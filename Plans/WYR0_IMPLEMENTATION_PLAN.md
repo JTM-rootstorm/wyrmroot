@@ -769,3 +769,160 @@ WYR0 is finished only when all of the following are true:
 - no TTY, shell, service manager, package manager, or persistent filesystem has been pulled into WYR0 as accidental scope
 
 Once these conditions hold, freeze a WYR0 completion commit/tag. WYR1 can then focus on the next real operating-system layer, likely console/TTY, persistent storage/VFS, and the first useful interactive shell, without destabilizing the proven loader/native-process chain.
+
+---
+
+# 14. Mandatory security validation flow and gate
+
+Security review is a **required WYR0 acceptance gate**. It complements functional testing and does not replace parser tests, QEMU integration, code review, or Deepwyrm's own kernel security gate. Daybreak Blue / Codex Security should be used as a dedicated review lane when available, but Wyrmroot must not acquire a runtime or build dependency on that service.
+
+## 14.1 Review flow
+
+For security-sensitive changes and at every applicable phase gate, use this sequence:
+
+```text
+implementation
+    |
+targeted functional/negative tests
+    |
+static/lint checks + fuzz/property tests for host-testable parsers
+    |
+Daybreak Blue security review of the exact revision/diff
+    |
+triage findings against WYR0 threat model and capability boundaries
+    |
+remediate confirmed findings
+    |
+add regression tests reproducing the failure class
+    |
+rerun targeted + affected integration tests
+    |
+re-review security-relevant remediation
+    |
+coordinator records security-gate disposition
+```
+
+Security review must identify the exact Wyrmroot revision and the pinned Deepwyrm revision used for integration. A report against stale loader/parser/runtime code does not satisfy the gate after security-sensitive changes land.
+
+If Daybreak Blue is temporarily unavailable, equivalent manual/security-tool review may cover an intermediate phase, but **WYR0 milestone closure requires a recorded security review of the release candidate** before tagging.
+
+## 14.2 Required WYR0 security-review surfaces
+
+Review at minimum:
+
+- UEFI artifact discovery, size/range arithmetic, memory allocation, and `ExitBootServices()` transition handling
+- Deepwyrm kernel ELF validation performed by `loader.efi`
+- `DwBootInfoV1` construction, module ranges, memory-map copying, framebuffer/ACPI metadata, command-line lengths, entropy fields, and reserved fields
+- loader configuration parsing and any path construction used before boot
+- `cpio newc` or replacement bootfs parsing, including bounds, alignment, numeric-field parsing, duplicate paths, malformed names, traversal attempts, and truncated archives
+- userspace ELF parser arithmetic, program-header validation, overlap detection, permissions, BSS zeroing, stack construction, and rejected unsupported features
+- capability distribution from primordial bootstrap to `init0` and from `init0` to children
+- bootstrap protocol length/version/type validation and transferred-handle expectations
+- runtime startup parsing for `argc`/`argv`/`envp`/auxv and bootstrap-channel acquisition
+- W^X and segment-protection requests made through the Deepwyrm ABI
+- deterministic image construction and exact Deepwyrm/Rust revision pinning as supply-chain/reproducibility controls
+- all production `unsafe` blocks in Wyrmroot loader/runtime/parser code and the abstractions containing them
+
+WYR0 has no network-facing service, package ingestion, login system, or persistent filesystem, so those threat surfaces remain explicitly out of scope rather than receiving speculative implementations.
+
+## 14.3 Required adversarial tests
+
+WYR0 should preserve reusable malformed-input corpora/regression tests for at least:
+
+- missing/zero-length/oversized boot artifacts
+- malformed ELF identification/class/machine/header sizes
+- arithmetic overflow and overlapping kernel/application ELF segments
+- `PT_INTERP` or unsupported dynamic features
+- segments requesting invalid W+X combinations
+- malformed/truncated `cpio newc` headers
+- enormous or overflowing namesize/filesize values
+- entries missing NUL termination where the format requires it
+- archive records extending beyond the mapped bootfs object
+- absolute paths, `..` traversal, duplicate paths, and ambiguous normalization cases
+- malformed bootstrap protocol size/version/type/reserved fields
+- unexpected, missing, duplicate, wrong-type, or excessive transferred handles
+- attempts to pass broader capability rights to `init0`/`hello` than their declared bootstrap contract permits
+- startup metadata whose pointers/ranges would exceed the constructed child address space
+
+Use coverage-guided fuzzing or equivalent fuzz/property testing for host-testable ELF, bootfs, configuration, and protocol parsers where practical. Every confirmed parser/security bug should add a minimized regression input when feasible.
+
+## 14.4 Cross-repository security boundary
+
+WYR0 and DW0 security reviews must meet at the shared contracts rather than assuming the other repository checked everything.
+
+Cross-repository review must explicitly validate:
+
+1. the exact `deepwyrm-abi` revision consumed by Wyrmroot
+2. `DwBootInfoV1` producer/consumer agreement
+3. bootstrap ELF restrictions expected by the Deepwyrm primordial loader
+4. bootstrap-channel transferred handle types and rights
+5. bootfs `MemoryObject` immutability/rights expectations
+6. process/memory/thread syscall use by `wyrmroot-loader`
+
+A Wyrmroot workaround that weakens a Deepwyrm security invariant is not an acceptable remediation. Missing kernel behavior must be routed through the Deepwyrm ABI coordinator.
+
+## 14.5 Finding disposition
+
+Before a phase or milestone security gate can close:
+
+- **Critical/High:** no confirmed unresolved finding may remain.
+- **Medium:** must be fixed or have an explicit written disposition, rationale, compensating control if any, and target milestone for remediation.
+- **Low/Informational:** may be tracked, but must not contradict a locked WYR0 security/capability invariant.
+- False positives must be documented with enough technical reasoning to avoid repeated rediscovery.
+
+Tool-provided severity is advisory. The coordinator validates exploitability, capability impact, and whether the issue crosses the UEFI/kernel/userspace trust boundaries.
+
+## 14.6 Security review artifact
+
+Maintain a milestone review record, for example:
+
+```text
+security/WYR0_SECURITY_REVIEW.md
+```
+
+Record:
+
+- reviewed Wyrmroot commit
+- pinned/reviewed Deepwyrm integration commit
+- Rust/Wyrmroot toolchain revision relevant to the build
+- review date/tooling
+- threat-model scope
+- findings and dispositions
+- parser/fuzz/regression tests added
+- explicitly accepted residual risks
+- final gate status
+
+Do not commit credentials, secrets, private prompts, or unnecessary proprietary scanner internals.
+
+## 14.7 Phase integration
+
+Security review is distributed across WYR0 rather than postponed to WYR0-I:
+
+- **WYR0-A:** dependency/ABI pinning, generated-boundary consumption, reproducibility controls.
+- **WYR0-B:** EFI artifact parsing/loading, kernel ELF, BootInfo construction, ExitBootServices transition.
+- **WYR0-C:** bootfs parser and path/traversal rules, fuzz corpus.
+- **WYR0-D:** startup/runtime/bootstrap protocol and capability receipt.
+- **WYR0-E:** userspace ELF loading, mapping arithmetic, stack construction, capability delegation.
+- **WYR0-F:** primordial bootstrap authority and bootfs validation.
+- **WYR0-G:** `init0` child delegation and rights minimization.
+- **WYR0-H:** image construction, integration boundaries, test harness assumptions.
+- **WYR0-I:** whole-milestone threat-model review, residual-risk triage, release-candidate security review.
+
+## 14.8 Mandatory WYR0 security exit gate
+
+The earlier WYR0 exit criteria are necessary but not sufficient. WYR0 **must not be tagged complete** until all of the following are also true:
+
+- the release-candidate Wyrmroot commit and pinned Deepwyrm revision have completed the recorded security-review flow
+- no confirmed Critical/High security finding remains unresolved
+- every Medium finding has an explicit disposition
+- confirmed security bugs have regression tests where technically practical
+- malformed kernel/application ELF inputs fail closed
+- malformed/traversal/overflow bootfs inputs fail closed
+- bootstrap protocol rejects malformed messages and unexpected handle sets
+- primordial/bootstrap/`init0` capability reviews confirm least privilege for WYR0's declared responsibilities
+- W^X/protection and userspace loader negative tests pass against the real Deepwyrm ABI
+- deterministic image/version pin checks pass
+- all security-sensitive production `unsafe` blocks are documented and reviewed
+- `security/WYR0_SECURITY_REVIEW.md` (or the canonical equivalent) records the exact reviewed revisions and final `PASS`/accepted-risk state
+
+Any security-sensitive code change after the recorded release-candidate review invalidates the final gate for the affected surface and requires targeted re-review before the WYR0 tag is created.
