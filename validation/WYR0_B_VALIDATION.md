@@ -6,6 +6,7 @@ substitute for the repository README and does not claim that the WYR0-B phase ga
 ## Loader implementation checkpoint
 
 - Wyrmroot base: `a35246850eb5c35e9a950cd148b2f9678a2dca1a`
+- Tested Wyrmroot loader revision: `25219686b87630d3a3cd6b3996cc56d521e72a39`
 - Pinned Deepwyrm revision: `07140ca7da26fad7173b80ed1cdf26c98b50aaab`
 - Accepted Rust source revision: `8bab26f4f68e0e26f0bb7960be334d5b520ea452`
 - Accepted toolchain manifest SHA-256:
@@ -31,23 +32,40 @@ The checkpoint contains the ownership-complete WYR0-B loader transaction. It inc
 - final-map normalization, retained table/module coherence, page-table population, bounded COM1
   marker emission, verified raw entry state, and the nonreturning kernel jump on the live entry path.
 
-Focused evidence collected before the checkpoint commit:
+Evidence collected against the tested clean revision:
 
-- loader parser/component tests: 73 passed, 0 failed;
+- complete loader host suite: 85 passed, 0 failed;
 - loader strict host Clippy with warnings denied: passed;
 - accepted `x86_64-unknown-uefi` target check: passed;
+- accepted `x86_64-unknown-uefi` target build and PE inspection: passed;
 - xtask unit tests: 29 passed, 0 failed, with the explicit real-artifact acceptance test ignored in
   the ordinary hermetic suite;
-- real immutable-toolchain trust test: passed before final integration, including whole-tree,
+- real immutable-toolchain trust gate: passed, including whole-tree,
   internal runtime-library, interpreter/dependency, and pre/post identity verification;
 - xtask strict Clippy with warnings denied: passed;
 - workspace formatting and diff hygiene: passed.
 
+The accepted build produced these path-neutral artifact identities:
+
+- `target/wyr0-b/x86_64-unknown-uefi/debug/loader.efi`: SHA-256
+  `deb041b224af53a97a674543fd566c691a47d0d71edf35ec2a6a59a03a02edda`;
+- `target/wyr0-b/x86_64-unknown-uefi/debug/loader.pdb`: SHA-256
+  `489d89804fbdc085db7a9bf9b0f908c91582680b3d8f701ab36a09e0f2d4ea2a`;
+- PE inspection report identity:
+  `f616d99b1385ed13d3d59091f5c02db5966c0228532ea632868794831f151b11`;
+- `target/wyr0-b/provenance/wyr0-b-loader.toml`: SHA-256
+  `e94a703664b2e201c1c27e8a8e4697aa794b3ae2dea5657b6c0612c5b141e07a`.
+
+The provenance records a clean Wyrmroot tree, the exact Deepwyrm and Rust revisions, the accepted
+toolchain manifest and whole-tree identities, the selected compiler/runtime component hashes, and
+repository-relative artifact paths. PDB-guided disassembly of the PE artifact verified the emitted
+16-byte raw handoff stub as `cli; cld; mov cr3; mov rsp; mov rdi; xor rbp; jmp rdx`, with no call or
+return edge.
+
 ## Gate disposition
 
-WYR0-B implementation and host security gates are complete. The exact accepted loader build, PE
-inspection, and path-neutral artifact provenance gate must still be rerun from the clean committed
-tree before a VM request is eligible.
+WYR0-B implementation, host security, accepted loader build, PE inspection, and path-neutral
+artifact provenance gates are complete for the tested revision pair.
 
-No VM request or QEMU/OVMF acceptance claim exists for this checkpoint. The manager-owned VM gate
-must wait for a committed boot-ready loader and exact paired artifacts with hashes.
+No VM or QEMU/OVMF acceptance claim exists for this checkpoint. The manager-owned paired Q35/UEFI
+serial and handoff gate remains required before WYR0-B phase closure.

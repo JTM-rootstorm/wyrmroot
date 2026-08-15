@@ -7,9 +7,9 @@ This record covers the Wyrmroot UEFI loader, hostile kernel-ELF intake,
 and loader artifact provenance for WYR0-B. It does not review or authorize
 WYR0-C bootfs-format/runtime behavior.
 
-The source and host-test review is complete with no Critical or High findings.
-WYR0-B remains open until the accepted-toolchain artifact gate and
-manager-owned paired VM gate pass against exact committed revisions.
+The source, host-test, and accepted-toolchain artifact reviews are complete
+with no Critical or High findings. WYR0-B remains open until the manager-owned
+paired VM gate passes against the exact committed revisions and artifacts.
 
 ## Closed findings
 
@@ -39,6 +39,10 @@ manager-owned paired VM gate pass against exact committed revisions.
 - Host regressions cover exact-once rollback, fatal post-EBS dispatch, retained
   table/module/entropy/RSDP address coherence, the absence of a second EBS or
   post-EBS release surface, and the linked `cli`/`cld`/CR3/RSP/RDI/`jmp` order.
+- The accepted PE/COFF artifact passed structural inspection. PDB-guided
+  disassembly independently verified the emitted 16-byte raw stub performs
+  `cli`, `cld`, CR3/RSP/RDI setup, RBP clearing, and an indirect `jmp`, with no
+  call or return edge.
 
 ## Open findings and accepted limitations
 
@@ -64,12 +68,13 @@ manager-owned paired VM gate pass against exact committed revisions.
   target libraries, and the whole toolchain tree are verified; the host kernel
   and system libraries remain platform dependencies.
 
-## Required closure evidence
+## Closure evidence
 
-- focused hostile-input and ownership regressions, strict Clippy, rustdoc,
-  formatting, and diff hygiene;
-- accepted `x86_64-unknown-uefi` check/build plus PE inspection and path-neutral
-  provenance;
-- exact compatible Deepwyrm/Wyrmroot commit pair and artifact hashes; and
-- manager-owned Q35/UEFI serial and handoff evidence. No QEMU or VM evidence is
-  claimed by this document yet.
+- Complete: focused hostile-input and ownership regressions, strict Clippy,
+  formatting, and diff hygiene.
+- Complete: accepted `x86_64-unknown-uefi` check/build, PE inspection,
+  path-neutral provenance, and raw-stub disassembly.
+- Complete: exact compatible Deepwyrm/Wyrmroot revision pair and loader artifact
+  hashes recorded in `validation/WYR0_B_VALIDATION.md`.
+- Pending: manager-owned Q35/UEFI serial and handoff evidence. No QEMU or VM
+  evidence is claimed by this document yet.
