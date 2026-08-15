@@ -8,9 +8,14 @@
 use core::cmp::Ordering;
 
 use deepwyrm_abi::{
-    DW_BOOT_BASE_PAGE_SIZE, DW_BOOT_MODULE_FLAG_READ_ONLY, DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS,
+    DW_BOOT_BASE_PAGE_SIZE, DW_BOOT_MODULE_FLAG_READ_ONLY,
+    DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1, DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS,
     DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP, DW_BOOT_MODULE_V1_SIZE, DW_BOOT_MODULE_V1_VERSION,
-    DwBootModuleFlags, DwBootModuleKind, DwBootModuleV1,
+    DW_BOOT_X86_64_PAGING_HANDOFF_MAX_BYTE_LEN,
+    DW_BOOT_X86_64_PAGING_HANDOFF_MIN_TABLE_FRAME_COUNT,
+    DW_BOOT_X86_64_PAGING_HANDOFF_TABLE_FRAME_STRIDE,
+    DW_BOOT_X86_64_PAGING_HANDOFF_TABLE_FRAMES_OFFSET, DwBootModuleFlags, DwBootModuleKind,
+    DwBootModuleV1,
 };
 
 /// The base page size required by the generated Deepwyrm boot contract.
@@ -46,6 +51,11 @@ impl PlannedModule {
     fn from_input(input: ModuleInput) -> Result<Self, ModulePlanError> {
         if input.byte_len == 0 {
             return Err(ModulePlanError::ZeroLength { kind: input.kind });
+        }
+        if input.kind == DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1
+            && !valid_paging_handoff_extent(input.byte_len)
+        {
+            return Err(ModulePlanError::InvalidPagingHandoffExtent);
         }
         if !input.physical_start.is_multiple_of(PAGE_SIZE) {
             return Err(ModulePlanError::UnalignedStart {
@@ -90,7 +100,9 @@ impl PlannedModule {
             size: DW_BOOT_MODULE_V1_SIZE,
             version: DW_BOOT_MODULE_V1_VERSION,
             kind: self.kind,
-            flags: if self.kind == DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS {
+            flags: if self.kind == DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS
+                || self.kind == DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1
+            {
                 DW_BOOT_MODULE_FLAG_READ_ONLY
             } else {
                 DwBootModuleFlags(0)
@@ -102,10 +114,23 @@ impl PlannedModule {
     }
 }
 
-/// The deterministic bootstrap-then-bootfs module plan.
+fn valid_paging_handoff_extent(byte_len: u64) -> bool {
+    let offset = u64::from(DW_BOOT_X86_64_PAGING_HANDOFF_TABLE_FRAMES_OFFSET);
+    let stride = u64::from(DW_BOOT_X86_64_PAGING_HANDOFF_TABLE_FRAME_STRIDE);
+    let minimum = offset + u64::from(DW_BOOT_X86_64_PAGING_HANDOFF_MIN_TABLE_FRAME_COUNT) * stride;
+    (minimum..=u64::from(DW_BOOT_X86_64_PAGING_HANDOFF_MAX_BYTE_LEN)).contains(&byte_len)
+        && (byte_len - offset).is_multiple_of(stride)
+}
+
+/// The deterministic bootstrap, bootfs, then internal paging-carrier module plan.
+///
+/// The third entry is deliberately not a loader-private convention: its kind
+/// and read-only flag come from the generated Deepwyrm ABI.  Keeping the
+/// carrier in this one plan prevents a second, unbounded module path from
+/// bypassing overlap and allocation-extent validation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ModulePlan {
-    modules: [PlannedModule; 2],
+    modules: [PlannedModule; 3],
 }
 
 impl ModulePlan {
@@ -117,9 +142,17 @@ impl ModulePlan {
         self.modules[1]
     }
 
+    pub fn paging_handoff(self) -> PlannedModule {
+        self.modules[2]
+    }
+
     /// Convert in canonical order without maintaining a parallel ABI type.
-    pub fn to_abi_modules(self) -> [DwBootModuleV1; 2] {
-        [self.bootstrap().to_abi(), self.bootfs().to_abi()]
+    pub fn to_abi_modules(self) -> [DwBootModuleV1; 3] {
+        [
+            self.bootstrap().to_abi(),
+            self.bootfs().to_abi(),
+            self.paging_handoff().to_abi(),
+        ]
     }
 }
 
@@ -127,16 +160,25 @@ impl ModulePlan {
 pub fn plan_modules(
     bootstrap: ModuleInput,
     bootfs: ModuleInput,
+    paging_handoff: ModuleInput,
 ) -> Result<ModulePlan, ModulePlanError> {
     require_kind(bootstrap, DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP)?;
     require_kind(bootfs, DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS)?;
+    require_kind(
+        paging_handoff,
+        DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1,
+    )?;
     let bootstrap = PlannedModule::from_input(bootstrap)?;
     let bootfs = PlannedModule::from_input(bootfs)?;
-    if ranges_overlap(bootstrap, bootfs) {
+    let paging_handoff = PlannedModule::from_input(paging_handoff)?;
+    if ranges_overlap(bootstrap, bootfs)
+        || ranges_overlap(bootstrap, paging_handoff)
+        || ranges_overlap(bootfs, paging_handoff)
+    {
         return Err(ModulePlanError::OverlappingAllocations);
     }
     Ok(ModulePlan {
-        modules: [bootstrap, bootfs],
+        modules: [bootstrap, bootfs, paging_handoff],
     })
 }
 
@@ -178,5 +220,6 @@ pub enum ModulePlanError {
     AllocationOverflow {
         kind: DwBootModuleKind,
     },
+    InvalidPagingHandoffExtent,
     OverlappingAllocations,
 }

@@ -2,9 +2,10 @@
 mod modules;
 
 use deepwyrm_abi::{
-    DW_BOOT_MODULE_FLAG_READ_ONLY, DW_BOOT_MODULE_KIND_UNSPECIFIED,
-    DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS, DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP,
-    DW_BOOT_MODULE_V1_SIZE, DW_BOOT_MODULE_V1_VERSION, DwBootModuleFlags, DwBootModuleKind,
+    DW_BOOT_MODULE_FLAG_READ_ONLY, DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1,
+    DW_BOOT_MODULE_KIND_UNSPECIFIED, DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS,
+    DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP, DW_BOOT_MODULE_V1_SIZE, DW_BOOT_MODULE_V1_VERSION,
+    DwBootModuleFlags, DwBootModuleKind,
 };
 use modules::{ModuleInput, ModulePlanError, PAGE_SIZE, plan_modules};
 
@@ -16,6 +17,14 @@ fn input(kind: DwBootModuleKind, start: u64, len: u64) -> ModuleInput {
     }
 }
 
+fn paging_handoff(start: u64, len: u64) -> ModuleInput {
+    input(
+        DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1,
+        start,
+        len,
+    )
+}
+
 #[test]
 fn plans_required_modules_in_canonical_order_and_preserves_byte_lengths() {
     let plan = plan_modules(
@@ -25,6 +34,7 @@ fn plans_required_modules_in_canonical_order_and_preserves_byte_lengths() {
             PAGE_SIZE * 3,
             PAGE_SIZE + 1,
         ),
+        paging_handoff(PAGE_SIZE * 6, 144),
     )
     .unwrap();
     let modules = plan.to_abi_modules();
@@ -34,6 +44,11 @@ fn plans_required_modules_in_canonical_order_and_preserves_byte_lengths() {
     assert_eq!(modules[0].byte_len, 1);
     assert_eq!(modules[1].byte_len, PAGE_SIZE + 1);
     assert_eq!(modules[1].flags, DW_BOOT_MODULE_FLAG_READ_ONLY);
+    assert_eq!(
+        modules[2].kind,
+        DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1
+    );
+    assert_eq!(modules[2].flags, DW_BOOT_MODULE_FLAG_READ_ONLY);
 }
 
 #[test]
@@ -45,11 +60,13 @@ fn rounds_each_payload_to_the_required_allocation_extent() {
             PAGE_SIZE * 3,
             PAGE_SIZE + 1,
         ),
+        paging_handoff(PAGE_SIZE * 6, 144),
     )
     .unwrap();
 
     assert_eq!(plan.bootstrap().allocated_len, PAGE_SIZE);
     assert_eq!(plan.bootfs().allocated_len, PAGE_SIZE * 2);
+    assert_eq!(plan.paging_handoff().allocated_len, PAGE_SIZE);
 }
 
 #[test]
@@ -57,6 +74,7 @@ fn accepts_allocations_that_are_exactly_adjacent_after_rounding() {
     let plan = plan_modules(
         input(DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP, PAGE_SIZE, 1),
         input(DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS, PAGE_SIZE * 2, 1),
+        paging_handoff(PAGE_SIZE * 3, 144),
     )
     .unwrap();
 
@@ -81,6 +99,7 @@ fn emits_complete_generated_module_records_with_zero_reserved_fields() {
             bootfs_start,
             bootfs_len,
         ),
+        paging_handoff(PAGE_SIZE * 6, 144),
     )
     .unwrap()
     .to_abi_modules();
@@ -100,6 +119,13 @@ fn emits_complete_generated_module_records_with_zero_reserved_fields() {
     assert_eq!(modules[1].physical_start, bootfs_start);
     assert_eq!(modules[1].byte_len, bootfs_len);
     assert_eq!(modules[1].reserved, [0; 4]);
+
+    assert_eq!(
+        modules[2].kind,
+        DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1
+    );
+    assert_eq!(modules[2].flags, DW_BOOT_MODULE_FLAG_READ_ONLY);
+    assert_eq!(modules[2].reserved, [0; 4]);
 }
 
 #[test]
@@ -107,6 +133,7 @@ fn rejects_wrong_kind_zero_length_unaligned_and_overlapping_ranges() {
     let err = plan_modules(
         input(DW_BOOT_MODULE_KIND_UNSPECIFIED, PAGE_SIZE, 1),
         input(DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS, PAGE_SIZE * 3, 1),
+        paging_handoff(PAGE_SIZE * 5, 144),
     )
     .unwrap_err();
     assert!(matches!(err, ModulePlanError::UnexpectedKind { .. }));
@@ -114,6 +141,7 @@ fn rejects_wrong_kind_zero_length_unaligned_and_overlapping_ranges() {
     let err = plan_modules(
         input(DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP, PAGE_SIZE, 0),
         input(DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS, PAGE_SIZE * 3, 1),
+        paging_handoff(PAGE_SIZE * 5, 144),
     )
     .unwrap_err();
     assert!(matches!(err, ModulePlanError::ZeroLength { .. }));
@@ -121,6 +149,7 @@ fn rejects_wrong_kind_zero_length_unaligned_and_overlapping_ranges() {
     let err = plan_modules(
         input(DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP, 1, 1),
         input(DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS, PAGE_SIZE * 3, 1),
+        paging_handoff(PAGE_SIZE * 5, 144),
     )
     .unwrap_err();
     assert!(matches!(err, ModulePlanError::UnalignedStart { .. }));
@@ -128,6 +157,7 @@ fn rejects_wrong_kind_zero_length_unaligned_and_overlapping_ranges() {
     let err = plan_modules(
         input(DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP, PAGE_SIZE, PAGE_SIZE),
         input(DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS, PAGE_SIZE, 1),
+        paging_handoff(PAGE_SIZE * 5, 144),
     )
     .unwrap_err();
     assert_eq!(err, ModulePlanError::OverlappingAllocations);
@@ -142,6 +172,7 @@ fn rejects_payload_and_page_rounding_overflow() {
             u64::MAX - PAGE_SIZE * 2 + 1,
         ),
         input(DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS, PAGE_SIZE * 3, 1),
+        paging_handoff(PAGE_SIZE * 5, 144),
     )
     .unwrap_err();
     assert!(matches!(
@@ -156,7 +187,31 @@ fn rejects_payload_and_page_rounding_overflow() {
             u64::MAX - PAGE_SIZE,
         ),
         input(DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS, PAGE_SIZE * 3, 1),
+        paging_handoff(PAGE_SIZE * 5, 144),
     )
     .unwrap_err();
     assert!(matches!(err, ModulePlanError::AllocationOverflow { .. }));
+}
+
+#[test]
+fn paging_handoff_extent_is_exactly_header_plus_bounded_u64_frames() {
+    for byte_len in [112_u64, 136, 145, 2161, 2168] {
+        assert_eq!(
+            plan_modules(
+                input(DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP, PAGE_SIZE, 1),
+                input(DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS, PAGE_SIZE * 2, 1),
+                paging_handoff(PAGE_SIZE * 3, byte_len),
+            ),
+            Err(ModulePlanError::InvalidPagingHandoffExtent)
+        );
+    }
+    for byte_len in [144_u64, 2160] {
+        let plan = plan_modules(
+            input(DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP, PAGE_SIZE, 1),
+            input(DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS, PAGE_SIZE * 2, 1),
+            paging_handoff(PAGE_SIZE * 3, byte_len),
+        )
+        .unwrap();
+        assert_eq!(plan.paging_handoff().byte_len, byte_len);
+    }
 }

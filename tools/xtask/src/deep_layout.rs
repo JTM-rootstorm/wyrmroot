@@ -1,10 +1,13 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsStr;
-use std::fs::{self, File};
-use std::io::{Read, Take, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Take, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::error::Failure;
 use crate::sha256::bytes_digest;
@@ -14,15 +17,52 @@ const PACKAGE_MANIFEST: &str = "crates/deepwyrm-abi/Cargo.toml";
 const LAYOUT_PATH: &str = "kernel/arch/x86_64/layout.toml";
 const GENERATED_POLICY_PATH: &str = "target/wyr0-b/generated/deepwyrm_layout_policy.rs";
 const MAX_LAYOUT_BYTES: u64 = 1024 * 1024;
+const MAX_METADATA_STDOUT_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_METADATA_STDERR_BYTES: u64 = 1024 * 1024;
+const METADATA_COMMAND_DEADLINE: Duration = Duration::from_secs(60);
+const MAX_GIT_ROOT_STDOUT_BYTES: u64 = 4096;
+const MAX_GIT_REVISION_STDOUT_BYTES: u64 = 64;
+const MAX_GIT_STATUS_STDOUT_BYTES: u64 = 1024;
+const MAX_GIT_PATH_STDOUT_BYTES: u64 = 256;
+const MAX_GIT_STDERR_BYTES: u64 = 64 * 1024;
+const GIT_COMMAND_DEADLINE: Duration = Duration::from_secs(10);
+const MAX_METADATA_JSON_DEPTH: usize = 32;
+const MAX_METADATA_JSON_VALUES: usize = 262_144;
+const MAX_METADATA_CONTAINER_ENTRIES: usize = 65_536;
+const MAX_METADATA_STRING_BYTES: usize = 64 * 1024;
+
+pub(crate) const LAYOUT_SCHEMA: &str = "deepwyrm-x86_64-layout";
+pub(crate) const LAYOUT_VERSION: u64 = 2;
+pub(crate) const TRANSITION_TABLE_CONTRACT: &str = "DW_BOOT_X86_64_PAGING_HANDOFF_V1";
+pub(crate) const GENERATED_POLICY_CONTRACT: &str = "wyrmroot-deep-layout-policy-v2";
+pub(crate) const GENERATED_POLICY_VALIDATION_SCOPE: &str =
+    "exact-layout-schema-fields-and-semantic-constraints";
+pub(crate) const GENERATED_ABI_ASSERTION_SCOPE: &str =
+    "base-page-and-paging-handoff-numeric-constants";
 
 pub(crate) struct DeepLayoutBuild {
     pub(crate) policy_path: PathBuf,
     pub(crate) layout_sha256: String,
     pub(crate) policy_sha256: String,
+    source_root: PathBuf,
+    expected_revision: String,
 }
 
 impl DeepLayoutBuild {
     pub(crate) fn verify_unchanged(&self) -> Result<(), Failure> {
+        verify_git_source_identity(&self.source_root, &self.expected_revision)?;
+        let layout_path = self.source_root.join(LAYOUT_PATH);
+        validate_regular_path(&self.source_root, &layout_path, "Deepwyrm x86_64 layout")?;
+        let layout_bytes = read_bounded(&layout_path, MAX_LAYOUT_BYTES, "Deepwyrm x86_64 layout")?;
+        verify_tracked_bytes(&self.source_root, LAYOUT_PATH, &layout_bytes)?;
+        let actual_layout = bytes_digest(&layout_bytes);
+        if actual_layout != self.layout_sha256 {
+            return Err(Failure::task(format!(
+                "Deepwyrm x86_64 layout hash changed: {actual_layout}, expected {}",
+                self.layout_sha256
+            )));
+        }
+        verify_git_source_identity(&self.source_root, &self.expected_revision)?;
         validate_regular_file(&self.policy_path, "generated Deepwyrm layout policy")?;
         let bytes = read_bounded(
             &self.policy_path,
@@ -59,13 +99,15 @@ pub(crate) fn prepare(
     let layout_sha256 = bytes_digest(&layout_bytes);
     let policy_sha256 = bytes_digest(generated.as_bytes());
     let policy_path = repository.join(GENERATED_POLICY_PATH);
-    write_generated_policy(&policy_path, &generated)?;
+    write_generated_policy(repository, &policy_path, &generated)?;
     verify_git_source_identity(&source_root, expected_revision)?;
 
     let build = DeepLayoutBuild {
         policy_path,
         layout_sha256,
         policy_sha256,
+        source_root,
+        expected_revision: expected_revision.to_owned(),
     };
     build.verify_unchanged()?;
     Ok(build)
@@ -73,13 +115,286 @@ pub(crate) fn prepare(
 
 fn cargo_metadata(repository: &Path) -> Result<String, Failure> {
     let cargo = env::var_os("CARGO").unwrap_or_else(|| OsStr::new("cargo").to_owned());
-    let output = Command::new(cargo)
-        .args(["metadata", "--locked", "--format-version", "1"])
-        .current_dir(repository)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| Failure::task(format!("could not run locked Cargo metadata: {error}")))?;
-    output_stdout(output, "locked Cargo metadata")
+    let output = bounded_command_output(
+        Command::new(cargo)
+            .args(["metadata", "--locked", "--format-version", "1"])
+            .current_dir(repository)
+            .stdin(Stdio::null()),
+        MAX_METADATA_STDOUT_BYTES,
+        MAX_METADATA_STDERR_BYTES,
+        METADATA_COMMAND_DEADLINE,
+        "locked Cargo metadata",
+    )?;
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|_| Failure::task("locked Cargo metadata produced non-UTF-8 stdout"))?;
+    if output.status.success() {
+        Ok(stdout)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(Failure::task(format!(
+            "locked Cargo metadata failed with exit code {}{}",
+            output.status.code().unwrap_or(-1),
+            if stderr.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {}", stderr.trim())
+            }
+        )))
+    }
+}
+
+#[derive(Debug)]
+struct BoundedCommandOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+enum PipeStream {
+    Stdout,
+    Stderr,
+}
+
+enum CommandWorkerResult {
+    Stdout(Result<BoundedPipe, Failure>),
+    Stderr(Result<BoundedPipe, Failure>),
+    Stdin(Result<(), Failure>),
+}
+
+fn bounded_command_output(
+    command: &mut Command,
+    stdout_maximum: u64,
+    stderr_maximum: u64,
+    deadline: Duration,
+    label: &str,
+) -> Result<BoundedCommandOutput, Failure> {
+    bounded_command_output_inner(
+        command,
+        None,
+        stdout_maximum,
+        stderr_maximum,
+        deadline,
+        label,
+    )
+}
+
+fn bounded_command_output_with_stdin(
+    command: &mut Command,
+    stdin_bytes: &[u8],
+    stdout_maximum: u64,
+    stderr_maximum: u64,
+    deadline: Duration,
+    label: &str,
+) -> Result<BoundedCommandOutput, Failure> {
+    bounded_command_output_inner(
+        command,
+        Some(stdin_bytes.to_vec()),
+        stdout_maximum,
+        stderr_maximum,
+        deadline,
+        label,
+    )
+}
+
+fn bounded_command_output_inner(
+    command: &mut Command,
+    stdin_bytes: Option<Vec<u8>>,
+    stdout_maximum: u64,
+    stderr_maximum: u64,
+    deadline: Duration,
+    label: &str,
+) -> Result<BoundedCommandOutput, Failure> {
+    command.stdin(if stdin_bytes.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| Failure::task(format!("could not run {label}: {error}")))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| Failure::task(format!("could not capture {label} stdout")))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| Failure::task(format!("could not capture {label} stderr")))?;
+    let (limit_sender, limit_receiver) = mpsc::channel();
+    let (worker_sender, worker_receiver) = mpsc::channel();
+    let stdout_sender = limit_sender.clone();
+    let stdout_worker_sender = worker_sender.clone();
+    thread::spawn(move || {
+        let result = read_pipe_bounded(
+            stdout,
+            stdout_maximum,
+            "command stdout",
+            Some((stdout_sender, PipeStream::Stdout)),
+        );
+        let _ = stdout_worker_sender.send(CommandWorkerResult::Stdout(result));
+    });
+    let stderr_worker_sender = worker_sender.clone();
+    thread::spawn(move || {
+        let result = read_pipe_bounded(
+            stderr,
+            stderr_maximum,
+            "command stderr",
+            Some((limit_sender, PipeStream::Stderr)),
+        );
+        let _ = stderr_worker_sender.send(CommandWorkerResult::Stderr(result));
+    });
+    let mut stdin_result = if let Some(bytes) = stdin_bytes {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| Failure::task(format!("could not open {label} stdin")))?;
+        let stdin_worker_sender = worker_sender.clone();
+        thread::spawn(move || {
+            let result = stdin
+                .write_all(&bytes)
+                .map_err(|error| Failure::task(format!("could not write command stdin: {error}")));
+            let _ = stdin_worker_sender.send(CommandWorkerResult::Stdin(result));
+        });
+        None
+    } else {
+        Some(Ok(()))
+    };
+    drop(worker_sender);
+
+    let started = Instant::now();
+    let mut status = None;
+    let mut stdout_result = None;
+    let mut stderr_result = None;
+    loop {
+        match limit_receiver.try_recv() {
+            Ok(stream) => {
+                if status.is_none() {
+                    terminate_direct_child(
+                        &mut child,
+                        label,
+                        "after its output limit was exceeded",
+                    )?;
+                }
+                // Do not join the reader threads on this failure path. A descendant may have
+                // inherited the other pipe and kept it open; dropping the handles detaches the
+                // already memory-bounded readers instead of reintroducing an unbounded wait.
+                let stream = match stream {
+                    PipeStream::Stdout => "stdout",
+                    PipeStream::Stderr => "stderr",
+                };
+                return Err(Failure::task(format!(
+                    "{label} {stream} exceeded its byte limit; the direct child was terminated and reaped when still running"
+                )));
+            }
+            Err(mpsc::TryRecvError::Disconnected | mpsc::TryRecvError::Empty) => {}
+        }
+
+        while let Ok(result) = worker_receiver.try_recv() {
+            match result {
+                CommandWorkerResult::Stdout(result) => stdout_result = Some(result),
+                CommandWorkerResult::Stderr(result) => stderr_result = Some(result),
+                CommandWorkerResult::Stdin(result) => stdin_result = Some(result),
+            }
+        }
+        if status.is_none() {
+            status = child
+                .try_wait()
+                .map_err(|error| Failure::task(format!("could not poll {label}: {error}")))?;
+        }
+        if status.is_some()
+            && stdout_result.is_some()
+            && stderr_result.is_some()
+            && stdin_result.is_some()
+        {
+            break;
+        }
+        if started.elapsed() >= deadline {
+            if status.is_none() {
+                terminate_direct_child(&mut child, label, "after its wall-clock deadline")?;
+            }
+            // Safe std APIs can terminate only the direct child. A same-user descendant may
+            // inherit a pipe and outlive it, so never wait for detached pipe workers here.
+            return Err(Failure::task(format!(
+                "{label} exceeded its {} ms wall-clock deadline; the direct child was terminated and reaped when still running",
+                deadline.as_millis()
+            )));
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    let status = status.ok_or_else(|| {
+        Failure::task(format!("{label} completed without a captured exit status"))
+    })?;
+    let stdout = stdout_result
+        .ok_or_else(|| Failure::task(format!("{label} completed without captured stdout")))??;
+    let stderr = stderr_result
+        .ok_or_else(|| Failure::task(format!("{label} completed without captured stderr")))??;
+    stdin_result
+        .ok_or_else(|| Failure::task(format!("{label} completed without closing stdin")))??;
+    if stdout.exceeded {
+        return Err(Failure::task(format!(
+            "{label} stdout exceeds the {stdout_maximum}-byte limit"
+        )));
+    }
+    if stderr.exceeded {
+        return Err(Failure::task(format!(
+            "{label} stderr exceeds the {stderr_maximum}-byte limit"
+        )));
+    }
+    Ok(BoundedCommandOutput {
+        status,
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+    })
+}
+
+fn terminate_direct_child(child: &mut Child, label: &str, reason: &str) -> Result<(), Failure> {
+    if let Err(kill_error) = child.kill()
+        && child
+            .try_wait()
+            .map_err(|error| {
+                Failure::task(format!(
+                    "could not inspect {label} after termination failed: {error}"
+                ))
+            })?
+            .is_none()
+    {
+        return Err(Failure::task(format!(
+            "could not terminate {label} {reason}: {kill_error}"
+        )));
+    }
+    child
+        .wait()
+        .map_err(|error| Failure::task(format!("could not reap {label} {reason}: {error}")))?;
+    Ok(())
+}
+
+struct BoundedPipe {
+    bytes: Vec<u8>,
+    exceeded: bool,
+}
+
+fn read_pipe_bounded<R: Read>(
+    mut reader: R,
+    maximum: u64,
+    label: &str,
+    limit_signal: Option<(mpsc::Sender<PipeStream>, PipeStream)>,
+) -> Result<BoundedPipe, Failure> {
+    let mut bytes = Vec::new();
+    (&mut reader)
+        .take(maximum + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| Failure::task(format!("could not read {label}: {error}")))?;
+    let exceeded = bytes.len() as u64 > maximum;
+    if exceeded {
+        bytes.truncate(maximum as usize);
+        if let Some((sender, stream)) = limit_signal {
+            let _ = sender.send(stream);
+        }
+    }
+    Ok(BoundedPipe { bytes, exceeded })
 }
 
 struct PackageSource {
@@ -167,7 +482,12 @@ fn validate_git_source(manifest: &Path, expected_revision: &str) -> Result<PathB
     let manifest_directory = manifest
         .parent()
         .ok_or_else(|| Failure::task("deepwyrm-abi manifest has no parent directory"))?;
-    let root_output = git_output(manifest_directory, ["rev-parse", "--show-toplevel"])?;
+    let root_output = git_output_bounded(
+        manifest_directory,
+        ["rev-parse", "--show-toplevel"],
+        MAX_GIT_ROOT_STDOUT_BYTES,
+        "Deepwyrm Git source root inspection",
+    )?;
     let root = PathBuf::from(root_output.trim());
     if !root.is_absolute() {
         return Err(Failure::task(
@@ -197,7 +517,12 @@ fn validate_git_source(manifest: &Path, expected_revision: &str) -> Result<PathB
 }
 
 fn verify_git_source_identity(root: &Path, expected_revision: &str) -> Result<(), Failure> {
-    let revision = git_output(root, ["rev-parse", "HEAD"])?;
+    let revision = git_output_bounded(
+        root,
+        ["rev-parse", "HEAD"],
+        MAX_GIT_REVISION_STDOUT_BYTES,
+        "Deepwyrm Git revision inspection",
+    )?;
     if revision.trim() != expected_revision {
         return Err(Failure::task(format!(
             "deepwyrm-abi source checkout revision is '{}', expected '{}'",
@@ -205,7 +530,12 @@ fn verify_git_source_identity(root: &Path, expected_revision: &str) -> Result<()
             expected_revision
         )));
     }
-    let status = git_output(root, ["status", "--porcelain=v1", "--untracked-files=all"])?;
+    let status = git_output_bounded(
+        root,
+        ["status", "--porcelain=v1", "--untracked-files=all"],
+        MAX_GIT_STATUS_STDOUT_BYTES,
+        "Deepwyrm Git status inspection",
+    )?;
     validate_git_status(root, &status)
 }
 
@@ -229,24 +559,30 @@ fn validate_git_status(root: &Path, status: &str) -> Result<(), Failure> {
     Ok(())
 }
 
-fn git_output<I, S>(repository: &Path, arguments: I) -> Result<String, Failure>
+fn git_output_bounded<I, S>(
+    repository: &Path,
+    arguments: I,
+    stdout_maximum: u64,
+    label: &str,
+) -> Result<String, Failure>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repository)
-        .args(arguments)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| {
-            Failure::task(format!("could not inspect Deepwyrm Git source: {error}"))
-        })?;
-    output_stdout(output, "Deepwyrm Git source inspection")
+    let output = bounded_command_output(
+        Command::new("git")
+            .arg("-C")
+            .arg(repository)
+            .args(arguments),
+        stdout_maximum,
+        MAX_GIT_STDERR_BYTES,
+        GIT_COMMAND_DEADLINE,
+        label,
+    )?;
+    output_stdout(output, label)
 }
 
-fn output_stdout(output: Output, label: &str) -> Result<String, Failure> {
+fn output_stdout(output: BoundedCommandOutput, label: &str) -> Result<String, Failure> {
     let stdout = String::from_utf8(output.stdout)
         .map_err(|_| Failure::task(format!("{label} produced non-UTF-8 output")))?;
     if output.status.success() {
@@ -316,8 +652,18 @@ fn validate_directory(path: &Path, label: &str) -> Result<(), Failure> {
 }
 
 fn verify_tracked_bytes(root: &Path, relative: &str, bytes: &[u8]) -> Result<(), Failure> {
-    git_output(root, ["ls-files", "--error-unmatch", relative])?;
-    let expected = git_output(root, ["rev-parse", &format!("HEAD:{relative}")])?;
+    git_output_bounded(
+        root,
+        ["ls-files", "--error-unmatch", relative],
+        MAX_GIT_PATH_STDOUT_BYTES,
+        "Deepwyrm tracked layout path inspection",
+    )?;
+    let expected = git_output_bounded(
+        root,
+        ["rev-parse", &format!("HEAD:{relative}")],
+        MAX_GIT_REVISION_STDOUT_BYTES,
+        "Deepwyrm tracked layout revision inspection",
+    )?;
     let actual = git_hash_bytes(root, bytes)?;
     if expected.trim() != actual.trim() {
         return Err(Failure::task(
@@ -328,54 +674,179 @@ fn verify_tracked_bytes(root: &Path, relative: &str, bytes: &[u8]) -> Result<(),
 }
 
 fn git_hash_bytes(root: &Path, bytes: &[u8]) -> Result<String, Failure> {
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["hash-object", "--stdin"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| Failure::task(format!("could not hash Deepwyrm layout bytes: {error}")))?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| Failure::task("could not open Git hash-object stdin"))?
-        .write_all(bytes)
-        .map_err(|error| Failure::task(format!("could not send layout bytes to Git: {error}")))?;
-    let output = child.wait_with_output().map_err(|error| {
-        Failure::task(format!("could not wait for Deepwyrm layout hash: {error}"))
-    })?;
+    let output = bounded_command_output_with_stdin(
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["hash-object", "--stdin"]),
+        bytes,
+        MAX_GIT_REVISION_STDOUT_BYTES,
+        MAX_GIT_STDERR_BYTES,
+        GIT_COMMAND_DEADLINE,
+        "Deepwyrm layout byte hashing",
+    )?;
     output_stdout(output, "Deepwyrm layout byte hashing")
 }
 
-fn write_generated_policy(path: &Path, contents: &str) -> Result<(), Failure> {
+fn write_generated_policy(repository: &Path, path: &Path, contents: &str) -> Result<(), Failure> {
     let directory = path
         .parent()
         .ok_or_else(|| Failure::task("generated layout policy has no parent directory"))?;
-    fs::create_dir_all(directory).map_err(|error| {
-        Failure::task(format!(
-            "could not create generated policy directory {}: {error}",
-            directory.display()
-        ))
+    let directory_identity = ensure_output_directory(
+        repository,
+        directory,
+        "generated Deepwyrm layout policy directory",
+    )?;
+    validate_optional_regular_file(path, "generated Deepwyrm layout policy")?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| Failure::task(format!("system clock precedes Unix epoch: {error}")))?
+        .as_nanos();
+    let mut temporary = None;
+    for attempt in 0_u8..16 {
+        let candidate = directory.join(format!(
+            ".deepwyrm_layout_policy.rs.tmp-{}-{nonce}-{attempt}",
+            std::process::id()
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                temporary = Some((candidate, file));
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(Failure::task(format!(
+                    "could not create exclusive generated policy temporary file: {error}"
+                )));
+            }
+        }
+    }
+    let (temporary, mut file) = temporary.ok_or_else(|| {
+        Failure::task("could not reserve a unique generated policy temporary file")
     })?;
-    let temporary = directory.join(format!(
-        ".deepwyrm_layout_policy.rs.tmp-{}",
-        std::process::id()
-    ));
-    fs::write(&temporary, contents).map_err(|error| {
-        Failure::task(format!(
-            "could not write generated layout policy {}: {error}",
-            temporary.display()
-        ))
-    })?;
-    fs::rename(&temporary, path).map_err(|error| {
+    let result = (|| {
+        file.write_all(contents.as_bytes()).map_err(|error| {
+            Failure::task(format!(
+                "could not write generated layout policy {}: {error}",
+                temporary.display()
+            ))
+        })?;
+        file.flush().map_err(|error| {
+            Failure::task(format!(
+                "could not flush generated layout policy {}: {error}",
+                temporary.display()
+            ))
+        })?;
+        verify_open_file_identity(&file, &temporary, "generated policy temporary file")?;
+        verify_directory_identity(
+            directory,
+            &directory_identity,
+            "generated Deepwyrm layout policy directory",
+        )?;
+        validate_optional_regular_file(path, "generated Deepwyrm layout policy")?;
+        fs::rename(&temporary, path).map_err(|error| {
+            Failure::task(format!(
+                "could not install generated layout policy {}: {error}",
+                path.display()
+            ))
+        })?;
+        verify_directory_identity(
+            directory,
+            &directory_identity,
+            "generated Deepwyrm layout policy directory",
+        )?;
+        let installed = read_bounded(path, MAX_LAYOUT_BYTES, "generated Deepwyrm layout policy")?;
+        if installed != contents.as_bytes() {
+            return Err(Failure::task(
+                "installed generated Deepwyrm layout policy content changed",
+            ));
+        }
+        Ok(())
+    })();
+    if result.is_err() {
         let _ = fs::remove_file(&temporary);
-        Failure::task(format!(
-            "could not install generated layout policy {}: {error}",
-            path.display()
-        ))
-    })
+    }
+    result
+}
+
+fn ensure_output_directory(
+    root: &Path,
+    directory: &Path,
+    label: &str,
+) -> Result<fs::Metadata, Failure> {
+    if !root.is_absolute() {
+        return Err(Failure::task(format!("{label} root must be absolute")));
+    }
+    validate_directory(root, &format!("{label} root"))?;
+    let canonical_root = fs::canonicalize(root)
+        .map_err(|error| Failure::task(format!("could not canonicalize {label} root: {error}")))?;
+    if canonical_root != root {
+        return Err(Failure::task(format!(
+            "{label} root is not canonical or contains a symlink"
+        )));
+    }
+    let relative = directory
+        .strip_prefix(root)
+        .map_err(|_| Failure::task(format!("{label} is outside its trusted root")))?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(Failure::task(format!(
+                "{label} contains traversal or a non-normal component"
+            )));
+        };
+        current.push(component);
+        match fs::create_dir(&current) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(Failure::task(format!(
+                    "could not create {label} {}: {error}",
+                    current.display()
+                )));
+            }
+        }
+        validate_directory(&current, label)?;
+    }
+    fs::symlink_metadata(directory)
+        .map_err(|error| Failure::task(format!("could not inspect {label}: {error}")))
+}
+
+fn validate_optional_regular_file(path: &Path, label: &str) -> Result<(), Failure> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            Err(Failure::task(format!(
+                "{label} destination must be a regular non-symlink file"
+            )))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Failure::task(format!(
+            "could not inspect {label} destination: {error}"
+        ))),
+    }
+}
+
+fn verify_directory_identity(
+    path: &Path,
+    expected: &fs::Metadata,
+    label: &str,
+) -> Result<(), Failure> {
+    let current = fs::symlink_metadata(path)
+        .map_err(|error| Failure::task(format!("could not re-inspect {label}: {error}")))?;
+    if current.file_type().is_symlink()
+        || !current.is_dir()
+        || !same_file_identity(expected, &current)
+    {
+        return Err(Failure::task(format!(
+            "{label} identity changed during generated output installation"
+        )));
+    }
+    Ok(())
 }
 
 fn read_bounded(path: &Path, maximum: u64, label: &str) -> Result<Vec<u8>, Failure> {
@@ -462,14 +933,19 @@ struct LayoutPolicy {
 impl LayoutPolicy {
     fn parse(contents: &str) -> Result<Self, Failure> {
         let mut values = parse_layout_toml(contents)?;
-        expect_string(&mut values, "schema", "deepwyrm-x86_64-layout")?;
-        expect_integer(&mut values, "version", 1)?;
+        expect_string(&mut values, "schema", LAYOUT_SCHEMA)?;
+        expect_integer(&mut values, "version", LAYOUT_VERSION)?;
         expect_string(&mut values, "entry_contract", "DW_BOOT_X86_64_ENTRY_V1")?;
         expect_string(&mut values, "elf_type", "ET_EXEC")?;
         expect_string(&mut values, "entry_symbol", "_dw_kernel_entry")?;
         let link_base_text = take_string(&mut values, "link_base")?;
         let link_base = parse_hex_u64(&link_base_text, "link_base")?;
-        expect_integer(&mut values, "base_page_size", 4096)?;
+        let base_page_size = take_integer(&mut values, "base_page_size")?;
+        if base_page_size != 4096 {
+            return Err(Failure::task(
+                "Deepwyrm base_page_size must remain the 4096-byte x86_64 base page",
+            ));
+        }
         expect_bool(&mut values, "red_zone", false)?;
         expect_integer(&mut values, "kernel_boot_stack_size", 65536)?;
         expect_integer(&mut values, "kernel_boot_stack_alignment", 4096)?;
@@ -490,9 +966,17 @@ impl LayoutPolicy {
             ("entry_state.cr0_write_protect", true),
             ("entry_state.execute_disable", true),
             ("entry_state.uefi_services_available", false),
-            ("handoff_mappings.mutable", false),
+            ("handoff_mappings.referenced_ranges_mutable", false),
             ("handoff_mappings.page_zero_mapped", false),
             ("handoff_mappings.framebuffer_pixels_identity_mapped", false),
+            ("transition_tables.pcide_enabled", false),
+            ("transition_tables.pge_enabled", false),
+        ] {
+            expect_bool(&mut values, key, expected)?;
+        }
+        for (key, expected) in [
+            ("transition_tables.identity_alias_mutable_by_deepwyrm", true),
+            ("transition_tables.cr3_low_bits_zero", true),
         ] {
             expect_bool(&mut values, key, expected)?;
         }
@@ -582,8 +1066,79 @@ impl LayoutPolicy {
             ),
             ("early_intake.acpi_mapping_overlap", "coalesce"),
             ("early_intake.acpi_table_traversal", "deferred-dw0-c"),
+            ("transition_tables.contract", TRANSITION_TABLE_CONTRACT),
+            ("transition_tables.initial_leaf", "exactly-zero-non-present"),
+            (
+                "transition_tables.temporary_leaf_permissions",
+                "supervisor-rw-nx-base-page",
+            ),
+            (
+                "transition_tables.identity_alias_permissions",
+                "supervisor-rw-nx-base-page",
+            ),
+            ("transition_tables.pat_entry_zero", "observed-write-back"),
+            (
+                "transition_tables.mtrr_policy",
+                "alias-consistent-no-effective-write-back-claim",
+            ),
+            (
+                "transition_tables.ownership_transfer",
+                "loader-to-deepwyrm-after-exit-boot-services",
+            ),
+            ("transition_tables.lifetime", "until-deepwyrm-cr3-switch"),
+            (
+                "transition_tables.concurrency",
+                "bsp-aps-off-if-clear-nonreentrant",
+            ),
+            (
+                "transition_tables.physical_role_policy",
+                "exclusive-table-frames-no-kernel-module-data-alias",
+            ),
+            (
+                "transition_tables.new_root_table_access",
+                "deepwyrm-owned-before-cr3-switch",
+            ),
         ] {
             expect_string(&mut values, key, expected)?;
+        }
+        expect_integer(&mut values, "transition_tables.layout_version", 2)?;
+        let temporary_page_count =
+            take_integer(&mut values, "transition_tables.temporary_page_count")?;
+        if temporary_page_count != 1 {
+            return Err(Failure::task(
+                "Deepwyrm transition-table temporary mapping must contain exactly one base page",
+            ));
+        }
+        expect_integer(&mut values, "transition_tables.cache_selection_bits", 0)?;
+        let temporary_address_text =
+            take_string(&mut values, "transition_tables.temporary_virtual_address")?;
+        let temporary_address = parse_hex_u64(
+            &temporary_address_text,
+            "transition_tables.temporary_virtual_address",
+        )?;
+        let declared_indices = [
+            take_integer(&mut values, "transition_tables.pml4_index")?,
+            take_integer(&mut values, "transition_tables.pdpt_index")?,
+            take_integer(&mut values, "transition_tables.pd_index")?,
+            take_integer(&mut values, "transition_tables.pt_index")?,
+        ];
+        let derived_indices = x86_64_page_table_indices(temporary_address);
+        if declared_indices != derived_indices.map(u64::from) {
+            return Err(Failure::task(
+                "Deepwyrm transition-table indices do not match temporary_virtual_address",
+            ));
+        }
+        let minimum_table_frames =
+            take_integer(&mut values, "transition_tables.minimum_table_frame_count")?;
+        let maximum_table_frames =
+            take_integer(&mut values, "transition_tables.maximum_table_frame_count")?;
+        if minimum_table_frames != declared_indices.len() as u64
+            || maximum_table_frames < minimum_table_frames
+            || maximum_table_frames > u64::from(u32::MAX)
+        {
+            return Err(Failure::task(
+                "Deepwyrm transition-table frame bounds are inconsistent with four-level paging",
+            ));
         }
         if !values.is_empty() {
             return Err(Failure::task(format!(
@@ -591,14 +1146,30 @@ impl LayoutPolicy {
                 values.keys().next().expect("nonempty map")
             )));
         }
-        if link_base < 0xffff_8000_0000_0000 || link_base % 4096 != 0 {
+        if !is_upper_canonical_four_level(link_base) || link_base % base_page_size != 0 {
             return Err(Failure::task(
                 "Deepwyrm link_base must be upper-canonical and base-page aligned",
+            ));
+        }
+        let temporary_byte_len = temporary_page_count
+            .checked_mul(base_page_size)
+            .ok_or_else(|| Failure::task("Deepwyrm temporary mapping byte length overflows"))?;
+        if !is_upper_canonical_four_level(temporary_address)
+            || temporary_address % base_page_size != 0
+            || temporary_address.checked_add(temporary_byte_len).is_none()
+            || derived_indices[0] == x86_64_page_table_indices(link_base)[0]
+        {
+            return Err(Failure::task(
+                "Deepwyrm temporary mapping must be one aligned upper-canonical page outside the kernel PT_LOAD PML4 slot",
             ));
         }
 
         let mut rendered_values = parse_layout_toml(contents)?;
         rendered_values.insert("link_base".to_owned(), TomlValue::Integer(link_base));
+        rendered_values.insert(
+            "transition_tables.temporary_virtual_address".to_owned(),
+            TomlValue::Integer(temporary_address),
+        );
         Ok(Self {
             values: rendered_values,
         })
@@ -615,8 +1186,33 @@ impl LayoutPolicy {
                 TomlValue::String(value) => {
                     output.push_str(&format!("pub const {identifier}: &str = {value:?};\n"));
                 }
-                TomlValue::Integer(value) if key == "link_base" => {
+                TomlValue::Integer(value)
+                    if matches!(
+                        key.as_str(),
+                        "link_base" | "transition_tables.temporary_virtual_address"
+                    ) =>
+                {
                     output.push_str(&format!("pub const {identifier}: u64 = {value:#018x};\n"));
+                }
+                TomlValue::Integer(_)
+                    if matches!(
+                        key.as_str(),
+                        "transition_tables.pml4_index"
+                            | "transition_tables.pdpt_index"
+                            | "transition_tables.pd_index"
+                            | "transition_tables.pt_index"
+                    ) =>
+                {
+                    let shift = match key.as_str() {
+                        "transition_tables.pml4_index" => 39,
+                        "transition_tables.pdpt_index" => 30,
+                        "transition_tables.pd_index" => 21,
+                        "transition_tables.pt_index" => 12,
+                        _ => unreachable!("guarded transition-table index key"),
+                    };
+                    output.push_str(&format!(
+                        "pub const {identifier}: u16 = ((DEEPWYRM_TRANSITION_TABLES_TEMPORARY_VIRTUAL_ADDRESS >> {shift}) & 0x1ff) as u16;\n"
+                    ));
                 }
                 TomlValue::Integer(value) => {
                     output.push_str(&format!("pub const {identifier}: u64 = {value};\n"));
@@ -642,7 +1238,41 @@ pub const fn deepwyrm_lowest_pt_load_matches_layout(\n\
     lowest_page_rounded_pt_load: u64,\n\
 ) -> bool {\n\
     lowest_page_rounded_pt_load == DEEPWYRM_ELF_WINDOW_START\n\
-}\n",
+}\n\
+\n\
+// The accepted target build compiles these assertions against the actual pinned ABI crate.\n\
+pub const fn deepwyrm_transition_table_policy_is_self_consistent() -> bool {\n\
+    let temporary = DEEPWYRM_TRANSITION_TABLES_TEMPORARY_VIRTUAL_ADDRESS;\n\
+    let link_base_pml4 = ((DEEPWYRM_LINK_BASE >> 39) & 0x1ff) as u16;\n\
+    let upper_canonical = (temporary >> 48) == 0xffff && ((temporary >> 47) & 1) == 1;\n\
+    upper_canonical\n\
+        && temporary % DEEPWYRM_BASE_PAGE_SIZE == 0\n\
+        && DEEPWYRM_TRANSITION_TABLES_TEMPORARY_PAGE_COUNT == 1\n\
+        && DEEPWYRM_TRANSITION_TABLES_PML4_INDEX != link_base_pml4\n\
+        && DEEPWYRM_TRANSITION_TABLES_MINIMUM_TABLE_FRAME_COUNT\n\
+            <= DEEPWYRM_TRANSITION_TABLES_MAXIMUM_TABLE_FRAME_COUNT\n\
+}\n\
+\n\
+const _: () = assert!(deepwyrm_transition_table_policy_is_self_consistent());\n\
+const _: () = assert!(\n\
+    DEEPWYRM_BASE_PAGE_SIZE == deepwyrm_abi::DW_BOOT_BASE_PAGE_SIZE as u64\n\
+        && DEEPWYRM_TRANSITION_TABLES_LAYOUT_VERSION\n\
+            == deepwyrm_abi::DW_BOOT_X86_64_PAGING_HANDOFF_LAYOUT_VERSION as u64\n\
+        && DEEPWYRM_TRANSITION_TABLES_TEMPORARY_VIRTUAL_ADDRESS\n\
+            == deepwyrm_abi::DW_BOOT_X86_64_PAGING_HANDOFF_TEMPORARY_VIRTUAL_ADDRESS\n\
+        && DEEPWYRM_TRANSITION_TABLES_PML4_INDEX\n\
+            == deepwyrm_abi::DW_BOOT_X86_64_PAGING_HANDOFF_PML4_INDEX\n\
+        && DEEPWYRM_TRANSITION_TABLES_PDPT_INDEX\n\
+            == deepwyrm_abi::DW_BOOT_X86_64_PAGING_HANDOFF_PDPT_INDEX\n\
+        && DEEPWYRM_TRANSITION_TABLES_PD_INDEX\n\
+            == deepwyrm_abi::DW_BOOT_X86_64_PAGING_HANDOFF_PD_INDEX\n\
+        && DEEPWYRM_TRANSITION_TABLES_PT_INDEX\n\
+            == deepwyrm_abi::DW_BOOT_X86_64_PAGING_HANDOFF_PT_INDEX\n\
+        && DEEPWYRM_TRANSITION_TABLES_MINIMUM_TABLE_FRAME_COUNT\n\
+            == deepwyrm_abi::DW_BOOT_X86_64_PAGING_HANDOFF_MIN_TABLE_FRAME_COUNT as u64\n\
+        && DEEPWYRM_TRANSITION_TABLES_MAXIMUM_TABLE_FRAME_COUNT\n\
+            == deepwyrm_abi::DW_BOOT_X86_64_PAGING_HANDOFF_MAX_TABLE_FRAME_COUNT as u64\n\
+);\n",
         );
         output
     }
@@ -663,7 +1293,11 @@ fn parse_layout_toml(contents: &str) -> Result<BTreeMap<String, TomlValue>, Fail
             section = line[1..line.len() - 1].trim().to_owned();
             if !matches!(
                 section.as_str(),
-                "load_policy" | "entry_state" | "handoff_mappings" | "early_intake"
+                "load_policy"
+                    | "entry_state"
+                    | "handoff_mappings"
+                    | "early_intake"
+                    | "transition_tables"
             ) {
                 return Err(layout_line_error(index, "unknown layout section"));
             }
@@ -740,6 +1374,15 @@ fn take_value(values: &mut BTreeMap<String, TomlValue>, key: &str) -> Result<Tom
 fn take_string(values: &mut BTreeMap<String, TomlValue>, key: &str) -> Result<String, Failure> {
     match take_value(values, key)? {
         TomlValue::String(value) => Ok(value),
+        _ => Err(Failure::task(format!(
+            "Deepwyrm layout field '{key}' has the wrong type"
+        ))),
+    }
+}
+
+fn take_integer(values: &mut BTreeMap<String, TomlValue>, key: &str) -> Result<u64, Failure> {
+    match take_value(values, key)? {
+        TomlValue::Integer(value) => Ok(value),
         _ => Err(Failure::task(format!(
             "Deepwyrm layout field '{key}' has the wrong type"
         ))),
@@ -831,6 +1474,14 @@ fn parse_hex_u64(value: &str, key: &str) -> Result<u64, Failure> {
         .map_err(|_| Failure::task(format!("Deepwyrm layout field '{key}' overflows u64")))
 }
 
+fn x86_64_page_table_indices(virtual_address: u64) -> [u16; 4] {
+    [39, 30, 21, 12].map(|shift| ((virtual_address >> shift) & 0x1ff) as u16)
+}
+
+fn is_upper_canonical_four_level(address: u64) -> bool {
+    (address >> 48) == 0xffff && ((address >> 47) & 1) == 1
+}
+
 #[derive(Debug)]
 enum JsonValue {
     Null,
@@ -869,6 +1520,7 @@ impl JsonValue {
 struct JsonParser<'a> {
     bytes: &'a [u8],
     offset: usize,
+    values: usize,
 }
 
 impl<'a> JsonParser<'a> {
@@ -876,11 +1528,15 @@ impl<'a> JsonParser<'a> {
         Self {
             bytes: input.as_bytes(),
             offset: 0,
+            values: 0,
         }
     }
 
     fn parse(mut self) -> Result<JsonValue, Failure> {
-        let value = self.value()?;
+        if self.bytes.len() > MAX_METADATA_STDOUT_BYTES as usize {
+            return Err(self.error("metadata document exceeds the admitted output limit"));
+        }
+        let value = self.value(0)?;
         self.whitespace();
         if self.offset != self.bytes.len() {
             return Err(self.error("trailing data"));
@@ -888,11 +1544,24 @@ impl<'a> JsonParser<'a> {
         Ok(value)
     }
 
-    fn value(&mut self) -> Result<JsonValue, Failure> {
+    fn value(&mut self, depth: usize) -> Result<JsonValue, Failure> {
+        self.values = self
+            .values
+            .checked_add(1)
+            .ok_or_else(|| self.error("metadata JSON value count overflows"))?;
+        if self.values > MAX_METADATA_JSON_VALUES {
+            return Err(self.error("metadata JSON contains too many values"));
+        }
         self.whitespace();
         match self.peek() {
-            Some(b'{') => self.object(),
-            Some(b'[') => self.array(),
+            Some(b'{') => {
+                self.require_container_depth(depth)?;
+                self.object(depth + 1)
+            }
+            Some(b'[') => {
+                self.require_container_depth(depth)?;
+                self.array(depth + 1)
+            }
             Some(b'"') => self.string().map(JsonValue::String),
             Some(b't') => {
                 self.literal(b"true")?;
@@ -914,7 +1583,7 @@ impl<'a> JsonParser<'a> {
         }
     }
 
-    fn object(&mut self) -> Result<JsonValue, Failure> {
+    fn object(&mut self, depth: usize) -> Result<JsonValue, Failure> {
         self.expect(b'{')?;
         let mut values = BTreeMap::new();
         self.whitespace();
@@ -922,11 +1591,14 @@ impl<'a> JsonParser<'a> {
             return Ok(JsonValue::Object(values));
         }
         loop {
+            if values.len() >= MAX_METADATA_CONTAINER_ENTRIES {
+                return Err(self.error("metadata JSON object contains too many entries"));
+            }
             self.whitespace();
             let key = self.string()?;
             self.whitespace();
             self.expect(b':')?;
-            let value = self.value()?;
+            let value = self.value(depth)?;
             if values.insert(key, value).is_some() {
                 return Err(self.error("duplicate JSON object key"));
             }
@@ -939,7 +1611,7 @@ impl<'a> JsonParser<'a> {
         Ok(JsonValue::Object(values))
     }
 
-    fn array(&mut self) -> Result<JsonValue, Failure> {
+    fn array(&mut self, depth: usize) -> Result<JsonValue, Failure> {
         self.expect(b'[')?;
         let mut values = Vec::new();
         self.whitespace();
@@ -947,7 +1619,10 @@ impl<'a> JsonParser<'a> {
             return Ok(JsonValue::Array(values));
         }
         loop {
-            values.push(self.value()?);
+            if values.len() >= MAX_METADATA_CONTAINER_ENTRIES {
+                return Err(self.error("metadata JSON array contains too many entries"));
+            }
+            values.push(self.value(depth)?);
             self.whitespace();
             if self.consume(b']') {
                 break;
@@ -968,20 +1643,23 @@ impl<'a> JsonParser<'a> {
                         .take()
                         .ok_or_else(|| self.error("truncated JSON escape"))?;
                     match escaped {
-                        b'"' => output.push('"'),
-                        b'\\' => output.push('\\'),
-                        b'/' => output.push('/'),
-                        b'b' => output.push('\u{0008}'),
-                        b'f' => output.push('\u{000c}'),
-                        b'n' => output.push('\n'),
-                        b'r' => output.push('\r'),
-                        b't' => output.push('\t'),
-                        b'u' => output.push(self.unicode_escape()?),
+                        b'"' => self.push_string_character(&mut output, '"')?,
+                        b'\\' => self.push_string_character(&mut output, '\\')?,
+                        b'/' => self.push_string_character(&mut output, '/')?,
+                        b'b' => self.push_string_character(&mut output, '\u{0008}')?,
+                        b'f' => self.push_string_character(&mut output, '\u{000c}')?,
+                        b'n' => self.push_string_character(&mut output, '\n')?,
+                        b'r' => self.push_string_character(&mut output, '\r')?,
+                        b't' => self.push_string_character(&mut output, '\t')?,
+                        b'u' => {
+                            let character = self.unicode_escape()?;
+                            self.push_string_character(&mut output, character)?;
+                        }
                         _ => return Err(self.error("invalid JSON escape")),
                     }
                 }
                 0x00..=0x1f => return Err(self.error("control byte in JSON string")),
-                0x20..=0x7f => output.push(char::from(byte)),
+                0x20..=0x7f => self.push_string_character(&mut output, char::from(byte))?,
                 _ => {
                     let width = utf8_width(byte)
                         .ok_or_else(|| self.error("invalid UTF-8 in JSON string"))?;
@@ -992,12 +1670,45 @@ impl<'a> JsonParser<'a> {
                         .ok_or_else(|| self.error("truncated UTF-8 in JSON string"))?;
                     let value = std::str::from_utf8(&self.bytes[start..end])
                         .map_err(|_| self.error("invalid UTF-8 in JSON string"))?;
-                    output.push_str(value);
+                    self.push_string_text(&mut output, value)?;
                     self.offset = end;
                 }
             }
         }
         Err(self.error("unterminated JSON string"))
+    }
+
+    fn push_string_character(&self, output: &mut String, character: char) -> Result<(), Failure> {
+        let additional = character.len_utf8();
+        if output
+            .len()
+            .checked_add(additional)
+            .is_none_or(|length| length > MAX_METADATA_STRING_BYTES)
+        {
+            return Err(self.error("metadata JSON string exceeds the decoded length limit"));
+        }
+        output.push(character);
+        Ok(())
+    }
+
+    fn push_string_text(&self, output: &mut String, value: &str) -> Result<(), Failure> {
+        if output
+            .len()
+            .checked_add(value.len())
+            .is_none_or(|length| length > MAX_METADATA_STRING_BYTES)
+        {
+            return Err(self.error("metadata JSON string exceeds the decoded length limit"));
+        }
+        output.push_str(value);
+        Ok(())
+    }
+
+    fn require_container_depth(&self, depth: usize) -> Result<(), Failure> {
+        if depth >= MAX_METADATA_JSON_DEPTH {
+            Err(self.error("metadata JSON nesting exceeds the depth limit"))
+        } else {
+            Ok(())
+        }
     }
 
     fn unicode_escape(&mut self) -> Result<char, Failure> {
@@ -1125,9 +1836,11 @@ fn hex_digit(byte: u8) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DeepLayoutBuild, JsonParser, LayoutPolicy, locate_package, open_stable_regular_file,
-        validate_git_status, validate_metadata_manifest_path, validate_regular_path,
-        verify_open_file_identity, verify_tracked_bytes,
+        DeepLayoutBuild, JsonParser, LayoutPolicy, MAX_METADATA_CONTAINER_ENTRIES,
+        MAX_METADATA_JSON_DEPTH, MAX_METADATA_STRING_BYTES, bounded_command_output, locate_package,
+        open_stable_regular_file, read_pipe_bounded, validate_git_status,
+        validate_metadata_manifest_path, validate_regular_path, verify_open_file_identity,
+        verify_tracked_bytes, write_generated_policy, x86_64_page_table_indices,
     };
     use crate::sha256::bytes_digest;
     use std::path::Path;
@@ -1200,6 +1913,124 @@ mod tests {
     }
 
     #[test]
+    fn metadata_json_enforces_depth_cardinality_string_and_pipe_limits() {
+        let deeply_nested = format!(
+            "{}0{}",
+            "[".repeat(MAX_METADATA_JSON_DEPTH + 1),
+            "]".repeat(MAX_METADATA_JSON_DEPTH + 1)
+        );
+        assert!(JsonParser::new(&deeply_nested).parse().is_err());
+
+        let oversized_string = format!("\"{}\"", "a".repeat(MAX_METADATA_STRING_BYTES + 1));
+        assert!(JsonParser::new(&oversized_string).parse().is_err());
+
+        let excessive_array = format!(
+            "[{}]",
+            std::iter::repeat_n("0", MAX_METADATA_CONTAINER_ENTRIES + 1)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert!(JsonParser::new(&excessive_array).parse().is_err());
+
+        let maximum_container = format!(
+            "[{}]",
+            std::iter::repeat_n("0", MAX_METADATA_CONTAINER_ENTRIES)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let excessive_values = format!(
+            "[{maximum_container},{maximum_container},{maximum_container},{maximum_container}]"
+        );
+        assert!(JsonParser::new(&excessive_values).parse().is_err());
+
+        let bounded = read_pipe_bounded(std::io::Cursor::new(b"12345"), 4, "test pipe", None)
+            .expect("bounded pipe read failed");
+        assert!(bounded.exceeded);
+        assert_eq!(bounded.bytes, b"1234");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_command_terminates_an_over_limit_producer() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        let started = Instant::now();
+        let failure = bounded_command_output(
+            Command::new("sh").args(["-c", "while :; do printf 0123456789abcdef; done"]),
+            64,
+            64,
+            Duration::from_secs(5),
+            "over-limit fixture",
+        )
+        .expect_err("unbounded producer unexpectedly succeeded");
+        assert!(failure.message.contains("child was terminated"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_command_times_out_a_silent_process() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        let started = Instant::now();
+        let failure = bounded_command_output(
+            Command::new("sh").args(["-c", "exec sleep 30"]),
+            64,
+            64,
+            Duration::from_millis(50),
+            "silent fixture",
+        )
+        .expect_err("silent producer unexpectedly succeeded");
+        assert!(failure.message.contains("wall-clock deadline"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_status_capture_rejects_hostile_cardinality() {
+        use std::fs;
+        use std::process::Command;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock precedes Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "wyrmroot-git-status-bound-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).expect("create isolated Git fixture");
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["init", "-q"])
+                .status()
+                .expect("initialize Git fixture")
+                .success()
+        );
+        for index in 0..32 {
+            fs::write(
+                root.join(format!("hostile-untracked-entry-{index:04}.txt")),
+                b"x",
+            )
+            .expect("write hostile status fixture");
+        }
+        let failure = super::git_output_bounded(
+            &root,
+            ["status", "--porcelain=v1", "--untracked-files=all"],
+            64,
+            "hostile Git status fixture",
+        )
+        .expect_err("oversized Git status unexpectedly succeeded");
+        assert!(failure.message.contains("limit"));
+        fs::remove_dir_all(&root).expect("remove isolated Git fixture");
+    }
+
+    #[test]
     fn layout_validation_is_strict_and_generation_is_path_neutral() {
         let valid = layout("0xffff800000200000");
         let policy = LayoutPolicy::parse(&valid).expect("locked layout fixture rejected");
@@ -1211,9 +2042,38 @@ mod tests {
             generated
                 .contains("DEEPWYRM_EARLY_INTAKE_MAX_NORMALIZED_MEMORY_MAP_ENTRIES: u64 = 128")
         );
+        assert!(generated.contains(
+            "DEEPWYRM_TRANSITION_TABLES_TEMPORARY_VIRTUAL_ADDRESS: u64 = 0xffffff0000000000"
+        ));
+        assert!(
+            generated.contains("DEEPWYRM_TRANSITION_TABLES_MAXIMUM_TABLE_FRAME_COUNT: u64 = 256")
+        );
+        assert!(generated.contains(
+            "DEEPWYRM_TRANSITION_TABLES_PML4_INDEX: u16 = ((DEEPWYRM_TRANSITION_TABLES_TEMPORARY_VIRTUAL_ADDRESS >> 39) & 0x1ff) as u16"
+        ));
+        assert!(generated.contains("deepwyrm_transition_table_policy_is_self_consistent"));
+        assert!(
+            generated
+                .contains("deepwyrm_abi::DW_BOOT_X86_64_PAGING_HANDOFF_TEMPORARY_VIRTUAL_ADDRESS")
+        );
+        assert!(
+            generated.contains("deepwyrm_abi::DW_BOOT_X86_64_PAGING_HANDOFF_MAX_TABLE_FRAME_COUNT")
+        );
         assert!(!generated.contains("/synthetic/private/workspace"));
 
-        assert!(LayoutPolicy::parse(&valid.replace("version = 1", "version = 2")).is_err());
+        let alternate = layout_with_transition("0xffff800000200000", "0xfffffe8000000000", 384);
+        let alternate_generated = LayoutPolicy::parse(&alternate)
+            .expect("semantically valid alternate manifest values rejected")
+            .render_rust();
+        assert!(alternate_generated.contains(
+            "DEEPWYRM_TRANSITION_TABLES_TEMPORARY_VIRTUAL_ADDRESS: u64 = 0xfffffe8000000000"
+        ));
+        assert!(
+            alternate_generated
+                .contains("DEEPWYRM_TRANSITION_TABLES_MAXIMUM_TABLE_FRAME_COUNT: u64 = 384")
+        );
+
+        assert!(LayoutPolicy::parse(&valid.replace("version = 2", "version = 1")).is_err());
         assert!(
             LayoutPolicy::parse(&valid.replace(
                 "p_paddr_policy = \"ignored\"",
@@ -1234,6 +2094,77 @@ mod tests {
             .is_err()
         );
         assert!(LayoutPolicy::parse(&layout("0x0000000000200000")).is_err());
+        assert!(
+            LayoutPolicy::parse(&valid.replace("pml4_index = 510", "pml4_index = 509")).is_err()
+        );
+        assert!(
+            LayoutPolicy::parse(&valid.replace(
+                "maximum_table_frame_count = 256",
+                "maximum_table_frame_count = 3"
+            ))
+            .is_err()
+        );
+        assert!(
+            LayoutPolicy::parse(
+                &valid.replace("temporary_page_count = 1", "temporary_page_count = 0")
+            )
+            .is_err()
+        );
+        assert!(
+            LayoutPolicy::parse(&valid.replace(
+                "minimum_table_frame_count = 4",
+                "minimum_table_frame_count = 5"
+            ))
+            .is_err()
+        );
+        assert!(
+            LayoutPolicy::parse(&valid.replace(
+                "maximum_table_frame_count = 256",
+                "maximum_table_frame_count = 4294967296"
+            ))
+            .is_err()
+        );
+        assert!(
+            LayoutPolicy::parse(&valid.replace(
+                "contract = \"DW_BOOT_X86_64_PAGING_HANDOFF_V1\"",
+                "contract = \"loader-private\""
+            ))
+            .is_err()
+        );
+        assert!(
+            LayoutPolicy::parse(&valid.replace("layout_version = 2", "layout_version = \"2\""))
+                .is_err()
+        );
+        assert!(
+            LayoutPolicy::parse(
+                &valid.replace("referenced_ranges_mutable = false", "mutable = false")
+            )
+            .is_err()
+        );
+        assert!(
+            LayoutPolicy::parse(&layout_with_transition(
+                "0xffff800000200000",
+                "0xffff800000300000",
+                256,
+            ))
+            .is_err()
+        );
+        assert!(
+            LayoutPolicy::parse(&layout_with_transition(
+                "0xffff800000200000",
+                "0xffffff0000000001",
+                256,
+            ))
+            .is_err()
+        );
+        assert!(
+            LayoutPolicy::parse(&layout_with_transition(
+                "0xffff800000200000",
+                "0xfffffffffffff000",
+                256,
+            ))
+            .is_err()
+        );
     }
 
     #[cfg(unix)]
@@ -1275,23 +2206,162 @@ mod tests {
             "wyrmroot-layout-policy-test-{}-{nonce}",
             std::process::id()
         ));
+        let source_root = std::env::temp_dir().join(format!(
+            "wyrmroot-layout-source-test-{}-{nonce}",
+            std::process::id()
+        ));
         fs::create_dir(&root).expect("create isolated generated directory");
+        let layout_path = source_root.join(super::LAYOUT_PATH);
+        fs::create_dir_all(layout_path.parent().expect("layout parent"))
+            .expect("create source layout directory");
+        fs::write(&layout_path, b"trusted layout").expect("write trusted source layout");
+        for arguments in [
+            vec!["init", "-q"],
+            vec!["add", super::LAYOUT_PATH],
+            vec![
+                "-c",
+                "user.name=Wyrmroot test",
+                "-c",
+                "user.email=wyrmroot-test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "fixture",
+            ],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&source_root)
+                    .args(arguments)
+                    .status()
+                    .expect("run source fixture Git command")
+                    .success()
+            );
+        }
+        let expected_revision = super::git_output_bounded(
+            &source_root,
+            ["rev-parse", "HEAD"],
+            super::MAX_GIT_REVISION_STDOUT_BYTES,
+            "source fixture revision",
+        )
+        .expect("read source fixture revision")
+        .trim()
+        .to_owned();
         let path = root.join("policy.rs");
         fs::write(&path, b"trusted policy").expect("write generated fixture");
         let build = DeepLayoutBuild {
             policy_path: path.clone(),
-            layout_sha256: bytes_digest(b"layout"),
+            layout_sha256: bytes_digest(b"trusted layout"),
             policy_sha256: bytes_digest(b"trusted policy"),
+            source_root: source_root.clone(),
+            expected_revision: expected_revision.clone(),
         };
         build.verify_unchanged().expect("trusted policy rejected");
         fs::write(&path, b"changed policy").expect("replace policy contents");
         assert!(build.verify_unchanged().is_err());
-        fs::remove_file(&path).expect("remove changed policy");
+        fs::write(&path, b"trusted policy").expect("restore trusted policy");
+        build.verify_unchanged().expect("restored policy rejected");
+        fs::remove_file(&path).expect("remove trusted policy");
         let target = root.join("target.rs");
         fs::write(&target, b"trusted policy").expect("write symlink target");
         symlink(&target, &path).expect("swap policy for symlink");
         assert!(build.verify_unchanged().is_err());
+        fs::remove_file(&path).expect("remove policy symlink");
+        fs::write(&path, b"trusted policy").expect("restore policy after symlink");
+        build
+            .verify_unchanged()
+            .expect("policy restored after symlink rejected");
+
+        fs::write(&layout_path, b"changed layout").expect("change source layout");
+        assert!(build.verify_unchanged().is_err());
+        fs::write(&layout_path, b"trusted layout").expect("restore source layout");
+        build
+            .verify_unchanged()
+            .expect("restored source layout rejected");
+
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&source_root)
+                .args([
+                    "-c",
+                    "user.name=Wyrmroot test",
+                    "-c",
+                    "user.email=wyrmroot-test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    "move head",
+                ])
+                .status()
+                .expect("move source fixture HEAD")
+                .success()
+        );
+        assert!(build.verify_unchanged().is_err());
+
         fs::remove_dir_all(root).expect("remove isolated generated directory");
+        fs::remove_dir_all(source_root).expect("remove isolated source repository");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_policy_writer_rejects_symlink_ancestry_and_destination() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock precedes Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "wyrmroot-generated-write-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let outside = std::env::temp_dir().join(format!(
+            "wyrmroot-generated-outside-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).expect("create generated root");
+        fs::create_dir(&outside).expect("create outside root");
+        symlink(&outside, root.join("target")).expect("create generated ancestry symlink");
+        let path = root.join(super::GENERATED_POLICY_PATH);
+        assert!(write_generated_policy(&root, &path, "trusted").is_err());
+
+        fs::remove_file(root.join("target")).expect("remove ancestry symlink");
+        fs::create_dir_all(path.parent().expect("generated parent"))
+            .expect("create generated parent");
+        let outside_file = outside.join("outside.rs");
+        fs::write(&outside_file, b"outside").expect("write outside file");
+        symlink(&outside_file, &path).expect("create destination symlink");
+        assert!(write_generated_policy(&root, &path, "trusted").is_err());
+        assert_eq!(
+            fs::read(&outside_file).expect("read outside file"),
+            b"outside"
+        );
+        fs::remove_file(&path).expect("remove destination symlink");
+        write_generated_policy(&root, &path, "trusted").expect("write generated policy");
+        assert_eq!(fs::read(&path).expect("read generated policy"), b"trusted");
+        assert!(
+            fs::read_dir(path.parent().expect("generated parent"))
+                .expect("read generated directory")
+                .all(|entry| {
+                    !entry
+                        .expect("read generated entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .contains(".tmp-")
+                })
+        );
+
+        fs::remove_dir_all(&root).expect("remove generated root");
+        fs::remove_dir_all(&outside).expect("remove outside root");
     }
 
     #[test]
@@ -1399,9 +2469,25 @@ mod tests {
     }
 
     fn layout(link_base: &str) -> String {
+        layout_with_transition(link_base, "0xffffff0000000000", 256)
+    }
+
+    fn layout_with_transition(
+        link_base: &str,
+        temporary_virtual_address: &str,
+        maximum_table_frame_count: u64,
+    ) -> String {
+        let temporary = u64::from_str_radix(
+            temporary_virtual_address
+                .strip_prefix("0x")
+                .expect("fixture temporary address must be hexadecimal"),
+            16,
+        )
+        .expect("fixture temporary address must fit u64");
+        let [pml4_index, pdpt_index, pd_index, pt_index] = x86_64_page_table_indices(temporary);
         format!(
             r#"schema = "deepwyrm-x86_64-layout"
-version = 1
+version = 2
 entry_contract = "DW_BOOT_X86_64_ENTRY_V1"
 elf_type = "ET_EXEC"
 entry_symbol = "_dw_kernel_entry"
@@ -1455,7 +2541,7 @@ physical_allocation = "arbitrary-suitable-firmware-pages"
 boot_info = "identity-mapped"
 referenced_ranges = "identity-mapped"
 lifetime = "until-kernel-page-table-replacement"
-mutable = false
+referenced_ranges_mutable = false
 page_zero_mapped = false
 framebuffer_pixels_identity_mapped = false
 
@@ -1474,6 +2560,33 @@ acpi_rsdp_max_intersecting_pages = 2
 acpi_mapping_overlap = "coalesce"
 acpi_table_traversal = "deferred-dw0-c"
 acpi_memory_types_identity_mapped = false
+
+[transition_tables]
+contract = "DW_BOOT_X86_64_PAGING_HANDOFF_V1"
+layout_version = 2
+temporary_virtual_address = "{temporary_virtual_address}"
+temporary_page_count = 1
+pml4_index = {pml4_index}
+pdpt_index = {pdpt_index}
+pd_index = {pd_index}
+pt_index = {pt_index}
+minimum_table_frame_count = 4
+maximum_table_frame_count = {maximum_table_frame_count}
+initial_leaf = "exactly-zero-non-present"
+temporary_leaf_permissions = "supervisor-rw-nx-base-page"
+identity_alias_permissions = "supervisor-rw-nx-base-page"
+identity_alias_mutable_by_deepwyrm = true
+cache_selection_bits = 0
+pat_entry_zero = "observed-write-back"
+mtrr_policy = "alias-consistent-no-effective-write-back-claim"
+pcide_enabled = false
+pge_enabled = false
+cr3_low_bits_zero = true
+ownership_transfer = "loader-to-deepwyrm-after-exit-boot-services"
+lifetime = "until-deepwyrm-cr3-switch"
+concurrency = "bsp-aps-off-if-clear-nonreentrant"
+physical_role_policy = "exclusive-table-frames-no-kernel-module-data-alias"
+new_root_table_access = "deepwyrm-owned-before-cr3-switch"
 "#
         )
     }

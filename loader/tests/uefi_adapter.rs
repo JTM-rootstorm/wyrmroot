@@ -261,6 +261,13 @@ fn post_exit_ownership_surface_has_no_firmware_release_authority() {
         .unwrap();
     assert!(!post_exit_pages.contains("fn release"));
     assert!(!post_exit_pages.contains("boot::free_pages"));
+    assert!(source.contains("paging_handoff: PostExitPages"));
+    assert_eq!(
+        source
+            .matches("release_pages(&mut self.paging_handoff)")
+            .count(),
+        2
+    );
 
     let completion = source
         .split("impl ExitedHandoff")
@@ -272,6 +279,14 @@ fn post_exit_ownership_surface_has_no_firmware_release_authority() {
     assert!(!completion.contains("boot::"));
     assert!(!completion.contains("uefi::println"));
     assert!(completion.contains("jump_to_kernel_authorized"));
+    assert!(
+        completion.find("write_paging_handoff_carrier").unwrap()
+            < completion.find("prepare_x86_64_transfer").unwrap()
+    );
+    assert!(
+        completion.find("prepare_x86_64_transfer").unwrap()
+            < completion.find("jump_to_kernel_authorized").unwrap()
+    );
     assert!(
         completion.find("Com1Writer::initialize").unwrap()
             < completion.find("enable_and_verify_entry_state").unwrap()
@@ -321,10 +336,19 @@ fn retained_records_and_transition_mappings_share_exact_addresses() {
             physical_start: 0x5000,
             byte_len: 9,
         },
+        ModuleInput {
+            kind: deepwyrm_abi::DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1,
+            physical_start: 0x8000,
+            byte_len: 144,
+        },
     )
     .unwrap()
     .to_abi_modules();
-    let module_allocations = [retained(0x4000, 0x1000), retained(0x5000, 0x1000)];
+    let module_allocations = [
+        retained(0x4000, 0x1000),
+        retained(0x5000, 0x1000),
+        retained(0x8000, 0x1000),
+    ];
     let entropy = retained(0x6000, 0x1000);
     let rsdp = ValidatedRsdpMappingInput {
         retained_allocation: retained(0x7000, 0x1000),
@@ -337,6 +361,7 @@ fn retained_records_and_transition_mappings_share_exact_addresses() {
         mapping(MappingKind::ModuleTable, 0x3000, 0x1000),
         mapping(MappingKind::ModuleData { index: 0 }, 0x4000, 0x1000),
         mapping(MappingKind::ModuleData { index: 1 }, 0x5000, 0x1000),
+        mapping(MappingKind::ModuleData { index: 2 }, 0x8000, 0x1000),
         mapping(MappingKind::Entropy, 0x6000, 0x1000),
         mapping(MappingKind::RequiredAcpiRsdp, 0x7000, 0x1000),
     ];

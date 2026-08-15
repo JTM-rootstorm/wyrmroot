@@ -14,8 +14,9 @@ use deepwyrm_abi::{
     DW_BOOT_ENTROPY_SOURCE_UEFI_RNG_PROTOCOL, DW_BOOT_INFO_FLAG_FRAMEBUFFER_PRESENT,
     DW_BOOT_MEMORY_KIND_MMIO, DW_BOOT_MEMORY_KIND_RESERVED, DW_BOOT_MEMORY_KIND_USABLE,
     DW_BOOT_MEMORY_RANGE_V1_SIZE, DW_BOOT_MEMORY_RANGE_V1_VERSION,
-    DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS, DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP, DwBootInfoV1,
-    DwBootMemoryKind, DwBootMemoryRangeV1, DwBootModuleV1,
+    DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1, DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS,
+    DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP, DwBootInfoV1, DwBootMemoryKind, DwBootMemoryRangeV1,
+    DwBootModuleV1,
 };
 use modules::{ModuleInput, plan_modules};
 
@@ -52,7 +53,7 @@ fn memory_map() -> [DwBootMemoryRangeV1; 2] {
     ]
 }
 
-fn canonical_modules() -> [DwBootModuleV1; 2] {
+fn canonical_modules() -> [DwBootModuleV1; 3] {
     plan_modules(
         ModuleInput {
             kind: DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP,
@@ -63,6 +64,11 @@ fn canonical_modules() -> [DwBootModuleV1; 2] {
             kind: DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS,
             physical_start: 0x5000,
             byte_len: 0x1000,
+        },
+        ModuleInput {
+            kind: DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1,
+            physical_start: 0xa000,
+            byte_len: 144,
         },
     )
     .unwrap()
@@ -140,7 +146,7 @@ fn builds_canonical_boot_info_and_copies_the_retained_module_table() {
     let memory_map = memory_map();
     let modules = canonical_modules();
     let mut info = DwBootInfoV1::default();
-    let mut copied_modules = [DwBootModuleV1::default(); 2];
+    let mut copied_modules = [DwBootModuleV1::default(); 3];
 
     build(
         &input(&memory_map, &modules),
@@ -161,7 +167,7 @@ fn rejects_generated_policy_entry_limit_excesses_before_publication() {
     let memory_map = memory_map();
     let modules = canonical_modules();
     let mut info = DwBootInfoV1::default();
-    let mut copied_modules = [DwBootModuleV1::default(); 2];
+    let mut copied_modules = [DwBootModuleV1::default(); 3];
     assert_eq!(
         build_with_limits(
             &input(&memory_map, &modules),
@@ -208,7 +214,7 @@ fn maps_every_firmware_entropy_source() {
         let mut value = input(&memory_map, &modules);
         value.entropy.as_mut().unwrap().source = source;
         let mut info = DwBootInfoV1::default();
-        let mut copied_modules = [DwBootModuleV1::default(); 2];
+        let mut copied_modules = [DwBootModuleV1::default(); 3];
 
         build(&value, &mut output(&mut info, &mut copied_modules)).unwrap();
         assert_eq!(info.entropy.source, expected);
@@ -226,7 +232,7 @@ fn accepts_an_unaligned_gop_framebuffer_inside_mmio() {
     let mut value = input(&memory_map, &modules);
     value.framebuffer.as_mut().unwrap().physical_start = 0x21003;
     let mut info = DwBootInfoV1::default();
-    let mut copied_modules = [DwBootModuleV1::default(); 2];
+    let mut copied_modules = [DwBootModuleV1::default(); 3];
 
     build(&value, &mut output(&mut info, &mut copied_modules)).unwrap();
     assert_eq!(info.framebuffer.physical_start, 0x21003);
@@ -257,7 +263,7 @@ fn rejects_pre_exit_released_and_misaligned_loader_owned_storage() {
         value.phase = phase;
         value.module_table_storage.lifetime = lifetime;
         let mut info = DwBootInfoV1::default();
-        let mut copied_modules = [DwBootModuleV1::default(); 2];
+        let mut copied_modules = [DwBootModuleV1::default(); 3];
         assert_eq!(
             build(&value, &mut output(&mut info, &mut copied_modules)),
             Err(expected)
@@ -267,7 +273,7 @@ fn rejects_pre_exit_released_and_misaligned_loader_owned_storage() {
     let mut value = input(&memory_map, &modules);
     value.command_line.as_mut().unwrap().storage = retained(0x6001, 0x1000);
     let mut info = DwBootInfoV1::default();
-    let mut copied_modules = [DwBootModuleV1::default(); 2];
+    let mut copied_modules = [DwBootModuleV1::default(); 3];
     assert_eq!(
         build(&value, &mut output(&mut info, &mut copied_modules)),
         Err(BootInfoError::PhysicalAddressUnaligned)
@@ -280,7 +286,7 @@ fn rejects_unknown_map_module_and_reserved_field_errors() {
     let modules = canonical_modules();
     invalid_memory_map[0].kind = DwBootMemoryKind(u32::MAX);
     let mut info = DwBootInfoV1::default();
-    let mut copied_modules = [DwBootModuleV1::default(); 2];
+    let mut copied_modules = [DwBootModuleV1::default(); 3];
     assert_eq!(
         build(
             &input(&invalid_memory_map, &modules),
@@ -293,7 +299,7 @@ fn rejects_unknown_map_module_and_reserved_field_errors() {
     let mut duplicate = canonical_modules();
     duplicate[1].kind = DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP;
     let mut info = DwBootInfoV1::default();
-    let mut copied_modules = [DwBootModuleV1::default(); 2];
+    let mut copied_modules = [DwBootModuleV1::default(); 3];
     assert_eq!(
         build(
             &input(&baseline_memory_map, &duplicate),
@@ -304,7 +310,7 @@ fn rejects_unknown_map_module_and_reserved_field_errors() {
 
     let mut valid_map = memory_map();
     let mut info = DwBootInfoV1::default();
-    let mut copied_modules = [DwBootModuleV1::default(); 2];
+    let mut copied_modules = [DwBootModuleV1::default(); 3];
     build(
         &input(&valid_map, &modules),
         &mut output(&mut info, &mut copied_modules),
@@ -318,6 +324,60 @@ fn rejects_unknown_map_module_and_reserved_field_errors() {
 }
 
 #[test]
+fn requires_exactly_one_read_only_generated_paging_handoff_module() {
+    let memory_map = memory_map();
+    let modules = canonical_modules();
+
+    let mut info = DwBootInfoV1::default();
+    let mut copied_modules = [DwBootModuleV1::default(); 3];
+    assert_eq!(
+        build(
+            &input(&memory_map, &modules[..2]),
+            &mut output(&mut info, &mut copied_modules[..2]),
+        ),
+        Err(BootInfoError::MissingPagingHandoffModule)
+    );
+
+    let mut writable = modules;
+    writable[2].flags = deepwyrm_abi::DwBootModuleFlags(0);
+    let mut info = DwBootInfoV1::default();
+    let mut copied_modules = [DwBootModuleV1::default(); 3];
+    assert_eq!(
+        build(
+            &input(&memory_map, &writable),
+            &mut output(&mut info, &mut copied_modules),
+        ),
+        Err(BootInfoError::ModuleMustBeReadOnly)
+    );
+
+    for byte_len in [112_u64, 136, 145, 2161] {
+        let mut invalid_extent = modules;
+        invalid_extent[2].byte_len = byte_len;
+        let mut info = DwBootInfoV1::default();
+        let mut copied_modules = [DwBootModuleV1::default(); 3];
+        assert_eq!(
+            build(
+                &input(&memory_map, &invalid_extent),
+                &mut output(&mut info, &mut copied_modules),
+            ),
+            Err(BootInfoError::InvalidHeader)
+        );
+    }
+
+    let mut duplicate = [modules[0], modules[1], modules[2], modules[2]];
+    duplicate[3].physical_start = 0xb000;
+    let mut info = DwBootInfoV1::default();
+    let mut copied_modules = [DwBootModuleV1::default(); 4];
+    assert_eq!(
+        build(
+            &input(&memory_map, &duplicate),
+            &mut output(&mut info, &mut copied_modules),
+        ),
+        Err(BootInfoError::DuplicateModule)
+    );
+}
+
+#[test]
 fn rejects_optional_storage_overlap_and_module_allocation_slack() {
     let memory_map = memory_map();
     let mut modules = canonical_modules();
@@ -327,7 +387,7 @@ fn rejects_optional_storage_overlap_and_module_allocation_slack() {
         let mut value = input(&memory_map, &modules);
         value.acpi_rsdp.as_mut().unwrap().storage = retained(overlap, 0x1000);
         let mut info = DwBootInfoV1::default();
-        let mut copied_modules = [DwBootModuleV1::default(); 2];
+        let mut copied_modules = [DwBootModuleV1::default(); 3];
         assert_eq!(
             build(&value, &mut output(&mut info, &mut copied_modules)),
             Err(BootInfoError::HandoffStorageOverlap)
@@ -341,7 +401,7 @@ fn rejects_optional_storage_overlap_and_module_allocation_slack() {
             byte_len: 32,
         });
         let mut info = DwBootInfoV1::default();
-        let mut copied_modules = [DwBootModuleV1::default(); 2];
+        let mut copied_modules = [DwBootModuleV1::default(); 3];
         assert_eq!(
             build(&value, &mut output(&mut info, &mut copied_modules)),
             Err(BootInfoError::HandoffStorageOverlap)
@@ -351,7 +411,7 @@ fn rejects_optional_storage_overlap_and_module_allocation_slack() {
     let mut value = input(&memory_map, &modules);
     value.entropy.as_mut().unwrap().storage = retained(0x4000, 0x1000);
     let mut info = DwBootInfoV1::default();
-    let mut copied_modules = [DwBootModuleV1::default(); 2];
+    let mut copied_modules = [DwBootModuleV1::default(); 3];
     assert_eq!(
         build(&value, &mut output(&mut info, &mut copied_modules)),
         Err(BootInfoError::HandoffStorageOverlap)
@@ -365,7 +425,7 @@ fn rejects_malformed_acpi_storage_and_module_output_length_mismatch() {
     let mut value = input(&memory_map, &modules);
     value.acpi_rsdp.as_mut().unwrap().byte_len = 0x1001;
     let mut info = DwBootInfoV1::default();
-    let mut copied_modules = [DwBootModuleV1::default(); 2];
+    let mut copied_modules = [DwBootModuleV1::default(); 3];
     assert_eq!(
         build(&value, &mut output(&mut info, &mut copied_modules)),
         Err(BootInfoError::InvalidAcpiRsdp)
@@ -374,7 +434,7 @@ fn rejects_malformed_acpi_storage_and_module_output_length_mismatch() {
     let mut value = input(&memory_map, &modules);
     value.acpi_rsdp.as_mut().unwrap().storage = retained(0x11000, 0x1000);
     let mut info = DwBootInfoV1::default();
-    let mut copied_modules = [DwBootModuleV1::default(); 2];
+    let mut copied_modules = [DwBootModuleV1::default(); 3];
     assert_eq!(
         build(&value, &mut output(&mut info, &mut copied_modules)),
         Err(BootInfoError::HandoffStorageNotReserved)

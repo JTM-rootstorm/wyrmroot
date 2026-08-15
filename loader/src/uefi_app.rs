@@ -564,8 +564,11 @@ mod firmware {
 
     #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
     use deepwyrm_abi::{
-        DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS, DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP, DwBootInfoV1,
-        DwBootMemoryRangeV1, DwBootModuleV1,
+        DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1, DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS,
+        DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP, DW_BOOT_X86_64_PAGING_HANDOFF_MAX_BYTE_LEN,
+        DW_BOOT_X86_64_PAGING_HANDOFF_TABLE_FRAME_STRIDE,
+        DW_BOOT_X86_64_PAGING_HANDOFF_TABLE_FRAMES_OFFSET, DW_BOOT_X86_64_PAGING_HANDOFF_V1_SIZE,
+        DwBootInfoV1, DwBootMemoryRangeV1, DwBootModuleV1, DwBootX86_64PagingHandoffV1,
     };
     use uefi::boot::{
         self, AllocateType, MemoryType, MemoryType as UefiMemoryType, ScopedProtocol,
@@ -1222,6 +1225,7 @@ mod firmware {
         boot_info: Option<RetainedPages>,
         memory_map: Option<RetainedPages>,
         modules: Option<RetainedPages>,
+        paging_handoff: Option<RetainedPages>,
         transition_stack: Option<RetainedPages>,
         page_tables: Option<RetainedPages>,
     }
@@ -1235,6 +1239,7 @@ mod firmware {
                 boot_info: None,
                 memory_map: None,
                 modules: None,
+                paging_handoff: None,
                 transition_stack: None,
                 page_tables: None,
             }
@@ -1316,11 +1321,15 @@ mod firmware {
                 .map_err(|_| FirmwarePreparationError::InvalidGeneratedPolicy)?;
             let module_cap = usize::try_from(policy.max_module_entries)
                 .map_err(|_| FirmwarePreparationError::InvalidGeneratedPolicy)?;
-            super::bounded_intake_count(2, policy.max_module_entries)
+            super::bounded_intake_count(3, policy.max_module_entries)
                 .map_err(FirmwarePreparationError::Artifact)?;
             self.boot_info = Some(allocate_typed_table::<DwBootInfoV1>(1)?);
             self.memory_map = Some(allocate_typed_table::<DwBootMemoryRangeV1>(map_cap)?);
             self.modules = Some(allocate_typed_table::<DwBootModuleV1>(module_cap)?);
+            self.paging_handoff = Some(RetainedPages::allocate_zeroed_pages(
+                pages_for_payload(DW_BOOT_X86_64_PAGING_HANDOFF_MAX_BYTE_LEN as usize)
+                    .map_err(FirmwarePreparationError::Artifact)?,
+            )?);
             let stack_pages = usize::try_from(policy.transition_stack_size / policy.base_page_size)
                 .map_err(|_| FirmwarePreparationError::InvalidPreExitAllocation)?;
             self.transition_stack = Some(RetainedPages::allocate_zeroed_pages(stack_pages)?);
@@ -1332,6 +1341,10 @@ mod firmware {
             let module_ranges = [
                 original.bootstrap.retained_physical_range()?,
                 original.bootfs.retained_physical_range()?,
+                self.paging_handoff
+                    .as_ref()
+                    .ok_or(FirmwarePreparationError::InvalidPreExitAllocation)?
+                    .retained_physical_range()?,
             ];
             let validated_rsdp = original
                 .acpi_rsdp
@@ -1362,7 +1375,7 @@ mod firmware {
                 lifetime: AllocationLifetime::RetainedUntilKernelPageTableReplacement,
             };
             let mapping_capacity = capacity
-                .checked_add(9)
+                .checked_add(10)
                 .ok_or(FirmwarePreparationError::InvalidPreExitAllocation)?;
             let mut mapping_output = fallible_mappings(mapping_capacity)?;
             let mut materialization_output = fallible_materializations(capacity)?;
@@ -1396,7 +1409,7 @@ mod firmware {
             };
             self.page_tables = Some(RetainedPages::allocate_zeroed_pages(page_count)?);
 
-            let materializations = {
+            let (materializations, paging_handoff_byte_len) = {
                 let identity = identity_inputs(
                     &self,
                     &module_ranges,
@@ -1426,7 +1439,18 @@ mod firmware {
                     .retained_physical_range()?;
                 let finalized = transition::finalize_transition(preflight, page_table_range)
                     .map_err(|_| FirmwarePreparationError::InvalidPreExitAllocation)?;
-                copy_materializations(finalized.pre_exit().kernel_materializations)?
+                let frame_bytes = finalized
+                    .used_page_table_page_count()
+                    .checked_mul(u64::from(DW_BOOT_X86_64_PAGING_HANDOFF_TABLE_FRAME_STRIDE))
+                    .ok_or(FirmwarePreparationError::InvalidPreExitAllocation)?;
+                let carrier_byte_len = u64::from(DW_BOOT_X86_64_PAGING_HANDOFF_TABLE_FRAMES_OFFSET)
+                    .checked_add(frame_bytes)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or(FirmwarePreparationError::InvalidPreExitAllocation)?;
+                (
+                    copy_materializations(finalized.pre_exit().kernel_materializations)?,
+                    carrier_byte_len,
+                )
             };
 
             {
@@ -1475,6 +1499,7 @@ mod firmware {
                 boot_info: self.boot_info.take(),
                 memory_map: self.memory_map.take(),
                 modules: self.modules.take(),
+                paging_handoff: self.paging_handoff.take(),
                 transition_stack: self.transition_stack.take(),
                 page_tables: self.page_tables.take(),
                 kernel_segments,
@@ -1488,6 +1513,7 @@ mod firmware {
                 handoff_stub_entry,
                 kernel_entry,
                 kernel_image_byte_len,
+                paging_handoff_byte_len,
             })
         }
     }
@@ -1498,6 +1524,7 @@ mod firmware {
             release_pages(&mut self.page_tables);
             release_pages(&mut self.transition_stack);
             release_pages(&mut self.modules);
+            release_pages(&mut self.paging_handoff);
             release_pages(&mut self.memory_map);
             release_pages(&mut self.boot_info);
             release_pages(&mut self.kernel_pages);
@@ -1514,12 +1541,13 @@ mod firmware {
         boot_info: Option<RetainedPages>,
         memory_map: Option<RetainedPages>,
         modules: Option<RetainedPages>,
+        paging_handoff: Option<RetainedPages>,
         transition_stack: Option<RetainedPages>,
         page_tables: Option<RetainedPages>,
         kernel_segments: Vec<KernelSegmentPages>,
         mapping_output: Vec<TransitionMapping>,
         materialization_output: Vec<KernelMaterialization>,
-        module_ranges: [RetainedPhysicalRange; 2],
+        module_ranges: [RetainedPhysicalRange; 3],
         validated_rsdp: Option<ValidatedRsdpMappingInput>,
         entropy_range: Option<RetainedPhysicalRange>,
         framebuffer_pixels: Option<PhysicalRange>,
@@ -1527,6 +1555,7 @@ mod firmware {
         handoff_stub_entry: u64,
         kernel_entry: u64,
         kernel_image_byte_len: u64,
+        paging_handoff_byte_len: usize,
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
@@ -1537,6 +1566,10 @@ mod firmware {
             let boot_info = self.boot_info.take().expect("prepared BootInfo pages");
             let memory_map_pages = self.memory_map.take().expect("prepared memory-map pages");
             let modules = self.modules.take().expect("prepared module pages");
+            let paging_handoff = self
+                .paging_handoff
+                .take()
+                .expect("prepared paging-handoff carrier pages");
             let transition_stack = self.transition_stack.take().expect("prepared stack pages");
             let page_tables = self.page_tables.take().expect("prepared page-table pages");
             let kernel_segments = core::mem::take(&mut self.kernel_segments);
@@ -1553,6 +1586,7 @@ mod firmware {
                 boot_info: boot_info.into_post_exit(),
                 memory_map_pages: memory_map_pages.into_post_exit(),
                 modules: modules.into_post_exit(),
+                paging_handoff: paging_handoff.into_post_exit(),
                 transition_stack: transition_stack.into_post_exit(),
                 page_tables: page_tables.into_post_exit(),
                 memory_map,
@@ -1567,6 +1601,7 @@ mod firmware {
                 handoff_stub_entry: self.handoff_stub_entry,
                 kernel_entry: self.kernel_entry,
                 kernel_image_byte_len: self.kernel_image_byte_len,
+                paging_handoff_byte_len: self.paging_handoff_byte_len,
             }
         }
     }
@@ -1577,6 +1612,7 @@ mod firmware {
             release_pages(&mut self.page_tables);
             release_pages(&mut self.transition_stack);
             release_pages(&mut self.modules);
+            release_pages(&mut self.paging_handoff);
             release_pages(&mut self.memory_map);
             release_pages(&mut self.boot_info);
             release_pages(&mut self.kernel_pages);
@@ -1593,13 +1629,14 @@ mod firmware {
         boot_info: PostExitPages,
         memory_map_pages: PostExitPages,
         modules: PostExitPages,
+        paging_handoff: PostExitPages,
         transition_stack: PostExitPages,
         page_tables: PostExitPages,
         memory_map: uefi::mem::memory_map::MemoryMapOwned,
         kernel_segments: Vec<KernelSegmentPages>,
         mapping_output: Vec<TransitionMapping>,
         materialization_output: Vec<KernelMaterialization>,
-        module_ranges: [RetainedPhysicalRange; 2],
+        module_ranges: [RetainedPhysicalRange; 3],
         validated_rsdp: Option<ValidatedRsdpMappingInput>,
         entropy_range: Option<RetainedPhysicalRange>,
         framebuffer_pixels: Option<PhysicalRange>,
@@ -1607,6 +1644,7 @@ mod firmware {
         handoff_stub_entry: u64,
         kernel_entry: u64,
         kernel_image_byte_len: u64,
+        paging_handoff_byte_len: usize,
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
@@ -1618,6 +1656,7 @@ mod firmware {
                 mut boot_info,
                 mut memory_map_pages,
                 mut modules,
+                mut paging_handoff,
                 transition_stack,
                 mut page_tables,
                 memory_map,
@@ -1632,6 +1671,7 @@ mod firmware {
                 handoff_stub_entry,
                 kernel_entry,
                 kernel_image_byte_len,
+                paging_handoff_byte_len,
             } = self;
 
             let kernel_allocation = match kernel_pages.retained_physical_range() {
@@ -1675,6 +1715,14 @@ mod firmware {
                     kind: DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS,
                     physical_start: inputs.bootfs.physical_start(),
                     byte_len: match u64::try_from(inputs.bootfs.payload_byte_len) {
+                        Ok(value) => value,
+                        Err(_) => post_exit_halt(),
+                    },
+                },
+                ModuleInput {
+                    kind: DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1,
+                    physical_start: paging_handoff.physical_start(),
+                    byte_len: match u64::try_from(paging_handoff_byte_len) {
                         Ok(value) => value,
                         Err(_) => post_exit_halt(),
                     },
@@ -1916,9 +1964,16 @@ mod firmware {
             };
             let page_table_result = (|| {
                 transition::populate_page_table(&plan, post_exit, &mut table).map_err(|_| ())?;
-                table.finish().map_err(|_| ())
+                let attestation = table.attest(&plan).map_err(|_| ())?;
+                let encoded_len = paging_handoff
+                    .write_paging_handoff_carrier(&attestation)
+                    .map_err(|_| ())?;
+                if encoded_len != paging_handoff_byte_len {
+                    return Err(());
+                }
+                Ok(attestation)
             })();
-            let (page_table_root, page_table_accepted) =
+            let (page_table_attestation, page_table_accepted) =
                 match super::accept_page_table(page_table_result) {
                     Ok(value) => value,
                     Err(error) => super::dispatch_post_exit_failure(error, |_| post_exit_halt()),
@@ -1944,7 +1999,7 @@ mod firmware {
                     Err(_) => post_exit_halt(),
                 };
             let (transfer, transfer_accepted) = match super::accept_transfer(
-                crate::handoff_x86_64::prepare_x86_64_transfer(&plan, page_table_root, entry_state),
+                crate::handoff_x86_64::prepare_x86_64_transfer(page_table_attestation, entry_state),
             ) {
                 Ok(value) => value,
                 Err(error) => super::dispatch_post_exit_failure(error, |_| post_exit_halt()),
@@ -2067,6 +2122,59 @@ mod firmware {
             })
         }
 
+        fn write_paging_handoff_carrier(
+            &mut self,
+            attestation: &crate::uefi_page_table::PageTableAttestation<'_, '_, '_>,
+        ) -> Result<usize, FirmwarePreparationError> {
+            if size_of::<DwBootX86_64PagingHandoffV1>()
+                != DW_BOOT_X86_64_PAGING_HANDOFF_V1_SIZE as usize
+                || DW_BOOT_X86_64_PAGING_HANDOFF_TABLE_FRAMES_OFFSET as usize
+                    != size_of::<DwBootX86_64PagingHandoffV1>()
+            {
+                return Err(FirmwarePreparationError::TypedViewInvalid);
+            }
+            let total = usize::try_from(
+                attestation
+                    .carrier_byte_len()
+                    .map_err(|_| FirmwarePreparationError::TypedViewInvalid)?,
+            )
+            .map_err(|_| FirmwarePreparationError::TypedViewInvalid)?;
+            if total > self.allocation_byte_len
+                || (self.ptr.as_ptr() as usize) % align_of::<DwBootX86_64PagingHandoffV1>() != 0
+            {
+                return Err(FirmwarePreparationError::TypedViewInvalid);
+            }
+            let frame_count = usize::try_from(attestation.used_page_count())
+                .map_err(|_| FirmwarePreparationError::TypedViewInvalid)?;
+            let frame_offset = DW_BOOT_X86_64_PAGING_HANDOFF_TABLE_FRAMES_OFFSET as usize;
+            let frame_bytes = frame_count
+                .checked_mul(size_of::<u64>())
+                .ok_or(FirmwarePreparationError::TypedViewInvalid)?;
+            if frame_offset.checked_add(frame_bytes) != Some(total) {
+                return Err(FirmwarePreparationError::TypedViewInvalid);
+            }
+            // SAFETY: the carrier allocation is uniquely owned after EBS. The
+            // generated header and frame-list extents were checked to be
+            // aligned, disjoint, and wholly inside that allocation.
+            let (header, frames) = unsafe {
+                (
+                    &mut *self.ptr.as_ptr().cast::<DwBootX86_64PagingHandoffV1>(),
+                    core::slice::from_raw_parts_mut(
+                        self.ptr.as_ptr().add(frame_offset).cast::<u64>(),
+                        frame_count,
+                    ),
+                )
+            };
+            let written = attestation
+                .write_carrier(header, frames)
+                .map_err(|_| FirmwarePreparationError::TypedViewInvalid)?;
+            if usize::try_from(written).ok() != Some(total) {
+                return Err(FirmwarePreparationError::TypedViewInvalid);
+            }
+            self.payload_byte_len = total;
+            Ok(total)
+        }
+
         unsafe fn typed_slice_mut<T>(
             &mut self,
             count: usize,
@@ -2125,7 +2233,7 @@ mod firmware {
     #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
     unsafe fn jump_to_kernel_authorized(
         _authorization: super::JumpAuthorization,
-        transfer: crate::handoff_x86_64::X86_64Transfer,
+        transfer: crate::handoff_x86_64::X86_64Transfer<'_, '_, '_>,
     ) -> ! {
         // SAFETY: authorization is constructed only after the final-map,
         // BootInfo, page-table, serial, and transfer gates all succeed.

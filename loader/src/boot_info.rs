@@ -20,9 +20,13 @@ use deepwyrm_abi::{
     DW_BOOT_MEMORY_KIND_RESERVED, DW_BOOT_MEMORY_KIND_RUNTIME_SERVICES,
     DW_BOOT_MEMORY_KIND_UNUSABLE, DW_BOOT_MEMORY_KIND_USABLE, DW_BOOT_MEMORY_RANGE_V1_SIZE,
     DW_BOOT_MEMORY_RANGE_V1_VERSION, DW_BOOT_MODULE_FLAG_READ_ONLY,
-    DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS, DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP,
-    DW_BOOT_MODULE_V1_SIZE, DW_BOOT_MODULE_V1_VERSION, DW_BOOT_PIXEL_FORMAT_BGRX8,
-    DW_BOOT_PIXEL_FORMAT_BITMASK, DW_BOOT_PIXEL_FORMAT_RGBX8, DwBootEntropyFlags, DwBootEntropyV1,
+    DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1, DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS,
+    DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP, DW_BOOT_MODULE_V1_SIZE, DW_BOOT_MODULE_V1_VERSION,
+    DW_BOOT_PIXEL_FORMAT_BGRX8, DW_BOOT_PIXEL_FORMAT_BITMASK, DW_BOOT_PIXEL_FORMAT_RGBX8,
+    DW_BOOT_X86_64_PAGING_HANDOFF_MAX_BYTE_LEN,
+    DW_BOOT_X86_64_PAGING_HANDOFF_MIN_TABLE_FRAME_COUNT,
+    DW_BOOT_X86_64_PAGING_HANDOFF_TABLE_FRAME_STRIDE,
+    DW_BOOT_X86_64_PAGING_HANDOFF_TABLE_FRAMES_OFFSET, DwBootEntropyFlags, DwBootEntropyV1,
     DwBootFramebufferV1, DwBootInfoFlags, DwBootInfoV1, DwBootMemoryKind, DwBootMemoryRangeV1,
     DwBootModuleV1,
 };
@@ -183,6 +187,7 @@ pub enum BootInfoError {
     HandoffStorageOverlap,
     MissingBootstrapModule,
     MissingBootfsModule,
+    MissingPagingHandoffModule,
     DuplicateModule,
     ModuleMustBeReadOnly,
     UnsupportedModuleFlags,
@@ -653,6 +658,7 @@ fn validate_memory_map(memory_map: &[DwBootMemoryRangeV1]) -> Result<(), BootInf
 fn validate_modules(modules: &[DwBootModuleV1]) -> Result<(), BootInfoError> {
     let mut bootstrap_seen = false;
     let mut bootfs_seen = false;
+    let mut paging_handoff_seen = false;
     for (index, module) in modules.iter().enumerate() {
         if module.size != DW_BOOT_MODULE_V1_SIZE || module.version != DW_BOOT_MODULE_V1_VERSION {
             return Err(BootInfoError::InvalidHeader);
@@ -677,6 +683,24 @@ fn validate_modules(modules: &[DwBootModuleV1]) -> Result<(), BootInfoError> {
                 return Err(BootInfoError::ModuleMustBeReadOnly);
             }
             bootfs_seen = true;
+        } else if module.kind == DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1 {
+            if paging_handoff_seen {
+                return Err(BootInfoError::DuplicateModule);
+            }
+            if module.flags != DW_BOOT_MODULE_FLAG_READ_ONLY {
+                return Err(BootInfoError::ModuleMustBeReadOnly);
+            }
+            let offset = u64::from(DW_BOOT_X86_64_PAGING_HANDOFF_TABLE_FRAMES_OFFSET);
+            let stride = u64::from(DW_BOOT_X86_64_PAGING_HANDOFF_TABLE_FRAME_STRIDE);
+            let minimum =
+                offset + u64::from(DW_BOOT_X86_64_PAGING_HANDOFF_MIN_TABLE_FRAME_COUNT) * stride;
+            if !(minimum..=u64::from(DW_BOOT_X86_64_PAGING_HANDOFF_MAX_BYTE_LEN))
+                .contains(&module.byte_len)
+                || !(module.byte_len - offset).is_multiple_of(stride)
+            {
+                return Err(BootInfoError::InvalidHeader);
+            }
+            paging_handoff_seen = true;
         } else {
             return Err(BootInfoError::InvalidHeader);
         }
@@ -696,6 +720,9 @@ fn validate_modules(modules: &[DwBootModuleV1]) -> Result<(), BootInfoError> {
     }
     if !bootfs_seen {
         return Err(BootInfoError::MissingBootfsModule);
+    }
+    if !paging_handoff_seen {
+        return Err(BootInfoError::MissingPagingHandoffModule);
     }
     Ok(())
 }

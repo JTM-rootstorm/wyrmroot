@@ -7,6 +7,13 @@
 //! the current handoff stub, and a dedicated transition stack. Framebuffer pixels are never added.
 
 use crate::kernel_elf::{KernelLoadSegment, SegmentPermissions};
+use deepwyrm_abi::{
+    DW_BOOT_X86_64_PAGING_HANDOFF_MAX_TABLE_FRAME_COUNT,
+    DW_BOOT_X86_64_PAGING_HANDOFF_MIN_TABLE_FRAME_COUNT, DW_BOOT_X86_64_PAGING_HANDOFF_PD_INDEX,
+    DW_BOOT_X86_64_PAGING_HANDOFF_PDPT_INDEX, DW_BOOT_X86_64_PAGING_HANDOFF_PML4_INDEX,
+    DW_BOOT_X86_64_PAGING_HANDOFF_PT_INDEX,
+    DW_BOOT_X86_64_PAGING_HANDOFF_TEMPORARY_VIRTUAL_ADDRESS,
+};
 
 /// How long a physical allocation remains owned and valid.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -102,16 +109,22 @@ pub struct PhysicalRange {
 /// Why a transition mapping exists. No catch-all mapping kind is intentionally provided.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MappingKind {
-    KernelSegment { program_header_index: u16 },
+    KernelSegment {
+        program_header_index: u16,
+    },
     BootInfo,
     MemoryMapTable,
     ModuleTable,
-    ModuleData { index: usize },
+    ModuleData {
+        index: usize,
+    },
     CommandLine,
     Entropy,
     RequiredAcpiRsdp,
     HandoffStub,
     TransitionStack,
+    /// Writable/NX identity alias over exactly the used transition-table prefix.
+    TransitionTableIdentity,
 }
 
 /// x86_64 supervisor-page permissions. Reads are implicit on present x86_64 pages.
@@ -131,6 +144,13 @@ pub struct TransitionMapping {
     pub byte_len: u64,
     pub permissions: MappingPermissions,
     pub lifetime: AllocationLifetime,
+}
+
+/// Generated empty-leaf reservation used by Deepwyrm's temporary table mapper.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TemporaryMappingReservation {
+    pub virtual_address: u64,
+    pub indices: [u16; 4],
 }
 
 /// Pre-`ExitBootServices` work required to materialize one kernel segment.
@@ -154,6 +174,8 @@ pub struct PreExitPlan<'a> {
     pub kernel_image_byte_len: u64,
     pub page_table_storage: RetainedPhysicalRange,
     pub page_table_page_count: u64,
+    /// Exact prefix of the capacity allocation that must become reachable tables.
+    pub used_page_table_page_count: u64,
     pub transition_stack: RetainedPhysicalRange,
     pub boot_info_storage: RetainedPhysicalRange,
     pub handoff_stub: RetainedPhysicalRange,
@@ -170,7 +192,8 @@ pub struct TransitionPreflightPlan<'a> {
     kernel_materializations: &'a [KernelMaterialization],
     policy: TransitionPolicy,
     kernel_image_byte_len: u64,
-    page_table_page_count: u64,
+    minimum_page_table_page_count: u64,
+    page_table_capacity_page_count: u64,
     transition_stack: RetainedPhysicalRange,
     boot_info_storage: RetainedPhysicalRange,
     handoff_stub: RetainedPhysicalRange,
@@ -183,8 +206,14 @@ pub struct TransitionPreflightPlan<'a> {
 }
 
 impl<'a> TransitionPreflightPlan<'a> {
+    /// Generated maximum allocation capacity. The exact used prefix depends on
+    /// the physical base returned by firmware and is fixed during finalization.
     pub fn page_table_page_count(&self) -> u64 {
-        self.page_table_page_count
+        self.page_table_capacity_page_count
+    }
+
+    pub fn minimum_page_table_page_count(&self) -> u64 {
+        self.minimum_page_table_page_count
     }
 
     pub fn mappings(&self) -> &'a [TransitionMapping] {
@@ -201,6 +230,8 @@ impl<'a> TransitionPreflightPlan<'a> {
 pub struct TransitionPlan<'a> {
     pre_exit: PreExitPlan<'a>,
     mappings: &'a [TransitionMapping],
+    table_identity_mapping: TransitionMapping,
+    temporary_mapping: TemporaryMappingReservation,
     mapping_granule: u64,
     kernel_entry: u64,
     boot_info_identity_pointer: u64,
@@ -217,6 +248,18 @@ impl<'a> TransitionPlan<'a> {
 
     pub fn mappings(&self) -> &'a [TransitionMapping] {
         self.mappings
+    }
+
+    pub fn table_identity_mapping(&self) -> TransitionMapping {
+        self.table_identity_mapping
+    }
+
+    pub fn temporary_mapping(&self) -> TemporaryMappingReservation {
+        self.temporary_mapping
+    }
+
+    pub fn used_page_table_page_count(&self) -> u64 {
+        self.pre_exit.used_page_table_page_count
     }
 
     pub fn mapping_granule(&self) -> u64 {
@@ -318,6 +361,15 @@ pub enum TransitionError {
         with: MappingKind,
     },
     FramebufferPixelsWouldBackPageTables,
+    TemporaryMappingConflict {
+        with: MappingKind,
+    },
+    PageTableFixedPointCapacityExceeded {
+        required_pages: u64,
+        maximum_pages: u64,
+    },
+    PageTableFixedPointRegressed,
+    PageTableFixedPointDidNotConverge,
 }
 
 /// Compatibility wrapper that preflights, sizes, and finalizes a transition in one call.
@@ -485,7 +537,16 @@ pub fn preflight_transition<'plan>(
             .then(mapping_kind_order(left.kind).cmp(&mapping_kind_order(right.kind)))
     });
     validate_mapping_set(mappings, input.identity.framebuffer_pixels, input.policy)?;
-    let page_table_page_count = required_page_table_pages(mappings, input.policy)?;
+    reject_temporary_mapping_collision(mappings)?;
+    let minimum_page_table_page_count = required_page_table_pages(mappings, None, input.policy)?;
+    let page_table_capacity_page_count =
+        u64::from(DW_BOOT_X86_64_PAGING_HANDOFF_MAX_TABLE_FRAME_COUNT);
+    if minimum_page_table_page_count > page_table_capacity_page_count {
+        return Err(TransitionError::PageTableFixedPointCapacityExceeded {
+            required_pages: minimum_page_table_page_count,
+            maximum_pages: page_table_capacity_page_count,
+        });
+    }
     if !input.kernel_segments.iter().any(|kernel| {
         let segment = kernel.segment;
         let Some(end) = segment.virtual_address.checked_add(segment.memory_size) else {
@@ -523,7 +584,8 @@ pub fn preflight_transition<'plan>(
         kernel_materializations: &materialization_output[..input.kernel_segments.len()],
         policy: input.policy,
         kernel_image_byte_len: input.kernel_image_byte_len,
-        page_table_page_count,
+        minimum_page_table_page_count,
+        page_table_capacity_page_count,
         transition_stack: input.identity.transition_stack,
         boot_info_storage: input.identity.boot_info,
         handoff_stub: input.identity.handoff_stub,
@@ -546,12 +608,12 @@ pub fn finalize_transition<'plan>(
 ) -> Result<TransitionPlan<'plan>, TransitionError> {
     validate_page_table_storage(page_table_storage, preflight.policy)?;
     let required_page_table_bytes = preflight
-        .page_table_page_count
+        .page_table_capacity_page_count
         .checked_mul(preflight.policy.mapping_granule)
         .ok_or(TransitionError::PageTableCountOverflow)?;
     if page_table_storage.byte_len != required_page_table_bytes {
         return Err(TransitionError::PageTableStorageLengthMismatch {
-            required_pages: preflight.page_table_page_count,
+            required_pages: preflight.page_table_capacity_page_count,
             provided_pages: page_table_storage.byte_len / preflight.policy.mapping_granule,
         });
     }
@@ -562,17 +624,68 @@ pub fn finalize_transition<'plan>(
         preflight.policy,
     )?;
 
+    let maximum_pages = preflight.page_table_capacity_page_count;
+    let mut used_pages = preflight.minimum_page_table_page_count;
+    let mut iterations = 0_u64;
+    loop {
+        iterations = iterations
+            .checked_add(1)
+            .ok_or(TransitionError::PageTableFixedPointDidNotConverge)?;
+        if iterations > maximum_pages {
+            return Err(TransitionError::PageTableFixedPointDidNotConverge);
+        }
+        if used_pages > maximum_pages {
+            return Err(TransitionError::PageTableFixedPointCapacityExceeded {
+                required_pages: used_pages,
+                maximum_pages,
+            });
+        }
+        let identity_byte_len = used_pages
+            .checked_mul(preflight.policy.mapping_granule)
+            .ok_or(TransitionError::PageTableCountOverflow)?;
+        let next = required_page_table_pages(
+            preflight.mappings,
+            Some((page_table_storage.physical_start, identity_byte_len)),
+            preflight.policy,
+        )?;
+        if next == used_pages {
+            break;
+        }
+        if next < used_pages {
+            return Err(TransitionError::PageTableFixedPointRegressed);
+        }
+        used_pages = next;
+    }
+    let identity_byte_len = used_pages
+        .checked_mul(preflight.policy.mapping_granule)
+        .ok_or(TransitionError::PageTableCountOverflow)?;
+    let table_identity_mapping = TransitionMapping {
+        kind: MappingKind::TransitionTableIdentity,
+        physical_start: page_table_storage.physical_start,
+        virtual_start: page_table_storage.physical_start,
+        byte_len: identity_byte_len,
+        permissions: MappingPermissions {
+            writable: true,
+            executable: false,
+        },
+        lifetime: AllocationLifetime::RetainedUntilKernelPageTableReplacement,
+    };
+    validate_table_identity_mapping(table_identity_mapping, preflight.mappings, preflight.policy)?;
+
     Ok(TransitionPlan {
         pre_exit: PreExitPlan {
             kernel_materializations: preflight.kernel_materializations,
             kernel_image_byte_len: preflight.kernel_image_byte_len,
             page_table_storage,
-            page_table_page_count: preflight.page_table_page_count,
+            page_table_page_count: preflight.page_table_capacity_page_count,
+            used_page_table_page_count: used_pages,
             transition_stack: preflight.transition_stack,
             boot_info_storage: preflight.boot_info_storage,
             handoff_stub: preflight.handoff_stub,
         },
         mappings: preflight.mappings,
+        table_identity_mapping,
+        temporary_mapping: generated_temporary_mapping(),
         mapping_granule: preflight.policy.mapping_granule,
         kernel_entry: preflight.kernel_entry,
         boot_info_identity_pointer: preflight.boot_info_identity_pointer,
@@ -610,10 +723,37 @@ fn validate_policy(policy: TransitionPolicy) -> Result<(), TransitionError> {
         || policy.transition_stack_alignment < policy.mapping_granule
         || !policy.stack_pointer_alignment.is_power_of_two()
         || !policy.boot_info_alignment.is_power_of_two()
+        || DW_BOOT_X86_64_PAGING_HANDOFF_MIN_TABLE_FRAME_COUNT as usize
+            != generated_temporary_mapping().indices.len()
+        || DW_BOOT_X86_64_PAGING_HANDOFF_MIN_TABLE_FRAME_COUNT
+            > DW_BOOT_X86_64_PAGING_HANDOFF_MAX_TABLE_FRAME_COUNT
+        || generated_temporary_mapping().indices != indices_for_generated_temporary_mapping()
     {
         return Err(TransitionError::InvalidPolicy);
     }
     Ok(())
+}
+
+const fn generated_temporary_mapping() -> TemporaryMappingReservation {
+    TemporaryMappingReservation {
+        virtual_address: DW_BOOT_X86_64_PAGING_HANDOFF_TEMPORARY_VIRTUAL_ADDRESS,
+        indices: [
+            DW_BOOT_X86_64_PAGING_HANDOFF_PML4_INDEX,
+            DW_BOOT_X86_64_PAGING_HANDOFF_PDPT_INDEX,
+            DW_BOOT_X86_64_PAGING_HANDOFF_PD_INDEX,
+            DW_BOOT_X86_64_PAGING_HANDOFF_PT_INDEX,
+        ],
+    }
+}
+
+const fn indices_for_generated_temporary_mapping() -> [u16; 4] {
+    let address = DW_BOOT_X86_64_PAGING_HANDOFF_TEMPORARY_VIRTUAL_ADDRESS;
+    [
+        ((address >> 39) & 0x1ff) as u16,
+        ((address >> 30) & 0x1ff) as u16,
+        ((address >> 21) & 0x1ff) as u16,
+        ((address >> 12) & 0x1ff) as u16,
+    ]
 }
 
 fn push_validated_rsdp(
@@ -781,6 +921,56 @@ fn validate_page_table_storage_disjoint(
     Ok(())
 }
 
+fn reject_temporary_mapping_collision(
+    mappings: &[TransitionMapping],
+) -> Result<(), TransitionError> {
+    let temporary = generated_temporary_mapping().virtual_address;
+    let slot_len = 1_u64 << 39;
+    let slot_start = temporary & !(slot_len - 1);
+    let slot_end = slot_start + slot_len;
+    for mapping in mappings {
+        let end = mapping
+            .virtual_start
+            .checked_add(mapping.byte_len)
+            .ok_or(TransitionError::RangeOverflow { kind: mapping.kind })?;
+        if mapping.virtual_start < slot_end && slot_start < end {
+            return Err(TransitionError::TemporaryMappingConflict { with: mapping.kind });
+        }
+    }
+    Ok(())
+}
+
+fn validate_table_identity_mapping(
+    identity: TransitionMapping,
+    mappings: &[TransitionMapping],
+    policy: TransitionPolicy,
+) -> Result<(), TransitionError> {
+    let end = identity
+        .virtual_start
+        .checked_add(identity.byte_len)
+        .ok_or(TransitionError::PageTableCountOverflow)?;
+    if identity.virtual_start == 0
+        || !identity
+            .virtual_start
+            .is_multiple_of(policy.mapping_granule)
+        || !identity.byte_len.is_multiple_of(policy.mapping_granule)
+        || canonical_four_level_half(identity.virtual_start) != Some(false)
+        || canonical_four_level_half(end - 1) != Some(false)
+    {
+        return Err(TransitionError::InvalidPageTableStorage);
+    }
+    for mapping in mappings {
+        let mapping_end = mapping.virtual_start + mapping.byte_len;
+        if identity.virtual_start < mapping_end && mapping.virtual_start < end {
+            return Err(TransitionError::VirtualOverlap {
+                first: MappingKind::TransitionTableIdentity,
+                second: mapping.kind,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_transition_stack(
     stack: RetainedPhysicalRange,
     policy: TransitionPolicy,
@@ -939,6 +1129,7 @@ fn validate_mapping_set(
 
 fn required_page_table_pages(
     mappings: &[TransitionMapping],
+    table_identity: Option<(u64, u64)>,
     policy: TransitionPolicy,
 ) -> Result<u64, TransitionError> {
     const X86_64_PAGE_TABLE_ENTRIES: u64 = 512;
@@ -953,13 +1144,80 @@ fn required_page_table_pages(
         .checked_mul(X86_64_PAGE_TABLE_ENTRIES)
         .ok_or(TransitionError::PageTableCountOverflow)?;
 
-    let pt_pages = distinct_regions(mappings, pt_coverage)?;
-    let pd_pages = distinct_regions(mappings, pd_coverage)?;
-    let pdpt_pages = distinct_regions(mappings, pdpt_coverage)?;
+    let temporary = generated_temporary_mapping().virtual_address;
+    let pt_pages =
+        distinct_regions_with_additions(mappings, table_identity, temporary, pt_coverage)?;
+    let pd_pages =
+        distinct_regions_with_additions(mappings, table_identity, temporary, pd_coverage)?;
+    let pdpt_pages =
+        distinct_regions_with_additions(mappings, table_identity, temporary, pdpt_coverage)?;
     1u64.checked_add(pt_pages)
         .and_then(|count| count.checked_add(pd_pages))
         .and_then(|count| count.checked_add(pdpt_pages))
         .ok_or(TransitionError::PageTableCountOverflow)
+}
+
+fn distinct_regions_with_additions(
+    mappings: &[TransitionMapping],
+    table_identity: Option<(u64, u64)>,
+    temporary: u64,
+    coverage: u64,
+) -> Result<u64, TransitionError> {
+    let mut count = distinct_regions(mappings, coverage)?;
+    if let Some((start, byte_len)) = table_identity {
+        let end = start
+            .checked_add(byte_len)
+            .ok_or(TransitionError::PageTableCountOverflow)?;
+        let first = start / coverage;
+        let last = (end - 1) / coverage;
+        let mut additional = last
+            .checked_sub(first)
+            .and_then(|span| span.checked_add(1))
+            .ok_or(TransitionError::PageTableCountOverflow)?;
+        let mut covered_through = None;
+        for mapping in mappings {
+            let mapping_end = mapping
+                .virtual_start
+                .checked_add(mapping.byte_len)
+                .ok_or(TransitionError::PageTableCountOverflow)?;
+            let mapping_first = mapping.virtual_start / coverage;
+            let mapping_last = (mapping_end - 1) / coverage;
+            let overlap_first = mapping_first.max(first);
+            let overlap_last = mapping_last.min(last);
+            if overlap_first <= overlap_last {
+                let uncovered_first = covered_through
+                    .and_then(|previous: u64| previous.checked_add(1))
+                    .map_or(overlap_first, |next| next.max(overlap_first));
+                if uncovered_first <= overlap_last {
+                    additional = additional
+                        .checked_sub(overlap_last - uncovered_first + 1)
+                        .ok_or(TransitionError::PageTableCountOverflow)?;
+                }
+                covered_through =
+                    Some(covered_through.map_or(overlap_last, |value| value.max(overlap_last)));
+            }
+        }
+        count = count
+            .checked_add(additional)
+            .ok_or(TransitionError::PageTableCountOverflow)?;
+    }
+
+    let temporary_region = temporary / coverage;
+    let covered_by_mapping = mappings.iter().any(|mapping| {
+        let end = mapping.virtual_start + mapping.byte_len;
+        mapping.virtual_start / coverage <= temporary_region
+            && temporary_region <= (end - 1) / coverage
+    });
+    let covered_by_identity = table_identity.is_some_and(|(start, byte_len)| {
+        start / coverage <= temporary_region
+            && temporary_region <= (start + byte_len - 1) / coverage
+    });
+    if !covered_by_mapping && !covered_by_identity {
+        count = count
+            .checked_add(1)
+            .ok_or(TransitionError::PageTableCountOverflow)?;
+    }
+    Ok(count)
 }
 
 fn distinct_regions(mappings: &[TransitionMapping], coverage: u64) -> Result<u64, TransitionError> {
@@ -1025,6 +1283,7 @@ fn mapping_kind_order(kind: MappingKind) -> (u8, usize) {
         MappingKind::RequiredAcpiRsdp => (7, 0),
         MappingKind::HandoffStub => (8, 0),
         MappingKind::TransitionStack => (9, 0),
+        MappingKind::TransitionTableIdentity => (10, 0),
     }
 }
 
@@ -1045,12 +1304,18 @@ pub trait TransitionPageTable {
 
     /// Record that the entire virtual page-zero granule is absent.
     fn leave_page_zero_unmapped(&mut self, byte_len: u64) -> Result<(), Self::Error>;
+    /// Materialize the intermediate hierarchy while preserving an exactly-zero leaf.
+    fn reserve_temporary_mapping(
+        &mut self,
+        reservation: TemporaryMappingReservation,
+    ) -> Result<(), Self::Error>;
     fn map(&mut self, mapping: TransitionMapping) -> Result<(), Self::Error>;
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum PageTablePopulationError<Error> {
     PageZero(Error),
+    TemporaryMapping(Error),
     Mapping { kind: MappingKind, error: Error },
 }
 
@@ -1074,6 +1339,9 @@ pub fn populate_page_table<Table: TransitionPageTable>(
     table
         .leave_page_zero_unmapped(plan.mapping_granule())
         .map_err(PageTablePopulationError::PageZero)?;
+    table
+        .reserve_temporary_mapping(plan.temporary_mapping())
+        .map_err(PageTablePopulationError::TemporaryMapping)?;
     for mapping in plan.mappings() {
         table
             .map(*mapping)
@@ -1082,5 +1350,12 @@ pub fn populate_page_table<Table: TransitionPageTable>(
                 error,
             })?;
     }
+    let table_identity = plan.table_identity_mapping();
+    table
+        .map(table_identity)
+        .map_err(|error| PageTablePopulationError::Mapping {
+            kind: table_identity.kind,
+            error,
+        })?;
     Ok(())
 }

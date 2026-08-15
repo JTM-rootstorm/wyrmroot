@@ -6,24 +6,33 @@ mod kernel_elf;
 #[path = "../src/transition.rs"]
 mod transition;
 
+use deepwyrm_abi::{
+    DW_BOOT_X86_64_PAGING_HANDOFF_MAX_TABLE_FRAME_COUNT, DW_BOOT_X86_64_PAGING_HANDOFF_PD_INDEX,
+    DW_BOOT_X86_64_PAGING_HANDOFF_PDPT_INDEX, DW_BOOT_X86_64_PAGING_HANDOFF_PML4_INDEX,
+    DW_BOOT_X86_64_PAGING_HANDOFF_PT_INDEX,
+    DW_BOOT_X86_64_PAGING_HANDOFF_TEMPORARY_VIRTUAL_ADDRESS,
+};
 use handoff_x86_64::{
     Com1InitializationError, Com1RegisterIo, FINAL_HANDOFF_MARKER, FinalDiagnosticError,
-    PostExitDiagnosticWriter, X86_64EntryStateEvidence, X86_64HandoffError,
-    initialize_com1_registers, prepare_x86_64_transfer, verify_x86_64_entry_state,
-    write_final_handoff_marker,
+    PostExitDiagnosticWriter, X86_64EntryStateEvidence, X86_64HandoffError, cr4_transition,
+    initialize_com1_registers, prepare_x86_64_transfer, test_page_table_attestation, verify_pat0,
+    verify_x86_64_entry_state, write_final_handoff_marker,
 };
 use kernel_elf::{KernelLoadSegment, SegmentPermissions};
 use transition::{
     AllocationLifetime, IdentityMapInputs, KernelMaterialization, KernelSegmentPages, MappingKind,
     MappingPermissions, PageTablePopulationError, PhysicalRange, RetainedPhysicalRange,
-    TransitionError, TransitionInput, TransitionMapping, TransitionPageTable, TransitionPolicy,
-    TransitionPreflightInput, ValidatedRsdpMappingInput, confirm_exit_boot_services,
-    finalize_transition, plan_transition, populate_page_table, preflight_transition,
+    TemporaryMappingReservation, TransitionError, TransitionInput, TransitionMapping,
+    TransitionPageTable, TransitionPolicy, TransitionPreflightInput, ValidatedRsdpMappingInput,
+    confirm_exit_boot_services, finalize_transition, plan_transition, populate_page_table,
+    preflight_transition,
 };
 
 const GRANULE: u64 = 0x1000;
 const CODE_MAPPING: u64 = 0xffff_8000_0010_0000;
 const RETAINED: AllocationLifetime = AllocationLifetime::RetainedUntilKernelPageTableReplacement;
+const TABLE_CAPACITY_PAGES: u64 = DW_BOOT_X86_64_PAGING_HANDOFF_MAX_TABLE_FRAME_COUNT as u64;
+const TABLE_STORAGE_START: u64 = 0x400000;
 
 const EMPTY_MAPPING: TransitionMapping = TransitionMapping {
     kind: MappingKind::BootInfo,
@@ -121,7 +130,7 @@ impl Fixture {
             kernel_entry: self.kernel[0].segment.virtual_address,
             kernel_image_byte_len: 0x4000,
             kernel_segments: &self.kernel,
-            page_table_storage: retained(0x220000, 0x7000),
+            page_table_storage: retained(TABLE_STORAGE_START, TABLE_CAPACITY_PAGES * GRANULE),
             identity: IdentityMapInputs {
                 boot_info: retained(0x200000, 312),
                 memory_map_table: retained(0x201000, 0x300),
@@ -227,6 +236,18 @@ fn plans_only_reviewed_mappings_with_wx_nx_and_pre_exit_materialization() {
     assert_eq!(plan.transition_stack_pointer(), 0x214000);
     assert_eq!(plan.boot_info_identity_pointer(), 0x200000);
     assert_eq!(plan.handoff_stub_entry(), 0x208000);
+    assert_eq!(
+        plan.temporary_mapping(),
+        TemporaryMappingReservation {
+            virtual_address: DW_BOOT_X86_64_PAGING_HANDOFF_TEMPORARY_VIRTUAL_ADDRESS,
+            indices: [
+                DW_BOOT_X86_64_PAGING_HANDOFF_PML4_INDEX,
+                DW_BOOT_X86_64_PAGING_HANDOFF_PDPT_INDEX,
+                DW_BOOT_X86_64_PAGING_HANDOFF_PD_INDEX,
+                DW_BOOT_X86_64_PAGING_HANDOFF_PT_INDEX,
+            ],
+        }
+    );
 
     assert_eq!(plan.pre_exit().kernel_materializations.len(), 2);
     assert_eq!(
@@ -243,10 +264,11 @@ fn plans_only_reviewed_mappings_with_wx_nx_and_pre_exit_materialization() {
             .byte_len,
         GRANULE
     );
-    assert_eq!(plan.pre_exit().page_table_page_count, 7);
+    assert_eq!(plan.pre_exit().page_table_page_count, TABLE_CAPACITY_PAGES);
+    assert_eq!(plan.used_page_table_page_count(), 11);
     assert_eq!(
         plan.pre_exit().page_table_storage,
-        retained(0x220000, 0x7000)
+        retained(TABLE_STORAGE_START, TABLE_CAPACITY_PAGES * GRANULE)
     );
 }
 
@@ -262,11 +284,17 @@ fn preflight_sizes_before_allocation_and_matches_final_plan() {
     )
     .unwrap();
 
-    assert_eq!(preflight.page_table_page_count(), 7);
+    assert_eq!(preflight.page_table_page_count(), TABLE_CAPACITY_PAGES);
+    assert_eq!(preflight.minimum_page_table_page_count(), 10);
     assert_eq!(preflight.mappings().len(), 12);
     assert_eq!(preflight.kernel_materializations().len(), 2);
-    let plan = finalize_transition(preflight, retained(0x220000, 7 * GRANULE)).unwrap();
-    assert_eq!(plan.pre_exit().page_table_page_count, 7);
+    let plan = finalize_transition(
+        preflight,
+        retained(TABLE_STORAGE_START, TABLE_CAPACITY_PAGES * GRANULE),
+    )
+    .unwrap();
+    assert_eq!(plan.pre_exit().page_table_page_count, TABLE_CAPACITY_PAGES);
+    assert_eq!(plan.used_page_table_page_count(), 11);
 
     let mut wrapper_mappings = [EMPTY_MAPPING; 16];
     let mut wrapper_copies = [EMPTY_MATERIALIZATION; 2];
@@ -295,14 +323,19 @@ fn preflight_and_final_planning_have_adversarial_parity() {
     let mut preflight_input = fixture.preflight_input();
     preflight_input.kernel_segments = &separated_kernel;
     let preflight = preflight_transition(&preflight_input, &mut mappings, &mut copies).unwrap();
+    let minimum_page_count = preflight.minimum_page_table_page_count();
+    assert!(minimum_page_count > 10);
     let page_count = preflight.page_table_page_count();
-    assert!(page_count > 7);
     let plan = finalize_transition(
         preflight,
-        retained(0x220000, page_count.checked_mul(GRANULE).unwrap()),
+        retained(
+            TABLE_STORAGE_START,
+            page_count.checked_mul(GRANULE).unwrap(),
+        ),
     )
     .unwrap();
     assert_eq!(plan.pre_exit().page_table_page_count, page_count);
+    assert!(plan.used_page_table_page_count() >= minimum_page_count);
 
     let mut wrapper_input = fixture.input();
     wrapper_input.kernel_segments = &separated_kernel;
@@ -328,6 +361,129 @@ fn preflight_and_final_planning_have_adversarial_parity() {
         plan_transition(&wrapper_input, &mut mappings, &mut copies),
         Err(TransitionError::WritableExecutable { .. })
     ));
+}
+
+#[test]
+fn fixed_point_is_bounded_and_temporary_leaf_cannot_be_planned() {
+    let fixture = Fixture::new();
+    let mut mappings = [EMPTY_MAPPING; 16];
+    let mut copies = [EMPTY_MATERIALIZATION; 2];
+    let preflight =
+        preflight_transition(&fixture.preflight_input(), &mut mappings, &mut copies).unwrap();
+    assert_eq!(preflight.minimum_page_table_page_count(), 10);
+    let plan = finalize_transition(
+        preflight,
+        retained(TABLE_STORAGE_START, TABLE_CAPACITY_PAGES * GRANULE),
+    )
+    .unwrap();
+    assert_eq!(plan.used_page_table_page_count(), 11);
+    assert_eq!(
+        plan.table_identity_mapping().byte_len,
+        plan.used_page_table_page_count() * GRANULE
+    );
+
+    let mut adjacent_kernel = fixture.kernel;
+    adjacent_kernel[0].segment.virtual_address =
+        DW_BOOT_X86_64_PAGING_HANDOFF_TEMPORARY_VIRTUAL_ADDRESS + GRANULE;
+    adjacent_kernel[0].segment.mapping_virtual_address =
+        DW_BOOT_X86_64_PAGING_HANDOFF_TEMPORARY_VIRTUAL_ADDRESS + GRANULE;
+    adjacent_kernel[0].segment.file_offset = GRANULE;
+    adjacent_kernel[0].segment.segment_page_offset = 0;
+    let mut input = fixture.preflight_input();
+    input.kernel_segments = &adjacent_kernel;
+    input.kernel_entry = adjacent_kernel[0].segment.virtual_address;
+    assert_eq!(
+        preflight_transition(&input, &mut mappings, &mut copies),
+        Err(TransitionError::TemporaryMappingConflict {
+            with: MappingKind::KernelSegment {
+                program_header_index: 0,
+            },
+        })
+    );
+
+    let mut kernel = fixture.kernel;
+    kernel[0].segment.virtual_address = DW_BOOT_X86_64_PAGING_HANDOFF_TEMPORARY_VIRTUAL_ADDRESS;
+    kernel[0].segment.mapping_virtual_address =
+        DW_BOOT_X86_64_PAGING_HANDOFF_TEMPORARY_VIRTUAL_ADDRESS;
+    kernel[0].segment.segment_page_offset = 0;
+    let mut input = fixture.preflight_input();
+    input.kernel_segments = &kernel;
+    input.kernel_entry = DW_BOOT_X86_64_PAGING_HANDOFF_TEMPORARY_VIRTUAL_ADDRESS;
+    assert_eq!(
+        preflight_transition(&input, &mut mappings, &mut copies),
+        Err(TransitionError::TemporaryMappingConflict {
+            with: MappingKind::KernelSegment {
+                program_header_index: 0,
+            },
+        })
+    );
+
+    let maximum = DW_BOOT_X86_64_PAGING_HANDOFF_MAX_TABLE_FRAME_COUNT as usize;
+    let mut many_kernel_segments = Vec::with_capacity(maximum);
+    for index in 0..maximum {
+        let index_u64 = u64::try_from(index).unwrap();
+        many_kernel_segments.push(KernelSegmentPages {
+            segment: KernelLoadSegment {
+                program_header_index: u16::try_from(index).unwrap(),
+                file_offset: index_u64 * GRANULE,
+                file_size: GRANULE,
+                virtual_address: CODE_MAPPING + index_u64 * 0x20_0000,
+                mapping_virtual_address: CODE_MAPPING + index_u64 * 0x20_0000,
+                mapping_byte_len: GRANULE,
+                segment_page_offset: 0,
+                memory_size: GRANULE,
+                alignment: GRANULE,
+                permissions: SegmentPermissions {
+                    read: true,
+                    write: false,
+                    execute: true,
+                },
+            },
+            pages: retained(0x1000_0000 + index_u64 * GRANULE, GRANULE),
+        });
+    }
+    let mut input = fixture.preflight_input();
+    input.kernel_segments = &many_kernel_segments;
+    input.kernel_entry = CODE_MAPPING;
+    input.kernel_image_byte_len = u64::try_from(maximum).unwrap() * GRANULE;
+    let mut many_mappings = vec![EMPTY_MAPPING; maximum + 16];
+    let mut many_copies = vec![EMPTY_MATERIALIZATION; maximum];
+    assert!(matches!(
+        preflight_transition(&input, &mut many_mappings, &mut many_copies),
+        Err(TransitionError::PageTableFixedPointCapacityExceeded {
+            maximum_pages: TABLE_CAPACITY_PAGES,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn fixed_point_converges_across_pt_pd_and_pdpt_boundaries() {
+    let fixture = Fixture::new();
+    for (boundary, expected_used) in [
+        (0x80_0000_u64, 12_u64),
+        (0x4000_0000, 13),
+        (0x80_0000_0000, 15),
+    ] {
+        let storage_start = boundary - GRANULE;
+        let mut mappings = [EMPTY_MAPPING; 16];
+        let mut copies = [EMPTY_MATERIALIZATION; 2];
+        let preflight =
+            preflight_transition(&fixture.preflight_input(), &mut mappings, &mut copies).unwrap();
+        let minimum = preflight.minimum_page_table_page_count();
+        let plan = finalize_transition(
+            preflight,
+            retained(storage_start, TABLE_CAPACITY_PAGES * GRANULE),
+        )
+        .unwrap();
+        let identity = plan.table_identity_mapping();
+        assert_eq!(identity.virtual_start, storage_start);
+        assert!(identity.virtual_start < boundary);
+        assert!(identity.virtual_start + identity.byte_len > boundary);
+        assert!(plan.used_page_table_page_count() >= minimum);
+        assert_eq!(plan.used_page_table_page_count(), expected_used);
+        assert!(plan.used_page_table_page_count() <= TABLE_CAPACITY_PAGES);
+    }
 }
 
 #[test]
@@ -491,7 +647,7 @@ fn rejects_framebuffer_page_identity_mapping_or_page_table_backing() {
     );
 
     fixture.framebuffer = Some(PhysicalRange {
-        physical_start: 0x220800,
+        physical_start: TABLE_STORAGE_START + 0x800,
         byte_len: 0x100,
     });
     assert_eq!(
@@ -573,8 +729,8 @@ fn rejects_bad_ranges_stack_policy_entry_sources_and_capacity() {
     assert_eq!(
         plan_transition(&input, &mut mappings, &mut copies),
         Err(TransitionError::PageTableStorageLengthMismatch {
-            required_pages: 7,
-            provided_pages: 6,
+            required_pages: TABLE_CAPACITY_PAGES,
+            provided_pages: TABLE_CAPACITY_PAGES - 1,
         })
     );
 
@@ -669,6 +825,7 @@ fn rejects_noncanonical_ranges_and_ranges_crossing_the_canonical_hole() {
 #[derive(Default)]
 struct RecordingTable {
     page_zero: Vec<u64>,
+    temporary: Vec<TemporaryMappingReservation>,
     mappings: Vec<TransitionMapping>,
     fail_kind: Option<MappingKind>,
 }
@@ -678,6 +835,14 @@ impl TransitionPageTable for RecordingTable {
 
     fn leave_page_zero_unmapped(&mut self, byte_len: u64) -> Result<(), Self::Error> {
         self.page_zero.push(byte_len);
+        Ok(())
+    }
+
+    fn reserve_temporary_mapping(
+        &mut self,
+        reservation: TemporaryMappingReservation,
+    ) -> Result<(), Self::Error> {
+        self.temporary.push(reservation);
         Ok(())
     }
 
@@ -702,7 +867,10 @@ fn post_exit_population_explicitly_leaves_page_zero_unmapped_and_is_fail_closed(
     let mut table = RecordingTable::default();
     populate_page_table(&plan, post_exit, &mut table).unwrap();
     assert_eq!(table.page_zero, vec![GRANULE]);
-    assert_eq!(table.mappings, plan.mappings());
+    assert_eq!(table.temporary, vec![plan.temporary_mapping()]);
+    let mut expected_mappings = plan.mappings().to_vec();
+    expected_mappings.push(plan.table_identity_mapping());
+    assert_eq!(table.mappings, expected_mappings);
 
     let mut failing = RecordingTable {
         fail_kind: Some(MappingKind::TransitionStack),
@@ -720,10 +888,12 @@ fn post_exit_population_explicitly_leaves_page_zero_unmapped_and_is_fail_closed(
 fn valid_evidence() -> X86_64EntryStateEvidence {
     X86_64EntryStateEvidence {
         exit_boot_services_complete: true,
+        interrupts_disabled: true,
         cr0_write_protect: true,
         execute_disable: true,
         four_level_paging: true,
         initial_processor_is_bsp: true,
+        pat0_write_back: true,
         valid_code_and_stack_segments: true,
     }
 }
@@ -737,6 +907,13 @@ fn raw_transfer_requires_verified_machine_state_and_preallocated_cr3() {
                 ..valid_evidence()
             },
             X86_64HandoffError::BootServicesStillAvailable,
+        ),
+        (
+            X86_64EntryStateEvidence {
+                interrupts_disabled: false,
+                ..valid_evidence()
+            },
+            X86_64HandoffError::InterruptsEnabled,
         ),
         (
             X86_64EntryStateEvidence {
@@ -768,6 +945,13 @@ fn raw_transfer_requires_verified_machine_state_and_preallocated_cr3() {
         ),
         (
             X86_64EntryStateEvidence {
+                pat0_write_back: false,
+                ..valid_evidence()
+            },
+            X86_64HandoffError::Pat0NotWriteBack,
+        ),
+        (
+            X86_64EntryStateEvidence {
                 valid_code_and_stack_segments: false,
                 ..valid_evidence()
             },
@@ -783,32 +967,93 @@ fn raw_transfer_requires_verified_machine_state_and_preallocated_cr3() {
     let mut mappings = [EMPTY_MAPPING; 16];
     let mut copies = [EMPTY_MATERIALIZATION; 2];
     let plan = plan_transition(&fixture.input(), &mut mappings, &mut copies).unwrap();
-    let transfer = prepare_x86_64_transfer(&plan, 0x220000, state).unwrap();
+    let attestation = test_page_table_attestation(
+        &plan,
+        TABLE_STORAGE_START,
+        u32::try_from(plan.used_page_table_page_count()).unwrap(),
+    );
+    let transfer = prepare_x86_64_transfer(attestation, state).unwrap();
     assert_eq!(
         transfer.kernel_entry(),
         fixture.kernel[0].segment.virtual_address
     );
     assert_eq!(transfer.boot_info_identity_pointer(), 0x200000);
     assert_eq!(transfer.transition_stack_pointer(), 0x214000);
-    assert_eq!(transfer.page_table_root_physical(), 0x220000);
+    assert_eq!(transfer.page_table_root_physical(), TABLE_STORAGE_START);
     assert_eq!(transfer.handoff_stub_range(), (0x208000, 0x208100));
 
+    assert_eq!(verify_pat0(0x0007_0406_0007_0406), Ok(()));
     assert_eq!(
-        prepare_x86_64_transfer(&plan, 0x220001, state),
+        verify_pat0(0x0007_0400_0007_0400),
+        Err(X86_64HandoffError::Pat0NotWriteBack)
+    );
+    for initial in [0, 1 << 7, 1 << 17, (1 << 7) | (1 << 17)] {
+        let transition = cr4_transition(initial | (1 << 5));
+        assert_eq!(transition.before_cr3 & (1 << 7), 0);
+        assert_eq!(transition.before_cr3 & (1 << 17), initial & (1 << 17));
+        assert_eq!(transition.after_cr3 & ((1 << 7) | (1 << 17)), 0);
+        assert_ne!(transition.after_cr3 & (1 << 5), 0);
+    }
+
+    assert!(matches!(
+        prepare_x86_64_transfer(
+            test_page_table_attestation(
+                &plan,
+                0x220001,
+                u32::try_from(plan.used_page_table_page_count()).unwrap()
+            ),
+            state
+        ),
         Err(X86_64HandoffError::InvalidPageTableRoot)
-    );
-    assert_eq!(
-        prepare_x86_64_transfer(&plan, 0x300000, state),
+    ));
+    assert!(matches!(
+        prepare_x86_64_transfer(
+            test_page_table_attestation(
+                &plan,
+                0x300000,
+                u32::try_from(plan.used_page_table_page_count()).unwrap()
+            ),
+            state
+        ),
         Err(X86_64HandoffError::PageTableRootOutsidePreExitStorage)
-    );
+    ));
+    assert!(matches!(
+        prepare_x86_64_transfer(
+            test_page_table_attestation(
+                &plan,
+                TABLE_STORAGE_START | (1 << 63),
+                u32::try_from(plan.used_page_table_page_count()).unwrap()
+            ),
+            state
+        ),
+        Err(X86_64HandoffError::InvalidPageTableRoot)
+    ));
+    assert!(matches!(
+        prepare_x86_64_transfer(
+            test_page_table_attestation(
+                &plan,
+                TABLE_STORAGE_START,
+                u32::try_from(plan.used_page_table_page_count() - 1).unwrap()
+            ),
+            state
+        ),
+        Err(X86_64HandoffError::InvalidPageTableRoot)
+    ));
 
     let mut input = fixture.input();
     input.identity.handoff_stub_entry += 1;
     let plan = plan_transition(&input, &mut mappings, &mut copies).unwrap();
-    assert_eq!(
-        prepare_x86_64_transfer(&plan, 0x220000, state),
+    assert!(matches!(
+        prepare_x86_64_transfer(
+            test_page_table_attestation(
+                &plan,
+                TABLE_STORAGE_START,
+                u32::try_from(plan.used_page_table_page_count()).unwrap()
+            ),
+            state
+        ),
         Err(X86_64HandoffError::InvalidHandoffStub)
-    );
+    ));
 }
 
 #[derive(Default)]
@@ -939,8 +1184,13 @@ fn final_marker_is_bounded_complete_and_fails_closed_without_firmware_io() {
 }
 
 #[test]
-fn linked_raw_stub_normalizes_flags_before_cr3_and_never_calls_kernel() {
+fn linked_raw_stub_orders_interrupt_pat_cr4_cr3_and_never_calls_kernel() {
     let source = include_str!("../src/handoff_x86_64.rs");
+    let cli = source.find("asm!(\"cli\"").unwrap();
+    let observation = source
+        .find("let evidence = unsafe { observe_entry_state(exit_boot_services_complete) }")
+        .unwrap();
+    assert!(cli < observation);
     let stub = source
         .split("__wyrmroot_handoff_start:")
         .nth(1)
@@ -948,12 +1198,31 @@ fn linked_raw_stub_normalizes_flags_before_cr3_and_never_calls_kernel() {
         .split("__wyrmroot_handoff_end:")
         .next()
         .unwrap();
-    let cli = stub.find("cli").unwrap();
     let cld = stub.find("cld").unwrap();
+    let read_cr4_before = stub.find("mov rax, cr4").unwrap();
+    let clear_pge = stub.find("btr rax, 7").unwrap();
+    let write_cr4_before = stub.find("mov cr4, rax").unwrap();
     let cr3 = stub.find("mov cr3, rdi").unwrap();
+    let after_cr3 = &stub[cr3..];
+    let read_cr4_after = cr3 + after_cr3.find("mov rax, cr4").unwrap();
+    let clear_pcide = cr3 + after_cr3.find("btr rax, 17").unwrap();
+    let write_cr4_after = cr3 + after_cr3.find("mov cr4, rax").unwrap();
     let stack = stub.find("mov rsp, rsi").unwrap();
     let boot_info = stub.find("mov rdi, rcx").unwrap();
     let jump = stub.find("jmp rdx").unwrap();
-    assert!(cli < cld && cld < cr3 && cr3 < stack && stack < boot_info && boot_info < jump);
+    assert!(
+        cld < read_cr4_before
+            && read_cr4_before < clear_pge
+            && clear_pge < write_cr4_before
+            && write_cr4_before < cr3
+            && cr3 < read_cr4_after
+            && read_cr4_after < clear_pcide
+            && clear_pcide < write_cr4_after
+            && write_cr4_after < stack
+            && stack < boot_info
+            && boot_info < jump
+    );
+    assert!(!stub.contains("cli"));
     assert!(!stub.contains("call"));
+    assert!(!stub.contains("ret"));
 }

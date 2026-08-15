@@ -7,16 +7,28 @@
 #[cfg(test)]
 use crate::transition::{AllocationLifetime, TransitionPlan};
 #[cfg(not(test))]
+use crate::uefi_page_table::PageTableAttestation;
+#[cfg(not(test))]
 use wyrmroot_efi_loader::transition::{AllocationLifetime, TransitionPlan};
+
+const CR4_PAGE_GLOBAL_ENABLE: u64 = 1 << 7;
+const CR4_PCID_ENABLE: u64 = 1 << 17;
+const IA32_PAT_WRITE_BACK: u8 = 0x06;
+const CR3_BASE_PAGE_BYTES: u64 = deepwyrm_abi::DW_BOOT_BASE_PAGE_SIZE as u64;
 
 /// Evidence collected immediately before the raw transition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct X86_64EntryStateEvidence {
     pub exit_boot_services_complete: bool,
+    pub interrupts_disabled: bool,
     pub cr0_write_protect: bool,
     pub execute_disable: bool,
     pub four_level_paging: bool,
     pub initial_processor_is_bsp: bool,
+    /// PAT entry zero was observed as architectural write-back (`0x06`). This
+    /// proves only PAT0 selection consistency; it is not an MTRR-derived claim
+    /// that every mapped physical range is effectively WB.
+    pub pat0_write_back: bool,
     /// UEFI x64 segment selectors were observed nonzero; descriptor semantics remain a firmware
     /// ABI precondition documented at the privileged boundary.
     pub valid_code_and_stack_segments: bool,
@@ -31,11 +43,13 @@ pub struct VerifiedX86_64EntryState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum X86_64HandoffError {
     BootServicesStillAvailable,
+    InterruptsEnabled,
     WriteProtectDisabled,
     ExecuteDisableUnavailable,
     WrongPagingMode,
     NotBootstrapProcessor,
     InvalidSegmentState,
+    Pat0NotWriteBack,
     InvalidPageTableRoot,
     PageTableRootOutsidePreExitStorage,
     InvalidKernelEntry,
@@ -51,6 +65,9 @@ pub fn verify_x86_64_entry_state(
     if !evidence.exit_boot_services_complete {
         return Err(X86_64HandoffError::BootServicesStillAvailable);
     }
+    if !evidence.interrupts_disabled {
+        return Err(X86_64HandoffError::InterruptsEnabled);
+    }
     if !evidence.cr0_write_protect {
         return Err(X86_64HandoffError::WriteProtectDisabled);
     }
@@ -63,6 +80,9 @@ pub fn verify_x86_64_entry_state(
     if !evidence.initial_processor_is_bsp {
         return Err(X86_64HandoffError::NotBootstrapProcessor);
     }
+    if !evidence.pat0_write_back {
+        return Err(X86_64HandoffError::Pat0NotWriteBack);
+    }
     if !evidence.valid_code_and_stack_segments {
         return Err(X86_64HandoffError::InvalidSegmentState);
     }
@@ -70,18 +90,46 @@ pub fn verify_x86_64_entry_state(
 }
 
 /// Fully checked register values for the nonreturning x86_64 transfer.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct X86_64Transfer {
+pub struct X86_64Transfer<'storage, 'plan, 'data> {
+    _page_table_pages: &'storage [[u64; 512]],
+    _plan: &'plan TransitionPlan<'data>,
     kernel_entry: u64,
     boot_info_identity_pointer: u64,
     transition_stack_pointer: u64,
     page_table_root_physical: u64,
     handoff_stub_start: u64,
     handoff_stub_end: u64,
-    entry_state: VerifiedX86_64EntryState,
+    _entry_state: VerifiedX86_64EntryState,
 }
 
-impl X86_64Transfer {
+/// Host-testable CR4 values required on the two sides of the CR3 load.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Cr4Transition {
+    pub before_cr3: u64,
+    pub after_cr3: u64,
+}
+
+/// Preserve unrelated CR4 state while ordering PGE removal before CR3 and
+/// PCIDE removal after it.
+pub const fn cr4_transition(initial: u64) -> Cr4Transition {
+    let before_cr3 = initial & !CR4_PAGE_GLOBAL_ENABLE;
+    Cr4Transition {
+        before_cr3,
+        after_cr3: before_cr3 & !CR4_PCID_ENABLE,
+    }
+}
+
+/// Validate the byte selected by paging structures whose PWT/PCD/PAT bits are
+/// all zero. This deliberately makes no claim about MTRR interaction.
+pub const fn verify_pat0(pat: u64) -> Result<(), X86_64HandoffError> {
+    if pat as u8 == IA32_PAT_WRITE_BACK {
+        Ok(())
+    } else {
+        Err(X86_64HandoffError::Pat0NotWriteBack)
+    }
+}
+
+impl X86_64Transfer<'_, '_, '_> {
     pub fn kernel_entry(&self) -> u64 {
         self.kernel_entry
     }
@@ -103,12 +151,59 @@ impl X86_64Transfer {
     }
 }
 
-/// Bind a validated mapping plan, preallocated page-table root, and verified machine state.
-pub fn prepare_x86_64_transfer(
-    plan: &TransitionPlan<'_>,
-    page_table_root_physical: u64,
+/// Test-only stand-in for immutable attestation. Production has no constructor
+/// accepting raw CR3 facts and requires the real consumed encoder evidence.
+#[cfg(test)]
+pub struct TestPageTableAttestation<'plan, 'data> {
+    plan: &'plan TransitionPlan<'data>,
+    root_physical: u64,
+    used_page_count: u32,
+}
+
+#[cfg(test)]
+pub const fn test_page_table_attestation<'plan, 'data>(
+    plan: &'plan TransitionPlan<'data>,
+    root_physical: u64,
+    used_page_count: u32,
+) -> TestPageTableAttestation<'plan, 'data> {
+    TestPageTableAttestation {
+        plan,
+        root_physical,
+        used_page_count,
+    }
+}
+
+/// Bind a validated mapping plan, consumed page-table attestation, and verified machine state.
+#[cfg(not(test))]
+pub fn prepare_x86_64_transfer<'storage, 'plan, 'data>(
+    page_table: PageTableAttestation<'storage, 'plan, 'data>,
     entry_state: VerifiedX86_64EntryState,
-) -> Result<X86_64Transfer, X86_64HandoffError> {
+) -> Result<X86_64Transfer<'storage, 'plan, 'data>, X86_64HandoffError> {
+    let (pages, plan, root_physical, used_page_count) = page_table.into_handoff_parts();
+    prepare_x86_64_transfer_values(plan, pages, root_physical, used_page_count, entry_state)
+}
+
+#[cfg(test)]
+pub fn prepare_x86_64_transfer<'plan, 'data>(
+    page_table: TestPageTableAttestation<'plan, 'data>,
+    entry_state: VerifiedX86_64EntryState,
+) -> Result<X86_64Transfer<'static, 'plan, 'data>, X86_64HandoffError> {
+    prepare_x86_64_transfer_values(
+        page_table.plan,
+        &[],
+        page_table.root_physical,
+        page_table.used_page_count,
+        entry_state,
+    )
+}
+
+fn prepare_x86_64_transfer_values<'storage, 'plan, 'data>(
+    plan: &'plan TransitionPlan<'data>,
+    page_table_pages: &'storage [[u64; 512]],
+    page_table_root_physical: u64,
+    used_page_count: u32,
+    entry_state: VerifiedX86_64EntryState,
+) -> Result<X86_64Transfer<'storage, 'plan, 'data>, X86_64HandoffError> {
     if plan.kernel_entry() == 0 {
         return Err(X86_64HandoffError::InvalidKernelEntry);
     }
@@ -122,12 +217,17 @@ pub fn prepare_x86_64_transfer(
     {
         return Err(X86_64HandoffError::InvalidTransitionStack);
     }
-    if page_table_root_physical == 0
-        || !page_table_root_physical.is_multiple_of(plan.mapping_granule())
+    if plan.mapping_granule() != CR3_BASE_PAGE_BYTES
+        || page_table_root_physical == 0
+        || page_table_root_physical & (CR3_BASE_PAGE_BYTES - 1) != 0
+        || page_table_root_physical & (1 << 63) != 0
     {
         return Err(X86_64HandoffError::InvalidPageTableRoot);
     }
     let storage = plan.pre_exit().page_table_storage;
+    if u64::from(used_page_count) != plan.used_page_table_page_count() {
+        return Err(X86_64HandoffError::InvalidPageTableRoot);
+    }
     if storage.lifetime != AllocationLifetime::RetainedUntilKernelPageTableReplacement {
         return Err(X86_64HandoffError::PageTableRootOutsidePreExitStorage);
     }
@@ -136,7 +236,7 @@ pub fn prepare_x86_64_transfer(
         .checked_add(storage.byte_len)
         .ok_or(X86_64HandoffError::PageTableRootOutsidePreExitStorage)?;
     let root_end = page_table_root_physical
-        .checked_add(plan.mapping_granule())
+        .checked_add(CR3_BASE_PAGE_BYTES)
         .ok_or(X86_64HandoffError::PageTableRootOutsidePreExitStorage)?;
     if page_table_root_physical < storage.physical_start || root_end > storage_end {
         return Err(X86_64HandoffError::PageTableRootOutsidePreExitStorage);
@@ -151,13 +251,15 @@ pub fn prepare_x86_64_transfer(
     }
 
     Ok(X86_64Transfer {
+        _page_table_pages: page_table_pages,
+        _plan: plan,
         kernel_entry: plan.kernel_entry(),
         boot_info_identity_pointer: plan.boot_info_identity_pointer(),
         transition_stack_pointer: plan.transition_stack_pointer(),
         page_table_root_physical,
         handoff_stub_start,
         handoff_stub_end,
-        entry_state,
+        _entry_state: entry_state,
     })
 }
 
@@ -288,8 +390,11 @@ mod privileged {
     };
     const IA32_EFER: u32 = 0xc000_0080;
     const IA32_APIC_BASE: u32 = 0x0000_001b;
+    const IA32_PAT: u32 = 0x0000_0277;
     const CR0_WRITE_PROTECT: u64 = 1 << 16;
     const EFER_EXECUTE_DISABLE_ENABLE: u64 = 1 << 11;
+    const CPUID_BASIC_FEATURES: u32 = 1;
+    const CPUID_PAT: u32 = 1 << 16;
     const CPUID_EXTENDED_FEATURES: u32 = 0x8000_0001;
     const CPUID_NX: u32 = 1 << 20;
 
@@ -300,9 +405,14 @@ mod privileged {
         .global __wyrmroot_handoff_start
         .global __wyrmroot_handoff_end
 __wyrmroot_handoff_start:
-        cli
         cld
+        mov rax, cr4
+        btr rax, 7
+        mov cr4, rax
         mov cr3, rdi
+        mov rax, cr4
+        btr rax, 17
+        mov cr4, rax
         mov rsp, rsi
         mov rdi, rcx
         xor rbp, rbp
@@ -393,7 +503,8 @@ __wyrmroot_handoff_end:
         TransmitTimeout,
     }
 
-    /// Enable CR0.WP and EFER.NXE, then observe and validate all entry-state facts.
+    /// Disable interrupts, enable CR0.WP and EFER.NXE, then observe and validate
+    /// all entry-state facts including PAT entry zero.
     ///
     /// # Safety
     ///
@@ -411,10 +522,16 @@ __wyrmroot_handoff_end:
         {
             return Err(super::X86_64HandoffError::ExecuteDisableUnavailable);
         }
+        if __cpuid(0).eax < CPUID_BASIC_FEATURES
+            || __cpuid(CPUID_BASIC_FEATURES).edx & CPUID_PAT == 0
+        {
+            return Err(super::X86_64HandoffError::Pat0NotWriteBack);
+        }
 
         // SAFETY: the function contract grants supervisor register/MSR access. Read-modify-write
         // preserves all unrelated architectural bits, and the following observation reads back.
         unsafe {
+            asm!("cli", options(nomem, nostack));
             let cr0 = read_cr0();
             write_cr0(cr0 | CR0_WRITE_PROTECT);
             let efer = rdmsr(IA32_EFER);
@@ -432,24 +549,30 @@ __wyrmroot_handoff_end:
         let cr4: u64;
         let code_segment: u16;
         let stack_segment: u16;
+        let rflags: u64;
         unsafe {
             asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
             asm!("mov {0:x}, cs", out(reg) code_segment, options(nomem, nostack, preserves_flags));
             asm!("mov {0:x}, ss", out(reg) stack_segment, options(nomem, nostack, preserves_flags));
+            asm!("pushfq", "pop {}", out(reg) rflags, options(nomem));
         }
         // SAFETY: EFER and APIC-base availability is part of the function contract.
         let efer = unsafe { rdmsr(IA32_EFER) };
         // SAFETY: same as above.
         let apic_base = unsafe { rdmsr(IA32_APIC_BASE) };
+        // SAFETY: IA32_PAT is architectural when PAT is available to x86_64 firmware.
+        let pat = unsafe { rdmsr(IA32_PAT) };
 
         X86_64EntryStateEvidence {
             exit_boot_services_complete,
+            interrupts_disabled: rflags & (1 << 9) == 0,
             cr0_write_protect: cr0 & (1 << 16) != 0,
             execute_disable: efer & (1 << 11) != 0,
             four_level_paging: cr0 & (1 << 31) != 0
                 && efer & (1 << 10) != 0
                 && cr4 & (1 << 12) == 0,
             initial_processor_is_bsp: apic_base & (1 << 8) != 0,
+            pat0_write_back: super::verify_pat0(pat).is_ok(),
             valid_code_and_stack_segments: code_segment != 0 && stack_segment != 0,
         }
     }
@@ -464,8 +587,8 @@ __wyrmroot_handoff_end:
     /// `transfer` must come from `prepare_x86_64_transfer`; the new page table must contain every
     /// validated mapping, including the currently executing stub and transition stack. The caller
     /// must have emitted its final diagnostic and must never invoke firmware services afterward.
-    pub unsafe fn jump_to_kernel(transfer: X86_64Transfer) -> ! {
-        let _verified = transfer.entry_state;
+    pub unsafe fn jump_to_kernel(transfer: X86_64Transfer<'_, '_, '_>) -> ! {
+        let _verified = transfer._entry_state;
         let (linked_start, linked_len, linked_entry) = match linked_handoff_stub() {
             Ok(layout) => layout,
             // SAFETY: malformed linker symbols cannot support a sound CR3 replacement.
@@ -578,7 +701,7 @@ pub unsafe fn enable_and_verify_entry_state(
 /// The caller must satisfy the mapping, diagnostic, and post-EBS contract documented by the
 /// privileged implementation.
 #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
-pub unsafe fn jump_to_kernel(transfer: X86_64Transfer) -> ! {
+pub unsafe fn jump_to_kernel(transfer: X86_64Transfer<'_, '_, '_>) -> ! {
     // SAFETY: the caller accepts the wrapper's identical handoff contract.
     unsafe { privileged::jump_to_kernel(transfer) }
 }
