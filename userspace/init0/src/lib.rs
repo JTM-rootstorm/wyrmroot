@@ -1,4 +1,5 @@
 #![no_std]
+#![forbid(unsafe_code)]
 
 //! Placeholder for the temporary WYR0 `init0` application.
 //!

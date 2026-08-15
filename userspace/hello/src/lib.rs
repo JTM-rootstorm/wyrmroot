@@ -1,4 +1,5 @@
 #![no_std]
+#![forbid(unsafe_code)]
 
 //! Placeholder for the WYR0 `hello` smoke-test application.
 //!

@@ -2,3 +2,5 @@
 //!
 //! Mapping, startup-state construction, capability delegation, and process launch will be
 //! implemented during WYR0-E after the required Deepwyrm contracts exist.
+//! This module intentionally exports no syscall, handle, rights, or startup-layout assumptions
+//! during WYR0-A.
