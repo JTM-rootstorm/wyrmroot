@@ -58,6 +58,25 @@ loader transition stack only after replacing the transition environment.
   preserves its physical description for a later mapping with the correct
   cache policy.
 
+The accepted Wyrmroot producer identity-maps every used transition-page-table
+frame, including the `CR3` root, exactly once at a virtual address numerically
+equal to its physical address. These identity aliases are supervisor-only,
+read/write, non-executable, non-global, and have `PWT`, `PCD`, and PAT selection
+set to zero.
+
+Under Deepwyrm's canonical paging-handoff contract, these identity aliases
+form the narrow unsafe bootstrap trust anchor intended for the first live
+graph read, before Deepwyrm has an independent scratch mapper. Before any
+table mutation or `CR3` replacement, Deepwyrm must compare the copied carrier
+with the live `CR3` root and live-revalidate the complete reachable graph, the
+fixed temporary path, every required `VA == PA` alias, and control and PAT
+state. `PAT0 = 0x06` proves PAT-selection and alias consistency only; it does
+not prove MTRR-derived effective write-back caching.
+
+This point-in-time validation provides no independent physical or
+cryptographic authentication. It does not prevent post-check TOCTOU or
+mutation by a malicious loader, firmware, unsafe code, or DMA.
+
 BootInfo, referenced handoff allocations, the loader transition stack, and
 transition page tables remain reserved until Deepwyrm has validated and
 copied or claimed the required information, switched to its own page tables,
@@ -70,3 +89,10 @@ overlap, arithmetic overflow, writable-executable segments, invalid entry
 placement, malformed BootInfo inputs, and handoff ranges that cannot remain
 mapped and reserved for the required lifetime. The loader must not guess a
 missing Deepwyrm ABI or linker constant.
+
+## Evidence lineage
+
+The accepted producer revision `bee49a19a8c4c341b8fd6ed71606f9473b00ae64`
+and acceptance-evidence revision `4b2d1d44152daf93a29613094f7361ea0ba8adc1`
+are preserved historical accepted identities. This documentation-only
+descendant neither alters the accepted artifacts nor assumes either identity.
