@@ -6,6 +6,17 @@ The project aims to provide a modern native operating-system substrate with a Un
 
 > **Status:** early architecture and bootstrap planning. Initial implementation should stop at a reliable text-mode/self-hosting system before graphical integration begins.
 
+## Repository bootstrap status
+
+The repository is being scaffolded for phase WYR0-A. The initial tree establishes project
+boundaries, pinned-input metadata, and host-checkable workspace structure only. It does not yet
+implement the UEFI boot path, native runtime, image construction, QEMU integration, or any WYR0
+acceptance gate.
+
+Command names described in `Plans/` are planned interfaces until their corresponding tooling is
+implemented and tested. Do not treat the presence of a crate, target definition, manifest, or
+placeholder entry point as evidence that a Wyrmroot guest artifact can boot or run.
+
 ## Project goals
 
 - **Own the operating system stack.** Wyrmroot is not intended to be a Linux distribution or a reskinned existing Unix.

@@ -1,0 +1,19 @@
+# Cargo and Rust build output
+/target/
+
+# Wyrmroot-generated build, image, and test output
+/artifacts/
+/build/
+/dist/
+
+# Coverage, profiling, and compiler diagnostics
+*.profdata
+*.profraw
+/rustc-ice-*.txt
+
+# Local editor and operating-system metadata
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

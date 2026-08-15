@@ -1,0 +1,10 @@
+[package]
+name = "wyrmroot-loader"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-only"
+publish = false
+description = "Wyrmroot userspace executable-loading support"
+
+[lib]
+path = "src/lib.rs"

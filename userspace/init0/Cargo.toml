@@ -1,0 +1,10 @@
+[package]
+name = "wyrmroot-init0"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Placeholder crate for the temporary WYR0 init0 application"
+license = "GPL-3.0-only"
+
+[lib]
+path = "src/lib.rs"

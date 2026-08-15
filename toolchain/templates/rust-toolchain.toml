@@ -1,0 +1,4 @@
+# Activation template. Do not move this to the repository root until the
+# matching locally built fork toolchain has been registered and verified.
+[toolchain]
+channel = "wyrmroot-1.97.1-8bab26f4"

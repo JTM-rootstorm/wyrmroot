@@ -1,0 +1,40 @@
+schema_version = 1
+milestone = "WYR0"
+
+[deepwyrm]
+repository = "https://github.com/JTM-rootstorm/deepwyrm"
+revision = "37d8665ba9aa34f3ac086d68c515f54334c850c8"
+abi_version = 0
+abi_dependency_state = "not-yet-available"
+
+[rust]
+upstream_repository = "https://github.com/rust-lang/rust"
+upstream_stable_release = "1.97.1"
+upstream_stable_revision = "8bab26f4f68e0e26f0bb7960be334d5b520ea452"
+fork_repository = "git@github.com:JTM-rootstorm/rust.git"
+wyrmroot_revision = "8bab26f4f68e0e26f0bb7960be334d5b520ea452"
+local_toolchain_name = "wyrmroot-1.97.1-8bab26f4"
+native_target = "x86_64-unknown-wyrmroot"
+native_target_state = "reserved-not-yet-implemented"
+
+[llvm]
+canonical_c_compiler = "clang"
+canonical_cxx_compiler = "clang++"
+canonical_linker = "ld.lld"
+canonical_compiler_runtime = "compiler-rt"
+canonical_archiver = "llvm-ar"
+canonical_object_tools = [
+    "llvm-readelf",
+    "llvm-objdump",
+    "llvm-nm",
+    "llvm-objcopy",
+    "llvm-symbolizer",
+]
+canonical_debugger = "gdb"
+host_version_state = "not-yet-adopted"
+
+[bootstrap_constraints]
+allow_moving_rust_channel = false
+allow_host_target_defaults_for_guest = false
+allow_host_libc_for_guest = false
+allow_unimplemented_deepwyrm_abi_dependency = false

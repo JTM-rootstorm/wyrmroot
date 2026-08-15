@@ -1,0 +1,10 @@
+[package]
+name = "wyrmroot-runtime"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-only"
+publish = false
+description = "Minimal native runtime support for Wyrmroot"
+
+[lib]
+path = "src/lib.rs"

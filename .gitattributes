@@ -1,0 +1,14 @@
+* text=auto
+
+*.md text eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+*.efi binary
+*.elf binary
+*.fd binary
+*.img binary
+*.qcow2 binary
+*.raw binary
