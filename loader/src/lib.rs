@@ -17,6 +17,7 @@ pub mod config;
 pub mod diagnostics;
 pub mod entry;
 pub mod firmware;
+pub mod kernel_elf;
 
 /// Canonical Deepwyrm definitions consumed by the UEFI loader boundary.
 ///
