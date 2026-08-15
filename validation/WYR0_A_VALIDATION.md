@@ -1,10 +1,10 @@
 # WYR0-A Validation Record
 
-**Date:** 2026-08-15  
-**Scope:** WYR0-A workspace, reproducible tooling, and Deepwyrm ABI consumption  
-**Wyrmroot implementation revision:** `9c7beee2174e49c70a2738a82147a832284ab646`  
-**Deepwyrm ABI revision:** `4751a2d3929675357e31389301d152f86e2ab7cb`  
-**Deepwyrm schema parent:** `092e20610b2d1c3b979d3c70b6645990f82a02df`  
+**Date:** 2026-08-15
+**Scope:** WYR0-A workspace, reproducible tooling, and Deepwyrm ABI consumption
+**Wyrmroot implementation revision:** `9c7beee2174e49c70a2738a82147a832284ab646`
+**Deepwyrm ABI revision:** `4751a2d3929675357e31389301d152f86e2ab7cb`
+**Deepwyrm schema parent:** `092e20610b2d1c3b979d3c70b6645990f82a02df`
 **Rust upstream/fork revision:** `8bab26f4f68e0e26f0bb7960be334d5b520ea452` (`1.97.1`)
 
 ## Disposition
