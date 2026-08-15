@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "deepwyrm-abi"
 version = "0.0.0"
-source = "git+https://github.com/JTM-rootstorm/deepwyrm.git?rev=4751a2d3929675357e31389301d152f86e2ab7cb#4751a2d3929675357e31389301d152f86e2ab7cb"
+source = "git+https://github.com/JTM-rootstorm/deepwyrm.git?rev=37338e8d44c08ef039eb34a01292a6b6cb5cac3a#37338e8d44c08ef039eb34a01292a6b6cb5cac3a"
 
 [[package]]
 name = "wyrmroot-bootfs"
