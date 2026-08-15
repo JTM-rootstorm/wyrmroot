@@ -23,7 +23,7 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 [[package]]
 name = "deepwyrm-abi"
 version = "0.0.0"
-source = "git+https://github.com/JTM-rootstorm/deepwyrm.git?rev=37338e8d44c08ef039eb34a01292a6b6cb5cac3a#37338e8d44c08ef039eb34a01292a6b6cb5cac3a"
+source = "git+https://github.com/JTM-rootstorm/deepwyrm.git?rev=d827dcbc3723904a2601fee3a9af42e27cdad693#d827dcbc3723904a2601fee3a9af42e27cdad693"
 
 [[package]]
 name = "log"

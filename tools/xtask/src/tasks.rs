@@ -5,19 +5,22 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use crate::cli::validate_filter;
+use crate::deep_layout::DeepLayoutBuild;
 use crate::error::Failure;
 use crate::metadata::{BuildManifest, LoaderProfile};
 use crate::provenance::{LoaderProvenance, write_loader_provenance};
 use crate::sha256::{bytes_digest, file_digest};
+use crate::toolchain_artifact::AcceptedToolchain;
 
 const UEFI_TARGET_DIRECTORY: &str = "target/wyr0-b";
 const UEFI_PROFILE_DIRECTORY: &str = "debug";
 const TOOLCHAIN_REQUEST: &str = "toolchain/requests/RUST-WYR0B-UEFI-001.toml";
 const MAX_LOADER_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DEBUG_SYMBOL_BYTES: u64 = 512 * 1024 * 1024;
+const DEEP_LAYOUT_POLICY_ENV: &str = "WYRMROOT_DEEP_LAYOUT_POLICY_RS";
 
 pub(crate) struct LoaderToolchain {
-    rustc: PathBuf,
+    accepted: AcceptedToolchain,
     validation_report: String,
 }
 
@@ -59,6 +62,7 @@ pub(crate) fn run_loader_build(
     manifest: &BuildManifest,
     profile: &LoaderProfile,
     toolchain: &LoaderToolchain,
+    layout: &DeepLayoutBuild,
 ) -> Result<(), Failure> {
     run_cargo(
         repository,
@@ -67,16 +71,18 @@ pub(crate) fn run_loader_build(
     let target_directory = repository.join(UEFI_TARGET_DIRECTORY);
     run_uefi_cargo(
         repository,
-        &toolchain.rustc,
+        toolchain,
         profile,
         &target_directory,
+        &layout.policy_path,
         "check",
     )?;
     run_uefi_cargo(
         repository,
-        &toolchain.rustc,
+        toolchain,
         profile,
         &target_directory,
+        &layout.policy_path,
         "build",
     )?;
 
@@ -100,7 +106,7 @@ pub(crate) fn run_loader_build(
     )?;
     let loader_hash = digest(&loader)?;
     let debug_hash = digest(&debug_symbols)?;
-    let rustc_hash = digest(&toolchain.rustc)?;
+    let rustc_hash = digest(&toolchain.accepted.rustc)?;
     let versions_hash = digest(&repository.join("toolchain/versions.toml"))?;
     let profiles_hash = digest(&repository.join("toolchain/profiles.toml"))?;
     let toolchain_report_hash = bytes_digest(toolchain.validation_report.as_bytes());
@@ -117,6 +123,11 @@ pub(crate) fn run_loader_build(
         rust_revision: manifest.rust_revision()?,
         rust_toolchain_name: manifest.rust_toolchain_name()?,
         rustc_sha256: &rustc_hash,
+        cargo_sha256: &toolchain.accepted.cargo_sha256,
+        rust_lld_sha256: &toolchain.accepted.rust_lld_sha256,
+        uefi_core_sha256: &toolchain.accepted.uefi_core_sha256,
+        uefi_builtins_sha256: &toolchain.accepted.uefi_builtins_sha256,
+        toolchain_manifest_sha256: &toolchain.accepted.manifest_sha256,
         target: &profile.rust_target,
         package: &profile.cargo_package,
         binary: &profile.cargo_binary,
@@ -126,6 +137,8 @@ pub(crate) fn run_loader_build(
         debug_sha256: &debug_hash,
         versions_sha256: &versions_hash,
         profiles_sha256: &profiles_hash,
+        deep_layout_sha256: &layout.layout_sha256,
+        generated_layout_policy_sha256: &layout.policy_sha256,
         toolchain_report_sha256: &toolchain_report_hash,
         artifact_report_sha256: &artifact_report_hash,
     };
@@ -155,22 +168,31 @@ fn repository_relative_path(
 pub(crate) fn prepare_loader_toolchain(
     repository: &Path,
     profile: &LoaderProfile,
+    manifest: &BuildManifest,
 ) -> Result<LoaderToolchain, Failure> {
     reject_ambient_rust_overrides()?;
-    let rustc = accepted_rustc(repository)?;
+    let configured = configured_rustc(repository)?;
+    let accepted = crate::toolchain_artifact::prepare(
+        repository,
+        &configured,
+        manifest.rust_toolchain_name()?,
+        manifest.rust_revision()?,
+    )?;
+    accepted.verify_unchanged()?;
     let validation_report = run_verified_report(
         repository,
         &profile.toolchain_inspection,
-        [OsStr::new("--rustc"), rustc.as_os_str()],
+        [OsStr::new("--rustc"), accepted.rustc.as_os_str()],
         "UEFI toolchain validation",
     )?;
+    accepted.verify_unchanged()?;
     Ok(LoaderToolchain {
-        rustc,
+        accepted,
         validation_report,
     })
 }
 
-fn accepted_rustc(repository: &Path) -> Result<PathBuf, Failure> {
+fn configured_rustc(repository: &Path) -> Result<PathBuf, Failure> {
     let Some(configured) = env::var_os("WYRMROOT_RUSTC") else {
         let request_path = repository.join(TOOLCHAIN_REQUEST);
         let request = fs::read_to_string(&request_path).map_err(|error| {
@@ -186,18 +208,6 @@ fn accepted_rustc(repository: &Path) -> Result<PathBuf, Failure> {
         return Err(Failure::task(
             "WYRMROOT_RUSTC must be an absolute path to the accepted compiler",
         ));
-    }
-    let metadata = fs::metadata(&path).map_err(|error| {
-        Failure::task(format!(
-            "could not inspect accepted rustc {}: {error}",
-            path.display()
-        ))
-    })?;
-    if !metadata.is_file() {
-        return Err(Failure::task(format!(
-            "accepted rustc path is not a regular file: {}",
-            path.display()
-        )));
     }
     Ok(path)
 }
@@ -228,6 +238,7 @@ fn reject_ambient_rust_overrides() -> Result<(), Failure> {
         "RUSTC_WORKSPACE_WRAPPER",
         "CARGO_BUILD_TARGET",
         "CARGO_TARGET_DIR",
+        DEEP_LAYOUT_POLICY_ENV,
     ] {
         if env::var_os(variable).is_some() {
             return Err(Failure::task(format!(
@@ -278,13 +289,25 @@ where
 
 fn run_uefi_cargo(
     repository: &Path,
-    rustc: &Path,
+    toolchain: &LoaderToolchain,
     profile: &LoaderProfile,
     target_directory: &Path,
+    layout_policy: &Path,
     operation: &str,
 ) -> Result<(), Failure> {
-    let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let status = Command::new(cargo)
+    toolchain.accepted.verify_unchanged()?;
+    let sysroot = toolchain
+        .accepted
+        .sysroot
+        .to_str()
+        .ok_or_else(|| Failure::task("accepted toolchain sysroot path is not valid UTF-8"))?;
+    let rust_lld = toolchain
+        .accepted
+        .rust_lld
+        .to_str()
+        .ok_or_else(|| Failure::task("accepted rust-lld path is not valid UTF-8"))?;
+    let encoded_rustflags = format!("--sysroot\u{1f}{sysroot}\u{1f}-C\u{1f}linker={rust_lld}");
+    let status = Command::new(&toolchain.accepted.cargo)
         .arg(operation)
         .arg("--locked")
         .arg("--package")
@@ -297,11 +320,18 @@ fn run_uefi_cargo(
         .arg(&profile.rust_target)
         .arg("--target-dir")
         .arg(target_directory)
-        .env("RUSTC", rustc)
+        .env("RUSTC", &toolchain.accepted.rustc)
+        .env("CARGO_ENCODED_RUSTFLAGS", encoded_rustflags)
+        .env(
+            "CARGO_TARGET_X86_64_UNKNOWN_UEFI_LINKER",
+            &toolchain.accepted.rust_lld,
+        )
+        .env(DEEP_LAYOUT_POLICY_ENV, layout_policy)
         .current_dir(repository)
         .stdin(Stdio::null())
         .status()
         .map_err(|error| Failure::task(format!("could not run Cargo {operation}: {error}")))?;
+    toolchain.accepted.verify_unchanged()?;
     if status.success() {
         Ok(())
     } else {

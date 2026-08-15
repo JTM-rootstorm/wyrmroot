@@ -2,9 +2,11 @@
 mod uefi_app;
 
 use uefi_app::{
-    ACPI_RSDP_V1_BYTES, ACPI_RSDP_V2_MIN_BYTES, CONFIG_PATH, MAX_KERNEL_ARTIFACT_BYTES,
-    MAX_TOTAL_ARTIFACT_BYTES, PreparationError, UEFI_PAGE_BYTES, bounded_artifact_len,
-    normalize_optional_config, pages_for_payload, total_artifact_bytes, validate_acpi_rsdp,
+    ACPI_RSDP_V1_BYTES, ACPI_RSDP_V2_MIN_BYTES, AcpiRsdpConfigCandidate, AcpiRsdpConfigKind,
+    CONFIG_PATH, MAX_KERNEL_ARTIFACT_BYTES, MAX_TOTAL_ARTIFACT_BYTES, PreparationError,
+    UEFI_PAGE_BYTES, allocation_bytes_for_payload, bounded_artifact_len,
+    initialize_payload_allocation, normalize_optional_config, pages_for_payload,
+    rsdp_intersecting_pages, select_rsdp_candidate, total_artifact_bytes, validate_acpi_rsdp,
     validate_acpi_rsdp_address,
 };
 use wyrmroot_efi_loader::config::{ConfigError, LoaderConfig, Profile};
@@ -35,6 +37,15 @@ fn page_accounting_rejects_empty_and_overflowing_payloads() {
         pages_for_payload(usize::MAX),
         Err(PreparationError::PageCountOverflow)
     );
+}
+
+#[test]
+fn one_byte_payload_retains_a_zeroed_full_page() {
+    assert_eq!(allocation_bytes_for_payload(1), Ok(UEFI_PAGE_BYTES));
+    let mut retained = [0xa5_u8; UEFI_PAGE_BYTES];
+    initialize_payload_allocation(&mut retained, &[0x42]).unwrap();
+    assert_eq!(retained[0], 0x42);
+    assert!(retained[1..].iter().all(|byte| *byte == 0));
 }
 
 #[test]
@@ -92,5 +103,54 @@ fn rsdp_validation_requires_checksums_and_bounded_v2_length() {
     assert_eq!(
         validate_acpi_rsdp(&v2),
         Err(PreparationError::InvalidAcpiRsdpChecksum)
+    );
+}
+
+#[test]
+fn rsdp_selection_prefers_acpi2_and_rejects_duplicates_without_downgrade() {
+    let acpi1 = AcpiRsdpConfigCandidate {
+        kind: AcpiRsdpConfigKind::Acpi1,
+        physical_start: 0x1000,
+    };
+    let acpi2 = AcpiRsdpConfigCandidate {
+        kind: AcpiRsdpConfigKind::Acpi2,
+        physical_start: 0x2000,
+    };
+    assert_eq!(select_rsdp_candidate([acpi1, acpi2]), Ok(Some(acpi2)));
+    assert_eq!(select_rsdp_candidate([acpi1]), Ok(Some(acpi1)));
+    assert_eq!(
+        select_rsdp_candidate([acpi2, acpi2]),
+        Err(PreparationError::DuplicateSelectedAcpiGuid)
+    );
+    // ACPI2 is selected before validation, so later malformed-record handling
+    // receives its address and cannot silently retry the ACPI1 candidate.
+    assert_eq!(select_rsdp_candidate([acpi1, acpi2]), Ok(Some(acpi2)));
+    assert_eq!(
+        select_rsdp_candidate([acpi1, acpi1, acpi2]),
+        Ok(Some(acpi2))
+    );
+}
+
+#[test]
+fn retained_rsdp_maps_only_its_intersecting_base_pages() {
+    let one_page = rsdp_intersecting_pages(0x2010, 36, UEFI_PAGE_BYTES as u64).unwrap();
+    assert_eq!(
+        one_page,
+        uefi_app::AcpiRsdpPageRange {
+            physical_start: 0x2000,
+            byte_len: 4096,
+        }
+    );
+    assert_eq!(one_page.page_count(UEFI_PAGE_BYTES as u64), 1);
+    assert_eq!(
+        rsdp_intersecting_pages(0x2ff0, 36, UEFI_PAGE_BYTES as u64),
+        Ok(uefi_app::AcpiRsdpPageRange {
+            physical_start: 0x2000,
+            byte_len: 8192,
+        })
+    );
+    assert_eq!(
+        rsdp_intersecting_pages(0x2000, 8193, UEFI_PAGE_BYTES as u64),
+        Err(PreparationError::AcpiMappingExceedsTwoPages)
     );
 }

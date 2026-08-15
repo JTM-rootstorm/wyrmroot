@@ -2,7 +2,11 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+#[allow(dead_code)] // Invoked only by the target-only final transfer after EBS.
+mod handoff_x86_64;
 mod uefi_app;
+#[allow(dead_code)] // Activated by the pending ownership-complete handoff builder.
+mod uefi_page_table;
 
 #[uefi::entry]
 fn main() -> uefi::Status {

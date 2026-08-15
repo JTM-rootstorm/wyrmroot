@@ -17,6 +17,11 @@ pub const CONFIG_PATH: &str = "/EFI/Wyrmroot/loader.conf";
 /// UEFI page size used solely for firmware page-allocation accounting.
 pub const UEFI_PAGE_BYTES: usize = 4096;
 
+// The loader's UEFI allocation granule must never drift from the generated
+// Deepwyrm BootInfo base-page contract. This is a compile-time equality guard,
+// not a locally duplicated ABI value.
+const _: [(); UEFI_PAGE_BYTES] = [(); deepwyrm_abi::DW_BOOT_BASE_PAGE_SIZE as usize];
+
 /// Loader-local admission limit for the kernel ELF.
 ///
 /// The phase plan does not yet prescribe artifact limits. This deliberately
@@ -49,6 +54,7 @@ pub const MAX_ACPI_RSDP_BYTES: usize = UEFI_PAGE_BYTES;
 pub enum PreparationError {
     Config(ConfigError),
     PageCountOverflow,
+    AllocationExtentMismatch,
     EmptyArtifact,
     ArtifactTooLarge,
     ArtifactLengthNotRepresentable,
@@ -57,6 +63,13 @@ pub enum PreparationError {
     InvalidAcpiRsdpSignature,
     InvalidAcpiRsdpLength,
     InvalidAcpiRsdpChecksum,
+    DuplicateSelectedAcpiGuid,
+    #[allow(dead_code)] // Returned by the pending generated-policy mapping bridge.
+    InvalidMappingGranule,
+    #[allow(dead_code)] // Returned by the pending generated-policy mapping bridge.
+    AcpiRangeOverflow,
+    #[allow(dead_code)] // Returned by the pending generated-policy mapping bridge.
+    AcpiMappingExceedsTwoPages,
 }
 
 /// Parsed facts needed to retain a validated RSDP without inventing an ACPI
@@ -65,6 +78,97 @@ pub enum PreparationError {
 pub struct AcpiRsdpLayout {
     pub revision: u8,
     pub byte_len: usize,
+}
+
+/// Firmware configuration-table identity relevant to RSDP selection only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AcpiRsdpConfigKind {
+    Acpi1,
+    Acpi2,
+}
+
+/// A configuration-table candidate normalized without retaining UEFI types.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AcpiRsdpConfigCandidate {
+    pub kind: AcpiRsdpConfigKind,
+    pub physical_start: u64,
+}
+
+/// The one contiguous identity range covering the one or two base pages that
+/// intersect a retained, validated RSDP record.
+#[allow(dead_code)] // Consumed by the pending generated-policy mapping bridge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AcpiRsdpPageRange {
+    pub physical_start: u64,
+    pub byte_len: u64,
+}
+
+#[allow(dead_code)] // Consumed by the pending generated-policy mapping bridge.
+impl AcpiRsdpPageRange {
+    pub const fn page_count(self, page_granule: u64) -> u64 {
+        self.byte_len / page_granule
+    }
+}
+
+/// Selects ACPI 2.0 when present. A duplicate selected GUID is ambiguous and
+/// rejected; a malformed selected ACPI2 record is later rejected in-place and
+/// must never trigger a silent ACPI1 downgrade.
+pub fn select_rsdp_candidate(
+    candidates: impl IntoIterator<Item = AcpiRsdpConfigCandidate>,
+) -> Result<Option<AcpiRsdpConfigCandidate>, PreparationError> {
+    let mut acpi1 = None;
+    let mut acpi2 = None;
+    let mut duplicate_acpi1 = false;
+    for candidate in candidates {
+        match candidate.kind {
+            AcpiRsdpConfigKind::Acpi1 => {
+                duplicate_acpi1 |= acpi1.replace(candidate).is_some();
+            }
+            AcpiRsdpConfigKind::Acpi2 => {
+                if acpi2.replace(candidate).is_some() {
+                    return Err(PreparationError::DuplicateSelectedAcpiGuid);
+                }
+            }
+        }
+    }
+    if let Some(acpi2) = acpi2 {
+        return Ok(Some(acpi2));
+    }
+    if duplicate_acpi1 {
+        return Err(PreparationError::DuplicateSelectedAcpiGuid);
+    }
+    Ok(acpi1)
+}
+
+/// Derives the exact base pages required for a retained validated RSDP. The
+/// caller supplies the generated base-page granule; no local ACPI mapping cap
+/// or traversal policy is introduced here.
+#[allow(dead_code)] // Consumed by the pending generated-policy mapping bridge.
+pub fn rsdp_intersecting_pages(
+    physical_start: u64,
+    record_byte_len: u64,
+    page_granule: u64,
+) -> Result<AcpiRsdpPageRange, PreparationError> {
+    if page_granule == 0 || !page_granule.is_power_of_two() || record_byte_len == 0 {
+        return Err(PreparationError::InvalidMappingGranule);
+    }
+    let record_end = physical_start
+        .checked_add(record_byte_len - 1)
+        .ok_or(PreparationError::AcpiRangeOverflow)?;
+    let page_mask = page_granule - 1;
+    let first_page = physical_start & !page_mask;
+    let last_page = record_end & !page_mask;
+    let byte_len = last_page
+        .checked_sub(first_page)
+        .and_then(|span| span.checked_add(page_granule))
+        .ok_or(PreparationError::AcpiRangeOverflow)?;
+    if byte_len > page_granule.saturating_mul(2) {
+        return Err(PreparationError::AcpiMappingExceedsTwoPages);
+    }
+    Ok(AcpiRsdpPageRange {
+        physical_start: first_page,
+        byte_len,
+    })
 }
 
 /// Validates the firmware-supplied RSDP address before any raw dereference.
@@ -120,6 +224,28 @@ pub fn pages_for_payload(byte_len: usize) -> Result<usize, PreparationError> {
         .ok_or(PreparationError::PageCountOverflow)
 }
 
+/// Full page-backed allocation extent for one payload. This is distinct from
+/// the exact payload length exposed in module records.
+pub fn allocation_bytes_for_payload(byte_len: usize) -> Result<usize, PreparationError> {
+    pages_for_payload(byte_len)?
+        .checked_mul(UEFI_PAGE_BYTES)
+        .ok_or(PreparationError::PageCountOverflow)
+}
+
+/// Initializes the entire retained allocation before copying exact payload
+/// bytes. This pure seam prevents page slack from retaining firmware data.
+pub fn initialize_payload_allocation(
+    allocation: &mut [u8],
+    payload: &[u8],
+) -> Result<(), PreparationError> {
+    if allocation.len() != allocation_bytes_for_payload(payload.len())? {
+        return Err(PreparationError::AllocationExtentMismatch);
+    }
+    allocation.fill(0);
+    allocation[..payload.len()].copy_from_slice(payload);
+    Ok(())
+}
+
 /// Validates an ACPI RSDP byte range before it becomes a handoff dependency.
 pub fn validate_acpi_rsdp(bytes: &[u8]) -> Result<AcpiRsdpLayout, PreparationError> {
     if bytes.len() < ACPI_RSDP_V1_BYTES || bytes[..8] != *b"RSD PTR " {
@@ -163,11 +289,18 @@ mod firmware {
     extern crate alloc;
 
     use alloc::vec::Vec;
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    use core::arch::x86_64::__cpuid;
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    use core::mem::{align_of, size_of};
     use core::ptr::{self, NonNull};
 
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    use deepwyrm_abi::{DwBootInfoV1, DwBootMemoryRangeV1, DwBootModuleV1};
     use uefi::boot::{
         self, AllocateType, MemoryType, MemoryType as UefiMemoryType, ScopedProtocol,
     };
+    use uefi::mem::memory_map::MemoryMapMut;
     use uefi::proto::console::gop::{GraphicsOutput, PixelFormat};
     use uefi::proto::media::file::{Directory, File, FileAttribute, FileInfo, FileMode};
     use uefi::proto::rng::Rng;
@@ -184,6 +317,28 @@ mod firmware {
         pages_for_payload, total_artifact_bytes, validate_acpi_rsdp, validate_acpi_rsdp_address,
     };
 
+    /// The exact purpose of a pre-EBS allocation. Byte and page counts remain
+    /// caller inputs until the pinned Deepwyrm layout manifest is available.
+    #[allow(dead_code)] // Final transaction inputs are supplied after ABI policy generation.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum PreExitAllocationPurpose {
+        KernelSegment { program_header_index: u16 },
+        PageTableStorage,
+        TransitionStack,
+        BootInfo,
+        MemoryMapTable,
+        ModuleTable,
+        HandoffScratch,
+    }
+
+    /// One caller-sized request for an exact zeroed LoaderData allocation.
+    #[allow(dead_code)] // Final transaction inputs are supplied after ABI policy generation.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct PreExitAllocationRequest {
+        pub purpose: PreExitAllocationPurpose,
+        pub page_count: usize,
+    }
+
     /// Firmware-specific failure before boot services have exited.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum FirmwarePreparationError {
@@ -194,15 +349,42 @@ mod firmware {
         Allocation,
         ShortRead,
         Acpi(PreparationError),
+        InvalidPreExitAllocation,
+        DuplicatePreExitAllocation,
+        PreExitAllocationSlotsExhausted,
+        CopyRangeInvalid,
+        #[allow(dead_code)] // Constructed by the pending kernel materialization bridge.
+        KernelSourceReleased,
+        #[allow(dead_code)] // Constructed by target-only CPUID probing.
+        CpuMaxPhysicalAddressUnavailable,
+        #[allow(dead_code)] // Constructed by target-only named typed-view methods.
+        TypedViewInvalid,
+        #[allow(dead_code)] // Constructed by target-only generated-granule guard.
+        GeneratedPageGranuleMismatch,
+        #[allow(dead_code)] // Constructed only in the x86_64 UEFI target discovery path.
+        LinkedHandoffStub,
     }
 
     /// Explicit firmware-entropy outcome; neither absence nor failure receives
     /// a synthetic replacement value. Successful bytes are retained in pages.
     #[derive(Debug)]
     pub enum FirmwareEntropy {
-        Available(RetainedPages),
+        Available {
+            storage: RetainedPages,
+            #[allow(dead_code)] // Forwarded unchanged to canonical BootInfo construction.
+            source: FirmwareEntropySource,
+            #[allow(dead_code)] // Forwarded unchanged to canonical BootInfo construction.
+            conditioned: bool,
+        },
         Unavailable,
         Failed,
+    }
+
+    /// The loader records firmware entropy provenance explicitly instead of
+    /// inferring a property from the storage location.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum FirmwareEntropySource {
+        UefiRngProtocol,
     }
 
     /// GOP pixel layout copied from firmware. RGB and BGR formats have their
@@ -246,17 +428,25 @@ mod firmware {
     pub struct RetainedPages {
         ptr: NonNull<u8>,
         page_count: usize,
-        byte_len: usize,
+        allocation_byte_len: usize,
+        payload_byte_len: usize,
     }
 
-    #[allow(dead_code)] // Transition/BootInfo consumes these retained-range facts.
+    #[allow(dead_code)] // Includes the pending pre-EBS segment/table allocation API.
     impl RetainedPages {
         pub fn physical_start(&self) -> u64 {
             self.ptr.as_ptr() as u64
         }
 
-        pub const fn byte_len(&self) -> usize {
-            self.byte_len
+        /// Full page-rounded retained extent. Collision, mapping, and lifetime
+        /// checks must use this value, never the smaller payload byte length.
+        pub const fn allocation_byte_len(&self) -> usize {
+            self.allocation_byte_len
+        }
+
+        /// Exact initialized payload length used for module/entropy/RSDP data.
+        pub const fn payload_byte_len(&self) -> usize {
+            self.payload_byte_len
         }
 
         pub const fn page_count(&self) -> usize {
@@ -270,12 +460,245 @@ mod firmware {
             unsafe { boot::free_pages(self.ptr, self.page_count) }
                 .expect("retained pre-exit pages must be releasable");
         }
+
+        /// Allocates exactly `page_count` fresh LoaderData pages and clears the
+        /// full allocation before any kernel segment or handoff table copy.
+        fn allocate_zeroed_pages(page_count: usize) -> Result<Self, FirmwarePreparationError> {
+            if page_count == 0 {
+                return Err(FirmwarePreparationError::InvalidPreExitAllocation);
+            }
+            let allocation_byte_len = page_count
+                .checked_mul(super::UEFI_PAGE_BYTES)
+                .ok_or(FirmwarePreparationError::InvalidPreExitAllocation)?;
+            let ptr = boot::allocate_pages(
+                AllocateType::AnyPages,
+                UefiMemoryType::LOADER_DATA,
+                page_count,
+            )
+            .map_err(|_| FirmwarePreparationError::PageAllocation)?;
+            // SAFETY: UEFI returned exactly `page_count` writable base pages;
+            // `allocation_byte_len` is their checked extent and no alias to this fresh
+            // allocation exists while it is being initialized.
+            unsafe { ptr::write_bytes(ptr.as_ptr(), 0, allocation_byte_len) };
+            Ok(Self {
+                ptr,
+                page_count,
+                allocation_byte_len,
+                payload_byte_len: allocation_byte_len,
+            })
+        }
+
+        /// Copies a bounded source slice into already-zeroed retained pages.
+        /// The caller supplies the ELF file range after hostile-input planning;
+        /// omitted bytes remain zero for BSS and page padding.
+        pub fn copy_zeroed_from(
+            &mut self,
+            destination_offset: usize,
+            source: &[u8],
+        ) -> Result<(), FirmwarePreparationError> {
+            let destination_end = destination_offset
+                .checked_add(source.len())
+                .ok_or(FirmwarePreparationError::CopyRangeInvalid)?;
+            if destination_end > self.allocation_byte_len {
+                return Err(FirmwarePreparationError::CopyRangeInvalid);
+            }
+            // SAFETY: `destination_end` was checked against this allocation's
+            // exact extent; source is a valid slice and retained pages do not
+            // alias its firmware-pool backing storage.
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    source.as_ptr(),
+                    self.ptr.as_ptr().add(destination_offset),
+                    source.len(),
+                )
+            };
+            Ok(())
+        }
+
+        /// Borrows the whole zeroed allocation as exact x86_64 page-table
+        /// pages. The allocation remains owned by `self` throughout the
+        /// callback and therefore cannot be freed or outlive the handoff.
+        #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+        pub fn with_page_table_pages<R>(
+            &mut self,
+            callback: impl FnOnce(&mut [crate::uefi_page_table::PageTablePage]) -> R,
+        ) -> Result<R, FirmwarePreparationError> {
+            verify_generated_base_page_size()?;
+            let page_bytes = size_of::<crate::uefi_page_table::PageTablePage>();
+            if self.allocation_byte_len == 0 || self.allocation_byte_len % page_bytes != 0 {
+                return Err(FirmwarePreparationError::TypedViewInvalid);
+            }
+            let count = self.allocation_byte_len / page_bytes;
+            // SAFETY: the named page-table view validates alignment, checked
+            // extent, and unique ownership below; it cannot escape this borrow.
+            let pages =
+                unsafe { self.typed_slice_mut::<crate::uefi_page_table::PageTablePage>(count)? };
+            Ok(callback(pages))
+        }
+
+        /// Borrows one generated BootInfo object from preallocated storage.
+        #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+        pub fn with_boot_info<R>(
+            &mut self,
+            callback: impl FnOnce(&mut DwBootInfoV1) -> R,
+        ) -> Result<R, FirmwarePreparationError> {
+            verify_generated_base_page_size()?;
+            // SAFETY: this named view retains unique ownership and checks the
+            // generated type's alignment and exact one-element extent.
+            let values = unsafe { self.typed_slice_mut::<DwBootInfoV1>(1)? };
+            Ok(callback(&mut values[0]))
+        }
+
+        /// Borrows exactly `count` generated memory-map records from retained
+        /// storage; count comes from final post-EBS map normalization.
+        #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+        pub fn with_memory_map_records<R>(
+            &mut self,
+            count: usize,
+            callback: impl FnOnce(&mut [DwBootMemoryRangeV1]) -> R,
+        ) -> Result<R, FirmwarePreparationError> {
+            verify_generated_base_page_size()?;
+            // SAFETY: this named view retains unique ownership and validates
+            // count/extent before exposing generated ABI records.
+            let values = unsafe { self.typed_slice_mut::<DwBootMemoryRangeV1>(count)? };
+            Ok(callback(values))
+        }
+
+        /// Borrows exactly `count` generated module records from retained
+        /// storage; canonical module ordering remains owned by `modules`.
+        #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+        pub fn with_module_records<R>(
+            &mut self,
+            count: usize,
+            callback: impl FnOnce(&mut [DwBootModuleV1]) -> R,
+        ) -> Result<R, FirmwarePreparationError> {
+            verify_generated_base_page_size()?;
+            // SAFETY: this named view retains unique ownership and validates
+            // count/extent before exposing generated ABI records.
+            let values = unsafe { self.typed_slice_mut::<DwBootModuleV1>(count)? };
+            Ok(callback(values))
+        }
+
+        /// The only raw conversion point. It is private so no caller can cast
+        /// retained pages into an arbitrary public type.
+        #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+        unsafe fn typed_slice_mut<T>(
+            &mut self,
+            count: usize,
+        ) -> Result<&mut [T], FirmwarePreparationError> {
+            let element_size = size_of::<T>();
+            if element_size == 0 || (self.ptr.as_ptr() as usize) % align_of::<T>() != 0 {
+                return Err(FirmwarePreparationError::TypedViewInvalid);
+            }
+            let byte_len = count
+                .checked_mul(element_size)
+                .ok_or(FirmwarePreparationError::TypedViewInvalid)?;
+            if byte_len > self.allocation_byte_len {
+                return Err(FirmwarePreparationError::TypedViewInvalid);
+            }
+            // SAFETY: caller selected one of the named ABI/page-table types;
+            // this unique `&mut self` owns at least `byte_len` aligned bytes.
+            Ok(unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr().cast::<T>(), count) })
+        }
+    }
+
+    /// One fixed caller-owned slot. Avoiding a growable vector ensures that no
+    /// hidden allocator-backed metadata survives into the final EBS boundary.
+    #[allow(dead_code)] // Fixed slots avoid allocator-backed metadata at the EBS boundary.
+    #[derive(Debug)]
+    pub struct PreExitAllocationSlot {
+        purpose: Option<PreExitAllocationPurpose>,
+        storage: Option<RetainedPages>,
+    }
+
+    #[allow(dead_code)] // Called by the final command-scoped handoff builder.
+    impl PreExitAllocationSlot {
+        pub const fn empty() -> Self {
+            Self {
+                purpose: None,
+                storage: None,
+            }
+        }
+    }
+
+    /// Ownership-complete pre-EBS allocation transaction. The future
+    /// transition/BootInfo adapter must use this for every extra allocation,
+    /// then consume the transaction only after it has built one full plan.
+    #[allow(dead_code)] // Activated once transition and BootInfo inputs share ownership.
+    #[derive(Debug)]
+    pub struct PreExitTransaction<'slots> {
+        prepared: PreparedPreExit,
+        slots: &'slots mut [PreExitAllocationSlot],
+    }
+
+    #[allow(dead_code)] // Activated once transition and BootInfo inputs share ownership.
+    impl<'slots> PreExitTransaction<'slots> {
+        pub fn begin(
+            prepared: PreparedPreExit,
+            slots: &'slots mut [PreExitAllocationSlot],
+        ) -> Result<Self, FirmwarePreparationError> {
+            if slots
+                .iter()
+                .any(|slot| slot.purpose.is_some() || slot.storage.is_some())
+            {
+                return Err(FirmwarePreparationError::InvalidPreExitAllocation);
+            }
+            Ok(Self { prepared, slots })
+        }
+
+        /// Allocates and zeroes one exact, caller-specified handoff object.
+        pub fn allocate(
+            &mut self,
+            request: PreExitAllocationRequest,
+        ) -> Result<&mut RetainedPages, FirmwarePreparationError> {
+            if request.page_count == 0 {
+                return Err(FirmwarePreparationError::InvalidPreExitAllocation);
+            }
+            if self
+                .slots
+                .iter()
+                .any(|slot| slot.purpose == Some(request.purpose))
+            {
+                return Err(FirmwarePreparationError::DuplicatePreExitAllocation);
+            }
+            let slot = self
+                .slots
+                .iter_mut()
+                .find(|slot| slot.storage.is_none())
+                .ok_or(FirmwarePreparationError::PreExitAllocationSlotsExhausted)?;
+            let storage = RetainedPages::allocate_zeroed_pages(request.page_count)?;
+            slot.purpose = Some(request.purpose);
+            slot.storage = Some(storage);
+            // The slot was populated immediately above and stays uniquely
+            // borrowed through `self`, so its retained-page metadata is valid.
+            Ok(slot.storage.as_mut().expect("just populated pre-exit slot"))
+        }
+
+        /// Releases every page on a failure path before boot services exit.
+        pub fn abort_before_exit(self) {
+            for slot in &mut *self.slots {
+                if let Some(storage) = slot.storage.take() {
+                    // SAFETY: transaction abort is exclusively pre-EBS and no
+                    // reference into a failed transaction may escape.
+                    unsafe { storage.release() };
+                }
+                slot.purpose = None;
+            }
+            self.prepared.release_before_exit();
+        }
+
+        /// Exposes the original retained artifact state only to the final
+        /// ownership-complete builder. It must not call EBS until it has also
+        /// converted all slots into the transition and BootInfo inputs.
+        pub fn prepared(&self) -> &PreparedPreExit {
+            &self.prepared
+        }
     }
 
     /// Pre-exit loader state containing only copied metadata and retained pages.
     #[derive(Debug)]
     pub struct PreparedPreExit {
-        pub kernel: RetainedPages,
+        kernel: Option<RetainedPages>,
         pub bootstrap: RetainedPages,
         pub bootfs: RetainedPages,
         pub acpi_rsdp: Option<AcpiRsdp>,
@@ -284,14 +707,56 @@ mod firmware {
         pub entropy: FirmwareEntropy,
     }
 
+    #[allow(dead_code)] // Consumed by the pending pre-EBS kernel materialization bridge.
     impl PreparedPreExit {
+        /// Exact immutable kernel ELF payload for hostile-input planning. The
+        /// source remains page-backed until successful PT_LOAD materialization.
+        pub fn kernel_elf_bytes(&self) -> Result<&[u8], FirmwarePreparationError> {
+            let kernel = self
+                .kernel
+                .as_ref()
+                .ok_or(FirmwarePreparationError::KernelSourceReleased)?;
+            // SAFETY: `kernel` retains the allocation for the returned borrow;
+            // only the exact initialized payload length is exposed.
+            Ok(
+                unsafe {
+                    core::slice::from_raw_parts(kernel.ptr.as_ptr(), kernel.payload_byte_len)
+                },
+            )
+        }
+
+        /// Runs all validated PT_LOAD copies over the immutable source and
+        /// releases only the original kernel source pages after success. A
+        /// failed closure preserves the source for diagnostics/retry; bootstrap,
+        /// bootfs, RSDP, and entropy are never affected by this operation.
+        pub fn materialize_kernel_and_release<R>(
+            &mut self,
+            materialize: impl FnOnce(&[u8]) -> Result<R, FirmwarePreparationError>,
+        ) -> Result<R, FirmwarePreparationError> {
+            let materialized = {
+                let bytes = self.kernel_elf_bytes()?;
+                materialize(bytes)?
+            };
+            let kernel = self
+                .kernel
+                .take()
+                .ok_or(FirmwarePreparationError::KernelSourceReleased)?;
+            // SAFETY: successful caller materialization is the only path to
+            // this consume point, and no immutable source borrow remains.
+            unsafe { kernel.release() };
+            Ok(materialized)
+        }
+
         /// Frees retained pages while boot services are still live. The current
         /// entry uses this fail-closed path until transition and BootInfo inputs
         /// are integrated into the same pre-exit allocation transaction.
         pub fn release_before_exit(self) {
             // SAFETY: this consumes every allocation before ExitBootServices;
             // no reference into these pages escapes the current fail-closed path.
-            unsafe { self.kernel.release() };
+            if let Some(kernel) = self.kernel {
+                // SAFETY: the source allocation is still pre-exit and uniquely owned.
+                unsafe { kernel.release() };
+            }
             // SAFETY: same ownership argument as for `kernel`.
             unsafe { self.bootstrap.release() };
             // SAFETY: same ownership argument as for `kernel`.
@@ -300,9 +765,9 @@ mod firmware {
                 // SAFETY: the retained copy is still pre-exit and uniquely owned.
                 unsafe { acpi.storage.release() };
             }
-            if let FirmwareEntropy::Available(entropy) = self.entropy {
+            if let FirmwareEntropy::Available { storage, .. } = self.entropy {
                 // SAFETY: the retained entropy copy is still pre-exit and uniquely owned.
-                unsafe { entropy.release() };
+                unsafe { storage.release() };
             }
         }
     }
@@ -313,6 +778,16 @@ mod firmware {
     pub struct PreparedPostExit {
         pub pre_exit: PreparedPreExit,
         pub memory_map: uefi::mem::memory_map::MemoryMapOwned,
+    }
+
+    #[allow(dead_code)] // Invoked only after EBS by final allocation-free normalization.
+    impl PreparedPostExit {
+        /// Sorts the final UEFI memory map in place. `MemoryMapMut::sort`
+        /// performs no allocation; the forthcoming generated coalescer must
+        /// consume this sorted map into preallocated BootInfo storage.
+        pub fn sort_final_memory_map(&mut self) {
+            self.memory_map.sort();
+        }
     }
 
     struct LoadedFiles {
@@ -351,6 +826,16 @@ mod firmware {
             framebuffer,
             entropy,
         )
+    }
+
+    /// Discover the exact linked CR3-replacement stub on the UEFI target. The
+    /// returned `(start, byte_len, entry)` must be supplied unchanged to the
+    /// transition planner; it is not a loader-local layout constant.
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    #[allow(dead_code)] // Called once generated layout inputs permit final transaction wiring.
+    pub fn discover_linked_handoff_stub() -> Result<(u64, u64, u64), FirmwarePreparationError> {
+        crate::handoff_x86_64::linked_handoff_stub()
+            .map_err(|_| FirmwarePreparationError::LinkedHandoffStub)
     }
 
     /// Uses uefi-rs's spec-compliant final-map / ExitBootServices retry wrapper.
@@ -510,7 +995,7 @@ mod firmware {
         };
 
         Ok(PreparedPreExit {
-            kernel,
+            kernel: Some(kernel),
             bootstrap,
             bootfs,
             acpi_rsdp,
@@ -529,23 +1014,16 @@ mod firmware {
     fn retain_payload(payload: &[u8]) -> Result<RetainedPages, FirmwarePreparationError> {
         let page_count =
             pages_for_payload(payload.len()).map_err(FirmwarePreparationError::Artifact)?;
-        let ptr = boot::allocate_pages(
-            AllocateType::AnyPages,
-            UefiMemoryType::LOADER_DATA,
-            page_count,
-        )
-        .map_err(|_| FirmwarePreparationError::PageAllocation)?;
-
-        // SAFETY: `allocate_pages` returned `page_count * 4096` writable bytes,
-        // which is at least `payload.len()` by `pages_for_payload`; the source
-        // slice is valid and the allocation cannot overlap it.
-        unsafe { ptr::copy_nonoverlapping(payload.as_ptr(), ptr.as_ptr(), payload.len()) };
-
-        Ok(RetainedPages {
-            ptr,
-            page_count,
-            byte_len: payload.len(),
-        })
+        let mut retained = RetainedPages::allocate_zeroed_pages(page_count)?;
+        // SAFETY: retained storage has exactly the checked full allocation
+        // extent. The pure helper clears all slack before copying the payload.
+        let allocation = unsafe {
+            core::slice::from_raw_parts_mut(retained.ptr.as_ptr(), retained.allocation_byte_len)
+        };
+        super::initialize_payload_allocation(allocation, payload)
+            .map_err(FirmwarePreparationError::Artifact)?;
+        retained.payload_byte_len = payload.len();
+        Ok(retained)
     }
 
     enum CollectedEntropy {
@@ -572,29 +1050,70 @@ mod firmware {
         entropy: CollectedEntropy,
     ) -> Result<FirmwareEntropy, FirmwarePreparationError> {
         match entropy {
-            CollectedEntropy::Available(bytes) => {
-                retain_payload(&bytes).map(FirmwareEntropy::Available)
-            }
+            CollectedEntropy::Available(bytes) => retain_payload(&bytes).map(|storage| {
+                FirmwareEntropy::Available {
+                    storage,
+                    source: FirmwareEntropySource::UefiRngProtocol,
+                    // The UEFI RNG protocol does not itself attest that the
+                    // bytes have passed Deepwyrm's conditioning policy.
+                    conditioned: false,
+                }
+            }),
             CollectedEntropy::Unavailable => Ok(FirmwareEntropy::Unavailable),
             CollectedEntropy::Failed => Ok(FirmwareEntropy::Failed),
         }
     }
 
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    fn verify_generated_base_page_size() -> Result<(), FirmwarePreparationError> {
+        (usize::try_from(deepwyrm_abi::DW_BOOT_BASE_PAGE_SIZE).ok() == Some(super::UEFI_PAGE_BYTES))
+            .then_some(())
+            .ok_or(FirmwarePreparationError::GeneratedPageGranuleMismatch)
+    }
+
+    /// Reads the architectural MAXPHYADDR fact from CPUID. The returned value
+    /// is deliberately not a Deepwyrm layout constant: pass it to
+    /// `UefiPageTable::new`, which enforces the supported encoder range before
+    /// any physical address can be encoded.
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    #[allow(dead_code)] // Called by the pending generated-policy table builder.
+    pub fn query_maxphyaddr() -> Result<u8, FirmwarePreparationError> {
+        let maximum_extended_leaf = __cpuid(0x8000_0000).eax;
+        if maximum_extended_leaf < 0x8000_0008 {
+            return Err(FirmwarePreparationError::CpuMaxPhysicalAddressUnavailable);
+        }
+        let physical_bits = __cpuid(0x8000_0008).eax as u8;
+        if physical_bits == 0 {
+            return Err(FirmwarePreparationError::CpuMaxPhysicalAddressUnavailable);
+        }
+        Ok(physical_bits)
+    }
+
     fn find_and_retain_acpi_rsdp() -> Result<Option<AcpiRsdp>, FirmwarePreparationError> {
-        let address = system::with_config_table(|entries| {
-            entries
-                .iter()
-                .find(|entry| entry.guid == ConfigTableEntry::ACPI2_GUID)
-                .or_else(|| {
-                    entries
-                        .iter()
-                        .find(|entry| entry.guid == ConfigTableEntry::ACPI_GUID)
-                })
-                .map(|entry| entry.address as usize)
-        });
-        let Some(address) = address else {
+        let selected = system::with_config_table(|entries| {
+            super::select_rsdp_candidate(entries.iter().filter_map(|entry| {
+                if entry.guid == ConfigTableEntry::ACPI2_GUID {
+                    Some(super::AcpiRsdpConfigCandidate {
+                        kind: super::AcpiRsdpConfigKind::Acpi2,
+                        physical_start: entry.address as u64,
+                    })
+                } else if entry.guid == ConfigTableEntry::ACPI_GUID {
+                    Some(super::AcpiRsdpConfigCandidate {
+                        kind: super::AcpiRsdpConfigKind::Acpi1,
+                        physical_start: entry.address as u64,
+                    })
+                } else {
+                    None
+                }
+            }))
+        })
+        .map_err(FirmwarePreparationError::Acpi)?;
+        let Some(selected) = selected else {
             return Ok(None);
         };
+        let address = usize::try_from(selected.physical_start).map_err(|_| {
+            FirmwarePreparationError::Acpi(PreparationError::InvalidAcpiRsdpAlignment)
+        })?;
         validate_acpi_rsdp_address(address).map_err(FirmwarePreparationError::Acpi)?;
 
         // SAFETY: UEFI owns configuration-table memory until handoff. The ACPI

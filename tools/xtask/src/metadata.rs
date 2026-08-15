@@ -105,6 +105,10 @@ impl BuildManifest {
         self.required("deepwyrm.revision")
     }
 
+    pub(crate) fn deepwyrm_repository(&self) -> Result<&str, Failure> {
+        self.required("deepwyrm.repository")
+    }
+
     pub(crate) fn rust_revision(&self) -> Result<&str, Failure> {
         self.required("rust.wyrmroot_revision")
     }

@@ -14,6 +14,8 @@ const PROGRAM_HEADER_SIZE: usize = 56;
 const ELF_CLASS_64: u8 = 2;
 const ELF_DATA_LITTLE_ENDIAN: u8 = 1;
 const ELF_IDENT_VERSION_CURRENT: u8 = 1;
+const ELF_OS_ABI_SYSTEM_V: u8 = 0;
+const ELF_ABI_VERSION_SYSTEM_V: u8 = 0;
 const ELF_VERSION_CURRENT: u32 = 1;
 const ELF_TYPE_EXECUTABLE: u16 = 2;
 const ELF_MACHINE_X86_64: u16 = 62;
@@ -47,8 +49,11 @@ impl AddressRange {
 /// Policy inputs generated from Deepwyrm's pinned linker/handoff contract.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KernelElfPolicy {
-    /// Virtual-address window in which every loadable segment must fit.
+    /// Deep-generated upper-half window. Its start must equal `link_base` and its conservative
+    /// half-open end must be `u64::MAX`, excluding the final byte.
     pub virtual_addresses: AddressRange,
+    /// Exact page-rounded address at which the first `PT_LOAD` mapping must begin.
+    pub link_base: u64,
     /// Power-of-two virtual mapping granule and smallest accepted segment `p_align`.
     pub mapping_granule: u64,
 }
@@ -75,6 +80,12 @@ pub struct KernelLoadSegment {
     pub file_size: u64,
     /// Requested runtime virtual address.
     pub virtual_address: u64,
+    /// Page-rounded virtual mapping start derived from `p_vaddr` and the policy granule.
+    pub mapping_virtual_address: u64,
+    /// Page-rounded mapping length required for this segment.
+    pub mapping_byte_len: u64,
+    /// Offset of the segment's first byte within its first mapped page.
+    pub segment_page_offset: u64,
     /// Total in-memory size, including a zero-filled tail after `file_size`.
     pub memory_size: u64,
     /// Required ELF segment alignment.
@@ -102,6 +113,8 @@ pub enum KernelElfError {
     UnsupportedClass(u8),
     UnsupportedDataEncoding(u8),
     UnsupportedIdentVersion(u8),
+    UnsupportedOsAbi(u8),
+    UnsupportedAbiVersion(u8),
     UnsupportedElfType(u16),
     UnsupportedMachine(u16),
     UnsupportedElfVersion(u32),
@@ -111,6 +124,7 @@ pub enum KernelElfError {
     MissingProgramHeaders,
     ExtendedProgramHeaderCountUnsupported,
     ProgramHeaderTableOverlapsElfHeader,
+    ProgramHeaderTableMisaligned,
     ProgramHeaderTableOverflow,
     ProgramHeaderTableTruncated,
     InvalidPolicy,
@@ -130,6 +144,7 @@ pub enum KernelElfError {
     SegmentVirtualRangeOutsidePolicy { index: u16 },
     OverlappingVirtualSegments { first: u16, second: u16 },
     OverlappingVirtualMappingRanges { first: u16, second: u16 },
+    KernelLinkBaseMismatch { expected: u64, observed: u64 },
     ZeroEntryPoint,
     EntryPointNotInExecutableFileData,
 }
@@ -202,6 +217,12 @@ pub fn plan_kernel_elf<'plan>(
     let first = segments
         .first()
         .ok_or(KernelElfError::MissingProgramHeaders)?;
+    if first.mapping_virtual_address != policy.link_base {
+        return Err(KernelElfError::KernelLinkBaseMismatch {
+            expected: policy.link_base,
+            observed: first.mapping_virtual_address,
+        });
+    }
     let virtual_start = first.virtual_address;
     let mut virtual_end = first.virtual_address + first.memory_size;
     for segment in &segments[1..] {
@@ -238,6 +259,12 @@ fn parse_header(image: &[u8]) -> Result<ElfHeader, KernelElfError> {
     }
     if header[6] != ELF_IDENT_VERSION_CURRENT {
         return Err(KernelElfError::UnsupportedIdentVersion(header[6]));
+    }
+    if header[7] != ELF_OS_ABI_SYSTEM_V {
+        return Err(KernelElfError::UnsupportedOsAbi(header[7]));
+    }
+    if header[8] != ELF_ABI_VERSION_SYSTEM_V {
+        return Err(KernelElfError::UnsupportedAbiVersion(header[8]));
     }
 
     let elf_type = read_u16(header, 16);
@@ -277,6 +304,9 @@ fn parse_header(image: &[u8]) -> Result<ElfHeader, KernelElfError> {
     if program_header_offset < ELF_HEADER_SIZE as u64 {
         return Err(KernelElfError::ProgramHeaderTableOverlapsElfHeader);
     }
+    if !program_header_offset.is_multiple_of(8) {
+        return Err(KernelElfError::ProgramHeaderTableMisaligned);
+    }
 
     Ok(ElfHeader {
         entry_point: read_u64(header, 24),
@@ -287,8 +317,10 @@ fn parse_header(image: &[u8]) -> Result<ElfHeader, KernelElfError> {
 }
 
 fn validate_policy(policy: KernelElfPolicy) -> Result<(), KernelElfError> {
-    if policy.virtual_addresses.start >= policy.virtual_addresses.end
+    if policy.virtual_addresses.start != policy.link_base
+        || policy.virtual_addresses.end != u64::MAX
         || !policy.mapping_granule.is_power_of_two()
+        || !policy.link_base.is_multiple_of(policy.mapping_granule)
     {
         return Err(KernelElfError::InvalidPolicy);
     }
@@ -364,6 +396,9 @@ fn parse_segment(
         file_offset,
         file_size,
         virtual_address,
+        mapping_virtual_address: mapping_start,
+        mapping_byte_len: mapping_end - mapping_start,
+        segment_page_offset: virtual_address - mapping_start,
         memory_size,
         alignment,
         permissions: SegmentPermissions {

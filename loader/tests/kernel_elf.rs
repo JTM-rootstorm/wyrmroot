@@ -16,6 +16,9 @@ const EMPTY_SEGMENT: KernelLoadSegment = KernelLoadSegment {
     file_offset: 0,
     file_size: 0,
     virtual_address: 0,
+    mapping_virtual_address: 0,
+    mapping_byte_len: 0,
+    segment_page_offset: 0,
     memory_size: 0,
     alignment: 1,
     permissions: SegmentPermissions {
@@ -65,7 +68,8 @@ fn data_segment() -> SegmentSpec {
 
 fn policy() -> KernelElfPolicy {
     KernelElfPolicy {
-        virtual_addresses: AddressRange::new(0xffff_8000_0000_0000, 0xffff_8001_0000_0000),
+        virtual_addresses: AddressRange::new(CODE_VIRTUAL, u64::MAX),
+        link_base: CODE_VIRTUAL,
         mapping_granule: 0x1000,
     }
 }
@@ -124,12 +128,51 @@ fn produces_a_deterministic_virtual_address_ordered_plan() {
     assert_eq!(plan.segments.len(), 2);
     assert_eq!(plan.segments[0].program_header_index, 1);
     assert_eq!(plan.segments[0].virtual_address, CODE_VIRTUAL);
+    assert_eq!(plan.segments[0].mapping_virtual_address, CODE_VIRTUAL);
+    assert_eq!(plan.segments[0].mapping_byte_len, 0x1000);
+    assert_eq!(plan.segments[0].segment_page_offset, 0);
     assert_eq!(plan.segments[1].program_header_index, 0);
     assert_eq!(plan.segments[1].virtual_address, DATA_VIRTUAL);
     assert_eq!(
         plan.virtual_span,
         AddressRange::new(CODE_VIRTUAL, DATA_VIRTUAL + 0x1000)
     );
+}
+
+#[test]
+fn et_exec_lowest_mapping_must_equal_the_manifest_link_base() {
+    let shift = 0x1000;
+    let mut code = code_segment();
+    code.virtual_address += shift;
+    let mut data = data_segment();
+    data.virtual_address += shift;
+    let image = elf(code.virtual_address, &[code, data]);
+    let mut output = [EMPTY_SEGMENT; 2];
+
+    assert_eq!(
+        plan_kernel_elf(&image, policy(), &mut output),
+        Err(KernelElfError::KernelLinkBaseMismatch {
+            expected: CODE_VIRTUAL,
+            observed: CODE_VIRTUAL + shift,
+        })
+    );
+}
+
+#[test]
+fn exposes_page_offset_and_rounded_mapping_for_congruent_unaligned_segment() {
+    let mut segment = code_segment();
+    segment.file_offset = 0x1800;
+    segment.virtual_address = CODE_VIRTUAL + 0x800;
+    segment.file_size = 0x100;
+    segment.memory_size = 0x700;
+    let image = elf(segment.virtual_address, &[segment]);
+    let mut output = [EMPTY_SEGMENT; 1];
+
+    let plan = plan_kernel_elf(&image, policy(), &mut output).unwrap();
+
+    assert_eq!(plan.segments[0].mapping_virtual_address, CODE_VIRTUAL);
+    assert_eq!(plan.segments[0].mapping_byte_len, 0x1000);
+    assert_eq!(plan.segments[0].segment_page_offset, 0x800);
 }
 
 #[test]
@@ -142,6 +185,8 @@ fn rejects_truncated_and_malformed_identification() {
         (4, 1, KernelElfError::UnsupportedClass(1)),
         (5, 2, KernelElfError::UnsupportedDataEncoding(2)),
         (6, 0, KernelElfError::UnsupportedIdentVersion(0)),
+        (7, 3, KernelElfError::UnsupportedOsAbi(3)),
+        (8, 1, KernelElfError::UnsupportedAbiVersion(1)),
     ];
     for (offset, value, expected) in cases {
         let mut image = base.clone();
@@ -214,6 +259,13 @@ fn rejects_malformed_program_header_tables() {
     assert_eq!(
         error_for(&overlap),
         KernelElfError::ProgramHeaderTableOverlapsElfHeader
+    );
+
+    let mut misaligned = base.clone();
+    put_u64(&mut misaligned, 32, 65);
+    assert_eq!(
+        error_for(&misaligned),
+        KernelElfError::ProgramHeaderTableMisaligned
     );
 
     let mut wrapped = base.clone();
@@ -324,12 +376,10 @@ fn rejects_mapping_granule_rounding_wrap() {
     segment.memory_size = 0x100;
 
     let image = elf(segment.virtual_address, &[segment]);
-    let mut near_top = policy();
-    near_top.virtual_addresses = AddressRange::new(u64::MAX - 0xfff, u64::MAX);
     let mut output = [EMPTY_SEGMENT; 1];
 
     assert_eq!(
-        plan_kernel_elf(&image, near_top, &mut output),
+        plan_kernel_elf(&image, policy(), &mut output),
         Err(KernelElfError::SegmentMappingRangeOverflow { index: 0 })
     );
 }
@@ -388,11 +438,18 @@ fn requires_all_segment_ranges_to_fit_explicit_policy() {
         Err(KernelElfError::InvalidPolicy)
     );
 
-    let mut virtual_outside = policy();
-    virtual_outside.virtual_addresses.start = CODE_VIRTUAL + 1;
+    let mut wrong_lower_bound = policy();
+    wrong_lower_bound.virtual_addresses.start -= 0x1000;
     assert_eq!(
-        plan_kernel_elf(&image, virtual_outside, &mut output),
-        Err(KernelElfError::SegmentVirtualRangeOutsidePolicy { index: 0 })
+        plan_kernel_elf(&image, wrong_lower_bound, &mut output),
+        Err(KernelElfError::InvalidPolicy)
+    );
+
+    let mut wrong_upper_bound = policy();
+    wrong_upper_bound.virtual_addresses.end = u64::MAX - 1;
+    assert_eq!(
+        plan_kernel_elf(&image, wrong_upper_bound, &mut output),
+        Err(KernelElfError::InvalidPolicy)
     );
 }
 

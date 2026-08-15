@@ -13,11 +13,15 @@
 #![forbid(unsafe_code)]
 
 pub mod artifacts;
+pub mod boot_info;
 pub mod config;
 pub mod diagnostics;
 pub mod entry;
 pub mod firmware;
 pub mod kernel_elf;
+pub mod memory_map;
+pub mod modules;
+pub mod transition;
 
 /// Canonical Deepwyrm definitions consumed by the UEFI loader boundary.
 ///

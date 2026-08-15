@@ -11,6 +11,11 @@ pub(crate) struct LoaderProvenance<'a> {
     pub(crate) rust_revision: &'a str,
     pub(crate) rust_toolchain_name: &'a str,
     pub(crate) rustc_sha256: &'a str,
+    pub(crate) cargo_sha256: &'a str,
+    pub(crate) rust_lld_sha256: &'a str,
+    pub(crate) uefi_core_sha256: &'a str,
+    pub(crate) uefi_builtins_sha256: &'a str,
+    pub(crate) toolchain_manifest_sha256: &'a str,
     pub(crate) target: &'a str,
     pub(crate) package: &'a str,
     pub(crate) binary: &'a str,
@@ -20,6 +25,8 @@ pub(crate) struct LoaderProvenance<'a> {
     pub(crate) debug_sha256: &'a str,
     pub(crate) versions_sha256: &'a str,
     pub(crate) profiles_sha256: &'a str,
+    pub(crate) deep_layout_sha256: &'a str,
+    pub(crate) generated_layout_policy_sha256: &'a str,
     pub(crate) toolchain_report_sha256: &'a str,
     pub(crate) artifact_report_sha256: &'a str,
 }
@@ -77,10 +84,17 @@ rust_revision = \"{}\"\n\
 [configuration]\n\
 versions_sha256 = \"{}\"\n\
 profiles_sha256 = \"{}\"\n\
+deepwyrm_layout_sha256 = \"{}\"\n\
+generated_layout_policy_sha256 = \"{}\"\n\
 \n\
 [toolchain]\n\
 rust_toolchain_name = \"{}\"\n\
 rustc_sha256 = \"{}\"\n\
+cargo_sha256 = \"{}\"\n\
+rust_lld_sha256 = \"{}\"\n\
+uefi_core_sha256 = \"{}\"\n\
+uefi_builtins_sha256 = \"{}\"\n\
+artifact_manifest_sha256 = \"{}\"\n\
 target = \"{}\"\n\
 validation_report_sha256 = \"{}\"\n\
 \n\
@@ -101,8 +115,15 @@ inspection_report_sha256 = \"{}\"\n",
         escape(record.rust_revision),
         escape(record.versions_sha256),
         escape(record.profiles_sha256),
+        escape(record.deep_layout_sha256),
+        escape(record.generated_layout_policy_sha256),
         escape(record.rust_toolchain_name),
         escape(record.rustc_sha256),
+        escape(record.cargo_sha256),
+        escape(record.rust_lld_sha256),
+        escape(record.uefi_core_sha256),
+        escape(record.uefi_builtins_sha256),
+        escape(record.toolchain_manifest_sha256),
         escape(record.target),
         escape(record.toolchain_report_sha256),
         escape(record.package),
@@ -160,6 +181,11 @@ mod tests {
             rust_revision: "c",
             rust_toolchain_name: "toolchain",
             rustc_sha256: "1",
+            cargo_sha256: "6",
+            rust_lld_sha256: "7",
+            uefi_core_sha256: "8",
+            uefi_builtins_sha256: "9",
+            toolchain_manifest_sha256: "a",
             target: "x86_64-unknown-uefi",
             package: "wyrmroot-efi-loader",
             binary: "loader",
@@ -169,6 +195,8 @@ mod tests {
             debug_sha256: "e",
             versions_sha256: "f",
             profiles_sha256: "0",
+            deep_layout_sha256: "4",
+            generated_layout_policy_sha256: "5",
             toolchain_report_sha256: "2",
             artifact_report_sha256: "3",
         };
@@ -178,6 +206,7 @@ mod tests {
         assert!(rendered.contains("rustc_sha256 = \"1\""));
         assert!(rendered.contains("validation_report_sha256 = \"2\""));
         assert!(rendered.contains("inspection_report_sha256 = \"3\""));
+        assert!(rendered.contains("deepwyrm_layout_sha256 = \"4\""));
         assert!(!rendered.contains(SYNTHETIC_WORKSPACE));
         assert!(!rendered.contains("rustc_path"));
         assert!(!rendered.contains("{\\\"verified\\\""));

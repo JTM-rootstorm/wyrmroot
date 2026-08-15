@@ -1,9 +1,11 @@
 mod cli;
+mod deep_layout;
 mod error;
 mod metadata;
 mod provenance;
 mod sha256;
 mod tasks;
+mod toolchain_artifact;
 
 use std::env;
 use std::process::ExitCode;
@@ -45,16 +47,31 @@ fn run(arguments: &[String]) -> Result<Option<&'static str>, Failure> {
                 manifest.validate_host_build_readiness(&repository)?;
             }
             tasks::run_host_tool_probe(&repository)?;
+            let loader_layout = if loader_profile.is_some() {
+                Some(deep_layout::prepare(
+                    &repository,
+                    manifest.deepwyrm_repository()?,
+                    manifest.deepwyrm_revision()?,
+                )?)
+            } else {
+                None
+            };
             let loader_toolchain = if let Some(profile) = &loader_profile {
-                Some(tasks::prepare_loader_toolchain(&repository, profile)?)
+                Some(tasks::prepare_loader_toolchain(
+                    &repository,
+                    profile,
+                    &manifest,
+                )?)
             } else {
                 None
             };
             if builds_host {
                 tasks::run_workspace_build(&repository)?;
             }
-            if let (Some(profile), Some(toolchain)) = (loader_profile, loader_toolchain) {
-                tasks::run_loader_build(&repository, &manifest, &profile, &toolchain)?;
+            if let (Some(profile), Some(toolchain), Some(layout)) =
+                (loader_profile, loader_toolchain, loader_layout)
+            {
+                tasks::run_loader_build(&repository, &manifest, &profile, &toolchain, &layout)?;
             }
             Ok(None)
         }

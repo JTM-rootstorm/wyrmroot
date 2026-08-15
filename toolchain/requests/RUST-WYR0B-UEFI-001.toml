@@ -1,8 +1,11 @@
 schema_version = 1
 request_id = "RUST-WYR0B-UEFI-001"
 coordinator_request_id = "RUST-PHASE0B-TOOLCHAIN-001"
-status = "active-coordinator-build"
+status = "accepted-immutable-artifact"
 request_kind = "build-immutable-existing-wyrmroot-rust-toolchain"
+artifact_request_id = "RUST-PHASE0B-TOOLCHAIN-001"
+artifact_configuration_id = "63e532b52e6d4c2e"
+artifact_manifest_sha256 = "553cbfe6eb5cd9976c4f078a3731269f2a2ecd4f3ff5d574ab3813bae8fcf1f1"
 
 [requirement]
 phase_gate = "WYR0-B UEFI loader build boundary"
@@ -33,4 +36,4 @@ required_debug_artifact = "PDB or equivalent retained host symbol artifact"
 [policy]
 human_reviewer = "not-applicable-no-rust-source-edit"
 soundness_classification = "toolchain-identity-and-target-contract"
-notes = "Deduplicated with Deepwyrm under RUST-PHASE0B-TOOLCHAIN-001. The current host has no rustup registration mechanism available and /usr/bin/rustc is revision 31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd, not the pinned Wyrmroot revision. Consume the immutable accepted compiler and sysroot through explicit verified paths; do not satisfy this request by changing the pinned revision or using the host compiler."
+notes = "Deduplicated with Deepwyrm under RUST-PHASE0B-TOOLCHAIN-001. The immutable stage-2 artifact passed both consumer gates and is identified by the request, configuration, manifest hash, and component hashes rather than a host installation path. The current host has no rustup registration mechanism available and /usr/bin/rustc is revision 31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd, not the pinned Wyrmroot revision. Consume the accepted compiler and sysroot through explicit verified paths; do not satisfy this request by changing the pinned revision or using the host compiler."
