@@ -295,11 +295,10 @@ mod privileged {
 
     global_asm!(
         r#"
-        .section .text.__wyrmroot_handoff,"ax",@progbits
+        .section .text$wyrmroot_handoff,"xr"
         .p2align 4
         .global __wyrmroot_handoff_start
         .global __wyrmroot_handoff_end
-        .type __wyrmroot_handoff_start,@function
 __wyrmroot_handoff_start:
         cli
         cld
@@ -309,7 +308,6 @@ __wyrmroot_handoff_start:
         xor rbp, rbp
         jmp rdx
 __wyrmroot_handoff_end:
-        .size __wyrmroot_handoff_start, __wyrmroot_handoff_end-__wyrmroot_handoff_start
 "#
     );
 
