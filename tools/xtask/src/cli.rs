@@ -3,7 +3,7 @@ use crate::error::Failure;
 pub(crate) const USAGE: &str = r#"Wyrmroot development task dispatcher
 
 Usage:
-    cargo xtask build [host|loader]
+    cargo xtask build [host|loader|bootfs]
     cargo xtask image
     cargo xtask run
     cargo xtask inspect-image
@@ -14,9 +14,9 @@ Usage:
 Host filters may name a component (bootfs, protocol, elf, runtime, bootstrap,
 efi, init0, hello, or xtask), package:<workspace-package>, or test:<substring>.
 
-WYR0-B implements host and UEFI-loader build orchestration. Image, run, image
-inspection, GDB, guest-test, integration-test, and external kernel-artifact
-collection remain unavailable until their assigned later phases.
+WYR0-C implements host, UEFI-loader, and bootfs build/test orchestration. Image,
+run, image inspection, GDB, guest-test, integration-test, and external
+kernel-artifact collection remain unavailable until their assigned later phases.
 "#;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -24,6 +24,21 @@ pub(crate) enum BuildScope {
     All,
     Host,
     Loader,
+    Bootfs,
+}
+
+impl BuildScope {
+    pub(crate) const fn runs_workspace(self) -> bool {
+        matches!(self, Self::All | Self::Host)
+    }
+
+    pub(crate) const fn runs_loader(self) -> bool {
+        matches!(self, Self::All | Self::Loader)
+    }
+
+    pub(crate) const fn runs_bootfs_package(self) -> bool {
+        matches!(self, Self::All | Self::Bootfs)
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -61,11 +76,12 @@ fn dispatch_build(arguments: &[String]) -> Result<Action, Failure> {
         [] => Ok(Action::Build(BuildScope::All)),
         [selector] if selector == "host" => Ok(Action::Build(BuildScope::Host)),
         [selector] if selector == "loader" => Ok(Action::Build(BuildScope::Loader)),
+        [selector] if selector == "bootfs" => Ok(Action::Build(BuildScope::Bootfs)),
         [unknown] => Err(Failure::usage(format!(
-            "unknown build selector '{unknown}'; expected host or loader"
+            "unknown build selector '{unknown}'; expected host, loader, or bootfs"
         ))),
         _ => Err(Failure::usage(
-            "build accepts at most one selector (host or loader)",
+            "build accepts at most one selector (host, loader, or bootfs)",
         )),
     }
 }
@@ -77,7 +93,7 @@ fn unavailable_without_arguments(
     expect_arity(
         arguments,
         1,
-        format!("{command} does not accept arguments in WYR0-B"),
+        format!("{command} does not accept arguments in WYR0-C"),
     )?;
     Ok(Action::Unavailable(command))
 }
@@ -148,7 +164,7 @@ mod tests {
     }
 
     #[test]
-    fn help_and_wyr0_b_actions_dispatch() {
+    fn help_and_wyr0_c_actions_dispatch() {
         for command in ["help", "--help", "-h"] {
             assert_eq!(dispatch(&arguments(&[command])), Ok(Action::Help));
         }
@@ -165,10 +181,20 @@ mod tests {
             Ok(Action::Build(BuildScope::Loader))
         );
         assert_eq!(
+            dispatch(&arguments(&["build", "bootfs"])),
+            Ok(Action::Build(BuildScope::Bootfs))
+        );
+        assert_eq!(
             dispatch(&arguments(&["test", "host", "bootfs"])),
             Ok(Action::HostTests(Some("bootfs".to_owned())))
         );
-        assert!(USAGE.contains("WYR0-B implements host and UEFI-loader"));
+        assert!(BuildScope::All.runs_workspace());
+        assert!(BuildScope::All.runs_loader());
+        assert!(BuildScope::All.runs_bootfs_package());
+        assert!(!BuildScope::Bootfs.runs_workspace());
+        assert!(!BuildScope::Bootfs.runs_loader());
+        assert!(BuildScope::Bootfs.runs_bootfs_package());
+        assert!(USAGE.contains("WYR0-C implements host, UEFI-loader, and bootfs"));
     }
 
     #[test]
@@ -189,7 +215,7 @@ mod tests {
             let failure = Failure::unavailable(command);
             assert_eq!(failure.kind, FailureKind::Unavailable);
             assert_eq!(failure.exit_code(), 1);
-            assert!(failure.message.contains("unavailable in WYR0-B"));
+            assert!(failure.message.contains("unavailable in WYR0-C"));
         }
     }
 
@@ -200,6 +226,7 @@ mod tests {
             &["unknown"],
             &["build", "extra"],
             &["build", "host", "extra"],
+            &["build", "bootfs", "extra"],
             &["image", "extra"],
             &["test"],
             &["test", "unknown"],

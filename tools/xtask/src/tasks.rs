@@ -18,6 +18,25 @@ const TOOLCHAIN_REQUEST: &str = "toolchain/requests/RUST-WYR0B-UEFI-001.toml";
 const MAX_LOADER_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DEBUG_SYMBOL_BYTES: u64 = 512 * 1024 * 1024;
 const DEEP_LAYOUT_POLICY_ENV: &str = "WYRMROOT_DEEP_LAYOUT_POLICY_RS";
+const BOOTFS_PACKAGE: &str = "wyrmroot-bootfs";
+const BOOTFS_BUILDER_FEATURE: &str = "builder";
+const BOOTFS_BUILD_ARGUMENTS: &[&str] = &[
+    "build",
+    "--locked",
+    "--package",
+    BOOTFS_PACKAGE,
+    "--all-targets",
+    "--features",
+    BOOTFS_BUILDER_FEATURE,
+];
+const BOOTFS_TEST_ARGUMENTS: &[&str] = &[
+    "test",
+    "--locked",
+    "--package",
+    BOOTFS_PACKAGE,
+    "--features",
+    BOOTFS_BUILDER_FEATURE,
+];
 
 pub(crate) struct LoaderToolchain {
     accepted: AcceptedToolchain,
@@ -55,6 +74,10 @@ pub(crate) fn run_workspace_build(repository: &Path) -> Result<(), Failure> {
         repository,
         &["build", "--workspace", "--all-targets", "--locked"],
     )
+}
+
+pub(crate) fn run_bootfs_build(repository: &Path) -> Result<(), Failure> {
+    run_cargo(repository, BOOTFS_BUILD_ARGUMENTS)
 }
 
 pub(crate) fn run_loader_build(
@@ -425,25 +448,51 @@ fn stderr_suffix(output: &Output) -> String {
 }
 
 pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<(), Failure> {
-    let mut arguments = vec!["test", "--locked"];
-    let owned_filter;
+    for arguments in host_test_commands(filter)? {
+        let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+        run_cargo(repository, &arguments)?;
+    }
+    Ok(())
+}
 
+fn host_test_commands(filter: Option<&str>) -> Result<Vec<Vec<String>>, Failure> {
+    let mut commands = vec![host_test_arguments(filter)?];
+    if filter.is_none() {
+        commands.push(
+            BOOTFS_TEST_ARGUMENTS
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect(),
+        );
+    }
+    Ok(commands)
+}
+
+fn host_test_arguments(filter: Option<&str>) -> Result<Vec<String>, Failure> {
+    let mut arguments = vec!["test".to_owned(), "--locked".to_owned()];
     match filter.and_then(component_package) {
-        Some(package) => arguments.extend(["--package", package]),
+        Some(package) => {
+            if package == BOOTFS_PACKAGE {
+                return Ok(BOOTFS_TEST_ARGUMENTS
+                    .iter()
+                    .map(|argument| (*argument).to_owned())
+                    .collect());
+            }
+            arguments.extend(["--package".to_owned(), package.to_owned()]);
+        }
         None => {
-            arguments.extend(["--workspace", "--all-targets"]);
+            arguments.extend(["--workspace".to_owned(), "--all-targets".to_owned()]);
             if let Some(filter) = filter {
-                owned_filter = explicit_test_filter(filter)?;
-                arguments.extend(["--", owned_filter.as_str()]);
+                arguments.extend(["--".to_owned(), explicit_test_filter(filter)?]);
             }
         }
     }
-    run_cargo(repository, &arguments)
+    Ok(arguments)
 }
 
 fn component_package(filter: &str) -> Option<&'static str> {
     match filter {
-        "bootfs" | "wyrmroot-bootfs" | "package:wyrmroot-bootfs" => Some("wyrmroot-bootfs"),
+        "bootfs" | "wyrmroot-bootfs" | "package:wyrmroot-bootfs" => Some(BOOTFS_PACKAGE),
         "protocol"
         | "bootstrap-proto"
         | "wyrmroot-bootstrap-proto"
@@ -502,7 +551,8 @@ fn child_status(code: Option<i32>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        blocked_toolchain_failure, component_package, explicit_test_filter,
+        BOOTFS_BUILD_ARGUMENTS, BOOTFS_PACKAGE, BOOTFS_TEST_ARGUMENTS, blocked_toolchain_failure,
+        component_package, explicit_test_filter, host_test_arguments, host_test_commands,
         validate_regular_artifact,
     };
     use std::fs;
@@ -510,7 +560,7 @@ mod tests {
 
     #[test]
     fn component_filters_select_one_workspace_package() {
-        assert_eq!(component_package("bootfs"), Some("wyrmroot-bootfs"));
+        assert_eq!(component_package("bootfs"), Some(BOOTFS_PACKAGE));
         assert_eq!(
             component_package("protocol"),
             Some("wyrmroot-bootstrap-proto")
@@ -522,6 +572,54 @@ mod tests {
         assert_eq!(component_package("malformed"), None);
         assert_eq!(explicit_test_filter("test:malformed").unwrap(), "malformed");
         assert!(explicit_test_filter("package:unknown").is_err());
+        assert_eq!(
+            host_test_arguments(Some("bootfs")).unwrap(),
+            BOOTFS_TEST_ARGUMENTS
+        );
+        assert_eq!(
+            host_test_arguments(Some("test:traversal")).unwrap(),
+            [
+                "test",
+                "--locked",
+                "--workspace",
+                "--all-targets",
+                "--",
+                "traversal"
+            ]
+        );
+    }
+
+    #[test]
+    fn bootfs_build_is_locked_and_package_scoped() {
+        assert_eq!(
+            BOOTFS_BUILD_ARGUMENTS,
+            [
+                "build",
+                "--locked",
+                "--package",
+                "wyrmroot-bootfs",
+                "--all-targets",
+                "--features",
+                "builder",
+            ]
+        );
+    }
+
+    #[test]
+    fn unfiltered_host_tests_add_the_builder_suite_without_global_features() {
+        let commands = host_test_commands(None).unwrap();
+        assert_eq!(
+            commands,
+            [
+                vec!["test", "--locked", "--workspace", "--all-targets"],
+                BOOTFS_TEST_ARGUMENTS.to_vec(),
+            ]
+        );
+
+        assert_eq!(
+            host_test_commands(Some("bootfs")).unwrap(),
+            [BOOTFS_TEST_ARGUMENTS.to_vec()]
+        );
     }
 
     #[test]

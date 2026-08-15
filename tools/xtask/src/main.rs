@@ -11,7 +11,7 @@ mod toolchain_artifact;
 use std::env;
 use std::process::ExitCode;
 
-use cli::{Action, BuildScope, USAGE, dispatch};
+use cli::{Action, USAGE, dispatch};
 use error::Failure;
 use metadata::BuildManifest;
 
@@ -38,8 +38,9 @@ fn run(arguments: &[String]) -> Result<Option<&'static str>, Failure> {
         Action::Build(scope) => {
             let repository = tasks::repository_root()?;
             let manifest = BuildManifest::load(&repository)?;
-            let builds_host = matches!(scope, BuildScope::All | BuildScope::Host);
-            let loader_profile = if matches!(scope, BuildScope::All | BuildScope::Loader) {
+            let builds_host = scope.runs_workspace();
+            let builds_bootfs = scope.runs_bootfs_package();
+            let loader_profile = if scope.runs_loader() {
                 Some(manifest.validate_loader_build_readiness(&repository)?)
             } else {
                 None
@@ -68,6 +69,9 @@ fn run(arguments: &[String]) -> Result<Option<&'static str>, Failure> {
             };
             if builds_host {
                 tasks::run_workspace_build(&repository)?;
+            }
+            if builds_bootfs {
+                tasks::run_bootfs_build(&repository)?;
             }
             if let (Some(profile), Some(toolchain), Some(layout)) =
                 (loader_profile, loader_toolchain, loader_layout)
