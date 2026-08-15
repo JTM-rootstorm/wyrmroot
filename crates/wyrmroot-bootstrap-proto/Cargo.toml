@@ -8,3 +8,11 @@ description = "Wyrmroot bootstrap protocol support"
 
 [lib]
 path = "src/lib.rs"
+
+# The protocol wire contract is deliberately deferred until the canonical
+# Deepwyrm/Wyrmroot bootstrap handoff exists. Keep this crate dependency-free
+# and independent from libc/POSIX compatibility layers.
+
+[lints.rust]
+unsafe_code = "deny"
+unused_crate_dependencies = "deny"

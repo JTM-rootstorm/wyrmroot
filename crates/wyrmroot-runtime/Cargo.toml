@@ -8,3 +8,12 @@ description = "Minimal native runtime support for Wyrmroot"
 
 [lib]
 path = "src/lib.rs"
+
+# This WYR0-A crate intentionally has no dependencies. In particular, do not
+# add a libc or POSIX compatibility dependency here: native guest runtime
+# support must remain directly layered on generated Deepwyrm bindings once the
+# canonical ABI is available.
+
+[lints.rust]
+unsafe_code = "deny"
+unused_crate_dependencies = "deny"
