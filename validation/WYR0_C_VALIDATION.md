@@ -47,7 +47,25 @@ Evidence collected on the committed source tree:
 - `cargo xtask build bootfs`: passed;
 - `cargo xtask test host bootfs`: 30 passed, 0 failed;
 - unfiltered `cargo xtask test host`: 166 passed, 0 failed, 1 accepted environment-gated ignored;
+- unfiltered `cargo xtask build` with the accepted immutable WYR0-B Rust artifact: passed through
+  workspace, bootfs-builder, loader-host-test, accepted UEFI target check/build, PE inspection, and
+  clean path-neutral provenance;
 - workspace formatting, rustdoc, and repository diff hygiene: passed.
+
+The full central build regenerated the existing loader integration artifact at the WYR0-C evidence
+revision; it did not create bootfs media or broaden WYR0-C scope:
+
+- `loader.efi` SHA-256:
+  `4dcd0eefe929e1fe69f9de138603edc424b17ab350dacbfc476ceddd9b5b7a20`;
+- `loader.pdb` SHA-256:
+  `84b8958818f3b9a805f60fc7f594932262b735cd1728408759088a2b79ed252d`;
+- loader provenance SHA-256:
+  `6c6a146c524d9500e49138090f581c9504599c1e67deb6d97126419157f8006c`.
+
+The provenance identifies clean Wyrmroot revision
+`3145a93984b2503a5af5b3a0cd1dc0336e2f8c22`, exact Deepwyrm pin
+`07140ca7da26fad7173b80ed1cdf26c98b50aaab`, and accepted Rust revision
+`8bab26f4f68e0e26f0bb7960be334d5b520ea452`.
 
 Dependency resolution used a command-scoped Git URL rewrite from the canonical Deepwyrm URL to the
 local checkout at the exact pinned revision. No rewrite, absolute local path, path dependency, or
