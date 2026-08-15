@@ -3,7 +3,7 @@ use crate::error::Failure;
 pub(crate) const USAGE: &str = r#"Wyrmroot development task dispatcher
 
 Usage:
-    cargo xtask build
+    cargo xtask build [host|loader]
     cargo xtask image
     cargo xtask run
     cargo xtask inspect-image
@@ -14,15 +14,22 @@ Usage:
 Host filters may name a component (bootfs, protocol, elf, runtime, bootstrap,
 efi, init0, hello, or xtask), package:<workspace-package>, or test:<substring>.
 
-WYR0-A implements build and host-test orchestration. Image, run, image
-inspection, GDB, guest-test, and integration-test operations remain unavailable
-until their later WYR0 phases.
+WYR0-B implements host and UEFI-loader build orchestration. Image, run, image
+inspection, GDB, guest-test, integration-test, and external kernel-artifact
+collection remain unavailable until their assigned later phases.
 "#;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BuildScope {
+    All,
+    Host,
+    Loader,
+}
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum Action {
     Help,
-    Build,
+    Build(BuildScope),
     HostTests(Option<String>),
     Unavailable(&'static str),
 }
@@ -37,10 +44,7 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
             expect_arity(arguments, 1, "help does not accept arguments")?;
             Ok(Action::Help)
         }
-        "build" => {
-            expect_arity(arguments, 1, "build does not accept arguments")?;
-            Ok(Action::Build)
-        }
+        "build" => dispatch_build(&arguments[1..]),
         "image" => unavailable_without_arguments(arguments, "image"),
         "run" => unavailable_without_arguments(arguments, "run"),
         "inspect-image" => unavailable_without_arguments(arguments, "inspect-image"),
@@ -52,6 +56,20 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
     }
 }
 
+fn dispatch_build(arguments: &[String]) -> Result<Action, Failure> {
+    match arguments {
+        [] => Ok(Action::Build(BuildScope::All)),
+        [selector] if selector == "host" => Ok(Action::Build(BuildScope::Host)),
+        [selector] if selector == "loader" => Ok(Action::Build(BuildScope::Loader)),
+        [unknown] => Err(Failure::usage(format!(
+            "unknown build selector '{unknown}'; expected host or loader"
+        ))),
+        _ => Err(Failure::usage(
+            "build accepts at most one selector (host or loader)",
+        )),
+    }
+}
+
 fn unavailable_without_arguments(
     arguments: &[String],
     command: &'static str,
@@ -59,7 +77,7 @@ fn unavailable_without_arguments(
     expect_arity(
         arguments,
         1,
-        format!("{command} does not accept arguments in WYR0-A"),
+        format!("{command} does not accept arguments in WYR0-B"),
     )?;
     Ok(Action::Unavailable(command))
 }
@@ -122,7 +140,7 @@ pub(crate) fn validate_filter(filter: &str) -> Result<(), Failure> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, USAGE, dispatch};
+    use super::{Action, BuildScope, USAGE, dispatch};
     use crate::error::{Failure, FailureKind};
 
     fn arguments(values: &[&str]) -> Vec<String> {
@@ -130,16 +148,27 @@ mod tests {
     }
 
     #[test]
-    fn help_and_wyr0_a_actions_dispatch() {
+    fn help_and_wyr0_b_actions_dispatch() {
         for command in ["help", "--help", "-h"] {
             assert_eq!(dispatch(&arguments(&[command])), Ok(Action::Help));
         }
-        assert_eq!(dispatch(&arguments(&["build"])), Ok(Action::Build));
+        assert_eq!(
+            dispatch(&arguments(&["build"])),
+            Ok(Action::Build(BuildScope::All))
+        );
+        assert_eq!(
+            dispatch(&arguments(&["build", "host"])),
+            Ok(Action::Build(BuildScope::Host))
+        );
+        assert_eq!(
+            dispatch(&arguments(&["build", "loader"])),
+            Ok(Action::Build(BuildScope::Loader))
+        );
         assert_eq!(
             dispatch(&arguments(&["test", "host", "bootfs"])),
             Ok(Action::HostTests(Some("bootfs".to_owned())))
         );
-        assert!(USAGE.contains("WYR0-A implements build and host-test"));
+        assert!(USAGE.contains("WYR0-B implements host and UEFI-loader"));
     }
 
     #[test]
@@ -160,7 +189,7 @@ mod tests {
             let failure = Failure::unavailable(command);
             assert_eq!(failure.kind, FailureKind::Unavailable);
             assert_eq!(failure.exit_code(), 1);
-            assert!(failure.message.contains("unavailable in WYR0-A"));
+            assert!(failure.message.contains("unavailable in WYR0-B"));
         }
     }
 
@@ -170,6 +199,7 @@ mod tests {
             &[][..],
             &["unknown"],
             &["build", "extra"],
+            &["build", "host", "extra"],
             &["image", "extra"],
             &["test"],
             &["test", "unknown"],

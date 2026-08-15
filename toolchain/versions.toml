@@ -25,6 +25,7 @@ canonical_compiler_runtime = "compiler-rt"
 canonical_archiver = "llvm-ar"
 canonical_object_tools = [
     "llvm-readelf",
+    "llvm-readobj",
     "llvm-objdump",
     "llvm-nm",
     "llvm-objcopy",

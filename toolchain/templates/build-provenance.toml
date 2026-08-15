@@ -16,6 +16,7 @@ rustc_host = ""
 clang_version = ""
 lld_version = ""
 llvm_readelf_version = ""
+llvm_readobj_version = ""
 llvm_objdump_version = ""
 llvm_nm_version = ""
 llvm_objcopy_version = ""
@@ -32,6 +33,14 @@ configuration_sha256 = ""
 profile_manifest_sha256 = ""
 effective_build_arguments = []
 artifacts = []
+
+[uefi_loader]
+target_spec_sha256 = ""
+linker = ""
+linker_flavor = ""
+debug_symbol_artifact = ""
+debug_symbol_sha256 = ""
+pe_imports = []
 
 # Populate `artifacts` in generated records with inline tables containing:
 # logical_name, path, sha256, and role.

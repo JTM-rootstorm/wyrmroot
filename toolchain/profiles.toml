@@ -14,11 +14,25 @@ debug_information = "retain-for-host-diagnostics"
 [uefi_loader]
 artifact_class = "WYR0 EFI loader"
 execution_environment = "64-bit UEFI firmware"
+cargo_package = "wyrmroot-efi-loader"
+cargo_binary = "loader"
+cargo_features = "firmware"
+uefi_crate_version = "0.39.0"
+artifact_name = "loader.efi"
 rust_target = "x86_64-unknown-uefi"
 target_state = "requires-pinned-fork-confirmation-before-build"
 host_libc = "prohibited-in-produced-artifact"
-linker_family = "LLVM LLD when a linker is selected"
-debug_information = "retain-host-symbol-artifact"
+binary_format = "PE32+ COFF"
+machine = "x86_64"
+rustc_linker = "rust-lld"
+rustc_linker_flavor = "msvc-lld"
+lld_flavor = "link"
+required_pre_link_args = ["/NOLOGO", "/entry:efi_main", "/subsystem:efi_application"]
+host_linker_fallback = "prohibited"
+host_libc_fallback = "prohibited"
+debug_information = "PDB-or-equivalent-symbol-artifact-required"
+artifact_inspection = "toolchain/inspect-uefi-artifact.sh"
+toolchain_inspection = "toolchain/verify-uefi-toolchain.sh"
 
 [native_guest]
 artifact_class = "bootstrap.elf, /system/init0, and /bin/hello"
@@ -36,3 +50,4 @@ debug_information = "retain-host-symbol-artifact"
 required_source_pins = ["deepwyrm", "rust"]
 required_configuration_inputs = ["toolchain/versions.toml", "toolchain/profiles.toml"]
 required_guest_inspection = ["PT_INTERP absent", "no guest libc dependency"]
+required_uefi_inspection = ["PE32+ AMD64", "EFI application subsystem", "no PE imports", "debug-symbol artifact"]

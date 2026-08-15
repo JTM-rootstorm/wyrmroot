@@ -1,9 +1,25 @@
 use std::env;
+use std::ffi::OsStr;
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 
 use crate::cli::validate_filter;
 use crate::error::Failure;
+use crate::metadata::{BuildManifest, LoaderProfile};
+use crate::provenance::{LoaderProvenance, write_loader_provenance};
+use crate::sha256::{bytes_digest, file_digest};
+
+const UEFI_TARGET_DIRECTORY: &str = "target/wyr0-b";
+const UEFI_PROFILE_DIRECTORY: &str = "debug";
+const TOOLCHAIN_REQUEST: &str = "toolchain/requests/RUST-WYR0B-UEFI-001.toml";
+const MAX_LOADER_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_DEBUG_SYMBOL_BYTES: u64 = 512 * 1024 * 1024;
+
+pub(crate) struct LoaderToolchain {
+    rustc: PathBuf,
+    validation_report: String,
+}
 
 pub(crate) fn repository_root() -> Result<PathBuf, Failure> {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -36,6 +52,335 @@ pub(crate) fn run_workspace_build(repository: &Path) -> Result<(), Failure> {
         repository,
         &["build", "--workspace", "--all-targets", "--locked"],
     )
+}
+
+pub(crate) fn run_loader_build(
+    repository: &Path,
+    manifest: &BuildManifest,
+    profile: &LoaderProfile,
+    toolchain: &LoaderToolchain,
+) -> Result<(), Failure> {
+    run_cargo(
+        repository,
+        &["test", "--locked", "--package", &profile.cargo_package],
+    )?;
+    let target_directory = repository.join(UEFI_TARGET_DIRECTORY);
+    run_uefi_cargo(
+        repository,
+        &toolchain.rustc,
+        profile,
+        &target_directory,
+        "check",
+    )?;
+    run_uefi_cargo(
+        repository,
+        &toolchain.rustc,
+        profile,
+        &target_directory,
+        "build",
+    )?;
+
+    let output_directory = target_directory
+        .join(&profile.rust_target)
+        .join(UEFI_PROFILE_DIRECTORY);
+    let loader = output_directory.join(&profile.artifact_name);
+    let debug_symbols = output_directory.join(format!("{}.pdb", profile.cargo_binary));
+    validate_regular_artifact(&loader, "UEFI loader", MAX_LOADER_BYTES)?;
+    validate_regular_artifact(
+        &debug_symbols,
+        "UEFI loader debug symbols",
+        MAX_DEBUG_SYMBOL_BYTES,
+    )?;
+
+    let artifact_report = run_verified_report(
+        repository,
+        &profile.artifact_inspection,
+        [loader.as_os_str(), debug_symbols.as_os_str()],
+        "UEFI artifact inspection",
+    )?;
+    let loader_hash = digest(&loader)?;
+    let debug_hash = digest(&debug_symbols)?;
+    let rustc_hash = digest(&toolchain.rustc)?;
+    let versions_hash = digest(&repository.join("toolchain/versions.toml"))?;
+    let profiles_hash = digest(&repository.join("toolchain/profiles.toml"))?;
+    let toolchain_report_hash = bytes_digest(toolchain.validation_report.as_bytes());
+    let artifact_report_hash = bytes_digest(artifact_report.as_bytes());
+    let (repository_revision, repository_dirty) = repository_identity(repository)?;
+    let loader_relative = repository_relative_path(repository, &loader, "UEFI loader")?;
+    let debug_relative =
+        repository_relative_path(repository, &debug_symbols, "UEFI loader debug symbols")?;
+
+    let record = LoaderProvenance {
+        repository_revision: &repository_revision,
+        repository_dirty,
+        deepwyrm_revision: manifest.deepwyrm_revision()?,
+        rust_revision: manifest.rust_revision()?,
+        rust_toolchain_name: manifest.rust_toolchain_name()?,
+        rustc_sha256: &rustc_hash,
+        target: &profile.rust_target,
+        package: &profile.cargo_package,
+        binary: &profile.cargo_binary,
+        artifact_path: &loader_relative,
+        artifact_sha256: &loader_hash,
+        debug_path: &debug_relative,
+        debug_sha256: &debug_hash,
+        versions_sha256: &versions_hash,
+        profiles_sha256: &profiles_hash,
+        toolchain_report_sha256: &toolchain_report_hash,
+        artifact_report_sha256: &artifact_report_hash,
+    };
+    let provenance = write_loader_provenance(&target_directory, &record)?;
+    println!("xtask: validated UEFI loader: {}", loader.display());
+    println!("xtask: recorded provenance: {}", provenance.display());
+    Ok(())
+}
+
+fn repository_relative_path(
+    repository: &Path,
+    path: &Path,
+    label: &str,
+) -> Result<String, Failure> {
+    let relative = path.strip_prefix(repository).map_err(|_| {
+        Failure::task(format!(
+            "{label} path is outside the Wyrmroot repository: {}",
+            path.display()
+        ))
+    })?;
+    relative
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| Failure::task(format!("{label} path is not valid UTF-8")))
+}
+
+pub(crate) fn prepare_loader_toolchain(
+    repository: &Path,
+    profile: &LoaderProfile,
+) -> Result<LoaderToolchain, Failure> {
+    reject_ambient_rust_overrides()?;
+    let rustc = accepted_rustc(repository)?;
+    let validation_report = run_verified_report(
+        repository,
+        &profile.toolchain_inspection,
+        [OsStr::new("--rustc"), rustc.as_os_str()],
+        "UEFI toolchain validation",
+    )?;
+    Ok(LoaderToolchain {
+        rustc,
+        validation_report,
+    })
+}
+
+fn accepted_rustc(repository: &Path) -> Result<PathBuf, Failure> {
+    let Some(configured) = env::var_os("WYRMROOT_RUSTC") else {
+        let request_path = repository.join(TOOLCHAIN_REQUEST);
+        let request = fs::read_to_string(&request_path).map_err(|error| {
+            Failure::task(format!(
+                "accepted WYR0-B rustc is unavailable and toolchain request {} could not be read: {error}",
+                request_path.display()
+            ))
+        })?;
+        return Err(blocked_toolchain_failure(&request));
+    };
+    let path = PathBuf::from(configured);
+    if !path.is_absolute() {
+        return Err(Failure::task(
+            "WYRMROOT_RUSTC must be an absolute path to the accepted compiler",
+        ));
+    }
+    let metadata = fs::metadata(&path).map_err(|error| {
+        Failure::task(format!(
+            "could not inspect accepted rustc {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(Failure::task(format!(
+            "accepted rustc path is not a regular file: {}",
+            path.display()
+        )));
+    }
+    Ok(path)
+}
+
+fn blocked_toolchain_failure(request: &str) -> Failure {
+    let status = scalar_assignment(request, "status").unwrap_or("missing-status");
+    Failure::task(format!(
+        "accepted WYR0-B rustc is unavailable: {TOOLCHAIN_REQUEST} status is '{status}'; set WYRMROOT_RUSTC only to the accepted compiler artifact from that coordinator request"
+    ))
+}
+
+fn scalar_assignment<'a>(contents: &'a str, key: &str) -> Option<&'a str> {
+    contents.lines().find_map(|line| {
+        let (actual_key, value) = line.split_once('=')?;
+        if actual_key.trim() != key {
+            return None;
+        }
+        value.trim().strip_prefix('"')?.strip_suffix('"')
+    })
+}
+
+fn reject_ambient_rust_overrides() -> Result<(), Failure> {
+    for variable in [
+        "RUSTC",
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_BUILD_TARGET",
+        "CARGO_TARGET_DIR",
+    ] {
+        if env::var_os(variable).is_some() {
+            return Err(Failure::task(format!(
+                "UEFI loader build refuses ambient {variable}; centralized WYR0-B tooling owns compiler, target, flags, and output paths"
+            )));
+        }
+    }
+    if let Some((variable, _)) = env::vars_os().find(|(key, _)| {
+        key.to_str()
+            .is_some_and(|key| key.starts_with("CARGO_TARGET_"))
+    }) {
+        return Err(Failure::task(format!(
+            "UEFI loader build refuses ambient {}; centralized WYR0-B tooling owns target-specific linker and rustflags configuration",
+            variable.to_string_lossy()
+        )));
+    }
+    Ok(())
+}
+
+fn run_verified_report<I, S>(
+    repository: &Path,
+    script: &str,
+    arguments: I,
+    label: &str,
+) -> Result<String, Failure>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let output = Command::new("sh")
+        .arg(script)
+        .args(arguments)
+        .current_dir(repository)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| Failure::task(format!("could not run {label}: {error}")))?;
+    let report = utf8_stdout(&output, label)?;
+    if !output.status.success() || !report.contains("\"verified\": true") {
+        return Err(Failure::task(format!(
+            "{label} failed with {}: {}{}",
+            child_status(output.status.code()),
+            report.trim(),
+            stderr_suffix(&output)
+        )));
+    }
+    Ok(report)
+}
+
+fn run_uefi_cargo(
+    repository: &Path,
+    rustc: &Path,
+    profile: &LoaderProfile,
+    target_directory: &Path,
+    operation: &str,
+) -> Result<(), Failure> {
+    let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let status = Command::new(cargo)
+        .arg(operation)
+        .arg("--locked")
+        .arg("--package")
+        .arg(&profile.cargo_package)
+        .arg("--bin")
+        .arg(&profile.cargo_binary)
+        .arg("--features")
+        .arg(&profile.cargo_features)
+        .arg("--target")
+        .arg(&profile.rust_target)
+        .arg("--target-dir")
+        .arg(target_directory)
+        .env("RUSTC", rustc)
+        .current_dir(repository)
+        .stdin(Stdio::null())
+        .status()
+        .map_err(|error| Failure::task(format!("could not run Cargo {operation}: {error}")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(Failure::task(format!(
+            "UEFI Cargo {operation} failed with {}",
+            child_status(status.code())
+        )))
+    }
+}
+
+fn validate_regular_artifact(path: &Path, label: &str, maximum: u64) -> Result<(), Failure> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| Failure::task(format!("missing {label} {}: {error}", path.display())))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(Failure::task(format!(
+            "{label} must be a regular non-symlink file: {}",
+            path.display()
+        )));
+    }
+    if metadata.len() == 0 || metadata.len() > maximum {
+        return Err(Failure::task(format!(
+            "{label} size {} is outside the accepted range 1..={maximum}: {}",
+            metadata.len(),
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn digest(path: &Path) -> Result<String, Failure> {
+    file_digest(path)
+        .map_err(|error| Failure::task(format!("could not hash {}: {error}", path.display())))
+}
+
+fn repository_identity(repository: &Path) -> Result<(String, bool), Failure> {
+    let revision_output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repository)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| Failure::task(format!("could not inspect Wyrmroot revision: {error}")))?;
+    let revision = utf8_stdout(&revision_output, "Wyrmroot revision inspection")?
+        .trim()
+        .to_owned();
+    if !revision_output.status.success()
+        || revision.len() != 40
+        || !revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(Failure::task(
+            "Wyrmroot revision inspection did not return a full Git commit",
+        ));
+    }
+    let status_output = Command::new("git")
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .current_dir(repository)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| Failure::task(format!("could not inspect Wyrmroot status: {error}")))?;
+    if !status_output.status.success() {
+        return Err(Failure::task(format!(
+            "Wyrmroot status inspection failed with {}",
+            child_status(status_output.status.code())
+        )));
+    }
+    Ok((revision, !status_output.stdout.is_empty()))
+}
+
+fn utf8_stdout(output: &Output, label: &str) -> Result<String, Failure> {
+    String::from_utf8(output.stdout.clone())
+        .map_err(|_| Failure::task(format!("{label} produced non-UTF-8 output")))
+}
+
+fn stderr_suffix(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.trim().is_empty() {
+        String::new()
+    } else {
+        format!("; stderr: {}", stderr.trim())
+    }
 }
 
 pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<(), Failure> {
@@ -115,7 +460,12 @@ fn child_status(code: Option<i32>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{component_package, explicit_test_filter};
+    use super::{
+        blocked_toolchain_failure, component_package, explicit_test_filter,
+        validate_regular_artifact,
+    };
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn component_filters_select_one_workspace_package() {
@@ -131,5 +481,51 @@ mod tests {
         assert_eq!(component_package("malformed"), None);
         assert_eq!(explicit_test_filter("test:malformed").unwrap(), "malformed");
         assert!(explicit_test_filter("package:unknown").is_err());
+    }
+
+    #[test]
+    fn blocked_toolchain_request_has_stable_diagnostic() {
+        let failure = blocked_toolchain_failure(
+            "request_id = \"RUST-WYR0B-UEFI-001\"\nstatus = \"blocked-pending-coordinator-assignment\"\n",
+        );
+        assert_eq!(
+            failure.message,
+            "accepted WYR0-B rustc is unavailable: toolchain/requests/RUST-WYR0B-UEFI-001.toml status is 'blocked-pending-coordinator-assignment'; set WYRMROOT_RUSTC only to the accepted compiler artifact from that coordinator request"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_validation_rejects_symlinks_and_invalid_sizes() {
+        use std::os::unix::fs::symlink;
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock precedes Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "wyrmroot-xtask-artifact-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).expect("create isolated test directory");
+
+        let regular = root.join("loader.efi");
+        fs::write(&regular, [0x4d, 0x5a]).expect("write regular test artifact");
+        validate_regular_artifact(&regular, "test artifact", 2)
+            .expect("valid regular artifact rejected");
+
+        let empty = root.join("empty.efi");
+        fs::write(&empty, []).expect("write empty test artifact");
+        assert!(validate_regular_artifact(&empty, "test artifact", 2).is_err());
+
+        assert!(validate_regular_artifact(&regular, "test artifact", 1).is_err());
+
+        let link = root.join("linked.efi");
+        symlink(&regular, &link).expect("create test artifact symlink");
+        let failure = validate_regular_artifact(&link, "test artifact", 2)
+            .expect_err("artifact validator followed or accepted a symlink");
+        assert!(failure.message.contains("regular non-symlink file"));
+
+        fs::remove_dir_all(&root).expect("remove isolated test directory");
     }
 }

@@ -48,9 +48,31 @@ reserved until the pinned Wyrmroot Rust fork implements it; no target JSON,
 
 The UEFI profile names the standard 64-bit UEFI Rust target, but it too must be
 confirmed against the accepted pinned fork before it is used to build an
-artifact. When `xtask` gains its real build implementation, it must consume
-this policy centrally and record the effective configuration hash in build
-provenance.
+artifact. Its locked target contract is PE32+ COFF for AMD64, with the Rust
+target's `rust-lld` MSVC-LLD/link-flavor selection and its EFI application
+entry/subsystem arguments. A host `ld`, GNU linker, or host-libc fallback is
+not permitted. When `xtask` gains its real build implementation, it must
+consume this policy centrally and record the effective configuration hash in
+build provenance.
+
+Validate an accepted compiler's target specification without substituting the
+host compiler:
+
+```text
+sh toolchain/verify-uefi-toolchain.sh --rustc <accepted-wyrmroot-rustc>
+```
+
+After a real loader build, validate the produced EFI file and its retained
+debug-symbol artifact with:
+
+```text
+sh toolchain/inspect-uefi-artifact.sh <loader.efi> <loader.pdb-or-equivalent>
+```
+
+UEFI uses PE/COFF rather than ELF, so this inspection intentionally checks the
+PE machine/subsystem/import table instead of applying the native userspace
+`PT_INTERP` rule. The latter remains mandatory for later `bootstrap.elf`,
+`init0`, and `hello` inspection.
 
 ## Host LLVM environment
 
@@ -71,6 +93,7 @@ The JSON report is machine-readable availability evidence only. It reports
 must capture exact versions in its generated provenance record before any host
 version becomes a WYR0 reproducibility input. The probe also requires the
 x86_64 compiler-rt builtins archive exposed by Clang's resource directory.
+`llvm-readobj` is required for the UEFI PE/COFF inspection path.
 
 `templates/build-provenance.toml` defines the minimum provenance fields for a
 future generated build record. Generated records belong with build artifacts,

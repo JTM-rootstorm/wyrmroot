@@ -1,0 +1,36 @@
+schema_version = 1
+request_id = "RUST-WYR0B-UEFI-001"
+coordinator_request_id = "RUST-PHASE0B-TOOLCHAIN-001"
+status = "active-coordinator-build"
+request_kind = "build-immutable-existing-wyrmroot-rust-toolchain"
+
+[requirement]
+phase_gate = "WYR0-B UEFI loader build boundary"
+consumer_repository = "wyrmroot"
+consumer_revision = "uncommitted-wyr0-b-worktree"
+expected_behavior = "Compile the loader for x86_64-unknown-uefi using the Rust target's PE32+ AMD64 rust-lld MSVC-LLD/link contract; no host compiler fallback."
+consumer_checks = [
+    "sh toolchain/verify-uefi-toolchain.sh --rustc <accepted-wyrmroot-rustc>",
+    "WYRMROOT_RUSTC=<accepted-wyrmroot-rustc> cargo xtask build loader",
+    "sh toolchain/inspect-uefi-artifact.sh <loader.efi> <debug-symbol-artifact>",
+]
+
+[rust]
+canonical_base_commit = "8bab26f4f68e0e26f0bb7960be334d5b520ea452"
+fork_repository = "git@github.com:JTM-rootstorm/rust.git"
+requested_toolchain_name = "wyrmroot-1.97.1-8bab26f4"
+source_edit_requested = false
+required_targets = ["x86_64-unknown-uefi"]
+required_artifacts = ["rustc", "rust-lld", "explicit sysroot path", "core for x86_64-unknown-uefi"]
+
+[build]
+target = "x86_64-unknown-uefi"
+expected_linker = "rust-lld"
+expected_linker_flavor = "msvc-lld"
+expected_lld_flavor = "link"
+required_debug_artifact = "PDB or equivalent retained host symbol artifact"
+
+[policy]
+human_reviewer = "not-applicable-no-rust-source-edit"
+soundness_classification = "toolchain-identity-and-target-contract"
+notes = "Deduplicated with Deepwyrm under RUST-PHASE0B-TOOLCHAIN-001. The current host has no rustup registration mechanism available and /usr/bin/rustc is revision 31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd, not the pinned Wyrmroot revision. Consume the immutable accepted compiler and sysroot through explicit verified paths; do not satisfy this request by changing the pinned revision or using the host compiler."

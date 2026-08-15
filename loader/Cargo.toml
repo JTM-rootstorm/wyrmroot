@@ -6,11 +6,23 @@ publish = false
 license = "GPL-3.0-only"
 description = "Inert scaffold for the future Wyrmroot EFI loader"
 
+[features]
+default = []
+firmware = ["dep:uefi"]
+
 [lib]
 path = "src/lib.rs"
 doctest = false
 test = false
 bench = false
 
+[[bin]]
+name = "loader"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["firmware"]
+
 [dependencies]
 deepwyrm-abi.workspace = true
+uefi = { workspace = true, optional = true }

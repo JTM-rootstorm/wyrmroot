@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
@@ -7,6 +7,18 @@ use crate::error::Failure;
 #[derive(Debug)]
 pub(crate) struct BuildManifest {
     values: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LoaderProfile {
+    pub(crate) cargo_package: String,
+    pub(crate) cargo_binary: String,
+    pub(crate) cargo_features: String,
+    pub(crate) uefi_crate_version: String,
+    pub(crate) artifact_name: String,
+    pub(crate) rust_target: String,
+    pub(crate) toolchain_inspection: String,
+    pub(crate) artifact_inspection: String,
 }
 
 impl BuildManifest {
@@ -49,7 +61,7 @@ impl BuildManifest {
         Ok(())
     }
 
-    pub(crate) fn validate_build_readiness(&self, repository: &Path) -> Result<(), Failure> {
+    pub(crate) fn validate_host_build_readiness(&self, repository: &Path) -> Result<(), Failure> {
         self.validate_phase_a_states()?;
 
         let revision = self.required("deepwyrm.revision")?;
@@ -73,10 +85,32 @@ impl BuildManifest {
             ));
         }
 
-        self.validate_profiles(repository)?;
+        self.validate_native_profile(repository)?;
         self.validate_provenance_template(repository)?;
         validate_reserved_target_policy(repository, self.required("rust.native_target")?)?;
         Ok(())
+    }
+
+    pub(crate) fn validate_loader_build_readiness(
+        &self,
+        repository: &Path,
+    ) -> Result<LoaderProfile, Failure> {
+        self.validate_host_build_readiness(repository)?;
+        let profile = self.load_loader_profile(repository)?;
+        validate_loader_dependency(repository, &profile)?;
+        Ok(profile)
+    }
+
+    pub(crate) fn deepwyrm_revision(&self) -> Result<&str, Failure> {
+        self.required("deepwyrm.revision")
+    }
+
+    pub(crate) fn rust_revision(&self) -> Result<&str, Failure> {
+        self.required("rust.wyrmroot_revision")
+    }
+
+    pub(crate) fn rust_toolchain_name(&self) -> Result<&str, Failure> {
+        self.required("rust.local_toolchain_name")
     }
 
     fn validate_phase_a_states(&self) -> Result<(), Failure> {
@@ -85,7 +119,7 @@ impl BuildManifest {
         Ok(())
     }
 
-    fn validate_profiles(&self, repository: &Path) -> Result<(), Failure> {
+    fn validate_native_profile(&self, repository: &Path) -> Result<(), Failure> {
         let path = repository.join("toolchain/profiles.toml");
         let values = parse_scalar_toml(&read_file(&path)?, &path)?;
         expect_map_value(&values, "schema_version", "1", &path)?;
@@ -115,6 +149,50 @@ impl BuildManifest {
             &path,
         )?;
         Ok(())
+    }
+
+    fn load_loader_profile(&self, repository: &Path) -> Result<LoaderProfile, Failure> {
+        let path = repository.join("toolchain/profiles.toml");
+        let values = parse_scalar_toml(&read_file(&path)?, &path)?;
+
+        for (key, expected) in [
+            ("schema_version", "1"),
+            ("uefi_loader.execution_environment", "64-bit UEFI firmware"),
+            ("uefi_loader.binary_format", "PE32+ COFF"),
+            ("uefi_loader.machine", "x86_64"),
+            ("uefi_loader.rustc_linker", "rust-lld"),
+            ("uefi_loader.rustc_linker_flavor", "msvc-lld"),
+            ("uefi_loader.lld_flavor", "link"),
+            ("uefi_loader.host_linker_fallback", "prohibited"),
+            ("uefi_loader.host_libc_fallback", "prohibited"),
+        ] {
+            expect_map_value(&values, key, expected, &path)?;
+        }
+
+        let profile = LoaderProfile {
+            cargo_package: required_map_value(&values, "uefi_loader.cargo_package", &path)?,
+            cargo_binary: required_map_value(&values, "uefi_loader.cargo_binary", &path)?,
+            cargo_features: required_map_value(&values, "uefi_loader.cargo_features", &path)?,
+            uefi_crate_version: required_map_value(
+                &values,
+                "uefi_loader.uefi_crate_version",
+                &path,
+            )?,
+            artifact_name: required_map_value(&values, "uefi_loader.artifact_name", &path)?,
+            rust_target: required_map_value(&values, "uefi_loader.rust_target", &path)?,
+            toolchain_inspection: required_map_value(
+                &values,
+                "uefi_loader.toolchain_inspection",
+                &path,
+            )?,
+            artifact_inspection: required_map_value(
+                &values,
+                "uefi_loader.artifact_inspection",
+                &path,
+            )?,
+        };
+        validate_loader_profile_components(&profile)?;
+        Ok(profile)
     }
 
     fn validate_provenance_template(&self, repository: &Path) -> Result<(), Failure> {
@@ -272,6 +350,254 @@ fn expect_map_value(
     }
 }
 
+fn required_map_value(
+    values: &BTreeMap<String, String>,
+    key: &str,
+    path: &Path,
+) -> Result<String, Failure> {
+    let value = values.get(key).ok_or_else(|| {
+        Failure::task(format!(
+            "{} is missing required key '{key}'",
+            path.display()
+        ))
+    })?;
+    if value.is_empty() {
+        return Err(Failure::task(format!(
+            "{} key '{key}' must not be empty",
+            path.display()
+        )));
+    }
+    Ok(value.clone())
+}
+
+fn validate_loader_profile_components(profile: &LoaderProfile) -> Result<(), Failure> {
+    for (label, value) in [
+        ("cargo package", profile.cargo_package.as_str()),
+        ("cargo binary", profile.cargo_binary.as_str()),
+        ("cargo features", profile.cargo_features.as_str()),
+        ("artifact name", profile.artifact_name.as_str()),
+    ] {
+        if value.is_empty()
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+            || value == "."
+            || value == ".."
+        {
+            return Err(Failure::task(format!(
+                "UEFI loader {label} '{value}' is not a safe deterministic component"
+            )));
+        }
+    }
+    if profile.rust_target != "x86_64-unknown-uefi" {
+        return Err(Failure::task(format!(
+            "UEFI loader target is '{}', expected 'x86_64-unknown-uefi'",
+            profile.rust_target
+        )));
+    }
+    if profile.cargo_features != "firmware" {
+        return Err(Failure::task(format!(
+            "UEFI loader Cargo feature is '{}', expected 'firmware'",
+            profile.cargo_features
+        )));
+    }
+    if profile.uefi_crate_version != "0.39.0" {
+        return Err(Failure::task(format!(
+            "UEFI loader crate version is '{}', expected '0.39.0'",
+            profile.uefi_crate_version
+        )));
+    }
+    if profile.artifact_name != format!("{}.efi", profile.cargo_binary) {
+        return Err(Failure::task(format!(
+            "UEFI loader artifact '{}' does not match Cargo binary '{}.efi'",
+            profile.artifact_name, profile.cargo_binary
+        )));
+    }
+    for (label, actual, expected) in [
+        (
+            "toolchain inspection",
+            profile.toolchain_inspection.as_str(),
+            "toolchain/verify-uefi-toolchain.sh",
+        ),
+        (
+            "artifact inspection",
+            profile.artifact_inspection.as_str(),
+            "toolchain/inspect-uefi-artifact.sh",
+        ),
+    ] {
+        if actual != expected {
+            return Err(Failure::task(format!(
+                "UEFI loader {label} path is '{actual}', expected '{expected}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_loader_dependency(repository: &Path, profile: &LoaderProfile) -> Result<(), Failure> {
+    let root_path = repository.join("Cargo.toml");
+    let root_manifest = read_file(&root_path)?;
+    let root_ready = root_has_uefi_dependency(&root_manifest, &profile.uefi_crate_version);
+    if !root_ready {
+        return Err(Failure::task(format!(
+            "{} must pin workspace dependency uefi exactly at ={} with default features disabled",
+            root_path.display(),
+            profile.uefi_crate_version
+        )));
+    }
+
+    let loader_path = repository.join("loader/Cargo.toml");
+    let loader_manifest = read_file(&loader_path)?;
+    let loader_ready = loader_has_optional_uefi_dependency(&loader_manifest);
+    if !loader_ready {
+        return Err(Failure::task(format!(
+            "{} must consume uefi as an optional workspace dependency",
+            loader_path.display()
+        )));
+    }
+
+    let lock_path = repository.join("Cargo.lock");
+    let lockfile = read_file(&lock_path)?;
+    if !lock_has_package(&lockfile, "uefi", &profile.uefi_crate_version) {
+        return Err(Failure::task(format!(
+            "{} does not resolve uefi {}",
+            lock_path.display(),
+            profile.uefi_crate_version
+        )));
+    }
+    Ok(())
+}
+
+fn root_has_uefi_dependency(manifest: &str, version: &str) -> bool {
+    manifest_inline_dependency(manifest, "workspace.dependencies", "uefi").is_some_and(|fields| {
+        let required_features = BTreeSet::from([
+            "alloc".to_owned(),
+            "global_allocator".to_owned(),
+            "panic_handler".to_owned(),
+        ]);
+        fields.get("version").map(String::as_str) == Some(format!("\"={version}\"").as_str())
+            && fields.get("default-features").map(String::as_str) == Some("false")
+            && fields
+                .get("features")
+                .and_then(|value| inline_string_array(value))
+                == Some(required_features)
+    })
+}
+
+fn loader_has_optional_uefi_dependency(manifest: &str) -> bool {
+    manifest_inline_dependency(manifest, "dependencies", "uefi").is_some_and(|fields| {
+        fields.get("workspace").map(String::as_str) == Some("true")
+            && fields.get("optional").map(String::as_str) == Some("true")
+    })
+}
+
+fn manifest_inline_dependency(
+    manifest: &str,
+    required_section: &str,
+    dependency: &str,
+) -> Option<BTreeMap<String, String>> {
+    let mut section = "";
+    for raw_line in manifest.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line.strip_prefix('[')?.strip_suffix(']')?.trim();
+            continue;
+        }
+        if section != required_section {
+            continue;
+        }
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        if name.trim() != dependency {
+            continue;
+        }
+        let table = value.trim().strip_prefix('{')?.strip_suffix('}')?;
+        let mut fields = BTreeMap::new();
+        for assignment in split_inline_table(table)? {
+            let (key, value) = assignment.split_once('=')?;
+            let key = key.trim();
+            let value = value.trim();
+            if key.is_empty()
+                || value.is_empty()
+                || fields.insert(key.to_owned(), value.to_owned()).is_some()
+            {
+                return None;
+            }
+        }
+        return Some(fields);
+    }
+    None
+}
+
+fn split_inline_table(table: &str) -> Option<Vec<&str>> {
+    let mut assignments = Vec::new();
+    let mut start = 0;
+    let mut nested = 0_u32;
+    let mut quoted = false;
+    let mut escaped = false;
+
+    for (index, character) in table.char_indices() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                quoted = false;
+            }
+            continue;
+        }
+        match character {
+            '"' => quoted = true,
+            '[' | '{' | '(' => nested = nested.checked_add(1)?,
+            ']' | '}' | ')' => nested = nested.checked_sub(1)?,
+            ',' if nested == 0 => {
+                assignments.push(&table[start..index]);
+                start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if quoted || escaped || nested != 0 {
+        return None;
+    }
+    assignments.push(&table[start..]);
+    Some(assignments)
+}
+
+fn inline_string_array(value: &str) -> Option<BTreeSet<String>> {
+    let contents = value.trim().strip_prefix('[')?.strip_suffix(']')?;
+    let mut values = BTreeSet::new();
+    for item in split_inline_table(contents)? {
+        let item = item.trim().strip_prefix('"')?.strip_suffix('"')?;
+        if item.is_empty()
+            || !item
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            || !values.insert(item.to_owned())
+        {
+            return None;
+        }
+    }
+    Some(values)
+}
+
+fn lock_has_package(lockfile: &str, name: &str, version: &str) -> bool {
+    lockfile.split("[[package]]").any(|package| {
+        let mut found_name = false;
+        let mut found_version = false;
+        for line in package.lines().map(str::trim) {
+            found_name |= line == format!("name = \"{name}\"");
+            found_version |= line == format!("version = \"{version}\"");
+        }
+        found_name && found_version
+    })
+}
+
 fn has_abi_consumer(repository: &Path) -> Result<bool, Failure> {
     for relative in ["bootstrap", "crates", "loader", "userspace"] {
         let root = repository.join(relative);
@@ -396,7 +722,10 @@ fn checked_file_type(entry: &fs::DirEntry, root: &Path) -> Result<fs::FileType, 
 
 #[cfg(test)]
 mod tests {
-    use super::{BuildManifest, parse_scalar_toml};
+    use super::{
+        BuildManifest, LoaderProfile, loader_has_optional_uefi_dependency, lock_has_package,
+        parse_scalar_toml, root_has_uefi_dependency, validate_loader_profile_components,
+    };
     use std::collections::BTreeMap;
     use std::path::Path;
 
@@ -433,6 +762,69 @@ mod tests {
 
         let premature_target = phase_a_manifest("available", "implemented");
         assert!(premature_target.validate_phase_a_states().is_err());
+    }
+
+    #[test]
+    fn loader_profile_rejects_host_target_leakage_and_unsafe_components() {
+        let valid = LoaderProfile {
+            cargo_package: "wyrmroot-efi-loader".to_owned(),
+            cargo_binary: "loader".to_owned(),
+            cargo_features: "firmware".to_owned(),
+            uefi_crate_version: "0.39.0".to_owned(),
+            artifact_name: "loader.efi".to_owned(),
+            rust_target: "x86_64-unknown-uefi".to_owned(),
+            toolchain_inspection: "toolchain/verify-uefi-toolchain.sh".to_owned(),
+            artifact_inspection: "toolchain/inspect-uefi-artifact.sh".to_owned(),
+        };
+        validate_loader_profile_components(&valid).expect("canonical loader profile rejected");
+
+        let mut host_target = valid.clone();
+        host_target.rust_target = "x86_64-unknown-linux-gnu".to_owned();
+        assert!(validate_loader_profile_components(&host_target).is_err());
+
+        let mut traversal = valid;
+        traversal.artifact_name = "../loader.efi".to_owned();
+        assert!(validate_loader_profile_components(&traversal).is_err());
+    }
+
+    #[test]
+    fn lockfile_dependency_check_rejects_mismatched_uefi_version() {
+        let lockfile = "[[package]]\nname = \"uefi\"\nversion = \"0.38.0\"\n\n[[package]]\nname = \"other\"\nversion = \"0.39.0\"\n";
+        assert!(!lock_has_package(lockfile, "uefi", "0.39.0"));
+        assert!(lock_has_package(lockfile, "uefi", "0.38.0"));
+    }
+
+    #[test]
+    fn manifest_dependency_checks_require_exact_pin_and_optional_consumer() {
+        let root = "[workspace.dependencies]\nuefi = { version = \"=0.39.0\", default-features = false, features = [\"panic_handler\", \"alloc\", \"global_allocator\"] }\n";
+        assert!(root_has_uefi_dependency(root, "0.39.0"));
+        assert!(!root_has_uefi_dependency(root, "0.38.0"));
+        assert!(!root_has_uefi_dependency(
+            "[workspace.dependencies]\nuefi = { version = \"0.39.0\", default-features = false }",
+            "0.39.0"
+        ));
+        assert!(!root_has_uefi_dependency(
+            "[workspace.dependencies]\nuefi = { version = \"=0.39.0\", default-features = false, features = [\"alloc\", \"global_allocator\"] }",
+            "0.39.0"
+        ));
+        assert!(!root_has_uefi_dependency(
+            "[workspace.dependencies]\nuefi = { version = \"=0.39.0\", default-features = false, features = [\"alloc\", \"global_allocator\", \"panic_handler\", \"logger\"] }",
+            "0.39.0"
+        ));
+        assert!(!root_has_uefi_dependency(
+            "[package.metadata]\nuefi = { version = \"=0.39.0\", default-features = false, features = [\"alloc\", \"global_allocator\", \"panic_handler\"] }",
+            "0.39.0"
+        ));
+
+        assert!(loader_has_optional_uefi_dependency(
+            "[dependencies]\nuefi = { workspace = true, optional = true }"
+        ));
+        assert!(!loader_has_optional_uefi_dependency(
+            "[dependencies]\nuefi = { workspace = true }"
+        ));
+        assert!(!loader_has_optional_uefi_dependency(
+            "[package.metadata]\nuefi = { workspace = true, optional = true }"
+        ));
     }
 
     #[cfg(unix)]

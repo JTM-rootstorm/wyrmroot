@@ -20,3 +20,4 @@ repository = "https://github.com/JTM-rootstorm/wyrmroot"
 
 [workspace.dependencies]
 deepwyrm-abi = { git = "https://github.com/JTM-rootstorm/deepwyrm.git", rev = "37338e8d44c08ef039eb34a01292a6b6cb5cac3a" }
+uefi = { version = "=0.39.0", default-features = false, features = ["alloc", "global_allocator", "panic_handler"] }
