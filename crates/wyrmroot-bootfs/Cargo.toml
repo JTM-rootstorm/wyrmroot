@@ -8,3 +8,7 @@ description = "Wyrmroot bootstrap archive support"
 
 [lib]
 path = "src/lib.rs"
+
+[features]
+default = []
+builder = []

@@ -16,6 +16,12 @@ This file defines the minimum architecture reading set for Wyrmroot implementati
 7. [`Plans/WYR0_IMPLEMENTATION_PLAN_NATIVE_CONTROL_SURFACES_ADDENDUM.md`](WYR0_IMPLEMENTATION_PLAN_NATIVE_CONTROL_SURFACES_ADDENDUM.md) - native control-plane direction versus Linux pseudo-filesystems/utilities.
 8. Deepwyrm's corresponding `Plans/DEEPWYRM_PRE_PHASE0_INVARIANTS.md`, DW0 plan, and addenda for any cross-repository ABI/handoff work.
 
+## Reached subsystem contracts
+
+- [`Plans/WYR0_BOOTFS_FORMAT_CONTRACT.md`](WYR0_BOOTFS_FORMAT_CONTRACT.md) defines the canonical
+  deterministic archive subset implemented by WYR0-C. Read it before changing bootfs builder,
+  parser, lookup, content-manifest, or archive-intake behavior.
+
 ## Authority rules
 
 - Deepwyrm owns kernel ABI, `DwBootInfo`, syscall/object/right/status definitions, and kernel-facing feature contracts.
