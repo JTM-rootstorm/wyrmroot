@@ -38,20 +38,40 @@ paired VM gate passes against the exact committed revisions and artifacts.
   jump wrapper can be authorized.
 - Host regressions cover exact-once rollback, fatal post-EBS dispatch, retained
   table/module/entropy/RSDP address coherence, the absence of a second EBS or
-  post-EBS release surface, and the linked `cli`/`cld`/CR3/RSP/RDI/`jmp` order.
+  post-EBS release surface, and the linked CR4.PGE/CR3/CR4.PCIDE/RSP/RDI/`jmp` order.
 - The accepted PE/COFF artifact passed structural inspection. PDB-guided
-  disassembly independently verified the emitted 16-byte raw stub performs
-  `cli`, `cld`, CR3/RSP/RDI setup, RBP clearing, and an indirect `jmp`, with no
-  call or return edge.
+  disassembly independently verified the emitted 37-byte raw stub clears PGE,
+  loads the aligned attested CR3 with PCID zero, clears PCIDE, installs RSP/RDI,
+  clears RBP, and performs an indirect `jmp`, with no call or return edge.
+- The complete used table graph is a bounded fixed point. The encoder reserves
+  the whole generated temporary PML4 slot, leaves its leaf exactly zero, rejects
+  cycles, shared/unreachable/unused tables, missing or extra leaves, and every
+  forbidden user/cache/huge/global/accessed/dirty bit, and attests exact plan
+  equality before releasing transfer authority.
+- Production attestation is non-copyable, retains an immutable borrow of the
+  exact table allocation and plan through the nonreturning jump, and has no raw
+  CR3 or unbound finalization path. The kind-3 carrier is serialized only from
+  this evidence and remains in a release-less post-EBS allocation.
+- PAT entry zero is observed as architectural write-back (`0x06`) before
+  transfer. All transition structures and aliases select PAT0 with zero cache
+  bits. This establishes alias consistency only; it does not claim effective
+  write-back after MTRR interaction.
 
 ## Open findings and accepted limitations
 
-- **Medium, accepted for WYR0-B:** a same-user replacement restored between
-  pre- and post-child identity checks is not prevented without descriptor-based
-  execution or stronger parent-filesystem immutability. Atomic opened-file
-  hashing, no-symlink checks, and immediate pre/post verification reduce this
-  risk; a future distributable toolchain should provide a stronger immutable
-  execution boundary.
+- **Medium, accepted for this developer checkpoint:** Deepwyrm source identity
+  uses exact HEAD, porcelain cleanliness, tracked-layout blob identity, and
+  pre/post hashes. Same-user `assume-unchanged`/`skip-worktree` state or a
+  transient modify-and-restore race can still evade a complete crate-tree
+  identity claim. Accepted artifacts must be built from a trusted single-writer
+  checkout/cache. Future hardening should materialize and hash the complete
+  pinned crate input in an immutable build tree.
+- **Medium, accepted for this developer checkpoint:** bounded Cargo/Git process
+  capture enforces output limits and deadlines, but portable safe standard
+  library APIs terminate only the direct child. A malicious same-user
+  descendant can survive with inherited pipes. Builds therefore require trusted
+  Cargo/Git executables and external host process isolation; future hardening
+  should kill a dedicated process group and test a forked descendant.
 - **Medium, accepted for WYR0-B:** Cargo and the accepted compiler use ambient
   Gentoo kernel and system runtime libraries, including libc/libgcc and Cargo's
   networking/parser dependencies. These are host-platform dependencies, not
@@ -76,5 +96,10 @@ paired VM gate passes against the exact committed revisions and artifacts.
   path-neutral provenance, and raw-stub disassembly.
 - Complete: exact compatible Deepwyrm/Wyrmroot revision pair and loader artifact
   hashes recorded in `validation/WYR0_B_VALIDATION.md`.
+- Complete: final Daybreak adversarial review found no Critical or High findings
+  for Wyrmroot `bee49a19a8c4c341b8fd6ed71606f9473b00ae64` paired with Deepwyrm
+  `79c2e365901ab95d04e5f6877b87b109f61f7ca4`; the two additional Medium
+  findings from this final review are explicitly accepted, and the three
+  previously recorded Medium limitations remain accepted as documented.
 - Pending: manager-owned Q35/UEFI serial and handoff evidence. No QEMU or VM
   evidence is claimed by this document yet.

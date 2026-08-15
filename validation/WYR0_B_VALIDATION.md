@@ -69,3 +69,53 @@ artifact provenance gates are complete for the tested revision pair.
 
 No VM or QEMU/OVMF acceptance claim exists for this checkpoint. The manager-owned paired Q35/UEFI
 serial and handoff gate remains required before WYR0-B phase closure.
+
+## Layout-v2 paging-handoff descendant
+
+The clean descendant `bee49a19a8c4c341b8fd6ed71606f9473b00ae64` consumes the canonical
+Deepwyrm paging-handoff contract at `79c2e365901ab95d04e5f6877b87b109f61f7ca4`. The accepted Rust
+source revision remains `8bab26f4f68e0e26f0bb7960be334d5b520ea452`, using immutable artifact
+request `RUST-PHASE0B-TOOLCHAIN-001`, configuration `63e532b52e6d4c2e`, and manifest SHA-256
+`553cbfe6eb5cd9976c4f078a3731269f2a2ecd4f3ff5d574ab3813bae8fcf1f1`.
+
+This descendant adds the bounded fixed point for the complete used transition-table graph, an
+identity-mapped supervisor-RW/NX table prefix, a reserved temporary PML4 slot with an exactly zero
+leaf, consuming plan-bound graph attestation, and the generated kind-3 paging carrier. The carrier
+publishes the exact 112-byte header plus the sorted used-frame prefix, remains owned across
+`ExitBootServices`, and is mapped read-only/NX. The raw transfer observes PAT entry zero as `0x06`,
+clears CR4.PGE, loads the aligned attested CR3 with PCID zero, then clears CR4.PCIDE. This records
+PAT-selection consistency only and makes no MTRR-derived effective write-back claim.
+
+Clean-revision evidence:
+
+- focused paging/module/BootInfo/UEFI host tests: 59 passed, 0 failed;
+- complete loader host suite: 95 passed, 0 failed;
+- unfiltered `cargo xtask test host`: 184 passed, 0 failed, 1 accepted environment-gated ignored;
+- `cargo test --locked -p xtask`: 39 passed, 0 failed, 1 accepted environment-gated ignored;
+- the ignored immutable-toolchain positive gate, run separately with the accepted compiler: passed;
+- strict loader and xtask Clippy with warnings denied: passed;
+- workspace formatting and repository diff hygiene: passed;
+- accepted immutable-toolchain verification, generated-policy target check/build, PE inspection, and
+  clean schema-v2 provenance generation: passed.
+
+The clean accepted build produced:
+
+- `target/wyr0-b/x86_64-unknown-uefi/debug/loader.efi`: SHA-256
+  `c6ec39a427754475616cab6cdd62c3f5cfd67a64a6cf34b8fe65ac4c9e142cdb`;
+- `target/wyr0-b/x86_64-unknown-uefi/debug/loader.pdb`: SHA-256
+  `3dbfb3019f4ca0cbf3bb5ef5c674707c6c74951640f9b26f0918a4c42cc52f89`;
+- PE inspection report identity:
+  `f616d99b1385ed13d3d59091f5c02db5966c0228532ea632868794831f151b11`;
+- `target/wyr0-b/provenance/wyr0-b-loader.toml`: SHA-256
+  `62ceb648996d1e18088e66d67800ece60aefc8b53d4e959cdfa1c1a73608da65`.
+
+The provenance records `wyrmroot_dirty = false`, the exact Wyrmroot/Deepwyrm/Rust revisions, both
+layout hashes, the accepted toolchain identities, and an explicit statement that build provenance
+does not itself claim behavioral handoff conformance. PDB public symbols place
+`__wyrmroot_handoff_start` and `__wyrmroot_handoff_end` 37 bytes apart. PE disassembly verifies
+`cld; read CR4; clear PGE; write CR4; load CR3; read CR4; clear PCIDE; write CR4; set RSP/RDI;
+clear RBP; jmp RDX`, with no call or return edge.
+
+The source, host, accepted-build, PE, provenance, and adversarial-review gates pass for this clean
+descendant. The root-coordinator-owned exact-pair VM BootInfo/carrier handoff gate remains pending;
+this record does not claim VM, QEMU/OVMF, or physical-hardware acceptance.
