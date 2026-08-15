@@ -5,7 +5,11 @@ mod boot_info;
 mod memory_map;
 
 use boot_info::UefiMemoryKind;
-use deepwyrm_abi::DW_BOOT_BASE_PAGE_SIZE;
+use deepwyrm_abi::{
+    DW_BOOT_BASE_PAGE_SIZE, DW_BOOT_MEMORY_KIND_ACPI_NVS, DW_BOOT_MEMORY_KIND_ACPI_RECLAIM,
+    DW_BOOT_MEMORY_KIND_MMIO, DW_BOOT_MEMORY_KIND_RESERVED, DW_BOOT_MEMORY_KIND_RUNTIME_SERVICES,
+    DW_BOOT_MEMORY_KIND_UNUSABLE, DW_BOOT_MEMORY_KIND_USABLE, DwBootMemoryRangeV1,
+};
 use memory_map::{FirmwareMemoryDescriptor, MemoryMapError, normalize_and_coalesce};
 
 const PAGE_SIZE: u64 = DW_BOOT_BASE_PAGE_SIZE as u64;
@@ -39,10 +43,39 @@ fn coalesces_normalized_kinds_without_a_raw_descriptor_limit() {
     let normalized = normalize_and_coalesce(input, &mut output).unwrap();
 
     assert_eq!(normalized.len(), 1);
-    assert_eq!(normalized[0].kind, UefiMemoryKind::Conventional);
+    assert_eq!(normalized[0].kind, DW_BOOT_MEMORY_KIND_USABLE);
     assert_eq!(normalized[0].physical_start, PAGE_SIZE);
     assert_eq!(normalized[0].page_count, 129);
     assert_eq!(normalized[0].firmware_attributes, 0x10);
+}
+
+#[test]
+fn normalizes_every_translated_firmware_memory_kind() {
+    let input = [
+        descriptor(Some(UefiMemoryKind::Loader), PAGE_SIZE, 1, 0),
+        descriptor(Some(UefiMemoryKind::Conventional), PAGE_SIZE * 2, 1, 1),
+        descriptor(Some(UefiMemoryKind::BootServices), PAGE_SIZE * 3, 1, 2),
+        descriptor(Some(UefiMemoryKind::Reserved), PAGE_SIZE * 4, 1, 3),
+        descriptor(Some(UefiMemoryKind::AcpiReclaim), PAGE_SIZE * 5, 1, 4),
+        descriptor(Some(UefiMemoryKind::AcpiNvs), PAGE_SIZE * 6, 1, 5),
+        descriptor(Some(UefiMemoryKind::Mmio), PAGE_SIZE * 7, 1, 6),
+        descriptor(Some(UefiMemoryKind::RuntimeServices), PAGE_SIZE * 8, 1, 7),
+        descriptor(Some(UefiMemoryKind::Unusable), PAGE_SIZE * 9, 1, 8),
+    ];
+    let mut output = [default_descriptor(); 9];
+
+    let normalized = normalize_and_coalesce(input, &mut output).unwrap();
+
+    assert_eq!(normalized.len(), 9);
+    assert_eq!(normalized[0].kind, DW_BOOT_MEMORY_KIND_RESERVED);
+    assert_eq!(normalized[1].kind, DW_BOOT_MEMORY_KIND_USABLE);
+    assert_eq!(normalized[2].kind, DW_BOOT_MEMORY_KIND_USABLE);
+    assert_eq!(normalized[3].kind, DW_BOOT_MEMORY_KIND_RESERVED);
+    assert_eq!(normalized[4].kind, DW_BOOT_MEMORY_KIND_ACPI_RECLAIM);
+    assert_eq!(normalized[5].kind, DW_BOOT_MEMORY_KIND_ACPI_NVS);
+    assert_eq!(normalized[6].kind, DW_BOOT_MEMORY_KIND_MMIO);
+    assert_eq!(normalized[7].kind, DW_BOOT_MEMORY_KIND_RUNTIME_SERVICES);
+    assert_eq!(normalized[8].kind, DW_BOOT_MEMORY_KIND_UNUSABLE);
 }
 
 #[test]
@@ -57,10 +90,10 @@ fn does_not_merge_across_kind_or_attribute_boundaries() {
     let normalized = normalize_and_coalesce(input, &mut output).unwrap();
 
     assert_eq!(normalized.len(), 3);
-    assert_eq!(normalized[0].kind, UefiMemoryKind::Reserved);
-    assert_eq!(normalized[1].kind, UefiMemoryKind::Reserved);
+    assert_eq!(normalized[0].kind, DW_BOOT_MEMORY_KIND_RESERVED);
+    assert_eq!(normalized[1].kind, DW_BOOT_MEMORY_KIND_RESERVED);
     assert_eq!(normalized[1].firmware_attributes, 0x20);
-    assert_eq!(normalized[2].kind, UefiMemoryKind::Mmio);
+    assert_eq!(normalized[2].kind, DW_BOOT_MEMORY_KIND_MMIO);
 }
 
 #[test]
@@ -155,11 +188,6 @@ fn rejects_unknown_zero_unaligned_unsorted_overlapping_and_wrapping_input() {
     );
 }
 
-fn default_descriptor() -> boot_info::UefiMemoryDescriptor {
-    boot_info::UefiMemoryDescriptor {
-        kind: UefiMemoryKind::Unusable,
-        physical_start: 0,
-        page_count: 0,
-        firmware_attributes: 0,
-    }
+fn default_descriptor() -> DwBootMemoryRangeV1 {
+    DwBootMemoryRangeV1::default()
 }

@@ -4,11 +4,17 @@
 //! [`boot_info::UefiMemoryKind`] before calling this module. An unknown value
 //! remains `None` and is rejected here rather than being guessed at. Output
 //! uses canonical representatives for categories with identical BootInfo
-//! meaning, allowing a caller-provided buffer to hold a coalesced map.
+//! meaning, allowing a caller-provided generated-record buffer to hold a
+//! coalesced map.
 
-use deepwyrm_abi::DW_BOOT_BASE_PAGE_SIZE;
+use deepwyrm_abi::{
+    DW_BOOT_BASE_PAGE_SIZE, DW_BOOT_MEMORY_KIND_ACPI_NVS, DW_BOOT_MEMORY_KIND_ACPI_RECLAIM,
+    DW_BOOT_MEMORY_KIND_MMIO, DW_BOOT_MEMORY_KIND_RESERVED, DW_BOOT_MEMORY_KIND_RUNTIME_SERVICES,
+    DW_BOOT_MEMORY_KIND_UNUSABLE, DW_BOOT_MEMORY_KIND_USABLE, DW_BOOT_MEMORY_RANGE_V1_SIZE,
+    DW_BOOT_MEMORY_RANGE_V1_VERSION, DwBootMemoryKind, DwBootMemoryRangeV1,
+};
 
-use crate::boot_info::{UefiMemoryDescriptor, UefiMemoryKind};
+use crate::boot_info::UefiMemoryKind;
 
 /// One already-translated, post-`ExitBootServices` firmware memory descriptor.
 ///
@@ -43,8 +49,8 @@ pub enum MemoryMapError {
 /// On error, callers must discard any partially written output.
 pub fn normalize_and_coalesce<I>(
     input: I,
-    output: &mut [UefiMemoryDescriptor],
-) -> Result<&[UefiMemoryDescriptor], MemoryMapError>
+    output: &mut [DwBootMemoryRangeV1],
+) -> Result<&[DwBootMemoryRangeV1], MemoryMapError>
 where
     I: IntoIterator<Item = FirmwareMemoryDescriptor>,
 {
@@ -94,11 +100,15 @@ where
         let slot = output
             .get_mut(output_len)
             .ok_or(MemoryMapError::OutputExhausted)?;
-        *slot = UefiMemoryDescriptor {
+        *slot = DwBootMemoryRangeV1 {
+            size: DW_BOOT_MEMORY_RANGE_V1_SIZE,
+            version: DW_BOOT_MEMORY_RANGE_V1_VERSION,
             kind,
+            reserved0: 0,
             physical_start: descriptor.physical_start,
             page_count: descriptor.page_count,
             firmware_attributes: descriptor.firmware_attributes,
+            reserved: [0; 3],
         };
         output_len = output_len
             .checked_add(1)
@@ -108,15 +118,15 @@ where
     Ok(&output[..output_len])
 }
 
-fn normalize_kind(kind: UefiMemoryKind) -> UefiMemoryKind {
+fn normalize_kind(kind: UefiMemoryKind) -> DwBootMemoryKind {
     match kind {
-        UefiMemoryKind::Conventional | UefiMemoryKind::BootServices => UefiMemoryKind::Conventional,
-        UefiMemoryKind::Loader | UefiMemoryKind::Reserved => UefiMemoryKind::Reserved,
-        UefiMemoryKind::AcpiReclaim => UefiMemoryKind::AcpiReclaim,
-        UefiMemoryKind::AcpiNvs => UefiMemoryKind::AcpiNvs,
-        UefiMemoryKind::Mmio => UefiMemoryKind::Mmio,
-        UefiMemoryKind::RuntimeServices => UefiMemoryKind::RuntimeServices,
-        UefiMemoryKind::Unusable => UefiMemoryKind::Unusable,
+        UefiMemoryKind::Conventional | UefiMemoryKind::BootServices => DW_BOOT_MEMORY_KIND_USABLE,
+        UefiMemoryKind::Loader | UefiMemoryKind::Reserved => DW_BOOT_MEMORY_KIND_RESERVED,
+        UefiMemoryKind::AcpiReclaim => DW_BOOT_MEMORY_KIND_ACPI_RECLAIM,
+        UefiMemoryKind::AcpiNvs => DW_BOOT_MEMORY_KIND_ACPI_NVS,
+        UefiMemoryKind::Mmio => DW_BOOT_MEMORY_KIND_MMIO,
+        UefiMemoryKind::RuntimeServices => DW_BOOT_MEMORY_KIND_RUNTIME_SERVICES,
+        UefiMemoryKind::Unusable => DW_BOOT_MEMORY_KIND_UNUSABLE,
     }
 }
 

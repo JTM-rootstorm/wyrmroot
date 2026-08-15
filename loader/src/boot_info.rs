@@ -4,9 +4,9 @@
 //! adapter supplies normalized descriptors and post-`ExitBootServices` storage ownership; this
 //! module rejects a handoff that cannot remain valid until Deepwyrm copies it.
 //!
-//! Construction writes the output slices before every later validation step has completed. Callers
-//! must treat `BootInfoOutput` as unusable after an error; transactional construction is deferred
-//! until the firmware adapter owns the final physical allocations.
+//! Construction may copy the module output immediately before final table validation. Callers must
+//! treat `BootInfoOutput` as unusable after an error; transactional construction is deferred until
+//! the firmware adapter owns the final physical allocations.
 
 use core::mem::{align_of, size_of};
 
@@ -66,9 +66,10 @@ pub struct UefiMemoryDescriptor {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AllocationLifetime {
-    /// The allocation remains valid until the kernel has copied the handoff data it needs.
-    RetainedUntilKernelCopy,
-    ReleasedBeforeHandoff,
+    /// The allocation remains Reserved and valid through Deepwyrm's early
+    /// handoff intake and page-table replacement.
+    RetainedUntilDeepwyrmPageTableReplacement,
+    ReleasedBeforeDeepwyrmPageTableReplacement,
     AllocationFailed,
 }
 
@@ -126,7 +127,9 @@ pub struct FramebufferInput {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AcpiRsdpInput {
-    pub physical_start: u64,
+    /// Full retained extent of the loader-owned RSDP copy.
+    pub storage: HandoffAllocation,
+    /// Exact validated RSDP payload length, excluding page slack.
     pub byte_len: u64,
 }
 
@@ -136,7 +139,8 @@ pub struct BootInfoInput<'a> {
     pub boot_info_storage: HandoffAllocation,
     pub memory_map_storage: HandoffAllocation,
     pub module_table_storage: HandoffAllocation,
-    pub memory_map: &'a [UefiMemoryDescriptor],
+    /// Already normalized/coalesced generated records in retained table storage.
+    pub memory_map: &'a [DwBootMemoryRangeV1],
     /// Already canonicalized by the modules lane; this module never creates or orders modules.
     pub modules: &'a [DwBootModuleV1],
     pub acpi_rsdp: Option<AcpiRsdpInput>,
@@ -147,7 +151,19 @@ pub struct BootInfoInput<'a> {
 
 pub struct BootInfoOutput<'a> {
     pub boot_info: &'a mut DwBootInfoV1,
-    pub memory_map: &'a mut [DwBootMemoryRangeV1],
+    /// Caller-provided view of `module_table_storage`; canonical input records
+    /// are copied here before the published BootInfo references that storage.
+    pub modules: &'a mut [DwBootModuleV1],
+}
+
+/// Integration-supplied bounds from Deepwyrm's generated early-intake policy.
+///
+/// This pure module deliberately does not own a numeric cap. The UEFI adapter
+/// converts the generated policy values to `usize` and supplies them here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BootInfoLimits {
+    pub max_memory_map_entries: usize,
+    pub max_module_entries: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -157,6 +173,8 @@ pub enum BootInfoError {
     AllocationReleased,
     EmptyMemoryMap,
     OutputLengthMismatch,
+    MemoryMapEntryLimitExceeded,
+    ModuleEntryLimitExceeded,
     PhysicalAddressUnaligned,
     EmptyRange,
     RangeOverflow,
@@ -183,14 +201,41 @@ pub fn build(
     input: &BootInfoInput<'_>,
     output: &mut BootInfoOutput<'_>,
 ) -> Result<(), BootInfoError> {
+    // Host callers may choose their own bounds. The production UEFI adapter must call
+    // `build_with_limits` with the generated Deepwyrm early-intake policy.
+    build_inner(input, output, None)
+}
+
+/// Builds BootInfo while enforcing generated early-intake capacity limits.
+pub fn build_with_limits(
+    input: &BootInfoInput<'_>,
+    output: &mut BootInfoOutput<'_>,
+    limits: BootInfoLimits,
+) -> Result<(), BootInfoError> {
+    build_inner(input, output, Some(limits))
+}
+
+fn build_inner(
+    input: &BootInfoInput<'_>,
+    output: &mut BootInfoOutput<'_>,
+    limits: Option<BootInfoLimits>,
+) -> Result<(), BootInfoError> {
     if input.phase != FirmwarePhase::AfterExitBootServices {
         return Err(BootInfoError::ExitBootServicesIncomplete);
     }
     if input.memory_map.is_empty() {
         return Err(BootInfoError::EmptyMemoryMap);
     }
-    if input.memory_map.len() != output.memory_map.len() {
+    if input.modules.len() != output.modules.len() {
         return Err(BootInfoError::OutputLengthMismatch);
+    }
+    if let Some(limits) = limits {
+        if input.memory_map.len() > limits.max_memory_map_entries {
+            return Err(BootInfoError::MemoryMapEntryLimitExceeded);
+        }
+        if input.modules.len() > limits.max_module_entries {
+            return Err(BootInfoError::ModuleEntryLimitExceeded);
+        }
     }
     let memory_map_entry_count =
         u64::try_from(input.memory_map.len()).map_err(|_| BootInfoError::RangeOverflow)?;
@@ -211,24 +256,23 @@ pub fn build(
         align_of::<DwBootModuleV1>() as u64,
     )?;
 
-    normalize_memory_map(input.memory_map, output.memory_map)?;
-    validate_memory_map(output.memory_map)?;
-    validate_reserved_storage(&input.boot_info_storage, output.memory_map)?;
-    validate_reserved_storage(&input.memory_map_storage, output.memory_map)?;
-    validate_reserved_storage(&input.module_table_storage, output.memory_map)?;
+    validate_memory_map(input.memory_map)?;
+    validate_reserved_storage(&input.boot_info_storage, input.memory_map)?;
+    validate_reserved_storage(&input.memory_map_storage, input.memory_map)?;
+    validate_reserved_storage(&input.module_table_storage, input.memory_map)?;
     validate_modules(input.modules)?;
     for module in input.modules {
         validate_reserved_range(
             module.physical_start,
             module_allocation_len(module.byte_len)?,
-            output.memory_map,
+            input.memory_map,
         )?;
     }
-    let command_line = build_command_line(input.command_line, output.memory_map)?;
-    let entropy = build_entropy(input.entropy, output.memory_map)?;
-    let (flags, framebuffer) = build_framebuffer(input.framebuffer, output.memory_map)?;
-    let acpi_rsdp_physical_address = build_acpi_rsdp(input.acpi_rsdp, output.memory_map)?;
-    validate_distinct_handoff_ranges(input, command_line, input.entropy)?;
+    let command_line = build_command_line(input.command_line, input.memory_map)?;
+    let entropy = build_entropy(input.entropy, input.memory_map)?;
+    let (flags, framebuffer) = build_framebuffer(input.framebuffer, input.memory_map)?;
+    let acpi_rsdp_physical_address = build_acpi_rsdp(input.acpi_rsdp, input.memory_map)?;
+    validate_distinct_handoff_ranges(input, command_line, input.entropy, input.acpi_rsdp)?;
 
     let info = DwBootInfoV1 {
         size: DW_BOOT_INFO_V1_SIZE,
@@ -250,7 +294,8 @@ pub fn build(
         reserved: [0; 8],
     };
     validate_boot_info(&info)?;
-    validate_tables(&info, output.memory_map, input.modules)?;
+    output.modules.copy_from_slice(input.modules);
+    validate_tables(&info, input.memory_map, output.modules)?;
     *output.boot_info = info;
     Ok(())
 }
@@ -340,38 +385,6 @@ pub fn validate_tables(
     validate_modules(modules)
 }
 
-fn normalize_memory_map(
-    input: &[UefiMemoryDescriptor],
-    output: &mut [DwBootMemoryRangeV1],
-) -> Result<(), BootInfoError> {
-    for (descriptor, entry) in input.iter().zip(output.iter_mut()) {
-        validate_page_range(descriptor.physical_start, descriptor.page_count)?;
-        *entry = DwBootMemoryRangeV1 {
-            size: DW_BOOT_MEMORY_RANGE_V1_SIZE,
-            version: DW_BOOT_MEMORY_RANGE_V1_VERSION,
-            kind: normalize_memory_kind(descriptor.kind),
-            reserved0: 0,
-            physical_start: descriptor.physical_start,
-            page_count: descriptor.page_count,
-            firmware_attributes: descriptor.firmware_attributes,
-            reserved: [0; 3],
-        };
-    }
-    Ok(())
-}
-
-fn normalize_memory_kind(kind: UefiMemoryKind) -> DwBootMemoryKind {
-    match kind {
-        UefiMemoryKind::Conventional | UefiMemoryKind::BootServices => DW_BOOT_MEMORY_KIND_USABLE,
-        UefiMemoryKind::Loader | UefiMemoryKind::Reserved => DW_BOOT_MEMORY_KIND_RESERVED,
-        UefiMemoryKind::AcpiReclaim => DW_BOOT_MEMORY_KIND_ACPI_RECLAIM,
-        UefiMemoryKind::AcpiNvs => DW_BOOT_MEMORY_KIND_ACPI_NVS,
-        UefiMemoryKind::Mmio => DW_BOOT_MEMORY_KIND_MMIO,
-        UefiMemoryKind::RuntimeServices => DW_BOOT_MEMORY_KIND_RUNTIME_SERVICES,
-        UefiMemoryKind::Unusable => DW_BOOT_MEMORY_KIND_UNUSABLE,
-    }
-}
-
 fn build_command_line(
     command_line: Option<CommandLineInput>,
     memory_map: &[DwBootMemoryRangeV1],
@@ -381,7 +394,7 @@ fn build_command_line(
             storage: HandoffAllocation {
                 physical_start: 0,
                 byte_len: 0,
-                lifetime: AllocationLifetime::RetainedUntilKernelCopy,
+                lifetime: AllocationLifetime::RetainedUntilDeepwyrmPageTableReplacement,
             },
             byte_len: 0,
         });
@@ -440,25 +453,26 @@ fn build_acpi_rsdp(
     let Some(rsdp) = rsdp else {
         return Ok(0);
     };
-    if rsdp.physical_start == 0
-        || !rsdp.physical_start.is_multiple_of(ACPI_RSDP_ALIGNMENT)
+    if rsdp.storage.physical_start == 0
+        || !rsdp
+            .storage
+            .physical_start
+            .is_multiple_of(ACPI_RSDP_ALIGNMENT)
         || rsdp.byte_len < ACPI_RSDP_MINIMUM_BYTES
-        || rsdp.physical_start.checked_add(rsdp.byte_len).is_none()
-        || !range_has_kind(rsdp.physical_start, rsdp.byte_len, memory_map, |kind| {
-            kind == DW_BOOT_MEMORY_KIND_ACPI_RECLAIM
-                || kind == DW_BOOT_MEMORY_KIND_ACPI_NVS
-                || kind == DW_BOOT_MEMORY_KIND_RESERVED
-        })?
+        || rsdp.byte_len > rsdp.storage.byte_len
     {
         return Err(BootInfoError::InvalidAcpiRsdp);
     }
-    Ok(rsdp.physical_start)
+    validate_retained(&rsdp.storage, rsdp.byte_len)?;
+    validate_reserved_storage(&rsdp.storage, memory_map)?;
+    Ok(rsdp.storage.physical_start)
 }
 
 fn validate_distinct_handoff_ranges(
     input: &BootInfoInput<'_>,
     command_line: CommandLineInput,
     entropy: Option<EntropyInput>,
+    acpi_rsdp: Option<AcpiRsdpInput>,
 ) -> Result<(), BootInfoError> {
     let fixed = [
         input.boot_info_storage,
@@ -487,58 +501,44 @@ fn validate_distinct_handoff_ranges(
             }
         }
     }
-    if command_line.byte_len != 0 {
+    let additional = [
+        (command_line.byte_len != 0).then_some(command_line.storage),
+        entropy.map(|value| value.storage),
+        acpi_rsdp.map(|value| value.storage),
+    ];
+    for (index, allocation) in additional.iter().enumerate() {
+        let Some(allocation) = allocation else {
+            continue;
+        };
         for left in fixed {
             if ranges_overlap(
                 left.physical_start,
                 left.byte_len,
-                command_line.storage.physical_start,
-                command_line.storage.byte_len,
+                allocation.physical_start,
+                allocation.byte_len,
             )? {
                 return Err(BootInfoError::HandoffStorageOverlap);
             }
         }
         for module in input.modules {
             if ranges_overlap(
-                command_line.storage.physical_start,
-                command_line.storage.byte_len,
+                allocation.physical_start,
+                allocation.byte_len,
                 module.physical_start,
                 module_allocation_len(module.byte_len)?,
             )? {
                 return Err(BootInfoError::HandoffStorageOverlap);
             }
         }
-    }
-    if let Some(entropy) = entropy {
-        for left in fixed {
+        for prior in additional.iter().take(index).flatten() {
             if ranges_overlap(
-                left.physical_start,
-                left.byte_len,
-                entropy.storage.physical_start,
-                entropy.storage.byte_len,
+                allocation.physical_start,
+                allocation.byte_len,
+                prior.physical_start,
+                prior.byte_len,
             )? {
                 return Err(BootInfoError::HandoffStorageOverlap);
             }
-        }
-        for module in input.modules {
-            if ranges_overlap(
-                entropy.storage.physical_start,
-                entropy.storage.byte_len,
-                module.physical_start,
-                module_allocation_len(module.byte_len)?,
-            )? {
-                return Err(BootInfoError::HandoffStorageOverlap);
-            }
-        }
-        if command_line.byte_len != 0
-            && ranges_overlap(
-                command_line.storage.physical_start,
-                command_line.storage.byte_len,
-                entropy.storage.physical_start,
-                entropy.storage.byte_len,
-            )?
-        {
-            return Err(BootInfoError::HandoffStorageOverlap);
         }
     }
     Ok(())
@@ -782,11 +782,22 @@ fn validate_retained(
 ) -> Result<(), BootInfoError> {
     match allocation.lifetime {
         AllocationLifetime::AllocationFailed => return Err(BootInfoError::AllocationUnavailable),
-        AllocationLifetime::ReleasedBeforeHandoff => return Err(BootInfoError::AllocationReleased),
-        AllocationLifetime::RetainedUntilKernelCopy => {}
+        AllocationLifetime::ReleasedBeforeDeepwyrmPageTableReplacement => {
+            return Err(BootInfoError::AllocationReleased);
+        }
+        AllocationLifetime::RetainedUntilDeepwyrmPageTableReplacement => {}
     }
     if allocation.physical_start == 0 || allocation.byte_len < minimum_len {
         return Err(BootInfoError::EmptyRange);
+    }
+    if !allocation
+        .physical_start
+        .is_multiple_of(u64::from(DW_BOOT_BASE_PAGE_SIZE))
+        || !allocation
+            .byte_len
+            .is_multiple_of(u64::from(DW_BOOT_BASE_PAGE_SIZE))
+    {
+        return Err(BootInfoError::PhysicalAddressUnaligned);
     }
     if allocation
         .physical_start

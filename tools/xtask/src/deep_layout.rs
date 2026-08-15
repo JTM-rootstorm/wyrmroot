@@ -1,22 +1,43 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsStr;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{Read, Take, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use crate::error::Failure;
-use crate::sha256::file_digest;
+use crate::sha256::bytes_digest;
 
 const PACKAGE_NAME: &str = "deepwyrm-abi";
 const PACKAGE_MANIFEST: &str = "crates/deepwyrm-abi/Cargo.toml";
 const LAYOUT_PATH: &str = "kernel/arch/x86_64/layout.toml";
 const GENERATED_POLICY_PATH: &str = "target/wyr0-b/generated/deepwyrm_layout_policy.rs";
+const MAX_LAYOUT_BYTES: u64 = 1024 * 1024;
 
 pub(crate) struct DeepLayoutBuild {
     pub(crate) policy_path: PathBuf,
     pub(crate) layout_sha256: String,
     pub(crate) policy_sha256: String,
+}
+
+impl DeepLayoutBuild {
+    pub(crate) fn verify_unchanged(&self) -> Result<(), Failure> {
+        validate_regular_file(&self.policy_path, "generated Deepwyrm layout policy")?;
+        let bytes = read_bounded(
+            &self.policy_path,
+            MAX_LAYOUT_BYTES,
+            "generated Deepwyrm layout policy",
+        )?;
+        let actual = bytes_digest(&bytes);
+        if actual != self.policy_sha256 {
+            return Err(Failure::task(format!(
+                "generated Deepwyrm layout policy hash changed: {actual}, expected {}",
+                self.policy_sha256
+            )));
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn prepare(
@@ -29,24 +50,25 @@ pub(crate) fn prepare(
     let source_root = validate_git_source(&package.manifest_path, expected_revision)?;
     let layout_path = source_root.join(LAYOUT_PATH);
     validate_regular_path(&source_root, &layout_path, "Deepwyrm x86_64 layout")?;
-    verify_tracked_file(&source_root, LAYOUT_PATH, &layout_path)?;
-
-    let contents = fs::read_to_string(&layout_path).map_err(|error| {
-        Failure::task(format!(
-            "could not read Deepwyrm layout {}: {error}",
-            layout_path.display()
-        ))
-    })?;
-    let policy = LayoutPolicy::parse(&contents)?;
+    let layout_bytes = read_bounded(&layout_path, MAX_LAYOUT_BYTES, "Deepwyrm x86_64 layout")?;
+    verify_tracked_bytes(&source_root, LAYOUT_PATH, &layout_bytes)?;
+    let contents = std::str::from_utf8(&layout_bytes)
+        .map_err(|_| Failure::task("Deepwyrm x86_64 layout is not UTF-8"))?;
+    let policy = LayoutPolicy::parse(contents)?;
     let generated = policy.render_rust();
+    let layout_sha256 = bytes_digest(&layout_bytes);
+    let policy_sha256 = bytes_digest(generated.as_bytes());
     let policy_path = repository.join(GENERATED_POLICY_PATH);
     write_generated_policy(&policy_path, &generated)?;
+    verify_git_source_identity(&source_root, expected_revision)?;
 
-    Ok(DeepLayoutBuild {
+    let build = DeepLayoutBuild {
         policy_path,
-        layout_sha256: digest(&layout_path)?,
-        policy_sha256: digest(&repository.join(GENERATED_POLICY_PATH))?,
-    })
+        layout_sha256,
+        policy_sha256,
+    };
+    build.verify_unchanged()?;
+    Ok(build)
 }
 
 fn cargo_metadata(repository: &Path) -> Result<String, Failure> {
@@ -153,6 +175,16 @@ fn validate_git_source(manifest: &Path, expected_revision: &str) -> Result<PathB
         ));
     }
     validate_directory(&root, "deepwyrm-abi Git source root")?;
+    let canonical_root = fs::canonicalize(&root).map_err(|error| {
+        Failure::task(format!(
+            "could not canonicalize deepwyrm-abi Git source root: {error}"
+        ))
+    })?;
+    if canonical_root != root {
+        return Err(Failure::task(
+            "deepwyrm-abi Git source root is not canonical or contains a symlink",
+        ));
+    }
     validate_regular_path(&root, manifest, "deepwyrm-abi manifest")?;
     if root.join(PACKAGE_MANIFEST) != manifest {
         return Err(Failure::task(format!(
@@ -160,7 +192,12 @@ fn validate_git_source(manifest: &Path, expected_revision: &str) -> Result<PathB
         )));
     }
 
-    let revision = git_output(&root, ["rev-parse", "HEAD"])?;
+    verify_git_source_identity(&root, expected_revision)?;
+    Ok(root)
+}
+
+fn verify_git_source_identity(root: &Path, expected_revision: &str) -> Result<(), Failure> {
+    let revision = git_output(root, ["rev-parse", "HEAD"])?;
     if revision.trim() != expected_revision {
         return Err(Failure::task(format!(
             "deepwyrm-abi source checkout revision is '{}', expected '{}'",
@@ -168,9 +205,8 @@ fn validate_git_source(manifest: &Path, expected_revision: &str) -> Result<PathB
             expected_revision
         )));
     }
-    let status = git_output(&root, ["status", "--porcelain=v1", "--untracked-files=all"])?;
-    validate_git_status(&root, &status)?;
-    Ok(root)
+    let status = git_output(root, ["status", "--porcelain=v1", "--untracked-files=all"])?;
+    validate_git_status(root, &status)
 }
 
 fn validate_git_status(root: &Path, status: &str) -> Result<(), Failure> {
@@ -279,19 +315,38 @@ fn validate_directory(path: &Path, label: &str) -> Result<(), Failure> {
     Ok(())
 }
 
-fn verify_tracked_file(root: &Path, relative: &str, path: &Path) -> Result<(), Failure> {
+fn verify_tracked_bytes(root: &Path, relative: &str, bytes: &[u8]) -> Result<(), Failure> {
     git_output(root, ["ls-files", "--error-unmatch", relative])?;
     let expected = git_output(root, ["rev-parse", &format!("HEAD:{relative}")])?;
-    let actual = git_output(
-        root,
-        ["hash-object", path.as_os_str().to_string_lossy().as_ref()],
-    )?;
+    let actual = git_hash_bytes(root, bytes)?;
     if expected.trim() != actual.trim() {
         return Err(Failure::task(
             "Deepwyrm x86_64 layout content does not match the pinned Git revision",
         ));
     }
     Ok(())
+}
+
+fn git_hash_bytes(root: &Path, bytes: &[u8]) -> Result<String, Failure> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["hash-object", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| Failure::task(format!("could not hash Deepwyrm layout bytes: {error}")))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| Failure::task("could not open Git hash-object stdin"))?
+        .write_all(bytes)
+        .map_err(|error| Failure::task(format!("could not send layout bytes to Git: {error}")))?;
+    let output = child.wait_with_output().map_err(|error| {
+        Failure::task(format!("could not wait for Deepwyrm layout hash: {error}"))
+    })?;
+    output_stdout(output, "Deepwyrm layout byte hashing")
 }
 
 fn write_generated_policy(path: &Path, contents: &str) -> Result<(), Failure> {
@@ -323,9 +378,73 @@ fn write_generated_policy(path: &Path, contents: &str) -> Result<(), Failure> {
     })
 }
 
-fn digest(path: &Path) -> Result<String, Failure> {
-    file_digest(path)
-        .map_err(|error| Failure::task(format!("could not hash {}: {error}", path.display())))
+fn read_bounded(path: &Path, maximum: u64, label: &str) -> Result<Vec<u8>, Failure> {
+    let file = open_stable_regular_file(path, label)?;
+    let mut bytes = Vec::new();
+    let mut bounded: Take<&File> = (&file).take(maximum + 1);
+    bounded
+        .read_to_end(&mut bytes)
+        .map_err(|error| Failure::task(format!("could not read {label}: {error}")))?;
+    if bytes.len() as u64 > maximum {
+        return Err(Failure::task(format!(
+            "{label} exceeds the {maximum}-byte limit"
+        )));
+    }
+    verify_open_file_identity(&file, path, label)?;
+    Ok(bytes)
+}
+
+fn open_stable_regular_file(path: &Path, label: &str) -> Result<File, Failure> {
+    let before = fs::symlink_metadata(path)
+        .map_err(|error| Failure::task(format!("could not inspect {label}: {error}")))?;
+    if before.file_type().is_symlink() || !before.is_file() {
+        return Err(Failure::task(format!(
+            "{label} must be a regular non-symlink file"
+        )));
+    }
+    let file = File::open(path)
+        .map_err(|error| Failure::task(format!("could not open {label}: {error}")))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| Failure::task(format!("could not inspect open {label}: {error}")))?;
+    if !same_file_identity(&before, &opened) {
+        return Err(Failure::task(format!(
+            "{label} identity changed while it was opened"
+        )));
+    }
+    verify_open_file_identity(&file, path, label)?;
+    Ok(file)
+}
+
+fn verify_open_file_identity(file: &File, path: &Path, label: &str) -> Result<(), Failure> {
+    let opened = file
+        .metadata()
+        .map_err(|error| Failure::task(format!("could not inspect open {label}: {error}")))?;
+    let current = fs::symlink_metadata(path)
+        .map_err(|error| Failure::task(format!("could not re-inspect {label}: {error}")))?;
+    if current.file_type().is_symlink()
+        || !current.is_file()
+        || !same_file_identity(&opened, &current)
+    {
+        return Err(Failure::task(format!(
+            "{label} identity changed during validation"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.len() == right.len()
+        && left.modified().ok() == right.modified().ok()
+        && left.created().ok() == right.created().ok()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1006,9 +1125,11 @@ fn hex_digit(byte: u8) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        JsonParser, LayoutPolicy, locate_package, validate_git_status,
-        validate_metadata_manifest_path, validate_regular_path,
+        DeepLayoutBuild, JsonParser, LayoutPolicy, locate_package, open_stable_regular_file,
+        validate_git_status, validate_metadata_manifest_path, validate_regular_path,
+        verify_open_file_identity, verify_tracked_bytes,
     };
+    use crate::sha256::bytes_digest;
     use std::path::Path;
 
     const REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -1137,6 +1258,115 @@ mod tests {
         symlink(&outside, &linked).expect("create source symlink");
         assert!(validate_regular_path(&root, &linked, "test layout").is_err());
         fs::remove_dir_all(root).expect("remove isolated source tree");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_policy_identity_rejects_content_and_symlink_swaps() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock precedes Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "wyrmroot-layout-policy-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).expect("create isolated generated directory");
+        let path = root.join("policy.rs");
+        fs::write(&path, b"trusted policy").expect("write generated fixture");
+        let build = DeepLayoutBuild {
+            policy_path: path.clone(),
+            layout_sha256: bytes_digest(b"layout"),
+            policy_sha256: bytes_digest(b"trusted policy"),
+        };
+        build.verify_unchanged().expect("trusted policy rejected");
+        fs::write(&path, b"changed policy").expect("replace policy contents");
+        assert!(build.verify_unchanged().is_err());
+        fs::remove_file(&path).expect("remove changed policy");
+        let target = root.join("target.rs");
+        fs::write(&target, b"trusted policy").expect("write symlink target");
+        symlink(&target, &path).expect("swap policy for symlink");
+        assert!(build.verify_unchanged().is_err());
+        fs::remove_dir_all(root).expect("remove isolated generated directory");
+    }
+
+    #[test]
+    fn exact_layout_bytes_are_bound_to_the_pinned_git_blob() {
+        use std::fs;
+        use std::process::Command;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock precedes Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "wyrmroot-layout-git-blob-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let layout_path = root.join(super::LAYOUT_PATH);
+        fs::create_dir_all(layout_path.parent().expect("layout parent"))
+            .expect("create layout fixture tree");
+        fs::write(&layout_path, b"trusted layout bytes\n").expect("write layout fixture");
+        for arguments in [
+            vec!["init", "-q"],
+            vec!["add", super::LAYOUT_PATH],
+            vec![
+                "-c",
+                "user.name=Wyrmroot test",
+                "-c",
+                "user.email=wyrmroot-test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "fixture",
+            ],
+        ] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&root)
+                    .args(arguments)
+                    .status()
+                    .expect("run fixture Git command")
+                    .success()
+            );
+        }
+        verify_tracked_bytes(&root, super::LAYOUT_PATH, b"trusted layout bytes\n")
+            .expect("exact committed layout bytes rejected");
+        assert!(
+            verify_tracked_bytes(&root, super::LAYOUT_PATH, b"swapped layout bytes\n").is_err()
+        );
+        fs::remove_dir_all(root).expect("remove isolated Git fixture");
+    }
+
+    #[test]
+    fn layout_read_detects_a_path_swap_after_open() {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock precedes Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "wyrmroot-layout-path-swap-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).expect("create isolated layout directory");
+        let path = root.join("layout.toml");
+        fs::write(&path, b"trusted").expect("write trusted layout");
+        let open = open_stable_regular_file(&path, "test layout").expect("open trusted layout");
+        fs::rename(&path, root.join("original.toml")).expect("move open layout");
+        fs::write(&path, b"replacement").expect("install replacement layout");
+        assert!(verify_open_file_identity(&open, &path, "test layout").is_err());
+        fs::remove_dir_all(root).expect("remove isolated layout directory");
     }
 
     #[test]

@@ -3,7 +3,7 @@ mod kernel_elf;
 
 use kernel_elf::{
     AddressRange, KernelElfError, KernelElfPolicy, KernelLoadSegment, SegmentPermissions,
-    plan_kernel_elf,
+    kernel_load_segment_capacity, plan_kernel_elf,
 };
 
 const CODE_VIRTUAL: u64 = 0xffff_8000_0010_0000;
@@ -137,6 +137,64 @@ fn produces_a_deterministic_virtual_address_ordered_plan() {
         plan.virtual_span,
         AddressRange::new(CODE_VIRTUAL, DATA_VIRTUAL + 0x1000)
     );
+}
+
+#[test]
+fn sizes_plan_storage_without_allocating_and_full_plan_reparses() {
+    let image = elf(CODE_VIRTUAL, &[code_segment(), data_segment()]);
+    assert_eq!(kernel_load_segment_capacity(&image, policy()), Ok(2));
+
+    let mut mutated = image;
+    put_u32(&mut mutated, 64 + 4, 8);
+    let mut output = [EMPTY_SEGMENT; 2];
+    assert_eq!(
+        plan_kernel_elf(&mutated, policy(), &mut output),
+        Err(KernelElfError::UnknownSegmentFlags { index: 0, flags: 8 })
+    );
+}
+
+#[test]
+fn sizing_rejects_invalid_truncated_and_extended_headers_without_a_local_cap() {
+    let mut invalid = elf(CODE_VIRTUAL, &[code_segment()]);
+    invalid[4] = 1;
+    assert_eq!(
+        kernel_load_segment_capacity(&invalid, policy()),
+        Err(KernelElfError::UnsupportedClass(1))
+    );
+
+    let mut unsupported_type = elf(CODE_VIRTUAL, &[code_segment()]);
+    put_u32(&mut unsupported_type, 64, 2);
+    assert_eq!(
+        kernel_load_segment_capacity(&unsupported_type, policy()),
+        Err(KernelElfError::UnsupportedProgramHeaderType {
+            index: 0,
+            program_type: 2,
+        })
+    );
+
+    let mut truncated = elf(CODE_VIRTUAL, &[code_segment()]);
+    put_u16(&mut truncated, 56, 2);
+    truncated.truncate(64 + 56);
+    assert_eq!(
+        kernel_load_segment_capacity(&truncated, policy()),
+        Err(KernelElfError::ProgramHeaderTableTruncated)
+    );
+
+    let mut extended = elf(CODE_VIRTUAL, &[code_segment()]);
+    put_u16(&mut extended, 56, u16::MAX);
+    assert_eq!(
+        kernel_load_segment_capacity(&extended, policy()),
+        Err(KernelElfError::ExtendedProgramHeaderCountUnsupported)
+    );
+
+    let count = usize::from(u16::MAX - 1);
+    let mut large = vec![0_u8; 64 + count * 56];
+    large[..64].copy_from_slice(&elf(CODE_VIRTUAL, &[code_segment()])[..64]);
+    put_u16(&mut large, 56, u16::MAX - 1);
+    for index in 0..count {
+        put_u32(&mut large, 64 + index * 56, 1);
+    }
+    assert_eq!(kernel_load_segment_capacity(&large, policy()), Ok(count));
 }
 
 #[test]

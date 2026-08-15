@@ -311,8 +311,11 @@ fn valid_physical_page(address: u64, address_mask: u64) -> bool {
 }
 
 fn canonical_address(address: u64) -> bool {
-    let high = address >> 48;
-    high == 0 || high == 0xffff
+    // In four-level mode bits 63:48 must sign-extend bit 47. Checking only
+    // the high 16 bits would wrongly admit the upper half of the low 48-bit
+    // range (for example 0x0000_8000_0000_0000), whose bit 47 is set but
+    // whose sign-extension bits are clear.
+    !(CANONICAL_LOW_END..CANONICAL_HIGH_START).contains(&address)
 }
 
 fn spans_canonical_hole(virtual_start: u64, byte_len: u64) -> bool {

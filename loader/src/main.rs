@@ -8,6 +8,31 @@ mod uefi_app;
 #[allow(dead_code)] // Activated by the pending ownership-complete handoff builder.
 mod uefi_page_table;
 
+#[cfg(all(feature = "firmware", target_arch = "x86_64", target_os = "uefi"))]
+#[allow(dead_code)] // The generated manifest intentionally carries facts consumed by peer seams.
+mod deep_layout_policy {
+    include!(env!("WYRMROOT_DEEP_LAYOUT_POLICY_RS"));
+}
+
+#[cfg(all(feature = "firmware", target_arch = "x86_64", target_os = "uefi"))]
+fn generated_handoff_policy() -> uefi_app::GeneratedHandoffPolicy {
+    uefi_app::GeneratedHandoffPolicy {
+        link_base: deep_layout_policy::DEEPWYRM_LINK_BASE,
+        base_page_size: deep_layout_policy::DEEPWYRM_BASE_PAGE_SIZE,
+        elf_window_start: deep_layout_policy::DEEPWYRM_ELF_WINDOW_START,
+        elf_window_end_exclusive: deep_layout_policy::DEEPWYRM_ELF_WINDOW_END_EXCLUSIVE,
+        transition_stack_size: deep_layout_policy::DEEPWYRM_LOADER_TRANSITION_STACK_SIZE,
+        transition_stack_alignment: deep_layout_policy::DEEPWYRM_LOADER_TRANSITION_STACK_ALIGNMENT,
+        stack_pointer_mod_16: deep_layout_policy::DEEPWYRM_ENTRY_STATE_LOADER_STACK_RSP_MOD_16,
+        boot_info_alignment: deep_layout_policy::DEEPWYRM_ENTRY_STATE_BOOT_INFO_ALIGNMENT,
+        max_normalized_memory_map_entries:
+            deep_layout_policy::DEEPWYRM_EARLY_INTAKE_MAX_NORMALIZED_MEMORY_MAP_ENTRIES,
+        max_module_entries: deep_layout_policy::DEEPWYRM_EARLY_INTAKE_MAX_MODULE_ENTRIES,
+        max_acpi_rsdp_intersecting_pages:
+            deep_layout_policy::DEEPWYRM_EARLY_INTAKE_ACPI_RSDP_MAX_INTERSECTING_PAGES,
+    }
+}
+
 #[uefi::entry]
 fn main() -> uefi::Status {
     // The entry macro initializes the UEFI crate's image/system-table state.
@@ -17,14 +42,9 @@ fn main() -> uefi::Status {
     }
     uefi::println!("wyrmroot-loader: UEFI adapter online");
 
-    match uefi_app::prepare_pre_exit() {
-        Ok(prepared) => {
-            // Do not take the irreversible ExitBootServices boundary until the
-            // transition and canonical BootInfo owners have added their page
-            // allocations to this same pre-exit state.
-            prepared.release_before_exit();
-            uefi::Status::ABORTED
-        }
-        Err(_) => uefi::Status::ABORTED,
-    }
+    #[cfg(all(feature = "firmware", target_arch = "x86_64", target_os = "uefi"))]
+    return uefi_app::run_handoff(generated_handoff_policy());
+
+    #[allow(unreachable_code)]
+    uefi::Status::ABORTED
 }

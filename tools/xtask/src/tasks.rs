@@ -74,7 +74,7 @@ pub(crate) fn run_loader_build(
         toolchain,
         profile,
         &target_directory,
-        &layout.policy_path,
+        layout,
         "check",
     )?;
     run_uefi_cargo(
@@ -82,7 +82,7 @@ pub(crate) fn run_loader_build(
         toolchain,
         profile,
         &target_directory,
-        &layout.policy_path,
+        layout,
         "build",
     )?;
 
@@ -127,6 +127,9 @@ pub(crate) fn run_loader_build(
         rust_lld_sha256: &toolchain.accepted.rust_lld_sha256,
         uefi_core_sha256: &toolchain.accepted.uefi_core_sha256,
         uefi_builtins_sha256: &toolchain.accepted.uefi_builtins_sha256,
+        rustc_driver_sha256: &toolchain.accepted.rustc_driver_sha256,
+        llvm_sha256: &toolchain.accepted.llvm_sha256,
+        toolchain_tree_sha256: &toolchain.accepted.toolchain_tree_sha256,
         toolchain_manifest_sha256: &toolchain.accepted.manifest_sha256,
         target: &profile.rust_target,
         package: &profile.cargo_package,
@@ -271,6 +274,9 @@ where
     let output = Command::new("sh")
         .arg(script)
         .args(arguments)
+        .env_remove("LD_AUDIT")
+        .env_remove("LD_LIBRARY_PATH")
+        .env_remove("LD_PRELOAD")
         .current_dir(repository)
         .stdin(Stdio::null())
         .output()
@@ -292,10 +298,11 @@ fn run_uefi_cargo(
     toolchain: &LoaderToolchain,
     profile: &LoaderProfile,
     target_directory: &Path,
-    layout_policy: &Path,
+    layout: &DeepLayoutBuild,
     operation: &str,
 ) -> Result<(), Failure> {
     toolchain.accepted.verify_unchanged()?;
+    layout.verify_unchanged()?;
     let sysroot = toolchain
         .accepted
         .sysroot
@@ -326,11 +333,15 @@ fn run_uefi_cargo(
             "CARGO_TARGET_X86_64_UNKNOWN_UEFI_LINKER",
             &toolchain.accepted.rust_lld,
         )
-        .env(DEEP_LAYOUT_POLICY_ENV, layout_policy)
+        .env(DEEP_LAYOUT_POLICY_ENV, &layout.policy_path)
+        .env_remove("LD_AUDIT")
+        .env_remove("LD_LIBRARY_PATH")
+        .env_remove("LD_PRELOAD")
         .current_dir(repository)
         .stdin(Stdio::null())
         .status()
         .map_err(|error| Failure::task(format!("could not run Cargo {operation}: {error}")))?;
+    layout.verify_unchanged()?;
     toolchain.accepted.verify_unchanged()?;
     if status.success() {
         Ok(())

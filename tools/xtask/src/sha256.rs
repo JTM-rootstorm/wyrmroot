@@ -19,10 +19,14 @@ const ROUND_CONSTANTS: [u32; 64] = [
 
 pub(crate) fn file_digest(path: &Path) -> io::Result<String> {
     let mut file = File::open(path)?;
+    reader_digest(&mut file)
+}
+
+pub(crate) fn reader_digest(reader: &mut impl Read) -> io::Result<String> {
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
-        let count = file.read(&mut buffer)?;
+        let count = reader.read(&mut buffer)?;
         if count == 0 {
             break;
         }

@@ -37,10 +37,20 @@ pub struct KernelSegmentPages {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransitionPolicy {
     pub mapping_granule: u64,
+    /// Generated Deep limit for retained RSDP record pages mapped during early intake.
+    pub rsdp_max_intersecting_pages: u64,
     pub transition_stack_size: u64,
     pub transition_stack_alignment: u64,
     pub stack_pointer_alignment: u64,
     pub boot_info_alignment: u64,
+}
+
+/// One validated RSDP record inside its exact retained page allocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ValidatedRsdpMappingInput {
+    pub retained_allocation: RetainedPhysicalRange,
+    pub record_physical_start: u64,
+    pub record_byte_len: u64,
 }
 
 /// Narrowly permitted identity mappings used during early handoff intake.
@@ -52,7 +62,8 @@ pub struct IdentityMapInputs<'a> {
     pub module_data: &'a [RetainedPhysicalRange],
     pub command_line: Option<RetainedPhysicalRange>,
     pub entropy: Option<RetainedPhysicalRange>,
-    pub required_acpi_pages: &'a [RetainedPhysicalRange],
+    /// Optional validated RSDP record. Its mapping is derived; callers cannot supply ACPI pages.
+    pub validated_rsdp: Option<ValidatedRsdpMappingInput>,
     pub handoff_stub: RetainedPhysicalRange,
     /// Address of the currently executing transfer stub inside `handoff_stub`.
     pub handoff_stub_entry: u64,
@@ -98,7 +109,7 @@ pub enum MappingKind {
     ModuleData { index: usize },
     CommandLine,
     Entropy,
-    RequiredAcpi { index: usize },
+    RequiredAcpiRsdp,
     HandoffStub,
     TransitionStack,
 }
@@ -293,6 +304,13 @@ pub enum TransitionError {
         kind: MappingKind,
     },
     InvalidFramebufferRange,
+    InvalidRsdpRecord,
+    RsdpRecordRangeOverflow,
+    RsdpRetainedAllocationMismatch,
+    RsdpMappingPageLimitExceeded {
+        required_pages: u64,
+        maximum_pages: u64,
+    },
     KernelSourceOutsideImage {
         program_header_index: u16,
     },
@@ -432,21 +450,8 @@ pub fn preflight_transition<'plan>(
             input.policy,
         )?;
     }
-    for (index, range) in input
-        .identity
-        .required_acpi_pages
-        .iter()
-        .copied()
-        .enumerate()
-    {
-        push_identity(
-            mapping_output,
-            &mut used,
-            MappingKind::RequiredAcpi { index },
-            range,
-            read_only_nx(),
-            input.policy,
-        )?;
+    if let Some(rsdp) = input.identity.validated_rsdp {
+        push_validated_rsdp(mapping_output, &mut used, rsdp, input.policy)?;
     }
     push_identity(
         mapping_output,
@@ -584,7 +589,7 @@ fn required_mapping_count(input: &TransitionPreflightInput<'_>) -> Result<usize,
         input.identity.module_data.len(),
         usize::from(input.identity.command_line.is_some()),
         usize::from(input.identity.entropy.is_some()),
-        input.identity.required_acpi_pages.len(),
+        usize::from(input.identity.validated_rsdp.is_some()),
         2usize,
     ] {
         count = count
@@ -596,6 +601,7 @@ fn required_mapping_count(input: &TransitionPreflightInput<'_>) -> Result<usize,
 
 fn validate_policy(policy: TransitionPolicy) -> Result<(), TransitionError> {
     if !policy.mapping_granule.is_power_of_two()
+        || policy.rsdp_max_intersecting_pages == 0
         || policy.transition_stack_size == 0
         || !policy
             .transition_stack_size
@@ -607,6 +613,55 @@ fn validate_policy(policy: TransitionPolicy) -> Result<(), TransitionError> {
     {
         return Err(TransitionError::InvalidPolicy);
     }
+    Ok(())
+}
+
+fn push_validated_rsdp(
+    output: &mut [TransitionMapping],
+    used: &mut usize,
+    rsdp: ValidatedRsdpMappingInput,
+    policy: TransitionPolicy,
+) -> Result<(), TransitionError> {
+    let kind = MappingKind::RequiredAcpiRsdp;
+    validate_retained(rsdp.retained_allocation, kind)?;
+    if rsdp.record_byte_len == 0 {
+        return Err(TransitionError::InvalidRsdpRecord);
+    }
+    let record_end = rsdp
+        .record_physical_start
+        .checked_add(rsdp.record_byte_len)
+        .ok_or(TransitionError::RsdpRecordRangeOverflow)?;
+    let mapping_start = align_down(rsdp.record_physical_start, policy.mapping_granule);
+    let mapping_end = align_up(record_end, policy.mapping_granule)
+        .ok_or(TransitionError::RsdpRecordRangeOverflow)?;
+    let mapping_byte_len = mapping_end
+        .checked_sub(mapping_start)
+        .filter(|length| *length != 0)
+        .ok_or(TransitionError::RsdpRecordRangeOverflow)?;
+    let required_pages = mapping_byte_len / policy.mapping_granule;
+    if required_pages > policy.rsdp_max_intersecting_pages {
+        return Err(TransitionError::RsdpMappingPageLimitExceeded {
+            required_pages,
+            maximum_pages: policy.rsdp_max_intersecting_pages,
+        });
+    }
+    if rsdp.retained_allocation.physical_start != mapping_start
+        || rsdp.retained_allocation.byte_len != mapping_byte_len
+    {
+        return Err(TransitionError::RsdpRetainedAllocationMismatch);
+    }
+    push_mapping(
+        output,
+        used,
+        TransitionMapping {
+            kind,
+            physical_start: mapping_start,
+            virtual_start: mapping_start,
+            byte_len: mapping_byte_len,
+            permissions: read_only_nx(),
+            lifetime: rsdp.retained_allocation.lifetime,
+        },
+    );
     Ok(())
 }
 
@@ -967,7 +1022,7 @@ fn mapping_kind_order(kind: MappingKind) -> (u8, usize) {
         MappingKind::ModuleData { index } => (4, index),
         MappingKind::CommandLine => (5, 0),
         MappingKind::Entropy => (6, 0),
-        MappingKind::RequiredAcpi { index } => (7, index),
+        MappingKind::RequiredAcpiRsdp => (7, 0),
         MappingKind::HandoffStub => (8, 0),
         MappingKind::TransitionStack => (9, 0),
     }

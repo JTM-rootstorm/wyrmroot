@@ -2,9 +2,12 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{Read, Take};
 use std::path::{Component as PathComponent, Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread;
 
+use crate::elf_runtime::{RuntimeMetadata, inspect};
 use crate::error::Failure;
-use crate::sha256::{bytes_digest, file_digest};
+use crate::sha256::{bytes_digest, reader_digest};
 
 const REQUEST_PATH: &str = "toolchain/requests/RUST-WYR0B-UEFI-001.toml";
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
@@ -19,6 +22,17 @@ const RUST_LLD_SHA256: &str = "38a9f28404309892f9c9afe02fa4979a0d9e8bc866979cde0
 const UEFI_CORE_SHA256: &str = "6777111445c5cf0c4abd7063fa0f7165c3df3809d7de4a9cbedaa84a6d7d9d68";
 const UEFI_BUILTINS_SHA256: &str =
     "eea1964f8b5e2ed67defcde06d7ca9874e13ba972f08526d8b1bb52127ccb136";
+const TOOLCHAIN_TREE_SHA256: &str =
+    "5d4275428555a7cd6ae7decc100456fe31cfa4562a7f5eb81a3cf7fe08aa03a5";
+const RUSTC_DRIVER_NAME: &str = "librustc_driver-7cb6fba0afdc0262.so";
+const RUSTC_DRIVER_SHA256: &str =
+    "adc7d227ecc4193c5dabaa2b132c01675fddf32b01f63e57010bc1ffaa3b7672";
+const LLVM_NAME: &str = "libLLVM.so.22.1-rust-1.97.1-stable";
+const LLVM_SHA256: &str = "ed4f320c4e1ed6de7d2db6fd89faccf764d63186c2f877057ddf31065b1fac09";
+const SYSTEM_INTERPRETER: &str = "/lib64/ld-linux-x86-64.so.2";
+const GNU_TAR: &str = "/usr/bin/tar";
+const MAX_TOOLCHAIN_ENTRIES: usize = 4096;
+const MAX_TOOLCHAIN_REGULAR_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 #[derive(Clone)]
 struct ArtifactComponent {
@@ -37,6 +51,9 @@ pub(crate) struct AcceptedToolchain {
     pub(crate) rust_lld_sha256: String,
     pub(crate) uefi_core_sha256: String,
     pub(crate) uefi_builtins_sha256: String,
+    pub(crate) rustc_driver_sha256: String,
+    pub(crate) llvm_sha256: String,
+    pub(crate) toolchain_tree_sha256: String,
     root: PathBuf,
     manifest: ArtifactComponent,
     components: Vec<ArtifactComponent>,
@@ -116,6 +133,13 @@ pub(crate) fn prepare(
         .map_err(|_| Failure::task("accepted toolchain manifest is not UTF-8"))?;
     let manifest = parse_manifest(manifest_contents)?;
     validate_manifest_identity(&manifest, expected_name, expected_commit)?;
+    let toolchain_tree_sha256 =
+        required_sha256(&manifest, "toolchain_tree_sha256", "artifact manifest")?;
+    if toolchain_tree_sha256 != TOOLCHAIN_TREE_SHA256 {
+        return Err(Failure::task(format!(
+            "artifact manifest toolchain tree hash is {toolchain_tree_sha256}, expected {TOOLCHAIN_TREE_SHA256}"
+        )));
+    }
 
     let rustc = component(&root, &manifest, "artifacts.rustc", "rustc", RUSTC_SHA256)?;
     if rustc.path != canonical_rustc {
@@ -162,6 +186,20 @@ pub(crate) fn prepare(
             "accepted sysroot is not a non-symlink directory",
         ));
     }
+    verify_toolchain_tree(&sysroot, &toolchain_tree_sha256)?;
+    let rustc_driver = fixed_component(
+        &root,
+        &format!("{toolchain_directory}/lib/{RUSTC_DRIVER_NAME}"),
+        "rustc driver",
+        RUSTC_DRIVER_SHA256,
+    )?;
+    let llvm = fixed_component(
+        &root,
+        &format!("{toolchain_directory}/lib/{LLVM_NAME}"),
+        "toolchain LLVM",
+        LLVM_SHA256,
+    )?;
+    validate_runtime_dependencies(&sysroot, &rustc, &cargo, &rust_lld, &rustc_driver, &llvm)?;
 
     let manifest_component = ArtifactComponent {
         label: "artifact manifest",
@@ -174,6 +212,8 @@ pub(crate) fn prepare(
         rust_lld.clone(),
         uefi_core.clone(),
         uefi_builtins.clone(),
+        rustc_driver.clone(),
+        llvm.clone(),
     ];
     let accepted = AcceptedToolchain {
         rustc: rustc.path.clone(),
@@ -185,6 +225,9 @@ pub(crate) fn prepare(
         rust_lld_sha256: rust_lld.sha256.clone(),
         uefi_core_sha256: uefi_core.sha256.clone(),
         uefi_builtins_sha256: uefi_builtins.sha256.clone(),
+        rustc_driver_sha256: rustc_driver.sha256.clone(),
+        llvm_sha256: llvm.sha256.clone(),
+        toolchain_tree_sha256,
         root,
         manifest: manifest_component,
         components,
@@ -341,6 +384,395 @@ fn component(
     Ok(component)
 }
 
+fn fixed_component(
+    root: &Path,
+    relative: &str,
+    label: &'static str,
+    sha256: &str,
+) -> Result<ArtifactComponent, Failure> {
+    let component = ArtifactComponent {
+        label,
+        path: contained_path(root, relative, label)?,
+        sha256: sha256.to_owned(),
+    };
+    validate_component(root, &component)?;
+    Ok(component)
+}
+
+fn verify_toolchain_tree(root: &Path, expected: &str) -> Result<(), Failure> {
+    validate_toolchain_tree_entries(root)?;
+    let version = Command::new(GNU_TAR)
+        .arg("--version")
+        .env_remove("TAR_OPTIONS")
+        .env_remove("LD_AUDIT")
+        .env_remove("LD_LIBRARY_PATH")
+        .env_remove("LD_PRELOAD")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| Failure::task(format!("could not identify GNU tar: {error}")))?;
+    if !version.status.success()
+        || String::from_utf8_lossy(&version.stdout)
+            .lines()
+            .next()
+            .is_none_or(|line| line != "tar (GNU tar) 1.35")
+    {
+        return Err(Failure::task(
+            "accepted toolchain tree verification requires GNU tar 1.35",
+        ));
+    }
+    let mut child = Command::new(GNU_TAR)
+        .args([
+            "--sort=name",
+            "--mtime=@0",
+            "--owner=0",
+            "--group=0",
+            "--numeric-owner",
+            "-cf",
+            "-",
+            "-C",
+        ])
+        .arg(root)
+        .arg(".")
+        .env_remove("TAR_OPTIONS")
+        .env_remove("LD_AUDIT")
+        .env_remove("LD_LIBRARY_PATH")
+        .env_remove("LD_PRELOAD")
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| Failure::task(format!("could not archive accepted toolchain: {error}")))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| Failure::task("could not capture accepted toolchain archive"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| Failure::task("could not capture GNU tar diagnostics"))?;
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let actual = reader_digest(&mut stdout).map_err(|error| {
+        Failure::task(format!("could not hash accepted toolchain tree: {error}"))
+    })?;
+    let status = child
+        .wait()
+        .map_err(|error| Failure::task(format!("could not wait for GNU tar: {error}")))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| Failure::task("GNU tar diagnostic reader panicked"))?
+        .map_err(|error| Failure::task(format!("could not read GNU tar diagnostics: {error}")))?;
+    if !status.success() {
+        return Err(Failure::task(format!(
+            "GNU tar toolchain hashing failed with exit code {}{}",
+            status.code().unwrap_or(-1),
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", String::from_utf8_lossy(&stderr).trim())
+            }
+        )));
+    }
+    if actual != expected {
+        return Err(Failure::task(format!(
+            "accepted toolchain tree hash is {actual}, expected {expected}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_toolchain_tree_entries(root: &Path) -> Result<(), Failure> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut entries = 0_usize;
+    let mut regular_bytes = 0_u64;
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).map_err(|error| {
+            Failure::task(format!(
+                "could not inspect accepted toolchain directory {}: {error}",
+                directory.display()
+            ))
+        })? {
+            let entry = entry.map_err(|error| {
+                Failure::task(format!(
+                    "could not inspect accepted toolchain entry: {error}"
+                ))
+            })?;
+            entries = entries
+                .checked_add(1)
+                .filter(|count| *count <= MAX_TOOLCHAIN_ENTRIES)
+                .ok_or_else(|| Failure::task("accepted toolchain tree has too many entries"))?;
+            let file_type = entry.file_type().map_err(|error| {
+                Failure::task(format!(
+                    "could not inspect accepted toolchain entry: {error}"
+                ))
+            })?;
+            if file_type.is_dir() {
+                pending.push(entry.path());
+            } else if file_type.is_file() {
+                let metadata = fs::symlink_metadata(entry.path()).map_err(|error| {
+                    Failure::task(format!(
+                        "could not inspect accepted toolchain file: {error}"
+                    ))
+                })?;
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(Failure::task(
+                        "accepted toolchain entry identity changed during traversal",
+                    ));
+                }
+                let size = metadata.len();
+                regular_bytes = regular_bytes
+                    .checked_add(size)
+                    .filter(|total| *total <= MAX_TOOLCHAIN_REGULAR_BYTES)
+                    .ok_or_else(|| {
+                        Failure::task("accepted toolchain regular-file bytes exceed the limit")
+                    })?;
+            } else if file_type.is_symlink() {
+                fs::read_link(entry.path()).map_err(|error| {
+                    Failure::task(format!(
+                        "could not inspect accepted toolchain symlink: {error}"
+                    ))
+                })?;
+            } else {
+                return Err(Failure::task(format!(
+                    "accepted toolchain contains unsupported filesystem entry {}",
+                    entry.path().display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_runtime_dependencies(
+    sysroot: &Path,
+    rustc: &ArtifactComponent,
+    cargo: &ArtifactComponent,
+    rust_lld: &ArtifactComponent,
+    rustc_driver: &ArtifactComponent,
+    llvm: &ArtifactComponent,
+) -> Result<(), Failure> {
+    let rustc_runtime = inspect_component(rustc)?;
+    expect_runtime(
+        rustc.label,
+        &rustc_runtime,
+        Some(SYSTEM_INTERPRETER),
+        "$ORIGIN/../lib",
+        &[RUSTC_DRIVER_NAME, "libc.so.6"],
+    )?;
+    verify_local_resolution(
+        sysroot,
+        &rustc.path,
+        &rustc_runtime,
+        &[(RUSTC_DRIVER_NAME, &rustc_driver.path)],
+    )?;
+
+    let cargo_runtime = inspect_component(cargo)?;
+    expect_runtime(
+        cargo.label,
+        &cargo_runtime,
+        Some(SYSTEM_INTERPRETER),
+        "$ORIGIN/../lib",
+        &[
+            "libgit2.so.1.9",
+            "libssl.so.3",
+            "libcurl.so.4",
+            "libgcc_s.so.1",
+            "libm.so.6",
+            "libc.so.6",
+            "ld-linux-x86-64.so.2",
+        ],
+    )?;
+    verify_local_resolution(sysroot, &cargo.path, &cargo_runtime, &[])?;
+
+    let lld_runtime = inspect_component(rust_lld)?;
+    expect_runtime(
+        rust_lld.label,
+        &lld_runtime,
+        Some(SYSTEM_INTERPRETER),
+        "$ORIGIN/../../../:$ORIGIN/../lib",
+        &[
+            "libpthread.so.0",
+            "libz.so.1",
+            LLVM_NAME,
+            "libm.so.6",
+            "libgcc_s.so.1",
+            "libc.so.6",
+            "ld-linux-x86-64.so.2",
+        ],
+    )?;
+    verify_local_resolution(
+        sysroot,
+        &rust_lld.path,
+        &lld_runtime,
+        &[(LLVM_NAME, &llvm.path)],
+    )?;
+
+    let driver_runtime = inspect_component(rustc_driver)?;
+    expect_runtime(
+        rustc_driver.label,
+        &driver_runtime,
+        None,
+        "$ORIGIN/../lib",
+        &[
+            LLVM_NAME,
+            "libstdc++.so.6",
+            "libgcc_s.so.1",
+            "libc.so.6",
+            "ld-linux-x86-64.so.2",
+        ],
+    )?;
+    verify_local_resolution(
+        sysroot,
+        &rustc_driver.path,
+        &driver_runtime,
+        &[(LLVM_NAME, &llvm.path)],
+    )?;
+
+    let llvm_runtime = inspect_component(llvm)?;
+    expect_runtime(
+        llvm.label,
+        &llvm_runtime,
+        None,
+        "$ORIGIN/../lib",
+        &[
+            "librt.so.1",
+            "libdl.so.2",
+            "libpthread.so.0",
+            "libm.so.6",
+            "libz.so.1",
+            "libgcc_s.so.1",
+            "libc.so.6",
+            "ld-linux-x86-64.so.2",
+        ],
+    )?;
+    verify_local_resolution(sysroot, &llvm.path, &llvm_runtime, &[])
+}
+
+fn inspect_component(component: &ArtifactComponent) -> Result<RuntimeMetadata, Failure> {
+    let mut file = open_stable_regular_file(&component.path, component.label)?;
+    let runtime = inspect(&mut file, component.label)?;
+    verify_open_file_identity(&file, &component.path, component.label)?;
+    Ok(runtime)
+}
+
+fn expect_runtime(
+    label: &str,
+    actual: &RuntimeMetadata,
+    interpreter: Option<&str>,
+    runpath: &str,
+    needed: &[&str],
+) -> Result<(), Failure> {
+    if actual.interpreter.as_deref() != interpreter
+        || actual.runpath != runpath
+        || !actual
+            .needed
+            .iter()
+            .map(String::as_str)
+            .eq(needed.iter().copied())
+    {
+        return Err(Failure::task(format!(
+            "accepted {label} runtime dependency metadata does not match the pinned contract"
+        )));
+    }
+    Ok(())
+}
+
+fn verify_local_resolution(
+    sysroot: &Path,
+    executable: &Path,
+    runtime: &RuntimeMetadata,
+    expected_local: &[(&str, &PathBuf)],
+) -> Result<(), Failure> {
+    let origin = executable
+        .parent()
+        .ok_or_else(|| Failure::task("accepted executable has no parent directory"))?;
+    let directories = runtime
+        .runpath
+        .split(':')
+        .map(|entry| expand_origin_path(sysroot, origin, entry))
+        .collect::<Result<Vec<_>, _>>()?;
+    for needed in &runtime.needed {
+        let expected = expected_local
+            .iter()
+            .find_map(|(name, path)| (*name == needed).then_some(path.as_path()));
+        let mut resolved = None;
+        for directory in &directories {
+            let candidate = directory.join(needed);
+            match fs::symlink_metadata(&candidate) {
+                Ok(_) => {
+                    if resolved.replace(candidate).is_some() {
+                        return Err(Failure::task(format!(
+                            "accepted runtime dependency '{needed}' has multiple toolchain-local resolutions"
+                        )));
+                    }
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(Failure::task(format!(
+                        "could not inspect runtime dependency '{needed}': {error}"
+                    )));
+                }
+            }
+        }
+        match (expected, resolved) {
+            (Some(expected), Some(actual)) if actual == expected => {}
+            (Some(_), _) => {
+                return Err(Failure::task(format!(
+                    "accepted runtime dependency '{needed}' does not resolve to its pinned toolchain component"
+                )));
+            }
+            (None, Some(actual)) => {
+                return Err(Failure::task(format!(
+                    "ambient system dependency '{needed}' is shadowed inside the toolchain at {}",
+                    actual.display()
+                )));
+            }
+            (None, None) => {}
+        }
+    }
+    Ok(())
+}
+
+fn expand_origin_path(sysroot: &Path, origin: &Path, entry: &str) -> Result<PathBuf, Failure> {
+    let suffix = entry
+        .strip_prefix("$ORIGIN")
+        .ok_or_else(|| Failure::task(format!("unsupported accepted RUNPATH entry '{entry}'")))?;
+    if !suffix.is_empty() && !suffix.starts_with('/') {
+        return Err(Failure::task(format!(
+            "unsupported accepted RUNPATH entry '{entry}'"
+        )));
+    }
+    let mut path = origin.to_path_buf();
+    for component in Path::new(suffix.trim_start_matches('/')).components() {
+        match component {
+            PathComponent::Normal(component) => path.push(component),
+            PathComponent::ParentDir => {
+                if !path.pop() || !path.starts_with(sysroot) {
+                    return Err(Failure::task(format!(
+                        "accepted RUNPATH entry '{entry}' escapes the toolchain"
+                    )));
+                }
+            }
+            _ => {
+                return Err(Failure::task(format!(
+                    "unsupported accepted RUNPATH entry '{entry}'"
+                )));
+            }
+        }
+    }
+    if !path.starts_with(sysroot) {
+        return Err(Failure::task(format!(
+            "accepted RUNPATH entry '{entry}' escapes the toolchain"
+        )));
+    }
+    Ok(path)
+}
+
 fn contained_path(root: &Path, relative: &str, label: &str) -> Result<PathBuf, Failure> {
     let relative = Path::new(relative);
     if relative.is_absolute()
@@ -366,13 +798,15 @@ fn contained_path(root: &Path, relative: &str, label: &str) -> Result<PathBuf, F
 }
 
 fn validate_component(root: &Path, component: &ArtifactComponent) -> Result<(), Failure> {
-    validate_contained_regular_file(root, &component.path, component.label)?;
-    let actual = file_digest(&component.path).map_err(|error| {
+    reject_symlink_components(root, &component.path, component.label)?;
+    let mut file = open_stable_regular_file(&component.path, component.label)?;
+    let actual = reader_digest(&mut file).map_err(|error| {
         Failure::task(format!(
             "could not hash accepted {}: {error}",
             component.label
         ))
     })?;
+    verify_open_file_identity(&file, &component.path, component.label)?;
     if actual != component.sha256 {
         return Err(Failure::task(format!(
             "accepted {} hash changed: {actual}, expected {}",
@@ -422,10 +856,9 @@ fn read_utf8_bounded(path: &Path, maximum: u64, label: &str) -> Result<String, F
 }
 
 fn read_bounded(path: &Path, maximum: u64, label: &str) -> Result<Vec<u8>, Failure> {
-    let file = File::open(path)
-        .map_err(|error| Failure::task(format!("could not open {label}: {error}")))?;
+    let file = open_stable_regular_file(path, label)?;
     let mut bytes = Vec::new();
-    let mut bounded: Take<File> = file.take(maximum + 1);
+    let mut bounded: Take<&File> = (&file).take(maximum + 1);
     bounded
         .read_to_end(&mut bytes)
         .map_err(|error| Failure::task(format!("could not read {label}: {error}")))?;
@@ -434,7 +867,61 @@ fn read_bounded(path: &Path, maximum: u64, label: &str) -> Result<Vec<u8>, Failu
             "{label} exceeds the {maximum}-byte limit"
         )));
     }
+    verify_open_file_identity(&file, path, label)?;
     Ok(bytes)
+}
+
+fn open_stable_regular_file(path: &Path, label: &str) -> Result<File, Failure> {
+    let before = fs::symlink_metadata(path)
+        .map_err(|error| Failure::task(format!("could not inspect {label}: {error}")))?;
+    if before.file_type().is_symlink() || !before.is_file() {
+        return Err(Failure::task(format!(
+            "{label} is not a regular non-symlink file"
+        )));
+    }
+    let file = File::open(path)
+        .map_err(|error| Failure::task(format!("could not open {label}: {error}")))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| Failure::task(format!("could not inspect open {label}: {error}")))?;
+    if !same_file_identity(&before, &opened) {
+        return Err(Failure::task(format!(
+            "{label} identity changed while it was opened"
+        )));
+    }
+    verify_open_file_identity(&file, path, label)?;
+    Ok(file)
+}
+
+fn verify_open_file_identity(file: &File, path: &Path, label: &str) -> Result<(), Failure> {
+    let opened = file
+        .metadata()
+        .map_err(|error| Failure::task(format!("could not inspect open {label}: {error}")))?;
+    let current = fs::symlink_metadata(path)
+        .map_err(|error| Failure::task(format!("could not re-inspect {label}: {error}")))?;
+    if current.file_type().is_symlink()
+        || !current.is_file()
+        || !same_file_identity(&opened, &current)
+    {
+        return Err(Failure::task(format!(
+            "{label} identity changed during validation"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.len() == right.len()
+        && left.modified().ok() == right.modified().ok()
+        && left.created().ok() == right.created().ok()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -657,15 +1144,34 @@ fn require_array_member(
 mod tests {
     use super::{
         ArtifactComponent, CONFIGURATION_SHA256, CONSUMER_REQUEST, COORDINATOR_REQUEST,
-        parse_manifest, prepare, validate_component, validate_manifest_identity,
+        contained_path, open_stable_regular_file, parse_manifest, prepare, validate_component,
+        validate_manifest_identity, verify_local_resolution, verify_open_file_identity,
     };
-    use crate::sha256::file_digest;
+    use crate::elf_runtime::RuntimeMetadata;
+    use crate::sha256::bytes_digest;
     use std::fs;
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const NAME: &str = "wyrmroot-1.97.1-8bab26f4";
     const COMMIT: &str = "8bab26f4f68e0e26f0bb7960be334d5b520ea452";
+
+    #[test]
+    #[ignore = "requires WYRMROOT_RUSTC pointing to the coordinator-accepted immutable artifact"]
+    fn accepted_toolchain_positive_gate() {
+        let rustc = std::env::var_os("WYRMROOT_RUSTC")
+            .map(std::path::PathBuf::from)
+            .expect("WYRMROOT_RUSTC is required for the ignored acceptance gate");
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("repository root");
+        let accepted = prepare(repository, &rustc, NAME, COMMIT)
+            .expect("coordinator-accepted immutable toolchain failed validation");
+        accepted
+            .verify_unchanged()
+            .expect("accepted toolchain drifted after validation");
+    }
 
     #[test]
     fn manifest_identity_requires_commit_configuration_targets_and_acceptance() {
@@ -721,7 +1227,7 @@ mod tests {
         let component = ArtifactComponent {
             label: "test component",
             path: path.clone(),
-            sha256: file_digest(&path).expect("hash trusted component"),
+            sha256: bytes_digest(b"trusted"),
         };
         validate_component(&root, &component).expect("trusted component rejected");
         fs::write(&path, b"changed").expect("replace component content");
@@ -731,6 +1237,54 @@ mod tests {
         fs::write(&target, b"trusted").expect("write symlink target");
         symlink(&target, &path).expect("swap component for symlink");
         assert!(validate_component(&root, &component).is_err());
+        fs::remove_dir_all(root).expect("remove synthetic artifact root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_component_resolution_never_crosses_an_ancestor_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = temporary_root("ancestor-symlink");
+        let outside = temporary_root("ancestor-symlink-outside");
+        fs::create_dir(&root).expect("create synthetic artifact root");
+        fs::create_dir(&outside).expect("create synthetic outside directory");
+        fs::write(outside.join("cargo"), b"sentinel").expect("write outside component");
+        symlink(&outside, root.join("bin")).expect("create ancestor symlink");
+        assert!(contained_path(&root, "bin/cargo", "test cargo").is_err());
+        fs::remove_dir_all(root).expect("remove synthetic artifact root");
+        fs::remove_dir_all(outside).expect("remove synthetic outside directory");
+    }
+
+    #[test]
+    fn manifest_read_detects_a_path_swap_after_open() {
+        let root = temporary_root("manifest-path-swap");
+        fs::create_dir(&root).expect("create synthetic artifact root");
+        let path = root.join("manifest.toml");
+        fs::write(&path, b"trusted").expect("write trusted manifest");
+        let open = open_stable_regular_file(&path, "test manifest").expect("open trusted manifest");
+        fs::rename(&path, root.join("original.toml")).expect("move open manifest");
+        fs::write(&path, b"replacement").expect("install replacement manifest");
+        assert!(verify_open_file_identity(&open, &path, "test manifest").is_err());
+        fs::remove_dir_all(root).expect("remove synthetic artifact root");
+    }
+
+    #[test]
+    fn runtime_resolution_rejects_toolchain_shadowing_of_system_libraries() {
+        let root = temporary_root("runtime-shadow");
+        fs::create_dir_all(root.join("bin")).expect("create synthetic executable directory");
+        fs::create_dir(root.join("lib")).expect("create synthetic library directory");
+        let executable = root.join("bin/rustc");
+        fs::write(&executable, b"fixture").expect("write synthetic executable");
+        let runtime = RuntimeMetadata {
+            interpreter: Some(super::SYSTEM_INTERPRETER.to_owned()),
+            runpath: "$ORIGIN/../lib".to_owned(),
+            needed: vec!["libc.so.6".to_owned()],
+        };
+        verify_local_resolution(&root, &executable, &runtime, &[])
+            .expect("unshadowed system dependency rejected");
+        fs::write(root.join("lib/libc.so.6"), b"shadow").expect("write shadow system library");
+        assert!(verify_local_resolution(&root, &executable, &runtime, &[]).is_err());
         fs::remove_dir_all(root).expect("remove synthetic artifact root");
     }
 

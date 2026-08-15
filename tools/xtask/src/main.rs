@@ -1,5 +1,6 @@
 mod cli;
 mod deep_layout;
+mod elf_runtime;
 mod error;
 mod metadata;
 mod provenance;

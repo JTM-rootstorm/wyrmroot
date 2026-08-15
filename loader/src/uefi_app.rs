@@ -59,6 +59,8 @@ pub enum PreparationError {
     ArtifactTooLarge,
     ArtifactLengthNotRepresentable,
     TotalArtifactLimitExceeded,
+    #[allow(dead_code)] // Target-only generated-policy validation consumes this.
+    IntakeCapacityExceeded,
     InvalidAcpiRsdpAlignment,
     InvalidAcpiRsdpSignature,
     InvalidAcpiRsdpLength,
@@ -213,6 +215,21 @@ pub fn total_artifact_bytes(lengths: [usize; 3]) -> Result<usize, PreparationErr
     Ok(total)
 }
 
+/// Converts a generated intake capacity into a checked local slice length and
+/// rejects an observed count before it can index caller-provided storage.
+///
+/// The caller supplies the generated capacity; this helper deliberately does
+/// not carry a second local memory-map or module cap.
+#[allow(dead_code)] // Used by target-only generated-policy validation and host tests.
+pub fn bounded_intake_count(observed: usize, capacity: u64) -> Result<usize, PreparationError> {
+    let capacity =
+        usize::try_from(capacity).map_err(|_| PreparationError::IntakeCapacityExceeded)?;
+    if observed > capacity {
+        return Err(PreparationError::IntakeCapacityExceeded);
+    }
+    Ok(observed)
+}
+
 /// Computes the exact number of UEFI pages needed for a non-empty payload.
 pub fn pages_for_payload(byte_len: usize) -> Result<usize, PreparationError> {
     if byte_len == 0 {
@@ -284,6 +301,256 @@ fn checksum(bytes: &[u8], byte_len: usize) -> u8 {
         .fold(0_u8, |sum, byte| sum.wrapping_add(*byte))
 }
 
+/// Consume an owned pre-EBS resource at most once.
+///
+/// The firmware transaction uses this helper for every optional rollback slot;
+/// a second cleanup pass observes `None` and therefore cannot free the same
+/// pages twice.
+pub fn take_owned_resource_once<T>(slot: &mut Option<T>, consume: impl FnOnce(T)) -> bool {
+    match slot.take() {
+        Some(value) => {
+            consume(value);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Post-EBS failure classes. Every one is fatal because firmware services are
+/// no longer callable and a partially built handoff must not reach the kernel.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PostExitGateError {
+    FinalMemoryMap,
+    BootInfo,
+    PageTable,
+    SerialDiagnostic,
+    Transfer,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FinalMemoryMapAccepted {
+    _private: (),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BootInfoAccepted {
+    _private: (),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PageTableAccepted {
+    _private: (),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SerialDiagnosticAccepted {
+    _private: (),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransferAccepted {
+    _private: (),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetainedAddressesAccepted {
+    _private: (),
+}
+
+pub struct RetainedAddressFacts<'a> {
+    pub boot_info: wyrmroot_efi_loader::boot_info::HandoffAllocation,
+    pub memory_map: wyrmroot_efi_loader::boot_info::HandoffAllocation,
+    pub module_table: wyrmroot_efi_loader::boot_info::HandoffAllocation,
+    pub module_records: &'a [deepwyrm_abi::DwBootModuleV1],
+    pub module_allocations: &'a [wyrmroot_efi_loader::transition::RetainedPhysicalRange],
+    pub entropy: Option<(
+        wyrmroot_efi_loader::boot_info::HandoffAllocation,
+        wyrmroot_efi_loader::transition::RetainedPhysicalRange,
+    )>,
+    pub rsdp: Option<(
+        wyrmroot_efi_loader::boot_info::HandoffAllocation,
+        wyrmroot_efi_loader::transition::ValidatedRsdpMappingInput,
+    )>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetainedAddressError {
+    MissingOrDuplicateMapping,
+    StorageMappingMismatch,
+    ModuleCountMismatch,
+    ModuleRecordMismatch,
+    OptionalMappingMismatch,
+}
+
+/// Unforgeable authorization consumed by the target-only raw jump wrapper.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JumpAuthorization {
+    _private: (),
+}
+
+pub fn accept_final_memory_map<T, E>(
+    result: Result<T, E>,
+) -> Result<(T, FinalMemoryMapAccepted), PostExitGateError> {
+    result
+        .map(|value| (value, FinalMemoryMapAccepted { _private: () }))
+        .map_err(|_| PostExitGateError::FinalMemoryMap)
+}
+
+pub fn accept_boot_info<T, E>(
+    result: Result<T, E>,
+) -> Result<(T, BootInfoAccepted), PostExitGateError> {
+    result
+        .map(|value| (value, BootInfoAccepted { _private: () }))
+        .map_err(|_| PostExitGateError::BootInfo)
+}
+
+pub fn accept_page_table<T, E>(
+    result: Result<T, E>,
+) -> Result<(T, PageTableAccepted), PostExitGateError> {
+    result
+        .map(|value| (value, PageTableAccepted { _private: () }))
+        .map_err(|_| PostExitGateError::PageTable)
+}
+
+pub fn accept_serial_diagnostic<T, E>(
+    result: Result<T, E>,
+) -> Result<(T, SerialDiagnosticAccepted), PostExitGateError> {
+    result
+        .map(|value| (value, SerialDiagnosticAccepted { _private: () }))
+        .map_err(|_| PostExitGateError::SerialDiagnostic)
+}
+
+pub fn accept_transfer<T, E>(
+    result: Result<T, E>,
+) -> Result<(T, TransferAccepted), PostExitGateError> {
+    result
+        .map(|value| (value, TransferAccepted { _private: () }))
+        .map_err(|_| PostExitGateError::Transfer)
+}
+
+pub fn authorize_jump(
+    _memory_map: FinalMemoryMapAccepted,
+    _boot_info: BootInfoAccepted,
+    _page_table: PageTableAccepted,
+    _serial: SerialDiagnosticAccepted,
+    _transfer: TransferAccepted,
+    _retained_addresses: RetainedAddressesAccepted,
+) -> JumpAuthorization {
+    JumpAuthorization { _private: () }
+}
+
+pub fn validate_retained_address_coherence(
+    mappings: &[wyrmroot_efi_loader::transition::TransitionMapping],
+    facts: RetainedAddressFacts<'_>,
+) -> Result<RetainedAddressesAccepted, RetainedAddressError> {
+    use wyrmroot_efi_loader::transition::{MappingKind, RetainedPhysicalRange};
+
+    fn exact_mapping(
+        mappings: &[wyrmroot_efi_loader::transition::TransitionMapping],
+        kind: MappingKind,
+        expected: RetainedPhysicalRange,
+    ) -> Result<(), RetainedAddressError> {
+        let mut matches = mappings.iter().filter(|mapping| mapping.kind == kind);
+        let mapping = matches
+            .next()
+            .ok_or(RetainedAddressError::MissingOrDuplicateMapping)?;
+        if matches.next().is_some() {
+            return Err(RetainedAddressError::MissingOrDuplicateMapping);
+        }
+        if mapping.physical_start != expected.physical_start
+            || mapping.virtual_start != expected.physical_start
+            || mapping.byte_len != expected.byte_len
+        {
+            return Err(RetainedAddressError::StorageMappingMismatch);
+        }
+        Ok(())
+    }
+
+    fn allocation(
+        value: wyrmroot_efi_loader::boot_info::HandoffAllocation,
+    ) -> RetainedPhysicalRange {
+        RetainedPhysicalRange {
+            physical_start: value.physical_start,
+            byte_len: value.byte_len,
+            lifetime: wyrmroot_efi_loader::transition::AllocationLifetime::RetainedUntilKernelPageTableReplacement,
+        }
+    }
+
+    exact_mapping(mappings, MappingKind::BootInfo, allocation(facts.boot_info))?;
+    exact_mapping(
+        mappings,
+        MappingKind::MemoryMapTable,
+        allocation(facts.memory_map),
+    )?;
+    exact_mapping(
+        mappings,
+        MappingKind::ModuleTable,
+        allocation(facts.module_table),
+    )?;
+    if facts.module_records.len() != facts.module_allocations.len() {
+        return Err(RetainedAddressError::ModuleCountMismatch);
+    }
+    for (index, (record, allocation)) in facts
+        .module_records
+        .iter()
+        .zip(facts.module_allocations)
+        .enumerate()
+    {
+        if record.physical_start != allocation.physical_start
+            || record.byte_len == 0
+            || record.byte_len > allocation.byte_len
+        {
+            return Err(RetainedAddressError::ModuleRecordMismatch);
+        }
+        exact_mapping(mappings, MappingKind::ModuleData { index }, *allocation)?;
+    }
+    match facts.entropy {
+        Some((storage, expected)) => {
+            if allocation(storage) != expected {
+                return Err(RetainedAddressError::OptionalMappingMismatch);
+            }
+            exact_mapping(mappings, MappingKind::Entropy, expected)?;
+        }
+        None if mappings
+            .iter()
+            .any(|mapping| mapping.kind == MappingKind::Entropy) =>
+        {
+            return Err(RetainedAddressError::OptionalMappingMismatch);
+        }
+        None => {}
+    }
+    match facts.rsdp {
+        Some((storage, expected)) => {
+            if allocation(storage) != expected.retained_allocation {
+                return Err(RetainedAddressError::OptionalMappingMismatch);
+            }
+            exact_mapping(
+                mappings,
+                MappingKind::RequiredAcpiRsdp,
+                expected.retained_allocation,
+            )?;
+        }
+        None if mappings
+            .iter()
+            .any(|mapping| mapping.kind == MappingKind::RequiredAcpiRsdp) =>
+        {
+            return Err(RetainedAddressError::OptionalMappingMismatch);
+        }
+        None => {}
+    }
+    Ok(RetainedAddressesAccepted { _private: () })
+}
+
+/// Dispatch one post-EBS gate failure to its sole fatal sink. The target sink
+/// is the local `cli; hlt` loop; host tests inject a recorder to prove the
+/// failure is delivered exactly once without a firmware call.
+pub fn dispatch_post_exit_failure<R>(
+    error: PostExitGateError,
+    fatal: impl FnOnce(PostExitGateError) -> R,
+) -> R {
+    fatal(error)
+}
+
 #[cfg(feature = "firmware")]
 mod firmware {
     extern crate alloc;
@@ -296,11 +563,14 @@ mod firmware {
     use core::ptr::{self, NonNull};
 
     #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
-    use deepwyrm_abi::{DwBootInfoV1, DwBootMemoryRangeV1, DwBootModuleV1};
+    use deepwyrm_abi::{
+        DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS, DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP, DwBootInfoV1,
+        DwBootMemoryRangeV1, DwBootModuleV1,
+    };
     use uefi::boot::{
         self, AllocateType, MemoryType, MemoryType as UefiMemoryType, ScopedProtocol,
     };
-    use uefi::mem::memory_map::MemoryMapMut;
+    use uefi::mem::memory_map::{MemoryMap, MemoryMapMut};
     use uefi::proto::console::gop::{GraphicsOutput, PixelFormat};
     use uefi::proto::media::file::{Directory, File, FileAttribute, FileInfo, FileMode};
     use uefi::proto::rng::Rng;
@@ -309,12 +579,35 @@ mod firmware {
     use wyrmroot_efi_loader::artifacts::{
         ArtifactInputs, BOOTFS_PATH, BOOTSTRAP_PATH, KERNEL_PATH,
     };
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    use wyrmroot_efi_loader::boot_info::{
+        AllocationLifetime as BootInfoAllocationLifetime, HandoffAllocation,
+    };
+    use wyrmroot_efi_loader::transition::{AllocationLifetime, RetainedPhysicalRange};
 
     use super::{
         ACPI_RSDP_V1_BYTES, ACPI_RSDP_V2_MIN_BYTES, AcpiRsdpLayout, CONFIG_PATH,
         MAX_ACPI_RSDP_BYTES, MAX_BOOTFS_ARTIFACT_BYTES, MAX_BOOTSTRAP_ARTIFACT_BYTES,
         MAX_CONFIG_BYTES, MAX_KERNEL_ARTIFACT_BYTES, PreparationError, bounded_artifact_len,
         pages_for_payload, total_artifact_bytes, validate_acpi_rsdp, validate_acpi_rsdp_address,
+    };
+
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    use wyrmroot_efi_loader::{
+        boot_info::{
+            self, AcpiRsdpInput, BootInfoInput, BootInfoLimits, BootInfoOutput, EntropyInput,
+            FirmwareEntropySource as BootInfoEntropySource, FirmwarePhase,
+            FramebufferInput as BootInfoFramebufferInput,
+            FramebufferPixelFormat as BootInfoPixelFormat, UefiMemoryKind,
+        },
+        kernel_elf::{self, AddressRange, KernelElfPolicy, KernelLoadSegment, SegmentPermissions},
+        memory_map::{self, FirmwareMemoryDescriptor},
+        modules::{self, ModuleInput},
+        transition::{
+            self, IdentityMapInputs, KernelMaterialization, KernelSegmentPages, PhysicalRange,
+            TransitionMapping, TransitionPolicy, TransitionPreflightInput,
+            ValidatedRsdpMappingInput,
+        },
     };
 
     /// The exact purpose of a pre-EBS allocation. Byte and page counts remain
@@ -363,6 +656,55 @@ mod firmware {
         GeneratedPageGranuleMismatch,
         #[allow(dead_code)] // Constructed only in the x86_64 UEFI target discovery path.
         LinkedHandoffStub,
+        #[allow(dead_code)] // Constructed only by the target-only policy boundary.
+        InvalidGeneratedPolicy,
+    }
+
+    /// Generated Deepwyrm values consumed by the target-only adapter. Keeping
+    /// these in one typed object prevents later transaction stages from
+    /// reaching back to environment-generated constants ad hoc.
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct GeneratedHandoffPolicy {
+        pub link_base: u64,
+        pub base_page_size: u64,
+        pub elf_window_start: u64,
+        pub elf_window_end_exclusive: u64,
+        pub transition_stack_size: u64,
+        pub transition_stack_alignment: u64,
+        pub stack_pointer_mod_16: u64,
+        pub boot_info_alignment: u64,
+        pub max_normalized_memory_map_entries: u64,
+        pub max_module_entries: u64,
+        pub max_acpi_rsdp_intersecting_pages: u64,
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    impl GeneratedHandoffPolicy {
+        pub fn validate(self) -> Result<(), FirmwarePreparationError> {
+            if self.base_page_size != super::UEFI_PAGE_BYTES as u64
+                || self.link_base != self.elf_window_start
+                || self.elf_window_end_exclusive <= self.elf_window_start
+                || self.transition_stack_size == 0
+                || !self
+                    .transition_stack_size
+                    .is_multiple_of(self.base_page_size)
+                || !self.transition_stack_alignment.is_power_of_two()
+                || self.transition_stack_alignment < self.base_page_size
+                || self.stack_pointer_mod_16 != 0
+                || !self.boot_info_alignment.is_power_of_two()
+                || self.max_normalized_memory_map_entries == 0
+                || self.max_module_entries == 0
+                || !(1..=2).contains(&self.max_acpi_rsdp_intersecting_pages)
+            {
+                return Err(FirmwarePreparationError::InvalidGeneratedPolicy);
+            }
+            super::bounded_intake_count(0, self.max_normalized_memory_map_entries)
+                .map_err(|_| FirmwarePreparationError::InvalidGeneratedPolicy)?;
+            super::bounded_intake_count(0, self.max_module_entries)
+                .map_err(|_| FirmwarePreparationError::InvalidGeneratedPolicy)?;
+            Ok(())
+        }
     }
 
     /// Explicit firmware-entropy outcome; neither absence nor failure receives
@@ -451,6 +793,32 @@ mod firmware {
 
         pub const fn page_count(&self) -> usize {
             self.page_count
+        }
+
+        /// Full retained physical allocation for overlap and transition
+        /// planning. Payload consumers must use `payload_byte_len` instead.
+        pub fn retained_physical_range(
+            &self,
+        ) -> Result<RetainedPhysicalRange, FirmwarePreparationError> {
+            Ok(RetainedPhysicalRange {
+                physical_start: self.physical_start(),
+                byte_len: u64::try_from(self.allocation_byte_len)
+                    .map_err(|_| FirmwarePreparationError::InvalidPreExitAllocation)?,
+                lifetime: AllocationLifetime::RetainedUntilKernelPageTableReplacement,
+            })
+        }
+
+        /// Converts only this owned allocation into the BootInfo lifetime
+        /// model. The full page-rounded extent is intentionally published so
+        /// storage-reservation and alias checks include zeroed slack.
+        #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+        pub fn boot_info_allocation(&self) -> Result<HandoffAllocation, FirmwarePreparationError> {
+            Ok(HandoffAllocation {
+                physical_start: self.physical_start(),
+                byte_len: u64::try_from(self.allocation_byte_len)
+                    .map_err(|_| FirmwarePreparationError::InvalidPreExitAllocation)?,
+                lifetime: BootInfoAllocationLifetime::RetainedUntilDeepwyrmPageTableReplacement,
+            })
         }
 
         unsafe fn release(self) {
@@ -772,24 +1140,6 @@ mod firmware {
         }
     }
 
-    /// State surviving the UEFI boot-services transition.
-    #[allow(dead_code)] // The handoff owner creates this after all pre-exit allocations exist.
-    #[derive(Debug)]
-    pub struct PreparedPostExit {
-        pub pre_exit: PreparedPreExit,
-        pub memory_map: uefi::mem::memory_map::MemoryMapOwned,
-    }
-
-    #[allow(dead_code)] // Invoked only after EBS by final allocation-free normalization.
-    impl PreparedPostExit {
-        /// Sorts the final UEFI memory map in place. `MemoryMapMut::sort`
-        /// performs no allocation; the forthcoming generated coalescer must
-        /// consume this sorted map into preallocated BootInfo storage.
-        pub fn sort_final_memory_map(&mut self) {
-            self.memory_map.sort();
-        }
-    }
-
     struct LoadedFiles {
         kernel: Vec<u8>,
         bootstrap: Vec<u8>,
@@ -838,23 +1188,1160 @@ mod firmware {
             .map_err(|_| FirmwarePreparationError::LinkedHandoffStub)
     }
 
-    /// Uses uefi-rs's spec-compliant final-map / ExitBootServices retry wrapper.
-    /// The entry deliberately does not call this yet: transition stack, page
-    /// table, kernel segments, and canonical BootInfo must be allocated before
-    /// the final map is captured.
-    #[allow(dead_code)] // The entry must not invoke this before transition/BootInfo integration.
-    pub fn exit_boot_services_after_handoff_preparation(
-        pre_exit: PreparedPreExit,
-    ) -> PreparedPostExit {
-        // All protocol guards, files, and pool-backed input buffers have been
-        // dropped. `pre_exit` has only copied scalars and retained page storage.
-        uefi::println!("wyrmroot-loader: final UEFI memory map / ExitBootServices");
-        // SAFETY: the uefi-rs wrapper owns the final map/key/retry sequence.
-        // Callers must not retain UEFI protocol or pool-backed values.
-        let memory_map = unsafe { boot::exit_boot_services(Some(MemoryType::LOADER_DATA)) };
-        PreparedPostExit {
-            pre_exit,
-            memory_map,
+    /// Complete target-only WYR0-B transaction. All firmware allocations are
+    /// guarded until the irreversible EBS call. Successful exit converts them
+    /// into tokens that have no firmware release operation.
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    pub fn run_handoff(policy: GeneratedHandoffPolicy) -> Status {
+        if policy.validate().is_err() {
+            return Status::ABORTED;
+        }
+        let prepared = match prepare_pre_exit() {
+            Ok(value) => value,
+            Err(_) => return Status::ABORTED,
+        };
+        let pending = PendingResources::new(prepared);
+        let prepared = match pending.prepare(policy) {
+            Ok(value) => value,
+            Err(_) => return Status::ABORTED,
+        };
+        prepared.exit_boot_services().complete(policy)
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    fn post_exit_halt() -> ! {
+        // SAFETY: no firmware service remains. Disabling interrupts prevents
+        // an unspecified firmware IDT from re-entering a failed handoff.
+        unsafe { core::arch::asm!("cli", "2:", "hlt", "jmp 2b", options(noreturn)) }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    struct PendingResources {
+        prepared: Option<PreparedPreExit>,
+        kernel_pages: Option<RetainedPages>,
+        boot_info: Option<RetainedPages>,
+        memory_map: Option<RetainedPages>,
+        modules: Option<RetainedPages>,
+        transition_stack: Option<RetainedPages>,
+        page_tables: Option<RetainedPages>,
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    impl PendingResources {
+        fn new(prepared: PreparedPreExit) -> Self {
+            Self {
+                prepared: Some(prepared),
+                kernel_pages: None,
+                boot_info: None,
+                memory_map: None,
+                modules: None,
+                transition_stack: None,
+                page_tables: None,
+            }
+        }
+
+        fn prepare(
+            mut self,
+            policy: GeneratedHandoffPolicy,
+        ) -> Result<PreparedHandoff, FirmwarePreparationError> {
+            let kernel_image_byte_len = u64::try_from(
+                self.prepared
+                    .as_ref()
+                    .ok_or(FirmwarePreparationError::KernelSourceReleased)?
+                    .kernel_elf_bytes()?
+                    .len(),
+            )
+            .map_err(|_| FirmwarePreparationError::InvalidPreExitAllocation)?;
+            let elf_policy = KernelElfPolicy {
+                virtual_addresses: AddressRange::new(
+                    policy.elf_window_start,
+                    policy.elf_window_end_exclusive,
+                ),
+                link_base: policy.link_base,
+                mapping_granule: policy.base_page_size,
+            };
+            let capacity = kernel_elf::kernel_load_segment_capacity(
+                self.prepared
+                    .as_ref()
+                    .ok_or(FirmwarePreparationError::KernelSourceReleased)?
+                    .kernel_elf_bytes()?,
+                elf_policy,
+            )
+            .map_err(|_| FirmwarePreparationError::InvalidPreExitAllocation)?;
+            let mut load_segments = fallible_segments(capacity)?;
+            let plan = kernel_elf::plan_kernel_elf(
+                self.prepared
+                    .as_ref()
+                    .ok_or(FirmwarePreparationError::KernelSourceReleased)?
+                    .kernel_elf_bytes()?,
+                elf_policy,
+                &mut load_segments,
+            )
+            .map_err(|_| FirmwarePreparationError::InvalidPreExitAllocation)?;
+            let kernel_entry = plan.entry_point;
+            let kernel_bytes = plan.segments.iter().try_fold(0_usize, |total, segment| {
+                let length = usize::try_from(segment.mapping_byte_len)
+                    .map_err(|_| FirmwarePreparationError::InvalidPreExitAllocation)?;
+                total
+                    .checked_add(length)
+                    .ok_or(FirmwarePreparationError::InvalidPreExitAllocation)
+            })?;
+            self.kernel_pages = Some(RetainedPages::allocate_zeroed_pages(
+                pages_for_payload(kernel_bytes).map_err(FirmwarePreparationError::Artifact)?,
+            )?);
+            let kernel_base = self
+                .kernel_pages
+                .as_ref()
+                .ok_or(FirmwarePreparationError::InvalidPreExitAllocation)?
+                .physical_start();
+            let mut kernel_segments = fallible_kernel_segment_pages(capacity)?;
+            let mut next_offset = 0_u64;
+            for segment in plan.segments {
+                kernel_segments.push(KernelSegmentPages {
+                    segment: *segment,
+                    pages: RetainedPhysicalRange {
+                        physical_start: kernel_base
+                            .checked_add(next_offset)
+                            .ok_or(FirmwarePreparationError::InvalidPreExitAllocation)?,
+                        byte_len: segment.mapping_byte_len,
+                        lifetime: AllocationLifetime::RetainedUntilKernelPageTableReplacement,
+                    },
+                });
+                next_offset = next_offset
+                    .checked_add(segment.mapping_byte_len)
+                    .ok_or(FirmwarePreparationError::InvalidPreExitAllocation)?;
+            }
+
+            let map_cap = usize::try_from(policy.max_normalized_memory_map_entries)
+                .map_err(|_| FirmwarePreparationError::InvalidGeneratedPolicy)?;
+            let module_cap = usize::try_from(policy.max_module_entries)
+                .map_err(|_| FirmwarePreparationError::InvalidGeneratedPolicy)?;
+            super::bounded_intake_count(2, policy.max_module_entries)
+                .map_err(FirmwarePreparationError::Artifact)?;
+            self.boot_info = Some(allocate_typed_table::<DwBootInfoV1>(1)?);
+            self.memory_map = Some(allocate_typed_table::<DwBootMemoryRangeV1>(map_cap)?);
+            self.modules = Some(allocate_typed_table::<DwBootModuleV1>(module_cap)?);
+            let stack_pages = usize::try_from(policy.transition_stack_size / policy.base_page_size)
+                .map_err(|_| FirmwarePreparationError::InvalidPreExitAllocation)?;
+            self.transition_stack = Some(RetainedPages::allocate_zeroed_pages(stack_pages)?);
+
+            let original = self
+                .prepared
+                .as_ref()
+                .ok_or(FirmwarePreparationError::KernelSourceReleased)?;
+            let module_ranges = [
+                original.bootstrap.retained_physical_range()?,
+                original.bootfs.retained_physical_range()?,
+            ];
+            let validated_rsdp = original
+                .acpi_rsdp
+                .as_ref()
+                .map(|rsdp| {
+                    Ok(ValidatedRsdpMappingInput {
+                        retained_allocation: rsdp.storage.retained_physical_range()?,
+                        record_physical_start: rsdp.storage.physical_start(),
+                        record_byte_len: u64::try_from(rsdp.byte_len)
+                            .map_err(|_| FirmwarePreparationError::InvalidPreExitAllocation)?,
+                    })
+                })
+                .transpose()?;
+            let entropy_range = match &original.entropy {
+                FirmwareEntropy::Available { storage, .. } => {
+                    Some(storage.retained_physical_range()?)
+                }
+                FirmwareEntropy::Unavailable | FirmwareEntropy::Failed => None,
+            };
+            let framebuffer_pixels = original.framebuffer.map(|framebuffer| PhysicalRange {
+                physical_start: framebuffer.physical_base,
+                byte_len: framebuffer.byte_len,
+            });
+            let (stub_start, stub_len, handoff_stub_entry) = discover_linked_handoff_stub()?;
+            let handoff_stub = RetainedPhysicalRange {
+                physical_start: stub_start,
+                byte_len: stub_len,
+                lifetime: AllocationLifetime::RetainedUntilKernelPageTableReplacement,
+            };
+            let mapping_capacity = capacity
+                .checked_add(9)
+                .ok_or(FirmwarePreparationError::InvalidPreExitAllocation)?;
+            let mut mapping_output = fallible_mappings(mapping_capacity)?;
+            let mut materialization_output = fallible_materializations(capacity)?;
+            let transition_policy = transition_policy(policy);
+
+            let page_count = {
+                let identity = identity_inputs(
+                    &self,
+                    &module_ranges,
+                    validated_rsdp,
+                    entropy_range,
+                    framebuffer_pixels,
+                    handoff_stub,
+                    handoff_stub_entry,
+                )?;
+                let input = TransitionPreflightInput {
+                    policy: transition_policy,
+                    kernel_entry,
+                    kernel_image_byte_len,
+                    kernel_segments: &kernel_segments,
+                    identity,
+                };
+                let preflight = transition::preflight_transition(
+                    &input,
+                    &mut mapping_output,
+                    &mut materialization_output,
+                )
+                .map_err(|_| FirmwarePreparationError::InvalidPreExitAllocation)?;
+                usize::try_from(preflight.page_table_page_count())
+                    .map_err(|_| FirmwarePreparationError::InvalidPreExitAllocation)?
+            };
+            self.page_tables = Some(RetainedPages::allocate_zeroed_pages(page_count)?);
+
+            let materializations = {
+                let identity = identity_inputs(
+                    &self,
+                    &module_ranges,
+                    validated_rsdp,
+                    entropy_range,
+                    framebuffer_pixels,
+                    handoff_stub,
+                    handoff_stub_entry,
+                )?;
+                let input = TransitionPreflightInput {
+                    policy: transition_policy,
+                    kernel_entry,
+                    kernel_image_byte_len,
+                    kernel_segments: &kernel_segments,
+                    identity,
+                };
+                let preflight = transition::preflight_transition(
+                    &input,
+                    &mut mapping_output,
+                    &mut materialization_output,
+                )
+                .map_err(|_| FirmwarePreparationError::InvalidPreExitAllocation)?;
+                let page_table_range = self
+                    .page_tables
+                    .as_ref()
+                    .ok_or(FirmwarePreparationError::InvalidPreExitAllocation)?
+                    .retained_physical_range()?;
+                let finalized = transition::finalize_transition(preflight, page_table_range)
+                    .map_err(|_| FirmwarePreparationError::InvalidPreExitAllocation)?;
+                copy_materializations(finalized.pre_exit().kernel_materializations)?
+            };
+
+            {
+                let prepared = self
+                    .prepared
+                    .as_mut()
+                    .ok_or(FirmwarePreparationError::KernelSourceReleased)?;
+                let kernel_pages = self
+                    .kernel_pages
+                    .as_mut()
+                    .ok_or(FirmwarePreparationError::InvalidPreExitAllocation)?;
+                let base = kernel_pages.physical_start();
+                prepared.materialize_kernel_and_release(|image| {
+                    for materialization in &materializations {
+                        let start = usize::try_from(materialization.file_offset)
+                            .map_err(|_| FirmwarePreparationError::CopyRangeInvalid)?;
+                        let len = usize::try_from(materialization.file_size)
+                            .map_err(|_| FirmwarePreparationError::CopyRangeInvalid)?;
+                        let end = start
+                            .checked_add(len)
+                            .ok_or(FirmwarePreparationError::CopyRangeInvalid)?;
+                        let destination = materialization
+                            .copy_destination
+                            .checked_sub(base)
+                            .and_then(|offset| usize::try_from(offset).ok())
+                            .ok_or(FirmwarePreparationError::CopyRangeInvalid)?;
+                        kernel_pages.copy_zeroed_from(
+                            destination,
+                            image
+                                .get(start..end)
+                                .ok_or(FirmwarePreparationError::CopyRangeInvalid)?,
+                        )?;
+                    }
+                    Ok(())
+                })?;
+            }
+            let materialized_inputs = materialized_inputs(
+                self.prepared
+                    .take()
+                    .ok_or(FirmwarePreparationError::KernelSourceReleased)?,
+            )?;
+
+            Ok(PreparedHandoff {
+                inputs: Some(materialized_inputs),
+                kernel_pages: self.kernel_pages.take(),
+                boot_info: self.boot_info.take(),
+                memory_map: self.memory_map.take(),
+                modules: self.modules.take(),
+                transition_stack: self.transition_stack.take(),
+                page_tables: self.page_tables.take(),
+                kernel_segments,
+                mapping_output,
+                materialization_output,
+                module_ranges,
+                validated_rsdp,
+                entropy_range,
+                framebuffer_pixels,
+                handoff_stub,
+                handoff_stub_entry,
+                kernel_entry,
+                kernel_image_byte_len,
+            })
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    impl Drop for PendingResources {
+        fn drop(&mut self) {
+            release_pages(&mut self.page_tables);
+            release_pages(&mut self.transition_stack);
+            release_pages(&mut self.modules);
+            release_pages(&mut self.memory_map);
+            release_pages(&mut self.boot_info);
+            release_pages(&mut self.kernel_pages);
+            if let Some(prepared) = self.prepared.take() {
+                prepared.release_before_exit();
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    struct PreparedHandoff {
+        inputs: Option<MaterializedInputs>,
+        kernel_pages: Option<RetainedPages>,
+        boot_info: Option<RetainedPages>,
+        memory_map: Option<RetainedPages>,
+        modules: Option<RetainedPages>,
+        transition_stack: Option<RetainedPages>,
+        page_tables: Option<RetainedPages>,
+        kernel_segments: Vec<KernelSegmentPages>,
+        mapping_output: Vec<TransitionMapping>,
+        materialization_output: Vec<KernelMaterialization>,
+        module_ranges: [RetainedPhysicalRange; 2],
+        validated_rsdp: Option<ValidatedRsdpMappingInput>,
+        entropy_range: Option<RetainedPhysicalRange>,
+        framebuffer_pixels: Option<PhysicalRange>,
+        handoff_stub: RetainedPhysicalRange,
+        handoff_stub_entry: u64,
+        kernel_entry: u64,
+        kernel_image_byte_len: u64,
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    impl PreparedHandoff {
+        fn exit_boot_services(mut self) -> ExitedHandoff {
+            let inputs = self.inputs.take().expect("prepared handoff inputs");
+            let kernel_pages = self.kernel_pages.take().expect("prepared kernel pages");
+            let boot_info = self.boot_info.take().expect("prepared BootInfo pages");
+            let memory_map_pages = self.memory_map.take().expect("prepared memory-map pages");
+            let modules = self.modules.take().expect("prepared module pages");
+            let transition_stack = self.transition_stack.take().expect("prepared stack pages");
+            let page_tables = self.page_tables.take().expect("prepared page-table pages");
+            let kernel_segments = core::mem::take(&mut self.kernel_segments);
+            let mapping_output = core::mem::take(&mut self.mapping_output);
+            let materialization_output = core::mem::take(&mut self.materialization_output);
+            uefi::println!("wyrmroot-loader: final UEFI memory map / ExitBootServices");
+            // SAFETY: no firmware protocol guard or pool-backed input remains;
+            // this wrapper owns final map capture and its one retry.
+            let mut memory_map = unsafe { boot::exit_boot_services(Some(MemoryType::LOADER_DATA)) };
+            memory_map.sort();
+            ExitedHandoff {
+                inputs: inputs.into_post_exit(),
+                kernel_pages: kernel_pages.into_post_exit(),
+                boot_info: boot_info.into_post_exit(),
+                memory_map_pages: memory_map_pages.into_post_exit(),
+                modules: modules.into_post_exit(),
+                transition_stack: transition_stack.into_post_exit(),
+                page_tables: page_tables.into_post_exit(),
+                memory_map,
+                kernel_segments,
+                mapping_output,
+                materialization_output,
+                module_ranges: self.module_ranges,
+                validated_rsdp: self.validated_rsdp,
+                entropy_range: self.entropy_range,
+                framebuffer_pixels: self.framebuffer_pixels,
+                handoff_stub: self.handoff_stub,
+                handoff_stub_entry: self.handoff_stub_entry,
+                kernel_entry: self.kernel_entry,
+                kernel_image_byte_len: self.kernel_image_byte_len,
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    impl Drop for PreparedHandoff {
+        fn drop(&mut self) {
+            release_pages(&mut self.page_tables);
+            release_pages(&mut self.transition_stack);
+            release_pages(&mut self.modules);
+            release_pages(&mut self.memory_map);
+            release_pages(&mut self.boot_info);
+            release_pages(&mut self.kernel_pages);
+            if let Some(inputs) = self.inputs.take() {
+                inputs.release_before_exit();
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    struct ExitedHandoff {
+        inputs: PostExitInputs,
+        kernel_pages: PostExitPages,
+        boot_info: PostExitPages,
+        memory_map_pages: PostExitPages,
+        modules: PostExitPages,
+        transition_stack: PostExitPages,
+        page_tables: PostExitPages,
+        memory_map: uefi::mem::memory_map::MemoryMapOwned,
+        kernel_segments: Vec<KernelSegmentPages>,
+        mapping_output: Vec<TransitionMapping>,
+        materialization_output: Vec<KernelMaterialization>,
+        module_ranges: [RetainedPhysicalRange; 2],
+        validated_rsdp: Option<ValidatedRsdpMappingInput>,
+        entropy_range: Option<RetainedPhysicalRange>,
+        framebuffer_pixels: Option<PhysicalRange>,
+        handoff_stub: RetainedPhysicalRange,
+        handoff_stub_entry: u64,
+        kernel_entry: u64,
+        kernel_image_byte_len: u64,
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    impl ExitedHandoff {
+        fn complete(self, policy: GeneratedHandoffPolicy) -> ! {
+            let ExitedHandoff {
+                inputs,
+                kernel_pages,
+                mut boot_info,
+                mut memory_map_pages,
+                mut modules,
+                transition_stack,
+                mut page_tables,
+                memory_map,
+                kernel_segments,
+                mut mapping_output,
+                mut materialization_output,
+                module_ranges,
+                validated_rsdp,
+                entropy_range,
+                framebuffer_pixels,
+                handoff_stub,
+                handoff_stub_entry,
+                kernel_entry,
+                kernel_image_byte_len,
+            } = self;
+
+            let kernel_allocation = match kernel_pages.retained_physical_range() {
+                Ok(value) => value,
+                Err(_) => post_exit_halt(),
+            };
+            let kernel_segment_bytes =
+                match kernel_segments.iter().try_fold(0_u64, |total, segment| {
+                    total.checked_add(segment.pages.byte_len)
+                }) {
+                    Some(value) => value,
+                    None => post_exit_halt(),
+                };
+            if kernel_segments
+                .first()
+                .map(|segment| segment.pages.physical_start)
+                != Some(kernel_allocation.physical_start)
+                || kernel_segment_bytes != kernel_allocation.byte_len
+            {
+                post_exit_halt();
+            }
+
+            let map_cap = match usize::try_from(policy.max_normalized_memory_map_entries) {
+                Ok(value) => value,
+                Err(_) => post_exit_halt(),
+            };
+            let module_cap = match usize::try_from(policy.max_module_entries) {
+                Ok(value) => value,
+                Err(_) => post_exit_halt(),
+            };
+            let module_plan = match modules::plan_modules(
+                ModuleInput {
+                    kind: DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP,
+                    physical_start: inputs.bootstrap.physical_start(),
+                    byte_len: match u64::try_from(inputs.bootstrap.payload_byte_len) {
+                        Ok(value) => value,
+                        Err(_) => post_exit_halt(),
+                    },
+                },
+                ModuleInput {
+                    kind: DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS,
+                    physical_start: inputs.bootfs.physical_start(),
+                    byte_len: match u64::try_from(inputs.bootfs.payload_byte_len) {
+                        Ok(value) => value,
+                        Err(_) => post_exit_halt(),
+                    },
+                },
+            ) {
+                Ok(value) => value,
+                Err(_) => post_exit_halt(),
+            };
+            let module_records = module_plan.to_abi_modules();
+            if super::bounded_intake_count(module_records.len(), policy.max_module_entries).is_err()
+            {
+                post_exit_halt();
+            }
+
+            let boot_info_storage = match boot_info.boot_info_allocation() {
+                Ok(value) => value,
+                Err(_) => post_exit_halt(),
+            };
+            let memory_map_storage = match memory_map_pages.boot_info_allocation() {
+                Ok(value) => value,
+                Err(_) => post_exit_halt(),
+            };
+            let module_table_storage = match modules.boot_info_allocation() {
+                Ok(value) => value,
+                Err(_) => post_exit_halt(),
+            };
+            let acpi_rsdp = match inputs.acpi_rsdp.as_ref() {
+                Some(rsdp) => Some(AcpiRsdpInput {
+                    storage: match rsdp.storage.boot_info_allocation() {
+                        Ok(value) => value,
+                        Err(_) => post_exit_halt(),
+                    },
+                    byte_len: match u64::try_from(rsdp.byte_len) {
+                        Ok(value) => value,
+                        Err(_) => post_exit_halt(),
+                    },
+                }),
+                None => None,
+            };
+            let framebuffer = inputs
+                .framebuffer
+                .map(|framebuffer| BootInfoFramebufferInput {
+                    physical_start: framebuffer.physical_base,
+                    byte_len: framebuffer.byte_len,
+                    width: framebuffer.width,
+                    height: framebuffer.height,
+                    pixels_per_scanline: framebuffer.pixels_per_scan_line,
+                    pixel_format: match framebuffer.pixel_format {
+                        FramebufferPixelFormat::Rgb => BootInfoPixelFormat::Rgbx8,
+                        FramebufferPixelFormat::Bgr => BootInfoPixelFormat::Bgrx8,
+                        FramebufferPixelFormat::Bitmask {
+                            red_mask,
+                            green_mask,
+                            blue_mask,
+                            reserved_mask,
+                        } => BootInfoPixelFormat::Bitmask {
+                            red_mask,
+                            green_mask,
+                            blue_mask,
+                            reserved_mask,
+                        },
+                    },
+                });
+            let entropy = match &inputs.entropy {
+                PostExitEntropy::Available {
+                    storage,
+                    source,
+                    conditioned,
+                } => Some(EntropyInput {
+                    storage: match storage.boot_info_allocation() {
+                        Ok(value) => value,
+                        Err(_) => post_exit_halt(),
+                    },
+                    byte_len: match u64::try_from(storage.payload_byte_len) {
+                        Ok(value) => value,
+                        Err(_) => post_exit_halt(),
+                    },
+                    source: match source {
+                        FirmwareEntropySource::UefiRngProtocol => {
+                            BootInfoEntropySource::UefiRngProtocol
+                        }
+                    },
+                    conditioned: *conditioned,
+                }),
+                PostExitEntropy::Unavailable | PostExitEntropy::Failed => None,
+            };
+
+            let memory_records =
+                match unsafe { memory_map_pages.typed_slice_mut::<DwBootMemoryRangeV1>(map_cap) } {
+                    Ok(value) => value,
+                    Err(_) => post_exit_halt(),
+                };
+            let (normalized, final_map_accepted) =
+                match super::accept_final_memory_map(memory_map::normalize_and_coalesce(
+                    memory_map
+                        .entries()
+                        .copied()
+                        .map(firmware_memory_descriptor),
+                    memory_records,
+                )) {
+                    Ok(value) => value,
+                    Err(error) => super::dispatch_post_exit_failure(error, |_| post_exit_halt()),
+                };
+            let module_output =
+                match unsafe { modules.typed_slice_mut::<DwBootModuleV1>(module_records.len()) } {
+                    Ok(value) => value,
+                    Err(_) => post_exit_halt(),
+                };
+            let boot_info_output = match unsafe { boot_info.typed_slice_mut::<DwBootInfoV1>(1) } {
+                Ok(value) => &mut value[0],
+                Err(_) => post_exit_halt(),
+            };
+            let boot_input = BootInfoInput {
+                phase: FirmwarePhase::AfterExitBootServices,
+                boot_info_storage,
+                memory_map_storage,
+                module_table_storage,
+                memory_map: normalized,
+                modules: &module_records,
+                acpi_rsdp,
+                framebuffer,
+                command_line: None,
+                entropy,
+            };
+            let mut boot_output = BootInfoOutput {
+                boot_info: boot_info_output,
+                modules: module_output,
+            };
+            let (_, boot_info_accepted) =
+                match super::accept_boot_info(boot_info::build_with_limits(
+                    &boot_input,
+                    &mut boot_output,
+                    BootInfoLimits {
+                        max_memory_map_entries: map_cap,
+                        max_module_entries: module_cap,
+                    },
+                )) {
+                    Ok(value) => value,
+                    Err(error) => super::dispatch_post_exit_failure(error, |_| post_exit_halt()),
+                };
+
+            let transition_policy = transition_policy(policy);
+            let identity = IdentityMapInputs {
+                boot_info: match boot_info.retained_physical_range() {
+                    Ok(value) => value,
+                    Err(_) => post_exit_halt(),
+                },
+                memory_map_table: match memory_map_pages.retained_physical_range() {
+                    Ok(value) => value,
+                    Err(_) => post_exit_halt(),
+                },
+                module_table: match modules.retained_physical_range() {
+                    Ok(value) => value,
+                    Err(_) => post_exit_halt(),
+                },
+                module_data: &module_ranges,
+                command_line: None,
+                entropy: entropy_range,
+                validated_rsdp,
+                handoff_stub,
+                handoff_stub_entry,
+                transition_stack: match transition_stack.retained_physical_range() {
+                    Ok(value) => value,
+                    Err(_) => post_exit_halt(),
+                },
+                framebuffer_pixels,
+            };
+            let transition_input = TransitionPreflightInput {
+                policy: transition_policy,
+                kernel_entry,
+                kernel_image_byte_len,
+                kernel_segments: &kernel_segments,
+                identity,
+            };
+            let preflight = match transition::preflight_transition(
+                &transition_input,
+                &mut mapping_output,
+                &mut materialization_output,
+            ) {
+                Ok(value) => value,
+                Err(_) => post_exit_halt(),
+            };
+            let page_table_storage = match page_tables.retained_physical_range() {
+                Ok(value) => value,
+                Err(_) => post_exit_halt(),
+            };
+            let plan = match transition::finalize_transition(preflight, page_table_storage) {
+                Ok(value) => value,
+                Err(_) => post_exit_halt(),
+            };
+            let entropy_coherence = match (entropy, entropy_range) {
+                (Some(value), Some(range)) => Some((value.storage, range)),
+                (None, None) => None,
+                _ => post_exit_halt(),
+            };
+            let rsdp_coherence = match (acpi_rsdp, validated_rsdp) {
+                (Some(value), Some(mapping)) => Some((value.storage, mapping)),
+                (None, None) => None,
+                _ => post_exit_halt(),
+            };
+            let retained_addresses = match super::validate_retained_address_coherence(
+                plan.mappings(),
+                super::RetainedAddressFacts {
+                    boot_info: boot_info_storage,
+                    memory_map: memory_map_storage,
+                    module_table: module_table_storage,
+                    module_records: &module_records,
+                    module_allocations: &module_ranges,
+                    entropy: entropy_coherence,
+                    rsdp: rsdp_coherence,
+                },
+            ) {
+                Ok(value) => value,
+                Err(_) => post_exit_halt(),
+            };
+            let physical_address_bits = match query_maxphyaddr() {
+                Ok(value) => value,
+                Err(_) => post_exit_halt(),
+            };
+            let table_pages = match unsafe {
+                page_tables.typed_slice_mut::<crate::uefi_page_table::PageTablePage>(
+                    page_tables.allocation_byte_len / super::UEFI_PAGE_BYTES,
+                )
+            } {
+                Ok(value) => value,
+                Err(_) => post_exit_halt(),
+            };
+            let mut table = match crate::uefi_page_table::UefiPageTable::new(
+                page_table_storage.physical_start,
+                physical_address_bits,
+                table_pages,
+            ) {
+                Ok(value) => value,
+                Err(_) => post_exit_halt(),
+            };
+            let post_exit = match transition::confirm_exit_boot_services(true) {
+                Some(value) => value,
+                None => post_exit_halt(),
+            };
+            let page_table_result = (|| {
+                transition::populate_page_table(&plan, post_exit, &mut table).map_err(|_| ())?;
+                table.finish().map_err(|_| ())
+            })();
+            let (page_table_root, page_table_accepted) =
+                match super::accept_page_table(page_table_result) {
+                    Ok(value) => value,
+                    Err(error) => super::dispatch_post_exit_failure(error, |_| post_exit_halt()),
+                };
+            let serial_result = (|| {
+                // SAFETY: EBS completed and this loader exclusively owns COM1
+                // for the final bounded marker path.
+                let mut serial = unsafe { crate::handoff_x86_64::Com1Writer::initialize(100_000) }
+                    .map_err(|_| ())?;
+                crate::handoff_x86_64::write_final_handoff_marker(&mut serial, 100_000)
+                    .map_err(|_| ())?;
+                Ok::<(), ()>(())
+            })();
+            let (_, serial_accepted) = match super::accept_serial_diagnostic(serial_result) {
+                Ok(value) => value,
+                Err(error) => super::dispatch_post_exit_failure(error, |_| post_exit_halt()),
+            };
+            // SAFETY: EBS completed, this is the BSP in x86_64 supervisor
+            // mode, and the helper validates NX/WP/paging/segment state.
+            let entry_state =
+                match unsafe { crate::handoff_x86_64::enable_and_verify_entry_state(true) } {
+                    Ok(value) => value,
+                    Err(_) => post_exit_halt(),
+                };
+            let (transfer, transfer_accepted) = match super::accept_transfer(
+                crate::handoff_x86_64::prepare_x86_64_transfer(&plan, page_table_root, entry_state),
+            ) {
+                Ok(value) => value,
+                Err(error) => super::dispatch_post_exit_failure(error, |_| post_exit_halt()),
+            };
+            let jump_authorization = super::authorize_jump(
+                final_map_accepted,
+                boot_info_accepted,
+                page_table_accepted,
+                serial_accepted,
+                transfer_accepted,
+                retained_addresses,
+            );
+            // SAFETY: `transfer` binds the finalized transition mappings,
+            // table root, BootInfo pointer, stack, linked stub, and verified
+            // machine state. This path is deliberately nonreturning.
+            unsafe { jump_to_kernel_authorized(jump_authorization, transfer) }
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    struct MaterializedInputs {
+        bootstrap: RetainedPages,
+        bootfs: RetainedPages,
+        acpi_rsdp: Option<AcpiRsdp>,
+        framebuffer: Option<FramebufferMetadata>,
+        entropy: FirmwareEntropy,
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    impl MaterializedInputs {
+        fn release_before_exit(self) {
+            // SAFETY: this type exists only while boot services remain live,
+            // and consumes every uniquely owned retained allocation.
+            unsafe { self.bootstrap.release() };
+            // SAFETY: same unique pre-EBS ownership as `bootstrap`.
+            unsafe { self.bootfs.release() };
+            if let Some(rsdp) = self.acpi_rsdp {
+                // SAFETY: the retained RSDP copy is still pre-EBS and unique.
+                unsafe { rsdp.storage.release() };
+            }
+            if let FirmwareEntropy::Available { storage, .. } = self.entropy {
+                // SAFETY: the retained entropy copy is still pre-EBS and unique.
+                unsafe { storage.release() };
+            }
+        }
+
+        fn into_post_exit(self) -> PostExitInputs {
+            let acpi_rsdp = self.acpi_rsdp.map(|rsdp| {
+                let _validated_revision = rsdp.revision;
+                PostExitAcpiRsdp {
+                    storage: rsdp.storage.into_post_exit(),
+                    byte_len: rsdp.byte_len,
+                }
+            });
+            let entropy = match self.entropy {
+                FirmwareEntropy::Available {
+                    storage,
+                    source,
+                    conditioned,
+                } => PostExitEntropy::Available {
+                    storage: storage.into_post_exit(),
+                    source,
+                    conditioned,
+                },
+                FirmwareEntropy::Unavailable => PostExitEntropy::Unavailable,
+                FirmwareEntropy::Failed => PostExitEntropy::Failed,
+            };
+            PostExitInputs {
+                bootstrap: self.bootstrap.into_post_exit(),
+                bootfs: self.bootfs.into_post_exit(),
+                acpi_rsdp,
+                framebuffer: self.framebuffer,
+                entropy,
+            }
+        }
+    }
+
+    /// Page ownership after successful EBS. Deliberately has no release API.
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    struct PostExitPages {
+        ptr: NonNull<u8>,
+        allocation_byte_len: usize,
+        payload_byte_len: usize,
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    impl RetainedPages {
+        fn into_post_exit(self) -> PostExitPages {
+            PostExitPages {
+                ptr: self.ptr,
+                allocation_byte_len: self.allocation_byte_len,
+                payload_byte_len: self.payload_byte_len,
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    impl PostExitPages {
+        fn physical_start(&self) -> u64 {
+            self.ptr.as_ptr() as u64
+        }
+
+        fn retained_physical_range(
+            &self,
+        ) -> Result<RetainedPhysicalRange, FirmwarePreparationError> {
+            Ok(RetainedPhysicalRange {
+                physical_start: self.physical_start(),
+                byte_len: u64::try_from(self.allocation_byte_len)
+                    .map_err(|_| FirmwarePreparationError::InvalidPreExitAllocation)?,
+                lifetime: AllocationLifetime::RetainedUntilKernelPageTableReplacement,
+            })
+        }
+
+        fn boot_info_allocation(&self) -> Result<HandoffAllocation, FirmwarePreparationError> {
+            Ok(HandoffAllocation {
+                physical_start: self.physical_start(),
+                byte_len: u64::try_from(self.allocation_byte_len)
+                    .map_err(|_| FirmwarePreparationError::InvalidPreExitAllocation)?,
+                lifetime: BootInfoAllocationLifetime::RetainedUntilDeepwyrmPageTableReplacement,
+            })
+        }
+
+        unsafe fn typed_slice_mut<T>(
+            &mut self,
+            count: usize,
+        ) -> Result<&mut [T], FirmwarePreparationError> {
+            let element_size = size_of::<T>();
+            if element_size == 0 || (self.ptr.as_ptr() as usize) % align_of::<T>() != 0 {
+                return Err(FirmwarePreparationError::TypedViewInvalid);
+            }
+            let byte_len = count
+                .checked_mul(element_size)
+                .ok_or(FirmwarePreparationError::TypedViewInvalid)?;
+            if byte_len > self.allocation_byte_len {
+                return Err(FirmwarePreparationError::TypedViewInvalid);
+            }
+            // SAFETY: this token uniquely owns the retained allocation after
+            // EBS and `byte_len` was checked against its full extent.
+            Ok(unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr().cast::<T>(), count) })
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    struct PostExitAcpiRsdp {
+        storage: PostExitPages,
+        byte_len: usize,
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    enum PostExitEntropy {
+        Available {
+            storage: PostExitPages,
+            source: FirmwareEntropySource,
+            conditioned: bool,
+        },
+        Unavailable,
+        Failed,
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    struct PostExitInputs {
+        bootstrap: PostExitPages,
+        bootfs: PostExitPages,
+        acpi_rsdp: Option<PostExitAcpiRsdp>,
+        framebuffer: Option<FramebufferMetadata>,
+        entropy: PostExitEntropy,
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    fn release_pages(storage: &mut Option<RetainedPages>) {
+        super::take_owned_resource_once(storage, |storage| {
+            // SAFETY: every caller is a pre-EBS rollback/drop path and owns the
+            // allocation exclusively through its `Option` token.
+            unsafe { storage.release() };
+        });
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    unsafe fn jump_to_kernel_authorized(
+        _authorization: super::JumpAuthorization,
+        transfer: crate::handoff_x86_64::X86_64Transfer,
+    ) -> ! {
+        // SAFETY: authorization is constructed only after the final-map,
+        // BootInfo, page-table, serial, and transfer gates all succeed.
+        unsafe { crate::handoff_x86_64::jump_to_kernel(transfer) }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    fn allocate_typed_table<T>(count: usize) -> Result<RetainedPages, FirmwarePreparationError> {
+        let byte_len = count
+            .checked_mul(size_of::<T>())
+            .ok_or(FirmwarePreparationError::InvalidPreExitAllocation)?;
+        RetainedPages::allocate_zeroed_pages(
+            pages_for_payload(byte_len).map_err(FirmwarePreparationError::Artifact)?,
+        )
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    fn transition_policy(policy: GeneratedHandoffPolicy) -> TransitionPolicy {
+        TransitionPolicy {
+            mapping_granule: policy.base_page_size,
+            rsdp_max_intersecting_pages: policy.max_acpi_rsdp_intersecting_pages,
+            transition_stack_size: policy.transition_stack_size,
+            transition_stack_alignment: policy.transition_stack_alignment,
+            stack_pointer_alignment: 16,
+            boot_info_alignment: policy.boot_info_alignment,
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    fn identity_inputs<'a>(
+        resources: &PendingResources,
+        module_ranges: &'a [RetainedPhysicalRange],
+        validated_rsdp: Option<ValidatedRsdpMappingInput>,
+        entropy: Option<RetainedPhysicalRange>,
+        framebuffer_pixels: Option<PhysicalRange>,
+        handoff_stub: RetainedPhysicalRange,
+        handoff_stub_entry: u64,
+    ) -> Result<IdentityMapInputs<'a>, FirmwarePreparationError> {
+        Ok(IdentityMapInputs {
+            boot_info: resources
+                .boot_info
+                .as_ref()
+                .ok_or(FirmwarePreparationError::InvalidPreExitAllocation)?
+                .retained_physical_range()?,
+            memory_map_table: resources
+                .memory_map
+                .as_ref()
+                .ok_or(FirmwarePreparationError::InvalidPreExitAllocation)?
+                .retained_physical_range()?,
+            module_table: resources
+                .modules
+                .as_ref()
+                .ok_or(FirmwarePreparationError::InvalidPreExitAllocation)?
+                .retained_physical_range()?,
+            module_data: module_ranges,
+            command_line: None,
+            entropy,
+            validated_rsdp,
+            handoff_stub,
+            handoff_stub_entry,
+            transition_stack: resources
+                .transition_stack
+                .as_ref()
+                .ok_or(FirmwarePreparationError::InvalidPreExitAllocation)?
+                .retained_physical_range()?,
+            framebuffer_pixels,
+        })
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    fn copy_materializations(
+        values: &[KernelMaterialization],
+    ) -> Result<Vec<KernelMaterialization>, FirmwarePreparationError> {
+        let mut result = Vec::new();
+        result
+            .try_reserve_exact(values.len())
+            .map_err(|_| FirmwarePreparationError::Allocation)?;
+        result.extend_from_slice(values);
+        Ok(result)
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    fn materialized_inputs(
+        prepared: PreparedPreExit,
+    ) -> Result<MaterializedInputs, FirmwarePreparationError> {
+        if prepared.kernel.is_some() {
+            prepared.release_before_exit();
+            return Err(FirmwarePreparationError::KernelSourceReleased);
+        }
+        Ok(MaterializedInputs {
+            bootstrap: prepared.bootstrap,
+            bootfs: prepared.bootfs,
+            acpi_rsdp: prepared.acpi_rsdp,
+            framebuffer: prepared.framebuffer,
+            entropy: prepared.entropy,
+        })
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    fn fallible_vec<T: Clone>(count: usize, value: T) -> Result<Vec<T>, FirmwarePreparationError> {
+        let mut result = Vec::new();
+        result
+            .try_reserve_exact(count)
+            .map_err(|_| FirmwarePreparationError::Allocation)?;
+        result.resize(count, value);
+        Ok(result)
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    fn dummy_segment() -> KernelLoadSegment {
+        KernelLoadSegment {
+            program_header_index: 0,
+            file_offset: 0,
+            file_size: 0,
+            virtual_address: 0,
+            mapping_virtual_address: 0,
+            mapping_byte_len: 0,
+            segment_page_offset: 0,
+            memory_size: 0,
+            alignment: 1,
+            permissions: SegmentPermissions {
+                read: false,
+                write: false,
+                execute: false,
+            },
+        }
+    }
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    fn fallible_segments(count: usize) -> Result<Vec<KernelLoadSegment>, FirmwarePreparationError> {
+        fallible_vec(count, dummy_segment())
+    }
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    fn fallible_kernel_segment_pages(
+        count: usize,
+    ) -> Result<Vec<KernelSegmentPages>, FirmwarePreparationError> {
+        let pages = RetainedPhysicalRange {
+            physical_start: 0,
+            byte_len: 0,
+            lifetime: AllocationLifetime::ReleasedBeforeKernelPageTableReplacement,
+        };
+        fallible_vec(
+            count,
+            KernelSegmentPages {
+                segment: dummy_segment(),
+                pages,
+            },
+        )
+        .map(|mut values| {
+            values.clear();
+            values
+        })
+    }
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    fn fallible_mappings(count: usize) -> Result<Vec<TransitionMapping>, FirmwarePreparationError> {
+        let value = TransitionMapping {
+            kind: transition::MappingKind::BootInfo,
+            physical_start: 0,
+            virtual_start: 0,
+            byte_len: 0,
+            permissions: transition::MappingPermissions {
+                writable: false,
+                executable: false,
+            },
+            lifetime: AllocationLifetime::ReleasedBeforeKernelPageTableReplacement,
+        };
+        fallible_vec(count, value)
+    }
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    fn fallible_materializations(
+        count: usize,
+    ) -> Result<Vec<KernelMaterialization>, FirmwarePreparationError> {
+        let allocation = RetainedPhysicalRange {
+            physical_start: 0,
+            byte_len: 0,
+            lifetime: AllocationLifetime::ReleasedBeforeKernelPageTableReplacement,
+        };
+        fallible_vec(
+            count,
+            KernelMaterialization {
+                program_header_index: 0,
+                allocation,
+                file_offset: 0,
+                file_size: 0,
+                copy_destination: 0,
+            },
+        )
+    }
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    fn firmware_memory_descriptor(
+        descriptor: uefi::mem::memory_map::MemoryDescriptor,
+    ) -> FirmwareMemoryDescriptor {
+        use uefi::mem::memory_map::MemoryType;
+        let kind = match descriptor.ty {
+            MemoryType::CONVENTIONAL => Some(UefiMemoryKind::Conventional),
+            MemoryType::LOADER_CODE | MemoryType::LOADER_DATA => Some(UefiMemoryKind::Loader),
+            MemoryType::BOOT_SERVICES_CODE | MemoryType::BOOT_SERVICES_DATA => {
+                Some(UefiMemoryKind::BootServices)
+            }
+            MemoryType::RUNTIME_SERVICES_CODE | MemoryType::RUNTIME_SERVICES_DATA => {
+                Some(UefiMemoryKind::RuntimeServices)
+            }
+            MemoryType::RESERVED
+            | MemoryType::PAL_CODE
+            | MemoryType::PERSISTENT_MEMORY
+            | MemoryType::UNACCEPTED => Some(UefiMemoryKind::Reserved),
+            MemoryType::UNUSABLE => Some(UefiMemoryKind::Unusable),
+            MemoryType::ACPI_RECLAIM => Some(UefiMemoryKind::AcpiReclaim),
+            MemoryType::ACPI_NON_VOLATILE => Some(UefiMemoryKind::AcpiNvs),
+            MemoryType::MMIO | MemoryType::MMIO_PORT_SPACE => Some(UefiMemoryKind::Mmio),
+            _ => None,
+        };
+        FirmwareMemoryDescriptor {
+            kind,
+            physical_start: descriptor.phys_start,
+            page_count: descriptor.page_count,
+            firmware_attributes: descriptor.att.bits(),
         }
     }
 
@@ -1182,5 +2669,5 @@ mod firmware {
     }
 }
 
-#[cfg(feature = "firmware")]
-pub use firmware::prepare_pre_exit;
+#[cfg(all(feature = "firmware", target_arch = "x86_64", target_os = "uefi"))]
+pub use firmware::{GeneratedHandoffPolicy, run_handoff};

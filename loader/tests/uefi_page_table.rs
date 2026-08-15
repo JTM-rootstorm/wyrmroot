@@ -133,6 +133,16 @@ fn rejects_noncanonical_and_unaligned_requests() {
     table.leave_page_zero_unmapped(PAGE_BYTES).unwrap();
     assert_eq!(
         table.map(mapping(
+            0x0000_8000_0000_0000,
+            0x2000,
+            PAGE_BYTES,
+            false,
+            false
+        )),
+        Err(UefiPageTableError::VirtualAddressNonCanonical)
+    );
+    assert_eq!(
+        table.map(mapping(
             0x0001_0000_0000_0000,
             0x2000,
             PAGE_BYTES,

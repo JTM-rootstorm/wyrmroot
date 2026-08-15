@@ -17,8 +17,8 @@ use transition::{
     AllocationLifetime, IdentityMapInputs, KernelMaterialization, KernelSegmentPages, MappingKind,
     MappingPermissions, PageTablePopulationError, PhysicalRange, RetainedPhysicalRange,
     TransitionError, TransitionInput, TransitionMapping, TransitionPageTable, TransitionPolicy,
-    TransitionPreflightInput, confirm_exit_boot_services, finalize_transition, plan_transition,
-    populate_page_table, preflight_transition,
+    TransitionPreflightInput, ValidatedRsdpMappingInput, confirm_exit_boot_services,
+    finalize_transition, plan_transition, populate_page_table, preflight_transition,
 };
 
 const GRANULE: u64 = 0x1000;
@@ -52,7 +52,6 @@ const EMPTY_MATERIALIZATION: KernelMaterialization = KernelMaterialization {
 struct Fixture {
     kernel: [KernelSegmentPages; 2],
     modules: [RetainedPhysicalRange; 2],
-    acpi: [RetainedPhysicalRange; 1],
     framebuffer: Option<PhysicalRange>,
 }
 
@@ -102,7 +101,6 @@ impl Fixture {
                 },
             ],
             modules: [retained(0x203000, 0x200), retained(0x204000, 0x300)],
-            acpi: [retained(0x207000, 0x100)],
             framebuffer: Some(PhysicalRange {
                 physical_start: 0x300000,
                 byte_len: 0x100000,
@@ -114,6 +112,7 @@ impl Fixture {
         TransitionInput {
             policy: TransitionPolicy {
                 mapping_granule: GRANULE,
+                rsdp_max_intersecting_pages: 2,
                 transition_stack_size: 0x4000,
                 transition_stack_alignment: GRANULE,
                 stack_pointer_alignment: 16,
@@ -130,7 +129,11 @@ impl Fixture {
                 module_data: &self.modules,
                 command_line: Some(retained(0x205000, 0x80)),
                 entropy: Some(retained(0x206000, 0x40)),
-                required_acpi_pages: &self.acpi,
+                validated_rsdp: Some(ValidatedRsdpMappingInput {
+                    retained_allocation: retained(0x207000, GRANULE),
+                    record_physical_start: 0x207000,
+                    record_byte_len: 0x100,
+                }),
                 handoff_stub: retained(0x208000, 0x100),
                 handoff_stub_entry: 0x208000,
                 transition_stack: retained(0x210000, 0x4000),
@@ -344,6 +347,130 @@ fn preflight_does_not_claim_page_table_storage_and_finalize_rejects_aliases() {
         Err(TransitionError::PageTableStorageAlias {
             with: MappingKind::BootInfo,
         })
+    );
+}
+
+#[test]
+fn derives_only_the_validated_rsdp_intersecting_pages() {
+    let fixture = Fixture::new();
+    let mut mappings = [EMPTY_MAPPING; 16];
+    let mut copies = [EMPTY_MATERIALIZATION; 2];
+
+    let plan = plan_transition(&fixture.input(), &mut mappings, &mut copies).unwrap();
+    let one_page = plan
+        .mappings()
+        .iter()
+        .find(|mapping| mapping.kind == MappingKind::RequiredAcpiRsdp)
+        .unwrap();
+    assert_eq!(one_page.physical_start, 0x207000);
+    assert_eq!(one_page.virtual_start, 0x207000);
+    assert_eq!(one_page.byte_len, GRANULE);
+    assert_eq!(
+        one_page.permissions,
+        MappingPermissions {
+            writable: false,
+            executable: false,
+        }
+    );
+
+    let mut input = fixture.input();
+    input.identity.validated_rsdp = Some(ValidatedRsdpMappingInput {
+        retained_allocation: retained(0x230000, 2 * GRANULE),
+        record_physical_start: 0x230ff0,
+        record_byte_len: 36,
+    });
+    let plan = plan_transition(&input, &mut mappings, &mut copies).unwrap();
+    let coalesced = plan
+        .mappings()
+        .iter()
+        .find(|mapping| mapping.kind == MappingKind::RequiredAcpiRsdp)
+        .unwrap();
+    assert_eq!(coalesced.physical_start, 0x230000);
+    assert_eq!(coalesced.byte_len, 2 * GRANULE);
+    assert_eq!(
+        plan.mappings()
+            .iter()
+            .filter(|mapping| mapping.kind == MappingKind::RequiredAcpiRsdp)
+            .count(),
+        1
+    );
+
+    let mut input = fixture.input();
+    input.identity.validated_rsdp = None;
+    let plan = plan_transition(&input, &mut mappings, &mut copies).unwrap();
+    assert!(
+        plan.mappings()
+            .iter()
+            .all(|mapping| mapping.kind != MappingKind::RequiredAcpiRsdp)
+    );
+}
+
+#[test]
+fn rejects_rsdp_mapping_mismatch_limits_and_overflow() {
+    let fixture = Fixture::new();
+    let mut mappings = [EMPTY_MAPPING; 16];
+    let mut copies = [EMPTY_MATERIALIZATION; 2];
+
+    let mut input = fixture.input();
+    input.identity.validated_rsdp = Some(ValidatedRsdpMappingInput {
+        retained_allocation: retained(0x207000, 2 * GRANULE),
+        record_physical_start: 0x207000,
+        record_byte_len: 36,
+    });
+    assert_eq!(
+        plan_transition(&input, &mut mappings, &mut copies),
+        Err(TransitionError::RsdpRetainedAllocationMismatch)
+    );
+
+    let mut input = fixture.input();
+    input.identity.validated_rsdp = Some(ValidatedRsdpMappingInput {
+        retained_allocation: retained(0x230000, 2 * GRANULE),
+        record_physical_start: 0x230ff0,
+        record_byte_len: 36,
+    });
+    input.policy.rsdp_max_intersecting_pages = 1;
+    assert_eq!(
+        plan_transition(&input, &mut mappings, &mut copies),
+        Err(TransitionError::RsdpMappingPageLimitExceeded {
+            required_pages: 2,
+            maximum_pages: 1,
+        })
+    );
+
+    let mut input = fixture.input();
+    input.identity.validated_rsdp = Some(ValidatedRsdpMappingInput {
+        retained_allocation: retained(0x230000, 3 * GRANULE),
+        record_physical_start: 0x230001,
+        record_byte_len: 2 * GRANULE,
+    });
+    assert_eq!(
+        plan_transition(&input, &mut mappings, &mut copies),
+        Err(TransitionError::RsdpMappingPageLimitExceeded {
+            required_pages: 3,
+            maximum_pages: 2,
+        })
+    );
+
+    let mut input = fixture.input();
+    input.identity.validated_rsdp = Some(ValidatedRsdpMappingInput {
+        retained_allocation: retained(0x207000, GRANULE),
+        record_physical_start: u64::MAX - 8,
+        record_byte_len: 16,
+    });
+    assert_eq!(
+        plan_transition(&input, &mut mappings, &mut copies),
+        Err(TransitionError::RsdpRecordRangeOverflow)
+    );
+
+    let mut input = fixture.input();
+    input.identity.validated_rsdp = Some(ValidatedRsdpMappingInput {
+        retained_allocation: retained(0x207000, GRANULE),
+        record_physical_start: 0x207000,
+        record_byte_len: 0,
+    });
+    assert_eq!(
+        plan_transition(&input, &mut mappings, &mut copies),
+        Err(TransitionError::InvalidRsdpRecord)
     );
 }
 
@@ -809,4 +936,24 @@ fn final_marker_is_bounded_complete_and_fails_closed_without_firmware_io() {
         write_final_handoff_marker(&mut failing, 1),
         Err(FinalDiagnosticError::Write("timeout"))
     );
+}
+
+#[test]
+fn linked_raw_stub_normalizes_flags_before_cr3_and_never_calls_kernel() {
+    let source = include_str!("../src/handoff_x86_64.rs");
+    let stub = source
+        .split("__wyrmroot_handoff_start:")
+        .nth(1)
+        .unwrap()
+        .split("__wyrmroot_handoff_end:")
+        .next()
+        .unwrap();
+    let cli = stub.find("cli").unwrap();
+    let cld = stub.find("cld").unwrap();
+    let cr3 = stub.find("mov cr3, rdi").unwrap();
+    let stack = stub.find("mov rsp, rsi").unwrap();
+    let boot_info = stub.find("mov rdi, rcx").unwrap();
+    let jump = stub.find("jmp rdx").unwrap();
+    assert!(cli < cld && cld < cr3 && cr3 < stack && stack < boot_info && boot_info < jump);
+    assert!(!stub.contains("call"));
 }

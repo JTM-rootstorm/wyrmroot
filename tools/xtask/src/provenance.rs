@@ -15,6 +15,9 @@ pub(crate) struct LoaderProvenance<'a> {
     pub(crate) rust_lld_sha256: &'a str,
     pub(crate) uefi_core_sha256: &'a str,
     pub(crate) uefi_builtins_sha256: &'a str,
+    pub(crate) rustc_driver_sha256: &'a str,
+    pub(crate) llvm_sha256: &'a str,
+    pub(crate) toolchain_tree_sha256: &'a str,
     pub(crate) toolchain_manifest_sha256: &'a str,
     pub(crate) target: &'a str,
     pub(crate) package: &'a str,
@@ -94,6 +97,9 @@ cargo_sha256 = \"{}\"\n\
 rust_lld_sha256 = \"{}\"\n\
 uefi_core_sha256 = \"{}\"\n\
 uefi_builtins_sha256 = \"{}\"\n\
+rustc_driver_sha256 = \"{}\"\n\
+llvm_sha256 = \"{}\"\n\
+toolchain_tree_sha256 = \"{}\"\n\
 artifact_manifest_sha256 = \"{}\"\n\
 target = \"{}\"\n\
 validation_report_sha256 = \"{}\"\n\
@@ -123,6 +129,9 @@ inspection_report_sha256 = \"{}\"\n",
         escape(record.rust_lld_sha256),
         escape(record.uefi_core_sha256),
         escape(record.uefi_builtins_sha256),
+        escape(record.rustc_driver_sha256),
+        escape(record.llvm_sha256),
+        escape(record.toolchain_tree_sha256),
         escape(record.toolchain_manifest_sha256),
         escape(record.target),
         escape(record.toolchain_report_sha256),
@@ -185,6 +194,9 @@ mod tests {
             rust_lld_sha256: "7",
             uefi_core_sha256: "8",
             uefi_builtins_sha256: "9",
+            rustc_driver_sha256: "a1",
+            llvm_sha256: "a2",
+            toolchain_tree_sha256: "a3",
             toolchain_manifest_sha256: "a",
             target: "x86_64-unknown-uefi",
             package: "wyrmroot-efi-loader",
@@ -204,6 +216,7 @@ mod tests {
         assert!(rendered.contains("wyrmroot_dirty = true"));
         assert!(rendered.contains("artifact_sha256 = \"d\""));
         assert!(rendered.contains("rustc_sha256 = \"1\""));
+        assert!(rendered.contains("toolchain_tree_sha256 = \"a3\""));
         assert!(rendered.contains("validation_report_sha256 = \"2\""));
         assert!(rendered.contains("inspection_report_sha256 = \"3\""));
         assert!(rendered.contains("deepwyrm_layout_sha256 = \"4\""));

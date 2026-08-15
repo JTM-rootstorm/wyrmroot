@@ -149,6 +149,18 @@ pub enum KernelElfError {
     EntryPointNotInExecutableFileData,
 }
 
+/// Validate the ELF header and complete program-header table before allocating plan storage.
+///
+/// This performs no allocation and returns the exact number of `KernelLoadSegment` slots required.
+/// The caller must preserve the image bytes unchanged, allocate fallibly, and then call
+/// [`plan_kernel_elf`], which deliberately reparses and authoritatively validates every field.
+pub fn kernel_load_segment_capacity(
+    image: &[u8],
+    policy: KernelElfPolicy,
+) -> Result<usize, KernelElfError> {
+    validated_header_and_capacity(image, policy).map(|(_, capacity)| capacity)
+}
+
 /// Validate an ELF image and write its deterministic load plan into caller-owned storage.
 ///
 /// The output buffer bounds hostile program-header counts without requiring allocation. On
@@ -159,10 +171,7 @@ pub fn plan_kernel_elf<'plan>(
     policy: KernelElfPolicy,
     output: &'plan mut [KernelLoadSegment],
 ) -> Result<KernelLoadPlan<'plan>, KernelElfError> {
-    validate_policy(policy)?;
-    let header = parse_header(image)?;
-
-    let segment_count = usize::from(header.program_header_count);
+    let (header, segment_count) = validated_header_and_capacity(image, policy)?;
     if segment_count > output.len() {
         return Err(KernelElfError::OutputTooSmall {
             required: segment_count,
@@ -170,27 +179,8 @@ pub fn plan_kernel_elf<'plan>(
         });
     }
 
-    let table_size = u64::from(header.program_header_count)
-        .checked_mul(u64::from(header.program_header_size))
-        .ok_or(KernelElfError::ProgramHeaderTableOverflow)?;
-    let table_end = header
-        .program_header_offset
-        .checked_add(table_size)
-        .ok_or(KernelElfError::ProgramHeaderTableOverflow)?;
-    if table_end > image_len_u64(image)? {
-        return Err(KernelElfError::ProgramHeaderTableTruncated);
-    }
-
     for index in 0..header.program_header_count {
-        let relative_offset = u64::from(index)
-            .checked_mul(u64::from(header.program_header_size))
-            .ok_or(KernelElfError::ProgramHeaderTableOverflow)?;
-        let offset = header
-            .program_header_offset
-            .checked_add(relative_offset)
-            .ok_or(KernelElfError::ProgramHeaderTableOverflow)?;
-        let bytes = byte_range(image, offset, PROGRAM_HEADER_SIZE as u64)
-            .ok_or(KernelElfError::ProgramHeaderTableTruncated)?;
+        let bytes = program_header_bytes(image, header, index)?;
         output[usize::from(index)] = parse_segment(image, bytes, index, policy)?;
     }
 
@@ -234,6 +224,51 @@ pub fn plan_kernel_elf<'plan>(
         segments,
         virtual_span: AddressRange::new(virtual_start, virtual_end),
     })
+}
+
+fn validated_header_and_capacity(
+    image: &[u8],
+    policy: KernelElfPolicy,
+) -> Result<(ElfHeader, usize), KernelElfError> {
+    validate_policy(policy)?;
+    let header = parse_header(image)?;
+    let table_size = u64::from(header.program_header_count)
+        .checked_mul(u64::from(header.program_header_size))
+        .ok_or(KernelElfError::ProgramHeaderTableOverflow)?;
+    let table_end = header
+        .program_header_offset
+        .checked_add(table_size)
+        .ok_or(KernelElfError::ProgramHeaderTableOverflow)?;
+    if table_end > image_len_u64(image)? {
+        return Err(KernelElfError::ProgramHeaderTableTruncated);
+    }
+    for index in 0..header.program_header_count {
+        let bytes = program_header_bytes(image, header, index)?;
+        let program_type = read_u32(bytes, 0);
+        if program_type != PROGRAM_TYPE_LOAD {
+            return Err(KernelElfError::UnsupportedProgramHeaderType {
+                index,
+                program_type,
+            });
+        }
+    }
+    Ok((header, usize::from(header.program_header_count)))
+}
+
+fn program_header_bytes(
+    image: &[u8],
+    header: ElfHeader,
+    index: u16,
+) -> Result<&[u8], KernelElfError> {
+    let relative_offset = u64::from(index)
+        .checked_mul(u64::from(header.program_header_size))
+        .ok_or(KernelElfError::ProgramHeaderTableOverflow)?;
+    let offset = header
+        .program_header_offset
+        .checked_add(relative_offset)
+        .ok_or(KernelElfError::ProgramHeaderTableOverflow)?;
+    byte_range(image, offset, PROGRAM_HEADER_SIZE as u64)
+        .ok_or(KernelElfError::ProgramHeaderTableTruncated)
 }
 
 #[derive(Clone, Copy)]
