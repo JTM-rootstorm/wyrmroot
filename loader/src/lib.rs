@@ -1,18 +1,22 @@
-//! WYR0-A boundary for the future Wyrmroot EFI loader.
+//! Host-testable policy and transition logic for the Wyrmroot EFI loader.
 //!
 //! The loader executes under x86_64 UEFI firmware, not on the Gentoo build host
-//! and not inside Wyrmroot. This crate therefore remains `no_std` and exposes
-//! only the phase-A build-boundary description below. Host builds and tests
-//! validate that description; they neither exercise firmware nor prove that a
-//! UEFI image can boot.
+//! and not inside Wyrmroot. This crate therefore remains `no_std`. Its pure
+//! WYR0-B components are host tested, but those tests neither exercise real
+//! firmware nor prove that a UEFI image can boot.
 //!
-//! In particular, this crate intentionally contains no executable entry point,
-//! firmware calls, boot protocol definitions, artifact access, or loading
-//! behavior. Those are WYR0-B work and require the pinned generated Deepwyrm
-//! ABI rather than locally defined ABI types.
+//! Firmware adapters, the PE/COFF application entry, BootInfo construction,
+//! transition mappings, and the raw kernel transfer remain explicit boundaries
+//! rather than being hidden inside parser code.
 
 #![no_std]
 #![forbid(unsafe_code)]
+
+pub mod artifacts;
+pub mod config;
+pub mod diagnostics;
+pub mod entry;
+pub mod firmware;
 
 /// Canonical Deepwyrm definitions consumed by the UEFI loader boundary.
 ///
