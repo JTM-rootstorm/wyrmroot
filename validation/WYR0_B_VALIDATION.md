@@ -6,10 +6,15 @@ substitute for the repository README and does not claim that the WYR0-B phase ga
 ## Component-groundwork checkpoint
 
 - Wyrmroot base: `77e112ee96dc016ec037bf60b10910f57ab14e9d`
-- Pinned Deepwyrm revision: `d827dcbc3723904a2601fee3a9af42e27cdad693`
+- Pinned Deepwyrm revision: `652b14b09c0d060cc04a5a335a60eb15856d30ad`
 - Accepted Rust source revision: `8bab26f4f68e0e26f0bb7960be334d5b520ea452`
 - Accepted toolchain manifest SHA-256:
   `553cbfe6eb5cd9976c4f078a3731269f2a2ecd4f3ff5d574ab3813bae8fcf1f1`
+
+Deepwyrm publication rewrote commit identities only to add GPG signatures. The signed source commit
+`ac11fd769c4111d9525a0ae6a934c40099b94f99` has the same tree as the validated unsigned source
+revision, and the pinned `652b14b09c0d060cc04a5a335a60eb15856d30ad` descendant adds validation
+records only. The source, layout, and artifact evidence below is therefore unchanged.
 
 The checkpoint contains host-tested WYR0-B components and keeps the firmware entry fail-closed
 before `ExitBootServices`. It includes:
