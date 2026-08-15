@@ -17,3 +17,6 @@ version = "0.0.0"
 edition = "2024"
 license = "GPL-3.0-only"
 repository = "https://github.com/JTM-rootstorm/wyrmroot"
+
+[workspace.dependencies]
+deepwyrm-abi = { git = "https://github.com/JTM-rootstorm/deepwyrm.git", rev = "4751a2d3929675357e31389301d152f86e2ab7cb" }

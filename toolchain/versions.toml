@@ -3,9 +3,9 @@ milestone = "WYR0"
 
 [deepwyrm]
 repository = "https://github.com/JTM-rootstorm/deepwyrm"
-revision = "37d8665ba9aa34f3ac086d68c515f54334c850c8"
+revision = "4751a2d3929675357e31389301d152f86e2ab7cb"
 abi_version = 0
-abi_dependency_state = "not-yet-available"
+abi_dependency_state = "available"
 
 [rust]
 upstream_repository = "https://github.com/rust-lang/rust"

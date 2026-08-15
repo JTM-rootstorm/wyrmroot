@@ -4,9 +4,9 @@ manifest_kind = "wyrmroot-build-provenance-template"
 [source]
 wyrmroot_revision = ""
 wyrmroot_dirty = false
-deepwyrm_revision = "37d8665ba9aa34f3ac086d68c515f54334c850c8"
+deepwyrm_revision = "4751a2d3929675357e31389301d152f86e2ab7cb"
 deepwyrm_dirty = false
-deepwyrm_abi_dependency_state = "not-yet-available"
+deepwyrm_abi_dependency_state = "available"
 rust_revision = "8bab26f4f68e0e26f0bb7960be334d5b520ea452"
 
 [toolchain]

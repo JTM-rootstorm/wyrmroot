@@ -14,6 +14,14 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+/// Canonical Deepwyrm definitions consumed by the UEFI loader boundary.
+///
+/// Re-exporting the generated types keeps the loader from maintaining a
+/// parallel copy of the kernel ABI while WYR0-B remains unimplemented.
+pub mod abi {
+    pub use deepwyrm_abi::{DW_ABI_VERSION, DW_BOOT_INFO_V1_SIZE, DwBootInfoV1};
+}
+
 /// The execution environment for the future loader artifact.
 ///
 /// WYR0-A keeps this as an explicit boundary so host-side validation cannot be

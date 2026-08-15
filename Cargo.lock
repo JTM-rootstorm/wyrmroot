@@ -3,6 +3,11 @@
 version = 4
 
 [[package]]
+name = "deepwyrm-abi"
+version = "0.0.0"
+source = "git+https://github.com/JTM-rootstorm/deepwyrm.git?rev=4751a2d3929675357e31389301d152f86e2ab7cb#4751a2d3929675357e31389301d152f86e2ab7cb"
+
+[[package]]
 name = "wyrmroot-bootfs"
 version = "0.0.0"
 
@@ -17,6 +22,9 @@ version = "0.0.0"
 [[package]]
 name = "wyrmroot-efi-loader"
 version = "0.0.0"
+dependencies = [
+ "deepwyrm-abi",
+]
 
 [[package]]
 name = "wyrmroot-hello"

@@ -11,3 +11,6 @@ path = "src/lib.rs"
 doctest = false
 test = false
 bench = false
+
+[dependencies]
+deepwyrm-abi.workspace = true

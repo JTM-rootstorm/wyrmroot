@@ -1,8 +1,8 @@
 # WYR0 toolchain and provenance bootstrap
 
 This directory records the immutable source revisions and canonical tool
-families selected for WYR0. It is bootstrap metadata only: it does not build a
-toolchain, add a Rust target, or make the planned Deepwyrm ABI crate available.
+families selected for WYR0. It does not build a toolchain or add a Rust target;
+the root dependency graph and build gate control Deepwyrm ABI consumption.
 
 ## Version authority
 
@@ -10,10 +10,11 @@ toolchain, add a Rust target, or make the planned Deepwyrm ABI crate available.
 must identify the exact Deepwyrm and Wyrmroot Rust revisions from that file;
 branch names are not reproducibility inputs.
 
-The pinned Deepwyrm revision is a planning baseline. Until that revision (or a
-coordinated successor) actually publishes the canonical `deepwyrm-abi` crate,
-Wyrmroot must not add a placeholder Git dependency, copy ABI definitions, or
-claim that ABI consumption passes.
+The pinned Deepwyrm revision must publish the canonical `deepwyrm-abi` crate.
+Wyrmroot consumes it through the canonical repository URL and exact revision;
+the build gate rejects a missing lockfile resolution or consumer. Never replace
+that dependency with copied ABI definitions, a floating branch, or a committed
+host-local path.
 
 The native Rust target name is reserved for coordinated work in the Wyrmroot
 Rust fork. The metadata does not claim that `x86_64-unknown-wyrmroot` exists at
