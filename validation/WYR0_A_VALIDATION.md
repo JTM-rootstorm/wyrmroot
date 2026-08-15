@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-15
 **Scope:** WYR0-A workspace, reproducible tooling, and Deepwyrm ABI consumption
-**Wyrmroot implementation revision:** `9c7beee2174e49c70a2738a82147a832284ab646`
+**Wyrmroot implementation revision:** `475b9e4509dec8e2ac0a5a3412dd5282a6745eed`
 **Deepwyrm ABI revision:** `37338e8d44c08ef039eb34a01292a6b6cb5cac3a`
 **Deepwyrm schema parent:** `8f6425fbcecb82a39fc2266544464b0d7ac192de`
 **Rust upstream/fork revision:** `8bab26f4f68e0e26f0bb7960be334d5b520ea452` (`1.97.1`)
