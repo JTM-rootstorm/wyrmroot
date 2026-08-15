@@ -32,9 +32,11 @@ canonical_object_tools = [
 ]
 canonical_debugger = "gdb"
 host_version_state = "not-yet-adopted"
+host_availability_probe = "sh toolchain/verify-host-tools.sh --json"
 
 [bootstrap_constraints]
 allow_moving_rust_channel = false
 allow_host_target_defaults_for_guest = false
 allow_host_libc_for_guest = false
 allow_unimplemented_deepwyrm_abi_dependency = false
+allow_unimplemented_native_target = false

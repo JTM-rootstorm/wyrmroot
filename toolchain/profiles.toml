@@ -1,0 +1,38 @@
+schema_version = 1
+manifest_kind = "wyrmroot-wyr0-build-profile-policy"
+
+# This manifest is policy and provenance input, not active Cargo configuration.
+# xtask becomes the sole consumer when its real build implementation is added.
+
+[host]
+artifact_class = "host-tooling-and-tests"
+execution_environment = "Gentoo development host"
+target_state = "host-only"
+host_libc = "allowed"
+debug_information = "retain-for-host-diagnostics"
+
+[uefi_loader]
+artifact_class = "WYR0 EFI loader"
+execution_environment = "64-bit UEFI firmware"
+rust_target = "x86_64-unknown-uefi"
+target_state = "requires-pinned-fork-confirmation-before-build"
+host_libc = "prohibited-in-produced-artifact"
+linker_family = "LLVM LLD when a linker is selected"
+debug_information = "retain-host-symbol-artifact"
+
+[native_guest]
+artifact_class = "bootstrap.elf, /system/init0, and /bin/hello"
+execution_environment = "Deepwyrm/Wyrmroot native userspace"
+rust_target = "x86_64-unknown-wyrmroot"
+target_state = "reserved-not-yet-implemented"
+host_libc = "prohibited"
+dynamic_interpreter = "prohibited"
+unix_target_family = "prohibited"
+linker_family = "LLVM LLD"
+compiler_runtime = "compiler-rt-only-as-needed"
+debug_information = "retain-host-symbol-artifact"
+
+[provenance]
+required_source_pins = ["deepwyrm", "rust"]
+required_configuration_inputs = ["toolchain/versions.toml", "toolchain/profiles.toml"]
+required_guest_inspection = ["PT_INTERP absent", "no guest libc dependency"]

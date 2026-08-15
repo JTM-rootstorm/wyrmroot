@@ -6,6 +6,7 @@ wyrmroot_revision = ""
 wyrmroot_dirty = false
 deepwyrm_revision = "37d8665ba9aa34f3ac086d68c515f54334c850c8"
 deepwyrm_dirty = false
+deepwyrm_abi_dependency_state = "not-yet-available"
 rust_revision = "8bab26f4f68e0e26f0bb7960be334d5b520ea452"
 
 [toolchain]
@@ -15,13 +16,21 @@ rustc_host = ""
 clang_version = ""
 lld_version = ""
 llvm_readelf_version = ""
+llvm_objdump_version = ""
+llvm_nm_version = ""
+llvm_objcopy_version = ""
+llvm_symbolizer_version = ""
 gdb_version = ""
+compiler_rt_resource_dir = ""
+compiler_rt_support = []
 
 [build]
 profile = ""
 host = ""
 target = ""
 configuration_sha256 = ""
+profile_manifest_sha256 = ""
+effective_build_arguments = []
 artifacts = []
 
 # Populate `artifacts` in generated records with inline tables containing:
