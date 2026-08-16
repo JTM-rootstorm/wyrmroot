@@ -30,6 +30,7 @@ use transition::{
 
 const GRANULE: u64 = 0x1000;
 const CODE_MAPPING: u64 = 0xffff_8000_0010_0000;
+const KERNEL_BOOT_STACK_BYTES: u64 = 128 * 1024;
 const RETAINED: AllocationLifetime = AllocationLifetime::RetainedUntilKernelPageTableReplacement;
 const TABLE_CAPACITY_PAGES: u64 = DW_BOOT_X86_64_PAGING_HANDOFF_MAX_TABLE_FRAME_COUNT as u64;
 const TABLE_STORAGE_START: u64 = 0x400000;
@@ -171,6 +172,17 @@ fn retained(physical_start: u64, byte_len: u64) -> RetainedPhysicalRange {
     }
 }
 
+fn configure_128_kib_nobits_tail(fixture: &mut Fixture, allocation_byte_len: u64) {
+    let data = &mut fixture.kernel[1];
+    data.segment.memory_size = data
+        .segment
+        .file_size
+        .checked_add(KERNEL_BOOT_STACK_BYTES)
+        .expect("fixture memory size fits u64");
+    data.segment.mapping_byte_len = 0x21_000;
+    data.pages.byte_len = allocation_byte_len;
+}
+
 #[test]
 fn plans_only_reviewed_mappings_with_wx_nx_and_pre_exit_materialization() {
     let fixture = Fixture::new();
@@ -269,6 +281,70 @@ fn plans_only_reviewed_mappings_with_wx_nx_and_pre_exit_materialization() {
     assert_eq!(
         plan.pre_exit().page_table_storage,
         retained(TABLE_STORAGE_START, TABLE_CAPACITY_PAGES * GRANULE)
+    );
+}
+
+#[test]
+fn plans_exact_rounded_materialization_for_a_128_kib_nobits_tail() {
+    let mut short = Fixture::new();
+    configure_128_kib_nobits_tail(&mut short, 0x20_000);
+    let mut short_mappings = [EMPTY_MAPPING; 16];
+    let mut short_materializations = [EMPTY_MATERIALIZATION; 2];
+    assert_eq!(
+        plan_transition(
+            &short.input(),
+            &mut short_mappings,
+            &mut short_materializations,
+        ),
+        Err(TransitionError::KernelPageLengthMismatch {
+            program_header_index: 1,
+        })
+    );
+
+    let mut fixture = Fixture::new();
+    configure_128_kib_nobits_tail(&mut fixture, 0x21_000);
+    let mut mappings = [EMPTY_MAPPING; 16];
+    let mut materializations = [EMPTY_MATERIALIZATION; 2];
+    let plan = plan_transition(&fixture.input(), &mut mappings, &mut materializations).unwrap();
+
+    assert!(
+        plan.mappings()
+            .windows(2)
+            .all(|pair| { pair[0].virtual_start + pair[0].byte_len <= pair[1].virtual_start })
+    );
+    let data_mapping = plan
+        .mappings()
+        .iter()
+        .find(|mapping| {
+            mapping.kind
+                == (MappingKind::KernelSegment {
+                    program_header_index: 1,
+                })
+        })
+        .unwrap();
+    assert_eq!(data_mapping.virtual_start, CODE_MAPPING + 0x2000);
+    assert_eq!(data_mapping.physical_start, 0x102000);
+    assert_eq!(data_mapping.byte_len, 0x21_000);
+    assert_eq!(
+        data_mapping.permissions,
+        MappingPermissions {
+            writable: true,
+            executable: false,
+        }
+    );
+
+    let materialization = plan
+        .pre_exit()
+        .kernel_materializations
+        .iter()
+        .find(|materialization| materialization.program_header_index == 1)
+        .unwrap();
+    assert_eq!(materialization.file_size, 0x200);
+    assert_eq!(materialization.copy_destination, 0x102000);
+    assert_eq!(materialization.allocation.byte_len, 0x21_000);
+    assert_eq!(
+        fixture.kernel[1].segment.memory_size - materialization.file_size,
+        KERNEL_BOOT_STACK_BYTES
     );
 }
 

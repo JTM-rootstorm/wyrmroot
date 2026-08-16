@@ -36,10 +36,13 @@ read/write and non-executable. At raw entry, `RSP` is 16-byte aligned at the
 one-past-the-end address and no return address is present. The stack is
 loader-owned and reserved across the jump.
 
-The Deepwyrm image provides its own page-aligned 64 KiB
+The Deepwyrm image provides its own page-aligned 128 KiB
 `.bss.boot_stack`, mapped read/write and non-executable. The raw assembly shim
 switches to that stack before making any call or push. Deepwyrm may reclaim the
 loader transition stack only after replacing the transition environment.
+This is a Deepwyrm image-layout and immediate-entry stack requirement; it does
+not change `DwBootInfoV1`, any wire ABI, or the loader-owned 16 KiB transition
+stack.
 
 ## ELF and transition mappings
 
@@ -94,5 +97,6 @@ missing Deepwyrm ABI or linker constant.
 
 The accepted producer revision `bee49a19a8c4c341b8fd6ed71606f9473b00ae64`
 and acceptance-evidence revision `4b2d1d44152daf93a29613094f7361ea0ba8adc1`
-are preserved historical accepted identities. This documentation-only
-descendant neither alters the accepted artifacts nor assumes either identity.
+are preserved historical accepted identities. Later descendants neither inherit
+those identities nor retroactively alter the historical accepted artifacts or
+evidence.

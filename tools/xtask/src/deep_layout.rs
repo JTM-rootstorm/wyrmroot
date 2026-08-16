@@ -947,7 +947,7 @@ impl LayoutPolicy {
             ));
         }
         expect_bool(&mut values, "red_zone", false)?;
-        expect_integer(&mut values, "kernel_boot_stack_size", 65536)?;
+        expect_integer(&mut values, "kernel_boot_stack_size", 131072)?;
         expect_integer(&mut values, "kernel_boot_stack_alignment", 4096)?;
         expect_integer(&mut values, "loader_transition_stack_size", 16384)?;
         expect_integer(&mut values, "loader_transition_stack_alignment", 4096)?;
@@ -2167,6 +2167,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn kernel_boot_stack_contract_requires_128_kib() {
+        let valid = layout("0xffff800000200000");
+        LayoutPolicy::parse(&valid).expect("128 KiB kernel boot stack rejected");
+
+        let stale = valid.replace(
+            "kernel_boot_stack_size = 131072",
+            "kernel_boot_stack_size = 65536",
+        );
+        assert_ne!(
+            stale, valid,
+            "stack-size fixture substitution did not apply"
+        );
+        let failure = match LayoutPolicy::parse(&stale) {
+            Ok(_) => panic!("stale 64 KiB kernel boot stack unexpectedly accepted"),
+            Err(failure) => failure,
+        };
+        assert!(
+            failure
+                .message
+                .contains("kernel_boot_stack_size' is 65536, expected 131072")
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn source_tree_validation_rejects_symlinks() {
@@ -2494,7 +2518,7 @@ entry_symbol = "_dw_kernel_entry"
 link_base = "{link_base}"
 base_page_size = 4096
 red_zone = false
-kernel_boot_stack_size = 65536
+kernel_boot_stack_size = 131072
 kernel_boot_stack_alignment = 4096
 loader_transition_stack_size = 16384
 loader_transition_stack_alignment = 4096

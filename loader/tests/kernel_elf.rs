@@ -10,6 +10,7 @@ const CODE_VIRTUAL: u64 = 0xffff_8000_0010_0000;
 const CODE_PHYSICAL: u64 = 0x0010_0000;
 const DATA_VIRTUAL: u64 = CODE_VIRTUAL + 0x2000;
 const DATA_PHYSICAL: u64 = CODE_PHYSICAL + 0x2000;
+const KERNEL_BOOT_STACK_BYTES: u64 = 128 * 1024;
 
 const EMPTY_SEGMENT: KernelLoadSegment = KernelLoadSegment {
     program_header_index: 0,
@@ -231,6 +232,39 @@ fn exposes_page_offset_and_rounded_mapping_for_congruent_unaligned_segment() {
     assert_eq!(plan.segments[0].mapping_virtual_address, CODE_VIRTUAL);
     assert_eq!(plan.segments[0].mapping_byte_len, 0x1000);
     assert_eq!(plan.segments[0].segment_page_offset, 0x800);
+}
+
+#[test]
+fn plans_a_rounded_writable_nx_segment_with_a_128_kib_nobits_tail() {
+    let mut data = data_segment();
+    data.memory_size = data
+        .file_size
+        .checked_add(KERNEL_BOOT_STACK_BYTES)
+        .expect("fixture memory size fits u64");
+    let image = elf(CODE_VIRTUAL, &[code_segment(), data]);
+    let mut output = [EMPTY_SEGMENT; 2];
+
+    let plan = plan_kernel_elf(&image, policy(), &mut output).unwrap();
+    let planned_data = &plan.segments[1];
+
+    assert_eq!(
+        planned_data.memory_size - planned_data.file_size,
+        KERNEL_BOOT_STACK_BYTES
+    );
+    assert_eq!(planned_data.mapping_virtual_address, DATA_VIRTUAL);
+    assert_eq!(planned_data.mapping_byte_len, 0x21_000);
+    assert_eq!(
+        planned_data.permissions,
+        SegmentPermissions {
+            read: true,
+            write: true,
+            execute: false,
+        }
+    );
+    assert_eq!(
+        plan.virtual_span,
+        AddressRange::new(CODE_VIRTUAL, DATA_VIRTUAL + data.memory_size)
+    );
 }
 
 #[test]
