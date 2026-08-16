@@ -101,5 +101,11 @@ paired VM gate passes against the exact committed revisions and artifacts.
   `79c2e365901ab95d04e5f6877b87b109f61f7ca4`; the two additional Medium
   findings from this final review are explicitly accepted, and the three
   previously recorded Medium limitations remain accepted as documented.
+- Complete: the bounded 128-KiB boot-stack acknowledgment at Wyrmroot
+  `6230d2c26b0260add3fad1e1cc55c878c0362ab5` paired with Deepwyrm
+  `b263a7a912c79b9e7d4b2439370417d7ae2ee076` passed strict layout, hostile
+  NOBITS-tail, exact-allocation, RW/NX, non-overlap, accepted-build, provenance,
+  and final Daybreak review gates with no new Critical, High, Medium, or Low
+  findings. The existing accepted limitations above remain in force.
 - Pending: manager-owned Q35/UEFI serial and handoff evidence. No QEMU or VM
   evidence is claimed by this document yet.

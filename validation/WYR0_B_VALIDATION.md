@@ -119,3 +119,43 @@ clear RBP; jmp RDX`, with no call or return edge.
 The source, host, accepted-build, PE, provenance, and adversarial-review gates pass for this clean
 descendant. The root-coordinator-owned exact-pair VM BootInfo/carrier handoff gate remains pending;
 this record does not claim VM, QEMU/OVMF, or physical-hardware acceptance.
+
+## 128-KiB kernel boot-stack descendant
+
+The clean descendant `6230d2c26b0260add3fad1e1cc55c878c0362ab5` consumes Deepwyrm
+`b263a7a912c79b9e7d4b2439370417d7ae2ee076`. The Deepwyrm ABI and layout schema version are
+unchanged; its locked x86_64 layout enlarges the kernel-owned immediate-entry `.bss.boot_stack`
+from 64 KiB to 128 KiB. The loader-owned 16 KiB transition stack and all handoff wire structures
+remain unchanged. The accepted Rust source, configuration, and manifest identities remain those
+recorded above.
+
+Clean-revision evidence:
+
+- strict layout ingestion accepts `kernel_boot_stack_size = 131072` and rejects stale `65536`;
+- the complete loader host suite passed 97 tests, including a 128-KiB writable NOBITS-tail
+  regression that verifies exact `0x21_000` page rounding, undersized-allocation rejection,
+  materialization extent, non-overlap, and read/write non-executable transition mapping;
+- `cargo test --locked -p xtask` passed 40 tests with the one accepted environment-gated test
+  ignored, and that immutable-toolchain positive gate passed separately;
+- unfiltered `cargo xtask test host`, strict loader and xtask Clippy, workspace formatting, and
+  repository diff hygiene passed;
+- accepted immutable-toolchain verification, target check/build, generated-layout checks, PE
+  inspection, and clean schema-v2 provenance generation passed.
+
+The clean accepted build produced:
+
+- `target/wyr0-b/x86_64-unknown-uefi/debug/loader.efi`: SHA-256
+  `c2d15d31db924a235a46730aca3e9dbf4b8edf58c2d6ceddb7bae9e82f776675`;
+- `target/wyr0-b/x86_64-unknown-uefi/debug/loader.pdb`: SHA-256
+  `810489525e70d3f57447709b523444ea018738d2b22876ed2cd9b1a5de486e6f`;
+- PE inspection report identity:
+  `f616d99b1385ed13d3d59091f5c02db5966c0228532ea632868794831f151b11`;
+- `target/wyr0-b/provenance/wyr0-b-loader.toml`: SHA-256
+  `47e7627da08fc783c74c21d705ed5c01e55fced4f9da320e876025865b51fe5a`.
+
+The provenance records `wyrmroot_dirty = false`, the exact Wyrmroot, Deepwyrm, and Rust revisions,
+Deepwyrm layout SHA-256 `aaebb83203efaaae5b495e59484f9e0003bae6a30067ee63f02c9ea48db54e5d`,
+and generated layout-policy SHA-256
+`7c557c7460b815615c73a0dc298814772c43ae1e1797775a8b10324b60bfd72f`. The final Daybreak
+review found no Critical, High, Medium, or Low findings in this bounded acknowledgment. Exact-pair
+VM execution remains root-coordinator-owned and is not claimed here.
