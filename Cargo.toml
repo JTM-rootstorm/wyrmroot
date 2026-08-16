@@ -19,5 +19,5 @@ license = "GPL-3.0-only"
 repository = "https://github.com/JTM-rootstorm/wyrmroot"
 
 [workspace.dependencies]
-deepwyrm-abi = { git = "https://github.com/JTM-rootstorm/deepwyrm.git", rev = "b263a7a912c79b9e7d4b2439370417d7ae2ee076" }
+deepwyrm-abi = { git = "https://github.com/JTM-rootstorm/deepwyrm.git", rev = "9c7d65d3df83ce44b2ce1f15c2ae88587f9b570b" }
 uefi = { version = "=0.39.0", default-features = false, features = ["alloc", "global_allocator", "panic_handler"] }
