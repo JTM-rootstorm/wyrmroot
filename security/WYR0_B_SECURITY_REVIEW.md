@@ -107,5 +107,21 @@ paired VM gate passes against the exact committed revisions and artifacts.
   NOBITS-tail, exact-allocation, RW/NX, non-overlap, accepted-build, provenance,
   and final Daybreak review gates with no new Critical, High, Medium, or Low
   findings. The existing accepted limitations above remain in force.
+- Complete: the guarded-IST pin descendant at Wyrmroot
+  `15fa42dda23834a80197161249738f001bb2d76f` paired with Deepwyrm
+  `9c7d65d3df83ce44b2ce1f15c2ae88587f9b570b` passed exact pin/lock/provenance
+  coherence, hostile loader regressions, clean host and accepted-target builds,
+  PE/PDB and raw-stub inspection, and schema-v2 provenance binding. The final
+  `gpt-daybreak-blue-latest` high-reasoning review dated 2026-08-16 found no new
+  Critical, High, Medium, or Low findings. Loader EFI SHA-256
+  `e47f6aaae15d5e4f8cf34fcfa827cf95ff43e5ec1bab288b02bc65b98800c031`,
+  PDB SHA-256
+  `7655e2c3102d54268703617132aaf86acf47484c4ec7595e6cafdac67d26e911`,
+  and provenance SHA-256
+  `384841ca8c3c867a87e23e27d8ec5420ce47fc2db0b1ce3aafa276f9e90047be`
+  match the reviewed clean artifact record. The existing accepted Medium
+  limitations above remain in force. Downstream image admission must rehash
+  the exact artifacts against this provenance under the trusted single-writer
+  checkpoint assumption.
 - Pending: manager-owned Q35/UEFI serial and handoff evidence. No QEMU or VM
   evidence is claimed by this document yet.

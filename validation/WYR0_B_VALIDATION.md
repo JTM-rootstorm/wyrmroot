@@ -159,3 +159,65 @@ and generated layout-policy SHA-256
 `7c557c7460b815615c73a0dc298814772c43ae1e1797775a8b10324b60bfd72f`. The final Daybreak
 review found no Critical, High, Medium, or Low findings in this bounded acknowledgment. Exact-pair
 VM execution remains root-coordinator-owned and is not claimed here.
+
+## Guarded-IST kernel-pin descendant
+
+The clean descendant `15fa42dda23834a80197161249738f001bb2d76f` consumes Deepwyrm
+`9c7d65d3df83ce44b2ce1f15c2ae88587f9b570b`. The Deepwyrm change adds guarded
+terminal IST stacks and corrects their artifact oracle. The ABI/schema,
+`kernel/arch/x86_64/layout.toml`, `DwBootInfoV1`, loader handoff, three-`PT_LOAD`
+policy, primordial startup, bootstrap Channel, and bootfs `MemoryObject` rights
+contracts are unchanged. The Rust revision and accepted immutable-toolchain
+identity remain those recorded above.
+
+Clean-revision evidence:
+
+- the exact Deepwyrm Git revision agrees across `Cargo.toml`, `Cargo.lock`,
+  `toolchain/versions.toml`, and the build-provenance template, and locked Cargo
+  metadata resolves only that canonical Git source;
+- unfiltered `cargo xtask test host` passed 187 tests with no failures and one
+  accepted immutable-toolchain test ignored in the normal suite;
+- the complete loader host suite passed 97 tests; focused kernel-ELF and
+  transition suites passed 20 and 18 tests respectively;
+- the bootfs builder/parser suite passed 30 tests, and focused runtime,
+  protocol, bootstrap, `init0`, and `hello` checks passed;
+- `cargo test --locked -p xtask` passed 40 tests with one accepted test ignored;
+  the ignored immutable-toolchain positive gate passed separately in 131.17
+  seconds against the accepted compiler;
+- strict loader and xtask Clippy with warnings denied, workspace formatting,
+  repository diff hygiene, immutable-toolchain verification, target check/build,
+  PE inspection, and clean schema-v2 provenance generation passed.
+
+An exploratory workspace-wide host Clippy invocation with every feature forced
+was not used as an acceptance gate: that unsupported composition combines the
+UEFI firmware panic handler with host `std` and fails on duplicate/incompatible
+panic implementations. The canonical host component checks and accepted
+`x86_64-unknown-uefi` target build above passed.
+
+The clean accepted build produced:
+
+- `target/wyr0-b/x86_64-unknown-uefi/debug/loader.efi`: SHA-256
+  `e47f6aaae15d5e4f8cf34fcfa827cf95ff43e5ec1bab288b02bc65b98800c031`;
+- `target/wyr0-b/x86_64-unknown-uefi/debug/loader.pdb`: SHA-256
+  `7655e2c3102d54268703617132aaf86acf47484c4ec7595e6cafdac67d26e911`;
+- PE inspection report identity:
+  `f616d99b1385ed13d3d59091f5c02db5966c0228532ea632868794831f151b11`;
+- `target/wyr0-b/provenance/wyr0-b-loader.toml`: SHA-256
+  `384841ca8c3c867a87e23e27d8ec5420ce47fc2db0b1ce3aafa276f9e90047be`.
+
+The provenance records `wyrmroot_dirty = false`, the exact Wyrmroot,
+Deepwyrm, and Rust revisions, Deepwyrm layout SHA-256
+`aaebb83203efaaae5b495e59484f9e0003bae6a30067ee63f02c9ea48db54e5d`,
+and generated layout-policy SHA-256
+`7c557c7460b815615c73a0dc298814772c43ae1e1797775a8b10324b60bfd72f`.
+PE/PDB inspection found a PE32+ AMD64 EFI application with no imports and
+matching PDB identity. PDB symbols delimit the 37-byte handoff stub; disassembly
+verifies PGE clear, CR3 load, PCID clear, RSP/RDI installation, RBP clear, and
+an indirect jump with no call or return edge.
+
+The final `gpt-daybreak-blue-latest` high-reasoning review dated 2026-08-16
+found no new Critical, High, Medium, or Low findings for the exact source and
+artifact pair. The existing accepted Medium limitations remain in force.
+Exact-pair VM execution remains root-coordinator-owned and unavailable at this
+phase; this record claims no VM, QEMU/OVMF, BootInfo/carrier execution, or
+physical-hardware acceptance.
