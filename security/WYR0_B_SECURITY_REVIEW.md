@@ -123,5 +123,25 @@ paired VM gate passes against the exact committed revisions and artifacts.
   limitations above remain in force. Downstream image admission must rehash
   the exact artifacts against this provenance under the trusted single-writer
   checkpoint assumption.
+- Complete, signed-publication mapping only: no build, test, artifact
+  generation, or artifact rehash was performed. The guarded-IST artifact and
+  Daybreak evidence remains the historical record for Wyrmroot
+  `15fa42dda23834a80197161249738f001bb2d76f` with Deepwyrm
+  `9c7d65d3df83ce44b2ce1f15c2ae88587f9b570b`. That Wyrmroot source commit and
+  signed rewrite `ee1b899045a3294f140945e013ba42a60f57aa84` share tree
+  `7472f8151aaf5312b9d28fef4f8002f56af8abb6`; historical evidence commit
+  `89235c7feef2a89ef2882ee096428b456496fa39` and signed rewrite
+  `2b16b94818632f562a0551205d94e62bba847502` share tree
+  `619fb9f232796f8b3fd963b3487f084f6bd82fb2`. Coordinator verification
+  establishes that the historical Deepwyrm commit and signed rewrite
+  `b424d7d89d9acc57ceff8d966c3931e26a51f614` share tree
+  `4053153adfaca4a3582d53768c2a6fc11572ee7f`. Signed live-quartet commit
+  `eaaba1491c2f45d4fbd8b02358989547e9a8d98a`, whose parent is
+  `2b16b94818632f562a0551205d94e62bba847502`, changes only that exact pin.
+  Its `gpt-daybreak-blue-latest` high-reasoning review dated 2026-08-16 found
+  no new Critical, High, Medium, or Low findings. Existing artifact hashes are
+  historical identities, not regenerated evidence for the live quartet. The
+  old chain remains reachable in this publication-preparation checkout at
+  `refs/backup/wyrmroot/pre-publication-main-20260816-89235c7`.
 - Pending: manager-owned Q35/UEFI serial and handoff evidence. No QEMU or VM
   evidence is claimed by this document yet.

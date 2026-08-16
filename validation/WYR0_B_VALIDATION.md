@@ -221,3 +221,36 @@ artifact pair. The existing accepted Medium limitations remain in force.
 Exact-pair VM execution remains root-coordinator-owned and unavailable at this
 phase; this record claims no VM, QEMU/OVMF, BootInfo/carrier execution, or
 physical-hardware acceptance.
+
+## Signed-publication evidence mapping
+
+No build, test, artifact generation, or artifact rehash was performed for this
+publication mapping. The loader, PDB, PE-inspection report, and generated
+provenance identities in the guarded-IST descendant above remain historical
+evidence generated for clean Wyrmroot
+`15fa42dda23834a80197161249738f001bb2d76f` paired with Deepwyrm
+`9c7d65d3df83ce44b2ce1f15c2ae88587f9b570b`.
+
+The historical Wyrmroot source commit and signed rewrite
+`ee1b899045a3294f140945e013ba42a60f57aa84` share Git tree
+`7472f8151aaf5312b9d28fef4f8002f56af8abb6`. Historical evidence commit
+`89235c7feef2a89ef2882ee096428b456496fa39` and signed rewrite
+`2b16b94818632f562a0551205d94e62bba847502` likewise share tree
+`619fb9f232796f8b3fd963b3487f084f6bd82fb2`. The old chain remains reachable
+in this publication-preparation checkout at
+`refs/backup/wyrmroot/pre-publication-main-20260816-89235c7`.
+
+Coordinator verification establishes that Deepwyrm
+`9c7d65d3df83ce44b2ce1f15c2ae88587f9b570b` and signed rewrite
+`b424d7d89d9acc57ceff8d966c3931e26a51f614` share tree
+`4053153adfaca4a3582d53768c2a6fc11572ee7f`. Signed live-quartet commit
+`eaaba1491c2f45d4fbd8b02358989547e9a8d98a`, whose parent is
+`2b16b94818632f562a0551205d94e62bba847502`, changes only the canonical
+Deepwyrm revision in `Cargo.toml`, `Cargo.lock`, `toolchain/versions.toml`, and
+`toolchain/templates/build-provenance.toml`.
+
+The historical artifact provenance therefore continues to name its original
+generating revisions and must not be read as freshly generated evidence for
+`eaaba1491c2f45d4fbd8b02358989547e9a8d98a`. Exact-pair VM execution remains
+root-coordinator-owned and pending; this mapping claims no VM, QEMU/OVMF,
+BootInfo/carrier execution, or physical-hardware acceptance.
