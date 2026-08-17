@@ -50,4 +50,4 @@ Architecture documents define design contracts. Validation and security evidence
 
 ## License
 
-Wyrmroot is licensed under the [GNU General Public License v3.0](LICENSE).
+Wyrmroot is licensed under the [GNU General Public License v2.0 or later](LICENSE).
