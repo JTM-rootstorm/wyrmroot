@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Verify that an explicitly supplied, accepted Wyrmroot rustc implements the
 # locked UEFI target contract.  There is deliberately no default to `rustc`:
 # using the host compiler would conceal a missing pinned Wyrmroot toolchain.

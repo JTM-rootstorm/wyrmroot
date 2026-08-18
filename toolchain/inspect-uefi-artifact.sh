@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Validate a completed UEFI loader and its retained debug-symbol artifact.
 # This is deliberately a PE/COFF check; native guest ELF policy is separate.
 

@@ -3,7 +3,7 @@ name = "wyrmroot-efi-loader"
 version = "0.0.0"
 edition = "2024"
 publish = false
-license = "GPL-2.0-or-later"
+license = "GPL-3.0-or-later"
 description = "Inert scaffold for the future Wyrmroot EFI loader"
 
 [features]

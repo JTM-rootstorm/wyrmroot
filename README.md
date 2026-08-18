@@ -43,6 +43,7 @@ Wyrmroot consumes generated Deepwyrm ABI definitions from an exact pinned Deepwy
 - [Architecture and plan index](Plans/ARCHITECTURE_INDEX.md)
 - [Platform conventions](Plans/WYRMROOT_PLATFORM_CONVENTIONS.md)
 - [WYR0 implementation plan](Plans/WYR0_IMPLEMENTATION_PLAN.md)
+- [Licensing policy and component map](LICENSING.md)
 - [Validation records](validation/)
 - [Security reviews](security/)
 
@@ -50,4 +51,4 @@ Architecture documents define design contracts. Validation and security evidence
 
 ## License
 
-Wyrmroot is licensed under the [GNU General Public License v2.0 or later](LICENSE).
+Wyrmroot's repository default is [GPL-2.0-or-later](LICENSE). Selected, explicitly identified leaf applications and host tools use `GPL-3.0-or-later`; reusable runtime/protocol/loader/bootfs foundations remain 2+. See [LICENSING.md](LICENSING.md) for the authoritative component map and contributor rules.

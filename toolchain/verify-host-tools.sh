@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Report the current host's WYR0 toolchain prerequisites without adopting them
 # as a WYR0 version pin.  The output is intentionally JSON for CI/provenance
 # consumers; a successful probe is availability evidence only.
