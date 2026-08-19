@@ -573,6 +573,7 @@ mod firmware {
     use uefi::boot::{
         self, AllocateType, MemoryType, MemoryType as UefiMemoryType, ScopedProtocol,
     };
+    use uefi::fs::{Path as UefiPath, PathBuf as UefiPathBuf};
     use uefi::mem::memory_map::{MemoryMap, MemoryMapMut};
     use uefi::proto::console::gop::{GraphicsOutput, PixelFormat};
     use uefi::proto::media::file::{Directory, File, FileAttribute, FileInfo, FileMode};
@@ -2470,14 +2471,10 @@ mod firmware {
             .open_volume()
             .map_err(|_| FirmwarePreparationError::FileSystem)?;
 
-        let kernel_path =
-            CString16::try_from(KERNEL_PATH).map_err(|_| FirmwarePreparationError::FileSystem)?;
-        let bootstrap_path = CString16::try_from(BOOTSTRAP_PATH)
-            .map_err(|_| FirmwarePreparationError::FileSystem)?;
-        let bootfs_path =
-            CString16::try_from(BOOTFS_PATH).map_err(|_| FirmwarePreparationError::FileSystem)?;
-        let config_path =
-            CString16::try_from(CONFIG_PATH).map_err(|_| FirmwarePreparationError::FileSystem)?;
+        let kernel_path = firmware_path(KERNEL_PATH)?;
+        let bootstrap_path = firmware_path(BOOTSTRAP_PATH)?;
+        let bootfs_path = firmware_path(BOOTFS_PATH)?;
+        let config_path = firmware_path(CONFIG_PATH)?;
 
         let kernel = read_bounded_file(&mut root, &kernel_path, MAX_KERNEL_ARTIFACT_BYTES)?;
         let bootstrap =
@@ -2495,23 +2492,29 @@ mod firmware {
         })
     }
 
+    fn firmware_path(path: &str) -> Result<UefiPathBuf, FirmwarePreparationError> {
+        let encoded =
+            CString16::try_from(path).map_err(|_| FirmwarePreparationError::FileSystem)?;
+        Ok(UefiPathBuf::from(encoded))
+    }
+
     fn read_bounded_file(
         root: &mut Directory,
-        path: &CString16,
+        path: &UefiPath,
         cap: usize,
     ) -> Result<Vec<u8>, FirmwarePreparationError> {
         let file = root
-            .open(path, FileMode::Read, FileAttribute::empty())
+            .open(path.to_cstr16(), FileMode::Read, FileAttribute::empty())
             .map_err(|_| FirmwarePreparationError::FileSystem)?;
         read_opened_bounded_file(file, cap)
     }
 
     fn read_optional_bounded_file(
         root: &mut Directory,
-        path: &CString16,
+        path: &UefiPath,
         cap: usize,
     ) -> Result<Option<Vec<u8>>, FirmwarePreparationError> {
-        let file = match root.open(path, FileMode::Read, FileAttribute::empty()) {
+        let file = match root.open(path.to_cstr16(), FileMode::Read, FileAttribute::empty()) {
             Ok(file) => file,
             Err(error) if error.status() == Status::NOT_FOUND => return Ok(None),
             Err(_) => return Err(FirmwarePreparationError::FileSystem),
