@@ -1195,18 +1195,27 @@ mod firmware {
     /// guarded until the irreversible EBS call. Successful exit converts them
     /// into tokens that have no firmware release operation.
     #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    fn pre_exit_abort(stage: &str, error: FirmwarePreparationError) -> Status {
+        // Firmware console services are still valid here. Keep diagnostics to
+        // one bounded enum discriminant and stage label; no post-EBS path may
+        // call this helper or retain firmware output authority.
+        uefi::println!("wyrmroot-loader: {stage} failed: {error:?}");
+        Status::ABORTED
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
     pub fn run_handoff(policy: GeneratedHandoffPolicy) -> Status {
-        if policy.validate().is_err() {
-            return Status::ABORTED;
+        if let Err(error) = policy.validate() {
+            return pre_exit_abort("policy-validation", error);
         }
         let prepared = match prepare_pre_exit() {
             Ok(value) => value,
-            Err(_) => return Status::ABORTED,
+            Err(error) => return pre_exit_abort("pre-exit-preparation", error),
         };
         let pending = PendingResources::new(prepared);
         let prepared = match pending.prepare(policy) {
             Ok(value) => value,
-            Err(_) => return Status::ABORTED,
+            Err(error) => return pre_exit_abort("transition-preparation", error),
         };
         prepared.exit_boot_services().complete(policy)
     }
