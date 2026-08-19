@@ -44,8 +44,6 @@ pub const MAX_TOTAL_ARTIFACT_BYTES: usize =
 pub const ACPI_RSDP_V1_BYTES: usize = 20;
 /// ACPI RSDP revision 2 and later require at least this many bytes.
 pub const ACPI_RSDP_V2_MIN_BYTES: usize = 36;
-/// A configuration-table RSDP must have this alignment.
-pub const ACPI_RSDP_ALIGNMENT: usize = 16;
 /// Loader-local upper bound for an extended RSDP length field.
 pub const MAX_ACPI_RSDP_BYTES: usize = UEFI_PAGE_BYTES;
 
@@ -61,7 +59,7 @@ pub enum PreparationError {
     TotalArtifactLimitExceeded,
     #[allow(dead_code)] // Target-only generated-policy validation consumes this.
     IntakeCapacityExceeded,
-    InvalidAcpiRsdpAlignment,
+    InvalidAcpiRsdpAddress,
     InvalidAcpiRsdpSignature,
     InvalidAcpiRsdpLength,
     InvalidAcpiRsdpChecksum,
@@ -173,10 +171,13 @@ pub fn rsdp_intersecting_pages(
     })
 }
 
-/// Validates the firmware-supplied RSDP address before any raw dereference.
+/// Validates the firmware-supplied UEFI configuration-table RSDP pointer before raw byte reads.
+///
+/// The ACPI 16-byte rule applies to the legacy IA-PC memory-search procedure,
+/// not to the pointer supplied directly through the UEFI configuration table.
 pub fn validate_acpi_rsdp_address(address: usize) -> Result<(), PreparationError> {
-    if address == 0 || !address.is_multiple_of(ACPI_RSDP_ALIGNMENT) {
-        return Err(PreparationError::InvalidAcpiRsdpAlignment);
+    if address == 0 || address.checked_add(MAX_ACPI_RSDP_BYTES).is_none() {
+        return Err(PreparationError::InvalidAcpiRsdpAddress);
     }
     Ok(())
 }
@@ -2719,13 +2720,13 @@ mod firmware {
             return Ok(None);
         };
         let address = usize::try_from(selected.physical_start).map_err(|_| {
-            FirmwarePreparationError::Acpi(PreparationError::InvalidAcpiRsdpAlignment)
+            FirmwarePreparationError::Acpi(PreparationError::InvalidAcpiRsdpAddress)
         })?;
         validate_acpi_rsdp_address(address).map_err(FirmwarePreparationError::Acpi)?;
 
         // SAFETY: UEFI owns configuration-table memory until handoff. The ACPI
-        // entry promises an RSDP at this aligned address; only the fixed v1
-        // prefix is read to determine the revision and extended byte length.
+        // configuration-table entry promises an RSDP at this address; only the
+        // fixed v1 prefix is read to determine revision and extended byte length.
         let prefix =
             unsafe { core::slice::from_raw_parts(address as *const u8, ACPI_RSDP_V1_BYTES) };
         let byte_len = if prefix[15] < 2 {

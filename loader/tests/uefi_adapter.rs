@@ -88,8 +88,13 @@ fn generated_intake_capacity_is_enforced_before_storage_use() {
 #[test]
 fn rsdp_validation_requires_checksums_and_bounded_v2_length() {
     assert_eq!(
-        validate_acpi_rsdp_address(1),
-        Err(PreparationError::InvalidAcpiRsdpAlignment)
+        validate_acpi_rsdp_address(0),
+        Err(PreparationError::InvalidAcpiRsdpAddress)
+    );
+    assert_eq!(validate_acpi_rsdp_address(1), Ok(()));
+    assert_eq!(
+        validate_acpi_rsdp_address(usize::MAX - uefi_app::MAX_ACPI_RSDP_BYTES + 1),
+        Err(PreparationError::InvalidAcpiRsdpAddress)
     );
     let mut v1 = [0_u8; ACPI_RSDP_V1_BYTES];
     v1[..8].copy_from_slice(b"RSD PTR ");
