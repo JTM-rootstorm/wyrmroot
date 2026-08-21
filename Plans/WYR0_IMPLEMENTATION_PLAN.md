@@ -312,7 +312,7 @@ WYR0 owns:
 4. normal userspace ELF loading policy
 5. initial process environment and capability distribution above the primordial handoff
 
-When ambiguity exists, do not let an implementation agent independently extend the kernel ABI. Record the missing operation and route it through the coordinator/Deepwyrm ABI schema first.
+When ambiguity exists, do not let an implementation agent independently extend the kernel ABI. Record the missing operation and route it through the coordinator/Deepwyrm ABI schema first. If the requested operation is motivated by POSIX/Linux/Windows/DOS compatibility, routing it to the schema is not approval: it must first pass the workspace cross-personality kernel-mechanism admission doctrine, with composition/userspace alternatives considered explicitly.
 
 ---
 

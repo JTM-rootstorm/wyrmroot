@@ -408,7 +408,9 @@ The following remain later subsystem work and are not pulled into WYR0 by this a
 
 When implemented, these should follow the same principle:
 
-> native typed Wyrmroot service/API first; Linux compatibility API only where required for third-party software.
+> define the native Wyrmroot service/API from native requirements; layer Linux compatibility only where required for third-party software.
+
+Do not invent a native service feature merely because it would unify two compatibility adapters, and do not request a Deepwyrm mechanism merely because a native service can be drawn generically. Shared adapter mechanics should remain restartable userspace unless the cross-personality admission test proves a real privileged/atomicity requirement.
 
 For example, ALSA/PulseAudio/PipeWire compatibility may be useful later, but none should automatically become Wyrmroot's native audio ABI merely because Linux software expects them.
 

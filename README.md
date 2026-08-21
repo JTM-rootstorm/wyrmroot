@@ -30,7 +30,7 @@ This diagram describes durable component boundaries, not implementation or accep
 
 Deepwyrm owns the native kernel ABI, kernel objects and rights, and low-level mechanisms. Wyrmroot owns the EFI loader, bootfs, userspace startup semantics above the primordial handoff, executable-loading policy, native service protocols, image assembly, and higher-level capability distribution.
 
-Wyrmroot consumes generated Deepwyrm ABI definitions from an exact pinned Deepwyrm revision rather than duplicating kernel definitions. Linux-shaped control surfaces and compatibility APIs may be exposed by adapters where useful, but they are not foundational Wyrmroot interfaces.
+Wyrmroot consumes generated Deepwyrm ABI definitions from an exact pinned Deepwyrm revision rather than duplicating kernel definitions. Linux-shaped control surfaces and compatibility APIs may be exposed by adapters where useful, but they are not foundational Wyrmroot interfaces. Multiple foreign APIs wanting similar behavior does not, by itself, justify a new native service or kernel primitive; compatibility is expected to compose existing mechanisms first and keep foreign policy in adapters.
 
 ## Related projects
 

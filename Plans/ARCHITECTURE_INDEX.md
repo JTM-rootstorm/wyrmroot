@@ -15,6 +15,7 @@ This file defines the minimum architecture reading set for Wyrmroot implementati
 6. [`Plans/WYR0_IMPLEMENTATION_PLAN_TOOLCHAIN_ADDENDUM.md`](WYR0_IMPLEMENTATION_PLAN_TOOLCHAIN_ADDENDUM.md) - LLVM/Clang/LLD/compiler-rt policy and host GDB workflow.
 7. [`Plans/WYR0_IMPLEMENTATION_PLAN_NATIVE_CONTROL_SURFACES_ADDENDUM.md`](WYR0_IMPLEMENTATION_PLAN_NATIVE_CONTROL_SURFACES_ADDENDUM.md) - native control-plane direction versus Linux pseudo-filesystems/utilities.
 8. Deepwyrm's corresponding `Plans/DEEPWYRM_PRE_PHASE0_INVARIANTS.md`, DW0 plan, and addenda for any cross-repository ABI/handoff work.
+9. When work touches compatibility personalities, personality hosting, or uses Linux/Windows/DOS/POSIX requirements to justify a native service or kernel change, the OS-Project coordination doctrine `../personality-plan/CROSS_PERSONALITY_KERNEL_MECHANISM_DOCTRINE.md` and the affected family plan are mandatory reading.
 
 ## Reached subsystem contracts
 
@@ -29,6 +30,7 @@ This file defines the minimum architecture reading set for Wyrmroot implementati
 - `WYRMROOT_PLATFORM_CONVENTIONS.md` applies to later milestones unless an explicit architecture revision changes it.
 - A milestone plan may add stricter requirements but may not silently weaken a platform convention.
 - If implementation reveals a conflict, stop local invention and route the change through the coordinator/architecture documents.
+- For compatibility-motivated native growth, the cross-personality doctrine is a hard admission overlay: an older statement that compatibility may influence or generalize a native abstraction cannot authorize personality-aware Wyrmroot policy or a broader Deepwyrm primitive. Prefer personality adapters and shared restartable userspace helpers; any kernel change must independently satisfy the stricter privileged-mechanism admission test.
 
 ## Phase-0 freeze policy
 

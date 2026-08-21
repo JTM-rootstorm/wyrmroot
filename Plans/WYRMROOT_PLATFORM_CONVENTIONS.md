@@ -11,13 +11,15 @@ The goal is not to design every future subsystem before WYR0 boots. The goal is 
 
 The governing principle is:
 
-> **Wyrmroot is a native capability-oriented operating system first. Unix/POSIX, Linux, Windows, DOS/Win16/Win9x, and other compatibility environments are personalities layered above native Wyrmroot interfaces. Compatibility requirements may influence general-purpose native abstractions, but compatibility quirks do not become native semantics by default.**
+> **Wyrmroot is a native capability-oriented operating system first. Unix/POSIX, Linux, Windows, DOS/Win16/Win9x, and other compatibility environments are personalities layered above native Wyrmroot interfaces. Compatibility requirements may reveal missing native abstractions, but they do not authorize them merely because the result could be generalized; personality semantics stay above native interfaces unless a separately justified native need exists.**
 
 ---
 
 # 1. Convention hierarchy and change control
 
-When documents appear to conflict, use this order unless a newer explicit architecture revision says otherwise:
+For compatibility/personality-driven changes, `../personality-plan/CROSS_PERSONALITY_KERNEL_MECHANISM_DOCTRINE.md` is a **scope/admission overlay** on the hierarchy below. Existing Deepwyrm ABI/schema remains authoritative for the semantics of mechanisms already admitted, but more permissive older text must not be interpreted as permission to widen those mechanisms or native Wyrmroot services for compatibility. Family plans may narrow the doctrine, not broaden it.
+
+When documents appear to conflict on ordinary native semantics, use this order unless a newer explicit architecture revision says otherwise:
 
 1. Deepwyrm native ABI schema and locked kernel invariants for kernel-facing behavior.
 2. This Wyrmroot Platform Conventions specification for system-wide userspace behavior.
@@ -580,7 +582,16 @@ Retro compatibility may use emulation/capsules and behavioral contracts. DOS dri
 
 ## 19.4 General rule
 
-Do not add a native kernel/service feature *solely* because one compatibility personality exposes it under a legacy name. Add it natively only when it is a sound general-purpose primitive, then map compatibility semantics onto it.
+Do not add a native kernel/service feature merely because one or several compatibility personalities expose nearby concepts. **General-purpose, architecture-neutral, or reusable is not sufficient justification.**
+
+Use this order:
+
+1. compose existing native mechanisms/services inside the owning personality;
+2. if several personalities genuinely share implementation mechanics, prefer a restartable shared compatibility/Wyrmroot userspace helper while preserving separate observable semantics;
+3. add a Wyrmroot-native service feature only when it has an independently justified native-system semantic and does not branch on personality identity to redefine the native contract; and
+4. request a Deepwyrm primitive only when a genuinely new personality-blind privileged operation, kernel-lifetime state transition, or atomicity/security guarantee cannot be safely provided above the kernel.
+
+A generic personality/ABI routing hook may identify which installed personality handler should receive a foreign executable/syscall/event. It must not make generic Process, VM, VFS, wait, Channel, or service operations reinterpret the same request according to caller personality. Modest duplicated personality-side code is acceptable when deduplication would create an omnibus native interface or one-more-flag policy surface.
 
 ---
 
