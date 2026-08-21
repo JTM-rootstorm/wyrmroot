@@ -1,7 +1,7 @@
 //! Allocation-free normalization of the final firmware memory map.
 //!
 //! The UEFI adapter translates firmware-specific memory-type numbers into
-//! [`boot_info::UefiMemoryKind`] before calling this module. An unknown value
+//! [`crate::boot_info::UefiMemoryKind`] before calling this module. An unknown value
 //! remains `None` and is rejected here rather than being guessed at. Output
 //! uses canonical representatives for categories with identical BootInfo
 //! meaning, allowing a caller-provided generated-record buffer to hold a
