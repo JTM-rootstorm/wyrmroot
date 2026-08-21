@@ -705,49 +705,224 @@ fn toml_code(line: &str) -> &str {
 }
 
 fn has_abi_consumer(repository: &Path) -> Result<bool, Failure> {
-    for relative in ["bootstrap", "crates", "loader", "userspace"] {
-        let root = repository.join(relative);
-        if manifest_tree_has_workspace_dependency(&root, "deepwyrm-abi")? {
+    let root_manifest_path = repository.join("Cargo.toml");
+    let root_manifest = read_file(&root_manifest_path)?;
+    for member in parse_workspace_members(&root_manifest, &root_manifest_path)? {
+        let manifest = workspace_member_manifest(repository, &member)?;
+        if manifest_consumes_workspace_dependency(&read_file(&manifest)?, "deepwyrm-abi") {
             return Ok(true);
         }
     }
     Ok(false)
 }
 
-fn manifest_tree_has_workspace_dependency(root: &Path, dependency: &str) -> Result<bool, Failure> {
-    for entry in fs::read_dir(root)
-        .map_err(|error| Failure::task(format!("could not inspect {}: {error}", root.display())))?
-    {
-        let entry = entry.map_err(|error| {
-            Failure::task(format!(
-                "could not inspect an entry in {}: {error}",
-                root.display()
-            ))
-        })?;
-        let path = entry.path();
-        let file_type = checked_file_type(&entry, root)?;
-        if file_type.is_symlink() {
+fn parse_workspace_members(manifest: &str, path: &Path) -> Result<BTreeSet<String>, Failure> {
+    let mut section = String::new();
+    let mut members_body = None;
+    let mut collecting_members = false;
+
+    for (index, raw_line) in manifest.lines().enumerate() {
+        let line = toml_code(raw_line);
+        if line.is_empty() {
+            continue;
+        }
+        if collecting_members {
+            collecting_members = collect_workspace_members_line(
+                line,
+                members_body
+                    .as_mut()
+                    .expect("member collection has initialized storage"),
+                path,
+                index + 1,
+            )?;
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line[1..line.len() - 1].trim().to_owned();
+            continue;
+        }
+        if section != "workspace" {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.contains(['"', '\'']) || key.bytes().any(|byte| byte.is_ascii_whitespace()) {
             return Err(Failure::task(format!(
-                "refusing to follow symlink while validating ABI consumers: {}",
+                "{} uses an unsupported workspace key form",
                 path.display()
             )));
         }
-        if file_type.is_dir() {
-            if manifest_tree_has_workspace_dependency(&path, dependency)? {
-                return Ok(true);
-            }
-        } else if file_type.is_file()
-            && path.file_name().and_then(|name| name.to_str()) == Some("Cargo.toml")
-            && manifest_consumes_workspace_dependency(&read_file(&path)?, dependency)
-        {
-            return Ok(true);
+        if key == "exclude" {
+            return Err(Failure::task(format!(
+                "{} uses unsupported workspace exclude semantics",
+                path.display()
+            )));
+        }
+        if key != "members" {
+            continue;
+        }
+        if members_body.is_some() {
+            return Err(Failure::task(format!(
+                "{} contains duplicate workspace members",
+                path.display()
+            )));
+        }
+        let value = value.trim();
+        let Some(value) = value.strip_prefix('[') else {
+            return Err(Failure::task(format!(
+                "{}:{} workspace members must be an explicit string array",
+                path.display(),
+                index + 1
+            )));
+        };
+        members_body = Some(String::new());
+        collecting_members = collect_workspace_members_line(
+            value,
+            members_body
+                .as_mut()
+                .expect("member collection has initialized storage"),
+            path,
+            index + 1,
+        )?;
+    }
+
+    if collecting_members {
+        return Err(Failure::task(format!(
+            "{} contains an unterminated workspace members array",
+            path.display()
+        )));
+    }
+    let body = members_body.ok_or_else(|| {
+        Failure::task(format!(
+            "{} is missing the explicit workspace members array",
+            path.display()
+        ))
+    })?;
+    let items = split_inline_table(&body).ok_or_else(|| {
+        Failure::task(format!(
+            "{} contains malformed workspace members",
+            path.display()
+        ))
+    })?;
+    let item_count = items.len();
+    let mut members = BTreeSet::new();
+    for (index, item) in items.into_iter().enumerate() {
+        let item = item.trim();
+        if item.is_empty() && index + 1 == item_count {
+            continue;
+        }
+        let member = basic_toml_string(item).ok_or_else(|| {
+            Failure::task(format!(
+                "{} workspace member must be a basic string path",
+                path.display()
+            ))
+        })?;
+        validate_workspace_member(member, path)?;
+        if !members.insert(member.to_owned()) {
+            return Err(Failure::task(format!(
+                "{} contains duplicate workspace member '{member}'",
+                path.display()
+            )));
         }
     }
+    if members.is_empty() {
+        return Err(Failure::task(format!(
+            "{} workspace members must not be empty",
+            path.display()
+        )));
+    }
+    Ok(members)
+}
+
+fn collect_workspace_members_line(
+    line: &str,
+    body: &mut String,
+    path: &Path,
+    line_number: usize,
+) -> Result<bool, Failure> {
+    let Some(closing) = line.find(']') else {
+        body.push_str(line);
+        body.push('\n');
+        return Ok(true);
+    };
+    if !line[closing + 1..].trim().is_empty() || line[..closing].contains('[') {
+        return Err(Failure::task(format!(
+            "{}:{line_number} contains malformed workspace members",
+            path.display()
+        )));
+    }
+    body.push_str(&line[..closing]);
     Ok(false)
+}
+
+fn validate_workspace_member(member: &str, path: &Path) -> Result<(), Failure> {
+    let relative = Path::new(member);
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || member
+            .bytes()
+            .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b']'))
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(Failure::task(format!(
+            "{} workspace member '{member}' is not a non-traversing relative path",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn workspace_member_manifest(
+    repository: &Path,
+    member: &str,
+) -> Result<std::path::PathBuf, Failure> {
+    let mut current = repository.to_path_buf();
+    for component in Path::new(member).components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(Failure::task(
+                "validated workspace member path changed form",
+            ));
+        };
+        current.push(component);
+        let metadata = fs::symlink_metadata(&current).map_err(|error| {
+            Failure::task(format!(
+                "could not inspect workspace member path {}: {error}",
+                current.display()
+            ))
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(Failure::task(format!(
+                "workspace member path must contain only non-symlink directories: {}",
+                current.display()
+            )));
+        }
+    }
+    let manifest = current.join("Cargo.toml");
+    let metadata = fs::symlink_metadata(&manifest).map_err(|error| {
+        Failure::task(format!(
+            "could not inspect workspace member manifest {}: {error}",
+            manifest.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(Failure::task(format!(
+            "workspace member manifest must be a regular non-symlink file: {}",
+            manifest.display()
+        )));
+    }
+    Ok(manifest)
 }
 
 fn manifest_consumes_workspace_dependency(manifest: &str, dependency: &str) -> bool {
     let mut section = String::new();
+    let workspace_key = format!("{dependency}.workspace");
+    let field_prefix = format!("{dependency}.");
+    let dependency_table = format!("dependencies.{dependency}");
+    let mut consumes = false;
     for raw_line in manifest.lines() {
         let line = toml_code(raw_line);
         if line.is_empty() {
@@ -755,6 +930,12 @@ fn manifest_consumes_workspace_dependency(manifest: &str, dependency: &str) -> b
         }
         if line.starts_with('[') && line.ends_with(']') {
             section = line[1..line.len() - 1].trim().to_owned();
+            if section == dependency_table || section.starts_with("dependencies.") {
+                return false;
+            }
+            continue;
+        }
+        if section != "dependencies" {
             continue;
         }
         let Some((key, value)) = line.split_once('=') else {
@@ -762,53 +943,21 @@ fn manifest_consumes_workspace_dependency(manifest: &str, dependency: &str) -> b
         };
         let key = key.trim();
         let value = value.trim();
-        if dependency_table_section(&section, dependency) {
-            if key == "workspace" && value == "true" {
-                return true;
+        if key.contains(['"', '\'']) || key.bytes().any(|byte| byte.is_ascii_whitespace()) {
+            return false;
+        }
+        if key == workspace_key {
+            if consumes || value != "true" {
+                return false;
             }
+            consumes = true;
             continue;
         }
-        if !dependency_list_section(&section) {
-            continue;
-        }
-        if key == format!("{dependency}.workspace") && value == "true" {
-            return true;
-        }
-        if key == dependency
-            && value
-                .strip_prefix('{')
-                .and_then(|value| value.strip_suffix('}'))
-                .and_then(split_inline_table)
-                .is_some_and(|assignments| {
-                    assignments.into_iter().any(|assignment| {
-                        assignment.split_once('=').is_some_and(|(key, value)| {
-                            key.trim() == "workspace" && value.trim() == "true"
-                        })
-                    })
-                })
-        {
-            return true;
+        if key == dependency || key.starts_with(&field_prefix) {
+            return false;
         }
     }
-    false
-}
-
-fn dependency_list_section(section: &str) -> bool {
-    matches!(
-        section,
-        "dependencies" | "dev-dependencies" | "build-dependencies"
-    ) || section.ends_with(".dependencies")
-        || section.ends_with(".dev-dependencies")
-        || section.ends_with(".build-dependencies")
-}
-
-fn dependency_table_section(section: &str, dependency: &str) -> bool {
-    ["dependencies", "dev-dependencies", "build-dependencies"]
-        .into_iter()
-        .any(|kind| {
-            section == format!("{kind}.{dependency}")
-                || section.ends_with(&format!(".{kind}.{dependency}"))
-        })
+    consumes
 }
 
 fn validate_reserved_target_policy(repository: &Path, native_target: &str) -> Result<(), Failure> {
@@ -894,9 +1043,10 @@ fn checked_file_type(entry: &fs::DirEntry, root: &Path) -> Result<fs::FileType, 
 #[cfg(test)]
 mod tests {
     use super::{
-        BuildManifest, LoaderProfile, loader_has_optional_uefi_dependency, lock_has_git_package,
-        lock_has_package, manifest_consumes_workspace_dependency, parse_scalar_toml,
-        root_has_deepwyrm_dependency, root_has_uefi_dependency, validate_loader_profile_components,
+        BuildManifest, LoaderProfile, has_abi_consumer, loader_has_optional_uefi_dependency,
+        lock_has_git_package, lock_has_package, manifest_consumes_workspace_dependency,
+        parse_scalar_toml, parse_workspace_members, root_has_deepwyrm_dependency,
+        root_has_uefi_dependency, validate_loader_profile_components,
     };
     use std::collections::BTreeMap;
     use std::path::Path;
@@ -1039,12 +1189,20 @@ mod tests {
             "[dependencies]\ndeepwyrm-abi.workspace = true\n",
             "deepwyrm-abi"
         ));
-        assert!(manifest_consumes_workspace_dependency(
+        assert!(!manifest_consumes_workspace_dependency(
             "[dependencies]\ndeepwyrm-abi = { workspace = true }\n",
             "deepwyrm-abi"
         ));
-        assert!(manifest_consumes_workspace_dependency(
+        assert!(!manifest_consumes_workspace_dependency(
             "[dependencies.deepwyrm-abi]\nworkspace = true\n",
+            "deepwyrm-abi"
+        ));
+        assert!(!manifest_consumes_workspace_dependency(
+            "[dependencies]\ndeepwyrm-abi.workspace = true\ndeepwyrm-abi.optional = true\n",
+            "deepwyrm-abi"
+        ));
+        assert!(!manifest_consumes_workspace_dependency(
+            "[dependencies]\ndeepwyrm-abi.workspace = true\n\"deepwyrm-abi\".optional = true\n",
             "deepwyrm-abi"
         ));
         assert!(!manifest_consumes_workspace_dependency(
@@ -1055,6 +1213,106 @@ mod tests {
             "[dependencies]\nunrelated = { package = \"deepwyrm-abi\", version = \"0.0.0\" } # deepwyrm-abi.workspace = true\n",
             "deepwyrm-abi"
         ));
+        assert!(!manifest_consumes_workspace_dependency(
+            "[package.metadata.dependencies]\ndeepwyrm-abi.workspace = true\n",
+            "deepwyrm-abi"
+        ));
+        assert!(!manifest_consumes_workspace_dependency(
+            "[target.'cfg(any())'.dependencies]\ndeepwyrm-abi.workspace = true\n",
+            "deepwyrm-abi"
+        ));
+        assert!(!manifest_consumes_workspace_dependency(
+            "[target.'cfg(any())'.dependencies.deepwyrm-abi]\nworkspace = true\n",
+            "deepwyrm-abi"
+        ));
+        assert!(!manifest_consumes_workspace_dependency(
+            "[dev-dependencies]\ndeepwyrm-abi.workspace = true\n",
+            "deepwyrm-abi"
+        ));
+    }
+
+    #[test]
+    fn workspace_members_parser_rejects_traversal_and_duplicates() {
+        let members = parse_workspace_members(
+            "[workspace]\nmembers = [\n  \"loader\",\n  \"crates/runtime\",\n]\n",
+            Path::new("Cargo.toml"),
+        )
+        .expect("explicit workspace members rejected");
+        assert_eq!(
+            members,
+            ["crates/runtime".to_owned(), "loader".to_owned()]
+                .into_iter()
+                .collect()
+        );
+        assert!(
+            parse_workspace_members(
+                "[workspace]\nmembers = [\"loader\", \"../decoy\"]\n",
+                Path::new("Cargo.toml")
+            )
+            .is_err()
+        );
+        assert!(
+            parse_workspace_members(
+                "[workspace]\nmembers = [\"loader\", \"loader\"]\n",
+                Path::new("Cargo.toml")
+            )
+            .is_err()
+        );
+        assert!(
+            parse_workspace_members(
+                "[workspace]\nmembers = [\"loader\"]\nexclude = [\"loader\"]\n",
+                Path::new("Cargo.toml")
+            )
+            .is_err()
+        );
+        assert!(
+            parse_workspace_members(
+                "[workspace]\nmembers = [\"loader\"]\n\"exclude\" = [\"loader\"]\n",
+                Path::new("Cargo.toml")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn abi_consumer_is_bound_to_an_explicit_workspace_member() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock precedes Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "wyrmroot-xtask-member-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let member = root.join("member");
+        let decoy = root.join("decoy/nested");
+        std::fs::create_dir_all(&member).expect("create member fixture");
+        std::fs::create_dir_all(&decoy).expect("create non-member fixture");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"member\"]\n",
+        )
+        .expect("write root fixture manifest");
+        std::fs::write(member.join("Cargo.toml"), "[package]\nname = \"member\"\n")
+            .expect("write member fixture manifest");
+        std::fs::write(
+            decoy.join("Cargo.toml"),
+            "[dependencies]\ndeepwyrm-abi.workspace = true\n",
+        )
+        .expect("write non-member decoy manifest");
+
+        assert!(!has_abi_consumer(&root).expect("inspect non-consuming workspace"));
+
+        std::fs::write(
+            member.join("Cargo.toml"),
+            "[dependencies]\ndeepwyrm-abi.workspace = true\n",
+        )
+        .expect("write consuming member fixture manifest");
+        assert!(has_abi_consumer(&root).expect("inspect consuming workspace"));
+
+        std::fs::remove_dir_all(&root).expect("remove workspace fixture");
     }
 
     #[test]
