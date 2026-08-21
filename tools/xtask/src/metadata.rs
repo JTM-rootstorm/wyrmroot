@@ -605,44 +605,117 @@ fn inline_string_array(value: &str) -> Option<BTreeSet<String>> {
 }
 
 fn lock_has_package(lockfile: &str, name: &str, version: &str) -> bool {
-    lockfile.split("[[package]]").any(|package| {
-        let mut found_name = false;
-        let mut found_version = false;
-        for line in package.lines().map(toml_code) {
-            found_name |= line == format!("name = \"{name}\"");
-            found_version |= line == format!("version = \"{version}\"");
-        }
-        found_name && found_version
+    parse_lock_packages(lockfile).is_some_and(|packages| {
+        packages
+            .iter()
+            .any(|package| package.name == name && package.version == version)
     })
 }
 
 fn lock_has_git_package(lockfile: &str, name: &str, repository: &str, revision: &str) -> bool {
-    lockfile.split("[[package]]").skip(1).any(|package| {
-        let mut package_name = None;
-        let mut package_source = None;
-        for raw_line in package.lines() {
-            let line = toml_code(raw_line);
-            if line.is_empty() {
-                continue;
-            }
-            let Some((key, value)) = line.split_once('=') else {
-                continue;
-            };
-            match key.trim() {
-                "name" if package_name.is_none() => {
-                    package_name = basic_toml_string(value.trim());
-                }
-                "source" if package_source.is_none() => {
-                    package_source = basic_toml_string(value.trim());
-                }
-                "name" | "source" => return false,
-                _ => {}
-            }
+    let Some(packages) = parse_lock_packages(lockfile) else {
+        return false;
+    };
+    let mut matching = packages.iter().filter(|package| package.name == name);
+    let Some(package) = matching.next() else {
+        return false;
+    };
+    matching.next().is_none()
+        && package
+            .source
+            .is_some_and(|source| git_lock_source_matches(source, repository, revision))
+}
+
+struct LockPackage<'a> {
+    name: &'a str,
+    version: &'a str,
+    source: Option<&'a str>,
+}
+
+fn parse_lock_packages(lockfile: &str) -> Option<Vec<LockPackage<'_>>> {
+    let mut packages = Vec::new();
+    let mut in_package = false;
+    let mut name = None;
+    let mut version = None;
+    let mut source = None;
+
+    for raw_line in lockfile.lines() {
+        let line = toml_code(raw_line);
+        if line.is_empty() {
+            continue;
         }
-        package_name == Some(name)
-            && package_source
-                .is_some_and(|source| git_lock_source_matches(source, repository, revision))
-    })
+        if line.contains("\"\"\"") || line.contains("'''") {
+            return None;
+        }
+        if line == "[[package]]" {
+            finish_lock_package(
+                &mut packages,
+                in_package,
+                &mut name,
+                &mut version,
+                &mut source,
+            )?;
+            in_package = true;
+            continue;
+        }
+        if line.starts_with('[') {
+            finish_lock_package(
+                &mut packages,
+                in_package,
+                &mut name,
+                &mut version,
+                &mut source,
+            )?;
+            in_package = false;
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.contains(['"', '\'']) || key.bytes().any(|byte| byte.is_ascii_whitespace()) {
+            return None;
+        }
+        let value = value.trim();
+        match key {
+            "name" if name.is_none() => name = Some(basic_toml_string(value)?),
+            "version" if version.is_none() => version = Some(basic_toml_string(value)?),
+            "source" if source.is_none() => source = Some(basic_toml_string(value)?),
+            "name" | "version" | "source" => return None,
+            _ => {}
+        }
+    }
+    finish_lock_package(
+        &mut packages,
+        in_package,
+        &mut name,
+        &mut version,
+        &mut source,
+    )?;
+    Some(packages)
+}
+
+fn finish_lock_package<'a>(
+    packages: &mut Vec<LockPackage<'a>>,
+    in_package: bool,
+    name: &mut Option<&'a str>,
+    version: &mut Option<&'a str>,
+    source: &mut Option<&'a str>,
+) -> Option<()> {
+    if in_package {
+        packages.push(LockPackage {
+            name: name.take()?,
+            version: version.take()?,
+            source: source.take(),
+        });
+    }
+    *name = None;
+    *version = None;
+    *source = None;
+    Some(())
 }
 
 fn git_lock_source_matches(source: &str, repository: &str, revision: &str) -> bool {
@@ -663,7 +736,8 @@ fn git_lock_source_matches(source: &str, repository: &str, revision: &str) -> bo
 
 fn git_repositories_match(left: &str, right: &str) -> bool {
     fn normalized(repository: &str) -> &str {
-        repository.trim_end_matches('/').trim_end_matches(".git")
+        let repository = repository.trim_end_matches('/');
+        repository.strip_suffix(".git").unwrap_or(repository)
     }
 
     normalized(left) == normalized(right)
@@ -1114,6 +1188,11 @@ mod tests {
         let lockfile = "[[package]]\nname = \"uefi\"\nversion = \"0.38.0\"\n\n[[package]]\nname = \"other\"\nversion = \"0.39.0\"\n";
         assert!(!lock_has_package(lockfile, "uefi", "0.39.0"));
         assert!(lock_has_package(lockfile, "uefi", "0.38.0"));
+        assert!(!lock_has_package(
+            "version = 4\n# [[package]]\nname = \"uefi\"\nversion = \"0.39.0\"\n",
+            "uefi",
+            "0.39.0"
+        ));
     }
 
     #[test]
@@ -1141,6 +1220,15 @@ mod tests {
         );
         assert!(!root_has_deepwyrm_dependency(
             &metadata_decoy,
+            REPOSITORY,
+            REVISION
+        ));
+
+        let repeated_suffix = format!(
+            "[workspace.dependencies]\ndeepwyrm-abi = {{ git = \"{REPOSITORY}.git.git\", rev = \"{REVISION}\" }}\n"
+        );
+        assert!(!root_has_deepwyrm_dependency(
+            &repeated_suffix,
             REPOSITORY,
             REVISION
         ));
@@ -1177,6 +1265,36 @@ mod tests {
         );
         assert!(!lock_has_git_package(
             &other_package_decoy,
+            "deepwyrm-abi",
+            REPOSITORY,
+            REVISION
+        ));
+
+        let commented_header_decoy = format!(
+            "version = 4\n# [[package]]\nname = \"deepwyrm-abi\"\nsource = \"git+{REPOSITORY}.git?rev={REVISION}#{REVISION}\"\n"
+        );
+        assert!(!lock_has_git_package(
+            &commented_header_decoy,
+            "deepwyrm-abi",
+            REPOSITORY,
+            REVISION
+        ));
+
+        let multiline_string_decoy = format!(
+            "description = \"\"\"\n[[package]]\n\"\"\"\nname = \"deepwyrm-abi\"\nversion = \"0.0.0\"\nsource = \"git+{REPOSITORY}.git?rev={REVISION}#{REVISION}\"\n"
+        );
+        assert!(!lock_has_git_package(
+            &multiline_string_decoy,
+            "deepwyrm-abi",
+            REPOSITORY,
+            REVISION
+        ));
+
+        let duplicate_source = format!(
+            "[[package]]\nname = \"deepwyrm-abi\"\nversion = \"0.0.0\"\nsource = \"git+{REPOSITORY}.git?rev={REVISION}#{REVISION}\"\nsource = \"git+{REPOSITORY}.git?rev={REVISION}#{REVISION}\"\n"
+        );
+        assert!(!lock_has_git_package(
+            &duplicate_source,
             "deepwyrm-abi",
             REPOSITORY,
             REVISION
