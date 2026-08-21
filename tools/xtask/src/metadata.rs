@@ -280,6 +280,12 @@ fn read_file(path: &Path) -> Result<String, Failure> {
 }
 
 fn parse_scalar_toml(contents: &str, path: &Path) -> Result<BTreeMap<String, String>, Failure> {
+    if contains_toml_multiline_string(contents) {
+        return Err(Failure::task(format!(
+            "{} contains an unsupported TOML multiline string",
+            path.display()
+        )));
+    }
     let mut section = String::new();
     let mut values = BTreeMap::new();
 
@@ -514,6 +520,9 @@ fn manifest_inline_dependency(
     required_section: &str,
     dependency: &str,
 ) -> Option<BTreeMap<String, String>> {
+    if contains_toml_multiline_string(manifest) {
+        return None;
+    }
     let mut section = "";
     for raw_line in manifest.lines() {
         let line = toml_code(raw_line);
@@ -633,6 +642,9 @@ struct LockPackage<'a> {
 }
 
 fn parse_lock_packages(lockfile: &str) -> Option<Vec<LockPackage<'_>>> {
+    if contains_toml_multiline_string(lockfile) {
+        return None;
+    }
     let mut packages = Vec::new();
     let mut in_package = false;
     let mut name = None;
@@ -643,9 +655,6 @@ fn parse_lock_packages(lockfile: &str) -> Option<Vec<LockPackage<'_>>> {
         let line = toml_code(raw_line);
         if line.is_empty() {
             continue;
-        }
-        if line.contains("\"\"\"") || line.contains("'''") {
-            return None;
         }
         if line == "[[package]]" {
             finish_lock_package(
@@ -778,6 +787,10 @@ fn toml_code(line: &str) -> &str {
     line.trim()
 }
 
+fn contains_toml_multiline_string(contents: &str) -> bool {
+    contents.contains("\"\"\"") || contents.contains("'''")
+}
+
 fn has_abi_consumer(repository: &Path) -> Result<bool, Failure> {
     let root_manifest_path = repository.join("Cargo.toml");
     let root_manifest = read_file(&root_manifest_path)?;
@@ -791,6 +804,12 @@ fn has_abi_consumer(repository: &Path) -> Result<bool, Failure> {
 }
 
 fn parse_workspace_members(manifest: &str, path: &Path) -> Result<BTreeSet<String>, Failure> {
+    if contains_toml_multiline_string(manifest) {
+        return Err(Failure::task(format!(
+            "{} contains an unsupported TOML multiline string",
+            path.display()
+        )));
+    }
     let mut section = String::new();
     let mut members_body = None;
     let mut collecting_members = false;
@@ -992,6 +1011,9 @@ fn workspace_member_manifest(
 }
 
 fn manifest_consumes_workspace_dependency(manifest: &str, dependency: &str) -> bool {
+    if contains_toml_multiline_string(manifest) {
+        return false;
+    }
     let mut section = String::new();
     let workspace_key = format!("{dependency}.workspace");
     let field_prefix = format!("{dependency}.");
@@ -1141,6 +1163,13 @@ mod tests {
         assert_eq!(values.get("deepwyrm.revision").unwrap(), "0123");
         assert_eq!(values.get("constraints.strict").unwrap(), "false");
         assert!(!values.contains_key("deepwyrm.items"));
+        assert!(
+            parse_scalar_toml(
+                "[metadata]\ndecoy = \"\"\"\n[deepwyrm]\nrevision = \"0123\"\n\"\"\"\n",
+                Path::new("versions.toml")
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1230,6 +1259,25 @@ mod tests {
         assert!(!root_has_deepwyrm_dependency(
             &repeated_suffix,
             REPOSITORY,
+            REVISION
+        ));
+
+        let multiline_section_decoy = format!(
+            "[package.metadata]\ndecoy = \"\"\"\n[workspace.dependencies]\ndeepwyrm-abi = {{ git = \"{REPOSITORY}.git\", rev = \"{REVISION}\" }}\n\"\"\"\n"
+        );
+        assert!(!root_has_deepwyrm_dependency(
+            &multiline_section_decoy,
+            REPOSITORY,
+            REVISION
+        ));
+
+        const HASH_REPOSITORY: &str = "https://example.invalid/deepwyrm#quoted";
+        let quoted_hash = format!(
+            "[workspace.dependencies]\ndeepwyrm-abi = {{ git = \"{HASH_REPOSITORY}\", rev = \"{REVISION}\" }} # trailing comment\n"
+        );
+        assert!(root_has_deepwyrm_dependency(
+            &quoted_hash,
+            HASH_REPOSITORY,
             REVISION
         ));
     }
@@ -1347,6 +1395,10 @@ mod tests {
             "[dev-dependencies]\ndeepwyrm-abi.workspace = true\n",
             "deepwyrm-abi"
         ));
+        assert!(!manifest_consumes_workspace_dependency(
+            "[package.metadata]\ndecoy = '''\n[dependencies]\ndeepwyrm-abi.workspace = true\n'''\n",
+            "deepwyrm-abi"
+        ));
     }
 
     #[test]
@@ -1386,6 +1438,13 @@ mod tests {
         assert!(
             parse_workspace_members(
                 "[workspace]\nmembers = [\"loader\"]\n\"exclude\" = [\"loader\"]\n",
+                Path::new("Cargo.toml")
+            )
+            .is_err()
+        );
+        assert!(
+            parse_workspace_members(
+                "[package.metadata]\ndecoy = \"\"\"\n[workspace]\nmembers = [\"decoy\"]\n\"\"\"\n",
                 Path::new("Cargo.toml")
             )
             .is_err()
