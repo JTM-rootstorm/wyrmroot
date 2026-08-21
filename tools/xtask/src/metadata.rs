@@ -65,17 +65,18 @@ impl BuildManifest {
         self.validate_phase_a_states()?;
 
         let revision = self.required("deepwyrm.revision")?;
+        let repository_url = self.required("deepwyrm.repository")?;
         let root_manifest = read_file(&repository.join("Cargo.toml"))?;
-        if !root_manifest.contains("deepwyrm-abi") || !root_manifest.contains(revision) {
+        if !root_has_deepwyrm_dependency(&root_manifest, repository_url, revision) {
             return Err(Failure::task(format!(
-                "Cargo.toml does not pin deepwyrm-abi at manifest revision {revision}"
+                "Cargo.toml does not pin deepwyrm-abi at manifest repository {repository_url} and revision {revision}"
             )));
         }
 
         let lockfile = read_file(&repository.join("Cargo.lock"))?;
-        if !lockfile.contains("name = \"deepwyrm-abi\"") || !lockfile.contains(revision) {
+        if !lock_has_git_package(&lockfile, "deepwyrm-abi", repository_url, revision) {
             return Err(Failure::task(format!(
-                "Cargo.lock does not resolve deepwyrm-abi at manifest revision {revision}"
+                "Cargo.lock does not resolve deepwyrm-abi from manifest repository {repository_url} at revision {revision}"
             )));
         }
 
@@ -488,6 +489,19 @@ fn root_has_uefi_dependency(manifest: &str, version: &str) -> bool {
     })
 }
 
+fn root_has_deepwyrm_dependency(manifest: &str, repository: &str, revision: &str) -> bool {
+    manifest_inline_dependency(manifest, "workspace.dependencies", "deepwyrm-abi").is_some_and(
+        |fields| {
+            fields.len() == 2
+                && fields
+                    .get("git")
+                    .and_then(|value| basic_toml_string(value))
+                    .is_some_and(|actual| git_repositories_match(actual, repository))
+                && fields.get("rev").and_then(|value| basic_toml_string(value)) == Some(revision)
+        },
+    )
+}
+
 fn loader_has_optional_uefi_dependency(manifest: &str) -> bool {
     manifest_inline_dependency(manifest, "dependencies", "uefi").is_some_and(|fields| {
         fields.get("workspace").map(String::as_str) == Some("true")
@@ -502,8 +516,8 @@ fn manifest_inline_dependency(
 ) -> Option<BTreeMap<String, String>> {
     let mut section = "";
     for raw_line in manifest.lines() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
+        let line = toml_code(raw_line);
+        if line.is_empty() {
             continue;
         }
         if line.starts_with('[') && line.ends_with(']') {
@@ -594,7 +608,7 @@ fn lock_has_package(lockfile: &str, name: &str, version: &str) -> bool {
     lockfile.split("[[package]]").any(|package| {
         let mut found_name = false;
         let mut found_version = false;
-        for line in package.lines().map(str::trim) {
+        for line in package.lines().map(toml_code) {
             found_name |= line == format!("name = \"{name}\"");
             found_version |= line == format!("version = \"{version}\"");
         }
@@ -602,17 +616,105 @@ fn lock_has_package(lockfile: &str, name: &str, version: &str) -> bool {
     })
 }
 
+fn lock_has_git_package(lockfile: &str, name: &str, repository: &str, revision: &str) -> bool {
+    lockfile.split("[[package]]").skip(1).any(|package| {
+        let mut package_name = None;
+        let mut package_source = None;
+        for raw_line in package.lines() {
+            let line = toml_code(raw_line);
+            if line.is_empty() {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            match key.trim() {
+                "name" if package_name.is_none() => {
+                    package_name = basic_toml_string(value.trim());
+                }
+                "source" if package_source.is_none() => {
+                    package_source = basic_toml_string(value.trim());
+                }
+                "name" | "source" => return false,
+                _ => {}
+            }
+        }
+        package_name == Some(name)
+            && package_source
+                .is_some_and(|source| git_lock_source_matches(source, repository, revision))
+    })
+}
+
+fn git_lock_source_matches(source: &str, repository: &str, revision: &str) -> bool {
+    let Some(source) = source.strip_prefix("git+") else {
+        return false;
+    };
+    let Some((requested, locked_revision)) = source.rsplit_once('#') else {
+        return false;
+    };
+    if locked_revision != revision {
+        return false;
+    }
+    let Some((actual_repository, requested_revision)) = requested.rsplit_once("?rev=") else {
+        return false;
+    };
+    requested_revision == revision && git_repositories_match(actual_repository, repository)
+}
+
+fn git_repositories_match(left: &str, right: &str) -> bool {
+    fn normalized(repository: &str) -> &str {
+        repository.trim_end_matches('/').trim_end_matches(".git")
+    }
+
+    normalized(left) == normalized(right)
+}
+
+fn basic_toml_string(value: &str) -> Option<&str> {
+    let value = value.trim();
+    let contents = value.strip_prefix('"')?.strip_suffix('"')?;
+    if contents
+        .bytes()
+        .any(|byte| byte == b'"' || byte == b'\\' || byte.is_ascii_control())
+    {
+        return None;
+    }
+    Some(contents)
+}
+
+fn toml_code(line: &str) -> &str {
+    let mut quoted = None;
+    let mut escaped = false;
+    for (index, character) in line.char_indices() {
+        if let Some(quote) = quoted {
+            if quote == '"' && escaped {
+                escaped = false;
+            } else if quote == '"' && character == '\\' {
+                escaped = true;
+            } else if character == quote {
+                quoted = None;
+            }
+            continue;
+        }
+        match character {
+            '"' | '\'' => quoted = Some(character),
+            '#' => return line[..index].trim(),
+            _ => {}
+        }
+    }
+    line.trim()
+}
+
 fn has_abi_consumer(repository: &Path) -> Result<bool, Failure> {
     for relative in ["bootstrap", "crates", "loader", "userspace"] {
         let root = repository.join(relative);
-        if manifest_tree_contains(&root, "deepwyrm-abi")? {
+        if manifest_tree_has_workspace_dependency(&root, "deepwyrm-abi")? {
             return Ok(true);
         }
     }
     Ok(false)
 }
 
-fn manifest_tree_contains(root: &Path, needle: &str) -> Result<bool, Failure> {
+fn manifest_tree_has_workspace_dependency(root: &Path, dependency: &str) -> Result<bool, Failure> {
     for entry in fs::read_dir(root)
         .map_err(|error| Failure::task(format!("could not inspect {}: {error}", root.display())))?
     {
@@ -631,17 +733,82 @@ fn manifest_tree_contains(root: &Path, needle: &str) -> Result<bool, Failure> {
             )));
         }
         if file_type.is_dir() {
-            if manifest_tree_contains(&path, needle)? {
+            if manifest_tree_has_workspace_dependency(&path, dependency)? {
                 return Ok(true);
             }
         } else if file_type.is_file()
             && path.file_name().and_then(|name| name.to_str()) == Some("Cargo.toml")
-            && read_file(&path)?.contains(needle)
+            && manifest_consumes_workspace_dependency(&read_file(&path)?, dependency)
         {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+fn manifest_consumes_workspace_dependency(manifest: &str, dependency: &str) -> bool {
+    let mut section = String::new();
+    for raw_line in manifest.lines() {
+        let line = toml_code(raw_line);
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line[1..line.len() - 1].trim().to_owned();
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if dependency_table_section(&section, dependency) {
+            if key == "workspace" && value == "true" {
+                return true;
+            }
+            continue;
+        }
+        if !dependency_list_section(&section) {
+            continue;
+        }
+        if key == format!("{dependency}.workspace") && value == "true" {
+            return true;
+        }
+        if key == dependency
+            && value
+                .strip_prefix('{')
+                .and_then(|value| value.strip_suffix('}'))
+                .and_then(split_inline_table)
+                .is_some_and(|assignments| {
+                    assignments.into_iter().any(|assignment| {
+                        assignment.split_once('=').is_some_and(|(key, value)| {
+                            key.trim() == "workspace" && value.trim() == "true"
+                        })
+                    })
+                })
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn dependency_list_section(section: &str) -> bool {
+    matches!(
+        section,
+        "dependencies" | "dev-dependencies" | "build-dependencies"
+    ) || section.ends_with(".dependencies")
+        || section.ends_with(".dev-dependencies")
+        || section.ends_with(".build-dependencies")
+}
+
+fn dependency_table_section(section: &str, dependency: &str) -> bool {
+    ["dependencies", "dev-dependencies", "build-dependencies"]
+        .into_iter()
+        .any(|kind| {
+            section == format!("{kind}.{dependency}")
+                || section.ends_with(&format!(".{kind}.{dependency}"))
+        })
 }
 
 fn validate_reserved_target_policy(repository: &Path, native_target: &str) -> Result<(), Failure> {
@@ -727,8 +894,9 @@ fn checked_file_type(entry: &fs::DirEntry, root: &Path) -> Result<fs::FileType, 
 #[cfg(test)]
 mod tests {
     use super::{
-        BuildManifest, LoaderProfile, loader_has_optional_uefi_dependency, lock_has_package,
-        parse_scalar_toml, root_has_uefi_dependency, validate_loader_profile_components,
+        BuildManifest, LoaderProfile, loader_has_optional_uefi_dependency, lock_has_git_package,
+        lock_has_package, manifest_consumes_workspace_dependency, parse_scalar_toml,
+        root_has_deepwyrm_dependency, root_has_uefi_dependency, validate_loader_profile_components,
     };
     use std::collections::BTreeMap;
     use std::path::Path;
@@ -796,6 +964,97 @@ mod tests {
         let lockfile = "[[package]]\nname = \"uefi\"\nversion = \"0.38.0\"\n\n[[package]]\nname = \"other\"\nversion = \"0.39.0\"\n";
         assert!(!lock_has_package(lockfile, "uefi", "0.39.0"));
         assert!(lock_has_package(lockfile, "uefi", "0.38.0"));
+    }
+
+    #[test]
+    fn deepwyrm_manifest_pin_rejects_comment_and_metadata_decoys() {
+        const REPOSITORY: &str = "https://example.invalid/deepwyrm";
+        const REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
+        const OTHER_REVISION: &str = "fedcba9876543210fedcba9876543210fedcba98";
+
+        let valid = format!(
+            "[workspace.dependencies]\ndeepwyrm-abi = {{ git = \"{REPOSITORY}.git\", rev = \"{REVISION}\" }}\n"
+        );
+        assert!(root_has_deepwyrm_dependency(&valid, REPOSITORY, REVISION));
+
+        let comment_decoy = format!(
+            "[workspace.dependencies]\ndeepwyrm-abi = {{ git = \"{REPOSITORY}.git\", rev = \"{OTHER_REVISION}\" }} # expected {REVISION}\n# deepwyrm-abi = {{ git = \"{REPOSITORY}.git\", rev = \"{REVISION}\" }}\n"
+        );
+        assert!(!root_has_deepwyrm_dependency(
+            &comment_decoy,
+            REPOSITORY,
+            REVISION
+        ));
+
+        let metadata_decoy = format!(
+            "[workspace.dependencies]\ndeepwyrm-abi = {{ git = \"{REPOSITORY}.git\", rev = \"{OTHER_REVISION}\" }}\n[package.metadata]\ndeepwyrm-abi = {{ git = \"{REPOSITORY}.git\", rev = \"{REVISION}\" }}\n"
+        );
+        assert!(!root_has_deepwyrm_dependency(
+            &metadata_decoy,
+            REPOSITORY,
+            REVISION
+        ));
+    }
+
+    #[test]
+    fn deepwyrm_lock_pin_rejects_comment_and_package_decoys() {
+        const REPOSITORY: &str = "https://example.invalid/deepwyrm";
+        const REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
+        const OTHER_REVISION: &str = "fedcba9876543210fedcba9876543210fedcba98";
+
+        let valid = format!(
+            "[[package]]\nname = \"deepwyrm-abi\"\nversion = \"0.0.0\"\nsource = \"git+{REPOSITORY}.git?rev={REVISION}#{REVISION}\"\n"
+        );
+        assert!(lock_has_git_package(
+            &valid,
+            "deepwyrm-abi",
+            REPOSITORY,
+            REVISION
+        ));
+
+        let comment_decoy = format!(
+            "[[package]]\nname = \"deepwyrm-abi\"\nversion = \"0.0.0\"\nsource = \"git+{REPOSITORY}.git?rev={OTHER_REVISION}#{OTHER_REVISION}\" # expected {REVISION}\n# source = \"git+{REPOSITORY}.git?rev={REVISION}#{REVISION}\"\n"
+        );
+        assert!(!lock_has_git_package(
+            &comment_decoy,
+            "deepwyrm-abi",
+            REPOSITORY,
+            REVISION
+        ));
+
+        let other_package_decoy = format!(
+            "[[package]]\nname = \"deepwyrm-abi\"\nversion = \"0.0.0\"\nsource = \"git+{REPOSITORY}.git?rev={OTHER_REVISION}#{OTHER_REVISION}\"\n\n[[package]]\nname = \"unrelated\"\nversion = \"0.0.0\"\nsource = \"git+{REPOSITORY}.git?rev={REVISION}#{REVISION}\"\n"
+        );
+        assert!(!lock_has_git_package(
+            &other_package_decoy,
+            "deepwyrm-abi",
+            REPOSITORY,
+            REVISION
+        ));
+    }
+
+    #[test]
+    fn abi_consumer_check_requires_real_workspace_dependency() {
+        assert!(manifest_consumes_workspace_dependency(
+            "[dependencies]\ndeepwyrm-abi.workspace = true\n",
+            "deepwyrm-abi"
+        ));
+        assert!(manifest_consumes_workspace_dependency(
+            "[dependencies]\ndeepwyrm-abi = { workspace = true }\n",
+            "deepwyrm-abi"
+        ));
+        assert!(manifest_consumes_workspace_dependency(
+            "[dependencies.deepwyrm-abi]\nworkspace = true\n",
+            "deepwyrm-abi"
+        ));
+        assert!(!manifest_consumes_workspace_dependency(
+            "# deepwyrm-abi.workspace = true\n[package.metadata]\ndeepwyrm-abi.workspace = true\n",
+            "deepwyrm-abi"
+        ));
+        assert!(!manifest_consumes_workspace_dependency(
+            "[dependencies]\nunrelated = { package = \"deepwyrm-abi\", version = \"0.0.0\" } # deepwyrm-abi.workspace = true\n",
+            "deepwyrm-abi"
+        ));
     }
 
     #[test]
