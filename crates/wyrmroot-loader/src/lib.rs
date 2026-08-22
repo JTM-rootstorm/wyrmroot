@@ -1,12 +1,8 @@
-//! Userspace executable-loading support for Wyrmroot.
-//!
-//! This crate is a WYR0 bootstrap placeholder. Hostile-input ELF parsing, image layout,
-//! process mapping, capability delegation, and launch behavior are intentionally not
-//! implemented yet.
+//! Bounded userspace executable-loading support for Wyrmroot.
 
 #![no_std]
 #![forbid(unsafe_code)]
 
-mod elf;
-mod image;
+pub mod elf;
+pub mod image;
 mod process;
