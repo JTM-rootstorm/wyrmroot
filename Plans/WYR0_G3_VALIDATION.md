@@ -4,9 +4,9 @@
 
 **Review date:** 2026-08-22
 
-**Deepwyrm artifact revision:** `d3a21cc0e12a33f03efe30f2868f10c5ff9afe3d`
+**Deepwyrm artifact revision:** `65e4cb52cfe47d754f684da99edf8a9eb1622e94`
 
-**Wyrmroot artifact revision:** `3d7ff88b2c9ba6d17eada92fc185a37fff12fcfa`
+**Wyrmroot artifact revision:** `c5925a28d876935cd20a7a3f9d9df1c0800989fb`
 
 **Rust source revision:** `fc555b0e2ef86b8037b6069ef3157c4862fa028d`
 
@@ -19,7 +19,7 @@ artifact gate only. No designated-VM lifecycle or guest execution was performed;
 
 The revision-named accepted root is:
 
-`artifacts/dw0-g3/accepted/dw-d3a21cc0e12a__wyr-3d7ff88b2c9b__rust-fc555b0e2ef8/`
+`artifacts/dw0-g3/accepted/dw-65e4cb52cfe4__wyr-c5925a28d876__rust-fc555b0e2ef8/`
 
 Its `G3_EVIDENCE.toml` records source trees, toolchain identities, artifact sizes and hashes,
 inspection results, licensing boundaries, and host gates. `MANIFEST.sha256` verifies every promoted
@@ -63,15 +63,15 @@ revision `9954cbc053874c3076640c8cd9dc1c5bf5cf0647`; it does not create a path d
 
 | Artifact | Bytes | SHA-256 |
 |---|---:|---|
-| production `deepwyrm.elf` | 9,699,104 | `b0882e6e849c31b1881f286733a8c50831051080cdcf00d657de108253a7aa01` |
-| primordial test kernel | 10,074,288 | `f7682f796af2ab1245e1ec63a8224f3e492730a8838f988c844985e7873edaad` |
+| production `deepwyrm.elf` | 9,658,072 | `a1b4e7f2643b1dd843809cbe4cfe8c689ab49fad3f17e1e09f95e09fd79207cd` |
+| primordial test kernel | 9,827,768 | `1abca97d0f4cdd127f6144ba0826606debe236e19677e23adc64b87af0885dc9` |
 | `loader.efi` | 138,752 | `09427a9574979a6e1f64f493ebe0c50896e419e625ed3cd614992746d74d9beb` |
 | retained `loader.pdb` | 8,056,832 | `58f209ad2369bee1a378532046c04a9ed3fe24f596ea9056e231a6295519088d` |
 | `bootstrap.elf` | 17,520 | `5a825d6da2345f94659efdb5c7627cfcc35c212c88495d67f2dd5f15c599e995` |
 | `system/init0` input | 8,312 | `937464a104782ca8da3c99199e6866ce5779b0e274e0c0912656bc363b972907` |
 | `bin/hello` input | 8,312 | `5f5246a222670530e14ced2bf6bb2f442d47763d9298280fef4e845b859e127e` |
 | bootfs | 16,992 | `0a7722b4c9fe6f4fa6e194a4eeedad84b292f1a0f4b69c16fc0bdaab8333e8da` |
-| FAT32 ESP | 134,217,728 | `775426b47a7f95fe45e0344e51205548b5ad5655f2e985ab5d28f0a685eca937` |
+| FAT32 ESP | 134,217,728 | `b6afcf56e166d9a82dc2075c32f0f80d0f251c36ee896fe8c23681840a74a6a2` |
 
 The native bootstrap, init0, hello, and bootfs reproduce the reviewed D2 hashes under the promoted
 G3 compiler. Two independent bootfs builds and two independent ESP builds are byte-identical.
@@ -105,7 +105,7 @@ toolchain input, not copied project source. Exact component hashes are in `G3_EV
 
 - Deepwyrm locked workspace tests, 483 kernel unit tests, ABI generation check, strict Clippy,
   formatting, production freestanding target build, and primordial test-support target build pass.
-- Wyrmroot locked workspace/all-target tests pass, including 49 xtask tests with the pre-existing
+- Wyrmroot locked workspace/all-target tests pass, including 50 xtask tests with the pre-existing
   accepted-environment gate ignored; strict workspace/all-target Clippy and warning-denied docs pass.
 - Production native and UEFI rebuilds pass with warnings denied; all artifact, bootfs, image,
   formatting, diff, manifest-hash, and independent FAT checks pass.
@@ -119,6 +119,33 @@ code inside Wyrmroot's explicitly GPL-3.0-or-later xtask package. No third-party
 into either project, no component was relicensed, and no mixed-license tree was mechanically
 normalized. Toolchain inputs retain their upstream licenses and are recorded separately as build
 provenance.
+
+
+## Review remediation and re-promotion
+
+The first accepted G3 host set was reviewed after promotion and was superseded rather than silently
+left current. Deepwyrm `65e4cb52cfe47d754f684da99edf8a9eb1622e94` closes the live primordial
+mapping findings: recoverable table-candidate exhaustion now returns `DW_STATUS_NO_RESOURCES`,
+publisher-preparation failure returns `DW_STATUS_BAD_STATE`, every unused table candidate is recycled
+on construction and syscall error paths, and failed zeroed backing/table transitions return their
+linear grant. A source-contract regression prevents the reviewed panic paths from returning.
+
+Wyrmroot `c5925a28d876935cd20a7a3f9d9df1c0800989fb` makes mandatory post-build ESP
+inspection failure delete the newly created image and adds a regression for that poisoned-output
+case. The validation record also now contains the exact disposable Git URL-rewrite recipe used to
+replay the canonical pinned Deepwyrm Git dependency from a local clean checkout.
+
+Before rebuilding the fixed kernels, the accepted Rust/Cargo build recipe was replayed at the old
+Deepwyrm revision and reproduced both prior accepted kernel artifacts byte-for-byte. The same recipe
+then produced the fixed kernels above. Wyrmroot's `Cargo.toml`, `Cargo.lock`, loader, bootstrap,
+runtime, bootfs, `init0`, and `hello` producing trees are byte-identical between the previous artifact
+revision `3d7ff88b2c9ba6d17eada92fc185a37fff12fcfa` and the fixed G3 tooling revision, so those
+unchanged accepted guest artifacts were retained. The ESP was regenerated three times from the fixed
+kernel and unchanged paired Wyrmroot inputs; all three images are byte-identical.
+
+The previous artifact root
+`artifacts/dw0-g3/superseded/dw-d3a21cc0e12a__wyr-3d7ff88b2c9b__rust-fc555b0e2ef8/`
+is retained only as superseded evidence. It is no longer an accepted G3 candidate.
 
 ## Remaining gate
 
