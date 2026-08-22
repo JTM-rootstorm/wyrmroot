@@ -3,6 +3,8 @@ use deepwyrm_syscall::{
     DW_STATUS_BAD_HANDLE, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights,
 };
 use wyrmroot_bootfs::builder::{Builder, FileMode};
+#[cfg(feature = "primordial-test-support")]
+use wyrmroot_bootstrap::run_bootstrap_with_before_ready;
 use wyrmroot_bootstrap::{BootstrapError, BootstrapSystem, HELLO_PATH, INIT0_PATH, run_bootstrap};
 use wyrmroot_bootstrap_proto::{
     BOOTSTRAP_INIT_V1_SIZE, BootstrapMessage, InitMessage, ReadyMessage, decode,
@@ -152,6 +154,21 @@ fn malformed_protocol_closes_received_handles_without_ready() {
         run_bootstrap(&mut fixture, CHANNEL),
         Err(BootstrapError::Protocol(_))
     ));
+    assert_eq!(fixture.closed, [ROOT, BOOTFS]);
+    assert!(fixture.sent.is_empty());
+}
+
+#[cfg(feature = "primordial-test-support")]
+#[test]
+fn test_hook_runs_after_capability_cleanup_and_before_ready_or_channel_close() {
+    let mut fixture = Fixture::valid();
+    assert_eq!(
+        run_bootstrap_with_before_ready(&mut fixture, CHANNEL, |_| {
+            Err(BootstrapError::UnexpectedMessage)
+        }),
+        Err(BootstrapError::UnexpectedMessage)
+    );
+    assert!(fixture.mapped);
     assert_eq!(fixture.closed, [ROOT, BOOTFS]);
     assert!(fixture.sent.is_empty());
 }

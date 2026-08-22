@@ -15,6 +15,12 @@ mod entry;
 mod memory;
 mod native;
 mod startup;
+#[cfg(feature = "primordial-test-support")]
+#[allow(
+    unsafe_code,
+    reason = "explicitly selected primordial kernel-test variants own their isolated generated-veneer and terminal-fault boundaries"
+)]
+mod test_support;
 
 pub use bootstrap::{
     BOOTFS_EXPECTATION, BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityExpectation, CapabilityInfo,
@@ -30,4 +36,9 @@ pub use native::{
 pub use startup::{
     AUXILIARY_VECTOR_TERMINATOR, BootstrapChannelHandle, STARTUP_ABI_V1, STARTUP_BLOCK_SIZE,
     StartupBlock, StartupError, StartupRegisters, StartupString, with_native_startup,
+};
+#[cfg(feature = "primordial-test-support")]
+pub use test_support::{
+    PrimordialTestError, primordial_blocking_cleanup, trigger_invalid_syscall_return,
+    trigger_user_exception,
 };

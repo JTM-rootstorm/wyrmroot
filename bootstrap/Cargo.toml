@@ -19,6 +19,10 @@ required-features = ["native-bootstrap"]
 [features]
 default = []
 native-bootstrap = []
+primordial-test-support = ["wyrmroot-runtime/primordial-test-support"]
+primordial-blocking-cleanup = ["native-bootstrap", "primordial-test-support"]
+primordial-user-exception = ["native-bootstrap", "primordial-test-support"]
+primordial-invalid-return = ["native-bootstrap", "primordial-test-support"]
 
 [dependencies]
 deepwyrm-syscall.workspace = true

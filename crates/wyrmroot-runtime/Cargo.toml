@@ -9,6 +9,10 @@ description = "Minimal native runtime support for Wyrmroot"
 [lib]
 path = "src/lib.rs"
 
+[features]
+default = []
+primordial-test-support = []
+
 [dependencies]
 deepwyrm-syscall.workspace = true
 

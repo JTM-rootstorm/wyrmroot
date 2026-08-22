@@ -6,6 +6,8 @@ use core::panic::PanicInfo;
 
 use deepwyrm_syscall::{DwHandle, DwReceivedHandleInfoV1};
 use wyrmroot_bootfs as _;
+#[cfg(feature = "primordial-blocking-cleanup")]
+use wyrmroot_bootstrap::run_bootstrap_with_before_ready;
 use wyrmroot_bootstrap::{BootstrapSystem, run_bootstrap};
 use wyrmroot_bootstrap_proto as _;
 use wyrmroot_runtime::{
@@ -67,9 +69,46 @@ fn panic(_info: &PanicInfo<'_>) -> ! {
     panic_abort()
 }
 
+#[cfg(not(any(
+    feature = "primordial-blocking-cleanup",
+    feature = "primordial-user-exception",
+    feature = "primordial-invalid-return"
+)))]
 fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
     let mut system = NativeSystem;
     u32::from(run_bootstrap(&mut system, startup.bootstrap_channel().as_abi()).is_err())
+}
+
+#[cfg(feature = "primordial-blocking-cleanup")]
+fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
+    let mut system = NativeSystem;
+    let result = run_bootstrap_with_before_ready(
+        &mut system,
+        startup.bootstrap_channel().as_abi(),
+        |channel| {
+            wyrmroot_runtime::primordial_blocking_cleanup(channel)
+                .map_err(wyrmroot_bootstrap::BootstrapError::TestSupport)
+        },
+    );
+    u32::from(result.is_err())
+}
+
+#[cfg(feature = "primordial-user-exception")]
+fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
+    let mut system = NativeSystem;
+    if run_bootstrap(&mut system, startup.bootstrap_channel().as_abi()).is_err() {
+        return 1;
+    }
+    wyrmroot_runtime::trigger_user_exception()
+}
+
+#[cfg(feature = "primordial-invalid-return")]
+fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
+    let mut system = NativeSystem;
+    if run_bootstrap(&mut system, startup.bootstrap_channel().as_abi()).is_err() {
+        return 1;
+    }
+    wyrmroot_runtime::trigger_invalid_syscall_return()
 }
 
 wyrmroot_runtime::native_entry!(crate::bootstrap_main);

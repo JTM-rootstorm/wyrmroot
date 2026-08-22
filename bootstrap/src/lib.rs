@@ -3,12 +3,30 @@
 
 //! Primordial Wyrmroot bootstrap transaction shared by the native entry and host fixtures.
 
+#[cfg(any(
+    all(
+        feature = "primordial-blocking-cleanup",
+        feature = "primordial-user-exception"
+    ),
+    all(
+        feature = "primordial-blocking-cleanup",
+        feature = "primordial-invalid-return"
+    ),
+    all(
+        feature = "primordial-user-exception",
+        feature = "primordial-invalid-return"
+    )
+))]
+compile_error!("primordial bootstrap test variants are mutually exclusive");
+
 use deepwyrm_syscall::{DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights};
 use wyrmroot_bootfs::archive::{Archive, LookupError, ParseError};
 use wyrmroot_bootstrap_proto::{
     BOOTSTRAP_INIT_V1_SIZE, BOOTSTRAP_READY_V1_SIZE, BootstrapMessage, DecodeError, InitMessage,
     MAX_BOOTSTRAP_HANDLES, ReadyMessage, decode,
 };
+#[cfg(feature = "primordial-test-support")]
+use wyrmroot_runtime::PrimordialTestError;
 use wyrmroot_runtime::{
     BOOTFS_EXPECTATION, BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, CapabilityValidationError,
     InitCapability, MappingPlan, MappingPlanError, NativeError, ReceiveCounts,
@@ -78,12 +96,33 @@ pub enum BootstrapError {
     MissingRequiredEntry,
     /// A required bootfs entry was not immutable executable content.
     RequiredEntryNotExecutable,
+    /// An explicitly selected primordial kernel-test behavior failed closed.
+    #[cfg(feature = "primordial-test-support")]
+    TestSupport(PrimordialTestError),
 }
 
 /// Executes the complete D2 bootstrap handshake without exiting the process.
 pub fn run_bootstrap<System: BootstrapSystem>(
     system: &mut System,
     bootstrap_channel: DwHandle,
+) -> Result<(), BootstrapError> {
+    run_bootstrap_inner(system, bootstrap_channel, |_| Ok(()))
+}
+
+/// Executes the bootstrap transaction with one explicit test-only hook before READY and close.
+#[cfg(feature = "primordial-test-support")]
+pub fn run_bootstrap_with_before_ready<System: BootstrapSystem>(
+    system: &mut System,
+    bootstrap_channel: DwHandle,
+    before_ready: impl FnOnce(DwHandle) -> Result<(), BootstrapError>,
+) -> Result<(), BootstrapError> {
+    run_bootstrap_inner(system, bootstrap_channel, before_ready)
+}
+
+fn run_bootstrap_inner<System: BootstrapSystem>(
+    system: &mut System,
+    bootstrap_channel: DwHandle,
+    before_ready: impl FnOnce(DwHandle) -> Result<(), BootstrapError>,
 ) -> Result<(), BootstrapError> {
     let channel_info = system
         .query_capability_info(bootstrap_channel)
@@ -115,6 +154,7 @@ pub fn run_bootstrap<System: BootstrapSystem>(
     let cleanup = close_received_handles(system, &handles[..counts.handles]);
     let transaction_id = operation?;
     cleanup?;
+    before_ready(bootstrap_channel)?;
 
     let mut ready = [0_u8; BOOTSTRAP_READY_V1_SIZE];
     let ready_size = ReadyMessage { transaction_id }
