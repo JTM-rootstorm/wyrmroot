@@ -165,8 +165,9 @@ soft-float ABI and disables hardware FP/vector features. Wyrmroot
 kernel, native, bootfs, and ESP artifacts were rebuilt and re-inspected before canonical G4.
 
 Accordingly, the formerly accepted root
-`artifacts/dw0-g3/accepted/dw-65e4cb52cfe4__wyr-c5925a28d876__rust-fc555b0e2ef8/` is retained as
-historical evidence but is superseded by the revision-named root at the top of this record.
+`artifacts/dw0-g3/superseded/dw-65e4cb52cfe4__wyr-c5925a28d876__rust-fc555b0e2ef8/` is retained as
+historical evidence. The `accepted/` namespace now contains only the revision-named G4 candidate at
+the top of this record.
 
 ## G4 live disposition
 
@@ -176,5 +177,14 @@ PASS/detail zero after capability-bearing INIT, read-only bootfs validation, REA
 Libvirt observed guest-request shutdown. The inactive domain XML was restored byte-for-byte to
 SHA-256 `a823095e2182f848be0c15fe1a88728fce9f126fbc55e7d9aab30d84a6c5d3c3`; UUID, shutoff state,
 disabled autostart, absent managed save/NVRAM, primary disk identity, and empty network set reproduce.
-`G4_EVIDENCE.toml` records the exact profile and hashes. G5 remains open, so this does not yet claim
-DW0-G full acceptance or progression to DW0-H.
+`G4_EVIDENCE.toml` records the exact profile and hashes. A post-acceptance Sol review also closed the
+evidence-hygiene findings without changing the candidate: the older G3 root was moved out of
+`accepted/`; primary-disk continuity is now recorded as an explicit campaign bookend from run 01
+preflight through run 19 post-run and the current restored domain, while the empty `qemu-img` probe
+files are explicitly excluded from that proof. The libvirt-effective profile synthesized an xHCI
+controller, PS/2 inputs, `audio type=none`, and an ITCO watchdog, but still had no network interface,
+host filesystem share, graphics device, functional audio backend, or attached USB device. Under
+libvirt the direct-QEMU numeric status 33 was not captured; the retained evidence instead records the
+unique checksum-valid PASS serial record followed immediately by `Shutdown Finished after guest
+request`, matching the test transport's serial-before-`isa-debug-exit` ordering. G5 remains open, so
+this does not yet claim DW0-G full acceptance or progression to DW0-H.
