@@ -51,4 +51,4 @@ Architecture documents define design contracts. Validation and security evidence
 
 ## License
 
-Wyrmroot's repository default is [GPL-2.0-or-later](LICENSE). Selected, explicitly identified leaf applications and host tools use `GPL-3.0-or-later`; reusable runtime/protocol/loader/bootfs foundations remain 2+. See [LICENSING.md](LICENSING.md) for the authoritative component map and contributor rules.
+Wyrmroot currently uses a component-aware mix: the repository fallback and several existing foundations are [GPL-2.0-or-later](LICENSE), while selected applications and tools are `GPL-3.0-or-later`. New wholly first-party project code defaults to GPL-3.0-or-later; GPLv2-compatible lanes are selected when actual provenance or combination requirements call for them. See [LICENSING.md](LICENSING.md) for the authoritative current map and provenance rules.
