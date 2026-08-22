@@ -219,7 +219,8 @@ hashes to `67c88666079db335d5aa81414c553c140e394a5ebdee2706267ae6e8bd58aac0`.
 Wyrmroot `21e4c1a05a62a00ee7a97babdcecea97bba909f1` commits the exact
 `RUST-WYR0-G5-X87-003` provenance record and closes the final evidence-only Low.
 
-G5 is accepted. P0 is closed by `../../DW0_G_P0_ACCOUNTING_RECONCILIATION.md` and the corresponding
-WYR0-B/C validation updates. DW0-G is therefore FULL ACCEPTED for progression to DW0-H and WYR0-D is
-FULL ACCEPTED. This still makes no general-exec, SMP, preemption, real-time, i386, physical-hardware,
+G5 is accepted. P0 was closed by the corresponding WYR0-B/C validation updates and retained exact
+accounting evidence; the one-off root reconciliation record has since been retired with the completed G
+coordination material and remains available in Git history. DW0-G is therefore FULL ACCEPTED for
+progression to DW0-H and WYR0-D is FULL ACCEPTED. This still makes no general-exec, SMP, preemption, real-time, i386, physical-hardware,
 full-WYR0-F, or full-Wyrmroot claim.
