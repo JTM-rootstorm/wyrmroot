@@ -86,3 +86,16 @@ The following remain intentionally deferred:
   later phases;
 - coverage-guided fuzzing as release-candidate hardening beyond the deterministic mutation and
   minimized regression suite used here.
+
+## P0 closure-continuity confirmation — 2026-08-22
+
+The final G5 artifact-producing Wyrmroot revision `f433baf36d671f3f8b515adf5f613bd01dc8bbb9` preserves
+every original WYR0-C library source as the exact Git object reviewed at
+`cdd33aa3d629d01b65f511ceee79cb3db0f4c65e`: `archive.rs` `681a02d4...`, `builder.rs`
+`a8d375e9...`, `content.rs` `752948aa...`, `lib.rs` `f2c119db...`, `limits.rs` `4f824ffc...`, and
+`path.rs` `437940a1...`. `Plans/WYR0_BOOTFS_FORMAT_CONTRACT.md` is likewise unchanged at object
+`e6a3fa9d8d4f9e88141084bdea22aa0e8ec32d10`. Later crate changes add only a host-side
+`src/bin/build.rs` wrapper and license metadata; they do not modify the reviewed parser/builder library.
+
+The existing WYR0-C security disposition therefore remains current. **WYR0-C remains FULL ACCEPTED for
+phase accounting**, with later runtime authority/mapping behavior owned by the subsequent WYR0-D/F gates.

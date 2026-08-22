@@ -1,7 +1,8 @@
 # WYR0-B validation record
 
 This document records changing WYR0-B implementation and validation evidence. It is not a
-substitute for the repository README and does not claim that the WYR0-B phase gate has closed.
+substitute for the repository README. The historical source/artifact checkpoints below retain their
+original scope; the final P0 reconciliation at the end closes the formerly pending manager-owned VM gate.
 
 ## Loader implementation checkpoint
 
@@ -67,8 +68,9 @@ return edge.
 WYR0-B implementation, host security, accepted loader build, PE inspection, and path-neutral
 artifact provenance gates are complete for the tested revision pair.
 
-No VM or QEMU/OVMF acceptance claim exists for this checkpoint. The manager-owned paired Q35/UEFI
-serial and handoff gate remains required before WYR0-B phase closure.
+No VM or QEMU/OVMF acceptance claim existed for this historical checkpoint. The later P0
+reconciliation below binds the formerly pending manager-owned Q35/UEFI serial/handoff gate to exact
+retained F12/F14 evidence without relabeling this earlier checkpoint as a VM run.
 
 ## Layout-v2 paging-handoff descendant
 
@@ -117,8 +119,9 @@ does not itself claim behavioral handoff conformance. PDB public symbols place
 clear RBP; jmp RDX`, with no call or return edge.
 
 The source, host, accepted-build, PE, provenance, and adversarial-review gates pass for this clean
-descendant. The root-coordinator-owned exact-pair VM BootInfo/carrier handoff gate remains pending;
-this record does not claim VM, QEMU/OVMF, or physical-hardware acceptance.
+descendant. At this historical checkpoint the root-coordinator-owned exact-pair VM BootInfo/carrier
+handoff gate was still pending; the final P0 reconciliation below closes that later accounting debt.
+This checkpoint itself does not claim VM, QEMU/OVMF, or physical-hardware acceptance.
 
 ## 128-KiB kernel boot-stack descendant
 
@@ -251,6 +254,23 @@ Deepwyrm revision in `Cargo.toml`, `Cargo.lock`, `toolchain/versions.toml`, and
 
 The historical artifact provenance therefore continues to name its original
 generating revisions and must not be read as freshly generated evidence for
-`eaaba1491c2f45d4fbd8b02358989547e9a8d98a`. Exact-pair VM execution remains
-root-coordinator-owned and pending; this mapping claims no VM, QEMU/OVMF,
+`eaaba1491c2f45d4fbd8b02358989547e9a8d98a`. Exact-pair VM execution was still
+root-coordinator-owned and pending at this publication-mapping checkpoint; the final P0 reconciliation
+below closes that later accounting debt. This mapping itself claims no VM, QEMU/OVMF,
 BootInfo/carrier execution, or physical-hardware acceptance.
+
+## P0 manager-owned VM reconciliation — CLOSED 2026-08-22
+
+The stale WYR0-B VM debt is satisfied by retained coordinator-owned evidence. Canonical F12 used
+Deepwyrm `6de5af17dfef979aeadc150ce3958cd941fedbb2`, Wyrmroot
+`b6ed32f104bb4579dbeaa815ab7bd0e0a7c18311`, and loader SHA-256
+`4afac804d519fcbd9e41db25614e3d274b83e5815494d466a791b33d276191dc`; the designated q35/OVMF
+gate passed and restored byte-identically. F14 used Wyrmroot
+`edc1071f78f4418c05e5bd0762b1c3fb760df094` and executed the same loader hash. Git objects prove
+F12/F14 `loader` tree `cc4718e4a5899c95f1fb75bd1d70dea56d231671` and
+`crates/wyrmroot-loader` tree `d8d4108b8ade2f9da141ce0ecf15b6f99156946d` are identical; both manifest and
+lockfile consume exact Deepwyrm pin `6de5af17dfef979aeadc150ce3958cd941fedbb2`. The F13 Daybreak Wyrmroot
+lane reviewed `b6ed32f1..edc1071f` with no unresolved Critical, High, or Medium product finding.
+
+This closes only the stale manager-owned Q35/UEFI accounting item. Every accepted Medium limitation in
+`security/WYR0_B_SECURITY_REVIEW.md` remains in force. **WYR0-B is FULL ACCEPTED for phase accounting.**

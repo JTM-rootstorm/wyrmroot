@@ -36,4 +36,5 @@ restoration.
 
 Final exact-diff cross-boundary disposition is C0/H0/M0/L0. This closes the Wyrmroot side of DW0-G5
 and supports WYR0-D acceptance evidence, but it does not close full WYR0-F or any later Wyrmroot
-phase. The coordination plan's separate P0 accounting lane remains open.
+phase. The coordination plan's separate P0 lane was subsequently closed from retained F12/F14
+accounting evidence, allowing WYR0-D FULL ACCEPTED without changing this security disposition.

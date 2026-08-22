@@ -53,3 +53,12 @@ That capability and mapping work belongs to WYR0-F and was not implemented or im
 - Focused and unfiltered central host build/test commands: passed.
 - Final independent read-only security review: passed with no Critical, High, or Medium findings.
 - No VM/QEMU, Rust-fork, README-status, or Deepwyrm ABI changes occurred.
+
+## P0 continuity note — 2026-08-22
+
+The P0 accounting reconciliation mechanically compared the original WYR0-C closure revision
+`cdd33aa3d629d01b65f511ceee79cb3db0f4c65e` with final G5 artifact-producing Wyrmroot
+`f433baf36d671f3f8b515adf5f613bd01dc8bbb9`. Every reviewed bootfs library source file and the
+WYR0-C format contract retain the exact same Git object identity. Later crate changes are limited to
+a host-side build wrapper and license metadata. No parser, builder, path, content, or limit behavior
+covered by this security review changed, so this review remains current for WYR0-C phase accounting.

@@ -1,6 +1,6 @@
 # DW0-G3 Paired Artifact Validation
 
-**Status:** G3 re-promoted, G4 accepted, and G5 Daybreak remediation accepted; P0 accounting remains open
+**Status:** G3/G4/G5 accepted; P0 accounting reconciled; DW0-G and WYR0-D final accounting accepted
 
 **Review date:** 2026-08-22
 
@@ -17,8 +17,8 @@ the real primordial launch path, and Wyrmroot provides the exact loader, native 
 native payloads, bootfs, and deterministic FAT32 ESP consumed by that path. Canonical G4 run 19
 then booted the paired test ESP through the designated VM and passed selector 18 with detail zero.
 The subsequent G5 Daybreak gate found and remediated terminal lifecycle and target-feature defects,
-then passed exact-diff rereview. P0 remains a separate accounting gate, so this does not yet claim
-DW0-G full acceptance.
+then passed exact-diff rereview. P0 was subsequently reconciled from retained exact F12/F14 evidence,
+so the paired coordination gate now supports DW0-G and WYR0-D final acceptance.
 
 The revision-named accepted root is:
 
@@ -219,6 +219,7 @@ hashes to `67c88666079db335d5aa81414c553c140e394a5ebdee2706267ae6e8bd58aac0`.
 Wyrmroot `21e4c1a05a62a00ee7a97babdcecea97bba909f1` commits the exact
 `RUST-WYR0-G5-X87-003` provenance record and closes the final evidence-only Low.
 
-G5 is accepted. P0 remains open, so this record does not claim DW0-G full acceptance or progression
-to DW0-H. It also makes no general-exec, SMP, preemption, real-time, i386, physical-hardware, or
-full-Wyrmroot claim.
+G5 is accepted. P0 is closed by `../../DW0_G_P0_ACCOUNTING_RECONCILIATION.md` and the corresponding
+WYR0-B/C validation updates. DW0-G is therefore FULL ACCEPTED for progression to DW0-H and WYR0-D is
+FULL ACCEPTED. This still makes no general-exec, SMP, preemption, real-time, i386, physical-hardware,
+full-WYR0-F, or full-Wyrmroot claim.

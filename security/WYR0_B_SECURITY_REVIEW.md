@@ -8,8 +8,8 @@ and loader artifact provenance for WYR0-B. It does not review or authorize
 WYR0-C bootfs-format/runtime behavior.
 
 The source, host-test, and accepted-toolchain artifact reviews are complete
-with no Critical or High findings. WYR0-B remains open until the manager-owned
-paired VM gate passes against the exact committed revisions and artifacts.
+with no Critical or High findings. The formerly pending manager-owned paired VM
+gate is closed by the P0 reconciliation recorded below; the accepted Medium limitations remain in force.
 
 ## Closed findings
 
@@ -143,5 +143,8 @@ paired VM gate passes against the exact committed revisions and artifacts.
   historical identities, not regenerated evidence for the live quartet. The
   old chain remains reachable in this publication-preparation checkout at
   `refs/backup/wyrmroot/pre-publication-main-20260816-89235c7`.
-- Pending: manager-owned Q35/UEFI serial and handoff evidence. No QEMU or VM
-  evidence is claimed by this document yet.
+- Closed by P0 accounting reconciliation: retained canonical F12/F14 evidence proves the same
+  loader source trees, exact Deepwyrm pin, executed loader SHA-256 `4afac804...`, successful designated
+  q35/UEFI handoff, and byte-identical restoration. This document does not invent a new VM run; it
+  incorporates that later exact-pair evidence for phase accounting. The accepted Medium limitations
+  above remain unchanged.
