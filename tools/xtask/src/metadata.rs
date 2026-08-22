@@ -120,7 +120,7 @@ impl BuildManifest {
 
     fn validate_phase_a_states(&self) -> Result<(), Failure> {
         self.expect("deepwyrm.abi_dependency_state", "available")?;
-        self.expect("rust.native_target_state", "reserved-not-yet-implemented")?;
+        self.expect("rust.native_target_state", "available")?;
         Ok(())
     }
 
@@ -134,12 +134,7 @@ impl BuildManifest {
             self.required("rust.native_target")?,
             &path,
         )?;
-        expect_map_value(
-            &values,
-            "native_guest.target_state",
-            "reserved-not-yet-implemented",
-            &path,
-        )?;
+        expect_map_value(&values, "native_guest.target_state", "available", &path)?;
         expect_map_value(&values, "native_guest.host_libc", "prohibited", &path)?;
         expect_map_value(
             &values,
@@ -1180,12 +1175,12 @@ mod tests {
             .expect("host metadata validation must remain independently runnable");
         assert!(pending.validate_phase_a_states().is_err());
 
-        let ready = phase_a_manifest("available", "reserved-not-yet-implemented");
+        let ready = phase_a_manifest("available", "available");
         ready
             .validate_phase_a_states()
-            .expect("available ABI with a reserved target is the WYR0-A build state");
+            .expect("available ABI and native target are the accepted WYR0-D build state");
 
-        let premature_target = phase_a_manifest("available", "implemented");
+        let premature_target = phase_a_manifest("available", "reserved-not-yet-implemented");
         assert!(premature_target.validate_phase_a_states().is_err());
     }
 

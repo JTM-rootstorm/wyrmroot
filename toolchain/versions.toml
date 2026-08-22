@@ -12,10 +12,10 @@ upstream_repository = "https://github.com/rust-lang/rust"
 upstream_stable_release = "1.97.1"
 upstream_stable_revision = "8bab26f4f68e0e26f0bb7960be334d5b520ea452"
 fork_repository = "git@github.com:JTM-rootstorm/rust.git"
-wyrmroot_revision = "8bab26f4f68e0e26f0bb7960be334d5b520ea452"
-local_toolchain_name = "wyrmroot-1.97.1-8bab26f4"
+wyrmroot_revision = "fc555b0e2ef86b8037b6069ef3157c4862fa028d"
+local_toolchain_name = "wyrmroot-1.97.1-fc555b0e"
 native_target = "x86_64-unknown-wyrmroot"
-native_target_state = "reserved-not-yet-implemented"
+native_target_state = "available"
 
 [llvm]
 canonical_c_compiler = "clang"

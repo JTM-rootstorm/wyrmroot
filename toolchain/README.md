@@ -16,10 +16,10 @@ the build gate rejects a missing lockfile resolution or consumer. Never replace
 that dependency with copied ABI definitions, a floating branch, or a committed
 host-local path.
 
-The native Rust target name is reserved for coordinated work in the Wyrmroot
-Rust fork. The metadata does not claim that `x86_64-unknown-wyrmroot` exists at
-the pinned commit, and build configuration must not emulate it with an
-unreviewed target JSON or mark it as `cfg(unix)`.
+The pinned Wyrmroot Rust fork implements `x86_64-unknown-wyrmroot` as a built-in
+static ELF target. It does not claim `cfg(unix)`, provide `std`, or authorize a
+target JSON substitute. The accepted R0 request record binds the target source,
+focused tests, `core`/compiler-builtins artifacts, and no-libc smoke ELF.
 
 ## Rust toolchain activation
 
@@ -42,9 +42,9 @@ corresponding rebuild and validation.
 
 `profiles.toml` is the machine-readable WYR0 profile policy. It keeps the
 host, UEFI-loader, and native-guest environments distinct without activating a
-guest Cargo target prematurely. In particular, the native target remains
-reserved until the pinned Wyrmroot Rust fork implements it; no target JSON,
-`cfg(unix)` compatibility setting, or host-default fallback is authorized.
+guest Cargo target prematurely. The native target is available at the exact
+fork revision in `versions.toml`; no target JSON, `cfg(unix)` compatibility
+setting, or host-default fallback is authorized.
 
 The UEFI profile names the standard 64-bit UEFI Rust target, but it too must be
 confirmed against the accepted pinned fork before it is used to build an

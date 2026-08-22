@@ -1,0 +1,39 @@
+schema_version = 1
+request_id = "RUST-WYR0-R0-TARGET-001"
+status = "accepted-immutable-artifact"
+request_kind = "implement-and-build-wyrmroot-native-target"
+artifact_root = "/home/mike/Documents/Programming/OS-Project/.artifacts/g1-r0-d1/r0-accepted"
+configuration_sha256 = "52fa9c8d56a71f91a2c964cb7165bc8b24ea62bb88621600449f0aa6da82e8be"
+
+[requirement]
+phase_gate = "DW0-G Rust R0 native target"
+consumer_repository = "wyrmroot"
+expected_behavior = "Provide a built-in static x86_64 Wyrmroot ELF target with no Unix family, libc, CRT, dynamic interpreter, TLS, or unwinding runtime contract."
+
+[rust]
+canonical_base_commit = "8bab26f4f68e0e26f0bb7960be334d5b520ea452"
+accepted_commit = "fc555b0e2ef86b8037b6069ef3157c4862fa028d"
+fork_repository = "git@github.com:JTM-rootstorm/rust.git"
+target = "x86_64-unknown-wyrmroot"
+stage = 1
+bootstrap_configuration = "default bootstrap configuration; BOOTSTRAP_SKIP_TARGET_SANITY=1 only for the new-target stage0 sanity bypass"
+components = ["core", "compiler-builtins", "rust-lld"]
+
+[validation]
+rustc_target_tests = "passed-329"
+target_cfg_ui_test = "passed-1"
+core_build = "passed"
+compiler_builtins_build = "passed"
+smoke_elf = "ELF64 little-endian x86-64 ET_EXEC; PHDR plus two PT_LOAD plus non-executable PT_GNU_STACK; no PT_INTERP, dynamic section, relocations, libc, or Unix target family"
+
+[artifacts]
+core_sha256 = "5c13dd7a1d99959e098349e5f599e78445c254061fde8540bffc3946014c5513"
+compiler_builtins_sha256 = "50f05249f9ee79885ef462214f7d4532a158ac737df6647406dbe90494ae5f39"
+rust_lld_sha256 = "38a9f28404309892f9c9afe02fa4979a0d9e8bc866979cde09f5bb7ec17e5721"
+smoke_elf_sha256 = "a1af8e5296c2188366f5681dffa93bfac28f2ce05f6e7749a207581a4af7a1e2"
+
+[policy]
+human_reviewer = "not-required-no-rust-local-policy-present"
+soundness_classification = "target-specification-and-static-runtime-boundary"
+source_edit_requested = true
+notes = "The Rust checkout contained no repository-local AGENTS.md, so the workspace policy governed this isolated lane. The accepted artifacts are read-only, request-scoped copies. No std, alloc, TLS, unwinding, thread runtime, libc, CRT, dynamic linker, target JSON, or cfg(unix) claim is accepted."
