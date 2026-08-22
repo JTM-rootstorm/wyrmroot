@@ -97,9 +97,13 @@ impl BuildManifest {
                 "no Wyrmroot workspace crate consumes the pinned deepwyrm-abi dependency",
             ));
         }
-        if !has_workspace_dependency_consumer(repository, "deepwyrm-syscall")? {
+        if !workspace_member_consumes_dependency(
+            repository,
+            "crates/wyrmroot-runtime",
+            "deepwyrm-syscall",
+        )? {
             return Err(Failure::task(
-                "no Wyrmroot workspace crate consumes the pinned deepwyrm-syscall dependency",
+                "crates/wyrmroot-runtime does not consume the pinned deepwyrm-syscall dependency",
             ));
         }
 
@@ -826,6 +830,24 @@ fn has_workspace_dependency_consumer(repository: &Path, dependency: &str) -> Res
     Ok(false)
 }
 
+fn workspace_member_consumes_dependency(
+    repository: &Path,
+    member: &str,
+    dependency: &str,
+) -> Result<bool, Failure> {
+    let root_manifest_path = repository.join("Cargo.toml");
+    let root_manifest = read_file(&root_manifest_path)?;
+    let members = parse_workspace_members(&root_manifest, &root_manifest_path)?;
+    if !members.contains(member) {
+        return Ok(false);
+    }
+    let manifest = workspace_member_manifest(repository, member)?;
+    Ok(manifest_consumes_workspace_dependency(
+        &read_file(&manifest)?,
+        dependency,
+    ))
+}
+
 fn parse_workspace_members(manifest: &str, path: &Path) -> Result<BTreeSet<String>, Failure> {
     if contains_toml_multiline_string(manifest) {
         return Err(Failure::task(format!(
@@ -1173,6 +1195,7 @@ mod tests {
         lock_has_git_package, lock_has_package, manifest_consumes_workspace_dependency,
         parse_scalar_toml, parse_workspace_members, root_has_deepwyrm_dependency,
         root_has_deepwyrm_package, root_has_uefi_dependency, validate_loader_profile_components,
+        workspace_member_consumes_dependency,
     };
     use std::collections::BTreeMap;
     use std::path::Path;
@@ -1527,6 +1550,64 @@ mod tests {
         assert!(has_abi_consumer(&root).expect("inspect consuming workspace"));
 
         std::fs::remove_dir_all(&root).expect("remove workspace fixture");
+    }
+
+    #[test]
+    fn syscall_consumer_is_bound_to_the_runtime_workspace_member() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock precedes Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "wyrmroot-xtask-runtime-consumer-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let runtime = root.join("crates/wyrmroot-runtime");
+        let decoy = root.join("crates/decoy");
+        std::fs::create_dir_all(&runtime).expect("create runtime fixture");
+        std::fs::create_dir_all(&decoy).expect("create decoy fixture");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/wyrmroot-runtime\", \"crates/decoy\"]\n",
+        )
+        .expect("write workspace fixture");
+        std::fs::write(
+            runtime.join("Cargo.toml"),
+            "[package]\nname = \"runtime\"\n",
+        )
+        .expect("write runtime manifest");
+        std::fs::write(
+            decoy.join("Cargo.toml"),
+            "[dependencies]\ndeepwyrm-syscall.workspace = true\n",
+        )
+        .expect("write decoy manifest");
+
+        assert!(
+            !workspace_member_consumes_dependency(
+                &root,
+                "crates/wyrmroot-runtime",
+                "deepwyrm-syscall",
+            )
+            .expect("inspect non-consuming runtime")
+        );
+
+        std::fs::write(
+            runtime.join("Cargo.toml"),
+            "[dependencies]\ndeepwyrm-syscall.workspace = true\n",
+        )
+        .expect("write consuming runtime manifest");
+        assert!(
+            workspace_member_consumes_dependency(
+                &root,
+                "crates/wyrmroot-runtime",
+                "deepwyrm-syscall",
+            )
+            .expect("inspect consuming runtime")
+        );
+
+        std::fs::remove_dir_all(&root).expect("remove runtime consumer fixture");
     }
 
     #[test]
