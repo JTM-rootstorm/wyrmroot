@@ -13,7 +13,7 @@ if [ -L "$artifact" ] || [ ! -f "$artifact" ] || [ ! -s "$artifact" ]; then
     exit 1
 fi
 
-for tool in awk llvm-readelf llvm-nm llvm-objdump sha256sum; do
+for tool in awk llvm-readelf llvm-readobj llvm-nm llvm-objdump sha256sum; do
     command -v "$tool" >/dev/null 2>&1 || {
         printf 'required inspection tool unavailable: %s\n' "$tool" >&2
         exit 1
@@ -21,6 +21,7 @@ for tool in awk llvm-readelf llvm-nm llvm-objdump sha256sum; do
 done
 
 headers=$(llvm-readelf --file-header --program-headers --wide "$artifact")
+raw_programs=$(llvm-readobj --program-headers "$artifact")
 dynamic=$(llvm-readelf --dynamic "$artifact")
 relocations=$(llvm-readelf --relocations "$artifact")
 undefined=$(llvm-nm --undefined-only "$artifact")
@@ -39,6 +40,8 @@ require_header 'Data:[[:space:]]+2.s complement, little endian$' 'little-endian 
 require_header 'Version:[[:space:]]+1 \(current\)$' 'current ELF version'
 require_header 'Type:[[:space:]]+EXEC \(Executable file\)$' 'fixed ET_EXEC'
 require_header 'Machine:[[:space:]]+Advanced Micro Devices X86-64$' 'x86-64 machine'
+require_header 'Size of this header:[[:space:]]+64 \(bytes\)$' '64-byte ELF header'
+require_header 'Size of program headers:[[:space:]]+56 \(bytes\)$' '56-byte program headers'
 
 size=$(wc -c < "$artifact" | tr -d ' ')
 if [ "$size" -gt $((16 * 1024 * 1024)) ]; then
@@ -72,6 +75,21 @@ if printf '%s\n' "$programs" | awk '$1 == "LOAD" && /W/ && /E/ { found=1 } END {
 fi
 if printf '%s\n' "$programs" | awk '$1 == "GNU_STACK" && /E/ { found=1 } END { exit !found }'; then
     printf '%s\n' 'native artifact requests an executable stack' >&2
+    exit 1
+fi
+if printf '%s\n' "$raw_programs" | awk '
+    /^[[:space:]]*Type: / { type=$2; next }
+    type != "" && /^[[:space:]]*Flags \[ \(0x/ {
+        raw=$3
+        gsub(/[()]/, "", raw)
+        flags=strtonum(raw)
+        if (type == "PT_LOAD" && flags != 4 && flags != 5 && flags != 6) bad=1
+        if (type == "PT_GNU_STACK" && (flags > 7 || and(flags, 1) != 0)) bad=1
+        type=""
+    }
+    END { exit !bad }
+'; then
+    printf '%s\n' 'native artifact contains raw program-header permission bits outside the primordial subset' >&2
     exit 1
 fi
 

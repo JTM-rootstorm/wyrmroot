@@ -6,7 +6,7 @@
 use deepwyrm_syscall::{DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights};
 use wyrmroot_bootfs::archive::{Archive, LookupError, ParseError};
 use wyrmroot_bootstrap_proto::{
-    BOOTSTRAP_INIT_V1_SIZE, BOOTSTRAP_READY_V1_SIZE, BootstrapMessage, DecodeError,
+    BOOTSTRAP_INIT_V1_SIZE, BOOTSTRAP_READY_V1_SIZE, BootstrapMessage, DecodeError, InitMessage,
     MAX_BOOTSTRAP_HANDLES, ReadyMessage, decode,
 };
 use wyrmroot_runtime::{
@@ -66,6 +66,8 @@ pub enum BootstrapError {
     Protocol(DecodeError),
     /// A valid protocol message was not the single expected INIT message.
     UnexpectedMessage,
+    /// INIT used a nonzero transaction identifier other than the G0 primordial value `1`.
+    UnexpectedTransactionId,
     /// Received or freshly queried capability metadata violated the exact role contract.
     Capability(CapabilityValidationError),
     /// The bootfs logical size could not produce a bounded mapping.
@@ -99,7 +101,12 @@ pub fn run_bootstrap<System: BootstrapSystem>(
         let transaction_id = match decode(&bytes[..counts.bytes], counts.handles)
             .map_err(BootstrapError::Protocol)?
         {
-            BootstrapMessage::Init(message) => message.transaction_id,
+            BootstrapMessage::Init(message) => {
+                if message.transaction_id != InitMessage::primordial().transaction_id {
+                    return Err(BootstrapError::UnexpectedTransactionId);
+                }
+                message.transaction_id
+            }
             BootstrapMessage::Ready(_) => return Err(BootstrapError::UnexpectedMessage),
         };
         process_init(system, &handles[..counts.handles])?;

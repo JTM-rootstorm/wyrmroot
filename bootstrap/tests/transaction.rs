@@ -157,6 +157,18 @@ fn malformed_protocol_closes_received_handles_without_ready() {
 }
 
 #[test]
+fn nonprimordial_transaction_id_is_rejected_and_received_handles_are_closed() {
+    let mut fixture = Fixture::valid();
+    fixture.init[24..32].copy_from_slice(&2_u64.to_le_bytes());
+    assert_eq!(
+        run_bootstrap(&mut fixture, CHANNEL),
+        Err(BootstrapError::UnexpectedTransactionId)
+    );
+    assert_eq!(fixture.closed, [ROOT, BOOTFS]);
+    assert!(fixture.sent.is_empty());
+}
+
+#[test]
 fn missing_or_nonexecutable_required_entries_fail_before_ready() {
     let mut missing = Fixture::valid();
     missing.bootfs = bootfs(&[(INIT0_PATH, b"init0")]);
