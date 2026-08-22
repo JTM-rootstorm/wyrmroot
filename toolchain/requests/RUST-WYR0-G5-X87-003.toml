@@ -1,0 +1,67 @@
+schema_version = 1
+request_id = "RUST-WYR0-G5-X87-003"
+status = "accepted-immutable-artifact"
+request_kind = "remove-unavailable-x87-and-fxsr-target-features"
+artifact_root = "/home/mike/Documents/Programming/OS-Project/artifacts/dw0-g3/accepted/dw-91d9b204c1ed__wyr-f433baf36d67__rust-a92dc7f7464/toolchain"
+manifest_sha256 = "67c88666079db335d5aa81414c553c140e394a5ebdee2706267ae6e8bd58aac0"
+
+[requirement]
+phase_gate = "DW0-G5 Daybreak remediation"
+consumer_repository = "wyrmroot"
+expected_behavior = "Do not advertise x87 or fxsr to Wyrmroot cfg selection and do not emit x87, MMX, SSE, AVX, or FXSR instructions under Deepwyrm's unavailable FP/SIMD policy."
+
+[rust]
+canonical_base_commit = "532159d837cadeb7d00e35eacb7f31bf0b640c3d"
+feature_commit = "c83060292b0baed98bee3b0dc29751fa18682203"
+accepted_commit = "a92dc7f7464ad6ddfece4402bd7b86dbfa86166d"
+integration_relation = "The feature-lane commit c8306029 and canonical integration commit a92dc7f7 are distinct sibling commits with identical tree aa3d5f9d1311772c99e385067d07641c01b8d203."
+fork_repository = "git@github.com:JTM-rootstorm/rust.git"
+target = "x86_64-unknown-wyrmroot"
+stage = 1
+rustc_version = "rustc 1.97.1-dev"
+llvm_version = "22.1.6"
+rustc_abi = "softfloat"
+target_features = "-x87,-fxsr,-mmx,-sse,-sse2,-sse3,-ssse3,-sse4.1,-sse4.2,-avx,-avx2,+soft-float"
+components = ["rustc", "rustc-driver", "core", "compiler-builtins", "rust-lld"]
+
+[validation]
+rustc_target_tests_lane = "passed-329"
+rustc_target_tests_canonical = "passed-329"
+resolved_cfg_x87 = "absent"
+resolved_cfg_fxsr = "absent"
+core_build = "passed"
+compiler_builtins_build = "passed"
+deepwyrm_production_and_selectors_18_through_21 = "passed"
+wyrmroot_native_variants = "passed-with-warnings-denied"
+native_disassembly = "no-x87-fxsr-mmx-xmm-ymm-zmm-instructions"
+esp_inspection = "passed-production-and-selectors-18-through-21"
+designated_vm = "passed-selectors-18-through-21"
+daybreak_cross_boundary_rereview = "product-security-pass-C0-H0-M0"
+
+[artifacts]
+rustc_sha256 = "65bd51e9ecb8e1185524471a8cbc4af1e6ac4e37e7d446c7a127bda0fa431c70"
+rustc_driver_sha256 = "6acbaa91cb797fa4c51d4ef0548deed766a0bd2efb100a8edf89eb7b141e3d34"
+core_sha256 = "b10995859e5867750360ff090d8ed40a8c290e4f43f4abcddcfd08ea6bd099f5"
+compiler_builtins_sha256 = "b51155de0b4ba898f8571e8f7e9aedbe6d7990f64bb658b3c79b1cb258fe5fdc"
+rust_lld_sha256 = "38a9f28404309892f9c9afe02fa4979a0d9e8bc866979cde09f5bb7ec17e5721"
+bootstrap_sha256 = "59cca570d52400dfa7dc3aef469b9c4cfafbf03db9e9675195c3fcc6913077b5"
+bootstrap_blocking_sha256 = "bb0aa46bf9de6a3baee709c0f7f85efde3c79d29791093b1394dee325cc00703"
+bootstrap_user_exception_sha256 = "320280cc3fc186995bfa24be16d4711c97943495090838c66112158ef51c35dd"
+bootstrap_invalid_return_sha256 = "b23dd9ad787d36efffc029646d69399d16e50b71a68a40fe64f6dd04719f0664"
+init0_sha256 = "a99077f134b83021a0f7ebd770de5ec02e26795329d9f50823ac53ba456f1d58"
+hello_sha256 = "6866ad9deaf0c62407a39fec48cd5f7c5f1fd4e6d28d95a6d2cde459f40dcd4e"
+
+[provenance]
+isolated_request = "RUST-WYR0-G5-X87-003"
+feature_worktree = "/home/mike/Documents/Programming/OS-Project/.worktrees/rust/RUST-WYR0-G5-X87-003"
+canonical_integration_checkout = "/home/mike/Documents/Programming/OS-Project/rust"
+accepted_build_root = "/home/mike/Documents/Programming/OS-Project/.tmp/RUST-WYR0-G5-X87-003/build-llvm-22.1.6"
+network_deviation = "Three pinned stage0 archives were fetched before offline enforcement; each hash exactly matched the Rust stage0 manifest, remained project-local, and no project data was uploaded."
+incidental_build_root = "A coordinator help probe created project-local rust/build state; it was not used for accepted artifacts and remains preserved."
+
+[policy]
+human_reviewer = "not-required-no-rust-local-policy-present-at-implementation-time"
+soundness_classification = "target-specification-and-static-runtime-boundary"
+source_edit_requested = true
+security_gate = "DW0-G5 exact-diff Daybreak rereview complete"
+notes = "The workspace Rust ownership and integration policy governed the isolated lane and canonical integration. The target correction removes unavailable feature claims; it does not add std, alloc, TLS, unwinding, libc, CRT, a dynamic linker, Unix-family membership, runtime FP emulation, or scheduler policy."
