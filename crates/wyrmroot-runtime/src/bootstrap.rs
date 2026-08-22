@@ -1,13 +1,14 @@
 //! Generic validation plans that the eventual exact Deepwyrm binding will execute.
 
-use deepwyrm_abi::{
-    DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL, DW_OBJECT_TYPE_MEMORY_OBJECT,
-    DW_RIGHT_DUPLICATE, DW_RIGHT_INSPECT, DW_RIGHT_MAP, DW_RIGHT_MODIFY, DW_RIGHT_READ,
-    DW_RIGHT_TRANSFER, DW_RIGHT_WAIT, DW_RIGHT_WRITE, DwObjectType, DwRights,
+use deepwyrm_syscall::{
+    DW_BASE_PAGE_SIZE, DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL,
+    DW_OBJECT_TYPE_MEMORY_OBJECT, DW_RIGHT_DUPLICATE, DW_RIGHT_INSPECT, DW_RIGHT_MAP,
+    DW_RIGHT_MODIFY, DW_RIGHT_READ, DW_RIGHT_TRANSFER, DW_RIGHT_WAIT, DW_RIGHT_WRITE, DwObjectType,
+    DwRights,
 };
 
 /// Native page size required by the D0 mapping contract.
-pub const PAGE_SIZE: u64 = 4096;
+pub const PAGE_SIZE: u64 = DW_BASE_PAGE_SIZE as u64;
 /// WYR0-C's maximum encoded bootfs archive size.
 pub const MAX_BOOTFS_LOGICAL_SIZE: u64 = 32 * 1024 * 1024;
 

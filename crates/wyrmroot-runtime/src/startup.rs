@@ -1,6 +1,6 @@
 //! Safe parsing of the bounded WYR0 native startup block.
 
-use deepwyrm_abi::DwHandle;
+use deepwyrm_syscall::DwHandle;
 
 /// The only startup ABI version currently understood by the runtime.
 pub const STARTUP_ABI_V1: u64 = 1;

@@ -4,13 +4,13 @@ manifest_kind = "wyrmroot-build-provenance-template"
 [source]
 wyrmroot_revision = ""
 wyrmroot_dirty = false
-deepwyrm_revision = "6de5af17dfef979aeadc150ce3958cd941fedbb2"
+deepwyrm_revision = "9954cbc053874c3076640c8cd9dc1c5bf5cf0647"
 deepwyrm_dirty = false
 deepwyrm_abi_dependency_state = "available"
-rust_revision = "8bab26f4f68e0e26f0bb7960be334d5b520ea452"
+rust_revision = "fc555b0e2ef86b8037b6069ef3157c4862fa028d"
 
 [toolchain]
-rust_toolchain_name = "wyrmroot-1.97.1-8bab26f4"
+rust_toolchain_name = "wyrmroot-1.97.1-fc555b0e"
 rustc_commit_hash = ""
 rustc_host = ""
 clang_version = ""

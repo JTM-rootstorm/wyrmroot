@@ -10,11 +10,7 @@ description = "Minimal native runtime support for Wyrmroot"
 path = "src/lib.rs"
 
 [dependencies]
-deepwyrm-abi.workspace = true
-
-# Native guest runtime support remains directly layered on generated
-# Deepwyrm definitions. The separate G1B consumer crate will supply the raw
-# syscall boundary without introducing libc or POSIX compatibility.
+deepwyrm-syscall.workspace = true
 
 [lints.rust]
 unsafe_code = "deny"

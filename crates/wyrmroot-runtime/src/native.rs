@@ -1,0 +1,358 @@
+//! Safe, allocation-free policy wrappers over Deepwyrm's native syscall crate.
+
+use deepwyrm_syscall::{
+    DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE, DW_ADDRESS_REGION_MAP_ARGS_V1_VERSION,
+    DW_CHANNEL_RECEIVE_RESULT_V1_SIZE, DW_MEMORY_OBJECT_INFO_V1_SIZE, DW_MEMORY_PROTECTION_READ,
+    DW_OBJECT_INFO_V1_SIZE, DW_STATUS_SUCCESS, DwAddressRegionMapArgsV1, DwAddressRegionMapFlags,
+    DwChannelReceiveResultV1, DwHandle, DwHandleTransferV1, DwMemoryObjectInfoV1, DwObjectInfoV1,
+    DwObjectType, DwOffset, DwReceivedHandleInfoV1, DwRights, DwSize, DwStatus, DwUserAddress,
+};
+
+use crate::{CapabilityInfo, MappingPlan};
+
+/// Exit code used when the freestanding runtime aborts after a panic or violated invariant.
+pub const PANIC_EXIT_CODE: u32 = u32::MAX;
+
+/// A successful kernel response violated the pinned generated ABI contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeOutputError {
+    /// An object-info record had the wrong size, version, or reserved fields.
+    InvalidObjectInfo,
+    /// A MemoryObject-info record had the wrong size, version, or reserved fields.
+    InvalidMemoryObjectInfo,
+    /// Channel receive counts or generated records were inconsistent with the supplied buffers.
+    InvalidChannelReceive,
+    /// A successful map returned a zero, unaligned, or overflowing userspace range.
+    InvalidMappedRange,
+}
+
+/// Failure from a native runtime operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeError {
+    /// The kernel returned an exact native Deepwyrm status.
+    Status(DwStatus),
+    /// The kernel reported success but returned malformed output for the pinned ABI.
+    Output(NativeOutputError),
+}
+
+/// Exact byte and handle counts produced by one successful Channel receive.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReceiveCounts {
+    /// Payload bytes initialized in the caller's byte buffer.
+    pub bytes: usize,
+    /// Handle records initialized in the caller's handle buffer.
+    pub handles: usize,
+}
+
+/// One successful read-only bootfs mapping.
+#[derive(Debug, Eq, PartialEq)]
+pub struct MappedBootfs {
+    address: DwUserAddress,
+    logical_size: u64,
+    mapped_size: u64,
+}
+
+impl MappedBootfs {
+    /// Returns the first mapped userspace address.
+    pub const fn address(&self) -> DwUserAddress {
+        self.address
+    }
+
+    /// Returns the exact logical archive length; page-rounded padding is excluded.
+    pub const fn logical_size(&self) -> u64 {
+        self.logical_size
+    }
+
+    /// Returns the page-rounded range that must be supplied to unmap.
+    pub const fn mapped_size(&self) -> u64 {
+        self.mapped_size
+    }
+}
+
+/// Closes one caller-local native handle.
+pub fn close_handle(handle: DwHandle) -> Result<(), NativeError> {
+    require_success(deepwyrm_syscall::handle_close(handle))
+}
+
+/// Queries fresh type and rights metadata through the generated basic-info record.
+pub fn query_capability_info(
+    handle: DwHandle,
+) -> Result<CapabilityInfo<DwObjectType, DwRights>, NativeError> {
+    let mut info = DwObjectInfoV1::default();
+    let mut required_size = 0;
+    require_success(deepwyrm_syscall::object_get_basic_info_v1(
+        handle,
+        &mut info,
+        &mut required_size,
+    ))?;
+    validate_object_info(&info, required_size)?;
+    Ok(CapabilityInfo {
+        object_type: info.object_type,
+        rights: info.rights,
+    })
+}
+
+/// Queries the exact logical size of a MemoryObject, excluding page-rounded padding.
+pub fn query_memory_object_size(handle: DwHandle) -> Result<u64, NativeError> {
+    let mut info = DwMemoryObjectInfoV1::default();
+    let mut required_size = 0;
+    require_success(deepwyrm_syscall::object_get_memory_object_info_v1(
+        handle,
+        &mut info,
+        &mut required_size,
+    ))?;
+    validate_memory_object_info(&info, required_size)?;
+    Ok(info.byte_size)
+}
+
+/// Sends one native Channel datagram with optional moved handles.
+pub fn send_channel(
+    channel: DwHandle,
+    bytes: &[u8],
+    transfers: &[DwHandleTransferV1],
+) -> Result<(), NativeError> {
+    require_success(deepwyrm_syscall::channel_send(channel, bytes, transfers, 0))
+}
+
+/// Receives one complete native Channel datagram into fixed caller-owned buffers.
+pub fn receive_channel(
+    channel: DwHandle,
+    bytes: &mut [u8],
+    handles: &mut [DwReceivedHandleInfoV1],
+) -> Result<ReceiveCounts, NativeError> {
+    let mut result = DwChannelReceiveResultV1::default();
+    require_success(deepwyrm_syscall::channel_receive(
+        channel,
+        bytes,
+        handles,
+        &mut result,
+    ))?;
+    validate_channel_receive(&result, bytes.len(), handles)
+}
+
+/// Maps a validated bootfs extent read-only at a kernel-selected address.
+pub fn map_bootfs_read_only(
+    root_region: DwHandle,
+    bootfs: DwHandle,
+    plan: MappingPlan,
+) -> Result<MappedBootfs, NativeError> {
+    let arguments = DwAddressRegionMapArgsV1 {
+        size: DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE,
+        version: DW_ADDRESS_REGION_MAP_ARGS_V1_VERSION,
+        memory_object_offset: DwOffset(0),
+        byte_len: DwSize(plan.mapped_size),
+        requested_address: DwUserAddress(0),
+        protections: DW_MEMORY_PROTECTION_READ,
+        flags: DwAddressRegionMapFlags(0),
+        reserved: [0; 4],
+    };
+    let mut address = DwUserAddress(0);
+    require_success(deepwyrm_syscall::address_region_map(
+        root_region,
+        bootfs,
+        &arguments,
+        &mut address,
+    ))?;
+    validate_mapped_range(address, plan.mapped_size)?;
+    Ok(MappedBootfs {
+        address,
+        logical_size: plan.logical_size,
+        mapped_size: plan.mapped_size,
+    })
+}
+
+/// Unmaps exactly one range returned by [`map_bootfs_read_only`].
+pub fn unmap_bootfs(root_region: DwHandle, mapping: &MappedBootfs) -> Result<(), NativeError> {
+    require_success(deepwyrm_syscall::address_region_unmap(
+        root_region,
+        mapping.address,
+        DwSize(mapping.mapped_size),
+    ))
+}
+
+/// Terminates the calling process normally. A rejected exit request fails closed by spinning.
+pub fn exit_process(exit_code: u32) -> ! {
+    let _unexpected_status = deepwyrm_syscall::process_exit(exit_code);
+    fail_stop()
+}
+
+/// Terminates the calling thread normally. A rejected exit request fails closed by spinning.
+pub fn exit_thread(exit_code: u32) -> ! {
+    let _unexpected_status = deepwyrm_syscall::thread_exit(exit_code);
+    fail_stop()
+}
+
+/// Freestanding panic policy: terminate the process with a deterministic nonzero code.
+pub fn panic_abort() -> ! {
+    exit_process(PANIC_EXIT_CODE)
+}
+
+fn require_success(status: DwStatus) -> Result<(), NativeError> {
+    if status == DW_STATUS_SUCCESS {
+        Ok(())
+    } else {
+        Err(NativeError::Status(status))
+    }
+}
+
+fn validate_object_info(info: &DwObjectInfoV1, required_size: u64) -> Result<(), NativeError> {
+    if required_size == u64::from(DW_OBJECT_INFO_V1_SIZE)
+        && info.size == DW_OBJECT_INFO_V1_SIZE
+        && info.version == 1
+        && info.reserved0 == 0
+        && info.reserved == [0; 4]
+    {
+        Ok(())
+    } else {
+        Err(NativeError::Output(NativeOutputError::InvalidObjectInfo))
+    }
+}
+
+fn validate_memory_object_info(
+    info: &DwMemoryObjectInfoV1,
+    required_size: u64,
+) -> Result<(), NativeError> {
+    if required_size == u64::from(DW_MEMORY_OBJECT_INFO_V1_SIZE)
+        && info.size == DW_MEMORY_OBJECT_INFO_V1_SIZE
+        && info.version == 1
+        && info.reserved == [0; 2]
+    {
+        Ok(())
+    } else {
+        Err(NativeError::Output(
+            NativeOutputError::InvalidMemoryObjectInfo,
+        ))
+    }
+}
+
+fn validate_channel_receive(
+    result: &DwChannelReceiveResultV1,
+    byte_capacity: usize,
+    handles: &[DwReceivedHandleInfoV1],
+) -> Result<ReceiveCounts, NativeError> {
+    let bytes = usize::try_from(result.actual_bytes)
+        .map_err(|_| NativeError::Output(NativeOutputError::InvalidChannelReceive))?;
+    let handle_count = usize::try_from(result.actual_handles)
+        .map_err(|_| NativeError::Output(NativeOutputError::InvalidChannelReceive))?;
+    let valid_handles = handles.get(..handle_count).is_some_and(|records| {
+        records.iter().all(|record| {
+            record.handle.0 != 0 && record.reserved0 == 0 && record.reserved == [0; 2]
+        })
+    });
+    if result.size == DW_CHANNEL_RECEIVE_RESULT_V1_SIZE
+        && result.version == 1
+        && result.reserved == [0; 4]
+        && bytes <= byte_capacity
+        && handle_count <= handles.len()
+        && result.required_bytes == result.actual_bytes
+        && result.required_handles == result.actual_handles
+        && valid_handles
+    {
+        Ok(ReceiveCounts {
+            bytes,
+            handles: handle_count,
+        })
+    } else {
+        Err(NativeError::Output(
+            NativeOutputError::InvalidChannelReceive,
+        ))
+    }
+}
+
+fn validate_mapped_range(address: DwUserAddress, mapped_size: u64) -> Result<(), NativeError> {
+    if address.0 != 0
+        && address.0.is_multiple_of(crate::PAGE_SIZE)
+        && mapped_size != 0
+        && mapped_size.is_multiple_of(crate::PAGE_SIZE)
+        && address.0.checked_add(mapped_size).is_some()
+    {
+        Ok(())
+    } else {
+        Err(NativeError::Output(NativeOutputError::InvalidMappedRange))
+    }
+}
+
+#[inline(never)]
+fn fail_stop() -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_handling_preserves_native_values() {
+        assert_eq!(require_success(DW_STATUS_SUCCESS), Ok(()));
+        let failure = DwStatus(-77);
+        assert_eq!(require_success(failure), Err(NativeError::Status(failure)));
+    }
+
+    #[test]
+    fn validates_generated_object_info_envelopes() {
+        let basic = DwObjectInfoV1 {
+            size: DW_OBJECT_INFO_V1_SIZE,
+            version: 1,
+            ..DwObjectInfoV1::default()
+        };
+        assert_eq!(
+            validate_object_info(&basic, u64::from(DW_OBJECT_INFO_V1_SIZE)),
+            Ok(())
+        );
+        assert!(validate_object_info(&basic, 0).is_err());
+
+        let memory = DwMemoryObjectInfoV1 {
+            size: DW_MEMORY_OBJECT_INFO_V1_SIZE,
+            version: 1,
+            byte_size: 17,
+            ..DwMemoryObjectInfoV1::default()
+        };
+        assert_eq!(
+            validate_memory_object_info(&memory, u64::from(DW_MEMORY_OBJECT_INFO_V1_SIZE)),
+            Ok(())
+        );
+        let mut malformed = memory;
+        malformed.reserved[0] = 1;
+        assert!(
+            validate_memory_object_info(&malformed, u64::from(DW_MEMORY_OBJECT_INFO_V1_SIZE))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn validates_channel_counts_and_received_handle_records() {
+        let mut handles = [DwReceivedHandleInfoV1 {
+            handle: DwHandle(9),
+            ..DwReceivedHandleInfoV1::default()
+        }];
+        let result = DwChannelReceiveResultV1 {
+            size: DW_CHANNEL_RECEIVE_RESULT_V1_SIZE,
+            version: 1,
+            actual_bytes: 4,
+            actual_handles: 1,
+            required_bytes: 4,
+            required_handles: 1,
+            reserved: [0; 4],
+        };
+        assert_eq!(
+            validate_channel_receive(&result, 4, &handles),
+            Ok(ReceiveCounts {
+                bytes: 4,
+                handles: 1
+            })
+        );
+        handles[0].handle = DwHandle(0);
+        assert!(validate_channel_receive(&result, 4, &handles).is_err());
+        assert!(validate_channel_receive(&result, 3, &handles).is_err());
+    }
+
+    #[test]
+    fn validates_page_bounded_mapping_outputs() {
+        assert_eq!(validate_mapped_range(DwUserAddress(0x4000), 0x2000), Ok(()));
+        assert!(validate_mapped_range(DwUserAddress(0), 0x1000).is_err());
+        assert!(validate_mapped_range(DwUserAddress(0x4001), 0x1000).is_err());
+        assert!(validate_mapped_range(DwUserAddress(u64::MAX - 0xfff), 0x2000).is_err());
+    }
+}

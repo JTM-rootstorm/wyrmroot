@@ -67,9 +67,16 @@ impl BuildManifest {
         let revision = self.required("deepwyrm.revision")?;
         let repository_url = self.required("deepwyrm.repository")?;
         let root_manifest = read_file(&repository.join("Cargo.toml"))?;
-        if !root_has_deepwyrm_dependency(&root_manifest, repository_url, revision) {
+        if !root_has_deepwyrm_dependency(&root_manifest, repository_url, revision)
+            || !root_has_deepwyrm_package(
+                &root_manifest,
+                "deepwyrm-syscall",
+                repository_url,
+                revision,
+            )
+        {
             return Err(Failure::task(format!(
-                "Cargo.toml does not pin deepwyrm-abi at manifest repository {repository_url} and revision {revision}"
+                "Cargo.toml does not pin both Deepwyrm guest packages at manifest repository {repository_url} and revision {revision}"
             )));
         }
 
@@ -79,10 +86,20 @@ impl BuildManifest {
                 "Cargo.lock does not resolve deepwyrm-abi from manifest repository {repository_url} at revision {revision}"
             )));
         }
+        if !lock_has_git_package(&lockfile, "deepwyrm-syscall", repository_url, revision) {
+            return Err(Failure::task(format!(
+                "Cargo.lock does not resolve deepwyrm-syscall from manifest repository {repository_url} at revision {revision}"
+            )));
+        }
 
         if !has_abi_consumer(repository)? {
             return Err(Failure::task(
                 "no Wyrmroot workspace crate consumes the pinned deepwyrm-abi dependency",
+            ));
+        }
+        if !has_workspace_dependency_consumer(repository, "deepwyrm-syscall")? {
+            return Err(Failure::task(
+                "no Wyrmroot workspace crate consumes the pinned deepwyrm-syscall dependency",
             ));
         }
 
@@ -491,16 +508,23 @@ fn root_has_uefi_dependency(manifest: &str, version: &str) -> bool {
 }
 
 fn root_has_deepwyrm_dependency(manifest: &str, repository: &str, revision: &str) -> bool {
-    manifest_inline_dependency(manifest, "workspace.dependencies", "deepwyrm-abi").is_some_and(
-        |fields| {
-            fields.len() == 2
-                && fields
-                    .get("git")
-                    .and_then(|value| basic_toml_string(value))
-                    .is_some_and(|actual| git_repositories_match(actual, repository))
-                && fields.get("rev").and_then(|value| basic_toml_string(value)) == Some(revision)
-        },
-    )
+    root_has_deepwyrm_package(manifest, "deepwyrm-abi", repository, revision)
+}
+
+fn root_has_deepwyrm_package(
+    manifest: &str,
+    package: &str,
+    repository: &str,
+    revision: &str,
+) -> bool {
+    manifest_inline_dependency(manifest, "workspace.dependencies", package).is_some_and(|fields| {
+        fields.len() == 2
+            && fields
+                .get("git")
+                .and_then(|value| basic_toml_string(value))
+                .is_some_and(|actual| git_repositories_match(actual, repository))
+            && fields.get("rev").and_then(|value| basic_toml_string(value)) == Some(revision)
+    })
 }
 
 fn loader_has_optional_uefi_dependency(manifest: &str) -> bool {
@@ -787,11 +811,15 @@ fn contains_toml_multiline_string(contents: &str) -> bool {
 }
 
 fn has_abi_consumer(repository: &Path) -> Result<bool, Failure> {
+    has_workspace_dependency_consumer(repository, "deepwyrm-abi")
+}
+
+fn has_workspace_dependency_consumer(repository: &Path, dependency: &str) -> Result<bool, Failure> {
     let root_manifest_path = repository.join("Cargo.toml");
     let root_manifest = read_file(&root_manifest_path)?;
     for member in parse_workspace_members(&root_manifest, &root_manifest_path)? {
         let manifest = workspace_member_manifest(repository, &member)?;
-        if manifest_consumes_workspace_dependency(&read_file(&manifest)?, "deepwyrm-abi") {
+        if manifest_consumes_workspace_dependency(&read_file(&manifest)?, dependency) {
             return Ok(true);
         }
     }
@@ -1084,6 +1112,13 @@ fn scan_policy_tree(root: &Path, native_target: &str) -> Result<(), Failure> {
             )));
         }
         if file_type.is_dir() {
+            // Request records are immutable evidence, not guest build inputs. They may name
+            // forbidden configurations to document that validation rejected them.
+            if root.file_name().and_then(|name| name.to_str()) == Some("toolchain")
+                && path.file_name().and_then(|name| name.to_str()) == Some("requests")
+            {
+                continue;
+            }
             scan_policy_tree(&path, native_target)?;
             continue;
         }
@@ -1137,7 +1172,7 @@ mod tests {
         BuildManifest, LoaderProfile, has_abi_consumer, loader_has_optional_uefi_dependency,
         lock_has_git_package, lock_has_package, manifest_consumes_workspace_dependency,
         parse_scalar_toml, parse_workspace_members, root_has_deepwyrm_dependency,
-        root_has_uefi_dependency, validate_loader_profile_components,
+        root_has_deepwyrm_package, root_has_uefi_dependency, validate_loader_profile_components,
     };
     use std::collections::BTreeMap;
     use std::path::Path;
@@ -1229,6 +1264,13 @@ mod tests {
             "[workspace.dependencies]\ndeepwyrm-abi = {{ git = \"{REPOSITORY}.git\", rev = \"{REVISION}\" }}\n"
         );
         assert!(root_has_deepwyrm_dependency(&valid, REPOSITORY, REVISION));
+        let syscall = valid.replace("deepwyrm-abi", "deepwyrm-syscall");
+        assert!(root_has_deepwyrm_package(
+            &syscall,
+            "deepwyrm-syscall",
+            REPOSITORY,
+            REVISION
+        ));
 
         let comment_decoy = format!(
             "[workspace.dependencies]\ndeepwyrm-abi = {{ git = \"{REPOSITORY}.git\", rev = \"{OTHER_REVISION}\" }} # expected {REVISION}\n# deepwyrm-abi = {{ git = \"{REPOSITORY}.git\", rev = \"{REVISION}\" }}\n"
@@ -1542,6 +1584,34 @@ mod tests {
         assert!(failure.message.contains("refusing to follow symlink"));
 
         fs::remove_dir_all(&root).expect("remove isolated test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn policy_scan_excludes_non_build_request_evidence() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock precedes Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "wyrmroot-xtask-policy-evidence-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let toolchain = root.join("toolchain");
+        let requests = toolchain.join("requests");
+        fs::create_dir_all(&requests).expect("create request evidence fixture");
+        fs::write(
+            requests.join("accepted.toml"),
+            "notes = \"validated absence of cfg(unix)\"\n",
+        )
+        .expect("write request evidence fixture");
+
+        scan_policy_tree(&toolchain, "x86_64-unknown-wyrmroot")
+            .expect("non-build request evidence was scanned as guest configuration");
+
+        fs::remove_dir_all(&root).expect("remove policy evidence fixture");
     }
 
     fn phase_a_manifest(abi_state: &str, target_state: &str) -> BuildManifest {
