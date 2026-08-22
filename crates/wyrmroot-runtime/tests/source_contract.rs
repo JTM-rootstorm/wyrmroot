@@ -7,6 +7,7 @@ const SOURCE: &str = concat!(
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bootstrap.rs")),
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/startup.rs")),
 );
+const NATIVE_SOURCE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/native.rs"));
 const MANIFEST: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
 
 #[test]
@@ -34,4 +35,12 @@ fn guest_runtime_has_no_host_personality_dependency() {
             "found forbidden dependency {forbidden}"
         );
     }
+}
+
+#[test]
+fn runtime_unsafe_is_confined_to_the_validated_bootfs_slice_boundary() {
+    assert_eq!(NATIVE_SOURCE.matches("unsafe {").count(), 1);
+    assert!(NATIVE_SOURCE.contains("core::slice::from_raw_parts"));
+    assert!(!NATIVE_SOURCE.contains("unsafe fn"));
+    assert!(!NATIVE_SOURCE.contains("from_raw_parts_mut"));
 }

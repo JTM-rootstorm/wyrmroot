@@ -116,12 +116,20 @@ pub fn validate_init_capabilities<ObjectType: Eq, Rights: Eq>(
 }
 
 /// The read-only mapping extent required for a validated bootfs logical length.
+///
+/// The fields are intentionally private so safe callers cannot pair an oversized logical parser
+/// extent with a smaller mapping. Construct plans through [`MappingPlan::for_bootfs`].
+///
+/// ```compile_fail
+/// # use wyrmroot_runtime::MappingPlan;
+/// let _ = MappingPlan { logical_size: 8192, mapped_size: 4096 };
+/// ```
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MappingPlan {
     /// Exact archive bytes passed to the WYR0-C parser.
-    pub logical_size: u64,
+    logical_size: u64,
     /// Page-rounded map capacity; its tail is never parser input.
-    pub mapped_size: u64,
+    mapped_size: u64,
 }
 
 /// Bootfs logical-length validation failure.
@@ -136,7 +144,17 @@ pub enum MappingPlanError {
 }
 
 impl MappingPlan {
-    /// Creates the exact read-only mapping plan; the caller must map only `mapped_size` and parse only `logical_size`.
+    /// Returns the exact archive byte length that may be exposed to the parser.
+    pub const fn logical_size(self) -> u64 {
+        self.logical_size
+    }
+
+    /// Returns the page-rounded extent that must be mapped and later unmapped.
+    pub const fn mapped_size(self) -> u64 {
+        self.mapped_size
+    }
+
+    /// Creates the exact read-only mapping plan; callers cannot forge mismatched logical and mapped extents.
     pub fn for_bootfs(logical_size: u64) -> Result<Self, MappingPlanError> {
         Self::for_limit(logical_size, MAX_BOOTFS_LOGICAL_SIZE)
     }

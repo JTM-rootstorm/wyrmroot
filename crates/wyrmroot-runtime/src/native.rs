@@ -10,6 +10,8 @@ use deepwyrm_syscall::{
 
 use crate::{CapabilityInfo, MappingPlan};
 
+const X86_64_USER_END_EXCLUSIVE: u64 = 1_u64 << 47;
+
 /// Exit code used when the freestanding runtime aborts after a panic or violated invariant.
 pub const PANIC_EXIT_CODE: u32 = u32::MAX;
 
@@ -47,25 +49,51 @@ pub struct ReceiveCounts {
 /// One successful read-only bootfs mapping.
 #[derive(Debug, Eq, PartialEq)]
 pub struct MappedBootfs {
+    root_region: DwHandle,
     address: DwUserAddress,
     logical_size: u64,
     mapped_size: u64,
 }
 
 impl MappedBootfs {
-    /// Returns the first mapped userspace address.
-    pub const fn address(&self) -> DwUserAddress {
-        self.address
-    }
-
     /// Returns the exact logical archive length; page-rounded padding is excluded.
     pub const fn logical_size(&self) -> u64 {
         self.logical_size
     }
 
-    /// Returns the page-rounded range that must be supplied to unmap.
+    /// Returns the page-rounded range that will be supplied to unmap.
     pub const fn mapped_size(&self) -> u64 {
         self.mapped_size
+    }
+
+    /// Borrows exactly the logical bootfs bytes for one non-escaping callback.
+    ///
+    /// The callback is higher-ranked over the temporary slice lifetime, so a parser object or
+    /// entry borrowing these bytes cannot escape the callback. This keeps safe callers from
+    /// retaining archive borrows across [`unmap_bootfs`], which consumes the mapping token.
+    ///
+    /// ```compile_fail
+    /// # use wyrmroot_runtime::MappedBootfs;
+    /// # fn leak(mapping: &MappedBootfs) -> &[u8] {
+    /// mapping.with_logical_bytes(|bytes| bytes)
+    /// # }
+    /// ```
+    #[allow(
+        unsafe_code,
+        reason = "the token is created only after Deepwyrm successfully maps the validated read-only range, and the higher-ranked callback prevents the resulting slice from escaping before teardown"
+    )]
+    pub fn with_logical_bytes<R>(
+        &self,
+        use_bytes: impl for<'bytes> FnOnce(&'bytes [u8]) -> R,
+    ) -> R {
+        let byte_len = usize::try_from(self.logical_size)
+            .expect("validated WYR0-C bootfs logical size fits the x86_64 native target");
+        let pointer = self.address.0 as *const u8;
+        // SAFETY: `map_bootfs_read_only` accepted a successful page-aligned Deepwyrm mapping
+        // whose mapped extent covers `logical_size`. The token is non-Copy and its raw address is
+        // not exposed. The higher-ranked callback prevents any borrow from escaping this call.
+        let bytes = unsafe { core::slice::from_raw_parts(pointer, byte_len) };
+        use_bytes(bytes)
     }
 }
 
@@ -140,7 +168,7 @@ pub fn map_bootfs_read_only(
         size: DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE,
         version: DW_ADDRESS_REGION_MAP_ARGS_V1_VERSION,
         memory_object_offset: DwOffset(0),
-        byte_len: DwSize(plan.mapped_size),
+        byte_len: DwSize(plan.mapped_size()),
         requested_address: DwUserAddress(0),
         protections: DW_MEMORY_PROTECTION_READ,
         flags: DwAddressRegionMapFlags(0),
@@ -153,18 +181,19 @@ pub fn map_bootfs_read_only(
         &arguments,
         &mut address,
     ))?;
-    validate_mapped_range(address, plan.mapped_size)?;
+    validate_mapped_range(address, plan.mapped_size())?;
     Ok(MappedBootfs {
+        root_region,
         address,
-        logical_size: plan.logical_size,
-        mapped_size: plan.mapped_size,
+        logical_size: plan.logical_size(),
+        mapped_size: plan.mapped_size(),
     })
 }
 
-/// Unmaps exactly one range returned by [`map_bootfs_read_only`].
-pub fn unmap_bootfs(root_region: DwHandle, mapping: &MappedBootfs) -> Result<(), NativeError> {
+/// Unmaps exactly one range returned by [`map_bootfs_read_only`], consuming its borrow token.
+pub fn unmap_bootfs(mapping: MappedBootfs) -> Result<(), NativeError> {
     require_success(deepwyrm_syscall::address_region_unmap(
-        root_region,
+        mapping.root_region,
         mapping.address,
         DwSize(mapping.mapped_size),
     ))
@@ -260,11 +289,15 @@ fn validate_channel_receive(
 }
 
 fn validate_mapped_range(address: DwUserAddress, mapped_size: u64) -> Result<(), NativeError> {
-    if address.0 != 0
+    let end_exclusive = address
+        .0
+        .checked_add(mapped_size)
+        .ok_or(NativeError::Output(NativeOutputError::InvalidMappedRange))?;
+    if address.0 >= crate::PAGE_SIZE
         && address.0.is_multiple_of(crate::PAGE_SIZE)
         && mapped_size != 0
         && mapped_size.is_multiple_of(crate::PAGE_SIZE)
-        && address.0.checked_add(mapped_size).is_some()
+        && end_exclusive <= X86_64_USER_END_EXCLUSIVE
     {
         Ok(())
     } else {
@@ -354,5 +387,33 @@ mod tests {
         assert!(validate_mapped_range(DwUserAddress(0), 0x1000).is_err());
         assert!(validate_mapped_range(DwUserAddress(0x4001), 0x1000).is_err());
         assert!(validate_mapped_range(DwUserAddress(u64::MAX - 0xfff), 0x2000).is_err());
+        assert!(validate_mapped_range(DwUserAddress(X86_64_USER_END_EXCLUSIVE), 0x1000).is_err());
+        assert!(
+            validate_mapped_range(
+                DwUserAddress(X86_64_USER_END_EXCLUSIVE - crate::PAGE_SIZE),
+                crate::PAGE_SIZE,
+            )
+            .is_ok()
+        );
+    }
+
+    #[repr(align(4096))]
+    struct AlignedBytes([u8; 4096]);
+
+    #[test]
+    fn mapped_bootfs_exposes_only_logical_bytes_inside_callback() {
+        static BYTES: AlignedBytes = AlignedBytes([0x5a; 4096]);
+        let mapping = MappedBootfs {
+            root_region: DwHandle(9),
+            address: DwUserAddress(BYTES.0.as_ptr() as u64),
+            logical_size: 17,
+            mapped_size: 4096,
+        };
+        let observed = mapping.with_logical_bytes(|bytes| {
+            assert_eq!(bytes.len(), 17);
+            assert!(bytes.iter().all(|byte| *byte == 0x5a));
+            bytes.len()
+        });
+        assert_eq!(observed, 17);
     }
 }
