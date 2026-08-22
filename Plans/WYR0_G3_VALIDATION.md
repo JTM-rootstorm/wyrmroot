@@ -1,26 +1,28 @@
 # DW0-G3 Paired Artifact Validation
 
-**Status:** Re-promoted host artifact gate; designated-VM G4 accepted; G5 remains open
+**Status:** G3 re-promoted, G4 accepted, and G5 Daybreak remediation accepted; P0 accounting remains open
 
 **Review date:** 2026-08-22
 
-**Deepwyrm artifact revision:** `7e70cf4f31cea89168bc0a54f1c55eef24b0c8cf`
+**Deepwyrm artifact revision:** `91d9b204c1ed0bdd4cef934e1be6203d41e9e5c3`
 
-**Wyrmroot artifact revision:** `be2a14435bd3256a535e49aaba0ad03c5e818dd4`
+**Wyrmroot artifact revision:** `f433baf36d671f3f8b515adf5f613bd01dc8bbb9`
 
-**Rust source revision:** `532159d837cadeb7d00e35eacb7f31bf0b640c3d`
+**Rust source revision:** `a92dc7f7464ad6ddfece4402bd7b86dbfa86166d`
 
 ## Result
 
-DW0-G3 now has one exact, project-local paired artifact set re-promoted after live G4 defect fixes. The production Deepwyrm kernel enters
+DW0-G3 now has one exact, project-local paired artifact set re-promoted after G4 and G5 fixes. The production Deepwyrm kernel enters
 the real primordial launch path, and Wyrmroot provides the exact loader, native bootstrap, minimal
 native payloads, bootfs, and deterministic FAT32 ESP consumed by that path. Canonical G4 run 19
 then booted the paired test ESP through the designated VM and passed selector 18 with detail zero.
-G5 remains a separate exact-candidate security gate.
+The subsequent G5 Daybreak gate found and remediated terminal lifecycle and target-feature defects,
+then passed exact-diff rereview. P0 remains a separate accounting gate, so this does not yet claim
+DW0-G full acceptance.
 
 The revision-named accepted root is:
 
-`artifacts/dw0-g3/accepted/dw-7e70cf4f31ce__wyr-be2a14435bd3__rust-532159d837ca/`
+`artifacts/dw0-g3/accepted/dw-91d9b204c1ed__wyr-f433baf36d67__rust-a92dc7f7464/`
 
 Its `G3_EVIDENCE.toml` records source trees, toolchain identities, artifact sizes and hashes,
 inspection results, licensing boundaries, and host gates. `MANIFEST.sha256` verifies every promoted
@@ -64,30 +66,40 @@ revision `9954cbc053874c3076640c8cd9dc1c5bf5cf0647`; it does not create a path d
 
 | Artifact | Bytes | SHA-256 |
 |---|---:|---|
-| production `deepwyrm.elf` | 10,486,568 | `8eb955ca5b088677fb2d6f45d39d52cbc9e96508e1cc609ec5ddf0d765e1702b` |
-| primordial test kernel | 10,621,472 | `1544b7f83a1d7de26d3b0be9d17db29194f2a196c20c712edea269656cf6a122` |
+| production `deepwyrm.elf` | 11,098,264 | `51372c6f5b73a7a31d77133086205a9bd2b65c179c0c2a5f0e827bc36136b8b0` |
+| selector-18 kernel | 11,189,304 | `638d23bbaf7ff4b8f627728f0c33a23d4e03238aaef0599cc30c69bf11af15e3` |
+| selector-19 kernel | 11,189,288 | `25df039fc9b3330b0c910968c31445e5104d5a9e2ea3ec4163650ebd6cb621af` |
+| selector-20 kernel | 11,189,336 | `664c01294cc063757160a2808903bf25c6e82672e3250b75904062ad6c4594c2` |
+| selector-21 kernel | 11,189,320 | `751578ca069552c105d090e8e9973de2c93a23e7a7ef2b04f39b2ee48274c61a` |
 | `loader.efi` | 138,752 | `09427a9574979a6e1f64f493ebe0c50896e419e625ed3cd614992746d74d9beb` |
 | retained `loader.pdb` | 8,056,832 | `58f209ad2369bee1a378532046c04a9ed3fe24f596ea9056e231a6295519088d` |
-| `bootstrap.elf` | 17,936 | `3c6f3be6dc92f99a36201fec77952c2eebcaa39aba30ffa7931c917813b5fd42` |
+| `bootstrap.elf` | 17,936 | `59cca570d52400dfa7dc3aef469b9c4cfafbf03db9e9675195c3fcc6913077b5` |
+| selector-19 bootstrap | 22,264 | `bb0aa46bf9de6a3baee709c0f7f85efde3c79d29791093b1394dee325cc00703` |
+| selector-20 bootstrap | 17,776 | `320280cc3fc186995bfa24be16d4711c97943495090838c66112158ef51c35dd` |
+| selector-21 bootstrap | 17,792 | `b23dd9ad787d36efffc029646d69399d16e50b71a68a40fe64f6dd04719f0664` |
 | `system/init0` input | 8,184 | `a99077f134b83021a0f7ebd770de5ec02e26795329d9f50823ac53ba456f1d58` |
 | `bin/hello` input | 8,184 | `6866ad9deaf0c62407a39fec48cd5f7c5f1fd4e6d28d95a6d2cde459f40dcd4e` |
 | bootfs | 16,736 | `2ac3969bc9ebbce062888f3a213b8fff8d707764b19e4a69924f83261d4abf51` |
-| production FAT32 ESP | 134,217,728 | `8529ec0e036e83a43f817f8e22d8d8a1a864745026b041ae862e3c8fa6f4edfb` |
-| G4 test FAT32 ESP | 134,217,728 | `cad9477b8b929679905fd9bda64ed09971e9fea780597ab58f1bee62f7142187` |
+| production FAT32 ESP | 134,217,728 | `8f92820b42ca9baa1499ae507f2c028d34faedbd96fbae5a325b9000ef7fa897` |
+| selector-18 FAT32 ESP | 134,217,728 | `23c72ace79ea9e1c754c6d57e2c0455b4c5cec7da6d19a2ccd41d46b9c6a49e1` |
+| selector-19 FAT32 ESP | 134,217,728 | `03181b3bddfe0273d881ff2269575b98d9c05ef8e4e14b046c53c35d752553fe` |
+| selector-20 FAT32 ESP | 134,217,728 | `b78223e35118bb2b0816036aea1383146fa820c21cb31d08ee7ec362a871ea82` |
+| selector-21 FAT32 ESP | 134,217,728 | `8921fcff071189688a8bd58351862c1f70fe216810ffd2e094e40f39b6794f6a` |
 
 The native bootstrap, init0, hello, and bootfs were rebuilt with the corrected soft-float target.
 Two independent bootfs builds and two independent production ESP builds are byte-identical.
 
 ## Artifact inspection
 
-- Both Deepwyrm kernels are ELF64 x86-64 `ET_EXEC` images with three W^X-separated `PT_LOAD`
+- All Deepwyrm production/selector kernels are ELF64 x86-64 `ET_EXEC` images with three W^X-separated `PT_LOAD`
   segments, no dynamic section, and no undefined symbols. The production image contains no
   test-support selector or debug-exit marker.
 - `loader.efi` is PE32+ AMD64 with EFI application subsystem, no PE imports, and retained PDB.
 - Each native Wyrmroot executable passes the hardened G1-compatible oracle: fixed static `ET_EXEC`,
-  one RX load segment, NX stack, no dynamic metadata, relocations, undefined symbols, libc, or
-  interpreter, and exactly one Deepwyrm syscall veneer. Disassembly contains no x87, MMX, SSE, or
-  AVX instruction.
+  W^X/NX segments, no dynamic metadata, relocations, undefined symbols, libc, or interpreter.
+  Production and ordinary test variants contain exactly one Deepwyrm syscall veneer. The explicit
+  invalid-return oracle accounts for one veneer plus one exact test-only `RSP=0` syscall tail.
+  Disassembly contains no x87, FXSR, MMX, SSE, or AVX instruction.
 - Extracting bootfs proves `system/init0` and `bin/hello` are byte-identical to the accepted native
   inputs.
 - The G3 image inspector re-extracts and compares the exact loader, production kernel, bootstrap,
@@ -99,13 +111,13 @@ Two independent bootfs builds and two independent production ESP builds are byte
 
 The revision-named artifact root contains the promoted `rustc 1.97.1-dev`/LLVM 22.1.6 compiler,
 Cargo 1.96.1, `rust-lld`, and the corrected Wyrmroot `core` and `compiler_builtins`. The built-in
-target selects `RustcAbi::Softfloat` and explicitly disables x87/MMX/SSE/AVX generation. No accepted
+target selects `RustcAbi::Softfloat` and explicitly disables x87/FXSR/MMX/SSE/AVX generation. No accepted
 toolchain path is a symlink or depends on the mutable implementation worktree. Exact component
 hashes are in `G3_EVIDENCE.toml` and `MANIFEST.sha256`.
 
 ## Host gates
 
-- Deepwyrm locked workspace tests, 508 test-support kernel unit tests, ABI generation check, strict Clippy,
+- Deepwyrm locked workspace tests, 484 test-support kernel unit tests plus integration suites, ABI generation check, strict Clippy,
   formatting, production freestanding target build, and primordial test-support target build pass.
 - Wyrmroot locked workspace/all-target tests pass, including 50 xtask tests with the pre-existing
   accepted-environment gate ignored; strict workspace/all-target Clippy and warning-denied docs pass.
@@ -186,5 +198,27 @@ controller, PS/2 inputs, `audio type=none`, and an ITCO watchdog, but still had 
 host filesystem share, graphics device, functional audio backend, or attached USB device. Under
 libvirt the direct-QEMU numeric status 33 was not captured; the retained evidence instead records the
 unique checksum-valid PASS serial record followed immediately by `Shutdown Finished after guest
-request`, matching the test transport's serial-before-`isa-debug-exit` ordering. G5 remains open, so
-this does not yet claim DW0-G full acceptance or progression to DW0-H.
+request`, matching the test transport's serial-before-`isa-debug-exit` ordering.
+
+## G5 Daybreak remediation and disposition
+
+The initial exact `gpt-daybreak-blue-latest` review found two High and one Medium Deepwyrm terminal
+lifecycle defects, one Medium Rust target-feature defect, and one Low manifest-closure defect.
+Deepwyrm `37ef1aba7a0006af194796c58782adabb1536f09` closes structured exception/invalid-return
+termination, production blocking suspend/resume, and complete terminal quiescence. Deepwyrm
+`91d9b204c1ed0bdd4cef934e1be6203d41e9e5c3` adds production-path selectors 19 through 21.
+Wyrmroot `f433baf36d671f3f8b515adf5f613bd01dc8bbb9` supplies mutually exclusive test bootstrap variants
+and strict artifact oracles. Rust `a92dc7f7464ad6ddfece4402bd7b86dbfa86166d` removes `x87` and
+`fxsr` from the resolved target features.
+
+Canonical campaign `artifacts/dw0-g5/run-01-canonical/` passed selectors 18, 19, 20, and 21 with
+checksum-valid records, guest-request shutdown, byte-identical restoration after every run, and
+unchanged primary-disk bookends. Final independent Deepwyrm and cross-boundary Daybreak rereviews
+report C0/H0/M0/L0. The final manifest covers 97/97 entries, including both evidence TOMLs, and
+hashes to `67c88666079db335d5aa81414c553c140e394a5ebdee2706267ae6e8bd58aac0`.
+Wyrmroot `21e4c1a05a62a00ee7a97babdcecea97bba909f1` commits the exact
+`RUST-WYR0-G5-X87-003` provenance record and closes the final evidence-only Low.
+
+G5 is accepted. P0 remains open, so this record does not claim DW0-G full acceptance or progression
+to DW0-H. It also makes no general-exec, SMP, preemption, real-time, i386, physical-hardware, or
+full-Wyrmroot claim.
