@@ -3,8 +3,26 @@ name = "wyrmroot-hello"
 version = "0.0.0"
 edition = "2024"
 publish = false
-description = "Placeholder crate for the WYR0 hello smoke-test application"
+description = "Native WYR0 hello smoke-test process"
 license = "GPL-3.0-or-later"
 
 [lib]
 path = "src/lib.rs"
+
+[[bin]]
+name = "wyrmroot-hello"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["native-hello"]
+
+[features]
+default = []
+native-hello = ["dep:wyrmroot-runtime"]
+
+[dependencies]
+wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime", optional = true }
+
+[lints.rust]
+unsafe_code = "deny"
+unused_crate_dependencies = "deny"

@@ -164,6 +164,12 @@ version = "0.0.0"
 [[package]]
 name = "wyrmroot-bootstrap"
 version = "0.0.0"
+dependencies = [
+ "deepwyrm-syscall",
+ "wyrmroot-bootfs",
+ "wyrmroot-bootstrap-proto",
+ "wyrmroot-runtime",
+]
 
 [[package]]
 name = "wyrmroot-bootstrap-proto"
@@ -180,10 +186,16 @@ dependencies = [
 [[package]]
 name = "wyrmroot-hello"
 version = "0.0.0"
+dependencies = [
+ "wyrmroot-runtime",
+]
 
 [[package]]
 name = "wyrmroot-init0"
 version = "0.0.0"
+dependencies = [
+ "wyrmroot-runtime",
+]
 
 [[package]]
 name = "wyrmroot-loader"

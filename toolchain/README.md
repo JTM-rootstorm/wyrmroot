@@ -105,3 +105,24 @@ For native guest artifacts, provenance must identify the compiler-rt objects
 actually linked and the LLVM inspection result proving both an absent
 `PT_INTERP` and no guest libc dependency. Host-tool libc dependencies are
 recorded separately and are not guest-runtime failures.
+
+Inspect each completed native executable without running it:
+
+```text
+sh toolchain/inspect-native-artifact.sh <native-elf>
+```
+
+The machine-readable report verifies the fixed x86-64 `ET_EXEC` shape, bounded
+program-header and load-segment counts, W^X, NX stack, entry symbol, absence of
+dynamic metadata, relocations, and undefined symbols, and that the only raw
+`syscall` instruction belongs to the Deepwyrm binding veneer.
+
+The host-only deterministic bootfs encoder accepts the exact native `init0` and
+`hello` artifacts and writes a new output without following or replacing an
+existing path:
+
+```text
+cargo run --locked --release -p wyrmroot-bootfs \
+  --features builder --bin wyrmroot-bootfs-build -- \
+  <init0-elf> <hello-elf> <output-bootfs>
+```

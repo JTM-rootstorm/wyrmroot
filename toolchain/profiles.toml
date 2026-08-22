@@ -45,9 +45,10 @@ unix_target_family = "prohibited"
 linker_family = "LLVM LLD"
 compiler_runtime = "compiler-rt-only-as-needed"
 debug_information = "retain-host-symbol-artifact"
+artifact_inspection = "toolchain/inspect-native-artifact.sh"
 
 [provenance]
 required_source_pins = ["deepwyrm", "rust"]
 required_configuration_inputs = ["toolchain/versions.toml", "toolchain/profiles.toml"]
-required_guest_inspection = ["PT_INTERP absent", "no guest libc dependency"]
+required_guest_inspection = ["static ET_EXEC", "W^X PT_LOAD segments", "NX stack", "PT_INTERP absent", "PT_DYNAMIC absent", "relocations absent", "undefined symbols absent", "single Deepwyrm syscall veneer"]
 required_uefi_inspection = ["PE32+ AMD64", "EFI application subsystem", "no PE imports", "debug-symbol artifact"]

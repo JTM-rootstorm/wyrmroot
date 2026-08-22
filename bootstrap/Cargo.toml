@@ -3,8 +3,32 @@ name = "wyrmroot-bootstrap"
 version = "0.0.0"
 edition = "2024"
 publish = false
-description = "Placeholder crate for the WYR0 primordial bootstrap application"
+description = "Primordial Wyrmroot bootstrap application"
 license = "GPL-3.0-or-later"
 
 [lib]
 path = "src/lib.rs"
+
+[[bin]]
+name = "wyrmroot-bootstrap"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["native-bootstrap"]
+
+[features]
+default = []
+native-bootstrap = []
+
+[dependencies]
+deepwyrm-syscall.workspace = true
+wyrmroot-bootfs = { path = "../crates/wyrmroot-bootfs" }
+wyrmroot-bootstrap-proto = { path = "../crates/wyrmroot-bootstrap-proto" }
+wyrmroot-runtime = { path = "../crates/wyrmroot-runtime" }
+
+[dev-dependencies]
+wyrmroot-bootfs = { path = "../crates/wyrmroot-bootfs", features = ["builder"] }
+
+[lints.rust]
+unsafe_code = "deny"
+unused_crate_dependencies = "deny"

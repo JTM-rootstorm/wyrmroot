@@ -15,3 +15,4 @@ deepwyrm-syscall.workspace = true
 [lints.rust]
 unsafe_code = "deny"
 unused_crate_dependencies = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("wyrmroot"))'] }

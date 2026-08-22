@@ -10,6 +10,9 @@
 
 mod bootstrap;
 mod diagnostics;
+mod entry;
+#[cfg(target_os = "wyrmroot")]
+mod memory;
 mod native;
 mod startup;
 
@@ -26,5 +29,5 @@ pub use native::{
 };
 pub use startup::{
     AUXILIARY_VECTOR_TERMINATOR, BootstrapChannelHandle, STARTUP_ABI_V1, STARTUP_BLOCK_SIZE,
-    StartupBlock, StartupError, StartupRegisters, StartupString,
+    StartupBlock, StartupError, StartupRegisters, StartupString, with_native_startup,
 };

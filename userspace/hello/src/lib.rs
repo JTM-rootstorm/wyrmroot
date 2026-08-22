@@ -1,8 +1,10 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
-//! Placeholder for the WYR0 `hello` smoke-test application.
+//! WYR0 `hello` smoke-test application contract.
 //!
-//! This crate intentionally contains no executable entry point or application
-//! behavior. Implementation begins only after its runtime and delegated
-//! capability contracts are available.
+//! The D2 native executable validates the shared startup ABI and exits deterministically. Later
+//! phases add diagnostic output once its delegated capability is available.
+
+#[cfg(feature = "native-hello")]
+use wyrmroot_runtime as _;

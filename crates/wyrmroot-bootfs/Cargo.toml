@@ -12,3 +12,10 @@ path = "src/lib.rs"
 [features]
 default = []
 builder = []
+
+[[bin]]
+name = "wyrmroot-bootfs-build"
+path = "src/bin/build.rs"
+required-features = ["builder"]
+test = false
+bench = false

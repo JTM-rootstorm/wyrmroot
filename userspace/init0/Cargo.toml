@@ -3,8 +3,26 @@ name = "wyrmroot-init0"
 version = "0.0.0"
 edition = "2024"
 publish = false
-description = "Placeholder crate for the temporary WYR0 init0 application"
+description = "Temporary native WYR0 init0 process"
 license = "GPL-3.0-or-later"
 
 [lib]
 path = "src/lib.rs"
+
+[[bin]]
+name = "wyrmroot-init0"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["native-init0"]
+
+[features]
+default = []
+native-init0 = ["dep:wyrmroot-runtime"]
+
+[dependencies]
+wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime", optional = true }
+
+[lints.rust]
+unsafe_code = "deny"
+unused_crate_dependencies = "deny"

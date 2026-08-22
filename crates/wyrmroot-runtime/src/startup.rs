@@ -94,6 +94,41 @@ pub enum StartupError {
     InvalidUtf8,
 }
 
+/// Parses the native startup page and keeps every borrow inside one non-escaping callback.
+///
+/// # Safety
+///
+/// `address` must identify the initial, immutable, readable [`STARTUP_BLOCK_SIZE`]-byte page for
+/// the complete call. It must be the initial stack address supplied by Deepwyrm rather than an
+/// arbitrary userspace pointer.
+#[allow(
+    unsafe_code,
+    reason = "the native entry shim supplies the validated initial stack pointer and the higher-ranked callback prevents startup borrows from escaping"
+)]
+pub unsafe fn with_native_startup<R>(
+    registers: StartupRegisters,
+    address: u64,
+    use_block: impl for<'block> FnOnce(StartupBlock<'block>) -> R,
+) -> Result<R, StartupError> {
+    if registers.startup_argument1 != STARTUP_ABI_V1 {
+        return Err(StartupError::UnsupportedVersion);
+    }
+    if registers.startup_argument0 == 0 {
+        return Err(StartupError::InvalidBootstrapChannelHandle);
+    }
+    if !address.is_multiple_of(16) {
+        return Err(StartupError::MisalignedStack);
+    }
+    address
+        .checked_add(STARTUP_BLOCK_SIZE as u64)
+        .ok_or(StartupError::AddressOverflow)?;
+    let pointer = address as *const u8;
+    // SAFETY: the caller guarantees that the initial startup page is readable and immutable for
+    // this call. The higher-ranked callback prevents `StartupBlock` or its strings from escaping.
+    let bytes = unsafe { core::slice::from_raw_parts(pointer, STARTUP_BLOCK_SIZE) };
+    StartupBlock::parse(registers, address, bytes).map(use_block)
+}
+
 impl<'a> StartupBlock<'a> {
     /// Parses and fully bounds-checks the ABI V1 startup block.
     pub fn parse(
@@ -417,5 +452,28 @@ mod tests {
             StartupBlock::parse(registers(), BASE, &block),
             Err(StartupError::InvalidUtf8)
         ));
+    }
+
+    #[repr(align(4096))]
+    struct AlignedStartup([u8; STARTUP_BLOCK_SIZE]);
+
+    #[test]
+    #[allow(
+        unsafe_code,
+        reason = "the test owns the complete aligned startup page for the documented native callback contract"
+    )]
+    fn native_startup_callback_receives_the_exact_bounded_block() {
+        let mut bytes = AlignedStartup(valid_block());
+        let address = bytes.0.as_ptr() as u64;
+        put_word(&mut bytes.0, 8, address + 128);
+        // SAFETY: `bytes` is aligned, readable, immutable for the call, and contains a complete
+        // startup block whose only pointer was rebased to this exact storage.
+        let observed = unsafe {
+            with_native_startup(registers(), address, |block| {
+                assert_eq!(block.arg(0).unwrap().as_bytes(), b"arg");
+                block.bootstrap_channel().raw()
+            })
+        };
+        assert_eq!(observed, Ok(77));
     }
 }
