@@ -1,25 +1,26 @@
 # DW0-G3 Paired Artifact Validation
 
-**Status:** Accepted host artifact gate; designated-VM G4 remains open
+**Status:** Re-promoted host artifact gate; designated-VM G4 accepted; G5 remains open
 
 **Review date:** 2026-08-22
 
-**Deepwyrm artifact revision:** `65e4cb52cfe47d754f684da99edf8a9eb1622e94`
+**Deepwyrm artifact revision:** `7e70cf4f31cea89168bc0a54f1c55eef24b0c8cf`
 
-**Wyrmroot artifact revision:** `c5925a28d876935cd20a7a3f9d9df1c0800989fb`
+**Wyrmroot artifact revision:** `be2a14435bd3256a535e49aaba0ad03c5e818dd4`
 
-**Rust source revision:** `fc555b0e2ef86b8037b6069ef3157c4862fa028d`
+**Rust source revision:** `532159d837cadeb7d00e35eacb7f31bf0b640c3d`
 
 ## Result
 
-DW0-G3 now has one exact, project-local paired artifact set. The production Deepwyrm kernel enters
+DW0-G3 now has one exact, project-local paired artifact set re-promoted after live G4 defect fixes. The production Deepwyrm kernel enters
 the real primordial launch path, and Wyrmroot provides the exact loader, native bootstrap, minimal
-native payloads, bootfs, and deterministic FAT32 ESP consumed by that path. This closes the G3 host
-artifact gate only. No designated-VM lifecycle or guest execution was performed; that is G4.
+native payloads, bootfs, and deterministic FAT32 ESP consumed by that path. Canonical G4 run 19
+then booted the paired test ESP through the designated VM and passed selector 18 with detail zero.
+G5 remains a separate exact-candidate security gate.
 
 The revision-named accepted root is:
 
-`artifacts/dw0-g3/accepted/dw-65e4cb52cfe4__wyr-c5925a28d876__rust-fc555b0e2ef8/`
+`artifacts/dw0-g3/accepted/dw-7e70cf4f31ce__wyr-be2a14435bd3__rust-532159d837ca/`
 
 Its `G3_EVIDENCE.toml` records source trees, toolchain identities, artifact sizes and hashes,
 inspection results, licensing boundaries, and host gates. `MANIFEST.sha256` verifies every promoted
@@ -63,18 +64,19 @@ revision `9954cbc053874c3076640c8cd9dc1c5bf5cf0647`; it does not create a path d
 
 | Artifact | Bytes | SHA-256 |
 |---|---:|---|
-| production `deepwyrm.elf` | 9,658,072 | `a1b4e7f2643b1dd843809cbe4cfe8c689ab49fad3f17e1e09f95e09fd79207cd` |
-| primordial test kernel | 9,827,768 | `1abca97d0f4cdd127f6144ba0826606debe236e19677e23adc64b87af0885dc9` |
+| production `deepwyrm.elf` | 10,486,568 | `8eb955ca5b088677fb2d6f45d39d52cbc9e96508e1cc609ec5ddf0d765e1702b` |
+| primordial test kernel | 10,621,472 | `1544b7f83a1d7de26d3b0be9d17db29194f2a196c20c712edea269656cf6a122` |
 | `loader.efi` | 138,752 | `09427a9574979a6e1f64f493ebe0c50896e419e625ed3cd614992746d74d9beb` |
 | retained `loader.pdb` | 8,056,832 | `58f209ad2369bee1a378532046c04a9ed3fe24f596ea9056e231a6295519088d` |
-| `bootstrap.elf` | 17,520 | `5a825d6da2345f94659efdb5c7627cfcc35c212c88495d67f2dd5f15c599e995` |
-| `system/init0` input | 8,312 | `937464a104782ca8da3c99199e6866ce5779b0e274e0c0912656bc363b972907` |
-| `bin/hello` input | 8,312 | `5f5246a222670530e14ced2bf6bb2f442d47763d9298280fef4e845b859e127e` |
-| bootfs | 16,992 | `0a7722b4c9fe6f4fa6e194a4eeedad84b292f1a0f4b69c16fc0bdaab8333e8da` |
-| FAT32 ESP | 134,217,728 | `b6afcf56e166d9a82dc2075c32f0f80d0f251c36ee896fe8c23681840a74a6a2` |
+| `bootstrap.elf` | 17,936 | `3c6f3be6dc92f99a36201fec77952c2eebcaa39aba30ffa7931c917813b5fd42` |
+| `system/init0` input | 8,184 | `a99077f134b83021a0f7ebd770de5ec02e26795329d9f50823ac53ba456f1d58` |
+| `bin/hello` input | 8,184 | `6866ad9deaf0c62407a39fec48cd5f7c5f1fd4e6d28d95a6d2cde459f40dcd4e` |
+| bootfs | 16,736 | `2ac3969bc9ebbce062888f3a213b8fff8d707764b19e4a69924f83261d4abf51` |
+| production FAT32 ESP | 134,217,728 | `8529ec0e036e83a43f817f8e22d8d8a1a864745026b041ae862e3c8fa6f4edfb` |
+| G4 test FAT32 ESP | 134,217,728 | `cad9477b8b929679905fd9bda64ed09971e9fea780597ab58f1bee62f7142187` |
 
-The native bootstrap, init0, hello, and bootfs reproduce the reviewed D2 hashes under the promoted
-G3 compiler. Two independent bootfs builds and two independent ESP builds are byte-identical.
+The native bootstrap, init0, hello, and bootfs were rebuilt with the corrected soft-float target.
+Two independent bootfs builds and two independent production ESP builds are byte-identical.
 
 ## Artifact inspection
 
@@ -84,7 +86,8 @@ G3 compiler. Two independent bootfs builds and two independent ESP builds are by
 - `loader.efi` is PE32+ AMD64 with EFI application subsystem, no PE imports, and retained PDB.
 - Each native Wyrmroot executable passes the hardened G1-compatible oracle: fixed static `ET_EXEC`,
   one RX load segment, NX stack, no dynamic metadata, relocations, undefined symbols, libc, or
-  interpreter, and exactly one Deepwyrm syscall veneer.
+  interpreter, and exactly one Deepwyrm syscall veneer. Disassembly contains no x87, MMX, SSE, or
+  AVX instruction.
 - Extracting bootfs proves `system/init0` and `bin/hello` are byte-identical to the accepted native
   inputs.
 - The G3 image inspector re-extracts and compares the exact loader, production kernel, bootstrap,
@@ -95,15 +98,14 @@ G3 compiler. Two independent bootfs builds and two independent ESP builds are by
 ## Toolchain identity
 
 The revision-named artifact root contains the promoted `rustc 1.97.1-dev`/LLVM 22.1.6 compiler,
-Cargo 1.96.0, `rust-lld`, the R0 Wyrmroot `core` and `compiler_builtins`, and the exact host
-`proc_macro` support required to build the UEFI dependency graph. The latter was compiled from
-Rust's `library/proc_macro` at the pinned Rust revision plus `rustc-literal-escaper` 0.0.7; it is a
-toolchain input, not copied project source. Exact component hashes are in `G3_EVIDENCE.toml` and
-`MANIFEST.sha256`.
+Cargo 1.96.1, `rust-lld`, and the corrected Wyrmroot `core` and `compiler_builtins`. The built-in
+target selects `RustcAbi::Softfloat` and explicitly disables x87/MMX/SSE/AVX generation. No accepted
+toolchain path is a symlink or depends on the mutable implementation worktree. Exact component
+hashes are in `G3_EVIDENCE.toml` and `MANIFEST.sha256`.
 
 ## Host gates
 
-- Deepwyrm locked workspace tests, 483 kernel unit tests, ABI generation check, strict Clippy,
+- Deepwyrm locked workspace tests, 508 test-support kernel unit tests, ABI generation check, strict Clippy,
   formatting, production freestanding target build, and primordial test-support target build pass.
 - Wyrmroot locked workspace/all-target tests pass, including 50 xtask tests with the pre-existing
   accepted-environment gate ignored; strict workspace/all-target Clippy and warning-denied docs pass.
@@ -147,8 +149,32 @@ The previous artifact root
 `artifacts/dw0-g3/superseded/dw-d3a21cc0e12a__wyr-3d7ff88b2c9b__rust-fc555b0e2ef8/`
 is retained only as superseded evidence. It is no longer an accepted G3 candidate.
 
-## Remaining gate
+## G4 live remediation and final re-promotion
 
-G4 must boot this exact ESP in the designated `OS-Project` VM and validate the structured
-primordial success path, serial evidence, guest-consumed identities, and restoration rules. G3 does
-not claim live boot acceptance.
+The first G4 attempts exposed defects that host composition could not exercise. Deepwyrm
+`d9d81c3102c662926d073f58cb1caa041e66a6ed` prevents LLVM from folding aliased emergency-stack
+linker boundaries as distinct extern statics and sizes initial primordial publication journals for
+the complete 64 KiB stack. Deepwyrm `7e70cf4f31cea89168bc0a54f1c55eef24b0c8cf` applies the same
+bounded journal capacity to native map/unmap syscalls, which allowed the real bootfs mapping to
+publish instead of returning `DW_STATUS_BAD_STATE`.
+
+Rust `532159d837cadeb7d00e35eacb7f31bf0b640c3d` corrects the built-in Wyrmroot target after the
+live kernel's deliberate CR0.TS policy caught compiler-emitted SSE in bootstrap. It selects the
+soft-float ABI and disables hardware FP/vector features. Wyrmroot
+`be2a14435bd3256a535e49aaba0ad03c5e818dd4` pins and records that exact correction. All affected
+kernel, native, bootfs, and ESP artifacts were rebuilt and re-inspected before canonical G4.
+
+Accordingly, the formerly accepted root
+`artifacts/dw0-g3/accepted/dw-65e4cb52cfe4__wyr-c5925a28d876__rust-fc555b0e2ef8/` is retained as
+historical evidence but is superseded by the revision-named root at the top of this record.
+
+## G4 live disposition
+
+Canonical `artifacts/dw0-g4/run-19-canonical/` booted this exact test ESP in the designated
+`OS-Project` VM and emitted `DWTEST1|01|00000012|00000000|1B75A741`. That record proves selector 18
+PASS/detail zero after capability-bearing INIT, read-only bootfs validation, READY, and normal exit.
+Libvirt observed guest-request shutdown. The inactive domain XML was restored byte-for-byte to
+SHA-256 `a823095e2182f848be0c15fe1a88728fce9f126fbc55e7d9aab30d84a6c5d3c3`; UUID, shutoff state,
+disabled autostart, absent managed save/NVRAM, primary disk identity, and empty network set reproduce.
+`G4_EVIDENCE.toml` records the exact profile and hashes. G5 remains open, so this does not yet claim
+DW0-G full acceptance or progression to DW0-H.

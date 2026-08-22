@@ -1,7 +1,9 @@
 schema_version = 1
 request_id = "RUST-WYR0-G4-SOFTFLOAT-002"
-status = "integrated-and-validated"
+status = "accepted-immutable-artifact"
 request_kind = "correct-wyrmroot-native-soft-float-target"
+artifact_root = "/home/mike/Documents/Programming/OS-Project/artifacts/dw0-g3/accepted/dw-7e70cf4f31ce__wyr-be2a14435bd3__rust-532159d837ca/toolchain"
+manifest_sha256 = "c6500a7a3514dd12c7cf235e3175b39fc51d2df2a7f721dc53bad1e34d0c2f98"
 
 [requirement]
 phase_gate = "DW0-G4 designated-VM primordial bootstrap"
@@ -31,6 +33,8 @@ rustc_sha256 = "65bd51e9ecb8e1185524471a8cbc4af1e6ac4e37e7d446c7a127bda0fa431c70
 core_sha256 = "6a075e53b274f057fe6ed67e40a2b7f62308c6cad6c7d6d1e863a27c43e34ba2"
 compiler_builtins_sha256 = "ff7f0cfdf665deee050a805c48f381a3dd4842682a74e60da67b147bade2834b"
 bootstrap_sha256 = "3c6f3be6dc92f99a36201fec77952c2eebcaa39aba30ffa7931c917813b5fd42"
+init0_sha256 = "a99077f134b83021a0f7ebd770de5ec02e26795329d9f50823ac53ba456f1d58"
+hello_sha256 = "6866ad9deaf0c62407a39fec48cd5f7c5f1fd4e6d28d95a6d2cde459f40dcd4e"
 
 [policy]
 human_reviewer = "not-required-no-rust-local-policy-present"
