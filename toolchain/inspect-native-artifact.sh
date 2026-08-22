@@ -2,12 +2,25 @@
 # Inspect one completed WYR0 native ELF without executing it.
 set -eu
 
-if [ "$#" -ne 1 ]; then
-    printf '%s\n' 'usage: sh toolchain/inspect-native-artifact.sh <native-elf>' >&2
-    exit 2
-fi
+inspection_mode=production
+case "$#" in
+    1)
+        artifact=$1
+        ;;
+    2)
+        if [ "$1" != '--primordial-invalid-return-test' ]; then
+            printf '%s\n' 'usage: sh toolchain/inspect-native-artifact.sh [--primordial-invalid-return-test] <native-elf>' >&2
+            exit 2
+        fi
+        inspection_mode=primordial-invalid-return-test
+        artifact=$2
+        ;;
+    *)
+        printf '%s\n' 'usage: sh toolchain/inspect-native-artifact.sh [--primordial-invalid-return-test] <native-elf>' >&2
+        exit 2
+        ;;
+esac
 
-artifact=$1
 if [ -L "$artifact" ] || [ ! -f "$artifact" ] || [ ! -s "$artifact" ]; then
     printf '%s\n' 'native artifact must be a nonempty regular file, not a symbolic link' >&2
     exit 1
@@ -151,12 +164,55 @@ printf '%s\n' "$symbols" | awk '$3 == "dw_syscall6" { found=1 } END { exit !foun
     exit 1
 }
 syscall_count=$(printf '%s\n' "$disassembly" | awk '$0 ~ /[[:space:]]syscall([[:space:]]|$)/ { count++ } END { print count + 0 }')
-if [ "$syscall_count" -ne 1 ]; then
-    printf 'native artifact has %s syscall instructions; expected the single binding veneer\n' \
-        "$syscall_count" >&2
+veneer_syscall_count=$(printf '%s\n' "$disassembly" | awk '
+    /^[[:xdigit:]]+ <dw_syscall6>:/ { veneer=1; next }
+    veneer && /^[[:xdigit:]]+ <[^>]+>:/ { veneer=0 }
+    veneer && $0 ~ /[[:space:]]syscall([[:space:]]|$)/ { count++ }
+    END { print count + 0 }
+')
+if [ "$veneer_syscall_count" -ne 1 ]; then
+    printf 'native artifact has %s syscall instructions in dw_syscall6; expected exactly one\n' \
+        "$veneer_syscall_count" >&2
     exit 1
 fi
 
+if [ "$inspection_mode" = production ]; then
+    if [ "$syscall_count" -ne 1 ]; then
+        printf 'native artifact has %s syscall instructions; expected the single binding veneer\n' \
+            "$syscall_count" >&2
+        exit 1
+    fi
+else
+    if [ "$syscall_count" -ne 2 ]; then
+        printf 'invalid-return test artifact has %s syscall instructions; expected one binding veneer and one test tail\n' \
+            "$syscall_count" >&2
+        exit 1
+    fi
+    invalid_return_tail_count=$(printf '%s\n' "$disassembly" | awk -F '\t' '
+        $2 == "movl" && $3 ~ /^\$0xffffffff, %eax([[:space:]]|$)/ { state=1; next }
+        state == 1 && $2 == "xorq" && $3 == "%rdi, %rdi" { state=2; next }
+        state == 2 && $2 == "xorq" && $3 == "%rsi, %rsi" { state=3; next }
+        state == 3 && $2 == "xorq" && $3 == "%rdx, %rdx" { state=4; next }
+        state == 4 && $2 == "xorq" && $3 == "%r10, %r10" { state=5; next }
+        state == 5 && $2 == "xorq" && $3 == "%r8, %r8" { state=6; next }
+        state == 6 && $2 == "xorq" && $3 == "%r9, %r9" { state=7; next }
+        state == 7 && $2 == "xorq" && $3 == "%rsp, %rsp" { state=8; next }
+        state == 8 && $2 == "syscall" { state=9; next }
+        state == 9 && $2 == "ud2" { count++; state=0; next }
+        state != 0 { state=0 }
+        END { print count + 0 }
+    ')
+    if [ "$invalid_return_tail_count" -ne 1 ]; then
+        printf '%s\n' 'invalid-return test artifact lacks exactly one u32::MAX/zero-argument/RSP=0/syscall/UD2 tail' >&2
+        exit 1
+    fi
+fi
+
 sha256=$(sha256sum "$artifact" | awk '{ print $1 }')
-printf '{"schema_version":1,"report_kind":"wyrmroot-wyr0-native-artifact-inspection","verified":true,"artifact":"%s","sha256":"%s","size":%s,"program_headers":%s,"load_segments":%s,"syscall_veneers":1}\n' \
-    "$(basename "$artifact")" "$sha256" "$size" "$program_count" "$load_count"
+if [ "$inspection_mode" = production ]; then
+    printf '{"schema_version":1,"report_kind":"wyrmroot-wyr0-native-artifact-inspection","verified":true,"artifact":"%s","sha256":"%s","size":%s,"program_headers":%s,"load_segments":%s,"syscall_veneers":1}\n' \
+        "$(basename "$artifact")" "$sha256" "$size" "$program_count" "$load_count"
+else
+    printf '{"schema_version":1,"report_kind":"wyrmroot-wyr0-native-artifact-inspection","verified":true,"artifact":"%s","sha256":"%s","size":%s,"program_headers":%s,"load_segments":%s,"syscall_veneers":1,"test_only_invalid_return_tails":1}\n' \
+        "$(basename "$artifact")" "$sha256" "$size" "$program_count" "$load_count"
+fi

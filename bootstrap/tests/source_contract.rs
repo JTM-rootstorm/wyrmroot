@@ -7,6 +7,10 @@ use wyrmroot_runtime as _;
 const MANIFEST: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
 const MAIN_SOURCE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
 const LIB_SOURCE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
+const NATIVE_ARTIFACT_INSPECTOR: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../toolchain/inspect-native-artifact.sh"
+));
 
 #[test]
 fn primordial_variants_are_explicit_mutually_exclusive_test_features() {
@@ -40,4 +44,24 @@ fn production_path_stays_separate_from_test_only_hook_and_terminal_behaviors() {
 fn blocking_variant_does_not_import_the_ordinary_bootstrap_entry() {
     assert!(MAIN_SOURCE.contains("#[cfg(not(feature = \"primordial-blocking-cleanup\"))]"));
     assert!(MAIN_SOURCE.contains("use wyrmroot_bootstrap::run_bootstrap;"));
+}
+
+#[test]
+fn artifact_oracle_has_one_exact_invalid_return_test_tail_exception() {
+    assert!(NATIVE_ARTIFACT_INSPECTOR.contains("--primordial-invalid-return-test"));
+    assert!(NATIVE_ARTIFACT_INSPECTOR.contains("if [ \"$syscall_count\" -ne 1 ]"));
+    assert!(NATIVE_ARTIFACT_INSPECTOR.contains("if [ \"$syscall_count\" -ne 2 ]"));
+    for instruction in [
+        "$0xffffffff, %eax",
+        "%rdi, %rdi",
+        "%rsi, %rsi",
+        "%rdx, %rdx",
+        "%r10, %r10",
+        "%r8, %r8",
+        "%r9, %r9",
+        "%rsp, %rsp",
+        "test_only_invalid_return_tails\":1",
+    ] {
+        assert!(NATIVE_ARTIFACT_INSPECTOR.contains(instruction));
+    }
 }

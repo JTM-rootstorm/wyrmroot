@@ -117,6 +117,17 @@ program-header and load-segment counts, W^X, NX stack, entry symbol, absence of
 dynamic metadata, relocations, and undefined symbols, and that the only raw
 `syscall` instruction belongs to the Deepwyrm binding veneer.
 
+The explicit primordial invalid-return test artifact is the sole exception:
+
+```text
+sh toolchain/inspect-native-artifact.sh --primordial-invalid-return-test <native-elf>
+```
+
+That mode requires exactly two raw `syscall` instructions: the ordinary binding
+veneer and one terminal test tail that loads `u32::MAX`, zeros every syscall
+argument plus `RSP`, executes `syscall`, and falls through only to `UD2`. It does
+not relax the production invocation above.
+
 The host-only deterministic bootfs encoder accepts the exact native `init0` and
 `hello` artifacts and writes a new output without following or replacing an
 existing path:
