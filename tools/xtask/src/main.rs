@@ -2,6 +2,7 @@ mod cli;
 mod deep_layout;
 mod elf_runtime;
 mod error;
+mod g3_image;
 mod metadata;
 mod provenance;
 mod sha256;
@@ -32,9 +33,9 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(arguments: &[String]) -> Result<Option<&'static str>, Failure> {
+fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
     match dispatch(arguments)? {
-        Action::Help => Ok(Some(USAGE)),
+        Action::Help => Ok(Some(USAGE.to_owned())),
         Action::Build(scope) => {
             let repository = tasks::repository_root()?;
             let manifest = BuildManifest::load(&repository)?;
@@ -86,6 +87,8 @@ fn run(arguments: &[String]) -> Result<Option<&'static str>, Failure> {
             tasks::run_host_tests(&repository, filter.as_deref())?;
             Ok(None)
         }
+        Action::BuildG3Image(arguments) => g3_image::build(&arguments).map(Some),
+        Action::InspectG3Image(arguments) => g3_image::inspect(&arguments).map(Some),
         Action::Unavailable(command) => Err(Failure::unavailable(command)),
     }
 }

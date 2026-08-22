@@ -1,5 +1,5 @@
 const FUTURE_PHASE_MESSAGE: &str =
-    "is unavailable in WYR0-C; it requires later image/guest integration phases";
+    "is unavailable in the current WYR0-G3 surface; it requires a later phase";
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum FailureKind {

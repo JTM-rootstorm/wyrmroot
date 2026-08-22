@@ -4,9 +4,9 @@ pub(crate) const USAGE: &str = r#"Wyrmroot development task dispatcher
 
 Usage:
     cargo xtask build [host|loader|bootfs]
-    cargo xtask image
+    cargo xtask image <loader.efi> <deepwyrm.elf> <bootstrap.elf> <bootfs.img> <esp.img>
     cargo xtask run
-    cargo xtask inspect-image
+    cargo xtask inspect-image <esp.img> <loader.efi> <deepwyrm.elf> <bootstrap.elf> <bootfs.img>
     cargo xtask gdb
     cargo xtask test host [filter]
     cargo xtask test <guest|integration> [filter]
@@ -14,10 +14,19 @@ Usage:
 Host filters may name a component (bootfs, protocol, elf, runtime, bootstrap,
 efi, init0, hello, or xtask), package:<workspace-package>, or test:<substring>.
 
-WYR0-C implements host, UEFI-loader, and bootfs build/test orchestration. Image,
-run, image inspection, GDB, guest-test, integration-test, and external
-kernel-artifact collection remain unavailable until their assigned later phases.
+WYR0-G3 adds only the exact paired deterministic ESP build and inspection
+surface above. Run, GDB, guest-test, integration-test, and general image-builder
+work remain unavailable until their assigned later phases.
 "#;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct G3ImageArguments {
+    pub(crate) image: String,
+    pub(crate) loader: String,
+    pub(crate) kernel: String,
+    pub(crate) bootstrap: String,
+    pub(crate) bootfs: String,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BuildScope {
@@ -46,6 +55,8 @@ pub(crate) enum Action {
     Help,
     Build(BuildScope),
     HostTests(Option<String>),
+    BuildG3Image(G3ImageArguments),
+    InspectG3Image(G3ImageArguments),
     Unavailable(&'static str),
 }
 
@@ -60,15 +71,45 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
             Ok(Action::Help)
         }
         "build" => dispatch_build(&arguments[1..]),
-        "image" => unavailable_without_arguments(arguments, "image"),
+        "image" => dispatch_image(&arguments[1..]),
         "run" => unavailable_without_arguments(arguments, "run"),
-        "inspect-image" => unavailable_without_arguments(arguments, "inspect-image"),
+        "inspect-image" => dispatch_inspect_image(&arguments[1..]),
         "gdb" => unavailable_without_arguments(arguments, "gdb"),
         "test" => dispatch_test(&arguments[1..]),
         unknown => Err(Failure::usage(format!(
             "unknown command '{unknown}'\n\n{USAGE}"
         ))),
     }
+}
+
+fn dispatch_image(arguments: &[String]) -> Result<Action, Failure> {
+    let [loader, kernel, bootstrap, bootfs, image] = arguments else {
+        return Err(Failure::usage(
+            "image requires loader, kernel, bootstrap, bootfs, and output ESP paths",
+        ));
+    };
+    Ok(Action::BuildG3Image(G3ImageArguments {
+        image: image.clone(),
+        loader: loader.clone(),
+        kernel: kernel.clone(),
+        bootstrap: bootstrap.clone(),
+        bootfs: bootfs.clone(),
+    }))
+}
+
+fn dispatch_inspect_image(arguments: &[String]) -> Result<Action, Failure> {
+    let [image, loader, kernel, bootstrap, bootfs] = arguments else {
+        return Err(Failure::usage(
+            "inspect-image requires ESP, loader, kernel, bootstrap, and bootfs paths",
+        ));
+    };
+    Ok(Action::InspectG3Image(G3ImageArguments {
+        image: image.clone(),
+        loader: loader.clone(),
+        kernel: kernel.clone(),
+        bootstrap: bootstrap.clone(),
+        bootfs: bootfs.clone(),
+    }))
 }
 
 fn dispatch_build(arguments: &[String]) -> Result<Action, Failure> {
@@ -164,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn help_and_wyr0_c_actions_dispatch() {
+    fn help_and_available_actions_dispatch() {
         for command in ["help", "--help", "-h"] {
             assert_eq!(dispatch(&arguments(&[command])), Ok(Action::Help));
         }
@@ -194,15 +235,13 @@ mod tests {
         assert!(!BuildScope::Bootfs.runs_workspace());
         assert!(!BuildScope::Bootfs.runs_loader());
         assert!(BuildScope::Bootfs.runs_bootfs_package());
-        assert!(USAGE.contains("WYR0-C implements host, UEFI-loader, and bootfs"));
+        assert!(USAGE.contains("WYR0-G3 adds only the exact paired deterministic ESP"));
     }
 
     #[test]
     fn later_phase_tasks_are_stable_unavailable_failures() {
         for values in [
-            &["image"][..],
-            &["run"],
-            &["inspect-image"],
+            &["run"][..],
             &["gdb"],
             &["test", "guest"],
             &["test", "integration", "wyr0"],
@@ -215,8 +254,30 @@ mod tests {
             let failure = Failure::unavailable(command);
             assert_eq!(failure.kind, FailureKind::Unavailable);
             assert_eq!(failure.exit_code(), 1);
-            assert!(failure.message.contains("unavailable in WYR0-C"));
+            assert!(
+                failure
+                    .message
+                    .contains("unavailable in the current WYR0-G3 surface")
+            );
         }
+
+        assert_eq!(
+            dispatch(&arguments(&[
+                "image",
+                "loader.efi",
+                "deepwyrm.elf",
+                "bootstrap.elf",
+                "bootfs.img",
+                "esp.img",
+            ])),
+            Ok(Action::BuildG3Image(super::G3ImageArguments {
+                image: "esp.img".to_owned(),
+                loader: "loader.efi".to_owned(),
+                kernel: "deepwyrm.elf".to_owned(),
+                bootstrap: "bootstrap.elf".to_owned(),
+                bootfs: "bootfs.img".to_owned(),
+            }))
+        );
     }
 
     #[test]
@@ -228,6 +289,8 @@ mod tests {
             &["build", "host", "extra"],
             &["build", "bootfs", "extra"],
             &["image", "extra"],
+            &["inspect-image"],
+            &["inspect-image", "one", "two"],
             &["test"],
             &["test", "unknown"],
             &["test", "host", "one", "two"],
