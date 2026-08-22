@@ -7,10 +7,10 @@ wyrmroot_dirty = false
 deepwyrm_revision = "9954cbc053874c3076640c8cd9dc1c5bf5cf0647"
 deepwyrm_dirty = false
 deepwyrm_abi_dependency_state = "available"
-rust_revision = "fc555b0e2ef86b8037b6069ef3157c4862fa028d"
+rust_revision = "532159d837cadeb7d00e35eacb7f31bf0b640c3d"
 
 [toolchain]
-rust_toolchain_name = "wyrmroot-1.97.1-fc555b0e"
+rust_toolchain_name = "wyrmroot-1.97.1-532159d8"
 rustc_commit_hash = ""
 rustc_host = ""
 clang_version = ""

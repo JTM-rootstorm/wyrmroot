@@ -1,0 +1,40 @@
+schema_version = 1
+request_id = "RUST-WYR0-G4-SOFTFLOAT-002"
+status = "integrated-and-validated"
+request_kind = "correct-wyrmroot-native-soft-float-target"
+
+[requirement]
+phase_gate = "DW0-G4 designated-VM primordial bootstrap"
+consumer_repository = "wyrmroot"
+expected_behavior = "Compile primordial Wyrmroot userspace without x87, MMX, SSE, or AVX instructions so it can execute under Deepwyrm's deliberate CR0.TS and unavailable FP/SIMD policy."
+
+[rust]
+canonical_base_commit = "fc555b0e2ef86b8037b6069ef3157c4862fa028d"
+accepted_commit = "532159d837cadeb7d00e35eacb7f31bf0b640c3d"
+fork_repository = "git@github.com:JTM-rootstorm/rust.git"
+target = "x86_64-unknown-wyrmroot"
+stage = 1
+rustc_abi = "softfloat"
+target_features = "-mmx,-sse,-sse2,-sse3,-ssse3,-sse4.1,-sse4.2,-avx,-avx2,+soft-float"
+components = ["rustc", "core", "compiler-builtins", "rust-lld"]
+
+[validation]
+rustc_target_tests_lane = "passed-329"
+rustc_target_tests_canonical = "passed-329"
+core_build = "passed"
+compiler_builtins_build = "passed"
+bootstrap_consumer_build = "passed"
+bootstrap_simd_disassembly = "no-x87-mmx-xmm-ymm-zmm-instructions"
+
+[artifacts]
+rustc_sha256 = "65bd51e9ecb8e1185524471a8cbc4af1e6ac4e37e7d446c7a127bda0fa431c70"
+core_sha256 = "6a075e53b274f057fe6ed67e40a2b7f62308c6cad6c7d6d1e863a27c43e34ba2"
+compiler_builtins_sha256 = "ff7f0cfdf665deee050a805c48f381a3dd4842682a74e60da67b147bade2834b"
+bootstrap_sha256 = "3c6f3be6dc92f99a36201fec77952c2eebcaa39aba30ffa7931c917813b5fd42"
+
+[policy]
+human_reviewer = "not-required-no-rust-local-policy-present"
+soundness_classification = "target-specification-and-static-runtime-boundary"
+source_edit_requested = true
+security_gate = "not-run-G5-remains-separate"
+notes = "The Rust checkout contains no repository-local AGENTS.md, so the workspace policy governed the isolated lane and canonical integration. The change disables hardware FP/vector code generation for the native target; it does not add std, alloc, TLS, unwinding, libc, CRT, a dynamic linker, Unix-family membership, or runtime FP emulation."
