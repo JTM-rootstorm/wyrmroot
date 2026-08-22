@@ -6,9 +6,11 @@ use core::panic::PanicInfo;
 
 use deepwyrm_syscall::{DwHandle, DwReceivedHandleInfoV1};
 use wyrmroot_bootfs as _;
+use wyrmroot_bootstrap::BootstrapSystem;
+#[cfg(not(feature = "primordial-blocking-cleanup"))]
+use wyrmroot_bootstrap::run_bootstrap;
 #[cfg(feature = "primordial-blocking-cleanup")]
 use wyrmroot_bootstrap::run_bootstrap_with_before_ready;
-use wyrmroot_bootstrap::{BootstrapSystem, run_bootstrap};
 use wyrmroot_bootstrap_proto as _;
 use wyrmroot_runtime::{
     CapabilityInfo, MappingPlan, NativeError, ReceiveCounts, StartupBlock, close_handle,

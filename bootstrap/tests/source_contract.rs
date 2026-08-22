@@ -35,3 +35,9 @@ fn production_path_stays_separate_from_test_only_hook_and_terminal_behaviors() {
     assert!(!MAIN_SOURCE.contains("DW_SYSCALL_"));
     assert!(!MAIN_SOURCE.contains("0x000400"));
 }
+
+#[test]
+fn blocking_variant_does_not_import_the_ordinary_bootstrap_entry() {
+    assert!(MAIN_SOURCE.contains("#[cfg(not(feature = \"primordial-blocking-cleanup\"))]"));
+    assert!(MAIN_SOURCE.contains("use wyrmroot_bootstrap::run_bootstrap;"));
+}
