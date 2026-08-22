@@ -43,6 +43,22 @@ populated the project-local Cargo cache from the clean Deepwyrm repository witho
 manifest, lockfile, source identity, or accepted dependency graph. No Cargo path patch or host path
 dependency was used for accepted artifacts.
 
+For host-local replay, set `DEEPWYRM_REPO` to the clean Deepwyrm checkout and use a disposable Git
+configuration only for the Cargo process tree:
+
+```sh
+rewrite="$(mktemp)"
+git config --file "$rewrite" \
+  url."file://$DEEPWYRM_REPO".insteadOf \
+  https://github.com/JTM-rootstorm/deepwyrm.git
+GIT_CONFIG_GLOBAL="$rewrite" CARGO_NET_GIT_FETCH_WITH_CLI=true \
+  cargo test --locked --workspace --all-targets
+rm -f "$rewrite"
+```
+
+The rewrite changes transport only. Cargo still resolves the GitHub source identity and exact locked
+revision `9954cbc053874c3076640c8cd9dc1c5bf5cf0647`; it does not create a path dependency or patch.
+
 ## Accepted artifacts
 
 | Artifact | Bytes | SHA-256 |

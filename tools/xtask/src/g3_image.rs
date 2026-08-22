@@ -139,12 +139,25 @@ pub(crate) fn build(arguments: &G3ImageArguments) -> Result<String, Failure> {
             .map_err(|error| Failure::task(format!("could not sync G3 ESP: {error}")))?;
         Ok(())
     })();
+    drop(output);
     if let Err(error) = result {
-        drop(output);
         let _ = fs::remove_file(&output_path);
         return Err(error);
     }
-    inspect(arguments)
+    inspect_created_or_remove(arguments, &output_path)
+}
+
+fn inspect_created_or_remove(
+    arguments: &G3ImageArguments,
+    output_path: &Path,
+) -> Result<String, Failure> {
+    match inspect(arguments) {
+        Ok(report) => Ok(report),
+        Err(error) => {
+            let _ = fs::remove_file(output_path);
+            Err(error)
+        }
+    }
 }
 
 pub(crate) fn inspect(arguments: &G3ImageArguments) -> Result<String, Failure> {
@@ -698,6 +711,27 @@ mod tests {
         assert_eq!(inspect(&arguments).unwrap(), report);
         let error = build(&arguments).expect_err("existing image was overwritten");
         assert!(error.message.contains("already exists"));
+        fs::remove_dir_all(root).expect("remove G3 image fixture");
+    }
+
+    #[test]
+    fn failed_post_build_inspection_removes_the_new_output() {
+        let (root, arguments) = fixture();
+        build(&arguments).expect("build initial G3 image");
+        OpenOptions::new()
+            .write(true)
+            .open(&arguments.image)
+            .expect("open G3 image for corruption")
+            .set_len(1)
+            .expect("truncate G3 image");
+        let image = Path::new(&arguments.image);
+        let error = inspect_created_or_remove(&arguments, image)
+            .expect_err("corrupt post-build image unexpectedly passed inspection");
+        assert!(error.message.contains("wrong type or fixed byte length"));
+        assert!(
+            !image.exists(),
+            "failed inspection left a poisoned G3 output"
+        );
         fs::remove_dir_all(root).expect("remove G3 image fixture");
     }
 }
