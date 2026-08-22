@@ -411,6 +411,23 @@ Limits and accounting are queried/changed through typed rights-controlled interf
 
 Exact scheduler/resource algorithms are deferred.
 
+## 11.1 Future real-time resource policy
+
+Wyrmroot remains a general-purpose platform, but its native resource-policy layer must preserve the ability to authorize **firm/soft real-time** execution for latency-sensitive native workloads without turning the whole OS into an RTOS.
+
+Platform direction:
+
+- ordinary processes and services use the normal general-purpose scheduling class by default;
+- real-time scheduling is privileged resource policy, not an ambient application preference. A future service/resource controller should grant bounded RT authority to an eligible TaskGroup or equivalent scope only when policy and admission control permit it;
+- pro-audio, VR/tracking, media, and latency-sensitive display services are expected native consumers, but those examples do not justify audio-, VR-, or graphics-specific Deepwyrm scheduler semantics;
+- a synchronous native service dependency that must complete on behalf of RT work must be able to preserve or inherit appropriate scheduling urgency across the client -> service -> driver/service chain. Native service design must not assume that putting only the leaf application at high priority solves end-to-end latency;
+- future RT policy should pair execution budgets/reservations with throttling and CPU/IRQ affinity where needed so an authorized RT workload cannot indefinitely starve the normal desktop;
+- services entering RT execution should be able to prefault/pin/commit the working memory and resources required for their bounded path before the time-sensitive section begins rather than depending on pageable/file-backed fault handling at an arbitrary instant;
+- latency guarantees are measurable properties of an exact kernel, userspace dependency chain, and hardware profile. Wyrmroot must not advertise hard-real-time guarantees on commodity hardware merely because Deepwyrm provides priority/deadline mechanisms; and
+- POSIX/Linux/Windows compatibility scheduling APIs translate onto admitted native scheduling/resource mechanisms and remain subject to native authorization/admission policy.
+
+No WYR0 protocol, package declaration, service-manager field, priority scale, or real-time capability format is reserved here. The first post-DW0 scheduler work belongs to Deepwyrm's normal preemptive/SMP foundation; Wyrmroot should begin live end-to-end RT policy integration only after its real process/service dependency chain is sufficiently developed to test propagation honestly.
+
 ---
 
 # 12. Feature discovery and compatibility negotiation
@@ -638,6 +655,7 @@ The following remain implementation/milestone decisions and must not be inferred
 
 - physical page allocator algorithm
 - final scheduler algorithm/quantum
+- final normal/real-time scheduler-class representation, priority scale, reservation/admission interface, and urgency-propagation policy
 - persistent filesystem implementation
 - dynamic-linker implementation details
 - package recipe syntax beyond already pinned high-level direction
@@ -669,6 +687,7 @@ Every future Wyrmroot milestone plan should explicitly check whether it introduc
 - native library ABI
 - package ownership/update generations
 - task/resource accounting
+- scheduler/real-time authorization, admission, or urgency-propagation policy
 - clock domains
 - device identity
 - debug-only API

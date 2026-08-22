@@ -227,6 +227,19 @@ EFI loader
 
 WYR0 implements only the loader and primordial startup pieces necessary to prove userspace process loading. It does not need the final PID 1 or service system yet.
 
+## 2.12 Scheduling and future real-time boundary
+
+WYR0 does not require or define the permanent Deepwyrm scheduler policy. Its loader -> bootstrap -> `init0` -> `hello` proof must remain valid on DW0's simple scheduler and must not acquire a hidden dependency on priority classes, timer-driven preemption, real-time reservations, or scheduler-specific protocol metadata.
+
+The longer-term direction is deliberately staged:
+
+1. DW0-H validates the existing task/wait/scheduler mechanisms under SMP without introducing RT policy.
+2. The first scheduler-focused post-DW0 work establishes the normal general-purpose timer-preemptive/SMP scheduler and latency instrumentation.
+3. A later DW1 phase may expose capability-authorized firm/soft real-time mechanisms after the normal scheduler is proven.
+4. Wyrmroot should use its real multi-process/service dependency chains to validate later priority/deadline propagation and admission policy rather than shaping WYR0 bootstrap protocol around speculative RT semantics.
+
+WYR0 therefore reserves no priority scale, scheduler-class identifier, budget/period/deadline record, RT package metadata, or service-manager field. Native protocols should remain asynchronous/bounded where already required and must not prevent later urgency propagation, but no new RT field is added merely for future-proofing.
+
 ---
 
 # 3. Canonical dependency and version pinning
@@ -671,6 +684,8 @@ Do not expand WYR0 to include:
 - service supervisor
 - service dependency controller
 - final logging service
+- permanent scheduler/resource-control policy or timer-driven preemption work
+- real-time scheduling authorization/admission, priority/deadline propagation, reservations/budgets, or hard-real-time guarantees
 - TTY/PTY
 - interactive shell
 - POSIX shell compatibility
