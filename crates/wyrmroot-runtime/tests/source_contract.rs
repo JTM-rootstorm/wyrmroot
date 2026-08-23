@@ -32,7 +32,8 @@ fn native_surface_uses_the_deepwyrm_owned_binding() {
     assert!(SOURCE.contains("deepwyrm_syscall::wait_many"));
     assert!(SOURCE.contains("deepwyrm_syscall::object_get_task_state_v1"));
     assert!(SOURCE.contains("deepwyrm_syscall::address_region_map"));
-    assert!(NATIVE_SOURCE.contains("DW_SYSCALL_CLOCK_GET"));
+    assert!(SOURCE.contains("deepwyrm_syscall::clock_get"));
+    assert!(!NATIVE_SOURCE.contains("DW_SYSCALL_CLOCK_GET"));
     assert!(!NATIVE_SOURCE.contains("DW_SYSCALL_WAIT_"));
     assert!(!SOURCE.contains("global_asm!"));
     assert!(!SOURCE.contains("asm!"));
@@ -64,11 +65,11 @@ fn guest_runtime_has_no_host_personality_dependency() {
 }
 
 #[test]
-fn runtime_unsafe_is_confined_to_the_validated_bootfs_slice_and_clock_boundaries() {
-    assert_eq!(NATIVE_SOURCE.matches("unsafe {").count(), 2);
+fn runtime_unsafe_is_confined_to_the_validated_bootfs_slice_boundary() {
+    assert_eq!(NATIVE_SOURCE.matches("unsafe {").count(), 1);
     assert!(NATIVE_SOURCE.contains("core::slice::from_raw_parts"));
-    assert!(NATIVE_SOURCE.contains("fn raw_clock_get"));
-    assert!(NATIVE_SOURCE.contains("fn dw_syscall6("));
+    assert!(!NATIVE_SOURCE.contains("fn raw_clock_get"));
+    assert!(!NATIVE_SOURCE.contains("fn dw_syscall6("));
     assert!(!NATIVE_SOURCE.contains("unsafe fn"));
     assert!(!NATIVE_SOURCE.contains("from_raw_parts_mut"));
 }
