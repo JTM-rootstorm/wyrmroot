@@ -3,9 +3,12 @@
 use deepwyrm_syscall::{
     DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE, DW_ADDRESS_REGION_MAP_ARGS_V1_VERSION,
     DW_CHANNEL_RECEIVE_RESULT_V1_SIZE, DW_MEMORY_OBJECT_INFO_V1_SIZE, DW_MEMORY_PROTECTION_READ,
-    DW_OBJECT_INFO_V1_SIZE, DW_STATUS_SUCCESS, DwAddressRegionMapArgsV1, DwAddressRegionMapFlags,
-    DwChannelReceiveResultV1, DwHandle, DwHandleTransferV1, DwMemoryObjectInfoV1, DwObjectInfoV1,
-    DwObjectType, DwOffset, DwReceivedHandleInfoV1, DwRights, DwSize, DwStatus, DwUserAddress,
+    DW_OBJECT_INFO_V1_SIZE, DW_SIGNALS_KNOWN_MASK, DW_STATUS_SUCCESS,
+    DW_TASK_TERMINATION_INFO_V1_SIZE, DW_WAIT_MODE_ANY, DW_WAIT_RESULT_V1_SIZE,
+    DwAddressRegionMapArgsV1, DwAddressRegionMapFlags, DwChannelReceiveResultV1, DwDeadline,
+    DwHandle, DwHandleTransferV1, DwMemoryObjectInfoV1, DwObjectInfoV1, DwObjectType, DwOffset,
+    DwReceivedHandleInfoV1, DwRights, DwSize, DwStatus, DwTaskTerminationInfoV1, DwUserAddress,
+    DwWaitItemV1, DwWaitResultV1,
 };
 
 use crate::{CapabilityInfo, MappingPlan};
@@ -28,6 +31,10 @@ pub enum NativeOutputError {
     InvalidMappedRange,
     /// A successful loader syscall returned malformed handles or records.
     InvalidLoaderOutput,
+    /// A successful wait returned a malformed or unrelated generated result.
+    InvalidWaitResult,
+    /// A successful task-state query returned a malformed generated record.
+    InvalidTaskTerminationInfo,
 }
 
 /// Failure from a native runtime operation.
@@ -133,6 +140,37 @@ pub fn query_memory_object_size(handle: DwHandle) -> Result<u64, NativeError> {
     ))?;
     validate_memory_object_info(&info, required_size)?;
     Ok(info.byte_size)
+}
+
+/// Queries the generated Process or Thread lifecycle and termination record.
+pub fn query_task_termination_info(
+    handle: DwHandle,
+) -> Result<DwTaskTerminationInfoV1, NativeError> {
+    let mut info = DwTaskTerminationInfoV1::default();
+    let mut required_size = 0;
+    require_success(deepwyrm_syscall::object_get_task_state_v1(
+        handle,
+        &mut info,
+        &mut required_size,
+    ))?;
+    validate_task_termination_info(&info, required_size)?;
+    Ok(info)
+}
+
+/// Waits for one of the caller-selected signals using ABI-0 WAIT_ANY.
+pub fn wait_many(
+    items: &[DwWaitItemV1],
+    deadline: DwDeadline,
+) -> Result<DwWaitResultV1, NativeError> {
+    let mut result = DwWaitResultV1::default();
+    require_success(deepwyrm_syscall::wait_many(
+        items,
+        DW_WAIT_MODE_ANY,
+        deadline,
+        &mut result,
+    ))?;
+    validate_wait_result(&result, items)?;
+    Ok(result)
 }
 
 /// Sends one native Channel datagram with optional moved handles.
@@ -256,6 +294,46 @@ fn validate_memory_object_info(
     }
 }
 
+fn validate_task_termination_info(
+    info: &DwTaskTerminationInfoV1,
+    required_size: u64,
+) -> Result<(), NativeError> {
+    if required_size == u64::from(DW_TASK_TERMINATION_INFO_V1_SIZE)
+        && info.size == DW_TASK_TERMINATION_INFO_V1_SIZE
+        && info.version == 1
+        && info.reserved0 == 0
+        && info.reserved == [0; 3]
+    {
+        Ok(())
+    } else {
+        Err(NativeError::Output(
+            NativeOutputError::InvalidTaskTerminationInfo,
+        ))
+    }
+}
+
+fn validate_wait_result(
+    result: &DwWaitResultV1,
+    items: &[DwWaitItemV1],
+) -> Result<(), NativeError> {
+    let index = usize::try_from(result.index)
+        .map_err(|_| NativeError::Output(NativeOutputError::InvalidWaitResult))?;
+    let Some(item) = items.get(index) else {
+        return Err(NativeError::Output(NativeOutputError::InvalidWaitResult));
+    };
+    if result.size == DW_WAIT_RESULT_V1_SIZE
+        && result.version == 1
+        && result.reserved0 == 0
+        && result.reserved == [0; 3]
+        && result.observed.0 & !DW_SIGNALS_KNOWN_MASK.0 == 0
+        && result.observed.0 & item.signals.0 != 0
+    {
+        Ok(())
+    } else {
+        Err(NativeError::Output(NativeOutputError::InvalidWaitResult))
+    }
+}
+
 fn validate_channel_receive(
     result: &DwChannelReceiveResultV1,
     byte_capacity: usize,
@@ -357,6 +435,25 @@ mod tests {
             validate_memory_object_info(&malformed, u64::from(DW_MEMORY_OBJECT_INFO_V1_SIZE))
                 .is_err()
         );
+
+        let task = DwTaskTerminationInfoV1 {
+            size: DW_TASK_TERMINATION_INFO_V1_SIZE,
+            version: 1,
+            ..DwTaskTerminationInfoV1::default()
+        };
+        assert_eq!(
+            validate_task_termination_info(&task, u64::from(DW_TASK_TERMINATION_INFO_V1_SIZE)),
+            Ok(())
+        );
+        let mut malformed_task = task;
+        malformed_task.reserved0 = 1;
+        assert!(
+            validate_task_termination_info(
+                &malformed_task,
+                u64::from(DW_TASK_TERMINATION_INFO_V1_SIZE)
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -384,6 +481,28 @@ mod tests {
         handles[0].handle = DwHandle(0);
         assert!(validate_channel_receive(&result, 4, &handles).is_err());
         assert!(validate_channel_receive(&result, 3, &handles).is_err());
+    }
+
+    #[test]
+    fn validates_wait_results_against_the_requested_items() {
+        let items = [DwWaitItemV1 {
+            handle: DwHandle(9),
+            signals: deepwyrm_syscall::DW_SIGNAL_EXITED,
+        }];
+        let result = DwWaitResultV1 {
+            size: DW_WAIT_RESULT_V1_SIZE,
+            version: 1,
+            index: 0,
+            observed: deepwyrm_syscall::DW_SIGNAL_EXITED,
+            ..DwWaitResultV1::default()
+        };
+        assert_eq!(validate_wait_result(&result, &items), Ok(()));
+        let mut malformed = result;
+        malformed.index = 1;
+        assert!(validate_wait_result(&malformed, &items).is_err());
+        malformed = result;
+        malformed.observed = deepwyrm_syscall::DW_SIGNAL_READABLE;
+        assert!(validate_wait_result(&malformed, &items).is_err());
     }
 
     #[test]

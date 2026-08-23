@@ -20,6 +20,7 @@ mod loader_native;
 mod memory;
 mod native;
 mod startup;
+mod supervision;
 #[cfg(feature = "primordial-test-support")]
 #[allow(
     unsafe_code,
@@ -37,11 +38,16 @@ pub use loader_native::NativeLoaderPlatform;
 pub use native::{
     MappedBootfs, NativeError, NativeOutputError, PANIC_EXIT_CODE, ReceiveCounts, close_handle,
     exit_process, exit_thread, map_bootfs_read_only, panic_abort, query_capability_info,
-    query_memory_object_size, receive_channel, send_channel, unmap_bootfs,
+    query_memory_object_size, query_task_termination_info, receive_channel, send_channel,
+    unmap_bootfs, wait_many,
 };
 pub use startup::{
     AUXILIARY_VECTOR_TERMINATOR, BootstrapChannelHandle, STARTUP_ABI_V1, STARTUP_BLOCK_SIZE,
     StartupBlock, StartupError, StartupRegisters, StartupString, with_native_startup,
+};
+pub use supervision::{
+    ExitValidationError, NativeSupervisionPlatform, SupervisionError, SupervisionPlatform,
+    supervise_child, supervise_native_child, validate_successful_exit,
 };
 #[cfg(feature = "primordial-test-support")]
 pub use test_support::{

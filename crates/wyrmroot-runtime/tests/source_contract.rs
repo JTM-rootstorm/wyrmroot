@@ -8,6 +8,7 @@ const SOURCE: &str = concat!(
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/loader_native.rs")),
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bootstrap.rs")),
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/startup.rs")),
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/supervision.rs")),
 );
 const NATIVE_SOURCE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/native.rs"));
 const LOADER_NATIVE_SOURCE: &str =
@@ -17,6 +18,8 @@ const ENTRY_SOURCE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/sr
 const MEMORY_SOURCE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/memory.rs"));
 const TEST_SUPPORT_SOURCE: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/test_support.rs"));
+const SUPERVISION_SOURCE: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/supervision.rs"));
 const MANIFEST: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
 
 #[test]
@@ -26,10 +29,23 @@ fn native_surface_uses_the_deepwyrm_owned_binding() {
     assert!(SOURCE.contains("deepwyrm_syscall::process_exit"));
     assert!(SOURCE.contains("deepwyrm_syscall::thread_exit"));
     assert!(SOURCE.contains("deepwyrm_syscall::channel_receive"));
+    assert!(SOURCE.contains("deepwyrm_syscall::wait_many"));
+    assert!(SOURCE.contains("deepwyrm_syscall::object_get_task_state_v1"));
     assert!(SOURCE.contains("deepwyrm_syscall::address_region_map"));
     assert!(!SOURCE.contains("DW_SYSCALL_"));
     assert!(!SOURCE.contains("global_asm!"));
     assert!(!SOURCE.contains("asm!"));
+}
+
+#[test]
+fn supervision_stays_bounded_and_uses_structured_process_exit() {
+    assert!(SUPERVISION_SOURCE.contains("DW_DEADLINE_INFINITE"));
+    assert!(SUPERVISION_SOURCE.contains("DW_SIGNAL_READABLE"));
+    assert!(SUPERVISION_SOURCE.contains("DW_SIGNAL_PEER_CLOSED"));
+    assert!(SUPERVISION_SOURCE.contains("DW_SIGNAL_EXITED"));
+    assert!(SUPERVISION_SOURCE.contains("validate_successful_exit"));
+    assert!(SUPERVISION_SOURCE.contains("DW_TERMINATION_NORMAL_EXIT"));
+    assert!(!SUPERVISION_SOURCE.contains("DW_SYSCALL_"));
 }
 
 #[test]
