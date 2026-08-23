@@ -18,10 +18,12 @@ required-features = ["native-init0"]
 
 [features]
 default = []
-native-init0 = ["dep:wyrmroot-runtime"]
+native-init0 = []
 
 [dependencies]
-wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime", optional = true }
+deepwyrm-syscall.workspace = true
+wyrmroot-loader = { path = "../../crates/wyrmroot-loader" }
+wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }
 
 [lints.rust]
 unsafe_code = "deny"

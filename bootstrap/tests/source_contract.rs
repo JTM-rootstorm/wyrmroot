@@ -2,7 +2,6 @@ use deepwyrm_syscall as _;
 use wyrmroot_bootfs as _;
 use wyrmroot_bootstrap as _;
 use wyrmroot_bootstrap_proto as _;
-#[cfg(feature = "loader-smoke-integration")]
 use wyrmroot_loader as _;
 use wyrmroot_runtime as _;
 
@@ -31,7 +30,7 @@ fn primordial_variants_are_explicit_mutually_exclusive_test_features() {
     assert!(
         LIB_SOURCE.contains("the WYR0-E loader-smoke integration is mutually exclusive with primordial behavior variants")
     );
-    assert!(MANIFEST.contains("loader-smoke-integration = [\"dep:wyrmroot-loader\"]"));
+    assert!(MANIFEST.contains("loader-smoke-integration = []"));
     assert!(MANIFEST.contains(
         "native-loader-smoke-integration = [\"native-bootstrap\", \"loader-smoke-integration\"]"
     ));
@@ -41,7 +40,7 @@ fn primordial_variants_are_explicit_mutually_exclusive_test_features() {
 fn production_path_stays_separate_from_test_only_hook_and_terminal_behaviors() {
     assert!(LIB_SOURCE.contains("#[cfg(feature = \"primordial-test-support\")]"));
     assert!(LIB_SOURCE.contains("pub fn run_bootstrap_with_before_ready"));
-    assert!(MAIN_SOURCE.contains("run_bootstrap(&mut system"));
+    assert!(MAIN_SOURCE.contains("run_init0_bootstrap("));
     assert!(MAIN_SOURCE.contains("primordial_blocking_cleanup(channel)"));
     assert!(MAIN_SOURCE.contains("trigger_user_exception()"));
     assert!(MAIN_SOURCE.contains("trigger_invalid_syscall_return()"));
@@ -53,7 +52,13 @@ fn production_path_stays_separate_from_test_only_hook_and_terminal_behaviors() {
 fn blocking_variant_does_not_import_the_ordinary_bootstrap_entry() {
     assert!(MAIN_SOURCE.contains("#[cfg(not(any("));
     assert!(MAIN_SOURCE.contains("feature = \"native-loader-smoke-integration\""));
-    assert!(MAIN_SOURCE.contains("use wyrmroot_bootstrap::run_bootstrap;"));
+    assert!(MAIN_SOURCE.contains("use wyrmroot_bootstrap::run_init0_bootstrap;"));
+    assert!(LIB_SOURCE.contains("pub fn run_init0_bootstrap"));
+    assert!(LIB_SOURCE.contains("profile: LaunchProfile::Init0"));
+    assert!(
+        !LIB_SOURCE
+            .contains("LaunchProfile::Hello,\n            transaction_id: INIT0_TRANSACTION_ID")
+    );
 }
 
 #[test]
