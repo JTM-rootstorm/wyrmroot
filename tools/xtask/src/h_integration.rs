@@ -18,7 +18,7 @@ const MAX_GUEST_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_FIRMWARE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SERIAL_BYTES: u64 = 16 * 1024 * 1024;
 const COMPLETION_RECORD_BYTES: usize = 38;
-const DEFAULT_MEMORY_MIB: u32 = 2048;
+const DEFAULT_MEMORY_MIB: u32 = 1024;
 const SMP_MEMORY_MIB: u32 = 2048;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -943,7 +943,7 @@ mod tests {
     fn locked_profiles_share_media_contract_but_not_cpu_count() {
         assert_eq!(HProfile::Default.vcpus(), 1);
         assert_eq!(HProfile::Smp.vcpus(), 4);
-        assert_eq!(HProfile::Default.memory_mib(), 2048);
+        assert_eq!(HProfile::Default.memory_mib(), 1024);
         assert_eq!(HProfile::Smp.memory_mib(), 2048);
     }
 
