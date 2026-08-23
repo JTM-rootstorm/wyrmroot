@@ -261,6 +261,12 @@ impl BootstrapError {
     }
 }
 
+/// Encodes a native loader-platform failure without losing its bounded cause.
+///
+/// The `0xB1` high byte is reserved for bootstrap loader-platform exits, separate from ordinary
+/// bootstrap-owned categories. Bit 23 records failed rollback, bits 22..16 identify the loader
+/// stage, bit 15 selects a bounded native-output cause, and bits 14..0 carry either that output
+/// code or a saturating absolute native status value.
 const fn loader_platform_exit_code(
     stage: LoadStage,
     cause: NativeError,
@@ -269,10 +275,14 @@ const fn loader_platform_exit_code(
     const PREFIX: u32 = 0xB100_0000;
     let rollback = if rollback_failed { 1 << 23 } else { 0 };
     let cause = match cause {
-        NativeError::Status(status) => status.0.unsigned_abs() & 0xffff,
+        NativeError::Status(status) => bounded_status_code(status.0.unsigned_abs()),
         NativeError::Output(output) => 0x8000 | native_output_code(output),
     };
     PREFIX | rollback | (load_stage_code(stage) << 16) | cause
+}
+
+const fn bounded_status_code(code: u32) -> u32 {
+    if code > 0x7fff { 0x7fff } else { code }
 }
 
 const fn load_stage_code(stage: LoadStage) -> u32 {

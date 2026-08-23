@@ -73,6 +73,29 @@ fn live_exit_code_identifies_bootstrap_owned_failure() {
         .exit_code(),
         0xB18C_8005
     );
+    for status in [
+        deepwyrm_syscall::DwStatus(-32_769),
+        deepwyrm_syscall::DwStatus(i32::MIN),
+    ] {
+        assert_eq!(
+            BootstrapError::Loader(LoadError::Platform {
+                stage: LoadStage::ChannelCreate,
+                cause: NativeError::Status(status),
+                rollback_failed: false,
+            })
+            .exit_code(),
+            0xB101_7FFF
+        );
+    }
+    assert_eq!(
+        BootstrapError::Loader(LoadError::Platform {
+            stage: LoadStage::ChannelCreate,
+            cause: NativeError::Output(wyrmroot_runtime::NativeOutputError::InvalidObjectInfo),
+            rollback_failed: false,
+        })
+        .exit_code(),
+        0xB101_8001
+    );
 }
 
 struct Fixture {

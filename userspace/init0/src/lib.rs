@@ -110,9 +110,11 @@ impl Init0Error {
             Self::Bootfs(_) => PREFIX | 0x07,
             Self::MissingHello => PREFIX | 0x08,
             Self::HelloNotExecutable => PREFIX | 0x09,
-            Self::Loader(LoadError::Platform { stage, .. }) => {
-                PREFIX | 0x0100 | load_stage_code(*stage)
-            }
+            Self::Loader(LoadError::Platform {
+                stage,
+                cause,
+                rollback_failed,
+            }) => loader_platform_exit_code(*stage, *cause, *rollback_failed),
             Self::Loader(_) => PREFIX | 0x01FF,
             Self::Supervision(SupervisionError::Exit(
                 wyrmroot_runtime::ExitValidationError::NonzeroApplicationCode(code),
@@ -122,6 +124,30 @@ impl Init0Error {
             Self::MissingLoadedProcess => PREFIX | 0x0301,
         }
     }
+}
+
+/// Encodes a native loader-platform failure without losing its bounded cause.
+///
+/// The `0x11` high byte is reserved for init0 loader-platform exits, separate from init0's
+/// ordinary `0x10` application-owned categories. Bit 23 records failed rollback, bits 22..16
+/// identify the loader stage, bit 15 selects a bounded native-output cause, and bits 14..0 carry
+/// either that output code or a saturating absolute native status value.
+const fn loader_platform_exit_code(
+    stage: LoadStage,
+    cause: NativeError,
+    rollback_failed: bool,
+) -> u32 {
+    const PREFIX: u32 = 0x1100_0000;
+    let rollback = if rollback_failed { 1 << 23 } else { 0 };
+    let cause = match cause {
+        NativeError::Status(status) => bounded_status_code(status.0.unsigned_abs()),
+        NativeError::Output(output) => 0x8000 | native_output_code(output),
+    };
+    PREFIX | rollback | (load_stage_code(stage) << 16) | cause
+}
+
+const fn bounded_status_code(code: u32) -> u32 {
+    if code > 0x7fff { 0x7fff } else { code }
 }
 
 const fn launch_error_code(error: LaunchError) -> u32 {
@@ -160,6 +186,20 @@ const fn load_stage_code(stage: LoadStage) -> u32 {
         LoadStage::InitSend => 10,
         LoadStage::ThreadStart => 11,
         LoadStage::SuccessCleanup => 12,
+    }
+}
+
+const fn native_output_code(output: wyrmroot_runtime::NativeOutputError) -> u32 {
+    use wyrmroot_runtime::NativeOutputError;
+    match output {
+        NativeOutputError::InvalidObjectInfo => 1,
+        NativeOutputError::InvalidMemoryObjectInfo => 2,
+        NativeOutputError::InvalidChannelReceive => 3,
+        NativeOutputError::InvalidMappedRange => 4,
+        NativeOutputError::InvalidLoaderOutput => 5,
+        NativeOutputError::InvalidWaitResult => 6,
+        NativeOutputError::InvalidTaskTerminationInfo => 7,
+        NativeOutputError::DeadlineOverflow => 8,
     }
 }
 

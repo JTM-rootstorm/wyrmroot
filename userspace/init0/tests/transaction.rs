@@ -12,12 +12,15 @@ use wyrmroot_bootfs::builder::{Builder, FileMode};
 use wyrmroot_init0::{HELLO_PATH, Init0Error, Init0System, run_init0};
 use wyrmroot_loader::{
     launch::{self, LaunchError, LaunchProfile, encode_init, parse_ready},
-    process::{LoaderPlatform, ParentMapping, ProcessCreateRequest, ProcessCreateResult},
+    process::{
+        LoadError, LoadStage, LoaderPlatform, ParentMapping, ProcessCreateRequest,
+        ProcessCreateResult,
+    },
 };
 use wyrmroot_runtime::{
     BOOTFS_EXPECTATION, BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo,
-    LOADER_TASK_GROUP_EXPECTATION, MappingPlan, NativeError, ReceiveCounts, SELF_ROOT_EXPECTATION,
-    SupervisionPlatform,
+    LOADER_TASK_GROUP_EXPECTATION, MappingPlan, NativeError, NativeOutputError, ReceiveCounts,
+    SELF_ROOT_EXPECTATION, SupervisionPlatform,
 };
 
 const CHANNEL: DwHandle = DwHandle(11);
@@ -46,6 +49,90 @@ fn live_exit_code_identifies_init0_owned_failure() {
         Init0Error::Launch(LaunchError::BadCapabilityRole { index: 2 }).exit_code(),
         0x1000_0312
     );
+}
+
+#[test]
+fn live_exit_code_exhaustively_encodes_init0_loader_platform_failures() {
+    let stages = [
+        (LoadStage::ChannelCreate, 1_u32),
+        (LoadStage::ChannelReduce, 2),
+        (LoadStage::ProcessCreate, 3),
+        (LoadStage::MemoryCreate, 4),
+        (LoadStage::ParentMaterialize, 5),
+        (LoadStage::ParentUnmap, 6),
+        (LoadStage::ChildMap, 7),
+        (LoadStage::ThreadCreate, 8),
+        (LoadStage::CapabilityDuplicate, 9),
+        (LoadStage::InitSend, 10),
+        (LoadStage::ThreadStart, 11),
+        (LoadStage::SuccessCleanup, 12),
+    ];
+    let outputs = [
+        (NativeOutputError::InvalidObjectInfo, 1_u32),
+        (NativeOutputError::InvalidMemoryObjectInfo, 2),
+        (NativeOutputError::InvalidChannelReceive, 3),
+        (NativeOutputError::InvalidMappedRange, 4),
+        (NativeOutputError::InvalidLoaderOutput, 5),
+        (NativeOutputError::InvalidWaitResult, 6),
+        (NativeOutputError::InvalidTaskTerminationInfo, 7),
+        (NativeOutputError::DeadlineOverflow, 8),
+    ];
+
+    for (stage, stage_code) in stages {
+        let status = Init0Error::Loader(LoadError::Platform {
+            stage,
+            cause: NativeError::Status(DwStatus(-13)),
+            rollback_failed: false,
+        });
+        assert_eq!(status.exit_code(), 0x1100_000D | (stage_code << 16));
+
+        let status_rollback = Init0Error::Loader(LoadError::Platform {
+            stage,
+            cause: NativeError::Status(DwStatus(-13)),
+            rollback_failed: true,
+        });
+        assert_eq!(
+            status_rollback.exit_code(),
+            0x1180_000D | (stage_code << 16)
+        );
+
+        for (native_output, output_code) in outputs {
+            let output = Init0Error::Loader(LoadError::Platform {
+                stage,
+                cause: NativeError::Output(native_output),
+                rollback_failed: false,
+            });
+            assert_eq!(
+                output.exit_code(),
+                0x1100_8000 | (stage_code << 16) | output_code
+            );
+
+            let output_rollback = Init0Error::Loader(LoadError::Platform {
+                stage,
+                cause: NativeError::Output(native_output),
+                rollback_failed: true,
+            });
+            assert_eq!(
+                output_rollback.exit_code(),
+                0x1180_8000 | (stage_code << 16) | output_code
+            );
+        }
+    }
+
+    for status in [DwStatus(-32_769), DwStatus(i32::MIN)] {
+        let bounded_status = Init0Error::Loader(LoadError::Platform {
+            stage: LoadStage::ChildMap,
+            cause: NativeError::Status(status),
+            rollback_failed: false,
+        });
+        assert_eq!(bounded_status.exit_code(), 0x1107_7FFF);
+    }
+    let output = Init0Error::Loader(LoadError::Platform {
+        stage: LoadStage::ChildMap,
+        cause: NativeError::Output(NativeOutputError::InvalidObjectInfo),
+        rollback_failed: false,
+    });
+    assert_eq!(output.exit_code(), 0x1107_8001);
 }
 
 struct Fixture {
