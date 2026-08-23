@@ -214,13 +214,17 @@ fn inspect_loaded(request: &HRequest, artifacts: &CandidateArtifacts) -> Result<
             "{{\"schema_version\":1,\"phase\":\"WYR0-H\",",
             "\"status\":\"PASS\",\"bootfs_sha256\":\"{}\",",
             "\"esp_sha256\":\"{}\",\"symbols_sha256\":\"{}\",",
-            "\"default\":{{\"vcpu\":1,\"memory_mib\":2048}},",
-            "\"smp\":{{\"vcpu\":4,\"memory_mib\":2048}},",
+            "\"default\":{{\"vcpu\":{},\"memory_mib\":{}}},",
+            "\"smp\":{{\"vcpu\":{},\"memory_mib\":{}}},",
             "\"no_host_share\":true,\"esp_inspection\":{}}}\n"
         ),
         sha256::bytes_digest(&actual_bootfs),
         digest(&request.esp, "ESP")?,
         digest(&artifacts.symbols, "Deepwyrm symbols")?,
+        HProfile::Default.vcpus(),
+        HProfile::Default.memory_mib(),
+        HProfile::Smp.vcpus(),
+        HProfile::Smp.memory_mib(),
         image_report.trim(),
     ))
 }
@@ -334,10 +338,10 @@ fn provenance_contents(
             "hello_sha256 = \"{}\"\n",
             "bootfs_sha256 = \"{}\"\n",
             "esp_sha256 = \"{}\"\n",
-            "default_vcpu = 1\n",
-            "default_memory_mib = 2048\n",
-            "smp_vcpu = 4\n",
-            "smp_memory_mib = 2048\n",
+            "default_vcpu = {}\n",
+            "default_memory_mib = {}\n",
+            "smp_vcpu = {}\n",
+            "smp_memory_mib = {}\n",
             "machine = \"q35\"\n",
             "firmware = \"OVMF\"\n",
             "no_host_share = true\n",
@@ -355,6 +359,10 @@ fn provenance_contents(
         digest(&artifacts.hello, "hello")?,
         digest(&request.bootfs, "bootfs")?,
         digest(&request.esp, "ESP")?,
+        HProfile::Default.vcpus(),
+        HProfile::Default.memory_mib(),
+        HProfile::Smp.vcpus(),
+        HProfile::Smp.memory_mib(),
     ))
 }
 
