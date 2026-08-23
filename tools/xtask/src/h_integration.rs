@@ -11,7 +11,7 @@ use wyrmroot_bootfs::builder::{Builder, FileMode};
 
 use crate::cli::{G3ImageArguments, HProfile};
 use crate::error::Failure;
-use crate::h_request::{self, HRequest};
+use crate::h_request::{self, ExpectedOutcome, HRequest};
 use crate::sha256;
 
 const MAX_GUEST_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
@@ -33,6 +33,25 @@ enum GuestOutcome {
     Pass,
     Fail,
     Panic,
+}
+
+impl GuestOutcome {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::Panic => "panic",
+        }
+    }
+
+    const fn matches(self, expected: ExpectedOutcome) -> bool {
+        matches!(
+            (self, expected),
+            (Self::Pass, ExpectedOutcome::Pass)
+                | (Self::Fail, ExpectedOutcome::Fail)
+                | (Self::Panic, ExpectedOutcome::Panic)
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -214,6 +233,7 @@ fn inspect_loaded(request: &HRequest, artifacts: &CandidateArtifacts) -> Result<
             "{{\"schema_version\":1,\"phase\":\"WYR0-H\",",
             "\"status\":\"PASS\",\"bootfs_sha256\":\"{}\",",
             "\"esp_sha256\":\"{}\",\"symbols_sha256\":\"{}\",",
+            "\"expected_outcome\":\"{}\",\"expected_detail\":{},",
             "\"default\":{{\"vcpu\":{},\"memory_mib\":{}}},",
             "\"smp\":{{\"vcpu\":{},\"memory_mib\":{}}},",
             "\"no_host_share\":true,\"esp_inspection\":{}}}\n"
@@ -221,6 +241,8 @@ fn inspect_loaded(request: &HRequest, artifacts: &CandidateArtifacts) -> Result<
         sha256::bytes_digest(&actual_bootfs),
         digest(&request.esp, "ESP")?,
         digest(&artifacts.symbols, "Deepwyrm symbols")?,
+        request.expected_outcome.name(),
+        request.expected_detail,
         HProfile::Default.vcpus(),
         HProfile::Default.memory_mib(),
         HProfile::Smp.vcpus(),
@@ -338,6 +360,8 @@ fn provenance_contents(
             "hello_sha256 = \"{}\"\n",
             "bootfs_sha256 = \"{}\"\n",
             "esp_sha256 = \"{}\"\n",
+            "expected_outcome = \"{}\"\n",
+            "expected_detail = {}\n",
             "default_vcpu = {}\n",
             "default_memory_mib = {}\n",
             "smp_vcpu = {}\n",
@@ -359,6 +383,8 @@ fn provenance_contents(
         digest(&artifacts.hello, "hello")?,
         digest(&request.bootfs, "bootfs")?,
         digest(&request.esp, "ESP")?,
+        request.expected_outcome.name(),
+        request.expected_detail,
         HProfile::Default.vcpus(),
         HProfile::Default.memory_mib(),
         HProfile::Smp.vcpus(),
@@ -475,18 +501,16 @@ fn execute(
                 .map_or_else(|| "signal".to_owned(), |code| code.to_string())
         )));
     }
-    let status_name = match record.outcome {
-        GuestOutcome::Pass if record.detail == 0 => "PASS",
-        GuestOutcome::Pass => "FAIL",
-        GuestOutcome::Fail => "FAIL",
-        GuestOutcome::Panic => "PANIC",
-    };
+    let expectation_matched = record.outcome.matches(request.expected_outcome)
+        && record.detail == request.expected_detail;
+    let status_name = if expectation_matched { "PASS" } else { "FAIL" };
     let result = format!(
         concat!(
             "{{\"schema_version\":1,\"phase\":\"WYR0-H\",",
             "\"mode\":\"integration\",\"profile\":\"{}\",",
             "\"status\":\"{}\",\"vcpu\":{},\"memory_mib\":{},",
-            "\"test_id\":{},\"detail\":{},\"serial_line\":{},",
+            "\"test_id\":{},\"expected_outcome\":\"{}\",\"expected_detail\":{},",
+            "\"actual_outcome\":\"{}\",\"detail\":{},\"serial_line\":{},",
             "\"qemu_exit_status\":{},\"esp_sha256\":\"{}\",",
             "\"deepwyrm_revision\":\"{}\",\"wyrmroot_revision\":\"{}\",",
             "\"rust_revision\":\"{}\",\"no_host_share\":true}}\n"
@@ -496,6 +520,9 @@ fn execute(
         profile.vcpus(),
         profile.memory_mib(),
         record.test_id,
+        request.expected_outcome.name(),
+        request.expected_detail,
+        record.outcome.name(),
         record.detail,
         record.line,
         expected_exit,
@@ -507,8 +534,11 @@ fn execute(
     write_new(&run.result_json, result.as_bytes(), "integration result")?;
     if status_name != "PASS" {
         return Err(Failure::task(format!(
-            "WYR0-H {} profile returned {status_name} detail {:08X}",
+            "WYR0-H {} profile expected {} {:08X}, observed {} {:08X}",
             profile.name(),
+            request.expected_outcome.name(),
+            request.expected_detail,
+            record.outcome.name(),
             record.detail
         )));
     }
@@ -532,6 +562,7 @@ fn write_integration_host_failure(
             "\"status\":\"ERROR\",\"reason\":\"{}\",",
             "\"vcpu\":{},\"memory_mib\":{},",
             "\"expected_test_id\":{},\"qemu_exit_status\":{},",
+            "\"expected_outcome\":\"{}\",\"expected_detail\":{},",
             "\"esp_sha256\":\"{}\",",
             "\"deepwyrm_revision\":\"{}\",\"wyrmroot_revision\":\"{}\",",
             "\"rust_revision\":\"{}\",\"no_host_share\":true}}\n"
@@ -542,6 +573,8 @@ fn write_integration_host_failure(
         profile.memory_mib(),
         request.test_id,
         exit_status,
+        request.expected_outcome.name(),
+        request.expected_detail,
         digest(&request.esp, "ESP")?,
         request.deepwyrm_revision,
         request.wyrmroot_revision,
@@ -977,6 +1010,21 @@ mod tests {
     }
 
     #[test]
+    fn expected_guest_outcome_requires_the_exact_kind_and_detail() {
+        assert!(GuestOutcome::Fail.matches(ExpectedOutcome::Fail));
+        assert!(!GuestOutcome::Fail.matches(ExpectedOutcome::Pass));
+        assert!(!GuestOutcome::Panic.matches(ExpectedOutcome::Fail));
+        let record = GuestRecord {
+            outcome: GuestOutcome::Fail,
+            test_id: 18,
+            detail: 0xB000_0200,
+            line: 1,
+        };
+        assert!(record.outcome.matches(ExpectedOutcome::Fail));
+        assert_ne!(record.detail, 0);
+    }
+
+    #[test]
     fn qemu_and_gdb_plans_are_centralized_and_share_exact_symbols() {
         let root = PathBuf::from("/candidate");
         let request = HRequest {
@@ -986,6 +1034,8 @@ mod tests {
             rust_revision: "3".repeat(40),
             selector: "primordial-bootstrap".into(),
             test_id: 18,
+            expected_outcome: ExpectedOutcome::Pass,
+            expected_detail: 0,
             timeout_seconds: 180,
             loader: root.join("loader.efi"),
             kernel: root.join("deepwyrm.elf"),
@@ -1075,6 +1125,8 @@ mod tests {
             rust_revision: "3".repeat(40),
             selector: "primordial-bootstrap".into(),
             test_id: 18,
+            expected_outcome: ExpectedOutcome::Pass,
+            expected_detail: 0,
             timeout_seconds: 180,
             loader: root.join("loader.efi"),
             kernel: root.join("deepwyrm.elf"),

@@ -7,7 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use crate::error::Failure;
 
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
-const REQUIRED_KEYS: &[&str] = &[
+const REQUIRED_KEYS_V1: &[&str] = &[
     "schema_version",
     "deepwyrm_revision",
     "wyrmroot_revision",
@@ -28,6 +28,46 @@ const REQUIRED_KEYS: &[&str] = &[
     "ovmf_vars_template",
     "run_directory",
 ];
+const REQUIRED_KEYS_V2: &[&str] = &[
+    "schema_version",
+    "deepwyrm_revision",
+    "wyrmroot_revision",
+    "rust_revision",
+    "selector",
+    "test_id",
+    "expected_outcome",
+    "expected_detail",
+    "timeout_seconds",
+    "loader",
+    "kernel",
+    "symbols",
+    "bootstrap",
+    "init0",
+    "hello",
+    "bootfs",
+    "esp",
+    "provenance",
+    "ovmf_code",
+    "ovmf_vars_template",
+    "run_directory",
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExpectedOutcome {
+    Pass,
+    Fail,
+    Panic,
+}
+
+impl ExpectedOutcome {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::Panic => "panic",
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HRequest {
@@ -37,6 +77,8 @@ pub(crate) struct HRequest {
     pub(crate) rust_revision: String,
     pub(crate) selector: String,
     pub(crate) test_id: u32,
+    pub(crate) expected_outcome: ExpectedOutcome,
+    pub(crate) expected_detail: u32,
     pub(crate) timeout_seconds: u64,
     pub(crate) loader: PathBuf,
     pub(crate) kernel: PathBuf,
@@ -62,7 +104,17 @@ pub(crate) fn load(path: &Path) -> Result<HRequest, Failure> {
     let text = fs::read_to_string(&path)
         .map_err(|error| Failure::task(format!("could not read WYR0-H request: {error}")))?;
     let values = parse(&text)?;
-    let expected = REQUIRED_KEYS.iter().copied().collect::<BTreeSet<_>>();
+    let schema_version = required(&values, "schema_version")?;
+    let required_keys = match schema_version {
+        "1" => REQUIRED_KEYS_V1,
+        "2" => REQUIRED_KEYS_V2,
+        _ => {
+            return Err(Failure::task(
+                "WYR0-H request requires schema_version = 1 or 2",
+            ));
+        }
+    };
+    let expected = required_keys.iter().copied().collect::<BTreeSet<_>>();
     let actual = values.keys().map(String::as_str).collect::<BTreeSet<_>>();
     if actual != expected {
         let unknown = actual.difference(&expected).copied().collect::<Vec<_>>();
@@ -73,10 +125,6 @@ pub(crate) fn load(path: &Path) -> Result<HRequest, Failure> {
             unknown.join(", ")
         )));
     }
-    if required(&values, "schema_version")? != "1" {
-        return Err(Failure::task("WYR0-H request requires schema_version = 1"));
-    }
-
     let parent = path
         .parent()
         .ok_or_else(|| Failure::task("WYR0-H request has no parent directory"))?
@@ -88,6 +136,16 @@ pub(crate) fn load(path: &Path) -> Result<HRequest, Failure> {
         rust_revision: revision(&values, "rust_revision")?,
         selector: selector(&values)?,
         test_id: number::<u32>(&values, "test_id")?,
+        expected_outcome: if schema_version == "1" {
+            ExpectedOutcome::Pass
+        } else {
+            expected_outcome(&values)?
+        },
+        expected_detail: if schema_version == "1" {
+            0
+        } else {
+            number::<u32>(&values, "expected_detail")?
+        },
         timeout_seconds: number::<u64>(&values, "timeout_seconds")?,
         loader: input_path(&parent, required(&values, "loader")?),
         kernel: input_path(&parent, required(&values, "kernel")?),
@@ -116,6 +174,17 @@ pub(crate) fn load(path: &Path) -> Result<HRequest, Failure> {
     }
     reject_output_aliases(&request)?;
     Ok(request)
+}
+
+fn expected_outcome(values: &BTreeMap<String, String>) -> Result<ExpectedOutcome, Failure> {
+    match required(values, "expected_outcome")? {
+        "pass" => Ok(ExpectedOutcome::Pass),
+        "fail" => Ok(ExpectedOutcome::Fail),
+        "panic" => Ok(ExpectedOutcome::Panic),
+        _ => Err(Failure::task(
+            "WYR0-H expected_outcome must be pass, fail, or panic",
+        )),
+    }
 }
 
 fn parse(text: &str) -> Result<BTreeMap<String, String>, Failure> {
@@ -354,5 +423,55 @@ mod tests {
         assert!(revision(&bad, "deepwyrm_revision").is_err());
         bad.insert("selector".into(), "--help".into());
         assert!(selector(&bad).is_err());
+    }
+
+    #[test]
+    fn schema_two_requires_a_named_terminal_outcome() {
+        let request = valid()
+            .replace("schema_version = 1", "schema_version = 2")
+            .replace(
+                "test_id = 18\n",
+                "test_id = 18\nexpected_outcome = \"fail\"\nexpected_detail = 2952791041\n",
+            );
+        let values = parse(&request).unwrap();
+        assert_eq!(expected_outcome(&values).unwrap(), ExpectedOutcome::Fail);
+        assert_eq!(
+            number::<u32>(&values, "expected_detail").unwrap(),
+            0xB000_0401
+        );
+        let mut invalid = values;
+        invalid.insert("expected_outcome".into(), "anything".into());
+        assert!(expected_outcome(&invalid).is_err());
+    }
+
+    #[test]
+    fn schema_two_loads_only_with_the_complete_explicit_expectation_contract() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("xtask-h-request-v2-test-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        for name in [
+            "loader.efi",
+            "deepwyrm.elf",
+            "bootstrap.elf",
+            "init0.elf",
+            "hello.elf",
+            "OVMF_CODE.fd",
+            "OVMF_VARS.fd",
+        ] {
+            fs::write(root.join(name), b"artifact").unwrap();
+        }
+        let request = valid()
+            .replace("schema_version = 1", "schema_version = 2")
+            .replace(
+                "test_id = 18\n",
+                "test_id = 18\nexpected_outcome = \"fail\"\nexpected_detail = 2952791041\n",
+            );
+        let path = root.join("request.toml");
+        fs::write(&path, request).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.expected_outcome, ExpectedOutcome::Fail);
+        assert_eq!(loaded.expected_detail, 0xB000_0401);
+        fs::remove_dir_all(root).unwrap();
     }
 }
