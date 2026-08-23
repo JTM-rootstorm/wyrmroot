@@ -155,7 +155,12 @@ impl BootstrapError {
     pub fn exit_code(&self) -> u32 {
         const PREFIX: u32 = 0xB000_0000;
         match self {
-            Self::Native(_) => PREFIX | 0x01,
+            Self::Native(NativeError::Status(status)) => {
+                PREFIX | 0x0001_0000 | status.0.unsigned_abs()
+            }
+            Self::Native(NativeError::Output(output)) => {
+                PREFIX | 0x0002_0000 | native_output_code(*output)
+            }
             Self::BootstrapChannel(_) => PREFIX | 0x02,
             Self::Protocol(_) => PREFIX | 0x03,
             Self::ReceiveCounts(_) => PREFIX | 0x04,
@@ -196,6 +201,20 @@ const fn load_stage_code(stage: LoadStage) -> u32 {
         LoadStage::InitSend => 10,
         LoadStage::ThreadStart => 11,
         LoadStage::SuccessCleanup => 12,
+    }
+}
+
+const fn native_output_code(output: wyrmroot_runtime::NativeOutputError) -> u32 {
+    use wyrmroot_runtime::NativeOutputError;
+    match output {
+        NativeOutputError::InvalidObjectInfo => 1,
+        NativeOutputError::InvalidMemoryObjectInfo => 2,
+        NativeOutputError::InvalidChannelReceive => 3,
+        NativeOutputError::InvalidMappedRange => 4,
+        NativeOutputError::InvalidLoaderOutput => 5,
+        NativeOutputError::InvalidWaitResult => 6,
+        NativeOutputError::InvalidTaskTerminationInfo => 7,
+        NativeOutputError::DeadlineOverflow => 8,
     }
 }
 

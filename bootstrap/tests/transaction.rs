@@ -42,6 +42,13 @@ fn live_exit_code_identifies_bootstrap_owned_failure() {
         BootstrapError::MissingRequiredEntry.exit_code(),
         0xB000_000A
     );
+    assert_eq!(
+        BootstrapError::Native(NativeError::Status(
+            deepwyrm_syscall::DW_STATUS_NO_RESOURCES
+        ))
+        .exit_code(),
+        0xB001_000D
+    );
 }
 
 struct Fixture {
