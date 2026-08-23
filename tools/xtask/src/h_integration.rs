@@ -1,8 +1,7 @@
 //! WYR0-H exact-artifact image, q35/OVMF, GDB, and integration tooling.
 
 use std::collections::BTreeSet;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
@@ -16,6 +15,7 @@ use crate::h_request::{
     self, EvidenceRequest, ExpectedOutcome, HRequest, I1_EVIDENCE_PROTOCOL, I2_SCHEDULE_VERSION,
     StressRequest,
 };
+use crate::secure_fs;
 use crate::sha256;
 
 const MAX_GUEST_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
@@ -182,15 +182,27 @@ struct StressSummaryDisposition<'a> {
 }
 
 #[derive(Debug, Eq, PartialEq)]
+struct AdmittedArtifact {
+    source: PathBuf,
+    bytes: Vec<u8>,
+}
+
+impl AdmittedArtifact {
+    fn digest(&self) -> String {
+        sha256::bytes_digest(&self.bytes)
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
 struct CandidateArtifacts {
-    loader: PathBuf,
-    kernel: PathBuf,
-    symbols: PathBuf,
-    bootstrap: PathBuf,
-    init0: PathBuf,
-    hello: PathBuf,
-    ovmf_code: PathBuf,
-    ovmf_vars_template: PathBuf,
+    loader: AdmittedArtifact,
+    kernel: AdmittedArtifact,
+    symbols: AdmittedArtifact,
+    bootstrap: AdmittedArtifact,
+    init0: AdmittedArtifact,
+    hello: AdmittedArtifact,
+    ovmf_code: AdmittedArtifact,
+    ovmf_vars_template: AdmittedArtifact,
 }
 
 #[derive(Debug)]
@@ -242,9 +254,9 @@ pub(crate) fn build(request_path: &str) -> Result<String, Failure> {
         inspect_loaded(&request, &artifacts)
     })();
     if result.is_err() {
-        remove_created(&request.provenance);
-        remove_created(&request.esp);
-        remove_created(&request.bootfs);
+        remove_created(&request, &request.provenance);
+        remove_created(&request, &request.esp);
+        remove_created(&request, &request.bootfs);
     }
     result
 }
@@ -301,9 +313,9 @@ pub(crate) fn integration(
             write_provenance(&request, &artifacts)
         })();
         if let Err(error) = result {
-            remove_created(&request.provenance);
-            remove_created(&request.esp);
-            remove_created(&request.bootfs);
+            remove_created(&request, &request.provenance);
+            remove_created(&request, &request.esp);
+            remove_created(&request, &request.bootfs);
             return Err(error);
         }
     }
@@ -413,38 +425,22 @@ fn inspect_loaded(request: &HRequest, artifacts: &CandidateArtifacts) -> Result<
 
 fn verify_candidate_inputs(request: &HRequest) -> Result<CandidateArtifacts, Failure> {
     let artifacts = CandidateArtifacts {
-        loader: h_request::canonical_regular(
-            &request.loader,
-            "loader.efi",
-            MAX_GUEST_ARTIFACT_BYTES,
-        )?,
-        kernel: h_request::canonical_regular(
-            &request.kernel,
-            "deepwyrm.elf",
-            MAX_GUEST_ARTIFACT_BYTES,
-        )?,
-        symbols: h_request::canonical_regular(
+        loader: admit_artifact(&request.loader, "loader.efi", MAX_GUEST_ARTIFACT_BYTES)?,
+        kernel: admit_artifact(&request.kernel, "deepwyrm.elf", MAX_GUEST_ARTIFACT_BYTES)?,
+        symbols: admit_artifact(
             &request.symbols,
             "Deepwyrm symbols",
             MAX_GUEST_ARTIFACT_BYTES,
         )?,
-        bootstrap: h_request::canonical_regular(
+        bootstrap: admit_artifact(
             &request.bootstrap,
             "bootstrap.elf",
             MAX_GUEST_ARTIFACT_BYTES,
         )?,
-        init0: h_request::canonical_regular(
-            &request.init0,
-            "system/init0",
-            MAX_GUEST_ARTIFACT_BYTES,
-        )?,
-        hello: h_request::canonical_regular(&request.hello, "bin/hello", MAX_GUEST_ARTIFACT_BYTES)?,
-        ovmf_code: h_request::canonical_regular(
-            &request.ovmf_code,
-            "OVMF code",
-            MAX_FIRMWARE_BYTES,
-        )?,
-        ovmf_vars_template: h_request::canonical_regular(
+        init0: admit_artifact(&request.init0, "system/init0", MAX_GUEST_ARTIFACT_BYTES)?,
+        hello: admit_artifact(&request.hello, "bin/hello", MAX_GUEST_ARTIFACT_BYTES)?,
+        ovmf_code: admit_artifact(&request.ovmf_code, "OVMF code", MAX_FIRMWARE_BYTES)?,
+        ovmf_vars_template: admit_artifact(
             &request.ovmf_vars_template,
             "OVMF vars template",
             MAX_FIRMWARE_BYTES,
@@ -460,15 +456,14 @@ fn verify_candidate_inputs(request: &HRequest) -> Result<CandidateArtifacts, Fai
         (&artifacts.ovmf_code, "OVMF code"),
         (&artifacts.ovmf_vars_template, "OVMF vars template"),
     ] {
-        let display = path.to_string_lossy();
+        let display = path.source.to_string_lossy();
         if display.contains([',', '\n', '\r']) {
             return Err(Failure::task(format!(
                 "WYR0-H {label} path contains a delimiter unsupported by QEMU media arguments"
             )));
         }
     }
-    if digest(&artifacts.kernel, "deepwyrm.elf")? != digest(&artifacts.symbols, "Deepwyrm symbols")?
-    {
+    if artifacts.kernel.bytes != artifacts.symbols.bytes {
         return Err(Failure::task(
             "WYR0-H GDB symbols do not exactly match the booted kernel SHA-256",
         ));
@@ -476,15 +471,24 @@ fn verify_candidate_inputs(request: &HRequest) -> Result<CandidateArtifacts, Fai
     Ok(artifacts)
 }
 
+fn admit_artifact(path: &Path, label: &str, max_bytes: u64) -> Result<AdmittedArtifact, Failure> {
+    Ok(AdmittedArtifact {
+        source: path.to_path_buf(),
+        bytes: secure_fs::read_path(path, label, max_bytes, false)?,
+    })
+}
+
 fn build_bootfs_bytes(artifacts: &CandidateArtifacts) -> Result<Vec<u8>, Failure> {
-    let init0 = read_regular(&artifacts.init0, "init0", MAX_GUEST_ARTIFACT_BYTES)?;
-    let hello = read_regular(&artifacts.hello, "hello", MAX_GUEST_ARTIFACT_BYTES)?;
     let mut builder = Builder::new();
     builder
-        .add(b"system/init0", &init0, FileMode::Executable)
+        .add(
+            b"system/init0",
+            &artifacts.init0.bytes,
+            FileMode::Executable,
+        )
         .map_err(|error| Failure::task(format!("could not add init0 to bootfs: {error:?}")))?;
     builder
-        .add(b"bin/hello", &hello, FileMode::Executable)
+        .add(b"bin/hello", &artifacts.hello.bytes, FileMode::Executable)
         .map_err(|error| Failure::task(format!("could not add hello to bootfs: {error:?}")))?;
     builder
         .build()
@@ -494,9 +498,9 @@ fn build_bootfs_bytes(artifacts: &CandidateArtifacts) -> Result<Vec<u8>, Failure
 fn image_arguments(request: &HRequest, artifacts: &CandidateArtifacts) -> G3ImageArguments {
     G3ImageArguments {
         image: request.esp.display().to_string(),
-        loader: artifacts.loader.display().to_string(),
-        kernel: artifacts.kernel.display().to_string(),
-        bootstrap: artifacts.bootstrap.display().to_string(),
+        loader: artifacts.loader.source.display().to_string(),
+        kernel: artifacts.kernel.source.display().to_string(),
+        bootstrap: artifacts.bootstrap.source.display().to_string(),
         bootfs: request.bootfs.display().to_string(),
     }
 }
@@ -574,17 +578,27 @@ fn candidate_digests(
     request: &HRequest,
     artifacts: &CandidateArtifacts,
 ) -> Result<CandidateDigests, Failure> {
-    let request_digest = digest(&request.path, "WYR0-H request")?;
-    let loader = digest(&artifacts.loader, "loader.efi")?;
-    let kernel = digest(&artifacts.kernel, "deepwyrm.elf")?;
-    let symbols = digest(&artifacts.symbols, "Deepwyrm symbols")?;
-    let bootstrap = digest(&artifacts.bootstrap, "bootstrap.elf")?;
-    let init0 = digest(&artifacts.init0, "init0")?;
-    let hello = digest(&artifacts.hello, "hello")?;
-    let bootfs = digest(&request.bootfs, "bootfs")?;
-    let esp = digest(&request.esp, "ESP")?;
-    let ovmf_code = digest(&artifacts.ovmf_code, "OVMF code")?;
-    let ovmf_vars_template = digest(&artifacts.ovmf_vars_template, "OVMF vars template")?;
+    let request_digest = sha256::bytes_digest(&request.request_bytes);
+    let loader = artifacts.loader.digest();
+    let kernel = artifacts.kernel.digest();
+    let symbols = artifacts.symbols.digest();
+    let bootstrap = artifacts.bootstrap.digest();
+    let init0 = artifacts.init0.digest();
+    let hello = artifacts.hello.digest();
+    let bootfs = sha256::bytes_digest(&request.root.read(
+        &request.bootfs,
+        "bootfs",
+        MAX_GUEST_ARTIFACT_BYTES,
+        false,
+    )?);
+    let esp = sha256::bytes_digest(&request.root.read(
+        &request.esp,
+        "ESP",
+        MAX_GUEST_ARTIFACT_BYTES,
+        false,
+    )?);
+    let ovmf_code = artifacts.ovmf_code.digest();
+    let ovmf_vars_template = artifacts.ovmf_vars_template.digest();
     let candidate = sha256::bytes_digest(
         format!(
             concat!(
@@ -749,7 +763,7 @@ fn execute(
 
     if kind == ExecutionKind::Gdb {
         let status = Command::new("gdb")
-            .args(gdb_arguments(artifacts))
+            .args(gdb_arguments(&run))
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -773,7 +787,7 @@ fn execute(
         return Ok(format!(
             "{{\"schema_version\":2,\"phase\":\"WYR0-H\",\"mode\":\"gdb\",\"profile\":\"{}\",\"status\":\"DIAGNOSTIC\",\"acceptance\":false,\"symbols_sha256\":\"{}\"}}\n",
             profile.name(),
-            digest(&artifacts.symbols, "Deepwyrm symbols")?
+            artifacts.symbols.digest()
         ));
     }
 
@@ -910,19 +924,25 @@ fn execute(
         String::new()
     };
     let manifest = result_manifest_json(request, artifacts)?;
+    let serial_sha256 = digest(&run.serial_log, "serial log")?;
+    let stderr_sha256 = digest_allow_empty(&run.stderr_log, "QEMU stderr")?;
+    let vars_sha256 = digest(&run.vars, "OVMF vars")?;
     let result = format!(
         concat!(
             "{{\"schema_version\":{},\"phase\":\"WYR0-H\",",
-            "\"mode\":\"integration\",\"profile\":\"{}\",",
+            "\"mode\":\"integration\",\"profile\":\"{}\",\"selector\":\"{}\",",
             "\"status\":\"{}\",\"vcpu\":{},\"memory_mib\":{},",
             "\"test_id\":{},\"expected_outcome\":\"{}\",\"expected_detail\":{},",
             "\"actual_outcome\":\"{}\",\"detail\":{},\"serial_line\":{},",
             "\"qemu_exit_status\":{},{}{}",
+            "\"serial_sha256\":\"{}\",\"qemu_stderr_sha256\":\"{}\",",
+            "\"ovmf_vars_sha256\":\"{}\",",
             "\"deepwyrm_revision\":\"{}\",\"wyrmroot_revision\":\"{}\",",
             "\"rust_revision\":\"{}\",\"no_host_share\":true}}\n"
         ),
         request.schema_version,
         profile.name(),
+        request.selector,
         status_name,
         profile.vcpus(),
         profile.memory_mib(),
@@ -935,6 +955,9 @@ fn execute(
         expected_exit,
         evidence_fields,
         manifest,
+        serial_sha256,
+        stderr_sha256,
+        vars_sha256,
         request.deepwyrm_revision,
         request.wyrmroot_revision,
         request.rust_revision,
@@ -974,13 +997,47 @@ fn execute_stress(request: &HRequest, artifacts: &CandidateArtifacts) -> Result<
             seed: splitmix64_seed(stress.base_seed, index),
             operations: stress.operations_per_run,
         };
-        let paths = prepare_stress_run_directory(request, artifacts, &i2_directory, run)?;
+        let paths = match prepare_stress_run_directory(request, artifacts, &i2_directory, run) {
+            Ok(paths) => paths,
+            Err(error) => {
+                let result_path = i2_directory
+                    .join(format!("run-{index:06}"))
+                    .join("result.json");
+                let evidence = write_stress_preparation_failure(
+                    request,
+                    run,
+                    &result_path,
+                    &error.message,
+                    &pre_execution_manifest,
+                );
+                if let Ok(result) = evidence {
+                    results.push((run, sha256::bytes_digest(result.as_bytes()), "ERROR"));
+                }
+                failure = Some((index, error, "ERROR"));
+                break;
+            }
+        };
         let outcome = execute_stress_run(request, artifacts, run, &paths, &pre_execution_manifest);
-        let result_digest = digest(&paths.result_json, "I2 run result")?;
-        let passed = outcome.is_ok();
-        results.push((run, result_digest, passed));
+        let result_bytes = request.root.read(
+            &paths.result_json,
+            "I2 run result",
+            MAX_EVIDENCE_RESULT_BYTES,
+            false,
+        )?;
+        let result_digest = sha256::bytes_digest(&result_bytes);
+        let run_status = if outcome.is_ok() {
+            "PASS"
+        } else if result_bytes
+            .windows(b"\"status\":\"FAIL\"".len())
+            .any(|window| window == b"\"status\":\"FAIL\"")
+        {
+            "FAIL"
+        } else {
+            "ERROR"
+        };
+        results.push((run, result_digest, run_status));
         if let Err(error) = outcome {
-            failure = Some((index, error));
+            failure = Some((index, error, run_status));
             break;
         }
     }
@@ -988,7 +1045,9 @@ fn execute_stress(request: &HRequest, artifacts: &CandidateArtifacts) -> Result<
     let revalidation = revalidate_before_pass(request, artifacts, &pre_execution_manifest);
     let (status, failing_index, reason) = match (&failure, &revalidation) {
         (None, Ok(())) if results.len() == stress.run_count as usize => ("PASS", None, None),
-        (Some((index, error)), Ok(())) => ("FAIL", Some(*index), Some(error.message.as_str())),
+        (Some((index, error, run_status)), Ok(())) => {
+            (*run_status, Some(*index), Some(error.message.as_str()))
+        }
         (_, Err(error)) => (
             "ERROR",
             failure.as_ref().map(|item| item.0),
@@ -1016,7 +1075,7 @@ fn execute_stress(request: &HRequest, artifacts: &CandidateArtifacts) -> Result<
     write_new(request, &summary_path, summary.as_bytes(), "I2 summary")?;
     if status != "PASS" {
         let detail = failure
-            .map(|(_, error)| error.message)
+            .map(|(_, error, _)| error.message)
             .or_else(|| revalidation.err().map(|error| error.message))
             .unwrap_or_else(|| "I2 did not complete every requested run".to_owned());
         return Err(Failure::task(format!(
@@ -1027,6 +1086,57 @@ fn execute_stress(request: &HRequest, artifacts: &CandidateArtifacts) -> Result<
     Ok(summary)
 }
 
+const MAX_EVIDENCE_RESULT_BYTES: u64 = 1024 * 1024;
+
+fn write_stress_preparation_failure(
+    request: &HRequest,
+    run: StressRun,
+    result_path: &Path,
+    detail: &str,
+    candidate_manifest: &str,
+) -> Result<String, Failure> {
+    if let Some(directory) = result_path.parent()
+        && !directory.exists()
+    {
+        request
+            .root
+            .create_dir(directory, "I2 failed-run evidence directory")?;
+    }
+    let result = format!(
+        concat!(
+            "{{\"schema_version\":4,\"phase\":\"WYR0-H-I2\",\"status\":\"ERROR\",",
+            "\"reason\":\"run_preparation_failed\",\"error_detail\":\"{}\",",
+            "\"profile\":\"smp\",\"selector\":\"{}\",\"test_id\":{},\"run_index\":{},",
+            "\"stress_schedule_version\":\"{}\",\"stress_base_seed\":\"{:016X}\",",
+            "\"stress_seed\":\"{:016X}\",\"configured_operations\":{},",
+            "\"serial_sha256\":null,\"qemu_stderr_sha256\":null,\"ovmf_vars_sha256\":null,",
+            "\"cleanup_disposition\":\"not_started\",\"cleanup_killed\":false,",
+            "\"cleanup_reaped\":false,{}\"deepwyrm_revision\":\"{}\",",
+            "\"wyrmroot_revision\":\"{}\",\"rust_revision\":\"{}\",",
+            "\"candidate_revalidated\":false,\"no_host_share\":true}}\n"
+        ),
+        json_escape(detail),
+        request.selector,
+        request.test_id,
+        run.index,
+        I2_SCHEDULE_VERSION,
+        run.base_seed,
+        run.seed,
+        run.operations,
+        candidate_manifest,
+        request.deepwyrm_revision,
+        request.wyrmroot_revision,
+        request.rust_revision,
+    );
+    write_new(
+        request,
+        result_path,
+        result.as_bytes(),
+        "I2 preparation-failure result",
+    )?;
+    Ok(result)
+}
+
 fn prepare_stress_directory(
     request: &HRequest,
     stress: &StressRequest,
@@ -1034,13 +1144,13 @@ fn prepare_stress_directory(
     h_request::validate_outputs(request)?;
     require_absent(request, &stress.v0_manifest, "V0 manifest output")?;
     if !request.run_directory.exists() {
-        fs::create_dir(&request.run_directory)
-            .map_err(|error| Failure::task(format!("could not create run directory: {error}")))?;
+        request
+            .root
+            .create_dir(&request.run_directory, "run directory")?;
     }
     h_request::validate_outputs(request)?;
     let directory = request.run_directory.join("i2");
-    fs::create_dir(&directory)
-        .map_err(|error| Failure::task(format!("could not create fresh I2 directory: {error}")))?;
+    request.root.create_dir(&directory, "fresh I2 directory")?;
     Ok(directory)
 }
 
@@ -1052,25 +1162,29 @@ fn prepare_stress_run_directory(
 ) -> Result<RunPaths, Failure> {
     let directory = i2_directory.join(format!("run-{:06}", run.index));
     h_request::validate_output_parent(request, &directory, "I2 run directory")?;
-    fs::create_dir(&directory).map_err(|error| {
-        Failure::task(format!(
-            "could not create fresh I2 run {:06} directory: {error}",
-            run.index
-        ))
-    })?;
+    request.root.create_dir(
+        &directory,
+        &format!("fresh I2 run {:06} directory", run.index),
+    )?;
     let paths = RunPaths {
         vars: directory.join("OVMF_VARS.fd"),
         serial_log: directory.join("serial.log"),
         result_json: directory.join("result.json"),
         stderr_log: directory.join("qemu.stderr.log"),
+        qemu_ovmf_code: String::new(),
+        qemu_vars: String::new(),
+        qemu_esp: String::new(),
+        qemu_serial: String::new(),
+        gdb_symbols: String::new(),
+        _inherited_files: Vec::new(),
     };
-    let vars = read_regular(
-        &artifacts.ovmf_vars_template,
-        "OVMF vars template",
-        MAX_FIRMWARE_BYTES,
+    write_new(
+        request,
+        &paths.vars,
+        &artifacts.ovmf_vars_template.bytes,
+        "I2 request-local OVMF vars",
     )?;
-    write_new(request, &paths.vars, &vars, "I2 request-local OVMF vars")?;
-    Ok(paths)
+    bind_run_inputs(request, artifacts, &directory, paths)
 }
 
 fn execute_stress_run(
@@ -1255,7 +1369,7 @@ fn stress_result_json(
     Ok(format!(
         concat!(
             "{{\"schema_version\":4,\"phase\":\"WYR0-H-I2\",\"status\":\"{}\",",
-            "\"profile\":\"smp\",\"test_id\":{},\"run_index\":{},",
+            "\"profile\":\"smp\",\"selector\":\"{}\",\"test_id\":{},\"run_index\":{},",
             "\"stress_schedule_version\":\"{}\",\"stress_base_seed\":\"{:016X}\",",
             "\"stress_seed\":\"{:016X}\",\"configured_operations\":{},",
             "\"completed_operations\":{},\"cpu_mask\":{},\"family_mask\":{},",
@@ -1268,6 +1382,7 @@ fn stress_result_json(
             "\"no_host_share\":true}}\n"
         ),
         status,
+        request.selector,
         transcript.stress.test_id,
         run.index,
         I2_SCHEDULE_VERSION,
@@ -1310,7 +1425,7 @@ fn write_stress_host_failure(
     let result = format!(
         concat!(
             "{{\"schema_version\":4,\"phase\":\"WYR0-H-I2\",\"status\":\"ERROR\",",
-            "\"reason\":\"{}\",\"profile\":\"smp\",\"test_id\":{},\"run_index\":{},",
+            "\"reason\":\"{}\",\"profile\":\"smp\",\"selector\":\"{}\",\"test_id\":{},\"run_index\":{},",
             "\"stress_schedule_version\":\"{}\",\"stress_base_seed\":\"{:016X}\",",
             "\"stress_seed\":\"{:016X}\",\"configured_operations\":{},",
             "\"serial_sha256\":{},\"qemu_stderr_sha256\":{},\"ovmf_vars_sha256\":\"{}\",",
@@ -1320,6 +1435,7 @@ fn write_stress_host_failure(
             "\"no_host_share\":true}}\n"
         ),
         reason,
+        request.selector,
         request.test_id,
         run.index,
         I2_SCHEDULE_VERSION,
@@ -1350,19 +1466,16 @@ fn stress_summary_json(
     stress: &StressRequest,
     disposition: StressSummaryDisposition<'_>,
     candidate_manifest: &str,
-    results: &[(StressRun, String, bool)],
+    results: &[(StressRun, String, &'static str)],
 ) -> Result<String, Failure> {
     let mut ordered = String::from("[");
-    for (position, (run, digest, passed)) in results.iter().enumerate() {
+    for (position, (run, digest, status)) in results.iter().enumerate() {
         if position != 0 {
             ordered.push(',');
         }
         ordered.push_str(&format!(
             "{{\"run_index\":{},\"seed\":\"{:016X}\",\"result_sha256\":\"{}\",\"status\":\"{}\"}}",
-            run.index,
-            run.seed,
-            digest,
-            if *passed { "PASS" } else { "FAIL" }
+            run.index, run.seed, digest, status
         ));
     }
     ordered.push(']');
@@ -1389,7 +1502,10 @@ fn stress_summary_json(
         stress.schedule_version,
         stress.base_seed,
         stress.run_count,
-        results.iter().filter(|(_, _, passed)| *passed).count(),
+        results
+            .iter()
+            .filter(|(_, _, status)| *status == "PASS")
+            .count(),
         failing,
         stress.operations_per_run,
         reason,
@@ -1544,6 +1660,12 @@ struct RunPaths {
     serial_log: PathBuf,
     result_json: PathBuf,
     stderr_log: PathBuf,
+    qemu_ovmf_code: String,
+    qemu_vars: String,
+    qemu_esp: String,
+    qemu_serial: String,
+    gdb_symbols: String,
+    _inherited_files: Vec<fs::File>,
 }
 
 fn prepare_run_directory(
@@ -1553,45 +1675,104 @@ fn prepare_run_directory(
 ) -> Result<RunPaths, Failure> {
     h_request::validate_outputs(request)?;
     if !request.run_directory.exists() {
-        let parent = request
-            .run_directory
-            .parent()
-            .ok_or_else(|| Failure::task("run directory has no parent"))?;
-        fs::canonicalize(parent)
-            .map_err(|error| Failure::task(format!("could not resolve run parent: {error}")))?;
-        fs::create_dir(&request.run_directory)
-            .map_err(|error| Failure::task(format!("could not create run directory: {error}")))?;
-        h_request::validate_outputs(request)?;
+        request
+            .root
+            .create_dir(&request.run_directory, "run directory")?;
     }
     let directory = request.run_directory.join(profile.name());
-    fs::create_dir(&directory).map_err(|error| {
-        Failure::task(format!(
-            "could not create fresh {} run directory: {error}",
-            profile.name()
-        ))
-    })?;
+    request.root.create_dir(
+        &directory,
+        &format!("fresh {} run directory", profile.name()),
+    )?;
     let vars = directory.join("OVMF_VARS.fd");
     let serial_log = directory.join("serial.log");
     let result_json = directory.join("result.json");
     let stderr_log = directory.join("qemu.stderr.log");
-    let vars_bytes = read_regular(
-        &artifacts.ovmf_vars_template,
-        "OVMF vars template",
-        MAX_FIRMWARE_BYTES,
+    write_new(
+        request,
+        &vars,
+        &artifacts.ovmf_vars_template.bytes,
+        "request-local OVMF vars",
     )?;
-    write_new(request, &vars, &vars_bytes, "request-local OVMF vars")?;
-    Ok(RunPaths {
-        vars,
-        serial_log,
-        result_json,
-        stderr_log,
-    })
+    bind_run_inputs(
+        request,
+        artifacts,
+        &directory,
+        RunPaths {
+            vars,
+            serial_log,
+            result_json,
+            stderr_log,
+            qemu_ovmf_code: String::new(),
+            qemu_vars: String::new(),
+            qemu_esp: String::new(),
+            qemu_serial: String::new(),
+            gdb_symbols: String::new(),
+            _inherited_files: Vec::new(),
+        },
+    )
+}
+
+fn bind_run_inputs(
+    request: &HRequest,
+    artifacts: &CandidateArtifacts,
+    directory: &Path,
+    mut paths: RunPaths,
+) -> Result<RunPaths, Failure> {
+    let snapshots = directory.join("input-snapshots");
+    request
+        .root
+        .create_dir(&snapshots, "run-local input snapshot directory")?;
+    let code = snapshots.join("OVMF_CODE.fd");
+    let esp = snapshots.join("esp.img");
+    let symbols = snapshots.join("deepwyrm.symbols");
+    let esp_bytes = request.root.read(
+        &request.esp,
+        "admitted ESP",
+        MAX_GUEST_ARTIFACT_BYTES,
+        false,
+    )?;
+    write_new(
+        request,
+        &code,
+        &artifacts.ovmf_code.bytes,
+        "OVMF code snapshot",
+    )?;
+    write_new(request, &esp, &esp_bytes, "ESP snapshot")?;
+    write_new(
+        request,
+        &symbols,
+        &artifacts.symbols.bytes,
+        "symbols snapshot",
+    )?;
+    let code_file = request
+        .root
+        .open_inherited_read(&code, "OVMF code snapshot")?;
+    let esp_file = request.root.open_inherited_read(&esp, "ESP snapshot")?;
+    let symbols_file = request
+        .root
+        .open_inherited_read(&symbols, "symbols snapshot")?;
+    let vars_file = request
+        .root
+        .open_inherited_read_write(&paths.vars, "OVMF vars snapshot")?;
+    let serial_file = request.root.open_new(&paths.serial_log, "serial log")?;
+    drop(serial_file);
+    let serial_file = request
+        .root
+        .open_inherited_read_write(&paths.serial_log, "serial log")?;
+    paths.qemu_ovmf_code = secure_fs::inherited_path(&code_file);
+    paths.qemu_esp = secure_fs::inherited_path(&esp_file);
+    paths.gdb_symbols = secure_fs::inherited_path(&symbols_file);
+    paths.qemu_vars = secure_fs::inherited_path(&vars_file);
+    paths.qemu_serial = secure_fs::inherited_path(&serial_file);
+    paths._inherited_files = vec![code_file, esp_file, symbols_file, vars_file, serial_file];
+    Ok(paths)
 }
 
 fn qemu_arguments(
     profile: HProfile,
     request: &HRequest,
-    artifacts: &CandidateArtifacts,
+    _artifacts: &CandidateArtifacts,
     kind: ExecutionKind,
     run: &RunPaths,
     stress: Option<StressRun>,
@@ -1612,17 +1793,14 @@ fn qemu_arguments(
         "-drive".into(),
         format!(
             "if=pflash,format=raw,readonly=on,file={}",
-            artifacts.ovmf_code.display()
+            run.qemu_ovmf_code
         ),
         "-drive".into(),
-        format!("if=pflash,format=raw,file={}", run.vars.display()),
+        format!("if=pflash,format=raw,file={}", run.qemu_vars),
         "-drive".into(),
-        format!(
-            "if=virtio,format=raw,readonly=on,file={}",
-            request.esp.display()
-        ),
+        format!("if=virtio,format=raw,readonly=on,file={}", run.qemu_esp),
         "-serial".into(),
-        format!("file:{}", run.serial_log.display()),
+        format!("file:{}", run.qemu_serial),
     ];
     if kind == ExecutionKind::Integration {
         args.extend([
@@ -1654,12 +1832,12 @@ fn qemu_arguments(
     args
 }
 
-fn gdb_arguments(artifacts: &CandidateArtifacts) -> Vec<String> {
+fn gdb_arguments(run: &RunPaths) -> Vec<String> {
     vec![
         "-ex".into(),
         "set architecture i386:x86-64".into(),
         "-ex".into(),
-        format!("file {}", artifacts.symbols.display()),
+        format!("file {}", run.gdb_symbols),
         "-ex".into(),
         "target remote 127.0.0.1:1234".into(),
     ]
@@ -2603,44 +2781,16 @@ fn read_regular(path: &Path, label: &str, max_bytes: u64) -> Result<Vec<u8>, Fai
 }
 
 fn write_new(request: &HRequest, path: &Path, bytes: &[u8], label: &str) -> Result<(), Failure> {
-    h_request::validate_output_parent(request, path, label)?;
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    fs::canonicalize(parent)
-        .map_err(|error| Failure::task(format!("could not resolve {label} parent: {error}")))?;
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|error| Failure::task(format!("could not create {label}: {error}")))?;
-    if let Err(error) = output.write_all(bytes).and_then(|()| output.sync_all()) {
-        drop(output);
-        remove_created(path);
-        return Err(Failure::task(format!("could not write {label}: {error}")));
-    }
-    Ok(())
+    request.root.write_new(path, bytes, label)
 }
 
 fn open_new(request: &HRequest, path: &Path, label: &str) -> Result<fs::File, Failure> {
-    h_request::validate_output_parent(request, path, label)?;
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    fs::canonicalize(parent)
-        .map_err(|error| Failure::task(format!("could not resolve {label} parent: {error}")))?;
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|error| Failure::task(format!("could not create {label}: {error}")))
+    request.root.open_new(path, label)
 }
 
 fn require_absent(request: &HRequest, path: &Path, label: &str) -> Result<(), Failure> {
     h_request::validate_output_parent(request, path, label)?;
-    if fs::symlink_metadata(path).is_ok() {
+    if request.root.exists(path, label)? {
         Err(Failure::task(format!("WYR0-H {label} already exists")))
     } else {
         Ok(())
@@ -2648,17 +2798,16 @@ fn require_absent(request: &HRequest, path: &Path, label: &str) -> Result<(), Fa
 }
 
 fn digest(path: &Path, label: &str) -> Result<String, Failure> {
-    sha256::file_digest(path)
-        .map_err(|error| Failure::task(format!("could not hash {label}: {error}")))
+    Ok(sha256::bytes_digest(&secure_fs::read_path(
+        path,
+        label,
+        1024 * 1024 * 1024,
+        true,
+    )?))
 }
 
-fn remove_created(path: &Path) {
-    if fs::symlink_metadata(path)
-        .map(|metadata| metadata.file_type().is_file())
-        .unwrap_or(false)
-    {
-        let _ = fs::remove_file(path);
-    }
+fn remove_created(request: &HRequest, path: &Path) {
+    let _ = request.root.remove_file(path, "partial output");
 }
 
 fn status_label(status: &ExitStatus) -> String {
@@ -2671,8 +2820,24 @@ fn status_label(status: &ExitStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     const TEST_EVIDENCE_NONCE: u64 = h_request::I1_EVIDENCE_NONCE;
+
+    fn test_root(path: &Path) -> secure_fs::Root {
+        if path.is_dir() {
+            secure_fs::Root::open(path, "test root").expect("open test root")
+        } else {
+            secure_fs::Root::placeholder(path)
+        }
+    }
+
+    fn test_artifact(path: &Path) -> AdmittedArtifact {
+        AdmittedArtifact {
+            source: path.to_path_buf(),
+            bytes: fs::read(path).unwrap_or_else(|_| b"artifact".to_vec()),
+        }
+    }
 
     #[derive(Clone, Copy)]
     struct EventSpec {
@@ -2816,6 +2981,8 @@ mod tests {
         let root = PathBuf::from("/candidate");
         HRequest {
             path: root.join("request.toml"),
+            root: test_root(&root),
+            request_bytes: Arc::new(b"request".to_vec()),
             schema_version: 3,
             deepwyrm_revision: "1".repeat(40),
             wyrmroot_revision: "2".repeat(40),
@@ -2961,6 +3128,44 @@ mod tests {
         let mut checksum = exact.clone();
         checksum[138] = if checksum[138] == b'0' { b'1' } else { b'0' };
         assert!(parse_stress_line(&checksum, 1, h_request::I2_TEST_ID, run).is_err());
+
+        let replacements = [
+            "DWSTRESX".to_owned(),
+            "02".to_owned(),
+            "00000017".to_owned(),
+            format!("{:08X}", run.index ^ 1),
+            format!("{:016X}", run.base_seed ^ 1),
+            format!("{:016X}", run.seed ^ 1),
+            "000000FF".to_owned(),
+            "000000FF".to_owned(),
+            "00000007".to_owned(),
+            "000000FF".to_owned(),
+            "00".to_owned(),
+            "00000001".to_owned(),
+            "00000000".to_owned(),
+            "00000001".to_owned(),
+            "00000000".to_owned(),
+        ];
+        for (field, replacement) in replacements.into_iter().enumerate() {
+            let text = std::str::from_utf8(&exact).expect("stress record UTF-8");
+            let mut fields = text
+                .trim_end()
+                .split('|')
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            assert_eq!(fields.len(), 15);
+            fields[field] = replacement;
+            let mutation = if field == 14 {
+                format!("{}\n", fields.join("|")).into_bytes()
+            } else {
+                let prefix = format!("{}|", fields[..14].join("|"));
+                format!("{prefix}{:08X}\n", fnv1a32(prefix.as_bytes())).into_bytes()
+            };
+            assert!(
+                parse_stress_line(&mutation, 1, h_request::I2_TEST_ID, run).is_err(),
+                "admitted recomputed DWSTRESS1 mutation in field {field}"
+            );
+        }
     }
 
     #[test]
@@ -3453,6 +3658,8 @@ mod tests {
         let root = PathBuf::from("/candidate");
         let request = HRequest {
             path: root.join("request.toml"),
+            root: test_root(&root),
+            request_bytes: Arc::new(b"request".to_vec()),
             schema_version: 2,
             deepwyrm_revision: "1".repeat(40),
             wyrmroot_revision: "2".repeat(40),
@@ -3478,20 +3685,34 @@ mod tests {
             stress: None,
         };
         let artifacts = CandidateArtifacts {
-            loader: request.loader.clone(),
-            kernel: request.kernel.clone(),
-            symbols: request.symbols.clone(),
-            bootstrap: request.bootstrap.clone(),
-            init0: request.init0.clone(),
-            hello: request.hello.clone(),
-            ovmf_code: request.ovmf_code.clone(),
-            ovmf_vars_template: request.ovmf_vars_template.clone(),
+            loader: test_artifact(&request.loader),
+            kernel: test_artifact(&request.kernel),
+            symbols: test_artifact(&request.symbols),
+            bootstrap: test_artifact(&request.bootstrap),
+            init0: test_artifact(&request.init0),
+            hello: test_artifact(&request.hello),
+            ovmf_code: test_artifact(&request.ovmf_code),
+            ovmf_vars_template: test_artifact(&request.ovmf_vars_template),
         };
         let run = RunPaths {
             vars: request.run_directory.join("smp/OVMF_VARS.fd"),
             serial_log: request.run_directory.join("smp/serial.log"),
             result_json: request.run_directory.join("smp/result.json"),
             stderr_log: request.run_directory.join("smp/qemu.stderr.log"),
+            qemu_ovmf_code: request.ovmf_code.display().to_string(),
+            qemu_vars: request
+                .run_directory
+                .join("smp/OVMF_VARS.fd")
+                .display()
+                .to_string(),
+            qemu_esp: request.esp.display().to_string(),
+            qemu_serial: request
+                .run_directory
+                .join("smp/serial.log")
+                .display()
+                .to_string(),
+            gdb_symbols: request.symbols.display().to_string(),
+            _inherited_files: Vec::new(),
         };
         let args = qemu_arguments(
             HProfile::Smp,
@@ -3511,7 +3732,7 @@ mod tests {
             assert!(!joined.contains(forbidden));
         }
         assert!(
-            gdb_arguments(&artifacts)
+            gdb_arguments(&run)
                 .join(" ")
                 .contains("file /candidate/deepwyrm.symbols")
         );
@@ -3597,6 +3818,8 @@ mod tests {
         let esp = root.join("esp.img");
         let request = HRequest {
             path: root.join("request.toml"),
+            root: test_root(&root),
+            request_bytes: Arc::new(b"request".to_vec()),
             schema_version: 2,
             deepwyrm_revision: "1".repeat(40),
             wyrmroot_revision: "2".repeat(40),
@@ -3626,17 +3849,23 @@ mod tests {
             serial_log: root.join("serial.log"),
             result_json: root.join("result.json"),
             stderr_log: root.join("stderr.log"),
+            qemu_ovmf_code: String::new(),
+            qemu_vars: String::new(),
+            qemu_esp: String::new(),
+            qemu_serial: String::new(),
+            gdb_symbols: String::new(),
+            _inherited_files: Vec::new(),
         };
         fs::write(&request.path, b"request").expect("write request");
         let artifacts = CandidateArtifacts {
-            loader: request.loader.clone(),
-            kernel: request.kernel.clone(),
-            symbols: request.symbols.clone(),
-            bootstrap: request.bootstrap.clone(),
-            init0: request.init0.clone(),
-            hello: request.hello.clone(),
-            ovmf_code: request.ovmf_code.clone(),
-            ovmf_vars_template: request.ovmf_vars_template.clone(),
+            loader: test_artifact(&request.loader),
+            kernel: test_artifact(&request.kernel),
+            symbols: test_artifact(&request.symbols),
+            bootstrap: test_artifact(&request.bootstrap),
+            init0: test_artifact(&request.init0),
+            hello: test_artifact(&request.hello),
+            ovmf_code: test_artifact(&request.ovmf_code),
+            ovmf_vars_template: test_artifact(&request.ovmf_vars_template),
         };
         write_integration_host_failure(
             HProfile::Smp,
@@ -3678,6 +3907,12 @@ mod tests {
                 serial_log: root.join("unused-serial.log"),
                 result_json: root.join(name),
                 stderr_log: root.join("unused-stderr.log"),
+                qemu_ovmf_code: String::new(),
+                qemu_vars: String::new(),
+                qemu_esp: String::new(),
+                qemu_serial: String::new(),
+                gdb_symbols: String::new(),
+                _inherited_files: Vec::new(),
             };
             write_integration_host_failure(
                 HProfile::Smp,
@@ -3702,6 +3937,12 @@ mod tests {
             serial_log: root.join("unused-i1-serial.log"),
             result_json: root.join("i1-error-result.json"),
             stderr_log: root.join("unused-i1-stderr.log"),
+            qemu_ovmf_code: String::new(),
+            qemu_vars: String::new(),
+            qemu_esp: String::new(),
+            qemu_serial: String::new(),
+            gdb_symbols: String::new(),
+            _inherited_files: Vec::new(),
         };
         let i1_request = HRequest {
             schema_version: 3,
@@ -3757,6 +3998,8 @@ mod tests {
         fs::write(root.join("deepwyrm.symbols"), b"different").expect("write symbols");
         let request = HRequest {
             path: root.join("request.toml"),
+            root: test_root(&root),
+            request_bytes: Arc::new(b"request".to_vec()),
             schema_version: 2,
             deepwyrm_revision: "1".repeat(40),
             wyrmroot_revision: "2".repeat(40),
@@ -3816,6 +4059,8 @@ mod tests {
         }
         let request = HRequest {
             path: root.join("request.toml"),
+            root: test_root(&root),
+            request_bytes: Arc::new(b"artifact".to_vec()),
             schema_version: 2,
             deepwyrm_revision: "1".repeat(40),
             wyrmroot_revision: "2".repeat(40),
@@ -3841,20 +4086,23 @@ mod tests {
             stress: None,
         };
         let artifacts = CandidateArtifacts {
-            loader: request.loader.clone(),
-            kernel: request.kernel.clone(),
-            symbols: request.symbols.clone(),
-            bootstrap: request.bootstrap.clone(),
-            init0: request.init0.clone(),
-            hello: request.hello.clone(),
-            ovmf_code: request.ovmf_code.clone(),
-            ovmf_vars_template: request.ovmf_vars_template.clone(),
+            loader: test_artifact(&request.loader),
+            kernel: test_artifact(&request.kernel),
+            symbols: test_artifact(&request.symbols),
+            bootstrap: test_artifact(&request.bootstrap),
+            init0: test_artifact(&request.init0),
+            hello: test_artifact(&request.hello),
+            ovmf_code: test_artifact(&request.ovmf_code),
+            ovmf_vars_template: test_artifact(&request.ovmf_vars_template),
         };
         let first = candidate_digests(&request, &artifacts).expect("first digest");
         let second = candidate_digests(&request, &artifacts).expect("second digest");
         assert_eq!(first.candidate, second.candidate);
         fs::write(&request.hello, b"changed").expect("mutate hello");
-        let changed = candidate_digests(&request, &artifacts).expect("changed digest");
+        let still_admitted = candidate_digests(&request, &artifacts).expect("held digest");
+        assert_eq!(first.candidate, still_admitted.candidate);
+        let readmitted = verify_candidate_inputs(&request).expect("readmit changed candidate");
+        let changed = candidate_digests(&request, &readmitted).expect("changed digest");
         assert_ne!(first.candidate, changed.candidate);
         fs::remove_dir_all(root).expect("remove test root");
     }
