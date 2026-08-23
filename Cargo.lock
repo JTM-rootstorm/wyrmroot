@@ -209,6 +209,7 @@ name = "wyrmroot-runtime"
 version = "0.0.0"
 dependencies = [
  "deepwyrm-syscall",
+ "wyrmroot-loader",
 ]
 
 [[package]]

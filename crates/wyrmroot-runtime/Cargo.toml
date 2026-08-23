@@ -15,6 +15,7 @@ primordial-test-support = []
 
 [dependencies]
 deepwyrm-syscall.workspace = true
+wyrmroot-loader = { path = "../wyrmroot-loader" }
 
 [lints.rust]
 unsafe_code = "deny"

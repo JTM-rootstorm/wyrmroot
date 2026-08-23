@@ -11,6 +11,11 @@
 mod bootstrap;
 mod diagnostics;
 mod entry;
+#[allow(
+    unsafe_code,
+    reason = "the WYR0 loader adapter confines one validated temporary writable mapping to a non-escaping slice"
+)]
+mod loader_native;
 #[cfg(target_os = "wyrmroot")]
 mod memory;
 mod native;
@@ -28,6 +33,7 @@ pub use bootstrap::{
     MappingPlanError, PAGE_SIZE, SELF_ROOT_EXPECTATION, validate_bootstrap_channel,
     validate_init_capabilities,
 };
+pub use loader_native::NativeLoaderPlatform;
 pub use native::{
     MappedBootfs, NativeError, NativeOutputError, PANIC_EXIT_CODE, ReceiveCounts, close_handle,
     exit_process, exit_thread, map_bootfs_read_only, panic_abort, query_capability_info,

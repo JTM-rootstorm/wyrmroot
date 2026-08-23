@@ -1,13 +1,17 @@
 use deepwyrm_syscall as _;
+use wyrmroot_loader as _;
 use wyrmroot_runtime as _;
 
 const SOURCE: &str = concat!(
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs")),
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/native.rs")),
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/loader_native.rs")),
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bootstrap.rs")),
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/startup.rs")),
 );
 const NATIVE_SOURCE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/native.rs"));
+const LOADER_NATIVE_SOURCE: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/loader_native.rs"));
 const STARTUP_SOURCE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/startup.rs"));
 const ENTRY_SOURCE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/entry.rs"));
 const MEMORY_SOURCE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/memory.rs"));
@@ -48,6 +52,14 @@ fn runtime_unsafe_is_confined_to_the_validated_bootfs_slice_boundary() {
     assert!(NATIVE_SOURCE.contains("core::slice::from_raw_parts"));
     assert!(!NATIVE_SOURCE.contains("unsafe fn"));
     assert!(!NATIVE_SOURCE.contains("from_raw_parts_mut"));
+}
+
+#[test]
+fn loader_unsafe_is_confined_to_the_temporary_writable_mapping() {
+    assert_eq!(LOADER_NATIVE_SOURCE.matches("unsafe {").count(), 1);
+    assert!(LOADER_NATIVE_SOURCE.contains("core::slice::from_raw_parts_mut"));
+    assert!(LOADER_NATIVE_SOURCE.contains("address_region_unmap"));
+    assert!(!LOADER_NATIVE_SOURCE.contains("unsafe fn"));
 }
 
 #[test]

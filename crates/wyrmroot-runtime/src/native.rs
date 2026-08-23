@@ -26,6 +26,8 @@ pub enum NativeOutputError {
     InvalidChannelReceive,
     /// A successful map returned a zero, unaligned, or overflowing userspace range.
     InvalidMappedRange,
+    /// A successful loader syscall returned malformed handles or records.
+    InvalidLoaderOutput,
 }
 
 /// Failure from a native runtime operation.
@@ -288,7 +290,10 @@ fn validate_channel_receive(
     }
 }
 
-fn validate_mapped_range(address: DwUserAddress, mapped_size: u64) -> Result<(), NativeError> {
+pub(crate) fn validate_mapped_range(
+    address: DwUserAddress,
+    mapped_size: u64,
+) -> Result<(), NativeError> {
     let end_exclusive = address
         .0
         .checked_add(mapped_size)
