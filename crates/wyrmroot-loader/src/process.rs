@@ -64,6 +64,7 @@ pub enum LoadStage {
     ProcessCreate,
     MemoryCreate,
     ParentMaterialize,
+    ParentUnmap,
     ChildMap,
     ThreadCreate,
     CapabilityDuplicate,
@@ -100,11 +101,18 @@ pub struct ProcessCreateResult {
     pub child_bootstrap: DwHandle,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ParentMapping {
+    pub address: u64,
+    pub bytes: u64,
+}
+
 /// Platform operations used by the transaction driver.
 ///
-/// `materialize_parent` must map the complete object RW in the parent, zero its complete extent,
-/// copy `source` at `destination_offset`, and successfully remove the temporary alias before
-/// returning. The driver calls `map_child` only after that return, preserving W^X ordering.
+/// `materialize_parent` maps the complete object RW in the parent, zeroes its complete extent,
+/// copies `source` at `destination_offset`, and returns exact cleanup ownership. The driver
+/// removes that alias before calling `map_child`, preserving W^X ordering and retaining enough
+/// information to retry cleanup during rollback if the first unmap fails.
 pub trait LoaderPlatform {
     type Error;
 
@@ -123,6 +131,11 @@ pub trait LoaderPlatform {
         object_size: u64,
         destination_offset: u64,
         source: &[u8],
+    ) -> Result<ParentMapping, Self::Error>;
+    fn unmap_parent(
+        &mut self,
+        parent_root: DwHandle,
+        mapping: ParentMapping,
     ) -> Result<(), Self::Error>;
     fn map_child(
         &mut self,
@@ -168,6 +181,7 @@ struct Range {
 }
 
 struct Transaction {
+    parent_root: DwHandle,
     broad_parent: Option<DwHandle>,
     child_endpoint: Option<DwHandle>,
     parent_channel: Option<DwHandle>,
@@ -175,6 +189,7 @@ struct Transaction {
     root: Option<DwHandle>,
     thread: Option<DwHandle>,
     scratch_memory: Option<DwHandle>,
+    parent_mapping: Option<ParentMapping>,
     delegated_bootfs: Option<DwHandle>,
     delegated_task_group: Option<DwHandle>,
     ranges: [Range; MAX_CHILD_RANGES],
@@ -182,8 +197,9 @@ struct Transaction {
 }
 
 impl Transaction {
-    const fn new() -> Self {
+    const fn new(parent_root: DwHandle) -> Self {
         Self {
+            parent_root,
             broad_parent: None,
             child_endpoint: None,
             parent_channel: None,
@@ -191,6 +207,7 @@ impl Transaction {
             root: None,
             thread: None,
             scratch_memory: None,
+            parent_mapping: None,
             delegated_bootfs: None,
             delegated_task_group: None,
             ranges: [Range {
@@ -203,6 +220,9 @@ impl Transaction {
 
     fn rollback<P: LoaderPlatform>(&mut self, platform: &mut P) -> bool {
         let mut failed = false;
+        if let Some(mapping) = self.parent_mapping.take() {
+            failed |= platform.unmap_parent(self.parent_root, mapping).is_err();
+        }
         if let Some(thread) = self.thread.take() {
             failed |= platform.thread_terminate(thread).is_err();
             failed |= platform.close(thread).is_err();
@@ -257,7 +277,7 @@ pub fn load_process<P: LoaderPlatform>(
     let init_len = launch::encode_init(request.profile, request.transaction_id, &mut init)
         .map_err(LoadError::Launch)?;
 
-    let mut transaction = Transaction::new();
+    let mut transaction = Transaction::new(authority.parent_root);
     let (broad_parent, child_endpoint) = platform
         .channel_create(CHANNEL_BROAD_RIGHTS)
         .map_err(|cause| platform_error(LoadStage::ChannelCreate, cause, false))?;
@@ -323,20 +343,33 @@ pub fn load_process<P: LoaderPlatform>(
         transaction.scratch_memory = Some(memory);
         let source_start = materialization.source_offset as usize;
         let source_end = source_start + materialization.source_size as usize;
-        if let Err(cause) = platform.materialize_parent(
+        let parent_mapping = match platform.materialize_parent(
             authority.parent_root,
             memory,
             materialization.object_size,
             materialization.destination_offset,
             &request.image[source_start..source_end],
         ) {
+            Ok(mapping) => mapping,
+            Err(cause) => {
+                return Err(fail(
+                    platform,
+                    &mut transaction,
+                    LoadStage::ParentMaterialize,
+                    cause,
+                ));
+            }
+        };
+        transaction.parent_mapping = Some(parent_mapping);
+        if let Err(cause) = platform.unmap_parent(authority.parent_root, parent_mapping) {
             return Err(fail(
                 platform,
                 &mut transaction,
-                LoadStage::ParentMaterialize,
+                LoadStage::ParentUnmap,
                 cause,
             ));
         }
+        transaction.parent_mapping = None;
         if let Err(cause) = platform.map_child(
             created.root,
             memory,
@@ -374,20 +407,33 @@ pub fn load_process<P: LoaderPlatform>(
         }
     };
     transaction.scratch_memory = Some(stack);
-    if let Err(cause) = platform.materialize_parent(
+    let parent_mapping = match platform.materialize_parent(
         authority.parent_root,
         stack,
         INITIAL_STACK.object_size,
         INITIAL_STACK.startup_page_offset,
         &startup_page,
     ) {
+        Ok(mapping) => mapping,
+        Err(cause) => {
+            return Err(fail(
+                platform,
+                &mut transaction,
+                LoadStage::ParentMaterialize,
+                cause,
+            ));
+        }
+    };
+    transaction.parent_mapping = Some(parent_mapping);
+    if let Err(cause) = platform.unmap_parent(authority.parent_root, parent_mapping) {
         return Err(fail(
             platform,
             &mut transaction,
-            LoadStage::ParentMaterialize,
+            LoadStage::ParentUnmap,
             cause,
         ));
     }
+    transaction.parent_mapping = None;
     if let Err(cause) = platform.map_child(
         created.root,
         stack,

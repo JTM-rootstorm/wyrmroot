@@ -9,7 +9,9 @@ use deepwyrm_syscall::{
     DwMemoryProtection, DwOffset, DwProcessCreateArgsV1, DwProcessCreateResultV1, DwRights, DwSize,
     DwThreadStartArgsV1, DwUserAddress,
 };
-use wyrmroot_loader::process::{LoaderPlatform, ProcessCreateRequest, ProcessCreateResult};
+use wyrmroot_loader::process::{
+    LoaderPlatform, ParentMapping, ProcessCreateRequest, ProcessCreateResult,
+};
 
 use crate::{NativeError, NativeOutputError};
 
@@ -104,7 +106,7 @@ impl LoaderPlatform for NativeLoaderPlatform {
         object_size: u64,
         destination_offset: u64,
         source: &[u8],
-    ) -> Result<(), Self::Error> {
+    ) -> Result<ParentMapping, Self::Error> {
         let length = usize::try_from(object_size)
             .map_err(|_| NativeError::Output(NativeOutputError::InvalidMappedRange))?;
         let destination = usize::try_from(destination_offset)
@@ -136,10 +138,21 @@ impl LoaderPlatform for NativeLoaderPlatform {
         let bytes = unsafe { core::slice::from_raw_parts_mut(address.0 as *mut u8, length) };
         bytes.fill(0);
         bytes[destination..end].copy_from_slice(source);
+        Ok(ParentMapping {
+            address: address.0,
+            bytes: object_size,
+        })
+    }
+
+    fn unmap_parent(
+        &mut self,
+        parent_root: DwHandle,
+        mapping: ParentMapping,
+    ) -> Result<(), Self::Error> {
         success(deepwyrm_syscall::address_region_unmap(
             parent_root,
-            address,
-            DwSize(object_size),
+            DwUserAddress(mapping.address),
+            DwSize(mapping.bytes),
         ))
     }
 

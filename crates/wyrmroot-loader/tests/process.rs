@@ -2,8 +2,8 @@ use deepwyrm_syscall::{DwHandle, DwHandleTransferV1, DwMemoryProtection, DwRight
 use wyrmroot_loader::{
     launch::LaunchProfile,
     process::{
-        LoadAuthority, LoadError, LoadRequest, LoadStage, LoaderPlatform, ProcessCreateRequest,
-        ProcessCreateResult, load_process,
+        LoadAuthority, LoadError, LoadRequest, LoadStage, LoaderPlatform, ParentMapping,
+        ProcessCreateRequest, ProcessCreateResult, load_process,
     },
 };
 
@@ -15,6 +15,7 @@ enum Event {
     Process,
     Memory(u64),
     Materialize(u64, usize),
+    UnmapParent(u64),
     Map(u64),
     Unmap(u64),
     Thread,
@@ -93,9 +94,17 @@ impl LoaderPlatform for Mock {
         _: u64,
         _: u64,
         source: &[u8],
-    ) -> Result<(), Self::Error> {
+    ) -> Result<ParentMapping, Self::Error> {
         self.events.push(Event::Materialize(memory.0, source.len()));
-        self.check("materialize")
+        self.check("materialize")?;
+        Ok(ParentMapping {
+            address: 0x6000_0000 + memory.0 * 0x1000,
+            bytes: 0x1000,
+        })
+    }
+    fn unmap_parent(&mut self, _: DwHandle, mapping: ParentMapping) -> Result<(), Self::Error> {
+        self.events.push(Event::UnmapParent(mapping.address));
+        self.check("unmap-parent")
     }
     fn map_child(
         &mut self,
@@ -160,10 +169,11 @@ fn init0_construction_materializes_before_mapping_and_starts_last() {
     assert_ne!(result.process.0, 0);
     assert_ne!(result.launch_channel.0, 0);
     let materialize = position(&platform.events, |e| matches!(e, Event::Materialize(_, _)));
+    let unmap_parent = position(&platform.events, |e| matches!(e, Event::UnmapParent(_)));
     let map = position(&platform.events, |e| matches!(e, Event::Map(_)));
     let send = position(&platform.events, |e| matches!(e, Event::Send(3)));
     let start = position(&platform.events, |e| matches!(e, Event::Start));
-    assert!(materialize < map && map < send && send < start);
+    assert!(materialize < unmap_parent && unmap_parent < map && map < send && send < start);
     assert_eq!(platform.events.last(), Some(&Event::Close(18)));
 }
 
@@ -197,6 +207,37 @@ fn prepublication_failure_unmaps_and_terminates_in_reverse_order() {
         })
         .collect();
     assert_eq!(unmaps, vec![0x0000_7fff_fffe_0000, 0x0040_0000]);
+    assert!(platform.events.contains(&Event::TerminateProcess));
+}
+
+#[test]
+fn failed_parent_unmap_retains_exact_alias_for_rollback_retry() {
+    let mut platform = Mock::new(Some("unmap-parent"));
+    let image = executable();
+    let error = load_process(
+        &mut platform,
+        authority(),
+        request(&image, LaunchProfile::Hello),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error,
+        LoadError::Platform {
+            stage: LoadStage::ParentUnmap,
+            cause: "unmap-parent",
+            rollback_failed: true,
+        }
+    );
+    let attempted: Vec<_> = platform
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            Event::UnmapParent(address) => Some(*address),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(attempted.len(), 2);
+    assert_eq!(attempted[0], attempted[1]);
     assert!(platform.events.contains(&Event::TerminateProcess));
 }
 
