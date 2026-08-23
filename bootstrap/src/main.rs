@@ -51,20 +51,20 @@ use wyrmroot_runtime::{NativeLoaderPlatform, NativeSupervisionPlatform, monotoni
 const BOOTSTRAP_SUPERVISION_TIMEOUT_NS: u64 = 5_000_000_000;
 
 struct NativeSystem {
-    last_native_operation: u32,
+    failed_native_operation: u32,
 }
 
 impl NativeSystem {
     const fn new() -> Self {
         Self {
-            last_native_operation: 0,
+            failed_native_operation: 0,
         }
     }
 
     fn exit_code(&self, error: &BootstrapError) -> u32 {
         let code = error.exit_code();
         if matches!(error, BootstrapError::Native(_)) {
-            code | (self.last_native_operation << 20)
+            code | (self.failed_native_operation << 20)
         } else {
             code
         }
@@ -79,8 +79,11 @@ impl BootstrapSystem for NativeSystem {
         CapabilityInfo<deepwyrm_syscall::DwObjectType, deepwyrm_syscall::DwRights>,
         NativeError,
     > {
-        self.last_native_operation = 1;
-        query_capability_info(handle)
+        let result = query_capability_info(handle);
+        if result.is_err() {
+            self.failed_native_operation = 1;
+        }
+        result
     }
 
     fn receive_channel(
@@ -89,13 +92,19 @@ impl BootstrapSystem for NativeSystem {
         bytes: &mut [u8],
         handles: &mut [DwReceivedHandleInfoV1],
     ) -> Result<ReceiveCounts, NativeError> {
-        self.last_native_operation = 2;
-        receive_channel(channel, bytes, handles)
+        let result = receive_channel(channel, bytes, handles);
+        if result.is_err() {
+            self.failed_native_operation = 2;
+        }
+        result
     }
 
     fn query_memory_object_size(&mut self, handle: DwHandle) -> Result<u64, NativeError> {
-        self.last_native_operation = 3;
-        query_memory_object_size(handle)
+        let result = query_memory_object_size(handle);
+        if result.is_err() {
+            self.failed_native_operation = 3;
+        }
+        result
     }
 
     fn with_bootfs_bytes<R>(
@@ -105,22 +114,35 @@ impl BootstrapSystem for NativeSystem {
         plan: MappingPlan,
         use_bytes: impl for<'bytes> FnOnce(&'bytes [u8]) -> R,
     ) -> Result<R, NativeError> {
-        self.last_native_operation = 4;
-        let mapping = map_bootfs_read_only(root_region, bootfs, plan)?;
+        let mapping = match map_bootfs_read_only(root_region, bootfs, plan) {
+            Ok(mapping) => mapping,
+            Err(error) => {
+                self.failed_native_operation = 4;
+                return Err(error);
+            }
+        };
         let result = mapping.with_logical_bytes(use_bytes);
-        self.last_native_operation = 5;
-        unmap_bootfs(mapping)?;
+        if let Err(error) = unmap_bootfs(mapping) {
+            self.failed_native_operation = 5;
+            return Err(error);
+        }
         Ok(result)
     }
 
     fn send_channel(&mut self, channel: DwHandle, bytes: &[u8]) -> Result<(), NativeError> {
-        self.last_native_operation = 6;
-        send_channel(channel, bytes, &[])
+        let result = send_channel(channel, bytes, &[]);
+        if result.is_err() {
+            self.failed_native_operation = 6;
+        }
+        result
     }
 
     fn close_handle(&mut self, handle: DwHandle) -> Result<(), NativeError> {
-        self.last_native_operation = 7;
-        close_handle(handle)
+        let result = close_handle(handle);
+        if result.is_err() {
+            self.failed_native_operation = 7;
+        }
+        result
     }
 }
 
