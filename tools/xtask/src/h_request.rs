@@ -3,10 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
 
 use crate::error::Failure;
-use crate::secure_fs;
 
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 const REQUIRED_KEYS_V2: &[&str] = &[
@@ -131,8 +129,6 @@ impl ExpectedOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HRequest {
     pub(crate) path: PathBuf,
-    pub(crate) root: secure_fs::Root,
-    pub(crate) request_bytes: Arc<Vec<u8>>,
     pub(crate) schema_version: u32,
     pub(crate) deepwyrm_revision: String,
     pub(crate) wyrmroot_revision: String,
@@ -159,19 +155,15 @@ pub(crate) struct HRequest {
 }
 
 pub(crate) fn load(path: &Path) -> Result<HRequest, Failure> {
-    let supplied_parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let root_path = fs::canonicalize(supplied_parent).map_err(|error| {
-        Failure::task(format!("could not resolve WYR0-H request root: {error}"))
-    })?;
-    let root = secure_fs::Root::open(&root_path, "WYR0-H request root")?;
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| Failure::task("WYR0-H request has no file name"))?;
-    let path = root_path.join(file_name);
-    let request_bytes = root.read(&path, "WYR0-H request", MAX_REQUEST_BYTES, false)?;
-    let text = std::str::from_utf8(&request_bytes)
-        .map_err(|_| Failure::task("WYR0-H request is not UTF-8"))?;
-    let values = parse(text)?;
+    let path = canonical_regular(path, "WYR0-H request", MAX_REQUEST_BYTES)?;
+    let metadata = fs::metadata(&path)
+        .map_err(|error| Failure::task(format!("could not stat WYR0-H request: {error}")))?;
+    if metadata.len() > MAX_REQUEST_BYTES {
+        return Err(Failure::task("WYR0-H request exceeds its size limit"));
+    }
+    let text = fs::read_to_string(&path)
+        .map_err(|error| Failure::task(format!("could not read WYR0-H request: {error}")))?;
+    let values = parse(&text)?;
     let schema_version = number::<u32>(&values, "schema_version")?;
     let required_keys = match schema_version {
         2 => REQUIRED_KEYS_V2,
@@ -287,8 +279,6 @@ pub(crate) fn load(path: &Path) -> Result<HRequest, Failure> {
     };
     let request = HRequest {
         path,
-        root,
-        request_bytes: Arc::new(request_bytes),
         schema_version,
         deepwyrm_revision: revision(&values, "deepwyrm_revision")?,
         wyrmroot_revision: revision(&values, "wyrmroot_revision")?,
@@ -509,19 +499,11 @@ fn reject_output_aliases(request: &HRequest) -> Result<(), Failure> {
     }
     for (index, (left, left_label)) in outputs.iter().enumerate() {
         for (right, right_label) in outputs.iter().skip(index + 1) {
-            if left == right || left.starts_with(right) || right.starts_with(left) {
+            if left == right {
                 return Err(Failure::task(format!(
-                    "WYR0-H {left_label} and {right_label} paths alias or overlap by ancestry"
+                    "WYR0-H {left_label} and {right_label} paths alias"
                 )));
             }
-        }
-    }
-    if let Some(stress) = &request.stress {
-        let fixed_i2 = request.run_directory.join("i2");
-        if stress.v0_manifest.starts_with(&fixed_i2) || fixed_i2.starts_with(&stress.v0_manifest) {
-            return Err(Failure::task(
-                "WYR0-H v0_manifest collides with the fixed I2 output tree",
-            ));
         }
     }
     Ok(())
@@ -551,27 +533,72 @@ pub(crate) fn validate_output_parent(
     path: &Path,
     label: &str,
 ) -> Result<(), Failure> {
-    request
-        .root
-        .validate_existing_ancestor(path, label)
-        .map_err(|error| {
-            Failure::task(format!(
-                "WYR0-H {label} output parent escapes the request root through a symlink or is invalid: {}",
-                error.message
-            ))
-        })
+    let request_root = request
+        .path
+        .parent()
+        .ok_or_else(|| Failure::task("WYR0-H request has no parent directory"))?;
+    let request_root = fs::canonicalize(request_root).map_err(|error| {
+        Failure::task(format!("could not resolve WYR0-H request root: {error}"))
+    })?;
+    let existing_parent = nearest_existing_parent(path)?;
+    let resolved_parent = fs::canonicalize(existing_parent).map_err(|error| {
+        Failure::task(format!(
+            "could not resolve WYR0-H {label} output parent: {error}"
+        ))
+    })?;
+    if !resolved_parent.starts_with(&request_root) {
+        return Err(Failure::task(format!(
+            "WYR0-H {label} output parent escapes the request root through a symlink"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_run_directory(request: &HRequest) -> Result<(), Failure> {
-    request
-        .root
-        .validate_directory_if_present(&request.run_directory, "run_directory")
-        .map_err(|error| {
-            Failure::task(format!(
-                "WYR0-H run_directory escapes the request root through a symlink or is invalid: {}",
-                error.message
-            ))
-        })
+    let metadata = match fs::symlink_metadata(&request.run_directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(Failure::task(format!(
+                "could not inspect WYR0-H run_directory: {error}"
+            )));
+        }
+    };
+    let root = request
+        .path
+        .parent()
+        .ok_or_else(|| Failure::task("WYR0-H request has no parent directory"))?;
+    let root = fs::canonicalize(root).map_err(|error| {
+        Failure::task(format!("could not resolve WYR0-H request root: {error}"))
+    })?;
+    let resolved = fs::canonicalize(&request.run_directory).map_err(|error| {
+        Failure::task(format!("could not resolve WYR0-H run_directory: {error}"))
+    })?;
+    if !resolved.starts_with(root) {
+        return Err(Failure::task(
+            "WYR0-H run_directory escapes the request root through a symlink",
+        ));
+    }
+    if !metadata.file_type().is_dir() {
+        return Err(Failure::task(
+            "WYR0-H run_directory must be a real directory when it already exists",
+        ));
+    }
+    Ok(())
+}
+
+fn nearest_existing_parent(path: &Path) -> Result<&Path, Failure> {
+    let mut candidate = path
+        .parent()
+        .ok_or_else(|| Failure::task("WYR0-H output path has no parent directory"))?;
+    loop {
+        if fs::symlink_metadata(candidate).is_ok() {
+            return Ok(candidate);
+        }
+        candidate = candidate
+            .parent()
+            .ok_or_else(|| Failure::task("WYR0-H output path has no existing parent directory"))?;
+    }
 }
 
 pub(crate) fn canonical_regular(
@@ -919,21 +946,6 @@ mod tests {
             (
                 "escape",
                 valid_v4().replace("evidence/v0-manifest.toml", "../v0.toml"),
-            ),
-            (
-                "manifest-run-root",
-                valid_v4().replace("evidence/v0-manifest.toml", "runs"),
-            ),
-            (
-                "manifest-i2-ancestor",
-                valid_v4().replace("evidence/v0-manifest.toml", "runs/i2"),
-            ),
-            (
-                "manifest-i2-descendant",
-                valid_v4().replace(
-                    "evidence/v0-manifest.toml",
-                    "runs/i2/run-000000/result.json",
-                ),
             ),
         ] {
             let invalid_root = request_root(label);

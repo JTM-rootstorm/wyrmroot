@@ -7,7 +7,6 @@ mod h_integration;
 mod h_request;
 mod metadata;
 mod provenance;
-mod secure_fs;
 mod sha256;
 mod tasks;
 mod toolchain_artifact;

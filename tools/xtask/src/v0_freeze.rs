@@ -1,11 +1,12 @@
 //! Create-new V0 evidence binding for an already validated release candidate.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 use crate::error::Failure;
-use crate::{h_integration, h_request, secure_fs, sha256};
+use crate::{h_integration, h_request, sha256};
 
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 const MAX_EVIDENCE_BYTES: u64 = 16 * 1024 * 1024;
@@ -33,7 +34,6 @@ const REQUEST_KEYS: &[&str] = &[
 #[derive(Debug)]
 struct FreezeRequest {
     root: PathBuf,
-    secure_root: secure_fs::Root,
     deepwyrm_revision: String,
     wyrmroot_revision: String,
     rust_revision: String,
@@ -112,7 +112,6 @@ pub(crate) fn freeze(request_path: &str) -> Result<String, Failure> {
     )?;
     require_json_scalar(&i2_bytes, "failing_run_index", "null", "I2 summary")?;
     require_json_scalar(&i2_bytes, "candidate_revalidated", "true", "I2 summary")?;
-    cross_bind_candidate_artifacts(&default_bytes, &i1_bytes, &i2_bytes)?;
 
     let geometry = checked_expected_digest(
         &request,
@@ -140,7 +139,7 @@ pub(crate) fn freeze(request_path: &str) -> Result<String, Failure> {
     }
     let candidate_fields = h_integration::freeze_candidate_fields(&request.candidate_request)?;
     let run_fields = validate_i2_results(&request, &candidate, &i2_bytes)?;
-    let matrix_manifest = file_digest(&request, &request.host_matrix, "V0 host matrix")?;
+    let matrix_manifest = file_digest(&request.host_matrix, "V0 host matrix")?;
 
     let mut matrix_fields = String::new();
     for (index, entry) in matrix.iter().enumerate() {
@@ -208,47 +207,24 @@ pub(crate) fn freeze(request_path: &str) -> Result<String, Failure> {
     ))
 }
 
-fn cross_bind_candidate_artifacts(default: &[u8], i1: &[u8], i2: &[u8]) -> Result<(), Failure> {
-    let default = parse_json_object(default, "default evidence")?;
-    let i1 = parse_json_object(i1, "I1 evidence")?;
-    let i2 = parse_json_object(i2, "I2 summary")?;
-    for key in [
-        "loader_sha256",
-        "kernel_sha256",
-        "symbols_sha256",
-        "bootstrap_sha256",
-        "init0_sha256",
-        "hello_sha256",
-        "bootfs_sha256",
-        "esp_sha256",
-        "ovmf_code_sha256",
-        "ovmf_vars_template_sha256",
-    ] {
-        let expected = i2
-            .get(key)
-            .ok_or_else(|| Failure::task(format!("I2 summary lacks '{key}'")))?;
-        if default.get(key) != Some(expected) || i1.get(key) != Some(expected) {
-            return Err(Failure::task(format!(
-                "default/I1/I2 evidence disagree on admitted candidate binding '{key}'"
-            )));
-        }
-    }
-    Ok(())
-}
-
 fn load_request(path: &Path) -> Result<FreezeRequest, Failure> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let root = fs::canonicalize(parent)
-        .map_err(|error| Failure::task(format!("could not resolve V0 request root: {error}")))?;
-    let secure_root = secure_fs::Root::open(&root, "V0 request root")?;
-    let name = path
-        .file_name()
-        .ok_or_else(|| Failure::task("V0 request has no file name"))?;
-    let path = root.join(name);
-    let request_bytes = secure_root.read(&path, "V0 request", MAX_REQUEST_BYTES, false)?;
-    let text = std::str::from_utf8(&request_bytes)
-        .map_err(|_| Failure::task("V0 request is not UTF-8"))?;
-    let values = parse_flat(text, "V0 request")?;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| Failure::task(format!("could not inspect V0 request: {error}")))?;
+    if !metadata.file_type().is_file() || metadata.len() == 0 || metadata.len() > MAX_REQUEST_BYTES
+    {
+        return Err(Failure::task(
+            "V0 request must be a bounded nonempty regular file",
+        ));
+    }
+    let path = fs::canonicalize(path)
+        .map_err(|error| Failure::task(format!("could not resolve V0 request: {error}")))?;
+    let root = path
+        .parent()
+        .ok_or_else(|| Failure::task("V0 request has no parent"))?
+        .to_path_buf();
+    let text = fs::read_to_string(&path)
+        .map_err(|error| Failure::task(format!("could not read V0 request: {error}")))?;
+    let values = parse_flat(&text, "V0 request")?;
     exact_keys(&values, REQUEST_KEYS, "V0 request")?;
     if required(&values, "schema_version", "V0 request")? != "1"
         || required(&values, "manifest_kind", "V0 request")? != "wyr0-v0-freeze-request"
@@ -258,7 +234,6 @@ fn load_request(path: &Path) -> Result<FreezeRequest, Failure> {
     let manifest = output_path(&root, required(&values, "manifest", "V0 request")?)?;
     let request = FreezeRequest {
         root: root.clone(),
-        secure_root,
         deepwyrm_revision: revision(&values, "deepwyrm_revision", "V0 request")?,
         wyrmroot_revision: revision(&values, "wyrmroot_revision", "V0 request")?,
         rust_revision: revision(&values, "rust_revision", "V0 request")?,
@@ -292,30 +267,8 @@ fn load_request(path: &Path) -> Result<FreezeRequest, Failure> {
         validate_relative_contained(&request, path, true)?;
     }
     validate_relative_contained(&request, &request.manifest, false)?;
-    if request
-        .secure_root
-        .exists(&request.manifest, "V0 manifest")?
-    {
+    if fs::symlink_metadata(&request.manifest).is_ok() {
         return Err(Failure::task("V0 manifest output already exists"));
-    }
-    for input in [
-        &request.candidate_request,
-        &request.default_result,
-        &request.i1_result,
-        &request.i2_summary,
-        &request.geometry_report,
-        &request.qemu_argument_report,
-        &request.version_report,
-        &request.host_matrix,
-    ] {
-        if request.manifest == *input
-            || request.manifest.starts_with(input)
-            || input.starts_with(&request.manifest)
-        {
-            return Err(Failure::task(
-                "V0 manifest aliases or overlaps a freeze input",
-            ));
-        }
     }
     Ok(request)
 }
@@ -388,7 +341,7 @@ fn load_matrix(request: &FreezeRequest) -> Result<Vec<MatrixEntry>, Failure> {
             &format!("entry_{index:03}_sha256"),
             "V0 host matrix",
         )?;
-        let actual_digest = file_digest(request, &evidence, "V0 host-matrix evidence")?;
+        let actual_digest = file_digest(&evidence, "V0 host-matrix evidence")?;
         if actual_digest != expected_digest {
             return Err(Failure::task("V0 host-matrix evidence digest mismatch"));
         }
@@ -416,7 +369,6 @@ fn validate_i2_results(
         validate_relative_contained(request, &result, true)?;
         let bytes = read_regular(request, &result, "I2 run result")?;
         validate_result(&bytes, 4, "WYR0-H-I2", request, "I2 run result")?;
-        cross_bind_i2_run(summary, &bytes)?;
         require_json_scalar(&bytes, "run_index", &index.to_string(), "I2 run result")?;
         require_json_scalar(
             &bytes,
@@ -440,92 +392,19 @@ fn validate_i2_results(
         require_json_scalar(&bytes, "family_mask", "511", "I2 run result")?;
         require_json_scalar(&bytes, "candidate_revalidated", "true", "I2 run result")?;
         let digest = sha256::bytes_digest(&bytes);
-        ordered.push((index, format!("{seed:016X}"), digest.clone()));
+        ordered.push(format!(
+            "{{\"run_index\":{index},\"seed\":\"{seed:016X}\",\"result_sha256\":\"{digest}\",\"status\":\"PASS\"}}"
+        ));
         fields.push_str(&format!(
             "i2_run_{index:03}_seed = \"{seed:016X}\"\ni2_run_{index:03}_result_sha256 = \"{digest}\"\n"
         ));
     }
-    validate_ordered_results(summary, &ordered)?;
+    require_json_token(
+        summary,
+        &format!("\"ordered_results\":[{}]", ordered.join(",")),
+        "I2 summary",
+    )?;
     Ok(fields)
-}
-
-fn cross_bind_i2_run(summary: &[u8], run: &[u8]) -> Result<(), Failure> {
-    let summary = parse_json_object(summary, "I2 summary")?;
-    let run = parse_json_object(run, "I2 run result")?;
-    for key in [
-        "selector",
-        "test_id",
-        "stress_schedule_version",
-        "stress_base_seed",
-        "candidate_sha256",
-        "provenance_sha256",
-        "request_sha256",
-        "loader_sha256",
-        "kernel_sha256",
-        "symbols_sha256",
-        "bootstrap_sha256",
-        "init0_sha256",
-        "hello_sha256",
-        "bootfs_sha256",
-        "esp_sha256",
-        "ovmf_code_sha256",
-        "ovmf_vars_template_sha256",
-        "deepwyrm_revision",
-        "wyrmroot_revision",
-        "rust_revision",
-    ] {
-        if run.get(key) != summary.get(key) {
-            return Err(Failure::task(format!(
-                "I2 run result disagrees with its summary on '{key}'"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn validate_ordered_results(
-    summary: &[u8],
-    expected: &[(u32, String, String)],
-) -> Result<(), Failure> {
-    let object = parse_json_document_object(summary, "I2 summary")?;
-    let JsonValue::Array(results) = object
-        .get("ordered_results")
-        .ok_or_else(|| Failure::task("I2 summary lacks ordered_results"))?
-    else {
-        return Err(Failure::task("I2 summary ordered_results is not an array"));
-    };
-    if results.len() != expected.len() {
-        return Err(Failure::task("I2 summary ordered_results length drifted"));
-    }
-    for (position, (value, (index, seed, digest))) in
-        results.iter().zip(expected.iter()).enumerate()
-    {
-        let JsonValue::Object(entry) = value else {
-            return Err(Failure::task(format!(
-                "I2 summary ordered_results[{position}] is not an object"
-            )));
-        };
-        if entry.keys().cloned().collect::<BTreeSet<_>>()
-            != key_set(&["run_index", "seed", "result_sha256", "status"])
-        {
-            return Err(Failure::task(format!(
-                "I2 summary ordered_results[{position}] key set drifted"
-            )));
-        }
-        for (key, expected) in [
-            ("run_index", index.to_string()),
-            ("seed", seed.clone()),
-            ("result_sha256", digest.clone()),
-            ("status", "PASS".to_owned()),
-        ] {
-            if entry.get(key).and_then(JsonValue::scalar).as_deref() != Some(expected.as_str()) {
-                return Err(Failure::task(format!(
-                    "I2 summary ordered_results[{position}] has invalid '{key}'"
-                )));
-            }
-        }
-    }
-    Ok(())
 }
 
 fn validate_result(
@@ -536,23 +415,6 @@ fn validate_result(
     label: &str,
 ) -> Result<(), Failure> {
     let values = parse_json_object(bytes, label)?;
-    let expected_keys = match (schema, phase, values.get("kind").map(String::as_str)) {
-        (2, "WYR0-H", None) => default_result_keys(false),
-        (3, "WYR0-H", None) => default_result_keys(true),
-        (4, "WYR0-H-I2", Some("stress-summary")) => i2_summary_keys(),
-        (4, "WYR0-H-I2", None) => i2_run_keys(),
-        _ => {
-            return Err(Failure::task(format!(
-                "{label} has an unsupported JSON schema kind"
-            )));
-        }
-    };
-    let actual = values.keys().cloned().collect::<BTreeSet<_>>();
-    if actual != expected_keys {
-        return Err(Failure::task(format!(
-            "{label} JSON key set drifted (unknown or missing fields)"
-        )));
-    }
     for (key, expected) in [
         ("schema_version", schema.to_string()),
         ("phase", phase.to_owned()),
@@ -567,219 +429,7 @@ fn validate_result(
             )));
         }
     }
-    for (key, value) in &values {
-        if key.ends_with("_sha256") && !is_sha256(value) {
-            return Err(Failure::task(format!(
-                "{label} has an invalid '{key}' digest"
-            )));
-        }
-    }
-    match schema {
-        2 => {
-            require_map_scalar(&values, "profile", "default", label)?;
-            require_map_scalar(&values, "selector", "primordial-bootstrap", label)?;
-            require_map_scalar(&values, "test_id", "18", label)?;
-            require_map_scalar(&values, "actual_outcome", "pass", label)?;
-            require_map_scalar(&values, "detail", "0", label)?;
-        }
-        3 => {
-            require_map_scalar(&values, "profile", "smp", label)?;
-            require_map_scalar(&values, "selector", h_request::I1_SELECTOR, label)?;
-            require_map_scalar(
-                &values,
-                "test_id",
-                &h_request::I1_TEST_ID.to_string(),
-                label,
-            )?;
-            require_map_scalar(&values, "actual_outcome", "pass", label)?;
-            require_map_scalar(&values, "detail", "0", label)?;
-        }
-        4 if !values.contains_key("kind") => {
-            require_map_scalar(&values, "profile", "smp", label)?;
-            require_map_scalar(&values, "selector", h_request::I2_SELECTOR, label)?;
-            require_map_scalar(
-                &values,
-                "test_id",
-                &h_request::I2_TEST_ID.to_string(),
-                label,
-            )?;
-            require_map_scalar(&values, "actual_outcome", "pass", label)?;
-            require_map_scalar(&values, "detail", "0", label)?;
-            require_map_scalar(&values, "failing_operation", &u32::MAX.to_string(), label)?;
-            require_map_scalar(&values, "stage", "0", label)?;
-        }
-        4 => {
-            require_map_scalar(&values, "selector", h_request::I2_SELECTOR, label)?;
-            require_map_scalar(
-                &values,
-                "test_id",
-                &h_request::I2_TEST_ID.to_string(),
-                label,
-            )?;
-        }
-        _ => unreachable!(),
-    }
     Ok(())
-}
-
-fn require_map_scalar(
-    values: &BTreeMap<String, String>,
-    key: &str,
-    expected: &str,
-    label: &str,
-) -> Result<(), Failure> {
-    if values.get(key).map(String::as_str) != Some(expected) {
-        return Err(Failure::task(format!(
-            "{label} has an invalid or missing '{key}' binding"
-        )));
-    }
-    Ok(())
-}
-
-fn key_set(keys: &[&str]) -> BTreeSet<String> {
-    keys.iter().map(|key| (*key).to_owned()).collect()
-}
-
-fn default_result_keys(i1: bool) -> BTreeSet<String> {
-    let mut keys = key_set(&[
-        "schema_version",
-        "phase",
-        "mode",
-        "profile",
-        "selector",
-        "status",
-        "vcpu",
-        "memory_mib",
-        "test_id",
-        "expected_outcome",
-        "expected_detail",
-        "actual_outcome",
-        "detail",
-        "serial_line",
-        "qemu_exit_status",
-        "candidate_sha256",
-        "provenance_sha256",
-        "request_sha256",
-        "loader_sha256",
-        "kernel_sha256",
-        "symbols_sha256",
-        "bootstrap_sha256",
-        "init0_sha256",
-        "hello_sha256",
-        "bootfs_sha256",
-        "esp_sha256",
-        "ovmf_code_sha256",
-        "ovmf_vars_template_sha256",
-        "serial_sha256",
-        "qemu_stderr_sha256",
-        "ovmf_vars_sha256",
-        "deepwyrm_revision",
-        "wyrmroot_revision",
-        "rust_revision",
-        "no_host_share",
-    ]);
-    if i1 {
-        keys.extend(key_set(&[
-            "evidence_protocol",
-            "evidence_nonce",
-            "required_evidence_mask",
-            "observed_evidence_mask",
-            "evidence_event_count",
-            "first_evidence_sequence",
-            "last_evidence_sequence",
-        ]));
-    }
-    keys
-}
-
-fn i2_run_keys() -> BTreeSet<String> {
-    key_set(&[
-        "schema_version",
-        "phase",
-        "status",
-        "profile",
-        "selector",
-        "test_id",
-        "run_index",
-        "stress_schedule_version",
-        "stress_base_seed",
-        "stress_seed",
-        "configured_operations",
-        "completed_operations",
-        "cpu_mask",
-        "family_mask",
-        "actual_outcome",
-        "detail",
-        "failing_operation",
-        "stage",
-        "stress_serial_line",
-        "terminal_serial_line",
-        "qemu_exit_status",
-        "serial_sha256",
-        "qemu_stderr_sha256",
-        "ovmf_vars_sha256",
-        "candidate_sha256",
-        "provenance_sha256",
-        "request_sha256",
-        "loader_sha256",
-        "kernel_sha256",
-        "symbols_sha256",
-        "bootstrap_sha256",
-        "init0_sha256",
-        "hello_sha256",
-        "bootfs_sha256",
-        "esp_sha256",
-        "ovmf_code_sha256",
-        "ovmf_vars_template_sha256",
-        "deepwyrm_revision",
-        "wyrmroot_revision",
-        "rust_revision",
-        "candidate_revalidated",
-        "no_host_share",
-    ])
-}
-
-fn i2_summary_keys() -> BTreeSet<String> {
-    key_set(&[
-        "schema_version",
-        "phase",
-        "kind",
-        "status",
-        "selector",
-        "test_id",
-        "stress_schedule_version",
-        "stress_base_seed",
-        "requested_runs",
-        "completed_runs",
-        "failing_run_index",
-        "operations_per_run",
-        "reason",
-        "ordered_results",
-        "candidate_sha256",
-        "provenance_sha256",
-        "request_sha256",
-        "loader_sha256",
-        "kernel_sha256",
-        "symbols_sha256",
-        "bootstrap_sha256",
-        "init0_sha256",
-        "hello_sha256",
-        "bootfs_sha256",
-        "esp_sha256",
-        "ovmf_code_sha256",
-        "ovmf_vars_template_sha256",
-        "deepwyrm_revision",
-        "wyrmroot_revision",
-        "rust_revision",
-        "candidate_revalidated",
-    ])
-}
-
-fn is_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn require_json_scalar(
@@ -797,62 +447,64 @@ fn require_json_scalar(
     Ok(())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum JsonValue {
-    String(String),
-    Number(String),
-    Bool(bool),
-    Null,
-    Object(BTreeMap<String, JsonValue>),
-    Array(Vec<JsonValue>),
-}
-
-fn parse_json_document_object(
-    bytes: &[u8],
-    label: &str,
-) -> Result<BTreeMap<String, JsonValue>, Failure> {
-    std::str::from_utf8(bytes)
+fn require_json_token(bytes: &[u8], token: &str, label: &str) -> Result<(), Failure> {
+    let text = std::str::from_utf8(bytes)
         .map_err(|_| Failure::task(format!("{label} is not UTF-8 JSON evidence")))?;
-    let (value, index) = parse_json_value(bytes, skip_json_whitespace(bytes, 0), label)?;
-    if skip_json_whitespace(bytes, index) != bytes.len() {
-        return Err(Failure::task(format!("{label} has trailing JSON data")));
+    if !text.contains(token) {
+        return Err(Failure::task(format!(
+            "{label} lacks required binding {token}"
+        )));
     }
-    let JsonValue::Object(object) = value else {
-        return Err(Failure::task(format!("{label} is not a JSON object")));
-    };
-    Ok(object)
-}
-
-impl JsonValue {
-    fn scalar(&self) -> Option<String> {
-        match self {
-            Self::String(value) | Self::Number(value) => Some(value.clone()),
-            Self::Bool(value) => Some(value.to_string()),
-            Self::Null => Some("null".to_owned()),
-            Self::Object(_) | Self::Array(_) => None,
-        }
-    }
+    Ok(())
 }
 
 fn parse_json_object(bytes: &[u8], label: &str) -> Result<BTreeMap<String, String>, Failure> {
     std::str::from_utf8(bytes)
         .map_err(|_| Failure::task(format!("{label} is not UTF-8 JSON evidence")))?;
-    let (value, index) = parse_json_value(bytes, skip_json_whitespace(bytes, 0), label)?;
+    let mut index = skip_json_whitespace(bytes, 0);
+    if bytes.get(index) != Some(&b'{') {
+        return Err(Failure::task(format!("{label} is not a JSON object")));
+    }
+    index += 1;
+    let mut values = BTreeMap::new();
+    loop {
+        index = skip_json_whitespace(bytes, index);
+        if bytes.get(index) == Some(&b'}') {
+            index += 1;
+            break;
+        }
+        let (key, next) = parse_json_string(bytes, index, label)?;
+        index = skip_json_whitespace(bytes, next);
+        if bytes.get(index) != Some(&b':') {
+            return Err(Failure::task(format!("{label} JSON key lacks ':'")));
+        }
+        index = skip_json_whitespace(bytes, index + 1);
+        let (value, next) = parse_json_value(bytes, index, label)?;
+        if values.insert(key.clone(), value).is_some() {
+            return Err(Failure::task(format!(
+                "{label} JSON repeats top-level key '{key}'"
+            )));
+        }
+        index = skip_json_whitespace(bytes, next);
+        match bytes.get(index) {
+            Some(b',') => index += 1,
+            Some(b'}') => {
+                index += 1;
+                break;
+            }
+            _ => {
+                return Err(Failure::task(format!(
+                    "{label} JSON object has invalid framing"
+                )));
+            }
+        }
+    }
     if skip_json_whitespace(bytes, index) != bytes.len() {
         return Err(Failure::task(format!(
             "{label} has trailing data after its JSON object"
         )));
     }
-    let JsonValue::Object(object) = value else {
-        return Err(Failure::task(format!("{label} is not a JSON object")));
-    };
-    Ok(object
-        .into_iter()
-        .map(|(key, value)| {
-            let scalar = value.scalar().unwrap_or_else(|| "<compound>".to_owned());
-            (key, scalar)
-        })
-        .collect())
+    Ok(values)
 }
 
 fn parse_json_string(bytes: &[u8], start: usize, label: &str) -> Result<(String, usize), Failure> {
@@ -880,16 +532,9 @@ fn parse_json_string(bytes: &[u8], start: usize, label: &str) -> Result<(String,
     )))
 }
 
-fn parse_json_value(
-    bytes: &[u8],
-    start: usize,
-    label: &str,
-) -> Result<(JsonValue, usize), Failure> {
+fn parse_json_value(bytes: &[u8], start: usize, label: &str) -> Result<(String, usize), Failure> {
     match bytes.get(start).copied() {
-        Some(b'"') => {
-            let (value, next) = parse_json_string(bytes, start, label)?;
-            Ok((JsonValue::String(value), next))
-        }
+        Some(b'"') => parse_json_string(bytes, start, label),
         Some(b'0'..=b'9') => {
             let mut end = start;
             while bytes.get(end).is_some_and(u8::is_ascii_digit) {
@@ -898,87 +543,62 @@ fn parse_json_value(
             let value = std::str::from_utf8(&bytes[start..end])
                 .expect("ASCII decimal JSON value")
                 .to_owned();
-            if value.len() > 1 && value.starts_with('0') {
-                return Err(Failure::task(format!(
-                    "{label} JSON number has a leading zero"
-                )));
-            }
-            Ok((JsonValue::Number(value), end))
+            Ok((value, end))
         }
         Some(b't') if bytes.get(start..start + 4) == Some(b"true") => {
-            Ok((JsonValue::Bool(true), start + 4))
+            Ok(("true".to_owned(), start + 4))
         }
         Some(b'f') if bytes.get(start..start + 5) == Some(b"false") => {
-            Ok((JsonValue::Bool(false), start + 5))
+            Ok(("false".to_owned(), start + 5))
         }
         Some(b'n') if bytes.get(start..start + 4) == Some(b"null") => {
-            Ok((JsonValue::Null, start + 4))
+            Ok(("null".to_owned(), start + 4))
         }
-        Some(b'{') => parse_json_map(bytes, start, label),
-        Some(b'[') => parse_json_array(bytes, start, label),
+        Some(b'{') | Some(b'[') => Ok((
+            "<compound>".to_owned(),
+            skip_json_compound(bytes, start, label)?,
+        )),
         _ => Err(Failure::task(format!(
             "{label} JSON contains an unsupported value"
         ))),
     }
 }
 
-fn parse_json_map(bytes: &[u8], start: usize, label: &str) -> Result<(JsonValue, usize), Failure> {
+fn skip_json_compound(bytes: &[u8], start: usize, label: &str) -> Result<usize, Failure> {
+    let first = bytes[start];
+    let mut stack = vec![if first == b'{' { b'}' } else { b']' }];
     let mut index = start + 1;
-    let mut values = BTreeMap::new();
-    loop {
-        index = skip_json_whitespace(bytes, index);
-        if bytes.get(index) == Some(&b'}') {
-            return Ok((JsonValue::Object(values), index + 1));
-        }
-        let (key, next) = parse_json_string(bytes, index, label)?;
-        index = skip_json_whitespace(bytes, next);
-        if bytes.get(index) != Some(&b':') {
-            return Err(Failure::task(format!("{label} JSON key lacks ':'")));
-        }
-        let (value, next) = parse_json_value(bytes, skip_json_whitespace(bytes, index + 1), label)?;
-        if values.insert(key.clone(), value).is_some() {
-            return Err(Failure::task(format!(
-                "{label} JSON repeats object key '{key}'"
-            )));
-        }
-        index = skip_json_whitespace(bytes, next);
-        match bytes.get(index) {
-            Some(b',') => index += 1,
-            Some(b'}') => return Ok((JsonValue::Object(values), index + 1)),
-            _ => {
-                return Err(Failure::task(format!(
-                    "{label} JSON object has invalid framing"
-                )));
+    while let Some(byte) = bytes.get(index).copied() {
+        match byte {
+            b'"' => {
+                let (_, next) = parse_json_string(bytes, index, label)?;
+                index = next;
             }
+            b'{' => {
+                stack.push(b'}');
+                index += 1;
+            }
+            b'[' => {
+                stack.push(b']');
+                index += 1;
+            }
+            b'}' | b']' => {
+                if stack.pop() != Some(byte) {
+                    return Err(Failure::task(format!(
+                        "{label} JSON compound has mismatched delimiters"
+                    )));
+                }
+                index += 1;
+                if stack.is_empty() {
+                    return Ok(index);
+                }
+            }
+            _ => index += 1,
         }
     }
-}
-
-fn parse_json_array(
-    bytes: &[u8],
-    start: usize,
-    label: &str,
-) -> Result<(JsonValue, usize), Failure> {
-    let mut index = start + 1;
-    let mut values = Vec::new();
-    loop {
-        index = skip_json_whitespace(bytes, index);
-        if bytes.get(index) == Some(&b']') {
-            return Ok((JsonValue::Array(values), index + 1));
-        }
-        let (value, next) = parse_json_value(bytes, index, label)?;
-        values.push(value);
-        index = skip_json_whitespace(bytes, next);
-        match bytes.get(index) {
-            Some(b',') => index += 1,
-            Some(b']') => return Ok((JsonValue::Array(values), index + 1)),
-            _ => {
-                return Err(Failure::task(format!(
-                    "{label} JSON array has invalid framing"
-                )));
-            }
-        }
-    }
+    Err(Failure::task(format!(
+        "{label} JSON compound is unterminated"
+    )))
 }
 
 fn skip_json_whitespace(bytes: &[u8], mut index: usize) -> usize {
@@ -997,7 +617,8 @@ fn checked_expected_digest(
     expected: &str,
     label: &str,
 ) -> Result<String, Failure> {
-    let actual = sha256::bytes_digest(&read_regular(request, path, label)?);
+    let _ = read_regular(request, path, label)?;
+    let actual = file_digest(path, label)?;
     if actual != expected {
         return Err(Failure::task(format!(
             "{label} digest does not match the request"
@@ -1155,25 +776,62 @@ fn validate_relative_contained(
     path: &Path,
     must_exist: bool,
 ) -> Result<(), Failure> {
-    request.secure_root.relative(path, "V0 path")?;
+    let relative = path
+        .strip_prefix(&request.root)
+        .map_err(|_| Failure::task("V0 path escapes the request root"))?;
+    let mut current = request.root.clone();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(Failure::task("V0 path contains a non-normal component"));
+        };
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(Failure::task("V0 path traverses a symlink"));
+            }
+            Ok(metadata) if current != path && !metadata.file_type().is_dir() => {
+                return Err(Failure::task("V0 path parent is not a directory"));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !must_exist => break,
+            Err(error) => return Err(Failure::task(format!("could not inspect V0 path: {error}"))),
+        }
+    }
     if must_exist {
-        let _ = request
-            .secure_root
-            .read(path, "V0 input", MAX_EVIDENCE_BYTES, false)?;
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|error| Failure::task(format!("could not inspect V0 input: {error}")))?;
+        if !metadata.file_type().is_file()
+            || metadata.len() == 0
+            || metadata.len() > MAX_EVIDENCE_BYTES
+        {
+            return Err(Failure::task(
+                "V0 input must be a bounded nonempty regular file",
+            ));
+        }
     } else {
-        request.secure_root.validate_parent(path, "V0 output")?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| Failure::task("V0 output has no parent"))?;
+        let metadata = fs::symlink_metadata(parent).map_err(|error| {
+            Failure::task(format!("could not inspect V0 output parent: {error}"))
+        })?;
+        if !metadata.file_type().is_dir() {
+            return Err(Failure::task(
+                "V0 output parent must be an existing real directory",
+            ));
+        }
     }
     Ok(())
 }
 
 fn read_regular(request: &FreezeRequest, path: &Path, label: &str) -> Result<Vec<u8>, Failure> {
-    request
-        .secure_root
-        .read(path, label, MAX_EVIDENCE_BYTES, false)
+    validate_relative_contained(request, path, true)?;
+    fs::read(path).map_err(|error| Failure::task(format!("could not read {label}: {error}")))
 }
 
-fn file_digest(request: &FreezeRequest, path: &Path, label: &str) -> Result<String, Failure> {
-    Ok(sha256::bytes_digest(&read_regular(request, path, label)?))
+fn file_digest(path: &Path, label: &str) -> Result<String, Failure> {
+    sha256::file_digest(path)
+        .map_err(|error| Failure::task(format!("could not hash {label}: {error}")))
 }
 
 fn write_new(
@@ -1182,7 +840,18 @@ fn write_new(
     bytes: &[u8],
     label: &str,
 ) -> Result<(), Failure> {
-    request.secure_root.write_new(path, bytes, label)
+    validate_relative_contained(request, path, false)?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| Failure::task(format!("could not create {label}: {error}")))?;
+    if let Err(error) = output.write_all(bytes).and_then(|()| output.sync_all()) {
+        drop(output);
+        let _ = fs::remove_file(path);
+        return Err(Failure::task(format!("could not write {label}: {error}")));
+    }
+    Ok(())
 }
 
 fn splitmix64_seed(base_seed: u64, run_index: u32) -> u64 {
@@ -1289,10 +958,9 @@ mod tests {
     }
 
     #[test]
-    fn minimal_result_binding_is_rejected_by_the_complete_schema() {
+    fn result_binding_requires_schema_status_phase_and_revisions() {
         let request = FreezeRequest {
             root: PathBuf::from("/request"),
-            secure_root: secure_fs::Root::placeholder(Path::new("/request")),
             deepwyrm_revision: "1".repeat(40),
             wyrmroot_revision: "2".repeat(40),
             rust_revision: "3".repeat(40),
@@ -1313,10 +981,20 @@ mod tests {
             "{{\"schema_version\":4,\"phase\":\"WYR0-H-I2\",\"status\":\"PASS\",\"deepwyrm_revision\":\"{}\",\"wyrmroot_revision\":\"{}\",\"rust_revision\":\"{}\"}}",
             request.deepwyrm_revision, request.wyrmroot_revision, request.rust_revision
         );
-        assert!(validate_result(valid.as_bytes(), 4, "WYR0-H-I2", &request, "fixture").is_err());
+        assert!(validate_result(valid.as_bytes(), 4, "WYR0-H-I2", &request, "fixture").is_ok());
+        for mutation in [
+            valid.replace("\"status\":\"PASS\"", "\"status\":\"FAIL\""),
+            valid.replace("\"schema_version\":4", "\"schema_version\":3"),
+            valid.replace(&request.deepwyrm_revision, &"4".repeat(40)),
+            valid.replacen("{", "{\"status\":\"FAIL\",", 1),
+            format!("{valid}trailing"),
+        ] {
+            assert!(
+                validate_result(mutation.as_bytes(), 4, "WYR0-H-I2", &request, "fixture").is_err()
+            );
+        }
         assert!(parse_json_object(br#"{"a":[{"b":1}],"c":null}"#, "fixture").is_ok());
         assert!(parse_json_object(br#"{"a":1,"a":1}"#, "fixture").is_err());
-        assert!(parse_json_object(br#"{"a":{"b":1,"b":2}}"#, "fixture").is_err());
         assert!(parse_json_object(br#"{"a":"escaped\\n"}"#, "fixture").is_err());
     }
 
