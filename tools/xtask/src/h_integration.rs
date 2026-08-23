@@ -412,7 +412,14 @@ fn execute(
         ));
     }
 
-    let status = wait_bounded(&mut child, request.timeout_seconds)?;
+    let status = match wait_bounded(&mut child, request.timeout_seconds) {
+        Ok(status) => status,
+        Err(error) if kind == ExecutionKind::Integration => {
+            write_integration_host_failure(profile, request, &run, None, "qemu_wait_failed")?;
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
     if kind == ExecutionKind::Run {
         if !status.success() {
             return Err(Failure::task(format!(
@@ -427,13 +434,32 @@ fn execute(
     }
 
     let serial = read_regular(&run.serial_log, "integration serial log", MAX_SERIAL_BYTES)?;
-    let record = parse_terminal_record(&serial, request.test_id)?;
+    let record = match parse_terminal_record(&serial, request.test_id) {
+        Ok(record) => record,
+        Err(error) => {
+            write_integration_host_failure(
+                profile,
+                request,
+                &run,
+                Some(&status),
+                "terminal_record_invalid",
+            )?;
+            return Err(error);
+        }
+    };
     let expected_exit = match record.outcome {
         GuestOutcome::Pass => 33,
         GuestOutcome::Fail => 35,
         GuestOutcome::Panic => 37,
     };
     if status.code() != Some(expected_exit) {
+        write_integration_host_failure(
+            profile,
+            request,
+            &run,
+            Some(&status),
+            "terminal_exit_mismatch",
+        )?;
         return Err(Failure::task(format!(
             "WYR0-H serial outcome and QEMU debug-exit status disagree (expected {expected_exit}, observed {})",
             status
@@ -479,6 +505,45 @@ fn execute(
         )));
     }
     Ok(result)
+}
+
+fn write_integration_host_failure(
+    profile: HProfile,
+    request: &HRequest,
+    run: &RunPaths,
+    status: Option<&ExitStatus>,
+    reason: &str,
+) -> Result<(), Failure> {
+    let exit_status = status
+        .and_then(ExitStatus::code)
+        .map_or_else(|| "null".to_owned(), |code| code.to_string());
+    let result = format!(
+        concat!(
+            "{{\"schema_version\":1,\"phase\":\"WYR0-H\",",
+            "\"mode\":\"integration\",\"profile\":\"{}\",",
+            "\"status\":\"ERROR\",\"reason\":\"{}\",",
+            "\"vcpu\":{},\"memory_mib\":{},",
+            "\"expected_test_id\":{},\"qemu_exit_status\":{},",
+            "\"esp_sha256\":\"{}\",",
+            "\"deepwyrm_revision\":\"{}\",\"wyrmroot_revision\":\"{}\",",
+            "\"rust_revision\":\"{}\",\"no_host_share\":true}}\n"
+        ),
+        profile.name(),
+        reason,
+        profile.vcpus(),
+        profile.memory_mib(),
+        request.test_id,
+        exit_status,
+        digest(&request.esp, "ESP")?,
+        request.deepwyrm_revision,
+        request.wyrmroot_revision,
+        request.rust_revision,
+    );
+    write_new(
+        &run.result_json,
+        result.as_bytes(),
+        "integration host-failure result",
+    )
 }
 
 struct RunPaths {
@@ -985,5 +1050,56 @@ mod tests {
         .expect_err("paired failures were accepted");
         assert!(failure.message.contains("default: default failed"));
         assert!(failure.message.contains("smp: smp failed"));
+    }
+
+    #[test]
+    fn host_failure_result_is_structured_without_a_guest_record() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("xtask-h-host-failure-test-{}", std::process::id()));
+        fs::create_dir(&root).expect("create test root");
+        let esp = root.join("esp.img");
+        fs::write(&esp, b"esp").expect("write test ESP");
+        let request = HRequest {
+            path: root.join("request.toml"),
+            deepwyrm_revision: "1".repeat(40),
+            wyrmroot_revision: "2".repeat(40),
+            rust_revision: "3".repeat(40),
+            selector: "primordial-bootstrap".into(),
+            test_id: 18,
+            timeout_seconds: 180,
+            loader: root.join("loader.efi"),
+            kernel: root.join("deepwyrm.elf"),
+            symbols: root.join("deepwyrm.symbols"),
+            bootstrap: root.join("bootstrap.elf"),
+            init0: root.join("init0.elf"),
+            hello: root.join("hello.elf"),
+            bootfs: root.join("bootfs.img"),
+            esp,
+            provenance: root.join("provenance.toml"),
+            ovmf_code: root.join("OVMF_CODE.fd"),
+            ovmf_vars_template: root.join("OVMF_VARS.fd"),
+            run_directory: root.join("runs"),
+        };
+        let run = RunPaths {
+            vars: root.join("OVMF_VARS.fd"),
+            serial_log: root.join("serial.log"),
+            result_json: root.join("result.json"),
+            stderr_log: root.join("stderr.log"),
+        };
+        write_integration_host_failure(
+            HProfile::Smp,
+            &request,
+            &run,
+            None,
+            "terminal_record_invalid",
+        )
+        .expect("write host failure result");
+        let result = fs::read_to_string(&run.result_json).expect("read host failure result");
+        assert!(result.contains("\"profile\":\"smp\""));
+        assert!(result.contains("\"status\":\"ERROR\""));
+        assert!(result.contains("\"reason\":\"terminal_record_invalid\""));
+        assert!(result.contains("\"qemu_exit_status\":null"));
+        fs::remove_dir_all(root).expect("remove test root");
     }
 }
