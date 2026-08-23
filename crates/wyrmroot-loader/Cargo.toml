@@ -8,3 +8,6 @@ description = "Wyrmroot userspace executable-loading support"
 
 [lib]
 path = "src/lib.rs"
+
+[dependencies]
+deepwyrm-syscall.workspace = true

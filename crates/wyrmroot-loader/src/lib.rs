@@ -5,4 +5,5 @@
 
 pub mod elf;
 pub mod image;
-mod process;
+pub mod launch;
+pub mod process;
