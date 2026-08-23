@@ -1,10 +1,11 @@
 use deepwyrm_syscall::{
     DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL, DW_OBJECT_TYPE_MEMORY_OBJECT,
-    DW_OBJECT_TYPE_TASK_GROUP, DW_SIGNAL_EXITED, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE,
-    DW_TASK_STATE_EXITED, DW_TASK_TERMINATION_INFO_V1_SIZE, DW_TERMINATION_NORMAL_EXIT,
-    DW_WAIT_RESULT_V1_SIZE, DwDeadline, DwHandle, DwHandleTransferV1, DwMemoryProtection,
-    DwObjectType, DwReceivedHandleInfoV1, DwRights, DwTaskTerminationInfoV1, DwWaitItemV1,
-    DwWaitResultV1,
+    DW_OBJECT_TYPE_TASK_GROUP, DW_RIGHT_INSPECT, DW_RIGHT_MAP, DW_RIGHT_MODIFY, DW_RIGHT_READ,
+    DW_RIGHT_TRANSFER, DW_RIGHT_WAIT, DW_RIGHT_WRITE, DW_SIGNAL_EXITED, DW_SIGNAL_PEER_CLOSED,
+    DW_SIGNAL_READABLE, DW_TASK_STATE_EXITED, DW_TASK_TERMINATION_INFO_V1_SIZE,
+    DW_TERMINATION_NORMAL_EXIT, DW_WAIT_RESULT_V1_SIZE, DwDeadline, DwHandle, DwHandleTransferV1,
+    DwMemoryProtection, DwObjectType, DwReceivedHandleInfoV1, DwRights, DwStatus,
+    DwTaskTerminationInfoV1, DwWaitItemV1, DwWaitResultV1,
 };
 use wyrmroot_bootfs::builder::{Builder, FileMode};
 use wyrmroot_init0::{HELLO_PATH, Init0Error, Init0System, run_init0};
@@ -23,11 +24,18 @@ const ROOT: DwHandle = DwHandle(21);
 const BOOTFS: DwHandle = DwHandle(22);
 const TASK_GROUP: DwHandle = DwHandle(23);
 const DEADLINE: DwDeadline = DwDeadline(99);
+const CHILD_CHANNEL: DwHandle = DwHandle(42);
+const CHILD_PROCESS: DwHandle = DwHandle(43);
+const MAPPING_TEARDOWN_FAILURE: NativeError = NativeError::Status(DwStatus(-71));
+const TERMINATE_FAILURE: NativeError = NativeError::Status(DwStatus(-72));
+const CHILD_CLOSE_FAILURE: NativeError = NativeError::Status(DwStatus(-73));
 
 struct Fixture {
     init: [u8; 64],
     bootfs: Vec<u8>,
     fresh_bootfs_rights: DwRights,
+    mapping_error_after_callback: bool,
+    close_failures: Vec<DwHandle>,
     sent: Vec<u8>,
     closed: Vec<DwHandle>,
 }
@@ -40,6 +48,8 @@ impl Fixture {
             init,
             bootfs: bootfs(&[(HELLO_PATH, &executable())]),
             fresh_bootfs_rights: BOOTFS_EXPECTATION.rights,
+            mapping_error_after_callback: false,
+            close_failures: Vec::new(),
             sent: Vec::new(),
             closed: Vec::new(),
         }
@@ -118,7 +128,11 @@ impl Init0System for Fixture {
         assert_eq!(root_region, ROOT);
         assert_eq!(bootfs, BOOTFS);
         assert_eq!(plan.logical_size(), self.bootfs.len() as u64);
-        Ok(use_bytes(&self.bootfs))
+        let result = use_bytes(&self.bootfs);
+        if self.mapping_error_after_callback {
+            return Err(MAPPING_TEARDOWN_FAILURE);
+        }
+        Ok(result)
     }
 
     fn send_channel(&mut self, channel: DwHandle, bytes: &[u8]) -> Result<(), NativeError> {
@@ -129,7 +143,11 @@ impl Init0System for Fixture {
 
     fn close_handle(&mut self, handle: DwHandle) -> Result<(), NativeError> {
         self.closed.push(handle);
-        Ok(())
+        if self.close_failures.contains(&handle) {
+            Err(CHILD_CLOSE_FAILURE)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -139,6 +157,7 @@ struct Loader {
     duplicate_sources: Vec<DwHandle>,
     hello_init: bool,
     terminated: Vec<DwHandle>,
+    terminate_error: Option<NativeError>,
 }
 
 impl Loader {
@@ -149,6 +168,7 @@ impl Loader {
             duplicate_sources: Vec::new(),
             hello_init: false,
             terminated: Vec::new(),
+            terminate_error: None,
         }
     }
 
@@ -262,7 +282,7 @@ impl LoaderPlatform for Loader {
 
     fn process_terminate(&mut self, process: DwHandle) -> Result<(), Self::Error> {
         self.terminated.push(process);
-        Ok(())
+        self.terminate_error.map_or(Ok(()), Err)
     }
 }
 
@@ -349,7 +369,20 @@ fn init0_launches_hello_in_its_delegated_subtree_and_reports_only_zero_exit() {
         Ok(())
     );
     assert_eq!(loader.creates.len(), 1);
-    assert_eq!(loader.creates[0].task_group, TASK_GROUP);
+    let request = loader.creates[0];
+    assert_eq!(request.task_group, TASK_GROUP);
+    assert_eq!(
+        request.process_rights,
+        DwRights(DW_RIGHT_WAIT.0 | DW_RIGHT_MODIFY.0 | DW_RIGHT_INSPECT.0)
+    );
+    assert_eq!(
+        request.root_rights,
+        DwRights(DW_RIGHT_MAP.0 | DW_RIGHT_MODIFY.0 | DW_RIGHT_INSPECT.0 | DW_RIGHT_TRANSFER.0)
+    );
+    assert_eq!(
+        request.child_bootstrap_rights,
+        DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_WAIT.0 | DW_RIGHT_INSPECT.0)
+    );
     assert!(loader.hello_init);
     assert!(!loader.duplicate_sources.contains(&ROOT));
     assert!(!loader.duplicate_sources.contains(&BOOTFS));
@@ -376,6 +409,58 @@ fn init0_rejects_a_nonzero_hello_exit_without_reporting_ready() {
         Err(Init0Error::Supervision(_))
     ));
     assert_eq!(loader.terminated.len(), 1);
+    assert!(fixture.sent.is_empty());
+}
+
+#[test]
+fn init0_mapping_teardown_failure_terminates_and_closes_hello_before_authority_cleanup() {
+    let mut fixture = Fixture::valid();
+    fixture.mapping_error_after_callback = true;
+    let mut loader = Loader::new();
+    let mut supervisor = Supervisor::successful();
+
+    assert_eq!(
+        run_init0(
+            &mut fixture,
+            &mut loader,
+            &mut supervisor,
+            CHANNEL,
+            DEADLINE
+        ),
+        Err(Init0Error::Native(MAPPING_TEARDOWN_FAILURE))
+    );
+    assert_eq!(loader.terminated, [CHILD_PROCESS]);
+    assert_eq!(
+        fixture.closed,
+        [CHILD_CHANNEL, CHILD_PROCESS, ROOT, BOOTFS, TASK_GROUP]
+    );
+    assert!(fixture.sent.is_empty());
+}
+
+#[test]
+fn init0_cleanup_prefers_termination_failure_and_still_closes_children_first() {
+    let mut fixture = Fixture::valid();
+    fixture.close_failures = vec![CHILD_CHANNEL, CHILD_PROCESS];
+    let mut loader = Loader::new();
+    loader.terminate_error = Some(TERMINATE_FAILURE);
+    let mut supervisor = Supervisor::successful();
+    supervisor.application_code = 7;
+
+    assert_eq!(
+        run_init0(
+            &mut fixture,
+            &mut loader,
+            &mut supervisor,
+            CHANNEL,
+            DEADLINE
+        ),
+        Err(Init0Error::Cleanup(TERMINATE_FAILURE))
+    );
+    assert_eq!(loader.terminated, [CHILD_PROCESS]);
+    assert_eq!(
+        fixture.closed,
+        [CHILD_CHANNEL, CHILD_PROCESS, ROOT, BOOTFS, TASK_GROUP]
+    );
     assert!(fixture.sent.is_empty());
 }
 
