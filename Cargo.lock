@@ -195,6 +195,8 @@ dependencies = [
 name = "wyrmroot-init0"
 version = "0.0.0"
 dependencies = [
+ "deepwyrm-syscall",
+ "wyrmroot-loader",
  "wyrmroot-runtime",
 ]
 
