@@ -235,7 +235,11 @@ The runner stops at the first failure, preserves that run's structured error,
 and then writes one create-new `runs/i2/summary.json` recording requested and
 completed runs, the failing index, and ordered result digests. A summary is
 PASS only after every requested run passes and the complete candidate is
-re-admitted unchanged.
+re-admitted unchanged. Guest-reported failure remains `FAIL`; preparation,
+launch, collection, or revalidation failure is `ERROR`. Once the I2 output
+directory has been created, preparation/hash failures also produce a durable
+ERROR summary, and a run that has started gets a per-run ERROR result whenever
+its create-new result path remains writable.
 
 Every run requires exactly one checksummed 140-byte stress record before one
 unchanged terminal record:
@@ -301,4 +305,8 @@ every ordered I2 result, and writes all artifact, firmware, evidence, schedule,
 seed, bound, and matrix hashes. Its disposition is
 `BOUND_EVIDENCE_COMPLETE`: it did not rerun guest tests, and cannot publish
 `v0_pass = true` unless all supplied matrix evidence and revalidation checks
-pass.
+pass. Required generated-result fields are read directly; missing or mismatched
+profile, selector/test, revision, artifact/media/firmware, provenance, stress,
+or per-run digest bindings are rejected. The V0 output path must not alias or
+contain any input, and the schema-v4 `v0_manifest` must not overlap the
+generated candidate or I2 output trees.

@@ -964,7 +964,29 @@ fn execute_stress(request: &HRequest, artifacts: &CandidateArtifacts) -> Result<
         .as_ref()
         .ok_or_else(|| Failure::task("I2 execution lacks a schema-v4 stress request"))?;
     let i2_directory = prepare_stress_directory(request, stress)?;
-    let pre_execution_manifest = result_manifest_json(request, artifacts)?;
+    let pre_execution_manifest = match result_manifest_json(request, artifacts) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            let summary_path = i2_directory.join("summary.json");
+            let summary = stress_early_error_summary(
+                request,
+                stress,
+                "candidate_manifest_failed",
+                &error.message,
+            );
+            write_new(
+                request,
+                &summary_path,
+                summary.as_bytes(),
+                "I2 early-error summary",
+            )?;
+            return Err(Failure::task(format!(
+                "WYR0-H I2 preparation failed; durable summary {}: {}",
+                summary_path.display(),
+                error.message
+            )));
+        }
+    };
     let mut results = Vec::new();
     let mut failure = None;
     for index in 0..stress.run_count {
@@ -974,13 +996,62 @@ fn execute_stress(request: &HRequest, artifacts: &CandidateArtifacts) -> Result<
             seed: splitmix64_seed(stress.base_seed, index),
             operations: stress.operations_per_run,
         };
-        let paths = prepare_stress_run_directory(request, artifacts, &i2_directory, run)?;
+        let paths = match prepare_stress_run_directory(request, artifacts, &i2_directory, run) {
+            Ok(paths) => paths,
+            Err(error) => {
+                let result_path = i2_directory
+                    .join(format!("run-{index:06}"))
+                    .join("result.json");
+                if let Ok(result) = write_stress_error_result(
+                    request,
+                    run,
+                    &result_path,
+                    "run_preparation_failed",
+                    &error.message,
+                    &pre_execution_manifest,
+                ) {
+                    results.push((run, sha256::bytes_digest(result.as_bytes()), "ERROR"));
+                }
+                failure = Some((index, error, "ERROR"));
+                break;
+            }
+        };
         let outcome = execute_stress_run(request, artifacts, run, &paths, &pre_execution_manifest);
-        let result_digest = digest(&paths.result_json, "I2 run result")?;
-        let passed = outcome.is_ok();
-        results.push((run, result_digest, passed));
+        let result_bytes = match fs::read(&paths.result_json) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                if let Ok(result) = write_stress_error_result(
+                    request,
+                    run,
+                    &paths.result_json,
+                    "result_read_failed",
+                    &error.to_string(),
+                    &pre_execution_manifest,
+                ) {
+                    results.push((run, sha256::bytes_digest(result.as_bytes()), "ERROR"));
+                }
+                failure = Some((
+                    index,
+                    Failure::task(format!("could not read I2 run result: {error}")),
+                    "ERROR",
+                ));
+                break;
+            }
+        };
+        let result_digest = sha256::bytes_digest(&result_bytes);
+        let run_status = if outcome.is_ok() {
+            "PASS"
+        } else if result_bytes
+            .windows(b"\"status\":\"FAIL\"".len())
+            .any(|window| window == b"\"status\":\"FAIL\"")
+        {
+            "FAIL"
+        } else {
+            "ERROR"
+        };
+        results.push((run, result_digest, run_status));
         if let Err(error) = outcome {
-            failure = Some((index, error));
+            failure = Some((index, error, run_status));
             break;
         }
     }
@@ -988,7 +1059,9 @@ fn execute_stress(request: &HRequest, artifacts: &CandidateArtifacts) -> Result<
     let revalidation = revalidate_before_pass(request, artifacts, &pre_execution_manifest);
     let (status, failing_index, reason) = match (&failure, &revalidation) {
         (None, Ok(())) if results.len() == stress.run_count as usize => ("PASS", None, None),
-        (Some((index, error)), Ok(())) => ("FAIL", Some(*index), Some(error.message.as_str())),
+        (Some((index, error, run_status)), Ok(())) => {
+            (*run_status, Some(*index), Some(error.message.as_str()))
+        }
         (_, Err(error)) => (
             "ERROR",
             failure.as_ref().map(|item| item.0),
@@ -1016,7 +1089,7 @@ fn execute_stress(request: &HRequest, artifacts: &CandidateArtifacts) -> Result<
     write_new(request, &summary_path, summary.as_bytes(), "I2 summary")?;
     if status != "PASS" {
         let detail = failure
-            .map(|(_, error)| error.message)
+            .map(|(_, error, _)| error.message)
             .or_else(|| revalidation.err().map(|error| error.message))
             .unwrap_or_else(|| "I2 did not complete every requested run".to_owned());
         return Err(Failure::task(format!(
@@ -1025,6 +1098,91 @@ fn execute_stress(request: &HRequest, artifacts: &CandidateArtifacts) -> Result<
         )));
     }
     Ok(summary)
+}
+
+fn write_stress_error_result(
+    request: &HRequest,
+    run: StressRun,
+    result_path: &Path,
+    reason: &str,
+    detail: &str,
+    candidate_manifest: &str,
+) -> Result<String, Failure> {
+    if let Some(directory) = result_path.parent()
+        && !directory.exists()
+    {
+        fs::create_dir(directory).map_err(|error| {
+            Failure::task(format!(
+                "could not create I2 failed-run evidence directory: {error}"
+            ))
+        })?;
+    }
+    let result = format!(
+        concat!(
+            "{{\"schema_version\":4,\"phase\":\"WYR0-H-I2\",\"status\":\"ERROR\",",
+            "\"reason\":\"{}\",\"error_detail\":\"{}\",",
+            "\"profile\":\"smp\",\"selector\":\"{}\",\"test_id\":{},\"run_index\":{},",
+            "\"stress_schedule_version\":\"{}\",\"stress_base_seed\":\"{:016X}\",",
+            "\"stress_seed\":\"{:016X}\",\"configured_operations\":{},",
+            "\"serial_sha256\":null,\"qemu_stderr_sha256\":null,\"ovmf_vars_sha256\":null,",
+            "\"cleanup_disposition\":\"not_started\",\"cleanup_killed\":false,",
+            "\"cleanup_reaped\":false,{}\"deepwyrm_revision\":\"{}\",",
+            "\"wyrmroot_revision\":\"{}\",\"rust_revision\":\"{}\",",
+            "\"candidate_revalidated\":false,\"no_host_share\":true}}\n"
+        ),
+        reason,
+        json_escape(detail),
+        request.selector,
+        request.test_id,
+        run.index,
+        I2_SCHEDULE_VERSION,
+        run.base_seed,
+        run.seed,
+        run.operations,
+        candidate_manifest,
+        request.deepwyrm_revision,
+        request.wyrmroot_revision,
+        request.rust_revision,
+    );
+    write_new(
+        request,
+        result_path,
+        result.as_bytes(),
+        "I2 preparation-failure result",
+    )?;
+    Ok(result)
+}
+
+fn stress_early_error_summary(
+    request: &HRequest,
+    stress: &StressRequest,
+    reason: &str,
+    detail: &str,
+) -> String {
+    format!(
+        concat!(
+            "{{\"schema_version\":4,\"phase\":\"WYR0-H-I2\",",
+            "\"kind\":\"stress-summary\",\"status\":\"ERROR\",",
+            "\"selector\":\"{}\",\"test_id\":{},",
+            "\"stress_schedule_version\":\"{}\",\"stress_base_seed\":\"{:016X}\",",
+            "\"requested_runs\":{},\"completed_runs\":0,",
+            "\"failing_run_index\":null,\"operations_per_run\":{},",
+            "\"reason\":\"{}\",\"error_detail\":\"{}\",\"ordered_results\":[],",
+            "\"deepwyrm_revision\":\"{}\",\"wyrmroot_revision\":\"{}\",",
+            "\"rust_revision\":\"{}\",\"candidate_revalidated\":false}}\n"
+        ),
+        request.selector,
+        request.test_id,
+        stress.schedule_version,
+        stress.base_seed,
+        stress.run_count,
+        stress.operations_per_run,
+        reason,
+        json_escape(detail),
+        request.deepwyrm_revision,
+        request.wyrmroot_revision,
+        request.rust_revision,
+    )
 }
 
 fn prepare_stress_directory(
@@ -1255,7 +1413,7 @@ fn stress_result_json(
     Ok(format!(
         concat!(
             "{{\"schema_version\":4,\"phase\":\"WYR0-H-I2\",\"status\":\"{}\",",
-            "\"profile\":\"smp\",\"test_id\":{},\"run_index\":{},",
+            "\"profile\":\"smp\",\"selector\":\"{}\",\"test_id\":{},\"run_index\":{},",
             "\"stress_schedule_version\":\"{}\",\"stress_base_seed\":\"{:016X}\",",
             "\"stress_seed\":\"{:016X}\",\"configured_operations\":{},",
             "\"completed_operations\":{},\"cpu_mask\":{},\"family_mask\":{},",
@@ -1268,6 +1426,7 @@ fn stress_result_json(
             "\"no_host_share\":true}}\n"
         ),
         status,
+        request.selector,
         transcript.stress.test_id,
         run.index,
         I2_SCHEDULE_VERSION,
@@ -1310,7 +1469,7 @@ fn write_stress_host_failure(
     let result = format!(
         concat!(
             "{{\"schema_version\":4,\"phase\":\"WYR0-H-I2\",\"status\":\"ERROR\",",
-            "\"reason\":\"{}\",\"profile\":\"smp\",\"test_id\":{},\"run_index\":{},",
+            "\"reason\":\"{}\",\"profile\":\"smp\",\"selector\":\"{}\",\"test_id\":{},\"run_index\":{},",
             "\"stress_schedule_version\":\"{}\",\"stress_base_seed\":\"{:016X}\",",
             "\"stress_seed\":\"{:016X}\",\"configured_operations\":{},",
             "\"serial_sha256\":{},\"qemu_stderr_sha256\":{},\"ovmf_vars_sha256\":\"{}\",",
@@ -1320,6 +1479,7 @@ fn write_stress_host_failure(
             "\"no_host_share\":true}}\n"
         ),
         reason,
+        request.selector,
         request.test_id,
         run.index,
         I2_SCHEDULE_VERSION,
@@ -1350,19 +1510,16 @@ fn stress_summary_json(
     stress: &StressRequest,
     disposition: StressSummaryDisposition<'_>,
     candidate_manifest: &str,
-    results: &[(StressRun, String, bool)],
+    results: &[(StressRun, String, &'static str)],
 ) -> Result<String, Failure> {
     let mut ordered = String::from("[");
-    for (position, (run, digest, passed)) in results.iter().enumerate() {
+    for (position, (run, digest, status)) in results.iter().enumerate() {
         if position != 0 {
             ordered.push(',');
         }
         ordered.push_str(&format!(
             "{{\"run_index\":{},\"seed\":\"{:016X}\",\"result_sha256\":\"{}\",\"status\":\"{}\"}}",
-            run.index,
-            run.seed,
-            digest,
-            if *passed { "PASS" } else { "FAIL" }
+            run.index, run.seed, digest, status
         ));
     }
     ordered.push(']');
@@ -1389,7 +1546,10 @@ fn stress_summary_json(
         stress.schedule_version,
         stress.base_seed,
         stress.run_count,
-        results.iter().filter(|(_, _, passed)| *passed).count(),
+        results
+            .iter()
+            .filter(|(_, _, status)| *status == "PASS")
+            .count(),
         failing,
         stress.operations_per_run,
         reason,
@@ -2885,6 +3045,87 @@ mod tests {
             ]
         );
         assert_ne!(splitmix64_seed(1, 0), 0);
+    }
+
+    #[test]
+    fn stress_summary_preserves_fail_versus_host_error() {
+        let mut request = i2_request();
+        let stress = request.stress.as_ref().expect("I2 stress request");
+        let run = StressRun {
+            index: 0,
+            base_seed: stress.base_seed,
+            seed: splitmix64_seed(stress.base_seed, 0),
+            operations: stress.operations_per_run,
+        };
+        for (status, reason) in [("FAIL", "guest failure"), ("ERROR", "host failure")] {
+            let summary = stress_summary_json(
+                &request,
+                stress,
+                StressSummaryDisposition {
+                    status,
+                    failing_index: Some(0),
+                    reason: Some(reason),
+                    candidate_revalidated: true,
+                },
+                "",
+                &[(run, "a".repeat(64), status)],
+            )
+            .expect("render stress summary");
+            assert!(summary.contains(&format!("\"status\":\"{status}\"")));
+            assert!(summary.contains(&format!(
+                "\"result_sha256\":\"{}\",\"status\":\"{status}\"",
+                "a".repeat(64)
+            )));
+            assert!(summary.contains("\"completed_runs\":0"));
+            assert!(summary.contains(&format!("\"reason\":\"{reason}\"")));
+        }
+        let early = stress_early_error_summary(
+            &request,
+            stress,
+            "candidate_manifest_failed",
+            "digest unavailable",
+        );
+        assert!(early.contains("\"status\":\"ERROR\""));
+        assert!(early.contains("\"reason\":\"candidate_manifest_failed\""));
+        assert!(early.contains("\"error_detail\":\"digest unavailable\""));
+        assert!(early.contains("\"completed_runs\":0"));
+
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!(
+                "xtask-i2-durable-error-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock before epoch")
+                    .as_nanos()
+            ));
+        let run_directory = root.join("runs");
+        let failed_directory = run_directory.join("i2/run-000000");
+        fs::create_dir_all(&failed_directory).expect("create failed-run fixture");
+        fs::create_dir(root.join("evidence")).expect("create evidence fixture");
+        request.path = root.join("request.toml");
+        request.run_directory = run_directory;
+        request
+            .stress
+            .as_mut()
+            .expect("I2 stress request")
+            .v0_manifest = root.join("evidence/v0.toml");
+        let result_path = failed_directory.join("result.json");
+        let written = write_stress_error_result(
+            &request,
+            run,
+            &result_path,
+            "run_preparation_failed",
+            "OVMF vars unavailable",
+            "",
+        )
+        .expect("write durable I2 run error");
+        assert_eq!(fs::read_to_string(&result_path).unwrap(), written);
+        assert!(written.contains("\"status\":\"ERROR\""));
+        assert!(written.contains("\"reason\":\"run_preparation_failed\""));
+        assert!(written.contains("\"error_detail\":\"OVMF vars unavailable\""));
+        fs::remove_dir_all(root).expect("remove durable-error fixture");
     }
 
     #[test]

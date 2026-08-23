@@ -499,11 +499,19 @@ fn reject_output_aliases(request: &HRequest) -> Result<(), Failure> {
     }
     for (index, (left, left_label)) in outputs.iter().enumerate() {
         for (right, right_label) in outputs.iter().skip(index + 1) {
-            if left == right {
+            if left == right || left.starts_with(right) || right.starts_with(left) {
                 return Err(Failure::task(format!(
-                    "WYR0-H {left_label} and {right_label} paths alias"
+                    "WYR0-H {left_label} and {right_label} paths alias or overlap by ancestry"
                 )));
             }
+        }
+    }
+    if let Some(stress) = &request.stress {
+        let fixed_i2 = request.run_directory.join("i2");
+        if stress.v0_manifest.starts_with(&fixed_i2) || fixed_i2.starts_with(&stress.v0_manifest) {
+            return Err(Failure::task(
+                "WYR0-H v0_manifest collides with the fixed I2 output tree",
+            ));
         }
     }
     Ok(())
@@ -780,9 +788,7 @@ mod tests {
 
     #[test]
     fn schema_two_loads_only_with_the_complete_explicit_expectation_contract() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target")
-            .join(format!("xtask-h-request-v2-test-{}", std::process::id()));
+        let root = request_root("v2-load");
         fs::create_dir(&root).unwrap();
         for name in [
             "loader.efi",
@@ -946,6 +952,21 @@ mod tests {
             (
                 "escape",
                 valid_v4().replace("evidence/v0-manifest.toml", "../v0.toml"),
+            ),
+            (
+                "manifest-run-root",
+                valid_v4().replace("evidence/v0-manifest.toml", "runs"),
+            ),
+            (
+                "manifest-i2-ancestor",
+                valid_v4().replace("evidence/v0-manifest.toml", "runs/i2"),
+            ),
+            (
+                "manifest-i2-descendant",
+                valid_v4().replace(
+                    "evidence/v0-manifest.toml",
+                    "runs/i2/run-000000/result.json",
+                ),
             ),
         ] {
             let invalid_root = request_root(label);

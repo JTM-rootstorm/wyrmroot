@@ -30,6 +30,19 @@ const REQUEST_KEYS: &[&str] = &[
     "host_matrix",
     "manifest",
 ];
+const CANDIDATE_SHARED_FIELDS: &[&str] = &[
+    "provenance_sha256",
+    "loader_sha256",
+    "kernel_sha256",
+    "symbols_sha256",
+    "bootstrap_sha256",
+    "init0_sha256",
+    "hello_sha256",
+    "bootfs_sha256",
+    "esp_sha256",
+    "ovmf_code_sha256",
+    "ovmf_vars_template_sha256",
+];
 
 #[derive(Debug)]
 struct FreezeRequest {
@@ -112,6 +125,24 @@ pub(crate) fn freeze(request_path: &str) -> Result<String, Failure> {
     )?;
     require_json_scalar(&i2_bytes, "failing_run_index", "null", "I2 summary")?;
     require_json_scalar(&i2_bytes, "candidate_revalidated", "true", "I2 summary")?;
+    require_json_scalar(
+        &i2_bytes,
+        "stress_schedule_version",
+        &stress.schedule_version,
+        "I2 summary",
+    )?;
+    require_json_scalar(
+        &i2_bytes,
+        "stress_base_seed",
+        &format!("{:016X}", stress.base_seed),
+        "I2 summary",
+    )?;
+    require_json_scalar(
+        &i2_bytes,
+        "operations_per_run",
+        &stress.operations_per_run.to_string(),
+        "I2 summary",
+    )?;
 
     let geometry = checked_expected_digest(
         &request,
@@ -138,6 +169,8 @@ pub(crate) fn freeze(request_path: &str) -> Result<String, Failure> {
         ));
     }
     let candidate_fields = h_integration::freeze_candidate_fields(&request.candidate_request)?;
+    let candidate_bindings = parse_flat(&candidate_fields, "readmitted candidate bindings")?;
+    cross_bind_evidence(&default_bytes, &i1_bytes, &i2_bytes, &candidate_bindings)?;
     let run_fields = validate_i2_results(&request, &candidate, &i2_bytes)?;
     let matrix_manifest = file_digest(&request.host_matrix, "V0 host matrix")?;
 
@@ -207,6 +240,47 @@ pub(crate) fn freeze(request_path: &str) -> Result<String, Failure> {
     ))
 }
 
+fn cross_bind_evidence(
+    default: &[u8],
+    i1: &[u8],
+    i2: &[u8],
+    candidate: &BTreeMap<String, String>,
+) -> Result<(), Failure> {
+    let results = [
+        parse_json_object(default, "default evidence")?,
+        parse_json_object(i1, "I1 evidence")?,
+        parse_json_object(i2, "I2 summary")?,
+    ];
+    for key in CANDIDATE_SHARED_FIELDS {
+        let expected = required(candidate, key, "readmitted candidate bindings")?;
+        if results
+            .iter()
+            .any(|result| result.get(*key).map(String::as_str) != Some(expected))
+        {
+            return Err(Failure::task(format!(
+                "default/I1/I2 evidence disagrees with the readmitted candidate on '{key}'"
+            )));
+        }
+    }
+    for (result_key, candidate_key) in [
+        ("request_sha256", "candidate_request_sha256"),
+        ("candidate_sha256", "candidate_sha256"),
+    ] {
+        if results[2].get(result_key).map(String::as_str)
+            != Some(required(
+                candidate,
+                candidate_key,
+                "readmitted candidate bindings",
+            )?)
+        {
+            return Err(Failure::task(format!(
+                "I2 summary disagrees with the readmitted candidate on '{result_key}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn load_request(path: &Path) -> Result<FreezeRequest, Failure> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| Failure::task(format!("could not inspect V0 request: {error}")))?;
@@ -269,6 +343,22 @@ fn load_request(path: &Path) -> Result<FreezeRequest, Failure> {
     validate_relative_contained(&request, &request.manifest, false)?;
     if fs::symlink_metadata(&request.manifest).is_ok() {
         return Err(Failure::task("V0 manifest output already exists"));
+    }
+    for input in [
+        &request.candidate_request,
+        &request.default_result,
+        &request.i1_result,
+        &request.i2_summary,
+        &request.geometry_report,
+        &request.qemu_argument_report,
+        &request.version_report,
+        &request.host_matrix,
+    ] {
+        if request.manifest.starts_with(input) || input.starts_with(&request.manifest) {
+            return Err(Failure::task(
+                "V0 manifest aliases or overlaps a freeze input",
+            ));
+        }
     }
     Ok(request)
 }
@@ -369,6 +459,36 @@ fn validate_i2_results(
         validate_relative_contained(request, &result, true)?;
         let bytes = read_regular(request, &result, "I2 run result")?;
         validate_result(&bytes, 4, "WYR0-H-I2", request, "I2 run result")?;
+        if parse_json_object(&bytes, "I2 run result")?.contains_key("kind") {
+            return Err(Failure::task("I2 run result has a summary kind field"));
+        }
+        require_matching_fields(
+            summary,
+            &bytes,
+            &[
+                "selector",
+                "test_id",
+                "stress_schedule_version",
+                "stress_base_seed",
+                "candidate_sha256",
+                "provenance_sha256",
+                "request_sha256",
+                "loader_sha256",
+                "kernel_sha256",
+                "symbols_sha256",
+                "bootstrap_sha256",
+                "init0_sha256",
+                "hello_sha256",
+                "bootfs_sha256",
+                "esp_sha256",
+                "ovmf_code_sha256",
+                "ovmf_vars_template_sha256",
+                "deepwyrm_revision",
+                "wyrmroot_revision",
+                "rust_revision",
+            ],
+            "I2 run result",
+        )?;
         require_json_scalar(&bytes, "run_index", &index.to_string(), "I2 run result")?;
         require_json_scalar(
             &bytes,
@@ -390,6 +510,15 @@ fn validate_i2_results(
         )?;
         require_json_scalar(&bytes, "cpu_mask", "15", "I2 run result")?;
         require_json_scalar(&bytes, "family_mask", "511", "I2 run result")?;
+        require_json_scalar(&bytes, "actual_outcome", "pass", "I2 run result")?;
+        require_json_scalar(&bytes, "detail", "0", "I2 run result")?;
+        require_json_scalar(
+            &bytes,
+            "failing_operation",
+            &u32::MAX.to_string(),
+            "I2 run result",
+        )?;
+        require_json_scalar(&bytes, "stage", "0", "I2 run result")?;
         require_json_scalar(&bytes, "candidate_revalidated", "true", "I2 run result")?;
         let digest = sha256::bytes_digest(&bytes);
         ordered.push(format!(
@@ -405,6 +534,24 @@ fn validate_i2_results(
         "I2 summary",
     )?;
     Ok(fields)
+}
+
+fn require_matching_fields(
+    left: &[u8],
+    right: &[u8],
+    keys: &[&str],
+    label: &str,
+) -> Result<(), Failure> {
+    let left = parse_json_object(left, "I2 summary")?;
+    let right = parse_json_object(right, label)?;
+    for key in keys {
+        if !left.contains_key(*key) || left.get(*key) != right.get(*key) {
+            return Err(Failure::task(format!(
+                "{label} disagrees with its summary on '{key}'"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_result(
@@ -429,7 +576,201 @@ fn validate_result(
             )));
         }
     }
+    for key in CANDIDATE_SHARED_FIELDS
+        .iter()
+        .copied()
+        .chain(["candidate_sha256", "request_sha256"])
+    {
+        let value = required(&values, key, label)?;
+        if !is_sha256(value) {
+            return Err(Failure::task(format!(
+                "{label} has an invalid or missing '{key}' digest"
+            )));
+        }
+    }
+    let selector = match schema {
+        2 => {
+            require_result_fields(
+                &values,
+                &[
+                    ("mode", "integration"),
+                    ("profile", "default"),
+                    ("vcpu", "1"),
+                    ("memory_mib", "1024"),
+                    ("test_id", "18"),
+                    ("expected_outcome", "pass"),
+                    ("expected_detail", "0"),
+                    ("actual_outcome", "pass"),
+                    ("detail", "0"),
+                    ("qemu_exit_status", "33"),
+                    ("no_host_share", "true"),
+                ],
+                label,
+            )?;
+            require_positive_u32(&values, "serial_line", label)?;
+            "primordial-bootstrap"
+        }
+        3 => {
+            require_result_fields(
+                &values,
+                &[
+                    ("mode", "integration"),
+                    ("profile", "smp"),
+                    ("vcpu", "4"),
+                    ("memory_mib", "2048"),
+                    ("test_id", "23"),
+                    ("expected_outcome", "pass"),
+                    ("expected_detail", "0"),
+                    ("actual_outcome", "pass"),
+                    ("detail", "0"),
+                    ("qemu_exit_status", "33"),
+                    ("evidence_protocol", "dwevid1"),
+                    ("evidence_nonce", "0123456789ABCDEF"),
+                    ("required_evidence_mask", "255"),
+                    ("observed_evidence_mask", "255"),
+                    ("first_evidence_sequence", "0"),
+                    ("no_host_share", "true"),
+                ],
+                label,
+            )?;
+            require_positive_u32(&values, "serial_line", label)?;
+            let count = required(&values, "evidence_event_count", label)?
+                .parse::<u32>()
+                .map_err(|_| Failure::task(format!("{label} has invalid evidence_event_count")))?;
+            let last = required(&values, "last_evidence_sequence", label)?
+                .parse::<u32>()
+                .map_err(|_| {
+                    Failure::task(format!("{label} has invalid last_evidence_sequence"))
+                })?;
+            if count == 0 || count > 64 || last != count - 1 {
+                return Err(Failure::task(format!(
+                    "{label} evidence sequence fields are inconsistent"
+                )));
+            }
+            h_request::I1_SELECTOR
+        }
+        4 => {
+            require_result_fields(
+                &values,
+                &[
+                    ("selector", h_request::I2_SELECTOR),
+                    ("test_id", "22"),
+                    ("candidate_revalidated", "true"),
+                ],
+                label,
+            )?;
+            if values.get("kind").map(String::as_str) != Some("stress-summary") {
+                require_result_fields(
+                    &values,
+                    &[
+                        ("profile", "smp"),
+                        ("actual_outcome", "pass"),
+                        ("detail", "0"),
+                        ("failing_operation", "4294967295"),
+                        ("stage", "0"),
+                        ("qemu_exit_status", "33"),
+                        ("no_host_share", "true"),
+                    ],
+                    label,
+                )?;
+                for key in ["serial_sha256", "qemu_stderr_sha256", "ovmf_vars_sha256"] {
+                    if !is_sha256(required(&values, key, label)?) {
+                        return Err(Failure::task(format!(
+                            "{label} has an invalid or missing '{key}' digest"
+                        )));
+                    }
+                }
+                let stress_line = require_positive_u32(&values, "stress_serial_line", label)?;
+                let terminal_line = require_positive_u32(&values, "terminal_serial_line", label)?;
+                if stress_line >= terminal_line {
+                    return Err(Failure::task(format!(
+                        "{label} stress/terminal line order is invalid"
+                    )));
+                }
+            }
+            h_request::I2_SELECTOR
+        }
+        _ => return Err(Failure::task(format!("{label} schema is unsupported"))),
+    };
+    validate_candidate_digest(&values, selector, label)?;
     Ok(())
+}
+
+fn require_positive_u32(
+    values: &BTreeMap<String, String>,
+    key: &str,
+    label: &str,
+) -> Result<u32, Failure> {
+    required(values, key, label)?
+        .parse::<u32>()
+        .ok()
+        .filter(|value| *value != 0)
+        .ok_or_else(|| Failure::task(format!("{label} has an invalid '{key}' binding")))
+}
+
+fn require_result_fields(
+    values: &BTreeMap<String, String>,
+    expected: &[(&str, &str)],
+    label: &str,
+) -> Result<(), Failure> {
+    for (key, expected) in expected {
+        if values.get(*key).map(String::as_str) != Some(*expected) {
+            return Err(Failure::task(format!(
+                "{label} has an invalid or missing '{key}' binding"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_candidate_digest(
+    values: &BTreeMap<String, String>,
+    selector: &str,
+    label: &str,
+) -> Result<(), Failure> {
+    let expected = sha256::bytes_digest(
+        format!(
+            concat!(
+                "wyr0-h-candidate-v1\nrequest={}\n",
+                "deepwyrm={}\nwyrmroot={}\nrust={}\nselector={}\ntest_id={}\n",
+                "expected_outcome=pass\nexpected_detail=0\n",
+                "loader={}\nkernel={}\nsymbols={}\n",
+                "bootstrap={}\ninit0={}\nhello={}\n",
+                "bootfs={}\nesp={}\novmf_code={}\n",
+                "ovmf_vars_template={}\n"
+            ),
+            values["request_sha256"],
+            values["deepwyrm_revision"],
+            values["wyrmroot_revision"],
+            values["rust_revision"],
+            selector,
+            values["test_id"],
+            values["loader_sha256"],
+            values["kernel_sha256"],
+            values["symbols_sha256"],
+            values["bootstrap_sha256"],
+            values["init0_sha256"],
+            values["hello_sha256"],
+            values["bootfs_sha256"],
+            values["esp_sha256"],
+            values["ovmf_code_sha256"],
+            values["ovmf_vars_template_sha256"],
+        )
+        .as_bytes(),
+    );
+    if values.get("candidate_sha256") != Some(&expected) {
+        return Err(Failure::task(format!(
+            "{label} candidate_sha256 does not bind its request and candidate fields"
+        )));
+    }
+    Ok(())
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn require_json_scalar(
@@ -958,7 +1299,7 @@ mod tests {
     }
 
     #[test]
-    fn result_binding_requires_schema_status_phase_and_revisions() {
+    fn result_binding_rejects_minimal_and_stale_evidence() {
         let request = FreezeRequest {
             root: PathBuf::from("/request"),
             deepwyrm_revision: "1".repeat(40),
@@ -977,11 +1318,72 @@ mod tests {
             host_matrix: PathBuf::new(),
             manifest: PathBuf::new(),
         };
+        let digest = "a".repeat(64);
+        let candidate = sha256::bytes_digest(
+            format!(
+                concat!(
+                    "wyr0-h-candidate-v1\nrequest={}\n",
+                    "deepwyrm={}\nwyrmroot={}\nrust={}\n",
+                    "selector=smp-adversarial-stress\ntest_id=22\n",
+                    "expected_outcome=pass\nexpected_detail=0\n",
+                    "loader={}\nkernel={}\nsymbols={}\nbootstrap={}\ninit0={}\nhello={}\n",
+                    "bootfs={}\nesp={}\novmf_code={}\novmf_vars_template={}\n"
+                ),
+                digest,
+                request.deepwyrm_revision,
+                request.wyrmroot_revision,
+                request.rust_revision,
+                digest,
+                digest,
+                digest,
+                digest,
+                digest,
+                digest,
+                digest,
+                digest,
+                digest,
+                digest,
+            )
+            .as_bytes(),
+        );
         let valid = format!(
+            concat!(
+                "{{\"schema_version\":4,\"phase\":\"WYR0-H-I2\",\"kind\":\"stress-summary\",",
+                "\"status\":\"PASS\",",
+                "\"selector\":\"smp-adversarial-stress\",\"test_id\":22,",
+                "\"candidate_revalidated\":true,\"candidate_sha256\":\"{}\",",
+                "\"provenance_sha256\":\"{}\",\"request_sha256\":\"{}\",",
+                "\"loader_sha256\":\"{}\",\"kernel_sha256\":\"{}\",",
+                "\"symbols_sha256\":\"{}\",\"bootstrap_sha256\":\"{}\",",
+                "\"init0_sha256\":\"{}\",\"hello_sha256\":\"{}\",",
+                "\"bootfs_sha256\":\"{}\",\"esp_sha256\":\"{}\",",
+                "\"ovmf_code_sha256\":\"{}\",\"ovmf_vars_template_sha256\":\"{}\",",
+                "\"deepwyrm_revision\":\"{}\",\"wyrmroot_revision\":\"{}\",",
+                "\"rust_revision\":\"{}\"}}"
+            ),
+            candidate,
+            digest,
+            digest,
+            digest,
+            digest,
+            digest,
+            digest,
+            digest,
+            digest,
+            digest,
+            digest,
+            digest,
+            digest,
+            request.deepwyrm_revision,
+            request.wyrmroot_revision,
+            request.rust_revision,
+        );
+        assert!(validate_result(valid.as_bytes(), 4, "WYR0-H-I2", &request, "fixture").is_ok());
+        let minimal = format!(
             "{{\"schema_version\":4,\"phase\":\"WYR0-H-I2\",\"status\":\"PASS\",\"deepwyrm_revision\":\"{}\",\"wyrmroot_revision\":\"{}\",\"rust_revision\":\"{}\"}}",
             request.deepwyrm_revision, request.wyrmroot_revision, request.rust_revision
         );
-        assert!(validate_result(valid.as_bytes(), 4, "WYR0-H-I2", &request, "fixture").is_ok());
+        assert!(validate_result(minimal.as_bytes(), 4, "WYR0-H-I2", &request, "fixture").is_err());
         for mutation in [
             valid.replace("\"status\":\"PASS\"", "\"status\":\"FAIL\""),
             valid.replace("\"schema_version\":4", "\"schema_version\":3"),
@@ -996,6 +1398,36 @@ mod tests {
         assert!(parse_json_object(br#"{"a":[{"b":1}],"c":null}"#, "fixture").is_ok());
         assert!(parse_json_object(br#"{"a":1,"a":1}"#, "fixture").is_err());
         assert!(parse_json_object(br#"{"a":"escaped\\n"}"#, "fixture").is_err());
+
+        let mut candidate_bindings = BTreeMap::new();
+        candidate_bindings.insert("candidate_request_sha256".into(), digest.clone());
+        candidate_bindings.insert("candidate_sha256".into(), candidate);
+        for key in CANDIDATE_SHARED_FIELDS {
+            candidate_bindings.insert((*key).into(), digest.clone());
+        }
+        assert!(
+            cross_bind_evidence(
+                valid.as_bytes(),
+                valid.as_bytes(),
+                valid.as_bytes(),
+                &candidate_bindings
+            )
+            .is_ok()
+        );
+        let stale = valid.replacen(
+            &format!("\"loader_sha256\":\"{digest}\""),
+            &format!("\"loader_sha256\":\"{}\"", "b".repeat(64)),
+            1,
+        );
+        assert!(
+            cross_bind_evidence(
+                stale.as_bytes(),
+                valid.as_bytes(),
+                valid.as_bytes(),
+                &candidate_bindings
+            )
+            .is_err()
+        );
     }
 
     #[test]
