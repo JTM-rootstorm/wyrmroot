@@ -2,10 +2,11 @@ use deepwyrm_syscall::{
     DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL, DW_OBJECT_TYPE_MEMORY_OBJECT,
     DW_OBJECT_TYPE_TASK_GROUP, DW_RIGHT_INSPECT, DW_RIGHT_MAP, DW_RIGHT_MODIFY, DW_RIGHT_READ,
     DW_RIGHT_TRANSFER, DW_RIGHT_WAIT, DW_RIGHT_WRITE, DW_SIGNAL_EXITED, DW_SIGNAL_PEER_CLOSED,
-    DW_SIGNAL_READABLE, DW_TASK_STATE_EXITED, DW_TASK_TERMINATION_INFO_V1_SIZE,
-    DW_TERMINATION_NORMAL_EXIT, DW_WAIT_RESULT_V1_SIZE, DwDeadline, DwHandle, DwHandleTransferV1,
-    DwMemoryProtection, DwObjectType, DwReceivedHandleInfoV1, DwRights, DwStatus,
-    DwTaskTerminationInfoV1, DwWaitItemV1, DwWaitResultV1,
+    DW_SIGNAL_READABLE, DW_STATUS_BAD_HANDLE, DW_TASK_STATE_EXITED,
+    DW_TASK_TERMINATION_INFO_V1_SIZE, DW_TERMINATION_NORMAL_EXIT, DW_WAIT_RESULT_V1_SIZE,
+    DwDeadline, DwHandle, DwHandleTransferV1, DwMemoryProtection, DwObjectType,
+    DwReceivedHandleInfoV1, DwRights, DwStatus, DwTaskTerminationInfoV1, DwWaitItemV1,
+    DwWaitResultV1,
 };
 use wyrmroot_bootfs::builder::{Builder, FileMode};
 use wyrmroot_init0::{HELLO_PATH, Init0Error, Init0System, run_init0};
@@ -307,6 +308,8 @@ impl LoaderPlatform for Loader {
 
 struct Supervisor {
     application_code: u32,
+    ready_handle_count: usize,
+    termination_query_error: bool,
     phase: usize,
 }
 
@@ -314,6 +317,8 @@ impl Supervisor {
     fn successful() -> Self {
         Self {
             application_code: 0,
+            ready_handle_count: 0,
+            termination_query_error: false,
             phase: 0,
         }
     }
@@ -353,13 +358,19 @@ impl SupervisionPlatform for Supervisor {
         _: &mut [DwReceivedHandleInfoV1],
     ) -> Result<ReceiveCounts, Self::Error> {
         let bytes = launch::encode_ready(2, bytes).unwrap();
-        Ok(ReceiveCounts { bytes, handles: 0 })
+        Ok(ReceiveCounts {
+            bytes,
+            handles: self.ready_handle_count,
+        })
     }
 
     fn query_task_termination(
         &mut self,
         _: DwHandle,
     ) -> Result<DwTaskTerminationInfoV1, Self::Error> {
+        if self.termination_query_error {
+            return Err(NativeError::Status(DW_STATUS_BAD_HANDLE));
+        }
         Ok(DwTaskTerminationInfoV1 {
             size: DW_TASK_TERMINATION_INFO_V1_SIZE,
             version: 1,
@@ -411,11 +422,40 @@ fn init0_launches_hello_in_its_delegated_subtree_and_reports_only_zero_exit() {
 }
 
 #[test]
-fn init0_rejects_a_nonzero_hello_exit_without_reporting_ready() {
+fn init0_preserves_a_nonzero_hello_exit_and_closes_without_redundant_termination() {
     let mut fixture = Fixture::valid();
     let mut loader = Loader::new();
     let mut supervisor = Supervisor::successful();
     supervisor.application_code = 7;
+
+    assert_eq!(
+        run_init0(
+            &mut fixture,
+            &mut loader,
+            &mut supervisor,
+            CHANNEL,
+            DEADLINE
+        ),
+        Err(Init0Error::Supervision(
+            wyrmroot_runtime::SupervisionError::Exit(
+                wyrmroot_runtime::ExitValidationError::NonzeroApplicationCode(7)
+            )
+        ))
+    );
+    assert!(loader.terminated.is_empty());
+    assert_eq!(
+        fixture.closed,
+        [CHILD_CHANNEL, CHILD_PROCESS, ROOT, BOOTFS, TASK_GROUP]
+    );
+    assert!(fixture.sent.is_empty());
+}
+
+#[test]
+fn init0_terminates_hello_after_unproven_readiness_failure() {
+    let mut fixture = Fixture::valid();
+    let mut loader = Loader::new();
+    let mut supervisor = Supervisor::successful();
+    supervisor.ready_handle_count = 1;
 
     assert!(matches!(
         run_init0(
@@ -427,8 +467,40 @@ fn init0_rejects_a_nonzero_hello_exit_without_reporting_ready() {
         ),
         Err(Init0Error::Supervision(_))
     ));
-    assert_eq!(loader.terminated.len(), 1);
+    assert_eq!(loader.terminated, [CHILD_PROCESS]);
+    assert_eq!(
+        fixture.closed,
+        [CHILD_CHANNEL, CHILD_PROCESS, ROOT, BOOTFS, TASK_GROUP]
+    );
     assert!(fixture.sent.is_empty());
+}
+
+#[test]
+fn init0_closes_post_ready_exited_hello_when_termination_query_fails() {
+    let mut fixture = Fixture::valid();
+    let mut loader = Loader::new();
+    let mut supervisor = Supervisor::successful();
+    supervisor.termination_query_error = true;
+
+    assert_eq!(
+        run_init0(
+            &mut fixture,
+            &mut loader,
+            &mut supervisor,
+            CHANNEL,
+            DEADLINE
+        ),
+        Err(Init0Error::Supervision(
+            wyrmroot_runtime::SupervisionError::ExitQuery(NativeError::Status(
+                DW_STATUS_BAD_HANDLE
+            ))
+        ))
+    );
+    assert!(loader.terminated.is_empty());
+    assert_eq!(
+        fixture.closed,
+        [CHILD_CHANNEL, CHILD_PROCESS, ROOT, BOOTFS, TASK_GROUP]
+    );
 }
 
 #[test]
@@ -463,7 +535,7 @@ fn init0_cleanup_prefers_termination_failure_and_still_closes_children_first() {
     let mut loader = Loader::new();
     loader.terminate_error = Some(TERMINATE_FAILURE);
     let mut supervisor = Supervisor::successful();
-    supervisor.application_code = 7;
+    supervisor.ready_handle_count = 1;
 
     assert_eq!(
         run_init0(

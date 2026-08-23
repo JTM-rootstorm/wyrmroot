@@ -458,7 +458,11 @@ pub fn run_init0_bootstrap_with_fault<
             INIT0_TRANSACTION_ID,
             deadline,
         );
-        let loaded_cleanup = cleanup_loaded_process(system, loader, loaded, supervision.is_err());
+        let terminate = matches!(
+            &supervision,
+            Err(error) if !error.process_exit_observed()
+        );
+        let loaded_cleanup = cleanup_loaded_process(system, loader, loaded, terminate);
         if let Err(cleanup) = loaded_cleanup {
             return Err(BootstrapError::Cleanup(cleanup));
         }
@@ -539,7 +543,11 @@ pub fn run_loader_smoke_bootstrap<
             LOADER_SMOKE_TRANSACTION_ID,
             deadline,
         );
-        let loaded_cleanup = cleanup_loaded_process(system, loader, loaded, supervision.is_err());
+        let terminate = matches!(
+            &supervision,
+            Err(error) if !error.process_exit_observed()
+        );
+        let loaded_cleanup = cleanup_loaded_process(system, loader, loaded, terminate);
         if let Err(cleanup) = loaded_cleanup {
             return Err(BootstrapError::Cleanup(cleanup));
         }

@@ -124,6 +124,8 @@ pub enum SupervisionError<PlatformError> {
     UnboundedDeadline,
     /// A typed native operation failed.
     Platform(PlatformError),
+    /// Querying termination failed after the Process `EXITED` signal was observed.
+    ExitQuery(PlatformError),
     /// A successful wait result did not select a requested handle or signal.
     InvalidWaitResult,
     /// A receive did not contain exactly one handle-free READY datagram.
@@ -138,6 +140,22 @@ pub enum SupervisionError<PlatformError> {
     DuplicateReady,
     /// The signaled Process did not report the exact normal zero exit record.
     Exit(ExitValidationError),
+}
+
+impl<PlatformError> SupervisionError<PlatformError> {
+    /// Returns whether this failure was produced after observing Process `EXITED`.
+    ///
+    /// Callers may use this to avoid an invalid redundant termination request while
+    /// still closing the Process and launch-Channel handles they own.  Every other
+    /// error remains an unproven liveness failure and therefore still requires
+    /// caller-selected termination during cleanup.
+    #[must_use]
+    pub const fn process_exit_observed(&self) -> bool {
+        matches!(
+            self,
+            Self::ExitedBeforeReady | Self::ExitQuery(_) | Self::Exit(_)
+        )
+    }
 }
 
 /// Observes exactly one child READY followed by a structured normal Process exit.
@@ -223,7 +241,13 @@ pub fn supervise_child<P: SupervisionPlatform>(
             return Err(SupervisionError::InvalidWaitResult);
         }
         if !ready {
-            return Err(SupervisionError::ExitedBeforeReady);
+            let info = platform
+                .query_task_termination(process)
+                .map_err(SupervisionError::ExitQuery)?;
+            return match validate_successful_exit(&info) {
+                Ok(()) => Err(SupervisionError::ExitedBeforeReady),
+                Err(error) => Err(SupervisionError::Exit(error)),
+            };
         }
         if monitor_channel {
             // Deepwyrm publishes Process EXITED wait readiness only after the
@@ -245,7 +269,7 @@ pub fn supervise_child<P: SupervisionPlatform>(
         }
         let info = platform
             .query_task_termination(process)
-            .map_err(SupervisionError::Platform)?;
+            .map_err(SupervisionError::ExitQuery)?;
         return validate_successful_exit(&info).map_err(SupervisionError::Exit);
     }
 }
@@ -282,6 +306,7 @@ mod tests {
         received: usize,
         counts: ReceiveCounts,
         task_info: DwTaskTerminationInfoV1,
+        query_fails: bool,
     }
 
     impl Mock {
@@ -295,6 +320,7 @@ mod tests {
                     handles: 0,
                 },
                 task_info: successful_exit_info(),
+                query_fails: false,
             }
         }
     }
@@ -341,6 +367,9 @@ mod tests {
             &mut self,
             _process: DwHandle,
         ) -> Result<DwTaskTerminationInfoV1, Self::Error> {
+            if self.query_fails {
+                return Err(());
+            }
             Ok(self.task_info)
         }
     }
@@ -376,6 +405,46 @@ mod tests {
             supervise_child(&mut mock, DwHandle(1), DwHandle(2), 7, DwDeadline(99)),
             Err(SupervisionError::ExitedBeforeReady)
         );
+        assert!(SupervisionError::<()>::ExitedBeforeReady.process_exit_observed());
+    }
+
+    #[test]
+    fn preserves_nonzero_application_exit_observed_before_ready() {
+        let mut mock = Mock::successful(&[EXITED]);
+        mock.task_info.application_code = 37;
+        let error = supervise_child(&mut mock, DwHandle(1), DwHandle(2), 7, DwDeadline(99));
+        assert_eq!(
+            error,
+            Err(SupervisionError::Exit(
+                ExitValidationError::NonzeroApplicationCode(37)
+            ))
+        );
+        assert!(error.unwrap_err().process_exit_observed());
+    }
+
+    #[test]
+    fn preserves_exit_observation_when_termination_query_fails() {
+        let mut mock = Mock::successful(&[EXITED]);
+        mock.query_fails = true;
+        let error = supervise_child(&mut mock, DwHandle(1), DwHandle(2), 7, DwDeadline(99));
+        assert_eq!(error, Err(SupervisionError::ExitQuery(())));
+        assert!(error.unwrap_err().process_exit_observed());
+    }
+
+    #[test]
+    fn preserves_exit_observation_when_post_ready_query_fails() {
+        let mut mock = Mock::successful(&[READY, EXITED, CLOSED]);
+        mock.query_fails = true;
+        let error = supervise_child(&mut mock, DwHandle(1), DwHandle(2), 7, DwDeadline(99));
+        assert_eq!(error, Err(SupervisionError::ExitQuery(())));
+        assert!(error.unwrap_err().process_exit_observed());
+    }
+
+    #[test]
+    fn readiness_errors_do_not_claim_process_exit_observation() {
+        assert!(!SupervisionError::<()>::PeerClosedBeforeReady.process_exit_observed());
+        assert!(!SupervisionError::<()>::DuplicateReady.process_exit_observed());
+        assert!(!SupervisionError::<()>::InvalidWaitResult.process_exit_observed());
     }
 
     #[test]

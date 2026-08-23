@@ -19,9 +19,7 @@ use wyrmroot_bootstrap::{
     run_init0_bootstrap_with_fault,
 };
 #[cfg(feature = "loader-smoke-integration")]
-use wyrmroot_bootstrap::{
-    LOADER_SMOKE_PATH, LOADER_SMOKE_TRANSACTION_ID, run_loader_smoke_bootstrap,
-};
+use wyrmroot_bootstrap::{LOADER_SMOKE_PATH, run_loader_smoke_bootstrap};
 use wyrmroot_bootstrap_proto::{
     BOOTSTRAP_INIT_V2_SIZE, BootstrapMessage, InitMessageV2, ReadyMessageV2, decode,
 };
@@ -467,6 +465,8 @@ struct SmokeSupervisor {
     events: &'static [bool],
     index: usize,
     received: usize,
+    ready_handle_count: usize,
+    termination_query_error: bool,
     transaction_id: u64,
 }
 
@@ -476,6 +476,8 @@ impl SmokeSupervisor {
             events: &[true, false],
             index: 0,
             received: 0,
+            ready_handle_count: 0,
+            termination_query_error: false,
             transaction_id: 2,
         }
     }
@@ -492,6 +494,8 @@ impl SmokeSupervisor {
             events: &[false],
             index: 0,
             received: 0,
+            ready_handle_count: 0,
+            termination_query_error: false,
             transaction_id: 2,
         }
     }
@@ -537,7 +541,7 @@ impl SupervisionPlatform for SmokeSupervisor {
             .map_err(|_| NativeError::Status(DW_STATUS_BAD_HANDLE))?;
         Ok(ReceiveCounts {
             bytes: size,
-            handles: 0,
+            handles: self.ready_handle_count,
         })
     }
 
@@ -545,6 +549,9 @@ impl SupervisionPlatform for SmokeSupervisor {
         &mut self,
         _: DwHandle,
     ) -> Result<DwTaskTerminationInfoV1, Self::Error> {
+        if self.termination_query_error {
+            return Err(NativeError::Status(DW_STATUS_BAD_HANDLE));
+        }
         Ok(DwTaskTerminationInfoV1 {
             size: DW_TASK_TERMINATION_INFO_V1_SIZE,
             version: 1,
@@ -685,7 +692,7 @@ fn i0_negative_terminal_details_are_unique_and_failure_class_bound() {
 }
 
 #[test]
-fn primordial_bootstrap_terminates_init0_after_bounded_readiness_failure() {
+fn primordial_bootstrap_closes_exited_init0_without_redundant_termination() {
     let image = executable();
     let mut fixture = Fixture::valid();
     fixture.bootfs = bootfs(&[(INIT0_PATH, &image), (HELLO_PATH, b"hello")]);
@@ -702,8 +709,63 @@ fn primordial_bootstrap_terminates_init0_after_bounded_readiness_failure() {
         ),
         Err(BootstrapError::Supervision(_))
     ));
+    assert!(loader.terminated.is_empty());
+    assert!(fixture.sent.is_empty());
+    assert_eq!(
+        fixture.closed,
+        [DwHandle(42), DwHandle(43), ROOT, BOOTFS, TASK_GROUP]
+    );
+}
+
+#[test]
+fn primordial_bootstrap_terminates_init0_after_unproven_readiness_failure() {
+    let image = executable();
+    let mut fixture = Fixture::valid();
+    fixture.bootfs = bootfs(&[(INIT0_PATH, &image), (HELLO_PATH, b"hello")]);
+    let mut loader = SmokeLoader::init0();
+    let mut supervisor = SmokeSupervisor::successful_init0();
+    supervisor.ready_handle_count = 1;
+
+    assert!(matches!(
+        run_init0_bootstrap(
+            &mut fixture,
+            &mut loader,
+            &mut supervisor,
+            CHANNEL,
+            DwDeadline(99),
+        ),
+        Err(BootstrapError::Supervision(_))
+    ));
     assert_eq!(loader.terminated, [DwHandle(43)]);
     assert!(fixture.sent.is_empty());
+    assert_eq!(
+        fixture.closed,
+        [DwHandle(42), DwHandle(43), ROOT, BOOTFS, TASK_GROUP]
+    );
+}
+
+#[test]
+fn primordial_bootstrap_closes_exited_init0_when_termination_query_fails() {
+    let image = executable();
+    let mut fixture = Fixture::valid();
+    fixture.bootfs = bootfs(&[(INIT0_PATH, &image), (HELLO_PATH, b"hello")]);
+    let mut loader = SmokeLoader::init0();
+    let mut supervisor = SmokeSupervisor::exited_before_ready();
+    supervisor.termination_query_error = true;
+
+    assert_eq!(
+        run_init0_bootstrap(
+            &mut fixture,
+            &mut loader,
+            &mut supervisor,
+            CHANNEL,
+            DwDeadline(99),
+        ),
+        Err(BootstrapError::Supervision(SupervisionError::ExitQuery(
+            NativeError::Status(DW_STATUS_BAD_HANDLE)
+        )))
+    );
+    assert!(loader.terminated.is_empty());
     assert_eq!(
         fixture.closed,
         [DwHandle(42), DwHandle(43), ROOT, BOOTFS, TASK_GROUP]
@@ -752,7 +814,7 @@ fn loader_smoke_runs_hello_then_exits_before_primordial_ready() {
 
 #[cfg(feature = "loader-smoke-integration")]
 #[test]
-fn loader_smoke_failure_terminates_and_closes_child_before_authority_cleanup() {
+fn loader_smoke_closes_an_exited_child_without_redundant_termination() {
     let image = executable();
     let mut fixture = Fixture::valid();
     fixture.bootfs = bootfs(&[(LOADER_SMOKE_PATH, &image)]);
@@ -769,7 +831,7 @@ fn loader_smoke_failure_terminates_and_closes_child_before_authority_cleanup() {
         ),
         Err(BootstrapError::Supervision(_))
     ));
-    assert_eq!(loader.terminated, [DwHandle(43)]);
+    assert!(loader.terminated.is_empty());
     assert_eq!(fixture.sent, []);
     assert_eq!(
         fixture.closed,
@@ -779,13 +841,14 @@ fn loader_smoke_failure_terminates_and_closes_child_before_authority_cleanup() {
 
 #[cfg(feature = "loader-smoke-integration")]
 #[test]
-fn loader_smoke_surfaces_cleanup_failure_after_supervision_failure() {
+fn loader_smoke_surfaces_cleanup_failure_after_unproven_readiness_failure() {
     let image = executable();
     let mut fixture = Fixture::valid();
     fixture.bootfs = bootfs(&[(LOADER_SMOKE_PATH, &image)]);
     let mut loader = SmokeLoader::new();
     loader.fail_terminate = true;
-    let mut supervisor = SmokeSupervisor::exited_before_ready();
+    let mut supervisor = SmokeSupervisor::successful();
+    supervisor.ready_handle_count = 1;
 
     assert_eq!(
         run_loader_smoke_bootstrap(

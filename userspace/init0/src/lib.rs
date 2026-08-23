@@ -249,7 +249,11 @@ pub fn run_init0<
             HELLO_TRANSACTION_ID,
             deadline,
         );
-        let loaded_cleanup = cleanup_loaded_process(system, loader, loaded, supervision.is_err());
+        let terminate = matches!(
+            &supervision,
+            Err(error) if !error.process_exit_observed()
+        );
+        let loaded_cleanup = cleanup_loaded_process(system, loader, loaded, terminate);
         if let Err(cleanup) = loaded_cleanup {
             return Err(Init0Error::Cleanup(cleanup));
         }
