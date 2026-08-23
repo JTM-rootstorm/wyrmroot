@@ -241,12 +241,12 @@ impl Transaction {
         if let Some(mapping) = self.parent_mapping.take() {
             failed |= platform.unmap_parent(self.parent_root, mapping).is_err();
         }
-        if let Some(thread) = self.thread.take() {
-            failed |= platform.thread_terminate(thread).is_err();
-            failed |= platform.close(thread).is_err();
-        }
-        let process = self.process.take();
-        if let Some(root) = self.root.take() {
+        let root = self.root.take();
+        if let Some(root) = root {
+            // A successful termination of this transaction's sole child
+            // thread also exits its Process.  Tear down child mappings first:
+            // the live address-space target ceases to accept them once that
+            // Process is terminal.
             while self.range_count != 0 {
                 self.range_count -= 1;
                 let range = self.ranges[self.range_count];
@@ -254,10 +254,19 @@ impl Transaction {
                     .unmap_child(root, range.address, range.bytes)
                     .is_err();
             }
+        }
+        let thread_terminated = self.thread.take().map(|thread| {
+            let thread_terminated = platform.thread_terminate(thread).is_ok();
+            failed |= platform.close(thread).is_err();
+            thread_terminated
+        });
+        if let Some(root) = root {
             failed |= platform.close(root).is_err();
         }
-        if let Some(process) = process {
-            failed |= platform.process_terminate(process).is_err();
+        if let Some(process) = self.process.take() {
+            let terminated =
+                thread_terminated == Some(true) || platform.process_terminate(process).is_ok();
+            failed |= !terminated;
             failed |= platform.close(process).is_err();
         }
         for handle in [
@@ -584,8 +593,9 @@ pub fn load_process_with_fault<P: LoaderPlatform>(
         ));
     }
     if let Err(cause) = platform.close(thread) {
-        let terminate_failed = platform.process_terminate(created.process).is_err();
-        let rollback_failed = terminate_failed
+        let process_terminated = platform.process_terminate(created.process).is_ok();
+        let thread_terminated = !process_terminated && platform.thread_terminate(thread).is_ok();
+        let rollback_failed = !(process_terminated || thread_terminated)
             | platform.close(thread).is_err()
             | platform.close(created.process).is_err()
             | platform.close(parent_channel).is_err();

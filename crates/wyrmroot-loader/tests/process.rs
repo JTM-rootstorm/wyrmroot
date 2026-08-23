@@ -29,7 +29,13 @@ struct Mock {
     next: u64,
     events: Vec<Event>,
     fail: Option<&'static str>,
+    duplicate_calls: usize,
+    fail_duplicate_at: Option<usize>,
     started_thread: Option<DwHandle>,
+    thread_terminated: bool,
+    fail_thread_terminate: bool,
+    reject_late_unmap: bool,
+    reject_redundant_process_terminate: bool,
     post_start_thread_close_failures: usize,
     fail_process_terminate: bool,
     materialized: Vec<Vec<u8>>,
@@ -43,7 +49,13 @@ impl Mock {
             next: 10,
             events: Vec::new(),
             fail,
+            duplicate_calls: 0,
+            fail_duplicate_at: None,
             started_thread: None,
+            thread_terminated: false,
+            fail_thread_terminate: false,
+            reject_late_unmap: false,
+            reject_redundant_process_terminate: false,
             post_start_thread_close_failures: 0,
             fail_process_terminate: false,
             materialized: Vec::new(),
@@ -75,6 +87,10 @@ impl LoaderPlatform for Mock {
     }
     fn duplicate(&mut self, handle: DwHandle, _: DwRights) -> Result<DwHandle, Self::Error> {
         self.events.push(Event::Duplicate(handle.0));
+        self.duplicate_calls += 1;
+        if self.fail_duplicate_at == Some(self.duplicate_calls) {
+            return Err("duplicate");
+        }
         self.check("duplicate")?;
         Ok(self.handle())
     }
@@ -136,6 +152,9 @@ impl LoaderPlatform for Mock {
     }
     fn unmap_child(&mut self, _: DwHandle, address: u64, _: u64) -> Result<(), Self::Error> {
         self.events.push(Event::Unmap(address));
+        if self.thread_terminated && self.reject_late_unmap {
+            return Err("unmap-after-terminate");
+        }
         Ok(())
     }
     fn thread_create(&mut self, _: DwHandle, _: DwRights) -> Result<DwHandle, Self::Error> {
@@ -169,10 +188,17 @@ impl LoaderPlatform for Mock {
     }
     fn thread_terminate(&mut self, _: DwHandle) -> Result<(), Self::Error> {
         self.events.push(Event::TerminateThread);
+        if self.fail_thread_terminate {
+            return Err("terminate-thread");
+        }
+        self.thread_terminated = true;
         Ok(())
     }
     fn process_terminate(&mut self, _: DwHandle) -> Result<(), Self::Error> {
         self.events.push(Event::TerminateProcess);
+        if self.thread_terminated && self.reject_redundant_process_terminate {
+            return Err("already-exited");
+        }
         if self.fail_process_terminate {
             Err("terminate-process")
         } else {
@@ -269,7 +295,7 @@ fn failed_parent_unmap_retains_exact_alias_for_rollback_retry() {
 #[test]
 fn postpublication_cleanup_reports_failed_process_termination() {
     let mut platform = Mock::new(None);
-    platform.post_start_thread_close_failures = 2;
+    platform.post_start_thread_close_failures = 1;
     platform.fail_process_terminate = true;
     let image = executable();
     let error = load_process(
@@ -283,10 +309,26 @@ fn postpublication_cleanup_reports_failed_process_termination() {
         LoadError::Platform {
             stage: LoadStage::SuccessCleanup,
             cause: "close-thread",
-            rollback_failed: true,
+            rollback_failed: false,
         }
     );
     assert!(platform.events.contains(&Event::TerminateProcess));
+    assert!(platform.events.contains(&Event::TerminateThread));
+    let terminate_process = position(&platform.events, |event| {
+        matches!(event, Event::TerminateProcess)
+    });
+    let terminate_thread = position(&platform.events, |event| {
+        matches!(event, Event::TerminateThread)
+    });
+    assert!(terminate_process < terminate_thread);
+    assert_eq!(
+        platform
+            .events
+            .iter()
+            .filter(|event| matches!(event, Event::Close(18)))
+            .count(),
+        2
+    );
 }
 
 #[test]
@@ -308,13 +350,116 @@ fn failed_start_after_init_transfer_uses_process_teardown() {
         }
     );
     assert!(platform.events.contains(&Event::TerminateThread));
-    assert!(platform.events.contains(&Event::TerminateProcess));
+    assert!(!platform.events.contains(&Event::TerminateProcess));
     assert!(
         !platform
             .events
             .iter()
             .any(|event| matches!(event, Event::Unmap(_)))
     );
+}
+
+#[test]
+fn capability_duplicate_rollback_unmaps_before_sole_thread_termination() {
+    let mut platform = Mock::new(None);
+    // The first duplicate narrows the loader's parent endpoint.  The second
+    // is the Init0 bootfs delegation that fails in the live eight-slot table.
+    platform.fail_duplicate_at = Some(2);
+    platform.reject_late_unmap = true;
+    platform.reject_redundant_process_terminate = true;
+    let image = executable();
+    let error = load_process(
+        &mut platform,
+        authority(),
+        request(&image, LaunchProfile::Init0),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error,
+        LoadError::Platform {
+            stage: LoadStage::CapabilityDuplicate,
+            cause: "duplicate",
+            rollback_failed: false,
+        }
+    );
+    let final_unmap = platform
+        .events
+        .iter()
+        .rposition(|event| matches!(event, Event::Unmap(_)))
+        .unwrap();
+    let terminate = position(&platform.events, |event| {
+        matches!(event, Event::TerminateThread)
+    });
+    assert!(final_unmap < terminate);
+    assert!(!platform.events.contains(&Event::TerminateProcess));
+    for handle in [18, 14, 13, 12] {
+        assert!(platform.events.contains(&Event::Close(handle)));
+    }
+}
+
+#[test]
+fn capability_duplicate_rollback_uses_process_termination_after_thread_failure() {
+    let mut platform = Mock::new(None);
+    platform.fail_duplicate_at = Some(2);
+    platform.fail_thread_terminate = true;
+    let image = executable();
+    let error = load_process(
+        &mut platform,
+        authority(),
+        request(&image, LaunchProfile::Init0),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error,
+        LoadError::Platform {
+            stage: LoadStage::CapabilityDuplicate,
+            cause: "duplicate",
+            rollback_failed: false,
+        }
+    );
+    let terminate_thread = position(&platform.events, |event| {
+        matches!(event, Event::TerminateThread)
+    });
+    let terminate_process = position(&platform.events, |event| {
+        matches!(event, Event::TerminateProcess)
+    });
+    assert!(terminate_thread < terminate_process);
+    for handle in [18, 14, 13, 12] {
+        assert!(platform.events.contains(&Event::Close(handle)));
+    }
+}
+
+#[test]
+fn capability_duplicate_rollback_reports_failure_after_both_terminators_fail() {
+    let mut platform = Mock::new(None);
+    platform.fail_duplicate_at = Some(2);
+    platform.fail_thread_terminate = true;
+    platform.fail_process_terminate = true;
+    let image = executable();
+    let error = load_process(
+        &mut platform,
+        authority(),
+        request(&image, LaunchProfile::Init0),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error,
+        LoadError::Platform {
+            stage: LoadStage::CapabilityDuplicate,
+            cause: "duplicate",
+            rollback_failed: true,
+        }
+    );
+    let terminate_thread = position(&platform.events, |event| {
+        matches!(event, Event::TerminateThread)
+    });
+    let terminate_process = position(&platform.events, |event| {
+        matches!(event, Event::TerminateProcess)
+    });
+    assert!(terminate_thread < terminate_process);
+    for handle in [18, 14, 13, 12] {
+        assert!(platform.events.contains(&Event::Close(handle)));
+    }
 }
 
 #[test]
