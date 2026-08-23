@@ -51,6 +51,24 @@ pub struct LoadRequest<'a> {
     pub transaction_id: u64,
 }
 
+/// Explicitly selected, test-only corruption of one child-launch boundary.
+///
+/// Production callers use [`load_process`], which always selects
+/// [`LoadFault::None`].  The malformed-ELF case exercises the ordinary parser
+/// on a test-synthesized invalid header; every other fault is applied only
+/// after the ordinary loader has validated the input ELF and constructed the
+/// ordinary startup/INIT records.  A negative variant therefore cannot
+/// silently change normal image construction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoadFault {
+    None,
+    MalformedElf,
+    MalformedStartup,
+    InitCapabilityCount,
+    InitCapabilityType,
+    InitCapabilityRights,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LoadedProcess {
     pub process: DwHandle,
@@ -264,7 +282,28 @@ pub fn load_process<P: LoaderPlatform>(
     authority: LoadAuthority,
     request: LoadRequest<'_>,
 ) -> Result<LoadedProcess, LoadError<P::Error>> {
+    load_process_with_fault(platform, authority, request, LoadFault::None)
+}
+
+/// Runs one child-construction transaction with an explicitly test-selected
+/// malformed-input boundary.
+///
+/// This is intentionally separate from [`load_process`] so production call
+/// sites cannot opt into a negative behavior accidentally.
+pub fn load_process_with_fault<P: LoaderPlatform>(
+    platform: &mut P,
+    authority: LoadAuthority,
+    request: LoadRequest<'_>,
+    fault: LoadFault,
+) -> Result<LoadedProcess, LoadError<P::Error>> {
     let mut segments = [empty_segment(); MAX_LOAD_SEGMENTS];
+    if fault == LoadFault::MalformedElf {
+        let malformed = [0_u8; 64];
+        return match elf::plan(&malformed, &mut segments) {
+            Err(error) => Err(LoadError::Elf(error)),
+            Ok(_) => unreachable!("test malformed ELF was accepted"),
+        };
+    }
     let plan = elf::plan(request.image, &mut segments).map_err(LoadError::Elf)?;
     let mut startup_page = [0_u8; PAGE_SIZE as usize];
     image::write_startup_block(
@@ -273,9 +312,11 @@ pub fn load_process<P: LoaderPlatform>(
         request.display_path,
     )
     .map_err(LoadError::Startup)?;
+    apply_startup_fault(&mut startup_page, fault);
     let mut init = [0_u8; INIT0_BYTES];
     let init_len = launch::encode_init(request.profile, request.transaction_id, &mut init)
         .map_err(LoadError::Launch)?;
+    apply_init_fault(&mut init[..init_len], fault);
 
     let mut transaction = Transaction::new(authority.parent_root);
     let (broad_parent, child_endpoint) = platform
@@ -504,6 +545,7 @@ pub fn load_process<P: LoaderPlatform>(
     } else {
         0
     };
+    apply_capability_fault(&mut transfers[..transfer_count], fault);
 
     if let Err(cause) = platform.send_init(
         parent_channel,
@@ -557,6 +599,33 @@ pub fn load_process<P: LoaderPlatform>(
         process: created.process,
         launch_channel: parent_channel,
     })
+}
+
+fn apply_startup_fault(startup_page: &mut [u8; PAGE_SIZE as usize], fault: LoadFault) {
+    if fault == LoadFault::MalformedStartup {
+        // WYR0-D0 requires argc = 1 for every native child.  The page was
+        // otherwise built by the canonical checked constructor above.
+        startup_page[..8].copy_from_slice(&2_u64.to_le_bytes());
+    }
+}
+
+fn apply_init_fault(init: &mut [u8], fault: LoadFault) {
+    if fault == LoadFault::InitCapabilityCount {
+        // Offset 20 is the locked little-endian WRLP capability-count field.
+        // The actual Channel transfer count remains three, so the child must
+        // reject both inconsistent representations before using authority.
+        init[20..24].copy_from_slice(&2_u32.to_le_bytes());
+    }
+}
+
+fn apply_capability_fault(transfers: &mut [DwHandleTransferV1], fault: LoadFault) {
+    match fault {
+        LoadFault::InitCapabilityType if transfers.len() == 3 => transfers.swap(0, 2),
+        LoadFault::InitCapabilityRights if !transfers.is_empty() => {
+            transfers[0].requested_rights = ROOT_RIGHTS;
+        }
+        _ => {}
+    }
 }
 
 fn fail<P: LoaderPlatform>(

@@ -2,8 +2,8 @@ use deepwyrm_syscall::{DwHandle, DwHandleTransferV1, DwMemoryProtection, DwRight
 use wyrmroot_loader::{
     launch::LaunchProfile,
     process::{
-        LoadAuthority, LoadError, LoadRequest, LoadStage, LoaderPlatform, ParentMapping,
-        ProcessCreateRequest, ProcessCreateResult, load_process,
+        LoadAuthority, LoadError, LoadFault, LoadRequest, LoadStage, LoaderPlatform, ParentMapping,
+        ProcessCreateRequest, ProcessCreateResult, load_process, load_process_with_fault,
     },
 };
 
@@ -32,6 +32,9 @@ struct Mock {
     started_thread: Option<DwHandle>,
     post_start_thread_close_failures: usize,
     fail_process_terminate: bool,
+    materialized: Vec<Vec<u8>>,
+    sent_init: Vec<u8>,
+    sent_transfers: Vec<DwHandleTransferV1>,
 }
 
 impl Mock {
@@ -43,6 +46,9 @@ impl Mock {
             started_thread: None,
             post_start_thread_close_failures: 0,
             fail_process_terminate: false,
+            materialized: Vec::new(),
+            sent_init: Vec::new(),
+            sent_transfers: Vec::new(),
         }
     }
     fn handle(&mut self) -> DwHandle {
@@ -106,6 +112,7 @@ impl LoaderPlatform for Mock {
         source: &[u8],
     ) -> Result<ParentMapping, Self::Error> {
         self.events.push(Event::Materialize(memory.0, source.len()));
+        self.materialized.push(source.to_vec());
         self.check("materialize")?;
         Ok(ParentMapping {
             address: 0x6000_0000 + memory.0 * 0x1000,
@@ -139,10 +146,12 @@ impl LoaderPlatform for Mock {
     fn send_init(
         &mut self,
         _: DwHandle,
-        _: &[u8],
+        bytes: &[u8],
         transfers: &[DwHandleTransferV1],
     ) -> Result<(), Self::Error> {
         self.events.push(Event::Send(transfers.len()));
+        self.sent_init = bytes.to_vec();
+        self.sent_transfers = transfers.to_vec();
         self.check("send")
     }
     fn thread_start(
@@ -306,6 +315,83 @@ fn failed_start_after_init_transfer_uses_process_teardown() {
             .iter()
             .any(|event| matches!(event, Event::Unmap(_)))
     );
+}
+
+#[test]
+fn selected_faults_change_only_their_locked_child_launch_boundary() {
+    let image = executable();
+
+    let mut startup = Mock::new(None);
+    load_process_with_fault(
+        &mut startup,
+        authority(),
+        request(&image, LaunchProfile::Init0),
+        LoadFault::MalformedStartup,
+    )
+    .unwrap();
+    assert!(
+        startup
+            .materialized
+            .iter()
+            .any(|bytes| bytes.len() == 4096 && bytes[..8] == 2_u64.to_le_bytes())
+    );
+
+    let mut count = Mock::new(None);
+    load_process_with_fault(
+        &mut count,
+        authority(),
+        request(&image, LaunchProfile::Init0),
+        LoadFault::InitCapabilityCount,
+    )
+    .unwrap();
+    assert_eq!(&count.sent_init[20..24], &2_u32.to_le_bytes());
+    assert_eq!(count.sent_transfers.len(), 3);
+
+    let mut kind = Mock::new(None);
+    let mut normal = Mock::new(None);
+    load_process(
+        &mut normal,
+        authority(),
+        request(&image, LaunchProfile::Init0),
+    )
+    .unwrap();
+    load_process_with_fault(
+        &mut kind,
+        authority(),
+        request(&image, LaunchProfile::Init0),
+        LoadFault::InitCapabilityType,
+    )
+    .unwrap();
+    assert_eq!(kind.sent_transfers[0], normal.sent_transfers[2]);
+
+    let mut rights = Mock::new(None);
+    load_process_with_fault(
+        &mut rights,
+        authority(),
+        request(&image, LaunchProfile::Init0),
+        LoadFault::InitCapabilityRights,
+    )
+    .unwrap();
+    assert_ne!(
+        rights.sent_transfers[0].requested_rights,
+        wyrmroot_loader::launch::SELF_ROOT_RIGHTS
+    );
+}
+
+#[test]
+fn malformed_elf_fault_fails_before_any_platform_operation() {
+    let mut platform = Mock::new(None);
+    let image = executable();
+    assert!(matches!(
+        load_process_with_fault(
+            &mut platform,
+            authority(),
+            request(&image, LaunchProfile::Init0),
+            LoadFault::MalformedElf,
+        ),
+        Err(LoadError::Elf(_))
+    ));
+    assert!(platform.events.is_empty());
 }
 
 fn authority() -> LoadAuthority {

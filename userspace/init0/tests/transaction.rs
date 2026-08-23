@@ -10,7 +10,7 @@ use deepwyrm_syscall::{
 use wyrmroot_bootfs::builder::{Builder, FileMode};
 use wyrmroot_init0::{HELLO_PATH, Init0Error, Init0System, run_init0};
 use wyrmroot_loader::{
-    launch::{self, LaunchProfile, encode_init, parse_ready},
+    launch::{self, LaunchError, LaunchProfile, encode_init, parse_ready},
     process::{LoaderPlatform, ParentMapping, ProcessCreateRequest, ProcessCreateResult},
 };
 use wyrmroot_runtime::{
@@ -33,10 +33,23 @@ const CHILD_CLOSE_FAILURE: NativeError = NativeError::Status(DwStatus(-73));
 #[test]
 fn live_exit_code_identifies_init0_owned_failure() {
     assert_eq!(Init0Error::MissingHello.exit_code(), 0x1000_0008);
+    assert_eq!(
+        Init0Error::Launch(LaunchError::BadCapabilityCount).exit_code(),
+        0x1000_0307
+    );
+    assert_eq!(
+        Init0Error::Launch(LaunchError::HandleMetadata { index: 0 }).exit_code(),
+        0x1000_0330
+    );
+    assert_eq!(
+        Init0Error::Launch(LaunchError::BadCapabilityRole { index: 2 }).exit_code(),
+        0x1000_0312
+    );
 }
 
 struct Fixture {
     init: [u8; 64],
+    received_handles: [DwReceivedHandleInfoV1; 3],
     bootfs: Vec<u8>,
     fresh_bootfs_rights: DwRights,
     mapping_error_after_callback: bool,
@@ -51,6 +64,23 @@ impl Fixture {
         encode_init(LaunchProfile::Init0, 7, &mut init).unwrap();
         Self {
             init,
+            received_handles: [
+                received(
+                    ROOT,
+                    DW_OBJECT_TYPE_ADDRESS_REGION,
+                    SELF_ROOT_EXPECTATION.rights,
+                ),
+                received(
+                    BOOTFS,
+                    DW_OBJECT_TYPE_MEMORY_OBJECT,
+                    BOOTFS_EXPECTATION.rights,
+                ),
+                received(
+                    TASK_GROUP,
+                    DW_OBJECT_TYPE_TASK_GROUP,
+                    LOADER_TASK_GROUP_EXPECTATION.rights,
+                ),
+            ],
             bootfs: bootfs(&[(HELLO_PATH, &executable())]),
             fresh_bootfs_rights: BOOTFS_EXPECTATION.rights,
             mapping_error_after_callback: false,
@@ -95,23 +125,7 @@ impl Init0System for Fixture {
     ) -> Result<ReceiveCounts, NativeError> {
         assert_eq!(channel, CHANNEL);
         bytes.copy_from_slice(&self.init);
-        handles.copy_from_slice(&[
-            received(
-                ROOT,
-                DW_OBJECT_TYPE_ADDRESS_REGION,
-                SELF_ROOT_EXPECTATION.rights,
-            ),
-            received(
-                BOOTFS,
-                DW_OBJECT_TYPE_MEMORY_OBJECT,
-                BOOTFS_EXPECTATION.rights,
-            ),
-            received(
-                TASK_GROUP,
-                DW_OBJECT_TYPE_TASK_GROUP,
-                LOADER_TASK_GROUP_EXPECTATION.rights,
-            ),
-        ]);
+        handles.copy_from_slice(&self.received_handles);
         Ok(ReceiveCounts {
             bytes: self.init.len(),
             handles: 3,
@@ -509,6 +523,51 @@ fn init0_rejects_a_non_init0_launch_before_descendant_creation() {
         ),
         Err(Init0Error::Launch(_))
     ));
+    assert!(loader.creates.is_empty());
+    assert!(fixture.sent.is_empty());
+}
+
+#[test]
+fn init0_preserves_distinct_init_parser_failures_before_descendant_creation() {
+    let mut count_fixture = Fixture::valid();
+    count_fixture.init[20..24].copy_from_slice(&2_u32.to_le_bytes());
+    assert_init_parser_failure(
+        count_fixture,
+        Init0Error::Launch(LaunchError::BadCapabilityCount),
+        0x1000_0307,
+    );
+
+    let mut type_fixture = Fixture::valid();
+    type_fixture.received_handles[0].object_type = DW_OBJECT_TYPE_TASK_GROUP;
+    assert_init_parser_failure(
+        type_fixture,
+        Init0Error::Launch(LaunchError::HandleMetadata { index: 0 }),
+        0x1000_0330,
+    );
+
+    let mut rights_fixture = Fixture::valid();
+    rights_fixture.received_handles[0].rights = DwRights(0);
+    assert_init_parser_failure(
+        rights_fixture,
+        Init0Error::Launch(LaunchError::HandleMetadata { index: 0 }),
+        0x1000_0330,
+    );
+}
+
+fn assert_init_parser_failure(fixture: Fixture, expected: Init0Error, expected_exit: u32) {
+    let mut loader = Loader::new();
+    let mut supervisor = Supervisor::successful();
+    let mut fixture = fixture;
+    let error = run_init0(
+        &mut fixture,
+        &mut loader,
+        &mut supervisor,
+        CHANNEL,
+        DEADLINE,
+    )
+    .expect_err("init parser failure was accepted");
+    assert_eq!(error, expected);
+    assert_eq!(error.exit_code(), expected_exit);
     assert!(loader.creates.is_empty());
     assert!(fixture.sent.is_empty());
 }

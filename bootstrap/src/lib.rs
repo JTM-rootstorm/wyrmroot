@@ -21,6 +21,76 @@ compile_error!("primordial bootstrap behavior variants are mutually exclusive");
 
 #[cfg(any(
     all(
+        feature = "i0-negative-malformed-elf",
+        any(
+            feature = "primordial-blocking-cleanup",
+            feature = "primordial-user-exception",
+            feature = "primordial-invalid-return",
+            feature = "i0-negative-malformed-startup",
+            feature = "i0-negative-capability-count",
+            feature = "i0-negative-capability-type",
+            feature = "i0-negative-capability-rights"
+        )
+    ),
+    all(
+        feature = "i0-negative-malformed-startup",
+        any(
+            feature = "primordial-blocking-cleanup",
+            feature = "primordial-user-exception",
+            feature = "primordial-invalid-return",
+            feature = "i0-negative-capability-count",
+            feature = "i0-negative-capability-type",
+            feature = "i0-negative-capability-rights"
+        )
+    ),
+    all(
+        feature = "i0-negative-capability-count",
+        any(
+            feature = "primordial-blocking-cleanup",
+            feature = "primordial-user-exception",
+            feature = "primordial-invalid-return",
+            feature = "i0-negative-capability-type",
+            feature = "i0-negative-capability-rights"
+        )
+    ),
+    all(
+        feature = "i0-negative-capability-type",
+        any(
+            feature = "primordial-blocking-cleanup",
+            feature = "primordial-user-exception",
+            feature = "primordial-invalid-return",
+            feature = "i0-negative-capability-rights"
+        )
+    ),
+    all(
+        feature = "i0-negative-capability-rights",
+        any(
+            feature = "primordial-blocking-cleanup",
+            feature = "primordial-user-exception",
+            feature = "primordial-invalid-return"
+        )
+    )
+))]
+compile_error!(
+    "I0 negative bootstrap variants are mutually exclusive with other bootstrap behavior variants"
+);
+
+#[cfg(all(
+    feature = "loader-smoke-integration",
+    any(
+        feature = "i0-negative-malformed-elf",
+        feature = "i0-negative-malformed-startup",
+        feature = "i0-negative-capability-count",
+        feature = "i0-negative-capability-type",
+        feature = "i0-negative-capability-rights"
+    )
+))]
+compile_error!(
+    "the WYR0-E loader-smoke integration is mutually exclusive with I0 negative variants"
+);
+
+#[cfg(any(
+    all(
         feature = "loader-smoke-integration",
         feature = "primordial-blocking-cleanup"
     ),
@@ -44,11 +114,13 @@ use wyrmroot_bootstrap_proto::{
     BOOTSTRAP_INIT_V2_SIZE, BOOTSTRAP_READY_V2_SIZE, BootstrapMessage, DecodeError, InitMessageV2,
     MAX_BOOTSTRAP_HANDLES, ReadyMessageV2, decode,
 };
+#[cfg(feature = "loader-smoke-integration")]
+use wyrmroot_loader::process::load_process;
 use wyrmroot_loader::{
     launch::LaunchProfile,
     process::{
-        LoadAuthority, LoadError, LoadRequest, LoadStage, LoadedProcess, LoaderPlatform,
-        load_process,
+        LoadAuthority, LoadError, LoadFault, LoadRequest, LoadStage, LoadedProcess, LoaderPlatform,
+        load_process_with_fault,
     },
 };
 #[cfg(feature = "primordial-test-support")]
@@ -245,6 +317,56 @@ pub fn run_bootstrap<System: BootstrapSystem>(
 /// WYR0-F child transaction identifier for `system/init0`.
 pub const INIT0_TRANSACTION_ID: u64 = 1;
 
+/// Stable terminal detail for the test-only malformed-ELF variant.
+pub const I0_NEGATIVE_MALFORMED_ELF_DETAIL: u32 = 0xB000_0401;
+/// Stable terminal detail for the test-only malformed-startup variant.
+pub const I0_NEGATIVE_MALFORMED_STARTUP_DETAIL: u32 = 0xB000_0402;
+/// Stable terminal detail for the test-only malformed capability-count variant.
+pub const I0_NEGATIVE_CAPABILITY_COUNT_DETAIL: u32 = 0xB000_0403;
+/// Stable terminal detail for the test-only malformed capability-type variant.
+pub const I0_NEGATIVE_CAPABILITY_TYPE_DETAIL: u32 = 0xB000_0404;
+/// Stable terminal detail for the test-only malformed capability-rights variant.
+pub const I0_NEGATIVE_CAPABILITY_RIGHTS_DETAIL: u32 = 0xB000_0405;
+
+/// Returns the distinct terminal detail only after a selected I0 test fault
+/// produced its exact expected failure.  `None` preserves the real diagnostic
+/// for every unexpected error.
+pub fn i0_negative_terminal_detail(fault: LoadFault, error: &BootstrapError) -> Option<u32> {
+    use wyrmroot_runtime::{ExitValidationError, SupervisionError};
+
+    match (fault, error) {
+        (
+            LoadFault::MalformedElf,
+            BootstrapError::Loader(LoadError::Elf(wyrmroot_loader::elf::ElfError::BadMagic)),
+        ) => Some(I0_NEGATIVE_MALFORMED_ELF_DETAIL),
+        (
+            LoadFault::MalformedStartup,
+            BootstrapError::Supervision(SupervisionError::Exit(
+                ExitValidationError::NonzeroApplicationCode(1),
+            )),
+        ) => Some(I0_NEGATIVE_MALFORMED_STARTUP_DETAIL),
+        (
+            LoadFault::InitCapabilityCount,
+            BootstrapError::Supervision(SupervisionError::Exit(
+                ExitValidationError::NonzeroApplicationCode(0x1000_0307),
+            )),
+        ) => Some(I0_NEGATIVE_CAPABILITY_COUNT_DETAIL),
+        (
+            LoadFault::InitCapabilityType,
+            BootstrapError::Supervision(SupervisionError::Exit(
+                ExitValidationError::NonzeroApplicationCode(0x1000_0330),
+            )),
+        ) => Some(I0_NEGATIVE_CAPABILITY_TYPE_DETAIL),
+        (
+            LoadFault::InitCapabilityRights,
+            BootstrapError::Supervision(SupervisionError::Exit(
+                ExitValidationError::NonzeroApplicationCode(0x1000_0330),
+            )),
+        ) => Some(I0_NEGATIVE_CAPABILITY_RIGHTS_DETAIL),
+        _ => None,
+    }
+}
+
 /// Runs the WYR0-F primordial bootstrap transaction before primordial READY.
 ///
 /// The bootstrap validates the existing G primordial handoff and the complete required bootfs
@@ -261,6 +383,30 @@ pub fn run_init0_bootstrap<
     supervisor: &mut Supervisor,
     bootstrap_channel: DwHandle,
     deadline: DwDeadline,
+) -> Result<(), BootstrapError> {
+    run_init0_bootstrap_with_fault(
+        system,
+        loader,
+        supervisor,
+        bootstrap_channel,
+        deadline,
+        LoadFault::None,
+    )
+}
+
+/// Runs the primordial `init0` transaction with one explicit test-only child
+/// launch fault.  Ordinary callers must use [`run_init0_bootstrap`].
+pub fn run_init0_bootstrap_with_fault<
+    System: BootstrapSystem,
+    Loader: LoaderPlatform<Error = NativeError>,
+    Supervisor: SupervisionPlatform<Error = NativeError>,
+>(
+    system: &mut System,
+    loader: &mut Loader,
+    supervisor: &mut Supervisor,
+    bootstrap_channel: DwHandle,
+    deadline: DwDeadline,
+    fault: LoadFault,
 ) -> Result<(), BootstrapError> {
     let channel_info = system
         .query_capability_info(bootstrap_channel)
@@ -285,7 +431,7 @@ pub fn run_init0_bootstrap<
         let mut loaded = None;
         let mapped =
             system.with_bootfs_bytes(authority.parent_root, authority.bootfs, plan, |bootfs| {
-                match load_init0(loader, authority, bootfs) {
+                match load_init0(loader, authority, bootfs, fault) {
                     Ok(candidate) => {
                         loaded = Some(candidate);
                         Ok(())
@@ -605,6 +751,7 @@ fn load_init0<Loader: LoaderPlatform<Error = NativeError>>(
     loader: &mut Loader,
     authority: LoadAuthority,
     bytes: &[u8],
+    fault: LoadFault,
 ) -> Result<LoadedProcess, BootstrapError> {
     validate_bootfs(bytes)?;
     let archive = Archive::new(bytes).map_err(BootstrapError::Bootfs)?;
@@ -614,7 +761,7 @@ fn load_init0<Loader: LoaderPlatform<Error = NativeError>>(
     let display_path = entry
         .name_utf8()
         .map_err(|_| BootstrapError::MissingRequiredEntry)?;
-    load_process(
+    load_process_with_fault(
         loader,
         authority,
         LoadRequest {
@@ -623,6 +770,7 @@ fn load_init0<Loader: LoaderPlatform<Error = NativeError>>(
             profile: LaunchProfile::Init0,
             transaction_id: INIT0_TRANSACTION_ID,
         },
+        fault,
     )
     .map_err(BootstrapError::Loader)
 }

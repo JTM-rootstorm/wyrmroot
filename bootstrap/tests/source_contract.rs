@@ -34,6 +34,17 @@ fn primordial_variants_are_explicit_mutually_exclusive_test_features() {
     assert!(MANIFEST.contains(
         "native-loader-smoke-integration = [\"native-bootstrap\", \"loader-smoke-integration\"]"
     ));
+    for variant in [
+        "i0-negative-malformed-elf",
+        "i0-negative-malformed-startup",
+        "i0-negative-capability-count",
+        "i0-negative-capability-type",
+        "i0-negative-capability-rights",
+    ] {
+        assert!(MANIFEST.contains(&format!("{variant} = [\"native-bootstrap\"]")));
+        assert!(MAIN_SOURCE.contains(&format!("feature = \"{variant}\"")));
+    }
+    assert!(LIB_SOURCE.contains("I0 negative bootstrap variants are mutually exclusive"));
 }
 
 #[test]
@@ -41,6 +52,8 @@ fn production_path_stays_separate_from_test_only_hook_and_terminal_behaviors() {
     assert!(LIB_SOURCE.contains("#[cfg(feature = \"primordial-test-support\")]"));
     assert!(LIB_SOURCE.contains("pub fn run_bootstrap_with_before_ready"));
     assert!(MAIN_SOURCE.contains("run_init0_bootstrap("));
+    assert!(MAIN_SOURCE.contains("run_init0_bootstrap_with_fault("));
+    assert!(LIB_SOURCE.contains("LoadFault::None"));
     assert!(MAIN_SOURCE.contains("primordial_blocking_cleanup(channel)"));
     assert!(MAIN_SOURCE.contains("trigger_user_exception()"));
     assert!(MAIN_SOURCE.contains("trigger_invalid_syscall_return()"));

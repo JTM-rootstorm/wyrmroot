@@ -25,6 +25,11 @@ primordial-test-support = ["wyrmroot-runtime/primordial-test-support"]
 primordial-blocking-cleanup = ["native-bootstrap", "primordial-test-support"]
 primordial-user-exception = ["native-bootstrap", "primordial-test-support"]
 primordial-invalid-return = ["native-bootstrap", "primordial-test-support"]
+i0-negative-malformed-elf = ["native-bootstrap"]
+i0-negative-malformed-startup = ["native-bootstrap"]
+i0-negative-capability-count = ["native-bootstrap"]
+i0-negative-capability-type = ["native-bootstrap"]
+i0-negative-capability-rights = ["native-bootstrap"]
 
 [dependencies]
 deepwyrm-syscall.workspace = true

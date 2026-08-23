@@ -12,7 +12,11 @@ use wyrmroot_bootfs::builder::{Builder, FileMode};
 #[cfg(feature = "primordial-test-support")]
 use wyrmroot_bootstrap::run_bootstrap_with_before_ready;
 use wyrmroot_bootstrap::{
-    BootstrapError, BootstrapSystem, HELLO_PATH, INIT0_PATH, run_bootstrap, run_init0_bootstrap,
+    BootstrapError, BootstrapSystem, HELLO_PATH, I0_NEGATIVE_CAPABILITY_COUNT_DETAIL,
+    I0_NEGATIVE_CAPABILITY_RIGHTS_DETAIL, I0_NEGATIVE_CAPABILITY_TYPE_DETAIL,
+    I0_NEGATIVE_MALFORMED_ELF_DETAIL, I0_NEGATIVE_MALFORMED_STARTUP_DETAIL, INIT0_PATH,
+    i0_negative_terminal_detail, run_bootstrap, run_init0_bootstrap,
+    run_init0_bootstrap_with_fault,
 };
 #[cfg(feature = "loader-smoke-integration")]
 use wyrmroot_bootstrap::{
@@ -22,17 +26,18 @@ use wyrmroot_bootstrap_proto::{
     BOOTSTRAP_INIT_V2_SIZE, BootstrapMessage, InitMessageV2, ReadyMessageV2, decode,
 };
 use wyrmroot_loader::{
+    elf::ElfError,
     launch,
     process::{
-        LoadError, LoadStage, LoaderPlatform, ParentMapping, ProcessCreateRequest,
+        LoadError, LoadFault, LoadStage, LoaderPlatform, ParentMapping, ProcessCreateRequest,
         ProcessCreateResult,
     },
 };
-use wyrmroot_runtime::SupervisionPlatform;
 use wyrmroot_runtime::{
     BOOTFS_EXPECTATION, BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo,
     LOADER_TASK_GROUP_EXPECTATION, MappingPlan, NativeError, ReceiveCounts, SELF_ROOT_EXPECTATION,
 };
+use wyrmroot_runtime::{ExitValidationError, SupervisionError, SupervisionPlatform};
 
 const CHANNEL: DwHandle = DwHandle(11);
 const ROOT: DwHandle = DwHandle(21);
@@ -611,6 +616,72 @@ fn primordial_bootstrap_rejects_missing_hello_without_launching_a_fallback() {
     assert_eq!(supervisor.received, 0);
     assert!(fixture.sent.is_empty());
     assert_eq!(fixture.closed, [ROOT, BOOTFS, TASK_GROUP]);
+}
+
+#[test]
+fn malformed_elf_variant_fails_before_publishing_init0() {
+    let image = executable();
+    let mut fixture = Fixture::valid();
+    fixture.bootfs = bootfs(&[(INIT0_PATH, &image), (HELLO_PATH, b"hello")]);
+    let mut loader = SmokeLoader::init0();
+    let mut supervisor = SmokeSupervisor::successful_init0();
+
+    assert!(matches!(
+        run_init0_bootstrap_with_fault(
+            &mut fixture,
+            &mut loader,
+            &mut supervisor,
+            CHANNEL,
+            DwDeadline(99),
+            LoadFault::MalformedElf,
+        ),
+        Err(BootstrapError::Loader(LoadError::Elf(_)))
+    ));
+    assert!(loader.init_profiles.is_empty());
+    assert_eq!(supervisor.received, 0);
+    assert!(fixture.sent.is_empty());
+}
+
+#[test]
+fn i0_negative_terminal_details_are_unique_and_failure_class_bound() {
+    let elf = BootstrapError::Loader(LoadError::Elf(ElfError::BadMagic));
+    let startup = BootstrapError::Supervision(SupervisionError::Exit(
+        ExitValidationError::NonzeroApplicationCode(1),
+    ));
+    let count = BootstrapError::Supervision(SupervisionError::Exit(
+        ExitValidationError::NonzeroApplicationCode(0x1000_0307),
+    ));
+    let capability = BootstrapError::Supervision(SupervisionError::Exit(
+        ExitValidationError::NonzeroApplicationCode(0x1000_0330),
+    ));
+    assert_eq!(
+        i0_negative_terminal_detail(LoadFault::MalformedElf, &elf),
+        Some(I0_NEGATIVE_MALFORMED_ELF_DETAIL)
+    );
+    assert_eq!(
+        i0_negative_terminal_detail(LoadFault::MalformedStartup, &startup),
+        Some(I0_NEGATIVE_MALFORMED_STARTUP_DETAIL)
+    );
+    assert_eq!(
+        i0_negative_terminal_detail(LoadFault::InitCapabilityCount, &count),
+        Some(I0_NEGATIVE_CAPABILITY_COUNT_DETAIL)
+    );
+    assert_eq!(
+        i0_negative_terminal_detail(LoadFault::InitCapabilityType, &capability),
+        Some(I0_NEGATIVE_CAPABILITY_TYPE_DETAIL)
+    );
+    assert_eq!(
+        i0_negative_terminal_detail(LoadFault::InitCapabilityRights, &capability),
+        Some(I0_NEGATIVE_CAPABILITY_RIGHTS_DETAIL)
+    );
+    assert_ne!(
+        I0_NEGATIVE_CAPABILITY_TYPE_DETAIL,
+        I0_NEGATIVE_CAPABILITY_RIGHTS_DETAIL
+    );
+    assert_eq!(
+        i0_negative_terminal_detail(LoadFault::MalformedStartup, &capability),
+        None
+    );
 }
 
 #[test]

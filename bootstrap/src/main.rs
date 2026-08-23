@@ -7,6 +7,14 @@ use core::panic::PanicInfo;
 use deepwyrm_syscall::{DwHandle, DwReceivedHandleInfoV1};
 use wyrmroot_bootfs as _;
 #[cfg(any(
+    feature = "i0-negative-malformed-elf",
+    feature = "i0-negative-malformed-startup",
+    feature = "i0-negative-capability-count",
+    feature = "i0-negative-capability-type",
+    feature = "i0-negative-capability-rights"
+))]
+use wyrmroot_bootstrap::i0_negative_terminal_detail;
+#[cfg(any(
     feature = "primordial-user-exception",
     feature = "primordial-invalid-return"
 ))]
@@ -17,9 +25,22 @@ use wyrmroot_bootstrap::run_bootstrap_with_before_ready;
     feature = "primordial-blocking-cleanup",
     feature = "native-loader-smoke-integration",
     feature = "primordial-user-exception",
-    feature = "primordial-invalid-return"
+    feature = "primordial-invalid-return",
+    feature = "i0-negative-malformed-elf",
+    feature = "i0-negative-malformed-startup",
+    feature = "i0-negative-capability-count",
+    feature = "i0-negative-capability-type",
+    feature = "i0-negative-capability-rights"
 )))]
 use wyrmroot_bootstrap::run_init0_bootstrap;
+#[cfg(any(
+    feature = "i0-negative-malformed-elf",
+    feature = "i0-negative-malformed-startup",
+    feature = "i0-negative-capability-count",
+    feature = "i0-negative-capability-type",
+    feature = "i0-negative-capability-rights"
+))]
+use wyrmroot_bootstrap::run_init0_bootstrap_with_fault;
 #[cfg(feature = "native-loader-smoke-integration")]
 use wyrmroot_bootstrap::run_loader_smoke_bootstrap;
 use wyrmroot_bootstrap::{BootstrapError, BootstrapSystem};
@@ -32,6 +53,11 @@ use wyrmroot_runtime::{
 };
 #[cfg(any(
     feature = "native-loader-smoke-integration",
+    feature = "i0-negative-malformed-elf",
+    feature = "i0-negative-malformed-startup",
+    feature = "i0-negative-capability-count",
+    feature = "i0-negative-capability-type",
+    feature = "i0-negative-capability-rights",
     not(any(
         feature = "primordial-blocking-cleanup",
         feature = "primordial-user-exception",
@@ -42,6 +68,11 @@ use wyrmroot_runtime::{NativeLoaderPlatform, NativeSupervisionPlatform, monotoni
 
 #[cfg(any(
     feature = "native-loader-smoke-integration",
+    feature = "i0-negative-malformed-elf",
+    feature = "i0-negative-malformed-startup",
+    feature = "i0-negative-capability-count",
+    feature = "i0-negative-capability-type",
+    feature = "i0-negative-capability-rights",
     not(any(
         feature = "primordial-blocking-cleanup",
         feature = "primordial-user-exception",
@@ -155,7 +186,12 @@ fn panic(_info: &PanicInfo<'_>) -> ! {
     feature = "primordial-blocking-cleanup",
     feature = "primordial-user-exception",
     feature = "primordial-invalid-return",
-    feature = "native-loader-smoke-integration"
+    feature = "native-loader-smoke-integration",
+    feature = "i0-negative-malformed-elf",
+    feature = "i0-negative-malformed-startup",
+    feature = "i0-negative-capability-count",
+    feature = "i0-negative-capability-type",
+    feature = "i0-negative-capability-rights"
 )))]
 fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
     let deadline = match monotonic_deadline_after(BOOTSTRAP_SUPERVISION_TIMEOUT_NS) {
@@ -174,6 +210,49 @@ fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
     ) {
         Ok(()) => 0,
         Err(error) => system.exit_code(&error),
+    }
+}
+
+#[cfg(any(
+    feature = "i0-negative-malformed-elf",
+    feature = "i0-negative-malformed-startup",
+    feature = "i0-negative-capability-count",
+    feature = "i0-negative-capability-type",
+    feature = "i0-negative-capability-rights"
+))]
+fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
+    use wyrmroot_loader::process::LoadFault;
+
+    let deadline = match monotonic_deadline_after(BOOTSTRAP_SUPERVISION_TIMEOUT_NS) {
+        Ok(deadline) => deadline,
+        Err(_) => return 1,
+    };
+    let fault = if cfg!(feature = "i0-negative-malformed-elf") {
+        LoadFault::MalformedElf
+    } else if cfg!(feature = "i0-negative-malformed-startup") {
+        LoadFault::MalformedStartup
+    } else if cfg!(feature = "i0-negative-capability-count") {
+        LoadFault::InitCapabilityCount
+    } else if cfg!(feature = "i0-negative-capability-type") {
+        LoadFault::InitCapabilityType
+    } else {
+        LoadFault::InitCapabilityRights
+    };
+    let mut system = NativeSystem::new();
+    let mut loader = NativeLoaderPlatform;
+    let mut supervisor = NativeSupervisionPlatform;
+    match run_init0_bootstrap_with_fault(
+        &mut system,
+        &mut loader,
+        &mut supervisor,
+        startup.bootstrap_channel().as_abi(),
+        deadline,
+        fault,
+    ) {
+        Ok(()) => 0,
+        Err(error) => {
+            i0_negative_terminal_detail(fault, &error).unwrap_or_else(|| system.exit_code(&error))
+        }
     }
 }
 

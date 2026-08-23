@@ -103,7 +103,7 @@ impl Init0Error {
         match self {
             Self::Native(_) => PREFIX | 0x01,
             Self::BootstrapChannel(_) => PREFIX | 0x02,
-            Self::Launch(_) => PREFIX | 0x03,
+            Self::Launch(error) => PREFIX | 0x0300 | launch_error_code(*error),
             Self::ReceiveCounts(_) => PREFIX | 0x04,
             Self::Capability(_) => PREFIX | 0x05,
             Self::Mapping(_) => PREFIX | 0x06,
@@ -122,6 +122,28 @@ impl Init0Error {
             Self::MissingLoadedProcess => PREFIX | 0x0301,
         }
     }
+}
+
+const fn launch_error_code(error: LaunchError) -> u32 {
+    match error {
+        LaunchError::BufferSize => 0x01,
+        LaunchError::BadMagic => 0x02,
+        LaunchError::BadVersion => 0x03,
+        LaunchError::BadType => 0x04,
+        LaunchError::NonzeroFlags => 0x05,
+        LaunchError::BadTotalSize => 0x06,
+        LaunchError::BadCapabilityCount => 0x07,
+        LaunchError::ZeroTransaction => 0x08,
+        LaunchError::TransactionMismatch => 0x09,
+        LaunchError::NonzeroReserved => 0x0A,
+        LaunchError::BadCapabilityRole { index } => 0x10 | bounded_index(index),
+        LaunchError::HandleCount => 0x20,
+        LaunchError::HandleMetadata { index } => 0x30 | bounded_index(index),
+    }
+}
+
+const fn bounded_index(index: usize) -> u32 {
+    if index < 16 { index as u32 } else { 15 }
 }
 
 const fn load_stage_code(stage: LoadStage) -> u32 {
