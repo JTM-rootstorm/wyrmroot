@@ -173,9 +173,11 @@ impl BootstrapError {
             Self::RequiredEntryNotExecutable => PREFIX | 0x0B,
             #[cfg(feature = "primordial-test-support")]
             Self::TestSupport(_) => PREFIX | 0x0C,
-            Self::Loader(LoadError::Platform { stage, .. }) => {
-                PREFIX | 0x0100 | load_stage_code(*stage)
-            }
+            Self::Loader(LoadError::Platform {
+                stage,
+                cause,
+                rollback_failed,
+            }) => loader_platform_exit_code(*stage, *cause, *rollback_failed),
             Self::Loader(_) => PREFIX | 0x01FF,
             Self::Supervision(SupervisionError::Exit(
                 wyrmroot_runtime::ExitValidationError::NonzeroApplicationCode(code),
@@ -185,6 +187,20 @@ impl BootstrapError {
             Self::MissingLoadedProcess => PREFIX | 0x0301,
         }
     }
+}
+
+const fn loader_platform_exit_code(
+    stage: LoadStage,
+    cause: NativeError,
+    rollback_failed: bool,
+) -> u32 {
+    const PREFIX: u32 = 0xB100_0000;
+    let rollback = if rollback_failed { 1 << 23 } else { 0 };
+    let cause = match cause {
+        NativeError::Status(status) => status.0.unsigned_abs() & 0xffff,
+        NativeError::Output(output) => 0x8000 | native_output_code(output),
+    };
+    PREFIX | rollback | (load_stage_code(stage) << 16) | cause
 }
 
 const fn load_stage_code(stage: LoadStage) -> u32 {

@@ -23,7 +23,10 @@ use wyrmroot_bootstrap_proto::{
 };
 use wyrmroot_loader::{
     launch,
-    process::{LoaderPlatform, ParentMapping, ProcessCreateRequest, ProcessCreateResult},
+    process::{
+        LoadError, LoadStage, LoaderPlatform, ParentMapping, ProcessCreateRequest,
+        ProcessCreateResult,
+    },
 };
 use wyrmroot_runtime::SupervisionPlatform;
 use wyrmroot_runtime::{
@@ -48,6 +51,24 @@ fn live_exit_code_identifies_bootstrap_owned_failure() {
         ))
         .exit_code(),
         0xB001_000D
+    );
+    assert_eq!(
+        BootstrapError::Loader(LoadError::Platform {
+            stage: LoadStage::ChannelCreate,
+            cause: NativeError::Status(deepwyrm_syscall::DW_STATUS_NO_RESOURCES),
+            rollback_failed: false,
+        })
+        .exit_code(),
+        0xB101_000D
+    );
+    assert_eq!(
+        BootstrapError::Loader(LoadError::Platform {
+            stage: LoadStage::SuccessCleanup,
+            cause: NativeError::Output(wyrmroot_runtime::NativeOutputError::InvalidLoaderOutput),
+            rollback_failed: true,
+        })
+        .exit_code(),
+        0xB18C_8005
     );
 }
 
