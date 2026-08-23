@@ -18,7 +18,7 @@ pub const BOOTSTRAP_INIT_V2_SIZE: usize = 64;
 pub const BOOTSTRAP_READY_V1_SIZE: usize = 40;
 /// Exact `BOOTSTRAP_READY_V2` payload size.
 pub const BOOTSTRAP_READY_V2_SIZE: usize = 40;
-/// The D0 contract permits exactly two INIT handles and no READY handles.
+/// The current H bootstrap envelope permits at most three INIT handles and no READY handles.
 pub const MAX_BOOTSTRAP_HANDLES: usize = 3;
 
 const INIT_TYPE: u32 = 1;

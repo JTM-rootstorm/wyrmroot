@@ -542,8 +542,9 @@ pub fn load_process<P: LoaderPlatform>(
         ));
     }
     if let Err(cause) = platform.close(thread) {
-        let _ = platform.process_terminate(created.process);
-        let rollback_failed = platform.close(thread).is_err()
+        let terminate_failed = platform.process_terminate(created.process).is_err();
+        let rollback_failed = terminate_failed
+            | platform.close(thread).is_err()
             | platform.close(created.process).is_err()
             | platform.close(parent_channel).is_err();
         return Err(platform_error(

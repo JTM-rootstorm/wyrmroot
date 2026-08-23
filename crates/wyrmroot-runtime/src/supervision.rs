@@ -225,6 +225,24 @@ pub fn supervise_child<P: SupervisionPlatform>(
         if !ready {
             return Err(SupervisionError::ExitedBeforeReady);
         }
+        if monitor_channel {
+            // Deepwyrm publishes Process EXITED wait readiness only after the
+            // terminal handle drain has closed the child endpoint. Recheck the
+            // now-level-triggered peer state so a second datagram queued in the
+            // same exit race cannot be mistaken for a clean one-READY launch.
+            let result = platform
+                .wait_many(core::slice::from_ref(&channel_item), deadline)
+                .map_err(SupervisionError::Platform)?;
+            if result.index != 0 || result.observed.0 & CHANNEL_SIGNALS.0 == 0 {
+                return Err(SupervisionError::InvalidWaitResult);
+            }
+            if result.observed.0 & DW_SIGNAL_READABLE.0 != 0 {
+                return Err(SupervisionError::DuplicateReady);
+            }
+            if result.observed.0 & DW_SIGNAL_PEER_CLOSED.0 == 0 {
+                return Err(SupervisionError::InvalidWaitResult);
+            }
+        }
         let info = platform
             .query_task_termination(process)
             .map_err(SupervisionError::Platform)?;
@@ -293,7 +311,7 @@ mod tests {
             self.wait_index += 1;
             let (index, observed) = match event {
                 WaitEvent::Channel(signals) => {
-                    assert_eq!(items.len(), 2);
+                    assert!(matches!(items.len(), 1 | 2));
                     assert_eq!(items[0].signals, CHANNEL_SIGNALS);
                     (0, signals)
                 }
@@ -338,11 +356,12 @@ mod tests {
     }
 
     const READY: WaitEvent = WaitEvent::Channel(DW_SIGNAL_READABLE);
+    const CLOSED: WaitEvent = WaitEvent::Channel(DW_SIGNAL_PEER_CLOSED);
     const EXITED: WaitEvent = WaitEvent::ProcessExited;
 
     #[test]
     fn accepts_one_ready_then_a_fresh_normal_zero_exit() {
-        let mut mock = Mock::successful(&[READY, EXITED]);
+        let mut mock = Mock::successful(&[READY, EXITED, CLOSED]);
         assert_eq!(
             supervise_child(&mut mock, DwHandle(1), DwHandle(2), 7, DwDeadline(99)),
             Ok(())
@@ -371,6 +390,15 @@ mod tests {
     #[test]
     fn rejects_duplicate_ready_before_process_exit() {
         let mut mock = Mock::successful(&[READY, READY]);
+        assert_eq!(
+            supervise_child(&mut mock, DwHandle(1), DwHandle(2), 7, DwDeadline(99)),
+            Err(SupervisionError::DuplicateReady)
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_ready_queued_in_the_process_exit_race() {
+        let mut mock = Mock::successful(&[READY, EXITED, READY]);
         assert_eq!(
             supervise_child(&mut mock, DwHandle(1), DwHandle(2), 7, DwDeadline(99)),
             Err(SupervisionError::DuplicateReady)

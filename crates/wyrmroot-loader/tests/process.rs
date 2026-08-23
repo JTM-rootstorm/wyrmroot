@@ -29,6 +29,9 @@ struct Mock {
     next: u64,
     events: Vec<Event>,
     fail: Option<&'static str>,
+    started_thread: Option<DwHandle>,
+    post_start_thread_close_failures: usize,
+    fail_process_terminate: bool,
 }
 
 impl Mock {
@@ -37,6 +40,9 @@ impl Mock {
             next: 10,
             events: Vec::new(),
             fail,
+            started_thread: None,
+            post_start_thread_close_failures: 0,
+            fail_process_terminate: false,
         }
     }
     fn handle(&mut self) -> DwHandle {
@@ -68,6 +74,10 @@ impl LoaderPlatform for Mock {
     }
     fn close(&mut self, handle: DwHandle) -> Result<(), Self::Error> {
         self.events.push(Event::Close(handle.0));
+        if self.started_thread == Some(handle) && self.post_start_thread_close_failures != 0 {
+            self.post_start_thread_close_failures -= 1;
+            return Err("close-thread");
+        }
         Ok(())
     }
     fn process_create(
@@ -137,14 +147,16 @@ impl LoaderPlatform for Mock {
     }
     fn thread_start(
         &mut self,
-        _: DwHandle,
+        thread: DwHandle,
         _: u64,
         _: u64,
         _: DwHandle,
         _: u64,
     ) -> Result<(), Self::Error> {
         self.events.push(Event::Start);
-        self.check("start")
+        self.check("start")?;
+        self.started_thread = Some(thread);
+        Ok(())
     }
     fn thread_terminate(&mut self, _: DwHandle) -> Result<(), Self::Error> {
         self.events.push(Event::TerminateThread);
@@ -152,7 +164,11 @@ impl LoaderPlatform for Mock {
     }
     fn process_terminate(&mut self, _: DwHandle) -> Result<(), Self::Error> {
         self.events.push(Event::TerminateProcess);
-        Ok(())
+        if self.fail_process_terminate {
+            Err("terminate-process")
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -238,6 +254,29 @@ fn failed_parent_unmap_retains_exact_alias_for_rollback_retry() {
         .collect();
     assert_eq!(attempted.len(), 2);
     assert_eq!(attempted[0], attempted[1]);
+    assert!(platform.events.contains(&Event::TerminateProcess));
+}
+
+#[test]
+fn postpublication_cleanup_reports_failed_process_termination() {
+    let mut platform = Mock::new(None);
+    platform.post_start_thread_close_failures = 2;
+    platform.fail_process_terminate = true;
+    let image = executable();
+    let error = load_process(
+        &mut platform,
+        authority(),
+        request(&image, LaunchProfile::Hello),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error,
+        LoadError::Platform {
+            stage: LoadStage::SuccessCleanup,
+            cause: "close-thread",
+            rollback_failed: true,
+        }
+    );
     assert!(platform.events.contains(&Event::TerminateProcess));
 }
 

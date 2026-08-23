@@ -139,6 +139,9 @@ pub enum BootstrapError {
     /// Temporary WYR0-E child readiness or completion did not satisfy the exact contract.
     #[cfg(feature = "loader-smoke-integration")]
     Supervision(SupervisionError<NativeError>),
+    /// Cleanup of an already-published temporary child failed.
+    #[cfg(feature = "loader-smoke-integration")]
+    Cleanup(NativeError),
     /// A successful bootfs callback failed to retain the child it created.
     #[cfg(feature = "loader-smoke-integration")]
     MissingLoadedProcess,
@@ -202,7 +205,9 @@ pub fn run_loader_smoke_bootstrap<
             (Ok(Ok(())), Some(loaded)) => loaded,
             (Ok(Err(error)), _) => return Err(error),
             (Err(error), Some(loaded)) => {
-                let _ = cleanup_loaded_process(system, loader, loaded, true);
+                if let Err(cleanup) = cleanup_loaded_process(system, loader, loaded, true) {
+                    return Err(BootstrapError::Cleanup(cleanup));
+                }
                 return Err(BootstrapError::Native(error));
             }
             (Err(error), None) => return Err(BootstrapError::Native(error)),
@@ -214,11 +219,12 @@ pub fn run_loader_smoke_bootstrap<
             loaded.launch_channel,
             LOADER_SMOKE_TRANSACTION_ID,
             deadline,
-        )
-        .map_err(BootstrapError::Supervision);
+        );
         let loaded_cleanup = cleanup_loaded_process(system, loader, loaded, supervision.is_err());
-        supervision?;
-        loaded_cleanup?;
+        if let Err(cleanup) = loaded_cleanup {
+            return Err(BootstrapError::Cleanup(cleanup));
+        }
+        supervision.map_err(BootstrapError::Supervision)?;
         Ok(transaction_id)
     })();
     let cleanup = close_received_handles(system, &handles[..counts.handles]);
@@ -460,16 +466,16 @@ fn cleanup_loaded_process<System: BootstrapSystem, Loader: LoaderPlatform<Error 
     loader: &mut Loader,
     loaded: LoadedProcess,
     terminate: bool,
-) -> Result<(), BootstrapError> {
-    if terminate {
-        let _ = loader.process_terminate(loaded.process);
-    }
+) -> Result<(), NativeError> {
     let mut first_error = None;
+    if terminate && let Err(error) = loader.process_terminate(loaded.process) {
+        first_error = Some(error);
+    }
     for handle in [loaded.launch_channel, loaded.process] {
         if let Err(error) = system.close_handle(handle)
             && first_error.is_none()
         {
-            first_error = Some(BootstrapError::Native(error));
+            first_error = Some(error);
         }
     }
     first_error.map_or(Ok(()), Err)

@@ -5,9 +5,9 @@ use deepwyrm_syscall::{
 };
 #[cfg(feature = "loader-smoke-integration")]
 use deepwyrm_syscall::{
-    DW_SIGNAL_EXITED, DW_SIGNAL_READABLE, DW_TASK_STATE_EXITED, DW_TASK_TERMINATION_INFO_V1_SIZE,
-    DW_TERMINATION_NORMAL_EXIT, DwDeadline, DwHandleTransferV1, DwMemoryProtection,
-    DwTaskTerminationInfoV1, DwWaitItemV1, DwWaitResultV1,
+    DW_SIGNAL_EXITED, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DW_TASK_STATE_EXITED,
+    DW_TASK_TERMINATION_INFO_V1_SIZE, DW_TERMINATION_NORMAL_EXIT, DwDeadline, DwHandleTransferV1,
+    DwMemoryProtection, DwTaskTerminationInfoV1, DwWaitItemV1, DwWaitResultV1,
 };
 use wyrmroot_bootfs::builder::{Builder, FileMode};
 #[cfg(feature = "primordial-test-support")]
@@ -254,6 +254,7 @@ struct SmokeLoader {
     next: u64,
     init_profiles: Vec<launch::LaunchProfile>,
     terminated: Vec<DwHandle>,
+    fail_terminate: bool,
 }
 
 #[cfg(feature = "loader-smoke-integration")]
@@ -263,6 +264,7 @@ impl SmokeLoader {
             next: 40,
             init_profiles: Vec::new(),
             terminated: Vec::new(),
+            fail_terminate: false,
         }
     }
 
@@ -372,7 +374,11 @@ impl LoaderPlatform for SmokeLoader {
 
     fn process_terminate(&mut self, process: DwHandle) -> Result<(), Self::Error> {
         self.terminated.push(process);
-        Ok(())
+        if self.fail_terminate {
+            Err(NativeError::Status(DW_STATUS_BAD_HANDLE))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -412,13 +418,16 @@ impl SupervisionPlatform for SmokeSupervisor {
         deadline: DwDeadline,
     ) -> Result<DwWaitResultV1, Self::Error> {
         assert_eq!(deadline, DwDeadline(99));
-        let ready = self.events[self.index];
-        self.index += 1;
-        let (index, observed) = if ready {
-            assert_eq!(items.len(), 2);
-            (0, DW_SIGNAL_READABLE)
+        let (index, observed) = if items.len() == 1 {
+            (0, DW_SIGNAL_PEER_CLOSED)
         } else {
-            (items.len() as u32 - 1, DW_SIGNAL_EXITED)
+            let ready = self.events[self.index];
+            self.index += 1;
+            if ready {
+                (0, DW_SIGNAL_READABLE)
+            } else {
+                (items.len() as u32 - 1, DW_SIGNAL_EXITED)
+            }
         };
         Ok(DwWaitResultV1 {
             size: deepwyrm_syscall::DW_WAIT_RESULT_V1_SIZE,
@@ -523,6 +532,32 @@ fn loader_smoke_failure_terminates_and_closes_child_before_authority_cleanup() {
         fixture.closed,
         [DwHandle(42), DwHandle(43), ROOT, BOOTFS, TASK_GROUP]
     );
+}
+
+#[cfg(feature = "loader-smoke-integration")]
+#[test]
+fn loader_smoke_surfaces_cleanup_failure_after_supervision_failure() {
+    let image = executable();
+    let mut fixture = Fixture::valid();
+    fixture.bootfs = bootfs(&[(LOADER_SMOKE_PATH, &image)]);
+    let mut loader = SmokeLoader::new();
+    loader.fail_terminate = true;
+    let mut supervisor = SmokeSupervisor::exited_before_ready();
+
+    assert_eq!(
+        run_loader_smoke_bootstrap(
+            &mut fixture,
+            &mut loader,
+            &mut supervisor,
+            CHANNEL,
+            DwDeadline(99),
+        ),
+        Err(BootstrapError::Cleanup(NativeError::Status(
+            DW_STATUS_BAD_HANDLE
+        )))
+    );
+    assert_eq!(loader.terminated, [DwHandle(43)]);
+    assert!(fixture.sent.is_empty());
 }
 
 #[cfg(feature = "loader-smoke-integration")]
