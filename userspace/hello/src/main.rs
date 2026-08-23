@@ -6,6 +6,7 @@ use core::panic::PanicInfo;
 
 use deepwyrm_syscall::{DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights};
 use wyrmroot_hello::{HelloSystem, run_hello};
+use wyrmroot_loader as _;
 use wyrmroot_runtime::{
     CapabilityInfo, NativeError, ReceiveCounts, StartupBlock, close_handle, panic_abort,
     query_capability_info, receive_channel, send_channel,

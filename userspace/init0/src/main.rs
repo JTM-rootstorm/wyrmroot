@@ -5,7 +5,9 @@
 use core::panic::PanicInfo;
 
 use deepwyrm_syscall::{DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights};
+use wyrmroot_bootfs as _;
 use wyrmroot_init0::{Init0System, run_init0};
+use wyrmroot_loader as _;
 use wyrmroot_runtime::{
     CapabilityInfo, MappingPlan, NativeError, NativeLoaderPlatform, NativeSupervisionPlatform,
     ReceiveCounts, StartupBlock, close_handle, map_bootfs_read_only, monotonic_deadline_after,
