@@ -46,7 +46,10 @@ use wyrmroot_bootstrap_proto::{
 };
 use wyrmroot_loader::{
     launch::LaunchProfile,
-    process::{LoadAuthority, LoadError, LoadRequest, LoadedProcess, LoaderPlatform, load_process},
+    process::{
+        LoadAuthority, LoadError, LoadRequest, LoadStage, LoadedProcess, LoaderPlatform,
+        load_process,
+    },
 };
 #[cfg(feature = "primordial-test-support")]
 use wyrmroot_runtime::PrimordialTestError;
@@ -140,6 +143,60 @@ pub enum BootstrapError {
     Cleanup(NativeError),
     /// A successful bootfs callback failed to retain the child it created.
     MissingLoadedProcess,
+}
+
+impl BootstrapError {
+    /// Returns a bounded native application exit code for live integration diagnostics.
+    ///
+    /// A descendant's nonzero exit code is preserved so the canonical serial completion record
+    /// identifies the deepest failing WYR0 application. Other failures retain a bootstrap-owned
+    /// prefix and a stable category or loader-stage suffix.
+    #[must_use]
+    pub fn exit_code(&self) -> u32 {
+        const PREFIX: u32 = 0xB000_0000;
+        match self {
+            Self::Native(_) => PREFIX | 0x01,
+            Self::BootstrapChannel(_) => PREFIX | 0x02,
+            Self::Protocol(_) => PREFIX | 0x03,
+            Self::ReceiveCounts(_) => PREFIX | 0x04,
+            Self::UnexpectedMessage => PREFIX | 0x05,
+            Self::UnexpectedTransactionId => PREFIX | 0x06,
+            Self::Capability(_) => PREFIX | 0x07,
+            Self::Mapping(_) => PREFIX | 0x08,
+            Self::Bootfs(_) => PREFIX | 0x09,
+            Self::MissingRequiredEntry => PREFIX | 0x0A,
+            Self::RequiredEntryNotExecutable => PREFIX | 0x0B,
+            #[cfg(feature = "primordial-test-support")]
+            Self::TestSupport(_) => PREFIX | 0x0C,
+            Self::Loader(LoadError::Platform { stage, .. }) => {
+                PREFIX | 0x0100 | load_stage_code(*stage)
+            }
+            Self::Loader(_) => PREFIX | 0x01FF,
+            Self::Supervision(SupervisionError::Exit(
+                wyrmroot_runtime::ExitValidationError::NonzeroApplicationCode(code),
+            )) => *code,
+            Self::Supervision(_) => PREFIX | 0x0200,
+            Self::Cleanup(_) => PREFIX | 0x0300,
+            Self::MissingLoadedProcess => PREFIX | 0x0301,
+        }
+    }
+}
+
+const fn load_stage_code(stage: LoadStage) -> u32 {
+    match stage {
+        LoadStage::ChannelCreate => 1,
+        LoadStage::ChannelReduce => 2,
+        LoadStage::ProcessCreate => 3,
+        LoadStage::MemoryCreate => 4,
+        LoadStage::ParentMaterialize => 5,
+        LoadStage::ParentUnmap => 6,
+        LoadStage::ChildMap => 7,
+        LoadStage::ThreadCreate => 8,
+        LoadStage::CapabilityDuplicate => 9,
+        LoadStage::InitSend => 10,
+        LoadStage::ThreadStart => 11,
+        LoadStage::SuccessCleanup => 12,
+    }
 }
 
 /// Executes the complete D2 bootstrap handshake without exiting the process.

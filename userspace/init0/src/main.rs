@@ -68,16 +68,16 @@ fn init0_main(startup: StartupBlock<'_>) -> u32 {
         Ok(deadline) => deadline,
         Err(_) => return 1,
     };
-    u32::from(
-        run_init0(
-            &mut system,
-            &mut NativeLoaderPlatform,
-            &mut NativeSupervisionPlatform,
-            startup.bootstrap_channel().as_abi(),
-            deadline,
-        )
-        .is_err(),
-    )
+    match run_init0(
+        &mut system,
+        &mut NativeLoaderPlatform,
+        &mut NativeSupervisionPlatform,
+        startup.bootstrap_channel().as_abi(),
+        deadline,
+    ) {
+        Ok(()) => 0,
+        Err(error) => error.exit_code(),
+    }
 }
 
 wyrmroot_runtime::native_entry!(crate::init0_main);

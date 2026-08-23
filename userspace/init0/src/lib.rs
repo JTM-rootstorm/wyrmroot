@@ -12,7 +12,10 @@ use deepwyrm_syscall::{DwDeadline, DwHandle, DwObjectType, DwReceivedHandleInfoV
 use wyrmroot_bootfs::archive::{Archive, LookupError, ParseError};
 use wyrmroot_loader::{
     launch::{HEADER_BYTES, INIT0_BYTES, LaunchError, LaunchProfile, encode_ready, parse_init},
-    process::{LoadAuthority, LoadError, LoadRequest, LoadedProcess, LoaderPlatform, load_process},
+    process::{
+        LoadAuthority, LoadError, LoadRequest, LoadStage, LoadedProcess, LoaderPlatform,
+        load_process,
+    },
 };
 use wyrmroot_runtime::{
     BOOTFS_EXPECTATION, BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, CapabilityValidationError,
@@ -90,6 +93,52 @@ pub enum Init0Error {
     Cleanup(NativeError),
     /// A successful bootfs callback did not retain the descendant it created.
     MissingLoadedProcess,
+}
+
+impl Init0Error {
+    /// Returns a bounded native application exit code for live integration diagnostics.
+    #[must_use]
+    pub fn exit_code(&self) -> u32 {
+        const PREFIX: u32 = 0x1000_0000;
+        match self {
+            Self::Native(_) => PREFIX | 0x01,
+            Self::BootstrapChannel(_) => PREFIX | 0x02,
+            Self::Launch(_) => PREFIX | 0x03,
+            Self::ReceiveCounts(_) => PREFIX | 0x04,
+            Self::Capability(_) => PREFIX | 0x05,
+            Self::Mapping(_) => PREFIX | 0x06,
+            Self::Bootfs(_) => PREFIX | 0x07,
+            Self::MissingHello => PREFIX | 0x08,
+            Self::HelloNotExecutable => PREFIX | 0x09,
+            Self::Loader(LoadError::Platform { stage, .. }) => {
+                PREFIX | 0x0100 | load_stage_code(*stage)
+            }
+            Self::Loader(_) => PREFIX | 0x01FF,
+            Self::Supervision(SupervisionError::Exit(
+                wyrmroot_runtime::ExitValidationError::NonzeroApplicationCode(code),
+            )) => *code,
+            Self::Supervision(_) => PREFIX | 0x0200,
+            Self::Cleanup(_) => PREFIX | 0x0300,
+            Self::MissingLoadedProcess => PREFIX | 0x0301,
+        }
+    }
+}
+
+const fn load_stage_code(stage: LoadStage) -> u32 {
+    match stage {
+        LoadStage::ChannelCreate => 1,
+        LoadStage::ChannelReduce => 2,
+        LoadStage::ProcessCreate => 3,
+        LoadStage::MemoryCreate => 4,
+        LoadStage::ParentMaterialize => 5,
+        LoadStage::ParentUnmap => 6,
+        LoadStage::ChildMap => 7,
+        LoadStage::ThreadCreate => 8,
+        LoadStage::CapabilityDuplicate => 9,
+        LoadStage::InitSend => 10,
+        LoadStage::ThreadStart => 11,
+        LoadStage::SuccessCleanup => 12,
+    }
 }
 
 /// Validates the WYR0-F handoff, then completes the WYR0-G descendant smoke chain.

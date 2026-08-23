@@ -36,6 +36,14 @@ const ROOT: DwHandle = DwHandle(21);
 const BOOTFS: DwHandle = DwHandle(22);
 const TASK_GROUP: DwHandle = DwHandle(23);
 
+#[test]
+fn live_exit_code_identifies_bootstrap_owned_failure() {
+    assert_eq!(
+        BootstrapError::MissingRequiredEntry.exit_code(),
+        0xB000_000A
+    );
+}
+
 struct Fixture {
     init: [u8; BOOTSTRAP_INIT_V2_SIZE],
     init_size: usize,

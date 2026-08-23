@@ -51,6 +51,20 @@ pub enum HelloError {
     Launch(LaunchError),
 }
 
+impl HelloError {
+    /// Returns a bounded native application exit code for live integration diagnostics.
+    #[must_use]
+    pub const fn exit_code(&self) -> u32 {
+        const PREFIX: u32 = 0x4800_0000;
+        match self {
+            Self::Native(_) => PREFIX | 0x01,
+            Self::BootstrapChannel(_) => PREFIX | 0x02,
+            Self::ReceiveCounts(_) => PREFIX | 0x03,
+            Self::Launch(_) => PREFIX | 0x04,
+        }
+    }
+}
+
 /// Completes the capability-mediated WYR0-G parent-channel exchange.
 pub fn run_hello<System: HelloSystem>(
     system: &mut System,

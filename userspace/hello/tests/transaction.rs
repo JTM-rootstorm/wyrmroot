@@ -11,6 +11,18 @@ use wyrmroot_runtime::{
 
 const CHANNEL: DwHandle = DwHandle(11);
 
+#[test]
+fn live_exit_code_identifies_hello_owned_failure() {
+    assert_eq!(
+        HelloError::ReceiveCounts(ReceiveCounts {
+            bytes: 0,
+            handles: 1,
+        })
+        .exit_code(),
+        0x4800_0003
+    );
+}
+
 struct Fixture {
     init: [u8; 40],
     received_handles: usize,

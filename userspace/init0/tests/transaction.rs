@@ -30,6 +30,11 @@ const MAPPING_TEARDOWN_FAILURE: NativeError = NativeError::Status(DwStatus(-71))
 const TERMINATE_FAILURE: NativeError = NativeError::Status(DwStatus(-72));
 const CHILD_CLOSE_FAILURE: NativeError = NativeError::Status(DwStatus(-73));
 
+#[test]
+fn live_exit_code_identifies_init0_owned_failure() {
+    assert_eq!(Init0Error::MissingHello.exit_code(), 0x1000_0008);
+}
+
 struct Fixture {
     init: [u8; 64],
     bootfs: Vec<u8>,

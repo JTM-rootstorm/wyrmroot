@@ -42,7 +42,10 @@ impl HelloSystem for NativeSystem {
 
 fn hello_main(startup: StartupBlock<'_>) -> u32 {
     let mut system = NativeSystem;
-    u32::from(run_hello(&mut system, startup.bootstrap_channel().as_abi()).is_err())
+    match run_hello(&mut system, startup.bootstrap_channel().as_abi()) {
+        Ok(()) => 0,
+        Err(error) => error.exit_code(),
+    }
 }
 
 wyrmroot_runtime::native_entry!(crate::hello_main);

@@ -117,16 +117,16 @@ fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
     let mut system = NativeSystem;
     let mut loader = NativeLoaderPlatform;
     let mut supervisor = NativeSupervisionPlatform;
-    u32::from(
-        run_init0_bootstrap(
-            &mut system,
-            &mut loader,
-            &mut supervisor,
-            startup.bootstrap_channel().as_abi(),
-            deadline,
-        )
-        .is_err(),
-    )
+    match run_init0_bootstrap(
+        &mut system,
+        &mut loader,
+        &mut supervisor,
+        startup.bootstrap_channel().as_abi(),
+        deadline,
+    ) {
+        Ok(()) => 0,
+        Err(error) => error.exit_code(),
+    }
 }
 
 #[cfg(feature = "native-loader-smoke-integration")]
