@@ -149,24 +149,46 @@ pub(crate) fn integration(
                 &request,
                 &artifacts,
                 ExecutionKind::Integration,
-            )?;
+            );
             let smp = execute(
                 HProfile::Smp,
                 &request,
                 &artifacts,
                 ExecutionKind::Integration,
-            )?;
-            Ok(format!(
-                concat!(
-                    "{{\"schema_version\":1,\"phase\":\"WYR0-H\",",
-                    "\"status\":\"PASS\",\"same_media\":true,",
-                    "\"inspection\":{},\"default\":{},\"smp\":{}}}\n"
-                ),
-                inspection.trim(),
-                default.trim(),
-                smp.trim()
-            ))
+            );
+            join_profile_results(&inspection, default, smp)
         }
+    }
+}
+
+fn join_profile_results(
+    inspection: &str,
+    default: Result<String, Failure>,
+    smp: Result<String, Failure>,
+) -> Result<String, Failure> {
+    match (default, smp) {
+        (Ok(default), Ok(smp)) => Ok(format!(
+            concat!(
+                "{{\"schema_version\":1,\"phase\":\"WYR0-H\",",
+                "\"status\":\"PASS\",\"same_media\":true,",
+                "\"inspection\":{},\"default\":{},\"smp\":{}}}\n"
+            ),
+            inspection.trim(),
+            default.trim(),
+            smp.trim()
+        )),
+        (Err(default), Ok(_)) => Err(Failure::task(format!(
+            "paired WYR0-H integration failed: default: {}",
+            default.message
+        ))),
+        (Ok(_), Err(smp)) => Err(Failure::task(format!(
+            "paired WYR0-H integration failed: smp: {}",
+            smp.message
+        ))),
+        (Err(default), Err(smp)) => Err(Failure::task(format!(
+            "paired WYR0-H integration failed: default: {}; smp: {}",
+            default.message, smp.message
+        ))),
     }
 }
 
@@ -942,5 +964,26 @@ mod tests {
                 .join(" ")
                 .contains("file /candidate/deepwyrm.symbols")
         );
+    }
+
+    #[test]
+    fn paired_join_requires_both_profiles_and_preserves_both_failures() {
+        let inspection = "{\"status\":\"PASS\"}\n";
+        let default = "{\"profile\":\"default\",\"status\":\"PASS\"}\n";
+        let smp = "{\"profile\":\"smp\",\"status\":\"PASS\"}\n";
+        let joined = join_profile_results(inspection, Ok(default.into()), Ok(smp.into()))
+            .expect("paired successful profiles rejected");
+        assert!(joined.contains("\"same_media\":true"));
+        assert!(joined.contains("\"default\":{\"profile\":\"default\""));
+        assert!(joined.contains("\"smp\":{\"profile\":\"smp\""));
+
+        let failure = join_profile_results(
+            inspection,
+            Err(Failure::task("default failed")),
+            Err(Failure::task("smp failed")),
+        )
+        .expect_err("paired failures were accepted");
+        assert!(failure.message.contains("default: default failed"));
+        assert!(failure.message.contains("smp: smp failed"));
     }
 }
