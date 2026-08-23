@@ -22,8 +22,12 @@ native-init0 = []
 
 [dependencies]
 deepwyrm-syscall.workspace = true
+wyrmroot-bootfs = { path = "../../crates/wyrmroot-bootfs" }
 wyrmroot-loader = { path = "../../crates/wyrmroot-loader" }
 wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }
+
+[dev-dependencies]
+wyrmroot-bootfs = { path = "../../crates/wyrmroot-bootfs", features = ["builder"] }
 
 [lints.rust]
 unsafe_code = "deny"

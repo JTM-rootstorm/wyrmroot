@@ -188,6 +188,8 @@ dependencies = [
 name = "wyrmroot-hello"
 version = "0.0.0"
 dependencies = [
+ "deepwyrm-syscall",
+ "wyrmroot-loader",
  "wyrmroot-runtime",
 ]
 
@@ -196,6 +198,7 @@ name = "wyrmroot-init0"
 version = "0.0.0"
 dependencies = [
  "deepwyrm-syscall",
+ "wyrmroot-bootfs",
  "wyrmroot-loader",
  "wyrmroot-runtime",
 ]

@@ -7,9 +7,13 @@ use core::panic::PanicInfo;
 use deepwyrm_syscall::{DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights};
 use wyrmroot_init0::{Init0System, run_init0};
 use wyrmroot_runtime::{
-    CapabilityInfo, NativeError, ReceiveCounts, StartupBlock, close_handle, panic_abort,
-    query_capability_info, receive_channel, send_channel,
+    CapabilityInfo, MappingPlan, NativeError, NativeLoaderPlatform, NativeSupervisionPlatform,
+    ReceiveCounts, StartupBlock, close_handle, map_bootfs_read_only, monotonic_deadline_after,
+    panic_abort, query_capability_info, query_memory_object_size, receive_channel, send_channel,
+    unmap_bootfs,
 };
+
+const HELLO_DEADLINE_NS: u64 = 5_000_000_000;
 
 struct NativeSystem;
 
@@ -30,6 +34,23 @@ impl Init0System for NativeSystem {
         receive_channel(channel, bytes, handles)
     }
 
+    fn query_memory_object_size(&mut self, handle: DwHandle) -> Result<u64, NativeError> {
+        query_memory_object_size(handle)
+    }
+
+    fn with_bootfs_bytes<R>(
+        &mut self,
+        root_region: DwHandle,
+        bootfs: DwHandle,
+        plan: MappingPlan,
+        use_bytes: impl for<'bytes> FnOnce(&'bytes [u8]) -> R,
+    ) -> Result<R, NativeError> {
+        let mapping = map_bootfs_read_only(root_region, bootfs, plan)?;
+        let result = mapping.with_logical_bytes(use_bytes);
+        unmap_bootfs(mapping)?;
+        Ok(result)
+    }
+
     fn send_channel(&mut self, channel: DwHandle, bytes: &[u8]) -> Result<(), NativeError> {
         send_channel(channel, bytes, &[])
     }
@@ -41,7 +62,20 @@ impl Init0System for NativeSystem {
 
 fn init0_main(startup: StartupBlock<'_>) -> u32 {
     let mut system = NativeSystem;
-    u32::from(run_init0(&mut system, startup.bootstrap_channel().as_abi()).is_err())
+    let deadline = match monotonic_deadline_after(HELLO_DEADLINE_NS) {
+        Ok(deadline) => deadline,
+        Err(_) => return 1,
+    };
+    u32::from(
+        run_init0(
+            &mut system,
+            &mut NativeLoaderPlatform,
+            &mut NativeSupervisionPlatform,
+            startup.bootstrap_channel().as_abi(),
+            deadline,
+        )
+        .is_err(),
+    )
 }
 
 wyrmroot_runtime::native_entry!(crate::init0_main);

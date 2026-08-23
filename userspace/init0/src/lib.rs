@@ -3,20 +3,30 @@
 
 //! Temporary WYR0 `init0` application contract.
 //!
-//! WYR0-F validates its one-time loader handoff and publishes READY.  It intentionally does not
-//! interpret the delegated bootfs or create a descendant; those are WYR0-G responsibilities.
+//! WYR0-G validates its one-time loader handoff, maps the delegated read-only bootfs just long
+//! enough to select `bin/hello`, and launches that descendant only through `wyrmroot-loader`.
+//! It reports READY to its primordial parent only after `hello` acknowledges its parent Channel
+//! and exits normally with application code zero.
 
-use deepwyrm_syscall::{DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights};
-use wyrmroot_loader::launch::{
-    HEADER_BYTES, INIT0_BYTES, LaunchError, LaunchProfile, encode_ready, parse_init,
+use deepwyrm_syscall::{DwDeadline, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights};
+use wyrmroot_bootfs::archive::{Archive, LookupError, ParseError};
+use wyrmroot_loader::{
+    launch::{HEADER_BYTES, INIT0_BYTES, LaunchError, LaunchProfile, encode_ready, parse_init},
+    process::{LoadAuthority, LoadError, LoadRequest, LoadedProcess, LoaderPlatform, load_process},
 };
 use wyrmroot_runtime::{
     BOOTFS_EXPECTATION, BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, CapabilityValidationError,
-    InitCapability, LOADER_TASK_GROUP_EXPECTATION, NativeError, ReceiveCounts,
-    SELF_ROOT_EXPECTATION, validate_bootstrap_channel, validate_init_capabilities_v2,
+    InitCapability, LOADER_TASK_GROUP_EXPECTATION, MappingPlan, MappingPlanError, NativeError,
+    ReceiveCounts, SELF_ROOT_EXPECTATION, SupervisionError, SupervisionPlatform, supervise_child,
+    validate_bootstrap_channel, validate_init_capabilities_v2,
 };
 
-/// Native operations used by the deliberately minimal WYR0-F `init0` handoff.
+/// The only bootfs path selected by the WYR0-G descendant smoke chain.
+pub const HELLO_PATH: &[u8] = b"bin/hello";
+/// Nonzero WRLP transaction identifier for the `init0 -> hello` launch.
+pub const HELLO_TRANSACTION_ID: u64 = 2;
+
+/// Native operations used by the WYR0-G `init0` descendant transaction.
 pub trait Init0System {
     /// Queries current object metadata for a locally held capability.
     fn query_capability_info(
@@ -32,6 +42,18 @@ pub trait Init0System {
         handles: &mut [DwReceivedHandleInfoV1],
     ) -> Result<ReceiveCounts, NativeError>;
 
+    /// Queries an immutable MemoryObject's exact logical size.
+    fn query_memory_object_size(&mut self, handle: DwHandle) -> Result<u64, NativeError>;
+
+    /// Maps the bootfs for one non-escaping logical-byte callback, then unmaps it.
+    fn with_bootfs_bytes<R>(
+        &mut self,
+        root_region: DwHandle,
+        bootfs: DwHandle,
+        plan: MappingPlan,
+        use_bytes: impl for<'bytes> FnOnce(&'bytes [u8]) -> R,
+    ) -> Result<R, NativeError>;
+
     /// Sends one handle-free loader READY datagram.
     fn send_channel(&mut self, channel: DwHandle, bytes: &[u8]) -> Result<(), NativeError>;
 
@@ -39,7 +61,7 @@ pub trait Init0System {
     fn close_handle(&mut self, handle: DwHandle) -> Result<(), NativeError>;
 }
 
-/// Why the WYR0-F `init0` startup transaction failed.
+/// Why the WYR0-G `init0` descendant transaction failed.
 #[derive(Debug, Eq, PartialEq)]
 pub enum Init0Error {
     /// A typed native operation failed or reported malformed output.
@@ -52,17 +74,40 @@ pub enum Init0Error {
     ReceiveCounts(ReceiveCounts),
     /// Received or freshly queried capability metadata violated the exact Init0 contract.
     Capability(CapabilityValidationError),
+    /// The bootfs logical size could not produce a bounded mapping.
+    Mapping(MappingPlanError),
+    /// The mapped bootfs archive was malformed.
+    Bootfs(ParseError),
+    /// `bin/hello` was absent or had an invalid bootfs name.
+    MissingHello,
+    /// `bin/hello` was not immutable executable content.
+    HelloNotExecutable,
+    /// The reusable loader could not construct the descendant transactionally.
+    Loader(LoadError<NativeError>),
+    /// `hello` did not acknowledge and exit under the bounded supervision contract.
+    Supervision(SupervisionError<NativeError>),
+    /// Cleanup of an already-published descendant failed.
+    Cleanup(NativeError),
+    /// A successful bootfs callback did not retain the descendant it created.
+    MissingLoadedProcess,
 }
 
-/// Validates the WYR0-F loader handoff, then publishes the matching handle-free READY.
+/// Validates the WYR0-F handoff, then completes the WYR0-G descendant smoke chain.
 ///
 /// The native entry macro has already validated the immutable startup page before this function
-/// receives the bootstrap Channel.  This transaction re-queries every received authority before
-/// use, closes all three delegated capabilities, and intentionally performs no bootfs parsing or
-/// child creation.
-pub fn run_init0<System: Init0System>(
+/// receives the bootstrap Channel. This transaction re-queries every received authority before
+/// use. It retains those handles only while it maps the bootfs and constructs one child in the
+/// delegated TaskGroup, then closes all three before publishing its own READY.
+pub fn run_init0<
+    System: Init0System,
+    Loader: LoaderPlatform<Error = NativeError>,
+    Supervisor: SupervisionPlatform<Error = NativeError>,
+>(
     system: &mut System,
+    loader: &mut Loader,
+    supervisor: &mut Supervisor,
     bootstrap_channel: DwHandle,
+    deadline: DwDeadline,
 ) -> Result<(), Init0Error> {
     let channel = system
         .query_capability_info(bootstrap_channel)
@@ -97,12 +142,109 @@ pub fn run_init0<System: Init0System>(
             LOADER_TASK_GROUP_EXPECTATION,
         )
         .map_err(Init0Error::Capability)?;
+        let authority = LoadAuthority {
+            parent_root: handles[0].handle,
+            bootfs: handles[1].handle,
+            task_group: handles[2].handle,
+        };
+        let plan = bootfs_mapping_plan(system, authority.bootfs)?;
+        let mut loaded = None;
+        let mapped =
+            system.with_bootfs_bytes(authority.parent_root, authority.bootfs, plan, |bootfs| {
+                match load_hello(loader, authority, bootfs) {
+                    Ok(candidate) => {
+                        loaded = Some(candidate);
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
+            });
+        let loaded = match (mapped, loaded) {
+            (Ok(Ok(())), Some(loaded)) => loaded,
+            (Ok(Err(error)), _) => return Err(error),
+            (Err(error), Some(loaded)) => {
+                if let Err(cleanup) = cleanup_loaded_process(system, loader, loaded, true) {
+                    return Err(Init0Error::Cleanup(cleanup));
+                }
+                return Err(Init0Error::Native(error));
+            }
+            (Err(error), None) => return Err(Init0Error::Native(error)),
+            (Ok(Ok(())), None) => return Err(Init0Error::MissingLoadedProcess),
+        };
+        let supervision = supervise_child(
+            supervisor,
+            loaded.process,
+            loaded.launch_channel,
+            HELLO_TRANSACTION_ID,
+            deadline,
+        );
+        let loaded_cleanup = cleanup_loaded_process(system, loader, loaded, supervision.is_err());
+        if let Err(cleanup) = loaded_cleanup {
+            return Err(Init0Error::Cleanup(cleanup));
+        }
+        supervision.map_err(Init0Error::Supervision)?;
         Ok(message.transaction_id)
     })();
     let cleanup = close_received_handles(system, &handles[..counts.handles]);
     let transaction_id = operation?;
     cleanup?;
     send_ready(system, bootstrap_channel, transaction_id)
+}
+
+fn bootfs_mapping_plan<System: Init0System>(
+    system: &mut System,
+    bootfs: DwHandle,
+) -> Result<MappingPlan, Init0Error> {
+    system
+        .query_memory_object_size(bootfs)
+        .map_err(Init0Error::Native)
+        .and_then(|size| MappingPlan::for_bootfs(size).map_err(Init0Error::Mapping))
+}
+
+fn load_hello<Loader: LoaderPlatform<Error = NativeError>>(
+    loader: &mut Loader,
+    authority: LoadAuthority,
+    bytes: &[u8],
+) -> Result<LoadedProcess, Init0Error> {
+    let archive = Archive::new(bytes).map_err(Init0Error::Bootfs)?;
+    let entry = archive.lookup(HELLO_PATH).map_err(|error| match error {
+        LookupError::NotFound | LookupError::InvalidPath(_) => Init0Error::MissingHello,
+    })?;
+    if !entry.is_executable() || entry.data().is_empty() {
+        return Err(Init0Error::HelloNotExecutable);
+    }
+    let display_path = entry.name_utf8().map_err(|_| Init0Error::MissingHello)?;
+    load_process(
+        loader,
+        authority,
+        LoadRequest {
+            image: entry.data(),
+            display_path,
+            profile: LaunchProfile::Hello,
+            transaction_id: HELLO_TRANSACTION_ID,
+        },
+    )
+    .map_err(Init0Error::Loader)
+}
+
+fn cleanup_loaded_process<System: Init0System, Loader: LoaderPlatform<Error = NativeError>>(
+    system: &mut System,
+    loader: &mut Loader,
+    loaded: LoadedProcess,
+    terminate: bool,
+) -> Result<(), NativeError> {
+    let mut first_error = None;
+    if terminate && let Err(error) = loader.process_terminate(loaded.process) {
+        first_error = Some(error);
+    }
+    for handle in [loaded.launch_channel, loaded.process] {
+        if let Err(error) = system.close_handle(handle)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 fn init_capability<System: Init0System>(
