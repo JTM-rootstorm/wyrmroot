@@ -397,6 +397,8 @@ struct Supervisor {
     application_code: u32,
     ready_handle_count: usize,
     termination_query_error: bool,
+    exit_selected_first: bool,
+    malformed_ready_after_exit: bool,
     phase: usize,
 }
 
@@ -406,6 +408,8 @@ impl Supervisor {
             application_code: 0,
             ready_handle_count: 0,
             termination_query_error: false,
+            exit_selected_first: false,
+            malformed_ready_after_exit: false,
             phase: 0,
         }
     }
@@ -420,14 +424,21 @@ impl SupervisionPlatform for Supervisor {
         deadline: DwDeadline,
     ) -> Result<DwWaitResultV1, Self::Error> {
         assert_eq!(deadline, DEADLINE);
-        let observed = match self.phase {
-            0 => DW_SIGNAL_READABLE,
-            1 => DW_SIGNAL_EXITED,
-            2 => DW_SIGNAL_PEER_CLOSED,
-            _ => panic!("unexpected wait"),
+        let (observed, index, expected_items) = if self.exit_selected_first {
+            match self.phase {
+                0 => (DW_SIGNAL_EXITED, 1, 2),
+                1 => (DW_SIGNAL_READABLE, 0, 1),
+                _ => panic!("unexpected exit-first wait"),
+            }
+        } else {
+            match self.phase {
+                0 => (DW_SIGNAL_READABLE, 0, 2),
+                1 => (DW_SIGNAL_EXITED, 1, 2),
+                2 => (DW_SIGNAL_PEER_CLOSED, 0, 1),
+                _ => panic!("unexpected wait"),
+            }
         };
-        let index = if self.phase == 1 { 1 } else { 0 };
-        assert_eq!(items.len(), if self.phase == 2 { 1 } else { 2 });
+        assert_eq!(items.len(), expected_items);
         self.phase += 1;
         Ok(DwWaitResultV1 {
             size: DW_WAIT_RESULT_V1_SIZE,
@@ -444,9 +455,13 @@ impl SupervisionPlatform for Supervisor {
         bytes: &mut [u8],
         _: &mut [DwReceivedHandleInfoV1],
     ) -> Result<ReceiveCounts, Self::Error> {
-        let bytes = launch::encode_ready(2, bytes).unwrap();
+        if self.malformed_ready_after_exit {
+            bytes.fill(0);
+        } else {
+            launch::encode_ready(2, bytes).unwrap();
+        }
         Ok(ReceiveCounts {
-            bytes,
+            bytes: bytes.len(),
             handles: self.ready_handle_count,
         })
     }
@@ -588,6 +603,36 @@ fn init0_closes_post_ready_exited_hello_when_termination_query_fails() {
         fixture.closed,
         [CHILD_CHANNEL, CHILD_PROCESS, ROOT, BOOTFS, TASK_GROUP]
     );
+}
+
+#[test]
+fn init0_closes_exit_observed_malformed_terminal_ready_without_retermination() {
+    let mut fixture = Fixture::valid();
+    let mut loader = Loader::new();
+    let mut supervisor = Supervisor::successful();
+    supervisor.exit_selected_first = true;
+    supervisor.malformed_ready_after_exit = true;
+
+    assert_eq!(
+        run_init0(
+            &mut fixture,
+            &mut loader,
+            &mut supervisor,
+            CHANNEL,
+            DEADLINE
+        ),
+        Err(Init0Error::Supervision(
+            wyrmroot_runtime::SupervisionError::ExitObservedReadiness(
+                wyrmroot_runtime::ExitObservedReadinessError::Ready(LaunchError::BadMagic)
+            )
+        ))
+    );
+    assert!(loader.terminated.is_empty());
+    assert_eq!(
+        fixture.closed,
+        [CHILD_CHANNEL, CHILD_PROCESS, ROOT, BOOTFS, TASK_GROUP]
+    );
+    assert!(fixture.sent.is_empty());
 }
 
 #[test]

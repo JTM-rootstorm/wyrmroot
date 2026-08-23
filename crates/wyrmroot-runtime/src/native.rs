@@ -227,6 +227,42 @@ pub fn map_bootfs_read_only(
     bootfs: DwHandle,
     plan: MappingPlan,
 ) -> Result<MappedBootfs, NativeError> {
+    map_bootfs_read_only_with(
+        root_region,
+        bootfs,
+        plan,
+        |arguments, address| {
+            require_success(deepwyrm_syscall::address_region_map(
+                root_region,
+                bootfs,
+                arguments,
+                address,
+            ))
+        },
+        |region, address, bytes| {
+            require_success(deepwyrm_syscall::address_region_unmap(
+                region, address, bytes,
+            ))
+        },
+    )
+}
+
+/// Performs the checked bootfs map transaction with an injected syscall boundary.
+///
+/// Keeping the mapping and compensating-unmap boundary explicit makes the failure path testable:
+/// a successful map may still return an unusable address, but its exact page extent is then known
+/// and must not be leaked when it is safe to name to the kernel.
+fn map_bootfs_read_only_with<Map, Unmap>(
+    root_region: DwHandle,
+    _bootfs: DwHandle,
+    plan: MappingPlan,
+    map: Map,
+    mut unmap: Unmap,
+) -> Result<MappedBootfs, NativeError>
+where
+    Map: FnOnce(&DwAddressRegionMapArgsV1, &mut DwUserAddress) -> Result<(), NativeError>,
+    Unmap: FnMut(DwHandle, DwUserAddress, DwSize) -> Result<(), NativeError>,
+{
     let arguments = DwAddressRegionMapArgsV1 {
         size: DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE,
         version: DW_ADDRESS_REGION_MAP_ARGS_V1_VERSION,
@@ -238,13 +274,16 @@ pub fn map_bootfs_read_only(
         reserved: [0; 4],
     };
     let mut address = DwUserAddress(0);
-    require_success(deepwyrm_syscall::address_region_map(
-        root_region,
-        bootfs,
-        &arguments,
-        &mut address,
-    ))?;
-    validate_mapped_range(address, plan.mapped_size())?;
+    map(&arguments, &mut address)?;
+    if let Err(error) = validate_mapped_range(address, plan.mapped_size()) {
+        // A successful map has created a kernel-owned mapping even when its returned address is
+        // invalid as a Wyrmroot user pointer.  Do not attempt cleanup for zero or unaligned
+        // garbage, but best-effort unmap the exact known extent when the output is nameable.
+        if address.0 != 0 && address.0.is_multiple_of(crate::PAGE_SIZE) {
+            let _ = unmap(root_region, address, DwSize(plan.mapped_size()));
+        }
+        return Err(error);
+    }
     Ok(MappedBootfs {
         root_region,
         address,
@@ -571,5 +610,66 @@ mod tests {
             bytes.len()
         });
         assert_eq!(observed, 17);
+    }
+
+    #[test]
+    fn malformed_successful_bootfs_map_unmaps_the_exact_known_extent() {
+        let plan = MappingPlan::for_bootfs(17).unwrap();
+        let map_call = core::cell::Cell::new(None);
+        let unmap_call = core::cell::Cell::new(None);
+        let result = map_bootfs_read_only_with(
+            DwHandle(41),
+            DwHandle(42),
+            plan,
+            |arguments, address| {
+                map_call.set(Some((DwHandle(41), DwUserAddress(0), arguments.byte_len)));
+                *address = DwUserAddress(X86_64_USER_END_EXCLUSIVE);
+                Ok(())
+            },
+            |root, address, bytes| {
+                unmap_call.set(Some((root, address, bytes)));
+                Ok(())
+            },
+        );
+        assert_eq!(
+            result,
+            Err(NativeError::Output(NativeOutputError::InvalidMappedRange))
+        );
+        assert_eq!(
+            map_call.get(),
+            Some((DwHandle(41), DwUserAddress(0), DwSize(4096)))
+        );
+        assert_eq!(
+            unmap_call.get(),
+            Some((
+                DwHandle(41),
+                DwUserAddress(X86_64_USER_END_EXCLUSIVE),
+                DwSize(4096)
+            ))
+        );
+    }
+
+    #[test]
+    fn malformed_unaligned_bootfs_map_output_is_not_used_for_cleanup() {
+        let plan = MappingPlan::for_bootfs(17).unwrap();
+        let mut unmapped = false;
+        let result = map_bootfs_read_only_with(
+            DwHandle(41),
+            DwHandle(42),
+            plan,
+            |_arguments, address| {
+                *address = DwUserAddress(0x4001);
+                Ok(())
+            },
+            |_root, _address, _bytes| {
+                unmapped = true;
+                Ok(())
+            },
+        );
+        assert_eq!(
+            result,
+            Err(NativeError::Output(NativeOutputError::InvalidMappedRange))
+        );
+        assert!(!unmapped);
     }
 }

@@ -68,20 +68,7 @@ impl LoaderPlatform for NativeLoaderPlatform {
         };
         let mut result = DwProcessCreateResultV1::default();
         success(deepwyrm_syscall::process_create(&args, &mut result))?;
-        if result.size != DW_PROCESS_CREATE_RESULT_V1_SIZE
-            || result.version != 1
-            || result.process.0 == 0
-            || result.root_address_region.0 == 0
-            || result.child_bootstrap_handle.0 == 0
-            || result.reserved != [0; 4]
-        {
-            return Err(NativeError::Output(NativeOutputError::InvalidLoaderOutput));
-        }
-        Ok(ProcessCreateResult {
-            process: result.process,
-            root: result.root_address_region,
-            child_bootstrap: result.child_bootstrap_handle,
-        })
+        validate_process_create_result(&result)
     }
 
     fn memory_create(&mut self, bytes: u64, rights: DwRights) -> Result<DwHandle, Self::Error> {
@@ -286,5 +273,61 @@ fn nonzero(handle: DwHandle) -> Result<DwHandle, NativeError> {
         Err(NativeError::Output(NativeOutputError::InvalidLoaderOutput))
     } else {
         Ok(handle)
+    }
+}
+
+fn validate_process_create_result(
+    result: &DwProcessCreateResultV1,
+) -> Result<ProcessCreateResult, NativeError> {
+    if result.size != DW_PROCESS_CREATE_RESULT_V1_SIZE
+        || result.version != 1
+        || result.process.0 == 0
+        || result.root_address_region.0 == 0
+        || result.child_bootstrap_handle.0 == 0
+        // Process and root-region handles name distinct kernel object kinds.  Equal nonzero
+        // values cannot be a valid successful create result.  The bootstrap endpoint is a
+        // separate channel handle and deliberately has no numeric inequality requirement.
+        || result.process == result.root_address_region
+        || result.reserved != [0; 4]
+    {
+        return Err(NativeError::Output(NativeOutputError::InvalidLoaderOutput));
+    }
+    Ok(ProcessCreateResult {
+        process: result.process,
+        root: result.root_address_region,
+        child_bootstrap: result.child_bootstrap_handle,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_process_create_result() -> DwProcessCreateResultV1 {
+        DwProcessCreateResultV1 {
+            size: DW_PROCESS_CREATE_RESULT_V1_SIZE,
+            version: 1,
+            process: DwHandle(11),
+            root_address_region: DwHandle(12),
+            child_bootstrap_handle: DwHandle(13),
+            ..DwProcessCreateResultV1::default()
+        }
+    }
+
+    #[test]
+    fn rejects_nonzero_process_root_alias_without_rejecting_bootstrap_number_reuse() {
+        let mut impossible = valid_process_create_result();
+        impossible.root_address_region = impossible.process;
+        assert!(matches!(
+            validate_process_create_result(&impossible),
+            Err(NativeError::Output(NativeOutputError::InvalidLoaderOutput))
+        ));
+
+        let mut valid = valid_process_create_result();
+        valid.child_bootstrap_handle = valid.process;
+        let validated = validate_process_create_result(&valid).unwrap();
+        assert_eq!(validated.process, DwHandle(11));
+        assert_eq!(validated.root, DwHandle(12));
+        assert_eq!(validated.child_bootstrap, DwHandle(11));
     }
 }

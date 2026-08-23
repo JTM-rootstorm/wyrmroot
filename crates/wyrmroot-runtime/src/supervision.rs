@@ -140,6 +140,26 @@ pub enum SupervisionError<PlatformError> {
     DuplicateReady,
     /// The signaled Process did not report the exact normal zero exit record.
     Exit(ExitValidationError),
+    /// A launch-channel validation failure occurred after Process `EXITED` was observed.
+    ///
+    /// The nested classification preserves the protocol failure while telling cleanup that the
+    /// Process must not be terminated again.
+    ExitObservedReadiness(ExitObservedReadinessError<PlatformError>),
+}
+
+/// A readiness failure encountered while draining the terminal launch-channel state.
+#[derive(Debug, Eq, PartialEq)]
+pub enum ExitObservedReadinessError<PlatformError> {
+    /// The terminal channel wait failed after Process `EXITED` was observed.
+    Platform(PlatformError),
+    /// A terminal channel wait result did not select its requested signal.
+    InvalidWaitResult,
+    /// The queued terminal datagram was not one handle-free READY message.
+    InvalidReadyReceive(ReceiveCounts),
+    /// The queued terminal READY was malformed or named the wrong transaction.
+    Ready(LaunchError),
+    /// More than one launch-channel datagram was queued before terminal close.
+    DuplicateReady,
 }
 
 impl<PlatformError> SupervisionError<PlatformError> {
@@ -153,7 +173,10 @@ impl<PlatformError> SupervisionError<PlatformError> {
     pub const fn process_exit_observed(&self) -> bool {
         matches!(
             self,
-            Self::ExitedBeforeReady | Self::ExitQuery(_) | Self::Exit(_)
+            Self::ExitedBeforeReady
+                | Self::ExitQuery(_)
+                | Self::Exit(_)
+                | Self::ExitObservedReadiness(_)
         )
     }
 }
@@ -240,37 +263,88 @@ pub fn supervise_child<P: SupervisionPlatform>(
         if index != 0 && !(monitor_channel && index == 1) {
             return Err(SupervisionError::InvalidWaitResult);
         }
-        if !ready {
-            let info = platform
-                .query_task_termination(process)
-                .map_err(SupervisionError::ExitQuery)?;
-            return match validate_successful_exit(&info) {
-                Ok(()) => Err(SupervisionError::ExitedBeforeReady),
-                Err(error) => Err(SupervisionError::Exit(error)),
-            };
-        }
-        if monitor_channel {
-            // Deepwyrm publishes Process EXITED wait readiness only after the
-            // terminal handle drain has closed the child endpoint. Recheck the
-            // now-level-triggered peer state so a second datagram queued in the
-            // same exit race cannot be mistaken for a clean one-READY launch.
-            let result = platform
-                .wait_many(core::slice::from_ref(&channel_item), deadline)
-                .map_err(SupervisionError::Platform)?;
-            if result.index != 0 || result.observed.0 & CHANNEL_SIGNALS.0 == 0 {
-                return Err(SupervisionError::InvalidWaitResult);
-            }
-            if result.observed.0 & DW_SIGNAL_READABLE.0 != 0 {
-                return Err(SupervisionError::DuplicateReady);
-            }
-            if result.observed.0 & DW_SIGNAL_PEER_CLOSED.0 == 0 {
-                return Err(SupervisionError::InvalidWaitResult);
-            }
-        }
         let info = platform
             .query_task_termination(process)
             .map_err(SupervisionError::ExitQuery)?;
-        return validate_successful_exit(&info).map_err(SupervisionError::Exit);
+        validate_successful_exit(&info).map_err(SupervisionError::Exit)?;
+        if !monitor_channel {
+            return Ok(());
+        }
+
+        // WAIT_ANY may select the Process even when a READY is already queued on the Channel.
+        // Once EXITED is observed, Deepwyrm's terminal endpoint drain makes this one-handle wait
+        // immediately resolve to READABLE and/or PEER_CLOSED.  Consume and validate every queued
+        // protocol message before deciding that READY was missing, preserving the EXITED fact for
+        // caller cleanup on every failure below.
+        return drain_terminal_launch_channel(
+            platform,
+            launch_channel,
+            transaction_id,
+            ready,
+            deadline,
+        );
+    }
+}
+
+fn drain_terminal_launch_channel<P: SupervisionPlatform>(
+    platform: &mut P,
+    launch_channel: DwHandle,
+    transaction_id: u64,
+    mut ready: bool,
+    deadline: DwDeadline,
+) -> Result<(), SupervisionError<P::Error>> {
+    let channel_item = DwWaitItemV1 {
+        handle: launch_channel,
+        signals: CHANNEL_SIGNALS,
+    };
+    loop {
+        let result = platform
+            .wait_many(core::slice::from_ref(&channel_item), deadline)
+            .map_err(|error| {
+                SupervisionError::ExitObservedReadiness(ExitObservedReadinessError::Platform(error))
+            })?;
+        if result.index != 0 || result.observed.0 & CHANNEL_SIGNALS.0 == 0 {
+            return Err(SupervisionError::ExitObservedReadiness(
+                ExitObservedReadinessError::InvalidWaitResult,
+            ));
+        }
+        if result.observed.0 & DW_SIGNAL_READABLE.0 != 0 {
+            let mut bytes = [0_u8; HEADER_BYTES];
+            let mut handles = [];
+            let counts = platform
+                .receive_channel(launch_channel, &mut bytes, &mut handles)
+                .map_err(|error| {
+                    SupervisionError::ExitObservedReadiness(ExitObservedReadinessError::Platform(
+                        error,
+                    ))
+                })?;
+            if counts
+                != (ReceiveCounts {
+                    bytes: HEADER_BYTES,
+                    handles: 0,
+                })
+            {
+                return Err(SupervisionError::ExitObservedReadiness(
+                    ExitObservedReadinessError::InvalidReadyReceive(counts),
+                ));
+            }
+            if ready {
+                return Err(SupervisionError::ExitObservedReadiness(
+                    ExitObservedReadinessError::DuplicateReady,
+                ));
+            }
+            launch::parse_ready(&bytes, transaction_id).map_err(|error| {
+                SupervisionError::ExitObservedReadiness(ExitObservedReadinessError::Ready(error))
+            })?;
+            ready = true;
+        }
+        if result.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 {
+            return if ready {
+                Ok(())
+            } else {
+                Err(SupervisionError::ExitedBeforeReady)
+            };
+        }
     }
 }
 
@@ -300,11 +374,19 @@ mod tests {
         ProcessExited,
     }
 
+    #[derive(Clone, Copy)]
+    enum ReadyPayload {
+        Valid,
+        Malformed,
+        WrongTransaction,
+    }
+
     struct Mock {
         waits: &'static [WaitEvent],
         wait_index: usize,
         received: usize,
         counts: ReceiveCounts,
+        payloads: &'static [ReadyPayload],
         task_info: DwTaskTerminationInfoV1,
         query_fails: bool,
     }
@@ -319,6 +401,7 @@ mod tests {
                     bytes: HEADER_BYTES,
                     handles: 0,
                 },
+                payloads: VALID_PAYLOADS,
                 task_info: successful_exit_info(),
                 query_fails: false,
             }
@@ -358,8 +441,19 @@ mod tests {
             bytes: &mut [u8],
             _handles: &mut [DwReceivedHandleInfoV1],
         ) -> Result<ReceiveCounts, Self::Error> {
+            let payload = self.payloads[self.received];
             self.received += 1;
-            launch::encode_ready(7, bytes).unwrap();
+            match payload {
+                ReadyPayload::Valid => {
+                    launch::encode_ready(7, bytes).unwrap();
+                }
+                ReadyPayload::Malformed => {
+                    bytes.fill(0);
+                }
+                ReadyPayload::WrongTransaction => {
+                    launch::encode_ready(8, bytes).unwrap();
+                }
+            }
             Ok(self.counts)
         }
 
@@ -386,7 +480,15 @@ mod tests {
 
     const READY: WaitEvent = WaitEvent::Channel(DW_SIGNAL_READABLE);
     const CLOSED: WaitEvent = WaitEvent::Channel(DW_SIGNAL_PEER_CLOSED);
+    const READY_AND_CLOSED: WaitEvent = WaitEvent::Channel(deepwyrm_syscall::DwSignals(
+        DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0,
+    ));
     const EXITED: WaitEvent = WaitEvent::ProcessExited;
+    const VALID_PAYLOADS: &[ReadyPayload] = &[
+        ReadyPayload::Valid,
+        ReadyPayload::Valid,
+        ReadyPayload::Valid,
+    ];
 
     #[test]
     fn accepts_one_ready_then_a_fresh_normal_zero_exit() {
@@ -399,13 +501,74 @@ mod tests {
     }
 
     #[test]
+    fn accepts_queued_ready_when_wait_any_selects_exit_first() {
+        let mut mock = Mock::successful(&[EXITED, READY, CLOSED]);
+        assert_eq!(
+            supervise_child(&mut mock, DwHandle(1), DwHandle(2), 7, DwDeadline(99)),
+            Ok(())
+        );
+        assert_eq!(mock.received, 1);
+    }
+
+    #[test]
+    fn accepts_queued_ready_when_exit_first_terminal_channel_is_readable_and_closed() {
+        let mut mock = Mock::successful(&[EXITED, READY_AND_CLOSED]);
+        assert_eq!(
+            supervise_child(&mut mock, DwHandle(1), DwHandle(2), 7, DwDeadline(99)),
+            Ok(())
+        );
+        assert_eq!(mock.received, 1);
+    }
+
+    #[test]
     fn rejects_exit_before_ready() {
-        let mut mock = Mock::successful(&[EXITED]);
+        let mut mock = Mock::successful(&[EXITED, CLOSED]);
         assert_eq!(
             supervise_child(&mut mock, DwHandle(1), DwHandle(2), 7, DwDeadline(99)),
             Err(SupervisionError::ExitedBeforeReady)
         );
         assert!(SupervisionError::<()>::ExitedBeforeReady.process_exit_observed());
+    }
+
+    #[test]
+    fn preserves_exit_observation_for_malformed_ready_queued_after_exit() {
+        let mut mock = Mock::successful(&[EXITED, READY]);
+        mock.payloads = &[ReadyPayload::Malformed];
+        let error = supervise_child(&mut mock, DwHandle(1), DwHandle(2), 7, DwDeadline(99));
+        assert_eq!(
+            error,
+            Err(SupervisionError::ExitObservedReadiness(
+                ExitObservedReadinessError::Ready(LaunchError::BadMagic)
+            ))
+        );
+        assert!(error.unwrap_err().process_exit_observed());
+    }
+
+    #[test]
+    fn preserves_exit_observation_for_wrong_transaction_ready_after_exit() {
+        let mut mock = Mock::successful(&[EXITED, READY]);
+        mock.payloads = &[ReadyPayload::WrongTransaction];
+        let error = supervise_child(&mut mock, DwHandle(1), DwHandle(2), 7, DwDeadline(99));
+        assert_eq!(
+            error,
+            Err(SupervisionError::ExitObservedReadiness(
+                ExitObservedReadinessError::Ready(LaunchError::TransactionMismatch)
+            ))
+        );
+        assert!(error.unwrap_err().process_exit_observed());
+    }
+
+    #[test]
+    fn rejects_duplicate_ready_queued_after_exit_without_retermination() {
+        let mut mock = Mock::successful(&[EXITED, READY, READY]);
+        let error = supervise_child(&mut mock, DwHandle(1), DwHandle(2), 7, DwDeadline(99));
+        assert_eq!(
+            error,
+            Err(SupervisionError::ExitObservedReadiness(
+                ExitObservedReadinessError::DuplicateReady
+            ))
+        );
+        assert!(error.unwrap_err().process_exit_observed());
     }
 
     #[test]
@@ -470,7 +633,9 @@ mod tests {
         let mut mock = Mock::successful(&[READY, EXITED, READY]);
         assert_eq!(
             supervise_child(&mut mock, DwHandle(1), DwHandle(2), 7, DwDeadline(99)),
-            Err(SupervisionError::DuplicateReady)
+            Err(SupervisionError::ExitObservedReadiness(
+                ExitObservedReadinessError::DuplicateReady
+            ))
         );
     }
 

@@ -46,8 +46,8 @@ pub use startup::{
     StartupBlock, StartupError, StartupRegisters, StartupString, with_native_startup,
 };
 pub use supervision::{
-    ExitValidationError, NativeSupervisionPlatform, SupervisionError, SupervisionPlatform,
-    supervise_child, supervise_native_child, validate_successful_exit,
+    ExitObservedReadinessError, ExitValidationError, NativeSupervisionPlatform, SupervisionError,
+    SupervisionPlatform, supervise_child, supervise_native_child, validate_successful_exit,
 };
 #[cfg(feature = "primordial-test-support")]
 pub use test_support::{
