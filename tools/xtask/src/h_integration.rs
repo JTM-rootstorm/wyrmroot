@@ -12,10 +12,7 @@ use wyrmroot_bootfs::builder::{Builder, FileMode};
 
 use crate::cli::{G3ImageArguments, HProfile};
 use crate::error::Failure;
-use crate::h_request::{
-    self, EvidenceRequest, ExpectedOutcome, HRequest, I1_EVIDENCE_PROTOCOL,
-    I1_REQUIRED_EVIDENCE_MASK,
-};
+use crate::h_request::{self, EvidenceRequest, ExpectedOutcome, HRequest, I1_EVIDENCE_PROTOCOL};
 use crate::sha256;
 
 const MAX_GUEST_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
@@ -24,6 +21,14 @@ const MAX_SERIAL_BYTES: u64 = 16 * 1024 * 1024;
 const COMPLETION_RECORD_BYTES: usize = 38;
 const EVIDENCE_RECORD_BYTES: usize = 85;
 const MAX_EVIDENCE_RECORDS: usize = 64;
+const PROOF_CPU_ONLINE: u32 = 1 << 0;
+const PROOF_CPL3_SYSCALL: u32 = 1 << 1;
+const PROOF_BLOCKED_DESCENDANT: u32 = 1 << 2;
+const PROOF_RUNNING_INVARIANT: u32 = 1 << 3;
+const PROOF_REMOTE_WAKE: u32 = 1 << 4;
+const PROOF_CHILD_CLEANUP: u32 = 1 << 5;
+const PROOF_TLB_ACK: u32 = 1 << 6;
+const PROOF_RENDEZVOUS_RECLAIM: u32 = 1 << 7;
 const DEFAULT_MEMORY_MIB: u32 = 1024;
 const SMP_MEMORY_MIB: u32 = 2048;
 
@@ -208,6 +213,7 @@ pub(crate) fn inspect(request_path: &str) -> Result<String, Failure> {
 
 pub(crate) fn run(profile: HProfile, request_path: &str) -> Result<String, Failure> {
     let request = h_request::load(Path::new(request_path))?;
+    validate_execution_profile(&request, Some(profile))?;
     verify_source_revisions(&request)?;
     let artifacts = verify_candidate_inputs(&request)?;
     inspect_loaded(&request, &artifacts)?;
@@ -216,6 +222,7 @@ pub(crate) fn run(profile: HProfile, request_path: &str) -> Result<String, Failu
 
 pub(crate) fn gdb(profile: HProfile, request_path: &str) -> Result<String, Failure> {
     let request = h_request::load(Path::new(request_path))?;
+    validate_execution_profile(&request, Some(profile))?;
     verify_source_revisions(&request)?;
     let artifacts = verify_candidate_inputs(&request)?;
     inspect_loaded(&request, &artifacts)?;
@@ -227,6 +234,7 @@ pub(crate) fn integration(
     request_path: &str,
 ) -> Result<String, Failure> {
     let request = h_request::load(Path::new(request_path))?;
+    validate_execution_profile(&request, profile)?;
     verify_source_revisions(&request)?;
     let artifacts = verify_candidate_inputs(&request)?;
     if outputs_all_absent(&request)? {
@@ -263,6 +271,18 @@ pub(crate) fn integration(
             join_profile_results(&inspection, default, smp)
         }
     }
+}
+
+fn validate_execution_profile(
+    request: &HRequest,
+    profile: Option<HProfile>,
+) -> Result<(), Failure> {
+    if request.schema_version == 3 && profile != Some(HProfile::Smp) {
+        return Err(Failure::task(
+            "WYR0-H schema_version = 3 execution requires an explicit smp profile",
+        ));
+    }
+    Ok(())
 }
 
 fn join_profile_results(
@@ -823,8 +843,7 @@ fn execute(
                 .map_or_else(|| "signal".to_owned(), |code| code.to_string())
         )));
     }
-    let expectation_matched = record.outcome.matches(request.expected_outcome)
-        && record.detail == request.expected_detail;
+    let expectation_matched = guest_expectation_matches(request, record);
     let status_name = if expectation_matched { "PASS" } else { "FAIL" };
     if status_name == "PASS" {
         revalidate_before_pass(request, artifacts, &pre_execution_manifest)?;
@@ -881,6 +900,16 @@ fn execute(
         )));
     }
     Ok(result)
+}
+
+fn guest_expectation_matches(request: &HRequest, record: GuestRecord) -> bool {
+    if request.schema_version == 3 {
+        return request.expected_outcome == ExpectedOutcome::Pass
+            && request.expected_detail == 0
+            && record.outcome == GuestOutcome::Pass
+            && record.detail == 0;
+    }
+    record.outcome.matches(request.expected_outcome) && record.detail == request.expected_detail
 }
 
 fn evidence_result_fields(
@@ -1124,7 +1153,7 @@ fn parse_evidence_transcript(
     let mut events = Vec::new();
     for (index, line) in bytes.split_inclusive(|byte| *byte == b'\n').enumerate() {
         let line_number = index + 1;
-        if line.len() >= 7 && line[..7].eq_ignore_ascii_case(b"DWEVID1") {
+        if resembles_protocol_magic(line, b"DWEVID1") {
             if terminal.is_some() {
                 return Err(Failure::task(format!(
                     "serial line {line_number} contains DWEVID1 evidence after the terminal record"
@@ -1146,7 +1175,7 @@ fn parse_evidence_transcript(
             events.push(event);
             continue;
         }
-        if line.starts_with(b"DWTEST1|") {
+        if resembles_protocol_magic(line, b"DWTEST1") {
             let record = parse_terminal_line(line, line_number, expected_test_id)?;
             if terminal.replace(record).is_some() {
                 return Err(Failure::task(
@@ -1169,12 +1198,18 @@ fn parse_evidence_transcript(
     })
 }
 
+fn resembles_protocol_magic(line: &[u8], magic: &[u8]) -> bool {
+    line.get(..magic.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(magic))
+}
+
 fn parse_terminal_line(
     line: &[u8],
     line_number: usize,
     expected_test_id: u32,
 ) -> Result<GuestRecord, Failure> {
     if line.len() != COMPLETION_RECORD_BYTES
+        || &line[..7] != b"DWTEST1"
         || line[7] != b'|'
         || line[10] != b'|'
         || line[19] != b'|'
@@ -1352,6 +1387,7 @@ fn validate_evidence(
     events: &[EvidenceEvent],
     required_evidence_mask: u32,
 ) -> Result<ValidatedEvidence, Failure> {
+    let mut observed_mask = 0_u32;
     let mut cpu_online = Vec::new();
     let mut cpl3_syscall = Vec::new();
     let mut parent_blocked = Vec::new();
@@ -1418,6 +1454,19 @@ fn validate_evidence(
             "I1 evidence does not contain CPU_ONLINE for every CPU 0..3",
         ));
     }
+    let last_online_sequence = cpu_online
+        .iter()
+        .map(|event| event.sequence)
+        .max()
+        .ok_or_else(|| Failure::task("I1 evidence contains no CPU_ONLINE record"))?;
+    if events.iter().any(|event| {
+        event.kind != EvidenceKind::CpuOnline && event.sequence <= last_online_sequence
+    }) {
+        return Err(Failure::task(
+            "I1 CPU_ONLINE records must precede every participation and activity event",
+        ));
+    }
+    observed_mask |= PROOF_CPU_ONLINE;
 
     let cpl3_cpus = cpl3_syscall
         .iter()
@@ -1428,6 +1477,16 @@ fn validate_evidence(
             "I1 evidence requires CPL3_SYSCALL on at least two distinct CPUs",
         ));
     }
+    let cpl3_tokens = cpl3_syscall
+        .iter()
+        .map(|event| event.token)
+        .collect::<BTreeSet<_>>();
+    if cpl3_tokens.contains(&0) || cpl3_tokens.len() < 2 {
+        return Err(Failure::task(
+            "I1 evidence requires CPL3_SYSCALL with two distinct nonzero execution tokens",
+        ));
+    }
+    observed_mask |= PROOF_CPL3_SYSCALL;
 
     let blocked = exactly_one(&parent_blocked, "PARENT_BLOCKED")?;
     let descendant = exactly_one(&descendant_running, "DESCENDANT_RUNNING")?;
@@ -1440,6 +1499,7 @@ fn validate_evidence(
             "I1 parent/descendant evidence has an invalid token, order, or CPU join",
         ));
     }
+    observed_mask |= PROOF_BLOCKED_DESCENDANT;
 
     let invariant = exactly_one(&running_invariant, "RUNNING_INVARIANT")?;
     if invariant.token != 0 || invariant.cpu != 0 || invariant.arg0 != 0 {
@@ -1447,6 +1507,12 @@ fn validate_evidence(
             "I1 RUNNING_INVARIANT must report zero token, CPU, and violation count",
         ));
     }
+    if events.last().map(|event| event.sequence) != Some(invariant.sequence) {
+        return Err(Failure::task(
+            "I1 RUNNING_INVARIANT must be the final evidence event after all scheduler and lifecycle activity",
+        ));
+    }
+    observed_mask |= PROOF_RUNNING_INVARIANT;
 
     let sent = exactly_one(&wake_sent, "WAKE_SENT")?;
     let observed = exactly_one(&wake_observed, "WAKE_OBSERVED")?;
@@ -1461,6 +1527,7 @@ fn validate_evidence(
             "I1 wake evidence has an invalid token, order, CPU, target, or source join",
         ));
     }
+    observed_mask |= PROOF_REMOTE_WAKE;
 
     let exited = exactly_one(&child_exit, "CHILD_EXIT")?;
     let cleanup = exactly_one(&child_cleanup, "CHILD_CLEANUP")?;
@@ -1473,13 +1540,14 @@ fn validate_evidence(
             "I1 child exit/cleanup evidence has an invalid token, order, or CPU join",
         ));
     }
+    observed_mask |= PROOF_CHILD_CLEANUP;
 
     let publish = exactly_one(&tlb_publish, "TLB_PUBLISH")?;
     let reclaim = exactly_one(&reclaim_allowed, "RECLAIM_ALLOWED")?;
     let required_cpu_mask = publish.arg0;
-    if publish.token == 0 || required_cpu_mask == 0 || required_cpu_mask & !0x0F != 0 {
+    if publish.token == 0 || required_cpu_mask != 0x0F {
         return Err(Failure::task(
-            "I1 TLB_PUBLISH requires a nonzero generation and a nonzero four-CPU mask",
+            "I1 TLB_PUBLISH requires a nonzero generation and exact CPU mask 0000000F",
         ));
     }
     if reclaim.token != publish.token || reclaim.sequence <= publish.sequence {
@@ -1500,12 +1568,18 @@ fn validate_evidence(
             "I1 RECLAIM_ALLOWED masks do not exactly match the observed acknowledgement masks",
         ));
     }
-
-    let observed_mask = I1_REQUIRED_EVIDENCE_MASK;
-    if observed_mask & required_evidence_mask != required_evidence_mask {
+    if reclaim.arg0 != 0x0F || reclaim.arg1 != 0x0F {
         return Err(Failure::task(
-            "I1 transcript does not cover the request's required evidence mask",
+            "I1 RECLAIM_ALLOWED requires exact TLB and rendezvous masks 0000000F",
         ));
+    }
+    observed_mask |= PROOF_TLB_ACK;
+    observed_mask |= PROOF_RENDEZVOUS_RECLAIM;
+
+    if observed_mask != required_evidence_mask {
+        return Err(Failure::task(format!(
+            "I1 transcript proof mask {observed_mask:08X} does not exactly match request {required_evidence_mask:08X}"
+        )));
     }
     Ok(ValidatedEvidence {
         count: events.len() as u32,
@@ -1884,7 +1958,6 @@ mod tests {
             event(0x02, 2, 2, 0, 0),
             event(0x03, 0, 0x100, 0, 0),
             event(0x04, 1, 0x100, 0, 0),
-            event(0x05, 0, 0, 0, 0),
             event(0x06, 1, 0x200, 3, 0),
             event(0x07, 3, 0x200, 1, 0),
             event(0x08, 2, 0x300, 0, 0),
@@ -1899,6 +1972,7 @@ mod tests {
             event(0x0C, 2, 0x400, 0x0F, 0),
             event(0x0C, 3, 0x400, 0x0F, 0),
             event(0x0D, 0, 0x400, 0x0F, 0x0F),
+            event(0x05, 0, 0, 0, 0),
         ]
     }
 
@@ -1961,7 +2035,7 @@ mod tests {
             run_directory: root.join("runs"),
             evidence: Some(EvidenceRequest {
                 nonce: TEST_EVIDENCE_NONCE,
-                required_mask: I1_REQUIRED_EVIDENCE_MASK,
+                required_mask: h_request::I1_REQUIRED_EVIDENCE_MASK,
             }),
         }
     }
@@ -1972,6 +2046,25 @@ mod tests {
         assert_eq!(HProfile::Smp.vcpus(), 4);
         assert_eq!(HProfile::Default.memory_mib(), 1024);
         assert_eq!(HProfile::Smp.memory_mib(), 2048);
+    }
+
+    #[test]
+    fn schema_three_execution_requires_an_explicit_smp_profile() {
+        let request = i1_request();
+        assert!(validate_execution_profile(&request, Some(HProfile::Smp)).is_ok());
+        assert!(validate_execution_profile(&request, Some(HProfile::Default)).is_err());
+        assert!(validate_execution_profile(&request, None).is_err());
+
+        let schema_two = HRequest {
+            schema_version: 2,
+            selector: "primordial-bootstrap".into(),
+            test_id: 18,
+            evidence: None,
+            ..request
+        };
+        assert!(validate_execution_profile(&schema_two, Some(HProfile::Smp)).is_ok());
+        assert!(validate_execution_profile(&schema_two, Some(HProfile::Default)).is_ok());
+        assert!(validate_execution_profile(&schema_two, None).is_ok());
     }
 
     #[test]
@@ -2106,6 +2199,19 @@ mod tests {
         lowercase_extra[0] = b'd';
         lowercase_extra.extend_from_slice(&valid);
         cases.push(("lowercase protocol before valid evidence", lowercase_extra));
+        let mut lowercase_terminal = terminal("01", 23, 0);
+        lowercase_terminal[..7].make_ascii_lowercase();
+        lowercase_terminal.extend_from_slice(&valid);
+        cases.push((
+            "lowercase terminal before valid transcript",
+            lowercase_terminal,
+        ));
+        let mut terminal_magic_diagnostic = b"DWTEST1 diagnostic decoy\n".to_vec();
+        terminal_magic_diagnostic.extend_from_slice(&valid);
+        cases.push(("terminal magic diagnostic decoy", terminal_magic_diagnostic));
+        let mut evidence_magic_diagnostic = b"dwevid1 diagnostic decoy\n".to_vec();
+        evidence_magic_diagnostic.extend_from_slice(&valid);
+        cases.push(("evidence magic diagnostic decoy", evidence_magic_diagnostic));
         cases.push((
             "unknown kind",
             mutate_evidence_line(&valid, 0, |line| {
@@ -2164,6 +2270,18 @@ mod tests {
         one_cpl3_cpu[5].cpu = 0;
         cases.push(("one CPL3 CPU", one_cpl3_cpu));
 
+        let mut duplicate_cpl3_token = valid_evidence_specs();
+        duplicate_cpl3_token[5].token = duplicate_cpl3_token[4].token;
+        cases.push(("duplicate CPL3 token", duplicate_cpl3_token));
+
+        let mut zero_cpl3_token = valid_evidence_specs();
+        zero_cpl3_token[4].token = 0;
+        cases.push(("zero CPL3 token", zero_cpl3_token));
+
+        let mut activity_before_online = valid_evidence_specs();
+        activity_before_online.swap(3, 4);
+        cases.push(("activity before CPU online", activity_before_online));
+
         let mut blocked_after_descendant = valid_evidence_specs();
         blocked_after_descendant.swap(6, 7);
         cases.push(("parent order", blocked_after_descendant));
@@ -2174,60 +2292,84 @@ mod tests {
         cases.push(("zero parent token", zero_block_token));
 
         let mut invariant_violation = valid_evidence_specs();
-        invariant_violation[8].arg0 = 1;
+        invariant_violation[22].arg0 = 1;
         cases.push(("running violation", invariant_violation));
 
         let mut invariant_cpu = valid_evidence_specs();
-        invariant_cpu[8].cpu = 1;
+        invariant_cpu[22].cpu = 1;
         cases.push(("running invariant CPU", invariant_cpu));
 
+        let mut invariant_before_activity = valid_evidence_specs();
+        invariant_before_activity.swap(21, 22);
+        cases.push((
+            "running invariant before reclaim",
+            invariant_before_activity,
+        ));
+
         let mut wake_target = valid_evidence_specs();
-        wake_target[9].arg0 = 2;
+        wake_target[8].arg0 = 2;
         cases.push(("wake target", wake_target));
 
         let mut wake_token = valid_evidence_specs();
-        wake_token[10].token = 0x201;
+        wake_token[9].token = 0x201;
         cases.push(("wake token", wake_token));
 
         let mut same_cleanup_cpu = valid_evidence_specs();
-        same_cleanup_cpu[12].cpu = 2;
+        same_cleanup_cpu[11].cpu = 2;
         cases.push(("cleanup CPU", same_cleanup_cpu));
 
         let mut cleanup_token = valid_evidence_specs();
-        cleanup_token[12].token = 0x301;
+        cleanup_token[11].token = 0x301;
         cases.push(("cleanup token", cleanup_token));
 
+        let mut missing_cleanup_proof = valid_evidence_specs();
+        missing_cleanup_proof.remove(11);
+        cases.push(("missing cleanup proof", missing_cleanup_proof));
+
         let mut zero_publish_mask = valid_evidence_specs();
-        zero_publish_mask[13].arg0 = 0;
+        zero_publish_mask[12].arg0 = 0;
         cases.push(("zero publish mask", zero_publish_mask));
 
         let mut wide_publish_mask = valid_evidence_specs();
-        wide_publish_mask[13].arg0 = 0x1F;
+        wide_publish_mask[12].arg0 = 0x1F;
         cases.push(("wide publish mask", wide_publish_mask));
 
+        let mut coherent_partial_mask = valid_evidence_specs();
+        coherent_partial_mask.retain(|event| !matches!(event.kind, 0x0B | 0x0C) || event.cpu != 3);
+        for event in &mut coherent_partial_mask {
+            if matches!(event.kind, 0x0A..=0x0C) {
+                event.arg0 = 0x07;
+            }
+            if event.kind == 0x0D {
+                event.arg0 = 0x07;
+                event.arg1 = 0x07;
+            }
+        }
+        cases.push(("coherent partial CPU mask", coherent_partial_mask));
+
         let mut missing_tlb_ack = valid_evidence_specs();
-        missing_tlb_ack.remove(17);
+        missing_tlb_ack.remove(16);
         cases.push(("missing TLB ack", missing_tlb_ack));
 
         let mut duplicate_rendezvous_cpu = valid_evidence_specs();
-        duplicate_rendezvous_cpu[21].cpu = 2;
+        duplicate_rendezvous_cpu[20].cpu = 2;
         cases.push(("duplicate rendezvous CPU", duplicate_rendezvous_cpu));
 
         let mut wrong_ack_token = valid_evidence_specs();
-        wrong_ack_token[16].token = 0x401;
+        wrong_ack_token[15].token = 0x401;
         cases.push(("wrong ack token", wrong_ack_token));
 
         let mut wrong_ack_mask = valid_evidence_specs();
-        wrong_ack_mask[20].arg0 = 0x07;
+        wrong_ack_mask[19].arg0 = 0x07;
         cases.push(("wrong ack mask", wrong_ack_mask));
 
         let mut early_reclaim = valid_evidence_specs();
-        let reclaim = early_reclaim.pop().expect("reclaim event");
-        early_reclaim.insert(16, reclaim);
+        let reclaim = early_reclaim.remove(21);
+        early_reclaim.insert(15, reclaim);
         cases.push(("early reclaim", early_reclaim));
 
         let mut wrong_reclaim_mask = valid_evidence_specs();
-        wrong_reclaim_mask[22].arg1 = 0x07;
+        wrong_reclaim_mask[21].arg1 = 0x07;
         cases.push(("wrong reclaim mask", wrong_reclaim_mask));
 
         let mut duplicate_event = valid_evidence_specs();
@@ -2260,6 +2402,22 @@ mod tests {
             )
             .is_ok()
         );
+        let mut schema_two_compatibility = b"dwtest1 diagnostic decoy\n".to_vec();
+        schema_two_compatibility.extend_from_slice(b"dwevid1 diagnostic decoy\n");
+        schema_two_compatibility.extend_from_slice(&terminal("01", 18, 0));
+        assert!(
+            parse_transcript(
+                &schema_two_compatibility,
+                &HRequest {
+                    schema_version: 2,
+                    selector: "primordial-bootstrap".into(),
+                    test_id: 18,
+                    evidence: None,
+                    ..i1_request()
+                }
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -2275,6 +2433,36 @@ mod tests {
         };
         assert!(record.outcome.matches(ExpectedOutcome::Fail));
         assert_ne!(record.detail, 0);
+
+        let i1 = i1_request();
+        assert!(guest_expectation_matches(
+            &i1,
+            GuestRecord {
+                outcome: GuestOutcome::Pass,
+                test_id: 23,
+                detail: 0,
+                line: 1,
+            }
+        ));
+        for outcome in [GuestOutcome::Fail, GuestOutcome::Panic] {
+            let invalid_request = HRequest {
+                expected_outcome: match outcome {
+                    GuestOutcome::Fail => ExpectedOutcome::Fail,
+                    GuestOutcome::Panic => ExpectedOutcome::Panic,
+                    GuestOutcome::Pass => unreachable!(),
+                },
+                ..i1.clone()
+            };
+            assert!(!guest_expectation_matches(
+                &invalid_request,
+                GuestRecord {
+                    outcome,
+                    test_id: 23,
+                    detail: 0,
+                    line: 1,
+                }
+            ));
+        }
     }
 
     #[test]
@@ -2535,7 +2723,7 @@ mod tests {
             test_id: 23,
             evidence: Some(EvidenceRequest {
                 nonce: TEST_EVIDENCE_NONCE,
-                required_mask: I1_REQUIRED_EVIDENCE_MASK,
+                required_mask: h_request::I1_REQUIRED_EVIDENCE_MASK,
             }),
             ..request.clone()
         };

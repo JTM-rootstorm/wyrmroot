@@ -150,6 +150,8 @@ pub(crate) fn load(path: &Path) -> Result<HRequest, Failure> {
         .to_path_buf();
     let selector = selector(&values)?;
     let test_id = number::<u32>(&values, "test_id")?;
+    let expected_outcome = expected_outcome(&values)?;
+    let expected_detail = number::<u32>(&values, "expected_detail")?;
     let evidence = match schema_version {
         2 => {
             if selector == I1_SELECTOR {
@@ -164,6 +166,11 @@ pub(crate) fn load(path: &Path) -> Result<HRequest, Failure> {
                 return Err(Failure::task(format!(
                     "WYR0-H schema_version = 3 is reserved for selector '{I1_SELECTOR}' with test_id {I1_TEST_ID}"
                 )));
+            }
+            if expected_outcome != ExpectedOutcome::Pass || expected_detail != 0 {
+                return Err(Failure::task(
+                    "WYR0-H schema_version = 3 requires expected_outcome = \"pass\" and expected_detail = 0",
+                ));
             }
             if required(&values, "evidence_protocol")? != I1_EVIDENCE_PROTOCOL {
                 return Err(Failure::task(format!(
@@ -192,8 +199,8 @@ pub(crate) fn load(path: &Path) -> Result<HRequest, Failure> {
         rust_revision: revision(&values, "rust_revision")?,
         selector,
         test_id,
-        expected_outcome: expected_outcome(&values)?,
-        expected_detail: number::<u32>(&values, "expected_detail")?,
+        expected_outcome,
+        expected_detail,
         timeout_seconds: number::<u64>(&values, "timeout_seconds")?,
         loader: input_path(&parent, required(&values, "loader")?),
         kernel: input_path(&parent, required(&values, "kernel")?),
@@ -727,6 +734,21 @@ mod tests {
             (
                 "v3-id22",
                 valid_v3().replace("test_id = 23", "test_id = 22"),
+            ),
+            (
+                "v3-expected-fail",
+                valid_v3().replace("expected_outcome = \"pass\"", "expected_outcome = \"fail\""),
+            ),
+            (
+                "v3-expected-panic",
+                valid_v3().replace(
+                    "expected_outcome = \"pass\"",
+                    "expected_outcome = \"panic\"",
+                ),
+            ),
+            (
+                "v3-expected-detail",
+                valid_v3().replace("expected_detail = 0", "expected_detail = 1"),
             ),
             (
                 "v3-extra",

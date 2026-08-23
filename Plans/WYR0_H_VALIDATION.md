@@ -150,6 +150,11 @@ and the request adds the exact fields `evidence_protocol = "dwevid1"`,
 The nonce is a nonzero fixed-width uppercase hexadecimal u64. Schema-v2
 requests remain the terminal-only contract for non-I1 selectors; test ID 22
 remains reserved for I2.
+Schema-v3 requests require `expected_outcome = "pass"` and
+`expected_detail = 0`; an observed FAIL or PANIC can never produce host PASS or
+validated evidence. I1 execution also requires an explicit `smp` profile.
+The `default` profile and unprofiled paired integration command are rejected
+for schema v3, so an I1 result cannot be wrapped in the schema-v2 paired result.
 
 An I1 serial transcript contains no more than 64 checksummed evidence records
 before its single unchanged `DWTEST1` terminal record. Evidence records are
@@ -166,6 +171,10 @@ request, and CPU IDs are limited to 0 through 3. Human diagnostics may surround
 or appear between protocol records, but malformed protocol records, duplicate
 terminals, evidence after the terminal, unknown kinds, and missing I1 evidence
 fail closed.
+For schema v3, a line whose beginning case-insensitively resembles either
+`DWEVID1` or `DWTEST1` is protocol input, not a human diagnostic. It must use
+the exact uppercase magic and complete valid framing. Schema-v2 transcript
+handling retains its terminal-only compatibility behavior.
 
 Kind assignments are `01 CPU_ONLINE`, `02 CPL3_SYSCALL`, `03 PARENT_BLOCKED`,
 `04 DESCENDANT_RUNNING`, `05 RUNNING_INVARIANT`, `06 WAKE_SENT`,
@@ -176,8 +185,19 @@ The validator requires the complete CPU-online, cross-CPU CPL3, blocked-parent
 and running-descendant, running-invariant, remote-wake, child-cleanup, TLB
 acknowledgement, rendezvous acknowledgement, and reclaim-order proofs. It
 rejects duplicate or inconsistent CPUs, tokens, ordering, joins, and masks.
+All four `CPU_ONLINE` records must precede every participation or activity
+record. The CPL3 proof uses at least two distinct CPUs and at least two distinct
+nonzero execution tokens. `RUNNING_INVARIANT` is pinned as the final evidence
+record after all scheduler and lifecycle activity; human diagnostics may follow
+it, but the terminal record remains after all evidence. `TLB_PUBLISH` requires
+exact mask `0000000F`. The TLB and rendezvous acknowledgements each cover
+exactly CPUs 0 through 3,
+and reclaim repeats exact masks `0000000F` and `0000000F`.
 Only after the normal request/artifact/media revalidation accepts a terminal
 PASS does the schema-v3 integration result publish the protocol, nonce,
 required and observed evidence masks, event count, and first/last sequence.
+The observed evidence mask is assembled from the eight proofs actually
+validated and must exactly equal the request mask `255`; it is not a constant
+success value.
 This host-side validation capability is not evidence that a guest candidate
 emitted the protocol and does not by itself close I1.
