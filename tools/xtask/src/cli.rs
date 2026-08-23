@@ -5,18 +5,22 @@ pub(crate) const USAGE: &str = r#"Wyrmroot development task dispatcher
 Usage:
     cargo xtask build [host|loader|bootfs]
     cargo xtask image <loader.efi> <deepwyrm.elf> <bootstrap.elf> <bootfs.img> <esp.img>
-    cargo xtask run
+    cargo xtask image --request <wyr0-h-request.toml>
+    cargo xtask run <default|smp> --request <wyr0-h-request.toml>
     cargo xtask inspect-image <esp.img> <loader.efi> <deepwyrm.elf> <bootstrap.elf> <bootfs.img>
-    cargo xtask gdb
+    cargo xtask inspect-image --request <wyr0-h-request.toml>
+    cargo xtask gdb <default|smp> --request <wyr0-h-request.toml>
     cargo xtask test host [filter]
-    cargo xtask test <guest|integration> [filter]
+    cargo xtask test guest [filter]
+    cargo xtask test integration wyr0 [default|smp] --request <wyr0-h-request.toml>
 
 Host filters may name a component (bootfs, protocol, elf, runtime, bootstrap,
 efi, init0, hello, or xtask), package:<workspace-package>, or test:<substring>.
 
-WYR0-G3 adds only the exact paired deterministic ESP build and inspection
-surface above. Run, GDB, guest-test, integration-test, and general image-builder
-work remain unavailable until their assigned later phases.
+The WYR0-H request path builds and inspects the exact init0/hello bootfs and
+paired ESP, records revision/hash provenance, and uses one q35/OVMF path for
+the 1-vCPU default and 4-vCPU smp profiles. Guest-test remains unavailable;
+the integration command owns the complete paired profile assertion.
 "#;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -57,7 +61,46 @@ pub(crate) enum Action {
     HostTests(Option<String>),
     BuildG3Image(G3ImageArguments),
     InspectG3Image(G3ImageArguments),
+    BuildHImage(String),
+    InspectHImage(String),
+    RunH {
+        profile: HProfile,
+        request: String,
+    },
+    GdbH {
+        profile: HProfile,
+        request: String,
+    },
+    IntegrationH {
+        profile: Option<HProfile>,
+        request: String,
+    },
     Unavailable(&'static str),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HProfile {
+    Default,
+    Smp,
+}
+
+impl HProfile {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Smp => "smp",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, Failure> {
+        match value {
+            "default" => Ok(Self::Default),
+            "smp" => Ok(Self::Smp),
+            _ => Err(Failure::usage(
+                "WYR0-H profile must be either 'default' or 'smp'",
+            )),
+        }
+    }
 }
 
 pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
@@ -72,9 +115,9 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
         }
         "build" => dispatch_build(&arguments[1..]),
         "image" => dispatch_image(&arguments[1..]),
-        "run" => unavailable_without_arguments(arguments, "run"),
+        "run" => dispatch_profile_request(&arguments[1..], false),
         "inspect-image" => dispatch_inspect_image(&arguments[1..]),
-        "gdb" => unavailable_without_arguments(arguments, "gdb"),
+        "gdb" => dispatch_profile_request(&arguments[1..], true),
         "test" => dispatch_test(&arguments[1..]),
         unknown => Err(Failure::usage(format!(
             "unknown command '{unknown}'\n\n{USAGE}"
@@ -83,9 +126,14 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
 }
 
 fn dispatch_image(arguments: &[String]) -> Result<Action, Failure> {
+    if let [flag, request] = arguments
+        && flag == "--request"
+    {
+        return Ok(Action::BuildHImage(request.clone()));
+    }
     let [loader, kernel, bootstrap, bootfs, image] = arguments else {
         return Err(Failure::usage(
-            "image requires loader, kernel, bootstrap, bootfs, and output ESP paths",
+            "image requires either --request <path> or loader, kernel, bootstrap, bootfs, and output ESP paths",
         ));
     };
     Ok(Action::BuildG3Image(G3ImageArguments {
@@ -98,6 +146,11 @@ fn dispatch_image(arguments: &[String]) -> Result<Action, Failure> {
 }
 
 fn dispatch_inspect_image(arguments: &[String]) -> Result<Action, Failure> {
+    if let [flag, request] = arguments
+        && flag == "--request"
+    {
+        return Ok(Action::InspectHImage(request.clone()));
+    }
     let [image, loader, kernel, bootstrap, bootfs] = arguments else {
         return Err(Failure::usage(
             "inspect-image requires ESP, loader, kernel, bootstrap, and bootfs paths",
@@ -110,6 +163,29 @@ fn dispatch_inspect_image(arguments: &[String]) -> Result<Action, Failure> {
         bootstrap: bootstrap.clone(),
         bootfs: bootfs.clone(),
     }))
+}
+
+fn dispatch_profile_request(arguments: &[String], gdb: bool) -> Result<Action, Failure> {
+    let [profile, flag, request] = arguments else {
+        return Err(Failure::usage(
+            "WYR0-H run/gdb requires <default|smp> --request <path>",
+        ));
+    };
+    if flag != "--request" {
+        return Err(Failure::usage("WYR0-H run/gdb requires the --request flag"));
+    }
+    let profile = HProfile::parse(profile)?;
+    if gdb {
+        Ok(Action::GdbH {
+            profile,
+            request: request.clone(),
+        })
+    } else {
+        Ok(Action::RunH {
+            profile,
+            request: request.clone(),
+        })
+    }
 }
 
 fn dispatch_build(arguments: &[String]) -> Result<Action, Failure> {
@@ -127,18 +203,6 @@ fn dispatch_build(arguments: &[String]) -> Result<Action, Failure> {
     }
 }
 
-fn unavailable_without_arguments(
-    arguments: &[String],
-    command: &'static str,
-) -> Result<Action, Failure> {
-    expect_arity(
-        arguments,
-        1,
-        format!("{command} does not accept arguments in WYR0-C"),
-    )?;
-    Ok(Action::Unavailable(command))
-}
-
 fn dispatch_test(arguments: &[String]) -> Result<Action, Failure> {
     let Some(suite) = arguments.first().map(String::as_str) else {
         return Err(Failure::usage(format!(
@@ -146,23 +210,47 @@ fn dispatch_test(arguments: &[String]) -> Result<Action, Failure> {
         )));
     };
 
-    if arguments.len() > 2 {
-        return Err(Failure::usage(
-            "test accepts at most one focused filter argument",
-        ));
-    }
-    let filter = arguments.get(1).cloned();
-    if let Some(filter) = &filter {
-        validate_filter(filter)?;
-    }
-
     match suite {
-        "host" => Ok(Action::HostTests(filter)),
-        "guest" => Ok(Action::Unavailable("test guest")),
-        "integration" => Ok(Action::Unavailable("test integration")),
+        "host" => {
+            if arguments.len() > 2 {
+                return Err(Failure::usage(
+                    "test host accepts at most one focused filter argument",
+                ));
+            }
+            let filter = arguments.get(1).cloned();
+            if let Some(filter) = &filter {
+                validate_filter(filter)?;
+            }
+            Ok(Action::HostTests(filter))
+        }
+        "guest" if arguments.len() <= 2 => Ok(Action::Unavailable("test guest")),
+        "guest" => Err(Failure::usage(
+            "test guest accepts at most one focused filter argument",
+        )),
+        "integration" => dispatch_integration(&arguments[1..]),
         unknown => Err(Failure::usage(format!(
             "unknown test suite '{unknown}'; expected host, guest, or integration"
         ))),
+    }
+}
+
+fn dispatch_integration(arguments: &[String]) -> Result<Action, Failure> {
+    match arguments {
+        [wyr0, flag, request] if wyr0 == "wyr0" && flag == "--request" => {
+            Ok(Action::IntegrationH {
+                profile: None,
+                request: request.clone(),
+            })
+        }
+        [wyr0, profile, flag, request] if wyr0 == "wyr0" && flag == "--request" => {
+            Ok(Action::IntegrationH {
+                profile: Some(HProfile::parse(profile)?),
+                request: request.clone(),
+            })
+        }
+        _ => Err(Failure::usage(
+            "test integration requires wyr0 [default|smp] --request <path>",
+        )),
     }
 }
 
@@ -197,7 +285,7 @@ pub(crate) fn validate_filter(filter: &str) -> Result<(), Failure> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, BuildScope, USAGE, dispatch};
+    use super::{Action, BuildScope, HProfile, USAGE, dispatch};
     use crate::error::{Failure, FailureKind};
 
     fn arguments(values: &[&str]) -> Vec<String> {
@@ -235,31 +323,74 @@ mod tests {
         assert!(!BuildScope::Bootfs.runs_workspace());
         assert!(!BuildScope::Bootfs.runs_loader());
         assert!(BuildScope::Bootfs.runs_bootfs_package());
-        assert!(USAGE.contains("WYR0-G3 adds only the exact paired deterministic ESP"));
+        assert!(USAGE.contains("WYR0-H request path"));
     }
 
     #[test]
-    fn later_phase_tasks_are_stable_unavailable_failures() {
-        for values in [
-            &["run"][..],
-            &["gdb"],
-            &["test", "guest"],
-            &["test", "integration", "wyr0"],
-        ] {
-            let Action::Unavailable(command) =
-                dispatch(&arguments(values)).expect("recognized command should dispatch")
-            else {
-                panic!("later phase operation did not remain unavailable");
-            };
-            let failure = Failure::unavailable(command);
-            assert_eq!(failure.kind, FailureKind::Unavailable);
-            assert_eq!(failure.exit_code(), 1);
-            assert!(
-                failure
-                    .message
-                    .contains("unavailable in the current WYR0-G3 surface")
-            );
-        }
+    fn h_actions_dispatch_and_guest_test_remains_unavailable() {
+        assert_eq!(
+            dispatch(&arguments(&["image", "--request", "request.toml"])),
+            Ok(Action::BuildHImage("request.toml".into()))
+        );
+        assert_eq!(
+            dispatch(&arguments(&["inspect-image", "--request", "request.toml"])),
+            Ok(Action::InspectHImage("request.toml".into()))
+        );
+        assert_eq!(
+            dispatch(&arguments(&["run", "default", "--request", "request.toml"])),
+            Ok(Action::RunH {
+                profile: HProfile::Default,
+                request: "request.toml".into(),
+            })
+        );
+        assert_eq!(
+            dispatch(&arguments(&["gdb", "smp", "--request", "request.toml"])),
+            Ok(Action::GdbH {
+                profile: HProfile::Smp,
+                request: "request.toml".into(),
+            })
+        );
+        assert_eq!(
+            dispatch(&arguments(&[
+                "test",
+                "integration",
+                "wyr0",
+                "--request",
+                "request.toml"
+            ])),
+            Ok(Action::IntegrationH {
+                profile: None,
+                request: "request.toml".into(),
+            })
+        );
+        assert_eq!(
+            dispatch(&arguments(&[
+                "test",
+                "integration",
+                "wyr0",
+                "smp",
+                "--request",
+                "request.toml"
+            ])),
+            Ok(Action::IntegrationH {
+                profile: Some(HProfile::Smp),
+                request: "request.toml".into(),
+            })
+        );
+
+        let Action::Unavailable(command) =
+            dispatch(&arguments(&["test", "guest"])).expect("guest dispatch")
+        else {
+            panic!("guest test unexpectedly became available");
+        };
+        let failure = Failure::unavailable(command);
+        assert_eq!(failure.kind, FailureKind::Unavailable);
+        assert_eq!(failure.exit_code(), 1);
+        assert!(
+            failure
+                .message
+                .contains("unavailable in the current WYR0-H surface")
+        );
 
         assert_eq!(
             dispatch(&arguments(&[
@@ -289,12 +420,25 @@ mod tests {
             &["build", "host", "extra"],
             &["build", "bootfs", "extra"],
             &["image", "extra"],
+            &["image", "--request"],
+            &["run"],
+            &["run", "debug", "--request", "request.toml"],
+            &["gdb", "default", "request.toml"],
             &["inspect-image"],
             &["inspect-image", "one", "two"],
             &["test"],
             &["test", "unknown"],
             &["test", "host", "one", "two"],
             &["test", "host", "--nocapture"],
+            &["test", "integration", "wyr0"],
+            &[
+                "test",
+                "integration",
+                "wyr0",
+                "debug",
+                "--request",
+                "request.toml",
+            ],
         ] {
             let failure = dispatch(&arguments(values)).expect_err("invalid syntax was accepted");
             assert_eq!(failure.kind, FailureKind::Usage);

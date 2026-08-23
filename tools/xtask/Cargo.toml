@@ -7,3 +7,4 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+wyrmroot-bootfs = { path = "../../crates/wyrmroot-bootfs", features = ["builder"] }

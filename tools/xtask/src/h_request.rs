@@ -1,0 +1,358 @@
+//! Strict, dependency-free parsing for one WYR0-H integration candidate.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+
+use crate::error::Failure;
+
+const MAX_REQUEST_BYTES: u64 = 64 * 1024;
+const REQUIRED_KEYS: &[&str] = &[
+    "schema_version",
+    "deepwyrm_revision",
+    "wyrmroot_revision",
+    "rust_revision",
+    "selector",
+    "test_id",
+    "timeout_seconds",
+    "loader",
+    "kernel",
+    "symbols",
+    "bootstrap",
+    "init0",
+    "hello",
+    "bootfs",
+    "esp",
+    "provenance",
+    "ovmf_code",
+    "ovmf_vars_template",
+    "run_directory",
+];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HRequest {
+    pub(crate) path: PathBuf,
+    pub(crate) deepwyrm_revision: String,
+    pub(crate) wyrmroot_revision: String,
+    pub(crate) rust_revision: String,
+    pub(crate) selector: String,
+    pub(crate) test_id: u32,
+    pub(crate) timeout_seconds: u64,
+    pub(crate) loader: PathBuf,
+    pub(crate) kernel: PathBuf,
+    pub(crate) symbols: PathBuf,
+    pub(crate) bootstrap: PathBuf,
+    pub(crate) init0: PathBuf,
+    pub(crate) hello: PathBuf,
+    pub(crate) bootfs: PathBuf,
+    pub(crate) esp: PathBuf,
+    pub(crate) provenance: PathBuf,
+    pub(crate) ovmf_code: PathBuf,
+    pub(crate) ovmf_vars_template: PathBuf,
+    pub(crate) run_directory: PathBuf,
+}
+
+pub(crate) fn load(path: &Path) -> Result<HRequest, Failure> {
+    let path = canonical_regular(path, "WYR0-H request", MAX_REQUEST_BYTES)?;
+    let metadata = fs::metadata(&path)
+        .map_err(|error| Failure::task(format!("could not stat WYR0-H request: {error}")))?;
+    if metadata.len() > MAX_REQUEST_BYTES {
+        return Err(Failure::task("WYR0-H request exceeds its size limit"));
+    }
+    let text = fs::read_to_string(&path)
+        .map_err(|error| Failure::task(format!("could not read WYR0-H request: {error}")))?;
+    let values = parse(&text)?;
+    let expected = REQUIRED_KEYS.iter().copied().collect::<BTreeSet<_>>();
+    let actual = values.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    if actual != expected {
+        let unknown = actual.difference(&expected).copied().collect::<Vec<_>>();
+        let missing = expected.difference(&actual).copied().collect::<Vec<_>>();
+        return Err(Failure::task(format!(
+            "WYR0-H request key set drifted (missing: {}; unknown: {})",
+            missing.join(", "),
+            unknown.join(", ")
+        )));
+    }
+    if required(&values, "schema_version")? != "1" {
+        return Err(Failure::task("WYR0-H request requires schema_version = 1"));
+    }
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| Failure::task("WYR0-H request has no parent directory"))?
+        .to_path_buf();
+    let request = HRequest {
+        path,
+        deepwyrm_revision: revision(&values, "deepwyrm_revision")?,
+        wyrmroot_revision: revision(&values, "wyrmroot_revision")?,
+        rust_revision: revision(&values, "rust_revision")?,
+        selector: selector(&values)?,
+        test_id: number::<u32>(&values, "test_id")?,
+        timeout_seconds: number::<u64>(&values, "timeout_seconds")?,
+        loader: input_path(&parent, required(&values, "loader")?),
+        kernel: input_path(&parent, required(&values, "kernel")?),
+        symbols: input_path(&parent, required(&values, "symbols")?),
+        bootstrap: input_path(&parent, required(&values, "bootstrap")?),
+        init0: input_path(&parent, required(&values, "init0")?),
+        hello: input_path(&parent, required(&values, "hello")?),
+        bootfs: output_path(&parent, required(&values, "bootfs")?, "bootfs")?,
+        esp: output_path(&parent, required(&values, "esp")?, "esp")?,
+        provenance: output_path(&parent, required(&values, "provenance")?, "provenance")?,
+        ovmf_code: input_path(&parent, required(&values, "ovmf_code")?),
+        ovmf_vars_template: input_path(&parent, required(&values, "ovmf_vars_template")?),
+        run_directory: output_path(
+            &parent,
+            required(&values, "run_directory")?,
+            "run_directory",
+        )?,
+    };
+    if request.test_id == 0 {
+        return Err(Failure::task("WYR0-H test_id must be nonzero"));
+    }
+    if !(1..=600).contains(&request.timeout_seconds) {
+        return Err(Failure::task(
+            "WYR0-H timeout_seconds must be between 1 and 600",
+        ));
+    }
+    reject_output_aliases(&request)?;
+    Ok(request)
+}
+
+fn parse(text: &str) -> Result<BTreeMap<String, String>, Failure> {
+    let mut values = BTreeMap::new();
+    for (index, raw) in text.lines().enumerate() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            return Err(Failure::task(format!(
+                "WYR0-H request line {} uses an unsupported section",
+                index + 1
+            )));
+        }
+        let (key, raw_value) = line.split_once('=').ok_or_else(|| {
+            Failure::task(format!(
+                "WYR0-H request line {} is not a scalar assignment",
+                index + 1
+            ))
+        })?;
+        let key = key.trim();
+        if key.is_empty()
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            return Err(Failure::task(format!(
+                "WYR0-H request line {} has an invalid key",
+                index + 1
+            )));
+        }
+        let raw_value = raw_value.trim();
+        let value = if let Some(quoted) = raw_value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+        {
+            if quoted.contains(['"', '\\']) || quoted.chars().any(char::is_control) {
+                return Err(Failure::task(format!(
+                    "WYR0-H request line {} has an unsupported quoted value",
+                    index + 1
+                )));
+            }
+            quoted.to_owned()
+        } else if !raw_value.is_empty() && raw_value.bytes().all(|byte| byte.is_ascii_digit()) {
+            raw_value.to_owned()
+        } else {
+            return Err(Failure::task(format!(
+                "WYR0-H request line {} must use a quoted string or unsigned integer",
+                index + 1
+            )));
+        };
+        if values.insert(key.to_owned(), value).is_some() {
+            return Err(Failure::task(format!(
+                "WYR0-H request line {} repeats key '{key}'",
+                index + 1
+            )));
+        }
+    }
+    Ok(values)
+}
+
+fn required<'a>(values: &'a BTreeMap<String, String>, key: &str) -> Result<&'a str, Failure> {
+    values
+        .get(key)
+        .map(String::as_str)
+        .ok_or_else(|| Failure::task(format!("WYR0-H request is missing '{key}'")))
+}
+
+fn number<T>(values: &BTreeMap<String, String>, key: &str) -> Result<T, Failure>
+where
+    T: std::str::FromStr,
+{
+    required(values, key)?
+        .parse()
+        .map_err(|_| Failure::task(format!("WYR0-H request '{key}' is not a valid integer")))
+}
+
+fn revision(values: &BTreeMap<String, String>, key: &str) -> Result<String, Failure> {
+    let value = required(values, key)?;
+    if value.len() != 40
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(Failure::task(format!(
+            "WYR0-H request '{key}' must be a full lowercase Git revision"
+        )));
+    }
+    Ok(value.to_owned())
+}
+
+fn selector(values: &BTreeMap<String, String>) -> Result<String, Failure> {
+    let value = required(values, "selector")?;
+    if value.is_empty()
+        || value.len() > 64
+        || value.starts_with('-')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(Failure::task(
+            "WYR0-H selector must be a bounded lowercase selector name",
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+fn input_path(parent: &Path, value: &str) -> PathBuf {
+    let path = Path::new(value);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        parent.join(path)
+    }
+}
+
+fn output_path(parent: &Path, value: &str, label: &str) -> Result<PathBuf, Failure> {
+    let relative = Path::new(value);
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+        || relative.as_os_str().is_empty()
+    {
+        return Err(Failure::task(format!(
+            "WYR0-H {label} must be a non-escaping request-relative path"
+        )));
+    }
+    Ok(parent.join(relative))
+}
+
+fn reject_output_aliases(request: &HRequest) -> Result<(), Failure> {
+    let outputs = [
+        (&request.bootfs, "bootfs"),
+        (&request.esp, "esp"),
+        (&request.provenance, "provenance"),
+        (&request.run_directory, "run_directory"),
+    ];
+    for (index, (left, left_label)) in outputs.iter().enumerate() {
+        for (right, right_label) in outputs.iter().skip(index + 1) {
+            if left == right {
+                return Err(Failure::task(format!(
+                    "WYR0-H {left_label} and {right_label} paths alias"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn canonical_regular(
+    path: &Path,
+    label: &str,
+    max_bytes: u64,
+) -> Result<PathBuf, Failure> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| Failure::task(format!("could not inspect {label}: {error}")))?;
+    if !metadata.file_type().is_file() || metadata.len() == 0 || metadata.len() > max_bytes {
+        return Err(Failure::task(format!(
+            "{label} must be a nonempty regular file no larger than {max_bytes} bytes"
+        )));
+    }
+    fs::canonicalize(path)
+        .map_err(|error| Failure::task(format!("could not resolve {label}: {error}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid() -> String {
+        let revision = "1".repeat(40);
+        format!(
+            concat!(
+                "schema_version = 1\n",
+                "deepwyrm_revision = \"{}\"\n",
+                "wyrmroot_revision = \"{}\"\n",
+                "rust_revision = \"{}\"\n",
+                "selector = \"primordial-bootstrap\"\n",
+                "test_id = 18\n",
+                "timeout_seconds = 180\n",
+                "loader = \"loader.efi\"\n",
+                "kernel = \"deepwyrm.elf\"\n",
+                "symbols = \"deepwyrm.elf\"\n",
+                "bootstrap = \"bootstrap.elf\"\n",
+                "init0 = \"init0.elf\"\n",
+                "hello = \"hello.elf\"\n",
+                "bootfs = \"media/bootfs.img\"\n",
+                "esp = \"media/wyrmroot-esp.img\"\n",
+                "provenance = \"media/provenance.toml\"\n",
+                "ovmf_code = \"OVMF_CODE.fd\"\n",
+                "ovmf_vars_template = \"OVMF_VARS.fd\"\n",
+                "run_directory = \"runs\"\n"
+            ),
+            revision, revision, revision,
+        )
+    }
+
+    #[test]
+    fn flat_request_parser_rejects_ambiguity() {
+        let parsed = parse(&valid()).unwrap();
+        assert_eq!(parsed.get("test_id").map(String::as_str), Some("18"));
+        for invalid in [
+            valid().replace("schema_version = 1", "schema_version = true"),
+            format!("{}schema_version = 1\n", valid()),
+            valid().replace("loader =", "[paths]\nloader ="),
+            valid().replace("loader.efi", "loader\\.efi"),
+        ] {
+            assert!(parse(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn output_paths_cannot_escape_the_request() {
+        let parent = Path::new("/request");
+        assert_eq!(
+            output_path(parent, "media/esp.img", "esp").unwrap(),
+            Path::new("/request/media/esp.img")
+        );
+        for invalid in ["/tmp/esp.img", "../esp.img", "media/../../esp.img", ""] {
+            assert!(output_path(parent, invalid, "esp").is_err());
+        }
+    }
+
+    #[test]
+    fn revisions_and_selectors_are_strict() {
+        let values = parse(&valid()).unwrap();
+        assert_eq!(revision(&values, "deepwyrm_revision").unwrap().len(), 40);
+        assert_eq!(selector(&values).unwrap(), "primordial-bootstrap");
+        let mut bad = values.clone();
+        bad.insert("deepwyrm_revision".into(), "A".repeat(40));
+        assert!(revision(&bad, "deepwyrm_revision").is_err());
+        bad.insert("selector".into(), "--help".into());
+        assert!(selector(&bad).is_err());
+    }
+}

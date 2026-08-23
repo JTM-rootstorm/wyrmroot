@@ -1,5 +1,5 @@
 const FUTURE_PHASE_MESSAGE: &str =
-    "is unavailable in the current WYR0-G3 surface; it requires a later phase";
+    "is unavailable in the current WYR0-H surface; it requires a later phase";
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum FailureKind {

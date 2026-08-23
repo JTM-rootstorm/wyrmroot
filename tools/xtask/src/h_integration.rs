@@ -1,0 +1,946 @@
+//! WYR0-H exact-artifact image, q35/OVMF, GDB, and integration tooling.
+
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use wyrmroot_bootfs::builder::{Builder, FileMode};
+
+use crate::cli::{G3ImageArguments, HProfile};
+use crate::error::Failure;
+use crate::h_request::{self, HRequest};
+use crate::sha256;
+
+const MAX_GUEST_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_FIRMWARE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_SERIAL_BYTES: u64 = 16 * 1024 * 1024;
+const COMPLETION_RECORD_BYTES: usize = 38;
+const DEFAULT_MEMORY_MIB: u32 = 2048;
+const SMP_MEMORY_MIB: u32 = 2048;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExecutionKind {
+    Run,
+    Integration,
+    Gdb,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GuestOutcome {
+    Pass,
+    Fail,
+    Panic,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GuestRecord {
+    outcome: GuestOutcome,
+    test_id: u32,
+    detail: u32,
+    line: usize,
+}
+
+#[derive(Debug)]
+struct CandidateArtifacts {
+    loader: PathBuf,
+    kernel: PathBuf,
+    symbols: PathBuf,
+    bootstrap: PathBuf,
+    init0: PathBuf,
+    hello: PathBuf,
+    ovmf_code: PathBuf,
+    ovmf_vars_template: PathBuf,
+}
+
+impl HProfile {
+    const fn vcpus(self) -> u32 {
+        match self {
+            Self::Default => 1,
+            Self::Smp => 4,
+        }
+    }
+
+    const fn memory_mib(self) -> u32 {
+        match self {
+            Self::Default => DEFAULT_MEMORY_MIB,
+            Self::Smp => SMP_MEMORY_MIB,
+        }
+    }
+}
+
+pub(crate) fn build(request_path: &str) -> Result<String, Failure> {
+    let request = h_request::load(Path::new(request_path))?;
+    verify_source_revisions(&request)?;
+    let artifacts = verify_candidate_inputs(&request)?;
+    require_absent(&request.bootfs, "bootfs output")?;
+    require_absent(&request.esp, "ESP output")?;
+    require_absent(&request.provenance, "provenance output")?;
+
+    let bootfs = build_bootfs_bytes(&artifacts)?;
+    write_new(&request.bootfs, &bootfs, "bootfs")?;
+    let image_arguments = image_arguments(&request, &artifacts);
+    let result = (|| {
+        crate::g3_image::build(&image_arguments)?;
+        write_provenance(&request, &artifacts)?;
+        inspect_loaded(&request, &artifacts)
+    })();
+    if result.is_err() {
+        remove_created(&request.provenance);
+        remove_created(&request.esp);
+        remove_created(&request.bootfs);
+    }
+    result
+}
+
+pub(crate) fn inspect(request_path: &str) -> Result<String, Failure> {
+    let request = h_request::load(Path::new(request_path))?;
+    verify_source_revisions(&request)?;
+    let artifacts = verify_candidate_inputs(&request)?;
+    inspect_loaded(&request, &artifacts)
+}
+
+pub(crate) fn run(profile: HProfile, request_path: &str) -> Result<String, Failure> {
+    let request = h_request::load(Path::new(request_path))?;
+    verify_source_revisions(&request)?;
+    let artifacts = verify_candidate_inputs(&request)?;
+    inspect_loaded(&request, &artifacts)?;
+    execute(profile, &request, &artifacts, ExecutionKind::Run)
+}
+
+pub(crate) fn gdb(profile: HProfile, request_path: &str) -> Result<String, Failure> {
+    let request = h_request::load(Path::new(request_path))?;
+    verify_source_revisions(&request)?;
+    let artifacts = verify_candidate_inputs(&request)?;
+    inspect_loaded(&request, &artifacts)?;
+    execute(profile, &request, &artifacts, ExecutionKind::Gdb)
+}
+
+pub(crate) fn integration(
+    profile: Option<HProfile>,
+    request_path: &str,
+) -> Result<String, Failure> {
+    let request = h_request::load(Path::new(request_path))?;
+    verify_source_revisions(&request)?;
+    let artifacts = verify_candidate_inputs(&request)?;
+    if outputs_all_absent(&request)? {
+        let bootfs = build_bootfs_bytes(&artifacts)?;
+        write_new(&request.bootfs, &bootfs, "bootfs")?;
+        let image_arguments = image_arguments(&request, &artifacts);
+        let result = (|| {
+            crate::g3_image::build(&image_arguments)?;
+            write_provenance(&request, &artifacts)
+        })();
+        if let Err(error) = result {
+            remove_created(&request.provenance);
+            remove_created(&request.esp);
+            remove_created(&request.bootfs);
+            return Err(error);
+        }
+    }
+    let inspection = inspect_loaded(&request, &artifacts)?;
+    match profile {
+        Some(profile) => execute(profile, &request, &artifacts, ExecutionKind::Integration),
+        None => {
+            let default = execute(
+                HProfile::Default,
+                &request,
+                &artifacts,
+                ExecutionKind::Integration,
+            )?;
+            let smp = execute(
+                HProfile::Smp,
+                &request,
+                &artifacts,
+                ExecutionKind::Integration,
+            )?;
+            Ok(format!(
+                concat!(
+                    "{{\"schema_version\":1,\"phase\":\"WYR0-H\",",
+                    "\"status\":\"PASS\",\"same_media\":true,",
+                    "\"inspection\":{},\"default\":{},\"smp\":{}}}\n"
+                ),
+                inspection.trim(),
+                default.trim(),
+                smp.trim()
+            ))
+        }
+    }
+}
+
+fn inspect_loaded(request: &HRequest, artifacts: &CandidateArtifacts) -> Result<String, Failure> {
+    let expected_bootfs = build_bootfs_bytes(artifacts)?;
+    let actual_bootfs = read_regular(&request.bootfs, "bootfs", MAX_GUEST_ARTIFACT_BYTES)?;
+    if actual_bootfs != expected_bootfs {
+        return Err(Failure::task(
+            "WYR0-H bootfs does not contain the exact current init0 and hello bytes",
+        ));
+    }
+    let image_report = crate::g3_image::inspect(&image_arguments(request, artifacts))?;
+    let expected_provenance = provenance_contents(request, artifacts)?;
+    let actual_provenance = fs::read(&request.provenance)
+        .map_err(|error| Failure::task(format!("could not read WYR0-H provenance: {error}")))?;
+    if actual_provenance != expected_provenance.as_bytes() {
+        return Err(Failure::task(
+            "WYR0-H provenance is absent, stale, or disagrees with the exact candidate",
+        ));
+    }
+    Ok(format!(
+        concat!(
+            "{{\"schema_version\":1,\"phase\":\"WYR0-H\",",
+            "\"status\":\"PASS\",\"bootfs_sha256\":\"{}\",",
+            "\"esp_sha256\":\"{}\",\"symbols_sha256\":\"{}\",",
+            "\"default\":{{\"vcpu\":1,\"memory_mib\":2048}},",
+            "\"smp\":{{\"vcpu\":4,\"memory_mib\":2048}},",
+            "\"no_host_share\":true,\"esp_inspection\":{}}}\n"
+        ),
+        sha256::bytes_digest(&actual_bootfs),
+        digest(&request.esp, "ESP")?,
+        digest(&artifacts.symbols, "Deepwyrm symbols")?,
+        image_report.trim(),
+    ))
+}
+
+fn verify_candidate_inputs(request: &HRequest) -> Result<CandidateArtifacts, Failure> {
+    let artifacts = CandidateArtifacts {
+        loader: h_request::canonical_regular(
+            &request.loader,
+            "loader.efi",
+            MAX_GUEST_ARTIFACT_BYTES,
+        )?,
+        kernel: h_request::canonical_regular(
+            &request.kernel,
+            "deepwyrm.elf",
+            MAX_GUEST_ARTIFACT_BYTES,
+        )?,
+        symbols: h_request::canonical_regular(
+            &request.symbols,
+            "Deepwyrm symbols",
+            MAX_GUEST_ARTIFACT_BYTES,
+        )?,
+        bootstrap: h_request::canonical_regular(
+            &request.bootstrap,
+            "bootstrap.elf",
+            MAX_GUEST_ARTIFACT_BYTES,
+        )?,
+        init0: h_request::canonical_regular(
+            &request.init0,
+            "system/init0",
+            MAX_GUEST_ARTIFACT_BYTES,
+        )?,
+        hello: h_request::canonical_regular(&request.hello, "bin/hello", MAX_GUEST_ARTIFACT_BYTES)?,
+        ovmf_code: h_request::canonical_regular(
+            &request.ovmf_code,
+            "OVMF code",
+            MAX_FIRMWARE_BYTES,
+        )?,
+        ovmf_vars_template: h_request::canonical_regular(
+            &request.ovmf_vars_template,
+            "OVMF vars template",
+            MAX_FIRMWARE_BYTES,
+        )?,
+    };
+    for (path, label) in [
+        (&artifacts.loader, "loader.efi"),
+        (&artifacts.kernel, "deepwyrm.elf"),
+        (&artifacts.symbols, "Deepwyrm symbols"),
+        (&artifacts.bootstrap, "bootstrap.elf"),
+        (&artifacts.init0, "init0"),
+        (&artifacts.hello, "hello"),
+        (&artifacts.ovmf_code, "OVMF code"),
+        (&artifacts.ovmf_vars_template, "OVMF vars template"),
+    ] {
+        let display = path.to_string_lossy();
+        if display.contains([',', '\n', '\r']) {
+            return Err(Failure::task(format!(
+                "WYR0-H {label} path contains a delimiter unsupported by QEMU media arguments"
+            )));
+        }
+    }
+    Ok(artifacts)
+}
+
+fn build_bootfs_bytes(artifacts: &CandidateArtifacts) -> Result<Vec<u8>, Failure> {
+    let init0 = read_regular(&artifacts.init0, "init0", MAX_GUEST_ARTIFACT_BYTES)?;
+    let hello = read_regular(&artifacts.hello, "hello", MAX_GUEST_ARTIFACT_BYTES)?;
+    let mut builder = Builder::new();
+    builder
+        .add(b"system/init0", &init0, FileMode::Executable)
+        .map_err(|error| Failure::task(format!("could not add init0 to bootfs: {error:?}")))?;
+    builder
+        .add(b"bin/hello", &hello, FileMode::Executable)
+        .map_err(|error| Failure::task(format!("could not add hello to bootfs: {error:?}")))?;
+    builder
+        .build()
+        .map_err(|error| Failure::task(format!("could not build WYR0-H bootfs: {error:?}")))
+}
+
+fn image_arguments(request: &HRequest, artifacts: &CandidateArtifacts) -> G3ImageArguments {
+    G3ImageArguments {
+        image: request.esp.display().to_string(),
+        loader: artifacts.loader.display().to_string(),
+        kernel: artifacts.kernel.display().to_string(),
+        bootstrap: artifacts.bootstrap.display().to_string(),
+        bootfs: request.bootfs.display().to_string(),
+    }
+}
+
+fn write_provenance(request: &HRequest, artifacts: &CandidateArtifacts) -> Result<(), Failure> {
+    let contents = provenance_contents(request, artifacts)?;
+    write_new(&request.provenance, contents.as_bytes(), "provenance")
+}
+
+fn provenance_contents(
+    request: &HRequest,
+    artifacts: &CandidateArtifacts,
+) -> Result<String, Failure> {
+    Ok(format!(
+        concat!(
+            "schema_version = 1\n",
+            "phase = \"WYR0-H\"\n",
+            "deepwyrm_revision = \"{}\"\n",
+            "wyrmroot_revision = \"{}\"\n",
+            "rust_revision = \"{}\"\n",
+            "request_sha256 = \"{}\"\n",
+            "loader_sha256 = \"{}\"\n",
+            "kernel_sha256 = \"{}\"\n",
+            "symbols_sha256 = \"{}\"\n",
+            "bootstrap_sha256 = \"{}\"\n",
+            "init0_sha256 = \"{}\"\n",
+            "hello_sha256 = \"{}\"\n",
+            "bootfs_sha256 = \"{}\"\n",
+            "esp_sha256 = \"{}\"\n",
+            "default_vcpu = 1\n",
+            "default_memory_mib = 2048\n",
+            "smp_vcpu = 4\n",
+            "smp_memory_mib = 2048\n",
+            "machine = \"q35\"\n",
+            "firmware = \"OVMF\"\n",
+            "no_host_share = true\n",
+            "same_boot_media = true\n"
+        ),
+        request.deepwyrm_revision,
+        request.wyrmroot_revision,
+        request.rust_revision,
+        digest(&request.path, "WYR0-H request")?,
+        digest(&artifacts.loader, "loader.efi")?,
+        digest(&artifacts.kernel, "deepwyrm.elf")?,
+        digest(&artifacts.symbols, "Deepwyrm symbols")?,
+        digest(&artifacts.bootstrap, "bootstrap.elf")?,
+        digest(&artifacts.init0, "init0")?,
+        digest(&artifacts.hello, "hello")?,
+        digest(&request.bootfs, "bootfs")?,
+        digest(&request.esp, "ESP")?,
+    ))
+}
+
+fn execute(
+    profile: HProfile,
+    request: &HRequest,
+    artifacts: &CandidateArtifacts,
+    kind: ExecutionKind,
+) -> Result<String, Failure> {
+    let run = prepare_run_directory(profile, request, artifacts)?;
+    let args = qemu_arguments(profile, request, artifacts, kind, &run);
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&args)
+        .current_dir(
+            request
+                .path
+                .parent()
+                .ok_or_else(|| Failure::task("WYR0-H request has no parent"))?,
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(open_new(&run.stderr_log, "QEMU stderr")?))
+        .spawn()
+        .map_err(|error| {
+            Failure::task(format!("could not launch canonical WYR0-H QEMU: {error}"))
+        })?;
+
+    if kind == ExecutionKind::Gdb {
+        let status = Command::new("gdb")
+            .args(gdb_arguments(artifacts))
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status();
+        let status = match status {
+            Ok(status) => status,
+            Err(error) => {
+                stop_child(&mut child)?;
+                return Err(Failure::task(format!(
+                    "could not launch WYR0-H GDB: {error}"
+                )));
+            }
+        };
+        stop_child(&mut child)?;
+        if !status.success() {
+            return Err(Failure::task(format!(
+                "WYR0-H GDB exited with {}",
+                status_label(&status)
+            )));
+        }
+        return Ok(format!(
+            "{{\"schema_version\":1,\"phase\":\"WYR0-H\",\"mode\":\"gdb\",\"profile\":\"{}\",\"status\":\"PASS\",\"symbols_sha256\":\"{}\"}}\n",
+            profile.name(),
+            digest(&artifacts.symbols, "Deepwyrm symbols")?
+        ));
+    }
+
+    let status = wait_bounded(&mut child, request.timeout_seconds)?;
+    if kind == ExecutionKind::Run {
+        if !status.success() {
+            return Err(Failure::task(format!(
+                "WYR0-H run exited with {}",
+                status_label(&status)
+            )));
+        }
+        return Ok(format!(
+            "{{\"schema_version\":1,\"phase\":\"WYR0-H\",\"mode\":\"run\",\"profile\":\"{}\",\"status\":\"PASS\",\"qemu_exit_status\":0}}\n",
+            profile.name()
+        ));
+    }
+
+    let serial = read_regular(&run.serial_log, "integration serial log", MAX_SERIAL_BYTES)?;
+    let record = parse_terminal_record(&serial, request.test_id)?;
+    let expected_exit = match record.outcome {
+        GuestOutcome::Pass => 33,
+        GuestOutcome::Fail => 35,
+        GuestOutcome::Panic => 37,
+    };
+    if status.code() != Some(expected_exit) {
+        return Err(Failure::task(format!(
+            "WYR0-H serial outcome and QEMU debug-exit status disagree (expected {expected_exit}, observed {})",
+            status
+                .code()
+                .map_or_else(|| "signal".to_owned(), |code| code.to_string())
+        )));
+    }
+    let status_name = match record.outcome {
+        GuestOutcome::Pass if record.detail == 0 => "PASS",
+        GuestOutcome::Pass => "FAIL",
+        GuestOutcome::Fail => "FAIL",
+        GuestOutcome::Panic => "PANIC",
+    };
+    let result = format!(
+        concat!(
+            "{{\"schema_version\":1,\"phase\":\"WYR0-H\",",
+            "\"mode\":\"integration\",\"profile\":\"{}\",",
+            "\"status\":\"{}\",\"vcpu\":{},\"memory_mib\":{},",
+            "\"test_id\":{},\"detail\":{},\"serial_line\":{},",
+            "\"qemu_exit_status\":{},\"esp_sha256\":\"{}\",",
+            "\"deepwyrm_revision\":\"{}\",\"wyrmroot_revision\":\"{}\",",
+            "\"rust_revision\":\"{}\",\"no_host_share\":true}}\n"
+        ),
+        profile.name(),
+        status_name,
+        profile.vcpus(),
+        profile.memory_mib(),
+        record.test_id,
+        record.detail,
+        record.line,
+        expected_exit,
+        digest(&request.esp, "ESP")?,
+        request.deepwyrm_revision,
+        request.wyrmroot_revision,
+        request.rust_revision,
+    );
+    write_new(&run.result_json, result.as_bytes(), "integration result")?;
+    if status_name != "PASS" {
+        return Err(Failure::task(format!(
+            "WYR0-H {} profile returned {status_name} detail {:08X}",
+            profile.name(),
+            record.detail
+        )));
+    }
+    Ok(result)
+}
+
+struct RunPaths {
+    vars: PathBuf,
+    serial_log: PathBuf,
+    result_json: PathBuf,
+    stderr_log: PathBuf,
+}
+
+fn prepare_run_directory(
+    profile: HProfile,
+    request: &HRequest,
+    artifacts: &CandidateArtifacts,
+) -> Result<RunPaths, Failure> {
+    if !request.run_directory.exists() {
+        let parent = request
+            .run_directory
+            .parent()
+            .ok_or_else(|| Failure::task("run directory has no parent"))?;
+        fs::canonicalize(parent)
+            .map_err(|error| Failure::task(format!("could not resolve run parent: {error}")))?;
+        fs::create_dir(&request.run_directory)
+            .map_err(|error| Failure::task(format!("could not create run directory: {error}")))?;
+    }
+    let directory = request.run_directory.join(profile.name());
+    fs::create_dir(&directory).map_err(|error| {
+        Failure::task(format!(
+            "could not create fresh {} run directory: {error}",
+            profile.name()
+        ))
+    })?;
+    let vars = directory.join("OVMF_VARS.fd");
+    let serial_log = directory.join("serial.log");
+    let result_json = directory.join("result.json");
+    let stderr_log = directory.join("qemu.stderr.log");
+    let vars_bytes = read_regular(
+        &artifacts.ovmf_vars_template,
+        "OVMF vars template",
+        MAX_FIRMWARE_BYTES,
+    )?;
+    write_new(&vars, &vars_bytes, "request-local OVMF vars")?;
+    Ok(RunPaths {
+        vars,
+        serial_log,
+        result_json,
+        stderr_log,
+    })
+}
+
+fn qemu_arguments(
+    profile: HProfile,
+    request: &HRequest,
+    artifacts: &CandidateArtifacts,
+    kind: ExecutionKind,
+    run: &RunPaths,
+) -> Vec<String> {
+    let mut args = vec![
+        "-machine".into(),
+        "q35".into(),
+        "-m".into(),
+        format!("{}M", profile.memory_mib()),
+        "-smp".into(),
+        profile.vcpus().to_string(),
+        "-nodefaults".into(),
+        "-display".into(),
+        "none".into(),
+        "-monitor".into(),
+        "none".into(),
+        "-no-reboot".into(),
+        "-drive".into(),
+        format!(
+            "if=pflash,format=raw,readonly=on,file={}",
+            artifacts.ovmf_code.display()
+        ),
+        "-drive".into(),
+        format!("if=pflash,format=raw,file={}", run.vars.display()),
+        "-drive".into(),
+        format!(
+            "if=virtio,format=raw,readonly=on,file={}",
+            request.esp.display()
+        ),
+        "-serial".into(),
+        format!("file:{}", run.serial_log.display()),
+    ];
+    if kind == ExecutionKind::Integration {
+        args.extend([
+            "-fw_cfg".into(),
+            format!(
+                "name=opt/org.deepwyrm.test.selector,string={}",
+                request.selector
+            ),
+            "-device".into(),
+            "isa-debug-exit,iobase=0xf4,iosize=0x04".into(),
+        ]);
+    }
+    if kind == ExecutionKind::Gdb {
+        args.extend(["-S".into(), "-gdb".into(), "tcp:127.0.0.1:1234".into()]);
+    }
+    args
+}
+
+fn gdb_arguments(artifacts: &CandidateArtifacts) -> Vec<String> {
+    vec![
+        "-ex".into(),
+        "set architecture i386:x86-64".into(),
+        "-ex".into(),
+        format!("file {}", artifacts.symbols.display()),
+        "-ex".into(),
+        "target remote 127.0.0.1:1234".into(),
+    ]
+}
+
+fn parse_terminal_record(bytes: &[u8], expected_test_id: u32) -> Result<GuestRecord, Failure> {
+    let mut terminal = None;
+    for (index, line) in bytes.split_inclusive(|byte| *byte == b'\n').enumerate() {
+        if !line.starts_with(b"DWTEST1|") {
+            continue;
+        }
+        if line.len() != COMPLETION_RECORD_BYTES
+            || line[7] != b'|'
+            || line[10] != b'|'
+            || line[19] != b'|'
+            || line[28] != b'|'
+            || line[37] != b'\n'
+        {
+            return Err(Failure::task(format!(
+                "serial line {} contains a malformed DWTEST1 record",
+                index + 1
+            )));
+        }
+        let outcome = match &line[8..10] {
+            b"01" => GuestOutcome::Pass,
+            b"02" => GuestOutcome::Fail,
+            b"03" => GuestOutcome::Panic,
+            _ => {
+                return Err(Failure::task(format!(
+                    "serial line {} has an invalid DWTEST1 outcome",
+                    index + 1
+                )));
+            }
+        };
+        let test_id = parse_hex(&line[11..19]).ok_or_else(|| {
+            Failure::task(format!(
+                "serial line {} has an invalid DWTEST1 test id",
+                index + 1
+            ))
+        })?;
+        let detail = parse_hex(&line[20..28]).ok_or_else(|| {
+            Failure::task(format!(
+                "serial line {} has an invalid DWTEST1 detail",
+                index + 1
+            ))
+        })?;
+        let checksum = parse_hex(&line[29..37]).ok_or_else(|| {
+            Failure::task(format!(
+                "serial line {} has an invalid DWTEST1 checksum",
+                index + 1
+            ))
+        })?;
+        if checksum != fnv1a32(&line[..29]) {
+            return Err(Failure::task(format!(
+                "serial line {} has a mismatched DWTEST1 checksum",
+                index + 1
+            )));
+        }
+        if test_id != expected_test_id {
+            return Err(Failure::task(format!(
+                "serial line {} test id {test_id:08X} does not match request {expected_test_id:08X}",
+                index + 1
+            )));
+        }
+        if terminal.is_some() {
+            return Err(Failure::task(
+                "serial log contains duplicate DWTEST1 terminal records",
+            ));
+        }
+        terminal = Some(GuestRecord {
+            outcome,
+            test_id,
+            detail,
+            line: index + 1,
+        });
+    }
+    terminal.ok_or_else(|| Failure::task("serial log contains no DWTEST1 terminal record"))
+}
+
+fn parse_hex(bytes: &[u8]) -> Option<u32> {
+    if bytes.len() != 8
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'A'..=b'F').contains(byte))
+    {
+        return None;
+    }
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|value| u32::from_str_radix(value, 16).ok())
+}
+
+fn fnv1a32(bytes: &[u8]) -> u32 {
+    bytes.iter().fold(0x811c_9dc5, |hash, byte| {
+        (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193)
+    })
+}
+
+fn wait_bounded(child: &mut Child, timeout_seconds: u64) -> Result<ExitStatus, Failure> {
+    let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(error) => {
+                let _ = stop_child(child);
+                return Err(Failure::task(format!(
+                    "could not poll WYR0-H QEMU: {error}"
+                )));
+            }
+        }
+        if Instant::now() >= deadline {
+            stop_child(child)?;
+            return Err(Failure::task(format!(
+                "WYR0-H QEMU timed out after {timeout_seconds} seconds"
+            )));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn stop_child(child: &mut Child) -> Result<(), Failure> {
+    if child
+        .try_wait()
+        .map_err(|error| Failure::task(format!("could not poll child QEMU: {error}")))?
+        .is_none()
+    {
+        child
+            .kill()
+            .map_err(|error| Failure::task(format!("could not stop child QEMU: {error}")))?;
+    }
+    child
+        .wait()
+        .map_err(|error| Failure::task(format!("could not reap child QEMU: {error}")))?;
+    Ok(())
+}
+
+fn verify_source_revisions(request: &HRequest) -> Result<(), Failure> {
+    let repository = crate::tasks::repository_root()?;
+    let workspace = repository
+        .parent()
+        .ok_or_else(|| Failure::task("Wyrmroot repository has no workspace parent"))?;
+    for (path, expected, label) in [
+        (&repository, request.wyrmroot_revision.as_str(), "Wyrmroot"),
+        (
+            &workspace.join("deepwyrm"),
+            request.deepwyrm_revision.as_str(),
+            "Deepwyrm",
+        ),
+        (
+            &workspace.join("rust"),
+            request.rust_revision.as_str(),
+            "Rust",
+        ),
+    ] {
+        let revision = git_output(path, &["rev-parse", "HEAD"], label)?;
+        if revision.trim() != expected {
+            return Err(Failure::task(format!(
+                "WYR0-H request {label} revision does not match the current checkout"
+            )));
+        }
+        let dirty = git_output(
+            path,
+            &["status", "--porcelain", "--untracked-files=no"],
+            label,
+        )?;
+        if !dirty.trim().is_empty() {
+            return Err(Failure::task(format!(
+                "WYR0-H requires a clean tracked {label} checkout for exact revision provenance"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn git_output(repository: &Path, arguments: &[&str], label: &str) -> Result<String, Failure> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(arguments)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| Failure::task(format!("could not inspect {label} Git state: {error}")))?;
+    if !output.status.success() {
+        return Err(Failure::task(format!(
+            "could not inspect {label} Git state ({})",
+            status_label(&output.status)
+        )));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|_| Failure::task(format!("{label} Git output was not UTF-8")))
+}
+
+fn outputs_all_absent(request: &HRequest) -> Result<bool, Failure> {
+    let states = [
+        fs::symlink_metadata(&request.bootfs).is_ok(),
+        fs::symlink_metadata(&request.esp).is_ok(),
+        fs::symlink_metadata(&request.provenance).is_ok(),
+    ];
+    if states.iter().all(|state| !state) {
+        Ok(true)
+    } else if states.iter().all(|state| *state) {
+        Ok(false)
+    } else {
+        Err(Failure::task(
+            "WYR0-H candidate outputs are partial; use a fresh request output set",
+        ))
+    }
+}
+
+fn read_regular(path: &Path, label: &str, max_bytes: u64) -> Result<Vec<u8>, Failure> {
+    let path = h_request::canonical_regular(path, label, max_bytes)?;
+    fs::read(path).map_err(|error| Failure::task(format!("could not read {label}: {error}")))
+}
+
+fn write_new(path: &Path, bytes: &[u8], label: &str) -> Result<(), Failure> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::canonicalize(parent)
+        .map_err(|error| Failure::task(format!("could not resolve {label} parent: {error}")))?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| Failure::task(format!("could not create {label}: {error}")))?;
+    if let Err(error) = output.write_all(bytes).and_then(|()| output.sync_all()) {
+        drop(output);
+        remove_created(path);
+        return Err(Failure::task(format!("could not write {label}: {error}")));
+    }
+    Ok(())
+}
+
+fn open_new(path: &Path, label: &str) -> Result<fs::File, Failure> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::canonicalize(parent)
+        .map_err(|error| Failure::task(format!("could not resolve {label} parent: {error}")))?;
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| Failure::task(format!("could not create {label}: {error}")))
+}
+
+fn require_absent(path: &Path, label: &str) -> Result<(), Failure> {
+    if fs::symlink_metadata(path).is_ok() {
+        Err(Failure::task(format!("WYR0-H {label} already exists")))
+    } else {
+        Ok(())
+    }
+}
+
+fn digest(path: &Path, label: &str) -> Result<String, Failure> {
+    sha256::file_digest(path)
+        .map_err(|error| Failure::task(format!("could not hash {label}: {error}")))
+}
+
+fn remove_created(path: &Path) {
+    if fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or(false)
+    {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn status_label(status: &ExitStatus) -> String {
+    status.code().map_or_else(
+        || "signal termination".to_owned(),
+        |code| format!("status {code}"),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn terminal(status: &str, test_id: u32, detail: u32) -> Vec<u8> {
+        let mut record = format!("DWTEST1|{status}|{test_id:08X}|{detail:08X}|").into_bytes();
+        record.extend_from_slice(format!("{:08X}\n", fnv1a32(&record)).as_bytes());
+        record
+    }
+
+    #[test]
+    fn locked_profiles_share_media_contract_but_not_cpu_count() {
+        assert_eq!(HProfile::Default.vcpus(), 1);
+        assert_eq!(HProfile::Smp.vcpus(), 4);
+        assert_eq!(HProfile::Default.memory_mib(), 2048);
+        assert_eq!(HProfile::Smp.memory_mib(), 2048);
+    }
+
+    #[test]
+    fn terminal_parser_is_checksum_and_identity_strict() {
+        let mut log = b"loader diagnostic\n".to_vec();
+        log.extend_from_slice(&terminal("01", 18, 0));
+        assert_eq!(
+            parse_terminal_record(&log, 18).unwrap(),
+            GuestRecord {
+                outcome: GuestOutcome::Pass,
+                test_id: 18,
+                detail: 0,
+                line: 2,
+            }
+        );
+        assert!(parse_terminal_record(&log, 19).is_err());
+        let mut corrupt = log.clone();
+        *corrupt.last_mut().unwrap() = b'0';
+        assert!(parse_terminal_record(&corrupt, 18).is_err());
+        log.extend_from_slice(&terminal("01", 18, 0));
+        assert!(parse_terminal_record(&log, 18).is_err());
+    }
+
+    #[test]
+    fn qemu_and_gdb_plans_are_centralized_and_share_exact_symbols() {
+        let root = PathBuf::from("/candidate");
+        let request = HRequest {
+            path: root.join("request.toml"),
+            deepwyrm_revision: "1".repeat(40),
+            wyrmroot_revision: "2".repeat(40),
+            rust_revision: "3".repeat(40),
+            selector: "primordial-bootstrap".into(),
+            test_id: 18,
+            timeout_seconds: 180,
+            loader: root.join("loader.efi"),
+            kernel: root.join("deepwyrm.elf"),
+            symbols: root.join("deepwyrm.symbols"),
+            bootstrap: root.join("bootstrap.elf"),
+            init0: root.join("init0.elf"),
+            hello: root.join("hello.elf"),
+            bootfs: root.join("bootfs.img"),
+            esp: root.join("esp.img"),
+            provenance: root.join("provenance.toml"),
+            ovmf_code: root.join("OVMF_CODE.fd"),
+            ovmf_vars_template: root.join("OVMF_VARS.fd"),
+            run_directory: root.join("runs"),
+        };
+        let artifacts = CandidateArtifacts {
+            loader: request.loader.clone(),
+            kernel: request.kernel.clone(),
+            symbols: request.symbols.clone(),
+            bootstrap: request.bootstrap.clone(),
+            init0: request.init0.clone(),
+            hello: request.hello.clone(),
+            ovmf_code: request.ovmf_code.clone(),
+            ovmf_vars_template: request.ovmf_vars_template.clone(),
+        };
+        let run = RunPaths {
+            vars: request.run_directory.join("smp/OVMF_VARS.fd"),
+            serial_log: request.run_directory.join("smp/serial.log"),
+            result_json: request.run_directory.join("smp/result.json"),
+            stderr_log: request.run_directory.join("smp/qemu.stderr.log"),
+        };
+        let args = qemu_arguments(
+            HProfile::Smp,
+            &request,
+            &artifacts,
+            ExecutionKind::Integration,
+            &run,
+        );
+        let joined = args.join(" ");
+        assert!(joined.contains("-machine q35"));
+        assert!(joined.contains("-m 2048M"));
+        assert!(joined.contains("-smp 4"));
+        assert!(joined.contains("readonly=on,file=/candidate/esp.img"));
+        assert!(joined.contains("isa-debug-exit"));
+        for forbidden in ["virtfs", "virtiofs", "9p", "-net", "user,id="] {
+            assert!(!joined.contains(forbidden));
+        }
+        assert!(
+            gdb_arguments(&artifacts)
+                .join(" ")
+                .contains("file /candidate/deepwyrm.symbols")
+        );
+    }
+}
