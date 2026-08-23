@@ -56,12 +56,52 @@ const REQUIRED_KEYS_V3: &[&str] = &[
     "evidence_nonce",
     "required_evidence_mask",
 ];
+const REQUIRED_KEYS_V4: &[&str] = &[
+    "schema_version",
+    "deepwyrm_revision",
+    "wyrmroot_revision",
+    "rust_revision",
+    "selector",
+    "test_id",
+    "expected_outcome",
+    "expected_detail",
+    "timeout_seconds",
+    "loader",
+    "kernel",
+    "symbols",
+    "bootstrap",
+    "init0",
+    "hello",
+    "bootfs",
+    "esp",
+    "provenance",
+    "ovmf_code",
+    "ovmf_vars_template",
+    "run_directory",
+    "stress_seed",
+    "stress_run_count",
+    "stress_operations_per_run",
+    "stress_schedule_version",
+    "v0_manifest",
+];
 
 pub(crate) const I1_SELECTOR: &str = "smp-runtime-acceptance";
 pub(crate) const I1_TEST_ID: u32 = 23;
 pub(crate) const I1_EVIDENCE_PROTOCOL: &str = "dwevid1";
 pub(crate) const I1_EVIDENCE_NONCE: u64 = 0x0123_4567_89AB_CDEF;
 pub(crate) const I1_REQUIRED_EVIDENCE_MASK: u32 = 255;
+pub(crate) const I2_SELECTOR: &str = "smp-adversarial-stress";
+pub(crate) const I2_TEST_ID: u32 = 22;
+pub(crate) const I2_SCHEDULE_VERSION: &str = "dw-i2-splitmix64-v1";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StressRequest {
+    pub(crate) base_seed: u64,
+    pub(crate) run_count: u32,
+    pub(crate) operations_per_run: u32,
+    pub(crate) schedule_version: String,
+    pub(crate) v0_manifest: PathBuf,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExpectedOutcome {
@@ -111,6 +151,7 @@ pub(crate) struct HRequest {
     pub(crate) ovmf_vars_template: PathBuf,
     pub(crate) run_directory: PathBuf,
     pub(crate) evidence: Option<EvidenceRequest>,
+    pub(crate) stress: Option<StressRequest>,
 }
 
 pub(crate) fn load(path: &Path) -> Result<HRequest, Failure> {
@@ -127,9 +168,10 @@ pub(crate) fn load(path: &Path) -> Result<HRequest, Failure> {
     let required_keys = match schema_version {
         2 => REQUIRED_KEYS_V2,
         3 => REQUIRED_KEYS_V3,
+        4 => REQUIRED_KEYS_V4,
         _ => {
             return Err(Failure::task(
-                "WYR0-H acceptance commands require schema_version = 2 or 3",
+                "WYR0-H acceptance commands require schema_version = 2, 3, or 4",
             ));
         }
     };
@@ -154,9 +196,9 @@ pub(crate) fn load(path: &Path) -> Result<HRequest, Failure> {
     let expected_detail = number::<u32>(&values, "expected_detail")?;
     let evidence = match schema_version {
         2 => {
-            if selector == I1_SELECTOR {
+            if selector == I1_SELECTOR || selector == I2_SELECTOR {
                 return Err(Failure::task(
-                    "WYR0-H I1 selector requires schema_version = 3",
+                    "WYR0-H I1 and I2 selectors require their pinned schema versions",
                 ));
             }
             None
@@ -189,7 +231,51 @@ pub(crate) fn load(path: &Path) -> Result<HRequest, Failure> {
                 required_mask,
             })
         }
+        4 => None,
         _ => unreachable!("schema version admitted above"),
+    };
+    let stress = if schema_version == 4 {
+        if selector != I2_SELECTOR || test_id != I2_TEST_ID {
+            return Err(Failure::task(format!(
+                "WYR0-H schema_version = 4 is reserved for selector '{I2_SELECTOR}' with test_id {I2_TEST_ID}"
+            )));
+        }
+        if expected_outcome != ExpectedOutcome::Pass || expected_detail != 0 {
+            return Err(Failure::task(
+                "WYR0-H schema_version = 4 requires expected_outcome = \"pass\" and expected_detail = 0",
+            ));
+        }
+        let base_seed = number::<u64>(&values, "stress_seed")?;
+        if base_seed == 0 {
+            return Err(Failure::task("WYR0-H I2 stress_seed must be nonzero"));
+        }
+        let run_count = number::<u32>(&values, "stress_run_count")?;
+        if !(1..=64).contains(&run_count) {
+            return Err(Failure::task(
+                "WYR0-H I2 stress_run_count must be between 1 and 64",
+            ));
+        }
+        let operations_per_run = number::<u32>(&values, "stress_operations_per_run")?;
+        if !(32..=4096).contains(&operations_per_run) {
+            return Err(Failure::task(
+                "WYR0-H I2 stress_operations_per_run must be between 32 and 4096",
+            ));
+        }
+        let schedule_version = required(&values, "stress_schedule_version")?;
+        if schedule_version != I2_SCHEDULE_VERSION {
+            return Err(Failure::task(format!(
+                "WYR0-H I2 stress_schedule_version must be '{I2_SCHEDULE_VERSION}'"
+            )));
+        }
+        Some(StressRequest {
+            base_seed,
+            run_count,
+            operations_per_run,
+            schedule_version: schedule_version.to_owned(),
+            v0_manifest: output_path(&parent, required(&values, "v0_manifest")?, "v0_manifest")?,
+        })
+    } else {
+        None
     };
     let request = HRequest {
         path,
@@ -219,6 +305,7 @@ pub(crate) fn load(path: &Path) -> Result<HRequest, Failure> {
             "run_directory",
         )?,
         evidence,
+        stress,
     };
     if request.test_id == 0 {
         return Err(Failure::task("WYR0-H test_id must be nonzero"));
@@ -401,12 +488,15 @@ fn output_path(parent: &Path, value: &str, label: &str) -> Result<PathBuf, Failu
 }
 
 fn reject_output_aliases(request: &HRequest) -> Result<(), Failure> {
-    let outputs = [
+    let mut outputs = vec![
         (&request.bootfs, "bootfs"),
         (&request.esp, "esp"),
         (&request.provenance, "provenance"),
         (&request.run_directory, "run_directory"),
     ];
+    if let Some(stress) = &request.stress {
+        outputs.push((&stress.v0_manifest, "v0_manifest"));
+    }
     for (index, (left, left_label)) in outputs.iter().enumerate() {
         for (right, right_label) in outputs.iter().skip(index + 1) {
             if left == right {
@@ -431,6 +521,9 @@ pub(crate) fn validate_outputs(request: &HRequest) -> Result<(), Failure> {
         (&request.run_directory, "run_directory"),
     ] {
         validate_output_parent(request, path, label)?;
+    }
+    if let Some(stress) = &request.stress {
+        validate_output_parent(request, &stress.v0_manifest, "v0_manifest")?;
     }
     validate_run_directory(request)
 }
@@ -577,6 +670,23 @@ mod tests {
                 "evidence_protocol = \"dwevid1\"\n",
                 "evidence_nonce = \"0123456789ABCDEF\"\n",
                 "required_evidence_mask = 255\n"
+            )
+    }
+
+    fn valid_v4() -> String {
+        valid_v2()
+            .replace("schema_version = 2", "schema_version = 4")
+            .replace(
+                "selector = \"primordial-bootstrap\"",
+                "selector = \"smp-adversarial-stress\"",
+            )
+            .replace("test_id = 18", "test_id = 22")
+            + concat!(
+                "stress_seed = 81985529216486895\n",
+                "stress_run_count = 4\n",
+                "stress_operations_per_run = 256\n",
+                "stress_schedule_version = \"dw-i2-splitmix64-v1\"\n",
+                "v0_manifest = \"evidence/v0-manifest.toml\"\n"
             )
     }
 
@@ -763,6 +873,88 @@ mod tests {
             let invalid_path = write_request_fixture(&invalid_root, &request);
             assert!(load(&invalid_path).is_err(), "admitted invalid {label}");
             fs::remove_dir_all(invalid_root).expect("remove invalid fixture");
+        }
+        fs::remove_dir_all(root).expect("remove request fixture");
+    }
+
+    #[test]
+    fn schema_four_stress_fields_are_exact_and_bounded() {
+        let root = request_root("v4");
+        let path = write_request_fixture(&root, &valid_v4());
+        let loaded = load(&path).expect("valid I2 request rejected");
+        let stress = loaded.stress.expect("I2 request lacks stress binding");
+        assert_eq!(loaded.schema_version, 4);
+        assert_eq!(loaded.selector, I2_SELECTOR);
+        assert_eq!(loaded.test_id, I2_TEST_ID);
+        assert_eq!(stress.base_seed, I1_EVIDENCE_NONCE);
+        assert_eq!(stress.run_count, 4);
+        assert_eq!(stress.operations_per_run, 256);
+        assert_eq!(stress.schedule_version, I2_SCHEDULE_VERSION);
+        assert_eq!(
+            stress.v0_manifest,
+            fs::canonicalize(&root)
+                .expect("canonical request root")
+                .join("evidence/v0-manifest.toml")
+        );
+
+        for (label, request) in [
+            (
+                "v3",
+                valid_v4().replace("schema_version = 4", "schema_version = 3"),
+            ),
+            ("selector", valid_v4().replace(I2_SELECTOR, I1_SELECTOR)),
+            ("id", valid_v4().replace("test_id = 22", "test_id = 23")),
+            (
+                "zero-seed",
+                valid_v4().replace("stress_seed = 81985529216486895", "stress_seed = 0"),
+            ),
+            (
+                "zero-runs",
+                valid_v4().replace("stress_run_count = 4", "stress_run_count = 0"),
+            ),
+            (
+                "wide-runs",
+                valid_v4().replace("stress_run_count = 4", "stress_run_count = 65"),
+            ),
+            (
+                "few-ops",
+                valid_v4().replace(
+                    "stress_operations_per_run = 256",
+                    "stress_operations_per_run = 31",
+                ),
+            ),
+            (
+                "many-ops",
+                valid_v4().replace(
+                    "stress_operations_per_run = 256",
+                    "stress_operations_per_run = 4097",
+                ),
+            ),
+            (
+                "schedule",
+                valid_v4().replace(I2_SCHEDULE_VERSION, "dw-i2-other"),
+            ),
+            (
+                "outcome",
+                valid_v4().replace("expected_outcome = \"pass\"", "expected_outcome = \"fail\""),
+            ),
+            (
+                "detail",
+                valid_v4().replace("expected_detail = 0", "expected_detail = 1"),
+            ),
+            ("unknown", format!("{}unknown = 1\n", valid_v4())),
+            (
+                "escape",
+                valid_v4().replace("evidence/v0-manifest.toml", "../v0.toml"),
+            ),
+        ] {
+            let invalid_root = request_root(label);
+            let invalid_path = write_request_fixture(&invalid_root, &request);
+            assert!(
+                load(&invalid_path).is_err(),
+                "admitted hostile I2 request {label}"
+            );
+            fs::remove_dir_all(invalid_root).expect("remove invalid request fixture");
         }
         fs::remove_dir_all(root).expect("remove request fixture");
     }

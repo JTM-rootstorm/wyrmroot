@@ -12,7 +12,10 @@ use wyrmroot_bootfs::builder::{Builder, FileMode};
 
 use crate::cli::{G3ImageArguments, HProfile};
 use crate::error::Failure;
-use crate::h_request::{self, EvidenceRequest, ExpectedOutcome, HRequest, I1_EVIDENCE_PROTOCOL};
+use crate::h_request::{
+    self, EvidenceRequest, ExpectedOutcome, HRequest, I1_EVIDENCE_PROTOCOL, I2_SCHEDULE_VERSION,
+    StressRequest,
+};
 use crate::sha256;
 
 const MAX_GUEST_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
@@ -20,7 +23,11 @@ const MAX_FIRMWARE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SERIAL_BYTES: u64 = 16 * 1024 * 1024;
 const COMPLETION_RECORD_BYTES: usize = 38;
 const EVIDENCE_RECORD_BYTES: usize = 85;
+const STRESS_RECORD_BYTES: usize = 140;
 const MAX_EVIDENCE_RECORDS: usize = 64;
+const I2_CPU_MASK: u32 = 0x0000_000F;
+const I2_FAMILY_MASK: u32 = 0x0000_01FF;
+const SPLITMIX64_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
 const PROOF_CPU_ONLINE: u32 = 1 << 0;
 const PROOF_CPL3_SYSCALL: u32 = 1 << 1;
 const PROOF_BLOCKED_DESCENDANT: u32 = 1 << 2;
@@ -136,6 +143,44 @@ struct GuestTranscript {
     evidence: Option<ValidatedEvidence>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StressRun {
+    index: u32,
+    base_seed: u64,
+    seed: u64,
+    operations: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StressRecord {
+    outcome: GuestOutcome,
+    test_id: u32,
+    run_index: u32,
+    base_seed: u64,
+    seed: u64,
+    configured_operations: u32,
+    completed_operations: u32,
+    cpu_mask: u32,
+    family_mask: u32,
+    detail: u32,
+    failing_operation: u32,
+    stage: u32,
+    line: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StressTranscript {
+    stress: StressRecord,
+    terminal: GuestRecord,
+}
+
+struct StressSummaryDisposition<'a> {
+    status: &'a str,
+    failing_index: Option<u32>,
+    reason: Option<&'a str>,
+    candidate_revalidated: bool,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct CandidateArtifacts {
     loader: PathBuf,
@@ -214,6 +259,11 @@ pub(crate) fn inspect(request_path: &str) -> Result<String, Failure> {
 pub(crate) fn run(profile: HProfile, request_path: &str) -> Result<String, Failure> {
     let request = h_request::load(Path::new(request_path))?;
     validate_execution_profile(&request, Some(profile))?;
+    if request.stress.is_some() {
+        return Err(Failure::task(
+            "WYR0-H schema_version = 4 is accepted only by test integration wyr0 smp",
+        ));
+    }
     verify_source_revisions(&request)?;
     let artifacts = verify_candidate_inputs(&request)?;
     inspect_loaded(&request, &artifacts)?;
@@ -223,6 +273,11 @@ pub(crate) fn run(profile: HProfile, request_path: &str) -> Result<String, Failu
 pub(crate) fn gdb(profile: HProfile, request_path: &str) -> Result<String, Failure> {
     let request = h_request::load(Path::new(request_path))?;
     validate_execution_profile(&request, Some(profile))?;
+    if request.stress.is_some() {
+        return Err(Failure::task(
+            "WYR0-H schema_version = 4 is accepted only by test integration wyr0 smp",
+        ));
+    }
     verify_source_revisions(&request)?;
     let artifacts = verify_candidate_inputs(&request)?;
     inspect_loaded(&request, &artifacts)?;
@@ -254,6 +309,7 @@ pub(crate) fn integration(
     }
     let inspection = inspect_loaded(&request, &artifacts)?;
     match profile {
+        Some(_) if request.stress.is_some() => execute_stress(&request, &artifacts),
         Some(profile) => execute(profile, &request, &artifacts, ExecutionKind::Integration),
         None => {
             let default = execute(
@@ -277,9 +333,9 @@ fn validate_execution_profile(
     request: &HRequest,
     profile: Option<HProfile>,
 ) -> Result<(), Failure> {
-    if request.schema_version == 3 && profile != Some(HProfile::Smp) {
+    if matches!(request.schema_version, 3 | 4) && profile != Some(HProfile::Smp) {
         return Err(Failure::task(
-            "WYR0-H schema_version = 3 execution requires an explicit smp profile",
+            "WYR0-H schema_version = 3 or 4 execution requires an explicit smp profile",
         ));
     }
     Ok(())
@@ -651,7 +707,7 @@ fn execute(
 ) -> Result<String, Failure> {
     let run = prepare_run_directory(profile, request, artifacts)?;
     let pre_execution_manifest = result_manifest_json(request, artifacts)?;
-    let args = qemu_arguments(profile, request, artifacts, kind, &run);
+    let args = qemu_arguments(profile, request, artifacts, kind, &run, None);
     let spawned = Command::new("qemu-system-x86_64")
         .args(&args)
         .current_dir(
@@ -902,6 +958,484 @@ fn execute(
     Ok(result)
 }
 
+fn execute_stress(request: &HRequest, artifacts: &CandidateArtifacts) -> Result<String, Failure> {
+    let stress = request
+        .stress
+        .as_ref()
+        .ok_or_else(|| Failure::task("I2 execution lacks a schema-v4 stress request"))?;
+    let i2_directory = prepare_stress_directory(request, stress)?;
+    let pre_execution_manifest = result_manifest_json(request, artifacts)?;
+    let mut results = Vec::new();
+    let mut failure = None;
+    for index in 0..stress.run_count {
+        let run = StressRun {
+            index,
+            base_seed: stress.base_seed,
+            seed: splitmix64_seed(stress.base_seed, index),
+            operations: stress.operations_per_run,
+        };
+        let paths = prepare_stress_run_directory(request, artifacts, &i2_directory, run)?;
+        let outcome = execute_stress_run(request, artifacts, run, &paths, &pre_execution_manifest);
+        let result_digest = digest(&paths.result_json, "I2 run result")?;
+        let passed = outcome.is_ok();
+        results.push((run, result_digest, passed));
+        if let Err(error) = outcome {
+            failure = Some((index, error));
+            break;
+        }
+    }
+
+    let revalidation = revalidate_before_pass(request, artifacts, &pre_execution_manifest);
+    let (status, failing_index, reason) = match (&failure, &revalidation) {
+        (None, Ok(())) if results.len() == stress.run_count as usize => ("PASS", None, None),
+        (Some((index, error)), Ok(())) => ("FAIL", Some(*index), Some(error.message.as_str())),
+        (_, Err(error)) => (
+            "ERROR",
+            failure.as_ref().map(|item| item.0),
+            Some(error.message.as_str()),
+        ),
+        _ => (
+            "ERROR",
+            None,
+            Some("I2 runner did not complete every requested run"),
+        ),
+    };
+    let summary = stress_summary_json(
+        request,
+        stress,
+        StressSummaryDisposition {
+            status,
+            failing_index,
+            reason,
+            candidate_revalidated: revalidation.is_ok(),
+        },
+        &pre_execution_manifest,
+        &results,
+    )?;
+    let summary_path = i2_directory.join("summary.json");
+    write_new(request, &summary_path, summary.as_bytes(), "I2 summary")?;
+    if status != "PASS" {
+        let detail = failure
+            .map(|(_, error)| error.message)
+            .or_else(|| revalidation.err().map(|error| error.message))
+            .unwrap_or_else(|| "I2 did not complete every requested run".to_owned());
+        return Err(Failure::task(format!(
+            "WYR0-H I2 stress failed; durable summary {}: {detail}",
+            summary_path.display()
+        )));
+    }
+    Ok(summary)
+}
+
+fn prepare_stress_directory(
+    request: &HRequest,
+    stress: &StressRequest,
+) -> Result<PathBuf, Failure> {
+    h_request::validate_outputs(request)?;
+    require_absent(request, &stress.v0_manifest, "V0 manifest output")?;
+    if !request.run_directory.exists() {
+        fs::create_dir(&request.run_directory)
+            .map_err(|error| Failure::task(format!("could not create run directory: {error}")))?;
+    }
+    h_request::validate_outputs(request)?;
+    let directory = request.run_directory.join("i2");
+    fs::create_dir(&directory)
+        .map_err(|error| Failure::task(format!("could not create fresh I2 directory: {error}")))?;
+    Ok(directory)
+}
+
+fn prepare_stress_run_directory(
+    request: &HRequest,
+    artifacts: &CandidateArtifacts,
+    i2_directory: &Path,
+    run: StressRun,
+) -> Result<RunPaths, Failure> {
+    let directory = i2_directory.join(format!("run-{:06}", run.index));
+    h_request::validate_output_parent(request, &directory, "I2 run directory")?;
+    fs::create_dir(&directory).map_err(|error| {
+        Failure::task(format!(
+            "could not create fresh I2 run {:06} directory: {error}",
+            run.index
+        ))
+    })?;
+    let paths = RunPaths {
+        vars: directory.join("OVMF_VARS.fd"),
+        serial_log: directory.join("serial.log"),
+        result_json: directory.join("result.json"),
+        stderr_log: directory.join("qemu.stderr.log"),
+    };
+    let vars = read_regular(
+        &artifacts.ovmf_vars_template,
+        "OVMF vars template",
+        MAX_FIRMWARE_BYTES,
+    )?;
+    write_new(request, &paths.vars, &vars, "I2 request-local OVMF vars")?;
+    Ok(paths)
+}
+
+fn execute_stress_run(
+    request: &HRequest,
+    artifacts: &CandidateArtifacts,
+    stress: StressRun,
+    paths: &RunPaths,
+    pre_execution_manifest: &str,
+) -> Result<String, Failure> {
+    let args = qemu_arguments(
+        HProfile::Smp,
+        request,
+        artifacts,
+        ExecutionKind::Integration,
+        paths,
+        Some(stress),
+    );
+    let spawned = Command::new("qemu-system-x86_64")
+        .args(&args)
+        .current_dir(
+            request
+                .path
+                .parent()
+                .ok_or_else(|| Failure::task("WYR0-H request has no parent"))?,
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(open_new(
+            request,
+            &paths.stderr_log,
+            "I2 QEMU stderr",
+        )?))
+        .spawn();
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(error) => {
+            write_stress_host_failure(
+                request,
+                stress,
+                paths,
+                "qemu_spawn_failed",
+                None,
+                pre_execution_manifest,
+            )?;
+            return Err(Failure::task(format!(
+                "could not launch canonical WYR0-H I2 QEMU: {error}"
+            )));
+        }
+    };
+    let exit = match wait_bounded(&mut child, request.timeout_seconds) {
+        Ok(WaitOutcome::Exited(status)) => status,
+        Ok(WaitOutcome::TimedOut(cleanup)) => {
+            write_stress_host_failure(
+                request,
+                stress,
+                paths,
+                "qemu_timeout",
+                Some(cleanup),
+                pre_execution_manifest,
+            )?;
+            return Err(Failure::task(format!(
+                "WYR0-H I2 QEMU timed out after {} seconds",
+                request.timeout_seconds
+            )));
+        }
+        Err(error) => {
+            write_stress_host_failure(
+                request,
+                stress,
+                paths,
+                "qemu_wait_failed",
+                Some(error.cleanup),
+                pre_execution_manifest,
+            )?;
+            return Err(error.failure);
+        }
+    };
+    let serial = match read_regular(&paths.serial_log, "I2 serial log", MAX_SERIAL_BYTES) {
+        Ok(serial) => serial,
+        Err(error) => {
+            write_stress_host_failure(
+                request,
+                stress,
+                paths,
+                "serial_log_unreadable",
+                Some(CleanupDisposition::exited()),
+                pre_execution_manifest,
+            )?;
+            return Err(error);
+        }
+    };
+    let transcript = match parse_stress_transcript(&serial, request.test_id, stress) {
+        Ok(transcript) => transcript,
+        Err(error) => {
+            write_stress_host_failure(
+                request,
+                stress,
+                paths,
+                "transcript_invalid",
+                Some(CleanupDisposition::exited()),
+                pre_execution_manifest,
+            )?;
+            return Err(error);
+        }
+    };
+    let expected_exit = match transcript.terminal.outcome {
+        GuestOutcome::Pass => 33,
+        GuestOutcome::Fail => 35,
+        GuestOutcome::Panic => 37,
+    };
+    if exit.code() != Some(expected_exit) {
+        write_stress_host_failure(
+            request,
+            stress,
+            paths,
+            "terminal_exit_mismatch",
+            Some(CleanupDisposition::exited()),
+            pre_execution_manifest,
+        )?;
+        return Err(Failure::task(
+            "I2 terminal outcome and QEMU debug-exit status disagree",
+        ));
+    }
+    let accepted = transcript.stress.outcome == GuestOutcome::Pass
+        && transcript.stress.detail == 0
+        && transcript.terminal.outcome == GuestOutcome::Pass
+        && transcript.terminal.detail == 0;
+    if accepted
+        && let Err(error) = revalidate_before_pass(request, artifacts, pre_execution_manifest)
+    {
+        write_stress_host_failure(
+            request,
+            stress,
+            paths,
+            "candidate_revalidation_failed",
+            Some(CleanupDisposition::exited()),
+            pre_execution_manifest,
+        )?;
+        return Err(error);
+    }
+    let status = if accepted { "PASS" } else { "FAIL" };
+    let result = stress_result_json(
+        request,
+        stress,
+        paths,
+        transcript,
+        status,
+        expected_exit,
+        pre_execution_manifest,
+    )?;
+    write_new(
+        request,
+        &paths.result_json,
+        result.as_bytes(),
+        "I2 run result",
+    )?;
+    if !accepted {
+        return Err(Failure::task(format!(
+            "I2 run {} reported {} detail {:08X} at operation {:08X} stage {:08X}",
+            stress.index,
+            transcript.stress.outcome.name(),
+            transcript.stress.detail,
+            transcript.stress.failing_operation,
+            transcript.stress.stage
+        )));
+    }
+    Ok(result)
+}
+
+fn stress_result_json(
+    request: &HRequest,
+    run: StressRun,
+    paths: &RunPaths,
+    transcript: StressTranscript,
+    status: &str,
+    exit_status: i32,
+    candidate_manifest: &str,
+) -> Result<String, Failure> {
+    let serial = digest(&paths.serial_log, "I2 serial log")?;
+    let stderr = digest_allow_empty(&paths.stderr_log, "I2 QEMU stderr")?;
+    let vars = digest(&paths.vars, "I2 OVMF vars")?;
+    Ok(format!(
+        concat!(
+            "{{\"schema_version\":4,\"phase\":\"WYR0-H-I2\",\"status\":\"{}\",",
+            "\"profile\":\"smp\",\"test_id\":{},\"run_index\":{},",
+            "\"stress_schedule_version\":\"{}\",\"stress_base_seed\":\"{:016X}\",",
+            "\"stress_seed\":\"{:016X}\",\"configured_operations\":{},",
+            "\"completed_operations\":{},\"cpu_mask\":{},\"family_mask\":{},",
+            "\"actual_outcome\":\"{}\",\"detail\":{},\"failing_operation\":{},",
+            "\"stage\":{},\"stress_serial_line\":{},\"terminal_serial_line\":{},",
+            "\"qemu_exit_status\":{},\"serial_sha256\":\"{}\",",
+            "\"qemu_stderr_sha256\":\"{}\",\"ovmf_vars_sha256\":\"{}\",{}",
+            "\"deepwyrm_revision\":\"{}\",\"wyrmroot_revision\":\"{}\",",
+            "\"rust_revision\":\"{}\",\"candidate_revalidated\":{},",
+            "\"no_host_share\":true}}\n"
+        ),
+        status,
+        transcript.stress.test_id,
+        run.index,
+        I2_SCHEDULE_VERSION,
+        run.base_seed,
+        run.seed,
+        transcript.stress.configured_operations,
+        transcript.stress.completed_operations,
+        transcript.stress.cpu_mask,
+        transcript.stress.family_mask,
+        transcript.stress.outcome.name(),
+        transcript.stress.detail,
+        transcript.stress.failing_operation,
+        transcript.stress.stage,
+        transcript.stress.line,
+        transcript.terminal.line,
+        exit_status,
+        serial,
+        stderr,
+        vars,
+        candidate_manifest,
+        request.deepwyrm_revision,
+        request.wyrmroot_revision,
+        request.rust_revision,
+        status == "PASS",
+    ))
+}
+
+fn write_stress_host_failure(
+    request: &HRequest,
+    run: StressRun,
+    paths: &RunPaths,
+    reason: &str,
+    cleanup: Option<CleanupDisposition>,
+    candidate_manifest: &str,
+) -> Result<(), Failure> {
+    let vars = digest(&paths.vars, "I2 OVMF vars")?;
+    let serial = optional_digest_json_allow_empty(&paths.serial_log, "I2 serial log")?;
+    let stderr = optional_digest_json_allow_empty(&paths.stderr_log, "I2 QEMU stderr")?;
+    let cleanup = cleanup.unwrap_or_else(CleanupDisposition::not_started);
+    let result = format!(
+        concat!(
+            "{{\"schema_version\":4,\"phase\":\"WYR0-H-I2\",\"status\":\"ERROR\",",
+            "\"reason\":\"{}\",\"profile\":\"smp\",\"test_id\":{},\"run_index\":{},",
+            "\"stress_schedule_version\":\"{}\",\"stress_base_seed\":\"{:016X}\",",
+            "\"stress_seed\":\"{:016X}\",\"configured_operations\":{},",
+            "\"serial_sha256\":{},\"qemu_stderr_sha256\":{},\"ovmf_vars_sha256\":\"{}\",",
+            "\"cleanup_disposition\":\"{}\",\"cleanup_killed\":{},\"cleanup_reaped\":{},{}",
+            "\"deepwyrm_revision\":\"{}\",\"wyrmroot_revision\":\"{}\",",
+            "\"rust_revision\":\"{}\",\"candidate_revalidated\":false,",
+            "\"no_host_share\":true}}\n"
+        ),
+        reason,
+        request.test_id,
+        run.index,
+        I2_SCHEDULE_VERSION,
+        run.base_seed,
+        run.seed,
+        run.operations,
+        serial,
+        stderr,
+        vars,
+        cleanup.name,
+        cleanup.killed,
+        cleanup.reaped,
+        candidate_manifest,
+        request.deepwyrm_revision,
+        request.wyrmroot_revision,
+        request.rust_revision,
+    );
+    write_new(
+        request,
+        &paths.result_json,
+        result.as_bytes(),
+        "I2 host-failure result",
+    )
+}
+
+fn stress_summary_json(
+    request: &HRequest,
+    stress: &StressRequest,
+    disposition: StressSummaryDisposition<'_>,
+    candidate_manifest: &str,
+    results: &[(StressRun, String, bool)],
+) -> Result<String, Failure> {
+    let mut ordered = String::from("[");
+    for (position, (run, digest, passed)) in results.iter().enumerate() {
+        if position != 0 {
+            ordered.push(',');
+        }
+        ordered.push_str(&format!(
+            "{{\"run_index\":{},\"seed\":\"{:016X}\",\"result_sha256\":\"{}\",\"status\":\"{}\"}}",
+            run.index,
+            run.seed,
+            digest,
+            if *passed { "PASS" } else { "FAIL" }
+        ));
+    }
+    ordered.push(']');
+    let failing = disposition
+        .failing_index
+        .map_or_else(|| "null".to_owned(), |index| index.to_string());
+    let reason = disposition.reason.map_or_else(
+        || "null".to_owned(),
+        |reason| format!("\"{}\"", json_escape(reason)),
+    );
+    Ok(format!(
+        concat!(
+            "{{\"schema_version\":4,\"phase\":\"WYR0-H-I2\",\"kind\":\"stress-summary\",",
+            "\"status\":\"{}\",\"selector\":\"{}\",\"test_id\":{},",
+            "\"stress_schedule_version\":\"{}\",\"stress_base_seed\":\"{:016X}\",",
+            "\"requested_runs\":{},\"completed_runs\":{},\"failing_run_index\":{},",
+            "\"operations_per_run\":{},\"reason\":{},\"ordered_results\":{},{}",
+            "\"deepwyrm_revision\":\"{}\",\"wyrmroot_revision\":\"{}\",",
+            "\"rust_revision\":\"{}\",\"candidate_revalidated\":{}}}\n"
+        ),
+        disposition.status,
+        request.selector,
+        request.test_id,
+        stress.schedule_version,
+        stress.base_seed,
+        stress.run_count,
+        results.iter().filter(|(_, _, passed)| *passed).count(),
+        failing,
+        stress.operations_per_run,
+        reason,
+        ordered,
+        candidate_manifest,
+        request.deepwyrm_revision,
+        request.wyrmroot_revision,
+        request.rust_revision,
+        disposition.candidate_revalidated,
+    ))
+}
+
+fn digest_allow_empty(path: &Path, label: &str) -> Result<String, Failure> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| Failure::task(format!("could not inspect {label}: {error}")))?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_SERIAL_BYTES {
+        return Err(Failure::task(format!(
+            "{label} must be a bounded regular file"
+        )));
+    }
+    digest(path, label)
+}
+
+fn optional_digest_json_allow_empty(path: &Path, label: &str) -> Result<String, Failure> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(format!("\"{}\"", digest_allow_empty(path, label)?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok("null".to_owned()),
+        Err(error) => Err(Failure::task(format!("could not inspect {label}: {error}"))),
+    }
+}
+
+fn json_escape(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|character| match character {
+            '\\' => "\\\\".chars().collect::<Vec<_>>(),
+            '"' => "\\\"".chars().collect::<Vec<_>>(),
+            '\n' => "\\n".chars().collect::<Vec<_>>(),
+            '\r' => "\\r".chars().collect::<Vec<_>>(),
+            '\t' => "\\t".chars().collect::<Vec<_>>(),
+            character if character.is_control() => '?'.to_string().chars().collect(),
+            character => vec![character],
+        })
+        .collect()
+}
+
 fn guest_expectation_matches(request: &HRequest, record: GuestRecord) -> bool {
     if request.schema_version == 3 {
         return request.expected_outcome == ExpectedOutcome::Pass
@@ -1060,6 +1594,7 @@ fn qemu_arguments(
     artifacts: &CandidateArtifacts,
     kind: ExecutionKind,
     run: &RunPaths,
+    stress: Option<StressRun>,
 ) -> Vec<String> {
     let mut args = vec![
         "-machine".into(),
@@ -1099,6 +1634,19 @@ fn qemu_arguments(
             "-device".into(),
             "isa-debug-exit,iobase=0xf4,iosize=0x04".into(),
         ]);
+        if let Some(stress) = stress {
+            for (name, value) in [
+                ("run-index", stress.index.to_string()),
+                ("base-seed", format!("{:016X}", stress.base_seed)),
+                ("seed", format!("{:016X}", stress.seed)),
+                ("operations", stress.operations.to_string()),
+            ] {
+                args.extend([
+                    "-fw_cfg".into(),
+                    format!("name=opt/org.deepwyrm.test.stress.{name},string={value}"),
+                ]);
+            }
+        }
     }
     if kind == ExecutionKind::Gdb {
         args.extend(["-S".into(), "-gdb".into(), "tcp:127.0.0.1:1234".into()]);
@@ -1142,6 +1690,176 @@ fn parse_terminal_record(bytes: &[u8], expected_test_id: u32) -> Result<GuestRec
         terminal = Some(record);
     }
     terminal.ok_or_else(|| Failure::task("serial log contains no DWTEST1 terminal record"))
+}
+
+fn splitmix64_seed(base_seed: u64, run_index: u32) -> u64 {
+    let mut value =
+        base_seed.wrapping_add(SPLITMIX64_GAMMA.wrapping_mul(u64::from(run_index).wrapping_add(1)));
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    let mixed = value ^ (value >> 31);
+    if mixed == 0 { SPLITMIX64_GAMMA } else { mixed }
+}
+
+fn parse_stress_transcript(
+    bytes: &[u8],
+    expected_test_id: u32,
+    run: StressRun,
+) -> Result<StressTranscript, Failure> {
+    let mut stress = None;
+    let mut terminal = None;
+    for (index, line) in bytes.split_inclusive(|byte| *byte == b'\n').enumerate() {
+        let line_number = index + 1;
+        if resembles_protocol_magic(line, b"DWSTRESS1") {
+            if terminal.is_some() {
+                return Err(Failure::task(format!(
+                    "serial line {line_number} contains DWSTRESS1 after the terminal record"
+                )));
+            }
+            let record = parse_stress_line(line, line_number, expected_test_id, run)?;
+            if stress.replace(record).is_some() {
+                return Err(Failure::task(
+                    "serial log contains duplicate DWSTRESS1 records",
+                ));
+            }
+            continue;
+        }
+        if resembles_protocol_magic(line, b"DWTEST1") {
+            let record = parse_terminal_line(line, line_number, expected_test_id)?;
+            if terminal.replace(record).is_some() {
+                return Err(Failure::task(
+                    "serial log contains duplicate DWTEST1 terminal records",
+                ));
+            }
+        }
+    }
+    let stress =
+        stress.ok_or_else(|| Failure::task("I2 serial log contains no DWSTRESS1 record"))?;
+    let terminal = terminal
+        .ok_or_else(|| Failure::task("I2 serial log contains no DWTEST1 terminal record"))?;
+    if stress.line >= terminal.line {
+        return Err(Failure::task(
+            "I2 DWSTRESS1 record must precede the DWTEST1 terminal record",
+        ));
+    }
+    if stress.outcome != terminal.outcome || stress.detail != terminal.detail {
+        return Err(Failure::task(
+            "I2 DWSTRESS1 and DWTEST1 outcomes or details disagree",
+        ));
+    }
+    Ok(StressTranscript { stress, terminal })
+}
+
+fn parse_stress_line(
+    line: &[u8],
+    line_number: usize,
+    expected_test_id: u32,
+    expected_run: StressRun,
+) -> Result<StressRecord, Failure> {
+    const DELIMITERS: &[usize] = &[9, 12, 21, 30, 47, 64, 73, 82, 91, 100, 103, 112, 121, 130];
+    if line.len() != STRESS_RECORD_BYTES
+        || &line[..9] != b"DWSTRESS1"
+        || DELIMITERS.iter().any(|index| line[*index] != b'|')
+        || line[139] != b'\n'
+    {
+        return Err(Failure::task(format!(
+            "serial line {line_number} contains a malformed DWSTRESS1 record"
+        )));
+    }
+    if &line[10..12] != b"01" {
+        return Err(Failure::task(format!(
+            "serial line {line_number} has an unsupported DWSTRESS1 version"
+        )));
+    }
+    let test_id = stress_hex_u32(&line[13..21], line_number, "test id")?;
+    let run_index = stress_hex_u32(&line[22..30], line_number, "run index")?;
+    let base_seed = stress_hex_u64(&line[31..47], line_number, "base seed")?;
+    let seed = stress_hex_u64(&line[48..64], line_number, "seed")?;
+    let configured_operations =
+        stress_hex_u32(&line[65..73], line_number, "configured operations")?;
+    let completed_operations = stress_hex_u32(&line[74..82], line_number, "completed operations")?;
+    let cpu_mask = stress_hex_u32(&line[83..91], line_number, "CPU mask")?;
+    let family_mask = stress_hex_u32(&line[92..100], line_number, "family mask")?;
+    let outcome = match &line[101..103] {
+        b"01" => GuestOutcome::Pass,
+        b"02" => GuestOutcome::Fail,
+        b"03" => GuestOutcome::Panic,
+        _ => {
+            return Err(Failure::task(format!(
+                "serial line {line_number} has an invalid DWSTRESS1 outcome"
+            )));
+        }
+    };
+    let detail = stress_hex_u32(&line[104..112], line_number, "detail")?;
+    let failing_operation = stress_hex_u32(&line[113..121], line_number, "failing operation")?;
+    let stage = stress_hex_u32(&line[122..130], line_number, "stage")?;
+    let checksum = stress_hex_u32(&line[131..139], line_number, "checksum")?;
+    if checksum != fnv1a32(&line[..131]) {
+        return Err(Failure::task(format!(
+            "serial line {line_number} has a mismatched DWSTRESS1 checksum"
+        )));
+    }
+    if test_id != expected_test_id
+        || run_index != expected_run.index
+        || base_seed != expected_run.base_seed
+        || seed != expected_run.seed
+        || configured_operations != expected_run.operations
+    {
+        return Err(Failure::task(format!(
+            "serial line {line_number} DWSTRESS1 identity or configuration does not match the request"
+        )));
+    }
+    if completed_operations > configured_operations
+        || cpu_mask & !I2_CPU_MASK != 0
+        || family_mask & !I2_FAMILY_MASK != 0
+    {
+        return Err(Failure::task(format!(
+            "serial line {line_number} DWSTRESS1 reports invalid progress or masks"
+        )));
+    }
+    if outcome == GuestOutcome::Pass
+        && (completed_operations != configured_operations
+            || cpu_mask != I2_CPU_MASK
+            || family_mask != I2_FAMILY_MASK
+            || detail != 0
+            || failing_operation != u32::MAX
+            || stage != 0)
+    {
+        return Err(Failure::task(format!(
+            "serial line {line_number} DWSTRESS1 PASS lacks the complete I2 proof"
+        )));
+    }
+    Ok(StressRecord {
+        outcome,
+        test_id,
+        run_index,
+        base_seed,
+        seed,
+        configured_operations,
+        completed_operations,
+        cpu_mask,
+        family_mask,
+        detail,
+        failing_operation,
+        stage,
+        line: line_number,
+    })
+}
+
+fn stress_hex_u32(bytes: &[u8], line_number: usize, field: &str) -> Result<u32, Failure> {
+    parse_hex(bytes).ok_or_else(|| {
+        Failure::task(format!(
+            "serial line {line_number} has an invalid DWSTRESS1 {field}"
+        ))
+    })
+}
+
+fn stress_hex_u64(bytes: &[u8], line_number: usize, field: &str) -> Result<u64, Failure> {
+    parse_hex_u64(bytes).ok_or_else(|| {
+        Failure::task(format!(
+            "serial line {line_number} has an invalid DWSTRESS1 {field}"
+        ))
+    })
 }
 
 fn parse_evidence_transcript(
@@ -1800,6 +2518,50 @@ fn verify_source_revisions(request: &HRequest) -> Result<(), Failure> {
     Ok(())
 }
 
+pub(crate) fn freeze_candidate_fields(request_path: &Path) -> Result<String, Failure> {
+    let request = h_request::load(request_path)?;
+    if request.schema_version != 4 || request.stress.is_none() {
+        return Err(Failure::task(
+            "V0 freeze candidate_request must be the admitted schema-v4 I2 request",
+        ));
+    }
+    verify_source_revisions(&request)?;
+    let artifacts = verify_candidate_inputs(&request)?;
+    inspect_loaded(&request, &artifacts)?;
+    let digests = candidate_digests(&request, &artifacts)?;
+    let provenance = digest(&request.provenance, "provenance")?;
+    Ok(format!(
+        concat!(
+            "candidate_request_sha256 = \"{}\"\n",
+            "candidate_sha256 = \"{}\"\n",
+            "loader_sha256 = \"{}\"\n",
+            "kernel_sha256 = \"{}\"\n",
+            "symbols_sha256 = \"{}\"\n",
+            "bootstrap_sha256 = \"{}\"\n",
+            "init0_sha256 = \"{}\"\n",
+            "hello_sha256 = \"{}\"\n",
+            "bootfs_sha256 = \"{}\"\n",
+            "esp_sha256 = \"{}\"\n",
+            "ovmf_code_sha256 = \"{}\"\n",
+            "ovmf_vars_template_sha256 = \"{}\"\n",
+            "provenance_sha256 = \"{}\"\n"
+        ),
+        digests.request,
+        digests.candidate,
+        digests.loader,
+        digests.kernel,
+        digests.symbols,
+        digests.bootstrap,
+        digests.init0,
+        digests.hello,
+        digests.bootfs,
+        digests.esp,
+        digests.ovmf_code,
+        digests.ovmf_vars_template,
+        provenance,
+    ))
+}
+
 fn git_output(repository: &Path, arguments: &[&str], label: &str) -> Result<String, Failure> {
     let output = Command::new("git")
         .arg("-C")
@@ -1938,6 +2700,48 @@ mod tests {
         record
     }
 
+    fn stress_line(run: StressRun, fields: (&str, u32, u32, u32, u32, u32, u32)) -> Vec<u8> {
+        let (outcome, done, cpu_mask, family_mask, detail, failop, stage) = fields;
+        let mut record = format!(
+            "DWSTRESS1|01|{:08X}|{:08X}|{:016X}|{:016X}|{:08X}|{:08X}|{:08X}|{:08X}|{}|{:08X}|{:08X}|{:08X}|",
+            h_request::I2_TEST_ID,
+            run.index,
+            run.base_seed,
+            run.seed,
+            run.operations,
+            done,
+            cpu_mask,
+            family_mask,
+            outcome,
+            detail,
+            failop,
+            stage,
+        )
+        .into_bytes();
+        record.extend_from_slice(format!("{:08X}\n", fnv1a32(&record)).as_bytes());
+        assert_eq!(record.len(), STRESS_RECORD_BYTES);
+        record
+    }
+
+    fn valid_stress_transcript(run: StressRun) -> Vec<u8> {
+        let mut transcript = b"diagnostic before stress\n".to_vec();
+        transcript.extend_from_slice(&stress_line(
+            run,
+            (
+                "01",
+                run.operations,
+                I2_CPU_MASK,
+                I2_FAMILY_MASK,
+                0,
+                u32::MAX,
+                0,
+            ),
+        ));
+        transcript.extend_from_slice(b"diagnostic before terminal\n");
+        transcript.extend_from_slice(&terminal("01", h_request::I2_TEST_ID, 0));
+        transcript
+    }
+
     const fn event(kind: u8, cpu: u32, token: u32, arg0: u32, arg1: u32) -> EventSpec {
         EventSpec {
             kind,
@@ -2037,6 +2841,25 @@ mod tests {
                 nonce: TEST_EVIDENCE_NONCE,
                 required_mask: h_request::I1_REQUIRED_EVIDENCE_MASK,
             }),
+            stress: None,
+        }
+    }
+
+    fn i2_request() -> HRequest {
+        let i1 = i1_request();
+        HRequest {
+            schema_version: 4,
+            selector: h_request::I2_SELECTOR.into(),
+            test_id: h_request::I2_TEST_ID,
+            evidence: None,
+            stress: Some(StressRequest {
+                base_seed: TEST_EVIDENCE_NONCE,
+                run_count: 4,
+                operations_per_run: 256,
+                schedule_version: I2_SCHEDULE_VERSION.into(),
+                v0_manifest: PathBuf::from("/candidate/v0-manifest.toml"),
+            }),
+            ..i1
         }
     }
 
@@ -2046,6 +2869,137 @@ mod tests {
         assert_eq!(HProfile::Smp.vcpus(), 4);
         assert_eq!(HProfile::Default.memory_mib(), 1024);
         assert_eq!(HProfile::Smp.memory_mib(), 2048);
+    }
+
+    #[test]
+    fn splitmix64_schedule_matches_pinned_vectors() {
+        assert_eq!(
+            (0..4)
+                .map(|index| splitmix64_seed(TEST_EVIDENCE_NONCE, index))
+                .collect::<Vec<_>>(),
+            vec![
+                0x157A_3807_A48F_AA9D,
+                0xD573_529B_34A1_D093,
+                0x2F90_B72E_996D_CCBE,
+                0xA2D4_1933_4C46_67EC,
+            ]
+        );
+        assert_ne!(splitmix64_seed(1, 0), 0);
+    }
+
+    #[test]
+    fn schema_four_execution_requires_explicit_smp() {
+        let request = i2_request();
+        assert!(validate_execution_profile(&request, Some(HProfile::Smp)).is_ok());
+        assert!(validate_execution_profile(&request, Some(HProfile::Default)).is_err());
+        assert!(validate_execution_profile(&request, None).is_err());
+    }
+
+    #[test]
+    fn i2_transcript_is_exact_strict_and_semantically_complete() {
+        let run = StressRun {
+            index: 2,
+            base_seed: TEST_EVIDENCE_NONCE,
+            seed: splitmix64_seed(TEST_EVIDENCE_NONCE, 2),
+            operations: 256,
+        };
+        let valid = valid_stress_transcript(run);
+        let parsed = parse_stress_transcript(&valid, h_request::I2_TEST_ID, run)
+            .expect("valid I2 transcript rejected");
+        assert_eq!(parsed.stress.completed_operations, 256);
+        assert_eq!(parsed.stress.cpu_mask, I2_CPU_MASK);
+        assert_eq!(parsed.stress.family_mask, I2_FAMILY_MASK);
+
+        let exact = stress_line(
+            run,
+            ("01", 256, I2_CPU_MASK, I2_FAMILY_MASK, 0, u32::MAX, 0),
+        );
+        for length in 0..STRESS_RECORD_BYTES {
+            assert!(
+                parse_stress_line(&exact[..length], 1, h_request::I2_TEST_ID, run).is_err(),
+                "admitted DWSTRESS1 truncation at {length}"
+            );
+        }
+        for delimiter in [9, 12, 21, 30, 47, 64, 73, 82, 91, 100, 103, 112, 121, 130] {
+            let mut malformed = exact.clone();
+            malformed[delimiter] = b':';
+            assert!(parse_stress_line(&malformed, 1, h_request::I2_TEST_ID, run).is_err());
+        }
+        for mutation in [
+            stress_line(
+                StressRun { index: 1, ..run },
+                ("01", 256, I2_CPU_MASK, I2_FAMILY_MASK, 0, u32::MAX, 0),
+            ),
+            stress_line(
+                StressRun {
+                    seed: run.seed ^ 1,
+                    ..run
+                },
+                ("01", 256, I2_CPU_MASK, I2_FAMILY_MASK, 0, u32::MAX, 0),
+            ),
+            stress_line(
+                run,
+                ("01", 255, I2_CPU_MASK, I2_FAMILY_MASK, 0, u32::MAX, 0),
+            ),
+            stress_line(run, ("01", 256, 0x07, I2_FAMILY_MASK, 0, u32::MAX, 0)),
+            stress_line(run, ("01", 256, I2_CPU_MASK, 0xFF, 0, u32::MAX, 0)),
+            stress_line(
+                run,
+                ("01", 256, I2_CPU_MASK, I2_FAMILY_MASK, 1, u32::MAX, 0),
+            ),
+            stress_line(run, ("01", 256, I2_CPU_MASK, I2_FAMILY_MASK, 0, 0, 0)),
+            stress_line(
+                run,
+                ("01", 256, I2_CPU_MASK, I2_FAMILY_MASK, 0, u32::MAX, 1),
+            ),
+        ] {
+            assert!(parse_stress_line(&mutation, 1, h_request::I2_TEST_ID, run).is_err());
+        }
+        let mut lowercase = exact.clone();
+        lowercase[49].make_ascii_lowercase();
+        assert!(parse_stress_line(&lowercase, 1, h_request::I2_TEST_ID, run).is_err());
+        let mut checksum = exact.clone();
+        checksum[138] = if checksum[138] == b'0' { b'1' } else { b'0' };
+        assert!(parse_stress_line(&checksum, 1, h_request::I2_TEST_ID, run).is_err());
+    }
+
+    #[test]
+    fn i2_near_magic_duplicates_and_order_fail_closed() {
+        let run = StressRun {
+            index: 0,
+            base_seed: TEST_EVIDENCE_NONCE,
+            seed: splitmix64_seed(TEST_EVIDENCE_NONCE, 0),
+            operations: 32,
+        };
+        let valid = valid_stress_transcript(run);
+        for prefix in [
+            b"dwstress1".as_slice(),
+            b"DwStReSs1".as_slice(),
+            b"dwtest1".as_slice(),
+        ] {
+            let mut transcript = prefix.to_vec();
+            transcript.extend_from_slice(b" malformed diagnostic\n");
+            transcript.extend_from_slice(&valid);
+            assert!(parse_stress_transcript(&transcript, h_request::I2_TEST_ID, run).is_err());
+        }
+        let mut duplicate_stress = valid.clone();
+        duplicate_stress.splice(
+            0..0,
+            stress_line(run, ("01", 32, I2_CPU_MASK, I2_FAMILY_MASK, 0, u32::MAX, 0)),
+        );
+        assert!(parse_stress_transcript(&duplicate_stress, h_request::I2_TEST_ID, run).is_err());
+        let mut duplicate_terminal = valid.clone();
+        duplicate_terminal.extend_from_slice(&terminal("01", h_request::I2_TEST_ID, 0));
+        assert!(parse_stress_transcript(&duplicate_terminal, h_request::I2_TEST_ID, run).is_err());
+        let mut after_terminal = terminal("01", h_request::I2_TEST_ID, 0);
+        after_terminal.extend_from_slice(&stress_line(
+            run,
+            ("01", 32, I2_CPU_MASK, I2_FAMILY_MASK, 0, u32::MAX, 0),
+        ));
+        assert!(parse_stress_transcript(&after_terminal, h_request::I2_TEST_ID, run).is_err());
+        let mut mismatch = stress_line(run, ("02", 7, 0x03, 0x01, 0xDEAD, 6, 2));
+        mismatch.extend_from_slice(&terminal("01", h_request::I2_TEST_ID, 0));
+        assert!(parse_stress_transcript(&mismatch, h_request::I2_TEST_ID, run).is_err());
     }
 
     #[test]
@@ -2060,6 +3014,7 @@ mod tests {
             selector: "primordial-bootstrap".into(),
             test_id: 18,
             evidence: None,
+            stress: None,
             ..request
         };
         assert!(validate_execution_profile(&schema_two, Some(HProfile::Smp)).is_ok());
@@ -2520,6 +3475,7 @@ mod tests {
             ovmf_vars_template: root.join("OVMF_VARS.fd"),
             run_directory: root.join("runs"),
             evidence: None,
+            stress: None,
         };
         let artifacts = CandidateArtifacts {
             loader: request.loader.clone(),
@@ -2543,6 +3499,7 @@ mod tests {
             &artifacts,
             ExecutionKind::Integration,
             &run,
+            None,
         );
         let joined = args.join(" ");
         assert!(joined.contains("-machine q35"));
@@ -2558,6 +3515,34 @@ mod tests {
                 .join(" ")
                 .contains("file /candidate/deepwyrm.symbols")
         );
+
+        let stress = StressRun {
+            index: 7,
+            base_seed: TEST_EVIDENCE_NONCE,
+            seed: splitmix64_seed(TEST_EVIDENCE_NONCE, 7),
+            operations: 4096,
+        };
+        let stress_args = qemu_arguments(
+            HProfile::Smp,
+            &i2_request(),
+            &artifacts,
+            ExecutionKind::Integration,
+            &run,
+            Some(stress),
+        )
+        .join(" ");
+        let seed_argument = format!(
+            "name=opt/org.deepwyrm.test.stress.seed,string={:016X}",
+            stress.seed
+        );
+        for expected in [
+            "name=opt/org.deepwyrm.test.stress.run-index,string=7",
+            "name=opt/org.deepwyrm.test.stress.base-seed,string=0123456789ABCDEF",
+            seed_argument.as_str(),
+            "name=opt/org.deepwyrm.test.stress.operations,string=4096",
+        ] {
+            assert!(stress_args.contains(expected));
+        }
     }
 
     #[test]
@@ -2634,6 +3619,7 @@ mod tests {
             ovmf_vars_template: root.join("OVMF_VARS.fd"),
             run_directory: root.join("runs"),
             evidence: None,
+            stress: None,
         };
         let run = RunPaths {
             vars: root.join("OVMF_VARS.fd"),
@@ -2793,6 +3779,7 @@ mod tests {
             ovmf_vars_template: root.join("OVMF_VARS.fd"),
             run_directory: root.join("runs"),
             evidence: None,
+            stress: None,
         };
         let error = verify_candidate_inputs(&request).expect_err("mismatched symbols accepted");
         assert!(error.message.contains("do not exactly match"));
@@ -2851,6 +3838,7 @@ mod tests {
             ovmf_vars_template: root.join("OVMF_VARS.fd"),
             run_directory: root.join("runs"),
             evidence: None,
+            stress: None,
         };
         let artifacts = CandidateArtifacts {
             loader: request.loader.clone(),

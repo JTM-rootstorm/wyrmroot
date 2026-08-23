@@ -201,3 +201,104 @@ validated and must exactly equal the request mask `255`; it is not a constant
 success value.
 This host-side validation capability is not evidence that a guest candidate
 emitted the protocol and does not by itself close I1.
+
+## I2 deterministic stress contract
+
+I2 uses selector `smp-adversarial-stress`, stable test ID 22, and a
+schema-v4 request. The request is accepted only by the explicit `smp`
+integration command and requires PASS/detail zero, a nonzero `stress_seed`,
+`stress_run_count` from 1 through 64, `stress_operations_per_run` from 32
+through 4096, and schedule identity `dw-i2-splitmix64-v1`. The request also
+names the contained create-new V0 manifest path. Schema-v2 and schema-v3
+behavior remains the non-I2 terminal and I1 evidence contract respectively.
+In addition to the schema-v2 candidate/artifact keys, schema v4 has exactly
+these I2 fields and no I1 evidence fields:
+
+```text
+stress_seed = NONZERO_U64_DECIMAL
+stress_run_count = 1_THROUGH_64
+stress_operations_per_run = 32_THROUGH_4096
+stress_schedule_version = "dw-i2-splitmix64-v1"
+v0_manifest = "request-relative/create-new/path"
+```
+
+Each zero-based run seed is the SplitMix64 finalizer applied to the wrapping
+sum of the base seed and golden gamma multiplied by the one-based run number.
+A zero result is mapped to golden gamma. The integration-only QEMU launch
+passes the run index, base seed, derived seed, and operation bound through
+`opt/org.deepwyrm.test.stress.*` fw_cfg names. These are test inputs and are
+not a production Wyrmroot or native ABI.
+
+Runs are create-new at
+`runs/i2/run-NNNNNN/{OVMF_VARS.fd,serial.log,qemu.stderr.log,result.json}`.
+The runner stops at the first failure, preserves that run's structured error,
+and then writes one create-new `runs/i2/summary.json` recording requested and
+completed runs, the failing index, and ordered result digests. A summary is
+PASS only after every requested run passes and the complete candidate is
+re-admitted unchanged.
+
+Every run requires exactly one checksummed 140-byte stress record before one
+unchanged terminal record:
+
+```text
+DWSTRESS1|01|TESTID8|RUN8|BASESEED16|SEED16|CONFIGOPS8|DONEOPS8|CPUMASK8|FAMILYMASK8|OUTCOME2|DETAIL8|FAILOP8|STAGE8|CHECKSUM8\n
+```
+
+The fixed-width hexadecimal fields and checksum are uppercase; FNV-1a-32
+covers the bytes through the delimiter before the checksum. Near-magic,
+malformed, duplicate, reordered, or request-mismatched records fail closed.
+A passing record requires ID 22, the exact run/configuration, all configured
+operations complete, CPU mask `0000000F`, family mask `000001FF`, PASS/detail
+zero, failing operation `FFFFFFFF`, and stage zero. The nine family bits bind
+handles; channels; waits/timers/terminal retirement; task lifecycle;
+mapping/protection/teardown; MemoryObject finalization; subtree authority;
+idle/wake/PM timer; and shootdown. Schema-v4 per-run results additionally bind
+the serial, QEMU stderr, and per-run OVMF variables hashes.
+
+## V0 evidence freeze
+
+The separate command is:
+
+```text
+cargo xtask freeze v0 --request <v0-freeze-request.toml>
+```
+
+The freeze request has this exact flat key set (values shown schematically):
+
+```text
+schema_version = 1
+manifest_kind = "wyr0-v0-freeze-request"
+deepwyrm_revision = "FULL40"
+wyrmroot_revision = "FULL40"
+rust_revision = "FULL40"
+candidate_request = "candidate/request.toml"
+default_result = "evidence/default/result.json"
+i1_result = "evidence/i1/result.json"
+i2_summary = "runs/i2/summary.json"
+geometry_report = "evidence/geometry.json"
+geometry_report_sha256 = "LOWERCASE64"
+qemu_argument_report = "evidence/qemu-arguments.json"
+qemu_argument_report_sha256 = "LOWERCASE64"
+version_report = "evidence/versions.json"
+version_report_sha256 = "LOWERCASE64"
+host_matrix = "evidence/host-matrix.toml"
+manifest = "evidence/v0-manifest.toml"
+```
+
+Its strict schema-v1 request has kind `wyr0-v0-freeze-request` and names the
+exact three revisions, schema-v4 candidate request, default/I1/I2 results,
+locked geometry report, QEMU argument-shape report, version report, host-matrix
+manifest, and create-new output manifest. All paths are request-relative,
+contained regular files with no symlink traversal; report hashes and every
+host-matrix evidence hash must match the coordinator-supplied values. The
+host-matrix manifest has kind `wyr0-v0-host-matrix`, a bounded nonzero entry
+count, and contiguous `entry_NNN_{name,status,evidence,sha256}` fields; every
+status must be `pass`.
+
+The freeze re-admits source revisions and the complete candidate, validates
+the schema identities and PASS bindings of default, I1, the I2 summary, and
+every ordered I2 result, and writes all artifact, firmware, evidence, schedule,
+seed, bound, and matrix hashes. Its disposition is
+`BOUND_EVIDENCE_COMPLETE`: it did not rerun guest tests, and cannot publish
+`v0_pass = true` unless all supplied matrix evidence and revalidation checks
+pass.
