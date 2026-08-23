@@ -18,10 +18,12 @@ required-features = ["native-hello"]
 
 [features]
 default = []
-native-hello = ["dep:wyrmroot-runtime"]
+native-hello = []
 
 [dependencies]
-wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime", optional = true }
+deepwyrm-syscall.workspace = true
+wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }
+wyrmroot-loader = { path = "../../crates/wyrmroot-loader" }
 
 [lints.rust]
 unsafe_code = "deny"

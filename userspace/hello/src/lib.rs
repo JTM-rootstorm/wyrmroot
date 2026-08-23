@@ -1,10 +1,84 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
-//! WYR0 `hello` smoke-test application contract.
+//! WYR0 `hello` descendant smoke-test application contract.
 //!
-//! The D2 native executable validates the shared startup ABI and exits deterministically. Later
-//! phases add diagnostic output once its delegated capability is available.
+//! `hello` accepts only its retained loader Channel, validates the handle-free `Hello` WRLP
+//! message, sends the matching READY reply, and then exits normally.  The reply is deliberately
+//! small: it proves a capability-mediated parent/child exchange without delegating authority to
+//! this smoke executable.
 
-#[cfg(feature = "native-hello")]
-use wyrmroot_runtime as _;
+use deepwyrm_syscall::{DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights};
+use wyrmroot_loader::launch::{HEADER_BYTES, LaunchError, LaunchProfile, encode_ready, parse_init};
+use wyrmroot_runtime::{
+    BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, CapabilityValidationError, NativeError,
+    ReceiveCounts, validate_bootstrap_channel,
+};
+
+/// Native operations used by the WYR0-G `hello` parent-channel exchange.
+pub trait HelloSystem {
+    /// Queries current object metadata for a locally held capability.
+    fn query_capability_info(
+        &mut self,
+        handle: DwHandle,
+    ) -> Result<CapabilityInfo<DwObjectType, DwRights>, NativeError>;
+
+    /// Receives the single handle-free loader launch datagram.
+    fn receive_channel(
+        &mut self,
+        channel: DwHandle,
+        bytes: &mut [u8],
+        handles: &mut [DwReceivedHandleInfoV1],
+    ) -> Result<ReceiveCounts, NativeError>;
+
+    /// Sends the matching handle-free READY datagram.
+    fn send_channel(&mut self, channel: DwHandle, bytes: &[u8]) -> Result<(), NativeError>;
+
+    /// Closes one caller-local handle.
+    fn close_handle(&mut self, handle: DwHandle) -> Result<(), NativeError>;
+}
+
+/// Why the WYR0-G `hello` startup exchange failed.
+#[derive(Debug, Eq, PartialEq)]
+pub enum HelloError {
+    /// A typed native operation failed or returned malformed output.
+    Native(NativeError),
+    /// The startup Channel did not have its exact locked type and rights.
+    BootstrapChannel(CapabilityValidationError),
+    /// The receive result exceeded the caller-provided fixed protocol buffers.
+    ReceiveCounts(ReceiveCounts),
+    /// The loader INIT or READY encoding violated WRLP.
+    Launch(LaunchError),
+}
+
+/// Completes the capability-mediated WYR0-G parent-channel exchange.
+pub fn run_hello<System: HelloSystem>(
+    system: &mut System,
+    bootstrap_channel: DwHandle,
+) -> Result<(), HelloError> {
+    let channel = system
+        .query_capability_info(bootstrap_channel)
+        .map_err(HelloError::Native)?;
+    validate_bootstrap_channel(channel, BOOTSTRAP_CHANNEL_EXPECTATION)
+        .map_err(HelloError::BootstrapChannel)?;
+
+    let mut init = [0_u8; HEADER_BYTES];
+    let mut handles = [];
+    let counts = system
+        .receive_channel(bootstrap_channel, &mut init, &mut handles)
+        .map_err(HelloError::Native)?;
+    if counts.bytes > init.len() || counts.handles != 0 {
+        return Err(HelloError::ReceiveCounts(counts));
+    }
+    let parsed = parse_init(LaunchProfile::Hello, &init[..counts.bytes], &handles)
+        .map_err(HelloError::Launch)?;
+
+    let mut ready = [0_u8; HEADER_BYTES];
+    let ready_size = encode_ready(parsed.transaction_id, &mut ready).map_err(HelloError::Launch)?;
+    system
+        .send_channel(bootstrap_channel, &ready[..ready_size])
+        .map_err(HelloError::Native)?;
+    system
+        .close_handle(bootstrap_channel)
+        .map_err(HelloError::Native)
+}
