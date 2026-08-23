@@ -6,7 +6,6 @@ use core::panic::PanicInfo;
 
 use deepwyrm_syscall::{DwHandle, DwReceivedHandleInfoV1};
 use wyrmroot_bootfs as _;
-use wyrmroot_bootstrap::BootstrapSystem;
 #[cfg(any(
     feature = "primordial-user-exception",
     feature = "primordial-invalid-return"
@@ -23,6 +22,7 @@ use wyrmroot_bootstrap::run_bootstrap_with_before_ready;
 use wyrmroot_bootstrap::run_init0_bootstrap;
 #[cfg(feature = "native-loader-smoke-integration")]
 use wyrmroot_bootstrap::run_loader_smoke_bootstrap;
+use wyrmroot_bootstrap::{BootstrapError, BootstrapSystem};
 use wyrmroot_bootstrap_proto as _;
 use wyrmroot_loader as _;
 use wyrmroot_runtime::{
@@ -50,7 +50,26 @@ use wyrmroot_runtime::{NativeLoaderPlatform, NativeSupervisionPlatform, monotoni
 ))]
 const BOOTSTRAP_SUPERVISION_TIMEOUT_NS: u64 = 5_000_000_000;
 
-struct NativeSystem;
+struct NativeSystem {
+    last_native_operation: u32,
+}
+
+impl NativeSystem {
+    const fn new() -> Self {
+        Self {
+            last_native_operation: 0,
+        }
+    }
+
+    fn exit_code(&self, error: &BootstrapError) -> u32 {
+        let code = error.exit_code();
+        if matches!(error, BootstrapError::Native(_)) {
+            code | (self.last_native_operation << 20)
+        } else {
+            code
+        }
+    }
+}
 
 impl BootstrapSystem for NativeSystem {
     fn query_capability_info(
@@ -60,6 +79,7 @@ impl BootstrapSystem for NativeSystem {
         CapabilityInfo<deepwyrm_syscall::DwObjectType, deepwyrm_syscall::DwRights>,
         NativeError,
     > {
+        self.last_native_operation = 1;
         query_capability_info(handle)
     }
 
@@ -69,10 +89,12 @@ impl BootstrapSystem for NativeSystem {
         bytes: &mut [u8],
         handles: &mut [DwReceivedHandleInfoV1],
     ) -> Result<ReceiveCounts, NativeError> {
+        self.last_native_operation = 2;
         receive_channel(channel, bytes, handles)
     }
 
     fn query_memory_object_size(&mut self, handle: DwHandle) -> Result<u64, NativeError> {
+        self.last_native_operation = 3;
         query_memory_object_size(handle)
     }
 
@@ -83,17 +105,21 @@ impl BootstrapSystem for NativeSystem {
         plan: MappingPlan,
         use_bytes: impl for<'bytes> FnOnce(&'bytes [u8]) -> R,
     ) -> Result<R, NativeError> {
+        self.last_native_operation = 4;
         let mapping = map_bootfs_read_only(root_region, bootfs, plan)?;
         let result = mapping.with_logical_bytes(use_bytes);
+        self.last_native_operation = 5;
         unmap_bootfs(mapping)?;
         Ok(result)
     }
 
     fn send_channel(&mut self, channel: DwHandle, bytes: &[u8]) -> Result<(), NativeError> {
+        self.last_native_operation = 6;
         send_channel(channel, bytes, &[])
     }
 
     fn close_handle(&mut self, handle: DwHandle) -> Result<(), NativeError> {
+        self.last_native_operation = 7;
         close_handle(handle)
     }
 }
@@ -114,7 +140,7 @@ fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
         Ok(deadline) => deadline,
         Err(_) => return 1,
     };
-    let mut system = NativeSystem;
+    let mut system = NativeSystem::new();
     let mut loader = NativeLoaderPlatform;
     let mut supervisor = NativeSupervisionPlatform;
     match run_init0_bootstrap(
@@ -125,7 +151,7 @@ fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
         deadline,
     ) {
         Ok(()) => 0,
-        Err(error) => error.exit_code(),
+        Err(error) => system.exit_code(&error),
     }
 }
 
@@ -135,7 +161,7 @@ fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
         Ok(deadline) => deadline,
         Err(_) => return 1,
     };
-    let mut system = NativeSystem;
+    let mut system = NativeSystem::new();
     let mut loader = NativeLoaderPlatform;
     let mut supervisor = NativeSupervisionPlatform;
     u32::from(
@@ -152,7 +178,7 @@ fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
 
 #[cfg(feature = "primordial-blocking-cleanup")]
 fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
-    let mut system = NativeSystem;
+    let mut system = NativeSystem::new();
     let result = run_bootstrap_with_before_ready(
         &mut system,
         startup.bootstrap_channel().as_abi(),
@@ -166,7 +192,7 @@ fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
 
 #[cfg(feature = "primordial-user-exception")]
 fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
-    let mut system = NativeSystem;
+    let mut system = NativeSystem::new();
     if run_bootstrap(&mut system, startup.bootstrap_channel().as_abi()).is_err() {
         return 1;
     }
