@@ -1,5 +1,6 @@
 //! WYR0-H exact-artifact image, q35/OVMF, GDB, and integration tooling.
 
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -11,13 +12,18 @@ use wyrmroot_bootfs::builder::{Builder, FileMode};
 
 use crate::cli::{G3ImageArguments, HProfile};
 use crate::error::Failure;
-use crate::h_request::{self, ExpectedOutcome, HRequest};
+use crate::h_request::{
+    self, EvidenceRequest, ExpectedOutcome, HRequest, I1_EVIDENCE_PROTOCOL,
+    I1_REQUIRED_EVIDENCE_MASK,
+};
 use crate::sha256;
 
 const MAX_GUEST_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_FIRMWARE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SERIAL_BYTES: u64 = 16 * 1024 * 1024;
 const COMPLETION_RECORD_BYTES: usize = 38;
+const EVIDENCE_RECORD_BYTES: usize = 85;
+const MAX_EVIDENCE_RECORDS: usize = 64;
 const DEFAULT_MEMORY_MIB: u32 = 1024;
 const SMP_MEMORY_MIB: u32 = 2048;
 
@@ -60,6 +66,69 @@ struct GuestRecord {
     test_id: u32,
     detail: u32,
     line: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum EvidenceKind {
+    CpuOnline,
+    Cpl3Syscall,
+    ParentBlocked,
+    DescendantRunning,
+    RunningInvariant,
+    WakeSent,
+    WakeObserved,
+    ChildExit,
+    ChildCleanup,
+    TlbPublish,
+    TlbAck,
+    RendezvousAck,
+    ReclaimAllowed,
+}
+
+impl EvidenceKind {
+    fn parse(value: u8) -> Option<Self> {
+        match value {
+            0x01 => Some(Self::CpuOnline),
+            0x02 => Some(Self::Cpl3Syscall),
+            0x03 => Some(Self::ParentBlocked),
+            0x04 => Some(Self::DescendantRunning),
+            0x05 => Some(Self::RunningInvariant),
+            0x06 => Some(Self::WakeSent),
+            0x07 => Some(Self::WakeObserved),
+            0x08 => Some(Self::ChildExit),
+            0x09 => Some(Self::ChildCleanup),
+            0x0A => Some(Self::TlbPublish),
+            0x0B => Some(Self::TlbAck),
+            0x0C => Some(Self::RendezvousAck),
+            0x0D => Some(Self::ReclaimAllowed),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EvidenceEvent {
+    sequence: u32,
+    kind: EvidenceKind,
+    cpu: u32,
+    token: u32,
+    arg0: u32,
+    arg1: u32,
+    line: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ValidatedEvidence {
+    count: u32,
+    observed_mask: u32,
+    first_sequence: u32,
+    last_sequence: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GuestTranscript {
+    terminal: GuestRecord,
+    evidence: Option<ValidatedEvidence>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -706,8 +775,8 @@ fn execute(
             return Err(error);
         }
     };
-    let record = match parse_terminal_record(&serial, request.test_id) {
-        Ok(record) => record,
+    let transcript = match parse_transcript(&serial, request) {
+        Ok(transcript) => transcript,
         Err(error) => {
             write_integration_host_failure(
                 profile,
@@ -716,7 +785,11 @@ fn execute(
                 &run,
                 HostFailure {
                     status: Some(&status),
-                    reason: "terminal_record_invalid",
+                    reason: if request.evidence.is_some() {
+                        "transcript_invalid"
+                    } else {
+                        "terminal_record_invalid"
+                    },
                     timeout_seconds: None,
                     cleanup: CleanupDisposition::exited(),
                 },
@@ -724,6 +797,7 @@ fn execute(
             return Err(error);
         }
     };
+    let record = transcript.terminal;
     let expected_exit = match record.outcome {
         GuestOutcome::Pass => 33,
         GuestOutcome::Fail => 35,
@@ -755,18 +829,24 @@ fn execute(
     if status_name == "PASS" {
         revalidate_before_pass(request, artifacts, &pre_execution_manifest)?;
     }
+    let evidence_fields = if status_name == "PASS" {
+        evidence_result_fields(request, transcript.evidence)?
+    } else {
+        String::new()
+    };
     let manifest = result_manifest_json(request, artifacts)?;
     let result = format!(
         concat!(
-            "{{\"schema_version\":2,\"phase\":\"WYR0-H\",",
+            "{{\"schema_version\":{},\"phase\":\"WYR0-H\",",
             "\"mode\":\"integration\",\"profile\":\"{}\",",
             "\"status\":\"{}\",\"vcpu\":{},\"memory_mib\":{},",
             "\"test_id\":{},\"expected_outcome\":\"{}\",\"expected_detail\":{},",
             "\"actual_outcome\":\"{}\",\"detail\":{},\"serial_line\":{},",
-            "\"qemu_exit_status\":{},{}",
+            "\"qemu_exit_status\":{},{}{}",
             "\"deepwyrm_revision\":\"{}\",\"wyrmroot_revision\":\"{}\",",
             "\"rust_revision\":\"{}\",\"no_host_share\":true}}\n"
         ),
+        request.schema_version,
         profile.name(),
         status_name,
         profile.vcpus(),
@@ -778,6 +858,7 @@ fn execute(
         record.detail,
         record.line,
         expected_exit,
+        evidence_fields,
         manifest,
         request.deepwyrm_revision,
         request.wyrmroot_revision,
@@ -800,6 +881,35 @@ fn execute(
         )));
     }
     Ok(result)
+}
+
+fn evidence_result_fields(
+    request: &HRequest,
+    evidence: Option<ValidatedEvidence>,
+) -> Result<String, Failure> {
+    evidence.map_or_else(
+        || Ok(String::new()),
+        |evidence| {
+            let request_evidence = request.evidence.ok_or_else(|| {
+                Failure::task("validated evidence is not bound to an evidence request")
+            })?;
+            Ok(format!(
+                concat!(
+                    "\"evidence_protocol\":\"{}\",\"evidence_nonce\":\"{:016X}\",",
+                    "\"required_evidence_mask\":{},\"observed_evidence_mask\":{},",
+                    "\"evidence_event_count\":{},\"first_evidence_sequence\":{},",
+                    "\"last_evidence_sequence\":{},"
+                ),
+                I1_EVIDENCE_PROTOCOL,
+                request_evidence.nonce,
+                request_evidence.required_mask,
+                evidence.observed_mask,
+                evidence.count,
+                evidence.first_sequence,
+                evidence.last_sequence,
+            ))
+        },
+    )
 }
 
 struct HostFailure<'a> {
@@ -827,7 +937,7 @@ fn write_integration_host_failure(
     );
     let result = format!(
         concat!(
-            "{{\"schema_version\":2,\"phase\":\"WYR0-H\",",
+            "{{\"schema_version\":{},\"phase\":\"WYR0-H\",",
             "\"mode\":\"integration\",\"profile\":\"{}\",",
             "\"status\":\"ERROR\",\"reason\":\"{}\",",
             "\"vcpu\":{},\"memory_mib\":{},",
@@ -838,6 +948,7 @@ fn write_integration_host_failure(
             "{}\"deepwyrm_revision\":\"{}\",\"wyrmroot_revision\":\"{}\",",
             "\"rust_revision\":\"{}\",\"no_host_share\":true}}\n"
         ),
+        request.schema_version,
         profile.name(),
         failure.reason,
         profile.vcpus(),
@@ -977,78 +1088,466 @@ fn gdb_arguments(artifacts: &CandidateArtifacts) -> Vec<String> {
     ]
 }
 
+fn parse_transcript(bytes: &[u8], request: &HRequest) -> Result<GuestTranscript, Failure> {
+    match request.evidence {
+        Some(evidence) => parse_evidence_transcript(bytes, request.test_id, evidence),
+        None => Ok(GuestTranscript {
+            terminal: parse_terminal_record(bytes, request.test_id)?,
+            evidence: None,
+        }),
+    }
+}
+
 fn parse_terminal_record(bytes: &[u8], expected_test_id: u32) -> Result<GuestRecord, Failure> {
     let mut terminal = None;
     for (index, line) in bytes.split_inclusive(|byte| *byte == b'\n').enumerate() {
         if !line.starts_with(b"DWTEST1|") {
             continue;
         }
-        if line.len() != COMPLETION_RECORD_BYTES
-            || line[7] != b'|'
-            || line[10] != b'|'
-            || line[19] != b'|'
-            || line[28] != b'|'
-            || line[37] != b'\n'
-        {
-            return Err(Failure::task(format!(
-                "serial line {} contains a malformed DWTEST1 record",
-                index + 1
-            )));
-        }
-        let outcome = match &line[8..10] {
-            b"01" => GuestOutcome::Pass,
-            b"02" => GuestOutcome::Fail,
-            b"03" => GuestOutcome::Panic,
-            _ => {
-                return Err(Failure::task(format!(
-                    "serial line {} has an invalid DWTEST1 outcome",
-                    index + 1
-                )));
-            }
-        };
-        let test_id = parse_hex(&line[11..19]).ok_or_else(|| {
-            Failure::task(format!(
-                "serial line {} has an invalid DWTEST1 test id",
-                index + 1
-            ))
-        })?;
-        let detail = parse_hex(&line[20..28]).ok_or_else(|| {
-            Failure::task(format!(
-                "serial line {} has an invalid DWTEST1 detail",
-                index + 1
-            ))
-        })?;
-        let checksum = parse_hex(&line[29..37]).ok_or_else(|| {
-            Failure::task(format!(
-                "serial line {} has an invalid DWTEST1 checksum",
-                index + 1
-            ))
-        })?;
-        if checksum != fnv1a32(&line[..29]) {
-            return Err(Failure::task(format!(
-                "serial line {} has a mismatched DWTEST1 checksum",
-                index + 1
-            )));
-        }
-        if test_id != expected_test_id {
-            return Err(Failure::task(format!(
-                "serial line {} test id {test_id:08X} does not match request {expected_test_id:08X}",
-                index + 1
-            )));
-        }
+        let record = parse_terminal_line(line, index + 1, expected_test_id)?;
         if terminal.is_some() {
             return Err(Failure::task(
                 "serial log contains duplicate DWTEST1 terminal records",
             ));
         }
-        terminal = Some(GuestRecord {
-            outcome,
-            test_id,
-            detail,
-            line: index + 1,
-        });
+        terminal = Some(record);
     }
     terminal.ok_or_else(|| Failure::task("serial log contains no DWTEST1 terminal record"))
+}
+
+fn parse_evidence_transcript(
+    bytes: &[u8],
+    expected_test_id: u32,
+    request: EvidenceRequest,
+) -> Result<GuestTranscript, Failure> {
+    let mut terminal = None;
+    let mut events = Vec::new();
+    for (index, line) in bytes.split_inclusive(|byte| *byte == b'\n').enumerate() {
+        let line_number = index + 1;
+        if line.len() >= 7 && line[..7].eq_ignore_ascii_case(b"DWEVID1") {
+            if terminal.is_some() {
+                return Err(Failure::task(format!(
+                    "serial line {line_number} contains DWEVID1 evidence after the terminal record"
+                )));
+            }
+            if events.len() == MAX_EVIDENCE_RECORDS {
+                return Err(Failure::task(format!(
+                    "serial line {line_number} exceeds the {MAX_EVIDENCE_RECORDS}-record DWEVID1 limit"
+                )));
+            }
+            let event = parse_evidence_line(line, line_number, request.nonce)?;
+            if event.sequence != events.len() as u32 {
+                return Err(Failure::task(format!(
+                    "serial line {line_number} has non-contiguous DWEVID1 sequence {:08X}; expected {:08X}",
+                    event.sequence,
+                    events.len()
+                )));
+            }
+            events.push(event);
+            continue;
+        }
+        if line.starts_with(b"DWTEST1|") {
+            let record = parse_terminal_line(line, line_number, expected_test_id)?;
+            if terminal.replace(record).is_some() {
+                return Err(Failure::task(
+                    "serial log contains duplicate DWTEST1 terminal records",
+                ));
+            }
+        }
+    }
+    let terminal =
+        terminal.ok_or_else(|| Failure::task("serial log contains no DWTEST1 terminal record"))?;
+    if events.is_empty() {
+        return Err(Failure::task(
+            "I1 serial log contains no DWEVID1 evidence records",
+        ));
+    }
+    let evidence = validate_evidence(&events, request.required_mask)?;
+    Ok(GuestTranscript {
+        terminal,
+        evidence: Some(evidence),
+    })
+}
+
+fn parse_terminal_line(
+    line: &[u8],
+    line_number: usize,
+    expected_test_id: u32,
+) -> Result<GuestRecord, Failure> {
+    if line.len() != COMPLETION_RECORD_BYTES
+        || line[7] != b'|'
+        || line[10] != b'|'
+        || line[19] != b'|'
+        || line[28] != b'|'
+        || line[37] != b'\n'
+    {
+        return Err(Failure::task(format!(
+            "serial line {line_number} contains a malformed DWTEST1 record"
+        )));
+    }
+    let outcome = match &line[8..10] {
+        b"01" => GuestOutcome::Pass,
+        b"02" => GuestOutcome::Fail,
+        b"03" => GuestOutcome::Panic,
+        _ => {
+            return Err(Failure::task(format!(
+                "serial line {line_number} has an invalid DWTEST1 outcome"
+            )));
+        }
+    };
+    let test_id = parse_hex(&line[11..19]).ok_or_else(|| {
+        Failure::task(format!(
+            "serial line {line_number} has an invalid DWTEST1 test id"
+        ))
+    })?;
+    let detail = parse_hex(&line[20..28]).ok_or_else(|| {
+        Failure::task(format!(
+            "serial line {line_number} has an invalid DWTEST1 detail"
+        ))
+    })?;
+    let checksum = parse_hex(&line[29..37]).ok_or_else(|| {
+        Failure::task(format!(
+            "serial line {line_number} has an invalid DWTEST1 checksum"
+        ))
+    })?;
+    if checksum != fnv1a32(&line[..29]) {
+        return Err(Failure::task(format!(
+            "serial line {line_number} has a mismatched DWTEST1 checksum"
+        )));
+    }
+    if test_id != expected_test_id {
+        return Err(Failure::task(format!(
+            "serial line {line_number} test id {test_id:08X} does not match request {expected_test_id:08X}"
+        )));
+    }
+    Ok(GuestRecord {
+        outcome,
+        test_id,
+        detail,
+        line: line_number,
+    })
+}
+
+fn parse_evidence_line(
+    line: &[u8],
+    line_number: usize,
+    expected_nonce: u64,
+) -> Result<EvidenceEvent, Failure> {
+    if line.len() != EVIDENCE_RECORD_BYTES
+        || &line[..7] != b"DWEVID1"
+        || line[7] != b'|'
+        || line[10] != b'|'
+        || line[27] != b'|'
+        || line[36] != b'|'
+        || line[39] != b'|'
+        || line[48] != b'|'
+        || line[57] != b'|'
+        || line[66] != b'|'
+        || line[75] != b'|'
+        || line[84] != b'\n'
+    {
+        return Err(Failure::task(format!(
+            "serial line {line_number} contains a malformed DWEVID1 record"
+        )));
+    }
+    if &line[8..10] != b"01" {
+        return Err(Failure::task(format!(
+            "serial line {line_number} has an unsupported DWEVID1 version"
+        )));
+    }
+    let nonce = parse_hex_u64(&line[11..27]).ok_or_else(|| {
+        Failure::task(format!(
+            "serial line {line_number} has an invalid DWEVID1 nonce"
+        ))
+    })?;
+    if nonce != expected_nonce {
+        return Err(Failure::task(format!(
+            "serial line {line_number} DWEVID1 nonce does not match the request"
+        )));
+    }
+    let sequence = evidence_hex_u32(&line[28..36], line_number, "sequence")?;
+    let kind_value = parse_hex_u8(&line[37..39]).ok_or_else(|| {
+        Failure::task(format!(
+            "serial line {line_number} has an invalid DWEVID1 kind"
+        ))
+    })?;
+    let kind = EvidenceKind::parse(kind_value).ok_or_else(|| {
+        Failure::task(format!(
+            "serial line {line_number} has unknown DWEVID1 kind {kind_value:02X}"
+        ))
+    })?;
+    let cpu = evidence_hex_u32(&line[40..48], line_number, "CPU")?;
+    if cpu > 3 {
+        return Err(Failure::task(format!(
+            "serial line {line_number} DWEVID1 CPU {cpu} is outside 0..3"
+        )));
+    }
+    let token = evidence_hex_u32(&line[49..57], line_number, "token")?;
+    let arg0 = evidence_hex_u32(&line[58..66], line_number, "arg0")?;
+    let arg1 = evidence_hex_u32(&line[67..75], line_number, "arg1")?;
+    let checksum = evidence_hex_u32(&line[76..84], line_number, "checksum")?;
+    if checksum != fnv1a32(&line[..76]) {
+        return Err(Failure::task(format!(
+            "serial line {line_number} has a mismatched DWEVID1 checksum"
+        )));
+    }
+    Ok(EvidenceEvent {
+        sequence,
+        kind,
+        cpu,
+        token,
+        arg0,
+        arg1,
+        line: line_number,
+    })
+}
+
+fn evidence_hex_u32(bytes: &[u8], line_number: usize, field: &str) -> Result<u32, Failure> {
+    parse_hex(bytes).ok_or_else(|| {
+        Failure::task(format!(
+            "serial line {line_number} has an invalid DWEVID1 {field}"
+        ))
+    })
+}
+
+fn parse_hex_u8(bytes: &[u8]) -> Option<u8> {
+    if bytes.len() != 2 || !bytes.iter().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    if !bytes
+        .iter()
+        .all(|byte| byte.is_ascii_digit() || (b'A'..=b'F').contains(byte))
+    {
+        return None;
+    }
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|value| u8::from_str_radix(value, 16).ok())
+}
+
+fn parse_hex_u64(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() != 16
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'A'..=b'F').contains(byte))
+    {
+        return None;
+    }
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|value| u64::from_str_radix(value, 16).ok())
+}
+
+fn exactly_one(events: &[EvidenceEvent], label: &str) -> Result<EvidenceEvent, Failure> {
+    if events.len() != 1 {
+        return Err(Failure::task(format!(
+            "I1 evidence requires exactly one {label} event; observed {}",
+            events.len()
+        )));
+    }
+    Ok(events[0])
+}
+
+fn validate_evidence(
+    events: &[EvidenceEvent],
+    required_evidence_mask: u32,
+) -> Result<ValidatedEvidence, Failure> {
+    let mut cpu_online = Vec::new();
+    let mut cpl3_syscall = Vec::new();
+    let mut parent_blocked = Vec::new();
+    let mut descendant_running = Vec::new();
+    let mut running_invariant = Vec::new();
+    let mut wake_sent = Vec::new();
+    let mut wake_observed = Vec::new();
+    let mut child_exit = Vec::new();
+    let mut child_cleanup = Vec::new();
+    let mut tlb_publish = Vec::new();
+    let mut tlb_ack = Vec::new();
+    let mut rendezvous_ack = Vec::new();
+    let mut reclaim_allowed = Vec::new();
+    let mut unique_events = BTreeSet::new();
+
+    for event in events.iter().copied() {
+        if !unique_events.insert((event.kind, event.cpu, event.token, event.arg0, event.arg1)) {
+            return Err(Failure::task(format!(
+                "serial line {} duplicates an earlier DWEVID1 event",
+                event.line
+            )));
+        }
+        match event.kind {
+            EvidenceKind::CpuOnline => cpu_online.push(event),
+            EvidenceKind::Cpl3Syscall => cpl3_syscall.push(event),
+            EvidenceKind::ParentBlocked => parent_blocked.push(event),
+            EvidenceKind::DescendantRunning => descendant_running.push(event),
+            EvidenceKind::RunningInvariant => running_invariant.push(event),
+            EvidenceKind::WakeSent => wake_sent.push(event),
+            EvidenceKind::WakeObserved => wake_observed.push(event),
+            EvidenceKind::ChildExit => child_exit.push(event),
+            EvidenceKind::ChildCleanup => child_cleanup.push(event),
+            EvidenceKind::TlbPublish => tlb_publish.push(event),
+            EvidenceKind::TlbAck => tlb_ack.push(event),
+            EvidenceKind::RendezvousAck => rendezvous_ack.push(event),
+            EvidenceKind::ReclaimAllowed => reclaim_allowed.push(event),
+        }
+    }
+
+    if cpu_online.len() != 4 {
+        return Err(Failure::task(format!(
+            "I1 evidence requires CPU_ONLINE exactly once for CPUs 0..3; observed {} records",
+            cpu_online.len()
+        )));
+    }
+    let mut online_cpus = BTreeSet::new();
+    let mut apic_ids = BTreeSet::new();
+    let mut slots = BTreeSet::new();
+    for event in &cpu_online {
+        if !online_cpus.insert(event.cpu) {
+            return Err(Failure::task("I1 evidence repeats a CPU_ONLINE CPU"));
+        }
+        if !apic_ids.insert(event.arg0) {
+            return Err(Failure::task("I1 evidence repeats a CPU_ONLINE APIC ID"));
+        }
+        if event.arg1 != event.cpu || !slots.insert(event.arg1) {
+            return Err(Failure::task(
+                "I1 CPU_ONLINE slots must be distinct and match their CPU IDs",
+            ));
+        }
+    }
+    if online_cpus != BTreeSet::from([0, 1, 2, 3]) {
+        return Err(Failure::task(
+            "I1 evidence does not contain CPU_ONLINE for every CPU 0..3",
+        ));
+    }
+
+    let cpl3_cpus = cpl3_syscall
+        .iter()
+        .map(|event| event.cpu)
+        .collect::<BTreeSet<_>>();
+    if cpl3_cpus.len() < 2 {
+        return Err(Failure::task(
+            "I1 evidence requires CPL3_SYSCALL on at least two distinct CPUs",
+        ));
+    }
+
+    let blocked = exactly_one(&parent_blocked, "PARENT_BLOCKED")?;
+    let descendant = exactly_one(&descendant_running, "DESCENDANT_RUNNING")?;
+    if blocked.token == 0
+        || descendant.token != blocked.token
+        || descendant.sequence <= blocked.sequence
+        || descendant.cpu == blocked.cpu
+    {
+        return Err(Failure::task(
+            "I1 parent/descendant evidence has an invalid token, order, or CPU join",
+        ));
+    }
+
+    let invariant = exactly_one(&running_invariant, "RUNNING_INVARIANT")?;
+    if invariant.token != 0 || invariant.cpu != 0 || invariant.arg0 != 0 {
+        return Err(Failure::task(
+            "I1 RUNNING_INVARIANT must report zero token, CPU, and violation count",
+        ));
+    }
+
+    let sent = exactly_one(&wake_sent, "WAKE_SENT")?;
+    let observed = exactly_one(&wake_observed, "WAKE_OBSERVED")?;
+    if sent.token == 0
+        || observed.token != sent.token
+        || observed.sequence <= sent.sequence
+        || observed.cpu == sent.cpu
+        || sent.arg0 != observed.cpu
+        || observed.arg0 != sent.cpu
+    {
+        return Err(Failure::task(
+            "I1 wake evidence has an invalid token, order, CPU, target, or source join",
+        ));
+    }
+
+    let exited = exactly_one(&child_exit, "CHILD_EXIT")?;
+    let cleanup = exactly_one(&child_cleanup, "CHILD_CLEANUP")?;
+    if exited.token == 0
+        || cleanup.token != exited.token
+        || cleanup.sequence <= exited.sequence
+        || cleanup.cpu == exited.cpu
+    {
+        return Err(Failure::task(
+            "I1 child exit/cleanup evidence has an invalid token, order, or CPU join",
+        ));
+    }
+
+    let publish = exactly_one(&tlb_publish, "TLB_PUBLISH")?;
+    let reclaim = exactly_one(&reclaim_allowed, "RECLAIM_ALLOWED")?;
+    let required_cpu_mask = publish.arg0;
+    if publish.token == 0 || required_cpu_mask == 0 || required_cpu_mask & !0x0F != 0 {
+        return Err(Failure::task(
+            "I1 TLB_PUBLISH requires a nonzero generation and a nonzero four-CPU mask",
+        ));
+    }
+    if reclaim.token != publish.token || reclaim.sequence <= publish.sequence {
+        return Err(Failure::task(
+            "I1 RECLAIM_ALLOWED has an invalid generation or order",
+        ));
+    }
+    let tlb_ack_mask = validate_ack_set(&tlb_ack, publish, reclaim, required_cpu_mask, "TLB_ACK")?;
+    let rendezvous_ack_mask = validate_ack_set(
+        &rendezvous_ack,
+        publish,
+        reclaim,
+        required_cpu_mask,
+        "RENDEZVOUS_ACK",
+    )?;
+    if reclaim.arg0 != tlb_ack_mask || reclaim.arg1 != rendezvous_ack_mask {
+        return Err(Failure::task(
+            "I1 RECLAIM_ALLOWED masks do not exactly match the observed acknowledgement masks",
+        ));
+    }
+
+    let observed_mask = I1_REQUIRED_EVIDENCE_MASK;
+    if observed_mask & required_evidence_mask != required_evidence_mask {
+        return Err(Failure::task(
+            "I1 transcript does not cover the request's required evidence mask",
+        ));
+    }
+    Ok(ValidatedEvidence {
+        count: events.len() as u32,
+        observed_mask,
+        first_sequence: events[0].sequence,
+        last_sequence: events[events.len() - 1].sequence,
+    })
+}
+
+fn validate_ack_set(
+    acknowledgements: &[EvidenceEvent],
+    publish: EvidenceEvent,
+    reclaim: EvidenceEvent,
+    required_cpu_mask: u32,
+    label: &str,
+) -> Result<u32, Failure> {
+    let mut observed_mask = 0_u32;
+    for event in acknowledgements {
+        let cpu_bit = 1_u32 << event.cpu;
+        if event.sequence <= publish.sequence
+            || event.sequence >= reclaim.sequence
+            || event.token != publish.token
+            || event.arg0 != required_cpu_mask
+            || required_cpu_mask & cpu_bit == 0
+        {
+            return Err(Failure::task(format!(
+                "I1 {label} has an invalid order, generation, CPU, or required mask"
+            )));
+        }
+        if observed_mask & cpu_bit != 0 {
+            return Err(Failure::task(format!(
+                "I1 {label} repeats an acknowledgement CPU"
+            )));
+        }
+        observed_mask |= cpu_bit;
+    }
+    if observed_mask != required_cpu_mask {
+        return Err(Failure::task(format!(
+            "I1 {label} acknowledgements do not cover the required CPU mask"
+        )));
+    }
+    Ok(observed_mask)
 }
 
 fn parse_hex(bytes: &[u8]) -> Option<u32> {
@@ -1337,10 +1836,134 @@ fn status_label(status: &ExitStatus) -> String {
 mod tests {
     use super::*;
 
+    const TEST_EVIDENCE_NONCE: u64 = h_request::I1_EVIDENCE_NONCE;
+
+    #[derive(Clone, Copy)]
+    struct EventSpec {
+        kind: u8,
+        cpu: u32,
+        token: u32,
+        arg0: u32,
+        arg1: u32,
+    }
+
     fn terminal(status: &str, test_id: u32, detail: u32) -> Vec<u8> {
         let mut record = format!("DWTEST1|{status}|{test_id:08X}|{detail:08X}|").into_bytes();
         record.extend_from_slice(format!("{:08X}\n", fnv1a32(&record)).as_bytes());
         record
+    }
+
+    fn evidence_line(nonce: u64, sequence: u32, event: EventSpec) -> Vec<u8> {
+        let mut record = format!(
+            "DWEVID1|01|{nonce:016X}|{sequence:08X}|{:02X}|{:08X}|{:08X}|{:08X}|{:08X}|",
+            event.kind, event.cpu, event.token, event.arg0, event.arg1
+        )
+        .into_bytes();
+        record.extend_from_slice(format!("{:08X}\n", fnv1a32(&record)).as_bytes());
+        assert_eq!(record.len(), EVIDENCE_RECORD_BYTES);
+        record
+    }
+
+    const fn event(kind: u8, cpu: u32, token: u32, arg0: u32, arg1: u32) -> EventSpec {
+        EventSpec {
+            kind,
+            cpu,
+            token,
+            arg0,
+            arg1,
+        }
+    }
+
+    fn valid_evidence_specs() -> Vec<EventSpec> {
+        vec![
+            event(0x01, 0, 0, 0x10, 0),
+            event(0x01, 1, 0, 0x11, 1),
+            event(0x01, 2, 0, 0x12, 2),
+            event(0x01, 3, 0, 0x13, 3),
+            event(0x02, 0, 1, 0, 0),
+            event(0x02, 2, 2, 0, 0),
+            event(0x03, 0, 0x100, 0, 0),
+            event(0x04, 1, 0x100, 0, 0),
+            event(0x05, 0, 0, 0, 0),
+            event(0x06, 1, 0x200, 3, 0),
+            event(0x07, 3, 0x200, 1, 0),
+            event(0x08, 2, 0x300, 0, 0),
+            event(0x09, 0, 0x300, 0, 0),
+            event(0x0A, 0, 0x400, 0x0F, 0),
+            event(0x0B, 0, 0x400, 0x0F, 0),
+            event(0x0B, 1, 0x400, 0x0F, 0),
+            event(0x0B, 2, 0x400, 0x0F, 0),
+            event(0x0B, 3, 0x400, 0x0F, 0),
+            event(0x0C, 0, 0x400, 0x0F, 0),
+            event(0x0C, 1, 0x400, 0x0F, 0),
+            event(0x0C, 2, 0x400, 0x0F, 0),
+            event(0x0C, 3, 0x400, 0x0F, 0),
+            event(0x0D, 0, 0x400, 0x0F, 0x0F),
+        ]
+    }
+
+    fn evidence_transcript(specs: &[EventSpec], nonce: u64) -> Vec<u8> {
+        let mut transcript = b"firmware diagnostic\n".to_vec();
+        for (sequence, event) in specs.iter().copied().enumerate() {
+            transcript.extend_from_slice(&evidence_line(nonce, sequence as u32, event));
+            if sequence == 8 {
+                transcript.extend_from_slice(b"human diagnostic between evidence records\n");
+            }
+        }
+        transcript.extend_from_slice(b"guest diagnostic before terminal\n");
+        transcript.extend_from_slice(&terminal("01", 23, 0));
+        transcript.extend_from_slice(b"host-visible diagnostic after terminal\n");
+        transcript
+    }
+
+    fn mutate_evidence_line(
+        transcript: &[u8],
+        evidence_index: usize,
+        mutate: impl FnOnce(&mut Vec<u8>),
+    ) -> Vec<u8> {
+        let mut lines = transcript
+            .split_inclusive(|byte| *byte == b'\n')
+            .map(<[u8]>::to_vec)
+            .collect::<Vec<_>>();
+        let line = lines
+            .iter_mut()
+            .filter(|line| line.starts_with(b"DWEVID1"))
+            .nth(evidence_index)
+            .expect("evidence line exists");
+        mutate(line);
+        lines.concat()
+    }
+
+    fn i1_request() -> HRequest {
+        let root = PathBuf::from("/candidate");
+        HRequest {
+            path: root.join("request.toml"),
+            schema_version: 3,
+            deepwyrm_revision: "1".repeat(40),
+            wyrmroot_revision: "2".repeat(40),
+            rust_revision: "3".repeat(40),
+            selector: "smp-runtime-acceptance".into(),
+            test_id: 23,
+            expected_outcome: ExpectedOutcome::Pass,
+            expected_detail: 0,
+            timeout_seconds: 180,
+            loader: root.join("loader.efi"),
+            kernel: root.join("deepwyrm.elf"),
+            symbols: root.join("deepwyrm.symbols"),
+            bootstrap: root.join("bootstrap.elf"),
+            init0: root.join("init0.elf"),
+            hello: root.join("hello.elf"),
+            bootfs: root.join("bootfs.img"),
+            esp: root.join("esp.img"),
+            provenance: root.join("provenance.toml"),
+            ovmf_code: root.join("OVMF_CODE.fd"),
+            ovmf_vars_template: root.join("OVMF_VARS.fd"),
+            run_directory: root.join("runs"),
+            evidence: Some(EvidenceRequest {
+                nonce: TEST_EVIDENCE_NONCE,
+                required_mask: I1_REQUIRED_EVIDENCE_MASK,
+            }),
+        }
     }
 
     #[test]
@@ -1370,6 +1993,273 @@ mod tests {
         assert!(parse_terminal_record(&corrupt, 18).is_err());
         log.extend_from_slice(&terminal("01", 18, 0));
         assert!(parse_terminal_record(&log, 18).is_err());
+    }
+
+    #[test]
+    fn i1_transcript_accepts_all_semantic_proofs_with_surrounding_diagnostics() {
+        let request = i1_request();
+        let transcript = evidence_transcript(&valid_evidence_specs(), TEST_EVIDENCE_NONCE);
+        let parsed = parse_transcript(&transcript, &request).expect("valid I1 transcript rejected");
+        assert_eq!(parsed.terminal.outcome, GuestOutcome::Pass);
+        assert_eq!(parsed.terminal.test_id, 23);
+        assert_eq!(
+            parsed.evidence,
+            Some(ValidatedEvidence {
+                count: 23,
+                observed_mask: 255,
+                first_sequence: 0,
+                last_sequence: 22,
+            })
+        );
+        let fields = evidence_result_fields(&request, parsed.evidence)
+            .expect("validated evidence fields rejected");
+        assert_eq!(
+            fields,
+            concat!(
+                "\"evidence_protocol\":\"dwevid1\",",
+                "\"evidence_nonce\":\"0123456789ABCDEF\",",
+                "\"required_evidence_mask\":255,\"observed_evidence_mask\":255,",
+                "\"evidence_event_count\":23,\"first_evidence_sequence\":0,",
+                "\"last_evidence_sequence\":22,"
+            )
+        );
+    }
+
+    #[test]
+    fn i1_protocol_framing_is_exact_and_fail_closed() {
+        let request = i1_request();
+        let valid = evidence_transcript(&valid_evidence_specs(), TEST_EVIDENCE_NONCE);
+        let exact_line = evidence_line(
+            TEST_EVIDENCE_NONCE,
+            0,
+            event(0x0A, 3, 0xABCD_EF01, 0x0F, 0xCAFE_BABE),
+        );
+        assert!(parse_evidence_line(&exact_line, 1, TEST_EVIDENCE_NONCE).is_ok());
+        for length in 0..EVIDENCE_RECORD_BYTES {
+            assert!(
+                parse_evidence_line(&exact_line[..length], 1, TEST_EVIDENCE_NONCE).is_err(),
+                "admitted DWEVID1 truncation at {length} bytes"
+            );
+        }
+        for delimiter in [7, 10, 27, 36, 39, 48, 57, 66, 75] {
+            let mut malformed = exact_line.clone();
+            malformed[delimiter] = b':';
+            assert!(
+                parse_evidence_line(&malformed, 1, TEST_EVIDENCE_NONCE).is_err(),
+                "admitted malformed delimiter at byte {delimiter}"
+            );
+        }
+        for &position in [26_usize, 38, 55, 56, 58, 82, 83].iter() {
+            if exact_line[position].is_ascii_uppercase() {
+                let mut lowercase = exact_line.clone();
+                lowercase[position].make_ascii_lowercase();
+                assert!(
+                    parse_evidence_line(&lowercase, 1, TEST_EVIDENCE_NONCE).is_err(),
+                    "admitted lowercase hexadecimal at byte {position}"
+                );
+            }
+        }
+        let mut cases = Vec::new();
+        cases.push((
+            "truncation",
+            mutate_evidence_line(&valid, 0, |line| {
+                line.pop();
+            }),
+        ));
+        cases.push((
+            "lowercase hex",
+            mutate_evidence_line(&valid, 0, |line| line[26] = b'f'),
+        ));
+        cases.push((
+            "delimiter",
+            mutate_evidence_line(&valid, 0, |line| line[27] = b':'),
+        ));
+        cases.push((
+            "checksum",
+            mutate_evidence_line(&valid, 0, |line| line[83] ^= 1),
+        ));
+        cases.push((
+            "nonce",
+            evidence_transcript(&valid_evidence_specs(), TEST_EVIDENCE_NONCE + 1),
+        ));
+        cases.push((
+            "sequence",
+            mutate_evidence_line(&valid, 0, |line| {
+                line[35] = b'1';
+                let checksum = fnv1a32(&line[..76]);
+                line[76..84].copy_from_slice(format!("{checksum:08X}").as_bytes());
+            }),
+        ));
+        cases.push((
+            "version",
+            mutate_evidence_line(&valid, 0, |line| {
+                line[8..10].copy_from_slice(b"02");
+                let checksum = fnv1a32(&line[..76]);
+                line[76..84].copy_from_slice(format!("{checksum:08X}").as_bytes());
+            }),
+        ));
+        cases.push((
+            "protocol case",
+            mutate_evidence_line(&valid, 0, |line| line[0] = b'd'),
+        ));
+        let mut lowercase_extra = evidence_line(TEST_EVIDENCE_NONCE, 0, valid_evidence_specs()[0]);
+        lowercase_extra[0] = b'd';
+        lowercase_extra.extend_from_slice(&valid);
+        cases.push(("lowercase protocol before valid evidence", lowercase_extra));
+        cases.push((
+            "unknown kind",
+            mutate_evidence_line(&valid, 0, |line| {
+                line[37..39].copy_from_slice(b"0E");
+                let checksum = fnv1a32(&line[..76]);
+                line[76..84].copy_from_slice(format!("{checksum:08X}").as_bytes());
+            }),
+        ));
+        let mut duplicate_terminal = valid.clone();
+        duplicate_terminal.extend_from_slice(&terminal("01", 23, 0));
+        cases.push(("duplicate terminal", duplicate_terminal));
+        let mut evidence_after_terminal =
+            evidence_transcript(&valid_evidence_specs(), TEST_EVIDENCE_NONCE);
+        evidence_after_terminal.extend_from_slice(&evidence_line(
+            TEST_EVIDENCE_NONCE,
+            23,
+            valid_evidence_specs()[0],
+        ));
+        cases.push(("evidence after terminal", evidence_after_terminal));
+        let too_many = vec![valid_evidence_specs()[0]; MAX_EVIDENCE_RECORDS + 1];
+        cases.push((
+            "record limit",
+            evidence_transcript(&too_many, TEST_EVIDENCE_NONCE),
+        ));
+
+        for (label, transcript) in cases {
+            assert!(
+                parse_transcript(&transcript, &request).is_err(),
+                "admitted hostile {label} transcript"
+            );
+        }
+    }
+
+    #[test]
+    fn i1_semantic_joins_order_cpus_and_masks_are_strict() {
+        let request = i1_request();
+        let mut cases = Vec::new();
+
+        let mut duplicate_cpu = valid_evidence_specs();
+        duplicate_cpu[3].cpu = 2;
+        cases.push(("duplicate online CPU", duplicate_cpu));
+
+        let mut duplicate_apic = valid_evidence_specs();
+        duplicate_apic[3].arg0 = duplicate_apic[2].arg0;
+        cases.push(("duplicate APIC", duplicate_apic));
+
+        let mut invalid_cpu = valid_evidence_specs();
+        invalid_cpu[5].cpu = 4;
+        cases.push(("out-of-range CPU", invalid_cpu));
+
+        let mut wrong_slot = valid_evidence_specs();
+        wrong_slot[3].arg1 = 2;
+        cases.push(("wrong online slot", wrong_slot));
+
+        let mut one_cpl3_cpu = valid_evidence_specs();
+        one_cpl3_cpu[5].cpu = 0;
+        cases.push(("one CPL3 CPU", one_cpl3_cpu));
+
+        let mut blocked_after_descendant = valid_evidence_specs();
+        blocked_after_descendant.swap(6, 7);
+        cases.push(("parent order", blocked_after_descendant));
+
+        let mut zero_block_token = valid_evidence_specs();
+        zero_block_token[6].token = 0;
+        zero_block_token[7].token = 0;
+        cases.push(("zero parent token", zero_block_token));
+
+        let mut invariant_violation = valid_evidence_specs();
+        invariant_violation[8].arg0 = 1;
+        cases.push(("running violation", invariant_violation));
+
+        let mut invariant_cpu = valid_evidence_specs();
+        invariant_cpu[8].cpu = 1;
+        cases.push(("running invariant CPU", invariant_cpu));
+
+        let mut wake_target = valid_evidence_specs();
+        wake_target[9].arg0 = 2;
+        cases.push(("wake target", wake_target));
+
+        let mut wake_token = valid_evidence_specs();
+        wake_token[10].token = 0x201;
+        cases.push(("wake token", wake_token));
+
+        let mut same_cleanup_cpu = valid_evidence_specs();
+        same_cleanup_cpu[12].cpu = 2;
+        cases.push(("cleanup CPU", same_cleanup_cpu));
+
+        let mut cleanup_token = valid_evidence_specs();
+        cleanup_token[12].token = 0x301;
+        cases.push(("cleanup token", cleanup_token));
+
+        let mut zero_publish_mask = valid_evidence_specs();
+        zero_publish_mask[13].arg0 = 0;
+        cases.push(("zero publish mask", zero_publish_mask));
+
+        let mut wide_publish_mask = valid_evidence_specs();
+        wide_publish_mask[13].arg0 = 0x1F;
+        cases.push(("wide publish mask", wide_publish_mask));
+
+        let mut missing_tlb_ack = valid_evidence_specs();
+        missing_tlb_ack.remove(17);
+        cases.push(("missing TLB ack", missing_tlb_ack));
+
+        let mut duplicate_rendezvous_cpu = valid_evidence_specs();
+        duplicate_rendezvous_cpu[21].cpu = 2;
+        cases.push(("duplicate rendezvous CPU", duplicate_rendezvous_cpu));
+
+        let mut wrong_ack_token = valid_evidence_specs();
+        wrong_ack_token[16].token = 0x401;
+        cases.push(("wrong ack token", wrong_ack_token));
+
+        let mut wrong_ack_mask = valid_evidence_specs();
+        wrong_ack_mask[20].arg0 = 0x07;
+        cases.push(("wrong ack mask", wrong_ack_mask));
+
+        let mut early_reclaim = valid_evidence_specs();
+        let reclaim = early_reclaim.pop().expect("reclaim event");
+        early_reclaim.insert(16, reclaim);
+        cases.push(("early reclaim", early_reclaim));
+
+        let mut wrong_reclaim_mask = valid_evidence_specs();
+        wrong_reclaim_mask[22].arg1 = 0x07;
+        cases.push(("wrong reclaim mask", wrong_reclaim_mask));
+
+        let mut duplicate_event = valid_evidence_specs();
+        duplicate_event.insert(5, duplicate_event[4]);
+        cases.push(("duplicate event", duplicate_event));
+
+        for (label, specs) in cases {
+            let transcript = evidence_transcript(&specs, TEST_EVIDENCE_NONCE);
+            assert!(
+                parse_transcript(&transcript, &request).is_err(),
+                "admitted hostile {label} semantics"
+            );
+        }
+    }
+
+    #[test]
+    fn i1_requires_evidence_before_one_unchanged_terminal() {
+        let request = i1_request();
+        assert!(parse_transcript(&terminal("01", 23, 0), &request).is_err());
+        let transcript = evidence_transcript(&valid_evidence_specs(), TEST_EVIDENCE_NONCE);
+        assert!(parse_transcript(&transcript, &request).is_ok());
+        assert!(
+            parse_transcript(
+                &transcript,
+                &HRequest {
+                    evidence: None,
+                    schema_version: 2,
+                    ..request
+                }
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1420,6 +2310,7 @@ mod tests {
         let root = PathBuf::from("/candidate");
         let request = HRequest {
             path: root.join("request.toml"),
+            schema_version: 2,
             deepwyrm_revision: "1".repeat(40),
             wyrmroot_revision: "2".repeat(40),
             rust_revision: "3".repeat(40),
@@ -1440,6 +2331,7 @@ mod tests {
             ovmf_code: root.join("OVMF_CODE.fd"),
             ovmf_vars_template: root.join("OVMF_VARS.fd"),
             run_directory: root.join("runs"),
+            evidence: None,
         };
         let artifacts = CandidateArtifacts {
             loader: request.loader.clone(),
@@ -1532,6 +2424,7 @@ mod tests {
         let esp = root.join("esp.img");
         let request = HRequest {
             path: root.join("request.toml"),
+            schema_version: 2,
             deepwyrm_revision: "1".repeat(40),
             wyrmroot_revision: "2".repeat(40),
             rust_revision: "3".repeat(40),
@@ -1552,6 +2445,7 @@ mod tests {
             ovmf_code: root.join("OVMF_CODE.fd"),
             ovmf_vars_template: root.join("OVMF_VARS.fd"),
             run_directory: root.join("runs"),
+            evidence: None,
         };
         let run = RunPaths {
             vars: root.join("OVMF_VARS.fd"),
@@ -1628,6 +2522,41 @@ mod tests {
             assert!(result.contains(&format!("\"reason\":\"{reason}\"")));
             assert!(result.contains("\"status\":\"ERROR\""));
         }
+
+        let i1_failure_run = RunPaths {
+            vars: root.join("unused-i1-vars.fd"),
+            serial_log: root.join("unused-i1-serial.log"),
+            result_json: root.join("i1-error-result.json"),
+            stderr_log: root.join("unused-i1-stderr.log"),
+        };
+        let i1_request = HRequest {
+            schema_version: 3,
+            selector: "smp-runtime-acceptance".into(),
+            test_id: 23,
+            evidence: Some(EvidenceRequest {
+                nonce: TEST_EVIDENCE_NONCE,
+                required_mask: I1_REQUIRED_EVIDENCE_MASK,
+            }),
+            ..request.clone()
+        };
+        write_integration_host_failure(
+            HProfile::Smp,
+            &i1_request,
+            &artifacts,
+            &i1_failure_run,
+            HostFailure {
+                status: None,
+                reason: "transcript_invalid",
+                timeout_seconds: None,
+                cleanup: CleanupDisposition::exited(),
+            },
+        )
+        .expect("write I1 host failure result");
+        let i1_result =
+            fs::read_to_string(&i1_failure_run.result_json).expect("read I1 failure result");
+        assert!(i1_result.contains("\"schema_version\":3"));
+        assert!(i1_result.contains("\"reason\":\"transcript_invalid\""));
+        assert!(!i1_result.contains("evidence_protocol"));
         fs::remove_dir_all(root).expect("remove test root");
     }
 
@@ -1654,6 +2583,7 @@ mod tests {
         fs::write(root.join("deepwyrm.symbols"), b"different").expect("write symbols");
         let request = HRequest {
             path: root.join("request.toml"),
+            schema_version: 2,
             deepwyrm_revision: "1".repeat(40),
             wyrmroot_revision: "2".repeat(40),
             rust_revision: "3".repeat(40),
@@ -1674,6 +2604,7 @@ mod tests {
             ovmf_code: root.join("OVMF_CODE.fd"),
             ovmf_vars_template: root.join("OVMF_VARS.fd"),
             run_directory: root.join("runs"),
+            evidence: None,
         };
         let error = verify_candidate_inputs(&request).expect_err("mismatched symbols accepted");
         assert!(error.message.contains("do not exactly match"));
@@ -1710,6 +2641,7 @@ mod tests {
         }
         let request = HRequest {
             path: root.join("request.toml"),
+            schema_version: 2,
             deepwyrm_revision: "1".repeat(40),
             wyrmroot_revision: "2".repeat(40),
             rust_revision: "3".repeat(40),
@@ -1730,6 +2662,7 @@ mod tests {
             ovmf_code: root.join("OVMF_CODE.fd"),
             ovmf_vars_template: root.join("OVMF_VARS.fd"),
             run_directory: root.join("runs"),
+            evidence: None,
         };
         let artifacts = CandidateArtifacts {
             loader: request.loader.clone(),

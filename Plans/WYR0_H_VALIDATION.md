@@ -140,3 +140,44 @@ actual QEMU launch arguments. No host-only result is claimed as I0 or I1 guest a
 - I1 must enable the shared multi-CPU userspace runtime and produce the required
   CPU-participation, remote-wake, and address-space-rendezvous evidence.
 - Daybreak remains deferred until the plan's dedicated final D0 security gate.
+
+## I1 host evidence contract
+
+The host integration harness admits the I1 selector only through a schema-v3
+request. The selector is `smp-runtime-acceptance`, its stable test ID is 23,
+and the request adds the exact fields `evidence_protocol = "dwevid1"`,
+`evidence_nonce = "0123456789ABCDEF"`, and `required_evidence_mask = 255`.
+The nonce is a nonzero fixed-width uppercase hexadecimal u64. Schema-v2
+requests remain the terminal-only contract for non-I1 selectors; test ID 22
+remains reserved for I2.
+
+An I1 serial transcript contains no more than 64 checksummed evidence records
+before its single unchanged `DWTEST1` terminal record. Evidence records are
+exactly 85 bytes and use this wire form:
+
+```text
+DWEVID1|01|NONCE16HEX|SEQ8HEX|KIND2HEX|CPU8HEX|TOKEN8HEX|ARG08HEX|ARG18HEX|CHECKSUM8HEX\n
+```
+
+All hexadecimal fields are uppercase and fixed width. The checksum is FNV-1a-32
+over the record through the delimiter immediately before the checksum. Sequence
+numbers start at zero and are contiguous, the nonce must exactly match the
+request, and CPU IDs are limited to 0 through 3. Human diagnostics may surround
+or appear between protocol records, but malformed protocol records, duplicate
+terminals, evidence after the terminal, unknown kinds, and missing I1 evidence
+fail closed.
+
+Kind assignments are `01 CPU_ONLINE`, `02 CPL3_SYSCALL`, `03 PARENT_BLOCKED`,
+`04 DESCENDANT_RUNNING`, `05 RUNNING_INVARIANT`, `06 WAKE_SENT`,
+`07 WAKE_OBSERVED`, `08 CHILD_EXIT`, `09 CHILD_CLEANUP`, `0A TLB_PUBLISH`,
+`0B TLB_ACK`, `0C RENDEZVOUS_ACK`, and `0D RECLAIM_ALLOWED`.
+
+The validator requires the complete CPU-online, cross-CPU CPL3, blocked-parent
+and running-descendant, running-invariant, remote-wake, child-cleanup, TLB
+acknowledgement, rendezvous acknowledgement, and reclaim-order proofs. It
+rejects duplicate or inconsistent CPUs, tokens, ordering, joins, and masks.
+Only after the normal request/artifact/media revalidation accepts a terminal
+PASS does the schema-v3 integration result publish the protocol, nonce,
+required and observed evidence masks, event count, and first/last sequence.
+This host-side validation capability is not evidence that a guest candidate
+emitted the protocol and does not by itself close I1.

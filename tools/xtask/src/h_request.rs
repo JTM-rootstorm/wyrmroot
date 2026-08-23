@@ -30,12 +30,50 @@ const REQUIRED_KEYS_V2: &[&str] = &[
     "ovmf_vars_template",
     "run_directory",
 ];
+const REQUIRED_KEYS_V3: &[&str] = &[
+    "schema_version",
+    "deepwyrm_revision",
+    "wyrmroot_revision",
+    "rust_revision",
+    "selector",
+    "test_id",
+    "expected_outcome",
+    "expected_detail",
+    "timeout_seconds",
+    "loader",
+    "kernel",
+    "symbols",
+    "bootstrap",
+    "init0",
+    "hello",
+    "bootfs",
+    "esp",
+    "provenance",
+    "ovmf_code",
+    "ovmf_vars_template",
+    "run_directory",
+    "evidence_protocol",
+    "evidence_nonce",
+    "required_evidence_mask",
+];
+
+pub(crate) const I1_SELECTOR: &str = "smp-runtime-acceptance";
+pub(crate) const I1_TEST_ID: u32 = 23;
+pub(crate) const I1_EVIDENCE_PROTOCOL: &str = "dwevid1";
+pub(crate) const I1_EVIDENCE_NONCE: u64 = 0x0123_4567_89AB_CDEF;
+pub(crate) const I1_REQUIRED_EVIDENCE_MASK: u32 = 255;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExpectedOutcome {
     Pass,
     Fail,
     Panic,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EvidenceRequest {
+    pub(crate) nonce: u64,
+    pub(crate) required_mask: u32,
 }
 
 impl ExpectedOutcome {
@@ -51,6 +89,7 @@ impl ExpectedOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HRequest {
     pub(crate) path: PathBuf,
+    pub(crate) schema_version: u32,
     pub(crate) deepwyrm_revision: String,
     pub(crate) wyrmroot_revision: String,
     pub(crate) rust_revision: String,
@@ -71,6 +110,7 @@ pub(crate) struct HRequest {
     pub(crate) ovmf_code: PathBuf,
     pub(crate) ovmf_vars_template: PathBuf,
     pub(crate) run_directory: PathBuf,
+    pub(crate) evidence: Option<EvidenceRequest>,
 }
 
 pub(crate) fn load(path: &Path) -> Result<HRequest, Failure> {
@@ -83,13 +123,16 @@ pub(crate) fn load(path: &Path) -> Result<HRequest, Failure> {
     let text = fs::read_to_string(&path)
         .map_err(|error| Failure::task(format!("could not read WYR0-H request: {error}")))?;
     let values = parse(&text)?;
-    let schema_version = required(&values, "schema_version")?;
-    if schema_version != "2" {
-        return Err(Failure::task(
-            "WYR0-H acceptance commands require schema_version = 2",
-        ));
-    }
-    let required_keys = REQUIRED_KEYS_V2;
+    let schema_version = number::<u32>(&values, "schema_version")?;
+    let required_keys = match schema_version {
+        2 => REQUIRED_KEYS_V2,
+        3 => REQUIRED_KEYS_V3,
+        _ => {
+            return Err(Failure::task(
+                "WYR0-H acceptance commands require schema_version = 2 or 3",
+            ));
+        }
+    };
     let expected = required_keys.iter().copied().collect::<BTreeSet<_>>();
     let actual = values.keys().map(String::as_str).collect::<BTreeSet<_>>();
     if actual != expected {
@@ -105,13 +148,50 @@ pub(crate) fn load(path: &Path) -> Result<HRequest, Failure> {
         .parent()
         .ok_or_else(|| Failure::task("WYR0-H request has no parent directory"))?
         .to_path_buf();
+    let selector = selector(&values)?;
+    let test_id = number::<u32>(&values, "test_id")?;
+    let evidence = match schema_version {
+        2 => {
+            if selector == I1_SELECTOR {
+                return Err(Failure::task(
+                    "WYR0-H I1 selector requires schema_version = 3",
+                ));
+            }
+            None
+        }
+        3 => {
+            if selector != I1_SELECTOR || test_id != I1_TEST_ID {
+                return Err(Failure::task(format!(
+                    "WYR0-H schema_version = 3 is reserved for selector '{I1_SELECTOR}' with test_id {I1_TEST_ID}"
+                )));
+            }
+            if required(&values, "evidence_protocol")? != I1_EVIDENCE_PROTOCOL {
+                return Err(Failure::task(format!(
+                    "WYR0-H I1 evidence_protocol must be '{I1_EVIDENCE_PROTOCOL}'"
+                )));
+            }
+            let nonce = evidence_nonce(&values)?;
+            let required_mask = number::<u32>(&values, "required_evidence_mask")?;
+            if required_mask != I1_REQUIRED_EVIDENCE_MASK {
+                return Err(Failure::task(format!(
+                    "WYR0-H I1 required_evidence_mask must be {I1_REQUIRED_EVIDENCE_MASK}"
+                )));
+            }
+            Some(EvidenceRequest {
+                nonce,
+                required_mask,
+            })
+        }
+        _ => unreachable!("schema version admitted above"),
+    };
     let request = HRequest {
         path,
+        schema_version,
         deepwyrm_revision: revision(&values, "deepwyrm_revision")?,
         wyrmroot_revision: revision(&values, "wyrmroot_revision")?,
         rust_revision: revision(&values, "rust_revision")?,
-        selector: selector(&values)?,
-        test_id: number::<u32>(&values, "test_id")?,
+        selector,
+        test_id,
         expected_outcome: expected_outcome(&values)?,
         expected_detail: number::<u32>(&values, "expected_detail")?,
         timeout_seconds: number::<u64>(&values, "timeout_seconds")?,
@@ -131,6 +211,7 @@ pub(crate) fn load(path: &Path) -> Result<HRequest, Failure> {
             required(&values, "run_directory")?,
             "run_directory",
         )?,
+        evidence,
     };
     if request.test_id == 0 {
         return Err(Failure::task("WYR0-H test_id must be nonzero"));
@@ -259,6 +340,30 @@ fn selector(values: &BTreeMap<String, String>) -> Result<String, Failure> {
         ));
     }
     Ok(value.to_owned())
+}
+
+fn evidence_nonce(values: &BTreeMap<String, String>) -> Result<u64, Failure> {
+    let value = required(values, "evidence_nonce")?;
+    if value.len() != 16
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'A'..=b'F').contains(&byte))
+    {
+        return Err(Failure::task(
+            "WYR0-H I1 evidence_nonce must be 16 uppercase hexadecimal digits",
+        ));
+    }
+    let nonce = u64::from_str_radix(value, 16)
+        .map_err(|_| Failure::task("WYR0-H I1 evidence_nonce is not a valid u64"))?;
+    if nonce == 0 {
+        return Err(Failure::task("WYR0-H I1 evidence_nonce must be nonzero"));
+    }
+    if nonce != I1_EVIDENCE_NONCE {
+        return Err(Failure::task(format!(
+            "WYR0-H I1 evidence_nonce must be {I1_EVIDENCE_NONCE:016X}"
+        )));
+    }
+    Ok(nonce)
 }
 
 fn input_path(parent: &Path, value: &str) -> PathBuf {
@@ -444,6 +549,61 @@ mod tests {
         )
     }
 
+    fn valid_v2() -> String {
+        valid()
+            .replace("schema_version = 1", "schema_version = 2")
+            .replace(
+                "test_id = 18\n",
+                "test_id = 18\nexpected_outcome = \"pass\"\nexpected_detail = 0\n",
+            )
+    }
+
+    fn valid_v3() -> String {
+        valid_v2()
+            .replace("schema_version = 2", "schema_version = 3")
+            .replace(
+                "selector = \"primordial-bootstrap\"",
+                "selector = \"smp-runtime-acceptance\"",
+            )
+            .replace("test_id = 18", "test_id = 23")
+            + concat!(
+                "evidence_protocol = \"dwevid1\"\n",
+                "evidence_nonce = \"0123456789ABCDEF\"\n",
+                "required_evidence_mask = 255\n"
+            )
+    }
+
+    fn request_root(label: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!(
+                "xtask-h-request-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock before epoch")
+                    .as_nanos()
+            ))
+    }
+
+    fn write_request_fixture(root: &Path, request: &str) -> PathBuf {
+        fs::create_dir(root).expect("create request fixture");
+        for name in [
+            "loader.efi",
+            "deepwyrm.elf",
+            "bootstrap.elf",
+            "init0.elf",
+            "hello.elf",
+            "OVMF_CODE.fd",
+            "OVMF_VARS.fd",
+        ] {
+            fs::write(root.join(name), b"artifact").expect("write request artifact");
+        }
+        let path = root.join("request.toml");
+        fs::write(&path, request).expect("write request fixture");
+        path
+    }
+
     #[test]
     fn flat_request_parser_rejects_ambiguity() {
         let parsed = parse(&valid()).unwrap();
@@ -530,6 +690,104 @@ mod tests {
         assert_eq!(loaded.expected_outcome, ExpectedOutcome::Fail);
         assert_eq!(loaded.expected_detail, 0xB000_0401);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn schema_three_is_reserved_for_the_exact_i1_contract() {
+        let root = request_root("v3");
+        let path = write_request_fixture(&root, &valid_v3());
+        let loaded = load(&path).expect("valid I1 request rejected");
+        assert_eq!(loaded.schema_version, 3);
+        assert_eq!(loaded.selector, I1_SELECTOR);
+        assert_eq!(loaded.test_id, I1_TEST_ID);
+        assert_eq!(
+            loaded.evidence,
+            Some(EvidenceRequest {
+                nonce: 0x0123_4567_89AB_CDEF,
+                required_mask: I1_REQUIRED_EVIDENCE_MASK,
+            })
+        );
+
+        for (label, request) in [
+            (
+                "v2-i1",
+                valid_v3()
+                    .replace("schema_version = 3", "schema_version = 2")
+                    .replace("evidence_protocol = \"dwevid1\"\n", "")
+                    .replace("evidence_nonce = \"0123456789ABCDEF\"\n", "")
+                    .replace("required_evidence_mask = 255\n", ""),
+            ),
+            (
+                "v3-non-i1",
+                valid_v3().replace(
+                    "selector = \"smp-runtime-acceptance\"",
+                    "selector = \"primordial-bootstrap\"",
+                ),
+            ),
+            (
+                "v3-id22",
+                valid_v3().replace("test_id = 23", "test_id = 22"),
+            ),
+            (
+                "v3-extra",
+                format!("{}unexpected = \"field\"\n", valid_v3()),
+            ),
+            (
+                "v3-missing",
+                valid_v3().replace("required_evidence_mask = 255\n", ""),
+            ),
+        ] {
+            let invalid_root = request_root(label);
+            let invalid_path = write_request_fixture(&invalid_root, &request);
+            assert!(load(&invalid_path).is_err(), "admitted invalid {label}");
+            fs::remove_dir_all(invalid_root).expect("remove invalid fixture");
+        }
+        fs::remove_dir_all(root).expect("remove request fixture");
+    }
+
+    #[test]
+    fn schema_three_evidence_scalars_are_exact_and_fail_closed() {
+        for (label, request) in [
+            (
+                "protocol-case",
+                valid_v3().replace("\"dwevid1\"", "\"DWEVID1\""),
+            ),
+            (
+                "nonce-lower",
+                valid_v3().replace("0123456789ABCDEF", "0123456789abcDEF"),
+            ),
+            (
+                "nonce-short",
+                valid_v3().replace("0123456789ABCDEF", "123456789ABCDEF"),
+            ),
+            (
+                "nonce-zero",
+                valid_v3().replace("0123456789ABCDEF", "0000000000000000"),
+            ),
+            (
+                "nonce-other",
+                valid_v3().replace("0123456789ABCDEF", "FEDCBA9876543210"),
+            ),
+            (
+                "mask-low",
+                valid_v3().replace(
+                    "required_evidence_mask = 255",
+                    "required_evidence_mask = 254",
+                ),
+            ),
+            (
+                "mask-hex",
+                valid_v3().replace(
+                    "required_evidence_mask = 255",
+                    "required_evidence_mask = \"FF\"",
+                ),
+            ),
+        ] {
+            let root = request_root(label);
+            let path = write_request_fixture(&root, &request);
+            assert!(load(&path).is_err(), "admitted invalid {label}");
+            fs::remove_dir_all(root).expect("remove evidence fixture");
+        }
     }
 
     #[test]
