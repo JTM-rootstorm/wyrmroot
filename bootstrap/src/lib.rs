@@ -22,15 +22,16 @@ compile_error!("primordial bootstrap test variants are mutually exclusive");
 use deepwyrm_syscall::{DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights};
 use wyrmroot_bootfs::archive::{Archive, LookupError, ParseError};
 use wyrmroot_bootstrap_proto::{
-    BOOTSTRAP_INIT_V1_SIZE, BOOTSTRAP_READY_V1_SIZE, BootstrapMessage, DecodeError, InitMessage,
-    MAX_BOOTSTRAP_HANDLES, ReadyMessage, decode,
+    BOOTSTRAP_INIT_V2_SIZE, BOOTSTRAP_READY_V2_SIZE, BootstrapMessage, DecodeError, InitMessageV2,
+    MAX_BOOTSTRAP_HANDLES, ReadyMessageV2, decode,
 };
 #[cfg(feature = "primordial-test-support")]
 use wyrmroot_runtime::PrimordialTestError;
 use wyrmroot_runtime::{
     BOOTFS_EXPECTATION, BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, CapabilityValidationError,
-    InitCapability, MappingPlan, MappingPlanError, NativeError, ReceiveCounts,
-    SELF_ROOT_EXPECTATION, validate_bootstrap_channel, validate_init_capabilities,
+    InitCapability, LOADER_TASK_GROUP_EXPECTATION, MappingPlan, MappingPlanError, NativeError,
+    ReceiveCounts, SELF_ROOT_EXPECTATION, validate_bootstrap_channel,
+    validate_init_capabilities_v2,
 };
 
 /// Canonical init executable required in the primordial bootfs.
@@ -130,7 +131,7 @@ fn run_bootstrap_inner<System: BootstrapSystem>(
     validate_bootstrap_channel(channel_info, BOOTSTRAP_CHANNEL_EXPECTATION)
         .map_err(BootstrapError::BootstrapChannel)?;
 
-    let mut bytes = [0_u8; BOOTSTRAP_INIT_V1_SIZE];
+    let mut bytes = [0_u8; BOOTSTRAP_INIT_V2_SIZE];
     let mut handles = [DwReceivedHandleInfoV1::default(); MAX_BOOTSTRAP_HANDLES];
     let counts = system
         .receive_channel(bootstrap_channel, &mut bytes, &mut handles)
@@ -140,13 +141,13 @@ fn run_bootstrap_inner<System: BootstrapSystem>(
         let transaction_id = match decode(&bytes[..counts.bytes], counts.handles)
             .map_err(BootstrapError::Protocol)?
         {
-            BootstrapMessage::Init(message) => {
-                if message.transaction_id != InitMessage::primordial().transaction_id {
+            BootstrapMessage::InitV2(message) => {
+                if message.transaction_id != InitMessageV2::primordial().transaction_id {
                     return Err(BootstrapError::UnexpectedTransactionId);
                 }
                 message.transaction_id
             }
-            BootstrapMessage::Ready(_) => return Err(BootstrapError::UnexpectedMessage),
+            _ => return Err(BootstrapError::UnexpectedMessage),
         };
         process_init(system, &handles[..counts.handles])?;
         Ok(transaction_id)
@@ -156,8 +157,8 @@ fn run_bootstrap_inner<System: BootstrapSystem>(
     cleanup?;
     before_ready(bootstrap_channel)?;
 
-    let mut ready = [0_u8; BOOTSTRAP_READY_V1_SIZE];
-    let ready_size = ReadyMessage { transaction_id }
+    let mut ready = [0_u8; BOOTSTRAP_READY_V2_SIZE];
+    let ready_size = ReadyMessageV2 { transaction_id }
         .encode_into(&mut ready)
         .map_err(BootstrapError::Protocol)?;
     system
@@ -180,6 +181,7 @@ fn process_init<System: BootstrapSystem>(
     let received = [
         received_capability(handles[0]),
         received_capability(handles[1]),
+        received_capability(handles[2]),
     ];
     let fresh = [
         system
@@ -187,6 +189,9 @@ fn process_init<System: BootstrapSystem>(
             .map_err(BootstrapError::Native)?,
         system
             .query_capability_info(handles[1].handle)
+            .map_err(BootstrapError::Native)?,
+        system
+            .query_capability_info(handles[2].handle)
             .map_err(BootstrapError::Native)?,
     ];
     let capabilities = [
@@ -198,9 +203,18 @@ fn process_init<System: BootstrapSystem>(
             received: received[1],
             fresh: fresh[1],
         },
+        InitCapability {
+            received: received[2],
+            fresh: fresh[2],
+        },
     ];
-    validate_init_capabilities(&capabilities, SELF_ROOT_EXPECTATION, BOOTFS_EXPECTATION)
-        .map_err(BootstrapError::Capability)?;
+    validate_init_capabilities_v2(
+        &capabilities,
+        SELF_ROOT_EXPECTATION,
+        BOOTFS_EXPECTATION,
+        LOADER_TASK_GROUP_EXPECTATION,
+    )
+    .map_err(BootstrapError::Capability)?;
 
     let logical_size = system
         .query_memory_object_size(handles[1].handle)

@@ -11,7 +11,8 @@
 mod envelope;
 
 pub use envelope::{
-    BOOTSTRAP_INIT_V1_SIZE, BOOTSTRAP_READY_V1_SIZE, BootstrapMessage, CapabilityRole, DecodeError,
-    HEADER_SIZE, InitMessage, MAX_BOOTSTRAP_HANDLES, MessageType, PROTOCOL_MAGIC, PROTOCOL_MAJOR,
-    PROTOCOL_MINOR, ReadyMessage, decode,
+    BOOTSTRAP_INIT_V1_SIZE, BOOTSTRAP_INIT_V2_SIZE, BOOTSTRAP_READY_V1_SIZE,
+    BOOTSTRAP_READY_V2_SIZE, BootstrapMessage, CapabilityRole, DecodeError, HEADER_SIZE,
+    InitMessage, InitMessageV2, MAX_BOOTSTRAP_HANDLES, MessageType, PROTOCOL_MAGIC, PROTOCOL_MAJOR,
+    PROTOCOL_MINOR, PROTOCOL_MINOR_V2, ReadyMessage, ReadyMessageV2, decode,
 };

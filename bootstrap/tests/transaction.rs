@@ -1,27 +1,29 @@
 use deepwyrm_syscall::{
     DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL, DW_OBJECT_TYPE_MEMORY_OBJECT,
-    DW_STATUS_BAD_HANDLE, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights,
+    DW_OBJECT_TYPE_TASK_GROUP, DW_STATUS_BAD_HANDLE, DwHandle, DwObjectType,
+    DwReceivedHandleInfoV1, DwRights,
 };
 use wyrmroot_bootfs::builder::{Builder, FileMode};
 #[cfg(feature = "primordial-test-support")]
 use wyrmroot_bootstrap::run_bootstrap_with_before_ready;
 use wyrmroot_bootstrap::{BootstrapError, BootstrapSystem, HELLO_PATH, INIT0_PATH, run_bootstrap};
 use wyrmroot_bootstrap_proto::{
-    BOOTSTRAP_INIT_V1_SIZE, BootstrapMessage, InitMessage, ReadyMessage, decode,
+    BOOTSTRAP_INIT_V2_SIZE, BootstrapMessage, InitMessageV2, ReadyMessageV2, decode,
 };
 use wyrmroot_runtime::{
-    BOOTFS_EXPECTATION, BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, MappingPlan, NativeError,
-    ReceiveCounts, SELF_ROOT_EXPECTATION,
+    BOOTFS_EXPECTATION, BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo,
+    LOADER_TASK_GROUP_EXPECTATION, MappingPlan, NativeError, ReceiveCounts, SELF_ROOT_EXPECTATION,
 };
 
 const CHANNEL: DwHandle = DwHandle(11);
 const ROOT: DwHandle = DwHandle(21);
 const BOOTFS: DwHandle = DwHandle(22);
+const TASK_GROUP: DwHandle = DwHandle(23);
 
 struct Fixture {
-    init: [u8; BOOTSTRAP_INIT_V1_SIZE],
+    init: [u8; BOOTSTRAP_INIT_V2_SIZE],
     init_size: usize,
-    handles: [DwReceivedHandleInfoV1; 2],
+    handles: [DwReceivedHandleInfoV1; 3],
     bootfs: Vec<u8>,
     sent: Vec<u8>,
     closed: Vec<DwHandle>,
@@ -30,8 +32,8 @@ struct Fixture {
 
 impl Fixture {
     fn valid() -> Self {
-        let mut init = [0_u8; BOOTSTRAP_INIT_V1_SIZE];
-        let init_size = InitMessage::primordial().encode_into(&mut init).unwrap();
+        let mut init = [0_u8; BOOTSTRAP_INIT_V2_SIZE];
+        let init_size = InitMessageV2::primordial().encode_into(&mut init).unwrap();
         Self {
             init,
             init_size,
@@ -46,6 +48,12 @@ impl Fixture {
                     handle: BOOTFS,
                     rights: BOOTFS_EXPECTATION.rights,
                     object_type: DW_OBJECT_TYPE_MEMORY_OBJECT,
+                    ..DwReceivedHandleInfoV1::default()
+                },
+                DwReceivedHandleInfoV1 {
+                    handle: TASK_GROUP,
+                    rights: LOADER_TASK_GROUP_EXPECTATION.rights,
+                    object_type: DW_OBJECT_TYPE_TASK_GROUP,
                     ..DwReceivedHandleInfoV1::default()
                 },
             ],
@@ -75,6 +83,10 @@ impl BootstrapSystem for Fixture {
                 object_type: DW_OBJECT_TYPE_MEMORY_OBJECT,
                 rights: BOOTFS_EXPECTATION.rights,
             }),
+            TASK_GROUP => Ok(CapabilityInfo {
+                object_type: DW_OBJECT_TYPE_TASK_GROUP,
+                rights: LOADER_TASK_GROUP_EXPECTATION.rights,
+            }),
             _ => Err(NativeError::Status(DW_STATUS_BAD_HANDLE)),
         }
     }
@@ -87,10 +99,10 @@ impl BootstrapSystem for Fixture {
     ) -> Result<ReceiveCounts, NativeError> {
         assert_eq!(channel, CHANNEL);
         bytes[..self.init_size].copy_from_slice(&self.init[..self.init_size]);
-        handles[..2].copy_from_slice(&self.handles);
+        handles[..3].copy_from_slice(&self.handles);
         Ok(ReceiveCounts {
             bytes: self.init_size,
-            handles: 2,
+            handles: 3,
         })
     }
 
@@ -141,9 +153,11 @@ fn synthetic_transaction_validates_bootfs_sends_ready_and_closes_handles() {
     assert!(fixture.mapped);
     assert_eq!(
         decode(&fixture.sent, 0),
-        Ok(BootstrapMessage::Ready(ReadyMessage { transaction_id: 1 }))
+        Ok(BootstrapMessage::ReadyV2(ReadyMessageV2 {
+            transaction_id: 1
+        }))
     );
-    assert_eq!(fixture.closed, [ROOT, BOOTFS, CHANNEL]);
+    assert_eq!(fixture.closed, [ROOT, BOOTFS, TASK_GROUP, CHANNEL]);
 }
 
 #[test]
@@ -154,7 +168,7 @@ fn malformed_protocol_closes_received_handles_without_ready() {
         run_bootstrap(&mut fixture, CHANNEL),
         Err(BootstrapError::Protocol(_))
     ));
-    assert_eq!(fixture.closed, [ROOT, BOOTFS]);
+    assert_eq!(fixture.closed, [ROOT, BOOTFS, TASK_GROUP]);
     assert!(fixture.sent.is_empty());
 }
 
@@ -169,7 +183,7 @@ fn test_hook_runs_after_capability_cleanup_and_before_ready_or_channel_close() {
         Err(BootstrapError::UnexpectedMessage)
     );
     assert!(fixture.mapped);
-    assert_eq!(fixture.closed, [ROOT, BOOTFS]);
+    assert_eq!(fixture.closed, [ROOT, BOOTFS, TASK_GROUP]);
     assert!(fixture.sent.is_empty());
 }
 
@@ -181,7 +195,7 @@ fn nonprimordial_transaction_id_is_rejected_and_received_handles_are_closed() {
         run_bootstrap(&mut fixture, CHANNEL),
         Err(BootstrapError::UnexpectedTransactionId)
     );
-    assert_eq!(fixture.closed, [ROOT, BOOTFS]);
+    assert_eq!(fixture.closed, [ROOT, BOOTFS, TASK_GROUP]);
     assert!(fixture.sent.is_empty());
 }
 
@@ -193,7 +207,7 @@ fn missing_or_nonexecutable_required_entries_fail_before_ready() {
         run_bootstrap(&mut missing, CHANNEL),
         Err(BootstrapError::MissingRequiredEntry)
     );
-    assert_eq!(missing.closed, [ROOT, BOOTFS]);
+    assert_eq!(missing.closed, [ROOT, BOOTFS, TASK_GROUP]);
     assert!(missing.sent.is_empty());
 
     let mut builder = Builder::new();

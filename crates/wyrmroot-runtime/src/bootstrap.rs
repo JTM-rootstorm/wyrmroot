@@ -2,9 +2,9 @@
 
 use deepwyrm_syscall::{
     DW_BASE_PAGE_SIZE, DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL,
-    DW_OBJECT_TYPE_MEMORY_OBJECT, DW_RIGHT_DUPLICATE, DW_RIGHT_INSPECT, DW_RIGHT_MAP,
-    DW_RIGHT_MODIFY, DW_RIGHT_READ, DW_RIGHT_TRANSFER, DW_RIGHT_WAIT, DW_RIGHT_WRITE, DwObjectType,
-    DwRights,
+    DW_OBJECT_TYPE_MEMORY_OBJECT, DW_OBJECT_TYPE_TASK_GROUP, DW_RIGHT_DUPLICATE, DW_RIGHT_INSPECT,
+    DW_RIGHT_MAP, DW_RIGHT_MODIFY, DW_RIGHT_READ, DW_RIGHT_TRANSFER, DW_RIGHT_WAIT, DW_RIGHT_WRITE,
+    DwObjectType, DwRights,
 };
 
 /// Native page size required by the D0 mapping contract.
@@ -57,6 +57,15 @@ pub const BOOTFS_EXPECTATION: CapabilityExpectation<DwObjectType, DwRights> =
         ),
     };
 
+/// Exact H contract for delegated descendant-process construction authority.
+pub const LOADER_TASK_GROUP_EXPECTATION: CapabilityExpectation<DwObjectType, DwRights> =
+    CapabilityExpectation {
+        object_type: DW_OBJECT_TYPE_TASK_GROUP,
+        rights: DwRights(
+            DW_RIGHT_MODIFY.0 | DW_RIGHT_INSPECT.0 | DW_RIGHT_DUPLICATE.0 | DW_RIGHT_TRANSFER.0,
+        ),
+    };
+
 /// Receive and fresh-query metadata for one ordered INIT capability.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InitCapability<ObjectType, Rights> {
@@ -101,6 +110,35 @@ pub fn validate_init_capabilities<ObjectType: Eq, Rights: Eq>(
         return Err(CapabilityValidationError::WrongInitCapabilityCount);
     }
     for (capability, expected) in [(&capabilities[0], &root), (&capabilities[1], &bootfs)] {
+        if capability.received.object_type != expected.object_type
+            || capability.received.rights != expected.rights
+        {
+            return Err(CapabilityValidationError::InvalidReceivedCapability);
+        }
+        if capability.fresh.object_type != expected.object_type
+            || capability.fresh.rights != expected.rights
+        {
+            return Err(CapabilityValidationError::InvalidFreshCapability);
+        }
+    }
+    Ok(())
+}
+
+/// Validates H's exact ordered root, bootfs, and TaskGroup capabilities.
+pub fn validate_init_capabilities_v2<ObjectType: Eq, Rights: Eq>(
+    capabilities: &[InitCapability<ObjectType, Rights>],
+    root: CapabilityExpectation<ObjectType, Rights>,
+    bootfs: CapabilityExpectation<ObjectType, Rights>,
+    task_group: CapabilityExpectation<ObjectType, Rights>,
+) -> Result<(), CapabilityValidationError> {
+    if capabilities.len() != 3 {
+        return Err(CapabilityValidationError::WrongInitCapabilityCount);
+    }
+    for (capability, expected) in [
+        (&capabilities[0], &root),
+        (&capabilities[1], &bootfs),
+        (&capabilities[2], &task_group),
+    ] {
         if capability.received.object_type != expected.object_type
             || capability.received.rights != expected.rights
         {
