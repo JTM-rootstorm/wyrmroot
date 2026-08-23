@@ -1,16 +1,20 @@
 use deepwyrm_syscall::{
-    DW_OBJECT_TYPE_CHANNEL, DW_RIGHT_INSPECT, DW_RIGHT_READ, DW_RIGHT_WAIT, DW_RIGHT_WRITE,
-    DW_STATUS_BAD_HANDLE, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights,
+    DW_OBJECT_TYPE_CHANNEL, DW_RIGHT_DUPLICATE, DW_RIGHT_INSPECT, DW_RIGHT_READ, DW_RIGHT_WAIT,
+    DW_RIGHT_WRITE, DW_STATUS_BAD_HANDLE, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights,
 };
 use wyrmroot_hello::{HelloError, HelloSystem, run_hello};
 use wyrmroot_loader::launch::{LaunchProfile, encode_init, parse_ready};
-use wyrmroot_runtime::{CapabilityInfo, NativeError, ReceiveCounts};
+use wyrmroot_runtime::{
+    BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, CapabilityValidationError, NativeError,
+    ReceiveCounts,
+};
 
 const CHANNEL: DwHandle = DwHandle(11);
 
 struct Fixture {
     init: [u8; 40],
     received_handles: usize,
+    channel_rights: DwRights,
     sent: Vec<u8>,
     closed: Vec<DwHandle>,
 }
@@ -22,6 +26,7 @@ impl Fixture {
         Self {
             init,
             received_handles: 0,
+            channel_rights: BOOTSTRAP_CHANNEL_EXPECTATION.rights,
             sent: Vec::new(),
             closed: Vec::new(),
         }
@@ -36,9 +41,7 @@ impl HelloSystem for Fixture {
         if handle == CHANNEL {
             Ok(CapabilityInfo {
                 object_type: DW_OBJECT_TYPE_CHANNEL,
-                rights: DwRights(
-                    DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_WAIT.0 | DW_RIGHT_INSPECT.0,
-                ),
+                rights: self.channel_rights,
             })
         } else {
             Err(NativeError::Status(DW_STATUS_BAD_HANDLE))
@@ -89,6 +92,27 @@ fn hello_rejects_any_delegated_handle() {
             bytes: 40,
             handles: 1,
         }))
+    );
+    assert!(fixture.sent.is_empty());
+    assert!(fixture.closed.is_empty());
+}
+
+#[test]
+fn hello_rejects_bootstrap_channel_excess_rights() {
+    let mut fixture = Fixture::valid();
+    fixture.channel_rights = DwRights(
+        DW_RIGHT_READ.0
+            | DW_RIGHT_WRITE.0
+            | DW_RIGHT_WAIT.0
+            | DW_RIGHT_INSPECT.0
+            | DW_RIGHT_DUPLICATE.0,
+    );
+
+    assert_eq!(
+        run_hello(&mut fixture, CHANNEL),
+        Err(HelloError::BootstrapChannel(
+            CapabilityValidationError::InvalidBootstrapChannel
+        ))
     );
     assert!(fixture.sent.is_empty());
     assert!(fixture.closed.is_empty());
