@@ -1,0 +1,29 @@
+[package]
+name = "wyrmroot-loader-smoke"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Test-only native WYR0 loader protocol smoke process"
+license = "GPL-3.0-or-later"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "wyrmroot-loader-smoke"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["native-loader-smoke"]
+
+[features]
+default = []
+native-loader-smoke = ["dep:wyrmroot-loader", "dep:wyrmroot-runtime"]
+
+[dependencies]
+wyrmroot-loader = { path = "../../crates/wyrmroot-loader", optional = true }
+wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime", optional = true }
+
+[lints.rust]
+unsafe_code = "deny"
+unused_crate_dependencies = "deny"

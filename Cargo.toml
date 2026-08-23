@@ -10,6 +10,7 @@ members = [
     "tools/xtask",
     "userspace/hello",
     "userspace/init0",
+    "userspace/loader-smoke",
 ]
 
 [workspace.package]
