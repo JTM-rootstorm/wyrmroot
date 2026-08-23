@@ -7,16 +7,28 @@ use core::panic::PanicInfo;
 use deepwyrm_syscall::{DwHandle, DwReceivedHandleInfoV1};
 use wyrmroot_bootfs as _;
 use wyrmroot_bootstrap::BootstrapSystem;
-#[cfg(not(feature = "primordial-blocking-cleanup"))]
+#[cfg(not(any(
+    feature = "primordial-blocking-cleanup",
+    feature = "native-loader-smoke-integration"
+)))]
 use wyrmroot_bootstrap::run_bootstrap;
 #[cfg(feature = "primordial-blocking-cleanup")]
 use wyrmroot_bootstrap::run_bootstrap_with_before_ready;
+#[cfg(feature = "native-loader-smoke-integration")]
+use wyrmroot_bootstrap::run_loader_smoke_bootstrap;
 use wyrmroot_bootstrap_proto as _;
+#[cfg(feature = "native-loader-smoke-integration")]
+use wyrmroot_loader as _;
 use wyrmroot_runtime::{
     CapabilityInfo, MappingPlan, NativeError, ReceiveCounts, StartupBlock, close_handle,
     map_bootfs_read_only, panic_abort, query_capability_info, query_memory_object_size,
     receive_channel, send_channel, unmap_bootfs,
 };
+#[cfg(feature = "native-loader-smoke-integration")]
+use wyrmroot_runtime::{NativeLoaderPlatform, NativeSupervisionPlatform, monotonic_deadline_after};
+
+#[cfg(feature = "native-loader-smoke-integration")]
+const LOADER_SMOKE_TIMEOUT_NS: u64 = 5_000_000_000;
 
 struct NativeSystem;
 
@@ -74,11 +86,33 @@ fn panic(_info: &PanicInfo<'_>) -> ! {
 #[cfg(not(any(
     feature = "primordial-blocking-cleanup",
     feature = "primordial-user-exception",
-    feature = "primordial-invalid-return"
+    feature = "primordial-invalid-return",
+    feature = "native-loader-smoke-integration"
 )))]
 fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
     let mut system = NativeSystem;
     u32::from(run_bootstrap(&mut system, startup.bootstrap_channel().as_abi()).is_err())
+}
+
+#[cfg(feature = "native-loader-smoke-integration")]
+fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
+    let deadline = match monotonic_deadline_after(LOADER_SMOKE_TIMEOUT_NS) {
+        Ok(deadline) => deadline,
+        Err(_) => return 1,
+    };
+    let mut system = NativeSystem;
+    let mut loader = NativeLoaderPlatform;
+    let mut supervisor = NativeSupervisionPlatform;
+    u32::from(
+        run_loader_smoke_bootstrap(
+            &mut system,
+            &mut loader,
+            &mut supervisor,
+            startup.bootstrap_channel().as_abi(),
+            deadline,
+        )
+        .is_err(),
+    )
 }
 
 #[cfg(feature = "primordial-blocking-cleanup")]

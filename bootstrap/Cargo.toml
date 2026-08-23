@@ -19,6 +19,8 @@ required-features = ["native-bootstrap"]
 [features]
 default = []
 native-bootstrap = []
+loader-smoke-integration = ["dep:wyrmroot-loader"]
+native-loader-smoke-integration = ["native-bootstrap", "loader-smoke-integration"]
 primordial-test-support = ["wyrmroot-runtime/primordial-test-support"]
 primordial-blocking-cleanup = ["native-bootstrap", "primordial-test-support"]
 primordial-user-exception = ["native-bootstrap", "primordial-test-support"]
@@ -28,6 +30,7 @@ primordial-invalid-return = ["native-bootstrap", "primordial-test-support"]
 deepwyrm-syscall.workspace = true
 wyrmroot-bootfs = { path = "../crates/wyrmroot-bootfs" }
 wyrmroot-bootstrap-proto = { path = "../crates/wyrmroot-bootstrap-proto" }
+wyrmroot-loader = { path = "../crates/wyrmroot-loader", optional = true }
 wyrmroot-runtime = { path = "../crates/wyrmroot-runtime" }
 
 [dev-dependencies]

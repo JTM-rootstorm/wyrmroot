@@ -2,6 +2,8 @@ use deepwyrm_syscall as _;
 use wyrmroot_bootfs as _;
 use wyrmroot_bootstrap as _;
 use wyrmroot_bootstrap_proto as _;
+#[cfg(feature = "loader-smoke-integration")]
+use wyrmroot_loader as _;
 use wyrmroot_runtime as _;
 
 const MANIFEST: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
@@ -25,7 +27,14 @@ fn primordial_variants_are_explicit_mutually_exclusive_test_features() {
         )));
         assert!(MAIN_SOURCE.contains(&format!("feature = \"{variant}\"")));
     }
-    assert!(LIB_SOURCE.contains("primordial bootstrap test variants are mutually exclusive"));
+    assert!(LIB_SOURCE.contains("primordial bootstrap behavior variants are mutually exclusive"));
+    assert!(
+        LIB_SOURCE.contains("the WYR0-E loader-smoke integration is mutually exclusive with primordial behavior variants")
+    );
+    assert!(MANIFEST.contains("loader-smoke-integration = [\"dep:wyrmroot-loader\"]"));
+    assert!(MANIFEST.contains(
+        "native-loader-smoke-integration = [\"native-bootstrap\", \"loader-smoke-integration\"]"
+    ));
 }
 
 #[test]
@@ -42,7 +51,8 @@ fn production_path_stays_separate_from_test_only_hook_and_terminal_behaviors() {
 
 #[test]
 fn blocking_variant_does_not_import_the_ordinary_bootstrap_entry() {
-    assert!(MAIN_SOURCE.contains("#[cfg(not(feature = \"primordial-blocking-cleanup\"))]"));
+    assert!(MAIN_SOURCE.contains("#[cfg(not(any("));
+    assert!(MAIN_SOURCE.contains("feature = \"native-loader-smoke-integration\""));
     assert!(MAIN_SOURCE.contains("use wyrmroot_bootstrap::run_bootstrap;"));
 }
 

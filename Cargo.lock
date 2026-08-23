@@ -168,6 +168,7 @@ dependencies = [
  "deepwyrm-syscall",
  "wyrmroot-bootfs",
  "wyrmroot-bootstrap-proto",
+ "wyrmroot-loader",
  "wyrmroot-runtime",
 ]
 

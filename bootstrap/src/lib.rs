@@ -17,13 +17,38 @@
         feature = "primordial-invalid-return"
     )
 ))]
-compile_error!("primordial bootstrap test variants are mutually exclusive");
+compile_error!("primordial bootstrap behavior variants are mutually exclusive");
 
+#[cfg(any(
+    all(
+        feature = "loader-smoke-integration",
+        feature = "primordial-blocking-cleanup"
+    ),
+    all(
+        feature = "loader-smoke-integration",
+        feature = "primordial-user-exception"
+    ),
+    all(
+        feature = "loader-smoke-integration",
+        feature = "primordial-invalid-return"
+    )
+))]
+compile_error!(
+    "the WYR0-E loader-smoke integration is mutually exclusive with primordial behavior variants"
+);
+
+#[cfg(feature = "loader-smoke-integration")]
+use deepwyrm_syscall::DwDeadline;
 use deepwyrm_syscall::{DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights};
 use wyrmroot_bootfs::archive::{Archive, LookupError, ParseError};
 use wyrmroot_bootstrap_proto::{
     BOOTSTRAP_INIT_V2_SIZE, BOOTSTRAP_READY_V2_SIZE, BootstrapMessage, DecodeError, InitMessageV2,
     MAX_BOOTSTRAP_HANDLES, ReadyMessageV2, decode,
+};
+#[cfg(feature = "loader-smoke-integration")]
+use wyrmroot_loader::{
+    launch::LaunchProfile,
+    process::{LoadAuthority, LoadError, LoadRequest, LoadedProcess, LoaderPlatform, load_process},
 };
 #[cfg(feature = "primordial-test-support")]
 use wyrmroot_runtime::PrimordialTestError;
@@ -33,11 +58,19 @@ use wyrmroot_runtime::{
     ReceiveCounts, SELF_ROOT_EXPECTATION, validate_bootstrap_channel,
     validate_init_capabilities_v2,
 };
+#[cfg(feature = "loader-smoke-integration")]
+use wyrmroot_runtime::{SupervisionError, SupervisionPlatform, supervise_child};
 
 /// Canonical init executable required in the primordial bootfs.
 pub const INIT0_PATH: &[u8] = b"system/init0";
 /// Canonical smoke executable required in the primordial bootfs.
 pub const HELLO_PATH: &[u8] = b"bin/hello";
+/// E-only temporary native loader probe. This is not an init0 policy entry.
+#[cfg(feature = "loader-smoke-integration")]
+pub const LOADER_SMOKE_PATH: &[u8] = b"test/loader-smoke";
+/// Distinct nonzero WRLP transaction identifier used by the temporary E-only child.
+#[cfg(feature = "loader-smoke-integration")]
+pub const LOADER_SMOKE_TRANSACTION_ID: u64 = 2;
 
 /// Native operations used by the shared bootstrap transaction.
 pub trait BootstrapSystem {
@@ -75,7 +108,7 @@ pub trait BootstrapSystem {
 }
 
 /// Why the primordial bootstrap transaction failed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum BootstrapError {
     /// A native Deepwyrm operation failed or returned malformed output.
     Native(NativeError),
@@ -100,6 +133,15 @@ pub enum BootstrapError {
     /// An explicitly selected primordial kernel-test behavior failed closed.
     #[cfg(feature = "primordial-test-support")]
     TestSupport(PrimordialTestError),
+    /// The E-only loader transaction failed before it published the temporary child.
+    #[cfg(feature = "loader-smoke-integration")]
+    Loader(LoadError<NativeError>),
+    /// Temporary WYR0-E child readiness or completion did not satisfy the exact contract.
+    #[cfg(feature = "loader-smoke-integration")]
+    Supervision(SupervisionError<NativeError>),
+    /// A successful bootfs callback failed to retain the child it created.
+    #[cfg(feature = "loader-smoke-integration")]
+    MissingLoadedProcess,
 }
 
 /// Executes the complete D2 bootstrap handshake without exiting the process.
@@ -108,6 +150,81 @@ pub fn run_bootstrap<System: BootstrapSystem>(
     bootstrap_channel: DwHandle,
 ) -> Result<(), BootstrapError> {
     run_bootstrap_inner(system, bootstrap_channel, |_| Ok(()))
+}
+
+/// Runs the WYR0-E-only loader-smoke transaction before primordial READY.
+///
+/// This path launches only `test/loader-smoke` with the handle-free `Hello` profile.  It neither
+/// starts `system/init0` nor establishes an init policy; later WYR0 phases own that behavior.
+/// The caller supplies separate platform adapters so bootfs mapping can remain borrowed only for
+/// ELF construction while readiness and completion observation remain fully host-testable.
+#[cfg(feature = "loader-smoke-integration")]
+pub fn run_loader_smoke_bootstrap<
+    System: BootstrapSystem,
+    Loader: LoaderPlatform<Error = NativeError>,
+    Supervisor: SupervisionPlatform<Error = NativeError>,
+>(
+    system: &mut System,
+    loader: &mut Loader,
+    supervisor: &mut Supervisor,
+    bootstrap_channel: DwHandle,
+    deadline: DwDeadline,
+) -> Result<(), BootstrapError> {
+    let channel_info = system
+        .query_capability_info(bootstrap_channel)
+        .map_err(BootstrapError::Native)?;
+    validate_bootstrap_channel(channel_info, BOOTSTRAP_CHANNEL_EXPECTATION)
+        .map_err(BootstrapError::BootstrapChannel)?;
+
+    let mut bytes = [0_u8; BOOTSTRAP_INIT_V2_SIZE];
+    let mut handles = [DwReceivedHandleInfoV1::default(); MAX_BOOTSTRAP_HANDLES];
+    let counts = system
+        .receive_channel(bootstrap_channel, &mut bytes, &mut handles)
+        .map_err(BootstrapError::Native)?;
+
+    let operation = (|| {
+        let transaction_id =
+            expected_primordial_transaction(&bytes[..counts.bytes], counts.handles)?;
+        let authority = validated_load_authority(system, &handles[..counts.handles])?;
+        let plan = bootfs_mapping_plan(system, authority.bootfs)?;
+        let mut loaded = None;
+        let mapped =
+            system.with_bootfs_bytes(authority.parent_root, authority.bootfs, plan, |bootfs| {
+                match load_loader_smoke(loader, authority, bootfs) {
+                    Ok(candidate) => {
+                        loaded = Some(candidate);
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
+            });
+        let loaded = match (mapped, loaded) {
+            (Ok(Ok(())), Some(loaded)) => loaded,
+            (Ok(Err(error)), _) => return Err(error),
+            (Err(error), Some(loaded)) => {
+                let _ = cleanup_loaded_process(system, loader, loaded, true);
+                return Err(BootstrapError::Native(error));
+            }
+            (Err(error), None) => return Err(BootstrapError::Native(error)),
+            (Ok(Ok(())), None) => return Err(BootstrapError::MissingLoadedProcess),
+        };
+        let supervision = supervise_child(
+            supervisor,
+            loaded.process,
+            loaded.launch_channel,
+            LOADER_SMOKE_TRANSACTION_ID,
+            deadline,
+        )
+        .map_err(BootstrapError::Supervision);
+        let loaded_cleanup = cleanup_loaded_process(system, loader, loaded, supervision.is_err());
+        supervision?;
+        loaded_cleanup?;
+        Ok(transaction_id)
+    })();
+    let cleanup = close_received_handles(system, &handles[..counts.handles]);
+    let transaction_id = operation?;
+    cleanup?;
+    send_primordial_ready(system, bootstrap_channel, transaction_id)
 }
 
 /// Executes the bootstrap transaction with one explicit test-only hook before READY and close.
@@ -138,17 +255,8 @@ fn run_bootstrap_inner<System: BootstrapSystem>(
         .map_err(BootstrapError::Native)?;
 
     let operation = (|| {
-        let transaction_id = match decode(&bytes[..counts.bytes], counts.handles)
-            .map_err(BootstrapError::Protocol)?
-        {
-            BootstrapMessage::InitV2(message) => {
-                if message.transaction_id != InitMessageV2::primordial().transaction_id {
-                    return Err(BootstrapError::UnexpectedTransactionId);
-                }
-                message.transaction_id
-            }
-            _ => return Err(BootstrapError::UnexpectedMessage),
-        };
+        let transaction_id =
+            expected_primordial_transaction(&bytes[..counts.bytes], counts.handles)?;
         process_init(system, &handles[..counts.handles])?;
         Ok(transaction_id)
     })();
@@ -157,6 +265,29 @@ fn run_bootstrap_inner<System: BootstrapSystem>(
     cleanup?;
     before_ready(bootstrap_channel)?;
 
+    send_primordial_ready(system, bootstrap_channel, transaction_id)
+}
+
+fn expected_primordial_transaction(
+    bytes: &[u8],
+    handle_count: usize,
+) -> Result<u64, BootstrapError> {
+    match decode(bytes, handle_count).map_err(BootstrapError::Protocol)? {
+        BootstrapMessage::InitV2(message) => {
+            if message.transaction_id != InitMessageV2::primordial().transaction_id {
+                return Err(BootstrapError::UnexpectedTransactionId);
+            }
+            Ok(message.transaction_id)
+        }
+        _ => Err(BootstrapError::UnexpectedMessage),
+    }
+}
+
+fn send_primordial_ready<System: BootstrapSystem>(
+    system: &mut System,
+    bootstrap_channel: DwHandle,
+    transaction_id: u64,
+) -> Result<(), BootstrapError> {
     let mut ready = [0_u8; BOOTSTRAP_READY_V2_SIZE];
     let ready_size = ReadyMessageV2 { transaction_id }
         .encode_into(&mut ready)
@@ -223,6 +354,125 @@ fn process_init<System: BootstrapSystem>(
     system
         .with_bootfs_bytes(handles[0].handle, handles[1].handle, plan, validate_bootfs)
         .map_err(BootstrapError::Native)?
+}
+
+#[cfg(feature = "loader-smoke-integration")]
+fn validated_load_authority<System: BootstrapSystem>(
+    system: &mut System,
+    handles: &[DwReceivedHandleInfoV1],
+) -> Result<LoadAuthority, BootstrapError> {
+    if handles.len() != MAX_BOOTSTRAP_HANDLES {
+        return Err(BootstrapError::Capability(
+            CapabilityValidationError::WrongInitCapabilityCount,
+        ));
+    }
+    let received = [
+        received_capability(handles[0]),
+        received_capability(handles[1]),
+        received_capability(handles[2]),
+    ];
+    let fresh = [
+        system
+            .query_capability_info(handles[0].handle)
+            .map_err(BootstrapError::Native)?,
+        system
+            .query_capability_info(handles[1].handle)
+            .map_err(BootstrapError::Native)?,
+        system
+            .query_capability_info(handles[2].handle)
+            .map_err(BootstrapError::Native)?,
+    ];
+    let capabilities = [
+        InitCapability {
+            received: received[0],
+            fresh: fresh[0],
+        },
+        InitCapability {
+            received: received[1],
+            fresh: fresh[1],
+        },
+        InitCapability {
+            received: received[2],
+            fresh: fresh[2],
+        },
+    ];
+    validate_init_capabilities_v2(
+        &capabilities,
+        SELF_ROOT_EXPECTATION,
+        BOOTFS_EXPECTATION,
+        LOADER_TASK_GROUP_EXPECTATION,
+    )
+    .map_err(BootstrapError::Capability)?;
+    Ok(LoadAuthority {
+        parent_root: handles[0].handle,
+        bootfs: handles[1].handle,
+        task_group: handles[2].handle,
+    })
+}
+
+#[cfg(feature = "loader-smoke-integration")]
+fn bootfs_mapping_plan<System: BootstrapSystem>(
+    system: &mut System,
+    bootfs: DwHandle,
+) -> Result<MappingPlan, BootstrapError> {
+    system
+        .query_memory_object_size(bootfs)
+        .map_err(BootstrapError::Native)
+        .and_then(|size| MappingPlan::for_bootfs(size).map_err(BootstrapError::Mapping))
+}
+
+#[cfg(feature = "loader-smoke-integration")]
+fn load_loader_smoke<Loader: LoaderPlatform<Error = NativeError>>(
+    loader: &mut Loader,
+    authority: LoadAuthority,
+    bytes: &[u8],
+) -> Result<LoadedProcess, BootstrapError> {
+    let archive = Archive::new(bytes).map_err(BootstrapError::Bootfs)?;
+    let entry = archive
+        .lookup(LOADER_SMOKE_PATH)
+        .map_err(|error| match error {
+            LookupError::NotFound | LookupError::InvalidPath(_) => {
+                BootstrapError::MissingRequiredEntry
+            }
+        })?;
+    if !entry.is_executable() || entry.data().is_empty() {
+        return Err(BootstrapError::RequiredEntryNotExecutable);
+    }
+    let display_path = entry
+        .name_utf8()
+        .map_err(|_| BootstrapError::MissingRequiredEntry)?;
+    load_process(
+        loader,
+        authority,
+        LoadRequest {
+            image: entry.data(),
+            display_path,
+            profile: LaunchProfile::Hello,
+            transaction_id: LOADER_SMOKE_TRANSACTION_ID,
+        },
+    )
+    .map_err(BootstrapError::Loader)
+}
+
+#[cfg(feature = "loader-smoke-integration")]
+fn cleanup_loaded_process<System: BootstrapSystem, Loader: LoaderPlatform<Error = NativeError>>(
+    system: &mut System,
+    loader: &mut Loader,
+    loaded: LoadedProcess,
+    terminate: bool,
+) -> Result<(), BootstrapError> {
+    if terminate {
+        let _ = loader.process_terminate(loaded.process);
+    }
+    let mut first_error = None;
+    for handle in [loaded.launch_channel, loaded.process] {
+        if let Err(error) = system.close_handle(handle)
+            && first_error.is_none()
+        {
+            first_error = Some(BootstrapError::Native(error));
+        }
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 fn received_capability(info: DwReceivedHandleInfoV1) -> CapabilityInfo<DwObjectType, DwRights> {

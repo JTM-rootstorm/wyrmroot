@@ -3,13 +3,30 @@ use deepwyrm_syscall::{
     DW_OBJECT_TYPE_TASK_GROUP, DW_STATUS_BAD_HANDLE, DwHandle, DwObjectType,
     DwReceivedHandleInfoV1, DwRights,
 };
+#[cfg(feature = "loader-smoke-integration")]
+use deepwyrm_syscall::{
+    DW_SIGNAL_EXITED, DW_SIGNAL_READABLE, DW_TASK_STATE_EXITED, DW_TASK_TERMINATION_INFO_V1_SIZE,
+    DW_TERMINATION_NORMAL_EXIT, DwDeadline, DwHandleTransferV1, DwMemoryProtection,
+    DwTaskTerminationInfoV1, DwWaitItemV1, DwWaitResultV1,
+};
 use wyrmroot_bootfs::builder::{Builder, FileMode};
 #[cfg(feature = "primordial-test-support")]
 use wyrmroot_bootstrap::run_bootstrap_with_before_ready;
 use wyrmroot_bootstrap::{BootstrapError, BootstrapSystem, HELLO_PATH, INIT0_PATH, run_bootstrap};
+#[cfg(feature = "loader-smoke-integration")]
+use wyrmroot_bootstrap::{
+    LOADER_SMOKE_PATH, LOADER_SMOKE_TRANSACTION_ID, run_loader_smoke_bootstrap,
+};
 use wyrmroot_bootstrap_proto::{
     BOOTSTRAP_INIT_V2_SIZE, BootstrapMessage, InitMessageV2, ReadyMessageV2, decode,
 };
+#[cfg(feature = "loader-smoke-integration")]
+use wyrmroot_loader::{
+    launch,
+    process::{LoaderPlatform, ParentMapping, ProcessCreateRequest, ProcessCreateResult},
+};
+#[cfg(feature = "loader-smoke-integration")]
+use wyrmroot_runtime::SupervisionPlatform;
 use wyrmroot_runtime::{
     BOOTFS_EXPECTATION, BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo,
     LOADER_TASK_GROUP_EXPECTATION, MappingPlan, NativeError, ReceiveCounts, SELF_ROOT_EXPECTATION,
@@ -28,6 +45,7 @@ struct Fixture {
     sent: Vec<u8>,
     closed: Vec<DwHandle>,
     mapped: bool,
+    mapping_error_after_callback: bool,
 }
 
 impl Fixture {
@@ -61,6 +79,7 @@ impl Fixture {
             sent: Vec::new(),
             closed: Vec::new(),
             mapped: false,
+            mapping_error_after_callback: false,
         }
     }
 }
@@ -123,7 +142,11 @@ impl BootstrapSystem for Fixture {
         assert_eq!(plan.logical_size(), self.bootfs.len() as u64);
         assert!(plan.mapped_size() >= plan.logical_size());
         self.mapped = true;
-        Ok(use_bytes(&self.bootfs))
+        let result = use_bytes(&self.bootfs);
+        if self.mapping_error_after_callback {
+            return Err(NativeError::Status(DW_STATUS_BAD_HANDLE));
+        }
+        Ok(result)
     }
 
     fn send_channel(&mut self, channel: DwHandle, bytes: &[u8]) -> Result<(), NativeError> {
@@ -224,4 +247,352 @@ fn missing_or_nonexecutable_required_entries_fail_before_ready() {
         Err(BootstrapError::RequiredEntryNotExecutable)
     );
     assert!(nonexecutable.sent.is_empty());
+}
+
+#[cfg(feature = "loader-smoke-integration")]
+struct SmokeLoader {
+    next: u64,
+    init_profiles: Vec<launch::LaunchProfile>,
+    terminated: Vec<DwHandle>,
+}
+
+#[cfg(feature = "loader-smoke-integration")]
+impl SmokeLoader {
+    fn new() -> Self {
+        Self {
+            next: 40,
+            init_profiles: Vec::new(),
+            terminated: Vec::new(),
+        }
+    }
+
+    fn handle(&mut self) -> DwHandle {
+        let handle = DwHandle(self.next);
+        self.next += 1;
+        handle
+    }
+}
+
+#[cfg(feature = "loader-smoke-integration")]
+impl LoaderPlatform for SmokeLoader {
+    type Error = NativeError;
+
+    fn channel_create(&mut self, _: DwRights) -> Result<(DwHandle, DwHandle), Self::Error> {
+        Ok((self.handle(), self.handle()))
+    }
+
+    fn duplicate(&mut self, _: DwHandle, _: DwRights) -> Result<DwHandle, Self::Error> {
+        Ok(self.handle())
+    }
+
+    fn close(&mut self, _: DwHandle) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn process_create(
+        &mut self,
+        _: ProcessCreateRequest,
+    ) -> Result<ProcessCreateResult, Self::Error> {
+        Ok(ProcessCreateResult {
+            process: self.handle(),
+            root: self.handle(),
+            child_bootstrap: self.handle(),
+        })
+    }
+
+    fn memory_create(&mut self, _: u64, _: DwRights) -> Result<DwHandle, Self::Error> {
+        Ok(self.handle())
+    }
+
+    fn materialize_parent(
+        &mut self,
+        _: DwHandle,
+        _: DwHandle,
+        bytes: u64,
+        _: u64,
+        _: &[u8],
+    ) -> Result<ParentMapping, Self::Error> {
+        Ok(ParentMapping {
+            address: 0x5000_0000,
+            bytes,
+        })
+    }
+
+    fn unmap_parent(&mut self, _: DwHandle, _: ParentMapping) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn map_child(
+        &mut self,
+        _: DwHandle,
+        _: DwHandle,
+        _: u64,
+        _: u64,
+        _: DwMemoryProtection,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn unmap_child(&mut self, _: DwHandle, _: u64, _: u64) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn thread_create(&mut self, _: DwHandle, _: DwRights) -> Result<DwHandle, Self::Error> {
+        Ok(self.handle())
+    }
+
+    fn send_init(
+        &mut self,
+        _: DwHandle,
+        bytes: &[u8],
+        transfers: &[DwHandleTransferV1],
+    ) -> Result<(), Self::Error> {
+        assert!(transfers.is_empty());
+        let parsed = launch::parse_init(launch::LaunchProfile::Hello, bytes, &[])
+            .map_err(|_| NativeError::Status(DW_STATUS_BAD_HANDLE))?;
+        assert_eq!(parsed.transaction_id, LOADER_SMOKE_TRANSACTION_ID);
+        self.init_profiles.push(parsed.profile);
+        Ok(())
+    }
+
+    fn thread_start(
+        &mut self,
+        _: DwHandle,
+        _: u64,
+        _: u64,
+        _: DwHandle,
+        _: u64,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn thread_terminate(&mut self, _: DwHandle) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn process_terminate(&mut self, process: DwHandle) -> Result<(), Self::Error> {
+        self.terminated.push(process);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "loader-smoke-integration")]
+struct SmokeSupervisor {
+    events: &'static [bool],
+    index: usize,
+    received: usize,
+}
+
+#[cfg(feature = "loader-smoke-integration")]
+impl SmokeSupervisor {
+    fn successful() -> Self {
+        Self {
+            events: &[true, false],
+            index: 0,
+            received: 0,
+        }
+    }
+
+    fn exited_before_ready() -> Self {
+        Self {
+            events: &[false],
+            index: 0,
+            received: 0,
+        }
+    }
+}
+
+#[cfg(feature = "loader-smoke-integration")]
+impl SupervisionPlatform for SmokeSupervisor {
+    type Error = NativeError;
+
+    fn wait_many(
+        &mut self,
+        items: &[DwWaitItemV1],
+        deadline: DwDeadline,
+    ) -> Result<DwWaitResultV1, Self::Error> {
+        assert_eq!(deadline, DwDeadline(99));
+        let ready = self.events[self.index];
+        self.index += 1;
+        let (index, observed) = if ready {
+            assert_eq!(items.len(), 2);
+            (0, DW_SIGNAL_READABLE)
+        } else {
+            (items.len() as u32 - 1, DW_SIGNAL_EXITED)
+        };
+        Ok(DwWaitResultV1 {
+            size: deepwyrm_syscall::DW_WAIT_RESULT_V1_SIZE,
+            version: 1,
+            index,
+            observed,
+            ..DwWaitResultV1::default()
+        })
+    }
+
+    fn receive_channel(
+        &mut self,
+        _: DwHandle,
+        bytes: &mut [u8],
+        _: &mut [DwReceivedHandleInfoV1],
+    ) -> Result<ReceiveCounts, Self::Error> {
+        self.received += 1;
+        let size = launch::encode_ready(LOADER_SMOKE_TRANSACTION_ID, bytes)
+            .map_err(|_| NativeError::Status(DW_STATUS_BAD_HANDLE))?;
+        Ok(ReceiveCounts {
+            bytes: size,
+            handles: 0,
+        })
+    }
+
+    fn query_task_termination(
+        &mut self,
+        _: DwHandle,
+    ) -> Result<DwTaskTerminationInfoV1, Self::Error> {
+        Ok(DwTaskTerminationInfoV1 {
+            size: DW_TASK_TERMINATION_INFO_V1_SIZE,
+            version: 1,
+            state: DW_TASK_STATE_EXITED,
+            reason: DW_TERMINATION_NORMAL_EXIT,
+            ..DwTaskTerminationInfoV1::default()
+        })
+    }
+}
+
+#[cfg(feature = "loader-smoke-integration")]
+#[test]
+fn loader_smoke_runs_hello_then_exits_before_primordial_ready() {
+    let image = executable();
+    let mut fixture = Fixture::valid();
+    fixture.bootfs = bootfs(&[(LOADER_SMOKE_PATH, &image)]);
+    let mut loader = SmokeLoader::new();
+    let mut supervisor = SmokeSupervisor::successful();
+
+    assert_eq!(
+        run_loader_smoke_bootstrap(
+            &mut fixture,
+            &mut loader,
+            &mut supervisor,
+            CHANNEL,
+            DwDeadline(99),
+        ),
+        Ok(())
+    );
+    assert_eq!(loader.init_profiles, [launch::LaunchProfile::Hello]);
+    assert_eq!(supervisor.received, 1);
+    assert_eq!(
+        decode(&fixture.sent, 0),
+        Ok(BootstrapMessage::ReadyV2(ReadyMessageV2 {
+            transaction_id: 1
+        }))
+    );
+    assert_eq!(
+        fixture.closed,
+        [
+            DwHandle(42),
+            DwHandle(43),
+            ROOT,
+            BOOTFS,
+            TASK_GROUP,
+            CHANNEL
+        ]
+    );
+}
+
+#[cfg(feature = "loader-smoke-integration")]
+#[test]
+fn loader_smoke_failure_terminates_and_closes_child_before_authority_cleanup() {
+    let image = executable();
+    let mut fixture = Fixture::valid();
+    fixture.bootfs = bootfs(&[(LOADER_SMOKE_PATH, &image)]);
+    let mut loader = SmokeLoader::new();
+    let mut supervisor = SmokeSupervisor::exited_before_ready();
+
+    assert!(matches!(
+        run_loader_smoke_bootstrap(
+            &mut fixture,
+            &mut loader,
+            &mut supervisor,
+            CHANNEL,
+            DwDeadline(99),
+        ),
+        Err(BootstrapError::Supervision(_))
+    ));
+    assert_eq!(loader.terminated, [DwHandle(43)]);
+    assert_eq!(fixture.sent, []);
+    assert_eq!(
+        fixture.closed,
+        [DwHandle(42), DwHandle(43), ROOT, BOOTFS, TASK_GROUP]
+    );
+}
+
+#[cfg(feature = "loader-smoke-integration")]
+#[test]
+fn loader_smoke_mapping_teardown_failure_still_terminates_and_closes_the_child() {
+    let image = executable();
+    let mut fixture = Fixture::valid();
+    fixture.bootfs = bootfs(&[(LOADER_SMOKE_PATH, &image)]);
+    fixture.mapping_error_after_callback = true;
+    let mut loader = SmokeLoader::new();
+    let mut supervisor = SmokeSupervisor::successful();
+
+    assert_eq!(
+        run_loader_smoke_bootstrap(
+            &mut fixture,
+            &mut loader,
+            &mut supervisor,
+            CHANNEL,
+            DwDeadline(99),
+        ),
+        Err(BootstrapError::Native(NativeError::Status(
+            DW_STATUS_BAD_HANDLE
+        )))
+    );
+    assert_eq!(loader.terminated, [DwHandle(43)]);
+    assert_eq!(supervisor.received, 0);
+    assert!(fixture.sent.is_empty());
+    assert_eq!(
+        fixture.closed,
+        [DwHandle(42), DwHandle(43), ROOT, BOOTFS, TASK_GROUP]
+    );
+}
+
+#[cfg(feature = "loader-smoke-integration")]
+fn executable() -> Vec<u8> {
+    let mut bytes = vec![0_u8; 0x2000];
+    bytes[..4].copy_from_slice(b"\x7fELF");
+    bytes[4] = 2;
+    bytes[5] = 1;
+    bytes[6] = 1;
+    put16(&mut bytes, 16, 2);
+    put16(&mut bytes, 18, 62);
+    put32(&mut bytes, 20, 1);
+    put64(&mut bytes, 24, 0x400000);
+    put64(&mut bytes, 32, 64);
+    put16(&mut bytes, 52, 64);
+    put16(&mut bytes, 54, 56);
+    put16(&mut bytes, 56, 1);
+    put32(&mut bytes, 64, 1);
+    put32(&mut bytes, 68, 5);
+    put64(&mut bytes, 72, 0x1000);
+    put64(&mut bytes, 80, 0x400000);
+    put64(&mut bytes, 88, 0x400000);
+    put64(&mut bytes, 96, 16);
+    put64(&mut bytes, 104, 32);
+    put64(&mut bytes, 112, 4096);
+    bytes
+}
+
+#[cfg(feature = "loader-smoke-integration")]
+fn put16(bytes: &mut [u8], at: usize, value: u16) {
+    bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+#[cfg(feature = "loader-smoke-integration")]
+fn put32(bytes: &mut [u8], at: usize, value: u32) {
+    bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+#[cfg(feature = "loader-smoke-integration")]
+fn put64(bytes: &mut [u8], at: usize, value: u64) {
+    bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
 }
