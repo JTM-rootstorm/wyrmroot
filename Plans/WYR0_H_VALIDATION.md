@@ -12,6 +12,12 @@ kernel symbols, captures serial output, and returns structured per-profile
 results. The paired integration command always runs both profiles before it
 decides the overall result.
 
+`run` and `gdb` are diagnostic-only commands. Their structured output is
+explicitly marked `DIAGNOSTIC` with `acceptance: false`; only `test integration
+wyr0` writes gate-shaped per-profile evidence or closes a WYR0 acceptance gate.
+Acceptance commands require a schema-v2 request; schema-v1 requests and their
+outputs are retained only as historical evidence.
+
 This closes the WYR0-H tooling gate. It does not close the separate I0 or I1
 guest-acceptance gates. The current exact candidate deterministically exposes
 one I0 failure and one I1 failure, recorded below.
@@ -67,9 +73,26 @@ The final image build and independent inspection both passed:
 | ESP | `49e33754430a1a341014f89fd05fdd162e71bf3adb2b7a48ac4377ca02b36060` |
 
 The request-bound provenance record repeats the exact three repository
-revisions, profile geometry, and all guest-consumed hashes. Inspection rebuilds
-the expected bootfs bytes from the exact current `init0` and `hello` inputs and
-rejects stale image or provenance content.
+revisions, profile geometry, OVMF code/template hashes, and all guest-consumed
+hashes. Inspection and every integration result include stable request,
+candidate, and provenance digests plus the full loader/kernel/bootstrap/init0/
+hello/bootfs/ESP manifest, so the default and SMP records are independently
+bound to the same image. GDB is rejected unless its unstripped symbols file has
+the exact SHA-256 of the kernel placed on the ESP. Output paths also reject a
+pre-existing parent symlink that escapes the request root, including a
+pre-existing `run_directory` itself. The tooling repeats containment checks at
+each create/open boundary and re-admits the request, artifacts, ESP, and
+provenance before publishing a PASS result. Every attempted integration profile
+writes a structured ERROR result for QEMU spawn, timeout, terminal-record, or
+serial-log failures.
+Timeout and wait-failure records also carry an explicit cleanup disposition,
+with independently confirmed `cleanup_killed` and `cleanup_reaped` fields; a
+failed kill or unconfirmed reap is never reported as successful cleanup.
+
+The current V0 tooling residual is an explicit native toolchain-manifest schema;
+this hardening batch deliberately does not introduce one. Fresh request output
+sets are required for the schema-v2 provenance/evidence format; older
+candidates remain historical evidence.
 
 ## Host validation
 

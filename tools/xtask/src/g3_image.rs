@@ -107,6 +107,13 @@ struct FileLayout<'a> {
 }
 
 pub(crate) fn build(arguments: &G3ImageArguments) -> Result<String, Failure> {
+    build_in_root(arguments, None)
+}
+
+pub(crate) fn build_in_root(
+    arguments: &G3ImageArguments,
+    output_root: Option<&Path>,
+) -> Result<String, Failure> {
     let inputs = Inputs::load(arguments)?;
     let geometry = Geometry::fixed();
     let total_file_clusters = inputs.total_clusters()?;
@@ -117,7 +124,7 @@ pub(crate) fn build(arguments: &G3ImageArguments) -> Result<String, Failure> {
         return Err(Failure::task("G3 artifacts do not fit the fixed FAT32 ESP"));
     }
     let layouts = layouts(&inputs)?;
-    validate_output_path(arguments, Path::new(&arguments.image))?;
+    validate_output_path(arguments, Path::new(&arguments.image), output_root)?;
     let output_path = PathBuf::from(&arguments.image);
     let mut output = OpenOptions::new()
         .write(true)
@@ -278,7 +285,11 @@ fn read_artifact(path: &str, label: &str) -> Result<Vec<u8>, Failure> {
         .map_err(|error| Failure::task(format!("could not read {label} artifact: {error}")))
 }
 
-fn validate_output_path(arguments: &G3ImageArguments, output: &Path) -> Result<(), Failure> {
+fn validate_output_path(
+    arguments: &G3ImageArguments,
+    output: &Path,
+    output_root: Option<&Path>,
+) -> Result<(), Failure> {
     if fs::symlink_metadata(output).is_ok() {
         return Err(Failure::task("G3 ESP output already exists"));
     }
@@ -288,6 +299,16 @@ fn validate_output_path(arguments: &G3ImageArguments, output: &Path) -> Result<(
         .unwrap_or_else(|| Path::new("."));
     let parent = fs::canonicalize(parent)
         .map_err(|error| Failure::task(format!("could not resolve ESP output parent: {error}")))?;
+    if let Some(root) = output_root {
+        let root = fs::canonicalize(root).map_err(|error| {
+            Failure::task(format!("could not resolve ESP output root: {error}"))
+        })?;
+        if !parent.starts_with(&root) {
+            return Err(Failure::task(
+                "G3 ESP output parent escapes the WYR0-H request root",
+            ));
+        }
+    }
     let output = parent.join(
         output
             .file_name()
@@ -733,5 +754,26 @@ mod tests {
             "failed inspection left a poisoned G3 output"
         );
         fs::remove_dir_all(root).expect("remove G3 image fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_in_root_rejects_an_escaping_output_parent() {
+        use std::os::unix::fs::symlink;
+
+        let (root, mut arguments) = fixture();
+        let outside = std::env::temp_dir().join(format!(
+            "g3-image-outside-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&outside).expect("create outside directory");
+        symlink(&outside, root.join("escape")).expect("create escaping parent link");
+        arguments.image = root.join("escape/esp.img").display().to_string();
+        let error = build_in_root(&arguments, Some(&root))
+            .expect_err("escaping request-root output accepted");
+        assert!(error.message.contains("escapes the WYR0-H request root"));
+        fs::remove_dir_all(root).expect("remove G3 image fixture");
+        fs::remove_dir_all(outside).expect("remove outside directory");
     }
 }

@@ -7,27 +7,6 @@ use std::path::{Component, Path, PathBuf};
 use crate::error::Failure;
 
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
-const REQUIRED_KEYS_V1: &[&str] = &[
-    "schema_version",
-    "deepwyrm_revision",
-    "wyrmroot_revision",
-    "rust_revision",
-    "selector",
-    "test_id",
-    "timeout_seconds",
-    "loader",
-    "kernel",
-    "symbols",
-    "bootstrap",
-    "init0",
-    "hello",
-    "bootfs",
-    "esp",
-    "provenance",
-    "ovmf_code",
-    "ovmf_vars_template",
-    "run_directory",
-];
 const REQUIRED_KEYS_V2: &[&str] = &[
     "schema_version",
     "deepwyrm_revision",
@@ -105,15 +84,12 @@ pub(crate) fn load(path: &Path) -> Result<HRequest, Failure> {
         .map_err(|error| Failure::task(format!("could not read WYR0-H request: {error}")))?;
     let values = parse(&text)?;
     let schema_version = required(&values, "schema_version")?;
-    let required_keys = match schema_version {
-        "1" => REQUIRED_KEYS_V1,
-        "2" => REQUIRED_KEYS_V2,
-        _ => {
-            return Err(Failure::task(
-                "WYR0-H request requires schema_version = 1 or 2",
-            ));
-        }
-    };
+    if schema_version != "2" {
+        return Err(Failure::task(
+            "WYR0-H acceptance commands require schema_version = 2",
+        ));
+    }
+    let required_keys = REQUIRED_KEYS_V2;
     let expected = required_keys.iter().copied().collect::<BTreeSet<_>>();
     let actual = values.keys().map(String::as_str).collect::<BTreeSet<_>>();
     if actual != expected {
@@ -136,16 +112,8 @@ pub(crate) fn load(path: &Path) -> Result<HRequest, Failure> {
         rust_revision: revision(&values, "rust_revision")?,
         selector: selector(&values)?,
         test_id: number::<u32>(&values, "test_id")?,
-        expected_outcome: if schema_version == "1" {
-            ExpectedOutcome::Pass
-        } else {
-            expected_outcome(&values)?
-        },
-        expected_detail: if schema_version == "1" {
-            0
-        } else {
-            number::<u32>(&values, "expected_detail")?
-        },
+        expected_outcome: expected_outcome(&values)?,
+        expected_detail: number::<u32>(&values, "expected_detail")?,
         timeout_seconds: number::<u64>(&values, "timeout_seconds")?,
         loader: input_path(&parent, required(&values, "loader")?),
         kernel: input_path(&parent, required(&values, "kernel")?),
@@ -172,7 +140,7 @@ pub(crate) fn load(path: &Path) -> Result<HRequest, Failure> {
             "WYR0-H timeout_seconds must be between 1 and 600",
         ));
     }
-    reject_output_aliases(&request)?;
+    validate_outputs(&request)?;
     Ok(request)
 }
 
@@ -339,6 +307,95 @@ fn reject_output_aliases(request: &HRequest) -> Result<(), Failure> {
     Ok(())
 }
 
+/// Output names are lexically request-relative, but a pre-existing directory
+/// component may still redirect creation through a symlink. Re-run this before
+/// each output open/create boundary as well as during request admission.
+pub(crate) fn validate_outputs(request: &HRequest) -> Result<(), Failure> {
+    reject_output_aliases(request)?;
+    for (path, label) in [
+        (&request.bootfs, "bootfs"),
+        (&request.esp, "esp"),
+        (&request.provenance, "provenance"),
+        (&request.run_directory, "run_directory"),
+    ] {
+        validate_output_parent(request, path, label)?;
+    }
+    validate_run_directory(request)
+}
+
+pub(crate) fn validate_output_parent(
+    request: &HRequest,
+    path: &Path,
+    label: &str,
+) -> Result<(), Failure> {
+    let request_root = request
+        .path
+        .parent()
+        .ok_or_else(|| Failure::task("WYR0-H request has no parent directory"))?;
+    let request_root = fs::canonicalize(request_root).map_err(|error| {
+        Failure::task(format!("could not resolve WYR0-H request root: {error}"))
+    })?;
+    let existing_parent = nearest_existing_parent(path)?;
+    let resolved_parent = fs::canonicalize(existing_parent).map_err(|error| {
+        Failure::task(format!(
+            "could not resolve WYR0-H {label} output parent: {error}"
+        ))
+    })?;
+    if !resolved_parent.starts_with(&request_root) {
+        return Err(Failure::task(format!(
+            "WYR0-H {label} output parent escapes the request root through a symlink"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_run_directory(request: &HRequest) -> Result<(), Failure> {
+    let metadata = match fs::symlink_metadata(&request.run_directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(Failure::task(format!(
+                "could not inspect WYR0-H run_directory: {error}"
+            )));
+        }
+    };
+    let root = request
+        .path
+        .parent()
+        .ok_or_else(|| Failure::task("WYR0-H request has no parent directory"))?;
+    let root = fs::canonicalize(root).map_err(|error| {
+        Failure::task(format!("could not resolve WYR0-H request root: {error}"))
+    })?;
+    let resolved = fs::canonicalize(&request.run_directory).map_err(|error| {
+        Failure::task(format!("could not resolve WYR0-H run_directory: {error}"))
+    })?;
+    if !resolved.starts_with(root) {
+        return Err(Failure::task(
+            "WYR0-H run_directory escapes the request root through a symlink",
+        ));
+    }
+    if !metadata.file_type().is_dir() {
+        return Err(Failure::task(
+            "WYR0-H run_directory must be a real directory when it already exists",
+        ));
+    }
+    Ok(())
+}
+
+fn nearest_existing_parent(path: &Path) -> Result<&Path, Failure> {
+    let mut candidate = path
+        .parent()
+        .ok_or_else(|| Failure::task("WYR0-H output path has no parent directory"))?;
+    loop {
+        if fs::symlink_metadata(candidate).is_ok() {
+            return Ok(candidate);
+        }
+        candidate = candidate
+            .parent()
+            .ok_or_else(|| Failure::task("WYR0-H output path has no existing parent directory"))?;
+    }
+}
+
 pub(crate) fn canonical_regular(
     path: &Path,
     label: &str,
@@ -473,5 +530,108 @@ mod tests {
         assert_eq!(loaded.expected_outcome, ExpectedOutcome::Fail);
         assert_eq!(loaded.expected_detail, 0xB000_0401);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn schema_one_is_historical_and_rejected_for_acceptance_commands() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("xtask-h-request-v1-test-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("request.toml");
+        fs::write(&path, valid()).unwrap();
+        let error = load(&path).expect_err("schema v1 request admitted");
+        assert!(error.message.contains("require schema_version = 2"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_parent_symlink_cannot_escape_request_root() {
+        use std::os::unix::fs::symlink;
+
+        let nonce = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(format!("xtask-h-request-root-{nonce}"));
+        let outside = std::env::temp_dir().join(format!("xtask-h-request-outside-{nonce}"));
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        for name in [
+            "loader.efi",
+            "deepwyrm.elf",
+            "bootstrap.elf",
+            "init0.elf",
+            "hello.elf",
+            "OVMF_CODE.fd",
+            "OVMF_VARS.fd",
+        ] {
+            fs::write(root.join(name), b"artifact").unwrap();
+        }
+        symlink(&outside, root.join("media")).unwrap();
+        let path = root.join("request.toml");
+        let request = valid()
+            .replace("schema_version = 1", "schema_version = 2")
+            .replace(
+                "test_id = 18\n",
+                "test_id = 18\nexpected_outcome = \"pass\"\nexpected_detail = 0\n",
+            );
+        fs::write(&path, request).unwrap();
+        let error = load(&path).expect_err("escaping media symlink accepted");
+        assert!(error.message.contains("escapes the request root"));
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_run_directory_symlink_cannot_escape_request_root() {
+        use std::os::unix::fs::symlink;
+
+        let nonce = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(format!("xtask-h-run-root-{nonce}"));
+        let outside = std::env::temp_dir().join(format!("xtask-h-run-outside-{nonce}"));
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        for name in [
+            "loader.efi",
+            "deepwyrm.elf",
+            "bootstrap.elf",
+            "init0.elf",
+            "hello.elf",
+            "OVMF_CODE.fd",
+            "OVMF_VARS.fd",
+        ] {
+            fs::write(root.join(name), b"artifact").unwrap();
+        }
+        symlink(&outside, root.join("runs")).unwrap();
+        let request = valid()
+            .replace("schema_version = 1", "schema_version = 2")
+            .replace(
+                "test_id = 18\n",
+                "test_id = 18\nexpected_outcome = \"pass\"\nexpected_detail = 0\n",
+            );
+        let path = root.join("request.toml");
+        fs::write(&path, request).unwrap();
+        let error = load(&path).expect_err("escaping run_directory symlink accepted");
+        assert!(
+            error
+                .message
+                .contains("run_directory escapes the request root")
+        );
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 }
