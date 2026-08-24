@@ -23,8 +23,14 @@ paired ESP, records revision/hash provenance, and uses one q35/OVMF path for
 the 1-vCPU default and 4-vCPU smp profiles. Guest-test remains unavailable;
 the integration command owns the complete paired profile assertion.
 
-The WYR0-I-B audit consumes two already-built requests in distinct output
-roots; it does not perform or substitute for the two clean builds.
+The WYR0-I-B artifact audit consumes two already-built requests in distinct
+output roots. It requires separately recorded clean-build process evidence;
+the command does not perform or prove the two clean builds.
+
+When the exact Deepwyrm commit is absent from the remote ref closure, run Cargo
+through the project-local transport after independently obtaining the sibling
+Git repository:
+    sh toolchain/cargo-with-local-deepwyrm.sh <deepwyrm-repository> -- <cargo-arguments...>
 "#;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -137,7 +143,7 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
 fn dispatch_i_b_audit(arguments: &[String]) -> Result<Action, Failure> {
     let [first_request, second_request] = arguments else {
         return Err(Failure::usage(
-            "audit-i-b requires exactly two independently built WYR0-H request paths",
+            "audit-i-b requires exactly two WYR0-H candidate request paths",
         ));
     };
     Ok(Action::AuditIB {
@@ -345,6 +351,7 @@ mod tests {
         assert!(!BuildScope::Bootfs.runs_loader());
         assert!(BuildScope::Bootfs.runs_bootfs_package());
         assert!(USAGE.contains("WYR0-H request path"));
+        assert!(USAGE.contains("requires separately recorded clean-build process evidence"));
     }
 
     #[test]

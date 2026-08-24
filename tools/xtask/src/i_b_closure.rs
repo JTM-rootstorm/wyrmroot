@@ -1,10 +1,13 @@
-//! Fail-closed host audit for the WYR0-I-B double-build closure gate.
+//! Fail-closed artifact audit supporting WYR0-I-B review.
 
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use wyrmroot_bootfs::archive::Archive;
 
@@ -24,6 +27,9 @@ const MAX_ESP_BYTES: u64 = crate::g3_image::IMAGE_BYTES;
 const ELF_HEADER_BYTES: usize = 64;
 const ELF_PROGRAM_HEADER_BYTES: usize = 56;
 const MAX_ELF_PROGRAM_HEADERS: usize = 128;
+const MAX_INSPECTOR_STDOUT_BYTES: u64 = 64 * 1024;
+const MAX_INSPECTOR_STDERR_BYTES: u64 = 64 * 1024;
+const INSPECTOR_DEADLINE: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ArtifactDigest {
@@ -44,6 +50,29 @@ struct NativeInspection {
     executable_segments: usize,
 }
 
+#[derive(Debug)]
+struct BoundedCommandOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PipeStream {
+    Stdout,
+    Stderr,
+}
+
+enum ReaderResult {
+    Stdout(Result<BoundedPipe, Failure>),
+    Stderr(Result<BoundedPipe, Failure>),
+}
+
+struct BoundedPipe {
+    bytes: Vec<u8>,
+    exceeded: bool,
+}
+
 pub(crate) fn audit(first_request: &str, second_request: &str) -> Result<String, Failure> {
     let repository = crate::tasks::repository_root()?;
     let manifest = BuildManifest::load(&repository)?;
@@ -54,19 +83,18 @@ pub(crate) fn audit(first_request: &str, second_request: &str) -> Result<String,
     let second = h_request::load(Path::new(second_request))?;
     validate_request_pair(&first, &second, &manifest)?;
 
-    // Reuse the canonical request/image inspector so this closure is about the exact bytes the
+    // Reuse the canonical request/image inspector so this audit covers the exact bytes the
     // existing QEMU path would consume, including request-bound provenance and ESP contents.
     let first_inspection = crate::h_integration::inspect(first_request)?;
     let second_inspection = crate::h_integration::inspect(second_request)?;
     let first_candidate = json_sha256_field(&first_inspection, "candidate_sha256")?;
     let second_candidate = json_sha256_field(&second_inspection, "candidate_sha256")?;
 
-    let llvm_identity = llvm_readobj_identity()?;
-    let first_native = inspect_request_native_artifacts(&first, &llvm_identity)?;
-    let second_native = inspect_request_native_artifacts(&second, &llvm_identity)?;
+    let first_native = inspect_request_native_artifacts(&repository, &first)?;
+    let second_native = inspect_request_native_artifacts(&repository, &second)?;
     if first_native != second_native {
         return Err(Failure::task(
-            "WYR0-I-B independently built native artifacts have different ELF structure",
+            "WYR0-I-B candidate native artifacts have different ELF structure",
         ));
     }
 
@@ -74,7 +102,7 @@ pub(crate) fn audit(first_request: &str, second_request: &str) -> Result<String,
     let bootfs_executables = inspect_bootfs_executables(&first)?;
     if bootfs_executables != inspect_bootfs_executables(&second)? {
         return Err(Failure::task(
-            "WYR0-I-B independently built bootfs archives expose different executable sets",
+            "WYR0-I-B candidate bootfs archives expose different executable sets",
         ));
     }
 
@@ -91,24 +119,28 @@ pub(crate) fn audit(first_request: &str, second_request: &str) -> Result<String,
 
     Ok(format!(
         concat!(
-            "{{\"schema_version\":1,\"phase\":\"WYR0-I-B\",\"status\":\"PASS\",",
+            "{{\"schema_version\":1,\"phase\":\"WYR0-I-B-artifact-audit\",",
+            "\"status\":\"ARTIFACT_AUDIT_PASS\",\"proves_independent_clean_builds\":false,",
+            "\"clean_build_process_evidence\":\"REQUIRED_SEPARATELY\",",
             "\"pins\":{{\"deepwyrm_revision\":\"{}\",\"wyrmroot_revision\":\"{}\",",
             "\"rust_revision\":\"{}\",\"rust_toolchain_name\":\"{}\"}},",
-            "\"requests\":{{\"independent_output_roots\":true,",
+            "\"requests\":{{\"distinct_candidate_roots\":true,",
             "\"first_request_sha256\":\"{}\",\"second_request_sha256\":\"{}\",",
             "\"first_candidate_sha256\":\"{}\",\"second_candidate_sha256\":\"{}\",",
             "\"canonical_image_inspection_reused\":true}},",
-            "\"reproducibility\":{{\"all_declared_build_artifacts_identical\":true,",
+            "\"artifact_equality\":{{\"all_declared_artifact_bytes_identical\":true,",
             "\"bootfs\":{{\"identical_bytes\":true,\"sha256\":\"{}\"}},",
-            "\"esp\":{{\"identical_bytes\":true,\"sha256\":\"{}\"}}}},",
-            "\"native_artifacts\":{{\"llvm_readobj\":\"{}\",",
+            "\"esp\":{{\"identical_bytes\":true,\"sha256\":\"{}\"}},",
+            "\"consumed_sha256\":{}}},",
+            "\"native_artifacts\":{{\"canonical_inspector\":\"toolchain/inspect-native-artifact.sh\",",
             "\"required\":[\"bootstrap\",\"init0\",\"hello\"],",
             "\"bootfs_executables\":{},\"static_elf\":true,\"no_pt_interp\":true,",
             "\"no_pt_dynamic\":true,\"no_writable_executable_segment\":true}},",
-            "\"abi_audit\":{{\"manifest_lock_consistent\":true,",
+            "\"abi_pin_audit\":{{\"manifest_lock_consistent\":true,",
             "\"generated_consumer_present\":true,\"bounded_source_audit\":true,",
             "\"source_files\":{},\"source_bytes\":{},",
-            "\"hand_copied_numeric_definitions\":0,\"raw_numeric_syscalls\":0}}}}\n"
+            "\"heuristic_findings\":0,",
+            "\"manual_structural_audit\":\"REQUIRED_SEPARATELY\"}}}}\n"
         ),
         DEEPWYRM_REVISION,
         first.wyrmroot_revision,
@@ -120,7 +152,7 @@ pub(crate) fn audit(first_request: &str, second_request: &str) -> Result<String,
         second_candidate,
         bootfs_sha256,
         esp_sha256,
-        json_escape(&llvm_identity),
+        artifact_hash_json(&artifacts),
         json_string_array(&bootfs_executables),
         source_audit.files,
         source_audit.bytes,
@@ -174,7 +206,7 @@ fn validate_request_pair(
         }
         if request.expected_outcome != ExpectedOutcome::Pass || request.expected_detail != 0 {
             return Err(Failure::task(
-                "WYR0-I-B closure requires a successful production candidate request",
+                "WYR0-I-B artifact audit requires a successful production candidate request",
             ));
         }
     }
@@ -192,7 +224,7 @@ fn validate_request_pair(
         ));
     }
 
-    for (left, right, label) in artifact_pairs(first, second) {
+    for (left, right, label) in distinct_output_pairs(first, second) {
         reject_alias(left, right, label)?;
     }
     Ok(())
@@ -210,7 +242,7 @@ fn request_root(request: &HRequest) -> Result<PathBuf, Failure> {
 fn artifact_pairs<'a>(
     first: &'a HRequest,
     second: &'a HRequest,
-) -> [(&'a Path, &'a Path, &'static str); 8] {
+) -> [(&'a Path, &'a Path, &'static str); 11] {
     [
         (&first.loader, &second.loader, "loader"),
         (&first.kernel, &second.kernel, "kernel"),
@@ -220,6 +252,30 @@ fn artifact_pairs<'a>(
         (&first.hello, &second.hello, "hello"),
         (&first.bootfs, &second.bootfs, "bootfs"),
         (&first.esp, &second.esp, "esp"),
+        (&first.provenance, &second.provenance, "provenance"),
+        (&first.ovmf_code, &second.ovmf_code, "ovmf_code"),
+        (
+            &first.ovmf_vars_template,
+            &second.ovmf_vars_template,
+            "ovmf_vars_template",
+        ),
+    ]
+}
+
+fn distinct_output_pairs<'a>(
+    first: &'a HRequest,
+    second: &'a HRequest,
+) -> [(&'a Path, &'a Path, &'static str); 9] {
+    [
+        (&first.loader, &second.loader, "loader"),
+        (&first.kernel, &second.kernel, "kernel"),
+        (&first.symbols, &second.symbols, "symbols"),
+        (&first.bootstrap, &second.bootstrap, "bootstrap"),
+        (&first.init0, &second.init0, "init0"),
+        (&first.hello, &second.hello, "hello"),
+        (&first.bootfs, &second.bootfs, "bootfs"),
+        (&first.esp, &second.esp, "esp"),
+        (&first.provenance, &second.provenance, "provenance"),
     ]
 }
 
@@ -230,7 +286,7 @@ fn reject_alias(first: &Path, second: &Path, label: &str) -> Result<(), Failure>
         .map_err(|error| Failure::task(format!("could not stat second I-B {label}: {error}")))?;
     if first.dev() == second.dev() && first.ino() == second.ino() {
         return Err(Failure::task(format!(
-            "WYR0-I-B {label} candidates alias one file instead of independent build outputs"
+            "WYR0-I-B {label} candidates alias one file instead of using distinct output files"
         )));
     }
     Ok(())
@@ -242,10 +298,9 @@ fn compare_candidate_artifacts(
 ) -> Result<Vec<ArtifactDigest>, Failure> {
     let mut artifacts = Vec::new();
     for (left, right, label) in artifact_pairs(first, second) {
-        let max_bytes = if label == "esp" {
-            MAX_ESP_BYTES
-        } else {
-            MAX_NATIVE_ARTIFACT_BYTES
+        let max_bytes = match label {
+            "esp" => MAX_ESP_BYTES,
+            _ => MAX_NATIVE_ARTIFACT_BYTES,
         };
         require_identical_files(left, right, label, max_bytes)?;
         artifacts.push(ArtifactDigest {
@@ -278,7 +333,7 @@ fn require_identical_files(
         .len();
     if first_len == 0 || first_len > max_bytes || first_len != second_len {
         return Err(Failure::task(format!(
-            "WYR0-I-B {label} outputs differ in byte length or exceed the closure bound"
+            "WYR0-I-B {label} outputs differ in byte length or exceed the artifact-audit bound"
         )));
     }
     let mut first_buffer = [0_u8; 64 * 1024];
@@ -311,31 +366,20 @@ fn artifact_digest<'a>(artifacts: &'a [ArtifactDigest], label: &str) -> Result<&
         .ok_or_else(|| Failure::task(format!("WYR0-I-B omitted {label} digest")))
 }
 
-fn llvm_readobj_identity() -> Result<String, Failure> {
-    let output = Command::new("llvm-readobj")
-        .arg("--version")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| Failure::task(format!("could not run llvm-readobj: {error}")))?;
-    if !output.status.success() || output.stdout.len() > 64 * 1024 {
-        return Err(Failure::task(
-            "llvm-readobj --version failed or exceeded its output bound",
-        ));
-    }
-    let text = std::str::from_utf8(&output.stdout)
-        .map_err(|_| Failure::task("llvm-readobj version output is not UTF-8"))?;
-    let identity = text.lines().take(2).collect::<Vec<_>>().join(" ");
-    if !identity.contains("LLVM") || !identity.contains("version") {
-        return Err(Failure::task(
-            "WYR0-I-B requires the canonical LLVM readobj implementation",
-        ));
-    }
-    Ok(identity)
+fn artifact_hash_json(artifacts: &[ArtifactDigest]) -> String {
+    format!(
+        "{{{}}}",
+        artifacts
+            .iter()
+            .map(|artifact| format!("\"{}\":\"{}\"", artifact.label, artifact.digest))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
 }
 
 fn inspect_request_native_artifacts(
+    repository: &Path,
     request: &HRequest,
-    _llvm_identity: &str,
 ) -> Result<Vec<NativeInspection>, Failure> {
     let mut inspected = Vec::new();
     for (path, label) in [
@@ -345,25 +389,245 @@ fn inspect_request_native_artifacts(
     ] {
         let bytes = read_bounded(path, label, MAX_NATIVE_ARTIFACT_BYTES)?;
         inspected.push(inspect_static_native_elf(&bytes, label)?);
-        let status = Command::new("llvm-readobj")
-            .args(["--file-header", "--program-headers", "--dynamic-table"])
-            .arg(path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|error| {
-                Failure::task(format!(
-                    "could not inspect {label} with llvm-readobj: {error}"
-                ))
-            })?;
-        if !status.success() {
-            return Err(Failure::task(format!(
-                "llvm-readobj rejected the exact WYR0-I-B {label} artifact"
-            )));
-        }
+        let digest = sha256::bytes_digest(&bytes);
+        run_canonical_native_inspector(repository, path, label, &digest)?;
     }
     Ok(inspected)
+}
+
+fn run_canonical_native_inspector(
+    repository: &Path,
+    artifact: &Path,
+    label: &str,
+    expected_digest: &str,
+) -> Result<(), Failure> {
+    let script = repository.join("toolchain/inspect-native-artifact.sh");
+    let metadata = fs::symlink_metadata(&script).map_err(|error| {
+        Failure::task(format!(
+            "could not inspect canonical native artifact inspector: {error}"
+        ))
+    })?;
+    if !metadata.file_type().is_file() || metadata.len() == 0 || metadata.len() > 64 * 1024 {
+        return Err(Failure::task(
+            "canonical native artifact inspector must be a bounded nonempty regular file",
+        ));
+    }
+
+    let mut command = Command::new("sh");
+    command.arg(&script).arg(artifact).current_dir(repository);
+    let output = bounded_command_output(
+        &mut command,
+        MAX_INSPECTOR_STDOUT_BYTES,
+        MAX_INSPECTOR_STDERR_BYTES,
+        INSPECTOR_DEADLINE,
+        &format!("canonical {label} native artifact inspection"),
+    )?;
+    if !output.status.success() {
+        return Err(Failure::task(format!(
+            "canonical {label} native artifact inspector rejected the candidate ({}): {}",
+            child_status(output.status),
+            bounded_diagnostic(&output.stderr, &output.stdout)
+        )));
+    }
+    if !output.stderr.is_empty() {
+        return Err(Failure::task(format!(
+            "canonical {label} native artifact inspector wrote unexpected diagnostics: {}",
+            bounded_diagnostic(&output.stderr, &[])
+        )));
+    }
+    let report = std::str::from_utf8(&output.stdout).map_err(|_| {
+        Failure::task(format!(
+            "canonical {label} native artifact inspector report is not UTF-8"
+        ))
+    })?;
+    let trimmed = report.strip_suffix('\n').ok_or_else(|| {
+        Failure::task(format!(
+            "canonical {label} native artifact inspector report lacks its final newline"
+        ))
+    })?;
+    if trimmed.is_empty()
+        || trimmed.contains(['\n', '\r'])
+        || !trimmed.starts_with('{')
+        || !trimmed.ends_with('}')
+        || !trimmed.contains("\"report_kind\":\"wyrmroot-wyr0-native-artifact-inspection\"")
+        || !trimmed.contains("\"verified\":true")
+        || json_sha256_field(trimmed, "sha256")? != expected_digest
+    {
+        return Err(Failure::task(format!(
+            "canonical {label} native artifact inspector returned an invalid or stale report"
+        )));
+    }
+    Ok(())
+}
+
+fn bounded_command_output(
+    command: &mut Command,
+    stdout_maximum: u64,
+    stderr_maximum: u64,
+    deadline: Duration,
+    label: &str,
+) -> Result<BoundedCommandOutput, Failure> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| Failure::task(format!("could not start {label}: {error}")))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| Failure::task(format!("could not capture {label} stdout")))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| Failure::task(format!("could not capture {label} stderr")))?;
+    let (reader_sender, reader_receiver) = mpsc::channel();
+    let (limit_sender, limit_receiver) = mpsc::channel();
+    let stdout_sender = reader_sender.clone();
+    let stdout_limit = limit_sender.clone();
+    thread::spawn(move || {
+        let result = read_pipe_bounded(
+            stdout,
+            stdout_maximum,
+            Some((stdout_limit, PipeStream::Stdout)),
+        );
+        let _ = stdout_sender.send(ReaderResult::Stdout(result));
+    });
+    thread::spawn(move || {
+        let result = read_pipe_bounded(
+            stderr,
+            stderr_maximum,
+            Some((limit_sender, PipeStream::Stderr)),
+        );
+        let _ = reader_sender.send(ReaderResult::Stderr(result));
+    });
+
+    let started = Instant::now();
+    let mut status = None;
+    let mut stdout = None;
+    let mut stderr = None;
+    loop {
+        if let Ok(stream) = limit_receiver.try_recv() {
+            terminate_direct_child(&mut child, label)?;
+            return Err(Failure::task(format!(
+                "{label} {} exceeded its byte limit",
+                match stream {
+                    PipeStream::Stdout => "stdout",
+                    PipeStream::Stderr => "stderr",
+                }
+            )));
+        }
+        while let Ok(result) = reader_receiver.try_recv() {
+            match result {
+                ReaderResult::Stdout(result) => stdout = Some(result),
+                ReaderResult::Stderr(result) => stderr = Some(result),
+            }
+        }
+        if status.is_none() {
+            status = child
+                .try_wait()
+                .map_err(|error| Failure::task(format!("could not poll {label}: {error}")))?;
+        }
+        if status.is_some() && stdout.is_some() && stderr.is_some() {
+            break;
+        }
+        if started.elapsed() >= deadline {
+            terminate_direct_child(&mut child, label)?;
+            return Err(Failure::task(format!(
+                "{label} exceeded its {} ms wall-clock deadline",
+                deadline.as_millis()
+            )));
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    let stdout =
+        stdout.ok_or_else(|| Failure::task(format!("{label} omitted captured stdout")))??;
+    let stderr =
+        stderr.ok_or_else(|| Failure::task(format!("{label} omitted captured stderr")))??;
+    if stdout.exceeded || stderr.exceeded {
+        return Err(Failure::task(format!(
+            "{label} exceeded its captured output limit"
+        )));
+    }
+    Ok(BoundedCommandOutput {
+        status: status.ok_or_else(|| Failure::task(format!("{label} omitted exit status")))?,
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+    })
+}
+
+fn read_pipe_bounded<R: Read>(
+    mut reader: R,
+    maximum: u64,
+    limit_signal: Option<(mpsc::Sender<PipeStream>, PipeStream)>,
+) -> Result<BoundedPipe, Failure> {
+    let mut bytes = Vec::new();
+    (&mut reader)
+        .take(maximum + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| Failure::task(format!("could not capture inspector output: {error}")))?;
+    let exceeded = bytes.len() as u64 > maximum;
+    if exceeded {
+        bytes.truncate(maximum as usize);
+        if let Some((sender, stream)) = limit_signal {
+            let _ = sender.send(stream);
+        }
+    }
+    Ok(BoundedPipe { bytes, exceeded })
+}
+
+fn terminate_direct_child(child: &mut Child, label: &str) -> Result<(), Failure> {
+    if child
+        .try_wait()
+        .map_err(|error| Failure::task(format!("could not inspect {label}: {error}")))?
+        .is_none()
+        && let Err(kill_error) = child.kill()
+        && child
+            .try_wait()
+            .map_err(|error| Failure::task(format!("could not re-inspect {label}: {error}")))?
+            .is_none()
+    {
+        return Err(Failure::task(format!(
+            "could not terminate {label}: {kill_error}"
+        )));
+    }
+    child
+        .wait()
+        .map_err(|error| Failure::task(format!("could not reap {label}: {error}")))?;
+    Ok(())
+}
+
+fn child_status(status: ExitStatus) -> String {
+    status.code().map_or_else(
+        || "terminated by signal".to_owned(),
+        |code| format!("exit {code}"),
+    )
+}
+
+fn bounded_diagnostic(primary: &[u8], fallback: &[u8]) -> String {
+    let bytes = if primary.is_empty() {
+        fallback
+    } else {
+        primary
+    };
+    if bytes.is_empty() {
+        return "no diagnostics".to_owned();
+    }
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .map(|character| {
+            if character == '\n' || character == '\r' || character == '\t' {
+                ' '
+            } else if character.is_control() {
+                '\u{fffd}'
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .trim()
+        .to_owned()
 }
 
 fn inspect_bootfs_executables(request: &HRequest) -> Result<Vec<String>, Failure> {
@@ -419,6 +683,7 @@ fn inspect_static_native_elf(bytes: &[u8], label: &str) -> Result<NativeInspecti
     let mut loads = 0;
     let mut executable = 0;
     let mut entry_covered = false;
+    let mut mapped_pages = Vec::new();
     for index in 0..entry_count {
         let offset = program_offset
             .checked_add(
@@ -429,8 +694,11 @@ fn inspect_static_native_elf(bytes: &[u8], label: &str) -> Result<NativeInspecti
             )
             .and_then(|value| usize::try_from(value).ok())
             .ok_or_else(|| Failure::task(format!("{label} program headers overflow")))?;
+        let header_end = offset
+            .checked_add(ELF_PROGRAM_HEADER_BYTES)
+            .ok_or_else(|| Failure::task(format!("{label} program-header slice overflows")))?;
         let header = bytes
-            .get(offset..offset + ELF_PROGRAM_HEADER_BYTES)
+            .get(offset..header_end)
             .ok_or_else(|| Failure::task(format!("{label} program headers are truncated")))?;
         let kind = u32_at(header, 0)?;
         let flags = u32_at(header, 4)?;
@@ -449,12 +717,54 @@ fn inspect_static_native_elf(bytes: &[u8], label: &str) -> Result<NativeInspecti
                 "WYR0-I-B {label} has invalid segment geometry"
             )));
         }
+        if alignment > 1 && file_offset % alignment != virtual_address % alignment {
+            return Err(Failure::task(format!(
+                "WYR0-I-B {label} has incongruent segment alignment"
+            )));
+        }
         if kind == 2 || kind == 3 {
             return Err(Failure::task(format!(
                 "WYR0-I-B {label} contains forbidden PT_DYNAMIC or PT_INTERP"
             )));
         }
+        if !matches!(kind, 1 | 6 | 0x6474_e551) {
+            return Err(Failure::task(format!(
+                "WYR0-I-B {label} contains a program-header type outside the native subset"
+            )));
+        }
+        if kind == 0x6474_e551 && (flags & 1 != 0 || flags > 6) {
+            return Err(Failure::task(format!(
+                "WYR0-I-B {label} requests an executable or invalid native stack"
+            )));
+        }
         if kind == 1 {
+            if memory_size == 0 || !matches!(flags, 4..=6) {
+                return Err(Failure::task(format!(
+                    "WYR0-I-B {label} has an empty or invalid-permission PT_LOAD"
+                )));
+            }
+            let memory_end = virtual_address
+                .checked_add(memory_size)
+                .ok_or_else(|| Failure::task(format!("{label} virtual load range overflows")))?;
+            let page_start = virtual_address & !0xfff;
+            let page_end = memory_end
+                .checked_add(0xfff)
+                .map(|value| value & !0xfff)
+                .ok_or_else(|| Failure::task(format!("{label} virtual page range overflows")))?;
+            if page_start < 0x1000 || page_end > 0x8000_0000_0000 {
+                return Err(Failure::task(format!(
+                    "WYR0-I-B {label} PT_LOAD leaves the admitted native user range"
+                )));
+            }
+            if mapped_pages
+                .iter()
+                .any(|(start, end)| page_start < *end && *start < page_end)
+            {
+                return Err(Failure::task(format!(
+                    "WYR0-I-B {label} PT_LOAD mappings overlap or create an executable alias"
+                )));
+            }
+            mapped_pages.push((page_start, page_end));
             loads += 1;
             if flags & 1 != 0 {
                 executable += 1;
@@ -463,9 +773,6 @@ fn inspect_static_native_elf(bytes: &[u8], label: &str) -> Result<NativeInspecti
                         "WYR0-I-B {label} contains a writable executable PT_LOAD"
                     )));
                 }
-                let memory_end = virtual_address.checked_add(memory_size).ok_or_else(|| {
-                    Failure::task(format!("{label} virtual load range overflows"))
-                })?;
                 entry_covered |= entry >= virtual_address && entry < memory_end;
             }
         }
@@ -610,17 +917,19 @@ fn forbidden_abi_copy(source: &str) -> Option<String> {
         for (position, token) in tokens.iter().enumerate() {
             if token.starts_with("DW_") {
                 let remainder = &tokens[position + 1..];
-                let declaration = tokens[..position]
-                    .iter()
-                    .any(|value| matches!(value.as_str(), "const" | "static"))
-                    || remainder.first().map(String::as_str) == Some("=");
-                if declaration
-                    && let Some(equals) = remainder.iter().position(|value| value == "=")
-                    && remainder
-                        .get(equals + 1)
-                        .is_some_and(|value| numeric_token(value))
-                {
-                    return Some(format!("numeric DW_ definition at line {}", index + 1));
+                let declaration = (tokens
+                    .first()
+                    .is_some_and(|value| matches!(value.as_str(), "const" | "static"))
+                    && (position == 1
+                        || (position == 2 && tokens.get(1).map(String::as_str) == Some("mut"))))
+                    || (remainder.first().map(String::as_str) == Some("=")
+                        && remainder.get(1).is_some_and(|value| {
+                            numeric_token(value)
+                                || (value == "-"
+                                    && remainder.get(2).is_some_and(|value| numeric_token(value)))
+                        }));
+                if declaration {
+                    return Some(format!("local DW_ definition at line {}", index + 1));
                 }
             }
             if matches!(token.as_str(), "struct" | "enum" | "union" | "type")
@@ -646,9 +955,8 @@ fn forbidden_abi_copy(source: &str) -> Option<String> {
         if tokens.first().map(String::as_str) == Some("#")
             && tokens.get(1).map(String::as_str) == Some("define")
             && tokens.get(2).is_some_and(|name| name.starts_with("DW_"))
-            && tokens.get(3).is_some_and(|value| numeric_token(value))
         {
-            return Some(format!("numeric DW_ macro at line {}", index + 1));
+            return Some(format!("local DW_ macro at line {}", index + 1));
         }
     }
     None
@@ -662,6 +970,7 @@ fn strip_comments_and_literals(source: &str) -> String {
         BlockComment(usize),
         String(bool),
         Character(bool),
+        RawString(usize),
     }
     let bytes = source.as_bytes();
     let mut output = String::with_capacity(source.len());
@@ -681,12 +990,19 @@ fn strip_comments_and_literals(source: &str) -> String {
                 state = State::BlockComment(1);
                 index += 2;
             }
+            State::Code if raw_string_start(bytes, index).is_some() => {
+                let (consumed, hashes) =
+                    raw_string_start(bytes, index).expect("raw string start matched in guard");
+                output.extend(std::iter::repeat_n(' ', consumed));
+                state = State::RawString(hashes);
+                index += consumed;
+            }
             State::Code if byte == b'"' => {
                 output.push(' ');
                 state = State::String(false);
                 index += 1;
             }
-            State::Code if byte == b'\'' => {
+            State::Code if byte == b'\'' && character_literal_start(bytes, index) => {
                 output.push(' ');
                 state = State::Character(false);
                 index += 1;
@@ -743,9 +1059,47 @@ fn strip_comments_and_literals(source: &str) -> String {
                 }
                 index += 1;
             }
+            State::RawString(hashes)
+                if byte == b'"'
+                    && index
+                        .checked_add(1 + hashes)
+                        .and_then(|end| bytes.get(index + 1..end))
+                        .is_some_and(|suffix| suffix.iter().all(|byte| *byte == b'#')) =>
+            {
+                output.extend(std::iter::repeat_n(' ', 1 + hashes));
+                state = State::Code;
+                index += 1 + hashes;
+            }
+            State::RawString(hashes) => {
+                output.push(if byte == b'\n' { '\n' } else { ' ' });
+                state = State::RawString(hashes);
+                index += 1;
+            }
         }
     }
     output
+}
+
+fn raw_string_start(bytes: &[u8], index: usize) -> Option<(usize, usize)> {
+    if bytes.get(index) != Some(&b'r') {
+        return None;
+    }
+    let mut cursor = index + 1;
+    while bytes.get(cursor) == Some(&b'#') {
+        cursor += 1;
+    }
+    (bytes.get(cursor) == Some(&b'"')).then_some((cursor - index + 1, cursor - index - 1))
+}
+
+fn character_literal_start(bytes: &[u8], index: usize) -> bool {
+    matches!(
+        (
+            bytes.get(index + 1),
+            bytes.get(index + 2),
+            bytes.get(index + 3)
+        ),
+        (Some(b'\\'), Some(_), Some(b'\'')) | (Some(_), Some(b'\''), _)
+    )
 }
 
 fn source_tokens(line: &str) -> Vec<String> {
@@ -865,17 +1219,44 @@ mod tests {
         assert!(inspect_static_native_elf(&elf_fixture(3, 4), "interp").is_err());
         assert!(inspect_static_native_elf(&elf_fixture(2, 4), "dynamic").is_err());
         assert!(inspect_static_native_elf(&elf_fixture(1, 7), "wx").is_err());
+
+        let mut phdr_overflow = valid.clone();
+        put_u64(&mut phdr_overflow, 32, u64::MAX);
+        assert!(inspect_static_native_elf(&phdr_overflow, "phdr-overflow").is_err());
+
+        let mut virtual_overflow = valid.clone();
+        put_u64(&mut virtual_overflow, 80, u64::MAX - 0x7f);
+        put_u64(&mut virtual_overflow, 104, 0x100);
+        assert!(inspect_static_native_elf(&virtual_overflow, "virtual-overflow").is_err());
+
+        let mut alias = valid.clone();
+        put_u16(&mut alias, 56, 2);
+        program_header(&mut alias, 120, 1, 4, 0, 0x400080, 64, 64, 1);
+        assert!(inspect_static_native_elf(&alias, "executable-alias").is_err());
     }
 
     #[test]
     fn source_audit_rejects_numeric_abi_copies_and_raw_syscalls() {
         assert!(forbidden_abi_copy("const DW_STATUS_FAKE: u32 = 0x10;").is_some());
+        assert!(forbidden_abi_copy("const DW_STATUS_FAKE: u32 = 1 << 4;").is_some());
         assert!(forbidden_abi_copy("#define DW_RIGHT_FAKE 4").is_some());
         assert!(forbidden_abi_copy("unsafe { dw_syscall6(17, 0, 0, 0, 0, 0, 0) }").is_some());
         assert!(forbidden_abi_copy("#[repr(C)] struct DwFakeWire { value: u64 }").is_some());
         assert!(
             forbidden_abi_copy(
                 "// const DW_STATUS_FAKE: u32 = 1;\nuse deepwyrm_abi::DW_STATUS_OK;\nlet text = \"DW_RIGHT_FAKE = 4\";"
+            )
+            .is_none()
+        );
+        assert!(
+            forbidden_abi_copy(
+                "fn borrow<'a>(value: &'a u32) -> &'a u32 { value }\nconst DW_FAKE: u32 = 7;"
+            )
+            .is_some()
+        );
+        assert!(
+            forbidden_abi_copy(
+                "let text = r###\"const DW_FAKE: u32 = 7; dw_syscall6(9)\"###;\nuse deepwyrm_abi::DW_STATUS_OK;"
             )
             .is_none()
         );
@@ -906,6 +1287,62 @@ mod tests {
     }
 
     #[test]
+    fn canonical_inspector_is_invoked_and_failure_diagnostics_are_preserved() {
+        let root = temporary_root("canonical-inspector");
+        fs::create_dir_all(root.join("toolchain")).expect("create toolchain directory");
+        let artifact = root.join("native.elf");
+        fs::write(&artifact, b"artifact-bytes").expect("write artifact");
+        let digest = sha256::bytes_digest(b"artifact-bytes");
+        let script = root.join("toolchain/inspect-native-artifact.sh");
+        fs::write(
+            &script,
+            format!(
+                concat!(
+                    "#!/bin/sh\nset -eu\n",
+                    "test \"$#\" -eq 1\ntest \"$1\" = '{}'\n",
+                    "printf '%s\\n' '{{\"schema_version\":1,",
+                    "\"report_kind\":\"wyrmroot-wyr0-native-artifact-inspection\",",
+                    "\"verified\":true,\"sha256\":\"{}\"}}'\n"
+                ),
+                artifact.display(),
+                digest,
+            ),
+        )
+        .expect("write success inspector");
+        run_canonical_native_inspector(&root, &artifact, "fixture", &digest)
+            .expect("canonical inspector success");
+
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' 'sentinel canonical failure' >&2\nexit 9\n",
+        )
+        .expect("write failure inspector");
+        let failure = run_canonical_native_inspector(&root, &artifact, "fixture", &digest)
+            .expect_err("canonical inspector failure accepted");
+        assert!(failure.message.contains("sentinel canonical failure"));
+        assert!(failure.message.contains("exit 9"));
+        fs::remove_dir_all(root).expect("remove temporary root");
+    }
+
+    #[test]
+    fn local_deepwyrm_transport_is_exact_and_process_scoped() {
+        const SOURCE: &str = include_str!("../../../toolchain/cargo-with-local-deepwyrm.sh");
+        for expected in [
+            "revision=5da17d0d2460936e171d0874ffd2262ad4a5cc97",
+            "abi_tree=1c6a74f130e386eee95b3780c75950beefd0037d",
+            "abi_crate_tree=3c4b82b4253d7d21d0f578d8d5b966304472cd8f",
+            "syscall_crate_tree=a64290953ccc0548e908be88586969ac0b70b589",
+            "GIT_CONFIG_GLOBAL=/dev/null",
+            "GIT_CONFIG_COUNT=1",
+            "CARGO_NET_GIT_FETCH_WITH_CLI=true",
+        ] {
+            assert!(SOURCE.contains(expected), "transport omitted {expected}");
+        }
+        assert!(SOURCE.contains("exec env"));
+        assert!(!SOURCE.contains("git config --global"));
+    }
+
+    #[test]
     fn report_field_parser_is_strict() {
         let digest = "a".repeat(64);
         let report = format!("{{\"candidate_sha256\":\"{digest}\"}}");
@@ -931,14 +1368,31 @@ mod tests {
         put_u16(&mut bytes, 52, 64);
         put_u16(&mut bytes, 54, 56);
         put_u16(&mut bytes, 56, 1);
-        put_u32(&mut bytes, 64, kind);
-        put_u32(&mut bytes, 68, flags);
-        put_u64(&mut bytes, 72, 0);
-        put_u64(&mut bytes, 80, 0x400000);
-        put_u64(&mut bytes, 96, byte_len);
-        put_u64(&mut bytes, 104, byte_len);
-        put_u64(&mut bytes, 112, 0x1000);
+        program_header(
+            &mut bytes, 64, kind, flags, 0, 0x400000, byte_len, byte_len, 0x1000,
+        );
         bytes
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn program_header(
+        bytes: &mut [u8],
+        offset: usize,
+        kind: u32,
+        flags: u32,
+        file_offset: u64,
+        virtual_address: u64,
+        file_size: u64,
+        memory_size: u64,
+        alignment: u64,
+    ) {
+        put_u32(bytes, offset, kind);
+        put_u32(bytes, offset + 4, flags);
+        put_u64(bytes, offset + 8, file_offset);
+        put_u64(bytes, offset + 16, virtual_address);
+        put_u64(bytes, offset + 32, file_size);
+        put_u64(bytes, offset + 40, memory_size);
+        put_u64(bytes, offset + 48, alignment);
     }
 
     fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
