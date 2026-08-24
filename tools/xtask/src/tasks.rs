@@ -337,7 +337,7 @@ fn run_uefi_cargo(
         .rust_lld
         .to_str()
         .ok_or_else(|| Failure::task("accepted rust-lld path is not valid UTF-8"))?;
-    let encoded_rustflags = format!("--sysroot\u{1f}{sysroot}\u{1f}-C\u{1f}linker={rust_lld}");
+    let encoded_rustflags = deterministic_uefi_rustflags(repository, sysroot, rust_lld)?;
     let status = Command::new(&toolchain.accepted.cargo)
         .arg(operation)
         .arg("--locked")
@@ -375,6 +375,75 @@ fn run_uefi_cargo(
             child_status(status.code())
         )))
     }
+}
+
+fn deterministic_uefi_rustflags(
+    repository: &Path,
+    sysroot: &str,
+    rust_lld: &str,
+) -> Result<String, Failure> {
+    let cargo_home = env::var_os("CARGO_HOME")
+        .ok_or_else(|| Failure::task("UEFI loader build requires an explicit CARGO_HOME"))?;
+    let cargo_home = PathBuf::from(cargo_home);
+    if !cargo_home.is_absolute() {
+        return Err(Failure::task(
+            "UEFI loader build requires CARGO_HOME to be an absolute path",
+        ));
+    }
+    encoded_uefi_rustflags(repository, &cargo_home, sysroot, rust_lld)
+}
+
+fn encoded_uefi_rustflags(
+    repository: &Path,
+    cargo_home: &Path,
+    sysroot: &str,
+    rust_lld: &str,
+) -> Result<String, Failure> {
+    let repository = canonical_build_directory(repository, "Wyrmroot repository")?;
+    let cargo_home = canonical_build_directory(cargo_home, "Cargo home")?;
+    let repository = repository
+        .to_str()
+        .ok_or_else(|| Failure::task("Wyrmroot repository path is not valid UTF-8"))?;
+    let cargo_home = cargo_home
+        .to_str()
+        .ok_or_else(|| Failure::task("Cargo home path is not valid UTF-8"))?;
+
+    for (value, label) in [
+        (repository, "Wyrmroot repository"),
+        (cargo_home, "Cargo home"),
+        (sysroot, "accepted sysroot"),
+        (rust_lld, "accepted rust-lld"),
+    ] {
+        if value.contains('\u{1f}') {
+            return Err(Failure::task(format!(
+                "{label} path contains Cargo's encoded-rustflags separator"
+            )));
+        }
+    }
+
+    Ok([
+        "--sysroot".to_owned(),
+        sysroot.to_owned(),
+        "-C".to_owned(),
+        format!("linker={rust_lld}"),
+        format!("--remap-path-prefix={repository}=/source/wyrmroot"),
+        format!("--remap-path-prefix={cargo_home}=/cargo-home"),
+    ]
+    .join("\u{1f}"))
+}
+
+fn canonical_build_directory(path: &Path, label: &str) -> Result<PathBuf, Failure> {
+    let canonical = fs::canonicalize(path)
+        .map_err(|error| Failure::task(format!("could not resolve {label}: {error}")))?;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| Failure::task(format!("could not inspect {label}: {error}")))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() || canonical != path {
+        return Err(Failure::task(format!(
+            "{label} must be an existing canonical non-symlink directory: {}",
+            path.display()
+        )));
+    }
+    Ok(canonical)
 }
 
 fn validate_regular_artifact(path: &Path, label: &str, maximum: u64) -> Result<(), Failure> {
@@ -553,8 +622,8 @@ fn child_status(code: Option<i32>) -> String {
 mod tests {
     use super::{
         BOOTFS_BUILD_ARGUMENTS, BOOTFS_PACKAGE, BOOTFS_TEST_ARGUMENTS, blocked_toolchain_failure,
-        component_package, explicit_test_filter, host_test_arguments, host_test_commands,
-        validate_regular_artifact,
+        component_package, encoded_uefi_rustflags, explicit_test_filter, host_test_arguments,
+        host_test_commands, validate_regular_artifact,
     };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -632,6 +701,47 @@ mod tests {
             failure.message,
             "accepted WYR0-B rustc is unavailable: toolchain/requests/RUST-WYR0-I-B-SYSROOTS-007.toml status is 'blocked-pending-coordinator-assignment'; set WYRMROOT_RUSTC only to the accepted compiler artifact from that coordinator request"
         );
+    }
+
+    #[test]
+    fn uefi_flags_remap_build_specific_paths() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock precedes Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "wyrmroot-xtask-remap-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let repository = root.join("checkout");
+        let cargo_home = root.join("cargo-home");
+        fs::create_dir_all(&repository).expect("create test repository");
+        fs::create_dir_all(&cargo_home).expect("create test Cargo home");
+
+        let flags = encoded_uefi_rustflags(
+            &repository,
+            &cargo_home,
+            "/accepted/sysroot",
+            "/accepted/rust-lld",
+        )
+        .expect("encode deterministic UEFI flags");
+        let flags: Vec<_> = flags.split('\u{1f}').map(str::to_owned).collect();
+        assert_eq!(
+            flags,
+            vec![
+                "--sysroot".to_owned(),
+                "/accepted/sysroot".to_owned(),
+                "-C".to_owned(),
+                "linker=/accepted/rust-lld".to_owned(),
+                format!(
+                    "--remap-path-prefix={}=/source/wyrmroot",
+                    repository.display()
+                ),
+                format!("--remap-path-prefix={}=/cargo-home", cargo_home.display()),
+            ]
+        );
+
+        fs::remove_dir_all(&root).expect("remove isolated test directory");
     }
 
     #[cfg(unix)]
