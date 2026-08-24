@@ -18,7 +18,7 @@ json_escape() {
 tool_json=""
 all_tools_available=true
 first=true
-for tool in rustc cargo clang clang++ ld.lld llvm-ar llvm-readelf llvm-readobj llvm-objdump llvm-nm llvm-objcopy llvm-symbolizer gdb; do
+for tool in rustc cargo clang clang++ ld.lld llvm-ar llvm-readelf llvm-readobj llvm-objdump llvm-nm llvm-objcopy llvm-pdbutil llvm-symbolizer gdb; do
     if [ "$first" = true ]; then
         first=false
     else

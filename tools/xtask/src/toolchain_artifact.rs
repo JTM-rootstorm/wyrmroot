@@ -169,6 +169,19 @@ pub(crate) fn prepare(
         "artifacts.none_compiler_builtins",
         "none compiler-builtins",
     )?;
+    let wyrmroot_core = component(&root, &manifest, "artifacts.wyrmroot_core", "Wyrmroot core")?;
+    let wyrmroot_alloc = component(
+        &root,
+        &manifest,
+        "artifacts.wyrmroot_alloc",
+        "Wyrmroot alloc",
+    )?;
+    let wyrmroot_builtins = component(
+        &root,
+        &manifest,
+        "artifacts.wyrmroot_compiler_builtins",
+        "Wyrmroot compiler-builtins",
+    )?;
 
     let toolchain_directory =
         required_string(&manifest, "toolchain_directory", "artifact manifest")?;
@@ -222,6 +235,9 @@ pub(crate) fn prepare(
         none_core.clone(),
         none_alloc.clone(),
         none_builtins.clone(),
+        wyrmroot_core,
+        wyrmroot_alloc,
+        wyrmroot_builtins,
         rustc_driver.clone(),
         llvm.clone(),
         host_core,

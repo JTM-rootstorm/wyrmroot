@@ -2,7 +2,7 @@
 # Resolve the exact accepted Deepwyrm Git object through a scoped local transport.
 set -eu
 
-revision=5da17d0d2460936e171d0874ffd2262ad4a5cc97
+revision=5bf80d485f00af3c82b24e170bc5b12faf8a3c67
 abi_tree=1c6a74f130e386eee95b3780c75950beefd0037d
 abi_crate_tree=3c4b82b4253d7d21d0f578d8d5b966304472cd8f
 syscall_crate_tree=a64290953ccc0548e908be88586969ac0b70b589

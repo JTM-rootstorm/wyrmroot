@@ -62,17 +62,18 @@ host compiler:
 sh toolchain/verify-uefi-toolchain.sh --rustc <accepted-wyrmroot-rustc>
 ```
 
-After a real loader build, validate the produced EFI file and its retained
-debug-symbol artifact with:
+The canonical loader build emits a `/Brepro` production EFI without a CodeView
+record and a separate full-debug EFI/PDB pair. Validate all three together:
 
 ```text
-sh toolchain/inspect-uefi-artifact.sh <loader.efi> <loader.pdb-or-equivalent>
+sh toolchain/inspect-uefi-artifact.sh <loader.efi> <debug-loader.efi> <loader.pdb>
 ```
 
 UEFI uses PE/COFF rather than ELF, so this inspection intentionally checks the
-PE machine/subsystem/import table instead of applying the native userspace
-`PT_INTERP` rule. The latter remains mandatory for later `bootstrap.elf`,
-`init0`, and `hello` inspection.
+PE machine/subsystem/import table, the production reproducibility record, and
+the exact CodeView GUID/age linkage of the retained debug pair. It does not
+rewrite PDB content. The native-userspace `PT_INTERP` rule remains mandatory
+for later `bootstrap.elf`, `init0`, and `hello` inspection.
 
 ## Host LLVM environment
 
@@ -93,7 +94,8 @@ The JSON report is machine-readable availability evidence only. It reports
 must capture exact versions in its generated provenance record before any host
 version becomes a WYR0 reproducibility input. The probe also requires the
 x86_64 compiler-rt builtins archive exposed by Clang's resource directory.
-`llvm-readobj` is required for the UEFI PE/COFF inspection path.
+`llvm-readobj` and `llvm-pdbutil` are required for the UEFI PE/COFF and retained
+debug-pair inspection path.
 
 `templates/build-provenance.toml` defines the minimum provenance fields for a
 future generated build record. Generated records belong with build artifacts,

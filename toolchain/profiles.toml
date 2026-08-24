@@ -30,7 +30,7 @@ lld_flavor = "link"
 required_pre_link_args = ["/NOLOGO", "/entry:efi_main", "/subsystem:efi_application"]
 host_linker_fallback = "prohibited"
 host_libc_fallback = "prohibited"
-debug_information = "PDB-or-equivalent-symbol-artifact-required"
+debug_information = "separate-full-debug-PE-and-linked-PDB-required"
 artifact_inspection = "toolchain/inspect-uefi-artifact.sh"
 toolchain_inspection = "toolchain/verify-uefi-toolchain.sh"
 
@@ -51,4 +51,4 @@ artifact_inspection = "toolchain/inspect-native-artifact.sh"
 required_source_pins = ["deepwyrm", "rust"]
 required_configuration_inputs = ["toolchain/versions.toml", "toolchain/profiles.toml"]
 required_guest_inspection = ["static ET_EXEC", "W^X PT_LOAD segments", "NX stack", "PT_INTERP absent", "PT_DYNAMIC absent", "relocations absent", "undefined symbols absent", "single Deepwyrm syscall veneer"]
-required_uefi_inspection = ["PE32+ AMD64", "EFI application subsystem", "no PE imports", "debug-symbol artifact"]
+required_uefi_inspection = ["PE32+ AMD64", "EFI application subsystem", "no PE imports", "production /Brepro record", "production CodeView absent", "retained debug PE/PDB GUID and age linked", "retained PDB globals and publics"]

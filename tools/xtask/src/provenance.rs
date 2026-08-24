@@ -12,7 +12,7 @@ use crate::error::Failure;
 const MAX_PROVENANCE_BYTES: u64 = 1024 * 1024;
 const MAX_PROVENANCE_PATH_BYTES: usize = 4096;
 const MAX_PROVENANCE_IDENTIFIER_BYTES: usize = 128;
-const LOADER_PROVENANCE_SCHEMA_VERSION: u64 = 3;
+const LOADER_PROVENANCE_SCHEMA_VERSION: u64 = 4;
 const LOADER_PROVENANCE_MANIFEST_KIND: &str = "wyrmroot-wyr0-b-loader-provenance";
 const LOADER_PROVENANCE_RECORD_ROLE: &str = "generated-loader-artifact-provenance";
 const BUILD_PROVENANCE_TEMPLATE_SCHEMA_VERSION: u64 = 1;
@@ -41,6 +41,8 @@ pub(crate) struct LoaderProvenance<'a> {
     pub(crate) binary: &'a str,
     pub(crate) artifact_path: &'a str,
     pub(crate) artifact_sha256: &'a str,
+    pub(crate) debug_image_path: &'a str,
+    pub(crate) debug_image_sha256: &'a str,
     pub(crate) debug_path: &'a str,
     pub(crate) debug_sha256: &'a str,
     pub(crate) versions_sha256: &'a str,
@@ -290,6 +292,10 @@ fn render(record: &LoaderProvenance<'_>) -> Result<String, Failure> {
             "toolchain manifest SHA-256",
         ),
         (record.artifact_sha256, "UEFI loader artifact SHA-256"),
+        (
+            record.debug_image_sha256,
+            "retained debug UEFI loader SHA-256",
+        ),
         (record.debug_sha256, "UEFI loader debug symbol SHA-256"),
         (record.versions_sha256, "versions manifest SHA-256"),
         (record.profiles_sha256, "profiles manifest SHA-256"),
@@ -318,6 +324,7 @@ fn render(record: &LoaderProvenance<'_>) -> Result<String, Failure> {
         validate_identifier(value, label)?;
     }
     validate_relative_path(record.artifact_path, "UEFI loader artifact")?;
+    validate_relative_path(record.debug_image_path, "retained debug UEFI loader")?;
     validate_relative_path(record.debug_path, "UEFI loader debug symbols")?;
     Ok(format!(
         "schema_version = {}\n\
@@ -368,6 +375,8 @@ profile = \"dev\"\n\
 [uefi_loader]\n\
 artifact_path = \"{}\"\n\
 artifact_sha256 = \"{}\"\n\
+debug_image_path = \"{}\"\n\
+debug_image_sha256 = \"{}\"\n\
 debug_symbol_path = \"{}\"\n\
 debug_symbol_sha256 = \"{}\"\n\
 inspection_report_sha256 = \"{}\"\n",
@@ -407,6 +416,8 @@ inspection_report_sha256 = \"{}\"\n",
         escape(record.binary),
         escape(record.artifact_path),
         escape(record.artifact_sha256),
+        escape(record.debug_image_path),
+        escape(record.debug_image_sha256),
         escape(record.debug_path),
         escape(record.debug_sha256),
         escape(record.artifact_report_sha256),
@@ -590,7 +601,9 @@ mod tests {
             binary: "loader",
             artifact_path: "target/wyr0-b/x86_64-unknown-uefi/debug/loader.efi",
             artifact_sha256: SHA256,
-            debug_path: "target/wyr0-b/x86_64-unknown-uefi/debug/loader.pdb",
+            debug_image_path: "target/wyr0-b-symbols/x86_64-unknown-uefi/debug/loader.efi",
+            debug_image_sha256: SHA256,
+            debug_path: "target/wyr0-b-symbols/x86_64-unknown-uefi/debug/loader.pdb",
             debug_sha256: SHA256,
             versions_sha256: SHA256,
             profiles_sha256: SHA256,
@@ -606,7 +619,7 @@ mod tests {
         const SYNTHETIC_WORKSPACE: &str = "/synthetic/private/workspace";
         let record = record();
         let rendered = render(&record).expect("valid relative provenance record rejected");
-        assert!(rendered.starts_with("schema_version = 3\n"));
+        assert!(rendered.starts_with("schema_version = 4\n"));
         assert!(rendered.contains("manifest_kind = \"wyrmroot-wyr0-b-loader-provenance\""));
         assert!(rendered.contains("record_role = \"generated-loader-artifact-provenance\""));
         assert!(rendered.contains("distinct_from_schema_version = 1"));
