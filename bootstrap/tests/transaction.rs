@@ -97,8 +97,7 @@ fn live_exit_code_identifies_bootstrap_owned_failure() {
         0xB101_8001
     );
     assert_eq!(
-        BootstrapError::Cleanup(NativeError::Status(deepwyrm_syscall::DwStatus(-73)))
-            .exit_code(),
+        BootstrapError::Cleanup(NativeError::Status(deepwyrm_syscall::DwStatus(-73))).exit_code(),
         0xB200_0049
     );
     assert_eq!(
@@ -456,7 +455,7 @@ impl LoaderPlatform for SmokeLoader {
                 assert!(transfers.is_empty());
                 &received[..0]
             }
-            launch::LaunchProfile::Init0 => {
+            launch::LaunchProfile::Init0 | launch::LaunchProfile::I2Stress => {
                 assert_eq!(transfers.len(), 3);
                 assert!(transfers.iter().all(|transfer| {
                     transfer.operation == deepwyrm_syscall::DW_HANDLE_TRANSFER_MOVE
