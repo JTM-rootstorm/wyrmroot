@@ -9,6 +9,7 @@ Usage:
     cargo xtask run <default|smp> --request <wyr0-h-request.toml>
     cargo xtask inspect-image <esp.img> <loader.efi> <deepwyrm.elf> <bootstrap.elf> <bootfs.img>
     cargo xtask inspect-image --request <wyr0-h-request.toml>
+    cargo xtask audit-i-b <first-request.toml> <second-request.toml>
     cargo xtask gdb <default|smp> --request <wyr0-h-request.toml>
     cargo xtask test host [filter]
     cargo xtask test guest [filter]
@@ -21,6 +22,9 @@ The WYR0-H request path builds and inspects the exact init0/hello bootfs and
 paired ESP, records revision/hash provenance, and uses one q35/OVMF path for
 the 1-vCPU default and 4-vCPU smp profiles. Guest-test remains unavailable;
 the integration command owns the complete paired profile assertion.
+
+The WYR0-I-B audit consumes two already-built requests in distinct output
+roots; it does not perform or substitute for the two clean builds.
 "#;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -63,6 +67,10 @@ pub(crate) enum Action {
     InspectG3Image(G3ImageArguments),
     BuildHImage(String),
     InspectHImage(String),
+    AuditIB {
+        first_request: String,
+        second_request: String,
+    },
     RunH {
         profile: HProfile,
         request: String,
@@ -117,12 +125,25 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
         "image" => dispatch_image(&arguments[1..]),
         "run" => dispatch_profile_request(&arguments[1..], false),
         "inspect-image" => dispatch_inspect_image(&arguments[1..]),
+        "audit-i-b" => dispatch_i_b_audit(&arguments[1..]),
         "gdb" => dispatch_profile_request(&arguments[1..], true),
         "test" => dispatch_test(&arguments[1..]),
         unknown => Err(Failure::usage(format!(
             "unknown command '{unknown}'\n\n{USAGE}"
         ))),
     }
+}
+
+fn dispatch_i_b_audit(arguments: &[String]) -> Result<Action, Failure> {
+    let [first_request, second_request] = arguments else {
+        return Err(Failure::usage(
+            "audit-i-b requires exactly two independently built WYR0-H request paths",
+        ));
+    };
+    Ok(Action::AuditIB {
+        first_request: first_request.clone(),
+        second_request: second_request.clone(),
+    })
 }
 
 fn dispatch_image(arguments: &[String]) -> Result<Action, Failure> {
@@ -337,6 +358,13 @@ mod tests {
             Ok(Action::InspectHImage("request.toml".into()))
         );
         assert_eq!(
+            dispatch(&arguments(&["audit-i-b", "first.toml", "second.toml"])),
+            Ok(Action::AuditIB {
+                first_request: "first.toml".into(),
+                second_request: "second.toml".into(),
+            })
+        );
+        assert_eq!(
             dispatch(&arguments(&["run", "default", "--request", "request.toml"])),
             Ok(Action::RunH {
                 profile: HProfile::Default,
@@ -426,6 +454,9 @@ mod tests {
             &["gdb", "default", "request.toml"],
             &["inspect-image"],
             &["inspect-image", "one", "two"],
+            &["audit-i-b"],
+            &["audit-i-b", "one"],
+            &["audit-i-b", "one", "two", "three"],
             &["test"],
             &["test", "unknown"],
             &["test", "host", "one", "two"],

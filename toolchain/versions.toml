@@ -3,7 +3,7 @@ milestone = "WYR0"
 
 [deepwyrm]
 repository = "https://github.com/JTM-rootstorm/deepwyrm"
-revision = "9954cbc053874c3076640c8cd9dc1c5bf5cf0647"
+revision = "5da17d0d2460936e171d0874ffd2262ad4a5cc97"
 abi_version = 0
 abi_dependency_state = "available"
 
@@ -12,8 +12,8 @@ upstream_repository = "https://github.com/rust-lang/rust"
 upstream_stable_release = "1.97.1"
 upstream_stable_revision = "8bab26f4f68e0e26f0bb7960be334d5b520ea452"
 fork_repository = "git@github.com:JTM-rootstorm/rust.git"
-wyrmroot_revision = "532159d837cadeb7d00e35eacb7f31bf0b640c3d"
-local_toolchain_name = "wyrmroot-1.97.1-532159d8"
+wyrmroot_revision = "a92dc7f7464ad6ddfece4402bd7b86dbfa86166d"
+local_toolchain_name = "wyrmroot-1.97.1-a92dc7f7"
 native_target = "x86_64-unknown-wyrmroot"
 native_target_state = "available"
 
