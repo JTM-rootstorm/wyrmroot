@@ -49,6 +49,25 @@ the launch-channel command protocol establishes the two-live-child overlap but
 does not transfer a shared Event or atomic address, so no such correlation is
 claimed.
 
+## Live closure evidence
+
+The exact I2 tuple Deepwyrm
+`18b59ef6f7b20e3ebf1abc8b793452cb22c5f2c6`, Wyrmroot
+`e6072c94c678f97ea5993285346408537e5c28a0`, and Rust
+`a92dc7f7464ad6ddfece4402bd7b86dbfa86166d` passed five consecutive canonical
+four-vCPU runs without a rebuild or source change. The immutable candidate is
+`56670e4a01b6d766c45bfd27a858ae671cbd12066fef439209287e5c253ef2fc`;
+its kernel and payload SHA-256 values are respectively
+`62c890e3df328ac8e660c6addf101872beed212b3914c6bf2034b7393ba0c089`
+and `66d2647242f31ce05e33c2603d95859b4bc56b86e6d230a543f523b58e1506e7`.
+
+The five structured PASS results are preserved under
+`artifacts/dw0-i2/checkpoint-dw-18b59ef__wyr-e6072c9__rust-a92dc7f7-live-7/repeats/pass-1`
+through `pass-5`. Every result reports schema 2, selector test ID 22, four
+vCPUs, 2048 MiB, detail zero, QEMU status 33, and `no_host_share = true`.
+This closes the bounded live I2 payload as specified; it does not broaden the
+explicit cross-process Event/atomic limit above.
+
 ## Build selection
 
 ```text

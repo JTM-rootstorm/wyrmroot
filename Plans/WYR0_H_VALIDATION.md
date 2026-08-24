@@ -112,7 +112,7 @@ inspection, deterministic FAT32 construction, shared-media profile geometry,
 absence of host shares, exact-symbol GDB arguments, checksummed terminal-record
 parsing, paired join behavior, and structured host-side failure results.
 
-## Current paired guest result
+## Historical pre-I0 paired guest result
 
 The pre-I0 review reran the canonical paired command after correcting the VM
 geometry. Both profiles consumed the same unchanged ESP
@@ -204,3 +204,27 @@ validated and must exactly equal the request mask `255`; it is not a constant
 success value.
 This host-side validation capability is not evidence that a guest candidate
 emitted the protocol and does not by itself close I1.
+
+## Accepted I1 and I2 live results
+
+I1 is closed on Deepwyrm `f8117bbe8943ca79d8815061a1a9e09ca0032929`,
+Wyrmroot `b90b05602319c5ee89a5ab04e763bdc2bdede453`, and Rust
+`a92dc7f7464ad6ddfece4402bd7b86dbfa86166d`. The default schema-v2 regression
+passed with candidate SHA-256
+`00fb641e7e3b9af4a7de6be95cb7d758d04a24edca77855e2911bb8c0dd545ca`.
+The four-vCPU schema-v3 run passed with all 18 evidence events, observed mask
+255, candidate SHA-256
+`05f075a5c3081f2954f819843baa8bbf3c5c7cffb13ababbfcbe50905a25ba42`,
+and exact operation-specific TLB/rendezvous acknowledgement validation.
+Results are preserved at
+`artifacts/dw0-i1/accepted-dw-f8117bbe__wyr-b90b056__rust-a92dc7f7/default/runs/default/result.json`
+and
+`artifacts/dw0-i1/checkpoint-dw-f8117bbe__wyr-b90b056__rust-a92dc7f7-evidence-live/runs/smp/result.json`.
+
+I2 is closed on Deepwyrm `18b59ef6f7b20e3ebf1abc8b793452cb22c5f2c6`,
+Wyrmroot `e6072c94c678f97ea5993285346408537e5c28a0`, and the same Rust revision.
+Five consecutive unchanged four-vCPU runs passed with candidate SHA-256
+`56670e4a01b6d766c45bfd27a858ae671cbd12066fef439209287e5c253ef2fc`.
+Their structured results are preserved under
+`artifacts/dw0-i2/checkpoint-dw-18b59ef__wyr-e6072c9__rust-a92dc7f7-live-7/repeats/pass-1`
+through `pass-5`.
