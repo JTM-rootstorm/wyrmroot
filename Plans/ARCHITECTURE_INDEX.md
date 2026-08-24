@@ -24,6 +24,7 @@ This file defines the minimum architecture reading set for Wyrmroot implementati
   parser, lookup, content-manifest, or archive-intake behavior.
 - [`Plans/WYR0_D0_PRIMORDIAL_STARTUP_CONTRACT.md`](WYR0_D0_PRIMORDIAL_STARTUP_CONTRACT.md) defines the paired native startup stack/register, bootstrap Channel wire/role, capability-validation, bootfs mapping/lifetime, and READY/exit contract. Read it before WYR0-D implementation.
 - [`Plans/WYR0_E0_USERSPACE_PROCESS_LOADING_CONTRACT.md`](WYR0_E0_USERSPACE_PROCESS_LOADING_CONTRACT.md) defines the paired static ELF subset, userspace child-construction transaction, capability delegation, rollback, readiness, and exit-observation contract. Read it before WYR0-E/F/G implementation.
+- [`Plans/WYR0_I_NATIVE_CAPABILITY_CONTRACT.md`](WYR0_I_NATIVE_CAPABILITY_CONTRACT.md) defines the generic WYR0-I native capability, bounded supervision/restart, readiness accounting/enforcement classification, peer/generation, and evidence contract. Read it before WYR0-I B/C/D/E/F implementation or any later consumer relies on the DW0-H/WYR0-I capability certificate.
 
 ## Authority rules
 
