@@ -1,5 +1,5 @@
 #![no_std]
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 //! Selector-specific, bounded I2 syscall stress payload.
 //!
@@ -10,11 +10,12 @@
 use deepwyrm_syscall::{
     self, DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE, DW_ADDRESS_REGION_MAP_ARGS_V1_VERSION,
     DW_MEMORY_PROTECTION_READ, DW_MEMORY_PROTECTION_WRITE, DW_RIGHT_DUPLICATE, DW_RIGHT_EXECUTE,
-    DW_RIGHT_INSPECT, DW_RIGHT_MAP, DW_RIGHT_READ, DW_RIGHT_TRANSFER, DW_RIGHT_WAIT,
-    DW_RIGHT_WRITE, DW_SIGNAL_EXITED, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DW_STATUS_SUCCESS,
-    DW_STATUS_TIMED_OUT, DwAddressRegionMapArgsV1, DwAddressRegionMapFlags, DwDeadline, DwHandle,
-    DwHandleTransferV1, DwMemoryObjectCreateFlags, DwMemoryProtection, DwOffset,
-    DwReceivedHandleInfoV1, DwRights, DwSize, DwUserAddress, DwWaitResultV1,
+    DW_RIGHT_INSPECT, DW_RIGHT_MAP, DW_RIGHT_MODIFY, DW_RIGHT_READ, DW_RIGHT_TRANSFER,
+    DW_RIGHT_WAIT, DW_RIGHT_WRITE, DW_SIGNAL_EXITED, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE,
+    DW_SIGNAL_SIGNALED, DW_STATUS_SUCCESS, DW_STATUS_TIMED_OUT, DW_STATUS_WOULD_BLOCK,
+    DwAddressRegionMapArgsV1, DwAddressRegionMapFlags, DwDeadline, DwHandle, DwHandleTransferV1,
+    DwMemoryObjectCreateFlags, DwMemoryProtection, DwOffset, DwReceivedHandleInfoV1, DwRights,
+    DwSize, DwUserAddress, DwWaitResultV1,
 };
 use wyrmroot_bootfs::archive::Archive;
 use wyrmroot_loader::launch::{HEADER_BYTES, INIT0_BYTES, LaunchProfile, encode_ready, parse_init};
@@ -28,6 +29,7 @@ use wyrmroot_runtime::{
 /// Fixed input that makes a failure record reproducible without randomized host state.
 pub const I2_SEED: u32 = 0x49_32_53_54;
 const ITERATIONS: usize = 32;
+const BACKPRESSURE_LIMIT: usize = 256;
 const PAGE: u64 = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -87,11 +89,9 @@ pub fn run_i2_stress(channel: DwHandle) -> Result<(), u32> {
 
     exercise_handles_and_transfer(bootfs)?;
     exercise_channels_and_waits()?;
+    exercise_event_timer_and_atomic()?;
     exercise_mapping(root)?;
     exercise_lifecycle(root, bootfs, task_group)?;
-    // The generated ABI exposes no cancel operation and the pinned syscall crate
-    // lacks Event/Timer wrappers.  Deadline-backed wait and peer-close terminal
-    // retirement below are the closest live operations available to this payload.
     close_handle(root).map_err(|_| failure(Stage::Lifecycle, 1))?;
     close_handle(bootfs).map_err(|_| failure(Stage::Lifecycle, 2))?;
     close_handle(task_group).map_err(|_| failure(Stage::Lifecycle, 3))?;
@@ -175,6 +175,28 @@ fn exercise_channels_and_waits() -> Result<(), u32> {
             return Err(failure(Stage::Channel, 4));
         }
     }
+    let mut filled = 0;
+    while filled < BACKPRESSURE_LIMIT {
+        let status = deepwyrm_syscall::channel_send(first, &[filled as u8], &[], 0);
+        if status == DW_STATUS_WOULD_BLOCK {
+            break;
+        }
+        success(status, Stage::Channel, 7)?;
+        filled += 1;
+    }
+    if filled == BACKPRESSURE_LIMIT {
+        return Err(failure(Stage::Channel, 8));
+    }
+    for _ in 0..filled {
+        let mut bytes = [0_u8; 1];
+        let mut handles = [];
+        let mut receive = deepwyrm_syscall::DwChannelReceiveResultV1::default();
+        success(
+            deepwyrm_syscall::channel_receive(second, &mut bytes, &mut handles, &mut receive),
+            Stage::Channel,
+            9,
+        )?;
+    }
     let mut timeout = DwWaitResultV1::default();
     if deepwyrm_syscall::wait_one(
         second,
@@ -198,6 +220,63 @@ fn exercise_channels_and_waits() -> Result<(), u32> {
         3,
     )?;
     close_handle(second).map_err(|_| failure(Stage::Channel, 6))
+}
+
+fn exercise_event_timer_and_atomic() -> Result<(), u32> {
+    let mut event = DwHandle(0);
+    let event_rights =
+        DwRights(DW_RIGHT_WAIT.0 | deepwyrm_syscall::DW_RIGHT_SIGNAL.0 | DW_RIGHT_INSPECT.0);
+    raw::event_create(event_rights, &mut event).map_err(|_| failure(Stage::Wait, 10))?;
+    raw::event_signal(event, deepwyrm_syscall::DwSignals(0), DW_SIGNAL_SIGNALED)
+        .map_err(|_| failure(Stage::Wait, 11))?;
+    let mut result = DwWaitResultV1::default();
+    success(
+        deepwyrm_syscall::wait_one(
+            event,
+            DW_SIGNAL_SIGNALED,
+            future_deadline(1_000_000)?,
+            &mut result,
+        ),
+        Stage::Wait,
+        12,
+    )?;
+    raw::event_signal(event, DW_SIGNAL_SIGNALED, deepwyrm_syscall::DwSignals(0))
+        .map_err(|_| failure(Stage::Wait, 13))?;
+    close_handle(event).map_err(|_| failure(Stage::Wait, 14))?;
+    let mut timer = DwHandle(0);
+    let timer_rights = DwRights(DW_RIGHT_WAIT.0 | DW_RIGHT_MODIFY.0 | DW_RIGHT_INSPECT.0);
+    raw::timer_create(timer_rights, &mut timer).map_err(|_| failure(Stage::Wait, 15))?;
+    for _ in 0..3 {
+        raw::timer_set(timer, future_deadline(1_000_000)?).map_err(|_| failure(Stage::Wait, 16))?;
+        let mut timer_result = DwWaitResultV1::default();
+        success(
+            deepwyrm_syscall::wait_one(
+                timer,
+                DW_SIGNAL_SIGNALED,
+                future_deadline(10_000_000)?,
+                &mut timer_result,
+            ),
+            Stage::Wait,
+            17,
+        )?;
+    }
+    raw::timer_set(timer, future_deadline(10_000_000)?).map_err(|_| failure(Stage::Wait, 18))?;
+    raw::timer_cancel(timer).map_err(|_| failure(Stage::Wait, 19))?;
+    close_handle(timer).map_err(|_| failure(Stage::Wait, 20))?;
+    let word = 1_u32;
+    if raw::atomic_wait32(&word, 0, future_deadline(1_000_000)?) != DW_STATUS_WOULD_BLOCK {
+        return Err(failure(Stage::Wait, 21));
+    }
+    let mut woken = 1_u32;
+    raw::atomic_wake(&word, 0, &mut woken).map_err(|_| failure(Stage::Wait, 22))?;
+    if woken != 0 {
+        return Err(failure(Stage::Wait, 23));
+    }
+    raw::atomic_wake(&word, 1, &mut woken).map_err(|_| failure(Stage::Wait, 24))?;
+    if woken != 0 {
+        return Err(failure(Stage::Wait, 25));
+    }
+    Ok(())
 }
 
 fn exercise_mapping(root: DwHandle) -> Result<(), u32> {
@@ -235,6 +314,8 @@ fn exercise_mapping(root: DwHandle) -> Result<(), u32> {
         Stage::Mapping,
         2,
     )?;
+    // Mapping captures its authority ceiling; finalization must wait for unmap.
+    close_handle(memory).map_err(|_| failure(Stage::Mapping, 3))?;
     success(
         deepwyrm_syscall::address_region_protect(
             root,
@@ -243,14 +324,14 @@ fn exercise_mapping(root: DwHandle) -> Result<(), u32> {
             DW_MEMORY_PROTECTION_READ,
         ),
         Stage::Mapping,
-        3,
+        4,
     )?;
     success(
         deepwyrm_syscall::address_region_unmap(root, address, DwSize(PAGE)),
         Stage::Mapping,
-        4,
+        5,
     )?;
-    close_handle(memory).map_err(|_| failure(Stage::Mapping, 5))
+    Ok(())
 }
 
 fn exercise_lifecycle(root: DwHandle, bootfs: DwHandle, task_group: DwHandle) -> Result<(), u32> {
@@ -371,6 +452,105 @@ fn success(status: deepwyrm_syscall::DwStatus, stage: Stage, operation: u16) -> 
         Ok(())
     } else {
         Err(failure(stage, operation))
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "I2-only generated-wrapper gap: this is the sole audited raw syscall boundary and uses only generated Deepwyrm exports."
+)]
+mod raw {
+    use deepwyrm_syscall::{
+        self, DW_STATUS_SUCCESS, DwDeadline, DwHandle, DwRights, DwSignals, DwStatus, DwSyscallId,
+    };
+
+    unsafe extern "C" {
+        fn dw_syscall6(
+            number: u64,
+            arg0: u64,
+            arg1: u64,
+            arg2: u64,
+            arg3: u64,
+            arg4: u64,
+            arg5: u64,
+        ) -> i64;
+    }
+    fn call(id: DwSyscallId, args: [u64; 6]) -> DwStatus {
+        // SAFETY: wrappers supply generated scalar arguments and borrow locals for the entire call.
+        unsafe {
+            DwStatus(dw_syscall6(
+                id.0.into(),
+                args[0],
+                args[1],
+                args[2],
+                args[3],
+                args[4],
+                args[5],
+            ) as i32)
+        }
+    }
+    fn result(status: DwStatus) -> Result<(), DwStatus> {
+        if status == DW_STATUS_SUCCESS {
+            Ok(())
+        } else {
+            Err(status)
+        }
+    }
+    pub fn event_create(rights: DwRights, out: &mut DwHandle) -> Result<(), DwStatus> {
+        result(call(
+            deepwyrm_syscall::DW_SYSCALL_EVENT_CREATE,
+            [rights.0, core::ptr::from_mut(out) as u64, 0, 0, 0, 0],
+        ))
+    }
+    pub fn event_signal(event: DwHandle, clear: DwSignals, set: DwSignals) -> Result<(), DwStatus> {
+        result(call(
+            deepwyrm_syscall::DW_SYSCALL_EVENT_SIGNAL,
+            [event.0, clear.0, set.0, 0, 0, 0],
+        ))
+    }
+    pub fn timer_create(rights: DwRights, out: &mut DwHandle) -> Result<(), DwStatus> {
+        result(call(
+            deepwyrm_syscall::DW_SYSCALL_TIMER_CREATE,
+            [rights.0, core::ptr::from_mut(out) as u64, 0, 0, 0, 0],
+        ))
+    }
+    pub fn timer_set(timer: DwHandle, deadline: DwDeadline) -> Result<(), DwStatus> {
+        result(call(
+            deepwyrm_syscall::DW_SYSCALL_TIMER_SET,
+            [timer.0, deadline.0, 0, 0, 0, 0],
+        ))
+    }
+    pub fn timer_cancel(timer: DwHandle) -> Result<(), DwStatus> {
+        result(call(
+            deepwyrm_syscall::DW_SYSCALL_TIMER_CANCEL,
+            [timer.0, 0, 0, 0, 0, 0],
+        ))
+    }
+    pub fn atomic_wait32(word: &u32, expected: u32, deadline: DwDeadline) -> DwStatus {
+        call(
+            deepwyrm_syscall::DW_SYSCALL_ATOMIC_WAIT32,
+            [
+                core::ptr::from_ref(word) as u64,
+                u64::from(expected),
+                deadline.0,
+                0,
+                0,
+                0,
+            ],
+        )
+    }
+    pub fn atomic_wake(word: &u32, count: u32, out: &mut u32) -> Result<(), DwStatus> {
+        result(call(
+            deepwyrm_syscall::DW_SYSCALL_ATOMIC_WAKE,
+            [
+                core::ptr::from_ref(word) as u64,
+                u64::from(count),
+                core::ptr::from_mut(out) as u64,
+                0,
+                0,
+                0,
+            ],
+        ))
     }
 }
 

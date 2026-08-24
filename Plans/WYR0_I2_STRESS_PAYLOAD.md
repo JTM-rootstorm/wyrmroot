@@ -24,8 +24,12 @@ existing structured Process exit and the selector's terminal result.
   through a new Channel, receives and closes it, then proves the closed value
   is stale by querying it.
 - Channel/wait stage sends and receives bounded datagrams, observes READABLE,
-  verifies a finite active-monotonic timeout, and observes PEER_CLOSED after
-  closing the peer.
+  fills the queue until the exact `WOULD_BLOCK` backpressure status then drains
+  it, verifies a finite active-monotonic timeout, and observes PEER_CLOSED.
+- The I2-only audited raw boundary uses generated syscall IDs/types to create,
+  set, reset, and wait on a manual Event; it also creates, arms, waits, and
+  cancels a one-shot Timer for three finite deadline cycles. Atomic mismatch
+  and bounded zero/one wake calls exercise the generated atomic wait/wake path.
 - Mapping stage creates a page-backed MemoryObject, maps it RW through the
   delegated root, reduces it to R with `address_region_protect`, unmaps it, and
   closes the object.
@@ -36,17 +40,12 @@ existing structured Process exit and the selector's terminal result.
 
 ## Explicit present limits
 
-The pinned generated ABI has `atomic_wait32`/`atomic_wake` but no safe wrapper
-in `deepwyrm-syscall`; it has Event/Timer object definitions, but the pinned
-consumer crate does not expose `event_create`, `event_signal`, or timer setup.
-It also has no standalone wait-cancellation syscall.  I2 consequently uses
-the closest available real primitives: Channel level signals, finite
-active-monotonic deadlines, peer-close, structured child terminal state, and
-authorized process termination.  Remote address-space residency, exception
-child delivery, subtree-authority rejection, queue backpressure saturation,
-and PM-timer idle/wake cycles require either existing test-support wrappers or
-the paired Deepwyrm selector implementation; they are deliberately not faked
-by this payload.
+The raw boundary exists only because the pinned safe consumer lacks wrappers
+for Event/Timer/atomic operations; it does not define a public API or copy ABI
+numbers/layouts. The remaining unimplemented cases are exception-child launch,
+cross-process atomic wake correlation, concurrent live children, task-group
+subtree rejection, and remote-residency teardown. They need a distinct leaf
+mode or selector support and are deliberately not faked.
 
 ## Build selection
 
