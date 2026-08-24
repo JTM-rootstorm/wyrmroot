@@ -91,6 +91,7 @@ pub fn run_i2_stress(channel: DwHandle) -> Result<(), u32> {
     exercise_channels_and_waits()?;
     exercise_event_timer_and_atomic()?;
     exercise_mapping(root)?;
+    exercise_task_groups(task_group, bootfs)?;
     exercise_lifecycle(root, bootfs, task_group)?;
     close_handle(root).map_err(|_| failure(Stage::Lifecycle, 1))?;
     close_handle(bootfs).map_err(|_| failure(Stage::Lifecycle, 2))?;
@@ -334,6 +335,37 @@ fn exercise_mapping(root: DwHandle) -> Result<(), u32> {
     Ok(())
 }
 
+fn exercise_task_groups(parent: DwHandle, wrong_type: DwHandle) -> Result<(), u32> {
+    let rights = DwRights(
+        DW_RIGHT_MODIFY.0 | DW_RIGHT_DUPLICATE.0 | DW_RIGHT_TRANSFER.0 | DW_RIGHT_INSPECT.0,
+    );
+    let mut child = DwHandle(0);
+    if raw::task_group_create(parent, rights, &mut child) != DW_STATUS_SUCCESS {
+        return Err(failure(Stage::Lifecycle, 30));
+    }
+    raw::task_group_terminate(child, deepwyrm_syscall::DW_TERMINATION_AUTHORIZED)
+        .map_err(|_| failure(Stage::Lifecycle, 31))?;
+    close_handle(child).map_err(|_| failure(Stage::Lifecycle, 32))?;
+    let mut rejected = DwHandle(0);
+    if raw::task_group_create(wrong_type, rights, &mut rejected)
+        != deepwyrm_syscall::DW_STATUS_WRONG_OBJECT_TYPE
+    {
+        return Err(failure(Stage::Lifecycle, 33));
+    }
+    let mut reduced = DwHandle(0);
+    success(
+        deepwyrm_syscall::handle_duplicate(parent, DW_RIGHT_INSPECT, &mut reduced),
+        Stage::Lifecycle,
+        34,
+    )?;
+    if raw::task_group_create(reduced, rights, &mut rejected)
+        != deepwyrm_syscall::DW_STATUS_ACCESS_DENIED
+    {
+        return Err(failure(Stage::Lifecycle, 35));
+    }
+    close_handle(reduced).map_err(|_| failure(Stage::Lifecycle, 36))
+}
+
 fn exercise_lifecycle(root: DwHandle, bootfs: DwHandle, task_group: DwHandle) -> Result<(), u32> {
     let bytes = query_memory_object_size(bootfs).map_err(|_| failure(Stage::Lifecycle, 10))?;
     let plan = MappingPlan::for_bootfs(bytes).map_err(|_| failure(Stage::Lifecycle, 11))?;
@@ -550,6 +582,21 @@ mod raw {
                 0,
                 0,
             ],
+        ))
+    }
+    pub fn task_group_create(parent: DwHandle, rights: DwRights, out: &mut DwHandle) -> DwStatus {
+        call(
+            deepwyrm_syscall::DW_SYSCALL_TASK_GROUP_CREATE,
+            [parent.0, rights.0, core::ptr::from_mut(out) as u64, 0, 0, 0],
+        )
+    }
+    pub fn task_group_terminate(
+        group: DwHandle,
+        reason: deepwyrm_syscall::DwTerminationReason,
+    ) -> Result<(), DwStatus> {
+        result(call(
+            deepwyrm_syscall::DW_SYSCALL_TASK_GROUP_TERMINATE,
+            [group.0, u64::from(reason.0), 0, 0, 0, 0],
         ))
     }
 }
