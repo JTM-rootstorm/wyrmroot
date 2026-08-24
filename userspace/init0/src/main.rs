@@ -66,7 +66,7 @@ fn init0_main(startup: StartupBlock<'_>) -> u32 {
     let mut system = NativeSystem;
     let deadline = match monotonic_deadline_after(HELLO_DEADLINE_NS) {
         Ok(deadline) => deadline,
-        Err(_) => return 1,
+        Err(error) => return 0x1400_0000 | wyrmroot_runtime::native_error_code(error),
     };
     match run_init0(
         &mut system,

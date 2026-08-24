@@ -196,7 +196,7 @@ fn panic(_info: &PanicInfo<'_>) -> ! {
 fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
     let deadline = match monotonic_deadline_after(BOOTSTRAP_SUPERVISION_TIMEOUT_NS) {
         Ok(deadline) => deadline,
-        Err(_) => return 1,
+        Err(error) => return 0xB300_0000 | wyrmroot_runtime::native_error_code(error),
     };
     let mut system = NativeSystem::new();
     let mut loader = NativeLoaderPlatform;

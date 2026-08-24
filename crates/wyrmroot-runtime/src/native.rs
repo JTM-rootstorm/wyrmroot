@@ -48,6 +48,32 @@ pub enum NativeError {
     Output(NativeOutputError),
 }
 
+/// Encodes a native status or malformed-output classification into a bounded
+/// 16-bit diagnostic value. Bit 15 distinguishes output-contract failures;
+/// status magnitudes saturate below that bit.
+#[must_use]
+pub const fn native_error_code(error: NativeError) -> u32 {
+    match error {
+        NativeError::Status(status) => {
+            let code = status.0.unsigned_abs();
+            if code > 0x7fff { 0x7fff } else { code }
+        }
+        NativeError::Output(output) => {
+            0x8000
+                | match output {
+                    NativeOutputError::InvalidObjectInfo => 1,
+                    NativeOutputError::InvalidMemoryObjectInfo => 2,
+                    NativeOutputError::InvalidChannelReceive => 3,
+                    NativeOutputError::InvalidMappedRange => 4,
+                    NativeOutputError::InvalidLoaderOutput => 5,
+                    NativeOutputError::InvalidWaitResult => 6,
+                    NativeOutputError::InvalidTaskTerminationInfo => 7,
+                    NativeOutputError::DeadlineOverflow => 8,
+                }
+        }
+    }
+}
+
 /// Exact byte and handle counts produced by one successful Channel receive.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReceiveCounts {
@@ -466,6 +492,19 @@ mod tests {
         assert_eq!(require_success(DW_STATUS_SUCCESS), Ok(()));
         let failure = DwStatus(-77);
         assert_eq!(require_success(failure), Err(NativeError::Status(failure)));
+    }
+
+    #[test]
+    fn native_error_diagnostics_preserve_status_and_output_classes() {
+        assert_eq!(native_error_code(NativeError::Status(DwStatus(-77))), 77);
+        assert_eq!(
+            native_error_code(NativeError::Status(DwStatus(i32::MIN))),
+            0x7fff
+        );
+        assert_eq!(
+            native_error_code(NativeError::Output(NativeOutputError::DeadlineOverflow)),
+            0x8008
+        );
     }
 
     #[test]
