@@ -71,6 +71,18 @@ pub fn run_i2_stress(channel: DwHandle) -> Result<(), u32> {
         let size = encode_ready(leaf.transaction_id, &mut ready)
             .map_err(|_| failure(Stage::Bootstrap, 3))?;
         send_channel(channel, &ready[..size], &[]).map_err(|_| failure(Stage::Bootstrap, 4))?;
+        if leaf.transaction_id == 0x2204 {
+            illegal_instruction();
+        }
+        if leaf.transaction_id == 0x2202 || leaf.transaction_id == 0x2203 {
+            let mut command = [0_u8; 4];
+            let mut none = [];
+            let command_received = receive_channel(channel, &mut command, &mut none)
+                .map_err(|_| failure(Stage::Bootstrap, 11))?;
+            if command_received.bytes != 4 || command != *b"exit" {
+                return Err(failure(Stage::Bootstrap, 12));
+            }
+        }
         return close_handle(channel).map_err(|_| failure(Stage::Bootstrap, 5));
     }
 
@@ -101,6 +113,15 @@ pub fn run_i2_stress(channel: DwHandle) -> Result<(), u32> {
         .map_err(|_| failure(Stage::Bootstrap, 8))?;
     send_channel(channel, &ready[..size], &[]).map_err(|_| failure(Stage::Bootstrap, 9))?;
     close_handle(channel).map_err(|_| failure(Stage::Bootstrap, 10))
+}
+
+#[allow(
+    unsafe_code,
+    reason = "I2-only exception child deliberately executes UD2 after a valid READY to exercise structured terminal exception handling."
+)]
+fn illegal_instruction() -> ! {
+    // SAFETY: this is an explicit test-only terminal fault. Deepwyrm must convert it into the generated structured illegal-instruction termination record.
+    unsafe { core::arch::asm!("ud2", options(noreturn)) }
 }
 
 fn exercise_handles_and_transfer(bootfs: DwHandle) -> Result<(), u32> {
@@ -409,9 +430,10 @@ fn exercise_lifecycle(root: DwHandle, bootfs: DwHandle, task_group: DwHandle) ->
         close_handle(normal.process).map_err(|_| failure(Stage::Lifecycle, 19))?;
         normal_result.map_err(|_| failure(Stage::Lifecycle, 20))?;
 
-        // A second genuine created-and-started child is terminated through its Process handle.
-        // Either successful authorization or an already-terminal BAD_STATE is a valid bounded race.
-        let terminated = load_process(
+        // Start two held leaves before either is supervised.  The first remains
+        // running until explicit termination; the second exits only after its
+        // launch-channel command, so this is a real overlapping-root teardown.
+        let held = load_process(
             &mut loader,
             authority,
             LoadRequest {
@@ -422,27 +444,82 @@ fn exercise_lifecycle(root: DwHandle, bootfs: DwHandle, task_group: DwHandle) ->
             },
         )
         .map_err(|_| failure(Stage::Lifecycle, 21))?;
+        let released = load_process(
+            &mut loader,
+            authority,
+            LoadRequest {
+                image: entry.data(),
+                display_path: display,
+                profile: LaunchProfile::Hello,
+                transaction_id: 0x2203,
+            },
+        )
+        .map_err(|_| failure(Stage::Lifecycle, 22))?;
+        send_channel(released.launch_channel, b"exit", &[])
+            .map_err(|_| failure(Stage::Lifecycle, 23))?;
         let status = deepwyrm_syscall::process_terminate(
-            terminated.process,
+            held.process,
             deepwyrm_syscall::DW_TERMINATION_AUTHORIZED,
             I2_SEED,
         );
         if status != DW_STATUS_SUCCESS && status != deepwyrm_syscall::DW_STATUS_BAD_STATE {
-            return Err(failure(Stage::Lifecycle, 22));
+            return Err(failure(Stage::Lifecycle, 24));
         }
         let mut terminal = DwWaitResultV1::default();
         success(
             deepwyrm_syscall::wait_one(
-                terminated.process,
+                held.process,
                 DW_SIGNAL_EXITED,
                 future_deadline(5_000_000)?,
                 &mut terminal,
             ),
             Stage::Lifecycle,
-            23,
+            25,
         )?;
-        close_handle(terminated.launch_channel).map_err(|_| failure(Stage::Lifecycle, 24))?;
-        close_handle(terminated.process).map_err(|_| failure(Stage::Lifecycle, 25))
+        close_handle(held.launch_channel).map_err(|_| failure(Stage::Lifecycle, 26))?;
+        close_handle(held.process).map_err(|_| failure(Stage::Lifecycle, 27))?;
+        let released_result = supervise_native_child(
+            released.process,
+            released.launch_channel,
+            0x2203,
+            future_deadline(5_000_000)?,
+        );
+        close_handle(released.launch_channel).map_err(|_| failure(Stage::Lifecycle, 28))?;
+        close_handle(released.process).map_err(|_| failure(Stage::Lifecycle, 29))?;
+        released_result.map_err(|_| failure(Stage::Lifecycle, 40))?;
+
+        let exception = load_process(
+            &mut loader,
+            authority,
+            LoadRequest {
+                image: entry.data(),
+                display_path: display,
+                profile: LaunchProfile::Hello,
+                transaction_id: 0x2204,
+            },
+        )
+        .map_err(|_| failure(Stage::Lifecycle, 41))?;
+        let mut exception_wait = DwWaitResultV1::default();
+        success(
+            deepwyrm_syscall::wait_one(
+                exception.process,
+                DW_SIGNAL_EXITED,
+                future_deadline(5_000_000)?,
+                &mut exception_wait,
+            ),
+            Stage::Lifecycle,
+            42,
+        )?;
+        let info = wyrmroot_runtime::query_task_termination_info(exception.process)
+            .map_err(|_| failure(Stage::Lifecycle, 43))?;
+        if info.state != deepwyrm_syscall::DW_TASK_STATE_EXITED
+            || info.reason != deepwyrm_syscall::DW_TERMINATION_UNHANDLED_EXCEPTION
+            || info.exception_type != deepwyrm_syscall::DW_EXCEPTION_ILLEGAL_INSTRUCTION
+        {
+            return Err(failure(Stage::Lifecycle, 44));
+        }
+        close_handle(exception.launch_channel).map_err(|_| failure(Stage::Lifecycle, 45))?;
+        close_handle(exception.process).map_err(|_| failure(Stage::Lifecycle, 46))
     });
     let unmap = unmap_bootfs(mapping).map_err(|_| failure(Stage::Lifecycle, 26));
     result?;

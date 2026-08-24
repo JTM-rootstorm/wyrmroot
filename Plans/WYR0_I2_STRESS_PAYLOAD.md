@@ -35,17 +35,19 @@ existing structured Process exit and the selector's terminal result.
   closes the object.
 - Lifecycle stage maps the immutable bootfs, uses the normal Wyrmroot loader
   to create/start a no-capability leaf copy of the payload, supervises normal
-  READY/exit, then creates/starts a second leaf and issues a real authorized
-  Process termination before waiting for terminal retirement.
+  READY/exit, then starts two command-held leaves before terminating one and
+  releasing/supervising the other. A third transaction-selected leaf emits a
+  valid READY then executes the narrow test-only `UD2`; its generated EXITED
+  record must report `UNHANDLED_EXCEPTION` plus `ILLEGAL_INSTRUCTION`.
 
 ## Explicit present limits
 
 The raw boundary exists only because the pinned safe consumer lacks wrappers
 for Event/Timer/atomic operations; it does not define a public API or copy ABI
-numbers/layouts. The remaining unimplemented cases are exception-child launch,
-cross-process atomic wake correlation, concurrent live children, task-group
-subtree rejection, and remote-residency teardown. They need a distinct leaf
-mode or selector support and are deliberately not faked.
+numbers/layouts. Cross-process Event/atomic correlation remains unimplemented:
+the launch-channel command protocol establishes the two-live-child overlap but
+does not transfer a shared Event or atomic address, so no such correlation is
+claimed.
 
 ## Build selection
 
