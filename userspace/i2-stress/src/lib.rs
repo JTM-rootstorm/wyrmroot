@@ -47,7 +47,7 @@ pub enum Stage {
 /// Bits 31..24 identify I2, 23..16 the stage, and 15..0 the failing operation.
 #[must_use]
 pub const fn failure(stage: Stage, operation: u16) -> u32 {
-    0x22_00_0000 | ((stage as u32) << 16) | operation as u32
+    0x2200_0000 | ((stage as u32) << 16) | operation as u32
 }
 
 /// Runs as either the I2 controller (`I2Stress` INIT) or a normal no-capability
