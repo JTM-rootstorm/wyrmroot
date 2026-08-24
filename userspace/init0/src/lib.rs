@@ -19,9 +19,10 @@ use wyrmroot_loader::{
 };
 use wyrmroot_runtime::{
     BOOTFS_EXPECTATION, BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, CapabilityValidationError,
-    InitCapability, LOADER_TASK_GROUP_EXPECTATION, MappingPlan, MappingPlanError, NativeError,
-    ReceiveCounts, SELF_ROOT_EXPECTATION, SupervisionError, SupervisionPlatform, supervise_child,
-    validate_bootstrap_channel, validate_init_capabilities_v2,
+    ExitObservedReadinessError, ExitValidationError, InitCapability, LOADER_TASK_GROUP_EXPECTATION,
+    MappingPlan, MappingPlanError, NativeError, ReceiveCounts, SELF_ROOT_EXPECTATION,
+    SupervisionError, SupervisionPlatform, supervise_child, validate_bootstrap_channel,
+    validate_init_capabilities_v2,
 };
 
 /// The only bootfs path selected by the WYR0-G descendant smoke chain.
@@ -119,7 +120,7 @@ impl Init0Error {
             Self::Supervision(SupervisionError::Exit(
                 wyrmroot_runtime::ExitValidationError::NonzeroApplicationCode(code),
             )) => *code,
-            Self::Supervision(_) => PREFIX | 0x0200,
+            Self::Supervision(error) => supervision_exit_code(error),
             Self::Cleanup(error) => cleanup_exit_code(*error),
             Self::MissingLoadedProcess => PREFIX | 0x0301,
         }
@@ -134,6 +135,56 @@ const fn cleanup_exit_code(error: NativeError) -> u32 {
     match error {
         NativeError::Status(status) => PREFIX | bounded_status_code(status.0.unsigned_abs()),
         NativeError::Output(output) => PREFIX | 0x8000 | native_output_code(output),
+    }
+}
+
+/// Encodes bounded child-supervision failures without collapsing the exact
+/// wait, readiness, or terminal-record stage. The `0x13` high byte is
+/// init0-owned; bits 23..16 identify the supervision stage and the low 16 bits
+/// retain a bounded native or protocol cause where one exists.
+const fn supervision_exit_code(error: &SupervisionError<NativeError>) -> u32 {
+    const PREFIX: u32 = 0x1300_0000;
+    match error {
+        SupervisionError::UnboundedDeadline => PREFIX | 0x0001_0000,
+        SupervisionError::Platform(error) => PREFIX | 0x0002_0000 | native_error_code(*error),
+        SupervisionError::ExitQuery(error) => PREFIX | 0x0003_0000 | native_error_code(*error),
+        SupervisionError::InvalidWaitResult => PREFIX | 0x0004_0000,
+        SupervisionError::InvalidReadyReceive(_) => PREFIX | 0x0005_0000,
+        SupervisionError::Ready(error) => PREFIX | 0x0006_0000 | launch_error_code(*error),
+        SupervisionError::ExitedBeforeReady => PREFIX | 0x0007_0000,
+        SupervisionError::PeerClosedBeforeReady => PREFIX | 0x0008_0000,
+        SupervisionError::DuplicateReady => PREFIX | 0x0009_0000,
+        SupervisionError::Exit(error) => PREFIX | 0x000A_0000 | exit_validation_code(*error),
+        SupervisionError::ExitObservedReadiness(error) => {
+            PREFIX | 0x000B_0000 | exit_observed_readiness_code(error)
+        }
+    }
+}
+
+const fn native_error_code(error: NativeError) -> u32 {
+    match error {
+        NativeError::Status(status) => bounded_status_code(status.0.unsigned_abs()),
+        NativeError::Output(output) => 0x8000 | native_output_code(output),
+    }
+}
+
+const fn exit_validation_code(error: ExitValidationError) -> u32 {
+    match error {
+        ExitValidationError::InvalidEnvelope => 1,
+        ExitValidationError::NotExited => 2,
+        ExitValidationError::NotNormalExit => 3,
+        ExitValidationError::NonzeroApplicationCode(_) => 4,
+        ExitValidationError::NonzeroExceptionFields => 5,
+    }
+}
+
+const fn exit_observed_readiness_code(error: &ExitObservedReadinessError<NativeError>) -> u32 {
+    match error {
+        ExitObservedReadinessError::Platform(error) => 0x1000 | native_error_code(*error),
+        ExitObservedReadinessError::InvalidWaitResult => 0x2000,
+        ExitObservedReadinessError::InvalidReadyReceive(_) => 0x3000,
+        ExitObservedReadinessError::Ready(error) => 0x4000 | launch_error_code(*error),
+        ExitObservedReadinessError::DuplicateReady => 0x5000,
     }
 }
 

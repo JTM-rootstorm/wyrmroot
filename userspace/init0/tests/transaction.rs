@@ -18,9 +18,9 @@ use wyrmroot_loader::{
     },
 };
 use wyrmroot_runtime::{
-    BOOTFS_EXPECTATION, BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo,
-    LOADER_TASK_GROUP_EXPECTATION, MappingPlan, NativeError, NativeOutputError, ReceiveCounts,
-    SELF_ROOT_EXPECTATION, SupervisionPlatform,
+    BOOTFS_EXPECTATION, BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, ExitObservedReadinessError,
+    ExitValidationError, LOADER_TASK_GROUP_EXPECTATION, MappingPlan, NativeError,
+    NativeOutputError, ReceiveCounts, SELF_ROOT_EXPECTATION, SupervisionError, SupervisionPlatform,
 };
 
 const CHANNEL: DwHandle = DwHandle(11);
@@ -54,9 +54,27 @@ fn live_exit_code_identifies_init0_owned_failure() {
         0x1200_0049
     );
     assert_eq!(
-        Init0Error::Cleanup(NativeError::Output(NativeOutputError::InvalidWaitResult))
-            .exit_code(),
+        Init0Error::Cleanup(NativeError::Output(NativeOutputError::InvalidWaitResult)).exit_code(),
         0x1200_8006
+    );
+    assert_eq!(
+        Init0Error::Supervision(SupervisionError::Platform(NativeError::Status(DwStatus(
+            -7
+        ))))
+        .exit_code(),
+        0x1302_0007
+    );
+    assert_eq!(
+        Init0Error::Supervision(SupervisionError::Exit(ExitValidationError::NotNormalExit,))
+            .exit_code(),
+        0x130A_0003
+    );
+    assert_eq!(
+        Init0Error::Supervision(SupervisionError::ExitObservedReadiness(
+            ExitObservedReadinessError::Ready(LaunchError::TransactionMismatch),
+        ))
+        .exit_code(),
+        0x130B_4009
     );
 }
 
