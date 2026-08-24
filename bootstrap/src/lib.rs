@@ -355,7 +355,9 @@ pub const I0_NEGATIVE_CAPABILITY_RIGHTS_DETAIL: u32 = 0xB000_0405;
 /// produced its exact expected failure.  `None` preserves the real diagnostic
 /// for every unexpected error.
 pub fn i0_negative_terminal_detail(fault: LoadFault, error: &BootstrapError) -> Option<u32> {
-    use wyrmroot_runtime::{ExitValidationError, SupervisionError};
+    use wyrmroot_runtime::{
+        ExitValidationError, StartupError, SupervisionError, startup_error_exit_code,
+    };
 
     match (fault, error) {
         (
@@ -365,9 +367,11 @@ pub fn i0_negative_terminal_detail(fault: LoadFault, error: &BootstrapError) -> 
         (
             LoadFault::MalformedStartup,
             BootstrapError::Supervision(SupervisionError::Exit(
-                ExitValidationError::NonzeroApplicationCode(1),
+                ExitValidationError::NonzeroApplicationCode(code),
             )),
-        ) => Some(I0_NEGATIVE_MALFORMED_STARTUP_DETAIL),
+        ) if *code == startup_error_exit_code(StartupError::StringPointerOutOfRange) => {
+            Some(I0_NEGATIVE_MALFORMED_STARTUP_DETAIL)
+        }
         (
             LoadFault::InitCapabilityCount,
             BootstrapError::Supervision(SupervisionError::Exit(

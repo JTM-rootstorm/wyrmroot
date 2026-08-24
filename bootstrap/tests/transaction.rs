@@ -36,6 +36,7 @@ use wyrmroot_runtime::{
     LOADER_TASK_GROUP_EXPECTATION, MappingPlan, NativeError, ReceiveCounts, SELF_ROOT_EXPECTATION,
 };
 use wyrmroot_runtime::{ExitValidationError, SupervisionError, SupervisionPlatform};
+use wyrmroot_runtime::{StartupError, startup_error_exit_code};
 
 const CHANNEL: DwHandle = DwHandle(11);
 const ROOT: DwHandle = DwHandle(21);
@@ -687,7 +688,9 @@ fn malformed_elf_variant_fails_before_publishing_init0() {
 fn i0_negative_terminal_details_are_unique_and_failure_class_bound() {
     let elf = BootstrapError::Loader(LoadError::Elf(ElfError::BadMagic));
     let startup = BootstrapError::Supervision(SupervisionError::Exit(
-        ExitValidationError::NonzeroApplicationCode(1),
+        ExitValidationError::NonzeroApplicationCode(startup_error_exit_code(
+            StartupError::StringPointerOutOfRange,
+        )),
     ));
     let count = BootstrapError::Supervision(SupervisionError::Exit(
         ExitValidationError::NonzeroApplicationCode(0x1000_0307),
