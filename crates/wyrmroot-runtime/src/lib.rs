@@ -43,7 +43,8 @@ pub use native::{
 };
 pub use startup::{
     AUXILIARY_VECTOR_TERMINATOR, BootstrapChannelHandle, STARTUP_ABI_V1, STARTUP_BLOCK_SIZE,
-    StartupBlock, StartupError, StartupRegisters, StartupString, with_native_startup,
+    StartupBlock, StartupError, StartupRegisters, StartupString, startup_error_exit_code,
+    with_native_startup,
 };
 pub use supervision::{
     ExitObservedReadinessError, ExitValidationError, NativeSupervisionPlatform, SupervisionError,

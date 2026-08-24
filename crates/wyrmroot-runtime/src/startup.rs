@@ -94,6 +94,28 @@ pub enum StartupError {
     InvalidUtf8,
 }
 
+/// Returns a stable bounded process exit code for native-entry startup
+/// validation failures. The `0x57` high byte is Wyrmroot-runtime-owned and the
+/// low byte identifies the exact [`StartupError`] variant.
+#[must_use]
+pub const fn startup_error_exit_code(error: StartupError) -> u32 {
+    const PREFIX: u32 = 0x5700_0000;
+    PREFIX
+        | match error {
+            StartupError::UnsupportedVersion => 1,
+            StartupError::InvalidBootstrapChannelHandle => 2,
+            StartupError::MisalignedStack => 3,
+            StartupError::WrongBlockSize => 4,
+            StartupError::AddressOverflow => 5,
+            StartupError::VectorOverflow => 6,
+            StartupError::MissingVectorTerminator => 7,
+            StartupError::MissingAuxiliaryTerminator => 8,
+            StartupError::StringPointerOutOfRange => 9,
+            StartupError::UnterminatedString => 10,
+            StartupError::InvalidUtf8 => 11,
+        }
+}
+
 /// Parses the native startup page and keeps every borrow inside one non-escaping callback.
 ///
 /// # Safety
@@ -452,6 +474,26 @@ mod tests {
             StartupBlock::parse(registers(), BASE, &block),
             Err(StartupError::InvalidUtf8)
         ));
+    }
+
+    #[test]
+    fn native_entry_exit_codes_preserve_each_startup_failure() {
+        let failures = [
+            StartupError::UnsupportedVersion,
+            StartupError::InvalidBootstrapChannelHandle,
+            StartupError::MisalignedStack,
+            StartupError::WrongBlockSize,
+            StartupError::AddressOverflow,
+            StartupError::VectorOverflow,
+            StartupError::MissingVectorTerminator,
+            StartupError::MissingAuxiliaryTerminator,
+            StartupError::StringPointerOutOfRange,
+            StartupError::UnterminatedString,
+            StartupError::InvalidUtf8,
+        ];
+        for (index, failure) in failures.into_iter().enumerate() {
+            assert_eq!(startup_error_exit_code(failure), 0x5700_0001 + index as u32);
+        }
     }
 
     #[repr(align(4096))]

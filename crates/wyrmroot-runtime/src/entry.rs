@@ -43,10 +43,12 @@ macro_rules! native_entry {
                 };
                 // SAFETY: `_start` passes the unmodified initial RSP supplied by Deepwyrm. The
                 // startup ABI guarantees that it names the immutable, readable 4 KiB block.
-                let exit_code = unsafe {
+                let exit_code = match unsafe {
                     $crate::with_native_startup(registers, startup_address, $handler)
-                }
-                .unwrap_or(1);
+                } {
+                    Ok(exit_code) => exit_code,
+                    Err(error) => $crate::startup_error_exit_code(error),
+                };
                 $crate::exit_process(exit_code)
             }
         }
