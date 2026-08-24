@@ -1502,9 +1502,9 @@ fn validate_evidence(
     observed_mask |= PROOF_BLOCKED_DESCENDANT;
 
     let invariant = exactly_one(&running_invariant, "RUNNING_INVARIANT")?;
-    if invariant.token != 0 || invariant.cpu != 0 || invariant.arg0 != 0 {
+    if invariant.token != 0 || invariant.arg0 != 0 {
         return Err(Failure::task(
-            "I1 RUNNING_INVARIANT must report zero token, CPU, and violation count",
+            "I1 RUNNING_INVARIANT must report zero token and violation count",
         ));
     }
     if events.last().map(|event| event.sequence) != Some(invariant.sequence) {
@@ -1544,10 +1544,10 @@ fn validate_evidence(
 
     let publish = exactly_one(&tlb_publish, "TLB_PUBLISH")?;
     let reclaim = exactly_one(&reclaim_allowed, "RECLAIM_ALLOWED")?;
-    let required_cpu_mask = publish.arg0;
-    if publish.token == 0 || required_cpu_mask != 0x0F {
+    let tlb_required_mask = publish.arg0;
+    if publish.token == 0 || tlb_required_mask == 0 || tlb_required_mask & !0x0F != 0 {
         return Err(Failure::task(
-            "I1 TLB_PUBLISH requires a nonzero generation and exact CPU mask 0000000F",
+            "I1 TLB_PUBLISH requires a nonzero generation and nonempty CPU mask within CPUs 0..3",
         ));
     }
     if reclaim.token != publish.token || reclaim.sequence <= publish.sequence {
@@ -1555,22 +1555,26 @@ fn validate_evidence(
             "I1 RECLAIM_ALLOWED has an invalid generation or order",
         ));
     }
-    let tlb_ack_mask = validate_ack_set(&tlb_ack, publish, reclaim, required_cpu_mask, "TLB_ACK")?;
+    let rendezvous_required_mask = rendezvous_ack
+        .first()
+        .map(|event| event.arg0)
+        .filter(|mask| *mask != 0 && *mask & !0x0F == 0)
+        .ok_or_else(|| {
+            Failure::task(
+                "I1 RENDEZVOUS_ACK requires a nonempty operation-specific CPU mask within CPUs 0..3",
+            )
+        })?;
+    let tlb_ack_mask = validate_ack_set(&tlb_ack, publish, reclaim, tlb_required_mask, "TLB_ACK")?;
     let rendezvous_ack_mask = validate_ack_set(
         &rendezvous_ack,
         publish,
         reclaim,
-        required_cpu_mask,
+        rendezvous_required_mask,
         "RENDEZVOUS_ACK",
     )?;
     if reclaim.arg0 != tlb_ack_mask || reclaim.arg1 != rendezvous_ack_mask {
         return Err(Failure::task(
             "I1 RECLAIM_ALLOWED masks do not exactly match the observed acknowledgement masks",
-        ));
-    }
-    if reclaim.arg0 != 0x0F || reclaim.arg1 != 0x0F {
-        return Err(Failure::task(
-            "I1 RECLAIM_ALLOWED requires exact TLB and rendezvous masks 0000000F",
         ));
     }
     observed_mask |= PROOF_TLB_ACK;
@@ -1962,17 +1966,13 @@ mod tests {
             event(0x07, 3, 0x200, 1, 0),
             event(0x08, 2, 0x300, 0, 0),
             event(0x09, 0, 0x300, 0, 0),
-            event(0x0A, 0, 0x400, 0x0F, 0),
-            event(0x0B, 0, 0x400, 0x0F, 0),
-            event(0x0B, 1, 0x400, 0x0F, 0),
-            event(0x0B, 2, 0x400, 0x0F, 0),
-            event(0x0B, 3, 0x400, 0x0F, 0),
-            event(0x0C, 0, 0x400, 0x0F, 0),
-            event(0x0C, 1, 0x400, 0x0F, 0),
-            event(0x0C, 2, 0x400, 0x0F, 0),
-            event(0x0C, 3, 0x400, 0x0F, 0),
-            event(0x0D, 0, 0x400, 0x0F, 0x0F),
-            event(0x05, 0, 0, 0, 0),
+            event(0x0A, 2, 0x400, 0x05, 0),
+            event(0x0B, 0, 0x400, 0x05, 0),
+            event(0x0B, 2, 0x400, 0x05, 0),
+            event(0x0C, 1, 0x400, 0x0A, 0),
+            event(0x0C, 3, 0x400, 0x0A, 0),
+            event(0x0D, 3, 0x400, 0x05, 0x0A),
+            event(0x05, 2, 0, 0, 0),
         ]
     }
 
@@ -2098,10 +2098,10 @@ mod tests {
         assert_eq!(
             parsed.evidence,
             Some(ValidatedEvidence {
-                count: 23,
+                count: 19,
                 observed_mask: 255,
                 first_sequence: 0,
-                last_sequence: 22,
+                last_sequence: 18,
             })
         );
         let fields = evidence_result_fields(&request, parsed.evidence)
@@ -2112,8 +2112,8 @@ mod tests {
                 "\"evidence_protocol\":\"dwevid1\",",
                 "\"evidence_nonce\":\"0123456789ABCDEF\",",
                 "\"required_evidence_mask\":255,\"observed_evidence_mask\":255,",
-                "\"evidence_event_count\":23,\"first_evidence_sequence\":0,",
-                "\"last_evidence_sequence\":22,"
+                "\"evidence_event_count\":19,\"first_evidence_sequence\":0,",
+                "\"last_evidence_sequence\":18,"
             )
         );
     }
@@ -2291,16 +2291,15 @@ mod tests {
         zero_block_token[7].token = 0;
         cases.push(("zero parent token", zero_block_token));
 
+        let invariant_index = valid_evidence_specs().len() - 1;
         let mut invariant_violation = valid_evidence_specs();
-        invariant_violation[22].arg0 = 1;
+        invariant_violation[invariant_index].arg0 = 1;
         cases.push(("running violation", invariant_violation));
 
-        let mut invariant_cpu = valid_evidence_specs();
-        invariant_cpu[22].cpu = 1;
-        cases.push(("running invariant CPU", invariant_cpu));
-
         let mut invariant_before_activity = valid_evidence_specs();
-        invariant_before_activity.swap(21, 22);
+        let reclaim_index = invariant_before_activity.len() - 2;
+        let invariant_index = invariant_before_activity.len() - 1;
+        invariant_before_activity.swap(reclaim_index, invariant_index);
         cases.push((
             "running invariant before reclaim",
             invariant_before_activity,
@@ -2334,42 +2333,29 @@ mod tests {
         wide_publish_mask[12].arg0 = 0x1F;
         cases.push(("wide publish mask", wide_publish_mask));
 
-        let mut coherent_partial_mask = valid_evidence_specs();
-        coherent_partial_mask.retain(|event| !matches!(event.kind, 0x0B | 0x0C) || event.cpu != 3);
-        for event in &mut coherent_partial_mask {
-            if matches!(event.kind, 0x0A..=0x0C) {
-                event.arg0 = 0x07;
-            }
-            if event.kind == 0x0D {
-                event.arg0 = 0x07;
-                event.arg1 = 0x07;
-            }
-        }
-        cases.push(("coherent partial CPU mask", coherent_partial_mask));
-
         let mut missing_tlb_ack = valid_evidence_specs();
-        missing_tlb_ack.remove(16);
+        missing_tlb_ack.remove(14);
         cases.push(("missing TLB ack", missing_tlb_ack));
 
         let mut duplicate_rendezvous_cpu = valid_evidence_specs();
-        duplicate_rendezvous_cpu[20].cpu = 2;
+        duplicate_rendezvous_cpu[16].cpu = 1;
         cases.push(("duplicate rendezvous CPU", duplicate_rendezvous_cpu));
 
         let mut wrong_ack_token = valid_evidence_specs();
-        wrong_ack_token[15].token = 0x401;
+        wrong_ack_token[14].token = 0x401;
         cases.push(("wrong ack token", wrong_ack_token));
 
         let mut wrong_ack_mask = valid_evidence_specs();
-        wrong_ack_mask[19].arg0 = 0x07;
+        wrong_ack_mask[16].arg0 = 0x08;
         cases.push(("wrong ack mask", wrong_ack_mask));
 
         let mut early_reclaim = valid_evidence_specs();
-        let reclaim = early_reclaim.remove(21);
-        early_reclaim.insert(15, reclaim);
+        let reclaim = early_reclaim.remove(17);
+        early_reclaim.insert(14, reclaim);
         cases.push(("early reclaim", early_reclaim));
 
         let mut wrong_reclaim_mask = valid_evidence_specs();
-        wrong_reclaim_mask[21].arg1 = 0x07;
+        wrong_reclaim_mask[17].arg1 = 0x02;
         cases.push(("wrong reclaim mask", wrong_reclaim_mask));
 
         let mut duplicate_event = valid_evidence_specs();

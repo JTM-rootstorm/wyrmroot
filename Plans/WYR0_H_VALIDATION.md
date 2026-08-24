@@ -188,11 +188,14 @@ rejects duplicate or inconsistent CPUs, tokens, ordering, joins, and masks.
 All four `CPU_ONLINE` records must precede every participation or activity
 record. The CPL3 proof uses at least two distinct CPUs and at least two distinct
 nonzero execution tokens. `RUNNING_INVARIANT` is pinned as the final evidence
-record after all scheduler and lifecycle activity; human diagnostics may follow
-it, but the terminal record remains after all evidence. `TLB_PUBLISH` requires
-exact mask `0000000F`. The TLB and rendezvous acknowledgements each cover
-exactly CPUs 0 through 3,
-and reclaim repeats exact masks `0000000F` and `0000000F`.
+record after all scheduler and lifecycle activity; it may be emitted by any
+participating CPU, human diagnostics may follow it, and the terminal record
+remains after all evidence. `TLB_PUBLISH` carries the nonempty
+operation-specific residency target mask, and TLB acknowledgements cover
+exactly that mask. Rendezvous acknowledgements carry and cover their own
+nonempty operation-specific stop target mask, which need not match the TLB
+mask. `RECLAIM_ALLOWED` repeats the two masks actually observed; neither proof
+requires acknowledgements from uninvolved CPUs.
 Only after the normal request/artifact/media revalidation accepts a terminal
 PASS does the schema-v3 integration result publish the protocol, nonce,
 required and observed evidence masks, event count, and first/last sequence.
