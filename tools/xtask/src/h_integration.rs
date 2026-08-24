@@ -21,6 +21,7 @@ use crate::sha256;
 
 const MAX_GUEST_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_FIRMWARE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_WYR0_H_ESP_SNAPSHOT_BYTES: u64 = crate::g3_image::IMAGE_BYTES;
 const MAX_SERIAL_BYTES: u64 = 16 * 1024 * 1024;
 const COMPLETION_RECORD_BYTES: usize = 38;
 const EVIDENCE_RECORD_BYTES: usize = 85;
@@ -1343,7 +1344,8 @@ fn prepare_run_directory(
     let hello_bytes = read_regular(&artifacts.hello, "hello", MAX_GUEST_ARTIFACT_BYTES)?;
     let bootfs_bytes =
         read_output_regular(outputs, &request.bootfs, "bootfs", MAX_GUEST_ARTIFACT_BYTES)?;
-    let esp_bytes = read_output_regular(outputs, &request.esp, "ESP", MAX_GUEST_ARTIFACT_BYTES)?;
+    let esp_bytes =
+        read_output_regular(outputs, &request.esp, "ESP", MAX_WYR0_H_ESP_SNAPSHOT_BYTES)?;
     let provenance_bytes = read_output_regular(
         outputs,
         &request.provenance,
@@ -3107,6 +3109,76 @@ mod tests {
             .expect("restore close-on-exec");
         drop(snapshot);
         fs::remove_dir_all(root).expect("remove snapshot race fixture");
+    }
+
+    #[test]
+    fn opened_esp_snapshot_size_policy_is_exact_and_bounded() {
+        assert_eq!(MAX_WYR0_H_ESP_SNAPSHOT_BYTES, 134_217_728);
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!(
+                "xtask-h-esp-size-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock before epoch")
+                    .as_nanos()
+            ));
+        fs::create_dir(&root).expect("create ESP size fixture");
+
+        let exact_path = root.join("exact.img");
+        let exact = fs::File::create(&exact_path).expect("create exact-size ESP");
+        exact
+            .set_len(MAX_WYR0_H_ESP_SNAPSHOT_BYTES)
+            .expect("size exact ESP");
+        drop(exact);
+        let bytes = read_opened_regular(
+            fs::File::open(&exact_path).expect("open exact-size ESP"),
+            "ESP",
+            MAX_WYR0_H_ESP_SNAPSHOT_BYTES,
+        )
+        .expect("rejecting the canonical ESP size");
+        assert_eq!(
+            u64::try_from(bytes.len()).expect("ESP length fits u64"),
+            MAX_WYR0_H_ESP_SNAPSHOT_BYTES
+        );
+        drop(bytes);
+
+        let oversized_path = root.join("oversized.img");
+        let oversized = fs::File::create(&oversized_path).expect("create oversized ESP");
+        oversized
+            .set_len(MAX_WYR0_H_ESP_SNAPSHOT_BYTES + 1)
+            .expect("size oversized ESP");
+        drop(oversized);
+        assert!(
+            read_opened_regular(
+                fs::File::open(&oversized_path).expect("open oversized ESP"),
+                "ESP",
+                MAX_WYR0_H_ESP_SNAPSHOT_BYTES,
+            )
+            .is_err()
+        );
+
+        let empty_path = root.join("empty.img");
+        fs::File::create(&empty_path).expect("create empty ESP");
+        assert!(
+            read_opened_regular(
+                fs::File::open(&empty_path).expect("open empty ESP"),
+                "ESP",
+                MAX_WYR0_H_ESP_SNAPSHOT_BYTES,
+            )
+            .is_err()
+        );
+        assert!(
+            read_opened_regular(
+                fs::File::open(&root).expect("open nonregular ESP fixture"),
+                "ESP",
+                MAX_WYR0_H_ESP_SNAPSHOT_BYTES,
+            )
+            .is_err()
+        );
+
+        fs::remove_dir_all(root).expect("remove ESP size fixture");
     }
 
     #[test]
