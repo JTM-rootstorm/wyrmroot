@@ -14,7 +14,7 @@ use crate::toolchain_artifact::AcceptedToolchain;
 
 const UEFI_TARGET_DIRECTORY: &str = "target/wyr0-b";
 const UEFI_PROFILE_DIRECTORY: &str = "debug";
-const TOOLCHAIN_REQUEST: &str = "toolchain/requests/RUST-WYR0B-UEFI-001.toml";
+const TOOLCHAIN_REQUEST: &str = "toolchain/requests/RUST-WYR0-I-B-SYSROOTS-007.toml";
 const MAX_LOADER_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DEBUG_SYMBOL_BYTES: u64 = 512 * 1024 * 1024;
 const DEEP_LAYOUT_POLICY_ENV: &str = "WYRMROOT_DEEP_LAYOUT_POLICY_RS";
@@ -149,6 +149,7 @@ pub(crate) fn run_loader_build(
         cargo_sha256: &toolchain.accepted.cargo_sha256,
         rust_lld_sha256: &toolchain.accepted.rust_lld_sha256,
         uefi_core_sha256: &toolchain.accepted.uefi_core_sha256,
+        uefi_alloc_sha256: &toolchain.accepted.uefi_alloc_sha256,
         uefi_builtins_sha256: &toolchain.accepted.uefi_builtins_sha256,
         rustc_driver_sha256: &toolchain.accepted.rustc_driver_sha256,
         llvm_sha256: &toolchain.accepted.llvm_sha256,
@@ -629,7 +630,7 @@ mod tests {
         );
         assert_eq!(
             failure.message,
-            "accepted WYR0-B rustc is unavailable: toolchain/requests/RUST-WYR0B-UEFI-001.toml status is 'blocked-pending-coordinator-assignment'; set WYRMROOT_RUSTC only to the accepted compiler artifact from that coordinator request"
+            "accepted WYR0-B rustc is unavailable: toolchain/requests/RUST-WYR0-I-B-SYSROOTS-007.toml status is 'blocked-pending-coordinator-assignment'; set WYRMROOT_RUSTC only to the accepted compiler artifact from that coordinator request"
         );
     }
 

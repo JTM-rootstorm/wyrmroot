@@ -12,7 +12,7 @@ use crate::error::Failure;
 const MAX_PROVENANCE_BYTES: u64 = 1024 * 1024;
 const MAX_PROVENANCE_PATH_BYTES: usize = 4096;
 const MAX_PROVENANCE_IDENTIFIER_BYTES: usize = 128;
-const LOADER_PROVENANCE_SCHEMA_VERSION: u64 = 2;
+const LOADER_PROVENANCE_SCHEMA_VERSION: u64 = 3;
 const LOADER_PROVENANCE_MANIFEST_KIND: &str = "wyrmroot-wyr0-b-loader-provenance";
 const LOADER_PROVENANCE_RECORD_ROLE: &str = "generated-loader-artifact-provenance";
 const BUILD_PROVENANCE_TEMPLATE_SCHEMA_VERSION: u64 = 1;
@@ -30,6 +30,7 @@ pub(crate) struct LoaderProvenance<'a> {
     pub(crate) cargo_sha256: &'a str,
     pub(crate) rust_lld_sha256: &'a str,
     pub(crate) uefi_core_sha256: &'a str,
+    pub(crate) uefi_alloc_sha256: &'a str,
     pub(crate) uefi_builtins_sha256: &'a str,
     pub(crate) rustc_driver_sha256: &'a str,
     pub(crate) llvm_sha256: &'a str,
@@ -279,6 +280,7 @@ fn render(record: &LoaderProvenance<'_>) -> Result<String, Failure> {
         (record.cargo_sha256, "Cargo SHA-256"),
         (record.rust_lld_sha256, "rust-lld SHA-256"),
         (record.uefi_core_sha256, "UEFI core library SHA-256"),
+        (record.uefi_alloc_sha256, "UEFI alloc library SHA-256"),
         (record.uefi_builtins_sha256, "UEFI builtins library SHA-256"),
         (record.rustc_driver_sha256, "rustc driver SHA-256"),
         (record.llvm_sha256, "LLVM SHA-256"),
@@ -349,6 +351,7 @@ rustc_sha256 = \"{}\"\n\
 cargo_sha256 = \"{}\"\n\
 rust_lld_sha256 = \"{}\"\n\
 uefi_core_sha256 = \"{}\"\n\
+uefi_alloc_sha256 = \"{}\"\n\
 uefi_builtins_sha256 = \"{}\"\n\
 rustc_driver_sha256 = \"{}\"\n\
 llvm_sha256 = \"{}\"\n\
@@ -392,6 +395,7 @@ inspection_report_sha256 = \"{}\"\n",
         escape(record.cargo_sha256),
         escape(record.rust_lld_sha256),
         escape(record.uefi_core_sha256),
+        escape(record.uefi_alloc_sha256),
         escape(record.uefi_builtins_sha256),
         escape(record.rustc_driver_sha256),
         escape(record.llvm_sha256),
@@ -575,6 +579,7 @@ mod tests {
             cargo_sha256: SHA256,
             rust_lld_sha256: SHA256,
             uefi_core_sha256: SHA256,
+            uefi_alloc_sha256: SHA256,
             uefi_builtins_sha256: SHA256,
             rustc_driver_sha256: SHA256,
             llvm_sha256: SHA256,
@@ -601,7 +606,7 @@ mod tests {
         const SYNTHETIC_WORKSPACE: &str = "/synthetic/private/workspace";
         let record = record();
         let rendered = render(&record).expect("valid relative provenance record rejected");
-        assert!(rendered.starts_with("schema_version = 2\n"));
+        assert!(rendered.starts_with("schema_version = 3\n"));
         assert!(rendered.contains("manifest_kind = \"wyrmroot-wyr0-b-loader-provenance\""));
         assert!(rendered.contains("record_role = \"generated-loader-artifact-provenance\""));
         assert!(rendered.contains("distinct_from_schema_version = 1"));

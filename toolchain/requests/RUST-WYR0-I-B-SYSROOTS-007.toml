@@ -1,0 +1,73 @@
+schema_version = 1
+request_id = "RUST-WYR0-I-B-SYSROOTS-007"
+coordinator_request_id = "RUST-WYR0-I-B-SYSROOTS-007"
+artifact_request_id = "RUST-WYR0-I-B-SYSROOTS-007"
+status = "accepted-immutable-artifact"
+request_kind = "extend-immutable-existing-wyrmroot-rust-toolchain"
+
+[requirement]
+phase_gate = "WYR0-I-B clean-build closure"
+consumer_repository = "wyrmroot"
+consumer_revision = "the Wyrmroot commit containing this exact request record"
+expected_behavior = "Build the UEFI loader and Deepwyrm kernel from the exact accepted Rust revision without build-std, host-compiler fallback, or mutable-source sysroot substitution."
+consumer_checks = [
+    "sh toolchain/verify-uefi-toolchain.sh --rustc <accepted-wyrmroot-rustc>",
+    "WYRMROOT_RUSTC=<accepted-wyrmroot-rustc> cargo xtask build loader",
+    "<accepted-rustc> --print sysroot",
+    "<accepted-cargo> build --locked --release --target x86_64-unknown-none --package deepwyrm-kernel --bin deepwyrm-kernel",
+]
+
+[rust]
+canonical_base_commit = "8bab26f4f68e0e26f0bb7960be334d5b520ea452"
+accepted_commit = "a92dc7f7464ad6ddfece4402bd7b86dbfa86166d"
+fork_repository = "git@github.com:JTM-rootstorm/rust.git"
+requested_toolchain_name = "wyrmroot-1.97.1-a92dc7f7"
+source_edit_requested = false
+required_targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-wyrmroot",
+    "x86_64-unknown-uefi",
+    "x86_64-unknown-none",
+]
+required_target_artifacts = ["core", "alloc", "compiler-builtins"]
+required_uefi_artifacts = ["std", "proc_macro"]
+required_host_artifacts = ["std", "proc_macro"]
+
+[build]
+stage = 1
+host = "x86_64-unknown-linux-gnu"
+llvm_version = "22.1.6"
+network = "offline"
+build_root = "/home/mike/Documents/Programming/OS-Project/.tmp/RUST-WYR0-I-B-SYSROOTS-004/build-llvm-22.1.6"
+source_worktree = "/home/mike/Documents/Programming/OS-Project/.worktrees/rust/RUST-WYR0-I-B-SYSROOTS-004"
+accepted_artifact_root = "/home/mike/Documents/Programming/OS-Project/artifacts/toolchains/accepted/RUST-WYR0-I-B-SYSROOTS-007"
+artifact_manifest_sha256 = "cc78368219552cce8fdaad38ab419040cab945fe175aa774d6dca51eece84fd2"
+toolchain_tree_sha256 = "dce57d31def1f509ce537f96ae6b6dd320da11c9f321382cb93d142f558a32ca"
+
+[artifacts]
+rustc_sha256 = "65bd51e9ecb8e1185524471a8cbc4af1e6ac4e37e7d446c7a127bda0fa431c70"
+cargo_sha256 = "a73b2c25573d251489101c0d8f19ad3702eb9761166de5ed8437b472b6c038ce"
+rust_lld_sha256 = "38a9f28404309892f9c9afe02fa4979a0d9e8bc866979cde09f5bb7ec17e5721"
+rustc_driver_sha256 = "9983632137b08dab20ac17930538afb664ad46960b71d80ae7494ca93a94bfe5"
+llvm_sha256 = "ed4f320c4e1ed6de7d2db6fd89faccf764d63186c2f877057ddf31065b1fac09"
+host_core_sha256 = "e9958bec388c0801e21ae1ac9ee4a4d942aaf88c8cd26f5c1fe414471f7ea038"
+host_std_sha256 = "8bef82febc98ce0c03d9005b81d39a96dd29cdc35bf8a49287db3e14865ec7e9"
+host_proc_macro_sha256 = "d682b3d53d850a1d229427f93906768248891cb429677b6246ddd6f3ce2988c2"
+host_compiler_builtins_sha256 = "1e752a1cc35c4bc101be332fc131f64bdec6aae93e7f207c8f481c046be2ff59"
+wyrmroot_core_sha256 = "c5e0fa32f6237cb05fb38334ca5f116e9b84753948aa95e5150d473e1e26fc7f"
+wyrmroot_alloc_sha256 = "bb456be383df74bbee39ec87dbd8074f216526d18141160a13b40115b064b89e"
+wyrmroot_compiler_builtins_sha256 = "bc459a6a6f87314b31f9d8a794c2a9203bd5043cf0de0cb55fbee422636d7d6d"
+uefi_core_sha256 = "cc29230f9e7c56ffcbf073bf276a619c80dc0fde6122bd6f97b13d8095c97201"
+uefi_alloc_sha256 = "0ad9cc4210feae9d64b88ddec9a721292facb891fc0b4b34f7e6dcb7fd55472b"
+uefi_std_sha256 = "34519dc60a58071c11cf18acde42dc9c605aea0fc197fde695df4a3c680157a4"
+uefi_proc_macro_sha256 = "b9b91ea6db9063e634ebff8ef833ceb372369f19cf46a5b3f94cce1d8489ce2e"
+uefi_compiler_builtins_sha256 = "09bf0a801b263c46b5d0e1c6789d988b5fac4d1ccdd4ef35b10d1d670238b6ac"
+none_core_sha256 = "255e514fd048086ee9736d5e00f083b63c3c5ca7e3d2d06ff35a2951bcec5d69"
+none_alloc_sha256 = "9b19103ba2c3db9b7b8b3f89f1008fd7754fd20c547d457ce05ade4d3a4d8024"
+none_compiler_builtins_sha256 = "d1641c5e93e712ad72ef2b60b210832fff429245489c9a69e48a855ddc0a32be"
+
+[policy]
+human_reviewer = "not-applicable-no-rust-source-edit"
+soundness_classification = "build-only-target-sysroot-extension"
+llm_disclosure = "Codex coordinated a no-source-edit build and validation workflow from the exact accepted Rust revision."
+notes = "The request does not alter Rust source, target specifications, compiler semantics, or the accepted revision. It extends a new immutable copy of the accepted toolchain with matching host, UEFI, and freestanding-none sysroots. Candidate 004 was rejected after detecting a mismatched host sysroot; candidates 005 and 006 were rejected while the canonical loader build proved the exact target and host proc_macro requirements. Rejected candidates remain under task-local temporary state."

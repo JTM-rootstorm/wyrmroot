@@ -9,26 +9,13 @@ use crate::elf_runtime::{RuntimeMetadata, inspect};
 use crate::error::Failure;
 use crate::sha256::{bytes_digest, reader_digest};
 
-const REQUEST_PATH: &str = "toolchain/requests/RUST-WYR0B-UEFI-001.toml";
+const REQUEST_PATH: &str = "toolchain/requests/RUST-WYR0-I-B-SYSROOTS-007.toml";
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
-const COORDINATOR_REQUEST: &str = "RUST-PHASE0B-TOOLCHAIN-001";
-const CONSUMER_REQUEST: &str = "RUST-WYR0B-UEFI-001";
-const CONFIGURATION_SHA256: &str =
-    "63e532b52e6d4c2ef4ed4a003e2aafd7ec11b55e3de5a635c1aea8bfa849f332";
-
-const RUSTC_SHA256: &str = "284606eec4c85a3780627a889f7e2694759446b68c4f65e7ce21168432f8915d";
-const CARGO_SHA256: &str = "1dbc247d0d8568da0b472a8ceaba18d29cea19e20d2d48cf21597b8574633438";
-const RUST_LLD_SHA256: &str = "38a9f28404309892f9c9afe02fa4979a0d9e8bc866979cde09f5bb7ec17e5721";
-const UEFI_CORE_SHA256: &str = "6777111445c5cf0c4abd7063fa0f7165c3df3809d7de4a9cbedaa84a6d7d9d68";
-const UEFI_BUILTINS_SHA256: &str =
-    "eea1964f8b5e2ed67defcde06d7ca9874e13ba972f08526d8b1bb52127ccb136";
-const TOOLCHAIN_TREE_SHA256: &str =
-    "5d4275428555a7cd6ae7decc100456fe31cfa4562a7f5eb81a3cf7fe08aa03a5";
-const RUSTC_DRIVER_NAME: &str = "librustc_driver-7cb6fba0afdc0262.so";
-const RUSTC_DRIVER_SHA256: &str =
-    "adc7d227ecc4193c5dabaa2b132c01675fddf32b01f63e57010bc1ffaa3b7672";
+const COORDINATOR_REQUEST: &str = "RUST-WYR0-I-B-SYSROOTS-007";
+const CONSUMER_REQUEST: &str = "RUST-WYR0-I-B-SYSROOTS-007";
+const RUST_SOURCE_TREE: &str = "aa3d5f9d1311772c99e385067d07641c01b8d203";
+const RUSTC_DRIVER_NAME: &str = "librustc_driver-948919618f142f9a.so";
 const LLVM_NAME: &str = "libLLVM.so.22.1-rust-1.97.1-stable";
-const LLVM_SHA256: &str = "ed4f320c4e1ed6de7d2db6fd89faccf764d63186c2f877057ddf31065b1fac09";
 const SYSTEM_INTERPRETER: &str = "/lib64/ld-linux-x86-64.so.2";
 const GNU_TAR: &str = "/usr/bin/tar";
 const MAX_TOOLCHAIN_ENTRIES: usize = 4096;
@@ -50,6 +37,7 @@ pub(crate) struct AcceptedToolchain {
     pub(crate) cargo_sha256: String,
     pub(crate) rust_lld_sha256: String,
     pub(crate) uefi_core_sha256: String,
+    pub(crate) uefi_alloc_sha256: String,
     pub(crate) uefi_builtins_sha256: String,
     pub(crate) rustc_driver_sha256: String,
     pub(crate) llvm_sha256: String,
@@ -107,19 +95,28 @@ pub(crate) fn prepare(
     expect_string(
         &request,
         "request_kind",
-        "build-immutable-existing-wyrmroot-rust-toolchain",
+        "extend-immutable-existing-wyrmroot-rust-toolchain",
         "toolchain request",
     )?;
-    expect_string(
+    let expected_manifest_sha = required_sha256(
         &request,
-        "artifact_configuration_id",
-        &CONFIGURATION_SHA256[..16],
+        "build.artifact_manifest_sha256",
         "toolchain request",
     )?;
-    let expected_manifest_sha =
-        required_sha256(&request, "artifact_manifest_sha256", "toolchain request")?;
+    let expected_tree_sha =
+        required_sha256(&request, "build.toolchain_tree_sha256", "toolchain request")?;
+    let expected_root = required_string(
+        &request,
+        "build.accepted_artifact_root",
+        "toolchain request",
+    )?;
 
     let (root, canonical_rustc) = artifact_root_from_rustc(configured_rustc, expected_name)?;
+    if root.to_str() != Some(expected_root.as_str()) {
+        return Err(Failure::task(
+            "configured WYRMROOT_RUSTC is outside the request-declared accepted artifact root",
+        ));
+    }
     let manifest_path = root.join("manifest.toml");
     validate_contained_regular_file(&root, &manifest_path, "artifact manifest")?;
     let manifest_bytes = read_bounded(&manifest_path, MAX_MANIFEST_BYTES, "artifact manifest")?;
@@ -135,39 +132,42 @@ pub(crate) fn prepare(
     validate_manifest_identity(&manifest, expected_name, expected_commit)?;
     let toolchain_tree_sha256 =
         required_sha256(&manifest, "toolchain_tree_sha256", "artifact manifest")?;
-    if toolchain_tree_sha256 != TOOLCHAIN_TREE_SHA256 {
+    if toolchain_tree_sha256 != expected_tree_sha {
         return Err(Failure::task(format!(
-            "artifact manifest toolchain tree hash is {toolchain_tree_sha256}, expected {TOOLCHAIN_TREE_SHA256}"
+            "artifact manifest toolchain tree hash is {toolchain_tree_sha256}, expected {expected_tree_sha}"
         )));
     }
 
-    let rustc = component(&root, &manifest, "artifacts.rustc", "rustc", RUSTC_SHA256)?;
+    let rustc = component(&root, &manifest, "artifacts.rustc", "rustc")?;
     if rustc.path != canonical_rustc {
         return Err(Failure::task(
             "configured WYRMROOT_RUSTC does not match manifest-declared rustc artifact",
         ));
     }
-    let cargo = component(&root, &manifest, "artifacts.cargo", "cargo", CARGO_SHA256)?;
-    let rust_lld = component(
+    let cargo = component(&root, &manifest, "artifacts.cargo", "cargo")?;
+    let rust_lld = component(&root, &manifest, "artifacts.rust_lld", "rust-lld")?;
+    let uefi_core = component(&root, &manifest, "artifacts.uefi_core", "UEFI core")?;
+    let uefi_alloc = component(&root, &manifest, "artifacts.uefi_alloc", "UEFI alloc")?;
+    let uefi_std = component(&root, &manifest, "artifacts.uefi_std", "UEFI std")?;
+    let uefi_proc_macro = component(
         &root,
         &manifest,
-        "artifacts.rust_lld",
-        "rust-lld",
-        RUST_LLD_SHA256,
-    )?;
-    let uefi_core = component(
-        &root,
-        &manifest,
-        "artifacts.uefi_core",
-        "UEFI core",
-        UEFI_CORE_SHA256,
+        "artifacts.uefi_proc_macro",
+        "UEFI proc_macro",
     )?;
     let uefi_builtins = component(
         &root,
         &manifest,
         "artifacts.uefi_compiler_builtins",
         "UEFI compiler-builtins",
-        UEFI_BUILTINS_SHA256,
+    )?;
+    let none_core = component(&root, &manifest, "artifacts.none_core", "none core")?;
+    let none_alloc = component(&root, &manifest, "artifacts.none_alloc", "none alloc")?;
+    let none_builtins = component(
+        &root,
+        &manifest,
+        "artifacts.none_compiler_builtins",
+        "none compiler-builtins",
     )?;
 
     let toolchain_directory =
@@ -187,17 +187,21 @@ pub(crate) fn prepare(
         ));
     }
     verify_toolchain_tree(&sysroot, &toolchain_tree_sha256)?;
-    let rustc_driver = fixed_component(
+    let rustc_driver = component(&root, &manifest, "artifacts.rustc_driver", "rustc driver")?;
+    let llvm = component(&root, &manifest, "artifacts.llvm", "toolchain LLVM")?;
+    let host_core = component(&root, &manifest, "artifacts.host_core", "host core")?;
+    let host_std = component(&root, &manifest, "artifacts.host_std", "host std")?;
+    let host_proc_macro = component(
         &root,
-        &format!("{toolchain_directory}/lib/{RUSTC_DRIVER_NAME}"),
-        "rustc driver",
-        RUSTC_DRIVER_SHA256,
+        &manifest,
+        "artifacts.host_proc_macro",
+        "host proc_macro",
     )?;
-    let llvm = fixed_component(
+    let host_builtins = component(
         &root,
-        &format!("{toolchain_directory}/lib/{LLVM_NAME}"),
-        "toolchain LLVM",
-        LLVM_SHA256,
+        &manifest,
+        "artifacts.host_compiler_builtins",
+        "host compiler-builtins",
     )?;
     validate_runtime_dependencies(&sysroot, &rustc, &cargo, &rust_lld, &rustc_driver, &llvm)?;
 
@@ -211,9 +215,19 @@ pub(crate) fn prepare(
         cargo.clone(),
         rust_lld.clone(),
         uefi_core.clone(),
+        uefi_alloc.clone(),
+        uefi_std,
+        uefi_proc_macro,
         uefi_builtins.clone(),
+        none_core.clone(),
+        none_alloc.clone(),
+        none_builtins.clone(),
         rustc_driver.clone(),
         llvm.clone(),
+        host_core,
+        host_std,
+        host_proc_macro,
+        host_builtins,
     ];
     let accepted = AcceptedToolchain {
         rustc: rustc.path.clone(),
@@ -224,6 +238,7 @@ pub(crate) fn prepare(
         cargo_sha256: cargo.sha256.clone(),
         rust_lld_sha256: rust_lld.sha256.clone(),
         uefi_core_sha256: uefi_core.sha256.clone(),
+        uefi_alloc_sha256: uefi_alloc.sha256.clone(),
         uefi_builtins_sha256: uefi_builtins.sha256.clone(),
         rustc_driver_sha256: rustc_driver.sha256.clone(),
         llvm_sha256: llvm.sha256.clone(),
@@ -262,7 +277,7 @@ fn validate_manifest_identity(
     )?;
     expect_bool(manifest, "source_dirty", false, "artifact manifest")?;
     expect_bool(manifest, "source_modified", false, "artifact manifest")?;
-    expect_integer(manifest, "bootstrap_stage", 2, "artifact manifest")?;
+    expect_integer(manifest, "bootstrap_stage", 1, "artifact manifest")?;
     expect_string(
         manifest,
         "host",
@@ -271,8 +286,8 @@ fn validate_manifest_identity(
     )?;
     expect_string(
         manifest,
-        "configuration_sha256",
-        CONFIGURATION_SHA256,
+        "source_tree",
+        RUST_SOURCE_TREE,
         "artifact manifest",
     )?;
     require_array_member(
@@ -283,6 +298,7 @@ fn validate_manifest_identity(
     )?;
     for target in [
         "x86_64-unknown-linux-gnu",
+        "x86_64-unknown-wyrmroot",
         "x86_64-unknown-uefi",
         "x86_64-unknown-none",
     ] {
@@ -297,8 +313,10 @@ fn validate_manifest_identity(
     )?;
     for key in [
         "acceptance.rustc_identity",
+        "acceptance.target_specs",
         "acceptance.uefi_sysroot_presence",
-        "acceptance.consumer_gates",
+        "acceptance.none_sysroot_presence",
+        "acceptance.wyrmroot_sysroot_presence",
     ] {
         expect_string(manifest, key, "passed", "artifact manifest")?;
     }
@@ -363,37 +381,16 @@ fn component(
     manifest: &BTreeMap<String, Value>,
     section: &str,
     label: &'static str,
-    expected_sha256: &str,
 ) -> Result<ArtifactComponent, Failure> {
     let path_key = format!("{section}.path");
     let hash_key = format!("{section}.sha256");
     let relative = required_string(manifest, &path_key, "artifact manifest")?;
     let declared_sha = required_sha256(manifest, &hash_key, "artifact manifest")?;
-    if declared_sha != expected_sha256 {
-        return Err(Failure::task(format!(
-            "artifact manifest {label} hash is {declared_sha}, expected {expected_sha256}"
-        )));
-    }
     let path = contained_path(root, &relative, label)?;
     let component = ArtifactComponent {
         label,
         path,
         sha256: declared_sha,
-    };
-    validate_component(root, &component)?;
-    Ok(component)
-}
-
-fn fixed_component(
-    root: &Path,
-    relative: &str,
-    label: &'static str,
-    sha256: &str,
-) -> Result<ArtifactComponent, Failure> {
-    let component = ArtifactComponent {
-        label,
-        path: contained_path(root, relative, label)?,
-        sha256: sha256.to_owned(),
     };
     validate_component(root, &component)?;
     Ok(component)
@@ -531,11 +528,10 @@ fn validate_toolchain_tree_entries(root: &Path) -> Result<(), Failure> {
                         Failure::task("accepted toolchain regular-file bytes exceed the limit")
                     })?;
             } else if file_type.is_symlink() {
-                fs::read_link(entry.path()).map_err(|error| {
-                    Failure::task(format!(
-                        "could not inspect accepted toolchain symlink: {error}"
-                    ))
-                })?;
+                return Err(Failure::task(format!(
+                    "accepted toolchain contains symbolic link {}",
+                    entry.path().display()
+                )));
             } else {
                 return Err(Failure::task(format!(
                     "accepted toolchain contains unsupported filesystem entry {}",
@@ -577,10 +573,10 @@ fn validate_runtime_dependencies(
         Some(SYSTEM_INTERPRETER),
         "$ORIGIN/../lib",
         &[
-            "libgit2.so.1.9",
-            "libssl.so.3",
-            "libcurl.so.4",
+            "libdl.so.2",
             "libgcc_s.so.1",
+            "librt.so.1",
+            "libpthread.so.0",
             "libm.so.6",
             "libc.so.6",
             "ld-linux-x86-64.so.2",
@@ -1143,8 +1139,8 @@ fn require_array_member(
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactComponent, CONFIGURATION_SHA256, CONSUMER_REQUEST, COORDINATOR_REQUEST,
-        contained_path, open_stable_regular_file, parse_manifest, prepare, validate_component,
+        ArtifactComponent, CONSUMER_REQUEST, COORDINATOR_REQUEST, contained_path,
+        open_stable_regular_file, parse_manifest, prepare, validate_component,
         validate_manifest_identity, verify_local_resolution, verify_open_file_identity,
     };
     use crate::elf_runtime::RuntimeMetadata;
@@ -1153,8 +1149,8 @@ mod tests {
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    const NAME: &str = "wyrmroot-1.97.1-8bab26f4";
-    const COMMIT: &str = "8bab26f4f68e0e26f0bb7960be334d5b520ea452";
+    const NAME: &str = "wyrmroot-1.97.1-a92dc7f7";
+    const COMMIT: &str = "a92dc7f7464ad6ddfece4402bd7b86dbfa86166d";
 
     #[test]
     #[ignore = "requires WYRMROOT_RUSTC pointing to the coordinator-accepted immutable artifact"]
@@ -1308,16 +1304,17 @@ consumer_requests = [
 ]
 registered_name = "{NAME}"
 source_commit = "{COMMIT}"
+source_tree = "aa3d5f9d1311772c99e385067d07641c01b8d203"
 source_dirty = false
 source_modified = false
-bootstrap_stage = 2
+bootstrap_stage = 1
 host = "x86_64-unknown-linux-gnu"
 targets = [
     "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-wyrmroot",
     "x86_64-unknown-uefi",
     "x86_64-unknown-none",
 ]
-configuration_sha256 = "{CONFIGURATION_SHA256}"
 
 [build]
 status = "passed"
@@ -1325,8 +1322,10 @@ rust_source_changes = false
 
 [acceptance]
 rustc_identity = "passed"
+target_specs = "passed"
 uefi_sysroot_presence = "passed"
-consumer_gates = "passed"
+none_sysroot_presence = "passed"
+wyrmroot_sysroot_presence = "passed"
 "#
         )
     }
