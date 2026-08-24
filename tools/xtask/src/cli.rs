@@ -13,7 +13,6 @@ Usage:
     cargo xtask test host [filter]
     cargo xtask test guest [filter]
     cargo xtask test integration wyr0 [default|smp] --request <wyr0-h-request.toml>
-    cargo xtask freeze v0 --request <v0-freeze-request.toml>
 
 Host filters may name a component (bootfs, protocol, elf, runtime, bootstrap,
 efi, init0, hello, or xtask), package:<workspace-package>, or test:<substring>.
@@ -76,7 +75,6 @@ pub(crate) enum Action {
         profile: Option<HProfile>,
         request: String,
     },
-    FreezeV0(String),
     Unavailable(&'static str),
 }
 
@@ -121,21 +119,9 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
         "inspect-image" => dispatch_inspect_image(&arguments[1..]),
         "gdb" => dispatch_profile_request(&arguments[1..], true),
         "test" => dispatch_test(&arguments[1..]),
-        "freeze" => dispatch_freeze(&arguments[1..]),
         unknown => Err(Failure::usage(format!(
             "unknown command '{unknown}'\n\n{USAGE}"
         ))),
-    }
-}
-
-fn dispatch_freeze(arguments: &[String]) -> Result<Action, Failure> {
-    match arguments {
-        [v0, flag, request] if v0 == "v0" && flag == "--request" => {
-            Ok(Action::FreezeV0(request.clone()))
-        }
-        _ => Err(Failure::usage(
-            "freeze requires v0 --request <v0-freeze-request.toml>",
-        )),
     }
 }
 
@@ -378,10 +364,6 @@ mod tests {
             })
         );
         assert_eq!(
-            dispatch(&arguments(&["freeze", "v0", "--request", "freeze.toml"])),
-            Ok(Action::FreezeV0("freeze.toml".into()))
-        );
-        assert_eq!(
             dispatch(&arguments(&[
                 "test",
                 "integration",
@@ -449,9 +431,6 @@ mod tests {
             &["test", "host", "one", "two"],
             &["test", "host", "--nocapture"],
             &["test", "integration", "wyr0"],
-            &["freeze"],
-            &["freeze", "v0", "request.toml"],
-            &["freeze", "v1", "--request", "request.toml"],
             &[
                 "test",
                 "integration",

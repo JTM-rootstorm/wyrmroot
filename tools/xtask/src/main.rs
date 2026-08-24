@@ -10,7 +10,6 @@ mod provenance;
 mod sha256;
 mod tasks;
 mod toolchain_artifact;
-mod v0_freeze;
 
 use std::env;
 use std::process::ExitCode;
@@ -99,7 +98,6 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
         Action::IntegrationH { profile, request } => {
             h_integration::integration(profile, &request).map(Some)
         }
-        Action::FreezeV0(request) => v0_freeze::freeze(&request).map(Some),
         Action::Unavailable(command) => Err(Failure::unavailable(command)),
     }
 }
