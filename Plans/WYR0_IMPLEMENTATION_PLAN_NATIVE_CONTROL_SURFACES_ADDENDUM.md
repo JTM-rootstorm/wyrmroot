@@ -234,6 +234,8 @@ Native configuration should be structured rather than requiring `/etc/fstab` as 
 
 A future mount configuration might use schema/TOML-like records containing source identity, target, filesystem, options, and required/optional policy.
 
+The concrete filesystem-role direction is pinned in `WYRMROOT_STORAGE_FILESYSTEM_DIRECTION.md`: FAT32 serves guest-side EFI System Partition management, ext4 is the initial persistent root, and the eventual Wyrmroot-native filesystem remains a later evidence-driven design track.
+
 POSIX compatibility may provide `mount`, `umount`, `findmnt`, `/etc/fstab`, and related conventions as adapters/frontends.
 
 ---
@@ -376,20 +378,41 @@ The names remain adjustable; the separation of responsibilities is the locked pa
 
 # 14. Priority order for future architecture/implementation
 
-Before driver-heavy desktop/audio work, use the following priority order unless a concrete dependency justifies changing it:
+Do not confuse **boot dependency order** with the broader order in which control-plane interfaces deserve design attention.
 
-1. **Native system/task introspection** so Wyrmroot does not grow `/proc`/`/sys` dependencies.
-2. **Native service registry + typed IPC schemas** so system services do not fragment into ad-hoc protocols or foundational D-Bus.
-3. **Device-manager contract** before substantial userspace-driver/hotplug expansion.
+## 14.1 Boot-critical bring-up order
+
+After WYR0 closes, the default bring-up sequence is:
+
+1. **Small permanent init/supervisor** from bootfs, using only a static bootstrap manifest/readiness graph and the minimum lifecycle/restart authority needed to bring up the base system.
+2. **Separate bootstrap service discovery/registry** sufficient for early components to obtain direct Channel capabilities without turning init into a message broker.
+3. **Device coordinator plus essential driver servers**, with storage first where required to reach the root device. The coordinator binds/owns devices; it does not become a single all-driver process.
+4. **VFS plus FAT32 ESP access**, using real block-device/partition paths. FAT32 is the boot-management filesystem: once running Wyrmroot userspace owns inspection or mutation of installed EFI/boot artifacts, that access must go through Wyrmroot's own storage/VFS/filesystem path rather than host tooling or firmware-runtime shortcuts.
+5. **ext4 persistent-root discovery and mount.** Ext4 is the initial normal root filesystem and is required before the persistent post-bootstrap userspace is considered fully online. FAT32 is not promoted into the root role.
+6. **Foundational post-root services and recovery/admin console**, including the full registry/discovery surface, configuration/state/runtime machinery, structured logging/crash services, console/TTY/PTY support, and a first useful recovery/administration shell path.
+7. **Non-boot-critical hardware/service families** such as general USB classes, networking, audio, accelerated graphics/display/render services, and other restartable domains as their dependencies become available.
+8. **Login/session and desktop stack**, followed by normal applications and compatibility environments.
+
+Bootfs must contain enough trusted userspace to execute steps 1-5 without the persistent filesystem already being mounted. Root-mount failure should leave a bounded recovery-capable userspace rather than forcing an immediate reboot or dead machine. FAT32 and ext4 filesystem work may proceed in parallel after common block/VFS prerequisites are stable; the numbered list expresses boot dependencies, not a mandatory implementation serialization.
+
+General service activation, dependency policy, registry/discovery, and supervision remain distinct even when the bootstrap supervisor starts them. The bootstrap supervisor may understand a deliberately tiny static graph; it must not grow into the final dependency controller.
+
+## 14.2 Broader control-plane design priority
+
+Across and after that boot spine, prioritize these interfaces before driver-heavy desktop/audio work unless a concrete dependency justifies interleaving:
+
+1. **Native service registry + typed IPC schemas** so system services do not fragment into ad-hoc protocols or foundational D-Bus.
+2. **Device-manager contract** before substantial userspace-driver/hotplug expansion.
+3. **Native system/task introspection** so Wyrmroot does not grow `/proc`/`/sys` dependencies.
 4. **Native tracing/crash/debug substrate** before ABI 1.
 5. **Structured logging service and `logctl`.**
-6. **Storage/mount model** before persistent-system tooling grows around util-linux assumptions.
+6. **Storage/mount control model** before persistent-system tooling grows around util-linux assumptions.
 7. **Authorization/elevation broker architecture.**
 8. **Scheduled-task service.**
 9. **User/account/credential model.**
 10. **Port/adapt conventional command-line utilities.**
 
-This ordering is directional rather than a requirement to implement all ten before later milestones. Dependency-driven interleaving is allowed, but implementations must preserve the pinned native-vs-compatibility boundaries.
+This second ordering is directional, not a claim that all ten must exist before the machine can mount root. Dependency-driven parallelism/interleaving is allowed, but implementations must preserve the pinned native-vs-compatibility and fault-domain boundaries.
 
 ---
 
@@ -455,6 +478,10 @@ Compatibility adapters must not become a route around Deepwyrm handle rights or 
 Before the corresponding subsystems are considered stable or before native ABI/service contracts are frozen, architecture review must confirm:
 
 - native system/task tools do not depend on `/proc` or `/sys`
+- the permanent init/supervisor remains a narrow bootstrap/lifecycle component rather than absorbing the global registry, general dependency controller, device drivers, filesystem implementations, logging, or package policy
+- boot-critical discovery, device/storage drivers, and VFS/filesystem services can start from bootfs without persistent root already mounted, with root-mount failure remaining recoverable userspace policy
+- FAT32 guest access is available through the native storage/VFS path when userspace must manage ESP boot artifacts, while ext4 is the initial persistent root required for full persistent-userspace onlining
+- the device coordinator remains an enumeration/binding/ownership authority rather than a single all-driver fault domain
 - native device access/management does not depend on `/dev` or udev rules
 - native service discovery does not require D-Bus
 - native subsystem control does not use a universal `ioctl` escape hatch

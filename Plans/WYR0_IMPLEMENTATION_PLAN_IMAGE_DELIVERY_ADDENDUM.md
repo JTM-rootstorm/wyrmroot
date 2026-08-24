@@ -214,7 +214,7 @@ QEMU
     └── persistent Wyrmroot storage in later milestones
 ```
 
-The system disk should begin as a **4 GiB sparse qcow2** image. WYR0 does not need to consume it.
+The system disk should begin as a **4 GiB sparse qcow2** image. WYR0 does not need to consume it. When the post-WYR0 storage/VFS milestone brings up the first persistent root, that root is ext4; the eventual Wyrmroot-native filesystem is a later replacement/research track rather than a prerequisite for first persistent userspace.
 
 Reasons for the split:
 
@@ -224,6 +224,14 @@ Reasons for the split:
 - the boot path remains physically realistic
 
 WYR0 image regeneration must not inherently recreate the system disk.
+
+## 7.1 Later guest-side ESP access
+
+WYR0 host tooling constructs and inspects the FAT32 ESP because the guest filesystem stack is intentionally out of scope. That host-side role does not define the later running-system update path.
+
+Once Wyrmroot userspace is expected to inspect, stage, replace, validate, or recover installed EFI/boot artifacts, the guest must use a FAT32 filesystem service/driver over its own partition/block/VFS path. Normal boot/update management must not depend on host image tools, a host filesystem share, or UEFI runtime file services as a substitute for the operating system's storage stack.
+
+FAT32 remains the EFI System Partition filesystem. It is not the persistent root filesystem; the first persistent root is ext4 as pinned by `WYRMROOT_STORAGE_FILESYSTEM_DIRECTION.md`.
 
 ---
 
@@ -241,20 +249,20 @@ read-only bootfs loaded into RAM
         |
         v
 
-Persistent storage
-==================
-ESP
+Persistent root bring-up
+========================
+FAT32 ESP through the guest storage/VFS path when boot management needs it
         +
-real Wyrmroot virtual system disk
+ext4 root on the real Wyrmroot virtual system disk
 
         |
         v
 
 Package manager
 ===============
-ESP
+FAT32 ESP
         +
-system disk
+ext4 system root
         +
 packages delivered through virtual removable media or Wyrmroot networking
 

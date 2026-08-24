@@ -97,6 +97,36 @@ client
 
 Do not create a universal broker through which every native IPC message must flow.
 
+## 2.5 FIDL is the principal WyrmIDL prior-art lineage, not a compatibility target
+
+WyrmIDL should begin from Fuchsia FIDL as its primary design prior art and justify meaningful departures instead of independently rediscovering solved IDL/wire-protocol problems. This does **not** promise FIDL source syntax, Fuchsia API, or byte-for-byte wire compatibility.
+
+Concepts to preserve or seriously evaluate include:
+
+- typed protocols with one-way calls, two-way transactions, and events;
+- explicit transaction identity and asynchronous implementations;
+- bounded strings/vectors/records and deterministic malformed-message rejection;
+- strict versus extensible enums/unions/records/protocols, or equivalent explicit evolution semantics;
+- typed client/server endpoints layered over ordinary Channels;
+- schema-declared transferred-handle object type and minimum rights, enforced by generated bindings using Deepwyrm transfer metadata;
+- canonical little-endian validation with complete byte/handle accounting; and
+- a compiler frontend that produces one canonical semantic IR consumed by Rust/C/documentation/conformance/fuzzing backends.
+
+Wyrmroot-specific locks remain authoritative where they intentionally differ from FIDL: stable method/event identifiers are explicit numeric IDs rather than source-order or hash-derived ordinals; major/minor versions plus feature negotiation remain explicit; `DwHandle`, Deepwyrm object types/rights, and Channel semantics are native; boundedness requirements remain mandatory; and Rust-first bindings/tooling are preferred.
+
+The WyrmIDL milestone should compare adapting suitable permissively licensed FIDL compiler/generator components against implementing a smaller Rust-native compiler informed by them. Reuse requires file-by-file license/provenance verification and preservation of required notices. Do not fork a large Fuchsia-specific compiler merely to avoid writing a small frontend if the retained Fuchsia policy surface would cost more than it saves.
+
+Keep transport choice below the schema semantics. Deepwyrm Channel transport is the first canonical WyrmIDL transport; a future same-process/colocated optimization may reuse generated protocol semantics only if it preserves the same observable contract and authority checks.
+
+Primary FIDL prior art to inspect and pin at the WyrmIDL implementation milestone includes:
+
+- `https://fuchsia.dev/fuchsia-src/reference/fidl/language/wire-format`
+- `https://fuchsia.dev/fuchsia-src/reference/fidl/language/bindings-spec`
+- `https://fuchsia.googlesource.com/fuchsia/+/refs/heads/main/docs/reference/fidl/language/fidlc.md`
+- `https://fuchsia.dev/docs/contribute/governance/rfcs/0131_fidl_wire_format_principles`
+
+These references inform WyrmIDL; they do not supersede Wyrmroot's locked protocol properties. Pin exact source revisions and record file-level licenses before source adaptation.
+
 ---
 
 # 3. Native naming and namespaces
@@ -218,7 +248,7 @@ Exact at-rest secret storage/encryption is deferred to the identity/security mil
 
 # 5. Native filesystem and pathname semantics
 
-The persistent filesystem implementation is not selected yet, but the native namespace semantics below are locked.
+The initial persistent root filesystem is **ext4**. FAT32 is the EFI System Partition filesystem used for guest-side boot-management access once ordinary userspace owns boot updates. The eventual Wyrmroot-native persistent filesystem/on-disk format remains deliberately unfrozen, but the native namespace semantics below are locked. `WYRMROOT_STORAGE_FILESYSTEM_DIRECTION.md` defines the reached role/sequencing and future-design direction.
 
 ## 5.1 Path component representation
 
@@ -284,6 +314,16 @@ Until a specific native userspace ABI/library major version is deliberately decl
 - no compatibility promise is inferred from a filename such as `libwyrmroot.so.1` unless its ABI contract has actually been specified
 
 Kernel ABI versioning and userspace library ABI versioning are independent.
+
+## 6.4 Kernel-provided native vDSO
+
+Wyrmroot should eventually map a kernel-matched, schema-generated Deepwyrm vDSO into every native process. This object is a special kernel/native-ABI mapping, not evidence that the normal dynamic linker or shared-library dependency graph has become a kernel concern. Static native executables must be able to consume it without `PT_INTERP`.
+
+The public native kernel-facing application ABI should be the vDSO's stable `dw_*` symbol surface; raw syscall numbers/register conventions remain bootstrap/private machine-entry details once the vDSO transition is complete. The image should be immutable to applications, freestanding, relocation-free for normal bootstrap use, and limited to read-only data plus executable code. Safe invariant queries and clock reads may gain userspace fast paths behind the same symbols without changing callers.
+
+The exact startup carrier for locating the vDSO is deferred to the loader/startup-contract milestone; do not import Linux `auxv` merely because Linux/Fuchsia use adjacent mechanisms. Mandatory syscall-origin checking against approved vDSO call sites is also deferred and, if adopted, remains defense in depth rather than a substitute for capability authorization.
+
+Foreign personalities retain their own observable ABI entry machinery. A Linux process may require Linux vDSO/vsyscall semantics and a Windows process may require NT/`ntdll`-style stubs even when their translated operations ultimately consume native Deepwyrm/Wyrmroot facilities.
 
 ---
 
@@ -610,6 +650,20 @@ Use this order:
 
 A generic personality/ABI routing hook may identify which installed personality handler should receive a foreign executable/syscall/event. It must not make generic Process, VM, VFS, wait, Channel, or service operations reinterpret the same request according to caller personality. Modest duplicated personality-side code is acceptable when deduplication would create an omnibus native interface or one-more-flag policy surface.
 
+## 19.5 Foreign ABI translation may converge on WyrmIDL native services
+
+After a personality has decoded a foreign syscall/API and applied that personality's observable semantics, route the **resulting native operation** according to what it fundamentally is:
+
+1. use an admitted Deepwyrm mechanism directly when the operation is privilege-bound/kernel-lifetime state already represented by the native kernel ABI, such as VM protection or a wait primitive;
+2. use a WyrmIDL native service when the operation belongs to Wyrmroot service/policy, such as storage, networking, graphics, audio, device, or other service-owned behavior; or
+3. keep it inside the personality/compatibility service when the semantic object is foreign-specific and does not need a native service operation.
+
+Hybrid foreign objects may choose among these destinations per operation. A Linux fd or Windows HANDLE can wrap a native capability while retaining personality-owned table, inheritance, flag, error, and lifetime behavior. Returned native capabilities may be projected back into Linux fd or Windows HANDLE/object-manager semantics without exposing WyrmIDL to the foreign application.
+
+The foreign ABI terminates at the personality adapter. Native WyrmIDL services receive native semantic requests, not Linux syscall numbers/struct layouts/`errno`, Windows syscall numbers/NT structures/`NTSTATUS`, or a generic personality discriminator. Do not create a universal `org.wyrmroot.compat.Syscall.Invoke(personality, number, args...)` protocol or mechanically serialize every foreign syscall through WyrmIDL.
+
+This is also the width-conversion boundary for service operations: Linux i386/Windows x86 pointer-sized structures are decoded explicitly by the personality and converted into width-neutral WyrmIDL records/handles. Native services must not need to know whether the originating application was 32-bit, 64-bit, Linux, or Windows in order to interpret the same native request.
+
 ---
 
 # 20. Native service restart and failure expectations
@@ -625,6 +679,40 @@ Native clients should be designed with explicit failure behavior:
 - critical services may be supervised, but supervision does not make their IPC endpoints immortal
 
 Service activation, registry, supervision, and dependency management remain distinct responsibilities.
+
+## 20.1 Post-WYR0 userspace bootstrap and persistent-root ordering
+
+The first permanent Wyrmroot control process after the primordial bootstrap is a **small init/supervisor**, not a general system-management monolith. The WYR0 `init0` smoke process is explicitly not this component.
+
+Its boot-critical authority is narrow: consume the immutable bootstrap manifest/capabilities, launch and reap the small set of early processes, distribute only required capabilities, observe READY/failure state, apply bounded restart policy where allowed, and coordinate shutdown/reboot sequencing. A minimal static startup graph is acceptable before the general dependency controller exists.
+
+The default dependency spine is:
+
+```text
+Deepwyrm
+  -> primordial bootstrap
+  -> permanent init/supervisor
+  -> bootstrap service discovery/registry
+  -> device coordinator
+  -> essential driver servers, especially block storage
+  -> VFS + FAT32 ESP access when boot management requires it
+  -> ext4 persistent-root discovery/mount
+  -> normal foundational services + recovery/admin console
+  -> non-boot-critical drivers/subsystems
+  -> login/session/desktop
+```
+
+The service registry remains separate from supervision, and the later general dependency controller remains separate from both. Early bootstrap ordering does not authorize init to accumulate their full policy surfaces.
+
+The device coordinator owns enumeration/binding/ownership/hotplug policy; it is not one giant driver process. Individual drivers or coherent driver families should use separate restartable fault domains where practical. Boot-critical storage drivers and filesystem servers must be launchable from bootfs without first requiring persistent root.
+
+FAT32 support exists early for the EFI System Partition and must become available through Wyrmroot's own block/VFS path before running userspace is expected to inspect or mutate installed boot artifacts. It is not the normal root filesystem. The first persistent root is ext4; reaching and mounting that ext4 root is the boundary before the normal persistent userspace is considered fully online.
+
+Bootfs is therefore a real bootstrap/recovery substrate, not merely an executable smoke-test archive and not the permanent filesystem. It should eventually carry enough trusted components to reach the ext4 persistent root and to leave a bounded recovery environment available when that root filesystem cannot be mounted.
+
+Persistent configuration, package/service state, and the full structured logging/configuration services are not bootstrap prerequisites. Bootstrap-critical policy comes from immutable boot-generation/bootfs metadata; file-backed administrator configuration and the normal `/config`/`/state` model become authoritative only after the persistent namespace is available. Secrets remain separate as already specified.
+
+This ordering is a dependency invariant, not a requirement that every listed component be a single process or that unrelated services serialize unnecessarily. Independent early services may start in parallel once their capabilities and dependencies exist.
 
 ---
 
@@ -656,7 +744,7 @@ The following remain implementation/milestone decisions and must not be inferred
 - physical page allocator algorithm
 - final scheduler algorithm/quantum
 - final normal/real-time scheduler-class representation, priority scale, reservation/admission interface, and urgency-propagation policy
-- persistent filesystem implementation
+- eventual Wyrmroot-native persistent filesystem on-disk format/algorithms beyond the locked initial ext4-root direction
 - dynamic-linker implementation details
 - package recipe syntax beyond already pinned high-level direction
 - final user/account database format
@@ -670,6 +758,8 @@ The following remain implementation/milestone decisions and must not be inferred
 - Secure Boot policy
 - installer design
 - final shared-library ABI
+- exact WyrmIDL surface syntax/compiler implementation and byte layout beyond the locked semantic/evolution/boundedness rules and FIDL prior-art lineage
+- exact native-vDSO startup locator/mapping API and optional syscall-origin enforcement policy beyond the locked kernel-matched symbol ABI direction
 
 These are deferred because implementation experience is likely to improve the decision.
 
@@ -681,6 +771,7 @@ Every future Wyrmroot milestone plan should explicitly check whether it introduc
 
 - native protocol/IDL contract
 - service namespace
+- post-primordial bootstrap/supervision/device/VFS dependency topology
 - filesystem/path semantics
 - configuration/state/cache/secret ownership
 - identity/capability authority

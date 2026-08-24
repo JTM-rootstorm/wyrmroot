@@ -26,11 +26,15 @@ This file defines the minimum architecture reading set for Wyrmroot implementati
 - [`Plans/WYR0_E0_USERSPACE_PROCESS_LOADING_CONTRACT.md`](WYR0_E0_USERSPACE_PROCESS_LOADING_CONTRACT.md) defines the paired static ELF subset, userspace child-construction transaction, capability delegation, rollback, readiness, and exit-observation contract. Read it before WYR0-E/F/G implementation.
 - [`Plans/WYR0_I_NATIVE_CAPABILITY_CONTRACT.md`](WYR0_I_NATIVE_CAPABILITY_CONTRACT.md) defines the generic WYR0-I native capability, bounded supervision/restart, readiness accounting/enforcement classification, peer/generation, and evidence contract. Read it before WYR0-I B/C/D/E/F implementation or any later consumer relies on the DW0-H/WYR0-I capability certificate.
 
+## Forward subsystem architecture
+
+- [`Plans/WYRMROOT_STORAGE_FILESYSTEM_DIRECTION.md`](WYRMROOT_STORAGE_FILESYSTEM_DIRECTION.md) pins the reached storage/filesystem roles: FAT32 for guest-side EFI System Partition management, ext4 as the initial persistent root required for full userspace onlining, and a later XFS-led/ext4-tempered/NTFS-informed native-filesystem track. Read it before post-WYR0 block/VFS/filesystem/root work or native-filesystem planning.
+
 ## Authority rules
 
 - Deepwyrm owns kernel ABI, `DwBootInfo`, syscall/object/right/status definitions, and kernel-facing feature contracts.
 - Wyrmroot owns platform conventions, EFI loader behavior, bootfs contents, native service protocols, userspace process-loading policy, system-service policy, and compatibility personalities.
-- `WYRMROOT_PLATFORM_CONVENTIONS.md` applies to later milestones unless an explicit architecture revision changes it.
+- `WYRMROOT_PLATFORM_CONVENTIONS.md` applies to later milestones unless an explicit architecture revision changes it. Its current locked direction includes FIDL as WyrmIDL's principal prior-art lineage, a post-WYR0 kernel-matched native vDSO consumption boundary, the rule that personality adapters route resulting native operations either directly to Deepwyrm, through typed WyrmIDL services, or keep them personality-local rather than creating a universal foreign-syscall IPC bus, and the post-WYR0 bootstrap spine of small permanent supervisor -> separate discovery -> device/storage drivers -> VFS/filesystem -> ext4 persistent root -> ordinary services while preserving separate fault/policy domains. FAT32 is the early guest-side ESP/boot-management filesystem, not the root filesystem.
 - A milestone plan may add stricter requirements but may not silently weaken a platform convention.
 - If implementation reveals a conflict, stop local invention and route the change through the coordinator/architecture documents.
 - For compatibility-motivated native growth, the cross-personality doctrine is a hard admission overlay: an older statement that compatibility may influence or generalize a native abstraction cannot authorize personality-aware Wyrmroot policy or a broader Deepwyrm primitive. Prefer personality adapters and shared restartable userspace helpers; any kernel change must independently satisfy the stricter privileged-mechanism admission test.

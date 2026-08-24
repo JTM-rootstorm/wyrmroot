@@ -212,20 +212,34 @@ WYR0 PASS
 
 A real console/TTY/shell belongs to WYR1 or a later dedicated plan.
 
-## 2.11 No systemd dependency
+## 2.11 No systemd dependency and post-WYR0 boot spine
 
-WYR0 must not introduce systemd components. The longer-term boot model remains:
+WYR0 must not introduce systemd components. `bootstrap.elf` and `init0` remain temporary proof machinery, not the permanent service architecture.
+
+The default post-WYR0 bring-up spine is:
 
 ```text
 EFI loader
   -> Deepwyrm
-  -> minimal PID 1
-  -> one-shot bootstrap orchestration
-  -> separate supervisor
-  -> separate service dependency controller
+  -> primordial Wyrmroot bootstrap
+  -> small permanent init/supervisor
+  -> separate bootstrap service discovery/registry
+  -> device coordinator
+  -> essential boot driver servers (especially block storage)
+  -> VFS + FAT32 ESP access when boot management requires it
+  -> ext4 persistent-root discovery/mount
+  -> ordinary foundational services + recovery/admin console
+  -> remaining drivers/subsystems
+  -> login/session/desktop
 ```
 
-WYR0 implements only the loader and primordial startup pieces necessary to prove userspace process loading. It does not need the final PID 1 or service system yet.
+The permanent init/supervisor is intentionally narrow. It may consume the immutable boot manifest, spawn/reap processes, distribute initial capabilities, enforce bounded startup/readiness/restart policy, perform boot/shutdown sequencing, and launch the components needed to reach persistent root. It must not absorb device-driver logic, filesystem implementations, the global service registry, general dependency policy, configuration storage, structured logging, scheduled jobs, or package management merely because those services start early.
+
+A small static bootstrap manifest/readiness graph is allowed before the general service dependency controller exists. The general registry/discovery, activation, supervision, and dependency-control responsibilities remain separable components and protocols.
+
+Persistent storage is not a prerequisite for entering useful userspace. The bootfs must remain capable of carrying the permanent supervisor plus enough service-discovery, device, storage, VFS/filesystem, and recovery components to discover and mount the real root. FAT32 support is needed early for native guest access to the EFI System Partition once running userspace owns boot-artifact management; it is not the root filesystem. The first persistent root is ext4, and mounting it is required before the normal persistent userspace is considered fully online. If that ext4 root cannot be mounted, the bootfs path should be able to remain as a bounded recovery environment instead of making failure synonymous with an unusable machine.
+
+WYR0 itself still implements only the loader and primordial startup pieces necessary to prove userspace process loading. It does not implement this permanent supervisor/service/storage stack.
 
 ## 2.12 Scheduling and future real-time boundary
 
@@ -698,6 +712,8 @@ Do not expand WYR0 to include:
 - user accounts/authentication
 - Linux binary compatibility
 - Windows/DOS compatibility
+- general WyrmIDL compiler/bindings and stable native service-protocol rollout beyond the narrow WYR0 bootstrap/evidence protocols
+- post-bootstrap native vDSO transition; WYR0 continues to consume the generated ABI-0 Deepwyrm entry binding
 - Glasswyrm
 - Prismdrake
 - audio
@@ -783,7 +799,7 @@ WYR0 is finished only when all of the following are true:
 - end-to-end WYR0 returns a structured host success/failure result
 - no TTY, shell, service manager, package manager, or persistent filesystem has been pulled into WYR0 as accidental scope
 
-Once these conditions hold, freeze a WYR0 completion commit/tag. WYR1 can then focus on the next real operating-system layer, likely console/TTY, persistent storage/VFS, and the first useful interactive shell, without destabilizing the proven loader/native-process chain.
+Once these conditions hold, freeze a WYR0 completion commit/tag. The next layer should preserve the pinned post-WYR0 spine: replace temporary `init0` with the small permanent supervisor/bootstrap-control path, bring up device/block storage plus VFS/filesystem services from bootfs, make FAT32 ESP access available for native boot management as required, mount the initial ext4 persistent root, then add the foundational recovery/admin console and broader services without destabilizing the proven loader/native-process chain. The later native-filesystem track does not block this first persistent-root bring-up.
 
 ---
 
