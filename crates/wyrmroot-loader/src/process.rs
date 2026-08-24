@@ -522,7 +522,7 @@ pub fn load_process_with_fault<P: LoaderPlatform>(
     transaction.thread = Some(thread);
 
     let mut transfers = [DwHandleTransferV1::default(); 3];
-    let transfer_count = if request.profile == LaunchProfile::Init0 {
+    let transfer_count = if request.profile.has_init0_capabilities() {
         let bootfs = match platform.duplicate(authority.bootfs, BOOTFS_RIGHTS) {
             Ok(handle) => handle,
             Err(cause) => {
@@ -563,7 +563,7 @@ pub fn load_process_with_fault<P: LoaderPlatform>(
     ) {
         return Err(fail(platform, &mut transaction, LoadStage::InitSend, cause));
     }
-    if request.profile == LaunchProfile::Init0 {
+    if request.profile.has_init0_capabilities() {
         transaction.root = None;
         transaction.delegated_bootfs = None;
         transaction.delegated_task_group = None;

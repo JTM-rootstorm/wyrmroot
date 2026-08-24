@@ -33,6 +33,23 @@ fn exact_init0_round_trip_validates_roles_and_handles() {
 }
 
 #[test]
+fn i2_stress_uses_the_same_explicit_three_capability_contract_as_init0() {
+    let mut bytes = [0; INIT0_BYTES];
+    let handles = init0_handles();
+    assert_eq!(
+        launch::encode_init(LaunchProfile::I2Stress, 0x2201, &mut bytes),
+        Ok(INIT0_BYTES)
+    );
+    assert_eq!(
+        launch::parse_init(LaunchProfile::I2Stress, &bytes, &handles)
+            .unwrap()
+            .transaction_id,
+        0x2201
+    );
+    assert!(launch::parse_init(LaunchProfile::I2Stress, &bytes, &handles[..2]).is_err());
+}
+
+#[test]
 fn hello_and_ready_are_handle_free_exact_headers() {
     let mut init = [0xaa; HEADER_BYTES];
     launch::encode_init(LaunchProfile::Hello, 9, &mut init).unwrap();

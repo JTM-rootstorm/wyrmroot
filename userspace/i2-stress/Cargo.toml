@@ -1,34 +1,30 @@
 [package]
-name = "wyrmroot-init0"
+name = "wyrmroot-i2-stress"
 version = "0.0.0"
 edition = "2024"
 publish = false
-description = "Temporary native WYR0 init0 process"
+description = "Bounded native WYR0 I2 runtime-stress payload"
 license = "GPL-3.0-or-later"
 
 [lib]
 path = "src/lib.rs"
 
 [[bin]]
-name = "wyrmroot-init0"
+name = "wyrmroot-i2-stress"
 path = "src/main.rs"
 test = false
 bench = false
-required-features = ["native-init0"]
+required-features = ["native-i2-stress"]
 
 [features]
 default = []
-native-init0 = []
-i2-stress-integration = []
+native-i2-stress = []
 
 [dependencies]
 deepwyrm-syscall.workspace = true
 wyrmroot-bootfs = { path = "../../crates/wyrmroot-bootfs" }
 wyrmroot-loader = { path = "../../crates/wyrmroot-loader" }
 wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }
-
-[dev-dependencies]
-wyrmroot-bootfs = { path = "../../crates/wyrmroot-bootfs", features = ["builder"] }
 
 [lints.rust]
 unsafe_code = "deny"

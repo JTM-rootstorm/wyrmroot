@@ -34,13 +34,16 @@ pub const LOADER_TASK_GROUP_RIGHTS: DwRights =
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LaunchProfile {
     Init0,
+    /// Test-only I2 controller.  It receives the same explicitly delegated
+    /// construction authority as init0, but is selected only by the I2 image.
+    I2Stress,
     Hello,
 }
 
 impl LaunchProfile {
     pub const fn capability_count(self) -> usize {
         match self {
-            Self::Init0 => 3,
+            Self::Init0 | Self::I2Stress => 3,
             Self::Hello => 0,
         }
     }
@@ -93,7 +96,7 @@ pub fn encode_init(
         profile.capability_count() as u32,
         transaction_id,
     );
-    if profile == LaunchProfile::Init0 {
+    if profile.has_init0_capabilities() {
         for (index, role) in [ROLE_SELF_ROOT, ROLE_BOOTFS, ROLE_LOADER_TASK_GROUP]
             .into_iter()
             .enumerate()
@@ -118,7 +121,7 @@ pub fn parse_init(
     if handles.len() != profile.capability_count() {
         return Err(LaunchError::HandleCount);
     }
-    if profile == LaunchProfile::Init0 {
+    if profile.has_init0_capabilities() {
         let expected = [
             (
                 ROLE_SELF_ROOT,
@@ -145,6 +148,12 @@ pub fn parse_init(
         transaction_id,
         profile,
     })
+}
+
+impl LaunchProfile {
+    pub const fn has_init0_capabilities(self) -> bool {
+        matches!(self, Self::Init0 | Self::I2Stress)
+    }
 }
 
 pub fn encode_ready(transaction_id: u64, output: &mut [u8]) -> Result<usize, LaunchError> {

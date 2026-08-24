@@ -9,6 +9,7 @@ members = [
     "loader",
     "tools/xtask",
     "userspace/hello",
+    "userspace/i2-stress",
     "userspace/init0",
     "userspace/loader-smoke",
 ]

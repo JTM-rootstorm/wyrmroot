@@ -27,6 +27,10 @@ use wyrmroot_runtime::{
 
 /// The only bootfs path selected by the WYR0-G descendant smoke chain.
 pub const HELLO_PATH: &[u8] = b"bin/hello";
+/// The I2 image deliberately replaces the normal hello artifact at this path
+/// with the dedicated stress controller.  Normal init0 images never select it.
+#[cfg(feature = "i2-stress-integration")]
+pub const I2_STRESS_PATH: &[u8] = b"bin/hello";
 /// Nonzero WRLP transaction identifier for the `init0 -> hello` launch.
 pub const HELLO_TRANSACTION_ID: u64 = 2;
 
@@ -324,7 +328,7 @@ pub fn run_init0<
         let mut loaded = None;
         let mapped =
             system.with_bootfs_bytes(authority.parent_root, authority.bootfs, plan, |bootfs| {
-                match load_hello(loader, authority, bootfs) {
+                match load_selected_child(loader, authority, bootfs) {
                     Ok(candidate) => {
                         loaded = Some(candidate);
                         Ok(())
@@ -378,13 +382,17 @@ fn bootfs_mapping_plan<System: Init0System>(
         .and_then(|size| MappingPlan::for_bootfs(size).map_err(Init0Error::Mapping))
 }
 
-fn load_hello<Loader: LoaderPlatform<Error = NativeError>>(
+fn load_selected_child<Loader: LoaderPlatform<Error = NativeError>>(
     loader: &mut Loader,
     authority: LoadAuthority,
     bytes: &[u8],
 ) -> Result<LoadedProcess, Init0Error> {
     let archive = Archive::new(bytes).map_err(Init0Error::Bootfs)?;
-    let entry = archive.lookup(HELLO_PATH).map_err(|error| match error {
+    #[cfg(feature = "i2-stress-integration")]
+    let path = I2_STRESS_PATH;
+    #[cfg(not(feature = "i2-stress-integration"))]
+    let path = HELLO_PATH;
+    let entry = archive.lookup(path).map_err(|error| match error {
         LookupError::NotFound | LookupError::InvalidPath(_) => Init0Error::MissingHello,
     })?;
     if !entry.is_executable() || entry.data().is_empty() {
@@ -397,11 +405,22 @@ fn load_hello<Loader: LoaderPlatform<Error = NativeError>>(
         LoadRequest {
             image: entry.data(),
             display_path,
-            profile: LaunchProfile::Hello,
+            profile: selected_profile(),
             transaction_id: HELLO_TRANSACTION_ID,
         },
     )
     .map_err(Init0Error::Loader)
+}
+
+const fn selected_profile() -> LaunchProfile {
+    #[cfg(feature = "i2-stress-integration")]
+    {
+        LaunchProfile::I2Stress
+    }
+    #[cfg(not(feature = "i2-stress-integration"))]
+    {
+        LaunchProfile::Hello
+    }
 }
 
 fn cleanup_loaded_process<System: Init0System, Loader: LoaderPlatform<Error = NativeError>>(
