@@ -49,6 +49,15 @@ fn live_exit_code_identifies_init0_owned_failure() {
         Init0Error::Launch(LaunchError::BadCapabilityRole { index: 2 }).exit_code(),
         0x1000_0312
     );
+    assert_eq!(
+        Init0Error::Cleanup(NativeError::Status(DwStatus(-73))).exit_code(),
+        0x1200_0049
+    );
+    assert_eq!(
+        Init0Error::Cleanup(NativeError::Output(NativeOutputError::InvalidWaitResult))
+            .exit_code(),
+        0x1200_8006
+    );
 }
 
 #[test]

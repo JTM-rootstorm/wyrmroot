@@ -120,9 +120,20 @@ impl Init0Error {
                 wyrmroot_runtime::ExitValidationError::NonzeroApplicationCode(code),
             )) => *code,
             Self::Supervision(_) => PREFIX | 0x0200,
-            Self::Cleanup(_) => PREFIX | 0x0300,
+            Self::Cleanup(error) => cleanup_exit_code(*error),
             Self::MissingLoadedProcess => PREFIX | 0x0301,
         }
+    }
+}
+
+/// Encodes final descendant-cleanup failures without collapsing the native
+/// cause. The `0x12` high byte is init0-owned; bit 15 distinguishes bounded
+/// native-output failures from native status values.
+const fn cleanup_exit_code(error: NativeError) -> u32 {
+    const PREFIX: u32 = 0x1200_0000;
+    match error {
+        NativeError::Status(status) => PREFIX | bounded_status_code(status.0.unsigned_abs()),
+        NativeError::Output(output) => PREFIX | 0x8000 | native_output_code(output),
     }
 }
 

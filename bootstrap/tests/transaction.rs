@@ -96,6 +96,18 @@ fn live_exit_code_identifies_bootstrap_owned_failure() {
         .exit_code(),
         0xB101_8001
     );
+    assert_eq!(
+        BootstrapError::Cleanup(NativeError::Status(deepwyrm_syscall::DwStatus(-73)))
+            .exit_code(),
+        0xB200_0049
+    );
+    assert_eq!(
+        BootstrapError::Cleanup(NativeError::Output(
+            wyrmroot_runtime::NativeOutputError::InvalidWaitResult,
+        ))
+        .exit_code(),
+        0xB200_8006
+    );
 }
 
 struct Fixture {

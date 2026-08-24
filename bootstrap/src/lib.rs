@@ -255,9 +255,22 @@ impl BootstrapError {
                 wyrmroot_runtime::ExitValidationError::NonzeroApplicationCode(code),
             )) => *code,
             Self::Supervision(_) => PREFIX | 0x0200,
-            Self::Cleanup(_) => PREFIX | 0x0300,
+            Self::Cleanup(error) => cleanup_exit_code(*error),
             Self::MissingLoadedProcess => PREFIX | 0x0301,
         }
+    }
+}
+
+/// Encodes final child-cleanup failures without collapsing the native cause.
+///
+/// The `0xB2` high byte is bootstrap-owned. Bit 15 distinguishes bounded
+/// native-output failures from native status values; the low 15 bits retain
+/// the same cause encoding used by loader-stage diagnostics.
+const fn cleanup_exit_code(error: NativeError) -> u32 {
+    const PREFIX: u32 = 0xB200_0000;
+    match error {
+        NativeError::Status(status) => PREFIX | bounded_status_code(status.0.unsigned_abs()),
+        NativeError::Output(output) => PREFIX | 0x8000 | native_output_code(output),
     }
 }
 
