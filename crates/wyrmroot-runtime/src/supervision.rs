@@ -251,12 +251,18 @@ pub fn supervise_child<P: SupervisionPlatform>(
                 }
                 launch::parse_ready(&bytes, transaction_id).map_err(SupervisionError::Ready)?;
                 ready = true;
-            } else if !ready {
+                // Channel signals are level-triggered, but this wait result predates the
+                // receive.  In particular, a combined READABLE | PEER_CLOSED result does not
+                // prove that the datagram just received was the final queued datagram.  Always
+                // wait again so a second valid, malformed, or capability-bearing datagram is
+                // observed and rejected before terminal peer closure is accepted.
+                continue;
+            }
+            if !ready {
                 return Err(SupervisionError::PeerClosedBeforeReady);
             }
-            if ready && result.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 {
-                monitor_channel = false;
-            }
+            // PEER_CLOSED is accepted only from this fresh wait with no READABLE bit.
+            monitor_channel = false;
             continue;
         }
 
@@ -337,14 +343,17 @@ fn drain_terminal_launch_channel<P: SupervisionPlatform>(
                 SupervisionError::ExitObservedReadiness(ExitObservedReadinessError::Ready(error))
             })?;
             ready = true;
+            // The wait result predates the receive.  Require a fresh level-triggered wait
+            // before accepting terminal peer closure so any additional queued datagram is
+            // consumed and rejected.
+            continue;
         }
-        if result.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 {
-            return if ready {
-                Ok(())
-            } else {
-                Err(SupervisionError::ExitedBeforeReady)
-            };
-        }
+        // PEER_CLOSED is accepted only from this fresh wait with no READABLE bit.
+        return if ready {
+            Ok(())
+        } else {
+            Err(SupervisionError::ExitedBeforeReady)
+        };
     }
 }
 
@@ -379,6 +388,7 @@ mod tests {
         Valid,
         Malformed,
         WrongTransaction,
+        CapabilityBearing,
     }
 
     struct Mock {
@@ -453,6 +463,13 @@ mod tests {
                 ReadyPayload::WrongTransaction => {
                     launch::encode_ready(8, bytes).unwrap();
                 }
+                ReadyPayload::CapabilityBearing => {
+                    launch::encode_ready(7, bytes).unwrap();
+                    return Ok(ReceiveCounts {
+                        bytes: HEADER_BYTES,
+                        handles: 1,
+                    });
+                }
             }
             Ok(self.counts)
         }
@@ -512,7 +529,7 @@ mod tests {
 
     #[test]
     fn accepts_queued_ready_when_exit_first_terminal_channel_is_readable_and_closed() {
-        let mut mock = Mock::successful(&[EXITED, READY_AND_CLOSED]);
+        let mut mock = Mock::successful(&[EXITED, READY_AND_CLOSED, CLOSED]);
         assert_eq!(
             supervise_child(&mut mock, DwHandle(1), DwHandle(2), 7, DwDeadline(99)),
             Ok(())
@@ -560,7 +577,7 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_ready_queued_after_exit_without_retermination() {
-        let mut mock = Mock::successful(&[EXITED, READY, READY]);
+        let mut mock = Mock::successful(&[EXITED, READY_AND_CLOSED, READY]);
         let error = supervise_child(&mut mock, DwHandle(1), DwHandle(2), 7, DwDeadline(99));
         assert_eq!(
             error,
@@ -621,7 +638,7 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_ready_before_process_exit() {
-        let mut mock = Mock::successful(&[READY, READY]);
+        let mut mock = Mock::successful(&[READY_AND_CLOSED, READY]);
         assert_eq!(
             supervise_child(&mut mock, DwHandle(1), DwHandle(2), 7, DwDeadline(99)),
             Err(SupervisionError::DuplicateReady)
@@ -630,7 +647,7 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_ready_queued_in_the_process_exit_race() {
-        let mut mock = Mock::successful(&[READY, EXITED, READY]);
+        let mut mock = Mock::successful(&[READY, EXITED, READY_AND_CLOSED]);
         assert_eq!(
             supervise_child(&mut mock, DwHandle(1), DwHandle(2), 7, DwDeadline(99)),
             Err(SupervisionError::ExitObservedReadiness(
@@ -650,6 +667,63 @@ mod tests {
                 handles: 1,
             }))
         );
+    }
+
+    #[test]
+    fn stale_peer_close_does_not_hide_a_malformed_second_datagram() {
+        let mut mock = Mock::successful(&[READY_AND_CLOSED, READY]);
+        mock.payloads = &[ReadyPayload::Valid, ReadyPayload::Malformed];
+        assert_eq!(
+            supervise_child(&mut mock, DwHandle(1), DwHandle(2), 7, DwDeadline(99)),
+            Err(SupervisionError::DuplicateReady)
+        );
+        assert_eq!(mock.received, 2);
+    }
+
+    #[test]
+    fn stale_peer_close_does_not_hide_a_capability_bearing_second_datagram() {
+        let mut mock = Mock::successful(&[READY_AND_CLOSED, READY]);
+        mock.payloads = &[ReadyPayload::Valid, ReadyPayload::CapabilityBearing];
+        assert_eq!(
+            supervise_child(&mut mock, DwHandle(1), DwHandle(2), 7, DwDeadline(99)),
+            Err(SupervisionError::InvalidReadyReceive(ReceiveCounts {
+                bytes: HEADER_BYTES,
+                handles: 1,
+            }))
+        );
+        assert_eq!(mock.received, 2);
+    }
+
+    #[test]
+    fn exit_first_stale_peer_close_does_not_hide_a_malformed_second_datagram() {
+        let mut mock = Mock::successful(&[EXITED, READY_AND_CLOSED, READY]);
+        mock.payloads = &[ReadyPayload::Valid, ReadyPayload::Malformed];
+        let error = supervise_child(&mut mock, DwHandle(1), DwHandle(2), 7, DwDeadline(99));
+        assert_eq!(
+            error,
+            Err(SupervisionError::ExitObservedReadiness(
+                ExitObservedReadinessError::DuplicateReady
+            ))
+        );
+        assert_eq!(mock.received, 2);
+        assert!(error.unwrap_err().process_exit_observed());
+    }
+
+    #[test]
+    fn exit_first_stale_peer_close_does_not_hide_a_capability_bearing_second_datagram() {
+        let mut mock = Mock::successful(&[EXITED, READY_AND_CLOSED, READY]);
+        mock.payloads = &[ReadyPayload::Valid, ReadyPayload::CapabilityBearing];
+        let error = supervise_child(&mut mock, DwHandle(1), DwHandle(2), 7, DwDeadline(99));
+        assert_eq!(
+            error,
+            Err(SupervisionError::ExitObservedReadiness(
+                ExitObservedReadinessError::InvalidReadyReceive(ReceiveCounts {
+                    bytes: HEADER_BYTES,
+                    handles: 1,
+                })
+            ))
+        );
+        assert!(error.unwrap_err().process_exit_observed());
     }
 
     #[test]
