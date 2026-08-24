@@ -2,7 +2,9 @@
 
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
@@ -12,7 +14,9 @@ use wyrmroot_bootfs::builder::{Builder, FileMode};
 
 use crate::cli::{G3ImageArguments, HProfile};
 use crate::error::Failure;
-use crate::h_request::{self, EvidenceRequest, ExpectedOutcome, HRequest, I1_EVIDENCE_PROTOCOL};
+use crate::h_request::{
+    self, CheckedOutputRoot, EvidenceRequest, ExpectedOutcome, HRequest, I1_EVIDENCE_PROTOCOL,
+};
 use crate::sha256;
 
 const MAX_GUEST_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
@@ -31,6 +35,14 @@ const PROOF_TLB_ACK: u32 = 1 << 6;
 const PROOF_RENDEZVOUS_RECLAIM: u32 = 1 << 7;
 const DEFAULT_MEMORY_MIB: u32 = 1024;
 const SMP_MEMORY_MIB: u32 = 2048;
+const O_NOFOLLOW: i32 = 0o400000;
+const F_GETFD: i32 = 1;
+const F_SETFD: i32 = 2;
+const FD_CLOEXEC: i32 = 1;
+
+unsafe extern "C" {
+    fn fcntl(file_descriptor: i32, command: i32, ...) -> i32;
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ExecutionKind {
@@ -136,7 +148,7 @@ struct GuestTranscript {
     evidence: Option<ValidatedEvidence>,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct CandidateArtifacts {
     loader: PathBuf,
     kernel: PathBuf,
@@ -146,6 +158,74 @@ struct CandidateArtifacts {
     hello: PathBuf,
     ovmf_code: PathBuf,
     ovmf_vars_template: PathBuf,
+}
+
+#[derive(Debug)]
+struct StableRunFile {
+    path: PathBuf,
+    file: fs::File,
+    digest: String,
+    immutable: bool,
+}
+
+impl StableRunFile {
+    fn child_path(&self) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+    }
+
+    fn set_inheritable(&self, inheritable: bool) -> Result<(), Failure> {
+        let descriptor = self.file.as_raw_fd();
+        if inheritable {
+            let mut file = self.file.try_clone().map_err(|error| {
+                Failure::task(format!("could not clone run-local descriptor: {error}"))
+            })?;
+            file.seek(SeekFrom::Start(0)).map_err(|error| {
+                Failure::task(format!("could not rewind run-local descriptor: {error}"))
+            })?;
+        }
+        // SAFETY: fcntl is called with a live descriptor owned by this object and the documented
+        // F_GETFD/F_SETFD integer commands. No pointer argument or borrowed memory crosses FFI.
+        let flags = unsafe { fcntl(descriptor, F_GETFD) };
+        if flags < 0 {
+            return Err(Failure::task(format!(
+                "could not inspect run-local descriptor flags: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let updated = if inheritable {
+            flags & !FD_CLOEXEC
+        } else {
+            flags | FD_CLOEXEC
+        };
+        // SAFETY: the live descriptor and integer flag value satisfy the F_SETFD contract.
+        if unsafe { fcntl(descriptor, F_SETFD, updated) } < 0 {
+            return Err(Failure::task(format!(
+                "could not update run-local descriptor flags: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(())
+    }
+
+    fn verify_unchanged(&self, label: &str) -> Result<(), Failure> {
+        if !self.immutable {
+            return Ok(());
+        }
+        let mut file = self.file.try_clone().map_err(|error| {
+            Failure::task(format!("could not clone run-local {label}: {error}"))
+        })?;
+        file.seek(SeekFrom::Start(0)).map_err(|error| {
+            Failure::task(format!("could not rewind run-local {label}: {error}"))
+        })?;
+        let digest = sha256::reader_digest(&mut file)
+            .map_err(|error| Failure::task(format!("could not hash run-local {label}: {error}")))?;
+        if digest != self.digest {
+            return Err(Failure::task(format!(
+                "run-local {label} changed after it was opened"
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -182,24 +262,27 @@ impl HProfile {
 
 pub(crate) fn build(request_path: &str) -> Result<String, Failure> {
     let request = h_request::load(Path::new(request_path))?;
+    let outputs = CheckedOutputRoot::open(&request)?;
     verify_source_revisions(&request)?;
     let artifacts = verify_candidate_inputs(&request)?;
-    require_absent(&request, &request.bootfs, "bootfs output")?;
-    require_absent(&request, &request.esp, "ESP output")?;
-    require_absent(&request, &request.provenance, "provenance output")?;
+    require_absent(&outputs, &request.bootfs, "bootfs output")?;
+    require_absent(&outputs, &request.esp, "ESP output")?;
+    require_absent(&outputs, &request.provenance, "provenance output")?;
 
     let bootfs = build_bootfs_bytes(&artifacts)?;
-    write_new(&request, &request.bootfs, &bootfs, "bootfs")?;
-    let image_arguments = image_arguments(&request, &artifacts);
+    write_new(&outputs, &request.bootfs, &bootfs, "bootfs")?;
+    let esp_target = outputs.target(&request.esp, "ESP output")?;
+    let mut image_arguments = image_arguments(&request, &artifacts);
+    image_arguments.image = esp_target.path().display().to_string();
     let result = (|| {
-        crate::g3_image::build_in_root(&image_arguments, request.path.parent())?;
-        write_provenance(&request, &artifacts)?;
+        crate::g3_image::build_in_root(&image_arguments, Some(&outputs.directory_path()))?;
+        write_provenance(&outputs, &request, &artifacts)?;
         inspect_loaded(&request, &artifacts)
     })();
     if result.is_err() {
-        remove_created(&request.provenance);
-        remove_created(&request.esp);
-        remove_created(&request.bootfs);
+        remove_created(&outputs, &request.provenance, "provenance");
+        remove_created(&outputs, &request.esp, "ESP");
+        remove_created(&outputs, &request.bootfs, "bootfs");
     }
     result
 }
@@ -213,20 +296,22 @@ pub(crate) fn inspect(request_path: &str) -> Result<String, Failure> {
 
 pub(crate) fn run(profile: HProfile, request_path: &str) -> Result<String, Failure> {
     let request = h_request::load(Path::new(request_path))?;
+    let outputs = CheckedOutputRoot::open(&request)?;
     validate_execution_profile(&request, Some(profile))?;
     verify_source_revisions(&request)?;
     let artifacts = verify_candidate_inputs(&request)?;
     inspect_loaded(&request, &artifacts)?;
-    execute(profile, &request, &artifacts, ExecutionKind::Run)
+    execute(profile, &request, &artifacts, &outputs, ExecutionKind::Run)
 }
 
 pub(crate) fn gdb(profile: HProfile, request_path: &str) -> Result<String, Failure> {
     let request = h_request::load(Path::new(request_path))?;
+    let outputs = CheckedOutputRoot::open(&request)?;
     validate_execution_profile(&request, Some(profile))?;
     verify_source_revisions(&request)?;
     let artifacts = verify_candidate_inputs(&request)?;
     inspect_loaded(&request, &artifacts)?;
-    execute(profile, &request, &artifacts, ExecutionKind::Gdb)
+    execute(profile, &request, &artifacts, &outputs, ExecutionKind::Gdb)
 }
 
 pub(crate) fn integration(
@@ -234,38 +319,49 @@ pub(crate) fn integration(
     request_path: &str,
 ) -> Result<String, Failure> {
     let request = h_request::load(Path::new(request_path))?;
+    let outputs = CheckedOutputRoot::open(&request)?;
     validate_execution_profile(&request, profile)?;
     verify_source_revisions(&request)?;
     let artifacts = verify_candidate_inputs(&request)?;
-    if outputs_all_absent(&request)? {
+    if outputs_all_absent(&outputs, &request)? {
         let bootfs = build_bootfs_bytes(&artifacts)?;
-        write_new(&request, &request.bootfs, &bootfs, "bootfs")?;
-        let image_arguments = image_arguments(&request, &artifacts);
+        write_new(&outputs, &request.bootfs, &bootfs, "bootfs")?;
+        let esp_target = outputs.target(&request.esp, "ESP output")?;
+        let mut image_arguments = image_arguments(&request, &artifacts);
+        image_arguments.image = esp_target.path().display().to_string();
         let result = (|| {
-            crate::g3_image::build_in_root(&image_arguments, request.path.parent())?;
-            write_provenance(&request, &artifacts)
+            crate::g3_image::build_in_root(&image_arguments, Some(&outputs.directory_path()))?;
+            write_provenance(&outputs, &request, &artifacts)
         })();
         if let Err(error) = result {
-            remove_created(&request.provenance);
-            remove_created(&request.esp);
-            remove_created(&request.bootfs);
+            remove_created(&outputs, &request.provenance, "provenance");
+            remove_created(&outputs, &request.esp, "ESP");
+            remove_created(&outputs, &request.bootfs, "bootfs");
             return Err(error);
         }
     }
     let inspection = inspect_loaded(&request, &artifacts)?;
     match profile {
-        Some(profile) => execute(profile, &request, &artifacts, ExecutionKind::Integration),
+        Some(profile) => execute(
+            profile,
+            &request,
+            &artifacts,
+            &outputs,
+            ExecutionKind::Integration,
+        ),
         None => {
             let default = execute(
                 HProfile::Default,
                 &request,
                 &artifacts,
+                &outputs,
                 ExecutionKind::Integration,
             );
             let smp = execute(
                 HProfile::Smp,
                 &request,
                 &artifacts,
+                &outputs,
                 ExecutionKind::Integration,
             );
             join_profile_results(&inspection, default, smp)
@@ -291,16 +387,25 @@ fn join_profile_results(
     smp: Result<String, Failure>,
 ) -> Result<String, Failure> {
     match (default, smp) {
-        (Ok(default), Ok(smp)) => Ok(format!(
-            concat!(
-                "{{\"schema_version\":2,\"phase\":\"WYR0-H\",",
-                "\"status\":\"PASS\",\"same_media\":true,",
-                "\"inspection\":{},\"default\":{},\"smp\":{}}}\n"
-            ),
-            inspection.trim(),
-            default.trim(),
-            smp.trim()
-        )),
+        (Ok(default), Ok(smp)) => {
+            let default_candidate = result_candidate_digest(&default)?;
+            let smp_candidate = result_candidate_digest(&smp)?;
+            if default_candidate != smp_candidate {
+                return Err(Failure::task(
+                    "paired WYR0-H integration profiles consumed different run-local candidates",
+                ));
+            }
+            Ok(format!(
+                concat!(
+                    "{{\"schema_version\":2,\"phase\":\"WYR0-H\",",
+                    "\"status\":\"PASS\",\"same_media\":true,",
+                    "\"inspection\":{},\"default\":{},\"smp\":{}}}\n"
+                ),
+                inspection.trim(),
+                default.trim(),
+                smp.trim()
+            ))
+        }
         (Err(default), Ok(_)) => Err(Failure::task(format!(
             "paired WYR0-H integration failed: default: {}",
             default.message
@@ -314,6 +419,28 @@ fn join_profile_results(
             default.message, smp.message
         ))),
     }
+}
+
+fn result_candidate_digest(result: &str) -> Result<&str, Failure> {
+    let marker = "\"candidate_sha256\":\"";
+    let start = result
+        .find(marker)
+        .map(|index| index + marker.len())
+        .ok_or_else(|| Failure::task("WYR0-H profile result omitted its candidate digest"))?;
+    let digest = result
+        .get(start..start + 64)
+        .filter(|digest| {
+            digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or_else(|| Failure::task("WYR0-H profile result has an invalid candidate digest"))?;
+    if result.as_bytes().get(start + 64) != Some(&b'"') {
+        return Err(Failure::task(
+            "WYR0-H profile result has an invalid candidate digest",
+        ));
+    }
+    Ok(digest)
 }
 
 fn inspect_loaded(request: &HRequest, artifacts: &CandidateArtifacts) -> Result<String, Failure> {
@@ -445,10 +572,14 @@ fn image_arguments(request: &HRequest, artifacts: &CandidateArtifacts) -> G3Imag
     }
 }
 
-fn write_provenance(request: &HRequest, artifacts: &CandidateArtifacts) -> Result<(), Failure> {
+fn write_provenance(
+    outputs: &CheckedOutputRoot,
+    request: &HRequest,
+    artifacts: &CandidateArtifacts,
+) -> Result<(), Failure> {
     let contents = provenance_contents(request, artifacts)?;
     write_new(
-        request,
+        outputs,
         &request.provenance,
         contents.as_bytes(),
         "provenance",
@@ -518,7 +649,7 @@ fn candidate_digests(
     request: &HRequest,
     artifacts: &CandidateArtifacts,
 ) -> Result<CandidateDigests, Failure> {
-    let request_digest = digest(&request.path, "WYR0-H request")?;
+    let request_digest = request.request_sha256.clone();
     let loader = digest(&artifacts.loader, "loader.efi")?;
     let kernel = digest(&artifacts.kernel, "deepwyrm.elf")?;
     let symbols = digest(&artifacts.symbols, "Deepwyrm symbols")?;
@@ -529,7 +660,52 @@ fn candidate_digests(
     let esp = digest(&request.esp, "ESP")?;
     let ovmf_code = digest(&artifacts.ovmf_code, "OVMF code")?;
     let ovmf_vars_template = digest(&artifacts.ovmf_vars_template, "OVMF vars template")?;
-    let candidate = sha256::bytes_digest(
+    let candidate = candidate_identity_digest(
+        request,
+        &request_digest,
+        &loader,
+        &kernel,
+        &symbols,
+        &bootstrap,
+        &init0,
+        &hello,
+        &bootfs,
+        &esp,
+        &ovmf_code,
+        &ovmf_vars_template,
+    );
+    Ok(CandidateDigests {
+        request: request_digest,
+        loader,
+        kernel,
+        symbols,
+        bootstrap,
+        init0,
+        hello,
+        bootfs,
+        esp,
+        ovmf_code,
+        ovmf_vars_template,
+        candidate,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn candidate_identity_digest(
+    request: &HRequest,
+    request_digest: &str,
+    loader: &str,
+    kernel: &str,
+    symbols: &str,
+    bootstrap: &str,
+    init0: &str,
+    hello: &str,
+    bootfs: &str,
+    esp: &str,
+    ovmf_code: &str,
+    ovmf_vars_template: &str,
+) -> String {
+    sha256::bytes_digest(
         format!(
             concat!(
                 "wyr0-h-candidate-v1\nrequest={}\n",
@@ -560,21 +736,41 @@ fn candidate_digests(
             ovmf_vars_template,
         )
         .as_bytes(),
+    )
+}
+
+fn run_candidate_digests(
+    request: &HRequest,
+    artifacts: &CandidateArtifacts,
+    run: &RunPaths,
+) -> Result<CandidateDigests, Failure> {
+    let mut digests = candidate_digests(request, artifacts)?;
+    digests.request.clone_from(&run.request.digest);
+    digests.loader.clone_from(&run.loader.digest);
+    digests.kernel.clone_from(&run.kernel.digest);
+    digests.symbols.clone_from(&run.symbols.digest);
+    digests.bootstrap.clone_from(&run.bootstrap.digest);
+    digests.init0.clone_from(&run.init0.digest);
+    digests.hello.clone_from(&run.hello.digest);
+    digests.bootfs.clone_from(&run.bootfs.digest);
+    digests.esp.clone_from(&run.esp.digest);
+    digests.ovmf_code.clone_from(&run.ovmf_code.digest);
+    digests.ovmf_vars_template.clone_from(&run.vars.digest);
+    digests.candidate = candidate_identity_digest(
+        request,
+        &digests.request,
+        &digests.loader,
+        &digests.kernel,
+        &digests.symbols,
+        &digests.bootstrap,
+        &digests.init0,
+        &digests.hello,
+        &digests.bootfs,
+        &digests.esp,
+        &digests.ovmf_code,
+        &digests.ovmf_vars_template,
     );
-    Ok(CandidateDigests {
-        request: request_digest,
-        loader,
-        kernel,
-        symbols,
-        bootstrap,
-        init0,
-        hello,
-        bootfs,
-        esp,
-        ovmf_code,
-        ovmf_vars_template,
-        candidate,
-    })
+    Ok(digests)
 }
 
 fn manifest_json_fields(digests: &CandidateDigests, provenance: &str) -> String {
@@ -607,9 +803,10 @@ fn manifest_json_fields(digests: &CandidateDigests, provenance: &str) -> String 
 fn result_manifest_json(
     request: &HRequest,
     artifacts: &CandidateArtifacts,
+    run: &RunPaths,
 ) -> Result<String, Failure> {
-    let digests = candidate_digests(request, artifacts)?;
-    let provenance = digest(&request.provenance, "provenance")?;
+    let digests = run_candidate_digests(request, artifacts, run)?;
+    let provenance = run.provenance.digest.clone();
     Ok(manifest_json_fields(&digests, &provenance))
 }
 
@@ -619,6 +816,7 @@ fn result_manifest_json(
 fn revalidate_before_pass(
     request: &HRequest,
     artifacts: &CandidateArtifacts,
+    run: &RunPaths,
     pre_execution_manifest: &str,
 ) -> Result<(), Failure> {
     let reloaded = h_request::load(&request.path)?;
@@ -635,7 +833,8 @@ fn revalidate_before_pass(
         ));
     }
     inspect_loaded(&reloaded, &current)?;
-    if result_manifest_json(&reloaded, &current)? != pre_execution_manifest {
+    run.verify_immutable()?;
+    if result_manifest_json(&reloaded, &current, run)? != pre_execution_manifest {
         return Err(Failure::task(
             "WYR0-H candidate digest changed after inspection; refusing PASS evidence",
         ));
@@ -647,35 +846,41 @@ fn execute(
     profile: HProfile,
     request: &HRequest,
     artifacts: &CandidateArtifacts,
+    outputs: &CheckedOutputRoot,
     kind: ExecutionKind,
 ) -> Result<String, Failure> {
-    let run = prepare_run_directory(profile, request, artifacts)?;
-    let pre_execution_manifest = result_manifest_json(request, artifacts)?;
+    let run = prepare_run_directory(profile, request, artifacts, outputs)?;
+    let pre_execution_manifest = result_manifest_json(request, artifacts, &run)?;
     let args = qemu_arguments(profile, request, artifacts, kind, &run);
+    run.set_qemu_inheritable(true)?;
     let spawned = Command::new("qemu-system-x86_64")
         .args(&args)
-        .current_dir(
-            request
-                .path
-                .parent()
-                .ok_or_else(|| Failure::task("WYR0-H request has no parent"))?,
-        )
+        .current_dir(outputs.directory_path())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(open_new(
-            request,
+            outputs,
             &run.stderr_log,
             "QEMU stderr",
         )?))
         .spawn();
+    let restore_result = run.set_qemu_inheritable(false);
     let mut child = match spawned {
-        Ok(child) => child,
+        Ok(mut child) => {
+            if let Err(error) = restore_result {
+                let _ = stop_child(&mut child);
+                return Err(error);
+            }
+            child
+        }
         Err(error) => {
+            restore_result?;
             if kind == ExecutionKind::Integration {
                 write_integration_host_failure(
                     profile,
                     request,
                     artifacts,
+                    outputs,
                     &run,
                     HostFailure {
                         status: None,
@@ -692,12 +897,20 @@ fn execute(
     };
 
     if kind == ExecutionKind::Gdb {
+        if let Err(error) = run.symbols.set_inheritable(true) {
+            let _ = stop_child(&mut child);
+            return Err(error);
+        }
         let status = Command::new("gdb")
-            .args(gdb_arguments(artifacts))
+            .args(gdb_arguments(&run.symbols))
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .status();
+        if let Err(error) = run.symbols.set_inheritable(false) {
+            let _ = stop_child(&mut child);
+            return Err(error);
+        }
         let status = match status {
             Ok(status) => status,
             Err(error) => {
@@ -717,7 +930,7 @@ fn execute(
         return Ok(format!(
             "{{\"schema_version\":2,\"phase\":\"WYR0-H\",\"mode\":\"gdb\",\"profile\":\"{}\",\"status\":\"DIAGNOSTIC\",\"acceptance\":false,\"symbols_sha256\":\"{}\"}}\n",
             profile.name(),
-            digest(&artifacts.symbols, "Deepwyrm symbols")?
+            run.symbols.digest
         ));
     }
 
@@ -728,6 +941,7 @@ fn execute(
                 profile,
                 request,
                 artifacts,
+                outputs,
                 &run,
                 HostFailure {
                     status: None,
@@ -752,6 +966,7 @@ fn execute(
                 profile,
                 request,
                 artifacts,
+                outputs,
                 &run,
                 HostFailure {
                     status: None,
@@ -777,13 +992,14 @@ fn execute(
         ));
     }
 
-    let serial = match read_regular(&run.serial_log, "integration serial log", MAX_SERIAL_BYTES) {
+    let serial = match read_run_file(&run.serial_log, "integration serial log", MAX_SERIAL_BYTES) {
         Ok(serial) => serial,
         Err(error) => {
             write_integration_host_failure(
                 profile,
                 request,
                 artifacts,
+                outputs,
                 &run,
                 HostFailure {
                     status: Some(&status),
@@ -802,6 +1018,7 @@ fn execute(
                 profile,
                 request,
                 artifacts,
+                outputs,
                 &run,
                 HostFailure {
                     status: Some(&status),
@@ -828,6 +1045,7 @@ fn execute(
             profile,
             request,
             artifacts,
+            outputs,
             &run,
             HostFailure {
                 status: Some(&status),
@@ -846,14 +1064,14 @@ fn execute(
     let expectation_matched = guest_expectation_matches(request, record);
     let status_name = if expectation_matched { "PASS" } else { "FAIL" };
     if status_name == "PASS" {
-        revalidate_before_pass(request, artifacts, &pre_execution_manifest)?;
+        revalidate_before_pass(request, artifacts, &run, &pre_execution_manifest)?;
     }
     let evidence_fields = if status_name == "PASS" {
         evidence_result_fields(request, transcript.evidence)?
     } else {
         String::new()
     };
-    let manifest = result_manifest_json(request, artifacts)?;
+    let manifest = result_manifest_json(request, artifacts, &run)?;
     let result = format!(
         concat!(
             "{{\"schema_version\":{},\"phase\":\"WYR0-H\",",
@@ -884,7 +1102,7 @@ fn execute(
         request.rust_revision,
     );
     write_new(
-        request,
+        outputs,
         &run.result_json,
         result.as_bytes(),
         "integration result",
@@ -952,6 +1170,7 @@ fn write_integration_host_failure(
     profile: HProfile,
     request: &HRequest,
     artifacts: &CandidateArtifacts,
+    outputs: &CheckedOutputRoot,
     run: &RunPaths,
     failure: HostFailure<'_>,
 ) -> Result<(), Failure> {
@@ -959,7 +1178,7 @@ fn write_integration_host_failure(
         .status
         .and_then(ExitStatus::code)
         .map_or_else(|| "null".to_owned(), |code| code.to_string());
-    let manifest = result_manifest_json(request, artifacts)?;
+    let manifest = result_manifest_json(request, artifacts, run)?;
     let timeout = failure.timeout_seconds.map_or_else(
         || "\"qemu_timeout\":false,".to_owned(),
         |seconds| format!("\"qemu_timeout\":true,\"timeout_seconds\":{seconds},",),
@@ -998,7 +1217,7 @@ fn write_integration_host_failure(
         request.rust_revision,
     );
     write_new(
-        request,
+        outputs,
         &run.result_json,
         result.as_bytes(),
         "integration host-failure result",
@@ -1006,38 +1225,132 @@ fn write_integration_host_failure(
 }
 
 struct RunPaths {
-    vars: PathBuf,
-    serial_log: PathBuf,
+    request: StableRunFile,
+    loader: StableRunFile,
+    kernel: StableRunFile,
+    symbols: StableRunFile,
+    bootstrap: StableRunFile,
+    init0: StableRunFile,
+    hello: StableRunFile,
+    bootfs: StableRunFile,
+    esp: StableRunFile,
+    provenance: StableRunFile,
+    ovmf_code: StableRunFile,
+    vars: StableRunFile,
+    serial_log: StableRunFile,
     result_json: PathBuf,
     stderr_log: PathBuf,
+}
+
+impl RunPaths {
+    fn immutable_files(&self) -> [(&StableRunFile, &'static str); 11] {
+        [
+            (&self.request, "request"),
+            (&self.loader, "loader.efi"),
+            (&self.kernel, "deepwyrm.elf"),
+            (&self.symbols, "Deepwyrm symbols"),
+            (&self.bootstrap, "bootstrap.elf"),
+            (&self.init0, "init0"),
+            (&self.hello, "hello"),
+            (&self.bootfs, "bootfs"),
+            (&self.esp, "ESP"),
+            (&self.provenance, "provenance"),
+            (&self.ovmf_code, "OVMF code"),
+        ]
+    }
+
+    fn verify_immutable(&self) -> Result<(), Failure> {
+        for (file, label) in self.immutable_files() {
+            file.verify_unchanged(label)?;
+        }
+        Ok(())
+    }
+
+    fn set_qemu_inheritable(&self, inheritable: bool) -> Result<(), Failure> {
+        for file in [&self.ovmf_code, &self.vars, &self.esp, &self.serial_log] {
+            file.set_inheritable(inheritable)?;
+        }
+        Ok(())
+    }
+
+    fn snapshot_request(&self, request: &HRequest) -> HRequest {
+        HRequest {
+            path: self.request.path.clone(),
+            loader: self.loader.path.clone(),
+            kernel: self.kernel.path.clone(),
+            symbols: self.symbols.path.clone(),
+            bootstrap: self.bootstrap.path.clone(),
+            init0: self.init0.path.clone(),
+            hello: self.hello.path.clone(),
+            bootfs: self.bootfs.path.clone(),
+            esp: self.esp.path.clone(),
+            provenance: self.provenance.path.clone(),
+            ovmf_code: self.ovmf_code.path.clone(),
+            ovmf_vars_template: self.vars.path.clone(),
+            ..request.clone()
+        }
+    }
+
+    fn snapshot_artifacts(&self) -> CandidateArtifacts {
+        CandidateArtifacts {
+            loader: self.loader.path.clone(),
+            kernel: self.kernel.path.clone(),
+            symbols: self.symbols.path.clone(),
+            bootstrap: self.bootstrap.path.clone(),
+            init0: self.init0.path.clone(),
+            hello: self.hello.path.clone(),
+            ovmf_code: self.ovmf_code.path.clone(),
+            ovmf_vars_template: self.vars.path.clone(),
+        }
+    }
 }
 
 fn prepare_run_directory(
     profile: HProfile,
     request: &HRequest,
     artifacts: &CandidateArtifacts,
+    outputs: &CheckedOutputRoot,
 ) -> Result<RunPaths, Failure> {
     h_request::validate_outputs(request)?;
-    if !request.run_directory.exists() {
-        let parent = request
-            .run_directory
-            .parent()
-            .ok_or_else(|| Failure::task("run directory has no parent"))?;
-        fs::canonicalize(parent)
-            .map_err(|error| Failure::task(format!("could not resolve run parent: {error}")))?;
-        fs::create_dir(&request.run_directory)
-            .map_err(|error| Failure::task(format!("could not create run directory: {error}")))?;
-        h_request::validate_outputs(request)?;
+    if !outputs.is_dir(&request.run_directory, "run directory")? {
+        outputs.create_dir(&request.run_directory, "run directory")?;
     }
     let directory = request.run_directory.join(profile.name());
-    fs::create_dir(&directory).map_err(|error| {
-        Failure::task(format!(
-            "could not create fresh {} run directory: {error}",
-            profile.name()
-        ))
-    })?;
-    let vars = directory.join("OVMF_VARS.fd");
-    let serial_log = directory.join("serial.log");
+    outputs.create_dir(
+        &directory,
+        &format!("fresh {} run directory", profile.name()),
+    )?;
+
+    let request_bytes = read_regular(&request.path, "WYR0-H request", 64 * 1024)?;
+    if sha256::bytes_digest(&request_bytes) != request.request_sha256 {
+        return Err(Failure::task(
+            "WYR0-H request changed before the run-local snapshot was created",
+        ));
+    }
+    let loader_bytes = read_regular(&artifacts.loader, "loader.efi", MAX_GUEST_ARTIFACT_BYTES)?;
+    let kernel_bytes = read_regular(&artifacts.kernel, "deepwyrm.elf", MAX_GUEST_ARTIFACT_BYTES)?;
+    let symbols_bytes = read_regular(
+        &artifacts.symbols,
+        "Deepwyrm symbols",
+        MAX_GUEST_ARTIFACT_BYTES,
+    )?;
+    let bootstrap_bytes = read_regular(
+        &artifacts.bootstrap,
+        "bootstrap.elf",
+        MAX_GUEST_ARTIFACT_BYTES,
+    )?;
+    let init0_bytes = read_regular(&artifacts.init0, "init0", MAX_GUEST_ARTIFACT_BYTES)?;
+    let hello_bytes = read_regular(&artifacts.hello, "hello", MAX_GUEST_ARTIFACT_BYTES)?;
+    let bootfs_bytes =
+        read_output_regular(outputs, &request.bootfs, "bootfs", MAX_GUEST_ARTIFACT_BYTES)?;
+    let esp_bytes = read_output_regular(outputs, &request.esp, "ESP", MAX_GUEST_ARTIFACT_BYTES)?;
+    let provenance_bytes = read_output_regular(
+        outputs,
+        &request.provenance,
+        "provenance",
+        MAX_GUEST_ARTIFACT_BYTES,
+    )?;
+    let ovmf_code_bytes = read_regular(&artifacts.ovmf_code, "OVMF code", MAX_FIRMWARE_BYTES)?;
     let result_json = directory.join("result.json");
     let stderr_log = directory.join("qemu.stderr.log");
     let vars_bytes = read_regular(
@@ -1045,19 +1358,64 @@ fn prepare_run_directory(
         "OVMF vars template",
         MAX_FIRMWARE_BYTES,
     )?;
-    write_new(request, &vars, &vars_bytes, "request-local OVMF vars")?;
-    Ok(RunPaths {
-        vars,
-        serial_log,
+
+    let run = RunPaths {
+        request: create_run_file(
+            outputs,
+            &directory.join("request.toml"),
+            &request_bytes,
+            true,
+        )?,
+        loader: create_run_file(outputs, &directory.join("loader.efi"), &loader_bytes, true)?,
+        kernel: create_run_file(
+            outputs,
+            &directory.join("deepwyrm.elf"),
+            &kernel_bytes,
+            true,
+        )?,
+        symbols: create_run_file(
+            outputs,
+            &directory.join("deepwyrm.symbols"),
+            &symbols_bytes,
+            true,
+        )?,
+        bootstrap: create_run_file(
+            outputs,
+            &directory.join("bootstrap.elf"),
+            &bootstrap_bytes,
+            true,
+        )?,
+        init0: create_run_file(outputs, &directory.join("init0.elf"), &init0_bytes, true)?,
+        hello: create_run_file(outputs, &directory.join("hello.elf"), &hello_bytes, true)?,
+        bootfs: create_run_file(outputs, &directory.join("bootfs.img"), &bootfs_bytes, true)?,
+        esp: create_run_file(outputs, &directory.join("esp.img"), &esp_bytes, true)?,
+        provenance: create_run_file(
+            outputs,
+            &directory.join("provenance.toml"),
+            &provenance_bytes,
+            true,
+        )?,
+        ovmf_code: create_run_file(
+            outputs,
+            &directory.join("OVMF_CODE.fd"),
+            &ovmf_code_bytes,
+            true,
+        )?,
+        vars: create_run_file(outputs, &directory.join("OVMF_VARS.fd"), &vars_bytes, false)?,
+        serial_log: create_run_file(outputs, &directory.join("serial.log"), &[], false)?,
         result_json,
         stderr_log,
-    })
+    };
+    run.verify_immutable()?;
+    let snapshot_request = run.snapshot_request(request);
+    inspect_loaded(&snapshot_request, &run.snapshot_artifacts())?;
+    Ok(run)
 }
 
 fn qemu_arguments(
     profile: HProfile,
     request: &HRequest,
-    artifacts: &CandidateArtifacts,
+    _artifacts: &CandidateArtifacts,
     kind: ExecutionKind,
     run: &RunPaths,
 ) -> Vec<String> {
@@ -1077,17 +1435,20 @@ fn qemu_arguments(
         "-drive".into(),
         format!(
             "if=pflash,format=raw,readonly=on,file={}",
-            artifacts.ovmf_code.display()
+            run.ovmf_code.child_path().display()
         ),
         "-drive".into(),
-        format!("if=pflash,format=raw,file={}", run.vars.display()),
+        format!(
+            "if=pflash,format=raw,file={}",
+            run.vars.child_path().display()
+        ),
         "-drive".into(),
         format!(
             "if=virtio,format=raw,readonly=on,file={}",
-            request.esp.display()
+            run.esp.child_path().display()
         ),
         "-serial".into(),
-        format!("file:{}", run.serial_log.display()),
+        format!("file:{}", run.serial_log.child_path().display()),
     ];
     if kind == ExecutionKind::Integration {
         args.extend([
@@ -1106,12 +1467,12 @@ fn qemu_arguments(
     args
 }
 
-fn gdb_arguments(artifacts: &CandidateArtifacts) -> Vec<String> {
+fn gdb_arguments(symbols: &StableRunFile) -> Vec<String> {
     vec![
         "-ex".into(),
         "set architecture i386:x86-64".into(),
         "-ex".into(),
-        format!("file {}", artifacts.symbols.display()),
+        format!("file {}", symbols.child_path().display()),
         "-ex".into(),
         "target remote 127.0.0.1:1234".into(),
     ]
@@ -1822,11 +2183,11 @@ fn git_output(repository: &Path, arguments: &[&str], label: &str) -> Result<Stri
         .map_err(|_| Failure::task(format!("{label} Git output was not UTF-8")))
 }
 
-fn outputs_all_absent(request: &HRequest) -> Result<bool, Failure> {
+fn outputs_all_absent(outputs: &CheckedOutputRoot, request: &HRequest) -> Result<bool, Failure> {
     let states = [
-        fs::symlink_metadata(&request.bootfs).is_ok(),
-        fs::symlink_metadata(&request.esp).is_ok(),
-        fs::symlink_metadata(&request.provenance).is_ok(),
+        outputs.exists(&request.bootfs, "bootfs")?,
+        outputs.exists(&request.esp, "ESP")?,
+        outputs.exists(&request.provenance, "provenance")?,
     ];
     if states.iter().all(|state| !state) {
         Ok(true)
@@ -1841,48 +2202,149 @@ fn outputs_all_absent(request: &HRequest) -> Result<bool, Failure> {
 
 fn read_regular(path: &Path, label: &str, max_bytes: u64) -> Result<Vec<u8>, Failure> {
     let path = h_request::canonical_regular(path, label, max_bytes)?;
-    fs::read(path).map_err(|error| Failure::task(format!("could not read {label}: {error}")))
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| Failure::task(format!("could not open {label}: {error}")))?;
+    read_opened_regular(file, label, max_bytes)
 }
 
-fn write_new(request: &HRequest, path: &Path, bytes: &[u8], label: &str) -> Result<(), Failure> {
-    h_request::validate_output_parent(request, path, label)?;
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    fs::canonicalize(parent)
-        .map_err(|error| Failure::task(format!("could not resolve {label} parent: {error}")))?;
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|error| Failure::task(format!("could not create {label}: {error}")))?;
+fn read_output_regular(
+    outputs: &CheckedOutputRoot,
+    path: &Path,
+    label: &str,
+    max_bytes: u64,
+) -> Result<Vec<u8>, Failure> {
+    let file = outputs.open_regular_file(path, label, true, false)?;
+    read_opened_regular(file, label, max_bytes)
+}
+
+fn read_opened_regular(
+    mut file: fs::File,
+    label: &str,
+    max_bytes: u64,
+) -> Result<Vec<u8>, Failure> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| Failure::task(format!("could not stat {label}: {error}")))?;
+    if !metadata.file_type().is_file() || metadata.len() == 0 || metadata.len() > max_bytes {
+        return Err(Failure::task(format!(
+            "{label} must be a nonempty regular file no larger than {max_bytes} bytes"
+        )));
+    }
+    let capacity = usize::try_from(metadata.len())
+        .map_err(|_| Failure::task(format!("{label} does not fit host address space")))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.read_to_end(&mut bytes)
+        .map_err(|error| Failure::task(format!("could not read {label}: {error}")))?;
+    if u64::try_from(bytes.len()).ok() != Some(metadata.len()) {
+        return Err(Failure::task(format!(
+            "{label} changed length while its opened bytes were read"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn read_run_file(file: &StableRunFile, label: &str, max_bytes: u64) -> Result<Vec<u8>, Failure> {
+    let mut opened = file
+        .file
+        .try_clone()
+        .map_err(|error| Failure::task(format!("could not clone run-local {label}: {error}")))?;
+    opened
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| Failure::task(format!("could not rewind run-local {label}: {error}")))?;
+    let metadata = opened
+        .metadata()
+        .map_err(|error| Failure::task(format!("could not stat run-local {label}: {error}")))?;
+    if metadata.len() > max_bytes {
+        return Err(Failure::task(format!(
+            "run-local {label} exceeds its {max_bytes}-byte limit"
+        )));
+    }
+    let mut bytes = Vec::new();
+    opened
+        .read_to_end(&mut bytes)
+        .map_err(|error| Failure::task(format!("could not read run-local {label}: {error}")))?;
+    Ok(bytes)
+}
+
+fn create_run_file(
+    outputs: &CheckedOutputRoot,
+    path: &Path,
+    bytes: &[u8],
+    immutable: bool,
+) -> Result<StableRunFile, Failure> {
+    let mut output = outputs.create_new_file(path, "run-local snapshot", true, true)?;
+    output
+        .write_all(bytes)
+        .and_then(|()| output.sync_all())
+        .map_err(|error| Failure::task(format!("could not write run-local snapshot: {error}")))?;
+    output
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| Failure::task(format!("could not rewind run-local snapshot: {error}")))?;
+    let file = if immutable {
+        let expected = output.metadata().map_err(|error| {
+            Failure::task(format!("could not stat run-local snapshot: {error}"))
+        })?;
+        output
+            .set_permissions(fs::Permissions::from_mode(0o400))
+            .map_err(|error| {
+                Failure::task(format!(
+                    "could not make run-local snapshot read-only: {error}"
+                ))
+            })?;
+        let reopened = outputs.open_regular_file(path, "run-local snapshot", true, false)?;
+        let observed = reopened.metadata().map_err(|error| {
+            Failure::task(format!(
+                "could not stat reopened run-local snapshot: {error}"
+            ))
+        })?;
+        if expected.dev() != observed.dev() || expected.ino() != observed.ino() {
+            return Err(Failure::task(
+                "run-local snapshot was replaced while it was made immutable",
+            ));
+        }
+        reopened
+    } else {
+        output
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|error| {
+                Failure::task(format!(
+                    "could not restrict run-local file permissions: {error}"
+                ))
+            })?;
+        output
+    };
+    Ok(StableRunFile {
+        path: path.to_path_buf(),
+        file,
+        digest: sha256::bytes_digest(bytes),
+        immutable,
+    })
+}
+
+fn write_new(
+    outputs: &CheckedOutputRoot,
+    path: &Path,
+    bytes: &[u8],
+    label: &str,
+) -> Result<(), Failure> {
+    let mut output = outputs.create_new_file(path, label, false, true)?;
     if let Err(error) = output.write_all(bytes).and_then(|()| output.sync_all()) {
         drop(output);
-        remove_created(path);
+        remove_created(outputs, path, label);
         return Err(Failure::task(format!("could not write {label}: {error}")));
     }
     Ok(())
 }
 
-fn open_new(request: &HRequest, path: &Path, label: &str) -> Result<fs::File, Failure> {
-    h_request::validate_output_parent(request, path, label)?;
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    fs::canonicalize(parent)
-        .map_err(|error| Failure::task(format!("could not resolve {label} parent: {error}")))?;
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|error| Failure::task(format!("could not create {label}: {error}")))
+fn open_new(outputs: &CheckedOutputRoot, path: &Path, label: &str) -> Result<fs::File, Failure> {
+    outputs.create_new_file(path, label, false, true)
 }
 
-fn require_absent(request: &HRequest, path: &Path, label: &str) -> Result<(), Failure> {
-    h_request::validate_output_parent(request, path, label)?;
-    if fs::symlink_metadata(path).is_ok() {
+fn require_absent(outputs: &CheckedOutputRoot, path: &Path, label: &str) -> Result<(), Failure> {
+    if outputs.exists(path, label)? {
         Err(Failure::task(format!("WYR0-H {label} already exists")))
     } else {
         Ok(())
@@ -1890,17 +2352,18 @@ fn require_absent(request: &HRequest, path: &Path, label: &str) -> Result<(), Fa
 }
 
 fn digest(path: &Path, label: &str) -> Result<String, Failure> {
-    sha256::file_digest(path)
+    let path = h_request::canonical_regular(path, label, u64::MAX)?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| Failure::task(format!("could not open {label}: {error}")))?;
+    sha256::reader_digest(&mut file)
         .map_err(|error| Failure::task(format!("could not hash {label}: {error}")))
 }
 
-fn remove_created(path: &Path) {
-    if fs::symlink_metadata(path)
-        .map(|metadata| metadata.file_type().is_file())
-        .unwrap_or(false)
-    {
-        let _ = fs::remove_file(path);
-    }
+fn remove_created(outputs: &CheckedOutputRoot, path: &Path, label: &str) {
+    outputs.remove_file(path, label);
 }
 
 fn status_label(status: &ExitStatus) -> String {
@@ -1915,6 +2378,45 @@ mod tests {
     use super::*;
 
     const TEST_EVIDENCE_NONCE: u64 = h_request::I1_EVIDENCE_NONCE;
+
+    fn test_stable_file(path: PathBuf, bytes: &[u8], immutable: bool) -> StableRunFile {
+        fs::write(&path, bytes).expect("write test stable file");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(!immutable)
+            .open(&path)
+            .expect("open test stable file");
+        StableRunFile {
+            path,
+            file,
+            digest: sha256::bytes_digest(bytes),
+            immutable,
+        }
+    }
+
+    fn test_run_paths(root: &Path, name: &str) -> RunPaths {
+        let directory = root.join(format!("run-snapshot-{name}"));
+        fs::create_dir(&directory).expect("create test run snapshot");
+        let stable =
+            |file_name: &str| test_stable_file(directory.join(file_name), b"artifact", true);
+        RunPaths {
+            request: stable("request.toml"),
+            loader: stable("loader.efi"),
+            kernel: stable("deepwyrm.elf"),
+            symbols: stable("deepwyrm.symbols"),
+            bootstrap: stable("bootstrap.elf"),
+            init0: stable("init0.elf"),
+            hello: stable("hello.elf"),
+            bootfs: stable("bootfs.img"),
+            esp: stable("esp.img"),
+            provenance: stable("provenance.toml"),
+            ovmf_code: stable("OVMF_CODE.fd"),
+            vars: test_stable_file(directory.join("OVMF_VARS.fd"), b"artifact", false),
+            serial_log: test_stable_file(directory.join("serial.log"), b"", false),
+            result_json: root.join(name),
+            stderr_log: directory.join("qemu.stderr.log"),
+        }
+    }
 
     #[derive(Clone, Copy)]
     struct EventSpec {
@@ -2012,6 +2514,7 @@ mod tests {
         let root = PathBuf::from("/candidate");
         HRequest {
             path: root.join("request.toml"),
+            request_sha256: sha256::bytes_digest(b"request"),
             schema_version: 3,
             deepwyrm_revision: "1".repeat(40),
             wyrmroot_revision: "2".repeat(40),
@@ -2481,9 +2984,13 @@ mod tests {
 
     #[test]
     fn qemu_and_gdb_plans_are_centralized_and_share_exact_symbols() {
-        let root = PathBuf::from("/candidate");
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("xtask-h-qemu-plan-test-{}", std::process::id()));
+        fs::create_dir(&root).expect("create QEMU plan fixture");
         let request = HRequest {
             path: root.join("request.toml"),
+            request_sha256: sha256::bytes_digest(b"request"),
             schema_version: 2,
             deepwyrm_revision: "1".repeat(40),
             wyrmroot_revision: "2".repeat(40),
@@ -2517,12 +3024,7 @@ mod tests {
             ovmf_code: request.ovmf_code.clone(),
             ovmf_vars_template: request.ovmf_vars_template.clone(),
         };
-        let run = RunPaths {
-            vars: request.run_directory.join("smp/OVMF_VARS.fd"),
-            serial_log: request.run_directory.join("smp/serial.log"),
-            result_json: request.run_directory.join("smp/result.json"),
-            stderr_log: request.run_directory.join("smp/qemu.stderr.log"),
-        };
+        let run = test_run_paths(&root, "result.json");
         let args = qemu_arguments(
             HProfile::Smp,
             &request,
@@ -2534,28 +3036,99 @@ mod tests {
         assert!(joined.contains("-machine q35"));
         assert!(joined.contains("-m 2048M"));
         assert!(joined.contains("-smp 4"));
-        assert!(joined.contains("readonly=on,file=/candidate/esp.img"));
+        assert!(joined.contains("readonly=on,file=/proc/self/fd/"));
         assert!(joined.contains("isa-debug-exit"));
         for forbidden in ["virtfs", "virtiofs", "9p", "-net", "user,id="] {
             assert!(!joined.contains(forbidden));
         }
         assert!(
-            gdb_arguments(&artifacts)
+            gdb_arguments(&run.symbols)
                 .join(" ")
-                .contains("file /candidate/deepwyrm.symbols")
+                .contains("file /proc/self/fd/")
         );
+        fs::remove_dir_all(root).expect("remove QEMU plan fixture");
+    }
+
+    #[test]
+    fn run_snapshot_descriptor_survives_path_replacement_after_hashing() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!(
+                "xtask-h-open-snapshot-race-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock before epoch")
+                    .as_nanos()
+            ));
+        fs::create_dir(&root).expect("create snapshot race root");
+        let request_path = root.join("request.toml");
+        fs::write(&request_path, b"request").expect("write snapshot race request");
+        let request = HRequest {
+            path: request_path,
+            ..i1_request()
+        };
+        let outputs = CheckedOutputRoot::open(&request).expect("open snapshot race root");
+        let directory = root.join("run");
+        outputs
+            .create_dir(&directory, "snapshot race run")
+            .expect("create snapshot race run");
+        let path = directory.join("esp.img");
+        let snapshot = create_run_file(&outputs, &path, b"trusted-media", true)
+            .expect("create stable run snapshot");
+
+        fs::rename(&path, directory.join("retained-esp.img"))
+            .expect("rename snapshot path after hashing");
+        fs::write(&path, b"attacker-media").expect("replace snapshot path");
+        let mut opened = fs::File::open(snapshot.child_path())
+            .expect("open the descriptor path that QEMU receives");
+        let mut bytes = Vec::new();
+        opened
+            .read_to_end(&mut bytes)
+            .expect("read inherited snapshot descriptor");
+
+        assert_eq!(bytes, b"trusted-media");
+        assert_eq!(snapshot.digest, sha256::bytes_digest(b"trusted-media"));
+        snapshot
+            .verify_unchanged("ESP")
+            .expect("path replacement changed opened snapshot");
+        assert_eq!(
+            fs::read(&path).expect("read replacement"),
+            b"attacker-media"
+        );
+        snapshot
+            .set_inheritable(true)
+            .expect("make snapshot descriptor inheritable");
+        // SAFETY: snapshot owns this live descriptor and F_GETFD takes no third argument.
+        let flags = unsafe { fcntl(snapshot.file.as_raw_fd(), F_GETFD) };
+        assert_eq!(flags & FD_CLOEXEC, 0);
+        snapshot
+            .set_inheritable(false)
+            .expect("restore close-on-exec");
+        drop(snapshot);
+        fs::remove_dir_all(root).expect("remove snapshot race fixture");
     }
 
     #[test]
     fn paired_join_requires_both_profiles_and_preserves_both_failures() {
         let inspection = "{\"status\":\"PASS\"}\n";
-        let default = "{\"profile\":\"default\",\"status\":\"PASS\"}\n";
-        let smp = "{\"profile\":\"smp\",\"status\":\"PASS\"}\n";
-        let joined = join_profile_results(inspection, Ok(default.into()), Ok(smp.into()))
+        let candidate = "a".repeat(64);
+        let default = format!(
+            "{{\"profile\":\"default\",\"status\":\"PASS\",\"candidate_sha256\":\"{candidate}\"}}\n"
+        );
+        let smp = format!(
+            "{{\"profile\":\"smp\",\"status\":\"PASS\",\"candidate_sha256\":\"{candidate}\"}}\n"
+        );
+        let joined = join_profile_results(inspection, Ok(default.clone()), Ok(smp.clone()))
             .expect("paired successful profiles rejected");
         assert!(joined.contains("\"same_media\":true"));
         assert!(joined.contains("\"default\":{\"profile\":\"default\""));
         assert!(joined.contains("\"smp\":{\"profile\":\"smp\""));
+
+        let mismatched = smp.replace(&candidate, &"b".repeat(64));
+        let failure = join_profile_results(inspection, Ok(default), Ok(mismatched))
+            .expect_err("paired candidates with different exact bytes were accepted");
+        assert!(failure.message.contains("different run-local candidates"));
 
         let failure = join_profile_results(
             inspection,
@@ -2598,6 +3171,7 @@ mod tests {
         let esp = root.join("esp.img");
         let request = HRequest {
             path: root.join("request.toml"),
+            request_sha256: sha256::bytes_digest(b"request"),
             schema_version: 2,
             deepwyrm_revision: "1".repeat(40),
             wyrmroot_revision: "2".repeat(40),
@@ -2621,13 +3195,9 @@ mod tests {
             run_directory: root.join("runs"),
             evidence: None,
         };
-        let run = RunPaths {
-            vars: root.join("OVMF_VARS.fd"),
-            serial_log: root.join("serial.log"),
-            result_json: root.join("result.json"),
-            stderr_log: root.join("stderr.log"),
-        };
         fs::write(&request.path, b"request").expect("write request");
+        let outputs = CheckedOutputRoot::open(&request).expect("open checked output root");
+        let run = test_run_paths(&root, "result.json");
         let artifacts = CandidateArtifacts {
             loader: request.loader.clone(),
             kernel: request.kernel.clone(),
@@ -2642,6 +3212,7 @@ mod tests {
             HProfile::Smp,
             &request,
             &artifacts,
+            &outputs,
             &run,
             HostFailure {
                 status: None,
@@ -2673,16 +3244,12 @@ mod tests {
             ("spawn-result.json", "qemu_spawn_failed"),
             ("serial-result.json", "serial_log_unreadable"),
         ] {
-            let error_run = RunPaths {
-                vars: root.join("unused-vars.fd"),
-                serial_log: root.join("unused-serial.log"),
-                result_json: root.join(name),
-                stderr_log: root.join("unused-stderr.log"),
-            };
+            let error_run = test_run_paths(&root, name);
             write_integration_host_failure(
                 HProfile::Smp,
                 &request,
                 &artifacts,
+                &outputs,
                 &error_run,
                 HostFailure {
                     status: None,
@@ -2697,12 +3264,7 @@ mod tests {
             assert!(result.contains("\"status\":\"ERROR\""));
         }
 
-        let i1_failure_run = RunPaths {
-            vars: root.join("unused-i1-vars.fd"),
-            serial_log: root.join("unused-i1-serial.log"),
-            result_json: root.join("i1-error-result.json"),
-            stderr_log: root.join("unused-i1-stderr.log"),
-        };
+        let i1_failure_run = test_run_paths(&root, "i1-error-result.json");
         let i1_request = HRequest {
             schema_version: 3,
             selector: "smp-runtime-acceptance".into(),
@@ -2717,6 +3279,7 @@ mod tests {
             HProfile::Smp,
             &i1_request,
             &artifacts,
+            &outputs,
             &i1_failure_run,
             HostFailure {
                 status: None,
@@ -2757,6 +3320,7 @@ mod tests {
         fs::write(root.join("deepwyrm.symbols"), b"different").expect("write symbols");
         let request = HRequest {
             path: root.join("request.toml"),
+            request_sha256: sha256::bytes_digest(b"artifact"),
             schema_version: 2,
             deepwyrm_revision: "1".repeat(40),
             wyrmroot_revision: "2".repeat(40),
@@ -2815,6 +3379,7 @@ mod tests {
         }
         let request = HRequest {
             path: root.join("request.toml"),
+            request_sha256: sha256::bytes_digest(b"artifact"),
             schema_version: 2,
             deepwyrm_revision: "1".repeat(40),
             wyrmroot_revision: "2".repeat(40),
@@ -2901,12 +3466,13 @@ mod tests {
         fs::write(&path, &request_text).expect("write request");
         let request = h_request::load(&path).expect("load request");
         let artifacts = verify_candidate_inputs(&request).expect("verify artifacts");
+        let run = test_run_paths(&root, "unused-result.json");
         fs::write(
             &path,
             request_text.replace("expected_detail = 0", "expected_detail = 1"),
         )
         .expect("mutate request");
-        let error = revalidate_before_pass(&request, &artifacts, "unused")
+        let error = revalidate_before_pass(&request, &artifacts, &run, "unused")
             .expect_err("mutated request accepted for PASS");
         assert!(error.message.contains("request changed after inspection"));
         fs::remove_dir_all(root).expect("remove test root");

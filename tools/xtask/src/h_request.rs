@@ -1,12 +1,19 @@
 //! Strict, dependency-free parsing for one WYR0-H integration candidate.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::ffi::{OsStr, OsString};
+use std::fs::{self, OpenOptions};
+use std::io::Read;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use crate::error::Failure;
+use crate::sha256;
 
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
+const O_DIRECTORY: i32 = 0o200000;
+const O_NOFOLLOW: i32 = 0o400000;
 const REQUIRED_KEYS_V2: &[&str] = &[
     "schema_version",
     "deepwyrm_revision",
@@ -89,6 +96,7 @@ impl ExpectedOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HRequest {
     pub(crate) path: PathBuf,
+    pub(crate) request_sha256: String,
     pub(crate) schema_version: u32,
     pub(crate) deepwyrm_revision: String,
     pub(crate) wyrmroot_revision: String,
@@ -113,15 +121,228 @@ pub(crate) struct HRequest {
     pub(crate) evidence: Option<EvidenceRequest>,
 }
 
+/// Stable request-root capability used for every WYR0-H output operation.
+///
+/// The request keeps lexical, request-relative output names for evidence. Actual traversal is
+/// rooted at this already-open directory and rejects symlink components. Renaming or replacing a
+/// checked pathname therefore cannot redirect a later create outside the admitted request root.
+#[derive(Debug)]
+pub(crate) struct CheckedOutputRoot {
+    path: PathBuf,
+    directory: fs::File,
+}
+
+#[derive(Debug)]
+pub(crate) struct CheckedOutputTarget {
+    parent: fs::File,
+    name: OsString,
+}
+
+impl CheckedOutputTarget {
+    /// Returns a procfs path rooted at the already-open parent directory.
+    ///
+    /// The target must remain alive while the path is used so its parent descriptor remains
+    /// valid. The final component is still opened with create-new or no-follow semantics.
+    pub(crate) fn path(&self) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", self.parent.as_raw_fd())).join(&self.name)
+    }
+}
+
+impl CheckedOutputRoot {
+    pub(crate) fn open(request: &HRequest) -> Result<Self, Failure> {
+        let root = request
+            .path
+            .parent()
+            .ok_or_else(|| Failure::task("WYR0-H request has no parent directory"))?;
+        let lexical_root = root.to_path_buf();
+        let root = fs::canonicalize(root).map_err(|error| {
+            Failure::task(format!("could not resolve WYR0-H request root: {error}"))
+        })?;
+        let expected = fs::metadata(&root).map_err(|error| {
+            Failure::task(format!("could not stat WYR0-H request root: {error}"))
+        })?;
+        let directory = open_directory(&root, "WYR0-H request root")?;
+        let opened = directory.metadata().map_err(|error| {
+            Failure::task(format!(
+                "could not stat opened WYR0-H request root: {error}"
+            ))
+        })?;
+        if !same_file(&expected, &opened) {
+            return Err(Failure::task(
+                "WYR0-H request root changed while it was being opened",
+            ));
+        }
+        Ok(Self {
+            path: lexical_root,
+            directory,
+        })
+    }
+
+    pub(crate) fn target(&self, path: &Path, label: &str) -> Result<CheckedOutputTarget, Failure> {
+        let relative = path.strip_prefix(&self.path).map_err(|_| {
+            Failure::task(format!(
+                "WYR0-H {label} is not inside the admitted request root"
+            ))
+        })?;
+        let mut components = relative
+            .components()
+            .filter_map(|component| match component {
+                Component::CurDir => None,
+                Component::Normal(component) => Some(Ok(component)),
+                _ => Some(Err(Failure::task(format!(
+                    "WYR0-H {label} is not a normalized request-relative output"
+                )))),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let name = components
+            .pop()
+            .ok_or_else(|| Failure::task(format!("WYR0-H {label} has no file name")))?;
+        let mut parent = self.directory.try_clone().map_err(|error| {
+            Failure::task(format!(
+                "could not clone WYR0-H request-root descriptor: {error}"
+            ))
+        })?;
+        for component in components {
+            parent = open_directory_child(&parent, component, label)?;
+        }
+        Ok(CheckedOutputTarget {
+            parent,
+            name: name.to_os_string(),
+        })
+    }
+
+    pub(crate) fn directory_path(&self) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", self.directory.as_raw_fd()))
+    }
+
+    pub(crate) fn create_new_file(
+        &self,
+        path: &Path,
+        label: &str,
+        read: bool,
+        write: bool,
+    ) -> Result<fs::File, Failure> {
+        let target = self.target(path, label)?;
+        OpenOptions::new()
+            .read(read)
+            .write(write)
+            .create_new(true)
+            .custom_flags(O_NOFOLLOW)
+            .open(target.path())
+            .map_err(|error| Failure::task(format!("could not create {label}: {error}")))
+    }
+
+    pub(crate) fn open_regular_file(
+        &self,
+        path: &Path,
+        label: &str,
+        read: bool,
+        write: bool,
+    ) -> Result<fs::File, Failure> {
+        let target = self.target(path, label)?;
+        let file = OpenOptions::new()
+            .read(read)
+            .write(write)
+            .custom_flags(O_NOFOLLOW)
+            .open(target.path())
+            .map_err(|error| Failure::task(format!("could not open {label}: {error}")))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| Failure::task(format!("could not stat {label}: {error}")))?;
+        if !metadata.file_type().is_file() {
+            return Err(Failure::task(format!(
+                "WYR0-H {label} must be a real regular file"
+            )));
+        }
+        Ok(file)
+    }
+
+    pub(crate) fn create_dir(&self, path: &Path, label: &str) -> Result<(), Failure> {
+        let target = self.target(path, label)?;
+        fs::create_dir(target.path())
+            .map_err(|error| Failure::task(format!("could not create {label}: {error}")))
+    }
+
+    pub(crate) fn is_dir(&self, path: &Path, label: &str) -> Result<bool, Failure> {
+        if !self.exists(path, label)? {
+            return Ok(false);
+        }
+        let target = self.target(path, label)?;
+        open_directory(&target.path(), label).map(|_| true)
+    }
+
+    pub(crate) fn exists(&self, path: &Path, label: &str) -> Result<bool, Failure> {
+        let target = self.target(path, label)?;
+        match fs::symlink_metadata(target.path()) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(Failure::task(format!(
+                "could not inspect WYR0-H {label}: {error}"
+            ))),
+        }
+    }
+
+    pub(crate) fn remove_file(&self, path: &Path, label: &str) {
+        if let Ok(target) = self.target(path, label) {
+            let _ = fs::remove_file(target.path());
+        }
+    }
+}
+
+fn open_directory(path: &Path, label: &str) -> Result<fs::File, Failure> {
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_DIRECTORY | O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| Failure::task(format!("could not open {label}: {error}")))?;
+    let metadata = directory
+        .metadata()
+        .map_err(|error| Failure::task(format!("could not stat {label}: {error}")))?;
+    if !metadata.file_type().is_dir() {
+        return Err(Failure::task(format!(
+            "WYR0-H {label} must be a real directory"
+        )));
+    }
+    Ok(directory)
+}
+
+fn open_directory_child(
+    parent: &fs::File,
+    component: &OsStr,
+    label: &str,
+) -> Result<fs::File, Failure> {
+    let path = PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd())).join(component);
+    open_directory(&path, label)
+}
+
+fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
 pub(crate) fn load(path: &Path) -> Result<HRequest, Failure> {
     let path = canonical_regular(path, "WYR0-H request", MAX_REQUEST_BYTES)?;
-    let metadata = fs::metadata(&path)
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(&path)
+        .map_err(|error| Failure::task(format!("could not open WYR0-H request: {error}")))?;
+    let metadata = file
+        .metadata()
         .map_err(|error| Failure::task(format!("could not stat WYR0-H request: {error}")))?;
-    if metadata.len() > MAX_REQUEST_BYTES {
-        return Err(Failure::task("WYR0-H request exceeds its size limit"));
+    if metadata.len() == 0 || metadata.len() > MAX_REQUEST_BYTES {
+        return Err(Failure::task(
+            "WYR0-H request must be nonempty and within its size limit",
+        ));
     }
-    let text = fs::read_to_string(&path)
+    let mut text = String::new();
+    file.read_to_string(&mut text)
         .map_err(|error| Failure::task(format!("could not read WYR0-H request: {error}")))?;
+    if u64::try_from(text.len()).ok() != Some(metadata.len()) {
+        return Err(Failure::task(
+            "WYR0-H request changed length while its opened bytes were read",
+        ));
+    }
+    let request_sha256 = sha256::bytes_digest(text.as_bytes());
     let values = parse(&text)?;
     let schema_version = number::<u32>(&values, "schema_version")?;
     let required_keys = match schema_version {
@@ -193,6 +414,7 @@ pub(crate) fn load(path: &Path) -> Result<HRequest, Failure> {
     };
     let request = HRequest {
         path,
+        request_sha256,
         schema_version,
         deepwyrm_revision: revision(&values, "deepwyrm_revision")?,
         wyrmroot_revision: revision(&values, "wyrmroot_revision")?,
@@ -913,5 +1135,75 @@ mod tests {
         );
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checked_output_target_survives_an_ancestor_rename_and_symlink_swap() {
+        use std::io::Write;
+        use std::os::unix::fs::symlink;
+
+        let root = request_root("checked-parent-race");
+        let outside = request_root("checked-parent-race-outside");
+        let path = write_request_fixture(&root, &valid_v2());
+        fs::create_dir(root.join("media")).expect("create media directory");
+        fs::create_dir(&outside).expect("create outside directory");
+        let request = load(&path).expect("load checked-parent fixture");
+        let checked = CheckedOutputRoot::open(&request).expect("open checked root");
+        let target = checked
+            .target(&request.bootfs, "bootfs")
+            .expect("resolve stable output parent");
+
+        fs::rename(root.join("media"), root.join("retained-media"))
+            .expect("rename admitted parent");
+        symlink(&outside, root.join("media")).expect("replace parent with escaping symlink");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(O_NOFOLLOW)
+            .open(target.path())
+            .expect("create through stable parent descriptor");
+        file.write_all(b"trusted").expect("write stable output");
+
+        assert_eq!(
+            fs::read(root.join("retained-media/bootfs.img")).expect("read stable output"),
+            b"trusted"
+        );
+        assert!(!outside.join("bootfs.img").exists());
+        fs::remove_dir_all(root).expect("remove checked-parent fixture");
+        fs::remove_dir_all(outside).expect("remove outside fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checked_output_root_survives_request_root_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let root = request_root("checked-root-race");
+        let retained = request_root("checked-root-race-retained");
+        let outside = request_root("checked-root-race-outside");
+        let path = write_request_fixture(&root, &valid_v2());
+        fs::create_dir(root.join("media")).expect("create media directory");
+        fs::create_dir(&outside).expect("create outside directory");
+        let request = load(&path).expect("load checked-root fixture");
+        let checked = CheckedOutputRoot::open(&request).expect("open checked root");
+
+        fs::rename(&root, &retained).expect("rename admitted request root");
+        fs::create_dir(&root).expect("create replacement request root");
+        symlink(&outside, root.join("media")).expect("install escaping replacement");
+        let mut output = checked
+            .create_new_file(&request.bootfs, "bootfs", false, true)
+            .expect("create under retained request-root descriptor");
+        use std::io::Write as _;
+        output.write_all(b"trusted").expect("write retained output");
+
+        assert_eq!(
+            fs::read(retained.join("media/bootfs.img")).expect("read retained output"),
+            b"trusted"
+        );
+        assert!(!outside.join("bootfs.img").exists());
+        fs::remove_dir_all(root).expect("remove replacement root");
+        fs::remove_dir_all(retained).expect("remove retained root");
+        fs::remove_dir_all(outside).expect("remove outside fixture");
     }
 }
