@@ -89,6 +89,10 @@ pub(crate) fn audit(first_request: &str, second_request: &str) -> Result<String,
     let second_inspection = crate::h_integration::inspect(second_request)?;
     let first_candidate = json_sha256_field(&first_inspection, "candidate_sha256")?;
     let second_candidate = json_sha256_field(&second_inspection, "candidate_sha256")?;
+    let first_provenance = sha256::file_digest(&first.provenance)
+        .map_err(|error| Failure::task(format!("could not hash first I-B provenance: {error}")))?;
+    let second_provenance = sha256::file_digest(&second.provenance)
+        .map_err(|error| Failure::task(format!("could not hash second I-B provenance: {error}")))?;
 
     let first_native = inspect_request_native_artifacts(&repository, &first)?;
     let second_native = inspect_request_native_artifacts(&repository, &second)?;
@@ -128,10 +132,12 @@ pub(crate) fn audit(first_request: &str, second_request: &str) -> Result<String,
             "\"first_request_sha256\":\"{}\",\"second_request_sha256\":\"{}\",",
             "\"first_candidate_sha256\":\"{}\",\"second_candidate_sha256\":\"{}\",",
             "\"canonical_image_inspection_reused\":true}},",
-            "\"artifact_equality\":{{\"all_declared_artifact_bytes_identical\":true,",
+            "\"artifact_equality\":{{\"all_comparable_artifact_bytes_identical\":true,",
             "\"bootfs\":{{\"identical_bytes\":true,\"sha256\":\"{}\"}},",
             "\"esp\":{{\"identical_bytes\":true,\"sha256\":\"{}\"}},",
             "\"consumed_sha256\":{}}},",
+            "\"request_bound_provenance\":{{\"validated_independently\":true,",
+            "\"first_sha256\":\"{}\",\"second_sha256\":\"{}\"}},",
             "\"native_artifacts\":{{\"canonical_inspector\":\"toolchain/inspect-native-artifact.sh\",",
             "\"required\":[\"bootstrap\",\"init0\",\"hello\"],",
             "\"bootfs_executables\":{},\"static_elf\":true,\"no_pt_interp\":true,",
@@ -153,6 +159,8 @@ pub(crate) fn audit(first_request: &str, second_request: &str) -> Result<String,
         bootfs_sha256,
         esp_sha256,
         artifact_hash_json(&artifacts),
+        first_provenance,
+        second_provenance,
         json_string_array(&bootfs_executables),
         source_audit.files,
         source_audit.bytes,
@@ -242,7 +250,7 @@ fn request_root(request: &HRequest) -> Result<PathBuf, Failure> {
 fn artifact_pairs<'a>(
     first: &'a HRequest,
     second: &'a HRequest,
-) -> [(&'a Path, &'a Path, &'static str); 11] {
+) -> [(&'a Path, &'a Path, &'static str); 10] {
     [
         (&first.loader, &second.loader, "loader"),
         (&first.kernel, &second.kernel, "kernel"),
@@ -252,7 +260,6 @@ fn artifact_pairs<'a>(
         (&first.hello, &second.hello, "hello"),
         (&first.bootfs, &second.bootfs, "bootfs"),
         (&first.esp, &second.esp, "esp"),
-        (&first.provenance, &second.provenance, "provenance"),
         (&first.ovmf_code, &second.ovmf_code, "ovmf_code"),
         (
             &first.ovmf_vars_template,
