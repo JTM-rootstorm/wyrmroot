@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
-use std::io::Read;
+use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
@@ -138,6 +138,13 @@ pub(crate) struct CheckedOutputTarget {
     name: OsString,
 }
 
+#[derive(Clone, Copy)]
+enum MissingParent {
+    Reject,
+    Absent,
+    Create,
+}
+
 impl CheckedOutputTarget {
     /// Returns a procfs path rooted at the already-open parent directory.
     ///
@@ -179,6 +186,16 @@ impl CheckedOutputRoot {
     }
 
     pub(crate) fn target(&self, path: &Path, label: &str) -> Result<CheckedOutputTarget, Failure> {
+        self.target_with_missing_parent(path, label, MissingParent::Reject)?
+            .ok_or_else(|| Failure::task(format!("WYR0-H {label} parent does not exist")))
+    }
+
+    fn target_with_missing_parent(
+        &self,
+        path: &Path,
+        label: &str,
+        missing_parent: MissingParent,
+    ) -> Result<Option<CheckedOutputTarget>, Failure> {
         let relative = path.strip_prefix(&self.path).map_err(|_| {
             Failure::task(format!(
                 "WYR0-H {label} is not inside the admitted request root"
@@ -203,12 +220,32 @@ impl CheckedOutputRoot {
             ))
         })?;
         for component in components {
-            parent = open_directory_child(&parent, component, label)?;
+            parent = match open_directory_child_io(&parent, component) {
+                Ok(directory) => directory,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => match missing_parent {
+                    MissingParent::Reject => return Err(open_directory_failure(label, error)),
+                    MissingParent::Absent => return Ok(None),
+                    MissingParent::Create => {
+                        let child = directory_child_path(&parent, component);
+                        match fs::create_dir(&child) {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                            Err(error) => {
+                                return Err(Failure::task(format!(
+                                    "could not create {label} parent directory: {error}"
+                                )));
+                            }
+                        }
+                        open_directory_child(&parent, component, label)?
+                    }
+                },
+                Err(error) => return Err(open_directory_failure(label, error)),
+            };
         }
-        Ok(CheckedOutputTarget {
+        Ok(Some(CheckedOutputTarget {
             parent,
             name: name.to_os_string(),
-        })
+        }))
     }
 
     pub(crate) fn directory_path(&self) -> PathBuf {
@@ -222,7 +259,9 @@ impl CheckedOutputRoot {
         read: bool,
         write: bool,
     ) -> Result<fs::File, Failure> {
-        let target = self.target(path, label)?;
+        let target = self
+            .target_with_missing_parent(path, label, MissingParent::Create)?
+            .ok_or_else(|| Failure::task(format!("WYR0-H {label} parent does not exist")))?;
         OpenOptions::new()
             .read(read)
             .write(write)
@@ -258,7 +297,9 @@ impl CheckedOutputRoot {
     }
 
     pub(crate) fn create_dir(&self, path: &Path, label: &str) -> Result<(), Failure> {
-        let target = self.target(path, label)?;
+        let target = self
+            .target_with_missing_parent(path, label, MissingParent::Create)?
+            .ok_or_else(|| Failure::task(format!("WYR0-H {label} parent does not exist")))?;
         fs::create_dir(target.path())
             .map_err(|error| Failure::task(format!("could not create {label}: {error}")))
     }
@@ -272,7 +313,10 @@ impl CheckedOutputRoot {
     }
 
     pub(crate) fn exists(&self, path: &Path, label: &str) -> Result<bool, Failure> {
-        let target = self.target(path, label)?;
+        let Some(target) = self.target_with_missing_parent(path, label, MissingParent::Absent)?
+        else {
+            return Ok(false);
+        };
         match fs::symlink_metadata(target.path()) {
             Ok(_) => Ok(true),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -290,20 +334,27 @@ impl CheckedOutputRoot {
 }
 
 fn open_directory(path: &Path, label: &str) -> Result<fs::File, Failure> {
+    open_directory_io(path).map_err(|error| open_directory_failure(label, error))
+}
+
+fn open_directory_io(path: &Path) -> io::Result<fs::File> {
     let directory = OpenOptions::new()
         .read(true)
         .custom_flags(O_DIRECTORY | O_NOFOLLOW)
-        .open(path)
-        .map_err(|error| Failure::task(format!("could not open {label}: {error}")))?;
-    let metadata = directory
-        .metadata()
-        .map_err(|error| Failure::task(format!("could not stat {label}: {error}")))?;
+        .open(path)?;
+    let metadata = directory.metadata()?;
     if !metadata.file_type().is_dir() {
-        return Err(Failure::task(format!(
-            "WYR0-H {label} must be a real directory"
-        )));
+        return Err(io::Error::other("opened object is not a real directory"));
     }
     Ok(directory)
+}
+
+fn open_directory_failure(label: &str, error: io::Error) -> Failure {
+    Failure::task(format!("could not open {label}: {error}"))
+}
+
+fn directory_child_path(parent: &fs::File, component: &OsStr) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd())).join(component)
 }
 
 fn open_directory_child(
@@ -311,8 +362,12 @@ fn open_directory_child(
     component: &OsStr,
     label: &str,
 ) -> Result<fs::File, Failure> {
-    let path = PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd())).join(component);
-    open_directory(&path, label)
+    open_directory_io(&directory_child_path(parent, component))
+        .map_err(|error| open_directory_failure(label, error))
+}
+
+fn open_directory_child_io(parent: &fs::File, component: &OsStr) -> io::Result<fs::File> {
+    open_directory_io(&directory_child_path(parent, component))
 }
 
 fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
@@ -1176,6 +1231,82 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn checked_output_creation_builds_missing_media_and_run_parents() {
+        use std::io::Write;
+
+        let root = request_root("checked-fresh-parents");
+        let path = write_request_fixture(&root, &valid_v2());
+        let request = load(&path).expect("load fresh-parent fixture");
+        let checked = CheckedOutputRoot::open(&request).expect("open checked root");
+
+        assert!(!root.join("media").exists());
+        assert!(!root.join("runs").exists());
+        assert!(
+            !checked
+                .exists(&request.bootfs, "bootfs")
+                .expect("inspect absent bootfs through absent parent")
+        );
+
+        let mut bootfs = checked
+            .create_new_file(&request.bootfs, "bootfs", false, true)
+            .expect("create bootfs and its missing parent");
+        bootfs
+            .write_all(b"trusted")
+            .expect("write fresh bootfs output");
+        drop(bootfs);
+        checked
+            .create_dir(
+                &request.run_directory.join("default"),
+                "fresh default run directory",
+            )
+            .expect("create nested run directory and its missing parent");
+
+        assert_eq!(
+            fs::read(root.join("media/bootfs.img")).expect("read fresh bootfs"),
+            b"trusted"
+        );
+        assert!(root.join("runs/default").is_dir());
+        assert!(
+            checked
+                .create_new_file(&request.bootfs, "bootfs", false, true)
+                .is_err()
+        );
+        assert!(
+            checked
+                .create_dir(
+                    &request.run_directory.join("default"),
+                    "fresh default run directory",
+                )
+                .is_err()
+        );
+        fs::remove_dir_all(root).expect("remove fresh-parent fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checked_output_creation_rejects_a_new_symlink_parent() {
+        use std::os::unix::fs::symlink;
+
+        let root = request_root("checked-new-parent-symlink");
+        let outside = request_root("checked-new-parent-symlink-outside");
+        let path = write_request_fixture(&root, &valid_v2());
+        fs::create_dir(&outside).expect("create outside directory");
+        let request = load(&path).expect("load missing-parent fixture");
+        let checked = CheckedOutputRoot::open(&request).expect("open checked root");
+
+        symlink(&outside, root.join("media")).expect("install post-admission symlink");
+        let error = checked
+            .create_new_file(&request.bootfs, "bootfs", false, true)
+            .expect_err("created through a post-admission parent symlink");
+
+        assert!(error.message.contains("could not open bootfs"));
+        assert!(!outside.join("bootfs.img").exists());
+        fs::remove_dir_all(root).expect("remove symlink-parent fixture");
+        fs::remove_dir_all(outside).expect("remove outside fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn checked_output_root_survives_request_root_replacement() {
         use std::os::unix::fs::symlink;
 
@@ -1183,7 +1314,6 @@ mod tests {
         let retained = request_root("checked-root-race-retained");
         let outside = request_root("checked-root-race-outside");
         let path = write_request_fixture(&root, &valid_v2());
-        fs::create_dir(root.join("media")).expect("create media directory");
         fs::create_dir(&outside).expect("create outside directory");
         let request = load(&path).expect("load checked-root fixture");
         let checked = CheckedOutputRoot::open(&request).expect("open checked root");
@@ -1193,7 +1323,7 @@ mod tests {
         symlink(&outside, root.join("media")).expect("install escaping replacement");
         let mut output = checked
             .create_new_file(&request.bootfs, "bootfs", false, true)
-            .expect("create under retained request-root descriptor");
+            .expect("create missing parent under retained request-root descriptor");
         use std::io::Write as _;
         output.write_all(b"trusted").expect("write retained output");
 
