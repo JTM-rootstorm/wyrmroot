@@ -201,7 +201,7 @@ impl<'a> Builder<'a> {
         }
         debug_assert_eq!(string_cursor, string_bytes);
 
-        Manifest::parse(&output, &self.boot_generation_identity)
+        Manifest::parse_structural(&output, &self.boot_generation_identity)
             .map_err(BuildError::InvalidManifest)?;
         Ok(output)
     }
@@ -213,7 +213,7 @@ impl<'a> Builder<'a> {
         profile: Wyr1aProductProfile<'_>,
     ) -> Result<Vec<u8>, BuildError> {
         let output = self.build_structural()?;
-        let manifest = Manifest::parse(&output, &self.boot_generation_identity)
+        let manifest = Manifest::parse_structural(&output, &self.boot_generation_identity)
             .map_err(BuildError::InvalidManifest)?;
         manifest
             .validate_wyr1a_product(profile)

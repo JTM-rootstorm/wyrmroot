@@ -137,7 +137,10 @@ impl<'a> Manifest<'a> {
     ///
     /// SHA-256 values are treated as opaque exact 32-byte identities. This
     /// function compares them but does not hash artifact bytes.
-    pub fn parse(bytes: &'a [u8], expected_boot_generation: &[u8; 32]) -> Result<Self, ParseError> {
+    pub fn parse_structural(
+        bytes: &'a [u8],
+        expected_boot_generation: &[u8; 32],
+    ) -> Result<Self, ParseError> {
         if bytes.len() > MAX_TOTAL_BYTES {
             return Err(ParseError::ManifestTooLarge);
         }

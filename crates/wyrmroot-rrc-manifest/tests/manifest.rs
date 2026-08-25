@@ -1,14 +1,18 @@
 #![cfg(feature = "builder")]
 
 use wyrmroot_rrc_manifest::{
-    Activation, DependencyKind, EDGE_RECORD_SIZE, HEADER_SIZE, MAX_EDGES, MAX_TOTAL_BYTES,
-    Manifest, MaterialResidence, ParseError, ProductError, ROLE_RECORD_SIZE, RetainedMaterial,
-    RoleId, StartupProfile, Wyr1aProductProfile,
+    Activation, DependencyKind, EDGE_RECORD_SIZE, ExpectedClosureEntry, ExpectedClosureUse,
+    ExpectedObservedIdentity, HEADER_SIZE, ImmutableDependencyKind, MAX_EDGES, MAX_TOTAL_BYTES,
+    Manifest, MaterialResidence, ObservedRetainedMaterial, ParseError, ProductError,
+    ProductReceiptIdentities, ROLE_RECORD_SIZE, RoleId, StartupProfile, Wyr1aProductProfile,
     builder::{BuildError, Builder, DependencySpec, RoleSpec},
 };
 
 const BOOT_IDENTITY: [u8; 32] = [0x42; 32];
 const INIT_IDENTITY: [u8; 32] = [0x99; 32];
+const INIT_RUNTIME_IDENTITY: [u8; 32] = [0x98; 32];
+const MANIFEST_RECEIPT_IDENTITY: [u8; 32] = [0xa1; 32];
+const BOOTFS_RECEIPT_IDENTITY: [u8; 32] = [0xb1; 32];
 const EMPTY_EDGE_GOLDEN_HEX: &str = "5752524d01000000500060002000000000000000d1000000010000002100000050000000b0000000b000000000000000424242424242424242424242424242424242424242424242424242424242424201000000030000000100010001000100000000001000000010000000110000000000000000000000111111111111111111111111111111111111111111111111111111111111111100000000000000000000000000000000000000000000000073797374656d2f7265676973747279646d696e696d756d20646973636f76657279";
 const FULL_FIVE_ROLE_GOLDEN_HEX: &str = "5752524d01000000500060002000000000000000c903000005000400190100005000000030020000b002000000000000424242424242424242424242424242424242424242424242424242424242424201000000030000000100010001000100000000001000000010000000310000000000000000000000111111111111111111111111111111111111111111111111111111111111111100000000000000000000000000000000000000000000000002000000030000000100010001000100410000000d0000004e000000280000000000010000000000222222222222222222222222222222222222222222222222222222222222222200000000000000000000000000000000000000000000000003000000030000000100020001000000760000001100000087000000270000000100010000000000333333333333333333333333333333333333333333333333333333333333333300000000000000000000000000000000000000000000000004000000030000000100030001000000ae0000000f000000bd0000002b0000000200010000000000444444444444444444444444444444444444444444444444444444444444444400000000000000000000000000000000000000000000000005000000030000000100030001000000e80000000d000000f50000002400000003000100000000005555555555555555555555555555555555555555555555555555555555555555000000000000000000000000000000000000000000000000020000000500010001000000190100000000000000000000000000000000000003000000050001000200000019010000000000000000000000000000000000000400000005000100030000001901000000000000000000000000000000000000050000000500010004000000190100000000000000000000000000000000000073797374656d2f7265676973747279646d696e696d756d20626f6f74667320646973636f7665727920666f72207265636f7665727920636f6e6e656374696f6e7373797374656d2f6465766d6772726f6f742d637269746963616c206465766963652062696e64696e6720616e64207265737461727473797374656d2f7561727431363535306473656c656374656420713335207265636f766572792d636f6e736f6c65207472616e73706f727473797374656d2f636f6e736f6c6564626f756e646564206465677261646564206f70657261746f722d636f6e74726f6c207472616e73706f727473797374656d2f7779726d73686d696e696d756d207265636f766572792061646d696e697374726174696f6e2070617468";
 
@@ -103,40 +107,89 @@ fn product_builder(reverse: bool) -> Builder<'static> {
     builder
 }
 
-fn material(path: &'static str, byte: u8) -> RetainedMaterial<'static> {
-    RetainedMaterial {
+fn observed_material(path: &'static str, byte: u8) -> ObservedRetainedMaterial<'static> {
+    ObservedRetainedMaterial {
         path,
         identity: [byte; 32],
         residence: MaterialResidence::RetainedBootfs,
     }
 }
 
-fn retained_product_materials() -> Vec<RetainedMaterial<'static>> {
+fn expected_product_closure() -> Vec<ExpectedClosureEntry<'static>> {
     vec![
-        material("system/consoled", 0x44),
-        material("system/devmgr", 0x22),
-        RetainedMaterial {
+        expected_role("system/consoled", 0x44, RoleId::Consoled),
+        expected_role("system/devmgr", 0x22, RoleId::Devmgr),
+        ExpectedClosureEntry {
+            path: "system/init",
+            identity: INIT_IDENTITY,
+            usage: ExpectedClosureUse::SystemInit,
+        },
+        expected_role("system/registryd", 0x11, RoleId::Registryd),
+        ExpectedClosureEntry {
+            path: "system/runtime/init-parser",
+            identity: INIT_RUNTIME_IDENTITY,
+            usage: ExpectedClosureUse::InitDependency {
+                kind: ImmutableDependencyKind::Runtime,
+            },
+        },
+        expected_role("system/uart16550d", 0x33, RoleId::Uart16550d),
+        expected_role("system/wyrmsh", 0x55, RoleId::Wyrmsh),
+    ]
+}
+
+fn expected_role(path: &'static str, byte: u8, role: RoleId) -> ExpectedClosureEntry<'static> {
+    ExpectedClosureEntry {
+        path,
+        identity: [byte; 32],
+        usage: ExpectedClosureUse::RoleExecutable { role },
+    }
+}
+
+fn observed_product_materials() -> Vec<ObservedRetainedMaterial<'static>> {
+    vec![
+        observed_material("system/consoled", 0x44),
+        observed_material("system/devmgr", 0x22),
+        ObservedRetainedMaterial {
             path: "system/init",
             identity: INIT_IDENTITY,
             residence: MaterialResidence::RetainedBootfs,
         },
-        material("system/registryd", 0x11),
-        material("system/uart16550d", 0x33),
-        material("system/wyrmsh", 0x55),
+        observed_material("system/registryd", 0x11),
+        ObservedRetainedMaterial {
+            path: "system/runtime/init-parser",
+            identity: INIT_RUNTIME_IDENTITY,
+            residence: MaterialResidence::RetainedBootfs,
+        },
+        observed_material("system/uart16550d", 0x33),
+        observed_material("system/wyrmsh", 0x55),
     ]
 }
 
-fn product_profile<'a>(materials: &'a [RetainedMaterial<'a>]) -> Wyr1aProductProfile<'a> {
+fn product_profile<'a>(
+    expected_closure: &'a [ExpectedClosureEntry<'a>],
+    observed_materials: &'a [ObservedRetainedMaterial<'a>],
+) -> Wyr1aProductProfile<'a> {
     Wyr1aProductProfile {
-        init_identity: INIT_IDENTITY,
-        materials,
+        receipts: ProductReceiptIdentities {
+            manifest: ExpectedObservedIdentity {
+                expected: MANIFEST_RECEIPT_IDENTITY,
+                observed: MANIFEST_RECEIPT_IDENTITY,
+            },
+            bootfs: ExpectedObservedIdentity {
+                expected: BOOTFS_RECEIPT_IDENTITY,
+                observed: BOOTFS_RECEIPT_IDENTITY,
+            },
+        },
+        expected_closure,
+        observed_materials,
     }
 }
 
 fn full_product_bytes() -> Vec<u8> {
-    let materials = retained_product_materials();
+    let expected = expected_product_closure();
+    let observed = observed_product_materials();
     product_builder(false)
-        .build_wyr1a_product(product_profile(&materials))
+        .build_wyr1a_product(product_profile(&expected, &observed))
         .unwrap()
 }
 
@@ -153,21 +206,21 @@ fn immutable_empty_edge_golden_binds_structural_wire_bytes() {
         .unwrap();
     let encoded = builder.build_structural().unwrap();
     assert_eq!(encoded, decode_hex(EMPTY_EDGE_GOLDEN_HEX));
-    let parsed = Manifest::parse(&encoded, &BOOT_IDENTITY).unwrap();
+    let parsed = Manifest::parse_structural(&encoded, &BOOT_IDENTITY).unwrap();
     assert_eq!((parsed.role_count(), parsed.edge_count()), (1, 0));
+    let expected = expected_product_closure();
+    let observed = observed_product_materials();
     assert_eq!(
-        parsed.validate_wyr1a_product(Wyr1aProductProfile {
-            init_identity: INIT_IDENTITY,
-            materials: &[]
-        }),
+        parsed.validate_wyr1a_product(product_profile(&expected, &observed)),
         Err(ProductError::WrongRoleSet)
     );
 }
 
 #[test]
 fn immutable_full_golden_is_product_valid_deterministic_and_zero_copy() {
-    let materials = retained_product_materials();
-    let profile = product_profile(&materials);
+    let expected = expected_product_closure();
+    let observed = observed_product_materials();
+    let profile = product_profile(&expected, &observed);
     let encoded = product_builder(false).build_wyr1a_product(profile).unwrap();
     assert_eq!(encoded, decode_hex(FULL_FIVE_ROLE_GOLDEN_HEX));
     assert_eq!(
@@ -191,13 +244,66 @@ fn immutable_full_golden_is_product_valid_deterministic_and_zero_copy() {
 }
 
 #[test]
+fn product_acceptance_binds_external_manifest_and_bootfs_receipts() {
+    let encoded = full_product_bytes();
+    let expected = expected_product_closure();
+    let observed = observed_product_materials();
+
+    let mut manifest_mismatch = product_profile(&expected, &observed);
+    manifest_mismatch.receipts.manifest.observed[0] ^= 1;
+    assert_eq!(
+        Manifest::parse_wyr1a_product(&encoded, &BOOT_IDENTITY, manifest_mismatch),
+        Err(ProductError::ManifestReceiptIdentityMismatch)
+    );
+
+    let mut same_length_mutation = encoded.clone();
+    same_length_mutation[HEADER_SIZE + 40] ^= 1;
+    assert!(Manifest::parse_structural(&same_length_mutation, &BOOT_IDENTITY).is_ok());
+    assert_eq!(
+        Manifest::parse_wyr1a_product(&same_length_mutation, &BOOT_IDENTITY, manifest_mismatch),
+        Err(ProductError::ManifestReceiptIdentityMismatch)
+    );
+
+    let mut manifest_zero = product_profile(&expected, &observed);
+    manifest_zero.receipts.manifest.observed = [0; 32];
+    assert_eq!(
+        Manifest::parse_wyr1a_product(&encoded, &BOOT_IDENTITY, manifest_zero),
+        Err(ProductError::ZeroManifestReceiptIdentity)
+    );
+
+    let mut bootfs_mismatch = product_profile(&expected, &observed);
+    bootfs_mismatch.receipts.bootfs.observed[0] ^= 1;
+    assert_eq!(
+        Manifest::parse_wyr1a_product(&encoded, &BOOT_IDENTITY, bootfs_mismatch),
+        Err(ProductError::BootfsReceiptIdentityMismatch)
+    );
+
+    let mut bootfs_zero = product_profile(&expected, &observed);
+    bootfs_zero.receipts.bootfs.expected = [0; 32];
+    assert_eq!(
+        Manifest::parse_wyr1a_product(&encoded, &BOOT_IDENTITY, bootfs_zero),
+        Err(ProductError::ZeroBootfsReceiptIdentity)
+    );
+}
+
+#[test]
+fn public_parser_names_separate_structural_from_product_acceptance() {
+    let format_source = include_str!("../src/format.rs");
+    let product_source = include_str!("../src/product.rs");
+    assert!(format_source.contains("pub fn parse_structural("));
+    assert!(!format_source.contains("pub fn parse("));
+    assert!(product_source.contains("pub fn parse_wyr1a_product("));
+}
+
+#[test]
 fn structural_flag_forms_are_valid_but_product_requires_both_bits() {
     let original = full_product_bytes();
-    let materials = retained_product_materials();
+    let expected = expected_product_closure();
+    let observed = observed_product_materials();
     for flags in 0..=3 {
         let mut bytes = original.clone();
         write_u32(&mut bytes, HEADER_SIZE + 4, flags);
-        let parsed = Manifest::parse(&bytes, &BOOT_IDENTITY).unwrap();
+        let parsed = Manifest::parse_structural(&bytes, &BOOT_IDENTITY).unwrap();
         assert_eq!(
             parsed.role(RoleId::Registryd).unwrap().required(),
             flags & 1 != 0
@@ -206,7 +312,7 @@ fn structural_flag_forms_are_valid_but_product_requires_both_bits() {
             parsed.role(RoleId::Registryd).unwrap().requires_ready(),
             flags & 2 != 0
         );
-        let result = parsed.validate_wyr1a_product(product_profile(&materials));
+        let result = parsed.validate_wyr1a_product(product_profile(&expected, &observed));
         assert_eq!(
             result,
             if flags == 3 {
@@ -219,7 +325,7 @@ fn structural_flag_forms_are_valid_but_product_requires_both_bits() {
     let mut unknown = original;
     write_u32(&mut unknown, HEADER_SIZE + 4, 4);
     assert_eq!(
-        Manifest::parse(&unknown, &BOOT_IDENTITY),
+        Manifest::parse_structural(&unknown, &BOOT_IDENTITY),
         Err(ParseError::InvalidRoleFlags)
     );
 }
@@ -228,7 +334,7 @@ fn structural_flag_forms_are_valid_but_product_requires_both_bits() {
 fn headers_truncation_counts_offsets_and_total_bounds_fail_closed() {
     let original = full_product_bytes();
     for end in [0, 1, HEADER_SIZE - 1, HEADER_SIZE, original.len() - 1] {
-        assert!(Manifest::parse(&original[..end], &BOOT_IDENTITY).is_err());
+        assert!(Manifest::parse_structural(&original[..end], &BOOT_IDENTITY).is_err());
     }
     for (offset, expected) in [
         (0, ParseError::WrongMagic),
@@ -246,7 +352,10 @@ fn headers_truncation_counts_offsets_and_total_bounds_fail_closed() {
     ] {
         let mut malformed = original.clone();
         malformed[offset] ^= 1;
-        assert_eq!(Manifest::parse(&malformed, &BOOT_IDENTITY), Err(expected));
+        assert_eq!(
+            Manifest::parse_structural(&malformed, &BOOT_IDENTITY),
+            Err(expected)
+        );
     }
     for (offset, value, expected) in [
         (24, 0, ParseError::RoleCountOutOfRange),
@@ -255,16 +364,19 @@ fn headers_truncation_counts_offsets_and_total_bounds_fail_closed() {
     ] {
         let mut malformed = original.clone();
         write_u16(&mut malformed, offset, value);
-        assert_eq!(Manifest::parse(&malformed, &BOOT_IDENTITY), Err(expected));
+        assert_eq!(
+            Manifest::parse_structural(&malformed, &BOOT_IDENTITY),
+            Err(expected)
+        );
     }
     let mut strings = original;
     write_u32(&mut strings, 28, 16 * 1024 + 1);
     assert_eq!(
-        Manifest::parse(&strings, &BOOT_IDENTITY),
+        Manifest::parse_structural(&strings, &BOOT_IDENTITY),
         Err(ParseError::StringBytesOutOfRange)
     );
     assert_eq!(
-        Manifest::parse(&vec![0; MAX_TOTAL_BYTES + 1], &BOOT_IDENTITY),
+        Manifest::parse_structural(&vec![0; MAX_TOTAL_BYTES + 1], &BOOT_IDENTITY),
         Err(ParseError::ManifestTooLarge)
     );
 }
@@ -283,53 +395,56 @@ fn role_fields_paths_utf8_reserved_and_identities_fail_closed() {
     ] {
         let mut malformed = original.clone();
         malformed[offset] ^= 1;
-        assert_eq!(Manifest::parse(&malformed, &BOOT_IDENTITY), Err(expected));
+        assert_eq!(
+            Manifest::parse_structural(&malformed, &BOOT_IDENTITY),
+            Err(expected)
+        );
     }
     let mut incompatible = original.clone();
     write_u16(&mut incompatible, HEADER_SIZE + 10, 2);
     assert_eq!(
-        Manifest::parse(&incompatible, &BOOT_IDENTITY),
+        Manifest::parse_structural(&incompatible, &BOOT_IDENTITY),
         Err(ParseError::ActivationProfileMismatch)
     );
     let mut unknown_activation = original.clone();
     write_u16(&mut unknown_activation, HEADER_SIZE + 10, 4);
     assert_eq!(
-        Manifest::parse(&unknown_activation, &BOOT_IDENTITY),
+        Manifest::parse_structural(&unknown_activation, &BOOT_IDENTITY),
         Err(ParseError::UnknownActivation)
     );
     let mut unknown_profile = original.clone();
     write_u16(&mut unknown_profile, HEADER_SIZE + 14, 2);
     assert_eq!(
-        Manifest::parse(&unknown_profile, &BOOT_IDENTITY),
+        Manifest::parse_structural(&unknown_profile, &BOOT_IDENTITY),
         Err(ParseError::UnknownStartupProfile)
     );
     assert_eq!(
-        Manifest::parse(&original, &[0x43; 32]),
+        Manifest::parse_structural(&original, &[0x43; 32]),
         Err(ParseError::BootGenerationIdentityMismatch)
     );
     let mut zero_boot = original.clone();
     zero_boot[48..80].fill(0);
     assert_eq!(
-        Manifest::parse(&zero_boot, &BOOT_IDENTITY),
+        Manifest::parse_structural(&zero_boot, &BOOT_IDENTITY),
         Err(ParseError::ZeroBootGenerationIdentity)
     );
     let mut zero_executable = original.clone();
     zero_executable[HEADER_SIZE + 40..HEADER_SIZE + 72].fill(0);
     assert_eq!(
-        Manifest::parse(&zero_executable, &BOOT_IDENTITY),
+        Manifest::parse_structural(&zero_executable, &BOOT_IDENTITY),
         Err(ParseError::ZeroExecutableIdentity)
     );
     let strings_offset = read_u32(&original, 40) as usize;
     let mut invalid_utf8 = original.clone();
     invalid_utf8[strings_offset] = 0xff;
     assert_eq!(
-        Manifest::parse(&invalid_utf8, &BOOT_IDENTITY),
+        Manifest::parse_structural(&invalid_utf8, &BOOT_IDENTITY),
         Err(ParseError::InvalidUtf8)
     );
     let mut gap = original;
     write_u32(&mut gap, HEADER_SIZE + 16, 1);
     assert_eq!(
-        Manifest::parse(&gap, &BOOT_IDENTITY),
+        Manifest::parse_structural(&gap, &BOOT_IDENTITY),
         Err(ParseError::NoncanonicalStringLayout)
     );
     for path in ["system/../bad", "TRAILER!!!", "system\\bad"] {
@@ -355,7 +470,7 @@ fn canonical_role_edge_and_string_order_is_exact() {
         RoleId::Registryd as u32,
     );
     assert_eq!(
-        Manifest::parse(&role_order, &BOOT_IDENTITY),
+        Manifest::parse_structural(&role_order, &BOOT_IDENTITY),
         Err(ParseError::NoncanonicalRoleOrder)
     );
     let mut duplicate_paths = Builder::new(BOOT_IDENTITY);
@@ -419,7 +534,7 @@ fn canonical_role_edge_and_string_order_is_exact() {
         DependencyKind::Config as u16,
     );
     assert_eq!(
-        Manifest::parse(&out_of_order, &BOOT_IDENTITY),
+        Manifest::parse_structural(&out_of_order, &BOOT_IDENTITY),
         Err(ParseError::NoncanonicalEdgeOrder)
     );
 }
@@ -431,31 +546,31 @@ fn edge_shapes_ranges_missing_targets_cycles_and_reserved_fail_closed() {
     let mut bad_range = original.clone();
     write_u16(&mut bad_range, HEADER_SIZE + 2 * ROLE_RECORD_SIZE + 32, 0);
     assert_eq!(
-        Manifest::parse(&bad_range, &BOOT_IDENTITY),
+        Manifest::parse_structural(&bad_range, &BOOT_IDENTITY),
         Err(ParseError::InvalidRoleEdgeRange)
     );
     let mut bad_owner = original.clone();
     write_u32(&mut bad_owner, edges_offset, RoleId::Registryd as u32);
     assert_eq!(
-        Manifest::parse(&bad_owner, &BOOT_IDENTITY),
+        Manifest::parse_structural(&bad_owner, &BOOT_IDENTITY),
         Err(ParseError::WrongEdgeOwner)
     );
     let mut reserved = original;
     reserved[edges_offset + 18] = 1;
     assert_eq!(
-        Manifest::parse(&reserved, &BOOT_IDENTITY),
+        Manifest::parse_structural(&reserved, &BOOT_IDENTITY),
         Err(ParseError::NonzeroEdgeReserved)
     );
     let mut bad_flags = full_product_bytes();
     write_u16(&mut bad_flags, edges_offset + 6, 0);
     assert_eq!(
-        Manifest::parse(&bad_flags, &BOOT_IDENTITY),
+        Manifest::parse_structural(&bad_flags, &BOOT_IDENTITY),
         Err(ParseError::InvalidEdgeFlags)
     );
     let mut unknown_kind = full_product_bytes();
     write_u16(&mut unknown_kind, edges_offset + 4, 6);
     assert_eq!(
-        Manifest::parse(&unknown_kind, &BOOT_IDENTITY),
+        Manifest::parse_structural(&unknown_kind, &BOOT_IDENTITY),
         Err(ParseError::UnknownDependencyKind)
     );
     let mut missing = Builder::new(BOOT_IDENTITY);
@@ -523,22 +638,23 @@ fn edge_shapes_ranges_missing_targets_cycles_and_reserved_fail_closed() {
     let target_offset = read_u32(&edge_utf8, edge_offset + 12) as usize;
     edge_utf8[string_offset + target_offset] = 0xff;
     assert_eq!(
-        Manifest::parse(&edge_utf8, &BOOT_IDENTITY),
+        Manifest::parse_structural(&edge_utf8, &BOOT_IDENTITY),
         Err(ParseError::InvalidUtf8)
     );
 }
 
 #[test]
 fn exact_product_roles_profiles_and_ready_graph_are_required() {
-    let materials = retained_product_materials();
-    let profile = product_profile(&materials);
+    let expected = expected_product_closure();
+    let observed = observed_product_materials();
+    let profile = product_profile(&expected, &observed);
     let mut wrong_activation = full_product_bytes();
     write_u16(
         &mut wrong_activation,
         HEADER_SIZE + 2 * ROLE_RECORD_SIZE + 10,
         Activation::ConsoleBound as u16,
     );
-    let parsed = Manifest::parse(&wrong_activation, &BOOT_IDENTITY).unwrap();
+    let parsed = Manifest::parse_structural(&wrong_activation, &BOOT_IDENTITY).unwrap();
     assert_eq!(
         parsed.validate_wyr1a_product(profile),
         Err(ProductError::WrongRoleActivationProfile)
@@ -587,57 +703,129 @@ fn retained_closure_is_exact_canonical_root_independent_and_identity_bound() {
             target_path: Some("system/config/registryd"),
         })
         .unwrap();
-    let mut materials = retained_product_materials();
-    materials.insert(0, material("system/config/registryd", 0x77));
+    let mut expected = expected_product_closure();
+    expected.insert(
+        0,
+        ExpectedClosureEntry {
+            path: "system/config/registryd",
+            identity: [0x77; 32],
+            usage: ExpectedClosureUse::RoleDependency {
+                owner: RoleId::Registryd,
+                kind: ImmutableDependencyKind::Config,
+            },
+        },
+    );
+    let mut observed = observed_product_materials();
+    observed.insert(0, observed_material("system/config/registryd", 0x77));
     assert!(
         builder
-            .build_wyr1a_product(product_profile(&materials))
+            .build_wyr1a_product(product_profile(&expected, &observed))
             .is_ok()
     );
-    let mut missing = materials.clone();
-    missing.remove(0);
+    let mut missing_expected = expected.clone();
+    missing_expected.remove(0);
     assert_eq!(
-        builder.build_wyr1a_product(product_profile(&missing)),
+        builder.build_wyr1a_product(product_profile(&missing_expected, &observed)),
         Err(BuildError::InvalidProduct(
-            ProductError::MissingDependencyMaterial
+            ProductError::MissingRoleDependencyMaterial
         ))
     );
-    let mut wrong_identity = materials.clone();
-    wrong_identity[2].identity[0] ^= 1;
+
+    let mut changed_dependency = observed.clone();
+    changed_dependency[0].identity[0] ^= 1;
     assert_eq!(
-        builder.build_wyr1a_product(product_profile(&wrong_identity)),
+        builder.build_wyr1a_product(product_profile(&expected, &changed_dependency)),
+        Err(BuildError::InvalidProduct(
+            ProductError::ObservedMaterialIdentityMismatch
+        ))
+    );
+
+    let mut missing_init_dependency = observed.clone();
+    missing_init_dependency.remove(5);
+    assert_eq!(
+        builder.build_wyr1a_product(product_profile(&expected, &missing_init_dependency)),
+        Err(BuildError::InvalidProduct(
+            ProductError::MissingObservedMaterial
+        ))
+    );
+
+    let mut extra_init_dependency = observed.clone();
+    extra_init_dependency.push(observed_material("system/zz-init-extra", 0x88));
+    assert_eq!(
+        builder.build_wyr1a_product(product_profile(&expected, &extra_init_dependency)),
+        Err(BuildError::InvalidProduct(
+            ProductError::UnexpectedObservedMaterial
+        ))
+    );
+
+    let mut wrong_ownership = expected.clone();
+    wrong_ownership[0].usage = ExpectedClosureUse::RoleDependency {
+        owner: RoleId::Devmgr,
+        kind: ImmutableDependencyKind::Config,
+    };
+    assert_eq!(
+        builder.build_wyr1a_product(product_profile(&wrong_ownership, &observed)),
+        Err(BuildError::InvalidProduct(
+            ProductError::WrongClosureRoleDependency
+        ))
+    );
+
+    let mut wrong_role_path = expected.clone();
+    wrong_role_path[1].usage = ExpectedClosureUse::RoleExecutable {
+        role: RoleId::Devmgr,
+    };
+    assert_eq!(
+        builder.build_wyr1a_product(product_profile(&wrong_role_path, &observed)),
+        Err(BuildError::InvalidProduct(ProductError::WrongClosurePath))
+    );
+
+    let mut wrong_role_identity = expected.clone();
+    wrong_role_identity[2].identity[0] ^= 1;
+    assert_eq!(
+        builder.build_wyr1a_product(product_profile(&wrong_role_identity, &observed)),
         Err(BuildError::InvalidProduct(
             ProductError::RoleIdentityMismatch(RoleId::Devmgr)
         ))
     );
-    let mut root_backed = materials.clone();
+
+    let mut root_backed = observed.clone();
     root_backed[0].residence = MaterialResidence::PersistentRoot;
     assert_eq!(
-        builder.build_wyr1a_product(product_profile(&root_backed)),
+        builder.build_wyr1a_product(product_profile(&expected, &root_backed)),
         Err(BuildError::InvalidProduct(ProductError::RootBackedMaterial))
     );
-    let mut noncanonical = materials.clone();
+    let mut noncanonical = observed.clone();
     noncanonical.swap(0, 1);
     assert_eq!(
-        builder.build_wyr1a_product(product_profile(&noncanonical)),
+        builder.build_wyr1a_product(product_profile(&expected, &noncanonical)),
         Err(BuildError::InvalidProduct(
-            ProductError::NoncanonicalInventory
+            ProductError::NoncanonicalObservedInventory
         ))
     );
-    let mut undeclared = materials.clone();
-    undeclared.push(material("system/zz-extra", 0x88));
+    let mut duplicate_observed = observed.clone();
+    let repeated_observed = duplicate_observed[0];
+    duplicate_observed.insert(1, repeated_observed);
     assert_eq!(
-        builder.build_wyr1a_product(product_profile(&undeclared)),
+        builder.build_wyr1a_product(product_profile(&expected, &duplicate_observed)),
         Err(BuildError::InvalidProduct(
-            ProductError::UndeclaredRetainedMaterial
+            ProductError::NoncanonicalObservedInventory
         ))
     );
-    let mut invalid_path = materials;
+    let mut duplicate_expected = expected.clone();
+    let repeated_expected = duplicate_expected[0];
+    duplicate_expected.insert(1, repeated_expected);
+    assert_eq!(
+        builder.build_wyr1a_product(product_profile(&duplicate_expected, &observed)),
+        Err(BuildError::InvalidProduct(
+            ProductError::NoncanonicalExpectedClosure
+        ))
+    );
+    let mut invalid_path = observed;
     invalid_path[0].path = "TRAILER!!!";
     assert_eq!(
-        builder.build_wyr1a_product(product_profile(&invalid_path)),
+        builder.build_wyr1a_product(product_profile(&expected, &invalid_path)),
         Err(BuildError::InvalidProduct(
-            ProductError::InvalidInventoryPath
+            ProductError::InvalidObservedPath
         ))
     );
 }
@@ -711,7 +899,8 @@ fn byte_mutations_never_panic() {
         let mut mutated = original.clone();
         mutated[index] ^= 0xa5;
         assert!(
-            std::panic::catch_unwind(|| Manifest::parse(&mutated, &BOOT_IDENTITY)).is_ok(),
+            std::panic::catch_unwind(|| Manifest::parse_structural(&mutated, &BOOT_IDENTITY))
+                .is_ok(),
             "mutation at {index} panicked"
         );
     }

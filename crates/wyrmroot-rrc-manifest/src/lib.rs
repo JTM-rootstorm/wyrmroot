@@ -17,4 +17,8 @@ pub use format::{
     MANIFEST_PATH, MAX_EDGES, MAX_JUSTIFICATION_BYTES, MAX_PATH_BYTES, MAX_ROLES, MAX_STRING_BYTES,
     MAX_TOTAL_BYTES, Manifest, ParseError, ROLE_RECORD_SIZE, Role, RoleId, Roles, StartupProfile,
 };
-pub use product::{MaterialResidence, ProductError, RetainedMaterial, Wyr1aProductProfile};
+pub use product::{
+    ExpectedClosureEntry, ExpectedClosureUse, ExpectedObservedIdentity, ImmutableDependencyKind,
+    MaterialResidence, ObservedRetainedMaterial, ProductError, ProductReceiptIdentities,
+    Wyr1aProductProfile,
+};
