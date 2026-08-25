@@ -3740,6 +3740,20 @@ mod tests {
 
     #[test]
     fn schema_four_content_is_canonical_immutable_and_bootfs_bound() {
+        let guest_asset = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../userspace/i-capability/assets/asset.bin"
+        ));
+        let guest_config = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../userspace/i-capability/assets/config.toml"
+        ));
+        assert_eq!(
+            canonical_selector_config(0x0123_4567_89AB_CDEF, &sha256::bytes_digest(guest_asset)),
+            guest_config,
+            "host and guest canonical selector config serializations diverged"
+        );
+
         let (root, request) = capability_request("content");
         let capability = request.capability.as_ref().expect("capability request");
         let nonce = request.evidence.expect("evidence request").nonce;

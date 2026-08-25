@@ -51,10 +51,10 @@ fn selector_content_and_wrcap1_framing_are_exactly_owned() {
     for required in [
         "test/wyr0-i/config.toml",
         "test/wyr0-i/asset.bin",
-        "schema_version=1",
-        r#"selector=\"native-userspace-capability\""#,
-        "test_id=24",
-        r#"evidence_protocol=\"wrcap1\""#,
+        "schema_version = 1",
+        r#"selector = \"native-userspace-capability\""#,
+        "test_id = 24",
+        r#"evidence_protocol = \"wrcap1\""#,
     ] {
         assert!(
             CONTENT.contains(required),

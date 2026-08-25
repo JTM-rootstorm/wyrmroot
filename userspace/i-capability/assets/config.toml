@@ -1,6 +1,6 @@
-schema_version=1
-selector="native-userspace-capability"
-test_id=24
-evidence_protocol="wrcap1"
-evidence_nonce="0123456789ABCDEF"
-asset_sha256="c0e83e5c67518828bc70fca24179f814687f0857dd9832fc61d159dd335282fa"
+schema_version = 1
+selector = "native-userspace-capability"
+test_id = 24
+evidence_protocol = "wrcap1"
+evidence_nonce = "0123456789ABCDEF"
+asset_sha256 = "c0e83e5c67518828bc70fca24179f814687f0857dd9832fc61d159dd335282fa"

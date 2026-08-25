@@ -7,8 +7,8 @@ pub const ASSET_BOOTFS_PATH: &[u8] = b"test/wyr0-i/asset.bin";
 pub const CANONICAL_CONFIG_SOURCE: &[u8] = include_bytes!("../assets/config.toml");
 pub const CANONICAL_ASSET_SOURCE: &[u8] = include_bytes!("../assets/asset.bin");
 
-const PREFIX: &[u8] = b"schema_version=1\nselector=\"native-userspace-capability\"\ntest_id=24\nevidence_protocol=\"wrcap1\"\nevidence_nonce=\"";
-const MIDDLE: &[u8] = b"\"\nasset_sha256=\"";
+const PREFIX: &[u8] = b"schema_version = 1\nselector = \"native-userspace-capability\"\ntest_id = 24\nevidence_protocol = \"wrcap1\"\nevidence_nonce = \"";
+const MIDDLE: &[u8] = b"\"\nasset_sha256 = \"";
 const SUFFIX: &[u8] = b"\"\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
