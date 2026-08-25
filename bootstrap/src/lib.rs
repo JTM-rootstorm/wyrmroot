@@ -267,7 +267,7 @@ impl BootstrapError {
             Self::MissingRequiredEntry => PREFIX | 0x0A,
             Self::RequiredEntryNotExecutable => PREFIX | 0x0B,
             #[cfg(feature = "i-capability-relay")]
-            Self::CapabilityRelay(error) => PREFIX | 0x0D00 | wrcap1_relay_error_code(error),
+            Self::CapabilityRelay(error) => PREFIX | 0x0D00 | *error as u32,
             #[cfg(feature = "primordial-test-support")]
             Self::TestSupport(_) => PREFIX | 0x0C,
             Self::Loader(LoadError::Platform {
@@ -283,23 +283,6 @@ impl BootstrapError {
             Self::Cleanup(error) => cleanup_exit_code(*error),
             Self::MissingLoadedProcess => PREFIX | 0x0301,
         }
-    }
-}
-
-#[cfg(feature = "i-capability-relay")]
-const fn wrcap1_relay_error_code(error: &Wrcap1RelayError) -> u32 {
-    match error {
-        Wrcap1RelayError::UnboundedDeadline => 1,
-        Wrcap1RelayError::TimedOut => 2,
-        Wrcap1RelayError::PeerClosed => 3,
-        Wrcap1RelayError::InvalidWaitResult => 4,
-        Wrcap1RelayError::ReceiveWouldBlock => 5,
-        Wrcap1RelayError::SendWouldBlock => 6,
-        Wrcap1RelayError::CapabilityBearing => 7,
-        Wrcap1RelayError::MalformedFraming => 8,
-        Wrcap1RelayError::UnexpectedSequence => 9,
-        Wrcap1RelayError::UnexpectedKind => 10,
-        Wrcap1RelayError::Checksum => 11,
     }
 }
 
@@ -396,30 +379,31 @@ pub const WRCAP1_RECORD_SIZE: usize = 117;
 
 /// A capability-evidence relay datagram did not meet the bootstrap boundary contract.
 #[cfg(feature = "i-capability-relay")]
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
 pub enum Wrcap1RelayError {
     /// The relay was given an unbounded deadline.
-    UnboundedDeadline,
+    UnboundedDeadline = 1,
     /// The bounded receive wait elapsed before the next required record arrived.
-    TimedOut,
+    TimedOut = 2,
     /// The child Channel closed before its next required record became readable.
-    PeerClosed,
+    PeerClosed = 3,
     /// A wait result did not select the requested Channel or its requested signals.
-    InvalidWaitResult,
+    InvalidWaitResult = 4,
     /// A post-readable receive raced with draining and reported `WOULD_BLOCK`.
-    ReceiveWouldBlock,
+    ReceiveWouldBlock = 5,
     /// A bounded relay send remained backpressured after every permitted retry.
-    SendWouldBlock,
+    SendWouldBlock = 6,
     /// The child attached one or more handles to an evidence datagram.
-    CapabilityBearing,
+    CapabilityBearing = 7,
     /// The record was not exact fixed-width, uppercase ASCII `WRCAP1` framing.
-    MalformedFraming,
+    MalformedFraming = 8,
     /// The record sequence was not the contiguous expected value.
-    UnexpectedSequence,
+    UnexpectedSequence = 9,
     /// The record kind was not the required canonical next kind.
-    UnexpectedKind,
+    UnexpectedKind = 10,
     /// The record's checksum did not authenticate its exact preceding byte sequence.
-    Checksum,
+    Checksum = 11,
 }
 
 /// Stable terminal detail for the test-only malformed-ELF variant.
