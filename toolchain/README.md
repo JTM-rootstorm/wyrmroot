@@ -28,15 +28,17 @@ bootstrap. A Rust commit cannot be selected accurately with an official
 moving-channel name, while activating a custom name before its compiler has
 been built and registered would make every Cargo command fail.
 
-After the pinned fork is built and its artifacts are accepted, register that
-installation under the exact `local_toolchain_name` from `versions.toml` and
-activate a root copy of `templates/rust-toolchain.toml`. The registered
-compiler must be checked with `rustc -vV`; its commit hash must match
-`rust.wyrmroot_revision` before it is used for guest artifacts.
+Accepted WYR0 builds consume the immutable toolchain through an explicit
+`WYRMROOT_RUSTC` path bound by the active coordinator request. `xtask` verifies
+that path is inside the request-declared accepted artifact root, that its
+manifest and full toolchain tree match the pinned hashes, and that the compiler
+identity matches `rust.wyrmroot_revision`. A rustup registration under
+`local_toolchain_name` may be convenient on a capable host, but it is not an
+acceptance identity and a root `rust-toolchain.toml` is not required.
 
-Do not replace the custom name with `stable`, `nightly`, or a host-default
+Do not replace the accepted compiler with `stable`, `nightly`, or a host-default
 toolchain. A later Rust update requires an intentional revision change and the
-corresponding rebuild and validation.
+corresponding immutable-artifact rebuild and validation.
 
 ## Build-profile authority
 
@@ -51,9 +53,9 @@ confirmed against the accepted pinned fork before it is used to build an
 artifact. Its locked target contract is PE32+ COFF for AMD64, with the Rust
 target's `rust-lld` MSVC-LLD/link-flavor selection and its EFI application
 entry/subsystem arguments. A host `ld`, GNU linker, or host-libc fallback is
-not permitted. When `xtask` gains its real build implementation, it must
-consume this policy centrally and record the effective configuration hash in
-build provenance.
+not permitted. The canonical `xtask` loader build consumes this policy centrally and records
+the effective configuration and accepted toolchain identities in build
+provenance.
 
 Validate an accepted compiler's target specification without substituting the
 host compiler:

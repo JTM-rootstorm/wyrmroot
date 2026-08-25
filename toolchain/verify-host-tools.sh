@@ -27,7 +27,13 @@ for tool in rustc cargo clang clang++ ld.lld llvm-ar llvm-readelf llvm-readobj l
 
     tool_path=$(command -v "$tool" 2>/dev/null || true)
     if [ -n "$tool_path" ]; then
-        tool_version=$("$tool" --version 2>&1 | sed -n '1p')
+        tool_version_output=$("$tool" --version 2>&1 || true)
+        llvm_version=$(printf '%s\n' "$tool_version_output" | sed -n 's/^[[:space:]]*\(LLVM version [^[:space:]]*\).*$/\1/p' | sed -n '1p')
+        if [ -n "$llvm_version" ]; then
+            tool_version=$llvm_version
+        else
+            tool_version=$(printf '%s\n' "$tool_version_output" | sed -n '1p')
+        fi
         tool_json="${tool_json}\n    {\"name\": \"$(json_escape "$tool")\", \"available\": true, \"path\": \"$(json_escape "$tool_path")\", \"version\": \"$(json_escape "$tool_version")\"}"
     else
         all_tools_available=false

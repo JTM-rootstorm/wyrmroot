@@ -68,6 +68,12 @@ The durable candidate requests have SHA-256 `c1dc9aad25b1be472811ab04091e8862b49
 
 The authority checks preserve the primordial bootstrap's narrow handoff, close-after-use and reverse-order cleanup behavior, temporary `init0`, and separation between production correctness and test-only debug-exit signaling. No Deepwyrm ABI/schema expansion was needed.
 
+## Post-acceptance non-Daybreak review
+
+A 2026-08-24 non-security review of the I-B closure machinery found and corrected two validator gaps, one host-tool identity reporting gap, and stale operator documentation. Runtime dependency validation now examines the complete RUNPATH search order: the first local match must be the manifest-pinned component, lower-priority duplicate copies are accepted only when byte-identical to that pinned component, divergent duplicates fail, and ambient system dependencies remain forbidden from being shadowed inside the accepted toolchain. The toolchain request's per-component SHA-256 fields are also now checked against the hashes in the already-pinned artifact manifest instead of remaining redundant unchecked claims. The host-tool probe now extracts the actual LLVM version line for LLVM utilities instead of recording their generic banner as the version identity.
+
+The accepted Rust 007 bundle still passes the strengthened positive identity gate. Its two RUNPATH-visible copies of the pinned LLVM shared library are byte-identical, so no accepted toolchain bytes or hashes changed. Wyrmroot formatting and clippy with warnings denied pass; the full host gate passes with xtask `92 passed, 1 accepted environment-gated test ignored`; the host-tool probe reports LLVM utilities as `LLVM version 22.1.8`; and Deepwyrm `cargo xtask abi check` remains clean. The review also re-read the active phase's required prior-art set and found no newly applicable pattern requiring an I-B architecture or ABI change. The exact accepted product tuple and original double-build/guest evidence above remain unchanged.
+
 ## Required-source and example disposition
 
 The root WYR0-I plan, I-A native capability contract, image-delivery addendum, bootfs contract, WYR0-H validation contract, architecture indices, and bootstrap/recovery architecture materially governed this implementation.

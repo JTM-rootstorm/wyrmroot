@@ -7,7 +7,7 @@ use std::thread;
 
 use crate::elf_runtime::{RuntimeMetadata, inspect};
 use crate::error::Failure;
-use crate::sha256::{bytes_digest, reader_digest};
+use crate::sha256::{bytes_digest, file_digest, reader_digest};
 
 const REQUEST_PATH: &str = "toolchain/requests/RUST-WYR0-I-B-SYSROOTS-007.toml";
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
@@ -215,6 +215,34 @@ pub(crate) fn prepare(
         &manifest,
         "artifacts.host_compiler_builtins",
         "host compiler-builtins",
+    )?;
+    validate_request_component_hashes(
+        &request,
+        &[
+            ("artifacts.rustc_sha256", &rustc),
+            ("artifacts.cargo_sha256", &cargo),
+            ("artifacts.rust_lld_sha256", &rust_lld),
+            ("artifacts.rustc_driver_sha256", &rustc_driver),
+            ("artifacts.llvm_sha256", &llvm),
+            ("artifacts.host_core_sha256", &host_core),
+            ("artifacts.host_std_sha256", &host_std),
+            ("artifacts.host_proc_macro_sha256", &host_proc_macro),
+            ("artifacts.host_compiler_builtins_sha256", &host_builtins),
+            ("artifacts.wyrmroot_core_sha256", &wyrmroot_core),
+            ("artifacts.wyrmroot_alloc_sha256", &wyrmroot_alloc),
+            (
+                "artifacts.wyrmroot_compiler_builtins_sha256",
+                &wyrmroot_builtins,
+            ),
+            ("artifacts.uefi_core_sha256", &uefi_core),
+            ("artifacts.uefi_alloc_sha256", &uefi_alloc),
+            ("artifacts.uefi_std_sha256", &uefi_std),
+            ("artifacts.uefi_proc_macro_sha256", &uefi_proc_macro),
+            ("artifacts.uefi_compiler_builtins_sha256", &uefi_builtins),
+            ("artifacts.none_core_sha256", &none_core),
+            ("artifacts.none_alloc_sha256", &none_alloc),
+            ("artifacts.none_compiler_builtins_sha256", &none_builtins),
+        ],
     )?;
     validate_runtime_dependencies(&sysroot, &rustc, &cargo, &rust_lld, &rustc_driver, &llvm)?;
 
@@ -711,18 +739,11 @@ fn verify_local_resolution(
         let expected = expected_local
             .iter()
             .find_map(|(name, path)| (*name == needed).then_some(path.as_path()));
-        let mut resolved = None;
+        let mut resolutions = Vec::new();
         for directory in &directories {
             let candidate = directory.join(needed);
             match fs::symlink_metadata(&candidate) {
-                Ok(_) => {
-                    if resolved.replace(candidate).is_some() {
-                        return Err(Failure::task(format!(
-                            "accepted runtime dependency '{needed}' has multiple toolchain-local resolutions"
-                        )));
-                    }
-                    break;
-                }
+                Ok(_) => resolutions.push(candidate),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
                     return Err(Failure::task(format!(
@@ -731,11 +752,31 @@ fn verify_local_resolution(
                 }
             }
         }
-        match (expected, resolved) {
-            (Some(expected), Some(actual)) if actual == expected => {}
+        match (expected, resolutions.first()) {
+            (Some(expected), Some(actual)) if actual == expected => {
+                if resolutions.len() > 1 {
+                    let expected_digest = file_digest(expected).map_err(|error| {
+                        Failure::task(format!(
+                            "could not hash pinned runtime dependency '{needed}': {error}"
+                        ))
+                    })?;
+                    for duplicate in resolutions.iter().skip(1) {
+                        let duplicate_digest = file_digest(duplicate).map_err(|error| {
+                            Failure::task(format!(
+                                "could not hash duplicate runtime dependency '{needed}': {error}"
+                            ))
+                        })?;
+                        if duplicate_digest != expected_digest {
+                            return Err(Failure::task(format!(
+                                "accepted runtime dependency '{needed}' has divergent toolchain-local resolutions"
+                            )));
+                        }
+                    }
+                }
+            }
             (Some(_), _) => {
                 return Err(Failure::task(format!(
-                    "accepted runtime dependency '{needed}' does not resolve to its pinned toolchain component"
+                    "accepted runtime dependency '{needed}' does not resolve first to its pinned toolchain component"
                 )));
             }
             (None, Some(actual)) => {
@@ -1082,6 +1123,16 @@ fn required_sha256(
     Ok(value)
 }
 
+fn validate_request_component_hashes(
+    request: &BTreeMap<String, Value>,
+    components: &[(&str, &ArtifactComponent)],
+) -> Result<(), Failure> {
+    for (key, artifact) in components {
+        expect_string(request, key, &artifact.sha256, "toolchain request")?;
+    }
+    Ok(())
+}
+
 fn expect_string(
     values: &BTreeMap<String, Value>,
     key: &str,
@@ -1157,7 +1208,8 @@ mod tests {
     use super::{
         ArtifactComponent, CONSUMER_REQUEST, COORDINATOR_REQUEST, contained_path,
         open_stable_regular_file, parse_manifest, prepare, validate_component,
-        validate_manifest_identity, verify_local_resolution, verify_open_file_identity,
+        validate_manifest_identity, validate_request_component_hashes, verify_local_resolution,
+        verify_open_file_identity,
     };
     use crate::elf_runtime::RuntimeMetadata;
     use crate::sha256::bytes_digest;
@@ -1195,6 +1247,29 @@ mod tests {
             parse_manifest(&identity_manifest().replace("    \"x86_64-unknown-none\",\n", ""))
                 .expect("parse missing-target fixture");
         assert!(validate_manifest_identity(&missing_target, NAME, COMMIT).is_err());
+    }
+
+    #[test]
+    fn request_component_hashes_must_match_the_accepted_manifest() {
+        let expected = "a".repeat(64);
+        let request = parse_manifest(&format!("[artifacts]\nrustc_sha256 = \"{expected}\"\n"))
+            .expect("parse request hash fixture");
+        let artifact = ArtifactComponent {
+            label: "rustc",
+            path: Path::new("toolchain/bin/rustc").to_path_buf(),
+            sha256: expected.clone(),
+        };
+        validate_request_component_hashes(&request, &[("artifacts.rustc_sha256", &artifact)])
+            .expect("matching request component hash rejected");
+
+        let stale = ArtifactComponent {
+            sha256: "b".repeat(64),
+            ..artifact
+        };
+        assert!(
+            validate_request_component_hashes(&request, &[("artifacts.rustc_sha256", &stale)],)
+                .is_err()
+        );
     }
 
     #[cfg(unix)]
@@ -1297,6 +1372,38 @@ mod tests {
             .expect("unshadowed system dependency rejected");
         fs::write(root.join("lib/libc.so.6"), b"shadow").expect("write shadow system library");
         assert!(verify_local_resolution(&root, &executable, &runtime, &[]).is_err());
+        fs::remove_dir_all(root).expect("remove synthetic artifact root");
+    }
+
+    #[test]
+    fn runtime_resolution_allows_identical_but_rejects_divergent_duplicate_local_libraries() {
+        let root = temporary_root("runtime-duplicate-local");
+        fs::create_dir_all(root.join("bin")).expect("create synthetic executable directory");
+        fs::create_dir(root.join("lib-a")).expect("create first synthetic library directory");
+        fs::create_dir(root.join("lib-b")).expect("create second synthetic library directory");
+        let executable = root.join("bin/rustc");
+        fs::write(&executable, b"fixture").expect("write synthetic executable");
+        let first = root.join("lib-a/liblocal.so");
+        let duplicate = root.join("lib-b/liblocal.so");
+        fs::write(&first, b"same").expect("write first local dependency");
+        fs::write(&duplicate, b"same").expect("write identical duplicate local dependency");
+        let runtime = RuntimeMetadata {
+            interpreter: Some(super::SYSTEM_INTERPRETER.to_owned()),
+            runpath: "$ORIGIN/../lib-a:$ORIGIN/../lib-b".to_owned(),
+            needed: vec!["liblocal.so".to_owned()],
+        };
+        verify_local_resolution(&root, &executable, &runtime, &[("liblocal.so", &first)])
+            .expect("identical lower-priority local copy rejected");
+
+        fs::write(&duplicate, b"different").expect("diverge duplicate local dependency");
+        let failure =
+            verify_local_resolution(&root, &executable, &runtime, &[("liblocal.so", &first)])
+                .expect_err("divergent toolchain-local resolution was accepted");
+        assert!(
+            failure
+                .message
+                .contains("divergent toolchain-local resolutions")
+        );
         fs::remove_dir_all(root).expect("remove synthetic artifact root");
     }
 
