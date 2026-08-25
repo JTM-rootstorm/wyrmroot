@@ -522,7 +522,7 @@ pub fn load_process_with_fault<P: LoaderPlatform>(
     transaction.thread = Some(thread);
 
     let mut transfers = [DwHandleTransferV1::default(); 3];
-    let transfer_count = if request.profile.has_init0_capabilities() {
+    let transfer_count = if request.profile.has_loader_authority_trio() {
         let bootfs = match platform.duplicate(authority.bootfs, BOOTFS_RIGHTS) {
             Ok(handle) => handle,
             Err(cause) => {
@@ -551,6 +551,12 @@ pub fn load_process_with_fault<P: LoaderPlatform>(
         transfers[1] = transfer(bootfs, BOOTFS_RIGHTS);
         transfers[2] = transfer(task_group, LOADER_TASK_GROUP_RIGHTS);
         3
+    } else if request.profile.needs_self_root() {
+        // WYR0-I probe children receive only their own mapping authority at
+        // startup. Shared MemoryObjects are a typed controller protocol after
+        // startup, not a loader launch capability.
+        transfers[0] = transfer(created.root, SELF_ROOT_RIGHTS);
+        1
     } else {
         0
     };
@@ -563,10 +569,12 @@ pub fn load_process_with_fault<P: LoaderPlatform>(
     ) {
         return Err(fail(platform, &mut transaction, LoadStage::InitSend, cause));
     }
-    if request.profile.has_init0_capabilities() {
+    if request.profile.needs_self_root() {
         transaction.root = None;
-        transaction.delegated_bootfs = None;
-        transaction.delegated_task_group = None;
+        if request.profile.has_loader_authority_trio() {
+            transaction.delegated_bootfs = None;
+            transaction.delegated_task_group = None;
+        }
     } else if let Err(cause) = platform.close(created.root) {
         return Err(fail(
             platform,

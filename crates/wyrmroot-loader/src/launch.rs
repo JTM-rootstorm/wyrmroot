@@ -1,4 +1,8 @@
 //! Wyrmroot parent/child launch protocol (`WRLP`) encoding and validation.
+//!
+//! Existing launch profiles retain the WRLP 1.0 wire shape. WYR0-I probe
+//! children use the explicit WRLP 1.1 profile so a self-root-only startup
+//! grant cannot be confused with the controller's authority trio.
 
 use deepwyrm_syscall::{
     DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_MEMORY_OBJECT, DW_OBJECT_TYPE_TASK_GROUP,
@@ -8,11 +12,13 @@ use deepwyrm_syscall::{
 
 pub const HEADER_BYTES: usize = 40;
 pub const INIT0_BYTES: usize = 64;
+pub const PROBE_CHILD_BYTES: usize = 48;
 pub const MAX_CAPABILITIES: usize = 3;
 
 const MAGIC: &[u8; 4] = b"WRLP";
 const MAJOR: u16 = 1;
-const MINOR: u16 = 0;
+const MINOR_V1_0: u16 = 0;
+const MINOR_V1_1: u16 = 1;
 const TYPE_INIT: u32 = 1;
 const TYPE_READY: u32 = 2;
 const ROLE_SELF_ROOT: u32 = 1;
@@ -37,14 +43,28 @@ pub enum LaunchProfile {
     /// Test-only I2 controller.  It receives the same explicitly delegated
     /// construction authority as init0, but is selected only by the I2 image.
     I2Stress,
+    /// WYR0-I controller. It retains the established WRLP 1.0 authority trio
+    /// so it can launch and supervise its own probe children.
+    CapabilityController,
+    /// WYR0-I ordinary probe child. Its WRLP 1.1 INIT carries only the child
+    /// self-root; controller-originated objects arrive after startup.
+    ProbeChild,
     Hello,
 }
 
 impl LaunchProfile {
     pub const fn capability_count(self) -> usize {
         match self {
-            Self::Init0 | Self::I2Stress => 3,
+            Self::Init0 | Self::I2Stress | Self::CapabilityController => 3,
+            Self::ProbeChild => 1,
             Self::Hello => 0,
+        }
+    }
+
+    pub const fn protocol_minor(self) -> u16 {
+        match self {
+            Self::ProbeChild => MINOR_V1_1,
+            Self::Init0 | Self::I2Stress | Self::CapabilityController | Self::Hello => MINOR_V1_0,
         }
     }
 
@@ -91,18 +111,21 @@ pub fn encode_init(
     output[..size].fill(0);
     write_header(
         &mut output[..size],
+        profile.protocol_minor(),
         TYPE_INIT,
         size as u32,
         profile.capability_count() as u32,
         transaction_id,
     );
-    if profile.has_init0_capabilities() {
+    if profile.has_loader_authority_trio() {
         for (index, role) in [ROLE_SELF_ROOT, ROLE_BOOTFS, ROLE_LOADER_TASK_GROUP]
             .into_iter()
             .enumerate()
         {
             put_u32(output, HEADER_BYTES + index * 8, role);
         }
+    } else if profile.needs_self_root() {
+        put_u32(output, HEADER_BYTES, ROLE_SELF_ROOT);
     }
     Ok(size)
 }
@@ -115,13 +138,14 @@ pub fn parse_init(
     let transaction_id = parse_header(
         bytes,
         TYPE_INIT,
+        profile.protocol_minor(),
         profile.init_size(),
         profile.capability_count(),
     )?;
     if handles.len() != profile.capability_count() {
         return Err(LaunchError::HandleCount);
     }
-    if profile.has_init0_capabilities() {
+    if profile.has_loader_authority_trio() {
         let expected = [
             (
                 ROLE_SELF_ROOT,
@@ -143,6 +167,16 @@ pub fn parse_init(
             }
             validate_handle(handles[index], object_type, rights, index)?;
         }
+    } else if profile.needs_self_root() {
+        if get_u32(bytes, HEADER_BYTES) != ROLE_SELF_ROOT || get_u32(bytes, HEADER_BYTES + 4) != 0 {
+            return Err(LaunchError::BadCapabilityRole { index: 0 });
+        }
+        validate_handle(
+            handles[0],
+            DW_OBJECT_TYPE_ADDRESS_REGION,
+            SELF_ROOT_RIGHTS,
+            0,
+        )?;
     }
     Ok(ParsedMessage {
         transaction_id,
@@ -151,8 +185,15 @@ pub fn parse_init(
 }
 
 impl LaunchProfile {
-    pub const fn has_init0_capabilities(self) -> bool {
-        matches!(self, Self::Init0 | Self::I2Stress)
+    pub const fn has_loader_authority_trio(self) -> bool {
+        matches!(
+            self,
+            Self::Init0 | Self::I2Stress | Self::CapabilityController
+        )
+    }
+
+    pub const fn needs_self_root(self) -> bool {
+        self.has_loader_authority_trio() || matches!(self, Self::ProbeChild)
     }
 }
 
@@ -164,12 +205,19 @@ pub fn encode_ready(transaction_id: u64, output: &mut [u8]) -> Result<usize, Lau
         return Err(LaunchError::ZeroTransaction);
     }
     output[..HEADER_BYTES].fill(0);
-    write_header(output, TYPE_READY, HEADER_BYTES as u32, 0, transaction_id);
+    write_header(
+        output,
+        MINOR_V1_0,
+        TYPE_READY,
+        HEADER_BYTES as u32,
+        0,
+        transaction_id,
+    );
     Ok(HEADER_BYTES)
 }
 
 pub fn parse_ready(bytes: &[u8], expected_transaction: u64) -> Result<(), LaunchError> {
-    let transaction_id = parse_header(bytes, TYPE_READY, HEADER_BYTES, 0)?;
+    let transaction_id = parse_header(bytes, TYPE_READY, MINOR_V1_0, HEADER_BYTES, 0)?;
     if transaction_id != expected_transaction {
         return Err(LaunchError::TransactionMismatch);
     }
@@ -179,6 +227,7 @@ pub fn parse_ready(bytes: &[u8], expected_transaction: u64) -> Result<(), Launch
 fn parse_header(
     bytes: &[u8],
     message_type: u32,
+    expected_minor: u16,
     expected_size: usize,
     expected_capabilities: usize,
 ) -> Result<u64, LaunchError> {
@@ -188,7 +237,7 @@ fn parse_header(
     if &bytes[..4] != MAGIC {
         return Err(LaunchError::BadMagic);
     }
-    if get_u16(bytes, 4) != MAJOR || get_u16(bytes, 6) != MINOR {
+    if get_u16(bytes, 4) != MAJOR || get_u16(bytes, 6) != expected_minor {
         return Err(LaunchError::BadVersion);
     }
     if get_u32(bytes, 8) != message_type {
@@ -232,6 +281,7 @@ fn validate_handle(
 
 fn write_header(
     output: &mut [u8],
+    minor: u16,
     message_type: u32,
     total_size: u32,
     capabilities: u32,
@@ -239,7 +289,7 @@ fn write_header(
 ) {
     output[..4].copy_from_slice(MAGIC);
     put_u16(output, 4, MAJOR);
-    put_u16(output, 6, MINOR);
+    put_u16(output, 6, minor);
     put_u32(output, 8, message_type);
     put_u32(output, 16, total_size);
     put_u32(output, 20, capabilities);

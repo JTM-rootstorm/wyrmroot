@@ -229,6 +229,61 @@ fn init0_construction_materializes_before_mapping_and_starts_last() {
 }
 
 #[test]
+fn probe_child_delegates_only_its_self_root_in_the_wrpl_1_1_init() {
+    let mut platform = Mock::new(None);
+    let image = executable();
+    load_process(
+        &mut platform,
+        authority(),
+        request(&image, LaunchProfile::ProbeChild),
+    )
+    .unwrap();
+
+    assert_eq!(
+        platform
+            .events
+            .iter()
+            .filter(|event| matches!(event, Event::Send(1)))
+            .count(),
+        1
+    );
+    assert_eq!(platform.sent_init.len(), 48);
+    assert_eq!(&platform.sent_init[6..8], &1_u16.to_le_bytes());
+    assert_eq!(platform.sent_transfers.len(), 1);
+    assert_eq!(
+        platform.sent_transfers[0].requested_rights,
+        wyrmroot_loader::launch::SELF_ROOT_RIGHTS
+    );
+    assert!(!platform.events.contains(&Event::Duplicate(2)));
+    assert!(!platform.events.contains(&Event::Duplicate(3)));
+}
+
+#[test]
+fn probe_child_send_failure_rolls_back_the_unmoved_self_root_without_controller_delegations() {
+    let mut platform = Mock::new(Some("send"));
+    let image = executable();
+    let error = load_process(
+        &mut platform,
+        authority(),
+        request(&image, LaunchProfile::ProbeChild),
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        error,
+        LoadError::Platform {
+            stage: LoadStage::InitSend,
+            cause: "send",
+            rollback_failed: false,
+        }
+    );
+    assert!(platform.events.contains(&Event::Send(1)));
+    assert!(platform.events.contains(&Event::Close(14)));
+    assert!(!platform.events.contains(&Event::Duplicate(2)));
+    assert!(!platform.events.contains(&Event::Duplicate(3)));
+}
+
+#[test]
 fn prepublication_failure_unmaps_and_terminates_in_reverse_order() {
     let mut platform = Mock::new(Some("thread"));
     let image = executable();

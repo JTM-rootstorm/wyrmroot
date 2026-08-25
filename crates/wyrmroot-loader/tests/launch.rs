@@ -4,7 +4,7 @@ use deepwyrm_syscall::{
 };
 use wyrmroot_loader::launch::{
     self, BOOTFS_RIGHTS, HEADER_BYTES, INIT0_BYTES, LOADER_TASK_GROUP_RIGHTS, LaunchError,
-    LaunchProfile, SELF_ROOT_RIGHTS,
+    LaunchProfile, PROBE_CHILD_BYTES, SELF_ROOT_RIGHTS,
 };
 
 #[test]
@@ -15,6 +15,8 @@ fn exact_init0_round_trip_validates_roles_and_handles() {
         Ok(64)
     );
     assert_eq!(&bytes[..4], b"WRLP");
+    assert_eq!(get16(&bytes, 4), 1);
+    assert_eq!(get16(&bytes, 6), 0);
     assert_eq!(get32(&bytes, 8), 1);
     assert_eq!(get32(&bytes, 16), 64);
     assert_eq!(get32(&bytes, 20), 3);
@@ -47,6 +49,106 @@ fn i2_stress_uses_the_same_explicit_three_capability_contract_as_init0() {
         0x2201
     );
     assert!(launch::parse_init(LaunchProfile::I2Stress, &bytes, &handles[..2]).is_err());
+}
+
+#[test]
+fn capability_controller_retains_the_wrpl_1_0_init0_authority_trio() {
+    let mut bytes = [0; INIT0_BYTES];
+    let handles = init0_handles();
+    assert_eq!(
+        launch::encode_init(LaunchProfile::CapabilityController, 0xc0de, &mut bytes),
+        Ok(INIT0_BYTES)
+    );
+    assert_eq!(get16(&bytes, 4), 1);
+    assert_eq!(get16(&bytes, 6), 0);
+    assert_eq!(get32(&bytes, 20), 3);
+    assert_eq!(
+        launch::parse_init(LaunchProfile::CapabilityController, &bytes, &handles)
+            .unwrap()
+            .transaction_id,
+        0xc0de
+    );
+}
+
+#[test]
+fn probe_child_is_an_exact_wrpl_1_1_self_root_only_profile() {
+    let mut bytes = [0xaa; PROBE_CHILD_BYTES];
+    let handle = [received(1, DW_OBJECT_TYPE_ADDRESS_REGION, SELF_ROOT_RIGHTS)];
+    assert_eq!(
+        launch::encode_init(LaunchProfile::ProbeChild, 0xbabe, &mut bytes),
+        Ok(PROBE_CHILD_BYTES)
+    );
+    assert_eq!(get16(&bytes, 4), 1);
+    assert_eq!(get16(&bytes, 6), 1);
+    assert_eq!(get32(&bytes, 16), PROBE_CHILD_BYTES as u32);
+    assert_eq!(get32(&bytes, 20), 1);
+    assert_eq!(get32(&bytes, 40), 1);
+    assert_eq!(get32(&bytes, 44), 0);
+    assert_eq!(
+        launch::parse_init(LaunchProfile::ProbeChild, &bytes, &handle)
+            .unwrap()
+            .transaction_id,
+        0xbabe
+    );
+}
+
+#[test]
+fn probe_child_rejects_v1_0_or_other_profile_shapes() {
+    let mut probe = [0; PROBE_CHILD_BYTES];
+    let root = [received(1, DW_OBJECT_TYPE_ADDRESS_REGION, SELF_ROOT_RIGHTS)];
+    launch::encode_init(LaunchProfile::ProbeChild, 7, &mut probe).unwrap();
+    probe[6..8].copy_from_slice(&0_u16.to_le_bytes());
+    assert_eq!(
+        launch::parse_init(LaunchProfile::ProbeChild, &probe, &root),
+        Err(LaunchError::BadVersion)
+    );
+
+    let mut controller = [0; INIT0_BYTES];
+    let controller_handles = init0_handles();
+    launch::encode_init(LaunchProfile::CapabilityController, 7, &mut controller).unwrap();
+    assert_eq!(
+        launch::parse_init(LaunchProfile::ProbeChild, &controller, &controller_handles),
+        Err(LaunchError::BufferSize)
+    );
+}
+
+#[test]
+fn probe_child_rejects_wrong_cardinality_role_or_root_metadata() {
+    let mut bytes = [0; PROBE_CHILD_BYTES];
+    let root = [received(1, DW_OBJECT_TYPE_ADDRESS_REGION, SELF_ROOT_RIGHTS)];
+    launch::encode_init(LaunchProfile::ProbeChild, 1, &mut bytes).unwrap();
+    assert_eq!(
+        launch::parse_init(LaunchProfile::ProbeChild, &bytes, &[]),
+        Err(LaunchError::HandleCount)
+    );
+
+    bytes[20..24].copy_from_slice(&2_u32.to_le_bytes());
+    assert_eq!(
+        launch::parse_init(LaunchProfile::ProbeChild, &bytes, &root),
+        Err(LaunchError::BadCapabilityCount)
+    );
+
+    launch::encode_init(LaunchProfile::ProbeChild, 1, &mut bytes).unwrap();
+    bytes[40..44].copy_from_slice(&2_u32.to_le_bytes());
+    assert_eq!(
+        launch::parse_init(LaunchProfile::ProbeChild, &bytes, &root),
+        Err(LaunchError::BadCapabilityRole { index: 0 })
+    );
+
+    launch::encode_init(LaunchProfile::ProbeChild, 1, &mut bytes).unwrap();
+    for field in 0..4 {
+        let mut wrong_metadata = root;
+        match field {
+            0 => wrong_metadata[0].handle = DwHandle(0),
+            1 => wrong_metadata[0].object_type = DW_OBJECT_TYPE_MEMORY_OBJECT,
+            2 => wrong_metadata[0].rights = BOOTFS_RIGHTS,
+            _ => wrong_metadata[0].reserved0 = 1,
+        }
+        assert_eq!(
+            launch::parse_init(LaunchProfile::ProbeChild, &bytes, &wrong_metadata),
+            Err(LaunchError::HandleMetadata { index: 0 })
+        );
+    }
 }
 
 #[test]
@@ -149,6 +251,9 @@ fn received(
 }
 fn get32(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+}
+fn get16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
 }
 fn get64(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
