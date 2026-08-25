@@ -267,7 +267,7 @@ impl BootstrapError {
             Self::MissingRequiredEntry => PREFIX | 0x0A,
             Self::RequiredEntryNotExecutable => PREFIX | 0x0B,
             #[cfg(feature = "i-capability-relay")]
-            Self::CapabilityRelay(error) => PREFIX | 0x0D00 | *error as u32,
+            Self::CapabilityRelay(_) => PREFIX | 0x0D,
             #[cfg(feature = "primordial-test-support")]
             Self::TestSupport(_) => PREFIX | 0x0C,
             Self::Loader(LoadError::Platform {
@@ -379,31 +379,30 @@ pub const WRCAP1_RECORD_SIZE: usize = 117;
 
 /// A capability-evidence relay datagram did not meet the bootstrap boundary contract.
 #[cfg(feature = "i-capability-relay")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u32)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum Wrcap1RelayError {
     /// The relay was given an unbounded deadline.
-    UnboundedDeadline = 1,
+    UnboundedDeadline,
     /// The bounded receive wait elapsed before the next required record arrived.
-    TimedOut = 2,
+    TimedOut,
     /// The child Channel closed before its next required record became readable.
-    PeerClosed = 3,
+    PeerClosed,
     /// A wait result did not select the requested Channel or its requested signals.
-    InvalidWaitResult = 4,
+    InvalidWaitResult,
     /// A post-readable receive raced with draining and reported `WOULD_BLOCK`.
-    ReceiveWouldBlock = 5,
+    ReceiveWouldBlock,
     /// A bounded relay send remained backpressured after every permitted retry.
-    SendWouldBlock = 6,
+    SendWouldBlock,
     /// The child attached one or more handles to an evidence datagram.
-    CapabilityBearing = 7,
+    CapabilityBearing,
     /// The record was not exact fixed-width, uppercase ASCII `WRCAP1` framing.
-    MalformedFraming = 8,
+    MalformedFraming,
     /// The record sequence was not the contiguous expected value.
-    UnexpectedSequence = 9,
+    UnexpectedSequence,
     /// The record kind was not the required canonical next kind.
-    UnexpectedKind = 10,
+    UnexpectedKind,
     /// The record's checksum did not authenticate its exact preceding byte sequence.
-    Checksum = 11,
+    Checksum,
 }
 
 /// Stable terminal detail for the test-only malformed-ELF variant.

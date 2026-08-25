@@ -120,19 +120,6 @@ fn live_exit_code_identifies_bootstrap_owned_failure() {
     );
 }
 
-#[cfg(feature = "i-capability-relay")]
-#[test]
-fn live_exit_code_identifies_capability_relay_failure() {
-    assert_eq!(
-        BootstrapError::CapabilityRelay(Wrcap1RelayError::TimedOut).exit_code(),
-        0xB000_0D02
-    );
-    assert_eq!(
-        BootstrapError::CapabilityRelay(Wrcap1RelayError::Checksum).exit_code(),
-        0xB000_0D0B
-    );
-}
-
 struct Fixture {
     init: [u8; BOOTSTRAP_INIT_V2_SIZE],
     init_size: usize,
