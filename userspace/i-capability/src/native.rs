@@ -19,11 +19,12 @@ use wyrmroot_loader::{
 };
 use wyrmroot_runtime::{
     AccountedResource, AccountingError, AttemptFailure, BOOTSTRAP_CHANNEL_EXPECTATION,
-    CleanupDisposition, LOADER_TASK_GROUP_EXPECTATION, MappingPlan, NativeError,
-    NativeLoaderPlatform, ReadinessAccounting, ReservationRequest, RestartState, RestartSupervisor,
-    SELF_ROOT_EXPECTATION, TerminalDisposition, WYR0_I_SUPERVISION_POLICY, cancel_timer,
-    close_handle, create_channel, create_event, create_memory_object, create_task_group,
-    create_timer, duplicate_handle, map_bootfs_read_only, map_memory_read_only,
+    CleanupDisposition, ExitObservedReadinessError, ExitValidationError,
+    LOADER_TASK_GROUP_EXPECTATION, MappingPlan, NativeError, NativeLoaderPlatform,
+    ReadinessAccounting, ReservationRequest, RestartState, RestartSupervisor,
+    SELF_ROOT_EXPECTATION, SupervisionError, TerminalDisposition, WYR0_I_SUPERVISION_POLICY,
+    cancel_timer, close_handle, create_channel, create_event, create_memory_object,
+    create_task_group, create_timer, duplicate_handle, map_bootfs_read_only, map_memory_read_only,
     map_memory_read_write, monotonic_active_now, monotonic_deadline_after, native_error_code,
     query_capability_info, query_memory_object_size, query_task_termination_info, receive_channel,
     send_channel, set_timer, signal_event, supervise_native_child, terminate_process, unmap_bootfs,
@@ -493,12 +494,43 @@ fn exercise_normal_lifecycle(
         NORMAL_TRANSACTION,
         future_deadline(CHILD_TIMEOUT_NS, EvidenceKind::ProcessLifecycle, 0x0101)?,
     )
-    .map_err(|_| failure(EvidenceKind::ProcessLifecycle, 0x0102));
+    .map_err(|error| supervision_failure(EvidenceKind::ProcessLifecycle, error));
     close_loaded(loaded, group, EvidenceKind::ProcessLifecycle, 0x0110)?;
     result?;
     ledger
         .complete_transaction(&mut transaction)
         .map_err(|_| failure(EvidenceKind::ProcessLifecycle, 0x0120))
+}
+
+fn supervision_failure(stage: EvidenceKind, error: SupervisionError<NativeError>) -> u32 {
+    let operation = match error {
+        SupervisionError::Exit(ExitValidationError::NonzeroApplicationCode(code)) => return code,
+        SupervisionError::Platform(error) => 0xa000 | native_cause(error),
+        SupervisionError::ExitQuery(error) => 0xa200 | native_cause(error),
+        SupervisionError::UnboundedDeadline => 0xa400,
+        SupervisionError::InvalidWaitResult => 0xa401,
+        SupervisionError::InvalidReadyReceive(_) => 0xa402,
+        SupervisionError::Ready(_) => 0xa403,
+        SupervisionError::ExitedBeforeReady => 0xa404,
+        SupervisionError::PeerClosedBeforeReady => 0xa405,
+        SupervisionError::DuplicateReady => 0xa406,
+        SupervisionError::Exit(ExitValidationError::InvalidEnvelope) => 0xa420,
+        SupervisionError::Exit(ExitValidationError::NotExited) => 0xa421,
+        SupervisionError::Exit(ExitValidationError::NotNormalExit) => 0xa422,
+        SupervisionError::Exit(ExitValidationError::NonzeroExceptionFields) => 0xa423,
+        SupervisionError::ExitObservedReadiness(error) => match error {
+            ExitObservedReadinessError::Platform(error) => 0xa600 | native_cause(error),
+            ExitObservedReadinessError::InvalidWaitResult => 0xa800,
+            ExitObservedReadinessError::InvalidReadyReceive(_) => 0xa801,
+            ExitObservedReadinessError::Ready(_) => 0xa802,
+            ExitObservedReadinessError::DuplicateReady => 0xa803,
+        },
+    };
+    failure(stage, operation)
+}
+
+const fn native_cause(error: NativeError) -> u16 {
+    (native_error_code(error) as u16) & 0x01ff
 }
 
 fn exercise_shared_memory(
@@ -1351,6 +1383,25 @@ mod tests {
                 rollback_failed: true,
             }),
             0xe205
+        );
+    }
+
+    #[test]
+    fn supervision_failure_preserves_child_code_and_classifies_native_failures() {
+        let child = failure(EvidenceKind::Cancellation, 0x1234);
+        assert_eq!(
+            supervision_failure(
+                EvidenceKind::ProcessLifecycle,
+                SupervisionError::Exit(ExitValidationError::NonzeroApplicationCode(child)),
+            ),
+            child
+        );
+        assert_eq!(
+            supervision_failure(
+                EvidenceKind::ProcessLifecycle,
+                SupervisionError::Platform(NativeError::Status(deepwyrm_syscall::DwStatus(-13))),
+            ),
+            failure(EvidenceKind::ProcessLifecycle, 0xa00d)
         );
     }
 }
