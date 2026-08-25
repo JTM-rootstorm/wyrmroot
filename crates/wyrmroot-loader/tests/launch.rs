@@ -158,11 +158,59 @@ fn hello_and_ready_are_handle_free_exact_headers() {
     assert!(launch::parse_init(LaunchProfile::Hello, &init, &[]).is_ok());
     let mut ready = [0xaa; HEADER_BYTES];
     launch::encode_ready(9, &mut ready).unwrap();
+    assert_eq!(get16(&ready, 4), 1);
+    assert_eq!(get16(&ready, 6), 0);
     assert_eq!(get32(&ready, 8), 2);
     assert_eq!(launch::parse_ready(&ready, 9), Ok(()));
     assert_eq!(
         launch::parse_ready(&ready, 10),
         Err(LaunchError::TransactionMismatch)
+    );
+}
+
+#[test]
+fn profile_aware_ready_binds_probe_child_to_wrpl_1_1_and_transaction() {
+    let mut ready = [0xaa; HEADER_BYTES];
+    assert_eq!(
+        launch::encode_ready_for_profile(LaunchProfile::ProbeChild, 0xbabe, &mut ready),
+        Ok(HEADER_BYTES)
+    );
+    assert_eq!(get16(&ready, 4), 1);
+    assert_eq!(get16(&ready, 6), 1);
+    assert_eq!(get32(&ready, 8), 2);
+    assert_eq!(get32(&ready, 20), 0);
+    assert_eq!(
+        launch::parse_ready_for_profile(LaunchProfile::ProbeChild, &ready, 0xbabe),
+        Ok(())
+    );
+    assert_eq!(
+        launch::parse_ready_for_profile(LaunchProfile::ProbeChild, &ready, 0xbeef),
+        Err(LaunchError::TransactionMismatch)
+    );
+}
+
+#[test]
+fn profile_aware_ready_rejects_minor_mismatch_without_relaxing_v1_0_compatibility() {
+    let mut probe_ready = [0; HEADER_BYTES];
+    launch::encode_ready_for_profile(LaunchProfile::ProbeChild, 7, &mut probe_ready).unwrap();
+    assert_eq!(
+        launch::parse_ready_for_profile(LaunchProfile::CapabilityController, &probe_ready, 7),
+        Err(LaunchError::BadVersion)
+    );
+    assert_eq!(
+        launch::parse_ready(&probe_ready, 7),
+        Err(LaunchError::BadVersion)
+    );
+
+    let mut legacy_ready = [0; HEADER_BYTES];
+    launch::encode_ready(7, &mut legacy_ready).unwrap();
+    assert_eq!(
+        launch::parse_ready_for_profile(LaunchProfile::ProbeChild, &legacy_ready, 7),
+        Err(LaunchError::BadVersion)
+    );
+    assert_eq!(
+        launch::parse_ready_for_profile(LaunchProfile::CapabilityController, &legacy_ready, 7),
+        Ok(())
     );
 }
 

@@ -1,8 +1,9 @@
 //! Wyrmroot parent/child launch protocol (`WRLP`) encoding and validation.
 //!
 //! Existing launch profiles retain the WRLP 1.0 wire shape. WYR0-I probe
-//! children use the explicit WRLP 1.1 profile so a self-root-only startup
-//! grant cannot be confused with the controller's authority trio.
+//! children use the explicit WRLP 1.1 profile for both INIT and READY so a
+//! self-root-only startup grant cannot be confused with the controller's
+//! authority trio.
 
 use deepwyrm_syscall::{
     DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_MEMORY_OBJECT, DW_OBJECT_TYPE_TASK_GROUP,
@@ -198,6 +199,16 @@ impl LaunchProfile {
 }
 
 pub fn encode_ready(transaction_id: u64, output: &mut [u8]) -> Result<usize, LaunchError> {
+    // Compatibility entry point for existing WRLP 1.0 callers. New launch
+    // flows must bind READY to the same profile used to validate INIT.
+    encode_ready_for_profile(LaunchProfile::Hello, transaction_id, output)
+}
+
+pub fn encode_ready_for_profile(
+    profile: LaunchProfile,
+    transaction_id: u64,
+    output: &mut [u8],
+) -> Result<usize, LaunchError> {
     if output.len() < HEADER_BYTES {
         return Err(LaunchError::BufferSize);
     }
@@ -207,7 +218,7 @@ pub fn encode_ready(transaction_id: u64, output: &mut [u8]) -> Result<usize, Lau
     output[..HEADER_BYTES].fill(0);
     write_header(
         output,
-        MINOR_V1_0,
+        profile.protocol_minor(),
         TYPE_READY,
         HEADER_BYTES as u32,
         0,
@@ -217,7 +228,18 @@ pub fn encode_ready(transaction_id: u64, output: &mut [u8]) -> Result<usize, Lau
 }
 
 pub fn parse_ready(bytes: &[u8], expected_transaction: u64) -> Result<(), LaunchError> {
-    let transaction_id = parse_header(bytes, TYPE_READY, MINOR_V1_0, HEADER_BYTES, 0)?;
+    // Compatibility entry point for existing WRLP 1.0 callers. New launch
+    // flows must bind READY to the same profile used to validate INIT.
+    parse_ready_for_profile(LaunchProfile::Hello, bytes, expected_transaction)
+}
+
+pub fn parse_ready_for_profile(
+    profile: LaunchProfile,
+    bytes: &[u8],
+    expected_transaction: u64,
+) -> Result<(), LaunchError> {
+    let transaction_id =
+        parse_header(bytes, TYPE_READY, profile.protocol_minor(), HEADER_BYTES, 0)?;
     if transaction_id != expected_transaction {
         return Err(LaunchError::TransactionMismatch);
     }
