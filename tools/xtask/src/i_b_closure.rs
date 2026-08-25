@@ -16,7 +16,7 @@ use crate::h_request::{self, ExpectedOutcome, HRequest};
 use crate::metadata::BuildManifest;
 use crate::sha256;
 
-const DEEPWYRM_REVISION: &str = "cfc69bd8a49819ce1cda1a132cf56e55c93f92e4";
+const DEEPWYRM_ABI_REVISION: &str = "cfc69bd8a49819ce1cda1a132cf56e55c93f92e4";
 const RUST_REVISION: &str = "a92dc7f7464ad6ddfece4402bd7b86dbfa86166d";
 const RUST_TOOLCHAIN_NAME: &str = "wyrmroot-1.97.1-a92dc7f7";
 const MAX_SOURCE_FILES: usize = 4096;
@@ -126,7 +126,8 @@ pub(crate) fn audit(first_request: &str, second_request: &str) -> Result<String,
             "{{\"schema_version\":1,\"phase\":\"WYR0-I-B-artifact-audit\",",
             "\"status\":\"ARTIFACT_AUDIT_PASS\",\"proves_independent_clean_builds\":false,",
             "\"clean_build_process_evidence\":\"REQUIRED_SEPARATELY\",",
-            "\"pins\":{{\"deepwyrm_revision\":\"{}\",\"wyrmroot_revision\":\"{}\",",
+            "\"pins\":{{\"deepwyrm_revision\":\"{}\",\"deepwyrm_abi_revision\":\"{}\",",
+            "\"wyrmroot_revision\":\"{}\",",
             "\"rust_revision\":\"{}\",\"rust_toolchain_name\":\"{}\"}},",
             "\"requests\":{{\"distinct_candidate_roots\":true,",
             "\"first_request_sha256\":\"{}\",\"second_request_sha256\":\"{}\",",
@@ -148,7 +149,8 @@ pub(crate) fn audit(first_request: &str, second_request: &str) -> Result<String,
             "\"heuristic_findings\":0,",
             "\"manual_structural_audit\":\"REQUIRED_SEPARATELY\"}}}}\n"
         ),
-        DEEPWYRM_REVISION,
+        first.deepwyrm_revision,
+        DEEPWYRM_ABI_REVISION,
         first.wyrmroot_revision,
         RUST_REVISION,
         RUST_TOOLCHAIN_NAME,
@@ -171,8 +173,8 @@ fn require_exact_manifest_pins(manifest: &BuildManifest) -> Result<(), Failure> 
     for (actual, expected, label) in [
         (
             manifest.deepwyrm_revision()?,
-            DEEPWYRM_REVISION,
-            "Deepwyrm revision",
+            DEEPWYRM_ABI_REVISION,
+            "Deepwyrm ABI revision",
         ),
         (manifest.rust_revision()?, RUST_REVISION, "Rust revision"),
         (
@@ -202,16 +204,15 @@ fn validate_request_pair(
             "WYR0-I-B requests must use two distinct canonical output roots",
         ));
     }
+    validate_request_source_pins(
+        &first.deepwyrm_revision,
+        &first.rust_revision,
+        &second.deepwyrm_revision,
+        &second.rust_revision,
+        manifest.deepwyrm_revision()?,
+        manifest.rust_revision()?,
+    )?;
     for request in [first, second] {
-        if request.deepwyrm_revision != DEEPWYRM_REVISION
-            || request.rust_revision != RUST_REVISION
-            || request.deepwyrm_revision != manifest.deepwyrm_revision()?
-            || request.rust_revision != manifest.rust_revision()?
-        {
-            return Err(Failure::task(
-                "WYR0-I-B request source pins disagree with the exact product/toolchain pins",
-            ));
-        }
         if request.expected_outcome != ExpectedOutcome::Pass || request.expected_detail != 0 {
             return Err(Failure::task(
                 "WYR0-I-B artifact audit requires a successful production candidate request",
@@ -234,6 +235,28 @@ fn validate_request_pair(
 
     for (left, right, label) in distinct_output_pairs(first, second) {
         reject_alias(left, right, label)?;
+    }
+    Ok(())
+}
+
+fn validate_request_source_pins(
+    first_deepwyrm: &str,
+    first_rust: &str,
+    second_deepwyrm: &str,
+    second_rust: &str,
+    manifest_deepwyrm_abi: &str,
+    manifest_rust: &str,
+) -> Result<(), Failure> {
+    if manifest_deepwyrm_abi != DEEPWYRM_ABI_REVISION
+        || manifest_rust != RUST_REVISION
+        || first_deepwyrm != second_deepwyrm
+        || first_rust != second_rust
+        || first_rust != RUST_REVISION
+        || first_rust != manifest_rust
+    {
+        return Err(Failure::task(
+            "WYR0-I-B requests disagree on their exact product source tuple or accepted toolchain pins",
+        ));
     }
     Ok(())
 }
@@ -1215,6 +1238,33 @@ fn u64_at(bytes: &[u8], offset: usize) -> Result<u64, Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn artifact_audit_separates_product_revision_from_the_pinned_abi_revision() {
+        let later_product = "2a9a42b33b9a4d0c7587ee7e4b51314b351e0b74";
+        assert!(
+            validate_request_source_pins(
+                later_product,
+                RUST_REVISION,
+                later_product,
+                RUST_REVISION,
+                DEEPWYRM_ABI_REVISION,
+                RUST_REVISION,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_request_source_pins(
+                later_product,
+                RUST_REVISION,
+                "6b25d12e69f5bd6f5e1e9a983310c60a36af22fa",
+                RUST_REVISION,
+                DEEPWYRM_ABI_REVISION,
+                RUST_REVISION,
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn static_native_elf_inspection_rejects_dynamic_interp_and_wx() {
