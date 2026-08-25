@@ -20,8 +20,8 @@ use wyrmroot_loader::{
 use wyrmroot_runtime::{
     AccountedResource, AccountingError, AttemptFailure, BOOTSTRAP_CHANNEL_EXPECTATION,
     CleanupDisposition, ExitObservedReadinessError, ExitValidationError,
-    LOADER_TASK_GROUP_EXPECTATION, MappingPlan, NativeError, NativeLoaderPlatform,
-    ReadinessAccounting, ReservationRequest, RestartState, RestartSupervisor,
+    LOADER_TASK_GROUP_EXPECTATION, MAX_ACCOUNTED_PEERS, MappingPlan, NativeError,
+    NativeLoaderPlatform, ReadinessAccounting, ReservationRequest, RestartState, RestartSupervisor,
     SELF_ROOT_EXPECTATION, SupervisionError, TerminalDisposition, WYR0_I_SUPERVISION_POLICY,
     cancel_timer, close_handle, create_channel, create_event, create_memory_object,
     create_task_group, create_timer, duplicate_handle, map_bootfs_read_only, map_memory_read_only,
@@ -52,6 +52,11 @@ const MEMORY_COMMAND_BYTES: usize = 16;
 const MEMORY_ACK: &[u8] = b"WICMACK1";
 const FAIL_EXIT_CODE: u32 = 0x2407_F001;
 const EXHAUST_EXIT_CODE: u32 = 0x2408_F001;
+
+const fn accounting_peer_slot(logical_peer: u8) -> u8 {
+    assert!(logical_peer != 0 && logical_peer as usize <= MAX_ACCOUNTED_PEERS);
+    logical_peer - 1
+}
 
 const CHANNEL_RIGHTS: DwRights = DwRights(
     DW_RIGHT_READ.0
@@ -467,7 +472,7 @@ fn exercise_normal_lifecycle(
     display: &str,
     ledger: &mut ReadinessAccounting,
 ) -> Result<(), u32> {
-    let peer = 1_u8;
+    let peer = accounting_peer_slot(1);
     let generation = 1_u64;
     ledger
         .begin_generation(peer, generation)
@@ -798,7 +803,7 @@ fn exercise_restart_replacement(
     image: &[u8],
     display: &str,
 ) -> Result<(), u32> {
-    let peer = 3_u8;
+    let peer = accounting_peer_slot(3);
     let mut ledger = ReadinessAccounting::new()
         .map_err(|_| failure(EvidenceKind::RestartReplacement, 0x0100))?;
     let now =
@@ -861,7 +866,7 @@ fn exercise_restart_exhaustion(
     image: &[u8],
     display: &str,
 ) -> Result<(), u32> {
-    let peer = 4_u8;
+    let peer = accounting_peer_slot(4);
     let mut ledger =
         ReadinessAccounting::new().map_err(|_| failure(EvidenceKind::RestartExhausted, 0x0100))?;
     let now =
@@ -1005,7 +1010,7 @@ fn run_restart_attempt(
 }
 
 fn exercise_overload_replay(ledger: &mut ReadinessAccounting) -> Result<(), u32> {
-    let peer = 1_u8;
+    let peer = accounting_peer_slot(1);
     let generation = 1_u64;
     let transaction = NORMAL_TRANSACTION;
     let exact = ReservationRequest::empty()
@@ -1429,5 +1434,12 @@ mod tests {
             ),
             0xc405
         );
+    }
+
+    #[test]
+    fn logical_evidence_peers_map_into_zero_based_accounting_slots() {
+        assert_eq!(accounting_peer_slot(1), 0);
+        assert_eq!(accounting_peer_slot(3), 2);
+        assert_eq!(accounting_peer_slot(4), 3);
     }
 }
