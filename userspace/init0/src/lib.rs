@@ -11,9 +11,12 @@
 #[cfg(feature = "i-capability-integration")]
 use deepwyrm_syscall::{
     DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DW_SIGNAL_WRITABLE, DW_STATUS_WOULD_BLOCK,
-    DW_TASK_STATE_EXITED, DwSignals, DwTaskTerminationInfoV1, DwWaitItemV1,
+    DwSignals, DwWaitItemV1,
 };
-use deepwyrm_syscall::{DwDeadline, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights};
+use deepwyrm_syscall::{
+    DW_TASK_STATE_EXITED, DwDeadline, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights,
+    DwTaskTerminationInfoV1,
+};
 use wyrmroot_bootfs::archive::{Archive, LookupError, ParseError};
 use wyrmroot_loader::{
     launch::{HEADER_BYTES, INIT0_BYTES, LaunchError, LaunchProfile, encode_ready, parse_init},
@@ -22,14 +25,12 @@ use wyrmroot_loader::{
         load_process,
     },
 };
-#[cfg(feature = "i-capability-integration")]
-use wyrmroot_runtime::validate_successful_exit;
 use wyrmroot_runtime::{
     BOOTFS_EXPECTATION, BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, CapabilityValidationError,
     ExitObservedReadinessError, ExitValidationError, InitCapability, LOADER_TASK_GROUP_EXPECTATION,
     MappingPlan, MappingPlanError, NativeError, ReceiveCounts, SELF_ROOT_EXPECTATION,
     SupervisionError, SupervisionPlatform, supervise_child, validate_bootstrap_channel,
-    validate_init_capabilities_v2,
+    validate_init_capabilities_v2, validate_successful_exit,
 };
 
 /// The only bootfs path selected by the WYR0-G descendant smoke chain.
@@ -373,9 +374,13 @@ pub fn run_init0<
                 .query_task_termination(loaded.process)
                 .ok()
                 .filter(|info| info.state == DW_TASK_STATE_EXITED);
-            cleanup_loaded_process(system, loader, loaded, terminal.is_none())
-                .map_err(Init0Error::Cleanup)?;
-            if let Some(error) = terminal.and_then(capability_terminal_error) {
+            let cleanup_exit =
+                cleanup_supervised_process(system, loader, supervisor, loaded, terminal.is_none())
+                    .map_err(Init0Error::Cleanup)?;
+            if let Some(error) = terminal
+                .or(cleanup_exit)
+                .and_then(capability_terminal_error)
+            {
                 return Err(error);
             }
             return Err(evidence);
@@ -387,13 +392,23 @@ pub fn run_init0<
             HELLO_TRANSACTION_ID,
             deadline,
         );
+        let late_exit = match &supervision {
+            Err(error) if !error.process_exit_observed() => supervisor
+                .query_task_termination(loaded.process)
+                .ok()
+                .filter(|info| info.state == DW_TASK_STATE_EXITED),
+            _ => None,
+        };
         let terminate = matches!(
             &supervision,
             Err(error) if !error.process_exit_observed()
-        );
-        let loaded_cleanup = cleanup_loaded_process(system, loader, loaded, terminate);
-        if let Err(cleanup) = loaded_cleanup {
-            return Err(Init0Error::Cleanup(cleanup));
+        ) && late_exit.is_none();
+        let cleanup_exit =
+            cleanup_supervised_process(system, loader, supervisor, loaded, terminate)
+                .map_err(Init0Error::Cleanup)?;
+        if let Some(info) = late_exit.or(cleanup_exit) {
+            validate_successful_exit(&info)
+                .map_err(|error| Init0Error::Supervision(SupervisionError::Exit(error)))?;
         }
         supervision.map_err(Init0Error::Supervision)?;
         Ok(message.transaction_id)
@@ -583,6 +598,41 @@ fn cleanup_loaded_process<System: Init0System, Loader: LoaderPlatform<Error = Na
         }
     }
     first_error.map_or(Ok(()), Err)
+}
+
+fn cleanup_supervised_process<
+    System: Init0System,
+    Loader: LoaderPlatform<Error = NativeError>,
+    Supervisor: SupervisionPlatform<Error = NativeError>,
+>(
+    system: &mut System,
+    loader: &mut Loader,
+    supervisor: &mut Supervisor,
+    loaded: LoadedProcess,
+    terminate: bool,
+) -> Result<Option<DwTaskTerminationInfoV1>, NativeError> {
+    let mut first_error = None;
+    let mut observed_exit = None;
+    if terminate && let Err(error) = loader.process_terminate(loaded.process) {
+        observed_exit = supervisor
+            .query_task_termination(loaded.process)
+            .ok()
+            .filter(|info| info.state == DW_TASK_STATE_EXITED);
+        if observed_exit.is_none() {
+            first_error = Some(error);
+        }
+    }
+    for handle in [loaded.launch_channel, loaded.process] {
+        if let Err(error) = system.close_handle(handle)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(observed_exit),
+    }
 }
 
 fn init_capability<System: Init0System>(

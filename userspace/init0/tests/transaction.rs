@@ -1,8 +1,14 @@
+#![cfg_attr(feature = "i-capability-integration", allow(unused_crate_dependencies))]
+#![cfg(not(feature = "i-capability-integration"))]
+
+// This fixture locks the ordinary `init0 -> hello` profile. The capability selector changes the
+// child launch contract and has dedicated feature-gated library tests instead.
+
 use deepwyrm_syscall::{
     DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL, DW_OBJECT_TYPE_MEMORY_OBJECT,
     DW_OBJECT_TYPE_TASK_GROUP, DW_RIGHT_INSPECT, DW_RIGHT_MAP, DW_RIGHT_MODIFY, DW_RIGHT_READ,
     DW_RIGHT_TRANSFER, DW_RIGHT_WAIT, DW_RIGHT_WRITE, DW_SIGNAL_EXITED, DW_SIGNAL_PEER_CLOSED,
-    DW_SIGNAL_READABLE, DW_STATUS_BAD_HANDLE, DW_TASK_STATE_EXITED,
+    DW_SIGNAL_READABLE, DW_STATUS_BAD_HANDLE, DW_TASK_STATE_EXITED, DW_TASK_STATE_RUNNING,
     DW_TASK_TERMINATION_INFO_V1_SIZE, DW_TERMINATION_NORMAL_EXIT, DW_WAIT_RESULT_V1_SIZE,
     DwDeadline, DwHandle, DwHandleTransferV1, DwMemoryProtection, DwObjectType,
     DwReceivedHandleInfoV1, DwRights, DwStatus, DwTaskTerminationInfoV1, DwWaitItemV1,
@@ -426,6 +432,8 @@ struct Supervisor {
     termination_query_error: bool,
     exit_selected_first: bool,
     malformed_ready_after_exit: bool,
+    exit_on_termination_query: Option<usize>,
+    termination_queries: usize,
     phase: usize,
 }
 
@@ -437,6 +445,8 @@ impl Supervisor {
             termination_query_error: false,
             exit_selected_first: false,
             malformed_ready_after_exit: false,
+            exit_on_termination_query: None,
+            termination_queries: 0,
             phase: 0,
         }
     }
@@ -500,10 +510,17 @@ impl SupervisionPlatform for Supervisor {
         if self.termination_query_error {
             return Err(NativeError::Status(DW_STATUS_BAD_HANDLE));
         }
+        self.termination_queries += 1;
+        let state = match self.exit_on_termination_query {
+            Some(query) if self.termination_queries < query => DW_TASK_STATE_RUNNING,
+            Some(_) => DW_TASK_STATE_EXITED,
+            None if self.ready_handle_count != 0 => DW_TASK_STATE_RUNNING,
+            None => DW_TASK_STATE_EXITED,
+        };
         Ok(DwTaskTerminationInfoV1 {
             size: DW_TASK_TERMINATION_INFO_V1_SIZE,
             version: 1,
-            state: DW_TASK_STATE_EXITED,
+            state,
             reason: DW_TERMINATION_NORMAL_EXIT,
             application_code: self.application_code,
             ..DwTaskTerminationInfoV1::default()
@@ -712,6 +729,61 @@ fn init0_cleanup_prefers_termination_failure_and_still_closes_children_first() {
         [CHILD_CHANNEL, CHILD_PROCESS, ROOT, BOOTFS, TASK_GROUP]
     );
     assert!(fixture.sent.is_empty());
+}
+
+#[test]
+fn init0_reconciles_an_exit_racing_failed_termination_without_masking_supervision() {
+    let mut fixture = Fixture::valid();
+    let mut loader = Loader::new();
+    loader.terminate_error = Some(TERMINATE_FAILURE);
+    let mut supervisor = Supervisor::successful();
+    supervisor.ready_handle_count = 1;
+    supervisor.exit_on_termination_query = Some(2);
+
+    assert!(matches!(
+        run_init0(
+            &mut fixture,
+            &mut loader,
+            &mut supervisor,
+            CHANNEL,
+            DEADLINE
+        ),
+        Err(Init0Error::Supervision(
+            SupervisionError::InvalidReadyReceive(_)
+        ))
+    ));
+    assert_eq!(supervisor.termination_queries, 2);
+    assert_eq!(loader.terminated, [CHILD_PROCESS]);
+    assert_eq!(
+        fixture.closed,
+        [CHILD_CHANNEL, CHILD_PROCESS, ROOT, BOOTFS, TASK_GROUP]
+    );
+}
+
+#[test]
+fn init0_preserves_terminal_detail_from_an_exit_racing_failed_termination() {
+    let mut fixture = Fixture::valid();
+    let mut loader = Loader::new();
+    loader.terminate_error = Some(TERMINATE_FAILURE);
+    let mut supervisor = Supervisor::successful();
+    supervisor.ready_handle_count = 1;
+    supervisor.application_code = 0x2402_8c0d;
+    supervisor.exit_on_termination_query = Some(2);
+
+    assert_eq!(
+        run_init0(
+            &mut fixture,
+            &mut loader,
+            &mut supervisor,
+            CHANNEL,
+            DEADLINE
+        ),
+        Err(Init0Error::Supervision(SupervisionError::Exit(
+            ExitValidationError::NonzeroApplicationCode(0x2402_8c0d)
+        )))
+    );
+    assert_eq!(supervisor.termination_queries, 2);
+    assert_eq!(loader.terminated, [CHILD_PROCESS]);
 }
 
 #[test]
