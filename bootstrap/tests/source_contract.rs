@@ -8,6 +8,8 @@ use wyrmroot_runtime as _;
 const MANIFEST: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
 const MAIN_SOURCE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
 const LIB_SOURCE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
+const WYR0_COMPAT_SOURCE: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/wyr0_compat.rs"));
 const NATIVE_ARTIFACT_INSPECTOR: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../toolchain/inspect-native-artifact.sh"
@@ -53,7 +55,7 @@ fn production_path_stays_separate_from_test_only_hook_and_terminal_behaviors() {
     assert!(LIB_SOURCE.contains("pub fn run_bootstrap_with_before_ready"));
     assert!(MAIN_SOURCE.contains("run_init0_bootstrap("));
     assert!(MAIN_SOURCE.contains("run_init0_bootstrap_with_fault("));
-    assert!(LIB_SOURCE.contains("LoadFault::None"));
+    assert!(WYR0_COMPAT_SOURCE.contains("LoadFault::None"));
     assert!(MAIN_SOURCE.contains("primordial_blocking_cleanup(channel)"));
     assert!(MAIN_SOURCE.contains("trigger_user_exception()"));
     assert!(MAIN_SOURCE.contains("trigger_invalid_syscall_return()"));
@@ -66,10 +68,10 @@ fn blocking_variant_does_not_import_the_ordinary_bootstrap_entry() {
     assert!(MAIN_SOURCE.contains("#[cfg(not(any("));
     assert!(MAIN_SOURCE.contains("feature = \"native-loader-smoke-integration\""));
     assert!(MAIN_SOURCE.contains("use wyrmroot_bootstrap::run_init0_bootstrap;"));
-    assert!(LIB_SOURCE.contains("pub fn run_init0_bootstrap"));
-    assert!(LIB_SOURCE.contains("profile: LaunchProfile::Init0"));
+    assert!(WYR0_COMPAT_SOURCE.contains("pub fn run_init0_bootstrap"));
+    assert!(WYR0_COMPAT_SOURCE.contains("profile: LaunchProfile::Init0"));
     assert!(
-        !LIB_SOURCE
+        !WYR0_COMPAT_SOURCE
             .contains("LaunchProfile::Hello,\n            transaction_id: INIT0_TRANSACTION_ID")
     );
 }
