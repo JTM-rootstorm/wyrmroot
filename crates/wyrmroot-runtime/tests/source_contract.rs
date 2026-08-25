@@ -5,12 +5,20 @@ use wyrmroot_runtime as _;
 const SOURCE: &str = concat!(
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs")),
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/native.rs")),
+    include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/capability_native.rs"
+    )),
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/loader_native.rs")),
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bootstrap.rs")),
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/startup.rs")),
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/supervision.rs")),
 );
 const NATIVE_SOURCE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/native.rs"));
+const CAPABILITY_NATIVE_SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/capability_native.rs"
+));
 const LOADER_NATIVE_SOURCE: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/loader_native.rs"));
 const STARTUP_SOURCE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/startup.rs"));
@@ -45,6 +53,43 @@ fn native_surface_uses_the_deepwyrm_owned_binding() {
     assert!(!NATIVE_SOURCE.contains("DW_SYSCALL_WAIT_"));
     assert!(!SOURCE.contains("global_asm!"));
     assert!(!SOURCE.contains("asm!"));
+}
+
+#[test]
+fn capability_wrappers_use_generated_ids_at_one_audited_raw_boundary() {
+    for required in [
+        "DW_SYSCALL_TASK_GROUP_CREATE",
+        "DW_SYSCALL_EVENT_CREATE",
+        "DW_SYSCALL_EVENT_SIGNAL",
+        "DW_SYSCALL_TIMER_CREATE",
+        "DW_SYSCALL_TIMER_SET",
+        "DW_SYSCALL_TIMER_CANCEL",
+        "mod raw",
+        "SAFETY:",
+    ] {
+        assert!(
+            CAPABILITY_NATIVE_SOURCE.contains(required),
+            "missing native capability-wrapper boundary marker {required}"
+        );
+    }
+    for forbidden in [
+        "0x0001_0001",
+        "0x0001_0002",
+        "0x0004_0010",
+        "0x0004_0011",
+        "0x0005_0010",
+        "0x0005_0011",
+        "0x0005_0012",
+        "global_asm!",
+        "asm!",
+        "std::",
+        "libc",
+    ] {
+        assert!(
+            !CAPABILITY_NATIVE_SOURCE.contains(forbidden),
+            "capability wrapper copied or imported forbidden boundary {forbidden}"
+        );
+    }
 }
 
 #[test]

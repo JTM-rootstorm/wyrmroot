@@ -10,6 +10,11 @@
 
 mod bootstrap;
 mod bounded_accounting;
+#[allow(
+    unsafe_code,
+    reason = "WYR0-I safe capability wrappers confine mapped-slice and generated raw-call boundaries"
+)]
+mod capability_native;
 mod diagnostics;
 mod entry;
 #[allow(
@@ -41,6 +46,11 @@ pub use bounded_accounting::{
     MAX_REPLAY_ENTRIES_PER_PEER, ReadinessAccounting, ReservationRequest, ReservationState,
     ReservationToken, ResourceBudget, TransactionToken, WYR0_I_RESOURCE_BUDGETS,
     kernel_channel_enforcement, validate_kernel_channel_envelope,
+};
+pub use capability_native::{
+    OwnedMemoryMapping, cancel_timer, create_channel, create_event, create_memory_object,
+    create_task_group, create_timer, duplicate_handle, map_memory_read_only, map_memory_read_write,
+    set_timer, signal_event, terminate_process, unmap_memory, wait_one,
 };
 pub use loader_native::NativeLoaderPlatform;
 pub use native::{

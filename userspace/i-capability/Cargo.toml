@@ -1,0 +1,31 @@
+[package]
+name = "wyrmroot-i-capability"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Bounded WYR0-I native capability controller and probe payload"
+license = "GPL-3.0-or-later"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "wyrmroot-i-capability"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["native-i-capability"]
+
+[features]
+default = []
+native-i-capability = []
+
+[dependencies]
+deepwyrm-syscall.workspace = true
+wyrmroot-bootfs = { path = "../../crates/wyrmroot-bootfs" }
+wyrmroot-loader = { path = "../../crates/wyrmroot-loader" }
+wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }
+
+[lints.rust]
+unsafe_code = "deny"
+unused_crate_dependencies = "deny"

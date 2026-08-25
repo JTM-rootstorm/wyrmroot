@@ -19,6 +19,7 @@ The following paths are explicitly licensed `GPL-3.0-or-later`:
 - `bootstrap/**` — the primordial Wyrmroot bootstrap application;
 - `userspace/init0/**` — the temporary WYR0 init application;
 - `userspace/hello/**` — the WYR0 hello smoke-test application;
+- `userspace/i-capability/**` — the WYR0-I native capability controller and probe payload;
 - `tools/xtask/**` — Wyrmroot host-side repository orchestration tooling;
 - `toolchain/inspect-uefi-artifact.sh`;
 - `toolchain/verify-host-tools.sh`; and

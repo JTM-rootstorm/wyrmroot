@@ -194,6 +194,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrmroot-i-capability"
+version = "0.0.0"
+dependencies = [
+ "deepwyrm-syscall",
+ "wyrmroot-bootfs",
+ "wyrmroot-loader",
+ "wyrmroot-runtime",
+]
+
+[[package]]
 name = "wyrmroot-i2-stress"
 version = "0.0.0"
 dependencies = [
