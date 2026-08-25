@@ -142,7 +142,7 @@ pub enum SupervisionError<PlatformError> {
     Ready(LaunchError),
     /// The Process exited before the expected READY was accepted.
     ExitedBeforeReady,
-    /// The launch Channel peer closed before a queued valid READY could be received.
+    /// The launch Channel peer closed before READY and the Process exit was then observed.
     PeerClosedBeforeReady,
     /// The child sent another launch-Channel datagram after a valid READY.
     DuplicateReady,
@@ -182,6 +182,7 @@ impl<PlatformError> SupervisionError<PlatformError> {
         matches!(
             self,
             Self::ExitedBeforeReady
+                | Self::PeerClosedBeforeReady
                 | Self::ExitQuery(_)
                 | Self::Exit(_)
                 | Self::ExitObservedReadiness(_)
@@ -266,10 +267,10 @@ pub fn supervise_child<P: SupervisionPlatform>(
                 // observed and rejected before terminal peer closure is accepted.
                 continue;
             }
-            if !ready {
-                return Err(SupervisionError::PeerClosedBeforeReady);
-            }
-            // PEER_CLOSED is accepted only from this fresh wait with no READABLE bit.
+            // PEER_CLOSED is accepted only from this fresh wait with no READABLE bit. If it
+            // arrives before READY, keep the bounded Process observation active instead of
+            // racing caller cleanup against a child that is already exiting. The eventual
+            // EXITED record still classifies the missing READY as failure.
             monitor_channel = false;
             continue;
         }
@@ -282,7 +283,11 @@ pub fn supervise_child<P: SupervisionPlatform>(
             .map_err(SupervisionError::ExitQuery)?;
         validate_successful_exit(&info).map_err(SupervisionError::Exit)?;
         if !monitor_channel {
-            return Ok(());
+            return if ready {
+                Ok(())
+            } else {
+                Err(SupervisionError::PeerClosedBeforeReady)
+            };
         }
 
         // WAIT_ANY may select the Process even when a READY is already queued on the Channel.
@@ -630,18 +635,18 @@ mod tests {
 
     #[test]
     fn readiness_errors_do_not_claim_process_exit_observation() {
-        assert!(!SupervisionError::<()>::PeerClosedBeforeReady.process_exit_observed());
         assert!(!SupervisionError::<()>::DuplicateReady.process_exit_observed());
         assert!(!SupervisionError::<()>::InvalidWaitResult.process_exit_observed());
     }
 
     #[test]
-    fn rejects_peer_close_before_a_queued_ready() {
-        let mut mock = Mock::successful(&[WaitEvent::Channel(DW_SIGNAL_PEER_CLOSED)]);
+    fn peer_close_before_ready_observes_exit_before_reporting_failure() {
+        let mut mock = Mock::successful(&[CLOSED, EXITED]);
         assert_eq!(
             supervise_child(&mut mock, DwHandle(1), DwHandle(2), 7, DwDeadline(99)),
             Err(SupervisionError::PeerClosedBeforeReady)
         );
+        assert!(SupervisionError::<()>::PeerClosedBeforeReady.process_exit_observed());
     }
 
     #[test]
