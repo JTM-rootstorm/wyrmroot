@@ -58,16 +58,8 @@ const fn accounting_peer_slot(logical_peer: u8) -> u8 {
     logical_peer - 1
 }
 
-const CHANNEL_RIGHTS: DwRights = DwRights(
-    DW_RIGHT_READ.0
-        | DW_RIGHT_WRITE.0
-        | DW_RIGHT_WAIT.0
-        | DW_RIGHT_DUPLICATE.0
-        | DW_RIGHT_TRANSFER.0
-        | DW_RIGHT_INSPECT.0,
-);
-const TASK_GROUP_RIGHTS: DwRights =
-    DwRights(DW_RIGHT_MODIFY.0 | DW_RIGHT_INSPECT.0 | DW_RIGHT_DUPLICATE.0 | DW_RIGHT_TRANSFER.0);
+const CHANNEL_RIGHTS: DwRights = DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0);
+const TASK_GROUP_RIGHTS: DwRights = DW_RIGHT_MODIFY;
 const MEMORY_OWNER_RIGHTS: DwRights = DwRights(
     DW_RIGHT_READ.0
         | DW_RIGHT_WRITE.0
@@ -149,6 +141,10 @@ fn run_leaf(channel: DwHandle, transaction: u64) -> Result<(), u32> {
     Ok(())
 }
 
+#[allow(
+    unsafe_code,
+    reason = "the probe child explicitly proves its read-only mapping has no mutable alias before viewing bytes"
+)]
 fn run_memory_child(channel: DwHandle, root: DwHandle, transaction: u64) -> Result<(), u32> {
     let root_info =
         query_capability_info(root).map_err(|_| failure(EvidenceKind::MemoryShare, 0x0101))?;
@@ -193,14 +189,18 @@ fn run_memory_child(channel: DwHandle, root: DwHandle, transaction: u64) -> Resu
     let mapping = map_memory_read_only(root, memory, PAGE_BYTES)
         .map_err(|_| failure(EvidenceKind::MemoryShare, 0x010C))?;
     close_handle(memory).map_err(|_| failure(EvidenceKind::MemoryShare, 0x010D))?;
-    let valid = mapping
-        .with_bytes(|bytes| {
+    // SAFETY: the received MemoryObject handle has exact READ | MAP | INSPECT rights, the mapping
+    // is read-only, and the trusted controller protocol removed its sole writable mapping before
+    // transfer and performs no later mutation. Neither participant mutates during this callback.
+    let valid = unsafe {
+        mapping.with_bytes(|bytes| {
             bytes
                 .iter()
                 .enumerate()
                 .all(|(index, byte)| *byte == memory_pattern(index))
         })
-        .map_err(|_| failure(EvidenceKind::MemoryShare, 0x010E))?;
+    }
+    .map_err(|_| failure(EvidenceKind::MemoryShare, 0x010E))?;
     if !valid {
         return Err(failure(EvidenceKind::MemoryShare, 0x010F));
     }
@@ -539,6 +539,10 @@ const fn native_cause(error: NativeError) -> u16 {
     (native_error_code(error) as u16) & 0x01ff
 }
 
+#[allow(
+    unsafe_code,
+    reason = "the controller explicitly sequences exclusive initialization before publishing only read-only shared mappings"
+)]
 fn exercise_shared_memory(
     authority: LoadAuthority,
     image: &[u8],
@@ -548,13 +552,16 @@ fn exercise_shared_memory(
         .map_err(|_| failure(EvidenceKind::MemoryShare, 0x0200))?;
     let mut mapping = map_memory_read_write(authority.parent_root, memory, PAGE_BYTES)
         .map_err(|_| failure(EvidenceKind::MemoryShare, 0x0201))?;
-    mapping
-        .with_bytes_mut(|bytes| {
+    // SAFETY: this is the sole mapping of a newly controller-created MemoryObject; no duplicate or
+    // child capability exists until after initialization and writable protection is removed below.
+    unsafe {
+        mapping.with_bytes_mut(|bytes| {
             for (index, byte) in bytes.iter_mut().enumerate() {
                 *byte = memory_pattern(index);
             }
         })
-        .map_err(|_| failure(EvidenceKind::MemoryShare, 0x0202))?;
+    }
+    .map_err(|_| failure(EvidenceKind::MemoryShare, 0x0202))?;
     mapping
         .protect_read_only()
         .map_err(|_| failure(EvidenceKind::MemoryShare, 0x0203))?;
@@ -598,14 +605,17 @@ fn exercise_shared_memory(
     send_channel(loaded.launch_channel, &command, &[moved])
         .map_err(|error| failure(EvidenceKind::MemoryShare, 0xb000 | native_cause(error)))?;
     close_handle(memory).map_err(|_| failure(EvidenceKind::MemoryShare, 0x0213))?;
-    let mapping_valid = mapping
-        .with_bytes(|bytes| {
+    // SAFETY: protect_read_only succeeded before publication, the child received no WRITE right,
+    // and the writable source handle is closed before this bounded read-only comparison.
+    let mapping_valid = unsafe {
+        mapping.with_bytes(|bytes| {
             bytes
                 .iter()
                 .enumerate()
                 .all(|(index, byte)| *byte == memory_pattern(index))
         })
-        .map_err(|_| failure(EvidenceKind::MemoryShare, 0x0214))?;
+    }
+    .map_err(|_| failure(EvidenceKind::MemoryShare, 0x0214))?;
     if !mapping_valid {
         return Err(failure(EvidenceKind::MemoryShare, 0x0215));
     }

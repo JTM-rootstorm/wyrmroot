@@ -35,13 +35,29 @@ fn payload_remains_freestanding_generated_abi_only_and_profile_bound() {
         "libc",
         "DW_SYSCALL_",
         "dw_syscall6",
-        "unsafe {",
         "asm!",
         "global_asm!",
     ] {
         assert!(
             !NATIVE.contains(forbidden),
             "payload imported forbidden native boundary {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn mapped_views_are_narrowly_audited_and_created_authority_is_minimal() {
+    assert_eq!(NATIVE.matches("unsafe {").count(), 3);
+    assert_eq!(NATIVE.matches("// SAFETY:").count(), 3);
+    for required in [
+        "the probe child explicitly proves its read-only mapping has no mutable alias",
+        "the controller explicitly sequences exclusive initialization before publishing only read-only shared mappings",
+        "const CHANNEL_RIGHTS: DwRights = DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0);",
+        "const TASK_GROUP_RIGHTS: DwRights = DW_RIGHT_MODIFY;",
+    ] {
+        assert!(
+            NATIVE.contains(required),
+            "missing narrow authority or safety contract {required}"
         );
     }
 }

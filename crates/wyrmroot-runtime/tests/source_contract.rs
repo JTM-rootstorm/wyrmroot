@@ -93,6 +93,25 @@ fn capability_wrappers_use_generated_ids_at_one_audited_raw_boundary() {
 }
 
 #[test]
+fn mapped_byte_views_require_explicit_unsafe_acknowledgement() {
+    for required in [
+        "pub unsafe fn with_bytes_mut",
+        "pub unsafe fn with_bytes",
+        "impl for<'bytes> FnOnce(&'bytes mut [u8])",
+        "impl for<'bytes> FnOnce(&'bytes [u8])",
+        "Deepwyrm permits multiple virtual mappings",
+        "```compile_fail",
+    ] {
+        assert!(
+            CAPABILITY_NATIVE_SOURCE.contains(required),
+            "missing mapped-view safety contract {required}"
+        );
+    }
+    assert!(!CAPABILITY_NATIVE_SOURCE.contains("pub fn with_bytes_mut"));
+    assert!(!CAPABILITY_NATIVE_SOURCE.contains("pub fn with_bytes<R>"));
+}
+
+#[test]
 fn supervision_stays_bounded_and_uses_structured_process_exit() {
     assert!(SUPERVISION_SOURCE.contains("DW_DEADLINE_INFINITE"));
     assert!(SUPERVISION_SOURCE.contains("DW_SIGNAL_READABLE"));

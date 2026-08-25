@@ -25,9 +25,27 @@ pub struct OwnedMemoryMapping {
 }
 
 impl OwnedMemoryMapping {
-    pub fn with_bytes_mut<R>(
+    /// Temporarily views this mapping as writable bytes.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure for the complete callback that the mapping remains live and
+    /// writable, its backing storage is initialized, and no other Rust reference, mapping,
+    /// process, thread, or device can read or mutate the same backing bytes in a way that violates
+    /// Rust's exclusive-reference rules. The mapping token alone cannot prove those conditions
+    /// because Deepwyrm permits multiple virtual mappings of one `MemoryObject`.
+    ///
+    /// Safe code cannot invoke this view:
+    ///
+    /// ```compile_fail
+    /// # use wyrmroot_runtime::OwnedMemoryMapping;
+    /// # fn view(mapping: &mut OwnedMemoryMapping) {
+    /// mapping.with_bytes_mut(|bytes| bytes.fill(0));
+    /// # }
+    /// ```
+    pub unsafe fn with_bytes_mut<R>(
         &mut self,
-        use_bytes: impl FnOnce(&mut [u8]) -> R,
+        use_bytes: impl for<'bytes> FnOnce(&'bytes mut [u8]) -> R,
     ) -> Result<R, NativeError> {
         if !self.writable {
             return Err(NativeError::Status(
@@ -37,17 +55,36 @@ impl OwnedMemoryMapping {
         let length = usize::try_from(self.bytes)
             .map_err(|_| NativeError::Output(NativeOutputError::InvalidMappedRange))?;
         // SAFETY: construction validated a nonzero aligned userspace range returned by a
-        // successful RW mapping. The affine mapping token owns the only slice exposed here and
-        // the callback cannot retain the borrow beyond this call.
+        // successful RW mapping. The caller upholds mapping liveness and exclusive backing access;
+        // the higher-ranked callback prevents the resulting borrow from escaping this call.
         let bytes = unsafe { core::slice::from_raw_parts_mut(self.address.0 as *mut u8, length) };
         Ok(use_bytes(bytes))
     }
 
-    pub fn with_bytes<R>(&self, use_bytes: impl FnOnce(&[u8]) -> R) -> Result<R, NativeError> {
+    /// Temporarily views this mapping as readable bytes.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure for the complete callback that the mapping remains live and
+    /// readable, its backing storage is initialized, and no process, thread, device, or other
+    /// mapping can mutate the same backing bytes outside Rust's interior-mutability rules.
+    ///
+    /// Safe code cannot invoke this view:
+    ///
+    /// ```compile_fail
+    /// # use wyrmroot_runtime::OwnedMemoryMapping;
+    /// # fn view(mapping: &OwnedMemoryMapping) {
+    /// mapping.with_bytes(|bytes| bytes.len());
+    /// # }
+    /// ```
+    pub unsafe fn with_bytes<R>(
+        &self,
+        use_bytes: impl for<'bytes> FnOnce(&'bytes [u8]) -> R,
+    ) -> Result<R, NativeError> {
         let length = usize::try_from(self.bytes)
             .map_err(|_| NativeError::Output(NativeOutputError::InvalidMappedRange))?;
-        // SAFETY: construction validated this live readable range. The shared slice is bounded by
-        // the mapping token and cannot escape the callback borrow.
+        // SAFETY: construction validated the range. The caller upholds mapping liveness and the
+        // absence of external mutation; the higher-ranked callback prevents the borrow escaping.
         let bytes = unsafe { core::slice::from_raw_parts(self.address.0 as *const u8, length) };
         Ok(use_bytes(bytes))
     }
