@@ -167,11 +167,12 @@ impl RestartHistory {
 pub enum RestartState {
     /// No active supervision episode or an explicitly cancelled episode.
     Stopped,
-    /// The caller may construct/start this exact generation and transaction.
+    /// The caller may construct/start this exact generation before its absolute READY deadline.
     Starting {
         attempt: u8,
         generation: u64,
         transaction_id: u64,
+        deadline_ns: u64,
     },
     /// Child start succeeded and exact READY is required by this absolute deadline.
     AwaitingReady {
@@ -302,6 +303,7 @@ impl RestartSupervisor {
         if generation <= self.last_generation {
             return Err(RestartTransitionError::GenerationNotAdvanced);
         }
+        let deadline_ns = checked_deadline(now_ns, self.policy.ready_timeout_ns)?;
         self.observe_time(now_ns)?;
         self.history = RestartHistory::new();
         self.episode_started_at_ns = now_ns;
@@ -311,11 +313,12 @@ impl RestartSupervisor {
             attempt: 1,
             generation,
             transaction_id,
+            deadline_ns,
         };
         Ok(())
     }
 
-    /// Records successful child start and begins the absolute READY deadline.
+    /// Records successful child start while preserving the attempt's absolute READY deadline.
     pub fn child_started(
         &mut self,
         generation: u64,
@@ -326,6 +329,7 @@ impl RestartSupervisor {
             attempt,
             generation: current_generation,
             transaction_id: current_transaction,
+            deadline_ns,
         } = self.state
         else {
             return Err(RestartTransitionError::InvalidState);
@@ -337,7 +341,17 @@ impl RestartSupervisor {
             current_transaction,
         )?;
         self.observe_time(now_ns)?;
-        let deadline_ns = checked_deadline(now_ns, self.policy.ready_timeout_ns)?;
+        if now_ns >= deadline_ns {
+            self.enter_cleanup(
+                now_ns,
+                AttemptFailure::ReadyTimeout,
+                CleanupAction::TerminateTaskGroup,
+                true,
+            )?;
+            return Err(RestartTransitionError::AttemptFailed(
+                AttemptFailure::ReadyTimeout,
+            ));
+        }
         self.state = RestartState::AwaitingReady {
             attempt,
             generation,
@@ -529,6 +543,28 @@ impl RestartSupervisor {
         now_ns: u64,
     ) -> Result<(), RestartTransitionError> {
         match self.state {
+            RestartState::Starting {
+                generation: current_generation,
+                transaction_id: current_transaction,
+                deadline_ns,
+                ..
+            } => {
+                validate_event_identity(
+                    generation,
+                    transaction_id,
+                    current_generation,
+                    current_transaction,
+                )?;
+                validate_deadline(expected_deadline_ns, deadline_ns)?;
+                self.observe_time(now_ns)?;
+                require_reached(now_ns, deadline_ns)?;
+                self.enter_cleanup(
+                    now_ns,
+                    AttemptFailure::ReadyTimeout,
+                    CleanupAction::CloseUnpublished,
+                    true,
+                )
+            }
             RestartState::AwaitingReady {
                 generation: current_generation,
                 transaction_id: current_transaction,
@@ -697,12 +733,14 @@ impl RestartSupervisor {
             };
             return Ok(());
         }
+        let deadline_ns = checked_deadline(now_ns, self.policy.ready_timeout_ns)?;
         self.attempt_started_at_ns = now_ns;
         self.last_generation = generation;
         self.state = RestartState::Starting {
             attempt: next_attempt,
             generation,
             transaction_id,
+            deadline_ns,
         };
         Ok(())
     }
@@ -719,6 +757,7 @@ impl RestartSupervisor {
                 attempt,
                 generation,
                 transaction_id,
+                ..
             }
             | RestartState::AwaitingReady {
                 attempt,
@@ -1001,6 +1040,62 @@ mod tests {
         assert!(matches!(
             supervisor.state(),
             RestartState::Ready { generation: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn ready_deadline_is_bound_to_attempt_start_not_child_start() {
+        let mut before = supervisor();
+        before.begin(100, 1, 11).unwrap();
+        let RestartState::Starting { deadline_ns, .. } = before.state() else {
+            panic!("attempt did not enter Starting");
+        };
+        assert_eq!(deadline_ns, 1_000_000_100);
+        before.child_started(1, 11, deadline_ns - 1).unwrap();
+        assert!(matches!(
+            before.state(),
+            RestartState::AwaitingReady {
+                deadline_ns: 1_000_000_100,
+                ..
+            }
+        ));
+
+        let mut at_deadline = supervisor();
+        at_deadline.begin(100, 1, 11).unwrap();
+        assert_eq!(
+            at_deadline.child_started(1, 11, 1_000_000_100),
+            Err(RestartTransitionError::AttemptFailed(
+                AttemptFailure::ReadyTimeout
+            ))
+        );
+        assert!(matches!(
+            at_deadline.state(),
+            RestartState::CleaningUp {
+                failure: AttemptFailure::ReadyTimeout,
+                action: CleanupAction::TerminateTaskGroup,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn starting_deadline_expiry_closes_unpublished_state() {
+        let mut supervisor = supervisor();
+        supervisor.begin(50, 1, 11).unwrap();
+        assert_eq!(
+            supervisor.deadline_elapsed(1, 11, 1_000_000_050, 1_000_000_049),
+            Err(RestartTransitionError::DeadlineNotReached)
+        );
+        supervisor
+            .deadline_elapsed(1, 11, 1_000_000_050, 1_000_000_050)
+            .unwrap();
+        assert!(matches!(
+            supervisor.state(),
+            RestartState::CleaningUp {
+                failure: AttemptFailure::ReadyTimeout,
+                action: CleanupAction::CloseUnpublished,
+                ..
+            }
         ));
     }
 
@@ -1467,13 +1562,41 @@ mod tests {
     }
 
     #[test]
+    fn replacement_attempt_gets_one_fixed_deadline_from_replacement_start() {
+        let mut supervisor = supervisor();
+        begin_started(&mut supervisor, 0);
+        supervisor
+            .fail_attempt(1, 11, 1, AttemptFailure::MalformedReady)
+            .unwrap();
+        supervisor.cleanup_complete(1, 11, 2).unwrap();
+        let RestartState::Backoff { deadline_ns, .. } = supervisor.state() else {
+            panic!("replacement backoff was not entered");
+        };
+        supervisor.start_replacement(deadline_ns, 2, 12).unwrap();
+        let attempt_deadline = deadline_ns + WYR0_I_SUPERVISION_POLICY.ready_timeout_ns;
+        assert!(matches!(
+            supervisor.state(),
+            RestartState::Starting {
+                deadline_ns: current,
+                ..
+            } if current == attempt_deadline
+        ));
+        assert_eq!(
+            supervisor.child_started(2, 12, attempt_deadline),
+            Err(RestartTransitionError::AttemptFailed(
+                AttemptFailure::ReadyTimeout
+            ))
+        );
+    }
+
+    #[test]
     fn deadline_and_generation_arithmetic_fail_closed() {
         let mut deadline = supervisor();
-        deadline.begin(u64::MAX, 1, 1).unwrap();
         assert_eq!(
-            deadline.child_started(1, 1, u64::MAX),
+            deadline.begin(u64::MAX, 1, 1),
             Err(RestartTransitionError::ArithmeticOverflow)
         );
+        assert_eq!(deadline.state(), RestartState::Stopped);
 
         let mut generation = supervisor();
         generation.begin(0, u64::MAX, 1).unwrap();
