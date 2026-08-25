@@ -348,6 +348,11 @@ A line whose beginning case-insensitively resembles `WRCAP1` is protocol input a
 Only the trusted WYR0-I controller emits `WRCAP1`. Child payload output cannot satisfy evidence by printing protocol-shaped lines.
 
 Host evidence is accepted only with a matching terminal PASS for test ID 24 and one exact immutable request/candidate/provenance identity.
+
+`OVERLOAD_REPLAY_REJECTED` is evidence from the controller-owned admission ledger. It proves that a completed normal transaction cannot be replayed, a live duplicate cannot be admitted, and one-over-budget work cannot reserve resources; it is not represented as a synthetic request received from an untrusted peer Channel.
+
+`CLEANUP_BASELINE` is emitted only after every product Process, Channel endpoint, object handle, mapping, transaction reservation, and peer generation owned by the controller has returned to baseline. The singular bootstrap reporting Channel carrying the final `WRCAP1` record and terminal result is excluded from that product baseline by construction; it closes immediately after delivery and cannot stand in for retained controller state.
+
 ### 11.1 Evidence kind assignments
 
 | Kind | Name | Required proof |
@@ -374,7 +379,7 @@ kinds provide the ordered joins required by I-F; they do not add mask bits:
 | `1` | `02` | `1/1` | READY on the normal-launch transaction |
 | `2` | `02` | `1/1` | normal exit on the same transaction |
 | `3` | `03` | `1/1` | one page with exact reduced read/map/inspect rights |
-| `4` | `04` | `1/1` | Channel proof bitmap and bounded queue-fill count |
+| `4` | `04` | `1/1` | Channel proof bitmap and measured nonzero queue-fill count below the 32-attempt ceiling |
 | `5` | `05` | `1/1` | wait/Event/Timer proof bitmap with no early success |
 | `6` | `06` | `2/1` | exact authorized termination reason |
 | `7` | `07` | `3/1` | first failed attempt names replacement generation `2` |

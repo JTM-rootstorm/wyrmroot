@@ -9,7 +9,10 @@
 //! and exits normally with application code zero.
 
 #[cfg(feature = "i-capability-integration")]
-use deepwyrm_syscall::{DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DwSignals, DwWaitItemV1};
+use deepwyrm_syscall::{
+    DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DW_SIGNAL_WRITABLE, DW_STATUS_WOULD_BLOCK,
+    DwSignals, DwWaitItemV1,
+};
 use deepwyrm_syscall::{DwDeadline, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights};
 use wyrmroot_bootfs::archive::{Archive, LookupError, ParseError};
 use wyrmroot_loader::{
@@ -505,11 +508,44 @@ fn relay_capability_evidence<
         {
             return Err(Init0Error::CapabilityEvidence);
         }
-        system
-            .send_channel(parent_channel, &record)
-            .map_err(|_| Init0Error::CapabilityEvidence)?;
+        send_capability_record_bounded(system, supervisor, parent_channel, &record, deadline)?;
     }
     Ok(())
+}
+
+#[cfg(feature = "i-capability-integration")]
+fn send_capability_record_bounded<
+    System: Init0System,
+    Supervisor: SupervisionPlatform<Error = NativeError>,
+>(
+    system: &mut System,
+    supervisor: &mut Supervisor,
+    parent_channel: DwHandle,
+    record: &[u8],
+    deadline: DwDeadline,
+) -> Result<(), Init0Error> {
+    for _ in 0..32 {
+        match system.send_channel(parent_channel, record) {
+            Ok(()) => return Ok(()),
+            Err(NativeError::Status(status)) if status == DW_STATUS_WOULD_BLOCK => {
+                let item = DwWaitItemV1 {
+                    handle: parent_channel,
+                    signals: DwSignals(DW_SIGNAL_WRITABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+                };
+                let observed = supervisor
+                    .wait_many(core::slice::from_ref(&item), deadline)
+                    .map_err(|_| Init0Error::CapabilityEvidence)?;
+                if observed.index != 0
+                    || observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0
+                    || observed.observed.0 & DW_SIGNAL_WRITABLE.0 == 0
+                {
+                    return Err(Init0Error::CapabilityEvidence);
+                }
+            }
+            Err(_) => return Err(Init0Error::CapabilityEvidence),
+        }
+    }
+    Err(Init0Error::CapabilityEvidence)
 }
 
 fn cleanup_loaded_process<System: Init0System, Loader: LoaderPlatform<Error = NativeError>>(
@@ -584,10 +620,10 @@ mod capability_relay_tests {
         DwTaskTerminationInfoV1, DwWaitResultV1,
     };
     use wyrmroot_i_capability::{
-        CANCEL_TRANSACTION, CHANNEL_TOKEN, CONTENT_TOKEN, EXHAUST_TRANSACTION_BASE, EvidenceEvent,
-        EvidenceKind, EvidenceTranscript, MEMORY_CHILD_RIGHTS_MASK, MEMORY_PAGE_BYTES,
-        MEMORY_TRANSACTION, NORMAL_TRANSACTION, RESTART_TRANSACTION_BASE, WAIT_TOKEN,
-        WRCAP1_EVENT_COUNT, WRCAP1_RECORD_BYTES,
+        CANCEL_TRANSACTION, CHANNEL_TOKEN, EXHAUST_TRANSACTION_BASE, EvidenceEvent, EvidenceKind,
+        EvidenceTranscript, MEMORY_CHILD_RIGHTS_MASK, MEMORY_PAGE_BYTES, MEMORY_TRANSACTION,
+        NORMAL_TRANSACTION, RESTART_TRANSACTION_BASE, WAIT_TOKEN, WRCAP1_EVENT_COUNT,
+        WRCAP1_RECORD_BYTES,
     };
 
     use super::*;
@@ -599,6 +635,7 @@ mod capability_relay_tests {
     struct RelaySystem {
         relayed: [[u8; WRCAP1_RECORD_BYTES]; WRCAP1_EVENT_COUNT],
         count: usize,
+        block_first_send: bool,
     }
 
     impl RelaySystem {
@@ -606,6 +643,7 @@ mod capability_relay_tests {
             Self {
                 relayed: [[0; WRCAP1_RECORD_BYTES]; WRCAP1_EVENT_COUNT],
                 count: 0,
+                block_first_send: false,
             }
         }
     }
@@ -643,6 +681,10 @@ mod capability_relay_tests {
 
         fn send_channel(&mut self, channel: DwHandle, bytes: &[u8]) -> Result<(), NativeError> {
             assert_eq!(channel, PARENT_CHANNEL);
+            if self.block_first_send {
+                self.block_first_send = false;
+                return Err(NativeError::Status(deepwyrm_syscall::DW_STATUS_WOULD_BLOCK));
+            }
             self.relayed[self.count].copy_from_slice(bytes);
             self.count += 1;
             Ok(())
@@ -656,6 +698,7 @@ mod capability_relay_tests {
     struct RelaySupervisor {
         records: [[u8; WRCAP1_RECORD_BYTES]; WRCAP1_EVENT_COUNT],
         next: usize,
+        writable_waits: usize,
     }
 
     impl SupervisionPlatform for RelaySupervisor {
@@ -668,12 +711,23 @@ mod capability_relay_tests {
         ) -> Result<DwWaitResultV1, Self::Error> {
             assert_eq!(deadline, DEADLINE);
             assert_eq!(items.len(), 1);
-            assert_eq!(items[0].handle, CHILD_CHANNEL);
+            let observed = if items[0].handle == CHILD_CHANNEL {
+                DW_SIGNAL_READABLE
+            } else {
+                assert_eq!(items[0].handle, PARENT_CHANNEL);
+                assert_eq!(
+                    items[0].signals.0,
+                    deepwyrm_syscall::DW_SIGNAL_WRITABLE.0
+                        | deepwyrm_syscall::DW_SIGNAL_PEER_CLOSED.0
+                );
+                self.writable_waits += 1;
+                deepwyrm_syscall::DW_SIGNAL_WRITABLE
+            };
             Ok(DwWaitResultV1 {
                 size: DW_WAIT_RESULT_V1_SIZE,
                 version: 1,
                 index: 0,
-                observed: DW_SIGNAL_READABLE,
+                observed,
                 ..DwWaitResultV1::default()
             })
         }
@@ -706,7 +760,11 @@ mod capability_relay_tests {
     fn relays_exactly_fifteen_controller_records_without_rewriting() {
         let records = records();
         let mut system = RelaySystem::new();
-        let mut supervisor = RelaySupervisor { records, next: 0 };
+        let mut supervisor = RelaySupervisor {
+            records,
+            next: 0,
+            writable_waits: 0,
+        };
 
         relay_capability_evidence(
             &mut system,
@@ -720,6 +778,33 @@ mod capability_relay_tests {
         assert_eq!(system.count, WRCAP1_EVENT_COUNT);
         assert_eq!(system.relayed, records);
         assert_eq!(supervisor.next, WRCAP1_EVENT_COUNT);
+        assert_eq!(supervisor.writable_waits, 0);
+    }
+
+    #[test]
+    fn retries_a_would_block_relay_send_only_after_writable() {
+        let records = records();
+        let mut system = RelaySystem::new();
+        system.block_first_send = true;
+        let mut supervisor = RelaySupervisor {
+            records,
+            next: 0,
+            writable_waits: 0,
+        };
+
+        relay_capability_evidence(
+            &mut system,
+            &mut supervisor,
+            PARENT_CHANNEL,
+            CHILD_CHANNEL,
+            DEADLINE,
+        )
+        .unwrap();
+
+        assert_eq!(system.count, WRCAP1_EVENT_COUNT);
+        assert_eq!(system.relayed, records);
+        assert_eq!(supervisor.next, WRCAP1_EVENT_COUNT);
+        assert_eq!(supervisor.writable_waits, 1);
     }
 
     #[test]
@@ -727,7 +812,11 @@ mod capability_relay_tests {
         let mut records = records();
         records[3][73] = b':';
         let mut system = RelaySystem::new();
-        let mut supervisor = RelaySupervisor { records, next: 0 };
+        let mut supervisor = RelaySupervisor {
+            records,
+            next: 0,
+            writable_waits: 0,
+        };
 
         assert_eq!(
             relay_capability_evidence(
@@ -746,7 +835,7 @@ mod capability_relay_tests {
     fn records() -> [[u8; WRCAP1_RECORD_BYTES]; WRCAP1_EVENT_COUNT] {
         let mut transcript = EvidenceTranscript::new(0x0123_4567_89AB_CDEF).unwrap();
         for event in [
-            event(EvidenceKind::ContentDelivery, 0, 0, CONTENT_TOKEN, 1, 2),
+            event(EvidenceKind::ContentDelivery, 0, 0, 3, 1, 2),
             event(
                 EvidenceKind::ProcessLifecycle,
                 1,
@@ -771,7 +860,7 @@ mod capability_relay_tests {
                 MEMORY_PAGE_BYTES,
                 MEMORY_CHILD_RIGHTS_MASK,
             ),
-            event(EvidenceKind::ChannelLifecycle, 1, 1, CHANNEL_TOKEN, 0xF, 32),
+            event(EvidenceKind::ChannelLifecycle, 1, 1, CHANNEL_TOKEN, 0xF, 2),
             event(EvidenceKind::WaitEventTimer, 1, 1, WAIT_TOKEN, 0xF, 0),
             event(
                 EvidenceKind::Cancellation,

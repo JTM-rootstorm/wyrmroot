@@ -4,8 +4,8 @@ use deepwyrm_syscall::{
     self, DW_OBJECT_TYPE_MEMORY_OBJECT, DW_RIGHT_DUPLICATE, DW_RIGHT_INSPECT, DW_RIGHT_MAP,
     DW_RIGHT_MODIFY, DW_RIGHT_READ, DW_RIGHT_SIGNAL, DW_RIGHT_TRANSFER, DW_RIGHT_WAIT,
     DW_RIGHT_WRITE, DW_SIGNAL_EXITED, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE,
-    DW_SIGNAL_SIGNALED, DW_STATUS_BAD_HANDLE, DW_STATUS_PEER_CLOSED, DW_STATUS_TIMED_OUT,
-    DW_STATUS_WOULD_BLOCK, DW_TASK_STATE_EXITED, DW_TERMINATION_AUTHORIZED,
+    DW_SIGNAL_SIGNALED, DW_SIGNAL_WRITABLE, DW_STATUS_BAD_HANDLE, DW_STATUS_PEER_CLOSED,
+    DW_STATUS_TIMED_OUT, DW_STATUS_WOULD_BLOCK, DW_TASK_STATE_EXITED, DW_TERMINATION_AUTHORIZED,
     DW_TERMINATION_NORMAL_EXIT, DwDeadline, DwHandle, DwHandleTransferV1, DwReceivedHandleInfoV1,
     DwRights, DwSignals,
 };
@@ -31,8 +31,9 @@ use wyrmroot_runtime::{
 };
 
 use crate::evidence::{
-    CANCEL_TRANSACTION, CHANNEL_TOKEN, CONTENT_TOKEN, EXHAUST_TRANSACTION_BASE, MEMORY_TRANSACTION,
-    NORMAL_TRANSACTION, RESTART_TRANSACTION_BASE, WAIT_TOKEN,
+    CANCEL_TRANSACTION, CHANNEL_BACKPRESSURE_ATTEMPT_LIMIT, CHANNEL_TOKEN,
+    EXHAUST_TRANSACTION_BASE, MEMORY_TRANSACTION, NORMAL_TRANSACTION, RESTART_TRANSACTION_BASE,
+    WAIT_TOKEN,
 };
 use crate::{
     ASSET_BOOTFS_PATH, CONFIG_BOOTFS_PATH, EvidenceEvent, EvidenceKind, EvidenceTranscript,
@@ -43,7 +44,8 @@ use crate::{
 const PAGE_BYTES: u64 = wyrmroot_runtime::PAGE_SIZE;
 const CHILD_TIMEOUT_NS: u64 = 1_000_000_000;
 const SHORT_TIMEOUT_NS: u64 = 1_000_000;
-const BACKPRESSURE_ATTEMPTS: usize = 32;
+const BACKPRESSURE_ATTEMPTS: usize = CHANNEL_BACKPRESSURE_ATTEMPT_LIMIT as usize;
+const RELAY_SEND_ATTEMPTS: usize = 32;
 
 const MEMORY_COMMAND_BYTES: usize = 16;
 const MEMORY_ACK: &[u8] = b"WICMACK1";
@@ -237,16 +239,23 @@ fn run_controller(
         let record = transcript
             .encoded(sequence)
             .map_err(|_| failure(EvidenceKind::CleanupBaseline, 0x0040 + sequence as u16))?;
-        send_channel(parent_channel, &record, &[])
-            .map_err(|_| failure(EvidenceKind::CleanupBaseline, 0x0050 + sequence as u16))?;
+        send_channel_bounded(
+            parent_channel,
+            &record,
+            EvidenceKind::CleanupBaseline,
+            0x0050 + sequence as u16,
+        )?;
     }
-    send_ready(
+    let mut ready = [0_u8; HEADER_BYTES];
+    let ready_bytes = encode_ready(parent_transaction, &mut ready)
+        .map_err(|_| failure(EvidenceKind::CleanupBaseline, 0x0020))?;
+    send_channel_bounded(
         parent_channel,
-        parent_transaction,
+        &ready[..ready_bytes],
         EvidenceKind::CleanupBaseline,
-        0x0020,
+        0x0021,
     )?;
-    close_handle(parent_channel).map_err(|_| failure(EvidenceKind::CleanupBaseline, 0x0021))
+    close_handle(parent_channel).map_err(|_| failure(EvidenceKind::CleanupBaseline, 0x0022))
 }
 
 fn run_mapped_controller(
@@ -278,18 +287,26 @@ fn run_mapped_controller(
         .map_err(|_| failure(EvidenceKind::ContentDelivery, 0x0016))?;
     let mut transcript = EvidenceTranscript::new(selector.evidence_nonce)
         .map_err(|_| failure(EvidenceKind::ContentDelivery, 0x0017))?;
+    let config_prefix = sha256_prefix_u64(&selector.config_sha256);
+    let asset_prefix = sha256_prefix_u64(&selector.asset_sha256);
+    let content_token = config_prefix ^ asset_prefix;
+    if content_token == 0 {
+        return Err(failure(EvidenceKind::ContentDelivery, 0x0018));
+    }
     push(
         &mut transcript,
         event(
             EvidenceKind::ContentDelivery,
             0,
             0,
-            CONTENT_TOKEN,
-            sha256_prefix_u64(&selector.config_sha256),
-            sha256_prefix_u64(&selector.asset_sha256),
+            content_token,
+            config_prefix,
+            asset_prefix,
         ),
     )?;
-    exercise_normal_lifecycle(authority, executable.data(), display)?;
+    let mut normal_ledger =
+        ReadinessAccounting::new().map_err(|_| failure(EvidenceKind::ProcessLifecycle, 0x00F0))?;
+    exercise_normal_lifecycle(authority, executable.data(), display, &mut normal_ledger)?;
     push(
         &mut transcript,
         event(
@@ -326,7 +343,7 @@ fn run_mapped_controller(
         ),
     )?;
 
-    exercise_channel_lifecycle(authority.bootfs)?;
+    let queued = exercise_channel_lifecycle(authority.bootfs)?;
     push(
         &mut transcript,
         event(
@@ -335,7 +352,7 @@ fn run_mapped_controller(
             1,
             CHANNEL_TOKEN,
             0xF,
-            BACKPRESSURE_ATTEMPTS as u64,
+            queued,
         ),
     )?;
 
@@ -401,7 +418,7 @@ fn run_mapped_controller(
         )?;
     }
 
-    exercise_overload_replay()?;
+    exercise_overload_replay(&mut normal_ledger)?;
     push(
         &mut transcript,
         event(
@@ -446,7 +463,21 @@ fn exercise_normal_lifecycle(
     authority: LoadAuthority,
     image: &[u8],
     display: &str,
+    ledger: &mut ReadinessAccounting,
 ) -> Result<(), u32> {
+    let peer = 1_u8;
+    let generation = 1_u64;
+    ledger
+        .begin_generation(peer, generation)
+        .map_err(|_| failure(EvidenceKind::ProcessLifecycle, 0x00F1))?;
+    let mut transaction = ledger
+        .begin_transaction(peer, generation, NORMAL_TRANSACTION)
+        .map_err(|_| failure(EvidenceKind::ProcessLifecycle, 0x00F2))?;
+    if ledger.begin_transaction(peer, generation, NORMAL_TRANSACTION)
+        != Err(AccountingError::DuplicateTransaction)
+    {
+        return Err(failure(EvidenceKind::ProcessLifecycle, 0x00F3));
+    }
     let (loaded, group) = load_child(
         authority,
         image,
@@ -464,7 +495,10 @@ fn exercise_normal_lifecycle(
     )
     .map_err(|_| failure(EvidenceKind::ProcessLifecycle, 0x0102));
     close_loaded(loaded, group, EvidenceKind::ProcessLifecycle, 0x0110)?;
-    result
+    result?;
+    ledger
+        .complete_transaction(&mut transaction)
+        .map_err(|_| failure(EvidenceKind::ProcessLifecycle, 0x0120))
 }
 
 fn exercise_shared_memory(
@@ -713,6 +747,7 @@ fn exercise_cancellation(authority: LoadAuthority, image: &[u8], display: &str) 
     terminate_process(loaded.process, DW_TERMINATION_AUTHORIZED, 0)
         .map_err(|_| failure(EvidenceKind::Cancellation, 0x0102))?;
     let info = wait_exit_info(loaded.process, EvidenceKind::Cancellation, 0x0103)?;
+    wait_clean_peer_close(loaded.launch_channel, EvidenceKind::Cancellation, 0x0105)?;
     if info.state != DW_TASK_STATE_EXITED
         || info.reason != DW_TERMINATION_AUTHORIZED
         || info.application_code != 0
@@ -730,7 +765,7 @@ fn exercise_restart_replacement(
     image: &[u8],
     display: &str,
 ) -> Result<(), u32> {
-    let peer = 2_u8;
+    let peer = 3_u8;
     let mut ledger = ReadinessAccounting::new()
         .map_err(|_| failure(EvidenceKind::RestartReplacement, 0x0100))?;
     let now =
@@ -793,7 +828,7 @@ fn exercise_restart_exhaustion(
     image: &[u8],
     display: &str,
 ) -> Result<(), u32> {
-    let peer = 3_u8;
+    let peer = 4_u8;
     let mut ledger =
         ReadinessAccounting::new().map_err(|_| failure(EvidenceKind::RestartExhausted, 0x0100))?;
     let now =
@@ -897,6 +932,7 @@ fn run_restart_attempt(
         .complete_transaction(&mut transaction_token)
         .map_err(|_| failure(stage, operation + 8))?;
     let info = wait_exit_info(loaded.process, stage, operation + 9)?;
+    wait_clean_peer_close(loaded.launch_channel, stage, operation + 19)?;
     if info.state != DW_TASK_STATE_EXITED
         || info.reason != DW_TERMINATION_NORMAL_EXIT
         || info.application_code != expected_exit
@@ -935,15 +971,10 @@ fn run_restart_attempt(
     Ok(())
 }
 
-fn exercise_overload_replay() -> Result<(), u32> {
-    let peer = 0_u8;
+fn exercise_overload_replay(ledger: &mut ReadinessAccounting) -> Result<(), u32> {
+    let peer = 1_u8;
     let generation = 1_u64;
     let transaction = NORMAL_TRANSACTION;
-    let mut ledger = ReadinessAccounting::new()
-        .map_err(|_| failure(EvidenceKind::OverloadReplayRejected, 0x0100))?;
-    ledger
-        .begin_generation(peer, generation)
-        .map_err(|_| failure(EvidenceKind::OverloadReplayRejected, 0x0101))?;
     let exact = ReservationRequest::empty()
         .add(AccountedResource::RetainedPayloadBytes, 4096)
         .map_err(|_| failure(EvidenceKind::OverloadReplayRejected, 0x0102))?;
@@ -963,17 +994,6 @@ fn exercise_overload_replay() -> Result<(), u32> {
     ledger
         .release(&mut reservation)
         .map_err(|_| failure(EvidenceKind::OverloadReplayRejected, 0x0106))?;
-    let mut token = ledger
-        .begin_transaction(peer, generation, transaction)
-        .map_err(|_| failure(EvidenceKind::OverloadReplayRejected, 0x0107))?;
-    if ledger.begin_transaction(peer, generation, transaction)
-        != Err(AccountingError::DuplicateTransaction)
-    {
-        return Err(failure(EvidenceKind::OverloadReplayRejected, 0x0108));
-    }
-    ledger
-        .complete_transaction(&mut token)
-        .map_err(|_| failure(EvidenceKind::OverloadReplayRejected, 0x0109))?;
     if ledger.begin_transaction(peer, generation, transaction)
         != Err(AccountingError::ReplayedTransaction)
         || ledger.begin_transaction(peer, generation + 1, transaction + 1)
@@ -999,7 +1019,7 @@ fn exercise_overload_replay() -> Result<(), u32> {
     ledger
         .finish_restart_episode(peer)
         .map_err(|_| failure(EvidenceKind::OverloadReplayRejected, 0x010D))?;
-    assert_accounting_zero(&ledger, EvidenceKind::OverloadReplayRejected, 0x0110)
+    assert_accounting_zero(ledger, EvidenceKind::OverloadReplayRejected, 0x0110)
 }
 
 fn assert_accounting_zero(
@@ -1090,6 +1110,64 @@ fn wait_ready(
         return Err(failure(stage, operation + 4));
     }
     Ok(())
+}
+
+fn wait_clean_peer_close(
+    channel: DwHandle,
+    stage: EvidenceKind,
+    operation: u16,
+) -> Result<(), u32> {
+    let observed = wait_one(
+        channel,
+        DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+        future_deadline(CHILD_TIMEOUT_NS, stage, operation)?,
+    )
+    .map_err(|_| failure(stage, operation + 1))?;
+    if observed.observed.0 & DW_SIGNAL_READABLE.0 != 0 {
+        let mut bytes = [0_u8; INIT0_BYTES];
+        let mut handles = [DwReceivedHandleInfoV1::default(); 3];
+        let received = receive_channel(channel, &mut bytes, &mut handles)
+            .map_err(|_| failure(stage, operation + 2))?;
+        for handle in handles[..received.handles].iter().map(|info| info.handle) {
+            close_handle(handle).map_err(|_| failure(stage, operation + 3))?;
+        }
+        return Err(failure(stage, operation + 4));
+    }
+    if observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 == 0 {
+        return Err(failure(stage, operation + 5));
+    }
+    Ok(())
+}
+
+fn send_channel_bounded(
+    channel: DwHandle,
+    bytes: &[u8],
+    stage: EvidenceKind,
+    operation: u16,
+) -> Result<(), u32> {
+    let deadline = future_deadline(CHILD_TIMEOUT_NS, stage, operation)?;
+    for _ in 0..RELAY_SEND_ATTEMPTS {
+        match send_channel(channel, bytes, &[]) {
+            Ok(()) => return Ok(()),
+            Err(wyrmroot_runtime::NativeError::Status(status))
+                if status == DW_STATUS_WOULD_BLOCK =>
+            {
+                let observed = wait_one(
+                    channel,
+                    DwSignals(DW_SIGNAL_WRITABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+                    deadline,
+                )
+                .map_err(|_| failure(stage, operation + 1))?;
+                if observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0
+                    || observed.observed.0 & DW_SIGNAL_WRITABLE.0 == 0
+                {
+                    return Err(failure(stage, operation + 2));
+                }
+            }
+            Err(_) => return Err(failure(stage, operation + 3)),
+        }
+    }
+    Err(failure(stage, operation + 4))
 }
 
 fn wait_exit_info(

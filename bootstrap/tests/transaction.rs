@@ -133,6 +133,7 @@ struct Fixture {
     relay_index: usize,
     relay_handle_count: usize,
     relay_receive_error: Option<NativeError>,
+    relay_send_would_block_once: bool,
 }
 
 impl Fixture {
@@ -171,6 +172,7 @@ impl Fixture {
             relay_index: 0,
             relay_handle_count: 0,
             relay_receive_error: None,
+            relay_send_would_block_once: false,
         }
     }
 }
@@ -258,6 +260,10 @@ impl BootstrapSystem for Fixture {
 
     fn send_channel(&mut self, channel: DwHandle, bytes: &[u8]) -> Result<(), NativeError> {
         assert_eq!(channel, CHANNEL);
+        if self.relay_send_would_block_once && bytes.starts_with(b"WRCAP1|") {
+            self.relay_send_would_block_once = false;
+            return Err(NativeError::Status(DW_STATUS_WOULD_BLOCK));
+        }
         self.sent.extend_from_slice(bytes);
         Ok(())
     }
@@ -552,6 +558,7 @@ struct SmokeSupervisor {
     relay_wait_error: Option<NativeError>,
     relay_invalid_wait_result: bool,
     ready_receive_counts: Option<ReceiveCounts>,
+    writable_waits: usize,
 }
 
 impl SmokeSupervisor {
@@ -568,6 +575,7 @@ impl SmokeSupervisor {
             relay_wait_error: None,
             relay_invalid_wait_result: false,
             ready_receive_counts: None,
+            writable_waits: 0,
         }
     }
 
@@ -591,6 +599,7 @@ impl SmokeSupervisor {
             relay_wait_error: None,
             relay_invalid_wait_result: false,
             ready_receive_counts: None,
+            writable_waits: 0,
         }
     }
 }
@@ -606,6 +615,20 @@ impl SupervisionPlatform for SmokeSupervisor {
         assert_eq!(deadline, DwDeadline(99));
         if let Some(error) = self.relay_wait_error.take() {
             return Err(error);
+        }
+        if items.len() == 1 && items[0].handle == CHANNEL {
+            assert_eq!(
+                items[0].signals.0,
+                deepwyrm_syscall::DW_SIGNAL_WRITABLE.0 | DW_SIGNAL_PEER_CLOSED.0
+            );
+            self.writable_waits += 1;
+            return Ok(DwWaitResultV1 {
+                size: deepwyrm_syscall::DW_WAIT_RESULT_V1_SIZE,
+                version: 1,
+                index: 0,
+                observed: deepwyrm_syscall::DW_SIGNAL_WRITABLE,
+                ..DwWaitResultV1::default()
+            });
         }
         if self.relay_invalid_wait_result {
             self.relay_invalid_wait_result = false;
@@ -762,6 +785,37 @@ fn capability_bootstrap_relays_fifteen_exact_wrcap1_records_before_init0_supervi
             transaction_id: 1
         }))
     );
+}
+
+#[cfg(feature = "i-capability-relay")]
+#[test]
+fn capability_bootstrap_retries_a_would_block_upstream_send_after_writable() {
+    let image = executable();
+    let mut fixture = Fixture::valid();
+    fixture.bootfs = bootfs(&[(INIT0_PATH, &image), (HELLO_PATH, b"hello")]);
+    fixture.relay_records = WRCAP1_KINDS
+        .into_iter()
+        .enumerate()
+        .map(|(sequence, kind)| wrcap1_record(sequence as u32, kind))
+        .collect();
+    let expected_records = fixture.relay_records.concat();
+    fixture.relay_send_would_block_once = true;
+    let mut loader = SmokeLoader::init0();
+    let mut supervisor = SmokeSupervisor::successful_init0();
+    supervisor.relay_events = &WRCAP1_READABLE_EVENTS;
+
+    assert_eq!(
+        run_init0_capability_bootstrap(
+            &mut fixture,
+            &mut loader,
+            &mut supervisor,
+            CHANNEL,
+            DwDeadline(99),
+        ),
+        Ok(())
+    );
+    assert!(fixture.sent.starts_with(&expected_records));
+    assert_eq!(supervisor.writable_waits, 1);
 }
 
 #[cfg(feature = "i-capability-relay")]

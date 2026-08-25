@@ -18,10 +18,11 @@ pub use content::{
     ContentError, SelectorContent, validate_selector_content,
 };
 pub use evidence::{
-    CANCEL_TRANSACTION, CHANNEL_TOKEN, CONTENT_TOKEN, EXHAUST_TRANSACTION_BASE, EvidenceError,
-    EvidenceEvent, EvidenceKind, EvidenceTranscript, MEMORY_CHILD_RIGHTS_MASK, MEMORY_PAGE_BYTES,
-    MEMORY_TRANSACTION, NORMAL_TRANSACTION, REQUIRED_CAPABILITY_MASK, RESTART_TRANSACTION_BASE,
-    WAIT_TOKEN, WRCAP1_EVENT_COUNT, WRCAP1_RECORD_BYTES, validate_relay_record,
+    CANCEL_TRANSACTION, CHANNEL_BACKPRESSURE_ATTEMPT_LIMIT, CHANNEL_TOKEN,
+    EXHAUST_TRANSACTION_BASE, EvidenceError, EvidenceEvent, EvidenceKind, EvidenceTranscript,
+    MEMORY_CHILD_RIGHTS_MASK, MEMORY_PAGE_BYTES, MEMORY_TRANSACTION, NORMAL_TRANSACTION,
+    REQUIRED_CAPABILITY_MASK, RESTART_TRANSACTION_BASE, WAIT_TOKEN, WRCAP1_EVENT_COUNT,
+    WRCAP1_RECORD_BYTES, validate_relay_record,
 };
 pub use model::{
     ModelError, prove_overload_replay_and_cleanup, prove_restart_replacement_and_exhaustion,

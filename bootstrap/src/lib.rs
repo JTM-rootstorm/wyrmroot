@@ -125,8 +125,8 @@ compile_error!("the WYR0-I capability relay is mutually exclusive with other boo
 
 #[cfg(feature = "i-capability-relay")]
 use deepwyrm_syscall::{
-    DW_DEADLINE_INFINITE, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DW_STATUS_TIMED_OUT,
-    DW_STATUS_WOULD_BLOCK, DwWaitItemV1,
+    DW_DEADLINE_INFINITE, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DW_SIGNAL_WRITABLE,
+    DW_STATUS_TIMED_OUT, DW_STATUS_WOULD_BLOCK, DwSignals, DwWaitItemV1,
 };
 use deepwyrm_syscall::{DwDeadline, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights};
 use wyrmroot_bootfs::archive::{Archive, LookupError, ParseError};
@@ -391,6 +391,8 @@ pub enum Wrcap1RelayError {
     InvalidWaitResult,
     /// A post-readable receive raced with draining and reported `WOULD_BLOCK`.
     ReceiveWouldBlock,
+    /// A bounded relay send remained backpressured after every permitted retry.
+    SendWouldBlock,
     /// The child attached one or more handles to an evidence datagram.
     CapabilityBearing,
     /// The record was not exact fixed-width, uppercase ASCII `WRCAP1` framing.
@@ -677,11 +679,65 @@ fn relay_wrcap1_records<
         let record = &bytes[..counts.bytes];
         validate_wrcap1_record(record, sequence as u32, expected_kind)
             .map_err(BootstrapError::CapabilityRelay)?;
-        system
-            .send_channel(primordial_parent_channel, record)
-            .map_err(BootstrapError::Native)?;
+        send_wrcap1_record_bounded(
+            system,
+            supervisor,
+            primordial_parent_channel,
+            record,
+            deadline,
+        )?;
     }
     Ok(())
+}
+
+#[cfg(feature = "i-capability-relay")]
+fn send_wrcap1_record_bounded<
+    System: BootstrapSystem,
+    Supervisor: SupervisionPlatform<Error = NativeError>,
+>(
+    system: &mut System,
+    supervisor: &mut Supervisor,
+    parent_channel: DwHandle,
+    record: &[u8],
+    deadline: DwDeadline,
+) -> Result<(), BootstrapError> {
+    for _ in 0..32 {
+        match system.send_channel(parent_channel, record) {
+            Ok(()) => return Ok(()),
+            Err(NativeError::Status(status)) if status == DW_STATUS_WOULD_BLOCK => {
+                let item = DwWaitItemV1 {
+                    handle: parent_channel,
+                    signals: DwSignals(DW_SIGNAL_WRITABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+                };
+                let observed = match supervisor.wait_many(core::slice::from_ref(&item), deadline) {
+                    Err(NativeError::Status(status)) if status == DW_STATUS_TIMED_OUT => {
+                        return Err(BootstrapError::CapabilityRelay(Wrcap1RelayError::TimedOut));
+                    }
+                    Err(error) => return Err(BootstrapError::Native(error)),
+                    Ok(observed) => observed,
+                };
+                if observed.index != 0 {
+                    return Err(BootstrapError::CapabilityRelay(
+                        Wrcap1RelayError::InvalidWaitResult,
+                    ));
+                }
+                if observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 {
+                    return Err(BootstrapError::CapabilityRelay(
+                        Wrcap1RelayError::PeerClosed,
+                    ));
+                }
+                if observed.observed.0 & DW_SIGNAL_WRITABLE.0 == 0 {
+                    return Err(BootstrapError::CapabilityRelay(
+                        Wrcap1RelayError::InvalidWaitResult,
+                    ));
+                }
+            }
+            Err(error) => return Err(BootstrapError::Native(error)),
+        }
+    }
+    Err(BootstrapError::CapabilityRelay(
+        Wrcap1RelayError::SendWouldBlock,
+    ))
 }
 
 #[cfg(feature = "i-capability-relay")]

@@ -32,10 +32,15 @@ const WRCAP1_RECORD_BYTES: usize = 117;
 const WYR0_I_CAPABILITY_EVENT_COUNT: u32 = 15;
 const WYR0_I_MEMORY_RIGHTS: u64 = DW_RIGHT_READ.0 | DW_RIGHT_MAP.0 | DW_RIGHT_INSPECT.0;
 const WYR0_I_AUTHORIZED_TERMINATION: u64 = DW_TERMINATION_AUTHORIZED.0 as u64;
+const WYR0_I_CHANNEL_BACKPRESSURE_ATTEMPT_LIMIT: u64 = 32;
 const MAX_EVIDENCE_RECORDS: usize = 64;
 const MAX_SELECTOR_CONTENT_BYTES: u64 = 64 * 1024;
 const WYR0_I_CONFIG_BOOTFS_PATH: &[u8] = b"test/wyr0-i/config.toml";
 const WYR0_I_ASSET_BOOTFS_PATH: &[u8] = b"test/wyr0-i/asset.bin";
+const WYR0_I_CANONICAL_ASSET: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../userspace/i-capability/assets/asset.bin"
+));
 const WYR0_I_RUST_TARGET: &str = "x86_64-unknown-wyrmroot";
 const WYR0_I_INHERITED_I0_I1_I2: &str = "Plans/WYR0_H_VALIDATION.md";
 const WYR0_I_INHERITED_D0: &str = "../deepwyrm/security/DW0_H_SECURITY_REVIEW.md";
@@ -984,7 +989,13 @@ fn build_bootfs_bytes(artifacts: &CandidateArtifacts) -> Result<Vec<u8>, Failure
 
 fn validate_selector_config(config: &Path, asset: &Path, nonce: u64) -> Result<(), Failure> {
     let config_bytes = read_regular(config, "WYR0-I selector config", MAX_SELECTOR_CONTENT_BYTES)?;
-    let asset_sha256 = digest(asset, "WYR0-I selector asset")?;
+    let asset_bytes = read_regular(asset, "WYR0-I selector asset", MAX_SELECTOR_CONTENT_BYTES)?;
+    if asset_bytes != WYR0_I_CANONICAL_ASSET {
+        return Err(Failure::task(
+            "WYR0-I selector asset is not the exact canonical immutable payload",
+        ));
+    }
+    let asset_sha256 = sha256::bytes_digest(&asset_bytes);
     let expected = canonical_selector_config(nonce, &asset_sha256);
     if config_bytes != expected.as_bytes() {
         return Err(Failure::task(
@@ -2362,7 +2373,18 @@ fn validate_capability_evidence(
         ));
     }
     require_capability_event(events[3], 1, 1, 4096, WYR0_I_MEMORY_RIGHTS, "MEMORY_SHARE")?;
-    require_capability_event(events[4], 1, 1, 0x0F, 32, "CHANNEL_LIFECYCLE")?;
+    let channel = events[4];
+    if channel.peer != 1
+        || channel.generation != 1
+        || channel.token == 0
+        || channel.arg0 != 0x0F
+        || channel.arg1 == 0
+        || channel.arg1 >= WYR0_I_CHANNEL_BACKPRESSURE_ATTEMPT_LIMIT
+    {
+        return Err(Failure::task(
+            "WYR0-I CHANNEL_LIFECYCLE has an invalid peer, generation, token, proof bitmap, or measured queue-fill count",
+        ));
+    }
     require_capability_event(events[5], 1, 1, 0x0F, 0, "WAIT_EVENT_TIMER")?;
     require_capability_event(
         events[6],
@@ -3489,7 +3511,7 @@ mod tests {
             ));
         fs::create_dir(&root).expect("create WYR0-I fixture");
         let asset = root.join("selector-asset.bin");
-        fs::write(&asset, b"immutable-wyr0-i-asset-v1\n").expect("write selector asset");
+        fs::write(&asset, WYR0_I_CANONICAL_ASSET).expect("write selector asset");
         let asset_sha256 = digest(&asset, "test selector asset").expect("hash selector asset");
         let config = root.join("selector-config.toml");
         fs::write(
@@ -3540,9 +3562,9 @@ mod tests {
         let (config, asset) = capability_content_prefixes(request).expect("content prefixes");
         let content_token = config ^ asset;
         assert_ne!(content_token, 0);
-        let normal_transaction = 0x1000;
-        let restart_base = 0x6000;
-        let exhaust_base = 0x7000;
+        let normal_transaction = wyrmroot_i_capability::NORMAL_TRANSACTION;
+        let restart_base = wyrmroot_i_capability::RESTART_TRANSACTION_BASE;
+        let exhaust_base = wyrmroot_i_capability::EXHAUST_TRANSACTION_BASE;
         vec![
             CapabilitySpec {
                 kind: 0x01,
@@ -3572,7 +3594,7 @@ mod tests {
                 kind: 0x03,
                 peer: 1,
                 generation: 1,
-                token: 0x2000,
+                token: wyrmroot_i_capability::MEMORY_TRANSACTION,
                 arg0: 4096,
                 arg1: WYR0_I_MEMORY_RIGHTS,
             },
@@ -3580,15 +3602,15 @@ mod tests {
                 kind: 0x04,
                 peer: 1,
                 generation: 1,
-                token: 0x3000,
+                token: wyrmroot_i_capability::CHANNEL_TOKEN,
                 arg0: 0x0F,
-                arg1: 32,
+                arg1: 2,
             },
             CapabilitySpec {
                 kind: 0x05,
                 peer: 1,
                 generation: 1,
-                token: 0x4000,
+                token: wyrmroot_i_capability::WAIT_TOKEN,
                 arg0: 0x0F,
                 arg1: 0,
             },
@@ -3596,7 +3618,7 @@ mod tests {
                 kind: 0x06,
                 peer: 2,
                 generation: 1,
-                token: 0x5000,
+                token: wyrmroot_i_capability::CANCEL_TRANSACTION,
                 arg0: WYR0_I_AUTHORIZED_TERMINATION,
                 arg1: 0,
             },
@@ -3824,6 +3846,22 @@ mod tests {
                 "accepted noncanonical {label} config"
             );
         }
+        let alternate_asset = b"alternate-request-bound-asset\n";
+        fs::write(&capability.selector_asset, alternate_asset).unwrap();
+        fs::write(
+            &capability.selector_config,
+            canonical_selector_config(nonce, &sha256::bytes_digest(alternate_asset)),
+        )
+        .unwrap();
+        assert!(
+            validate_selector_config(
+                &capability.selector_config,
+                &capability.selector_asset,
+                nonce,
+            )
+            .is_err(),
+            "accepted a self-consistent but noncanonical selector asset"
+        );
         fs::remove_dir_all(root).expect("remove content fixture");
     }
 
@@ -3848,6 +3886,59 @@ mod tests {
         assert!(fields.contains("\"evidence_protocol\":\"wrcap1\""));
         assert!(fields.contains("\"observed_evidence_mask\":1023"));
         fs::remove_dir_all(root).expect("remove evidence fixture");
+    }
+
+    #[test]
+    fn wrcap1_real_controller_encoder_is_accepted_by_the_host_join() {
+        use wyrmroot_i_capability::{EvidenceEvent, EvidenceKind, EvidenceTranscript};
+
+        let (root, request) = capability_request("real-controller-encoder");
+        let nonce = request.evidence.expect("evidence request").nonce;
+        let mut producer = EvidenceTranscript::new(nonce).expect("nonzero nonce");
+        for spec in capability_specs(&request) {
+            let kind = match spec.kind {
+                0x01 => EvidenceKind::ContentDelivery,
+                0x02 => EvidenceKind::ProcessLifecycle,
+                0x03 => EvidenceKind::MemoryShare,
+                0x04 => EvidenceKind::ChannelLifecycle,
+                0x05 => EvidenceKind::WaitEventTimer,
+                0x06 => EvidenceKind::Cancellation,
+                0x07 => EvidenceKind::RestartReplacement,
+                0x08 => EvidenceKind::RestartExhausted,
+                0x09 => EvidenceKind::OverloadReplayRejected,
+                0x0A => EvidenceKind::CleanupBaseline,
+                _ => panic!("unknown capability kind"),
+            };
+            producer
+                .push(EvidenceEvent {
+                    kind,
+                    peer: spec.peer,
+                    generation: spec.generation,
+                    token: spec.token,
+                    arg0: spec.arg0,
+                    arg1: spec.arg1,
+                })
+                .expect("controller event accepted");
+        }
+
+        let mut transcript = b"controller diagnostic\n".to_vec();
+        for sequence in 0..producer.len() {
+            transcript.extend_from_slice(
+                &producer
+                    .encoded(sequence)
+                    .expect("complete controller transcript"),
+            );
+        }
+        transcript.extend_from_slice(&terminal("01", h_request::I_CAPABILITY_TEST_ID, 0));
+
+        let parsed = parse_transcript(&transcript, &request)
+            .expect("host rejected the real controller encoder");
+        assert_eq!(parsed.terminal.outcome, GuestOutcome::Pass);
+        assert_eq!(
+            parsed.evidence.expect("validated evidence").observed_mask,
+            h_request::I_CAPABILITY_REQUIRED_EVIDENCE_MASK
+        );
+        fs::remove_dir_all(root).expect("remove producer fixture");
     }
 
     #[test]
@@ -3973,6 +4064,12 @@ mod tests {
         let mut wrong_memory_rights = valid.clone();
         wrong_memory_rights[3].arg1 ^= DW_RIGHT_INSPECT.0;
         cases.push(wrong_memory_rights);
+        let mut zero_queue_fill = valid.clone();
+        zero_queue_fill[4].arg1 = 0;
+        cases.push(zero_queue_fill);
+        let mut unbounded_queue_fill = valid.clone();
+        unbounded_queue_fill[4].arg1 = WYR0_I_CHANNEL_BACKPRESSURE_ATTEMPT_LIMIT;
+        cases.push(unbounded_queue_fill);
         let mut wrong_cancellation_reason = valid.clone();
         wrong_cancellation_reason[6].arg0 = u64::from(deepwyrm_abi::DW_TERMINATION_NORMAL_EXIT.0);
         cases.push(wrong_cancellation_reason);

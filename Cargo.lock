@@ -253,4 +253,5 @@ version = "0.0.0"
 dependencies = [
  "deepwyrm-abi",
  "wyrmroot-bootfs",
+ "wyrmroot-i-capability",
 ]

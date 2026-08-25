@@ -6,7 +6,6 @@ pub const WRCAP1_RECORD_BYTES: usize = 117;
 pub const WRCAP1_EVENT_COUNT: usize = 15;
 pub const REQUIRED_CAPABILITY_MASK: u16 = (1 << 10) - 1;
 
-pub const CONTENT_TOKEN: u64 = 0x2401_0001;
 pub const NORMAL_TRANSACTION: u64 = 0x2402_0001;
 pub const MEMORY_TRANSACTION: u64 = 0x2403_0001;
 pub const CHANNEL_TOKEN: u64 = 0x2404_0001;
@@ -17,6 +16,7 @@ pub const EXHAUST_TRANSACTION_BASE: u64 = 0x2408_0000;
 
 pub const MEMORY_PAGE_BYTES: u64 = wyrmroot_runtime::PAGE_SIZE;
 pub const MEMORY_CHILD_RIGHTS_MASK: u64 = DW_RIGHT_READ.0 | DW_RIGHT_MAP.0 | DW_RIGHT_INSPECT.0;
+pub const CHANNEL_BACKPRESSURE_ATTEMPT_LIMIT: u64 = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -190,8 +190,9 @@ fn validate_join(index: usize, event: EvidenceEvent) -> Result<(), EvidenceError
         0 => {
             event.peer == 0
                 && event.generation == 0
-                && event.token == CONTENT_TOKEN
                 && event.kind == EvidenceKind::ContentDelivery
+                && event.token != 0
+                && event.token == event.arg0 ^ event.arg1
         }
         1 => process_join(event, 1),
         2 => process_join(event, 2),
@@ -203,7 +204,8 @@ fn validate_join(index: usize, event: EvidenceEvent) -> Result<(), EvidenceError
         4 => {
             peer_join(event, EvidenceKind::ChannelLifecycle, 1, 1, CHANNEL_TOKEN)
                 && event.arg0 == 0xF
-                && event.arg1 == 32
+                && event.arg1 > 0
+                && event.arg1 < CHANNEL_BACKPRESSURE_ATTEMPT_LIMIT
         }
         5 => {
             peer_join(event, EvidenceKind::WaitEventTimer, 1, 1, WAIT_TOKEN)
@@ -417,14 +419,7 @@ mod tests {
             Err(EvidenceError::KindOrder)
         );
         transcript
-            .push(event(
-                EvidenceKind::ContentDelivery,
-                0,
-                0,
-                CONTENT_TOKEN,
-                2,
-                3,
-            ))
+            .push(event(EvidenceKind::ContentDelivery, 0, 0, 1, 2, 3))
             .unwrap();
         assert_eq!(
             transcript.push(event(
@@ -463,7 +458,7 @@ mod tests {
     fn complete_transcript() -> EvidenceTranscript {
         let mut transcript = EvidenceTranscript::new(0x0123_4567_89AB_CDEF).unwrap();
         for item in [
-            event(EvidenceKind::ContentDelivery, 0, 0, CONTENT_TOKEN, 2, 3),
+            event(EvidenceKind::ContentDelivery, 0, 0, 1, 2, 3),
             event(
                 EvidenceKind::ProcessLifecycle,
                 1,
@@ -488,7 +483,7 @@ mod tests {
                 4096,
                 MEMORY_CHILD_RIGHTS_MASK,
             ),
-            event(EvidenceKind::ChannelLifecycle, 1, 1, CHANNEL_TOKEN, 0xF, 32),
+            event(EvidenceKind::ChannelLifecycle, 1, 1, CHANNEL_TOKEN, 0xF, 2),
             event(EvidenceKind::WaitEventTimer, 1, 1, WAIT_TOKEN, 0xF, 0),
             event(
                 EvidenceKind::Cancellation,
