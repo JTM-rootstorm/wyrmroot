@@ -25,6 +25,12 @@ This file defines the minimum architecture reading set for Wyrmroot implementati
 - [`Plans/WYR0_D0_PRIMORDIAL_STARTUP_CONTRACT.md`](WYR0_D0_PRIMORDIAL_STARTUP_CONTRACT.md) defines the paired native startup stack/register, bootstrap Channel wire/role, capability-validation, bootfs mapping/lifetime, and READY/exit contract. Read it before WYR0-D implementation.
 - [`Plans/WYR0_E0_USERSPACE_PROCESS_LOADING_CONTRACT.md`](WYR0_E0_USERSPACE_PROCESS_LOADING_CONTRACT.md) defines the paired static ELF subset, userspace child-construction transaction, capability delegation, rollback, readiness, and exit-observation contract. Read it before WYR0-E/F/G implementation.
 - [`Plans/WYR0_I_NATIVE_CAPABILITY_CONTRACT.md`](WYR0_I_NATIVE_CAPABILITY_CONTRACT.md) defines the generic WYR0-I native capability, bounded supervision/restart, readiness accounting/enforcement classification, peer/generation, and evidence contract. Read it before WYR0-I B/C/D/E/F implementation or any later consumer relies on the DW0-H/WYR0-I capability certificate.
+- [`Plans/WYR0_I_VALIDATION.md`](WYR0_I_VALIDATION.md),
+  [`Plans/WYR0_COMPLETION_REPORT.md`](WYR0_COMPLETION_REPORT.md), and
+  [`security/WYR0_SECURITY_REVIEW.md`](../security/WYR0_SECURITY_REVIEW.md)
+  are the accepted WYR0-I validation, WYR0 completion, and exact-candidate
+  security records. Later consumers require their exact certified tuple and
+  evidence; the generic contract alone is not an acceptance certificate.
 
 ## Forward subsystem architecture
 

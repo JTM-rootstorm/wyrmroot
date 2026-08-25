@@ -558,6 +558,16 @@ The integration test observes that `init0` created `hello` from userspace, `hell
 
 All WYR0 host and integration tests pass from a clean checkout using documented commands.
 
+**Accepted 2026-08-25:** Phase WYR0-I and the WYR0 milestone are complete on
+Deepwyrm `5a8bb0a75979bb3ecde9bd7209619e924ec5e36d`, Wyrmroot product
+`ec84cc6441db15de83d55329ac442a01988c52e9`, and Rust
+`a92dc7f7464ad6ddfece4402bd7b86dbfa86166d`. See
+`Plans/WYR0_I_VALIDATION.md` for the exact clean-build, host, q35/OVMF,
+artifact, capability-certificate, and evidence identities;
+`security/WYR0_SECURITY_REVIEW.md` for the exact-candidate C0/H0/M0/L0 final
+security disposition; and `Plans/WYR0_COMPLETION_REPORT.md` for phases A-I,
+nonclaims, and WYR1 prerequisites. WYR0-GW remains a separate workload gate.
+
 ---
 
 # 7. Testing strategy
