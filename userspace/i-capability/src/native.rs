@@ -15,19 +15,19 @@ use wyrmroot_loader::{
         HEADER_BYTES, INIT0_BYTES, LaunchProfile, encode_ready, encode_ready_for_profile,
         parse_init, parse_ready, parse_ready_for_profile,
     },
-    process::{LoadAuthority, LoadRequest, LoadedProcess, load_process},
+    process::{LoadAuthority, LoadError, LoadRequest, LoadStage, LoadedProcess, load_process},
 };
 use wyrmroot_runtime::{
     AccountedResource, AccountingError, AttemptFailure, BOOTSTRAP_CHANNEL_EXPECTATION,
-    CleanupDisposition, LOADER_TASK_GROUP_EXPECTATION, MappingPlan, NativeLoaderPlatform,
-    ReadinessAccounting, ReservationRequest, RestartState, RestartSupervisor,
+    CleanupDisposition, LOADER_TASK_GROUP_EXPECTATION, MappingPlan, NativeError,
+    NativeLoaderPlatform, ReadinessAccounting, ReservationRequest, RestartState, RestartSupervisor,
     SELF_ROOT_EXPECTATION, TerminalDisposition, WYR0_I_SUPERVISION_POLICY, cancel_timer,
     close_handle, create_channel, create_event, create_memory_object, create_task_group,
     create_timer, duplicate_handle, map_bootfs_read_only, map_memory_read_only,
-    map_memory_read_write, monotonic_active_now, monotonic_deadline_after, query_capability_info,
-    query_memory_object_size, query_task_termination_info, receive_channel, send_channel,
-    set_timer, signal_event, supervise_native_child, terminate_process, unmap_bootfs, unmap_memory,
-    validate_bootstrap_channel, validate_successful_exit, wait_one,
+    map_memory_read_write, monotonic_active_now, monotonic_deadline_after, native_error_code,
+    query_capability_info, query_memory_object_size, query_task_termination_info, receive_channel,
+    send_channel, set_timer, signal_event, supervise_native_child, terminate_process, unmap_bootfs,
+    unmap_memory, validate_bootstrap_channel, validate_successful_exit, wait_one,
 };
 
 use crate::evidence::{
@@ -1077,8 +1077,53 @@ fn load_child(
             transaction_id: transaction,
         },
     )
-    .map_err(|_| failure(stage, operation + 1))?;
+    .map_err(|error| failure(stage, load_error_operation(error)))?;
     Ok((loaded, group))
+}
+
+/// Encodes the exact reusable-loader stage, rollback state, and bounded native
+/// cause into the operation half of `0x24SSOOOO` failures. This keeps a failed
+/// live candidate actionable even when no WRCAP record was publishable.
+const fn load_error_operation(error: LoadError<NativeError>) -> u16 {
+    match error {
+        LoadError::Platform {
+            stage,
+            cause,
+            rollback_failed,
+        } => {
+            let encoded_cause = native_error_code(cause);
+            let output = if encoded_cause & 0x8000 != 0 {
+                0x0200
+            } else {
+                0
+            };
+            0x8000
+                | if rollback_failed { 0x4000 } else { 0 }
+                | (load_stage_code(stage) << 10)
+                | output
+                | (encoded_cause as u16 & 0x01ff)
+        }
+        LoadError::Elf(_) => 0xf001,
+        LoadError::Startup(_) => 0xf002,
+        LoadError::Launch(_) => 0xf003,
+    }
+}
+
+const fn load_stage_code(stage: LoadStage) -> u16 {
+    match stage {
+        LoadStage::ChannelCreate => 1,
+        LoadStage::ChannelReduce => 2,
+        LoadStage::ProcessCreate => 3,
+        LoadStage::MemoryCreate => 4,
+        LoadStage::ParentMaterialize => 5,
+        LoadStage::ParentUnmap => 6,
+        LoadStage::ChildMap => 7,
+        LoadStage::ThreadCreate => 8,
+        LoadStage::CapabilityDuplicate => 9,
+        LoadStage::InitSend => 10,
+        LoadStage::ThreadStart => 11,
+        LoadStage::SuccessCleanup => 12,
+    }
 }
 
 fn wait_ready(
@@ -1281,4 +1326,31 @@ const fn event(
 
 fn memory_pattern(index: usize) -> u8 {
     (index as u8).wrapping_mul(37).wrapping_add(0x5A)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loader_failure_operation_preserves_stage_cause_and_rollback() {
+        assert_eq!(
+            load_error_operation(LoadError::Platform {
+                stage: LoadStage::ProcessCreate,
+                cause: NativeError::Status(deepwyrm_syscall::DwStatus(-13)),
+                rollback_failed: false,
+            }),
+            0x8c0d
+        );
+        assert_eq!(
+            load_error_operation(LoadError::Platform {
+                stage: LoadStage::ThreadCreate,
+                cause: NativeError::Output(
+                    wyrmroot_runtime::NativeOutputError::InvalidLoaderOutput,
+                ),
+                rollback_failed: true,
+            }),
+            0xe205
+        );
+    }
 }
