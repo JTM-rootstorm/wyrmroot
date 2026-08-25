@@ -559,6 +559,7 @@ struct SmokeSupervisor {
     ready_handle_count: usize,
     termination_query_error: bool,
     termination_state: DwTaskState,
+    termination_application_code: u32,
     termination_queries: usize,
     exit_on_query: Option<usize>,
     transaction_id: u64,
@@ -579,6 +580,7 @@ impl SmokeSupervisor {
             ready_handle_count: 0,
             termination_query_error: false,
             termination_state: DW_TASK_STATE_EXITED,
+            termination_application_code: 0,
             termination_queries: 0,
             exit_on_query: None,
             transaction_id: 2,
@@ -606,6 +608,7 @@ impl SmokeSupervisor {
             ready_handle_count: 0,
             termination_query_error: false,
             termination_state: DW_TASK_STATE_EXITED,
+            termination_application_code: 0,
             termination_queries: 0,
             exit_on_query: None,
             transaction_id: 2,
@@ -729,6 +732,7 @@ impl SupervisionPlatform for SmokeSupervisor {
             version: 1,
             state,
             reason: DW_TERMINATION_NORMAL_EXIT,
+            application_code: self.termination_application_code,
             ..DwTaskTerminationInfoV1::default()
         })
     }
@@ -893,6 +897,32 @@ fn capability_bootstrap_rejects_malformed_first_relay_record_before_supervision(
         fixture.closed,
         [DwHandle(42), DwHandle(43), ROOT, BOOTFS, TASK_GROUP]
     );
+}
+
+#[cfg(feature = "i-capability-relay")]
+#[test]
+fn capability_bootstrap_preserves_terminal_child_failure_before_relay_cleanup() {
+    let image = executable();
+    let mut fixture = Fixture::valid();
+    fixture.bootfs = bootfs(&[(INIT0_PATH, &image), (HELLO_PATH, b"hello")]);
+    let mut loader = SmokeLoader::init0();
+    let mut supervisor = SmokeSupervisor::successful_init0();
+    supervisor.relay_events = &[DW_SIGNAL_PEER_CLOSED];
+    supervisor.termination_application_code = 0x2408_0130;
+
+    assert_eq!(
+        run_init0_capability_bootstrap(
+            &mut fixture,
+            &mut loader,
+            &mut supervisor,
+            CHANNEL,
+            DwDeadline(99),
+        ),
+        Err(BootstrapError::Supervision(SupervisionError::Exit(
+            wyrmroot_runtime::ExitValidationError::NonzeroApplicationCode(0x2408_0130),
+        )))
+    );
+    assert!(loader.terminated.is_empty());
 }
 
 #[cfg(feature = "i-capability-relay")]

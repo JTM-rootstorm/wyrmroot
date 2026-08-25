@@ -640,8 +640,16 @@ fn run_init0_bootstrap_with_fault_and_before_supervision<
             bootstrap_channel,
             deadline,
         ) {
-            if let Err(cleanup) = cleanup_loaded_process(system, loader, loaded, true) {
-                return Err(BootstrapError::Cleanup(cleanup));
+            let terminal = supervisor
+                .query_task_termination(loaded.process)
+                .ok()
+                .filter(|info| info.state == DW_TASK_STATE_EXITED);
+            let cleanup_exit =
+                cleanup_supervised_process(system, loader, supervisor, loaded, terminal.is_none())
+                    .map_err(BootstrapError::Cleanup)?;
+            if let Some(info) = terminal.or(cleanup_exit) {
+                validate_successful_exit(&info)
+                    .map_err(|error| BootstrapError::Supervision(SupervisionError::Exit(error)))?;
             }
             return Err(error);
         }
