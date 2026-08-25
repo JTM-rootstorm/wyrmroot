@@ -1,6 +1,6 @@
 //! WYR0-H exact-artifact image, q35/OVMF, GDB, and integration tooling.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
@@ -267,6 +267,20 @@ struct CandidateDigests {
     candidate: String,
 }
 
+#[derive(Debug)]
+struct CertificateIdentity {
+    deepwyrm_abi_tree: String,
+    generated_schema_bound: bool,
+    rust_target: String,
+    rust_toolchain_name: String,
+    llvm_build_version: String,
+    rust_lld_sha256: String,
+    llvm_sha256: String,
+    versions_sha256: String,
+    profiles_sha256: String,
+    accepted_toolchain_request_sha256: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum CapabilityEvidenceKind {
     ContentDelivery,
@@ -366,12 +380,20 @@ pub(crate) fn build(request_path: &str) -> Result<String, Failure> {
         write_provenance(&outputs, &request, &artifacts)?;
         inspect_loaded(&request, &artifacts)
     })();
-    if result.is_err() {
-        remove_created(&outputs, &request.provenance, "provenance");
-        remove_created(&outputs, &request.esp, "ESP");
-        remove_created(&outputs, &request.bootfs, "bootfs");
+    match result {
+        Ok(result) => Ok(result),
+        Err(error) => Err(with_rollback(
+            error,
+            rollback_created(
+                &outputs,
+                &[
+                    (&request.provenance, "provenance"),
+                    (&request.esp, "ESP"),
+                    (&request.bootfs, "bootfs"),
+                ],
+            ),
+        )),
     }
-    result
 }
 
 pub(crate) fn inspect(request_path: &str) -> Result<String, Failure> {
@@ -421,10 +443,17 @@ pub(crate) fn integration(
             write_provenance(&outputs, &request, &artifacts)
         })();
         if let Err(error) = result {
-            remove_created(&outputs, &request.provenance, "provenance");
-            remove_created(&outputs, &request.esp, "ESP");
-            remove_created(&outputs, &request.bootfs, "bootfs");
-            return Err(error);
+            return Err(with_rollback(
+                error,
+                rollback_created(
+                    &outputs,
+                    &[
+                        (&request.provenance, "provenance"),
+                        (&request.esp, "ESP"),
+                        (&request.bootfs, "bootfs"),
+                    ],
+                ),
+            ));
         }
     }
     let inspection = inspect_loaded(&request, &artifacts)?;
@@ -621,36 +650,7 @@ fn write_capability_certificate(
         ));
     }
 
-    let repository = crate::tasks::repository_root()?;
-    let workspace = repository
-        .parent()
-        .ok_or_else(|| Failure::task("Wyrmroot repository has no workspace parent"))?;
-    let deepwyrm = workspace.join("deepwyrm");
-    let abi_tree = git_output(&deepwyrm, &["rev-parse", "HEAD:abi"], "Deepwyrm")?;
-    let abi_tree = abi_tree.trim();
-    if abi_tree.len() != 40
-        || !abi_tree
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(Failure::task(
-            "Deepwyrm ABI tree identity is not a full lowercase Git object ID",
-        ));
-    }
-    let manifest = crate::metadata::BuildManifest::load(&repository)?;
-    let rust_toolchain_name = manifest.rust_toolchain_name()?;
-    let versions_sha256 = digest(
-        &repository.join("toolchain/versions.toml"),
-        "toolchain versions",
-    )?;
-    let profiles_sha256 = digest(
-        &repository.join("toolchain/profiles.toml"),
-        "toolchain profiles",
-    )?;
-    let toolchain_request_sha256 = digest(
-        &repository.join("toolchain/requests/RUST-WYR0-I-B-SYSROOTS-007.toml"),
-        "accepted toolchain identity request",
-    )?;
+    let identity = certificate_identity(request)?;
     let provenance_sha256 = digest(&request.provenance, "WYR0-H provenance")?;
     let default_sha256 = sha256::bytes_digest(default.as_bytes());
     let smp_sha256 = sha256::bytes_digest(smp.as_bytes());
@@ -672,10 +672,10 @@ fn write_capability_certificate(
             "\"source\":{{\"deepwyrm_revision\":\"{}\",\"deepwyrm_clean\":true,",
             "\"wyrmroot_revision\":\"{}\",\"wyrmroot_clean\":true,",
             "\"rust_revision\":\"{}\",\"rust_clean\":true}},",
-            "\"abi\":{{\"deepwyrm_abi_tree\":\"{}\",\"generated_schema_bound\":true}},",
+            "\"abi\":{{\"deepwyrm_abi_tree\":\"{}\",\"generated_schema_bound\":{}}},",
             "\"toolchain\":{{\"rust_target\":\"{}\",\"rust_toolchain_name\":\"{}\",",
-            "\"llvm_build_version\":\"22.1.6\",\"clang_identity\":\"clang\",",
-            "\"lld_identity\":\"ld.lld/rust-lld\",",
+            "\"llvm_build_version\":\"{}\",\"rust_lld_sha256\":\"{}\",",
+            "\"llvm_sha256\":\"{}\",",
             "\"versions_sha256\":\"{}\",\"profiles_sha256\":\"{}\",",
             "\"accepted_toolchain_request_sha256\":\"{}\"}},",
             "\"artifacts\":{{\"candidate_sha256\":\"{}\",\"request_sha256\":\"{}\",",
@@ -705,12 +705,16 @@ fn write_capability_certificate(
         request.deepwyrm_revision,
         request.wyrmroot_revision,
         request.rust_revision,
-        abi_tree,
-        WYR0_I_RUST_TARGET,
-        rust_toolchain_name,
-        versions_sha256,
-        profiles_sha256,
-        toolchain_request_sha256,
+        identity.deepwyrm_abi_tree,
+        identity.generated_schema_bound,
+        identity.rust_target,
+        identity.rust_toolchain_name,
+        identity.llvm_build_version,
+        identity.rust_lld_sha256,
+        identity.llvm_sha256,
+        identity.versions_sha256,
+        identity.profiles_sha256,
+        identity.accepted_toolchain_request_sha256,
         digests.candidate,
         digests.request,
         provenance_sha256,
@@ -773,26 +777,247 @@ fn write_capability_outputs(
     certificate: &[u8],
     summary: &[u8],
 ) -> Result<(), Failure> {
+    // The summary is intentionally staged before the authoritative certificate.
+    // A surviving certificate is therefore an all-or-nothing publication marker:
+    // readers never treat a standalone, earlier certificate as accepted evidence.
     write_new(
-        outputs,
-        &capability.certificate,
-        certificate,
-        "WYR0-I capability certificate",
-    )?;
-    if let Err(error) = write_new(
         outputs,
         &capability.capability_summary,
         summary,
         "WYR0-I capability summary",
+    )?;
+    if let Err(error) = write_new(
+        outputs,
+        &capability.certificate,
+        certificate,
+        "WYR0-I capability certificate",
     ) {
-        remove_created(
-            outputs,
-            &capability.certificate,
-            "WYR0-I capability certificate",
-        );
-        return Err(error);
+        return Err(with_rollback(
+            error,
+            rollback_created(
+                outputs,
+                &[(&capability.capability_summary, "WYR0-I capability summary")],
+            ),
+        ));
     }
     Ok(())
+}
+
+/// Derives every certificate identity claim from the checked-in binding and the
+/// accepted immutable toolchain record.  In particular, the host's currently
+/// installed LLVM programs are not evidence about the toolchain that produced
+/// a WYR0-I candidate.
+fn certificate_identity(request: &HRequest) -> Result<CertificateIdentity, Failure> {
+    let repository = crate::tasks::repository_root()?;
+    let deepwyrm = repository
+        .ancestors()
+        .skip(1)
+        .map(|ancestor| ancestor.join("deepwyrm"))
+        .find(|candidate| candidate.is_dir())
+        .ok_or_else(|| Failure::task("could not locate the sibling Deepwyrm repository"))?;
+    let manifest = crate::metadata::BuildManifest::load(&repository)?;
+    // This validates the canonical Cargo.toml/Cargo.lock dependency, its real
+    // consumers, and the no-private-ABI policy before we attest that the
+    // candidate ABI is equivalent to that generated binding.
+    manifest.validate_host_build_readiness(&repository)?;
+    if manifest.rust_revision()? != request.rust_revision {
+        return Err(Failure::task(
+            "accepted Wyrmroot toolchain manifest does not bind the request Rust revision",
+        ));
+    }
+
+    let consumer_revision = manifest.deepwyrm_revision()?;
+    let consumer_spec = format!("{consumer_revision}:abi");
+    let candidate_spec = format!("{}:abi", request.deepwyrm_revision);
+    let consumer_abi_tree = git_output(&deepwyrm, &["rev-parse", &consumer_spec], "Deepwyrm")?;
+    let candidate_abi_tree = git_output(&deepwyrm, &["rev-parse", &candidate_spec], "Deepwyrm")?;
+    let consumer_abi_tree = required_git_object(
+        consumer_abi_tree.trim(),
+        "Wyrmroot's generated Deepwyrm ABI binding",
+    )?;
+    let candidate_abi_tree = required_git_object(
+        candidate_abi_tree.trim(),
+        "certificate candidate Deepwyrm ABI tree",
+    )?;
+    if consumer_abi_tree != candidate_abi_tree {
+        return Err(Failure::task(
+            "certificate candidate ABI tree differs from Wyrmroot's generated ABI binding",
+        ));
+    }
+
+    let versions_path = repository.join("toolchain/versions.toml");
+    let versions = identity_toml(&versions_path, "toolchain versions")?;
+    let rust_target =
+        required_identity_value(&versions, "rust.native_target", "toolchain versions")?;
+    if rust_target != WYR0_I_RUST_TARGET {
+        return Err(Failure::task(format!(
+            "accepted toolchain native target is '{rust_target}', expected '{WYR0_I_RUST_TARGET}'"
+        )));
+    }
+
+    let accepted_request_path =
+        repository.join("toolchain/requests/RUST-WYR0-I-B-SYSROOTS-007.toml");
+    let accepted = identity_toml(
+        &accepted_request_path,
+        "accepted toolchain identity request",
+    )?;
+    if required_identity_value(&accepted, "status", "accepted toolchain identity request")?
+        != "accepted-immutable-artifact"
+    {
+        return Err(Failure::task(
+            "WYR0-I toolchain identity record is not an accepted immutable artifact",
+        ));
+    }
+    if required_identity_value(
+        &accepted,
+        "rust.accepted_commit",
+        "accepted toolchain identity request",
+    )? != request.rust_revision
+    {
+        return Err(Failure::task(
+            "accepted toolchain identity record does not bind the request Rust revision",
+        ));
+    }
+    let rust_toolchain_name = required_identity_value(
+        &accepted,
+        "rust.requested_toolchain_name",
+        "accepted toolchain identity request",
+    )?;
+    if rust_toolchain_name != manifest.rust_toolchain_name()? {
+        return Err(Failure::task(
+            "accepted toolchain identity record does not match toolchain/versions.toml",
+        ));
+    }
+    let llvm_build_version = required_identity_value(
+        &accepted,
+        "build.llvm_version",
+        "accepted toolchain identity request",
+    )?;
+    let rust_lld_sha256 = required_sha256_identity_value(
+        &accepted,
+        "artifacts.rust_lld_sha256",
+        "accepted toolchain identity request",
+    )?;
+    let llvm_sha256 = required_sha256_identity_value(
+        &accepted,
+        "artifacts.llvm_sha256",
+        "accepted toolchain identity request",
+    )?;
+
+    Ok(CertificateIdentity {
+        deepwyrm_abi_tree: candidate_abi_tree,
+        generated_schema_bound: true,
+        rust_target,
+        rust_toolchain_name,
+        llvm_build_version,
+        rust_lld_sha256,
+        llvm_sha256,
+        versions_sha256: digest(&versions_path, "toolchain versions")?,
+        profiles_sha256: digest(
+            &repository.join("toolchain/profiles.toml"),
+            "toolchain profiles",
+        )?,
+        accepted_toolchain_request_sha256: digest(
+            &accepted_request_path,
+            "accepted toolchain identity request",
+        )?,
+    })
+}
+
+fn required_git_object(value: &str, label: &str) -> Result<String, Failure> {
+    if value.len() != 40
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(Failure::task(format!(
+            "{label} is not a full lowercase Git object ID"
+        )));
+    }
+    Ok(value.to_owned())
+}
+
+/// A deliberately narrow reader for the immutable records used by the
+/// certificate.  It accepts only single-line quoted scalar values and rejects
+/// a duplicate scalar key, so an ambiguous record cannot supply identity.
+fn identity_toml(path: &Path, label: &str) -> Result<BTreeMap<String, String>, Failure> {
+    let contents = fs::read_to_string(path)
+        .map_err(|error| Failure::task(format!("could not read {label}: {error}")))?;
+    let mut values = BTreeMap::new();
+    let mut section = String::new();
+    for (line_number, raw) in contents.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') && !line.starts_with("[[") {
+            section = line[1..line.len() - 1].to_owned();
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty()
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            || value.len() < 2
+            || !value.starts_with('"')
+            || !value.ends_with('"')
+        {
+            continue;
+        }
+        let value = &value[1..value.len() - 1];
+        if value.contains('"') || value.contains('\\') {
+            return Err(Failure::task(format!(
+                "{label} line {} has an unsupported escaped identity value",
+                line_number + 1
+            )));
+        }
+        let full_key = if section.is_empty() {
+            key.to_owned()
+        } else {
+            format!("{section}.{key}")
+        };
+        if values.insert(full_key.clone(), value.to_owned()).is_some() {
+            return Err(Failure::task(format!(
+                "{label} has a duplicate scalar identity key '{full_key}'"
+            )));
+        }
+    }
+    Ok(values)
+}
+
+fn required_identity_value(
+    values: &BTreeMap<String, String>,
+    key: &str,
+    label: &str,
+) -> Result<String, Failure> {
+    values
+        .get(key)
+        .cloned()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| Failure::task(format!("{label} omits required identity key '{key}'")))
+}
+
+fn required_sha256_identity_value(
+    values: &BTreeMap<String, String>,
+    key: &str,
+    label: &str,
+) -> Result<String, Failure> {
+    let value = required_identity_value(values, key, label)?;
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(Failure::task(format!(
+            "{label} key '{key}' is not a lowercase SHA-256 identity"
+        )));
+    }
+    Ok(value)
 }
 
 fn result_number_field(result: &str, field: &str) -> Result<u32, Failure> {
@@ -3274,8 +3499,10 @@ fn write_new(
     let mut output = outputs.create_new_file(path, label, false, true)?;
     if let Err(error) = output.write_all(bytes).and_then(|()| output.sync_all()) {
         drop(output);
-        remove_created(outputs, path, label);
-        return Err(Failure::task(format!("could not write {label}: {error}")));
+        return Err(with_rollback(
+            Failure::task(format!("could not write {label}: {error}")),
+            rollback_created(outputs, &[(path, label)]),
+        ));
     }
     Ok(())
 }
@@ -3303,8 +3530,31 @@ fn digest(path: &Path, label: &str) -> Result<String, Failure> {
         .map_err(|error| Failure::task(format!("could not hash {label}: {error}")))
 }
 
-fn remove_created(outputs: &CheckedOutputRoot, path: &Path, label: &str) {
-    outputs.remove_file(path, label);
+fn rollback_created(outputs: &CheckedOutputRoot, created: &[(&Path, &str)]) -> Result<(), Failure> {
+    let mut failures = Vec::new();
+    for (path, label) in created {
+        if let Err(error) = outputs.remove_file(path, label) {
+            failures.push(error.message);
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(Failure::task(format!(
+            "could not complete output rollback: {}",
+            failures.join("; ")
+        )))
+    }
+}
+
+fn with_rollback(mut primary: Failure, rollback: Result<(), Failure>) -> Failure {
+    if let Err(rollback) = rollback {
+        primary.message = format!(
+            "{}; partial WYR0-H outputs may remain because rollback failed: {}",
+            primary.message, rollback.message
+        );
+    }
+    primary
 }
 
 fn status_label(status: &ExitStatus) -> String {
@@ -4163,7 +4413,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_outputs_roll_back_when_either_create_new_step_fails() {
+    fn capability_summary_is_staged_before_certificate_and_rolls_back_on_certificate_failure() {
         let (root, request) = capability_request("certificate-rollback");
         let capability = request.capability.as_ref().expect("capability outputs");
         let outputs = CheckedOutputRoot::open(&request).expect("open output root");
@@ -4178,6 +4428,8 @@ mod tests {
             fs::read(&capability.certificate).unwrap(),
             b"existing certificate"
         );
+        // The summary was staged first and then removed when the authoritative
+        // create-new certificate publication collided.
         assert!(!capability.capability_summary.exists());
 
         fs::remove_file(&capability.certificate).expect("remove certificate collision");
@@ -4193,7 +4445,102 @@ mod tests {
             b"existing summary"
         );
 
+        fs::remove_file(&capability.capability_summary).expect("remove summary collision");
+        write_capability_outputs(&outputs, capability, b"new certificate", b"new summary")
+            .expect("publish staged summary and certificate");
+        assert_eq!(
+            fs::read(&capability.capability_summary).unwrap(),
+            b"new summary"
+        );
+        assert_eq!(
+            fs::read(&capability.certificate).unwrap(),
+            b"new certificate"
+        );
+
         fs::remove_dir_all(root).expect("remove rollback fixture");
+    }
+
+    #[test]
+    fn rollback_failures_are_reported_instead_of_suppressed() {
+        let (root, request) = capability_request("rollback-cleanup-failure");
+        let outputs = CheckedOutputRoot::open(&request).expect("open output root");
+        let stuck = root.join("stuck-output");
+        fs::create_dir(&stuck).expect("create non-file rollback target");
+
+        let error = with_rollback(
+            Failure::task("publication failed"),
+            rollback_created(&outputs, &[(&stuck, "stuck capability output")]),
+        );
+        assert!(error.message.contains("publication failed"));
+        assert!(error.message.contains("rollback failed"));
+        assert!(stuck.exists());
+
+        fs::remove_dir_all(root).expect("remove rollback fixture");
+    }
+
+    #[test]
+    fn identity_reader_rejects_duplicate_or_non_sha256_component_claims() {
+        let (root, _) = capability_request("certificate-identity-reader");
+        let path = root.join("identity.toml");
+        fs::write(
+            &path,
+            "[artifacts]\nrust_lld_sha256 = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n",
+        )
+        .expect("write identity fixture");
+        let values = identity_toml(&path, "identity fixture").expect("parse identity fixture");
+        assert_eq!(
+            required_sha256_identity_value(
+                &values,
+                "artifacts.rust_lld_sha256",
+                "identity fixture"
+            )
+            .unwrap(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+
+        fs::write(&path, "[artifacts]\nrust_lld_sha256 = \"not-a-sha256\"\n")
+            .expect("write invalid identity fixture");
+        let values =
+            identity_toml(&path, "identity fixture").expect("parse invalid identity fixture");
+        assert!(
+            required_sha256_identity_value(
+                &values,
+                "artifacts.rust_lld_sha256",
+                "identity fixture"
+            )
+            .is_err()
+        );
+
+        fs::write(
+            &path,
+            "[artifacts]\nrust_lld_sha256 = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\nrust_lld_sha256 = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"\n",
+        )
+        .expect("write duplicate identity fixture");
+        assert!(identity_toml(&path, "identity fixture").is_err());
+        fs::remove_dir_all(root).expect("remove identity fixture");
+    }
+
+    #[test]
+    fn certificate_identity_uses_the_accepted_record_not_host_llvm_programs() {
+        let (root, mut request) = capability_request("certificate-identity");
+        let deepwyrm = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .map(|ancestor| ancestor.join("deepwyrm"))
+            .find(|candidate| candidate.is_dir())
+            .expect("locate sibling Deepwyrm");
+        request.deepwyrm_revision = git_output(&deepwyrm, &["rev-parse", "HEAD"], "Deepwyrm")
+            .expect("read current Deepwyrm revision")
+            .trim()
+            .to_owned();
+        request.rust_revision = "a92dc7f7464ad6ddfece4402bd7b86dbfa86166d".to_owned();
+
+        let identity = certificate_identity(&request).expect("derive certificate identity");
+        assert!(identity.generated_schema_bound);
+        assert_eq!(identity.rust_target, WYR0_I_RUST_TARGET);
+        assert_eq!(identity.llvm_build_version, "22.1.6");
+        assert_eq!(identity.rust_lld_sha256.len(), 64);
+        assert_eq!(identity.llvm_sha256.len(), 64);
+        fs::remove_dir_all(root).expect("remove identity fixture");
     }
 
     #[test]

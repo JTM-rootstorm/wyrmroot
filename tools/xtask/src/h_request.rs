@@ -385,9 +385,19 @@ impl CheckedOutputRoot {
         }
     }
 
-    pub(crate) fn remove_file(&self, path: &Path, label: &str) {
-        if let Ok(target) = self.target(path, label) {
-            let _ = fs::remove_file(target.path());
+    /// Removes a request-root output that this invocation created.
+    ///
+    /// A rollback is part of the observable publication result.  Do not hide a
+    /// failed unlink: callers must retain the original failure *and* report
+    /// that a partial output may remain for operator recovery.
+    pub(crate) fn remove_file(&self, path: &Path, label: &str) -> Result<(), Failure> {
+        let target = self.target(path, label)?;
+        match fs::remove_file(target.path()) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(Failure::task(format!(
+                "could not remove WYR0-H {label} during rollback: {error}"
+            ))),
         }
     }
 }
