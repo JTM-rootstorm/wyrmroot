@@ -590,7 +590,7 @@ fn exercise_shared_memory(
         reserved: [0; 2],
     };
     send_channel(loaded.launch_channel, &command, &[moved])
-        .map_err(|_| failure(EvidenceKind::MemoryShare, 0x0212))?;
+        .map_err(|error| failure(EvidenceKind::MemoryShare, 0xb000 | native_cause(error)))?;
     close_handle(memory).map_err(|_| failure(EvidenceKind::MemoryShare, 0x0213))?;
     let mapping_valid = mapping
         .with_bytes(|bytes| {
