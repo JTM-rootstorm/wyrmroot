@@ -15,7 +15,8 @@ use wyrmroot_bootfs::builder::{Builder, FileMode};
 use crate::cli::{G3ImageArguments, HProfile};
 use crate::error::Failure;
 use crate::h_request::{
-    self, CheckedOutputRoot, EvidenceRequest, ExpectedOutcome, HRequest, I1_EVIDENCE_PROTOCOL,
+    self, CapabilityRequest, CheckedOutputRoot, EvidenceProtocol, EvidenceRequest, ExpectedOutcome,
+    HRequest,
 };
 use crate::sha256;
 
@@ -24,8 +25,15 @@ const MAX_FIRMWARE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_WYR0_H_ESP_SNAPSHOT_BYTES: u64 = crate::g3_image::IMAGE_BYTES;
 const MAX_SERIAL_BYTES: u64 = 16 * 1024 * 1024;
 const COMPLETION_RECORD_BYTES: usize = 38;
-const EVIDENCE_RECORD_BYTES: usize = 85;
+const DWEVID1_RECORD_BYTES: usize = 85;
+const WRCAP1_RECORD_BYTES: usize = 117;
 const MAX_EVIDENCE_RECORDS: usize = 64;
+const MAX_SELECTOR_CONTENT_BYTES: u64 = 64 * 1024;
+const WYR0_I_CONFIG_BOOTFS_PATH: &[u8] = b"test/wyr0-i/config.toml";
+const WYR0_I_ASSET_BOOTFS_PATH: &[u8] = b"test/wyr0-i/asset.bin";
+const WYR0_I_RUST_TARGET: &str = "x86_64-unknown-wyrmroot";
+const WYR0_I_INHERITED_I0_I1_I2: &str = "Plans/WYR0_H_VALIDATION.md";
+const WYR0_I_INHERITED_D0: &str = "../deepwyrm/security/DW0_H_SECURITY_REVIEW.md";
 const PROOF_CPU_ONLINE: u32 = 1 << 0;
 const PROOF_CPL3_SYSCALL: u32 = 1 << 1;
 const PROOF_BLOCKED_DESCENDANT: u32 = 1 << 2;
@@ -157,6 +165,8 @@ struct CandidateArtifacts {
     bootstrap: PathBuf,
     init0: PathBuf,
     hello: PathBuf,
+    selector_config: Option<PathBuf>,
+    selector_asset: Option<PathBuf>,
     ovmf_code: PathBuf,
     ovmf_vars_template: PathBuf,
 }
@@ -238,11 +248,76 @@ struct CandidateDigests {
     bootstrap: String,
     init0: String,
     hello: String,
+    selector_config: Option<String>,
+    selector_asset: Option<String>,
     bootfs: String,
     esp: String,
     ovmf_code: String,
     ovmf_vars_template: String,
     candidate: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum CapabilityEvidenceKind {
+    ContentDelivery,
+    ProcessLifecycle,
+    MemoryShare,
+    ChannelLifecycle,
+    WaitEventTimer,
+    Cancellation,
+    RestartReplacement,
+    RestartExhausted,
+    OverloadReplayRejected,
+    CleanupBaseline,
+}
+
+impl CapabilityEvidenceKind {
+    fn parse(value: u8) -> Option<Self> {
+        match value {
+            0x01 => Some(Self::ContentDelivery),
+            0x02 => Some(Self::ProcessLifecycle),
+            0x03 => Some(Self::MemoryShare),
+            0x04 => Some(Self::ChannelLifecycle),
+            0x05 => Some(Self::WaitEventTimer),
+            0x06 => Some(Self::Cancellation),
+            0x07 => Some(Self::RestartReplacement),
+            0x08 => Some(Self::RestartExhausted),
+            0x09 => Some(Self::OverloadReplayRejected),
+            0x0A => Some(Self::CleanupBaseline),
+            _ => None,
+        }
+    }
+
+    const fn value(self) -> u8 {
+        match self {
+            Self::ContentDelivery => 0x01,
+            Self::ProcessLifecycle => 0x02,
+            Self::MemoryShare => 0x03,
+            Self::ChannelLifecycle => 0x04,
+            Self::WaitEventTimer => 0x05,
+            Self::Cancellation => 0x06,
+            Self::RestartReplacement => 0x07,
+            Self::RestartExhausted => 0x08,
+            Self::OverloadReplayRejected => 0x09,
+            Self::CleanupBaseline => 0x0A,
+        }
+    }
+
+    const fn bit(self) -> u32 {
+        1_u32 << (self.value() - 1)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CapabilityEvidenceEvent {
+    sequence: u32,
+    kind: CapabilityEvidenceKind,
+    peer: u32,
+    generation: u32,
+    token: u64,
+    arg0: u64,
+    arg1: u64,
+    line: usize,
 }
 
 impl HProfile {
@@ -269,6 +344,7 @@ pub(crate) fn build(request_path: &str) -> Result<String, Failure> {
     require_absent(&outputs, &request.bootfs, "bootfs output")?;
     require_absent(&outputs, &request.esp, "ESP output")?;
     require_absent(&outputs, &request.provenance, "provenance output")?;
+    require_capability_outputs_absent(&outputs, &request)?;
 
     let bootfs = build_bootfs_bytes(&artifacts)?;
     write_new(&outputs, &request.bootfs, &bootfs, "bootfs")?;
@@ -351,6 +427,7 @@ pub(crate) fn integration(
             ExecutionKind::Integration,
         ),
         None => {
+            require_capability_outputs_absent(&outputs, &request)?;
             let default = execute(
                 HProfile::Default,
                 &request,
@@ -365,7 +442,7 @@ pub(crate) fn integration(
                 &outputs,
                 ExecutionKind::Integration,
             );
-            join_profile_results(&inspection, default, smp)
+            join_profile_results(&inspection, default, smp, &request, &artifacts, &outputs)
         }
     }
 }
@@ -386,7 +463,25 @@ fn join_profile_results(
     inspection: &str,
     default: Result<String, Failure>,
     smp: Result<String, Failure>,
+    request: &HRequest,
+    artifacts: &CandidateArtifacts,
+    outputs: &CheckedOutputRoot,
 ) -> Result<String, Failure> {
+    let (joined, default, smp) =
+        join_profile_result_json(inspection, default, smp, request.schema_version)?;
+    if request.schema_version == 4 {
+        let candidate = result_candidate_digest(&default)?;
+        write_capability_certificate(request, artifacts, outputs, &default, &smp, candidate)?;
+    }
+    Ok(joined)
+}
+
+fn join_profile_result_json(
+    inspection: &str,
+    default: Result<String, Failure>,
+    smp: Result<String, Failure>,
+    schema_version: u32,
+) -> Result<(String, String, String), Failure> {
     match (default, smp) {
         (Ok(default), Ok(smp)) => {
             let default_candidate = result_candidate_digest(&default)?;
@@ -396,16 +491,18 @@ fn join_profile_results(
                     "paired WYR0-H integration profiles consumed different run-local candidates",
                 ));
             }
-            Ok(format!(
+            let joined = format!(
                 concat!(
-                    "{{\"schema_version\":2,\"phase\":\"WYR0-H\",",
+                    "{{\"schema_version\":{},\"phase\":\"WYR0-H\",",
                     "\"status\":\"PASS\",\"same_media\":true,",
                     "\"inspection\":{},\"default\":{},\"smp\":{}}}\n"
                 ),
+                schema_version,
                 inspection.trim(),
                 default.trim(),
                 smp.trim()
-            ))
+            );
+            Ok((joined, default, smp))
         }
         (Err(default), Ok(_)) => Err(Failure::task(format!(
             "paired WYR0-H integration failed: default: {}",
@@ -444,12 +541,261 @@ fn result_candidate_digest(result: &str) -> Result<&str, Failure> {
     Ok(digest)
 }
 
+fn require_capability_outputs_absent(
+    outputs: &CheckedOutputRoot,
+    request: &HRequest,
+) -> Result<(), Failure> {
+    if let Some(capability) = &request.capability {
+        require_absent(
+            outputs,
+            &capability.certificate,
+            "WYR0-I certificate output",
+        )?;
+        require_absent(
+            outputs,
+            &capability.capability_summary,
+            "WYR0-I capability summary output",
+        )?;
+    }
+    Ok(())
+}
+
+fn write_capability_certificate(
+    request: &HRequest,
+    artifacts: &CandidateArtifacts,
+    outputs: &CheckedOutputRoot,
+    default: &str,
+    smp: &str,
+    paired_candidate: &str,
+) -> Result<(), Failure> {
+    let capability = request.capability.as_ref().ok_or_else(|| {
+        Failure::task("schema-4 paired integration has no certificate output contract")
+    })?;
+    let evidence = request.evidence.ok_or_else(|| {
+        Failure::task("schema-4 paired integration has no WRCAP1 request contract")
+    })?;
+    if evidence.protocol != EvidenceProtocol::Wrcap1 {
+        return Err(Failure::task(
+            "schema-4 paired integration is not bound to WRCAP1",
+        ));
+    }
+    for (result, profile) in [(default, "default"), (smp, "smp")] {
+        if !result.contains(&format!("\"profile\":\"{profile}\",\"status\":\"PASS\"")) {
+            return Err(Failure::task(format!(
+                "WYR0-I {profile} result is not a validated PASS profile"
+            )));
+        }
+        if result_number_field(result, "required_evidence_mask")? != evidence.required_mask
+            || result_number_field(result, "observed_evidence_mask")? != evidence.required_mask
+            || result_number_field(result, "evidence_event_count")? != 10
+        {
+            return Err(Failure::task(format!(
+                "WYR0-I {profile} result does not contain the exact fully validated capability evidence"
+            )));
+        }
+    }
+
+    verify_source_revisions(request)?;
+    let current = verify_candidate_inputs(request)?;
+    if &current != artifacts {
+        return Err(Failure::task(
+            "WYR0-I candidate paths changed before certificate publication",
+        ));
+    }
+    inspect_loaded(request, artifacts)?;
+    require_capability_outputs_absent(outputs, request)?;
+    let digests = candidate_digests(request, artifacts)?;
+    if digests.candidate != paired_candidate {
+        return Err(Failure::task(
+            "WYR0-I paired result does not match the revalidated certificate candidate",
+        ));
+    }
+
+    let repository = crate::tasks::repository_root()?;
+    let workspace = repository
+        .parent()
+        .ok_or_else(|| Failure::task("Wyrmroot repository has no workspace parent"))?;
+    let deepwyrm = workspace.join("deepwyrm");
+    let abi_tree = git_output(&deepwyrm, &["rev-parse", "HEAD:abi"], "Deepwyrm")?;
+    let abi_tree = abi_tree.trim();
+    if abi_tree.len() != 40
+        || !abi_tree
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(Failure::task(
+            "Deepwyrm ABI tree identity is not a full lowercase Git object ID",
+        ));
+    }
+    let manifest = crate::metadata::BuildManifest::load(&repository)?;
+    let rust_toolchain_name = manifest.rust_toolchain_name()?;
+    let versions_sha256 = digest(
+        &repository.join("toolchain/versions.toml"),
+        "toolchain versions",
+    )?;
+    let profiles_sha256 = digest(
+        &repository.join("toolchain/profiles.toml"),
+        "toolchain profiles",
+    )?;
+    let toolchain_request_sha256 = digest(
+        &repository.join("toolchain/requests/RUST-WYR0-I-B-SYSROOTS-007.toml"),
+        "accepted toolchain identity request",
+    )?;
+    let provenance_sha256 = digest(&request.provenance, "WYR0-H provenance")?;
+    let default_sha256 = sha256::bytes_digest(default.as_bytes());
+    let smp_sha256 = sha256::bytes_digest(smp.as_bytes());
+    let config_sha256 = digests
+        .selector_config
+        .as_ref()
+        .ok_or_else(|| Failure::task("WYR0-I candidate has no selector config digest"))?;
+    let asset_sha256 = digests
+        .selector_asset
+        .as_ref()
+        .ok_or_else(|| Failure::task("WYR0-I candidate has no selector asset digest"))?;
+
+    let certificate = format!(
+        concat!(
+            "{{\"schema_version\":1,",
+            "\"certificate_kind\":\"wyr0-i-native-userspace-capability\",",
+            "\"status\":\"PASS\",\"acceptance\":true,",
+            "\"selector\":\"native-userspace-capability\",\"test_id\":24,",
+            "\"source\":{{\"deepwyrm_revision\":\"{}\",\"deepwyrm_clean\":true,",
+            "\"wyrmroot_revision\":\"{}\",\"wyrmroot_clean\":true,",
+            "\"rust_revision\":\"{}\",\"rust_clean\":true}},",
+            "\"abi\":{{\"deepwyrm_abi_tree\":\"{}\",\"generated_schema_bound\":true}},",
+            "\"toolchain\":{{\"rust_target\":\"{}\",\"rust_toolchain_name\":\"{}\",",
+            "\"llvm_build_version\":\"22.1.6\",\"clang_identity\":\"clang\",",
+            "\"lld_identity\":\"ld.lld/rust-lld\",",
+            "\"versions_sha256\":\"{}\",\"profiles_sha256\":\"{}\",",
+            "\"accepted_toolchain_request_sha256\":\"{}\"}},",
+            "\"artifacts\":{{\"candidate_sha256\":\"{}\",\"request_sha256\":\"{}\",",
+            "\"provenance_sha256\":\"{}\",\"loader_sha256\":\"{}\",",
+            "\"kernel_sha256\":\"{}\",\"symbols_sha256\":\"{}\",",
+            "\"bootstrap_sha256\":\"{}\",\"init0_sha256\":\"{}\",",
+            "\"payload_sha256\":\"{}\",\"selector_config_sha256\":\"{}\",",
+            "\"selector_asset_sha256\":\"{}\",\"bootfs_sha256\":\"{}\",",
+            "\"esp_sha256\":\"{}\",\"ovmf_code_sha256\":\"{}\",",
+            "\"ovmf_vars_template_sha256\":\"{}\"}},",
+            "\"profiles\":{{\"same_immutable_media\":true,",
+            "\"default\":{{\"vcpu\":1,\"memory_mib\":1024,\"result_sha256\":\"{}\"}},",
+            "\"smp\":{{\"vcpu\":4,\"memory_mib\":2048,\"result_sha256\":\"{}\"}}}},",
+            "\"containment\":{{\"machine\":\"q35\",\"firmware\":\"OVMF\",",
+            "\"no_host_share\":true,\"no_network\":true}},",
+            "\"evidence\":{{\"protocol\":\"wrcap1\",\"version\":1,",
+            "\"nonce\":\"{:016X}\",\"required_mask\":{},\"observed_mask\":{},",
+            "\"event_count_per_profile\":10,\"result\":\"PASS\"}},",
+            "\"accounting_enforcement\":{{",
+            "\"kernel\":[\"bounded Channel envelope and native object invariants\"],",
+            "\"wyrmroot\":[\"controller-owned admission, reservation, replay, and cleanup classes\"],",
+            "\"future\":[\"generic hostile-peer TaskGroup resource quotas\"],",
+            "\"generic_kernel_quota_containment\":false}},",
+            "\"inherited_evidence\":{{\"i0_i1_i2\":\"{}\",\"d0\":\"{}\"}},",
+            "\"wyr0_gw_claimed\":false}}\n"
+        ),
+        request.deepwyrm_revision,
+        request.wyrmroot_revision,
+        request.rust_revision,
+        abi_tree,
+        WYR0_I_RUST_TARGET,
+        rust_toolchain_name,
+        versions_sha256,
+        profiles_sha256,
+        toolchain_request_sha256,
+        digests.candidate,
+        digests.request,
+        provenance_sha256,
+        digests.loader,
+        digests.kernel,
+        digests.symbols,
+        digests.bootstrap,
+        digests.init0,
+        digests.hello,
+        config_sha256,
+        asset_sha256,
+        digests.bootfs,
+        digests.esp,
+        digests.ovmf_code,
+        digests.ovmf_vars_template,
+        default_sha256,
+        smp_sha256,
+        evidence.nonce,
+        evidence.required_mask,
+        evidence.required_mask,
+        WYR0_I_INHERITED_I0_I1_I2,
+        WYR0_I_INHERITED_D0,
+    );
+    let certificate_sha256 = sha256::bytes_digest(certificate.as_bytes());
+    let summary = format!(
+        concat!(
+            "# WYR0-I Native Userspace Capability Summary\n\n",
+            "Status: **PASS** for `native-userspace-capability` test 24 on the same immutable candidate under default and SMP profiles.\n\n",
+            "- Candidate SHA-256: `{}`\n",
+            "- Certificate SHA-256: `{}`\n",
+            "- WRCAP1 nonce: `{:016X}`\n",
+            "- Required/observed capability mask: `0x{:08X}` / `0x{:08X}` on both profiles\n",
+            "- Selector content: `{}` and `{}`\n",
+            "- Inherited evidence: `{}` and `{}`\n",
+            "- Boundary: Wyrmroot controller admission is proven; generic hostile-peer TaskGroup quotas and WYR0-GW remain unclaimed.\n"
+        ),
+        digests.candidate,
+        certificate_sha256,
+        evidence.nonce,
+        evidence.required_mask,
+        evidence.required_mask,
+        String::from_utf8_lossy(WYR0_I_CONFIG_BOOTFS_PATH),
+        String::from_utf8_lossy(WYR0_I_ASSET_BOOTFS_PATH),
+        WYR0_I_INHERITED_I0_I1_I2,
+        WYR0_I_INHERITED_D0,
+    );
+
+    write_new(
+        outputs,
+        &capability.certificate,
+        certificate.as_bytes(),
+        "WYR0-I capability certificate",
+    )?;
+    if let Err(error) = write_new(
+        outputs,
+        &capability.capability_summary,
+        summary.as_bytes(),
+        "WYR0-I capability summary",
+    ) {
+        remove_created(
+            outputs,
+            &capability.certificate,
+            "WYR0-I capability certificate",
+        );
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn result_number_field(result: &str, field: &str) -> Result<u32, Failure> {
+    let marker = format!("\"{field}\":");
+    let start = result
+        .find(&marker)
+        .map(|index| index + marker.len())
+        .ok_or_else(|| Failure::task(format!("WYR0-I result omitted '{field}'")))?;
+    let end = result[start..]
+        .find(|character: char| !character.is_ascii_digit())
+        .map(|length| start + length)
+        .ok_or_else(|| Failure::task(format!("WYR0-I result has an invalid '{field}'")))?;
+    if end == start {
+        return Err(Failure::task(format!(
+            "WYR0-I result has an invalid '{field}'"
+        )));
+    }
+    result[start..end]
+        .parse()
+        .map_err(|_| Failure::task(format!("WYR0-I result has an invalid '{field}'")))
+}
+
 fn inspect_loaded(request: &HRequest, artifacts: &CandidateArtifacts) -> Result<String, Failure> {
     let expected_bootfs = build_bootfs_bytes(artifacts)?;
     let actual_bootfs = read_regular(&request.bootfs, "bootfs", MAX_GUEST_ARTIFACT_BYTES)?;
     if actual_bootfs != expected_bootfs {
         return Err(Failure::task(
-            "WYR0-H bootfs does not contain the exact current init0 and hello bytes",
+            "WYR0-H bootfs does not contain the exact current selector-bound content",
         ));
     }
     let image_report = crate::g3_image::inspect(&image_arguments(request, artifacts))?;
@@ -511,6 +857,28 @@ fn verify_candidate_inputs(request: &HRequest) -> Result<CandidateArtifacts, Fai
             MAX_GUEST_ARTIFACT_BYTES,
         )?,
         hello: h_request::canonical_regular(&request.hello, "bin/hello", MAX_GUEST_ARTIFACT_BYTES)?,
+        selector_config: request
+            .capability
+            .as_ref()
+            .map(|capability| {
+                h_request::canonical_regular(
+                    &capability.selector_config,
+                    "WYR0-I selector config",
+                    MAX_SELECTOR_CONTENT_BYTES,
+                )
+            })
+            .transpose()?,
+        selector_asset: request
+            .capability
+            .as_ref()
+            .map(|capability| {
+                h_request::canonical_regular(
+                    &capability.selector_asset,
+                    "WYR0-I selector asset",
+                    MAX_SELECTOR_CONTENT_BYTES,
+                )
+            })
+            .transpose()?,
         ovmf_code: h_request::canonical_regular(
             &request.ovmf_code,
             "OVMF code",
@@ -539,6 +907,13 @@ fn verify_candidate_inputs(request: &HRequest) -> Result<CandidateArtifacts, Fai
             )));
         }
     }
+    if let (Some(config), Some(asset), Some(evidence)) = (
+        artifacts.selector_config.as_ref(),
+        artifacts.selector_asset.as_ref(),
+        request.evidence,
+    ) {
+        validate_selector_config(config, asset, evidence.nonce)?;
+    }
     if digest(&artifacts.kernel, "deepwyrm.elf")? != digest(&artifacts.symbols, "Deepwyrm symbols")?
     {
         return Err(Failure::task(
@@ -551,6 +926,18 @@ fn verify_candidate_inputs(request: &HRequest) -> Result<CandidateArtifacts, Fai
 fn build_bootfs_bytes(artifacts: &CandidateArtifacts) -> Result<Vec<u8>, Failure> {
     let init0 = read_regular(&artifacts.init0, "init0", MAX_GUEST_ARTIFACT_BYTES)?;
     let hello = read_regular(&artifacts.hello, "hello", MAX_GUEST_ARTIFACT_BYTES)?;
+    let selector_content = match (&artifacts.selector_config, &artifacts.selector_asset) {
+        (Some(config), Some(asset)) => Some((
+            read_regular(config, "WYR0-I selector config", MAX_SELECTOR_CONTENT_BYTES)?,
+            read_regular(asset, "WYR0-I selector asset", MAX_SELECTOR_CONTENT_BYTES)?,
+        )),
+        (None, None) => None,
+        _ => {
+            return Err(Failure::task(
+                "WYR0-H selector config/asset identity is incomplete",
+            ));
+        }
+    };
     let mut builder = Builder::new();
     builder
         .add(b"system/init0", &init0, FileMode::Executable)
@@ -558,9 +945,64 @@ fn build_bootfs_bytes(artifacts: &CandidateArtifacts) -> Result<Vec<u8>, Failure
     builder
         .add(b"bin/hello", &hello, FileMode::Executable)
         .map_err(|error| Failure::task(format!("could not add hello to bootfs: {error:?}")))?;
+    if let Some((config, asset)) = &selector_content {
+        builder
+            .add(WYR0_I_CONFIG_BOOTFS_PATH, config, FileMode::ReadOnly)
+            .map_err(|error| {
+                Failure::task(format!("could not add WYR0-I config to bootfs: {error:?}"))
+            })?;
+        builder
+            .add(WYR0_I_ASSET_BOOTFS_PATH, asset, FileMode::ReadOnly)
+            .map_err(|error| {
+                Failure::task(format!("could not add WYR0-I asset to bootfs: {error:?}"))
+            })?;
+    }
     builder
         .build()
         .map_err(|error| Failure::task(format!("could not build WYR0-H bootfs: {error:?}")))
+}
+
+fn validate_selector_config(config: &Path, asset: &Path, nonce: u64) -> Result<(), Failure> {
+    let config_bytes = read_regular(config, "WYR0-I selector config", MAX_SELECTOR_CONTENT_BYTES)?;
+    let asset_sha256 = digest(asset, "WYR0-I selector asset")?;
+    let expected = canonical_selector_config(nonce, &asset_sha256);
+    if config_bytes != expected.as_bytes() {
+        return Err(Failure::task(
+            "WYR0-I selector config is not the exact canonical request/asset-bound serialization",
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_selector_config(nonce: u64, asset_sha256: &str) -> String {
+    format!(
+        concat!(
+            "schema_version = 1\n",
+            "selector = \"native-userspace-capability\"\n",
+            "test_id = 24\n",
+            "evidence_protocol = \"wrcap1\"\n",
+            "evidence_nonce = \"{:016X}\"\n",
+            "asset_sha256 = \"{}\"\n"
+        ),
+        nonce, asset_sha256,
+    )
+}
+
+fn capability_content_prefixes(request: &HRequest) -> Result<(u64, u64), Failure> {
+    let capability = request.capability.as_ref().ok_or_else(|| {
+        Failure::task("WYR0-I evidence request has no selector config/asset binding")
+    })?;
+    let config = digest(&capability.selector_config, "WYR0-I selector config")?;
+    let asset = digest(&capability.selector_asset, "WYR0-I selector asset")?;
+    Ok((sha256_prefix_u64(&config)?, sha256_prefix_u64(&asset)?))
+}
+
+fn sha256_prefix_u64(digest: &str) -> Result<u64, Failure> {
+    let prefix = digest
+        .get(..16)
+        .ok_or_else(|| Failure::task("SHA-256 identity is too short for an evidence prefix"))?;
+    u64::from_str_radix(prefix, 16)
+        .map_err(|_| Failure::task("SHA-256 identity has an invalid evidence prefix"))
 }
 
 fn image_arguments(request: &HRequest, artifacts: &CandidateArtifacts) -> G3ImageArguments {
@@ -592,6 +1034,23 @@ fn provenance_contents(
     artifacts: &CandidateArtifacts,
 ) -> Result<String, Failure> {
     let digests = candidate_digests(request, artifacts)?;
+    let capability_fields = match (&digests.selector_config, &digests.selector_asset) {
+        (Some(config), Some(asset)) => format!(
+            concat!(
+                "selector_config_bootfs_path = \"test/wyr0-i/config.toml\"\n",
+                "selector_config_sha256 = \"{}\"\n",
+                "selector_asset_bootfs_path = \"test/wyr0-i/asset.bin\"\n",
+                "selector_asset_sha256 = \"{}\"\n"
+            ),
+            config, asset
+        ),
+        (None, None) => String::new(),
+        _ => {
+            return Err(Failure::task(
+                "WYR0-H selector config/asset identity is incomplete",
+            ));
+        }
+    };
     Ok(format!(
         concat!(
             "schema_version = 2\n",
@@ -611,6 +1070,7 @@ fn provenance_contents(
             "esp_sha256 = \"{}\"\n",
             "ovmf_code_sha256 = \"{}\"\n",
             "ovmf_vars_template_sha256 = \"{}\"\n",
+            "{}",
             "expected_outcome = \"{}\"\n",
             "expected_detail = {}\n",
             "default_vcpu = {}\n",
@@ -637,6 +1097,7 @@ fn provenance_contents(
         digests.esp,
         digests.ovmf_code,
         digests.ovmf_vars_template,
+        capability_fields,
         request.expected_outcome.name(),
         request.expected_detail,
         HProfile::Default.vcpus(),
@@ -657,6 +1118,16 @@ fn candidate_digests(
     let bootstrap = digest(&artifacts.bootstrap, "bootstrap.elf")?;
     let init0 = digest(&artifacts.init0, "init0")?;
     let hello = digest(&artifacts.hello, "hello")?;
+    let selector_config = artifacts
+        .selector_config
+        .as_ref()
+        .map(|path| digest(path, "WYR0-I selector config"))
+        .transpose()?;
+    let selector_asset = artifacts
+        .selector_asset
+        .as_ref()
+        .map(|path| digest(path, "WYR0-I selector asset"))
+        .transpose()?;
     let bootfs = digest(&request.bootfs, "bootfs")?;
     let esp = digest(&request.esp, "ESP")?;
     let ovmf_code = digest(&artifacts.ovmf_code, "OVMF code")?;
@@ -670,6 +1141,8 @@ fn candidate_digests(
         &bootstrap,
         &init0,
         &hello,
+        selector_config.as_deref(),
+        selector_asset.as_deref(),
         &bootfs,
         &esp,
         &ovmf_code,
@@ -683,6 +1156,8 @@ fn candidate_digests(
         bootstrap,
         init0,
         hello,
+        selector_config,
+        selector_asset,
         bootfs,
         esp,
         ovmf_code,
@@ -701,11 +1176,20 @@ fn candidate_identity_digest(
     bootstrap: &str,
     init0: &str,
     hello: &str,
+    selector_config: Option<&str>,
+    selector_asset: Option<&str>,
     bootfs: &str,
     esp: &str,
     ovmf_code: &str,
     ovmf_vars_template: &str,
 ) -> String {
+    let selector_content = match (selector_config, selector_asset) {
+        (Some(config), Some(asset)) => {
+            format!("selector_config={config}\nselector_asset={asset}\n")
+        }
+        (None, None) => String::new(),
+        _ => "selector_content=incomplete\n".to_owned(),
+    };
     sha256::bytes_digest(
         format!(
             concat!(
@@ -714,6 +1198,7 @@ fn candidate_identity_digest(
                 "expected_outcome={}\nexpected_detail={}\n",
                 "loader={}\nkernel={}\nsymbols={}\n",
                 "bootstrap={}\ninit0={}\nhello={}\n",
+                "{}",
                 "bootfs={}\nesp={}\novmf_code={}\n",
                 "ovmf_vars_template={}\n"
             ),
@@ -731,6 +1216,7 @@ fn candidate_identity_digest(
             bootstrap,
             init0,
             hello,
+            selector_content,
             bootfs,
             esp,
             ovmf_code,
@@ -753,6 +1239,12 @@ fn run_candidate_digests(
     digests.bootstrap.clone_from(&run.bootstrap.digest);
     digests.init0.clone_from(&run.init0.digest);
     digests.hello.clone_from(&run.hello.digest);
+    if let (Some(digest), Some(snapshot)) = (&mut digests.selector_config, &run.selector_config) {
+        digest.clone_from(&snapshot.digest);
+    }
+    if let (Some(digest), Some(snapshot)) = (&mut digests.selector_asset, &run.selector_asset) {
+        digest.clone_from(&snapshot.digest);
+    }
     digests.bootfs.clone_from(&run.bootfs.digest);
     digests.esp.clone_from(&run.esp.digest);
     digests.ovmf_code.clone_from(&run.ovmf_code.digest);
@@ -766,6 +1258,8 @@ fn run_candidate_digests(
         &digests.bootstrap,
         &digests.init0,
         &digests.hello,
+        digests.selector_config.as_deref(),
+        digests.selector_asset.as_deref(),
         &digests.bootfs,
         &digests.esp,
         &digests.ovmf_code,
@@ -775,6 +1269,18 @@ fn run_candidate_digests(
 }
 
 fn manifest_json_fields(digests: &CandidateDigests, provenance: &str) -> String {
+    let selector_content = match (&digests.selector_config, &digests.selector_asset) {
+        (Some(config), Some(asset)) => format!(
+            concat!(
+                "\"selector_config_bootfs_path\":\"test/wyr0-i/config.toml\",",
+                "\"selector_config_sha256\":\"{}\",",
+                "\"selector_asset_bootfs_path\":\"test/wyr0-i/asset.bin\",",
+                "\"selector_asset_sha256\":\"{}\","
+            ),
+            config, asset
+        ),
+        _ => String::new(),
+    };
     format!(
         concat!(
             "\"candidate_sha256\":\"{}\",\"provenance_sha256\":\"{}\",",
@@ -783,7 +1289,8 @@ fn manifest_json_fields(digests: &CandidateDigests, provenance: &str) -> String 
             "\"bootstrap_sha256\":\"{}\",\"init0_sha256\":\"{}\",",
             "\"hello_sha256\":\"{}\",\"bootfs_sha256\":\"{}\",",
             "\"esp_sha256\":\"{}\",\"ovmf_code_sha256\":\"{}\",",
-            "\"ovmf_vars_template_sha256\":\"{}\","
+            "\"ovmf_vars_template_sha256\":\"{}\",",
+            "{}"
         ),
         digests.candidate,
         provenance,
@@ -798,6 +1305,7 @@ fn manifest_json_fields(digests: &CandidateDigests, provenance: &str) -> String 
         digests.esp,
         digests.ovmf_code,
         digests.ovmf_vars_template,
+        selector_content,
     )
 }
 
@@ -827,6 +1335,7 @@ fn revalidate_before_pass(
         ));
     }
     h_request::validate_outputs(&reloaded)?;
+    verify_source_revisions(&reloaded)?;
     let current = verify_candidate_inputs(&reloaded)?;
     if &current != artifacts {
         return Err(Failure::task(
@@ -1148,7 +1657,7 @@ fn evidence_result_fields(
                     "\"evidence_event_count\":{},\"first_evidence_sequence\":{},",
                     "\"last_evidence_sequence\":{},"
                 ),
-                I1_EVIDENCE_PROTOCOL,
+                request_evidence.protocol.name(),
                 request_evidence.nonce,
                 request_evidence.required_mask,
                 evidence.observed_mask,
@@ -1233,6 +1742,8 @@ struct RunPaths {
     bootstrap: StableRunFile,
     init0: StableRunFile,
     hello: StableRunFile,
+    selector_config: Option<StableRunFile>,
+    selector_asset: Option<StableRunFile>,
     bootfs: StableRunFile,
     esp: StableRunFile,
     provenance: StableRunFile,
@@ -1244,8 +1755,8 @@ struct RunPaths {
 }
 
 impl RunPaths {
-    fn immutable_files(&self) -> [(&StableRunFile, &'static str); 11] {
-        [
+    fn immutable_files(&self) -> Vec<(&StableRunFile, &'static str)> {
+        let mut files = vec![
             (&self.request, "request"),
             (&self.loader, "loader.efi"),
             (&self.kernel, "deepwyrm.elf"),
@@ -1257,7 +1768,14 @@ impl RunPaths {
             (&self.esp, "ESP"),
             (&self.provenance, "provenance"),
             (&self.ovmf_code, "OVMF code"),
-        ]
+        ];
+        if let Some(config) = &self.selector_config {
+            files.push((config, "WYR0-I selector config"));
+        }
+        if let Some(asset) = &self.selector_asset {
+            files.push((asset, "WYR0-I selector asset"));
+        }
+        files
     }
 
     fn verify_immutable(&self) -> Result<(), Failure> {
@@ -1275,6 +1793,21 @@ impl RunPaths {
     }
 
     fn snapshot_request(&self, request: &HRequest) -> HRequest {
+        let capability = request
+            .capability
+            .as_ref()
+            .map(|capability| CapabilityRequest {
+                selector_config: self.selector_config.as_ref().map_or_else(
+                    || capability.selector_config.clone(),
+                    |file| file.path.clone(),
+                ),
+                selector_asset: self.selector_asset.as_ref().map_or_else(
+                    || capability.selector_asset.clone(),
+                    |file| file.path.clone(),
+                ),
+                certificate: capability.certificate.clone(),
+                capability_summary: capability.capability_summary.clone(),
+            });
         HRequest {
             path: self.request.path.clone(),
             loader: self.loader.path.clone(),
@@ -1283,6 +1816,7 @@ impl RunPaths {
             bootstrap: self.bootstrap.path.clone(),
             init0: self.init0.path.clone(),
             hello: self.hello.path.clone(),
+            capability,
             bootfs: self.bootfs.path.clone(),
             esp: self.esp.path.clone(),
             provenance: self.provenance.path.clone(),
@@ -1300,6 +1834,8 @@ impl RunPaths {
             bootstrap: self.bootstrap.path.clone(),
             init0: self.init0.path.clone(),
             hello: self.hello.path.clone(),
+            selector_config: self.selector_config.as_ref().map(|file| file.path.clone()),
+            selector_asset: self.selector_asset.as_ref().map(|file| file.path.clone()),
             ovmf_code: self.ovmf_code.path.clone(),
             ovmf_vars_template: self.vars.path.clone(),
         }
@@ -1342,6 +1878,16 @@ fn prepare_run_directory(
     )?;
     let init0_bytes = read_regular(&artifacts.init0, "init0", MAX_GUEST_ARTIFACT_BYTES)?;
     let hello_bytes = read_regular(&artifacts.hello, "hello", MAX_GUEST_ARTIFACT_BYTES)?;
+    let selector_config_bytes = artifacts
+        .selector_config
+        .as_ref()
+        .map(|path| read_regular(path, "WYR0-I selector config", MAX_SELECTOR_CONTENT_BYTES))
+        .transpose()?;
+    let selector_asset_bytes = artifacts
+        .selector_asset
+        .as_ref()
+        .map(|path| read_regular(path, "WYR0-I selector asset", MAX_SELECTOR_CONTENT_BYTES))
+        .transpose()?;
     let bootfs_bytes =
         read_output_regular(outputs, &request.bootfs, "bootfs", MAX_GUEST_ARTIFACT_BYTES)?;
     let esp_bytes =
@@ -1389,6 +1935,23 @@ fn prepare_run_directory(
         )?,
         init0: create_run_file(outputs, &directory.join("init0.elf"), &init0_bytes, true)?,
         hello: create_run_file(outputs, &directory.join("hello.elf"), &hello_bytes, true)?,
+        selector_config: selector_config_bytes
+            .as_ref()
+            .map(|bytes| {
+                create_run_file(
+                    outputs,
+                    &directory.join("selector-config.toml"),
+                    bytes,
+                    true,
+                )
+            })
+            .transpose()?,
+        selector_asset: selector_asset_bytes
+            .as_ref()
+            .map(|bytes| {
+                create_run_file(outputs, &directory.join("selector-asset.bin"), bytes, true)
+            })
+            .transpose()?,
         bootfs: create_run_file(outputs, &directory.join("bootfs.img"), &bootfs_bytes, true)?,
         esp: create_run_file(outputs, &directory.join("esp.img"), &esp_bytes, true)?,
         provenance: create_run_file(
@@ -1482,7 +2045,10 @@ fn gdb_arguments(symbols: &StableRunFile) -> Vec<String> {
 
 fn parse_transcript(bytes: &[u8], request: &HRequest) -> Result<GuestTranscript, Failure> {
     match request.evidence {
-        Some(evidence) => parse_evidence_transcript(bytes, request.test_id, evidence),
+        Some(evidence) => match evidence.protocol {
+            EvidenceProtocol::Dwevid1 => parse_dwevid1_transcript(bytes, request.test_id, evidence),
+            EvidenceProtocol::Wrcap1 => parse_wrcap1_transcript(bytes, request, evidence),
+        },
         None => Ok(GuestTranscript {
             terminal: parse_terminal_record(bytes, request.test_id)?,
             evidence: None,
@@ -1507,7 +2073,7 @@ fn parse_terminal_record(bytes: &[u8], expected_test_id: u32) -> Result<GuestRec
     terminal.ok_or_else(|| Failure::task("serial log contains no DWTEST1 terminal record"))
 }
 
-fn parse_evidence_transcript(
+fn parse_dwevid1_transcript(
     bytes: &[u8],
     expected_test_id: u32,
     request: EvidenceRequest,
@@ -1559,6 +2125,274 @@ fn parse_evidence_transcript(
         terminal,
         evidence: Some(evidence),
     })
+}
+
+fn parse_wrcap1_transcript(
+    bytes: &[u8],
+    request: &HRequest,
+    evidence_request: EvidenceRequest,
+) -> Result<GuestTranscript, Failure> {
+    let mut terminal = None;
+    let mut events = Vec::new();
+    for (index, line) in bytes.split_inclusive(|byte| *byte == b'\n').enumerate() {
+        let line_number = index + 1;
+        if resembles_protocol_magic(line, b"WRCAP1") {
+            if terminal.is_some() {
+                return Err(Failure::task(format!(
+                    "serial line {line_number} contains WRCAP1 evidence after the terminal record"
+                )));
+            }
+            if events.len() == MAX_EVIDENCE_RECORDS {
+                return Err(Failure::task(format!(
+                    "serial line {line_number} exceeds the {MAX_EVIDENCE_RECORDS}-record WRCAP1 limit"
+                )));
+            }
+            let event = parse_capability_evidence_line(line, line_number, evidence_request.nonce)?;
+            if event.sequence != events.len() as u32 {
+                return Err(Failure::task(format!(
+                    "serial line {line_number} has non-contiguous WRCAP1 sequence {:08X}; expected {:08X}",
+                    event.sequence,
+                    events.len()
+                )));
+            }
+            events.push(event);
+            continue;
+        }
+        if resembles_protocol_magic(line, b"DWEVID1") {
+            return Err(Failure::task(format!(
+                "serial line {line_number} contains cross-protocol DWEVID1 input in a WRCAP1 transcript"
+            )));
+        }
+        if resembles_protocol_magic(line, b"DWTEST1") {
+            let record = parse_terminal_line(line, line_number, request.test_id)?;
+            if terminal.replace(record).is_some() {
+                return Err(Failure::task(
+                    "serial log contains duplicate DWTEST1 terminal records",
+                ));
+            }
+        }
+    }
+    let terminal =
+        terminal.ok_or_else(|| Failure::task("serial log contains no DWTEST1 terminal record"))?;
+    if terminal.outcome != GuestOutcome::Pass || terminal.detail != 0 {
+        return Err(Failure::task(
+            "WRCAP1 transcript requires one matching PASS/0 terminal for test 24",
+        ));
+    }
+    if events.is_empty() {
+        return Err(Failure::task(
+            "WYR0-I serial log contains no WRCAP1 evidence records",
+        ));
+    }
+    let evidence = validate_capability_evidence(&events, request, evidence_request.required_mask)?;
+    Ok(GuestTranscript {
+        terminal,
+        evidence: Some(evidence),
+    })
+}
+
+fn parse_capability_evidence_line(
+    line: &[u8],
+    line_number: usize,
+    expected_nonce: u64,
+) -> Result<CapabilityEvidenceEvent, Failure> {
+    if line.len() != WRCAP1_RECORD_BYTES
+        || &line[..6] != b"WRCAP1"
+        || line[6] != b'|'
+        || line[9] != b'|'
+        || line[26] != b'|'
+        || line[35] != b'|'
+        || line[38] != b'|'
+        || line[47] != b'|'
+        || line[56] != b'|'
+        || line[73] != b'|'
+        || line[90] != b'|'
+        || line[107] != b'|'
+        || line[116] != b'\n'
+    {
+        return Err(Failure::task(format!(
+            "serial line {line_number} contains a malformed WRCAP1 record"
+        )));
+    }
+    if &line[7..9] != b"01" {
+        return Err(Failure::task(format!(
+            "serial line {line_number} has an unsupported WRCAP1 version"
+        )));
+    }
+    let nonce = parse_hex_u64(&line[10..26]).ok_or_else(|| {
+        Failure::task(format!(
+            "serial line {line_number} has an invalid WRCAP1 nonce"
+        ))
+    })?;
+    if nonce != expected_nonce {
+        return Err(Failure::task(format!(
+            "serial line {line_number} WRCAP1 nonce does not match the request"
+        )));
+    }
+    let sequence = capability_hex_u32(&line[27..35], line_number, "sequence")?;
+    let kind_value = parse_hex_u8(&line[36..38]).ok_or_else(|| {
+        Failure::task(format!(
+            "serial line {line_number} has an invalid WRCAP1 kind"
+        ))
+    })?;
+    let kind = CapabilityEvidenceKind::parse(kind_value).ok_or_else(|| {
+        Failure::task(format!(
+            "serial line {line_number} has unknown WRCAP1 kind {kind_value:02X}"
+        ))
+    })?;
+    let peer = capability_hex_u32(&line[39..47], line_number, "peer")?;
+    let generation = capability_hex_u32(&line[48..56], line_number, "generation")?;
+    let token = capability_hex_u64(&line[57..73], line_number, "token")?;
+    let arg0 = capability_hex_u64(&line[74..90], line_number, "arg0")?;
+    let arg1 = capability_hex_u64(&line[91..107], line_number, "arg1")?;
+    let checksum = capability_hex_u32(&line[108..116], line_number, "checksum")?;
+    if checksum != fnv1a32(&line[..108]) {
+        return Err(Failure::task(format!(
+            "serial line {line_number} has a mismatched WRCAP1 checksum"
+        )));
+    }
+    Ok(CapabilityEvidenceEvent {
+        sequence,
+        kind,
+        peer,
+        generation,
+        token,
+        arg0,
+        arg1,
+        line: line_number,
+    })
+}
+
+fn capability_hex_u32(bytes: &[u8], line_number: usize, field: &str) -> Result<u32, Failure> {
+    parse_hex(bytes).ok_or_else(|| {
+        Failure::task(format!(
+            "serial line {line_number} has an invalid WRCAP1 {field}"
+        ))
+    })
+}
+
+fn capability_hex_u64(bytes: &[u8], line_number: usize, field: &str) -> Result<u64, Failure> {
+    parse_hex_u64(bytes).ok_or_else(|| {
+        Failure::task(format!(
+            "serial line {line_number} has an invalid WRCAP1 {field}"
+        ))
+    })
+}
+
+fn validate_capability_evidence(
+    events: &[CapabilityEvidenceEvent],
+    request: &HRequest,
+    required_evidence_mask: u32,
+) -> Result<ValidatedEvidence, Failure> {
+    if events.len() != 10 {
+        return Err(Failure::task(format!(
+            "WYR0-I evidence requires exactly ten canonical records; observed {}",
+            events.len()
+        )));
+    }
+    let mut seen_kinds = 0_u32;
+    let mut tokens = BTreeSet::new();
+    for (index, event) in events.iter().copied().enumerate() {
+        let expected_kind = u8::try_from(index + 1).expect("ten capability kinds fit u8");
+        if event.kind.value() != expected_kind {
+            return Err(Failure::task(format!(
+                "serial line {} has WRCAP1 kind {:02X} out of canonical order; expected {expected_kind:02X}",
+                event.line,
+                event.kind.value()
+            )));
+        }
+        if seen_kinds & event.kind.bit() != 0 {
+            return Err(Failure::task(format!(
+                "serial line {} duplicates a WRCAP1 capability kind",
+                event.line
+            )));
+        }
+        seen_kinds |= event.kind.bit();
+        if event.token != 0 && !tokens.insert(event.token) {
+            return Err(Failure::task(format!(
+                "serial line {} reuses a WRCAP1 transaction/object token",
+                event.line
+            )));
+        }
+    }
+
+    let content = events[0];
+    let (config_prefix, asset_prefix) = capability_content_prefixes(request)?;
+    let content_token = config_prefix ^ asset_prefix;
+    if content.peer != 0
+        || content.generation != 0
+        || content_token == 0
+        || content.token != content_token
+        || content.arg0 != config_prefix
+        || content.arg1 != asset_prefix
+    {
+        return Err(Failure::task(
+            "WYR0-I CONTENT_DELIVERY does not match the request-bound config/asset identity",
+        ));
+    }
+    let mut observed_mask = content.kind.bit();
+
+    require_capability_event(events[1], 1, 1, 1, 0, "PROCESS_LIFECYCLE")?;
+    observed_mask |= events[1].kind.bit();
+    require_capability_event(events[2], 1, 1, 4096, 0, "MEMORY_SHARE")?;
+    observed_mask |= events[2].kind.bit();
+    require_capability_event(events[3], 1, 1, 0x0F, 32, "CHANNEL_LIFECYCLE")?;
+    observed_mask |= events[3].kind.bit();
+    require_capability_event(events[4], 1, 1, 0x0F, 0, "WAIT_EVENT_TIMER")?;
+    observed_mask |= events[4].kind.bit();
+    require_capability_event(events[5], 2, 1, 1, 0, "CANCELLATION")?;
+    observed_mask |= events[5].kind.bit();
+    require_capability_event(events[6], 3, 2, 1, 2, "RESTART_REPLACEMENT")?;
+    observed_mask |= events[6].kind.bit();
+    require_capability_event(events[7], 4, 4, 4, 0, "RESTART_EXHAUSTED")?;
+    observed_mask |= events[7].kind.bit();
+    require_capability_event(events[8], 1, 1, 0x0F, 0, "OVERLOAD_REPLAY_REJECTED")?;
+    observed_mask |= events[8].kind.bit();
+
+    let cleanup = events[9];
+    if cleanup.peer != 0
+        || cleanup.generation != 0
+        || cleanup.token != 0
+        || cleanup.arg0 != 0
+        || cleanup.arg1 != 0
+    {
+        return Err(Failure::task(
+            "WYR0-I CLEANUP_BASELINE must be the final global zero-baseline record",
+        ));
+    }
+    observed_mask |= cleanup.kind.bit();
+    if observed_mask != required_evidence_mask {
+        return Err(Failure::task(format!(
+            "WYR0-I transcript proof mask {observed_mask:08X} does not exactly match request {required_evidence_mask:08X}"
+        )));
+    }
+    Ok(ValidatedEvidence {
+        count: events.len() as u32,
+        observed_mask,
+        first_sequence: events[0].sequence,
+        last_sequence: events[events.len() - 1].sequence,
+    })
+}
+
+fn require_capability_event(
+    event: CapabilityEvidenceEvent,
+    peer: u32,
+    generation: u32,
+    arg0: u64,
+    arg1: u64,
+    label: &str,
+) -> Result<(), Failure> {
+    if event.peer != peer
+        || event.generation != generation
+        || event.token == 0
+        || event.arg0 != arg0
+        || event.arg1 != arg1
+    {
+        return Err(Failure::task(format!(
+            "WYR0-I {label} has an invalid peer, generation, token, or joined fact"
+        )));
+    }
+    Ok(())
 }
 
 fn resembles_protocol_magic(line: &[u8], magic: &[u8]) -> bool {
@@ -1631,7 +2465,7 @@ fn parse_evidence_line(
     line_number: usize,
     expected_nonce: u64,
 ) -> Result<EvidenceEvent, Failure> {
-    if line.len() != EVIDENCE_RECORD_BYTES
+    if line.len() != DWEVID1_RECORD_BYTES
         || &line[..7] != b"DWEVID1"
         || line[7] != b'|'
         || line[10] != b'|'
@@ -2409,6 +3243,8 @@ mod tests {
             bootstrap: stable("bootstrap.elf"),
             init0: stable("init0.elf"),
             hello: stable("hello.elf"),
+            selector_config: None,
+            selector_asset: None,
             bootfs: stable("bootfs.img"),
             esp: stable("esp.img"),
             provenance: stable("provenance.toml"),
@@ -2442,7 +3278,7 @@ mod tests {
         )
         .into_bytes();
         record.extend_from_slice(format!("{:08X}\n", fnv1a32(&record)).as_bytes());
-        assert_eq!(record.len(), EVIDENCE_RECORD_BYTES);
+        assert_eq!(record.len(), DWEVID1_RECORD_BYTES);
         record
     }
 
@@ -2539,10 +3375,233 @@ mod tests {
             ovmf_vars_template: root.join("OVMF_VARS.fd"),
             run_directory: root.join("runs"),
             evidence: Some(EvidenceRequest {
+                protocol: EvidenceProtocol::Dwevid1,
                 nonce: TEST_EVIDENCE_NONCE,
                 required_mask: h_request::I1_REQUIRED_EVIDENCE_MASK,
             }),
+            capability: None,
         }
+    }
+
+    #[derive(Clone, Copy)]
+    struct CapabilitySpec {
+        kind: u8,
+        peer: u32,
+        generation: u32,
+        token: u64,
+        arg0: u64,
+        arg1: u64,
+    }
+
+    fn capability_request(label: &str) -> (PathBuf, HRequest) {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!(
+                "xtask-wyr0-i-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock before epoch")
+                    .as_nanos()
+            ));
+        fs::create_dir(&root).expect("create WYR0-I fixture");
+        let asset = root.join("selector-asset.bin");
+        fs::write(&asset, b"immutable-wyr0-i-asset-v1\n").expect("write selector asset");
+        let asset_sha256 = digest(&asset, "test selector asset").expect("hash selector asset");
+        let config = root.join("selector-config.toml");
+        fs::write(
+            &config,
+            canonical_selector_config(0x89AB_CDEF_0123_4567, &asset_sha256),
+        )
+        .expect("write selector config");
+        let request = HRequest {
+            path: root.join("request.toml"),
+            request_sha256: sha256::bytes_digest(b"request"),
+            schema_version: 4,
+            deepwyrm_revision: "1".repeat(40),
+            wyrmroot_revision: "2".repeat(40),
+            rust_revision: "3".repeat(40),
+            selector: h_request::I_CAPABILITY_SELECTOR.into(),
+            test_id: h_request::I_CAPABILITY_TEST_ID,
+            expected_outcome: ExpectedOutcome::Pass,
+            expected_detail: 0,
+            timeout_seconds: 180,
+            loader: root.join("loader.efi"),
+            kernel: root.join("deepwyrm.elf"),
+            symbols: root.join("deepwyrm.symbols"),
+            bootstrap: root.join("bootstrap.elf"),
+            init0: root.join("init0.elf"),
+            hello: root.join("hello.elf"),
+            bootfs: root.join("bootfs.img"),
+            esp: root.join("esp.img"),
+            provenance: root.join("provenance.toml"),
+            ovmf_code: root.join("OVMF_CODE.fd"),
+            ovmf_vars_template: root.join("OVMF_VARS.fd"),
+            run_directory: root.join("runs"),
+            evidence: Some(EvidenceRequest {
+                protocol: EvidenceProtocol::Wrcap1,
+                nonce: 0x89AB_CDEF_0123_4567,
+                required_mask: h_request::I_CAPABILITY_REQUIRED_EVIDENCE_MASK,
+            }),
+            capability: Some(CapabilityRequest {
+                selector_config: config,
+                selector_asset: asset,
+                certificate: root.join("certificate.json"),
+                capability_summary: root.join("capability.md"),
+            }),
+        };
+        (root, request)
+    }
+
+    fn capability_specs(request: &HRequest) -> Vec<CapabilitySpec> {
+        let (config, asset) = capability_content_prefixes(request).expect("content prefixes");
+        let content_token = config ^ asset;
+        assert_ne!(content_token, 0);
+        vec![
+            CapabilitySpec {
+                kind: 0x01,
+                peer: 0,
+                generation: 0,
+                token: content_token,
+                arg0: config,
+                arg1: asset,
+            },
+            CapabilitySpec {
+                kind: 0x02,
+                peer: 1,
+                generation: 1,
+                token: 0x101,
+                arg0: 1,
+                arg1: 0,
+            },
+            CapabilitySpec {
+                kind: 0x03,
+                peer: 1,
+                generation: 1,
+                token: 0x102,
+                arg0: 4096,
+                arg1: 0,
+            },
+            CapabilitySpec {
+                kind: 0x04,
+                peer: 1,
+                generation: 1,
+                token: 0x103,
+                arg0: 0x0F,
+                arg1: 32,
+            },
+            CapabilitySpec {
+                kind: 0x05,
+                peer: 1,
+                generation: 1,
+                token: 0x104,
+                arg0: 0x0F,
+                arg1: 0,
+            },
+            CapabilitySpec {
+                kind: 0x06,
+                peer: 2,
+                generation: 1,
+                token: 0x105,
+                arg0: 1,
+                arg1: 0,
+            },
+            CapabilitySpec {
+                kind: 0x07,
+                peer: 3,
+                generation: 2,
+                token: 0x106,
+                arg0: 1,
+                arg1: 2,
+            },
+            CapabilitySpec {
+                kind: 0x08,
+                peer: 4,
+                generation: 4,
+                token: 0x107,
+                arg0: 4,
+                arg1: 0,
+            },
+            CapabilitySpec {
+                kind: 0x09,
+                peer: 1,
+                generation: 1,
+                token: 0x108,
+                arg0: 0x0F,
+                arg1: 0,
+            },
+            CapabilitySpec {
+                kind: 0x0A,
+                peer: 0,
+                generation: 0,
+                token: 0,
+                arg0: 0,
+                arg1: 0,
+            },
+        ]
+    }
+
+    fn capability_line(nonce: u64, sequence: u32, spec: CapabilitySpec) -> Vec<u8> {
+        let mut record = format!(
+            concat!(
+                "WRCAP1|01|{:016X}|{:08X}|{:02X}|{:08X}|{:08X}|",
+                "{:016X}|{:016X}|{:016X}|"
+            ),
+            nonce,
+            sequence,
+            spec.kind,
+            spec.peer,
+            spec.generation,
+            spec.token,
+            spec.arg0,
+            spec.arg1,
+        )
+        .into_bytes();
+        record.extend_from_slice(format!("{:08X}\n", fnv1a32(&record)).as_bytes());
+        assert_eq!(record.len(), WRCAP1_RECORD_BYTES);
+        record
+    }
+
+    fn capability_transcript(
+        request: &HRequest,
+        specs: &[CapabilitySpec],
+        terminal_status: &str,
+        terminal_detail: u32,
+    ) -> Vec<u8> {
+        let nonce = request.evidence.expect("evidence request").nonce;
+        let mut transcript = b"trusted controller diagnostic\n".to_vec();
+        for (sequence, spec) in specs.iter().copied().enumerate() {
+            transcript.extend_from_slice(&capability_line(nonce, sequence as u32, spec));
+        }
+        transcript.extend_from_slice(&terminal(
+            terminal_status,
+            h_request::I_CAPABILITY_TEST_ID,
+            terminal_detail,
+        ));
+        transcript
+    }
+
+    fn mutate_capability_record(
+        transcript: &[u8],
+        index: usize,
+        mutate: impl FnOnce(&mut Vec<u8>),
+        repair_checksum: bool,
+    ) -> Vec<u8> {
+        let mut lines = transcript
+            .split_inclusive(|byte| *byte == b'\n')
+            .map(<[u8]>::to_vec)
+            .collect::<Vec<_>>();
+        let line = lines
+            .iter_mut()
+            .filter(|line| line.starts_with(b"WRCAP1"))
+            .nth(index)
+            .expect("capability record exists");
+        mutate(line);
+        if repair_checksum && line.len() == WRCAP1_RECORD_BYTES {
+            let checksum = format!("{:08X}", fnv1a32(&line[..108]));
+            line[108..116].copy_from_slice(checksum.as_bytes());
+        }
+        lines.concat()
     }
 
     #[test]
@@ -2551,6 +3610,260 @@ mod tests {
         assert_eq!(HProfile::Smp.vcpus(), 4);
         assert_eq!(HProfile::Default.memory_mib(), 1024);
         assert_eq!(HProfile::Smp.memory_mib(), 2048);
+    }
+
+    #[test]
+    fn schema_four_content_is_canonical_immutable_and_bootfs_bound() {
+        let (root, request) = capability_request("content");
+        let capability = request.capability.as_ref().expect("capability request");
+        let nonce = request.evidence.expect("evidence request").nonce;
+        validate_selector_config(
+            &capability.selector_config,
+            &capability.selector_asset,
+            nonce,
+        )
+        .expect("canonical selector config rejected");
+
+        for name in [
+            "loader.efi",
+            "deepwyrm.elf",
+            "deepwyrm.symbols",
+            "bootstrap.elf",
+            "init0.elf",
+            "hello.elf",
+            "OVMF_CODE.fd",
+            "OVMF_VARS.fd",
+        ] {
+            fs::write(root.join(name), b"artifact").expect("write candidate fixture");
+        }
+        let artifacts = verify_candidate_inputs(&request).expect("verify capability inputs");
+        let bootfs = build_bootfs_bytes(&artifacts).expect("build capability bootfs");
+        let archive =
+            wyrmroot_bootfs::archive::Archive::new(&bootfs).expect("parse capability bootfs");
+        let config = archive
+            .lookup(WYR0_I_CONFIG_BOOTFS_PATH)
+            .expect("missing selector config");
+        let asset = archive
+            .lookup(WYR0_I_ASSET_BOOTFS_PATH)
+            .expect("missing selector asset");
+        assert!(!config.is_executable());
+        assert!(!asset.is_executable());
+        assert_eq!(
+            config.data(),
+            fs::read(&capability.selector_config).unwrap()
+        );
+        assert_eq!(asset.data(), fs::read(&capability.selector_asset).unwrap());
+
+        let canonical = fs::read_to_string(&capability.selector_config).unwrap();
+        for (label, changed) in [
+            ("extra", format!("{canonical}unexpected = 1\n")),
+            (
+                "reordered",
+                canonical.replacen("schema_version = 1\n", "", 1) + "schema_version = 1\n",
+            ),
+            (
+                "nonce",
+                canonical.replace("89ABCDEF01234567", "89ABCDEF01234568"),
+            ),
+            (
+                "asset",
+                canonical.replace(
+                    &digest(&capability.selector_asset, "asset").unwrap(),
+                    &"0".repeat(64),
+                ),
+            ),
+        ] {
+            fs::write(&capability.selector_config, changed).unwrap();
+            assert!(
+                validate_selector_config(
+                    &capability.selector_config,
+                    &capability.selector_asset,
+                    nonce,
+                )
+                .is_err(),
+                "accepted noncanonical {label} config"
+            );
+        }
+        fs::remove_dir_all(root).expect("remove content fixture");
+    }
+
+    #[test]
+    fn wrcap1_accepts_only_the_complete_ten_kind_join_and_matching_terminal() {
+        let (root, request) = capability_request("valid-evidence");
+        let specs = capability_specs(&request);
+        let transcript = capability_transcript(&request, &specs, "01", 0);
+        let parsed = parse_transcript(&transcript, &request).expect("valid WRCAP1 rejected");
+        assert_eq!(parsed.terminal.outcome, GuestOutcome::Pass);
+        let evidence = parsed
+            .evidence
+            .expect("missing validated capability evidence");
+        assert_eq!(evidence.count, 10);
+        assert_eq!(
+            evidence.observed_mask,
+            h_request::I_CAPABILITY_REQUIRED_EVIDENCE_MASK
+        );
+        assert_eq!(evidence.first_sequence, 0);
+        assert_eq!(evidence.last_sequence, 9);
+        let fields = evidence_result_fields(&request, parsed.evidence).unwrap();
+        assert!(fields.contains("\"evidence_protocol\":\"wrcap1\""));
+        assert!(fields.contains("\"observed_evidence_mask\":1023"));
+        fs::remove_dir_all(root).expect("remove evidence fixture");
+    }
+
+    #[test]
+    fn wrcap1_framing_nonce_sequence_checksum_and_terminal_are_fail_closed() {
+        let (root, request) = capability_request("framing");
+        let specs = capability_specs(&request);
+        let valid = capability_transcript(&request, &specs, "01", 0);
+
+        let first = capability_line(request.evidence.unwrap().nonce, 0, specs[0]);
+        for length in 6..WRCAP1_RECORD_BYTES {
+            let mut truncated = first[..length].to_vec();
+            truncated.extend_from_slice(&terminal("01", 24, 0));
+            assert!(
+                parse_transcript(&truncated, &request).is_err(),
+                "accepted WRCAP1 truncation at {length} bytes"
+            );
+        }
+
+        let mut cases = Vec::new();
+        cases.push(mutate_capability_record(
+            &valid,
+            0,
+            |line| line[..6].make_ascii_lowercase(),
+            false,
+        ));
+        cases.push(mutate_capability_record(
+            &valid,
+            0,
+            |line| line[8] = b'2',
+            true,
+        ));
+        cases.push(mutate_capability_record(
+            &valid,
+            0,
+            |line| line[10] = if line[10] == b'8' { b'9' } else { b'8' },
+            true,
+        ));
+        cases.push(mutate_capability_record(
+            &valid,
+            1,
+            |line| line[34] = b'0',
+            true,
+        ));
+        cases.push(mutate_capability_record(
+            &valid,
+            0,
+            |line| line[36..38].copy_from_slice(b"0B"),
+            true,
+        ));
+        cases.push(mutate_capability_record(
+            &valid,
+            0,
+            |line| line[10] = b'a',
+            true,
+        ));
+        cases.push(mutate_capability_record(
+            &valid,
+            0,
+            |line| line[108] = if line[108] == b'0' { b'1' } else { b'0' },
+            false,
+        ));
+        let mut after_terminal = valid.clone();
+        after_terminal.extend_from_slice(&capability_line(
+            request.evidence.unwrap().nonce,
+            10,
+            specs[0],
+        ));
+        cases.push(after_terminal);
+        let mut duplicate_terminal = valid.clone();
+        duplicate_terminal.extend_from_slice(&terminal("01", 24, 0));
+        cases.push(duplicate_terminal);
+        let mut cross_protocol = evidence_line(TEST_EVIDENCE_NONCE, 0, event(0x01, 0, 0, 0, 0));
+        cross_protocol.extend_from_slice(&valid);
+        cases.push(cross_protocol);
+        cases.push(capability_transcript(&request, &specs, "02", 0x2401_0001));
+        cases.push(capability_transcript(&request, &specs, "01", 1));
+        cases.push(capability_transcript(&request, &specs[..9], "01", 0));
+
+        let mut too_many = b"diagnostic\n".to_vec();
+        for sequence in 0..=MAX_EVIDENCE_RECORDS {
+            too_many.extend_from_slice(&capability_line(
+                request.evidence.unwrap().nonce,
+                sequence as u32,
+                specs[0],
+            ));
+        }
+        too_many.extend_from_slice(&terminal("01", 24, 0));
+        cases.push(too_many);
+
+        for (index, transcript) in cases.into_iter().enumerate() {
+            assert!(
+                parse_transcript(&transcript, &request).is_err(),
+                "accepted hostile framing/terminal case {index}"
+            );
+        }
+        fs::remove_dir_all(root).expect("remove framing fixture");
+    }
+
+    #[test]
+    fn wrcap1_peer_generation_token_and_kind_facts_are_strict() {
+        let (root, request) = capability_request("semantic-joins");
+        let valid = capability_specs(&request);
+        let mut cases = Vec::new();
+        for (index, mutate) in [
+            (1, 0_u8),
+            (2, 1),
+            (3, 2),
+            (4, 3),
+            (5, 4),
+            (6, 5),
+            (7, 6),
+            (8, 7),
+            (9, 8),
+        ] {
+            let mut specs = valid.clone();
+            match mutate % 3 {
+                0 => specs[index].peer = specs[index].peer.wrapping_add(1),
+                1 => specs[index].generation = specs[index].generation.wrapping_add(1),
+                _ => specs[index].arg0 = specs[index].arg0.wrapping_add(1),
+            }
+            cases.push(specs);
+        }
+        let mut zero_token = valid.clone();
+        zero_token[2].token = 0;
+        cases.push(zero_token);
+        let mut reused_token = valid.clone();
+        reused_token[3].token = reused_token[2].token;
+        cases.push(reused_token);
+        let mut wrong_cleanup = valid.clone();
+        wrong_cleanup[9].arg1 = 1;
+        cases.push(wrong_cleanup);
+        let mut reordered = valid.clone();
+        reordered.swap(1, 2);
+        cases.push(reordered);
+        let mut wrong_content = valid.clone();
+        wrong_content[0].arg0 ^= 1;
+        cases.push(wrong_content);
+
+        for (index, specs) in cases.iter().enumerate() {
+            let transcript = capability_transcript(&request, specs, "01", 0);
+            assert!(
+                parse_transcript(&transcript, &request).is_err(),
+                "accepted invalid peer/generation/token/join case {index}"
+            );
+        }
+
+        let mut wrong_mask = request.clone();
+        wrong_mask.evidence.as_mut().unwrap().required_mask = 0x01FF;
+        assert!(
+            parse_transcript(
+                &capability_transcript(&request, &valid, "01", 0),
+                &wrong_mask,
+            )
+            .is_err()
+        );
+        fs::remove_dir_all(root).expect("remove semantic fixture");
     }
 
     #[test]
@@ -2633,7 +3946,7 @@ mod tests {
             event(0x0A, 3, 0xABCD_EF01, 0x0F, 0xCAFE_BABE),
         );
         assert!(parse_evidence_line(&exact_line, 1, TEST_EVIDENCE_NONCE).is_ok());
-        for length in 0..EVIDENCE_RECORD_BYTES {
+        for length in 0..DWEVID1_RECORD_BYTES {
             assert!(
                 parse_evidence_line(&exact_line[..length], 1, TEST_EVIDENCE_NONCE).is_err(),
                 "admitted DWEVID1 truncation at {length} bytes"
@@ -3015,6 +4328,7 @@ mod tests {
             ovmf_vars_template: root.join("OVMF_VARS.fd"),
             run_directory: root.join("runs"),
             evidence: None,
+            capability: None,
         };
         let artifacts = CandidateArtifacts {
             loader: request.loader.clone(),
@@ -3023,6 +4337,8 @@ mod tests {
             bootstrap: request.bootstrap.clone(),
             init0: request.init0.clone(),
             hello: request.hello.clone(),
+            selector_config: None,
+            selector_asset: None,
             ovmf_code: request.ovmf_code.clone(),
             ovmf_vars_template: request.ovmf_vars_template.clone(),
         };
@@ -3191,21 +4507,23 @@ mod tests {
         let smp = format!(
             "{{\"profile\":\"smp\",\"status\":\"PASS\",\"candidate_sha256\":\"{candidate}\"}}\n"
         );
-        let joined = join_profile_results(inspection, Ok(default.clone()), Ok(smp.clone()))
-            .expect("paired successful profiles rejected");
+        let (joined, _, _) =
+            join_profile_result_json(inspection, Ok(default.clone()), Ok(smp.clone()), 2)
+                .expect("paired successful profiles rejected");
         assert!(joined.contains("\"same_media\":true"));
         assert!(joined.contains("\"default\":{\"profile\":\"default\""));
         assert!(joined.contains("\"smp\":{\"profile\":\"smp\""));
 
         let mismatched = smp.replace(&candidate, &"b".repeat(64));
-        let failure = join_profile_results(inspection, Ok(default), Ok(mismatched))
+        let failure = join_profile_result_json(inspection, Ok(default), Ok(mismatched), 2)
             .expect_err("paired candidates with different exact bytes were accepted");
         assert!(failure.message.contains("different run-local candidates"));
 
-        let failure = join_profile_results(
+        let failure = join_profile_result_json(
             inspection,
             Err(Failure::task("default failed")),
             Err(Failure::task("smp failed")),
+            2,
         )
         .expect_err("paired failures were accepted");
         assert!(failure.message.contains("default: default failed"));
@@ -3266,6 +4584,7 @@ mod tests {
             ovmf_vars_template: root.join("OVMF_VARS.fd"),
             run_directory: root.join("runs"),
             evidence: None,
+            capability: None,
         };
         fs::write(&request.path, b"request").expect("write request");
         let outputs = CheckedOutputRoot::open(&request).expect("open checked output root");
@@ -3277,6 +4596,8 @@ mod tests {
             bootstrap: request.bootstrap.clone(),
             init0: request.init0.clone(),
             hello: request.hello.clone(),
+            selector_config: None,
+            selector_asset: None,
             ovmf_code: request.ovmf_code.clone(),
             ovmf_vars_template: request.ovmf_vars_template.clone(),
         };
@@ -3342,6 +4663,7 @@ mod tests {
             selector: "smp-runtime-acceptance".into(),
             test_id: 23,
             evidence: Some(EvidenceRequest {
+                protocol: EvidenceProtocol::Dwevid1,
                 nonce: TEST_EVIDENCE_NONCE,
                 required_mask: h_request::I1_REQUIRED_EVIDENCE_MASK,
             }),
@@ -3415,6 +4737,7 @@ mod tests {
             ovmf_vars_template: root.join("OVMF_VARS.fd"),
             run_directory: root.join("runs"),
             evidence: None,
+            capability: None,
         };
         let error = verify_candidate_inputs(&request).expect_err("mismatched symbols accepted");
         assert!(error.message.contains("do not exactly match"));
@@ -3474,6 +4797,7 @@ mod tests {
             ovmf_vars_template: root.join("OVMF_VARS.fd"),
             run_directory: root.join("runs"),
             evidence: None,
+            capability: None,
         };
         let artifacts = CandidateArtifacts {
             loader: request.loader.clone(),
@@ -3482,6 +4806,8 @@ mod tests {
             bootstrap: request.bootstrap.clone(),
             init0: request.init0.clone(),
             hello: request.hello.clone(),
+            selector_config: None,
+            selector_asset: None,
             ovmf_code: request.ovmf_code.clone(),
             ovmf_vars_template: request.ovmf_vars_template.clone(),
         };

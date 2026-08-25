@@ -63,12 +63,61 @@ const REQUIRED_KEYS_V3: &[&str] = &[
     "evidence_nonce",
     "required_evidence_mask",
 ];
+const REQUIRED_KEYS_V4: &[&str] = &[
+    "schema_version",
+    "deepwyrm_revision",
+    "wyrmroot_revision",
+    "rust_revision",
+    "selector",
+    "test_id",
+    "expected_outcome",
+    "expected_detail",
+    "timeout_seconds",
+    "loader",
+    "kernel",
+    "symbols",
+    "bootstrap",
+    "init0",
+    "hello",
+    "selector_config",
+    "selector_asset",
+    "bootfs",
+    "esp",
+    "provenance",
+    "ovmf_code",
+    "ovmf_vars_template",
+    "run_directory",
+    "evidence_protocol",
+    "evidence_nonce",
+    "required_evidence_mask",
+    "certificate",
+    "capability_summary",
+];
 
 pub(crate) const I1_SELECTOR: &str = "smp-runtime-acceptance";
 pub(crate) const I1_TEST_ID: u32 = 23;
 pub(crate) const I1_EVIDENCE_PROTOCOL: &str = "dwevid1";
 pub(crate) const I1_EVIDENCE_NONCE: u64 = 0x0123_4567_89AB_CDEF;
 pub(crate) const I1_REQUIRED_EVIDENCE_MASK: u32 = 255;
+pub(crate) const I_CAPABILITY_SELECTOR: &str = "native-userspace-capability";
+pub(crate) const I_CAPABILITY_TEST_ID: u32 = 24;
+pub(crate) const I_CAPABILITY_EVIDENCE_PROTOCOL: &str = "wrcap1";
+pub(crate) const I_CAPABILITY_REQUIRED_EVIDENCE_MASK: u32 = 0x03FF;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EvidenceProtocol {
+    Dwevid1,
+    Wrcap1,
+}
+
+impl EvidenceProtocol {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Dwevid1 => I1_EVIDENCE_PROTOCOL,
+            Self::Wrcap1 => I_CAPABILITY_EVIDENCE_PROTOCOL,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExpectedOutcome {
@@ -79,8 +128,17 @@ pub(crate) enum ExpectedOutcome {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct EvidenceRequest {
+    pub(crate) protocol: EvidenceProtocol,
     pub(crate) nonce: u64,
     pub(crate) required_mask: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CapabilityRequest {
+    pub(crate) selector_config: PathBuf,
+    pub(crate) selector_asset: PathBuf,
+    pub(crate) certificate: PathBuf,
+    pub(crate) capability_summary: PathBuf,
 }
 
 impl ExpectedOutcome {
@@ -119,6 +177,7 @@ pub(crate) struct HRequest {
     pub(crate) ovmf_vars_template: PathBuf,
     pub(crate) run_directory: PathBuf,
     pub(crate) evidence: Option<EvidenceRequest>,
+    pub(crate) capability: Option<CapabilityRequest>,
 }
 
 /// Stable request-root capability used for every WYR0-H output operation.
@@ -403,9 +462,10 @@ pub(crate) fn load(path: &Path) -> Result<HRequest, Failure> {
     let required_keys = match schema_version {
         2 => REQUIRED_KEYS_V2,
         3 => REQUIRED_KEYS_V3,
+        4 => REQUIRED_KEYS_V4,
         _ => {
             return Err(Failure::task(
-                "WYR0-H acceptance commands require schema_version = 2 or 3",
+                "WYR0-H acceptance commands require schema_version = 2, 3, or 4",
             ));
         }
     };
@@ -435,6 +495,11 @@ pub(crate) fn load(path: &Path) -> Result<HRequest, Failure> {
                     "WYR0-H I1 selector requires schema_version = 3",
                 ));
             }
+            if selector == I_CAPABILITY_SELECTOR {
+                return Err(Failure::task(
+                    "WYR0-H WYR0-I capability selector requires schema_version = 4",
+                ));
+            }
             None
         }
         3 => {
@@ -461,11 +526,55 @@ pub(crate) fn load(path: &Path) -> Result<HRequest, Failure> {
                 )));
             }
             Some(EvidenceRequest {
+                protocol: EvidenceProtocol::Dwevid1,
+                nonce,
+                required_mask,
+            })
+        }
+        4 => {
+            if selector != I_CAPABILITY_SELECTOR || test_id != I_CAPABILITY_TEST_ID {
+                return Err(Failure::task(format!(
+                    "WYR0-H schema_version = 4 is reserved for selector '{I_CAPABILITY_SELECTOR}' with test_id {I_CAPABILITY_TEST_ID}"
+                )));
+            }
+            if expected_outcome != ExpectedOutcome::Pass || expected_detail != 0 {
+                return Err(Failure::task(
+                    "WYR0-H schema_version = 4 requires expected_outcome = \"pass\" and expected_detail = 0",
+                ));
+            }
+            if required(&values, "evidence_protocol")? != I_CAPABILITY_EVIDENCE_PROTOCOL {
+                return Err(Failure::task(format!(
+                    "WYR0-H WYR0-I evidence_protocol must be '{I_CAPABILITY_EVIDENCE_PROTOCOL}'"
+                )));
+            }
+            let nonce = capability_evidence_nonce(&values)?;
+            let required_mask = number::<u32>(&values, "required_evidence_mask")?;
+            if required_mask != I_CAPABILITY_REQUIRED_EVIDENCE_MASK {
+                return Err(Failure::task(format!(
+                    "WYR0-H WYR0-I required_evidence_mask must be {I_CAPABILITY_REQUIRED_EVIDENCE_MASK}"
+                )));
+            }
+            Some(EvidenceRequest {
+                protocol: EvidenceProtocol::Wrcap1,
                 nonce,
                 required_mask,
             })
         }
         _ => unreachable!("schema version admitted above"),
+    };
+    let capability = if schema_version == 4 {
+        Some(CapabilityRequest {
+            selector_config: input_path(&parent, required(&values, "selector_config")?),
+            selector_asset: input_path(&parent, required(&values, "selector_asset")?),
+            certificate: output_path(&parent, required(&values, "certificate")?, "certificate")?,
+            capability_summary: output_path(
+                &parent,
+                required(&values, "capability_summary")?,
+                "capability_summary",
+            )?,
+        })
+    } else {
+        None
     };
     let request = HRequest {
         path,
@@ -496,6 +605,7 @@ pub(crate) fn load(path: &Path) -> Result<HRequest, Failure> {
             "run_directory",
         )?,
         evidence,
+        capability,
     };
     if request.test_id == 0 {
         return Err(Failure::task("WYR0-H test_id must be nonzero"));
@@ -650,6 +760,27 @@ fn evidence_nonce(values: &BTreeMap<String, String>) -> Result<u64, Failure> {
     Ok(nonce)
 }
 
+fn capability_evidence_nonce(values: &BTreeMap<String, String>) -> Result<u64, Failure> {
+    let value = required(values, "evidence_nonce")?;
+    if value.len() != 16
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'A'..=b'F').contains(&byte))
+    {
+        return Err(Failure::task(
+            "WYR0-H WYR0-I evidence_nonce must be 16 uppercase hexadecimal digits",
+        ));
+    }
+    let nonce = u64::from_str_radix(value, 16)
+        .map_err(|_| Failure::task("WYR0-H WYR0-I evidence_nonce is not a valid u64"))?;
+    if nonce == 0 {
+        return Err(Failure::task(
+            "WYR0-H WYR0-I evidence_nonce must be nonzero",
+        ));
+    }
+    Ok(nonce)
+}
+
 fn input_path(parent: &Path, value: &str) -> PathBuf {
     let path = Path::new(value);
     if path.is_absolute() {
@@ -678,12 +809,25 @@ fn output_path(parent: &Path, value: &str, label: &str) -> Result<PathBuf, Failu
 }
 
 fn reject_output_aliases(request: &HRequest) -> Result<(), Failure> {
-    let outputs = [
+    let mut outputs = vec![
         (&request.bootfs, "bootfs"),
         (&request.esp, "esp"),
         (&request.provenance, "provenance"),
         (&request.run_directory, "run_directory"),
     ];
+    if let Some(capability) = &request.capability {
+        outputs.push((&capability.certificate, "certificate"));
+        outputs.push((&capability.capability_summary, "capability_summary"));
+        if capability.certificate.starts_with(&request.run_directory)
+            || capability
+                .capability_summary
+                .starts_with(&request.run_directory)
+        {
+            return Err(Failure::task(
+                "WYR0-H capability outputs must not be nested under run_directory",
+            ));
+        }
+    }
     for (index, (left, left_label)) in outputs.iter().enumerate() {
         for (right, right_label) in outputs.iter().skip(index + 1) {
             if left == right {
@@ -701,12 +845,17 @@ fn reject_output_aliases(request: &HRequest) -> Result<(), Failure> {
 /// each output open/create boundary as well as during request admission.
 pub(crate) fn validate_outputs(request: &HRequest) -> Result<(), Failure> {
     reject_output_aliases(request)?;
-    for (path, label) in [
+    let mut outputs = vec![
         (&request.bootfs, "bootfs"),
         (&request.esp, "esp"),
         (&request.provenance, "provenance"),
         (&request.run_directory, "run_directory"),
-    ] {
+    ];
+    if let Some(capability) = &request.capability {
+        outputs.push((&capability.certificate, "certificate"));
+        outputs.push((&capability.capability_summary, "capability_summary"));
+    }
+    for (path, label) in outputs {
         validate_output_parent(request, path, label)?;
     }
     validate_run_directory(request)
@@ -857,6 +1006,31 @@ mod tests {
             )
     }
 
+    fn valid_v4() -> String {
+        valid_v2()
+            .replace("schema_version = 2", "schema_version = 4")
+            .replace(
+                "selector = \"primordial-bootstrap\"",
+                "selector = \"native-userspace-capability\"",
+            )
+            .replace("test_id = 18", "test_id = 24")
+            .replace(
+                "hello = \"hello.elf\"\n",
+                concat!(
+                    "hello = \"hello.elf\"\n",
+                    "selector_config = \"selector-config.toml\"\n",
+                    "selector_asset = \"selector-asset.bin\"\n"
+                ),
+            )
+            + concat!(
+                "evidence_protocol = \"wrcap1\"\n",
+                "evidence_nonce = \"89ABCDEF01234567\"\n",
+                "required_evidence_mask = 1023\n",
+                "certificate = \"wyr0-i/certificate.json\"\n",
+                "capability_summary = \"wyr0-i/capability.md\"\n"
+            )
+    }
+
     fn request_root(label: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target")
@@ -987,6 +1161,7 @@ mod tests {
         assert_eq!(
             loaded.evidence,
             Some(EvidenceRequest {
+                protocol: EvidenceProtocol::Dwevid1,
                 nonce: 0x0123_4567_89AB_CDEF,
                 required_mask: I1_REQUIRED_EVIDENCE_MASK,
             })
@@ -1087,6 +1262,122 @@ mod tests {
             assert!(load(&path).is_err(), "admitted invalid {label}");
             fs::remove_dir_all(root).expect("remove evidence fixture");
         }
+    }
+
+    #[test]
+    fn schema_four_is_reserved_for_the_exact_wyr0_i_capability_contract() {
+        let root = request_root("v4");
+        let path = write_request_fixture(&root, &valid_v4());
+        let loaded = load(&path).expect("valid WYR0-I capability request rejected");
+        assert_eq!(loaded.schema_version, 4);
+        assert_eq!(loaded.selector, I_CAPABILITY_SELECTOR);
+        assert_eq!(loaded.test_id, I_CAPABILITY_TEST_ID);
+        assert_eq!(
+            loaded.evidence,
+            Some(EvidenceRequest {
+                protocol: EvidenceProtocol::Wrcap1,
+                nonce: 0x89AB_CDEF_0123_4567,
+                required_mask: I_CAPABILITY_REQUIRED_EVIDENCE_MASK,
+            })
+        );
+        let capability = loaded
+            .capability
+            .expect("schema 4 omitted capability paths");
+        let canonical_root = fs::canonicalize(&root).expect("canonical request root");
+        assert_eq!(
+            capability.selector_config,
+            canonical_root.join("selector-config.toml")
+        );
+        assert_eq!(
+            capability.selector_asset,
+            canonical_root.join("selector-asset.bin")
+        );
+        assert_eq!(
+            capability.certificate,
+            canonical_root.join("wyr0-i/certificate.json")
+        );
+        assert_eq!(
+            capability.capability_summary,
+            canonical_root.join("wyr0-i/capability.md")
+        );
+
+        for (label, request) in [
+            (
+                "v2-capability",
+                valid_v4()
+                    .replace("schema_version = 4", "schema_version = 2")
+                    .replace("selector_config = \"selector-config.toml\"\n", "")
+                    .replace("selector_asset = \"selector-asset.bin\"\n", "")
+                    .replace("evidence_protocol = \"wrcap1\"\n", "")
+                    .replace("evidence_nonce = \"89ABCDEF01234567\"\n", "")
+                    .replace("required_evidence_mask = 1023\n", "")
+                    .replace("certificate = \"wyr0-i/certificate.json\"\n", "")
+                    .replace("capability_summary = \"wyr0-i/capability.md\"\n", ""),
+            ),
+            (
+                "v4-selector",
+                valid_v4().replace(
+                    "selector = \"native-userspace-capability\"",
+                    "selector = \"primordial-bootstrap\"",
+                ),
+            ),
+            (
+                "v4-test-id",
+                valid_v4().replace("test_id = 24", "test_id = 23"),
+            ),
+            (
+                "v4-outcome",
+                valid_v4().replace("expected_outcome = \"pass\"", "expected_outcome = \"fail\""),
+            ),
+            (
+                "v4-detail",
+                valid_v4().replace("expected_detail = 0", "expected_detail = 1"),
+            ),
+            (
+                "v4-protocol",
+                valid_v4().replace("\"wrcap1\"", "\"WRCAP1\""),
+            ),
+            (
+                "v4-nonce-lower",
+                valid_v4().replace("89ABCDEF01234567", "89abcdef01234567"),
+            ),
+            (
+                "v4-nonce-zero",
+                valid_v4().replace("89ABCDEF01234567", "0000000000000000"),
+            ),
+            (
+                "v4-mask",
+                valid_v4().replace(
+                    "required_evidence_mask = 1023",
+                    "required_evidence_mask = 1022",
+                ),
+            ),
+            ("v4-extra", format!("{}unexpected = 1\n", valid_v4())),
+            (
+                "v4-missing-output",
+                valid_v4().replace("certificate = \"wyr0-i/certificate.json\"\n", ""),
+            ),
+            (
+                "v4-output-alias",
+                valid_v4().replace(
+                    "capability_summary = \"wyr0-i/capability.md\"",
+                    "capability_summary = \"wyr0-i/certificate.json\"",
+                ),
+            ),
+            (
+                "v4-output-under-runs",
+                valid_v4().replace(
+                    "certificate = \"wyr0-i/certificate.json\"",
+                    "certificate = \"runs/default/result.json\"",
+                ),
+            ),
+        ] {
+            let invalid_root = request_root(label);
+            let invalid_path = write_request_fixture(&invalid_root, &request);
+            assert!(load(&invalid_path).is_err(), "admitted invalid {label}");
+            fs::remove_dir_all(invalid_root).expect("remove invalid fixture");
+        }
+        fs::remove_dir_all(root).expect("remove request fixture");
     }
 
     #[test]
