@@ -634,7 +634,7 @@ fn write_capability_certificate(
         }
     }
 
-    verify_source_revisions(request)?;
+    let source = verify_source_revisions(request)?;
     let current = verify_candidate_inputs(request)?;
     if &current != artifacts {
         return Err(Failure::task(
@@ -669,9 +669,9 @@ fn write_capability_certificate(
             "\"certificate_kind\":\"wyr0-i-native-userspace-capability\",",
             "\"status\":\"PASS\",\"acceptance\":true,",
             "\"selector\":\"native-userspace-capability\",\"test_id\":24,",
-            "\"source\":{{\"deepwyrm_revision\":\"{}\",\"deepwyrm_clean\":true,",
-            "\"wyrmroot_revision\":\"{}\",\"wyrmroot_clean\":true,",
-            "\"rust_revision\":\"{}\",\"rust_clean\":true}},",
+            "\"source\":{{\"deepwyrm_revision\":\"{}\",\"deepwyrm_clean\":{},",
+            "\"wyrmroot_revision\":\"{}\",\"wyrmroot_clean\":{},",
+            "\"rust_revision\":\"{}\",\"rust_clean\":{}}},",
             "\"abi\":{{\"deepwyrm_abi_tree\":\"{}\",\"generated_schema_bound\":{}}},",
             "\"toolchain\":{{\"rust_target\":\"{}\",\"rust_toolchain_name\":\"{}\",",
             "\"llvm_build_version\":\"{}\",\"rust_lld_sha256\":\"{}\",",
@@ -702,9 +702,12 @@ fn write_capability_certificate(
             "\"inherited_evidence\":{{\"i0_i1_i2\":\"{}\",\"d0\":\"{}\"}},",
             "\"wyr0_gw_claimed\":false}}\n"
         ),
-        request.deepwyrm_revision,
-        request.wyrmroot_revision,
-        request.rust_revision,
+        source.deepwyrm.revision,
+        source.deepwyrm.clean,
+        source.wyrmroot.revision,
+        source.wyrmroot.clean,
+        source.rust.revision,
+        source.rust.clean,
         identity.deepwyrm_abi_tree,
         identity.generated_schema_bound,
         identity.rust_target,
@@ -787,7 +790,7 @@ fn write_capability_outputs(
         summary,
         "WYR0-I capability summary",
     )?;
-    let staged_certificate = staged_certificate_path(&capability.certificate)?;
+    let staged_certificate = h_request::staged_certificate_path(&capability.certificate)?;
     let staged_file = match write_new_retained(
         outputs,
         &staged_certificate,
@@ -841,15 +844,6 @@ fn write_capability_outputs(
         ));
     }
     Ok(())
-}
-
-fn staged_certificate_path(certificate: &Path) -> Result<PathBuf, Failure> {
-    let name = certificate
-        .file_name()
-        .ok_or_else(|| Failure::task("WYR0-I capability certificate has no file name"))?;
-    let mut staged = name.to_os_string();
-    staged.push(".staged");
-    Ok(certificate.with_file_name(staged))
 }
 
 fn publish_staged_certificate(
@@ -3390,34 +3384,51 @@ fn cleanup_after_kill_failure(killed: bool, suffix: &str) -> CleanupDisposition 
     }
 }
 
-fn verify_source_revisions(request: &HRequest) -> Result<(), Failure> {
+#[derive(Debug, Eq, PartialEq)]
+struct SourceState {
+    revision: String,
+    clean: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SourceQualification {
+    deepwyrm: SourceState,
+    wyrmroot: SourceState,
+    rust: SourceState,
+}
+
+fn verify_source_revisions(request: &HRequest) -> Result<SourceQualification, Failure> {
     let repository = crate::tasks::repository_root()?;
     let workspace = source_workspace_root(&repository)?;
     let deepwyrm = workspace.join("deepwyrm");
     let rust = workspace.join("rust");
-    for (path, expected, label) in [
-        (&repository, request.wyrmroot_revision.as_str(), "Wyrmroot"),
-        (&deepwyrm, request.deepwyrm_revision.as_str(), "Deepwyrm"),
-        (&rust, request.rust_revision.as_str(), "Rust"),
-    ] {
-        let revision = git_output(path, &["rev-parse", "HEAD"], label)?;
-        if revision.trim() != expected {
-            return Err(Failure::task(format!(
-                "WYR0-H request {label} revision does not match the current checkout"
-            )));
-        }
-        let dirty = git_output(
-            path,
-            &["status", "--porcelain", "--untracked-files=no"],
-            label,
-        )?;
-        if !dirty.trim().is_empty() {
-            return Err(Failure::task(format!(
-                "WYR0-H requires a clean tracked {label} checkout for exact revision provenance"
-            )));
-        }
+    Ok(SourceQualification {
+        deepwyrm: qualify_source(&deepwyrm, &request.deepwyrm_revision, "Deepwyrm")?,
+        wyrmroot: qualify_source(&repository, &request.wyrmroot_revision, "Wyrmroot")?,
+        rust: qualify_source(&rust, &request.rust_revision, "Rust")?,
+    })
+}
+
+fn qualify_source(repository: &Path, expected: &str, label: &str) -> Result<SourceState, Failure> {
+    let revision = git_output(repository, &["rev-parse", "HEAD"], label)?;
+    let revision = revision.trim().to_owned();
+    if revision != expected {
+        return Err(Failure::task(format!(
+            "WYR0-H request {label} revision does not match the current checkout"
+        )));
     }
-    Ok(())
+    let dirty = git_output(
+        repository,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+        label,
+    )?;
+    let clean = dirty.is_empty();
+    if !clean {
+        return Err(Failure::task(format!(
+            "WYR0-H requires a clean {label} checkout, including untracked files, for exact revision provenance"
+        )));
+    }
+    Ok(SourceState { revision, clean })
 }
 
 fn source_workspace_root(repository: &Path) -> Result<PathBuf, Failure> {
@@ -3698,6 +3709,76 @@ mod tests {
         assert_eq!(source_workspace_root(&detached).unwrap(), workspace);
 
         fs::remove_dir_all(root).expect("remove source-workspace fixture");
+    }
+
+    #[test]
+    fn source_qualification_rejects_tracked_and_untracked_changes() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!(
+                "xtask-source-qualification-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock before epoch")
+                    .as_nanos()
+            ));
+        fs::create_dir_all(&root).expect("create source qualification fixture");
+        run_git(&root, &["init", "-q"]);
+        fs::write(root.join("tracked"), b"accepted\n").expect("write tracked fixture");
+        run_git(&root, &["add", "tracked"]);
+        run_git(
+            &root,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=Codex Test",
+                "-c",
+                "user.email=codex-test@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "fixture",
+            ],
+        );
+        let revision = git_output(&root, &["rev-parse", "HEAD"], "fixture")
+            .expect("read fixture revision")
+            .trim()
+            .to_owned();
+
+        assert_eq!(
+            qualify_source(&root, &revision, "fixture").expect("qualify clean fixture"),
+            SourceState {
+                revision: revision.clone(),
+                clean: true,
+            }
+        );
+
+        fs::write(root.join("untracked"), b"not certified\n").expect("write untracked fixture");
+        let error = qualify_source(&root, &revision, "fixture")
+            .expect_err("qualified a checkout with an untracked file");
+        assert!(error.message.contains("including untracked files"));
+        fs::remove_file(root.join("untracked")).expect("remove untracked fixture");
+
+        fs::write(root.join("tracked"), b"modified\n").expect("modify tracked fixture");
+        assert!(qualify_source(&root, &revision, "fixture").is_err());
+
+        fs::remove_dir_all(root).expect("remove source qualification fixture");
+    }
+
+    fn run_git(repository: &Path, arguments: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(repository)
+            .args(arguments)
+            .stdin(Stdio::null())
+            .status()
+            .expect("run fixture Git command");
+        assert!(
+            status.success(),
+            "fixture Git command failed: {arguments:?}"
+        );
     }
 
     fn test_stable_file(path: PathBuf, bytes: &[u8], immutable: bool) -> StableRunFile {
@@ -4576,7 +4657,8 @@ mod tests {
         );
 
         fs::remove_file(&capability.capability_summary).expect("remove summary collision");
-        let staged_certificate = staged_certificate_path(&capability.certificate).unwrap();
+        let staged_certificate =
+            h_request::staged_certificate_path(&capability.certificate).unwrap();
         fs::write(&staged_certificate, b"stale staged certificate")
             .expect("write staged certificate collision");
         assert!(
@@ -4611,7 +4693,8 @@ mod tests {
         let (root, request) = capability_request("certificate-stage-swap");
         let capability = request.capability.as_ref().expect("capability outputs");
         let outputs = CheckedOutputRoot::open(&request).expect("open output root");
-        let staged_certificate = staged_certificate_path(&capability.certificate).unwrap();
+        let staged_certificate =
+            h_request::staged_certificate_path(&capability.certificate).unwrap();
         let staged_file = write_new_retained(
             &outputs,
             &staged_certificate,
@@ -4705,11 +4788,10 @@ mod tests {
     #[test]
     fn certificate_identity_uses_the_accepted_record_not_host_llvm_programs() {
         let (root, mut request) = capability_request("certificate-identity");
-        let deepwyrm = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .map(|ancestor| ancestor.join("deepwyrm"))
-            .find(|candidate| candidate.is_dir())
-            .expect("locate sibling Deepwyrm");
+        let repository = crate::tasks::repository_root().expect("locate Wyrmroot repository");
+        let deepwyrm = source_workspace_root(&repository)
+            .expect("locate source workspace")
+            .join("deepwyrm");
         request.deepwyrm_revision = git_output(&deepwyrm, &["rev-parse", "HEAD"], "Deepwyrm")
             .expect("read current Deepwyrm revision")
             .trim()

@@ -820,34 +820,38 @@ fn output_path(parent: &Path, value: &str, label: &str) -> Result<PathBuf, Failu
 
 fn reject_output_aliases(request: &HRequest) -> Result<(), Failure> {
     let mut outputs = vec![
-        (&request.bootfs, "bootfs"),
-        (&request.esp, "esp"),
-        (&request.provenance, "provenance"),
-        (&request.run_directory, "run_directory"),
+        (request.bootfs.clone(), "bootfs"),
+        (request.esp.clone(), "esp"),
+        (request.provenance.clone(), "provenance"),
+        (request.run_directory.clone(), "run_directory"),
     ];
     if let Some(capability) = &request.capability {
-        outputs.push((&capability.certificate, "certificate"));
-        outputs.push((&capability.capability_summary, "capability_summary"));
-        if capability.certificate.starts_with(&request.run_directory)
-            || capability
-                .capability_summary
-                .starts_with(&request.run_directory)
-        {
-            return Err(Failure::task(
-                "WYR0-H capability outputs must not be nested under run_directory",
-            ));
-        }
+        outputs.push((capability.certificate.clone(), "certificate"));
+        outputs.push((capability.capability_summary.clone(), "capability_summary"));
+        outputs.push((
+            staged_certificate_path(&capability.certificate)?,
+            "implicit staged certificate",
+        ));
     }
     for (index, (left, left_label)) in outputs.iter().enumerate() {
         for (right, right_label) in outputs.iter().skip(index + 1) {
-            if left == right {
+            if left == right || left.starts_with(right) || right.starts_with(left) {
                 return Err(Failure::task(format!(
-                    "WYR0-H {left_label} and {right_label} paths alias"
+                    "WYR0-H {left_label} and {right_label} output paths overlap"
                 )));
             }
         }
     }
     Ok(())
+}
+
+pub(crate) fn staged_certificate_path(certificate: &Path) -> Result<PathBuf, Failure> {
+    let name = certificate
+        .file_name()
+        .ok_or_else(|| Failure::task("WYR0-I capability certificate has no file name"))?;
+    let mut staged = name.to_os_string();
+    staged.push(".staged");
+    Ok(certificate.with_file_name(staged))
 }
 
 /// Output names are lexically request-relative, but a pre-existing directory
@@ -1379,6 +1383,34 @@ mod tests {
                 valid_v4().replace(
                     "certificate = \"wyr0-i/certificate.json\"",
                     "certificate = \"runs/default/result.json\"",
+                ),
+            ),
+            (
+                "v4-output-equals-implicit-stage",
+                valid_v4().replace(
+                    "capability_summary = \"wyr0-i/capability.md\"",
+                    "capability_summary = \"wyr0-i/certificate.json.staged\"",
+                ),
+            ),
+            (
+                "v4-output-ancestor",
+                valid_v4().replace(
+                    "capability_summary = \"wyr0-i/capability.md\"",
+                    "capability_summary = \"wyr0-i\"",
+                ),
+            ),
+            (
+                "v4-output-descendant",
+                valid_v4().replace(
+                    "capability_summary = \"wyr0-i/capability.md\"",
+                    "capability_summary = \"wyr0-i/certificate.json/details\"",
+                ),
+            ),
+            (
+                "v4-non-capability-output-overlap",
+                valid_v4().replace(
+                    "esp = \"media/wyrmroot-esp.img\"",
+                    "esp = \"media/bootfs.img/esp\"",
                 ),
             ),
         ] {
