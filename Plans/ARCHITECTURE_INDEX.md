@@ -19,6 +19,7 @@ This file defines the minimum architecture reading set for Wyrmroot implementati
 
 ## Reached subsystem contracts
 
+- [`Plans/WYR1_BOOTSTRAP_SUPERVISOR_CONTRACT.md`](WYR1_BOOTSTRAP_SUPERVISOR_CONTRACT.md) defines the reached WYR1-A permanent `/system/init` handoff, immutable bootfs/RRC-A manifest, fixed bootstrap graph, generation-exact READY/restart/reap behavior, capability distribution, and finite degraded-recovery transition. Read it before implementing or changing WYR1 supervision and recovery-residency behavior.
 - [`Plans/WYR0_BOOTFS_FORMAT_CONTRACT.md`](WYR0_BOOTFS_FORMAT_CONTRACT.md) defines the canonical
   deterministic archive subset implemented by WYR0-C. Read it before changing bootfs builder,
   parser, lookup, content-manifest, or archive-intake behavior.
