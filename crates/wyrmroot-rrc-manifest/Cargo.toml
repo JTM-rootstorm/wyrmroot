@@ -1,0 +1,17 @@
+[package]
+name = "wyrmroot-rrc-manifest"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+description = "Deterministic Wyrmroot RRC-A manifest format"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+builder = []
+
+[dependencies]
+wyrmroot-bootfs = { path = "../wyrmroot-bootfs" }

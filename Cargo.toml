@@ -5,6 +5,7 @@ members = [
     "crates/wyrmroot-bootfs",
     "crates/wyrmroot-bootstrap-proto",
     "crates/wyrmroot-loader",
+    "crates/wyrmroot-rrc-manifest",
     "crates/wyrmroot-runtime",
     "loader",
     "tools/xtask",
