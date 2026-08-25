@@ -13,6 +13,14 @@ use wyrmroot_loader::launch::{self, HEADER_BYTES, LaunchError};
 
 use crate::{NativeError, ReceiveCounts, query_task_termination_info, receive_channel, wait_many};
 
+mod restart;
+
+pub use restart::{
+    AttemptFailure, AttemptRecord, CleanupAction, CleanupDisposition, RestartHistory, RestartState,
+    RestartSupervisor, RestartTransitionError, SupervisionPolicy, TerminalDisposition,
+    WYR0_I_SUPERVISION_POLICY,
+};
+
 const CHANNEL_SIGNALS: deepwyrm_syscall::DwSignals =
     deepwyrm_syscall::DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0);
 

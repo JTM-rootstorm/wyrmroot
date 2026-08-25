@@ -20,6 +20,10 @@ const TEST_SUPPORT_SOURCE: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/test_support.rs"));
 const SUPERVISION_SOURCE: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/supervision.rs"));
+const RESTART_SUPERVISION_SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/supervision/restart.rs"
+));
 const MANIFEST: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
 
 #[test]
@@ -48,6 +52,32 @@ fn supervision_stays_bounded_and_uses_structured_process_exit() {
     assert!(SUPERVISION_SOURCE.contains("validate_successful_exit"));
     assert!(SUPERVISION_SOURCE.contains("DW_TERMINATION_NORMAL_EXIT"));
     assert!(!SUPERVISION_SOURCE.contains("DW_SYSCALL_"));
+}
+
+#[test]
+fn restart_supervision_is_finite_generation_safe_native_policy() {
+    for required in [
+        "WYR0_I_SUPERVISION_POLICY",
+        "max_attempts: 4",
+        "backoff_ns: 25_000_000",
+        "restart_window_ns: 2_000_000_000",
+        "ready_timeout_ns: 1_000_000_000",
+        "cleanup_timeout_ns: 1_000_000_000",
+        "RestartState::PermanentFailure",
+        "CleanupAction::TerminateTaskGroup",
+        "checked_add",
+    ] {
+        assert!(
+            RESTART_SUPERVISION_SOURCE.contains(required),
+            "missing restart-supervision contract marker {required}"
+        );
+    }
+    for forbidden in ["std::", "libc", "signal(", "filesystem", "service registry"] {
+        assert!(
+            !RESTART_SUPERVISION_SOURCE.contains(forbidden),
+            "restart supervision imported forbidden service-manager surface {forbidden}"
+        );
+    }
 }
 
 #[test]

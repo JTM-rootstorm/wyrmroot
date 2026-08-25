@@ -48,8 +48,11 @@ pub use startup::{
     with_native_startup,
 };
 pub use supervision::{
-    ExitObservedReadinessError, ExitValidationError, NativeSupervisionPlatform, SupervisionError,
-    SupervisionPlatform, supervise_child, supervise_native_child, validate_successful_exit,
+    AttemptFailure, AttemptRecord, CleanupAction, CleanupDisposition, ExitObservedReadinessError,
+    ExitValidationError, NativeSupervisionPlatform, RestartHistory, RestartState,
+    RestartSupervisor, RestartTransitionError, SupervisionError, SupervisionPlatform,
+    SupervisionPolicy, TerminalDisposition, WYR0_I_SUPERVISION_POLICY, supervise_child,
+    supervise_native_child, validate_successful_exit,
 };
 #[cfg(feature = "primordial-test-support")]
 pub use test_support::{
