@@ -31,6 +31,10 @@ pub const I2_SEED: u32 = 0x49_32_53_54;
 const ITERATIONS: usize = 32;
 const BACKPRESSURE_LIMIT: usize = 256;
 const PAGE: u64 = 4096;
+// Process dispatch and terminal publication require another vCPU to run.  Keep
+// this comfortably above the deliberate nanosecond/millisecond timeout probes
+// so host scheduling pressure cannot turn the lifecycle oracle into a flake.
+const LIFECYCLE_SCHEDULING_TIMEOUT_NS: u64 = 1_000_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -424,7 +428,7 @@ fn exercise_lifecycle(root: DwHandle, bootfs: DwHandle, task_group: DwHandle) ->
             normal.process,
             normal.launch_channel,
             0x2201,
-            future_deadline(5_000_000)?,
+            future_deadline(LIFECYCLE_SCHEDULING_TIMEOUT_NS)?,
         );
         close_handle(normal.launch_channel).map_err(|_| failure(Stage::Lifecycle, 18))?;
         close_handle(normal.process).map_err(|_| failure(Stage::Lifecycle, 19))?;
@@ -470,7 +474,7 @@ fn exercise_lifecycle(root: DwHandle, bootfs: DwHandle, task_group: DwHandle) ->
             deepwyrm_syscall::wait_one(
                 held.process,
                 DW_SIGNAL_EXITED,
-                future_deadline(5_000_000)?,
+                future_deadline(LIFECYCLE_SCHEDULING_TIMEOUT_NS)?,
                 &mut terminal,
             ),
             Stage::Lifecycle,
@@ -482,7 +486,7 @@ fn exercise_lifecycle(root: DwHandle, bootfs: DwHandle, task_group: DwHandle) ->
             released.process,
             released.launch_channel,
             0x2203,
-            future_deadline(5_000_000)?,
+            future_deadline(LIFECYCLE_SCHEDULING_TIMEOUT_NS)?,
         );
         close_handle(released.launch_channel).map_err(|_| failure(Stage::Lifecycle, 28))?;
         close_handle(released.process).map_err(|_| failure(Stage::Lifecycle, 29))?;
@@ -504,7 +508,7 @@ fn exercise_lifecycle(root: DwHandle, bootfs: DwHandle, task_group: DwHandle) ->
             deepwyrm_syscall::wait_one(
                 exception.process,
                 DW_SIGNAL_EXITED,
-                future_deadline(5_000_000)?,
+                future_deadline(LIFECYCLE_SCHEDULING_TIMEOUT_NS)?,
                 &mut exception_wait,
             ),
             Stage::Lifecycle,

@@ -19,6 +19,10 @@ The deterministic seed is `0x49325354`; every stage runs at most 32 channel
 iterations.  An application failure is `0x22SSOOOO`, where `SS` is the stage
 and `OOOO` the exact failed operation.  This propagates through init0's
 existing structured Process exit and the selector's terminal result.
+Lifecycle waits that depend on another vCPU receiving dispatch use a one-second
+active-monotonic bound.  The intentionally tiny nanosecond/millisecond timeout
+probes remain unchanged; they test timeout semantics rather than scheduling
+latency.
 
 - Handle stage duplicates an immutable bootfs capability, move-transfers it
   through a new Channel, receives and closes it, then proves the closed value
