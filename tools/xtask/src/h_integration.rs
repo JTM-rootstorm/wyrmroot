@@ -10,6 +10,8 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use deepwyrm_abi::{DW_RIGHT_INSPECT, DW_RIGHT_MAP, DW_RIGHT_READ, DW_TERMINATION_AUTHORIZED};
+
 use wyrmroot_bootfs::builder::{Builder, FileMode};
 
 use crate::cli::{G3ImageArguments, HProfile};
@@ -27,6 +29,9 @@ const MAX_SERIAL_BYTES: u64 = 16 * 1024 * 1024;
 const COMPLETION_RECORD_BYTES: usize = 38;
 const DWEVID1_RECORD_BYTES: usize = 85;
 const WRCAP1_RECORD_BYTES: usize = 117;
+const WYR0_I_CAPABILITY_EVENT_COUNT: u32 = 15;
+const WYR0_I_MEMORY_RIGHTS: u64 = DW_RIGHT_READ.0 | DW_RIGHT_MAP.0 | DW_RIGHT_INSPECT.0;
+const WYR0_I_AUTHORIZED_TERMINATION: u64 = DW_TERMINATION_AUTHORIZED.0 as u64;
 const MAX_EVIDENCE_RECORDS: usize = 64;
 const MAX_SELECTOR_CONTENT_BYTES: u64 = 64 * 1024;
 const WYR0_I_CONFIG_BOOTFS_PATH: &[u8] = b"test/wyr0-i/config.toml";
@@ -587,7 +592,7 @@ fn write_capability_certificate(
         }
         if result_number_field(result, "required_evidence_mask")? != evidence.required_mask
             || result_number_field(result, "observed_evidence_mask")? != evidence.required_mask
-            || result_number_field(result, "evidence_event_count")? != 10
+            || result_number_field(result, "evidence_event_count")? != WYR0_I_CAPABILITY_EVENT_COUNT
         {
             return Err(Failure::task(format!(
                 "WYR0-I {profile} result does not contain the exact fully validated capability evidence"
@@ -683,7 +688,7 @@ fn write_capability_certificate(
             "\"no_host_share\":true,\"no_network\":true}},",
             "\"evidence\":{{\"protocol\":\"wrcap1\",\"version\":1,",
             "\"nonce\":\"{:016X}\",\"required_mask\":{},\"observed_mask\":{},",
-            "\"event_count_per_profile\":10,\"result\":\"PASS\"}},",
+            "\"event_count_per_profile\":{},\"result\":\"PASS\"}},",
             "\"accounting_enforcement\":{{",
             "\"kernel\":[\"bounded Channel envelope and native object invariants\"],",
             "\"wyrmroot\":[\"controller-owned admission, reservation, replay, and cleanup classes\"],",
@@ -721,6 +726,7 @@ fn write_capability_certificate(
         evidence.nonce,
         evidence.required_mask,
         evidence.required_mask,
+        WYR0_I_CAPABILITY_EVENT_COUNT,
         WYR0_I_INHERITED_I0_I1_I2,
         WYR0_I_INHERITED_D0,
     );
@@ -748,16 +754,30 @@ fn write_capability_certificate(
         WYR0_I_INHERITED_D0,
     );
 
+    write_capability_outputs(
+        outputs,
+        capability,
+        certificate.as_bytes(),
+        summary.as_bytes(),
+    )
+}
+
+fn write_capability_outputs(
+    outputs: &CheckedOutputRoot,
+    capability: &CapabilityRequest,
+    certificate: &[u8],
+    summary: &[u8],
+) -> Result<(), Failure> {
     write_new(
         outputs,
         &capability.certificate,
-        certificate.as_bytes(),
+        certificate,
         "WYR0-I capability certificate",
     )?;
     if let Err(error) = write_new(
         outputs,
         &capability.capability_summary,
-        summary.as_bytes(),
+        summary,
         "WYR0-I capability summary",
     ) {
         remove_created(
@@ -2284,34 +2304,36 @@ fn validate_capability_evidence(
     request: &HRequest,
     required_evidence_mask: u32,
 ) -> Result<ValidatedEvidence, Failure> {
-    if events.len() != 10 {
+    if events.len() != WYR0_I_CAPABILITY_EVENT_COUNT as usize {
         return Err(Failure::task(format!(
-            "WYR0-I evidence requires exactly ten canonical records; observed {}",
+            "WYR0-I evidence requires exactly {WYR0_I_CAPABILITY_EVENT_COUNT} canonical records; observed {}",
             events.len()
         )));
     }
-    let mut seen_kinds = 0_u32;
-    let mut tokens = BTreeSet::new();
-    for (index, event) in events.iter().copied().enumerate() {
-        let expected_kind = u8::try_from(index + 1).expect("ten capability kinds fit u8");
-        if event.kind.value() != expected_kind {
+    let expected_kinds = [
+        CapabilityEvidenceKind::ContentDelivery,
+        CapabilityEvidenceKind::ProcessLifecycle,
+        CapabilityEvidenceKind::ProcessLifecycle,
+        CapabilityEvidenceKind::MemoryShare,
+        CapabilityEvidenceKind::ChannelLifecycle,
+        CapabilityEvidenceKind::WaitEventTimer,
+        CapabilityEvidenceKind::Cancellation,
+        CapabilityEvidenceKind::RestartReplacement,
+        CapabilityEvidenceKind::RestartReplacement,
+        CapabilityEvidenceKind::RestartExhausted,
+        CapabilityEvidenceKind::RestartExhausted,
+        CapabilityEvidenceKind::RestartExhausted,
+        CapabilityEvidenceKind::RestartExhausted,
+        CapabilityEvidenceKind::OverloadReplayRejected,
+        CapabilityEvidenceKind::CleanupBaseline,
+    ];
+    for (event, expected_kind) in events.iter().zip(expected_kinds) {
+        if event.kind != expected_kind {
             return Err(Failure::task(format!(
-                "serial line {} has WRCAP1 kind {:02X} out of canonical order; expected {expected_kind:02X}",
+                "serial line {} has WRCAP1 kind {:02X} out of canonical order; expected {:02X}",
                 event.line,
-                event.kind.value()
-            )));
-        }
-        if seen_kinds & event.kind.bit() != 0 {
-            return Err(Failure::task(format!(
-                "serial line {} duplicates a WRCAP1 capability kind",
-                event.line
-            )));
-        }
-        seen_kinds |= event.kind.bit();
-        if event.token != 0 && !tokens.insert(event.token) {
-            return Err(Failure::task(format!(
-                "serial line {} reuses a WRCAP1 transaction/object token",
-                event.line
+                event.kind.value(),
+                expected_kind.value(),
             )));
         }
     }
@@ -2330,26 +2352,65 @@ fn validate_capability_evidence(
             "WYR0-I CONTENT_DELIVERY does not match the request-bound config/asset identity",
         ));
     }
-    let mut observed_mask = content.kind.bit();
 
-    require_capability_event(events[1], 1, 1, 1, 0, "PROCESS_LIFECYCLE")?;
-    observed_mask |= events[1].kind.bit();
-    require_capability_event(events[2], 1, 1, 4096, 0, "MEMORY_SHARE")?;
-    observed_mask |= events[2].kind.bit();
-    require_capability_event(events[3], 1, 1, 0x0F, 32, "CHANNEL_LIFECYCLE")?;
-    observed_mask |= events[3].kind.bit();
-    require_capability_event(events[4], 1, 1, 0x0F, 0, "WAIT_EVENT_TIMER")?;
-    observed_mask |= events[4].kind.bit();
-    require_capability_event(events[5], 2, 1, 1, 0, "CANCELLATION")?;
-    observed_mask |= events[5].kind.bit();
-    require_capability_event(events[6], 3, 2, 1, 2, "RESTART_REPLACEMENT")?;
-    observed_mask |= events[6].kind.bit();
-    require_capability_event(events[7], 4, 4, 4, 0, "RESTART_EXHAUSTED")?;
-    observed_mask |= events[7].kind.bit();
-    require_capability_event(events[8], 1, 1, 0x0F, 0, "OVERLOAD_REPLAY_REJECTED")?;
-    observed_mask |= events[8].kind.bit();
+    let normal_transaction = events[1].token;
+    require_capability_event(events[1], 1, 1, 1, 0, "PROCESS_LIFECYCLE READY")?;
+    require_capability_event(events[2], 1, 1, 2, 0, "PROCESS_LIFECYCLE EXIT")?;
+    if events[2].token != normal_transaction {
+        return Err(Failure::task(
+            "WYR0-I PROCESS_LIFECYCLE READY and EXIT do not share NORMAL_TRANSACTION",
+        ));
+    }
+    require_capability_event(events[3], 1, 1, 4096, WYR0_I_MEMORY_RIGHTS, "MEMORY_SHARE")?;
+    require_capability_event(events[4], 1, 1, 0x0F, 32, "CHANNEL_LIFECYCLE")?;
+    require_capability_event(events[5], 1, 1, 0x0F, 0, "WAIT_EVENT_TIMER")?;
+    require_capability_event(
+        events[6],
+        2,
+        1,
+        WYR0_I_AUTHORIZED_TERMINATION,
+        0,
+        "CANCELLATION",
+    )?;
 
-    let cleanup = events[9];
+    require_capability_event(events[7], 3, 1, 1, 2, "RESTART_REPLACEMENT attempt 1")?;
+    require_capability_event(events[8], 3, 2, 2, 1, "RESTART_REPLACEMENT attempt 2")?;
+    if events[7].token.checked_add(1) != Some(events[8].token) {
+        return Err(Failure::task(
+            "WYR0-I RESTART_REPLACEMENT tokens are not contiguous RESTART_BASE + attempt",
+        ));
+    }
+
+    for generation in 1_u32..=4 {
+        let index = 8 + generation as usize;
+        let next_generation = if generation == 4 {
+            0
+        } else {
+            u64::from(generation + 1)
+        };
+        require_capability_event(
+            events[index],
+            4,
+            generation,
+            u64::from(generation),
+            next_generation,
+            "RESTART_EXHAUSTED",
+        )?;
+        if generation > 1 && events[index - 1].token.checked_add(1) != Some(events[index].token) {
+            return Err(Failure::task(
+                "WYR0-I RESTART_EXHAUSTED tokens are not contiguous EXHAUST_BASE + generation",
+            ));
+        }
+    }
+
+    require_capability_event(events[13], 1, 1, 0x0F, 2, "OVERLOAD_REPLAY_REJECTED")?;
+    if events[13].token != normal_transaction {
+        return Err(Failure::task(
+            "WYR0-I OVERLOAD_REPLAY_REJECTED is not joined to NORMAL_TRANSACTION",
+        ));
+    }
+
+    let cleanup = events[14];
     if cleanup.peer != 0
         || cleanup.generation != 0
         || cleanup.token != 0
@@ -2360,7 +2421,29 @@ fn validate_capability_evidence(
             "WYR0-I CLEANUP_BASELINE must be the final global zero-baseline record",
         ));
     }
-    observed_mask |= cleanup.kind.bit();
+
+    let mut tokens = BTreeSet::new();
+    for (index, event) in events[..14].iter().enumerate() {
+        if event.token == 0 {
+            return Err(Failure::task(format!(
+                "serial line {} has a zero WRCAP1 transaction/object token",
+                event.line
+            )));
+        }
+        if matches!(index, 2 | 13) {
+            continue;
+        }
+        if !tokens.insert(event.token) {
+            return Err(Failure::task(format!(
+                "serial line {} reuses a WRCAP1 token outside the declared NORMAL_TRANSACTION join",
+                event.line
+            )));
+        }
+    }
+
+    let observed_mask = events
+        .iter()
+        .fold(0_u32, |mask, event| mask | event.kind.bit());
     if observed_mask != required_evidence_mask {
         return Err(Failure::task(format!(
             "WYR0-I transcript proof mask {observed_mask:08X} does not exactly match request {required_evidence_mask:08X}"
@@ -3457,6 +3540,9 @@ mod tests {
         let (config, asset) = capability_content_prefixes(request).expect("content prefixes");
         let content_token = config ^ asset;
         assert_ne!(content_token, 0);
+        let normal_transaction = 0x1000;
+        let restart_base = 0x6000;
+        let exhaust_base = 0x7000;
         vec![
             CapabilitySpec {
                 kind: 0x01,
@@ -3470,23 +3556,31 @@ mod tests {
                 kind: 0x02,
                 peer: 1,
                 generation: 1,
-                token: 0x101,
+                token: normal_transaction,
                 arg0: 1,
+                arg1: 0,
+            },
+            CapabilitySpec {
+                kind: 0x02,
+                peer: 1,
+                generation: 1,
+                token: normal_transaction,
+                arg0: 2,
                 arg1: 0,
             },
             CapabilitySpec {
                 kind: 0x03,
                 peer: 1,
                 generation: 1,
-                token: 0x102,
+                token: 0x2000,
                 arg0: 4096,
-                arg1: 0,
+                arg1: WYR0_I_MEMORY_RIGHTS,
             },
             CapabilitySpec {
                 kind: 0x04,
                 peer: 1,
                 generation: 1,
-                token: 0x103,
+                token: 0x3000,
                 arg0: 0x0F,
                 arg1: 32,
             },
@@ -3494,7 +3588,7 @@ mod tests {
                 kind: 0x05,
                 peer: 1,
                 generation: 1,
-                token: 0x104,
+                token: 0x4000,
                 arg0: 0x0F,
                 arg1: 0,
             },
@@ -3502,23 +3596,55 @@ mod tests {
                 kind: 0x06,
                 peer: 2,
                 generation: 1,
-                token: 0x105,
-                arg0: 1,
+                token: 0x5000,
+                arg0: WYR0_I_AUTHORIZED_TERMINATION,
                 arg1: 0,
             },
             CapabilitySpec {
                 kind: 0x07,
                 peer: 3,
+                generation: 1,
+                token: restart_base + 1,
+                arg0: 1,
+                arg1: 2,
+            },
+            CapabilitySpec {
+                kind: 0x07,
+                peer: 3,
                 generation: 2,
-                token: 0x106,
+                token: restart_base + 2,
+                arg0: 2,
+                arg1: 1,
+            },
+            CapabilitySpec {
+                kind: 0x08,
+                peer: 4,
+                generation: 1,
+                token: exhaust_base + 1,
                 arg0: 1,
                 arg1: 2,
             },
             CapabilitySpec {
                 kind: 0x08,
                 peer: 4,
+                generation: 2,
+                token: exhaust_base + 2,
+                arg0: 2,
+                arg1: 3,
+            },
+            CapabilitySpec {
+                kind: 0x08,
+                peer: 4,
+                generation: 3,
+                token: exhaust_base + 3,
+                arg0: 3,
+                arg1: 4,
+            },
+            CapabilitySpec {
+                kind: 0x08,
+                peer: 4,
                 generation: 4,
-                token: 0x107,
+                token: exhaust_base + 4,
                 arg0: 4,
                 arg1: 0,
             },
@@ -3526,9 +3652,9 @@ mod tests {
                 kind: 0x09,
                 peer: 1,
                 generation: 1,
-                token: 0x108,
+                token: normal_transaction,
                 arg0: 0x0F,
-                arg1: 0,
+                arg1: 2,
             },
             CapabilitySpec {
                 kind: 0x0A,
@@ -3688,7 +3814,7 @@ mod tests {
     }
 
     #[test]
-    fn wrcap1_accepts_only_the_complete_ten_kind_join_and_matching_terminal() {
+    fn wrcap1_accepts_only_the_complete_fifteen_record_join_and_matching_terminal() {
         let (root, request) = capability_request("valid-evidence");
         let specs = capability_specs(&request);
         let transcript = capability_transcript(&request, &specs, "01", 0);
@@ -3697,13 +3823,13 @@ mod tests {
         let evidence = parsed
             .evidence
             .expect("missing validated capability evidence");
-        assert_eq!(evidence.count, 10);
+        assert_eq!(evidence.count, WYR0_I_CAPABILITY_EVENT_COUNT);
         assert_eq!(
             evidence.observed_mask,
             h_request::I_CAPABILITY_REQUIRED_EVIDENCE_MASK
         );
         assert_eq!(evidence.first_sequence, 0);
-        assert_eq!(evidence.last_sequence, 9);
+        assert_eq!(evidence.last_sequence, 14);
         let fields = evidence_result_fields(&request, parsed.evidence).unwrap();
         assert!(fields.contains("\"evidence_protocol\":\"wrcap1\""));
         assert!(fields.contains("\"observed_evidence_mask\":1023"));
@@ -3782,9 +3908,15 @@ mod tests {
         let mut cross_protocol = evidence_line(TEST_EVIDENCE_NONCE, 0, event(0x01, 0, 0, 0, 0));
         cross_protocol.extend_from_slice(&valid);
         cases.push(cross_protocol);
+        let mut protocol_diagnostic = b"WRCAP1 diagnostic must not resemble evidence\n".to_vec();
+        protocol_diagnostic.extend_from_slice(&valid);
+        cases.push(protocol_diagnostic);
+        let mut unrelated_lookalike = b"WRCAP10|unrelated output\n".to_vec();
+        unrelated_lookalike.extend_from_slice(&valid);
+        cases.push(unrelated_lookalike);
         cases.push(capability_transcript(&request, &specs, "02", 0x2401_0001));
         cases.push(capability_transcript(&request, &specs, "01", 1));
-        cases.push(capability_transcript(&request, &specs[..9], "01", 0));
+        cases.push(capability_transcript(&request, &specs[..14], "01", 0));
 
         let mut too_many = b"diagnostic\n".to_vec();
         for sequence in 0..=MAX_EVIDENCE_RECORDS {
@@ -3811,36 +3943,68 @@ mod tests {
         let (root, request) = capability_request("semantic-joins");
         let valid = capability_specs(&request);
         let mut cases = Vec::new();
-        for (index, mutate) in [
-            (1, 0_u8),
-            (2, 1),
-            (3, 2),
-            (4, 3),
-            (5, 4),
-            (6, 5),
-            (7, 6),
-            (8, 7),
-            (9, 8),
-        ] {
-            let mut specs = valid.clone();
-            match mutate % 3 {
-                0 => specs[index].peer = specs[index].peer.wrapping_add(1),
-                1 => specs[index].generation = specs[index].generation.wrapping_add(1),
-                _ => specs[index].arg0 = specs[index].arg0.wrapping_add(1),
-            }
-            cases.push(specs);
+
+        let mut mismatched_lifecycle_token = valid.clone();
+        mismatched_lifecycle_token[2].token += 1;
+        cases.push(mismatched_lifecycle_token);
+        let mut unrelated_replay_token = valid.clone();
+        unrelated_replay_token[13].token += 1;
+        cases.push(unrelated_replay_token);
+        let mut wrong_ready_stage = valid.clone();
+        wrong_ready_stage[1].arg0 = 2;
+        cases.push(wrong_ready_stage);
+        let mut wrong_exit_stage = valid.clone();
+        wrong_exit_stage[2].arg0 = 1;
+        cases.push(wrong_exit_stage);
+        let mut wrong_memory_rights = valid.clone();
+        wrong_memory_rights[3].arg1 ^= DW_RIGHT_INSPECT.0;
+        cases.push(wrong_memory_rights);
+        let mut wrong_cancellation_reason = valid.clone();
+        wrong_cancellation_reason[6].arg0 = u64::from(deepwyrm_abi::DW_TERMINATION_NORMAL_EXIT.0);
+        cases.push(wrong_cancellation_reason);
+
+        let mut swapped_restart_generations = valid.clone();
+        swapped_restart_generations.swap(7, 8);
+        cases.push(swapped_restart_generations);
+        let mut skipped_restart_generation = valid.clone();
+        skipped_restart_generation[8].generation = 3;
+        cases.push(skipped_restart_generation);
+        let mut repeated_restart_generation = valid.clone();
+        repeated_restart_generation[8].generation = 1;
+        cases.push(repeated_restart_generation);
+        let mut skipped_restart_token = valid.clone();
+        skipped_restart_token[8].token += 1;
+        cases.push(skipped_restart_token);
+
+        let mut swapped_exhaust_generations = valid.clone();
+        swapped_exhaust_generations.swap(9, 10);
+        cases.push(swapped_exhaust_generations);
+        let mut skipped_exhaust_generation = valid.clone();
+        skipped_exhaust_generation[10].generation = 3;
+        cases.push(skipped_exhaust_generation);
+        let mut repeated_exhaust_generation = valid.clone();
+        repeated_exhaust_generation[10].generation = 1;
+        cases.push(repeated_exhaust_generation);
+        let mut skipped_exhaust_token = valid.clone();
+        skipped_exhaust_token[11].token += 1;
+        cases.push(skipped_exhaust_token);
+
+        for index in 1..14 {
+            let mut wrong_peer = valid.clone();
+            wrong_peer[index].peer = wrong_peer[index].peer.wrapping_add(1);
+            cases.push(wrong_peer);
         }
         let mut zero_token = valid.clone();
-        zero_token[2].token = 0;
+        zero_token[3].token = 0;
         cases.push(zero_token);
         let mut reused_token = valid.clone();
-        reused_token[3].token = reused_token[2].token;
+        reused_token[4].token = reused_token[3].token;
         cases.push(reused_token);
         let mut wrong_cleanup = valid.clone();
-        wrong_cleanup[9].arg1 = 1;
+        wrong_cleanup[14].arg1 = 1;
         cases.push(wrong_cleanup);
         let mut reordered = valid.clone();
-        reordered.swap(1, 2);
+        reordered.swap(2, 3);
         cases.push(reordered);
         let mut wrong_content = valid.clone();
         wrong_content[0].arg0 ^= 1;
@@ -3854,6 +4018,27 @@ mod tests {
             );
         }
 
+        let mut fifth_exhaustion = valid.clone();
+        fifth_exhaustion.insert(
+            13,
+            CapabilitySpec {
+                kind: 0x08,
+                peer: 4,
+                generation: 5,
+                token: valid[12].token + 1,
+                arg0: 5,
+                arg1: 0,
+            },
+        );
+        assert!(
+            parse_transcript(
+                &capability_transcript(&request, &fifth_exhaustion, "01", 0),
+                &request,
+            )
+            .is_err(),
+            "accepted a fifth exhaustion generation"
+        );
+
         let mut wrong_mask = request.clone();
         wrong_mask.evidence.as_mut().unwrap().required_mask = 0x01FF;
         assert!(
@@ -3864,6 +4049,40 @@ mod tests {
             .is_err()
         );
         fs::remove_dir_all(root).expect("remove semantic fixture");
+    }
+
+    #[test]
+    fn capability_outputs_roll_back_when_either_create_new_step_fails() {
+        let (root, request) = capability_request("certificate-rollback");
+        let capability = request.capability.as_ref().expect("capability outputs");
+        let outputs = CheckedOutputRoot::open(&request).expect("open output root");
+
+        fs::write(&capability.certificate, b"existing certificate")
+            .expect("write certificate collision");
+        assert!(
+            write_capability_outputs(&outputs, capability, b"new certificate", b"new summary")
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(&capability.certificate).unwrap(),
+            b"existing certificate"
+        );
+        assert!(!capability.capability_summary.exists());
+
+        fs::remove_file(&capability.certificate).expect("remove certificate collision");
+        fs::write(&capability.capability_summary, b"existing summary")
+            .expect("write summary collision");
+        assert!(
+            write_capability_outputs(&outputs, capability, b"new certificate", b"new summary")
+                .is_err()
+        );
+        assert!(!capability.certificate.exists());
+        assert_eq!(
+            fs::read(&capability.capability_summary).unwrap(),
+            b"existing summary"
+        );
+
+        fs::remove_dir_all(root).expect("remove rollback fixture");
     }
 
     #[test]
