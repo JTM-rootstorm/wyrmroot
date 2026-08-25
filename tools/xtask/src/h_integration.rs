@@ -48,6 +48,12 @@ const INIT0_PROFILE_I2: &[u8] = b"WYRMINIT0-PROFILE-V1:i2-stress";
 const INIT0_PROFILE_CAPABILITY: &[u8] = b"WYRMINIT0-PROFILE-V1:i-capability";
 const WYR0_I_INHERITED_I0_I1_I2: &str = "Plans/WYR0_H_VALIDATION.md";
 const WYR0_I_INHERITED_D0: &str = "../deepwyrm/security/DW0_H_SECURITY_REVIEW.md";
+const BUILD_RECEIPT_FILE: &str = h_request::BUILD_RECEIPT_FILE;
+const BUILD_RECEIPT_KIND: &str = "wyrmroot-wyr0-h-build-lineage";
+const BUILD_RECEIPT_TOOLCHAIN_REQUEST: &str = "RUST-WYR0-I-B-SYSROOTS-007";
+const BUILD_RECEIPT_LOADER_RECIPE: &str = "wyrmroot-xtask-build-loader-v1";
+const BUILD_RECEIPT_KERNEL_RECIPE: &str = "deepwyrm-cargo-release-selector-v1";
+const BUILD_RECEIPT_NATIVE_RECIPE: &str = "wyrmroot-cargo-release-selector-v1";
 const PROOF_CPU_ONLINE: u32 = 1 << 0;
 const PROOF_CPL3_SYSCALL: u32 = 1 << 1;
 const PROOF_BLOCKED_DESCENDANT: u32 = 1 << 2;
@@ -173,6 +179,7 @@ struct GuestTranscript {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CandidateArtifacts {
+    build_receipt: PathBuf,
     loader: PathBuf,
     kernel: PathBuf,
     symbols: PathBuf,
@@ -256,6 +263,7 @@ impl StableRunFile {
 #[derive(Debug)]
 struct CandidateDigests {
     request: String,
+    build_receipt: String,
     loader: String,
     kernel: String,
     symbols: String,
@@ -283,7 +291,55 @@ struct CertificateIdentity {
     versions_sha256: String,
     profiles_sha256: String,
     accepted_toolchain_request_sha256: String,
+    accepted_toolchain_manifest_sha256: String,
+    toolchain_tree_sha256: String,
+    rustc_sha256: String,
+    cargo_sha256: String,
 }
+
+const BUILD_RECEIPT_KEYS: &[&str] = &[
+    "schema_version",
+    "report_kind",
+    "status",
+    "source_checkout_clean_before",
+    "source_checkout_clean_after",
+    "deepwyrm_revision",
+    "deepwyrm_tree",
+    "wyrmroot_revision",
+    "wyrmroot_tree",
+    "rust_revision",
+    "rust_tree",
+    "accepted_toolchain_request",
+    "accepted_toolchain_request_sha256",
+    "accepted_toolchain_manifest_sha256",
+    "toolchain_tree_sha256",
+    "rustc_sha256",
+    "cargo_sha256",
+    "rust_lld_sha256",
+    "llvm_sha256",
+    "llvm_build_version",
+    "versions_sha256",
+    "profiles_sha256",
+    "loader.target",
+    "loader.profile",
+    "loader.recipe",
+    "kernel.target",
+    "kernel.profile",
+    "kernel.recipe",
+    "native.target",
+    "native.profile",
+    "native.recipe",
+    "selector",
+    "test_id",
+    "outputs.loader_sha256",
+    "outputs.kernel_sha256",
+    "outputs.symbols_sha256",
+    "outputs.bootstrap_sha256",
+    "outputs.init0_sha256",
+    "outputs.hello_sha256",
+    "outputs.ovmf_code_sha256",
+    "outputs.ovmf_vars_template_sha256",
+];
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum CapabilityEvidenceKind {
@@ -622,21 +678,7 @@ fn write_capability_certificate(
             "schema-4 paired integration is not bound to WRCAP1",
         ));
     }
-    for (result, profile) in [(default, "default"), (smp, "smp")] {
-        if !result.contains(&format!("\"profile\":\"{profile}\",\"status\":\"PASS\"")) {
-            return Err(Failure::task(format!(
-                "WYR0-I {profile} result is not a validated PASS profile"
-            )));
-        }
-        if result_number_field(result, "required_evidence_mask")? != evidence.required_mask
-            || result_number_field(result, "observed_evidence_mask")? != evidence.required_mask
-            || result_number_field(result, "evidence_event_count")? != WYR0_I_CAPABILITY_EVENT_COUNT
-        {
-            return Err(Failure::task(format!(
-                "WYR0-I {profile} result does not contain the exact fully validated capability evidence"
-            )));
-        }
-    }
+    let observed_mask = validated_certificate_observed_mask(evidence, default, smp)?;
 
     let source = verify_source_revisions(request)?;
     let current = verify_candidate_inputs(request)?;
@@ -669,7 +711,7 @@ fn write_capability_certificate(
 
     let certificate = format!(
         concat!(
-            "{{\"schema_version\":1,",
+            "{{\"schema_version\":2,",
             "\"certificate_kind\":\"wyr0-i-native-userspace-capability\",",
             "\"status\":\"PASS\",\"acceptance\":true,",
             "\"selector\":\"native-userspace-capability\",\"test_id\":24,",
@@ -678,11 +720,14 @@ fn write_capability_certificate(
             "\"rust_revision\":\"{}\",\"rust_clean\":{}}},",
             "\"abi\":{{\"deepwyrm_abi_tree\":\"{}\",\"generated_schema_bound\":{}}},",
             "\"toolchain\":{{\"rust_target\":\"{}\",\"rust_toolchain_name\":\"{}\",",
-            "\"llvm_build_version\":\"{}\",\"rust_lld_sha256\":\"{}\",",
+            "\"llvm_build_version\":\"{}\",\"rustc_sha256\":\"{}\",",
+            "\"cargo_sha256\":\"{}\",\"rust_lld_sha256\":\"{}\",",
             "\"llvm_sha256\":\"{}\",",
+            "\"toolchain_tree_sha256\":\"{}\",\"artifact_manifest_sha256\":\"{}\",",
             "\"versions_sha256\":\"{}\",\"profiles_sha256\":\"{}\",",
             "\"accepted_toolchain_request_sha256\":\"{}\"}},",
             "\"artifacts\":{{\"candidate_sha256\":\"{}\",\"request_sha256\":\"{}\",",
+            "\"build_receipt_sha256\":\"{}\",",
             "\"provenance_sha256\":\"{}\",\"loader_sha256\":\"{}\",",
             "\"kernel_sha256\":\"{}\",\"symbols_sha256\":\"{}\",",
             "\"bootstrap_sha256\":\"{}\",\"init0_sha256\":\"{}\",",
@@ -717,13 +762,18 @@ fn write_capability_certificate(
         identity.rust_target,
         identity.rust_toolchain_name,
         identity.llvm_build_version,
+        identity.rustc_sha256,
+        identity.cargo_sha256,
         identity.rust_lld_sha256,
         identity.llvm_sha256,
+        identity.toolchain_tree_sha256,
+        identity.accepted_toolchain_manifest_sha256,
         identity.versions_sha256,
         identity.profiles_sha256,
         identity.accepted_toolchain_request_sha256,
         digests.candidate,
         digests.request,
+        digests.build_receipt,
         provenance_sha256,
         digests.loader,
         digests.kernel,
@@ -741,7 +791,7 @@ fn write_capability_certificate(
         smp_sha256,
         evidence.nonce,
         evidence.required_mask,
-        evidence.required_mask,
+        observed_mask,
         WYR0_I_CAPABILITY_EVENT_COUNT,
         WYR0_I_INHERITED_I0_I1_I2,
         WYR0_I_INHERITED_D0,
@@ -763,7 +813,7 @@ fn write_capability_certificate(
         certificate_sha256,
         evidence.nonce,
         evidence.required_mask,
-        evidence.required_mask,
+        observed_mask,
         String::from_utf8_lossy(WYR0_I_CONFIG_BOOTFS_PATH),
         String::from_utf8_lossy(WYR0_I_ASSET_BOOTFS_PATH),
         WYR0_I_INHERITED_I0_I1_I2,
@@ -776,6 +826,40 @@ fn write_capability_certificate(
         certificate.as_bytes(),
         summary.as_bytes(),
     )
+}
+
+fn validated_certificate_observed_mask(
+    evidence: EvidenceRequest,
+    default: &str,
+    smp: &str,
+) -> Result<u32, Failure> {
+    let mut validated_observed_mask = None;
+    for (result, profile) in [(default, "default"), (smp, "smp")] {
+        if !result.contains(&format!("\"profile\":\"{profile}\",\"status\":\"PASS\"")) {
+            return Err(Failure::task(format!(
+                "WYR0-I {profile} result is not a validated PASS profile"
+            )));
+        }
+        let observed_mask = result_number_field(result, "observed_evidence_mask")?;
+        if result_number_field(result, "required_evidence_mask")? != evidence.required_mask
+            || observed_mask != evidence.required_mask
+            || result_number_field(result, "evidence_event_count")? != WYR0_I_CAPABILITY_EVENT_COUNT
+        {
+            return Err(Failure::task(format!(
+                "WYR0-I {profile} result does not contain the exact fully validated capability evidence"
+            )));
+        }
+        if validated_observed_mask
+            .replace(observed_mask)
+            .is_some_and(|prior| prior != observed_mask)
+        {
+            return Err(Failure::task(
+                "WYR0-I paired results have different parser-validated observed masks",
+            ));
+        }
+    }
+    validated_observed_mask
+        .ok_or_else(|| Failure::task("WYR0-I paired results have no validated observed mask"))
 }
 
 fn write_capability_outputs(
@@ -998,6 +1082,26 @@ fn certificate_identity(request: &HRequest) -> Result<CertificateIdentity, Failu
         "artifacts.llvm_sha256",
         "accepted toolchain identity request",
     )?;
+    let accepted_toolchain_manifest_sha256 = required_sha256_identity_value(
+        &accepted,
+        "build.artifact_manifest_sha256",
+        "accepted toolchain identity request",
+    )?;
+    let toolchain_tree_sha256 = required_sha256_identity_value(
+        &accepted,
+        "build.toolchain_tree_sha256",
+        "accepted toolchain identity request",
+    )?;
+    let rustc_sha256 = required_sha256_identity_value(
+        &accepted,
+        "artifacts.rustc_sha256",
+        "accepted toolchain identity request",
+    )?;
+    let cargo_sha256 = required_sha256_identity_value(
+        &accepted,
+        "artifacts.cargo_sha256",
+        "accepted toolchain identity request",
+    )?;
 
     Ok(CertificateIdentity {
         deepwyrm_abi_tree: candidate_abi_tree,
@@ -1016,6 +1120,10 @@ fn certificate_identity(request: &HRequest) -> Result<CertificateIdentity, Failu
             &accepted_request_path,
             "accepted toolchain identity request",
         )?,
+        accepted_toolchain_manifest_sha256,
+        toolchain_tree_sha256,
+        rustc_sha256,
+        cargo_sha256,
     })
 }
 
@@ -1083,6 +1191,269 @@ fn identity_toml(path: &Path, label: &str) -> Result<BTreeMap<String, String>, F
         }
     }
     Ok(values)
+}
+
+fn build_receipt_values(path: &Path) -> Result<BTreeMap<String, String>, Failure> {
+    let contents = read_regular(path, "WYR0-H build-lineage receipt", 64 * 1024)?;
+    let contents = std::str::from_utf8(&contents)
+        .map_err(|_| Failure::task("WYR0-H build-lineage receipt is not UTF-8"))?;
+    let mut values = BTreeMap::new();
+    let mut section = String::new();
+    for (line_number, raw) in contents.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') && !line.starts_with("[[") {
+            let name = &line[1..line.len() - 1];
+            if name.is_empty()
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            {
+                return Err(Failure::task(format!(
+                    "WYR0-H build-lineage receipt line {} has an invalid section",
+                    line_number + 1
+                )));
+            }
+            section = name.to_owned();
+            continue;
+        }
+        let (key, raw_value) = line.split_once('=').ok_or_else(|| {
+            Failure::task(format!(
+                "WYR0-H build-lineage receipt line {} is not one scalar assignment",
+                line_number + 1
+            ))
+        })?;
+        let key = key.trim();
+        if key.is_empty()
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return Err(Failure::task(format!(
+                "WYR0-H build-lineage receipt line {} has an invalid key",
+                line_number + 1
+            )));
+        }
+        let raw_value = raw_value.trim();
+        let value = if raw_value.starts_with('"') && raw_value.ends_with('"') {
+            let value = &raw_value[1..raw_value.len() - 1];
+            if value.contains(['"', '\\']) {
+                return Err(Failure::task(format!(
+                    "WYR0-H build-lineage receipt line {} uses an unsupported escaped value",
+                    line_number + 1
+                )));
+            }
+            value
+        } else if matches!(raw_value, "true" | "false")
+            || (!raw_value.is_empty() && raw_value.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            raw_value
+        } else {
+            return Err(Failure::task(format!(
+                "WYR0-H build-lineage receipt line {} has an unsupported value",
+                line_number + 1
+            )));
+        };
+        let full_key = if section.is_empty() {
+            key.to_owned()
+        } else {
+            format!("{section}.{key}")
+        };
+        if values.insert(full_key.clone(), value.to_owned()).is_some() {
+            return Err(Failure::task(format!(
+                "WYR0-H build-lineage receipt duplicates '{full_key}'"
+            )));
+        }
+    }
+    Ok(values)
+}
+
+fn receipt_value<'a>(values: &'a BTreeMap<String, String>, key: &str) -> Result<&'a str, Failure> {
+    values
+        .get(key)
+        .map(String::as_str)
+        .ok_or_else(|| Failure::task(format!("WYR0-H build-lineage receipt omitted '{key}'")))
+}
+
+fn expect_receipt_value(
+    values: &BTreeMap<String, String>,
+    key: &str,
+    expected: &str,
+) -> Result<(), Failure> {
+    let actual = receipt_value(values, key)?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(Failure::task(format!(
+            "WYR0-H build-lineage receipt '{key}' is '{actual}', expected '{expected}'"
+        )))
+    }
+}
+
+fn build_receipt_path(request: &HRequest) -> Result<PathBuf, Failure> {
+    request
+        .path
+        .parent()
+        .map(|parent| parent.join(BUILD_RECEIPT_FILE))
+        .ok_or_else(|| Failure::task("WYR0-H request has no build-lineage receipt parent"))
+}
+
+fn git_tree(repository: &Path, revision: &str, label: &str) -> Result<String, Failure> {
+    let specification = format!("{revision}^{{tree}}");
+    required_git_object(
+        git_output(repository, &["rev-parse", &specification], label)?.trim(),
+        label,
+    )
+}
+
+fn verify_build_receipt(request: &HRequest, artifacts: &CandidateArtifacts) -> Result<(), Failure> {
+    let values = build_receipt_values(&artifacts.build_receipt)?;
+    let mut expected_keys = BUILD_RECEIPT_KEYS.iter().copied().collect::<BTreeSet<_>>();
+    if request.capability.is_some() {
+        expected_keys.extend([
+            "outputs.selector_config_sha256",
+            "outputs.selector_asset_sha256",
+        ]);
+    }
+    let actual_keys = values.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    if actual_keys != expected_keys {
+        let missing = expected_keys
+            .difference(&actual_keys)
+            .copied()
+            .collect::<Vec<_>>();
+        let unknown = actual_keys
+            .difference(&expected_keys)
+            .copied()
+            .collect::<Vec<_>>();
+        return Err(Failure::task(format!(
+            "WYR0-H build-lineage receipt key set drifted (missing: {}; unknown: {})",
+            missing.join(", "),
+            unknown.join(", ")
+        )));
+    }
+
+    for (key, expected) in [
+        ("schema_version", "1"),
+        ("report_kind", BUILD_RECEIPT_KIND),
+        ("status", "PASS"),
+        ("source_checkout_clean_before", "true"),
+        ("source_checkout_clean_after", "true"),
+        ("deepwyrm_revision", request.deepwyrm_revision.as_str()),
+        ("wyrmroot_revision", request.wyrmroot_revision.as_str()),
+        ("rust_revision", request.rust_revision.as_str()),
+        (
+            "accepted_toolchain_request",
+            BUILD_RECEIPT_TOOLCHAIN_REQUEST,
+        ),
+        ("loader.target", "x86_64-unknown-uefi"),
+        ("loader.profile", "production"),
+        ("loader.recipe", BUILD_RECEIPT_LOADER_RECIPE),
+        ("kernel.target", "x86_64-unknown-none"),
+        ("kernel.profile", "release"),
+        ("kernel.recipe", BUILD_RECEIPT_KERNEL_RECIPE),
+        ("native.target", WYR0_I_RUST_TARGET),
+        ("native.profile", "release"),
+        ("native.recipe", BUILD_RECEIPT_NATIVE_RECIPE),
+        ("selector", request.selector.as_str()),
+    ] {
+        expect_receipt_value(&values, key, expected)?;
+    }
+    expect_receipt_value(&values, "test_id", &request.test_id.to_string())?;
+
+    let repository = crate::tasks::repository_root()?;
+    let workspace = source_workspace_root(&repository)?;
+    for (key, tree) in [
+        (
+            "deepwyrm_tree",
+            git_tree(
+                &workspace.join("deepwyrm"),
+                &request.deepwyrm_revision,
+                "Deepwyrm tree",
+            )?,
+        ),
+        (
+            "wyrmroot_tree",
+            git_tree(&repository, &request.wyrmroot_revision, "Wyrmroot tree")?,
+        ),
+        (
+            "rust_tree",
+            git_tree(&workspace.join("rust"), &request.rust_revision, "Rust tree")?,
+        ),
+    ] {
+        expect_receipt_value(&values, key, &tree)?;
+    }
+
+    let identity = certificate_identity(request)?;
+    for (key, expected) in [
+        (
+            "accepted_toolchain_request_sha256",
+            identity.accepted_toolchain_request_sha256.as_str(),
+        ),
+        (
+            "accepted_toolchain_manifest_sha256",
+            identity.accepted_toolchain_manifest_sha256.as_str(),
+        ),
+        (
+            "toolchain_tree_sha256",
+            identity.toolchain_tree_sha256.as_str(),
+        ),
+        ("rustc_sha256", identity.rustc_sha256.as_str()),
+        ("cargo_sha256", identity.cargo_sha256.as_str()),
+        ("rust_lld_sha256", identity.rust_lld_sha256.as_str()),
+        ("llvm_sha256", identity.llvm_sha256.as_str()),
+        ("llvm_build_version", identity.llvm_build_version.as_str()),
+        ("versions_sha256", identity.versions_sha256.as_str()),
+        ("profiles_sha256", identity.profiles_sha256.as_str()),
+    ] {
+        expect_receipt_value(&values, key, expected)?;
+    }
+
+    let mut outputs = vec![
+        ("outputs.loader_sha256", &artifacts.loader, "loader.efi"),
+        ("outputs.kernel_sha256", &artifacts.kernel, "deepwyrm.elf"),
+        (
+            "outputs.symbols_sha256",
+            &artifacts.symbols,
+            "Deepwyrm symbols",
+        ),
+        (
+            "outputs.bootstrap_sha256",
+            &artifacts.bootstrap,
+            "bootstrap.elf",
+        ),
+        ("outputs.init0_sha256", &artifacts.init0, "init0"),
+        ("outputs.hello_sha256", &artifacts.hello, "hello"),
+        (
+            "outputs.ovmf_code_sha256",
+            &artifacts.ovmf_code,
+            "OVMF code",
+        ),
+        (
+            "outputs.ovmf_vars_template_sha256",
+            &artifacts.ovmf_vars_template,
+            "OVMF vars template",
+        ),
+    ];
+    if let (Some(config), Some(asset)) = (&artifacts.selector_config, &artifacts.selector_asset) {
+        outputs.extend([
+            (
+                "outputs.selector_config_sha256",
+                config,
+                "WYR0-I selector config",
+            ),
+            (
+                "outputs.selector_asset_sha256",
+                asset,
+                "WYR0-I selector asset",
+            ),
+        ]);
+    }
+    for (key, path, label) in outputs {
+        expect_receipt_value(&values, key, &digest(path, label)?)?;
+    }
+    Ok(())
 }
 
 fn required_identity_value(
@@ -1176,6 +1547,7 @@ fn inspect_loaded(request: &HRequest, artifacts: &CandidateArtifacts) -> Result<
 
 fn verify_candidate_inputs(request: &HRequest) -> Result<CandidateArtifacts, Failure> {
     let artifacts = CandidateArtifacts {
+        build_receipt: build_receipt_path(request)?,
         loader: h_request::canonical_regular(
             &request.loader,
             "loader.efi",
@@ -1266,6 +1638,7 @@ fn verify_candidate_inputs(request: &HRequest) -> Result<CandidateArtifacts, Fai
         ));
     }
     validate_init0_profile(request, &artifacts.init0)?;
+    verify_build_receipt(request, &artifacts)?;
     Ok(artifacts)
 }
 
@@ -1438,12 +1811,13 @@ fn provenance_contents(
     };
     Ok(format!(
         concat!(
-            "schema_version = 2\n",
+            "schema_version = 3\n",
             "phase = \"WYR0-H\"\n",
             "deepwyrm_revision = \"{}\"\n",
             "wyrmroot_revision = \"{}\"\n",
             "rust_revision = \"{}\"\n",
             "request_sha256 = \"{}\"\n",
+            "build_receipt_sha256 = \"{}\"\n",
             "candidate_sha256 = \"{}\"\n",
             "loader_sha256 = \"{}\"\n",
             "kernel_sha256 = \"{}\"\n",
@@ -1471,6 +1845,7 @@ fn provenance_contents(
         request.wyrmroot_revision,
         request.rust_revision,
         digests.request,
+        digests.build_receipt,
         digests.candidate,
         digests.loader,
         digests.kernel,
@@ -1497,6 +1872,7 @@ fn candidate_digests(
     artifacts: &CandidateArtifacts,
 ) -> Result<CandidateDigests, Failure> {
     let request_digest = request.request_sha256.clone();
+    let build_receipt = digest(&artifacts.build_receipt, "WYR0-H build-lineage receipt")?;
     let loader = digest(&artifacts.loader, "loader.efi")?;
     let kernel = digest(&artifacts.kernel, "deepwyrm.elf")?;
     let symbols = digest(&artifacts.symbols, "Deepwyrm symbols")?;
@@ -1520,6 +1896,7 @@ fn candidate_digests(
     let candidate = candidate_identity_digest(
         request,
         &request_digest,
+        &build_receipt,
         &loader,
         &kernel,
         &symbols,
@@ -1535,6 +1912,7 @@ fn candidate_digests(
     );
     Ok(CandidateDigests {
         request: request_digest,
+        build_receipt,
         loader,
         kernel,
         symbols,
@@ -1555,6 +1933,7 @@ fn candidate_digests(
 fn candidate_identity_digest(
     request: &HRequest,
     request_digest: &str,
+    build_receipt: &str,
     loader: &str,
     kernel: &str,
     symbols: &str,
@@ -1578,7 +1957,7 @@ fn candidate_identity_digest(
     sha256::bytes_digest(
         format!(
             concat!(
-                "wyr0-h-candidate-v1\nrequest={}\n",
+                "wyr0-h-candidate-v2\nrequest={}\nbuild_receipt={}\n",
                 "deepwyrm={}\nwyrmroot={}\nrust={}\nselector={}\ntest_id={}\n",
                 "expected_outcome={}\nexpected_detail={}\n",
                 "loader={}\nkernel={}\nsymbols={}\n",
@@ -1588,6 +1967,7 @@ fn candidate_identity_digest(
                 "ovmf_vars_template={}\n"
             ),
             request_digest,
+            build_receipt,
             request.deepwyrm_revision,
             request.wyrmroot_revision,
             request.rust_revision,
@@ -1618,6 +1998,7 @@ fn run_candidate_digests(
 ) -> Result<CandidateDigests, Failure> {
     let mut digests = candidate_digests(request, artifacts)?;
     digests.request.clone_from(&run.request.digest);
+    digests.build_receipt.clone_from(&run.build_receipt.digest);
     digests.loader.clone_from(&run.loader.digest);
     digests.kernel.clone_from(&run.kernel.digest);
     digests.symbols.clone_from(&run.symbols.digest);
@@ -1637,6 +2018,7 @@ fn run_candidate_digests(
     digests.candidate = candidate_identity_digest(
         request,
         &digests.request,
+        &digests.build_receipt,
         &digests.loader,
         &digests.kernel,
         &digests.symbols,
@@ -1669,7 +2051,8 @@ fn manifest_json_fields(digests: &CandidateDigests, provenance: &str) -> String 
     format!(
         concat!(
             "\"candidate_sha256\":\"{}\",\"provenance_sha256\":\"{}\",",
-            "\"request_sha256\":\"{}\",\"loader_sha256\":\"{}\",",
+            "\"request_sha256\":\"{}\",\"build_receipt_sha256\":\"{}\",",
+            "\"loader_sha256\":\"{}\",",
             "\"kernel_sha256\":\"{}\",\"symbols_sha256\":\"{}\",",
             "\"bootstrap_sha256\":\"{}\",\"init0_sha256\":\"{}\",",
             "\"hello_sha256\":\"{}\",\"bootfs_sha256\":\"{}\",",
@@ -1680,6 +2063,7 @@ fn manifest_json_fields(digests: &CandidateDigests, provenance: &str) -> String 
         digests.candidate,
         provenance,
         digests.request,
+        digests.build_receipt,
         digests.loader,
         digests.kernel,
         digests.symbols,
@@ -2121,6 +2505,7 @@ fn write_integration_host_failure(
 
 struct RunPaths {
     request: StableRunFile,
+    build_receipt: StableRunFile,
     loader: StableRunFile,
     kernel: StableRunFile,
     symbols: StableRunFile,
@@ -2143,6 +2528,7 @@ impl RunPaths {
     fn immutable_files(&self) -> Vec<(&StableRunFile, &'static str)> {
         let mut files = vec![
             (&self.request, "request"),
+            (&self.build_receipt, "build-lineage receipt"),
             (&self.loader, "loader.efi"),
             (&self.kernel, "deepwyrm.elf"),
             (&self.symbols, "Deepwyrm symbols"),
@@ -2213,6 +2599,7 @@ impl RunPaths {
 
     fn snapshot_artifacts(&self) -> CandidateArtifacts {
         CandidateArtifacts {
+            build_receipt: self.build_receipt.path.clone(),
             loader: self.loader.path.clone(),
             kernel: self.kernel.path.clone(),
             symbols: self.symbols.path.clone(),
@@ -2249,6 +2636,11 @@ fn prepare_run_directory(
             "WYR0-H request changed before the run-local snapshot was created",
         ));
     }
+    let build_receipt_bytes = read_regular(
+        &artifacts.build_receipt,
+        "WYR0-H build-lineage receipt",
+        64 * 1024,
+    )?;
     let loader_bytes = read_regular(&artifacts.loader, "loader.efi", MAX_GUEST_ARTIFACT_BYTES)?;
     let kernel_bytes = read_regular(&artifacts.kernel, "deepwyrm.elf", MAX_GUEST_ARTIFACT_BYTES)?;
     let symbols_bytes = read_regular(
@@ -2297,6 +2689,12 @@ fn prepare_run_directory(
             outputs,
             &directory.join("request.toml"),
             &request_bytes,
+            true,
+        )?,
+        build_receipt: create_run_file(
+            outputs,
+            &directory.join(BUILD_RECEIPT_FILE),
+            &build_receipt_bytes,
             true,
         )?,
         loader: create_run_file(outputs, &directory.join("loader.efi"), &loader_bytes, true)?,
@@ -3841,6 +4239,7 @@ mod tests {
             |file_name: &str| test_stable_file(directory.join(file_name), b"artifact", true);
         RunPaths {
             request: stable("request.toml"),
+            build_receipt: stable(BUILD_RECEIPT_FILE),
             loader: stable("loader.efi"),
             kernel: stable("deepwyrm.elf"),
             symbols: stable("deepwyrm.symbols"),
@@ -3858,6 +4257,136 @@ mod tests {
             result_json: root.join(name),
             stderr_log: directory.join("qemu.stderr.log"),
         }
+    }
+
+    fn lineage_fixture(root: &Path) -> (HRequest, CandidateArtifacts) {
+        fs::create_dir_all(root).expect("create lineage fixture");
+        for name in [
+            "loader.efi",
+            "deepwyrm.elf",
+            "bootstrap.elf",
+            "init0.elf",
+            "hello.elf",
+            "OVMF_CODE.fd",
+            "OVMF_VARS.fd",
+        ] {
+            fs::write(root.join(name), b"admitted artifact").expect("write lineage artifact");
+        }
+        fs::write(root.join("init0.elf"), INIT0_PROFILE_ORDINARY)
+            .expect("write lineage init0 marker");
+        let repository = crate::tasks::repository_root().expect("repository root");
+        let workspace = source_workspace_root(&repository).expect("source workspace");
+        let revision = |path: &Path, label: &str| {
+            git_output(path, &["rev-parse", "HEAD"], label)
+                .expect("read fixture revision")
+                .trim()
+                .to_owned()
+        };
+        let request = HRequest {
+            path: root.join("request.toml"),
+            request_sha256: sha256::bytes_digest(b"lineage request"),
+            schema_version: 2,
+            deepwyrm_revision: revision(&workspace.join("deepwyrm"), "Deepwyrm"),
+            wyrmroot_revision: revision(&repository, "Wyrmroot"),
+            rust_revision: revision(&workspace.join("rust"), "Rust"),
+            selector: "primordial-bootstrap".into(),
+            test_id: 18,
+            expected_outcome: ExpectedOutcome::Pass,
+            expected_detail: 0,
+            timeout_seconds: 180,
+            loader: root.join("loader.efi"),
+            kernel: root.join("deepwyrm.elf"),
+            symbols: root.join("deepwyrm.elf"),
+            bootstrap: root.join("bootstrap.elf"),
+            init0: root.join("init0.elf"),
+            hello: root.join("hello.elf"),
+            bootfs: root.join("bootfs.img"),
+            esp: root.join("esp.img"),
+            provenance: root.join("provenance.toml"),
+            ovmf_code: root.join("OVMF_CODE.fd"),
+            ovmf_vars_template: root.join("OVMF_VARS.fd"),
+            run_directory: root.join("runs"),
+            evidence: None,
+            capability: None,
+        };
+        fs::write(&request.path, b"lineage request").expect("write lineage request");
+        let artifacts = CandidateArtifacts {
+            build_receipt: root.join(BUILD_RECEIPT_FILE),
+            loader: request.loader.clone(),
+            kernel: request.kernel.clone(),
+            symbols: request.symbols.clone(),
+            bootstrap: request.bootstrap.clone(),
+            init0: request.init0.clone(),
+            hello: request.hello.clone(),
+            selector_config: None,
+            selector_asset: None,
+            ovmf_code: request.ovmf_code.clone(),
+            ovmf_vars_template: request.ovmf_vars_template.clone(),
+        };
+        let identity = certificate_identity(&request).expect("certificate identity");
+        let receipt = format!(
+            concat!(
+                "schema_version = 1\nreport_kind = \"{}\"\nstatus = \"PASS\"\n",
+                "source_checkout_clean_before = true\nsource_checkout_clean_after = true\n",
+                "deepwyrm_revision = \"{}\"\ndeepwyrm_tree = \"{}\"\n",
+                "wyrmroot_revision = \"{}\"\nwyrmroot_tree = \"{}\"\n",
+                "rust_revision = \"{}\"\nrust_tree = \"{}\"\n",
+                "accepted_toolchain_request = \"{}\"\n",
+                "accepted_toolchain_request_sha256 = \"{}\"\n",
+                "accepted_toolchain_manifest_sha256 = \"{}\"\n",
+                "toolchain_tree_sha256 = \"{}\"\nrustc_sha256 = \"{}\"\n",
+                "cargo_sha256 = \"{}\"\nrust_lld_sha256 = \"{}\"\n",
+                "llvm_sha256 = \"{}\"\nllvm_build_version = \"{}\"\n",
+                "versions_sha256 = \"{}\"\nprofiles_sha256 = \"{}\"\n",
+                "selector = \"{}\"\ntest_id = {}\n",
+                "[loader]\ntarget = \"x86_64-unknown-uefi\"\nprofile = \"production\"\nrecipe = \"{}\"\n",
+                "[kernel]\ntarget = \"x86_64-unknown-none\"\nprofile = \"release\"\nrecipe = \"{}\"\n",
+                "[native]\ntarget = \"{}\"\nprofile = \"release\"\nrecipe = \"{}\"\n",
+                "[outputs]\nloader_sha256 = \"{}\"\nkernel_sha256 = \"{}\"\n",
+                "symbols_sha256 = \"{}\"\nbootstrap_sha256 = \"{}\"\n",
+                "init0_sha256 = \"{}\"\nhello_sha256 = \"{}\"\n",
+                "ovmf_code_sha256 = \"{}\"\novmf_vars_template_sha256 = \"{}\"\n"
+            ),
+            BUILD_RECEIPT_KIND,
+            request.deepwyrm_revision,
+            git_tree(
+                &workspace.join("deepwyrm"),
+                &request.deepwyrm_revision,
+                "Deepwyrm tree"
+            )
+            .unwrap(),
+            request.wyrmroot_revision,
+            git_tree(&repository, &request.wyrmroot_revision, "Wyrmroot tree").unwrap(),
+            request.rust_revision,
+            git_tree(&workspace.join("rust"), &request.rust_revision, "Rust tree").unwrap(),
+            BUILD_RECEIPT_TOOLCHAIN_REQUEST,
+            identity.accepted_toolchain_request_sha256,
+            identity.accepted_toolchain_manifest_sha256,
+            identity.toolchain_tree_sha256,
+            identity.rustc_sha256,
+            identity.cargo_sha256,
+            identity.rust_lld_sha256,
+            identity.llvm_sha256,
+            identity.llvm_build_version,
+            identity.versions_sha256,
+            identity.profiles_sha256,
+            request.selector,
+            request.test_id,
+            BUILD_RECEIPT_LOADER_RECIPE,
+            BUILD_RECEIPT_KERNEL_RECIPE,
+            WYR0_I_RUST_TARGET,
+            BUILD_RECEIPT_NATIVE_RECIPE,
+            digest(&artifacts.loader, "loader").unwrap(),
+            digest(&artifacts.kernel, "kernel").unwrap(),
+            digest(&artifacts.symbols, "symbols").unwrap(),
+            digest(&artifacts.bootstrap, "bootstrap").unwrap(),
+            digest(&artifacts.init0, "init0").unwrap(),
+            digest(&artifacts.hello, "hello").unwrap(),
+            digest(&artifacts.ovmf_code, "OVMF code").unwrap(),
+            digest(&artifacts.ovmf_vars_template, "OVMF vars").unwrap(),
+        );
+        fs::write(&artifacts.build_receipt, receipt).expect("write lineage receipt");
+        (request, artifacts)
     }
 
     #[derive(Clone, Copy)]
@@ -4322,12 +4851,25 @@ mod tests {
             "hello.elf",
             "OVMF_CODE.fd",
             "OVMF_VARS.fd",
+            BUILD_RECEIPT_FILE,
         ] {
             fs::write(root.join(name), b"artifact").expect("write candidate fixture");
         }
         fs::write(root.join("init0.elf"), INIT0_PROFILE_CAPABILITY)
             .expect("write capability init0 fixture");
-        let artifacts = verify_candidate_inputs(&request).expect("verify capability inputs");
+        let artifacts = CandidateArtifacts {
+            build_receipt: root.join(BUILD_RECEIPT_FILE),
+            loader: request.loader.clone(),
+            kernel: request.kernel.clone(),
+            symbols: request.symbols.clone(),
+            bootstrap: request.bootstrap.clone(),
+            init0: request.init0.clone(),
+            hello: request.hello.clone(),
+            selector_config: Some(capability.selector_config.clone()),
+            selector_asset: Some(capability.selector_asset.clone()),
+            ovmf_code: request.ovmf_code.clone(),
+            ovmf_vars_template: request.ovmf_vars_template.clone(),
+        };
         let bootfs = build_bootfs_bytes(&artifacts).expect("build capability bootfs");
         let archive =
             wyrmroot_bootfs::archive::Archive::new(&bootfs).expect("parse capability bootfs");
@@ -4754,6 +5296,78 @@ mod tests {
         assert!(!staged_certificate.exists());
 
         fs::remove_dir_all(root).expect("remove rollback fixture");
+    }
+
+    #[test]
+    fn certificate_uses_parser_validated_observed_mask_from_both_profiles() {
+        let evidence = EvidenceRequest {
+            protocol: EvidenceProtocol::Wrcap1,
+            nonce: 1,
+            required_mask: h_request::I_CAPABILITY_REQUIRED_EVIDENCE_MASK,
+        };
+        let result = |profile: &str, observed: u32| {
+            format!(
+                "{{\"profile\":\"{profile}\",\"status\":\"PASS\",\"required_evidence_mask\":1023,\"observed_evidence_mask\":{observed},\"evidence_event_count\":15}}"
+            )
+        };
+        let default = result("default", 1023);
+        let smp = result("smp", 1023);
+        assert_eq!(
+            validated_certificate_observed_mask(evidence, &default, &smp).unwrap(),
+            1023
+        );
+
+        let incomplete = result("smp", 511);
+        assert!(validated_certificate_observed_mask(evidence, &default, &incomplete).is_err());
+    }
+
+    #[test]
+    fn build_receipt_rejects_other_artifact_or_toolchain_identity_before_media_build() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!(
+                "xtask-build-lineage-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock before epoch")
+                    .as_nanos()
+            ));
+        let (request, artifacts) = lineage_fixture(&root);
+        verify_candidate_inputs(&request).expect("valid build receipt rejected");
+
+        fs::write(&artifacts.hello, b"valid artifact bytes from another build")
+            .expect("substitute native artifact");
+        let artifact_error = verify_candidate_inputs(&request)
+            .expect_err("accepted artifact substituted after receipt creation");
+        assert!(artifact_error.message.contains("outputs.hello_sha256"));
+
+        let (_, artifacts) = lineage_fixture(&root);
+        let receipt = fs::read_to_string(&artifacts.build_receipt).expect("read receipt");
+        let claimed = certificate_identity(&request)
+            .expect("certificate identity")
+            .rustc_sha256;
+        fs::write(
+            &artifacts.build_receipt,
+            receipt.replace(&claimed, &"0".repeat(64)),
+        )
+        .expect("substitute toolchain identity");
+        let toolchain_error =
+            verify_candidate_inputs(&request).expect_err("accepted substituted toolchain identity");
+        assert!(toolchain_error.message.contains("rustc_sha256"));
+
+        fs::remove_dir_all(root).expect("remove lineage fixture");
+    }
+
+    #[test]
+    fn build_receipt_template_matches_the_strict_base_schema() {
+        let template = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../toolchain/templates/wyr0-h-build-receipt.toml");
+        let values = build_receipt_values(&template).expect("parse build receipt template");
+        assert_eq!(
+            values.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+            BUILD_RECEIPT_KEYS.iter().copied().collect::<BTreeSet<_>>()
+        );
     }
 
     #[test]
@@ -5340,6 +5954,7 @@ mod tests {
             capability: None,
         };
         let artifacts = CandidateArtifacts {
+            build_receipt: root.join(BUILD_RECEIPT_FILE),
             loader: request.loader.clone(),
             kernel: request.kernel.clone(),
             symbols: request.symbols.clone(),
@@ -5596,9 +6211,11 @@ mod tests {
             capability: None,
         };
         fs::write(&request.path, b"request").expect("write request");
+        fs::write(root.join(BUILD_RECEIPT_FILE), b"receipt").expect("write receipt");
         let outputs = CheckedOutputRoot::open(&request).expect("open checked output root");
         let run = test_run_paths(&root, "result.json");
         let artifacts = CandidateArtifacts {
+            build_receipt: root.join(BUILD_RECEIPT_FILE),
             loader: request.loader.clone(),
             kernel: request.kernel.clone(),
             symbols: request.symbols.clone(),
@@ -5634,6 +6251,7 @@ mod tests {
         assert!(result.contains("\"reason\":\"terminal_record_invalid\""));
         assert!(result.contains("\"qemu_exit_status\":null"));
         assert!(result.contains("\"candidate_sha256\":"));
+        assert!(result.contains("\"build_receipt_sha256\":"));
         assert!(result.contains("\"ovmf_code_sha256\":"));
         assert!(result.contains("\"qemu_timeout\":true"));
         assert!(result.contains("\"timeout_seconds\":7"));
@@ -5717,6 +6335,7 @@ mod tests {
             "hello.elf",
             "OVMF_CODE.fd",
             "OVMF_VARS.fd",
+            BUILD_RECEIPT_FILE,
         ] {
             fs::write(root.join(name), b"artifact").expect("write test artifact");
         }
@@ -5778,6 +6397,7 @@ mod tests {
             "esp.img",
             "OVMF_CODE.fd",
             "OVMF_VARS.fd",
+            BUILD_RECEIPT_FILE,
         ] {
             fs::write(root.join(name), b"artifact").expect("write test artifact");
         }
@@ -5809,6 +6429,7 @@ mod tests {
             capability: None,
         };
         let artifacts = CandidateArtifacts {
+            build_receipt: root.join(BUILD_RECEIPT_FILE),
             loader: request.loader.clone(),
             kernel: request.kernel.clone(),
             symbols: request.symbols.clone(),
@@ -5826,6 +6447,11 @@ mod tests {
         fs::write(&request.hello, b"changed").expect("mutate hello");
         let changed = candidate_digests(&request, &artifacts).expect("changed digest");
         assert_ne!(first.candidate, changed.candidate);
+        fs::write(&request.hello, b"artifact").expect("restore hello");
+        fs::write(&artifacts.build_receipt, b"different receipt").expect("substitute receipt");
+        let changed_receipt =
+            candidate_digests(&request, &artifacts).expect("receipt-bound digest");
+        assert_ne!(first.candidate, changed_receipt.candidate);
         fs::remove_dir_all(root).expect("remove test root");
     }
 
@@ -5874,7 +6500,19 @@ mod tests {
         let path = root.join("request.toml");
         fs::write(&path, &request_text).expect("write request");
         let request = h_request::load(&path).expect("load request");
-        let artifacts = verify_candidate_inputs(&request).expect("verify artifacts");
+        let artifacts = CandidateArtifacts {
+            build_receipt: root.join(BUILD_RECEIPT_FILE),
+            loader: request.loader.clone(),
+            kernel: request.kernel.clone(),
+            symbols: request.symbols.clone(),
+            bootstrap: request.bootstrap.clone(),
+            init0: request.init0.clone(),
+            hello: request.hello.clone(),
+            selector_config: None,
+            selector_asset: None,
+            ovmf_code: request.ovmf_code.clone(),
+            ovmf_vars_template: request.ovmf_vars_template.clone(),
+        };
         let run = test_run_paths(&root, "unused-result.json");
         fs::write(
             &path,

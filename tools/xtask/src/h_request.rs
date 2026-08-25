@@ -103,6 +103,7 @@ pub(crate) const I_CAPABILITY_SELECTOR: &str = "native-userspace-capability";
 pub(crate) const I_CAPABILITY_TEST_ID: u32 = 24;
 pub(crate) const I_CAPABILITY_EVIDENCE_PROTOCOL: &str = "wrcap1";
 pub(crate) const I_CAPABILITY_REQUIRED_EVIDENCE_MASK: u32 = 0x03FF;
+pub(crate) const BUILD_RECEIPT_FILE: &str = "build-receipt.toml";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EvidenceProtocol {
@@ -819,11 +820,19 @@ fn output_path(parent: &Path, value: &str, label: &str) -> Result<PathBuf, Failu
 }
 
 fn reject_output_aliases(request: &HRequest) -> Result<(), Failure> {
+    let request_parent = request
+        .path
+        .parent()
+        .ok_or_else(|| Failure::task("WYR0-H request has no parent directory"))?;
     let mut outputs = vec![
         (request.bootfs.clone(), "bootfs"),
         (request.esp.clone(), "esp"),
         (request.provenance.clone(), "provenance"),
         (request.run_directory.clone(), "run_directory"),
+        (
+            request_parent.join(BUILD_RECEIPT_FILE),
+            "implicit build-lineage receipt input",
+        ),
     ];
     if let Some(capability) = &request.capability {
         outputs.push((capability.certificate.clone(), "certificate"));
@@ -1411,6 +1420,13 @@ mod tests {
                 valid_v4().replace(
                     "esp = \"media/wyrmroot-esp.img\"",
                     "esp = \"media/bootfs.img/esp\"",
+                ),
+            ),
+            (
+                "v4-build-receipt-output-alias",
+                valid_v4().replace(
+                    "bootfs = \"media/bootfs.img\"",
+                    "bootfs = \"build-receipt.toml\"",
                 ),
             ),
         ] {

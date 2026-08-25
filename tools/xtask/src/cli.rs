@@ -22,6 +22,8 @@ The WYR0-H request path builds and inspects the exact init0/hello bootfs and
 paired ESP, records revision/hash provenance, and uses one q35/OVMF path for
 the 1-vCPU default and 4-vCPU smp profiles. Guest-test remains unavailable;
 the integration command owns the complete paired profile assertion.
+Each request requires a sibling build-receipt.toml produced by its isolated
+canonical build lane; see toolchain/templates/wyr0-h-build-receipt.toml.
 
 The WYR0-I-B artifact audit consumes two already-built requests in distinct
 output roots. It requires separately recorded clean-build process evidence;
@@ -351,6 +353,7 @@ mod tests {
         assert!(!BuildScope::Bootfs.runs_loader());
         assert!(BuildScope::Bootfs.runs_bootfs_package());
         assert!(USAGE.contains("WYR0-H request path"));
+        assert!(USAGE.contains("build-receipt.toml"));
         assert!(USAGE.contains("requires separately recorded clean-build process evidence"));
     }
 
