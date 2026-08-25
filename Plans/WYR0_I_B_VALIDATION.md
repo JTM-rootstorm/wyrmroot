@@ -74,6 +74,12 @@ A 2026-08-24 non-security review of the I-B closure machinery found and correcte
 
 The accepted Rust 007 bundle still passes the strengthened positive identity gate. Its two RUNPATH-visible copies of the pinned LLVM shared library are byte-identical, so no accepted toolchain bytes or hashes changed. Wyrmroot formatting and clippy with warnings denied pass; the full host gate passes with xtask `92 passed, 1 accepted environment-gated test ignored`; the host-tool probe reports LLVM utilities as `LLVM version 22.1.8`; and Deepwyrm `cargo xtask abi check` remains clean. The review also re-read the active phase's required prior-art set and found no newly applicable pattern requiring an I-B architecture or ABI change. The exact accepted product tuple and original double-build/guest evidence above remain unchanged.
 
+## Post-signing revision identity
+
+On 2026-08-24, the unpublished Deepwyrm and Wyrmroot histories were rewritten solely to add GPG signatures while preserving every rewritten commit's tree, message, author identity/date, committer identity/date, and topology. The acceptance evidence above intentionally retains the pre-sign identities embedded in the durable request/provenance bytes. Their canonical signed equivalents are Deepwyrm product `a6db870e1f0123cfb46491c583a3a8d7bf08e9a2` -> `cfc69bd8a49819ce1cda1a132cf56e55c93f92e4`, Wyrmroot I-A `b856079fe4a480930b68f425167c271a1397ae03` -> `afa55d32086d3fddc9a5554238e7c42ab6b7e5fe`, and Wyrmroot I-B product `f246dd7a7d37d3e1c73791a24f5a73ddb71c3979` -> `26a4049f8cab0b2de0213d3ed76fcf2c7c9d82a8`. The complete Wyrmroot mapping is recorded in `Plans/SIGNED_HISTORY_MAP_2026-08-24.md`; Deepwyrm carries its corresponding map in `docs/SIGNED_HISTORY_MAP_2026-08-24.md`.
+
+Live Wyrmroot dependency/toolchain pins use the canonical signed Deepwyrm identity. Existing durable I-B artifacts are not rewritten, because changing their embedded revision fields would invalidate the request/provenance hashes they are evidence for.
+
 ## Required-source and example disposition
 
 The root WYR0-I plan, I-A native capability contract, image-delivery addendum, bootfs contract, WYR0-H validation contract, architecture indices, and bootstrap/recovery architecture materially governed this implementation.
