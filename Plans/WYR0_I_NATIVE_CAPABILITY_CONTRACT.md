@@ -365,7 +365,30 @@ Host evidence is accepted only with a matching terminal PASS for test ID 24 and 
 
 The canonical request requires all ten capability bits; the observed mask is assembled from successfully validated events and is never a hard-coded success constant.
 
-Event count may exceed ten when one proof requires multiple joined records, but all evidence remains bounded by the request/parser limit established in I-F.
+The canonical schema-4 transcript contains exactly fifteen records. Duplicate
+kinds provide the ordered joins required by I-F; they do not add mask bits:
+
+| Sequence | Kind | Peer/generation | Required join |
+| ---: | ---: | --- | --- |
+| `0` | `01` | `0/0` | config and asset digest prefixes |
+| `1` | `02` | `1/1` | READY on the normal-launch transaction |
+| `2` | `02` | `1/1` | normal exit on the same transaction |
+| `3` | `03` | `1/1` | one page with exact reduced read/map/inspect rights |
+| `4` | `04` | `1/1` | Channel proof bitmap and bounded queue-fill count |
+| `5` | `05` | `1/1` | wait/Event/Timer proof bitmap with no early success |
+| `6` | `06` | `2/1` | exact authorized termination reason |
+| `7` | `07` | `3/1` | first failed attempt names replacement generation `2` |
+| `8` | `07` | `3/2` | replacement names retired generation `1` |
+| `9`-`12` | `08` | `4/1`-`4/4` | contiguous exhaustion attempts; the fourth names no successor |
+| `13` | `09` | `1/1` | overload/replay rejection reuses the normal-launch transaction |
+| `14` | `0A` | `0/0` | final zero-valued cleanup baseline |
+
+The host requires the declared token reuse for sequences `1`, `2`, and `13`,
+contiguous restart and exhaustion generations/tokens, and no fifth exhaustion
+generation. Token reuse outside those declared joins fails closed. The exact
+fifteen-record cardinality remains bounded by the request/parser limit
+established in I-F.
+
 ### 11.2 Failure-code ownership
 
 WYR0-I does not allocate native status codes. Selector-local terminal failure detail uses:
