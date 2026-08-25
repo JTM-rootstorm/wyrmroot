@@ -20,12 +20,14 @@ required-features = ["native-init0"]
 default = []
 native-init0 = []
 i2-stress-integration = []
+i-capability-integration = ["dep:wyrmroot-i-capability"]
 
 [dependencies]
 deepwyrm-syscall.workspace = true
 wyrmroot-bootfs = { path = "../../crates/wyrmroot-bootfs" }
 wyrmroot-loader = { path = "../../crates/wyrmroot-loader" }
 wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }
+wyrmroot-i-capability = { path = "../i-capability", optional = true }
 
 [dev-dependencies]
 wyrmroot-bootfs = { path = "../../crates/wyrmroot-bootfs", features = ["builder"] }

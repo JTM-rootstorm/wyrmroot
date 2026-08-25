@@ -8,6 +8,8 @@
 //! It reports READY to its primordial parent only after `hello` acknowledges its parent Channel
 //! and exits normally with application code zero.
 
+#[cfg(feature = "i-capability-integration")]
+use deepwyrm_syscall::{DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DwSignals, DwWaitItemV1};
 use deepwyrm_syscall::{DwDeadline, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights};
 use wyrmroot_bootfs::archive::{Archive, LookupError, ParseError};
 use wyrmroot_loader::{
@@ -31,6 +33,9 @@ pub const HELLO_PATH: &[u8] = b"bin/hello";
 /// with the dedicated stress controller.  Normal init0 images never select it.
 #[cfg(feature = "i2-stress-integration")]
 pub const I2_STRESS_PATH: &[u8] = b"bin/hello";
+/// The WYR0-I image supplies its dedicated controller through the existing selector payload slot.
+#[cfg(feature = "i-capability-integration")]
+pub const I_CAPABILITY_PATH: &[u8] = b"bin/hello";
 /// Nonzero WRLP transaction identifier for the `init0 -> hello` launch.
 pub const HELLO_TRANSACTION_ID: u64 = 2;
 
@@ -96,6 +101,8 @@ pub enum Init0Error {
     Supervision(SupervisionError<NativeError>),
     /// Cleanup of an already-published descendant failed.
     Cleanup(NativeError),
+    /// A selector-bound WRCAP1 datagram could not be received and relayed byte-for-byte.
+    CapabilityEvidence,
     /// A successful bootfs callback did not retain the descendant it created.
     MissingLoadedProcess,
 }
@@ -126,6 +133,7 @@ impl Init0Error {
             )) => *code,
             Self::Supervision(error) => supervision_exit_code(error),
             Self::Cleanup(error) => cleanup_exit_code(*error),
+            Self::CapabilityEvidence => PREFIX | 0x0A,
             Self::MissingLoadedProcess => PREFIX | 0x0301,
         }
     }
@@ -348,6 +356,17 @@ pub fn run_init0<
             (Err(error), None) => return Err(Init0Error::Native(error)),
             (Ok(Ok(())), None) => return Err(Init0Error::MissingLoadedProcess),
         };
+        #[cfg(feature = "i-capability-integration")]
+        if let Err(evidence) = relay_capability_evidence(
+            system,
+            supervisor,
+            bootstrap_channel,
+            loaded.launch_channel,
+            deadline,
+        ) {
+            cleanup_loaded_process(system, loader, loaded, true).map_err(Init0Error::Cleanup)?;
+            return Err(evidence);
+        }
         let supervision = supervise_child(
             supervisor,
             loaded.process,
@@ -388,9 +407,20 @@ fn load_selected_child<Loader: LoaderPlatform<Error = NativeError>>(
     bytes: &[u8],
 ) -> Result<LoadedProcess, Init0Error> {
     let archive = Archive::new(bytes).map_err(Init0Error::Bootfs)?;
-    #[cfg(feature = "i2-stress-integration")]
+    #[cfg(all(
+        feature = "i2-stress-integration",
+        not(feature = "i-capability-integration")
+    ))]
     let path = I2_STRESS_PATH;
-    #[cfg(not(feature = "i2-stress-integration"))]
+    #[cfg(all(
+        feature = "i-capability-integration",
+        not(feature = "i2-stress-integration")
+    ))]
+    let path = I_CAPABILITY_PATH;
+    #[cfg(not(any(
+        feature = "i2-stress-integration",
+        feature = "i-capability-integration"
+    )))]
     let path = HELLO_PATH;
     let entry = archive.lookup(path).map_err(|error| match error {
         LookupError::NotFound | LookupError::InvalidPath(_) => Init0Error::MissingHello,
@@ -413,14 +443,73 @@ fn load_selected_child<Loader: LoaderPlatform<Error = NativeError>>(
 }
 
 const fn selected_profile() -> LaunchProfile {
-    #[cfg(feature = "i2-stress-integration")]
+    #[cfg(all(
+        feature = "i2-stress-integration",
+        not(feature = "i-capability-integration")
+    ))]
     {
         LaunchProfile::I2Stress
     }
-    #[cfg(not(feature = "i2-stress-integration"))]
+    #[cfg(all(
+        feature = "i-capability-integration",
+        not(feature = "i2-stress-integration")
+    ))]
+    {
+        LaunchProfile::CapabilityController
+    }
+    #[cfg(not(any(
+        feature = "i2-stress-integration",
+        feature = "i-capability-integration"
+    )))]
     {
         LaunchProfile::Hello
     }
+}
+
+#[cfg(all(
+    feature = "i2-stress-integration",
+    feature = "i-capability-integration"
+))]
+compile_error!("init0 selector integrations are mutually exclusive");
+
+#[cfg(feature = "i-capability-integration")]
+fn relay_capability_evidence<
+    System: Init0System,
+    Supervisor: SupervisionPlatform<Error = NativeError>,
+>(
+    system: &mut System,
+    supervisor: &mut Supervisor,
+    parent_channel: DwHandle,
+    child_channel: DwHandle,
+    deadline: DwDeadline,
+) -> Result<(), Init0Error> {
+    for sequence in 0..wyrmroot_i_capability::WRCAP1_EVENT_COUNT {
+        let item = DwWaitItemV1 {
+            handle: child_channel,
+            signals: DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+        };
+        let observed = supervisor
+            .wait_many(core::slice::from_ref(&item), deadline)
+            .map_err(|_| Init0Error::CapabilityEvidence)?;
+        if observed.index != 0 || observed.observed.0 & DW_SIGNAL_READABLE.0 == 0 {
+            return Err(Init0Error::CapabilityEvidence);
+        }
+        let mut record = [0_u8; wyrmroot_i_capability::WRCAP1_RECORD_BYTES];
+        let mut no_handles = [];
+        let received = supervisor
+            .receive_channel(child_channel, &mut record, &mut no_handles)
+            .map_err(|_| Init0Error::CapabilityEvidence)?;
+        if received.bytes != record.len()
+            || received.handles != 0
+            || !wyrmroot_i_capability::validate_relay_record(&record, sequence as u32)
+        {
+            return Err(Init0Error::CapabilityEvidence);
+        }
+        system
+            .send_channel(parent_channel, &record)
+            .map_err(|_| Init0Error::CapabilityEvidence)?;
+    }
+    Ok(())
 }
 
 fn cleanup_loaded_process<System: Init0System, Loader: LoaderPlatform<Error = NativeError>>(
@@ -486,4 +575,294 @@ fn send_ready<System: Init0System>(
     system
         .close_handle(bootstrap_channel)
         .map_err(Init0Error::Native)
+}
+
+#[cfg(all(test, feature = "i-capability-integration"))]
+mod capability_relay_tests {
+    use deepwyrm_syscall::{
+        DW_SIGNAL_READABLE, DW_TERMINATION_AUTHORIZED, DW_WAIT_RESULT_V1_SIZE,
+        DwTaskTerminationInfoV1, DwWaitResultV1,
+    };
+    use wyrmroot_i_capability::{
+        CANCEL_TRANSACTION, CHANNEL_TOKEN, CONTENT_TOKEN, EXHAUST_TRANSACTION_BASE, EvidenceEvent,
+        EvidenceKind, EvidenceTranscript, MEMORY_CHILD_RIGHTS_MASK, MEMORY_PAGE_BYTES,
+        MEMORY_TRANSACTION, NORMAL_TRANSACTION, RESTART_TRANSACTION_BASE, WAIT_TOKEN,
+        WRCAP1_EVENT_COUNT, WRCAP1_RECORD_BYTES,
+    };
+
+    use super::*;
+
+    const PARENT_CHANNEL: DwHandle = DwHandle(90);
+    const CHILD_CHANNEL: DwHandle = DwHandle(91);
+    const DEADLINE: DwDeadline = DwDeadline(1234);
+
+    struct RelaySystem {
+        relayed: [[u8; WRCAP1_RECORD_BYTES]; WRCAP1_EVENT_COUNT],
+        count: usize,
+    }
+
+    impl RelaySystem {
+        const fn new() -> Self {
+            Self {
+                relayed: [[0; WRCAP1_RECORD_BYTES]; WRCAP1_EVENT_COUNT],
+                count: 0,
+            }
+        }
+    }
+
+    impl Init0System for RelaySystem {
+        fn query_capability_info(
+            &mut self,
+            _: DwHandle,
+        ) -> Result<CapabilityInfo<DwObjectType, DwRights>, NativeError> {
+            unreachable!("relay does not query capabilities")
+        }
+
+        fn receive_channel(
+            &mut self,
+            _: DwHandle,
+            _: &mut [u8],
+            _: &mut [DwReceivedHandleInfoV1],
+        ) -> Result<ReceiveCounts, NativeError> {
+            unreachable!("relay receives through the supervision adapter")
+        }
+
+        fn query_memory_object_size(&mut self, _: DwHandle) -> Result<u64, NativeError> {
+            unreachable!("relay does not query memory")
+        }
+
+        fn with_bootfs_bytes<R>(
+            &mut self,
+            _: DwHandle,
+            _: DwHandle,
+            _: MappingPlan,
+            _: impl for<'bytes> FnOnce(&'bytes [u8]) -> R,
+        ) -> Result<R, NativeError> {
+            unreachable!("relay does not map bootfs")
+        }
+
+        fn send_channel(&mut self, channel: DwHandle, bytes: &[u8]) -> Result<(), NativeError> {
+            assert_eq!(channel, PARENT_CHANNEL);
+            self.relayed[self.count].copy_from_slice(bytes);
+            self.count += 1;
+            Ok(())
+        }
+
+        fn close_handle(&mut self, _: DwHandle) -> Result<(), NativeError> {
+            unreachable!("relay does not own handle cleanup")
+        }
+    }
+
+    struct RelaySupervisor {
+        records: [[u8; WRCAP1_RECORD_BYTES]; WRCAP1_EVENT_COUNT],
+        next: usize,
+    }
+
+    impl SupervisionPlatform for RelaySupervisor {
+        type Error = NativeError;
+
+        fn wait_many(
+            &mut self,
+            items: &[DwWaitItemV1],
+            deadline: DwDeadline,
+        ) -> Result<DwWaitResultV1, Self::Error> {
+            assert_eq!(deadline, DEADLINE);
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].handle, CHILD_CHANNEL);
+            Ok(DwWaitResultV1 {
+                size: DW_WAIT_RESULT_V1_SIZE,
+                version: 1,
+                index: 0,
+                observed: DW_SIGNAL_READABLE,
+                ..DwWaitResultV1::default()
+            })
+        }
+
+        fn receive_channel(
+            &mut self,
+            channel: DwHandle,
+            bytes: &mut [u8],
+            handles: &mut [DwReceivedHandleInfoV1],
+        ) -> Result<ReceiveCounts, Self::Error> {
+            assert_eq!(channel, CHILD_CHANNEL);
+            assert!(handles.is_empty());
+            bytes.copy_from_slice(&self.records[self.next]);
+            self.next += 1;
+            Ok(ReceiveCounts {
+                bytes: WRCAP1_RECORD_BYTES,
+                handles: 0,
+            })
+        }
+
+        fn query_task_termination(
+            &mut self,
+            _: DwHandle,
+        ) -> Result<DwTaskTerminationInfoV1, Self::Error> {
+            unreachable!("relay runs before child supervision")
+        }
+    }
+
+    #[test]
+    fn relays_exactly_fifteen_controller_records_without_rewriting() {
+        let records = records();
+        let mut system = RelaySystem::new();
+        let mut supervisor = RelaySupervisor { records, next: 0 };
+
+        relay_capability_evidence(
+            &mut system,
+            &mut supervisor,
+            PARENT_CHANNEL,
+            CHILD_CHANNEL,
+            DEADLINE,
+        )
+        .unwrap();
+
+        assert_eq!(system.count, WRCAP1_EVENT_COUNT);
+        assert_eq!(system.relayed, records);
+        assert_eq!(supervisor.next, WRCAP1_EVENT_COUNT);
+    }
+
+    #[test]
+    fn malformed_record_stops_relay_before_later_facts() {
+        let mut records = records();
+        records[3][73] = b':';
+        let mut system = RelaySystem::new();
+        let mut supervisor = RelaySupervisor { records, next: 0 };
+
+        assert_eq!(
+            relay_capability_evidence(
+                &mut system,
+                &mut supervisor,
+                PARENT_CHANNEL,
+                CHILD_CHANNEL,
+                DEADLINE,
+            ),
+            Err(Init0Error::CapabilityEvidence)
+        );
+        assert_eq!(system.count, 3);
+        assert_eq!(supervisor.next, 4);
+    }
+
+    fn records() -> [[u8; WRCAP1_RECORD_BYTES]; WRCAP1_EVENT_COUNT] {
+        let mut transcript = EvidenceTranscript::new(0x0123_4567_89AB_CDEF).unwrap();
+        for event in [
+            event(EvidenceKind::ContentDelivery, 0, 0, CONTENT_TOKEN, 1, 2),
+            event(
+                EvidenceKind::ProcessLifecycle,
+                1,
+                1,
+                NORMAL_TRANSACTION,
+                1,
+                0,
+            ),
+            event(
+                EvidenceKind::ProcessLifecycle,
+                1,
+                1,
+                NORMAL_TRANSACTION,
+                2,
+                0,
+            ),
+            event(
+                EvidenceKind::MemoryShare,
+                1,
+                1,
+                MEMORY_TRANSACTION,
+                MEMORY_PAGE_BYTES,
+                MEMORY_CHILD_RIGHTS_MASK,
+            ),
+            event(EvidenceKind::ChannelLifecycle, 1, 1, CHANNEL_TOKEN, 0xF, 32),
+            event(EvidenceKind::WaitEventTimer, 1, 1, WAIT_TOKEN, 0xF, 0),
+            event(
+                EvidenceKind::Cancellation,
+                2,
+                1,
+                CANCEL_TRANSACTION,
+                u64::from(DW_TERMINATION_AUTHORIZED.0),
+                0,
+            ),
+            event(
+                EvidenceKind::RestartReplacement,
+                3,
+                1,
+                RESTART_TRANSACTION_BASE + 1,
+                1,
+                2,
+            ),
+            event(
+                EvidenceKind::RestartReplacement,
+                3,
+                2,
+                RESTART_TRANSACTION_BASE + 2,
+                2,
+                1,
+            ),
+            event(
+                EvidenceKind::RestartExhausted,
+                4,
+                1,
+                EXHAUST_TRANSACTION_BASE + 1,
+                1,
+                2,
+            ),
+            event(
+                EvidenceKind::RestartExhausted,
+                4,
+                2,
+                EXHAUST_TRANSACTION_BASE + 2,
+                2,
+                3,
+            ),
+            event(
+                EvidenceKind::RestartExhausted,
+                4,
+                3,
+                EXHAUST_TRANSACTION_BASE + 3,
+                3,
+                4,
+            ),
+            event(
+                EvidenceKind::RestartExhausted,
+                4,
+                4,
+                EXHAUST_TRANSACTION_BASE + 4,
+                4,
+                0,
+            ),
+            event(
+                EvidenceKind::OverloadReplayRejected,
+                1,
+                1,
+                NORMAL_TRANSACTION,
+                0xF,
+                2,
+            ),
+            event(EvidenceKind::CleanupBaseline, 0, 0, 0, 0, 0),
+        ] {
+            transcript.push(event).unwrap();
+        }
+        let mut records = [[0_u8; WRCAP1_RECORD_BYTES]; WRCAP1_EVENT_COUNT];
+        for (index, record) in records.iter_mut().enumerate() {
+            *record = transcript.encoded(index).unwrap();
+        }
+        records
+    }
+
+    const fn event(
+        kind: EvidenceKind,
+        peer: u32,
+        generation: u32,
+        token: u64,
+        arg0: u64,
+        arg1: u64,
+    ) -> EvidenceEvent {
+        EvidenceEvent {
+            kind,
+            peer,
+            generation,
+            token,
+            arg0,
+            arg1,
+        }
+    }
 }
