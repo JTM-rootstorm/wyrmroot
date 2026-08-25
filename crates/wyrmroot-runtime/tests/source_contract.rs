@@ -24,6 +24,10 @@ const RESTART_SUPERVISION_SOURCE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/src/supervision/restart.rs"
 ));
+const BOUNDED_ACCOUNTING_SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/bounded_accounting.rs"
+));
 const MANIFEST: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
 
 #[test]
@@ -76,6 +80,38 @@ fn restart_supervision_is_finite_generation_safe_native_policy() {
         assert!(
             !RESTART_SUPERVISION_SOURCE.contains(forbidden),
             "restart supervision imported forbidden service-manager surface {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn readiness_accounting_is_fixed_generated_and_truthfully_scoped() {
+    for required in [
+        "DW_CHANNEL_MAX_PAYLOAD",
+        "DW_CHANNEL_MAX_HANDLES",
+        "EnforcementClass::Kernel",
+        "EnforcementClass::Wyrmroot",
+        "EnforcementClass::Future",
+        "CleanupDisposition::Complete",
+        "TerminalRecordMissing",
+        "OutstandingGenerationResource",
+        "checked_add",
+        "checked_sub",
+        "[PeerAccounting; MAX_ACCOUNTED_PEERS]",
+        "[u64; MAX_LIVE_TRANSACTIONS_PER_PEER]",
+        "[u64; MAX_REPLAY_ENTRIES_PER_PEER]",
+    ] {
+        assert!(
+            BOUNDED_ACCOUNTING_SOURCE.contains(required),
+            "missing bounded-accounting contract marker {required}"
+        );
+    }
+    for forbidden in [
+        "Vec<", "VecDeque", "HashMap", "BTreeMap", "alloc::", "std::",
+    ] {
+        assert!(
+            !BOUNDED_ACCOUNTING_SOURCE.contains(forbidden),
+            "bounded accounting imported dynamic surface {forbidden}"
         );
     }
 }

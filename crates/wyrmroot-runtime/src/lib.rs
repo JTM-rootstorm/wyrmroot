@@ -9,6 +9,7 @@
 #![deny(unused_crate_dependencies)]
 
 mod bootstrap;
+mod bounded_accounting;
 mod diagnostics;
 mod entry;
 #[allow(
@@ -33,6 +34,13 @@ pub use bootstrap::{
     CapabilityValidationError, InitCapability, LOADER_TASK_GROUP_EXPECTATION,
     MAX_BOOTFS_LOGICAL_SIZE, MappingPlan, MappingPlanError, PAGE_SIZE, SELF_ROOT_EXPECTATION,
     validate_bootstrap_channel, validate_init_capabilities, validate_init_capabilities_v2,
+};
+pub use bounded_accounting::{
+    AccountedResource, AccountingError, EnforcementClass, GenerationRetirement,
+    GenericContainmentGap, MAX_ACCOUNTED_PEERS, MAX_LIVE_TRANSACTIONS_PER_PEER,
+    MAX_REPLAY_ENTRIES_PER_PEER, ReadinessAccounting, ReservationRequest, ReservationState,
+    ReservationToken, ResourceBudget, TransactionToken, WYR0_I_RESOURCE_BUDGETS,
+    kernel_channel_enforcement, validate_kernel_channel_envelope,
 };
 pub use loader_native::NativeLoaderPlatform;
 pub use native::{
