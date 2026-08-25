@@ -365,9 +365,14 @@ pub fn run_bootstrap<System: BootstrapSystem>(
 /// WYR0-F child transaction identifier for `system/init0`.
 pub const INIT0_TRANSACTION_ID: u64 = 1;
 
-/// Number of controller-originated WYR0-I capability evidence kinds.
+/// Number of controller-originated WYR0-I capability evidence records.
 #[cfg(feature = "i-capability-relay")]
-pub const WRCAP1_RECORD_COUNT: usize = 10;
+pub const WRCAP1_RECORD_COUNT: usize = 15;
+/// Canonical ordered WYR0-I controller evidence kinds for the relay.
+#[cfg(feature = "i-capability-relay")]
+pub const WRCAP1_KINDS: [u8; WRCAP1_RECORD_COUNT] = [
+    0x01, 0x02, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x07, 0x08, 0x08, 0x08, 0x08, 0x09, 0x0A,
+];
 /// Exact fixed-width ASCII length of one `WRCAP1` evidence datagram.
 #[cfg(feature = "i-capability-relay")]
 pub const WRCAP1_RECORD_SIZE: usize = 117;
@@ -482,7 +487,7 @@ pub fn run_init0_bootstrap<
 
 /// Runs the selector-gated WYR0-I bootstrap transaction.
 ///
-/// Before ordinary WRLP supervision, this path relays the controller's ten exact, handle-free
+/// Before ordinary WRLP supervision, this path relays the controller's fifteen exact, handle-free
 /// WRCAP1 datagrams from init0's launch Channel to the primordial parent Channel. Bootstrap
 /// validates only the transport boundary it owns and forwards each accepted byte slice unchanged;
 /// the controller remains the sole evidence-record source and the host owns full semantic joins.
@@ -650,7 +655,7 @@ fn relay_wrcap1_records<
     }
     let mut bytes = [0_u8; WRCAP1_RECORD_SIZE];
     let mut handles = [];
-    for sequence in 0..WRCAP1_RECORD_COUNT {
+    for (sequence, expected_kind) in WRCAP1_KINDS.into_iter().enumerate() {
         wait_for_wrcap1_record(supervisor, launch_channel, deadline)?;
         let counts = match system.receive_channel(launch_channel, &mut bytes, &mut handles) {
             Err(NativeError::Status(status)) if status == DW_STATUS_WOULD_BLOCK => {
@@ -670,7 +675,7 @@ fn relay_wrcap1_records<
             return Err(BootstrapError::ReceiveCounts(counts));
         }
         let record = &bytes[..counts.bytes];
-        validate_wrcap1_record(record, sequence as u32, sequence as u8 + 1)
+        validate_wrcap1_record(record, sequence as u32, expected_kind)
             .map_err(BootstrapError::CapabilityRelay)?;
         system
             .send_channel(primordial_parent_channel, record)

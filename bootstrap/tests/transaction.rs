@@ -24,7 +24,8 @@ use wyrmroot_bootstrap::{
 use wyrmroot_bootstrap::{LOADER_SMOKE_PATH, run_loader_smoke_bootstrap};
 #[cfg(feature = "i-capability-relay")]
 use wyrmroot_bootstrap::{
-    WRCAP1_RECORD_COUNT, WRCAP1_RECORD_SIZE, Wrcap1RelayError, run_init0_capability_bootstrap,
+    WRCAP1_KINDS, WRCAP1_RECORD_COUNT, WRCAP1_RECORD_SIZE, Wrcap1RelayError,
+    run_init0_capability_bootstrap,
 };
 use wyrmroot_bootstrap_proto::{
     BOOTSTRAP_INIT_V2_SIZE, BootstrapMessage, InitMessageV2, ReadyMessageV2, decode,
@@ -550,6 +551,7 @@ struct SmokeSupervisor {
     relay_index: usize,
     relay_wait_error: Option<NativeError>,
     relay_invalid_wait_result: bool,
+    ready_receive_counts: Option<ReceiveCounts>,
 }
 
 impl SmokeSupervisor {
@@ -565,6 +567,7 @@ impl SmokeSupervisor {
             relay_index: 0,
             relay_wait_error: None,
             relay_invalid_wait_result: false,
+            ready_receive_counts: None,
         }
     }
 
@@ -587,6 +590,7 @@ impl SmokeSupervisor {
             relay_index: 0,
             relay_wait_error: None,
             relay_invalid_wait_result: false,
+            ready_receive_counts: None,
         }
     }
 }
@@ -655,6 +659,9 @@ impl SupervisionPlatform for SmokeSupervisor {
         _: &mut [DwReceivedHandleInfoV1],
     ) -> Result<ReceiveCounts, Self::Error> {
         self.received += 1;
+        if let Some(counts) = self.ready_receive_counts {
+            return Ok(counts);
+        }
         let size = launch::encode_ready(self.transaction_id, bytes)
             .map_err(|_| NativeError::Status(DW_STATUS_BAD_HANDLE))?;
         Ok(ReceiveCounts {
@@ -721,12 +728,14 @@ fn primordial_bootstrap_launches_only_init0_and_supervises_it_before_ready() {
 
 #[cfg(feature = "i-capability-relay")]
 #[test]
-fn capability_bootstrap_relays_ten_exact_wrcap1_records_before_init0_supervision() {
+fn capability_bootstrap_relays_fifteen_exact_wrcap1_records_before_init0_supervision() {
     let image = executable();
     let mut fixture = Fixture::valid();
     fixture.bootfs = bootfs(&[(INIT0_PATH, &image), (HELLO_PATH, b"hello")]);
-    fixture.relay_records = (0..WRCAP1_RECORD_COUNT)
-        .map(|sequence| wrcap1_record(sequence as u32, sequence as u8 + 1))
+    fixture.relay_records = WRCAP1_KINDS
+        .into_iter()
+        .enumerate()
+        .map(|(sequence, kind)| wrcap1_record(sequence as u32, kind))
         .collect();
     let expected_records = fixture.relay_records.concat();
     let mut loader = SmokeLoader::init0();
@@ -778,6 +787,26 @@ fn capability_bootstrap_rejects_malformed_first_relay_record_before_supervision(
         ),
         Err(BootstrapError::CapabilityRelay(
             Wrcap1RelayError::MalformedFraming
+        ))
+    );
+    assert_eq!(supervisor.received, 0);
+
+    let mut kind_fixture = Fixture::valid();
+    kind_fixture.bootfs = bootfs(&[(INIT0_PATH, &image), (HELLO_PATH, b"hello")]);
+    kind_fixture.relay_records = vec![wrcap1_record(0, 1), wrcap1_record(1, 3)];
+    let mut loader = SmokeLoader::init0();
+    let mut supervisor = SmokeSupervisor::successful_init0();
+    supervisor.relay_events = &WRCAP1_READABLE_EVENTS;
+    assert_eq!(
+        run_init0_capability_bootstrap(
+            &mut kind_fixture,
+            &mut loader,
+            &mut supervisor,
+            CHANNEL,
+            DwDeadline(99),
+        ),
+        Err(BootstrapError::CapabilityRelay(
+            Wrcap1RelayError::UnexpectedKind
         ))
     );
     assert_eq!(supervisor.received, 0);
@@ -957,6 +986,46 @@ fn capability_bootstrap_waits_each_record_and_rejects_terminal_or_racing_receive
         ))
     );
     assert_eq!(supervisor.received, 0);
+}
+
+#[cfg(feature = "i-capability-relay")]
+#[test]
+fn capability_bootstrap_rejects_a_sixteenth_record_through_ordinary_ready_validation() {
+    let image = executable();
+    let mut fixture = Fixture::valid();
+    fixture.bootfs = bootfs(&[(INIT0_PATH, &image), (HELLO_PATH, b"hello")]);
+    fixture.relay_records = WRCAP1_KINDS
+        .into_iter()
+        .enumerate()
+        .map(|(sequence, kind)| wrcap1_record(sequence as u32, kind))
+        .collect();
+    let expected_records = fixture.relay_records.concat();
+    let mut loader = SmokeLoader::init0();
+    let mut supervisor = SmokeSupervisor::successful_init0();
+    supervisor.relay_events = &WRCAP1_READABLE_EVENTS;
+    supervisor.ready_receive_counts = Some(ReceiveCounts {
+        bytes: WRCAP1_RECORD_SIZE,
+        handles: 0,
+    });
+
+    assert_eq!(
+        run_init0_capability_bootstrap(
+            &mut fixture,
+            &mut loader,
+            &mut supervisor,
+            CHANNEL,
+            DwDeadline(99),
+        ),
+        Err(BootstrapError::Supervision(
+            SupervisionError::InvalidReadyReceive(ReceiveCounts {
+                bytes: WRCAP1_RECORD_SIZE,
+                handles: 0,
+            })
+        ))
+    );
+    assert_eq!(fixture.relay_index, WRCAP1_RECORD_COUNT);
+    assert_eq!(supervisor.relay_index, WRCAP1_RECORD_COUNT);
+    assert_eq!(fixture.sent, expected_records);
 }
 
 #[cfg(feature = "i-capability-relay")]
