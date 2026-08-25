@@ -11,7 +11,8 @@
 #[cfg(feature = "i-capability-integration")]
 use deepwyrm_syscall::{
     DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DW_SIGNAL_WRITABLE, DW_STATUS_WOULD_BLOCK,
-    DwSignals, DwWaitItemV1,
+    DW_TASK_STATE_EXITED, DW_TERMINATION_NORMAL_EXIT, DwSignals, DwTaskTerminationInfoV1,
+    DwWaitItemV1,
 };
 use deepwyrm_syscall::{DwDeadline, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights};
 use wyrmroot_bootfs::archive::{Archive, LookupError, ParseError};
@@ -367,7 +368,15 @@ pub fn run_init0<
             loaded.launch_channel,
             deadline,
         ) {
-            cleanup_loaded_process(system, loader, loaded, true).map_err(Init0Error::Cleanup)?;
+            let terminal = supervisor
+                .query_task_termination(loaded.process)
+                .ok()
+                .filter(|info| info.state == DW_TASK_STATE_EXITED);
+            cleanup_loaded_process(system, loader, loaded, terminal.is_none())
+                .map_err(Init0Error::Cleanup)?;
+            if let Some(error) = terminal.and_then(capability_terminal_error) {
+                return Err(error);
+            }
             return Err(evidence);
         }
         let supervision = supervise_child(
@@ -392,6 +401,20 @@ pub fn run_init0<
     let transaction_id = operation?;
     cleanup?;
     send_ready(system, bootstrap_channel, transaction_id)
+}
+
+#[cfg(feature = "i-capability-integration")]
+fn capability_terminal_error(info: DwTaskTerminationInfoV1) -> Option<Init0Error> {
+    if info.state == DW_TASK_STATE_EXITED
+        && info.reason == DW_TERMINATION_NORMAL_EXIT
+        && info.application_code != 0
+    {
+        Some(Init0Error::Supervision(SupervisionError::Exit(
+            ExitValidationError::NonzeroApplicationCode(info.application_code),
+        )))
+    } else {
+        None
+    }
 }
 
 fn bootfs_mapping_plan<System: Init0System>(
@@ -627,6 +650,23 @@ mod capability_relay_tests {
     };
 
     use super::*;
+
+    #[test]
+    fn terminal_controller_failure_is_preserved_before_relay_cleanup() {
+        let mut info = DwTaskTerminationInfoV1::default();
+        info.state = DW_TASK_STATE_EXITED;
+        info.reason = DW_TERMINATION_NORMAL_EXIT;
+        info.application_code = 0x2402_8c0d;
+        assert_eq!(
+            capability_terminal_error(info),
+            Some(Init0Error::Supervision(SupervisionError::Exit(
+                ExitValidationError::NonzeroApplicationCode(0x2402_8c0d)
+            )))
+        );
+
+        info.application_code = 0;
+        assert_eq!(capability_terminal_error(info), None);
+    }
 
     const PARENT_CHANNEL: DwHandle = DwHandle(90);
     const CHILD_CHANNEL: DwHandle = DwHandle(91);
