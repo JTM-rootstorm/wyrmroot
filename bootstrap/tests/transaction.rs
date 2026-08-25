@@ -1,3 +1,6 @@
+#[cfg(feature = "i-capability-relay")]
+use deepwyrm_syscall::DW_STATUS_TIMED_OUT;
+use deepwyrm_syscall::DW_STATUS_WOULD_BLOCK;
 use deepwyrm_syscall::{
     DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL, DW_OBJECT_TYPE_MEMORY_OBJECT,
     DW_OBJECT_TYPE_TASK_GROUP, DW_STATUS_BAD_HANDLE, DwHandle, DwObjectType,
@@ -9,8 +12,6 @@ use deepwyrm_syscall::{
     DwDeadline, DwHandleTransferV1, DwMemoryProtection, DwTaskState, DwTaskTerminationInfoV1,
     DwWaitItemV1, DwWaitResultV1,
 };
-#[cfg(feature = "i-capability-relay")]
-use deepwyrm_syscall::{DW_STATUS_TIMED_OUT, DW_STATUS_WOULD_BLOCK};
 use wyrmroot_bootfs::builder::{Builder, FileMode};
 #[cfg(feature = "primordial-test-support")]
 use wyrmroot_bootstrap::run_bootstrap_with_before_ready;

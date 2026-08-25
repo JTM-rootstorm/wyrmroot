@@ -11,8 +11,7 @@
 #[cfg(feature = "i-capability-integration")]
 use deepwyrm_syscall::{
     DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DW_SIGNAL_WRITABLE, DW_STATUS_WOULD_BLOCK,
-    DW_TASK_STATE_EXITED, DW_TERMINATION_NORMAL_EXIT, DwSignals, DwTaskTerminationInfoV1,
-    DwWaitItemV1,
+    DW_TASK_STATE_EXITED, DwSignals, DwTaskTerminationInfoV1, DwWaitItemV1,
 };
 use deepwyrm_syscall::{DwDeadline, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights};
 use wyrmroot_bootfs::archive::{Archive, LookupError, ParseError};
@@ -23,6 +22,8 @@ use wyrmroot_loader::{
         load_process,
     },
 };
+#[cfg(feature = "i-capability-integration")]
+use wyrmroot_runtime::validate_successful_exit;
 use wyrmroot_runtime::{
     BOOTFS_EXPECTATION, BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, CapabilityValidationError,
     ExitObservedReadinessError, ExitValidationError, InitCapability, LOADER_TASK_GROUP_EXPECTATION,
@@ -405,16 +406,9 @@ pub fn run_init0<
 
 #[cfg(feature = "i-capability-integration")]
 fn capability_terminal_error(info: DwTaskTerminationInfoV1) -> Option<Init0Error> {
-    if info.state == DW_TASK_STATE_EXITED
-        && info.reason == DW_TERMINATION_NORMAL_EXIT
-        && info.application_code != 0
-    {
-        Some(Init0Error::Supervision(SupervisionError::Exit(
-            ExitValidationError::NonzeroApplicationCode(info.application_code),
-        )))
-    } else {
-        None
-    }
+    validate_successful_exit(&info)
+        .err()
+        .map(|error| Init0Error::Supervision(SupervisionError::Exit(error)))
 }
 
 fn bootfs_mapping_plan<System: Init0System>(
@@ -639,8 +633,9 @@ fn send_ready<System: Init0System>(
 #[cfg(all(test, feature = "i-capability-integration"))]
 mod capability_relay_tests {
     use deepwyrm_syscall::{
-        DW_SIGNAL_READABLE, DW_TERMINATION_AUTHORIZED, DW_WAIT_RESULT_V1_SIZE,
-        DwTaskTerminationInfoV1, DwWaitResultV1,
+        DW_SIGNAL_READABLE, DW_TASK_TERMINATION_INFO_V1_SIZE, DW_TERMINATION_AUTHORIZED,
+        DW_TERMINATION_NORMAL_EXIT, DW_WAIT_RESULT_V1_SIZE, DwTaskTerminationInfoV1,
+        DwWaitResultV1,
     };
     use wyrmroot_i_capability::{
         CANCEL_TRANSACTION, CHANNEL_TOKEN, EXHAUST_TRANSACTION_BASE, EvidenceEvent, EvidenceKind,
@@ -654,6 +649,8 @@ mod capability_relay_tests {
     #[test]
     fn terminal_controller_failure_is_preserved_before_relay_cleanup() {
         let mut info = DwTaskTerminationInfoV1::default();
+        info.size = DW_TASK_TERMINATION_INFO_V1_SIZE;
+        info.version = 1;
         info.state = DW_TASK_STATE_EXITED;
         info.reason = DW_TERMINATION_NORMAL_EXIT;
         info.application_code = 0x2402_8c0d;
@@ -666,6 +663,32 @@ mod capability_relay_tests {
 
         info.application_code = 0;
         assert_eq!(capability_terminal_error(info), None);
+
+        info.reason = DW_TERMINATION_AUTHORIZED;
+        assert_eq!(
+            capability_terminal_error(info),
+            Some(Init0Error::Supervision(SupervisionError::Exit(
+                ExitValidationError::NotNormalExit
+            )))
+        );
+
+        info.reason = DW_TERMINATION_NORMAL_EXIT;
+        info.detail = 7;
+        assert_eq!(
+            capability_terminal_error(info),
+            Some(Init0Error::Supervision(SupervisionError::Exit(
+                ExitValidationError::NonzeroExceptionFields
+            )))
+        );
+
+        info.detail = 0;
+        info.size = 0;
+        assert_eq!(
+            capability_terminal_error(info),
+            Some(Init0Error::Supervision(SupervisionError::Exit(
+                ExitValidationError::InvalidEnvelope
+            )))
+        );
     }
 
     const PARENT_CHANNEL: DwHandle = DwHandle(90);

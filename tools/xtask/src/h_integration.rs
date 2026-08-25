@@ -778,26 +778,128 @@ fn write_capability_outputs(
     summary: &[u8],
 ) -> Result<(), Failure> {
     // The summary is intentionally staged before the authoritative certificate.
-    // A surviving certificate is therefore an all-or-nothing publication marker:
-    // readers never treat a standalone, earlier certificate as accepted evidence.
+    // The certificate bytes themselves are first written and synced under a
+    // non-authoritative staging name, then published with one hard-link operation.
+    // A surviving final certificate is therefore always a complete publication marker.
     write_new(
         outputs,
         &capability.capability_summary,
         summary,
         "WYR0-I capability summary",
     )?;
-    if let Err(error) = write_new(
+    let staged_certificate = staged_certificate_path(&capability.certificate)?;
+    let staged_file = match write_new_retained(
         outputs,
-        &capability.certificate,
+        &staged_certificate,
         certificate,
-        "WYR0-I capability certificate",
+        "staged WYR0-I capability certificate",
+    ) {
+        Ok(file) => file,
+        Err(error) => {
+            return Err(with_rollback(
+                error,
+                rollback_created(
+                    outputs,
+                    &[(&capability.capability_summary, "WYR0-I capability summary")],
+                ),
+            ));
+        }
+    };
+    if let Err(error) = publish_staged_certificate(
+        outputs,
+        &staged_certificate,
+        &capability.certificate,
+        &staged_file,
     ) {
         return Err(with_rollback(
             error,
             rollback_created(
                 outputs,
-                &[(&capability.capability_summary, "WYR0-I capability summary")],
+                &[
+                    (&staged_certificate, "staged WYR0-I capability certificate"),
+                    (&capability.capability_summary, "WYR0-I capability summary"),
+                ],
             ),
+        ));
+    }
+    if let Err(error) =
+        outputs.remove_file(&staged_certificate, "staged WYR0-I capability certificate")
+    {
+        return Err(with_rollback(
+            Failure::task(format!(
+                "certificate publication staging cleanup failed: {}",
+                error.message
+            )),
+            rollback_created(
+                outputs,
+                &[
+                    (&capability.certificate, "WYR0-I capability certificate"),
+                    (&capability.capability_summary, "WYR0-I capability summary"),
+                    (&staged_certificate, "staged WYR0-I capability certificate"),
+                ],
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn staged_certificate_path(certificate: &Path) -> Result<PathBuf, Failure> {
+    let name = certificate
+        .file_name()
+        .ok_or_else(|| Failure::task("WYR0-I capability certificate has no file name"))?;
+    let mut staged = name.to_os_string();
+    staged.push(".staged");
+    Ok(certificate.with_file_name(staged))
+}
+
+fn publish_staged_certificate(
+    outputs: &CheckedOutputRoot,
+    staged: &Path,
+    certificate: &Path,
+    staged_file: &fs::File,
+) -> Result<(), Failure> {
+    require_absent(outputs, certificate, "WYR0-I capability certificate")?;
+    let expected = staged_file.metadata().map_err(|error| {
+        Failure::task(format!(
+            "could not stat staged WYR0-I capability certificate: {error}"
+        ))
+    })?;
+    let staged = outputs.target(staged, "staged WYR0-I capability certificate")?;
+    let certificate_target = outputs.target(certificate, "WYR0-I capability certificate")?;
+    fs::hard_link(staged.path(), certificate_target.path()).map_err(|error| {
+        Failure::task(format!(
+            "could not atomically publish WYR0-I capability certificate: {error}"
+        ))
+    })?;
+    let published = match outputs.open_regular_file(
+        certificate,
+        "published WYR0-I capability certificate",
+        true,
+        false,
+    ) {
+        Ok(file) => file,
+        Err(error) => {
+            return Err(with_rollback(
+                error,
+                outputs.remove_file(certificate, "WYR0-I capability certificate"),
+            ));
+        }
+    };
+    let observed = match published.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return Err(with_rollback(
+                Failure::task(format!(
+                    "could not stat published WYR0-I capability certificate: {error}"
+                )),
+                outputs.remove_file(certificate, "WYR0-I capability certificate"),
+            ));
+        }
+    };
+    if expected.dev() != observed.dev() || expected.ino() != observed.ino() {
+        return Err(with_rollback(
+            Failure::task("staged WYR0-I capability certificate changed before atomic publication"),
+            outputs.remove_file(certificate, "WYR0-I capability certificate"),
         ));
     }
     Ok(())
@@ -809,12 +911,7 @@ fn write_capability_outputs(
 /// a WYR0-I candidate.
 fn certificate_identity(request: &HRequest) -> Result<CertificateIdentity, Failure> {
     let repository = crate::tasks::repository_root()?;
-    let deepwyrm = repository
-        .ancestors()
-        .skip(1)
-        .map(|ancestor| ancestor.join("deepwyrm"))
-        .find(|candidate| candidate.is_dir())
-        .ok_or_else(|| Failure::task("could not locate the sibling Deepwyrm repository"))?;
+    let deepwyrm = source_workspace_root(&repository)?.join("deepwyrm");
     let manifest = crate::metadata::BuildManifest::load(&repository)?;
     // This validates the canonical Cargo.toml/Cargo.lock dependency, its real
     // consumers, and the no-private-ABI policy before we attest that the
@@ -3295,21 +3392,13 @@ fn cleanup_after_kill_failure(killed: bool, suffix: &str) -> CleanupDisposition 
 
 fn verify_source_revisions(request: &HRequest) -> Result<(), Failure> {
     let repository = crate::tasks::repository_root()?;
-    let workspace = repository
-        .parent()
-        .ok_or_else(|| Failure::task("Wyrmroot repository has no workspace parent"))?;
+    let workspace = source_workspace_root(&repository)?;
+    let deepwyrm = workspace.join("deepwyrm");
+    let rust = workspace.join("rust");
     for (path, expected, label) in [
         (&repository, request.wyrmroot_revision.as_str(), "Wyrmroot"),
-        (
-            &workspace.join("deepwyrm"),
-            request.deepwyrm_revision.as_str(),
-            "Deepwyrm",
-        ),
-        (
-            &workspace.join("rust"),
-            request.rust_revision.as_str(),
-            "Rust",
-        ),
+        (&deepwyrm, request.deepwyrm_revision.as_str(), "Deepwyrm"),
+        (&rust, request.rust_revision.as_str(), "Rust"),
     ] {
         let revision = git_output(path, &["rev-parse", "HEAD"], label)?;
         if revision.trim() != expected {
@@ -3329,6 +3418,19 @@ fn verify_source_revisions(request: &HRequest) -> Result<(), Failure> {
         }
     }
     Ok(())
+}
+
+fn source_workspace_root(repository: &Path) -> Result<PathBuf, Failure> {
+    repository
+        .ancestors()
+        .skip(1)
+        .find(|ancestor| ancestor.join("deepwyrm").is_dir() && ancestor.join("rust").is_dir())
+        .map(Path::to_path_buf)
+        .ok_or_else(|| {
+            Failure::task(
+                "could not locate the workspace containing sibling Deepwyrm and Rust repositories",
+            )
+        })
 }
 
 fn git_output(repository: &Path, arguments: &[&str], label: &str) -> Result<String, Failure> {
@@ -3496,6 +3598,15 @@ fn write_new(
     bytes: &[u8],
     label: &str,
 ) -> Result<(), Failure> {
+    write_new_retained(outputs, path, bytes, label).map(drop)
+}
+
+fn write_new_retained(
+    outputs: &CheckedOutputRoot,
+    path: &Path,
+    bytes: &[u8],
+    label: &str,
+) -> Result<fs::File, Failure> {
     let mut output = outputs.create_new_file(path, label, false, true)?;
     if let Err(error) = output.write_all(bytes).and_then(|()| output.sync_all()) {
         drop(output);
@@ -3504,7 +3615,7 @@ fn write_new(
             rollback_created(outputs, &[(path, label)]),
         ));
     }
-    Ok(())
+    Ok(output)
 }
 
 fn open_new(outputs: &CheckedOutputRoot, path: &Path, label: &str) -> Result<fs::File, Failure> {
@@ -3569,6 +3680,25 @@ mod tests {
     use super::*;
 
     const TEST_EVIDENCE_NONCE: u64 = h_request::I1_EVIDENCE_NONCE;
+
+    #[test]
+    fn source_workspace_root_accepts_canonical_and_detached_review_layouts() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("xtask-source-workspace-{}", std::process::id()));
+        let workspace = root.join("workspace");
+        let canonical = workspace.join("wyrmroot");
+        let detached = workspace.join(".worktrees/wyrmroot/review-wave3");
+        fs::create_dir_all(&canonical).expect("create canonical repository fixture");
+        fs::create_dir_all(&detached).expect("create detached repository fixture");
+        fs::create_dir(workspace.join("deepwyrm")).expect("create Deepwyrm sibling fixture");
+        fs::create_dir(workspace.join("rust")).expect("create Rust sibling fixture");
+
+        assert_eq!(source_workspace_root(&canonical).unwrap(), workspace);
+        assert_eq!(source_workspace_root(&detached).unwrap(), workspace);
+
+        fs::remove_dir_all(root).expect("remove source-workspace fixture");
+    }
 
     fn test_stable_file(path: PathBuf, bytes: &[u8], immutable: bool) -> StableRunFile {
         fs::write(&path, bytes).expect("write test stable file");
@@ -4446,6 +4576,21 @@ mod tests {
         );
 
         fs::remove_file(&capability.capability_summary).expect("remove summary collision");
+        let staged_certificate = staged_certificate_path(&capability.certificate).unwrap();
+        fs::write(&staged_certificate, b"stale staged certificate")
+            .expect("write staged certificate collision");
+        assert!(
+            write_capability_outputs(&outputs, capability, b"new certificate", b"new summary")
+                .is_err()
+        );
+        assert!(!capability.capability_summary.exists());
+        assert!(!capability.certificate.exists());
+        assert_eq!(
+            fs::read(&staged_certificate).unwrap(),
+            b"stale staged certificate"
+        );
+        fs::remove_file(&staged_certificate).expect("remove staged certificate collision");
+
         write_capability_outputs(&outputs, capability, b"new certificate", b"new summary")
             .expect("publish staged summary and certificate");
         assert_eq!(
@@ -4456,8 +4601,45 @@ mod tests {
             fs::read(&capability.certificate).unwrap(),
             b"new certificate"
         );
+        assert!(!staged_certificate.exists());
 
         fs::remove_dir_all(root).expect("remove rollback fixture");
+    }
+
+    #[test]
+    fn staged_certificate_path_swap_cannot_publish_different_bytes() {
+        let (root, request) = capability_request("certificate-stage-swap");
+        let capability = request.capability.as_ref().expect("capability outputs");
+        let outputs = CheckedOutputRoot::open(&request).expect("open output root");
+        let staged_certificate = staged_certificate_path(&capability.certificate).unwrap();
+        let staged_file = write_new_retained(
+            &outputs,
+            &staged_certificate,
+            b"retained certificate",
+            "staged WYR0-I capability certificate",
+        )
+        .expect("write retained staged certificate");
+
+        fs::remove_file(&staged_certificate).expect("unlink retained staging name");
+        fs::write(&staged_certificate, b"replacement certificate")
+            .expect("replace staged certificate path");
+
+        let error = publish_staged_certificate(
+            &outputs,
+            &staged_certificate,
+            &capability.certificate,
+            &staged_file,
+        )
+        .expect_err("published bytes from a replaced staging path");
+        assert!(error.message.contains("changed before atomic publication"));
+        assert!(!capability.certificate.exists());
+        assert_eq!(
+            fs::read(&staged_certificate).unwrap(),
+            b"replacement certificate"
+        );
+
+        drop(staged_file);
+        fs::remove_dir_all(root).expect("remove stage-swap fixture");
     }
 
     #[test]

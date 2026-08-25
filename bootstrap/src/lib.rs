@@ -125,11 +125,12 @@ compile_error!("the WYR0-I capability relay is mutually exclusive with other boo
 
 #[cfg(feature = "i-capability-relay")]
 use deepwyrm_syscall::{
-    DW_DEADLINE_INFINITE, DW_SIGNAL_EXITED, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE,
-    DW_SIGNAL_WRITABLE, DW_STATUS_TIMED_OUT, DW_STATUS_WOULD_BLOCK, DwSignals, DwWaitItemV1,
+    DW_DEADLINE_INFINITE, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DW_SIGNAL_WRITABLE,
+    DW_STATUS_TIMED_OUT, DW_STATUS_WOULD_BLOCK,
 };
 use deepwyrm_syscall::{
-    DW_TASK_STATE_EXITED, DwDeadline, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights,
+    DW_SIGNAL_EXITED, DW_TASK_STATE_EXITED, DwDeadline, DwHandle, DwObjectType,
+    DwReceivedHandleInfoV1, DwRights, DwSignals, DwWaitItemV1,
 };
 use wyrmroot_bootfs::archive::{Archive, LookupError, ParseError};
 use wyrmroot_bootstrap_proto::{
@@ -702,7 +703,6 @@ fn run_init0_bootstrap_with_fault_and_before_supervision<
     send_primordial_ready(system, bootstrap_channel, transaction_id)
 }
 
-#[cfg(feature = "i-capability-relay")]
 fn observe_terminal_after_relay_failure<Supervisor: SupervisionPlatform<Error = NativeError>>(
     supervisor: &mut Supervisor,
     process: DwHandle,
