@@ -848,4 +848,25 @@ mod tests {
             .is_ok()
         );
     }
+
+    #[test]
+    fn checked_fixtures_are_valid_for_both_terminal_scenarios() {
+        let nonce = 0x0123_4567_89ab_cdef;
+        assert!(
+            parse_evidence(
+                include_bytes!("../../../tools/xtask/tests/fixtures/wyr1-a-normal.evidence"),
+                nonce,
+                Scenario::Normal,
+            )
+            .is_ok()
+        );
+        assert!(
+            parse_evidence(
+                include_bytes!("../../../tools/xtask/tests/fixtures/wyr1-a-degraded.evidence"),
+                nonce,
+                Scenario::DegradedRecovery,
+            )
+            .is_ok()
+        );
+    }
 }
