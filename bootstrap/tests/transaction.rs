@@ -5,8 +5,9 @@ use deepwyrm_syscall::{
 };
 use deepwyrm_syscall::{
     DW_SIGNAL_EXITED, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DW_TASK_STATE_EXITED,
-    DW_TASK_TERMINATION_INFO_V1_SIZE, DW_TERMINATION_NORMAL_EXIT, DwDeadline, DwHandleTransferV1,
-    DwMemoryProtection, DwTaskTerminationInfoV1, DwWaitItemV1, DwWaitResultV1,
+    DW_TASK_STATE_RUNNING, DW_TASK_TERMINATION_INFO_V1_SIZE, DW_TERMINATION_NORMAL_EXIT,
+    DwDeadline, DwHandleTransferV1, DwMemoryProtection, DwTaskState, DwTaskTerminationInfoV1,
+    DwWaitItemV1, DwWaitResultV1,
 };
 #[cfg(feature = "i-capability-relay")]
 use deepwyrm_syscall::{DW_STATUS_TIMED_OUT, DW_STATUS_WOULD_BLOCK};
@@ -557,6 +558,7 @@ struct SmokeSupervisor {
     received: usize,
     ready_handle_count: usize,
     termination_query_error: bool,
+    termination_state: DwTaskState,
     transaction_id: u64,
     relay_events: &'static [deepwyrm_syscall::DwSignals],
     relay_index: usize,
@@ -574,6 +576,7 @@ impl SmokeSupervisor {
             received: 0,
             ready_handle_count: 0,
             termination_query_error: false,
+            termination_state: DW_TASK_STATE_EXITED,
             transaction_id: 2,
             relay_events: &[],
             relay_index: 0,
@@ -598,6 +601,7 @@ impl SmokeSupervisor {
             received: 0,
             ready_handle_count: 0,
             termination_query_error: false,
+            termination_state: DW_TASK_STATE_EXITED,
             transaction_id: 2,
             relay_events: &[],
             relay_index: 0,
@@ -708,7 +712,7 @@ impl SupervisionPlatform for SmokeSupervisor {
         Ok(DwTaskTerminationInfoV1 {
             size: DW_TASK_TERMINATION_INFO_V1_SIZE,
             version: 1,
-            state: DW_TASK_STATE_EXITED,
+            state: self.termination_state,
             reason: DW_TERMINATION_NORMAL_EXIT,
             ..DwTaskTerminationInfoV1::default()
         })
@@ -1231,6 +1235,7 @@ fn primordial_bootstrap_terminates_init0_after_unproven_readiness_failure() {
     let mut loader = SmokeLoader::init0();
     let mut supervisor = SmokeSupervisor::successful_init0();
     supervisor.ready_handle_count = 1;
+    supervisor.termination_state = DW_TASK_STATE_RUNNING;
 
     assert!(matches!(
         run_init0_bootstrap(
@@ -1243,6 +1248,33 @@ fn primordial_bootstrap_terminates_init0_after_unproven_readiness_failure() {
         Err(BootstrapError::Supervision(_))
     ));
     assert_eq!(loader.terminated, [DwHandle(43)]);
+    assert!(fixture.sent.is_empty());
+    assert_eq!(
+        fixture.closed,
+        [DwHandle(42), DwHandle(43), ROOT, BOOTFS, TASK_GROUP]
+    );
+}
+
+#[test]
+fn primordial_bootstrap_rechecks_a_late_exit_before_termination() {
+    let image = executable();
+    let mut fixture = Fixture::valid();
+    fixture.bootfs = bootfs(&[(INIT0_PATH, &image), (HELLO_PATH, b"hello")]);
+    let mut loader = SmokeLoader::init0();
+    let mut supervisor = SmokeSupervisor::successful_init0();
+    supervisor.ready_handle_count = 1;
+
+    assert!(matches!(
+        run_init0_bootstrap(
+            &mut fixture,
+            &mut loader,
+            &mut supervisor,
+            CHANNEL,
+            DwDeadline(99),
+        ),
+        Err(BootstrapError::Supervision(_))
+    ));
+    assert!(loader.terminated.is_empty());
     assert!(fixture.sent.is_empty());
     assert_eq!(
         fixture.closed,
@@ -1355,6 +1387,7 @@ fn loader_smoke_surfaces_cleanup_failure_after_unproven_readiness_failure() {
     loader.fail_terminate = true;
     let mut supervisor = SmokeSupervisor::successful();
     supervisor.ready_handle_count = 1;
+    supervisor.termination_state = DW_TASK_STATE_RUNNING;
 
     assert_eq!(
         run_loader_smoke_bootstrap(

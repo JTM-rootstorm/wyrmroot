@@ -128,7 +128,9 @@ use deepwyrm_syscall::{
     DW_DEADLINE_INFINITE, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DW_SIGNAL_WRITABLE,
     DW_STATUS_TIMED_OUT, DW_STATUS_WOULD_BLOCK, DwSignals, DwWaitItemV1,
 };
-use deepwyrm_syscall::{DwDeadline, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights};
+use deepwyrm_syscall::{
+    DW_TASK_STATE_EXITED, DwDeadline, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights,
+};
 use wyrmroot_bootfs::archive::{Archive, LookupError, ParseError};
 use wyrmroot_bootstrap_proto::{
     BOOTSTRAP_INIT_V2_SIZE, BOOTSTRAP_READY_V2_SIZE, BootstrapMessage, DecodeError, InitMessageV2,
@@ -151,7 +153,9 @@ use wyrmroot_runtime::{
     ReceiveCounts, SELF_ROOT_EXPECTATION, validate_bootstrap_channel,
     validate_init_capabilities_v2,
 };
-use wyrmroot_runtime::{SupervisionError, SupervisionPlatform, supervise_child};
+use wyrmroot_runtime::{
+    SupervisionError, SupervisionPlatform, supervise_child, validate_successful_exit,
+};
 
 /// Canonical init executable required in the primordial bootfs.
 pub const INIT0_PATH: &[u8] = b"system/init0";
@@ -648,13 +652,24 @@ fn run_init0_bootstrap_with_fault_and_before_supervision<
             INIT0_TRANSACTION_ID,
             deadline,
         );
+        let late_exit = match &supervision {
+            Err(error) if !error.process_exit_observed() => supervisor
+                .query_task_termination(loaded.process)
+                .ok()
+                .filter(|info| info.state == DW_TASK_STATE_EXITED),
+            _ => None,
+        };
         let terminate = matches!(
             &supervision,
             Err(error) if !error.process_exit_observed()
-        );
+        ) && late_exit.is_none();
         let loaded_cleanup = cleanup_loaded_process(system, loader, loaded, terminate);
         if let Err(cleanup) = loaded_cleanup {
             return Err(BootstrapError::Cleanup(cleanup));
+        }
+        if let Some(info) = late_exit {
+            validate_successful_exit(&info)
+                .map_err(|error| BootstrapError::Supervision(SupervisionError::Exit(error)))?;
         }
         supervision.map_err(BootstrapError::Supervision)?;
         Ok(transaction_id)
@@ -927,13 +942,24 @@ pub fn run_loader_smoke_bootstrap<
             LOADER_SMOKE_TRANSACTION_ID,
             deadline,
         );
+        let late_exit = match &supervision {
+            Err(error) if !error.process_exit_observed() => supervisor
+                .query_task_termination(loaded.process)
+                .ok()
+                .filter(|info| info.state == DW_TASK_STATE_EXITED),
+            _ => None,
+        };
         let terminate = matches!(
             &supervision,
             Err(error) if !error.process_exit_observed()
-        );
+        ) && late_exit.is_none();
         let loaded_cleanup = cleanup_loaded_process(system, loader, loaded, terminate);
         if let Err(cleanup) = loaded_cleanup {
             return Err(BootstrapError::Cleanup(cleanup));
+        }
+        if let Some(info) = late_exit {
+            validate_successful_exit(&info)
+                .map_err(|error| BootstrapError::Supervision(SupervisionError::Exit(error)))?;
         }
         supervision.map_err(BootstrapError::Supervision)?;
         Ok(transaction_id)
