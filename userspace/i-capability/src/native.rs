@@ -73,6 +73,7 @@ const MEMORY_OWNER_RIGHTS: DwRights = DwRights(
 );
 const MEMORY_CHILD_RIGHTS: DwRights =
     DwRights(DW_RIGHT_READ.0 | DW_RIGHT_MAP.0 | DW_RIGHT_INSPECT.0);
+const MEMORY_TRANSFER_RIGHTS: DwRights = DwRights(MEMORY_CHILD_RIGHTS.0 | DW_RIGHT_TRANSFER.0);
 
 /// Runs as the trusted capability controller, an ordinary handle-free leaf, or the explicit
 /// self-root-only memory probe child according to its WRLP launch profile.
@@ -552,12 +553,12 @@ fn exercise_shared_memory(
     mapping
         .protect_read_only()
         .map_err(|_| failure(EvidenceKind::MemoryShare, 0x0203))?;
-    let transfer = duplicate_handle(memory, MEMORY_CHILD_RIGHTS)
+    let transfer = duplicate_handle(memory, MEMORY_TRANSFER_RIGHTS)
         .map_err(|_| failure(EvidenceKind::MemoryShare, 0x0204))?;
     let transfer_info =
         query_capability_info(transfer).map_err(|_| failure(EvidenceKind::MemoryShare, 0x0205))?;
     if transfer_info.object_type != DW_OBJECT_TYPE_MEMORY_OBJECT
-        || transfer_info.rights != MEMORY_CHILD_RIGHTS
+        || transfer_info.rights != MEMORY_TRANSFER_RIGHTS
     {
         return Err(failure(EvidenceKind::MemoryShare, 0x0206));
     }
@@ -1403,5 +1404,14 @@ mod tests {
             ),
             failure(EvidenceKind::ProcessLifecycle, 0xa00d)
         );
+    }
+
+    #[test]
+    fn shared_memory_source_retains_only_the_right_needed_to_move() {
+        assert_eq!(
+            MEMORY_TRANSFER_RIGHTS.0,
+            MEMORY_CHILD_RIGHTS.0 | DW_RIGHT_TRANSFER.0
+        );
+        assert_eq!(MEMORY_CHILD_RIGHTS.0 & DW_RIGHT_TRANSFER.0, 0);
     }
 }
