@@ -125,8 +125,8 @@ compile_error!("the WYR0-I capability relay is mutually exclusive with other boo
 
 #[cfg(feature = "i-capability-relay")]
 use deepwyrm_syscall::{
-    DW_DEADLINE_INFINITE, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DW_SIGNAL_WRITABLE,
-    DW_STATUS_TIMED_OUT, DW_STATUS_WOULD_BLOCK, DwSignals, DwWaitItemV1,
+    DW_DEADLINE_INFINITE, DW_SIGNAL_EXITED, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE,
+    DW_SIGNAL_WRITABLE, DW_STATUS_TIMED_OUT, DW_STATUS_WOULD_BLOCK, DwSignals, DwWaitItemV1,
 };
 use deepwyrm_syscall::{
     DW_TASK_STATE_EXITED, DwDeadline, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights,
@@ -640,10 +640,8 @@ fn run_init0_bootstrap_with_fault_and_before_supervision<
             bootstrap_channel,
             deadline,
         ) {
-            let terminal = supervisor
-                .query_task_termination(loaded.process)
-                .ok()
-                .filter(|info| info.state == DW_TASK_STATE_EXITED);
+            let terminal =
+                observe_terminal_after_relay_failure(supervisor, loaded.process, deadline);
             let cleanup_exit =
                 cleanup_supervised_process(system, loader, supervisor, loaded, terminal.is_none())
                     .map_err(BootstrapError::Cleanup)?;
@@ -685,6 +683,33 @@ fn run_init0_bootstrap_with_fault_and_before_supervision<
     let transaction_id = operation?;
     cleanup?;
     send_primordial_ready(system, bootstrap_channel, transaction_id)
+}
+
+#[cfg(feature = "i-capability-relay")]
+fn observe_terminal_after_relay_failure<Supervisor: SupervisionPlatform<Error = NativeError>>(
+    supervisor: &mut Supervisor,
+    process: DwHandle,
+    deadline: DwDeadline,
+) -> Option<deepwyrm_syscall::DwTaskTerminationInfoV1> {
+    if let Ok(info) = supervisor.query_task_termination(process)
+        && info.state == DW_TASK_STATE_EXITED
+    {
+        return Some(info);
+    }
+    let item = DwWaitItemV1 {
+        handle: process,
+        signals: DwSignals(DW_SIGNAL_EXITED.0),
+    };
+    let observed = supervisor
+        .wait_many(core::slice::from_ref(&item), deadline)
+        .ok()?;
+    if observed.index != 0 || observed.observed.0 & DW_SIGNAL_EXITED.0 == 0 {
+        return None;
+    }
+    supervisor
+        .query_task_termination(process)
+        .ok()
+        .filter(|info| info.state == DW_TASK_STATE_EXITED)
 }
 
 #[cfg(feature = "i-capability-relay")]

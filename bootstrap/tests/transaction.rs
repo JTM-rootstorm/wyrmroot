@@ -648,6 +648,15 @@ impl SupervisionPlatform for SmokeSupervisor {
                 ..DwWaitResultV1::default()
             });
         }
+        if items.len() == 1 && items[0].signals == DW_SIGNAL_EXITED {
+            return Ok(DwWaitResultV1 {
+                size: deepwyrm_syscall::DW_WAIT_RESULT_V1_SIZE,
+                version: 1,
+                index: 0,
+                observed: DW_SIGNAL_EXITED,
+                ..DwWaitResultV1::default()
+            });
+        }
         if self.relay_invalid_wait_result {
             self.relay_invalid_wait_result = false;
             return Ok(DwWaitResultV1 {
@@ -908,6 +917,8 @@ fn capability_bootstrap_preserves_terminal_child_failure_before_relay_cleanup() 
     let mut loader = SmokeLoader::init0();
     let mut supervisor = SmokeSupervisor::successful_init0();
     supervisor.relay_events = &[DW_SIGNAL_PEER_CLOSED];
+    supervisor.termination_state = DW_TASK_STATE_RUNNING;
+    supervisor.exit_on_query = Some(2);
     supervisor.termination_application_code = 0x2408_0130;
 
     assert_eq!(
