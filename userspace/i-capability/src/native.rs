@@ -1331,7 +1331,12 @@ fn send_probe_ready(
 }
 
 fn future_deadline(delta: u64, stage: EvidenceKind, operation: u16) -> Result<DwDeadline, u32> {
-    monotonic_deadline_after(delta).map_err(|_| failure(stage, operation))
+    monotonic_deadline_after(delta)
+        .map_err(|error| failure(stage, future_deadline_failure_operation(operation, error)))
+}
+
+const fn future_deadline_failure_operation(operation: u16, error: NativeError) -> u16 {
+    0xc000 | ((operation & 0x001f) << 9) | native_cause(error)
 }
 
 fn push(transcript: &mut EvidenceTranscript, event: EvidenceEvent) -> Result<(), u32> {
@@ -1413,5 +1418,16 @@ mod tests {
             MEMORY_CHILD_RIGHTS.0 | DW_RIGHT_TRANSFER.0
         );
         assert_eq!(MEMORY_CHILD_RIGHTS.0 & DW_RIGHT_TRANSFER.0, 0);
+    }
+
+    #[test]
+    fn deadline_failure_preserves_site_and_native_cause() {
+        assert_eq!(
+            future_deadline_failure_operation(
+                0x0102,
+                NativeError::Status(deepwyrm_syscall::DwStatus(-5)),
+            ),
+            0xc405
+        );
     }
 }
