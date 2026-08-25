@@ -232,7 +232,7 @@ pub enum BootstrapError {
     /// Temporary WYR0-E child readiness or completion did not satisfy the exact contract.
     Supervision(SupervisionError<NativeError>),
     /// Cleanup of an already-published temporary child failed.
-    Cleanup(NativeError),
+    Cleanup(ChildCleanupError),
     /// A successful bootfs callback failed to retain the child it created.
     MissingLoadedProcess,
     /// The selector-gated WYR0-I controller evidence relay rejected an init0 datagram.
@@ -286,17 +286,43 @@ impl BootstrapError {
     }
 }
 
-/// Encodes final child-cleanup failures without collapsing the native cause.
+/// The exact operation that failed while reclaiming a published child.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChildCleanupStage {
+    /// Terminating a child whose successful exit was not proven.
+    ProcessTerminate,
+    /// Closing the retained parent endpoint of the child's launch channel.
+    LaunchChannelClose,
+    /// Closing the retained child Process handle.
+    ProcessHandleClose,
+}
+
+/// An exact failure while reclaiming a published child.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChildCleanupError {
+    /// The cleanup operation that failed.
+    pub stage: ChildCleanupStage,
+    /// The native status or malformed-output cause.
+    pub cause: NativeError,
+}
+
+/// Encodes final child-cleanup failures without collapsing the operation or native cause.
 ///
-/// The `0xB2` high byte is bootstrap-owned. Bit 15 distinguishes bounded
-/// native-output failures from native status values; the low 15 bits retain
-/// the same cause encoding used by loader-stage diagnostics.
-const fn cleanup_exit_code(error: NativeError) -> u32 {
+/// The `0xB2` high byte is bootstrap-owned. Bits 23..16 identify the cleanup
+/// stage, bit 15 distinguishes bounded native-output failures from native
+/// status values, and the low 15 bits retain the native cause.
+const fn cleanup_exit_code(error: ChildCleanupError) -> u32 {
     const PREFIX: u32 = 0xB200_0000;
-    match error {
+    let stage = match error.stage {
+        ChildCleanupStage::ProcessTerminate => 1,
+        ChildCleanupStage::LaunchChannelClose => 2,
+        ChildCleanupStage::ProcessHandleClose => 3,
+    };
+    let cause = match error.cause {
         NativeError::Status(status) => PREFIX | bounded_status_code(status.0.unsigned_abs()),
         NativeError::Output(output) => PREFIX | 0x8000 | native_output_code(output),
-    }
+    };
+    cause | (stage << 16)
 }
 
 /// Encodes a native loader-platform failure without losing its bounded cause.
@@ -1179,16 +1205,25 @@ fn cleanup_loaded_process<System: BootstrapSystem, Loader: LoaderPlatform<Error 
     loader: &mut Loader,
     loaded: LoadedProcess,
     terminate: bool,
-) -> Result<(), NativeError> {
+) -> Result<(), ChildCleanupError> {
     let mut first_error = None;
     if terminate && let Err(error) = loader.process_terminate(loaded.process) {
-        first_error = Some(error);
+        first_error = Some(ChildCleanupError {
+            stage: ChildCleanupStage::ProcessTerminate,
+            cause: error,
+        });
     }
-    for handle in [loaded.launch_channel, loaded.process] {
+    for (handle, stage) in [
+        (loaded.launch_channel, ChildCleanupStage::LaunchChannelClose),
+        (loaded.process, ChildCleanupStage::ProcessHandleClose),
+    ] {
         if let Err(error) = system.close_handle(handle)
             && first_error.is_none()
         {
-            first_error = Some(error);
+            first_error = Some(ChildCleanupError {
+                stage,
+                cause: error,
+            });
         }
     }
     first_error.map_or(Ok(()), Err)

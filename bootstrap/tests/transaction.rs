@@ -14,11 +14,11 @@ use wyrmroot_bootfs::builder::{Builder, FileMode};
 #[cfg(feature = "primordial-test-support")]
 use wyrmroot_bootstrap::run_bootstrap_with_before_ready;
 use wyrmroot_bootstrap::{
-    BootstrapError, BootstrapSystem, HELLO_PATH, I0_NEGATIVE_CAPABILITY_COUNT_DETAIL,
-    I0_NEGATIVE_CAPABILITY_RIGHTS_DETAIL, I0_NEGATIVE_CAPABILITY_TYPE_DETAIL,
-    I0_NEGATIVE_MALFORMED_ELF_DETAIL, I0_NEGATIVE_MALFORMED_STARTUP_DETAIL, INIT0_PATH,
-    i0_negative_terminal_detail, run_bootstrap, run_init0_bootstrap,
-    run_init0_bootstrap_with_fault,
+    BootstrapError, BootstrapSystem, ChildCleanupError, ChildCleanupStage, HELLO_PATH,
+    I0_NEGATIVE_CAPABILITY_COUNT_DETAIL, I0_NEGATIVE_CAPABILITY_RIGHTS_DETAIL,
+    I0_NEGATIVE_CAPABILITY_TYPE_DETAIL, I0_NEGATIVE_MALFORMED_ELF_DETAIL,
+    I0_NEGATIVE_MALFORMED_STARTUP_DETAIL, INIT0_PATH, i0_negative_terminal_detail, run_bootstrap,
+    run_init0_bootstrap, run_init0_bootstrap_with_fault,
 };
 #[cfg(feature = "loader-smoke-integration")]
 use wyrmroot_bootstrap::{LOADER_SMOKE_PATH, run_loader_smoke_bootstrap};
@@ -108,15 +108,20 @@ fn live_exit_code_identifies_bootstrap_owned_failure() {
         0xB101_8001
     );
     assert_eq!(
-        BootstrapError::Cleanup(NativeError::Status(deepwyrm_syscall::DwStatus(-73))).exit_code(),
-        0xB200_0049
+        BootstrapError::Cleanup(ChildCleanupError {
+            stage: ChildCleanupStage::ProcessTerminate,
+            cause: NativeError::Status(deepwyrm_syscall::DwStatus(-73)),
+        })
+        .exit_code(),
+        0xB201_0049
     );
     assert_eq!(
-        BootstrapError::Cleanup(NativeError::Output(
-            wyrmroot_runtime::NativeOutputError::InvalidWaitResult,
-        ))
+        BootstrapError::Cleanup(ChildCleanupError {
+            stage: ChildCleanupStage::ProcessHandleClose,
+            cause: NativeError::Output(wyrmroot_runtime::NativeOutputError::InvalidWaitResult),
+        })
         .exit_code(),
-        0xB200_8006
+        0xB203_8006
     );
 }
 
@@ -1359,9 +1364,10 @@ fn loader_smoke_surfaces_cleanup_failure_after_unproven_readiness_failure() {
             CHANNEL,
             DwDeadline(99),
         ),
-        Err(BootstrapError::Cleanup(NativeError::Status(
-            DW_STATUS_BAD_HANDLE
-        )))
+        Err(BootstrapError::Cleanup(ChildCleanupError {
+            stage: ChildCleanupStage::ProcessTerminate,
+            cause: NativeError::Status(DW_STATUS_BAD_HANDLE),
+        }))
     );
     assert_eq!(loader.terminated, [DwHandle(43)]);
     assert!(fixture.sent.is_empty());
