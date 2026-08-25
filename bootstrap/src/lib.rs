@@ -107,6 +107,22 @@ compile_error!(
     "the WYR0-E loader-smoke integration is mutually exclusive with primordial behavior variants"
 );
 
+#[cfg(all(
+    feature = "i-capability-integration",
+    any(
+        feature = "loader-smoke-integration",
+        feature = "primordial-blocking-cleanup",
+        feature = "primordial-user-exception",
+        feature = "primordial-invalid-return",
+        feature = "i0-negative-malformed-elf",
+        feature = "i0-negative-malformed-startup",
+        feature = "i0-negative-capability-count",
+        feature = "i0-negative-capability-type",
+        feature = "i0-negative-capability-rights"
+    )
+))]
+compile_error!("the WYR0-I capability relay is mutually exclusive with other bootstrap variants");
+
 use deepwyrm_syscall::DwDeadline;
 use deepwyrm_syscall::{DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights};
 use wyrmroot_bootfs::archive::{Archive, LookupError, ParseError};
@@ -215,6 +231,9 @@ pub enum BootstrapError {
     Cleanup(NativeError),
     /// A successful bootfs callback failed to retain the child it created.
     MissingLoadedProcess,
+    /// The selector-gated WYR0-I controller evidence relay rejected an init0 datagram.
+    #[cfg(feature = "i-capability-relay")]
+    CapabilityRelay(Wrcap1RelayError),
 }
 
 impl BootstrapError {
@@ -243,6 +262,8 @@ impl BootstrapError {
             Self::Bootfs(_) => PREFIX | 0x09,
             Self::MissingRequiredEntry => PREFIX | 0x0A,
             Self::RequiredEntryNotExecutable => PREFIX | 0x0B,
+            #[cfg(feature = "i-capability-relay")]
+            Self::CapabilityRelay(_) => PREFIX | 0x0D,
             #[cfg(feature = "primordial-test-support")]
             Self::TestSupport(_) => PREFIX | 0x0C,
             Self::Loader(LoadError::Platform {
@@ -340,6 +361,29 @@ pub fn run_bootstrap<System: BootstrapSystem>(
 /// WYR0-F child transaction identifier for `system/init0`.
 pub const INIT0_TRANSACTION_ID: u64 = 1;
 
+/// Number of controller-originated WYR0-I capability evidence kinds.
+#[cfg(feature = "i-capability-relay")]
+pub const WRCAP1_RECORD_COUNT: usize = 10;
+/// Exact fixed-width ASCII length of one `WRCAP1` evidence datagram.
+#[cfg(feature = "i-capability-relay")]
+pub const WRCAP1_RECORD_SIZE: usize = 117;
+
+/// A capability-evidence relay datagram did not meet the bootstrap boundary contract.
+#[cfg(feature = "i-capability-relay")]
+#[derive(Debug, Eq, PartialEq)]
+pub enum Wrcap1RelayError {
+    /// The child attached one or more handles to an evidence datagram.
+    CapabilityBearing,
+    /// The record was not exact fixed-width, uppercase ASCII `WRCAP1` framing.
+    MalformedFraming,
+    /// The record sequence was not the contiguous expected value.
+    UnexpectedSequence,
+    /// The record kind was not the required canonical next kind.
+    UnexpectedKind,
+    /// The record's checksum did not authenticate its exact preceding byte sequence.
+    Checksum,
+}
+
 /// Stable terminal detail for the test-only malformed-ELF variant.
 pub const I0_NEGATIVE_MALFORMED_ELF_DETAIL: u32 = 0xB000_0401;
 /// Stable terminal detail for the test-only malformed-startup variant.
@@ -411,13 +455,43 @@ pub fn run_init0_bootstrap<
     bootstrap_channel: DwHandle,
     deadline: DwDeadline,
 ) -> Result<(), BootstrapError> {
-    run_init0_bootstrap_with_fault(
+    run_init0_bootstrap_with_fault_and_before_supervision(
         system,
         loader,
         supervisor,
         bootstrap_channel,
         deadline,
         LoadFault::None,
+        |_, _, _| Ok(()),
+    )
+}
+
+/// Runs the selector-gated WYR0-I bootstrap transaction.
+///
+/// Before ordinary WRLP supervision, this path relays the controller's ten exact, handle-free
+/// WRCAP1 datagrams from init0's launch Channel to the primordial parent Channel. Bootstrap
+/// validates only the transport boundary it owns and forwards each accepted byte slice unchanged;
+/// the controller remains the sole evidence-record source and the host owns full semantic joins.
+#[cfg(feature = "i-capability-relay")]
+pub fn run_init0_capability_bootstrap<
+    System: BootstrapSystem,
+    Loader: LoaderPlatform<Error = NativeError>,
+    Supervisor: SupervisionPlatform<Error = NativeError>,
+>(
+    system: &mut System,
+    loader: &mut Loader,
+    supervisor: &mut Supervisor,
+    bootstrap_channel: DwHandle,
+    deadline: DwDeadline,
+) -> Result<(), BootstrapError> {
+    run_init0_bootstrap_with_fault_and_before_supervision(
+        system,
+        loader,
+        supervisor,
+        bootstrap_channel,
+        deadline,
+        LoadFault::None,
+        relay_wrcap1_records,
     )
 }
 
@@ -434,6 +508,30 @@ pub fn run_init0_bootstrap_with_fault<
     bootstrap_channel: DwHandle,
     deadline: DwDeadline,
     fault: LoadFault,
+) -> Result<(), BootstrapError> {
+    run_init0_bootstrap_with_fault_and_before_supervision(
+        system,
+        loader,
+        supervisor,
+        bootstrap_channel,
+        deadline,
+        fault,
+        |_, _, _| Ok(()),
+    )
+}
+
+fn run_init0_bootstrap_with_fault_and_before_supervision<
+    System: BootstrapSystem,
+    Loader: LoaderPlatform<Error = NativeError>,
+    Supervisor: SupervisionPlatform<Error = NativeError>,
+>(
+    system: &mut System,
+    loader: &mut Loader,
+    supervisor: &mut Supervisor,
+    bootstrap_channel: DwHandle,
+    deadline: DwDeadline,
+    fault: LoadFault,
+    before_supervision: impl FnOnce(&mut System, DwHandle, DwHandle) -> Result<(), BootstrapError>,
 ) -> Result<(), BootstrapError> {
     let channel_info = system
         .query_capability_info(bootstrap_channel)
@@ -478,6 +576,12 @@ pub fn run_init0_bootstrap_with_fault<
             (Err(error), None) => return Err(BootstrapError::Native(error)),
             (Ok(Ok(())), None) => return Err(BootstrapError::MissingLoadedProcess),
         };
+        if let Err(error) = before_supervision(system, loaded.launch_channel, bootstrap_channel) {
+            if let Err(cleanup) = cleanup_loaded_process(system, loader, loaded, true) {
+                return Err(BootstrapError::Cleanup(cleanup));
+            }
+            return Err(error);
+        }
         let supervision = supervise_child(
             supervisor,
             loaded.process,
@@ -500,6 +604,99 @@ pub fn run_init0_bootstrap_with_fault<
     let transaction_id = operation?;
     cleanup?;
     send_primordial_ready(system, bootstrap_channel, transaction_id)
+}
+
+#[cfg(feature = "i-capability-relay")]
+fn relay_wrcap1_records<System: BootstrapSystem>(
+    system: &mut System,
+    launch_channel: DwHandle,
+    primordial_parent_channel: DwHandle,
+) -> Result<(), BootstrapError> {
+    let mut bytes = [0_u8; WRCAP1_RECORD_SIZE];
+    let mut handles = [];
+    for sequence in 0..WRCAP1_RECORD_COUNT {
+        let counts = system
+            .receive_channel(launch_channel, &mut bytes, &mut handles)
+            .map_err(BootstrapError::Native)?;
+        if counts.handles != 0 {
+            return Err(BootstrapError::CapabilityRelay(
+                Wrcap1RelayError::CapabilityBearing,
+            ));
+        }
+        if counts.bytes > bytes.len() {
+            return Err(BootstrapError::ReceiveCounts(counts));
+        }
+        let record = &bytes[..counts.bytes];
+        validate_wrcap1_record(record, sequence as u32, sequence as u8 + 1)
+            .map_err(BootstrapError::CapabilityRelay)?;
+        system
+            .send_channel(primordial_parent_channel, record)
+            .map_err(BootstrapError::Native)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "i-capability-relay")]
+fn validate_wrcap1_record(
+    record: &[u8],
+    expected_sequence: u32,
+    expected_kind: u8,
+) -> Result<(), Wrcap1RelayError> {
+    const DELIMITERS: [usize; 10] = [6, 9, 26, 35, 38, 47, 56, 73, 90, 107];
+    if record.len() != WRCAP1_RECORD_SIZE
+        || record[..7] != *b"WRCAP1|"
+        || record[7..9] != *b"01"
+        || record[116] != b'\n'
+        || DELIMITERS.iter().any(|&index| record[index] != b'|')
+        || !record[10..26].iter().any(|&byte| byte != b'0')
+        || !record[10..26]
+            .iter()
+            .chain(record[27..35].iter())
+            .chain(record[36..38].iter())
+            .chain(record[39..47].iter())
+            .chain(record[48..56].iter())
+            .chain(record[57..73].iter())
+            .chain(record[74..90].iter())
+            .chain(record[91..107].iter())
+            .chain(record[108..116].iter())
+            .all(|&byte| matches!(byte, b'0'..=b'9' | b'A'..=b'F'))
+    {
+        return Err(Wrcap1RelayError::MalformedFraming);
+    }
+    if parse_hex_u32(&record[27..35]) != Some(expected_sequence) {
+        return Err(Wrcap1RelayError::UnexpectedSequence);
+    }
+    if parse_hex_u32(&record[36..38]) != Some(u32::from(expected_kind)) {
+        return Err(Wrcap1RelayError::UnexpectedKind);
+    }
+    if parse_hex_u32(&record[108..116]) != Some(fnv1a32(&record[..108])) {
+        return Err(Wrcap1RelayError::Checksum);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "i-capability-relay")]
+fn parse_hex_u32(bytes: &[u8]) -> Option<u32> {
+    bytes.iter().try_fold(0_u32, |value, &byte| {
+        let digit = match byte {
+            b'0'..=b'9' => u32::from(byte - b'0'),
+            b'A'..=b'F' => u32::from(byte - b'A' + 10),
+            _ => return None,
+        };
+        value.checked_mul(16)?.checked_add(digit)
+    })
+}
+
+#[cfg(feature = "i-capability-relay")]
+const fn fnv1a32(bytes: &[u8]) -> u32 {
+    let mut hash = 0x811c_9dc5_u32;
+    let mut index = 0;
+    while index < bytes.len() {
+        hash ^= bytes[index] as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+        index += 1;
+    }
+    hash
 }
 
 /// Runs the WYR0-E-only loader-smoke transaction before primordial READY.

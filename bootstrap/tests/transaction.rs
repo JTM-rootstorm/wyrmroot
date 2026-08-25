@@ -20,6 +20,10 @@ use wyrmroot_bootstrap::{
 };
 #[cfg(feature = "loader-smoke-integration")]
 use wyrmroot_bootstrap::{LOADER_SMOKE_PATH, run_loader_smoke_bootstrap};
+#[cfg(feature = "i-capability-relay")]
+use wyrmroot_bootstrap::{
+    WRCAP1_RECORD_COUNT, WRCAP1_RECORD_SIZE, Wrcap1RelayError, run_init0_capability_bootstrap,
+};
 use wyrmroot_bootstrap_proto::{
     BOOTSTRAP_INIT_V2_SIZE, BootstrapMessage, InitMessageV2, ReadyMessageV2, decode,
 };
@@ -119,6 +123,9 @@ struct Fixture {
     closed: Vec<DwHandle>,
     mapped: bool,
     mapping_error_after_callback: bool,
+    relay_records: Vec<Vec<u8>>,
+    relay_index: usize,
+    relay_handle_count: usize,
 }
 
 impl Fixture {
@@ -153,6 +160,9 @@ impl Fixture {
             closed: Vec::new(),
             mapped: false,
             mapping_error_after_callback: false,
+            relay_records: Vec::new(),
+            relay_index: 0,
+            relay_handle_count: 0,
         }
     }
 }
@@ -189,12 +199,23 @@ impl BootstrapSystem for Fixture {
         bytes: &mut [u8],
         handles: &mut [DwReceivedHandleInfoV1],
     ) -> Result<ReceiveCounts, NativeError> {
-        assert_eq!(channel, CHANNEL);
-        bytes[..self.init_size].copy_from_slice(&self.init[..self.init_size]);
-        handles[..3].copy_from_slice(&self.handles);
+        if channel == CHANNEL {
+            bytes[..self.init_size].copy_from_slice(&self.init[..self.init_size]);
+            handles[..3].copy_from_slice(&self.handles);
+            return Ok(ReceiveCounts {
+                bytes: self.init_size,
+                handles: 3,
+            });
+        }
+        let record = self
+            .relay_records
+            .get(self.relay_index)
+            .expect("unexpected init0 launch receive");
+        self.relay_index += 1;
+        bytes[..record.len()].copy_from_slice(record);
         Ok(ReceiveCounts {
-            bytes: self.init_size,
-            handles: 3,
+            bytes: record.len(),
+            handles: self.relay_handle_count,
         })
     }
 
@@ -634,6 +655,134 @@ fn primordial_bootstrap_launches_only_init0_and_supervises_it_before_ready() {
             CHANNEL
         ]
     );
+}
+
+#[cfg(feature = "i-capability-relay")]
+#[test]
+fn capability_bootstrap_relays_ten_exact_wrcap1_records_before_init0_supervision() {
+    let image = executable();
+    let mut fixture = Fixture::valid();
+    fixture.bootfs = bootfs(&[(INIT0_PATH, &image), (HELLO_PATH, b"hello")]);
+    fixture.relay_records = (0..WRCAP1_RECORD_COUNT)
+        .map(|sequence| wrcap1_record(sequence as u32, sequence as u8 + 1))
+        .collect();
+    let expected_records = fixture.relay_records.concat();
+    let mut loader = SmokeLoader::init0();
+    let mut supervisor = SmokeSupervisor::successful_init0();
+
+    assert_eq!(
+        run_init0_capability_bootstrap(
+            &mut fixture,
+            &mut loader,
+            &mut supervisor,
+            CHANNEL,
+            DwDeadline(99),
+        ),
+        Ok(())
+    );
+    assert_eq!(fixture.relay_index, WRCAP1_RECORD_COUNT);
+    assert_eq!(supervisor.received, 1);
+    assert_eq!(&fixture.sent[..expected_records.len()], expected_records);
+    assert_eq!(
+        decode(&fixture.sent[expected_records.len()..], 0),
+        Ok(BootstrapMessage::ReadyV2(ReadyMessageV2 {
+            transaction_id: 1
+        }))
+    );
+}
+
+#[cfg(feature = "i-capability-relay")]
+#[test]
+fn capability_bootstrap_rejects_malformed_first_relay_record_before_supervision() {
+    let image = executable();
+    let mut fixture = Fixture::valid();
+    fixture.bootfs = bootfs(&[(INIT0_PATH, &image), (HELLO_PATH, b"hello")]);
+    let mut malformed = wrcap1_record(0, 1);
+    malformed[0] = b'w';
+    fixture.relay_records = vec![malformed];
+    let mut loader = SmokeLoader::init0();
+    let mut supervisor = SmokeSupervisor::successful_init0();
+
+    assert_eq!(
+        run_init0_capability_bootstrap(
+            &mut fixture,
+            &mut loader,
+            &mut supervisor,
+            CHANNEL,
+            DwDeadline(99),
+        ),
+        Err(BootstrapError::CapabilityRelay(
+            Wrcap1RelayError::MalformedFraming
+        ))
+    );
+    assert_eq!(supervisor.received, 0);
+    assert!(fixture.sent.is_empty());
+    assert_eq!(
+        fixture.closed,
+        [DwHandle(42), DwHandle(43), ROOT, BOOTFS, TASK_GROUP]
+    );
+}
+
+#[cfg(feature = "i-capability-relay")]
+#[test]
+fn capability_bootstrap_rejects_noncontiguous_or_capability_bearing_relay_records() {
+    let image = executable();
+    let mut sequence_fixture = Fixture::valid();
+    sequence_fixture.bootfs = bootfs(&[(INIT0_PATH, &image), (HELLO_PATH, b"hello")]);
+    sequence_fixture.relay_records = vec![wrcap1_record(1, 1)];
+    let mut loader = SmokeLoader::init0();
+    let mut supervisor = SmokeSupervisor::successful_init0();
+    assert_eq!(
+        run_init0_capability_bootstrap(
+            &mut sequence_fixture,
+            &mut loader,
+            &mut supervisor,
+            CHANNEL,
+            DwDeadline(99),
+        ),
+        Err(BootstrapError::CapabilityRelay(
+            Wrcap1RelayError::UnexpectedSequence
+        ))
+    );
+    assert_eq!(supervisor.received, 0);
+
+    let mut handle_fixture = Fixture::valid();
+    handle_fixture.bootfs = bootfs(&[(INIT0_PATH, &image), (HELLO_PATH, b"hello")]);
+    handle_fixture.relay_records = vec![wrcap1_record(0, 1)];
+    handle_fixture.relay_handle_count = 1;
+    let mut loader = SmokeLoader::init0();
+    let mut supervisor = SmokeSupervisor::successful_init0();
+    assert_eq!(
+        run_init0_capability_bootstrap(
+            &mut handle_fixture,
+            &mut loader,
+            &mut supervisor,
+            CHANNEL,
+            DwDeadline(99),
+        ),
+        Err(BootstrapError::CapabilityRelay(
+            Wrcap1RelayError::CapabilityBearing
+        ))
+    );
+    assert_eq!(supervisor.received, 0);
+}
+
+#[cfg(feature = "i-capability-relay")]
+fn wrcap1_record(sequence: u32, kind: u8) -> Vec<u8> {
+    let prefix = format!(
+        "WRCAP1|01|0000000000000001|{sequence:08X}|{kind:02X}|00000000|00000001|0000000000000001|0000000000000000|0000000000000000|"
+    );
+    let checksum = fnv1a32(prefix.as_bytes());
+    let record = format!("{prefix}{checksum:08X}\n");
+    assert_eq!(record.len(), WRCAP1_RECORD_SIZE);
+    record.into_bytes()
+}
+
+#[cfg(feature = "i-capability-relay")]
+fn fnv1a32(bytes: &[u8]) -> u32 {
+    bytes.iter().fold(0x811c_9dc5_u32, |hash, &byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+    })
 }
 
 #[test]

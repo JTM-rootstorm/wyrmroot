@@ -32,6 +32,7 @@ use wyrmroot_bootstrap::run_bootstrap_with_before_ready;
     feature = "i0-negative-capability-type",
     feature = "i0-negative-capability-rights"
 )))]
+#[cfg(not(feature = "i-capability-integration"))]
 use wyrmroot_bootstrap::run_init0_bootstrap;
 #[cfg(any(
     feature = "i0-negative-malformed-elf",
@@ -41,6 +42,8 @@ use wyrmroot_bootstrap::run_init0_bootstrap;
     feature = "i0-negative-capability-rights"
 ))]
 use wyrmroot_bootstrap::run_init0_bootstrap_with_fault;
+#[cfg(feature = "i-capability-integration")]
+use wyrmroot_bootstrap::run_init0_capability_bootstrap;
 #[cfg(feature = "native-loader-smoke-integration")]
 use wyrmroot_bootstrap::run_loader_smoke_bootstrap;
 use wyrmroot_bootstrap::{BootstrapError, BootstrapSystem};
@@ -191,7 +194,8 @@ fn panic(_info: &PanicInfo<'_>) -> ! {
     feature = "i0-negative-malformed-startup",
     feature = "i0-negative-capability-count",
     feature = "i0-negative-capability-type",
-    feature = "i0-negative-capability-rights"
+    feature = "i0-negative-capability-rights",
+    feature = "i-capability-integration"
 )))]
 fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
     let deadline = match monotonic_deadline_after(BOOTSTRAP_SUPERVISION_TIMEOUT_NS) {
@@ -202,6 +206,27 @@ fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
     let mut loader = NativeLoaderPlatform;
     let mut supervisor = NativeSupervisionPlatform;
     match run_init0_bootstrap(
+        &mut system,
+        &mut loader,
+        &mut supervisor,
+        startup.bootstrap_channel().as_abi(),
+        deadline,
+    ) {
+        Ok(()) => 0,
+        Err(error) => system.exit_code(&error),
+    }
+}
+
+#[cfg(feature = "i-capability-integration")]
+fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
+    let deadline = match monotonic_deadline_after(BOOTSTRAP_SUPERVISION_TIMEOUT_NS) {
+        Ok(deadline) => deadline,
+        Err(error) => return 0xB300_0000 | wyrmroot_runtime::native_error_code(error),
+    };
+    let mut system = NativeSystem::new();
+    let mut loader = NativeLoaderPlatform;
+    let mut supervisor = NativeSupervisionPlatform;
+    match run_init0_capability_bootstrap(
         &mut system,
         &mut loader,
         &mut supervisor,

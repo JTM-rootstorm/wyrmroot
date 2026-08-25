@@ -30,6 +30,8 @@ i0-negative-malformed-startup = ["native-bootstrap"]
 i0-negative-capability-count = ["native-bootstrap"]
 i0-negative-capability-type = ["native-bootstrap"]
 i0-negative-capability-rights = ["native-bootstrap"]
+i-capability-relay = []
+i-capability-integration = ["native-bootstrap", "i-capability-relay"]
 
 [dependencies]
 deepwyrm-syscall.workspace = true
