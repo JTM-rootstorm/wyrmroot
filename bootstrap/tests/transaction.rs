@@ -559,6 +559,8 @@ struct SmokeSupervisor {
     ready_handle_count: usize,
     termination_query_error: bool,
     termination_state: DwTaskState,
+    termination_queries: usize,
+    exit_on_query: Option<usize>,
     transaction_id: u64,
     relay_events: &'static [deepwyrm_syscall::DwSignals],
     relay_index: usize,
@@ -577,6 +579,8 @@ impl SmokeSupervisor {
             ready_handle_count: 0,
             termination_query_error: false,
             termination_state: DW_TASK_STATE_EXITED,
+            termination_queries: 0,
+            exit_on_query: None,
             transaction_id: 2,
             relay_events: &[],
             relay_index: 0,
@@ -602,6 +606,8 @@ impl SmokeSupervisor {
             ready_handle_count: 0,
             termination_query_error: false,
             termination_state: DW_TASK_STATE_EXITED,
+            termination_queries: 0,
+            exit_on_query: None,
             transaction_id: 2,
             relay_events: &[],
             relay_index: 0,
@@ -706,13 +712,22 @@ impl SupervisionPlatform for SmokeSupervisor {
         &mut self,
         _: DwHandle,
     ) -> Result<DwTaskTerminationInfoV1, Self::Error> {
+        self.termination_queries += 1;
         if self.termination_query_error {
             return Err(NativeError::Status(DW_STATUS_BAD_HANDLE));
         }
+        let state = if self
+            .exit_on_query
+            .is_some_and(|query| self.termination_queries >= query)
+        {
+            DW_TASK_STATE_EXITED
+        } else {
+            self.termination_state
+        };
         Ok(DwTaskTerminationInfoV1 {
             size: DW_TASK_TERMINATION_INFO_V1_SIZE,
             version: 1,
-            state: self.termination_state,
+            state,
             reason: DW_TERMINATION_NORMAL_EXIT,
             ..DwTaskTerminationInfoV1::default()
         })
@@ -1276,6 +1291,36 @@ fn primordial_bootstrap_rechecks_a_late_exit_before_termination() {
     ));
     assert!(loader.terminated.is_empty());
     assert!(fixture.sent.is_empty());
+    assert_eq!(
+        fixture.closed,
+        [DwHandle(42), DwHandle(43), ROOT, BOOTFS, TASK_GROUP]
+    );
+}
+
+#[test]
+fn primordial_bootstrap_reconciles_exit_racing_failed_termination() {
+    let image = executable();
+    let mut fixture = Fixture::valid();
+    fixture.bootfs = bootfs(&[(INIT0_PATH, &image), (HELLO_PATH, b"hello")]);
+    let mut loader = SmokeLoader::init0();
+    loader.fail_terminate = true;
+    let mut supervisor = SmokeSupervisor::successful_init0();
+    supervisor.ready_handle_count = 1;
+    supervisor.termination_state = DW_TASK_STATE_RUNNING;
+    supervisor.exit_on_query = Some(2);
+
+    assert!(matches!(
+        run_init0_bootstrap(
+            &mut fixture,
+            &mut loader,
+            &mut supervisor,
+            CHANNEL,
+            DwDeadline(99),
+        ),
+        Err(BootstrapError::Supervision(_))
+    ));
+    assert_eq!(loader.terminated, [DwHandle(43)]);
+    assert_eq!(supervisor.termination_queries, 2);
     assert_eq!(
         fixture.closed,
         [DwHandle(42), DwHandle(43), ROOT, BOOTFS, TASK_GROUP]

@@ -663,11 +663,10 @@ fn run_init0_bootstrap_with_fault_and_before_supervision<
             &supervision,
             Err(error) if !error.process_exit_observed()
         ) && late_exit.is_none();
-        let loaded_cleanup = cleanup_loaded_process(system, loader, loaded, terminate);
-        if let Err(cleanup) = loaded_cleanup {
-            return Err(BootstrapError::Cleanup(cleanup));
-        }
-        if let Some(info) = late_exit {
+        let cleanup_exit =
+            cleanup_supervised_process(system, loader, supervisor, loaded, terminate)
+                .map_err(BootstrapError::Cleanup)?;
+        if let Some(info) = late_exit.or(cleanup_exit) {
             validate_successful_exit(&info)
                 .map_err(|error| BootstrapError::Supervision(SupervisionError::Exit(error)))?;
         }
@@ -953,11 +952,10 @@ pub fn run_loader_smoke_bootstrap<
             &supervision,
             Err(error) if !error.process_exit_observed()
         ) && late_exit.is_none();
-        let loaded_cleanup = cleanup_loaded_process(system, loader, loaded, terminate);
-        if let Err(cleanup) = loaded_cleanup {
-            return Err(BootstrapError::Cleanup(cleanup));
-        }
-        if let Some(info) = late_exit {
+        let cleanup_exit =
+            cleanup_supervised_process(system, loader, supervisor, loaded, terminate)
+                .map_err(BootstrapError::Cleanup)?;
+        if let Some(info) = late_exit.or(cleanup_exit) {
             validate_successful_exit(&info)
                 .map_err(|error| BootstrapError::Supervision(SupervisionError::Exit(error)))?;
         }
@@ -1253,6 +1251,50 @@ fn cleanup_loaded_process<System: BootstrapSystem, Loader: LoaderPlatform<Error 
         }
     }
     first_error.map_or(Ok(()), Err)
+}
+
+fn cleanup_supervised_process<
+    System: BootstrapSystem,
+    Loader: LoaderPlatform<Error = NativeError>,
+    Supervisor: SupervisionPlatform<Error = NativeError>,
+>(
+    system: &mut System,
+    loader: &mut Loader,
+    supervisor: &mut Supervisor,
+    loaded: LoadedProcess,
+    terminate: bool,
+) -> Result<Option<deepwyrm_syscall::DwTaskTerminationInfoV1>, ChildCleanupError> {
+    let mut first_error = None;
+    let mut observed_exit = None;
+    if terminate && let Err(error) = loader.process_terminate(loaded.process) {
+        observed_exit = supervisor
+            .query_task_termination(loaded.process)
+            .ok()
+            .filter(|info| info.state == DW_TASK_STATE_EXITED);
+        if observed_exit.is_none() {
+            first_error = Some(ChildCleanupError {
+                stage: ChildCleanupStage::ProcessTerminate,
+                cause: error,
+            });
+        }
+    }
+    for (handle, stage) in [
+        (loaded.launch_channel, ChildCleanupStage::LaunchChannelClose),
+        (loaded.process, ChildCleanupStage::ProcessHandleClose),
+    ] {
+        if let Err(error) = system.close_handle(handle)
+            && first_error.is_none()
+        {
+            first_error = Some(ChildCleanupError {
+                stage,
+                cause: error,
+            });
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(observed_exit),
+    }
 }
 
 fn received_capability(info: DwReceivedHandleInfoV1) -> CapabilityInfo<DwObjectType, DwRights> {
