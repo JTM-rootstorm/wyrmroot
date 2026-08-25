@@ -1,8 +1,9 @@
 use deepwyrm_syscall::{
     DW_OBJECT_TYPE_CHANNEL, DW_RIGHT_DUPLICATE, DW_RIGHT_INSPECT, DW_RIGHT_READ, DW_RIGHT_WAIT,
-    DW_RIGHT_WRITE, DW_STATUS_BAD_HANDLE, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights,
+    DW_RIGHT_WRITE, DW_STATUS_BAD_HANDLE, DW_STATUS_NO_RESOURCES, DwHandle, DwObjectType,
+    DwReceivedHandleInfoV1, DwRights,
 };
-use wyrmroot_hello::{HelloError, HelloSystem, run_hello};
+use wyrmroot_hello::{HelloError, HelloNativeOperation, HelloSystem, run_hello};
 use wyrmroot_loader::launch::{LaunchProfile, encode_init, parse_ready};
 use wyrmroot_runtime::{
     BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, CapabilityValidationError, NativeError,
@@ -20,6 +21,18 @@ fn live_exit_code_identifies_hello_owned_failure() {
         })
         .exit_code(),
         0x4800_0003
+    );
+}
+
+#[test]
+fn live_exit_code_preserves_native_operation_and_cause() {
+    assert_eq!(
+        HelloError::Native {
+            operation: HelloNativeOperation::SendReady,
+            cause: NativeError::Status(DW_STATUS_NO_RESOURCES),
+        }
+        .exit_code(),
+        0x4803_000d
     );
 }
 
