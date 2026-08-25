@@ -1,0 +1,37 @@
+[package]
+name = "wyrmroot-wyr1-bootstrap-stubs"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+description = "Truthful WYR1-A registryd and devmgr READY stubs"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "registryd"
+path = "src/registryd.rs"
+test = false
+bench = false
+required-features = ["native-stubs"]
+
+[[bin]]
+name = "devmgr"
+path = "src/devmgr.rs"
+test = false
+bench = false
+required-features = ["native-stubs"]
+
+[features]
+default = []
+native-stubs = []
+
+[dependencies]
+deepwyrm-syscall.workspace = true
+wyrmroot-loader = { path = "../../crates/wyrmroot-loader" }
+wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }
+
+[lints.rust]
+unsafe_code = "deny"
+unused_crate_dependencies = "deny"

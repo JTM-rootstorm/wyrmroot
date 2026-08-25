@@ -13,6 +13,7 @@ use deepwyrm_syscall::{
 
 pub const HEADER_BYTES: usize = 40;
 pub const INIT0_BYTES: usize = 64;
+pub const SUPERVISOR_BYTES: usize = 64;
 pub const PROBE_CHILD_BYTES: usize = 48;
 pub const MAX_CAPABILITIES: usize = 3;
 
@@ -20,6 +21,7 @@ const MAGIC: &[u8; 4] = b"WRLP";
 const MAJOR: u16 = 1;
 const MINOR_V1_0: u16 = 0;
 const MINOR_V1_1: u16 = 1;
+const MINOR_V1_2: u16 = 2;
 const TYPE_INIT: u32 = 1;
 const TYPE_READY: u32 = 2;
 const ROLE_SELF_ROOT: u32 = 1;
@@ -50,21 +52,26 @@ pub enum LaunchProfile {
     /// WYR0-I ordinary probe child. Its WRLP 1.1 INIT carries only the child
     /// self-root; controller-originated objects arrive after startup.
     ProbeChild,
+    /// Permanent WYR1 supervisor with the exact loader authority trio.
+    Supervisor,
+    /// WYR1-A early-role stub with only its generation-bound launch Channel.
+    EarlyBootStub,
     Hello,
 }
 
 impl LaunchProfile {
     pub const fn capability_count(self) -> usize {
         match self {
-            Self::Init0 | Self::I2Stress | Self::CapabilityController => 3,
+            Self::Init0 | Self::I2Stress | Self::CapabilityController | Self::Supervisor => 3,
             Self::ProbeChild => 1,
-            Self::Hello => 0,
+            Self::Hello | Self::EarlyBootStub => 0,
         }
     }
 
     pub const fn protocol_minor(self) -> u16 {
         match self {
             Self::ProbeChild => MINOR_V1_1,
+            Self::Supervisor | Self::EarlyBootStub => MINOR_V1_2,
             Self::Init0 | Self::I2Stress | Self::CapabilityController | Self::Hello => MINOR_V1_0,
         }
     }
@@ -189,7 +196,7 @@ impl LaunchProfile {
     pub const fn has_loader_authority_trio(self) -> bool {
         matches!(
             self,
-            Self::Init0 | Self::I2Stress | Self::CapabilityController
+            Self::Init0 | Self::I2Stress | Self::CapabilityController | Self::Supervisor
         )
     }
 

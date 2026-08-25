@@ -131,6 +131,11 @@ pub use wyr0_compat::{
     I0_NEGATIVE_MALFORMED_STARTUP_DETAIL, INIT0_PATH, INIT0_TRANSACTION_ID,
     i0_negative_terminal_detail, run_init0_bootstrap, run_init0_bootstrap_with_fault,
 };
+
+/// Permanent supervisor path used by normal WYR1 media.
+pub const SYSTEM_INIT_PATH: &[u8] = b"system/init";
+/// Primordial-owned nonzero transaction for the permanent supervisor handoff.
+pub const SYSTEM_INIT_TRANSACTION_ID: u64 = 0x5759_5231_0000_0001;
 #[cfg(feature = "loader-smoke-integration")]
 pub use wyr0_compat::{LOADER_SMOKE_PATH, LOADER_SMOKE_TRANSACTION_ID, run_loader_smoke_bootstrap};
 #[cfg(feature = "i-capability-relay")]
@@ -147,11 +152,13 @@ use wyrmroot_bootstrap_proto::{
     BOOTSTRAP_INIT_V2_SIZE, BOOTSTRAP_READY_V2_SIZE, BootstrapMessage, DecodeError, InitMessageV2,
     MAX_BOOTSTRAP_HANDLES, ReadyMessageV2, decode,
 };
+use wyrmroot_loader::launch::LaunchProfile;
 use wyrmroot_loader::process::{
-    LoadAuthority, LoadError, LoadStage, LoadedProcess, LoaderPlatform,
+    LoadAuthority, LoadError, LoadRequest, LoadStage, LoadedProcess, LoaderPlatform,
 };
 #[cfg(feature = "primordial-test-support")]
 use wyrmroot_runtime::PrimordialTestError;
+use wyrmroot_runtime::await_child_ready_profile;
 use wyrmroot_runtime::{
     BOOTFS_EXPECTATION, BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, CapabilityValidationError,
     InitCapability, LOADER_TASK_GROUP_EXPECTATION, MappingPlan, MappingPlanError, NativeError,
@@ -159,6 +166,99 @@ use wyrmroot_runtime::{
     validate_init_capabilities_v2,
 };
 use wyrmroot_runtime::{SupervisionError, SupervisionPlatform};
+
+/// Launches exactly `/system/init`, accepts its operational WRLP 1.2 READY,
+/// retires primordial authority, and reports READY to the kernel parent. The
+/// permanent supervisor is deliberately not awaited to exit.
+pub fn run_supervisor_bootstrap<
+    System: BootstrapSystem,
+    Loader: LoaderPlatform<Error = NativeError>,
+    Supervisor: SupervisionPlatform<Error = NativeError>,
+>(
+    system: &mut System,
+    loader: &mut Loader,
+    supervisor: &mut Supervisor,
+    bootstrap_channel: DwHandle,
+    deadline: deepwyrm_syscall::DwDeadline,
+) -> Result<(), BootstrapError> {
+    let channel_info = system
+        .query_capability_info(bootstrap_channel)
+        .map_err(BootstrapError::Native)?;
+    validate_bootstrap_channel(channel_info, BOOTSTRAP_CHANNEL_EXPECTATION)
+        .map_err(BootstrapError::BootstrapChannel)?;
+    let mut bytes = [0; BOOTSTRAP_INIT_V2_SIZE];
+    let mut handles = [DwReceivedHandleInfoV1::default(); MAX_BOOTSTRAP_HANDLES];
+    let counts = system
+        .receive_channel(bootstrap_channel, &mut bytes, &mut handles)
+        .map_err(BootstrapError::Native)?;
+    if counts.bytes > bytes.len() || counts.handles > handles.len() {
+        return Err(BootstrapError::ReceiveCounts(counts));
+    }
+    let operation = (|| {
+        let message =
+            decode(&bytes[..counts.bytes], counts.handles).map_err(BootstrapError::Protocol)?;
+        let BootstrapMessage::InitV2(init) = message else {
+            return Err(BootstrapError::UnexpectedMessage);
+        };
+        if init.transaction_id != 1 {
+            return Err(BootstrapError::UnexpectedTransactionId);
+        }
+        let authority = validated_load_authority(system, &handles[..counts.handles])?;
+        let plan = bootfs_mapping_plan(system, authority.bootfs)?;
+        let mut loaded = None;
+        system
+            .with_bootfs_bytes(authority.parent_root, authority.bootfs, plan, |bootfs| {
+                let archive = Archive::new(bootfs).map_err(BootstrapError::Bootfs)?;
+                let entry = archive
+                    .lookup(SYSTEM_INIT_PATH)
+                    .map_err(|_| BootstrapError::MissingRequiredEntry)?;
+                if !entry.is_executable() || entry.data().is_empty() {
+                    return Err(BootstrapError::RequiredEntryNotExecutable);
+                }
+                let display_path = entry
+                    .name_utf8()
+                    .map_err(|_| BootstrapError::MissingRequiredEntry)?;
+                loaded = Some(
+                    wyrmroot_loader::process::load_process(
+                        loader,
+                        authority,
+                        LoadRequest {
+                            image: entry.data(),
+                            display_path,
+                            profile: LaunchProfile::Supervisor,
+                            transaction_id: SYSTEM_INIT_TRANSACTION_ID,
+                        },
+                    )
+                    .map_err(BootstrapError::Loader)?,
+                );
+                Ok(())
+            })
+            .map_err(BootstrapError::Native)??;
+        let loaded = loaded.ok_or(BootstrapError::MissingLoadedProcess)?;
+        let ready = await_child_ready_profile(
+            supervisor,
+            loaded.process,
+            loaded.launch_channel,
+            LaunchProfile::Supervisor,
+            SYSTEM_INIT_TRANSACTION_ID,
+            deadline,
+        );
+        if let Err(error) = ready {
+            let terminate = !error.process_exit_observed();
+            cleanup_loaded_process(system, loader, loaded, terminate)
+                .map_err(BootstrapError::Cleanup)?;
+            return Err(BootstrapError::Supervision(error));
+        }
+        // Closing primordial's observation handles does not terminate init;
+        // init owns its delegated descendant TaskGroup and immutable bootfs.
+        cleanup_loaded_process(system, loader, loaded, false).map_err(BootstrapError::Cleanup)?;
+        Ok(init.transaction_id)
+    })();
+    let cleanup = close_received_handles(system, &handles[..counts.handles]);
+    let transaction = operation?;
+    cleanup?;
+    send_primordial_ready(system, bootstrap_channel, transaction)
+}
 
 /// Native operations used by the shared bootstrap transaction.
 pub trait BootstrapSystem {

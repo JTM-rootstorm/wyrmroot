@@ -1,0 +1,35 @@
+[package]
+name = "wyrmroot-system-init"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+description = "Permanent WYR1 bootfs supervisor"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "system-init"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["native-init"]
+
+[features]
+default = []
+native-init = []
+
+[dependencies]
+deepwyrm-syscall.workspace = true
+wyrmroot-bootfs = { path = "../../crates/wyrmroot-bootfs" }
+wyrmroot-loader = { path = "../../crates/wyrmroot-loader" }
+wyrmroot-rrc-manifest = { path = "../../crates/wyrmroot-rrc-manifest" }
+wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }
+
+[dev-dependencies]
+wyrmroot-rrc-manifest = { path = "../../crates/wyrmroot-rrc-manifest", features = ["builder"] }
+
+[lints.rust]
+unsafe_code = "deny"
+unused_crate_dependencies = "deny"

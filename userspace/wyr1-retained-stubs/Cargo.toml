@@ -1,0 +1,37 @@
+[package]
+name = "wyrmroot-wyr1-retained-stubs"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+description = "Unlaunchable retained WYR1-A closure artifacts"
+
+[[bin]]
+name = "uart16550d"
+path = "src/uart16550d.rs"
+test = false
+bench = false
+required-features = ["native-retained"]
+[[bin]]
+name = "consoled"
+path = "src/consoled.rs"
+test = false
+bench = false
+required-features = ["native-retained"]
+[[bin]]
+name = "wyrmsh"
+path = "src/wyrmsh.rs"
+test = false
+bench = false
+required-features = ["native-retained"]
+
+[features]
+default = []
+native-retained = []
+
+[dependencies]
+wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }
+
+[lints.rust]
+unsafe_code = "deny"
+unused_crate_dependencies = "deny"

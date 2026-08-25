@@ -9,7 +9,7 @@ use deepwyrm_syscall::{
     DW_TASK_STATE_EXITED, DW_TASK_TERMINATION_INFO_V1_SIZE, DW_TERMINATION_NORMAL_EXIT, DwDeadline,
     DwHandle, DwReceivedHandleInfoV1, DwTaskTerminationInfoV1, DwWaitItemV1, DwWaitResultV1,
 };
-use wyrmroot_loader::launch::{self, HEADER_BYTES, LaunchError};
+use wyrmroot_loader::launch::{self, HEADER_BYTES, LaunchError, LaunchProfile};
 
 use crate::{NativeError, ReceiveCounts, query_task_termination_info, receive_channel, wait_many};
 
@@ -203,6 +203,26 @@ pub fn supervise_child<P: SupervisionPlatform>(
     transaction_id: u64,
     deadline: DwDeadline,
 ) -> Result<(), SupervisionError<P::Error>> {
+    supervise_child_profile(
+        platform,
+        process,
+        launch_channel,
+        LaunchProfile::Hello,
+        transaction_id,
+        deadline,
+    )
+}
+
+/// Profile-aware READY/exit observation. Existing `supervise_child` callers
+/// remain bound byte-for-byte to WRLP 1.0 through its compatibility wrapper.
+pub fn supervise_child_profile<P: SupervisionPlatform>(
+    platform: &mut P,
+    process: DwHandle,
+    launch_channel: DwHandle,
+    profile: LaunchProfile,
+    transaction_id: u64,
+    deadline: DwDeadline,
+) -> Result<(), SupervisionError<P::Error>> {
     if deadline == DW_DEADLINE_INFINITE {
         return Err(SupervisionError::UnboundedDeadline);
     }
@@ -258,7 +278,8 @@ pub fn supervise_child<P: SupervisionPlatform>(
                 if ready {
                     return Err(SupervisionError::DuplicateReady);
                 }
-                launch::parse_ready(&bytes, transaction_id).map_err(SupervisionError::Ready)?;
+                launch::parse_ready_for_profile(profile, &bytes, transaction_id)
+                    .map_err(SupervisionError::Ready)?;
                 ready = true;
                 // Channel signals are level-triggered, but this wait result predates the
                 // receive.  In particular, a combined READABLE | PEER_CLOSED result does not
@@ -298,6 +319,7 @@ pub fn supervise_child<P: SupervisionPlatform>(
         return drain_terminal_launch_channel(
             platform,
             launch_channel,
+            profile,
             transaction_id,
             ready,
             deadline,
@@ -305,9 +327,73 @@ pub fn supervise_child<P: SupervisionPlatform>(
     }
 }
 
+/// Observes one exact profile-bound READY without waiting for child exit.
+///
+/// This is the permanent-supervisor handoff boundary: successful return proves
+/// the child is operational and leaves its Process/Channel ownership with the
+/// caller. It never reinterprets process existence as READY.
+pub fn await_child_ready_profile<P: SupervisionPlatform>(
+    platform: &mut P,
+    process: DwHandle,
+    launch_channel: DwHandle,
+    profile: LaunchProfile,
+    transaction_id: u64,
+    deadline: DwDeadline,
+) -> Result<(), SupervisionError<P::Error>> {
+    if deadline == DW_DEADLINE_INFINITE {
+        return Err(SupervisionError::UnboundedDeadline);
+    }
+    let items = [
+        DwWaitItemV1 {
+            handle: launch_channel,
+            signals: CHANNEL_SIGNALS,
+        },
+        DwWaitItemV1 {
+            handle: process,
+            signals: DW_SIGNAL_EXITED,
+        },
+    ];
+    let result = platform
+        .wait_many(&items, deadline)
+        .map_err(SupervisionError::Platform)?;
+    let index = usize::try_from(result.index).map_err(|_| SupervisionError::InvalidWaitResult)?;
+    let Some(item) = items.get(index) else {
+        return Err(SupervisionError::InvalidWaitResult);
+    };
+    if result.observed.0 & item.signals.0 == 0 {
+        return Err(SupervisionError::InvalidWaitResult);
+    }
+    if index == 1 {
+        platform
+            .query_task_termination(process)
+            .map_err(SupervisionError::ExitQuery)?;
+        return Err(SupervisionError::ExitedBeforeReady);
+    }
+    if result.observed.0 & DW_SIGNAL_READABLE.0 == 0 {
+        return Err(SupervisionError::PeerClosedBeforeReady);
+    }
+    let mut bytes = [0; HEADER_BYTES];
+    let mut handles = [];
+    let counts = platform
+        .receive_channel(launch_channel, &mut bytes, &mut handles)
+        .map_err(SupervisionError::Platform)?;
+    if counts
+        != (ReceiveCounts {
+            bytes: HEADER_BYTES,
+            handles: 0,
+        })
+    {
+        return Err(SupervisionError::InvalidReadyReceive(counts));
+    }
+    launch::parse_ready_for_profile(profile, &bytes, transaction_id)
+        .map_err(SupervisionError::Ready)?;
+    Ok(())
+}
+
 fn drain_terminal_launch_channel<P: SupervisionPlatform>(
     platform: &mut P,
     launch_channel: DwHandle,
+    profile: LaunchProfile,
     transaction_id: u64,
     mut ready: bool,
     deadline: DwDeadline,
@@ -352,7 +438,7 @@ fn drain_terminal_launch_channel<P: SupervisionPlatform>(
                     ExitObservedReadinessError::DuplicateReady,
                 ));
             }
-            launch::parse_ready(&bytes, transaction_id).map_err(|error| {
+            launch::parse_ready_for_profile(profile, &bytes, transaction_id).map_err(|error| {
                 SupervisionError::ExitObservedReadiness(ExitObservedReadinessError::Ready(error))
             })?;
             ready = true;
@@ -381,6 +467,24 @@ pub fn supervise_native_child(
         &mut NativeSupervisionPlatform,
         process,
         launch_channel,
+        transaction_id,
+        deadline,
+    )
+}
+
+/// Native profile-aware READY/exit observation.
+pub fn supervise_native_child_profile(
+    process: DwHandle,
+    launch_channel: DwHandle,
+    profile: LaunchProfile,
+    transaction_id: u64,
+    deadline: DwDeadline,
+) -> Result<(), SupervisionError<NativeError>> {
+    supervise_child_profile(
+        &mut NativeSupervisionPlatform,
+        process,
+        launch_channel,
+        profile,
         transaction_id,
         deadline,
     )

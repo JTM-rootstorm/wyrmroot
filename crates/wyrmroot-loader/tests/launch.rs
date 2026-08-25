@@ -4,7 +4,7 @@ use deepwyrm_syscall::{
 };
 use wyrmroot_loader::launch::{
     self, BOOTFS_RIGHTS, HEADER_BYTES, INIT0_BYTES, LOADER_TASK_GROUP_RIGHTS, LaunchError,
-    LaunchProfile, PROBE_CHILD_BYTES, SELF_ROOT_RIGHTS,
+    LaunchProfile, PROBE_CHILD_BYTES, SELF_ROOT_RIGHTS, SUPERVISOR_BYTES,
 };
 
 #[test]
@@ -187,6 +187,66 @@ fn profile_aware_ready_binds_probe_child_to_wrpl_1_1_and_transaction() {
         launch::parse_ready_for_profile(LaunchProfile::ProbeChild, &ready, 0xbeef),
         Err(LaunchError::TransactionMismatch)
     );
+}
+
+#[test]
+fn supervisor_and_early_stub_are_exact_wrpl_1_2_profiles() {
+    let legacy_init0 = {
+        let mut bytes = [0; INIT0_BYTES];
+        launch::encode_init(LaunchProfile::Init0, 7, &mut bytes).unwrap();
+        bytes
+    };
+    let legacy_probe = {
+        let mut bytes = [0; PROBE_CHILD_BYTES];
+        launch::encode_init(LaunchProfile::ProbeChild, 7, &mut bytes).unwrap();
+        bytes
+    };
+    let handles = init0_handles();
+    let mut supervisor = [0xaa; SUPERVISOR_BYTES];
+    assert_eq!(
+        launch::encode_init(LaunchProfile::Supervisor, 0x1200, &mut supervisor),
+        Ok(SUPERVISOR_BYTES)
+    );
+    assert_eq!(
+        (
+            get16(&supervisor, 6),
+            get32(&supervisor, 16),
+            get32(&supervisor, 20)
+        ),
+        (2, 64, 3)
+    );
+    assert_eq!(
+        launch::parse_init(LaunchProfile::Supervisor, &supervisor, &handles)
+            .unwrap()
+            .transaction_id,
+        0x1200
+    );
+
+    let mut stub = [0xaa; HEADER_BYTES];
+    launch::encode_init(LaunchProfile::EarlyBootStub, 0x1201, &mut stub).unwrap();
+    assert_eq!(
+        (get16(&stub, 6), get32(&stub, 16), get32(&stub, 20)),
+        (2, 40, 0)
+    );
+    assert!(launch::parse_init(LaunchProfile::EarlyBootStub, &stub, &[]).is_ok());
+    let mut ready = [0xaa; HEADER_BYTES];
+    launch::encode_ready_for_profile(LaunchProfile::EarlyBootStub, 0x1201, &mut ready).unwrap();
+    assert_eq!(
+        launch::parse_ready_for_profile(LaunchProfile::EarlyBootStub, &ready, 0x1201),
+        Ok(())
+    );
+    assert_eq!(
+        launch::parse_ready_for_profile(LaunchProfile::Hello, &ready, 0x1201),
+        Err(LaunchError::BadVersion)
+    );
+
+    // Adding 1.2 profiles must not perturb the exact established bytes.
+    let mut after_init0 = [0; INIT0_BYTES];
+    let mut after_probe = [0; PROBE_CHILD_BYTES];
+    launch::encode_init(LaunchProfile::Init0, 7, &mut after_init0).unwrap();
+    launch::encode_init(LaunchProfile::ProbeChild, 7, &mut after_probe).unwrap();
+    assert_eq!(after_init0, legacy_init0);
+    assert_eq!(after_probe, legacy_probe);
 }
 
 #[test]

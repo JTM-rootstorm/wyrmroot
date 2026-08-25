@@ -19,8 +19,9 @@ use wyrmroot_bootstrap::{
     BootstrapError, BootstrapSystem, ChildCleanupError, ChildCleanupStage, HELLO_PATH,
     I0_NEGATIVE_CAPABILITY_COUNT_DETAIL, I0_NEGATIVE_CAPABILITY_RIGHTS_DETAIL,
     I0_NEGATIVE_CAPABILITY_TYPE_DETAIL, I0_NEGATIVE_MALFORMED_ELF_DETAIL,
-    I0_NEGATIVE_MALFORMED_STARTUP_DETAIL, INIT0_PATH, i0_negative_terminal_detail, run_bootstrap,
-    run_init0_bootstrap, run_init0_bootstrap_with_fault,
+    I0_NEGATIVE_MALFORMED_STARTUP_DETAIL, INIT0_PATH, SYSTEM_INIT_PATH, SYSTEM_INIT_TRANSACTION_ID,
+    i0_negative_terminal_detail, run_bootstrap, run_init0_bootstrap,
+    run_init0_bootstrap_with_fault, run_supervisor_bootstrap,
 };
 #[cfg(feature = "loader-smoke-integration")]
 use wyrmroot_bootstrap::{LOADER_SMOKE_PATH, run_loader_smoke_bootstrap};
@@ -403,6 +404,14 @@ impl SmokeLoader {
         }
     }
 
+    fn supervisor() -> Self {
+        Self {
+            expected_profile: launch::LaunchProfile::Supervisor,
+            expected_transaction: SYSTEM_INIT_TRANSACTION_ID,
+            ..Self::new()
+        }
+    }
+
     fn handle(&mut self) -> DwHandle {
         let handle = DwHandle(self.next);
         self.next += 1;
@@ -504,13 +513,14 @@ impl LoaderPlatform for SmokeLoader {
             },
         ];
         let handles = match self.expected_profile {
-            launch::LaunchProfile::Hello => {
+            launch::LaunchProfile::Hello | launch::LaunchProfile::EarlyBootStub => {
                 assert!(transfers.is_empty());
                 &received[..0]
             }
             launch::LaunchProfile::Init0
             | launch::LaunchProfile::I2Stress
-            | launch::LaunchProfile::CapabilityController => {
+            | launch::LaunchProfile::CapabilityController
+            | launch::LaunchProfile::Supervisor => {
                 assert_eq!(transfers.len(), 3);
                 assert!(transfers.iter().all(|transfer| {
                     transfer.operation == deepwyrm_syscall::DW_HANDLE_TRANSFER_MOVE
@@ -569,6 +579,7 @@ struct SmokeSupervisor {
     termination_queries: usize,
     exit_on_query: Option<usize>,
     transaction_id: u64,
+    ready_profile: launch::LaunchProfile,
     relay_events: &'static [deepwyrm_syscall::DwSignals],
     relay_index: usize,
     relay_wait_error: Option<NativeError>,
@@ -590,6 +601,7 @@ impl SmokeSupervisor {
             termination_queries: 0,
             exit_on_query: None,
             transaction_id: 2,
+            ready_profile: launch::LaunchProfile::Hello,
             relay_events: &[],
             relay_index: 0,
             relay_wait_error: None,
@@ -606,6 +618,15 @@ impl SmokeSupervisor {
         }
     }
 
+    fn successful_supervisor() -> Self {
+        Self {
+            events: &[true],
+            transaction_id: SYSTEM_INIT_TRANSACTION_ID,
+            ready_profile: launch::LaunchProfile::Supervisor,
+            ..Self::successful()
+        }
+    }
+
     fn exited_before_ready() -> Self {
         Self {
             events: &[false],
@@ -618,6 +639,7 @@ impl SmokeSupervisor {
             termination_queries: 0,
             exit_on_query: None,
             transaction_id: 2,
+            ready_profile: launch::LaunchProfile::Hello,
             relay_events: &[],
             relay_index: 0,
             relay_wait_error: None,
@@ -718,7 +740,7 @@ impl SupervisionPlatform for SmokeSupervisor {
         if let Some(counts) = self.ready_receive_counts {
             return Ok(counts);
         }
-        let size = launch::encode_ready(self.transaction_id, bytes)
+        let size = launch::encode_ready_for_profile(self.ready_profile, self.transaction_id, bytes)
             .map_err(|_| NativeError::Status(DW_STATUS_BAD_HANDLE))?;
         Ok(ReceiveCounts {
             bytes: size,
@@ -772,6 +794,46 @@ fn primordial_bootstrap_launches_only_init0_and_supervises_it_before_ready() {
         Ok(())
     );
     assert_eq!(loader.init_profiles, [launch::LaunchProfile::Init0]);
+    assert_eq!(supervisor.received, 1);
+    assert_eq!(
+        decode(&fixture.sent, 0),
+        Ok(BootstrapMessage::ReadyV2(ReadyMessageV2 {
+            transaction_id: 1
+        }))
+    );
+    assert_eq!(
+        fixture.closed,
+        [
+            DwHandle(42),
+            DwHandle(43),
+            ROOT,
+            BOOTFS,
+            TASK_GROUP,
+            CHANNEL
+        ]
+    );
+}
+
+#[test]
+fn wyr1_primordial_launches_only_system_init_and_retires_after_operational_ready() {
+    let image = executable();
+    let mut fixture = Fixture::valid();
+    fixture.bootfs = bootfs(&[(SYSTEM_INIT_PATH, &image)]);
+    let mut loader = SmokeLoader::supervisor();
+    let mut supervisor = SmokeSupervisor::successful_supervisor();
+
+    assert_eq!(
+        run_supervisor_bootstrap(
+            &mut fixture,
+            &mut loader,
+            &mut supervisor,
+            CHANNEL,
+            DwDeadline(99),
+        ),
+        Ok(())
+    );
+    assert_eq!(loader.init_profiles, [launch::LaunchProfile::Supervisor]);
+    assert!(loader.terminated.is_empty());
     assert_eq!(supervisor.received, 1);
     assert_eq!(
         decode(&fixture.sent, 0),

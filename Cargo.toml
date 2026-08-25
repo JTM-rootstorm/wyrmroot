@@ -5,6 +5,7 @@ members = [
     "crates/wyrmroot-bootfs",
     "crates/wyrmroot-bootstrap-proto",
     "crates/wyrmroot-loader",
+    "crates/wyrmroot-launch-proto",
     "crates/wyrmroot-rrc-manifest",
     "crates/wyrmroot-runtime",
     "loader",
@@ -13,6 +14,9 @@ members = [
     "userspace/i-capability",
     "userspace/i2-stress",
     "userspace/init0",
+    "userspace/system-init",
+    "userspace/wyr1-bootstrap-stubs",
+    "userspace/wyr1-retained-stubs",
     "userspace/loader-smoke",
 ]
 

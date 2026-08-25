@@ -225,6 +225,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrmroot-launch-proto"
+version = "0.0.0"
+
+[[package]]
 name = "wyrmroot-loader"
 version = "0.0.0"
 dependencies = [
@@ -252,6 +256,33 @@ version = "0.0.0"
 dependencies = [
  "deepwyrm-syscall",
  "wyrmroot-loader",
+]
+
+[[package]]
+name = "wyrmroot-system-init"
+version = "0.0.0"
+dependencies = [
+ "deepwyrm-syscall",
+ "wyrmroot-bootfs",
+ "wyrmroot-loader",
+ "wyrmroot-rrc-manifest",
+ "wyrmroot-runtime",
+]
+
+[[package]]
+name = "wyrmroot-wyr1-bootstrap-stubs"
+version = "0.0.0"
+dependencies = [
+ "deepwyrm-syscall",
+ "wyrmroot-loader",
+ "wyrmroot-runtime",
+]
+
+[[package]]
+name = "wyrmroot-wyr1-retained-stubs"
+version = "0.0.0"
+dependencies = [
+ "wyrmroot-runtime",
 ]
 
 [[package]]

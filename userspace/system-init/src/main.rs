@@ -1,0 +1,110 @@
+#![no_std]
+#![no_main]
+#![deny(unsafe_code)]
+
+use core::panic::PanicInfo;
+use deepwyrm_syscall::{
+    DW_RIGHT_INSPECT, DW_RIGHT_MODIFY, DW_RIGHT_WAIT, DW_SIGNAL_SIGNALED, DwDeadline, DwHandle,
+    DwObjectType, DwReceivedHandleInfoV1, DwRights,
+};
+use wyrmroot_bootfs as _;
+use wyrmroot_loader as _;
+use wyrmroot_rrc_manifest as _;
+use wyrmroot_runtime::{
+    CapabilityInfo, MappingPlan, NativeError, NativeLoaderPlatform, NativeSupervisionPlatform,
+    ReceiveCounts, StartupBlock, close_handle, create_task_group, create_timer,
+    map_bootfs_read_only, monotonic_active_now, panic_abort, query_capability_info,
+    query_memory_object_size, receive_channel, send_channel, set_timer, unmap_bootfs, wait_one,
+};
+use wyrmroot_system_init::{InitPlatform, run_system_init};
+
+struct NativeSystem;
+
+impl InitPlatform for NativeSystem {
+    fn query_capability_info(
+        &mut self,
+        handle: DwHandle,
+    ) -> Result<CapabilityInfo<DwObjectType, DwRights>, NativeError> {
+        query_capability_info(handle)
+    }
+    fn receive_channel(
+        &mut self,
+        channel: DwHandle,
+        bytes: &mut [u8],
+        handles: &mut [DwReceivedHandleInfoV1],
+    ) -> Result<ReceiveCounts, NativeError> {
+        receive_channel(channel, bytes, handles)
+    }
+    fn query_memory_object_size(&mut self, handle: DwHandle) -> Result<u64, NativeError> {
+        query_memory_object_size(handle)
+    }
+    fn with_bootfs_bytes<R>(
+        &mut self,
+        root: DwHandle,
+        bootfs: DwHandle,
+        plan: MappingPlan,
+        use_bytes: impl for<'a> FnOnce(&mut Self, &'a [u8]) -> R,
+    ) -> Result<R, NativeError> {
+        let mapping = map_bootfs_read_only(root, bootfs, plan)?;
+        let result = mapping.with_logical_bytes(|bytes| use_bytes(self, bytes));
+        unmap_bootfs(mapping)?;
+        Ok(result)
+    }
+    fn send_channel(&mut self, channel: DwHandle, bytes: &[u8]) -> Result<(), NativeError> {
+        send_channel(channel, bytes, &[])
+    }
+    fn close_handle(&mut self, handle: DwHandle) -> Result<(), NativeError> {
+        close_handle(handle)
+    }
+    fn create_attempt_task_group(&mut self, parent: DwHandle) -> Result<DwHandle, NativeError> {
+        create_task_group(parent, DwRights(DW_RIGHT_MODIFY.0 | DW_RIGHT_INSPECT.0))
+    }
+    fn now(&mut self) -> Result<u64, NativeError> {
+        monotonic_active_now()
+    }
+    fn wait_until(&mut self, deadline_ns: u64) -> Result<(), NativeError> {
+        let timer = create_timer(DwRights(
+            DW_RIGHT_WAIT.0 | DW_RIGHT_MODIFY.0 | DW_RIGHT_INSPECT.0,
+        ))?;
+        let result = (|| {
+            set_timer(timer, DwDeadline(deadline_ns))?;
+            let end = deadline_ns
+                .checked_add(1_000_000_000)
+                .ok_or(NativeError::Output(
+                    wyrmroot_runtime::NativeOutputError::DeadlineOverflow,
+                ))?;
+            wait_one(timer, DW_SIGNAL_SIGNALED, DwDeadline(end))?;
+            Ok(())
+        })();
+        result.and(close_handle(timer))
+    }
+}
+
+fn main(startup: StartupBlock<'_>) -> u32 {
+    let result = run_system_init(
+        &mut NativeSystem,
+        &mut NativeLoaderPlatform,
+        &mut NativeSupervisionPlatform,
+        startup.bootstrap_channel().as_abi(),
+    );
+    let Ok(_structured_state) = result else {
+        return 0xAF01_0002;
+    };
+    loop {
+        let Ok(now) = monotonic_active_now() else {
+            return 0xAF01_0003;
+        };
+        let Some(deadline) = now.checked_add(1_000_000_000) else {
+            return 0xAF01_0004;
+        };
+        if InitPlatform::wait_until(&mut NativeSystem, deadline).is_err() {
+            return 0xAF01_0005;
+        }
+    }
+}
+
+wyrmroot_runtime::native_entry!(crate::main);
+#[panic_handler]
+fn panic(_: &PanicInfo<'_>) -> ! {
+    panic_abort()
+}

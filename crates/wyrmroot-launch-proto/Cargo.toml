@@ -1,0 +1,14 @@
+[package]
+name = "wyrmroot-launch-proto"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+description = "Reserved WYR1 generation-scoped launch/job protocol envelope"
+
+[lib]
+path = "src/lib.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_crate_dependencies = "deny"
