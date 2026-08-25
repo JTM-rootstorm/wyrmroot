@@ -1,0 +1,3 @@
+wyr1evid1|nonce=0123456789ABCDEF|seq=0|event=READY|role=00000001|generation=0000000000000001|transaction=0000000000000001|checksum=REPLACE
+wyr1evid1|nonce=0123456789ABCDEF|seq=1|event=PermanentFailure|role=00000002|generation=0000000000000004|transaction=0000000000000004|checksum=REPLACE
+wyr1evid1|nonce=0123456789ABCDEF|seq=2|event=DEGRADED|role=00000000|generation=0000000000000000|transaction=0000000000000000|checksum=REPLACE

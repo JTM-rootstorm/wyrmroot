@@ -14,6 +14,9 @@ Usage:
     cargo xtask test host [filter]
     cargo xtask test guest [filter]
     cargo xtask test integration wyr0 [default|smp] --request <wyr0-h-request.toml>
+    cargo xtask wyr1 image --request <wyr1-a-request.toml>
+    cargo xtask wyr1 inspect --request <wyr1-a-request.toml>
+    cargo xtask wyr1 evidence --request <wyr1-a-request.toml> --default <log> --smp <log>
 
 Host filters may name a component (bootfs, protocol, elf, runtime, bootstrap,
 efi, init0, hello, or xtask), package:<workspace-package>, or test:<substring>.
@@ -91,6 +94,13 @@ pub(crate) enum Action {
         profile: Option<HProfile>,
         request: String,
     },
+    Wyr1Image(String),
+    Wyr1Inspect(String),
+    Wyr1Evidence {
+        request: String,
+        default: String,
+        smp: String,
+    },
     Unavailable(&'static str),
 }
 
@@ -136,9 +146,36 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
         "audit-i-b" => dispatch_i_b_audit(&arguments[1..]),
         "gdb" => dispatch_profile_request(&arguments[1..], true),
         "test" => dispatch_test(&arguments[1..]),
+        "wyr1" => dispatch_wyr1(&arguments[1..]),
         unknown => Err(Failure::usage(format!(
             "unknown command '{unknown}'\n\n{USAGE}"
         ))),
+    }
+}
+
+fn dispatch_wyr1(arguments: &[String]) -> Result<Action, Failure> {
+    match arguments {
+        [command, flag, request] if command == "image" && flag == "--request" => {
+            Ok(Action::Wyr1Image(request.clone()))
+        }
+        [command, flag, request] if command == "inspect" && flag == "--request" => {
+            Ok(Action::Wyr1Inspect(request.clone()))
+        }
+        [command, flag, request, default_flag, default, smp_flag, smp]
+            if command == "evidence"
+                && flag == "--request"
+                && default_flag == "--default"
+                && smp_flag == "--smp" =>
+        {
+            Ok(Action::Wyr1Evidence {
+                request: request.clone(),
+                default: default.clone(),
+                smp: smp.clone(),
+            })
+        }
+        _ => Err(Failure::usage(
+            "wyr1 requires image|inspect --request <path>, or evidence --request <path> --default <log> --smp <log>",
+        )),
     }
 }
 

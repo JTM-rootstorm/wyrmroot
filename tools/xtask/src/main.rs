@@ -11,6 +11,7 @@ mod provenance;
 mod sha256;
 mod tasks;
 mod toolchain_artifact;
+mod wyr1;
 
 use std::env;
 use std::process::ExitCode;
@@ -103,6 +104,89 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
         Action::IntegrationH { profile, request } => {
             h_integration::integration(profile, &request).map(Some)
         }
+        Action::Wyr1Image(request) => wyr1_image(&request).map(Some),
+        Action::Wyr1Inspect(request) => wyr1_inspect(&request).map(Some),
+        Action::Wyr1Evidence {
+            request,
+            default,
+            smp,
+        } => wyr1_evidence(&request, &default, &smp).map(Some),
         Action::Unavailable(command) => Err(Failure::unavailable(command)),
     }
+}
+
+fn wyr1_image(path: &str) -> Result<String, Failure> {
+    let request = wyr1::load(std::path::Path::new(path))?;
+    let bootfs_sha256 = wyr1::build_bootfs(&request)?;
+    let arguments = cli::G3ImageArguments {
+        image: request.esp.display().to_string(),
+        loader: request.loader.display().to_string(),
+        kernel: request.kernel.display().to_string(),
+        bootstrap: request.bootstrap.display().to_string(),
+        bootfs: request.bootfs.display().to_string(),
+    };
+    let _ = g3_image::build(&arguments)?;
+    let esp_sha256 = sha256::file_digest(&request.esp)
+        .map_err(|error| Failure::task(format!("could not hash WYR1 ESP: {error}")))?;
+    let receipt = wyr1::receipt_text(
+        &request,
+        &bootfs_sha256,
+        &esp_sha256,
+        wyr1::Profile::Default,
+    )?;
+    wyr1::write_receipt(&request, &receipt)?;
+    Ok(format!(
+        "WYR1_IMAGE_PASS bootfs_sha256={bootfs_sha256} esp_sha256={esp_sha256}\n"
+    ))
+}
+
+fn wyr1_inspect(path: &str) -> Result<String, Failure> {
+    let request = wyr1::load(std::path::Path::new(path))?;
+    wyr1::verify_receipt(&request, wyr1::Profile::Default)?;
+    let bootfs = std::fs::read(&request.bootfs)
+        .map_err(|error| Failure::task(format!("could not read WYR1 bootfs: {error}")))?;
+    let archive = wyrmroot_bootfs::archive::Archive::new(&bootfs)
+        .map_err(|error| Failure::task(format!("WYR1 bootfs inspection failed: {error:?}")))?;
+    for (path, artifact) in request.artifact_paths() {
+        let entry = archive
+            .lookup(path.as_bytes())
+            .map_err(|error| Failure::task(format!("WYR1 bootfs is missing {path}: {error:?}")))?;
+        let expected = std::fs::read(artifact).map_err(|error| {
+            Failure::task(format!("could not read WYR1 artifact {path}: {error}"))
+        })?;
+        let expected_executable = path != "system/bootstrap/rrc-a-v1";
+        if entry.data() != expected || entry.is_executable() != expected_executable {
+            return Err(Failure::task(format!(
+                "WYR1 bootfs artifact substitution or mode mismatch at {path}"
+            )));
+        }
+    }
+    if archive.entries().count() != 7 {
+        return Err(Failure::task("WYR1 bootfs contains an undeclared entry"));
+    }
+    Ok(format!(
+        "WYR1_INSPECTION_PASS bootfs_sha256={} entries=7\n",
+        sha256::bytes_digest(&bootfs)
+    ))
+}
+
+fn wyr1_evidence(
+    request_path: &str,
+    default_path: &str,
+    smp_path: &str,
+) -> Result<String, Failure> {
+    let request = wyr1::load(std::path::Path::new(request_path))?;
+    let default = std::fs::read(default_path)
+        .map_err(|error| Failure::task(format!("could not read default WYR1 evidence: {error}")))
+        .and_then(|bytes| wyr1::parse_evidence(&bytes, request.evidence_nonce, request.scenario));
+    let smp = std::fs::read(smp_path)
+        .map_err(|error| Failure::task(format!("could not read SMP WYR1 evidence: {error}")))
+        .and_then(|bytes| wyr1::parse_evidence(&bytes, request.evidence_nonce, request.scenario));
+    let (default, smp) = wyr1::join_profiles(default, smp)?;
+    Ok(format!(
+        "WYR1_PAIRED_PASS default_records={} smp_records={} terminal={}\n",
+        default.records.len(),
+        smp.records.len(),
+        default.terminal.name()
+    ))
 }

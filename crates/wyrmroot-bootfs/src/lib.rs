@@ -13,6 +13,8 @@ pub mod builder;
 pub mod content;
 mod limits;
 pub mod path;
+#[cfg(feature = "builder")]
+pub mod wyr1;
 
 pub use limits::{BootfsLimits, WYR0_LIMITS};
 

@@ -104,6 +104,8 @@ impl<'a> Builder<'a> {
 /// Why a boot archive could not be constructed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BuildError {
+    /// A fixed WYR1 product entry had no immutable payload.
+    EmptyArtifact,
     /// The supplied path was not a canonical archive-relative path.
     InvalidPath,
     /// The encoded `newc` name, including its required NUL terminator, exceeds the cap.
