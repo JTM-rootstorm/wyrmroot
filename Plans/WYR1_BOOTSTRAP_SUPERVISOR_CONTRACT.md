@@ -270,6 +270,17 @@ authority path. WYR1-D activates `CONSOLE_BOUND` only after the reached serial
 and stream dependencies exist. An implementation cannot reinterpret retention
 as activation merely because an executable is present in bootfs.
 
+The initial WYR1-A product profile is stricter than structural WRRM v1 parsing:
+it contains exactly role IDs `1..=5`, every role sets both `required` and
+`requires READY`, and the activation/startup-profile pairs are exactly those in
+the table above (`EARLY`/`EarlyBootStub` for roles 1 and 2, retained profile 0
+for roles 3 through 5). Its exact `ROLE_READY` edges are `devmgr -> registryd`,
+`uart16550d -> devmgr`, `consoled -> uart16550d`, and `wyrmsh -> consoled`.
+Additional edges may only name required immutable executable, configuration,
+runtime, or firmware closure; they cannot add another role-ordering edge. A
+structurally valid manifest that differs from this product profile fails before
+child creation.
+
 ## 6. Fixed graph and generation identity
 
 Role IDs are coordinator-owned Wyrmroot policy identifiers, not PIDs, kernel
