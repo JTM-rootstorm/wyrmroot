@@ -45,6 +45,30 @@ pub const I_CAPABILITY_PATH: &[u8] = b"bin/hello";
 /// Nonzero WRLP transaction identifier for the `init0 -> hello` launch.
 pub const HELLO_TRANSACTION_ID: u64 = 2;
 
+// Retained by the native linker as a candidate-assembly attestation. Each
+// selector build has exactly one marker, so host tooling can reject a stale
+// Cargo output from a different init0 feature set before constructing media.
+#[cfg(not(any(
+    feature = "i2-stress-integration",
+    feature = "i-capability-integration"
+)))]
+#[used]
+static INIT0_PROFILE_MARKER: [u8; 29] = *b"WYRMINIT0-PROFILE-V1:ordinary";
+
+#[cfg(all(
+    feature = "i2-stress-integration",
+    not(feature = "i-capability-integration")
+))]
+#[used]
+static INIT0_PROFILE_MARKER: [u8; 30] = *b"WYRMINIT0-PROFILE-V1:i2-stress";
+
+#[cfg(all(
+    feature = "i-capability-integration",
+    not(feature = "i2-stress-integration")
+))]
+#[used]
+static INIT0_PROFILE_MARKER: [u8; 33] = *b"WYRMINIT0-PROFILE-V1:i-capability";
+
 /// Native operations used by the WYR0-G `init0` descendant transaction.
 pub trait Init0System {
     /// Queries current object metadata for a locally held capability.

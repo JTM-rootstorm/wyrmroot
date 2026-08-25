@@ -42,6 +42,10 @@ const WYR0_I_CANONICAL_ASSET: &[u8] = include_bytes!(concat!(
     "/../../userspace/i-capability/assets/asset.bin"
 ));
 const WYR0_I_RUST_TARGET: &str = "x86_64-unknown-wyrmroot";
+const I2_SELECTOR: &str = "smp-runtime-stress";
+const INIT0_PROFILE_ORDINARY: &[u8] = b"WYRMINIT0-PROFILE-V1:ordinary";
+const INIT0_PROFILE_I2: &[u8] = b"WYRMINIT0-PROFILE-V1:i2-stress";
+const INIT0_PROFILE_CAPABILITY: &[u8] = b"WYRMINIT0-PROFILE-V1:i-capability";
 const WYR0_I_INHERITED_I0_I1_I2: &str = "Plans/WYR0_H_VALIDATION.md";
 const WYR0_I_INHERITED_D0: &str = "../deepwyrm/security/DW0_H_SECURITY_REVIEW.md";
 const PROOF_CPU_ONLINE: u32 = 1 << 0;
@@ -1261,7 +1265,41 @@ fn verify_candidate_inputs(request: &HRequest) -> Result<CandidateArtifacts, Fai
             "WYR0-H GDB symbols do not exactly match the booted kernel SHA-256",
         ));
     }
+    validate_init0_profile(request, &artifacts.init0)?;
     Ok(artifacts)
+}
+
+fn validate_init0_profile(request: &HRequest, init0: &Path) -> Result<(), Failure> {
+    let bytes = read_regular(init0, "init0", MAX_GUEST_ARTIFACT_BYTES)?;
+    validate_init0_profile_bytes(&request.selector, &bytes)
+}
+
+fn validate_init0_profile_bytes(selector: &str, bytes: &[u8]) -> Result<(), Failure> {
+    let expected = if selector == h_request::I_CAPABILITY_SELECTOR {
+        INIT0_PROFILE_CAPABILITY
+    } else if selector == I2_SELECTOR {
+        INIT0_PROFILE_I2
+    } else {
+        INIT0_PROFILE_ORDINARY
+    };
+    for marker in [
+        INIT0_PROFILE_ORDINARY,
+        INIT0_PROFILE_I2,
+        INIT0_PROFILE_CAPABILITY,
+    ] {
+        let count = bytes
+            .windows(marker.len())
+            .filter(|window| *window == marker)
+            .count();
+        let required = usize::from(marker == expected);
+        if count != required {
+            return Err(Failure::task(format!(
+                "WYR0-H selector '{selector}' requires exactly one '{}' init0 profile marker and no competing profile marker",
+                String::from_utf8_lossy(expected)
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn build_bootfs_bytes(artifacts: &CandidateArtifacts) -> Result<Vec<u8>, Failure> {
@@ -4222,6 +4260,34 @@ mod tests {
     }
 
     #[test]
+    fn candidate_init0_profile_must_match_the_selector() {
+        assert!(
+            validate_init0_profile_bytes("primordial-bootstrap", INIT0_PROFILE_ORDINARY).is_ok()
+        );
+        assert!(
+            validate_init0_profile_bytes(h_request::I1_SELECTOR, INIT0_PROFILE_ORDINARY).is_ok()
+        );
+        assert!(validate_init0_profile_bytes(I2_SELECTOR, INIT0_PROFILE_I2).is_ok());
+        assert!(
+            validate_init0_profile_bytes(
+                h_request::I_CAPABILITY_SELECTOR,
+                INIT0_PROFILE_CAPABILITY,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_init0_profile_bytes("primordial-bootstrap", INIT0_PROFILE_CAPABILITY)
+                .unwrap_err()
+                .message
+                .contains("requires exactly one")
+        );
+
+        let mut competing = INIT0_PROFILE_ORDINARY.to_vec();
+        competing.extend_from_slice(INIT0_PROFILE_CAPABILITY);
+        assert!(validate_init0_profile_bytes("primordial-bootstrap", &competing).is_err());
+    }
+
+    #[test]
     fn schema_four_content_is_canonical_immutable_and_bootfs_bound() {
         let guest_asset = include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -4259,6 +4325,8 @@ mod tests {
         ] {
             fs::write(root.join(name), b"artifact").expect("write candidate fixture");
         }
+        fs::write(root.join("init0.elf"), INIT0_PROFILE_CAPABILITY)
+            .expect("write capability init0 fixture");
         let artifacts = verify_candidate_inputs(&request).expect("verify capability inputs");
         let bootfs = build_bootfs_bytes(&artifacts).expect("build capability bootfs");
         let archive =
@@ -5785,6 +5853,8 @@ mod tests {
         ] {
             fs::write(root.join(name), b"artifact").expect("write test artifact");
         }
+        fs::write(root.join("init0.elf"), INIT0_PROFILE_ORDINARY)
+            .expect("write ordinary init0 fixture");
         let revision = "1".repeat(40);
         let request_text = format!(
             concat!(
