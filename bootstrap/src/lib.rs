@@ -123,8 +123,12 @@ compile_error!(
 ))]
 compile_error!("the WYR0-I capability relay is mutually exclusive with other bootstrap variants");
 
-use deepwyrm_syscall::DwDeadline;
-use deepwyrm_syscall::{DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights};
+#[cfg(feature = "i-capability-relay")]
+use deepwyrm_syscall::{
+    DW_DEADLINE_INFINITE, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DW_STATUS_TIMED_OUT,
+    DW_STATUS_WOULD_BLOCK, DwWaitItemV1,
+};
+use deepwyrm_syscall::{DwDeadline, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights};
 use wyrmroot_bootfs::archive::{Archive, LookupError, ParseError};
 use wyrmroot_bootstrap_proto::{
     BOOTSTRAP_INIT_V2_SIZE, BOOTSTRAP_READY_V2_SIZE, BootstrapMessage, DecodeError, InitMessageV2,
@@ -372,6 +376,16 @@ pub const WRCAP1_RECORD_SIZE: usize = 117;
 #[cfg(feature = "i-capability-relay")]
 #[derive(Debug, Eq, PartialEq)]
 pub enum Wrcap1RelayError {
+    /// The relay was given an unbounded deadline.
+    UnboundedDeadline,
+    /// The bounded receive wait elapsed before the next required record arrived.
+    TimedOut,
+    /// The child Channel closed before its next required record became readable.
+    PeerClosed,
+    /// A wait result did not select the requested Channel or its requested signals.
+    InvalidWaitResult,
+    /// A post-readable receive raced with draining and reported `WOULD_BLOCK`.
+    ReceiveWouldBlock,
     /// The child attached one or more handles to an evidence datagram.
     CapabilityBearing,
     /// The record was not exact fixed-width, uppercase ASCII `WRCAP1` framing.
@@ -462,7 +476,7 @@ pub fn run_init0_bootstrap<
         bootstrap_channel,
         deadline,
         LoadFault::None,
-        |_, _, _| Ok(()),
+        |_, _, _, _, _| Ok(()),
     )
 }
 
@@ -516,7 +530,7 @@ pub fn run_init0_bootstrap_with_fault<
         bootstrap_channel,
         deadline,
         fault,
-        |_, _, _| Ok(()),
+        |_, _, _, _, _| Ok(()),
     )
 }
 
@@ -531,7 +545,13 @@ fn run_init0_bootstrap_with_fault_and_before_supervision<
     bootstrap_channel: DwHandle,
     deadline: DwDeadline,
     fault: LoadFault,
-    before_supervision: impl FnOnce(&mut System, DwHandle, DwHandle) -> Result<(), BootstrapError>,
+    before_supervision: impl FnOnce(
+        &mut System,
+        &mut Supervisor,
+        DwHandle,
+        DwHandle,
+        DwDeadline,
+    ) -> Result<(), BootstrapError>,
 ) -> Result<(), BootstrapError> {
     let channel_info = system
         .query_capability_info(bootstrap_channel)
@@ -576,7 +596,13 @@ fn run_init0_bootstrap_with_fault_and_before_supervision<
             (Err(error), None) => return Err(BootstrapError::Native(error)),
             (Ok(Ok(())), None) => return Err(BootstrapError::MissingLoadedProcess),
         };
-        if let Err(error) = before_supervision(system, loaded.launch_channel, bootstrap_channel) {
+        if let Err(error) = before_supervision(
+            system,
+            supervisor,
+            loaded.launch_channel,
+            bootstrap_channel,
+            deadline,
+        ) {
             if let Err(cleanup) = cleanup_loaded_process(system, loader, loaded, true) {
                 return Err(BootstrapError::Cleanup(cleanup));
             }
@@ -607,17 +633,34 @@ fn run_init0_bootstrap_with_fault_and_before_supervision<
 }
 
 #[cfg(feature = "i-capability-relay")]
-fn relay_wrcap1_records<System: BootstrapSystem>(
+fn relay_wrcap1_records<
+    System: BootstrapSystem,
+    Supervisor: SupervisionPlatform<Error = NativeError>,
+>(
     system: &mut System,
+    supervisor: &mut Supervisor,
     launch_channel: DwHandle,
     primordial_parent_channel: DwHandle,
+    deadline: DwDeadline,
 ) -> Result<(), BootstrapError> {
+    if deadline == DW_DEADLINE_INFINITE {
+        return Err(BootstrapError::CapabilityRelay(
+            Wrcap1RelayError::UnboundedDeadline,
+        ));
+    }
     let mut bytes = [0_u8; WRCAP1_RECORD_SIZE];
     let mut handles = [];
     for sequence in 0..WRCAP1_RECORD_COUNT {
-        let counts = system
-            .receive_channel(launch_channel, &mut bytes, &mut handles)
-            .map_err(BootstrapError::Native)?;
+        wait_for_wrcap1_record(supervisor, launch_channel, deadline)?;
+        let counts = match system.receive_channel(launch_channel, &mut bytes, &mut handles) {
+            Err(NativeError::Status(status)) if status == DW_STATUS_WOULD_BLOCK => {
+                return Err(BootstrapError::CapabilityRelay(
+                    Wrcap1RelayError::ReceiveWouldBlock,
+                ));
+            }
+            Err(error) => return Err(BootstrapError::Native(error)),
+            Ok(counts) => counts,
+        };
         if counts.handles != 0 {
             return Err(BootstrapError::CapabilityRelay(
                 Wrcap1RelayError::CapabilityBearing,
@@ -632,6 +675,36 @@ fn relay_wrcap1_records<System: BootstrapSystem>(
         system
             .send_channel(primordial_parent_channel, record)
             .map_err(BootstrapError::Native)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "i-capability-relay")]
+fn wait_for_wrcap1_record<Supervisor: SupervisionPlatform<Error = NativeError>>(
+    supervisor: &mut Supervisor,
+    launch_channel: DwHandle,
+    deadline: DwDeadline,
+) -> Result<(), BootstrapError> {
+    let item = DwWaitItemV1 {
+        handle: launch_channel,
+        signals: deepwyrm_syscall::DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+    };
+    let result = match supervisor.wait_many(core::slice::from_ref(&item), deadline) {
+        Err(NativeError::Status(status)) if status == DW_STATUS_TIMED_OUT => {
+            return Err(BootstrapError::CapabilityRelay(Wrcap1RelayError::TimedOut));
+        }
+        Err(error) => return Err(BootstrapError::Native(error)),
+        Ok(result) => result,
+    };
+    if result.index != 0 || result.observed.0 & item.signals.0 == 0 {
+        return Err(BootstrapError::CapabilityRelay(
+            Wrcap1RelayError::InvalidWaitResult,
+        ));
+    }
+    if result.observed.0 & DW_SIGNAL_READABLE.0 == 0 {
+        return Err(BootstrapError::CapabilityRelay(
+            Wrcap1RelayError::PeerClosed,
+        ));
     }
     Ok(())
 }

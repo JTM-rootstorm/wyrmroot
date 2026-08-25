@@ -8,6 +8,8 @@ use deepwyrm_syscall::{
     DW_TASK_TERMINATION_INFO_V1_SIZE, DW_TERMINATION_NORMAL_EXIT, DwDeadline, DwHandleTransferV1,
     DwMemoryProtection, DwTaskTerminationInfoV1, DwWaitItemV1, DwWaitResultV1,
 };
+#[cfg(feature = "i-capability-relay")]
+use deepwyrm_syscall::{DW_STATUS_TIMED_OUT, DW_STATUS_WOULD_BLOCK};
 use wyrmroot_bootfs::builder::{Builder, FileMode};
 #[cfg(feature = "primordial-test-support")]
 use wyrmroot_bootstrap::run_bootstrap_with_before_ready;
@@ -46,6 +48,9 @@ const CHANNEL: DwHandle = DwHandle(11);
 const ROOT: DwHandle = DwHandle(21);
 const BOOTFS: DwHandle = DwHandle(22);
 const TASK_GROUP: DwHandle = DwHandle(23);
+#[cfg(feature = "i-capability-relay")]
+const WRCAP1_READABLE_EVENTS: [deepwyrm_syscall::DwSignals; WRCAP1_RECORD_COUNT] =
+    [DW_SIGNAL_READABLE; WRCAP1_RECORD_COUNT];
 
 #[test]
 fn live_exit_code_identifies_bootstrap_owned_failure() {
@@ -126,6 +131,7 @@ struct Fixture {
     relay_records: Vec<Vec<u8>>,
     relay_index: usize,
     relay_handle_count: usize,
+    relay_receive_error: Option<NativeError>,
 }
 
 impl Fixture {
@@ -163,6 +169,7 @@ impl Fixture {
             relay_records: Vec::new(),
             relay_index: 0,
             relay_handle_count: 0,
+            relay_receive_error: None,
         }
     }
 }
@@ -211,8 +218,13 @@ impl BootstrapSystem for Fixture {
             .relay_records
             .get(self.relay_index)
             .expect("unexpected init0 launch receive");
+        if let Some(error) = self.relay_receive_error {
+            return Err(error);
+        }
         self.relay_index += 1;
-        bytes[..record.len()].copy_from_slice(record);
+        if record.len() <= bytes.len() {
+            bytes[..record.len()].copy_from_slice(record);
+        }
         Ok(ReceiveCounts {
             bytes: record.len(),
             handles: self.relay_handle_count,
@@ -477,12 +489,22 @@ impl LoaderPlatform for SmokeLoader {
                 assert!(transfers.is_empty());
                 &received[..0]
             }
-            launch::LaunchProfile::Init0 | launch::LaunchProfile::I2Stress => {
+            launch::LaunchProfile::Init0
+            | launch::LaunchProfile::I2Stress
+            | launch::LaunchProfile::CapabilityController => {
                 assert_eq!(transfers.len(), 3);
                 assert!(transfers.iter().all(|transfer| {
                     transfer.operation == deepwyrm_syscall::DW_HANDLE_TRANSFER_MOVE
                 }));
                 &received[..]
+            }
+            launch::LaunchProfile::ProbeChild => {
+                assert_eq!(transfers.len(), 1);
+                assert_eq!(
+                    transfers[0].operation,
+                    deepwyrm_syscall::DW_HANDLE_TRANSFER_MOVE
+                );
+                &received[..1]
             }
         };
         let parsed = launch::parse_init(self.expected_profile, bytes, handles)
@@ -524,6 +546,10 @@ struct SmokeSupervisor {
     ready_handle_count: usize,
     termination_query_error: bool,
     transaction_id: u64,
+    relay_events: &'static [deepwyrm_syscall::DwSignals],
+    relay_index: usize,
+    relay_wait_error: Option<NativeError>,
+    relay_invalid_wait_result: bool,
 }
 
 impl SmokeSupervisor {
@@ -535,6 +561,10 @@ impl SmokeSupervisor {
             ready_handle_count: 0,
             termination_query_error: false,
             transaction_id: 2,
+            relay_events: &[],
+            relay_index: 0,
+            relay_wait_error: None,
+            relay_invalid_wait_result: false,
         }
     }
 
@@ -553,6 +583,10 @@ impl SmokeSupervisor {
             ready_handle_count: 0,
             termination_query_error: false,
             transaction_id: 2,
+            relay_events: &[],
+            relay_index: 0,
+            relay_wait_error: None,
+            relay_invalid_wait_result: false,
         }
     }
 }
@@ -566,6 +600,34 @@ impl SupervisionPlatform for SmokeSupervisor {
         deadline: DwDeadline,
     ) -> Result<DwWaitResultV1, Self::Error> {
         assert_eq!(deadline, DwDeadline(99));
+        if let Some(error) = self.relay_wait_error.take() {
+            return Err(error);
+        }
+        if self.relay_invalid_wait_result {
+            self.relay_invalid_wait_result = false;
+            return Ok(DwWaitResultV1 {
+                size: deepwyrm_syscall::DW_WAIT_RESULT_V1_SIZE,
+                version: 1,
+                index: 1,
+                observed: DW_SIGNAL_READABLE,
+                ..DwWaitResultV1::default()
+            });
+        }
+        if let Some(&observed) = self.relay_events.get(self.relay_index) {
+            self.relay_index += 1;
+            assert_eq!(items.len(), 1);
+            assert_eq!(
+                items[0].signals.0,
+                DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0
+            );
+            return Ok(DwWaitResultV1 {
+                size: deepwyrm_syscall::DW_WAIT_RESULT_V1_SIZE,
+                version: 1,
+                index: 0,
+                observed,
+                ..DwWaitResultV1::default()
+            });
+        }
         let (index, observed) = if items.len() == 1 {
             (0, DW_SIGNAL_PEER_CLOSED)
         } else {
@@ -669,6 +731,7 @@ fn capability_bootstrap_relays_ten_exact_wrcap1_records_before_init0_supervision
     let expected_records = fixture.relay_records.concat();
     let mut loader = SmokeLoader::init0();
     let mut supervisor = SmokeSupervisor::successful_init0();
+    supervisor.relay_events = &WRCAP1_READABLE_EVENTS;
 
     assert_eq!(
         run_init0_capability_bootstrap(
@@ -681,6 +744,7 @@ fn capability_bootstrap_relays_ten_exact_wrcap1_records_before_init0_supervision
         Ok(())
     );
     assert_eq!(fixture.relay_index, WRCAP1_RECORD_COUNT);
+    assert_eq!(supervisor.relay_index, WRCAP1_RECORD_COUNT);
     assert_eq!(supervisor.received, 1);
     assert_eq!(&fixture.sent[..expected_records.len()], expected_records);
     assert_eq!(
@@ -702,6 +766,7 @@ fn capability_bootstrap_rejects_malformed_first_relay_record_before_supervision(
     fixture.relay_records = vec![malformed];
     let mut loader = SmokeLoader::init0();
     let mut supervisor = SmokeSupervisor::successful_init0();
+    supervisor.relay_events = &WRCAP1_READABLE_EVENTS;
 
     assert_eq!(
         run_init0_capability_bootstrap(
@@ -732,6 +797,7 @@ fn capability_bootstrap_rejects_noncontiguous_or_capability_bearing_relay_record
     sequence_fixture.relay_records = vec![wrcap1_record(1, 1)];
     let mut loader = SmokeLoader::init0();
     let mut supervisor = SmokeSupervisor::successful_init0();
+    supervisor.relay_events = &WRCAP1_READABLE_EVENTS;
     assert_eq!(
         run_init0_capability_bootstrap(
             &mut sequence_fixture,
@@ -752,6 +818,7 @@ fn capability_bootstrap_rejects_noncontiguous_or_capability_bearing_relay_record
     handle_fixture.relay_handle_count = 1;
     let mut loader = SmokeLoader::init0();
     let mut supervisor = SmokeSupervisor::successful_init0();
+    supervisor.relay_events = &WRCAP1_READABLE_EVENTS;
     assert_eq!(
         run_init0_capability_bootstrap(
             &mut handle_fixture,
@@ -762,6 +829,131 @@ fn capability_bootstrap_rejects_noncontiguous_or_capability_bearing_relay_record
         ),
         Err(BootstrapError::CapabilityRelay(
             Wrcap1RelayError::CapabilityBearing
+        ))
+    );
+    assert_eq!(supervisor.received, 0);
+
+    let mut invalid_wait_fixture = Fixture::valid();
+    invalid_wait_fixture.bootfs = bootfs(&[(INIT0_PATH, &image), (HELLO_PATH, b"hello")]);
+    let mut loader = SmokeLoader::init0();
+    let mut supervisor = SmokeSupervisor::successful_init0();
+    supervisor.relay_invalid_wait_result = true;
+    assert_eq!(
+        run_init0_capability_bootstrap(
+            &mut invalid_wait_fixture,
+            &mut loader,
+            &mut supervisor,
+            CHANNEL,
+            DwDeadline(99),
+        ),
+        Err(BootstrapError::CapabilityRelay(
+            Wrcap1RelayError::InvalidWaitResult
+        ))
+    );
+    assert_eq!(supervisor.received, 0);
+
+    let mut extra_fixture = Fixture::valid();
+    extra_fixture.bootfs = bootfs(&[(INIT0_PATH, &image), (HELLO_PATH, b"hello")]);
+    let mut extra = wrcap1_record(0, 1);
+    extra.push(b'X');
+    extra_fixture.relay_records = vec![extra];
+    let mut loader = SmokeLoader::init0();
+    let mut supervisor = SmokeSupervisor::successful_init0();
+    supervisor.relay_events = &WRCAP1_READABLE_EVENTS;
+    assert_eq!(
+        run_init0_capability_bootstrap(
+            &mut extra_fixture,
+            &mut loader,
+            &mut supervisor,
+            CHANNEL,
+            DwDeadline(99),
+        ),
+        Err(BootstrapError::ReceiveCounts(ReceiveCounts {
+            bytes: WRCAP1_RECORD_SIZE + 1,
+            handles: 0,
+        }))
+    );
+    assert_eq!(supervisor.received, 0);
+}
+
+#[cfg(feature = "i-capability-relay")]
+#[test]
+fn capability_bootstrap_waits_each_record_and_rejects_terminal_or_racing_receives() {
+    let image = executable();
+
+    let mut would_block_fixture = Fixture::valid();
+    would_block_fixture.bootfs = bootfs(&[(INIT0_PATH, &image), (HELLO_PATH, b"hello")]);
+    would_block_fixture.relay_records = vec![wrcap1_record(0, 1)];
+    would_block_fixture.relay_receive_error = Some(NativeError::Status(DW_STATUS_WOULD_BLOCK));
+    let mut loader = SmokeLoader::init0();
+    let mut supervisor = SmokeSupervisor::successful_init0();
+    supervisor.relay_events = &WRCAP1_READABLE_EVENTS;
+    assert_eq!(
+        run_init0_capability_bootstrap(
+            &mut would_block_fixture,
+            &mut loader,
+            &mut supervisor,
+            CHANNEL,
+            DwDeadline(99),
+        ),
+        Err(BootstrapError::CapabilityRelay(
+            Wrcap1RelayError::ReceiveWouldBlock
+        ))
+    );
+    assert_eq!(supervisor.received, 0);
+
+    let mut peer_closed_fixture = Fixture::valid();
+    peer_closed_fixture.bootfs = bootfs(&[(INIT0_PATH, &image), (HELLO_PATH, b"hello")]);
+    let mut loader = SmokeLoader::init0();
+    let mut supervisor = SmokeSupervisor::successful_init0();
+    supervisor.relay_events = &[DW_SIGNAL_PEER_CLOSED];
+    assert_eq!(
+        run_init0_capability_bootstrap(
+            &mut peer_closed_fixture,
+            &mut loader,
+            &mut supervisor,
+            CHANNEL,
+            DwDeadline(99),
+        ),
+        Err(BootstrapError::CapabilityRelay(
+            Wrcap1RelayError::PeerClosed
+        ))
+    );
+    assert_eq!(supervisor.received, 0);
+
+    let mut timeout_fixture = Fixture::valid();
+    timeout_fixture.bootfs = bootfs(&[(INIT0_PATH, &image), (HELLO_PATH, b"hello")]);
+    let mut loader = SmokeLoader::init0();
+    let mut supervisor = SmokeSupervisor::successful_init0();
+    supervisor.relay_wait_error = Some(NativeError::Status(DW_STATUS_TIMED_OUT));
+    assert_eq!(
+        run_init0_capability_bootstrap(
+            &mut timeout_fixture,
+            &mut loader,
+            &mut supervisor,
+            CHANNEL,
+            DwDeadline(99),
+        ),
+        Err(BootstrapError::CapabilityRelay(Wrcap1RelayError::TimedOut))
+    );
+    assert_eq!(supervisor.received, 0);
+
+    let mut partial_fixture = Fixture::valid();
+    partial_fixture.bootfs = bootfs(&[(INIT0_PATH, &image), (HELLO_PATH, b"hello")]);
+    partial_fixture.relay_records = vec![wrcap1_record(0, 1)[..16].to_vec()];
+    let mut loader = SmokeLoader::init0();
+    let mut supervisor = SmokeSupervisor::successful_init0();
+    supervisor.relay_events = &WRCAP1_READABLE_EVENTS;
+    assert_eq!(
+        run_init0_capability_bootstrap(
+            &mut partial_fixture,
+            &mut loader,
+            &mut supervisor,
+            CHANNEL,
+            DwDeadline(99),
+        ),
+        Err(BootstrapError::CapabilityRelay(
+            Wrcap1RelayError::MalformedFraming
         ))
     );
     assert_eq!(supervisor.received, 0);
