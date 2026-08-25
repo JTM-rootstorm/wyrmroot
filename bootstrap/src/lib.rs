@@ -271,7 +271,7 @@ impl BootstrapError {
             Self::MissingRequiredEntry => PREFIX | 0x0A,
             Self::RequiredEntryNotExecutable => PREFIX | 0x0B,
             #[cfg(feature = "i-capability-relay")]
-            Self::CapabilityRelay(_) => PREFIX | 0x0D,
+            Self::CapabilityRelay(error) => PREFIX | 0x0D00 | wrcap1_relay_error_code(error),
             #[cfg(feature = "primordial-test-support")]
             Self::TestSupport(_) => PREFIX | 0x0C,
             Self::Loader(LoadError::Platform {
@@ -287,6 +287,23 @@ impl BootstrapError {
             Self::Cleanup(error) => cleanup_exit_code(*error),
             Self::MissingLoadedProcess => PREFIX | 0x0301,
         }
+    }
+}
+
+#[cfg(feature = "i-capability-relay")]
+const fn wrcap1_relay_error_code(error: &Wrcap1RelayError) -> u32 {
+    match error {
+        Wrcap1RelayError::UnboundedDeadline => 1,
+        Wrcap1RelayError::TimedOut => 2,
+        Wrcap1RelayError::PeerClosed => 3,
+        Wrcap1RelayError::InvalidWaitResult => 4,
+        Wrcap1RelayError::ReceiveWouldBlock => 5,
+        Wrcap1RelayError::SendWouldBlock => 6,
+        Wrcap1RelayError::CapabilityBearing => 7,
+        Wrcap1RelayError::MalformedFraming => 8,
+        Wrcap1RelayError::UnexpectedSequence => 9,
+        Wrcap1RelayError::UnexpectedKind => 10,
+        Wrcap1RelayError::Checksum => 11,
     }
 }
 

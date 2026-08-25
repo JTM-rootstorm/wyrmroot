@@ -124,6 +124,11 @@ fn live_exit_code_identifies_bootstrap_owned_failure() {
         .exit_code(),
         0xB203_8006
     );
+    #[cfg(feature = "i-capability-relay")]
+    assert_eq!(
+        BootstrapError::CapabilityRelay(Wrcap1RelayError::UnexpectedKind).exit_code(),
+        0xB000_0D0A
+    );
 }
 
 struct Fixture {
