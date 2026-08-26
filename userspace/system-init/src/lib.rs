@@ -78,6 +78,41 @@ pub const fn fatal_application_status(_error: &InitError) -> InitApplicationStat
     InitApplicationStatus::FatalRebootRequired
 }
 
+/// Test-only application status that preserves the top-level init failure
+/// category across the selector's process-exit boundary. These values are
+/// diagnostic evidence, not part of the production application-status ABI.
+#[cfg(feature = "wyr1-test-evidence")]
+#[must_use]
+pub const fn wyr1_test_failure_application_status(error: &InitError) -> u32 {
+    let category = match error {
+        InitError::WrongManifestProfile => 0x01,
+        InitError::UnlaunchableRole => 0x02,
+        InitError::WrongActivationOrder => 0x03,
+        InitError::MissingAttemptResources => 0x04,
+        InitError::ResourcesAlreadyInstalled => 0x05,
+        InitError::ResourceIdentityMismatch => 0x06,
+        InitError::InvalidResourceHandle => 0x07,
+        InitError::Restart(_) => 0x08,
+        InitError::Bootfs(_) => 0x09,
+        InitError::MissingRetainedMaterial => 0x0a,
+        InitError::NonExecutableRole => 0x0b,
+        InitError::Manifest(_) => 0x0c,
+        InitError::ZeroBootGeneration => 0x0d,
+        InitError::ArtifactIdentityMismatch(_) => 0x0e,
+        InitError::Native(_) => 0x0f,
+        InitError::Capability(_) => 0x10,
+        InitError::Mapping(_) => 0x11,
+        InitError::Launch(_) => 0x12,
+        InitError::Loader(_) => 0x13,
+        InitError::Supervision => 0x14,
+        InitError::Cleanup => 0x15,
+        InitError::Accounting => 0x16,
+        InitError::GateConfig(_) => 0x17,
+        InitError::Evidence(_) => 0x18,
+    };
+    0xAF11_0000 | category
+}
+
 /// Boot-lifetime owner of the fixed supervisor state and primordial authority.
 /// The immutable bootfs handle is retained and remapped narrowly for each load;
 /// no borrowed mapping escapes a transition.
@@ -2055,5 +2090,22 @@ mod native_cleanup_tests {
             InitApplicationStatus::FatalRebootRequired
         );
         assert_eq!(fatal_application_status(&error) as u32, 0xAF01_0002);
+    }
+
+    #[cfg(feature = "wyr1-test-evidence")]
+    #[test]
+    fn wyr1_test_failure_status_preserves_top_level_category() {
+        assert_eq!(
+            wyr1_test_failure_application_status(&InitError::Cleanup),
+            0xAF11_0015
+        );
+        assert_eq!(
+            wyr1_test_failure_application_status(&InitError::Accounting),
+            0xAF11_0016
+        );
+        assert_eq!(
+            wyr1_test_failure_application_status(&InitError::WrongActivationOrder),
+            0xAF11_0003
+        );
     }
 }
