@@ -276,13 +276,98 @@ connection while retaining or losing ambiguous authority.
 Only clients installed with `BOOTSTRAP_METADATA` may enumerate. `SERVICE_LIST`
 is canonical service-name/protocol/version/current-generation metadata for at
 most 32 services. It contains no Process ID, handle value, supervisor role ID,
-or capability.
+or capability. `ENUMERATE` is header-only. One reply page has this fixed
+prefix:
+
+| Offset | Width | Field |
+| ---: | ---: | --- |
+| 64 | 2 | zero-based page index |
+| 66 | 2 | nonzero page count, at most 16 |
+| 68 | 2 | record count, `0..=2` |
+| 70 | 2 | total record count, `0..=32` |
+| 72 | 4 | flags, zero |
+| 76 | 4 | reserved, zero |
+| 80 | `168*n` | fixed service records |
+
+Each 168-byte record contains nonzero protocol ID at `+0`, nonzero current
+service generation at `+8`, name length at `+16`, version count at `+18`, zero
+reserved bytes at `+19..+24`, four fixed version slots at `+24..+40`, and a
+128-byte name field at `+40`. Version count is `1..=4`; unused version slots
+and unused name bytes are zero. Consequently the only page sizes are 80, 248,
+and 416 bytes. Published services sort by raw service-name bytes. Empty
+enumeration is one empty page. Every nonfinal page contains exactly two
+records. All pages use the same installed endpoint and transaction, which
+remains live until the final page send commits. A page-send failure removes
+the client endpoint. Registryd uses a begin/record/complete ticket so the
+single service loop cannot interleave registry mutation into a page sequence.
 
 `WATCH` identifies one canonical name/protocol and a last-observed service
 generation. If current state differs, `GENERATION_CHANGED` replies immediately.
 Otherwise the exact transaction remains registered until publication,
 retirement, replacement, peer close, or `CANCEL`. Generation `0` in the reply
 means absent/retired; no old endpoint is returned.
+
+Pending watches occupy a fixed global pool of 32 and each client may own at
+most 16. A capacity rejection completes the watch transaction into replay and
+returns `ERROR(CAPACITY)`. Publication becomes visible only after the
+`PUBLISHED` send commits; only then does registryd complete matching watches
+and emit their original transaction IDs. A failed `PUBLISHED` send removes the
+publisher while leaving absence watches pending. Retirement and publication
+peer close commit absence before notification. Once a watch is consumed, a
+notification-send failure removes that client endpoint so no live client can
+silently lose a completed watch.
+
+`CANCEL` owns a distinct transaction and may target only a pending watch on
+the same client. Success completes both target and cancel into replay before
+`CANCELLED`. An unknown, foreign, or already completed target still completes
+the cancel transaction, then returns `ERROR(UNKNOWN_TRANSACTION)`.
+
+### 7.5 Typed errors and recoverable framing
+
+The fixed 72-byte `ERROR` body carries exactly one of these `u32` codes and a
+zero reserved word:
+
+| Code | Name |
+| ---: | --- |
+| 1 | `MALFORMED_REQUEST` |
+| 2 | `CORRELATION_MISMATCH` |
+| 3 | `WRONG_ENDPOINT_KIND` |
+| 4 | `TRANSACTION_LIVE` |
+| 5 | `TRANSACTION_REPLAY` |
+| 6 | `OUTSTANDING_LIMIT` |
+| 7 | `CAPACITY` |
+| 8 | `NOT_PUBLISHED` |
+| 9 | `UNSUPPORTED_VERSION` |
+| 10 | `ENUMERATION_DENIED` |
+| 11 | `UNKNOWN_TRANSACTION` |
+| 12 | `INVALID_STATE` |
+| 13 | `FORWARD_FAILED` |
+
+Zero, unknown codes, and nonzero reserved fields are invalid. Registryd first
+decodes only the correlation boundary. A message shorter than 64 bytes, with
+wrong magic, or with transaction zero is uncorrelatable and is discarded after
+closing received handles. On an installed wait slot with a recoverable nonzero
+transaction, replies use the canonical controller-installed registry and
+endpoint identities: wrong protocol version returns `UNSUPPORTED_VERSION`, a
+supervisor-only or directionally wrong known type returns
+`WRONG_ENDPOINT_KIND`, an unknown numeric message type returns
+`MALFORMED_REQUEST`, wrong registry/endpoint correlation returns
+`CORRELATION_MISMATCH`, and bad size/flags/reserved/body/handle framing returns
+`MALFORMED_REQUEST`. Such
+transactions complete into replay. Semantic errors also complete into replay
+and do not stop the loop; failure to send their `ERROR` removes the endpoint.
+Supervisor install rejection closes the moved endpoint and continues without
+sending a supervisor `ERROR`.
+
+The receive handle array is the generated kernel maximum of 16 entries. Thus
+every dequeued WRRG-sized datagram with `0..=16` transferred handles can close
+all unexpected handles exactly once and return recoverable
+`MALFORMED_REQUEST`. The byte buffer remains the maximum valid WRRG page size,
+416 bytes. A payload of 417 bytes or more, or an impossible over-kernel handle
+condition, cannot be safely dequeued inside this fixed envelope: the receive
+failure removes the endpoint, whose finalization drains the queued bytes and
+transfer references. This over-capacity case is intentionally not a typed
+recoverable error.
 
 ## 8. Registry replay and cleanup
 
@@ -297,6 +382,30 @@ completed IDs. Duplicate-live and completed replay reject before mutation.
 A new generation receives fresh Channels and empty replay state. Old endpoint
 destruction is the replay-history lifetime boundary; WYR1-B claims no unbounded
 global replay database. Every rejected received handle closes exactly once.
+
+Service-name slots are tombstones for the registry-generation lifetime. Each
+of the 32 slots retains its last issued service generation and an optional
+active grant. Retirement or publication peer close removes the active grant
+before acknowledgement, retains the tombstone, and permits a replacement only
+with a strictly greater service generation and fresh identities. The active
+grant owns its endpoint handle, role, publication ID, protocol, versions,
+phase, live transaction, and replay state.
+
+Numeric identities never rebind within one registry generation. Registryd
+keeps fixed no-eviction ledgers for 128 endpoint IDs shared across publication
+and client kinds, 64 publication IDs, and 64 client IDs. Exhaustion returns
+`CAPACITY`; only construction of a new registry generation resets the ledgers.
+Thus P1 endpoint/publication identities remain rejected after retirement,
+peer close, and a later successful P2 replacement.
+
+The native resident loop is a thin syscall adapter over a bounded generic
+service step. When `READABLE` and `PEER_CLOSED` are observed together, it first
+receives and dispatches the committed datagram; cleanup occurs only on a fresh
+observation with no readable message. Direct forwarding moves the service
+endpoint only after exact metadata and fresh capability validation. Failed
+MOVE retains and closes it exactly once and returns `FORWARD_FAILED`; successful
+MOVE transfers ownership to the publisher before `CONNECTED`, and a later
+client-send failure never reclaims publisher-owned authority.
 
 ## 9. WRLJ version 1 protocol
 
