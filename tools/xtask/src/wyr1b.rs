@@ -206,16 +206,16 @@ pub fn build(path: &Path) -> Result<String, Failure> {
     if expected != observed {
         return Err(Failure::task("WYR1-B independent bootfs reread mismatch"));
     }
-    let receipt = receipt(
-        &request,
-        &observed,
-        &manifest,
+    let receipt = receipt(ReceiptInput {
+        request: &request,
+        bootfs: &observed,
+        manifest: &manifest,
         policy,
-        b_gate.as_bytes(),
-        &hello,
-        &publisher,
-        &client,
-    );
+        gate: b_gate.as_bytes(),
+        hello: &hello,
+        publisher: &publisher,
+        client: &client,
+    });
     fs::write(&request.receipt, receipt)
         .map_err(|error| Failure::task(format!("could not write WYR1-B receipt: {error}")))?;
     Ok(format!(
@@ -335,30 +335,32 @@ fn verify_manifest_profile(
     Ok(())
 }
 
-fn receipt(
-    request: &Request,
-    bootfs: &[u8],
-    manifest: &[u8],
-    policy: &[u8],
-    gate: &[u8],
-    hello: &[u8],
-    publisher: &[u8],
-    client: &[u8],
-) -> String {
+struct ReceiptInput<'a> {
+    request: &'a Request,
+    bootfs: &'a [u8],
+    manifest: &'a [u8],
+    policy: &'a [u8],
+    gate: &'a [u8],
+    hello: &'a [u8],
+    publisher: &'a [u8],
+    client: &'a [u8],
+}
+
+fn receipt(input: ReceiptInput<'_>) -> String {
     format!(
         "kind = \"wyrmroot-wyr1-b-build-lineage\"\nschema_version = 6\nselector = \"{}\"\ntest_id = 27\nrequest_sha256 = \"{}\"\ndeepwyrm_revision = \"{}\"\nwyrmroot_revision = \"{}\"\nrust_revision = \"{}\"\nbootfs_sha256 = \"{}\"\nrrc_manifest_sha256 = \"{}\"\nlaunch_policy_sha256 = \"{}\"\ngate_sha256 = \"{}\"\nhello_sha256 = \"{}\"\npublisher_sha256 = \"{}\"\nclient_sha256 = \"{}\"\n",
         SELECTOR,
-        request.request_sha256,
-        request.deepwyrm_revision,
-        request.wyrmroot_revision,
-        request.rust_revision,
-        sha256::bytes_digest(bootfs),
-        sha256::bytes_digest(manifest),
-        sha256::bytes_digest(policy),
-        sha256::bytes_digest(gate),
-        sha256::bytes_digest(hello),
-        sha256::bytes_digest(publisher),
-        sha256::bytes_digest(client)
+        input.request.request_sha256,
+        input.request.deepwyrm_revision,
+        input.request.wyrmroot_revision,
+        input.request.rust_revision,
+        sha256::bytes_digest(input.bootfs),
+        sha256::bytes_digest(input.manifest),
+        sha256::bytes_digest(input.policy),
+        sha256::bytes_digest(input.gate),
+        sha256::bytes_digest(input.hello),
+        sha256::bytes_digest(input.publisher),
+        sha256::bytes_digest(input.client)
     )
 }
 
