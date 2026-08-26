@@ -322,6 +322,16 @@ pub fn parse(bytes: &[u8]) -> Result<Reservation, Error> {
     parse_envelope(bytes)
 }
 
+/// Parses only the fixed correlatable envelope from a complete or partial
+/// message. Dispatchers use this before semantic body validation so a fresh
+/// transaction is replay-protected even when the body is rejected.
+pub fn parse_reservation_prefix(bytes: &[u8]) -> Result<Reservation, Error> {
+    if bytes.len() < ENVELOPE_BYTES {
+        return Err(Error::WrongSize);
+    }
+    parse_envelope(bytes)
+}
+
 pub fn parse_message(bytes: &[u8], received_handles: usize) -> Result<ParsedMessage<'_>, Error> {
     if bytes.len() < HEADER_BYTES {
         return Err(Error::WrongSize);
@@ -975,6 +985,13 @@ mod tests {
             malformed[offset] ^= 1;
             assert!(parse(&malformed).is_err());
         }
+        let mut complete = [0_u8; HEADER_BYTES];
+        complete[..ENVELOPE_BYTES].copy_from_slice(&bytes);
+        assert_eq!(parse_reservation_prefix(&complete), Ok(R));
+        assert_eq!(
+            parse_reservation_prefix(&complete[..ENVELOPE_BYTES - 1]),
+            Err(Error::WrongSize)
+        );
     }
 
     #[test]

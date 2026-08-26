@@ -192,6 +192,13 @@ pub struct LaunchTicket {
     slot: usize,
     pub job_id: u64,
     owner: ConnectionIdentity,
+    transaction_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RequestTicket {
+    owner: ConnectionIdentity,
+    transaction_id: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -322,6 +329,7 @@ pub(crate) enum ReadyObservationError<E> {
     Ready(ObservedSupervisionError<E>),
     TerminalQuery(E),
     ReadyAndExited(deepwyrm_syscall::DwTaskTerminationInfoV1),
+    NotRunning(deepwyrm_syscall::DwTaskTerminationInfoV1),
 }
 
 /// Constructs the publication proof only after parsing this child's exact
@@ -345,6 +353,9 @@ pub(crate) fn observe_prepared_ready<W: SupervisionPlatform>(
         .map_err(ReadyObservationError::TerminalQuery)?;
     if terminal.state == deepwyrm_syscall::DW_TASK_STATE_EXITED {
         return Err(ReadyObservationError::ReadyAndExited(terminal));
+    }
+    if terminal.state != deepwyrm_syscall::DW_TASK_STATE_RUNNING {
+        return Err(ReadyObservationError::NotRunning(terminal));
     }
     Ok(ExactReadyObservation {
         profile: prepared.profile,
@@ -416,8 +427,25 @@ impl JobController {
         Ok(())
     }
 
+    pub(crate) fn reserve_request(
+        &mut self,
+        request: Reservation,
+    ) -> Result<RequestTicket, JobError> {
+        Ok(RequestTicket {
+            owner: self.reserve_transaction(request)?,
+            transaction_id: request.transaction_id,
+        })
+    }
+
     pub fn begin_launch(&mut self, request: Reservation) -> Result<LaunchTicket, JobError> {
-        let owner = self.reserve_transaction(request)?;
+        let ticket = self.reserve_request(request)?;
+        self.begin_reserved_launch(ticket)
+    }
+
+    pub(crate) fn begin_reserved_launch(
+        &mut self,
+        request: RequestTicket,
+    ) -> Result<LaunchTicket, JobError> {
         let slot = self
             .jobs
             .iter()
@@ -430,7 +458,7 @@ impl JobController {
             .ok_or(JobError::ArithmeticOverflow)?;
         self.jobs[slot] = Some(Job {
             id: job_id,
-            owner,
+            owner: request.owner,
             phase: JobPhase::Reserved,
             orphaned: false,
             process: 0,
@@ -440,7 +468,8 @@ impl JobController {
         Ok(LaunchTicket {
             slot,
             job_id,
-            owner,
+            owner: request.owner,
+            transaction_id: request.transaction_id,
         })
     }
 
@@ -483,8 +512,16 @@ impl JobController {
     }
 
     pub fn query(&mut self, request: Reservation, job_id: u64) -> Result<JobSnapshot, JobError> {
-        let owner = self.reserve_transaction(request)?;
-        let job = self.owned_job(owner, job_id)?;
+        let ticket = self.reserve_request(request)?;
+        self.query_reserved(ticket, job_id)
+    }
+
+    pub(crate) fn query_reserved(
+        &self,
+        request: RequestTicket,
+        job_id: u64,
+    ) -> Result<JobSnapshot, JobError> {
+        let job = self.owned_job(request.owner, job_id)?;
         Ok(JobSnapshot {
             job_id,
             phase: job.phase,
@@ -497,8 +534,16 @@ impl JobController {
         request: Reservation,
         job_id: u64,
     ) -> Result<JobResources, JobError> {
-        let owner = self.reserve_transaction(request)?;
-        let index = self.owned_job_index(owner, job_id)?;
+        let ticket = self.reserve_request(request)?;
+        self.terminate_reserved(ticket, job_id)
+    }
+
+    pub(crate) fn terminate_reserved(
+        &mut self,
+        request: RequestTicket,
+        job_id: u64,
+    ) -> Result<JobResources, JobError> {
+        let index = self.owned_job_index(request.owner, job_id)?;
         let job = self.jobs[index].as_mut().unwrap();
         if job.phase != JobPhase::Running {
             return Err(JobError::WrongState);
@@ -543,22 +588,40 @@ impl JobController {
     }
 
     pub fn result(&mut self, request: Reservation, job_id: u64) -> Result<JobResult, JobError> {
-        let owner = self.reserve_transaction(request)?;
+        let ticket = self.reserve_request(request)?;
+        self.result_reserved(ticket, job_id)
+    }
+
+    pub(crate) fn result_reserved(
+        &self,
+        request: RequestTicket,
+        job_id: u64,
+    ) -> Result<JobResult, JobError> {
         self.completed
             .iter()
             .flatten()
-            .find(|record| record.id == job_id && record.owner == owner && record.visible)
+            .find(|record| record.id == job_id && record.owner == request.owner && record.visible)
             .map(|record| record.result)
             .ok_or(JobError::UnknownJob)
     }
 
     pub fn close_job(&mut self, request: Reservation, job_id: u64) -> Result<(), JobError> {
-        let owner = self.reserve_transaction(request)?;
+        let ticket = self.reserve_request(request)?;
+        self.close_job_reserved(ticket, job_id)
+    }
+
+    pub(crate) fn close_job_reserved(
+        &mut self,
+        request: RequestTicket,
+        job_id: u64,
+    ) -> Result<(), JobError> {
         if self
             .jobs
             .iter_mut()
             .flatten()
-            .find(|job| job.id == job_id && job.owner == owner && job.phase != JobPhase::Reserved)
+            .find(|job| {
+                job.id == job_id && job.owner == request.owner && job.phase != JobPhase::Reserved
+            })
             .is_some_and(|job| {
                 job.orphaned = true;
                 true
@@ -566,11 +629,10 @@ impl JobController {
         {
             return Ok(());
         }
-        if let Some(record) = self
-            .completed
-            .iter_mut()
-            .flatten()
-            .find(|record| record.id == job_id && record.owner == owner && record.visible)
+        if let Some(record) =
+            self.completed.iter_mut().flatten().find(|record| {
+                record.id == job_id && record.owner == request.owner && record.visible
+            })
         {
             record.visible = false;
             return Ok(());
@@ -581,10 +643,18 @@ impl JobController {
     /// Lists only active jobs visible to the exact owning session. Completion
     /// records deliberately use `result` rather than leaking into this list.
     pub fn list(&mut self, request: Reservation, out: &mut [u64]) -> Result<usize, JobError> {
-        let owner = self.reserve_transaction(request)?;
+        let ticket = self.reserve_request(request)?;
+        self.list_reserved(ticket, out)
+    }
+
+    pub(crate) fn list_reserved(
+        &self,
+        request: RequestTicket,
+        out: &mut [u64],
+    ) -> Result<usize, JobError> {
         let mut count = 0usize;
         for job in self.jobs.iter().flatten() {
-            if job.owner == owner && !job.orphaned && job.phase != JobPhase::Reserved {
+            if job.owner == request.owner && !job.orphaned && job.phase != JobPhase::Reserved {
                 let slot = out.get_mut(count).ok_or(JobError::Capacity)?;
                 *slot = job.id;
                 count += 1;
@@ -644,6 +714,56 @@ impl JobController {
             .flatten()
             .filter(|job| job.orphaned)
             .count()
+    }
+
+    pub(crate) fn loaded_job(&self, job_id: u64) -> Result<LoadedJob, JobError> {
+        let job = self
+            .jobs
+            .iter()
+            .flatten()
+            .find(|job| job.id == job_id && job.phase != JobPhase::Reserved)
+            .ok_or(JobError::UnknownJob)?;
+        Ok(LoadedJob {
+            job_id: job.id,
+            loaded: LoadedProcess {
+                process: deepwyrm_syscall::DwHandle(job.process),
+                launch_channel: deepwyrm_syscall::DwHandle(job.launch_channel),
+            },
+            task_group: job.task_group,
+        })
+    }
+
+    pub(crate) fn mark_orphan_terminating(
+        &mut self,
+        job_id: u64,
+    ) -> Result<Option<JobResources>, JobError> {
+        let job = self
+            .jobs
+            .iter_mut()
+            .flatten()
+            .find(|job| job.id == job_id && job.phase != JobPhase::Reserved)
+            .ok_or(JobError::UnknownJob)?;
+        if !job.orphaned || job.phase == JobPhase::Terminating {
+            return Ok(None);
+        }
+        job.phase = JobPhase::Terminating;
+        Ok(Some(JobResources {
+            process: job.process,
+            task_group: job.task_group,
+            launch_channel: job.launch_channel,
+        }))
+    }
+
+    pub(crate) fn live_job_id(&self, cursor: usize) -> Option<(usize, u64)> {
+        for offset in 0..MAX_LIVE_JOBS {
+            let index = (cursor + offset) % MAX_LIVE_JOBS;
+            if let Some(job) = self.jobs[index]
+                && job.phase != JobPhase::Reserved
+            {
+                return Some(((index + 1) % MAX_LIVE_JOBS, job.id));
+            }
+        }
+        None
     }
 
     fn reserve_transaction(
@@ -742,6 +862,40 @@ pub(crate) fn prepare_authorized_job<'a, L: LoaderPlatform>(
     let ticket = jobs
         .begin_launch(reservation)
         .map_err(LaunchEngineError::Job)?;
+    prepare_reserved_job(
+        jobs,
+        policy,
+        loader,
+        authority,
+        task_group,
+        reservation,
+        ticket,
+        request,
+        streams,
+    )
+}
+
+/// Continues a launch whose correlatable transaction was reserved before
+/// semantic message validation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_reserved_job<'a, L: LoaderPlatform>(
+    jobs: &mut JobController,
+    policy: &PolicyView<'a>,
+    loader: &mut L,
+    authority: LoadAuthority,
+    task_group: u64,
+    reservation: Reservation,
+    ticket: LaunchTicket,
+    request: wyrmroot_launch_proto::LaunchRequest<'a>,
+    streams: &'a [deepwyrm_syscall::DwHandle],
+) -> Result<PreparedJob, LaunchEngineError<L::Error>> {
+    if ticket.owner
+        != identity(reservation.connection_id, reservation.generation)
+            .map_err(LaunchEngineError::Job)?
+        || ticket.transaction_id != reservation.transaction_id
+    {
+        return Err(LaunchEngineError::Job(JobError::ResourceIdentity));
+    }
     let reject = |jobs: &mut JobController,
                   loader: &mut L,
                   error: JobError|
@@ -1099,9 +1253,9 @@ mod tests {
         abort_prepared_job(&mut jobs, prepared).unwrap();
     }
 
-    struct ReadyAndExited;
+    struct ReadyWithState(deepwyrm_syscall::DwTaskState);
 
-    impl SupervisionPlatform for ReadyAndExited {
+    impl SupervisionPlatform for ReadyWithState {
         type Error = ();
 
         fn wait_many(
@@ -1136,7 +1290,7 @@ mod tests {
             _process: deepwyrm_syscall::DwHandle,
         ) -> Result<deepwyrm_syscall::DwTaskTerminationInfoV1, Self::Error> {
             Ok(deepwyrm_syscall::DwTaskTerminationInfoV1 {
-                state: deepwyrm_syscall::DW_TASK_STATE_EXITED,
+                state: self.0,
                 reason: deepwyrm_syscall::DW_TERMINATION_NORMAL_EXIT,
                 ..deepwyrm_syscall::DwTaskTerminationInfoV1::default()
             })
@@ -1158,7 +1312,7 @@ mod tests {
             task_group: 32,
         };
         let observed = observe_prepared_ready(
-            &mut ReadyAndExited,
+            &mut ReadyWithState(deepwyrm_syscall::DW_TASK_STATE_EXITED),
             &prepared,
             deepwyrm_syscall::DwDeadline(100),
         );
@@ -1170,6 +1324,36 @@ mod tests {
         let mut listed = [0; MAX_LIVE_JOBS];
         assert_eq!(jobs.list(reservation(1, 1, 8), &mut listed), Ok(0));
         abort_prepared_job(&mut jobs, prepared).unwrap();
+    }
+
+    #[test]
+    fn ready_with_created_or_unknown_state_never_constructs_publication_proof() {
+        for state in [
+            deepwyrm_syscall::DW_TASK_STATE_CREATED,
+            deepwyrm_syscall::DwTaskState(u32::MAX),
+        ] {
+            let mut jobs = JobController::new();
+            jobs.open_connection(1, 1).unwrap();
+            let prepared = PreparedJob {
+                ticket: jobs.begin_launch(reservation(1, 1, 7)).unwrap(),
+                profile: LaunchProfile::JobV2,
+                transaction_id: 7,
+                loaded: LoadedProcess {
+                    process: deepwyrm_syscall::DwHandle(30),
+                    launch_channel: deepwyrm_syscall::DwHandle(31),
+                },
+                task_group: 32,
+            };
+            assert!(matches!(
+                observe_prepared_ready(
+                    &mut ReadyWithState(state),
+                    &prepared,
+                    deepwyrm_syscall::DwDeadline(100),
+                ),
+                Err(ReadyObservationError::NotRunning(info)) if info.state == state
+            ));
+            abort_prepared_job(&mut jobs, prepared).unwrap();
+        }
     }
 
     #[test]
