@@ -68,6 +68,16 @@ pub struct Request {
     receipt: PathBuf,
 }
 
+struct ProductInputs<'a> {
+    kernel: &'a [u8],
+    symbols: &'a [u8],
+    init: &'a [u8],
+    hello: &'a [u8],
+    hog: &'a [u8],
+    progress: &'a [u8],
+    provenance: &'a [u8],
+}
+
 pub fn load(path: &Path) -> Result<Request, Failure> {
     let bytes =
         fs::read(path).map_err(|e| Failure::task(format!("could not read DW1-B request: {e}")))?;
@@ -149,13 +159,15 @@ pub fn build(path: &Path) -> Result<String, Failure> {
     let progress = read(&request.progress, "progress")?;
     verify_product_inputs(
         &request,
-        &kernel,
-        &symbols,
-        &init,
-        &hello,
-        &hog,
-        &progress,
-        &provenance,
+        ProductInputs {
+            kernel: &kernel,
+            symbols: &symbols,
+            init: &init,
+            hello: &hello,
+            hog: &hog,
+            progress: &progress,
+            provenance: &provenance,
+        },
     )?;
     let bootfs = build_archive(&init, &hello, &hog, &progress)?;
     let pages = bootfs.len().div_ceil(4096);
@@ -229,13 +241,15 @@ pub fn inspect(path: &Path) -> Result<String, Failure> {
     ];
     verify_product_inputs(
         &request,
-        &kernel,
-        &symbols,
-        &artifacts[0],
-        &artifacts[1],
-        &artifacts[2],
-        &artifacts[3],
-        &provenance,
+        ProductInputs {
+            kernel: &kernel,
+            symbols: &symbols,
+            init: &artifacts[0],
+            hello: &artifacts[1],
+            hog: &artifacts[2],
+            progress: &artifacts[3],
+            provenance: &provenance,
+        },
     )?;
     verify_archive(
         &bootfs,
@@ -353,33 +367,24 @@ fn verify_archive(bootfs: &[u8], artifacts: [&[u8]; 4]) -> Result<(), Failure> {
     Ok(())
 }
 
-fn verify_product_inputs(
-    request: &Request,
-    kernel: &[u8],
-    symbols: &[u8],
-    init: &[u8],
-    hello: &[u8],
-    hog: &[u8],
-    progress: &[u8],
-    provenance: &[u8],
-) -> Result<(), Failure> {
+fn verify_product_inputs(request: &Request, inputs: ProductInputs<'_>) -> Result<(), Failure> {
     for (label, elf) in [
-        ("kernel", kernel),
-        ("symbols", symbols),
-        ("init", init),
-        ("hello", hello),
-        ("cpu hog", hog),
-        ("progress", progress),
+        ("kernel", inputs.kernel),
+        ("symbols", inputs.symbols),
+        ("init", inputs.init),
+        ("hello", inputs.hello),
+        ("cpu hog", inputs.hog),
+        ("progress", inputs.progress),
     ] {
         verify_static_elf(label, elf)?;
     }
-    if !contains_bytes(init, b"WYRMINIT0-PROFILE-V1:dw1b-preemption")
-        || !contains_bytes(hog, b"WYRMDW1B-HOG-V1:steady-spin-only")
-        || !contains_bytes(progress, b"WYRMDW1B-PROGRESS-V1:eight-rounds")
+    if !contains_bytes(inputs.init, b"WYRMINIT0-PROFILE-V1:dw1b-preemption")
+        || !contains_bytes(inputs.hog, b"WYRMDW1B-HOG-V1:steady-spin-only")
+        || !contains_bytes(inputs.progress, b"WYRMDW1B-PROGRESS-V1:eight-rounds")
     {
         return Err(Failure::task("DW1-B payload profile marker mismatch"));
     }
-    let provenance = core::str::from_utf8(provenance)
+    let provenance = core::str::from_utf8(inputs.provenance)
         .map_err(|_| Failure::task("DW1-B provenance is not UTF-8"))?;
     for expected in [
         format!("deepwyrm_revision={DEEPWYRM_CANDIDATE}"),
