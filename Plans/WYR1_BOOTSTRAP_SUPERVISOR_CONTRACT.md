@@ -240,6 +240,21 @@ identity mismatch, and dependencies outside retained material fail before child
 creation. Golden empty-edge and full five-role vectors bind builder/parser
 agreement before live use.
 
+Identity closure must join independent sources. During construction, expected
+manifest, bootfs, and retained-material identities are derived from the
+deterministic input model; observed identities are derived only after the
+serialized manifest and archive have been written and reread. Inspection joins
+receipt-bound expected identities against independently parsed output files and
+archive contents. It must not compute both sides of an equality from the same
+in-memory buffer or parsed output.
+
+The guest authenticates each role executable against the independently supplied
+manifest digest. `/system/init` and non-role dependency-edge targets remain
+required, nonempty, retained, and executable where applicable, but WYR1-A does
+not claim a content-identity comparison for material that has no independent
+guest-side comparator. A hash derived from the same archive bytes is not such a
+comparator.
+
 The manifest is build/recovery evidence, not a general configuration language.
 It cannot promote arbitrary packages into RRC-A. Each entry identifies the
 exact recovery dependency cycle or minimum degraded-control requirement it
@@ -292,7 +307,7 @@ most one authoritative active generation.
 ```text
 validate retained closure
     -> start registryd; require exact READY
-    -> start devmgr; require exact READY
+    -> on registryd READY, start devmgr immediately; require exact READY
     -> later: devmgr starts uart16550d after device authority
     -> later: consoled starts after the exact serial generation exists
     -> later: wyrmsh starts after exact console streams exist
@@ -371,6 +386,21 @@ generation with exact nonzero profiles before activating them.
 7. Publish role READY only after validation.
 8. On failure/exit, drain and classify terminal readiness safely.
 9. Reap/close controller state exactly once before restart or retention.
+
+Registryd READY, not registryd exit, satisfies the WYR1-A activation edge and
+starts devmgr immediately. A later clean registryd exit is a separately owned
+terminal/reap event and never gates dependent activation. Once both roles have
+reached READY, `/system/init` owns both live Process, TaskGroup, launch-Channel,
+mapping, and accounting records concurrently until each generation retires.
+
+The resident control loop first performs a zero-time `wait_many` probe across
+the generation's launch Channel and Process. If either signal is pending, it
+uses the positive bounded cleanup deadline to drain peer-close/Process-exit
+ordering and classify the exact terminal outcome. This prevents a peer-close
+observation from being mistaken for a timeout merely because Process `EXITED`
+becomes visible one scheduling edge later. Final acceptance evidence is emitted
+only after every active Phase-A attempt has been retired and its cleanup and
+accounting state reconciled.
 
 READY carries no ambient authority. Count, type, rights, version, role,
 generation, and transaction are checked before mutation; unexpected received
@@ -459,7 +489,15 @@ Host tests must prove:
   arithmetic;
 - duplicate/cyclic/missing/root-backed dependencies are rejected;
 - every RRC-A entry has accepted justification and retained transitive closure;
+- expected and observed manifest/bootfs/material identities come from
+  independent construction and reread/inspection sources;
+- `/system/init` and non-role edge targets remain required without claiming a
+  self-derived hash comparison;
 - exact role/generation/transaction READY and process-exists distinction;
+- registryd READY starts devmgr before registryd terminal/reap, while both role
+  resources remain resident and independently supervised;
+- zero-time peer-close/exit probes drain to bounded authoritative terminal
+  state rather than manufacturing a timeout;
 - structured exit/reap/cleanup races;
 - finite retry/backoff/window and PermanentFailure;
 - stale READY/exit/timer/cleanup cannot mutate replacement;
