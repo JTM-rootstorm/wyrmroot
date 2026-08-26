@@ -23,7 +23,7 @@ use wyrmroot_runtime::{
     BOOTSTRAP_CHANNEL_EXPECTATION, StartupBlock, close_handle, create_channel, panic_abort,
     query_capability_info, receive_channel, send_channel, validate_bootstrap_channel, wait_one,
 };
-use wyrmroot_wyr1b_gate::{Client, ClientAction};
+use wyrmroot_wyr1b_gate::{Client, ClientAction, FailureTracker};
 use wyrmroot_wyr1b_gate_proto::{
     Direction, ECHO_PROTOCOL_ID, ECHO_SERVICE_NAME, ECHO_VERSION_MAJOR, ECHO_VERSION_MINOR,
     MessageType, RECORD_BYTES, Record, encode, parse_for,
@@ -35,23 +35,19 @@ const BROAD_CHANNEL_RIGHTS: DwRights = DwRights(
 const CLIENT_ERROR_BASE: u32 = 0xB103_0000;
 
 fn client_main(startup: StartupBlock<'_>) -> u32 {
-    match run(startup) {
+    let mut failure = FailureTracker::new(startup_registry_generation(startup));
+    match run(startup, &mut failure) {
         Ok(code) => code,
         Err(code) => {
-            if let Some(registry_generation) = startup_registry_generation(startup) {
-                let _ = send_failure(
-                    startup.bootstrap_channel().as_abi(),
-                    None,
-                    registry_generation,
-                    code,
-                );
+            if let Some(record) = failure.take(code) {
+                let _ = send_failure(startup.bootstrap_channel().as_abi(), record);
             }
             code
         }
     }
 }
 
-fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
+fn run(startup: StartupBlock<'_>, failure: &mut FailureTracker) -> Result<u32, u32> {
     let parent = startup.bootstrap_channel().as_abi();
     validate_bootstrap_channel(
         query_capability_info(parent).map_err(|_| CLIENT_ERROR_BASE + 0x0001)?,
@@ -127,6 +123,9 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
         close_received(&handles, 2);
         return Err(CLIENT_ERROR_BASE + 0x000D);
     }
+    failure
+        .mark_ready()
+        .map_err(|_| CLIENT_ERROR_BASE + 0x001B)?;
     if close_handle(handles[0].handle).is_err() {
         let _ = close_handle(handles[1].handle);
         return Err(CLIENT_ERROR_BASE + 0x000E);
@@ -134,7 +133,7 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
     let authority = handles[1].handle;
 
     if profile == LaunchProfile::RegistryClient {
-        if let Err(code) = registry_cycles(parent, authority, &mut actor) {
+        if let Err(code) = registry_cycles(parent, authority, &mut actor, failure) {
             let _ = close_handle(authority);
             return Err(code);
         }
@@ -149,10 +148,11 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
             ClientAction::Launch | ClientAction::Configured => {}
             _ => return Err(CLIENT_ERROR_BASE + 0x0012),
         }
+        failure
+            .update(configure)
+            .map_err(|_| CLIENT_ERROR_BASE + 0x001C)?;
         let code = CLIENT_ERROR_BASE + 0x001A;
-        let _ = send_failure(parent, Some(configure), configure.registry_generation, code);
         let _ = close_handle(authority);
-        let _ = close_handle(parent);
         return Err(code);
     }
     close_handle(authority).map_err(|_| CLIENT_ERROR_BASE + 0x0016)?;
@@ -160,7 +160,12 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
     Ok(0)
 }
 
-fn registry_cycles(parent: DwHandle, registry: DwHandle, actor: &mut Client) -> Result<(), u32> {
+fn registry_cycles(
+    parent: DwHandle,
+    registry: DwHandle,
+    actor: &mut Client,
+    failure: &mut FailureTracker,
+) -> Result<(), u32> {
     for operation in 1..=2 {
         let configure = receive_record(parent, Direction::InitToChild, CLIENT_ERROR_BASE + 0x0020)?;
         if configure.operation_id != operation
@@ -171,11 +176,14 @@ fn registry_cycles(parent: DwHandle, registry: DwHandle, actor: &mut Client) -> 
         {
             return Err(CLIENT_ERROR_BASE + 0x0022);
         }
+        failure
+            .update(configure)
+            .map_err(|_| CLIENT_ERROR_BASE + 0x0038)?;
         let (direct, service) = match create_channel(BROAD_CHANNEL_RIGHTS) {
             Ok(pair) => pair,
             Err(_) => {
                 let code = CLIENT_ERROR_BASE + 0x0023;
-                return Err(report_and_close(parent, configure, code));
+                return Err(code);
             }
         };
         let header = match actor.registry_header(RegistryType::LookupConnect) {
@@ -184,7 +192,7 @@ fn registry_cycles(parent: DwHandle, registry: DwHandle, actor: &mut Client) -> 
                 let _ = close_handle(service);
                 let _ = close_handle(direct);
                 let code = CLIENT_ERROR_BASE + 0x0024;
-                return Err(report_and_close(parent, configure, code));
+                return Err(code);
             }
         };
         let lookup = Lookup {
@@ -202,7 +210,7 @@ fn registry_cycles(parent: DwHandle, registry: DwHandle, actor: &mut Client) -> 
                 let _ = close_handle(service);
                 let _ = close_handle(direct);
                 let code = CLIENT_ERROR_BASE + 0x0025;
-                return Err(report_and_close(parent, configure, code));
+                return Err(code);
             }
         };
         let transfer = DwHandleTransferV1 {
@@ -220,7 +228,7 @@ fn registry_cycles(parent: DwHandle, registry: DwHandle, actor: &mut Client) -> 
             } else {
                 CLIENT_ERROR_BASE + 0x0026
             };
-            return Err(report_and_close(parent, configure, code));
+            return Err(code);
         }
 
         let cycle = (|| {
@@ -257,8 +265,6 @@ fn registry_cycles(parent: DwHandle, registry: DwHandle, actor: &mut Client) -> 
         })();
         let close = close_handle(direct);
         if let Err(code) = cycle {
-            let _ = send_failure(parent, Some(configure), configure.registry_generation, code);
-            let _ = close_handle(parent);
             return Err(code);
         }
         close.map_err(|_| CLIENT_ERROR_BASE + 0x0031)?;
@@ -266,17 +272,13 @@ fn registry_cycles(parent: DwHandle, registry: DwHandle, actor: &mut Client) -> 
             let done =
                 match receive_record(parent, Direction::InitToChild, CLIENT_ERROR_BASE + 0x0032) {
                     Ok(done) => done,
-                    Err(code) => return Err(report_and_close(parent, configure, code)),
+                    Err(code) => return Err(code),
                 };
             if done.message_type != MessageType::Done
                 || actor.done(done).map_err(|_| CLIENT_ERROR_BASE + 0x0033)
                     != Ok(ClientAction::Done)
             {
-                return Err(report_and_close(
-                    parent,
-                    configure,
-                    CLIENT_ERROR_BASE + 0x0034,
-                ));
+                return Err(CLIENT_ERROR_BASE + 0x0034);
             }
             return Ok(());
         }
@@ -345,50 +347,10 @@ fn startup_registry_generation(startup: StartupBlock<'_>) -> Option<u64> {
     )
 }
 
-fn send_failure(
-    parent: DwHandle,
-    configured: Option<Record>,
-    registry_generation: u64,
-    code: u32,
-) -> Result<(), ()> {
-    let value = match u64::from(code & 0xFFFF) {
-        0 => 1,
-        value => value,
-    };
-    let record = configured.map_or(
-        Record {
-            message_type: MessageType::Failure,
-            nonce: 1,
-            registry_generation,
-            actor_id: 0,
-            actor_generation: 0,
-            object_id: 0,
-            object_generation: 0,
-            operation_id: 1,
-            value,
-        },
-        |config| Record {
-            message_type: MessageType::Failure,
-            object_id: 0,
-            object_generation: 0,
-            value,
-            ..config
-        },
-    );
+fn send_failure(parent: DwHandle, record: Record) -> Result<(), ()> {
     let mut bytes = [0; RECORD_BYTES];
     encode(record, &mut bytes).map_err(|_| ())?;
     send_channel(parent, &bytes, &[]).map_err(|_| ())
-}
-
-fn report_and_close(parent: DwHandle, configured: Record, code: u32) -> u32 {
-    let _ = send_failure(
-        parent,
-        Some(configured),
-        configured.registry_generation,
-        code,
-    );
-    let _ = close_handle(parent);
-    code
 }
 
 wyrmroot_runtime::native_entry!(crate::client_main);

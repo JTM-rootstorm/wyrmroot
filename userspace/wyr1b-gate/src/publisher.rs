@@ -22,7 +22,7 @@ use wyrmroot_runtime::{
     BOOTSTRAP_CHANNEL_EXPECTATION, StartupBlock, close_handle, panic_abort, query_capability_info,
     receive_channel, send_channel, validate_bootstrap_channel, wait_one,
 };
-use wyrmroot_wyr1b_gate::{Publisher, PublisherAction};
+use wyrmroot_wyr1b_gate::{FailureTracker, Publisher, PublisherAction};
 use wyrmroot_wyr1b_gate_proto::{
     Direction, ECHO_PROTOCOL_ID, ECHO_SERVICE_NAME, ECHO_VERSION_MAJOR, ECHO_VERSION_MINOR,
     MessageType, RECORD_BYTES, Record, encode, parse_for,
@@ -31,23 +31,19 @@ use wyrmroot_wyr1b_gate_proto::{
 const PUB_ERROR_BASE: u32 = 0xB102_0000;
 
 fn publisher_main(startup: StartupBlock<'_>) -> u32 {
-    match run(startup) {
+    let mut failure = FailureTracker::new(startup_registry_generation(startup));
+    match run(startup, &mut failure) {
         Ok(code) => code,
         Err(code) => {
-            if let Some(registry_generation) = startup_registry_generation(startup) {
-                let _ = send_failure(
-                    startup.bootstrap_channel().as_abi(),
-                    None,
-                    registry_generation,
-                    code,
-                );
+            if let Some(record) = failure.take(code) {
+                let _ = send_failure(startup.bootstrap_channel().as_abi(), record);
             }
             code
         }
     }
 }
 
-fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
+fn run(startup: StartupBlock<'_>, failure: &mut FailureTracker) -> Result<u32, u32> {
     if startup.envc() != 3 {
         return Err(PUB_ERROR_BASE + 0x0001);
     }
@@ -58,7 +54,7 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
     ];
     let mut actor =
         Publisher::from_environment(&environment).map_err(|_| PUB_ERROR_BASE + 0x0003)?;
-    let (parent, publication) = ready(startup, LaunchProfile::BootstrapService)?;
+    let (parent, publication) = ready(startup, LaunchProfile::BootstrapService, failure)?;
 
     let configure = receive_record(parent, Direction::InitToChild, PUB_ERROR_BASE + 0x0010)?;
     if actor
@@ -68,6 +64,9 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
     {
         return Err(PUB_ERROR_BASE + 0x0012);
     }
+    failure
+        .update(configure)
+        .map_err(|_| PUB_ERROR_BASE + 0x0013)?;
     let outcome = (|| {
         request_empty(
             &actor,
@@ -174,6 +173,7 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
         else {
             return Err(PUB_ERROR_BASE + 0x0055);
         };
+        failure.update(stale).map_err(|_| PUB_ERROR_BASE + 0x005D)?;
         if stale.message_type != MessageType::StaleRejected {
             return Err(PUB_ERROR_BASE + 0x0056);
         }
@@ -186,15 +186,17 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
         close_handle(parent).map_err(|_| PUB_ERROR_BASE + 0x005C)?;
         Ok(0)
     })();
-    if let Err(code) = outcome {
-        let _ = send_failure(parent, Some(configure), configure.registry_generation, code);
+    if outcome.is_err() {
         let _ = close_handle(publication);
-        let _ = close_handle(parent);
     }
     outcome
 }
 
-fn ready(startup: StartupBlock<'_>, profile: LaunchProfile) -> Result<(DwHandle, DwHandle), u32> {
+fn ready(
+    startup: StartupBlock<'_>,
+    profile: LaunchProfile,
+    failure: &mut FailureTracker,
+) -> Result<(DwHandle, DwHandle), u32> {
     let parent = startup.bootstrap_channel().as_abi();
     validate_bootstrap_channel(
         query_capability_info(parent).map_err(|_| PUB_ERROR_BASE + 0x0060)?,
@@ -235,6 +237,7 @@ fn ready(startup: StartupBlock<'_>, profile: LaunchProfile) -> Result<(DwHandle,
         close_received(&handles, 2);
         return Err(PUB_ERROR_BASE + 0x0067);
     }
+    failure.mark_ready().map_err(|_| PUB_ERROR_BASE + 0x006B)?;
     if close_handle(handles[0].handle).is_err() {
         let _ = close_handle(handles[1].handle);
         return Err(PUB_ERROR_BASE + 0x0068);
@@ -338,36 +341,7 @@ fn startup_registry_generation(startup: StartupBlock<'_>) -> Option<u64> {
     )
 }
 
-fn send_failure(
-    parent: DwHandle,
-    configured: Option<Record>,
-    registry_generation: u64,
-    code: u32,
-) -> Result<(), ()> {
-    let value = match u64::from(code & 0xFFFF) {
-        0 => 1,
-        value => value,
-    };
-    let record = configured.map_or(
-        Record {
-            message_type: MessageType::Failure,
-            nonce: 1,
-            registry_generation,
-            actor_id: 0,
-            actor_generation: 0,
-            object_id: 0,
-            object_generation: 0,
-            operation_id: 1,
-            value,
-        },
-        |config| Record {
-            message_type: MessageType::Failure,
-            object_id: 0,
-            object_generation: 0,
-            value,
-            ..config
-        },
-    );
+fn send_failure(parent: DwHandle, record: Record) -> Result<(), ()> {
     let mut bytes = [0; RECORD_BYTES];
     encode(record, &mut bytes).map_err(|_| ())?;
     send_channel(parent, &bytes, &[]).map_err(|_| ())

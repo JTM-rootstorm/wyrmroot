@@ -24,6 +24,94 @@ pub enum Error {
     NonzeroJobResult,
 }
 
+/// Tracks the one state-aware WRTG failure diagnostic a native peer may attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FailureTracker {
+    startup_registry_generation: Option<u64>,
+    ready: bool,
+    current: Option<Record>,
+    attempted: bool,
+}
+
+impl FailureTracker {
+    pub const fn new(startup_registry_generation: Option<u64>) -> Self {
+        Self {
+            startup_registry_generation,
+            ready: false,
+            current: None,
+            attempted: false,
+        }
+    }
+
+    /// Records that the exact profile-bound WRLP READY send completed.
+    pub fn mark_ready(&mut self) -> Result<(), Error> {
+        if self.ready {
+            return Err(Error::WrongState);
+        }
+        self.ready = true;
+        Ok(())
+    }
+
+    /// Updates the exact actor identity and current operation after actor acceptance.
+    pub fn update(&mut self, record: Record) -> Result<(), Error> {
+        if !self.ready
+            || record.nonce == 0
+            || record.registry_generation == 0
+            || record.actor_id == 0
+            || record.actor_generation == 0
+            || !matches!(record.operation_id, 1..=5)
+        {
+            return Err(Error::WrongState);
+        }
+        if let Some(current) = self.current
+            && (record.nonce != current.nonce
+                || record.registry_generation != current.registry_generation
+                || record.actor_id != current.actor_id
+                || record.actor_generation != current.actor_generation
+                || (record.operation_id != current.operation_id
+                    && !(current.operation_id == 1 && record.operation_id == 2)))
+        {
+            return Err(Error::WrongActor);
+        }
+        self.current = Some(record);
+        Ok(())
+    }
+
+    /// Returns the sole failure record this process may attempt to send.
+    pub fn take(&mut self, code: u32) -> Option<Record> {
+        if !self.ready || self.attempted {
+            return None;
+        }
+        let (nonce, registry_generation, actor_id, actor_generation, operation_id) =
+            if let Some(current) = self.current {
+                (
+                    current.nonce,
+                    current.registry_generation,
+                    current.actor_id,
+                    current.actor_generation,
+                    current.operation_id,
+                )
+            } else {
+                (1, self.startup_registry_generation?, 0, 0, 1)
+            };
+        self.attempted = true;
+        Some(Record {
+            message_type: MessageType::Failure,
+            nonce,
+            registry_generation,
+            actor_id,
+            actor_generation,
+            object_id: 0,
+            object_generation: 0,
+            operation_id,
+            value: match u64::from(code & 0xFFFF) {
+                0 => 1,
+                value => value,
+            },
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PublisherAction {
     Publish,
@@ -359,6 +447,9 @@ impl Client {
                 {
                     return Err(Error::WrongActor);
                 }
+                if !replacement && record.operation_id != 1 {
+                    return Err(Error::WrongOperation);
+                }
                 (
                     ClientMode::Registry,
                     ClientPhase::RegistryConfigured,
@@ -649,6 +740,62 @@ mod tests {
     }
 
     #[test]
+    fn failure_tracker_requires_ready_and_preserves_current_exact_context_once() {
+        let first = record(MessageType::ConfigureRegistryClient, (21, 31), (61, 71), 1);
+        let second = record(MessageType::ConfigureRegistryClient, (21, 31), (62, 72), 2);
+
+        let mut before_ready = FailureTracker::new(Some(11));
+        assert_eq!(before_ready.take(9), None);
+        before_ready.mark_ready().unwrap();
+        let preconfigure = before_ready.take(0x1_0000).unwrap();
+        assert_eq!((preconfigure.actor_id, preconfigure.operation_id), (0, 1));
+        assert_eq!(preconfigure.value, 1);
+        assert_eq!(before_ready.take(2), None);
+
+        let mut configured = FailureTracker::new(Some(11));
+        configured.mark_ready().unwrap();
+        configured.update(first).unwrap();
+        let op1 = configured.take(0x1234).unwrap();
+        assert_eq!(
+            (
+                op1.actor_id,
+                op1.actor_generation,
+                op1.operation_id,
+                op1.value
+            ),
+            (21, 31, 1, 0x1234)
+        );
+        assert_eq!(configured.take(3), None);
+
+        let mut replacement = FailureTracker::new(Some(11));
+        replacement.mark_ready().unwrap();
+        replacement.update(first).unwrap();
+        // While op2 is only awaited or rejected, op1 remains current.
+        assert_eq!(replacement.current.unwrap().operation_id, 1);
+        replacement.update(second).unwrap();
+        let op2 = replacement.take(7).unwrap();
+        assert_eq!(
+            (op2.actor_id, op2.actor_generation, op2.operation_id),
+            (21, 31, 2)
+        );
+
+        let mut stale = FailureTracker::new(Some(11));
+        stale.mark_ready().unwrap();
+        stale
+            .update(record(
+                MessageType::ConfigurePublisher,
+                (21, 31),
+                (41, 51),
+                1,
+            ))
+            .unwrap();
+        stale
+            .update(record(MessageType::StaleRejected, (21, 31), (22, 32), 2))
+            .unwrap();
+        assert_eq!(stale.take(8).unwrap().operation_id, 2);
+    }
+
+    #[test]
     fn publisher_publish_echo_retire_and_peer_close_stale_sequence_is_exact() {
         let mut publisher = Publisher::from_environment(&ENV).unwrap();
         let configure = wire(
@@ -761,6 +908,11 @@ mod tests {
     #[test]
     fn registry_client_connect_exchange_and_replacement_are_exact() {
         let mut client = Client::registry_from_environment(&ENV).unwrap();
+        let initial_op2 = wire(
+            record(MessageType::ConfigureRegistryClient, (21, 31), (61, 71), 2),
+            Direction::InitToChild,
+        );
+        assert_eq!(client.configure(initial_op2), Err(Error::WrongOperation));
         let first = wire(
             record(MessageType::ConfigureRegistryClient, (21, 31), (61, 71), 1),
             Direction::InitToChild,

@@ -13,6 +13,8 @@ fn publisher_revalidates_authority_and_offer_capabilities() {
     assert!(source.contains("let mut reply = [0u8; 72]"));
     assert!(source.contains("Message::Error { .. }"));
     assert!(source.contains("send_failure"));
+    assert!(source.contains("FailureTracker"));
+    assert!(source.contains("mark_ready"));
 }
 
 #[test]
@@ -27,4 +29,6 @@ fn client_moves_broad_endpoint_and_has_failure_atomic_cleanup() {
     assert!(source.contains("validate_fresh(handles[0]"));
     assert!(source.contains("validate_fresh(handles[1]"));
     assert!(source.contains("send_failure"));
+    assert!(source.contains("FailureTracker"));
+    assert!(source.contains("mark_ready"));
 }
