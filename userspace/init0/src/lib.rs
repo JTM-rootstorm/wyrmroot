@@ -12,6 +12,8 @@
 extern crate std;
 
 #[cfg(feature = "dw1b-preemption-integration")]
+use deepwyrm_syscall::DW_SIGNAL_EXITED;
+#[cfg(feature = "dw1b-preemption-integration")]
 use deepwyrm_syscall::{
     DW_OBJECT_TYPE_CHANNEL, DW_RIGHT_DUPLICATE, DW_RIGHT_INSPECT, DW_RIGHT_READ, DW_RIGHT_TRANSFER,
     DW_RIGHT_WAIT, DW_RIGHT_WRITE,
@@ -20,9 +22,7 @@ use deepwyrm_syscall::{
     feature = "i-capability-integration",
     feature = "dw1b-preemption-integration"
 ))]
-use deepwyrm_syscall::{
-    DW_SIGNAL_EXITED, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DwSignals, DwWaitItemV1,
-};
+use deepwyrm_syscall::{DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DwSignals, DwWaitItemV1};
 #[cfg(feature = "i-capability-integration")]
 use deepwyrm_syscall::{DW_SIGNAL_WRITABLE, DW_STATUS_WOULD_BLOCK};
 use deepwyrm_syscall::{
@@ -721,11 +721,7 @@ fn run_dw1b_preemption<
     })();
 
     let cleanup = cleanup_dw1b_peers(system, loader, supervisor, peers, progress_reaped, deadline);
-    match (operation, cleanup) {
-        (_, Err(cleanup)) => Err(cleanup),
-        (Err(operation), Ok(())) => Err(operation),
-        (Ok(()), Ok(())) => Ok(()),
-    }
+    finish_dw1b_operation(operation, cleanup)
 }
 
 #[cfg(feature = "dw1b-preemption-integration")]
@@ -1066,6 +1062,27 @@ fn record_cleanup(first: &mut Option<Init0Error>, result: Result<(), Init0Error>
         && first.is_none()
     {
         *first = Some(error);
+    }
+}
+
+#[cfg(feature = "dw1b-preemption-integration")]
+fn finish_dw1b_operation(
+    operation: Result<(), Init0Error>,
+    cleanup: Result<(), Init0Error>,
+) -> Result<(), Init0Error> {
+    let mut first_cleanup = None;
+    let primary = match operation {
+        Err(error @ Init0Error::Cleanup(_)) => {
+            record_cleanup(&mut first_cleanup, Err(error));
+            None
+        }
+        Err(error) => Some(error),
+        Ok(()) => None,
+    };
+    record_cleanup(&mut first_cleanup, cleanup);
+    match (first_cleanup, primary) {
+        (Some(error), _) | (None, Some(error)) => Err(error),
+        (None, None) => Ok(()),
     }
 }
 

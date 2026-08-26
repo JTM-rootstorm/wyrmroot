@@ -763,6 +763,38 @@ fn cleanup_aggregates_progress_failure_and_still_reaps_hog() {
     assert!(!events.contains(&Event::InitReady));
 }
 
+#[test]
+fn normal_progress_close_failure_precedes_later_hog_cleanup_failure() {
+    let shared = Rc::new(RefCell::new(Shared::default()));
+    let mut system = System::new(shared.clone());
+    system.fail_close = Some(CleanupTarget::ProgressData);
+    let mut loader = Loader::new(shared.clone());
+    loader.fail_terminate = Some(Peer::Hog);
+    let mut supervisor = Supervisor {
+        shared: shared.clone(),
+        fail_wait: None,
+        fail_query: None,
+    };
+
+    assert_eq!(
+        run_init0(
+            &mut system,
+            &mut loader,
+            &mut supervisor,
+            BOOTSTRAP,
+            DEADLINE,
+        ),
+        Err(Init0Error::Cleanup(CLOSE_FAILURE))
+    );
+    let shared = shared.borrow();
+    assert_eq!(shared.reply_round, 8);
+    assert!(shared.events.contains(&Event::Terminate(Peer::Hog)));
+    assert!(shared.events.contains(&Event::ExitWait(Peer::Hog)));
+    assert!(shared.events.contains(&Event::Query(Peer::Hog)));
+    assert!(!shared.events.contains(&Event::Init(Peer::Hello)));
+    assert!(!shared.events.contains(&Event::InitReady));
+}
+
 #[derive(Clone, Copy)]
 enum CleanupFault {
     Terminate(Peer),
