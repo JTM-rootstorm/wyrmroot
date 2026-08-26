@@ -31,23 +31,6 @@ const CONTROLLER_CHANNEL_RIGHTS: DwRights = DwRights(
     DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_WAIT.0 | DW_RIGHT_INSPECT.0 | DW_RIGHT_TRANSFER.0,
 );
 
-fn loader_caller_retains_service_channel(error: &LoadError<NativeError>) -> bool {
-    match error {
-        LoadError::Elf(_) | LoadError::Startup(_) | LoadError::Launch(_) => true,
-        LoadError::Platform { stage, .. } => matches!(
-            stage,
-            LoadStage::ChannelCreate
-                | LoadStage::ChannelReduce
-                | LoadStage::ProcessCreate
-                | LoadStage::MemoryCreate
-                | LoadStage::ParentMaterialize
-                | LoadStage::ParentUnmap
-                | LoadStage::ChildMap
-                | LoadStage::ThreadCreate
-        ),
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct InstalledPeer {
     pub grant: EndpointGrant,
@@ -102,9 +85,22 @@ const fn peer_launch_error(stage: PeerLaunchStage, error: InitError) -> PeerLaun
     }
 }
 
+fn retry_preinstall_once<T>(
+    mut attempt: impl FnMut() -> Result<T, PeerLaunchError>,
+) -> Result<T, PeerLaunchError> {
+    match attempt() {
+        Err(PeerLaunchError::PreInstall(InitError::Cleanup)) => {
+            Err(PeerLaunchError::PreInstall(InitError::Cleanup))
+        }
+        Err(PeerLaunchError::PreInstall(_)) => attempt(),
+        result => result,
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum GateRunError {
     PreInstall(InitError),
+    CleanupFailed(InitError),
     InstallCommitted {
         error: InitError,
         cleanup_failed: bool,
@@ -121,12 +117,10 @@ fn classify_gate_run_error(
             error,
             cleanup_failed,
         }
+    } else if cleanup_failed {
+        GateRunError::CleanupFailed(InitError::Cleanup)
     } else {
-        GateRunError::PreInstall(if cleanup_failed {
-            InitError::Cleanup
-        } else {
-            error
-        })
+        GateRunError::PreInstall(error)
     }
 }
 
@@ -325,6 +319,17 @@ where
                     gate,
                 });
             }
+            Err(GateRunError::CleanupFailed(_)) => {
+                let _ = poison_registry_generation(system, waits, &mut controller, registry, true)?;
+                return Ok(Activation {
+                    controller,
+                    result: RecoveryResult::Degraded,
+                    active: [None, devmgr],
+                    registry_control: DwHandle(0),
+                    topology: Some(topology),
+                    gate,
+                });
+            }
             Err(GateRunError::InstallCommitted {
                 error: _,
                 cleanup_failed,
@@ -363,10 +368,13 @@ where
                         gate,
                     });
                 };
-                topology
-                    .restart(replacement.active.generation)
-                    .map_err(InitError::Wyr1BModel)?;
-                registry = replacement;
+                registry = restart_topology_or_poison(
+                    system,
+                    waits,
+                    &mut controller,
+                    &mut topology,
+                    replacement,
+                )?;
             }
         }
     }
@@ -644,8 +652,8 @@ where
         },
     ) {
         Ok(loaded) => loaded,
-        Err(error) => {
-            if !loader_caller_retains_service_channel(&error) {
+        Err(failure) => {
+            if failure.service_channel_consumed {
                 channels.commit_second_move()?;
             }
             let control_failed = !channels.cleanup(system);
@@ -654,7 +662,7 @@ where
             return Err(if control_failed || group_failed || release_failed {
                 InitError::Cleanup
             } else {
-                InitError::Loader(error)
+                InitError::Loader(failure.error)
             });
         }
     };
@@ -791,7 +799,7 @@ where
                 generation,
                 transaction_id,
                 ready_at,
-                AttemptFailure::Cancelled,
+                AttemptFailure::WaitFailed,
                 InitError::MissingAttemptResources,
             ));
         }
@@ -807,7 +815,7 @@ where
             generation,
             transaction_id,
             ready_at,
-            AttemptFailure::Cancelled,
+            AttemptFailure::WaitFailed,
             InitError::ResourceIdentityMismatch,
         ));
     }
@@ -825,7 +833,7 @@ where
                 generation,
                 transaction_id,
                 ready_at,
-                AttemptFailure::Cancelled,
+                AttemptFailure::WaitFailed,
                 error,
             ));
         }
@@ -994,14 +1002,19 @@ where
     S: InitPlatform,
     W: SupervisionPlatform<Error = NativeError>,
 {
-    let now = system.now().map_err(InitError::Native)?;
-    controller.fail(
-        RoleId::Registryd,
-        registry.active.generation,
-        registry.active.transaction_id,
-        now,
-        AttemptFailure::Cancelled,
-    )?;
+    let observed_now = system.now().map_err(InitError::Native);
+    let transition = match observed_now {
+        Ok(now) => controller
+            .fail(
+                RoleId::Registryd,
+                registry.active.generation,
+                registry.active.transaction_id,
+                now,
+                AttemptFailure::WaitFailed,
+            )
+            .map(|()| now),
+        Err(error) => Err(error),
+    };
     let native_cleanup_failed = cleanup_loaded(
         system,
         waits,
@@ -1012,23 +1025,72 @@ where
     .is_err()
         | system.close_handle(registry.control_channel).is_err()
         | dependent_cleanup_failed;
-    let retired_at = now.checked_add(1).ok_or(InitError::Accounting)?;
-    if native_cleanup_failed {
-        controller.cleanup_failed(
-            RoleId::Registryd,
-            registry.active.generation,
-            registry.active.transaction_id,
-            retired_at,
-        )?;
-        return Ok(true);
+
+    let now = match transition {
+        Ok(now) => now,
+        Err(error) => {
+            let retirement_failed = controller
+                .retire_attempt_after_fatal(RoleId::Registryd)
+                .is_err();
+            return Err(if native_cleanup_failed || retirement_failed {
+                InitError::Cleanup
+            } else {
+                error
+            });
+        }
+    };
+    let retired_at = now.checked_add(1).unwrap_or(now);
+    let cleanup_must_fail = native_cleanup_failed || retired_at == now;
+    if cleanup_must_fail {
+        if controller
+            .cleanup_failed(
+                RoleId::Registryd,
+                registry.active.generation,
+                registry.active.transaction_id,
+                retired_at,
+            )
+            .is_err()
+        {
+            let _ = controller.retire_attempt_after_fatal(RoleId::Registryd);
+            return Err(InitError::Cleanup);
+        }
+        return if retired_at == now && !native_cleanup_failed {
+            Err(InitError::Accounting)
+        } else {
+            Ok(true)
+        };
     }
-    controller.cleanup_complete(
+    if let Err(error) = controller.cleanup_complete(
         RoleId::Registryd,
         registry.active.generation,
         registry.active.transaction_id,
         retired_at,
-    )?;
+    ) {
+        let _ = controller.retire_attempt_after_fatal(RoleId::Registryd);
+        return Err(error);
+    }
     advance_registry_or_exhausted(system, controller, registry.active.transaction_id)
+}
+
+fn restart_topology_or_poison<S, W>(
+    system: &mut S,
+    waits: &mut W,
+    controller: &mut SystemInit,
+    topology: &mut RegistryTopology,
+    registry: RegistryNativeAttempt,
+) -> Result<RegistryNativeAttempt, InitError>
+where
+    S: InitPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    if let Err(error) = topology
+        .restart(registry.active.generation)
+        .map_err(InitError::Wyr1BModel)
+    {
+        let _ = poison_registry_generation(system, waits, controller, registry, false)?;
+        return Err(error);
+    }
+    Ok(registry)
 }
 
 fn advance_registry_or_exhausted<S: InitPlatform>(
@@ -1166,8 +1228,8 @@ where
         },
     ) {
         Ok(loaded) => loaded,
-        Err(error) => {
-            if !loader_caller_retains_service_channel(&error) {
+        Err(failure) => {
+            if failure.service_channel_consumed {
                 channels
                     .commit_second_move()
                     .map_err(PeerLaunchError::InstallCommitted)?;
@@ -1178,7 +1240,7 @@ where
                 if close_failed {
                     InitError::Cleanup
                 } else {
-                    InitError::Loader(error)
+                    InitError::Loader(failure.error)
                 },
             ));
         }
@@ -1379,9 +1441,8 @@ where
     let outcome: Result<(), InitError> = (|| {
         macro_rules! launch {
             ($slot:ident, $kind:expr) => {{
-                let mut preinstall_retried = false;
-                loop {
-                    match launch_peer(
+                match retry_preinstall_once(|| {
+                    launch_peer(
                         system,
                         loader,
                         waits,
@@ -1390,21 +1451,16 @@ where
                         registry_control,
                         topology,
                         $kind,
-                    ) {
-                        Ok(peer) => {
-                            install_committed = true;
-                            $slot = Some(peer);
-                            break;
-                        }
-                        Err(PeerLaunchError::PreInstall(_)) if !preinstall_retried => {
-                            preinstall_retried = true;
-                            continue;
-                        }
-                        Err(PeerLaunchError::PreInstall(error)) => return Err(error),
-                        Err(PeerLaunchError::InstallCommitted(error)) => {
-                            install_committed = true;
-                            return Err(error);
-                        }
+                    )
+                }) {
+                    Ok(peer) => {
+                        install_committed = true;
+                        $slot = Some(peer);
+                    }
+                    Err(PeerLaunchError::PreInstall(error)) => return Err(error),
+                    Err(PeerLaunchError::InstallCommitted(error)) => {
+                        install_committed = true;
+                        return Err(error);
                     }
                 }
             }};
@@ -1531,13 +1587,7 @@ where
         else {
             return Ok(None);
         };
-        if let Err(error) = topology
-            .restart(registry.active.generation)
-            .map_err(InitError::Wyr1BModel)
-        {
-            let _ = poison_registry_generation(system, waits, controller, registry, false)?;
-            return Err(error);
-        }
+        let registry = restart_topology_or_poison(system, waits, controller, topology, registry)?;
         match run_registry_gate(
             system,
             loader,
@@ -1550,6 +1600,10 @@ where
         ) {
             Ok(()) => return Ok(Some((registry, true))),
             Err(GateRunError::PreInstall(_)) => return Ok(Some((registry, false))),
+            Err(GateRunError::CleanupFailed(_)) => {
+                let _ = poison_registry_generation(system, waits, controller, registry, true)?;
+                return Ok(None);
+            }
             Err(GateRunError::InstallCommitted {
                 error: _,
                 cleanup_failed,
@@ -1786,8 +1840,12 @@ mod tests {
         queried: [DwHandle; 4],
         query_count: usize,
         created_rights: DwRights,
-        closed: [DwHandle; 4],
+        closed: [DwHandle; 8],
         close_count: usize,
+        fail_close: Option<DwHandle>,
+        now: Option<u64>,
+        terminate_count: usize,
+        allow_wait: bool,
     }
 
     impl MockPlatform {
@@ -1800,8 +1858,12 @@ mod tests {
                 queried: [DwHandle(0); 4],
                 query_count: 0,
                 created_rights: DwRights(0),
-                closed: [DwHandle(0); 4],
+                closed: [DwHandle(0); 8],
                 close_count: 0,
+                fail_close: None,
+                now: None,
+                terminate_count: 0,
+                allow_wait: false,
             }
         }
     }
@@ -1844,7 +1906,11 @@ mod tests {
         fn close_handle(&mut self, handle: DwHandle) -> Result<(), NativeError> {
             self.closed[self.close_count] = handle;
             self.close_count += 1;
-            Ok(())
+            if self.fail_close == Some(handle) {
+                Err(FAILURE)
+            } else {
+                Ok(())
+            }
         }
         fn create_attempt_task_group(
             &mut self,
@@ -1853,13 +1919,52 @@ mod tests {
             Err(FAILURE)
         }
         fn terminate_task_group(&mut self, _task_group: DwHandle) -> Result<(), NativeError> {
-            Err(FAILURE)
+            self.terminate_count += 1;
+            Ok(())
         }
         fn now(&mut self) -> Result<u64, NativeError> {
+            self.now.ok_or(FAILURE)
+        }
+        fn wait_until(&mut self, deadline_ns: u64) -> Result<(), NativeError> {
+            if self.allow_wait {
+                self.now = Some(deadline_ns);
+                Ok(())
+            } else {
+                Err(FAILURE)
+            }
+        }
+    }
+
+    struct TerminalWaits;
+
+    impl SupervisionPlatform for TerminalWaits {
+        type Error = NativeError;
+
+        fn wait_many(
+            &mut self,
+            _items: &[DwWaitItemV1],
+            _deadline: DwDeadline,
+        ) -> Result<DwWaitResultV1, Self::Error> {
             Err(FAILURE)
         }
-        fn wait_until(&mut self, _deadline_ns: u64) -> Result<(), NativeError> {
+
+        fn receive_channel(
+            &mut self,
+            _channel: DwHandle,
+            _bytes: &mut [u8],
+            _handles: &mut [DwReceivedHandleInfoV1],
+        ) -> Result<ReceiveCounts, Self::Error> {
             Err(FAILURE)
+        }
+
+        fn query_task_termination(
+            &mut self,
+            _process: DwHandle,
+        ) -> Result<DwTaskTerminationInfoV1, Self::Error> {
+            Ok(DwTaskTerminationInfoV1 {
+                state: DW_TASK_STATE_EXITED,
+                ..DwTaskTerminationInfoV1::default()
+            })
         }
     }
 
@@ -1900,6 +2005,157 @@ mod tests {
             role_generation,
             kind,
         }
+    }
+
+    fn ready_registry() -> (SystemInit, RegistryNativeAttempt) {
+        let mut controller = SystemInit {
+            mode: SystemMode::Bootstrap,
+            roles: [
+                RoleController::new(RoleId::Registryd, [1; 32]).unwrap(),
+                RoleController::new(RoleId::Devmgr, [2; 32]).unwrap(),
+            ],
+            degraded_transitions: 0,
+            activated: [false; EARLY_ROLE_COUNT],
+            accounting: AttemptLedger::new(),
+            gate: None,
+            evidence: None,
+            registry_startup_profile: StartupProfile::BootstrapRegistry,
+        };
+        controller.become_operational().unwrap();
+        controller.begin_registry(0, 1, 0x1001).unwrap();
+        let reservation = controller
+            .reserve_attempt(RoleId::Registryd, 1, 0x1001)
+            .unwrap();
+        let loaded = LoadedProcess {
+            process: DwHandle(31),
+            launch_channel: DwHandle(32),
+        };
+        let task_group = DwHandle(30);
+        controller
+            .install_attempt(AttemptResources {
+                role: RoleId::Registryd,
+                generation: 1,
+                transaction_id: 0x1001,
+                executable_identity: [1; 32],
+                startup_profile: StartupProfile::BootstrapRegistry,
+                task_group,
+                process: loaded.process,
+                launch_channel: loaded.launch_channel,
+                mappings: 0,
+                reservation,
+            })
+            .unwrap();
+        controller
+            .child_started(RoleId::Registryd, 1, 0x1001, 1)
+            .unwrap();
+        controller.ready(RoleId::Registryd, 1, 0x1001, 2).unwrap();
+        (
+            controller,
+            RegistryNativeAttempt {
+                active: ActiveNativeRole {
+                    role: RoleId::Registryd,
+                    generation: 1,
+                    transaction_id: 0x1001,
+                    loaded,
+                    task_group,
+                },
+                control_channel: DwHandle(33),
+            },
+        )
+    }
+
+    #[test]
+    fn poison_consumes_every_native_owner_when_clock_transition_cannot_start() {
+        let (mut controller, registry) = ready_registry();
+        let mut platform = MockPlatform::new();
+        let mut waits = TerminalWaits;
+
+        assert_eq!(
+            poison_registry_generation(&mut platform, &mut waits, &mut controller, registry, false,),
+            Err(InitError::Native(FAILURE))
+        );
+        assert_eq!(platform.terminate_count, 1);
+        assert_eq!(
+            platform.closed[..platform.close_count],
+            [DwHandle(32), DwHandle(31), DwHandle(30), DwHandle(33)]
+        );
+        assert!(controller.resources(RoleId::Registryd).is_none());
+        assert_eq!(controller.mode(), SystemMode::Fatal);
+    }
+
+    #[test]
+    fn poison_cleanup_failure_is_permanent_and_blocks_replacement() {
+        let (mut controller, registry) = ready_registry();
+        let mut platform = MockPlatform::new();
+        platform.now = Some(3);
+        platform.fail_close = Some(registry.control_channel);
+        let mut waits = TerminalWaits;
+
+        assert_eq!(
+            poison_registry_generation(&mut platform, &mut waits, &mut controller, registry, true,),
+            Ok(true)
+        );
+        assert!(matches!(
+            controller.role_state(RoleId::Registryd),
+            Some(RestartState::PermanentFailure { .. })
+        ));
+        assert_eq!(controller.mode(), SystemMode::Degraded);
+        assert!(
+            controller
+                .start_replacement(RoleId::Registryd, 4, 2, 0x1002)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn poison_complete_cleanup_admits_exact_next_registry_generation() {
+        let (mut controller, registry) = ready_registry();
+        let mut platform = MockPlatform::new();
+        platform.now = Some(3);
+        platform.allow_wait = true;
+        let mut waits = TerminalWaits;
+
+        assert_eq!(
+            poison_registry_generation(&mut platform, &mut waits, &mut controller, registry, false,),
+            Ok(false)
+        );
+        assert!(matches!(
+            controller.role_state(RoleId::Registryd),
+            Some(RestartState::Starting {
+                generation: 2,
+                transaction_id: 0x1002,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejected_topology_restart_cleans_the_newly_ready_registry() {
+        let (mut controller, registry) = ready_registry();
+        let mut topology = RegistryTopology::new(2).unwrap();
+        let mut platform = MockPlatform::new();
+        platform.now = Some(3);
+        platform.allow_wait = true;
+        let mut waits = TerminalWaits;
+
+        assert_eq!(
+            restart_topology_or_poison(
+                &mut platform,
+                &mut waits,
+                &mut controller,
+                &mut topology,
+                registry,
+            ),
+            Err(InitError::Wyr1BModel(
+                crate::wyr1b::JobError::StaleGeneration
+            ))
+        );
+        assert_eq!(platform.terminate_count, 1);
+        assert_eq!(
+            platform.closed[..platform.close_count],
+            [DwHandle(32), DwHandle(31), DwHandle(30), DwHandle(33)]
+        );
+        assert!(controller.resources(RoleId::Registryd).is_none());
     }
 
     #[test]
@@ -1966,7 +2222,7 @@ mod tests {
         );
         assert_eq!(
             classify_gate_run_error(false, true, InitError::Native(FAILURE)),
-            GateRunError::PreInstall(InitError::Cleanup)
+            GateRunError::CleanupFailed(InitError::Cleanup)
         );
         assert_eq!(
             classify_gate_run_error(true, true, InitError::Native(FAILURE)),
@@ -2006,6 +2262,32 @@ mod tests {
                 PeerLaunchError::InstallCommitted(InitError::Native(FAILURE))
             ));
         }
+    }
+
+    #[test]
+    fn preinstall_retry_executes_once_but_cleanup_failure_is_sticky() {
+        let mut recoverable_calls = 0;
+        let recovered = retry_preinstall_once(|| {
+            recoverable_calls += 1;
+            if recoverable_calls == 1 {
+                Err(PeerLaunchError::PreInstall(InitError::Native(FAILURE)))
+            } else {
+                Ok(7_u8)
+            }
+        });
+        assert_eq!(recovered, Ok(7));
+        assert_eq!(recoverable_calls, 2);
+
+        let mut cleanup_calls = 0;
+        let blocked = retry_preinstall_once(|| {
+            cleanup_calls += 1;
+            Err::<u8, _>(PeerLaunchError::PreInstall(InitError::Cleanup))
+        });
+        assert_eq!(
+            blocked,
+            Err(PeerLaunchError::PreInstall(InitError::Cleanup))
+        );
+        assert_eq!(cleanup_calls, 1);
     }
 
     #[test]
@@ -2055,22 +2337,6 @@ mod tests {
             expect_gate(stale, expected),
             Err(InitError::Wyr1BGateMismatch)
         );
-    }
-
-    #[test]
-    fn loader_service_channel_ownership_changes_at_init_send() {
-        let before = LoadError::Platform {
-            stage: LoadStage::ThreadCreate,
-            cause: FAILURE,
-            rollback_failed: false,
-        };
-        let moved_boundary = LoadError::Platform {
-            stage: LoadStage::InitSend,
-            cause: FAILURE,
-            rollback_failed: false,
-        };
-        assert!(loader_caller_retains_service_channel(&before));
-        assert!(!loader_caller_retains_service_channel(&moved_boundary));
     }
 
     #[test]

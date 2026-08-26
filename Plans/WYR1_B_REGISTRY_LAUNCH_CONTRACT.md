@@ -205,6 +205,13 @@ failed native cleanup is recorded as RRC cleanup failure and reaches permanent
 failure/degraded state; init never reports `cleanup_complete` merely because a
 rollback was attempted.
 
+The loader reports service-endpoint MOVE ownership independently of its
+diagnostic load stage: before the successful WRLP INIT send the caller still
+owns and closes that endpoint, while after that send the loader has consumed
+it. A `PreInstall` rollback that itself fails cleanup is sticky fatal cleanup,
+not a recoverable pre-install attempt, and is never retried against the same
+registry generation.
+
 Registry replacement follows one ownership order. Dependents are terminated
 and reaped first, then the old registry process/task group and controller
 endpoint close, then RRC admits a replacement. A newly READY registry remains
