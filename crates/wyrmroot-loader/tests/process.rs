@@ -2,7 +2,7 @@ use deepwyrm_syscall::{DwHandle, DwHandleTransferV1, DwMemoryProtection, DwRight
 use wyrmroot_loader::{
     launch::LaunchProfile,
     process::{
-        JobLoadRequest, LoadAuthority, LoadError, LoadFault, LoadRequest, LoadStage,
+        JobLoadError, JobLoadRequest, LoadAuthority, LoadError, LoadFault, LoadRequest, LoadStage,
         LoaderPlatform, ParentMapping, ProcessCreateRequest, ProcessCreateResult, ServiceLoadError,
         ServiceLoadRequest, load_job_process, load_process, load_process_with_fault,
         load_service_process,
@@ -495,15 +495,53 @@ fn job_v2_selects_zero_or_three_stream_profile_and_retains_streams_on_failed_mov
     )
     .unwrap_err();
     assert!(matches!(
-        error,
+        error.error,
         LoadError::Platform {
             stage: LoadStage::InitSend,
             rollback_failed: false,
             ..
         }
     ));
+    assert!(!error.streams_consumed);
     for stream in streams {
         assert!(!failing.events.contains(&Event::Close(stream.0)));
+    }
+}
+
+#[test]
+fn job_load_reports_stream_ownership_after_successful_init_move() {
+    let image = executable();
+    let argv = ["bin/hello"];
+    let streams = [DwHandle(0x921), DwHandle(0x922), DwHandle(0x923)];
+    let mut platform = Mock::new(None);
+    platform.post_start_thread_close_failures = 1;
+
+    let error = load_job_process(
+        &mut platform,
+        authority(),
+        JobLoadRequest {
+            image: &image,
+            policy_path: "bin/hello",
+            argv: &argv,
+            environment: &[],
+            streams: &streams,
+            transaction_id: 0x1320,
+        },
+    )
+    .expect_err("post-INIT cleanup must report transferred stream ownership");
+
+    assert!(matches!(
+        error,
+        JobLoadError {
+            error: LoadError::Platform {
+                stage: LoadStage::SuccessCleanup,
+                ..
+            },
+            streams_consumed: true,
+        }
+    ));
+    for stream in streams {
+        assert!(!platform.events.contains(&Event::Close(stream.0)));
     }
 }
 

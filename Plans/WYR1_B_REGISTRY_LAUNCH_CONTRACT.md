@@ -580,12 +580,21 @@ turn init into a general service manager.
   init has observed the exact `JobV2`/`JobV2Streams` READY record. A process
   that is both readable with READY and exited during the bounded observation is
   classified from its exact termination record before acceptance; it is never
-  accepted merely because its Channel was readable.
+  accepted merely because its Channel was readable. The READY observation is
+  bound to the exact profile, request transaction, child Process, and launch
+  Channel; no observation can publish another prepared child.
+- A fresh correlatable LAUNCH transaction is reserved before stream or launch
+  policy validation. Semantic rejection aborts the invisible job reservation
+  and retains the transaction in replay history, so retrying the same request
+  is `TransactionReplay` and cannot allocate or publish a job.
 - The loader owns all zero or three stream endpoints uniformly. A failed send
   leaves all supplied endpoints owned by the caller for reverse-order cleanup;
   a successful MOVE transfers all of them and every later rollback path must
   not close them again.
 - Deepwyrm termination fields are copied without POSIX translation. The
+  classification wire values are exactly `1` normal exit, `2` authorized
+  termination, `3` unhandled exception, `4` resource policy, and `5` task-group
+  teardown. Unknown or zero classifications fail closed. The
   `cleanup_result` bit set is controller-owned: bit 0 task-group termination
   failed, bit 1 terminal wait timed out or failed, bit 2 launch Channel close
   failed, bit 3 process close failed, and bit 4 task-group close failed. Zero

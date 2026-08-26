@@ -5,8 +5,11 @@ use wyrmroot_bootfs::{
     launch_policy::{LAUNCH_POLICY_PATH, LaunchPolicy, PolicyError},
 };
 use wyrmroot_launch_proto::{MAX_COMPLETED_JOBS, MAX_LIVE_JOBS, Reservation};
-use wyrmroot_loader::process::{
-    JobLoadRequest, LoadAuthority, LoadError, LoadedProcess, LoaderPlatform, load_job_process,
+use wyrmroot_loader::{
+    launch::LaunchProfile,
+    process::{
+        JobLoadRequest, LoadAuthority, LoadError, LoadedProcess, LoaderPlatform, load_job_process,
+    },
 };
 use wyrmroot_registry_proto::{Correlation, CorrelationEnvironment};
 use wyrmroot_runtime::sha256;
@@ -296,27 +299,50 @@ pub struct LoadedJob {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PreparedJob {
     ticket: LaunchTicket,
+    profile: LaunchProfile,
+    transaction_id: u64,
     pub loaded: LoadedProcess,
     pub task_group: u64,
 }
 
-/// Opaque proof supplied only after the native dispatcher has consumed the
-/// exact profile/transaction READY record for this prepared child.
+/// Proof supplied only after the native dispatcher has consumed the exact
+/// profile/transaction READY record and separately excluded child exit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)] // Consumed by the serialized D/E dispatcher integration.
-pub(crate) struct ExactReadyObservation(());
+pub(crate) struct ExactReadyObservation {
+    profile: LaunchProfile,
+    transaction_id: u64,
+    process: deepwyrm_syscall::DwHandle,
+    launch_channel: deepwyrm_syscall::DwHandle,
+}
 
-#[allow(dead_code)] // Constructed only at the future native READY observation.
-pub(crate) const fn exact_ready_observation() -> ExactReadyObservation {
-    ExactReadyObservation(())
+#[allow(dead_code)] // Used by the resident native dispatcher below this checkpoint.
+pub(crate) const fn exact_ready_observation(
+    profile: LaunchProfile,
+    transaction_id: u64,
+    process: deepwyrm_syscall::DwHandle,
+    launch_channel: deepwyrm_syscall::DwHandle,
+) -> ExactReadyObservation {
+    ExactReadyObservation {
+        profile,
+        transaction_id,
+        process,
+        launch_channel,
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum LaunchEngineError<E> {
     Job(JobError),
+    Validation {
+        error: JobError,
+        abort_failed: bool,
+        cleanup_failed: bool,
+    },
     Loader {
         error: LoadError<E>,
+        streams_consumed: bool,
         abort_failed: bool,
+        cleanup_failed: bool,
     },
     Publication {
         error: JobError,
@@ -689,20 +715,39 @@ pub(crate) fn prepare_authorized_job<'a, L: LoaderPlatform>(
     request: wyrmroot_launch_proto::LaunchRequest<'a>,
     streams: &'a [deepwyrm_syscall::DwHandle],
 ) -> Result<PreparedJob, LaunchEngineError<L::Error>> {
-    if request.stream_count != streams.len() {
-        return Err(LaunchEngineError::Job(JobError::StreamPolicy));
-    }
-    let image = policy
-        .authorize(request.path, request.stream_count)
-        .map_err(LaunchEngineError::Job)?;
     let ticket = jobs
         .begin_launch(reservation)
         .map_err(LaunchEngineError::Job)?;
+    let reject = |jobs: &mut JobController,
+                  loader: &mut L,
+                  error: JobError|
+     -> LaunchEngineError<L::Error> {
+        let cleanup_failed = close_streams_reverse(streams, |stream| loader.close(stream));
+        let abort_failed = jobs.abort_launch(ticket).is_err();
+        LaunchEngineError::Validation {
+            error,
+            abort_failed,
+            cleanup_failed,
+        }
+    };
+    if request.stream_count != streams.len() {
+        return Err(reject(jobs, loader, JobError::StreamPolicy));
+    }
+    let profile = match request.stream_count {
+        0 => LaunchProfile::JobV2,
+        3 => LaunchProfile::JobV2Streams,
+        _ => return Err(reject(jobs, loader, JobError::StreamPolicy)),
+    };
+    let image = match policy.authorize(request.path, request.stream_count) {
+        Ok(image) => image,
+        Err(error) => return Err(reject(jobs, loader, error)),
+    };
     let mut argv = [""; wyrmroot_launch_proto::MAX_ARGV];
     for (index, slot) in argv.iter_mut().take(request.argc()).enumerate() {
-        *slot = request
-            .arg(index)
-            .ok_or(LaunchEngineError::Job(JobError::PolicyMissing))?;
+        let Some(argument) = request.arg(index) else {
+            return Err(reject(jobs, loader, JobError::PolicyMissing));
+        };
+        *slot = argument;
     }
     let mut environment = [""; wyrmroot_launch_proto::MAX_ENVIRONMENT];
     for (index, slot) in environment
@@ -710,9 +755,10 @@ pub(crate) fn prepare_authorized_job<'a, L: LoaderPlatform>(
         .take(request.environment_count())
         .enumerate()
     {
-        *slot = request
-            .environment(index)
-            .ok_or(LaunchEngineError::Job(JobError::PolicyMissing))?;
+        let Some(value) = request.environment(index) else {
+            return Err(reject(jobs, loader, JobError::PolicyMissing));
+        };
+        *slot = value;
     }
     let loaded = match load_job_process(
         loader,
@@ -730,19 +776,39 @@ pub(crate) fn prepare_authorized_job<'a, L: LoaderPlatform>(
         },
     ) {
         Ok(loaded) => loaded,
-        Err(error) => {
+        Err(failure) => {
+            let cleanup_failed = if failure.streams_consumed {
+                false
+            } else {
+                close_streams_reverse(streams, |stream| loader.close(stream))
+            };
             let abort_failed = jobs.abort_launch(ticket).is_err();
             return Err(LaunchEngineError::Loader {
-                error,
+                error: failure.error,
+                streams_consumed: failure.streams_consumed,
                 abort_failed,
+                cleanup_failed,
             });
         }
     };
     Ok(PreparedJob {
         ticket,
+        profile,
+        transaction_id: reservation.transaction_id,
         loaded,
         task_group,
     })
+}
+
+fn close_streams_reverse<E>(
+    streams: &[deepwyrm_syscall::DwHandle],
+    mut close: impl FnMut(deepwyrm_syscall::DwHandle) -> Result<(), E>,
+) -> bool {
+    let mut failed = false;
+    for &stream in streams.iter().rev() {
+        failed |= close(stream).is_err();
+    }
+    failed
 }
 
 /// Publishes a prepared job only after the dispatcher has observed READY.
@@ -750,8 +816,15 @@ pub(crate) fn prepare_authorized_job<'a, L: LoaderPlatform>(
 pub(crate) fn commit_prepared_job(
     jobs: &mut JobController,
     prepared: PreparedJob,
-    _ready: ExactReadyObservation,
+    ready: ExactReadyObservation,
 ) -> Result<LoadedJob, JobError> {
+    if ready.profile != prepared.profile
+        || ready.transaction_id != prepared.transaction_id
+        || ready.process != prepared.loaded.process
+        || ready.launch_channel != prepared.loaded.launch_channel
+    {
+        return Err(JobError::ResourceIdentity);
+    }
     jobs.commit_launch(
         prepared.ticket,
         prepared.loaded.process.0,
@@ -870,26 +943,123 @@ mod tests {
     }
 
     #[test]
+    fn rejected_fresh_launch_is_replay_protected_without_job_publication() {
+        let mut jobs = JobController::new();
+        jobs.open_connection(1, 1).unwrap();
+        let request = reservation(1, 1, 9);
+        let ticket = jobs.begin_launch(request).unwrap();
+        jobs.abort_launch(ticket).unwrap();
+        assert_eq!(jobs.live_jobs(), 0);
+        assert_eq!(jobs.begin_launch(request), Err(JobError::TransactionReplay));
+    }
+
+    #[test]
+    fn retained_stream_cleanup_is_reverse_ordered_exactly_once() {
+        let streams = [
+            deepwyrm_syscall::DwHandle(10),
+            deepwyrm_syscall::DwHandle(11),
+            deepwyrm_syscall::DwHandle(12),
+        ];
+        let mut closed = [deepwyrm_syscall::DwHandle(0); 3];
+        let mut count = 0;
+        let failed = close_streams_reverse(&streams, |stream| {
+            closed[count] = stream;
+            count += 1;
+            if stream.0 == 11 { Err(()) } else { Ok(()) }
+        });
+        assert!(failed);
+        assert_eq!(count, 3);
+        assert_eq!(
+            closed,
+            [
+                deepwyrm_syscall::DwHandle(12),
+                deepwyrm_syscall::DwHandle(11),
+                deepwyrm_syscall::DwHandle(10),
+            ]
+        );
+    }
+
+    #[test]
     fn prepared_job_needs_exact_ready_token_before_publication_or_abort() {
         let mut jobs = JobController::new();
         jobs.open_connection(1, 1).unwrap();
         let ticket = jobs.begin_launch(reservation(1, 1, 1)).unwrap();
         let prepared = PreparedJob {
             ticket,
+            profile: LaunchProfile::JobV2,
+            transaction_id: 1,
             loaded: LoadedProcess {
                 process: deepwyrm_syscall::DwHandle(10),
                 launch_channel: deepwyrm_syscall::DwHandle(12),
             },
             task_group: 11,
         };
-        let committed =
-            commit_prepared_job(&mut jobs, prepared, exact_ready_observation()).unwrap();
+        let committed = commit_prepared_job(
+            &mut jobs,
+            prepared,
+            exact_ready_observation(
+                LaunchProfile::JobV2,
+                1,
+                prepared.loaded.process,
+                prepared.loaded.launch_channel,
+            ),
+        )
+        .unwrap();
         assert_eq!(committed.job_id, ticket.job_id);
         let aborted = PreparedJob {
             ticket: jobs.begin_launch(reservation(1, 1, 2)).unwrap(),
             ..prepared
         };
         abort_prepared_job(&mut jobs, aborted).unwrap();
+    }
+
+    #[test]
+    fn ready_observation_is_bound_to_the_exact_prepared_child() {
+        let mut jobs = JobController::new();
+        jobs.open_connection(1, 1).unwrap();
+        let prepared = PreparedJob {
+            ticket: jobs.begin_launch(reservation(1, 1, 7)).unwrap(),
+            profile: LaunchProfile::JobV2Streams,
+            transaction_id: 7,
+            loaded: LoadedProcess {
+                process: deepwyrm_syscall::DwHandle(30),
+                launch_channel: deepwyrm_syscall::DwHandle(31),
+            },
+            task_group: 32,
+        };
+        for wrong in [
+            exact_ready_observation(
+                LaunchProfile::JobV2,
+                7,
+                prepared.loaded.process,
+                prepared.loaded.launch_channel,
+            ),
+            exact_ready_observation(
+                prepared.profile,
+                8,
+                prepared.loaded.process,
+                prepared.loaded.launch_channel,
+            ),
+            exact_ready_observation(
+                prepared.profile,
+                7,
+                deepwyrm_syscall::DwHandle(33),
+                prepared.loaded.launch_channel,
+            ),
+            exact_ready_observation(
+                prepared.profile,
+                7,
+                prepared.loaded.process,
+                deepwyrm_syscall::DwHandle(34),
+            ),
+        ] {
+            assert_eq!(
+                commit_prepared_job(&mut jobs, prepared, wrong),
+                Err(JobError::ResourceIdentity)
+            );
+        }
+        assert_eq!(jobs.live_jobs(), 1);
+        abort_prepared_job(&mut jobs, prepared).unwrap();
     }
 
     #[test]

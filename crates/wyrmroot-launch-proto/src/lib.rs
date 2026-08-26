@@ -139,6 +139,7 @@ pub enum TerminationClassification {
     NormalExit = 1,
     Authorized = 2,
     UnhandledException = 3,
+    ResourcePolicy = 4,
     TaskGroupTeardown = 5,
 }
 
@@ -148,6 +149,7 @@ impl TerminationClassification {
             1 => Self::NormalExit,
             2 => Self::Authorized,
             3 => Self::UnhandledException,
+            4 => Self::ResourcePolicy,
             5 => Self::TaskGroupTeardown,
             _ => return Err(Error::InvalidTerminationClassification),
         })
@@ -1066,6 +1068,25 @@ mod tests {
     }
 
     #[test]
+    fn resource_policy_termination_has_the_exact_deepwyrm_wire_value() {
+        let mut bytes = [0u8; 88];
+        let result = TerminationResult {
+            classification: TerminationClassification::ResourcePolicy,
+            application_code: 0,
+            exception_class: 0,
+            exception_detail: 0,
+            exception_address: 0,
+            cleanup_result: 0,
+        };
+        let size = encode_job_result(R, 17, result, &mut bytes).unwrap();
+        assert_eq!(&bytes[56..60], &4_u32.to_le_bytes());
+        assert_eq!(
+            parse_message(&bytes[..size], 0).unwrap().message,
+            Message::JobResult { job_id: 17, result }
+        );
+    }
+
+    #[test]
     fn error_and_result_enums_reject_unknown_or_unowned_values() {
         let mut bytes = [0u8; 88];
         let size = encode_error(R, ErrorCode::Capacity, &mut bytes).unwrap();
@@ -1092,7 +1113,7 @@ mod tests {
             ..result
         };
         let size = encode_job_result(R, 17, valid, &mut bytes).unwrap();
-        bytes[56..60].copy_from_slice(&4_u32.to_le_bytes());
+        bytes[56..60].copy_from_slice(&6_u32.to_le_bytes());
         assert_eq!(
             parse_message(&bytes[..size], 0),
             Err(Error::InvalidTerminationClassification)

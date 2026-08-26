@@ -157,6 +157,23 @@ pub struct ServiceLoadError<PlatformError> {
     pub service_channel_consumed: bool,
 }
 
+/// Job-launch failure with explicit ownership of the caller-supplied stream
+/// endpoints at the atomic INIT boundary.
+#[derive(Debug, Eq, PartialEq)]
+pub struct JobLoadError<PlatformError> {
+    pub error: LoadError<PlatformError>,
+    pub streams_consumed: bool,
+}
+
+impl<E> JobLoadError<E> {
+    const fn caller_retains(error: LoadError<E>) -> Self {
+        Self {
+            error,
+            streams_consumed: false,
+        }
+    }
+}
+
 impl<E> ServiceLoadError<E> {
     const fn caller_retains(error: LoadError<E>) -> Self {
         Self {
@@ -394,11 +411,15 @@ pub fn load_job_process<P: LoaderPlatform>(
     platform: &mut P,
     authority: LoadAuthority,
     request: JobLoadRequest<'_>,
-) -> Result<LoadedProcess, LoadError<P::Error>> {
+) -> Result<LoadedProcess, JobLoadError<P::Error>> {
     let profile = match request.streams.len() {
         0 => LaunchProfile::JobV2,
         3 => LaunchProfile::JobV2Streams,
-        _ => return Err(LoadError::Launch(LaunchError::HandleCount)),
+        _ => {
+            return Err(JobLoadError::caller_retains(LoadError::Launch(
+                LaunchError::HandleCount,
+            )));
+        }
     };
     let mut delegated_channels_consumed = false;
     load_process_internal(
@@ -418,6 +439,10 @@ pub fn load_job_process<P: LoaderPlatform>(
         LoadFault::None,
         &mut delegated_channels_consumed,
     )
+    .map_err(|error| JobLoadError {
+        error,
+        streams_consumed: delegated_channels_consumed,
+    })
 }
 
 /// Loads one WYR1-B registry, publisher, or client using the exact
