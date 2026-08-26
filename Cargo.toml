@@ -6,6 +6,7 @@ members = [
     "crates/wyrmroot-bootstrap-proto",
     "crates/wyrmroot-loader",
     "crates/wyrmroot-launch-proto",
+    "crates/wyrmroot-registry-proto",
     "crates/wyrmroot-rrc-manifest",
     "crates/wyrmroot-runtime",
     "loader",
