@@ -5,7 +5,8 @@
 use core::panic::PanicInfo;
 use deepwyrm_syscall::{
     DW_RIGHT_INSPECT, DW_RIGHT_MODIFY, DW_RIGHT_WAIT, DW_SIGNAL_SIGNALED, DwDeadline, DwHandle,
-    DwObjectType, DwReceivedHandleInfoV1, DwRights,
+    DwHandleTransferV1, DwObjectType, DwReceivedHandleInfoV1, DwRights, DwWaitItemV1,
+    DwWaitResultV1,
 };
 use wyrmroot_bootfs as _;
 use wyrmroot_launch_proto as _;
@@ -14,15 +15,16 @@ use wyrmroot_registry_proto as _;
 use wyrmroot_rrc_manifest as _;
 use wyrmroot_runtime::{
     CapabilityInfo, MappingPlan, NativeError, NativeLoaderPlatform, NativeSupervisionPlatform,
-    ReceiveCounts, StartupBlock, close_handle, create_task_group, create_timer,
+    ReceiveCounts, StartupBlock, close_handle, create_channel, create_task_group, create_timer,
     map_bootfs_read_only, monotonic_active_now, panic_abort, query_capability_info,
-    query_memory_object_size, receive_channel, send_channel, set_timer, unmap_bootfs, wait_one,
+    query_memory_object_size, receive_channel, send_channel, set_timer, unmap_bootfs, wait_many,
+    wait_one,
 };
 #[cfg(not(feature = "wyr1-test-evidence"))]
 use wyrmroot_system_init::fatal_application_status;
 #[cfg(feature = "wyr1-test-evidence")]
 use wyrmroot_system_init::wyr1_test_failure_application_status;
-use wyrmroot_system_init::{InitPlatform, run_system_init};
+use wyrmroot_system_init::{InitPlatform, Wyr1BPlatform, run_system_init};
 
 struct NativeSystem;
 
@@ -89,6 +91,29 @@ impl InitPlatform for NativeSystem {
             Ok(())
         })();
         result.and(close_handle(timer))
+    }
+}
+
+impl Wyr1BPlatform for NativeSystem {
+    fn channel_create(&mut self, rights: DwRights) -> Result<(DwHandle, DwHandle), NativeError> {
+        create_channel(rights)
+    }
+
+    fn send_channel_with_handles(
+        &mut self,
+        channel: DwHandle,
+        bytes: &[u8],
+        transfers: &[DwHandleTransferV1],
+    ) -> Result<(), NativeError> {
+        send_channel(channel, bytes, transfers)
+    }
+
+    fn wait_many(
+        &mut self,
+        items: &[DwWaitItemV1],
+        deadline: DwDeadline,
+    ) -> Result<DwWaitResultV1, NativeError> {
+        wait_many(items, deadline)
     }
 }
 

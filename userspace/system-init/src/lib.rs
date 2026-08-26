@@ -16,8 +16,8 @@ use crate::gate::{GATE_CONFIG_PATH, GateConfig, GateConfigError, parse_gate_conf
 use deepwyrm_syscall::{
     DW_SIGNAL_EXITED, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DW_STATUS_TIMED_OUT,
     DW_TASK_STATE_EXITED, DW_TERMINATION_AUTHORIZED, DW_TERMINATION_NORMAL_EXIT,
-    DW_TERMINATION_TASK_GROUP_TEARDOWN, DwDeadline, DwHandle, DwObjectType, DwReceivedHandleInfoV1,
-    DwRights, DwTaskTerminationInfoV1, DwWaitItemV1,
+    DW_TERMINATION_TASK_GROUP_TEARDOWN, DwDeadline, DwHandle, DwHandleTransferV1, DwObjectType,
+    DwReceivedHandleInfoV1, DwRights, DwTaskTerminationInfoV1, DwWaitItemV1, DwWaitResultV1,
 };
 use wyrmroot_bootfs::archive::{Archive, LookupError, ParseError};
 use wyrmroot_loader::{
@@ -1095,6 +1095,25 @@ pub trait InitPlatform {
     fn terminate_task_group(&mut self, task_group: DwHandle) -> Result<(), NativeError>;
     fn now(&mut self) -> Result<u64, NativeError>;
     fn wait_until(&mut self, deadline_ns: u64) -> Result<(), NativeError>;
+}
+
+/// Selector-27-only native operations used by the WYR1-B controller.
+///
+/// The permanent selector-25 path remains bounded by [`InitPlatform`], so it
+/// cannot create or transfer the additional registry service Channels.
+pub trait Wyr1BPlatform: InitPlatform {
+    fn channel_create(&mut self, rights: DwRights) -> Result<(DwHandle, DwHandle), NativeError>;
+    fn send_channel_with_handles(
+        &mut self,
+        channel: DwHandle,
+        bytes: &[u8],
+        transfers: &[DwHandleTransferV1],
+    ) -> Result<(), NativeError>;
+    fn wait_many(
+        &mut self,
+        items: &[DwWaitItemV1],
+        deadline: DwDeadline,
+    ) -> Result<DwWaitResultV1, NativeError>;
 }
 
 /// Runs the native selected-generation activation through NORMAL or DEGRADED.
