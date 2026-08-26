@@ -3,7 +3,7 @@ use wyrmroot_loader::{
     launch::LaunchProfile,
     process::{
         JobLoadRequest, LoadAuthority, LoadError, LoadFault, LoadRequest, LoadStage,
-        LoaderPlatform, ParentMapping, ProcessCreateRequest, ProcessCreateResult,
+        LoaderPlatform, ParentMapping, ProcessCreateRequest, ProcessCreateResult, ServiceLoadError,
         ServiceLoadRequest, load_job_process, load_process, load_process_with_fault,
         load_service_process,
     },
@@ -42,6 +42,8 @@ struct Mock {
     reject_late_unmap: bool,
     reject_redundant_process_terminate: bool,
     post_start_thread_close_failures: usize,
+    close_calls: usize,
+    fail_close_at: Option<usize>,
     fail_process_terminate: bool,
     materialized: Vec<Vec<u8>>,
     sent_init: Vec<u8>,
@@ -64,6 +66,8 @@ impl Mock {
             reject_late_unmap: false,
             reject_redundant_process_terminate: false,
             post_start_thread_close_failures: 0,
+            close_calls: 0,
+            fail_close_at: None,
             fail_process_terminate: false,
             materialized: Vec::new(),
             sent_init: Vec::new(),
@@ -103,6 +107,10 @@ impl LoaderPlatform for Mock {
     }
     fn close(&mut self, handle: DwHandle) -> Result<(), Self::Error> {
         self.events.push(Event::Close(handle.0));
+        self.close_calls += 1;
+        if self.fail_close_at == Some(self.close_calls) {
+            return Err("close-selected");
+        }
         if self.started_thread == Some(handle) && self.post_start_thread_close_failures != 0 {
             self.post_start_thread_close_failures -= 1;
             return Err("close-thread");
@@ -214,6 +222,99 @@ impl LoaderPlatform for Mock {
             Ok(())
         }
     }
+}
+
+#[test]
+fn owned_service_load_reports_the_exact_atomic_init_boundary() {
+    let image = executable();
+    let service_channel = DwHandle(0x912);
+    let request = || ServiceLoadRequest {
+        image: &image,
+        display_path: "/test/dw1-b/progress",
+        profile: LaunchProfile::Dw1bProgress,
+        service_channel,
+        correlation: None,
+        transaction_id: 0x1311,
+    };
+
+    let mut early_cleanup = Mock::new(None);
+    early_cleanup.fail_close_at = Some(3);
+    let early = load_service_process(&mut early_cleanup, authority(), request())
+        .expect_err("pre-INIT SuccessCleanup failure accepted");
+    assert_eq!(
+        early,
+        ServiceLoadError {
+            error: LoadError::Platform {
+                stage: LoadStage::SuccessCleanup,
+                cause: "close-selected",
+                rollback_failed: false,
+            },
+            service_channel_consumed: false,
+        }
+    );
+    assert_eq!(
+        early_cleanup
+            .events
+            .iter()
+            .filter(|event| **event == Event::Close(service_channel.0))
+            .count(),
+        0
+    );
+    early_cleanup.close(service_channel).unwrap();
+    assert_eq!(
+        early_cleanup
+            .events
+            .iter()
+            .filter(|event| **event == Event::Close(service_channel.0))
+            .count(),
+        1
+    );
+
+    let mut failed_send = Mock::new(Some("send"));
+    let send = load_service_process(&mut failed_send, authority(), request())
+        .expect_err("failed atomic INIT accepted");
+    assert_eq!(
+        send,
+        ServiceLoadError {
+            error: LoadError::Platform {
+                stage: LoadStage::InitSend,
+                cause: "send",
+                rollback_failed: false,
+            },
+            service_channel_consumed: false,
+        }
+    );
+    assert!(
+        !failed_send
+            .events
+            .contains(&Event::Close(service_channel.0))
+    );
+    failed_send.close(service_channel).unwrap();
+    assert_eq!(
+        failed_send
+            .events
+            .iter()
+            .filter(|event| **event == Event::Close(service_channel.0))
+            .count(),
+        1
+    );
+
+    let mut post_send = Mock::new(None);
+    post_send.post_start_thread_close_failures = 1;
+    let post = load_service_process(&mut post_send, authority(), request())
+        .expect_err("post-INIT SuccessCleanup failure accepted");
+    assert_eq!(
+        post,
+        ServiceLoadError {
+            error: LoadError::Platform {
+                stage: LoadStage::SuccessCleanup,
+                cause: "close-thread",
+                rollback_failed: false,
+            },
+            service_channel_consumed: true,
+        }
+    );
+    assert!(!post_send.events.contains(&Event::Close(service_channel.0)));
 }
 
 #[test]
@@ -346,9 +447,12 @@ fn bootstrap_service_uses_startup_v2_for_controller_correlation_environment() {
     );
     assert_eq!(
         missing,
-        Err(LoadError::Startup(
-            wyrmroot_loader::image::StartupBlockError::InvalidEnvironment
-        ))
+        Err(ServiceLoadError {
+            error: LoadError::Startup(
+                wyrmroot_loader::image::StartupBlockError::InvalidEnvironment
+            ),
+            service_channel_consumed: false,
+        })
     );
 }
 

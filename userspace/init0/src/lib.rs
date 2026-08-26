@@ -8,6 +8,9 @@
 //! It reports READY to its primordial parent only after `hello` acknowledges its parent Channel
 //! and exits normally with application code zero.
 
+#[cfg(test)]
+extern crate std;
+
 #[cfg(feature = "dw1b-preemption-integration")]
 use deepwyrm_syscall::{
     DW_OBJECT_TYPE_CHANNEL, DW_RIGHT_DUPLICATE, DW_RIGHT_INSPECT, DW_RIGHT_READ, DW_RIGHT_TRANSFER,
@@ -39,6 +42,8 @@ use wyrmroot_loader::{
         load_process,
     },
 };
+#[cfg(feature = "dw1b-preemption-integration")]
+use wyrmroot_runtime::await_child_ready_profile;
 use wyrmroot_runtime::{
     BOOTFS_EXPECTATION, BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, CapabilityValidationError,
     ExitObservedReadinessError, ExitValidationError, InitCapability, LOADER_TASK_GROUP_EXPECTATION,
@@ -46,8 +51,6 @@ use wyrmroot_runtime::{
     SupervisionError, SupervisionPlatform, supervise_child, validate_bootstrap_channel,
     validate_init_capabilities_v2, validate_successful_exit,
 };
-#[cfg(feature = "dw1b-preemption-integration")]
-use wyrmroot_runtime::{arm_dw1b_preemption, await_child_ready_profile};
 
 /// The only bootfs path selected by the WYR0-G descendant smoke chain.
 pub const HELLO_PATH: &[u8] = b"bin/hello";
@@ -139,6 +142,14 @@ pub trait Init0System {
 
     /// Closes one caller-local handle.
     fn close_handle(&mut self, handle: DwHandle) -> Result<(), NativeError>;
+
+    /// Submits selector 26's test-private ARM operation.
+    #[cfg(feature = "dw1b-preemption-integration")]
+    fn arm_dw1b_preemption(
+        &mut self,
+        hog_process: DwHandle,
+        progress_process: DwHandle,
+    ) -> Result<(), NativeError>;
 }
 
 /// Why the WYR0-G `init0` descendant transaction failed.
@@ -403,7 +414,7 @@ pub fn run_init0<
         #[cfg(feature = "dw1b-preemption-integration")]
         {
             run_dw1b_preemption(system, loader, supervisor, authority, plan, deadline)?;
-            return Ok(message.transaction_id);
+            Ok(message.transaction_id)
         }
         #[cfg(not(feature = "dw1b-preemption-integration"))]
         {
@@ -558,8 +569,10 @@ fn run_dw1b_preemption<
         (Ok(Ok(())), Some(hog)) => hog,
         (Ok(Err(error)), _) => return Err(error),
         (Err(error), Some(hog)) => {
-            terminate_reap_close(loader, supervisor, hog, deadline)?;
-            return Err(Init0Error::Native(error));
+            return Err(prefer_cleanup(
+                Init0Error::Native(error),
+                terminate_reap_close(loader, supervisor, hog, deadline),
+            ));
         }
         (Err(error), None) => return Err(Init0Error::Native(error)),
         (Ok(Ok(())), None) => return Err(Init0Error::MissingLoadedProcess),
@@ -572,15 +585,19 @@ fn run_dw1b_preemption<
         wyrmroot_dw1b_preemption::HOG_TRANSACTION_ID,
         deadline,
     ) {
-        terminate_reap_close(loader, supervisor, hog, deadline)?;
-        return Err(Init0Error::Supervision(error));
+        return Err(prefer_cleanup(
+            Init0Error::Supervision(error),
+            terminate_reap_close(loader, supervisor, hog, deadline),
+        ));
     }
 
     let (progress_data, progress_child) = match create_dw1b_data_pair(system, loader) {
         Ok(pair) => pair,
         Err(error) => {
-            terminate_reap_close(loader, supervisor, hog, deadline)?;
-            return Err(error);
+            return Err(prefer_cleanup(
+                error,
+                terminate_reap_close(loader, supervisor, hog, deadline),
+            ));
         }
     };
     let mut progress = None;
@@ -594,11 +611,16 @@ fn run_dw1b_preemption<
     let progress = match (mapped, progress) {
         (Ok(Ok(())), Some(progress)) => progress,
         (Ok(Err(error)), _) => {
-            system
-                .close_handle(progress_data)
-                .map_err(Init0Error::Cleanup)?;
-            terminate_reap_close(loader, supervisor, hog, deadline)?;
-            return Err(error);
+            let cleanup = cleanup_unloaded_progress(
+                system,
+                loader,
+                supervisor,
+                hog,
+                progress_data,
+                None,
+                deadline,
+            );
+            return Err(prefer_cleanup(error, cleanup));
         }
         (Err(error), Some(progress)) => {
             let peers = Dw1bPeers {
@@ -610,24 +632,30 @@ fn run_dw1b_preemption<
             return Err(Init0Error::Native(error));
         }
         (Err(error), None) => {
-            if !progress_attempted {
-                loader.close(progress_child).map_err(Init0Error::Cleanup)?;
-            }
-            system
-                .close_handle(progress_data)
-                .map_err(Init0Error::Cleanup)?;
-            terminate_reap_close(loader, supervisor, hog, deadline)?;
-            return Err(Init0Error::Native(error));
+            let child = (!progress_attempted).then_some(progress_child);
+            let cleanup = cleanup_unloaded_progress(
+                system,
+                loader,
+                supervisor,
+                hog,
+                progress_data,
+                child,
+                deadline,
+            );
+            return Err(prefer_cleanup(Init0Error::Native(error), cleanup));
         }
         (Ok(Ok(())), None) => {
-            if !progress_attempted {
-                loader.close(progress_child).map_err(Init0Error::Cleanup)?;
-            }
-            system
-                .close_handle(progress_data)
-                .map_err(Init0Error::Cleanup)?;
-            terminate_reap_close(loader, supervisor, hog, deadline)?;
-            return Err(Init0Error::MissingLoadedProcess);
+            let child = (!progress_attempted).then_some(progress_child);
+            let cleanup = cleanup_unloaded_progress(
+                system,
+                loader,
+                supervisor,
+                hog,
+                progress_data,
+                child,
+                deadline,
+            );
+            return Err(prefer_cleanup(Init0Error::MissingLoadedProcess, cleanup));
         }
     };
     let peers = Dw1bPeers {
@@ -647,7 +675,8 @@ fn run_dw1b_preemption<
             deadline,
         )
         .map_err(Init0Error::Supervision)?;
-        arm_dw1b_preemption(peers.hog.process, peers.progress.process)
+        system
+            .arm_dw1b_preemption(peers.hog.process, peers.progress.process)
             .map_err(Init0Error::Native)?;
         exchange_dw1b_progress(system, supervisor, peers.progress_data, deadline)?;
         wait_dw1b_normal_exit(supervisor, peers.progress.process, deadline)?;
@@ -740,9 +769,11 @@ fn load_dw1b_progress<Loader: LoaderPlatform<Error = NativeError>>(
         },
     ) {
         Ok(progress) => Ok(progress),
-        Err(error) => {
-            loader.close(progress_child).map_err(Init0Error::Cleanup)?;
-            Err(Init0Error::Loader(error))
+        Err(failure) => {
+            if !failure.service_channel_consumed {
+                loader.close(progress_child).map_err(Init0Error::Cleanup)?;
+            }
+            Err(Init0Error::Loader(failure.error))
         }
     }
 }
@@ -758,30 +789,32 @@ fn create_dw1b_data_pair<System: Init0System, Loader: LoaderPlatform<Error = Nat
     let parent = match loader.duplicate(broad_parent, CHILD_CHANNEL_RIGHTS) {
         Ok(parent) => parent,
         Err(error) => {
-            let _ = loader.close(broad_parent);
-            let _ = loader.close(child);
-            return Err(Init0Error::Native(error));
+            return Err(prefer_cleanup(
+                Init0Error::Native(error),
+                close_loader_handles(loader, &[broad_parent, child]),
+            ));
         }
     };
     if let Err(error) = loader.close(broad_parent) {
-        let _ = loader.close(parent);
-        let _ = loader.close(child);
-        return Err(Init0Error::Native(error));
+        let _ = close_loader_handles(loader, &[parent, child]);
+        return Err(Init0Error::Cleanup(error));
     }
     let parent_info = match system.query_capability_info(parent) {
         Ok(info) => info,
         Err(error) => {
-            let _ = loader.close(parent);
-            let _ = loader.close(child);
-            return Err(Init0Error::Native(error));
+            return Err(prefer_cleanup(
+                Init0Error::Native(error),
+                close_loader_handles(loader, &[parent, child]),
+            ));
         }
     };
     let child_info = match system.query_capability_info(child) {
         Ok(info) => info,
         Err(error) => {
-            let _ = loader.close(parent);
-            let _ = loader.close(child);
-            return Err(Init0Error::Native(error));
+            return Err(prefer_cleanup(
+                Init0Error::Native(error),
+                close_loader_handles(loader, &[parent, child]),
+            ));
         }
     };
     if parent_info.object_type != DW_OBJECT_TYPE_CHANNEL
@@ -789,13 +822,27 @@ fn create_dw1b_data_pair<System: Init0System, Loader: LoaderPlatform<Error = Nat
         || child_info.object_type != DW_OBJECT_TYPE_CHANNEL
         || child_info.rights != DW1B_CHANNEL_BROAD_RIGHTS
     {
-        let _ = loader.close(parent);
-        let _ = loader.close(child);
-        return Err(Init0Error::Capability(
-            CapabilityValidationError::InvalidFreshCapability,
+        return Err(prefer_cleanup(
+            Init0Error::Capability(CapabilityValidationError::InvalidFreshCapability),
+            close_loader_handles(loader, &[parent, child]),
         ));
     }
     Ok((parent, child))
+}
+
+#[cfg(feature = "dw1b-preemption-integration")]
+fn close_loader_handles<Loader: LoaderPlatform<Error = NativeError>>(
+    loader: &mut Loader,
+    handles: &[DwHandle],
+) -> Result<(), Init0Error> {
+    let mut first = None;
+    for handle in handles {
+        record_cleanup(
+            &mut first,
+            loader.close(*handle).map_err(Init0Error::Cleanup),
+        );
+    }
+    first.map_or(Ok(()), Err)
 }
 
 #[cfg(feature = "dw1b-preemption-integration")]
@@ -916,29 +963,34 @@ fn terminate_reap_close<
     loaded: LoadedProcess,
     deadline: DwDeadline,
 ) -> Result<(), Init0Error> {
-    loader
-        .process_terminate(loaded.process)
-        .map_err(Init0Error::Cleanup)?;
+    let mut first = None;
+    record_cleanup(
+        &mut first,
+        loader
+            .process_terminate(loaded.process)
+            .map_err(Init0Error::Cleanup),
+    );
     let item = DwWaitItemV1 {
         handle: loaded.process,
         signals: DW_SIGNAL_EXITED,
     };
-    let observed = supervisor
-        .wait_many(core::slice::from_ref(&item), deadline)
-        .map_err(Init0Error::Cleanup)?;
-    if observed.index != 0 || observed.observed.0 & DW_SIGNAL_EXITED.0 == 0 {
-        return Err(Init0Error::CapabilityEvidence);
+    match supervisor.wait_many(core::slice::from_ref(&item), deadline) {
+        Ok(observed) if observed.index == 0 && observed.observed.0 & DW_SIGNAL_EXITED.0 != 0 => {}
+        Ok(_) => record_cleanup(&mut first, Err(Init0Error::CapabilityEvidence)),
+        Err(error) => record_cleanup(&mut first, Err(Init0Error::Cleanup(error))),
     }
-    let info = supervisor
-        .query_task_termination(loaded.process)
-        .map_err(Init0Error::Cleanup)?;
-    if info.state != DW_TASK_STATE_EXITED {
-        return Err(Init0Error::CapabilityEvidence);
+    match supervisor.query_task_termination(loaded.process) {
+        Ok(info) if info.state == DW_TASK_STATE_EXITED => {}
+        Ok(_) => record_cleanup(&mut first, Err(Init0Error::CapabilityEvidence)),
+        Err(error) => record_cleanup(&mut first, Err(Init0Error::Cleanup(error))),
     }
-    loader
-        .close(loaded.launch_channel)
-        .map_err(Init0Error::Cleanup)?;
-    loader.close(loaded.process).map_err(Init0Error::Cleanup)
+    for handle in [loaded.launch_channel, loaded.process] {
+        record_cleanup(
+            &mut first,
+            loader.close(handle).map_err(Init0Error::Cleanup),
+        );
+    }
+    first.map_or(Ok(()), Err)
 }
 
 #[cfg(feature = "dw1b-preemption-integration")]
@@ -954,13 +1006,72 @@ fn cleanup_dw1b_peers<
     progress_reaped: bool,
     deadline: DwDeadline,
 ) -> Result<(), Init0Error> {
+    let mut first = None;
     if !progress_reaped {
-        terminate_reap_close(loader, supervisor, peers.progress, deadline)?;
-        system
-            .close_handle(peers.progress_data)
-            .map_err(Init0Error::Cleanup)?;
+        record_cleanup(
+            &mut first,
+            terminate_reap_close(loader, supervisor, peers.progress, deadline),
+        );
+        record_cleanup(
+            &mut first,
+            system
+                .close_handle(peers.progress_data)
+                .map_err(Init0Error::Cleanup),
+        );
     }
-    terminate_reap_close(loader, supervisor, peers.hog, deadline)
+    record_cleanup(
+        &mut first,
+        terminate_reap_close(loader, supervisor, peers.hog, deadline),
+    );
+    first.map_or(Ok(()), Err)
+}
+
+#[cfg(feature = "dw1b-preemption-integration")]
+fn cleanup_unloaded_progress<
+    System: Init0System,
+    Loader: LoaderPlatform<Error = NativeError>,
+    Supervisor: SupervisionPlatform<Error = NativeError>,
+>(
+    system: &mut System,
+    loader: &mut Loader,
+    supervisor: &mut Supervisor,
+    hog: LoadedProcess,
+    progress_data: DwHandle,
+    progress_child: Option<DwHandle>,
+    deadline: DwDeadline,
+) -> Result<(), Init0Error> {
+    let mut first = None;
+    if let Some(progress_child) = progress_child {
+        record_cleanup(
+            &mut first,
+            loader.close(progress_child).map_err(Init0Error::Cleanup),
+        );
+    }
+    record_cleanup(
+        &mut first,
+        system
+            .close_handle(progress_data)
+            .map_err(Init0Error::Cleanup),
+    );
+    record_cleanup(
+        &mut first,
+        terminate_reap_close(loader, supervisor, hog, deadline),
+    );
+    first.map_or(Ok(()), Err)
+}
+
+#[cfg(feature = "dw1b-preemption-integration")]
+fn record_cleanup(first: &mut Option<Init0Error>, result: Result<(), Init0Error>) {
+    if let Err(error) = result
+        && first.is_none()
+    {
+        *first = Some(error);
+    }
+}
+
+#[cfg(feature = "dw1b-preemption-integration")]
+fn prefer_cleanup(primary: Init0Error, cleanup: Result<(), Init0Error>) -> Init0Error {
+    cleanup.err().unwrap_or(primary)
 }
 
 fn load_selected_child<Loader: LoaderPlatform<Error = NativeError>>(
@@ -1605,3 +1716,6 @@ mod capability_relay_tests {
         }
     }
 }
+
+#[cfg(all(test, feature = "dw1b-preemption-integration"))]
+mod dw1b_tests;

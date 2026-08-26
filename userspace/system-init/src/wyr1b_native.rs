@@ -31,23 +31,6 @@ const CONTROLLER_CHANNEL_RIGHTS: DwRights = DwRights(
     DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_WAIT.0 | DW_RIGHT_INSPECT.0 | DW_RIGHT_TRANSFER.0,
 );
 
-fn loader_caller_retains_service_channel(error: &LoadError<NativeError>) -> bool {
-    match error {
-        LoadError::Elf(_) | LoadError::Startup(_) | LoadError::Launch(_) => true,
-        LoadError::Platform { stage, .. } => matches!(
-            stage,
-            LoadStage::ChannelCreate
-                | LoadStage::ChannelReduce
-                | LoadStage::ProcessCreate
-                | LoadStage::MemoryCreate
-                | LoadStage::ParentMaterialize
-                | LoadStage::ParentUnmap
-                | LoadStage::ChildMap
-                | LoadStage::ThreadCreate
-        ),
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct InstalledPeer {
     pub grant: EndpointGrant,
@@ -644,8 +627,8 @@ where
         },
     ) {
         Ok(loaded) => loaded,
-        Err(error) => {
-            if !loader_caller_retains_service_channel(&error) {
+        Err(failure) => {
+            if failure.service_channel_consumed {
                 channels.commit_second_move()?;
             }
             let control_failed = !channels.cleanup(system);
@@ -654,7 +637,7 @@ where
             return Err(if control_failed || group_failed || release_failed {
                 InitError::Cleanup
             } else {
-                InitError::Loader(error)
+                InitError::Loader(failure.error)
             });
         }
     };
@@ -1166,8 +1149,8 @@ where
         },
     ) {
         Ok(loaded) => loaded,
-        Err(error) => {
-            if !loader_caller_retains_service_channel(&error) {
+        Err(failure) => {
+            if failure.service_channel_consumed {
                 channels
                     .commit_second_move()
                     .map_err(PeerLaunchError::InstallCommitted)?;
@@ -1178,7 +1161,7 @@ where
                 if close_failed {
                     InitError::Cleanup
                 } else {
-                    InitError::Loader(error)
+                    InitError::Loader(failure.error)
                 },
             ));
         }
@@ -2055,22 +2038,6 @@ mod tests {
             expect_gate(stale, expected),
             Err(InitError::Wyr1BGateMismatch)
         );
-    }
-
-    #[test]
-    fn loader_service_channel_ownership_changes_at_init_send() {
-        let before = LoadError::Platform {
-            stage: LoadStage::ThreadCreate,
-            cause: FAILURE,
-            rollback_failed: false,
-        };
-        let moved_boundary = LoadError::Platform {
-            stage: LoadStage::InitSend,
-            cause: FAILURE,
-            rollback_failed: false,
-        };
-        assert!(loader_caller_retains_service_channel(&before));
-        assert!(!loader_caller_retains_service_channel(&moved_boundary));
     }
 
     #[test]

@@ -12,6 +12,8 @@ use wyrmroot_dw1b_preemption as _;
 use wyrmroot_i_capability as _;
 use wyrmroot_init0::{Init0System, run_init0};
 use wyrmroot_loader as _;
+#[cfg(feature = "dw1b-preemption-integration")]
+use wyrmroot_runtime::arm_dw1b_preemption;
 use wyrmroot_runtime::{
     CapabilityInfo, MappingPlan, NativeError, NativeLoaderPlatform, NativeSupervisionPlatform,
     ReceiveCounts, StartupBlock, close_handle, map_bootfs_read_only, monotonic_deadline_after,
@@ -63,6 +65,15 @@ impl Init0System for NativeSystem {
 
     fn close_handle(&mut self, handle: DwHandle) -> Result<(), NativeError> {
         close_handle(handle)
+    }
+
+    #[cfg(feature = "dw1b-preemption-integration")]
+    fn arm_dw1b_preemption(
+        &mut self,
+        hog_process: DwHandle,
+        progress_process: DwHandle,
+    ) -> Result<(), NativeError> {
+        arm_dw1b_preemption(hog_process, progress_process)
     }
 }
 

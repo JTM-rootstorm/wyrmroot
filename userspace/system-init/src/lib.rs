@@ -24,8 +24,8 @@ use wyrmroot_bootfs::archive::{Archive, LookupError, ParseError};
 use wyrmroot_loader::{
     launch::{HEADER_BYTES, LaunchProfile, SUPERVISOR_BYTES, encode_ready_for_profile, parse_init},
     process::{
-        LoadAuthority, LoadError, LoadRequest, LoadStage, LoadedProcess, LoaderPlatform,
-        ServiceLoadRequest, load_process, load_service_process,
+        LoadAuthority, LoadError, LoadRequest, LoadedProcess, LoaderPlatform, ServiceLoadRequest,
+        load_process, load_service_process,
     },
 };
 use wyrmroot_rrc_manifest::{
