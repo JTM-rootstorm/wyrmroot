@@ -10,9 +10,8 @@ pub mod evidence;
 pub mod gate;
 
 use deepwyrm_syscall::{
-    DW_SIGNAL_EXITED, DW_TERMINATION_AUTHORIZED, DW_TERMINATION_NORMAL_EXIT,
-    DW_TERMINATION_TASK_GROUP_TEARDOWN, DwDeadline, DwHandle, DwObjectType, DwReceivedHandleInfoV1,
-    DwRights, DwWaitItemV1,
+    DW_DEADLINE_INFINITE, DW_SIGNAL_EXITED, DW_TASK_STATE_EXITED, DwDeadline, DwHandle,
+    DwObjectType, DwReceivedHandleInfoV1, DwRights, DwWaitItemV1,
 };
 use wyrmroot_bootfs::archive::{Archive, LookupError, ParseError};
 use wyrmroot_loader::{
@@ -31,8 +30,8 @@ use wyrmroot_runtime::{
     BOOTFS_EXPECTATION, BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, CapabilityValidationError,
     InitCapability, LOADER_TASK_GROUP_EXPECTATION, MappingPlan, MappingPlanError, NativeError,
     ReceiveCounts, SELF_ROOT_EXPECTATION, SupervisionError, SupervisionPlatform,
-    await_child_ready_profile, validate_bootstrap_channel, validate_init_capabilities_v2,
-    validate_successful_exit,
+    await_child_ready_profile, supervise_ready_child_profile, validate_bootstrap_channel,
+    validate_init_capabilities_v2,
 };
 
 pub const SYSTEM_INIT_PATH: &str = "system/init";
@@ -55,6 +54,47 @@ pub enum RecoveryResult {
     Fatal,
 }
 
+/// Boot-lifetime owner of the fixed supervisor state and primordial authority.
+/// The immutable bootfs handle is retained and remapped narrowly for each load;
+/// no borrowed mapping escapes a transition.
+#[derive(Debug, Eq, PartialEq)]
+pub struct ResidentSystemInit {
+    controller: SystemInit,
+    authority: LoadAuthority,
+    result: RecoveryResult,
+    last_tick_ns: u64,
+}
+
+impl ResidentSystemInit {
+    #[must_use]
+    pub const fn result(&self) -> RecoveryResult {
+        self.result
+    }
+
+    #[must_use]
+    pub const fn controller(&self) -> &SystemInit {
+        &self.controller
+    }
+
+    #[must_use]
+    pub const fn authority(&self) -> LoadAuthority {
+        self.authority
+    }
+
+    /// Advances the permanent fixed-role control loop without inventing service
+    /// manager policy. Native role events are consumed during activation and
+    /// future reached profiles can extend this exact generation-owned tick.
+    pub fn control_tick(&mut self, now_ns: u64) -> Result<SystemMode, InitError> {
+        if now_ns < self.last_tick_ns {
+            self.controller.fatal();
+            self.result = RecoveryResult::Fatal;
+            return Err(InitError::WrongActivationOrder);
+        }
+        self.last_tick_ns = now_ns;
+        Ok(self.controller.mode())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AttemptResources {
     pub role: RoleId,
@@ -69,7 +109,7 @@ pub struct AttemptResources {
     pub accounting_reserved: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum InitError {
     WrongManifestProfile,
     UnlaunchableRole,
@@ -89,7 +129,7 @@ pub enum InitError {
     Capability(CapabilityValidationError),
     Mapping(MappingPlanError),
     Launch(wyrmroot_loader::launch::LaunchError),
-    Loader,
+    Loader(LoadError<NativeError>),
     Supervision,
     Cleanup,
 }
@@ -153,6 +193,8 @@ impl SystemInit {
                 (Activation::ConsoleBound, StartupProfile::Retained)
             };
             if role.id() != expected
+                || !role.required()
+                || !role.requires_ready()
                 || (role.activation(), role.startup_profile()) != expected_shape
             {
                 return Err(InitError::WrongManifestProfile);
@@ -516,6 +558,7 @@ pub trait InitPlatform {
     fn send_channel(&mut self, channel: DwHandle, bytes: &[u8]) -> Result<(), NativeError>;
     fn close_handle(&mut self, handle: DwHandle) -> Result<(), NativeError>;
     fn create_attempt_task_group(&mut self, parent: DwHandle) -> Result<DwHandle, NativeError>;
+    fn terminate_task_group(&mut self, task_group: DwHandle) -> Result<(), NativeError>;
     fn now(&mut self) -> Result<u64, NativeError>;
     fn wait_until(&mut self, deadline_ns: u64) -> Result<(), NativeError>;
 }
@@ -527,7 +570,7 @@ pub fn run_system_init<S, L, W>(
     loader: &mut L,
     waits: &mut W,
     bootstrap_channel: DwHandle,
-) -> Result<RecoveryResult, InitError>
+) -> Result<ResidentSystemInit, InitError>
 where
     S: InitPlatform,
     L: LoaderPlatform<Error = NativeError>,
@@ -543,66 +586,96 @@ where
     let counts = system
         .receive_channel(bootstrap_channel, &mut init_bytes, &mut handles)
         .map_err(InitError::Native)?;
+    let received = core::cmp::min(counts.handles, handles.len());
     if counts
         != (ReceiveCounts {
             bytes: SUPERVISOR_BYTES,
             handles: 3,
         })
     {
-        return Err(InitError::Launch(
-            wyrmroot_loader::launch::LaunchError::HandleCount,
-        ));
+        let error = InitError::Launch(wyrmroot_loader::launch::LaunchError::HandleCount);
+        close_startup_failure(system, &handles[..received], bootstrap_channel)?;
+        return Err(error);
     }
-    let parsed =
-        parse_init(LaunchProfile::Supervisor, &init_bytes, &handles).map_err(InitError::Launch)?;
-    let capabilities = [
-        fresh_capability(system, handles[0])?,
-        fresh_capability(system, handles[1])?,
-        fresh_capability(system, handles[2])?,
-    ];
-    validate_init_capabilities_v2(
-        &capabilities,
-        SELF_ROOT_EXPECTATION,
-        BOOTFS_EXPECTATION,
-        LOADER_TASK_GROUP_EXPECTATION,
-    )
-    .map_err(InitError::Capability)?;
-    let authority = LoadAuthority {
-        parent_root: handles[0].handle,
-        bootfs: handles[1].handle,
-        task_group: handles[2].handle,
-    };
-    let size = system
-        .query_memory_object_size(authority.bootfs)
-        .map_err(InitError::Native)?;
-    let plan = MappingPlan::for_bootfs(size).map_err(InitError::Mapping)?;
-    let activation = system
-        .with_bootfs_bytes(
-            authority.parent_root,
-            authority.bootfs,
-            plan,
-            |system, bootfs| {
-                activate_retained_bootfs(
-                    system,
-                    loader,
-                    waits,
-                    authority,
-                    bootstrap_channel,
-                    parsed.transaction_id,
-                    bootfs,
-                )
-            },
+    let startup = (|| {
+        let parsed = parse_init(LaunchProfile::Supervisor, &init_bytes, &handles)
+            .map_err(InitError::Launch)?;
+        let capabilities = [
+            fresh_capability(system, handles[0])?,
+            fresh_capability(system, handles[1])?,
+            fresh_capability(system, handles[2])?,
+        ];
+        validate_init_capabilities_v2(
+            &capabilities,
+            SELF_ROOT_EXPECTATION,
+            BOOTFS_EXPECTATION,
+            LOADER_TASK_GROUP_EXPECTATION,
         )
+        .map_err(InitError::Capability)?;
+        let authority = LoadAuthority {
+            parent_root: handles[0].handle,
+            bootfs: handles[1].handle,
+            task_group: handles[2].handle,
+        };
+        let size = system
+            .query_memory_object_size(authority.bootfs)
+            .map_err(InitError::Native)?;
+        let plan = MappingPlan::for_bootfs(size).map_err(InitError::Mapping)?;
+        let activation = system
+            .with_bootfs_bytes(
+                authority.parent_root,
+                authority.bootfs,
+                plan,
+                |system, bootfs| {
+                    activate_retained_bootfs(
+                        system,
+                        loader,
+                        waits,
+                        authority,
+                        bootstrap_channel,
+                        parsed.transaction_id,
+                        bootfs,
+                    )
+                },
+            )
+            .map_err(InitError::Native)??;
+        Ok::<_, InitError>((authority, activation))
+    })();
+    let (authority, (result, controller)) = match startup {
+        Ok(value) => value,
+        Err(error) => {
+            close_startup_failure(system, &handles, bootstrap_channel)?;
+            return Err(error);
+        }
+    };
+    system
+        .close_handle(bootstrap_channel)
         .map_err(InitError::Native)?;
-    let mut cleanup_failed = false;
+    Ok(ResidentSystemInit {
+        controller,
+        authority,
+        result,
+        last_tick_ns: system.now().map_err(InitError::Native)?,
+    })
+}
+
+fn close_startup_failure<S: InitPlatform>(
+    system: &mut S,
+    handles: &[DwReceivedHandleInfoV1],
+    bootstrap_channel: DwHandle,
+) -> Result<(), InitError> {
+    let mut failed = false;
     for handle in handles {
-        cleanup_failed |= system.close_handle(handle.handle).is_err();
+        if handle.handle.0 != 0 {
+            failed |= system.close_handle(handle.handle).is_err();
+        }
     }
-    cleanup_failed |= system.close_handle(bootstrap_channel).is_err();
-    if cleanup_failed {
-        return Err(InitError::Cleanup);
+    failed |= system.close_handle(bootstrap_channel).is_err();
+    if failed {
+        Err(InitError::Cleanup)
+    } else {
+        Ok(())
     }
-    activation
 }
 
 fn activate_retained_bootfs<S, L, W>(
@@ -613,7 +686,7 @@ fn activate_retained_bootfs<S, L, W>(
     bootstrap_channel: DwHandle,
     parent_transaction: u64,
     bootfs: &[u8],
-) -> Result<RecoveryResult, InitError>
+) -> Result<(RecoveryResult, SystemInit), InitError>
 where
     S: InitPlatform,
     L: LoaderPlatform<Error = NativeError>,
@@ -651,7 +724,7 @@ where
             };
             let loaded = match load_role(loader, role_authority, bootfs, role, transaction_id) {
                 Ok(value) => value,
-                Err(_) => {
+                Err(error) => {
                     let now = system.now().map_err(InitError::Native)?;
                     controller.fail(
                         role,
@@ -660,10 +733,22 @@ where
                         now,
                         AttemptFailure::CreationFailed,
                     )?;
-                    system.close_handle(task_group).map_err(InitError::Native)?;
+                    let rollback_failed = matches!(
+                        error,
+                        InitError::Loader(LoadError::Platform {
+                            rollback_failed: true,
+                            ..
+                        })
+                    );
+                    let close_failed = system.close_handle(task_group).is_err();
+                    if rollback_failed || close_failed {
+                        controller.cleanup_failed(role, generation, transaction_id, now + 1)?;
+                        controller.fatal();
+                        return Err(error);
+                    }
                     controller.cleanup_complete(role, generation, transaction_id, now + 1)?;
                     if advance_or_degrade(system, &mut controller, role, transaction_id)? {
-                        return Ok(RecoveryResult::Degraded);
+                        return Ok((RecoveryResult::Degraded, controller));
                     }
                     continue;
                 }
@@ -699,8 +784,16 @@ where
                 Ok(()) => {
                     let now = system.now().map_err(InitError::Native)?;
                     controller.ready(role, generation, transaction_id, now)?;
-                    match observe_terminal(waits, loaded.process, deadline) {
-                        Ok(disposition) => {
+                    match supervise_ready_child_profile(
+                        waits,
+                        loaded.process,
+                        loaded.launch_channel,
+                        LaunchProfile::EarlyBootStub,
+                        transaction_id,
+                        DW_DEADLINE_INFINITE,
+                    ) {
+                        Ok(()) => {
+                            let disposition = TerminalDisposition::NormalExit(0);
                             let now = system.now().map_err(InitError::Native)?;
                             controller.terminal(
                                 role,
@@ -709,7 +802,7 @@ where
                                 now,
                                 disposition,
                             )?;
-                            cleanup_loaded(system, loader, loaded, task_group, false)?;
+                            cleanup_loaded(system, waits, loaded, task_group, false)?;
                             controller.cleanup_complete(
                                 role,
                                 generation,
@@ -720,13 +813,20 @@ where
                                 break;
                             }
                             if advance_or_degrade(system, &mut controller, role, transaction_id)? {
-                                return Ok(RecoveryResult::Degraded);
+                                return Ok((RecoveryResult::Degraded, controller));
                             }
                         }
-                        Err(failure) => {
+                        Err(error) => {
+                            let failure = classify_supervision(&error);
                             let now = system.now().map_err(InitError::Native)?;
                             controller.fail(role, generation, transaction_id, now, failure)?;
-                            cleanup_loaded(system, loader, loaded, task_group, true)?;
+                            cleanup_loaded(
+                                system,
+                                waits,
+                                loaded,
+                                task_group,
+                                !error.process_exit_observed(),
+                            )?;
                             controller.cleanup_complete(
                                 role,
                                 generation,
@@ -734,7 +834,7 @@ where
                                 now + 1,
                             )?;
                             if advance_or_degrade(system, &mut controller, role, transaction_id)? {
-                                return Ok(RecoveryResult::Degraded);
+                                return Ok((RecoveryResult::Degraded, controller));
                             }
                         }
                     }
@@ -745,20 +845,20 @@ where
                     controller.fail(role, generation, transaction_id, now, failure)?;
                     cleanup_loaded(
                         system,
-                        loader,
+                        waits,
                         loaded,
                         task_group,
                         !error.process_exit_observed(),
                     )?;
                     controller.cleanup_complete(role, generation, transaction_id, now + 1)?;
                     if advance_or_degrade(system, &mut controller, role, transaction_id)? {
-                        return Ok(RecoveryResult::Degraded);
+                        return Ok((RecoveryResult::Degraded, controller));
                     }
                 }
             }
         }
     }
-    Ok(RecoveryResult::Recovered)
+    Ok((RecoveryResult::Recovered, controller))
 }
 
 fn fresh_capability<S: InitPlatform>(
@@ -814,56 +914,53 @@ fn load_role<L: LoaderPlatform<Error = NativeError>>(
             transaction_id,
         },
     )
-    .map_err(|_: LoadError<NativeError>| InitError::Loader)
+    .map_err(InitError::Loader)
 }
-fn observe_terminal<W: SupervisionPlatform<Error = NativeError>>(
-    waits: &mut W,
-    process: DwHandle,
-    deadline: DwDeadline,
-) -> Result<TerminalDisposition, AttemptFailure> {
-    let item = DwWaitItemV1 {
-        handle: process,
-        signals: DW_SIGNAL_EXITED,
-    };
-    let result = waits
-        .wait_many(core::slice::from_ref(&item), deadline)
-        .map_err(|_| AttemptFailure::WaitFailed)?;
-    if result.index != 0 || result.observed.0 & DW_SIGNAL_EXITED.0 == 0 {
-        return Err(AttemptFailure::WaitFailed);
-    }
-    let info = waits
-        .query_task_termination(process)
-        .map_err(|_| AttemptFailure::ExitQueryFailed)?;
-    if validate_successful_exit(&info).is_ok() {
-        return Ok(TerminalDisposition::NormalExit(0));
-    }
-    if info.reason == DW_TERMINATION_NORMAL_EXIT {
-        return Ok(TerminalDisposition::NormalExit(info.application_code));
-    }
-    if info.reason == DW_TERMINATION_AUTHORIZED {
-        return Ok(TerminalDisposition::AuthorizedTermination);
-    }
-    if info.reason == DW_TERMINATION_TASK_GROUP_TEARDOWN {
-        return Ok(TerminalDisposition::TaskGroupTeardown);
-    }
-    Ok(TerminalDisposition::UnhandledException)
-}
-fn cleanup_loaded<S: InitPlatform, L: LoaderPlatform<Error = NativeError>>(
+fn cleanup_loaded<S: InitPlatform, W: SupervisionPlatform<Error = NativeError>>(
     system: &mut S,
-    loader: &mut L,
+    waits: &mut W,
     loaded: LoadedProcess,
     task_group: DwHandle,
     terminate: bool,
 ) -> Result<(), InitError> {
-    if terminate {
-        loader
-            .process_terminate(loaded.process)
-            .map_err(|_| InitError::Cleanup)?;
+    let mut failed = false;
+    let cleanup_deadline = system
+        .now()
+        .ok()
+        .and_then(|now| now.checked_add(WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns));
+    if terminate && system.terminate_task_group(task_group).is_err() {
+        // A termination request may race the child's own terminal transition.
+        failed |= !matches!(
+            waits.query_task_termination(loaded.process),
+            Ok(info) if info.state == DW_TASK_STATE_EXITED
+        );
     }
+    let mut terminal = matches!(
+        waits.query_task_termination(loaded.process),
+        Ok(info) if info.state == DW_TASK_STATE_EXITED
+    );
+    if !terminal && let Some(deadline) = cleanup_deadline {
+        let item = DwWaitItemV1 {
+            handle: loaded.process,
+            signals: DW_SIGNAL_EXITED,
+        };
+        terminal = matches!(
+            waits.wait_many(core::slice::from_ref(&item), DwDeadline(deadline)),
+            Ok(result) if result.index == 0 && result.observed.0 & DW_SIGNAL_EXITED.0 != 0
+        ) && matches!(
+            waits.query_task_termination(loaded.process),
+            Ok(info) if info.state == DW_TASK_STATE_EXITED
+        );
+    }
+    failed |= !terminal;
     for h in [loaded.launch_channel, loaded.process, task_group] {
-        system.close_handle(h).map_err(InitError::Native)?;
+        failed |= system.close_handle(h).is_err();
     }
-    Ok(())
+    if failed {
+        Err(InitError::Cleanup)
+    } else {
+        Ok(())
+    }
 }
 fn classify_supervision(error: &SupervisionError<NativeError>) -> AttemptFailure {
     match error {

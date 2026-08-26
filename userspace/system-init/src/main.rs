@@ -59,6 +59,12 @@ impl InitPlatform for NativeSystem {
     fn create_attempt_task_group(&mut self, parent: DwHandle) -> Result<DwHandle, NativeError> {
         create_task_group(parent, DwRights(DW_RIGHT_MODIFY.0 | DW_RIGHT_INSPECT.0))
     }
+    fn terminate_task_group(&mut self, task_group: DwHandle) -> Result<(), NativeError> {
+        wyrmroot_runtime::terminate_task_group(
+            task_group,
+            deepwyrm_syscall::DW_TERMINATION_AUTHORIZED,
+        )
+    }
     fn now(&mut self) -> Result<u64, NativeError> {
         monotonic_active_now()
     }
@@ -87,7 +93,7 @@ fn main(startup: StartupBlock<'_>) -> u32 {
         &mut NativeSupervisionPlatform,
         startup.bootstrap_channel().as_abi(),
     );
-    let Ok(_structured_state) = result else {
+    let Ok(mut resident) = result else {
         return 0xAF01_0002;
     };
     loop {
@@ -97,6 +103,9 @@ fn main(startup: StartupBlock<'_>) -> u32 {
         let Some(deadline) = now.checked_add(1_000_000_000) else {
             return 0xAF01_0004;
         };
+        if resident.control_tick(now).is_err() {
+            return 0xAF01_0006;
+        }
         if InitPlatform::wait_until(&mut NativeSystem, deadline).is_err() {
             return 0xAF01_0005;
         }

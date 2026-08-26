@@ -72,7 +72,7 @@ pub use supervision::{
     RestartSupervisor, RestartTransitionError, SupervisionError, SupervisionPlatform,
     SupervisionPolicy, TerminalDisposition, WYR0_I_SUPERVISION_POLICY, await_child_ready_profile,
     supervise_child, supervise_child_profile, supervise_native_child,
-    supervise_native_child_profile, validate_successful_exit,
+    supervise_native_child_profile, supervise_ready_child_profile, validate_successful_exit,
 };
 #[cfg(feature = "primordial-test-support")]
 pub use test_support::{

@@ -227,7 +227,51 @@ pub fn supervise_child_profile<P: SupervisionPlatform>(
         return Err(SupervisionError::UnboundedDeadline);
     }
 
-    let mut ready = false;
+    supervise_profile_state(
+        platform,
+        process,
+        launch_channel,
+        profile,
+        transaction_id,
+        deadline,
+        false,
+    )
+}
+
+/// Continues observing a resident child after exact READY was already accepted.
+///
+/// Unlike temporary child supervision, the service lifetime is intentionally
+/// not bounded by its READY deadline. An infinite lifetime wait is therefore
+/// valid here. The launch channel remains monitored so duplicate, malformed,
+/// or capability-bearing post-READY datagrams fail before terminal cleanup.
+pub fn supervise_ready_child_profile<P: SupervisionPlatform>(
+    platform: &mut P,
+    process: DwHandle,
+    launch_channel: DwHandle,
+    profile: LaunchProfile,
+    transaction_id: u64,
+    lifetime_deadline: DwDeadline,
+) -> Result<(), SupervisionError<P::Error>> {
+    supervise_profile_state(
+        platform,
+        process,
+        launch_channel,
+        profile,
+        transaction_id,
+        lifetime_deadline,
+        true,
+    )
+}
+
+fn supervise_profile_state<P: SupervisionPlatform>(
+    platform: &mut P,
+    process: DwHandle,
+    launch_channel: DwHandle,
+    profile: LaunchProfile,
+    transaction_id: u64,
+    deadline: DwDeadline,
+    mut ready: bool,
+) -> Result<(), SupervisionError<P::Error>> {
     let mut monitor_channel = true;
     loop {
         let channel_item = DwWaitItemV1 {

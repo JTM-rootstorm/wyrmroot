@@ -194,9 +194,11 @@ mod tests {
         let size = producer
             .encode(EvidenceEvent::Normal, 0, 0, 0, &mut output)
             .unwrap();
-        assert!(core::str::from_utf8(&output[..size])
-            .unwrap()
-            .contains("|seq=1|event=NORMAL|"));
+        assert!(
+            core::str::from_utf8(&output[..size])
+                .unwrap()
+                .contains("|seq=1|event=NORMAL|")
+        );
         assert_eq!(
             producer.encode(EvidenceEvent::Reap, 1, 1, 2, &mut output),
             Err(EvidenceError::AlreadyTerminal)
