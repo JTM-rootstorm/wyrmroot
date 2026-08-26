@@ -7,6 +7,9 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "native-registryd")]
+use {deepwyrm_syscall as _, wyrmroot_loader as _, wyrmroot_runtime as _};
+
 use wyrmroot_registry_proto::{
     EnumerationScope, InstallClient, InstallPublication, Lookup, MAX_CLIENT_REPLAY,
     MAX_OUTSTANDING_PER_CLIENT, MAX_PROTOCOL_VERSIONS, MAX_PUBLICATION_REPLAY,
