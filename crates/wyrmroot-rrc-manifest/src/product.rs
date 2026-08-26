@@ -97,6 +97,10 @@ pub struct Wyr1aProductProfile<'a> {
     pub observed_materials: &'a [ObservedRetainedMaterial<'a>],
 }
 
+/// WYR1-B retains the same RRC closure and receipts while assigning registryd
+/// its reached resident bootstrap profile.
+pub type Wyr1bProductProfile<'a> = Wyr1aProductProfile<'a>;
+
 impl<'a> Manifest<'a> {
     /// Parses structural WRRM v1 and then applies the exact initial WYR1-A
     /// product role graph, external receipts, and retained-material closure.
@@ -118,13 +122,35 @@ impl<'a> Manifest<'a> {
         profile: Wyr1aProductProfile<'_>,
     ) -> Result<(), ProductError> {
         validate_receipts(profile.receipts)?;
-        self.validate_product_roles()?;
+        self.validate_product_roles(StartupProfile::EarlyBootStub)?;
         self.validate_product_role_edges()?;
         self.validate_expected_closure(profile.expected_closure)?;
         validate_observed_materials(profile.expected_closure, profile.observed_materials)
     }
 
-    fn validate_product_roles(self) -> Result<(), ProductError> {
+    pub fn parse_wyr1b_product(
+        bytes: &'a [u8],
+        expected_boot_generation: &[u8; 32],
+        profile: Wyr1bProductProfile<'_>,
+    ) -> Result<Self, ProductError> {
+        let manifest = Self::parse_structural(bytes, expected_boot_generation)
+            .map_err(ProductError::StructuralParse)?;
+        manifest.validate_wyr1b_product(profile)?;
+        Ok(manifest)
+    }
+
+    pub fn validate_wyr1b_product(
+        self,
+        profile: Wyr1bProductProfile<'_>,
+    ) -> Result<(), ProductError> {
+        validate_receipts(profile.receipts)?;
+        self.validate_product_roles(StartupProfile::BootstrapRegistry)?;
+        self.validate_product_role_edges()?;
+        self.validate_expected_closure(profile.expected_closure)?;
+        validate_observed_materials(profile.expected_closure, profile.observed_materials)
+    }
+
+    fn validate_product_roles(self, registry_profile: StartupProfile) -> Result<(), ProductError> {
         if self.role_count() != EXPECTED_ROLE_COUNT {
             return Err(ProductError::WrongRoleSet);
         }
@@ -142,9 +168,8 @@ impl<'a> Manifest<'a> {
                 return Err(ProductError::WrongRoleFlags);
             }
             let expected_profile = match expected_id {
-                RoleId::Registryd | RoleId::Devmgr => {
-                    (Activation::Early, StartupProfile::EarlyBootStub)
-                }
+                RoleId::Registryd => (Activation::Early, registry_profile),
+                RoleId::Devmgr => (Activation::Early, StartupProfile::EarlyBootStub),
                 RoleId::Uart16550d => (Activation::DeviceBound, StartupProfile::Retained),
                 RoleId::Consoled | RoleId::Wyrmsh => {
                     (Activation::ConsoleBound, StartupProfile::Retained)

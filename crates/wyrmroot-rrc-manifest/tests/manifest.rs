@@ -107,6 +107,19 @@ fn product_builder(reverse: bool) -> Builder<'static> {
     builder
 }
 
+fn wyr1b_product_builder() -> Builder<'static> {
+    let mut builder = Builder::new(BOOT_IDENTITY);
+    let mut roles = product_roles();
+    roles[0].startup_profile = StartupProfile::BootstrapRegistry;
+    for role in roles {
+        builder.add_role(role).unwrap();
+    }
+    for edge in product_edges() {
+        builder.add_dependency(edge).unwrap();
+    }
+    builder
+}
+
 fn observed_material(path: &'static str, byte: u8) -> ObservedRetainedMaterial<'static> {
     ObservedRetainedMaterial {
         path,
@@ -241,6 +254,35 @@ fn immutable_full_golden_is_product_valid_deterministic_and_zero_copy() {
         .unwrap();
     assert_eq!(global_edge, role_edge);
     assert_eq!(role_edge.target_role(), Some(RoleId::Devmgr));
+}
+
+#[test]
+fn wyr1a_and_wyr1b_registry_profile_matrices_are_distinct() {
+    let expected = expected_product_closure();
+    let observed = observed_product_materials();
+    let profile = product_profile(&expected, &observed);
+    let encoded = wyr1b_product_builder()
+        .build_wyr1b_product(profile)
+        .unwrap();
+    let parsed = Manifest::parse_wyr1b_product(&encoded, &BOOT_IDENTITY, profile).unwrap();
+    assert_eq!(
+        parsed.role(RoleId::Registryd).unwrap().startup_profile(),
+        StartupProfile::BootstrapRegistry
+    );
+    assert_eq!(
+        parsed.validate_wyr1a_product(profile),
+        Err(ProductError::WrongRoleActivationProfile)
+    );
+    let selector_25 = product_builder(false).build_wyr1a_product(profile).unwrap();
+    assert_eq!(selector_25, decode_hex(FULL_FIVE_ROLE_GOLDEN_HEX));
+    assert_eq!(
+        Manifest::parse_structural(&selector_25, &BOOT_IDENTITY)
+            .unwrap()
+            .role(RoleId::Registryd)
+            .unwrap()
+            .startup_profile(),
+        StartupProfile::EarlyBootStub
+    );
 }
 
 #[test]
@@ -413,7 +455,7 @@ fn role_fields_paths_utf8_reserved_and_identities_fail_closed() {
         Err(ParseError::UnknownActivation)
     );
     let mut unknown_profile = original.clone();
-    write_u16(&mut unknown_profile, HEADER_SIZE + 14, 2);
+    write_u16(&mut unknown_profile, HEADER_SIZE + 14, 3);
     assert_eq!(
         Manifest::parse_structural(&unknown_profile, &BOOT_IDENTITY),
         Err(ParseError::UnknownStartupProfile)

@@ -85,6 +85,7 @@ impl Activation {
 pub enum StartupProfile {
     Retained = 0,
     EarlyBootStub = 1,
+    BootstrapRegistry = 2,
 }
 
 impl StartupProfile {
@@ -92,6 +93,7 @@ impl StartupProfile {
         match value {
             0 => Ok(Self::Retained),
             1 => Ok(Self::EarlyBootStub),
+            2 => Ok(Self::BootstrapRegistry),
             _ => Err(ParseError::UnknownStartupProfile),
         }
     }
@@ -777,11 +779,13 @@ fn validate_activation_profile(
 ) -> Result<(), ParseError> {
     if matches!(
         (activation, profile),
-        (Activation::Early, StartupProfile::EarlyBootStub)
-            | (
-                Activation::DeviceBound | Activation::ConsoleBound,
-                StartupProfile::Retained
-            )
+        (
+            Activation::Early,
+            StartupProfile::EarlyBootStub | StartupProfile::BootstrapRegistry,
+        ) | (
+            Activation::DeviceBound | Activation::ConsoleBound,
+            StartupProfile::Retained
+        )
     ) {
         Ok(())
     } else {
