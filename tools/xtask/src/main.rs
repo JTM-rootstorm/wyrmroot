@@ -1,5 +1,6 @@
 mod cli;
 mod deep_layout;
+mod dw1b;
 mod elf_runtime;
 mod error;
 mod g3_image;
@@ -119,6 +120,30 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
         Action::Wyr1BEvidence { request, log } => {
             wyr1b::evidence(std::path::Path::new(&request), std::path::Path::new(&log)).map(Some)
         }
+        Action::Dw1BImage(request) => dw1b::build(std::path::Path::new(&request)).map(Some),
+        Action::Dw1BInspect(request) => dw1b::inspect(std::path::Path::new(&request)).map(Some),
+        Action::Dw1BMeasure {
+            init,
+            hello,
+            cpu_hog,
+            progress,
+        } => dw1b::measure(
+            std::path::Path::new(&init),
+            std::path::Path::new(&hello),
+            std::path::Path::new(&cpu_hog),
+            std::path::Path::new(&progress),
+        )
+        .map(Some),
+        Action::Dw1BEvidence {
+            request,
+            log,
+            debug_exit,
+        } => dw1b::evidence(
+            std::path::Path::new(&request),
+            std::path::Path::new(&log),
+            debug_exit,
+        )
+        .map(Some),
         Action::Unavailable(command) => Err(Failure::unavailable(command)),
     }
 }

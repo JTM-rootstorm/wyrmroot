@@ -21,6 +21,10 @@ Usage:
     cargo xtask wyr1b image --request <wyr1-b-request.toml>
     cargo xtask wyr1b inspect --request <wyr1-b-request.toml>
     cargo xtask wyr1b evidence --request <wyr1-b-request.toml> --log <evidence>
+    cargo xtask dw1b image --request <dw1-b-request.toml>
+    cargo xtask dw1b inspect --request <dw1-b-request.toml>
+    cargo xtask dw1b measure --init <elf> --hello <elf> --cpu-hog <elf> --progress <elf>
+    cargo xtask dw1b evidence --request <dw1-b-request.toml> --log <serial-log> --debug-exit 33
 
 Host filters may name a component (bootfs, protocol, elf, runtime, bootstrap,
 efi, init0, hello, or xtask), package:<workspace-package>, or test:<substring>.
@@ -112,6 +116,19 @@ pub(crate) enum Action {
         request: String,
         log: String,
     },
+    Dw1BImage(String),
+    Dw1BInspect(String),
+    Dw1BMeasure {
+        init: String,
+        hello: String,
+        cpu_hog: String,
+        progress: String,
+    },
+    Dw1BEvidence {
+        request: String,
+        log: String,
+        debug_exit: u32,
+    },
     Unavailable(&'static str),
 }
 
@@ -159,9 +176,61 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
         "test" => dispatch_test(&arguments[1..]),
         "wyr1" => dispatch_wyr1(&arguments[1..]),
         "wyr1b" => dispatch_wyr1b(&arguments[1..]),
+        "dw1b" => dispatch_dw1b(&arguments[1..]),
         unknown => Err(Failure::usage(format!(
             "unknown command '{unknown}'\n\n{USAGE}"
         ))),
+    }
+}
+
+fn dispatch_dw1b(arguments: &[String]) -> Result<Action, Failure> {
+    match arguments {
+        [command, flag, request] if command == "image" && flag == "--request" => {
+            Ok(Action::Dw1BImage(request.clone()))
+        }
+        [command, flag, request] if command == "inspect" && flag == "--request" => {
+            Ok(Action::Dw1BInspect(request.clone()))
+        }
+        [
+            command,
+            init_flag,
+            init,
+            hello_flag,
+            hello,
+            hog_flag,
+            cpu_hog,
+            progress_flag,
+            progress,
+        ] if command == "measure"
+            && init_flag == "--init"
+            && hello_flag == "--hello"
+            && hog_flag == "--cpu-hog"
+            && progress_flag == "--progress" =>
+        {
+            Ok(Action::Dw1BMeasure {
+                init: init.clone(),
+                hello: hello.clone(),
+                cpu_hog: cpu_hog.clone(),
+                progress: progress.clone(),
+            })
+        }
+        [command, flag, request, log_flag, log, exit_flag, debug_exit]
+            if command == "evidence"
+                && flag == "--request"
+                && log_flag == "--log"
+                && exit_flag == "--debug-exit" =>
+        {
+            Ok(Action::Dw1BEvidence {
+                request: request.clone(),
+                log: log.clone(),
+                debug_exit: debug_exit.parse().map_err(|_| {
+                    Failure::usage("dw1b --debug-exit must be a canonical decimal status")
+                })?,
+            })
+        }
+        _ => Err(Failure::usage(
+            "dw1b requires image|inspect --request <path>, measure with four exact artifacts, or evidence --request <path> --log <serial-log> --debug-exit 33",
+        )),
     }
 }
 
