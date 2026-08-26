@@ -70,11 +70,12 @@ pub use startup::{
 };
 pub use supervision::{
     AttemptFailure, AttemptRecord, CleanupAction, CleanupDisposition, ExitObservedReadinessError,
-    ExitValidationError, NativeSupervisionPlatform, RestartHistory, RestartState,
-    RestartSupervisor, RestartTransitionError, SupervisionError, SupervisionPlatform,
+    ExitValidationError, NativeSupervisionPlatform, ObservedSupervisionError, RestartHistory,
+    RestartState, RestartSupervisor, RestartTransitionError, SupervisionError, SupervisionPlatform,
     SupervisionPolicy, TerminalDisposition, WYR0_I_SUPERVISION_POLICY, await_child_ready_profile,
-    supervise_child, supervise_child_profile, supervise_native_child,
-    supervise_native_child_profile, supervise_ready_child_profile, validate_successful_exit,
+    await_child_ready_profile_observed, supervise_child, supervise_child_profile,
+    supervise_native_child, supervise_native_child_profile, supervise_ready_child_profile,
+    validate_successful_exit,
 };
 #[cfg(feature = "primordial-test-support")]
 pub use test_support::{

@@ -101,16 +101,7 @@ pub enum ExitValidationError {
 
 /// Validates the complete successful Process exit record required by WYR0-E.
 pub fn validate_successful_exit(info: &DwTaskTerminationInfoV1) -> Result<(), ExitValidationError> {
-    if info.size != DW_TASK_TERMINATION_INFO_V1_SIZE
-        || info.version != 1
-        || info.reserved0 != 0
-        || info.reserved != [0; 3]
-    {
-        return Err(ExitValidationError::InvalidEnvelope);
-    }
-    if info.state != DW_TASK_STATE_EXITED {
-        return Err(ExitValidationError::NotExited);
-    }
+    validate_terminal_record(info)?;
     if info.reason != DW_TERMINATION_NORMAL_EXIT {
         return Err(ExitValidationError::NotNormalExit);
     }
@@ -121,6 +112,20 @@ pub fn validate_successful_exit(info: &DwTaskTerminationInfoV1) -> Result<(), Ex
     }
     if info.exception_type.0 != 0 || info.detail != 0 || info.fault_address != 0 {
         return Err(ExitValidationError::NonzeroExceptionFields);
+    }
+    Ok(())
+}
+
+fn validate_terminal_record(info: &DwTaskTerminationInfoV1) -> Result<(), ExitValidationError> {
+    if info.size != DW_TASK_TERMINATION_INFO_V1_SIZE
+        || info.version != 1
+        || info.reserved0 != 0
+        || info.reserved != [0; 3]
+    {
+        return Err(ExitValidationError::InvalidEnvelope);
+    }
+    if info.state != DW_TASK_STATE_EXITED {
+        return Err(ExitValidationError::NotExited);
     }
     Ok(())
 }
@@ -168,6 +173,26 @@ pub enum ExitObservedReadinessError<PlatformError> {
     Ready(LaunchError),
     /// More than one launch-channel datagram was queued before terminal close.
     DuplicateReady,
+    /// Terminal close was observed without an accepted READY.
+    MissingReady,
+}
+
+/// Supervision result that preserves a fresh structured termination record.
+#[derive(Debug, Eq, PartialEq)]
+pub enum ObservedSupervisionError<PlatformError> {
+    /// Failure occurred before a terminal record was available.
+    Supervision(SupervisionError<PlatformError>),
+    /// Exact terminal state was observed before READY.
+    ExitedBeforeReady(DwTaskTerminationInfoV1),
+    /// Launch peer closure was followed by exact terminal observation before READY.
+    PeerClosedBeforeReady(DwTaskTerminationInfoV1),
+    /// Exact terminal state was structurally valid but not normal-zero.
+    Exit(ExitValidationError, DwTaskTerminationInfoV1),
+    /// READY drain failed after exact terminal state was observed.
+    ExitObservedReadiness(
+        ExitObservedReadinessError<PlatformError>,
+        DwTaskTerminationInfoV1,
+    ),
 }
 
 impl<PlatformError> SupervisionError<PlatformError> {
@@ -187,6 +212,33 @@ impl<PlatformError> SupervisionError<PlatformError> {
                 | Self::Exit(_)
                 | Self::ExitObservedReadiness(_)
         )
+    }
+}
+
+impl<PlatformError> ObservedSupervisionError<PlatformError> {
+    #[must_use]
+    pub const fn process_exit_observed(&self) -> bool {
+        match self {
+            Self::Supervision(SupervisionError::PeerClosedBeforeReady) => false,
+            Self::Supervision(error) => error.process_exit_observed(),
+            Self::ExitedBeforeReady(_)
+            | Self::PeerClosedBeforeReady(_)
+            | Self::Exit(_, _)
+            | Self::ExitObservedReadiness(_, _) => true,
+        }
+    }
+
+    fn into_legacy(self) -> SupervisionError<PlatformError> {
+        match self {
+            Self::Supervision(error) => error,
+            Self::ExitedBeforeReady(info) => match validate_successful_exit(&info) {
+                Ok(()) => SupervisionError::ExitedBeforeReady,
+                Err(error) => SupervisionError::Exit(error),
+            },
+            Self::PeerClosedBeforeReady(_) => SupervisionError::PeerClosedBeforeReady,
+            Self::Exit(error, _) => SupervisionError::Exit(error),
+            Self::ExitObservedReadiness(error, _) => SupervisionError::ExitObservedReadiness(error),
+        }
     }
 }
 
@@ -236,6 +288,8 @@ pub fn supervise_child_profile<P: SupervisionPlatform>(
         deadline,
         false,
     )
+    .map(|_| ())
+    .map_err(ObservedSupervisionError::into_legacy)
 }
 
 /// Continues observing a resident child after exact READY was already accepted.
@@ -251,7 +305,7 @@ pub fn supervise_ready_child_profile<P: SupervisionPlatform>(
     profile: LaunchProfile,
     transaction_id: u64,
     lifetime_deadline: DwDeadline,
-) -> Result<(), SupervisionError<P::Error>> {
+) -> Result<DwTaskTerminationInfoV1, ObservedSupervisionError<P::Error>> {
     supervise_profile_state(
         platform,
         process,
@@ -271,7 +325,7 @@ fn supervise_profile_state<P: SupervisionPlatform>(
     transaction_id: u64,
     deadline: DwDeadline,
     mut ready: bool,
-) -> Result<(), SupervisionError<P::Error>> {
+) -> Result<DwTaskTerminationInfoV1, ObservedSupervisionError<P::Error>> {
     let mut monitor_channel = true;
     loop {
         let channel_item = DwWaitItemV1 {
@@ -292,16 +346,21 @@ fn supervise_profile_state<P: SupervisionPlatform>(
         } else {
             &items[..1]
         };
-        let result = platform
-            .wait_many(wait_items, deadline)
-            .map_err(SupervisionError::Platform)?;
-        let index =
-            usize::try_from(result.index).map_err(|_| SupervisionError::InvalidWaitResult)?;
+        let result = platform.wait_many(wait_items, deadline).map_err(|error| {
+            ObservedSupervisionError::Supervision(SupervisionError::Platform(error))
+        })?;
+        let index = usize::try_from(result.index).map_err(|_| {
+            ObservedSupervisionError::Supervision(SupervisionError::InvalidWaitResult)
+        })?;
         let Some(item) = wait_items.get(index) else {
-            return Err(SupervisionError::InvalidWaitResult);
+            return Err(ObservedSupervisionError::Supervision(
+                SupervisionError::InvalidWaitResult,
+            ));
         };
         if result.observed.0 & item.signals.0 == 0 {
-            return Err(SupervisionError::InvalidWaitResult);
+            return Err(ObservedSupervisionError::Supervision(
+                SupervisionError::InvalidWaitResult,
+            ));
         }
 
         if monitor_channel && index == 0 {
@@ -310,20 +369,27 @@ fn supervise_profile_state<P: SupervisionPlatform>(
                 let mut handles = [];
                 let counts = platform
                     .receive_channel(launch_channel, &mut bytes, &mut handles)
-                    .map_err(SupervisionError::Platform)?;
+                    .map_err(|error| {
+                        ObservedSupervisionError::Supervision(SupervisionError::Platform(error))
+                    })?;
                 if counts
                     != (ReceiveCounts {
                         bytes: HEADER_BYTES,
                         handles: 0,
                     })
                 {
-                    return Err(SupervisionError::InvalidReadyReceive(counts));
+                    return Err(ObservedSupervisionError::Supervision(
+                        SupervisionError::InvalidReadyReceive(counts),
+                    ));
                 }
                 if ready {
-                    return Err(SupervisionError::DuplicateReady);
+                    return Err(ObservedSupervisionError::Supervision(
+                        SupervisionError::DuplicateReady,
+                    ));
                 }
-                launch::parse_ready_for_profile(profile, &bytes, transaction_id)
-                    .map_err(SupervisionError::Ready)?;
+                launch::parse_ready_for_profile(profile, &bytes, transaction_id).map_err(
+                    |error| ObservedSupervisionError::Supervision(SupervisionError::Ready(error)),
+                )?;
                 ready = true;
                 // Channel signals are level-triggered, but this wait result predates the
                 // receive.  In particular, a combined READABLE | PEER_CLOSED result does not
@@ -341,17 +407,23 @@ fn supervise_profile_state<P: SupervisionPlatform>(
         }
 
         if index != 0 && !(monitor_channel && index == 1) {
-            return Err(SupervisionError::InvalidWaitResult);
+            return Err(ObservedSupervisionError::Supervision(
+                SupervisionError::InvalidWaitResult,
+            ));
         }
-        let info = platform
-            .query_task_termination(process)
-            .map_err(SupervisionError::ExitQuery)?;
-        validate_successful_exit(&info).map_err(SupervisionError::Exit)?;
+        let info = platform.query_task_termination(process).map_err(|error| {
+            ObservedSupervisionError::Supervision(SupervisionError::ExitQuery(error))
+        })?;
+        if let Err(error) = validate_terminal_record(&info) {
+            return Err(ObservedSupervisionError::Exit(error, info));
+        }
         if !monitor_channel {
             return if ready {
-                Ok(())
+                validate_successful_exit(&info)
+                    .map(|()| info)
+                    .map_err(|error| ObservedSupervisionError::Exit(error, info))
             } else {
-                Err(SupervisionError::PeerClosedBeforeReady)
+                Err(ObservedSupervisionError::PeerClosedBeforeReady(info))
             };
         }
 
@@ -360,14 +432,22 @@ fn supervise_profile_state<P: SupervisionPlatform>(
         // immediately resolve to READABLE and/or PEER_CLOSED.  Consume and validate every queued
         // protocol message before deciding that READY was missing, preserving the EXITED fact for
         // caller cleanup on every failure below.
-        return drain_terminal_launch_channel(
+        return match drain_terminal_launch_channel(
             platform,
             launch_channel,
             profile,
             transaction_id,
             ready,
             deadline,
-        );
+        ) {
+            Ok(()) => validate_successful_exit(&info)
+                .map(|()| info)
+                .map_err(|error| ObservedSupervisionError::Exit(error, info)),
+            Err(ExitObservedReadinessError::MissingReady) => {
+                Err(ObservedSupervisionError::ExitedBeforeReady(info))
+            }
+            Err(error) => Err(ObservedSupervisionError::ExitObservedReadiness(error, info)),
+        };
     }
 }
 
@@ -384,8 +464,30 @@ pub fn await_child_ready_profile<P: SupervisionPlatform>(
     transaction_id: u64,
     deadline: DwDeadline,
 ) -> Result<(), SupervisionError<P::Error>> {
+    await_child_ready_profile_observed(
+        platform,
+        process,
+        launch_channel,
+        profile,
+        transaction_id,
+        deadline,
+    )
+    .map_err(ObservedSupervisionError::into_legacy)
+}
+
+/// READY observation that preserves an exact terminal record on early exit.
+pub fn await_child_ready_profile_observed<P: SupervisionPlatform>(
+    platform: &mut P,
+    process: DwHandle,
+    launch_channel: DwHandle,
+    profile: LaunchProfile,
+    transaction_id: u64,
+    deadline: DwDeadline,
+) -> Result<(), ObservedSupervisionError<P::Error>> {
     if deadline == DW_DEADLINE_INFINITE {
-        return Err(SupervisionError::UnboundedDeadline);
+        return Err(ObservedSupervisionError::Supervision(
+            SupervisionError::UnboundedDeadline,
+        ));
     }
     let items = [
         DwWaitItemV1 {
@@ -397,40 +499,54 @@ pub fn await_child_ready_profile<P: SupervisionPlatform>(
             signals: DW_SIGNAL_EXITED,
         },
     ];
-    let result = platform
-        .wait_many(&items, deadline)
-        .map_err(SupervisionError::Platform)?;
-    let index = usize::try_from(result.index).map_err(|_| SupervisionError::InvalidWaitResult)?;
+    let result = platform.wait_many(&items, deadline).map_err(|error| {
+        ObservedSupervisionError::Supervision(SupervisionError::Platform(error))
+    })?;
+    let index = usize::try_from(result.index)
+        .map_err(|_| ObservedSupervisionError::Supervision(SupervisionError::InvalidWaitResult))?;
     let Some(item) = items.get(index) else {
-        return Err(SupervisionError::InvalidWaitResult);
+        return Err(ObservedSupervisionError::Supervision(
+            SupervisionError::InvalidWaitResult,
+        ));
     };
     if result.observed.0 & item.signals.0 == 0 {
-        return Err(SupervisionError::InvalidWaitResult);
+        return Err(ObservedSupervisionError::Supervision(
+            SupervisionError::InvalidWaitResult,
+        ));
     }
     if index == 1 {
-        platform
-            .query_task_termination(process)
-            .map_err(SupervisionError::ExitQuery)?;
-        return Err(SupervisionError::ExitedBeforeReady);
+        let info = platform.query_task_termination(process).map_err(|error| {
+            ObservedSupervisionError::Supervision(SupervisionError::ExitQuery(error))
+        })?;
+        if let Err(error) = validate_terminal_record(&info) {
+            return Err(ObservedSupervisionError::Exit(error, info));
+        }
+        return Err(ObservedSupervisionError::ExitedBeforeReady(info));
     }
     if result.observed.0 & DW_SIGNAL_READABLE.0 == 0 {
-        return Err(SupervisionError::PeerClosedBeforeReady);
+        return Err(ObservedSupervisionError::Supervision(
+            SupervisionError::PeerClosedBeforeReady,
+        ));
     }
     let mut bytes = [0; HEADER_BYTES];
     let mut handles = [];
     let counts = platform
         .receive_channel(launch_channel, &mut bytes, &mut handles)
-        .map_err(SupervisionError::Platform)?;
+        .map_err(|error| {
+            ObservedSupervisionError::Supervision(SupervisionError::Platform(error))
+        })?;
     if counts
         != (ReceiveCounts {
             bytes: HEADER_BYTES,
             handles: 0,
         })
     {
-        return Err(SupervisionError::InvalidReadyReceive(counts));
+        return Err(ObservedSupervisionError::Supervision(
+            SupervisionError::InvalidReadyReceive(counts),
+        ));
     }
     launch::parse_ready_for_profile(profile, &bytes, transaction_id)
-        .map_err(SupervisionError::Ready)?;
+        .map_err(|error| ObservedSupervisionError::Supervision(SupervisionError::Ready(error)))?;
     Ok(())
 }
 
@@ -441,7 +557,7 @@ fn drain_terminal_launch_channel<P: SupervisionPlatform>(
     transaction_id: u64,
     mut ready: bool,
     deadline: DwDeadline,
-) -> Result<(), SupervisionError<P::Error>> {
+) -> Result<(), ExitObservedReadinessError<P::Error>> {
     let channel_item = DwWaitItemV1 {
         handle: launch_channel,
         signals: CHANNEL_SIGNALS,
@@ -449,42 +565,29 @@ fn drain_terminal_launch_channel<P: SupervisionPlatform>(
     loop {
         let result = platform
             .wait_many(core::slice::from_ref(&channel_item), deadline)
-            .map_err(|error| {
-                SupervisionError::ExitObservedReadiness(ExitObservedReadinessError::Platform(error))
-            })?;
+            .map_err(ExitObservedReadinessError::Platform)?;
         if result.index != 0 || result.observed.0 & CHANNEL_SIGNALS.0 == 0 {
-            return Err(SupervisionError::ExitObservedReadiness(
-                ExitObservedReadinessError::InvalidWaitResult,
-            ));
+            return Err(ExitObservedReadinessError::InvalidWaitResult);
         }
         if result.observed.0 & DW_SIGNAL_READABLE.0 != 0 {
             let mut bytes = [0_u8; HEADER_BYTES];
             let mut handles = [];
             let counts = platform
                 .receive_channel(launch_channel, &mut bytes, &mut handles)
-                .map_err(|error| {
-                    SupervisionError::ExitObservedReadiness(ExitObservedReadinessError::Platform(
-                        error,
-                    ))
-                })?;
+                .map_err(ExitObservedReadinessError::Platform)?;
             if counts
                 != (ReceiveCounts {
                     bytes: HEADER_BYTES,
                     handles: 0,
                 })
             {
-                return Err(SupervisionError::ExitObservedReadiness(
-                    ExitObservedReadinessError::InvalidReadyReceive(counts),
-                ));
+                return Err(ExitObservedReadinessError::InvalidReadyReceive(counts));
             }
             if ready {
-                return Err(SupervisionError::ExitObservedReadiness(
-                    ExitObservedReadinessError::DuplicateReady,
-                ));
+                return Err(ExitObservedReadinessError::DuplicateReady);
             }
-            launch::parse_ready_for_profile(profile, &bytes, transaction_id).map_err(|error| {
-                SupervisionError::ExitObservedReadiness(ExitObservedReadinessError::Ready(error))
-            })?;
+            launch::parse_ready_for_profile(profile, &bytes, transaction_id)
+                .map_err(ExitObservedReadinessError::Ready)?;
             ready = true;
             // The wait result predates the receive.  Require a fresh level-triggered wait
             // before accepting terminal peer closure so any additional queued datagram is
@@ -495,7 +598,7 @@ fn drain_terminal_launch_channel<P: SupervisionPlatform>(
         return if ready {
             Ok(())
         } else {
-            Err(SupervisionError::ExitedBeforeReady)
+            Err(ExitObservedReadinessError::MissingReady)
         };
     }
 }
@@ -751,7 +854,7 @@ mod tests {
 
     #[test]
     fn preserves_nonzero_application_exit_observed_before_ready() {
-        let mut mock = Mock::successful(&[EXITED]);
+        let mut mock = Mock::successful(&[EXITED, CLOSED]);
         mock.task_info.application_code = 37;
         let error = supervise_child(&mut mock, DwHandle(1), DwHandle(2), 7, DwDeadline(99));
         assert_eq!(
@@ -761,6 +864,44 @@ mod tests {
             ))
         );
         assert!(error.unwrap_err().process_exit_observed());
+    }
+
+    #[test]
+    fn observed_ready_wait_preserves_exact_degraded_exit_record() {
+        let mut mock = Mock::successful(&[EXITED]);
+        mock.task_info.application_code = 0xA101_F001;
+        let error = await_child_ready_profile_observed(
+            &mut mock,
+            DwHandle(1),
+            DwHandle(2),
+            LaunchProfile::Hello,
+            7,
+            DwDeadline(99),
+        )
+        .unwrap_err();
+        let ObservedSupervisionError::ExitedBeforeReady(info) = error else {
+            panic!("expected termination-bearing early exit")
+        };
+        assert_eq!(info.application_code, 0xA101_F001);
+    }
+
+    #[test]
+    fn observed_post_ready_failure_preserves_exact_authorized_record() {
+        let mut mock = Mock::successful(&[EXITED, CLOSED]);
+        mock.task_info.reason = deepwyrm_syscall::DW_TERMINATION_AUTHORIZED;
+        let error = supervise_ready_child_profile(
+            &mut mock,
+            DwHandle(1),
+            DwHandle(2),
+            LaunchProfile::Hello,
+            7,
+            DW_DEADLINE_INFINITE,
+        )
+        .unwrap_err();
+        let ObservedSupervisionError::Exit(ExitValidationError::NotNormalExit, info) = error else {
+            panic!("expected termination-bearing authorized exit")
+        };
+        assert_eq!(info.reason, deepwyrm_syscall::DW_TERMINATION_AUTHORIZED);
     }
 
     #[test]
