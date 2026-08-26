@@ -26,12 +26,23 @@ if [ -L "$artifact" ] || [ ! -f "$artifact" ] || [ ! -s "$artifact" ]; then
     exit 1
 fi
 
-for tool in awk llvm-readelf llvm-readobj llvm-nm llvm-objdump sha256sum; do
+for tool in awk llvm-readelf llvm-readobj llvm-nm llvm-objdump od sha256sum; do
     command -v "$tool" >/dev/null 2>&1 || {
         printf 'required inspection tool unavailable: %s\n' "$tool" >&2
         exit 1
     }
 done
+
+osabi=$(od -An -tu1 -j7 -N1 "$artifact" | tr -d ' ')
+abi_version=$(od -An -tu1 -j8 -N1 "$artifact" | tr -d ' ')
+if [ "$osabi" != 0 ]; then
+    printf 'native artifact has numeric ELF OSABI %s; expected 0\n' "$osabi" >&2
+    exit 1
+fi
+if [ "$abi_version" != 0 ]; then
+    printf 'native artifact has numeric ELF ABI version %s; expected 0\n' "$abi_version" >&2
+    exit 1
+fi
 
 headers=$(llvm-readelf --file-header --program-headers --wide "$artifact")
 raw_programs=$(llvm-readobj --program-headers "$artifact")
@@ -210,9 +221,9 @@ fi
 
 sha256=$(sha256sum "$artifact" | awk '{ print $1 }')
 if [ "$inspection_mode" = production ]; then
-    printf '{"schema_version":1,"report_kind":"wyrmroot-wyr0-native-artifact-inspection","verified":true,"artifact":"%s","sha256":"%s","size":%s,"program_headers":%s,"load_segments":%s,"syscall_veneers":1}\n' \
-        "$(basename "$artifact")" "$sha256" "$size" "$program_count" "$load_count"
+    printf '{"schema_version":1,"report_kind":"wyrmroot-wyr0-native-artifact-inspection","verified":true,"artifact":"%s","sha256":"%s","size":%s,"osabi":%s,"abi_version":%s,"program_headers":%s,"load_segments":%s,"syscall_veneers":1}\n' \
+        "$(basename "$artifact")" "$sha256" "$size" "$osabi" "$abi_version" "$program_count" "$load_count"
 else
-    printf '{"schema_version":1,"report_kind":"wyrmroot-wyr0-native-artifact-inspection","verified":true,"artifact":"%s","sha256":"%s","size":%s,"program_headers":%s,"load_segments":%s,"syscall_veneers":1,"test_only_invalid_return_tails":1}\n' \
-        "$(basename "$artifact")" "$sha256" "$size" "$program_count" "$load_count"
+    printf '{"schema_version":1,"report_kind":"wyrmroot-wyr0-native-artifact-inspection","verified":true,"artifact":"%s","sha256":"%s","size":%s,"osabi":%s,"abi_version":%s,"program_headers":%s,"load_segments":%s,"syscall_veneers":1,"test_only_invalid_return_tails":1}\n' \
+        "$(basename "$artifact")" "$sha256" "$size" "$osabi" "$abi_version" "$program_count" "$load_count"
 fi

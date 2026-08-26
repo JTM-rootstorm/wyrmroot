@@ -16,6 +16,17 @@ fn repository() -> PathBuf {
 }
 
 #[test]
+fn both_native_payloads_use_the_canonical_linker_contract() {
+    let build =
+        fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("build.rs")).unwrap();
+    assert!(build.contains("../../toolchain/native-user.ld"));
+    for binary in ["wyrmroot-dw1b-cpu-hog", "wyrmroot-dw1b-progress"] {
+        assert!(build.contains(binary), "build script omitted {binary}");
+        assert!(build.contains("--build-id=none"));
+    }
+}
+
+#[test]
 fn executed_hog_loop_is_syscall_yield_and_block_free() {
     let source =
         fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs")).unwrap();
