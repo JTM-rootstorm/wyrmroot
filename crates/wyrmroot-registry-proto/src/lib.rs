@@ -87,6 +87,8 @@ pub enum EnumerationScope {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InstallPublication<'a> {
+    pub endpoint_id: u64,
+    pub endpoint_generation: u64,
     pub supervisor_role_id: u32,
     pub publication_id: u64,
     pub service_generation: u64,
@@ -97,6 +99,8 @@ pub struct InstallPublication<'a> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InstallClient {
+    pub endpoint_id: u64,
+    pub endpoint_generation: u64,
     pub client_id: u64,
     pub client_generation: u64,
     pub scope: EnumerationScope,
@@ -246,21 +250,27 @@ pub fn parse(bytes: &[u8], received_handle_count: usize) -> Result<ParsedMessage
         }
         MessageType::InstallClient => {
             require_handles(received_handle_count, 1)?;
-            require_size(bytes, 88)?;
-            let scope = match read_u32(bytes, 80)? {
+            require_size(bytes, 104)?;
+            let scope = match read_u32(bytes, 96)? {
                 0 => EnumerationScope::None,
                 1 => EnumerationScope::BootstrapMetadata,
                 _ => return Err(Error::InvalidScope),
             };
-            if read_u32(bytes, 84)? != 0 {
+            if read_u32(bytes, 100)? != 0 {
                 return Err(Error::NonzeroReserved);
             }
             let value = InstallClient {
-                client_id: read_u64(bytes, 64)?,
-                client_generation: read_u64(bytes, 72)?,
+                endpoint_id: read_u64(bytes, 64)?,
+                endpoint_generation: read_u64(bytes, 72)?,
+                client_id: read_u64(bytes, 80)?,
+                client_generation: read_u64(bytes, 88)?,
                 scope,
             };
-            if value.client_id == 0 || value.client_generation == 0 {
+            if value.endpoint_id == 0
+                || value.endpoint_generation == 0
+                || value.client_id == 0
+                || value.client_generation == 0
+            {
                 return Err(Error::ZeroIdentity);
             }
             Message::InstallClient(value)
@@ -445,6 +455,8 @@ pub fn encode_lookup(header: Header, lookup: Lookup<'_>, out: &mut [u8]) -> Resu
 
 pub fn encode_install_publication(
     header: Header,
+    endpoint_id: u64,
+    endpoint_generation: u64,
     supervisor_role_id: u32,
     publication_id: u64,
     service_generation: u64,
@@ -454,6 +466,8 @@ pub fn encode_install_publication(
     out: &mut [u8],
 ) -> Result<usize, Error> {
     if header.message_type != MessageType::InstallPublication
+        || endpoint_id == 0
+        || endpoint_generation == 0
         || supervisor_role_id == 0
         || publication_id == 0
         || service_generation == 0
@@ -463,7 +477,7 @@ pub fn encode_install_publication(
     }
     validate_name(name)?;
     validate_versions(versions)?;
-    let size = 104usize
+    let size = 120usize
         .checked_add(
             versions
                 .len()
@@ -473,19 +487,50 @@ pub fn encode_install_publication(
         .and_then(|value| value.checked_add(name.len()))
         .ok_or(Error::ArithmeticOverflow)?;
     encode_header(header, 1, size, out)?;
-    put_u32(out, 64, supervisor_role_id)?;
-    put_u64(out, 72, publication_id)?;
-    put_u64(out, 80, service_generation)?;
-    put_u64(out, 88, protocol_id)?;
-    put_u16(out, 96, versions.len() as u16)?;
-    put_u16(out, 98, name.len() as u16)?;
+    put_u64(out, 64, endpoint_id)?;
+    put_u64(out, 72, endpoint_generation)?;
+    put_u32(out, 80, supervisor_role_id)?;
+    put_u64(out, 88, publication_id)?;
+    put_u64(out, 96, service_generation)?;
+    put_u64(out, 104, protocol_id)?;
+    put_u16(out, 112, versions.len() as u16)?;
+    put_u16(out, 114, name.len() as u16)?;
     for (index, version) in versions.iter().enumerate() {
-        put_u16(out, 104 + index * 4, version.major)?;
-        put_u16(out, 106 + index * 4, version.minor)?;
+        put_u16(out, 120 + index * 4, version.major)?;
+        put_u16(out, 122 + index * 4, version.minor)?;
     }
-    let name_offset = 104 + versions.len() * 4;
+    let name_offset = 120 + versions.len() * 4;
     out[name_offset..size].copy_from_slice(name);
     Ok(size)
+}
+
+pub fn encode_install_client(
+    header: Header,
+    install: InstallClient,
+    out: &mut [u8],
+) -> Result<usize, Error> {
+    if header.message_type != MessageType::InstallClient
+        || install.endpoint_id == 0
+        || install.endpoint_generation == 0
+        || install.client_id == 0
+        || install.client_generation == 0
+    {
+        return Err(Error::ZeroIdentity);
+    }
+    encode_header(header, 1, 104, out)?;
+    put_u64(out, 64, install.endpoint_id)?;
+    put_u64(out, 72, install.endpoint_generation)?;
+    put_u64(out, 80, install.client_id)?;
+    put_u64(out, 88, install.client_generation)?;
+    put_u32(
+        out,
+        96,
+        match install.scope {
+            EnumerationScope::None => 0,
+            EnumerationScope::BootstrapMetadata => 1,
+        },
+    )?;
+    Ok(104)
 }
 
 pub fn validate_name(name: &[u8]) -> Result<(), Error> {
@@ -501,18 +546,18 @@ pub fn validate_name(name: &[u8]) -> Result<(), Error> {
 }
 
 fn parse_install_publication(bytes: &[u8]) -> Result<InstallPublication<'_>, Error> {
-    if bytes.len() < 108 {
+    if bytes.len() < 124 {
         return Err(Error::WrongSize);
     }
-    if read_u32(bytes, 68)? != 0 || read_u32(bytes, 100)? != 0 {
+    if read_u32(bytes, 84)? != 0 || read_u32(bytes, 116)? != 0 {
         return Err(Error::NonzeroReserved);
     }
-    let count = usize::from(read_u16(bytes, 96)?);
-    let name_len = usize::from(read_u16(bytes, 98)?);
+    let count = usize::from(read_u16(bytes, 112)?);
+    let name_len = usize::from(read_u16(bytes, 114)?);
     if !(1..=MAX_PROTOCOL_VERSIONS).contains(&count) {
         return Err(Error::InvalidVersionList);
     }
-    let versions_end = 104usize
+    let versions_end = 120usize
         .checked_add(count.checked_mul(4).ok_or(Error::ArithmeticOverflow)?)
         .ok_or(Error::ArithmeticOverflow)?;
     let total = versions_end
@@ -522,20 +567,27 @@ fn parse_install_publication(bytes: &[u8]) -> Result<InstallPublication<'_>, Err
         return Err(Error::WrongSize);
     }
     let versions = VersionList {
-        bytes: &bytes[104..versions_end],
+        bytes: &bytes[120..versions_end],
     };
     validate_version_list(versions)?;
     let service_name = &bytes[versions_end..];
     validate_name(service_name)?;
     let value = InstallPublication {
-        supervisor_role_id: read_u32(bytes, 64)?,
-        publication_id: read_u64(bytes, 72)?,
-        service_generation: read_u64(bytes, 80)?,
-        protocol_id: read_u64(bytes, 88)?,
+        endpoint_id: read_u64(bytes, 64)?,
+        endpoint_generation: read_u64(bytes, 72)?,
+        supervisor_role_id: read_u32(bytes, 80)?,
+        publication_id: read_u64(bytes, 88)?,
+        service_generation: read_u64(bytes, 96)?,
+        protocol_id: read_u64(bytes, 104)?,
         versions,
         service_name,
     };
-    if value.supervisor_role_id == 0 || value.publication_id == 0 || value.service_generation == 0 {
+    if value.endpoint_id == 0
+        || value.endpoint_generation == 0
+        || value.supervisor_role_id == 0
+        || value.publication_id == 0
+        || value.service_generation == 0
+    {
         return Err(Error::ZeroIdentity);
     }
     if value.protocol_id == 0 {
@@ -711,9 +763,11 @@ mod tests {
             ProtocolVersion { major: 1, minor: 0 },
             ProtocolVersion { major: 1, minor: 2 },
         ];
-        let mut bytes = [0u8; 140];
+        let mut bytes = [0u8; 160];
         let size = encode_install_publication(
             header(MessageType::InstallPublication),
+            21,
+            2,
             3,
             5,
             9,
@@ -727,6 +781,8 @@ mod tests {
         let Message::InstallPublication(value) = parsed.message else {
             panic!("wrong message")
         };
+        assert_eq!(value.endpoint_id, 21);
+        assert_eq!(value.endpoint_generation, 2);
         assert_eq!(value.supervisor_role_id, 3);
         assert_eq!(value.versions.get(1), Some(versions[1]));
         assert_eq!(value.service_name, b"org.wyrmroot.echo");
@@ -766,6 +822,8 @@ mod tests {
         assert_eq!(
             encode_install_publication(
                 header(MessageType::InstallPublication),
+                1,
+                1,
                 1,
                 1,
                 1,

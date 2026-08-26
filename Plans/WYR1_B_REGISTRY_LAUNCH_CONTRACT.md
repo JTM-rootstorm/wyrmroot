@@ -201,21 +201,24 @@ pairs.
 
 | Offset | Width | Field |
 | ---: | ---: | --- |
-| 64 | 4 | nonzero supervisor role ID |
-| 68 | 4 | flags, zero |
-| 72 | 8 | nonzero publication ID |
-| 80 | 8 | nonzero service generation |
-| 88 | 8 | nonzero protocol ID |
-| 96 | 2 | version count |
-| 98 | 2 | service-name byte count |
-| 100 | 4 | reserved, zero |
-| 104 | `4*n` | version pairs |
+| 64 | 8 | nonzero installed endpoint ID |
+| 72 | 8 | nonzero installed endpoint generation |
+| 80 | 4 | nonzero supervisor role ID |
+| 84 | 4 | flags, zero |
+| 88 | 8 | nonzero publication ID |
+| 96 | 8 | nonzero service generation |
+| 104 | 8 | nonzero protocol ID |
+| 112 | 2 | version count |
+| 114 | 2 | service-name byte count |
+| 116 | 4 | reserved, zero |
+| 120 | `4*n` | version pairs |
 | following | name length | service-name bytes |
 
 `INSTALL_CLIENT` carries one registry-side Channel with exact
-`READ | WRITE | WAIT | INSPECT`. Its fixed 88-byte message appends nonzero
-client ID, nonzero client generation, enumeration scope, and zero reserved
-fields. Enumeration scope is `0 NONE` or `1 BOOTSTRAP_METADATA`.
+`READ | WRITE | WAIT | INSPECT`. Its fixed 104-byte message appends nonzero
+installed endpoint ID, nonzero installed endpoint generation, nonzero client
+ID, nonzero client generation, enumeration scope, and zero reserved fields.
+Enumeration scope is `0 NONE` or `1 BOOTSTRAP_METADATA`.
 
 Duplicate endpoint/publication/client IDs, duplicate live service names,
 unsupported versions, wrong handles, capacity exhaustion, or stale generation

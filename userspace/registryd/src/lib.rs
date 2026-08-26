@@ -246,10 +246,13 @@ impl RegistryState {
     pub fn install_publication(
         &mut self,
         registry_generation: u64,
-        endpoint: EndpointIdentity,
         handle: u64,
         install: InstallPublication<'_>,
     ) -> Result<(), RegistryError> {
+        let endpoint = EndpointIdentity {
+            id: install.endpoint_id,
+            generation: install.endpoint_generation,
+        };
         self.validate_install(registry_generation, endpoint, handle)?;
         if self
             .publications
@@ -307,10 +310,13 @@ impl RegistryState {
     pub fn install_client(
         &mut self,
         registry_generation: u64,
-        endpoint: EndpointIdentity,
         handle: u64,
         install: InstallClient,
     ) -> Result<(), RegistryError> {
+        let endpoint = EndpointIdentity {
+            id: install.endpoint_id,
+            generation: install.endpoint_generation,
+        };
         self.validate_install(registry_generation, endpoint, handle)?;
         if self
             .clients
@@ -605,6 +611,8 @@ mod tests {
         };
         let size = encode_install_publication(
             header,
+            31,
+            1,
             1,
             11,
             13,
@@ -634,14 +642,15 @@ mod tests {
         };
         let mut bytes = [0u8; 160];
         state
-            .install_publication(7, publication, 101, install(&mut bytes))
+            .install_publication(7, 101, install(&mut bytes))
             .unwrap();
         state
             .install_client(
                 7,
-                client,
                 102,
                 InstallClient {
+                    endpoint_id: client.id,
+                    endpoint_generation: client.generation,
                     client_id: 3,
                     client_generation: 1,
                     scope: EnumerationScope::BootstrapMetadata,
@@ -684,7 +693,7 @@ mod tests {
         };
         let mut bytes = [0u8; 160];
         state
-            .install_publication(7, publication, 101, install(&mut bytes))
+            .install_publication(7, 101, install(&mut bytes))
             .unwrap();
         assert_eq!(state.publish(publication, 5), Ok(13));
         assert_eq!(
@@ -698,9 +707,10 @@ mod tests {
         state
             .install_client(
                 7,
-                client,
                 102,
                 InstallClient {
+                    endpoint_id: client.id,
+                    endpoint_generation: client.generation,
                     client_id: 3,
                     client_generation: 1,
                     scope: EnumerationScope::None,
