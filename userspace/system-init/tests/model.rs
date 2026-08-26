@@ -181,9 +181,8 @@ fn exact_registry_then_devmgr_ready_reaches_normal_without_activating_retained_r
     assert_eq!(init.mode(), SystemMode::Normal);
     init.terminal(RoleId::Devmgr, 1, 11, 6, TerminalDisposition::NormalExit(0))
         .unwrap();
+    assert_eq!(init.mode(), SystemMode::Normal);
     init.cleanup_complete(RoleId::Devmgr, 1, 11, 7).unwrap();
-    assert_eq!(init.mode(), SystemMode::ActivatingEarlyRoles);
-    init.complete_early_activation(7, 1, 11).unwrap();
     assert_eq!(init.mode(), SystemMode::Normal);
     assert_eq!(init.result(), Some(RecoveryResult::Recovered));
 }
