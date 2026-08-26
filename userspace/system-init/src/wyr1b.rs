@@ -8,6 +8,7 @@ use wyrmroot_launch_proto::{MAX_COMPLETED_JOBS, MAX_LIVE_JOBS, Reservation};
 use wyrmroot_loader::process::{
     JobLoadRequest, LoadAuthority, LoadError, LoadedProcess, LoaderPlatform, load_job_process,
 };
+use wyrmroot_registry_proto::{Correlation, CorrelationEnvironment};
 use wyrmroot_runtime::sha256;
 
 const MAX_CONNECTIONS: usize = 16;
@@ -80,6 +81,21 @@ impl RegistryTopology {
     pub const fn accepts(&self, grant: EndpointGrant) -> bool {
         grant.registry_generation == self.registry_generation
     }
+}
+
+pub fn correlation_environment(grant: EndpointGrant) -> Result<CorrelationEnvironment, JobError> {
+    if !matches!(
+        grant.kind,
+        EndpointKind::Publication | EndpointKind::RegistryClient
+    ) {
+        return Err(JobError::WrongState);
+    }
+    CorrelationEnvironment::new(Correlation {
+        registry_generation: grant.registry_generation,
+        endpoint_id: grant.endpoint_id,
+        endpoint_generation: grant.endpoint_generation,
+    })
+    .map_err(|_| JobError::ZeroIdentity)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -779,5 +795,29 @@ mod tests {
         topology.restart(2).unwrap();
         assert!(!topology.accepts(grant));
         assert_eq!(topology.restart(2), Err(JobError::StaleGeneration));
+    }
+
+    #[test]
+    fn publisher_and_client_grants_pack_exact_correlation_environment() {
+        let mut topology = RegistryTopology::new(7).unwrap();
+        for kind in [EndpointKind::Publication, EndpointKind::RegistryClient] {
+            let grant = topology.issue(3, kind).unwrap();
+            let environment = correlation_environment(grant).unwrap();
+            let entries = [
+                environment.entry(0).unwrap(),
+                environment.entry(1).unwrap(),
+                environment.entry(2).unwrap(),
+            ];
+            assert_eq!(
+                wyrmroot_registry_proto::parse_correlation_environment(&entries),
+                Ok(Correlation {
+                    registry_generation: grant.registry_generation,
+                    endpoint_id: grant.endpoint_id,
+                    endpoint_generation: grant.endpoint_generation,
+                })
+            );
+        }
+        let launch = topology.issue(3, EndpointKind::LaunchSession).unwrap();
+        assert_eq!(correlation_environment(launch), Err(JobError::WrongState));
     }
 }

@@ -60,6 +60,7 @@ pub enum StartupBlockError {
     InvalidEnvironment,
     DuplicateEnvironment,
     Argv0Mismatch,
+    StringContainsNul,
 }
 
 /// Writes the exact WYR0-D0 `argc`/`argv`/`envp`/auxv startup block.
@@ -132,6 +133,14 @@ pub fn write_startup_block_v2(
         } else {
             StartupBlockError::DisplayPathContainsNul
         });
+    }
+    if argv
+        .iter()
+        .skip(1)
+        .chain(environment.iter())
+        .any(|value| value.as_bytes().contains(&0))
+    {
+        return Err(StartupBlockError::StringContainsNul);
     }
     let aggregate_string_bytes = argv
         .iter()

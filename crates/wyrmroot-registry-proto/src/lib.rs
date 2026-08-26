@@ -14,6 +14,11 @@ pub const MAX_PROTOCOL_VERSIONS: usize = 4;
 pub const MAX_OUTSTANDING_PER_CLIENT: usize = 16;
 pub const MAX_CLIENT_REPLAY: usize = 32;
 pub const MAX_PUBLICATION_REPLAY: usize = 8;
+pub const CORRELATION_ENVIRONMENT_COUNT: usize = 3;
+pub const MAX_CORRELATION_ENVIRONMENT_BYTES: usize = 64;
+pub const REGISTRY_GENERATION_ENV: &str = "WYR_REGISTRY_GENERATION=";
+pub const ENDPOINT_ID_ENV: &str = "WYR_REGISTRY_ENDPOINT_ID=";
+pub const ENDPOINT_GENERATION_ENV: &str = "WYR_REGISTRY_ENDPOINT_GENERATION=";
 
 const MAGIC: [u8; 4] = *b"WRRG";
 const MAJOR: u16 = 1;
@@ -190,6 +195,79 @@ pub enum Error {
     InvalidVersionList,
     NoncanonicalVersions,
     ArithmeticOverflow,
+    InvalidCorrelationEnvironment,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Correlation {
+    pub registry_generation: u64,
+    pub endpoint_id: u64,
+    pub endpoint_generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CorrelationEnvironment {
+    bytes: [[u8; MAX_CORRELATION_ENVIRONMENT_BYTES]; CORRELATION_ENVIRONMENT_COUNT],
+    lengths: [u8; CORRELATION_ENVIRONMENT_COUNT],
+}
+
+impl CorrelationEnvironment {
+    pub fn new(correlation: Correlation) -> Result<Self, Error> {
+        if correlation.registry_generation == 0
+            || correlation.endpoint_id == 0
+            || correlation.endpoint_generation == 0
+        {
+            return Err(Error::InvalidCorrelationEnvironment);
+        }
+        let mut value = Self {
+            bytes: [[0; MAX_CORRELATION_ENVIRONMENT_BYTES]; CORRELATION_ENVIRONMENT_COUNT],
+            lengths: [0; CORRELATION_ENVIRONMENT_COUNT],
+        };
+        value.write(0, REGISTRY_GENERATION_ENV, correlation.registry_generation)?;
+        value.write(1, ENDPOINT_ID_ENV, correlation.endpoint_id)?;
+        value.write(2, ENDPOINT_GENERATION_ENV, correlation.endpoint_generation)?;
+        Ok(value)
+    }
+
+    pub fn entry(&self, index: usize) -> Option<&str> {
+        let length = usize::from(*self.lengths.get(index)?);
+        core::str::from_utf8(self.bytes.get(index)?.get(..length)?).ok()
+    }
+
+    fn write(&mut self, index: usize, prefix: &str, number: u64) -> Result<(), Error> {
+        let output = self
+            .bytes
+            .get_mut(index)
+            .ok_or(Error::InvalidCorrelationEnvironment)?;
+        output[..prefix.len()].copy_from_slice(prefix.as_bytes());
+        let digits = decimal(number, &mut output[prefix.len()..])?;
+        self.lengths[index] = u8::try_from(prefix.len() + digits)
+            .map_err(|_| Error::InvalidCorrelationEnvironment)?;
+        Ok(())
+    }
+}
+
+pub fn parse_correlation_environment(entries: &[&str]) -> Result<Correlation, Error> {
+    if entries.len() != CORRELATION_ENVIRONMENT_COUNT {
+        return Err(Error::InvalidCorrelationEnvironment);
+    }
+    Ok(Correlation {
+        registry_generation: parse_decimal(
+            entries[0]
+                .strip_prefix(REGISTRY_GENERATION_ENV)
+                .ok_or(Error::InvalidCorrelationEnvironment)?,
+        )?,
+        endpoint_id: parse_decimal(
+            entries[1]
+                .strip_prefix(ENDPOINT_ID_ENV)
+                .ok_or(Error::InvalidCorrelationEnvironment)?,
+        )?,
+        endpoint_generation: parse_decimal(
+            entries[2]
+                .strip_prefix(ENDPOINT_GENERATION_ENV)
+                .ok_or(Error::InvalidCorrelationEnvironment)?,
+        )?,
+    })
 }
 
 /// Parses one complete Channel datagram and validates its exact moved-handle
@@ -743,6 +821,41 @@ fn put_u64(bytes: &mut [u8], offset: usize, value: u64) -> Result<(), Error> {
     Ok(())
 }
 
+fn decimal(mut value: u64, output: &mut [u8]) -> Result<usize, Error> {
+    if value == 0 {
+        return Err(Error::InvalidCorrelationEnvironment);
+    }
+    let mut reversed = [0u8; 20];
+    let mut count = 0;
+    while value != 0 {
+        reversed[count] = b'0' + (value % 10) as u8;
+        count += 1;
+        value /= 10;
+    }
+    if output.len() < count {
+        return Err(Error::InvalidCorrelationEnvironment);
+    }
+    for index in 0..count {
+        output[index] = reversed[count - index - 1];
+    }
+    Ok(count)
+}
+
+fn parse_decimal(value: &str) -> Result<u64, Error> {
+    if value.is_empty()
+        || value.starts_with('0')
+        || !value.as_bytes().iter().all(u8::is_ascii_digit)
+    {
+        return Err(Error::InvalidCorrelationEnvironment);
+    }
+    value.as_bytes().iter().try_fold(0u64, |current, digit| {
+        current
+            .checked_mul(10)
+            .and_then(|current| current.checked_add(u64::from(digit - b'0')))
+            .ok_or(Error::InvalidCorrelationEnvironment)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -876,6 +989,59 @@ mod tests {
             Message::Cancelled {
                 target_transaction_id: 17
             }
+        );
+    }
+
+    #[test]
+    fn correlation_environment_is_canonical_bounded_and_exact() {
+        let correlation = Correlation {
+            registry_generation: u64::MAX,
+            endpoint_id: 17,
+            endpoint_generation: 2,
+        };
+        let packed = CorrelationEnvironment::new(correlation).unwrap();
+        let entries = [
+            packed.entry(0).unwrap(),
+            packed.entry(1).unwrap(),
+            packed.entry(2).unwrap(),
+        ];
+        assert_eq!(parse_correlation_environment(&entries), Ok(correlation));
+        for malformed in [
+            ["WYR_REGISTRY_GENERATION=0", entries[1], entries[2]],
+            ["WYR_REGISTRY_GENERATION=01", entries[1], entries[2]],
+            [
+                "WYR_REGISTRY_GENERATION=18446744073709551616",
+                entries[1],
+                entries[2],
+            ],
+            [entries[1], entries[0], entries[2]],
+            [entries[0], entries[0], entries[2]],
+        ] {
+            assert_eq!(
+                parse_correlation_environment(&malformed),
+                Err(Error::InvalidCorrelationEnvironment)
+            );
+        }
+        assert_eq!(
+            parse_correlation_environment(&entries[..2]),
+            Err(Error::InvalidCorrelationEnvironment)
+        );
+        let extra = [entries[0], entries[1], entries[2], "EXTRA=1"];
+        assert_eq!(
+            parse_correlation_environment(&extra),
+            Err(Error::InvalidCorrelationEnvironment)
+        );
+        let malformed = ["WYR_REGISTRY_GENERATION=seven", entries[1], entries[2]];
+        assert_eq!(
+            parse_correlation_environment(&malformed),
+            Err(Error::InvalidCorrelationEnvironment)
+        );
+        assert_eq!(
+            CorrelationEnvironment::new(Correlation {
+                endpoint_id: 0,
+                ..correlation
+            }),
+            Err(Error::InvalidCorrelationEnvironment)
         );
     }
 }

@@ -6,6 +6,7 @@ use deepwyrm_syscall::{
     DW_RIGHT_MAP, DW_RIGHT_MODIFY, DW_RIGHT_READ, DW_RIGHT_TRANSFER, DW_RIGHT_WAIT, DW_RIGHT_WRITE,
     DwHandle, DwHandleTransferV1, DwMemoryProtection, DwRights,
 };
+use wyrmroot_registry_proto::CorrelationEnvironment;
 
 use crate::{
     elf::{self, ElfError, LoadSegment, MAX_LOAD_SEGMENTS, PAGE_SIZE, SegmentProtection},
@@ -71,6 +72,9 @@ pub struct ServiceLoadRequest<'a> {
     pub display_path: &'a str,
     pub profile: LaunchProfile,
     pub service_channel: DwHandle,
+    /// Present exactly for BootstrapService and RegistryClient. The typed
+    /// value prevents arbitrary environment injection at the loader boundary.
+    pub correlation: Option<&'a CorrelationEnvironment>,
     pub transaction_id: u64,
 }
 
@@ -406,6 +410,31 @@ pub fn load_service_process<P: LoaderPlatform>(
         return Err(LoadError::Launch(LaunchError::HandleCount));
     }
     let channels = [request.service_channel];
+    let uses_correlation = matches!(
+        request.profile,
+        LaunchProfile::BootstrapService | LaunchProfile::RegistryClient
+    );
+    let argv = [request.display_path];
+    let mut environment = [""; wyrmroot_registry_proto::CORRELATION_ENVIRONMENT_COUNT];
+    let startup = if uses_correlation {
+        let correlation = request
+            .correlation
+            .ok_or(LoadError::Startup(StartupBlockError::InvalidEnvironment))?;
+        for (index, slot) in environment.iter_mut().enumerate() {
+            *slot = correlation
+                .entry(index)
+                .ok_or(LoadError::Startup(StartupBlockError::InvalidEnvironment))?;
+        }
+        StartupSpec::JobV2 {
+            path: request.display_path,
+            argv: &argv,
+            environment: &environment,
+        }
+    } else if request.correlation.is_none() {
+        StartupSpec::Legacy(request.display_path)
+    } else {
+        return Err(LoadError::Startup(StartupBlockError::TooManyArguments));
+    };
     load_process_internal(
         platform,
         authority,
@@ -413,7 +442,7 @@ pub fn load_service_process<P: LoaderPlatform>(
             image: request.image,
             profile: request.profile,
             transaction_id: request.transaction_id,
-            startup: StartupSpec::Legacy(request.display_path),
+            startup,
             channels: &channels,
         },
         LoadFault::None,

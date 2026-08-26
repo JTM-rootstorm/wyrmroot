@@ -233,6 +233,7 @@ name = "wyrmroot-loader"
 version = "0.0.0"
 dependencies = [
  "deepwyrm-syscall",
+ "wyrmroot-registry-proto",
 ]
 
 [[package]]
@@ -280,6 +281,7 @@ dependencies = [
  "wyrmroot-bootfs",
  "wyrmroot-launch-proto",
  "wyrmroot-loader",
+ "wyrmroot-registry-proto",
  "wyrmroot-rrc-manifest",
  "wyrmroot-runtime",
 ]

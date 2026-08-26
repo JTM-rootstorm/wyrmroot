@@ -2,6 +2,7 @@ use deepwyrm_syscall::DwHandle;
 use wyrmroot_bootfs::builder::{Builder as BootfsBuilder, FileMode};
 use wyrmroot_launch_proto as _;
 use wyrmroot_loader::launch::{self, HEADER_BYTES, LaunchProfile};
+use wyrmroot_registry_proto as _;
 use wyrmroot_rrc_manifest::{
     Activation, DependencyKind, Manifest, RoleId, StartupProfile,
     builder::{Builder, DependencySpec, RoleSpec},

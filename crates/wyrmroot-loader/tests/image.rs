@@ -96,6 +96,24 @@ fn startup_v2_uses_five_pages_and_canonical_vectors() {
         ),
         Err(StartupBlockError::Argv0Mismatch)
     );
+    for (argv, environment) in [
+        (
+            ["bin/hello", "bad\0arg"].as_slice(),
+            ["MODE=gate"].as_slice(),
+        ),
+        (["bin/hello"].as_slice(), ["MODE=bad\0value"].as_slice()),
+    ] {
+        assert_eq!(
+            write_startup_block_v2(
+                &mut block,
+                STARTUP_V2_BLOCK_ADDRESS,
+                "bin/hello",
+                argv,
+                environment,
+            ),
+            Err(StartupBlockError::StringContainsNul)
+        );
+    }
 }
 
 fn get64(bytes: &[u8], offset: usize) -> u64 {

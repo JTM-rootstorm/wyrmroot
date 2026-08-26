@@ -116,13 +116,30 @@ Exact role contracts are:
 | launch session | Channel | `READ | WRITE | WAIT | INSPECT` |
 | stdin/stdout/stderr | Channel | `READ | WRITE | WAIT | INSPECT` |
 
-`JobV2` receives its startup ABI v2 vector through the Thread start stack and
-its optional stream roles through WRLP. Stream roles are opaque Channels in
+Startup ABI v2 covers `JobV2` plus the profile-authorized `BootstrapService`
+and `RegistryClient` peers. `JobV2` receives its vector through the Thread
+start stack and its optional stream roles through WRLP. Its `argv[0]` exactly
+matches the launch-policy path. A bootstrap peer's `argv[0]` exactly matches
+the controller-authorized bootfs path. Stream roles are opaque Channels in
 WYR1-B; WYR1-D defines their byte-stream protocol. Passing the roles here does
 not claim console, fd, terminal, or stdout behavior.
 
 Unknown profile/role, wrong order/count/type/rights, nonzero reserved words, or
 unexpected transferred handles fail before child publication or exact cleanup.
+
+`BootstrapService` and `RegistryClient` use startup ABI v2. Init supplies
+exactly these three controller-owned environment entries in this order:
+
+1. `WYR_REGISTRY_GENERATION=<u64>`;
+2. `WYR_REGISTRY_ENDPOINT_ID=<u64>`; and
+3. `WYR_REGISTRY_ENDPOINT_GENERATION=<u64>`.
+
+Each value is nonzero canonical base-10 ASCII with no leading zero and checked
+`u64` overflow. Missing, duplicate, reordered, extra, malformed, or zero values
+fail before the peer's first protocol send. These values are correlation data
+only. Possession of the profile-specific WRLP-transferred Channel remains the
+authority, and registryd validates each request header against the installed
+endpoint identity received out-of-band from init.
 
 ## 5. Registry control topology
 
@@ -138,9 +155,11 @@ checked correlation values and never manufacture authority.
 
 Restarting registryd closes every old control, publication, and client endpoint.
 Init waits for exact terminal cleanup, creates fresh pairs and a nonzero new
-registry generation, then reinstalls only policy-authorized current service and
-client generations. Old endpoints cannot register with or satisfy the new
-registry.
+registry generation, then relaunches dependent bootstrap publisher/client
+generations with fresh Channels and fresh correlation environment entries. It
+reinstalls only policy-authorized current service and client generations; it
+does not claim that a running old peer can be rebound. Old endpoints cannot
+register with or satisfy the new registry.
 
 ## 6. WRRG version 1 envelope
 

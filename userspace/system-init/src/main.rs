@@ -8,7 +8,9 @@ use deepwyrm_syscall::{
     DwObjectType, DwReceivedHandleInfoV1, DwRights,
 };
 use wyrmroot_bootfs as _;
+use wyrmroot_launch_proto as _;
 use wyrmroot_loader as _;
+use wyrmroot_registry_proto as _;
 use wyrmroot_rrc_manifest as _;
 use wyrmroot_runtime::{
     CapabilityInfo, MappingPlan, NativeError, NativeLoaderPlatform, NativeSupervisionPlatform,

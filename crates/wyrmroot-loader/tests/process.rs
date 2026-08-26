@@ -8,6 +8,7 @@ use wyrmroot_loader::{
         load_service_process,
     },
 };
+use wyrmroot_registry_proto::{Correlation, CorrelationEnvironment};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Event {
@@ -34,6 +35,8 @@ struct Mock {
     duplicate_calls: usize,
     fail_duplicate_at: Option<usize>,
     started_thread: Option<DwHandle>,
+    started_abi: Option<u64>,
+    started_stack_pointer: Option<u64>,
     thread_terminated: bool,
     fail_thread_terminate: bool,
     reject_late_unmap: bool,
@@ -54,6 +57,8 @@ impl Mock {
             duplicate_calls: 0,
             fail_duplicate_at: None,
             started_thread: None,
+            started_abi: None,
+            started_stack_pointer: None,
             thread_terminated: false,
             fail_thread_terminate: false,
             reject_late_unmap: false,
@@ -125,7 +130,7 @@ impl LoaderPlatform for Mock {
         &mut self,
         _: DwHandle,
         memory: DwHandle,
-        _: u64,
+        _object_size: u64,
         _: u64,
         source: &[u8],
     ) -> Result<ParentMapping, Self::Error> {
@@ -179,13 +184,15 @@ impl LoaderPlatform for Mock {
         &mut self,
         thread: DwHandle,
         _: u64,
-        _: u64,
+        stack_pointer: u64,
         _: DwHandle,
-        _: u64,
+        startup_abi: u64,
     ) -> Result<(), Self::Error> {
         self.events.push(Event::Start);
         self.check("start")?;
         self.started_thread = Some(thread);
+        self.started_abi = Some(startup_abi);
+        self.started_stack_pointer = Some(stack_pointer);
         Ok(())
     }
     fn thread_terminate(&mut self, _: DwHandle) -> Result<(), Self::Error> {
@@ -272,6 +279,7 @@ fn bootstrap_registry_moves_self_root_and_controller_endpoint() {
             display_path: "/system/registryd",
             profile: LaunchProfile::BootstrapRegistry,
             service_channel: DwHandle(0x900),
+            correlation: None,
             transaction_id: 0x1301,
         },
     )
@@ -284,6 +292,64 @@ fn bootstrap_registry_moves_self_root_and_controller_endpoint() {
         wyrmroot_loader::launch::CHILD_CHANNEL_RIGHTS
     );
     assert_eq!(&platform.sent_init[6..8], &3_u16.to_le_bytes());
+}
+
+#[test]
+fn bootstrap_service_uses_startup_v2_for_controller_correlation_environment() {
+    let mut platform = Mock::new(None);
+    let image = executable();
+    let correlation = CorrelationEnvironment::new(Correlation {
+        registry_generation: 7,
+        endpoint_id: 11,
+        endpoint_generation: 1,
+    })
+    .unwrap();
+    load_service_process(
+        &mut platform,
+        authority(),
+        ServiceLoadRequest {
+            image: &image,
+            display_path: "test/wyr1-b/publisher",
+            profile: LaunchProfile::BootstrapService,
+            service_channel: DwHandle(0x904),
+            correlation: Some(&correlation),
+            transaction_id: 0x1304,
+        },
+    )
+    .unwrap();
+    assert_eq!(platform.started_abi, Some(2));
+    assert_eq!(
+        platform.started_stack_pointer,
+        Some(wyrmroot_loader::image::STARTUP_V2_BLOCK_ADDRESS)
+    );
+    assert_eq!(platform.materialized.last().unwrap().len(), 20 * 1024);
+    assert!(
+        platform
+            .materialized
+            .last()
+            .unwrap()
+            .windows(correlation.entry(2).unwrap().len())
+            .any(|window| window == correlation.entry(2).unwrap().as_bytes())
+    );
+
+    let missing = load_service_process(
+        &mut Mock::new(None),
+        authority(),
+        ServiceLoadRequest {
+            image: &image,
+            display_path: "test/wyr1-b/publisher",
+            profile: LaunchProfile::BootstrapService,
+            service_channel: DwHandle(0x905),
+            correlation: None,
+            transaction_id: 0x1305,
+        },
+    );
+    assert_eq!(
+        missing,
+        Err(LoadError::Startup(
+            wyrmroot_loader::image::StartupBlockError::InvalidEnvironment
+        ))
+    );
 }
 
 #[test]
