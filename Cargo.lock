@@ -248,6 +248,16 @@ name = "wyrmroot-registry-proto"
 version = "0.0.0"
 
 [[package]]
+name = "wyrmroot-registryd"
+version = "0.0.0"
+dependencies = [
+ "deepwyrm-syscall",
+ "wyrmroot-loader",
+ "wyrmroot-registry-proto",
+ "wyrmroot-runtime",
+]
+
+[[package]]
 name = "wyrmroot-rrc-manifest"
 version = "0.0.0"
 dependencies = [

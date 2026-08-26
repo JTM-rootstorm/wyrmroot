@@ -19,6 +19,7 @@ members = [
     "userspace/wyr1-bootstrap-stubs",
     "userspace/wyr1-retained-stubs",
     "userspace/loader-smoke",
+    "userspace/registryd",
 ]
 
 [workspace.package]
