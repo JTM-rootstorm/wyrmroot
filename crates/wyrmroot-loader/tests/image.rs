@@ -1,8 +1,8 @@
 use wyrmroot_loader::{
     elf::{LoadSegment, PAGE_SIZE, STACK_BYTES, STACK_TOP, SegmentProtection},
     image::{
-        INITIAL_STACK, INITIAL_STACK_POINTER, MaterializationPlan, StartupBlockError,
-        write_startup_block,
+        INITIAL_STACK, INITIAL_STACK_POINTER, MaterializationPlan, STARTUP_V2_BLOCK_ADDRESS,
+        STARTUP_V2_BLOCK_BYTES, StartupBlockError, write_startup_block, write_startup_block_v2,
     },
 };
 
@@ -68,6 +68,34 @@ fn startup_block_rejects_invalid_inputs_without_partial_writes() {
         Err(StartupBlockError::DisplayPathTooLong)
     );
     assert!(page.iter().all(|byte| *byte == 0xaa));
+}
+
+#[test]
+fn startup_v2_uses_five_pages_and_canonical_vectors() {
+    let mut block = [0xaa; STARTUP_V2_BLOCK_BYTES];
+    write_startup_block_v2(
+        &mut block,
+        STARTUP_V2_BLOCK_ADDRESS,
+        "bin/hello",
+        &["bin/hello", "kobold"],
+        &["MODE=gate"],
+    )
+    .unwrap();
+    assert_eq!(get64(&block, 0), 2);
+    assert_eq!(get64(&block, 8), STARTUP_V2_BLOCK_ADDRESS + 64);
+    assert_eq!(&block[64..74], b"bin/hello\0");
+    assert_eq!(&block[74..81], b"kobold\0");
+    assert_eq!(&block[81..91], b"MODE=gate\0");
+    assert_eq!(
+        write_startup_block_v2(
+            &mut block,
+            STARTUP_V2_BLOCK_ADDRESS,
+            "bin/hello",
+            &["wrong"],
+            &[],
+        ),
+        Err(StartupBlockError::Argv0Mismatch)
+    );
 }
 
 fn get64(bytes: &[u8], offset: usize) -> u64 {

@@ -51,6 +51,34 @@ pub struct LoadRequest<'a> {
     pub transaction_id: u64,
 }
 
+/// WYR1-B launch request using startup ABI v2 and the WRLP 1.3 JobV2 profile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JobLoadRequest<'a> {
+    pub image: &'a [u8],
+    pub policy_path: &'a str,
+    pub argv: &'a [&'a str],
+    pub environment: &'a [&'a str],
+    pub transaction_id: u64,
+}
+
+#[derive(Clone, Copy)]
+enum StartupSpec<'a> {
+    Legacy(&'a str),
+    JobV2 {
+        path: &'a str,
+        argv: &'a [&'a str],
+        environment: &'a [&'a str],
+    },
+}
+
+#[derive(Clone, Copy)]
+struct InternalLoadRequest<'a> {
+    image: &'a [u8],
+    profile: LaunchProfile,
+    transaction_id: u64,
+    startup: StartupSpec<'a>,
+}
+
 /// Explicitly selected, test-only corruption of one child-launch boundary.
 ///
 /// Production callers use [`load_process`], which always selects
@@ -305,6 +333,48 @@ pub fn load_process_with_fault<P: LoaderPlatform>(
     request: LoadRequest<'_>,
     fault: LoadFault,
 ) -> Result<LoadedProcess, LoadError<P::Error>> {
+    load_process_internal(
+        platform,
+        authority,
+        InternalLoadRequest {
+            image: request.image,
+            profile: request.profile,
+            transaction_id: request.transaction_id,
+            startup: StartupSpec::Legacy(request.display_path),
+        },
+        fault,
+    )
+}
+
+/// Loads one policy-authorized WYR1-B job with startup ABI v2.
+pub fn load_job_process<P: LoaderPlatform>(
+    platform: &mut P,
+    authority: LoadAuthority,
+    request: JobLoadRequest<'_>,
+) -> Result<LoadedProcess, LoadError<P::Error>> {
+    load_process_internal(
+        platform,
+        authority,
+        InternalLoadRequest {
+            image: request.image,
+            profile: LaunchProfile::JobV2,
+            transaction_id: request.transaction_id,
+            startup: StartupSpec::JobV2 {
+                path: request.policy_path,
+                argv: request.argv,
+                environment: request.environment,
+            },
+        },
+        LoadFault::None,
+    )
+}
+
+fn load_process_internal<P: LoaderPlatform>(
+    platform: &mut P,
+    authority: LoadAuthority,
+    request: InternalLoadRequest<'_>,
+    fault: LoadFault,
+) -> Result<LoadedProcess, LoadError<P::Error>> {
     let mut segments = [empty_segment(); MAX_LOAD_SEGMENTS];
     if fault == LoadFault::MalformedElf {
         let malformed = [0_u8; 64];
@@ -314,14 +384,44 @@ pub fn load_process_with_fault<P: LoaderPlatform>(
         };
     }
     let plan = elf::plan(request.image, &mut segments).map_err(LoadError::Elf)?;
-    let mut startup_page = [0_u8; PAGE_SIZE as usize];
-    image::write_startup_block(
-        &mut startup_page,
-        image::INITIAL_STACK_POINTER,
-        request.display_path,
-    )
-    .map_err(LoadError::Startup)?;
-    apply_startup_fault(&mut startup_page, fault);
+    let mut startup_block = [0_u8; image::STARTUP_V2_BLOCK_BYTES];
+    let (startup_size, startup_offset, stack_pointer, startup_abi) = match request.startup {
+        StartupSpec::Legacy(display_path) => {
+            image::write_startup_block(
+                &mut startup_block[..PAGE_SIZE as usize],
+                image::INITIAL_STACK_POINTER,
+                display_path,
+            )
+            .map_err(LoadError::Startup)?;
+            (
+                PAGE_SIZE as usize,
+                INITIAL_STACK.startup_page_offset,
+                INITIAL_STACK.stack_pointer,
+                image::STARTUP_ABI_VERSION,
+            )
+        }
+        StartupSpec::JobV2 {
+            path,
+            argv,
+            environment,
+        } => {
+            image::write_startup_block_v2(
+                &mut startup_block,
+                image::STARTUP_V2_BLOCK_ADDRESS,
+                path,
+                argv,
+                environment,
+            )
+            .map_err(LoadError::Startup)?;
+            (
+                image::STARTUP_V2_BLOCK_BYTES,
+                INITIAL_STACK.object_size - image::STARTUP_V2_BLOCK_BYTES as u64,
+                image::STARTUP_V2_BLOCK_ADDRESS,
+                image::STARTUP_ABI_V2,
+            )
+        }
+    };
+    apply_startup_fault(&mut startup_block[..startup_size], fault);
     let mut init = [0_u8; INIT0_BYTES];
     let init_len = launch::encode_init(request.profile, request.transaction_id, &mut init)
         .map_err(LoadError::Launch)?;
@@ -461,8 +561,8 @@ pub fn load_process_with_fault<P: LoaderPlatform>(
         authority.parent_root,
         stack,
         INITIAL_STACK.object_size,
-        INITIAL_STACK.startup_page_offset,
-        &startup_page,
+        startup_offset,
+        &startup_block[..startup_size],
     ) {
         Ok(mapping) => mapping,
         Err(cause) => {
@@ -589,9 +689,9 @@ pub fn load_process_with_fault<P: LoaderPlatform>(
     if let Err(cause) = platform.thread_start(
         thread,
         plan.entry,
-        INITIAL_STACK.stack_pointer,
+        stack_pointer,
         created.child_bootstrap,
-        image::STARTUP_ABI_VERSION,
+        startup_abi,
     ) {
         return Err(fail(
             platform,
@@ -619,7 +719,7 @@ pub fn load_process_with_fault<P: LoaderPlatform>(
     })
 }
 
-fn apply_startup_fault(startup_page: &mut [u8; PAGE_SIZE as usize], fault: LoadFault) {
+fn apply_startup_fault(startup_page: &mut [u8], fault: LoadFault) {
     if fault == LoadFault::MalformedStartup {
         // WYR0-D0 requires argc = 1 for every native child.  The page was
         // otherwise built by the canonical checked constructor above.

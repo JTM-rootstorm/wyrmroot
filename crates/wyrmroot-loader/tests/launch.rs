@@ -1,10 +1,10 @@
 use deepwyrm_syscall::{
-    DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_MEMORY_OBJECT, DW_OBJECT_TYPE_TASK_GROUP,
-    DwHandle, DwReceivedHandleInfoV1,
+    DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL, DW_OBJECT_TYPE_MEMORY_OBJECT,
+    DW_OBJECT_TYPE_TASK_GROUP, DwHandle, DwReceivedHandleInfoV1,
 };
 use wyrmroot_loader::launch::{
-    self, BOOTFS_RIGHTS, HEADER_BYTES, INIT0_BYTES, LOADER_TASK_GROUP_RIGHTS, LaunchError,
-    LaunchProfile, PROBE_CHILD_BYTES, SELF_ROOT_RIGHTS, SUPERVISOR_BYTES,
+    self, BOOTFS_RIGHTS, CHILD_CHANNEL_RIGHTS, HEADER_BYTES, INIT0_BYTES, LOADER_TASK_GROUP_RIGHTS,
+    LaunchError, LaunchProfile, PROBE_CHILD_BYTES, SELF_ROOT_RIGHTS, SUPERVISOR_BYTES,
 };
 
 #[test]
@@ -272,6 +272,51 @@ fn profile_aware_ready_rejects_minor_mismatch_without_relaxing_v1_0_compatibilit
         launch::parse_ready_for_profile(LaunchProfile::CapabilityController, &legacy_ready, 7),
         Ok(())
     );
+}
+
+#[test]
+fn wyr1_b_profiles_are_exact_wrlp_1_3_shapes() {
+    for profile in [
+        LaunchProfile::BootstrapRegistry,
+        LaunchProfile::BootstrapService,
+        LaunchProfile::RegistryClient,
+        LaunchProfile::LaunchClient,
+    ] {
+        let mut init = [0xaa; 56];
+        launch::encode_init(profile, 0x1300, &mut init).unwrap();
+        assert_eq!(
+            (get16(&init, 6), get32(&init, 16), get32(&init, 20)),
+            (3, 56, 2)
+        );
+        let handles = [
+            received(1, DW_OBJECT_TYPE_ADDRESS_REGION, SELF_ROOT_RIGHTS),
+            received(2, DW_OBJECT_TYPE_CHANNEL, CHILD_CHANNEL_RIGHTS),
+        ];
+        assert!(launch::parse_init(profile, &init, &handles).is_ok());
+    }
+
+    let mut no_streams = [0xaa; HEADER_BYTES];
+    launch::encode_init(LaunchProfile::JobV2, 0x1301, &mut no_streams).unwrap();
+    assert_eq!((get16(&no_streams, 6), get32(&no_streams, 20)), (3, 0));
+    assert!(launch::parse_init(LaunchProfile::JobV2, &no_streams, &[]).is_ok());
+
+    let mut streams = [0xaa; 64];
+    launch::encode_init(LaunchProfile::JobV2Streams, 0x1302, &mut streams).unwrap();
+    assert_eq!((get16(&streams, 6), get32(&streams, 20)), (3, 3));
+    assert_eq!(
+        [
+            get32(&streams, 40),
+            get32(&streams, 48),
+            get32(&streams, 56)
+        ],
+        [8, 9, 10]
+    );
+    let handles = [
+        received(3, DW_OBJECT_TYPE_CHANNEL, CHILD_CHANNEL_RIGHTS),
+        received(4, DW_OBJECT_TYPE_CHANNEL, CHILD_CHANNEL_RIGHTS),
+        received(5, DW_OBJECT_TYPE_CHANNEL, CHILD_CHANNEL_RIGHTS),
+    ];
+    assert!(launch::parse_init(LaunchProfile::JobV2Streams, &streams, &handles).is_ok());
 }
 
 #[test]

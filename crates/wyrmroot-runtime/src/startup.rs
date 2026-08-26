@@ -4,8 +4,12 @@ use deepwyrm_syscall::DwHandle;
 
 /// The only startup ABI version currently understood by the runtime.
 pub const STARTUP_ABI_V1: u64 = 1;
+/// WYR1-B launched-job startup ABI.
+pub const STARTUP_ABI_V2: u64 = 2;
 /// Size of the primordial vector-and-string block at the initial stack pointer.
 pub const STARTUP_BLOCK_SIZE: usize = 4096;
+/// Startup ABI v2 occupies the highest five mapped stack pages.
+pub const STARTUP_BLOCK_V2_SIZE: usize = 20 * 1024;
 /// Terminal auxiliary-vector pair required by startup ABI V1.
 pub const AUXILIARY_VECTOR_TERMINATOR: (u64, u64) = (0, 0);
 const WORD_SIZE: usize = 8;
@@ -92,6 +96,18 @@ pub enum StartupError {
     UnterminatedString,
     /// A referenced argv/environment string was not valid native UTF-8 text.
     InvalidUtf8,
+    /// ABI v2 exceeded the fixed argv bound or omitted argv[0].
+    ArgumentLimit,
+    /// ABI v2 exceeded the fixed environment-entry bound.
+    EnvironmentLimit,
+    /// ABI v2 argv/environment strings exceeded 16 KiB including NULs.
+    StringBytesExceeded,
+    /// ABI v2 strings did not immediately follow the vectors without aliases or gaps.
+    NoncanonicalStringLayout,
+    /// An ABI v2 environment entry did not use canonical NAME=VALUE spelling.
+    InvalidEnvironment,
+    /// ABI v2 repeated an environment variable name.
+    DuplicateEnvironment,
 }
 
 /// Returns a stable bounded process exit code for native-entry startup
@@ -113,6 +129,12 @@ pub const fn startup_error_exit_code(error: StartupError) -> u32 {
             StartupError::StringPointerOutOfRange => 9,
             StartupError::UnterminatedString => 10,
             StartupError::InvalidUtf8 => 11,
+            StartupError::ArgumentLimit => 12,
+            StartupError::EnvironmentLimit => 13,
+            StartupError::StringBytesExceeded => 14,
+            StartupError::NoncanonicalStringLayout => 15,
+            StartupError::InvalidEnvironment => 16,
+            StartupError::DuplicateEnvironment => 17,
         }
 }
 
@@ -132,9 +154,7 @@ pub unsafe fn with_native_startup<R>(
     address: u64,
     use_block: impl for<'block> FnOnce(StartupBlock<'block>) -> R,
 ) -> Result<R, StartupError> {
-    if registers.startup_argument1 != STARTUP_ABI_V1 {
-        return Err(StartupError::UnsupportedVersion);
-    }
+    let block_size = startup_block_size(registers.startup_argument1)?;
     if registers.startup_argument0 == 0 {
         return Err(StartupError::InvalidBootstrapChannelHandle);
     }
@@ -142,12 +162,12 @@ pub unsafe fn with_native_startup<R>(
         return Err(StartupError::MisalignedStack);
     }
     address
-        .checked_add(STARTUP_BLOCK_SIZE as u64)
+        .checked_add(block_size as u64)
         .ok_or(StartupError::AddressOverflow)?;
     let pointer = address as *const u8;
     // SAFETY: the caller guarantees that the initial startup page is readable and immutable for
     // this call. The higher-ranked callback prevents `StartupBlock` or its strings from escaping.
-    let bytes = unsafe { core::slice::from_raw_parts(pointer, STARTUP_BLOCK_SIZE) };
+    let bytes = unsafe { core::slice::from_raw_parts(pointer, block_size) };
     StartupBlock::parse(registers, address, bytes).map(use_block)
 }
 
@@ -158,20 +178,18 @@ impl<'a> StartupBlock<'a> {
         address: u64,
         bytes: &'a [u8],
     ) -> Result<Self, StartupError> {
-        if registers.startup_argument1 != STARTUP_ABI_V1 {
-            return Err(StartupError::UnsupportedVersion);
-        }
+        let block_size = startup_block_size(registers.startup_argument1)?;
         if registers.startup_argument0 == 0 {
             return Err(StartupError::InvalidBootstrapChannelHandle);
         }
         if !address.is_multiple_of(16) {
             return Err(StartupError::MisalignedStack);
         }
-        if bytes.len() != STARTUP_BLOCK_SIZE {
+        if bytes.len() != block_size {
             return Err(StartupError::WrongBlockSize);
         }
         let block_end = address
-            .checked_add(STARTUP_BLOCK_SIZE as u64)
+            .checked_add(block_size as u64)
             .ok_or(StartupError::AddressOverflow)?;
         let argc = usize::try_from(read_word(bytes, 0).ok_or(StartupError::VectorOverflow)?)
             .map_err(|_| StartupError::VectorOverflow)?;
@@ -198,6 +216,17 @@ impl<'a> StartupBlock<'a> {
                 address,
                 block_end,
                 word_at(bytes, envp_offset, index)?,
+            )?;
+        }
+        if registers.startup_argument1 == STARTUP_ABI_V2 {
+            validate_v2_layout(
+                bytes,
+                address,
+                argc,
+                argv_offset,
+                envc,
+                envp_offset,
+                auxv_offset,
             )?;
         }
         Ok(Self {
@@ -268,6 +297,148 @@ impl<'a> StartupBlock<'a> {
             .expect("validated startup string");
         StartupString(&tail[..nul])
     }
+}
+
+fn startup_block_size(version: u64) -> Result<usize, StartupError> {
+    match version {
+        STARTUP_ABI_V1 => Ok(STARTUP_BLOCK_SIZE),
+        STARTUP_ABI_V2 => Ok(STARTUP_BLOCK_V2_SIZE),
+        _ => Err(StartupError::UnsupportedVersion),
+    }
+}
+
+fn validate_v2_layout(
+    bytes: &[u8],
+    address: u64,
+    argc: usize,
+    argv_offset: usize,
+    envc: usize,
+    envp_offset: usize,
+    auxv_offset: usize,
+) -> Result<(), StartupError> {
+    if !(1..=64).contains(&argc) {
+        return Err(StartupError::ArgumentLimit);
+    }
+    if envc > 64 {
+        return Err(StartupError::EnvironmentLimit);
+    }
+    let mut cursor = scan_auxiliary_vector_end(bytes, auxv_offset)?;
+    let mut string_bytes = 0usize;
+    for index in 0..argc {
+        cursor = validate_canonical_v2_string(
+            bytes,
+            address,
+            argv_offset,
+            index,
+            cursor,
+            &mut string_bytes,
+        )?;
+    }
+    for index in 0..envc {
+        cursor = validate_canonical_v2_string(
+            bytes,
+            address,
+            envp_offset,
+            index,
+            cursor,
+            &mut string_bytes,
+        )?;
+    }
+    if string_bytes > 16 * 1024 {
+        return Err(StartupError::StringBytesExceeded);
+    }
+    for index in 0..envc {
+        let pointer = word_at(bytes, envp_offset, index)?;
+        let value = string_slice(bytes, address, pointer)?;
+        let name = environment_name(value)?;
+        for previous in 0..index {
+            let previous = string_slice(bytes, address, word_at(bytes, envp_offset, previous)?)?;
+            if environment_name(previous)? == name {
+                return Err(StartupError::DuplicateEnvironment);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn scan_auxiliary_vector_end(bytes: &[u8], offset: usize) -> Result<usize, StartupError> {
+    let mut current = offset;
+    loop {
+        let kind = read_word(bytes, current).ok_or(StartupError::MissingAuxiliaryTerminator)?;
+        let value = read_word(bytes, current + WORD_SIZE)
+            .ok_or(StartupError::MissingAuxiliaryTerminator)?;
+        current = current
+            .checked_add(2 * WORD_SIZE)
+            .ok_or(StartupError::VectorOverflow)?;
+        if (kind, value) == AUXILIARY_VECTOR_TERMINATOR {
+            return Ok(current);
+        }
+    }
+}
+
+fn validate_canonical_v2_string(
+    bytes: &[u8],
+    address: u64,
+    vector_offset: usize,
+    index: usize,
+    cursor: usize,
+    total: &mut usize,
+) -> Result<usize, StartupError> {
+    let pointer = word_at(bytes, vector_offset, index)?;
+    let expected = address
+        .checked_add(cursor as u64)
+        .ok_or(StartupError::AddressOverflow)?;
+    if pointer != expected {
+        return Err(StartupError::NoncanonicalStringLayout);
+    }
+    let tail = bytes
+        .get(cursor..)
+        .ok_or(StartupError::StringPointerOutOfRange)?;
+    let nul = tail
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or(StartupError::UnterminatedString)?;
+    core::str::from_utf8(&tail[..nul]).map_err(|_| StartupError::InvalidUtf8)?;
+    let consumed = nul.checked_add(1).ok_or(StartupError::VectorOverflow)?;
+    *total = total.checked_add(nul).ok_or(StartupError::VectorOverflow)?;
+    cursor
+        .checked_add(consumed)
+        .ok_or(StartupError::VectorOverflow)
+}
+
+fn string_slice(bytes: &[u8], address: u64, pointer: u64) -> Result<&[u8], StartupError> {
+    let offset = usize::try_from(
+        pointer
+            .checked_sub(address)
+            .ok_or(StartupError::StringPointerOutOfRange)?,
+    )
+    .map_err(|_| StartupError::StringPointerOutOfRange)?;
+    let tail = bytes
+        .get(offset..)
+        .ok_or(StartupError::StringPointerOutOfRange)?;
+    let nul = tail
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or(StartupError::UnterminatedString)?;
+    Ok(&tail[..nul])
+}
+
+fn environment_name(value: &[u8]) -> Result<&[u8], StartupError> {
+    let equals = value
+        .iter()
+        .position(|byte| *byte == b'=')
+        .ok_or(StartupError::InvalidEnvironment)?;
+    let name = &value[..equals];
+    if name.is_empty()
+        || name.len() > 64
+        || !(name[0].is_ascii_uppercase() || name[0] == b'_')
+        || !name[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || *byte == b'_')
+    {
+        return Err(StartupError::InvalidEnvironment);
+    }
+    Ok(name)
 }
 
 fn scan_null_terminated_vector(
@@ -415,7 +586,7 @@ mod tests {
         assert!(matches!(
             StartupBlock::parse(
                 StartupRegisters {
-                    startup_argument1: 2,
+                    startup_argument1: 3,
                     ..registers()
                 },
                 BASE,
@@ -473,6 +644,31 @@ mod tests {
         assert!(matches!(
             StartupBlock::parse(registers(), BASE, &block),
             Err(StartupError::InvalidUtf8)
+        ));
+    }
+
+    #[test]
+    fn parses_canonical_startup_v2_and_rejects_string_aliases() {
+        let mut block = [0u8; STARTUP_BLOCK_V2_SIZE];
+        // argc, argv[0], argv NULL, env[0], env NULL, aux terminator.
+        let strings = 56usize;
+        put_word(&mut block, 0, 1);
+        put_word(&mut block, 8, BASE + strings as u64);
+        put_word(&mut block, 24, BASE + strings as u64 + 10);
+        block[strings..strings + 10].copy_from_slice(b"bin/hello\0");
+        block[strings + 10..strings + 17].copy_from_slice(b"MODE=1\0");
+        let registers = StartupRegisters {
+            startup_argument0: 77,
+            startup_argument1: STARTUP_ABI_V2,
+        };
+        let parsed = StartupBlock::parse(registers, BASE, &block).unwrap();
+        assert_eq!(parsed.arg(0).unwrap().as_str(), "bin/hello");
+        assert_eq!(parsed.env(0).unwrap().as_str(), "MODE=1");
+
+        put_word(&mut block, 24, BASE + strings as u64);
+        assert!(matches!(
+            StartupBlock::parse(registers, BASE, &block),
+            Err(StartupError::NoncanonicalStringLayout)
         ));
     }
 

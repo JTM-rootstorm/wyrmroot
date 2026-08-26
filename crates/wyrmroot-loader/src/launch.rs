@@ -6,9 +6,10 @@
 //! authority trio.
 
 use deepwyrm_syscall::{
-    DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_MEMORY_OBJECT, DW_OBJECT_TYPE_TASK_GROUP,
-    DW_RIGHT_DUPLICATE, DW_RIGHT_INSPECT, DW_RIGHT_MAP, DW_RIGHT_MODIFY, DW_RIGHT_READ,
-    DW_RIGHT_TRANSFER, DwObjectType, DwReceivedHandleInfoV1, DwRights,
+    DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL, DW_OBJECT_TYPE_MEMORY_OBJECT,
+    DW_OBJECT_TYPE_TASK_GROUP, DW_RIGHT_DUPLICATE, DW_RIGHT_INSPECT, DW_RIGHT_MAP, DW_RIGHT_MODIFY,
+    DW_RIGHT_READ, DW_RIGHT_TRANSFER, DW_RIGHT_WAIT, DW_RIGHT_WRITE, DwObjectType,
+    DwReceivedHandleInfoV1, DwRights,
 };
 
 pub const HEADER_BYTES: usize = 40;
@@ -22,11 +23,19 @@ const MAJOR: u16 = 1;
 const MINOR_V1_0: u16 = 0;
 const MINOR_V1_1: u16 = 1;
 const MINOR_V1_2: u16 = 2;
+const MINOR_V1_3: u16 = 3;
 const TYPE_INIT: u32 = 1;
 const TYPE_READY: u32 = 2;
 const ROLE_SELF_ROOT: u32 = 1;
 const ROLE_BOOTFS: u32 = 2;
 const ROLE_LOADER_TASK_GROUP: u32 = 3;
+const ROLE_SUPERVISOR_CONTROL: u32 = 4;
+const ROLE_PUBLICATION_AUTHORITY: u32 = 5;
+const ROLE_REGISTRY_CLIENT: u32 = 6;
+const ROLE_LAUNCH_SESSION: u32 = 7;
+const ROLE_STDIN: u32 = 8;
+const ROLE_STDOUT: u32 = 9;
+const ROLE_STDERR: u32 = 10;
 
 pub const SELF_ROOT_RIGHTS: DwRights =
     DwRights(DW_RIGHT_MAP.0 | DW_RIGHT_MODIFY.0 | DW_RIGHT_INSPECT.0);
@@ -39,6 +48,8 @@ pub const BOOTFS_RIGHTS: DwRights = DwRights(
 );
 pub const LOADER_TASK_GROUP_RIGHTS: DwRights =
     DwRights(DW_RIGHT_MODIFY.0 | DW_RIGHT_INSPECT.0 | DW_RIGHT_DUPLICATE.0 | DW_RIGHT_TRANSFER.0);
+pub const CHILD_CHANNEL_RIGHTS: DwRights =
+    DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_WAIT.0 | DW_RIGHT_INSPECT.0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LaunchProfile {
@@ -56,6 +67,18 @@ pub enum LaunchProfile {
     Supervisor,
     /// WYR1-A early-role stub with only its generation-bound launch Channel.
     EarlyBootStub,
+    /// Separate resident WYR1-B registry with self root and supervisor control.
+    BootstrapRegistry,
+    /// WYR1-B publisher with self root and one publication authority endpoint.
+    BootstrapService,
+    /// WYR1-B registry client with self root and one client endpoint.
+    RegistryClient,
+    /// WYR1-B launch client with self root and one launch-session endpoint.
+    LaunchClient,
+    /// WYR1-B launched job with no startup stream roles.
+    JobV2,
+    /// WYR1-B launched job with exact stdin/stdout/stderr Channel roles.
+    JobV2Streams,
     Hello,
 }
 
@@ -64,7 +87,12 @@ impl LaunchProfile {
         match self {
             Self::Init0 | Self::I2Stress | Self::CapabilityController | Self::Supervisor => 3,
             Self::ProbeChild => 1,
-            Self::Hello | Self::EarlyBootStub => 0,
+            Self::BootstrapRegistry
+            | Self::BootstrapService
+            | Self::RegistryClient
+            | Self::LaunchClient => 2,
+            Self::JobV2Streams => 3,
+            Self::Hello | Self::EarlyBootStub | Self::JobV2 => 0,
         }
     }
 
@@ -72,6 +100,12 @@ impl LaunchProfile {
         match self {
             Self::ProbeChild => MINOR_V1_1,
             Self::Supervisor | Self::EarlyBootStub => MINOR_V1_2,
+            Self::BootstrapRegistry
+            | Self::BootstrapService
+            | Self::RegistryClient
+            | Self::LaunchClient
+            | Self::JobV2
+            | Self::JobV2Streams => MINOR_V1_3,
             Self::Init0 | Self::I2Stress | Self::CapabilityController | Self::Hello => MINOR_V1_0,
         }
     }
@@ -134,6 +168,16 @@ pub fn encode_init(
         }
     } else if profile.needs_self_root() {
         put_u32(output, HEADER_BYTES, ROLE_SELF_ROOT);
+        if let Some(role) = profile.channel_role() {
+            put_u32(output, HEADER_BYTES + 8, role);
+        }
+    } else if profile == LaunchProfile::JobV2Streams {
+        for (index, role) in [ROLE_STDIN, ROLE_STDOUT, ROLE_STDERR]
+            .into_iter()
+            .enumerate()
+        {
+            put_u32(output, HEADER_BYTES + index * 8, role);
+        }
     }
     Ok(size)
 }
@@ -185,6 +229,29 @@ pub fn parse_init(
             SELF_ROOT_RIGHTS,
             0,
         )?;
+        if let Some(role) = profile.channel_role() {
+            if get_u32(bytes, HEADER_BYTES + 8) != role || get_u32(bytes, HEADER_BYTES + 12) != 0 {
+                return Err(LaunchError::BadCapabilityRole { index: 1 });
+            }
+            validate_handle(handles[1], DW_OBJECT_TYPE_CHANNEL, CHILD_CHANNEL_RIGHTS, 1)?;
+        }
+    } else if profile == LaunchProfile::JobV2Streams {
+        for (index, role) in [ROLE_STDIN, ROLE_STDOUT, ROLE_STDERR]
+            .into_iter()
+            .enumerate()
+        {
+            if get_u32(bytes, HEADER_BYTES + index * 8) != role
+                || get_u32(bytes, HEADER_BYTES + index * 8 + 4) != 0
+            {
+                return Err(LaunchError::BadCapabilityRole { index });
+            }
+            validate_handle(
+                handles[index],
+                DW_OBJECT_TYPE_CHANNEL,
+                CHILD_CHANNEL_RIGHTS,
+                index,
+            )?;
+        }
     }
     Ok(ParsedMessage {
         transaction_id,
@@ -201,7 +268,25 @@ impl LaunchProfile {
     }
 
     pub const fn needs_self_root(self) -> bool {
-        self.has_loader_authority_trio() || matches!(self, Self::ProbeChild)
+        self.has_loader_authority_trio()
+            || matches!(
+                self,
+                Self::ProbeChild
+                    | Self::BootstrapRegistry
+                    | Self::BootstrapService
+                    | Self::RegistryClient
+                    | Self::LaunchClient
+            )
+    }
+
+    pub const fn channel_role(self) -> Option<u32> {
+        match self {
+            Self::BootstrapRegistry => Some(ROLE_SUPERVISOR_CONTROL),
+            Self::BootstrapService => Some(ROLE_PUBLICATION_AUTHORITY),
+            Self::RegistryClient => Some(ROLE_REGISTRY_CLIENT),
+            Self::LaunchClient => Some(ROLE_LAUNCH_SESSION),
+            _ => None,
+        }
     }
 }
 
