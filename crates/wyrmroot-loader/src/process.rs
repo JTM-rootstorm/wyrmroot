@@ -741,6 +741,10 @@ fn load_process_internal<P: LoaderPlatform>(
         transfers[1] = transfer(bootfs, BOOTFS_RIGHTS);
         transfers[2] = transfer(task_group, LOADER_TASK_GROUP_RIGHTS);
         3
+    } else if request.profile == LaunchProfile::Dw1bProgress {
+        transaction.delegated_channels[0] = Some(request.channels[0]);
+        transfers[0] = transfer(request.channels[0], launch::CHILD_CHANNEL_RIGHTS);
+        1
     } else if request.profile.channel_role().is_some() {
         transaction.delegated_channels[0] = Some(request.channels[0]);
         transfers[0] = transfer(created.root, SELF_ROOT_RIGHTS);

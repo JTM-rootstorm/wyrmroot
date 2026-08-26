@@ -24,6 +24,7 @@ const MINOR_V1_0: u16 = 0;
 const MINOR_V1_1: u16 = 1;
 const MINOR_V1_2: u16 = 2;
 const MINOR_V1_3: u16 = 3;
+const MINOR_V1_4_TEST: u16 = 4;
 const TYPE_INIT: u32 = 1;
 const TYPE_READY: u32 = 2;
 const ROLE_SELF_ROOT: u32 = 1;
@@ -36,6 +37,7 @@ const ROLE_LAUNCH_SESSION: u32 = 7;
 const ROLE_STDIN: u32 = 8;
 const ROLE_STDOUT: u32 = 9;
 const ROLE_STDERR: u32 = 10;
+const ROLE_DW1B_PROGRESS_DATA: u32 = 11;
 
 pub const SELF_ROOT_RIGHTS: DwRights =
     DwRights(DW_RIGHT_MAP.0 | DW_RIGHT_MODIFY.0 | DW_RIGHT_INSPECT.0);
@@ -79,6 +81,8 @@ pub enum LaunchProfile {
     JobV2,
     /// WYR1-B launched job with exact stdin/stdout/stderr Channel roles.
     JobV2Streams,
+    /// Selector-26-only progress peer with exactly one test data Channel.
+    Dw1bProgress,
     Hello,
 }
 
@@ -86,7 +90,7 @@ impl LaunchProfile {
     pub const fn capability_count(self) -> usize {
         match self {
             Self::Init0 | Self::I2Stress | Self::CapabilityController | Self::Supervisor => 3,
-            Self::ProbeChild => 1,
+            Self::ProbeChild | Self::Dw1bProgress => 1,
             Self::BootstrapRegistry
             | Self::BootstrapService
             | Self::RegistryClient
@@ -106,6 +110,7 @@ impl LaunchProfile {
             | Self::LaunchClient
             | Self::JobV2
             | Self::JobV2Streams => MINOR_V1_3,
+            Self::Dw1bProgress => MINOR_V1_4_TEST,
             Self::Init0 | Self::I2Stress | Self::CapabilityController | Self::Hello => MINOR_V1_0,
         }
     }
@@ -166,6 +171,8 @@ pub fn encode_init(
         {
             put_u32(output, HEADER_BYTES + index * 8, role);
         }
+    } else if profile == LaunchProfile::Dw1bProgress {
+        put_u32(output, HEADER_BYTES, ROLE_DW1B_PROGRESS_DATA);
     } else if profile.needs_self_root() {
         put_u32(output, HEADER_BYTES, ROLE_SELF_ROOT);
         if let Some(role) = profile.channel_role() {
@@ -219,6 +226,13 @@ pub fn parse_init(
             }
             validate_handle(handles[index], object_type, rights, index)?;
         }
+    } else if profile == LaunchProfile::Dw1bProgress {
+        if get_u32(bytes, HEADER_BYTES) != ROLE_DW1B_PROGRESS_DATA
+            || get_u32(bytes, HEADER_BYTES + 4) != 0
+        {
+            return Err(LaunchError::BadCapabilityRole { index: 0 });
+        }
+        validate_handle(handles[0], DW_OBJECT_TYPE_CHANNEL, CHILD_CHANNEL_RIGHTS, 0)?;
     } else if profile.needs_self_root() {
         if get_u32(bytes, HEADER_BYTES) != ROLE_SELF_ROOT || get_u32(bytes, HEADER_BYTES + 4) != 0 {
             return Err(LaunchError::BadCapabilityRole { index: 0 });
@@ -285,6 +299,7 @@ impl LaunchProfile {
             Self::BootstrapService => Some(ROLE_PUBLICATION_AUTHORITY),
             Self::RegistryClient => Some(ROLE_REGISTRY_CLIENT),
             Self::LaunchClient => Some(ROLE_LAUNCH_SESSION),
+            Self::Dw1bProgress => Some(ROLE_DW1B_PROGRESS_DATA),
             _ => None,
         }
     }

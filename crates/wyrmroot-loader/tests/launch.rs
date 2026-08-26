@@ -320,6 +320,22 @@ fn wyr1_b_profiles_are_exact_wrlp_1_3_shapes() {
 }
 
 #[test]
+fn dw1b_progress_has_one_exact_test_private_data_channel() {
+    let mut init = [0xaa; PROBE_CHILD_BYTES];
+    launch::encode_init(LaunchProfile::Dw1bProgress, 0xD1B0_0002, &mut init).unwrap();
+    assert_eq!((get16(&init, 6), get32(&init, 20)), (4, 1));
+    let handles = [received(77, DW_OBJECT_TYPE_CHANNEL, CHILD_CHANNEL_RIGHTS)];
+    assert!(launch::parse_init(LaunchProfile::Dw1bProgress, &init, &handles).is_ok());
+    assert!(launch::parse_init(LaunchProfile::Hello, &init, &handles).is_err());
+    let mut ready = [0_u8; HEADER_BYTES];
+    launch::encode_ready_for_profile(LaunchProfile::Dw1bProgress, 0xD1B0_0002, &mut ready).unwrap();
+    assert!(
+        launch::parse_ready_for_profile(LaunchProfile::Dw1bProgress, &ready, 0xD1B0_0002).is_ok()
+    );
+    assert!(launch::parse_ready_for_profile(LaunchProfile::Hello, &ready, 0xD1B0_0002).is_err());
+}
+
+#[test]
 fn malformed_headers_fail_closed() {
     let handles = init0_handles();
     for offset in [0, 4, 6, 8, 12, 16, 20, 32] {

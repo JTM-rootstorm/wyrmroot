@@ -8,6 +8,9 @@ use wyrmroot_dw1b_preemption::run_cpu_hog;
 use wyrmroot_loader as _;
 use wyrmroot_runtime::{StartupBlock, panic_abort};
 
+#[used]
+static DW1B_HOG_MARKER: [u8; 32] = *b"WYRMDW1B-HOG-V1:steady-spin-only";
+
 fn payload_main(startup: StartupBlock<'_>) -> u32 {
     match run_cpu_hog(startup.bootstrap_channel().as_abi()) {
         Err(code) => code,

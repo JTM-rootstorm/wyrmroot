@@ -8,6 +8,9 @@ use wyrmroot_dw1b_preemption::run_progress;
 use wyrmroot_loader as _;
 use wyrmroot_runtime::{StartupBlock, panic_abort};
 
+#[used]
+static DW1B_PROGRESS_MARKER: [u8; 33] = *b"WYRMDW1B-PROGRESS-V1:eight-rounds";
+
 fn payload_main(startup: StartupBlock<'_>) -> u32 {
     match run_progress(startup.bootstrap_channel().as_abi()) {
         Ok(()) => 0,

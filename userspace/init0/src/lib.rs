@@ -8,16 +8,30 @@
 //! It reports READY to its primordial parent only after `hello` acknowledges its parent Channel
 //! and exits normally with application code zero.
 
-#[cfg(feature = "i-capability-integration")]
+#[cfg(feature = "dw1b-preemption-integration")]
 use deepwyrm_syscall::{
-    DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DW_SIGNAL_WRITABLE, DW_STATUS_WOULD_BLOCK,
-    DwSignals, DwWaitItemV1,
+    DW_OBJECT_TYPE_CHANNEL, DW_RIGHT_DUPLICATE, DW_RIGHT_INSPECT, DW_RIGHT_READ, DW_RIGHT_TRANSFER,
+    DW_RIGHT_WAIT, DW_RIGHT_WRITE,
 };
+#[cfg(any(
+    feature = "i-capability-integration",
+    feature = "dw1b-preemption-integration"
+))]
+use deepwyrm_syscall::{
+    DW_SIGNAL_EXITED, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DwSignals, DwWaitItemV1,
+};
+#[cfg(feature = "i-capability-integration")]
+use deepwyrm_syscall::{DW_SIGNAL_WRITABLE, DW_STATUS_WOULD_BLOCK};
 use deepwyrm_syscall::{
     DW_TASK_STATE_EXITED, DwDeadline, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights,
     DwTaskTerminationInfoV1,
 };
 use wyrmroot_bootfs::archive::{Archive, LookupError, ParseError};
+#[cfg(feature = "dw1b-preemption-integration")]
+use wyrmroot_loader::{
+    launch::CHILD_CHANNEL_RIGHTS,
+    process::{ServiceLoadRequest, load_service_process},
+};
 use wyrmroot_loader::{
     launch::{HEADER_BYTES, INIT0_BYTES, LaunchError, LaunchProfile, encode_ready, parse_init},
     process::{
@@ -32,6 +46,8 @@ use wyrmroot_runtime::{
     SupervisionError, SupervisionPlatform, supervise_child, validate_bootstrap_channel,
     validate_init_capabilities_v2, validate_successful_exit,
 };
+#[cfg(feature = "dw1b-preemption-integration")]
+use wyrmroot_runtime::{arm_dw1b_preemption, await_child_ready_profile};
 
 /// The only bootfs path selected by the WYR0-G descendant smoke chain.
 pub const HELLO_PATH: &[u8] = b"bin/hello";
@@ -44,30 +60,51 @@ pub const I2_STRESS_PATH: &[u8] = b"bin/hello";
 pub const I_CAPABILITY_PATH: &[u8] = b"bin/hello";
 /// Nonzero WRLP transaction identifier for the `init0 -> hello` launch.
 pub const HELLO_TRANSACTION_ID: u64 = 2;
+#[cfg(feature = "dw1b-preemption-integration")]
+pub const DW1B_HOG_PATH: &[u8] = b"test/dw1-b/cpu-hog";
+#[cfg(feature = "dw1b-preemption-integration")]
+pub const DW1B_PROGRESS_PATH: &[u8] = b"test/dw1-b/progress";
 
 // Retained by the native linker as a candidate-assembly attestation. Each
 // selector build has exactly one marker, so host tooling can reject a stale
 // Cargo output from a different init0 feature set before constructing media.
 #[cfg(not(any(
     feature = "i2-stress-integration",
-    feature = "i-capability-integration"
+    feature = "i-capability-integration",
+    feature = "dw1b-preemption-integration"
 )))]
 #[used]
 static INIT0_PROFILE_MARKER: [u8; 29] = *b"WYRMINIT0-PROFILE-V1:ordinary";
 
 #[cfg(all(
     feature = "i2-stress-integration",
-    not(feature = "i-capability-integration")
+    not(any(
+        feature = "i-capability-integration",
+        feature = "dw1b-preemption-integration"
+    ))
 ))]
 #[used]
 static INIT0_PROFILE_MARKER: [u8; 30] = *b"WYRMINIT0-PROFILE-V1:i2-stress";
 
 #[cfg(all(
     feature = "i-capability-integration",
-    not(feature = "i2-stress-integration")
+    not(any(
+        feature = "i2-stress-integration",
+        feature = "dw1b-preemption-integration"
+    ))
 ))]
 #[used]
 static INIT0_PROFILE_MARKER: [u8; 33] = *b"WYRMINIT0-PROFILE-V1:i-capability";
+
+#[cfg(all(
+    feature = "dw1b-preemption-integration",
+    not(any(
+        feature = "i2-stress-integration",
+        feature = "i-capability-integration"
+    ))
+))]
+#[used]
+static INIT0_PROFILE_MARKER: [u8; 36] = *b"WYRMINIT0-PROFILE-V1:dw1b-preemption";
 
 /// Native operations used by the WYR0-G `init0` descendant transaction.
 pub trait Init0System {
@@ -363,79 +400,92 @@ pub fn run_init0<
             task_group: handles[2].handle,
         };
         let plan = bootfs_mapping_plan(system, authority.bootfs)?;
-        let mut loaded = None;
-        let mapped =
-            system.with_bootfs_bytes(authority.parent_root, authority.bootfs, plan, |bootfs| {
-                match load_selected_child(loader, authority, bootfs) {
-                    Ok(candidate) => {
-                        loaded = Some(candidate);
-                        Ok(())
+        #[cfg(feature = "dw1b-preemption-integration")]
+        {
+            run_dw1b_preemption(system, loader, supervisor, authority, plan, deadline)?;
+            return Ok(message.transaction_id);
+        }
+        #[cfg(not(feature = "dw1b-preemption-integration"))]
+        {
+            let mut loaded = None;
+            let mapped =
+                system.with_bootfs_bytes(authority.parent_root, authority.bootfs, plan, |bootfs| {
+                    match load_selected_child(loader, authority, bootfs) {
+                        Ok(candidate) => {
+                            loaded = Some(candidate);
+                            Ok(())
+                        }
+                        Err(error) => Err(error),
                     }
-                    Err(error) => Err(error),
+                });
+            let loaded = match (mapped, loaded) {
+                (Ok(Ok(())), Some(loaded)) => loaded,
+                (Ok(Err(error)), _) => return Err(error),
+                (Err(error), Some(loaded)) => {
+                    if let Err(cleanup) = cleanup_loaded_process(system, loader, loaded, true) {
+                        return Err(Init0Error::Cleanup(cleanup));
+                    }
+                    return Err(Init0Error::Native(error));
                 }
-            });
-        let loaded = match (mapped, loaded) {
-            (Ok(Ok(())), Some(loaded)) => loaded,
-            (Ok(Err(error)), _) => return Err(error),
-            (Err(error), Some(loaded)) => {
-                if let Err(cleanup) = cleanup_loaded_process(system, loader, loaded, true) {
-                    return Err(Init0Error::Cleanup(cleanup));
-                }
-                return Err(Init0Error::Native(error));
-            }
-            (Err(error), None) => return Err(Init0Error::Native(error)),
-            (Ok(Ok(())), None) => return Err(Init0Error::MissingLoadedProcess),
-        };
-        #[cfg(feature = "i-capability-integration")]
-        if let Err(evidence) = relay_capability_evidence(
-            system,
-            supervisor,
-            bootstrap_channel,
-            loaded.launch_channel,
-            deadline,
-        ) {
-            let terminal = supervisor
-                .query_task_termination(loaded.process)
-                .ok()
-                .filter(|info| info.state == DW_TASK_STATE_EXITED);
-            let cleanup_exit =
-                cleanup_supervised_process(system, loader, supervisor, loaded, terminal.is_none())
-                    .map_err(Init0Error::Cleanup)?;
-            if let Some(error) = terminal
-                .or(cleanup_exit)
-                .and_then(capability_terminal_error)
-            {
-                return Err(error);
-            }
-            return Err(evidence);
-        }
-        let supervision = supervise_child(
-            supervisor,
-            loaded.process,
-            loaded.launch_channel,
-            HELLO_TRANSACTION_ID,
-            deadline,
-        );
-        let late_exit = match &supervision {
-            Err(error) if !error.process_exit_observed() => supervisor
-                .query_task_termination(loaded.process)
-                .ok()
-                .filter(|info| info.state == DW_TASK_STATE_EXITED),
-            _ => None,
-        };
-        let terminate = matches!(
-            &supervision,
-            Err(error) if !error.process_exit_observed()
-        ) && late_exit.is_none();
-        let cleanup_exit =
-            cleanup_supervised_process(system, loader, supervisor, loaded, terminate)
+                (Err(error), None) => return Err(Init0Error::Native(error)),
+                (Ok(Ok(())), None) => return Err(Init0Error::MissingLoadedProcess),
+            };
+            #[cfg(feature = "i-capability-integration")]
+            if let Err(evidence) = relay_capability_evidence(
+                system,
+                supervisor,
+                bootstrap_channel,
+                loaded.launch_channel,
+                deadline,
+            ) {
+                let terminal = supervisor
+                    .query_task_termination(loaded.process)
+                    .ok()
+                    .filter(|info| info.state == DW_TASK_STATE_EXITED);
+                let cleanup_exit = cleanup_supervised_process(
+                    system,
+                    loader,
+                    supervisor,
+                    loaded,
+                    terminal.is_none(),
+                )
                 .map_err(Init0Error::Cleanup)?;
-        if let Some(info) = late_exit.or(cleanup_exit) {
-            validate_successful_exit(&info)
-                .map_err(|error| Init0Error::Supervision(SupervisionError::Exit(error)))?;
+                if let Some(error) = terminal
+                    .or(cleanup_exit)
+                    .and_then(capability_terminal_error)
+                {
+                    return Err(error);
+                }
+                return Err(evidence);
+            }
+            let supervision = supervise_child(
+                supervisor,
+                loaded.process,
+                loaded.launch_channel,
+                HELLO_TRANSACTION_ID,
+                deadline,
+            );
+            let late_exit = match &supervision {
+                Err(error) if !error.process_exit_observed() => supervisor
+                    .query_task_termination(loaded.process)
+                    .ok()
+                    .filter(|info| info.state == DW_TASK_STATE_EXITED),
+                _ => None,
+            };
+            let terminate = matches!(
+                &supervision,
+                Err(error) if !error.process_exit_observed()
+            ) && late_exit.is_none();
+            let cleanup_exit =
+                cleanup_supervised_process(system, loader, supervisor, loaded, terminate)
+                    .map_err(Init0Error::Cleanup)?;
+            if let Some(info) = late_exit.or(cleanup_exit) {
+                validate_successful_exit(&info)
+                    .map_err(|error| Init0Error::Supervision(SupervisionError::Exit(error)))?;
+            }
+            supervision.map_err(Init0Error::Supervision)?;
+            Ok(message.transaction_id)
         }
-        supervision.map_err(Init0Error::Supervision)?;
-        Ok(message.transaction_id)
     })();
     let cleanup = close_received_handles(system, &handles[..counts.handles]);
     let transaction_id = operation?;
@@ -458,6 +508,459 @@ fn bootfs_mapping_plan<System: Init0System>(
         .query_memory_object_size(bootfs)
         .map_err(Init0Error::Native)
         .and_then(|size| MappingPlan::for_bootfs(size).map_err(Init0Error::Mapping))
+}
+
+#[cfg(feature = "dw1b-preemption-integration")]
+#[derive(Clone, Copy)]
+struct Dw1bPeers {
+    hog: LoadedProcess,
+    progress: LoadedProcess,
+    progress_data: DwHandle,
+}
+
+#[cfg(feature = "dw1b-preemption-integration")]
+const DW1B_CHANNEL_BROAD_RIGHTS: DwRights = DwRights(
+    DW_RIGHT_READ.0
+        | DW_RIGHT_WRITE.0
+        | DW_RIGHT_WAIT.0
+        | DW_RIGHT_DUPLICATE.0
+        | DW_RIGHT_TRANSFER.0
+        | DW_RIGHT_INSPECT.0,
+);
+
+#[cfg(feature = "dw1b-preemption-integration")]
+fn run_dw1b_preemption<
+    System: Init0System,
+    Loader: LoaderPlatform<Error = NativeError>,
+    Supervisor: SupervisionPlatform<Error = NativeError>,
+>(
+    system: &mut System,
+    loader: &mut Loader,
+    supervisor: &mut Supervisor,
+    authority: LoadAuthority,
+    plan: MappingPlan,
+    deadline: DwDeadline,
+) -> Result<(), Init0Error> {
+    let mut hog = None;
+    let mapped =
+        system.with_bootfs_bytes(authority.parent_root, authority.bootfs, plan, |bootfs| {
+            let archive = Archive::new(bootfs).map_err(Init0Error::Bootfs)?;
+            load_dw1b_peer(
+                loader,
+                authority,
+                &archive,
+                DW1B_HOG_PATH,
+                wyrmroot_dw1b_preemption::HOG_TRANSACTION_ID,
+            )
+            .map(|loaded| hog = Some(loaded))
+        });
+    let hog = match (mapped, hog) {
+        (Ok(Ok(())), Some(hog)) => hog,
+        (Ok(Err(error)), _) => return Err(error),
+        (Err(error), Some(hog)) => {
+            terminate_reap_close(loader, supervisor, hog, deadline)?;
+            return Err(Init0Error::Native(error));
+        }
+        (Err(error), None) => return Err(Init0Error::Native(error)),
+        (Ok(Ok(())), None) => return Err(Init0Error::MissingLoadedProcess),
+    };
+    if let Err(error) = await_child_ready_profile(
+        supervisor,
+        hog.process,
+        hog.launch_channel,
+        LaunchProfile::Hello,
+        wyrmroot_dw1b_preemption::HOG_TRANSACTION_ID,
+        deadline,
+    ) {
+        terminate_reap_close(loader, supervisor, hog, deadline)?;
+        return Err(Init0Error::Supervision(error));
+    }
+
+    let (progress_data, progress_child) = match create_dw1b_data_pair(system, loader) {
+        Ok(pair) => pair,
+        Err(error) => {
+            terminate_reap_close(loader, supervisor, hog, deadline)?;
+            return Err(error);
+        }
+    };
+    let mut progress = None;
+    let mut progress_attempted = false;
+    let mapped =
+        system.with_bootfs_bytes(authority.parent_root, authority.bootfs, plan, |bootfs| {
+            progress_attempted = true;
+            load_dw1b_progress(loader, authority, bootfs, progress_child)
+                .map(|loaded| progress = Some(loaded))
+        });
+    let progress = match (mapped, progress) {
+        (Ok(Ok(())), Some(progress)) => progress,
+        (Ok(Err(error)), _) => {
+            system
+                .close_handle(progress_data)
+                .map_err(Init0Error::Cleanup)?;
+            terminate_reap_close(loader, supervisor, hog, deadline)?;
+            return Err(error);
+        }
+        (Err(error), Some(progress)) => {
+            let peers = Dw1bPeers {
+                hog,
+                progress,
+                progress_data,
+            };
+            cleanup_dw1b_peers(system, loader, supervisor, peers, false, deadline)?;
+            return Err(Init0Error::Native(error));
+        }
+        (Err(error), None) => {
+            if !progress_attempted {
+                loader.close(progress_child).map_err(Init0Error::Cleanup)?;
+            }
+            system
+                .close_handle(progress_data)
+                .map_err(Init0Error::Cleanup)?;
+            terminate_reap_close(loader, supervisor, hog, deadline)?;
+            return Err(Init0Error::Native(error));
+        }
+        (Ok(Ok(())), None) => {
+            if !progress_attempted {
+                loader.close(progress_child).map_err(Init0Error::Cleanup)?;
+            }
+            system
+                .close_handle(progress_data)
+                .map_err(Init0Error::Cleanup)?;
+            terminate_reap_close(loader, supervisor, hog, deadline)?;
+            return Err(Init0Error::MissingLoadedProcess);
+        }
+    };
+    let peers = Dw1bPeers {
+        hog,
+        progress,
+        progress_data,
+    };
+
+    let mut progress_reaped = false;
+    let operation = (|| {
+        await_child_ready_profile(
+            supervisor,
+            peers.progress.process,
+            peers.progress.launch_channel,
+            LaunchProfile::Dw1bProgress,
+            wyrmroot_dw1b_preemption::PROGRESS_TRANSACTION_ID,
+            deadline,
+        )
+        .map_err(Init0Error::Supervision)?;
+        arm_dw1b_preemption(peers.hog.process, peers.progress.process)
+            .map_err(Init0Error::Native)?;
+        exchange_dw1b_progress(system, supervisor, peers.progress_data, deadline)?;
+        wait_dw1b_normal_exit(supervisor, peers.progress.process, deadline)?;
+        progress_reaped = true;
+        close_dw1b_progress(system, peers)?;
+
+        let mut hello = None;
+        let mapped =
+            system.with_bootfs_bytes(authority.parent_root, authority.bootfs, plan, |bootfs| {
+                match load_selected_child(loader, authority, bootfs) {
+                    Ok(loaded) => {
+                        hello = Some(loaded);
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
+            });
+        let hello = match (mapped, hello) {
+            (Ok(Ok(())), Some(hello)) => hello,
+            (Ok(Err(error)), _) => return Err(error),
+            (Err(error), Some(hello)) => {
+                cleanup_loaded_process(system, loader, hello, true).map_err(Init0Error::Cleanup)?;
+                return Err(Init0Error::Native(error));
+            }
+            (Err(error), None) => return Err(Init0Error::Native(error)),
+            (Ok(Ok(())), None) => return Err(Init0Error::MissingLoadedProcess),
+        };
+        let supervision = supervise_child(
+            supervisor,
+            hello.process,
+            hello.launch_channel,
+            HELLO_TRANSACTION_ID,
+            deadline,
+        );
+        let exited = supervision
+            .as_ref()
+            .map(|_| true)
+            .unwrap_or_else(|error| error.process_exit_observed());
+        cleanup_supervised_process(system, loader, supervisor, hello, !exited)
+            .map_err(Init0Error::Cleanup)?;
+        supervision.map_err(Init0Error::Supervision)
+    })();
+
+    let cleanup = cleanup_dw1b_peers(system, loader, supervisor, peers, progress_reaped, deadline);
+    match (operation, cleanup) {
+        (_, Err(cleanup)) => Err(cleanup),
+        (Err(operation), Ok(())) => Err(operation),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+#[cfg(feature = "dw1b-preemption-integration")]
+fn load_dw1b_progress<Loader: LoaderPlatform<Error = NativeError>>(
+    loader: &mut Loader,
+    authority: LoadAuthority,
+    bytes: &[u8],
+    progress_child: DwHandle,
+) -> Result<LoadedProcess, Init0Error> {
+    let archive = match Archive::new(bytes) {
+        Ok(archive) => archive,
+        Err(error) => {
+            loader.close(progress_child).map_err(Init0Error::Cleanup)?;
+            return Err(Init0Error::Bootfs(error));
+        }
+    };
+    let entry = match archive.lookup(DW1B_PROGRESS_PATH) {
+        Ok(entry) if entry.is_executable() && !entry.data().is_empty() => entry,
+        _ => {
+            loader.close(progress_child).map_err(Init0Error::Cleanup)?;
+            return Err(Init0Error::MissingHello);
+        }
+    };
+    let display_path = match entry.name_utf8() {
+        Ok(path) => path,
+        Err(_) => {
+            loader.close(progress_child).map_err(Init0Error::Cleanup)?;
+            return Err(Init0Error::MissingHello);
+        }
+    };
+    match load_service_process(
+        loader,
+        authority,
+        ServiceLoadRequest {
+            image: entry.data(),
+            display_path,
+            profile: LaunchProfile::Dw1bProgress,
+            service_channel: progress_child,
+            correlation: None,
+            transaction_id: wyrmroot_dw1b_preemption::PROGRESS_TRANSACTION_ID,
+        },
+    ) {
+        Ok(progress) => Ok(progress),
+        Err(error) => {
+            loader.close(progress_child).map_err(Init0Error::Cleanup)?;
+            Err(Init0Error::Loader(error))
+        }
+    }
+}
+
+#[cfg(feature = "dw1b-preemption-integration")]
+fn create_dw1b_data_pair<System: Init0System, Loader: LoaderPlatform<Error = NativeError>>(
+    system: &mut System,
+    loader: &mut Loader,
+) -> Result<(DwHandle, DwHandle), Init0Error> {
+    let (broad_parent, child) = loader
+        .channel_create(DW1B_CHANNEL_BROAD_RIGHTS)
+        .map_err(Init0Error::Native)?;
+    let parent = match loader.duplicate(broad_parent, CHILD_CHANNEL_RIGHTS) {
+        Ok(parent) => parent,
+        Err(error) => {
+            let _ = loader.close(broad_parent);
+            let _ = loader.close(child);
+            return Err(Init0Error::Native(error));
+        }
+    };
+    if let Err(error) = loader.close(broad_parent) {
+        let _ = loader.close(parent);
+        let _ = loader.close(child);
+        return Err(Init0Error::Native(error));
+    }
+    let parent_info = match system.query_capability_info(parent) {
+        Ok(info) => info,
+        Err(error) => {
+            let _ = loader.close(parent);
+            let _ = loader.close(child);
+            return Err(Init0Error::Native(error));
+        }
+    };
+    let child_info = match system.query_capability_info(child) {
+        Ok(info) => info,
+        Err(error) => {
+            let _ = loader.close(parent);
+            let _ = loader.close(child);
+            return Err(Init0Error::Native(error));
+        }
+    };
+    if parent_info.object_type != DW_OBJECT_TYPE_CHANNEL
+        || parent_info.rights != CHILD_CHANNEL_RIGHTS
+        || child_info.object_type != DW_OBJECT_TYPE_CHANNEL
+        || child_info.rights != DW1B_CHANNEL_BROAD_RIGHTS
+    {
+        let _ = loader.close(parent);
+        let _ = loader.close(child);
+        return Err(Init0Error::Capability(
+            CapabilityValidationError::InvalidFreshCapability,
+        ));
+    }
+    Ok((parent, child))
+}
+
+#[cfg(feature = "dw1b-preemption-integration")]
+fn load_dw1b_peer<Loader: LoaderPlatform<Error = NativeError>>(
+    loader: &mut Loader,
+    authority: LoadAuthority,
+    archive: &Archive<'_>,
+    path: &[u8],
+    transaction_id: u64,
+) -> Result<LoadedProcess, Init0Error> {
+    let entry = archive.lookup(path).map_err(|_| Init0Error::MissingHello)?;
+    if !entry.is_executable() || entry.data().is_empty() {
+        return Err(Init0Error::HelloNotExecutable);
+    }
+    let display_path = entry.name_utf8().map_err(|_| Init0Error::MissingHello)?;
+    load_process(
+        loader,
+        authority,
+        LoadRequest {
+            image: entry.data(),
+            display_path,
+            profile: LaunchProfile::Hello,
+            transaction_id,
+        },
+    )
+    .map_err(Init0Error::Loader)
+}
+
+#[cfg(feature = "dw1b-preemption-integration")]
+fn exchange_dw1b_progress<
+    System: Init0System,
+    Supervisor: SupervisionPlatform<Error = NativeError>,
+>(
+    system: &mut System,
+    supervisor: &mut Supervisor,
+    channel: DwHandle,
+    deadline: DwDeadline,
+) -> Result<(), Init0Error> {
+    for round in 0..wyrmroot_dw1b_preemption::ROUND_COUNT {
+        system
+            .send_channel(channel, &wyrmroot_dw1b_preemption::encode_challenge(round))
+            .map_err(Init0Error::Native)?;
+        let item = DwWaitItemV1 {
+            handle: channel,
+            signals: DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+        };
+        let observed = supervisor
+            .wait_many(core::slice::from_ref(&item), deadline)
+            .map_err(Init0Error::Native)?;
+        if observed.index != 0 || observed.observed.0 & DW_SIGNAL_READABLE.0 == 0 {
+            return Err(Init0Error::CapabilityEvidence);
+        }
+        let mut reply = [0; wyrmroot_dw1b_preemption::RECORD_BYTES];
+        let mut handles = [];
+        let counts = supervisor
+            .receive_channel(channel, &mut reply, &mut handles)
+            .map_err(Init0Error::Native)?;
+        if counts.bytes != reply.len()
+            || counts.handles != 0
+            || wyrmroot_dw1b_preemption::parse_reply(&reply, round).is_err()
+        {
+            return Err(Init0Error::CapabilityEvidence);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "dw1b-preemption-integration")]
+fn wait_dw1b_normal_exit<Supervisor: SupervisionPlatform<Error = NativeError>>(
+    supervisor: &mut Supervisor,
+    process: DwHandle,
+    deadline: DwDeadline,
+) -> Result<(), Init0Error> {
+    let item = DwWaitItemV1 {
+        handle: process,
+        signals: DW_SIGNAL_EXITED,
+    };
+    let observed = supervisor
+        .wait_many(core::slice::from_ref(&item), deadline)
+        .map_err(Init0Error::Native)?;
+    if observed.index != 0 || observed.observed.0 & DW_SIGNAL_EXITED.0 == 0 {
+        return Err(Init0Error::CapabilityEvidence);
+    }
+    let info = supervisor
+        .query_task_termination(process)
+        .map_err(Init0Error::Native)?;
+    validate_successful_exit(&info)
+        .map_err(|error| Init0Error::Supervision(SupervisionError::Exit(error)))
+}
+
+#[cfg(feature = "dw1b-preemption-integration")]
+fn close_dw1b_progress<System: Init0System>(
+    system: &mut System,
+    peers: Dw1bPeers,
+) -> Result<(), Init0Error> {
+    let mut first = None;
+    for handle in [
+        peers.progress_data,
+        peers.progress.launch_channel,
+        peers.progress.process,
+    ] {
+        if let Err(error) = system.close_handle(handle)
+            && first.is_none()
+        {
+            first = Some(error);
+        }
+    }
+    first.map_or(Ok(()), |error| Err(Init0Error::Cleanup(error)))
+}
+
+#[cfg(feature = "dw1b-preemption-integration")]
+fn terminate_reap_close<
+    Loader: LoaderPlatform<Error = NativeError>,
+    Supervisor: SupervisionPlatform<Error = NativeError>,
+>(
+    loader: &mut Loader,
+    supervisor: &mut Supervisor,
+    loaded: LoadedProcess,
+    deadline: DwDeadline,
+) -> Result<(), Init0Error> {
+    loader
+        .process_terminate(loaded.process)
+        .map_err(Init0Error::Cleanup)?;
+    let item = DwWaitItemV1 {
+        handle: loaded.process,
+        signals: DW_SIGNAL_EXITED,
+    };
+    let observed = supervisor
+        .wait_many(core::slice::from_ref(&item), deadline)
+        .map_err(Init0Error::Cleanup)?;
+    if observed.index != 0 || observed.observed.0 & DW_SIGNAL_EXITED.0 == 0 {
+        return Err(Init0Error::CapabilityEvidence);
+    }
+    let info = supervisor
+        .query_task_termination(loaded.process)
+        .map_err(Init0Error::Cleanup)?;
+    if info.state != DW_TASK_STATE_EXITED {
+        return Err(Init0Error::CapabilityEvidence);
+    }
+    loader
+        .close(loaded.launch_channel)
+        .map_err(Init0Error::Cleanup)?;
+    loader.close(loaded.process).map_err(Init0Error::Cleanup)
+}
+
+#[cfg(feature = "dw1b-preemption-integration")]
+fn cleanup_dw1b_peers<
+    System: Init0System,
+    Loader: LoaderPlatform<Error = NativeError>,
+    Supervisor: SupervisionPlatform<Error = NativeError>,
+>(
+    system: &mut System,
+    loader: &mut Loader,
+    supervisor: &mut Supervisor,
+    peers: Dw1bPeers,
+    progress_reaped: bool,
+    deadline: DwDeadline,
+) -> Result<(), Init0Error> {
+    if !progress_reaped {
+        terminate_reap_close(loader, supervisor, peers.progress, deadline)?;
+        system
+            .close_handle(peers.progress_data)
+            .map_err(Init0Error::Cleanup)?;
+    }
+    terminate_reap_close(loader, supervisor, peers.hog, deadline)
 }
 
 fn load_selected_child<Loader: LoaderPlatform<Error = NativeError>>(
@@ -525,9 +1028,19 @@ const fn selected_profile() -> LaunchProfile {
     }
 }
 
-#[cfg(all(
-    feature = "i2-stress-integration",
-    feature = "i-capability-integration"
+#[cfg(any(
+    all(
+        feature = "i2-stress-integration",
+        feature = "i-capability-integration"
+    ),
+    all(
+        feature = "i2-stress-integration",
+        feature = "dw1b-preemption-integration"
+    ),
+    all(
+        feature = "i-capability-integration",
+        feature = "dw1b-preemption-integration"
+    )
 ))]
 compile_error!("init0 selector integrations are mutually exclusive");
 

@@ -6,6 +6,8 @@ use core::panic::PanicInfo;
 
 use deepwyrm_syscall::{DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights};
 use wyrmroot_bootfs as _;
+#[cfg(feature = "dw1b-preemption-integration")]
+use wyrmroot_dw1b_preemption as _;
 #[cfg(feature = "i-capability-integration")]
 use wyrmroot_i_capability as _;
 use wyrmroot_init0::{Init0System, run_init0};

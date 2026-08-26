@@ -21,6 +21,10 @@ default = []
 native-init0 = []
 i2-stress-integration = []
 i-capability-integration = ["dep:wyrmroot-i-capability"]
+dw1b-preemption-integration = [
+    "dep:wyrmroot-dw1b-preemption",
+    "wyrmroot-runtime/dw1b-test-evidence",
+]
 
 [dependencies]
 deepwyrm-syscall.workspace = true
@@ -28,6 +32,7 @@ wyrmroot-bootfs = { path = "../../crates/wyrmroot-bootfs" }
 wyrmroot-loader = { path = "../../crates/wyrmroot-loader" }
 wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }
 wyrmroot-i-capability = { path = "../i-capability", optional = true }
+wyrmroot-dw1b-preemption = { path = "../dw1b-preemption", optional = true }
 
 [dev-dependencies]
 wyrmroot-bootfs = { path = "../../crates/wyrmroot-bootfs", features = ["builder"] }

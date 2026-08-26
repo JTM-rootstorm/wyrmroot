@@ -125,7 +125,7 @@ fn parse(
 /// yield, memory access, or blocking instruction.
 #[cfg(feature = "native-payloads")]
 pub fn run_cpu_hog(channel: DwHandle) -> Result<Infallible, u32> {
-    receive_startup_and_ready(channel, HOG_TRANSACTION_ID)?;
+    receive_hog_startup_and_ready(channel)?;
     close_handle(channel).map_err(|_| 0xD1B0_0104_u32)?;
     loop {
         core::hint::spin_loop();
@@ -135,40 +135,65 @@ pub fn run_cpu_hog(channel: DwHandle) -> Result<Infallible, u32> {
 /// Runs the progress peer and attests only after all eight exact replies.
 #[cfg(feature = "native-payloads")]
 pub fn run_progress(channel: DwHandle) -> Result<(), u32> {
-    receive_startup_and_ready(channel, PROGRESS_TRANSACTION_ID)?;
+    let data_channel = receive_progress_startup_and_ready(channel)?;
+    close_handle(channel).map_err(|_| 0xD1B0_0206_u32)?;
     for round in 0..ROUND_COUNT {
         let mut bytes = [0; RECORD_BYTES];
         let mut handles = [];
         let counts =
-            receive_channel(channel, &mut bytes, &mut handles).map_err(|_| 0xD1B0_0201_u32)?;
+            receive_channel(data_channel, &mut bytes, &mut handles).map_err(|_| 0xD1B0_0201_u32)?;
         if counts.bytes != RECORD_BYTES
             || counts.handles != 0
             || parse_challenge(&bytes, round).is_err()
         {
             return Err(0xD1B0_0202);
         }
-        send_channel(channel, &encode_reply(round), &[]).map_err(|_| 0xD1B0_0203_u32)?;
+        send_channel(data_channel, &encode_reply(round), &[]).map_err(|_| 0xD1B0_0203_u32)?;
     }
     submit_dw1b_progress(CHALLENGE_DIGEST).map_err(|_| 0xD1B0_0204_u32)?;
-    close_handle(channel).map_err(|_| 0xD1B0_0205_u32)
+    close_handle(data_channel).map_err(|_| 0xD1B0_0205_u32)
 }
 
 #[cfg(feature = "native-payloads")]
-fn receive_startup_and_ready(channel: DwHandle, transaction: u64) -> Result<(), u32> {
+fn receive_hog_startup_and_ready(channel: DwHandle) -> Result<(), u32> {
     let mut bytes = [0; HEADER_BYTES];
-    let mut handles = [DwReceivedHandleInfoV1::default(); 1];
+    let mut handles = [];
     let counts = receive_channel(channel, &mut bytes, &mut handles).map_err(|_| 0xD1B0_0101_u32)?;
     if counts.bytes != HEADER_BYTES || counts.handles != 0 {
         return Err(0xD1B0_0102);
     }
     let init = parse_init(LaunchProfile::Hello, &bytes, &[]).map_err(|_| 0xD1B0_0102_u32)?;
-    if init.transaction_id != transaction {
+    if init.transaction_id != HOG_TRANSACTION_ID {
         return Err(0xD1B0_0102);
     }
     let mut ready = [0; HEADER_BYTES];
-    let size = encode_ready_for_profile(LaunchProfile::Hello, transaction, &mut ready)
+    let size = encode_ready_for_profile(LaunchProfile::Hello, HOG_TRANSACTION_ID, &mut ready)
         .map_err(|_| 0xD1B0_0103_u32)?;
     send_channel(channel, &ready[..size], &[]).map_err(|_| 0xD1B0_0103_u32)
+}
+
+#[cfg(feature = "native-payloads")]
+fn receive_progress_startup_and_ready(channel: DwHandle) -> Result<DwHandle, u32> {
+    let mut bytes = [0; HEADER_BYTES + 8];
+    let mut handles = [DwReceivedHandleInfoV1::default(); 1];
+    let counts = receive_channel(channel, &mut bytes, &mut handles).map_err(|_| 0xD1B0_0211_u32)?;
+    if counts.bytes != bytes.len() || counts.handles != 1 {
+        return Err(0xD1B0_0212);
+    }
+    let init =
+        parse_init(LaunchProfile::Dw1bProgress, &bytes, &handles).map_err(|_| 0xD1B0_0212_u32)?;
+    if init.transaction_id != PROGRESS_TRANSACTION_ID {
+        return Err(0xD1B0_0212);
+    }
+    let mut ready = [0; HEADER_BYTES];
+    let size = encode_ready_for_profile(
+        LaunchProfile::Dw1bProgress,
+        PROGRESS_TRANSACTION_ID,
+        &mut ready,
+    )
+    .map_err(|_| 0xD1B0_0213_u32)?;
+    send_channel(channel, &ready[..size], &[]).map_err(|_| 0xD1B0_0213_u32)?;
+    Ok(handles[0].handle)
 }
 
 #[cfg(test)]
