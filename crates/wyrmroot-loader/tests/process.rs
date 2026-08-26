@@ -3,7 +3,7 @@ use wyrmroot_loader::{
     launch::LaunchProfile,
     process::{
         JobLoadRequest, LoadAuthority, LoadError, LoadFault, LoadRequest, LoadStage,
-        LoaderPlatform, ParentMapping, ProcessCreateRequest, ProcessCreateResult,
+        LoaderPlatform, ParentMapping, ProcessCreateRequest, ProcessCreateResult, ServiceLoadError,
         ServiceLoadRequest, load_job_process, load_process, load_process_with_fault,
         load_service_process,
     },
@@ -42,6 +42,8 @@ struct Mock {
     reject_late_unmap: bool,
     reject_redundant_process_terminate: bool,
     post_start_thread_close_failures: usize,
+    close_calls: usize,
+    fail_close_at: Option<usize>,
     fail_process_terminate: bool,
     materialized: Vec<Vec<u8>>,
     sent_init: Vec<u8>,
@@ -64,6 +66,8 @@ impl Mock {
             reject_late_unmap: false,
             reject_redundant_process_terminate: false,
             post_start_thread_close_failures: 0,
+            close_calls: 0,
+            fail_close_at: None,
             fail_process_terminate: false,
             materialized: Vec::new(),
             sent_init: Vec::new(),
@@ -103,6 +107,10 @@ impl LoaderPlatform for Mock {
     }
     fn close(&mut self, handle: DwHandle) -> Result<(), Self::Error> {
         self.events.push(Event::Close(handle.0));
+        self.close_calls += 1;
+        if self.fail_close_at == Some(self.close_calls) {
+            return Err("close");
+        }
         if self.started_thread == Some(handle) && self.post_start_thread_close_failures != 0 {
             self.post_start_thread_close_failures -= 1;
             return Err("close-thread");
@@ -346,9 +354,65 @@ fn bootstrap_service_uses_startup_v2_for_controller_correlation_environment() {
     );
     assert_eq!(
         missing,
-        Err(LoadError::Startup(
-            wyrmroot_loader::image::StartupBlockError::InvalidEnvironment
-        ))
+        Err(ServiceLoadError {
+            error: LoadError::Startup(
+                wyrmroot_loader::image::StartupBlockError::InvalidEnvironment
+            ),
+            service_channel_consumed: false,
+        })
+    );
+}
+
+#[test]
+fn service_load_reports_endpoint_ownership_on_both_sides_of_init_commit() {
+    let image = executable();
+    let request = |service_channel| ServiceLoadRequest {
+        image: &image,
+        display_path: "/system/registryd",
+        profile: LaunchProfile::BootstrapRegistry,
+        service_channel,
+        correlation: None,
+        transaction_id: 0x1310,
+    };
+
+    let mut before = Mock::new(None);
+    // The first close reduces the loader's broad bootstrap endpoint. The
+    // second is the first mapped image object's pre-INIT scratch close.
+    before.fail_close_at = Some(2);
+    let before_error = load_service_process(&mut before, authority(), request(DwHandle(0x910)))
+        .expect_err("pre-INIT scratch cleanup must fail");
+    assert!(matches!(
+        before_error.error,
+        LoadError::Platform {
+            stage: LoadStage::SuccessCleanup,
+            ..
+        }
+    ));
+    assert!(!before_error.service_channel_consumed);
+    assert!(
+        !before
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Send(_)))
+    );
+
+    let mut after = Mock::new(None);
+    after.post_start_thread_close_failures = 1;
+    let after_error = load_service_process(&mut after, authority(), request(DwHandle(0x911)))
+        .expect_err("post-INIT thread cleanup must fail");
+    assert!(matches!(
+        after_error.error,
+        LoadError::Platform {
+            stage: LoadStage::SuccessCleanup,
+            ..
+        }
+    ));
+    assert!(after_error.service_channel_consumed);
+    assert!(
+        after
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Send(2)))
     );
 }
 

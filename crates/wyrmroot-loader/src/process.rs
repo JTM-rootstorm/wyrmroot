@@ -149,6 +149,23 @@ pub enum LoadError<PlatformError> {
     },
 }
 
+/// Service-launch failure with explicit ownership of the caller-supplied
+/// service endpoint at the atomic INIT boundary.
+#[derive(Debug, Eq, PartialEq)]
+pub struct ServiceLoadError<PlatformError> {
+    pub error: LoadError<PlatformError>,
+    pub service_channel_consumed: bool,
+}
+
+impl<E> ServiceLoadError<E> {
+    const fn caller_retains(error: LoadError<E>) -> Self {
+        Self {
+            error,
+            service_channel_consumed: false,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct ProcessCreateRequest {
     pub task_group: DwHandle,
@@ -356,6 +373,7 @@ pub fn load_process_with_fault<P: LoaderPlatform>(
     request: LoadRequest<'_>,
     fault: LoadFault,
 ) -> Result<LoadedProcess, LoadError<P::Error>> {
+    let mut delegated_channels_consumed = false;
     load_process_internal(
         platform,
         authority,
@@ -367,6 +385,7 @@ pub fn load_process_with_fault<P: LoaderPlatform>(
             channels: &[],
         },
         fault,
+        &mut delegated_channels_consumed,
     )
 }
 
@@ -381,6 +400,7 @@ pub fn load_job_process<P: LoaderPlatform>(
         3 => LaunchProfile::JobV2Streams,
         _ => return Err(LoadError::Launch(LaunchError::HandleCount)),
     };
+    let mut delegated_channels_consumed = false;
     load_process_internal(
         platform,
         authority,
@@ -396,6 +416,7 @@ pub fn load_job_process<P: LoaderPlatform>(
             channels: request.streams,
         },
         LoadFault::None,
+        &mut delegated_channels_consumed,
     )
 }
 
@@ -405,9 +426,11 @@ pub fn load_service_process<P: LoaderPlatform>(
     platform: &mut P,
     authority: LoadAuthority,
     request: ServiceLoadRequest<'_>,
-) -> Result<LoadedProcess, LoadError<P::Error>> {
+) -> Result<LoadedProcess, ServiceLoadError<P::Error>> {
     if request.profile.channel_role().is_none() {
-        return Err(LoadError::Launch(LaunchError::HandleCount));
+        return Err(ServiceLoadError::caller_retains(LoadError::Launch(
+            LaunchError::HandleCount,
+        )));
     }
     let channels = [request.service_channel];
     let uses_correlation = matches!(
@@ -417,13 +440,17 @@ pub fn load_service_process<P: LoaderPlatform>(
     let argv = [request.display_path];
     let mut environment = [""; wyrmroot_registry_proto::CORRELATION_ENVIRONMENT_COUNT];
     let startup = if uses_correlation {
-        let correlation = request
-            .correlation
-            .ok_or(LoadError::Startup(StartupBlockError::InvalidEnvironment))?;
+        let correlation = request.correlation.ok_or_else(|| {
+            ServiceLoadError::caller_retains(LoadError::Startup(
+                StartupBlockError::InvalidEnvironment,
+            ))
+        })?;
         for (index, slot) in environment.iter_mut().enumerate() {
-            *slot = correlation
-                .entry(index)
-                .ok_or(LoadError::Startup(StartupBlockError::InvalidEnvironment))?;
+            *slot = correlation.entry(index).ok_or_else(|| {
+                ServiceLoadError::caller_retains(LoadError::Startup(
+                    StartupBlockError::InvalidEnvironment,
+                ))
+            })?;
         }
         StartupSpec::JobV2 {
             path: request.display_path,
@@ -433,8 +460,11 @@ pub fn load_service_process<P: LoaderPlatform>(
     } else if request.correlation.is_none() {
         StartupSpec::Legacy(request.display_path)
     } else {
-        return Err(LoadError::Startup(StartupBlockError::TooManyArguments));
+        return Err(ServiceLoadError::caller_retains(LoadError::Startup(
+            StartupBlockError::TooManyArguments,
+        )));
     };
+    let mut service_channel_consumed = false;
     load_process_internal(
         platform,
         authority,
@@ -446,7 +476,12 @@ pub fn load_service_process<P: LoaderPlatform>(
             channels: &channels,
         },
         LoadFault::None,
+        &mut service_channel_consumed,
     )
+    .map_err(|error| ServiceLoadError {
+        error,
+        service_channel_consumed,
+    })
 }
 
 fn load_process_internal<P: LoaderPlatform>(
@@ -454,6 +489,7 @@ fn load_process_internal<P: LoaderPlatform>(
     authority: LoadAuthority,
     request: InternalLoadRequest<'_>,
     fault: LoadFault,
+    delegated_channels_consumed: &mut bool,
 ) -> Result<LoadedProcess, LoadError<P::Error>> {
     let expected_channels = if request.profile.channel_role().is_some() {
         1
@@ -775,6 +811,7 @@ fn load_process_internal<P: LoaderPlatform>(
         return Err(fail(platform, &mut transaction, LoadStage::InitSend, cause));
     }
     // Successful Channel send consumed every externally supplied endpoint.
+    *delegated_channels_consumed = !request.channels.is_empty();
     for delegated in &mut transaction.delegated_channels {
         *delegated = None;
     }
