@@ -21,6 +21,7 @@ This file defines the minimum architecture reading set for Wyrmroot implementati
 
 - [`Plans/WYR1_BOOTSTRAP_SUPERVISOR_CONTRACT.md`](WYR1_BOOTSTRAP_SUPERVISOR_CONTRACT.md) defines the reached WYR1-A permanent `/system/init` handoff, immutable bootfs/RRC-A manifest, fixed bootstrap graph, generation-exact READY/restart/reap behavior, capability distribution, and finite degraded-recovery transition. Read it before implementing or changing WYR1 supervision and recovery-residency behavior.
 - [`Plans/WYR1_A_VALIDATION.md`](WYR1_A_VALIDATION.md) records the accepted WYR1-A product tuple, artifact identities, host gates, paired default/SMP live boot matrix, remediation, and explicit VM-hardware/nonclaim boundary.
+- [`Plans/WYR1_B_REGISTRY_LAUNCH_CONTRACT.md`](WYR1_B_REGISTRY_LAUNCH_CONTRACT.md) defines the bounded separate bootstrap registry, controller-installed publication/client authority, direct endpoint routing, startup ABI v2 and WRLP 1.3 profiles, supervisor-owned scoped launch/job protocol, orphan/reap policy, immutable launch policy, and WYR1-B host/live gates.
 - [`Plans/WYR0_BOOTFS_FORMAT_CONTRACT.md`](WYR0_BOOTFS_FORMAT_CONTRACT.md) defines the canonical
   deterministic archive subset implemented by WYR0-C. Read it before changing bootfs builder,
   parser, lookup, content-manifest, or archive-intake behavior.
