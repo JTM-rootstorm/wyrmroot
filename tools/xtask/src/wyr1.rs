@@ -1266,6 +1266,7 @@ pub fn encode_evidence_line_with_scenario(
 }
 
 fn parse_hex(bytes: &[u8], label: &str) -> Result<u64, Failure> {
+    require_upper_hex(bytes, label)?;
     u64::from_str_radix(
         std::str::from_utf8(bytes)
             .map_err(|_| Failure::task(format!("WYR1 evidence {label} is not ASCII")))?,
@@ -1275,6 +1276,7 @@ fn parse_hex(bytes: &[u8], label: &str) -> Result<u64, Failure> {
 }
 
 fn parse_hex_byte(bytes: &[u8], label: &str) -> Result<u8, Failure> {
+    require_upper_hex(bytes, label)?;
     u8::from_str_radix(
         std::str::from_utf8(bytes)
             .map_err(|_| Failure::task(format!("WYR1 evidence {label} is not ASCII")))?,
@@ -1284,12 +1286,24 @@ fn parse_hex_byte(bytes: &[u8], label: &str) -> Result<u8, Failure> {
 }
 
 fn parse_hex_u32(bytes: &[u8], label: &str) -> Result<u32, Failure> {
+    require_upper_hex(bytes, label)?;
     u32::from_str_radix(
         std::str::from_utf8(bytes)
             .map_err(|_| Failure::task(format!("WYR1 evidence {label} is not ASCII")))?,
         16,
     )
     .map_err(|_| Failure::task(format!("WYR1 evidence {label} is invalid")))
+}
+
+fn require_upper_hex(bytes: &[u8], label: &str) -> Result<(), Failure> {
+    if bytes
+        .iter()
+        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'A'..=b'F'))
+    {
+        Ok(())
+    } else {
+        Err(Failure::task(format!("WYR1 evidence {label} is invalid")))
+    }
 }
 fn fnv1a32(bytes: &[u8]) -> u32 {
     let mut hash = 0x811c9dc5;
@@ -1323,6 +1337,62 @@ pub fn join_profiles(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lowercase_field(mut line: Vec<u8>, range: std::ops::Range<usize>) -> Vec<u8> {
+        let byte = line[range]
+            .iter_mut()
+            .find(|byte| matches!(byte, b'A'..=b'F'))
+            .expect("test field contains an uppercase hexadecimal letter");
+        byte.make_ascii_lowercase();
+        let checksum = fnv1a32(&line[..105]);
+        line[105..113].copy_from_slice(format!("{checksum:08X}").as_bytes());
+        line
+    }
+
+    fn assert_invalid_field(line: Vec<u8>, nonce: u64, label: &str) {
+        let error = parse_evidence(&line, nonce, Scenario::Normal).unwrap_err();
+        assert_eq!(error.message, format!("WYR1 evidence {label} is invalid"));
+    }
+
+    #[test]
+    fn evidence_rejects_lowercase_hexadecimal_fields() {
+        let nonce = 0x0123_4567_89ab_cdef;
+        let cases = [
+            (13..29, nonce, 0, Event::Ready, 1, 1, 1, "nonce"),
+            (30..38, nonce, 0xA, Event::Ready, 1, 1, 1, "sequence"),
+            (39..41, nonce, 0, Event::Normal, 0, 0, 0, "kind"),
+            (45..53, nonce, 0, Event::Ready, 0xABCD, 1, 1, "role"),
+            (54..70, nonce, 0, Event::Ready, 1, 0xABCD, 1, "generation"),
+            (71..87, nonce, 0, Event::Ready, 1, 1, 0xABCD, "transaction"),
+        ];
+        for (range, encoded_nonce, sequence, event, role, generation, transaction, label) in cases {
+            let line = encode_evidence_line(
+                encoded_nonce,
+                sequence,
+                event,
+                role,
+                generation,
+                transaction,
+            )
+            .into_bytes();
+            assert_invalid_field(lowercase_field(line, range), nonce, label);
+        }
+
+        let mut value = encode_evidence_line(nonce, 0, Event::Reap, 1, 1, 1).into_bytes();
+        value[88..104].copy_from_slice(b"000000000000ABCD");
+        let checksum = fnv1a32(&value[..105]);
+        value[105..113].copy_from_slice(format!("{checksum:08X}").as_bytes());
+        assert_invalid_field(lowercase_field(value, 88..104), nonce, "value");
+
+        let mut checksum = encode_evidence_line(nonce, 0, Event::Ready, 1, 1, 1).into_bytes();
+        let checksum_byte = checksum[105..113]
+            .iter_mut()
+            .find(|byte| matches!(byte, b'A'..=b'F'))
+            .expect("test checksum contains an uppercase hexadecimal letter");
+        checksum_byte.make_ascii_lowercase();
+        assert_invalid_field(checksum, nonce, "checksum");
+    }
+
     #[test]
     fn evidence_rejects_gap_checksum_stale_nonce_and_after_terminal() {
         let nonce = 0x0123_4567_89ab_cdef;
