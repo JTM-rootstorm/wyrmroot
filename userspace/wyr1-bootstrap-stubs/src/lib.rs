@@ -34,6 +34,29 @@ pub enum StubError {
 }
 
 pub fn run_stub<S: StubSystem>(system: &mut S, channel: DwHandle) -> Result<(), StubError> {
+    let transaction = receive_init(system, channel)?;
+    let mut ready = [0; HEADER_BYTES];
+    let size =
+        launch::encode_ready_for_profile(LaunchProfile::EarlyBootStub, transaction, &mut ready)
+            .map_err(StubError::Launch)?;
+    system
+        .send_channel(channel, &ready[..size])
+        .map_err(StubError::Native)?;
+    system.close_handle(channel).map_err(StubError::Native)
+}
+
+/// Accepts the exact launch profile and then deterministically retires before
+/// READY. This distinct artifact exists only so degraded WYR1 media can drive
+/// the supervisor's real four-attempt exhaustion path.
+pub fn run_fail_before_ready<S: StubSystem>(
+    system: &mut S,
+    channel: DwHandle,
+) -> Result<(), StubError> {
+    let _transaction = receive_init(system, channel)?;
+    system.close_handle(channel).map_err(StubError::Native)
+}
+
+fn receive_init<S: StubSystem>(system: &mut S, channel: DwHandle) -> Result<u64, StubError> {
     let info = system
         .query_capability_info(channel)
         .map_err(StubError::Native)?;
@@ -54,12 +77,5 @@ pub fn run_stub<S: StubSystem>(system: &mut S, channel: DwHandle) -> Result<(), 
     let transaction = launch::parse_init(LaunchProfile::EarlyBootStub, &init, &handles)
         .map_err(StubError::Launch)?
         .transaction_id;
-    let mut ready = [0; HEADER_BYTES];
-    let size =
-        launch::encode_ready_for_profile(LaunchProfile::EarlyBootStub, transaction, &mut ready)
-            .map_err(StubError::Launch)?;
-    system
-        .send_channel(channel, &ready[..size])
-        .map_err(StubError::Native)?;
-    system.close_handle(channel).map_err(StubError::Native)
+    Ok(transaction)
 }

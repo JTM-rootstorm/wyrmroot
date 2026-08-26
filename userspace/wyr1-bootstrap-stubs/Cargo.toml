@@ -23,6 +23,13 @@ test = false
 bench = false
 required-features = ["native-stubs"]
 
+[[bin]]
+name = "registryd-fail"
+path = "src/registryd_fail.rs"
+test = false
+bench = false
+required-features = ["native-stubs"]
+
 [features]
 default = []
 native-stubs = []
