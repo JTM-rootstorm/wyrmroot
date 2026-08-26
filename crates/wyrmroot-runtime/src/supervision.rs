@@ -520,9 +520,27 @@ pub fn await_child_ready_profile_observed<P: SupervisionPlatform>(
         return Err(ObservedSupervisionError::ExitedBeforeReady(info));
     }
     if result.observed.0 & DW_SIGNAL_READABLE.0 == 0 {
-        return Err(ObservedSupervisionError::Supervision(
-            SupervisionError::PeerClosedBeforeReady,
-        ));
+        let process_item = DwWaitItemV1 {
+            handle: process,
+            signals: DW_SIGNAL_EXITED,
+        };
+        let terminal = platform
+            .wait_many(core::slice::from_ref(&process_item), deadline)
+            .map_err(|error| {
+                ObservedSupervisionError::Supervision(SupervisionError::Platform(error))
+            })?;
+        if terminal.index != 0 || terminal.observed.0 & DW_SIGNAL_EXITED.0 == 0 {
+            return Err(ObservedSupervisionError::Supervision(
+                SupervisionError::InvalidWaitResult,
+            ));
+        }
+        let info = platform.query_task_termination(process).map_err(|error| {
+            ObservedSupervisionError::Supervision(SupervisionError::ExitQuery(error))
+        })?;
+        if let Err(error) = validate_terminal_record(&info) {
+            return Err(ObservedSupervisionError::Exit(error, info));
+        }
+        return Err(ObservedSupervisionError::PeerClosedBeforeReady(info));
     }
     let mut bytes = [0; HEADER_BYTES];
     let mut handles = [];
@@ -873,6 +891,25 @@ mod tests {
         .unwrap_err();
         let ObservedSupervisionError::ExitedBeforeReady(info) = error else {
             panic!("expected termination-bearing early exit")
+        };
+        assert_eq!(info.application_code, 0xA101_F001);
+    }
+
+    #[test]
+    fn peer_close_first_observed_ready_wait_preserves_exact_degraded_exit_record() {
+        let mut mock = Mock::successful(&[CLOSED, EXITED]);
+        mock.task_info.application_code = 0xA101_F001;
+        let error = await_child_ready_profile_observed(
+            &mut mock,
+            DwHandle(1),
+            DwHandle(2),
+            LaunchProfile::Hello,
+            7,
+            DwDeadline(99),
+        )
+        .unwrap_err();
+        let ObservedSupervisionError::PeerClosedBeforeReady(info) = error else {
+            panic!("expected peer-close termination record")
         };
         assert_eq!(info.application_code, 0xA101_F001);
     }

@@ -192,6 +192,13 @@ pub fn run_supervisor_bootstrap<
         .receive_channel(bootstrap_channel, &mut bytes, &mut handles)
         .map_err(BootstrapError::Native)?;
     if counts.bytes > bytes.len() || counts.handles > handles.len() {
+        let initialized = core::cmp::min(counts.handles, handles.len());
+        let handles_cleanup = close_received_handles(system, &handles[..initialized]);
+        let channel_cleanup = system
+            .close_handle(bootstrap_channel)
+            .map_err(BootstrapError::Native);
+        handles_cleanup?;
+        channel_cleanup?;
         return Err(BootstrapError::ReceiveCounts(counts));
     }
     let operation = (|| {

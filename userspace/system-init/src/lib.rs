@@ -13,8 +13,9 @@ use crate::evidence::{EvidenceError, EvidenceEvent, EvidenceLog};
 use crate::gate::{GATE_CONFIG_PATH, GateConfig, GateConfigError, parse_gate_config};
 use deepwyrm_syscall::{
     DW_DEADLINE_INFINITE, DW_SIGNAL_EXITED, DW_SIGNAL_PEER_CLOSED, DW_TASK_STATE_EXITED,
-    DW_TERMINATION_AUTHORIZED, DW_TERMINATION_NORMAL_EXIT, DwDeadline, DwHandle, DwObjectType,
-    DwReceivedHandleInfoV1, DwRights, DwTaskTerminationInfoV1, DwWaitItemV1,
+    DW_TERMINATION_AUTHORIZED, DW_TERMINATION_NORMAL_EXIT, DW_TERMINATION_TASK_GROUP_TEARDOWN,
+    DwDeadline, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights, DwTaskTerminationInfoV1,
+    DwWaitItemV1,
 };
 use wyrmroot_bootfs::archive::{Archive, LookupError, ParseError};
 use wyrmroot_loader::{
@@ -1601,6 +1602,12 @@ fn terminal_disposition(info: &DwTaskTerminationInfoV1) -> TerminalDisposition {
         && info.fault_address == 0
     {
         TerminalDisposition::NormalExit(info.application_code)
+    } else if info.reason == DW_TERMINATION_TASK_GROUP_TEARDOWN
+        && info.exception_type.0 == 0
+        && info.detail == 0
+        && info.fault_address == 0
+    {
+        TerminalDisposition::TaskGroupTeardown
     } else if info.reason == DW_TERMINATION_AUTHORIZED
         && info.exception_type.0 == 0
         && info.detail == 0
@@ -2019,6 +2026,16 @@ mod native_cleanup_tests {
         assert_eq!(
             terminal_disposition(&info),
             TerminalDisposition::UnhandledException
+        );
+        info.reason = DW_TERMINATION_TASK_GROUP_TEARDOWN;
+        info.exception_type = deepwyrm_syscall::DwExceptionType(0);
+        assert_eq!(
+            terminal_disposition(&info),
+            TerminalDisposition::TaskGroupTeardown
+        );
+        assert_eq!(
+            reap_evidence_value(AttemptFailure::ExitAfterReady(terminal_disposition(&info))),
+            (REAP_CLASS_TASK_GROUP_TEARDOWN as u64) << 32
         );
         assert_eq!(
             reap_evidence_value(AttemptFailure::DuplicateReady),

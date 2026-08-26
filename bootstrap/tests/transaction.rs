@@ -147,6 +147,7 @@ struct Fixture {
     relay_handle_count: usize,
     relay_receive_error: Option<NativeError>,
     relay_send_would_block_once: bool,
+    startup_counts: Option<ReceiveCounts>,
 }
 
 impl Fixture {
@@ -186,6 +187,7 @@ impl Fixture {
             relay_handle_count: 0,
             relay_receive_error: None,
             relay_send_would_block_once: false,
+            startup_counts: None,
         }
     }
 }
@@ -225,10 +227,10 @@ impl BootstrapSystem for Fixture {
         if channel == CHANNEL {
             bytes[..self.init_size].copy_from_slice(&self.init[..self.init_size]);
             handles[..3].copy_from_slice(&self.handles);
-            return Ok(ReceiveCounts {
+            return Ok(self.startup_counts.unwrap_or(ReceiveCounts {
                 bytes: self.init_size,
                 handles: 3,
-            });
+            }));
         }
         let record = self
             .relay_records
@@ -852,6 +854,33 @@ fn wyr1_primordial_launches_only_system_init_and_retires_after_operational_ready
             CHANNEL
         ]
     );
+}
+
+#[test]
+fn wyr1_primordial_oversized_receive_closes_initialized_handles_and_channel() {
+    let mut fixture = Fixture::valid();
+    fixture.startup_counts = Some(ReceiveCounts {
+        bytes: BOOTSTRAP_INIT_V2_SIZE,
+        handles: usize::MAX,
+    });
+    let mut loader = SmokeLoader::supervisor();
+    let mut supervisor = SmokeSupervisor::successful_supervisor();
+    assert_eq!(
+        run_supervisor_bootstrap(
+            &mut fixture,
+            &mut loader,
+            &mut supervisor,
+            CHANNEL,
+            DwDeadline(99),
+        ),
+        Err(BootstrapError::ReceiveCounts(ReceiveCounts {
+            bytes: BOOTSTRAP_INIT_V2_SIZE,
+            handles: usize::MAX,
+        }))
+    );
+    assert_eq!(fixture.closed, [ROOT, BOOTFS, TASK_GROUP, CHANNEL]);
+    assert!(loader.init_profiles.is_empty());
+    assert_eq!(supervisor.received, 0);
 }
 
 #[cfg(feature = "i-capability-relay")]
