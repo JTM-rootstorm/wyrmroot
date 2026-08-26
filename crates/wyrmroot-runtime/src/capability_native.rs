@@ -293,6 +293,31 @@ pub fn submit_wyr1_evidence(record: &[u8; WYR1_EVIDENCE_RECORD_BYTES]) -> Result
     ))
 }
 
+#[cfg(feature = "dw1b-test-evidence")]
+const DW1B_TEST_EVIDENCE_SYSCALL: deepwyrm_syscall::DwSyscallId =
+    deepwyrm_syscall::DwSyscallId(0xFFFF_FF1A);
+
+/// Arms selector 26 from the exact init0 controller.
+#[cfg(feature = "dw1b-test-evidence")]
+pub fn arm_dw1b_preemption(
+    hog_process: DwHandle,
+    progress_process: DwHandle,
+) -> Result<(), NativeError> {
+    require_success(raw::call(
+        DW1B_TEST_EVIDENCE_SYSCALL,
+        [1, hog_process.0, progress_process.0, 8, 0, 0],
+    ))
+}
+
+/// Submits selector 26 progress only after the fixed eight-round exchange.
+#[cfg(feature = "dw1b-test-evidence")]
+pub fn submit_dw1b_progress(digest: u64) -> Result<(), NativeError> {
+    require_success(raw::call(
+        DW1B_TEST_EVIDENCE_SYSCALL,
+        [2, 8, digest, 0, 0, 0],
+    ))
+}
+
 pub fn create_event(rights: DwRights) -> Result<DwHandle, NativeError> {
     let mut event = DwHandle(0);
     require_success(raw::call(

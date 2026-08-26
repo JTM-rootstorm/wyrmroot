@@ -1,0 +1,37 @@
+[package]
+name = "wyrmroot-dw1b-preemption"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Selector-26 normal-preemption payloads and fixed challenge protocol"
+license = "GPL-3.0-or-later"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "wyrmroot-dw1b-cpu-hog"
+path = "src/bin/cpu_hog.rs"
+test = false
+bench = false
+required-features = ["native-payloads"]
+
+[[bin]]
+name = "wyrmroot-dw1b-progress"
+path = "src/bin/progress.rs"
+test = false
+bench = false
+required-features = ["native-payloads"]
+
+[features]
+default = []
+native-payloads = ["wyrmroot-runtime/dw1b-test-evidence"]
+
+[dependencies]
+deepwyrm-syscall.workspace = true
+wyrmroot-loader = { path = "../../crates/wyrmroot-loader" }
+wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }
+
+[lints.rust]
+unsafe_code = "deny"
+unused_crate_dependencies = "deny"

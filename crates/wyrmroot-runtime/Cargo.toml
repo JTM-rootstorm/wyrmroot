@@ -13,6 +13,7 @@ path = "src/lib.rs"
 default = []
 primordial-test-support = []
 wyr1-test-evidence = []
+dw1b-test-evidence = []
 
 [dependencies]
 deepwyrm-syscall.workspace = true
