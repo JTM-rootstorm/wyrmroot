@@ -6,7 +6,11 @@ use wyrmroot_rrc_manifest::{
     builder::{Builder, DependencySpec, RoleSpec},
 };
 use wyrmroot_runtime::{AttemptFailure, RestartState, TerminalDisposition};
-use wyrmroot_system_init::{AttemptResources, InitError, SystemInit, SystemMode, observe_ready};
+use wyrmroot_system_init::{
+    AttemptResources, InitError, REAP_CLASS_AUTHORIZED_TERMINATION, REAP_CLASS_NORMAL_EXIT,
+    REAP_CLASS_TASK_GROUP_TEARDOWN, REAP_CLASS_UNHANDLED_EXCEPTION, SystemInit, SystemMode,
+    observe_ready, reap_evidence_value,
+};
 
 const BOOT: [u8; 32] = [0x42; 32];
 
@@ -270,6 +274,34 @@ fn ready_timeout_equality_uses_deadline_transition() {
             ..
         })
     ));
+}
+
+#[test]
+fn reap_evidence_value_encodes_terminal_class_and_application_code() {
+    assert_eq!(
+        reap_evidence_value(AttemptFailure::ExitAfterReady(
+            TerminalDisposition::NormalExit(0)
+        )),
+        (REAP_CLASS_NORMAL_EXIT as u64) << 32
+    );
+    assert_eq!(
+        reap_evidence_value(AttemptFailure::ExitBeforeReady(
+            TerminalDisposition::NormalExit(0xA5A5_5A5A)
+        )),
+        ((REAP_CLASS_NORMAL_EXIT as u64) << 32) | 0xA5A5_5A5A
+    );
+    assert_eq!(
+        reap_evidence_value(AttemptFailure::StartFailed),
+        (REAP_CLASS_AUTHORIZED_TERMINATION as u64) << 32
+    );
+    assert_eq!(
+        reap_evidence_value(AttemptFailure::DuplicateReady),
+        (REAP_CLASS_TASK_GROUP_TEARDOWN as u64) << 32
+    );
+    assert_eq!(
+        reap_evidence_value(AttemptFailure::ExitQueryFailed),
+        (REAP_CLASS_UNHANDLED_EXCEPTION as u64) << 32
+    );
 }
 
 #[test]

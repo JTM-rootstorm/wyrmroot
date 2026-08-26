@@ -629,6 +629,7 @@ impl SystemInit {
     ) -> Result<(), InitError> {
         let index = self.index(role).ok_or(InitError::UnlaunchableRole)?;
         let controller = &mut self.roles[index];
+        let had_resources = controller.resources.is_some();
         let unpublished = matches!(
             controller.restart.state(),
             RestartState::CleaningUp {
@@ -645,7 +646,17 @@ impl SystemInit {
         if let Some(mut resources) = controller.resources.take() {
             self.accounting.release(&mut resources.reservation)?;
         }
-        self.record_evidence(EvidenceEvent::Reap, role, generation, transaction, 0)?;
+        if had_resources {
+            let value = self.roles[index]
+                .restart
+                .history()
+                .as_slice()
+                .last()
+                .and_then(|record| *record)
+                .map(|record| reap_evidence_value(record.failure))
+                .ok_or(InitError::Accounting)?;
+            self.record_evidence(EvidenceEvent::Reap, role, generation, transaction, value)?;
+        }
         self.update_permanent_failure(role)?;
         Ok(())
     }
@@ -694,6 +705,15 @@ impl SystemInit {
 
     pub fn fatal(&mut self) {
         self.mode = SystemMode::Fatal;
+    }
+
+    fn retire_attempt_after_fatal(&mut self, role: RoleId) -> Result<(), InitError> {
+        let index = self.index(role).ok_or(InitError::UnlaunchableRole)?;
+        if let Some(mut resources) = self.roles[index].resources.take() {
+            self.accounting.release(&mut resources.reservation)?;
+        }
+        self.fatal();
+        Ok(())
     }
 
     fn update_permanent_failure(&mut self, role: RoleId) -> Result<(), InitError> {
@@ -1027,6 +1047,7 @@ where
             else {
                 return Err(InitError::WrongActivationOrder);
             };
+            let executable_identity = role_identity(bootfs, role)?;
             let task_group = system
                 .create_attempt_task_group(authority.task_group)
                 .map_err(InitError::Native)?;
@@ -1038,14 +1059,35 @@ where
             let loaded = match load_role(loader, role_authority, bootfs, role, transaction_id) {
                 Ok(value) => value,
                 Err(error) => {
-                    let now = system.now().map_err(InitError::Native)?;
-                    controller.fail(
+                    let now = match system.now().map_err(InitError::Native) {
+                        Ok(now) => now,
+                        Err(clock_error) => {
+                            let close_failed = system.close_handle(task_group).is_err();
+                            let release_failed = controller.abort_reservation(reservation).is_err();
+                            controller.fatal();
+                            return Err(if close_failed || release_failed {
+                                InitError::Cleanup
+                            } else {
+                                clock_error
+                            });
+                        }
+                    };
+                    if let Err(transition_error) = controller.fail(
                         role,
                         generation,
                         transaction_id,
                         now,
                         AttemptFailure::CreationFailed,
-                    )?;
+                    ) {
+                        let close_failed = system.close_handle(task_group).is_err();
+                        let release_failed = controller.abort_reservation(reservation).is_err();
+                        controller.fatal();
+                        return Err(if close_failed || release_failed {
+                            InitError::Cleanup
+                        } else {
+                            transition_error
+                        });
+                    }
                     let rollback_failed = matches!(
                         error,
                         InitError::Loader(LoadError::Platform {
@@ -1068,26 +1110,64 @@ where
                     continue;
                 }
             };
-            controller.install_attempt(AttemptResources {
+            let install = controller.install_attempt(AttemptResources {
                 role,
                 generation,
                 transaction_id,
-                executable_identity: role_identity(bootfs, role)?,
+                executable_identity,
                 startup_profile: StartupProfile::EarlyBootStub,
                 task_group,
                 process: loaded.process,
                 launch_channel: loaded.launch_channel,
                 mappings: 0,
                 reservation,
-            })?;
-            let now = system.now().map_err(InitError::Native)?;
-            controller.child_started(role, generation, transaction_id, now)?;
-            let deadline = DwDeadline(
-                now.checked_add(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
-                    .ok_or(InitError::Restart(
-                        RestartTransitionError::ArithmeticOverflow,
-                    ))?,
-            );
+            });
+            if let Err(error) = install {
+                controller.fatal();
+                return match cleanup_loaded(system, waits, loaded, task_group, true) {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(cleanup),
+                };
+            }
+            let now = match system.now().map_err(InitError::Native) {
+                Ok(now) => now,
+                Err(error) => {
+                    return Err(cleanup_after_transition_error(
+                        system,
+                        waits,
+                        &mut controller,
+                        loaded,
+                        task_group,
+                        role,
+                        error,
+                    ));
+                }
+            };
+            if let Err(error) = controller.child_started(role, generation, transaction_id, now) {
+                return Err(cleanup_after_transition_error(
+                    system,
+                    waits,
+                    &mut controller,
+                    loaded,
+                    task_group,
+                    role,
+                    error,
+                ));
+            }
+            let deadline = match now.checked_add(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns) {
+                Some(deadline) => DwDeadline(deadline),
+                None => {
+                    return Err(cleanup_after_transition_error(
+                        system,
+                        waits,
+                        &mut controller,
+                        loaded,
+                        task_group,
+                        role,
+                        InitError::Restart(RestartTransitionError::ArithmeticOverflow),
+                    ));
+                }
+            };
             match await_child_ready_profile(
                 waits,
                 loaded.process,
@@ -1097,8 +1177,31 @@ where
                 deadline,
             ) {
                 Ok(()) => {
-                    let now = system.now().map_err(InitError::Native)?;
-                    controller.ready(role, generation, transaction_id, now)?;
+                    let now = match system.now().map_err(InitError::Native) {
+                        Ok(now) => now,
+                        Err(error) => {
+                            return Err(cleanup_after_transition_error(
+                                system,
+                                waits,
+                                &mut controller,
+                                loaded,
+                                task_group,
+                                role,
+                                error,
+                            ));
+                        }
+                    };
+                    if let Err(error) = controller.ready(role, generation, transaction_id, now) {
+                        return Err(cleanup_after_transition_error(
+                            system,
+                            waits,
+                            &mut controller,
+                            loaded,
+                            task_group,
+                            role,
+                            error,
+                        ));
+                    }
                     match supervise_ready_child_profile(
                         waits,
                         loaded.process,
@@ -1109,14 +1212,37 @@ where
                     ) {
                         Ok(()) => {
                             let disposition = TerminalDisposition::NormalExit(0);
-                            let now = system.now().map_err(InitError::Native)?;
-                            controller.terminal(
+                            let now = match system.now().map_err(InitError::Native) {
+                                Ok(now) => now,
+                                Err(error) => {
+                                    return Err(cleanup_after_transition_error(
+                                        system,
+                                        waits,
+                                        &mut controller,
+                                        loaded,
+                                        task_group,
+                                        role,
+                                        error,
+                                    ));
+                                }
+                            };
+                            if let Err(error) = controller.terminal(
                                 role,
                                 generation,
                                 transaction_id,
                                 now,
                                 disposition,
-                            )?;
+                            ) {
+                                return Err(cleanup_after_transition_error(
+                                    system,
+                                    waits,
+                                    &mut controller,
+                                    loaded,
+                                    task_group,
+                                    role,
+                                    error,
+                                ));
+                            }
                             complete_native_cleanup(
                                 system,
                                 waits,
@@ -1139,8 +1265,33 @@ where
                         }
                         Err(error) => {
                             let failure = classify_supervision(&error);
-                            let now = system.now().map_err(InitError::Native)?;
-                            controller.fail(role, generation, transaction_id, now, failure)?;
+                            let now = match system.now().map_err(InitError::Native) {
+                                Ok(now) => now,
+                                Err(error) => {
+                                    return Err(cleanup_after_transition_error(
+                                        system,
+                                        waits,
+                                        &mut controller,
+                                        loaded,
+                                        task_group,
+                                        role,
+                                        error,
+                                    ));
+                                }
+                            };
+                            if let Err(error) =
+                                controller.fail(role, generation, transaction_id, now, failure)
+                            {
+                                return Err(cleanup_after_transition_error(
+                                    system,
+                                    waits,
+                                    &mut controller,
+                                    loaded,
+                                    task_group,
+                                    role,
+                                    error,
+                                ));
+                            }
                             complete_native_cleanup(
                                 system,
                                 waits,
@@ -1162,8 +1313,33 @@ where
                 }
                 Err(error) => {
                     let failure = classify_supervision(&error);
-                    let now = system.now().map_err(InitError::Native)?;
-                    controller.ready_wait_failed(role, generation, transaction_id, now, failure)?;
+                    let now = match system.now().map_err(InitError::Native) {
+                        Ok(now) => now,
+                        Err(error) => {
+                            return Err(cleanup_after_transition_error(
+                                system,
+                                waits,
+                                &mut controller,
+                                loaded,
+                                task_group,
+                                role,
+                                error,
+                            ));
+                        }
+                    };
+                    if let Err(error) =
+                        controller.ready_wait_failed(role, generation, transaction_id, now, failure)
+                    {
+                        return Err(cleanup_after_transition_error(
+                            system,
+                            waits,
+                            &mut controller,
+                            loaded,
+                            task_group,
+                            role,
+                            error,
+                        ));
+                    }
                     complete_native_cleanup(
                         system,
                         waits,
@@ -1291,6 +1467,29 @@ fn cleanup_loaded<S: InitPlatform, W: SupervisionPlatform<Error = NativeError>>(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn cleanup_after_transition_error<S: InitPlatform, W: SupervisionPlatform<Error = NativeError>>(
+    system: &mut S,
+    waits: &mut W,
+    controller: &mut SystemInit,
+    loaded: LoadedProcess,
+    task_group: DwHandle,
+    role: RoleId,
+    transition_error: InitError,
+) -> InitError {
+    if cleanup_loaded(system, waits, loaded, task_group, true).is_err() {
+        controller.fatal();
+        return InitError::Cleanup;
+    }
+    match controller.retire_attempt_after_fatal(role) {
+        Ok(()) => transition_error,
+        Err(error) => {
+            controller.fatal();
+            error
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn complete_native_cleanup<S: InitPlatform, W: SupervisionPlatform<Error = NativeError>>(
     system: &mut S,
     waits: &mut W,
@@ -1304,21 +1503,27 @@ fn complete_native_cleanup<S: InitPlatform, W: SupervisionPlatform<Error = Nativ
     classified_at: u64,
 ) -> Result<(), InitError> {
     match cleanup_loaded(system, waits, loaded, task_group, terminate) {
-        Ok(()) => controller.cleanup_complete(
-            role,
-            generation,
-            transaction,
-            classified_at.checked_add(1).ok_or(InitError::Accounting)?,
-        ),
+        Ok(()) => {
+            let retired_at = classified_at.checked_add(1).ok_or(InitError::Accounting)?;
+            match controller.cleanup_complete(role, generation, transaction, retired_at) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let retirement = controller.retire_attempt_after_fatal(role);
+                    match retirement {
+                        Ok(()) => Err(error),
+                        Err(retirement_error) => Err(retirement_error),
+                    }
+                }
+            }
+        }
         Err(error) => {
-            controller.cleanup_failed(
-                role,
-                generation,
-                transaction,
-                classified_at.checked_add(1).ok_or(InitError::Accounting)?,
-            )?;
+            let classified = classified_at.checked_add(1).ok_or(InitError::Accounting)?;
+            let transition = controller.cleanup_failed(role, generation, transaction, classified);
             controller.fatal();
-            Err(error)
+            match transition {
+                Ok(()) => Err(error),
+                Err(_) => Err(InitError::Cleanup),
+            }
         }
     }
 }
@@ -1398,6 +1603,41 @@ pub const fn normal_exit(code: u32) -> TerminalDisposition {
     TerminalDisposition::NormalExit(code)
 }
 
+pub const REAP_CLASS_NORMAL_EXIT: u32 = 1;
+pub const REAP_CLASS_AUTHORIZED_TERMINATION: u32 = 2;
+pub const REAP_CLASS_TASK_GROUP_TEARDOWN: u32 = 3;
+pub const REAP_CLASS_UNHANDLED_EXCEPTION: u32 = 4;
+
+#[must_use]
+pub const fn reap_evidence_value(failure: AttemptFailure) -> u64 {
+    let disposition = match failure {
+        AttemptFailure::ExitBeforeReady(disposition)
+        | AttemptFailure::ExitAfterReady(disposition) => disposition,
+        AttemptFailure::MalformedReady
+        | AttemptFailure::DuplicateReady
+        | AttemptFailure::ReadinessFailedAfterExit
+        | AttemptFailure::WrongTransactionReady
+        | AttemptFailure::PeerClosedBeforeReady
+        | AttemptFailure::WaitFailed
+        | AttemptFailure::ReadyTimeout
+        | AttemptFailure::Cancelled => TerminalDisposition::TaskGroupTeardown,
+        AttemptFailure::ExitQueryFailed => TerminalDisposition::UnhandledException,
+        AttemptFailure::CreationFailed | AttemptFailure::StartFailed => {
+            TerminalDisposition::AuthorizedTermination
+        }
+    };
+    match disposition {
+        TerminalDisposition::NormalExit(code) => {
+            ((REAP_CLASS_NORMAL_EXIT as u64) << 32) | code as u64
+        }
+        TerminalDisposition::AuthorizedTermination => {
+            (REAP_CLASS_AUTHORIZED_TERMINATION as u64) << 32
+        }
+        TerminalDisposition::TaskGroupTeardown => (REAP_CLASS_TASK_GROUP_TEARDOWN as u64) << 32,
+        TerminalDisposition::UnhandledException => (REAP_CLASS_UNHANDLED_EXCEPTION as u64) << 32,
+    }
+}
+
 #[must_use]
 pub const fn cleanup_is_permanent(state: RestartState) -> bool {
     matches!(
@@ -1407,4 +1647,207 @@ pub const fn cleanup_is_permanent(state: RestartState) -> bool {
             ..
         }
     )
+}
+
+#[cfg(test)]
+mod native_cleanup_tests {
+    use super::*;
+    use deepwyrm_syscall::{
+        DW_TASK_STATE_EXITED, DwStatus, DwTaskState, DwTaskTerminationInfoV1, DwWaitResultV1,
+    };
+    use wyrmroot_runtime::NativeOutputError;
+
+    const FAILURE: NativeError = NativeError::Status(DwStatus(-1));
+
+    struct MockNative {
+        now: u64,
+        terminate_fails: bool,
+        close_failure: DwHandle,
+        closed: [DwHandle; 3],
+        close_count: usize,
+    }
+
+    impl MockNative {
+        const fn new() -> Self {
+            Self {
+                now: 10,
+                terminate_fails: false,
+                close_failure: DwHandle(0),
+                closed: [DwHandle(0); 3],
+                close_count: 0,
+            }
+        }
+    }
+
+    impl InitPlatform for MockNative {
+        fn query_capability_info(
+            &mut self,
+            _handle: DwHandle,
+        ) -> Result<CapabilityInfo<DwObjectType, DwRights>, NativeError> {
+            Err(FAILURE)
+        }
+
+        fn receive_channel(
+            &mut self,
+            _channel: DwHandle,
+            _bytes: &mut [u8],
+            _handles: &mut [DwReceivedHandleInfoV1],
+        ) -> Result<ReceiveCounts, NativeError> {
+            Err(FAILURE)
+        }
+
+        fn query_memory_object_size(&mut self, _handle: DwHandle) -> Result<u64, NativeError> {
+            Err(FAILURE)
+        }
+
+        fn with_bootfs_bytes<R>(
+            &mut self,
+            _root: DwHandle,
+            _bootfs: DwHandle,
+            _plan: MappingPlan,
+            _use_bytes: impl for<'a> FnOnce(&mut Self, &'a [u8]) -> R,
+        ) -> Result<R, NativeError> {
+            Err(FAILURE)
+        }
+
+        fn send_channel(&mut self, _channel: DwHandle, _bytes: &[u8]) -> Result<(), NativeError> {
+            Err(FAILURE)
+        }
+
+        fn close_handle(&mut self, handle: DwHandle) -> Result<(), NativeError> {
+            self.closed[self.close_count] = handle;
+            self.close_count += 1;
+            if handle == self.close_failure {
+                Err(FAILURE)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn create_attempt_task_group(
+            &mut self,
+            _parent: DwHandle,
+        ) -> Result<DwHandle, NativeError> {
+            Err(FAILURE)
+        }
+
+        fn terminate_task_group(&mut self, _task_group: DwHandle) -> Result<(), NativeError> {
+            if self.terminate_fails {
+                Err(FAILURE)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn now(&mut self) -> Result<u64, NativeError> {
+            Ok(self.now)
+        }
+
+        fn wait_until(&mut self, _deadline_ns: u64) -> Result<(), NativeError> {
+            Err(FAILURE)
+        }
+    }
+
+    struct MockWaits {
+        query_count: u8,
+        terminal_at: u8,
+        wait_exited: bool,
+    }
+
+    impl SupervisionPlatform for MockWaits {
+        type Error = NativeError;
+
+        fn wait_many(
+            &mut self,
+            _items: &[DwWaitItemV1],
+            _deadline: DwDeadline,
+        ) -> Result<DwWaitResultV1, Self::Error> {
+            if self.wait_exited {
+                Ok(DwWaitResultV1 {
+                    index: 0,
+                    observed: DW_SIGNAL_EXITED,
+                    ..DwWaitResultV1::default()
+                })
+            } else {
+                Err(NativeError::Output(NativeOutputError::InvalidWaitResult))
+            }
+        }
+
+        fn receive_channel(
+            &mut self,
+            _channel: DwHandle,
+            _bytes: &mut [u8],
+            _handles: &mut [DwReceivedHandleInfoV1],
+        ) -> Result<ReceiveCounts, Self::Error> {
+            Err(FAILURE)
+        }
+
+        fn query_task_termination(
+            &mut self,
+            _process: DwHandle,
+        ) -> Result<DwTaskTerminationInfoV1, Self::Error> {
+            self.query_count += 1;
+            Ok(DwTaskTerminationInfoV1 {
+                state: if self.query_count >= self.terminal_at {
+                    DW_TASK_STATE_EXITED
+                } else {
+                    DwTaskState(0)
+                },
+                ..DwTaskTerminationInfoV1::default()
+            })
+        }
+    }
+
+    const LOADED: LoadedProcess = LoadedProcess {
+        process: DwHandle(20),
+        launch_channel: DwHandle(30),
+    };
+
+    #[test]
+    fn task_group_termination_race_reconciles_with_fresh_terminal_query() {
+        let mut native = MockNative::new();
+        native.terminate_fails = true;
+        let mut waits = MockWaits {
+            query_count: 0,
+            terminal_at: 1,
+            wait_exited: false,
+        };
+        assert_eq!(
+            cleanup_loaded(&mut native, &mut waits, LOADED, DwHandle(10), true),
+            Ok(())
+        );
+        assert_eq!(native.closed, [DwHandle(30), DwHandle(20), DwHandle(10)]);
+    }
+
+    #[test]
+    fn cleanup_closes_every_handle_after_individual_close_failure() {
+        let mut native = MockNative::new();
+        native.close_failure = DwHandle(20);
+        let mut waits = MockWaits {
+            query_count: 0,
+            terminal_at: 1,
+            wait_exited: false,
+        };
+        assert_eq!(
+            cleanup_loaded(&mut native, &mut waits, LOADED, DwHandle(10), false),
+            Err(InitError::Cleanup)
+        );
+        assert_eq!(native.close_count, 3);
+        assert_eq!(native.closed, [DwHandle(30), DwHandle(20), DwHandle(10)]);
+    }
+
+    #[test]
+    fn cleanup_deadline_failure_is_visible_after_closing_all_handles() {
+        let mut native = MockNative::new();
+        let mut waits = MockWaits {
+            query_count: 0,
+            terminal_at: u8::MAX,
+            wait_exited: false,
+        };
+        assert_eq!(
+            cleanup_loaded(&mut native, &mut waits, LOADED, DwHandle(10), true),
+            Err(InitError::Cleanup)
+        );
+        assert_eq!(native.close_count, 3);
+    }
 }
