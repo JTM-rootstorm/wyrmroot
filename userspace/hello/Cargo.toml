@@ -16,9 +16,17 @@ test = false
 bench = false
 required-features = ["native-hello"]
 
+[[bin]]
+name = "wyrmroot-job-hello"
+path = "src/job_main.rs"
+test = false
+bench = false
+required-features = ["native-job-hello"]
+
 [features]
 default = []
 native-hello = []
+native-job-hello = []
 
 [dependencies]
 deepwyrm-syscall.workspace = true

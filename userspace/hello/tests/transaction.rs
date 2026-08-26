@@ -3,8 +3,8 @@ use deepwyrm_syscall::{
     DW_RIGHT_WRITE, DW_STATUS_BAD_HANDLE, DW_STATUS_NO_RESOURCES, DwHandle, DwObjectType,
     DwReceivedHandleInfoV1, DwRights,
 };
-use wyrmroot_hello::{HelloError, HelloNativeOperation, HelloSystem, run_hello};
-use wyrmroot_loader::launch::{LaunchProfile, encode_init, parse_ready};
+use wyrmroot_hello::{HelloError, HelloNativeOperation, HelloSystem, run_hello, run_job_hello};
+use wyrmroot_loader::launch::{LaunchProfile, encode_init, parse_ready, parse_ready_for_profile};
 use wyrmroot_runtime::{
     BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, CapabilityValidationError, NativeError,
     ReceiveCounts,
@@ -46,8 +46,12 @@ struct Fixture {
 
 impl Fixture {
     fn valid() -> Self {
+        Self::profile(LaunchProfile::Hello)
+    }
+
+    fn profile(profile: LaunchProfile) -> Self {
         let mut init = [0_u8; 40];
-        encode_init(LaunchProfile::Hello, 2, &mut init).unwrap();
+        encode_init(profile, 2, &mut init).unwrap();
         Self {
             init,
             received_handles: 0,
@@ -104,6 +108,17 @@ fn hello_acknowledges_the_parent_channel_then_closes_it() {
     let mut fixture = Fixture::valid();
     assert_eq!(run_hello(&mut fixture, CHANNEL), Ok(()));
     assert_eq!(parse_ready(&fixture.sent, 2), Ok(()));
+    assert_eq!(fixture.closed, [CHANNEL]);
+}
+
+#[test]
+fn job_hello_uses_the_handle_free_wrlp_1_3_profile() {
+    let mut fixture = Fixture::profile(LaunchProfile::JobV2);
+    assert_eq!(run_job_hello(&mut fixture, CHANNEL), Ok(()));
+    assert_eq!(
+        parse_ready_for_profile(LaunchProfile::JobV2, &fixture.sent, 2),
+        Ok(())
+    );
     assert_eq!(fixture.closed, [CHANNEL]);
 }
 

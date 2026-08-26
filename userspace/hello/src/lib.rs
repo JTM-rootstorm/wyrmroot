@@ -9,7 +9,9 @@
 //! this smoke executable.
 
 use deepwyrm_syscall::{DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights};
-use wyrmroot_loader::launch::{HEADER_BYTES, LaunchError, LaunchProfile, encode_ready, parse_init};
+use wyrmroot_loader::launch::{
+    HEADER_BYTES, LaunchError, LaunchProfile, encode_ready_for_profile, parse_init,
+};
 use wyrmroot_runtime::{
     BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, CapabilityValidationError, NativeError,
     ReceiveCounts, native_error_code, validate_bootstrap_channel,
@@ -91,6 +93,22 @@ pub fn run_hello<System: HelloSystem>(
     system: &mut System,
     bootstrap_channel: DwHandle,
 ) -> Result<(), HelloError> {
+    run_profile(system, bootstrap_channel, LaunchProfile::Hello)
+}
+
+/// Completes the WYR1-B startup exchange for policy-launched `bin/hello`.
+pub fn run_job_hello<System: HelloSystem>(
+    system: &mut System,
+    bootstrap_channel: DwHandle,
+) -> Result<(), HelloError> {
+    run_profile(system, bootstrap_channel, LaunchProfile::JobV2)
+}
+
+fn run_profile<System: HelloSystem>(
+    system: &mut System,
+    bootstrap_channel: DwHandle,
+    profile: LaunchProfile,
+) -> Result<(), HelloError> {
     let channel = system
         .query_capability_info(bootstrap_channel)
         .map_err(|cause| HelloError::Native {
@@ -111,11 +129,12 @@ pub fn run_hello<System: HelloSystem>(
     if counts.bytes > init.len() || counts.handles != 0 {
         return Err(HelloError::ReceiveCounts(counts));
     }
-    let parsed = parse_init(LaunchProfile::Hello, &init[..counts.bytes], &handles)
-        .map_err(HelloError::Launch)?;
+    let parsed =
+        parse_init(profile, &init[..counts.bytes], &handles).map_err(HelloError::Launch)?;
 
     let mut ready = [0_u8; HEADER_BYTES];
-    let ready_size = encode_ready(parsed.transaction_id, &mut ready).map_err(HelloError::Launch)?;
+    let ready_size = encode_ready_for_profile(profile, parsed.transaction_id, &mut ready)
+        .map_err(HelloError::Launch)?;
     system
         .send_channel(bootstrap_channel, &ready[..ready_size])
         .map_err(|cause| HelloError::Native {
