@@ -12,6 +12,7 @@ mod sha256;
 mod tasks;
 mod toolchain_artifact;
 mod wyr1;
+mod wyr1_vm;
 
 use std::env;
 use std::process::ExitCode;
@@ -106,6 +107,7 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
         }
         Action::Wyr1Image(request) => wyr1_image(&request).map(Some),
         Action::Wyr1Inspect(request) => wyr1_inspect(&request).map(Some),
+        Action::Wyr1Prepare(request) => wyr1_prepare(&request).map(Some),
         Action::Wyr1Evidence {
             request,
             default,
@@ -113,6 +115,18 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
         } => wyr1_evidence(&request, &default, &smp).map(Some),
         Action::Unavailable(command) => Err(Failure::unavailable(command)),
     }
+}
+
+fn wyr1_prepare(path: &str) -> Result<String, Failure> {
+    let request = wyr1::load(std::path::Path::new(path))?;
+    wyr1::verify_receipt(&request, wyr1::Profile::Default)?;
+    let bundles = wyr1_vm::prepare(&request)?;
+    Ok(format!(
+        "WYR1_VM_HANDOFF_READY default={} smp={} shared_esp_sha256={}\n",
+        bundles.default.display(),
+        bundles.smp.display(),
+        bundles.esp_sha256
+    ))
 }
 
 fn wyr1_image(path: &str) -> Result<String, Failure> {

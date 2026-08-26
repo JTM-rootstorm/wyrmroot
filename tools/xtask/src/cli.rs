@@ -16,6 +16,7 @@ Usage:
     cargo xtask test integration wyr0 [default|smp] --request <wyr0-h-request.toml>
     cargo xtask wyr1 image --request <wyr1-a-request.toml>
     cargo xtask wyr1 inspect --request <wyr1-a-request.toml>
+    cargo xtask wyr1 prepare --request <wyr1-a-request.toml>
     cargo xtask wyr1 evidence --request <wyr1-a-request.toml> --default <log> --smp <log>
 
 Host filters may name a component (bootfs, protocol, elf, runtime, bootstrap,
@@ -96,6 +97,7 @@ pub(crate) enum Action {
     },
     Wyr1Image(String),
     Wyr1Inspect(String),
+    Wyr1Prepare(String),
     Wyr1Evidence {
         request: String,
         default: String,
@@ -161,6 +163,9 @@ fn dispatch_wyr1(arguments: &[String]) -> Result<Action, Failure> {
         [command, flag, request] if command == "inspect" && flag == "--request" => {
             Ok(Action::Wyr1Inspect(request.clone()))
         }
+        [command, flag, request] if command == "prepare" && flag == "--request" => {
+            Ok(Action::Wyr1Prepare(request.clone()))
+        }
         [command, flag, request, default_flag, default, smp_flag, smp]
             if command == "evidence"
                 && flag == "--request"
@@ -174,7 +179,7 @@ fn dispatch_wyr1(arguments: &[String]) -> Result<Action, Failure> {
             })
         }
         _ => Err(Failure::usage(
-            "wyr1 requires image|inspect --request <path>, or evidence --request <path> --default <log> --smp <log>",
+            "wyr1 requires image|inspect|prepare --request <path>, or evidence --request <path> --default <log> --smp <log>",
         )),
     }
 }
@@ -484,6 +489,20 @@ mod tests {
                 bootfs: "bootfs.img".to_owned(),
             }))
         );
+    }
+
+    #[test]
+    fn wyr1_vm_preparation_dispatches_separately_from_execution() {
+        assert_eq!(
+            dispatch(&arguments(&[
+                "wyr1",
+                "prepare",
+                "--request",
+                "request.toml",
+            ])),
+            Ok(Action::Wyr1Prepare("request.toml".into()))
+        );
+        assert!(USAGE.contains("wyr1 prepare --request"));
     }
 
     #[test]
