@@ -881,6 +881,7 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), Failure> {
 const LOADER_COMMAND: &str = "xtask-central-deterministic-uefi-release-pair";
 const BOOTSTRAP_FEATURES: &str = "native-bootstrap,wyr0-init0-integration";
 const BOOTSTRAP_COMMAND: &str = "cargo build --offline --locked --release --target x86_64-unknown-wyrmroot --package wyrmroot-bootstrap --bin wyrmroot-bootstrap --features native-bootstrap,wyr0-init0-integration";
+const SELECTOR26_INIT_PATH: &[u8] = b"system/init0";
 const INIT_COMMAND: &str = "cargo build --offline --locked --release --target x86_64-unknown-wyrmroot --package wyrmroot-init0 --bin wyrmroot-init0 --features native-init0,dw1b-preemption-integration";
 const HELLO_COMMAND: &str = "cargo build --offline --locked --release --target x86_64-unknown-wyrmroot --package wyrmroot-hello --bin wyrmroot-hello --features native-hello";
 const HOG_COMMAND: &str = "cargo build --offline --locked --release --target x86_64-unknown-wyrmroot --package wyrmroot-dw1b-preemption --bin wyrmroot-dw1b-cpu-hog --features native-payloads";
@@ -1352,7 +1353,7 @@ fn build_archive(
 ) -> Result<Vec<u8>, Failure> {
     let mut builder = Builder::new();
     for (path, bytes) in [
-        (b"system/init".as_slice(), init),
+        (SELECTOR26_INIT_PATH, init),
         (b"bin/hello", hello),
         (b"test/dw1-b/cpu-hog", hog),
         (b"test/dw1-b/progress", progress),
@@ -1373,7 +1374,7 @@ fn verify_archive(bootfs: &[u8], artifacts: [&[u8]; 4]) -> Result<(), Failure> {
     let archive =
         Archive::new(bootfs).map_err(|e| Failure::task(format!("DW1-B bootfs invalid: {e:?}")))?;
     for ((path, expected), actual) in [
-        (b"system/init".as_slice(), artifacts[0]),
+        (SELECTOR26_INIT_PATH, artifacts[0]),
         (b"bin/hello", artifacts[1]),
         (b"test/dw1-b/cpu-hog", artifacts[2]),
         (b"test/dw1-b/progress", artifacts[3]),
@@ -2344,6 +2345,9 @@ mod tests {
         let second = build_archive(b"i", b"h", b"c", b"p").unwrap();
         assert_eq!(first, second);
         verify_archive(&first, [b"i", b"h", b"c", b"p"]).unwrap();
+        let archive = Archive::new(&first).unwrap();
+        assert_eq!(archive.lookup(b"system/init0").unwrap().data(), b"i");
+        assert!(archive.lookup(b"system/init").is_err());
     }
 
     #[test]
@@ -2544,6 +2548,7 @@ mod tests {
             "native-bootstrap,wyr0-init0-integration"
         );
         assert!(BOOTSTRAP_COMMAND.ends_with("--features native-bootstrap,wyr0-init0-integration"));
+        assert_eq!(SELECTOR26_INIT_PATH, b"system/init0");
     }
 
     #[test]

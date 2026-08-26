@@ -9,7 +9,7 @@ The selector product separately requires kernel candidate
 kernel candidate. This contract does not claim that a Wyrmroot revision which
 has not yet been integrated and committed is final.
 
-The exact bootfs has four executable entries: `system/init`, `bin/hello`,
+The exact selector-specific bootfs has four executable entries: `system/init0`, `bin/hello`,
 `test/dw1-b/cpu-hog`, and `test/dw1-b/progress`. The CPU hog completes ordinary
 handle-free WRLP 1.0 READY, closes that launch endpoint, and only then enters
 its audited steady spin loop. That executed loop has no syscall, yield, block,
