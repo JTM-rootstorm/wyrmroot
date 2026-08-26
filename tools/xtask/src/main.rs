@@ -179,6 +179,24 @@ fn wyr1_inspect(path: &str) -> Result<String, Failure> {
     let expected = wyr1::decode_request_identity(&request)?;
     let manifest_digest = wyr1::sha256_bytes(&manifest);
     let bootfs_digest = wyr1::sha256_bytes(&bootfs);
+    let role_hashes = [
+        wyr1::sha256_bytes(&registryd),
+        wyr1::sha256_bytes(&devmgr),
+        wyr1::sha256_bytes(&uart),
+        wyr1::sha256_bytes(&console),
+        wyr1::sha256_bytes(&shell),
+    ];
+    let (expected_closure, observed_materials) = wyr1::closure_materials_for_request(
+        wyr1::sha256_bytes(&init),
+        role_hashes,
+        wyr1::sha256_bytes(&gate_config),
+    );
+    let profile = wyr1::product_profile_for_request(
+        manifest_digest,
+        bootfs_digest,
+        &expected_closure,
+        &observed_materials,
+    );
     wyr1::validate_product(
         &expected,
         &manifest,
@@ -187,6 +205,7 @@ fn wyr1_inspect(path: &str) -> Result<String, Failure> {
         bootfs_digest,
         &gate_config,
         [&init, &registryd, &devmgr, &uart, &console, &shell],
+        profile,
     )?;
     if archive.entries().count() != 8 {
         return Err(Failure::task("WYR1 bootfs contains an undeclared entry"));

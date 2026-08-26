@@ -11,6 +11,12 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::error::Failure;
 use crate::sha256;
+use wyrmroot_rrc_manifest::{
+    Activation, DependencyKind, ExpectedClosureEntry, ExpectedClosureUse, ExpectedObservedIdentity,
+    ImmutableDependencyKind, MaterialResidence, ObservedRetainedMaterial, ProductReceiptIdentities,
+    RoleId, StartupProfile, Wyr1aProductProfile,
+    builder::{Builder, DependencySpec, RoleSpec},
+};
 
 pub const SCHEMA_VERSION: u32 = 5;
 pub const SELECTOR: &str = "permanent-supervisor-rrc";
@@ -389,21 +395,59 @@ pub fn build_bootfs(request: &Request) -> Result<String, Failure> {
         sha256::bytes_digest_array(&console),
         sha256::bytes_digest_array(&shell),
     ];
-    let manifest = build_manifest(&expected, role_hashes)?;
     let gate_config = gate_config_for_request(request);
+    let builder = fixed_builder(&expected, role_hashes)?;
+    let structural_manifest = builder.build_structural().map_err(|error| {
+        Failure::task(format!("WYR1 structural manifest build failed: {error:?}"))
+    })?;
+    let structural_archive = build_archive(
+        [&init, &registryd, &devmgr, &uart, &console, &shell],
+        &structural_manifest,
+        &gate_config,
+    )?;
+    let init_hash = sha256::bytes_digest_array(&init);
+    let config_hash = sha256::bytes_digest_array(&gate_config);
+    let structural_manifest_digest = sha256::bytes_digest_array(&structural_manifest);
+    let structural_bootfs_digest = sha256::bytes_digest_array(&structural_archive);
+    let (expected_closure, observed_materials) =
+        closure_materials_for_request(init_hash, role_hashes, config_hash);
+    let profile = product_profile_for_request(
+        structural_manifest_digest,
+        structural_bootfs_digest,
+        &expected_closure,
+        &observed_materials,
+    );
+    let manifest = builder
+        .build_wyr1a_product(profile)
+        .map_err(|error| Failure::task(format!("WYR1 product manifest build failed: {error:?}")))?;
+    let parsed =
+        wyrmroot_rrc_manifest::Manifest::parse_wyr1a_product(&manifest, &expected, profile)
+            .map_err(|error| {
+                Failure::task(format!("WYR1 product manifest parse failed: {error:?}"))
+            })?;
+    parsed.validate_wyr1a_product(profile).map_err(|error| {
+        Failure::task(format!(
+            "WYR1 product manifest validation failed: {error:?}"
+        ))
+    })?;
+    if manifest != structural_manifest {
+        return Err(Failure::task("WYR1 product manifest is not deterministic"));
+    }
+    let archive = build_archive(
+        [&init, &registryd, &devmgr, &uart, &console, &shell],
+        &manifest,
+        &gate_config,
+    )?;
+    if archive != structural_archive {
+        return Err(Failure::task("WYR1 product bootfs is not deterministic"));
+    }
     let manifest_digest = sha256::bytes_digest_array(&manifest);
-    let archive = wyrmroot_bootfs::wyr1::build(wyrmroot_bootfs::wyr1::Product {
-        init: &init,
-        registryd: &registryd,
-        devmgr: &devmgr,
-        uart16550d: &uart,
-        consoled: &console,
-        wyrmsh: &shell,
-        rrc_manifest: &manifest,
-        gate_config: &gate_config,
-    })
-    .map_err(|error| Failure::task(format!("WYR1 bootfs build failed: {error:?}")))?;
     let bootfs_digest = sha256::bytes_digest_array(&archive);
+    if manifest_digest != structural_manifest_digest || bootfs_digest != structural_bootfs_digest {
+        return Err(Failure::task(
+            "WYR1 product identities changed after validation",
+        ));
+    }
     validate_product(
         &expected,
         &manifest,
@@ -412,6 +456,7 @@ pub fn build_bootfs(request: &Request) -> Result<String, Failure> {
         bootfs_digest,
         &gate_config,
         [&init, &registryd, &devmgr, &uart, &console, &shell],
+        profile,
     )?;
     fs::write(&request.rrc_manifest, &manifest).map_err(|error| {
         Failure::task(format!("could not write generated WYR1 manifest: {error}"))
@@ -419,6 +464,100 @@ pub fn build_bootfs(request: &Request) -> Result<String, Failure> {
     fs::write(&request.bootfs, &archive)
         .map_err(|error| Failure::task(format!("could not write WYR1 bootfs: {error}")))?;
     Ok(sha256::bytes_digest(&archive))
+}
+
+fn fixed_builder(
+    boot_generation: &[u8; 32],
+    role_hashes: [[u8; 32]; 5],
+) -> Result<Builder<'static>, Failure> {
+    let mut builder = Builder::new(*boot_generation);
+    let roles = [
+        (
+            RoleId::Registryd,
+            "system/registryd",
+            ROLE_JUSTIFICATIONS[0],
+            Activation::Early,
+            StartupProfile::EarlyBootStub,
+        ),
+        (
+            RoleId::Devmgr,
+            "system/devmgr",
+            ROLE_JUSTIFICATIONS[1],
+            Activation::Early,
+            StartupProfile::EarlyBootStub,
+        ),
+        (
+            RoleId::Uart16550d,
+            "system/uart16550d",
+            ROLE_JUSTIFICATIONS[2],
+            Activation::DeviceBound,
+            StartupProfile::Retained,
+        ),
+        (
+            RoleId::Consoled,
+            "system/consoled",
+            ROLE_JUSTIFICATIONS[3],
+            Activation::ConsoleBound,
+            StartupProfile::Retained,
+        ),
+        (
+            RoleId::Wyrmsh,
+            "system/wyrmsh",
+            ROLE_JUSTIFICATIONS[4],
+            Activation::ConsoleBound,
+            StartupProfile::Retained,
+        ),
+    ];
+    for (index, (id, path, justification, activation, startup_profile)) in
+        roles.into_iter().enumerate()
+    {
+        builder
+            .add_role(RoleSpec {
+                id,
+                required: true,
+                requires_ready: true,
+                activation,
+                startup_profile,
+                path,
+                justification,
+                executable_identity: role_hashes[index],
+            })
+            .map_err(|error| Failure::task(format!("WYR1 role builder failed: {error:?}")))?;
+    }
+    for (owner, target) in [
+        (RoleId::Devmgr, RoleId::Registryd),
+        (RoleId::Uart16550d, RoleId::Devmgr),
+        (RoleId::Consoled, RoleId::Uart16550d),
+        (RoleId::Wyrmsh, RoleId::Consoled),
+    ] {
+        builder
+            .add_dependency(DependencySpec {
+                owner,
+                kind: DependencyKind::RoleReady,
+                target_role: Some(target),
+                target_path: None,
+            })
+            .map_err(|error| Failure::task(format!("WYR1 dependency builder failed: {error:?}")))?;
+    }
+    Ok(builder)
+}
+
+fn build_archive(
+    artifacts: [&[u8]; 6],
+    manifest: &[u8],
+    gate_config: &[u8],
+) -> Result<Vec<u8>, Failure> {
+    wyrmroot_bootfs::wyr1::build(wyrmroot_bootfs::wyr1::Product {
+        init: artifacts[0],
+        registryd: artifacts[1],
+        devmgr: artifacts[2],
+        uart16550d: artifacts[3],
+        consoled: artifacts[4],
+        wyrmsh: artifacts[5],
+        rrc_manifest: manifest,
+        gate_config,
+    })
+    .map_err(|error| Failure::task(format!("WYR1 bootfs build failed: {error:?}")))
 }
 
 fn decode_digest(value: &str) -> Result<[u8; 32], Failure> {
@@ -465,97 +604,94 @@ pub(crate) fn gate_config_for_request(request: &Request) -> Vec<u8> {
     .into_bytes()
 }
 
-fn build_manifest(
-    boot_generation: &[u8; 32],
+pub(crate) fn closure_materials_for_request(
+    init_hash: [u8; 32],
     role_hashes: [[u8; 32]; 5],
-) -> Result<Vec<u8>, Failure> {
-    let paths = [
-        "system/registryd",
-        "system/devmgr",
-        "system/uart16550d",
-        "system/consoled",
-        "system/wyrmsh",
+    config_hash: [u8; 32],
+) -> (
+    [ExpectedClosureEntry<'static>; 7],
+    [ObservedRetainedMaterial<'static>; 7],
+) {
+    let expected = [
+        ExpectedClosureEntry {
+            path: "system/bootstrap/wyr1-a-gate-v1",
+            identity: config_hash,
+            usage: ExpectedClosureUse::InitDependency {
+                kind: ImmutableDependencyKind::Config,
+            },
+        },
+        ExpectedClosureEntry {
+            path: "system/consoled",
+            identity: role_hashes[3],
+            usage: ExpectedClosureUse::RoleExecutable {
+                role: RoleId::Consoled,
+            },
+        },
+        ExpectedClosureEntry {
+            path: "system/devmgr",
+            identity: role_hashes[1],
+            usage: ExpectedClosureUse::RoleExecutable {
+                role: RoleId::Devmgr,
+            },
+        },
+        ExpectedClosureEntry {
+            path: "system/init",
+            identity: init_hash,
+            usage: ExpectedClosureUse::SystemInit,
+        },
+        ExpectedClosureEntry {
+            path: "system/registryd",
+            identity: role_hashes[0],
+            usage: ExpectedClosureUse::RoleExecutable {
+                role: RoleId::Registryd,
+            },
+        },
+        ExpectedClosureEntry {
+            path: "system/uart16550d",
+            identity: role_hashes[2],
+            usage: ExpectedClosureUse::RoleExecutable {
+                role: RoleId::Uart16550d,
+            },
+        },
+        ExpectedClosureEntry {
+            path: "system/wyrmsh",
+            identity: role_hashes[4],
+            usage: ExpectedClosureUse::RoleExecutable {
+                role: RoleId::Wyrmsh,
+            },
+        },
     ];
-    let mut strings = Vec::new();
-    let mut role_offsets = [(0_u32, 0_u16, 0_u32, 0_u16); 5];
-    for (index, (path, justification)) in paths.iter().zip(ROLE_JUSTIFICATIONS).enumerate() {
-        let path_offset = u32::try_from(strings.len())
-            .map_err(|_| Failure::task("WYR1 manifest string table overflow"))?;
-        strings.extend_from_slice(path.as_bytes());
-        let justification_offset = u32::try_from(strings.len())
-            .map_err(|_| Failure::task("WYR1 manifest string table overflow"))?;
-        strings.extend_from_slice(justification.as_bytes());
-        role_offsets[index] = (
-            path_offset,
-            u16::try_from(path.len()).map_err(|_| Failure::task("WYR1 role path is too long"))?,
-            justification_offset,
-            u16::try_from(justification.len())
-                .map_err(|_| Failure::task("WYR1 role justification is too long"))?,
-        );
-    }
-    let header = 80usize;
-    let role_size = 96usize;
-    let edge_size = 32usize;
-    let edges_offset = header + role_size * 5;
-    let strings_offset = edges_offset + edge_size * 4;
-    let total = strings_offset + strings.len();
-    let mut output = vec![0_u8; total];
-    output[..4].copy_from_slice(b"WRRM");
-    put_u16(&mut output, 4, 1);
-    put_u16(&mut output, 8, header as u16);
-    put_u16(&mut output, 10, role_size as u16);
-    put_u16(&mut output, 12, edge_size as u16);
-    put_u32(&mut output, 20, total as u32);
-    put_u16(&mut output, 24, 5);
-    put_u16(&mut output, 26, 4);
-    put_u32(&mut output, 28, strings.len() as u32);
-    put_u32(&mut output, 32, header as u32);
-    put_u32(&mut output, 36, edges_offset as u32);
-    put_u32(&mut output, 40, strings_offset as u32);
-    output[48..80].copy_from_slice(boot_generation);
-
-    let activations = [1_u16, 1, 2, 3, 3];
-    let profiles = [1_u16, 1, 0, 0, 0];
-    let edge_starts = [0_u16, 0, 1, 2, 3];
-    let edge_counts = [0_u16, 1, 1, 1, 1];
-    for index in 0..5 {
-        let offset = header + index * role_size;
-        put_u32(&mut output, offset, (index + 1) as u32);
-        put_u32(&mut output, offset + 4, 3);
-        put_u16(&mut output, offset + 8, 1);
-        put_u16(&mut output, offset + 10, activations[index]);
-        put_u16(&mut output, offset + 12, 1);
-        put_u16(&mut output, offset + 14, profiles[index]);
-        put_u32(&mut output, offset + 16, role_offsets[index].0);
-        put_u16(&mut output, offset + 20, role_offsets[index].1);
-        put_u32(&mut output, offset + 24, role_offsets[index].2);
-        put_u16(&mut output, offset + 28, role_offsets[index].3);
-        put_u16(&mut output, offset + 32, edge_starts[index]);
-        put_u16(&mut output, offset + 34, edge_counts[index]);
-        output[offset + 40..offset + 72].copy_from_slice(&role_hashes[index]);
-    }
-    for (index, (owner, target)) in [(2_u32, 1_u32), (3, 2), (4, 3), (5, 4)]
-        .into_iter()
-        .enumerate()
-    {
-        let offset = edges_offset + index * edge_size;
-        put_u32(&mut output, offset, owner);
-        put_u16(&mut output, offset + 4, 5);
-        put_u16(&mut output, offset + 6, 1);
-        put_u32(&mut output, offset + 8, target);
-    }
-    output[strings_offset..].copy_from_slice(&strings);
-    Ok(output)
+    let observed = expected.map(|entry| ObservedRetainedMaterial {
+        path: entry.path,
+        identity: entry.identity,
+        residence: MaterialResidence::RetainedBootfs,
+    });
+    (expected, observed)
 }
 
-fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
-    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+pub(crate) fn product_profile_for_request<'a>(
+    manifest: [u8; 32],
+    bootfs: [u8; 32],
+    expected_closure: &'a [ExpectedClosureEntry<'a>; 7],
+    observed_materials: &'a [ObservedRetainedMaterial<'a>; 7],
+) -> Wyr1aProductProfile<'a> {
+    Wyr1aProductProfile {
+        receipts: ProductReceiptIdentities {
+            manifest: ExpectedObservedIdentity {
+                expected: manifest,
+                observed: manifest,
+            },
+            bootfs: ExpectedObservedIdentity {
+                expected: bootfs,
+                observed: bootfs,
+            },
+        },
+        expected_closure,
+        observed_materials,
+    }
 }
 
-fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
-    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-}
-
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn validate_product(
     boot_generation: &[u8; 32],
     manifest: &[u8],
@@ -564,20 +700,14 @@ pub(crate) fn validate_product(
     bootfs_digest: [u8; 32],
     gate_config: &[u8],
     artifacts: [&[u8]; 6],
+    profile: Wyr1aProductProfile<'_>,
 ) -> Result<(), Failure> {
-    let role_hashes = [
-        sha256::bytes_digest_array(artifacts[1]),
-        sha256::bytes_digest_array(artifacts[2]),
-        sha256::bytes_digest_array(artifacts[3]),
-        sha256::bytes_digest_array(artifacts[4]),
-        sha256::bytes_digest_array(artifacts[5]),
-    ];
-    let rebuilt = build_manifest(boot_generation, role_hashes)?;
-    if rebuilt != manifest {
-        return Err(Failure::task(
-            "WYR1 generated manifest is not deterministic",
-        ));
-    }
+    let parsed =
+        wyrmroot_rrc_manifest::Manifest::parse_wyr1a_product(manifest, boot_generation, profile)
+            .map_err(|error| Failure::task(format!("WYR1 product validation failed: {error:?}")))?;
+    parsed
+        .validate_wyr1a_product(profile)
+        .map_err(|error| Failure::task(format!("WYR1 product validation failed: {error:?}")))?;
     if manifest_digest == [0; 32] || bootfs_digest == [0; 32] {
         return Err(Failure::task("WYR1 product identity is zero"));
     }
@@ -826,6 +956,7 @@ pub struct EvidenceRecord {
     pub role: u32,
     pub generation: u64,
     pub transaction: u64,
+    pub value: u64,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Event {
@@ -837,14 +968,13 @@ pub enum Event {
     Degraded,
 }
 impl Event {
-    fn parse(value: &str) -> Option<Self> {
-        Some(match value {
-            "READY" => Self::Ready,
-            "REAP" => Self::Reap,
-            "RESTART" => Self::Restart,
-            "PermanentFailure" => Self::PermanentFailure,
-            "NORMAL" => Self::Normal,
-            "DEGRADED" => Self::Degraded,
+    fn from_kind(kind: u8) -> Option<Self> {
+        Some(match kind {
+            0x01 => Self::Ready,
+            0x02 => Self::Reap,
+            0x03 => Self::Restart,
+            0x04 => Self::PermanentFailure,
+            0xff => Self::Normal,
             _ => return None,
         })
     }
@@ -878,56 +1008,71 @@ pub fn parse_evidence(
             "WYR1 evidence is empty or exceeds its size limit",
         ));
     }
-    let text =
-        std::str::from_utf8(bytes).map_err(|_| Failure::task("WYR1 evidence is not UTF-8"))?;
     let mut records = Vec::new();
     let mut terminal = None;
-    for (expected_sequence, line) in text.lines().enumerate() {
+    if !bytes.len().is_multiple_of(114) {
+        return Err(Failure::task("WYR1 evidence record size is invalid"));
+    }
+    for (expected_sequence, record_bytes) in bytes.chunks_exact(114).enumerate() {
         if terminal.is_some() {
             return Err(Failure::task("WYR1 evidence has records after terminal"));
         }
-        let fields: Vec<_> = line.split('|').collect();
-        if fields.len() != 8 || fields[0] != EVIDENCE_PROTOCOL {
+        if record_bytes[113] != b'\n'
+            || &record_bytes[0..9] != b"WYR1EVID1"
+            || record_bytes[9] != b'|'
+            || &record_bytes[10..12] != b"01"
+            || record_bytes[12] != b'|'
+            || record_bytes[29] != b'|'
+            || record_bytes[38] != b'|'
+            || record_bytes[41] != b'|'
+            || record_bytes[44] != b'|'
+            || record_bytes[53] != b'|'
+            || record_bytes[70] != b'|'
+            || record_bytes[87] != b'|'
+            || record_bytes[104] != b'|'
+        {
             return Err(Failure::task("WYR1 evidence framing is invalid"));
         }
-        let read = |prefix: &str| {
-            fields
-                .iter()
-                .find_map(|field| field.strip_prefix(prefix))
-                .ok_or_else(|| Failure::task("WYR1 evidence field is missing"))
-        };
-        let got_nonce = u64::from_str_radix(read("nonce=")?, 16)
-            .map_err(|_| Failure::task("WYR1 evidence nonce is invalid"))?;
+        let got_nonce = parse_hex(&record_bytes[13..29], "nonce")?;
         if got_nonce != nonce || nonce == 0 {
             return Err(Failure::task("WYR1 evidence nonce mismatch"));
         }
-        let sequence = read("seq=")?
-            .parse::<u64>()
-            .map_err(|_| Failure::task("WYR1 evidence sequence is invalid"))?;
+        let sequence = parse_hex(&record_bytes[30..38], "sequence")?;
         if sequence != expected_sequence as u64 {
             return Err(Failure::task("WYR1 evidence sequence is not contiguous"));
         }
-        let event = Event::parse(read("event=")?)
+        let kind = parse_hex_byte(&record_bytes[39..41], "kind")?;
+        let mut event = Event::from_kind(kind)
             .ok_or_else(|| Failure::task("WYR1 evidence event is unknown"))?;
-        let role = u32::from_str_radix(read("role=")?, 16)
-            .map_err(|_| Failure::task("WYR1 evidence role is invalid"))?;
-        let generation = u64::from_str_radix(read("generation=")?, 16)
-            .map_err(|_| Failure::task("WYR1 evidence generation is invalid"))?;
-        let transaction = u64::from_str_radix(read("transaction=")?, 16)
-            .map_err(|_| Failure::task("WYR1 evidence transaction is invalid"))?;
-        let checksum_text = read("checksum=")?;
-        let checksum = u32::from_str_radix(checksum_text, 16)
-            .map_err(|_| Failure::task("WYR1 evidence checksum is invalid"))?;
-        let prefix = line
-            .rsplit_once("|checksum=")
-            .ok_or_else(|| Failure::task("WYR1 evidence checksum framing is invalid"))?
-            .0;
-        if fnv1a32(prefix.as_bytes()) != checksum {
+        let encoded_scenario = parse_hex_byte(&record_bytes[42..44], "scenario")?;
+        let expected_scenario = match scenario {
+            Scenario::Normal => 1,
+            Scenario::DegradedRecovery => 2,
+        };
+        if encoded_scenario != expected_scenario {
+            return Err(Failure::task("WYR1 evidence scenario mismatch"));
+        }
+        if kind == 0xff {
+            event = match scenario {
+                Scenario::Normal => Event::Normal,
+                Scenario::DegradedRecovery => Event::Degraded,
+            };
+        }
+        let role = parse_hex_u32(&record_bytes[45..53], "role")?;
+        let generation = parse_hex(&record_bytes[54..70], "generation")?;
+        let transaction = parse_hex(&record_bytes[71..87], "transaction")?;
+        let value = parse_hex(&record_bytes[88..104], "value")?;
+        let checksum = parse_hex_u32(&record_bytes[105..113], "checksum")?;
+        if fnv1a32(&record_bytes[..105]) != checksum {
             return Err(Failure::task("WYR1 evidence checksum mismatch"));
         }
         let is_terminal = matches!(event, Event::Normal | Event::Degraded);
         if is_terminal {
-            if role != 0 || generation != 0 || transaction != 0 || terminal.replace(event).is_some()
+            if role != 0
+                || generation != 0
+                || transaction != 0
+                || value != 0
+                || terminal.replace(event).is_some()
             {
                 return Err(Failure::task(
                     "WYR1 terminal evidence identity/order is invalid",
@@ -936,12 +1081,25 @@ pub fn parse_evidence(
         } else if role == 0 || generation == 0 || transaction == 0 {
             return Err(Failure::task("WYR1 role evidence identity is invalid"));
         }
+        if event == Event::Ready && value != 0 {
+            return Err(Failure::task("WYR1 READY value is not zero"));
+        }
+        if event == Event::Reap && value == 0 {
+            return Err(Failure::task("WYR1 REAP value is zero"));
+        }
+        if event == Event::Restart && (value == 0 || value <= generation) {
+            return Err(Failure::task("WYR1 RESTART next generation is invalid"));
+        }
+        if event == Event::PermanentFailure && value == 0 {
+            return Err(Failure::task("WYR1 PermanentFailure detail is zero"));
+        }
         records.push(EvidenceRecord {
             sequence,
             event,
             role,
             generation,
             transaction,
+            value,
         });
     }
     let terminal = terminal.ok_or_else(|| Failure::task("WYR1 evidence has no terminal result"))?;
@@ -1077,18 +1235,71 @@ pub fn encode_evidence_line(
     generation: u64,
     transaction: u64,
 ) -> String {
-    let prefix = format!(
-        "{EVIDENCE_PROTOCOL}|nonce={nonce:016X}|seq={sequence}|event={}|role={role:08X}|generation={generation:016X}|transaction={transaction:016X}",
-        match event {
-            Event::Ready => "READY",
-            Event::Reap => "REAP",
-            Event::Restart => "RESTART",
-            Event::PermanentFailure => "PermanentFailure",
-            Event::Normal => "NORMAL",
-            Event::Degraded => "DEGRADED",
-        }
-    );
-    format!("{prefix}|checksum={:08X}\n", fnv1a32(prefix.as_bytes()))
+    encode_evidence_line_with_scenario(
+        nonce,
+        sequence,
+        event,
+        role,
+        generation,
+        transaction,
+        Scenario::Normal,
+    )
+}
+
+pub fn encode_evidence_line_with_scenario(
+    nonce: u64,
+    sequence: u64,
+    event: Event,
+    role: u32,
+    generation: u64,
+    transaction: u64,
+    scenario: Scenario,
+) -> String {
+    let (kind, value) = match event {
+        Event::Ready => (0x01_u8, 0),
+        Event::Reap => (0x02, 1),
+        Event::Restart => (0x03, generation.saturating_add(1)),
+        Event::PermanentFailure => (0x04, 1),
+        Event::Normal | Event::Degraded => (0xff, 0),
+    };
+    let encoded_scenario = match scenario {
+        Scenario::Normal => 1,
+        Scenario::DegradedRecovery => 2,
+    };
+    let mut bytes = format!(
+        "WYR1EVID1|01|{nonce:016X}|{sequence:08X}|{kind:02X}|{encoded_scenario:02X}|{role:08X}|{generation:016X}|{transaction:016X}|{value:016X}|",
+    )
+    .into_bytes();
+    let checksum = fnv1a32(&bytes);
+    bytes.extend_from_slice(format!("{checksum:08X}\n").as_bytes());
+    String::from_utf8(bytes).expect("fixed evidence is UTF-8")
+}
+
+fn parse_hex(bytes: &[u8], label: &str) -> Result<u64, Failure> {
+    u64::from_str_radix(
+        std::str::from_utf8(bytes)
+            .map_err(|_| Failure::task(format!("WYR1 evidence {label} is not ASCII")))?,
+        16,
+    )
+    .map_err(|_| Failure::task(format!("WYR1 evidence {label} is invalid")))
+}
+
+fn parse_hex_byte(bytes: &[u8], label: &str) -> Result<u8, Failure> {
+    u8::from_str_radix(
+        std::str::from_utf8(bytes)
+            .map_err(|_| Failure::task(format!("WYR1 evidence {label} is not ASCII")))?,
+        16,
+    )
+    .map_err(|_| Failure::task(format!("WYR1 evidence {label} is invalid")))
+}
+
+fn parse_hex_u32(bytes: &[u8], label: &str) -> Result<u32, Failure> {
+    u32::from_str_radix(
+        std::str::from_utf8(bytes)
+            .map_err(|_| Failure::task(format!("WYR1 evidence {label} is not ASCII")))?,
+        16,
+    )
+    .map_err(|_| Failure::task(format!("WYR1 evidence {label} is invalid")))
 }
 fn fnv1a32(bytes: &[u8]) -> u32 {
     let mut hash = 0x811c9dc5;
@@ -1134,10 +1345,10 @@ mod tests {
             encode_evidence_line(nonce, 4, Event::Normal, 0, 0, 0)
         );
         parse_evidence(valid.as_bytes(), nonce, Scenario::Normal).unwrap();
-        let gap = valid.replace("seq=1", "seq=2");
+        let gap = valid.replace("|00000001|01|01|", "|00000002|01|01|");
         assert!(parse_evidence(gap.as_bytes(), nonce, Scenario::Normal).is_err());
         let mut checksum = valid.clone();
-        let index = checksum.find("checksum=").unwrap() + "checksum=".len();
+        let index = checksum.find("|BE46E06B").unwrap() + 1;
         checksum.replace_range(index..index + 1, "0");
         assert!(parse_evidence(checksum.as_bytes(), nonce, Scenario::Normal).is_err());
         assert!(parse_evidence(valid.as_bytes(), nonce + 1, Scenario::Normal).is_err());
@@ -1150,8 +1361,24 @@ mod tests {
     }
     #[test]
     fn degraded_requires_permanent_failure() {
-        let line = encode_evidence_line(1, 0, Event::Restart, 1, 1, 1);
-        let terminal = encode_evidence_line(1, 1, Event::Degraded, 0, 0, 0);
+        let line = encode_evidence_line_with_scenario(
+            1,
+            0,
+            Event::Restart,
+            1,
+            1,
+            1,
+            Scenario::DegradedRecovery,
+        );
+        let terminal = encode_evidence_line_with_scenario(
+            1,
+            1,
+            Event::Degraded,
+            0,
+            0,
+            0,
+            Scenario::DegradedRecovery,
+        );
         assert!(
             parse_evidence(
                 format!("{line}{terminal}").as_bytes(),
@@ -1160,10 +1387,42 @@ mod tests {
             )
             .is_err()
         );
-        let restart2 = encode_evidence_line(1, 1, Event::Restart, 1, 2, 2);
-        let restart3 = encode_evidence_line(1, 2, Event::Restart, 1, 3, 3);
-        let failure = encode_evidence_line(1, 3, Event::PermanentFailure, 1, 4, 4);
-        let terminal = encode_evidence_line(1, 4, Event::Degraded, 0, 0, 0);
+        let restart2 = encode_evidence_line_with_scenario(
+            1,
+            1,
+            Event::Restart,
+            1,
+            2,
+            2,
+            Scenario::DegradedRecovery,
+        );
+        let restart3 = encode_evidence_line_with_scenario(
+            1,
+            2,
+            Event::Restart,
+            1,
+            3,
+            3,
+            Scenario::DegradedRecovery,
+        );
+        let failure = encode_evidence_line_with_scenario(
+            1,
+            3,
+            Event::PermanentFailure,
+            1,
+            4,
+            4,
+            Scenario::DegradedRecovery,
+        );
+        let terminal = encode_evidence_line_with_scenario(
+            1,
+            4,
+            Event::Degraded,
+            0,
+            0,
+            0,
+            Scenario::DegradedRecovery,
+        );
         parse_evidence(
             format!("{line}{restart2}{restart3}{failure}{terminal}").as_bytes(),
             1,

@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 deepwyrm-abi.workspace = true
 wyrmroot-bootfs = { path = "../../crates/wyrmroot-bootfs", features = ["builder"] }
+wyrmroot-rrc-manifest = { path = "../../crates/wyrmroot-rrc-manifest", features = ["builder"] }
 
 [dev-dependencies]
 wyrmroot-i-capability = { path = "../../userspace/i-capability" }
