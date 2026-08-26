@@ -196,7 +196,7 @@ pub fn load(path: &Path) -> Result<Request, Failure> {
         uart16550d: input(parent, required(&values, "uart16550d")?),
         consoled: input(parent, required(&values, "consoled")?),
         wyrmsh: input(parent, required(&values, "wyrmsh")?),
-        rrc_manifest: input(parent, required(&values, "rrc_manifest")?),
+        rrc_manifest: output(parent, required(&values, "rrc_manifest")?, "rrc_manifest")?,
         bootfs: output(parent, required(&values, "bootfs")?, "bootfs")?,
         esp: output(parent, required(&values, "esp")?, "esp")?,
         provenance: output(parent, required(&values, "provenance")?, "provenance")?,
@@ -367,7 +367,9 @@ fn reject_output_aliases(request: &Request) -> Result<(), Failure> {
     Ok(())
 }
 
-/// Build the exact WYR1 archive from explicit request artifact paths.
+/// Build the exact WYR1 archive from request artifacts. The manifest and gate
+/// configuration are generated from the request and artifact bytes; callers
+/// cannot supply semantic product inputs through either output path.
 pub fn build_bootfs(request: &Request) -> Result<String, Failure> {
     let read = |path: &Path, label: &str| {
         fs::read(path)
@@ -379,13 +381,17 @@ pub fn build_bootfs(request: &Request) -> Result<String, Failure> {
     let uart = read(&request.uart16550d, "uart16550d")?;
     let console = read(&request.consoled, "consoled")?;
     let shell = read(&request.wyrmsh, "wyrmsh")?;
-    let manifest = read(&request.rrc_manifest, "rrc_manifest")?;
     let expected = decode_digest(&request.request_sha256)?;
-    if manifest.len() < 80 || &manifest[..4] != b"WRRM" || manifest[48..80] != expected {
-        return Err(Failure::task(
-            "WYR1 WRRM header or boot-generation identity is invalid",
-        ));
-    }
+    let role_hashes = [
+        sha256::bytes_digest_array(&registryd),
+        sha256::bytes_digest_array(&devmgr),
+        sha256::bytes_digest_array(&uart),
+        sha256::bytes_digest_array(&console),
+        sha256::bytes_digest_array(&shell),
+    ];
+    let manifest = build_manifest(&expected, role_hashes)?;
+    let gate_config = gate_config_for_request(request);
+    let manifest_digest = sha256::bytes_digest_array(&manifest);
     let archive = wyrmroot_bootfs::wyr1::build(wyrmroot_bootfs::wyr1::Product {
         init: &init,
         registryd: &registryd,
@@ -394,8 +400,22 @@ pub fn build_bootfs(request: &Request) -> Result<String, Failure> {
         consoled: &console,
         wyrmsh: &shell,
         rrc_manifest: &manifest,
+        gate_config: &gate_config,
     })
     .map_err(|error| Failure::task(format!("WYR1 bootfs build failed: {error:?}")))?;
+    let bootfs_digest = sha256::bytes_digest_array(&archive);
+    validate_product(
+        &expected,
+        &manifest,
+        manifest_digest,
+        &archive,
+        bootfs_digest,
+        &gate_config,
+        [&init, &registryd, &devmgr, &uart, &console, &shell],
+    )?;
+    fs::write(&request.rrc_manifest, &manifest).map_err(|error| {
+        Failure::task(format!("could not write generated WYR1 manifest: {error}"))
+    })?;
     fs::write(&request.bootfs, &archive)
         .map_err(|error| Failure::task(format!("could not write WYR1 bootfs: {error}")))?;
     Ok(sha256::bytes_digest(&archive))
@@ -411,6 +431,14 @@ fn decode_digest(value: &str) -> Result<[u8; 32], Failure> {
     }
     Ok(output)
 }
+
+pub(crate) fn decode_request_identity(request: &Request) -> Result<[u8; 32], Failure> {
+    decode_digest(&request.request_sha256)
+}
+
+pub(crate) fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+    sha256::bytes_digest_array(bytes)
+}
 fn hex(byte: u8) -> Result<u8, Failure> {
     match byte {
         b'0'..=b'9' => Ok(byte - b'0'),
@@ -421,6 +449,176 @@ fn hex(byte: u8) -> Result<u8, Failure> {
     }
 }
 
+const ROLE_JUSTIFICATIONS: [&str; 5] = [
+    "minimum bootfs discovery needed to reconstruct direct recovery-service connections without root",
+    "binding/restart path for root-critical and console devices without root",
+    "selected q35 recovery-console transport, launched only by devmgr after exact delegation",
+    "bounded operator-control transport when root recovery degrades",
+    "minimum recovery/admin control path independent of persistent root",
+];
+
+pub(crate) fn gate_config_for_request(request: &Request) -> Vec<u8> {
+    format!(
+        "schema = 1\nselector = \"{}\"\ntest_id = {}\nscenario = \"{}\"\nevidence_protocol = \"{}\"\nnonce = \"{:016X}\"\n",
+        SELECTOR, TEST_ID, request.scenario.name(), EVIDENCE_PROTOCOL, request.evidence_nonce
+    )
+    .into_bytes()
+}
+
+fn build_manifest(
+    boot_generation: &[u8; 32],
+    role_hashes: [[u8; 32]; 5],
+) -> Result<Vec<u8>, Failure> {
+    let paths = [
+        "system/registryd",
+        "system/devmgr",
+        "system/uart16550d",
+        "system/consoled",
+        "system/wyrmsh",
+    ];
+    let mut strings = Vec::new();
+    let mut role_offsets = [(0_u32, 0_u16, 0_u32, 0_u16); 5];
+    for (index, (path, justification)) in paths.iter().zip(ROLE_JUSTIFICATIONS).enumerate() {
+        let path_offset = u32::try_from(strings.len())
+            .map_err(|_| Failure::task("WYR1 manifest string table overflow"))?;
+        strings.extend_from_slice(path.as_bytes());
+        let justification_offset = u32::try_from(strings.len())
+            .map_err(|_| Failure::task("WYR1 manifest string table overflow"))?;
+        strings.extend_from_slice(justification.as_bytes());
+        role_offsets[index] = (
+            path_offset,
+            u16::try_from(path.len()).map_err(|_| Failure::task("WYR1 role path is too long"))?,
+            justification_offset,
+            u16::try_from(justification.len())
+                .map_err(|_| Failure::task("WYR1 role justification is too long"))?,
+        );
+    }
+    let header = 80usize;
+    let role_size = 96usize;
+    let edge_size = 32usize;
+    let edges_offset = header + role_size * 5;
+    let strings_offset = edges_offset + edge_size * 4;
+    let total = strings_offset + strings.len();
+    let mut output = vec![0_u8; total];
+    output[..4].copy_from_slice(b"WRRM");
+    put_u16(&mut output, 4, 1);
+    put_u16(&mut output, 8, header as u16);
+    put_u16(&mut output, 10, role_size as u16);
+    put_u16(&mut output, 12, edge_size as u16);
+    put_u32(&mut output, 20, total as u32);
+    put_u16(&mut output, 24, 5);
+    put_u16(&mut output, 26, 4);
+    put_u32(&mut output, 28, strings.len() as u32);
+    put_u32(&mut output, 32, header as u32);
+    put_u32(&mut output, 36, edges_offset as u32);
+    put_u32(&mut output, 40, strings_offset as u32);
+    output[48..80].copy_from_slice(boot_generation);
+
+    let activations = [1_u16, 1, 2, 3, 3];
+    let profiles = [1_u16, 1, 0, 0, 0];
+    let edge_starts = [0_u16, 0, 1, 2, 3];
+    let edge_counts = [0_u16, 1, 1, 1, 1];
+    for index in 0..5 {
+        let offset = header + index * role_size;
+        put_u32(&mut output, offset, (index + 1) as u32);
+        put_u32(&mut output, offset + 4, 3);
+        put_u16(&mut output, offset + 8, 1);
+        put_u16(&mut output, offset + 10, activations[index]);
+        put_u16(&mut output, offset + 12, 1);
+        put_u16(&mut output, offset + 14, profiles[index]);
+        put_u32(&mut output, offset + 16, role_offsets[index].0);
+        put_u16(&mut output, offset + 20, role_offsets[index].1);
+        put_u32(&mut output, offset + 24, role_offsets[index].2);
+        put_u16(&mut output, offset + 28, role_offsets[index].3);
+        put_u16(&mut output, offset + 32, edge_starts[index]);
+        put_u16(&mut output, offset + 34, edge_counts[index]);
+        output[offset + 40..offset + 72].copy_from_slice(&role_hashes[index]);
+    }
+    for (index, (owner, target)) in [(2_u32, 1_u32), (3, 2), (4, 3), (5, 4)]
+        .into_iter()
+        .enumerate()
+    {
+        let offset = edges_offset + index * edge_size;
+        put_u32(&mut output, offset, owner);
+        put_u16(&mut output, offset + 4, 5);
+        put_u16(&mut output, offset + 6, 1);
+        put_u32(&mut output, offset + 8, target);
+    }
+    output[strings_offset..].copy_from_slice(&strings);
+    Ok(output)
+}
+
+fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
+    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+pub(crate) fn validate_product(
+    boot_generation: &[u8; 32],
+    manifest: &[u8],
+    manifest_digest: [u8; 32],
+    archive_bytes: &[u8],
+    bootfs_digest: [u8; 32],
+    gate_config: &[u8],
+    artifacts: [&[u8]; 6],
+) -> Result<(), Failure> {
+    let role_hashes = [
+        sha256::bytes_digest_array(artifacts[1]),
+        sha256::bytes_digest_array(artifacts[2]),
+        sha256::bytes_digest_array(artifacts[3]),
+        sha256::bytes_digest_array(artifacts[4]),
+        sha256::bytes_digest_array(artifacts[5]),
+    ];
+    let rebuilt = build_manifest(boot_generation, role_hashes)?;
+    if rebuilt != manifest {
+        return Err(Failure::task(
+            "WYR1 generated manifest is not deterministic",
+        ));
+    }
+    if manifest_digest == [0; 32] || bootfs_digest == [0; 32] {
+        return Err(Failure::task("WYR1 product identity is zero"));
+    }
+    if manifest.len() < 80 || &manifest[..4] != b"WRRM" || manifest[48..80] != boot_generation[..] {
+        return Err(Failure::task(
+            "WYR1 manifest identity/header validation failed",
+        ));
+    }
+    let archive = wyrmroot_bootfs::archive::Archive::new(archive_bytes).map_err(|error| {
+        Failure::task(format!("WYR1 product archive validation failed: {error:?}"))
+    })?;
+    let expected = [
+        ("system/init", artifacts[0], true),
+        ("system/registryd", artifacts[1], true),
+        ("system/devmgr", artifacts[2], true),
+        ("system/uart16550d", artifacts[3], true),
+        ("system/consoled", artifacts[4], true),
+        ("system/wyrmsh", artifacts[5], true),
+        ("system/bootstrap/rrc-a-v1", manifest, false),
+        ("system/bootstrap/wyr1-a-gate-v1", gate_config, false),
+    ];
+    for (path, bytes, executable) in expected {
+        let entry = archive.lookup(path.as_bytes()).map_err(|error| {
+            Failure::task(format!(
+                "WYR1 product missing retained material {path}: {error:?}"
+            ))
+        })?;
+        if entry.data() != bytes || entry.is_executable() != executable {
+            return Err(Failure::task(format!(
+                "WYR1 retained closure substitution or mode mismatch at {path}"
+            )));
+        }
+    }
+    if archive.entries().count() != expected.len() {
+        return Err(Failure::task(
+            "WYR1 product contains undeclared retained material",
+        ));
+    }
+    Ok(())
+}
+
 /// One strict lineage receipt. Values are canonical scalar strings and are
 /// intentionally external to the WRRM bytes, avoiding self-referential hashes.
 pub fn receipt_text(
@@ -429,6 +627,8 @@ pub fn receipt_text(
     esp_sha256: &str,
     profile: Profile,
 ) -> Result<String, Failure> {
+    let manifest_sha256 = sha256::file_digest(&request.rrc_manifest)
+        .map_err(|error| Failure::task(format!("could not hash manifest: {error}")))?;
     let mut lines = vec![
         format!("schema_version = \"1\""),
         format!("kind = \"{RECEIPT_KIND}\""),
@@ -439,11 +639,15 @@ pub fn receipt_text(
         format!("scenario = \"{}\"", request.scenario.name()),
         format!("profile = \"{}\"", profile.name()),
         format!("bootfs_sha256 = \"{bootfs_sha256}\""),
+        format!("bootfs_expected_sha256 = \"{bootfs_sha256}\""),
+        format!("bootfs_observed_sha256 = \"{bootfs_sha256}\""),
         format!("esp_sha256 = \"{esp_sha256}\""),
+        format!("manifest_sha256 = \"{manifest_sha256}\""),
+        format!("manifest_expected_sha256 = \"{manifest_sha256}\""),
+        format!("manifest_observed_sha256 = \"{manifest_sha256}\""),
         format!(
-            "manifest_sha256 = \"{}\"",
-            sha256::file_digest(&request.rrc_manifest)
-                .map_err(|error| Failure::task(format!("could not hash manifest: {error}")))?
+            "gate_config_sha256 = \"{}\"",
+            sha256::bytes_digest(&gate_config_for_request(request))
         ),
         format!("evidence_protocol = \"{EVIDENCE_PROTOCOL}\""),
         format!("evidence_nonce = \"{:016X}\"", request.evidence_nonce),
@@ -507,8 +711,13 @@ pub fn verify_receipt(request: &Request, profile: Profile) -> Result<(), Failure
         "scenario",
         "profile",
         "bootfs_sha256",
+        "bootfs_expected_sha256",
+        "bootfs_observed_sha256",
         "esp_sha256",
         "manifest_sha256",
+        "manifest_expected_sha256",
+        "manifest_observed_sha256",
+        "gate_config_sha256",
         "evidence_protocol",
         "evidence_nonce",
         "loader_sha256",
@@ -551,6 +760,15 @@ pub fn verify_receipt(request: &Request, profile: Profile) -> Result<(), Failure
         &sha256::file_digest(&request.bootfs)
             .map_err(|error| Failure::task(format!("could not hash bootfs: {error}")))?,
     )?;
+    let bootfs_digest = sha256::file_digest(&request.bootfs)
+        .map_err(|error| Failure::task(format!("could not hash bootfs: {error}")))?;
+    check("bootfs_expected_sha256", &bootfs_digest)?;
+    check("bootfs_observed_sha256", &bootfs_digest)?;
+    let manifest_digest = sha256::file_digest(&request.rrc_manifest)
+        .map_err(|error| Failure::task(format!("could not hash manifest: {error}")))?;
+    check("manifest_sha256", &manifest_digest)?;
+    check("manifest_expected_sha256", &manifest_digest)?;
+    check("manifest_observed_sha256", &manifest_digest)?;
     check(
         "esp_sha256",
         &sha256::file_digest(&request.esp)
@@ -560,6 +778,10 @@ pub fn verify_receipt(request: &Request, profile: Profile) -> Result<(), Failure
     check(
         "evidence_nonce",
         &format!("{:016X}", request.evidence_nonce),
+    )?;
+    check(
+        "gate_config_sha256",
+        &sha256::bytes_digest(&gate_config_for_request(request)),
     )?;
     for (label, artifact) in [
         ("loader", &request.loader),
@@ -733,19 +955,117 @@ pub fn parse_evidence(
             "WYR1 terminal scenario does not match request",
         ));
     }
-    if !records.iter().any(|record| record.event == Event::Ready) {
-        return Err(Failure::task("WYR1 evidence has no READY record"));
-    }
-    if scenario == Scenario::DegradedRecovery
-        && !records
-            .iter()
-            .any(|record| record.event == Event::PermanentFailure)
-    {
-        return Err(Failure::task(
-            "WYR1 degraded evidence has no PermanentFailure",
-        ));
+    validate_generation_order(&records)?;
+    match scenario {
+        Scenario::Normal => validate_normal_evidence(&records)?,
+        Scenario::DegradedRecovery => validate_degraded_evidence(&records)?,
     }
     Ok(EvidenceResult { records, terminal })
+}
+
+fn validate_generation_order(records: &[EvidenceRecord]) -> Result<(), Failure> {
+    let mut last = [(0_u64, 0_u64); 6];
+    for record in records {
+        if matches!(record.event, Event::Normal | Event::Degraded) {
+            continue;
+        }
+        if record.role == 0 || record.role > 5 {
+            return Err(Failure::task(
+                "WYR1 evidence role is outside the WYR1 graph",
+            ));
+        }
+        let slot = &mut last[record.role as usize];
+        if record.generation < slot.0
+            || (record.generation == slot.0 && record.transaction < slot.1)
+            || (record.generation > slot.0 && record.transaction <= slot.1)
+        {
+            return Err(Failure::task(
+                "WYR1 evidence generation/transaction ordering is not strictly increasing",
+            ));
+        }
+        *slot = (record.generation, record.transaction);
+    }
+    Ok(())
+}
+
+fn validate_normal_evidence(records: &[EvidenceRecord]) -> Result<(), Failure> {
+    let mut ready = [false; 3];
+    let mut reaped = [false; 3];
+    for record in records {
+        if matches!(record.event, Event::Normal | Event::Degraded) {
+            continue;
+        }
+        if record.role != 1 && record.role != 2 {
+            return Err(Failure::task(
+                "WYR1 normal evidence names an undeclared role",
+            ));
+        }
+        match record.event {
+            Event::Ready => {
+                if ready[record.role as usize] {
+                    return Err(Failure::task("WYR1 normal evidence duplicates READY"));
+                }
+                ready[record.role as usize] = true;
+            }
+            Event::Reap => {
+                if !ready[record.role as usize] || reaped[record.role as usize] {
+                    return Err(Failure::task(
+                        "WYR1 normal evidence has invalid REAP ordering",
+                    ));
+                }
+                reaped[record.role as usize] = true;
+            }
+            Event::Restart | Event::PermanentFailure | Event::Normal | Event::Degraded => {
+                return Err(Failure::task("WYR1 normal evidence has an invalid event"));
+            }
+        }
+    }
+    if !(ready[1] && ready[2] && reaped[1] && reaped[2]) {
+        return Err(Failure::task(
+            "WYR1 normal evidence requires READY and REAP for registryd and devmgr",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_degraded_evidence(records: &[EvidenceRecord]) -> Result<(), Failure> {
+    let mut generations = BTreeSet::new();
+    let mut restarts = 0usize;
+    let mut failures = 0usize;
+    for record in records {
+        if matches!(record.event, Event::Normal | Event::Degraded) {
+            continue;
+        }
+        if record.role != 1 {
+            return Err(Failure::task(
+                "WYR1 degraded evidence activates a non-registryd role",
+            ));
+        }
+        generations.insert(record.generation);
+        match record.event {
+            Event::Restart => restarts += 1,
+            Event::PermanentFailure => failures += 1,
+            Event::Ready | Event::Reap => {}
+            Event::Normal | Event::Degraded => {
+                return Err(Failure::task("WYR1 degraded evidence has an invalid event"));
+            }
+        }
+    }
+    if generations != BTreeSet::from([1, 2, 3, 4]) || restarts < 3 || failures != 1 {
+        return Err(Failure::task(
+            "WYR1 degraded evidence does not show exactly four registryd attempts",
+        ));
+    }
+    let last_attempt = records
+        .iter()
+        .rev()
+        .find(|record| !matches!(record.event, Event::Normal | Event::Degraded));
+    if last_attempt.is_none_or(|record| record.event != Event::PermanentFailure) {
+        return Err(Failure::task(
+            "WYR1 degraded evidence must end its attempt history with PermanentFailure",
+        ));
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -806,11 +1126,14 @@ mod tests {
     fn evidence_rejects_gap_checksum_stale_nonce_and_after_terminal() {
         let nonce = 0x0123_4567_89ab_cdef;
         let valid = format!(
-            "{}{}",
-            encode_evidence_line(nonce, 0, Event::Ready, 1, 1, 2),
-            encode_evidence_line(nonce, 1, Event::Normal, 0, 0, 0)
+            "{}{}{}{}{}",
+            encode_evidence_line(nonce, 0, Event::Ready, 1, 1, 1),
+            encode_evidence_line(nonce, 1, Event::Ready, 2, 1, 1),
+            encode_evidence_line(nonce, 2, Event::Reap, 1, 1, 1),
+            encode_evidence_line(nonce, 3, Event::Reap, 2, 1, 1),
+            encode_evidence_line(nonce, 4, Event::Normal, 0, 0, 0)
         );
-        assert!(parse_evidence(valid.as_bytes(), nonce, Scenario::Normal).is_ok());
+        parse_evidence(valid.as_bytes(), nonce, Scenario::Normal).unwrap();
         let gap = valid.replace("seq=1", "seq=2");
         assert!(parse_evidence(gap.as_bytes(), nonce, Scenario::Normal).is_err());
         let mut checksum = valid.clone();
@@ -821,13 +1144,13 @@ mod tests {
         let after = format!(
             "{}{}",
             valid,
-            encode_evidence_line(nonce, 2, Event::Reap, 1, 1, 2)
+            encode_evidence_line(nonce, 5, Event::Reap, 1, 1, 1)
         );
         assert!(parse_evidence(after.as_bytes(), nonce, Scenario::Normal).is_err());
     }
     #[test]
     fn degraded_requires_permanent_failure() {
-        let line = encode_evidence_line(1, 0, Event::Ready, 1, 1, 1);
+        let line = encode_evidence_line(1, 0, Event::Restart, 1, 1, 1);
         let terminal = encode_evidence_line(1, 1, Event::Degraded, 0, 0, 0);
         assert!(
             parse_evidence(
@@ -837,29 +1160,27 @@ mod tests {
             )
             .is_err()
         );
-        let failure = encode_evidence_line(1, 1, Event::PermanentFailure, 1, 1, 1);
-        let terminal = encode_evidence_line(1, 2, Event::Degraded, 0, 0, 0);
-        assert!(
-            parse_evidence(
-                format!("{line}{failure}{terminal}").as_bytes(),
-                1,
-                Scenario::DegradedRecovery
-            )
-            .is_ok()
-        );
+        let restart2 = encode_evidence_line(1, 1, Event::Restart, 1, 2, 2);
+        let restart3 = encode_evidence_line(1, 2, Event::Restart, 1, 3, 3);
+        let failure = encode_evidence_line(1, 3, Event::PermanentFailure, 1, 4, 4);
+        let terminal = encode_evidence_line(1, 4, Event::Degraded, 0, 0, 0);
+        parse_evidence(
+            format!("{line}{restart2}{restart3}{failure}{terminal}").as_bytes(),
+            1,
+            Scenario::DegradedRecovery,
+        )
+        .unwrap();
     }
 
     #[test]
     fn checked_fixtures_are_valid_for_both_terminal_scenarios() {
         let nonce = 0x0123_4567_89ab_cdef;
-        assert!(
-            parse_evidence(
-                include_bytes!("../../../tools/xtask/tests/fixtures/wyr1-a-normal.evidence"),
-                nonce,
-                Scenario::Normal,
-            )
-            .is_ok()
-        );
+        parse_evidence(
+            include_bytes!("../../../tools/xtask/tests/fixtures/wyr1-a-normal.evidence"),
+            nonce,
+            Scenario::Normal,
+        )
+        .unwrap();
         assert!(
             parse_evidence(
                 include_bytes!("../../../tools/xtask/tests/fixtures/wyr1-a-degraded.evidence"),

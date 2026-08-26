@@ -41,6 +41,12 @@ pub(crate) fn bytes_digest(bytes: &[u8]) -> String {
     to_hex(digest.finish())
 }
 
+pub(crate) fn bytes_digest_array(bytes: &[u8]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(bytes);
+    digest.finish()
+}
+
 struct Sha256 {
     state: [u32; 8],
     buffer: [u8; 64],

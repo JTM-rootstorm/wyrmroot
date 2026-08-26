@@ -161,11 +161,38 @@ fn wyr1_inspect(path: &str) -> Result<String, Failure> {
             )));
         }
     }
-    if archive.entries().count() != 7 {
+    let gate_config = wyr1::gate_config_for_request(&request);
+    let init = std::fs::read(&request.init)
+        .map_err(|error| Failure::task(format!("could not read WYR1 init: {error}")))?;
+    let registryd = std::fs::read(&request.registryd)
+        .map_err(|error| Failure::task(format!("could not read WYR1 registryd: {error}")))?;
+    let devmgr = std::fs::read(&request.devmgr)
+        .map_err(|error| Failure::task(format!("could not read WYR1 devmgr: {error}")))?;
+    let uart = std::fs::read(&request.uart16550d)
+        .map_err(|error| Failure::task(format!("could not read WYR1 uart16550d: {error}")))?;
+    let console = std::fs::read(&request.consoled)
+        .map_err(|error| Failure::task(format!("could not read WYR1 consoled: {error}")))?;
+    let shell = std::fs::read(&request.wyrmsh)
+        .map_err(|error| Failure::task(format!("could not read WYR1 wyrmsh: {error}")))?;
+    let manifest = std::fs::read(&request.rrc_manifest)
+        .map_err(|error| Failure::task(format!("could not read WYR1 manifest: {error}")))?;
+    let expected = wyr1::decode_request_identity(&request)?;
+    let manifest_digest = wyr1::sha256_bytes(&manifest);
+    let bootfs_digest = wyr1::sha256_bytes(&bootfs);
+    wyr1::validate_product(
+        &expected,
+        &manifest,
+        manifest_digest,
+        &bootfs,
+        bootfs_digest,
+        &gate_config,
+        [&init, &registryd, &devmgr, &uart, &console, &shell],
+    )?;
+    if archive.entries().count() != 8 {
         return Err(Failure::task("WYR1 bootfs contains an undeclared entry"));
     }
     Ok(format!(
-        "WYR1_INSPECTION_PASS bootfs_sha256={} entries=7\n",
+        "WYR1_INSPECTION_PASS bootfs_sha256={} entries=8\n",
         sha256::bytes_digest(&bootfs)
     ))
 }

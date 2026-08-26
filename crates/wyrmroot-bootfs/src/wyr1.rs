@@ -2,7 +2,7 @@
 //!
 //! WYR0 content admission remains in [`crate::content`].  This module is a
 //! separate, fixed product surface: callers provide the exact immutable bytes
-//! selected by the integration request and the builder emits the seven
+//! selected by the integration request and the builder emits the eight
 //! canonical WYR1 entries in the existing `cpio newc` format.
 
 #![cfg(feature = "builder")]
@@ -22,6 +22,7 @@ pub const UART16550D_PATH: &str = "system/uart16550d";
 pub const CONSOLED_PATH: &str = "system/consoled";
 pub const WYRMSH_PATH: &str = "system/wyrmsh";
 pub const RRC_MANIFEST_PATH: &str = "system/bootstrap/rrc-a-v1";
+pub const GATE_CONFIG_PATH: &str = "system/bootstrap/wyr1-a-gate-v1";
 
 /// Canonical WYR1-A role paths, in product order.
 pub const ROLE_PATHS: [&str; 5] = [
@@ -58,7 +59,7 @@ impl<'a> Artifact<'a> {
     }
 }
 
-/// Exact seven-entry WYR1-A bootfs input.  Artifact hashes are intentionally
+/// Exact eight-entry WYR1-A bootfs input.  Artifact hashes are intentionally
 /// computed by the host receipt layer over these same byte slices; this crate
 /// never derives identity from host metadata.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,10 +71,11 @@ pub struct Product<'a> {
     pub consoled: &'a [u8],
     pub wyrmsh: &'a [u8],
     pub rrc_manifest: &'a [u8],
+    pub gate_config: &'a [u8],
 }
 
 impl<'a> Product<'a> {
-    pub const fn artifacts(self) -> [Artifact<'a>; 7] {
+    pub const fn artifacts(self) -> [Artifact<'a>; 8] {
         [
             Artifact::executable(INIT_PATH, self.init),
             Artifact::executable(REGISTRYD_PATH, self.registryd),
@@ -82,6 +84,7 @@ impl<'a> Product<'a> {
             Artifact::executable(CONSOLED_PATH, self.consoled),
             Artifact::executable(WYRMSH_PATH, self.wyrmsh),
             Artifact::read_only(RRC_MANIFEST_PATH, self.rrc_manifest),
+            Artifact::read_only(GATE_CONFIG_PATH, self.gate_config),
         ]
     }
 }
@@ -124,6 +127,7 @@ mod tests {
             consoled: b"console",
             wyrmsh: b"shell",
             rrc_manifest: b"WRRM",
+            gate_config: b"config",
         };
         let first = build(product).unwrap();
         let second = build(product).unwrap();
@@ -134,6 +138,7 @@ mod tests {
             names,
             vec![
                 b"system/bootstrap/rrc-a-v1".as_slice(),
+                b"system/bootstrap/wyr1-a-gate-v1".as_slice(),
                 b"system/consoled".as_slice(),
                 b"system/devmgr".as_slice(),
                 b"system/init".as_slice(),

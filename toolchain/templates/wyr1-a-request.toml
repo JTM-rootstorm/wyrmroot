@@ -17,6 +17,7 @@ devmgr = "devmgr.elf"
 uart16550d = "uart16550d.elf"
 consoled = "consoled.elf"
 wyrmsh = "wyrmsh.elf"
+# Generated output; caller bytes at this path are never consumed.
 rrc_manifest = "rrc-a-v1.bin"
 bootfs = "bootfs.img"
 esp = "esp.img"

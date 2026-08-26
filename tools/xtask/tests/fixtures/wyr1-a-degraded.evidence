@@ -1,3 +1,5 @@
-wyr1evid1|nonce=0123456789ABCDEF|seq=0|event=READY|role=00000001|generation=0000000000000001|transaction=0000000000000001|checksum=1911712D
-wyr1evid1|nonce=0123456789ABCDEF|seq=1|event=PermanentFailure|role=00000002|generation=0000000000000004|transaction=0000000000000004|checksum=B856907A
-wyr1evid1|nonce=0123456789ABCDEF|seq=2|event=DEGRADED|role=00000000|generation=0000000000000000|transaction=0000000000000000|checksum=B42A106B
+wyr1evid1|nonce=0123456789ABCDEF|seq=0|event=RESTART|role=00000001|generation=0000000000000001|transaction=0000000000000001|checksum=180F47D1
+wyr1evid1|nonce=0123456789ABCDEF|seq=1|event=RESTART|role=00000001|generation=0000000000000002|transaction=0000000000000002|checksum=A6CA7272
+wyr1evid1|nonce=0123456789ABCDEF|seq=2|event=RESTART|role=00000001|generation=0000000000000003|transaction=0000000000000003|checksum=98096C6B
+wyr1evid1|nonce=0123456789ABCDEF|seq=3|event=PermanentFailure|role=00000001|generation=0000000000000004|transaction=0000000000000004|checksum=B58868DF
+wyr1evid1|nonce=0123456789ABCDEF|seq=4|event=DEGRADED|role=00000000|generation=0000000000000000|transaction=0000000000000000|checksum=76664FC5
