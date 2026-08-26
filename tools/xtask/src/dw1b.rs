@@ -879,7 +879,8 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), Failure> {
 }
 
 const LOADER_COMMAND: &str = "xtask-central-deterministic-uefi-release-pair";
-const BOOTSTRAP_COMMAND: &str = "cargo build --offline --locked --release --target x86_64-unknown-wyrmroot --package wyrmroot-bootstrap --bin wyrmroot-bootstrap --features native-bootstrap";
+const BOOTSTRAP_FEATURES: &str = "native-bootstrap,wyr0-init0-integration";
+const BOOTSTRAP_COMMAND: &str = "cargo build --offline --locked --release --target x86_64-unknown-wyrmroot --package wyrmroot-bootstrap --bin wyrmroot-bootstrap --features native-bootstrap,wyr0-init0-integration";
 const INIT_COMMAND: &str = "cargo build --offline --locked --release --target x86_64-unknown-wyrmroot --package wyrmroot-init0 --bin wyrmroot-init0 --features native-init0,dw1b-preemption-integration";
 const HELLO_COMMAND: &str = "cargo build --offline --locked --release --target x86_64-unknown-wyrmroot --package wyrmroot-hello --bin wyrmroot-hello --features native-hello";
 const HOG_COMMAND: &str = "cargo build --offline --locked --release --target x86_64-unknown-wyrmroot --package wyrmroot-dw1b-preemption --bin wyrmroot-dw1b-cpu-hog --features native-payloads";
@@ -1095,7 +1096,7 @@ fn build_wyr_artifact_set(
             NATIVE_TARGET,
             "wyrmroot-bootstrap",
             "wyrmroot-bootstrap",
-            "native-bootstrap",
+            BOOTSTRAP_FEATURES,
             "wyrmroot-bootstrap",
         ),
         BuildSpec::new(
@@ -2534,6 +2535,15 @@ mod tests {
         assert!(template.contains(ACCEPTED_RUST_REVISION));
         assert!(template.contains("REPLACE_WITH_INTEGRATED_WYRMROOT_COMMIT"));
         assert!(!template.contains("revision = \"0000000000000000000000000000000000000000\""));
+    }
+
+    #[test]
+    fn selector_26_bootstrap_uses_the_init0_launch_profile() {
+        assert_eq!(
+            BOOTSTRAP_FEATURES,
+            "native-bootstrap,wyr0-init0-integration"
+        );
+        assert!(BOOTSTRAP_COMMAND.ends_with("--features native-bootstrap,wyr0-init0-integration"));
     }
 
     #[test]
