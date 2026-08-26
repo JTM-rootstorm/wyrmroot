@@ -89,6 +89,31 @@ pub enum JobPhase {
     Reaped,
 }
 
+/// Stable controller failure classes for WRLJ `ERROR` responses.
+///
+/// These codes deliberately describe controller/protocol outcomes rather than
+/// Deepwyrm statuses, which remain available only in a terminal `JOB_RESULT`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum ErrorCode {
+    MalformedRequest = 1,
+    StaleOrUnknownSession = 2,
+    TransactionReplay = 3,
+    ForeignOrUnknownJob = 4,
+    InvalidState = 5,
+    Capacity = 6,
+    PolicyRejected = 7,
+    LoaderFailure = 8,
+    CleanupFailure = 9,
+    CancellationUnavailable = 10,
+}
+
+impl ErrorCode {
+    pub const fn as_u32(self) -> u32 {
+        self as u32
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TerminationResult {
     pub classification: u32,
@@ -448,6 +473,106 @@ pub fn encode_job_message(
     encode_prefix(reservation, kind, out)?;
     put_u64(out, 48, job_id)?;
     Ok(56)
+}
+
+/// Encodes a terminal or current job phase response.
+pub fn encode_job_state(
+    reservation: Reservation,
+    job_id: u64,
+    phase: JobPhase,
+    out: &mut [u8],
+) -> Result<usize, Error> {
+    nonzero(job_id)?;
+    if out.len() < 64 {
+        return Err(Error::WrongSize);
+    }
+    out[..64].fill(0);
+    encode_prefix(reservation, MessageType::JobState, out)?;
+    put_u64(out, 48, job_id)?;
+    put_u32(
+        out,
+        56,
+        match phase {
+            JobPhase::Running => 1,
+            JobPhase::Terminating => 2,
+            JobPhase::Exited => 3,
+            JobPhase::Reaped => 4,
+        },
+    )?;
+    Ok(64)
+}
+
+/// Encodes the exact structured Deepwyrm termination and controller cleanup
+/// outcome. No POSIX status is synthesized here.
+pub fn encode_job_result(
+    reservation: Reservation,
+    job_id: u64,
+    result: TerminationResult,
+    out: &mut [u8],
+) -> Result<usize, Error> {
+    nonzero(job_id)?;
+    if out.len() < 88 {
+        return Err(Error::WrongSize);
+    }
+    out[..88].fill(0);
+    encode_prefix(reservation, MessageType::JobResult, out)?;
+    put_u64(out, 48, job_id)?;
+    put_u32(out, 56, result.classification)?;
+    put_u32(out, 60, result.application_code)?;
+    put_u32(out, 64, result.exception_class)?;
+    put_u32(out, 68, result.exception_detail)?;
+    put_u64(out, 72, result.exception_address)?;
+    put_u32(out, 80, result.cleanup_result)?;
+    Ok(88)
+}
+
+/// Encodes a typed protocol/controller failure response.
+pub fn encode_error(
+    reservation: Reservation,
+    code: ErrorCode,
+    out: &mut [u8],
+) -> Result<usize, Error> {
+    if out.len() < 56 {
+        return Err(Error::WrongSize);
+    }
+    out[..56].fill(0);
+    encode_prefix(reservation, MessageType::Error, out)?;
+    put_u32(out, 48, code.as_u32())?;
+    Ok(56)
+}
+
+/// Encodes a canonical owner-visible job list.
+pub fn encode_job_list(
+    reservation: Reservation,
+    job_ids: &[u64],
+    out: &mut [u8],
+) -> Result<usize, Error> {
+    if job_ids.len() > MAX_LIVE_JOBS {
+        return Err(Error::WrongSize);
+    }
+    let size = 56usize
+        .checked_add(
+            job_ids
+                .len()
+                .checked_mul(8)
+                .ok_or(Error::ArithmeticOverflow)?,
+        )
+        .ok_or(Error::ArithmeticOverflow)?;
+    if out.len() < size {
+        return Err(Error::WrongSize);
+    }
+    out[..size].fill(0);
+    encode_prefix(reservation, MessageType::JobList, out)?;
+    put_u32(
+        out,
+        48,
+        u32::try_from(job_ids.len()).map_err(|_| Error::WrongSize)?,
+    )?;
+    for (index, job_id) in job_ids.iter().copied().enumerate() {
+        nonzero(job_id)?;
+        put_u64(out, 56 + index * 8, job_id)?;
+    }
+    Ok(size)
 }
 
 fn parse_launch(bytes: &[u8], received_handles: usize) -> Result<LaunchRequest<'_>, Error> {
@@ -854,6 +979,53 @@ mod tests {
         assert_eq!(
             encode_job_message(R, MessageType::ListJobs, 17, &mut bytes),
             Err(Error::UnknownMessageType)
+        );
+    }
+
+    #[test]
+    fn typed_responses_round_trip_without_posix_translation() {
+        let mut bytes = [0u8; 88];
+        let result = TerminationResult {
+            classification: 4,
+            application_code: 0,
+            exception_class: 7,
+            exception_detail: 9,
+            exception_address: 0xfeed_beef,
+            cleanup_result: 0b1_0100,
+        };
+        let size = encode_job_result(R, 17, result, &mut bytes).unwrap();
+        assert_eq!(
+            parse_message(&bytes[..size], 0).unwrap().message,
+            Message::JobResult { job_id: 17, result }
+        );
+        let size = encode_error(R, ErrorCode::ForeignOrUnknownJob, &mut bytes).unwrap();
+        assert_eq!(
+            parse_message(&bytes[..size], 0).unwrap().message,
+            Message::Error {
+                code: ErrorCode::ForeignOrUnknownJob as u32
+            }
+        );
+    }
+
+    #[test]
+    fn canonical_job_state_and_list_encoders_reject_bad_identities() {
+        let mut bytes = [0u8; 320];
+        let size = encode_job_state(R, 17, JobPhase::Terminating, &mut bytes).unwrap();
+        assert_eq!(
+            parse_message(&bytes[..size], 0).unwrap().message,
+            Message::JobState {
+                job_id: 17,
+                phase: JobPhase::Terminating,
+            }
+        );
+        let size = encode_job_list(R, &[17, 18], &mut bytes).unwrap();
+        let Message::JobList(ids) = parse_message(&bytes[..size], 0).unwrap().message else {
+            panic!("wrong message");
+        };
+        assert_eq!([ids.get(0), ids.get(1)], [Some(17), Some(18)]);
+        assert_eq!(
+            encode_job_list(R, &[0], &mut bytes),
+            Err(Error::ZeroIdentity)
         );
     }
 }

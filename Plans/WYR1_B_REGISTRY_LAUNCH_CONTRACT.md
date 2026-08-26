@@ -564,6 +564,42 @@ controller records, permits the job to run, observes terminal state, and reaps
 it exactly once. A later connection cannot reattach to the orphan. This creates
 neither leaked children nor ambient cross-connection kill authority.
 
+### 9.5 Slice-F dispatcher dispositions
+
+Slice F fixes the following controller behavior for selector 27 only. These
+rules do not extend selector 25, add evidence authority to a test actor, or
+turn init into a general service manager.
+
+- `ERROR` carries one of these stable numeric codes: `1` malformed request,
+  `2` stale or unknown session, `3` replayed transaction, `4` foreign or
+  unknown job, `5` invalid state, `6` capacity, `7` launch-policy rejection,
+  `8` loader failure, `9` cleanup failure, or `10` cancellation unavailable.
+  Each response repeats the request connection ID/generation/transaction ID;
+  only a fresh request transaction may receive one response.
+- `LAUNCH_ACCEPTED` is emitted only after the loader transfer has committed and
+  init has observed the exact `JobV2`/`JobV2Streams` READY record. A process
+  that is both readable with READY and exited during the bounded observation is
+  classified from its exact termination record before acceptance; it is never
+  accepted merely because its Channel was readable.
+- The loader owns all zero or three stream endpoints uniformly. A failed send
+  leaves all supplied endpoints owned by the caller for reverse-order cleanup;
+  a successful MOVE transfers all of them and every later rollback path must
+  not close them again.
+- Deepwyrm termination fields are copied without POSIX translation. The
+  `cleanup_result` bit set is controller-owned: bit 0 task-group termination
+  failed, bit 1 terminal wait timed out or failed, bit 2 launch Channel close
+  failed, bit 3 process close failed, and bit 4 task-group close failed. Zero
+  means every required controller cleanup/reap action completed.
+- There are at most 16 simultaneously open sessions and 32 live jobs globally.
+  Job visibility is exact-owner-session only. Session identities are the
+  nonzero boot-monotonic `(connection_id, generation)` pair, never a handle or
+  a reused slot. A closed session is reclaimed only after all its orphaned jobs
+  have reached terminal observation and exact reap.
+- The dispatcher polls a bounded session/job subset per tick and uses no giant
+  aggregate wait set. It drains readable work before acting on `PEER_CLOSED`.
+  Timeout and cleanup-retry outcomes remain explicit `ERROR` or structured
+  terminal results; they are never reported as a successful job result.
+
 ## 10. Implementation ownership
 
 - `crates/wyrmroot-registry-proto`: WRRG types, codecs, limits, golden vectors.
