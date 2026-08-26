@@ -13,7 +13,8 @@ use crate::evidence::{EvidenceError, EvidenceEvent, EvidenceLog};
 use crate::gate::{GATE_CONFIG_PATH, GateConfig, GateConfigError, parse_gate_config};
 use deepwyrm_syscall::{
     DW_DEADLINE_INFINITE, DW_SIGNAL_EXITED, DW_SIGNAL_PEER_CLOSED, DW_TASK_STATE_EXITED,
-    DwDeadline, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights, DwWaitItemV1,
+    DW_TERMINATION_AUTHORIZED, DW_TERMINATION_NORMAL_EXIT, DwDeadline, DwHandle, DwObjectType,
+    DwReceivedHandleInfoV1, DwRights, DwTaskTerminationInfoV1, DwWaitItemV1,
 };
 use wyrmroot_bootfs::archive::{Archive, LookupError, ParseError};
 use wyrmroot_loader::{
@@ -31,13 +32,20 @@ use wyrmroot_runtime::{
 use wyrmroot_runtime::{
     BOOTFS_EXPECTATION, BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, CapabilityValidationError,
     InitCapability, LOADER_TASK_GROUP_EXPECTATION, MappingPlan, MappingPlanError, NativeError,
-    ReceiveCounts, SELF_ROOT_EXPECTATION, SupervisionError, SupervisionPlatform,
-    await_child_ready_profile, supervise_ready_child_profile, validate_bootstrap_channel,
-    validate_init_capabilities_v2,
+    ObservedSupervisionError, ReceiveCounts, SELF_ROOT_EXPECTATION, SupervisionError,
+    SupervisionPlatform, await_child_ready_profile_observed, supervise_ready_child_profile,
+    validate_bootstrap_channel, validate_init_capabilities_v2,
 };
 
 pub const SYSTEM_INIT_PATH: &str = "system/init";
 pub const EARLY_ROLE_COUNT: usize = 2;
+const EXPECTED_ROLE_PATHS: [(RoleId, &str); 5] = [
+    (RoleId::Registryd, "system/registryd"),
+    (RoleId::Devmgr, "system/devmgr"),
+    (RoleId::Uart16550d, "system/uart16550d"),
+    (RoleId::Consoled, "system/consoled"),
+    (RoleId::Wyrmsh, "system/wyrmsh"),
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SystemMode {
@@ -54,6 +62,19 @@ pub enum RecoveryResult {
     Recovered,
     Degraded,
     Fatal,
+}
+
+/// Process application status used when permanent init cannot safely continue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum InitApplicationStatus {
+    /// Fatal bootstrap/supervision failure; platform recovery requires reboot.
+    FatalRebootRequired = 0xAF01_0002,
+}
+
+#[must_use]
+pub const fn fatal_application_status(_error: &InitError) -> InitApplicationStatus {
+    InitApplicationStatus::FatalRebootRequired
 }
 
 /// Boot-lifetime owner of the fixed supervisor state and primordial authority.
@@ -316,15 +337,8 @@ impl SystemInit {
         if manifest.role_count() != 5 {
             return Err(InitError::WrongManifestProfile);
         }
-        for (expected, role) in [
-            RoleId::Registryd,
-            RoleId::Devmgr,
-            RoleId::Uart16550d,
-            RoleId::Consoled,
-            RoleId::Wyrmsh,
-        ]
-        .into_iter()
-        .zip(manifest.roles())
+        for ((expected, expected_path), role) in
+            EXPECTED_ROLE_PATHS.into_iter().zip(manifest.roles())
         {
             let launchable = matches!(expected, RoleId::Registryd | RoleId::Devmgr);
             let expected_shape = if launchable {
@@ -335,6 +349,7 @@ impl SystemInit {
                 (Activation::ConsoleBound, StartupProfile::Retained)
             };
             if role.id() != expected
+                || role.path() != expected_path
                 || !role.required()
                 || !role.requires_ready()
                 || (role.activation(), role.startup_profile()) != expected_shape
@@ -780,6 +795,11 @@ impl SystemInit {
         let i = self.index(role).ok_or(InitError::UnlaunchableRole)?;
         Ok(&mut self.roles[i])
     }
+
+    fn executable_identity(&self, role: RoleId) -> Result<[u8; 32], InitError> {
+        let index = self.index(role).ok_or(InitError::UnlaunchableRole)?;
+        Ok(self.roles[index].executable_identity)
+    }
 }
 
 /// Validates the runtime half of the selected-generation trust boundary.
@@ -899,7 +919,6 @@ where
     let counts = system
         .receive_channel(bootstrap_channel, &mut init_bytes, &mut handles)
         .map_err(InitError::Native)?;
-    let received = core::cmp::min(counts.handles, handles.len());
     if counts
         != (ReceiveCounts {
             bytes: SUPERVISOR_BYTES,
@@ -907,7 +926,7 @@ where
         })
     {
         let error = InitError::Launch(wyrmroot_loader::launch::LaunchError::HandleCount);
-        close_startup_failure(system, &handles[..received], bootstrap_channel)?;
+        close_malformed_startup(system, &handles, counts.handles, bootstrap_channel)?;
         return Err(error);
     }
     let startup = (|| {
@@ -991,6 +1010,16 @@ fn close_startup_failure<S: InitPlatform>(
     }
 }
 
+fn close_malformed_startup<S: InitPlatform>(
+    system: &mut S,
+    handles: &[DwReceivedHandleInfoV1; 3],
+    reported_handles: usize,
+    bootstrap_channel: DwHandle,
+) -> Result<(), InitError> {
+    let initialized = core::cmp::min(reported_handles, handles.len());
+    close_startup_failure(system, &handles[..initialized], bootstrap_channel)
+}
+
 fn activate_retained_bootfs<S, L, W>(
     system: &mut S,
     loader: &mut L,
@@ -1047,7 +1076,7 @@ where
             else {
                 return Err(InitError::WrongActivationOrder);
             };
-            let executable_identity = role_identity(bootfs, role)?;
+            let executable_identity = controller.executable_identity(role)?;
             let task_group = system
                 .create_attempt_task_group(authority.task_group)
                 .map_err(InitError::Native)?;
@@ -1056,7 +1085,14 @@ where
                 task_group,
                 ..authority
             };
-            let loaded = match load_role(loader, role_authority, bootfs, role, transaction_id) {
+            let loaded = match load_role(
+                loader,
+                role_authority,
+                bootfs,
+                role,
+                executable_identity,
+                transaction_id,
+            ) {
                 Ok(value) => value,
                 Err(error) => {
                     let now = match system.now().map_err(InitError::Native) {
@@ -1097,12 +1133,14 @@ where
                     );
                     let close_failed = system.close_handle(task_group).is_err();
                     if rollback_failed || close_failed {
-                        controller.cleanup_failed(role, generation, transaction_id, now + 1)?;
+                        let retired_at = now.checked_add(1).ok_or(InitError::Accounting)?;
+                        controller.cleanup_failed(role, generation, transaction_id, retired_at)?;
                         controller.fatal();
                         return Err(error);
                     }
                     controller.abort_reservation(reservation)?;
-                    controller.cleanup_complete(role, generation, transaction_id, now + 1)?;
+                    let retired_at = now.checked_add(1).ok_or(InitError::Accounting)?;
+                    controller.cleanup_complete(role, generation, transaction_id, retired_at)?;
                     if advance_or_degrade(system, &mut controller, role, transaction_id)? {
                         controller.finalize_evidence(RecoveryResult::Degraded)?;
                         return Ok((RecoveryResult::Degraded, controller));
@@ -1168,7 +1206,7 @@ where
                     ));
                 }
             };
-            match await_child_ready_profile(
+            match await_child_ready_profile_observed(
                 waits,
                 loaded.process,
                 loaded.launch_channel,
@@ -1210,8 +1248,8 @@ where
                         transaction_id,
                         DW_DEADLINE_INFINITE,
                     ) {
-                        Ok(()) => {
-                            let disposition = TerminalDisposition::NormalExit(0);
+                        Ok(info) => {
+                            let disposition = terminal_disposition(&info);
                             let now = match system.now().map_err(InitError::Native) {
                                 Ok(now) => now,
                                 Err(error) => {
@@ -1264,7 +1302,7 @@ where
                             }
                         }
                         Err(error) => {
-                            let failure = classify_supervision(&error);
+                            let failure = classify_observed_supervision(&error, true);
                             let now = match system.now().map_err(InitError::Native) {
                                 Ok(now) => now,
                                 Err(error) => {
@@ -1312,7 +1350,7 @@ where
                     }
                 }
                 Err(error) => {
-                    let failure = classify_supervision(&error);
+                    let failure = classify_observed_supervision(&error, false);
                     let now = match system.now().map_err(InitError::Native) {
                         Ok(now) => now,
                         Err(error) => {
@@ -1378,26 +1416,12 @@ fn fresh_capability<S: InitPlatform>(
             .map_err(InitError::Native)?,
     })
 }
-fn role_identity(bytes: &[u8], role: RoleId) -> Result<[u8; 32], InitError> {
-    let a = Archive::new(bytes).map_err(InitError::Bootfs)?;
-    let m = a.lookup(MANIFEST_PATH.as_bytes()).map_err(map_lookup)?;
-    let id: [u8; 32] = m
-        .data()
-        .get(48..80)
-        .ok_or(InitError::ZeroBootGeneration)?
-        .try_into()
-        .unwrap();
-    let manifest = Manifest::parse_structural(m.data(), &id).map_err(InitError::Manifest)?;
-    Ok(*manifest
-        .role(role)
-        .ok_or(InitError::WrongManifestProfile)?
-        .executable_identity())
-}
 fn load_role<L: LoaderPlatform<Error = NativeError>>(
     loader: &mut L,
     authority: LoadAuthority,
     bytes: &[u8],
     role: RoleId,
+    expected_identity: [u8; 32],
     transaction_id: u64,
 ) -> Result<LoadedProcess, InitError> {
     let archive = Archive::new(bytes).map_err(InitError::Bootfs)?;
@@ -1407,6 +1431,9 @@ fn load_role<L: LoaderPlatform<Error = NativeError>>(
         _ => return Err(InitError::UnlaunchableRole),
     };
     let e = archive.lookup(path.as_bytes()).map_err(map_lookup)?;
+    if wyrmroot_runtime::sha256::digest(e.data()) != expected_identity {
+        return Err(InitError::ArtifactIdentityMismatch(role));
+    }
     load_process(
         loader,
         authority,
@@ -1536,12 +1563,52 @@ fn classify_supervision(error: &SupervisionError<NativeError>) -> AttemptFailure
             AttemptFailure::MalformedReady
         }
         SupervisionError::PeerClosedBeforeReady => AttemptFailure::PeerClosedBeforeReady,
-        SupervisionError::ExitedBeforeReady
-        | SupervisionError::Exit(_)
-        | SupervisionError::ExitQuery(_) => {
-            AttemptFailure::ExitBeforeReady(TerminalDisposition::NormalExit(1))
+        SupervisionError::ExitedBeforeReady | SupervisionError::Exit(_) => {
+            AttemptFailure::ExitQueryFailed
         }
+        SupervisionError::ExitQuery(_) => AttemptFailure::ExitQueryFailed,
         _ => AttemptFailure::WaitFailed,
+    }
+}
+
+fn classify_observed_supervision(
+    error: &ObservedSupervisionError<NativeError>,
+    after_ready: bool,
+) -> AttemptFailure {
+    let disposition = match error {
+        ObservedSupervisionError::ExitedBeforeReady(info)
+        | ObservedSupervisionError::PeerClosedBeforeReady(info)
+        | ObservedSupervisionError::Exit(_, info)
+        | ObservedSupervisionError::ExitObservedReadiness(_, info) => {
+            Some(terminal_disposition(info))
+        }
+        ObservedSupervisionError::Supervision(_) => None,
+    };
+    match disposition {
+        Some(disposition) if after_ready => AttemptFailure::ExitAfterReady(disposition),
+        Some(disposition) => AttemptFailure::ExitBeforeReady(disposition),
+        None => match error {
+            ObservedSupervisionError::Supervision(error) => classify_supervision(error),
+            _ => unreachable!("termination-bearing variants were handled above"),
+        },
+    }
+}
+
+fn terminal_disposition(info: &DwTaskTerminationInfoV1) -> TerminalDisposition {
+    if info.reason == DW_TERMINATION_NORMAL_EXIT
+        && info.exception_type.0 == 0
+        && info.detail == 0
+        && info.fault_address == 0
+    {
+        TerminalDisposition::NormalExit(info.application_code)
+    } else if info.reason == DW_TERMINATION_AUTHORIZED
+        && info.exception_type.0 == 0
+        && info.detail == 0
+        && info.fault_address == 0
+    {
+        TerminalDisposition::AuthorizedTermination
+    } else {
+        TerminalDisposition::UnhandledException
     }
 }
 fn advance_or_degrade<S: InitPlatform>(
@@ -1560,19 +1627,35 @@ fn advance_or_degrade<S: InitPlatform>(
             deadline_ns,
             ..
         } => {
-            system.wait_until(deadline_ns).map_err(InitError::Native)?;
+            let observed_now = wait_for_replacement(system, deadline_ns)?;
             controller.start_replacement(
                 role,
-                deadline_ns,
+                observed_now,
                 next_generation,
-                transaction.checked_add(1).ok_or(InitError::Restart(
-                    RestartTransitionError::ArithmeticOverflow,
-                ))?,
+                next_transaction(transaction)?,
             )?;
             Ok(matches!(controller.mode(), SystemMode::Degraded))
         }
         _ => Err(InitError::WrongActivationOrder),
     }
+}
+
+fn wait_for_replacement<S: InitPlatform>(
+    system: &mut S,
+    deadline_ns: u64,
+) -> Result<u64, InitError> {
+    system.wait_until(deadline_ns).map_err(InitError::Native)?;
+    let observed_now = system.now().map_err(InitError::Native)?;
+    if observed_now < deadline_ns {
+        return Err(InitError::WrongActivationOrder);
+    }
+    Ok(observed_now)
+}
+
+fn next_transaction(transaction: u64) -> Result<u64, InitError> {
+    transaction.checked_add(1).ok_or(InitError::Restart(
+        RestartTransitionError::ArithmeticOverflow,
+    ))
 }
 
 /// Distinguishes process existence from profile-aware READY validation.
@@ -1663,8 +1746,9 @@ mod native_cleanup_tests {
         now: u64,
         terminate_fails: bool,
         close_failure: DwHandle,
-        closed: [DwHandle; 3],
+        closed: [DwHandle; 4],
         close_count: usize,
+        wake_now: Option<u64>,
     }
 
     impl MockNative {
@@ -1673,8 +1757,9 @@ mod native_cleanup_tests {
                 now: 10,
                 terminate_fails: false,
                 close_failure: DwHandle(0),
-                closed: [DwHandle(0); 3],
+                closed: [DwHandle(0); 4],
                 close_count: 0,
+                wake_now: None,
             }
         }
     }
@@ -1744,7 +1829,13 @@ mod native_cleanup_tests {
         }
 
         fn wait_until(&mut self, _deadline_ns: u64) -> Result<(), NativeError> {
-            Err(FAILURE)
+            match self.wake_now {
+                Some(now) => {
+                    self.now = now;
+                    Ok(())
+                }
+                None => Err(FAILURE),
+            }
         }
     }
 
@@ -1816,7 +1907,10 @@ mod native_cleanup_tests {
             cleanup_loaded(&mut native, &mut waits, LOADED, DwHandle(10), true),
             Ok(())
         );
-        assert_eq!(native.closed, [DwHandle(30), DwHandle(20), DwHandle(10)]);
+        assert_eq!(
+            &native.closed[..3],
+            &[DwHandle(30), DwHandle(20), DwHandle(10)]
+        );
     }
 
     #[test]
@@ -1833,7 +1927,10 @@ mod native_cleanup_tests {
             Err(InitError::Cleanup)
         );
         assert_eq!(native.close_count, 3);
-        assert_eq!(native.closed, [DwHandle(30), DwHandle(20), DwHandle(10)]);
+        assert_eq!(
+            &native.closed[..3],
+            &[DwHandle(30), DwHandle(20), DwHandle(10)]
+        );
     }
 
     #[test]
@@ -1849,5 +1946,97 @@ mod native_cleanup_tests {
             Err(InitError::Cleanup)
         );
         assert_eq!(native.close_count, 3);
+    }
+
+    #[test]
+    fn oversized_startup_count_closes_every_initialized_handle_and_channel() {
+        let handles = [
+            DwReceivedHandleInfoV1 {
+                handle: DwHandle(1),
+                ..DwReceivedHandleInfoV1::default()
+            },
+            DwReceivedHandleInfoV1 {
+                handle: DwHandle(2),
+                ..DwReceivedHandleInfoV1::default()
+            },
+            DwReceivedHandleInfoV1 {
+                handle: DwHandle(3),
+                ..DwReceivedHandleInfoV1::default()
+            },
+        ];
+        let mut native = MockNative::new();
+        assert_eq!(
+            close_malformed_startup(&mut native, &handles, usize::MAX, DwHandle(4)),
+            Ok(())
+        );
+        assert_eq!(
+            native.closed,
+            [DwHandle(1), DwHandle(2), DwHandle(3), DwHandle(4)]
+        );
+    }
+
+    #[test]
+    fn replacement_uses_fresh_delayed_wake_and_rejects_early_wake() {
+        let mut native = MockNative::new();
+        native.wake_now = Some(125);
+        assert_eq!(wait_for_replacement(&mut native, 100), Ok(125));
+        native.wake_now = Some(99);
+        assert_eq!(
+            wait_for_replacement(&mut native, 100),
+            Err(InitError::WrongActivationOrder)
+        );
+    }
+
+    #[test]
+    fn replacement_transaction_overflow_is_structured() {
+        assert_eq!(
+            next_transaction(u64::MAX),
+            Err(InitError::Restart(
+                RestartTransitionError::ArithmeticOverflow
+            ))
+        );
+    }
+
+    #[test]
+    fn exact_terminal_records_map_to_all_reap_classes() {
+        let mut info = DwTaskTerminationInfoV1 {
+            reason: DW_TERMINATION_NORMAL_EXIT,
+            application_code: 0xA101_F001,
+            ..DwTaskTerminationInfoV1::default()
+        };
+        assert_eq!(
+            terminal_disposition(&info),
+            TerminalDisposition::NormalExit(0xA101_F001)
+        );
+        info.reason = DW_TERMINATION_AUTHORIZED;
+        info.application_code = 0;
+        assert_eq!(
+            terminal_disposition(&info),
+            TerminalDisposition::AuthorizedTermination
+        );
+        info.reason = deepwyrm_syscall::DW_TERMINATION_UNHANDLED_EXCEPTION;
+        info.exception_type = deepwyrm_syscall::DW_EXCEPTION_ILLEGAL_INSTRUCTION;
+        assert_eq!(
+            terminal_disposition(&info),
+            TerminalDisposition::UnhandledException
+        );
+        assert_eq!(
+            reap_evidence_value(AttemptFailure::DuplicateReady),
+            (REAP_CLASS_TASK_GROUP_TEARDOWN as u64) << 32
+        );
+    }
+
+    #[test]
+    fn rollback_failure_maps_to_exact_fatal_reboot_status() {
+        let error = InitError::Loader(LoadError::Platform {
+            stage: wyrmroot_loader::process::LoadStage::ProcessCreate,
+            cause: FAILURE,
+            rollback_failed: true,
+        });
+        assert_eq!(
+            fatal_application_status(&error),
+            InitApplicationStatus::FatalRebootRequired
+        );
+        assert_eq!(fatal_application_status(&error) as u32, 0xAF01_0002);
     }
 }

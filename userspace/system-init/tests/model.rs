@@ -15,17 +15,21 @@ use wyrmroot_system_init::{
 const BOOT: [u8; 32] = [0x42; 32];
 
 fn manifest_bytes() -> Vec<u8> {
+    manifest_bytes_with_early_paths("system/registryd", "system/devmgr")
+}
+
+fn manifest_bytes_with_early_paths(registry_path: &str, devmgr_path: &str) -> Vec<u8> {
     let mut builder = Builder::new(BOOT);
     for (id, path, activation, profile) in [
         (
             RoleId::Registryd,
-            "system/registryd",
+            registry_path,
             Activation::Early,
             StartupProfile::EarlyBootStub,
         ),
         (
             RoleId::Devmgr,
-            "system/devmgr",
+            devmgr_path,
             Activation::Early,
             StartupProfile::EarlyBootStub,
         ),
@@ -77,6 +81,26 @@ fn manifest_bytes() -> Vec<u8> {
             .unwrap();
     }
     builder.build_structural().unwrap()
+}
+
+#[test]
+fn manifest_role_path_drift_is_rejected_before_activation() {
+    let bytes = manifest_bytes_with_early_paths("system/registryd-v2", "system/devmgr");
+    let manifest = Manifest::parse_structural(&bytes, &BOOT).unwrap();
+    assert_eq!(
+        SystemInit::from_manifest(manifest),
+        Err(InitError::WrongManifestProfile)
+    );
+}
+
+#[test]
+fn manifest_role_path_substitution_is_rejected_before_activation() {
+    let bytes = manifest_bytes_with_early_paths("system/devmgr", "system/registryd");
+    let manifest = Manifest::parse_structural(&bytes, &BOOT).unwrap();
+    assert_eq!(
+        SystemInit::from_manifest(manifest),
+        Err(InitError::WrongManifestProfile)
+    );
 }
 
 fn system() -> SystemInit {
@@ -286,9 +310,15 @@ fn reap_evidence_value_encodes_terminal_class_and_application_code() {
     );
     assert_eq!(
         reap_evidence_value(AttemptFailure::ExitBeforeReady(
-            TerminalDisposition::NormalExit(0xA5A5_5A5A)
+            TerminalDisposition::NormalExit(0xA101_F001)
         )),
-        ((REAP_CLASS_NORMAL_EXIT as u64) << 32) | 0xA5A5_5A5A
+        ((REAP_CLASS_NORMAL_EXIT as u64) << 32) | 0xA101_F001
+    );
+    assert_eq!(
+        reap_evidence_value(AttemptFailure::ExitAfterReady(
+            TerminalDisposition::AuthorizedTermination
+        )),
+        (REAP_CLASS_AUTHORIZED_TERMINATION as u64) << 32
     );
     assert_eq!(
         reap_evidence_value(AttemptFailure::StartFailed),

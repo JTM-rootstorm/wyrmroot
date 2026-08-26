@@ -16,7 +16,7 @@ use wyrmroot_runtime::{
     map_bootfs_read_only, monotonic_active_now, panic_abort, query_capability_info,
     query_memory_object_size, receive_channel, send_channel, set_timer, unmap_bootfs, wait_one,
 };
-use wyrmroot_system_init::{InitPlatform, run_system_init};
+use wyrmroot_system_init::{InitPlatform, fatal_application_status, run_system_init};
 
 struct NativeSystem;
 
@@ -94,7 +94,7 @@ fn main(startup: StartupBlock<'_>) -> u32 {
         startup.bootstrap_channel().as_abi(),
     );
     let Ok(mut resident) = result else {
-        return 0xAF01_0002;
+        return fatal_application_status(&result.unwrap_err()) as u32;
     };
     #[cfg(feature = "wyr1-test-evidence")]
     {
