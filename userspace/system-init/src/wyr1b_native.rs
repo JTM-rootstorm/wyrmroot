@@ -1,12 +1,25 @@
 //! Native selector-27 registry and dependent-peer controller.
 
 use super::*;
-use crate::wyr1b::{EndpointGrant, EndpointKind, RegistryTopology, correlation_environment};
+use crate::wyr1b::{
+    EndpointGrant, EndpointKind, JobError, JobResult as ControllerJobResult, LaunchEngineError,
+    PolicyView, RegistryTopology, abort_prepared_job, commit_prepared_job, correlation_environment,
+    observe_prepared_ready, prepare_authorized_job,
+};
 use crate::wyr1b_gate::{GATE_PATH, GateConfig, parse_config};
+use crate::wyr1b_job::JobDispatcher;
 use deepwyrm_syscall::{
     DW_HANDLE_TRANSFER_MOVE, DW_OBJECT_TYPE_CHANNEL, DW_RIGHT_INSPECT, DW_RIGHT_READ,
     DW_RIGHT_TRANSFER, DW_RIGHT_WAIT, DW_RIGHT_WRITE, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE,
-    DwHandleTransferV1, DwRights,
+    DW_TASK_STATE_EXITED, DW_TERMINATION_AUTHORIZED, DW_TERMINATION_NORMAL_EXIT,
+    DW_TERMINATION_RESOURCE_POLICY, DW_TERMINATION_TASK_GROUP_TEARDOWN,
+    DW_TERMINATION_UNHANDLED_EXCEPTION, DwHandleTransferV1, DwRights,
+};
+use wyrmroot_launch_proto::{
+    ErrorCode as LaunchErrorCode, Message as LaunchMessage, MessageType as LaunchMessageType,
+    Reservation as LaunchReservation, TerminationClassification, TerminationResult,
+    encode_error as encode_launch_error, encode_job_message, encode_job_result,
+    parse_message as parse_launch_message,
 };
 use wyrmroot_loader::launch::CHILD_CHANNEL_RIGHTS;
 use wyrmroot_registry_proto::{
@@ -177,13 +190,15 @@ pub(crate) struct Activation {
     pub registry_control: DwHandle,
     pub topology: Option<RegistryTopology>,
     pub gate: GateConfig,
+    pub jobs: JobDispatcher,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ResidentState {
     pub registry_control: DwHandle,
     pub topology: Option<RegistryTopology>,
     pub gate: GateConfig,
+    pub jobs: JobDispatcher,
 }
 
 /// Validates the selector-27 retained product without weakening the selector-25
@@ -247,6 +262,7 @@ where
     W: SupervisionPlatform<Error = NativeError>,
 {
     let (mut controller, gate) = validate_retained_bootfs(bootfs)?;
+    let mut jobs = JobDispatcher::new();
     controller.become_operational()?;
     let mut ready = [0u8; HEADER_BYTES];
     let ready_len =
@@ -283,6 +299,7 @@ where
             registry_control: DwHandle(0),
             topology: None,
             gate,
+            jobs,
         });
     };
     let (devmgr, result) = match activate_role_until_ready(
@@ -307,6 +324,7 @@ where
             registry.control_channel,
             &mut topology,
             gate,
+            &mut jobs,
         ) {
             Ok(()) => break,
             Err(GateRunError::PreInstall(_error)) => {
@@ -317,6 +335,7 @@ where
                     registry_control: registry.control_channel,
                     topology: Some(topology),
                     gate,
+                    jobs,
                 });
             }
             Err(GateRunError::CleanupFailed(_)) => {
@@ -328,6 +347,7 @@ where
                     registry_control: DwHandle(0),
                     topology: Some(topology),
                     gate,
+                    jobs,
                 });
             }
             Err(GateRunError::InstallCommitted {
@@ -348,6 +368,7 @@ where
                         registry_control: DwHandle(0),
                         topology: Some(topology),
                         gate,
+                        jobs,
                     });
                 }
                 let Some((replacement, _)) = launch_registry_until_ready(
@@ -366,6 +387,7 @@ where
                         registry_control: DwHandle(0),
                         topology: Some(topology),
                         gate,
+                        jobs,
                     });
                 };
                 registry = restart_topology_or_poison(
@@ -385,6 +407,7 @@ where
         registry_control: registry.control_channel,
         topology: Some(topology),
         gate,
+        jobs,
     })
 }
 
@@ -1444,6 +1467,690 @@ fn complete_exchange<S: Wyr1BPlatform>(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn launch_launch_client<S, L, W>(
+    system: &mut S,
+    loader: &mut L,
+    waits: &mut W,
+    authority: LoadAuthority,
+    bootfs: &[u8],
+    topology: &mut RegistryTopology,
+    jobs: &mut JobDispatcher,
+    operation: u64,
+) -> Result<InstalledPeer, InitError>
+where
+    S: Wyr1BPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let archive = Archive::new(bootfs).map_err(InitError::Bootfs)?;
+    let image = archive.lookup(CLIENT_PATH.as_bytes()).map_err(map_lookup)?;
+    if !image.is_executable() || image.data().is_empty() {
+        return Err(InitError::NonExecutableRole);
+    }
+    let grant = topology
+        .issue(operation, EndpointKind::LaunchSession)
+        .map_err(InitError::Wyr1BModel)?;
+    let task_group = system
+        .create_attempt_task_group(authority.task_group)
+        .map_err(InitError::Native)?;
+    let mut channels = match create_controller_channel_pair(system) {
+        Ok((controller, child)) => StagedChannelPair::new(controller, child),
+        Err(error) => {
+            return Err(if system.close_handle(task_group).is_err() {
+                InitError::Cleanup
+            } else {
+                error
+            });
+        }
+    };
+    let child = channels.second()?;
+    let transaction_id = 0x4000_u64
+        .checked_add(grant.endpoint_id)
+        .ok_or(InitError::Accounting)?;
+    let loaded = match load_service_process(
+        loader,
+        LoadAuthority {
+            task_group,
+            ..authority
+        },
+        ServiceLoadRequest {
+            image: image.data(),
+            display_path: CLIENT_PATH,
+            profile: LaunchProfile::LaunchClient,
+            service_channel: child,
+            correlation: None,
+            transaction_id,
+        },
+    ) {
+        Ok(loaded) => loaded,
+        Err(failure) => {
+            if failure.service_channel_consumed {
+                channels.commit_second_move()?;
+            }
+            let failed = !channels.cleanup(system) | system.close_handle(task_group).is_err();
+            return Err(if failed {
+                InitError::Cleanup
+            } else {
+                InitError::Loader(failure.error)
+            });
+        }
+    };
+    channels.commit_second_move()?;
+    let deadline = report_deadline(system)?;
+    if await_child_ready_profile_observed(
+        waits,
+        loaded.process,
+        loaded.launch_channel,
+        LaunchProfile::LaunchClient,
+        transaction_id,
+        deadline,
+    )
+    .is_err()
+    {
+        let failed = cleanup_loaded(system, waits, loaded, task_group, true).is_err()
+            | !channels.cleanup(system);
+        return Err(if failed {
+            InitError::Cleanup
+        } else {
+            InitError::Supervision
+        });
+    }
+    let session = channels.take_first()?;
+    if let Err(error) = jobs.install_session(grant, session) {
+        let failed = system.close_handle(session).is_err()
+            | cleanup_loaded(system, waits, loaded, task_group, true).is_err();
+        return Err(if failed {
+            InitError::Cleanup
+        } else {
+            InitError::Wyr1BModel(error)
+        });
+    }
+    Ok(InstalledPeer {
+        grant,
+        loaded,
+        task_group,
+    })
+}
+
+fn wait_session_readable<S: Wyr1BPlatform>(
+    system: &mut S,
+    session: DwHandle,
+) -> Result<(), InitError> {
+    let deadline = report_deadline(system)?;
+    let result = system
+        .wait_many(
+            core::slice::from_ref(&DwWaitItemV1 {
+                handle: session,
+                signals: deepwyrm_syscall::DwSignals(
+                    DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0,
+                ),
+            }),
+            deadline,
+        )
+        .map_err(InitError::Native)?;
+    if result.index != 0 || result.observed.0 & DW_SIGNAL_READABLE.0 == 0 {
+        return Err(InitError::Supervision);
+    }
+    Ok(())
+}
+
+fn close_received_reverse<S: InitPlatform>(
+    system: &mut S,
+    handles: &[DwReceivedHandleInfoV1],
+    count: usize,
+) -> bool {
+    let mut failed = false;
+    for handle in handles[..count.min(handles.len())].iter().rev() {
+        failed |= system.close_handle(handle.handle).is_err();
+    }
+    failed
+}
+
+fn launch_engine_error(error: LaunchEngineError<NativeError>) -> InitError {
+    match error {
+        LaunchEngineError::Job(error) => InitError::Wyr1BModel(error),
+        LaunchEngineError::Validation {
+            error,
+            abort_failed,
+            cleanup_failed,
+        } => {
+            if abort_failed || cleanup_failed {
+                InitError::Cleanup
+            } else {
+                InitError::Wyr1BModel(error)
+            }
+        }
+        LaunchEngineError::Loader {
+            error,
+            abort_failed,
+            cleanup_failed,
+            ..
+        } => {
+            if abort_failed || cleanup_failed {
+                InitError::Cleanup
+            } else {
+                InitError::Loader(error)
+            }
+        }
+        LaunchEngineError::Publication { error, .. } => InitError::Wyr1BModel(error),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn receive_and_accept_job<S, L, W>(
+    system: &mut S,
+    loader: &mut L,
+    waits: &mut W,
+    authority: LoadAuthority,
+    policy: &PolicyView<'_>,
+    jobs: &mut JobDispatcher,
+    session: DwHandle,
+    grant: EndpointGrant,
+) -> Result<crate::wyr1b::LoadedJob, InitError>
+where
+    S: Wyr1BPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    wait_session_readable(system, session)?;
+    let mut bytes = [0_u8; wyrmroot_launch_proto::MAX_STRING_BYTES + 2048];
+    let mut received = [DwReceivedHandleInfoV1::default(); 16];
+    let counts = system
+        .receive_channel(session, &mut bytes, &mut received)
+        .map_err(InitError::Native)?;
+    if counts.bytes > bytes.len() || counts.handles > received.len() {
+        let failed = close_received_reverse(system, &received, counts.handles);
+        return Err(if failed {
+            InitError::Cleanup
+        } else {
+            InitError::Wyr1BModel(JobError::StreamPolicy)
+        });
+    }
+    for info in &received[..counts.handles] {
+        if let Err(error) = validate_controller_channel(system, info.handle) {
+            let failed = close_received_reverse(system, &received, counts.handles);
+            return Err(if failed { InitError::Cleanup } else { error });
+        }
+    }
+    let parsed = match parse_launch_message(&bytes[..counts.bytes], counts.handles) {
+        Ok(parsed) => parsed,
+        Err(_) => {
+            let failed = close_received_reverse(system, &received, counts.handles);
+            return Err(if failed {
+                InitError::Cleanup
+            } else {
+                InitError::Wyr1BModel(JobError::StreamPolicy)
+            });
+        }
+    };
+    if parsed.reservation.connection_id != grant.endpoint_id
+        || parsed.reservation.generation != grant.endpoint_generation
+    {
+        let failed = close_received_reverse(system, &received, counts.handles);
+        return Err(if failed {
+            InitError::Cleanup
+        } else {
+            InitError::Wyr1BModel(JobError::StaleGeneration)
+        });
+    }
+    let LaunchMessage::Launch(request) = parsed.message else {
+        let failed = close_received_reverse(system, &received, counts.handles);
+        return Err(if failed {
+            InitError::Cleanup
+        } else {
+            InitError::Wyr1BModel(JobError::WrongState)
+        });
+    };
+    let streams = [received[0].handle, received[1].handle, received[2].handle];
+    let streams = &streams[..counts.handles];
+    let task_group = match system.create_attempt_task_group(authority.task_group) {
+        Ok(task_group) => task_group,
+        Err(error) => {
+            return Err(
+                if close_received_reverse(system, &received, counts.handles) {
+                    InitError::Cleanup
+                } else {
+                    InitError::Native(error)
+                },
+            );
+        }
+    };
+    let prepared = match prepare_authorized_job(
+        &mut jobs.jobs,
+        policy,
+        loader,
+        authority,
+        task_group.0,
+        parsed.reservation,
+        request,
+        streams,
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let mapped = launch_engine_error(error);
+            return Err(if system.close_handle(task_group).is_err() {
+                InitError::Cleanup
+            } else {
+                mapped
+            });
+        }
+    };
+    let observation = observe_prepared_ready(waits, &prepared, report_deadline(system)?);
+    if observation.is_err() {
+        let abort_failed = abort_prepared_job(&mut jobs.jobs, prepared).is_err();
+        let cleanup_failed = cleanup_loaded(
+            system,
+            waits,
+            prepared.loaded,
+            DwHandle(prepared.task_group),
+            true,
+        )
+        .is_err();
+        return Err(if abort_failed || cleanup_failed {
+            InitError::Cleanup
+        } else {
+            InitError::Supervision
+        });
+    }
+    let observation = observation.expect("checked exact READY observation");
+    let loaded = commit_prepared_job(&mut jobs.jobs, prepared, observation)
+        .map_err(InitError::Wyr1BModel)?;
+    let mut response = [0_u8; 88];
+    let size = encode_job_message(
+        parsed.reservation,
+        LaunchMessageType::LaunchAccepted,
+        loaded.job_id,
+        &mut response,
+    )
+    .map_err(|_| InitError::Accounting)?;
+    system
+        .send_channel(session, &response[..size])
+        .map_err(InitError::Native)?;
+    Ok(loaded)
+}
+
+fn classify_termination(
+    info: &DwTaskTerminationInfoV1,
+) -> Result<TerminationClassification, InitError> {
+    Ok(if info.reason == DW_TERMINATION_NORMAL_EXIT {
+        TerminationClassification::NormalExit
+    } else if info.reason == DW_TERMINATION_AUTHORIZED {
+        TerminationClassification::Authorized
+    } else if info.reason == DW_TERMINATION_UNHANDLED_EXCEPTION {
+        TerminationClassification::UnhandledException
+    } else if info.reason == DW_TERMINATION_RESOURCE_POLICY {
+        TerminationClassification::ResourcePolicy
+    } else if info.reason == DW_TERMINATION_TASK_GROUP_TEARDOWN {
+        TerminationClassification::TaskGroupTeardown
+    } else {
+        return Err(InitError::Supervision);
+    })
+}
+
+fn reap_job<S, W>(
+    system: &mut S,
+    waits: &mut W,
+    jobs: &mut JobDispatcher,
+    loaded: crate::wyr1b::LoadedJob,
+) -> Result<TerminationResult, InitError>
+where
+    S: Wyr1BPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let mut info = waits.query_task_termination(loaded.loaded.process);
+    if !matches!(&info, Ok(info) if info.state == DW_TASK_STATE_EXITED) {
+        waits
+            .wait_many(
+                core::slice::from_ref(&DwWaitItemV1 {
+                    handle: loaded.loaded.process,
+                    signals: DW_SIGNAL_EXITED,
+                }),
+                report_deadline(system)?,
+            )
+            .map_err(|_| InitError::Supervision)?;
+        info = waits.query_task_termination(loaded.loaded.process);
+    }
+    let info = info.map_err(|_| InitError::Supervision)?;
+    if info.state != DW_TASK_STATE_EXITED {
+        return Err(InitError::Supervision);
+    }
+    let mut cleanup_result = 0_u32;
+    if system.close_handle(loaded.loaded.launch_channel).is_err() {
+        cleanup_result |= 1 << 2;
+    }
+    if system.close_handle(loaded.loaded.process).is_err() {
+        cleanup_result |= 1 << 3;
+    }
+    if system.close_handle(DwHandle(loaded.task_group)).is_err() {
+        cleanup_result |= 1 << 4;
+    }
+    let result = TerminationResult {
+        classification: classify_termination(&info)?,
+        application_code: info.application_code,
+        exception_class: info.exception_type.0,
+        exception_detail: info.detail,
+        exception_address: info.fault_address,
+        cleanup_result,
+    };
+    jobs.jobs
+        .complete(
+            loaded.job_id,
+            loaded.loaded.process.0,
+            loaded.task_group,
+            loaded.loaded.launch_channel.0,
+            ControllerJobResult {
+                classification: result.classification.as_u32(),
+                application_code: result.application_code,
+                exception_class: result.exception_class,
+                exception_detail: result.exception_detail,
+                exception_address: result.exception_address,
+                cleanup_result,
+            },
+        )
+        .map_err(InitError::Wyr1BModel)?;
+    jobs.jobs.reclaim_closed_sessions();
+    Ok(result)
+}
+
+fn receive_job_operation<S: Wyr1BPlatform>(
+    system: &mut S,
+    session: DwHandle,
+) -> Result<(LaunchReservation, LaunchMessage<'static>), InitError> {
+    wait_session_readable(system, session)?;
+    let mut bytes = [0_u8; 320];
+    let mut handles = [DwReceivedHandleInfoV1::default(); 16];
+    let counts = system
+        .receive_channel(session, &mut bytes, &mut handles)
+        .map_err(InitError::Native)?;
+    if counts.bytes > bytes.len() || counts.handles != 0 {
+        let failed = close_received_reverse(system, &handles, counts.handles);
+        return Err(if failed {
+            InitError::Cleanup
+        } else {
+            InitError::Wyr1BModel(JobError::WrongState)
+        });
+    }
+    let parsed = parse_launch_message(&bytes[..counts.bytes], 0)
+        .map_err(|_| InitError::Wyr1BModel(JobError::WrongState))?;
+    let message = match parsed.message {
+        LaunchMessage::Wait { job_id } => LaunchMessage::Wait { job_id },
+        LaunchMessage::Query { job_id } => LaunchMessage::Query { job_id },
+        _ => return Err(InitError::Wyr1BModel(JobError::WrongState)),
+    };
+    Ok((parsed.reservation, message))
+}
+
+fn close_launch_client<S, W>(
+    system: &mut S,
+    waits: &mut W,
+    jobs: &mut JobDispatcher,
+    peer: InstalledPeer,
+) -> Result<(), InitError>
+where
+    S: Wyr1BPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let session = jobs
+        .session_handle(peer.grant)
+        .map_err(InitError::Wyr1BModel)?;
+    let deadline = report_deadline(system)?;
+    let result = system
+        .wait_many(
+            core::slice::from_ref(&DwWaitItemV1 {
+                handle: session,
+                signals: DW_SIGNAL_PEER_CLOSED,
+            }),
+            deadline,
+        )
+        .map_err(InitError::Native)?;
+    if result.observed.0 & DW_SIGNAL_PEER_CLOSED.0 == 0 {
+        return Err(InitError::Supervision);
+    }
+    let session = jobs
+        .disconnect_session(peer.grant)
+        .map_err(InitError::Wyr1BModel)?;
+    let failed = system.close_handle(session).is_err()
+        | cleanup_loaded(system, waits, peer.loaded, peer.task_group, false).is_err();
+    if failed {
+        Err(InitError::Cleanup)
+    } else {
+        Ok(())
+    }
+}
+
+fn launch_gate_record(
+    message_type: GateMessageType,
+    gate: GateConfig,
+    actor: EndpointGrant,
+    object_id: u64,
+    object_generation: u64,
+    operation_id: u64,
+) -> GateRecord {
+    GateRecord {
+        message_type,
+        nonce: gate.nonce,
+        registry_generation: actor.registry_generation,
+        actor_id: actor.endpoint_id,
+        actor_generation: actor.endpoint_generation,
+        object_id,
+        object_generation,
+        operation_id,
+        value: 0,
+    }
+}
+
+fn expect_launch_report<S: Wyr1BPlatform>(
+    system: &mut S,
+    peer: InstalledPeer,
+    expected: GateRecord,
+) -> Result<(), InitError> {
+    let deadline = report_deadline(system)?;
+    let actual = receive_gate(system, peer.loaded.launch_channel, deadline)?;
+    expect_gate(actual, expected)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_job_gate<S, L, W>(
+    system: &mut S,
+    loader: &mut L,
+    waits: &mut W,
+    authority: LoadAuthority,
+    bootfs: &[u8],
+    topology: &mut RegistryTopology,
+    gate: GateConfig,
+    jobs: &mut JobDispatcher,
+) -> Result<(), InitError>
+where
+    S: Wyr1BPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let archive = Archive::new(bootfs).map_err(InitError::Bootfs)?;
+    let manifest = archive
+        .lookup(MANIFEST_PATH.as_bytes())
+        .map_err(map_lookup)?;
+    let boot_generation: [u8; 32] = manifest
+        .data()
+        .get(48..80)
+        .ok_or(InitError::Accounting)?
+        .try_into()
+        .map_err(|_| InitError::Accounting)?;
+    let policy =
+        PolicyView::from_bootfs(archive, boot_generation).map_err(InitError::Wyr1BModel)?;
+
+    let owner = launch_launch_client(system, loader, waits, authority, bootfs, topology, jobs, 3)?;
+    let (_, owner_session) = jobs.next_session().ok_or(InitError::Accounting)?;
+    let owner_config = launch_gate_record(
+        GateMessageType::ConfigureLaunchOwner,
+        gate,
+        owner.grant,
+        0,
+        0,
+        3,
+    );
+    send_gate(system, owner.loaded.launch_channel, owner_config)?;
+    let owner_job = receive_and_accept_job(
+        system,
+        loader,
+        waits,
+        authority,
+        &policy,
+        jobs,
+        owner_session,
+        owner.grant,
+    )?;
+    expect_launch_report(
+        system,
+        owner,
+        launch_gate_record(
+            GateMessageType::JobAccepted,
+            gate,
+            owner.grant,
+            owner_job.job_id,
+            owner.grant.endpoint_generation,
+            3,
+        ),
+    )?;
+    let (wait_reservation, wait) = receive_job_operation(system, owner_session)?;
+    let LaunchMessage::Wait { job_id } = wait else {
+        return Err(InitError::Wyr1BModel(JobError::WrongState));
+    };
+    if job_id != owner_job.job_id {
+        return Err(InitError::Wyr1BModel(JobError::ResourceIdentity));
+    }
+    let terminal = reap_job(system, waits, jobs, owner_job)?;
+    let controller_result = jobs
+        .jobs
+        .result(wait_reservation, job_id)
+        .map_err(InitError::Wyr1BModel)?;
+    if controller_result.classification != terminal.classification.as_u32()
+        || controller_result.application_code != terminal.application_code
+        || controller_result.exception_class != terminal.exception_class
+        || controller_result.exception_detail != terminal.exception_detail
+        || controller_result.exception_address != terminal.exception_address
+        || controller_result.cleanup_result != terminal.cleanup_result
+    {
+        return Err(InitError::Accounting);
+    }
+    let mut response = [0_u8; 88];
+    let size = encode_job_result(wait_reservation, job_id, terminal, &mut response)
+        .map_err(|_| InitError::Accounting)?;
+    system
+        .send_channel(owner_session, &response[..size])
+        .map_err(InitError::Native)?;
+    expect_launch_report(
+        system,
+        owner,
+        launch_gate_record(
+            GateMessageType::JobResult,
+            gate,
+            owner.grant,
+            job_id,
+            owner.grant.endpoint_generation,
+            3,
+        ),
+    )?;
+    close_launch_client(system, waits, jobs, owner)?;
+
+    let foreign =
+        launch_launch_client(system, loader, waits, authority, bootfs, topology, jobs, 4)?;
+    let (_, foreign_session) = jobs.next_session().ok_or(InitError::Accounting)?;
+    let foreign_config = launch_gate_record(
+        GateMessageType::ConfigureLaunchForeign,
+        gate,
+        foreign.grant,
+        owner.grant.endpoint_id,
+        owner.grant.endpoint_generation,
+        4,
+    );
+    send_gate(system, foreign.loaded.launch_channel, foreign_config)?;
+    let probe = launch_gate_record(
+        GateMessageType::ProbeForeign,
+        gate,
+        foreign.grant,
+        job_id,
+        owner.grant.endpoint_generation,
+        4,
+    );
+    send_gate(system, foreign.loaded.launch_channel, probe)?;
+    let (query_reservation, query) = receive_job_operation(system, foreign_session)?;
+    let LaunchMessage::Query { job_id: probed } = query else {
+        return Err(InitError::Wyr1BModel(JobError::WrongState));
+    };
+    if probed != job_id
+        || !matches!(
+            jobs.jobs.query(query_reservation, probed),
+            Err(JobError::ForeignJob | JobError::UnknownJob)
+        )
+    {
+        return Err(InitError::Wyr1BModel(JobError::ResourceIdentity));
+    }
+    let size = encode_launch_error(
+        query_reservation,
+        LaunchErrorCode::ForeignOrUnknownJob,
+        &mut response,
+    )
+    .map_err(|_| InitError::Accounting)?;
+    system
+        .send_channel(foreign_session, &response[..size])
+        .map_err(InitError::Native)?;
+    expect_launch_report(
+        system,
+        foreign,
+        launch_gate_record(
+            GateMessageType::ForeignRejected,
+            gate,
+            foreign.grant,
+            job_id,
+            owner.grant.endpoint_generation,
+            4,
+        ),
+    )?;
+    close_launch_client(system, waits, jobs, foreign)?;
+
+    let orphan = launch_launch_client(system, loader, waits, authority, bootfs, topology, jobs, 5)?;
+    let (_, orphan_session) = jobs.next_session().ok_or(InitError::Accounting)?;
+    let orphan_config = launch_gate_record(
+        GateMessageType::ConfigureLaunchOwner,
+        gate,
+        orphan.grant,
+        0,
+        0,
+        5,
+    );
+    send_gate(system, orphan.loaded.launch_channel, orphan_config)?;
+    let orphan_job = receive_and_accept_job(
+        system,
+        loader,
+        waits,
+        authority,
+        &policy,
+        jobs,
+        orphan_session,
+        orphan.grant,
+    )?;
+    expect_launch_report(
+        system,
+        orphan,
+        launch_gate_record(
+            GateMessageType::OrphanDisconnecting,
+            gate,
+            orphan.grant,
+            orphan_job.job_id,
+            orphan.grant.endpoint_generation,
+            5,
+        ),
+    )?;
+    close_launch_client(system, waits, jobs, orphan)?;
+    let _ = reap_job(system, waits, jobs, orphan_job)?;
+    jobs.jobs.reclaim_closed_sessions();
+    if jobs.session_count() != 0 || jobs.jobs.live_jobs() != 0 || jobs.jobs.orphan_jobs() != 0 {
+        return Err(InitError::Accounting);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_registry_gate<S, L, W>(
     system: &mut S,
     loader: &mut L,
@@ -1453,6 +2160,7 @@ fn run_registry_gate<S, L, W>(
     registry_control: DwHandle,
     topology: &mut RegistryTopology,
     gate: GateConfig,
+    jobs: &mut JobDispatcher,
 ) -> Result<(), GateRunError>
 where
     S: Wyr1BPlatform,
@@ -1571,6 +2279,9 @@ where
             client_peer.task_group,
             false,
         )?;
+        run_job_gate(
+            system, loader, waits, authority, bootfs, topology, gate, jobs,
+        )?;
         Ok(())
     })();
     if let Err(error) = outcome {
@@ -1600,6 +2311,7 @@ fn launch_registry_replacement_with_gate<S, L, W>(
     bootfs: &[u8],
     topology: &mut RegistryTopology,
     gate: GateConfig,
+    jobs: &mut JobDispatcher,
 ) -> Result<Option<(RegistryNativeAttempt, bool)>, InitError>
 where
     S: Wyr1BPlatform,
@@ -1622,6 +2334,7 @@ where
             registry.control_channel,
             topology,
             gate,
+            jobs,
         ) {
             Ok(()) => return Ok(Some((registry, true))),
             Err(GateRunError::PreInstall(_)) => return Ok(Some((registry, false))),
@@ -1826,6 +2539,7 @@ where
                                 .as_mut()
                                 .ok_or(InitError::WrongActivationOrder)?,
                             state.gate,
+                            &mut state.jobs,
                         )
                     },
                 )
@@ -2765,9 +3479,10 @@ mod tests {
     }
 
     #[test]
-    fn selector_27_controller_does_not_embed_wrlj_dispatch() {
+    fn selector_27_controller_owns_the_native_wrlj_dispatch() {
         let source = include_str!("wyr1b_native.rs");
+        assert!(source.contains(concat!("run_", "job_gate")));
+        assert!(source.contains(concat!("parse_launch_", "message")));
         assert!(!source.contains(concat!("launch_", "authorized_job")));
-        assert!(!source.contains(concat!("wyrmroot_launch_", "proto")));
     }
 }

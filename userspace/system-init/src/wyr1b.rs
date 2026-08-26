@@ -12,7 +12,9 @@ use wyrmroot_loader::{
     },
 };
 use wyrmroot_registry_proto::{Correlation, CorrelationEnvironment};
-use wyrmroot_runtime::sha256;
+use wyrmroot_runtime::{
+    ObservedSupervisionError, SupervisionPlatform, await_child_ready_profile_observed, sha256,
+};
 
 const MAX_CONNECTIONS: usize = 16;
 const REPLAY_RECORDS: usize = 32;
@@ -315,19 +317,41 @@ pub(crate) struct ExactReadyObservation {
     launch_channel: deepwyrm_syscall::DwHandle,
 }
 
-#[allow(dead_code)] // Used by the resident native dispatcher below this checkpoint.
-pub(crate) const fn exact_ready_observation(
-    profile: LaunchProfile,
-    transaction_id: u64,
-    process: deepwyrm_syscall::DwHandle,
-    launch_channel: deepwyrm_syscall::DwHandle,
-) -> ExactReadyObservation {
-    ExactReadyObservation {
-        profile,
-        transaction_id,
-        process,
-        launch_channel,
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum ReadyObservationError<E> {
+    Ready(ObservedSupervisionError<E>),
+    TerminalQuery(E),
+    ReadyAndExited(deepwyrm_syscall::DwTaskTerminationInfoV1),
+}
+
+/// Constructs the publication proof only after parsing this child's exact
+/// READY and performing a fresh Process termination query.
+pub(crate) fn observe_prepared_ready<W: SupervisionPlatform>(
+    waits: &mut W,
+    prepared: &PreparedJob,
+    deadline: deepwyrm_syscall::DwDeadline,
+) -> Result<ExactReadyObservation, ReadyObservationError<W::Error>> {
+    await_child_ready_profile_observed(
+        waits,
+        prepared.loaded.process,
+        prepared.loaded.launch_channel,
+        prepared.profile,
+        prepared.transaction_id,
+        deadline,
+    )
+    .map_err(ReadyObservationError::Ready)?;
+    let terminal = waits
+        .query_task_termination(prepared.loaded.process)
+        .map_err(ReadyObservationError::TerminalQuery)?;
+    if terminal.state == deepwyrm_syscall::DW_TASK_STATE_EXITED {
+        return Err(ReadyObservationError::ReadyAndExited(terminal));
     }
+    Ok(ExactReadyObservation {
+        profile: prepared.profile,
+        transaction_id: prepared.transaction_id,
+        process: prepared.loaded.process,
+        launch_channel: prepared.loaded.launch_channel,
+    })
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -864,6 +888,19 @@ fn identity(id: u64, generation: u64) -> Result<ConnectionIdentity, JobError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn ready_token(
+        profile: LaunchProfile,
+        transaction_id: u64,
+        process: deepwyrm_syscall::DwHandle,
+        launch_channel: deepwyrm_syscall::DwHandle,
+    ) -> ExactReadyObservation {
+        ExactReadyObservation {
+            profile,
+            transaction_id,
+            process,
+            launch_channel,
+        }
+    }
     fn reservation(id: u64, generation: u64, transaction_id: u64) -> Reservation {
         Reservation {
             connection_id: id,
@@ -997,7 +1034,7 @@ mod tests {
         let committed = commit_prepared_job(
             &mut jobs,
             prepared,
-            exact_ready_observation(
+            ready_token(
                 LaunchProfile::JobV2,
                 1,
                 prepared.loaded.process,
@@ -1028,25 +1065,25 @@ mod tests {
             task_group: 32,
         };
         for wrong in [
-            exact_ready_observation(
+            ready_token(
                 LaunchProfile::JobV2,
                 7,
                 prepared.loaded.process,
                 prepared.loaded.launch_channel,
             ),
-            exact_ready_observation(
+            ready_token(
                 prepared.profile,
                 8,
                 prepared.loaded.process,
                 prepared.loaded.launch_channel,
             ),
-            exact_ready_observation(
+            ready_token(
                 prepared.profile,
                 7,
                 deepwyrm_syscall::DwHandle(33),
                 prepared.loaded.launch_channel,
             ),
-            exact_ready_observation(
+            ready_token(
                 prepared.profile,
                 7,
                 prepared.loaded.process,
@@ -1059,6 +1096,79 @@ mod tests {
             );
         }
         assert_eq!(jobs.live_jobs(), 1);
+        abort_prepared_job(&mut jobs, prepared).unwrap();
+    }
+
+    struct ReadyAndExited;
+
+    impl SupervisionPlatform for ReadyAndExited {
+        type Error = ();
+
+        fn wait_many(
+            &mut self,
+            _items: &[deepwyrm_syscall::DwWaitItemV1],
+            _deadline: deepwyrm_syscall::DwDeadline,
+        ) -> Result<deepwyrm_syscall::DwWaitResultV1, Self::Error> {
+            Ok(deepwyrm_syscall::DwWaitResultV1 {
+                index: 0,
+                observed: deepwyrm_syscall::DW_SIGNAL_READABLE,
+                ..deepwyrm_syscall::DwWaitResultV1::default()
+            })
+        }
+
+        fn receive_channel(
+            &mut self,
+            _channel: deepwyrm_syscall::DwHandle,
+            bytes: &mut [u8],
+            _handles: &mut [deepwyrm_syscall::DwReceivedHandleInfoV1],
+        ) -> Result<wyrmroot_runtime::ReceiveCounts, Self::Error> {
+            let size =
+                wyrmroot_loader::launch::encode_ready_for_profile(LaunchProfile::JobV2, 7, bytes)
+                    .unwrap();
+            Ok(wyrmroot_runtime::ReceiveCounts {
+                bytes: size,
+                handles: 0,
+            })
+        }
+
+        fn query_task_termination(
+            &mut self,
+            _process: deepwyrm_syscall::DwHandle,
+        ) -> Result<deepwyrm_syscall::DwTaskTerminationInfoV1, Self::Error> {
+            Ok(deepwyrm_syscall::DwTaskTerminationInfoV1 {
+                state: deepwyrm_syscall::DW_TASK_STATE_EXITED,
+                reason: deepwyrm_syscall::DW_TERMINATION_NORMAL_EXIT,
+                ..deepwyrm_syscall::DwTaskTerminationInfoV1::default()
+            })
+        }
+    }
+
+    #[test]
+    fn combined_ready_and_exit_never_constructs_publication_proof() {
+        let mut jobs = JobController::new();
+        jobs.open_connection(1, 1).unwrap();
+        let prepared = PreparedJob {
+            ticket: jobs.begin_launch(reservation(1, 1, 7)).unwrap(),
+            profile: LaunchProfile::JobV2,
+            transaction_id: 7,
+            loaded: LoadedProcess {
+                process: deepwyrm_syscall::DwHandle(30),
+                launch_channel: deepwyrm_syscall::DwHandle(31),
+            },
+            task_group: 32,
+        };
+        let observed = observe_prepared_ready(
+            &mut ReadyAndExited,
+            &prepared,
+            deepwyrm_syscall::DwDeadline(100),
+        );
+        assert!(matches!(
+            observed,
+            Err(ReadyObservationError::ReadyAndExited(info))
+                if info.state == deepwyrm_syscall::DW_TASK_STATE_EXITED
+        ));
+        let mut listed = [0; MAX_LIVE_JOBS];
+        assert_eq!(jobs.list(reservation(1, 1, 8), &mut listed), Ok(0));
         abort_prepared_job(&mut jobs, prepared).unwrap();
     }
 

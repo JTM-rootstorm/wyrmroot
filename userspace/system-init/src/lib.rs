@@ -10,6 +10,7 @@ pub mod evidence;
 pub mod gate;
 pub mod wyr1b;
 pub mod wyr1b_gate;
+mod wyr1b_job;
 pub mod wyr1b_native;
 
 use crate::evidence::{EvidenceError, EvidenceEvent, EvidenceLog};
@@ -1273,6 +1274,9 @@ where
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
+    // The no-alloc primordial boundary keeps both fixed-capacity activation
+    // states inline; selector choice consumes the larger state exactly once.
+    #[allow(clippy::large_enum_variant)]
     enum ProductActivation {
         Wyr1A(ActivationState),
         Wyr1B(wyr1b_native::Activation),
@@ -1329,6 +1333,7 @@ where
                 registry_control: activation.registry_control,
                 topology: activation.topology,
                 gate: activation.gate,
+                jobs: activation.jobs,
             }),
         },
     })
