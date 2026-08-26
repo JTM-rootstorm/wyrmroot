@@ -52,8 +52,10 @@ product. It refuses pre-existing Wyrmroot outputs. Source-build receipt schema
 2 binds the clean source revision, Cargo lock, accepted toolchain identities,
 generated Deep layout and policy hashes, normalized effective UEFI
 configuration digest, inspector and inspection-report hashes, exact separate
-release commands/profile, retained-debug EFI/PDB hashes, and all six production
-output hashes. The two DW1-B native payloads use the canonical native linker
+release commands/profile, and all six production output hashes. The retained
+debug EFI/PDB pair is freshly built and inspector-validated at every freeze and
+rebuild, but its build-local identity is not production evidence. The two
+DW1-B native payloads use the canonical native linker
 script; all native artifacts have numeric ELF OSABI 0 and ABI version 0. The
 request also binds SHA-256 identities for loader, kernel, symbols, bootstrap,
 all four payloads, provenance, OVMF code and OVMF variables, the deterministic

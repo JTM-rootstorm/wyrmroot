@@ -108,8 +108,6 @@ const WYR_BUILD_RECEIPT_KEYS: &[&str] = &[
     "hog_command",
     "progress_command",
     "loader_sha256",
-    "debug_loader_sha256",
-    "debug_symbols_sha256",
     "bootstrap_sha256",
     "init_sha256",
     "hello_sha256",
@@ -1192,8 +1190,6 @@ fn build_wyr_artifact_set(
         &layout,
         &uefi,
         [&loader, &bootstrap, &init, &hello, &hog, &progress],
-        &debug_loader,
-        &debug_symbols,
         &toolchain.validation_report_sha256(),
     )?;
     Ok(WyrArtifactSet {
@@ -1246,8 +1242,6 @@ fn render_wyr_build_receipt(
     layout: &crate::deep_layout::DeepLayoutBuild,
     uefi: &crate::tasks::DeterministicUefiArtifacts,
     artifacts: [&[u8]; 6],
-    debug_loader: &[u8],
-    debug_symbols: &[u8],
     toolchain_validation_report_sha256: &str,
 ) -> Result<String, Failure> {
     let repository = crate::tasks::repository_root()?;
@@ -1259,7 +1253,7 @@ fn render_wyr_build_receipt(
         sha256::file_digest(&repository.join("toolchain/inspect-uefi-artifact.sh"))
             .map_err(|error| Failure::task(format!("could not hash UEFI inspector: {error}")))?;
     Ok(format!(
-        "kind = \"{WYR_BUILD_KIND}\"\nschema_version = 2\nwyrmroot_revision = \"{}\"\nrust_revision = \"{ACCEPTED_RUST_REVISION}\"\nrustc_sha256 = \"{}\"\ncargo_sha256 = \"{}\"\nrust_lld_sha256 = \"{}\"\ntoolchain_manifest_sha256 = \"{}\"\ntoolchain_tree_sha256 = \"{}\"\ncargo_lock_sha256 = \"{}\"\nprofile = \"release-separate-invocations\"\ndeep_layout_sha256 = \"{}\"\ngenerated_layout_policy_sha256 = \"{}\"\nuefi_effective_config_sha256 = \"{}\"\nuefi_inspector_sha256 = \"{}\"\nuefi_inspection_report_sha256 = \"{}\"\ntoolchain_validation_report_sha256 = \"{}\"\nloader_command = \"{LOADER_COMMAND}\"\nbootstrap_command = \"{BOOTSTRAP_COMMAND}\"\ninit_command = \"{INIT_COMMAND}\"\nhello_command = \"{HELLO_COMMAND}\"\nhog_command = \"{HOG_COMMAND}\"\nprogress_command = \"{PROGRESS_COMMAND}\"\nloader_sha256 = \"{}\"\ndebug_loader_sha256 = \"{}\"\ndebug_symbols_sha256 = \"{}\"\nbootstrap_sha256 = \"{}\"\ninit_sha256 = \"{}\"\nhello_sha256 = \"{}\"\ncpu_hog_sha256 = \"{}\"\nprogress_sha256 = \"{}\"\n",
+        "kind = \"{WYR_BUILD_KIND}\"\nschema_version = 2\nwyrmroot_revision = \"{}\"\nrust_revision = \"{ACCEPTED_RUST_REVISION}\"\nrustc_sha256 = \"{}\"\ncargo_sha256 = \"{}\"\nrust_lld_sha256 = \"{}\"\ntoolchain_manifest_sha256 = \"{}\"\ntoolchain_tree_sha256 = \"{}\"\ncargo_lock_sha256 = \"{}\"\nprofile = \"release-separate-invocations\"\ndeep_layout_sha256 = \"{}\"\ngenerated_layout_policy_sha256 = \"{}\"\nuefi_effective_config_sha256 = \"{}\"\nuefi_inspector_sha256 = \"{}\"\nuefi_inspection_report_sha256 = \"{}\"\ntoolchain_validation_report_sha256 = \"{}\"\nloader_command = \"{LOADER_COMMAND}\"\nbootstrap_command = \"{BOOTSTRAP_COMMAND}\"\ninit_command = \"{INIT_COMMAND}\"\nhello_command = \"{HELLO_COMMAND}\"\nhog_command = \"{HOG_COMMAND}\"\nprogress_command = \"{PROGRESS_COMMAND}\"\nloader_sha256 = \"{}\"\nbootstrap_sha256 = \"{}\"\ninit_sha256 = \"{}\"\nhello_sha256 = \"{}\"\ncpu_hog_sha256 = \"{}\"\nprogress_sha256 = \"{}\"\n",
         source_revision,
         rustc_sha256,
         toolchain.cargo_sha256,
@@ -1274,8 +1268,6 @@ fn render_wyr_build_receipt(
         uefi.inspection_report_sha256,
         toolchain_validation_report_sha256,
         sha256::bytes_digest(artifacts[0]),
-        sha256::bytes_digest(debug_loader),
-        sha256::bytes_digest(debug_symbols),
         sha256::bytes_digest(artifacts[1]),
         sha256::bytes_digest(artifacts[2]),
         sha256::bytes_digest(artifacts[3]),
@@ -1345,8 +1337,6 @@ fn verify_wyr_build_receipt(
         "uefi_inspector_sha256",
         "uefi_inspection_report_sha256",
         "toolchain_validation_report_sha256",
-        "debug_loader_sha256",
-        "debug_symbols_sha256",
     ] {
         require_sha256(required(&values, key)?, key)?;
     }
@@ -2811,7 +2801,7 @@ mod tests {
         let cargo_lock = sha256::file_digest(&repository.join("Cargo.lock")).unwrap();
         let metadata = sha256::bytes_digest(b"fixture metadata");
         format!(
-            "kind = \"{WYR_BUILD_KIND}\"\nschema_version = 2\nwyrmroot_revision = \"{}\"\nrust_revision = \"{ACCEPTED_RUST_REVISION}\"\nrustc_sha256 = \"{ACCEPTED_RUSTC_SHA256}\"\ncargo_sha256 = \"{ACCEPTED_CARGO_SHA256}\"\nrust_lld_sha256 = \"{ACCEPTED_RUST_LLD_SHA256}\"\ntoolchain_manifest_sha256 = \"{ACCEPTED_TOOLCHAIN_MANIFEST_SHA256}\"\ntoolchain_tree_sha256 = \"{ACCEPTED_TOOLCHAIN_TREE_SHA256}\"\ncargo_lock_sha256 = \"{cargo_lock}\"\nprofile = \"release-separate-invocations\"\ndeep_layout_sha256 = \"{metadata}\"\ngenerated_layout_policy_sha256 = \"{metadata}\"\nuefi_effective_config_sha256 = \"{metadata}\"\nuefi_inspector_sha256 = \"{metadata}\"\nuefi_inspection_report_sha256 = \"{metadata}\"\ntoolchain_validation_report_sha256 = \"{metadata}\"\nloader_command = \"{LOADER_COMMAND}\"\nbootstrap_command = \"{BOOTSTRAP_COMMAND}\"\ninit_command = \"{INIT_COMMAND}\"\nhello_command = \"{HELLO_COMMAND}\"\nhog_command = \"{HOG_COMMAND}\"\nprogress_command = \"{PROGRESS_COMMAND}\"\nloader_sha256 = \"{}\"\ndebug_loader_sha256 = \"{metadata}\"\ndebug_symbols_sha256 = \"{metadata}\"\nbootstrap_sha256 = \"{}\"\ninit_sha256 = \"{}\"\nhello_sha256 = \"{}\"\ncpu_hog_sha256 = \"{}\"\nprogress_sha256 = \"{}\"\n",
+            "kind = \"{WYR_BUILD_KIND}\"\nschema_version = 2\nwyrmroot_revision = \"{}\"\nrust_revision = \"{ACCEPTED_RUST_REVISION}\"\nrustc_sha256 = \"{ACCEPTED_RUSTC_SHA256}\"\ncargo_sha256 = \"{ACCEPTED_CARGO_SHA256}\"\nrust_lld_sha256 = \"{ACCEPTED_RUST_LLD_SHA256}\"\ntoolchain_manifest_sha256 = \"{ACCEPTED_TOOLCHAIN_MANIFEST_SHA256}\"\ntoolchain_tree_sha256 = \"{ACCEPTED_TOOLCHAIN_TREE_SHA256}\"\ncargo_lock_sha256 = \"{cargo_lock}\"\nprofile = \"release-separate-invocations\"\ndeep_layout_sha256 = \"{metadata}\"\ngenerated_layout_policy_sha256 = \"{metadata}\"\nuefi_effective_config_sha256 = \"{metadata}\"\nuefi_inspector_sha256 = \"{metadata}\"\nuefi_inspection_report_sha256 = \"{metadata}\"\ntoolchain_validation_report_sha256 = \"{metadata}\"\nloader_command = \"{LOADER_COMMAND}\"\nbootstrap_command = \"{BOOTSTRAP_COMMAND}\"\ninit_command = \"{INIT_COMMAND}\"\nhello_command = \"{HELLO_COMMAND}\"\nhog_command = \"{HOG_COMMAND}\"\nprogress_command = \"{PROGRESS_COMMAND}\"\nloader_sha256 = \"{}\"\nbootstrap_sha256 = \"{}\"\ninit_sha256 = \"{}\"\nhello_sha256 = \"{}\"\ncpu_hog_sha256 = \"{}\"\nprogress_sha256 = \"{}\"\n",
             request.wyrmroot_revision,
             sha256::bytes_digest(artifacts[0]),
             sha256::bytes_digest(artifacts[1]),
