@@ -8,8 +8,8 @@ use wyrmroot_rrc_manifest::{
 use wyrmroot_runtime::{AttemptFailure, RestartState, TerminalDisposition};
 use wyrmroot_system_init::{
     AttemptResources, InitError, REAP_CLASS_AUTHORIZED_TERMINATION, REAP_CLASS_NORMAL_EXIT,
-    REAP_CLASS_TASK_GROUP_TEARDOWN, REAP_CLASS_UNHANDLED_EXCEPTION, SystemInit, SystemMode,
-    observe_ready, reap_evidence_value,
+    REAP_CLASS_TASK_GROUP_TEARDOWN, REAP_CLASS_UNHANDLED_EXCEPTION, RecoveryResult, SystemInit,
+    SystemMode, observe_ready, reap_evidence_value,
 };
 
 const BOOT: [u8; 32] = [0x42; 32];
@@ -144,14 +144,7 @@ fn exact_registry_then_devmgr_ready_reaches_normal_without_activating_retained_r
     init.begin_registry(0, 1, 10).unwrap();
     start_role(&mut init, RoleId::Registryd, 1, 10, 0);
     init.ready(RoleId::Registryd, 1, 10, 2).unwrap();
-    assert!(matches!(
-        init.role_state(RoleId::Devmgr),
-        Some(RestartState::Starting {
-            generation: 1,
-            transaction_id: 11,
-            ..
-        })
-    ));
+    assert_eq!(init.role_state(RoleId::Devmgr), Some(RestartState::Stopped));
     assert_eq!(init.role_state(RoleId::Uart16550d), None);
     assert_eq!(
         init.reserve_attempt(RoleId::Wyrmsh, 1, 1),
@@ -166,9 +159,82 @@ fn exact_registry_then_devmgr_ready_reaches_normal_without_activating_retained_r
     )
     .unwrap();
     init.cleanup_complete(RoleId::Registryd, 1, 10, 4).unwrap();
-    start_role(&mut init, RoleId::Devmgr, 1, 11, 2);
+    assert_eq!(
+        init.begin_devmgr_after_registry(3, 1, 10),
+        Err(InitError::WrongActivationOrder)
+    );
+    assert_eq!(
+        init.begin_devmgr_after_registry(4, 2, 10),
+        Err(InitError::WrongActivationOrder)
+    );
+    init.begin_devmgr_after_registry(4, 1, 10).unwrap();
+    assert!(matches!(
+        init.role_state(RoleId::Devmgr),
+        Some(RestartState::Starting {
+            generation: 1,
+            transaction_id: 11,
+            ..
+        })
+    ));
+    start_role(&mut init, RoleId::Devmgr, 1, 11, 4);
     init.ready(RoleId::Devmgr, 1, 11, 5).unwrap();
     assert_eq!(init.mode(), SystemMode::Normal);
+    init.terminal(RoleId::Devmgr, 1, 11, 6, TerminalDisposition::NormalExit(0))
+        .unwrap();
+    init.cleanup_complete(RoleId::Devmgr, 1, 11, 7).unwrap();
+    assert_eq!(init.mode(), SystemMode::ActivatingEarlyRoles);
+    init.complete_early_activation(7, 1, 11).unwrap();
+    assert_eq!(init.mode(), SystemMode::Normal);
+    assert_eq!(init.result(), Some(RecoveryResult::Recovered));
+}
+
+#[test]
+fn registry_retry_does_not_preactivate_devmgr() {
+    let mut init = system();
+    init.become_operational().unwrap();
+    init.begin_registry(0, 1, 10).unwrap();
+    start_role(&mut init, RoleId::Registryd, 1, 10, 0);
+    init.ready(RoleId::Registryd, 1, 10, 2).unwrap();
+    assert_eq!(init.role_state(RoleId::Devmgr), Some(RestartState::Stopped));
+    init.terminal(
+        RoleId::Registryd,
+        1,
+        10,
+        3,
+        TerminalDisposition::NormalExit(7),
+    )
+    .unwrap();
+    init.cleanup_complete(RoleId::Registryd, 1, 10, 4).unwrap();
+    let RestartState::Backoff { deadline_ns, .. } = init.role_state(RoleId::Registryd).unwrap()
+    else {
+        panic!("expected registry retry backoff")
+    };
+    init.start_replacement(RoleId::Registryd, deadline_ns, 2, 11)
+        .unwrap();
+    start_role(&mut init, RoleId::Registryd, 2, 11, deadline_ns);
+    init.ready(RoleId::Registryd, 2, 11, deadline_ns + 2)
+        .unwrap();
+    assert_eq!(init.role_state(RoleId::Devmgr), Some(RestartState::Stopped));
+    init.terminal(
+        RoleId::Registryd,
+        2,
+        11,
+        deadline_ns + 3,
+        TerminalDisposition::NormalExit(0),
+    )
+    .unwrap();
+    init.cleanup_complete(RoleId::Registryd, 2, 11, deadline_ns + 4)
+        .unwrap();
+    init.begin_devmgr_after_registry(deadline_ns + 4, 2, 11)
+        .unwrap();
+    assert!(matches!(
+        init.role_state(RoleId::Devmgr),
+        Some(RestartState::Starting {
+            generation: 2,
+            transaction_id: 12,
+            ..
+        })
+    ));
 }
 
 #[test]

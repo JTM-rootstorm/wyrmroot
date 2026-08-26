@@ -520,6 +520,72 @@ impl SystemInit {
         Ok(())
     }
 
+    pub fn begin_devmgr_after_registry(
+        &mut self,
+        now: u64,
+        registry_generation: u64,
+        registry_transaction: u64,
+    ) -> Result<(), InitError> {
+        let registry_record = self.roles[0]
+            .restart
+            .history()
+            .as_slice()
+            .last()
+            .and_then(|record| *record)
+            .ok_or(InitError::WrongActivationOrder)?;
+        if self.mode != SystemMode::ActivatingEarlyRoles
+            || !self.activated[0]
+            || self.roles[0].restart.state() != RestartState::Stopped
+            || self.roles[1].restart.state() != RestartState::Stopped
+            || registry_record.generation != registry_generation
+            || registry_record.transaction_id != registry_transaction
+            || registry_record.failure
+                != AttemptFailure::ExitAfterReady(TerminalDisposition::NormalExit(0))
+            || registry_record.cleanup != CleanupDisposition::Complete
+            || now <= registry_record.terminal_at_ns
+        {
+            return Err(InitError::WrongActivationOrder);
+        }
+        self.roles[1].restart.begin(
+            now,
+            registry_generation,
+            next_transaction(registry_transaction)?,
+        )?;
+        Ok(())
+    }
+
+    pub fn complete_early_activation(
+        &mut self,
+        now: u64,
+        devmgr_generation: u64,
+        devmgr_transaction: u64,
+    ) -> Result<(), InitError> {
+        let devmgr_record = self.roles[1]
+            .restart
+            .history()
+            .as_slice()
+            .last()
+            .and_then(|record| *record)
+            .ok_or(InitError::WrongActivationOrder)?;
+        if self.mode != SystemMode::ActivatingEarlyRoles
+            || !self.activated.iter().all(|activated| *activated)
+            || self
+                .roles
+                .iter()
+                .any(|role| role.restart.state() != RestartState::Stopped)
+            || devmgr_record.generation != devmgr_generation
+            || devmgr_record.transaction_id != devmgr_transaction
+            || devmgr_record.failure
+                != AttemptFailure::ExitAfterReady(TerminalDisposition::NormalExit(0))
+            || devmgr_record.cleanup != CleanupDisposition::Complete
+            || now <= devmgr_record.terminal_at_ns
+        {
+            return Err(InitError::WrongActivationOrder);
+        }
+        self.mode = SystemMode::Normal;
+        Ok(())
+    }
+
     pub fn install_attempt(&mut self, mut resources: AttemptResources) -> Result<(), InitError> {
         let index = self
             .index(resources.role)
@@ -600,18 +666,7 @@ impl SystemInit {
             .ready(generation, transaction, now)?;
         self.record_evidence(EvidenceEvent::Ready, role, generation, transaction, 0)?;
         self.activated[index] = true;
-        if role == RoleId::Registryd {
-            if self.roles[1].restart.state() != RestartState::Stopped {
-                return Err(InitError::WrongActivationOrder);
-            }
-            self.roles[1].restart.begin(
-                now,
-                generation,
-                transaction.checked_add(1).ok_or(InitError::Restart(
-                    RestartTransitionError::ArithmeticOverflow,
-                ))?,
-            )?;
-        } else if role == RoleId::Devmgr && self.activated[0] {
+        if role == RoleId::Devmgr && self.activated[0] {
             self.mode = SystemMode::Normal;
         }
         Ok(())
@@ -1317,7 +1372,7 @@ where
                                     error,
                                 ));
                             }
-                            complete_native_cleanup(
+                            let retired_at = complete_native_cleanup(
                                 system,
                                 waits,
                                 &mut controller,
@@ -1330,6 +1385,19 @@ where
                                 now,
                             )?;
                             if disposition == TerminalDisposition::NormalExit(0) {
+                                if role == RoleId::Registryd {
+                                    controller.begin_devmgr_after_registry(
+                                        retired_at,
+                                        generation,
+                                        transaction_id,
+                                    )?;
+                                } else {
+                                    controller.complete_early_activation(
+                                        retired_at,
+                                        generation,
+                                        transaction_id,
+                                    )?;
+                                }
                                 break;
                             }
                             if advance_or_degrade(system, &mut controller, role, transaction_id)? {
@@ -1352,7 +1420,8 @@ where
                                     ));
                                 }
                             };
-                            let transition = match classify_after_ready_observation(&error) {
+                            let observed_transition = classify_after_ready_observation(&error);
+                            let transition = match observed_transition {
                                 AfterReadyTransition::Terminal(disposition) => controller.terminal(
                                     role,
                                     generation,
@@ -1375,7 +1444,7 @@ where
                                     error,
                                 ));
                             }
-                            complete_native_cleanup(
+                            let retired_at = complete_native_cleanup(
                                 system,
                                 waits,
                                 &mut controller,
@@ -1387,6 +1456,26 @@ where
                                 transaction_id,
                                 now,
                             )?;
+                            if observed_transition
+                                == AfterReadyTransition::Terminal(TerminalDisposition::NormalExit(
+                                    0,
+                                ))
+                            {
+                                if role == RoleId::Registryd {
+                                    controller.begin_devmgr_after_registry(
+                                        retired_at,
+                                        generation,
+                                        transaction_id,
+                                    )?;
+                                } else {
+                                    controller.complete_early_activation(
+                                        retired_at,
+                                        generation,
+                                        transaction_id,
+                                    )?;
+                                }
+                                break;
+                            }
                             if advance_or_degrade(system, &mut controller, role, transaction_id)? {
                                 controller.finalize_evidence(RecoveryResult::Degraded)?;
                                 return Ok((RecoveryResult::Degraded, controller));
@@ -1573,12 +1662,12 @@ fn complete_native_cleanup<S: InitPlatform, W: SupervisionPlatform<Error = Nativ
     generation: u64,
     transaction: u64,
     classified_at: u64,
-) -> Result<(), InitError> {
+) -> Result<u64, InitError> {
     match cleanup_loaded(system, waits, loaded, task_group, terminate) {
         Ok(()) => {
             let retired_at = classified_at.checked_add(1).ok_or(InitError::Accounting)?;
             match controller.cleanup_complete(role, generation, transaction, retired_at) {
-                Ok(()) => Ok(()),
+                Ok(()) => Ok(retired_at),
                 Err(error) => {
                     let retirement = controller.retire_attempt_after_fatal(role);
                     match retirement {
