@@ -2443,7 +2443,7 @@ where
                         },
                     )
                     .map_err(InitError::Native)?;
-                if dispatched.is_err() {
+                if let Err(dispatch_error) = dispatched {
                     let disconnected = jobs.disconnect_owned_session(grant);
                     let close_failed = disconnected.map_or(true, |session| {
                         system.close_handle(session.channel).is_err()
@@ -2452,6 +2452,7 @@ where
                     if close_failed {
                         return Err(InitError::Cleanup);
                     }
+                    return Err(dispatch_error);
                 }
             }
             Ok(observed) if observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 => {
@@ -3363,6 +3364,10 @@ mod tests {
         fail_send: bool,
         inbound: [u8; 256],
         inbound_len: usize,
+        inbound_handles: [DwReceivedHandleInfoV1; 16],
+        inbound_handle_count: usize,
+        bootfs: Option<Vec<u8>>,
+        session_poll_readable: bool,
     }
 
     impl MockPlatform {
@@ -3387,6 +3392,10 @@ mod tests {
                 fail_send: true,
                 inbound: [0; 256],
                 inbound_len: 0,
+                inbound_handles: [DwReceivedHandleInfoV1::default(); 16],
+                inbound_handle_count: 0,
+                bootfs: None,
+                session_poll_readable: false,
             }
         }
     }
@@ -3585,6 +3594,8 @@ mod tests {
 
     fn job_policy_bootfs(image: &[u8]) -> (Vec<u8>, [u8; 32]) {
         let generation = [0x44; 32];
+        let mut manifest = [0_u8; 80];
+        manifest[48..80].copy_from_slice(&generation);
         let entry = LaunchPolicyEntry {
             path: "bin/hello",
             content_sha256: wyrmroot_runtime::sha256::digest(image),
@@ -3605,6 +3616,9 @@ mod tests {
                 &policy[..policy_size],
                 FileMode::ReadOnly,
             )
+            .unwrap();
+        builder
+            .add(MANIFEST_PATH.as_bytes(), &manifest, FileMode::ReadOnly)
             .unwrap();
         (builder.build().unwrap(), generation)
     }
@@ -3645,27 +3659,37 @@ mod tests {
             &mut self,
             _channel: DwHandle,
             bytes: &mut [u8],
-            _handles: &mut [DwReceivedHandleInfoV1],
+            handles: &mut [DwReceivedHandleInfoV1],
         ) -> Result<ReceiveCounts, NativeError> {
             if self.inbound_len == 0 {
                 return Err(FAILURE);
             }
             bytes[..self.inbound_len].copy_from_slice(&self.inbound[..self.inbound_len]);
+            handles[..self.inbound_handle_count]
+                .copy_from_slice(&self.inbound_handles[..self.inbound_handle_count]);
             let bytes = self.inbound_len;
+            let handles = self.inbound_handle_count;
             self.inbound_len = 0;
-            Ok(ReceiveCounts { bytes, handles: 0 })
+            self.inbound_handle_count = 0;
+            Ok(ReceiveCounts { bytes, handles })
         }
         fn query_memory_object_size(&mut self, _handle: DwHandle) -> Result<u64, NativeError> {
-            Err(FAILURE)
+            self.bootfs
+                .as_ref()
+                .map(|bootfs| bootfs.len() as u64)
+                .ok_or(FAILURE)
         }
         fn with_bootfs_bytes<R>(
             &mut self,
             _root: DwHandle,
             _bootfs: DwHandle,
             _plan: MappingPlan,
-            _use_bytes: impl for<'a> FnOnce(&mut Self, &'a [u8]) -> R,
+            use_bytes: impl for<'a> FnOnce(&mut Self, &'a [u8]) -> R,
         ) -> Result<R, NativeError> {
-            Err(FAILURE)
+            let bootfs = self.bootfs.take().ok_or(FAILURE)?;
+            let result = use_bytes(self, &bootfs);
+            self.bootfs = Some(bootfs);
+            Ok(result)
         }
         fn send_channel(&mut self, _channel: DwHandle, bytes: &[u8]) -> Result<(), NativeError> {
             if self.fail_send {
@@ -3811,7 +3835,13 @@ mod tests {
             _items: &[DwWaitItemV1],
             _deadline: DwDeadline,
         ) -> Result<DwWaitResultV1, NativeError> {
-            if self.session_poll_timeout {
+            if self.session_poll_readable {
+                Ok(DwWaitResultV1 {
+                    index: 0,
+                    observed: DW_SIGNAL_READABLE,
+                    ..DwWaitResultV1::default()
+                })
+            } else if self.session_poll_timeout {
                 Err(NativeError::Status(DW_STATUS_TIMED_OUT))
             } else {
                 Err(FAILURE)
@@ -4059,6 +4089,54 @@ mod tests {
             response.message,
             LaunchMessage::JobResult { job_id, .. } if job_id == launch.job_id
         ));
+    }
+
+    #[test]
+    fn resident_poll_disconnects_but_preserves_received_move_cleanup_failure() {
+        let image = executable();
+        let (bootfs, _) = job_policy_bootfs(&image);
+        let mut platform = MockPlatform::new();
+        platform.bootfs = Some(bootfs);
+        platform.fail_close = Some(DwHandle(500));
+        platform.session_poll_readable = true;
+        platform.inbound_len = encode_job_message(
+            reservation(1),
+            LaunchMessageType::Query,
+            7,
+            &mut platform.inbound,
+        )
+        .unwrap();
+        platform.inbound_handles[0] = DwReceivedHandleInfoV1 {
+            handle: DwHandle(500),
+            ..DwReceivedHandleInfoV1::default()
+        };
+        platform.inbound_handle_count = 1;
+        let mut loader = InitSendLoader::new();
+        let mut waits = TerminalWaits;
+        let mut jobs = JobDispatcher::new();
+        let owner = grant(EndpointKind::LaunchSession, 1, 1);
+        jobs.install_session(owner, DwHandle(90)).unwrap();
+
+        assert_eq!(
+            poll_job_dispatcher(
+                &mut platform,
+                &mut loader,
+                &mut waits,
+                LoadAuthority {
+                    parent_root: DwHandle(1),
+                    bootfs: DwHandle(2),
+                    task_group: DwHandle(3),
+                },
+                &mut jobs,
+                10,
+            ),
+            Err(InitError::Cleanup)
+        );
+        assert_eq!(jobs.session_count(), 0);
+        assert_eq!(
+            &platform.closed[..platform.close_count],
+            &[DwHandle(500), DwHandle(90)]
+        );
     }
 
     #[test]
