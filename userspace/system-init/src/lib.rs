@@ -92,21 +92,7 @@ pub const fn wyr1_test_failure_application_status(error: &InitError) -> u32 {
         InitError::ResourcesAlreadyInstalled => 0x05,
         InitError::ResourceIdentityMismatch => 0x06,
         InitError::InvalidResourceHandle => 0x07,
-        InitError::Restart(error) => match error {
-            RestartTransitionError::InvalidPolicy => 0x81,
-            RestartTransitionError::ZeroIdentity => 0x82,
-            RestartTransitionError::InvalidState => 0x83,
-            RestartTransitionError::StaleGeneration => 0x84,
-            RestartTransitionError::TransactionMismatch => 0x85,
-            RestartTransitionError::DeadlineNotReached => 0x86,
-            RestartTransitionError::DeadlineExpired => 0x87,
-            RestartTransitionError::DeadlineMismatch => 0x88,
-            RestartTransitionError::TimeRegression => 0x89,
-            RestartTransitionError::GenerationNotAdvanced => 0x8a,
-            RestartTransitionError::AttemptFailed(_) => 0x8b,
-            RestartTransitionError::ArithmeticOverflow => 0x8c,
-            RestartTransitionError::HistoryExhausted => 0x8d,
-        },
+        InitError::Restart(_) => 0x08,
         InitError::Bootfs(_) => 0x09,
         InitError::MissingRetainedMaterial => 0x0a,
         InitError::NonExecutableRole => 0x0b,
@@ -1454,7 +1440,7 @@ where
                     }
                 }
                 Err(error) => {
-                    let failure = classify_observed_supervision(&error, false);
+                    let observed_transition = classify_after_ready_observation(&error);
                     let now = match system.now().map_err(InitError::Native) {
                         Ok(now) => now,
                         Err(error) => {
@@ -1469,9 +1455,19 @@ where
                             ));
                         }
                     };
-                    if let Err(error) =
-                        controller.ready_wait_failed(role, generation, transaction_id, now, failure)
-                    {
+                    let transition = match observed_transition {
+                        AfterReadyTransition::Terminal(disposition) => {
+                            controller.terminal(role, generation, transaction_id, now, disposition)
+                        }
+                        AfterReadyTransition::Failure(failure) => controller.ready_wait_failed(
+                            role,
+                            generation,
+                            transaction_id,
+                            now,
+                            failure,
+                        ),
+                    };
+                    if let Err(error) = transition {
                         return Err(cleanup_after_transition_error(
                             system,
                             waits,
@@ -1658,23 +1654,6 @@ fn complete_native_cleanup<S: InitPlatform, W: SupervisionPlatform<Error = Nativ
         }
     }
 }
-fn classify_supervision(error: &SupervisionError<NativeError>) -> AttemptFailure {
-    match error {
-        SupervisionError::Ready(wyrmroot_loader::launch::LaunchError::TransactionMismatch) => {
-            AttemptFailure::WrongTransactionReady
-        }
-        SupervisionError::Ready(_) | SupervisionError::InvalidReadyReceive(_) => {
-            AttemptFailure::MalformedReady
-        }
-        SupervisionError::PeerClosedBeforeReady => AttemptFailure::PeerClosedBeforeReady,
-        SupervisionError::ExitedBeforeReady | SupervisionError::Exit(_) => {
-            AttemptFailure::ExitQueryFailed
-        }
-        SupervisionError::ExitQuery(_) => AttemptFailure::ExitQueryFailed,
-        _ => AttemptFailure::WaitFailed,
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AfterReadyTransition {
     Terminal(TerminalDisposition),
@@ -1708,29 +1687,6 @@ fn classify_after_ready_observation(
             };
             AfterReadyTransition::Failure(failure)
         }
-    }
-}
-
-fn classify_observed_supervision(
-    error: &ObservedSupervisionError<NativeError>,
-    after_ready: bool,
-) -> AttemptFailure {
-    let disposition = match error {
-        ObservedSupervisionError::ExitedBeforeReady(info)
-        | ObservedSupervisionError::PeerClosedBeforeReady(info)
-        | ObservedSupervisionError::Exit(_, info)
-        | ObservedSupervisionError::ExitObservedReadiness(_, info) => {
-            Some(terminal_disposition(info))
-        }
-        ObservedSupervisionError::Supervision(_) => None,
-    };
-    match disposition {
-        Some(disposition) if after_ready => AttemptFailure::ExitAfterReady(disposition),
-        Some(disposition) => AttemptFailure::ExitBeforeReady(disposition),
-        None => match error {
-            ObservedSupervisionError::Supervision(error) => classify_supervision(error),
-            _ => unreachable!("termination-bearing variants were handled above"),
-        },
     }
 }
 
@@ -2215,6 +2171,37 @@ mod native_cleanup_tests {
     }
 
     #[test]
+    fn initial_ready_exit_race_uses_the_terminal_transition() {
+        let info = DwTaskTerminationInfoV1 {
+            reason: DW_TERMINATION_NORMAL_EXIT,
+            application_code: 0xA101_F001,
+            ..DwTaskTerminationInfoV1::default()
+        };
+        let observed: ObservedSupervisionError<NativeError> =
+            ObservedSupervisionError::ExitedBeforeReady(info);
+        let AfterReadyTransition::Terminal(disposition) =
+            classify_after_ready_observation(&observed)
+        else {
+            panic!("early terminal observation lost its terminal owner")
+        };
+
+        let mut supervisor = RestartSupervisor::new(WYR0_I_SUPERVISION_POLICY).unwrap();
+        supervisor.begin(1, 1, 1).unwrap();
+        supervisor.child_started(1, 1, 2).unwrap();
+        supervisor.terminal(1, 1, 3, disposition).unwrap();
+        assert!(matches!(
+            supervisor.state(),
+            RestartState::CleaningUp {
+                failure: AttemptFailure::ExitBeforeReady(TerminalDisposition::NormalExit(
+                    0xA101_F001
+                )),
+                action: wyrmroot_runtime::CleanupAction::CloseTerminal,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn after_ready_exit_race_enters_the_admitted_restart_transition() {
         let mut supervisor = RestartSupervisor::new(WYR0_I_SUPERVISION_POLICY).unwrap();
         supervisor.begin(1, 1, 1).unwrap();
@@ -2295,12 +2282,6 @@ mod native_cleanup_tests {
         assert_eq!(
             wyr1_test_failure_application_status(&InitError::WrongActivationOrder),
             0xAF11_0003
-        );
-        assert_eq!(
-            wyr1_test_failure_application_status(&InitError::Restart(
-                RestartTransitionError::DeadlineExpired
-            )),
-            0xAF11_0087
         );
     }
 }

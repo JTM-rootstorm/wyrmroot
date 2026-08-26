@@ -317,6 +317,99 @@ fn four_failed_attempts_reap_exact_resources_and_degrade_once() {
 }
 
 #[test]
+fn four_after_ready_nonzero_exits_degrade_once() {
+    let mut init = system();
+    init.become_operational().unwrap();
+    init.begin_registry(0, 1, 10).unwrap();
+    let mut now = 0;
+    for attempt in 0..4_u64 {
+        let generation = attempt + 1;
+        let transaction = 10 + attempt;
+        start_role(&mut init, RoleId::Registryd, generation, transaction, now);
+        now += 2;
+        init.ready(RoleId::Registryd, generation, transaction, now)
+            .unwrap();
+        now += 1;
+        init.terminal(
+            RoleId::Registryd,
+            generation,
+            transaction,
+            now,
+            TerminalDisposition::NormalExit(0xA101_F001),
+        )
+        .unwrap();
+        now += 1;
+        init.cleanup_complete(RoleId::Registryd, generation, transaction, now)
+            .unwrap();
+        if attempt != 3 {
+            let RestartState::Backoff {
+                deadline_ns,
+                next_generation,
+                ..
+            } = init.role_state(RoleId::Registryd).unwrap()
+            else {
+                panic!("expected backoff")
+            };
+            assert_eq!(next_generation, generation + 1);
+            now = deadline_ns;
+            init.start_replacement(RoleId::Registryd, now, generation + 1, transaction + 1)
+                .unwrap();
+        }
+    }
+    assert!(matches!(
+        init.role_state(RoleId::Registryd),
+        Some(RestartState::PermanentFailure { .. })
+    ));
+    assert_eq!(init.mode(), SystemMode::Degraded);
+    assert_eq!(init.degraded_transitions(), 1);
+}
+
+#[test]
+fn four_exit_before_ready_records_degrade_once() {
+    let mut init = system();
+    init.become_operational().unwrap();
+    init.begin_registry(0, 1, 10).unwrap();
+    let mut now = 0;
+    for attempt in 0..4_u64 {
+        let generation = attempt + 1;
+        let transaction = 10 + attempt;
+        start_role(&mut init, RoleId::Registryd, generation, transaction, now);
+        now += 2;
+        init.terminal(
+            RoleId::Registryd,
+            generation,
+            transaction,
+            now,
+            TerminalDisposition::NormalExit(0xA101_F001),
+        )
+        .unwrap();
+        now += 1;
+        init.cleanup_complete(RoleId::Registryd, generation, transaction, now)
+            .unwrap();
+        if attempt != 3 {
+            let RestartState::Backoff {
+                deadline_ns,
+                next_generation,
+                ..
+            } = init.role_state(RoleId::Registryd).unwrap()
+            else {
+                panic!("expected backoff")
+            };
+            assert_eq!(next_generation, generation + 1);
+            now = deadline_ns;
+            init.start_replacement(RoleId::Registryd, now, generation + 1, transaction + 1)
+                .unwrap();
+        }
+    }
+    assert!(matches!(
+        init.role_state(RoleId::Registryd),
+        Some(RestartState::PermanentFailure { .. })
+    ));
+    assert_eq!(init.mode(), SystemMode::Degraded);
+    assert_eq!(init.degraded_transitions(), 1);
+}
+
+#[test]
 fn failed_cleanup_retains_generation_reservation_and_blocks_replacement() {
     let mut init = system();
     init.become_operational().unwrap();
