@@ -13,6 +13,7 @@ use wyrmroot_bootfs::builder::{Builder, FileMode};
 use wyrmroot_loader::elf::{self, LoadSegment, MAX_LOAD_SEGMENTS, SegmentProtection};
 
 use crate::error::Failure;
+use crate::metadata::BuildManifest;
 use crate::sha256;
 
 pub const SCHEMA_VERSION: u32 = 5;
@@ -39,7 +40,6 @@ const ACCEPTED_TOOLCHAIN_TREE_SHA256: &str =
     "dce57d31def1f509ce537f96ae6b6dd320da11c9f321382cb93d142f558a32ca";
 const GENERATED_ABI_REVISION: &str = "cfc69bd8a49819ce1cda1a132cf56e55c93f92e4";
 const NATIVE_TARGET: &str = "x86_64-unknown-wyrmroot";
-const UEFI_TARGET: &str = "x86_64-unknown-uefi";
 const SHA256_ZERO: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 const REQUEST_KEYS: &[&str] = &[
     "schema_version",
@@ -95,6 +95,12 @@ const WYR_BUILD_RECEIPT_KEYS: &[&str] = &[
     "toolchain_tree_sha256",
     "cargo_lock_sha256",
     "profile",
+    "deep_layout_sha256",
+    "generated_layout_policy_sha256",
+    "uefi_effective_config_sha256",
+    "uefi_inspector_sha256",
+    "uefi_inspection_report_sha256",
+    "toolchain_validation_report_sha256",
     "loader_command",
     "bootstrap_command",
     "init_command",
@@ -102,6 +108,8 @@ const WYR_BUILD_RECEIPT_KEYS: &[&str] = &[
     "hog_command",
     "progress_command",
     "loader_sha256",
+    "debug_loader_sha256",
+    "debug_symbols_sha256",
     "bootstrap_sha256",
     "init_sha256",
     "hello_sha256",
@@ -115,6 +123,7 @@ const RUN_RECEIPT_KEYS: &[&str] = &[
     "test_id",
     "request_sha256",
     "build_receipt_sha256",
+    "wyr_build_receipt_sha256",
     "esp_sha256",
     "bootfs_sha256",
     "serial_log_sha256",
@@ -245,23 +254,23 @@ pub fn load(path: &Path) -> Result<Request, Failure> {
         deepwyrm_revision: revision(&values, "deepwyrm_revision")?,
         wyrmroot_revision: revision(&values, "wyrmroot_revision")?,
         rust_revision: revision(&values, "rust_revision")?,
-        loader: output(&parent, required(&values, "loader")?)?,
+        loader: input(&parent, required(&values, "loader")?)?,
         loader_sha256: digest(&values, "loader_sha256")?,
         kernel: input(&parent, required(&values, "kernel")?)?,
         kernel_sha256: digest(&values, "kernel_sha256")?,
         symbols: input(&parent, required(&values, "symbols")?)?,
         symbols_sha256: digest(&values, "symbols_sha256")?,
-        bootstrap: output(&parent, required(&values, "bootstrap")?)?,
+        bootstrap: input(&parent, required(&values, "bootstrap")?)?,
         bootstrap_sha256: digest(&values, "bootstrap_sha256")?,
-        init: output(&parent, required(&values, "init")?)?,
+        init: input(&parent, required(&values, "init")?)?,
         init_sha256: digest(&values, "init_sha256")?,
-        hello: output(&parent, required(&values, "hello")?)?,
+        hello: input(&parent, required(&values, "hello")?)?,
         hello_sha256: digest(&values, "hello_sha256")?,
-        cpu_hog: output(&parent, required(&values, "cpu_hog")?)?,
+        cpu_hog: input(&parent, required(&values, "cpu_hog")?)?,
         cpu_hog_sha256: digest(&values, "cpu_hog_sha256")?,
-        progress: output(&parent, required(&values, "progress")?)?,
+        progress: input(&parent, required(&values, "progress")?)?,
         progress_sha256: digest(&values, "progress_sha256")?,
-        wyr_build_receipt: output(&parent, required(&values, "wyr_build_receipt")?)?,
+        wyr_build_receipt: input(&parent, required(&values, "wyr_build_receipt")?)?,
         provenance: input(&parent, required(&values, "provenance")?)?,
         provenance_sha256: digest(&values, "provenance_sha256")?,
         ovmf_code: input(&parent, required(&values, "ovmf_code")?)?,
@@ -602,6 +611,7 @@ fn execute_run_loaded_with_validation(
     let snapshot_vars = request.run_directory.join("OVMF_VARS.fd");
     let snapshot_bootfs = request.run_directory.join("bootfs.img");
     let snapshot_build_receipt = request.run_directory.join("build-receipt.toml");
+    let snapshot_wyr_build_receipt = request.run_directory.join("wyr-source-build.toml");
     let stderr_log = request.run_directory.join("qemu.stderr.log");
     for path in [
         &request.serial_log,
@@ -612,6 +622,7 @@ fn execute_run_loaded_with_validation(
         &snapshot_vars,
         &snapshot_bootfs,
         &snapshot_build_receipt,
+        &snapshot_wyr_build_receipt,
         &stderr_log,
     ] {
         if fs::symlink_metadata(path).is_ok() {
@@ -645,6 +656,12 @@ fn execute_run_loaded_with_validation(
         None,
         "build receipt",
     )?;
+    snapshot_exact(
+        &request.wyr_build_receipt,
+        &snapshot_wyr_build_receipt,
+        None,
+        "Wyr source-build receipt",
+    )?;
     let initial_esp_hash = sha256::file_digest(&snapshot_esp)
         .map_err(|error| Failure::task(format!("could not hash run-local ESP: {error}")))?;
     let invocation = RunInvocation {
@@ -670,6 +687,11 @@ fn execute_run_loaded_with_validation(
     let live_esp = read_bounded(&request.esp, "ESP", crate::g3_image::IMAGE_BYTES)?;
     let live_bootfs = read_bounded(&request.bootfs, "bootfs", crate::g3_image::IMAGE_BYTES)?;
     let live_build_receipt = read_bounded(&request.receipt, "build receipt", 64 * 1024)?;
+    let live_wyr_build_receipt = read_bounded(
+        &request.wyr_build_receipt,
+        "Wyr source-build receipt",
+        64 * 1024,
+    )?;
     let bootfs = read_bounded(
         &snapshot_bootfs,
         "run-local bootfs",
@@ -680,10 +702,16 @@ fn execute_run_loaded_with_validation(
         "run-local build receipt",
         64 * 1024,
     )?;
+    let wyr_build_receipt = read_bounded(
+        &snapshot_wyr_build_receipt,
+        "run-local Wyr source-build receipt",
+        64 * 1024,
+    )?;
     if sha256::bytes_digest(&request_after) != request.request_sha256
         || sha256::bytes_digest(&live_esp) != initial_esp_hash
         || live_bootfs != bootfs
         || live_build_receipt != build_receipt
+        || live_wyr_build_receipt != wyr_build_receipt
     {
         return Err(Failure::task(
             "DW1-B request or product changed during canonical execution",
@@ -695,6 +723,7 @@ fn execute_run_loaded_with_validation(
         &serial,
         &initial_esp_hash,
         &build_receipt,
+        &wyr_build_receipt,
         &bootfs,
         observation,
     )?;
@@ -716,7 +745,8 @@ fn execute_run_loaded_with_validation(
         "run-local booted ESP",
         crate::g3_image::IMAGE_BYTES,
     )?;
-    let verified = verify_run_receipt_against(&request, &esp, &bootfs, &build_receipt)?;
+    let verified =
+        verify_run_receipt_against(&request, &esp, &bootfs, &build_receipt, &wyr_build_receipt)?;
     Ok((request, verified))
 }
 
@@ -725,13 +755,15 @@ fn render_run_receipt(
     serial: &[u8],
     esp_sha256: &str,
     build_receipt: &[u8],
+    wyr_build_receipt: &[u8],
     bootfs: &[u8],
     observation: RunObservation,
 ) -> Result<String, Failure> {
     Ok(format!(
-        "kind = \"{RUN_RECEIPT_KIND}\"\nschema_version = 1\nselector = \"{SELECTOR}\"\ntest_id = {TEST_ID}\nrequest_sha256 = \"{}\"\nbuild_receipt_sha256 = \"{}\"\nesp_sha256 = \"{esp_sha256}\"\nbootfs_sha256 = \"{}\"\nserial_log_sha256 = \"{}\"\novmf_code_sha256 = \"{}\"\novmf_vars_sha256 = \"{}\"\nrun_directory = \"{}\"\nserial_log = \"{}\"\ntimeout_seconds = {}\nqemu_exit_status = {}\ntimed_out = {}\n",
+        "kind = \"{RUN_RECEIPT_KIND}\"\nschema_version = 2\nselector = \"{SELECTOR}\"\ntest_id = {TEST_ID}\nrequest_sha256 = \"{}\"\nbuild_receipt_sha256 = \"{}\"\nwyr_build_receipt_sha256 = \"{}\"\nesp_sha256 = \"{esp_sha256}\"\nbootfs_sha256 = \"{}\"\nserial_log_sha256 = \"{}\"\novmf_code_sha256 = \"{}\"\novmf_vars_sha256 = \"{}\"\nrun_directory = \"{}\"\nserial_log = \"{}\"\ntimeout_seconds = {}\nqemu_exit_status = {}\ntimed_out = {}\n",
         request.request_sha256,
         sha256::bytes_digest(build_receipt),
+        sha256::bytes_digest(wyr_build_receipt),
         sha256::bytes_digest(bootfs),
         sha256::bytes_digest(serial),
         request.ovmf_code_sha256,
@@ -747,9 +779,14 @@ fn render_run_receipt(
 #[cfg(test)]
 fn verify_run_receipt(request: &Request) -> Result<Vec<u8>, Failure> {
     let build_receipt = read_bounded(&request.receipt, "build receipt", 64 * 1024)?;
+    let wyr_build_receipt = read_bounded(
+        &request.wyr_build_receipt,
+        "Wyr source-build receipt",
+        64 * 1024,
+    )?;
     let esp = read(&request.esp, "ESP")?;
     let bootfs = read(&request.bootfs, "bootfs")?;
-    verify_run_receipt_against(request, &esp, &bootfs, &build_receipt)
+    verify_run_receipt_against(request, &esp, &bootfs, &build_receipt, &wyr_build_receipt)
 }
 
 fn verify_run_receipt_against(
@@ -757,6 +794,7 @@ fn verify_run_receipt_against(
     esp: &[u8],
     bootfs: &[u8],
     build_receipt: &[u8],
+    wyr_build_receipt: &[u8],
 ) -> Result<Vec<u8>, Failure> {
     let receipt_bytes = read_bounded(&request.run_receipt, "run receipt", 64 * 1024)?;
     let receipt_text = core::str::from_utf8(&receipt_bytes)
@@ -766,11 +804,15 @@ fn verify_run_receipt_against(
     let serial = read_bounded(&request.serial_log, "serial log", 16 * 1024 * 1024)?;
     for (key, expected) in [
         ("kind", RUN_RECEIPT_KIND.to_owned()),
-        ("schema_version", "1".to_owned()),
+        ("schema_version", "2".to_owned()),
         ("selector", SELECTOR.to_owned()),
         ("test_id", TEST_ID.to_string()),
         ("request_sha256", request.request_sha256.clone()),
         ("build_receipt_sha256", sha256::bytes_digest(build_receipt)),
+        (
+            "wyr_build_receipt_sha256",
+            sha256::bytes_digest(wyr_build_receipt),
+        ),
         ("esp_sha256", sha256::bytes_digest(esp)),
         ("bootfs_sha256", sha256::bytes_digest(bootfs)),
         ("serial_log_sha256", sha256::bytes_digest(&serial)),
@@ -838,12 +880,110 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), Failure> {
         .map_err(|error| Failure::task(format!("could not write DW1-B run product: {error}")))
 }
 
-const LOADER_COMMAND: &str = "cargo build --offline --locked --release --target x86_64-unknown-uefi --package wyrmroot-efi-loader --bin loader --features firmware";
+const LOADER_COMMAND: &str = "xtask-central-deterministic-uefi-release-pair";
 const BOOTSTRAP_COMMAND: &str = "cargo build --offline --locked --release --target x86_64-unknown-wyrmroot --package wyrmroot-bootstrap --bin wyrmroot-bootstrap --features native-bootstrap";
 const INIT_COMMAND: &str = "cargo build --offline --locked --release --target x86_64-unknown-wyrmroot --package wyrmroot-init0 --bin wyrmroot-init0 --features native-init0,dw1b-preemption-integration";
 const HELLO_COMMAND: &str = "cargo build --offline --locked --release --target x86_64-unknown-wyrmroot --package wyrmroot-hello --bin wyrmroot-hello --features native-hello";
 const HOG_COMMAND: &str = "cargo build --offline --locked --release --target x86_64-unknown-wyrmroot --package wyrmroot-dw1b-preemption --bin wyrmroot-dw1b-cpu-hog --features native-payloads";
 const PROGRESS_COMMAND: &str = "cargo build --offline --locked --release --target x86_64-unknown-wyrmroot --package wyrmroot-dw1b-preemption --bin wyrmroot-dw1b-progress --features native-payloads";
+
+struct WyrArtifactSet {
+    loader: Vec<u8>,
+    bootstrap: Vec<u8>,
+    init: Vec<u8>,
+    hello: Vec<u8>,
+    hog: Vec<u8>,
+    progress: Vec<u8>,
+    debug_loader: Vec<u8>,
+    debug_symbols: Vec<u8>,
+    effective_uefi_config: String,
+    uefi_inspection_report: String,
+    receipt: String,
+}
+
+impl WyrArtifactSet {
+    fn primary(&self) -> [&[u8]; 6] {
+        [
+            &self.loader,
+            &self.bootstrap,
+            &self.init,
+            &self.hello,
+            &self.hog,
+            &self.progress,
+        ]
+    }
+}
+
+pub fn freeze(output: &Path) -> Result<String, Failure> {
+    let revision = verify_clean_source()?;
+    if fs::symlink_metadata(output).is_ok() {
+        return Err(Failure::task(
+            "DW1-B freeze refuses a pre-existing output path",
+        ));
+    }
+    let parent = output
+        .parent()
+        .ok_or_else(|| Failure::task("DW1-B freeze output has no parent"))?;
+    let parent = fs::canonicalize(parent)
+        .map_err(|error| Failure::task(format!("could not resolve freeze parent: {error}")))?;
+    let name = output
+        .file_name()
+        .ok_or_else(|| Failure::task("DW1-B freeze output has no final component"))?;
+    let output = parent.join(name);
+    fs::create_dir(&output)
+        .map_err(|error| Failure::task(format!("could not create freeze output: {error}")))?;
+    let set = build_wyr_artifact_set(&output.join("build"), &revision)?;
+    let artifacts = output.join("artifacts");
+    fs::create_dir(&artifacts)
+        .map_err(|error| Failure::task(format!("could not create freeze artifacts: {error}")))?;
+    for (name, bytes) in [
+        ("loader.efi", set.loader.as_slice()),
+        ("bootstrap.elf", set.bootstrap.as_slice()),
+        ("wyrmroot-init0", set.init.as_slice()),
+        ("wyrmroot-hello", set.hello.as_slice()),
+        ("wyrmroot-dw1b-cpu-hog", set.hog.as_slice()),
+        ("wyrmroot-dw1b-progress", set.progress.as_slice()),
+        ("loader-debug.efi", set.debug_loader.as_slice()),
+        ("loader.pdb", set.debug_symbols.as_slice()),
+    ] {
+        write_new_file(&artifacts.join(name), bytes)?;
+    }
+    write_new_file(
+        &output.join("uefi-effective-config.txt"),
+        set.effective_uefi_config.as_bytes(),
+    )?;
+    write_new_file(
+        &output.join("uefi-inspection.json"),
+        set.uefi_inspection_report.as_bytes(),
+    )?;
+    write_new_file(
+        &output.join("wyr-source-build.toml"),
+        set.receipt.as_bytes(),
+    )?;
+    let hashes = render_freeze_hashes(set.primary());
+    write_new_file(&output.join("wyr-source-hashes.toml"), hashes.as_bytes())?;
+    verify_clean_source_revision(&revision)?;
+    Ok(format!(
+        "DW1_B_FREEZE_PASS revision={revision} loader_sha256={} bootfs_inputs_sha256={}:{}:{}:{}\n",
+        sha256::bytes_digest(&set.loader),
+        sha256::bytes_digest(&set.init),
+        sha256::bytes_digest(&set.hello),
+        sha256::bytes_digest(&set.hog),
+        sha256::bytes_digest(&set.progress),
+    ))
+}
+
+fn render_freeze_hashes(artifacts: [&[u8]; 6]) -> String {
+    format!(
+        "schema_version = 1\nloader_sha256 = \"{}\"\nbootstrap_sha256 = \"{}\"\ninit_sha256 = \"{}\"\nhello_sha256 = \"{}\"\ncpu_hog_sha256 = \"{}\"\nprogress_sha256 = \"{}\"\n",
+        sha256::bytes_digest(artifacts[0]),
+        sha256::bytes_digest(artifacts[1]),
+        sha256::bytes_digest(artifacts[2]),
+        sha256::bytes_digest(artifacts[3]),
+        sha256::bytes_digest(artifacts[4]),
+        sha256::bytes_digest(artifacts[5]),
+    )
+}
 
 fn canonical_build_wyr_artifacts(request: &Request) -> Result<(), Failure> {
     for variable in [
@@ -862,56 +1002,96 @@ fn canonical_build_wyr_artifacts(request: &Request) -> Result<(), Failure> {
             )));
         }
     }
-    for path in [
-        &request.loader,
-        &request.bootstrap,
-        &request.init,
-        &request.hello,
-        &request.cpu_hog,
-        &request.progress,
-        &request.wyr_build_receipt,
-        &request.bootfs,
-        &request.esp,
-        &request.receipt,
-    ] {
+    for path in [&request.bootfs, &request.esp, &request.receipt] {
         if fs::symlink_metadata(path).is_ok() {
             return Err(Failure::task(
                 "DW1-B canonical source build refuses pre-existing product outputs",
             ));
         }
     }
-    let repository = crate::tasks::repository_root()?;
-    let rustc = PathBuf::from(
-        env::var_os("WYRMROOT_RUSTC")
-            .ok_or_else(|| Failure::task("DW1-B source build requires WYRMROOT_RUSTC"))?,
-    );
-    let toolchain = crate::toolchain_artifact::prepare(
-        &repository,
-        &rustc,
-        ACCEPTED_TOOLCHAIN_NAME,
-        ACCEPTED_RUST_REVISION,
+    let set = build_wyr_artifact_set(
+        &request.run_directory.join("canonical-source-rebuild"),
+        &request.wyrmroot_revision,
     )?;
+    let frozen = [
+        read_expected(&request.loader, "loader", &request.loader_sha256)?,
+        read_expected(&request.bootstrap, "bootstrap", &request.bootstrap_sha256)?,
+        read_expected(&request.init, "init", &request.init_sha256)?,
+        read_expected(&request.hello, "hello", &request.hello_sha256)?,
+        read_expected(&request.cpu_hog, "cpu hog", &request.cpu_hog_sha256)?,
+        read_expected(&request.progress, "progress", &request.progress_sha256)?,
+    ];
+    for (rebuilt, frozen) in set.primary().into_iter().zip(&frozen) {
+        if rebuilt != frozen.as_slice() {
+            return Err(Failure::task(
+                "DW1-B canonical rebuild does not reproduce the frozen artifact set",
+            ));
+        }
+    }
+    let frozen_receipt = read_bounded(
+        &request.wyr_build_receipt,
+        "Wyr source-build receipt",
+        64 * 1024,
+    )?;
+    require_matching_wyr_receipt(&frozen_receipt, set.receipt.as_bytes())?;
+    Ok(())
+}
+
+fn require_matching_wyr_receipt(frozen: &[u8], rebuilt: &[u8]) -> Result<(), Failure> {
+    if frozen != rebuilt {
+        return Err(Failure::task(
+            "DW1-B canonical rebuild receipt does not match the frozen source build",
+        ));
+    }
+    Ok(())
+}
+
+fn build_wyr_artifact_set(
+    build_root: &Path,
+    source_revision: &str,
+) -> Result<WyrArtifactSet, Failure> {
+    fs::create_dir(build_root).map_err(|error| {
+        Failure::task(format!("could not create fresh DW1-B build root: {error}"))
+    })?;
+    let repository = crate::tasks::repository_root()?;
+    let manifest = BuildManifest::load(&repository)?;
+    if manifest.deepwyrm_revision()? != GENERATED_ABI_REVISION
+        || manifest.rust_revision()? != ACCEPTED_RUST_REVISION
+        || manifest.rust_toolchain_name()? != ACCEPTED_TOOLCHAIN_NAME
+    {
+        return Err(Failure::task(
+            "DW1-B source build metadata does not name the accepted ABI and Rust toolchain",
+        ));
+    }
+    let profile = manifest.validate_loader_build_readiness(&repository)?;
     let layout = crate::deep_layout::prepare(
         &repository,
-        "https://github.com/JTM-rootstorm/deepwyrm",
-        GENERATED_ABI_REVISION,
+        manifest.deepwyrm_repository()?,
+        manifest.deepwyrm_revision()?,
     )?;
-    let build_root = request.run_directory.join("canonical-source-build");
-    fs::create_dir(&build_root).map_err(|error| {
-        Failure::task(format!(
-            "could not create fresh DW1-B source-build root: {error}"
-        ))
-    })?;
+    let toolchain = crate::tasks::prepare_loader_toolchain(&repository, &profile, &manifest)?;
+    let cargo_home = canonical_environment_directory("CARGO_HOME")?;
+    let uefi = crate::tasks::build_deterministic_uefi_pair(
+        &repository,
+        &toolchain,
+        &profile,
+        &layout,
+        &crate::tasks::IsolatedUefiBuild {
+            cargo_home: &cargo_home,
+            production_target: &build_root.join("uefi-production"),
+            retained_debug_target: &build_root.join("uefi-retained-debug"),
+            cargo_profile: crate::tasks::UefiCargoProfile::Release,
+        },
+    )?;
+    let loader = read_cargo_build_output(&uefi.loader, "loader", 64 * 1024 * 1024)?;
+    let debug_loader = read_cargo_build_output(
+        &uefi.debug_loader,
+        "retained debug loader",
+        64 * 1024 * 1024,
+    )?;
+    let debug_symbols =
+        read_cargo_build_output(&uefi.debug_symbols, "loader PDB", 512 * 1024 * 1024)?;
     let specs = [
-        BuildSpec::new(
-            "loader",
-            UEFI_TARGET,
-            "wyrmroot-efi-loader",
-            "loader",
-            "firmware",
-            "loader.efi",
-            Some(&layout.policy_path),
-        ),
         BuildSpec::new(
             "bootstrap",
             NATIVE_TARGET,
@@ -919,7 +1099,6 @@ fn canonical_build_wyr_artifacts(request: &Request) -> Result<(), Failure> {
             "wyrmroot-bootstrap",
             "native-bootstrap",
             "wyrmroot-bootstrap",
-            None,
         ),
         BuildSpec::new(
             "init",
@@ -928,7 +1107,6 @@ fn canonical_build_wyr_artifacts(request: &Request) -> Result<(), Failure> {
             "wyrmroot-init0",
             "native-init0,dw1b-preemption-integration",
             "wyrmroot-init0",
-            None,
         ),
         BuildSpec::new(
             "hello",
@@ -937,7 +1115,6 @@ fn canonical_build_wyr_artifacts(request: &Request) -> Result<(), Failure> {
             "wyrmroot-hello",
             "native-hello",
             "wyrmroot-hello",
-            None,
         ),
         BuildSpec::new(
             "hog",
@@ -946,7 +1123,6 @@ fn canonical_build_wyr_artifacts(request: &Request) -> Result<(), Failure> {
             "wyrmroot-dw1b-cpu-hog",
             "native-payloads",
             "wyrmroot-dw1b-cpu-hog",
-            None,
         ),
         BuildSpec::new(
             "progress",
@@ -955,23 +1131,16 @@ fn canonical_build_wyr_artifacts(request: &Request) -> Result<(), Failure> {
             "wyrmroot-dw1b-progress",
             "native-payloads",
             "wyrmroot-dw1b-progress",
-            None,
         ),
     ];
-    let destinations = [
-        (&request.loader, &request.loader_sha256),
-        (&request.bootstrap, &request.bootstrap_sha256),
-        (&request.init, &request.init_sha256),
-        (&request.hello, &request.hello_sha256),
-        (&request.cpu_hog, &request.cpu_hog_sha256),
-        (&request.progress, &request.progress_sha256),
-    ];
     let mut artifacts = Vec::with_capacity(specs.len());
-    for (spec, (destination, expected)) in specs.iter().zip(destinations) {
-        toolchain.verify_unchanged()?;
+    for spec in specs {
+        toolchain.accepted().verify_unchanged()?;
         layout.verify_unchanged()?;
         let target_dir = build_root.join(spec.label);
-        let status = Command::new(&toolchain.cargo)
+        fs::create_dir(&target_dir).map_err(io_failure)?;
+        let encoded_rustflags = native_remap_flags(&repository, &cargo_home, &target_dir)?;
+        let status = Command::new(&toolchain.accepted().cargo)
             .args(["build", "--offline", "--locked", "--release", "--target"])
             .arg(spec.target)
             .args([
@@ -984,16 +1153,14 @@ fn canonical_build_wyr_artifacts(request: &Request) -> Result<(), Failure> {
             ])
             .arg("--target-dir")
             .arg(&target_dir)
-            .env("RUSTC", &toolchain.rustc)
+            .env("RUSTC", &toolchain.accepted().rustc)
+            .env("CARGO_HOME", &cargo_home)
+            .env("CARGO_ENCODED_RUSTFLAGS", encoded_rustflags)
             .env("CARGO_INCREMENTAL", "0")
             .env("SOURCE_DATE_EPOCH", "0")
             .env_remove("LD_AUDIT")
             .env_remove("LD_LIBRARY_PATH")
             .env_remove("LD_PRELOAD")
-            .envs(
-                spec.policy
-                    .map(|path| ("WYRMROOT_DEEP_LAYOUT_POLICY_RS", path)),
-            )
             .current_dir(&repository)
             .stdin(Stdio::null())
             .status()
@@ -1011,37 +1178,37 @@ fn canonical_build_wyr_artifacts(request: &Request) -> Result<(), Failure> {
             .join("release")
             .join(spec.artifact);
         let bytes = read_cargo_build_output(&source, spec.label, 64 * 1024 * 1024)?;
-        if sha256::bytes_digest(&bytes) != *expected {
-            return Err(Failure::task(format!(
-                "DW1-B canonical {} artifact does not reproduce the request hash",
-                spec.label
-            )));
-        }
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent).map_err(io_failure)?;
-        }
-        write_new_file(destination, &bytes)?;
         artifacts.push(bytes);
     }
-    verify_acceptance_source(request)?;
-    toolchain.verify_unchanged()?;
+    let [bootstrap, init, hello, hog, progress]: [Vec<u8>; 5] = artifacts
+        .try_into()
+        .map_err(|_| Failure::task("DW1-B build produced the wrong artifact count"))?;
+    verify_clean_source_revision(source_revision)?;
+    toolchain.accepted().verify_unchanged()?;
     layout.verify_unchanged()?;
     let receipt = render_wyr_build_receipt(
-        request,
-        &toolchain,
-        [
-            &artifacts[0],
-            &artifacts[1],
-            &artifacts[2],
-            &artifacts[3],
-            &artifacts[4],
-            &artifacts[5],
-        ],
+        source_revision,
+        toolchain.accepted(),
+        &layout,
+        &uefi,
+        [&loader, &bootstrap, &init, &hello, &hog, &progress],
+        &debug_loader,
+        &debug_symbols,
+        &toolchain.validation_report_sha256(),
     )?;
-    if let Some(parent) = request.wyr_build_receipt.parent() {
-        fs::create_dir_all(parent).map_err(io_failure)?;
-    }
-    write_new_file(&request.wyr_build_receipt, receipt.as_bytes())
+    Ok(WyrArtifactSet {
+        loader,
+        bootstrap,
+        init,
+        hello,
+        hog,
+        progress,
+        debug_loader,
+        debug_symbols,
+        effective_uefi_config: uefi.effective_config,
+        uefi_inspection_report: uefi.inspection_report,
+        receipt,
+    })
 }
 
 struct BuildSpec<'a> {
@@ -1051,7 +1218,6 @@ struct BuildSpec<'a> {
     binary: &'a str,
     features: &'a str,
     artifact: &'a str,
-    policy: Option<&'a Path>,
 }
 
 impl<'a> BuildSpec<'a> {
@@ -1062,7 +1228,6 @@ impl<'a> BuildSpec<'a> {
         binary: &'a str,
         features: &'a str,
         artifact: &'a str,
-        policy: Option<&'a Path>,
     ) -> Self {
         Self {
             label,
@@ -1071,32 +1236,46 @@ impl<'a> BuildSpec<'a> {
             binary,
             features,
             artifact,
-            policy,
         }
     }
 }
 
 fn render_wyr_build_receipt(
-    request: &Request,
+    source_revision: &str,
     toolchain: &crate::toolchain_artifact::AcceptedToolchain,
+    layout: &crate::deep_layout::DeepLayoutBuild,
+    uefi: &crate::tasks::DeterministicUefiArtifacts,
     artifacts: [&[u8]; 6],
+    debug_loader: &[u8],
+    debug_symbols: &[u8],
+    toolchain_validation_report_sha256: &str,
 ) -> Result<String, Failure> {
     let repository = crate::tasks::repository_root()?;
     let rustc_sha256 = sha256::file_digest(&toolchain.rustc)
         .map_err(|error| Failure::task(format!("could not hash accepted rustc: {error}")))?;
     let cargo_lock_sha256 = sha256::file_digest(&repository.join("Cargo.lock"))
         .map_err(|error| Failure::task(format!("could not hash Cargo.lock: {error}")))?;
+    let uefi_inspector_sha256 =
+        sha256::file_digest(&repository.join("toolchain/inspect-uefi-artifact.sh"))
+            .map_err(|error| Failure::task(format!("could not hash UEFI inspector: {error}")))?;
     Ok(format!(
-        "kind = \"{WYR_BUILD_KIND}\"\nschema_version = 1\nwyrmroot_revision = \"{}\"\nrust_revision = \"{}\"\nrustc_sha256 = \"{}\"\ncargo_sha256 = \"{}\"\nrust_lld_sha256 = \"{}\"\ntoolchain_manifest_sha256 = \"{}\"\ntoolchain_tree_sha256 = \"{}\"\ncargo_lock_sha256 = \"{}\"\nprofile = \"release-separate-invocations\"\nloader_command = \"{LOADER_COMMAND}\"\nbootstrap_command = \"{BOOTSTRAP_COMMAND}\"\ninit_command = \"{INIT_COMMAND}\"\nhello_command = \"{HELLO_COMMAND}\"\nhog_command = \"{HOG_COMMAND}\"\nprogress_command = \"{PROGRESS_COMMAND}\"\nloader_sha256 = \"{}\"\nbootstrap_sha256 = \"{}\"\ninit_sha256 = \"{}\"\nhello_sha256 = \"{}\"\ncpu_hog_sha256 = \"{}\"\nprogress_sha256 = \"{}\"\n",
-        request.wyrmroot_revision,
-        request.rust_revision,
+        "kind = \"{WYR_BUILD_KIND}\"\nschema_version = 2\nwyrmroot_revision = \"{}\"\nrust_revision = \"{ACCEPTED_RUST_REVISION}\"\nrustc_sha256 = \"{}\"\ncargo_sha256 = \"{}\"\nrust_lld_sha256 = \"{}\"\ntoolchain_manifest_sha256 = \"{}\"\ntoolchain_tree_sha256 = \"{}\"\ncargo_lock_sha256 = \"{}\"\nprofile = \"release-separate-invocations\"\ndeep_layout_sha256 = \"{}\"\ngenerated_layout_policy_sha256 = \"{}\"\nuefi_effective_config_sha256 = \"{}\"\nuefi_inspector_sha256 = \"{}\"\nuefi_inspection_report_sha256 = \"{}\"\ntoolchain_validation_report_sha256 = \"{}\"\nloader_command = \"{LOADER_COMMAND}\"\nbootstrap_command = \"{BOOTSTRAP_COMMAND}\"\ninit_command = \"{INIT_COMMAND}\"\nhello_command = \"{HELLO_COMMAND}\"\nhog_command = \"{HOG_COMMAND}\"\nprogress_command = \"{PROGRESS_COMMAND}\"\nloader_sha256 = \"{}\"\ndebug_loader_sha256 = \"{}\"\ndebug_symbols_sha256 = \"{}\"\nbootstrap_sha256 = \"{}\"\ninit_sha256 = \"{}\"\nhello_sha256 = \"{}\"\ncpu_hog_sha256 = \"{}\"\nprogress_sha256 = \"{}\"\n",
+        source_revision,
         rustc_sha256,
         toolchain.cargo_sha256,
         toolchain.rust_lld_sha256,
         toolchain.manifest_sha256,
         toolchain.toolchain_tree_sha256,
         cargo_lock_sha256,
+        layout.layout_sha256,
+        layout.policy_sha256,
+        uefi.effective_config_sha256,
+        uefi_inspector_sha256,
+        uefi.inspection_report_sha256,
+        toolchain_validation_report_sha256,
         sha256::bytes_digest(artifacts[0]),
+        sha256::bytes_digest(debug_loader),
+        sha256::bytes_digest(debug_symbols),
         sha256::bytes_digest(artifacts[1]),
         sha256::bytes_digest(artifacts[2]),
         sha256::bytes_digest(artifacts[3]),
@@ -1123,7 +1302,7 @@ fn verify_wyr_build_receipt(
         .map_err(|error| Failure::task(format!("could not hash Cargo.lock: {error}")))?;
     let expected = [
         ("kind", WYR_BUILD_KIND.to_owned()),
-        ("schema_version", "1".to_owned()),
+        ("schema_version", "2".to_owned()),
         ("wyrmroot_revision", request.wyrmroot_revision.clone()),
         ("rust_revision", ACCEPTED_RUST_REVISION.to_owned()),
         ("rustc_sha256", ACCEPTED_RUSTC_SHA256.to_owned()),
@@ -1158,6 +1337,18 @@ fn verify_wyr_build_receipt(
                 "DW1-B Wyr source-build receipt field {key} does not match"
             )));
         }
+    }
+    for key in [
+        "deep_layout_sha256",
+        "generated_layout_policy_sha256",
+        "uefi_effective_config_sha256",
+        "uefi_inspector_sha256",
+        "uefi_inspection_report_sha256",
+        "toolchain_validation_report_sha256",
+        "debug_loader_sha256",
+        "debug_symbols_sha256",
+    ] {
+        require_sha256(required(&values, key)?, key)?;
     }
     Ok(())
 }
@@ -1515,9 +1706,11 @@ fn verify_efi_loader(bytes: &[u8]) -> Result<(), Failure> {
     let optional = bytes
         .get(pe_offset + 24..pe_offset + 24 + optional_size)
         .ok_or_else(|| Failure::task("DW1-B loader optional header is truncated"))?;
-    if u16::from_le_bytes(optional[..2].try_into().unwrap()) != 0x20b
+    if optional.len() < 168
+        || u16::from_le_bytes(optional[..2].try_into().unwrap()) != 0x20b
         || u32::from_le_bytes(optional[16..20].try_into().unwrap()) == 0
         || u16::from_le_bytes(optional[68..70].try_into().unwrap()) != 10
+        || u32::from_le_bytes(optional[108..112].try_into().unwrap()) < 7
     {
         return Err(Failure::task(
             "DW1-B loader is not an executable EFI application",
@@ -1543,6 +1736,68 @@ fn verify_efi_loader(bytes: &[u8]) -> Result<(), Failure> {
         {
             return Err(Failure::task("DW1-B loader section contract is invalid"));
         }
+    }
+    let import_rva = u32::from_le_bytes(optional[120..124].try_into().unwrap());
+    let import_size = u32::from_le_bytes(optional[124..128].try_into().unwrap());
+    if import_rva != 0 || import_size != 0 {
+        return Err(Failure::task("DW1-B production loader contains PE imports"));
+    }
+    let debug_rva = u32::from_le_bytes(optional[160..164].try_into().unwrap());
+    let debug_size = usize::try_from(u32::from_le_bytes(optional[164..168].try_into().unwrap()))
+        .map_err(|_| Failure::task("DW1-B loader debug directory size overflows"))?;
+    if debug_rva == 0 || debug_size == 0 || debug_size % 28 != 0 {
+        return Err(Failure::task(
+            "DW1-B production loader lacks a canonical PE debug directory",
+        ));
+    }
+    let debug_offset = sections.chunks_exact(40).find_map(|section| {
+        let virtual_size = u32::from_le_bytes(section[8..12].try_into().unwrap());
+        let virtual_address = u32::from_le_bytes(section[12..16].try_into().unwrap());
+        let raw_size = u32::from_le_bytes(section[16..20].try_into().unwrap());
+        let raw_offset = u32::from_le_bytes(section[20..24].try_into().unwrap());
+        let span = virtual_size.max(raw_size);
+        (debug_rva >= virtual_address
+            && debug_rva.checked_add(debug_size as u32)? <= virtual_address.checked_add(span)?)
+        .then(|| usize::try_from(raw_offset + (debug_rva - virtual_address)).ok())
+        .flatten()
+    });
+    let debug_offset = debug_offset
+        .ok_or_else(|| Failure::task("DW1-B loader debug directory is not file-backed"))?;
+    let debug_end = debug_offset
+        .checked_add(debug_size)
+        .ok_or_else(|| Failure::task("DW1-B loader debug directory overflows"))?;
+    let debug = bytes
+        .get(debug_offset..debug_end)
+        .ok_or_else(|| Failure::task("DW1-B loader debug directory is truncated"))?;
+    let mut repro = 0;
+    for entry in debug.chunks_exact(28) {
+        let kind = u32::from_le_bytes(entry[12..16].try_into().unwrap());
+        if kind == 2 {
+            return Err(Failure::task(
+                "DW1-B production loader contains a CodeView record",
+            ));
+        }
+        if kind == 16 {
+            repro += 1;
+        }
+        let data_size = usize::try_from(u32::from_le_bytes(entry[16..20].try_into().unwrap()))
+            .map_err(|_| Failure::task("DW1-B loader debug payload size overflows"))?;
+        let data_offset = usize::try_from(u32::from_le_bytes(entry[24..28].try_into().unwrap()))
+            .map_err(|_| Failure::task("DW1-B loader debug payload offset overflows"))?;
+        if data_size != 0
+            && data_offset
+                .checked_add(data_size)
+                .is_none_or(|end| end > bytes.len())
+        {
+            return Err(Failure::task(
+                "DW1-B loader debug payload is outside the image",
+            ));
+        }
+    }
+    if repro != 1 {
+        return Err(Failure::task(
+            "DW1-B production loader lacks exactly one Repro record",
+        ));
     }
     Ok(())
 }
@@ -1740,6 +1995,19 @@ fn digest(values: &BTreeMap<String, String>, key: &str) -> Result<String, Failur
     }
     Ok(value.to_owned())
 }
+fn require_sha256(value: &str, key: &str) -> Result<(), Failure> {
+    if value.len() != 64
+        || value == SHA256_ZERO
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(Failure::task(format!(
+            "DW1-B {key} is not a nonzero lowercase SHA-256"
+        )));
+    }
+    Ok(())
+}
 fn clean_path(parent: &Path, value: &str, output: bool) -> Result<PathBuf, Failure> {
     let p = Path::new(value);
     if p.is_absolute() || p.components().any(|c| !matches!(c, Component::Normal(_))) {
@@ -1908,7 +2176,56 @@ fn read_expected(path: &Path, label: &str, expected: &str) -> Result<Vec<u8>, Fa
     }
     Ok(bytes)
 }
-fn verify_acceptance_source(request: &Request) -> Result<(), Failure> {
+
+fn canonical_environment_directory(variable: &str) -> Result<PathBuf, Failure> {
+    let path = PathBuf::from(
+        env::var_os(variable)
+            .ok_or_else(|| Failure::task(format!("DW1-B source build requires {variable}")))?,
+    );
+    if !path.is_absolute() {
+        return Err(Failure::task(format!(
+            "DW1-B source build requires absolute {variable}"
+        )));
+    }
+    let canonical = fs::canonicalize(&path)
+        .map_err(|error| Failure::task(format!("could not resolve {variable}: {error}")))?;
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|error| Failure::task(format!("could not inspect {variable}: {error}")))?;
+    if canonical != path || !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(Failure::task(format!(
+            "DW1-B source build requires canonical non-symlink {variable}"
+        )));
+    }
+    Ok(canonical)
+}
+
+fn native_remap_flags(
+    repository: &Path,
+    cargo_home: &Path,
+    target: &Path,
+) -> Result<String, Failure> {
+    let repository = fs::canonicalize(repository).map_err(io_failure)?;
+    let cargo_home = fs::canonicalize(cargo_home).map_err(io_failure)?;
+    let target = fs::canonicalize(target).map_err(io_failure)?;
+    for path in [&repository, &cargo_home, &target] {
+        if path.to_string_lossy().contains('\u{1f}') {
+            return Err(Failure::task(
+                "DW1-B build path contains Cargo's encoded-rustflags separator",
+            ));
+        }
+    }
+    Ok([
+        format!(
+            "--remap-path-prefix={}=/source/wyrmroot",
+            repository.display()
+        ),
+        format!("--remap-path-prefix={}=/cargo-home", cargo_home.display()),
+        format!("--remap-path-prefix={}=/cargo-target", target.display()),
+    ]
+    .join("\u{1f}"))
+}
+
+fn verify_clean_source() -> Result<String, Failure> {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let revision = Command::new("git")
         .args(["-C", repository.to_str().unwrap(), "rev-parse", "HEAD"])
@@ -1917,14 +2234,23 @@ fn verify_acceptance_source(request: &Request) -> Result<(), Failure> {
     if !revision.status.success() {
         return Err(Failure::task("could not resolve Wyrmroot HEAD"));
     }
-    let head = core::str::from_utf8(&revision.stdout)
+    let revision = core::str::from_utf8(&revision.stdout)
+        .map_err(|_| Failure::task("Wyrmroot HEAD is not UTF-8"))?
+        .trim()
+        .to_owned();
+    verify_clean_source_revision(&revision)?;
+    Ok(revision)
+}
+
+fn verify_clean_source_revision(expected: &str) -> Result<(), Failure> {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let revision = Command::new("git")
+        .args(["-C", repository.to_str().unwrap(), "rev-parse", "HEAD"])
+        .output()
+        .map_err(|error| Failure::task(format!("could not inspect Wyrmroot HEAD: {error}")))?;
+    let actual = core::str::from_utf8(&revision.stdout)
         .map_err(|_| Failure::task("Wyrmroot HEAD is not UTF-8"))?
         .trim();
-    if request.wyrmroot_revision != head {
-        return Err(Failure::task(
-            "DW1-B request Wyrmroot revision does not match the current checkout HEAD",
-        ));
-    }
     let status = Command::new("git")
         .args([
             "-C",
@@ -1935,12 +2261,20 @@ fn verify_acceptance_source(request: &Request) -> Result<(), Failure> {
         ])
         .output()
         .map_err(|error| Failure::task(format!("could not inspect Wyrmroot status: {error}")))?;
-    if !status.status.success() || !status.stdout.is_empty() {
+    if !revision.status.success()
+        || actual != expected
+        || !status.status.success()
+        || !status.stdout.is_empty()
+    {
         return Err(Failure::task(
-            "DW1-B acceptance requires the exact clean Wyrmroot HEAD",
+            "DW1-B acceptance requires the exact clean Wyrmroot revision",
         ));
     }
     Ok(())
+}
+
+fn verify_acceptance_source(request: &Request) -> Result<(), Failure> {
+    verify_clean_source_revision(&request.wyrmroot_revision)
 }
 fn read_bounded(path: &Path, label: &str, maximum: u64) -> Result<Vec<u8>, Failure> {
     let metadata = fs::symlink_metadata(path)
@@ -2168,8 +2502,8 @@ mod tests {
     }
 
     #[test]
-    fn mid_run_build_receipt_and_bootfs_mutation_fail_before_run_receipt() {
-        for mutate_receipt in [true, false] {
+    fn mid_run_receipt_and_bootfs_mutation_fail_before_run_receipt() {
+        for mutation in ["main-receipt", "wyr-receipt", "bootfs"] {
             let root = fixture();
             fs::create_dir_all(root.join("out")).unwrap();
             fs::create_dir_all(root.join("run")).unwrap();
@@ -2181,10 +2515,11 @@ mod tests {
             let request = load(&request_path).unwrap();
             let error = execute_run_loaded(&request_path, request, |run| {
                 fs::write(&run.serial_log, valid_evidence_log(1)).unwrap();
-                let target = if mutate_receipt {
-                    root.join("out/receipt.toml")
-                } else {
-                    root.join("out/bootfs.img")
+                let target = match mutation {
+                    "main-receipt" => root.join("out/receipt.toml"),
+                    "wyr-receipt" => root.join("out/wyr-build.toml"),
+                    "bootfs" => root.join("out/bootfs.img"),
+                    _ => unreachable!(),
                 };
                 fs::write(target, b"mutated during execution").unwrap();
                 Ok(RunObservation {
@@ -2251,6 +2586,17 @@ mod tests {
 
         let loader = valid_pe();
         verify_efi_loader(&loader).unwrap();
+        let mut codeview = loader.clone();
+        codeview[0x20c..0x210].copy_from_slice(&2_u32.to_le_bytes());
+        assert!(verify_efi_loader(&codeview).is_err());
+        let mut timestamped = loader.clone();
+        timestamped[0x204..0x208].copy_from_slice(&1_u32.to_le_bytes());
+        timestamped[0x20c..0x210].fill(0);
+        assert!(verify_efi_loader(&timestamped).is_err());
+        let mut imported = loader.clone();
+        imported[0x110..0x114].copy_from_slice(&0x1000_u32.to_le_bytes());
+        imported[0x114..0x118].copy_from_slice(&20_u32.to_le_bytes());
+        assert!(verify_efi_loader(&imported).is_err());
         let mut wrong_subsystem = loader;
         wrong_subsystem[220..222].copy_from_slice(&3_u16.to_le_bytes());
         assert!(verify_efi_loader(&wrong_subsystem).is_err());
@@ -2338,6 +2684,18 @@ mod tests {
             )
             .is_err()
         );
+        let layout_mutation =
+            receipt.replace("deep_layout_sha256 = \"", "deep_layout_sha256 = \"0");
+        assert!(
+            require_matching_wyr_receipt(receipt.as_bytes(), layout_mutation.as_bytes()).is_err()
+        );
+        let config_mutation = receipt.replace(
+            "uefi_effective_config_sha256 = \"",
+            "uefi_effective_config_sha256 = \"0",
+        );
+        assert!(
+            require_matching_wyr_receipt(receipt.as_bytes(), config_mutation.as_bytes()).is_err()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2401,6 +2759,7 @@ mod tests {
             .as_nanos();
         let root = std::env::temp_dir().join(format!("wyrmroot-dw1b-{nonce}"));
         fs::create_dir_all(root.join("inputs")).unwrap();
+        fs::create_dir_all(root.join("out")).unwrap();
         for name in [
             "loader",
             "kernel",
@@ -2416,6 +2775,7 @@ mod tests {
         ] {
             fs::write(root.join("inputs").join(name), b"x").unwrap();
         }
+        fs::write(root.join("out/wyr-build.toml"), b"x").unwrap();
         root
     }
 
@@ -2449,8 +2809,9 @@ mod tests {
     fn test_wyr_build_receipt(request: &Request, artifacts: [&[u8]; 6]) -> String {
         let repository = crate::tasks::repository_root().unwrap();
         let cargo_lock = sha256::file_digest(&repository.join("Cargo.lock")).unwrap();
+        let metadata = sha256::bytes_digest(b"fixture metadata");
         format!(
-            "kind = \"{WYR_BUILD_KIND}\"\nschema_version = 1\nwyrmroot_revision = \"{}\"\nrust_revision = \"{ACCEPTED_RUST_REVISION}\"\nrustc_sha256 = \"{ACCEPTED_RUSTC_SHA256}\"\ncargo_sha256 = \"{ACCEPTED_CARGO_SHA256}\"\nrust_lld_sha256 = \"{ACCEPTED_RUST_LLD_SHA256}\"\ntoolchain_manifest_sha256 = \"{ACCEPTED_TOOLCHAIN_MANIFEST_SHA256}\"\ntoolchain_tree_sha256 = \"{ACCEPTED_TOOLCHAIN_TREE_SHA256}\"\ncargo_lock_sha256 = \"{cargo_lock}\"\nprofile = \"release-separate-invocations\"\nloader_command = \"{LOADER_COMMAND}\"\nbootstrap_command = \"{BOOTSTRAP_COMMAND}\"\ninit_command = \"{INIT_COMMAND}\"\nhello_command = \"{HELLO_COMMAND}\"\nhog_command = \"{HOG_COMMAND}\"\nprogress_command = \"{PROGRESS_COMMAND}\"\nloader_sha256 = \"{}\"\nbootstrap_sha256 = \"{}\"\ninit_sha256 = \"{}\"\nhello_sha256 = \"{}\"\ncpu_hog_sha256 = \"{}\"\nprogress_sha256 = \"{}\"\n",
+            "kind = \"{WYR_BUILD_KIND}\"\nschema_version = 2\nwyrmroot_revision = \"{}\"\nrust_revision = \"{ACCEPTED_RUST_REVISION}\"\nrustc_sha256 = \"{ACCEPTED_RUSTC_SHA256}\"\ncargo_sha256 = \"{ACCEPTED_CARGO_SHA256}\"\nrust_lld_sha256 = \"{ACCEPTED_RUST_LLD_SHA256}\"\ntoolchain_manifest_sha256 = \"{ACCEPTED_TOOLCHAIN_MANIFEST_SHA256}\"\ntoolchain_tree_sha256 = \"{ACCEPTED_TOOLCHAIN_TREE_SHA256}\"\ncargo_lock_sha256 = \"{cargo_lock}\"\nprofile = \"release-separate-invocations\"\ndeep_layout_sha256 = \"{metadata}\"\ngenerated_layout_policy_sha256 = \"{metadata}\"\nuefi_effective_config_sha256 = \"{metadata}\"\nuefi_inspector_sha256 = \"{metadata}\"\nuefi_inspection_report_sha256 = \"{metadata}\"\ntoolchain_validation_report_sha256 = \"{metadata}\"\nloader_command = \"{LOADER_COMMAND}\"\nbootstrap_command = \"{BOOTSTRAP_COMMAND}\"\ninit_command = \"{INIT_COMMAND}\"\nhello_command = \"{HELLO_COMMAND}\"\nhog_command = \"{HOG_COMMAND}\"\nprogress_command = \"{PROGRESS_COMMAND}\"\nloader_sha256 = \"{}\"\ndebug_loader_sha256 = \"{metadata}\"\ndebug_symbols_sha256 = \"{metadata}\"\nbootstrap_sha256 = \"{}\"\ninit_sha256 = \"{}\"\nhello_sha256 = \"{}\"\ncpu_hog_sha256 = \"{}\"\nprogress_sha256 = \"{}\"\n",
             request.wyrmroot_revision,
             sha256::bytes_digest(artifacts[0]),
             sha256::bytes_digest(artifacts[1]),
@@ -2566,20 +2927,26 @@ mod tests {
     }
 
     fn valid_pe() -> Vec<u8> {
-        let mut pe = vec![0_u8; 512];
+        let mut pe = vec![0_u8; 1024];
         pe[..2].copy_from_slice(b"MZ");
         pe[0x3c..0x40].copy_from_slice(&0x80_u32.to_le_bytes());
         pe[0x80..0x84].copy_from_slice(b"PE\0\0");
         pe[0x84..0x86].copy_from_slice(&0x8664_u16.to_le_bytes());
         pe[0x86..0x88].copy_from_slice(&1_u16.to_le_bytes());
-        pe[0x94..0x96].copy_from_slice(&112_u16.to_le_bytes());
+        pe[0x94..0x96].copy_from_slice(&240_u16.to_le_bytes());
         pe[0x96..0x98].copy_from_slice(&2_u16.to_le_bytes());
         pe[0x98..0x9a].copy_from_slice(&0x20b_u16.to_le_bytes());
         pe[0xa8..0xac].copy_from_slice(&0x1000_u32.to_le_bytes());
         pe[0xdc..0xde].copy_from_slice(&10_u16.to_le_bytes());
-        pe[0x118..0x11c].copy_from_slice(&16_u32.to_le_bytes());
-        pe[0x11c..0x120].copy_from_slice(&320_u32.to_le_bytes());
-        pe[0x12c..0x130].copy_from_slice(&0x6000_0000_u32.to_le_bytes());
+        pe[0x104..0x108].copy_from_slice(&16_u32.to_le_bytes());
+        pe[0x138..0x13c].copy_from_slice(&0x1000_u32.to_le_bytes());
+        pe[0x13c..0x140].copy_from_slice(&28_u32.to_le_bytes());
+        pe[0x190..0x194].copy_from_slice(&0x200_u32.to_le_bytes());
+        pe[0x194..0x198].copy_from_slice(&0x1000_u32.to_le_bytes());
+        pe[0x198..0x19c].copy_from_slice(&0x200_u32.to_le_bytes());
+        pe[0x19c..0x1a0].copy_from_slice(&0x200_u32.to_le_bytes());
+        pe[0x1ac..0x1b0].copy_from_slice(&0x6000_0020_u32.to_le_bytes());
+        pe[0x20c..0x210].copy_from_slice(&16_u32.to_le_bytes());
         pe
     }
 }

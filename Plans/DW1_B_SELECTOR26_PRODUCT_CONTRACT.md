@@ -34,16 +34,30 @@ Schema 5 uses canonical request-relative paths with no traversal, symlink
 ancestry, hard-link substitution, or input/output/run-directory aliases. It
 binds nonzero exact revisions, the candidate and ABI tree, accepted Rust
 revision `a92dc7f7464ad6ddfece4402bd7b86dbfa86166d`, and the exact clean current
-Wyrmroot HEAD. The canonical `image`/`run` path first performs six separate,
-locked, offline release builds for loader, bootstrap, init0, hello, CPU hog,
-and progress with the accepted Rust007 toolchain. It refuses pre-existing
-Wyrmroot outputs and emits a builder-owned source-build receipt binding the
-clean source revision, Cargo lock, toolchain and generated-layout identities,
-exact build commands/profile, and all six output hashes. The two DW1-B native
-payloads use the canonical native linker script; all native artifacts have
-numeric ELF OSABI 0 and ABI version 0. It also binds SHA-256 identities for loader, kernel, symbols,
-bootstrap, all four payloads, provenance, OVMF code and OVMF variables, the
-deterministic bootfs and ESP outputs, nonce, frozen digest
+Wyrmroot HEAD. Before a request is authored, `cargo xtask dw1b freeze --output
+<new-directory>` refuses existing output and a dirty source tree, then produces
+the six request input artifacts plus the builder-owned Wyr source-build
+receipt. It uses the central deterministic UEFI builder for isolated release
+and retained-debug loader builds, the accepted Rust007 sysroot and `rust-lld`,
+repository/Cargo-home/target remaps, `/Brepro`, and production `/debug:none`.
+The central UEFI inspector must report a production loader with Repro metadata,
+no CodeView record, and no import directory. The freeze retains the audited
+debug EFI/PDB pair and normalized effective UEFI configuration and inspector
+reports for provenance, but those retained-debug files do not enter the ESP.
+
+The canonical `image`/`run` path independently rebuilds loader, bootstrap,
+init0, hello, CPU hog, and progress with the same isolated accepted workflow
+and requires byte-for-byte equality with the frozen inputs before it writes a
+product. It refuses pre-existing Wyrmroot outputs. Source-build receipt schema
+2 binds the clean source revision, Cargo lock, accepted toolchain identities,
+generated Deep layout and policy hashes, normalized effective UEFI
+configuration digest, inspector and inspection-report hashes, exact separate
+release commands/profile, retained-debug EFI/PDB hashes, and all six production
+output hashes. The two DW1-B native payloads use the canonical native linker
+script; all native artifacts have numeric ELF OSABI 0 and ABI version 0. The
+request also binds SHA-256 identities for loader, kernel, symbols, bootstrap,
+all four payloads, provenance, OVMF code and OVMF variables, the deterministic
+bootfs and ESP outputs, nonce, frozen digest
 `5E4E054B5C244ACE`, bounded timeout, and measured page ceiling. The canonical
 template intentionally leaves the not-yet-integrated Wyrmroot revision and
 artifact digests as replacement fields; it is not itself an acceptance
@@ -64,12 +78,17 @@ writes an exact run receipt. The legacy `evidence` spelling performs the same
 fresh run; it does not accept a caller-supplied receipt. Pre-existing run
 products are rejected.
 
-The run receipt binds the frozen request and both build-receipt hashes, the actually
-booted ESP and bootfs hashes, initial OVMF identities, serial-log hash and
-request-relative path, run directory, timeout, observed QEMU debug-exit status
-33, and `timed_out = false`. A caller assertion or serial text alone is never
-evidence. Before execution, the canonical G3 image inspector must prove that
-the request-bound ESP contains the exact loader, kernel, bootstrap, and bootfs.
+The run receipt binds the frozen request and both the main build receipt and
+Wyr source-build receipt hashes, the actually booted ESP and bootfs hashes,
+initial OVMF identities, serial-log hash and request-relative path, run
+directory, timeout, observed QEMU debug-exit status 33, and `timed_out = false`.
+The runner snapshots both receipts and bootfs before execution, derives the run
+receipt only from those immutable run-local inputs, and after execution
+revalidates that the live request, products, receipts, and G3 relations remain
+unchanged. Mid-run mutation therefore fails closed without an evidence receipt.
+A caller assertion or serial text alone is never evidence. Before execution,
+the canonical G3 image inspector must prove that the request-bound ESP contains
+the exact loader, kernel, bootstrap, and bootfs.
 Product validation applies the native loader's ELF planning invariants to the
 bootstrap and four ELF payloads, validates the loader as a bounded x86_64
 PE32+ EFI application, proves loaded profile markers, and audits the exact

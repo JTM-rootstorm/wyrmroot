@@ -121,6 +121,7 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
             wyr1b::evidence(std::path::Path::new(&request), std::path::Path::new(&log)).map(Some)
         }
         Action::Dw1BImage(request) => dw1b::build(std::path::Path::new(&request)).map(Some),
+        Action::Dw1BFreeze(output) => dw1b::freeze(std::path::Path::new(&output)).map(Some),
         Action::Dw1BInspect(request) => dw1b::inspect(std::path::Path::new(&request)).map(Some),
         Action::Dw1BRun(request) => dw1b::run(std::path::Path::new(&request)).map(Some),
         Action::Dw1BMeasure {

@@ -14,7 +14,6 @@ use crate::toolchain_artifact::AcceptedToolchain;
 
 const UEFI_TARGET_DIRECTORY: &str = "target/wyr0-b";
 const UEFI_DEBUG_TARGET_DIRECTORY: &str = "target/wyr0-b-symbols";
-const UEFI_PROFILE_DIRECTORY: &str = "debug";
 const TOOLCHAIN_REQUEST: &str = "toolchain/requests/RUST-WYR0-I-B-SYSROOTS-007.toml";
 const MAX_LOADER_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DEBUG_SYMBOL_BYTES: u64 = 512 * 1024 * 1024;
@@ -44,10 +43,59 @@ pub(crate) struct LoaderToolchain {
     validation_report: String,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LoaderLinkMode {
     Production,
     RetainedDebug,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UefiCargoProfile {
+    Development,
+    Release,
+}
+
+impl UefiCargoProfile {
+    const fn directory(self) -> &'static str {
+        match self {
+            Self::Development => "debug",
+            Self::Release => "release",
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Development => "development",
+            Self::Release => "release",
+        }
+    }
+}
+
+pub(crate) struct IsolatedUefiBuild<'a> {
+    pub(crate) cargo_home: &'a Path,
+    pub(crate) production_target: &'a Path,
+    pub(crate) retained_debug_target: &'a Path,
+    pub(crate) cargo_profile: UefiCargoProfile,
+}
+
+pub(crate) struct DeterministicUefiArtifacts {
+    pub(crate) loader: PathBuf,
+    pub(crate) debug_loader: PathBuf,
+    pub(crate) debug_symbols: PathBuf,
+    pub(crate) effective_config: String,
+    pub(crate) effective_config_sha256: String,
+    pub(crate) inspection_report: String,
+    pub(crate) inspection_report_sha256: String,
+}
+
+impl LoaderToolchain {
+    pub(crate) const fn accepted(&self) -> &AcceptedToolchain {
+        &self.accepted
+    }
+
+    pub(crate) fn validation_report_sha256(&self) -> String {
+        bytes_digest(self.validation_report.as_bytes())
+    }
 }
 
 pub(crate) fn repository_root() -> Result<PathBuf, Failure> {
@@ -100,73 +148,30 @@ pub(crate) fn run_loader_build(
     )?;
     let target_directory = repository.join(UEFI_TARGET_DIRECTORY);
     let debug_target_directory = repository.join(UEFI_DEBUG_TARGET_DIRECTORY);
-    run_uefi_cargo(
+    let cargo_home = explicit_cargo_home()?;
+    let artifacts = build_deterministic_uefi_pair(
         repository,
         toolchain,
         profile,
-        &target_directory,
         layout,
-        LoaderLinkMode::Production,
-        "check",
+        &IsolatedUefiBuild {
+            cargo_home: &cargo_home,
+            production_target: &target_directory,
+            retained_debug_target: &debug_target_directory,
+            cargo_profile: UefiCargoProfile::Development,
+        },
     )?;
-    run_uefi_cargo(
-        repository,
-        toolchain,
-        profile,
-        &debug_target_directory,
-        layout,
-        LoaderLinkMode::RetainedDebug,
-        "build",
-    )?;
-    run_uefi_cargo(
-        repository,
-        toolchain,
-        profile,
-        &target_directory,
-        layout,
-        LoaderLinkMode::Production,
-        "build",
-    )?;
-
-    let output_directory = target_directory
-        .join(&profile.rust_target)
-        .join(UEFI_PROFILE_DIRECTORY);
-    let loader = output_directory.join(&profile.artifact_name);
-    let debug_output_directory = debug_target_directory
-        .join(&profile.rust_target)
-        .join(UEFI_PROFILE_DIRECTORY);
-    let debug_loader = debug_output_directory.join(&profile.artifact_name);
-    let debug_symbols = debug_output_directory.join(format!("{}.pdb", profile.cargo_binary));
-    validate_regular_artifact(&loader, "UEFI loader", MAX_LOADER_BYTES)?;
-    validate_regular_artifact(
-        &debug_loader,
-        "retained debug UEFI loader",
-        MAX_LOADER_BYTES,
-    )?;
-    validate_regular_artifact(
-        &debug_symbols,
-        "UEFI loader debug symbols",
-        MAX_DEBUG_SYMBOL_BYTES,
-    )?;
-
-    let artifact_report = run_verified_report(
-        repository,
-        &profile.artifact_inspection,
-        [
-            loader.as_os_str(),
-            debug_loader.as_os_str(),
-            debug_symbols.as_os_str(),
-        ],
-        "UEFI artifact inspection",
-    )?;
+    let loader = &artifacts.loader;
+    let debug_loader = &artifacts.debug_loader;
+    let debug_symbols = &artifacts.debug_symbols;
     let loader_hash = digest(&loader)?;
     let debug_loader_hash = digest(&debug_loader)?;
     let debug_hash = digest(&debug_symbols)?;
     let rustc_hash = digest(&toolchain.accepted.rustc)?;
     let versions_hash = digest(&repository.join("toolchain/versions.toml"))?;
     let profiles_hash = digest(&repository.join("toolchain/profiles.toml"))?;
-    let toolchain_report_hash = bytes_digest(toolchain.validation_report.as_bytes());
-    let artifact_report_hash = bytes_digest(artifact_report.as_bytes());
+    let toolchain_report_hash = toolchain.validation_report_sha256();
+    let artifact_report_hash = artifacts.inspection_report_sha256;
     let (repository_revision, repository_dirty) = repository_identity(repository)?;
     let loader_relative = repository_relative_path(repository, &loader, "UEFI loader")?;
     let debug_loader_relative =
@@ -276,6 +281,19 @@ fn configured_rustc(repository: &Path) -> Result<PathBuf, Failure> {
     Ok(path)
 }
 
+fn explicit_cargo_home() -> Result<PathBuf, Failure> {
+    let path = PathBuf::from(
+        env::var_os("CARGO_HOME")
+            .ok_or_else(|| Failure::task("UEFI loader build requires an explicit CARGO_HOME"))?,
+    );
+    if !path.is_absolute() {
+        return Err(Failure::task(
+            "UEFI loader build requires CARGO_HOME to be an absolute path",
+        ));
+    }
+    canonical_build_directory(&path, "Cargo home")
+}
+
 fn blocked_toolchain_failure(request: &str) -> Failure {
     let status = scalar_assignment(request, "status").unwrap_or("missing-status");
     Failure::task(format!(
@@ -354,12 +372,135 @@ where
     Ok(report)
 }
 
+pub(crate) fn build_deterministic_uefi_pair(
+    repository: &Path,
+    toolchain: &LoaderToolchain,
+    profile: &LoaderProfile,
+    layout: &DeepLayoutBuild,
+    build: &IsolatedUefiBuild<'_>,
+) -> Result<DeterministicUefiArtifacts, Failure> {
+    fs::create_dir_all(build.production_target).map_err(|error| {
+        Failure::task(format!(
+            "could not create production UEFI target root: {error}"
+        ))
+    })?;
+    fs::create_dir_all(build.retained_debug_target).map_err(|error| {
+        Failure::task(format!(
+            "could not create retained-debug UEFI target root: {error}"
+        ))
+    })?;
+    let cargo_home = canonical_build_directory(build.cargo_home, "Cargo home")?;
+    let production_target =
+        canonical_build_directory(build.production_target, "production UEFI target root")?;
+    let retained_debug_target = canonical_build_directory(
+        build.retained_debug_target,
+        "retained-debug UEFI target root",
+    )?;
+    run_uefi_cargo(
+        repository,
+        toolchain,
+        profile,
+        &cargo_home,
+        &production_target,
+        layout,
+        build.cargo_profile,
+        LoaderLinkMode::Production,
+        "check",
+    )?;
+    run_uefi_cargo(
+        repository,
+        toolchain,
+        profile,
+        &cargo_home,
+        &retained_debug_target,
+        layout,
+        build.cargo_profile,
+        LoaderLinkMode::RetainedDebug,
+        "build",
+    )?;
+    run_uefi_cargo(
+        repository,
+        toolchain,
+        profile,
+        &cargo_home,
+        &production_target,
+        layout,
+        build.cargo_profile,
+        LoaderLinkMode::Production,
+        "build",
+    )?;
+
+    let loader = production_target
+        .join(&profile.rust_target)
+        .join(build.cargo_profile.directory())
+        .join(&profile.artifact_name);
+    let debug_output = retained_debug_target
+        .join(&profile.rust_target)
+        .join(build.cargo_profile.directory());
+    let debug_loader = debug_output.join(&profile.artifact_name);
+    let debug_symbols = debug_output.join(format!("{}.pdb", profile.cargo_binary));
+    validate_regular_artifact(&loader, "UEFI loader", MAX_LOADER_BYTES)?;
+    validate_regular_artifact(
+        &debug_loader,
+        "retained debug UEFI loader",
+        MAX_LOADER_BYTES,
+    )?;
+    validate_regular_artifact(
+        &debug_symbols,
+        "UEFI loader debug symbols",
+        MAX_DEBUG_SYMBOL_BYTES,
+    )?;
+    let inspection_report = run_verified_report(
+        repository,
+        &profile.artifact_inspection,
+        [
+            loader.as_os_str(),
+            debug_loader.as_os_str(),
+            debug_symbols.as_os_str(),
+        ],
+        "UEFI artifact inspection",
+    )?;
+    let effective_config = normalized_uefi_config(profile, build.cargo_profile);
+    Ok(DeterministicUefiArtifacts {
+        loader,
+        debug_loader,
+        debug_symbols,
+        effective_config_sha256: bytes_digest(effective_config.as_bytes()),
+        effective_config,
+        inspection_report_sha256: bytes_digest(inspection_report.as_bytes()),
+        inspection_report,
+    })
+}
+
+fn normalized_uefi_config(profile: &LoaderProfile, cargo_profile: UefiCargoProfile) -> String {
+    format!(
+        concat!(
+            "schema_version=1\n",
+            "target={}\npackage={}\nbinary={}\nfeatures={}\nprofile={}\n",
+            "repository_remap=/source/wyrmroot\n",
+            "cargo_home_remap=/cargo-home\n",
+            "cargo_target_remap=/cargo-target\n",
+            "linker=accepted-rust-lld\n",
+            "production_link_args=/Brepro,/debug:none\n",
+            "retained_debug_link_args=/Brepro,/pdbaltpath:loader.pdb\n",
+            "source_date_epoch=0\ncargo_incremental=0\n"
+        ),
+        profile.rust_target,
+        profile.cargo_package,
+        profile.cargo_binary,
+        profile.cargo_features,
+        cargo_profile.name(),
+    )
+}
+
 fn run_uefi_cargo(
     repository: &Path,
     toolchain: &LoaderToolchain,
     profile: &LoaderProfile,
+    cargo_home: &Path,
     target_directory: &Path,
     layout: &DeepLayoutBuild,
+    cargo_profile: UefiCargoProfile,
     link_mode: LoaderLinkMode,
     operation: &str,
 ) -> Result<(), Failure> {
@@ -375,9 +516,20 @@ fn run_uefi_cargo(
         .rust_lld
         .to_str()
         .ok_or_else(|| Failure::task("accepted rust-lld path is not valid UTF-8"))?;
-    let encoded_rustflags = deterministic_uefi_rustflags(repository, sysroot, rust_lld, link_mode)?;
-    let status = Command::new(&toolchain.accepted.cargo)
-        .arg(operation)
+    let encoded_rustflags = deterministic_uefi_rustflags(
+        repository,
+        cargo_home,
+        target_directory,
+        sysroot,
+        rust_lld,
+        link_mode,
+    )?;
+    let mut command = Command::new(&toolchain.accepted.cargo);
+    command.arg(operation);
+    if cargo_profile == UefiCargoProfile::Release {
+        command.arg("--release");
+    }
+    let status = command
         .arg("--locked")
         .arg("--package")
         .arg(&profile.cargo_package)
@@ -389,6 +541,7 @@ fn run_uefi_cargo(
         .arg(&profile.rust_target)
         .arg("--target-dir")
         .arg(target_directory)
+        .env("CARGO_HOME", cargo_home)
         .env("RUSTC", &toolchain.accepted.rustc)
         .env("CARGO_ENCODED_RUSTFLAGS", encoded_rustflags)
         .env("SOURCE_DATE_EPOCH", "0")
@@ -419,40 +572,47 @@ fn run_uefi_cargo(
 
 fn deterministic_uefi_rustflags(
     repository: &Path,
+    cargo_home: &Path,
+    target_directory: &Path,
     sysroot: &str,
     rust_lld: &str,
     link_mode: LoaderLinkMode,
 ) -> Result<String, Failure> {
-    let cargo_home = env::var_os("CARGO_HOME")
-        .ok_or_else(|| Failure::task("UEFI loader build requires an explicit CARGO_HOME"))?;
-    let cargo_home = PathBuf::from(cargo_home);
-    if !cargo_home.is_absolute() {
-        return Err(Failure::task(
-            "UEFI loader build requires CARGO_HOME to be an absolute path",
-        ));
-    }
-    encoded_uefi_rustflags(repository, &cargo_home, sysroot, rust_lld, link_mode)
+    encoded_uefi_rustflags(
+        repository,
+        cargo_home,
+        target_directory,
+        sysroot,
+        rust_lld,
+        link_mode,
+    )
 }
 
 fn encoded_uefi_rustflags(
     repository: &Path,
     cargo_home: &Path,
+    target_directory: &Path,
     sysroot: &str,
     rust_lld: &str,
     link_mode: LoaderLinkMode,
 ) -> Result<String, Failure> {
     let repository = canonical_build_directory(repository, "Wyrmroot repository")?;
     let cargo_home = canonical_build_directory(cargo_home, "Cargo home")?;
+    let target_directory = canonical_build_directory(target_directory, "Cargo target root")?;
     let repository = repository
         .to_str()
         .ok_or_else(|| Failure::task("Wyrmroot repository path is not valid UTF-8"))?;
     let cargo_home = cargo_home
         .to_str()
         .ok_or_else(|| Failure::task("Cargo home path is not valid UTF-8"))?;
+    let target_directory = target_directory
+        .to_str()
+        .ok_or_else(|| Failure::task("Cargo target root is not valid UTF-8"))?;
 
     for (value, label) in [
         (repository, "Wyrmroot repository"),
         (cargo_home, "Cargo home"),
+        (target_directory, "Cargo target root"),
         (sysroot, "accepted sysroot"),
         (rust_lld, "accepted rust-lld"),
     ] {
@@ -470,6 +630,7 @@ fn encoded_uefi_rustflags(
         format!("linker={rust_lld}"),
         format!("--remap-path-prefix={repository}=/source/wyrmroot"),
         format!("--remap-path-prefix={cargo_home}=/cargo-home"),
+        format!("--remap-path-prefix={target_directory}=/cargo-target"),
         "-C".to_owned(),
         "link-arg=/Brepro".to_owned(),
     ];
@@ -769,12 +930,15 @@ mod tests {
         ));
         let repository = root.join("checkout");
         let cargo_home = root.join("cargo-home");
+        let target_directory = root.join("cargo-target");
         fs::create_dir_all(&repository).expect("create test repository");
         fs::create_dir_all(&cargo_home).expect("create test Cargo home");
+        fs::create_dir_all(&target_directory).expect("create test Cargo target root");
 
         let production_flags = encoded_uefi_rustflags(
             &repository,
             &cargo_home,
+            &target_directory,
             "/accepted/sysroot",
             "/accepted/rust-lld",
             LoaderLinkMode::Production,
@@ -796,6 +960,10 @@ mod tests {
                     repository.display()
                 ),
                 format!("--remap-path-prefix={}=/cargo-home", cargo_home.display()),
+                format!(
+                    "--remap-path-prefix={}=/cargo-target",
+                    target_directory.display()
+                ),
                 "-C".to_owned(),
                 "link-arg=/Brepro".to_owned(),
                 "-C".to_owned(),
@@ -806,6 +974,7 @@ mod tests {
         let debug_flags = encoded_uefi_rustflags(
             &repository,
             &cargo_home,
+            &target_directory,
             "/accepted/sysroot",
             "/accepted/rust-lld",
             LoaderLinkMode::RetainedDebug,

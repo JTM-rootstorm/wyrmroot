@@ -22,6 +22,7 @@ Usage:
     cargo xtask wyr1b inspect --request <wyr1-b-request.toml>
     cargo xtask wyr1b evidence --request <wyr1-b-request.toml> --log <evidence>
     cargo xtask dw1b image --request <dw1-b-request.toml>
+    cargo xtask dw1b freeze --output <directory>
     cargo xtask dw1b inspect --request <dw1-b-request.toml>
     cargo xtask dw1b run --request <dw1-b-request.toml>
     cargo xtask dw1b measure --init <elf> --hello <elf> --cpu-hog <elf> --progress <elf>
@@ -118,6 +119,7 @@ pub(crate) enum Action {
         log: String,
     },
     Dw1BImage(String),
+    Dw1BFreeze(String),
     Dw1BInspect(String),
     Dw1BRun(String),
     Dw1BMeasure {
@@ -183,6 +185,9 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
 
 fn dispatch_dw1b(arguments: &[String]) -> Result<Action, Failure> {
     match arguments {
+        [command, flag, output] if command == "freeze" && flag == "--output" => {
+            Ok(Action::Dw1BFreeze(output.clone()))
+        }
         [command, flag, request] if command == "image" && flag == "--request" => {
             Ok(Action::Dw1BImage(request.clone()))
         }
@@ -219,7 +224,7 @@ fn dispatch_dw1b(arguments: &[String]) -> Result<Action, Failure> {
             Ok(Action::Dw1BEvidence(request.clone()))
         }
         _ => Err(Failure::usage(
-            "dw1b requires image|inspect|run|evidence --request <path>, or measure with four exact artifacts",
+            "dw1b requires freeze --output <directory>, image|inspect|run|evidence --request <path>, or measure with four exact artifacts",
         )),
     }
 }
@@ -603,6 +608,11 @@ mod tests {
             Ok(Action::Dw1BRun("request.toml".into()))
         );
         assert!(USAGE.contains("dw1b run --request"));
+        assert_eq!(
+            dispatch(&arguments(&["dw1b", "freeze", "--output", "freeze"])),
+            Ok(Action::Dw1BFreeze("freeze".into()))
+        );
+        assert!(USAGE.contains("dw1b freeze --output"));
     }
 
     #[test]
