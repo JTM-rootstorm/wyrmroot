@@ -808,11 +808,12 @@ fn load_process_internal<P: LoaderPlatform>(
         &init[..init_len],
         &transfers[..transfer_count],
     ) {
-        if request.profile.channel_role().is_some() {
-            // The failed atomic send did not MOVE the caller-owned service
-            // endpoint.  Remove it from loader rollback ownership before
-            // consuming the transaction's internal handles.
-            transaction.delegated_channels[0] = None;
+        // A failed MOVE consumes nothing. Stream endpoints originate with the
+        // caller, so it retains every externally supplied endpoint for one
+        // exact cleanup path rather than letting loader rollback take partial
+        // ownership.
+        for delegated in &mut transaction.delegated_channels {
+            *delegated = None;
         }
         return Err(fail(platform, &mut transaction, LoadStage::InitSend, cause));
     }

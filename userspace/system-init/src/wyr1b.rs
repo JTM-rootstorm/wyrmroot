@@ -290,6 +290,16 @@ pub struct LoadedJob {
     pub task_group: u64,
 }
 
+/// A loader-committed launch which is deliberately not yet visible to the
+/// session owner. The dispatcher publishes it only after the exact profile
+/// READY observation, so a READY-and-exited race cannot yield acceptance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PreparedJob {
+    ticket: LaunchTicket,
+    pub loaded: LoadedProcess,
+    pub task_group: u64,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum LaunchEngineError<E> {
     Job(JobError),
@@ -507,6 +517,21 @@ impl JobController {
         Err(JobError::ForeignJob)
     }
 
+    /// Lists only active jobs visible to the exact owning session. Completion
+    /// records deliberately use `result` rather than leaking into this list.
+    pub fn list(&mut self, request: Reservation, out: &mut [u64]) -> Result<usize, JobError> {
+        let owner = self.reserve_transaction(request)?;
+        let mut count = 0usize;
+        for job in self.jobs.iter().flatten() {
+            if job.owner == owner && !job.orphaned {
+                let slot = out.get_mut(count).ok_or(JobError::Capacity)?;
+                *slot = job.id;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     pub fn disconnect(&mut self, id: u64, generation: u64) -> Result<(), JobError> {
         let identity = identity(id, generation)?;
         let connection = self.connection_mut(identity)?;
@@ -528,6 +553,25 @@ impl JobController {
             record.visible = false;
         }
         Ok(())
+    }
+
+    /// Reclaims closed session slots only after their retained orphan jobs
+    /// have terminally completed. IDs are never reassigned by this operation.
+    pub fn reclaim_closed_sessions(&mut self) {
+        for slot in &mut self.connections {
+            let Some(connection) = *slot else {
+                continue;
+            };
+            if !connection.open
+                && !self
+                    .jobs
+                    .iter()
+                    .flatten()
+                    .any(|job| job.owner == connection.identity)
+            {
+                *slot = None;
+            }
+        }
     }
 
     pub fn live_jobs(&self) -> usize {
@@ -627,6 +671,37 @@ pub fn launch_authorized_job<'a, L: LoaderPlatform>(
     request: wyrmroot_launch_proto::LaunchRequest<'a>,
     streams: &'a [deepwyrm_syscall::DwHandle],
 ) -> Result<LoadedJob, LaunchEngineError<L::Error>> {
+    let prepared = prepare_authorized_job(
+        jobs,
+        policy,
+        loader,
+        authority,
+        task_group,
+        reservation,
+        request,
+        streams,
+    )?;
+    commit_prepared_job(jobs, prepared).map_err(|error| LaunchEngineError::Publication {
+        error,
+        loaded: prepared.loaded,
+        task_group: prepared.task_group,
+    })
+}
+
+/// Performs policy validation and loader construction while retaining the
+/// reservation. The caller must either observe the exact READY then call
+/// [`commit_prepared_job`], or abort and clean up the loaded process.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_authorized_job<'a, L: LoaderPlatform>(
+    jobs: &mut JobController,
+    policy: &PolicyView<'a>,
+    loader: &mut L,
+    authority: LoadAuthority,
+    task_group: u64,
+    reservation: Reservation,
+    request: wyrmroot_launch_proto::LaunchRequest<'a>,
+    streams: &'a [deepwyrm_syscall::DwHandle],
+) -> Result<PreparedJob, LaunchEngineError<L::Error>> {
     if request.stream_count != streams.len() {
         return Err(LaunchEngineError::Job(JobError::StreamPolicy));
     }
@@ -676,23 +751,35 @@ pub fn launch_authorized_job<'a, L: LoaderPlatform>(
             });
         }
     };
-    if let Err(error) = jobs.commit_launch(
+    Ok(PreparedJob {
         ticket,
-        loaded.process.0,
-        task_group,
-        loaded.launch_channel.0,
-    ) {
-        return Err(LaunchEngineError::Publication {
-            error,
-            loaded,
-            task_group,
-        });
-    }
-    Ok(LoadedJob {
-        job_id: ticket.job_id,
         loaded,
         task_group,
     })
+}
+
+/// Publishes a prepared job only after the dispatcher has observed READY.
+pub fn commit_prepared_job(
+    jobs: &mut JobController,
+    prepared: PreparedJob,
+) -> Result<LoadedJob, JobError> {
+    jobs.commit_launch(
+        prepared.ticket,
+        prepared.loaded.process.0,
+        prepared.task_group,
+        prepared.loaded.launch_channel.0,
+    )?;
+    Ok(LoadedJob {
+        job_id: prepared.ticket.job_id,
+        loaded: prepared.loaded,
+        task_group: prepared.task_group,
+    })
+}
+
+/// Aborts a not-yet-visible prepared job reservation. The caller remains
+/// responsible for terminating/reaping and closing its loaded handles.
+pub fn abort_prepared_job(jobs: &mut JobController, prepared: PreparedJob) -> Result<(), JobError> {
+    jobs.abort_launch(prepared.ticket)
 }
 
 impl Default for JobController {
@@ -784,6 +871,33 @@ mod tests {
         assert_eq!(
             jobs.result(reservation(2, 1, 1), ticket.job_id),
             Err(JobError::UnknownJob)
+        );
+    }
+
+    #[test]
+    fn session_visibility_list_and_reclamation_are_owner_scoped() {
+        let mut jobs = JobController::new();
+        jobs.open_connection(1, 1).unwrap();
+        jobs.open_connection(2, 1).unwrap();
+        let first = jobs.begin_launch(reservation(1, 1, 1)).unwrap();
+        jobs.commit_launch(first, 10, 11, 12).unwrap();
+        let second = jobs.begin_launch(reservation(2, 1, 1)).unwrap();
+        jobs.commit_launch(second, 20, 21, 22).unwrap();
+        let mut listed = [0; MAX_LIVE_JOBS];
+        assert_eq!(jobs.list(reservation(1, 1, 2), &mut listed), Ok(1));
+        assert_eq!(listed[0], first.job_id);
+        jobs.disconnect(1, 1).unwrap();
+        jobs.reclaim_closed_sessions();
+        assert_eq!(
+            jobs.open_connection(1, 2),
+            Err(JobError::DuplicateConnection)
+        );
+        jobs.complete(first.job_id, 10, 11, 12, normal()).unwrap();
+        jobs.reclaim_closed_sessions();
+        jobs.open_connection(1, 2).unwrap();
+        assert_eq!(
+            jobs.query(reservation(1, 2, 1), second.job_id),
+            Err(JobError::ForeignJob)
         );
     }
 

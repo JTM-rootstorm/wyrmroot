@@ -452,7 +452,7 @@ fn failed_service_init_send_leaves_endpoint_with_caller() {
 }
 
 #[test]
-fn job_v2_selects_zero_or_three_stream_profile_and_rolls_back_owned_streams() {
+fn job_v2_selects_zero_or_three_stream_profile_and_retains_streams_on_failed_move() {
     let image = executable();
     let argv = ["bin/hello"];
     let streams = [DwHandle(0x901), DwHandle(0x902), DwHandle(0x903)];
@@ -503,7 +503,7 @@ fn job_v2_selects_zero_or_three_stream_profile_and_rolls_back_owned_streams() {
         }
     ));
     for stream in streams {
-        assert!(failing.events.contains(&Event::Close(stream.0)));
+        assert!(!failing.events.contains(&Event::Close(stream.0)));
     }
 }
 
