@@ -123,6 +123,11 @@ impl<'a> LaunchPolicy<'a> {
     pub const fn len(self) -> usize {
         self.count
     }
+
+    pub const fn is_empty(self) -> bool {
+        self.count == 0
+    }
+
     pub const fn boot_generation_sha256(self) -> [u8; 32] {
         self.boot_generation_sha256
     }

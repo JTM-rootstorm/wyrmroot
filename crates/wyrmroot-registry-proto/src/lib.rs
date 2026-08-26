@@ -755,6 +755,7 @@ pub fn encode_lookup(header: Header, lookup: Lookup<'_>, out: &mut [u8]) -> Resu
     Ok(size)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn encode_install_publication(
     header: Header,
     endpoint_id: u64,
@@ -1039,7 +1040,7 @@ fn validate_page_shape(
     let expected_pages = if total_count == 0 {
         1
     } else {
-        (total_count + 1) / 2
+        total_count.div_ceil(2)
     };
     let expected_records = if total_count == 0 {
         0
