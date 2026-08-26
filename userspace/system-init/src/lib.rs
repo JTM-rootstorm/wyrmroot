@@ -9,6 +9,7 @@
 pub mod evidence;
 pub mod gate;
 
+use crate::gate::{GATE_CONFIG_PATH, GateConfig, GateConfigError, parse_gate_config};
 use deepwyrm_syscall::{
     DW_DEADLINE_INFINITE, DW_SIGNAL_EXITED, DW_TASK_STATE_EXITED, DwDeadline, DwHandle,
     DwObjectType, DwReceivedHandleInfoV1, DwRights, DwWaitItemV1,
@@ -267,6 +268,7 @@ pub enum InitError {
     Supervision,
     Cleanup,
     Accounting,
+    GateConfig(GateConfigError),
 }
 
 impl From<RestartTransitionError> for InitError {
@@ -301,6 +303,7 @@ pub struct SystemInit {
     degraded_transitions: u8,
     activated: [bool; EARLY_ROLE_COUNT],
     accounting: AttemptLedger,
+    gate: Option<GateConfig>,
 }
 
 impl SystemInit {
@@ -371,6 +374,7 @@ impl SystemInit {
             degraded_transitions: 0,
             activated: [false; EARLY_ROLE_COUNT],
             accounting: AttemptLedger::new(),
+            gate: None,
         })
     }
 
@@ -422,6 +426,11 @@ impl SystemInit {
     #[must_use]
     pub const fn outstanding_reservations(&self) -> usize {
         self.accounting.outstanding()
+    }
+
+    #[must_use]
+    pub const fn gate_config(&self) -> Option<GateConfig> {
+        self.gate
     }
 
     /// Marks manifest/closure/controller initialization complete. This is the
@@ -682,7 +691,7 @@ pub fn validate_retained_bootfs(bytes: &[u8]) -> Result<SystemInit, InitError> {
     }
     let manifest = Manifest::parse_structural(manifest_bytes, &encoded_generation)
         .map_err(InitError::Manifest)?;
-    let controller = SystemInit::from_manifest(manifest)?;
+    let mut controller = SystemInit::from_manifest(manifest)?;
     for role in manifest.roles() {
         let entry = archive.lookup(role.path().as_bytes()).map_err(map_lookup)?;
         if !entry.is_executable() || entry.data().is_empty() {
@@ -708,6 +717,11 @@ pub fn validate_retained_bootfs(bytes: &[u8]) -> Result<SystemInit, InitError> {
             let _observed_identity = wyrmroot_runtime::sha256::digest(entry.data());
         }
     }
+    controller.gate = match archive.lookup(GATE_CONFIG_PATH.as_bytes()) {
+        Ok(entry) => Some(parse_gate_config(entry.data()).map_err(InitError::GateConfig)?),
+        Err(LookupError::NotFound) => None,
+        Err(error) => return Err(map_lookup(error)),
+    };
     Ok(controller)
 }
 
