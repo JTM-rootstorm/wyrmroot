@@ -53,6 +53,8 @@ pub use capability_native::{
     create_task_group, create_timer, duplicate_handle, map_memory_read_only, map_memory_read_write,
     set_timer, signal_event, terminate_process, terminate_task_group, unmap_memory, wait_one,
 };
+#[cfg(feature = "wyr1-test-evidence")]
+pub use capability_native::{WYR1_EVIDENCE_RECORD_BYTES, submit_wyr1_evidence};
 pub use loader_native::NativeLoaderPlatform;
 pub use native::{
     MappedBootfs, NativeError, NativeOutputError, PANIC_EXIT_CODE, ReceiveCounts, close_handle,

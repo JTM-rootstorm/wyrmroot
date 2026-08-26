@@ -12,6 +12,7 @@ path = "src/lib.rs"
 [features]
 default = []
 primordial-test-support = []
+wyr1-test-evidence = []
 
 [dependencies]
 deepwyrm-syscall.workspace = true

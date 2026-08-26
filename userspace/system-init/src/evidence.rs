@@ -1,7 +1,9 @@
-//! Allocation-free WYR1EVID1 records emitted from supervisor transitions.
+//! Allocation-free fixed WYR1EVID1 records for the selector-25 collector.
 
-/// Largest canonical WYR1 evidence record, including its newline.
-pub const MAX_RECORD_BYTES: usize = 192;
+use crate::gate::GateScenario;
+
+pub const RECORD_BYTES: usize = 114;
+pub const MAX_TRANSCRIPT_RECORDS: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EvidenceEvent {
@@ -9,24 +11,18 @@ pub enum EvidenceEvent {
     Reap,
     Restart,
     PermanentFailure,
-    Normal,
-    Degraded,
+    Terminal,
 }
 
 impl EvidenceEvent {
-    const fn name(self) -> &'static [u8] {
+    const fn kind(self) -> u8 {
         match self {
-            Self::Ready => b"READY",
-            Self::Reap => b"REAP",
-            Self::Restart => b"RESTART",
-            Self::PermanentFailure => b"PermanentFailure",
-            Self::Normal => b"NORMAL",
-            Self::Degraded => b"DEGRADED",
+            Self::Ready => 0x01,
+            Self::Reap => 0x02,
+            Self::Restart => 0x03,
+            Self::PermanentFailure => 0x04,
+            Self::Terminal => 0xff,
         }
-    }
-
-    const fn terminal(self) -> bool {
-        matches!(self, Self::Normal | Self::Degraded)
     }
 }
 
@@ -34,27 +30,29 @@ impl EvidenceEvent {
 pub enum EvidenceError {
     ZeroNonce,
     InvalidIdentity,
+    InvalidValue,
     SequenceOverflow,
-    BufferTooSmall,
+    TranscriptFull,
     AlreadyTerminal,
 }
 
-/// Current-boot producer state. Sequence and terminal ordering are not caller supplied.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EvidenceProducer {
     nonce: u64,
-    sequence: u64,
+    sequence: u32,
+    scenario: GateScenario,
     terminal: bool,
 }
 
 impl EvidenceProducer {
-    pub const fn new(nonce: u64) -> Result<Self, EvidenceError> {
+    pub const fn new(nonce: u64, scenario: GateScenario) -> Result<Self, EvidenceError> {
         if nonce == 0 {
             return Err(EvidenceError::ZeroNonce);
         }
         Ok(Self {
             nonce,
             sequence: 0,
+            scenario,
             terminal: false,
         })
     }
@@ -65,44 +63,119 @@ impl EvidenceProducer {
         role: u32,
         generation: u64,
         transaction: u64,
-        output: &mut [u8],
-    ) -> Result<usize, EvidenceError> {
+        value: u64,
+    ) -> Result<[u8; RECORD_BYTES], EvidenceError> {
         if self.terminal {
             return Err(EvidenceError::AlreadyTerminal);
         }
-        if event.terminal() {
-            if role != 0 || generation != 0 || transaction != 0 {
+        let terminal = event == EvidenceEvent::Terminal;
+        if terminal {
+            if role != 0 || generation != 0 || transaction != 0 || value != 0 {
                 return Err(EvidenceError::InvalidIdentity);
             }
         } else if role == 0 || generation == 0 || transaction == 0 {
             return Err(EvidenceError::InvalidIdentity);
         }
+        match event {
+            EvidenceEvent::Ready if value != 0 => return Err(EvidenceError::InvalidValue),
+            EvidenceEvent::Restart if value <= generation => {
+                return Err(EvidenceError::InvalidValue);
+            }
+            EvidenceEvent::PermanentFailure if value == 0 => {
+                return Err(EvidenceError::InvalidValue);
+            }
+            _ => {}
+        }
 
-        let mut writer = Writer::new(output);
-        writer.bytes(b"wyr1evid1|nonce=")?;
-        writer.hex_u64(self.nonce)?;
-        writer.bytes(b"|seq=")?;
-        writer.decimal_u64(self.sequence)?;
-        writer.bytes(b"|event=")?;
-        writer.bytes(event.name())?;
-        writer.bytes(b"|role=")?;
-        writer.hex_u32(role)?;
-        writer.bytes(b"|generation=")?;
-        writer.hex_u64(generation)?;
-        writer.bytes(b"|transaction=")?;
-        writer.hex_u64(transaction)?;
-        let checksum = fnv1a32(&writer.output[..writer.position]);
-        writer.bytes(b"|checksum=")?;
-        writer.hex_u32(checksum)?;
-        writer.byte(b'\n')?;
-        let size = writer.position;
-
+        let mut output = [b'|'; RECORD_BYTES];
+        output[..9].copy_from_slice(b"WYR1EVID1");
+        put_hex(&mut output[10..12], 1);
+        put_hex(&mut output[13..29], self.nonce);
+        put_hex(&mut output[30..38], u64::from(self.sequence));
+        put_hex(&mut output[39..41], u64::from(event.kind()));
+        put_hex(
+            &mut output[42..44],
+            match self.scenario {
+                GateScenario::Normal => 1,
+                GateScenario::DegradedRecovery => 2,
+            },
+        );
+        put_hex(&mut output[45..53], u64::from(role));
+        put_hex(&mut output[54..70], generation);
+        put_hex(&mut output[71..87], transaction);
+        put_hex(&mut output[88..104], value);
+        let checksum = fnv1a32(&output[..105]);
+        put_hex(&mut output[105..113], u64::from(checksum));
+        output[113] = b'\n';
         self.sequence = self
             .sequence
             .checked_add(1)
             .ok_or(EvidenceError::SequenceOverflow)?;
-        self.terminal = event.terminal();
-        Ok(size)
+        self.terminal = terminal;
+        Ok(output)
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct EvidenceLog {
+    producer: EvidenceProducer,
+    lines: [[u8; RECORD_BYTES]; MAX_TRANSCRIPT_RECORDS],
+    count: usize,
+}
+
+impl EvidenceLog {
+    pub const fn new(nonce: u64, scenario: GateScenario) -> Result<Self, EvidenceError> {
+        Ok(Self {
+            producer: match EvidenceProducer::new(nonce, scenario) {
+                Ok(producer) => producer,
+                Err(error) => return Err(error),
+            },
+            lines: [[0; RECORD_BYTES]; MAX_TRANSCRIPT_RECORDS],
+            count: 0,
+        })
+    }
+
+    pub fn record(
+        &mut self,
+        event: EvidenceEvent,
+        role: u32,
+        generation: u64,
+        transaction: u64,
+        value: u64,
+    ) -> Result<(), EvidenceError> {
+        let slot = self
+            .lines
+            .get_mut(self.count)
+            .ok_or(EvidenceError::TranscriptFull)?;
+        *slot = self
+            .producer
+            .encode(event, role, generation, transaction, value)?;
+        self.count += 1;
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.count
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    #[must_use]
+    pub fn line(&self, index: usize) -> Option<&[u8; RECORD_BYTES]> {
+        self.lines.get(index).filter(|_| index < self.count)
+    }
+}
+
+fn put_hex(output: &mut [u8], value: u64) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let length = output.len();
+    for (index, byte) in output.iter_mut().enumerate() {
+        let shift = (length - index - 1) * 4;
+        *byte = HEX[((value >> shift) & 0xf) as usize];
     }
 }
 
@@ -114,93 +187,42 @@ fn fnv1a32(bytes: &[u8]) -> u32 {
     hash
 }
 
-struct Writer<'a> {
-    output: &'a mut [u8],
-    position: usize,
-}
-
-impl<'a> Writer<'a> {
-    const fn new(output: &'a mut [u8]) -> Self {
-        Self {
-            output,
-            position: 0,
-        }
-    }
-
-    fn byte(&mut self, value: u8) -> Result<(), EvidenceError> {
-        let slot = self
-            .output
-            .get_mut(self.position)
-            .ok_or(EvidenceError::BufferTooSmall)?;
-        *slot = value;
-        self.position += 1;
-        Ok(())
-    }
-
-    fn bytes(&mut self, values: &[u8]) -> Result<(), EvidenceError> {
-        for value in values {
-            self.byte(*value)?;
-        }
-        Ok(())
-    }
-
-    fn hex_u32(&mut self, value: u32) -> Result<(), EvidenceError> {
-        self.hex(u64::from(value), 8)
-    }
-
-    fn hex_u64(&mut self, value: u64) -> Result<(), EvidenceError> {
-        self.hex(value, 16)
-    }
-
-    fn hex(&mut self, value: u64, digits: usize) -> Result<(), EvidenceError> {
-        const HEX: &[u8; 16] = b"0123456789ABCDEF";
-        for shift in (0..digits).rev() {
-            self.byte(HEX[((value >> (shift * 4)) & 0xf) as usize])?;
-        }
-        Ok(())
-    }
-
-    fn decimal_u64(&mut self, value: u64) -> Result<(), EvidenceError> {
-        let mut digits = [0_u8; 20];
-        let mut index = digits.len();
-        let mut remaining = value;
-        loop {
-            index -= 1;
-            digits[index] = b'0' + (remaining % 10) as u8;
-            remaining /= 10;
-            if remaining == 0 {
-                break;
-            }
-        }
-        self.bytes(&digits[index..])
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn canonical_records_match_tooling_protocol() {
-        let mut producer = EvidenceProducer::new(0x0123_4567_89ab_cdef).unwrap();
-        let mut output = [0; MAX_RECORD_BYTES];
-        let size = producer
-            .encode(EvidenceEvent::Ready, 1, 1, 2, &mut output)
-            .unwrap();
+    fn exact_wire_offsets_length_and_checksum_are_stable() {
+        let mut producer =
+            EvidenceProducer::new(0x0123_4567_89ab_cdef, GateScenario::Normal).unwrap();
+        let line = producer.encode(EvidenceEvent::Ready, 1, 1, 2, 0).unwrap();
+        assert_eq!(&line[..10], b"WYR1EVID1|");
+        assert_eq!(&line[10..13], b"01|");
+        assert_eq!(&line[13..30], b"0123456789ABCDEF|");
+        assert_eq!(&line[39..45], b"01|01|");
+        assert_eq!(line[113], b'\n');
+        let checksum = core::str::from_utf8(&line[105..113]).unwrap();
         assert_eq!(
-            core::str::from_utf8(&output[..size]).unwrap(),
-            "wyr1evid1|nonce=0123456789ABCDEF|seq=0|event=READY|role=00000001|generation=0000000000000001|transaction=0000000000000002|checksum=16116C74\n"
+            u32::from_str_radix(checksum, 16).unwrap(),
+            fnv1a32(&line[..105])
         );
-        let size = producer
-            .encode(EvidenceEvent::Normal, 0, 0, 0, &mut output)
-            .unwrap();
-        assert!(
-            core::str::from_utf8(&output[..size])
-                .unwrap()
-                .contains("|seq=1|event=NORMAL|")
-        );
+    }
+
+    #[test]
+    fn transcript_enforces_restart_and_terminal_semantics() {
+        let mut log = EvidenceLog::new(1, GateScenario::DegradedRecovery).unwrap();
+        log.record(EvidenceEvent::Ready, 1, 1, 2, 0).unwrap();
         assert_eq!(
-            producer.encode(EvidenceEvent::Reap, 1, 1, 2, &mut output),
+            log.record(EvidenceEvent::Restart, 1, 1, 2, 1),
+            Err(EvidenceError::InvalidValue)
+        );
+        log.record(EvidenceEvent::Restart, 1, 1, 2, 2).unwrap();
+        log.record(EvidenceEvent::PermanentFailure, 1, 2, 3, 1)
+            .unwrap();
+        log.record(EvidenceEvent::Terminal, 0, 0, 0, 0).unwrap();
+        assert_eq!(log.len(), 4);
+        assert_eq!(
+            log.record(EvidenceEvent::Reap, 1, 2, 3, 0),
             Err(EvidenceError::AlreadyTerminal)
         );
     }

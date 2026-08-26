@@ -96,6 +96,19 @@ fn main(startup: StartupBlock<'_>) -> u32 {
     let Ok(mut resident) = result else {
         return 0xAF01_0002;
     };
+    #[cfg(feature = "wyr1-test-evidence")]
+    {
+        let mut index = 0;
+        while let Some(line) = resident.controller().evidence_line(index) {
+            let Ok(record) = <&[u8; 114]>::try_from(line) else {
+                return 0xAF01_0007;
+            };
+            if wyrmroot_runtime::submit_wyr1_evidence(record).is_err() {
+                return 0xAF01_0008;
+            }
+            index += 1;
+        }
+    }
     loop {
         let Ok(now) = monotonic_active_now() else {
             return 0xAF01_0003;

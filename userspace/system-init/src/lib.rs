@@ -9,10 +9,11 @@
 pub mod evidence;
 pub mod gate;
 
+use crate::evidence::{EvidenceError, EvidenceEvent, EvidenceLog};
 use crate::gate::{GATE_CONFIG_PATH, GateConfig, GateConfigError, parse_gate_config};
 use deepwyrm_syscall::{
-    DW_DEADLINE_INFINITE, DW_SIGNAL_EXITED, DW_TASK_STATE_EXITED, DwDeadline, DwHandle,
-    DwObjectType, DwReceivedHandleInfoV1, DwRights, DwWaitItemV1,
+    DW_DEADLINE_INFINITE, DW_SIGNAL_EXITED, DW_SIGNAL_PEER_CLOSED, DW_TASK_STATE_EXITED,
+    DwDeadline, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights, DwWaitItemV1,
 };
 use wyrmroot_bootfs::archive::{Archive, LookupError, ParseError};
 use wyrmroot_loader::{
@@ -269,6 +270,7 @@ pub enum InitError {
     Cleanup,
     Accounting,
     GateConfig(GateConfigError),
+    Evidence(EvidenceError),
 }
 
 impl From<RestartTransitionError> for InitError {
@@ -304,6 +306,7 @@ pub struct SystemInit {
     activated: [bool; EARLY_ROLE_COUNT],
     accounting: AttemptLedger,
     gate: Option<GateConfig>,
+    evidence: Option<EvidenceLog>,
 }
 
 impl SystemInit {
@@ -375,6 +378,7 @@ impl SystemInit {
             activated: [false; EARLY_ROLE_COUNT],
             accounting: AttemptLedger::new(),
             gate: None,
+            evidence: None,
         })
     }
 
@@ -431,6 +435,14 @@ impl SystemInit {
     #[must_use]
     pub const fn gate_config(&self) -> Option<GateConfig> {
         self.gate
+    }
+
+    #[must_use]
+    pub fn evidence_line(&self, index: usize) -> Option<&[u8]> {
+        self.evidence
+            .as_ref()?
+            .line(index)
+            .map(|line| line.as_slice())
     }
 
     /// Marks manifest/closure/controller initialization complete. This is the
@@ -535,6 +547,7 @@ impl SystemInit {
         self.roles[index]
             .restart
             .ready(generation, transaction, now)?;
+        self.record_evidence(EvidenceEvent::Ready, role, generation, transaction, 0)?;
         self.activated[index] = true;
         if role == RoleId::Registryd {
             if self.roles[1].restart.state() != RestartState::Stopped {
@@ -609,7 +622,8 @@ impl SystemInit {
         if let Some(mut resources) = controller.resources.take() {
             self.accounting.release(&mut resources.reservation)?;
         }
-        self.update_permanent_failure(role);
+        self.record_evidence(EvidenceEvent::Reap, role, generation, transaction, 0)?;
+        self.update_permanent_failure(role)?;
         Ok(())
     }
 
@@ -624,7 +638,7 @@ impl SystemInit {
         controller
             .restart
             .cleanup_failed(generation, transaction, now)?;
-        self.update_permanent_failure(role);
+        self.update_permanent_failure(role)?;
         Ok(())
     }
 
@@ -635,10 +649,23 @@ impl SystemInit {
         generation: u64,
         transaction: u64,
     ) -> Result<(), InitError> {
+        let previous = self
+            .index(role)
+            .and_then(|index| self.roles[index].restart.history().as_slice().last())
+            .and_then(|record| *record)
+            .map(|record| (record.generation, record.transaction_id))
+            .ok_or(InitError::Accounting)?;
         self.controller_mut(role)?
             .restart
             .start_replacement(now, generation, transaction)?;
-        self.update_permanent_failure(role);
+        self.record_evidence(
+            EvidenceEvent::Restart,
+            role,
+            previous.0,
+            previous.1,
+            generation,
+        )?;
+        self.update_permanent_failure(role)?;
         Ok(())
     }
 
@@ -646,7 +673,7 @@ impl SystemInit {
         self.mode = SystemMode::Fatal;
     }
 
-    fn update_permanent_failure(&mut self, role: RoleId) {
+    fn update_permanent_failure(&mut self, role: RoleId) -> Result<(), InitError> {
         if self
             .role_state(role)
             .is_some_and(|state| matches!(state, RestartState::PermanentFailure { .. }))
@@ -654,7 +681,50 @@ impl SystemInit {
         {
             self.mode = SystemMode::Degraded;
             self.degraded_transitions = self.degraded_transitions.saturating_add(1);
+            let identity = self
+                .index(role)
+                .and_then(|index| self.roles[index].restart.history().as_slice().last())
+                .and_then(|record| *record)
+                .map(|record| (record.generation, record.transaction_id));
+            if let Some((last_generation, last_transaction_id)) = identity {
+                self.record_evidence(
+                    EvidenceEvent::PermanentFailure,
+                    role,
+                    last_generation,
+                    last_transaction_id,
+                    1,
+                )?;
+            }
         }
+        Ok(())
+    }
+    fn record_evidence(
+        &mut self,
+        event: EvidenceEvent,
+        role: RoleId,
+        generation: u64,
+        transaction: u64,
+        value: u64,
+    ) -> Result<(), InitError> {
+        if let Some(evidence) = &mut self.evidence {
+            evidence
+                .record(event, role as u32, generation, transaction, value)
+                .map_err(InitError::Evidence)?;
+        }
+        Ok(())
+    }
+
+    fn finalize_evidence(&mut self, result: RecoveryResult) -> Result<(), InitError> {
+        if let Some(evidence) = &mut self.evidence {
+            match result {
+                RecoveryResult::Recovered | RecoveryResult::Degraded => {}
+                RecoveryResult::Fatal => return Ok(()),
+            }
+            evidence
+                .record(EvidenceEvent::Terminal, 0, 0, 0, 0)
+                .map_err(InitError::Evidence)?;
+        }
+        Ok(())
     }
     fn index(&self, role: RoleId) -> Option<usize> {
         match role {
@@ -722,6 +792,11 @@ pub fn validate_retained_bootfs(bytes: &[u8]) -> Result<SystemInit, InitError> {
         Err(LookupError::NotFound) => None,
         Err(error) => return Err(map_lookup(error)),
     };
+    controller.evidence = controller
+        .gate
+        .map(|config| EvidenceLog::new(config.nonce, config.scenario))
+        .transpose()
+        .map_err(InitError::Evidence)?;
     Ok(controller)
 }
 
@@ -896,6 +971,25 @@ where
     system
         .send_channel(bootstrap_channel, &ready[..ready_len])
         .map_err(InitError::Native)?;
+    let retire_now = system.now().map_err(InitError::Native)?;
+    let retire_deadline = retire_now
+        .checked_add(WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns)
+        .ok_or(InitError::Restart(
+            RestartTransitionError::ArithmeticOverflow,
+        ))?;
+    let retire_item = DwWaitItemV1 {
+        handle: bootstrap_channel,
+        signals: DW_SIGNAL_PEER_CLOSED,
+    };
+    let retired = waits
+        .wait_many(
+            core::slice::from_ref(&retire_item),
+            DwDeadline(retire_deadline),
+        )
+        .map_err(|_| InitError::Supervision)?;
+    if retired.index != 0 || retired.observed.0 & DW_SIGNAL_PEER_CLOSED.0 == 0 {
+        return Err(InitError::Supervision);
+    }
     let now = system.now().map_err(InitError::Native)?;
     controller.begin_registry(now, 1, 0x1001)?;
     for role in [RoleId::Registryd, RoleId::Devmgr] {
@@ -945,6 +1039,7 @@ where
                     }
                     controller.cleanup_complete(role, generation, transaction_id, now + 1)?;
                     if advance_or_degrade(system, &mut controller, role, transaction_id)? {
+                        controller.finalize_evidence(RecoveryResult::Degraded)?;
                         return Ok((RecoveryResult::Degraded, controller));
                     }
                     continue;
@@ -1010,6 +1105,7 @@ where
                                 break;
                             }
                             if advance_or_degrade(system, &mut controller, role, transaction_id)? {
+                                controller.finalize_evidence(RecoveryResult::Degraded)?;
                                 return Ok((RecoveryResult::Degraded, controller));
                             }
                         }
@@ -1031,6 +1127,7 @@ where
                                 now + 1,
                             )?;
                             if advance_or_degrade(system, &mut controller, role, transaction_id)? {
+                                controller.finalize_evidence(RecoveryResult::Degraded)?;
                                 return Ok((RecoveryResult::Degraded, controller));
                             }
                         }
@@ -1049,12 +1146,14 @@ where
                     )?;
                     controller.cleanup_complete(role, generation, transaction_id, now + 1)?;
                     if advance_or_degrade(system, &mut controller, role, transaction_id)? {
+                        controller.finalize_evidence(RecoveryResult::Degraded)?;
                         return Ok((RecoveryResult::Degraded, controller));
                     }
                 }
             }
         }
     }
+    controller.finalize_evidence(RecoveryResult::Recovered)?;
     Ok((RecoveryResult::Recovered, controller))
 }
 

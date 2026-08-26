@@ -14,6 +14,11 @@ use deepwyrm_syscall::{
 
 use crate::{NativeError, NativeOutputError, PAGE_SIZE, wait_many};
 
+#[cfg(feature = "wyr1-test-evidence")]
+const DW_TEST_SYSCALL_WYR1_EVIDENCE: DwSyscallId = DwSyscallId(0xffff_ff19);
+#[cfg(feature = "wyr1-test-evidence")]
+pub const WYR1_EVIDENCE_RECORD_BYTES: usize = 114;
+
 /// One controller-owned mapping whose lifetime is explicit and whose writable alias can be
 /// irreversibly removed before publication.
 #[must_use = "memory mappings must be explicitly unmapped"]
@@ -268,6 +273,23 @@ pub fn terminate_task_group(
     require_success(raw::call(
         deepwyrm_syscall::DW_SYSCALL_TASK_GROUP_TERMINATE,
         [task_group.0, u64::from(reason.0), 0, 0, 0, 0],
+    ))
+}
+
+/// Submits one selector-25-only WYR1 evidence record to the test collector.
+/// Production kernels and other selectors reject the reserved raw operation.
+#[cfg(feature = "wyr1-test-evidence")]
+pub fn submit_wyr1_evidence(record: &[u8; WYR1_EVIDENCE_RECORD_BYTES]) -> Result<(), NativeError> {
+    require_success(raw::call(
+        DW_TEST_SYSCALL_WYR1_EVIDENCE,
+        [
+            record.as_ptr() as u64,
+            WYR1_EVIDENCE_RECORD_BYTES as u64,
+            0,
+            0,
+            0,
+            0,
+        ],
     ))
 }
 
