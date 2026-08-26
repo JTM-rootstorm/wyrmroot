@@ -515,7 +515,9 @@ impl LoaderPlatform for SmokeLoader {
             },
         ];
         let handles = match self.expected_profile {
-            launch::LaunchProfile::Hello | launch::LaunchProfile::EarlyBootStub => {
+            launch::LaunchProfile::Hello
+            | launch::LaunchProfile::EarlyBootStub
+            | launch::LaunchProfile::JobV2 => {
                 assert!(transfers.is_empty());
                 &received[..0]
             }
@@ -536,6 +538,13 @@ impl LoaderPlatform for SmokeLoader {
                     deepwyrm_syscall::DW_HANDLE_TRANSFER_MOVE
                 );
                 &received[..1]
+            }
+            launch::LaunchProfile::BootstrapRegistry
+            | launch::LaunchProfile::BootstrapService
+            | launch::LaunchProfile::RegistryClient
+            | launch::LaunchProfile::LaunchClient
+            | launch::LaunchProfile::JobV2Streams => {
+                return Err(NativeError::Status(DW_STATUS_BAD_HANDLE));
             }
         };
         let parsed = launch::parse_init(self.expected_profile, bytes, handles)
