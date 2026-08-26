@@ -157,6 +157,14 @@ each publisher or client, init creates another Channel pair and:
 The registry records the receiving control endpoint out-of-band. Header IDs are
 checked correlation values and never manufacture authority.
 
+Init creates the registry-control and every dependent-peer Channel pair with
+controller-broad `READ | WRITE | WAIT | INSPECT | TRANSFER` rights. Immediately
+before each atomic MOVE, init freshly queries the still-owned source endpoint
+and requires exact Channel type plus those exact broad rights. Rights are
+reduced to `READ | WRITE | WAIT | INSPECT` only by the MOVE descriptor that
+transfers the endpoint to registryd or the launched child; the retained
+controller endpoint is never prematurely reduced.
+
 Restarting registryd closes every old control, publication, and client endpoint.
 Init waits for exact terminal cleanup, creates fresh pairs and a nonzero new
 registry generation exactly equal to the new RRC `Registryd` role generation,
@@ -173,12 +181,38 @@ endpoint IDs as well as fresh Channels. This makes old numeric identities
 unavailable for accidental rebinding even after registryd's generation-local
 issued-identity ledgers are discarded.
 
+The four generations are intentionally distinct. Registry generation is the
+current RRC `Registryd` role generation. Endpoint generation is the
+controller-issued generation of one endpoint identity (WYR1-B issues `1` for
+each fresh boot-monotonic endpoint ID) and is what WRTG actor/object generation
+fields carry. Publication service generation is the P1/P2 service incarnation
+stored by WRRG. Client generation is the installed logical client incarnation.
+Neither service/client generation nor an RRC role generation may be substituted
+for endpoint generation in WRTG correlation.
+
 WRRG v1 has no installation acknowledgement. Therefore an init-side failure
 after a successful atomic `INSTALL_PUBLICATION` or `INSTALL_CLIENT` MOVE cannot
 prove whether registryd committed the grant. Init poisons and restarts the
 whole registry generation, tears down all dependent peers first, and never
 retries installation against that generation. Failures before the atomic MOVE
 commits remain locally recoverable because init still owns the endpoint.
+
+The controller represents that boundary as typed `PreInstall` versus
+`InstallCommitted` failure. Every staged owner removes a handle from local
+ownership only when the corresponding atomic MOVE succeeds. Rollback consumes
+each remaining handle, process, task group, and reservation at most once. A
+failed native cleanup is recorded as RRC cleanup failure and reaches permanent
+failure/degraded state; init never reports `cleanup_complete` merely because a
+rollback was attempted.
+
+Registry replacement follows one ownership order. Dependents are terminated
+and reaped first, then the old registry process/task group and controller
+endpoint close, then RRC admits a replacement. A newly READY registry remains
+staged until its dependent gate succeeds. Any committed-install gate failure
+cleans dependents first and rolls that registry generation back before another
+replacement can start. A dependent cleanup failure forbids replacement.
+`devmgr` uses its independent RRC state and neither blocks registry recovery nor
+inherits registry failure.
 
 ## 6. WRRG version 1 envelope
 
@@ -234,8 +268,8 @@ pairs.
 
 ### 7.1 Installation
 
-`INSTALL_PUBLICATION` carries one registry-side Channel with exact
-`READ | WRITE | WAIT | INSPECT`. Its body is:
+`INSTALL_PUBLICATION` carries one registry-side Channel reduced by the atomic
+MOVE to exact `READ | WRITE | WAIT | INSPECT`. Its body is:
 
 | Offset | Width | Field |
 | ---: | ---: | --- |
@@ -252,8 +286,8 @@ pairs.
 | 120 | `4*n` | version pairs |
 | following | name length | service-name bytes |
 
-`INSTALL_CLIENT` carries one registry-side Channel with exact
-`READ | WRITE | WAIT | INSPECT`. Its fixed 104-byte message appends nonzero
+`INSTALL_CLIENT` carries one registry-side Channel reduced by the atomic MOVE
+to exact `READ | WRITE | WAIT | INSPECT`. Its fixed 104-byte message appends nonzero
 installed endpoint ID, nonzero installed endpoint generation, nonzero client
 ID, nonzero client generation, enumeration scope, and zero reserved fields.
 Enumeration scope is `0 NONE` or `1 BOOTSTRAP_METADATA`.
