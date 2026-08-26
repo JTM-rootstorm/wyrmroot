@@ -472,13 +472,25 @@ fn execute_run(
 ) -> Result<(Request, Vec<u8>), Failure> {
     let _ = inspect(request_path)?;
     let request = load(request_path)?;
-    execute_run_loaded(request_path, request, executor)
+    execute_run_loaded_with_validation(request_path, request, executor, || {
+        inspect(request_path).map(|_| ())
+    })
 }
 
+#[cfg(test)]
 fn execute_run_loaded(
     request_path: &Path,
     request: Request,
     executor: impl FnOnce(&RunInvocation) -> Result<RunObservation, Failure>,
+) -> Result<(Request, Vec<u8>), Failure> {
+    execute_run_loaded_with_validation(request_path, request, executor, || Ok(()))
+}
+
+fn execute_run_loaded_with_validation(
+    request_path: &Path,
+    request: Request,
+    executor: impl FnOnce(&RunInvocation) -> Result<RunObservation, Failure>,
+    post_run_validator: impl FnOnce() -> Result<(), Failure>,
 ) -> Result<(Request, Vec<u8>), Failure> {
     if request.serial_log.parent() != Some(request.run_directory.as_path())
         || request.run_receipt.parent() != Some(request.run_directory.as_path())
@@ -492,6 +504,8 @@ fn execute_run_loaded(
     let snapshot_esp = request.run_directory.join("booted-esp.img");
     let snapshot_code = request.run_directory.join("OVMF_CODE.fd");
     let snapshot_vars = request.run_directory.join("OVMF_VARS.fd");
+    let snapshot_bootfs = request.run_directory.join("bootfs.img");
+    let snapshot_build_receipt = request.run_directory.join("build-receipt.toml");
     let stderr_log = request.run_directory.join("qemu.stderr.log");
     for path in [
         &request.serial_log,
@@ -500,6 +514,8 @@ fn execute_run_loaded(
         &snapshot_esp,
         &snapshot_code,
         &snapshot_vars,
+        &snapshot_bootfs,
+        &snapshot_build_receipt,
         &stderr_log,
     ] {
         if fs::symlink_metadata(path).is_ok() {
@@ -526,6 +542,13 @@ fn execute_run_loaded(
         Some(&request.ovmf_vars_sha256),
         "OVMF vars",
     )?;
+    snapshot_exact(&request.bootfs, &snapshot_bootfs, None, "bootfs")?;
+    snapshot_exact(
+        &request.receipt,
+        &snapshot_build_receipt,
+        None,
+        "build receipt",
+    )?;
     let initial_esp_hash = sha256::file_digest(&snapshot_esp)
         .map_err(|error| Failure::task(format!("could not hash run-local ESP: {error}")))?;
     let invocation = RunInvocation {
@@ -547,7 +570,38 @@ fn execute_run_loaded(
             "DW1-B read-only boot media changed during canonical execution",
         ));
     }
-    let receipt = render_run_receipt(&request, &serial, &initial_esp_hash, observation)?;
+    let request_after = read_bounded(request_path, "request", 64 * 1024)?;
+    let live_esp = read_bounded(&request.esp, "ESP", crate::g3_image::IMAGE_BYTES)?;
+    let live_bootfs = read_bounded(&request.bootfs, "bootfs", crate::g3_image::IMAGE_BYTES)?;
+    let live_build_receipt = read_bounded(&request.receipt, "build receipt", 64 * 1024)?;
+    let bootfs = read_bounded(
+        &snapshot_bootfs,
+        "run-local bootfs",
+        crate::g3_image::IMAGE_BYTES,
+    )?;
+    let build_receipt = read_bounded(
+        &snapshot_build_receipt,
+        "run-local build receipt",
+        64 * 1024,
+    )?;
+    if sha256::bytes_digest(&request_after) != request.request_sha256
+        || sha256::bytes_digest(&live_esp) != initial_esp_hash
+        || live_bootfs != bootfs
+        || live_build_receipt != build_receipt
+    {
+        return Err(Failure::task(
+            "DW1-B request or product changed during canonical execution",
+        ));
+    }
+    post_run_validator()?;
+    let receipt = render_run_receipt(
+        &request,
+        &serial,
+        &initial_esp_hash,
+        &build_receipt,
+        &bootfs,
+        observation,
+    )?;
     write_new_file(&request.run_receipt, receipt.as_bytes())?;
     if observation.timed_out {
         return Err(Failure::task(format!(
@@ -561,7 +615,12 @@ fn execute_run_loaded(
             observation.qemu_exit_status
         )));
     }
-    let verified = verify_run_receipt(&request)?;
+    let esp = read_bounded(
+        &snapshot_esp,
+        "run-local booted ESP",
+        crate::g3_image::IMAGE_BYTES,
+    )?;
+    let verified = verify_run_receipt_against(&request, &esp, &bootfs, &build_receipt)?;
     Ok((request, verified))
 }
 
@@ -569,15 +628,15 @@ fn render_run_receipt(
     request: &Request,
     serial: &[u8],
     esp_sha256: &str,
+    build_receipt: &[u8],
+    bootfs: &[u8],
     observation: RunObservation,
 ) -> Result<String, Failure> {
-    let build_receipt = read_bounded(&request.receipt, "build receipt", 64 * 1024)?;
-    let bootfs = read(&request.bootfs, "bootfs")?;
     Ok(format!(
         "kind = \"{RUN_RECEIPT_KIND}\"\nschema_version = 1\nselector = \"{SELECTOR}\"\ntest_id = {TEST_ID}\nrequest_sha256 = \"{}\"\nbuild_receipt_sha256 = \"{}\"\nesp_sha256 = \"{esp_sha256}\"\nbootfs_sha256 = \"{}\"\nserial_log_sha256 = \"{}\"\novmf_code_sha256 = \"{}\"\novmf_vars_sha256 = \"{}\"\nrun_directory = \"{}\"\nserial_log = \"{}\"\ntimeout_seconds = {}\nqemu_exit_status = {}\ntimed_out = {}\n",
         request.request_sha256,
-        sha256::bytes_digest(&build_receipt),
-        sha256::bytes_digest(&bootfs),
+        sha256::bytes_digest(build_receipt),
+        sha256::bytes_digest(bootfs),
         sha256::bytes_digest(serial),
         request.ovmf_code_sha256,
         request.ovmf_vars_sha256,
@@ -589,15 +648,25 @@ fn render_run_receipt(
     ))
 }
 
+#[cfg(test)]
 fn verify_run_receipt(request: &Request) -> Result<Vec<u8>, Failure> {
+    let build_receipt = read_bounded(&request.receipt, "build receipt", 64 * 1024)?;
+    let esp = read(&request.esp, "ESP")?;
+    let bootfs = read(&request.bootfs, "bootfs")?;
+    verify_run_receipt_against(request, &esp, &bootfs, &build_receipt)
+}
+
+fn verify_run_receipt_against(
+    request: &Request,
+    esp: &[u8],
+    bootfs: &[u8],
+    build_receipt: &[u8],
+) -> Result<Vec<u8>, Failure> {
     let receipt_bytes = read_bounded(&request.run_receipt, "run receipt", 64 * 1024)?;
     let receipt_text = core::str::from_utf8(&receipt_bytes)
         .map_err(|_| Failure::task("DW1-B run receipt is not UTF-8"))?;
     let values = parse_scalars(receipt_text)?;
     exact_keys(&values, RUN_RECEIPT_KEYS, "DW1-B run receipt")?;
-    let build_receipt = read_bounded(&request.receipt, "build receipt", 64 * 1024)?;
-    let esp = read(&request.esp, "ESP")?;
-    let bootfs = read(&request.bootfs, "bootfs")?;
     let serial = read_bounded(&request.serial_log, "serial log", 16 * 1024 * 1024)?;
     for (key, expected) in [
         ("kind", RUN_RECEIPT_KIND.to_owned()),
@@ -605,9 +674,9 @@ fn verify_run_receipt(request: &Request) -> Result<Vec<u8>, Failure> {
         ("selector", SELECTOR.to_owned()),
         ("test_id", TEST_ID.to_string()),
         ("request_sha256", request.request_sha256.clone()),
-        ("build_receipt_sha256", sha256::bytes_digest(&build_receipt)),
-        ("esp_sha256", sha256::bytes_digest(&esp)),
-        ("bootfs_sha256", sha256::bytes_digest(&bootfs)),
+        ("build_receipt_sha256", sha256::bytes_digest(build_receipt)),
+        ("esp_sha256", sha256::bytes_digest(esp)),
+        ("bootfs_sha256", sha256::bytes_digest(bootfs)),
         ("serial_log_sha256", sha256::bytes_digest(&serial)),
         ("ovmf_code_sha256", request.ovmf_code_sha256.clone()),
         ("ovmf_vars_sha256", request.ovmf_vars_sha256.clone()),
@@ -1479,6 +1548,38 @@ mod tests {
         assert!(verify_run_receipt(&request).is_err());
         assert!(evidence(Path::new("missing")).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mid_run_build_receipt_and_bootfs_mutation_fail_before_run_receipt() {
+        for mutate_receipt in [true, false] {
+            let root = fixture();
+            fs::create_dir_all(root.join("out")).unwrap();
+            fs::create_dir_all(root.join("run")).unwrap();
+            let request_path = root.join("request.toml");
+            fs::write(&request_path, request_text()).unwrap();
+            fs::write(root.join("out/receipt.toml"), b"build receipt").unwrap();
+            fs::write(root.join("out/esp.img"), b"esp").unwrap();
+            fs::write(root.join("out/bootfs.img"), b"bootfs").unwrap();
+            let request = load(&request_path).unwrap();
+            let error = execute_run_loaded(&request_path, request, |run| {
+                fs::write(&run.serial_log, valid_evidence_log(1)).unwrap();
+                let target = if mutate_receipt {
+                    root.join("out/receipt.toml")
+                } else {
+                    root.join("out/bootfs.img")
+                };
+                fs::write(target, b"mutated during execution").unwrap();
+                Ok(RunObservation {
+                    qemu_exit_status: Some(33),
+                    timed_out: false,
+                })
+            })
+            .unwrap_err();
+            assert!(error.message.contains("changed during canonical execution"));
+            assert!(!root.join("run/run-receipt.toml").exists());
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
