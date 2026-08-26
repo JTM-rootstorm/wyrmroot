@@ -805,16 +805,6 @@ pub fn receipt_text(
                 .map_err(|error| Failure::task(format!("could not hash {path}: {error}")))?
         ));
     }
-    lines.push(format!(
-        "ovmf_code_sha256 = \"{}\"",
-        sha256::file_digest(&request.ovmf_code)
-            .map_err(|error| Failure::task(format!("could not hash OVMF code: {error}")))?
-    ));
-    lines.push(format!(
-        "ovmf_vars_template_sha256 = \"{}\"",
-        sha256::file_digest(&request.ovmf_vars_template)
-            .map_err(|error| Failure::task(format!("could not hash OVMF vars: {error}")))?
-    ));
     Ok(format!("{}\n", lines.join("\n")))
 }
 
