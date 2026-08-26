@@ -15,7 +15,7 @@ use deepwyrm_syscall::{
 use crate::{NativeError, NativeOutputError, PAGE_SIZE, wait_many};
 
 #[cfg(feature = "wyr1-test-evidence")]
-const DW_TEST_SYSCALL_WYR1_EVIDENCE: DwSyscallId = DwSyscallId(0xffff_ff19);
+const WYR1_TEST_EVIDENCE_SYSCALL: DwSyscallId = DwSyscallId(0xffff_ff19);
 #[cfg(feature = "wyr1-test-evidence")]
 pub const WYR1_EVIDENCE_RECORD_BYTES: usize = 114;
 
@@ -281,7 +281,7 @@ pub fn terminate_task_group(
 #[cfg(feature = "wyr1-test-evidence")]
 pub fn submit_wyr1_evidence(record: &[u8; WYR1_EVIDENCE_RECORD_BYTES]) -> Result<(), NativeError> {
     require_success(raw::call(
-        DW_TEST_SYSCALL_WYR1_EVIDENCE,
+        WYR1_TEST_EVIDENCE_SYSCALL,
         [
             record.as_ptr() as u64,
             WYR1_EVIDENCE_RECORD_BYTES as u64,
