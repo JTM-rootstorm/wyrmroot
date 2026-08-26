@@ -417,6 +417,41 @@ fn service_load_reports_endpoint_ownership_on_both_sides_of_init_commit() {
 }
 
 #[test]
+fn failed_service_init_send_leaves_endpoint_with_caller() {
+    let image = executable();
+    let service_channel = DwHandle(0x912);
+    let mut platform = Mock::new(Some("send"));
+
+    let failure = load_service_process(
+        &mut platform,
+        authority(),
+        ServiceLoadRequest {
+            image: &image,
+            display_path: "/system/registryd",
+            profile: LaunchProfile::BootstrapRegistry,
+            service_channel,
+            correlation: None,
+            transaction_id: 0x1311,
+        },
+    )
+    .expect_err("INIT send must fail");
+
+    assert_eq!(
+        failure,
+        ServiceLoadError {
+            error: LoadError::Platform {
+                stage: LoadStage::InitSend,
+                cause: "send",
+                rollback_failed: false,
+            },
+            service_channel_consumed: false,
+        }
+    );
+    assert!(platform.events.contains(&Event::Send(2)));
+    assert!(!platform.events.contains(&Event::Close(service_channel.0)));
+}
+
+#[test]
 fn job_v2_selects_zero_or_three_stream_profile_and_rolls_back_owned_streams() {
     let image = executable();
     let argv = ["bin/hello"];
