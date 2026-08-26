@@ -580,6 +580,29 @@ impl SystemInit {
         Ok(())
     }
 
+    pub fn ready_wait_failed(
+        &mut self,
+        role: RoleId,
+        generation: u64,
+        transaction: u64,
+        now: u64,
+        failure: AttemptFailure,
+    ) -> Result<(), InitError> {
+        let controller = self.controller_mut(role)?;
+        if let RestartState::AwaitingReady { deadline_ns, .. } = controller.restart.state()
+            && now >= deadline_ns
+        {
+            controller
+                .restart
+                .deadline_elapsed(generation, transaction, deadline_ns, now)?;
+            return Ok(());
+        }
+        controller
+            .restart
+            .fail_attempt(generation, transaction, now, failure)?;
+        Ok(())
+    }
+
     pub fn terminal(
         &mut self,
         role: RoleId,
@@ -1136,7 +1159,7 @@ where
                 Err(error) => {
                     let failure = classify_supervision(&error);
                     let now = system.now().map_err(InitError::Native)?;
-                    controller.fail(role, generation, transaction_id, now, failure)?;
+                    controller.ready_wait_failed(role, generation, transaction_id, now, failure)?;
                     cleanup_loaded(
                         system,
                         waits,

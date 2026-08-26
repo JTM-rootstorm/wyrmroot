@@ -245,6 +245,34 @@ fn failed_cleanup_retains_generation_reservation_and_blocks_replacement() {
 }
 
 #[test]
+fn ready_timeout_equality_uses_deadline_transition() {
+    let mut init = system();
+    init.become_operational().unwrap();
+    init.begin_registry(0, 1, 10).unwrap();
+    start_role(&mut init, RoleId::Registryd, 1, 10, 0);
+    let RestartState::AwaitingReady { deadline_ns, .. } =
+        init.role_state(RoleId::Registryd).unwrap()
+    else {
+        panic!("expected READY wait")
+    };
+    init.ready_wait_failed(
+        RoleId::Registryd,
+        1,
+        10,
+        deadline_ns,
+        AttemptFailure::WaitFailed,
+    )
+    .unwrap();
+    assert!(matches!(
+        init.role_state(RoleId::Registryd),
+        Some(RestartState::CleaningUp {
+            failure: AttemptFailure::ReadyTimeout,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn stale_ready_exit_and_cleanup_cannot_mutate_a_replacement() {
     let mut init = system();
     init.become_operational().unwrap();
