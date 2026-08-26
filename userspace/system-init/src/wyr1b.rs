@@ -5,6 +5,9 @@ use wyrmroot_bootfs::{
     launch_policy::{LAUNCH_POLICY_PATH, LaunchPolicy, PolicyError},
 };
 use wyrmroot_launch_proto::{MAX_COMPLETED_JOBS, MAX_LIVE_JOBS, Reservation};
+use wyrmroot_loader::process::{
+    JobLoadRequest, LoadAuthority, LoadError, LoadedProcess, LoaderPlatform, load_job_process,
+};
 use wyrmroot_runtime::sha256;
 
 const MAX_CONNECTIONS: usize = 16;
@@ -148,6 +151,13 @@ pub struct JobSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JobResources {
+    pub process: u64,
+    pub task_group: u64,
+    pub launch_channel: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JobResult {
     pub classification: u32,
     pub application_code: u32,
@@ -213,6 +223,7 @@ struct Job {
     orphaned: bool,
     process: u64,
     task_group: u64,
+    launch_channel: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -255,6 +266,27 @@ pub enum JobError {
     ArtifactNotExecutable,
     ArtifactIdentityMismatch,
     StreamPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LoadedJob {
+    pub job_id: u64,
+    pub loaded: LoadedProcess,
+    pub task_group: u64,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum LaunchEngineError<E> {
+    Job(JobError),
+    Loader {
+        error: LoadError<E>,
+        abort_failed: bool,
+    },
+    Publication {
+        error: JobError,
+        loaded: LoadedProcess,
+        task_group: u64,
+    },
 }
 
 impl From<PolicyError> for JobError {
@@ -317,6 +349,7 @@ impl JobController {
             orphaned: false,
             process: 0,
             task_group: 0,
+            launch_channel: 0,
         });
         Ok(LaunchTicket {
             slot,
@@ -330,8 +363,9 @@ impl JobController {
         ticket: LaunchTicket,
         process: u64,
         task_group: u64,
+        launch_channel: u64,
     ) -> Result<(), JobError> {
-        if process == 0 || task_group == 0 {
+        if process == 0 || task_group == 0 || launch_channel == 0 {
             return Err(JobError::ResourceIdentity);
         }
         let job = self
@@ -344,6 +378,7 @@ impl JobController {
         }
         job.process = process;
         job.task_group = task_group;
+        job.launch_channel = launch_channel;
         job.phase = JobPhase::Running;
         Ok(())
     }
@@ -371,7 +406,11 @@ impl JobController {
         })
     }
 
-    pub fn terminate(&mut self, request: Reservation, job_id: u64) -> Result<(u64, u64), JobError> {
+    pub fn terminate(
+        &mut self,
+        request: Reservation,
+        job_id: u64,
+    ) -> Result<JobResources, JobError> {
         let owner = self.reserve_transaction(request)?;
         let index = self.owned_job_index(owner, job_id)?;
         let job = self.jobs[index].as_mut().unwrap();
@@ -379,7 +418,11 @@ impl JobController {
             return Err(JobError::WrongState);
         }
         job.phase = JobPhase::Terminating;
-        Ok((job.process, job.task_group))
+        Ok(JobResources {
+            process: job.process,
+            task_group: job.task_group,
+            launch_channel: job.launch_channel,
+        })
     }
 
     pub fn complete(
@@ -387,6 +430,7 @@ impl JobController {
         job_id: u64,
         process: u64,
         task_group: u64,
+        launch_channel: u64,
         result: JobResult,
     ) -> Result<(), JobError> {
         let index = self
@@ -395,7 +439,10 @@ impl JobController {
             .position(|job| job.as_ref().is_some_and(|job| job.id == job_id))
             .ok_or(JobError::UnknownJob)?;
         let job = self.jobs[index].take().unwrap();
-        if job.phase == JobPhase::Reserved || job.process != process || job.task_group != task_group
+        if job.phase == JobPhase::Reserved
+            || job.process != process
+            || job.task_group != task_group
+            || job.launch_channel != launch_channel
         {
             self.jobs[index] = Some(job);
             return Err(JobError::ResourceIdentity);
@@ -551,6 +598,87 @@ impl JobController {
     }
 }
 
+/// Policy-checks and failure-atomically loads one WRLJ launch request through
+/// the canonical executable loader. The caller supplies the already-created
+/// per-job TaskGroup and retains responsibility for it on any returned error.
+pub fn launch_authorized_job<'a, L: LoaderPlatform>(
+    jobs: &mut JobController,
+    policy: &PolicyView<'a>,
+    loader: &mut L,
+    authority: LoadAuthority,
+    task_group: u64,
+    reservation: Reservation,
+    request: wyrmroot_launch_proto::LaunchRequest<'a>,
+    streams: &'a [deepwyrm_syscall::DwHandle],
+) -> Result<LoadedJob, LaunchEngineError<L::Error>> {
+    if request.stream_count != streams.len() {
+        return Err(LaunchEngineError::Job(JobError::StreamPolicy));
+    }
+    let image = policy
+        .authorize(request.path, request.stream_count)
+        .map_err(LaunchEngineError::Job)?;
+    let ticket = jobs
+        .begin_launch(reservation)
+        .map_err(LaunchEngineError::Job)?;
+    let mut argv = [""; wyrmroot_launch_proto::MAX_ARGV];
+    for (index, slot) in argv.iter_mut().take(request.argc()).enumerate() {
+        *slot = request
+            .arg(index)
+            .ok_or(LaunchEngineError::Job(JobError::PolicyMissing))?;
+    }
+    let mut environment = [""; wyrmroot_launch_proto::MAX_ENVIRONMENT];
+    for (index, slot) in environment
+        .iter_mut()
+        .take(request.environment_count())
+        .enumerate()
+    {
+        *slot = request
+            .environment(index)
+            .ok_or(LaunchEngineError::Job(JobError::PolicyMissing))?;
+    }
+    let loaded = match load_job_process(
+        loader,
+        LoadAuthority {
+            task_group: deepwyrm_syscall::DwHandle(task_group),
+            ..authority
+        },
+        JobLoadRequest {
+            image,
+            policy_path: request.path,
+            argv: &argv[..request.argc()],
+            environment: &environment[..request.environment_count()],
+            streams,
+            transaction_id: reservation.transaction_id,
+        },
+    ) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            let abort_failed = jobs.abort_launch(ticket).is_err();
+            return Err(LaunchEngineError::Loader {
+                error,
+                abort_failed,
+            });
+        }
+    };
+    if let Err(error) = jobs.commit_launch(
+        ticket,
+        loaded.process.0,
+        task_group,
+        loaded.launch_channel.0,
+    ) {
+        return Err(LaunchEngineError::Publication {
+            error,
+            loaded,
+            task_group,
+        });
+    }
+    Ok(LoadedJob {
+        job_id: ticket.job_id,
+        loaded,
+        task_group,
+    })
+}
+
 impl Default for JobController {
     fn default() -> Self {
         Self::new()
@@ -592,7 +720,7 @@ mod tests {
         jobs.open_connection(2, 1).unwrap();
         let ticket = jobs.begin_launch(reservation(1, 1, 1)).unwrap();
         assert_eq!(jobs.live_jobs(), 1);
-        jobs.commit_launch(ticket, 10, 11).unwrap();
+        jobs.commit_launch(ticket, 10, 11, 12).unwrap();
         assert_eq!(
             jobs.query(reservation(1, 1, 2), ticket.job_id)
                 .unwrap()
@@ -605,9 +733,13 @@ mod tests {
         );
         assert_eq!(
             jobs.terminate(reservation(1, 1, 3), ticket.job_id),
-            Ok((10, 11))
+            Ok(JobResources {
+                process: 10,
+                task_group: 11,
+                launch_channel: 12,
+            })
         );
-        jobs.complete(ticket.job_id, 10, 11, normal()).unwrap();
+        jobs.complete(ticket.job_id, 10, 11, 12, normal()).unwrap();
         assert_eq!(
             jobs.result(reservation(1, 1, 4), ticket.job_id),
             Ok(normal())
@@ -623,14 +755,14 @@ mod tests {
         let mut jobs = JobController::new();
         jobs.open_connection(1, 1).unwrap();
         let ticket = jobs.begin_launch(reservation(1, 1, 1)).unwrap();
-        jobs.commit_launch(ticket, 10, 11).unwrap();
+        jobs.commit_launch(ticket, 10, 11, 12).unwrap();
         jobs.disconnect(1, 1).unwrap();
         assert_eq!(jobs.orphan_jobs(), 1);
         assert_eq!(
             jobs.query(reservation(1, 1, 2), ticket.job_id),
             Err(JobError::ClosedConnection)
         );
-        jobs.complete(ticket.job_id, 10, 11, normal()).unwrap();
+        jobs.complete(ticket.job_id, 10, 11, 12, normal()).unwrap();
         assert_eq!(jobs.live_jobs(), 0);
         jobs.open_connection(2, 1).unwrap();
         assert_eq!(
