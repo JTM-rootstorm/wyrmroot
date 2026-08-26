@@ -122,6 +122,7 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
         }
         Action::Dw1BImage(request) => dw1b::build(std::path::Path::new(&request)).map(Some),
         Action::Dw1BInspect(request) => dw1b::inspect(std::path::Path::new(&request)).map(Some),
+        Action::Dw1BRun(request) => dw1b::run(std::path::Path::new(&request)).map(Some),
         Action::Dw1BMeasure {
             init,
             hello,

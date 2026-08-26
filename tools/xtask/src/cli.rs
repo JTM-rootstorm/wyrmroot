@@ -23,6 +23,7 @@ Usage:
     cargo xtask wyr1b evidence --request <wyr1-b-request.toml> --log <evidence>
     cargo xtask dw1b image --request <dw1-b-request.toml>
     cargo xtask dw1b inspect --request <dw1-b-request.toml>
+    cargo xtask dw1b run --request <dw1-b-request.toml>
     cargo xtask dw1b measure --init <elf> --hello <elf> --cpu-hog <elf> --progress <elf>
     cargo xtask dw1b evidence --request <dw1-b-request.toml>
 
@@ -118,6 +119,7 @@ pub(crate) enum Action {
     },
     Dw1BImage(String),
     Dw1BInspect(String),
+    Dw1BRun(String),
     Dw1BMeasure {
         init: String,
         hello: String,
@@ -187,6 +189,9 @@ fn dispatch_dw1b(arguments: &[String]) -> Result<Action, Failure> {
         [command, flag, request] if command == "inspect" && flag == "--request" => {
             Ok(Action::Dw1BInspect(request.clone()))
         }
+        [command, flag, request] if command == "run" && flag == "--request" => {
+            Ok(Action::Dw1BRun(request.clone()))
+        }
         [
             command,
             init_flag,
@@ -214,7 +219,7 @@ fn dispatch_dw1b(arguments: &[String]) -> Result<Action, Failure> {
             Ok(Action::Dw1BEvidence(request.clone()))
         }
         _ => Err(Failure::usage(
-            "dw1b requires image|inspect|evidence --request <path>, or measure with four exact artifacts",
+            "dw1b requires image|inspect|run|evidence --request <path>, or measure with four exact artifacts",
         )),
     }
 }
@@ -589,6 +594,15 @@ mod tests {
             Ok(Action::Wyr1Prepare("request.toml".into()))
         );
         assert!(USAGE.contains("wyr1 prepare --request"));
+    }
+
+    #[test]
+    fn dw1b_run_dispatches_to_the_observed_execution_path() {
+        assert_eq!(
+            dispatch(&arguments(&["dw1b", "run", "--request", "request.toml",])),
+            Ok(Action::Dw1BRun("request.toml".into()))
+        );
+        assert!(USAGE.contains("dw1b run --request"));
     }
 
     #[test]

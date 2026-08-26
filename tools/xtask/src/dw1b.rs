@@ -1,12 +1,15 @@
 //! DW1-B selector-26 request, four-entry product, receipt, and evidence parser.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 
 use wyrmroot_bootfs::archive::Archive;
 use wyrmroot_bootfs::builder::{Builder, FileMode};
+use wyrmroot_loader::elf::{self, LoadSegment, MAX_LOAD_SEGMENTS, SegmentProtection};
 
 use crate::error::Failure;
 use crate::sha256;
@@ -17,6 +20,7 @@ pub const TEST_ID: u32 = 26;
 pub const DIGEST: u64 = 0x5E4E_054B_5C24_4ACE;
 pub const DEEPWYRM_CANDIDATE: &str = "ae30e879ed61698c7f11d8486639a03a7c7c323e";
 pub const DEEPWYRM_ABI_TREE: &str = "1c6a74f130e386eee95b3780c75950beefd0037d";
+pub const ACCEPTED_RUST_REVISION: &str = "a92dc7f7464ad6ddfece4402bd7b86dbfa86166d";
 const RECEIPT_KIND: &str = "wyrmroot-dw1-b-build-lineage";
 const RUN_RECEIPT_KIND: &str = "wyrmroot-dw1-b-run-receipt";
 const PROVENANCE_KIND: &str = "wyrmroot-dw1-b-kernel-build";
@@ -48,6 +52,10 @@ const REQUEST_KEYS: &[&str] = &[
     "progress_sha256",
     "provenance",
     "provenance_sha256",
+    "ovmf_code",
+    "ovmf_code_sha256",
+    "ovmf_vars",
+    "ovmf_vars_sha256",
     "bootfs",
     "esp",
     "run_directory",
@@ -68,6 +76,8 @@ const RUN_RECEIPT_KEYS: &[&str] = &[
     "esp_sha256",
     "bootfs_sha256",
     "serial_log_sha256",
+    "ovmf_code_sha256",
+    "ovmf_vars_sha256",
     "run_directory",
     "serial_log",
     "timeout_seconds",
@@ -114,6 +124,10 @@ pub struct Request {
     progress_sha256: String,
     provenance: PathBuf,
     provenance_sha256: String,
+    ovmf_code: PathBuf,
+    ovmf_code_sha256: String,
+    ovmf_vars: PathBuf,
+    ovmf_vars_sha256: String,
     bootfs: PathBuf,
     esp: PathBuf,
     run_directory: PathBuf,
@@ -126,8 +140,10 @@ pub struct Request {
 }
 
 struct ProductInputs<'a> {
+    loader: &'a [u8],
     kernel: &'a [u8],
     symbols: &'a [u8],
+    bootstrap: &'a [u8],
     init: &'a [u8],
     hello: &'a [u8],
     hog: &'a [u8],
@@ -155,6 +171,7 @@ pub fn load(path: &Path) -> Result<Request, Failure> {
     }
     if required(&values, "deepwyrm_revision")? != DEEPWYRM_CANDIDATE
         || required(&values, "deepwyrm_abi_tree")? != DEEPWYRM_ABI_TREE
+        || required(&values, "rust_revision")? != ACCEPTED_RUST_REVISION
     {
         return Err(Failure::task(
             "DW1-B requires the exact selector-26 kernel candidate and accepted ABI tree",
@@ -203,6 +220,10 @@ pub fn load(path: &Path) -> Result<Request, Failure> {
         progress_sha256: digest(&values, "progress_sha256")?,
         provenance: input(&parent, required(&values, "provenance")?)?,
         provenance_sha256: digest(&values, "provenance_sha256")?,
+        ovmf_code: input(&parent, required(&values, "ovmf_code")?)?,
+        ovmf_code_sha256: digest(&values, "ovmf_code_sha256")?,
+        ovmf_vars: input(&parent, required(&values, "ovmf_vars")?)?,
+        ovmf_vars_sha256: digest(&values, "ovmf_vars_sha256")?,
         bootfs: output(&parent, required(&values, "bootfs")?)?,
         esp: output(&parent, required(&values, "esp")?)?,
         run_directory: output(&parent, required(&values, "run_directory")?)?,
@@ -219,6 +240,7 @@ pub fn load(path: &Path) -> Result<Request, Failure> {
 
 pub fn build(path: &Path) -> Result<String, Failure> {
     let request = load(path)?;
+    verify_acceptance_source(&request)?;
     let loader = read_expected(&request.loader, "loader", &request.loader_sha256)?;
     let kernel = read_expected(&request.kernel, "kernel", &request.kernel_sha256)?;
     let symbols = read_expected(&request.symbols, "symbols", &request.symbols_sha256)?;
@@ -235,8 +257,10 @@ pub fn build(path: &Path) -> Result<String, Failure> {
     verify_product_inputs(
         &request,
         ProductInputs {
+            loader: &loader,
             kernel: &kernel,
             symbols: &symbols,
+            bootstrap: &bootstrap,
             init: &init,
             hello: &hello,
             hog: &hog,
@@ -301,6 +325,7 @@ pub fn measure(init: &Path, hello: &Path, hog: &Path, progress: &Path) -> Result
 
 pub fn inspect(path: &Path) -> Result<String, Failure> {
     let request = load(path)?;
+    verify_acceptance_source(&request)?;
     let loader = read_expected(&request.loader, "loader", &request.loader_sha256)?;
     let kernel = read_expected(&request.kernel, "kernel", &request.kernel_sha256)?;
     let symbols = read_expected(&request.symbols, "symbols", &request.symbols_sha256)?;
@@ -321,8 +346,10 @@ pub fn inspect(path: &Path) -> Result<String, Failure> {
     verify_product_inputs(
         &request,
         ProductInputs {
+            loader: &loader,
             kernel: &kernel,
             symbols: &symbols,
+            bootstrap: &bootstrap,
             init: &artifacts[0],
             hello: &artifacts[1],
             hog: &artifacts[2],
@@ -339,6 +366,7 @@ pub fn inspect(path: &Path) -> Result<String, Failure> {
             "DW1-B inspected bootfs page count does not match request",
         ));
     }
+    inspect_canonical_esp(&request)?;
     verify_receipt(
         &request,
         &bootfs,
@@ -353,10 +381,43 @@ pub fn inspect(path: &Path) -> Result<String, Failure> {
     ))
 }
 
+fn inspect_canonical_esp(request: &Request) -> Result<(), Failure> {
+    let image_args = crate::cli::G3ImageArguments {
+        image: request.esp.display().to_string(),
+        loader: request.loader.display().to_string(),
+        kernel: request.kernel.display().to_string(),
+        bootstrap: request.bootstrap.display().to_string(),
+        bootfs: request.bootfs.display().to_string(),
+    };
+    crate::g3_image::inspect(&image_args).map(|_| ())
+}
+
+pub fn run(request_path: &Path) -> Result<String, Failure> {
+    let (request, bytes) = execute_run(request_path, |run| {
+        let outcome = crate::h_integration::run_canonical_one_cpu_selector(
+            &crate::h_integration::CanonicalSelectorRun {
+                ovmf_code: &run.ovmf_code,
+                ovmf_vars: &run.ovmf_vars,
+                esp: &run.esp,
+                serial_log: &run.serial_log,
+                stderr_log: &run.stderr_log,
+                selector: SELECTOR,
+                timeout_seconds: run.timeout_seconds,
+            },
+        )?;
+        Ok(RunObservation {
+            qemu_exit_status: outcome.qemu_exit_status,
+            timed_out: outcome.timed_out,
+        })
+    })?;
+    parse_evidence(&request, &bytes)
+}
+
 pub fn evidence(request_path: &Path) -> Result<String, Failure> {
-    let _ = inspect(request_path)?;
-    let request = load(request_path)?;
-    let bytes = verify_run_receipt(&request)?;
+    run(request_path)
+}
+
+fn parse_evidence(request: &Request, bytes: &[u8]) -> Result<String, Failure> {
     let mut summary = None;
     let mut terminal = None;
     for (index, line) in bytes.split_inclusive(|byte| *byte == b'\n').enumerate() {
@@ -390,6 +451,144 @@ pub fn evidence(request_path: &Path) -> Result<String, Failure> {
     ))
 }
 
+struct RunInvocation {
+    ovmf_code: PathBuf,
+    ovmf_vars: PathBuf,
+    esp: PathBuf,
+    serial_log: PathBuf,
+    stderr_log: PathBuf,
+    timeout_seconds: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RunObservation {
+    qemu_exit_status: Option<i32>,
+    timed_out: bool,
+}
+
+fn execute_run(
+    request_path: &Path,
+    executor: impl FnOnce(&RunInvocation) -> Result<RunObservation, Failure>,
+) -> Result<(Request, Vec<u8>), Failure> {
+    let _ = inspect(request_path)?;
+    let request = load(request_path)?;
+    execute_run_loaded(request_path, request, executor)
+}
+
+fn execute_run_loaded(
+    request_path: &Path,
+    request: Request,
+    executor: impl FnOnce(&RunInvocation) -> Result<RunObservation, Failure>,
+) -> Result<(Request, Vec<u8>), Failure> {
+    if request.serial_log.parent() != Some(request.run_directory.as_path())
+        || request.run_receipt.parent() != Some(request.run_directory.as_path())
+        || !request.run_directory.is_dir()
+    {
+        return Err(Failure::task(
+            "DW1-B serial and run receipt must be direct children of the existing run directory",
+        ));
+    }
+    let snapshot_request = request.run_directory.join("request.toml");
+    let snapshot_esp = request.run_directory.join("booted-esp.img");
+    let snapshot_code = request.run_directory.join("OVMF_CODE.fd");
+    let snapshot_vars = request.run_directory.join("OVMF_VARS.fd");
+    let stderr_log = request.run_directory.join("qemu.stderr.log");
+    for path in [
+        &request.serial_log,
+        &request.run_receipt,
+        &snapshot_request,
+        &snapshot_esp,
+        &snapshot_code,
+        &snapshot_vars,
+        &stderr_log,
+    ] {
+        if fs::symlink_metadata(path).is_ok() {
+            return Err(Failure::task(
+                "DW1-B run refuses caller-created or reused run products",
+            ));
+        }
+    }
+    let request_bytes = read_bounded(request_path, "request", 64 * 1024)?;
+    if sha256::bytes_digest(&request_bytes) != request.request_sha256 {
+        return Err(Failure::task("DW1-B request changed before run snapshot"));
+    }
+    write_new_file(&snapshot_request, &request_bytes)?;
+    snapshot_exact(&request.esp, &snapshot_esp, None, "ESP")?;
+    snapshot_exact(
+        &request.ovmf_code,
+        &snapshot_code,
+        Some(&request.ovmf_code_sha256),
+        "OVMF code",
+    )?;
+    snapshot_exact(
+        &request.ovmf_vars,
+        &snapshot_vars,
+        Some(&request.ovmf_vars_sha256),
+        "OVMF vars",
+    )?;
+    let initial_esp_hash = sha256::file_digest(&snapshot_esp)
+        .map_err(|error| Failure::task(format!("could not hash run-local ESP: {error}")))?;
+    let invocation = RunInvocation {
+        ovmf_code: snapshot_code.clone(),
+        ovmf_vars: snapshot_vars,
+        esp: snapshot_esp.clone(),
+        serial_log: request.serial_log.clone(),
+        stderr_log,
+        timeout_seconds: request.timeout_seconds,
+    };
+    let observation = executor(&invocation)?;
+    let serial = read_run_serial(&request.serial_log)?;
+    let final_esp_hash = sha256::file_digest(&snapshot_esp)
+        .map_err(|error| Failure::task(format!("could not rehash run-local ESP: {error}")))?;
+    let final_code_hash = sha256::file_digest(&snapshot_code)
+        .map_err(|error| Failure::task(format!("could not rehash run-local OVMF code: {error}")))?;
+    if final_esp_hash != initial_esp_hash || final_code_hash != request.ovmf_code_sha256 {
+        return Err(Failure::task(
+            "DW1-B read-only boot media changed during canonical execution",
+        ));
+    }
+    let receipt = render_run_receipt(&request, &serial, &initial_esp_hash, observation)?;
+    write_new_file(&request.run_receipt, receipt.as_bytes())?;
+    if observation.timed_out {
+        return Err(Failure::task(format!(
+            "DW1-B canonical QEMU timed out after {} seconds",
+            request.timeout_seconds
+        )));
+    }
+    if observation.qemu_exit_status != Some(33) {
+        return Err(Failure::task(format!(
+            "DW1-B canonical QEMU did not produce debug-exit status 33: {:?}",
+            observation.qemu_exit_status
+        )));
+    }
+    let verified = verify_run_receipt(&request)?;
+    Ok((request, verified))
+}
+
+fn render_run_receipt(
+    request: &Request,
+    serial: &[u8],
+    esp_sha256: &str,
+    observation: RunObservation,
+) -> Result<String, Failure> {
+    let build_receipt = read_bounded(&request.receipt, "build receipt", 64 * 1024)?;
+    let bootfs = read(&request.bootfs, "bootfs")?;
+    Ok(format!(
+        "kind = \"{RUN_RECEIPT_KIND}\"\nschema_version = 1\nselector = \"{SELECTOR}\"\ntest_id = {TEST_ID}\nrequest_sha256 = \"{}\"\nbuild_receipt_sha256 = \"{}\"\nesp_sha256 = \"{esp_sha256}\"\nbootfs_sha256 = \"{}\"\nserial_log_sha256 = \"{}\"\novmf_code_sha256 = \"{}\"\novmf_vars_sha256 = \"{}\"\nrun_directory = \"{}\"\nserial_log = \"{}\"\ntimeout_seconds = {}\nqemu_exit_status = {}\ntimed_out = {}\n",
+        request.request_sha256,
+        sha256::bytes_digest(&build_receipt),
+        sha256::bytes_digest(&bootfs),
+        sha256::bytes_digest(serial),
+        request.ovmf_code_sha256,
+        request.ovmf_vars_sha256,
+        relative_path_text(request, &request.run_directory)?,
+        relative_path_text(request, &request.serial_log)?,
+        request.timeout_seconds,
+        observation.qemu_exit_status.unwrap_or(-1),
+        observation.timed_out,
+    ))
+}
+
 fn verify_run_receipt(request: &Request) -> Result<Vec<u8>, Failure> {
     let receipt_bytes = read_bounded(&request.run_receipt, "run receipt", 64 * 1024)?;
     let receipt_text = core::str::from_utf8(&receipt_bytes)
@@ -410,6 +609,8 @@ fn verify_run_receipt(request: &Request) -> Result<Vec<u8>, Failure> {
         ("esp_sha256", sha256::bytes_digest(&esp)),
         ("bootfs_sha256", sha256::bytes_digest(&bootfs)),
         ("serial_log_sha256", sha256::bytes_digest(&serial)),
+        ("ovmf_code_sha256", request.ovmf_code_sha256.clone()),
+        ("ovmf_vars_sha256", request.ovmf_vars_sha256.clone()),
         (
             "run_directory",
             relative_path_text(request, &request.run_directory)?,
@@ -429,6 +630,47 @@ fn verify_run_receipt(request: &Request) -> Result<Vec<u8>, Failure> {
         }
     }
     Ok(serial)
+}
+
+fn read_run_serial(path: &Path) -> Result<Vec<u8>, Failure> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| Failure::task(format!("could not inspect DW1-B serial log: {error}")))?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.nlink() != 1
+        || metadata.len() > 16 * 1024 * 1024
+    {
+        return Err(Failure::task(
+            "DW1-B serial log is not a bounded single-link regular file",
+        ));
+    }
+    read(path, "serial log")
+}
+
+fn snapshot_exact(
+    source: &Path,
+    destination: &Path,
+    expected_sha256: Option<&str>,
+    label: &str,
+) -> Result<(), Failure> {
+    let bytes = read_bounded(source, label, crate::g3_image::IMAGE_BYTES)?;
+    if expected_sha256.is_some_and(|expected| sha256::bytes_digest(&bytes) != expected) {
+        return Err(Failure::task(format!(
+            "DW1-B {label} changed before run snapshot"
+        )));
+    }
+    write_new_file(destination, &bytes)
+}
+
+fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), Failure> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| Failure::task(format!("could not create DW1-B run product: {error}")))?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| Failure::task(format!("could not write DW1-B run product: {error}")))
 }
 
 fn build_archive(
@@ -482,12 +724,12 @@ fn verify_archive(bootfs: &[u8], artifacts: [&[u8]; 4]) -> Result<(), Failure> {
 }
 
 fn verify_product_inputs(request: &Request, inputs: ProductInputs<'_>) -> Result<(), Failure> {
-    verify_static_elf("kernel", inputs.kernel)?;
-    verify_static_elf("symbols", inputs.symbols)?;
-    let init = verify_static_elf("init", inputs.init)?;
-    verify_static_elf("hello", inputs.hello)?;
-    let hog = verify_static_elf("cpu hog", inputs.hog)?;
-    let progress = verify_static_elf("progress", inputs.progress)?;
+    verify_efi_loader(inputs.loader)?;
+    verify_loader_elf("bootstrap", inputs.bootstrap)?;
+    let init = verify_loader_elf("init", inputs.init)?;
+    verify_loader_elf("hello", inputs.hello)?;
+    let hog = verify_loader_elf("cpu hog", inputs.hog)?;
+    let progress = verify_loader_elf("progress", inputs.progress)?;
     if !contains_loaded_marker(inputs.init, &init, b"WYRMINIT0-PROFILE-V1:dw1b-preemption")
         || !contains_loaded_marker(inputs.hog, &hog, b"WYRMDW1B-HOG-V1:steady-spin-only")
         || !contains_loaded_marker(
@@ -498,6 +740,11 @@ fn verify_product_inputs(request: &Request, inputs: ProductInputs<'_>) -> Result
     {
         return Err(Failure::task(
             "DW1-B payload profile marker is absent from a PT_LOAD segment",
+        ));
+    }
+    if !contains_exact_hog_steady_loop(inputs.hog, &hog) {
+        return Err(Failure::task(
+            "DW1-B cpu hog lacks the exact audited pause/jump steady loop in executable bytes",
         ));
     }
     let provenance = core::str::from_utf8(inputs.provenance)
@@ -535,101 +782,43 @@ fn verify_product_inputs(request: &Request, inputs: ProductInputs<'_>) -> Result
 
 struct ElfLayout {
     load_file_ranges: Vec<(usize, usize)>,
+    executable_file_ranges: Vec<(usize, usize)>,
 }
 
-fn verify_static_elf(label: &str, bytes: &[u8]) -> Result<ElfLayout, Failure> {
-    if bytes.len() < 64
-        || &bytes[..4] != b"\x7fELF"
-        || bytes[4] != 2
-        || bytes[5] != 1
-        || u16::from_le_bytes([bytes[16], bytes[17]]) != 2
-        || u16::from_le_bytes([bytes[18], bytes[19]]) != 62
-        || u16::from_le_bytes([bytes[52], bytes[53]]) != 64
-    {
-        return Err(Failure::task(format!(
-            "DW1-B {label} is not a static x86_64 executable ELF"
-        )));
-    }
-    let phoff = usize::try_from(u64::from_le_bytes(bytes[32..40].try_into().unwrap()))
-        .map_err(|_| Failure::task("DW1-B ELF program-header offset overflow"))?;
-    let phentsize = usize::from(u16::from_le_bytes([bytes[54], bytes[55]]));
-    let phnum = usize::from(u16::from_le_bytes([bytes[56], bytes[57]]));
-    if phentsize != 56 || !(1..=64).contains(&phnum) {
-        return Err(Failure::task("DW1-B ELF program-header size is invalid"));
-    }
-    let table_size = phentsize
-        .checked_mul(phnum)
-        .ok_or_else(|| Failure::task("DW1-B ELF program-header table overflow"))?;
-    let table_end = phoff
-        .checked_add(table_size)
-        .ok_or_else(|| Failure::task("DW1-B ELF program-header table overflow"))?;
-    if phoff < 64 || table_end > bytes.len() {
-        return Err(Failure::task("DW1-B ELF program-header table is invalid"));
-    }
-    let entry = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
-    if entry == 0 {
-        return Err(Failure::task("DW1-B ELF entry is zero"));
-    }
-    let mut load_file_ranges = Vec::new();
-    let mut entry_is_executable = false;
-    for index in 0..phnum {
-        let offset = phoff
-            .checked_add(index.checked_mul(phentsize).unwrap())
-            .ok_or_else(|| Failure::task("DW1-B ELF program-header overflow"))?;
-        let header = bytes
-            .get(offset..offset + phentsize)
-            .ok_or_else(|| Failure::task("DW1-B ELF program-header is truncated"))?;
-        let kind = u32::from_le_bytes(header[..4].try_into().unwrap());
-        if kind == 2 || kind == 3 {
-            return Err(Failure::task(format!(
-                "DW1-B {label} has a dynamic or interpreter segment"
-            )));
+fn verify_loader_elf(label: &str, bytes: &[u8]) -> Result<ElfLayout, Failure> {
+    const EMPTY: LoadSegment = LoadSegment {
+        header_index: 0,
+        file_offset: 0,
+        file_size: 0,
+        memory_size: 0,
+        virtual_address: 0,
+        mapping_start: 0,
+        mapping_size: 0,
+        leading_bytes: 0,
+        protection: SegmentProtection::Read,
+    };
+    let mut segments = [EMPTY; MAX_LOAD_SEGMENTS];
+    let plan = elf::plan(bytes, &mut segments).map_err(|error| {
+        Failure::task(format!(
+            "DW1-B {label} violates the loader ELF contract: {error:?}"
+        ))
+    })?;
+    let mut load_file_ranges = Vec::with_capacity(plan.segments.len());
+    let mut executable_file_ranges = Vec::new();
+    for segment in plan.segments {
+        let start = usize::try_from(segment.file_offset)
+            .map_err(|_| Failure::task("DW1-B loader ELF file offset overflow"))?;
+        let end = usize::try_from(segment.file_offset + segment.file_size)
+            .map_err(|_| Failure::task("DW1-B loader ELF file range overflow"))?;
+        load_file_ranges.push((start, end));
+        if segment.protection == SegmentProtection::ReadExecute {
+            executable_file_ranges.push((start, end));
         }
-        if kind != 1 {
-            continue;
-        }
-        let flags = u32::from_le_bytes(header[4..8].try_into().unwrap());
-        let file_offset = u64::from_le_bytes(header[8..16].try_into().unwrap());
-        let virtual_address = u64::from_le_bytes(header[16..24].try_into().unwrap());
-        let file_size = u64::from_le_bytes(header[32..40].try_into().unwrap());
-        let memory_size = u64::from_le_bytes(header[40..48].try_into().unwrap());
-        let align = u64::from_le_bytes(header[48..56].try_into().unwrap());
-        if flags & !7 != 0
-            || flags & 2 != 0 && flags & 1 != 0
-            || file_size > memory_size
-            || memory_size == 0
-            || align != 0
-                && (!align.is_power_of_two() || file_offset % align != virtual_address % align)
-        {
-            return Err(Failure::task(format!(
-                "DW1-B {label} has an invalid PT_LOAD contract"
-            )));
-        }
-        let file_start = usize::try_from(file_offset)
-            .map_err(|_| Failure::task("DW1-B PT_LOAD file offset overflow"))?;
-        let file_end = usize::try_from(
-            file_offset
-                .checked_add(file_size)
-                .ok_or_else(|| Failure::task("DW1-B PT_LOAD file range overflow"))?,
-        )
-        .map_err(|_| Failure::task("DW1-B PT_LOAD file range overflow"))?;
-        if file_end > bytes.len() {
-            return Err(Failure::task("DW1-B PT_LOAD exceeds the ELF file"));
-        }
-        let memory_end = virtual_address
-            .checked_add(memory_size)
-            .ok_or_else(|| Failure::task("DW1-B PT_LOAD virtual range overflow"))?;
-        if flags & 1 != 0 && (virtual_address..memory_end).contains(&entry) {
-            entry_is_executable = true;
-        }
-        load_file_ranges.push((file_start, file_end));
     }
-    if load_file_ranges.is_empty() || !entry_is_executable {
-        return Err(Failure::task(format!(
-            "DW1-B {label} entry is not inside an executable PT_LOAD"
-        )));
-    }
-    Ok(ElfLayout { load_file_ranges })
+    Ok(ElfLayout {
+        load_file_ranges,
+        executable_file_ranges,
+    })
 }
 
 fn contains_loaded_marker(bytes: &[u8], layout: &ElfLayout, marker: &[u8]) -> bool {
@@ -638,6 +827,70 @@ fn contains_loaded_marker(bytes: &[u8], layout: &ElfLayout, marker: &[u8]) -> bo
             .windows(marker.len())
             .any(|window| window == marker)
     })
+}
+
+fn contains_exact_hog_steady_loop(bytes: &[u8], layout: &ElfLayout) -> bool {
+    const STEADY_LOOP: &[u8] = &[0xf3, 0x90, 0xeb, 0xfc];
+    layout
+        .executable_file_ranges
+        .iter()
+        .flat_map(|(start, end)| bytes[*start..*end].windows(STEADY_LOOP.len()))
+        .filter(|window| *window == STEADY_LOOP)
+        .count()
+        == 1
+}
+
+fn verify_efi_loader(bytes: &[u8]) -> Result<(), Failure> {
+    if bytes.len() < 0x100 || &bytes[..2] != b"MZ" {
+        return Err(Failure::task("DW1-B loader is not a PE32+ EFI image"));
+    }
+    let pe_offset = usize::try_from(u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()))
+        .map_err(|_| Failure::task("DW1-B loader PE header offset overflow"))?;
+    let coff = bytes
+        .get(pe_offset..pe_offset + 24)
+        .ok_or_else(|| Failure::task("DW1-B loader PE header is truncated"))?;
+    if &coff[..4] != b"PE\0\0" || u16::from_le_bytes(coff[4..6].try_into().unwrap()) != 0x8664 {
+        return Err(Failure::task("DW1-B loader is not x86_64 PE"));
+    }
+    let section_count = usize::from(u16::from_le_bytes(coff[6..8].try_into().unwrap()));
+    let optional_size = usize::from(u16::from_le_bytes(coff[20..22].try_into().unwrap()));
+    let characteristics = u16::from_le_bytes(coff[22..24].try_into().unwrap());
+    if !(1..=96).contains(&section_count) || optional_size < 112 || characteristics & 2 == 0 {
+        return Err(Failure::task("DW1-B loader COFF contract is invalid"));
+    }
+    let optional = bytes
+        .get(pe_offset + 24..pe_offset + 24 + optional_size)
+        .ok_or_else(|| Failure::task("DW1-B loader optional header is truncated"))?;
+    if u16::from_le_bytes(optional[..2].try_into().unwrap()) != 0x20b
+        || u32::from_le_bytes(optional[16..20].try_into().unwrap()) == 0
+        || u16::from_le_bytes(optional[68..70].try_into().unwrap()) != 10
+    {
+        return Err(Failure::task(
+            "DW1-B loader is not an executable EFI application",
+        ));
+    }
+    let table = pe_offset + 24 + optional_size;
+    let table_end = table
+        .checked_add(section_count * 40)
+        .ok_or_else(|| Failure::task("DW1-B loader section table overflow"))?;
+    let sections = bytes
+        .get(table..table_end)
+        .ok_or_else(|| Failure::task("DW1-B loader section table is truncated"))?;
+    for section in sections.chunks_exact(40) {
+        let raw_size = usize::try_from(u32::from_le_bytes(section[16..20].try_into().unwrap()))
+            .map_err(|_| Failure::task("DW1-B loader section size overflow"))?;
+        let raw_offset = usize::try_from(u32::from_le_bytes(section[20..24].try_into().unwrap()))
+            .map_err(|_| Failure::task("DW1-B loader section offset overflow"))?;
+        let flags = u32::from_le_bytes(section[36..40].try_into().unwrap());
+        if raw_offset
+            .checked_add(raw_size)
+            .is_none_or(|end| end > bytes.len())
+            || flags & 0x2000_0000 != 0 && flags & 0x8000_0000 != 0
+        {
+            return Err(Failure::task("DW1-B loader section contract is invalid"));
+        }
+    }
+    Ok(())
 }
 
 fn parse_summary(line: &[u8], nonce: u64) -> Result<(u64, u64, u64, u64), Failure> {
@@ -923,6 +1176,8 @@ fn reject_path_aliases(request: &Request) -> Result<(), Failure> {
         &request.cpu_hog,
         &request.progress,
         &request.provenance,
+        &request.ovmf_code,
+        &request.ovmf_vars,
         &request.bootfs,
         &request.esp,
         &request.run_directory,
@@ -997,6 +1252,40 @@ fn read_expected(path: &Path, label: &str, expected: &str) -> Result<Vec<u8>, Fa
     }
     Ok(bytes)
 }
+fn verify_acceptance_source(request: &Request) -> Result<(), Failure> {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let revision = Command::new("git")
+        .args(["-C", repository.to_str().unwrap(), "rev-parse", "HEAD"])
+        .output()
+        .map_err(|error| Failure::task(format!("could not inspect Wyrmroot HEAD: {error}")))?;
+    if !revision.status.success() {
+        return Err(Failure::task("could not resolve Wyrmroot HEAD"));
+    }
+    let head = core::str::from_utf8(&revision.stdout)
+        .map_err(|_| Failure::task("Wyrmroot HEAD is not UTF-8"))?
+        .trim();
+    if request.wyrmroot_revision != head {
+        return Err(Failure::task(
+            "DW1-B request Wyrmroot revision does not match the current checkout HEAD",
+        ));
+    }
+    let status = Command::new("git")
+        .args([
+            "-C",
+            repository.to_str().unwrap(),
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+        ])
+        .output()
+        .map_err(|error| Failure::task(format!("could not inspect Wyrmroot status: {error}")))?;
+    if !status.status.success() || !status.stdout.is_empty() {
+        return Err(Failure::task(
+            "DW1-B acceptance requires the exact clean Wyrmroot HEAD",
+        ));
+    }
+    Ok(())
+}
 fn read_bounded(path: &Path, label: &str, maximum: u64) -> Result<Vec<u8>, Failure> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|e| Failure::task(format!("could not inspect DW1-B {label}: {e}")))?;
@@ -1036,9 +1325,6 @@ fn io_failure(error: std::io::Error) -> Failure {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    const TEST_WYRMROOT_REVISION: &str = "1111111111111111111111111111111111111111";
-    const TEST_RUST_REVISION: &str = "2222222222222222222222222222222222222222";
 
     #[test]
     fn exact_summary_and_terminal_are_ordered_and_relational() {
@@ -1080,8 +1366,12 @@ mod tests {
             valid.replace("esp = \"out/esp.img\"", "esp = \"out/bootfs.img\""),
             valid.replace("hello = \"inputs/hello\"", "hello = \"../hello\""),
             valid.replace(
-                &format!("wyrmroot_revision = \"{TEST_WYRMROOT_REVISION}\""),
+                &format!("wyrmroot_revision = \"{}\"", current_test_revision()),
                 "wyrmroot_revision = \"0000000000000000000000000000000000000000\"",
+            ),
+            valid.replace(
+                ACCEPTED_RUST_REVISION,
+                "b92dc7f7464ad6ddfece4402bd7b86dbfa86166d",
             ),
         ] {
             fs::write(&request, invalid).unwrap();
@@ -1137,7 +1427,28 @@ mod tests {
     }
 
     #[test]
-    fn evidence_requires_an_exact_request_bound_run_receipt() {
+    fn evidence_run_owns_receipt_and_rejects_caller_crafted_status() {
+        let crafted_root = fixture();
+        fs::create_dir_all(crafted_root.join("out")).unwrap();
+        fs::create_dir_all(crafted_root.join("run")).unwrap();
+        let crafted_path = crafted_root.join("request.toml");
+        fs::write(&crafted_path, request_text()).unwrap();
+        fs::write(crafted_root.join("out/receipt.toml"), b"build receipt").unwrap();
+        fs::write(crafted_root.join("out/esp.img"), b"esp").unwrap();
+        fs::write(crafted_root.join("out/bootfs.img"), b"bootfs").unwrap();
+        fs::write(crafted_root.join("run/run-receipt.toml"), b"caller crafted").unwrap();
+        let crafted_request = load(&crafted_path).unwrap();
+        let mut executed = false;
+        assert!(
+            execute_run_loaded(&crafted_path, crafted_request, |_| {
+                executed = true;
+                unreachable!()
+            })
+            .is_err()
+        );
+        assert!(!executed);
+        fs::remove_dir_all(crafted_root).unwrap();
+
         let root = fixture();
         fs::create_dir_all(root.join("out")).unwrap();
         fs::create_dir_all(root.join("run")).unwrap();
@@ -1146,13 +1457,20 @@ mod tests {
         fs::write(root.join("out/receipt.toml"), b"build receipt").unwrap();
         fs::write(root.join("out/esp.img"), b"esp").unwrap();
         fs::write(root.join("out/bootfs.img"), b"bootfs").unwrap();
-        let serial = valid_evidence_log(1);
-        fs::write(root.join("run/serial.log"), &serial).unwrap();
         let request = load(&request_path).unwrap();
-        let run_receipt = run_receipt_text(&request, &serial);
-        fs::write(root.join("run/run-receipt.toml"), &run_receipt).unwrap();
-        assert_eq!(verify_run_receipt(&request).unwrap(), serial);
+        let serial = valid_evidence_log(1);
+        let expected_serial = serial.clone();
+        let (_, observed) = execute_run_loaded(&request_path, request.clone(), |run| {
+            fs::write(&run.serial_log, &serial).unwrap();
+            Ok(RunObservation {
+                qemu_exit_status: Some(33),
+                timed_out: false,
+            })
+        })
+        .unwrap();
+        assert_eq!(observed, expected_serial);
 
+        let run_receipt = fs::read_to_string(root.join("run/run-receipt.toml")).unwrap();
         fs::write(
             root.join("run/run-receipt.toml"),
             run_receipt.replace("qemu_exit_status = 33", "qemu_exit_status = 32"),
@@ -1169,7 +1487,8 @@ mod tests {
         assert!(template.contains(DEEPWYRM_CANDIDATE));
         assert!(template.contains(DEEPWYRM_ABI_TREE));
         assert!(template.contains("challenge_digest = \"5E4E054B5C244ACE\""));
-        assert!(template.contains("bootfs_pages = 1424"));
+        assert!(template.contains("bootfs_pages = 31"));
+        assert!(template.contains(ACCEPTED_RUST_REVISION));
         assert!(template.contains("REPLACE_WITH_INTEGRATED_WYRMROOT_COMMIT"));
         assert!(!template.contains("revision = \"0000000000000000000000000000000000000000\""));
     }
@@ -1178,25 +1497,141 @@ mod tests {
     fn elf_audit_requires_static_loaded_identity() {
         let marker = b"WYRMDW1B-HOG-V1:steady-spin-only";
         let valid = valid_elf(marker);
-        let layout = verify_static_elf("fixture", &valid).unwrap();
+        let layout = verify_loader_elf("fixture", &valid).unwrap();
         assert!(contains_loaded_marker(&valid, &layout, marker));
+        assert!(contains_exact_hog_steady_loop(&valid, &layout));
 
         let mut appended = valid_elf(b"different loaded bytes");
-        let layout = verify_static_elf("fixture", &appended).unwrap();
+        let layout = verify_loader_elf("fixture", &appended).unwrap();
         appended.extend_from_slice(marker);
         assert!(!contains_loaded_marker(&appended, &layout, marker));
 
         let mut zero_entry = valid.clone();
         zero_entry[24..32].copy_from_slice(&0_u64.to_le_bytes());
-        assert!(verify_static_elf("fixture", &zero_entry).is_err());
+        assert!(verify_loader_elf("fixture", &zero_entry).is_err());
 
         let mut dynamic = valid.clone();
         dynamic[64..68].copy_from_slice(&2_u32.to_le_bytes());
-        assert!(verify_static_elf("fixture", &dynamic).is_err());
+        assert!(verify_loader_elf("fixture", &dynamic).is_err());
 
         let mut writable_executable = valid;
         writable_executable[68..72].copy_from_slice(&7_u32.to_le_bytes());
-        assert!(verify_static_elf("fixture", &writable_executable).is_err());
+        assert!(verify_loader_elf("fixture", &writable_executable).is_err());
+
+        let mut bad_alignment = valid_elf(marker);
+        bad_alignment[112..120].copy_from_slice(&3_u64.to_le_bytes());
+        assert!(verify_loader_elf("fixture", &bad_alignment).is_err());
+
+        let loader = valid_pe();
+        verify_efi_loader(&loader).unwrap();
+        let mut wrong_subsystem = loader;
+        wrong_subsystem[220..222].copy_from_slice(&3_u16.to_le_bytes());
+        assert!(verify_efi_loader(&wrong_subsystem).is_err());
+    }
+
+    #[test]
+    fn product_validation_inspects_loader_bootstrap_and_real_hog_loop() {
+        let root = fixture();
+        let request_path = root.join("request.toml");
+        fs::write(&request_path, request_text()).unwrap();
+        let request = load(&request_path).unwrap();
+        let kernel = b"kernel";
+        let symbols = b"symbols";
+        let provenance = format!(
+            "kind = \"{PROVENANCE_KIND}\"\nschema_version = 1\nselector = \"{SELECTOR}\"\ntest_id = 26\ndeepwyrm_revision = \"{DEEPWYRM_CANDIDATE}\"\ndeepwyrm_abi_tree = \"{DEEPWYRM_ABI_TREE}\"\nrust_revision = \"{ACCEPTED_RUST_REVISION}\"\nkernel_sha256 = \"{}\"\nsymbols_sha256 = \"{}\"\nDEEPWYRM_DW1B_EVIDENCE_NONCE = \"0000000000000001\"\nDEEPWYRM_DW1B_CHALLENGE_DIGEST = \"{DIGEST:016X}\"\nDEEPWYRM_DW1B_BOOTFS_MAX_PAGES = 1\n",
+            sha256::bytes_digest(kernel),
+            sha256::bytes_digest(symbols),
+        );
+        let loader = valid_pe();
+        let bootstrap = valid_elf(b"bootstrap");
+        let init = valid_elf(b"WYRMINIT0-PROFILE-V1:dw1b-preemption");
+        let hello = valid_elf(b"hello");
+        let hog = valid_elf(b"WYRMDW1B-HOG-V1:steady-spin-only");
+        let progress = valid_elf(b"WYRMDW1B-PROGRESS-V1:eight-rounds");
+        macro_rules! inputs {
+            ($loader:expr, $bootstrap:expr, $hog:expr) => {
+                ProductInputs {
+                    loader: $loader,
+                    kernel,
+                    symbols,
+                    bootstrap: $bootstrap,
+                    init: &init,
+                    hello: &hello,
+                    hog: $hog,
+                    progress: &progress,
+                    provenance: provenance.as_bytes(),
+                }
+            };
+        }
+        verify_product_inputs(&request, inputs!(&loader, &bootstrap, &hog)).unwrap();
+
+        let mut wrong_loader = loader.clone();
+        wrong_loader[220..222].copy_from_slice(&3_u16.to_le_bytes());
+        assert!(verify_product_inputs(&request, inputs!(&wrong_loader, &bootstrap, &hog)).is_err());
+        let mut wrong_bootstrap = bootstrap.clone();
+        wrong_bootstrap[64..68].copy_from_slice(&2_u32.to_le_bytes());
+        assert!(verify_product_inputs(&request, inputs!(&loader, &wrong_bootstrap, &hog)).is_err());
+        let mut hog_without_loop = valid_elf(b"WYRMDW1B-HOG-V1:steady-spin-only");
+        let loop_start = hog_without_loop.len() - 4;
+        hog_without_loop[loop_start..].fill(0x90);
+        assert!(
+            verify_product_inputs(&request, inputs!(&loader, &bootstrap, &hog_without_loop))
+                .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn canonical_esp_inspection_rejects_loader_and_bootstrap_substitution() {
+        let root = fixture();
+        fs::create_dir_all(root.join("out")).unwrap();
+        let request_path = root.join("request.toml");
+        fs::write(&request_path, request_text()).unwrap();
+        let request = load(&request_path).unwrap();
+        let image_args = crate::cli::G3ImageArguments {
+            image: request.esp.display().to_string(),
+            loader: request.loader.display().to_string(),
+            kernel: request.kernel.display().to_string(),
+            bootstrap: request.bootstrap.display().to_string(),
+            bootfs: request.bootfs.display().to_string(),
+        };
+        fs::write(&request.bootfs, b"bootfs").unwrap();
+        crate::g3_image::build(&image_args).unwrap();
+        inspect_canonical_esp(&request).unwrap();
+
+        fs::write(&request.loader, b"substituted loader").unwrap();
+        assert!(inspect_canonical_esp(&request).is_err());
+        fs::write(&request.loader, [0]).unwrap();
+        fs::write(&request.bootstrap, b"substituted bootstrap").unwrap();
+        assert!(inspect_canonical_esp(&request).is_err());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn observed_timeout_is_recorded_but_never_accepted() {
+        let root = fixture();
+        fs::create_dir_all(root.join("out")).unwrap();
+        fs::create_dir_all(root.join("run")).unwrap();
+        let request_path = root.join("request.toml");
+        fs::write(&request_path, request_text()).unwrap();
+        fs::write(root.join("out/receipt.toml"), b"build receipt").unwrap();
+        fs::write(root.join("out/esp.img"), b"esp").unwrap();
+        fs::write(root.join("out/bootfs.img"), b"bootfs").unwrap();
+        let request = load(&request_path).unwrap();
+        let error = execute_run_loaded(&request_path, request, |run| {
+            fs::write(&run.serial_log, b"partial serial").unwrap();
+            Ok(RunObservation {
+                qemu_exit_status: None,
+                timed_out: true,
+            })
+        })
+        .unwrap_err();
+        assert!(error.message.contains("timed out"));
+        let receipt = fs::read_to_string(root.join("run/run-receipt.toml")).unwrap();
+        assert!(receipt.contains("qemu_exit_status = -1"));
+        assert!(receipt.contains("timed_out = true"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn fixture() -> PathBuf {
@@ -1216,6 +1651,8 @@ mod tests {
             "hog",
             "progress",
             "provenance",
+            "ovmf-code",
+            "ovmf-vars",
         ] {
             fs::write(root.join("inputs").join(name), b"x").unwrap();
         }
@@ -1224,8 +1661,9 @@ mod tests {
 
     fn request_text() -> String {
         let input_hash = sha256::bytes_digest(b"x");
+        let wyrmroot_revision = current_test_revision();
         format!(
-            "schema_version = 5\ndeepwyrm_revision = \"{DEEPWYRM_CANDIDATE}\"\ndeepwyrm_abi_tree = \"{DEEPWYRM_ABI_TREE}\"\nwyrmroot_revision = \"{TEST_WYRMROOT_REVISION}\"\nrust_revision = \"{TEST_RUST_REVISION}\"\nselector = \"{SELECTOR}\"\ntest_id = 26\ntimeout_seconds = 30\nloader = \"inputs/loader\"\nloader_sha256 = \"{input_hash}\"\nkernel = \"inputs/kernel\"\nkernel_sha256 = \"{input_hash}\"\nsymbols = \"inputs/symbols\"\nsymbols_sha256 = \"{input_hash}\"\nbootstrap = \"inputs/bootstrap\"\nbootstrap_sha256 = \"{input_hash}\"\ninit = \"inputs/init\"\ninit_sha256 = \"{input_hash}\"\nhello = \"inputs/hello\"\nhello_sha256 = \"{input_hash}\"\ncpu_hog = \"inputs/hog\"\ncpu_hog_sha256 = \"{input_hash}\"\nprogress = \"inputs/progress\"\nprogress_sha256 = \"{input_hash}\"\nprovenance = \"inputs/provenance\"\nprovenance_sha256 = \"{input_hash}\"\nbootfs = \"out/bootfs.img\"\nesp = \"out/esp.img\"\nrun_directory = \"run\"\nserial_log = \"run/serial.log\"\nrun_receipt = \"run/run-receipt.toml\"\nevidence_nonce = \"0000000000000001\"\nchallenge_digest = \"{DIGEST:016X}\"\nbootfs_pages = 1\nreceipt = \"out/receipt.toml\"\n"
+            "schema_version = 5\ndeepwyrm_revision = \"{DEEPWYRM_CANDIDATE}\"\ndeepwyrm_abi_tree = \"{DEEPWYRM_ABI_TREE}\"\nwyrmroot_revision = \"{wyrmroot_revision}\"\nrust_revision = \"{ACCEPTED_RUST_REVISION}\"\nselector = \"{SELECTOR}\"\ntest_id = 26\ntimeout_seconds = 30\nloader = \"inputs/loader\"\nloader_sha256 = \"{input_hash}\"\nkernel = \"inputs/kernel\"\nkernel_sha256 = \"{input_hash}\"\nsymbols = \"inputs/symbols\"\nsymbols_sha256 = \"{input_hash}\"\nbootstrap = \"inputs/bootstrap\"\nbootstrap_sha256 = \"{input_hash}\"\ninit = \"inputs/init\"\ninit_sha256 = \"{input_hash}\"\nhello = \"inputs/hello\"\nhello_sha256 = \"{input_hash}\"\ncpu_hog = \"inputs/hog\"\ncpu_hog_sha256 = \"{input_hash}\"\nprogress = \"inputs/progress\"\nprogress_sha256 = \"{input_hash}\"\nprovenance = \"inputs/provenance\"\nprovenance_sha256 = \"{input_hash}\"\novmf_code = \"inputs/ovmf-code\"\novmf_code_sha256 = \"{input_hash}\"\novmf_vars = \"inputs/ovmf-vars\"\novmf_vars_sha256 = \"{input_hash}\"\nbootfs = \"out/bootfs.img\"\nesp = \"out/esp.img\"\nrun_directory = \"run\"\nserial_log = \"run/serial.log\"\nrun_receipt = \"run/run-receipt.toml\"\nevidence_nonce = \"0000000000000001\"\nchallenge_digest = \"{DIGEST:016X}\"\nbootfs_pages = 1\nreceipt = \"out/receipt.toml\"\n"
         )
     }
 
@@ -1240,15 +1678,12 @@ mod tests {
         pre
     }
 
-    fn run_receipt_text(request: &Request, serial: &[u8]) -> String {
-        format!(
-            "kind = \"{RUN_RECEIPT_KIND}\"\nschema_version = 1\nselector = \"{SELECTOR}\"\ntest_id = 26\nrequest_sha256 = \"{}\"\nbuild_receipt_sha256 = \"{}\"\nesp_sha256 = \"{}\"\nbootfs_sha256 = \"{}\"\nserial_log_sha256 = \"{}\"\nrun_directory = \"run\"\nserial_log = \"run/serial.log\"\ntimeout_seconds = 30\nqemu_exit_status = 33\ntimed_out = false\n",
-            request.request_sha256,
-            sha256::bytes_digest(b"build receipt"),
-            sha256::bytes_digest(b"esp"),
-            sha256::bytes_digest(b"bootfs"),
-            sha256::bytes_digest(serial),
-        )
+    fn current_test_revision() -> String {
+        let output = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
     }
 
     fn valid_elf(marker: &[u8]) -> Vec<u8> {
@@ -1256,8 +1691,10 @@ mod tests {
         elf[..4].copy_from_slice(b"\x7fELF");
         elf[4] = 2;
         elf[5] = 1;
+        elf[6] = 1;
         elf[16..18].copy_from_slice(&2_u16.to_le_bytes());
         elf[18..20].copy_from_slice(&62_u16.to_le_bytes());
+        elf[20..24].copy_from_slice(&1_u32.to_le_bytes());
         elf[24..32].copy_from_slice(&0x0040_0000_u64.to_le_bytes());
         elf[32..40].copy_from_slice(&64_u64.to_le_bytes());
         elf[52..54].copy_from_slice(&64_u16.to_le_bytes());
@@ -1267,10 +1704,29 @@ mod tests {
         elf[68..72].copy_from_slice(&5_u32.to_le_bytes());
         elf[80..88].copy_from_slice(&0x0040_0000_u64.to_le_bytes());
         elf.extend_from_slice(marker);
+        elf.extend_from_slice(&[0xf3, 0x90, 0xeb, 0xfc]);
         let size = u64::try_from(elf.len()).unwrap();
         elf[96..104].copy_from_slice(&size.to_le_bytes());
         elf[104..112].copy_from_slice(&size.to_le_bytes());
         elf[112..120].copy_from_slice(&0x1000_u64.to_le_bytes());
         elf
+    }
+
+    fn valid_pe() -> Vec<u8> {
+        let mut pe = vec![0_u8; 512];
+        pe[..2].copy_from_slice(b"MZ");
+        pe[0x3c..0x40].copy_from_slice(&0x80_u32.to_le_bytes());
+        pe[0x80..0x84].copy_from_slice(b"PE\0\0");
+        pe[0x84..0x86].copy_from_slice(&0x8664_u16.to_le_bytes());
+        pe[0x86..0x88].copy_from_slice(&1_u16.to_le_bytes());
+        pe[0x94..0x96].copy_from_slice(&112_u16.to_le_bytes());
+        pe[0x96..0x98].copy_from_slice(&2_u16.to_le_bytes());
+        pe[0x98..0x9a].copy_from_slice(&0x20b_u16.to_le_bytes());
+        pe[0xa8..0xac].copy_from_slice(&0x1000_u32.to_le_bytes());
+        pe[0xdc..0xde].copy_from_slice(&10_u16.to_le_bytes());
+        pe[0x118..0x11c].copy_from_slice(&16_u32.to_le_bytes());
+        pe[0x11c..0x120].copy_from_slice(&320_u32.to_le_bytes());
+        pe[0x12c..0x130].copy_from_slice(&0x6000_0000_u32.to_le_bytes());
+        pe
     }
 }

@@ -32,8 +32,10 @@ failure without falsely reporting a later cleanup as successful.
 
 Schema 5 uses canonical request-relative paths with no traversal, symlink
 ancestry, hard-link substitution, or input/output/run-directory aliases. It
-binds nonzero exact revisions, the candidate and ABI tree, SHA-256 identities
-for loader, kernel, symbols, bootstrap, all four payloads and provenance, the
+binds nonzero exact revisions, the candidate and ABI tree, accepted Rust
+revision `a92dc7f7464ad6ddfece4402bd7b86dbfa86166d`, and the exact clean current
+Wyrmroot HEAD. It also binds SHA-256 identities for loader, kernel, symbols,
+bootstrap, all four payloads, provenance, OVMF code and OVMF variables, the
 deterministic bootfs and ESP outputs, nonce, frozen digest
 `5E4E054B5C244ACE`, bounded timeout, and measured page ceiling. The canonical
 template intentionally leaves the not-yet-integrated Wyrmroot revision and
@@ -47,13 +49,31 @@ kernel build. Its hash is itself request-bound. This proves agreement between
 the accepted build record and inspected artifacts; it does not claim to infer
 an unrecorded compiler invocation from an ELF file.
 
-The root-owned bounded run writes an exact run receipt. That receipt binds the
-frozen request and build-receipt hashes, the actually booted ESP and bootfs
-hashes, serial-log hash and request-relative path, run directory, timeout,
-observed QEMU debug-exit status 33, and `timed_out = false`. A caller assertion
-or serial text alone is never evidence. Acceptance additionally requires the
-inspected static x86_64 ELF identities and loaded profile markers, the audited
-and request-hashed hog artifact, the exact 122-byte `DWPRE1` with facts
-`000000FF`, and an immediately following PASS `DWTEST1` ID 26/detail zero.
-This host contract prepares those checks but makes no live selector-26 run
-claim.
+`cargo xtask dw1b run --request <request>` is the canonical bounded execution
+command. It reuses the central one-CPU q35/OVMF Wyrmroot runner, creates fresh
+run-local snapshots of the inspected ESP and exact OVMF code/variables, owns
+the serial and stderr outputs, observes timeout/process status, and only then
+writes an exact run receipt. The legacy `evidence` spelling performs the same
+fresh run; it does not accept a caller-supplied receipt. Pre-existing run
+products are rejected.
+
+The run receipt binds the frozen request and build-receipt hashes, the actually
+booted ESP and bootfs hashes, initial OVMF identities, serial-log hash and
+request-relative path, run directory, timeout, observed QEMU debug-exit status
+33, and `timed_out = false`. A caller assertion or serial text alone is never
+evidence. Before execution, the canonical G3 image inspector must prove that
+the request-bound ESP contains the exact loader, kernel, bootstrap, and bootfs.
+Product validation applies the native loader's ELF planning invariants to the
+bootstrap and four ELF payloads, validates the loader as a bounded x86_64
+PE32+ EFI application, proves loaded profile markers, and audits the exact
+request-hashed hog steady-loop bytes. Acceptance additionally requires the
+exact 122-byte `DWPRE1` with facts `000000FF` and an immediately following PASS
+`DWTEST1` ID 26/detail zero.
+
+The accepted release four-entry archive measured 124568 bytes, 31 pages, and
+SHA-256 `4c9f870ea9e9543d86446e6194c4efc1762e01c97812b6b5719ed9af4be00f0b` at
+Wyrmroot `b01641b4da3eab0cff6f128a1a633351c6370836`. The frozen build contract is
+the 31-page ceiling; a final acceptance request records the exact rebuilt
+archive byte count and hash for its own clean Wyrmroot revision. This host
+contract and tooling prepare the canonical checks but make no live selector-26
+run claim.
