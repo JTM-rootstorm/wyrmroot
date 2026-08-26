@@ -128,6 +128,14 @@ pub struct Request {
     pub receipt: PathBuf,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductIdentities {
+    pub manifest_expected: String,
+    pub manifest_observed: String,
+    pub bootfs_expected: String,
+    pub bootfs_observed: String,
+}
+
 impl Request {
     pub fn artifact_paths(&self) -> [(&'static str, &Path); 7] {
         [
@@ -376,7 +384,7 @@ fn reject_output_aliases(request: &Request) -> Result<(), Failure> {
 /// Build the exact WYR1 archive from request artifacts. The manifest and gate
 /// configuration are generated from the request and artifact bytes; callers
 /// cannot supply semantic product inputs through either output path.
-pub fn build_bootfs(request: &Request) -> Result<String, Failure> {
+pub fn build_bootfs(request: &Request) -> Result<ProductIdentities, Failure> {
     let read = |path: &Path, label: &str| {
         fs::read(path)
             .map_err(|error| Failure::task(format!("could not read WYR1 {label}: {error}")))
@@ -409,61 +417,47 @@ pub fn build_bootfs(request: &Request) -> Result<String, Failure> {
     let config_hash = sha256::bytes_digest_array(&gate_config);
     let structural_manifest_digest = sha256::bytes_digest_array(&structural_manifest);
     let structural_bootfs_digest = sha256::bytes_digest_array(&structural_archive);
-    let (expected_closure, observed_materials) =
-        closure_materials_for_request(init_hash, role_hashes, config_hash);
+    let expected_closure = expected_closure_for_request(init_hash, role_hashes, config_hash);
+    fs::write(&request.rrc_manifest, &structural_manifest).map_err(|error| {
+        Failure::task(format!("could not write generated WYR1 manifest: {error}"))
+    })?;
+    fs::write(&request.bootfs, &structural_archive)
+        .map_err(|error| Failure::task(format!("could not write WYR1 bootfs: {error}")))?;
+    let observed_manifest = fs::read(&request.rrc_manifest)
+        .map_err(|error| Failure::task(format!("could not re-read WYR1 manifest: {error}")))?;
+    let observed_archive = fs::read(&request.bootfs)
+        .map_err(|error| Failure::task(format!("could not re-read WYR1 bootfs: {error}")))?;
+    let observed_materials = observe_closure_from_archive(&observed_archive)?;
+    let observed_manifest_digest = sha256::bytes_digest_array(&observed_manifest);
+    let observed_bootfs_digest = sha256::bytes_digest_array(&observed_archive);
     let profile = product_profile_for_request(
         structural_manifest_digest,
+        observed_manifest_digest,
         structural_bootfs_digest,
+        observed_bootfs_digest,
         &expected_closure,
         &observed_materials,
     );
-    let manifest = builder
-        .build_wyr1a_product(profile)
-        .map_err(|error| Failure::task(format!("WYR1 product manifest build failed: {error:?}")))?;
-    let parsed =
-        wyrmroot_rrc_manifest::Manifest::parse_wyr1a_product(&manifest, &expected, profile)
-            .map_err(|error| {
-                Failure::task(format!("WYR1 product manifest parse failed: {error:?}"))
-            })?;
-    parsed.validate_wyr1a_product(profile).map_err(|error| {
-        Failure::task(format!(
-            "WYR1 product manifest validation failed: {error:?}"
-        ))
-    })?;
-    if manifest != structural_manifest {
-        return Err(Failure::task("WYR1 product manifest is not deterministic"));
-    }
-    let archive = build_archive(
-        [&init, &registryd, &devmgr, &uart, &console, &shell],
-        &manifest,
-        &gate_config,
-    )?;
-    if archive != structural_archive {
-        return Err(Failure::task("WYR1 product bootfs is not deterministic"));
-    }
-    let manifest_digest = sha256::bytes_digest_array(&manifest);
-    let bootfs_digest = sha256::bytes_digest_array(&archive);
-    if manifest_digest != structural_manifest_digest || bootfs_digest != structural_bootfs_digest {
-        return Err(Failure::task(
-            "WYR1 product identities changed after validation",
-        ));
-    }
     validate_product(
         &expected,
-        &manifest,
-        manifest_digest,
-        &archive,
-        bootfs_digest,
+        &observed_manifest,
+        observed_manifest_digest,
+        &observed_archive,
+        observed_bootfs_digest,
         &gate_config,
         [&init, &registryd, &devmgr, &uart, &console, &shell],
         profile,
     )?;
-    fs::write(&request.rrc_manifest, &manifest).map_err(|error| {
-        Failure::task(format!("could not write generated WYR1 manifest: {error}"))
-    })?;
-    fs::write(&request.bootfs, &archive)
-        .map_err(|error| Failure::task(format!("could not write WYR1 bootfs: {error}")))?;
-    Ok(sha256::bytes_digest(&archive))
+    let manifest_expected = sha256::bytes_digest(&structural_manifest);
+    let manifest_observed = sha256::bytes_digest(&observed_manifest);
+    let bootfs_expected = sha256::bytes_digest(&structural_archive);
+    let bootfs_observed = sha256::bytes_digest(&observed_archive);
+    Ok(ProductIdentities {
+        manifest_expected,
+        manifest_observed,
+        bootfs_expected,
+        bootfs_observed,
+    })
 }
 
 fn fixed_builder(
@@ -560,7 +554,7 @@ fn build_archive(
     .map_err(|error| Failure::task(format!("WYR1 bootfs build failed: {error:?}")))
 }
 
-fn decode_digest(value: &str) -> Result<[u8; 32], Failure> {
+pub(crate) fn decode_digest(value: &str) -> Result<[u8; 32], Failure> {
     if value.len() != 64 {
         return Err(Failure::task("request identity is not a SHA-256 digest"));
     }
@@ -604,15 +598,12 @@ pub(crate) fn gate_config_for_request(request: &Request) -> Vec<u8> {
     .into_bytes()
 }
 
-pub(crate) fn closure_materials_for_request(
+pub(crate) fn expected_closure_for_request(
     init_hash: [u8; 32],
     role_hashes: [[u8; 32]; 5],
     config_hash: [u8; 32],
-) -> (
-    [ExpectedClosureEntry<'static>; 7],
-    [ObservedRetainedMaterial<'static>; 7],
-) {
-    let expected = [
+) -> [ExpectedClosureEntry<'static>; 7] {
+    [
         ExpectedClosureEntry {
             path: "system/bootstrap/wyr1-a-gate-v1",
             identity: config_hash,
@@ -660,30 +651,72 @@ pub(crate) fn closure_materials_for_request(
                 role: RoleId::Wyrmsh,
             },
         },
-    ];
-    let observed = expected.map(|entry| ObservedRetainedMaterial {
-        path: entry.path,
-        identity: entry.identity,
-        residence: MaterialResidence::RetainedBootfs,
-    });
-    (expected, observed)
+    ]
+}
+
+pub(crate) fn observe_closure_from_archive(
+    archive_bytes: &[u8],
+) -> Result<[ObservedRetainedMaterial<'static>; 7], Failure> {
+    let archive = wyrmroot_bootfs::archive::Archive::new(archive_bytes).map_err(|error| {
+        Failure::task(format!(
+            "WYR1 observed closure archive is invalid: {error:?}"
+        ))
+    })?;
+    let observed = |path: &'static str| -> Result<ObservedRetainedMaterial<'static>, Failure> {
+        let entry = archive.lookup(path.as_bytes()).map_err(|error| {
+            Failure::task(format!(
+                "WYR1 observed closure is missing {path}: {error:?}"
+            ))
+        })?;
+        Ok(ObservedRetainedMaterial {
+            path,
+            identity: sha256::bytes_digest_array(entry.data()),
+            residence: MaterialResidence::RetainedBootfs,
+        })
+    };
+    Ok([
+        observed("system/bootstrap/wyr1-a-gate-v1")?,
+        observed("system/consoled")?,
+        observed("system/devmgr")?,
+        observed("system/init")?,
+        observed("system/registryd")?,
+        observed("system/uart16550d")?,
+        observed("system/wyrmsh")?,
+    ])
+}
+
+#[cfg(test)]
+fn observed_archive_identity(archive_bytes: &[u8], path: &str) -> Result<[u8; 32], Failure> {
+    let archive = wyrmroot_bootfs::archive::Archive::new(archive_bytes).map_err(|error| {
+        Failure::task(format!(
+            "WYR1 observed product archive is invalid: {error:?}"
+        ))
+    })?;
+    let entry = archive.lookup(path.as_bytes()).map_err(|error| {
+        Failure::task(format!(
+            "WYR1 observed product is missing {path}: {error:?}"
+        ))
+    })?;
+    Ok(sha256::bytes_digest_array(entry.data()))
 }
 
 pub(crate) fn product_profile_for_request<'a>(
-    manifest: [u8; 32],
-    bootfs: [u8; 32],
+    manifest_expected: [u8; 32],
+    manifest_observed: [u8; 32],
+    bootfs_expected: [u8; 32],
+    bootfs_observed: [u8; 32],
     expected_closure: &'a [ExpectedClosureEntry<'a>; 7],
     observed_materials: &'a [ObservedRetainedMaterial<'a>; 7],
 ) -> Wyr1aProductProfile<'a> {
     Wyr1aProductProfile {
         receipts: ProductReceiptIdentities {
             manifest: ExpectedObservedIdentity {
-                expected: manifest,
-                observed: manifest,
+                expected: manifest_expected,
+                observed: manifest_observed,
             },
             bootfs: ExpectedObservedIdentity {
-                expected: bootfs,
-                observed: bootfs,
+                expected: bootfs_expected,
+                observed: bootfs_observed,
             },
         },
         expected_closure,
@@ -753,12 +786,10 @@ pub(crate) fn validate_product(
 /// intentionally external to the WRRM bytes, avoiding self-referential hashes.
 pub fn receipt_text(
     request: &Request,
-    bootfs_sha256: &str,
+    identities: &ProductIdentities,
     esp_sha256: &str,
     profile: Profile,
 ) -> Result<String, Failure> {
-    let manifest_sha256 = sha256::file_digest(&request.rrc_manifest)
-        .map_err(|error| Failure::task(format!("could not hash manifest: {error}")))?;
     let mut lines = vec![
         format!("schema_version = \"1\""),
         format!("kind = \"{RECEIPT_KIND}\""),
@@ -768,13 +799,25 @@ pub fn receipt_text(
         format!("rust_revision = \"{}\"", request.rust_revision),
         format!("scenario = \"{}\"", request.scenario.name()),
         format!("profile = \"{}\"", profile.name()),
-        format!("bootfs_sha256 = \"{bootfs_sha256}\""),
-        format!("bootfs_expected_sha256 = \"{bootfs_sha256}\""),
-        format!("bootfs_observed_sha256 = \"{bootfs_sha256}\""),
+        format!("bootfs_sha256 = \"{}\"", identities.bootfs_expected),
+        format!(
+            "bootfs_expected_sha256 = \"{}\"",
+            identities.bootfs_expected
+        ),
+        format!(
+            "bootfs_observed_sha256 = \"{}\"",
+            identities.bootfs_observed
+        ),
         format!("esp_sha256 = \"{esp_sha256}\""),
-        format!("manifest_sha256 = \"{manifest_sha256}\""),
-        format!("manifest_expected_sha256 = \"{manifest_sha256}\""),
-        format!("manifest_observed_sha256 = \"{manifest_sha256}\""),
+        format!("manifest_sha256 = \"{}\"", identities.manifest_expected),
+        format!(
+            "manifest_expected_sha256 = \"{}\"",
+            identities.manifest_expected
+        ),
+        format!(
+            "manifest_observed_sha256 = \"{}\"",
+            identities.manifest_observed
+        ),
         format!(
             "gate_config_sha256 = \"{}\"",
             sha256::bytes_digest(&gate_config_for_request(request))
@@ -815,7 +858,7 @@ pub fn write_receipt(request: &Request, text: &str) -> Result<(), Failure> {
 
 /// Re-read a receipt and compare every identity against the request and its
 /// current immutable inputs. Unknown/missing/duplicate keys are rejected.
-pub fn verify_receipt(request: &Request, profile: Profile) -> Result<(), Failure> {
+pub fn verify_receipt(request: &Request, profile: Profile) -> Result<ProductIdentities, Failure> {
     let bytes = fs::read(&request.receipt)
         .map_err(|error| Failure::task(format!("could not read WYR1 receipt: {error}")))?;
     let text =
@@ -875,20 +918,26 @@ pub fn verify_receipt(request: &Request, profile: Profile) -> Result<(), Failure
     check("rust_revision", &request.rust_revision)?;
     check("scenario", request.scenario.name())?;
     check("profile", profile.name())?;
-    check(
-        "bootfs_sha256",
-        &sha256::file_digest(&request.bootfs)
-            .map_err(|error| Failure::task(format!("could not hash bootfs: {error}")))?,
-    )?;
-    let bootfs_digest = sha256::file_digest(&request.bootfs)
+    let bootfs_observed = sha256::file_digest(&request.bootfs)
         .map_err(|error| Failure::task(format!("could not hash bootfs: {error}")))?;
-    check("bootfs_expected_sha256", &bootfs_digest)?;
-    check("bootfs_observed_sha256", &bootfs_digest)?;
-    let manifest_digest = sha256::file_digest(&request.rrc_manifest)
+    let bootfs_expected = required(&values, "bootfs_expected_sha256")?;
+    check("bootfs_sha256", bootfs_expected)?;
+    check("bootfs_observed_sha256", &bootfs_observed)?;
+    if bootfs_expected != bootfs_observed {
+        return Err(Failure::task(
+            "WYR1 bootfs expected/observed receipt identity mismatch",
+        ));
+    }
+    let manifest_observed = sha256::file_digest(&request.rrc_manifest)
         .map_err(|error| Failure::task(format!("could not hash manifest: {error}")))?;
-    check("manifest_sha256", &manifest_digest)?;
-    check("manifest_expected_sha256", &manifest_digest)?;
-    check("manifest_observed_sha256", &manifest_digest)?;
+    let manifest_expected = required(&values, "manifest_expected_sha256")?;
+    check("manifest_sha256", manifest_expected)?;
+    check("manifest_observed_sha256", &manifest_observed)?;
+    if manifest_expected != manifest_observed {
+        return Err(Failure::task(
+            "WYR1 manifest expected/observed receipt identity mismatch",
+        ));
+    }
     check(
         "esp_sha256",
         &sha256::file_digest(&request.esp)
@@ -924,7 +973,12 @@ pub fn verify_receipt(request: &Request, profile: Profile) -> Result<(), Failure
             check("manifest_sha256", &digest)?;
         }
     }
-    Ok(())
+    Ok(ProductIdentities {
+        manifest_expected: manifest_expected.to_owned(),
+        manifest_observed,
+        bootfs_expected: bootfs_expected.to_owned(),
+        bootfs_observed,
+    })
 }
 
 fn artifact_key(path: &str) -> String {
@@ -1337,6 +1391,82 @@ pub fn join_profiles(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observed_closure_is_measured_from_archive_and_mismatch_reaches_validator() {
+        let boot_generation = [0x42; 32];
+        let init = b"init".as_slice();
+        let registryd = b"registryd".as_slice();
+        let devmgr = b"devmgr".as_slice();
+        let uart = b"uart".as_slice();
+        let console = b"console".as_slice();
+        let shell = b"shell".as_slice();
+        let gate = b"gate".as_slice();
+        let role_hashes = [registryd, devmgr, uart, console, shell].map(sha256_bytes);
+        let manifest = fixed_builder(&boot_generation, role_hashes)
+            .unwrap()
+            .build_structural()
+            .unwrap();
+        let archive = build_archive(
+            [init, registryd, devmgr, uart, console, shell],
+            &manifest,
+            gate,
+        )
+        .unwrap();
+        let expected =
+            expected_closure_for_request(sha256_bytes(init), role_hashes, sha256_bytes(gate));
+        let mut observed = observe_closure_from_archive(&archive).unwrap();
+        let manifest_identity = sha256_bytes(&manifest);
+        let bootfs_identity = sha256_bytes(&archive);
+        let valid = product_profile_for_request(
+            manifest_identity,
+            observed_archive_identity(&archive, "system/bootstrap/rrc-a-v1").unwrap(),
+            bootfs_identity,
+            sha256_bytes(&archive),
+            &expected,
+            &observed,
+        );
+        wyrmroot_rrc_manifest::Manifest::parse_wyr1a_product(&manifest, &boot_generation, valid)
+            .unwrap();
+
+        observed[4].identity[0] ^= 1;
+        let mismatched = product_profile_for_request(
+            manifest_identity,
+            observed_archive_identity(&archive, "system/bootstrap/rrc-a-v1").unwrap(),
+            bootfs_identity,
+            sha256_bytes(&archive),
+            &expected,
+            &observed,
+        );
+        assert!(matches!(
+            wyrmroot_rrc_manifest::Manifest::parse_wyr1a_product(
+                &manifest,
+                &boot_generation,
+                mismatched,
+            ),
+            Err(wyrmroot_rrc_manifest::ProductError::ObservedMaterialIdentityMismatch)
+        ));
+
+        let mut bootfs_observed = bootfs_identity;
+        bootfs_observed[0] ^= 1;
+        let observed = observe_closure_from_archive(&archive).unwrap();
+        let mismatched = product_profile_for_request(
+            manifest_identity,
+            manifest_identity,
+            bootfs_identity,
+            bootfs_observed,
+            &expected,
+            &observed,
+        );
+        assert!(matches!(
+            wyrmroot_rrc_manifest::Manifest::parse_wyr1a_product(
+                &manifest,
+                &boot_generation,
+                mismatched,
+            ),
+            Err(wyrmroot_rrc_manifest::ProductError::BootfsReceiptIdentityMismatch)
+        ));
+    }
 
     fn lowercase_field(mut line: Vec<u8>, range: std::ops::Range<usize>) -> Vec<u8> {
         let byte = line[range]

@@ -100,12 +100,14 @@ fn verify_snapshotted_receipt(request: &Request, inputs: &ImmutableInputs) -> Re
         receipt: inputs.receipt.path.clone(),
         ..request.clone()
     };
-    wyr1::verify_receipt(&snapshot, Profile::Default).map_err(|error| {
-        Failure::task(format!(
-            "snapshotted WYR1 receipt did not rejoin immutable inputs: {}",
-            error.message
-        ))
-    })
+    wyr1::verify_receipt(&snapshot, Profile::Default)
+        .map(|_| ())
+        .map_err(|error| {
+            Failure::task(format!(
+                "snapshotted WYR1 receipt did not rejoin immutable inputs: {}",
+                error.message
+            ))
+        })
 }
 
 fn create_fresh_run_root(request: &Request) -> Result<PathBuf, Failure> {
@@ -701,7 +703,12 @@ mod tests {
         };
         let receipt = wyr1::receipt_text(
             &request,
-            &sha256::file_digest(&request.bootfs).unwrap(),
+            &wyr1::ProductIdentities {
+                manifest_expected: sha256::file_digest(&request.rrc_manifest).unwrap(),
+                manifest_observed: sha256::file_digest(&request.rrc_manifest).unwrap(),
+                bootfs_expected: sha256::file_digest(&request.bootfs).unwrap(),
+                bootfs_observed: sha256::file_digest(&request.bootfs).unwrap(),
+            },
             &sha256::file_digest(&request.esp).unwrap(),
             Profile::Default,
         )
@@ -817,6 +824,35 @@ mod tests {
         );
         assert_eq!(smp_xml, fs::read(root.join("runs/smp/domain.xml")).unwrap());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn receipt_rejects_expected_observed_product_identity_mismatches() {
+        let root = fixture_root("receipt-identity-mismatch");
+        let request = fixture_request(&root);
+        let actual_bootfs = sha256::file_digest(&request.bootfs).unwrap();
+        let replacement = if actual_bootfs == "a".repeat(64) {
+            "b".repeat(64)
+        } else {
+            "a".repeat(64)
+        };
+        let receipt = fs::read_to_string(&request.receipt).unwrap();
+        let receipt = receipt
+            .replace(
+                &format!("bootfs_sha256 = \"{actual_bootfs}\""),
+                &format!("bootfs_sha256 = \"{replacement}\""),
+            )
+            .replace(
+                &format!("bootfs_expected_sha256 = \"{actual_bootfs}\""),
+                &format!("bootfs_expected_sha256 = \"{replacement}\""),
+            );
+        fs::write(&request.receipt, receipt).unwrap();
+        assert_eq!(
+            wyr1::verify_receipt(&request, Profile::Default)
+                .unwrap_err()
+                .message,
+            "WYR1 bootfs expected/observed receipt identity mismatch"
+        );
     }
 
     #[test]

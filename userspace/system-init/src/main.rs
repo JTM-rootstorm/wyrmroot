@@ -91,10 +91,13 @@ impl InitPlatform for NativeSystem {
 }
 
 fn main(startup: StartupBlock<'_>) -> u32 {
+    let mut system = NativeSystem;
+    let mut loader = NativeLoaderPlatform;
+    let mut waits = NativeSupervisionPlatform;
     let result = run_system_init(
-        &mut NativeSystem,
-        &mut NativeLoaderPlatform,
-        &mut NativeSupervisionPlatform,
+        &mut system,
+        &mut loader,
+        &mut waits,
         startup.bootstrap_channel().as_abi(),
     );
     let mut resident = match result {
@@ -107,18 +110,7 @@ fn main(startup: StartupBlock<'_>) -> u32 {
         }
     };
     #[cfg(feature = "wyr1-test-evidence")]
-    {
-        let mut index = 0;
-        while let Some(line) = resident.controller().evidence_line(index) {
-            let Ok(record) = <&[u8; 114]>::try_from(line) else {
-                return 0xAF01_0007;
-            };
-            if wyrmroot_runtime::submit_wyr1_evidence(record).is_err() {
-                return 0xAF01_0008;
-            }
-            index += 1;
-        }
-    }
+    let mut evidence_submitted = false;
     loop {
         let Ok(now) = monotonic_active_now() else {
             return 0xAF01_0003;
@@ -126,10 +118,27 @@ fn main(startup: StartupBlock<'_>) -> u32 {
         let Some(deadline) = now.checked_add(1_000_000_000) else {
             return 0xAF01_0004;
         };
-        if resident.control_tick(now).is_err() {
+        if resident
+            .control_tick(&mut system, &mut loader, &mut waits, now)
+            .is_err()
+        {
             return 0xAF01_0006;
         }
-        if InitPlatform::wait_until(&mut NativeSystem, deadline).is_err() {
+        #[cfg(feature = "wyr1-test-evidence")]
+        if resident.evidence_finalized() && !evidence_submitted {
+            let mut index = 0;
+            while let Some(line) = resident.controller().evidence_line(index) {
+                let Ok(record) = <&[u8; 114]>::try_from(line) else {
+                    return 0xAF01_0007;
+                };
+                if wyrmroot_runtime::submit_wyr1_evidence(record).is_err() {
+                    return 0xAF01_0008;
+                }
+                index += 1;
+            }
+            evidence_submitted = true;
+        }
+        if InitPlatform::wait_until(&mut system, deadline).is_err() {
             return 0xAF01_0005;
         }
     }

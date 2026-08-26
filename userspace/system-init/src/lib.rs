@@ -12,10 +12,10 @@ pub mod gate;
 use crate::evidence::{EvidenceError, EvidenceEvent, EvidenceLog};
 use crate::gate::{GATE_CONFIG_PATH, GateConfig, GateConfigError, parse_gate_config};
 use deepwyrm_syscall::{
-    DW_DEADLINE_INFINITE, DW_SIGNAL_EXITED, DW_SIGNAL_PEER_CLOSED, DW_TASK_STATE_EXITED,
-    DW_TERMINATION_AUTHORIZED, DW_TERMINATION_NORMAL_EXIT, DW_TERMINATION_TASK_GROUP_TEARDOWN,
-    DwDeadline, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights, DwTaskTerminationInfoV1,
-    DwWaitItemV1,
+    DW_SIGNAL_EXITED, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DW_STATUS_TIMED_OUT,
+    DW_TASK_STATE_EXITED, DW_TERMINATION_AUTHORIZED, DW_TERMINATION_NORMAL_EXIT,
+    DW_TERMINATION_TASK_GROUP_TEARDOWN, DwDeadline, DwHandle, DwObjectType, DwReceivedHandleInfoV1,
+    DwRights, DwTaskTerminationInfoV1, DwWaitItemV1,
 };
 use wyrmroot_bootfs::archive::{Archive, LookupError, ParseError};
 use wyrmroot_loader::{
@@ -121,7 +121,31 @@ pub struct ResidentSystemInit {
     controller: SystemInit,
     authority: LoadAuthority,
     result: RecoveryResult,
+    active: [Option<ActiveNativeRole>; EARLY_ROLE_COUNT],
+    evidence_finalized: bool,
     last_tick_ns: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ActiveNativeRole {
+    role: RoleId,
+    generation: u64,
+    transaction_id: u64,
+    loaded: LoadedProcess,
+    task_group: DwHandle,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ActivationState {
+    controller: SystemInit,
+    result: RecoveryResult,
+    active: [Option<ActiveNativeRole>; EARLY_ROLE_COUNT],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RoleActivation {
+    Ready(ActiveNativeRole),
+    Degraded,
 }
 
 impl ResidentSystemInit {
@@ -140,16 +164,155 @@ impl ResidentSystemInit {
         self.authority
     }
 
+    #[must_use]
+    pub const fn evidence_finalized(&self) -> bool {
+        self.evidence_finalized
+    }
+
     /// Advances the permanent fixed-role control loop without inventing service
-    /// manager policy. Native role events are consumed during activation and
-    /// future reached profiles can extend this exact generation-owned tick.
-    pub fn control_tick(&mut self, now_ns: u64) -> Result<SystemMode, InitError> {
+    /// manager policy. A zero-time probe keeps idle ticks nonblocking; once a
+    /// role signal is pending, the exact terminal protocol is drained under the
+    /// bounded cleanup deadline before the generation-owned transition occurs.
+    pub fn control_tick<S, L, W>(
+        &mut self,
+        system: &mut S,
+        loader: &mut L,
+        waits: &mut W,
+        now_ns: u64,
+    ) -> Result<SystemMode, InitError>
+    where
+        S: InitPlatform,
+        L: LoaderPlatform<Error = NativeError>,
+        W: SupervisionPlatform<Error = NativeError>,
+    {
         if now_ns < self.last_tick_ns {
             self.controller.fatal();
             self.result = RecoveryResult::Fatal;
             return Err(InitError::WrongActivationOrder);
         }
         self.last_tick_ns = now_ns;
+
+        for index in 0..self.active.len() {
+            let Some(active) = self.active[index] else {
+                continue;
+            };
+            let poll_items = [
+                DwWaitItemV1 {
+                    handle: active.loaded.launch_channel,
+                    signals: deepwyrm_syscall::DwSignals(
+                        DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0,
+                    ),
+                },
+                DwWaitItemV1 {
+                    handle: active.loaded.process,
+                    signals: DW_SIGNAL_EXITED,
+                },
+            ];
+            let observed = match waits.wait_many(&poll_items, DwDeadline(now_ns)) {
+                Err(NativeError::Status(status)) if status == DW_STATUS_TIMED_OUT => continue,
+                Err(error) => Err(ObservedSupervisionError::Supervision(
+                    SupervisionError::Platform(error),
+                )),
+                Ok(_) => {
+                    let observation_deadline = now_ns
+                        .checked_add(WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns)
+                        .ok_or(InitError::Restart(
+                            RestartTransitionError::ArithmeticOverflow,
+                        ))?;
+                    supervise_ready_child_profile(
+                        waits,
+                        active.loaded.process,
+                        active.loaded.launch_channel,
+                        LaunchProfile::EarlyBootStub,
+                        active.transaction_id,
+                        DwDeadline(observation_deadline),
+                    )
+                }
+            };
+
+            let (transition, terminate) = match observed {
+                Ok(info) => (
+                    AfterReadyTransition::Terminal(terminal_disposition(&info)),
+                    false,
+                ),
+                Err(error) => (
+                    classify_after_ready_observation(&error),
+                    !error.process_exit_observed(),
+                ),
+            };
+            let transitioned = match transition {
+                AfterReadyTransition::Terminal(disposition) => self.controller.terminal(
+                    active.role,
+                    active.generation,
+                    active.transaction_id,
+                    now_ns,
+                    disposition,
+                ),
+                AfterReadyTransition::Failure(failure) => self.controller.fail(
+                    active.role,
+                    active.generation,
+                    active.transaction_id,
+                    now_ns,
+                    failure,
+                ),
+            };
+            if let Err(error) = transitioned {
+                return Err(cleanup_after_transition_error(
+                    system,
+                    waits,
+                    &mut self.controller,
+                    active.loaded,
+                    active.task_group,
+                    active.role,
+                    error,
+                ));
+            }
+            complete_native_cleanup(
+                system,
+                waits,
+                &mut self.controller,
+                active.loaded,
+                active.task_group,
+                terminate,
+                active.role,
+                active.generation,
+                active.transaction_id,
+                now_ns,
+            )?;
+            self.active[index] = None;
+
+            if transition == AfterReadyTransition::Terminal(TerminalDisposition::NormalExit(0)) {
+                continue;
+            }
+            if advance_or_degrade(
+                system,
+                &mut self.controller,
+                active.role,
+                active.transaction_id,
+            )? {
+                self.result = RecoveryResult::Degraded;
+                continue;
+            }
+            match remap_and_activate_role(
+                system,
+                loader,
+                waits,
+                self.authority,
+                &mut self.controller,
+                active.role,
+            )? {
+                RoleActivation::Ready(replacement) => self.active[index] = Some(replacement),
+                RoleActivation::Degraded => self.result = RecoveryResult::Degraded,
+            }
+        }
+
+        if self.controller.mode() == SystemMode::Degraded {
+            self.result = RecoveryResult::Degraded;
+        }
+        if !self.evidence_finalized && self.active.iter().all(Option::is_none) {
+            self.controller.finalize_evidence(self.result)?;
+            self.evidence_finalized = true;
+        }
         Ok(self.controller.mode())
     }
 }
@@ -520,40 +683,6 @@ impl SystemInit {
         Ok(())
     }
 
-    pub fn begin_devmgr_after_registry(
-        &mut self,
-        now: u64,
-        registry_generation: u64,
-        registry_transaction: u64,
-    ) -> Result<(), InitError> {
-        let registry_record = self.roles[0]
-            .restart
-            .history()
-            .as_slice()
-            .last()
-            .and_then(|record| *record)
-            .ok_or(InitError::WrongActivationOrder)?;
-        if self.mode != SystemMode::ActivatingEarlyRoles
-            || !self.activated[0]
-            || self.roles[0].restart.state() != RestartState::Stopped
-            || self.roles[1].restart.state() != RestartState::Stopped
-            || registry_record.generation != registry_generation
-            || registry_record.transaction_id != registry_transaction
-            || registry_record.failure
-                != AttemptFailure::ExitAfterReady(TerminalDisposition::NormalExit(0))
-            || registry_record.cleanup != CleanupDisposition::Complete
-            || now <= registry_record.terminal_at_ns
-        {
-            return Err(InitError::WrongActivationOrder);
-        }
-        self.roles[1].restart.begin(
-            now,
-            registry_generation,
-            next_transaction(registry_transaction)?,
-        )?;
-        Ok(())
-    }
-
     pub fn install_attempt(&mut self, mut resources: AttemptResources) -> Result<(), InitError> {
         let index = self
             .index(resources.role)
@@ -634,8 +763,20 @@ impl SystemInit {
             .ready(generation, transaction, now)?;
         self.record_evidence(EvidenceEvent::Ready, role, generation, transaction, 0)?;
         self.activated[index] = true;
-        if role == RoleId::Devmgr && self.activated[0] {
-            self.mode = SystemMode::Normal;
+        match role {
+            RoleId::Registryd if !self.activated[1] => {
+                if self.mode != SystemMode::ActivatingEarlyRoles
+                    || self.roles[1].restart.state() != RestartState::Stopped
+                {
+                    return Err(InitError::WrongActivationOrder);
+                }
+                self.roles[1]
+                    .restart
+                    .begin(now, generation, next_transaction(transaction)?)?;
+            }
+            RoleId::Registryd if self.activated[1] => self.mode = SystemMode::Normal,
+            RoleId::Devmgr if self.activated[0] => self.mode = SystemMode::Normal,
+            _ => {}
         }
         Ok(())
     }
@@ -894,19 +1035,18 @@ pub fn validate_retained_bootfs(bytes: &[u8]) -> Result<SystemInit, InitError> {
         }
     }
     // Init itself and all declared immutable dependencies must resolve from
-    // the same retained archive. Their bytes are hashed here; their expected
-    // identities remain bound by the external selected-generation receipt.
+    // the same retained archive. Their expected identities remain bound by
+    // the external selected-generation receipt; hashing them again here would
+    // produce an unauthenticated value with no independent comparison source.
     let init = archive
         .lookup(SYSTEM_INIT_PATH.as_bytes())
         .map_err(map_lookup)?;
     if !init.is_executable() || init.data().is_empty() {
         return Err(InitError::NonExecutableRole);
     }
-    let _init_identity = wyrmroot_runtime::sha256::digest(init.data());
     for edge in manifest.edges() {
         if let Some(path) = edge.target_path() {
-            let entry = archive.lookup(path.as_bytes()).map_err(map_lookup)?;
-            let _observed_identity = wyrmroot_runtime::sha256::digest(entry.data());
+            archive.lookup(path.as_bytes()).map_err(map_lookup)?;
         }
     }
     controller.gate = match archive.lookup(GATE_CONFIG_PATH.as_bytes()) {
@@ -1032,7 +1172,7 @@ where
             .map_err(InitError::Native)??;
         Ok::<_, InitError>((authority, activation))
     })();
-    let (authority, (result, controller)) = match startup {
+    let (authority, activation) = match startup {
         Ok(value) => value,
         Err(error) => {
             close_startup_failure(system, &handles, bootstrap_channel)?;
@@ -1043,9 +1183,11 @@ where
         .close_handle(bootstrap_channel)
         .map_err(InitError::Native)?;
     Ok(ResidentSystemInit {
-        controller,
+        controller: activation.controller,
         authority,
-        result,
+        result: activation.result,
+        active: activation.active,
+        evidence_finalized: false,
         last_tick_ns: system.now().map_err(InitError::Native)?,
     })
 }
@@ -1087,7 +1229,7 @@ fn activate_retained_bootfs<S, L, W>(
     bootstrap_channel: DwHandle,
     parent_transaction: u64,
     bootfs: &[u8],
-) -> Result<(RecoveryResult, SystemInit), InitError>
+) -> Result<ActivationState, InitError>
 where
     S: InitPlatform,
     L: LoaderPlatform<Error = NativeError>,
@@ -1123,383 +1265,291 @@ where
     }
     let now = system.now().map_err(InitError::Native)?;
     controller.begin_registry(now, 1, 0x1001)?;
+    let mut active = [None; EARLY_ROLE_COUNT];
     for role in [RoleId::Registryd, RoleId::Devmgr] {
-        loop {
-            let RestartState::Starting {
-                generation,
-                transaction_id,
-                ..
-            } = controller
-                .role_state(role)
-                .ok_or(InitError::WrongActivationOrder)?
-            else {
-                return Err(InitError::WrongActivationOrder);
-            };
-            let executable_identity = controller.executable_identity(role)?;
-            let task_group = system
-                .create_attempt_task_group(authority.task_group)
-                .map_err(InitError::Native)?;
-            let reservation = controller.reserve_attempt(role, generation, transaction_id)?;
-            let role_authority = LoadAuthority {
-                task_group,
-                ..authority
-            };
-            let loaded = match load_role(
-                loader,
-                role_authority,
-                bootfs,
-                role,
-                executable_identity,
-                transaction_id,
-            ) {
-                Ok(value) => value,
-                Err(error) => {
-                    let now = match system.now().map_err(InitError::Native) {
-                        Ok(now) => now,
-                        Err(clock_error) => {
-                            let close_failed = system.close_handle(task_group).is_err();
-                            let release_failed = controller.abort_reservation(reservation).is_err();
-                            controller.fatal();
-                            return Err(if close_failed || release_failed {
-                                InitError::Cleanup
-                            } else {
-                                clock_error
-                            });
-                        }
-                    };
-                    if let Err(transition_error) = controller.fail(
-                        role,
-                        generation,
-                        transaction_id,
-                        now,
-                        AttemptFailure::CreationFailed,
-                    ) {
+        match activate_role_until_ready(
+            system,
+            &mut controller,
+            loader,
+            waits,
+            authority,
+            bootfs,
+            role,
+        )? {
+            RoleActivation::Ready(attempt) => active[role_index(role)?] = Some(attempt),
+            RoleActivation::Degraded => {
+                return Ok(ActivationState {
+                    controller,
+                    result: RecoveryResult::Degraded,
+                    active,
+                });
+            }
+        }
+    }
+    Ok(ActivationState {
+        controller,
+        result: RecoveryResult::Recovered,
+        active,
+    })
+}
+
+fn remap_and_activate_role<S, L, W>(
+    system: &mut S,
+    loader: &mut L,
+    waits: &mut W,
+    authority: LoadAuthority,
+    controller: &mut SystemInit,
+    role: RoleId,
+) -> Result<RoleActivation, InitError>
+where
+    S: InitPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let size = system
+        .query_memory_object_size(authority.bootfs)
+        .map_err(InitError::Native)?;
+    let plan = MappingPlan::for_bootfs(size).map_err(InitError::Mapping)?;
+    system
+        .with_bootfs_bytes(
+            authority.parent_root,
+            authority.bootfs,
+            plan,
+            |system, bootfs| {
+                activate_role_until_ready(
+                    system, controller, loader, waits, authority, bootfs, role,
+                )
+            },
+        )
+        .map_err(InitError::Native)?
+}
+
+#[allow(clippy::too_many_arguments)]
+fn activate_role_until_ready<S, L, W>(
+    system: &mut S,
+    controller: &mut SystemInit,
+    loader: &mut L,
+    waits: &mut W,
+    authority: LoadAuthority,
+    bootfs: &[u8],
+    role: RoleId,
+) -> Result<RoleActivation, InitError>
+where
+    S: InitPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    loop {
+        let RestartState::Starting {
+            generation,
+            transaction_id,
+            ..
+        } = controller
+            .role_state(role)
+            .ok_or(InitError::WrongActivationOrder)?
+        else {
+            return Err(InitError::WrongActivationOrder);
+        };
+        let executable_identity = controller.executable_identity(role)?;
+        let task_group = system
+            .create_attempt_task_group(authority.task_group)
+            .map_err(InitError::Native)?;
+        let reservation = controller.reserve_attempt(role, generation, transaction_id)?;
+        let role_authority = LoadAuthority {
+            task_group,
+            ..authority
+        };
+        let loaded = match load_role(
+            loader,
+            role_authority,
+            bootfs,
+            role,
+            executable_identity,
+            transaction_id,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                let now = match system.now().map_err(InitError::Native) {
+                    Ok(now) => now,
+                    Err(clock_error) => {
                         let close_failed = system.close_handle(task_group).is_err();
                         let release_failed = controller.abort_reservation(reservation).is_err();
                         controller.fatal();
                         return Err(if close_failed || release_failed {
                             InitError::Cleanup
                         } else {
-                            transition_error
+                            clock_error
                         });
                     }
-                    let rollback_failed = matches!(
-                        error,
-                        InitError::Loader(LoadError::Platform {
-                            rollback_failed: true,
-                            ..
-                        })
-                    );
-                    let close_failed = system.close_handle(task_group).is_err();
-                    if rollback_failed || close_failed {
-                        let retired_at = now.checked_add(1).ok_or(InitError::Accounting)?;
-                        controller.cleanup_failed(role, generation, transaction_id, retired_at)?;
-                        controller.fatal();
-                        return Err(error);
-                    }
-                    controller.abort_reservation(reservation)?;
-                    let retired_at = now.checked_add(1).ok_or(InitError::Accounting)?;
-                    controller.cleanup_complete(role, generation, transaction_id, retired_at)?;
-                    if advance_or_degrade(system, &mut controller, role, transaction_id)? {
-                        controller.finalize_evidence(RecoveryResult::Degraded)?;
-                        return Ok((RecoveryResult::Degraded, controller));
-                    }
-                    continue;
-                }
-            };
-            let install = controller.install_attempt(AttemptResources {
-                role,
-                generation,
-                transaction_id,
-                executable_identity,
-                startup_profile: StartupProfile::EarlyBootStub,
-                task_group,
-                process: loaded.process,
-                launch_channel: loaded.launch_channel,
-                mappings: 0,
-                reservation,
-            });
-            if let Err(error) = install {
-                controller.fatal();
-                return match cleanup_loaded(system, waits, loaded, task_group, true) {
-                    Ok(()) => Err(error),
-                    Err(cleanup) => Err(cleanup),
                 };
-            }
-            let now = match system.now().map_err(InitError::Native) {
-                Ok(now) => now,
-                Err(error) => {
-                    return Err(cleanup_after_transition_error(
-                        system,
-                        waits,
-                        &mut controller,
-                        loaded,
-                        task_group,
-                        role,
-                        error,
-                    ));
+                if let Err(transition_error) = controller.fail(
+                    role,
+                    generation,
+                    transaction_id,
+                    now,
+                    AttemptFailure::CreationFailed,
+                ) {
+                    let close_failed = system.close_handle(task_group).is_err();
+                    let release_failed = controller.abort_reservation(reservation).is_err();
+                    controller.fatal();
+                    return Err(if close_failed || release_failed {
+                        InitError::Cleanup
+                    } else {
+                        transition_error
+                    });
                 }
+                let rollback_failed = matches!(
+                    error,
+                    InitError::Loader(LoadError::Platform {
+                        rollback_failed: true,
+                        ..
+                    })
+                );
+                let close_failed = system.close_handle(task_group).is_err();
+                if rollback_failed || close_failed {
+                    let retired_at = now.checked_add(1).ok_or(InitError::Accounting)?;
+                    controller.cleanup_failed(role, generation, transaction_id, retired_at)?;
+                    controller.fatal();
+                    return Err(error);
+                }
+                controller.abort_reservation(reservation)?;
+                let retired_at = now.checked_add(1).ok_or(InitError::Accounting)?;
+                controller.cleanup_complete(role, generation, transaction_id, retired_at)?;
+                if advance_or_degrade(system, controller, role, transaction_id)? {
+                    return Ok(RoleActivation::Degraded);
+                }
+                continue;
+            }
+        };
+        let install = controller.install_attempt(AttemptResources {
+            role,
+            generation,
+            transaction_id,
+            executable_identity,
+            startup_profile: StartupProfile::EarlyBootStub,
+            task_group,
+            process: loaded.process,
+            launch_channel: loaded.launch_channel,
+            mappings: 0,
+            reservation,
+        });
+        if let Err(error) = install {
+            controller.fatal();
+            return match cleanup_loaded(system, waits, loaded, task_group, true) {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(cleanup),
             };
-            if let Err(error) = controller.child_started(role, generation, transaction_id, now) {
+        }
+        let now = match system.now().map_err(InitError::Native) {
+            Ok(now) => now,
+            Err(error) => {
+                return Err(cleanup_after_transition_error(
+                    system, waits, controller, loaded, task_group, role, error,
+                ));
+            }
+        };
+        if let Err(error) = controller.child_started(role, generation, transaction_id, now) {
+            return Err(cleanup_after_transition_error(
+                system, waits, controller, loaded, task_group, role, error,
+            ));
+        }
+        let deadline = match now.checked_add(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns) {
+            Some(deadline) => DwDeadline(deadline),
+            None => {
                 return Err(cleanup_after_transition_error(
                     system,
                     waits,
-                    &mut controller,
+                    controller,
                     loaded,
                     task_group,
                     role,
-                    error,
+                    InitError::Restart(RestartTransitionError::ArithmeticOverflow),
                 ));
             }
-            let deadline = match now.checked_add(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns) {
-                Some(deadline) => DwDeadline(deadline),
-                None => {
+        };
+        match await_child_ready_profile_observed(
+            waits,
+            loaded.process,
+            loaded.launch_channel,
+            LaunchProfile::EarlyBootStub,
+            transaction_id,
+            deadline,
+        ) {
+            Ok(()) => {
+                let now = match system.now().map_err(InitError::Native) {
+                    Ok(now) => now,
+                    Err(error) => {
+                        return Err(cleanup_after_transition_error(
+                            system, waits, controller, loaded, task_group, role, error,
+                        ));
+                    }
+                };
+                if let Err(error) = controller.ready(role, generation, transaction_id, now) {
+                    return Err(cleanup_after_transition_error(
+                        system, waits, controller, loaded, task_group, role, error,
+                    ));
+                }
+                return Ok(RoleActivation::Ready(ActiveNativeRole {
+                    role,
+                    generation,
+                    transaction_id,
+                    loaded,
+                    task_group,
+                }));
+            }
+            Err(error) => {
+                let observed_transition = classify_after_ready_observation(&error);
+                let now = match system.now().map_err(InitError::Native) {
+                    Ok(now) => now,
+                    Err(clock_error) => {
+                        return Err(cleanup_after_transition_error(
+                            system,
+                            waits,
+                            controller,
+                            loaded,
+                            task_group,
+                            role,
+                            clock_error,
+                        ));
+                    }
+                };
+                let transition = match observed_transition {
+                    AfterReadyTransition::Terminal(disposition) => {
+                        controller.terminal(role, generation, transaction_id, now, disposition)
+                    }
+                    AfterReadyTransition::Failure(failure) => {
+                        controller.ready_wait_failed(role, generation, transaction_id, now, failure)
+                    }
+                };
+                if let Err(transition_error) = transition {
                     return Err(cleanup_after_transition_error(
                         system,
                         waits,
-                        &mut controller,
+                        controller,
                         loaded,
                         task_group,
                         role,
-                        InitError::Restart(RestartTransitionError::ArithmeticOverflow),
+                        transition_error,
                     ));
                 }
-            };
-            match await_child_ready_profile_observed(
-                waits,
-                loaded.process,
-                loaded.launch_channel,
-                LaunchProfile::EarlyBootStub,
-                transaction_id,
-                deadline,
-            ) {
-                Ok(()) => {
-                    let now = match system.now().map_err(InitError::Native) {
-                        Ok(now) => now,
-                        Err(error) => {
-                            return Err(cleanup_after_transition_error(
-                                system,
-                                waits,
-                                &mut controller,
-                                loaded,
-                                task_group,
-                                role,
-                                error,
-                            ));
-                        }
-                    };
-                    if let Err(error) = controller.ready(role, generation, transaction_id, now) {
-                        return Err(cleanup_after_transition_error(
-                            system,
-                            waits,
-                            &mut controller,
-                            loaded,
-                            task_group,
-                            role,
-                            error,
-                        ));
-                    }
-                    match supervise_ready_child_profile(
-                        waits,
-                        loaded.process,
-                        loaded.launch_channel,
-                        LaunchProfile::EarlyBootStub,
-                        transaction_id,
-                        DW_DEADLINE_INFINITE,
-                    ) {
-                        Ok(info) => {
-                            let disposition = terminal_disposition(&info);
-                            let now = match system.now().map_err(InitError::Native) {
-                                Ok(now) => now,
-                                Err(error) => {
-                                    return Err(cleanup_after_transition_error(
-                                        system,
-                                        waits,
-                                        &mut controller,
-                                        loaded,
-                                        task_group,
-                                        role,
-                                        error,
-                                    ));
-                                }
-                            };
-                            if let Err(error) = controller.terminal(
-                                role,
-                                generation,
-                                transaction_id,
-                                now,
-                                disposition,
-                            ) {
-                                return Err(cleanup_after_transition_error(
-                                    system,
-                                    waits,
-                                    &mut controller,
-                                    loaded,
-                                    task_group,
-                                    role,
-                                    error,
-                                ));
-                            }
-                            let retired_at = complete_native_cleanup(
-                                system,
-                                waits,
-                                &mut controller,
-                                loaded,
-                                task_group,
-                                false,
-                                role,
-                                generation,
-                                transaction_id,
-                                now,
-                            )?;
-                            if disposition == TerminalDisposition::NormalExit(0) {
-                                if role == RoleId::Registryd {
-                                    controller.begin_devmgr_after_registry(
-                                        retired_at,
-                                        generation,
-                                        transaction_id,
-                                    )?;
-                                }
-                                break;
-                            }
-                            if advance_or_degrade(system, &mut controller, role, transaction_id)? {
-                                controller.finalize_evidence(RecoveryResult::Degraded)?;
-                                return Ok((RecoveryResult::Degraded, controller));
-                            }
-                        }
-                        Err(error) => {
-                            let now = match system.now().map_err(InitError::Native) {
-                                Ok(now) => now,
-                                Err(error) => {
-                                    return Err(cleanup_after_transition_error(
-                                        system,
-                                        waits,
-                                        &mut controller,
-                                        loaded,
-                                        task_group,
-                                        role,
-                                        error,
-                                    ));
-                                }
-                            };
-                            let observed_transition = classify_after_ready_observation(&error);
-                            let transition = match observed_transition {
-                                AfterReadyTransition::Terminal(disposition) => controller.terminal(
-                                    role,
-                                    generation,
-                                    transaction_id,
-                                    now,
-                                    disposition,
-                                ),
-                                AfterReadyTransition::Failure(failure) => {
-                                    controller.fail(role, generation, transaction_id, now, failure)
-                                }
-                            };
-                            if let Err(error) = transition {
-                                return Err(cleanup_after_transition_error(
-                                    system,
-                                    waits,
-                                    &mut controller,
-                                    loaded,
-                                    task_group,
-                                    role,
-                                    error,
-                                ));
-                            }
-                            let retired_at = complete_native_cleanup(
-                                system,
-                                waits,
-                                &mut controller,
-                                loaded,
-                                task_group,
-                                !error.process_exit_observed(),
-                                role,
-                                generation,
-                                transaction_id,
-                                now,
-                            )?;
-                            if observed_transition
-                                == AfterReadyTransition::Terminal(TerminalDisposition::NormalExit(
-                                    0,
-                                ))
-                            {
-                                if role == RoleId::Registryd {
-                                    controller.begin_devmgr_after_registry(
-                                        retired_at,
-                                        generation,
-                                        transaction_id,
-                                    )?;
-                                }
-                                break;
-                            }
-                            if advance_or_degrade(system, &mut controller, role, transaction_id)? {
-                                controller.finalize_evidence(RecoveryResult::Degraded)?;
-                                return Ok((RecoveryResult::Degraded, controller));
-                            }
-                        }
-                    }
-                }
-                Err(error) => {
-                    let observed_transition = classify_after_ready_observation(&error);
-                    let now = match system.now().map_err(InitError::Native) {
-                        Ok(now) => now,
-                        Err(error) => {
-                            return Err(cleanup_after_transition_error(
-                                system,
-                                waits,
-                                &mut controller,
-                                loaded,
-                                task_group,
-                                role,
-                                error,
-                            ));
-                        }
-                    };
-                    let transition = match observed_transition {
-                        AfterReadyTransition::Terminal(disposition) => {
-                            controller.terminal(role, generation, transaction_id, now, disposition)
-                        }
-                        AfterReadyTransition::Failure(failure) => controller.ready_wait_failed(
-                            role,
-                            generation,
-                            transaction_id,
-                            now,
-                            failure,
-                        ),
-                    };
-                    if let Err(error) = transition {
-                        return Err(cleanup_after_transition_error(
-                            system,
-                            waits,
-                            &mut controller,
-                            loaded,
-                            task_group,
-                            role,
-                            error,
-                        ));
-                    }
-                    complete_native_cleanup(
-                        system,
-                        waits,
-                        &mut controller,
-                        loaded,
-                        task_group,
-                        !error.process_exit_observed(),
-                        role,
-                        generation,
-                        transaction_id,
-                        now,
-                    )?;
-                    if advance_or_degrade(system, &mut controller, role, transaction_id)? {
-                        controller.finalize_evidence(RecoveryResult::Degraded)?;
-                        return Ok((RecoveryResult::Degraded, controller));
-                    }
+                complete_native_cleanup(
+                    system,
+                    waits,
+                    controller,
+                    loaded,
+                    task_group,
+                    !error.process_exit_observed(),
+                    role,
+                    generation,
+                    transaction_id,
+                    now,
+                )?;
+                if advance_or_degrade(system, controller, role, transaction_id)? {
+                    return Ok(RoleActivation::Degraded);
                 }
             }
         }
     }
-    controller.finalize_evidence(RecoveryResult::Recovered)?;
-    Ok((RecoveryResult::Recovered, controller))
 }
 
 fn fresh_capability<S: InitPlatform>(
@@ -1838,7 +1888,8 @@ pub const fn cleanup_is_permanent(state: RestartState) -> bool {
 mod native_cleanup_tests {
     use super::*;
     use deepwyrm_syscall::{
-        DW_TASK_STATE_EXITED, DwStatus, DwTaskState, DwTaskTerminationInfoV1, DwWaitResultV1,
+        DW_TASK_STATE_EXITED, DW_TASK_TERMINATION_INFO_V1_SIZE, DW_WAIT_RESULT_V1_SIZE, DwStatus,
+        DwTaskState, DwTaskTerminationInfoV1, DwWaitResultV1,
     };
     use wyrmroot_runtime::NativeOutputError;
 
@@ -1947,6 +1998,66 @@ mod native_cleanup_tests {
         wait_exited: bool,
     }
 
+    struct ResidentWaits {
+        wait_count: u8,
+    }
+
+    impl SupervisionPlatform for ResidentWaits {
+        type Error = NativeError;
+
+        fn wait_many(
+            &mut self,
+            items: &[DwWaitItemV1],
+            _deadline: DwDeadline,
+        ) -> Result<DwWaitResultV1, Self::Error> {
+            let result = match self.wait_count {
+                0 | 1 => DwWaitResultV1 {
+                    size: DW_WAIT_RESULT_V1_SIZE,
+                    version: 1,
+                    index: 0,
+                    observed: DW_SIGNAL_PEER_CLOSED,
+                    ..DwWaitResultV1::default()
+                },
+                2 => DwWaitResultV1 {
+                    size: DW_WAIT_RESULT_V1_SIZE,
+                    version: 1,
+                    index: 0,
+                    observed: DW_SIGNAL_EXITED,
+                    ..DwWaitResultV1::default()
+                },
+                3 => return Err(NativeError::Status(DW_STATUS_TIMED_OUT)),
+                _ => panic!("unexpected resident wait"),
+            };
+            if self.wait_count == 2 {
+                assert_eq!(items.len(), 1);
+            }
+            self.wait_count += 1;
+            Ok(result)
+        }
+
+        fn receive_channel(
+            &mut self,
+            _channel: DwHandle,
+            _bytes: &mut [u8],
+            _handles: &mut [DwReceivedHandleInfoV1],
+        ) -> Result<ReceiveCounts, Self::Error> {
+            Err(FAILURE)
+        }
+
+        fn query_task_termination(
+            &mut self,
+            _process: DwHandle,
+        ) -> Result<DwTaskTerminationInfoV1, Self::Error> {
+            Ok(DwTaskTerminationInfoV1 {
+                size: DW_TASK_TERMINATION_INFO_V1_SIZE,
+                version: 1,
+                state: DW_TASK_STATE_EXITED,
+                reason: DW_TERMINATION_NORMAL_EXIT,
+                ..DwTaskTerminationInfoV1::default()
+            })
+        }
+    }
+
     impl SupervisionPlatform for MockWaits {
         type Error = NativeError;
 
@@ -1995,6 +2106,119 @@ mod native_cleanup_tests {
         process: DwHandle(20),
         launch_channel: DwHandle(30),
     };
+
+    fn install_ready_attempt(
+        controller: &mut SystemInit,
+        role: RoleId,
+        generation: u64,
+        transaction_id: u64,
+        handles: (u64, u64, u64),
+        now: u64,
+    ) -> ActiveNativeRole {
+        let reservation = controller
+            .reserve_attempt(role, generation, transaction_id)
+            .unwrap();
+        let loaded = LoadedProcess {
+            process: DwHandle(handles.1),
+            launch_channel: DwHandle(handles.2),
+        };
+        let task_group = DwHandle(handles.0);
+        let executable_identity = controller.executable_identity(role).unwrap();
+        controller
+            .install_attempt(AttemptResources {
+                role,
+                generation,
+                transaction_id,
+                executable_identity,
+                startup_profile: StartupProfile::EarlyBootStub,
+                task_group,
+                process: loaded.process,
+                launch_channel: loaded.launch_channel,
+                mappings: 0,
+                reservation,
+            })
+            .unwrap();
+        controller
+            .child_started(role, generation, transaction_id, now)
+            .unwrap();
+        controller
+            .ready(role, generation, transaction_id, now + 1)
+            .unwrap();
+        ActiveNativeRole {
+            role,
+            generation,
+            transaction_id,
+            loaded,
+            task_group,
+        }
+    }
+
+    #[test]
+    fn resident_drains_peer_close_to_clean_exit_without_dropping_other_role() {
+        let mut controller = SystemInit {
+            mode: SystemMode::Bootstrap,
+            roles: [
+                RoleController::new(RoleId::Registryd, [1; 32]).unwrap(),
+                RoleController::new(RoleId::Devmgr, [2; 32]).unwrap(),
+            ],
+            degraded_transitions: 0,
+            activated: [false; EARLY_ROLE_COUNT],
+            accounting: AttemptLedger::new(),
+            gate: None,
+            evidence: None,
+        };
+        controller.become_operational().unwrap();
+        controller.begin_registry(0, 1, 0x1001).unwrap();
+        let registry = install_ready_attempt(
+            &mut controller,
+            RoleId::Registryd,
+            1,
+            0x1001,
+            (10, 20, 30),
+            1,
+        );
+        let devmgr =
+            install_ready_attempt(&mut controller, RoleId::Devmgr, 1, 0x1002, (11, 21, 31), 3);
+        let mut resident = ResidentSystemInit {
+            controller,
+            authority: LoadAuthority {
+                parent_root: DwHandle(100),
+                bootfs: DwHandle(101),
+                task_group: DwHandle(102),
+            },
+            result: RecoveryResult::Recovered,
+            active: [Some(registry), Some(devmgr)],
+            evidence_finalized: false,
+            last_tick_ns: 9,
+        };
+        let mut native = MockNative::new();
+        let mut loader = wyrmroot_runtime::NativeLoaderPlatform;
+        let mut waits = ResidentWaits { wait_count: 0 };
+
+        assert_eq!(
+            resident.control_tick(&mut native, &mut loader, &mut waits, 10),
+            Ok(SystemMode::Normal)
+        );
+        assert_eq!(resident.active, [None, Some(devmgr)]);
+        assert_eq!(
+            resident.controller.role_state(RoleId::Registryd),
+            Some(RestartState::Stopped)
+        );
+        assert!(matches!(
+            resident.controller.role_state(RoleId::Devmgr),
+            Some(RestartState::Ready { .. })
+        ));
+        assert!(!resident.evidence_finalized());
+        assert_eq!(
+            &native.closed[..3],
+            &[
+                registry.loaded.launch_channel,
+                registry.loaded.process,
+                registry.task_group
+            ]
+        );
+        assert_eq!(waits.wait_count, 3);
+    }
 
     #[test]
     fn task_group_termination_race_reconciles_with_fresh_terminal_query() {

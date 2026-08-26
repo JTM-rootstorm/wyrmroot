@@ -131,7 +131,7 @@ fn wyr1_prepare(path: &str) -> Result<String, Failure> {
 
 fn wyr1_image(path: &str) -> Result<String, Failure> {
     let request = wyr1::load(std::path::Path::new(path))?;
-    let bootfs_sha256 = wyr1::build_bootfs(&request)?;
+    let identities = wyr1::build_bootfs(&request)?;
     let arguments = cli::G3ImageArguments {
         image: request.esp.display().to_string(),
         loader: request.loader.display().to_string(),
@@ -142,21 +142,17 @@ fn wyr1_image(path: &str) -> Result<String, Failure> {
     let _ = g3_image::build(&arguments)?;
     let esp_sha256 = sha256::file_digest(&request.esp)
         .map_err(|error| Failure::task(format!("could not hash WYR1 ESP: {error}")))?;
-    let receipt = wyr1::receipt_text(
-        &request,
-        &bootfs_sha256,
-        &esp_sha256,
-        wyr1::Profile::Default,
-    )?;
+    let receipt = wyr1::receipt_text(&request, &identities, &esp_sha256, wyr1::Profile::Default)?;
     wyr1::write_receipt(&request, &receipt)?;
     Ok(format!(
-        "WYR1_IMAGE_PASS bootfs_sha256={bootfs_sha256} esp_sha256={esp_sha256}\n"
+        "WYR1_IMAGE_PASS bootfs_sha256={} esp_sha256={esp_sha256}\n",
+        identities.bootfs_observed
     ))
 }
 
 fn wyr1_inspect(path: &str) -> Result<String, Failure> {
     let request = wyr1::load(std::path::Path::new(path))?;
-    wyr1::verify_receipt(&request, wyr1::Profile::Default)?;
+    let receipt_identities = wyr1::verify_receipt(&request, wyr1::Profile::Default)?;
     let bootfs = std::fs::read(&request.bootfs)
         .map_err(|error| Failure::task(format!("could not read WYR1 bootfs: {error}")))?;
     let archive = wyrmroot_bootfs::archive::Archive::new(&bootfs)
@@ -200,14 +196,22 @@ fn wyr1_inspect(path: &str) -> Result<String, Failure> {
         wyr1::sha256_bytes(&console),
         wyr1::sha256_bytes(&shell),
     ];
-    let (expected_closure, observed_materials) = wyr1::closure_materials_for_request(
+    let expected_closure = wyr1::expected_closure_for_request(
         wyr1::sha256_bytes(&init),
         role_hashes,
         wyr1::sha256_bytes(&gate_config),
     );
+    let observed_materials = wyr1::observe_closure_from_archive(&bootfs)?;
+    let observed_manifest_digest = archive
+        .lookup(b"system/bootstrap/rrc-a-v1")
+        .map(|entry| wyr1::sha256_bytes(entry.data()))
+        .map_err(|error| Failure::task(format!("WYR1 observed manifest is missing: {error:?}")))?;
+    let observed_bootfs_digest = wyr1::sha256_bytes(&bootfs);
     let profile = wyr1::product_profile_for_request(
-        manifest_digest,
-        bootfs_digest,
+        wyr1::decode_digest(&receipt_identities.manifest_expected)?,
+        observed_manifest_digest,
+        wyr1::decode_digest(&receipt_identities.bootfs_expected)?,
+        observed_bootfs_digest,
         &expected_closure,
         &observed_materials,
     );

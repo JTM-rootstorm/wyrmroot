@@ -144,30 +144,6 @@ fn exact_registry_then_devmgr_ready_reaches_normal_without_activating_retained_r
     init.begin_registry(0, 1, 10).unwrap();
     start_role(&mut init, RoleId::Registryd, 1, 10, 0);
     init.ready(RoleId::Registryd, 1, 10, 2).unwrap();
-    assert_eq!(init.role_state(RoleId::Devmgr), Some(RestartState::Stopped));
-    assert_eq!(init.role_state(RoleId::Uart16550d), None);
-    assert_eq!(
-        init.reserve_attempt(RoleId::Wyrmsh, 1, 1),
-        Err(InitError::UnlaunchableRole)
-    );
-    init.terminal(
-        RoleId::Registryd,
-        1,
-        10,
-        3,
-        TerminalDisposition::NormalExit(0),
-    )
-    .unwrap();
-    init.cleanup_complete(RoleId::Registryd, 1, 10, 4).unwrap();
-    assert_eq!(
-        init.begin_devmgr_after_registry(3, 1, 10),
-        Err(InitError::WrongActivationOrder)
-    );
-    assert_eq!(
-        init.begin_devmgr_after_registry(4, 2, 10),
-        Err(InitError::WrongActivationOrder)
-    );
-    init.begin_devmgr_after_registry(4, 1, 10).unwrap();
     assert!(matches!(
         init.role_state(RoleId::Devmgr),
         Some(RestartState::Starting {
@@ -176,9 +152,23 @@ fn exact_registry_then_devmgr_ready_reaches_normal_without_activating_retained_r
             ..
         })
     ));
-    start_role(&mut init, RoleId::Devmgr, 1, 11, 4);
+    assert_eq!(init.role_state(RoleId::Uart16550d), None);
+    assert_eq!(
+        init.reserve_attempt(RoleId::Wyrmsh, 1, 1),
+        Err(InitError::UnlaunchableRole)
+    );
+    start_role(&mut init, RoleId::Devmgr, 1, 11, 2);
     init.ready(RoleId::Devmgr, 1, 11, 5).unwrap();
     assert_eq!(init.mode(), SystemMode::Normal);
+    init.terminal(
+        RoleId::Registryd,
+        1,
+        10,
+        6,
+        TerminalDisposition::NormalExit(0),
+    )
+    .unwrap();
+    init.cleanup_complete(RoleId::Registryd, 1, 10, 7).unwrap();
     init.terminal(RoleId::Devmgr, 1, 11, 6, TerminalDisposition::NormalExit(0))
         .unwrap();
     assert_eq!(init.mode(), SystemMode::Normal);
@@ -188,13 +178,11 @@ fn exact_registry_then_devmgr_ready_reaches_normal_without_activating_retained_r
 }
 
 #[test]
-fn registry_retry_does_not_preactivate_devmgr() {
+fn registry_retry_admits_devmgr_only_after_replacement_ready() {
     let mut init = system();
     init.become_operational().unwrap();
     init.begin_registry(0, 1, 10).unwrap();
     start_role(&mut init, RoleId::Registryd, 1, 10, 0);
-    init.ready(RoleId::Registryd, 1, 10, 2).unwrap();
-    assert_eq!(init.role_state(RoleId::Devmgr), Some(RestartState::Stopped));
     init.terminal(
         RoleId::Registryd,
         1,
@@ -211,20 +199,8 @@ fn registry_retry_does_not_preactivate_devmgr() {
     init.start_replacement(RoleId::Registryd, deadline_ns, 2, 11)
         .unwrap();
     start_role(&mut init, RoleId::Registryd, 2, 11, deadline_ns);
-    init.ready(RoleId::Registryd, 2, 11, deadline_ns + 2)
-        .unwrap();
     assert_eq!(init.role_state(RoleId::Devmgr), Some(RestartState::Stopped));
-    init.terminal(
-        RoleId::Registryd,
-        2,
-        11,
-        deadline_ns + 3,
-        TerminalDisposition::NormalExit(0),
-    )
-    .unwrap();
-    init.cleanup_complete(RoleId::Registryd, 2, 11, deadline_ns + 4)
-        .unwrap();
-    init.begin_devmgr_after_registry(deadline_ns + 4, 2, 11)
+    init.ready(RoleId::Registryd, 2, 11, deadline_ns + 2)
         .unwrap();
     assert!(matches!(
         init.role_state(RoleId::Devmgr),
@@ -329,6 +305,11 @@ fn four_after_ready_nonzero_exits_degrade_once() {
         now += 2;
         init.ready(RoleId::Registryd, generation, transaction, now)
             .unwrap();
+        if attempt == 0 {
+            start_role(&mut init, RoleId::Devmgr, 1, 11, now);
+            now += 2;
+            init.ready(RoleId::Devmgr, 1, 11, now).unwrap();
+        }
         now += 1;
         init.terminal(
             RoleId::Registryd,
@@ -619,15 +600,23 @@ fn retained_bootfs_validation_hashes_exact_role_artifacts_and_rejects_mutation()
             })
             .unwrap();
     }
+    manifest
+        .add_dependency(DependencySpec {
+            owner: RoleId::Registryd,
+            kind: DependencyKind::Config,
+            target_role: None,
+            target_path: Some("system/config/registryd"),
+        })
+        .unwrap();
     let manifest = manifest.build_structural().unwrap();
-    let build = |registry: &[u8]| {
+    let build = |registry: &[u8], init: Option<(&[u8], FileMode)>, include_config: bool| {
         let mut bootfs = BootfsBuilder::new();
         bootfs
             .add(b"system/bootstrap/rrc-a-v1", &manifest, FileMode::ReadOnly)
             .unwrap();
-        bootfs
-            .add(b"system/init", b"init", FileMode::Executable)
-            .unwrap();
+        if let Some((bytes, mode)) = init {
+            bootfs.add(b"system/init", bytes, mode).unwrap();
+        }
         for (_, path, bytes) in artifacts {
             let bytes = if path == "system/registryd" {
                 registry
@@ -638,11 +627,40 @@ fn retained_bootfs_validation_hashes_exact_role_artifacts_and_rejects_mutation()
                 .add(path.as_bytes(), bytes, FileMode::Executable)
                 .unwrap();
         }
+        if include_config {
+            bootfs
+                .add(
+                    b"system/config/registryd",
+                    b"registry-config",
+                    FileMode::ReadOnly,
+                )
+                .unwrap();
+        }
         bootfs.build().unwrap()
     };
-    assert!(wyrmroot_system_init::validate_retained_bootfs(&build(b"registryd")).is_ok());
+    let valid_init = Some((b"init".as_slice(), FileMode::Executable));
+    assert!(
+        wyrmroot_system_init::validate_retained_bootfs(&build(b"registryd", valid_init, true))
+            .is_ok()
+    );
     assert_eq!(
-        wyrmroot_system_init::validate_retained_bootfs(&build(b"mutated")),
+        wyrmroot_system_init::validate_retained_bootfs(&build(b"mutated", valid_init, true)),
         Err(InitError::ArtifactIdentityMismatch(RoleId::Registryd))
+    );
+    assert_eq!(
+        wyrmroot_system_init::validate_retained_bootfs(&build(b"registryd", None, true)),
+        Err(InitError::MissingRetainedMaterial)
+    );
+    assert_eq!(
+        wyrmroot_system_init::validate_retained_bootfs(&build(
+            b"registryd",
+            Some((b"init".as_slice(), FileMode::ReadOnly)),
+            true,
+        )),
+        Err(InitError::NonExecutableRole)
+    );
+    assert_eq!(
+        wyrmroot_system_init::validate_retained_bootfs(&build(b"registryd", valid_init, false)),
+        Err(InitError::MissingRetainedMaterial)
     );
 }
