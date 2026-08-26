@@ -3,11 +3,11 @@
 use super::*;
 use crate::wyr1b::{
     EndpointGrant, EndpointKind, JobError, JobResult as ControllerJobResult, LaunchEngineError,
-    PolicyView, RegistryTopology, abort_prepared_job, commit_prepared_job, correlation_environment,
-    observe_prepared_ready, prepare_authorized_job,
+    PolicyView, RegistryTopology, RequestTicket, abort_prepared_job, commit_prepared_job,
+    correlation_environment, observe_prepared_ready, prepare_reserved_job,
 };
 use crate::wyr1b_gate::{GATE_PATH, GateConfig, parse_config};
-use crate::wyr1b_job::JobDispatcher;
+use crate::wyr1b_job::{JobDispatcher, SessionOwner};
 use deepwyrm_syscall::{
     DW_HANDLE_TRANSFER_MOVE, DW_OBJECT_TYPE_CHANNEL, DW_RIGHT_INSPECT, DW_RIGHT_READ,
     DW_RIGHT_TRANSFER, DW_RIGHT_WAIT, DW_RIGHT_WRITE, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE,
@@ -18,8 +18,8 @@ use deepwyrm_syscall::{
 use wyrmroot_launch_proto::{
     ErrorCode as LaunchErrorCode, Message as LaunchMessage, MessageType as LaunchMessageType,
     Reservation as LaunchReservation, TerminationClassification, TerminationResult,
-    encode_error as encode_launch_error, encode_job_message, encode_job_result,
-    parse_message as parse_launch_message,
+    encode_error as encode_launch_error, encode_job_list, encode_job_message, encode_job_result,
+    encode_job_state, parse_message as parse_launch_message, parse_reservation_prefix,
 };
 use wyrmroot_loader::launch::CHILD_CHANNEL_RIGHTS;
 use wyrmroot_registry_proto::{
@@ -1565,6 +1565,23 @@ where
             InitError::Wyr1BModel(error)
         });
     }
+    if let Err(error) = jobs.attach_session_owner(
+        grant,
+        SessionOwner {
+            process: loaded.process,
+            launch_channel: loaded.launch_channel,
+            task_group,
+        },
+    ) {
+        let disconnected = jobs.disconnect_session(grant);
+        let failed = disconnected.map_or(true, |channel| system.close_handle(channel).is_err())
+            | cleanup_loaded(system, waits, loaded, task_group, true).is_err();
+        return Err(if failed {
+            InitError::Cleanup
+        } else {
+            InitError::Wyr1BModel(error)
+        });
+    }
     Ok(InstalledPeer {
         grant,
         loaded,
@@ -1636,8 +1653,42 @@ fn launch_engine_error(error: LaunchEngineError<NativeError>) -> InitError {
     }
 }
 
+fn publish_launch_accepted<S, W>(
+    system: &mut S,
+    waits: &mut W,
+    jobs: &mut JobDispatcher,
+    session: DwHandle,
+    reservation: LaunchReservation,
+    loaded: crate::wyr1b::LoadedJob,
+) -> Result<(), InitError>
+where
+    S: Wyr1BPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let mut response = [0_u8; 88];
+    let size = encode_job_message(
+        reservation,
+        LaunchMessageType::LaunchAccepted,
+        loaded.job_id,
+        &mut response,
+    )
+    .map_err(|_| InitError::Accounting)?;
+    if let Err(error) = system.send_channel(session, &response[..size]) {
+        let terminate_failed = system
+            .terminate_task_group(DwHandle(loaded.task_group))
+            .is_err();
+        let reap_failed = reap_job(system, waits, jobs, loaded).is_err();
+        return Err(if terminate_failed || reap_failed {
+            InitError::Cleanup
+        } else {
+            InitError::Native(error)
+        });
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
-fn receive_and_accept_job<S, L, W>(
+fn accept_reserved_launch<S, L, W>(
     system: &mut S,
     loader: &mut L,
     waits: &mut W,
@@ -1645,69 +1696,43 @@ fn receive_and_accept_job<S, L, W>(
     policy: &PolicyView<'_>,
     jobs: &mut JobDispatcher,
     session: DwHandle,
-    grant: EndpointGrant,
+    reservation: LaunchReservation,
+    request_ticket: RequestTicket,
+    request: wyrmroot_launch_proto::LaunchRequest<'_>,
+    received: &[DwReceivedHandleInfoV1; 16],
+    handle_count: usize,
 ) -> Result<crate::wyr1b::LoadedJob, InitError>
 where
     S: Wyr1BPlatform,
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
-    wait_session_readable(system, session)?;
-    let mut bytes = [0_u8; wyrmroot_launch_proto::MAX_STRING_BYTES + 2048];
-    let mut received = [DwReceivedHandleInfoV1::default(); 16];
-    let counts = system
-        .receive_channel(session, &mut bytes, &mut received)
-        .map_err(InitError::Native)?;
-    if counts.bytes > bytes.len() || counts.handles > received.len() {
-        let failed = close_received_reverse(system, &received, counts.handles);
-        return Err(if failed {
-            InitError::Cleanup
-        } else {
-            InitError::Wyr1BModel(JobError::StreamPolicy)
-        });
-    }
-    for info in &received[..counts.handles] {
+    for info in &received[..handle_count] {
         if let Err(error) = validate_controller_channel(system, info.handle) {
-            let failed = close_received_reverse(system, &received, counts.handles);
+            let failed = close_received_reverse(system, received, handle_count);
             return Err(if failed { InitError::Cleanup } else { error });
         }
     }
-    let parsed = match parse_launch_message(&bytes[..counts.bytes], counts.handles) {
-        Ok(parsed) => parsed,
-        Err(_) => {
-            let failed = close_received_reverse(system, &received, counts.handles);
+    let ticket = match jobs.jobs.begin_reserved_launch(request_ticket) {
+        Ok(ticket) => ticket,
+        Err(error) => {
+            let failed = close_received_reverse(system, received, handle_count);
             return Err(if failed {
                 InitError::Cleanup
             } else {
-                InitError::Wyr1BModel(JobError::StreamPolicy)
+                InitError::Wyr1BModel(error)
             });
         }
     };
-    if parsed.reservation.connection_id != grant.endpoint_id
-        || parsed.reservation.generation != grant.endpoint_generation
-    {
-        let failed = close_received_reverse(system, &received, counts.handles);
-        return Err(if failed {
-            InitError::Cleanup
-        } else {
-            InitError::Wyr1BModel(JobError::StaleGeneration)
-        });
-    }
-    let LaunchMessage::Launch(request) = parsed.message else {
-        let failed = close_received_reverse(system, &received, counts.handles);
-        return Err(if failed {
-            InitError::Cleanup
-        } else {
-            InitError::Wyr1BModel(JobError::WrongState)
-        });
-    };
     let streams = [received[0].handle, received[1].handle, received[2].handle];
-    let streams = &streams[..counts.handles];
+    let streams = &streams[..handle_count];
     let task_group = match system.create_attempt_task_group(authority.task_group) {
         Ok(task_group) => task_group,
         Err(error) => {
             return Err(
-                if close_received_reverse(system, &received, counts.handles) {
+                if close_received_reverse(system, received, handle_count)
+                    | jobs.jobs.abort_launch(ticket).is_err()
+                {
                     InitError::Cleanup
                 } else {
                     InitError::Native(error)
@@ -1715,13 +1740,14 @@ where
             );
         }
     };
-    let prepared = match prepare_authorized_job(
+    let prepared = match prepare_reserved_job(
         &mut jobs.jobs,
         policy,
         loader,
         authority,
         task_group.0,
-        parsed.reservation,
+        reservation,
+        ticket,
         request,
         streams,
     ) {
@@ -1755,18 +1781,40 @@ where
     let observation = observation.expect("checked exact READY observation");
     let loaded = commit_prepared_job(&mut jobs.jobs, prepared, observation)
         .map_err(InitError::Wyr1BModel)?;
-    let mut response = [0_u8; 88];
-    let size = encode_job_message(
-        parsed.reservation,
-        LaunchMessageType::LaunchAccepted,
-        loaded.job_id,
-        &mut response,
-    )
-    .map_err(|_| InitError::Accounting)?;
-    system
-        .send_channel(session, &response[..size])
-        .map_err(InitError::Native)?;
+    publish_launch_accepted(system, waits, jobs, session, reservation, loaded)?;
     Ok(loaded)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn receive_and_accept_job<S, L, W>(
+    system: &mut S,
+    loader: &mut L,
+    waits: &mut W,
+    authority: LoadAuthority,
+    policy: &PolicyView<'_>,
+    jobs: &mut JobDispatcher,
+    session: DwHandle,
+    grant: EndpointGrant,
+) -> Result<crate::wyr1b::LoadedJob, InitError>
+where
+    S: Wyr1BPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    wait_session_readable(system, session)?;
+    match dispatch_one_job_request(
+        system,
+        loader,
+        waits,
+        authority,
+        Some(policy),
+        jobs,
+        session,
+        grant,
+    )? {
+        JobDispatchOutcome::Launched(loaded) => Ok(loaded),
+        JobDispatchOutcome::Responded => Err(InitError::Wyr1BModel(JobError::WrongState)),
+    }
 }
 
 fn classify_termination(
@@ -1814,6 +1862,7 @@ where
     if info.state != DW_TASK_STATE_EXITED {
         return Err(InitError::Supervision);
     }
+    let classification = classify_termination(&info)?;
     let mut cleanup_result = 0_u32;
     if system.close_handle(loaded.loaded.launch_channel).is_err() {
         cleanup_result |= 1 << 2;
@@ -1825,7 +1874,7 @@ where
         cleanup_result |= 1 << 4;
     }
     let result = TerminationResult {
-        classification: classify_termination(&info)?,
+        classification,
         application_code: info.application_code,
         exception_class: info.exception_type.0,
         exception_detail: info.detail,
@@ -1852,32 +1901,451 @@ where
     Ok(result)
 }
 
-fn receive_job_operation<S: Wyr1BPlatform>(
+const fn job_error_code(error: JobError) -> LaunchErrorCode {
+    match error {
+        JobError::TransactionReplay => LaunchErrorCode::TransactionReplay,
+        JobError::UnknownConnection
+        | JobError::ClosedConnection
+        | JobError::StaleGeneration
+        | JobError::DuplicateConnection
+        | JobError::ZeroIdentity => LaunchErrorCode::StaleOrUnknownSession,
+        JobError::ForeignJob | JobError::UnknownJob => LaunchErrorCode::ForeignOrUnknownJob,
+        JobError::Capacity | JobError::ArithmeticOverflow => LaunchErrorCode::Capacity,
+        JobError::Policy(_)
+        | JobError::PolicyMissing
+        | JobError::PolicyExecutable
+        | JobError::Bootfs(_)
+        | JobError::BootGenerationMismatch
+        | JobError::ArtifactNotExecutable
+        | JobError::ArtifactIdentityMismatch
+        | JobError::StreamPolicy => LaunchErrorCode::PolicyRejected,
+        JobError::WrongState | JobError::ResourceIdentity => LaunchErrorCode::InvalidState,
+    }
+}
+
+fn send_job_error<S: InitPlatform>(
     system: &mut S,
     session: DwHandle,
-) -> Result<(LaunchReservation, LaunchMessage<'static>), InitError> {
-    wait_session_readable(system, session)?;
-    let mut bytes = [0_u8; 320];
-    let mut handles = [DwReceivedHandleInfoV1::default(); 16];
+    reservation: LaunchReservation,
+    code: LaunchErrorCode,
+) -> Result<(), InitError> {
+    let mut response = [0_u8; 88];
+    let size =
+        encode_launch_error(reservation, code, &mut response).map_err(|_| InitError::Accounting)?;
+    system
+        .send_channel(session, &response[..size])
+        .map_err(InitError::Native)
+}
+
+fn controller_result_to_wire(result: ControllerJobResult) -> Result<TerminationResult, InitError> {
+    let classification = match result.classification {
+        1 => TerminationClassification::NormalExit,
+        2 => TerminationClassification::Authorized,
+        3 => TerminationClassification::UnhandledException,
+        4 => TerminationClassification::ResourcePolicy,
+        5 => TerminationClassification::TaskGroupTeardown,
+        _ => return Err(InitError::Accounting),
+    };
+    Ok(TerminationResult {
+        classification,
+        application_code: result.application_code,
+        exception_class: result.exception_class,
+        exception_detail: result.exception_detail,
+        exception_address: result.exception_address,
+        cleanup_result: result.cleanup_result,
+    })
+}
+
+fn dispatch_reserved_operation<S, W>(
+    system: &mut S,
+    waits: &mut W,
+    jobs: &mut JobDispatcher,
+    session: DwHandle,
+    reservation: LaunchReservation,
+    ticket: RequestTicket,
+    message: LaunchMessage<'_>,
+) -> Result<(), InitError>
+where
+    S: Wyr1BPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let mut response = [0_u8; 320];
+    let result = match message {
+        LaunchMessage::Query { job_id } => {
+            jobs.jobs
+                .query_reserved(ticket, job_id)
+                .and_then(|snapshot| {
+                    let phase = match snapshot.phase {
+                        crate::wyr1b::JobPhase::Running => wyrmroot_launch_proto::JobPhase::Running,
+                        crate::wyr1b::JobPhase::Terminating => {
+                            wyrmroot_launch_proto::JobPhase::Terminating
+                        }
+                        crate::wyr1b::JobPhase::Reserved => return Err(JobError::WrongState),
+                    };
+                    encode_job_state(reservation, job_id, phase, &mut response)
+                        .map_err(|_| JobError::WrongState)
+                })
+        }
+        LaunchMessage::Wait { job_id } => (|| -> Result<usize, JobError> {
+            let controller = match jobs.jobs.result_reserved(ticket, job_id) {
+                Ok(result) => Ok(result),
+                Err(JobError::UnknownJob) => {
+                    jobs.jobs.query_reserved(ticket, job_id)?;
+                    let loaded = jobs.jobs.loaded_job(job_id)?;
+                    let terminal =
+                        reap_job(system, waits, jobs, loaded).map_err(|_| JobError::WrongState)?;
+                    let controller = ControllerJobResult {
+                        classification: terminal.classification.as_u32(),
+                        application_code: terminal.application_code,
+                        exception_class: terminal.exception_class,
+                        exception_detail: terminal.exception_detail,
+                        exception_address: terminal.exception_address,
+                        cleanup_result: terminal.cleanup_result,
+                    };
+                    Ok(controller)
+                }
+                Err(error) => Err(error),
+            }?;
+            let terminal =
+                controller_result_to_wire(controller).map_err(|_| JobError::WrongState)?;
+            encode_job_result(reservation, job_id, terminal, &mut response)
+                .map_err(|_| JobError::WrongState)
+        })(),
+        LaunchMessage::Terminate { job_id } => jobs
+            .jobs
+            .terminate_reserved(ticket, job_id)
+            .and_then(|resources| {
+                system
+                    .terminate_task_group(DwHandle(resources.task_group))
+                    .map_err(|_| JobError::WrongState)?;
+                encode_job_message(
+                    reservation,
+                    LaunchMessageType::TerminationAccepted,
+                    job_id,
+                    &mut response,
+                )
+                .map_err(|_| JobError::WrongState)
+            }),
+        LaunchMessage::ListJobs => {
+            let mut ids = [0_u64; wyrmroot_launch_proto::MAX_LIVE_JOBS];
+            jobs.jobs.list_reserved(ticket, &mut ids).and_then(|count| {
+                encode_job_list(reservation, &ids[..count], &mut response)
+                    .map_err(|_| JobError::WrongState)
+            })
+        }
+        LaunchMessage::CloseJob { job_id } => {
+            jobs.jobs.close_job_reserved(ticket, job_id).and_then(|()| {
+                encode_job_message(
+                    reservation,
+                    LaunchMessageType::Closed,
+                    job_id,
+                    &mut response,
+                )
+                .map_err(|_| JobError::WrongState)
+            })
+        }
+        LaunchMessage::Cancel { .. } => {
+            return send_job_error(
+                system,
+                session,
+                reservation,
+                LaunchErrorCode::CancellationUnavailable,
+            );
+        }
+        _ => Err(JobError::WrongState),
+    };
+    match result {
+        Ok(size) => system
+            .send_channel(session, &response[..size])
+            .map_err(InitError::Native),
+        Err(error) => send_job_error(system, session, reservation, job_error_code(error)),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JobDispatchOutcome {
+    Responded,
+    Launched(crate::wyr1b::LoadedJob),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_one_job_request<S, L, W>(
+    system: &mut S,
+    loader: &mut L,
+    waits: &mut W,
+    authority: LoadAuthority,
+    policy: Option<&PolicyView<'_>>,
+    jobs: &mut JobDispatcher,
+    session: DwHandle,
+    grant: EndpointGrant,
+) -> Result<JobDispatchOutcome, InitError>
+where
+    S: Wyr1BPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let mut bytes = [0_u8; wyrmroot_launch_proto::MAX_STRING_BYTES + 2048];
+    let mut received = [DwReceivedHandleInfoV1::default(); 16];
     let counts = system
-        .receive_channel(session, &mut bytes, &mut handles)
+        .receive_channel(session, &mut bytes, &mut received)
         .map_err(InitError::Native)?;
-    if counts.bytes > bytes.len() || counts.handles != 0 {
-        let failed = close_received_reverse(system, &handles, counts.handles);
+    if counts.bytes > bytes.len() || counts.handles > received.len() {
+        let failed = close_received_reverse(system, &received, counts.handles);
         return Err(if failed {
             InitError::Cleanup
         } else {
-            InitError::Wyr1BModel(JobError::WrongState)
+            InitError::Wyr1BModel(JobError::StreamPolicy)
         });
     }
-    let parsed = parse_launch_message(&bytes[..counts.bytes], 0)
-        .map_err(|_| InitError::Wyr1BModel(JobError::WrongState))?;
-    let message = match parsed.message {
-        LaunchMessage::Wait { job_id } => LaunchMessage::Wait { job_id },
-        LaunchMessage::Query { job_id } => LaunchMessage::Query { job_id },
-        _ => return Err(InitError::Wyr1BModel(JobError::WrongState)),
+    let reservation = match parse_reservation_prefix(&bytes[..counts.bytes]) {
+        Ok(reservation) => reservation,
+        Err(_) => {
+            let failed = close_received_reverse(system, &received, counts.handles);
+            return Err(if failed {
+                InitError::Cleanup
+            } else {
+                InitError::Wyr1BModel(JobError::WrongState)
+            });
+        }
     };
-    Ok((parsed.reservation, message))
+    if reservation.connection_id != grant.endpoint_id
+        || reservation.generation != grant.endpoint_generation
+    {
+        let failed = close_received_reverse(system, &received, counts.handles);
+        if failed {
+            return Err(InitError::Cleanup);
+        }
+        send_job_error(
+            system,
+            session,
+            reservation,
+            LaunchErrorCode::StaleOrUnknownSession,
+        )?;
+        return Ok(JobDispatchOutcome::Responded);
+    }
+    let request_ticket = match jobs.jobs.reserve_request(reservation) {
+        Ok(ticket) => ticket,
+        Err(error) => {
+            let failed = close_received_reverse(system, &received, counts.handles);
+            if failed {
+                return Err(InitError::Cleanup);
+            }
+            send_job_error(system, session, reservation, job_error_code(error))?;
+            return Ok(JobDispatchOutcome::Responded);
+        }
+    };
+    let parsed = match parse_launch_message(&bytes[..counts.bytes], counts.handles) {
+        Ok(parsed) => parsed,
+        Err(_) => {
+            let failed = close_received_reverse(system, &received, counts.handles);
+            if failed {
+                return Err(InitError::Cleanup);
+            }
+            send_job_error(
+                system,
+                session,
+                reservation,
+                LaunchErrorCode::MalformedRequest,
+            )?;
+            return Ok(JobDispatchOutcome::Responded);
+        }
+    };
+    match parsed.message {
+        LaunchMessage::Launch(request) => accept_reserved_launch(
+            system,
+            loader,
+            waits,
+            authority,
+            policy.ok_or(InitError::Wyr1BModel(JobError::PolicyMissing))?,
+            jobs,
+            session,
+            reservation,
+            request_ticket,
+            request,
+            &received,
+            counts.handles,
+        )
+        .map(JobDispatchOutcome::Launched),
+        message => {
+            if close_received_reverse(system, &received, counts.handles) {
+                return Err(InitError::Cleanup);
+            }
+            dispatch_reserved_operation(
+                system,
+                waits,
+                jobs,
+                session,
+                reservation,
+                request_ticket,
+                message,
+            )?;
+            Ok(JobDispatchOutcome::Responded)
+        }
+    }
+}
+
+fn poll_job_dispatcher<S, L, W>(
+    system: &mut S,
+    loader: &mut L,
+    waits: &mut W,
+    authority: LoadAuthority,
+    jobs: &mut JobDispatcher,
+    now_ns: u64,
+) -> Result<(), InitError>
+where
+    S: Wyr1BPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    if let Some((grant, session)) = jobs.next_session() {
+        let item = DwWaitItemV1 {
+            handle: session,
+            signals: deepwyrm_syscall::DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+        };
+        match system.wait_many(core::slice::from_ref(&item), DwDeadline(now_ns)) {
+            Err(NativeError::Status(status)) if status == DW_STATUS_TIMED_OUT => {}
+            Err(error) => return Err(InitError::Native(error)),
+            Ok(observed) if observed.observed.0 & DW_SIGNAL_READABLE.0 != 0 => {
+                let size = system
+                    .query_memory_object_size(authority.bootfs)
+                    .map_err(InitError::Native)?;
+                let plan = MappingPlan::for_bootfs(size).map_err(InitError::Mapping)?;
+                let dispatched = system
+                    .with_bootfs_bytes(
+                        authority.parent_root,
+                        authority.bootfs,
+                        plan,
+                        |system, bootfs| {
+                            let archive = Archive::new(bootfs).map_err(InitError::Bootfs)?;
+                            let manifest = archive
+                                .lookup(MANIFEST_PATH.as_bytes())
+                                .map_err(map_lookup)?;
+                            let boot_generation: [u8; 32] = manifest
+                                .data()
+                                .get(48..80)
+                                .ok_or(InitError::Accounting)?
+                                .try_into()
+                                .map_err(|_| InitError::Accounting)?;
+                            let policy = PolicyView::from_bootfs(archive, boot_generation)
+                                .map_err(InitError::Wyr1BModel)?;
+                            dispatch_one_job_request(
+                                system,
+                                loader,
+                                waits,
+                                authority,
+                                Some(&policy),
+                                jobs,
+                                session,
+                                grant,
+                            )
+                        },
+                    )
+                    .map_err(InitError::Native)?;
+                if dispatched.is_err() {
+                    let disconnected = jobs.disconnect_owned_session(grant);
+                    let close_failed = disconnected.map_or(true, |session| {
+                        system.close_handle(session.channel).is_err()
+                            | cleanup_session_owner(system, waits, session.owner, true)
+                    });
+                    if close_failed {
+                        return Err(InitError::Cleanup);
+                    }
+                }
+            }
+            Ok(observed) if observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 => {
+                let disconnected = jobs
+                    .disconnect_owned_session(grant)
+                    .map_err(InitError::Wyr1BModel)?;
+                if system.close_handle(disconnected.channel).is_err()
+                    | cleanup_session_owner(system, waits, disconnected.owner, true)
+                {
+                    return Err(InitError::Cleanup);
+                }
+            }
+            Ok(_) => return Err(InitError::Supervision),
+        }
+    }
+    if let Some(loaded) = jobs.next_job() {
+        if let Some(resources) = jobs
+            .jobs
+            .mark_orphan_terminating(loaded.job_id)
+            .map_err(InitError::Wyr1BModel)?
+        {
+            system
+                .terminate_task_group(DwHandle(resources.task_group))
+                .map_err(InitError::Native)?;
+        }
+        let info = waits
+            .query_task_termination(loaded.loaded.process)
+            .map_err(|_| InitError::Supervision)?;
+        if info.state == DW_TASK_STATE_EXITED {
+            reap_job(system, waits, jobs, loaded)?;
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_session_owner<S, W>(
+    system: &mut S,
+    waits: &mut W,
+    owner: Option<SessionOwner>,
+    terminate: bool,
+) -> bool
+where
+    S: InitPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    owner.is_some_and(|owner| {
+        cleanup_loaded(
+            system,
+            waits,
+            LoadedProcess {
+                process: owner.process,
+                launch_channel: owner.launch_channel,
+            },
+            owner.task_group,
+            terminate,
+        )
+        .is_err()
+    })
+}
+
+fn drain_job_dispatcher<S, W>(
+    system: &mut S,
+    waits: &mut W,
+    jobs: &mut JobDispatcher,
+) -> Result<(), InitError>
+where
+    S: Wyr1BPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let mut sessions = [None; crate::wyr1b_job::MAX_SESSIONS];
+    let session_count = jobs.drain_sessions(&mut sessions);
+    let mut failed = false;
+    for session in sessions[..session_count].iter().rev().flatten().copied() {
+        failed |= system.close_handle(session.channel).is_err()
+            | cleanup_session_owner(system, waits, session.owner, true);
+    }
+    for _ in 0..wyrmroot_launch_proto::MAX_LIVE_JOBS {
+        let Some(loaded) = jobs.next_job() else {
+            break;
+        };
+        if let Some(resources) = jobs
+            .jobs
+            .mark_orphan_terminating(loaded.job_id)
+            .map_err(InitError::Wyr1BModel)?
+        {
+            failed |= system
+                .terminate_task_group(DwHandle(resources.task_group))
+                .is_err();
+        }
+        failed |= reap_job(system, waits, jobs, loaded).is_err();
+    }
+    if jobs.jobs.live_jobs() != 0 || failed {
+        Err(InitError::Cleanup)
+    } else {
+        Ok(())
+    }
 }
 
 fn close_launch_client<S, W>(
@@ -1906,11 +2374,19 @@ where
     if result.observed.0 & DW_SIGNAL_PEER_CLOSED.0 == 0 {
         return Err(InitError::Supervision);
     }
-    let session = jobs
-        .disconnect_session(peer.grant)
+    let disconnected = jobs
+        .disconnect_owned_session(peer.grant)
         .map_err(InitError::Wyr1BModel)?;
-    let failed = system.close_handle(session).is_err()
-        | cleanup_loaded(system, waits, peer.loaded, peer.task_group, false).is_err();
+    let expected_owner = SessionOwner {
+        process: peer.loaded.process,
+        launch_channel: peer.loaded.launch_channel,
+        task_group: peer.task_group,
+    };
+    if disconnected.owner != Some(expected_owner) {
+        return Err(InitError::Accounting);
+    }
+    let failed = system.close_handle(disconnected.channel).is_err()
+        | cleanup_session_owner(system, waits, disconnected.owner, false);
     if failed {
         Err(InitError::Cleanup)
     } else {
@@ -2011,33 +2487,21 @@ where
             3,
         ),
     )?;
-    let (wait_reservation, wait) = receive_job_operation(system, owner_session)?;
-    let LaunchMessage::Wait { job_id } = wait else {
-        return Err(InitError::Wyr1BModel(JobError::WrongState));
-    };
-    if job_id != owner_job.job_id {
-        return Err(InitError::Wyr1BModel(JobError::ResourceIdentity));
-    }
-    let terminal = reap_job(system, waits, jobs, owner_job)?;
-    let controller_result = jobs
-        .jobs
-        .result(wait_reservation, job_id)
-        .map_err(InitError::Wyr1BModel)?;
-    if controller_result.classification != terminal.classification.as_u32()
-        || controller_result.application_code != terminal.application_code
-        || controller_result.exception_class != terminal.exception_class
-        || controller_result.exception_detail != terminal.exception_detail
-        || controller_result.exception_address != terminal.exception_address
-        || controller_result.cleanup_result != terminal.cleanup_result
+    wait_session_readable(system, owner_session)?;
+    if dispatch_one_job_request(
+        system,
+        loader,
+        waits,
+        authority,
+        Some(&policy),
+        jobs,
+        owner_session,
+        owner.grant,
+    )? != JobDispatchOutcome::Responded
     {
-        return Err(InitError::Accounting);
+        return Err(InitError::Wyr1BModel(JobError::WrongState));
     }
-    let mut response = [0_u8; 88];
-    let size = encode_job_result(wait_reservation, job_id, terminal, &mut response)
-        .map_err(|_| InitError::Accounting)?;
-    system
-        .send_channel(owner_session, &response[..size])
-        .map_err(InitError::Native)?;
+    let job_id = owner_job.job_id;
     expect_launch_report(
         system,
         owner,
@@ -2073,27 +2537,20 @@ where
         4,
     );
     send_gate(system, foreign.loaded.launch_channel, probe)?;
-    let (query_reservation, query) = receive_job_operation(system, foreign_session)?;
-    let LaunchMessage::Query { job_id: probed } = query else {
-        return Err(InitError::Wyr1BModel(JobError::WrongState));
-    };
-    if probed != job_id
-        || !matches!(
-            jobs.jobs.query(query_reservation, probed),
-            Err(JobError::ForeignJob | JobError::UnknownJob)
-        )
+    wait_session_readable(system, foreign_session)?;
+    if dispatch_one_job_request(
+        system,
+        loader,
+        waits,
+        authority,
+        Some(&policy),
+        jobs,
+        foreign_session,
+        foreign.grant,
+    )? != JobDispatchOutcome::Responded
     {
-        return Err(InitError::Wyr1BModel(JobError::ResourceIdentity));
+        return Err(InitError::Wyr1BModel(JobError::WrongState));
     }
-    let size = encode_launch_error(
-        query_reservation,
-        LaunchErrorCode::ForeignOrUnknownJob,
-        &mut response,
-    )
-    .map_err(|_| InitError::Accounting)?;
-    system
-        .send_channel(foreign_session, &response[..size])
-        .map_err(InitError::Native)?;
     expect_launch_report(
         system,
         foreign,
@@ -2285,7 +2742,8 @@ where
         Ok(())
     })();
     if let Err(error) = outcome {
-        let mut cleanup_failed = error == InitError::Cleanup;
+        let mut cleanup_failed =
+            error == InitError::Cleanup || drain_job_dispatcher(system, waits, jobs).is_err();
         for slot in [&mut publisher2, &mut client, &mut publisher1] {
             if let Some(peer) = slot.take() {
                 cleanup_failed |=
@@ -2487,9 +2945,10 @@ where
                 continue;
             }
 
-            let cleanup_failed =
-                cleanup_loaded(system, waits, active.loaded, active.task_group, terminate).is_err()
-                    | system.close_handle(state.registry_control).is_err();
+            let cleanup_failed = drain_job_dispatcher(system, waits, &mut state.jobs).is_err()
+                | cleanup_loaded(system, waits, active.loaded, active.task_group, terminate)
+                    .is_err()
+                | system.close_handle(state.registry_control).is_err();
             resident.active[index] = None;
             state.registry_control = DwHandle(0);
             let retired_at = now_ns.checked_add(1).ok_or(InitError::Accounting)?;
@@ -2554,6 +3013,14 @@ where
                 resident.result = RecoveryResult::Degraded;
             }
         }
+        poll_job_dispatcher(
+            system,
+            loader,
+            waits,
+            resident.authority,
+            &mut state.jobs,
+            now_ns,
+        )?;
         if resident.controller.mode() == SystemMode::Degraded {
             resident.result = RecoveryResult::Degraded;
         }
@@ -2591,6 +3058,9 @@ mod tests {
         terminate_count: usize,
         allow_wait: bool,
         task_group: Option<DwHandle>,
+        fail_send: bool,
+        inbound: [u8; 256],
+        inbound_len: usize,
     }
 
     impl MockPlatform {
@@ -2610,6 +3080,9 @@ mod tests {
                 terminate_count: 0,
                 allow_wait: false,
                 task_group: None,
+                fail_send: true,
+                inbound: [0; 256],
+                inbound_len: 0,
             }
         }
     }
@@ -2836,10 +3309,16 @@ mod tests {
         fn receive_channel(
             &mut self,
             _channel: DwHandle,
-            _bytes: &mut [u8],
+            bytes: &mut [u8],
             _handles: &mut [DwReceivedHandleInfoV1],
         ) -> Result<ReceiveCounts, NativeError> {
-            Err(FAILURE)
+            if self.inbound_len == 0 {
+                return Err(FAILURE);
+            }
+            bytes[..self.inbound_len].copy_from_slice(&self.inbound[..self.inbound_len]);
+            let bytes = self.inbound_len;
+            self.inbound_len = 0;
+            Ok(ReceiveCounts { bytes, handles: 0 })
         }
         fn query_memory_object_size(&mut self, _handle: DwHandle) -> Result<u64, NativeError> {
             Err(FAILURE)
@@ -2853,8 +3332,13 @@ mod tests {
         ) -> Result<R, NativeError> {
             Err(FAILURE)
         }
-        fn send_channel(&mut self, _channel: DwHandle, _bytes: &[u8]) -> Result<(), NativeError> {
-            Err(FAILURE)
+        fn send_channel(&mut self, _channel: DwHandle, bytes: &[u8]) -> Result<(), NativeError> {
+            if self.fail_send {
+                return Err(FAILURE);
+            }
+            self.sent[..bytes.len()].copy_from_slice(bytes);
+            self.sent_len = bytes.len();
+            Ok(())
         }
         fn close_handle(&mut self, handle: DwHandle) -> Result<(), NativeError> {
             self.closed[self.close_count] = handle;
@@ -2916,6 +3400,7 @@ mod tests {
         ) -> Result<DwTaskTerminationInfoV1, Self::Error> {
             Ok(DwTaskTerminationInfoV1 {
                 state: DW_TASK_STATE_EXITED,
+                reason: DW_TERMINATION_NORMAL_EXIT,
                 ..DwTaskTerminationInfoV1::default()
             })
         }
@@ -2958,6 +3443,317 @@ mod tests {
             role_generation,
             kind,
         }
+    }
+
+    fn reservation(transaction_id: u64) -> LaunchReservation {
+        LaunchReservation {
+            connection_id: 1,
+            generation: 3,
+            transaction_id,
+        }
+    }
+
+    #[test]
+    fn native_dispatcher_executes_every_nonlaunch_operation_and_rejects_replay() {
+        let mut platform = MockPlatform::new();
+        platform.fail_send = false;
+        let mut waits = TerminalWaits;
+        let mut jobs = JobDispatcher::new();
+        let owner = grant(EndpointKind::LaunchSession, 1, 1);
+        jobs.install_session(owner, DwHandle(90)).unwrap();
+        let launch = jobs.jobs.begin_launch(reservation(1)).unwrap();
+        jobs.jobs.commit_launch(launch, 101, 102, 103).unwrap();
+
+        let query_ticket = jobs.jobs.reserve_request(reservation(2)).unwrap();
+        dispatch_reserved_operation(
+            &mut platform,
+            &mut waits,
+            &mut jobs,
+            DwHandle(90),
+            reservation(2),
+            query_ticket,
+            LaunchMessage::Query {
+                job_id: launch.job_id,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            parse_launch_message(&platform.sent[..platform.sent_len], 0)
+                .unwrap()
+                .message,
+            LaunchMessage::JobState {
+                phase: wyrmroot_launch_proto::JobPhase::Running,
+                ..
+            }
+        ));
+
+        let list_ticket = jobs.jobs.reserve_request(reservation(3)).unwrap();
+        dispatch_reserved_operation(
+            &mut platform,
+            &mut waits,
+            &mut jobs,
+            DwHandle(90),
+            reservation(3),
+            list_ticket,
+            LaunchMessage::ListJobs,
+        )
+        .unwrap();
+        let listed = parse_launch_message(&platform.sent[..platform.sent_len], 0).unwrap();
+        assert!(
+            matches!(listed.message, LaunchMessage::JobList(ids) if ids.get(0) == Some(launch.job_id))
+        );
+
+        let terminate_ticket = jobs.jobs.reserve_request(reservation(4)).unwrap();
+        dispatch_reserved_operation(
+            &mut platform,
+            &mut waits,
+            &mut jobs,
+            DwHandle(90),
+            reservation(4),
+            terminate_ticket,
+            LaunchMessage::Terminate {
+                job_id: launch.job_id,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            parse_launch_message(&platform.sent[..platform.sent_len], 0)
+                .unwrap()
+                .message,
+            LaunchMessage::TerminationAccepted { job_id } if job_id == launch.job_id
+        ));
+        assert_eq!(platform.terminate_count, 1);
+
+        let wait_ticket = jobs.jobs.reserve_request(reservation(5)).unwrap();
+        dispatch_reserved_operation(
+            &mut platform,
+            &mut waits,
+            &mut jobs,
+            DwHandle(90),
+            reservation(5),
+            wait_ticket,
+            LaunchMessage::Wait {
+                job_id: launch.job_id,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            parse_launch_message(&platform.sent[..platform.sent_len], 0)
+                .unwrap()
+                .message,
+            LaunchMessage::JobResult { job_id, .. } if job_id == launch.job_id
+        ));
+
+        let close_ticket = jobs.jobs.reserve_request(reservation(6)).unwrap();
+        dispatch_reserved_operation(
+            &mut platform,
+            &mut waits,
+            &mut jobs,
+            DwHandle(90),
+            reservation(6),
+            close_ticket,
+            LaunchMessage::CloseJob {
+                job_id: launch.job_id,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            parse_launch_message(&platform.sent[..platform.sent_len], 0)
+                .unwrap()
+                .message,
+            LaunchMessage::Closed { job_id } if job_id == launch.job_id
+        ));
+
+        let cancel_ticket = jobs.jobs.reserve_request(reservation(7)).unwrap();
+        dispatch_reserved_operation(
+            &mut platform,
+            &mut waits,
+            &mut jobs,
+            DwHandle(90),
+            reservation(7),
+            cancel_ticket,
+            LaunchMessage::Cancel {
+                target_transaction_id: 1,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            parse_launch_message(&platform.sent[..platform.sent_len], 0)
+                .unwrap()
+                .message,
+            LaunchMessage::Error {
+                code: LaunchErrorCode::CancellationUnavailable
+            }
+        ));
+        assert_eq!(
+            jobs.jobs.reserve_request(reservation(7)),
+            Err(JobError::TransactionReplay)
+        );
+
+        let foreign_grant = grant(EndpointKind::LaunchSession, 2, 1);
+        jobs.install_session(foreign_grant, DwHandle(91)).unwrap();
+        let foreign = LaunchReservation {
+            connection_id: 2,
+            generation: 3,
+            transaction_id: 1,
+        };
+        let foreign_ticket = jobs.jobs.reserve_request(foreign).unwrap();
+        dispatch_reserved_operation(
+            &mut platform,
+            &mut waits,
+            &mut jobs,
+            DwHandle(91),
+            foreign,
+            foreign_ticket,
+            LaunchMessage::Query {
+                job_id: launch.job_id,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            parse_launch_message(&platform.sent[..platform.sent_len], 0)
+                .unwrap()
+                .message,
+            LaunchMessage::Error {
+                code: LaunchErrorCode::ForeignOrUnknownJob
+            }
+        ));
+    }
+
+    #[test]
+    fn native_receive_reserves_before_malformed_and_replay_responses() {
+        let mut platform = MockPlatform::new();
+        platform.fail_send = false;
+        let mut waits = TerminalWaits;
+        let mut loader = InitSendLoader::new();
+        let mut jobs = JobDispatcher::new();
+        let owner = grant(EndpointKind::LaunchSession, 1, 1);
+        jobs.install_session(owner, DwHandle(90)).unwrap();
+        let launch = jobs.jobs.begin_launch(reservation(1)).unwrap();
+        jobs.jobs.commit_launch(launch, 101, 102, 103).unwrap();
+        let authority = LoadAuthority {
+            parent_root: DwHandle(1),
+            bootfs: DwHandle(2),
+            task_group: DwHandle(3),
+        };
+
+        let size = encode_job_message(
+            reservation(2),
+            LaunchMessageType::Query,
+            launch.job_id,
+            &mut platform.inbound,
+        )
+        .unwrap();
+        platform.inbound_len = size;
+        assert_eq!(
+            dispatch_one_job_request(
+                &mut platform,
+                &mut loader,
+                &mut waits,
+                authority,
+                None,
+                &mut jobs,
+                DwHandle(90),
+                owner,
+            ),
+            Ok(JobDispatchOutcome::Responded)
+        );
+        assert!(matches!(
+            parse_launch_message(&platform.sent[..platform.sent_len], 0)
+                .unwrap()
+                .message,
+            LaunchMessage::JobState { job_id, .. } if job_id == launch.job_id
+        ));
+
+        let replay = encode_job_message(
+            reservation(2),
+            LaunchMessageType::Query,
+            launch.job_id,
+            &mut platform.inbound,
+        )
+        .unwrap();
+        platform.inbound_len = replay;
+        dispatch_one_job_request(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            authority,
+            None,
+            &mut jobs,
+            DwHandle(90),
+            owner,
+        )
+        .unwrap();
+        assert!(matches!(
+            parse_launch_message(&platform.sent[..platform.sent_len], 0)
+                .unwrap()
+                .message,
+            LaunchMessage::Error {
+                code: LaunchErrorCode::TransactionReplay
+            }
+        ));
+
+        encode_job_message(
+            reservation(3),
+            LaunchMessageType::Query,
+            launch.job_id,
+            &mut platform.inbound,
+        )
+        .unwrap();
+        platform.inbound_len = wyrmroot_launch_proto::HEADER_BYTES;
+        dispatch_one_job_request(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            authority,
+            None,
+            &mut jobs,
+            DwHandle(90),
+            owner,
+        )
+        .unwrap();
+        assert!(matches!(
+            parse_launch_message(&platform.sent[..platform.sent_len], 0)
+                .unwrap()
+                .message,
+            LaunchMessage::Error {
+                code: LaunchErrorCode::MalformedRequest
+            }
+        ));
+        assert_eq!(
+            jobs.jobs.reserve_request(reservation(3)),
+            Err(JobError::TransactionReplay)
+        );
+    }
+
+    #[test]
+    fn failed_launch_accepted_send_terminates_reaps_and_closes_once() {
+        let mut platform = MockPlatform::new();
+        let mut waits = TerminalWaits;
+        let mut jobs = JobDispatcher::new();
+        let owner = grant(EndpointKind::LaunchSession, 1, 1);
+        jobs.install_session(owner, DwHandle(90)).unwrap();
+        let ticket = jobs.jobs.begin_launch(reservation(1)).unwrap();
+        jobs.jobs.commit_launch(ticket, 101, 102, 103).unwrap();
+        let loaded = jobs.jobs.loaded_job(ticket.job_id).unwrap();
+
+        assert_eq!(
+            publish_launch_accepted(
+                &mut platform,
+                &mut waits,
+                &mut jobs,
+                DwHandle(90),
+                reservation(1),
+                loaded,
+            ),
+            Err(InitError::Native(FAILURE))
+        );
+        assert_eq!(platform.terminate_count, 1);
+        assert_eq!(jobs.jobs.live_jobs(), 0);
+        assert_eq!(
+            &platform.closed[..platform.close_count],
+            &[DwHandle(103), DwHandle(101), DwHandle(102)]
+        );
     }
 
     fn ready_registry() -> (SystemInit, RegistryNativeAttempt) {

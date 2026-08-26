@@ -10,6 +10,20 @@ pub(crate) const MAX_SESSIONS: usize = 16;
 struct Session {
     grant: EndpointGrant,
     channel: DwHandle,
+    owner: Option<SessionOwner>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SessionOwner {
+    pub(crate) process: DwHandle,
+    pub(crate) launch_channel: DwHandle,
+    pub(crate) task_group: DwHandle,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DisconnectedSession {
+    pub(crate) channel: DwHandle,
+    pub(crate) owner: Option<SessionOwner>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -17,6 +31,7 @@ pub(crate) struct JobDispatcher {
     pub(crate) jobs: JobController,
     sessions: [Option<Session>; MAX_SESSIONS],
     poll_cursor: usize,
+    job_cursor: usize,
 }
 
 impl JobDispatcher {
@@ -25,6 +40,7 @@ impl JobDispatcher {
             jobs: JobController::new(),
             sessions: [None; MAX_SESSIONS],
             poll_cursor: 0,
+            job_cursor: 0,
         }
     }
 
@@ -43,7 +59,32 @@ impl JobDispatcher {
             .ok_or(JobError::Capacity)?;
         self.jobs
             .open_connection(grant.endpoint_id, grant.endpoint_generation)?;
-        self.sessions[slot] = Some(Session { grant, channel });
+        self.sessions[slot] = Some(Session {
+            grant,
+            channel,
+            owner: None,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn attach_session_owner(
+        &mut self,
+        grant: EndpointGrant,
+        owner: SessionOwner,
+    ) -> Result<(), JobError> {
+        if owner.process.0 == 0 || owner.launch_channel.0 == 0 || owner.task_group.0 == 0 {
+            return Err(JobError::ResourceIdentity);
+        }
+        let session = self
+            .sessions
+            .iter_mut()
+            .flatten()
+            .find(|session| session.grant == grant)
+            .ok_or(JobError::UnknownConnection)?;
+        if session.owner.is_some() {
+            return Err(JobError::WrongState);
+        }
+        session.owner = Some(owner);
         Ok(())
     }
 
@@ -51,6 +92,25 @@ impl JobDispatcher {
         &mut self,
         grant: EndpointGrant,
     ) -> Result<DwHandle, JobError> {
+        if self
+            .sessions
+            .iter()
+            .flatten()
+            .find(|session| session.grant == grant)
+            .ok_or(JobError::UnknownConnection)?
+            .owner
+            .is_some()
+        {
+            return Err(JobError::WrongState);
+        }
+        let disconnected = self.disconnect_owned_session(grant)?;
+        Ok(disconnected.channel)
+    }
+
+    pub(crate) fn disconnect_owned_session(
+        &mut self,
+        grant: EndpointGrant,
+    ) -> Result<DisconnectedSession, JobError> {
         let index = self
             .sessions
             .iter()
@@ -58,9 +118,12 @@ impl JobDispatcher {
             .ok_or(JobError::UnknownConnection)?;
         self.jobs
             .disconnect(grant.endpoint_id, grant.endpoint_generation)?;
-        let channel = self.sessions[index].take().unwrap().channel;
+        let session = self.sessions[index].take().unwrap();
         self.jobs.reclaim_closed_sessions();
-        Ok(channel)
+        Ok(DisconnectedSession {
+            channel: session.channel,
+            owner: session.owner,
+        })
     }
 
     pub(crate) fn next_session(&mut self) -> Option<(EndpointGrant, DwHandle)> {
@@ -85,6 +148,32 @@ impl JobDispatcher {
 
     pub(crate) fn session_count(&self) -> usize {
         self.sessions.iter().flatten().count()
+    }
+
+    pub(crate) fn next_job(&mut self) -> Option<crate::wyr1b::LoadedJob> {
+        let (cursor, job_id) = self.jobs.live_job_id(self.job_cursor)?;
+        self.job_cursor = cursor;
+        self.jobs.loaded_job(job_id).ok()
+    }
+
+    pub(crate) fn drain_sessions(
+        &mut self,
+        out: &mut [Option<DisconnectedSession>; MAX_SESSIONS],
+    ) -> usize {
+        let mut count = 0;
+        for session in &mut self.sessions {
+            if let Some(session) = session.take() {
+                let _ = self
+                    .jobs
+                    .disconnect(session.grant.endpoint_id, session.grant.endpoint_generation);
+                out[count] = Some(DisconnectedSession {
+                    channel: session.channel,
+                    owner: session.owner,
+                });
+                count += 1;
+            }
+        }
+        count
     }
 }
 
