@@ -134,16 +134,7 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
             std::path::Path::new(&progress),
         )
         .map(Some),
-        Action::Dw1BEvidence {
-            request,
-            log,
-            debug_exit,
-        } => dw1b::evidence(
-            std::path::Path::new(&request),
-            std::path::Path::new(&log),
-            debug_exit,
-        )
-        .map(Some),
+        Action::Dw1BEvidence(request) => dw1b::evidence(std::path::Path::new(&request)).map(Some),
         Action::Unavailable(command) => Err(Failure::unavailable(command)),
     }
 }

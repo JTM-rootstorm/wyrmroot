@@ -24,7 +24,7 @@ Usage:
     cargo xtask dw1b image --request <dw1-b-request.toml>
     cargo xtask dw1b inspect --request <dw1-b-request.toml>
     cargo xtask dw1b measure --init <elf> --hello <elf> --cpu-hog <elf> --progress <elf>
-    cargo xtask dw1b evidence --request <dw1-b-request.toml> --log <serial-log> --debug-exit 33
+    cargo xtask dw1b evidence --request <dw1-b-request.toml>
 
 Host filters may name a component (bootfs, protocol, elf, runtime, bootstrap,
 efi, init0, hello, or xtask), package:<workspace-package>, or test:<substring>.
@@ -124,11 +124,7 @@ pub(crate) enum Action {
         cpu_hog: String,
         progress: String,
     },
-    Dw1BEvidence {
-        request: String,
-        log: String,
-        debug_exit: u32,
-    },
+    Dw1BEvidence(String),
     Unavailable(&'static str),
 }
 
@@ -214,22 +210,11 @@ fn dispatch_dw1b(arguments: &[String]) -> Result<Action, Failure> {
                 progress: progress.clone(),
             })
         }
-        [command, flag, request, log_flag, log, exit_flag, debug_exit]
-            if command == "evidence"
-                && flag == "--request"
-                && log_flag == "--log"
-                && exit_flag == "--debug-exit" =>
-        {
-            Ok(Action::Dw1BEvidence {
-                request: request.clone(),
-                log: log.clone(),
-                debug_exit: debug_exit.parse().map_err(|_| {
-                    Failure::usage("dw1b --debug-exit must be a canonical decimal status")
-                })?,
-            })
+        [command, flag, request] if command == "evidence" && flag == "--request" => {
+            Ok(Action::Dw1BEvidence(request.clone()))
         }
         _ => Err(Failure::usage(
-            "dw1b requires image|inspect --request <path>, measure with four exact artifacts, or evidence --request <path> --log <serial-log> --debug-exit 33",
+            "dw1b requires image|inspect|evidence --request <path>, or measure with four exact artifacts",
         )),
     }
 }
