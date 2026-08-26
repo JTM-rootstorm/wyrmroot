@@ -32,3 +32,17 @@ fn client_moves_broad_endpoint_and_has_failure_atomic_cleanup() {
     assert!(source.contains("FailureTracker"));
     assert!(source.contains("mark_ready"));
 }
+
+#[test]
+fn client_uses_typed_wrlj_for_gate_job_reports_without_evidence_authority() {
+    let source = include_str!("../src/client.rs");
+    assert!(source.contains("encode_launch("));
+    assert!(source.contains("LaunchType::Wait"));
+    assert!(source.contains("LaunchType::Query"));
+    assert!(source.contains("LaunchErrorCode::ForeignOrUnknownJob"));
+    assert!(source.contains("Message::LaunchAccepted"));
+    assert!(source.contains("Message::JobResult"));
+    assert!(source.contains("ClientAction::Report(record)"));
+    assert!(source.contains("ClientAction::Disconnect(record)"));
+    assert!(source.contains("let mut handles = [DwReceivedHandleInfoV1::default(); 16]"));
+}

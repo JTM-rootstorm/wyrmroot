@@ -10,7 +10,10 @@ use deepwyrm_syscall::{
     DW_RIGHT_WRITE, DW_SIGNAL_READABLE, DwHandle, DwHandleTransferV1, DwObjectType,
     DwReceivedHandleInfoV1, DwRights,
 };
-use wyrmroot_launch_proto as _;
+use wyrmroot_launch_proto::{
+    ErrorCode as LaunchErrorCode, Message as LaunchMessage, MessageType as LaunchType,
+    Reservation as LaunchReservation, encode_job_message, encode_launch, parse_message,
+};
 use wyrmroot_loader::launch::{
     CHILD_CHANNEL_RIGHTS, HEADER_BYTES as WRLP_BYTES, LaunchProfile, SELF_ROOT_RIGHTS,
     encode_ready_for_profile, parse_init,
@@ -138,26 +141,178 @@ fn run(startup: StartupBlock<'_>, failure: &mut FailureTracker) -> Result<u32, u
             return Err(code);
         }
     } else {
-        // Slice B freezes and validates launch-client CONFIGURE state only. Native WRLJ
-        // execution is deliberately owned by Slice F.
         let configure = receive_record(parent, Direction::InitToChild, CLIENT_ERROR_BASE + 0x0010)?;
-        match actor
+        let action = actor
             .configure(configure)
-            .map_err(|_| CLIENT_ERROR_BASE + 0x0011)?
-        {
-            ClientAction::Launch | ClientAction::Configured => {}
-            _ => return Err(CLIENT_ERROR_BASE + 0x0012),
-        }
+            .map_err(|_| CLIENT_ERROR_BASE + 0x0011)?;
         failure
             .update(configure)
             .map_err(|_| CLIENT_ERROR_BASE + 0x001C)?;
-        let code = CLIENT_ERROR_BASE + 0x001A;
-        let _ = close_handle(authority);
-        return Err(code);
+        match action {
+            ClientAction::Launch => {
+                launch_job_cycle(parent, authority, &mut actor, configure, failure)?
+            }
+            ClientAction::Configured => {
+                foreign_job_cycle(parent, authority, &mut actor, configure)?
+            }
+            _ => return Err(CLIENT_ERROR_BASE + 0x0012),
+        }
     }
     close_handle(authority).map_err(|_| CLIENT_ERROR_BASE + 0x0016)?;
     close_handle(parent).map_err(|_| CLIENT_ERROR_BASE + 0x0017)?;
     Ok(0)
+}
+
+fn launch_reservation(configure: Record, transaction_id: u64) -> Result<LaunchReservation, u32> {
+    if configure.actor_id == 0 || configure.actor_generation == 0 || transaction_id == 0 {
+        return Err(CLIENT_ERROR_BASE + 0x0040);
+    }
+    Ok(LaunchReservation {
+        connection_id: configure.actor_id,
+        generation: configure.actor_generation,
+        transaction_id,
+    })
+}
+
+fn launch_job_cycle(
+    parent: DwHandle,
+    session: DwHandle,
+    actor: &mut Client,
+    configure: Record,
+    _failure: &mut FailureTracker,
+) -> Result<(), u32> {
+    let reservation = launch_reservation(configure, 1)?;
+    let mut bytes = [0u8; 416];
+    let launch_len = encode_launch(
+        reservation,
+        "bin/hello",
+        &["bin/hello"],
+        &[],
+        false,
+        &mut bytes,
+    )
+    .map_err(|_| CLIENT_ERROR_BASE + 0x0041)?;
+    send_channel(session, &bytes[..launch_len], &[]).map_err(|_| CLIENT_ERROR_BASE + 0x0042)?;
+    let accepted = receive_launch(session, reservation, CLIENT_ERROR_BASE + 0x0043)?;
+    let LaunchMessage::LaunchAccepted { job_id } = accepted else {
+        return Err(CLIENT_ERROR_BASE + 0x0044);
+    };
+    match actor
+        .job_accepted(job_id)
+        .map_err(|_| CLIENT_ERROR_BASE + 0x0045)?
+    {
+        ClientAction::Report(record) => send_record(parent, record, CLIENT_ERROR_BASE + 0x0046)?,
+        ClientAction::Disconnect(record) => {
+            send_record(parent, record, CLIENT_ERROR_BASE + 0x0047)?;
+            return Ok(());
+        }
+        _ => return Err(CLIENT_ERROR_BASE + 0x0048),
+    }
+    let wait_reservation = launch_reservation(configure, 2)?;
+    let wait_len = encode_job_message(wait_reservation, LaunchType::Wait, job_id, &mut bytes)
+        .map_err(|_| CLIENT_ERROR_BASE + 0x0049)?;
+    send_channel(session, &bytes[..wait_len], &[]).map_err(|_| CLIENT_ERROR_BASE + 0x004A)?;
+    let result = receive_launch(session, wait_reservation, CLIENT_ERROR_BASE + 0x004B)?;
+    let LaunchMessage::JobResult {
+        job_id: result_job,
+        result,
+    } = result
+    else {
+        return Err(CLIENT_ERROR_BASE + 0x004C);
+    };
+    if result_job != job_id {
+        return Err(CLIENT_ERROR_BASE + 0x004D);
+    }
+    let report = actor
+        .job_result(
+            result.classification == 1
+                && result.application_code == 0
+                && result.exception_class == 0
+                && result.exception_detail == 0
+                && result.exception_address == 0
+                && result.cleanup_result == 0,
+        )
+        .map_err(|_| CLIENT_ERROR_BASE + 0x004E)?;
+    send_record(parent, report, CLIENT_ERROR_BASE + 0x004F)
+}
+
+fn foreign_job_cycle(
+    parent: DwHandle,
+    session: DwHandle,
+    actor: &mut Client,
+    configure: Record,
+) -> Result<(), u32> {
+    let probe = receive_record(parent, Direction::InitToChild, CLIENT_ERROR_BASE + 0x0050)?;
+    if actor
+        .probe_foreign(probe)
+        .map_err(|_| CLIENT_ERROR_BASE + 0x0051)?
+        != ClientAction::ProbeForeign
+    {
+        return Err(CLIENT_ERROR_BASE + 0x0052);
+    }
+    let reservation = launch_reservation(configure, 1)?;
+    let mut bytes = [0u8; 416];
+    let size = encode_job_message(reservation, LaunchType::Query, probe.object_id, &mut bytes)
+        .map_err(|_| CLIENT_ERROR_BASE + 0x0053)?;
+    send_channel(session, &bytes[..size], &[]).map_err(|_| CLIENT_ERROR_BASE + 0x0054)?;
+    let response = receive_launch(session, reservation, CLIENT_ERROR_BASE + 0x0055)?;
+    if response
+        != (LaunchMessage::Error {
+            code: LaunchErrorCode::ForeignOrUnknownJob as u32,
+        })
+    {
+        return Err(CLIENT_ERROR_BASE + 0x0056);
+    }
+    let report = actor
+        .foreign_error(probe.object_id, true)
+        .map_err(|_| CLIENT_ERROR_BASE + 0x0057)?;
+    send_record(parent, report, CLIENT_ERROR_BASE + 0x0058)
+}
+
+fn receive_launch(
+    channel: DwHandle,
+    reservation: LaunchReservation,
+    code: u32,
+) -> Result<LaunchMessage<'static>, u32> {
+    wait_readable(channel, code)?;
+    let mut bytes = [0u8; 416];
+    let mut handles = [DwReceivedHandleInfoV1::default(); 16];
+    let counts = receive_channel(channel, &mut bytes, &mut handles).map_err(|_| code + 1)?;
+    if counts.bytes > bytes.len() || counts.handles > handles.len() {
+        close_launch_handles(&handles, counts.handles);
+        return Err(code + 2);
+    }
+    let parsed = match parse_message(&bytes[..counts.bytes], counts.handles) {
+        Ok(parsed) => parsed,
+        Err(_) => {
+            close_launch_handles(&handles, counts.handles);
+            return Err(code + 3);
+        }
+    };
+    if parsed.reservation != reservation {
+        close_launch_handles(&handles, counts.handles);
+        return Err(code + 4);
+    }
+    if counts.handles != 0 {
+        close_launch_handles(&handles, counts.handles);
+        return Err(code + 5);
+    }
+    // All response variants borrow only the input packet. Copying into a
+    // fixed owned representation keeps the native client allocation-free.
+    match parsed.message {
+        LaunchMessage::LaunchAccepted { job_id } => Ok(LaunchMessage::LaunchAccepted { job_id }),
+        LaunchMessage::JobResult { job_id, result } => {
+            Ok(LaunchMessage::JobResult { job_id, result })
+        }
+        LaunchMessage::Error { code } => Ok(LaunchMessage::Error { code }),
+        _ => Err(code + 6),
+    }
+}
+
+fn close_launch_handles(handles: &[DwReceivedHandleInfoV1], count: usize) {
+    for handle in &handles[..count.min(handles.len())] {
+        let _ = close_handle(handle.handle);
+    }
 }
 
 fn registry_cycles(
