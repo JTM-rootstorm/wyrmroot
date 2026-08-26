@@ -10,6 +10,7 @@ pub mod evidence;
 pub mod gate;
 pub mod wyr1b;
 pub mod wyr1b_gate;
+pub mod wyr1b_native;
 
 use crate::evidence::{EvidenceError, EvidenceEvent, EvidenceLog};
 use crate::gate::{GATE_CONFIG_PATH, GateConfig, GateConfigError, parse_gate_config};
@@ -22,7 +23,10 @@ use deepwyrm_syscall::{
 use wyrmroot_bootfs::archive::{Archive, LookupError, ParseError};
 use wyrmroot_loader::{
     launch::{HEADER_BYTES, LaunchProfile, SUPERVISOR_BYTES, encode_ready_for_profile, parse_init},
-    process::{LoadAuthority, LoadError, LoadRequest, LoadedProcess, LoaderPlatform, load_process},
+    process::{
+        LoadAuthority, LoadError, LoadRequest, LoadStage, LoadedProcess, LoaderPlatform,
+        ServiceLoadRequest, load_process, load_service_process,
+    },
 };
 use wyrmroot_rrc_manifest::{
     Activation, DependencyKind, MANIFEST_PATH, Manifest, ParseError as ManifestParseError, RoleId,
@@ -111,6 +115,11 @@ pub const fn wyr1_test_failure_application_status(error: &InitError) -> u32 {
         InitError::Accounting => 0x16,
         InitError::GateConfig(_) => 0x17,
         InitError::Evidence(_) => 0x18,
+        InitError::Wyr1BGateConfig(_) => 0x19,
+        InitError::RegistryProtocol(_) => 0x1a,
+        InitError::Wyr1BGateProtocol(_) => 0x1b,
+        InitError::Wyr1BGateMismatch => 0x1c,
+        InitError::Wyr1BModel(_) => 0x1d,
     };
     0xAF11_0000 | category
 }
@@ -126,6 +135,7 @@ pub struct ResidentSystemInit {
     active: [Option<ActiveNativeRole>; EARLY_ROLE_COUNT],
     evidence_finalized: bool,
     last_tick_ns: u64,
+    wyr1b: Option<wyr1b_native::ResidentState>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -317,6 +327,28 @@ impl ResidentSystemInit {
         }
         Ok(self.controller.mode())
     }
+
+    /// Product-dispatched resident loop. Selector 25 immediately delegates to
+    /// the unchanged legacy loop and therefore performs zero WYR1-B platform
+    /// operations.
+    pub fn control_tick_product<S, L, W>(
+        &mut self,
+        system: &mut S,
+        loader: &mut L,
+        waits: &mut W,
+        now_ns: u64,
+    ) -> Result<SystemMode, InitError>
+    where
+        S: Wyr1BPlatform,
+        L: LoaderPlatform<Error = NativeError>,
+        W: SupervisionPlatform<Error = NativeError>,
+    {
+        if self.wyr1b.is_none() {
+            self.control_tick(system, loader, waits, now_ns)
+        } else {
+            wyr1b_native::control_tick(self, system, loader, waits, now_ns)
+        }
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -493,6 +525,11 @@ pub enum InitError {
     Accounting,
     GateConfig(GateConfigError),
     Evidence(EvidenceError),
+    Wyr1BGateConfig(wyr1b_gate::GateError),
+    RegistryProtocol(wyrmroot_registry_proto::Error),
+    Wyr1BGateProtocol(wyrmroot_wyr1b_gate_proto::Error),
+    Wyr1BGateMismatch,
+    Wyr1BModel(wyr1b::JobError),
 }
 
 impl From<RestartTransitionError> for InitError {
@@ -529,20 +566,33 @@ pub struct SystemInit {
     accounting: AttemptLedger,
     gate: Option<GateConfig>,
     evidence: Option<EvidenceLog>,
+    registry_startup_profile: StartupProfile,
 }
 
 impl SystemInit {
     /// Consumes an already product-validated WRRM manifest and binds exact
     /// executable identities to the two WYR1-A launchable roles.
     pub fn from_manifest(manifest: Manifest<'_>) -> Result<Self, InitError> {
+        Self::from_manifest_with_registry_profile(manifest, StartupProfile::EarlyBootStub)
+    }
+
+    pub(crate) fn from_wyr1b_manifest(manifest: Manifest<'_>) -> Result<Self, InitError> {
+        Self::from_manifest_with_registry_profile(manifest, StartupProfile::BootstrapRegistry)
+    }
+
+    fn from_manifest_with_registry_profile(
+        manifest: Manifest<'_>,
+        registry_startup_profile: StartupProfile,
+    ) -> Result<Self, InitError> {
         if manifest.role_count() != 5 {
             return Err(InitError::WrongManifestProfile);
         }
         for ((expected, expected_path), role) in
             EXPECTED_ROLE_PATHS.into_iter().zip(manifest.roles())
         {
-            let launchable = matches!(expected, RoleId::Registryd | RoleId::Devmgr);
-            let expected_shape = if launchable {
+            let expected_shape = if expected == RoleId::Registryd {
+                (Activation::Early, registry_startup_profile)
+            } else if expected == RoleId::Devmgr {
                 (Activation::Early, StartupProfile::EarlyBootStub)
             } else if expected == RoleId::Uart16550d {
                 (Activation::DeviceBound, StartupProfile::Retained)
@@ -595,6 +645,7 @@ impl SystemInit {
             accounting: AttemptLedger::new(),
             gate: None,
             evidence: None,
+            registry_startup_profile,
         })
     }
 
@@ -696,7 +747,12 @@ impl SystemInit {
             self.accounting.release(&mut resources.reservation)?;
             return Err(InitError::InvalidResourceHandle);
         }
-        if resources.startup_profile != StartupProfile::EarlyBootStub
+        let expected_profile = match resources.role {
+            RoleId::Registryd => self.registry_startup_profile,
+            RoleId::Devmgr => StartupProfile::EarlyBootStub,
+            _ => return Err(InitError::UnlaunchableRole),
+        };
+        if resources.startup_profile != expected_profile
             || resources.executable_identity != self.roles[index].executable_identity
         {
             self.accounting.release(&mut resources.reservation)?;
@@ -768,13 +824,19 @@ impl SystemInit {
         match role {
             RoleId::Registryd if !self.activated[1] => {
                 if self.mode != SystemMode::ActivatingEarlyRoles
-                    || self.roles[1].restart.state() != RestartState::Stopped
+                    && self.mode != SystemMode::Degraded
                 {
                     return Err(InitError::WrongActivationOrder);
                 }
-                self.roles[1]
-                    .restart
-                    .begin(now, generation, next_transaction(transaction)?)?;
+                match self.roles[1].restart.state() {
+                    RestartState::Stopped => self.roles[1].restart.begin(
+                        now,
+                        generation,
+                        next_transaction(transaction)?,
+                    )?,
+                    RestartState::PermanentFailure { .. } if self.mode == SystemMode::Degraded => {}
+                    _ => return Err(InitError::WrongActivationOrder),
+                }
             }
             RoleId::Registryd if self.activated[1] => self.mode = SystemMode::Normal,
             RoleId::Devmgr if self.activated[0] => self.mode = SystemMode::Normal,
@@ -1129,6 +1191,115 @@ where
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
+    let (authority, activation) = receive_and_activate(
+        system,
+        bootstrap_channel,
+        |system, authority, transaction_id, bootfs| {
+            activate_retained_bootfs(
+                system,
+                loader,
+                waits,
+                authority,
+                bootstrap_channel,
+                transaction_id,
+                bootfs,
+            )
+        },
+    )?;
+    Ok(ResidentSystemInit {
+        controller: activation.controller,
+        authority,
+        result: activation.result,
+        active: activation.active,
+        evidence_finalized: false,
+        last_tick_ns: system.now().map_err(InitError::Native)?,
+        wyr1b: None,
+    })
+}
+
+/// Selects the immutable product path from the retained bootfs. Selector 25
+/// remains the exact legacy path; only a canonical selector-27 gate admits the
+/// WYR1-B platform extension.
+pub fn run_system_init_product<S, L, W>(
+    system: &mut S,
+    loader: &mut L,
+    waits: &mut W,
+    bootstrap_channel: DwHandle,
+) -> Result<ResidentSystemInit, InitError>
+where
+    S: Wyr1BPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    enum ProductActivation {
+        Wyr1A(ActivationState),
+        Wyr1B(wyr1b_native::Activation),
+    }
+    let (authority, activation) = receive_and_activate(
+        system,
+        bootstrap_channel,
+        |system, authority, transaction_id, bootfs| {
+            let archive = Archive::new(bootfs).map_err(InitError::Bootfs)?;
+            match archive.lookup(wyr1b_gate::GATE_PATH.as_bytes()) {
+                Ok(_) => wyr1b_native::activate(
+                    system,
+                    loader,
+                    waits,
+                    authority,
+                    bootstrap_channel,
+                    transaction_id,
+                    bootfs,
+                )
+                .map(ProductActivation::Wyr1B),
+                Err(LookupError::NotFound) => activate_retained_bootfs(
+                    system,
+                    loader,
+                    waits,
+                    authority,
+                    bootstrap_channel,
+                    transaction_id,
+                    bootfs,
+                )
+                .map(ProductActivation::Wyr1A),
+                Err(error) => Err(map_lookup(error)),
+            }
+        },
+    )?;
+    let now = system.now().map_err(InitError::Native)?;
+    Ok(match activation {
+        ProductActivation::Wyr1A(activation) => ResidentSystemInit {
+            controller: activation.controller,
+            authority,
+            result: activation.result,
+            active: activation.active,
+            evidence_finalized: false,
+            last_tick_ns: now,
+            wyr1b: None,
+        },
+        ProductActivation::Wyr1B(activation) => ResidentSystemInit {
+            controller: activation.controller,
+            authority,
+            result: activation.result,
+            active: activation.active,
+            evidence_finalized: false,
+            last_tick_ns: now,
+            wyr1b: Some(wyr1b_native::ResidentState {
+                registry_control: activation.registry_control,
+                topology: activation.topology,
+                gate: activation.gate,
+            }),
+        },
+    })
+}
+
+fn receive_and_activate<S, T>(
+    system: &mut S,
+    bootstrap_channel: DwHandle,
+    activate: impl FnOnce(&mut S, LoadAuthority, u64, &[u8]) -> Result<T, InitError>,
+) -> Result<(LoadAuthority, T), InitError>
+where
+    S: InitPlatform,
+{
     let channel = system
         .query_capability_info(bootstrap_channel)
         .map_err(InitError::Native)?;
@@ -1178,17 +1349,7 @@ where
                 authority.parent_root,
                 authority.bootfs,
                 plan,
-                |system, bootfs| {
-                    activate_retained_bootfs(
-                        system,
-                        loader,
-                        waits,
-                        authority,
-                        bootstrap_channel,
-                        parsed.transaction_id,
-                        bootfs,
-                    )
-                },
+                |system, bootfs| activate(system, authority, parsed.transaction_id, bootfs),
             )
             .map_err(InitError::Native)??;
         Ok::<_, InitError>((authority, activation))
@@ -1203,14 +1364,7 @@ where
     system
         .close_handle(bootstrap_channel)
         .map_err(InitError::Native)?;
-    Ok(ResidentSystemInit {
-        controller: activation.controller,
-        authority,
-        result: activation.result,
-        active: activation.active,
-        evidence_finalized: false,
-        last_tick_ns: system.now().map_err(InitError::Native)?,
-    })
+    Ok((authority, activation))
 }
 
 fn close_startup_failure<S: InitPlatform>(
@@ -1923,6 +2077,7 @@ mod native_cleanup_tests {
         closed: [DwHandle; 4],
         close_count: usize,
         wake_now: Option<u64>,
+        wyr1b_calls: usize,
     }
 
     impl MockNative {
@@ -1934,6 +2089,7 @@ mod native_cleanup_tests {
                 closed: [DwHandle(0); 4],
                 close_count: 0,
                 wake_now: None,
+                wyr1b_calls: 0,
             }
         }
     }
@@ -2010,6 +2166,35 @@ mod native_cleanup_tests {
                 }
                 None => Err(FAILURE),
             }
+        }
+    }
+
+    impl Wyr1BPlatform for MockNative {
+        fn channel_create(
+            &mut self,
+            _rights: DwRights,
+        ) -> Result<(DwHandle, DwHandle), NativeError> {
+            self.wyr1b_calls += 1;
+            Err(FAILURE)
+        }
+
+        fn send_channel_with_handles(
+            &mut self,
+            _channel: DwHandle,
+            _bytes: &[u8],
+            _transfers: &[DwHandleTransferV1],
+        ) -> Result<(), NativeError> {
+            self.wyr1b_calls += 1;
+            Err(FAILURE)
+        }
+
+        fn wait_many(
+            &mut self,
+            _items: &[DwWaitItemV1],
+            _deadline: DwDeadline,
+        ) -> Result<DwWaitResultV1, NativeError> {
+            self.wyr1b_calls += 1;
+            Err(FAILURE)
         }
     }
 
@@ -2187,6 +2372,7 @@ mod native_cleanup_tests {
             accounting: AttemptLedger::new(),
             gate: None,
             evidence: None,
+            registry_startup_profile: StartupProfile::EarlyBootStub,
         };
         controller.become_operational().unwrap();
         controller.begin_registry(0, 1, 0x1001).unwrap();
@@ -2211,15 +2397,17 @@ mod native_cleanup_tests {
             active: [Some(registry), Some(devmgr)],
             evidence_finalized: false,
             last_tick_ns: 9,
+            wyr1b: None,
         };
         let mut native = MockNative::new();
         let mut loader = wyrmroot_runtime::NativeLoaderPlatform;
         let mut waits = ResidentWaits { wait_count: 0 };
 
         assert_eq!(
-            resident.control_tick(&mut native, &mut loader, &mut waits, 10),
+            resident.control_tick_product(&mut native, &mut loader, &mut waits, 10),
             Ok(SystemMode::Normal)
         );
+        assert_eq!(native.wyr1b_calls, 0);
         assert_eq!(resident.active, [None, Some(devmgr)]);
         assert_eq!(
             resident.controller.role_state(RoleId::Registryd),

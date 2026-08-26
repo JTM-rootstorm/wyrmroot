@@ -74,7 +74,6 @@ impl RegistryTopology {
             return Err(JobError::StaleGeneration);
         }
         self.registry_generation = next_generation;
-        self.next_endpoint_id = 1;
         Ok(())
     }
 
@@ -617,6 +616,7 @@ impl JobController {
 /// Policy-checks and failure-atomically loads one WRLJ launch request through
 /// the canonical executable loader. The caller supplies the already-created
 /// per-job TaskGroup and retains responsibility for it on any returned error.
+#[allow(clippy::too_many_arguments)]
 pub fn launch_authorized_job<'a, L: LoaderPlatform>(
     jobs: &mut JobController,
     policy: &PolicyView<'a>,
@@ -794,6 +794,9 @@ mod tests {
         assert!(topology.accepts(grant));
         topology.restart(2).unwrap();
         assert!(!topology.accepts(grant));
+        let replacement = topology.issue(8, EndpointKind::Publication).unwrap();
+        assert!(topology.accepts(replacement));
+        assert!(replacement.endpoint_id > grant.endpoint_id);
         assert_eq!(topology.restart(2), Err(JobError::StaleGeneration));
     }
 

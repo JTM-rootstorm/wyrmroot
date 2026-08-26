@@ -24,7 +24,8 @@ use wyrmroot_runtime::{
 use wyrmroot_system_init::fatal_application_status;
 #[cfg(feature = "wyr1-test-evidence")]
 use wyrmroot_system_init::wyr1_test_failure_application_status;
-use wyrmroot_system_init::{InitPlatform, Wyr1BPlatform, run_system_init};
+use wyrmroot_system_init::{InitPlatform, Wyr1BPlatform, run_system_init_product};
+use wyrmroot_wyr1b_gate_proto as _;
 
 struct NativeSystem;
 
@@ -121,7 +122,7 @@ fn main(startup: StartupBlock<'_>) -> u32 {
     let mut system = NativeSystem;
     let mut loader = NativeLoaderPlatform;
     let mut waits = NativeSupervisionPlatform;
-    let result = run_system_init(
+    let result = run_system_init_product(
         &mut system,
         &mut loader,
         &mut waits,
@@ -146,7 +147,7 @@ fn main(startup: StartupBlock<'_>) -> u32 {
             return 0xAF01_0004;
         };
         if resident
-            .control_tick(&mut system, &mut loader, &mut waits, now)
+            .control_tick_product(&mut system, &mut loader, &mut waits, now)
             .is_err()
         {
             return 0xAF01_0006;

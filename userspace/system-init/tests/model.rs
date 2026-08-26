@@ -13,6 +13,7 @@ use wyrmroot_system_init::{
     REAP_CLASS_TASK_GROUP_TEARDOWN, REAP_CLASS_UNHANDLED_EXCEPTION, RecoveryResult, SystemInit,
     SystemMode, observe_ready, reap_evidence_value,
 };
+use wyrmroot_wyr1b_gate_proto as _;
 
 const BOOT: [u8; 32] = [0x42; 32];
 

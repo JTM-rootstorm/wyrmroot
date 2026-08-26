@@ -284,6 +284,7 @@ dependencies = [
  "wyrmroot-registry-proto",
  "wyrmroot-rrc-manifest",
  "wyrmroot-runtime",
+ "wyrmroot-wyr1b-gate-proto",
 ]
 
 [[package]]
