@@ -688,6 +688,8 @@ fn inspect_static_native_elf(bytes: &[u8], label: &str) -> Result<NativeInspecti
         || bytes[4] != 2
         || bytes[5] != 1
         || bytes[6] != 1
+        || bytes[7] != 0
+        || bytes[8] != 0
         || u16_at(bytes, 16)? != 2
         || u16_at(bytes, 18)? != 62
         || u32_at(bytes, 20)? != 1
@@ -1276,6 +1278,14 @@ mod tests {
         assert!(inspect_static_native_elf(&elf_fixture(3, 4), "interp").is_err());
         assert!(inspect_static_native_elf(&elf_fixture(2, 4), "dynamic").is_err());
         assert!(inspect_static_native_elf(&elf_fixture(1, 7), "wx").is_err());
+
+        let mut non_system_v = valid.clone();
+        non_system_v[7] = 3;
+        assert!(inspect_static_native_elf(&non_system_v, "osabi-3").is_err());
+
+        let mut abi_version = valid.clone();
+        abi_version[8] = 1;
+        assert!(inspect_static_native_elf(&abi_version, "abi-version-1").is_err());
 
         let mut phdr_overflow = valid.clone();
         put_u64(&mut phdr_overflow, 32, u64::MAX);

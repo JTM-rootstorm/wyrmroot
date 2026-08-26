@@ -22,9 +22,11 @@ Usage:
     cargo xtask wyr1b inspect --request <wyr1-b-request.toml>
     cargo xtask wyr1b evidence --request <wyr1-b-request.toml> --log <evidence>
     cargo xtask dw1b image --request <dw1-b-request.toml>
+    cargo xtask dw1b freeze --output <directory>
     cargo xtask dw1b inspect --request <dw1-b-request.toml>
+    cargo xtask dw1b run --request <dw1-b-request.toml>
     cargo xtask dw1b measure --init <elf> --hello <elf> --cpu-hog <elf> --progress <elf>
-    cargo xtask dw1b evidence --request <dw1-b-request.toml> --log <serial-log> --debug-exit 33
+    cargo xtask dw1b evidence --request <dw1-b-request.toml>
 
 Host filters may name a component (bootfs, protocol, elf, runtime, bootstrap,
 efi, init0, hello, or xtask), package:<workspace-package>, or test:<substring>.
@@ -117,18 +119,16 @@ pub(crate) enum Action {
         log: String,
     },
     Dw1BImage(String),
+    Dw1BFreeze(String),
     Dw1BInspect(String),
+    Dw1BRun(String),
     Dw1BMeasure {
         init: String,
         hello: String,
         cpu_hog: String,
         progress: String,
     },
-    Dw1BEvidence {
-        request: String,
-        log: String,
-        debug_exit: u32,
-    },
+    Dw1BEvidence(String),
     Unavailable(&'static str),
 }
 
@@ -185,11 +185,17 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
 
 fn dispatch_dw1b(arguments: &[String]) -> Result<Action, Failure> {
     match arguments {
+        [command, flag, output] if command == "freeze" && flag == "--output" => {
+            Ok(Action::Dw1BFreeze(output.clone()))
+        }
         [command, flag, request] if command == "image" && flag == "--request" => {
             Ok(Action::Dw1BImage(request.clone()))
         }
         [command, flag, request] if command == "inspect" && flag == "--request" => {
             Ok(Action::Dw1BInspect(request.clone()))
+        }
+        [command, flag, request] if command == "run" && flag == "--request" => {
+            Ok(Action::Dw1BRun(request.clone()))
         }
         [
             command,
@@ -214,22 +220,11 @@ fn dispatch_dw1b(arguments: &[String]) -> Result<Action, Failure> {
                 progress: progress.clone(),
             })
         }
-        [command, flag, request, log_flag, log, exit_flag, debug_exit]
-            if command == "evidence"
-                && flag == "--request"
-                && log_flag == "--log"
-                && exit_flag == "--debug-exit" =>
-        {
-            Ok(Action::Dw1BEvidence {
-                request: request.clone(),
-                log: log.clone(),
-                debug_exit: debug_exit.parse().map_err(|_| {
-                    Failure::usage("dw1b --debug-exit must be a canonical decimal status")
-                })?,
-            })
+        [command, flag, request] if command == "evidence" && flag == "--request" => {
+            Ok(Action::Dw1BEvidence(request.clone()))
         }
         _ => Err(Failure::usage(
-            "dw1b requires image|inspect --request <path>, measure with four exact artifacts, or evidence --request <path> --log <serial-log> --debug-exit 33",
+            "dw1b requires freeze --output <directory>, image|inspect|run|evidence --request <path>, or measure with four exact artifacts",
         )),
     }
 }
@@ -604,6 +599,20 @@ mod tests {
             Ok(Action::Wyr1Prepare("request.toml".into()))
         );
         assert!(USAGE.contains("wyr1 prepare --request"));
+    }
+
+    #[test]
+    fn dw1b_run_dispatches_to_the_observed_execution_path() {
+        assert_eq!(
+            dispatch(&arguments(&["dw1b", "run", "--request", "request.toml",])),
+            Ok(Action::Dw1BRun("request.toml".into()))
+        );
+        assert!(USAGE.contains("dw1b run --request"));
+        assert_eq!(
+            dispatch(&arguments(&["dw1b", "freeze", "--output", "freeze"])),
+            Ok(Action::Dw1BFreeze("freeze".into()))
+        );
+        assert!(USAGE.contains("dw1b freeze --output"));
     }
 
     #[test]

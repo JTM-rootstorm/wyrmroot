@@ -2767,13 +2767,37 @@ fn qemu_arguments(
     kind: ExecutionKind,
     run: &RunPaths,
 ) -> Vec<String> {
+    let mut args = canonical_qemu_arguments(
+        profile.vcpus(),
+        profile.memory_mib(),
+        &run.ovmf_code.child_path(),
+        &run.vars.child_path(),
+        &run.esp.child_path(),
+        &run.serial_log.child_path(),
+        (kind == ExecutionKind::Integration).then_some(request.selector.as_str()),
+    );
+    if kind == ExecutionKind::Gdb {
+        args.extend(["-S".into(), "-gdb".into(), "tcp:127.0.0.1:1234".into()]);
+    }
+    args
+}
+
+fn canonical_qemu_arguments(
+    vcpus: u32,
+    memory_mib: u32,
+    ovmf_code: &Path,
+    ovmf_vars: &Path,
+    esp: &Path,
+    serial_log: &Path,
+    selector: Option<&str>,
+) -> Vec<String> {
     let mut args = vec![
         "-machine".into(),
         "q35".into(),
         "-m".into(),
-        format!("{}M", profile.memory_mib()),
+        format!("{memory_mib}M"),
         "-smp".into(),
-        profile.vcpus().to_string(),
+        vcpus.to_string(),
         "-nodefaults".into(),
         "-display".into(),
         "none".into(),
@@ -2783,34 +2807,22 @@ fn qemu_arguments(
         "-drive".into(),
         format!(
             "if=pflash,format=raw,readonly=on,file={}",
-            run.ovmf_code.child_path().display()
+            ovmf_code.display()
         ),
         "-drive".into(),
-        format!(
-            "if=pflash,format=raw,file={}",
-            run.vars.child_path().display()
-        ),
+        format!("if=pflash,format=raw,file={}", ovmf_vars.display()),
         "-drive".into(),
-        format!(
-            "if=virtio,format=raw,readonly=on,file={}",
-            run.esp.child_path().display()
-        ),
+        format!("if=virtio,format=raw,readonly=on,file={}", esp.display()),
         "-serial".into(),
-        format!("file:{}", run.serial_log.child_path().display()),
+        format!("file:{}", serial_log.display()),
     ];
-    if kind == ExecutionKind::Integration {
+    if let Some(selector) = selector {
         args.extend([
             "-fw_cfg".into(),
-            format!(
-                "name=opt/org.deepwyrm.test.selector,string={}",
-                request.selector
-            ),
+            format!("name=opt/org.deepwyrm.test.selector,string={selector}"),
             "-device".into(),
             "isa-debug-exit,iobase=0xf4,iosize=0x04".into(),
         ]);
-    }
-    if kind == ExecutionKind::Gdb {
-        args.extend(["-S".into(), "-gdb".into(), "tcp:127.0.0.1:1234".into()]);
     }
     args
 }
@@ -3736,6 +3748,63 @@ enum WaitOutcome {
 struct WaitFailure {
     failure: Failure,
     cleanup: CleanupDisposition,
+}
+
+pub(crate) struct CanonicalSelectorRun<'paths> {
+    pub(crate) ovmf_code: &'paths Path,
+    pub(crate) ovmf_vars: &'paths Path,
+    pub(crate) esp: &'paths Path,
+    pub(crate) serial_log: &'paths Path,
+    pub(crate) stderr_log: &'paths Path,
+    pub(crate) selector: &'paths str,
+    pub(crate) timeout_seconds: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CanonicalSelectorOutcome {
+    pub(crate) qemu_exit_status: Option<i32>,
+    pub(crate) timed_out: bool,
+}
+
+pub(crate) fn run_canonical_one_cpu_selector(
+    run: &CanonicalSelectorRun<'_>,
+) -> Result<CanonicalSelectorOutcome, Failure> {
+    let stderr = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(run.stderr_log)
+        .map_err(|error| {
+            Failure::task(format!("could not create canonical QEMU stderr: {error}"))
+        })?;
+    let args = canonical_qemu_arguments(
+        1,
+        DEFAULT_MEMORY_MIB,
+        run.ovmf_code,
+        run.ovmf_vars,
+        run.esp,
+        run.serial_log,
+        Some(run.selector),
+    );
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .map_err(|error| {
+            Failure::task(format!("could not launch canonical selector QEMU: {error}"))
+        })?;
+    match wait_bounded(&mut child, run.timeout_seconds) {
+        Ok(WaitOutcome::Exited(status)) => Ok(CanonicalSelectorOutcome {
+            qemu_exit_status: status.code(),
+            timed_out: false,
+        }),
+        Ok(WaitOutcome::TimedOut(_)) => Ok(CanonicalSelectorOutcome {
+            qemu_exit_status: None,
+            timed_out: true,
+        }),
+        Err(error) => Err(error.failure),
+    }
 }
 
 fn wait_bounded(child: &mut Child, timeout_seconds: u64) -> Result<WaitOutcome, WaitFailure> {

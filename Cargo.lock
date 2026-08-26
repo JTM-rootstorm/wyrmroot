@@ -336,5 +336,6 @@ dependencies = [
  "deepwyrm-abi",
  "wyrmroot-bootfs",
  "wyrmroot-i-capability",
+ "wyrmroot-loader",
  "wyrmroot-rrc-manifest",
 ]

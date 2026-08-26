@@ -89,9 +89,9 @@ fi
 printf '{\n'
 printf '  "schema_version": 2,\n'
 printf '  "report_kind": "wyrmroot-wyr0-uefi-artifact-inspection",\n'
-printf '  "loader": "%s",\n' "$(json_escape "$loader")"
-printf '  "debug_loader": "%s",\n' "$(json_escape "$debug_loader")"
-printf '  "debug_symbol_artifact": "%s",\n' "$(json_escape "$debug_symbols")"
+printf '  "loader": "%s",\n' "$(json_escape "$(basename "$loader")")"
+printf '  "debug_loader": "%s",\n' "$(json_escape "$(basename "$debug_loader")")"
+printf '  "debug_symbol_artifact": "%s",\n' "$(json_escape "$(basename "$debug_symbols")")"
 printf '  "pe32_plus": %s,\n' "$pe32_plus"
 printf '  "amd64": %s,\n' "$amd64"
 printf '  "efi_application": %s,\n' "$efi_application"
