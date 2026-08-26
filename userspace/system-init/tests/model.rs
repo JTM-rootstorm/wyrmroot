@@ -81,7 +81,12 @@ fn system() -> SystemInit {
     SystemInit::from_manifest(manifest).unwrap()
 }
 
-fn resources(role: RoleId, generation: u64, transaction: u64) -> AttemptResources {
+fn resources(
+    init: &mut SystemInit,
+    role: RoleId,
+    generation: u64,
+    transaction: u64,
+) -> AttemptResources {
     AttemptResources {
         role,
         generation,
@@ -92,13 +97,13 @@ fn resources(role: RoleId, generation: u64, transaction: u64) -> AttemptResource
         process: DwHandle(200 + generation),
         launch_channel: DwHandle(300 + generation),
         mappings: 3,
-        accounting_reserved: true,
+        reservation: init.reserve_attempt(role, generation, transaction).unwrap(),
     }
 }
 
 fn start_role(init: &mut SystemInit, role: RoleId, generation: u64, transaction: u64, now: u64) {
-    init.install_attempt(resources(role, generation, transaction))
-        .unwrap();
+    let resources = resources(init, role, generation, transaction);
+    init.install_attempt(resources).unwrap();
     init.child_started(role, generation, transaction, now + 1)
         .unwrap();
 }
@@ -121,7 +126,7 @@ fn exact_registry_then_devmgr_ready_reaches_normal_without_activating_retained_r
     ));
     assert_eq!(init.role_state(RoleId::Uart16550d), None);
     assert_eq!(
-        init.install_attempt(resources(RoleId::Wyrmsh, 1, 1)),
+        init.reserve_attempt(RoleId::Wyrmsh, 1, 1),
         Err(InitError::UnlaunchableRole)
     );
     init.terminal(
@@ -187,6 +192,7 @@ fn four_failed_attempts_reap_exact_resources_and_degrade_once() {
         init.cleanup_complete(RoleId::Registryd, generation, transaction, now)
             .unwrap();
         assert!(init.resources(RoleId::Registryd).is_none());
+        assert_eq!(init.outstanding_reservations(), 0);
         if attempt != 3 {
             let RestartState::Backoff {
                 deadline_ns,
@@ -215,6 +221,27 @@ fn four_failed_attempts_reap_exact_resources_and_degrade_once() {
         ))
     );
     assert_eq!(init.degraded_transitions(), 1);
+}
+
+#[test]
+fn failed_cleanup_retains_generation_reservation_and_blocks_replacement() {
+    let mut init = system();
+    init.become_operational().unwrap();
+    init.begin_registry(0, 1, 10).unwrap();
+    start_role(&mut init, RoleId::Registryd, 1, 10, 0);
+    init.fail(RoleId::Registryd, 1, 10, 2, AttemptFailure::MalformedReady)
+        .unwrap();
+    init.cleanup_failed(RoleId::Registryd, 1, 10, 3).unwrap();
+    assert_eq!(init.outstanding_reservations(), 1);
+    assert!(init.resources(RoleId::Registryd).is_some());
+    assert!(matches!(
+        init.role_state(RoleId::Registryd),
+        Some(RestartState::PermanentFailure { .. })
+    ));
+    assert!(
+        init.start_replacement(RoleId::Registryd, 30_000_000, 2, 11)
+            .is_err()
+    );
 }
 
 #[test]
@@ -268,23 +295,34 @@ fn capability_and_profile_mismatch_fail_before_publication() {
     let mut init = system();
     init.become_operational().unwrap();
     init.begin_registry(0, 1, 10).unwrap();
-    let mut wrong = resources(RoleId::Registryd, 1, 10);
+    let mut wrong = resources(&mut init, RoleId::Registryd, 1, 10);
     wrong.startup_profile = StartupProfile::Retained;
     assert_eq!(
         init.install_attempt(wrong),
         Err(InitError::ResourceIdentityMismatch)
     );
-    wrong = resources(RoleId::Registryd, 1, 10);
+    assert_eq!(init.outstanding_reservations(), 0);
+
+    let mut init = system();
+    init.become_operational().unwrap();
+    init.begin_registry(0, 1, 10).unwrap();
+    let mut wrong = resources(&mut init, RoleId::Registryd, 1, 10);
     wrong.task_group = DwHandle(0);
     assert_eq!(
         init.install_attempt(wrong),
         Err(InitError::InvalidResourceHandle)
     );
-    wrong = resources(RoleId::Registryd, 1, 99);
+    assert_eq!(init.outstanding_reservations(), 0);
+
+    let mut init = system();
+    init.become_operational().unwrap();
+    init.begin_registry(0, 1, 10).unwrap();
+    let wrong = resources(&mut init, RoleId::Registryd, 1, 99);
     assert_eq!(
         init.install_attempt(wrong),
         Err(InitError::ResourceIdentityMismatch)
     );
+    assert_eq!(init.outstanding_reservations(), 0);
 }
 
 #[test]

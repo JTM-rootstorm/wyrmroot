@@ -95,7 +95,7 @@ impl ResidentSystemInit {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct AttemptResources {
     pub role: RoleId,
     pub generation: u64,
@@ -106,7 +106,141 @@ pub struct AttemptResources {
     pub process: DwHandle,
     pub launch_channel: DwHandle,
     pub mappings: u8,
-    pub accounting_reserved: bool,
+    pub reservation: AttemptReservation,
+}
+
+/// Affine token proving one fixed-role generation was reserved before child
+/// publication. It is intentionally neither `Copy` nor `Clone`.
+#[derive(Debug, Eq, PartialEq)]
+pub struct AttemptReservation {
+    role: RoleId,
+    generation: u64,
+    transaction_id: u64,
+    nonce: u64,
+    published: bool,
+    released: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReservationSlot {
+    last_generation: u64,
+    transaction_id: u64,
+    nonce: u64,
+    outstanding: bool,
+    published: bool,
+}
+
+impl ReservationSlot {
+    const EMPTY: Self = Self {
+        last_generation: 0,
+        transaction_id: 0,
+        nonce: 0,
+        outstanding: false,
+        published: false,
+    };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AttemptLedger {
+    slots: [ReservationSlot; EARLY_ROLE_COUNT],
+    next_nonce: u64,
+}
+
+impl AttemptLedger {
+    const fn new() -> Self {
+        Self {
+            slots: [ReservationSlot::EMPTY; EARLY_ROLE_COUNT],
+            next_nonce: 1,
+        }
+    }
+
+    fn reserve(
+        &mut self,
+        index: usize,
+        role: RoleId,
+        generation: u64,
+        transaction_id: u64,
+    ) -> Result<AttemptReservation, InitError> {
+        let slot = &mut self.slots[index];
+        if generation == 0 || transaction_id == 0 || slot.outstanding {
+            return Err(InitError::Accounting);
+        }
+        if generation <= slot.last_generation || self.next_nonce == 0 {
+            return Err(InitError::Accounting);
+        }
+        let nonce = self.next_nonce;
+        self.next_nonce = self
+            .next_nonce
+            .checked_add(1)
+            .ok_or(InitError::Accounting)?;
+        *slot = ReservationSlot {
+            last_generation: generation,
+            transaction_id,
+            nonce,
+            outstanding: true,
+            published: false,
+        };
+        Ok(AttemptReservation {
+            role,
+            generation,
+            transaction_id,
+            nonce,
+            published: false,
+            released: false,
+        })
+    }
+
+    fn publish(&mut self, token: &mut AttemptReservation) -> Result<(), InitError> {
+        let index = role_index(token.role)?;
+        let slot = &mut self.slots[index];
+        validate_reservation(slot, token)?;
+        if token.published || slot.published {
+            return Err(InitError::Accounting);
+        }
+        token.published = true;
+        slot.published = true;
+        Ok(())
+    }
+
+    fn release(&mut self, token: &mut AttemptReservation) -> Result<(), InitError> {
+        let index = role_index(token.role)?;
+        let slot = &mut self.slots[index];
+        validate_reservation(slot, token)?;
+        token.released = true;
+        slot.outstanding = false;
+        slot.published = false;
+        slot.transaction_id = 0;
+        slot.nonce = 0;
+        Ok(())
+    }
+
+    const fn outstanding(&self) -> usize {
+        self.slots[0].outstanding as usize + self.slots[1].outstanding as usize
+    }
+}
+
+fn validate_reservation(
+    slot: &ReservationSlot,
+    token: &AttemptReservation,
+) -> Result<(), InitError> {
+    if token.released
+        || !slot.outstanding
+        || slot.last_generation != token.generation
+        || slot.transaction_id != token.transaction_id
+        || slot.nonce != token.nonce
+    {
+        Err(InitError::Accounting)
+    } else {
+        Ok(())
+    }
+}
+
+fn role_index(role: RoleId) -> Result<usize, InitError> {
+    match role {
+        RoleId::Registryd => Ok(0),
+        RoleId::Devmgr => Ok(1),
+        _ => Err(InitError::UnlaunchableRole),
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -132,6 +266,7 @@ pub enum InitError {
     Loader(LoadError<NativeError>),
     Supervision,
     Cleanup,
+    Accounting,
 }
 
 impl From<RestartTransitionError> for InitError {
@@ -140,7 +275,7 @@ impl From<RestartTransitionError> for InitError {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 struct RoleController {
     role: RoleId,
     executable_identity: [u8; 32],
@@ -159,12 +294,13 @@ impl RoleController {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct SystemInit {
     mode: SystemMode,
     roles: [RoleController; EARLY_ROLE_COUNT],
     degraded_transitions: u8,
     activated: [bool; EARLY_ROLE_COUNT],
+    accounting: AttemptLedger,
 }
 
 impl SystemInit {
@@ -234,6 +370,7 @@ impl SystemInit {
             ],
             degraded_transitions: 0,
             activated: [false; EARLY_ROLE_COUNT],
+            accounting: AttemptLedger::new(),
         })
     }
 
@@ -259,8 +396,32 @@ impl SystemInit {
         self.index(role).map(|i| self.roles[i].restart.state())
     }
     #[must_use]
-    pub fn resources(&self, role: RoleId) -> Option<AttemptResources> {
-        self.index(role).and_then(|i| self.roles[i].resources)
+    pub fn resources(&self, role: RoleId) -> Option<&AttemptResources> {
+        self.index(role)
+            .and_then(|i| self.roles[i].resources.as_ref())
+    }
+
+    pub fn reserve_attempt(
+        &mut self,
+        role: RoleId,
+        generation: u64,
+        transaction: u64,
+    ) -> Result<AttemptReservation, InitError> {
+        let index = role_index(role)?;
+        self.accounting
+            .reserve(index, role, generation, transaction)
+    }
+
+    pub fn abort_reservation(
+        &mut self,
+        mut reservation: AttemptReservation,
+    ) -> Result<(), InitError> {
+        self.accounting.release(&mut reservation)
+    }
+
+    #[must_use]
+    pub const fn outstanding_reservations(&self) -> usize {
+        self.accounting.outstanding()
     }
 
     /// Marks manifest/closure/controller initialization complete. This is the
@@ -287,7 +448,7 @@ impl SystemInit {
         Ok(())
     }
 
-    pub fn install_attempt(&mut self, resources: AttemptResources) -> Result<(), InitError> {
+    pub fn install_attempt(&mut self, mut resources: AttemptResources) -> Result<(), InitError> {
         let index = self
             .index(resources.role)
             .ok_or(InitError::UnlaunchableRole)?;
@@ -295,11 +456,13 @@ impl SystemInit {
             || resources.process.0 == 0
             || resources.launch_channel.0 == 0
         {
+            self.accounting.release(&mut resources.reservation)?;
             return Err(InitError::InvalidResourceHandle);
         }
         if resources.startup_profile != StartupProfile::EarlyBootStub
             || resources.executable_identity != self.roles[index].executable_identity
         {
+            self.accounting.release(&mut resources.reservation)?;
             return Err(InitError::ResourceIdentityMismatch);
         }
         let RestartState::Starting {
@@ -308,13 +471,23 @@ impl SystemInit {
             ..
         } = self.roles[index].restart.state()
         else {
+            self.accounting.release(&mut resources.reservation)?;
             return Err(InitError::WrongActivationOrder);
         };
         if (generation, transaction_id) != (resources.generation, resources.transaction_id) {
+            self.accounting.release(&mut resources.reservation)?;
             return Err(InitError::ResourceIdentityMismatch);
         }
         if self.roles[index].resources.is_some() {
+            self.accounting.release(&mut resources.reservation)?;
             return Err(InitError::ResourcesAlreadyInstalled);
+        }
+        if resources.reservation.role != resources.role
+            || resources.reservation.generation != resources.generation
+            || resources.reservation.transaction_id != resources.transaction_id
+        {
+            self.accounting.release(&mut resources.reservation)?;
+            return Err(InitError::Accounting);
         }
         self.roles[index].resources = Some(resources);
         Ok(())
@@ -327,13 +500,18 @@ impl SystemInit {
         transaction: u64,
         now: u64,
     ) -> Result<(), InitError> {
-        let controller = self.controller_mut(role)?;
-        if controller.resources.is_none() {
+        let index = self.index(role).ok_or(InitError::UnlaunchableRole)?;
+        if self.roles[index].resources.is_none() {
             return Err(InitError::MissingAttemptResources);
         }
-        controller
+        self.roles[index]
             .restart
             .child_started(generation, transaction, now)?;
+        let resources = self.roles[index]
+            .resources
+            .as_mut()
+            .ok_or(InitError::MissingAttemptResources)?;
+        self.accounting.publish(&mut resources.reservation)?;
         Ok(())
     }
 
@@ -404,7 +582,8 @@ impl SystemInit {
         transaction: u64,
         now: u64,
     ) -> Result<(), InitError> {
-        let controller = self.controller_mut(role)?;
+        let index = self.index(role).ok_or(InitError::UnlaunchableRole)?;
+        let controller = &mut self.roles[index];
         let unpublished = matches!(
             controller.restart.state(),
             RestartState::CleaningUp {
@@ -412,12 +591,15 @@ impl SystemInit {
                 ..
             }
         );
-        if controller.resources.take().is_none() && !unpublished {
+        if controller.resources.is_none() && !unpublished {
             return Err(InitError::MissingAttemptResources);
         }
         controller
             .restart
             .cleanup_complete(generation, transaction, now)?;
+        if let Some(mut resources) = controller.resources.take() {
+            self.accounting.release(&mut resources.reservation)?;
+        }
         self.update_permanent_failure(role);
         Ok(())
     }
@@ -430,7 +612,6 @@ impl SystemInit {
         now: u64,
     ) -> Result<(), InitError> {
         let controller = self.controller_mut(role)?;
-        controller.resources = None;
         controller
             .restart
             .cleanup_failed(generation, transaction, now)?;
@@ -718,6 +899,7 @@ where
             let task_group = system
                 .create_attempt_task_group(authority.task_group)
                 .map_err(InitError::Native)?;
+            let reservation = controller.reserve_attempt(role, generation, transaction_id)?;
             let role_authority = LoadAuthority {
                 task_group,
                 ..authority
@@ -741,6 +923,7 @@ where
                         })
                     );
                     let close_failed = system.close_handle(task_group).is_err();
+                    controller.abort_reservation(reservation)?;
                     if rollback_failed || close_failed {
                         controller.cleanup_failed(role, generation, transaction_id, now + 1)?;
                         controller.fatal();
@@ -763,7 +946,7 @@ where
                 process: loaded.process,
                 launch_channel: loaded.launch_channel,
                 mappings: 0,
-                accounting_reserved: true,
+                reservation,
             })?;
             let now = system.now().map_err(InitError::Native)?;
             controller.child_started(role, generation, transaction_id, now)?;
