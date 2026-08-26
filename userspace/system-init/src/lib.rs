@@ -1120,7 +1120,6 @@ where
         return Err(InitError::Supervision);
     }
     let now = system.now().map_err(InitError::Native)?;
-    wyr1_test_set_restart_stage(1);
     controller.begin_registry(now, 1, 0x1001)?;
     for role in [RoleId::Registryd, RoleId::Devmgr] {
         loop {
@@ -1243,7 +1242,6 @@ where
                     ));
                 }
             };
-            wyr1_test_set_restart_stage(2);
             if let Err(error) = controller.child_started(role, generation, transaction_id, now) {
                 return Err(cleanup_after_transition_error(
                     system,
@@ -1292,7 +1290,6 @@ where
                             ));
                         }
                     };
-                    wyr1_test_set_restart_stage(3);
                     if let Err(error) = controller.ready(role, generation, transaction_id, now) {
                         return Err(cleanup_after_transition_error(
                             system,
@@ -1328,7 +1325,6 @@ where
                                     ));
                                 }
                             };
-                            wyr1_test_set_restart_stage(4);
                             if let Err(error) = controller.terminal(
                                 role,
                                 generation,
@@ -1602,7 +1598,6 @@ fn complete_native_cleanup<S: InitPlatform, W: SupervisionPlatform<Error = Nativ
     match cleanup_loaded(system, waits, loaded, task_group, terminate) {
         Ok(()) => {
             let retired_at = classified_at.checked_add(1).ok_or(InitError::Accounting)?;
-            wyr1_test_set_restart_stage(5);
             match controller.cleanup_complete(role, generation, transaction, retired_at) {
                 Ok(()) => Ok(()),
                 Err(error) => {
