@@ -1,6 +1,8 @@
 # Wyrmroot WYR1-A Permanent Supervisor and RRC-A Contract
 
-**Status:** Reached contract; authoritative for WYR1-A
+**Status:** Reached and live-accepted contract; authoritative for WYR1-A
+
+**Validation:** [`WYR1_A_VALIDATION.md`](WYR1_A_VALIDATION.md)
 **Prepared:** 2026-08-25
 **Wyrmroot baseline:** `120fafa36e0e32402656b23d5a4b0c03b949c7b6`
 **Accepted WYR0 product:** `ec84cc6441db15de83d55329ac442a01988c52e9`
