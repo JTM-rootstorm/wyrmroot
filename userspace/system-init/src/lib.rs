@@ -92,7 +92,14 @@ pub const fn wyr1_test_failure_application_status(error: &InitError) -> u32 {
         InitError::ResourcesAlreadyInstalled => 0x05,
         InitError::ResourceIdentityMismatch => 0x06,
         InitError::InvalidResourceHandle => 0x07,
-        InitError::Restart(error) => return wyr1_test_restart_failure_application_status(*error),
+        InitError::Restart(error) => {
+            return 0xAF12_0000 | wyr1_test_restart_failure_category(*error);
+        }
+        InitError::Wyr1TestRestart(stage, error) => {
+            return 0xAF13_0000
+                | ((*stage as u32) << 8)
+                | wyr1_test_restart_failure_category(*error);
+        }
         InitError::Bootfs(_) => 0x09,
         InitError::MissingRetainedMaterial => 0x0a,
         InitError::NonExecutableRole => 0x0b,
@@ -114,8 +121,8 @@ pub const fn wyr1_test_failure_application_status(error: &InitError) -> u32 {
 }
 
 #[cfg(feature = "wyr1-test-evidence")]
-const fn wyr1_test_restart_failure_application_status(error: RestartTransitionError) -> u32 {
-    let category = match error {
+const fn wyr1_test_restart_failure_category(error: RestartTransitionError) -> u32 {
+    match error {
         RestartTransitionError::InvalidPolicy => 0x01,
         RestartTransitionError::ZeroIdentity => 0x02,
         RestartTransitionError::InvalidState => 0x03,
@@ -145,8 +152,20 @@ const fn wyr1_test_restart_failure_application_status(error: RestartTransitionEr
                 AttemptFailure::Cancelled => 0x0d,
             }
         }
-    };
-    0xAF12_0000 | category
+    }
+}
+
+#[cfg(feature = "wyr1-test-evidence")]
+fn wyr1_test_restart_stage(error: InitError, stage: u8) -> InitError {
+    match error {
+        InitError::Restart(error) => InitError::Wyr1TestRestart(stage, error),
+        error => error,
+    }
+}
+
+#[cfg(not(feature = "wyr1-test-evidence"))]
+fn wyr1_test_restart_stage(error: InitError, _stage: u8) -> InitError {
+    error
 }
 
 /// Boot-lifetime owner of the fixed supervisor state and primordial authority.
@@ -348,6 +367,8 @@ pub enum InitError {
     ResourceIdentityMismatch,
     InvalidResourceHandle,
     Restart(RestartTransitionError),
+    #[cfg(feature = "wyr1-test-evidence")]
+    Wyr1TestRestart(u8, RestartTransitionError),
     Bootfs(ParseError),
     MissingRetainedMaterial,
     NonExecutableRole,
@@ -1135,7 +1156,9 @@ where
         return Err(InitError::Supervision);
     }
     let now = system.now().map_err(InitError::Native)?;
-    controller.begin_registry(now, 1, 0x1001)?;
+    controller
+        .begin_registry(now, 1, 0x1001)
+        .map_err(|error| wyr1_test_restart_stage(error, 1))?;
     for role in [RoleId::Registryd, RoleId::Devmgr] {
         loop {
             let RestartState::Starting {
@@ -1261,7 +1284,7 @@ where
                     loaded,
                     task_group,
                     role,
-                    error,
+                    wyr1_test_restart_stage(error, 2),
                 ));
             }
             let deadline = match now.checked_add(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns) {
@@ -1309,7 +1332,7 @@ where
                             loaded,
                             task_group,
                             role,
-                            error,
+                            wyr1_test_restart_stage(error, 3),
                         ));
                     }
                     match supervise_ready_child_profile(
@@ -1350,7 +1373,7 @@ where
                                     loaded,
                                     task_group,
                                     role,
-                                    error,
+                                    wyr1_test_restart_stage(error, 4),
                                 ));
                             }
                             complete_native_cleanup(
@@ -1607,6 +1630,7 @@ fn complete_native_cleanup<S: InitPlatform, W: SupervisionPlatform<Error = Nativ
             match controller.cleanup_complete(role, generation, transaction, retired_at) {
                 Ok(()) => Ok(()),
                 Err(error) => {
+                    let error = wyr1_test_restart_stage(error, 5);
                     let retirement = controller.retire_attempt_after_fatal(role);
                     match retirement {
                         Ok(()) => Err(error),
@@ -2155,5 +2179,8 @@ mod native_cleanup_tests {
             )),
             0xAF12_0009
         );
+        let staged =
+            wyr1_test_restart_stage(InitError::Restart(RestartTransitionError::InvalidState), 3);
+        assert_eq!(wyr1_test_failure_application_status(&staged), 0xAF13_0303);
     }
 }
