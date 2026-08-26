@@ -404,7 +404,7 @@ pub fn build_bootfs(request: &Request) -> Result<ProductIdentities, Failure> {
         sha256::bytes_digest_array(&shell),
     ];
     let gate_config = gate_config_for_request(request);
-    let builder = fixed_builder(&expected, role_hashes)?;
+    let builder = fixed_builder_for_profile(&expected, role_hashes, StartupProfile::EarlyBootStub)?;
     let structural_manifest = builder.build_structural().map_err(|error| {
         Failure::task(format!("WYR1 structural manifest build failed: {error:?}"))
     })?;
@@ -460,9 +460,10 @@ pub fn build_bootfs(request: &Request) -> Result<ProductIdentities, Failure> {
     })
 }
 
-fn fixed_builder(
+pub(super) fn fixed_builder_for_profile(
     boot_generation: &[u8; 32],
     role_hashes: [[u8; 32]; 5],
+    registry_profile: StartupProfile,
 ) -> Result<Builder<'static>, Failure> {
     let mut builder = Builder::new(*boot_generation);
     let roles = [
@@ -471,7 +472,7 @@ fn fixed_builder(
             "system/registryd",
             ROLE_JUSTIFICATIONS[0],
             Activation::Early,
-            StartupProfile::EarlyBootStub,
+            registry_profile,
         ),
         (
             RoleId::Devmgr,
@@ -1403,10 +1404,11 @@ mod tests {
         let shell = b"shell".as_slice();
         let gate = b"gate".as_slice();
         let role_hashes = [registryd, devmgr, uart, console, shell].map(sha256_bytes);
-        let manifest = fixed_builder(&boot_generation, role_hashes)
-            .unwrap()
-            .build_structural()
-            .unwrap();
+        let manifest =
+            fixed_builder_for_profile(&boot_generation, role_hashes, StartupProfile::EarlyBootStub)
+                .unwrap()
+                .build_structural()
+                .unwrap();
         let archive = build_archive(
             [init, registryd, devmgr, uart, console, shell],
             &manifest,

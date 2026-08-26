@@ -73,7 +73,7 @@ impl<'a> Builder<'a> {
     }
 
     /// Encodes structurally valid WRRM v1 bytes without claiming that they
-    /// satisfy the exact initial WYR1-A product profile or retained closure.
+    /// satisfy either exact WYR1 product profile or retained closure.
     /// Production image construction must use [`Self::build_wyr1a_product`].
     pub fn build_structural(&self) -> Result<Vec<u8>, BuildError> {
         let mut roles = Vec::new();

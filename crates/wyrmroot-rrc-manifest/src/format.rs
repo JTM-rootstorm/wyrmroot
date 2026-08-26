@@ -79,7 +79,7 @@ impl Activation {
     }
 }
 
-/// Child startup profile assigned by the reached WYR1-A contract.
+/// Child startup profile assigned by the reached WYR1 retained-role contracts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]
 pub enum StartupProfile {

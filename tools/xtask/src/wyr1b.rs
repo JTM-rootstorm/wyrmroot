@@ -6,12 +6,14 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+use crate::wyr1::fixed_builder_for_profile;
 use crate::{error::Failure, sha256};
 use wyrmroot_bootfs::{
     archive::Archive,
     launch_policy::{LaunchPolicy, LaunchPolicyEntry, encode as encode_policy},
     wyr1::{Product, ProductB, build_b},
 };
+use wyrmroot_rrc_manifest::{Activation, Manifest, RoleId, StartupProfile};
 
 pub const SCHEMA: u32 = 6;
 pub const SELECTOR: &str = "bootstrap-registry-launch";
@@ -99,7 +101,7 @@ pub fn load(path: &Path) -> Result<Request, Failure> {
         uart16550d: input(parent, required(&values, "uart16550d")?),
         consoled: input(parent, required(&values, "consoled")?),
         wyrmsh: input(parent, required(&values, "wyrmsh")?),
-        rrc_manifest: input(parent, required(&values, "rrc_manifest")?),
+        rrc_manifest: output(parent, required(&values, "rrc_manifest")?)?,
         hello: input(parent, required(&values, "hello")?),
         publisher: input(parent, required(&values, "publisher")?),
         client: input(parent, required(&values, "client")?),
@@ -108,8 +110,14 @@ pub fn load(path: &Path) -> Result<Request, Failure> {
         evidence_nonce: nonce(required(&values, "evidence_nonce")?)?,
     };
     if request.bootfs == request.receipt
+        || request.bootfs == request.rrc_manifest
+        || request.receipt == request.rrc_manifest
         || request.bootfs.starts_with(&request.receipt)
         || request.receipt.starts_with(&request.bootfs)
+        || request.bootfs.starts_with(&request.rrc_manifest)
+        || request.rrc_manifest.starts_with(&request.bootfs)
+        || request.receipt.starts_with(&request.rrc_manifest)
+        || request.rrc_manifest.starts_with(&request.receipt)
     {
         return Err(Failure::task("WYR1-B outputs overlap"));
     }
@@ -124,11 +132,26 @@ pub fn build(path: &Path) -> Result<String, Failure> {
     let uart = read(&request.uart16550d, "uart16550d")?;
     let console = read(&request.consoled, "consoled")?;
     let shell = read(&request.wyrmsh, "wyrmsh")?;
-    let manifest = read(&request.rrc_manifest, "rrc manifest")?;
     let hello = read(&request.hello, "hello")?;
     let publisher = read(&request.publisher, "publisher")?;
     let client = read(&request.client, "client")?;
     let boot_generation = decode_digest(&request.request_sha256)?;
+    let role_hashes = [
+        sha256::bytes_digest_array(&registryd),
+        sha256::bytes_digest_array(&devmgr),
+        sha256::bytes_digest_array(&uart),
+        sha256::bytes_digest_array(&console),
+        sha256::bytes_digest_array(&shell),
+    ];
+    let manifest = fixed_builder_for_profile(
+        &boot_generation,
+        role_hashes,
+        StartupProfile::BootstrapRegistry,
+    )?
+    .build_structural()
+    .map_err(|error| Failure::task(format!("WYR1-B manifest build failed: {error:?}")))?;
+    fs::write(&request.rrc_manifest, &manifest)
+        .map_err(|error| Failure::task(format!("could not write WYR1-B manifest: {error}")))?;
     let policy_entry = LaunchPolicyEntry {
         path: "bin/hello",
         content_sha256: sha256::bytes_digest_array(&hello),
@@ -173,6 +196,7 @@ pub fn build(path: &Path) -> Result<String, Failure> {
         .map_err(|error| Failure::task(format!("could not reread WYR1-B bootfs: {error}")))?;
     verify_archive(
         &observed,
+        &boot_generation,
         &hello,
         &publisher,
         &client,
@@ -185,6 +209,7 @@ pub fn build(path: &Path) -> Result<String, Failure> {
     let receipt = receipt(
         &request,
         &observed,
+        &manifest,
         policy,
         b_gate.as_bytes(),
         &hello,
@@ -216,6 +241,7 @@ pub fn inspect(path: &Path) -> Result<String, Failure> {
     }
     let archive = Archive::new(&bootfs)
         .map_err(|error| Failure::task(format!("WYR1-B archive invalid: {error:?}")))?;
+    verify_manifest_profile(&archive, &decode_digest(&request.request_sha256)?)?;
     if archive.entries().count() != 13 {
         return Err(Failure::task(
             "WYR1-B archive must contain exactly 13 entries",
@@ -254,6 +280,7 @@ pub fn evidence(request: &Path, log: &Path) -> Result<String, Failure> {
 
 fn verify_archive(
     bootfs: &[u8],
+    boot_generation: &[u8; 32],
     hello: &[u8],
     publisher: &[u8],
     client: &[u8],
@@ -262,6 +289,7 @@ fn verify_archive(
 ) -> Result<(), Failure> {
     let archive = Archive::new(bootfs)
         .map_err(|error| Failure::task(format!("WYR1-B archive invalid: {error:?}")))?;
+    verify_manifest_profile(&archive, boot_generation)?;
     for (path, bytes, executable) in [
         ("bin/hello", hello, true),
         ("test/wyr1-b/publisher", publisher, true),
@@ -282,9 +310,35 @@ fn verify_archive(
     Ok(())
 }
 
+fn verify_manifest_profile(
+    archive: &Archive<'_>,
+    boot_generation: &[u8; 32],
+) -> Result<(), Failure> {
+    let entry = archive
+        .lookup(wyrmroot_rrc_manifest::MANIFEST_PATH.as_bytes())
+        .map_err(|error| Failure::task(format!("WYR1-B manifest missing: {error:?}")))?;
+    let manifest = Manifest::parse_structural(entry.data(), boot_generation)
+        .map_err(|error| Failure::task(format!("WYR1-B manifest invalid: {error:?}")))?;
+    let registry = manifest
+        .role(RoleId::Registryd)
+        .ok_or_else(|| Failure::task("WYR1-B registry role missing"))?;
+    let devmgr = manifest
+        .role(RoleId::Devmgr)
+        .ok_or_else(|| Failure::task("WYR1-B devmgr role missing"))?;
+    if registry.activation() != Activation::Early
+        || registry.startup_profile() != StartupProfile::BootstrapRegistry
+        || devmgr.activation() != Activation::Early
+        || devmgr.startup_profile() != StartupProfile::EarlyBootStub
+    {
+        return Err(Failure::task("WYR1-B retained-role profile drifted"));
+    }
+    Ok(())
+}
+
 fn receipt(
     request: &Request,
     bootfs: &[u8],
+    manifest: &[u8],
     policy: &[u8],
     gate: &[u8],
     hello: &[u8],
@@ -292,13 +346,14 @@ fn receipt(
     client: &[u8],
 ) -> String {
     format!(
-        "kind = \"wyrmroot-wyr1-b-build-lineage\"\nschema_version = 6\nselector = \"{}\"\ntest_id = 27\nrequest_sha256 = \"{}\"\ndeepwyrm_revision = \"{}\"\nwyrmroot_revision = \"{}\"\nrust_revision = \"{}\"\nbootfs_sha256 = \"{}\"\nlaunch_policy_sha256 = \"{}\"\ngate_sha256 = \"{}\"\nhello_sha256 = \"{}\"\npublisher_sha256 = \"{}\"\nclient_sha256 = \"{}\"\n",
+        "kind = \"wyrmroot-wyr1-b-build-lineage\"\nschema_version = 6\nselector = \"{}\"\ntest_id = 27\nrequest_sha256 = \"{}\"\ndeepwyrm_revision = \"{}\"\nwyrmroot_revision = \"{}\"\nrust_revision = \"{}\"\nbootfs_sha256 = \"{}\"\nrrc_manifest_sha256 = \"{}\"\nlaunch_policy_sha256 = \"{}\"\ngate_sha256 = \"{}\"\nhello_sha256 = \"{}\"\npublisher_sha256 = \"{}\"\nclient_sha256 = \"{}\"\n",
         SELECTOR,
         request.request_sha256,
         request.deepwyrm_revision,
         request.wyrmroot_revision,
         request.rust_revision,
         sha256::bytes_digest(bootfs),
+        sha256::bytes_digest(manifest),
         sha256::bytes_digest(policy),
         sha256::bytes_digest(gate),
         sha256::bytes_digest(hello),
@@ -474,5 +529,27 @@ mod tests {
         assert_eq!(verify_record(&record, 1, 0, 1), Ok(()));
         record[95] ^= 1;
         assert!(verify_record(&record, 1, 0, 1).is_err());
+    }
+
+    #[test]
+    fn selector_27_builder_uses_bootstrap_registry_without_changing_devmgr() {
+        let generation = [0x42; 32];
+        let manifest = fixed_builder_for_profile(
+            &generation,
+            [[1; 32], [2; 32], [3; 32], [4; 32], [5; 32]],
+            StartupProfile::BootstrapRegistry,
+        )
+        .unwrap()
+        .build_structural()
+        .unwrap();
+        let parsed = Manifest::parse_structural(&manifest, &generation).unwrap();
+        assert_eq!(
+            parsed.role(RoleId::Registryd).unwrap().startup_profile(),
+            StartupProfile::BootstrapRegistry
+        );
+        assert_eq!(
+            parsed.role(RoleId::Devmgr).unwrap().startup_profile(),
+            StartupProfile::EarlyBootStub
+        );
     }
 }
