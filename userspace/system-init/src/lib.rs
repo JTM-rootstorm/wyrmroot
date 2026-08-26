@@ -92,13 +92,13 @@ pub const fn wyr1_test_failure_application_status(error: &InitError) -> u32 {
         InitError::ResourcesAlreadyInstalled => 0x05,
         InitError::ResourceIdentityMismatch => 0x06,
         InitError::InvalidResourceHandle => 0x07,
-        InitError::Restart(error) => {
-            return 0xAF12_0000 | wyr1_test_restart_failure_category(*error);
-        }
+        InitError::Restart(_) => 0x08,
         InitError::Wyr1TestRestart(stage, error) => {
-            return 0xAF13_0000
-                | ((*stage as u32) << 8)
-                | wyr1_test_restart_failure_category(*error);
+            let reason = match error {
+                RestartTransitionError::InvalidState => 0x03,
+                _ => 0xff,
+            };
+            return 0xAF13_0000 | ((*stage as u32) << 8) | reason;
         }
         InitError::Bootfs(_) => 0x09,
         InitError::MissingRetainedMaterial => 0x0a,
@@ -118,41 +118,6 @@ pub const fn wyr1_test_failure_application_status(error: &InitError) -> u32 {
         InitError::Evidence(_) => 0x18,
     };
     0xAF11_0000 | category
-}
-
-#[cfg(feature = "wyr1-test-evidence")]
-const fn wyr1_test_restart_failure_category(error: RestartTransitionError) -> u32 {
-    match error {
-        RestartTransitionError::InvalidPolicy => 0x01,
-        RestartTransitionError::ZeroIdentity => 0x02,
-        RestartTransitionError::InvalidState => 0x03,
-        RestartTransitionError::StaleGeneration => 0x04,
-        RestartTransitionError::TransactionMismatch => 0x05,
-        RestartTransitionError::DeadlineNotReached => 0x06,
-        RestartTransitionError::DeadlineExpired => 0x07,
-        RestartTransitionError::DeadlineMismatch => 0x08,
-        RestartTransitionError::TimeRegression => 0x09,
-        RestartTransitionError::GenerationNotAdvanced => 0x0a,
-        RestartTransitionError::ArithmeticOverflow => 0x0b,
-        RestartTransitionError::HistoryExhausted => 0x0c,
-        RestartTransitionError::AttemptFailed(failure) => {
-            0x20 | match failure {
-                AttemptFailure::CreationFailed => 0x01,
-                AttemptFailure::StartFailed => 0x02,
-                AttemptFailure::ExitBeforeReady(_) => 0x03,
-                AttemptFailure::MalformedReady => 0x04,
-                AttemptFailure::DuplicateReady => 0x05,
-                AttemptFailure::ReadinessFailedAfterExit => 0x06,
-                AttemptFailure::WrongTransactionReady => 0x07,
-                AttemptFailure::PeerClosedBeforeReady => 0x08,
-                AttemptFailure::WaitFailed => 0x09,
-                AttemptFailure::ExitQueryFailed => 0x0a,
-                AttemptFailure::ReadyTimeout => 0x0b,
-                AttemptFailure::ExitAfterReady(_) => 0x0c,
-                AttemptFailure::Cancelled => 0x0d,
-            }
-        }
-    }
 }
 
 #[cfg(feature = "wyr1-test-evidence")]
@@ -2166,18 +2131,6 @@ mod native_cleanup_tests {
         assert_eq!(
             wyr1_test_failure_application_status(&InitError::WrongActivationOrder),
             0xAF11_0003
-        );
-        assert_eq!(
-            wyr1_test_failure_application_status(&InitError::Restart(
-                RestartTransitionError::AttemptFailed(AttemptFailure::ReadyTimeout)
-            )),
-            0xAF12_002b
-        );
-        assert_eq!(
-            wyr1_test_failure_application_status(&InitError::Restart(
-                RestartTransitionError::TimeRegression
-            )),
-            0xAF12_0009
         );
         let staged =
             wyr1_test_restart_stage(InitError::Restart(RestartTransitionError::InvalidState), 3);
