@@ -526,23 +526,10 @@ impl SystemInit {
         registry_generation: u64,
         registry_transaction: u64,
     ) -> Result<(), InitError> {
-        let registry_record = self.roles[0]
-            .restart
-            .history()
-            .as_slice()
-            .last()
-            .and_then(|record| *record)
-            .ok_or(InitError::WrongActivationOrder)?;
         if self.mode != SystemMode::ActivatingEarlyRoles
             || !self.activated[0]
-            || self.roles[0].restart.state() != RestartState::Stopped
+            || !self.exact_clean_exit(0, now, registry_generation, registry_transaction)
             || self.roles[1].restart.state() != RestartState::Stopped
-            || registry_record.generation != registry_generation
-            || registry_record.transaction_id != registry_transaction
-            || registry_record.failure
-                != AttemptFailure::ExitAfterReady(TerminalDisposition::NormalExit(0))
-            || registry_record.cleanup != CleanupDisposition::Complete
-            || now <= registry_record.terminal_at_ns
         {
             return Err(InitError::WrongActivationOrder);
         }
@@ -560,30 +547,35 @@ impl SystemInit {
         devmgr_generation: u64,
         devmgr_transaction: u64,
     ) -> Result<(), InitError> {
-        let devmgr_record = self.roles[1]
-            .restart
-            .history()
-            .as_slice()
-            .last()
-            .and_then(|record| *record)
-            .ok_or(InitError::WrongActivationOrder)?;
         if self.mode != SystemMode::ActivatingEarlyRoles
-            || !self.activated.iter().all(|activated| *activated)
-            || self
-                .roles
-                .iter()
-                .any(|role| role.restart.state() != RestartState::Stopped)
-            || devmgr_record.generation != devmgr_generation
-            || devmgr_record.transaction_id != devmgr_transaction
-            || devmgr_record.failure
-                != AttemptFailure::ExitAfterReady(TerminalDisposition::NormalExit(0))
-            || devmgr_record.cleanup != CleanupDisposition::Complete
-            || now <= devmgr_record.terminal_at_ns
+            || !self.activated[0]
+            || !self.activated[1]
+            || self.roles[0].restart.state() != RestartState::Stopped
+            || !self.exact_clean_exit(1, now, devmgr_generation, devmgr_transaction)
         {
             return Err(InitError::WrongActivationOrder);
         }
         self.mode = SystemMode::Normal;
         Ok(())
+    }
+
+    #[inline(never)]
+    fn exact_clean_exit(&self, index: usize, now: u64, generation: u64, transaction: u64) -> bool {
+        self.roles[index].restart.state() == RestartState::Stopped
+            && self.roles[index]
+                .restart
+                .history()
+                .as_slice()
+                .last()
+                .and_then(|record| *record)
+                .is_some_and(|record| {
+                    record.generation == generation
+                        && record.transaction_id == transaction
+                        && record.failure
+                            == AttemptFailure::ExitAfterReady(TerminalDisposition::NormalExit(0))
+                        && record.cleanup == CleanupDisposition::Complete
+                        && now > record.terminal_at_ns
+                })
     }
 
     pub fn install_attempt(&mut self, mut resources: AttemptResources) -> Result<(), InitError> {
