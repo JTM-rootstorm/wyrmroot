@@ -7,6 +7,7 @@ members = [
     "crates/wyrmroot-loader",
     "crates/wyrmroot-launch-proto",
     "crates/wyrmroot-registry-proto",
+    "crates/wyrmroot-wyr1b-gate-proto",
     "crates/wyrmroot-rrc-manifest",
     "crates/wyrmroot-runtime",
     "loader",
@@ -20,6 +21,7 @@ members = [
     "userspace/wyr1-retained-stubs",
     "userspace/loader-smoke",
     "userspace/registryd",
+    "userspace/wyr1b-gate",
 ]
 
 [workspace.package]

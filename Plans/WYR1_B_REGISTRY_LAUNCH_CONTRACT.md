@@ -411,7 +411,133 @@ neither leaked children nor ambient cross-connection kill authority.
 `wyrmroot-runtime` may gain reusable bounded Channel/wait/task wrappers but must
 not become registryd, a service manager, or a dependency controller.
 
-## 11. Product and evidence
+## 11. Selector-27 test actors and WRTG v1
+
+Slice B fixes one test-private echo service named `test.wyr1-b.echo`, protocol
+ID wire spelling `WYR1ECHO` (`0x4F48_4345_3152_5957`), and version `1.0`.
+Its supervisor role ID is test-private `0xFFFF001B`; policy must reject that
+role from RRC-A even when the gate artifacts are present in acceptance media.
+
+`wyrmroot-wyr1b-gate-proto` is a dependency-free, allocation-free, `no_std`,
+forbid-unsafe codec. Every handle-free WRTG v1 datagram is exactly 96 bytes:
+
+| Offset | Width | Field |
+| ---: | ---: | --- |
+| 0 | 4 | magic `WRTG` |
+| 4 | 2 | major `1` |
+| 6 | 2 | minor `0` |
+| 8 | 4 | message type |
+| 12 | 4 | flags, zero |
+| 16 | 4 | size, exactly 96 |
+| 20 | 4 | handle count, zero |
+| 24 | 8 | nonzero nonce |
+| 32 | 8 | nonzero registry generation `R` |
+| 40 | 8 | actor ID |
+| 48 | 8 | actor generation |
+| 56 | 8 | object ID |
+| 64 | 8 | object generation |
+| 72 | 8 | operation ID |
+| 80 | 8 | value |
+| 88 | 8 | reserved, zero |
+
+Operations are fixed: `1` first registry generation, `2` replacement/stale,
+`3` normal job, `4` foreign probe, and `5` orphan. Values are zero except
+types 7 through 10, whose value is the exact challenge, and `FAILURE`, whose
+test-local diagnostic class is `1..=0xFFFF`. A failure class is never a
+`DwStatus` and never success evidence. The challenge is FNV-1a-64 over the
+little-endian u64 sequence `[nonce,R,C,CG,P,SG,op]`, offset basis
+`0xCBF29CE484222325`, prime `0x100000001B3`. The independent vector
+`[1,2,3,4,5,6,1]` yields `0x4322F6213655B843`.
+
+| Type | Name | Exact direction and meaning |
+| ---: | --- | --- |
+| 1 | `CONFIGURE_PUBLISHER` | init to publisher; `P/SG,C/CG`, op 1 or 2 |
+| 2 | `CONFIGURE_REGISTRY_CLIENT` | init to client; `C/CG,P/SG`, op 1 or 2 |
+| 3 | `CONFIGURE_LAUNCH_OWNER` | init to owner; `L/LG,0/0`, op 3 or 5 |
+| 4 | `CONFIGURE_LAUNCH_FOREIGN` | init to foreign; `F/FG,L/LG`, op 4 |
+| 5 | `PUBLISHED` | publisher to init, mirrors type 1 |
+| 6 | `CONNECTED` | client to init, mirrors type 2 |
+| 7 | `DIRECT_CHALLENGE` | client to direct Channel, `C/CG,P/SG`, exact challenge |
+| 8 | `DIRECT_ECHO` | publisher to direct Channel, `P/SG,C/CG`, exact challenge |
+| 9 | `ECHOED` | publisher to init, exact type-8 challenge |
+| 10 | `EXCHANGED` | client to init, exact type-7 challenge |
+| 11 | `RETIRE` | init to P1; `P1/SG1,C/CG`, op 1 |
+| 12 | `RETIRED` | P1 to init, mirrors type 11 |
+| 13 | `PROBE_STALE` | init to old P1; `P1/SG1,P2/SG2`, op 2 |
+| 14 | `STALE_REJECTED` | P1 to init only after exact old-authority peer close |
+| 15 | `JOB_ACCEPTED` | owner to init; `L/LG,J/LG`, op 3 |
+| 16 | `JOB_RESULT` | owner to init only after normal exit 0 and cleanup 0 |
+| 17 | `PROBE_FOREIGN` | init to foreign; `F/FG,J/LG`, op 4 |
+| 18 | `FOREIGN_REJECTED` | foreign to init only after bounded WRLJ foreign-job `ERROR` |
+| 19 | `ORPHAN_DISCONNECTING` | owner to init; `L/LG,O/LG`, op 5, immediately before close |
+| 20 | `DONE` | init to configured child, object `0/0`, exact current op |
+| 255 | `FAILURE` | child to init, object `0/0`, bounded diagnostic only |
+
+Types 1-4, 11, 13, 17, and 20 exist only on the init-to-child parent
+Channel. Types 5, 6, 9, 10, 12, 14-16, 18, 19, and 255 exist only in the
+reverse direction. Types 7 and 8 exist only on the direct Channel. Actor and
+object identities are nonzero except the stated object `0/0` shapes. Types
+15, 16, and 19 additionally require object generation equal actor generation.
+Before configuration only, `FAILURE` may use actor/object `0/0`, operation 1;
+the parent Channel scopes that diagnostic and no success record may accompany
+it.
+
+The inherited bootstrap Channel becomes a test-only, post-exact-WRLP-READY
+WRTG control/report path. It transfers no WRTG handles and conveys no service,
+registry, or launch authority. WRLP-transferred publication, registry-client,
+and launch-session Channels remain the only authority. The shared client
+artifact stays unconfigured until type 2, 3, or 4 selects its actor mode.
+Bootstrap publisher and registry-client peers parse the exact Section 4
+startup-v2 correlation environment before their first WRRG send and construct
+every WRRG header from it.
+
+WRRG transaction IDs are stage-specific while WRTG operation IDs remain 1 or
+2. One RegistryClient uses lookup transaction 1 then 2 on the same installed
+endpoint. A publisher uses transaction `2*op-1` for `PUBLISH` (1 for P1, 3 for
+P2); P1 uses transaction `2*op` (2) for `RETIRE`. Replies and offers must match
+the exact stage transaction.
+
+Init creates each Channel pair. WRLP MOVE transfers only the child endpoint.
+For lookup the client creates a broad-rights pair, retains the direct endpoint,
+and MOVEs the service endpoint to registryd with exact
+`READ|WRITE|WAIT|INSPECT|TRANSFER`. On failed MOVE the client still owns and
+closes both endpoints exactly once. On success it never closes the moved
+endpoint; registryd owns it, reduces the forwarded endpoint to exact child
+rights, and closes it exactly once on a failed forward. Publisher/client
+rejection paths freshly validate received metadata and object info and close
+rejected handles exactly once.
+
+P1 accepts retirement only after the exact direct exchange. Its later
+peer-close proof depends explicitly on Slice C making registry retirement
+close the old publication endpoint; Slice B does not patch registryd or claim
+integrated retirement/replacement. P2 accepts exact op-2 `DONE` after exchange
+without waiting for retirement. Types 15 through 19 are host-model-only until
+Slice F supplies native WRLJ task execution; no launch success is claimed here.
+
+### 11.1 WRB1 relational meanings
+
+The existing 14 WRB1 event labels are not standalone booleans. A later
+controller producer may emit them only after these joins are proven:
+
+1. `RegistryReady`: exact resident registryd WRLP READY and installed registry generation.
+2. `PublisherReady`: exact publisher WRLP READY plus matching type-1 configuration.
+3. `ClientReady`: exact client WRLP READY plus matching type-2 configuration.
+4. `Published`: matching WRRG `PUBLISH/PUBLISHED` stage transaction and WRTG type 5.
+5. `Connected`: matching WRRG lookup/offer/connected authority move and WRTG type 6.
+6. `DirectExchange`: one identical computed challenge joined across WRTG types 7-10.
+7. `Retired`: exact P1 WRRG retirement transaction joined with WRTG types 11-12.
+8. `StaleRejected`: old-authority peer-close failure joined with WRTG types 13-14, never `ERROR` or success.
+9. `JobAccepted`: owner-scoped WRLJ acceptance joined with WRTG type 15.
+10. `JobExitZero`: exact structured WRLJ normal exit 0 and cleanup 0 joined with type 16.
+11. `JobReaped`: the accepted normal job's controller-owned terminal cleanup and exact reap.
+12. `ForeignRejected`: type-17 command, bounded foreign-job WRLJ `ERROR`, then once-only type 18.
+13. `OrphanReaped`: type 19 before session close, retained ownership, terminal observation, and exact reap.
+14. `Terminal`: all required prior joins, exact sequence/cardinality, and no `FAILURE`.
+
+Slice B documents these meanings but adds no WRB1 producer and makes no
+selector-27 evidence, receipt, or live-acceptance claim.
+
+## 12. Product and evidence
 
 WYR1-B introduces:
 
@@ -431,7 +557,7 @@ Test clients and gate configuration are test content, not RRC-A merely because
 they appear in acceptance media. The RRC manifest retains only components that
 pass its recovery dependency-cycle admission test.
 
-## 12. Validation
+## 13. Validation
 
 Host/model tests must cover:
 
@@ -470,7 +596,7 @@ Selector-25 normal/degraded default/SMP acceptance is rerun as regression.
 WYR1-B does not claim DW1-C SMP scheduling, WYR1-C device coordination,
 WYR1-D stream semantics, or WYR1-E interactive shell behavior.
 
-## 13. Required-source and provenance disposition
+## 14. Required-source and provenance disposition
 
 The root WYR1-B plan, Bootstrap and Recovery Architecture, Wyrmroot architecture
 index/platform conventions, reached WYR1-A contract/validation, WYR0-D/E/I

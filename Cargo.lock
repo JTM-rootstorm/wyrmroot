@@ -303,6 +303,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrmroot-wyr1b-gate"
+version = "0.0.0"
+dependencies = [
+ "deepwyrm-syscall",
+ "wyrmroot-launch-proto",
+ "wyrmroot-loader",
+ "wyrmroot-registry-proto",
+ "wyrmroot-runtime",
+ "wyrmroot-wyr1b-gate-proto",
+]
+
+[[package]]
+name = "wyrmroot-wyr1b-gate-proto"
+version = "0.0.0"
+
+[[package]]
 name = "xtask"
 version = "0.0.0"
 dependencies = [

@@ -1,0 +1,40 @@
+[package]
+name = "wyrmroot-wyr1b-gate"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+description = "Independent selector-27 publisher and client gate actors"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "wyr1-b-publisher"
+path = "src/publisher.rs"
+test = false
+bench = false
+required-features = ["native-gate"]
+
+[[bin]]
+name = "wyr1-b-client"
+path = "src/client.rs"
+test = false
+bench = false
+required-features = ["native-gate"]
+
+[features]
+default = []
+native-gate = ["dep:deepwyrm-syscall", "dep:wyrmroot-loader", "dep:wyrmroot-runtime"]
+
+[dependencies]
+deepwyrm-syscall = { workspace = true, optional = true }
+wyrmroot-launch-proto = { path = "../../crates/wyrmroot-launch-proto" }
+wyrmroot-loader = { path = "../../crates/wyrmroot-loader", optional = true }
+wyrmroot-registry-proto = { path = "../../crates/wyrmroot-registry-proto" }
+wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime", optional = true }
+wyrmroot-wyr1b-gate-proto = { path = "../../crates/wyrmroot-wyr1b-gate-proto" }
+
+[lints.rust]
+unsafe_code = "deny"
+unused_crate_dependencies = "deny"

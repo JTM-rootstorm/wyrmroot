@@ -1,0 +1,399 @@
+#![no_std]
+#![no_main]
+#![deny(unsafe_code)]
+
+use core::panic::PanicInfo;
+
+use deepwyrm_syscall::{
+    DW_DEADLINE_INFINITE, DW_HANDLE_TRANSFER_MOVE, DW_OBJECT_TYPE_ADDRESS_REGION,
+    DW_OBJECT_TYPE_CHANNEL, DW_RIGHT_INSPECT, DW_RIGHT_READ, DW_RIGHT_TRANSFER, DW_RIGHT_WAIT,
+    DW_RIGHT_WRITE, DW_SIGNAL_READABLE, DwHandle, DwHandleTransferV1, DwObjectType,
+    DwReceivedHandleInfoV1, DwRights,
+};
+use wyrmroot_launch_proto as _;
+use wyrmroot_loader::launch::{
+    CHILD_CHANNEL_RIGHTS, HEADER_BYTES as WRLP_BYTES, LaunchProfile, SELF_ROOT_RIGHTS,
+    encode_ready_for_profile, parse_init,
+};
+use wyrmroot_registry_proto::{
+    Lookup, Message, MessageType as RegistryType, ProtocolVersion, encode_lookup, parse,
+    parse_correlation_environment,
+};
+use wyrmroot_runtime::{
+    BOOTSTRAP_CHANNEL_EXPECTATION, StartupBlock, close_handle, create_channel, panic_abort,
+    query_capability_info, receive_channel, send_channel, validate_bootstrap_channel, wait_one,
+};
+use wyrmroot_wyr1b_gate::{Client, ClientAction};
+use wyrmroot_wyr1b_gate_proto::{
+    Direction, ECHO_PROTOCOL_ID, ECHO_SERVICE_NAME, ECHO_VERSION_MAJOR, ECHO_VERSION_MINOR,
+    MessageType, RECORD_BYTES, Record, encode, parse_for,
+};
+
+const BROAD_CHANNEL_RIGHTS: DwRights = DwRights(
+    DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_WAIT.0 | DW_RIGHT_INSPECT.0 | DW_RIGHT_TRANSFER.0,
+);
+const CLIENT_ERROR_BASE: u32 = 0xB103_0000;
+
+fn client_main(startup: StartupBlock<'_>) -> u32 {
+    match run(startup) {
+        Ok(code) => code,
+        Err(code) => {
+            if let Some(registry_generation) = startup_registry_generation(startup) {
+                let _ = send_failure(
+                    startup.bootstrap_channel().as_abi(),
+                    None,
+                    registry_generation,
+                    code,
+                );
+            }
+            code
+        }
+    }
+}
+
+fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
+    let parent = startup.bootstrap_channel().as_abi();
+    validate_bootstrap_channel(
+        query_capability_info(parent).map_err(|_| CLIENT_ERROR_BASE + 0x0001)?,
+        BOOTSTRAP_CHANNEL_EXPECTATION,
+    )
+    .map_err(|_| CLIENT_ERROR_BASE + 0x0002)?;
+    wait_readable(parent, CLIENT_ERROR_BASE + 0x0003)?;
+    let mut init = [0u8; 64];
+    let mut handles = [DwReceivedHandleInfoV1::default(); 2];
+    let counts =
+        receive_channel(parent, &mut init, &mut handles).map_err(|_| CLIENT_ERROR_BASE + 0x0004)?;
+    if counts.bytes > init.len() || counts.handles != 2 {
+        close_received(&handles, counts.handles);
+        return Err(CLIENT_ERROR_BASE + 0x0005);
+    }
+    let bytes = &init[..counts.bytes];
+    let profile = if parse_init(LaunchProfile::RegistryClient, bytes, &handles).is_ok() {
+        LaunchProfile::RegistryClient
+    } else if parse_init(LaunchProfile::LaunchClient, bytes, &handles).is_ok() {
+        LaunchProfile::LaunchClient
+    } else {
+        close_received(&handles, 2);
+        return Err(CLIENT_ERROR_BASE + 0x0006);
+    };
+    let parsed = match parse_init(profile, bytes, &handles) {
+        Ok(parsed) => parsed,
+        Err(_) => {
+            close_received(&handles, 2);
+            return Err(CLIENT_ERROR_BASE + 0x0007);
+        }
+    };
+    if validate_fresh(handles[0], DW_OBJECT_TYPE_ADDRESS_REGION, SELF_ROOT_RIGHTS).is_err()
+        || validate_fresh(handles[1], DW_OBJECT_TYPE_CHANNEL, CHILD_CHANNEL_RIGHTS).is_err()
+    {
+        close_received(&handles, 2);
+        return Err(CLIENT_ERROR_BASE + 0x0018);
+    }
+
+    let mut actor = if profile == LaunchProfile::RegistryClient {
+        if startup.envc() != 3 {
+            close_received(&handles, 2);
+            return Err(CLIENT_ERROR_BASE + 0x0008);
+        }
+        let environment = [
+            startup.env(0).ok_or(CLIENT_ERROR_BASE + 0x0009)?.as_str(),
+            startup.env(1).ok_or(CLIENT_ERROR_BASE + 0x0009)?.as_str(),
+            startup.env(2).ok_or(CLIENT_ERROR_BASE + 0x0009)?.as_str(),
+        ];
+        match Client::registry_from_environment(&environment) {
+            Ok(actor) => actor,
+            Err(_) => {
+                close_received(&handles, 2);
+                return Err(CLIENT_ERROR_BASE + 0x000A);
+            }
+        }
+    } else {
+        if startup.envc() != 0 {
+            close_received(&handles, 2);
+            return Err(CLIENT_ERROR_BASE + 0x000B);
+        }
+        Client::launch()
+    };
+
+    let mut ready = [0u8; WRLP_BYTES];
+    let size = match encode_ready_for_profile(profile, parsed.transaction_id, &mut ready) {
+        Ok(size) => size,
+        Err(_) => {
+            close_received(&handles, 2);
+            return Err(CLIENT_ERROR_BASE + 0x000C);
+        }
+    };
+    if send_channel(parent, &ready[..size], &[]).is_err() {
+        close_received(&handles, 2);
+        return Err(CLIENT_ERROR_BASE + 0x000D);
+    }
+    if close_handle(handles[0].handle).is_err() {
+        let _ = close_handle(handles[1].handle);
+        return Err(CLIENT_ERROR_BASE + 0x000E);
+    }
+    let authority = handles[1].handle;
+
+    if profile == LaunchProfile::RegistryClient {
+        if let Err(code) = registry_cycles(parent, authority, &mut actor) {
+            let _ = close_handle(authority);
+            return Err(code);
+        }
+    } else {
+        // Slice B freezes and validates launch-client CONFIGURE state only. Native WRLJ
+        // execution is deliberately owned by Slice F.
+        let configure = receive_record(parent, Direction::InitToChild, CLIENT_ERROR_BASE + 0x0010)?;
+        match actor
+            .configure(configure)
+            .map_err(|_| CLIENT_ERROR_BASE + 0x0011)?
+        {
+            ClientAction::Launch | ClientAction::Configured => {}
+            _ => return Err(CLIENT_ERROR_BASE + 0x0012),
+        }
+        let code = CLIENT_ERROR_BASE + 0x001A;
+        let _ = send_failure(parent, Some(configure), configure.registry_generation, code);
+        let _ = close_handle(authority);
+        let _ = close_handle(parent);
+        return Err(code);
+    }
+    close_handle(authority).map_err(|_| CLIENT_ERROR_BASE + 0x0016)?;
+    close_handle(parent).map_err(|_| CLIENT_ERROR_BASE + 0x0017)?;
+    Ok(0)
+}
+
+fn registry_cycles(parent: DwHandle, registry: DwHandle, actor: &mut Client) -> Result<(), u32> {
+    for operation in 1..=2 {
+        let configure = receive_record(parent, Direction::InitToChild, CLIENT_ERROR_BASE + 0x0020)?;
+        if configure.operation_id != operation
+            || actor
+                .configure(configure)
+                .map_err(|_| CLIENT_ERROR_BASE + 0x0021)?
+                != ClientAction::Lookup
+        {
+            return Err(CLIENT_ERROR_BASE + 0x0022);
+        }
+        let (direct, service) = match create_channel(BROAD_CHANNEL_RIGHTS) {
+            Ok(pair) => pair,
+            Err(_) => {
+                let code = CLIENT_ERROR_BASE + 0x0023;
+                return Err(report_and_close(parent, configure, code));
+            }
+        };
+        let header = match actor.registry_header(RegistryType::LookupConnect) {
+            Ok(header) => header,
+            Err(_) => {
+                let _ = close_handle(service);
+                let _ = close_handle(direct);
+                let code = CLIENT_ERROR_BASE + 0x0024;
+                return Err(report_and_close(parent, configure, code));
+            }
+        };
+        let lookup = Lookup {
+            protocol_id: ECHO_PROTOCOL_ID,
+            version: ProtocolVersion {
+                major: ECHO_VERSION_MAJOR,
+                minor: ECHO_VERSION_MINOR,
+            },
+            service_name: ECHO_SERVICE_NAME,
+        };
+        let mut bytes = [0u8; 256];
+        let size = match encode_lookup(header, lookup, &mut bytes) {
+            Ok(size) => size,
+            Err(_) => {
+                let _ = close_handle(service);
+                let _ = close_handle(direct);
+                let code = CLIENT_ERROR_BASE + 0x0025;
+                return Err(report_and_close(parent, configure, code));
+            }
+        };
+        let transfer = DwHandleTransferV1 {
+            handle: service,
+            requested_rights: BROAD_CHANNEL_RIGHTS,
+            operation: DW_HANDLE_TRANSFER_MOVE,
+            reserved0: 0,
+            reserved: [0; 2],
+        };
+        if send_channel(registry, &bytes[..size], &[transfer]).is_err() {
+            let first = close_handle(service);
+            let second = close_handle(direct);
+            let code = if first.is_err() || second.is_err() {
+                CLIENT_ERROR_BASE + 0x0035
+            } else {
+                CLIENT_ERROR_BASE + 0x0026
+            };
+            return Err(report_and_close(parent, configure, code));
+        }
+
+        let cycle = (|| {
+            wait_readable(registry, CLIENT_ERROR_BASE + 0x0027)?;
+            let mut connected_bytes = [0u8; 72];
+            let counts = receive_channel(registry, &mut connected_bytes, &mut [])
+                .map_err(|_| CLIENT_ERROR_BASE + 0x0028)?;
+            let connected = parse(&connected_bytes[..counts.bytes], counts.handles)
+                .map_err(|_| CLIENT_ERROR_BASE + 0x0029)?;
+            if matches!(connected.message, Message::Error { .. }) {
+                return Err(CLIENT_ERROR_BASE + 0x0036);
+            }
+            if connected.header
+                != (wyrmroot_registry_proto::Header {
+                    message_type: RegistryType::Connected,
+                    ..header
+                })
+                || connected.message != Message::Connected
+            {
+                return Err(CLIENT_ERROR_BASE + 0x002A);
+            }
+            let (report, challenge) = actor.connected().map_err(|_| CLIENT_ERROR_BASE + 0x002B)?;
+            send_record(parent, report, CLIENT_ERROR_BASE + 0x002C)?;
+            send_record(direct, challenge, CLIENT_ERROR_BASE + 0x002D)?;
+            let echo = receive_record(
+                direct,
+                Direction::PublisherToDirect,
+                CLIENT_ERROR_BASE + 0x002E,
+            )?;
+            let exchanged = actor
+                .direct_echo(echo)
+                .map_err(|_| CLIENT_ERROR_BASE + 0x002F)?;
+            send_record(parent, exchanged, CLIENT_ERROR_BASE + 0x0030)
+        })();
+        let close = close_handle(direct);
+        if let Err(code) = cycle {
+            let _ = send_failure(parent, Some(configure), configure.registry_generation, code);
+            let _ = close_handle(parent);
+            return Err(code);
+        }
+        close.map_err(|_| CLIENT_ERROR_BASE + 0x0031)?;
+        if operation == 2 {
+            let done =
+                match receive_record(parent, Direction::InitToChild, CLIENT_ERROR_BASE + 0x0032) {
+                    Ok(done) => done,
+                    Err(code) => return Err(report_and_close(parent, configure, code)),
+                };
+            if done.message_type != MessageType::Done
+                || actor.done(done).map_err(|_| CLIENT_ERROR_BASE + 0x0033)
+                    != Ok(ClientAction::Done)
+            {
+                return Err(report_and_close(
+                    parent,
+                    configure,
+                    CLIENT_ERROR_BASE + 0x0034,
+                ));
+            }
+            return Ok(());
+        }
+    }
+    Err(CLIENT_ERROR_BASE + 0x0037)
+}
+
+fn receive_record(channel: DwHandle, direction: Direction, code: u32) -> Result<Record, u32> {
+    wait_readable(channel, code)?;
+    let mut bytes = [0u8; RECORD_BYTES];
+    let counts = receive_channel(channel, &mut bytes, &mut []).map_err(|_| code + 1)?;
+    if counts.bytes != RECORD_BYTES || counts.handles != 0 {
+        return Err(code + 2);
+    }
+    parse_for(&bytes, direction).map_err(|_| code + 3)
+}
+
+fn send_record(channel: DwHandle, record: Record, code: u32) -> Result<(), u32> {
+    let mut bytes = [0u8; RECORD_BYTES];
+    encode(record, &mut bytes).map_err(|_| code)?;
+    send_channel(channel, &bytes, &[]).map_err(|_| code + 1)
+}
+
+fn wait_readable(channel: DwHandle, code: u32) -> Result<(), u32> {
+    let observed = wait_one(channel, DW_SIGNAL_READABLE, DW_DEADLINE_INFINITE).map_err(|_| code)?;
+    if observed.observed.0 & DW_SIGNAL_READABLE.0 == 0 {
+        return Err(code + 1);
+    }
+    Ok(())
+}
+
+fn validate_fresh(
+    received: DwReceivedHandleInfoV1,
+    object_type: DwObjectType,
+    rights: DwRights,
+) -> Result<(), ()> {
+    if received.object_type != object_type || received.rights != rights {
+        return Err(());
+    }
+    let fresh = query_capability_info(received.handle).map_err(|_| ())?;
+    if fresh.object_type != object_type || fresh.rights != rights {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn close_received(handles: &[DwReceivedHandleInfoV1; 2], initialized: usize) {
+    for info in &handles[..initialized.min(handles.len())] {
+        let _ = close_handle(info.handle);
+    }
+}
+
+fn startup_registry_generation(startup: StartupBlock<'_>) -> Option<u64> {
+    if startup.envc() != 3 {
+        return None;
+    }
+    let entries = [
+        startup.env(0)?.as_str(),
+        startup.env(1)?.as_str(),
+        startup.env(2)?.as_str(),
+    ];
+    Some(
+        parse_correlation_environment(&entries)
+            .ok()?
+            .registry_generation,
+    )
+}
+
+fn send_failure(
+    parent: DwHandle,
+    configured: Option<Record>,
+    registry_generation: u64,
+    code: u32,
+) -> Result<(), ()> {
+    let value = match u64::from(code & 0xFFFF) {
+        0 => 1,
+        value => value,
+    };
+    let record = configured.map_or(
+        Record {
+            message_type: MessageType::Failure,
+            nonce: 1,
+            registry_generation,
+            actor_id: 0,
+            actor_generation: 0,
+            object_id: 0,
+            object_generation: 0,
+            operation_id: 1,
+            value,
+        },
+        |config| Record {
+            message_type: MessageType::Failure,
+            object_id: 0,
+            object_generation: 0,
+            value,
+            ..config
+        },
+    );
+    let mut bytes = [0; RECORD_BYTES];
+    encode(record, &mut bytes).map_err(|_| ())?;
+    send_channel(parent, &bytes, &[]).map_err(|_| ())
+}
+
+fn report_and_close(parent: DwHandle, configured: Record, code: u32) -> u32 {
+    let _ = send_failure(
+        parent,
+        Some(configured),
+        configured.registry_generation,
+        code,
+    );
+    let _ = close_handle(parent);
+    code
+}
+
+wyrmroot_runtime::native_entry!(crate::client_main);
+
+#[panic_handler]
+fn panic(_info: &PanicInfo<'_>) -> ! {
+    panic_abort()
+}
