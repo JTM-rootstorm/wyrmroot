@@ -9,6 +9,9 @@
 pub mod evidence;
 pub mod gate;
 
+#[cfg(feature = "wyr1-test-evidence")]
+use core::sync::atomic::{AtomicU8, Ordering};
+
 use crate::evidence::{EvidenceError, EvidenceEvent, EvidenceLog};
 use crate::gate::{GATE_CONFIG_PATH, GateConfig, GateConfigError, parse_gate_config};
 use deepwyrm_syscall::{
@@ -83,7 +86,14 @@ pub const fn fatal_application_status(_error: &InitError) -> InitApplicationStat
 /// diagnostic evidence, not part of the production application-status ABI.
 #[cfg(feature = "wyr1-test-evidence")]
 #[must_use]
-pub const fn wyr1_test_failure_application_status(error: &InitError) -> u32 {
+pub fn wyr1_test_failure_application_status(error: &InitError) -> u32 {
+    if matches!(
+        error,
+        InitError::Restart(RestartTransitionError::InvalidState)
+    ) {
+        let stage = WYR1_TEST_RESTART_STAGE.load(Ordering::Relaxed);
+        return 0xAF13_0003 | ((stage as u32) << 8);
+    }
     let category = match error {
         InitError::WrongManifestProfile => 0x01,
         InitError::UnlaunchableRole => 0x02,
@@ -93,13 +103,6 @@ pub const fn wyr1_test_failure_application_status(error: &InitError) -> u32 {
         InitError::ResourceIdentityMismatch => 0x06,
         InitError::InvalidResourceHandle => 0x07,
         InitError::Restart(_) => 0x08,
-        InitError::Wyr1TestRestart(stage, error) => {
-            let reason = match error {
-                RestartTransitionError::InvalidState => 0x03,
-                _ => 0xff,
-            };
-            return 0xAF13_0000 | ((*stage as u32) << 8) | reason;
-        }
         InitError::Bootfs(_) => 0x09,
         InitError::MissingRetainedMaterial => 0x0a,
         InitError::NonExecutableRole => 0x0b,
@@ -121,17 +124,15 @@ pub const fn wyr1_test_failure_application_status(error: &InitError) -> u32 {
 }
 
 #[cfg(feature = "wyr1-test-evidence")]
-fn wyr1_test_restart_stage(error: InitError, stage: u8) -> InitError {
-    match error {
-        InitError::Restart(error) => InitError::Wyr1TestRestart(stage, error),
-        error => error,
-    }
+static WYR1_TEST_RESTART_STAGE: AtomicU8 = AtomicU8::new(0);
+
+#[cfg(feature = "wyr1-test-evidence")]
+fn wyr1_test_set_restart_stage(stage: u8) {
+    WYR1_TEST_RESTART_STAGE.store(stage, Ordering::Relaxed);
 }
 
 #[cfg(not(feature = "wyr1-test-evidence"))]
-fn wyr1_test_restart_stage(error: InitError, _stage: u8) -> InitError {
-    error
-}
+fn wyr1_test_set_restart_stage(_stage: u8) {}
 
 /// Boot-lifetime owner of the fixed supervisor state and primordial authority.
 /// The immutable bootfs handle is retained and remapped narrowly for each load;
@@ -332,8 +333,6 @@ pub enum InitError {
     ResourceIdentityMismatch,
     InvalidResourceHandle,
     Restart(RestartTransitionError),
-    #[cfg(feature = "wyr1-test-evidence")]
-    Wyr1TestRestart(u8, RestartTransitionError),
     Bootfs(ParseError),
     MissingRetainedMaterial,
     NonExecutableRole,
@@ -1121,9 +1120,8 @@ where
         return Err(InitError::Supervision);
     }
     let now = system.now().map_err(InitError::Native)?;
-    controller
-        .begin_registry(now, 1, 0x1001)
-        .map_err(|error| wyr1_test_restart_stage(error, 1))?;
+    wyr1_test_set_restart_stage(1);
+    controller.begin_registry(now, 1, 0x1001)?;
     for role in [RoleId::Registryd, RoleId::Devmgr] {
         loop {
             let RestartState::Starting {
@@ -1168,6 +1166,7 @@ where
                             });
                         }
                     };
+                    wyr1_test_set_restart_stage(6);
                     if let Err(transition_error) = controller.fail(
                         role,
                         generation,
@@ -1175,7 +1174,6 @@ where
                         now,
                         AttemptFailure::CreationFailed,
                     ) {
-                        let transition_error = wyr1_test_restart_stage(transition_error, 6);
                         let close_failed = system.close_handle(task_group).is_err();
                         let release_failed = controller.abort_reservation(reservation).is_err();
                         controller.fatal();
@@ -1195,20 +1193,17 @@ where
                     let close_failed = system.close_handle(task_group).is_err();
                     if rollback_failed || close_failed {
                         let retired_at = now.checked_add(1).ok_or(InitError::Accounting)?;
-                        controller
-                            .cleanup_failed(role, generation, transaction_id, retired_at)
-                            .map_err(|error| wyr1_test_restart_stage(error, 7))?;
+                        wyr1_test_set_restart_stage(7);
+                        controller.cleanup_failed(role, generation, transaction_id, retired_at)?;
                         controller.fatal();
                         return Err(error);
                     }
                     controller.abort_reservation(reservation)?;
                     let retired_at = now.checked_add(1).ok_or(InitError::Accounting)?;
-                    controller
-                        .cleanup_complete(role, generation, transaction_id, retired_at)
-                        .map_err(|error| wyr1_test_restart_stage(error, 7))?;
-                    if advance_or_degrade(system, &mut controller, role, transaction_id)
-                        .map_err(|error| wyr1_test_restart_stage(error, 10))?
-                    {
+                    wyr1_test_set_restart_stage(7);
+                    controller.cleanup_complete(role, generation, transaction_id, retired_at)?;
+                    wyr1_test_set_restart_stage(10);
+                    if advance_or_degrade(system, &mut controller, role, transaction_id)? {
                         controller.finalize_evidence(RecoveryResult::Degraded)?;
                         return Ok((RecoveryResult::Degraded, controller));
                     }
@@ -1248,6 +1243,7 @@ where
                     ));
                 }
             };
+            wyr1_test_set_restart_stage(2);
             if let Err(error) = controller.child_started(role, generation, transaction_id, now) {
                 return Err(cleanup_after_transition_error(
                     system,
@@ -1256,7 +1252,7 @@ where
                     loaded,
                     task_group,
                     role,
-                    wyr1_test_restart_stage(error, 2),
+                    error,
                 ));
             }
             let deadline = match now.checked_add(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns) {
@@ -1296,6 +1292,7 @@ where
                             ));
                         }
                     };
+                    wyr1_test_set_restart_stage(3);
                     if let Err(error) = controller.ready(role, generation, transaction_id, now) {
                         return Err(cleanup_after_transition_error(
                             system,
@@ -1304,7 +1301,7 @@ where
                             loaded,
                             task_group,
                             role,
-                            wyr1_test_restart_stage(error, 3),
+                            error,
                         ));
                     }
                     match supervise_ready_child_profile(
@@ -1331,6 +1328,7 @@ where
                                     ));
                                 }
                             };
+                            wyr1_test_set_restart_stage(4);
                             if let Err(error) = controller.terminal(
                                 role,
                                 generation,
@@ -1345,7 +1343,7 @@ where
                                     loaded,
                                     task_group,
                                     role,
-                                    wyr1_test_restart_stage(error, 4),
+                                    error,
                                 ));
                             }
                             complete_native_cleanup(
@@ -1363,9 +1361,8 @@ where
                             if disposition == TerminalDisposition::NormalExit(0) {
                                 break;
                             }
-                            if advance_or_degrade(system, &mut controller, role, transaction_id)
-                                .map_err(|error| wyr1_test_restart_stage(error, 10))?
-                            {
+                            wyr1_test_set_restart_stage(10);
+                            if advance_or_degrade(system, &mut controller, role, transaction_id)? {
                                 controller.finalize_evidence(RecoveryResult::Degraded)?;
                                 return Ok((RecoveryResult::Degraded, controller));
                             }
@@ -1386,6 +1383,7 @@ where
                                     ));
                                 }
                             };
+                            wyr1_test_set_restart_stage(8);
                             if let Err(error) =
                                 controller.fail(role, generation, transaction_id, now, failure)
                             {
@@ -1396,7 +1394,7 @@ where
                                     loaded,
                                     task_group,
                                     role,
-                                    wyr1_test_restart_stage(error, 8),
+                                    error,
                                 ));
                             }
                             complete_native_cleanup(
@@ -1411,9 +1409,8 @@ where
                                 transaction_id,
                                 now,
                             )?;
-                            if advance_or_degrade(system, &mut controller, role, transaction_id)
-                                .map_err(|error| wyr1_test_restart_stage(error, 10))?
-                            {
+                            wyr1_test_set_restart_stage(10);
+                            if advance_or_degrade(system, &mut controller, role, transaction_id)? {
                                 controller.finalize_evidence(RecoveryResult::Degraded)?;
                                 return Ok((RecoveryResult::Degraded, controller));
                             }
@@ -1436,6 +1433,7 @@ where
                             ));
                         }
                     };
+                    wyr1_test_set_restart_stage(9);
                     if let Err(error) =
                         controller.ready_wait_failed(role, generation, transaction_id, now, failure)
                     {
@@ -1446,7 +1444,7 @@ where
                             loaded,
                             task_group,
                             role,
-                            wyr1_test_restart_stage(error, 9),
+                            error,
                         ));
                     }
                     complete_native_cleanup(
@@ -1461,9 +1459,8 @@ where
                         transaction_id,
                         now,
                     )?;
-                    if advance_or_degrade(system, &mut controller, role, transaction_id)
-                        .map_err(|error| wyr1_test_restart_stage(error, 10))?
-                    {
+                    wyr1_test_set_restart_stage(10);
+                    if advance_or_degrade(system, &mut controller, role, transaction_id)? {
                         controller.finalize_evidence(RecoveryResult::Degraded)?;
                         return Ok((RecoveryResult::Degraded, controller));
                     }
@@ -1605,10 +1602,10 @@ fn complete_native_cleanup<S: InitPlatform, W: SupervisionPlatform<Error = Nativ
     match cleanup_loaded(system, waits, loaded, task_group, terminate) {
         Ok(()) => {
             let retired_at = classified_at.checked_add(1).ok_or(InitError::Accounting)?;
+            wyr1_test_set_restart_stage(5);
             match controller.cleanup_complete(role, generation, transaction, retired_at) {
                 Ok(()) => Ok(()),
                 Err(error) => {
-                    let error = wyr1_test_restart_stage(error, 5);
                     let retirement = controller.retire_attempt_after_fatal(role);
                     match retirement {
                         Ok(()) => Err(error),
@@ -2145,8 +2142,12 @@ mod native_cleanup_tests {
             wyr1_test_failure_application_status(&InitError::WrongActivationOrder),
             0xAF11_0003
         );
-        let staged =
-            wyr1_test_restart_stage(InitError::Restart(RestartTransitionError::InvalidState), 3);
-        assert_eq!(wyr1_test_failure_application_status(&staged), 0xAF13_0303);
+        wyr1_test_set_restart_stage(3);
+        assert_eq!(
+            wyr1_test_failure_application_status(&InitError::Restart(
+                RestartTransitionError::InvalidState
+            )),
+            0xAF13_0303
+        );
     }
 }
