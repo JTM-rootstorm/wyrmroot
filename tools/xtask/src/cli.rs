@@ -18,6 +18,9 @@ Usage:
     cargo xtask wyr1 inspect --request <wyr1-a-request.toml>
     cargo xtask wyr1 prepare --request <wyr1-a-request.toml>
     cargo xtask wyr1 evidence --request <wyr1-a-request.toml> --default <log> --smp <log>
+    cargo xtask wyr1b image --request <wyr1-b-request.toml>
+    cargo xtask wyr1b inspect --request <wyr1-b-request.toml>
+    cargo xtask wyr1b evidence --request <wyr1-b-request.toml> --log <evidence>
 
 Host filters may name a component (bootfs, protocol, elf, runtime, bootstrap,
 efi, init0, hello, or xtask), package:<workspace-package>, or test:<substring>.
@@ -103,6 +106,12 @@ pub(crate) enum Action {
         default: String,
         smp: String,
     },
+    Wyr1BImage(String),
+    Wyr1BInspect(String),
+    Wyr1BEvidence {
+        request: String,
+        log: String,
+    },
     Unavailable(&'static str),
 }
 
@@ -149,9 +158,32 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
         "gdb" => dispatch_profile_request(&arguments[1..], true),
         "test" => dispatch_test(&arguments[1..]),
         "wyr1" => dispatch_wyr1(&arguments[1..]),
+        "wyr1b" => dispatch_wyr1b(&arguments[1..]),
         unknown => Err(Failure::usage(format!(
             "unknown command '{unknown}'\n\n{USAGE}"
         ))),
+    }
+}
+
+fn dispatch_wyr1b(arguments: &[String]) -> Result<Action, Failure> {
+    match arguments {
+        [command, flag, request] if command == "image" && flag == "--request" => {
+            Ok(Action::Wyr1BImage(request.clone()))
+        }
+        [command, flag, request] if command == "inspect" && flag == "--request" => {
+            Ok(Action::Wyr1BInspect(request.clone()))
+        }
+        [command, flag, request, log_flag, log]
+            if command == "evidence" && flag == "--request" && log_flag == "--log" =>
+        {
+            Ok(Action::Wyr1BEvidence {
+                request: request.clone(),
+                log: log.clone(),
+            })
+        }
+        _ => Err(Failure::usage(
+            "wyr1b requires image|inspect --request <path>, or evidence --request <path> --log <evidence>",
+        )),
     }
 }
 

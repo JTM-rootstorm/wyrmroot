@@ -13,6 +13,7 @@ mod tasks;
 mod toolchain_artifact;
 mod wyr1;
 mod wyr1_vm;
+mod wyr1b;
 
 use std::env;
 use std::process::ExitCode;
@@ -113,6 +114,11 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
             default,
             smp,
         } => wyr1_evidence(&request, &default, &smp).map(Some),
+        Action::Wyr1BImage(request) => wyr1b::build(std::path::Path::new(&request)).map(Some),
+        Action::Wyr1BInspect(request) => wyr1b::inspect(std::path::Path::new(&request)).map(Some),
+        Action::Wyr1BEvidence { request, log } => {
+            wyr1b::evidence(std::path::Path::new(&request), std::path::Path::new(&log)).map(Some)
+        }
         Action::Unavailable(command) => Err(Failure::unavailable(command)),
     }
 }
