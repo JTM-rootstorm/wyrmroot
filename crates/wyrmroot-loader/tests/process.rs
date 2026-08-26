@@ -2,8 +2,10 @@ use deepwyrm_syscall::{DwHandle, DwHandleTransferV1, DwMemoryProtection, DwRight
 use wyrmroot_loader::{
     launch::LaunchProfile,
     process::{
-        LoadAuthority, LoadError, LoadFault, LoadRequest, LoadStage, LoaderPlatform, ParentMapping,
-        ProcessCreateRequest, ProcessCreateResult, load_process, load_process_with_fault,
+        JobLoadRequest, LoadAuthority, LoadError, LoadFault, LoadRequest, LoadStage,
+        LoaderPlatform, ParentMapping, ProcessCreateRequest, ProcessCreateResult,
+        ServiceLoadRequest, load_job_process, load_process, load_process_with_fault,
+        load_service_process,
     },
 };
 
@@ -256,6 +258,88 @@ fn probe_child_delegates_only_its_self_root_in_the_wrpl_1_1_init() {
     );
     assert!(!platform.events.contains(&Event::Duplicate(2)));
     assert!(!platform.events.contains(&Event::Duplicate(3)));
+}
+
+#[test]
+fn bootstrap_registry_moves_self_root_and_controller_endpoint() {
+    let mut platform = Mock::new(None);
+    let image = executable();
+    load_service_process(
+        &mut platform,
+        authority(),
+        ServiceLoadRequest {
+            image: &image,
+            display_path: "/system/registryd",
+            profile: LaunchProfile::BootstrapRegistry,
+            service_channel: DwHandle(0x900),
+            transaction_id: 0x1301,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(platform.sent_transfers.len(), 2);
+    assert_eq!(platform.sent_transfers[1].handle, DwHandle(0x900));
+    assert_eq!(
+        platform.sent_transfers[1].requested_rights,
+        wyrmroot_loader::launch::CHILD_CHANNEL_RIGHTS
+    );
+    assert_eq!(&platform.sent_init[6..8], &3_u16.to_le_bytes());
+}
+
+#[test]
+fn job_v2_selects_zero_or_three_stream_profile_and_rolls_back_owned_streams() {
+    let image = executable();
+    let argv = ["bin/hello"];
+    let streams = [DwHandle(0x901), DwHandle(0x902), DwHandle(0x903)];
+    let mut platform = Mock::new(None);
+    load_job_process(
+        &mut platform,
+        authority(),
+        JobLoadRequest {
+            image: &image,
+            policy_path: "bin/hello",
+            argv: &argv,
+            environment: &[],
+            streams: &streams,
+            transaction_id: 0x1302,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        platform
+            .sent_transfers
+            .iter()
+            .map(|transfer| transfer.handle)
+            .collect::<Vec<_>>(),
+        streams
+    );
+    assert_eq!(&platform.sent_init[6..8], &3_u16.to_le_bytes());
+
+    let mut failing = Mock::new(Some("send"));
+    let error = load_job_process(
+        &mut failing,
+        authority(),
+        JobLoadRequest {
+            image: &image,
+            policy_path: "bin/hello",
+            argv: &argv,
+            environment: &[],
+            streams: &streams,
+            transaction_id: 0x1303,
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        LoadError::Platform {
+            stage: LoadStage::InitSend,
+            rollback_failed: false,
+            ..
+        }
+    ));
+    for stream in streams {
+        assert!(failing.events.contains(&Event::Close(stream.0)));
+    }
 }
 
 #[test]

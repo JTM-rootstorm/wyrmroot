@@ -58,6 +58,19 @@ pub struct JobLoadRequest<'a> {
     pub policy_path: &'a str,
     pub argv: &'a [&'a str],
     pub environment: &'a [&'a str],
+    /// Zero or exactly three owned Channel endpoints in stdin, stdout,
+    /// stderr order.
+    pub streams: &'a [DwHandle],
+    pub transaction_id: u64,
+}
+
+/// WYR1-B bootstrap child request carrying one controller-issued endpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ServiceLoadRequest<'a> {
+    pub image: &'a [u8],
+    pub display_path: &'a str,
+    pub profile: LaunchProfile,
+    pub service_channel: DwHandle,
     pub transaction_id: u64,
 }
 
@@ -77,6 +90,7 @@ struct InternalLoadRequest<'a> {
     profile: LaunchProfile,
     transaction_id: u64,
     startup: StartupSpec<'a>,
+    channels: &'a [DwHandle],
 }
 
 /// Explicitly selected, test-only corruption of one child-launch boundary.
@@ -238,6 +252,7 @@ struct Transaction {
     parent_mapping: Option<ParentMapping>,
     delegated_bootfs: Option<DwHandle>,
     delegated_task_group: Option<DwHandle>,
+    delegated_channels: [Option<DwHandle>; 3],
     ranges: [Range; MAX_CHILD_RANGES],
     range_count: usize,
 }
@@ -256,6 +271,7 @@ impl Transaction {
             parent_mapping: None,
             delegated_bootfs: None,
             delegated_task_group: None,
+            delegated_channels: [None; 3],
             ranges: [Range {
                 address: 0,
                 bytes: 0,
@@ -301,6 +317,9 @@ impl Transaction {
             self.scratch_memory.take(),
             self.delegated_task_group.take(),
             self.delegated_bootfs.take(),
+            self.delegated_channels[0].take(),
+            self.delegated_channels[1].take(),
+            self.delegated_channels[2].take(),
             self.child_endpoint.take(),
             self.broad_parent.take(),
             self.parent_channel.take(),
@@ -341,6 +360,7 @@ pub fn load_process_with_fault<P: LoaderPlatform>(
             profile: request.profile,
             transaction_id: request.transaction_id,
             startup: StartupSpec::Legacy(request.display_path),
+            channels: &[],
         },
         fault,
     )
@@ -352,18 +372,49 @@ pub fn load_job_process<P: LoaderPlatform>(
     authority: LoadAuthority,
     request: JobLoadRequest<'_>,
 ) -> Result<LoadedProcess, LoadError<P::Error>> {
+    let profile = match request.streams.len() {
+        0 => LaunchProfile::JobV2,
+        3 => LaunchProfile::JobV2Streams,
+        _ => return Err(LoadError::Launch(LaunchError::HandleCount)),
+    };
     load_process_internal(
         platform,
         authority,
         InternalLoadRequest {
             image: request.image,
-            profile: LaunchProfile::JobV2,
+            profile,
             transaction_id: request.transaction_id,
             startup: StartupSpec::JobV2 {
                 path: request.policy_path,
                 argv: request.argv,
                 environment: request.environment,
             },
+            channels: request.streams,
+        },
+        LoadFault::None,
+    )
+}
+
+/// Loads one WYR1-B registry, publisher, or client using the exact
+/// profile-specific controller endpoint as the second WRLP capability.
+pub fn load_service_process<P: LoaderPlatform>(
+    platform: &mut P,
+    authority: LoadAuthority,
+    request: ServiceLoadRequest<'_>,
+) -> Result<LoadedProcess, LoadError<P::Error>> {
+    if request.profile.channel_role().is_none() {
+        return Err(LoadError::Launch(LaunchError::HandleCount));
+    }
+    let channels = [request.service_channel];
+    load_process_internal(
+        platform,
+        authority,
+        InternalLoadRequest {
+            image: request.image,
+            profile: request.profile,
+            transaction_id: request.transaction_id,
+            startup: StartupSpec::Legacy(request.display_path),
+            channels: &channels,
         },
         LoadFault::None,
     )
@@ -375,6 +426,16 @@ fn load_process_internal<P: LoaderPlatform>(
     request: InternalLoadRequest<'_>,
     fault: LoadFault,
 ) -> Result<LoadedProcess, LoadError<P::Error>> {
+    let expected_channels = if request.profile.channel_role().is_some() {
+        1
+    } else if request.profile == LaunchProfile::JobV2Streams {
+        3
+    } else {
+        0
+    };
+    if request.channels.len() != expected_channels {
+        return Err(LoadError::Launch(LaunchError::HandleCount));
+    }
     let mut segments = [empty_segment(); MAX_LOAD_SEGMENTS];
     if fault == LoadFault::MalformedElf {
         let malformed = [0_u8; 64];
@@ -651,12 +712,23 @@ fn load_process_internal<P: LoaderPlatform>(
         transfers[1] = transfer(bootfs, BOOTFS_RIGHTS);
         transfers[2] = transfer(task_group, LOADER_TASK_GROUP_RIGHTS);
         3
+    } else if request.profile.channel_role().is_some() {
+        transaction.delegated_channels[0] = Some(request.channels[0]);
+        transfers[0] = transfer(created.root, SELF_ROOT_RIGHTS);
+        transfers[1] = transfer(request.channels[0], launch::CHILD_CHANNEL_RIGHTS);
+        2
     } else if request.profile.needs_self_root() {
         // WYR0-I probe children receive only their own mapping authority at
         // startup. Shared MemoryObjects are a typed controller protocol after
         // startup, not a loader launch capability.
         transfers[0] = transfer(created.root, SELF_ROOT_RIGHTS);
         1
+    } else if request.profile == LaunchProfile::JobV2Streams {
+        for (index, handle) in request.channels.iter().copied().enumerate() {
+            transaction.delegated_channels[index] = Some(handle);
+            transfers[index] = transfer(handle, launch::CHILD_CHANNEL_RIGHTS);
+        }
+        3
     } else {
         0
     };
@@ -668,6 +740,10 @@ fn load_process_internal<P: LoaderPlatform>(
         &transfers[..transfer_count],
     ) {
         return Err(fail(platform, &mut transaction, LoadStage::InitSend, cause));
+    }
+    // Successful Channel send consumed every externally supplied endpoint.
+    for delegated in &mut transaction.delegated_channels {
+        *delegated = None;
     }
     if request.profile.needs_self_root() {
         transaction.root = None;
@@ -685,7 +761,6 @@ fn load_process_internal<P: LoaderPlatform>(
     } else {
         transaction.root = None;
     }
-
     if let Err(cause) = platform.thread_start(
         thread,
         plan.entry,
