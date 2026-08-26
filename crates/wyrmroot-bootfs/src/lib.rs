@@ -11,6 +11,7 @@ pub mod archive;
 pub mod builder;
 #[cfg(feature = "builder")]
 pub mod content;
+pub mod launch_policy;
 mod limits;
 pub mod path;
 #[cfg(feature = "builder")]

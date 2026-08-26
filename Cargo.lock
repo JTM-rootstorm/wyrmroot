@@ -278,6 +278,7 @@ version = "0.0.0"
 dependencies = [
  "deepwyrm-syscall",
  "wyrmroot-bootfs",
+ "wyrmroot-launch-proto",
  "wyrmroot-loader",
  "wyrmroot-rrc-manifest",
  "wyrmroot-runtime",

@@ -25,6 +25,7 @@ wyr1-test-evidence = ["native-init", "wyrmroot-runtime/wyr1-test-evidence"]
 deepwyrm-syscall.workspace = true
 wyrmroot-bootfs = { path = "../../crates/wyrmroot-bootfs" }
 wyrmroot-loader = { path = "../../crates/wyrmroot-loader" }
+wyrmroot-launch-proto = { path = "../../crates/wyrmroot-launch-proto" }
 wyrmroot-rrc-manifest = { path = "../../crates/wyrmroot-rrc-manifest" }
 wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }
 
