@@ -16,6 +16,19 @@ use wyrmroot_registry_proto::{
 const MAX_CLIENTS: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EndpointKind {
+    Publication,
+    Client,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InstalledEndpoint {
+    pub identity: EndpointIdentity,
+    pub handle: u64,
+    pub kind: EndpointKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EndpointIdentity {
     pub id: u64,
     pub generation: u64,
@@ -208,6 +221,26 @@ impl RegistryState {
             .flatten()
             .filter(|slot| slot.published)
             .count()
+    }
+
+    /// Returns the `index`th installed endpoint in stable publication-then-
+    /// client slot order for construction of a bounded native wait set.
+    pub fn installed_endpoint(&self, index: usize) -> Option<InstalledEndpoint> {
+        let publications = self
+            .publications
+            .iter()
+            .flatten()
+            .map(|slot| InstalledEndpoint {
+                identity: slot.endpoint,
+                handle: slot.handle,
+                kind: EndpointKind::Publication,
+            });
+        let clients = self.clients.iter().flatten().map(|slot| InstalledEndpoint {
+            identity: slot.endpoint,
+            handle: slot.handle,
+            kind: EndpointKind::Client,
+        });
+        publications.chain(clients).nth(index)
     }
 
     pub fn install_publication(

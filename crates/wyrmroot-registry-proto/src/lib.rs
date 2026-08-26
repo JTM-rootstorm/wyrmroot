@@ -366,6 +366,83 @@ pub fn encode_header(
     Ok(())
 }
 
+/// Encodes one exact header-only WRRG message.
+pub fn encode_empty(header: Header, out: &mut [u8]) -> Result<usize, Error> {
+    if !matches!(
+        header.message_type,
+        MessageType::Publish
+            | MessageType::Published
+            | MessageType::Retire
+            | MessageType::Retired
+            | MessageType::Connected
+            | MessageType::Enumerate
+    ) {
+        return Err(Error::UnknownMessageType);
+    }
+    encode_header(header, 0, HEADER_BYTES, out)?;
+    Ok(HEADER_BYTES)
+}
+
+/// Encodes a generation-change reply.
+pub fn encode_generation_changed(
+    header: Header,
+    generation: u64,
+    out: &mut [u8],
+) -> Result<usize, Error> {
+    if header.message_type != MessageType::GenerationChanged {
+        return Err(Error::UnknownMessageType);
+    }
+    encode_header(header, 0, 72, out)?;
+    put_u64(out, 64, generation)?;
+    Ok(72)
+}
+
+/// Encodes a cancellation request or acknowledgement.
+pub fn encode_cancel(header: Header, target: u64, out: &mut [u8]) -> Result<usize, Error> {
+    if !matches!(
+        header.message_type,
+        MessageType::Cancel | MessageType::Cancelled
+    ) || target == 0
+    {
+        return Err(Error::ZeroIdentity);
+    }
+    encode_header(header, 0, 72, out)?;
+    put_u64(out, 64, target)?;
+    Ok(72)
+}
+
+/// Encodes a bounded registry error response.
+pub fn encode_error(header: Header, code: u32, out: &mut [u8]) -> Result<usize, Error> {
+    if header.message_type != MessageType::Error || code == 0 {
+        return Err(Error::ZeroIdentity);
+    }
+    encode_header(header, 0, 72, out)?;
+    put_u32(out, 64, code)?;
+    Ok(72)
+}
+
+/// Encodes `LOOKUP_CONNECT` or `CONNECT_OFFER`; both share one canonical body.
+pub fn encode_lookup(header: Header, lookup: Lookup<'_>, out: &mut [u8]) -> Result<usize, Error> {
+    if !matches!(
+        header.message_type,
+        MessageType::LookupConnect | MessageType::ConnectOffer
+    ) || lookup.protocol_id == 0
+    {
+        return Err(Error::InvalidProtocolId);
+    }
+    validate_name(lookup.service_name)?;
+    let size = 80usize
+        .checked_add(lookup.service_name.len())
+        .ok_or(Error::ArithmeticOverflow)?;
+    encode_header(header, 1, size, out)?;
+    put_u64(out, 64, lookup.protocol_id)?;
+    put_u16(out, 72, lookup.version.major)?;
+    put_u16(out, 74, lookup.version.minor)?;
+    put_u16(out, 76, lookup.service_name.len() as u16)?;
+    out[80..size].copy_from_slice(lookup.service_name);
+    Ok(size)
+}
+
 pub fn encode_install_publication(
     header: Header,
     supervisor_role_id: u32,
@@ -698,6 +775,49 @@ mod tests {
                 &mut bytes
             ),
             Err(Error::NoncanonicalVersions)
+        );
+    }
+
+    #[test]
+    fn response_and_direct_offer_encoders_round_trip_exactly() {
+        let mut endpoint = header(MessageType::Published);
+        endpoint.endpoint_id = 21;
+        endpoint.endpoint_generation = 3;
+        let mut bytes = [0u8; 128];
+        let size = encode_empty(endpoint, &mut bytes).unwrap();
+        assert_eq!(
+            parse(&bytes[..size], 0).unwrap().message,
+            Message::Published
+        );
+
+        endpoint.message_type = MessageType::GenerationChanged;
+        let size = encode_generation_changed(endpoint, 19, &mut bytes).unwrap();
+        assert_eq!(
+            parse(&bytes[..size], 0).unwrap().message,
+            Message::GenerationChanged {
+                service_generation: 19
+            }
+        );
+
+        endpoint.message_type = MessageType::ConnectOffer;
+        let lookup = Lookup {
+            protocol_id: 0x1300,
+            version: ProtocolVersion { major: 1, minor: 2 },
+            service_name: b"org.wyrmroot.echo",
+        };
+        let size = encode_lookup(endpoint, lookup, &mut bytes).unwrap();
+        assert_eq!(
+            parse(&bytes[..size], 1).unwrap().message,
+            Message::ConnectOffer(lookup)
+        );
+
+        endpoint.message_type = MessageType::Cancelled;
+        let size = encode_cancel(endpoint, 17, &mut bytes).unwrap();
+        assert_eq!(
+            parse(&bytes[..size], 0).unwrap().message,
+            Message::Cancelled {
+                target_transaction_id: 17
+            }
         );
     }
 }
