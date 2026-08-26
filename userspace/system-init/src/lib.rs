@@ -92,7 +92,21 @@ pub const fn wyr1_test_failure_application_status(error: &InitError) -> u32 {
         InitError::ResourcesAlreadyInstalled => 0x05,
         InitError::ResourceIdentityMismatch => 0x06,
         InitError::InvalidResourceHandle => 0x07,
-        InitError::Restart(_) => 0x08,
+        InitError::Restart(error) => match error {
+            RestartTransitionError::InvalidPolicy => 0x81,
+            RestartTransitionError::ZeroIdentity => 0x82,
+            RestartTransitionError::InvalidState => 0x83,
+            RestartTransitionError::StaleGeneration => 0x84,
+            RestartTransitionError::TransactionMismatch => 0x85,
+            RestartTransitionError::DeadlineNotReached => 0x86,
+            RestartTransitionError::DeadlineExpired => 0x87,
+            RestartTransitionError::DeadlineMismatch => 0x88,
+            RestartTransitionError::TimeRegression => 0x89,
+            RestartTransitionError::GenerationNotAdvanced => 0x8a,
+            RestartTransitionError::AttemptFailed(_) => 0x8b,
+            RestartTransitionError::ArithmeticOverflow => 0x8c,
+            RestartTransitionError::HistoryExhausted => 0x8d,
+        },
         InitError::Bootfs(_) => 0x09,
         InitError::MissingRetainedMaterial => 0x0a,
         InitError::NonExecutableRole => 0x0b,
@@ -2281,6 +2295,12 @@ mod native_cleanup_tests {
         assert_eq!(
             wyr1_test_failure_application_status(&InitError::WrongActivationOrder),
             0xAF11_0003
+        );
+        assert_eq!(
+            wyr1_test_failure_application_status(&InitError::Restart(
+                RestartTransitionError::DeadlineExpired
+            )),
+            0xAF11_0087
         );
     }
 }
