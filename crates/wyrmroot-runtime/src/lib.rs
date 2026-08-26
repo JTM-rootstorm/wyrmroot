@@ -51,7 +51,7 @@ pub use bounded_accounting::{
 pub use capability_native::{
     OwnedMemoryMapping, cancel_timer, create_channel, create_event, create_memory_object,
     create_task_group, create_timer, duplicate_handle, map_memory_read_only, map_memory_read_write,
-    set_timer, signal_event, terminate_process, unmap_memory, wait_one,
+    set_timer, signal_event, terminate_process, terminate_task_group, unmap_memory, wait_one,
 };
 pub use loader_native::NativeLoaderPlatform;
 pub use native::{

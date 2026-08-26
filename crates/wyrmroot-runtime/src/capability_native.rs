@@ -9,7 +9,7 @@ use deepwyrm_syscall::{
     DW_MEMORY_PROTECTION_READ, DW_MEMORY_PROTECTION_WRITE, DW_STATUS_SUCCESS,
     DW_WAIT_RESULT_V1_SIZE, DwAddressRegionMapArgsV1, DwAddressRegionMapFlags, DwDeadline,
     DwHandle, DwMemoryObjectCreateFlags, DwMemoryProtection, DwOffset, DwRights, DwSignals, DwSize,
-    DwStatus, DwSyscallId, DwUserAddress, DwWaitItemV1, DwWaitResultV1,
+    DwStatus, DwSyscallId, DwTerminationReason, DwUserAddress, DwWaitItemV1, DwWaitResultV1,
 };
 
 use crate::{NativeError, NativeOutputError, PAGE_SIZE, wait_many};
@@ -254,6 +254,21 @@ pub fn create_task_group(parent: DwHandle, rights: DwRights) -> Result<DwHandle,
         return Err(NativeError::Output(NativeOutputError::InvalidObjectInfo));
     }
     Ok(child)
+}
+
+/// Recursively terminates one controller-owned TaskGroup subtree.
+///
+/// The generated syscall consumer does not yet expose this typed convenience
+/// wrapper, so the raw boundary remains localized here alongside TaskGroup
+/// creation. The kernel admits only `DW_TERMINATION_AUTHORIZED` for this call.
+pub fn terminate_task_group(
+    task_group: DwHandle,
+    reason: DwTerminationReason,
+) -> Result<(), NativeError> {
+    require_success(raw::call(
+        deepwyrm_syscall::DW_SYSCALL_TASK_GROUP_TERMINATE,
+        [task_group.0, u64::from(reason.0), 0, 0, 0, 0],
+    ))
 }
 
 pub fn create_event(rights: DwRights) -> Result<DwHandle, NativeError> {
