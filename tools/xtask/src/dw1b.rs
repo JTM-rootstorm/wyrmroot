@@ -2859,7 +2859,7 @@ mod tests {
         let strings = b"\0_RNvNtCsa7HzTacrzfa_16wyrmroot_runtime6native12close_handle\0_RNvCslacJCwVW9f1_24wyrmroot_dw1b_preemption11run_cpu_hog\0";
         let string_offset = elf.len();
         elf.extend_from_slice(strings);
-        while elf.len() % 8 != 0 {
+        while !elf.len().is_multiple_of(8) {
             elf.push(0);
         }
         let symbol_offset = elf.len();
@@ -2882,7 +2882,7 @@ mod tests {
             .copy_from_slice(&(0x0040_0000_u64 + u64::try_from(run_offset).unwrap()).to_le_bytes());
         run[16..24].copy_from_slice(&u64::try_from(run_size).unwrap().to_le_bytes());
         elf.extend_from_slice(&run);
-        while elf.len() % 8 != 0 {
+        while !elf.len().is_multiple_of(8) {
             elf.push(0);
         }
         let section_offset = elf.len();

@@ -50,6 +50,21 @@ enum LoaderLinkMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UefiCargoOperation {
+    Check,
+    Build,
+}
+
+impl UefiCargoOperation {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Check => "check",
+            Self::Build => "build",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UefiCargoProfile {
     Development,
     Release,
@@ -76,6 +91,14 @@ pub(crate) struct IsolatedUefiBuild<'a> {
     pub(crate) production_target: &'a Path,
     pub(crate) retained_debug_target: &'a Path,
     pub(crate) cargo_profile: UefiCargoProfile,
+}
+
+struct UefiCargoInvocation<'a> {
+    cargo_home: &'a Path,
+    target_directory: &'a Path,
+    cargo_profile: UefiCargoProfile,
+    link_mode: LoaderLinkMode,
+    operation: UefiCargoOperation,
 }
 
 pub(crate) struct DeterministicUefiArtifacts {
@@ -164,20 +187,20 @@ pub(crate) fn run_loader_build(
     let loader = &artifacts.loader;
     let debug_loader = &artifacts.debug_loader;
     let debug_symbols = &artifacts.debug_symbols;
-    let loader_hash = digest(&loader)?;
-    let debug_loader_hash = digest(&debug_loader)?;
-    let debug_hash = digest(&debug_symbols)?;
+    let loader_hash = digest(loader)?;
+    let debug_loader_hash = digest(debug_loader)?;
+    let debug_hash = digest(debug_symbols)?;
     let rustc_hash = digest(&toolchain.accepted.rustc)?;
     let versions_hash = digest(&repository.join("toolchain/versions.toml"))?;
     let profiles_hash = digest(&repository.join("toolchain/profiles.toml"))?;
     let toolchain_report_hash = toolchain.validation_report_sha256();
     let artifact_report_hash = artifacts.inspection_report_sha256;
     let (repository_revision, repository_dirty) = repository_identity(repository)?;
-    let loader_relative = repository_relative_path(repository, &loader, "UEFI loader")?;
+    let loader_relative = repository_relative_path(repository, loader, "UEFI loader")?;
     let debug_loader_relative =
-        repository_relative_path(repository, &debug_loader, "retained debug UEFI loader")?;
+        repository_relative_path(repository, debug_loader, "retained debug UEFI loader")?;
     let debug_relative =
-        repository_relative_path(repository, &debug_symbols, "UEFI loader debug symbols")?;
+        repository_relative_path(repository, debug_symbols, "UEFI loader debug symbols")?;
 
     let record = LoaderProvenance {
         repository_revision: &repository_revision,
@@ -400,34 +423,40 @@ pub(crate) fn build_deterministic_uefi_pair(
         repository,
         toolchain,
         profile,
-        &cargo_home,
-        &production_target,
         layout,
-        build.cargo_profile,
-        LoaderLinkMode::Production,
-        "check",
+        &UefiCargoInvocation {
+            cargo_home: &cargo_home,
+            target_directory: &production_target,
+            cargo_profile: build.cargo_profile,
+            link_mode: LoaderLinkMode::Production,
+            operation: UefiCargoOperation::Check,
+        },
     )?;
     run_uefi_cargo(
         repository,
         toolchain,
         profile,
-        &cargo_home,
-        &retained_debug_target,
         layout,
-        build.cargo_profile,
-        LoaderLinkMode::RetainedDebug,
-        "build",
+        &UefiCargoInvocation {
+            cargo_home: &cargo_home,
+            target_directory: &retained_debug_target,
+            cargo_profile: build.cargo_profile,
+            link_mode: LoaderLinkMode::RetainedDebug,
+            operation: UefiCargoOperation::Build,
+        },
     )?;
     run_uefi_cargo(
         repository,
         toolchain,
         profile,
-        &cargo_home,
-        &production_target,
         layout,
-        build.cargo_profile,
-        LoaderLinkMode::Production,
-        "build",
+        &UefiCargoInvocation {
+            cargo_home: &cargo_home,
+            target_directory: &production_target,
+            cargo_profile: build.cargo_profile,
+            link_mode: LoaderLinkMode::Production,
+            operation: UefiCargoOperation::Build,
+        },
     )?;
 
     let loader = production_target
@@ -497,12 +526,8 @@ fn run_uefi_cargo(
     repository: &Path,
     toolchain: &LoaderToolchain,
     profile: &LoaderProfile,
-    cargo_home: &Path,
-    target_directory: &Path,
     layout: &DeepLayoutBuild,
-    cargo_profile: UefiCargoProfile,
-    link_mode: LoaderLinkMode,
-    operation: &str,
+    invocation: &UefiCargoInvocation<'_>,
 ) -> Result<(), Failure> {
     toolchain.accepted.verify_unchanged()?;
     layout.verify_unchanged()?;
@@ -518,15 +543,16 @@ fn run_uefi_cargo(
         .ok_or_else(|| Failure::task("accepted rust-lld path is not valid UTF-8"))?;
     let encoded_rustflags = deterministic_uefi_rustflags(
         repository,
-        cargo_home,
-        target_directory,
+        invocation.cargo_home,
+        invocation.target_directory,
         sysroot,
         rust_lld,
-        link_mode,
+        invocation.link_mode,
     )?;
+    let operation = invocation.operation.as_str();
     let mut command = Command::new(&toolchain.accepted.cargo);
     command.arg(operation);
-    if cargo_profile == UefiCargoProfile::Release {
+    if invocation.cargo_profile == UefiCargoProfile::Release {
         command.arg("--release");
     }
     let status = command
@@ -540,8 +566,8 @@ fn run_uefi_cargo(
         .arg("--target")
         .arg(&profile.rust_target)
         .arg("--target-dir")
-        .arg(target_directory)
-        .env("CARGO_HOME", cargo_home)
+        .arg(invocation.target_directory)
+        .env("CARGO_HOME", invocation.cargo_home)
         .env("RUSTC", &toolchain.accepted.rustc)
         .env("CARGO_ENCODED_RUSTFLAGS", encoded_rustflags)
         .env("SOURCE_DATE_EPOCH", "0")
