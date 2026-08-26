@@ -1010,7 +1010,7 @@ fn canonical_build_wyr_artifacts(request: &Request) -> Result<(), Failure> {
             .join(spec.target)
             .join("release")
             .join(spec.artifact);
-        let bytes = read_bounded(&source, spec.label, 64 * 1024 * 1024)?;
+        let bytes = read_cargo_build_output(&source, spec.label, 64 * 1024 * 1024)?;
         if sha256::bytes_digest(&bytes) != *expected {
             return Err(Failure::task(format!(
                 "DW1-B canonical {} artifact does not reproduce the request hash",
@@ -1957,6 +1957,21 @@ fn read_bounded(path: &Path, label: &str, maximum: u64) -> Result<Vec<u8>, Failu
     }
     read(path, label)
 }
+
+fn read_cargo_build_output(path: &Path, label: &str, maximum: u64) -> Result<Vec<u8>, Failure> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|e| Failure::task(format!("could not inspect DW1-B {label}: {e}")))?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() == 0
+        || metadata.len() > maximum
+    {
+        return Err(Failure::task(format!(
+            "DW1-B {label} is not a bounded regular Cargo build output"
+        )));
+    }
+    read(path, label)
+}
 fn relative_path_text(request: &Request, path: &Path) -> Result<String, Failure> {
     let relative = path
         .strip_prefix(&request.root)
@@ -2004,6 +2019,21 @@ mod tests {
         let second = build_archive(b"i", b"h", b"c", b"p").unwrap();
         assert_eq!(first, second);
         verify_archive(&first, [b"i", b"h", b"c", b"p"]).unwrap();
+    }
+
+    #[test]
+    fn fresh_cargo_build_outputs_may_be_hard_linked_before_owned_copy() {
+        let root = fixture();
+        let source = root.join("cargo-artifact");
+        let alias = root.join("cargo-artifact-alias");
+        fs::write(&source, b"fresh artifact").unwrap();
+        fs::hard_link(&source, &alias).unwrap();
+        assert_eq!(
+            read_cargo_build_output(&source, "fixture", 1024).unwrap(),
+            b"fresh artifact"
+        );
+        assert!(read_bounded(&source, "fixture", 1024).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
