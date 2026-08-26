@@ -1054,12 +1054,12 @@ where
                         })
                     );
                     let close_failed = system.close_handle(task_group).is_err();
-                    controller.abort_reservation(reservation)?;
                     if rollback_failed || close_failed {
                         controller.cleanup_failed(role, generation, transaction_id, now + 1)?;
                         controller.fatal();
                         return Err(error);
                     }
+                    controller.abort_reservation(reservation)?;
                     controller.cleanup_complete(role, generation, transaction_id, now + 1)?;
                     if advance_or_degrade(system, &mut controller, role, transaction_id)? {
                         controller.finalize_evidence(RecoveryResult::Degraded)?;
@@ -1117,12 +1117,17 @@ where
                                 now,
                                 disposition,
                             )?;
-                            cleanup_loaded(system, waits, loaded, task_group, false)?;
-                            controller.cleanup_complete(
+                            complete_native_cleanup(
+                                system,
+                                waits,
+                                &mut controller,
+                                loaded,
+                                task_group,
+                                false,
                                 role,
                                 generation,
                                 transaction_id,
-                                now + 1,
+                                now,
                             )?;
                             if disposition == TerminalDisposition::NormalExit(0) {
                                 break;
@@ -1136,18 +1141,17 @@ where
                             let failure = classify_supervision(&error);
                             let now = system.now().map_err(InitError::Native)?;
                             controller.fail(role, generation, transaction_id, now, failure)?;
-                            cleanup_loaded(
+                            complete_native_cleanup(
                                 system,
                                 waits,
+                                &mut controller,
                                 loaded,
                                 task_group,
                                 !error.process_exit_observed(),
-                            )?;
-                            controller.cleanup_complete(
                                 role,
                                 generation,
                                 transaction_id,
-                                now + 1,
+                                now,
                             )?;
                             if advance_or_degrade(system, &mut controller, role, transaction_id)? {
                                 controller.finalize_evidence(RecoveryResult::Degraded)?;
@@ -1160,14 +1164,18 @@ where
                     let failure = classify_supervision(&error);
                     let now = system.now().map_err(InitError::Native)?;
                     controller.ready_wait_failed(role, generation, transaction_id, now, failure)?;
-                    cleanup_loaded(
+                    complete_native_cleanup(
                         system,
                         waits,
+                        &mut controller,
                         loaded,
                         task_group,
                         !error.process_exit_observed(),
+                        role,
+                        generation,
+                        transaction_id,
+                        now,
                     )?;
-                    controller.cleanup_complete(role, generation, transaction_id, now + 1)?;
                     if advance_or_degrade(system, &mut controller, role, transaction_id)? {
                         controller.finalize_evidence(RecoveryResult::Degraded)?;
                         return Ok((RecoveryResult::Degraded, controller));
@@ -1279,6 +1287,39 @@ fn cleanup_loaded<S: InitPlatform, W: SupervisionPlatform<Error = NativeError>>(
         Err(InitError::Cleanup)
     } else {
         Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn complete_native_cleanup<S: InitPlatform, W: SupervisionPlatform<Error = NativeError>>(
+    system: &mut S,
+    waits: &mut W,
+    controller: &mut SystemInit,
+    loaded: LoadedProcess,
+    task_group: DwHandle,
+    terminate: bool,
+    role: RoleId,
+    generation: u64,
+    transaction: u64,
+    classified_at: u64,
+) -> Result<(), InitError> {
+    match cleanup_loaded(system, waits, loaded, task_group, terminate) {
+        Ok(()) => controller.cleanup_complete(
+            role,
+            generation,
+            transaction,
+            classified_at.checked_add(1).ok_or(InitError::Accounting)?,
+        ),
+        Err(error) => {
+            controller.cleanup_failed(
+                role,
+                generation,
+                transaction,
+                classified_at.checked_add(1).ok_or(InitError::Accounting)?,
+            )?;
+            controller.fatal();
+            Err(error)
+        }
     }
 }
 fn classify_supervision(error: &SupervisionError<NativeError>) -> AttemptFailure {
