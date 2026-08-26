@@ -173,8 +173,6 @@ pub enum ExitObservedReadinessError<PlatformError> {
     Ready(LaunchError),
     /// More than one launch-channel datagram was queued before terminal close.
     DuplicateReady,
-    /// Terminal close was observed without an accepted READY.
-    MissingReady,
 }
 
 /// Supervision result that preserves a fresh structured termination record.
@@ -440,12 +438,10 @@ fn supervise_profile_state<P: SupervisionPlatform>(
             ready,
             deadline,
         ) {
-            Ok(()) => validate_successful_exit(&info)
+            Ok(true) => validate_successful_exit(&info)
                 .map(|()| info)
                 .map_err(|error| ObservedSupervisionError::Exit(error, info)),
-            Err(ExitObservedReadinessError::MissingReady) => {
-                Err(ObservedSupervisionError::ExitedBeforeReady(info))
-            }
+            Ok(false) => Err(ObservedSupervisionError::ExitedBeforeReady(info)),
             Err(error) => Err(ObservedSupervisionError::ExitObservedReadiness(error, info)),
         };
     }
@@ -557,7 +553,7 @@ fn drain_terminal_launch_channel<P: SupervisionPlatform>(
     transaction_id: u64,
     mut ready: bool,
     deadline: DwDeadline,
-) -> Result<(), ExitObservedReadinessError<P::Error>> {
+) -> Result<bool, ExitObservedReadinessError<P::Error>> {
     let channel_item = DwWaitItemV1 {
         handle: launch_channel,
         signals: CHANNEL_SIGNALS,
@@ -595,11 +591,7 @@ fn drain_terminal_launch_channel<P: SupervisionPlatform>(
             continue;
         }
         // PEER_CLOSED is accepted only from this fresh wait with no READABLE bit.
-        return if ready {
-            Ok(())
-        } else {
-            Err(ExitObservedReadinessError::MissingReady)
-        };
+        return Ok(ready);
     }
 }
 
