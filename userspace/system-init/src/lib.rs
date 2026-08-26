@@ -1175,6 +1175,7 @@ where
                         now,
                         AttemptFailure::CreationFailed,
                     ) {
+                        let transition_error = wyr1_test_restart_stage(transition_error, 6);
                         let close_failed = system.close_handle(task_group).is_err();
                         let release_failed = controller.abort_reservation(reservation).is_err();
                         controller.fatal();
@@ -1194,14 +1195,20 @@ where
                     let close_failed = system.close_handle(task_group).is_err();
                     if rollback_failed || close_failed {
                         let retired_at = now.checked_add(1).ok_or(InitError::Accounting)?;
-                        controller.cleanup_failed(role, generation, transaction_id, retired_at)?;
+                        controller
+                            .cleanup_failed(role, generation, transaction_id, retired_at)
+                            .map_err(|error| wyr1_test_restart_stage(error, 7))?;
                         controller.fatal();
                         return Err(error);
                     }
                     controller.abort_reservation(reservation)?;
                     let retired_at = now.checked_add(1).ok_or(InitError::Accounting)?;
-                    controller.cleanup_complete(role, generation, transaction_id, retired_at)?;
-                    if advance_or_degrade(system, &mut controller, role, transaction_id)? {
+                    controller
+                        .cleanup_complete(role, generation, transaction_id, retired_at)
+                        .map_err(|error| wyr1_test_restart_stage(error, 7))?;
+                    if advance_or_degrade(system, &mut controller, role, transaction_id)
+                        .map_err(|error| wyr1_test_restart_stage(error, 10))?
+                    {
                         controller.finalize_evidence(RecoveryResult::Degraded)?;
                         return Ok((RecoveryResult::Degraded, controller));
                     }
@@ -1356,7 +1363,9 @@ where
                             if disposition == TerminalDisposition::NormalExit(0) {
                                 break;
                             }
-                            if advance_or_degrade(system, &mut controller, role, transaction_id)? {
+                            if advance_or_degrade(system, &mut controller, role, transaction_id)
+                                .map_err(|error| wyr1_test_restart_stage(error, 10))?
+                            {
                                 controller.finalize_evidence(RecoveryResult::Degraded)?;
                                 return Ok((RecoveryResult::Degraded, controller));
                             }
@@ -1387,7 +1396,7 @@ where
                                     loaded,
                                     task_group,
                                     role,
-                                    error,
+                                    wyr1_test_restart_stage(error, 8),
                                 ));
                             }
                             complete_native_cleanup(
@@ -1402,7 +1411,9 @@ where
                                 transaction_id,
                                 now,
                             )?;
-                            if advance_or_degrade(system, &mut controller, role, transaction_id)? {
+                            if advance_or_degrade(system, &mut controller, role, transaction_id)
+                                .map_err(|error| wyr1_test_restart_stage(error, 10))?
+                            {
                                 controller.finalize_evidence(RecoveryResult::Degraded)?;
                                 return Ok((RecoveryResult::Degraded, controller));
                             }
@@ -1435,7 +1446,7 @@ where
                             loaded,
                             task_group,
                             role,
-                            error,
+                            wyr1_test_restart_stage(error, 9),
                         ));
                     }
                     complete_native_cleanup(
@@ -1450,7 +1461,9 @@ where
                         transaction_id,
                         now,
                     )?;
-                    if advance_or_degrade(system, &mut controller, role, transaction_id)? {
+                    if advance_or_degrade(system, &mut controller, role, transaction_id)
+                        .map_err(|error| wyr1_test_restart_stage(error, 10))?
+                    {
                         controller.finalize_evidence(RecoveryResult::Degraded)?;
                         return Ok((RecoveryResult::Degraded, controller));
                     }
