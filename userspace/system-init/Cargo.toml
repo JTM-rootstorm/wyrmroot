@@ -28,6 +28,7 @@ wyrmroot-rrc-manifest = { path = "../../crates/wyrmroot-rrc-manifest" }
 wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }
 
 [dev-dependencies]
+wyrmroot-bootfs = { path = "../../crates/wyrmroot-bootfs", features = ["builder"] }
 wyrmroot-rrc-manifest = { path = "../../crates/wyrmroot-rrc-manifest", features = ["builder"] }
 
 [lints.rust]

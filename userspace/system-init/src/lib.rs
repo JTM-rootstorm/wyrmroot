@@ -6,6 +6,9 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod evidence;
+pub mod gate;
+
 use deepwyrm_syscall::{
     DW_SIGNAL_EXITED, DW_TERMINATION_AUTHORIZED, DW_TERMINATION_NORMAL_EXIT,
     DW_TERMINATION_TASK_GROUP_TEARDOWN, DwDeadline, DwHandle, DwObjectType, DwReceivedHandleInfoV1,
