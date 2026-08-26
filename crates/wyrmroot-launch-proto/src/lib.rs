@@ -109,14 +109,61 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
+    const fn parse(value: u32) -> Result<Self, Error> {
+        Ok(match value {
+            1 => Self::MalformedRequest,
+            2 => Self::StaleOrUnknownSession,
+            3 => Self::TransactionReplay,
+            4 => Self::ForeignOrUnknownJob,
+            5 => Self::InvalidState,
+            6 => Self::Capacity,
+            7 => Self::PolicyRejected,
+            8 => Self::LoaderFailure,
+            9 => Self::CleanupFailure,
+            10 => Self::CancellationUnavailable,
+            _ => return Err(Error::InvalidErrorCode),
+        })
+    }
+
     pub const fn as_u32(self) -> u32 {
         self as u32
     }
 }
 
+/// Deepwyrm's exact public task-termination reasons accepted on the WRLJ
+/// result wire. Values are frozen to the generated ABI and are not POSIX
+/// status aliases.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum TerminationClassification {
+    NormalExit = 1,
+    Authorized = 2,
+    UnhandledException = 3,
+    TaskGroupTeardown = 5,
+}
+
+impl TerminationClassification {
+    const fn parse(value: u32) -> Result<Self, Error> {
+        Ok(match value {
+            1 => Self::NormalExit,
+            2 => Self::Authorized,
+            3 => Self::UnhandledException,
+            5 => Self::TaskGroupTeardown,
+            _ => return Err(Error::InvalidTerminationClassification),
+        })
+    }
+
+    pub const fn as_u32(self) -> u32 {
+        self as u32
+    }
+}
+
+/// All controller-owned cleanup bits currently admitted by WRLJ v1.
+pub const CLEANUP_RESULT_MASK: u32 = 0x1f;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TerminationResult {
-    pub classification: u32,
+    pub classification: TerminationClassification,
     pub application_code: u32,
     pub exception_class: u32,
     pub exception_detail: u32,
@@ -222,7 +269,7 @@ pub enum Message<'a> {
         job_id: u64,
     },
     Error {
-        code: u32,
+        code: ErrorCode,
     },
 }
 
@@ -253,6 +300,9 @@ pub enum Error {
     DuplicateEnvironmentName,
     Argv0Mismatch,
     InvalidJobState,
+    InvalidErrorCode,
+    InvalidTerminationClassification,
+    InvalidCleanupResult,
     ArithmeticOverflow,
 }
 
@@ -315,12 +365,12 @@ pub fn parse_message(bytes: &[u8], received_handles: usize) -> Result<ParsedMess
             Message::JobResult {
                 job_id: nonzero(read_u64(bytes, 48)?)?,
                 result: TerminationResult {
-                    classification: read_u32(bytes, 56)?,
+                    classification: TerminationClassification::parse(read_u32(bytes, 56)?)?,
                     application_code: read_u32(bytes, 60)?,
                     exception_class: read_u32(bytes, 64)?,
                     exception_detail: read_u32(bytes, 68)?,
                     exception_address: read_u64(bytes, 72)?,
-                    cleanup_result: read_u32(bytes, 80)?,
+                    cleanup_result: parse_cleanup_result(read_u32(bytes, 80)?)?,
                 },
             }
         }
@@ -355,7 +405,7 @@ pub fn parse_message(bytes: &[u8], received_handles: usize) -> Result<ParsedMess
                 return Err(Error::NonzeroReserved);
             }
             Message::Error {
-                code: read_u32(bytes, 48)?,
+                code: ErrorCode::parse(read_u32(bytes, 48)?)?,
             }
         }
     };
@@ -517,12 +567,12 @@ pub fn encode_job_result(
     out[..88].fill(0);
     encode_prefix(reservation, MessageType::JobResult, out)?;
     put_u64(out, 48, job_id)?;
-    put_u32(out, 56, result.classification)?;
+    put_u32(out, 56, result.classification.as_u32())?;
     put_u32(out, 60, result.application_code)?;
     put_u32(out, 64, result.exception_class)?;
     put_u32(out, 68, result.exception_detail)?;
     put_u64(out, 72, result.exception_address)?;
-    put_u32(out, 80, result.cleanup_result)?;
+    put_u32(out, 80, parse_cleanup_result(result.cleanup_result)?)?;
     Ok(88)
 }
 
@@ -836,6 +886,14 @@ fn nonzero(value: u64) -> Result<u64, Error> {
         Ok(value)
     }
 }
+
+fn parse_cleanup_result(value: u32) -> Result<u32, Error> {
+    if value & !CLEANUP_RESULT_MASK != 0 {
+        Err(Error::InvalidCleanupResult)
+    } else {
+        Ok(value)
+    }
+}
 fn require_size(bytes: &[u8], expected: usize) -> Result<(), Error> {
     if bytes.len() == expected {
         Ok(())
@@ -986,7 +1044,7 @@ mod tests {
     fn typed_responses_round_trip_without_posix_translation() {
         let mut bytes = [0u8; 88];
         let result = TerminationResult {
-            classification: 4,
+            classification: TerminationClassification::UnhandledException,
             application_code: 0,
             exception_class: 7,
             exception_detail: 9,
@@ -1002,8 +1060,49 @@ mod tests {
         assert_eq!(
             parse_message(&bytes[..size], 0).unwrap().message,
             Message::Error {
-                code: ErrorCode::ForeignOrUnknownJob as u32
+                code: ErrorCode::ForeignOrUnknownJob
             }
+        );
+    }
+
+    #[test]
+    fn error_and_result_enums_reject_unknown_or_unowned_values() {
+        let mut bytes = [0u8; 88];
+        let size = encode_error(R, ErrorCode::Capacity, &mut bytes).unwrap();
+        bytes[48..52].copy_from_slice(&0_u32.to_le_bytes());
+        assert_eq!(
+            parse_message(&bytes[..size], 0),
+            Err(Error::InvalidErrorCode)
+        );
+
+        let result = TerminationResult {
+            classification: TerminationClassification::NormalExit,
+            application_code: 0,
+            exception_class: 0,
+            exception_detail: 0,
+            exception_address: 0,
+            cleanup_result: CLEANUP_RESULT_MASK + 1,
+        };
+        assert_eq!(
+            encode_job_result(R, 17, result, &mut bytes),
+            Err(Error::InvalidCleanupResult)
+        );
+        let valid = TerminationResult {
+            cleanup_result: 0,
+            ..result
+        };
+        let size = encode_job_result(R, 17, valid, &mut bytes).unwrap();
+        bytes[56..60].copy_from_slice(&4_u32.to_le_bytes());
+        assert_eq!(
+            parse_message(&bytes[..size], 0),
+            Err(Error::InvalidTerminationClassification)
+        );
+        bytes[56..60]
+            .copy_from_slice(&(TerminationClassification::NormalExit as u32).to_le_bytes());
+        bytes[80..84].copy_from_slice(&(CLEANUP_RESULT_MASK + 1).to_le_bytes());
+        assert_eq!(
+            parse_message(&bytes[..size], 0),
+            Err(Error::InvalidCleanupResult)
         );
     }
 

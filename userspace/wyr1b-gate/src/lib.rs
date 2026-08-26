@@ -679,6 +679,11 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wyrmroot_launch_proto::{
+        ErrorCode as LaunchErrorCode, Message as LaunchMessage, MessageType as LaunchType,
+        Reservation as LaunchReservation, TerminationClassification, TerminationResult,
+        encode_error, encode_job_message, encode_job_result, encode_launch, parse_message,
+    };
     use wyrmroot_wyr1b_gate_proto::{RECORD_BYTES, encode, parse_for};
 
     const ENV: [&str; 3] = [
@@ -705,6 +710,151 @@ mod tests {
         let mut bytes = [0; RECORD_BYTES];
         encode(record, &mut bytes).unwrap();
         parse_for(&bytes, direction).unwrap()
+    }
+
+    #[test]
+    fn launch_owner_and_foreign_wrlj_transcripts_bind_wrtg_reports() {
+        let owner_config = wire(
+            record(MessageType::ConfigureLaunchOwner, (41, 51), (0, 0), 3),
+            Direction::InitToChild,
+        );
+        let mut owner = Client::launch();
+        assert_eq!(owner.configure(owner_config), Ok(ClientAction::Launch));
+        let owner_tx1 = LaunchReservation {
+            connection_id: 41,
+            generation: 51,
+            transaction_id: 1,
+        };
+        let mut bytes = [0u8; 416];
+        let size = encode_launch(
+            owner_tx1,
+            "bin/hello",
+            &["bin/hello"],
+            &[],
+            false,
+            &mut bytes,
+        )
+        .unwrap();
+        assert!(matches!(
+            parse_message(&bytes[..size], 0),
+            Ok(parsed) if parsed.reservation == owner_tx1 && matches!(parsed.message, LaunchMessage::Launch(_))
+        ));
+        let size =
+            encode_job_message(owner_tx1, LaunchType::LaunchAccepted, 77, &mut bytes).unwrap();
+        assert_eq!(
+            parse_message(&bytes[..size], 0).unwrap().message,
+            LaunchMessage::LaunchAccepted { job_id: 77 }
+        );
+        let ClientAction::Report(accepted) = owner.job_accepted(77).unwrap() else {
+            panic!("owner must report acceptance");
+        };
+        assert_eq!(
+            (
+                accepted.message_type,
+                accepted.object_id,
+                accepted.object_generation
+            ),
+            (MessageType::JobAccepted, 77, 51)
+        );
+        let owner_tx2 = LaunchReservation {
+            transaction_id: 2,
+            ..owner_tx1
+        };
+        let size = encode_job_message(owner_tx2, LaunchType::Wait, 77, &mut bytes).unwrap();
+        assert_eq!(
+            parse_message(&bytes[..size], 0).unwrap().message,
+            LaunchMessage::Wait { job_id: 77 }
+        );
+        let result = TerminationResult {
+            classification: TerminationClassification::NormalExit,
+            application_code: 0,
+            exception_class: 0,
+            exception_detail: 0,
+            exception_address: 0,
+            cleanup_result: 0,
+        };
+        let size = encode_job_result(owner_tx2, 77, result, &mut bytes).unwrap();
+        assert_eq!(
+            parse_message(&bytes[..size], 0).unwrap().message,
+            LaunchMessage::JobResult { job_id: 77, result }
+        );
+        assert_eq!(
+            owner.job_result(true).unwrap().message_type,
+            MessageType::JobResult
+        );
+
+        let foreign_config = wire(
+            record(MessageType::ConfigureLaunchForeign, (42, 52), (41, 51), 4),
+            Direction::InitToChild,
+        );
+        let mut foreign = Client::launch();
+        assert_eq!(
+            foreign.configure(foreign_config),
+            Ok(ClientAction::Configured)
+        );
+        let probe = wire(
+            record(MessageType::ProbeForeign, (42, 52), (77, 51), 4),
+            Direction::InitToChild,
+        );
+        assert_eq!(foreign.probe_foreign(probe), Ok(ClientAction::ProbeForeign));
+        let foreign_tx1 = LaunchReservation {
+            connection_id: 42,
+            generation: 52,
+            transaction_id: 1,
+        };
+        let size = encode_job_message(foreign_tx1, LaunchType::Query, 77, &mut bytes).unwrap();
+        assert_eq!(
+            parse_message(&bytes[..size], 0).unwrap().message,
+            LaunchMessage::Query { job_id: 77 }
+        );
+        let size = encode_error(
+            foreign_tx1,
+            LaunchErrorCode::ForeignOrUnknownJob,
+            &mut bytes,
+        )
+        .unwrap();
+        assert_eq!(
+            parse_message(&bytes[..size], 0).unwrap().message,
+            LaunchMessage::Error {
+                code: LaunchErrorCode::ForeignOrUnknownJob
+            }
+        );
+        assert_eq!(
+            foreign.foreign_error(77, true).unwrap().message_type,
+            MessageType::ForeignRejected
+        );
+    }
+
+    #[test]
+    fn launch_transcript_rejects_wrong_correlation_job_and_malformed_packets() {
+        let config = wire(
+            record(MessageType::ConfigureLaunchForeign, (42, 52), (41, 51), 4),
+            Direction::InitToChild,
+        );
+        let mut foreign = Client::launch();
+        foreign.configure(config).unwrap();
+        let wrong_correlation = wire(
+            record(MessageType::ProbeForeign, (42, 52), (77, 50), 4),
+            Direction::InitToChild,
+        );
+        assert_eq!(
+            foreign.probe_foreign(wrong_correlation),
+            Err(Error::WrongObject)
+        );
+
+        let reservation = LaunchReservation {
+            connection_id: 42,
+            generation: 52,
+            transaction_id: 1,
+        };
+        let mut bytes = [0u8; 56];
+        let size = encode_job_message(reservation, LaunchType::Query, 77, &mut bytes).unwrap();
+        bytes[8..16].copy_from_slice(&43_u64.to_le_bytes());
+        assert!(
+            matches!(parse_message(&bytes[..size], 0), Ok(parsed) if parsed.reservation != reservation)
+        );
+        bytes[0] = b'X';
+        assert!(parse_message(&bytes[..size], 0).is_err());
     }
 
     #[test]

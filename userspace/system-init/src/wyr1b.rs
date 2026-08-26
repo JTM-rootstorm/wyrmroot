@@ -294,10 +294,21 @@ pub struct LoadedJob {
 /// session owner. The dispatcher publishes it only after the exact profile
 /// READY observation, so a READY-and-exited race cannot yield acceptance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PreparedJob {
+pub(crate) struct PreparedJob {
     ticket: LaunchTicket,
     pub loaded: LoadedProcess,
     pub task_group: u64,
+}
+
+/// Opaque proof supplied only after the native dispatcher has consumed the
+/// exact profile/transaction READY record for this prepared child.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // Consumed by the serialized D/E dispatcher integration.
+pub(crate) struct ExactReadyObservation(());
+
+#[allow(dead_code)] // Constructed only at the future native READY observation.
+pub(crate) const fn exact_ready_observation() -> ExactReadyObservation {
+    ExactReadyObservation(())
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -497,7 +508,7 @@ impl JobController {
             .jobs
             .iter_mut()
             .flatten()
-            .find(|job| job.id == job_id && job.owner == owner)
+            .find(|job| job.id == job_id && job.owner == owner && job.phase != JobPhase::Reserved)
             .is_some_and(|job| {
                 job.orphaned = true;
                 true
@@ -523,7 +534,7 @@ impl JobController {
         let owner = self.reserve_transaction(request)?;
         let mut count = 0usize;
         for job in self.jobs.iter().flatten() {
-            if job.owner == owner && !job.orphaned {
+            if job.owner == owner && !job.orphaned && job.phase != JobPhase::Reserved {
                 let slot = out.get_mut(count).ok_or(JobError::Capacity)?;
                 *slot = job.id;
                 count += 1;
@@ -630,6 +641,9 @@ impl JobController {
         if job.owner != owner || job.orphaned {
             return Err(JobError::ForeignJob);
         }
+        if job.phase == JobPhase::Reserved {
+            return Err(JobError::UnknownJob);
+        }
         Ok(job)
     }
     fn owned_job_index(&self, owner: ConnectionIdentity, id: u64) -> Result<usize, JobError> {
@@ -642,6 +656,9 @@ impl JobController {
             || self.jobs[index].as_ref().unwrap().orphaned
         {
             return Err(JobError::ForeignJob);
+        }
+        if self.jobs[index].as_ref().unwrap().phase == JobPhase::Reserved {
+            return Err(JobError::UnknownJob);
         }
         Ok(index)
     }
@@ -657,42 +674,12 @@ impl JobController {
     }
 }
 
-/// Policy-checks and failure-atomically loads one WRLJ launch request through
-/// the canonical executable loader. The caller supplies the already-created
-/// per-job TaskGroup and retains responsibility for it on any returned error.
-#[allow(clippy::too_many_arguments)]
-pub fn launch_authorized_job<'a, L: LoaderPlatform>(
-    jobs: &mut JobController,
-    policy: &PolicyView<'a>,
-    loader: &mut L,
-    authority: LoadAuthority,
-    task_group: u64,
-    reservation: Reservation,
-    request: wyrmroot_launch_proto::LaunchRequest<'a>,
-    streams: &'a [deepwyrm_syscall::DwHandle],
-) -> Result<LoadedJob, LaunchEngineError<L::Error>> {
-    let prepared = prepare_authorized_job(
-        jobs,
-        policy,
-        loader,
-        authority,
-        task_group,
-        reservation,
-        request,
-        streams,
-    )?;
-    commit_prepared_job(jobs, prepared).map_err(|error| LaunchEngineError::Publication {
-        error,
-        loaded: prepared.loaded,
-        task_group: prepared.task_group,
-    })
-}
-
 /// Performs policy validation and loader construction while retaining the
 /// reservation. The caller must either observe the exact READY then call
 /// [`commit_prepared_job`], or abort and clean up the loaded process.
 #[allow(clippy::too_many_arguments)]
-pub fn prepare_authorized_job<'a, L: LoaderPlatform>(
+#[allow(dead_code)] // D/E's serialized native dispatcher hookup consumes this next.
+pub(crate) fn prepare_authorized_job<'a, L: LoaderPlatform>(
     jobs: &mut JobController,
     policy: &PolicyView<'a>,
     loader: &mut L,
@@ -759,9 +746,11 @@ pub fn prepare_authorized_job<'a, L: LoaderPlatform>(
 }
 
 /// Publishes a prepared job only after the dispatcher has observed READY.
-pub fn commit_prepared_job(
+#[allow(dead_code)] // Kept crate-private until the D/E native dispatcher lands.
+pub(crate) fn commit_prepared_job(
     jobs: &mut JobController,
     prepared: PreparedJob,
+    _ready: ExactReadyObservation,
 ) -> Result<LoadedJob, JobError> {
     jobs.commit_launch(
         prepared.ticket,
@@ -778,7 +767,11 @@ pub fn commit_prepared_job(
 
 /// Aborts a not-yet-visible prepared job reservation. The caller remains
 /// responsible for terminating/reaping and closing its loaded handles.
-pub fn abort_prepared_job(jobs: &mut JobController, prepared: PreparedJob) -> Result<(), JobError> {
+#[allow(dead_code)] // Kept alongside commit for the serialized dispatcher join.
+pub(crate) fn abort_prepared_job(
+    jobs: &mut JobController,
+    prepared: PreparedJob,
+) -> Result<(), JobError> {
     jobs.abort_launch(prepared.ticket)
 }
 
@@ -851,6 +844,52 @@ mod tests {
             jobs.result(reservation(1, 1, 4), ticket.job_id),
             Err(JobError::TransactionReplay)
         );
+    }
+
+    #[test]
+    fn reserved_jobs_are_invisible_until_exact_ready_commit_or_abort() {
+        let mut jobs = JobController::new();
+        jobs.open_connection(1, 1).unwrap();
+        let ticket = jobs.begin_launch(reservation(1, 1, 1)).unwrap();
+        let mut listed = [0; MAX_LIVE_JOBS];
+        assert_eq!(jobs.list(reservation(1, 1, 2), &mut listed), Ok(0));
+        assert_eq!(
+            jobs.query(reservation(1, 1, 3), ticket.job_id),
+            Err(JobError::UnknownJob)
+        );
+        assert_eq!(
+            jobs.terminate(reservation(1, 1, 4), ticket.job_id),
+            Err(JobError::UnknownJob)
+        );
+        jobs.commit_launch(ticket, 10, 11, 12).unwrap();
+        assert_eq!(jobs.list(reservation(1, 1, 5), &mut listed), Ok(1));
+        assert_eq!(listed[0], ticket.job_id);
+        let abort = jobs.begin_launch(reservation(1, 1, 6)).unwrap();
+        jobs.abort_launch(abort).unwrap();
+        assert_eq!(jobs.list(reservation(1, 1, 7), &mut listed), Ok(1));
+    }
+
+    #[test]
+    fn prepared_job_needs_exact_ready_token_before_publication_or_abort() {
+        let mut jobs = JobController::new();
+        jobs.open_connection(1, 1).unwrap();
+        let ticket = jobs.begin_launch(reservation(1, 1, 1)).unwrap();
+        let prepared = PreparedJob {
+            ticket,
+            loaded: LoadedProcess {
+                process: deepwyrm_syscall::DwHandle(10),
+                launch_channel: deepwyrm_syscall::DwHandle(12),
+            },
+            task_group: 11,
+        };
+        let committed =
+            commit_prepared_job(&mut jobs, prepared, exact_ready_observation()).unwrap();
+        assert_eq!(committed.job_id, ticket.job_id);
+        let aborted = PreparedJob {
+            ticket: jobs.begin_launch(reservation(1, 1, 2)).unwrap(),
+            ..prepared
+        };
+        abort_prepared_job(&mut jobs, aborted).unwrap();
     }
 
     #[test]

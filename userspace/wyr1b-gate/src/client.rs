@@ -12,7 +12,8 @@ use deepwyrm_syscall::{
 };
 use wyrmroot_launch_proto::{
     ErrorCode as LaunchErrorCode, Message as LaunchMessage, MessageType as LaunchType,
-    Reservation as LaunchReservation, encode_job_message, encode_launch, parse_message,
+    Reservation as LaunchReservation, TerminationClassification, encode_job_message, encode_launch,
+    parse_message,
 };
 use wyrmroot_loader::launch::{
     CHILD_CHANNEL_RIGHTS, HEADER_BYTES as WRLP_BYTES, LaunchProfile, SELF_ROOT_RIGHTS,
@@ -225,7 +226,7 @@ fn launch_job_cycle(
     }
     let report = actor
         .job_result(
-            result.classification == 1
+            result.classification == TerminationClassification::NormalExit
                 && result.application_code == 0
                 && result.exception_class == 0
                 && result.exception_detail == 0
@@ -258,7 +259,7 @@ fn foreign_job_cycle(
     let response = receive_launch(session, reservation, CLIENT_ERROR_BASE + 0x0055)?;
     if response
         != (LaunchMessage::Error {
-            code: LaunchErrorCode::ForeignOrUnknownJob as u32,
+            code: LaunchErrorCode::ForeignOrUnknownJob,
         })
     {
         return Err(CLIENT_ERROR_BASE + 0x0056);
