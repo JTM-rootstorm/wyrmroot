@@ -5,7 +5,7 @@ product. It does not extend Deepwyrm's public ABI. Wyrmroot's global generated
 ABI/syscall consumers remain pinned to `cfc69bd8a49819ce1cda1a132cf56e55c93f92e4`
 and ABI tree `1c6a74f130e386eee95b3780c75950beefd0037d`.
 The selector product separately requires kernel candidate
-`4861943be76aa3efc7244d1bcf2905f680d18861`; this is the canonical selector-26
+`629870e4e2122e70fce47476b2ad0f0aa08e453e`; this is the canonical selector-26
 kernel candidate. This contract does not claim that a Wyrmroot revision which
 has not yet been integrated and committed is final.
 
