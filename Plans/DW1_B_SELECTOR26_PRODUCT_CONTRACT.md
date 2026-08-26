@@ -34,7 +34,14 @@ Schema 5 uses canonical request-relative paths with no traversal, symlink
 ancestry, hard-link substitution, or input/output/run-directory aliases. It
 binds nonzero exact revisions, the candidate and ABI tree, accepted Rust
 revision `a92dc7f7464ad6ddfece4402bd7b86dbfa86166d`, and the exact clean current
-Wyrmroot HEAD. It also binds SHA-256 identities for loader, kernel, symbols,
+Wyrmroot HEAD. The canonical `image`/`run` path first performs six separate,
+locked, offline release builds for loader, bootstrap, init0, hello, CPU hog,
+and progress with the accepted Rust007 toolchain. It refuses pre-existing
+Wyrmroot outputs and emits a builder-owned source-build receipt binding the
+clean source revision, Cargo lock, toolchain and generated-layout identities,
+exact build commands/profile, and all six output hashes. The two DW1-B native
+payloads use the canonical native linker script; all native artifacts have
+numeric ELF OSABI 0 and ABI version 0. It also binds SHA-256 identities for loader, kernel, symbols,
 bootstrap, all four payloads, provenance, OVMF code and OVMF variables, the
 deterministic bootfs and ESP outputs, nonce, frozen digest
 `5E4E054B5C244ACE`, bounded timeout, and measured page ceiling. The canonical
@@ -57,7 +64,7 @@ writes an exact run receipt. The legacy `evidence` spelling performs the same
 fresh run; it does not accept a caller-supplied receipt. Pre-existing run
 products are rejected.
 
-The run receipt binds the frozen request and build-receipt hashes, the actually
+The run receipt binds the frozen request and both build-receipt hashes, the actually
 booted ESP and bootfs hashes, initial OVMF identities, serial-log hash and
 request-relative path, run directory, timeout, observed QEMU debug-exit status
 33, and `timed_out = false`. A caller assertion or serial text alone is never
@@ -70,9 +77,11 @@ request-hashed hog steady-loop bytes. Acceptance additionally requires the
 exact 122-byte `DWPRE1` with facts `000000FF` and an immediately following PASS
 `DWTEST1` ID 26/detail zero.
 
-The accepted release four-entry archive measured 124568 bytes, 31 pages, and
-SHA-256 `4c9f870ea9e9543d86446e6194c4efc1762e01c97812b6b5719ed9af4be00f0b` at
-Wyrmroot `b01641b4da3eab0cff6f128a1a633351c6370836`. The frozen build contract is
+The accepted separate-release four-entry archive measured 123840 bytes, 31
+pages, and SHA-256
+`08febb6e14463fa5c5d8c846ace725336eb6cac0bfd0a93370685076e3115f95` after
+the native-linkage checkpoint `1ef846073970e0ec9c367fc14bd4c15a4478d15f`.
+The frozen build contract is
 the 31-page ceiling; a final acceptance request records the exact rebuilt
 archive byte count and hash for its own clean Wyrmroot revision. This host
 contract and tooling prepare the canonical checks but make no live selector-26

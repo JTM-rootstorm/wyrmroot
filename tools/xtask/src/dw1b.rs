@@ -1,11 +1,12 @@
 //! DW1-B selector-26 request, four-entry product, receipt, and evidence parser.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use wyrmroot_bootfs::archive::Archive;
 use wyrmroot_bootfs::builder::{Builder, FileMode};
@@ -24,6 +25,21 @@ pub const ACCEPTED_RUST_REVISION: &str = "a92dc7f7464ad6ddfece4402bd7b86dbfa8616
 const RECEIPT_KIND: &str = "wyrmroot-dw1-b-build-lineage";
 const RUN_RECEIPT_KIND: &str = "wyrmroot-dw1-b-run-receipt";
 const PROVENANCE_KIND: &str = "wyrmroot-dw1-b-kernel-build";
+const WYR_BUILD_KIND: &str = "wyrmroot-dw1-b-wyr-source-build";
+const ACCEPTED_TOOLCHAIN_NAME: &str = "wyrmroot-1.97.1-a92dc7f7";
+const ACCEPTED_RUSTC_SHA256: &str =
+    "65bd51e9ecb8e1185524471a8cbc4af1e6ac4e37e7d446c7a127bda0fa431c70";
+const ACCEPTED_CARGO_SHA256: &str =
+    "a73b2c25573d251489101c0d8f19ad3702eb9761166de5ed8437b472b6c038ce";
+const ACCEPTED_RUST_LLD_SHA256: &str =
+    "38a9f28404309892f9c9afe02fa4979a0d9e8bc866979cde09f5bb7ec17e5721";
+const ACCEPTED_TOOLCHAIN_MANIFEST_SHA256: &str =
+    "cc78368219552cce8fdaad38ab419040cab945fe175aa774d6dca51eece84fd2";
+const ACCEPTED_TOOLCHAIN_TREE_SHA256: &str =
+    "dce57d31def1f509ce537f96ae6b6dd320da11c9f321382cb93d142f558a32ca";
+const GENERATED_ABI_REVISION: &str = "cfc69bd8a49819ce1cda1a132cf56e55c93f92e4";
+const NATIVE_TARGET: &str = "x86_64-unknown-wyrmroot";
+const UEFI_TARGET: &str = "x86_64-unknown-uefi";
 const SHA256_ZERO: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 const REQUEST_KEYS: &[&str] = &[
     "schema_version",
@@ -50,6 +66,7 @@ const REQUEST_KEYS: &[&str] = &[
     "cpu_hog_sha256",
     "progress",
     "progress_sha256",
+    "wyr_build_receipt",
     "provenance",
     "provenance_sha256",
     "ovmf_code",
@@ -65,6 +82,31 @@ const REQUEST_KEYS: &[&str] = &[
     "challenge_digest",
     "bootfs_pages",
     "receipt",
+];
+const WYR_BUILD_RECEIPT_KEYS: &[&str] = &[
+    "kind",
+    "schema_version",
+    "wyrmroot_revision",
+    "rust_revision",
+    "rustc_sha256",
+    "cargo_sha256",
+    "rust_lld_sha256",
+    "toolchain_manifest_sha256",
+    "toolchain_tree_sha256",
+    "cargo_lock_sha256",
+    "profile",
+    "loader_command",
+    "bootstrap_command",
+    "init_command",
+    "hello_command",
+    "hog_command",
+    "progress_command",
+    "loader_sha256",
+    "bootstrap_sha256",
+    "init_sha256",
+    "hello_sha256",
+    "cpu_hog_sha256",
+    "progress_sha256",
 ];
 const RUN_RECEIPT_KEYS: &[&str] = &[
     "kind",
@@ -122,6 +164,7 @@ pub struct Request {
     cpu_hog_sha256: String,
     progress: PathBuf,
     progress_sha256: String,
+    wyr_build_receipt: PathBuf,
     provenance: PathBuf,
     provenance_sha256: String,
     ovmf_code: PathBuf,
@@ -202,22 +245,23 @@ pub fn load(path: &Path) -> Result<Request, Failure> {
         deepwyrm_revision: revision(&values, "deepwyrm_revision")?,
         wyrmroot_revision: revision(&values, "wyrmroot_revision")?,
         rust_revision: revision(&values, "rust_revision")?,
-        loader: input(&parent, required(&values, "loader")?)?,
+        loader: output(&parent, required(&values, "loader")?)?,
         loader_sha256: digest(&values, "loader_sha256")?,
         kernel: input(&parent, required(&values, "kernel")?)?,
         kernel_sha256: digest(&values, "kernel_sha256")?,
         symbols: input(&parent, required(&values, "symbols")?)?,
         symbols_sha256: digest(&values, "symbols_sha256")?,
-        bootstrap: input(&parent, required(&values, "bootstrap")?)?,
+        bootstrap: output(&parent, required(&values, "bootstrap")?)?,
         bootstrap_sha256: digest(&values, "bootstrap_sha256")?,
-        init: input(&parent, required(&values, "init")?)?,
+        init: output(&parent, required(&values, "init")?)?,
         init_sha256: digest(&values, "init_sha256")?,
-        hello: input(&parent, required(&values, "hello")?)?,
+        hello: output(&parent, required(&values, "hello")?)?,
         hello_sha256: digest(&values, "hello_sha256")?,
-        cpu_hog: input(&parent, required(&values, "cpu_hog")?)?,
+        cpu_hog: output(&parent, required(&values, "cpu_hog")?)?,
         cpu_hog_sha256: digest(&values, "cpu_hog_sha256")?,
-        progress: input(&parent, required(&values, "progress")?)?,
+        progress: output(&parent, required(&values, "progress")?)?,
         progress_sha256: digest(&values, "progress_sha256")?,
+        wyr_build_receipt: output(&parent, required(&values, "wyr_build_receipt")?)?,
         provenance: input(&parent, required(&values, "provenance")?)?,
         provenance_sha256: digest(&values, "provenance_sha256")?,
         ovmf_code: input(&parent, required(&values, "ovmf_code")?)?,
@@ -241,6 +285,8 @@ pub fn load(path: &Path) -> Result<Request, Failure> {
 pub fn build(path: &Path) -> Result<String, Failure> {
     let request = load(path)?;
     verify_acceptance_source(&request)?;
+    fs::create_dir_all(&request.run_directory).map_err(io_failure)?;
+    canonical_build_wyr_artifacts(&request)?;
     let loader = read_expected(&request.loader, "loader", &request.loader_sha256)?;
     let kernel = read_expected(&request.kernel, "kernel", &request.kernel_sha256)?;
     let symbols = read_expected(&request.symbols, "symbols", &request.symbols_sha256)?;
@@ -254,6 +300,16 @@ pub fn build(path: &Path) -> Result<String, Failure> {
     let hello = read_expected(&request.hello, "hello", &request.hello_sha256)?;
     let hog = read_expected(&request.cpu_hog, "cpu hog", &request.cpu_hog_sha256)?;
     let progress = read_expected(&request.progress, "progress", &request.progress_sha256)?;
+    let wyr_build_receipt = read_bounded(
+        &request.wyr_build_receipt,
+        "Wyr source-build receipt",
+        64 * 1024,
+    )?;
+    verify_wyr_build_receipt(
+        &request,
+        &wyr_build_receipt,
+        [&loader, &bootstrap, &init, &hello, &hog, &progress],
+    )?;
     verify_product_inputs(
         &request,
         ProductInputs {
@@ -276,7 +332,6 @@ pub fn build(path: &Path) -> Result<String, Failure> {
             request.bootfs_pages
         )));
     }
-    fs::create_dir_all(&request.run_directory).map_err(io_failure)?;
     if let Some(parent) = request.bootfs.parent() {
         fs::create_dir_all(parent).map_err(io_failure)?;
     }
@@ -294,7 +349,15 @@ pub fn build(path: &Path) -> Result<String, Failure> {
         &request,
         &bootfs,
         [&init, &hello, &hog, &progress],
-        [&loader, &kernel, &symbols, &bootstrap, &provenance, &esp],
+        [
+            &loader,
+            &kernel,
+            &symbols,
+            &bootstrap,
+            &provenance,
+            &esp,
+            &wyr_build_receipt,
+        ],
     );
     if let Some(parent) = request.receipt.parent() {
         fs::create_dir_all(parent).map_err(io_failure)?;
@@ -309,10 +372,17 @@ pub fn build(path: &Path) -> Result<String, Failure> {
 }
 
 pub fn measure(init: &Path, hello: &Path, hog: &Path, progress: &Path) -> Result<String, Failure> {
+    let hog_bytes = read(hog, "cpu hog")?;
+    let hog_layout = verify_loader_elf("cpu hog", &hog_bytes)?;
+    if !contains_exact_hog_steady_loop(&hog_bytes, &hog_layout) {
+        return Err(Failure::task(
+            "DW1-B measured cpu hog lacks the executed steady-loop control flow",
+        ));
+    }
     let bootfs = build_archive(
         &read(init, "init")?,
         &read(hello, "hello")?,
-        &read(hog, "cpu hog")?,
+        &hog_bytes,
         &read(progress, "progress")?,
     )?;
     Ok(format!(
@@ -343,6 +413,23 @@ pub fn inspect(path: &Path) -> Result<String, Failure> {
         read_expected(&request.cpu_hog, "cpu hog", &request.cpu_hog_sha256)?,
         read_expected(&request.progress, "progress", &request.progress_sha256)?,
     ];
+    let wyr_build_receipt = read_bounded(
+        &request.wyr_build_receipt,
+        "Wyr source-build receipt",
+        64 * 1024,
+    )?;
+    verify_wyr_build_receipt(
+        &request,
+        &wyr_build_receipt,
+        [
+            &loader,
+            &bootstrap,
+            &artifacts[0],
+            &artifacts[1],
+            &artifacts[2],
+            &artifacts[3],
+        ],
+    )?;
     verify_product_inputs(
         &request,
         ProductInputs {
@@ -371,7 +458,15 @@ pub fn inspect(path: &Path) -> Result<String, Failure> {
         &request,
         &bootfs,
         [&artifacts[0], &artifacts[1], &artifacts[2], &artifacts[3]],
-        [&loader, &kernel, &symbols, &bootstrap, &provenance, &esp],
+        [
+            &loader,
+            &kernel,
+            &symbols,
+            &bootstrap,
+            &provenance,
+            &esp,
+            &wyr_build_receipt,
+        ],
     )?;
     Ok(format!(
         "DW1_B_INSPECTION_PASS entries=4 bootfs_bytes={} bootfs_pages={} bootfs_sha256={}\n",
@@ -393,6 +488,7 @@ fn inspect_canonical_esp(request: &Request) -> Result<(), Failure> {
 }
 
 pub fn run(request_path: &Path) -> Result<String, Failure> {
+    let _ = build(request_path)?;
     let (request, bytes) = execute_run(request_path, |run| {
         let outcome = crate::h_integration::run_canonical_one_cpu_selector(
             &crate::h_integration::CanonicalSelectorRun {
@@ -742,6 +838,330 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), Failure> {
         .map_err(|error| Failure::task(format!("could not write DW1-B run product: {error}")))
 }
 
+const LOADER_COMMAND: &str = "cargo build --offline --locked --release --target x86_64-unknown-uefi --package wyrmroot-efi-loader --bin loader --features firmware";
+const BOOTSTRAP_COMMAND: &str = "cargo build --offline --locked --release --target x86_64-unknown-wyrmroot --package wyrmroot-bootstrap --bin wyrmroot-bootstrap --features native-bootstrap";
+const INIT_COMMAND: &str = "cargo build --offline --locked --release --target x86_64-unknown-wyrmroot --package wyrmroot-init0 --bin wyrmroot-init0 --features native-init0,dw1b-preemption-integration";
+const HELLO_COMMAND: &str = "cargo build --offline --locked --release --target x86_64-unknown-wyrmroot --package wyrmroot-hello --bin wyrmroot-hello --features native-hello";
+const HOG_COMMAND: &str = "cargo build --offline --locked --release --target x86_64-unknown-wyrmroot --package wyrmroot-dw1b-preemption --bin wyrmroot-dw1b-cpu-hog --features native-payloads";
+const PROGRESS_COMMAND: &str = "cargo build --offline --locked --release --target x86_64-unknown-wyrmroot --package wyrmroot-dw1b-preemption --bin wyrmroot-dw1b-progress --features native-payloads";
+
+fn canonical_build_wyr_artifacts(request: &Request) -> Result<(), Failure> {
+    for variable in [
+        "RUSTC",
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_BUILD_TARGET",
+        "CARGO_TARGET_DIR",
+        "WYRMROOT_DEEP_LAYOUT_POLICY_RS",
+    ] {
+        if env::var_os(variable).is_some() {
+            return Err(Failure::task(format!(
+                "DW1-B canonical source build refuses ambient {variable}"
+            )));
+        }
+    }
+    for path in [
+        &request.loader,
+        &request.bootstrap,
+        &request.init,
+        &request.hello,
+        &request.cpu_hog,
+        &request.progress,
+        &request.wyr_build_receipt,
+        &request.bootfs,
+        &request.esp,
+        &request.receipt,
+    ] {
+        if fs::symlink_metadata(path).is_ok() {
+            return Err(Failure::task(
+                "DW1-B canonical source build refuses pre-existing product outputs",
+            ));
+        }
+    }
+    let repository = crate::tasks::repository_root()?;
+    let rustc = PathBuf::from(
+        env::var_os("WYRMROOT_RUSTC")
+            .ok_or_else(|| Failure::task("DW1-B source build requires WYRMROOT_RUSTC"))?,
+    );
+    let toolchain = crate::toolchain_artifact::prepare(
+        &repository,
+        &rustc,
+        ACCEPTED_TOOLCHAIN_NAME,
+        ACCEPTED_RUST_REVISION,
+    )?;
+    let layout = crate::deep_layout::prepare(
+        &repository,
+        "https://github.com/JTM-rootstorm/deepwyrm",
+        GENERATED_ABI_REVISION,
+    )?;
+    let build_root = request.run_directory.join("canonical-source-build");
+    fs::create_dir(&build_root).map_err(|error| {
+        Failure::task(format!(
+            "could not create fresh DW1-B source-build root: {error}"
+        ))
+    })?;
+    let specs = [
+        BuildSpec::new(
+            "loader",
+            UEFI_TARGET,
+            "wyrmroot-efi-loader",
+            "loader",
+            "firmware",
+            "loader.efi",
+            Some(&layout.policy_path),
+        ),
+        BuildSpec::new(
+            "bootstrap",
+            NATIVE_TARGET,
+            "wyrmroot-bootstrap",
+            "wyrmroot-bootstrap",
+            "native-bootstrap",
+            "wyrmroot-bootstrap",
+            None,
+        ),
+        BuildSpec::new(
+            "init",
+            NATIVE_TARGET,
+            "wyrmroot-init0",
+            "wyrmroot-init0",
+            "native-init0,dw1b-preemption-integration",
+            "wyrmroot-init0",
+            None,
+        ),
+        BuildSpec::new(
+            "hello",
+            NATIVE_TARGET,
+            "wyrmroot-hello",
+            "wyrmroot-hello",
+            "native-hello",
+            "wyrmroot-hello",
+            None,
+        ),
+        BuildSpec::new(
+            "hog",
+            NATIVE_TARGET,
+            "wyrmroot-dw1b-preemption",
+            "wyrmroot-dw1b-cpu-hog",
+            "native-payloads",
+            "wyrmroot-dw1b-cpu-hog",
+            None,
+        ),
+        BuildSpec::new(
+            "progress",
+            NATIVE_TARGET,
+            "wyrmroot-dw1b-preemption",
+            "wyrmroot-dw1b-progress",
+            "native-payloads",
+            "wyrmroot-dw1b-progress",
+            None,
+        ),
+    ];
+    let destinations = [
+        (&request.loader, &request.loader_sha256),
+        (&request.bootstrap, &request.bootstrap_sha256),
+        (&request.init, &request.init_sha256),
+        (&request.hello, &request.hello_sha256),
+        (&request.cpu_hog, &request.cpu_hog_sha256),
+        (&request.progress, &request.progress_sha256),
+    ];
+    let mut artifacts = Vec::with_capacity(specs.len());
+    for (spec, (destination, expected)) in specs.iter().zip(destinations) {
+        toolchain.verify_unchanged()?;
+        layout.verify_unchanged()?;
+        let target_dir = build_root.join(spec.label);
+        let status = Command::new(&toolchain.cargo)
+            .args(["build", "--offline", "--locked", "--release", "--target"])
+            .arg(spec.target)
+            .args([
+                "--package",
+                spec.package,
+                "--bin",
+                spec.binary,
+                "--features",
+                spec.features,
+            ])
+            .arg("--target-dir")
+            .arg(&target_dir)
+            .env("RUSTC", &toolchain.rustc)
+            .env("CARGO_INCREMENTAL", "0")
+            .env("SOURCE_DATE_EPOCH", "0")
+            .env_remove("LD_AUDIT")
+            .env_remove("LD_LIBRARY_PATH")
+            .env_remove("LD_PRELOAD")
+            .envs(
+                spec.policy
+                    .map(|path| ("WYRMROOT_DEEP_LAYOUT_POLICY_RS", path)),
+            )
+            .current_dir(&repository)
+            .stdin(Stdio::null())
+            .status()
+            .map_err(|error| {
+                Failure::task(format!("could not run DW1-B {} build: {error}", spec.label))
+            })?;
+        if !status.success() {
+            return Err(Failure::task(format!(
+                "DW1-B canonical {} release build failed",
+                spec.label
+            )));
+        }
+        let source = target_dir
+            .join(spec.target)
+            .join("release")
+            .join(spec.artifact);
+        let bytes = read_bounded(&source, spec.label, 64 * 1024 * 1024)?;
+        if sha256::bytes_digest(&bytes) != *expected {
+            return Err(Failure::task(format!(
+                "DW1-B canonical {} artifact does not reproduce the request hash",
+                spec.label
+            )));
+        }
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(io_failure)?;
+        }
+        write_new_file(destination, &bytes)?;
+        artifacts.push(bytes);
+    }
+    verify_acceptance_source(request)?;
+    toolchain.verify_unchanged()?;
+    layout.verify_unchanged()?;
+    let receipt = render_wyr_build_receipt(
+        request,
+        &toolchain,
+        [
+            &artifacts[0],
+            &artifacts[1],
+            &artifacts[2],
+            &artifacts[3],
+            &artifacts[4],
+            &artifacts[5],
+        ],
+    )?;
+    if let Some(parent) = request.wyr_build_receipt.parent() {
+        fs::create_dir_all(parent).map_err(io_failure)?;
+    }
+    write_new_file(&request.wyr_build_receipt, receipt.as_bytes())
+}
+
+struct BuildSpec<'a> {
+    label: &'a str,
+    target: &'a str,
+    package: &'a str,
+    binary: &'a str,
+    features: &'a str,
+    artifact: &'a str,
+    policy: Option<&'a Path>,
+}
+
+impl<'a> BuildSpec<'a> {
+    const fn new(
+        label: &'a str,
+        target: &'a str,
+        package: &'a str,
+        binary: &'a str,
+        features: &'a str,
+        artifact: &'a str,
+        policy: Option<&'a Path>,
+    ) -> Self {
+        Self {
+            label,
+            target,
+            package,
+            binary,
+            features,
+            artifact,
+            policy,
+        }
+    }
+}
+
+fn render_wyr_build_receipt(
+    request: &Request,
+    toolchain: &crate::toolchain_artifact::AcceptedToolchain,
+    artifacts: [&[u8]; 6],
+) -> Result<String, Failure> {
+    let repository = crate::tasks::repository_root()?;
+    let rustc_sha256 = sha256::file_digest(&toolchain.rustc)
+        .map_err(|error| Failure::task(format!("could not hash accepted rustc: {error}")))?;
+    let cargo_lock_sha256 = sha256::file_digest(&repository.join("Cargo.lock"))
+        .map_err(|error| Failure::task(format!("could not hash Cargo.lock: {error}")))?;
+    Ok(format!(
+        "kind = \"{WYR_BUILD_KIND}\"\nschema_version = 1\nwyrmroot_revision = \"{}\"\nrust_revision = \"{}\"\nrustc_sha256 = \"{}\"\ncargo_sha256 = \"{}\"\nrust_lld_sha256 = \"{}\"\ntoolchain_manifest_sha256 = \"{}\"\ntoolchain_tree_sha256 = \"{}\"\ncargo_lock_sha256 = \"{}\"\nprofile = \"release-separate-invocations\"\nloader_command = \"{LOADER_COMMAND}\"\nbootstrap_command = \"{BOOTSTRAP_COMMAND}\"\ninit_command = \"{INIT_COMMAND}\"\nhello_command = \"{HELLO_COMMAND}\"\nhog_command = \"{HOG_COMMAND}\"\nprogress_command = \"{PROGRESS_COMMAND}\"\nloader_sha256 = \"{}\"\nbootstrap_sha256 = \"{}\"\ninit_sha256 = \"{}\"\nhello_sha256 = \"{}\"\ncpu_hog_sha256 = \"{}\"\nprogress_sha256 = \"{}\"\n",
+        request.wyrmroot_revision,
+        request.rust_revision,
+        rustc_sha256,
+        toolchain.cargo_sha256,
+        toolchain.rust_lld_sha256,
+        toolchain.manifest_sha256,
+        toolchain.toolchain_tree_sha256,
+        cargo_lock_sha256,
+        sha256::bytes_digest(artifacts[0]),
+        sha256::bytes_digest(artifacts[1]),
+        sha256::bytes_digest(artifacts[2]),
+        sha256::bytes_digest(artifacts[3]),
+        sha256::bytes_digest(artifacts[4]),
+        sha256::bytes_digest(artifacts[5]),
+    ))
+}
+
+fn verify_wyr_build_receipt(
+    request: &Request,
+    receipt: &[u8],
+    artifacts: [&[u8]; 6],
+) -> Result<(), Failure> {
+    let text = core::str::from_utf8(receipt)
+        .map_err(|_| Failure::task("DW1-B Wyr source-build receipt is not UTF-8"))?;
+    let values = parse_scalars(text)?;
+    exact_keys(
+        &values,
+        WYR_BUILD_RECEIPT_KEYS,
+        "DW1-B Wyr source-build receipt",
+    )?;
+    let repository = crate::tasks::repository_root()?;
+    let cargo_lock_sha256 = sha256::file_digest(&repository.join("Cargo.lock"))
+        .map_err(|error| Failure::task(format!("could not hash Cargo.lock: {error}")))?;
+    let expected = [
+        ("kind", WYR_BUILD_KIND.to_owned()),
+        ("schema_version", "1".to_owned()),
+        ("wyrmroot_revision", request.wyrmroot_revision.clone()),
+        ("rust_revision", ACCEPTED_RUST_REVISION.to_owned()),
+        ("rustc_sha256", ACCEPTED_RUSTC_SHA256.to_owned()),
+        ("cargo_sha256", ACCEPTED_CARGO_SHA256.to_owned()),
+        ("rust_lld_sha256", ACCEPTED_RUST_LLD_SHA256.to_owned()),
+        (
+            "toolchain_manifest_sha256",
+            ACCEPTED_TOOLCHAIN_MANIFEST_SHA256.to_owned(),
+        ),
+        (
+            "toolchain_tree_sha256",
+            ACCEPTED_TOOLCHAIN_TREE_SHA256.to_owned(),
+        ),
+        ("cargo_lock_sha256", cargo_lock_sha256),
+        ("profile", "release-separate-invocations".to_owned()),
+        ("loader_command", LOADER_COMMAND.to_owned()),
+        ("bootstrap_command", BOOTSTRAP_COMMAND.to_owned()),
+        ("init_command", INIT_COMMAND.to_owned()),
+        ("hello_command", HELLO_COMMAND.to_owned()),
+        ("hog_command", HOG_COMMAND.to_owned()),
+        ("progress_command", PROGRESS_COMMAND.to_owned()),
+        ("loader_sha256", sha256::bytes_digest(artifacts[0])),
+        ("bootstrap_sha256", sha256::bytes_digest(artifacts[1])),
+        ("init_sha256", sha256::bytes_digest(artifacts[2])),
+        ("hello_sha256", sha256::bytes_digest(artifacts[3])),
+        ("cpu_hog_sha256", sha256::bytes_digest(artifacts[4])),
+        ("progress_sha256", sha256::bytes_digest(artifacts[5])),
+    ];
+    for (key, expected) in expected {
+        if required(&values, key)? != expected {
+            return Err(Failure::task(format!(
+                "DW1-B Wyr source-build receipt field {key} does not match"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn build_archive(
     init: &[u8],
     hello: &[u8],
@@ -851,7 +1271,7 @@ fn verify_product_inputs(request: &Request, inputs: ProductInputs<'_>) -> Result
 
 struct ElfLayout {
     load_file_ranges: Vec<(usize, usize)>,
-    executable_file_ranges: Vec<(usize, usize)>,
+    executable_segments: Vec<(u64, usize, usize)>,
 }
 
 fn verify_loader_elf(label: &str, bytes: &[u8]) -> Result<ElfLayout, Failure> {
@@ -873,7 +1293,7 @@ fn verify_loader_elf(label: &str, bytes: &[u8]) -> Result<ElfLayout, Failure> {
         ))
     })?;
     let mut load_file_ranges = Vec::with_capacity(plan.segments.len());
-    let mut executable_file_ranges = Vec::new();
+    let mut executable_segments = Vec::new();
     for segment in plan.segments {
         let start = usize::try_from(segment.file_offset)
             .map_err(|_| Failure::task("DW1-B loader ELF file offset overflow"))?;
@@ -881,12 +1301,12 @@ fn verify_loader_elf(label: &str, bytes: &[u8]) -> Result<ElfLayout, Failure> {
             .map_err(|_| Failure::task("DW1-B loader ELF file range overflow"))?;
         load_file_ranges.push((start, end));
         if segment.protection == SegmentProtection::ReadExecute {
-            executable_file_ranges.push((start, end));
+            executable_segments.push((segment.virtual_address, start, end));
         }
     }
     Ok(ElfLayout {
         load_file_ranges,
-        executable_file_ranges,
+        executable_segments,
     })
 }
 
@@ -900,13 +1320,178 @@ fn contains_loaded_marker(bytes: &[u8], layout: &ElfLayout, marker: &[u8]) -> bo
 
 fn contains_exact_hog_steady_loop(bytes: &[u8], layout: &ElfLayout) -> bool {
     const STEADY_LOOP: &[u8] = &[0xf3, 0x90, 0xeb, 0xfc];
-    layout
-        .executable_file_ranges
+    let Ok(symbols) = elf_symbols(bytes) else {
+        return false;
+    };
+    let mut hog_symbols = symbols
         .iter()
-        .flat_map(|(start, end)| bytes[*start..*end].windows(STEADY_LOOP.len()))
-        .filter(|window| *window == STEADY_LOOP)
-        .count()
-        == 1
+        .filter(|symbol| symbol.name.ends_with("11run_cpu_hog") && symbol.size != 0);
+    let Some(hog) = hog_symbols.next() else {
+        return false;
+    };
+    if hog_symbols.next().is_some() {
+        return false;
+    }
+    let Some(close) = symbols
+        .iter()
+        .find(|symbol| symbol.name.ends_with("12close_handle") && symbol.size != 0)
+    else {
+        return false;
+    };
+    let Some((segment_virtual, segment_start, _segment_end)) = layout
+        .executable_segments
+        .iter()
+        .find(|(virtual_address, start, end)| {
+            hog.value >= *virtual_address
+                && hog.value.checked_add(hog.size).is_some_and(|symbol_end| {
+                    symbol_end <= *virtual_address + u64::try_from(end - start).unwrap_or(0)
+                })
+        })
+    else {
+        return false;
+    };
+    let symbol_start =
+        *segment_start + usize::try_from(hog.value - *segment_virtual).unwrap_or(usize::MAX);
+    let symbol_end = symbol_start.saturating_add(usize::try_from(hog.size).unwrap_or(usize::MAX));
+    let Some(function) = bytes.get(symbol_start..symbol_end) else {
+        return false;
+    };
+    let loops = function
+        .windows(STEADY_LOOP.len())
+        .enumerate()
+        .filter(|(_, window)| *window == STEADY_LOOP)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if loops.len() != 1 || loops[0] < 32 {
+        return false;
+    }
+    let loop_at = loops[0];
+    if function.get(loop_at - 8..loop_at) != Some(&[0x0f, 0x1f, 0x84, 0, 0, 0, 0, 0])
+        || function
+            .get(loop_at - 14..loop_at - 8)
+            .is_none_or(|bytes| bytes[..2] != [0x0f, 0x85])
+        || function.get(loop_at - 17..loop_at - 14) != Some(&[0x80, 0xf9, 0x02])
+    {
+        return false;
+    }
+    let branch_at = loop_at - 14;
+    let branch_displacement =
+        i32::from_le_bytes(function[branch_at + 2..branch_at + 6].try_into().unwrap());
+    let branch_target = (branch_at + 6).wrapping_add_signed(branch_displacement as isize);
+    if branch_target >= branch_at || branch_target >= function.len() {
+        return false;
+    }
+    let call = (loop_at.saturating_sub(48)..loop_at - 17)
+        .rev()
+        .find(|index| function[*index] == 0xe8);
+    let Some(call) = call else { return false };
+    let Some(displacement) = function.get(call + 1..call + 5) else {
+        return false;
+    };
+    let displacement = i32::from_le_bytes(displacement.try_into().unwrap());
+    let call_address = hog.value + u64::try_from(call).unwrap_or(u64::MAX) + 5;
+    call_address.wrapping_add_signed(i64::from(displacement)) == close.value
+}
+
+struct ElfSymbol {
+    name: String,
+    value: u64,
+    size: u64,
+}
+
+fn elf_symbols(bytes: &[u8]) -> Result<Vec<ElfSymbol>, Failure> {
+    let section_offset = usize::try_from(read_u64(bytes, 40)?)
+        .map_err(|_| Failure::task("DW1-B ELF section offset overflow"))?;
+    let section_size = usize::from(read_u16(bytes, 58)?);
+    let section_count = usize::from(read_u16(bytes, 60)?);
+    if section_size != 64 || !(1..=128).contains(&section_count) {
+        return Err(Failure::task(
+            "DW1-B ELF section table is absent or invalid",
+        ));
+    }
+    let table = bytes
+        .get(
+            section_offset
+                ..section_offset
+                    .checked_add(section_size * section_count)
+                    .ok_or_else(|| Failure::task("DW1-B ELF section table overflow"))?,
+        )
+        .ok_or_else(|| Failure::task("DW1-B ELF section table is truncated"))?;
+    let sections = table.chunks_exact(64).collect::<Vec<_>>();
+    let symtab = sections
+        .iter()
+        .filter(|section| u32::from_le_bytes(section[4..8].try_into().unwrap()) == 2)
+        .copied()
+        .collect::<Vec<_>>();
+    if symtab.len() != 1 {
+        return Err(Failure::task("DW1-B ELF requires one static symbol table"));
+    }
+    let symtab = symtab[0];
+    let string_index = usize::try_from(u32::from_le_bytes(symtab[40..44].try_into().unwrap()))
+        .map_err(|_| Failure::task("DW1-B ELF string-table index overflow"))?;
+    let strings_section = sections
+        .get(string_index)
+        .ok_or_else(|| Failure::task("DW1-B ELF symbol strings are absent"))?;
+    let strings = section_bytes(bytes, strings_section)?;
+    if u64::from_le_bytes(symtab[56..64].try_into().unwrap()) != 24 {
+        return Err(Failure::task("DW1-B ELF symbol entry size is invalid"));
+    }
+    let entries = section_bytes(bytes, symtab)?;
+    if entries.len() % 24 != 0 || entries.len() / 24 > 4096 {
+        return Err(Failure::task("DW1-B ELF symbol table is invalid"));
+    }
+    let mut symbols = Vec::new();
+    for entry in entries.chunks_exact(24) {
+        if entry[4] & 0x0f != 2 || u16::from_le_bytes(entry[6..8].try_into().unwrap()) == 0 {
+            continue;
+        }
+        let name_offset = usize::try_from(u32::from_le_bytes(entry[..4].try_into().unwrap()))
+            .map_err(|_| Failure::task("DW1-B ELF symbol name overflow"))?;
+        let tail = strings
+            .get(name_offset..)
+            .ok_or_else(|| Failure::task("DW1-B ELF symbol name is out of range"))?;
+        let end = tail
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or_else(|| Failure::task("DW1-B ELF symbol name is unterminated"))?;
+        let name = core::str::from_utf8(&tail[..end])
+            .map_err(|_| Failure::task("DW1-B ELF symbol name is not UTF-8"))?;
+        symbols.push(ElfSymbol {
+            name: name.to_owned(),
+            value: u64::from_le_bytes(entry[8..16].try_into().unwrap()),
+            size: u64::from_le_bytes(entry[16..24].try_into().unwrap()),
+        });
+    }
+    Ok(symbols)
+}
+
+fn section_bytes<'a>(bytes: &'a [u8], section: &[u8]) -> Result<&'a [u8], Failure> {
+    let offset = usize::try_from(u64::from_le_bytes(section[24..32].try_into().unwrap()))
+        .map_err(|_| Failure::task("DW1-B ELF section offset overflow"))?;
+    let size = usize::try_from(u64::from_le_bytes(section[32..40].try_into().unwrap()))
+        .map_err(|_| Failure::task("DW1-B ELF section size overflow"))?;
+    bytes
+        .get(
+            offset
+                ..offset
+                    .checked_add(size)
+                    .ok_or_else(|| Failure::task("DW1-B ELF section range overflow"))?,
+        )
+        .ok_or_else(|| Failure::task("DW1-B ELF section is truncated"))
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, Failure> {
+    bytes
+        .get(offset..offset + 2)
+        .map(|value| u16::from_le_bytes(value.try_into().unwrap()))
+        .ok_or_else(|| Failure::task("DW1-B ELF header is truncated"))
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, Failure> {
+    bytes
+        .get(offset..offset + 8)
+        .map(|value| u64::from_le_bytes(value.try_into().unwrap()))
+        .ok_or_else(|| Failure::task("DW1-B ELF header is truncated"))
 }
 
 fn verify_efi_loader(bytes: &[u8]) -> Result<(), Failure> {
@@ -1021,10 +1606,10 @@ fn receipt(
     request: &Request,
     bootfs: &[u8],
     artifacts: [&[u8]; 4],
-    platform: [&[u8]; 6],
+    platform: [&[u8]; 7],
 ) -> String {
     format!(
-        "kind = \"{RECEIPT_KIND}\"\nschema_version = 5\nselector = \"{SELECTOR}\"\ntest_id = 26\nrequest_sha256 = \"{}\"\ndeepwyrm_revision = \"{}\"\ndeepwyrm_abi_tree = \"{DEEPWYRM_ABI_TREE}\"\nwyrmroot_revision = \"{}\"\nrust_revision = \"{}\"\nloader_sha256 = \"{}\"\nkernel_sha256 = \"{}\"\nsymbols_sha256 = \"{}\"\nbootstrap_sha256 = \"{}\"\nprovenance_sha256 = \"{}\"\nesp_sha256 = \"{}\"\nbootfs_sha256 = \"{}\"\ninit_sha256 = \"{}\"\nhello_sha256 = \"{}\"\ncpu_hog_sha256 = \"{}\"\nprogress_sha256 = \"{}\"\nbootfs_bytes = {}\nbootfs_pages = {}\nkernel_bootfs_env = \"DEEPWYRM_DW1B_BOOTFS_MAX_PAGES={}\"\nevidence_nonce = \"{:016X}\"\nchallenge_digest = \"{DIGEST:016X}\"\ntimeout_seconds = {}\n",
+        "kind = \"{RECEIPT_KIND}\"\nschema_version = 5\nselector = \"{SELECTOR}\"\ntest_id = 26\nrequest_sha256 = \"{}\"\ndeepwyrm_revision = \"{}\"\ndeepwyrm_abi_tree = \"{DEEPWYRM_ABI_TREE}\"\nwyrmroot_revision = \"{}\"\nrust_revision = \"{}\"\nloader_sha256 = \"{}\"\nkernel_sha256 = \"{}\"\nsymbols_sha256 = \"{}\"\nbootstrap_sha256 = \"{}\"\nprovenance_sha256 = \"{}\"\nesp_sha256 = \"{}\"\nwyr_build_receipt_sha256 = \"{}\"\nbootfs_sha256 = \"{}\"\ninit_sha256 = \"{}\"\nhello_sha256 = \"{}\"\ncpu_hog_sha256 = \"{}\"\nprogress_sha256 = \"{}\"\nbootfs_bytes = {}\nbootfs_pages = {}\nkernel_bootfs_env = \"DEEPWYRM_DW1B_BOOTFS_MAX_PAGES={}\"\nevidence_nonce = \"{:016X}\"\nchallenge_digest = \"{DIGEST:016X}\"\ntimeout_seconds = {}\n",
         request.request_sha256,
         request.deepwyrm_revision,
         request.wyrmroot_revision,
@@ -1035,6 +1620,7 @@ fn receipt(
         sha256::bytes_digest(platform[3]),
         sha256::bytes_digest(platform[4]),
         sha256::bytes_digest(platform[5]),
+        sha256::bytes_digest(platform[6]),
         sha256::bytes_digest(bootfs),
         sha256::bytes_digest(artifacts[0]),
         sha256::bytes_digest(artifacts[1]),
@@ -1052,7 +1638,7 @@ fn verify_receipt(
     request: &Request,
     bootfs: &[u8],
     artifacts: [&[u8]; 4],
-    platform: [&[u8]; 6],
+    platform: [&[u8]; 7],
 ) -> Result<(), Failure> {
     let observed = fs::read_to_string(&request.receipt)
         .map_err(|e| Failure::task(format!("could not read DW1-B receipt: {e}")))?;
@@ -1244,6 +1830,7 @@ fn reject_path_aliases(request: &Request) -> Result<(), Failure> {
         &request.hello,
         &request.cpu_hog,
         &request.progress,
+        &request.wyr_build_receipt,
         &request.provenance,
         &request.ovmf_code,
         &request.ovmf_vars,
@@ -1597,10 +2184,19 @@ mod tests {
     #[test]
     fn elf_audit_requires_static_loaded_identity() {
         let marker = b"WYRMDW1B-HOG-V1:steady-spin-only";
-        let valid = valid_elf(marker);
+        let valid = valid_hog_elf(marker);
         let layout = verify_loader_elf("fixture", &valid).unwrap();
         assert!(contains_loaded_marker(&valid, &layout, marker));
         assert!(contains_exact_hog_steady_loop(&valid, &layout));
+
+        let mut unreachable = valid.clone();
+        let loop_at = unreachable
+            .windows(4)
+            .position(|window| window == [0xf3, 0x90, 0xeb, 0xfc])
+            .unwrap();
+        unreachable[loop_at - 12..loop_at - 8].copy_from_slice(&4_i32.to_le_bytes());
+        let layout = verify_loader_elf("fixture", &unreachable).unwrap();
+        assert!(!contains_exact_hog_steady_loop(&unreachable, &layout));
 
         let mut appended = valid_elf(b"different loaded bytes");
         let layout = verify_loader_elf("fixture", &appended).unwrap();
@@ -1647,7 +2243,7 @@ mod tests {
         let bootstrap = valid_elf(b"bootstrap");
         let init = valid_elf(b"WYRMINIT0-PROFILE-V1:dw1b-preemption");
         let hello = valid_elf(b"hello");
-        let hog = valid_elf(b"WYRMDW1B-HOG-V1:steady-spin-only");
+        let hog = valid_hog_elf(b"WYRMDW1B-HOG-V1:steady-spin-only");
         let progress = valid_elf(b"WYRMDW1B-PROGRESS-V1:eight-rounds");
         macro_rules! inputs {
             ($loader:expr, $bootstrap:expr, $hog:expr) => {
@@ -1672,12 +2268,45 @@ mod tests {
         let mut wrong_bootstrap = bootstrap.clone();
         wrong_bootstrap[64..68].copy_from_slice(&2_u32.to_le_bytes());
         assert!(verify_product_inputs(&request, inputs!(&loader, &wrong_bootstrap, &hog)).is_err());
-        let mut hog_without_loop = valid_elf(b"WYRMDW1B-HOG-V1:steady-spin-only");
-        let loop_start = hog_without_loop.len() - 4;
-        hog_without_loop[loop_start..].fill(0x90);
+        let mut hog_without_loop = valid_hog_elf(b"WYRMDW1B-HOG-V1:steady-spin-only");
+        let loop_start = hog_without_loop
+            .windows(4)
+            .position(|window| window == [0xf3, 0x90, 0xeb, 0xfc])
+            .unwrap();
+        hog_without_loop[loop_start..loop_start + 4].fill(0x90);
         assert!(
             verify_product_inputs(&request, inputs!(&loader, &bootstrap, &hog_without_loop))
                 .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_build_receipt_rejects_a_structurally_valid_substitute_loader() {
+        let root = fixture();
+        let request_path = root.join("request.toml");
+        fs::write(&request_path, request_text()).unwrap();
+        let request = load(&request_path).unwrap();
+        let loader = valid_pe();
+        let bootstrap = valid_elf(b"bootstrap");
+        let init = valid_elf(b"init");
+        let hello = valid_elf(b"hello");
+        let hog = valid_hog_elf(b"WYRMDW1B-HOG-V1:steady-spin-only");
+        let progress = valid_elf(b"progress");
+        let artifacts = [&loader[..], &bootstrap, &init, &hello, &hog, &progress];
+        let receipt = test_wyr_build_receipt(&request, artifacts);
+        verify_wyr_build_receipt(&request, receipt.as_bytes(), artifacts).unwrap();
+
+        let mut substitute = loader.clone();
+        substitute[400] ^= 0x5a;
+        verify_efi_loader(&substitute).unwrap();
+        assert!(
+            verify_wyr_build_receipt(
+                &request,
+                receipt.as_bytes(),
+                [&substitute, &bootstrap, &init, &hello, &hog, &progress],
+            )
+            .is_err()
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -1764,7 +2393,7 @@ mod tests {
         let input_hash = sha256::bytes_digest(b"x");
         let wyrmroot_revision = current_test_revision();
         format!(
-            "schema_version = 5\ndeepwyrm_revision = \"{DEEPWYRM_CANDIDATE}\"\ndeepwyrm_abi_tree = \"{DEEPWYRM_ABI_TREE}\"\nwyrmroot_revision = \"{wyrmroot_revision}\"\nrust_revision = \"{ACCEPTED_RUST_REVISION}\"\nselector = \"{SELECTOR}\"\ntest_id = 26\ntimeout_seconds = 30\nloader = \"inputs/loader\"\nloader_sha256 = \"{input_hash}\"\nkernel = \"inputs/kernel\"\nkernel_sha256 = \"{input_hash}\"\nsymbols = \"inputs/symbols\"\nsymbols_sha256 = \"{input_hash}\"\nbootstrap = \"inputs/bootstrap\"\nbootstrap_sha256 = \"{input_hash}\"\ninit = \"inputs/init\"\ninit_sha256 = \"{input_hash}\"\nhello = \"inputs/hello\"\nhello_sha256 = \"{input_hash}\"\ncpu_hog = \"inputs/hog\"\ncpu_hog_sha256 = \"{input_hash}\"\nprogress = \"inputs/progress\"\nprogress_sha256 = \"{input_hash}\"\nprovenance = \"inputs/provenance\"\nprovenance_sha256 = \"{input_hash}\"\novmf_code = \"inputs/ovmf-code\"\novmf_code_sha256 = \"{input_hash}\"\novmf_vars = \"inputs/ovmf-vars\"\novmf_vars_sha256 = \"{input_hash}\"\nbootfs = \"out/bootfs.img\"\nesp = \"out/esp.img\"\nrun_directory = \"run\"\nserial_log = \"run/serial.log\"\nrun_receipt = \"run/run-receipt.toml\"\nevidence_nonce = \"0000000000000001\"\nchallenge_digest = \"{DIGEST:016X}\"\nbootfs_pages = 1\nreceipt = \"out/receipt.toml\"\n"
+            "schema_version = 5\ndeepwyrm_revision = \"{DEEPWYRM_CANDIDATE}\"\ndeepwyrm_abi_tree = \"{DEEPWYRM_ABI_TREE}\"\nwyrmroot_revision = \"{wyrmroot_revision}\"\nrust_revision = \"{ACCEPTED_RUST_REVISION}\"\nselector = \"{SELECTOR}\"\ntest_id = 26\ntimeout_seconds = 30\nloader = \"inputs/loader\"\nloader_sha256 = \"{input_hash}\"\nkernel = \"inputs/kernel\"\nkernel_sha256 = \"{input_hash}\"\nsymbols = \"inputs/symbols\"\nsymbols_sha256 = \"{input_hash}\"\nbootstrap = \"inputs/bootstrap\"\nbootstrap_sha256 = \"{input_hash}\"\ninit = \"inputs/init\"\ninit_sha256 = \"{input_hash}\"\nhello = \"inputs/hello\"\nhello_sha256 = \"{input_hash}\"\ncpu_hog = \"inputs/hog\"\ncpu_hog_sha256 = \"{input_hash}\"\nprogress = \"inputs/progress\"\nprogress_sha256 = \"{input_hash}\"\nwyr_build_receipt = \"out/wyr-build.toml\"\nprovenance = \"inputs/provenance\"\nprovenance_sha256 = \"{input_hash}\"\novmf_code = \"inputs/ovmf-code\"\novmf_code_sha256 = \"{input_hash}\"\novmf_vars = \"inputs/ovmf-vars\"\novmf_vars_sha256 = \"{input_hash}\"\nbootfs = \"out/bootfs.img\"\nesp = \"out/esp.img\"\nrun_directory = \"run\"\nserial_log = \"run/serial.log\"\nrun_receipt = \"run/run-receipt.toml\"\nevidence_nonce = \"0000000000000001\"\nchallenge_digest = \"{DIGEST:016X}\"\nbootfs_pages = 1\nreceipt = \"out/receipt.toml\"\n"
         )
     }
 
@@ -1785,6 +2414,21 @@ mod tests {
             .output()
             .unwrap();
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn test_wyr_build_receipt(request: &Request, artifacts: [&[u8]; 6]) -> String {
+        let repository = crate::tasks::repository_root().unwrap();
+        let cargo_lock = sha256::file_digest(&repository.join("Cargo.lock")).unwrap();
+        format!(
+            "kind = \"{WYR_BUILD_KIND}\"\nschema_version = 1\nwyrmroot_revision = \"{}\"\nrust_revision = \"{ACCEPTED_RUST_REVISION}\"\nrustc_sha256 = \"{ACCEPTED_RUSTC_SHA256}\"\ncargo_sha256 = \"{ACCEPTED_CARGO_SHA256}\"\nrust_lld_sha256 = \"{ACCEPTED_RUST_LLD_SHA256}\"\ntoolchain_manifest_sha256 = \"{ACCEPTED_TOOLCHAIN_MANIFEST_SHA256}\"\ntoolchain_tree_sha256 = \"{ACCEPTED_TOOLCHAIN_TREE_SHA256}\"\ncargo_lock_sha256 = \"{cargo_lock}\"\nprofile = \"release-separate-invocations\"\nloader_command = \"{LOADER_COMMAND}\"\nbootstrap_command = \"{BOOTSTRAP_COMMAND}\"\ninit_command = \"{INIT_COMMAND}\"\nhello_command = \"{HELLO_COMMAND}\"\nhog_command = \"{HOG_COMMAND}\"\nprogress_command = \"{PROGRESS_COMMAND}\"\nloader_sha256 = \"{}\"\nbootstrap_sha256 = \"{}\"\ninit_sha256 = \"{}\"\nhello_sha256 = \"{}\"\ncpu_hog_sha256 = \"{}\"\nprogress_sha256 = \"{}\"\n",
+            request.wyrmroot_revision,
+            sha256::bytes_digest(artifacts[0]),
+            sha256::bytes_digest(artifacts[1]),
+            sha256::bytes_digest(artifacts[2]),
+            sha256::bytes_digest(artifacts[3]),
+            sha256::bytes_digest(artifacts[4]),
+            sha256::bytes_digest(artifacts[5]),
+        )
     }
 
     fn valid_elf(marker: &[u8]) -> Vec<u8> {
@@ -1810,6 +2454,84 @@ mod tests {
         elf[96..104].copy_from_slice(&size.to_le_bytes());
         elf[104..112].copy_from_slice(&size.to_le_bytes());
         elf[112..120].copy_from_slice(&0x1000_u64.to_le_bytes());
+        elf
+    }
+
+    fn valid_hog_elf(marker: &[u8]) -> Vec<u8> {
+        let mut elf = valid_elf(marker);
+        elf.truncate(elf.len() - 4);
+        let close_offset = elf.len();
+        elf.push(0xc3);
+        let run_offset = elf.len();
+        elf.extend_from_slice(&[0x90; 8]);
+        let call_offset = elf.len();
+        elf.push(0xe8);
+        let call_displacement =
+            i32::try_from(close_offset).unwrap() - i32::try_from(call_offset + 5).unwrap();
+        elf.extend_from_slice(&call_displacement.to_le_bytes());
+        elf.extend_from_slice(&[0x48, 0x89, 0xc1, 0xb8, 4, 1, 0xb0, 0xd1]);
+        elf.extend_from_slice(&[0x80, 0xf9, 0x02, 0x0f, 0x85]);
+        elf.extend_from_slice(&(-30_i32).to_le_bytes());
+        elf.extend_from_slice(&[0x0f, 0x1f, 0x84, 0, 0, 0, 0, 0]);
+        elf.extend_from_slice(&[0xf3, 0x90, 0xeb, 0xfc]);
+        let run_size = elf.len() - run_offset;
+        let strings = b"\0_RNvNtCsa7HzTacrzfa_16wyrmroot_runtime6native12close_handle\0_RNvCslacJCwVW9f1_24wyrmroot_dw1b_preemption11run_cpu_hog\0";
+        let string_offset = elf.len();
+        elf.extend_from_slice(strings);
+        while elf.len() % 8 != 0 {
+            elf.push(0);
+        }
+        let symbol_offset = elf.len();
+        elf.extend_from_slice(&[0; 24]);
+        let mut close = [0_u8; 24];
+        close[..4].copy_from_slice(&1_u32.to_le_bytes());
+        close[4] = 0x12;
+        close[6..8].copy_from_slice(&1_u16.to_le_bytes());
+        close[8..16].copy_from_slice(
+            &(0x0040_0000_u64 + u64::try_from(close_offset).unwrap()).to_le_bytes(),
+        );
+        close[16..24].copy_from_slice(&1_u64.to_le_bytes());
+        elf.extend_from_slice(&close);
+        let mut run = [0_u8; 24];
+        let run_name = 1 + b"_RNvNtCsa7HzTacrzfa_16wyrmroot_runtime6native12close_handle".len() + 1;
+        run[..4].copy_from_slice(&u32::try_from(run_name).unwrap().to_le_bytes());
+        run[4] = 0x12;
+        run[6..8].copy_from_slice(&1_u16.to_le_bytes());
+        run[8..16]
+            .copy_from_slice(&(0x0040_0000_u64 + u64::try_from(run_offset).unwrap()).to_le_bytes());
+        run[16..24].copy_from_slice(&u64::try_from(run_size).unwrap().to_le_bytes());
+        elf.extend_from_slice(&run);
+        while elf.len() % 8 != 0 {
+            elf.push(0);
+        }
+        let section_offset = elf.len();
+        elf.extend_from_slice(&[0; 64]);
+        let mut text = [0_u8; 64];
+        text[4..8].copy_from_slice(&1_u32.to_le_bytes());
+        text[8..16].copy_from_slice(&6_u64.to_le_bytes());
+        text[16..24].copy_from_slice(&0x0040_0000_u64.to_le_bytes());
+        text[32..40].copy_from_slice(&u64::try_from(symbol_offset).unwrap().to_le_bytes());
+        text[48..56].copy_from_slice(&16_u64.to_le_bytes());
+        elf.extend_from_slice(&text);
+        let mut symtab = [0_u8; 64];
+        symtab[4..8].copy_from_slice(&2_u32.to_le_bytes());
+        symtab[24..32].copy_from_slice(&u64::try_from(symbol_offset).unwrap().to_le_bytes());
+        symtab[32..40].copy_from_slice(&72_u64.to_le_bytes());
+        symtab[40..44].copy_from_slice(&3_u32.to_le_bytes());
+        symtab[56..64].copy_from_slice(&24_u64.to_le_bytes());
+        elf.extend_from_slice(&symtab);
+        let mut strtab = [0_u8; 64];
+        strtab[4..8].copy_from_slice(&3_u32.to_le_bytes());
+        strtab[24..32].copy_from_slice(&u64::try_from(string_offset).unwrap().to_le_bytes());
+        strtab[32..40].copy_from_slice(&u64::try_from(strings.len()).unwrap().to_le_bytes());
+        strtab[48..56].copy_from_slice(&1_u64.to_le_bytes());
+        elf.extend_from_slice(&strtab);
+        elf[40..48].copy_from_slice(&u64::try_from(section_offset).unwrap().to_le_bytes());
+        elf[58..60].copy_from_slice(&64_u16.to_le_bytes());
+        elf[60..62].copy_from_slice(&4_u16.to_le_bytes());
+        let size = u64::try_from(elf.len()).unwrap();
+        elf[96..104].copy_from_slice(&size.to_le_bytes());
+        elf[104..112].copy_from_slice(&size.to_le_bytes());
         elf
     }
 
