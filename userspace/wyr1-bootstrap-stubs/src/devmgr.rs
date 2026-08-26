@@ -6,11 +6,13 @@ use wyrmroot_runtime::StartupBlock;
 #[path = "native.rs"]
 mod native;
 fn main(startup: StartupBlock<'_>) -> u32 {
-    wyrmroot_wyr1_bootstrap_stubs::run_stub(
-        &mut native::NativeSystem,
-        startup.bootstrap_channel().as_abi(),
+    wyrmroot_wyr1_bootstrap_stubs::stub_application_status(
+        wyrmroot_wyr1_bootstrap_stubs::run_stub(
+            &mut native::NativeSystem,
+            startup.bootstrap_channel().as_abi(),
+        ),
+        0xA102_0001,
     )
-    .map_or(0, |_| 0xA102_0001)
 }
 wyrmroot_runtime::native_entry!(crate::main);
 #[panic_handler]

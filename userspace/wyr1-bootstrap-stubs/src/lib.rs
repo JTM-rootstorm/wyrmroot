@@ -33,6 +33,11 @@ pub enum StubError {
     Launch(LaunchError),
 }
 
+#[inline(always)]
+pub fn stub_application_status<E>(result: Result<(), E>, failure: u32) -> u32 {
+    result.map_or(failure, |()| 0)
+}
+
 pub fn run_stub<S: StubSystem>(system: &mut S, channel: DwHandle) -> Result<(), StubError> {
     let transaction = receive_init(system, channel)?;
     let mut ready = [0; HEADER_BYTES];
@@ -78,4 +83,22 @@ fn receive_init<S: StubSystem>(system: &mut S, channel: DwHandle) -> Result<u64,
         .map_err(StubError::Launch)?
         .transaction_id;
     Ok(transaction)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stub_application_status;
+
+    #[test]
+    fn successful_stub_exit_is_zero_and_failure_is_preserved() {
+        assert_eq!(stub_application_status(Ok::<(), ()>(()), 0xA101_0001), 0);
+        assert_eq!(
+            stub_application_status(Err::<(), ()>(()), 0xA101_0001),
+            0xA101_0001
+        );
+        assert_eq!(
+            stub_application_status(Err::<(), ()>(()), 0xA102_0001),
+            0xA102_0001
+        );
+    }
 }
