@@ -3,6 +3,7 @@
 use deepwyrm_syscall::DwHandle;
 
 use crate::wyr1b::{EndpointGrant, EndpointKind, JobController, JobError};
+use wyrmroot_launch_proto::Reservation;
 
 pub(crate) const MAX_SESSIONS: usize = 16;
 
@@ -26,12 +27,21 @@ pub(crate) struct DisconnectedSession {
     pub(crate) owner: Option<SessionOwner>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PendingWait {
+    pub(crate) grant: EndpointGrant,
+    pub(crate) reservation: Reservation,
+    pub(crate) job_id: u64,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct JobDispatcher {
     pub(crate) jobs: JobController,
     sessions: [Option<Session>; MAX_SESSIONS],
     poll_cursor: usize,
     job_cursor: usize,
+    pending_waits: [Option<PendingWait>; MAX_SESSIONS],
+    wait_cursor: usize,
 }
 
 impl JobDispatcher {
@@ -41,6 +51,8 @@ impl JobDispatcher {
             sessions: [None; MAX_SESSIONS],
             poll_cursor: 0,
             job_cursor: 0,
+            pending_waits: [None; MAX_SESSIONS],
+            wait_cursor: 0,
         }
     }
 
@@ -118,6 +130,7 @@ impl JobDispatcher {
             .ok_or(JobError::UnknownConnection)?;
         self.jobs
             .disconnect(grant.endpoint_id, grant.endpoint_generation)?;
+        self.drop_session_waits(grant);
         let session = self.sessions[index].take().unwrap();
         self.jobs.reclaim_closed_sessions();
         Ok(DisconnectedSession {
@@ -150,10 +163,93 @@ impl JobDispatcher {
         self.sessions.iter().flatten().count()
     }
 
-    pub(crate) fn next_job(&mut self) -> Option<crate::wyr1b::LoadedJob> {
-        let (cursor, job_id) = self.jobs.live_job_id(self.job_cursor)?;
+    pub(crate) fn next_cleanup_job(&mut self) -> Option<crate::wyr1b::LoadedJob> {
+        let (cursor, job_id) = self.jobs.cleanup_job_id(self.job_cursor)?;
         self.job_cursor = cursor;
         self.jobs.loaded_job(job_id).ok()
+    }
+
+    pub(crate) fn install_pending_wait(
+        &mut self,
+        grant: EndpointGrant,
+        reservation: Reservation,
+        job_id: u64,
+    ) -> Result<(), JobError> {
+        if reservation.connection_id != grant.endpoint_id
+            || reservation.generation != grant.endpoint_generation
+            || reservation.transaction_id == 0
+            || job_id == 0
+        {
+            return Err(JobError::ResourceIdentity);
+        }
+        if self.pending_waits.iter().flatten().any(|pending| {
+            pending.grant == grant
+                && pending.reservation.transaction_id == reservation.transaction_id
+        }) {
+            return Err(JobError::TransactionReplay);
+        }
+        let slot = self
+            .pending_waits
+            .iter()
+            .position(Option::is_none)
+            .ok_or(JobError::Capacity)?;
+        self.pending_waits[slot] = Some(PendingWait {
+            grant,
+            reservation,
+            job_id,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn cancel_pending_wait(
+        &mut self,
+        grant: EndpointGrant,
+        target_transaction_id: u64,
+    ) -> Option<PendingWait> {
+        let index = self.pending_waits.iter().position(|pending| {
+            pending.is_some_and(|pending| {
+                pending.grant == grant
+                    && pending.reservation.transaction_id == target_transaction_id
+            })
+        })?;
+        self.pending_waits[index].take()
+    }
+
+    pub(crate) fn drop_job_waits(&mut self, grant: EndpointGrant, job_id: u64) {
+        for pending in &mut self.pending_waits {
+            if pending.is_some_and(|pending| pending.grant == grant && pending.job_id == job_id) {
+                *pending = None;
+            }
+        }
+    }
+
+    pub(crate) fn next_pending_wait(&mut self) -> Option<PendingWait> {
+        for offset in 0..MAX_SESSIONS {
+            let index = (self.wait_cursor + offset) % MAX_SESSIONS;
+            if let Some(pending) = self.pending_waits[index] {
+                self.wait_cursor = (index + 1) % MAX_SESSIONS;
+                return Some(pending);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn finish_pending_wait(&mut self, pending: PendingWait) -> Result<(), JobError> {
+        let index = self
+            .pending_waits
+            .iter()
+            .position(|entry| *entry == Some(pending))
+            .ok_or(JobError::WrongState)?;
+        self.pending_waits[index] = None;
+        Ok(())
+    }
+
+    fn drop_session_waits(&mut self, grant: EndpointGrant) {
+        for pending in &mut self.pending_waits {
+            if pending.is_some_and(|pending| pending.grant == grant) {
+                *pending = None;
+            }
+        }
     }
 
     pub(crate) fn drain_sessions(
@@ -173,6 +269,7 @@ impl JobDispatcher {
                 count += 1;
             }
         }
+        self.pending_waits.fill(None);
         count
     }
 }
@@ -378,5 +475,54 @@ mod tests {
         ));
         assert_ne!(9, 7, "wrong job correlation must not satisfy job 7");
         assert!(parse_message(&bytes[..size - 1], 0).is_err());
+    }
+
+    #[test]
+    fn pending_waits_are_bounded_replay_exact_and_owner_correlated() {
+        let mut dispatcher = JobDispatcher::new();
+        let owner = grant(1);
+        dispatcher.install_session(owner, DwHandle(101)).unwrap();
+        for transaction_id in 1..=MAX_SESSIONS as u64 {
+            dispatcher
+                .install_pending_wait(
+                    owner,
+                    Reservation {
+                        connection_id: 1,
+                        generation: 1,
+                        transaction_id,
+                    },
+                    9,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            dispatcher.install_pending_wait(
+                owner,
+                Reservation {
+                    connection_id: 1,
+                    generation: 1,
+                    transaction_id: 1,
+                },
+                9,
+            ),
+            Err(JobError::TransactionReplay)
+        );
+        assert_eq!(
+            dispatcher.install_pending_wait(
+                owner,
+                Reservation {
+                    connection_id: 1,
+                    generation: 1,
+                    transaction_id: 17,
+                },
+                9,
+            ),
+            Err(JobError::Capacity)
+        );
+        assert!(dispatcher.cancel_pending_wait(grant(2), 1).is_none());
+        let cancelled = dispatcher.cancel_pending_wait(owner, 1).unwrap();
+        assert_eq!(cancelled.grant, owner);
+        assert_eq!(cancelled.reservation.transaction_id, 1);
+        assert_eq!(cancelled.job_id, 9);
     }
 }

@@ -251,6 +251,9 @@ struct Job {
     process: u64,
     task_group: u64,
     launch_channel: u64,
+    terminal: Option<JobResult>,
+    cleanup_result: u32,
+    published: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -312,6 +315,12 @@ pub(crate) struct PreparedJob {
     transaction_id: u64,
     pub loaded: LoadedProcess,
     pub task_group: u64,
+}
+
+impl PreparedJob {
+    pub(crate) const fn job_id(self) -> u64 {
+        self.ticket.job_id
+    }
 }
 
 /// Proof supplied only after the native dispatcher has consumed the exact
@@ -381,6 +390,7 @@ pub enum LaunchEngineError<E> {
     },
     Publication {
         error: JobError,
+        ticket: LaunchTicket,
         loaded: LoadedProcess,
         task_group: u64,
     },
@@ -464,6 +474,9 @@ impl JobController {
             process: 0,
             task_group: 0,
             launch_channel: 0,
+            terminal: None,
+            cleanup_result: 0,
+            published: false,
         });
         Ok(LaunchTicket {
             slot,
@@ -491,10 +504,48 @@ impl JobController {
         if job.id != ticket.job_id || job.owner != ticket.owner || job.phase != JobPhase::Reserved {
             return Err(JobError::WrongState);
         }
+        if job.process == 0 && job.task_group == 0 && job.launch_channel == 0 {
+            job.process = process;
+            job.task_group = task_group;
+            job.launch_channel = launch_channel;
+        } else if job.process != process
+            || job.task_group != task_group
+            || job.launch_channel != launch_channel
+        {
+            return Err(JobError::ResourceIdentity);
+        }
+        job.phase = JobPhase::Running;
+        job.published = true;
+        Ok(())
+    }
+
+    pub(crate) fn stage_launch(
+        &mut self,
+        ticket: LaunchTicket,
+        process: u64,
+        task_group: u64,
+        launch_channel: u64,
+    ) -> Result<(), JobError> {
+        if process == 0 || task_group == 0 || launch_channel == 0 {
+            return Err(JobError::ResourceIdentity);
+        }
+        let job = self
+            .jobs
+            .get_mut(ticket.slot)
+            .and_then(Option::as_mut)
+            .ok_or(JobError::UnknownJob)?;
+        if job.id != ticket.job_id
+            || job.owner != ticket.owner
+            || job.phase != JobPhase::Reserved
+            || job.process != 0
+            || job.task_group != 0
+            || job.launch_channel != 0
+        {
+            return Err(JobError::WrongState);
+        }
         job.process = process;
         job.task_group = task_group;
         job.launch_channel = launch_channel;
-        job.phase = JobPhase::Running;
         Ok(())
     }
 
@@ -535,25 +586,62 @@ impl JobController {
         job_id: u64,
     ) -> Result<JobResources, JobError> {
         let ticket = self.reserve_request(request)?;
-        self.terminate_reserved(ticket, job_id)
+        let resources = self.authorize_terminate_reserved(ticket, job_id)?;
+        self.commit_terminate(job_id, resources)?;
+        Ok(resources)
     }
 
-    pub(crate) fn terminate_reserved(
-        &mut self,
+    pub(crate) fn authorize_terminate_reserved(
+        &self,
         request: RequestTicket,
         job_id: u64,
     ) -> Result<JobResources, JobError> {
         let index = self.owned_job_index(request.owner, job_id)?;
-        let job = self.jobs[index].as_mut().unwrap();
+        let job = self.jobs[index].as_ref().unwrap();
         if job.phase != JobPhase::Running {
             return Err(JobError::WrongState);
         }
-        job.phase = JobPhase::Terminating;
         Ok(JobResources {
             process: job.process,
             task_group: job.task_group,
             launch_channel: job.launch_channel,
         })
+    }
+
+    pub(crate) fn commit_terminate(
+        &mut self,
+        job_id: u64,
+        resources: JobResources,
+    ) -> Result<(), JobError> {
+        let job = self
+            .jobs
+            .iter_mut()
+            .flatten()
+            .find(|job| job.id == job_id)
+            .ok_or(JobError::UnknownJob)?;
+        if job.phase != JobPhase::Running
+            || job.process != resources.process
+            || job.task_group != resources.task_group
+            || job.launch_channel != resources.launch_channel
+        {
+            return Err(JobError::ResourceIdentity);
+        }
+        job.phase = JobPhase::Terminating;
+        Ok(())
+    }
+
+    pub(crate) fn record_cleanup_bits(&mut self, job_id: u64, bits: u32) -> Result<(), JobError> {
+        if bits & !wyrmroot_launch_proto::CLEANUP_RESULT_MASK != 0 {
+            return Err(JobError::ResourceIdentity);
+        }
+        let job = self
+            .jobs
+            .iter_mut()
+            .flatten()
+            .find(|job| job.id == job_id)
+            .ok_or(JobError::UnknownJob)?;
+        job.cleanup_result |= bits;
+        Ok(())
     }
 
     pub fn complete(
@@ -582,9 +670,75 @@ impl JobController {
             id: job.id,
             owner: job.owner,
             result,
-            visible: !job.orphaned,
+            visible: job.published && !job.orphaned,
         });
         Ok(())
+    }
+
+    pub(crate) fn terminal_result(&self, job_id: u64) -> Result<Option<JobResult>, JobError> {
+        self.jobs
+            .iter()
+            .flatten()
+            .find(|job| job.id == job_id)
+            .map(|job| job.terminal)
+            .ok_or(JobError::UnknownJob)
+    }
+
+    pub(crate) fn apply_cleanup_progress(
+        &mut self,
+        job_id: u64,
+        mut terminal: JobResult,
+        closed_mask: u32,
+        failed_bits: u32,
+    ) -> Result<Option<JobResult>, JobError> {
+        const CLOSE_MASK: u32 = (1 << 2) | (1 << 3) | (1 << 4);
+        if closed_mask & !CLOSE_MASK != 0
+            || failed_bits & !wyrmroot_launch_proto::CLEANUP_RESULT_MASK != 0
+        {
+            return Err(JobError::ResourceIdentity);
+        }
+        terminal.cleanup_result = 0;
+        let index = self
+            .jobs
+            .iter()
+            .position(|job| job.as_ref().is_some_and(|job| job.id == job_id))
+            .ok_or(JobError::UnknownJob)?;
+        let job = self.jobs[index].as_mut().unwrap();
+        if let Some(previous) = job.terminal {
+            let mut previous = previous;
+            previous.cleanup_result = 0;
+            if previous != terminal {
+                return Err(JobError::ResourceIdentity);
+            }
+        } else {
+            job.terminal = Some(terminal);
+        }
+        if closed_mask & (1 << 2) != 0 {
+            job.launch_channel = 0;
+        }
+        if closed_mask & (1 << 3) != 0 {
+            job.process = 0;
+        }
+        if closed_mask & (1 << 4) != 0 {
+            job.task_group = 0;
+        }
+        job.cleanup_result |= failed_bits;
+        if job.process != 0 || job.task_group != 0 || job.launch_channel != 0 {
+            return Ok(None);
+        }
+        let job = self.jobs[index].take().unwrap();
+        let mut result = job.terminal.ok_or(JobError::WrongState)?;
+        result.cleanup_result = job.cleanup_result;
+        if !job.published {
+            return Ok(Some(result));
+        }
+        self.push_completed(Completed {
+            id: job.id,
+            owner: job.owner,
+            result,
+            visible: !job.orphaned,
+        });
+        Ok(Some(result))
     }
 
     pub fn result(&mut self, request: Reservation, job_id: u64) -> Result<JobResult, JobError> {
@@ -601,6 +755,21 @@ impl JobController {
             .iter()
             .flatten()
             .find(|record| record.id == job_id && record.owner == request.owner && record.visible)
+            .map(|record| record.result)
+            .ok_or(JobError::UnknownJob)
+    }
+
+    pub(crate) fn result_for_owner(
+        &self,
+        connection_id: u64,
+        generation: u64,
+        job_id: u64,
+    ) -> Result<JobResult, JobError> {
+        let owner = identity(connection_id, generation)?;
+        self.completed
+            .iter()
+            .flatten()
+            .find(|record| record.id == job_id && record.owner == owner && record.visible)
             .map(|record| record.result)
             .ok_or(JobError::UnknownJob)
     }
@@ -716,12 +885,20 @@ impl JobController {
             .count()
     }
 
+    #[cfg(test)]
+    pub(crate) const fn completed_results(&self) -> usize {
+        self.completed_len
+    }
+
     pub(crate) fn loaded_job(&self, job_id: u64) -> Result<LoadedJob, JobError> {
         let job = self
             .jobs
             .iter()
             .flatten()
-            .find(|job| job.id == job_id && job.phase != JobPhase::Reserved)
+            .find(|job| {
+                job.id == job_id
+                    && (job.process != 0 || job.task_group != 0 || job.launch_channel != 0)
+            })
             .ok_or(JobError::UnknownJob)?;
         Ok(LoadedJob {
             job_id: job.id,
@@ -733,20 +910,19 @@ impl JobController {
         })
     }
 
-    pub(crate) fn mark_orphan_terminating(
-        &mut self,
+    pub(crate) fn forced_termination_resources(
+        &self,
         job_id: u64,
     ) -> Result<Option<JobResources>, JobError> {
         let job = self
             .jobs
-            .iter_mut()
+            .iter()
             .flatten()
-            .find(|job| job.id == job_id && job.phase != JobPhase::Reserved)
+            .find(|job| job.id == job_id)
             .ok_or(JobError::UnknownJob)?;
-        if !job.orphaned || job.phase == JobPhase::Terminating {
+        if job.phase == JobPhase::Terminating || job.terminal.is_some() || job.task_group == 0 {
             return Ok(None);
         }
-        job.phase = JobPhase::Terminating;
         Ok(Some(JobResources {
             process: job.process,
             task_group: job.task_group,
@@ -754,11 +930,33 @@ impl JobController {
         }))
     }
 
-    pub(crate) fn live_job_id(&self, cursor: usize) -> Option<(usize, u64)> {
+    pub(crate) fn commit_forced_termination(
+        &mut self,
+        job_id: u64,
+        resources: JobResources,
+    ) -> Result<(), JobError> {
+        let job = self
+            .jobs
+            .iter_mut()
+            .flatten()
+            .find(|job| job.id == job_id)
+            .ok_or(JobError::UnknownJob)?;
+        if job.task_group != resources.task_group
+            || job.process != resources.process
+            || job.launch_channel != resources.launch_channel
+            || job.terminal.is_some()
+        {
+            return Err(JobError::ResourceIdentity);
+        }
+        job.phase = JobPhase::Terminating;
+        Ok(())
+    }
+
+    pub(crate) fn cleanup_job_id(&self, cursor: usize) -> Option<(usize, u64)> {
         for offset in 0..MAX_LIVE_JOBS {
             let index = (cursor + offset) % MAX_LIVE_JOBS;
             if let Some(job) = self.jobs[index]
-                && job.phase != JobPhase::Reserved
+                && (job.process != 0 || job.task_group != 0 || job.launch_channel != 0)
             {
                 return Some(((index + 1) % MAX_LIVE_JOBS, job.id));
             }
@@ -969,6 +1167,19 @@ pub(crate) fn prepare_reserved_job<'a, L: LoaderPlatform>(
             });
         }
     };
+    if let Err(error) = jobs.stage_launch(
+        ticket,
+        loaded.process.0,
+        task_group,
+        loaded.launch_channel.0,
+    ) {
+        return Err(LaunchEngineError::Publication {
+            error,
+            ticket,
+            loaded,
+            task_group,
+        });
+    }
     Ok(PreparedJob {
         ticket,
         profile,
@@ -1142,6 +1353,25 @@ mod tests {
         jobs.abort_launch(ticket).unwrap();
         assert_eq!(jobs.live_jobs(), 0);
         assert_eq!(jobs.begin_launch(request), Err(JobError::TransactionReplay));
+    }
+
+    #[test]
+    fn unpublished_staged_cleanup_never_creates_a_visible_or_completed_record() {
+        let mut jobs = JobController::new();
+        jobs.open_connection(1, 1).unwrap();
+        let ticket = jobs.begin_launch(reservation(1, 1, 1)).unwrap();
+        jobs.stage_launch(ticket, 10, 11, 12).unwrap();
+        assert_eq!(jobs.completed_results(), 0);
+        assert_eq!(
+            jobs.apply_cleanup_progress(ticket.job_id, normal(), 0x1c, 0),
+            Ok(Some(normal()))
+        );
+        assert_eq!(jobs.live_jobs(), 0);
+        assert_eq!(jobs.completed_results(), 0);
+        assert_eq!(
+            jobs.result(reservation(1, 1, 2), ticket.job_id),
+            Err(JobError::UnknownJob)
+        );
     }
 
     #[test]
