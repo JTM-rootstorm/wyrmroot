@@ -9,6 +9,7 @@
 pub mod evidence;
 pub mod gate;
 pub mod wyr1b;
+pub mod wyr1b_gate;
 
 use crate::evidence::{EvidenceError, EvidenceEvent, EvidenceLog};
 use crate::gate::{GATE_CONFIG_PATH, GateConfig, GateConfigError, parse_gate_config};

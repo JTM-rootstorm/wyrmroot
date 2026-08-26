@@ -23,6 +23,11 @@ pub const CONSOLED_PATH: &str = "system/consoled";
 pub const WYRMSH_PATH: &str = "system/wyrmsh";
 pub const RRC_MANIFEST_PATH: &str = "system/bootstrap/rrc-a-v1";
 pub const GATE_CONFIG_PATH: &str = "system/bootstrap/wyr1-a-gate-v1";
+pub const LAUNCH_POLICY_PATH: &str = "system/bootstrap/launch-policy-v1";
+pub const WYR1_B_GATE_PATH: &str = "system/bootstrap/wyr1-b-gate-v1";
+pub const HELLO_PATH: &str = "bin/hello";
+pub const WYR1_B_PUBLISHER_PATH: &str = "test/wyr1-b/publisher";
+pub const WYR1_B_CLIENT_PATH: &str = "test/wyr1-b/client";
 
 /// Canonical WYR1-A role paths, in product order.
 pub const ROLE_PATHS: [&str; 5] = [
@@ -111,6 +116,58 @@ pub fn build(product: Product<'_>) -> Result<Vec<u8>, BuildError> {
     builder.build()
 }
 
+/// Exact WYR1-B product inputs. Gate publisher/client binaries are explicit
+/// test content and do not enter the RRC-A manifest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProductB<'a> {
+    pub base: Product<'a>,
+    pub launch_policy: &'a [u8],
+    pub gate_config: &'a [u8],
+    pub hello: &'a [u8],
+    pub publisher: &'a [u8],
+    pub client: &'a [u8],
+}
+
+impl<'a> ProductB<'a> {
+    pub fn artifacts(self) -> [Artifact<'a>; 13] {
+        let base = self.base.artifacts();
+        [
+            base[0],
+            base[1],
+            base[2],
+            base[3],
+            base[4],
+            base[5],
+            base[6],
+            base[7],
+            Artifact::read_only(LAUNCH_POLICY_PATH, self.launch_policy),
+            Artifact::read_only(WYR1_B_GATE_PATH, self.gate_config),
+            Artifact::executable(HELLO_PATH, self.hello),
+            Artifact::executable(WYR1_B_PUBLISHER_PATH, self.publisher),
+            Artifact::executable(WYR1_B_CLIENT_PATH, self.client),
+        ]
+    }
+}
+
+pub fn build_b(product: ProductB<'_>) -> Result<Vec<u8>, BuildError> {
+    let mut builder = Builder::new();
+    for artifact in product.artifacts() {
+        if artifact.bytes.is_empty() {
+            return Err(BuildError::EmptyArtifact);
+        }
+        builder.add(
+            artifact.path.as_bytes(),
+            artifact.bytes,
+            if artifact.executable {
+                FileMode::Executable
+            } else {
+                FileMode::ReadOnly
+            },
+        )?;
+    }
+    builder.build()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,6 +203,51 @@ mod tests {
                 b"system/uart16550d".as_slice(),
                 b"system/wyrmsh".as_slice(),
             ]
+        );
+    }
+
+    #[test]
+    fn wyr1_b_adds_policy_hello_and_independent_gate_processes() {
+        let base = Product {
+            init: b"init",
+            registryd: b"registry",
+            devmgr: b"devmgr",
+            uart16550d: b"uart",
+            consoled: b"console",
+            wyrmsh: b"shell",
+            rrc_manifest: b"WRRM",
+            gate_config: b"a",
+        };
+        let bytes = build_b(ProductB {
+            base,
+            launch_policy: b"WRJP",
+            gate_config: b"b",
+            hello: b"hello",
+            publisher: b"publisher",
+            client: b"client",
+        })
+        .unwrap();
+        let archive = Archive::new(&bytes).unwrap();
+        for path in [
+            LAUNCH_POLICY_PATH,
+            WYR1_B_GATE_PATH,
+            HELLO_PATH,
+            WYR1_B_PUBLISHER_PATH,
+            WYR1_B_CLIENT_PATH,
+        ] {
+            assert!(archive.lookup(path.as_bytes()).is_ok());
+        }
+        assert!(
+            !archive
+                .lookup(LAUNCH_POLICY_PATH.as_bytes())
+                .unwrap()
+                .is_executable()
+        );
+        assert!(
+            archive
+                .lookup(HELLO_PATH.as_bytes())
+                .unwrap()
+                .is_executable()
         );
     }
 }
