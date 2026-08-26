@@ -9,9 +9,6 @@
 pub mod evidence;
 pub mod gate;
 
-#[cfg(feature = "wyr1-test-evidence")]
-use core::sync::atomic::{AtomicU8, Ordering};
-
 use crate::evidence::{EvidenceError, EvidenceEvent, EvidenceLog};
 use crate::gate::{GATE_CONFIG_PATH, GateConfig, GateConfigError, parse_gate_config};
 use deepwyrm_syscall::{
@@ -86,14 +83,7 @@ pub const fn fatal_application_status(_error: &InitError) -> InitApplicationStat
 /// diagnostic evidence, not part of the production application-status ABI.
 #[cfg(feature = "wyr1-test-evidence")]
 #[must_use]
-pub fn wyr1_test_failure_application_status(error: &InitError) -> u32 {
-    if matches!(
-        error,
-        InitError::Restart(RestartTransitionError::InvalidState)
-    ) {
-        let stage = WYR1_TEST_RESTART_STAGE.load(Ordering::Relaxed);
-        return 0xAF13_0003 | ((stage as u32) << 8);
-    }
+pub const fn wyr1_test_failure_application_status(error: &InitError) -> u32 {
     let category = match error {
         InitError::WrongManifestProfile => 0x01,
         InitError::UnlaunchableRole => 0x02,
@@ -122,17 +112,6 @@ pub fn wyr1_test_failure_application_status(error: &InitError) -> u32 {
     };
     0xAF11_0000 | category
 }
-
-#[cfg(feature = "wyr1-test-evidence")]
-static WYR1_TEST_RESTART_STAGE: AtomicU8 = AtomicU8::new(0);
-
-#[cfg(feature = "wyr1-test-evidence")]
-fn wyr1_test_set_restart_stage(stage: u8) {
-    WYR1_TEST_RESTART_STAGE.store(stage, Ordering::Relaxed);
-}
-
-#[cfg(not(feature = "wyr1-test-evidence"))]
-fn wyr1_test_set_restart_stage(_stage: u8) {}
 
 /// Boot-lifetime owner of the fixed supervisor state and primordial authority.
 /// The immutable bootfs handle is retained and remapped narrowly for each load;
@@ -1165,7 +1144,6 @@ where
                             });
                         }
                     };
-                    wyr1_test_set_restart_stage(6);
                     if let Err(transition_error) = controller.fail(
                         role,
                         generation,
@@ -1192,16 +1170,13 @@ where
                     let close_failed = system.close_handle(task_group).is_err();
                     if rollback_failed || close_failed {
                         let retired_at = now.checked_add(1).ok_or(InitError::Accounting)?;
-                        wyr1_test_set_restart_stage(7);
                         controller.cleanup_failed(role, generation, transaction_id, retired_at)?;
                         controller.fatal();
                         return Err(error);
                     }
                     controller.abort_reservation(reservation)?;
                     let retired_at = now.checked_add(1).ok_or(InitError::Accounting)?;
-                    wyr1_test_set_restart_stage(7);
                     controller.cleanup_complete(role, generation, transaction_id, retired_at)?;
-                    wyr1_test_set_restart_stage(10);
                     if advance_or_degrade(system, &mut controller, role, transaction_id)? {
                         controller.finalize_evidence(RecoveryResult::Degraded)?;
                         return Ok((RecoveryResult::Degraded, controller));
@@ -1357,14 +1332,12 @@ where
                             if disposition == TerminalDisposition::NormalExit(0) {
                                 break;
                             }
-                            wyr1_test_set_restart_stage(10);
                             if advance_or_degrade(system, &mut controller, role, transaction_id)? {
                                 controller.finalize_evidence(RecoveryResult::Degraded)?;
                                 return Ok((RecoveryResult::Degraded, controller));
                             }
                         }
                         Err(error) => {
-                            let failure = classify_observed_supervision(&error, true);
                             let now = match system.now().map_err(InitError::Native) {
                                 Ok(now) => now,
                                 Err(error) => {
@@ -1379,10 +1352,19 @@ where
                                     ));
                                 }
                             };
-                            wyr1_test_set_restart_stage(8);
-                            if let Err(error) =
-                                controller.fail(role, generation, transaction_id, now, failure)
-                            {
+                            let transition = match classify_after_ready_observation(&error) {
+                                AfterReadyTransition::Terminal(disposition) => controller.terminal(
+                                    role,
+                                    generation,
+                                    transaction_id,
+                                    now,
+                                    disposition,
+                                ),
+                                AfterReadyTransition::Failure(failure) => {
+                                    controller.fail(role, generation, transaction_id, now, failure)
+                                }
+                            };
+                            if let Err(error) = transition {
                                 return Err(cleanup_after_transition_error(
                                     system,
                                     waits,
@@ -1405,7 +1387,6 @@ where
                                 transaction_id,
                                 now,
                             )?;
-                            wyr1_test_set_restart_stage(10);
                             if advance_or_degrade(system, &mut controller, role, transaction_id)? {
                                 controller.finalize_evidence(RecoveryResult::Degraded)?;
                                 return Ok((RecoveryResult::Degraded, controller));
@@ -1429,7 +1410,6 @@ where
                             ));
                         }
                     };
-                    wyr1_test_set_restart_stage(9);
                     if let Err(error) =
                         controller.ready_wait_failed(role, generation, transaction_id, now, failure)
                     {
@@ -1455,7 +1435,6 @@ where
                         transaction_id,
                         now,
                     )?;
-                    wyr1_test_set_restart_stage(10);
                     if advance_or_degrade(system, &mut controller, role, transaction_id)? {
                         controller.finalize_evidence(RecoveryResult::Degraded)?;
                         return Ok((RecoveryResult::Degraded, controller));
@@ -1634,6 +1613,42 @@ fn classify_supervision(error: &SupervisionError<NativeError>) -> AttemptFailure
         }
         SupervisionError::ExitQuery(_) => AttemptFailure::ExitQueryFailed,
         _ => AttemptFailure::WaitFailed,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AfterReadyTransition {
+    Terminal(TerminalDisposition),
+    Failure(AttemptFailure),
+}
+
+fn classify_after_ready_observation(
+    error: &ObservedSupervisionError<NativeError>,
+) -> AfterReadyTransition {
+    match error {
+        ObservedSupervisionError::ExitedBeforeReady(info)
+        | ObservedSupervisionError::PeerClosedBeforeReady(info)
+        | ObservedSupervisionError::Exit(_, info) => {
+            AfterReadyTransition::Terminal(terminal_disposition(info))
+        }
+        ObservedSupervisionError::ExitObservedReadiness(_, _) => {
+            AfterReadyTransition::Failure(AttemptFailure::ReadinessFailedAfterExit)
+        }
+        ObservedSupervisionError::Supervision(error) => {
+            let failure = match error {
+                SupervisionError::Ready(_)
+                | SupervisionError::InvalidReadyReceive(_)
+                | SupervisionError::DuplicateReady => AttemptFailure::DuplicateReady,
+                SupervisionError::ExitObservedReadiness(_) => {
+                    AttemptFailure::ReadinessFailedAfterExit
+                }
+                SupervisionError::ExitQuery(_) | SupervisionError::Exit(_) => {
+                    AttemptFailure::ExitQueryFailed
+                }
+                _ => AttemptFailure::WaitFailed,
+            };
+            AfterReadyTransition::Failure(failure)
+        }
     }
 }
 
@@ -2109,6 +2124,91 @@ mod native_cleanup_tests {
     }
 
     #[test]
+    fn after_ready_observation_uses_terminal_and_failure_owners_exactly() {
+        let info = DwTaskTerminationInfoV1 {
+            reason: DW_TERMINATION_NORMAL_EXIT,
+            application_code: 7,
+            ..DwTaskTerminationInfoV1::default()
+        };
+        let terminal: ObservedSupervisionError<NativeError> =
+            ObservedSupervisionError::ExitedBeforeReady(info);
+        assert_eq!(
+            classify_after_ready_observation(&terminal),
+            AfterReadyTransition::Terminal(TerminalDisposition::NormalExit(7))
+        );
+
+        let post_exit: ObservedSupervisionError<NativeError> =
+            ObservedSupervisionError::ExitObservedReadiness(
+                wyrmroot_runtime::ExitObservedReadinessError::DuplicateReady,
+                info,
+            );
+        assert_eq!(
+            classify_after_ready_observation(&post_exit),
+            AfterReadyTransition::Failure(AttemptFailure::ReadinessFailedAfterExit)
+        );
+
+        let duplicate: ObservedSupervisionError<NativeError> =
+            ObservedSupervisionError::Supervision(SupervisionError::DuplicateReady);
+        assert_eq!(
+            classify_after_ready_observation(&duplicate),
+            AfterReadyTransition::Failure(AttemptFailure::DuplicateReady)
+        );
+    }
+
+    #[test]
+    fn after_ready_exit_race_enters_the_admitted_restart_transition() {
+        let mut supervisor = RestartSupervisor::new(WYR0_I_SUPERVISION_POLICY).unwrap();
+        supervisor.begin(1, 1, 1).unwrap();
+        supervisor.child_started(1, 1, 2).unwrap();
+        supervisor.ready(1, 1, 3).unwrap();
+        let info = DwTaskTerminationInfoV1 {
+            reason: DW_TERMINATION_NORMAL_EXIT,
+            ..DwTaskTerminationInfoV1::default()
+        };
+        let observed: ObservedSupervisionError<NativeError> =
+            ObservedSupervisionError::ExitedBeforeReady(info);
+        let AfterReadyTransition::Terminal(disposition) =
+            classify_after_ready_observation(&observed)
+        else {
+            panic!("terminal observation lost its terminal owner")
+        };
+        supervisor.terminal(1, 1, 4, disposition).unwrap();
+        assert!(matches!(
+            supervisor.state(),
+            RestartState::CleaningUp {
+                failure: AttemptFailure::ExitAfterReady(TerminalDisposition::NormalExit(0)),
+                action: wyrmroot_runtime::CleanupAction::CloseTerminal,
+                ..
+            }
+        ));
+        supervisor.cleanup_complete(1, 1, 5).unwrap();
+        assert_eq!(supervisor.state(), RestartState::Stopped);
+
+        let mut drain_failure = RestartSupervisor::new(WYR0_I_SUPERVISION_POLICY).unwrap();
+        drain_failure.begin(1, 1, 1).unwrap();
+        drain_failure.child_started(1, 1, 2).unwrap();
+        drain_failure.ready(1, 1, 3).unwrap();
+        let observed: ObservedSupervisionError<NativeError> =
+            ObservedSupervisionError::ExitObservedReadiness(
+                wyrmroot_runtime::ExitObservedReadinessError::DuplicateReady,
+                info,
+            );
+        let AfterReadyTransition::Failure(failure) = classify_after_ready_observation(&observed)
+        else {
+            panic!("post-exit readiness failure lost its failure owner")
+        };
+        drain_failure.fail_attempt(1, 1, 4, failure).unwrap();
+        assert!(matches!(
+            drain_failure.state(),
+            RestartState::CleaningUp {
+                failure: AttemptFailure::ReadinessFailedAfterExit,
+                action: wyrmroot_runtime::CleanupAction::CloseTerminal,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn rollback_failure_maps_to_exact_fatal_reboot_status() {
         let error = InitError::Loader(LoadError::Platform {
             stage: wyrmroot_loader::process::LoadStage::ProcessCreate,
@@ -2136,13 +2236,6 @@ mod native_cleanup_tests {
         assert_eq!(
             wyr1_test_failure_application_status(&InitError::WrongActivationOrder),
             0xAF11_0003
-        );
-        wyr1_test_set_restart_stage(3);
-        assert_eq!(
-            wyr1_test_failure_application_status(&InitError::Restart(
-                RestartTransitionError::InvalidState
-            )),
-            0xAF13_0303
         );
     }
 }
