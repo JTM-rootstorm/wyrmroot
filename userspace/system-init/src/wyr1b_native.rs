@@ -1003,17 +1003,18 @@ where
     W: SupervisionPlatform<Error = NativeError>,
 {
     let observed_now = system.now().map_err(InitError::Native);
-    let transition = match observed_now {
-        Ok(now) => controller
-            .fail(
+    let (transition_now, transition) = match observed_now {
+        Ok(now) => (
+            Some(now),
+            controller.fail(
                 RoleId::Registryd,
                 registry.active.generation,
                 registry.active.transaction_id,
                 now,
                 AttemptFailure::WaitFailed,
-            )
-            .map(|()| now),
-        Err(error) => Err(error),
+            ),
+        ),
+        Err(error) => (None, Err(error)),
     };
     let native_cleanup_failed = cleanup_loaded(
         system,
@@ -1027,14 +1028,38 @@ where
         | dependent_cleanup_failed;
 
     let now = match transition {
-        Ok(now) => now,
+        Ok(()) => transition_now.ok_or(InitError::Accounting)?,
         Err(error) => {
-            let retirement_failed = controller
-                .retire_attempt_after_fatal(RoleId::Registryd)
-                .is_err();
-            return Err(if native_cleanup_failed || retirement_failed {
+            let identity_mismatch = matches!(
+                error,
+                InitError::Restart(RestartTransitionError::StaleGeneration)
+                    | InitError::Restart(RestartTransitionError::TransactionMismatch)
+            );
+            let retirement = if identity_mismatch || transition_now.is_none() {
+                controller.retire_attempt_after_fatal(RoleId::Registryd)
+            } else {
+                controller.retire_active_fail_closed(
+                    RoleId::Registryd,
+                    registry.active.generation,
+                    registry.active.transaction_id,
+                    transition_now.ok_or(InitError::Accounting)?,
+                    AttemptFailure::WaitFailed,
+                    if native_cleanup_failed {
+                        CleanupDisposition::Failed
+                    } else {
+                        CleanupDisposition::Complete
+                    },
+                )
+            };
+            if retirement.is_err() {
+                let _ = controller.retire_attempt_after_fatal(RoleId::Registryd);
+            }
+            return Err(if native_cleanup_failed || retirement.is_err() {
                 InitError::Cleanup
             } else {
+                // Preserve the original transition error after complete native
+                // cleanup; its exact type explains why fail()->CleaningUp did
+                // not commit while the role is now truthfully permanent.
                 error
             });
         }
@@ -1826,8 +1851,13 @@ where
 
 #[cfg(test)]
 mod tests {
+    extern crate alloc;
+
     use super::*;
-    use deepwyrm_syscall::{DwStatus, DwWaitResultV1};
+    use alloc::{vec, vec::Vec};
+    use deepwyrm_syscall::{DwMemoryProtection, DwStatus, DwWaitResultV1};
+    use wyrmroot_bootfs::builder::{Builder as BootfsBuilder, FileMode};
+    use wyrmroot_loader::process::{ParentMapping, ProcessCreateRequest, ProcessCreateResult};
     use wyrmroot_registry_proto::{Message, parse};
 
     const FAILURE: NativeError = NativeError::Status(DwStatus(-1));
@@ -1846,6 +1876,7 @@ mod tests {
         now: Option<u64>,
         terminate_count: usize,
         allow_wait: bool,
+        task_group: Option<DwHandle>,
     }
 
     impl MockPlatform {
@@ -1864,8 +1895,216 @@ mod tests {
                 now: None,
                 terminate_count: 0,
                 allow_wait: false,
+                task_group: None,
             }
         }
+    }
+
+    struct InitSendLoader {
+        next: u64,
+        closed: [DwHandle; 32],
+        close_count: usize,
+        transferred_service: Option<DwHandle>,
+    }
+
+    impl InitSendLoader {
+        const fn new() -> Self {
+            Self {
+                next: 0x1000,
+                closed: [DwHandle(0); 32],
+                close_count: 0,
+                transferred_service: None,
+            }
+        }
+
+        fn handle(&mut self) -> DwHandle {
+            let handle = DwHandle(self.next);
+            self.next += 1;
+            handle
+        }
+
+        fn close_count(&self, handle: DwHandle) -> usize {
+            self.closed[..self.close_count]
+                .iter()
+                .filter(|closed| **closed == handle)
+                .count()
+        }
+    }
+
+    impl LoaderPlatform for InitSendLoader {
+        type Error = NativeError;
+
+        fn channel_create(
+            &mut self,
+            _rights: DwRights,
+        ) -> Result<(DwHandle, DwHandle), Self::Error> {
+            Ok((self.handle(), self.handle()))
+        }
+
+        fn duplicate(
+            &mut self,
+            _handle: DwHandle,
+            _rights: DwRights,
+        ) -> Result<DwHandle, Self::Error> {
+            Ok(self.handle())
+        }
+
+        fn close(&mut self, handle: DwHandle) -> Result<(), Self::Error> {
+            self.closed[self.close_count] = handle;
+            self.close_count += 1;
+            Ok(())
+        }
+
+        fn process_create(
+            &mut self,
+            _request: ProcessCreateRequest,
+        ) -> Result<ProcessCreateResult, Self::Error> {
+            Ok(ProcessCreateResult {
+                process: self.handle(),
+                root: self.handle(),
+                child_bootstrap: self.handle(),
+            })
+        }
+
+        fn memory_create(
+            &mut self,
+            _bytes: u64,
+            _rights: DwRights,
+        ) -> Result<DwHandle, Self::Error> {
+            Ok(self.handle())
+        }
+
+        fn materialize_parent(
+            &mut self,
+            _parent_root: DwHandle,
+            memory: DwHandle,
+            object_size: u64,
+            _destination_offset: u64,
+            _source: &[u8],
+        ) -> Result<ParentMapping, Self::Error> {
+            Ok(ParentMapping {
+                address: 0x6000_0000 + memory.0 * 0x10_0000,
+                bytes: object_size,
+            })
+        }
+
+        fn unmap_parent(
+            &mut self,
+            _parent_root: DwHandle,
+            _mapping: ParentMapping,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn map_child(
+            &mut self,
+            _child_root: DwHandle,
+            _memory: DwHandle,
+            _address: u64,
+            _bytes: u64,
+            _protection: DwMemoryProtection,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn unmap_child(
+            &mut self,
+            _child_root: DwHandle,
+            _address: u64,
+            _bytes: u64,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn thread_create(
+            &mut self,
+            _process: DwHandle,
+            _rights: DwRights,
+        ) -> Result<DwHandle, Self::Error> {
+            Ok(self.handle())
+        }
+
+        fn send_init(
+            &mut self,
+            _channel: DwHandle,
+            _bytes: &[u8],
+            transfers: &[DwHandleTransferV1],
+        ) -> Result<(), Self::Error> {
+            self.transferred_service = transfers.last().map(|transfer| transfer.handle);
+            Err(FAILURE)
+        }
+
+        fn thread_start(
+            &mut self,
+            _thread: DwHandle,
+            _entry: u64,
+            _stack_pointer: u64,
+            _child_bootstrap: DwHandle,
+            _startup_abi: u64,
+        ) -> Result<(), Self::Error> {
+            panic!("failed INIT must prevent thread start")
+        }
+
+        fn thread_terminate(&mut self, _thread: DwHandle) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn process_terminate(&mut self, _process: DwHandle) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    fn executable() -> Vec<u8> {
+        let mut bytes = vec![0_u8; 0x2000];
+        bytes[..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = 2;
+        bytes[5] = 1;
+        bytes[6] = 1;
+        bytes[16..18].copy_from_slice(&2_u16.to_le_bytes());
+        bytes[18..20].copy_from_slice(&62_u16.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[24..32].copy_from_slice(&0x400000_u64.to_le_bytes());
+        bytes[32..40].copy_from_slice(&64_u64.to_le_bytes());
+        bytes[52..54].copy_from_slice(&64_u16.to_le_bytes());
+        bytes[54..56].copy_from_slice(&56_u16.to_le_bytes());
+        bytes[56..58].copy_from_slice(&1_u16.to_le_bytes());
+        bytes[64..68].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[68..72].copy_from_slice(&5_u32.to_le_bytes());
+        bytes[72..80].copy_from_slice(&0x1000_u64.to_le_bytes());
+        bytes[80..88].copy_from_slice(&0x400000_u64.to_le_bytes());
+        bytes[88..96].copy_from_slice(&0x400000_u64.to_le_bytes());
+        bytes[96..104].copy_from_slice(&16_u64.to_le_bytes());
+        bytes[104..112].copy_from_slice(&32_u64.to_le_bytes());
+        bytes[112..120].copy_from_slice(&4096_u64.to_le_bytes());
+        bytes
+    }
+
+    fn service_bootfs(path: &str, image: &[u8]) -> Vec<u8> {
+        let mut builder = BootfsBuilder::new();
+        builder
+            .add(path.as_bytes(), image, FileMode::Executable)
+            .unwrap();
+        builder.build().unwrap()
+    }
+
+    fn starting_registry(image: &[u8]) -> SystemInit {
+        let mut controller = SystemInit {
+            mode: SystemMode::Bootstrap,
+            roles: [
+                RoleController::new(RoleId::Registryd, wyrmroot_runtime::sha256::digest(image))
+                    .unwrap(),
+                RoleController::new(RoleId::Devmgr, [2; 32]).unwrap(),
+            ],
+            degraded_transitions: 0,
+            activated: [false; EARLY_ROLE_COUNT],
+            accounting: AttemptLedger::new(),
+            gate: None,
+            evidence: None,
+            registry_startup_profile: StartupProfile::BootstrapRegistry,
+        };
+        controller.become_operational().unwrap();
+        controller.begin_registry(0, 1, 0x1001).unwrap();
+        controller
     }
 
     impl InitPlatform for MockPlatform {
@@ -1916,7 +2155,7 @@ mod tests {
             &mut self,
             _parent: DwHandle,
         ) -> Result<DwHandle, NativeError> {
-            Err(FAILURE)
+            self.task_group.ok_or(FAILURE)
         }
         fn terminate_task_group(&mut self, _task_group: DwHandle) -> Result<(), NativeError> {
             self.terminate_count += 1;
@@ -2065,6 +2304,102 @@ mod tests {
     }
 
     #[test]
+    fn registry_init_send_failure_is_closed_once_by_controller() {
+        let image = executable();
+        let bootfs = service_bootfs(REGISTRY_PATH, &image);
+        let mut controller = starting_registry(&image);
+        let mut platform = MockPlatform::new();
+        platform.task_group = Some(DwHandle(22));
+        let mut loader = InitSendLoader::new();
+        let mut waits = TerminalWaits;
+        let authority = LoadAuthority {
+            parent_root: DwHandle(1),
+            bootfs: DwHandle(2),
+            task_group: DwHandle(3),
+        };
+
+        assert!(matches!(
+            launch_registry(
+                &mut platform,
+                &mut loader,
+                &mut waits,
+                &mut controller,
+                authority,
+                &bootfs,
+            ),
+            Err(InitError::Loader(LoadError::Platform {
+                stage: wyrmroot_loader::process::LoadStage::InitSend,
+                rollback_failed: false,
+                ..
+            }))
+        ));
+        assert_eq!(loader.transferred_service, Some(DwHandle(21)));
+        assert_eq!(loader.close_count(DwHandle(21)), 0);
+        assert_eq!(
+            platform.closed[..platform.close_count]
+                .iter()
+                .filter(|handle| **handle == DwHandle(21))
+                .count(),
+            1
+        );
+        assert_eq!(
+            platform.closed[..platform.close_count],
+            [DwHandle(21), DwHandle(20), DwHandle(22)]
+        );
+        assert_eq!(controller.outstanding_reservations(), 0);
+    }
+
+    #[test]
+    fn peer_init_send_failure_is_closed_once_after_registry_install() {
+        let image = executable();
+        let bootfs = service_bootfs(PUBLISHER_PATH, &image);
+        let mut topology = RegistryTopology::new(7).unwrap();
+        let mut platform = MockPlatform::new();
+        platform.task_group = Some(DwHandle(22));
+        let mut loader = InitSendLoader::new();
+        let mut waits = TerminalWaits;
+        let authority = LoadAuthority {
+            parent_root: DwHandle(1),
+            bootfs: DwHandle(2),
+            task_group: DwHandle(3),
+        };
+
+        assert!(matches!(
+            launch_peer(
+                &mut platform,
+                &mut loader,
+                &mut waits,
+                authority,
+                &bootfs,
+                DwHandle(10),
+                &mut topology,
+                PeerKind::Publisher { operation: 1 },
+            ),
+            Err(PeerLaunchError::InstallCommitted(InitError::Loader(
+                LoadError::Platform {
+                    stage: wyrmroot_loader::process::LoadStage::InitSend,
+                    rollback_failed: false,
+                    ..
+                }
+            )))
+        ));
+        assert_eq!(loader.transferred_service, Some(DwHandle(21)));
+        assert_eq!(loader.close_count(DwHandle(21)), 0);
+        assert_eq!(
+            platform.closed[..platform.close_count]
+                .iter()
+                .filter(|handle| **handle == DwHandle(21))
+                .count(),
+            1
+        );
+        assert_eq!(
+            platform.closed[..platform.close_count],
+            [DwHandle(21), DwHandle(22)]
+        );
+        assert!(!platform.closed[..platform.close_count].contains(&DwHandle(20)));
+    }
+
+    #[test]
     fn poison_consumes_every_native_owner_when_clock_transition_cannot_start() {
         let (mut controller, registry) = ready_registry();
         let mut platform = MockPlatform::new();
@@ -2081,6 +2416,96 @@ mod tests {
         );
         assert!(controller.resources(RoleId::Registryd).is_none());
         assert_eq!(controller.mode(), SystemMode::Fatal);
+    }
+
+    #[test]
+    fn poison_transition_rejection_still_consumes_native_owners_and_retires_fatal() {
+        let (mut controller, mut registry) = ready_registry();
+        registry.active.transaction_id += 1;
+        let mut platform = MockPlatform::new();
+        platform.now = Some(3);
+        let mut waits = TerminalWaits;
+
+        assert_eq!(
+            poison_registry_generation(&mut platform, &mut waits, &mut controller, registry, false,),
+            Err(InitError::Restart(
+                RestartTransitionError::TransactionMismatch
+            ))
+        );
+        assert_eq!(platform.terminate_count, 1);
+        assert_eq!(
+            platform.closed[..platform.close_count],
+            [DwHandle(32), DwHandle(31), DwHandle(30), DwHandle(33)]
+        );
+        assert!(controller.resources(RoleId::Registryd).is_none());
+        assert_eq!(controller.mode(), SystemMode::Fatal);
+        assert!(!matches!(
+            controller.role_state(RoleId::Registryd),
+            Some(RestartState::CleaningUp { .. })
+        ));
+    }
+
+    #[test]
+    fn poison_timestamp_overflow_records_failure_without_stranding_cleanup() {
+        let (mut controller, registry) = ready_registry();
+        let mut platform = MockPlatform::new();
+        platform.now = Some(u64::MAX);
+        let mut waits = TerminalWaits;
+
+        assert_eq!(
+            poison_registry_generation(&mut platform, &mut waits, &mut controller, registry, false,),
+            Err(InitError::Restart(
+                RestartTransitionError::ArithmeticOverflow
+            ))
+        );
+        assert_eq!(platform.terminate_count, 1);
+        assert_eq!(
+            platform.closed[..platform.close_count],
+            [DwHandle(32), DwHandle(31), DwHandle(30), DwHandle(33)]
+        );
+        assert_eq!(controller.outstanding_reservations(), 0);
+        assert!(controller.resources(RoleId::Registryd).is_none());
+        assert_eq!(
+            controller.role_state(RoleId::Registryd),
+            Some(RestartState::PermanentFailure {
+                final_failure: AttemptFailure::WaitFailed,
+                cleanup: CleanupDisposition::Complete,
+            })
+        );
+        assert_eq!(controller.mode(), SystemMode::Degraded);
+        assert!(!matches!(
+            controller.role_state(RoleId::Registryd),
+            Some(RestartState::CleaningUp { .. })
+        ));
+    }
+
+    #[test]
+    fn poison_timestamp_overflow_preserves_cleanup_failure_precedence() {
+        let (mut controller, registry) = ready_registry();
+        let mut platform = MockPlatform::new();
+        platform.now = Some(u64::MAX);
+        platform.fail_close = Some(registry.control_channel);
+        let mut waits = TerminalWaits;
+
+        assert_eq!(
+            poison_registry_generation(&mut platform, &mut waits, &mut controller, registry, false,),
+            Err(InitError::Cleanup)
+        );
+        assert_eq!(platform.terminate_count, 1);
+        assert_eq!(
+            platform.closed[..platform.close_count],
+            [DwHandle(32), DwHandle(31), DwHandle(30), DwHandle(33)]
+        );
+        assert!(controller.resources(RoleId::Registryd).is_some());
+        assert_eq!(controller.outstanding_reservations(), 1);
+        assert_eq!(controller.mode(), SystemMode::Degraded);
+        assert_eq!(
+            controller.role_state(RoleId::Registryd),
+            Some(RestartState::PermanentFailure {
+                final_failure: AttemptFailure::WaitFailed,
+                cleanup: CleanupDisposition::Failed,
+            })
+        );
     }
 
     #[test]

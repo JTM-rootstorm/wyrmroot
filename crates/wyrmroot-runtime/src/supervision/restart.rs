@@ -489,6 +489,63 @@ impl RestartSupervisor {
         self.enter_cleanup(now_ns, failure, action, true)
     }
 
+    /// Retires an exact active identity when its ordinary failure transition
+    /// could not commit before native cleanup had to proceed.
+    ///
+    /// This is a terminal fail-closed path: it records the supplied failure
+    /// and observed cleanup disposition directly, without constructing a
+    /// cleanup deadline or admitting a replacement generation.
+    pub fn retire_active_fail_closed(
+        &mut self,
+        generation: u64,
+        transaction_id: u64,
+        now_ns: u64,
+        failure: AttemptFailure,
+        cleanup: CleanupDisposition,
+    ) -> Result<(), RestartTransitionError> {
+        let (attempt, current_generation, current_transaction) = match self.state {
+            RestartState::Starting {
+                attempt,
+                generation,
+                transaction_id,
+                ..
+            }
+            | RestartState::AwaitingReady {
+                attempt,
+                generation,
+                transaction_id,
+                ..
+            }
+            | RestartState::Ready {
+                attempt,
+                generation,
+                transaction_id,
+            } => (attempt, generation, transaction_id),
+            _ => return self.identity_error_or_invalid_state(generation, transaction_id),
+        };
+        validate_event_identity(
+            generation,
+            transaction_id,
+            current_generation,
+            current_transaction,
+        )?;
+        self.observe_time(now_ns)?;
+        self.history.push(AttemptRecord {
+            attempt,
+            generation,
+            transaction_id,
+            started_at_ns: self.attempt_started_at_ns,
+            terminal_at_ns: now_ns,
+            failure,
+            cleanup,
+        })?;
+        self.state = RestartState::PermanentFailure {
+            final_failure: failure,
+            cleanup,
+        };
+        Ok(())
+    }
+
     /// Records a structured terminal Process disposition for the current generation.
     pub fn terminal(
         &mut self,
@@ -1441,6 +1498,81 @@ mod tests {
         assert_eq!(
             supervisor.history().as_slice()[0].unwrap().cleanup,
             CleanupDisposition::Failed
+        );
+    }
+
+    #[test]
+    fn fail_closed_retirement_records_complete_cleanup_without_replacement() {
+        let mut supervisor = supervisor();
+        begin_started(&mut supervisor, 0);
+        supervisor.ready(1, 11, 1).unwrap();
+
+        supervisor
+            .retire_active_fail_closed(
+                1,
+                11,
+                u64::MAX,
+                AttemptFailure::WaitFailed,
+                CleanupDisposition::Complete,
+            )
+            .unwrap();
+
+        assert_eq!(
+            supervisor.state(),
+            RestartState::PermanentFailure {
+                final_failure: AttemptFailure::WaitFailed,
+                cleanup: CleanupDisposition::Complete,
+            }
+        );
+        assert_eq!(
+            supervisor.history().as_slice(),
+            &[Some(AttemptRecord {
+                attempt: 1,
+                generation: 1,
+                transaction_id: 11,
+                started_at_ns: 0,
+                terminal_at_ns: u64::MAX,
+                failure: AttemptFailure::WaitFailed,
+                cleanup: CleanupDisposition::Complete,
+            })]
+        );
+    }
+
+    #[test]
+    fn fail_closed_retirement_is_identity_exact_and_records_failed_cleanup() {
+        let mut supervisor = supervisor();
+        begin_started(&mut supervisor, 0);
+        supervisor.ready(1, 11, 1).unwrap();
+        let ready = supervisor.state();
+
+        assert_eq!(
+            supervisor.retire_active_fail_closed(
+                1,
+                12,
+                2,
+                AttemptFailure::WaitFailed,
+                CleanupDisposition::Failed,
+            ),
+            Err(RestartTransitionError::TransactionMismatch)
+        );
+        assert_eq!(supervisor.state(), ready);
+        assert!(supervisor.history().is_empty());
+
+        supervisor
+            .retire_active_fail_closed(
+                1,
+                11,
+                2,
+                AttemptFailure::WaitFailed,
+                CleanupDisposition::Failed,
+            )
+            .unwrap();
+        assert_eq!(
+            supervisor.state(),
+            RestartState::PermanentFailure {
+                final_failure: AttemptFailure::WaitFailed,
+                cleanup: CleanupDisposition::Failed,
+            }
         );
     }
 

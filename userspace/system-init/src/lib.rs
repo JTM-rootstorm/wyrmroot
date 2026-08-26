@@ -955,6 +955,48 @@ impl SystemInit {
         Ok(())
     }
 
+    /// Retires an exact active role after its ordinary transition into
+    /// `CleaningUp` failed but the caller has already attempted native owner
+    /// release. Complete cleanup releases the installed accounting reservation
+    /// exactly once; failed cleanup remains retained and blocks replacement.
+    pub fn retire_active_fail_closed(
+        &mut self,
+        role: RoleId,
+        generation: u64,
+        transaction: u64,
+        now: u64,
+        failure: AttemptFailure,
+        cleanup: CleanupDisposition,
+    ) -> Result<(), InitError> {
+        let index = self.index(role).ok_or(InitError::UnlaunchableRole)?;
+        if self.roles[index].resources.is_none() {
+            return Err(InitError::MissingAttemptResources);
+        }
+        self.roles[index].restart.retire_active_fail_closed(
+            generation,
+            transaction,
+            now,
+            failure,
+            cleanup,
+        )?;
+        if cleanup == CleanupDisposition::Complete {
+            let mut resources = self.roles[index]
+                .resources
+                .take()
+                .ok_or(InitError::MissingAttemptResources)?;
+            self.accounting.release(&mut resources.reservation)?;
+            self.record_evidence(
+                EvidenceEvent::Reap,
+                role,
+                generation,
+                transaction,
+                reap_evidence_value(failure),
+            )?;
+        }
+        self.update_permanent_failure(role)?;
+        Ok(())
+    }
+
     pub fn start_replacement(
         &mut self,
         role: RoleId,
@@ -2357,6 +2399,104 @@ mod native_cleanup_tests {
             loaded,
             task_group,
         }
+    }
+
+    fn ready_registry_controller() -> SystemInit {
+        let mut controller = SystemInit {
+            mode: SystemMode::Bootstrap,
+            roles: [
+                RoleController::new(RoleId::Registryd, [1; 32]).unwrap(),
+                RoleController::new(RoleId::Devmgr, [2; 32]).unwrap(),
+            ],
+            degraded_transitions: 0,
+            activated: [false; EARLY_ROLE_COUNT],
+            accounting: AttemptLedger::new(),
+            gate: None,
+            evidence: None,
+            registry_startup_profile: StartupProfile::EarlyBootStub,
+        };
+        controller.become_operational().unwrap();
+        controller.begin_registry(0, 1, 0x1001).unwrap();
+        install_ready_attempt(
+            &mut controller,
+            RoleId::Registryd,
+            1,
+            0x1001,
+            (10, 20, 30),
+            1,
+        );
+        controller
+    }
+
+    #[test]
+    fn fail_closed_complete_retirement_releases_accounting_and_degrades() {
+        let mut controller = ready_registry_controller();
+        assert_eq!(controller.outstanding_reservations(), 1);
+
+        controller
+            .retire_active_fail_closed(
+                RoleId::Registryd,
+                1,
+                0x1001,
+                u64::MAX,
+                AttemptFailure::WaitFailed,
+                CleanupDisposition::Complete,
+            )
+            .unwrap();
+
+        assert!(controller.resources(RoleId::Registryd).is_none());
+        assert_eq!(controller.outstanding_reservations(), 0);
+        assert_eq!(controller.mode(), SystemMode::Degraded);
+        assert_eq!(
+            controller.role_state(RoleId::Registryd),
+            Some(RestartState::PermanentFailure {
+                final_failure: AttemptFailure::WaitFailed,
+                cleanup: CleanupDisposition::Complete,
+            })
+        );
+    }
+
+    #[test]
+    fn fail_closed_retirement_is_identity_exact_and_failed_cleanup_stays_owned() {
+        let mut controller = ready_registry_controller();
+        let ready = controller.role_state(RoleId::Registryd);
+
+        assert_eq!(
+            controller.retire_active_fail_closed(
+                RoleId::Registryd,
+                1,
+                0x1002,
+                3,
+                AttemptFailure::WaitFailed,
+                CleanupDisposition::Complete,
+            ),
+            Err(InitError::Restart(
+                RestartTransitionError::TransactionMismatch
+            ))
+        );
+        assert_eq!(controller.role_state(RoleId::Registryd), ready);
+        assert_eq!(controller.outstanding_reservations(), 1);
+
+        controller
+            .retire_active_fail_closed(
+                RoleId::Registryd,
+                1,
+                0x1001,
+                3,
+                AttemptFailure::WaitFailed,
+                CleanupDisposition::Failed,
+            )
+            .unwrap();
+        assert!(controller.resources(RoleId::Registryd).is_some());
+        assert_eq!(controller.outstanding_reservations(), 1);
+        assert_eq!(controller.mode(), SystemMode::Degraded);
+        assert!(matches!(
+            controller.role_state(RoleId::Registryd),
+            Some(RestartState::PermanentFailure {
+                cleanup: CleanupDisposition::Failed,
+                ..
+            })
+        ));
     }
 
     #[test]
