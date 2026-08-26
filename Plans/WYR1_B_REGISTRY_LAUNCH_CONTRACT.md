@@ -105,6 +105,10 @@ rights before use.
 | `LaunchClient` | self root; launch-session Channel |
 | `JobV2` | zero or exactly three stream Channels in stdin, stdout, stderr order |
 
+The WRRM v1 startup-profile field truthfully encodes `BootstrapRegistry` as
+wire value `2`. WYR1-A manifests continue to encode `EarlyBootStub` as `1`;
+selector 25 is not reinterpreted and no retained role gains a launch profile.
+
 Exact role contracts are:
 
 | Role | Object | Exact child rights |
@@ -155,11 +159,26 @@ checked correlation values and never manufacture authority.
 
 Restarting registryd closes every old control, publication, and client endpoint.
 Init waits for exact terminal cleanup, creates fresh pairs and a nonzero new
-registry generation, then relaunches dependent bootstrap publisher/client
+registry generation exactly equal to the new RRC `Registryd` role generation,
+then relaunches dependent bootstrap publisher/client
 generations with fresh Channels and fresh correlation environment entries. It
 reinstalls only policy-authorized current service and client generations; it
 does not claim that a running old peer can be rebound. Old endpoints cannot
 register with or satisfy the new registry.
+
+Controller-issued endpoint IDs are boot-monotonic across registry restarts;
+the allocator never resets during one boot. Endpoint generation remains
+nonzero correlation metadata, but a new registry generation receives fresh
+endpoint IDs as well as fresh Channels. This makes old numeric identities
+unavailable for accidental rebinding even after registryd's generation-local
+issued-identity ledgers are discarded.
+
+WRRG v1 has no installation acknowledgement. Therefore an init-side failure
+after a successful atomic `INSTALL_PUBLICATION` or `INSTALL_CLIENT` MOVE cannot
+prove whether registryd committed the grant. Init poisons and restarts the
+whole registry generation, tears down all dependent peers first, and never
+retries installation against that generation. Failures before the atomic MOVE
+commits remain locally recoverable because init still owns the endpoint.
 
 ## 6. WRRG version 1 envelope
 
@@ -557,6 +576,12 @@ test-local diagnostic class is `1..=0xFFFF`. A failure class is never a
 little-endian u64 sequence `[nonce,R,C,CG,P,SG,op]`, offset basis
 `0xCBF29CE484222325`, prime `0x100000001B3`. The independent vector
 `[1,2,3,4,5,6,1]` yields `0x4322F6213655B843`.
+
+For registry operations, `P/SG` means the controller-issued publication
+endpoint ID and endpoint generation, not publication ID and not service
+generation. Likewise `C/CG` is the installed client endpoint ID/generation.
+Service generation remains WRRG installation state and is never substituted
+into a WRTG actor field.
 
 | Type | Name | Exact direction and meaning |
 | ---: | --- | --- |
