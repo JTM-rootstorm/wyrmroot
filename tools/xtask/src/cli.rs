@@ -31,6 +31,10 @@ Usage:
     cargo xtask dw1b measure --init <elf> --hello <elf> --cpu-hog <elf> --progress <elf>
     cargo xtask dw1b evidence --request <dw1-b-request.toml>
     cargo xtask dw1c prepare --request <dw1-c-request.toml>
+    cargo xtask dw1c freeze --output <directory>
+    cargo xtask dw1c image --request <dw1-c-request.toml>
+    cargo xtask dw1c image-rebuild --request <dw1-c-request.toml>
+    cargo xtask dw1c inspect --request <dw1-c-request.toml>
 
 Host filters may name a component (bootfs, protocol, elf, runtime, bootstrap,
 efi, init0, hello, or xtask), package:<workspace-package>, or test:<substring>.
@@ -134,6 +138,10 @@ pub(crate) enum Action {
     },
     Dw1BEvidence(String),
     Dw1CPrepare(String),
+    Dw1CFreeze(String),
+    Dw1CImage(String),
+    Dw1CImageRebuild(String),
+    Dw1CInspect(String),
     Unavailable(&'static str),
 }
 
@@ -191,11 +199,23 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
 
 fn dispatch_dw1c(arguments: &[String]) -> Result<Action, Failure> {
     match arguments {
+        [command, flag, output] if command == "freeze" && flag == "--output" => {
+            Ok(Action::Dw1CFreeze(output.clone()))
+        }
+        [command, flag, request] if command == "image" && flag == "--request" => {
+            Ok(Action::Dw1CImage(request.clone()))
+        }
+        [command, flag, request] if command == "image-rebuild" && flag == "--request" => {
+            Ok(Action::Dw1CImageRebuild(request.clone()))
+        }
+        [command, flag, request] if command == "inspect" && flag == "--request" => {
+            Ok(Action::Dw1CInspect(request.clone()))
+        }
         [command, flag, request] if command == "prepare" && flag == "--request" => {
             Ok(Action::Dw1CPrepare(request.clone()))
         }
         _ => Err(Failure::usage(
-            "dw1c requires prepare --request <dw1-c-request.toml>",
+            "dw1c requires freeze --output <directory>, image|image-rebuild|inspect|prepare --request <dw1-c-request.toml>",
         )),
     }
 }
@@ -643,6 +663,36 @@ mod tests {
                 "request.toml",
             ])),
             Ok(Action::Dw1BImageRebuild("request.toml".into()))
+        );
+    }
+
+    #[test]
+    fn dw1c_product_commands_dispatch_to_request_bound_actions() {
+        assert_eq!(
+            dispatch(&arguments(&["dw1c", "freeze", "--output", "freeze"])),
+            Ok(Action::Dw1CFreeze("freeze".into()))
+        );
+        assert_eq!(
+            dispatch(&arguments(&["dw1c", "image", "--request", "request.toml"])),
+            Ok(Action::Dw1CImage("request.toml".into()))
+        );
+        assert_eq!(
+            dispatch(&arguments(&[
+                "dw1c",
+                "image-rebuild",
+                "--request",
+                "request.toml"
+            ])),
+            Ok(Action::Dw1CImageRebuild("request.toml".into()))
+        );
+        assert_eq!(
+            dispatch(&arguments(&[
+                "dw1c",
+                "inspect",
+                "--request",
+                "request.toml"
+            ])),
+            Ok(Action::Dw1CInspect("request.toml".into()))
         );
     }
 

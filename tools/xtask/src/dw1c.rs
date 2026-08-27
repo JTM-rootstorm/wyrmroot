@@ -205,6 +205,65 @@ pub fn prepare(request_path: &Path) -> Result<String, Failure> {
     ))
 }
 
+/// Build the deterministic FAT ESP from a fully-qualified selector request.
+/// Artifact compilation is intentionally owned by the request's isolated
+/// build lane; this operation only assembles and verifies immutable inputs.
+pub fn image(request_path: &Path) -> Result<String, Failure> {
+    let request = Request::load(request_path)?;
+    let bootfs = read_regular(&request.path("bootfs")?, "DW1-C bootfs")?;
+    let pages = bootfs.len().div_ceil(4096);
+    let receipt = request.build_receipt.clone();
+    verify_build_receipt(&request, &receipt)?;
+    let receipt_values = scalars(
+        core::str::from_utf8(&read_regular(&receipt, "DW1-C build receipt")?)
+            .map_err(|_| Failure::task("DW1-C build receipt is not UTF-8"))?,
+    )?;
+    if request.values["bootfs_sha256"] != sha256::bytes_digest(&bootfs)
+        || receipt_values.get("bootfs_max_pages") != Some(&pages.to_string())
+    {
+        return Err(Failure::task("DW1-C bootfs identity or page count drifted"));
+    }
+    let args = crate::cli::G3ImageArguments {
+        image: request.path("esp")?.display().to_string(),
+        loader: request.path("loader")?.display().to_string(),
+        kernel: request.path("kernel")?.display().to_string(),
+        bootstrap: request.path("bootstrap")?.display().to_string(),
+        bootfs: request.path("bootfs")?.display().to_string(),
+    };
+    let result = crate::g3_image::build(&args)?;
+    Ok(format!("DW1_C_IMAGE_PASS pages={pages} {result}"))
+}
+
+pub fn inspect(request_path: &Path) -> Result<String, Failure> {
+    let request = Request::load(request_path)?;
+    for label in INPUTS {
+        let path = request.path(label)?;
+        let bytes = read_regular(&path, "DW1-C artifact")?;
+        if sha256::bytes_digest(&bytes) != request.values[&format!("{label}_sha256")] {
+            return Err(Failure::task(format!("DW1-C {label} hash mismatch")));
+        }
+    }
+    verify_build_receipt(&request, &request.build_receipt)?;
+    let args = crate::cli::G3ImageArguments {
+        image: request.path("esp")?.display().to_string(),
+        loader: request.path("loader")?.display().to_string(),
+        kernel: request.path("kernel")?.display().to_string(),
+        bootstrap: request.path("bootstrap")?.display().to_string(),
+        bootfs: request.path("bootfs")?.display().to_string(),
+    };
+    let result = crate::g3_image::inspect(&args)?;
+    Ok(format!("DW1_C_INSPECTION_PASS {result}"))
+}
+
+pub fn freeze(output: &Path) -> Result<String, Failure> {
+    if output.exists() {
+        return Err(Failure::task("DW1-C freeze output already exists"));
+    }
+    Err(Failure::task(
+        "DW1-C freeze requires the isolated build lane to provide product artifacts",
+    ))
+}
+
 fn verify_build_receipt(request: &Request, path: &Path) -> Result<(), Failure> {
     let bytes = read_regular(path, "DW1-C build receipt")?;
     let values = scalars(
@@ -249,6 +308,12 @@ fn verify_build_receipt(request: &Request, path: &Path) -> Result<(), Failure> {
     if !(1..=8192).contains(&pages) {
         return Err(Failure::task(
             "DW1-C build receipt bootfs_max_pages is out of range",
+        ));
+    }
+    let actual_bootfs = read_regular(&request.path("bootfs")?, "DW1-C bootfs")?;
+    if pages != actual_bootfs.len().div_ceil(4096) {
+        return Err(Failure::task(
+            "DW1-C build receipt bootfs_max_pages does not match bootfs size",
         ));
     }
     for label in INPUTS {
