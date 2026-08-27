@@ -433,6 +433,9 @@ fn render_wyr_source_receipt(
     actors: &[Vec<u8>; 10],
     toolchain_validation_report_sha256: &str,
 ) -> Result<String, Failure> {
+    // C0 §9.1 binds nonce/digest/pages to the Deep selector build.  Native
+    // init0 and actors consume only the digest for challenge correlation, so
+    // this Wyrmroot source receipt intentionally has no evidence_nonce field.
     let repository = crate::tasks::repository_root()?;
     let cargo_lock_sha256 = sha256::file_digest(&repository.join("Cargo.lock"))
         .map_err(|error| Failure::task(format!("could not hash Cargo.lock: {error}")))?;
@@ -1185,6 +1188,17 @@ fn canonical_repository_path(path: &Path, label: &str) -> Result<PathBuf, Failur
             "DW1-C {label} repository contains a symlink or escape"
         )));
     }
+    let wyrmroot = crate::tasks::repository_root()?;
+    let project = wyrmroot
+        .ancestors()
+        .find(|ancestor| ancestor.ends_with("OS-Project"))
+        .ok_or_else(|| Failure::task("DW1-C could not locate OS-Project root"))?;
+    let expected = fs::canonicalize(project.join("deepwyrm")).map_err(io)?;
+    if canonical != expected {
+        return Err(Failure::task(
+            "DW1-C Deepwyrm repository must be the canonical OS-Project sibling",
+        ));
+    }
     Ok(canonical)
 }
 
@@ -1826,6 +1840,25 @@ mod tests {
             REQUEST_KEYS.into_iter().collect()
         );
         assert_eq!(request_values["campaign_directory"], "campaign");
+    }
+
+    #[test]
+    fn explicit_deep_repository_rejects_non_sibling_path() {
+        assert!(canonical_repository_path(Path::new("/tmp"), "Deepwyrm").is_err());
+    }
+
+    #[test]
+    fn wyr_source_contract_binds_digest_but_not_deep_only_nonce() {
+        let source = include_str!("dw1c.rs");
+        let renderer = source
+            .split_once("fn render_wyr_source_receipt")
+            .expect("source receipt renderer")
+            .1
+            .split_once("fn native_build_command")
+            .expect("next item")
+            .0;
+        assert!(renderer.contains("progress_digest"));
+        assert!(renderer.contains("no evidence_nonce field"));
     }
 
     #[test]
