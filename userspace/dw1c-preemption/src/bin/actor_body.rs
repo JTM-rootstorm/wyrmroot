@@ -77,24 +77,6 @@ fn payload_main(startup: StartupBlock<'_>) -> u32 {
     if TOKEN >= 9 {
         return 0;
     }
-    if TOKEN == 6 {
-        if wait_one(
-            channel,
-            DwSignals(DW_SIGNAL_READABLE.0),
-            DW_DEADLINE_INFINITE,
-        )
-        .is_err()
-        {
-            return 0xD1C0_0600;
-        }
-        let mut byte = [0_u8; 1];
-        if receive_channel(channel, &mut byte, &mut []).is_err() {
-            return 0xD1C0_0601;
-        }
-        if byte[0] != 0xC6 {
-            return 0xD1C0_0602;
-        }
-    }
     if TOKEN == 7 {
         let payload = [0xA7_u8; 128];
         loop {

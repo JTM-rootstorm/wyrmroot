@@ -867,19 +867,17 @@ const DW1C_ACTOR_PATHS: [&[u8]; wyrmroot_runtime::DW1C_ACTOR_COUNT] = [
 #[cfg(feature = "dw1c-preemption-integration")]
 const DW1C_GO: [u8; 1] = [1];
 #[cfg(feature = "dw1c-preemption-integration")]
-const DW1C_ACTOR6_WAKE: [u8; 1] = [0xC6];
 #[cfg(all(test, feature = "dw1c-preemption-integration"))]
 const DW1C_POST_ARM_ORDER: [u8; wyrmroot_runtime::DW1C_ACTOR_COUNT] =
     [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 
 #[cfg(all(test, feature = "dw1c-preemption-integration"))]
 mod dw1c_protocol_tests {
-    use super::{DW1C_ACTOR6_WAKE, DW1C_GO, DW1C_POST_ARM_ORDER};
+    use super::{DW1C_GO, DW1C_POST_ARM_ORDER};
 
     #[test]
     fn post_arm_protocol_has_one_go_per_actor_and_orders_reaps() {
         assert_eq!(DW1C_GO, [1]);
-        assert_eq!(DW1C_ACTOR6_WAKE, [0xC6]);
         assert_eq!(DW1C_POST_ARM_ORDER, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         assert_eq!(&DW1C_POST_ARM_ORDER[8..], &[9, 10]);
     }
@@ -893,6 +891,7 @@ mod dw1c_protocol_tests {
         let gate = actor.find("if gate.map_or").unwrap();
         assert!(actor[gate..].contains("submit_dw1c_progress(TOKEN"));
         assert!(actor[..gate].find("submit_dw1c_progress(TOKEN").is_none());
+        assert!(!actor[gate..].contains("0xC6"));
         assert!(actor[gate..].contains("if TOKEN == 7"));
         assert!(actor[gate..].contains("DW_STATUS_WOULD_BLOCK"));
 
@@ -1036,24 +1035,6 @@ fn drive_dw1c_workload<
     system
         .send_channel(actor6.launch_channel, &go)
         .map_err(Init0Error::Native)?;
-    // GO releases actor6's gate; the second datagram is the controller's
-    // matching wake for its deliberately blocking wait.
-    system
-        .send_channel(actor6.launch_channel, &DW1C_ACTOR6_WAKE)
-        .map_err(Init0Error::Native)?;
-    wait_actor_signal(
-        supervisor,
-        actor6.launch_channel,
-        DW_SIGNAL_READABLE,
-        deadline,
-    )?;
-    let mut byte = [0_u8; 1];
-    let counts = supervisor
-        .receive_channel(actor6.launch_channel, &mut byte, &mut [])
-        .map_err(Init0Error::Native)?;
-    if counts.bytes != 1 || counts.handles != 0 {
-        return Err(Init0Error::ReceiveCounts(counts));
-    }
 
     let actor7 = actor(6)?;
     system
