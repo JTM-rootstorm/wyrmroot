@@ -17,8 +17,11 @@ memory access, or function call. The progress peer instead uses test-private
 WRLP 1.4 profile `Dw1bProgress`: INIT transfers exactly one data Channel with
 `CHILD_CHANNEL_RIGHTS`; READY remains handle-free on the separate launch
 Channel. The launch endpoint is then closed and all eight fixed DWP1 exchanges
-occur only on the data Channel. The progress raw operation is submitted once
-after the eighth validated request and reply.
+occur only on the data Channel. Before each receive, the progress peer waits
+for `READABLE | PEER_CLOSED` and rejects peer closure without readable data;
+it never treats an empty live Channel as a terminal protocol error. The
+progress raw operation is submitted once after the eighth validated request
+and reply.
 
 Init0 creates/starts the hog and accepts its READY before creating/starting the
 progress peer. After progress READY it submits exact ARM arguments, performs

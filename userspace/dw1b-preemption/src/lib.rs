@@ -7,13 +7,18 @@
 use core::convert::Infallible;
 use deepwyrm_syscall as _;
 #[cfg(feature = "native-payloads")]
-use deepwyrm_syscall::{DwHandle, DwReceivedHandleInfoV1};
+use deepwyrm_syscall::{
+    DW_DEADLINE_INFINITE, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DwHandle,
+    DwReceivedHandleInfoV1, DwSignals,
+};
 use wyrmroot_loader as _;
 #[cfg(feature = "native-payloads")]
 use wyrmroot_loader::launch::{HEADER_BYTES, LaunchProfile, encode_ready_for_profile, parse_init};
 use wyrmroot_runtime as _;
 #[cfg(feature = "native-payloads")]
-use wyrmroot_runtime::{close_handle, receive_channel, send_channel, submit_dw1b_progress};
+use wyrmroot_runtime::{
+    close_handle, receive_channel, send_channel, submit_dw1b_progress, wait_one,
+};
 
 pub const ROUND_COUNT: usize = 8;
 pub const RECORD_BYTES: usize = 32;
@@ -138,6 +143,15 @@ pub fn run_progress(channel: DwHandle) -> Result<(), u32> {
     let data_channel = receive_progress_startup_and_ready(channel)?;
     close_handle(channel).map_err(|_| 0xD1B0_0206_u32)?;
     for round in 0..ROUND_COUNT {
+        let observed = wait_one(
+            data_channel,
+            DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+            DW_DEADLINE_INFINITE,
+        )
+        .map_err(|_| 0xD1B0_0207_u32)?;
+        if observed.observed.0 & DW_SIGNAL_READABLE.0 == 0 {
+            return Err(0xD1B0_0208);
+        }
         let mut bytes = [0; RECORD_BYTES];
         let mut handles = [];
         let counts =

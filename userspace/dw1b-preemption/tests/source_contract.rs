@@ -52,12 +52,23 @@ fn progress_attestation_is_after_all_eight_correlated_exchanges() {
         + start;
     let function = &source[start..end];
     let loop_pos = function.find("for round in 0..ROUND_COUNT").unwrap();
+    let wait_pos = function.find("wait_one(").unwrap();
+    let receive_pos = function.find("receive_channel(data_channel").unwrap();
     let parse_pos = function.find("parse_challenge(&bytes, round)").unwrap();
     let reply_pos = function.find("encode_reply(round)").unwrap();
     let submit_pos = function
         .find("submit_dw1b_progress(CHALLENGE_DIGEST)")
         .unwrap();
-    assert!(loop_pos < parse_pos && parse_pos < reply_pos && reply_pos < submit_pos);
+    assert!(function.contains("DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0"));
+    assert!(function.contains("DW_DEADLINE_INFINITE"));
+    assert!(function.contains("observed.observed.0 & DW_SIGNAL_READABLE.0 == 0"));
+    assert!(
+        loop_pos < wait_pos
+            && wait_pos < receive_pos
+            && receive_pos < parse_pos
+            && parse_pos < reply_pos
+            && reply_pos < submit_pos
+    );
     assert_eq!(
         source
             .matches("submit_dw1b_progress(CHALLENGE_DIGEST)")
@@ -72,6 +83,7 @@ enum Event {
     HogReady,
     ProgressCreateStart,
     ProgressReady,
+    ProgressWait,
     Arm,
     Exchange(u8),
     ProgressExitQueryReap,
@@ -83,7 +95,12 @@ enum Event {
 #[test]
 fn executable_mock_trace_proves_the_complete_selector_26_order() {
     let mut trace = vec![Event::HogCreateStart, Event::HogReady];
-    trace.extend([Event::ProgressCreateStart, Event::ProgressReady, Event::Arm]);
+    trace.extend([
+        Event::ProgressCreateStart,
+        Event::ProgressReady,
+        Event::ProgressWait,
+        Event::Arm,
+    ]);
     for round in 0..wyrmroot_dw1b_preemption::ROUND_COUNT {
         let request = wyrmroot_dw1b_preemption::encode_challenge(round);
         let reply = wyrmroot_dw1b_preemption::encode_reply(round);
@@ -98,7 +115,12 @@ fn executable_mock_trace_proves_the_complete_selector_26_order() {
         Event::InitReadyExit,
     ]);
     let mut expected = vec![Event::HogCreateStart, Event::HogReady];
-    expected.extend([Event::ProgressCreateStart, Event::ProgressReady, Event::Arm]);
+    expected.extend([
+        Event::ProgressCreateStart,
+        Event::ProgressReady,
+        Event::ProgressWait,
+        Event::Arm,
+    ]);
     expected.extend((0..8).map(Event::Exchange));
     expected.extend([
         Event::ProgressExitQueryReap,
