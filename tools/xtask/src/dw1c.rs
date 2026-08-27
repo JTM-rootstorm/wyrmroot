@@ -16,6 +16,7 @@ use crate::sha256;
 const SELECTOR: &str = "normal-preemption-smp";
 const TEST_ID: &str = "28";
 const MACHINE: &str = "pc-q35-10.2";
+const DOMAIN_UUID: &str = "33005e22-d7c2-4b13-b1ac-b82eda95e584";
 const O_NOFOLLOW: i32 = 0x2_0000;
 const MAX_INPUT_BYTES: u64 = 512 * 1024 * 1024;
 const ABSENT: &str = "absent";
@@ -42,6 +43,60 @@ const INPUTS: [&str; 19] = [
     "esp",
     "ovmf_code",
     "ovmf_vars_template",
+];
+const REQUEST_KEYS: [&str; 52] = [
+    "schema_version",
+    "selector",
+    "test_id",
+    "timeout_seconds",
+    "vcpus",
+    "memory_mib",
+    "deepwyrm_revision",
+    "wyrmroot_revision",
+    "rust_revision",
+    "evidence_nonce",
+    "progress_digest",
+    "build_receipt",
+    "build_receipt_sha256",
+    "campaign_directory",
+    "loader_path",
+    "loader_sha256",
+    "kernel_path",
+    "kernel_sha256",
+    "symbols_path",
+    "symbols_sha256",
+    "bootstrap_path",
+    "bootstrap_sha256",
+    "actor1_path",
+    "actor1_sha256",
+    "actor2_path",
+    "actor2_sha256",
+    "actor3_path",
+    "actor3_sha256",
+    "actor4_path",
+    "actor4_sha256",
+    "actor5_path",
+    "actor5_sha256",
+    "actor6_path",
+    "actor6_sha256",
+    "actor7_path",
+    "actor7_sha256",
+    "actor8_path",
+    "actor8_sha256",
+    "actor9_path",
+    "actor9_sha256",
+    "actor10_path",
+    "actor10_sha256",
+    "provenance_path",
+    "provenance_sha256",
+    "bootfs_path",
+    "bootfs_sha256",
+    "esp_path",
+    "esp_sha256",
+    "ovmf_code_path",
+    "ovmf_code_sha256",
+    "ovmf_vars_template_path",
+    "ovmf_vars_template_sha256",
 ];
 
 /// Creates a fresh six-pass campaign containing immutable all-string TOML
@@ -75,7 +130,7 @@ pub fn prepare(request_path: &Path) -> Result<String, Failure> {
     for pass in PASSES {
         let directory = create_fresh_directory(&campaign.join(pass), "DW1-C pass directory")?;
         let vars_source = request.path("ovmf_vars_template")?;
-        let vars = snapshot(&vars_source, &directory.join("OVMF_VARS.fd"))?;
+        let vars = snapshot_with_mode(&vars_source, &directory.join("OVMF_VARS.fd"), 0o600)?;
         let xml = domain_xml(&inputs, &vars)?;
         let xml_snapshot = write_new(&directory.join("domain.xml"), xml.as_bytes(), 0o444)?;
         let mut fields = base_fields(&request, &request_snapshot, &receipt_snapshot, &inputs)?;
@@ -138,6 +193,11 @@ impl Request {
             core::str::from_utf8(&bytes)
                 .map_err(|_| Failure::task("DW1-C request is not UTF-8"))?,
         )?;
+        let expected = REQUEST_KEYS.into_iter().collect::<BTreeSet<_>>();
+        let actual = values.keys().map(String::as_str).collect::<BTreeSet<_>>();
+        if actual != expected {
+            return Err(Failure::task("DW1-C request key set is not exact"));
+        }
         for (key, expected) in [
             ("selector", SELECTOR),
             ("test_id", TEST_ID),
@@ -163,6 +223,31 @@ impl Request {
         ] {
             if values.get(key).is_none_or(String::is_empty) {
                 return Err(Failure::task(format!("DW1-C request is missing {key}")));
+            }
+        }
+        for key in ["deepwyrm_revision", "wyrmroot_revision", "rust_revision"] {
+            let value = &values[key];
+            if value.len() != 40
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            {
+                return Err(Failure::task(format!(
+                    "DW1-C request {key} is not a lowercase Git revision"
+                )));
+            }
+        }
+        for key in ["evidence_nonce", "progress_digest"] {
+            let value = &values[key];
+            if value.len() != 16
+                || value == "0000000000000000"
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_lowercase())
+            {
+                return Err(Failure::task(format!(
+                    "DW1-C request {key} is not nonzero uppercase 16-hex"
+                )));
             }
         }
         for label in INPUTS {
@@ -266,7 +351,7 @@ fn base_fields(
 
 fn domain_xml(inputs: &BTreeMap<&str, Snapshot>, vars: &Snapshot) -> Result<String, Failure> {
     Ok(format!(
-        "<domain xmlns:qemu=\"http://libvirt.org/schemas/domain/qemu/1.0\" type=\"qemu\">\n  <name>OS-Project</name>\n  <memory unit=\"KiB\">2097152</memory>\n  <currentMemory unit=\"KiB\">2097152</currentMemory>\n  <vcpu placement=\"static\">4</vcpu>\n  <sysinfo type=\"fwcfg\"><entry name=\"opt/org.deepwyrm.test.selector\">{SELECTOR}</entry><entry name=\"opt/org.deepwyrm.test.test_id\">{TEST_ID}</entry></sysinfo>\n  <os><type arch=\"x86_64\" machine=\"{MACHINE}\">hvm</type><loader readonly=\"yes\" secure=\"no\" type=\"pflash\" format=\"raw\">{}</loader><nvram type=\"file\" format=\"raw\"><source file=\"{}\"/></nvram><boot dev=\"hd\"/></os>\n  <features><acpi/><apic/></features><devices><emulator>/usr/bin/qemu-system-x86_64</emulator><disk type=\"file\" device=\"disk\"><driver name=\"qemu\" type=\"raw\"/><source file=\"{}\"/><target dev=\"vda\" bus=\"virtio\"/><readonly/></disk><controller type=\"pci\" index=\"0\" model=\"pcie-root\"/><serial type=\"pty\"><target type=\"isa-serial\" port=\"0\"/></serial><console type=\"pty\"><target type=\"serial\" port=\"0\"/></console></devices>\n  <qemu:commandline><qemu:arg value=\"-device\"/><qemu:arg value=\"isa-debug-exit,iobase=0xf4,iosize=0x04\"/></qemu:commandline>\n</domain>\n",
+        "<domain xmlns:qemu=\"http://libvirt.org/schemas/domain/qemu/1.0\" type=\"qemu\">\n  <name>OS-Project</name>\n  <uuid>{DOMAIN_UUID}</uuid>\n  <memory unit=\"KiB\">2097152</memory>\n  <currentMemory unit=\"KiB\">2097152</currentMemory>\n  <vcpu placement=\"static\">4</vcpu>\n  <sysinfo type=\"fwcfg\"><entry name=\"opt/org.deepwyrm.test.selector\">{SELECTOR}</entry><entry name=\"opt/org.deepwyrm.test.test_id\">{TEST_ID}</entry></sysinfo>\n  <os><type arch=\"x86_64\" machine=\"{MACHINE}\">hvm</type><loader readonly=\"yes\" secure=\"no\" type=\"pflash\" format=\"raw\">{}</loader><nvram type=\"file\" format=\"raw\"><source file=\"{}\"/></nvram><boot dev=\"hd\"/></os>\n  <features><acpi/><apic/></features>\n  <clock offset=\"utc\"><timer name=\"rtc\" tickpolicy=\"catchup\"/><timer name=\"pit\" tickpolicy=\"delay\"/><timer name=\"hpet\" present=\"no\"/></clock>\n  <on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>destroy</on_crash>\n  <pm><suspend-to-mem enabled=\"no\"/><suspend-to-disk enabled=\"no\"/></pm>\n  <devices><emulator>/usr/bin/qemu-system-x86_64</emulator><disk type=\"file\" device=\"disk\"><driver name=\"qemu\" type=\"raw\"/><source file=\"{}\"/><target dev=\"vda\" bus=\"virtio\"/><readonly/></disk><controller type=\"pci\" index=\"0\" model=\"pcie-root\"/><serial type=\"pty\"><target type=\"isa-serial\" port=\"0\"/></serial><console type=\"pty\"><target type=\"serial\" port=\"0\"/></console></devices>\n  <qemu:commandline><qemu:arg value=\"-device\"/><qemu:arg value=\"isa-debug-exit,iobase=0xf4,iosize=0x04\"/></qemu:commandline>\n</domain>\n",
         xml(&inputs["ovmf_code"].path)?,
         xml(&vars.path)?,
         xml(&inputs["esp"].path)?
@@ -295,8 +380,11 @@ fn ensure_absent_outputs(paths: &[&Path]) -> Result<(), Failure> {
     Ok(())
 }
 fn snapshot(source: &Path, target: &Path) -> Result<Snapshot, Failure> {
+    snapshot_with_mode(source, target, 0o444)
+}
+fn snapshot_with_mode(source: &Path, target: &Path, mode: u32) -> Result<Snapshot, Failure> {
     let bytes = read_regular(source, "DW1-C immutable input")?;
-    write_new(target, &bytes, 0o444)
+    write_new(target, &bytes, mode)
 }
 fn snapshot_expected(source: &Path, expected: &str, target: &Path) -> Result<Snapshot, Failure> {
     let bytes = read_regular(source, "DW1-C immutable input")?;
@@ -430,8 +518,19 @@ mod tests {
         }
         let xml = domain_xml(&inputs, &s).unwrap();
         assert!(xml.contains("pc-q35-10.2"));
+        assert!(xml.contains(DOMAIN_UUID));
         assert!(xml.contains("<vcpu placement=\"static\">4</vcpu>"));
         assert!(xml.contains("2097152"));
+        for required in [
+            "<clock offset=\"utc\">",
+            "<on_poweroff>destroy</on_poweroff>",
+            "<on_reboot>restart</on_reboot>",
+            "<on_crash>destroy</on_crash>",
+            "<suspend-to-mem enabled=\"no\"/>",
+            "<suspend-to-disk enabled=\"no\"/>",
+        ] {
+            assert!(xml.contains(required));
+        }
         assert!(!xml.contains("interface"));
         assert!(!xml.contains("filesystem"));
         assert!(!xml.contains("system_disk"));
@@ -444,5 +543,20 @@ mod tests {
             render(&fields).unwrap(),
             "selector = \"normal-preemption-smp\"\n"
         );
+    }
+
+    #[test]
+    fn per_pass_vars_snapshot_is_owner_writable_only() {
+        let root = std::env::temp_dir().join(format!("dw1c-vars-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let source = root.join("source.fd");
+        fs::write(&source, b"vars").unwrap();
+        let target = root.join("OVMF_VARS.fd");
+        snapshot_with_mode(&source, &target, 0o600).unwrap();
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }
