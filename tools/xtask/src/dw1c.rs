@@ -11,6 +11,9 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use wyrmroot_bootfs::archive::Archive;
+use wyrmroot_bootfs::builder::{Builder, FileMode};
+
 use crate::error::Failure;
 use crate::metadata::BuildManifest;
 use crate::sha256;
@@ -18,6 +21,11 @@ use crate::sha256;
 const NATIVE_TARGET: &str = "x86_64-unknown-wyrmroot";
 const DW1C_INIT_FEATURES: &str = "native-init0,dw1c-preemption-integration";
 const DW1C_ACTOR_FEATURES: &str = "native-payloads";
+const KERNEL_TARGET: &str = "x86_64-unknown-none";
+const OVMF_CODE_PATH: &str = "/usr/share/edk2/OvmfX64/OVMF_CODE.fd";
+const OVMF_CODE_SHA256: &str = "f3ff7e73448ed2845ee15356f394882f5618eb5dab92c9a30ec6ee0e1468553a";
+const OVMF_VARS_PATH: &str = "/usr/share/edk2/OvmfX64/OVMF_VARS.fd";
+const OVMF_VARS_SHA256: &str = "6ed987af3a3c155be71665f510eae3e007eda9b8b94afd59d45e91c4a11565cc";
 
 const SELECTOR: &str = "normal-preemption-smp";
 const TEST_ID: &str = "28";
@@ -716,9 +724,379 @@ pub fn freeze(
             )));
         }
     }
-    Err(Failure::task(
-        "DW1-C build orchestration is not yet available in this checkout",
+    validate_upper_hex(evidence_nonce, 16, "evidence_nonce")?;
+    validate_upper_hex(progress_digest, 16, "progress_digest")?;
+    if evidence_nonce == "0000000000000000" || progress_digest == "0000000000000000" {
+        return Err(Failure::task(
+            "DW1-C nonce and progress digest must be nonzero",
+        ));
+    }
+    let parent = output
+        .parent()
+        .ok_or_else(|| Failure::task("DW1-C freeze output has no parent"))?;
+    let parent = fs::canonicalize(parent).map_err(io)?;
+    let name = output
+        .file_name()
+        .ok_or_else(|| Failure::task("DW1-C freeze output has no final component"))?;
+    let output = parent.join(name);
+    fs::create_dir(&output).map_err(io)?;
+    let result = freeze_product(
+        &output,
+        deep_repository,
+        deep_revision,
+        evidence_nonce,
+        progress_digest,
+    );
+    if result.is_err() {
+        // This directory was just created with `create_dir`; never retain a
+        // partial product which another command could mistake for a freeze.
+        fs::remove_dir_all(&output).map_err(io)?;
+    }
+    result
+}
+
+fn freeze_product(
+    output: &Path,
+    deep_repository: &Path,
+    deep_revision: &str,
+    evidence_nonce: &str,
+    progress_digest: &str,
+) -> Result<String, Failure> {
+    let repository = crate::tasks::repository_root()?;
+    let wyrmroot_revision = current_revision(&repository)?;
+    let manifest = BuildManifest::load(&repository)?;
+    let rust_revision = manifest.rust_revision()?.to_owned();
+    let build_root = output.join("build");
+    fs::create_dir(&build_root).map_err(io)?;
+    let artifacts = build_wyr_artifact_set(
+        &build_root.join("wyrmroot"),
+        &wyrmroot_revision,
+        progress_digest,
+    )?;
+    let bootfs = build_bootfs(&artifacts.init0, &artifacts.actors)?;
+    let pages = bootfs.len().div_ceil(4096);
+    if !(1..=8192).contains(&pages) {
+        return Err(Failure::task(
+            "DW1-C measured bootfs page count is out of range",
+        ));
+    }
+    let kernel = build_kernel(
+        deep_repository,
+        &build_root.join("deepwyrm"),
+        evidence_nonce,
+        progress_digest,
+        pages,
+    )?;
+    let symbols = kernel.clone();
+    let provenance = render_kernel_provenance(
+        deep_revision,
+        &rust_revision,
+        evidence_nonce,
+        progress_digest,
+        pages,
+        &kernel,
+    )?;
+    let ovmf_code = read_pinned_firmware(OVMF_CODE_PATH, OVMF_CODE_SHA256, "OVMF code")?;
+    let ovmf_vars = read_pinned_firmware(OVMF_VARS_PATH, OVMF_VARS_SHA256, "OVMF vars")?;
+    let product = output.join("product");
+    fs::create_dir(&product).map_err(io)?;
+    for (name, bytes) in [
+        ("loader.efi", artifacts.loader.as_slice()),
+        ("deepwyrm.elf", kernel.as_slice()),
+        ("deepwyrm.symbols", symbols.as_slice()),
+        ("bootstrap.elf", artifacts.bootstrap.as_slice()),
+        ("kernel-provenance.toml", provenance.as_bytes()),
+        ("bootfs.img", bootfs.as_slice()),
+        ("OVMF_CODE.fd", ovmf_code.as_slice()),
+        ("OVMF_VARS.fd", ovmf_vars.as_slice()),
+        ("loader-debug.efi", artifacts.debug_loader.as_slice()),
+        ("loader.pdb", artifacts.debug_symbols.as_slice()),
+        ("wyr-source-build.toml", artifacts.source_receipt.as_bytes()),
+        (
+            "uefi-effective-config.txt",
+            artifacts.effective_uefi_config.as_bytes(),
+        ),
+        (
+            "uefi-inspection.json",
+            artifacts.uefi_inspection_report.as_bytes(),
+        ),
+    ] {
+        write_new(&product.join(name), bytes, 0o444)?;
+    }
+    for (index, actor) in artifacts.actors.iter().enumerate() {
+        write_new(
+            &product.join(format!("actor{}.elf", index + 1)),
+            actor,
+            0o444,
+        )?;
+    }
+    let esp = product.join("esp.img");
+    let image_args = crate::cli::G3ImageArguments {
+        image: esp.display().to_string(),
+        loader: product.join("loader.efi").display().to_string(),
+        kernel: product.join("deepwyrm.elf").display().to_string(),
+        bootstrap: product.join("bootstrap.elf").display().to_string(),
+        bootfs: product.join("bootfs.img").display().to_string(),
+    };
+    crate::g3_image::build(&image_args)?;
+    let values = product_values(&product)?;
+    let receipt = render_build_receipt(
+        deep_revision,
+        &wyrmroot_revision,
+        &rust_revision,
+        evidence_nonce,
+        progress_digest,
+        pages,
+        &values,
+    )?;
+    let receipt_snapshot = write_new(
+        &product.join("build-receipt.toml"),
+        receipt.as_bytes(),
+        0o444,
+    )?;
+    let request = render_freeze_request(
+        deep_revision,
+        &wyrmroot_revision,
+        &rust_revision,
+        evidence_nonce,
+        progress_digest,
+        &values,
+        &receipt_snapshot,
+    )?;
+    let request_snapshot = write_new(&output.join("request.toml"), request.as_bytes(), 0o444)?;
+    let loaded = Request::load(&request_snapshot.path)?;
+    verify_build_receipt(&loaded, &receipt_snapshot.path)?;
+    verify_clean_repository(&repository, "Wyrmroot", &wyrmroot_revision)?;
+    verify_clean_repository(deep_repository, "Deepwyrm", deep_revision)?;
+    Ok(format!(
+        "DW1_C_FREEZE_PASS selector={SELECTOR} test_id={TEST_ID} bootfs_max_pages={pages} request={} sha256={}",
+        request_snapshot.path.display(),
+        request_snapshot.sha256
     ))
+}
+
+fn build_bootfs(init0: &[u8], actors: &[Vec<u8>; 10]) -> Result<Vec<u8>, Failure> {
+    let mut builder = Builder::new();
+    builder
+        .add(b"system/init0", init0, FileMode::Executable)
+        .map_err(|error| Failure::task(format!("DW1-C bootfs init0 add failed: {error:?}")))?;
+    let paths = (1..=10)
+        .map(|index| format!("test/dw1-c/actor{index}"))
+        .collect::<Vec<_>>();
+    for (path, actor) in paths.iter().zip(actors) {
+        builder
+            .add(path.as_bytes(), actor, FileMode::Executable)
+            .map_err(|error| Failure::task(format!("DW1-C bootfs actor add failed: {error:?}")))?;
+    }
+    let bootfs = builder
+        .build()
+        .map_err(|error| Failure::task(format!("DW1-C bootfs build failed: {error:?}")))?;
+    let archive = Archive::new(&bootfs)
+        .map_err(|error| Failure::task(format!("DW1-C bootfs invalid: {error:?}")))?;
+    if archive.entries().count() != 11 {
+        return Err(Failure::task("DW1-C bootfs entry count drifted"));
+    }
+    Ok(bootfs)
+}
+
+fn build_kernel(
+    repository: &Path,
+    target: &Path,
+    evidence_nonce: &str,
+    progress_digest: &str,
+    pages: usize,
+) -> Result<Vec<u8>, Failure> {
+    fs::create_dir_all(target).map_err(io)?;
+    let status = Command::new(repository.join("tools/pinned-cargo"))
+        .arg("target")
+        .args([
+            "build",
+            "--locked",
+            "--offline",
+            "--release",
+            "--target",
+            KERNEL_TARGET,
+            "--package",
+            "deepwyrm-kernel",
+            "--bin",
+            "deepwyrm-kernel",
+            "--features",
+            "test-support",
+        ])
+        .env("DEEPWYRM_PINNED_TARGET_DIR", target)
+        .env("DEEPWYRM_GUEST_TEST_SELECTOR", SELECTOR)
+        .env("DEEPWYRM_DW1C_EVIDENCE_NONCE", evidence_nonce)
+        .env("DEEPWYRM_DW1C_PROGRESS_DIGEST", progress_digest)
+        .env("DEEPWYRM_DW1C_BOOTFS_MAX_PAGES", pages.to_string())
+        .env_remove("CARGO_HOME")
+        .env_remove("LD_AUDIT")
+        .env_remove("LD_LIBRARY_PATH")
+        .env_remove("LD_PRELOAD")
+        .current_dir(repository)
+        .stdin(Stdio::null())
+        .status()
+        .map_err(io)?;
+    if !status.success() {
+        return Err(Failure::task(
+            "DW1-C canonical Deepwyrm kernel build failed",
+        ));
+    }
+    read_cargo_build_output(
+        &target.join(KERNEL_TARGET).join("release/deepwyrm-kernel"),
+        "kernel",
+        64 * 1024 * 1024,
+    )
+}
+
+fn read_pinned_firmware(path: &str, expected: &str, label: &str) -> Result<Vec<u8>, Failure> {
+    let bytes = read_regular(Path::new(path), label)?;
+    if sha256::bytes_digest(&bytes) != expected {
+        return Err(Failure::task(format!(
+            "DW1-C pinned {label} identity mismatch"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn render_kernel_provenance(
+    deep: &str,
+    rust: &str,
+    nonce: &str,
+    digest: &str,
+    pages: usize,
+    kernel: &[u8],
+) -> Result<String, Failure> {
+    let mut fields = BTreeMap::new();
+    for (key, value) in [
+        ("schema_version", "1".to_owned()), ("kind", "wyrmroot-dw1-c-kernel-build".to_owned()),
+        ("selector", SELECTOR.to_owned()), ("test_id", TEST_ID.to_owned()),
+        ("deepwyrm_revision", deep.to_owned()), ("rust_revision", rust.to_owned()),
+        ("kernel_command", "tools/pinned-cargo target build --locked --offline --release --target x86_64-unknown-none --package deepwyrm-kernel --bin deepwyrm-kernel --features test-support".to_owned()),
+        ("kernel_sha256", sha256::bytes_digest(kernel)), ("symbols_sha256", sha256::bytes_digest(kernel)),
+        ("evidence_nonce", nonce.to_owned()), ("progress_digest", digest.to_owned()), ("bootfs_max_pages", pages.to_string()),
+    ] { fields.insert(key.to_owned(), value); }
+    render(&fields)
+}
+
+fn product_values(product: &Path) -> Result<BTreeMap<String, String>, Failure> {
+    let mut values = BTreeMap::new();
+    for (label, file) in [
+        ("loader", "loader.efi"),
+        ("kernel", "deepwyrm.elf"),
+        ("symbols", "deepwyrm.symbols"),
+        ("bootstrap", "bootstrap.elf"),
+        ("provenance", "kernel-provenance.toml"),
+        ("bootfs", "bootfs.img"),
+        ("esp", "esp.img"),
+        ("ovmf_code", "OVMF_CODE.fd"),
+        ("ovmf_vars_template", "OVMF_VARS.fd"),
+    ] {
+        values.insert(
+            label.to_owned(),
+            sha256::bytes_digest(&read_regular(&product.join(file), label)?),
+        );
+    }
+    for index in 1..=10 {
+        values.insert(
+            format!("actor{index}"),
+            sha256::bytes_digest(&read_regular(
+                &product.join(format!("actor{index}.elf")),
+                "actor",
+            )?),
+        );
+    }
+    Ok(values)
+}
+
+fn render_build_receipt(
+    deep: &str,
+    wyr: &str,
+    rust: &str,
+    nonce: &str,
+    digest: &str,
+    pages: usize,
+    hashes: &BTreeMap<String, String>,
+) -> Result<String, Failure> {
+    let mut fields = BTreeMap::new();
+    for (key, value) in [
+        ("schema_version", "1"),
+        ("kind", "wyrmroot-dw1-c-build-lineage"),
+        ("selector", SELECTOR),
+        ("test_id", TEST_ID),
+        ("deepwyrm_revision", deep),
+        ("wyrmroot_revision", wyr),
+        ("rust_revision", rust),
+        ("evidence_nonce", nonce),
+        ("progress_digest", digest),
+    ] {
+        fields.insert(key.to_owned(), value.to_owned());
+    }
+    fields.insert("bootfs_max_pages".to_owned(), pages.to_string());
+    for label in INPUTS {
+        fields.insert(
+            format!("{label}_sha256"),
+            hashes
+                .get(label)
+                .cloned()
+                .ok_or_else(|| Failure::task("DW1-C product hash missing"))?,
+        );
+    }
+    render(&fields)
+}
+
+fn render_freeze_request(
+    deep: &str,
+    wyr: &str,
+    rust: &str,
+    nonce: &str,
+    digest: &str,
+    hashes: &BTreeMap<String, String>,
+    receipt: &Snapshot,
+) -> Result<String, Failure> {
+    let mut fields = BTreeMap::new();
+    for (key, value) in [
+        ("schema_version", "1"),
+        ("selector", SELECTOR),
+        ("test_id", TEST_ID),
+        ("timeout_seconds", "240"),
+        ("vcpus", "4"),
+        ("memory_mib", "2048"),
+        ("deepwyrm_revision", deep),
+        ("wyrmroot_revision", wyr),
+        ("rust_revision", rust),
+        ("evidence_nonce", nonce),
+        ("progress_digest", digest),
+        ("build_receipt", "product/build-receipt.toml"),
+        ("campaign_directory", "campaign"),
+    ] {
+        fields.insert(key.to_owned(), value.to_owned());
+    }
+    fields.insert("build_receipt_sha256".to_owned(), receipt.sha256.clone());
+    for label in INPUTS {
+        if let Some(number) = label.strip_prefix("actor") {
+            fields.insert(
+                format!("{label}_path"),
+                format!("product/actor{number}.elf"),
+            );
+            fields.insert(format!("{label}_sha256"), hashes[label].clone());
+            continue;
+        }
+        let file = match label {
+            "loader" => "loader.efi",
+            "kernel" => "deepwyrm.elf",
+            "symbols" => "deepwyrm.symbols",
+            "bootstrap" => "bootstrap.elf",
+            "provenance" => "kernel-provenance.toml",
+            "bootfs" => "bootfs.img",
+            "esp" => "esp.img",
+            "ovmf_code" => "OVMF_CODE.fd",
+            "ovmf_vars_template" => "OVMF_VARS.fd",
+            _ => return Err(Failure::task("DW1-C input label drifted")),
+        };
+        fields.insert(format!("{label}_path"), format!("product/{file}"));
+        fields.insert(format!("{label}_sha256"), hashes[label].clone());
+    }
+    render(&fields)
 }
 
 fn current_revision(repository: &Path) -> Result<String, Failure> {
@@ -1254,6 +1632,72 @@ mod tests {
         }
         assert_eq!(progress_digest_environment(specs[0], "A1"), None);
         assert_eq!(progress_digest_environment(specs[1], "A1"), None);
+    }
+
+    #[test]
+    fn bootfs_has_only_the_fixed_init0_and_ten_actor_entries() {
+        let init0 = b"init0".to_vec();
+        let actors = core::array::from_fn(|index| format!("actor-{index}").into_bytes());
+        let bootfs = build_bootfs(&init0, &actors).unwrap();
+        let archive = Archive::new(&bootfs).unwrap();
+        assert_eq!(archive.entries().count(), 11);
+        assert_eq!(archive.lookup(b"system/init0").unwrap().data(), init0);
+        for (index, actor) in actors.iter().enumerate() {
+            let path = format!("test/dw1-c/actor{}", index + 1);
+            let entry = archive.lookup(path.as_bytes()).unwrap();
+            assert!(entry.is_executable());
+            assert_eq!(entry.data(), actor);
+        }
+        assert!((1..=8192).contains(&bootfs.len().div_ceil(4096)));
+    }
+
+    #[test]
+    fn freeze_receipt_and_request_have_the_exact_declared_key_sets() {
+        let hashes = INPUTS
+            .into_iter()
+            .map(|label| (label.to_owned(), "a".repeat(64)))
+            .collect::<BTreeMap<_, _>>();
+        let receipt = render_build_receipt(
+            &"d".repeat(40),
+            &"w".repeat(40),
+            &"r".repeat(40),
+            "A1B2C3D4E5F60708",
+            "1020304050607080",
+            1,
+            &hashes,
+        )
+        .unwrap();
+        let receipt_values = scalars(&receipt).unwrap();
+        assert_eq!(
+            receipt_values
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BUILD_RECEIPT_KEYS.into_iter().collect()
+        );
+        let snapshot = Snapshot {
+            path: PathBuf::from("/tmp/receipt"),
+            sha256: "b".repeat(64),
+        };
+        let request = render_freeze_request(
+            &"d".repeat(40),
+            &"w".repeat(40),
+            &"r".repeat(40),
+            "A1B2C3D4E5F60708",
+            "1020304050607080",
+            &hashes,
+            &snapshot,
+        )
+        .unwrap();
+        let request_values = scalars(&request).unwrap();
+        assert_eq!(
+            request_values
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            REQUEST_KEYS.into_iter().collect()
+        );
+        assert_eq!(request_values["campaign_directory"], "campaign");
     }
 
     #[test]
