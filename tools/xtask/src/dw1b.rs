@@ -290,11 +290,20 @@ pub fn load(path: &Path) -> Result<Request, Failure> {
 }
 
 pub fn build(path: &Path) -> Result<String, Failure> {
+    build_product(path, false)
+}
+
+pub fn rebuild(path: &Path) -> Result<String, Failure> {
+    build_product(path, true)
+}
+
+fn build_product(path: &Path, verify_rebuild: bool) -> Result<String, Failure> {
     let request = load(path)?;
-    verify_acceptance_source(&request)?;
-    preflight_source_build_environment()?;
-    fs::create_dir_all(&request.run_directory).map_err(io_failure)?;
-    canonical_build_wyr_artifacts(&request)?;
+    if verify_rebuild {
+        verify_acceptance_source(&request)?;
+        preflight_source_build_environment()?;
+    }
+    refuse_product_outputs(&request)?;
     let loader = read_expected(&request.loader, "loader", &request.loader_sha256)?;
     let kernel = read_expected(&request.kernel, "kernel", &request.kernel_sha256)?;
     let symbols = read_expected(&request.symbols, "symbols", &request.symbols_sha256)?;
@@ -318,7 +327,9 @@ pub fn build(path: &Path) -> Result<String, Failure> {
         &wyr_build_receipt,
         [&loader, &bootstrap, &init, &hello, &hog, &progress],
     )?;
-    verify_current_cargo_lock(&wyr_build_receipt)?;
+    if verify_rebuild {
+        verify_current_cargo_lock(&wyr_build_receipt)?;
+    }
     verify_product_inputs(
         &request,
         ProductInputs {
@@ -340,6 +351,10 @@ pub fn build(path: &Path) -> Result<String, Failure> {
             "DW1-B measured bootfs pages {pages} do not match request {}",
             request.bootfs_pages
         )));
+    }
+    if verify_rebuild {
+        fs::create_dir_all(&request.run_directory).map_err(io_failure)?;
+        canonical_build_wyr_artifacts(&request)?;
     }
     if let Some(parent) = request.bootfs.parent() {
         fs::create_dir_all(parent).map_err(io_failure)?;
@@ -378,6 +393,17 @@ pub fn build(path: &Path) -> Result<String, Failure> {
         bootfs.len().div_ceil(4096),
         sha256::bytes_digest(&bootfs)
     ))
+}
+
+fn refuse_product_outputs(request: &Request) -> Result<(), Failure> {
+    for path in [&request.bootfs, &request.esp, &request.receipt] {
+        if fs::symlink_metadata(path).is_ok() {
+            return Err(Failure::task(
+                "DW1-B image refuses pre-existing product outputs",
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn measure(init: &Path, hello: &Path, hog: &Path, progress: &Path) -> Result<String, Failure> {
@@ -1024,13 +1050,6 @@ fn canonical_build_wyr_artifacts(request: &Request) -> Result<(), Failure> {
             return Err(Failure::task(format!(
                 "DW1-B canonical source build refuses ambient {variable}"
             )));
-        }
-    }
-    for path in [&request.bootfs, &request.esp, &request.receipt] {
-        if fs::symlink_metadata(path).is_ok() {
-            return Err(Failure::task(
-                "DW1-B canonical source build refuses pre-existing product outputs",
-            ));
         }
     }
     let set = build_wyr_artifact_set(
@@ -2394,7 +2413,7 @@ mod tests {
     fn source_build_preflights_the_project_cargo_home_before_outputs() {
         let source = include_str!("dw1b.rs");
         let build = source
-            .split_once("pub fn build(path: &Path)")
+            .split_once("fn build_product(path: &Path, verify_rebuild: bool)")
             .expect("build entry")
             .1
             .split_once("pub fn measure(")
@@ -2402,8 +2421,35 @@ mod tests {
             .0;
         assert!(
             build.find("preflight_source_build_environment()")
+                < build.find("verify_product_inputs(")
+        );
+        assert!(
+            build.find("verify_product_inputs(")
                 < build.find("fs::create_dir_all(&request.run_directory)")
         );
+        assert!(
+            build.find("canonical_build_wyr_artifacts(&request)")
+                < build.find("fs::write(&request.bootfs")
+        );
+        let image_entry = source
+            .split_once("pub fn build(path: &Path)")
+            .expect("image entry")
+            .1
+            .split_once("pub fn rebuild(path: &Path)")
+            .expect("image entry boundary")
+            .0;
+        assert!(image_entry.contains("build_product(path, false)"));
+        let rebuild_entry = source
+            .split_once("pub fn rebuild(path: &Path)")
+            .expect("rebuild entry")
+            .1
+            .split_once("fn build_product(")
+            .expect("rebuild entry boundary")
+            .0;
+        assert!(rebuild_entry.contains("build_product(path, true)"));
+        assert!(build.contains("if verify_rebuild {"));
+        assert!(build.contains("verify_acceptance_source(&request)?"));
+        assert!(build.contains("verify_current_cargo_lock(&wyr_build_receipt)?"));
 
         let freeze = source
             .split_once("pub fn freeze(output: &Path)")

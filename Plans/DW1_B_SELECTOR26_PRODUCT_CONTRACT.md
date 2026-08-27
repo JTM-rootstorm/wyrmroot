@@ -52,10 +52,13 @@ no CodeView record, and no import directory. The freeze retains the audited
 debug EFI/PDB pair and normalized effective UEFI configuration and inspector
 reports for provenance, but those retained-debug files do not enter the ESP.
 
-The canonical `image` path independently rebuilds loader, bootstrap, init0,
-hello, CPU hog, and progress with the same isolated accepted workflow and
-requires byte-for-byte equality with the frozen inputs before it writes a
-product. It refuses pre-existing Wyrmroot outputs. The canonical `run` path
+The canonical image surface has two explicit modes. `image-rebuild`
+independently rebuilds loader, bootstrap, init0, hello, CPU hog, and progress
+with the same isolated accepted workflow and requires byte-for-byte equality
+with the frozen inputs before it writes a product. Ordinary `image` strictly
+validates and assembles the already-frozen source artifacts without rebuilding
+them or requiring the tooling checkout to remain at the frozen revision. Both
+modes refuse pre-existing product outputs. The canonical `run` path
 requires that completed product, revalidates it through the same strict
 recorded-artifact inspection path before and after execution, and never
 rebuilds already-proven artifacts. Candidate creation remains bound to the

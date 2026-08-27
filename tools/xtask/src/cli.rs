@@ -22,6 +22,7 @@ Usage:
     cargo xtask wyr1b inspect --request <wyr1-b-request.toml>
     cargo xtask wyr1b evidence --request <wyr1-b-request.toml> --log <evidence>
     cargo xtask dw1b image --request <dw1-b-request.toml>
+    cargo xtask dw1b image-rebuild --request <dw1-b-request.toml>
     cargo xtask dw1b freeze --output <directory>
     cargo xtask dw1b inspect --request <dw1-b-request.toml>
     cargo xtask dw1b run --request <dw1-b-request.toml>
@@ -119,6 +120,7 @@ pub(crate) enum Action {
         log: String,
     },
     Dw1BImage(String),
+    Dw1BImageRebuild(String),
     Dw1BFreeze(String),
     Dw1BInspect(String),
     Dw1BRun(String),
@@ -191,6 +193,9 @@ fn dispatch_dw1b(arguments: &[String]) -> Result<Action, Failure> {
         [command, flag, request] if command == "image" && flag == "--request" => {
             Ok(Action::Dw1BImage(request.clone()))
         }
+        [command, flag, request] if command == "image-rebuild" && flag == "--request" => {
+            Ok(Action::Dw1BImageRebuild(request.clone()))
+        }
         [command, flag, request] if command == "inspect" && flag == "--request" => {
             Ok(Action::Dw1BInspect(request.clone()))
         }
@@ -224,7 +229,7 @@ fn dispatch_dw1b(arguments: &[String]) -> Result<Action, Failure> {
             Ok(Action::Dw1BEvidence(request.clone()))
         }
         _ => Err(Failure::usage(
-            "dw1b requires freeze --output <directory>, image|inspect|run|evidence --request <path>, or measure with four exact artifacts",
+            "dw1b requires freeze --output <directory>, image|image-rebuild|inspect|run|evidence --request <path>, or measure with four exact artifacts",
         )),
     }
 }
@@ -613,6 +618,15 @@ mod tests {
             Ok(Action::Dw1BFreeze("freeze".into()))
         );
         assert!(USAGE.contains("dw1b freeze --output"));
+        assert_eq!(
+            dispatch(&arguments(&[
+                "dw1b",
+                "image-rebuild",
+                "--request",
+                "request.toml",
+            ])),
+            Ok(Action::Dw1BImageRebuild("request.toml".into()))
+        );
     }
 
     #[test]
