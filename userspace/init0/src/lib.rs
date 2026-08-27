@@ -16,6 +16,11 @@ extern crate std;
     feature = "dw1c-preemption-integration"
 ))]
 use deepwyrm_syscall::DW_SIGNAL_EXITED;
+#[cfg(any(
+    feature = "i-capability-integration",
+    feature = "dw1b-preemption-integration"
+))]
+use deepwyrm_syscall::DW_STATUS_WOULD_BLOCK;
 #[cfg(feature = "dw1b-preemption-integration")]
 use deepwyrm_syscall::{
     DW_OBJECT_TYPE_CHANNEL, DW_RIGHT_DUPLICATE, DW_RIGHT_INSPECT, DW_RIGHT_READ, DW_RIGHT_TRANSFER,
@@ -31,9 +36,7 @@ use deepwyrm_syscall::{DW_SIGNAL_PEER_CLOSED, DwSignals};
     feature = "dw1b-preemption-integration",
     feature = "dw1c-preemption-integration"
 ))]
-use deepwyrm_syscall::{
-    DW_SIGNAL_READABLE, DW_SIGNAL_WRITABLE, DW_STATUS_WOULD_BLOCK, DwWaitItemV1,
-};
+use deepwyrm_syscall::{DW_SIGNAL_READABLE, DW_SIGNAL_WRITABLE, DwWaitItemV1};
 use deepwyrm_syscall::{
     DW_TASK_STATE_EXITED, DwDeadline, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights,
     DwTaskTerminationInfoV1,
@@ -862,6 +865,55 @@ const DW1C_ACTOR_PATHS: [&[u8]; wyrmroot_runtime::DW1C_ACTOR_COUNT] = [
 ];
 
 #[cfg(feature = "dw1c-preemption-integration")]
+const DW1C_GO: [u8; 1] = [1];
+#[cfg(feature = "dw1c-preemption-integration")]
+const DW1C_ACTOR6_WAKE: [u8; 1] = [0xC6];
+#[cfg(all(test, feature = "dw1c-preemption-integration"))]
+const DW1C_POST_ARM_ORDER: [u8; wyrmroot_runtime::DW1C_ACTOR_COUNT] =
+    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+
+#[cfg(all(test, feature = "dw1c-preemption-integration"))]
+mod dw1c_protocol_tests {
+    use super::{DW1C_ACTOR6_WAKE, DW1C_GO, DW1C_POST_ARM_ORDER};
+
+    #[test]
+    fn post_arm_protocol_has_one_go_per_actor_and_orders_reaps() {
+        assert_eq!(DW1C_GO, [1]);
+        assert_eq!(DW1C_ACTOR6_WAKE, [0xC6]);
+        assert_eq!(DW1C_POST_ARM_ORDER, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(&DW1C_POST_ARM_ORDER[8..], &[9, 10]);
+    }
+
+    #[test]
+    fn source_contract_keeps_work_after_ready_and_completion_last() {
+        let actor = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../dw1c-preemption/src/bin/actor_body.rs"
+        ));
+        let gate = actor.find("if gate.map_or").unwrap();
+        assert!(actor[gate..].contains("submit_dw1c_progress(TOKEN"));
+        assert!(actor[..gate].find("submit_dw1c_progress(TOKEN").is_none());
+        assert!(actor[gate..].contains("if TOKEN == 7"));
+        assert!(actor[gate..].contains("DW_STATUS_WOULD_BLOCK"));
+
+        let controller = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
+        let arm = controller
+            .find("    arm_dw1c_after_ready(system, processes)?;")
+            .unwrap();
+        let first_go = controller[arm..].find("DW1C_GO").unwrap() + arm;
+        let complete = controller
+            .rfind("        .complete_dw1c_workload(")
+            .unwrap();
+        assert!(arm < first_go);
+        assert!(first_go < complete);
+        assert!(controller[arm..complete].contains("actor6.launch_channel"));
+        assert!(controller[arm..complete].contains("actor7.launch_channel"));
+        assert!(controller[arm..complete].contains("actor9.launch_channel"));
+        assert!(controller[arm..complete].contains("actor10.launch_channel"));
+    }
+}
+
+#[cfg(feature = "dw1c-preemption-integration")]
 fn run_dw1c_preemption<
     System: Init0System,
     Loader: LoaderPlatform<Error = NativeError>,
@@ -971,7 +1023,7 @@ fn drive_dw1c_workload<
     deadline: DwDeadline,
 ) -> Result<(), Init0Error> {
     let actor = |index: usize| actors[index].ok_or(Init0Error::MissingLoadedProcess);
-    let go = [1_u8];
+    let go = DW1C_GO;
     let mut index = 0;
     while index < 5 {
         let child = actor(index)?;
@@ -987,7 +1039,7 @@ fn drive_dw1c_workload<
     // GO releases actor6's gate; the second datagram is the controller's
     // matching wake for its deliberately blocking wait.
     system
-        .send_channel(actor6.launch_channel, &[0xC6])
+        .send_channel(actor6.launch_channel, &DW1C_ACTOR6_WAKE)
         .map_err(Init0Error::Native)?;
     wait_actor_signal(
         supervisor,
