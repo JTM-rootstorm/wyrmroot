@@ -22,6 +22,13 @@ const MAJOR: u16 = 1;
 const MINOR: u16 = 0;
 const RECORD_BYTES: usize = 8;
 const LAUNCH_FIXED_BYTES: usize = 72;
+/// Exact largest admitted LAUNCH message without reducing any argv,
+/// environment, stream, path, or aggregate-string limit.
+pub const MAX_LAUNCH_MESSAGE_BYTES: usize = LAUNCH_FIXED_BYTES
+    + (MAX_ARGV + MAX_ENVIRONMENT) * RECORD_BYTES
+    + STREAM_COUNT * RECORD_BYTES
+    + MAX_PATH_BYTES
+    + MAX_STRING_BYTES;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Reservation {
@@ -968,7 +975,10 @@ fn put_u64(bytes: &mut [u8], offset: usize, value: u64) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
+    use std::{string::String, vec, vec::Vec};
     const R: Reservation = Reservation {
         connection_id: 7,
         generation: 9,
@@ -1008,6 +1018,53 @@ mod tests {
         assert_eq!(request.arg(1), Some("kobold"));
         assert_eq!(request.environment(1), Some("WYRMROOT_TEST=1"));
         assert_eq!(request.stream_count, 3);
+    }
+
+    #[test]
+    fn maximum_launch_message_size_is_exact_for_encode_and_parse() {
+        let path = "p".repeat(MAX_PATH_BYTES);
+        let environment: Vec<String> = (0..MAX_ENVIRONMENT)
+            .map(|index| std::format!("E{index:02}="))
+            .collect();
+        let environment: Vec<&str> = environment.iter().map(String::as_str).collect();
+        let environment_bytes = environment.iter().map(|value| value.len()).sum::<usize>();
+        let mut argv = vec![String::new(); MAX_ARGV];
+        argv[0] = path.clone();
+        argv[1] = "a".repeat(MAX_STRING_BYTES - path.len() - environment_bytes);
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        assert_eq!(
+            argv.iter()
+                .chain(environment.iter())
+                .map(|value| value.len())
+                .sum::<usize>(),
+            MAX_STRING_BYTES
+        );
+
+        let mut bytes = vec![0; MAX_LAUNCH_MESSAGE_BYTES];
+        assert_eq!(
+            encode_launch(R, &path, &argv, &environment, true, &mut bytes),
+            Ok(MAX_LAUNCH_MESSAGE_BYTES)
+        );
+        assert!(matches!(
+            parse_message(&bytes, STREAM_COUNT),
+            Ok(ParsedMessage {
+                message: Message::Launch(_),
+                ..
+            })
+        ));
+        assert_eq!(
+            encode_launch(
+                R,
+                &path,
+                &argv,
+                &environment,
+                true,
+                &mut bytes[..MAX_LAUNCH_MESSAGE_BYTES - 1],
+            ),
+            Err(Error::WrongSize)
+        );
+        bytes.push(0);
+        assert_eq!(parse_message(&bytes, STREAM_COUNT), Err(Error::WrongSize));
     }
 
     #[test]

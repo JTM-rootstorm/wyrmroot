@@ -1766,6 +1766,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 fn accept_reserved_launch<S, L, W>(
     system: &mut S,
     loader: &mut L,
@@ -1777,7 +1778,7 @@ fn accept_reserved_launch<S, L, W>(
     reservation: LaunchReservation,
     request_ticket: RequestTicket,
     request: wyrmroot_launch_proto::LaunchRequest<'_>,
-    received: &[DwReceivedHandleInfoV1; 16],
+    received: &[DwReceivedHandleInfoV1; wyrmroot_launch_proto::STREAM_COUNT],
     handle_count: usize,
 ) -> Result<crate::wyr1b::LoadedJob, InitError>
 where
@@ -2284,8 +2285,8 @@ where
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
-    let mut bytes = [0_u8; wyrmroot_launch_proto::MAX_STRING_BYTES + 2048];
-    let mut received = [DwReceivedHandleInfoV1::default(); 16];
+    let mut bytes = [0_u8; wyrmroot_launch_proto::MAX_LAUNCH_MESSAGE_BYTES];
+    let mut received = [DwReceivedHandleInfoV1::default(); wyrmroot_launch_proto::STREAM_COUNT];
     let counts = system
         .receive_channel(session, &mut bytes, &mut received)
         .map_err(InitError::Native)?;
@@ -2408,6 +2409,7 @@ where
     }
 }
 
+#[inline(always)]
 fn poll_job_dispatcher<S, L, W>(
     system: &mut S,
     loader: &mut L,

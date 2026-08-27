@@ -1076,6 +1076,7 @@ pub(crate) fn prepare_authorized_job<'a, L: LoaderPlatform>(
 /// Continues a launch whose correlatable transaction was reserved before
 /// semantic message validation.
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub(crate) fn prepare_reserved_job<'a, L: LoaderPlatform>(
     jobs: &mut JobController,
     policy: &PolicyView<'a>,

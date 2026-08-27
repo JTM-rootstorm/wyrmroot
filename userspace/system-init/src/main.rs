@@ -51,6 +51,7 @@ impl InitPlatform for NativeSystem {
     fn query_memory_object_size(&mut self, handle: DwHandle) -> Result<u64, NativeError> {
         query_memory_object_size(handle)
     }
+    #[cfg_attr(feature = "wyr1b-test-evidence", inline(always))]
     fn with_bootfs_bytes<R>(
         &mut self,
         root: DwHandle,

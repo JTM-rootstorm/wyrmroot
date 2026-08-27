@@ -461,6 +461,7 @@ impl ResidentSystemInit {
     /// Product-dispatched resident loop. Selector 25 immediately delegates to
     /// the unchanged legacy loop and therefore performs zero WYR1-B platform
     /// operations.
+    #[inline(always)]
     pub fn control_tick_product<S, L, W>(
         &mut self,
         system: &mut S,

@@ -6,6 +6,7 @@ use {
 
 const MAIN: &str = include_str!("../src/main.rs");
 const LIB: &str = include_str!("../src/lib.rs");
+const WYR1B_MODEL: &str = include_str!("../src/wyr1b.rs");
 const NATIVE: &str = include_str!("../src/wyr1b_native.rs");
 const MANIFEST: &str = include_str!("../Cargo.toml");
 
@@ -73,6 +74,36 @@ fn selector_27_resident_control_borrows_large_state_in_place() {
     assert!(NATIVE.contains("#[inline(never)]\nfn run_registry_replacement_gate"));
     assert!(NATIVE.contains("enum ReplacementGateOutcome"));
     assert!(NATIVE.contains(") -> Result<Option<RegistryNativeAttempt>, InitError>"));
+}
+
+#[test]
+fn selector_27_dispatcher_keeps_one_protocol_sized_payload_and_stream_set() {
+    let dispatch_start = NATIVE.find("fn dispatch_one_job_request").unwrap();
+    let dispatch_end = NATIVE[dispatch_start..]
+        .find("fn poll_job_dispatcher")
+        .map(|offset| dispatch_start + offset)
+        .unwrap();
+    let dispatch = &NATIVE[dispatch_start..dispatch_end];
+    assert_eq!(
+        dispatch
+            .matches("wyrmroot_launch_proto::MAX_LAUNCH_MESSAGE_BYTES")
+            .count(),
+        1
+    );
+    assert_eq!(
+        dispatch
+            .matches("wyrmroot_launch_proto::STREAM_COUNT")
+            .count(),
+        1
+    );
+    assert!(!dispatch.contains("MAX_STRING_BYTES + 2048"));
+    assert!(NATIVE.contains("#[inline(always)]\nfn accept_reserved_launch"));
+    assert!(NATIVE.contains("#[inline(always)]\nfn poll_job_dispatcher"));
+    assert!(WYR1B_MODEL.contains("#[inline(always)]\npub(crate) fn prepare_reserved_job"));
+    assert!(LIB.contains("#[inline(always)]\n    pub fn control_tick_product"));
+    assert!(MAIN.contains(
+        "#[cfg_attr(feature = \"wyr1b-test-evidence\", inline(always))]\n    fn with_bootfs_bytes"
+    ));
 }
 
 #[test]
