@@ -20,6 +20,10 @@ use wyrmroot_runtime::{
     panic_abort, query_capability_info, query_memory_object_size, receive_channel, send_channel,
     unmap_bootfs,
 };
+#[cfg(feature = "dw1c-preemption-integration")]
+use wyrmroot_runtime::{
+    DW1C_ACTOR_COUNT, Dw1cActorBindV1, arm_dw1c_preemption, submit_dw1c_workload_complete,
+};
 
 const HELLO_DEADLINE_NS: u64 = 5_000_000_000;
 
@@ -74,6 +78,19 @@ impl Init0System for NativeSystem {
         progress_process: DwHandle,
     ) -> Result<(), NativeError> {
         arm_dw1b_preemption(hog_process, progress_process)
+    }
+
+    #[cfg(feature = "dw1c-preemption-integration")]
+    fn arm_dw1c_preemption(
+        &mut self,
+        bindings: &[Dw1cActorBindV1; DW1C_ACTOR_COUNT],
+    ) -> Result<(), NativeError> {
+        arm_dw1c_preemption(bindings)
+    }
+
+    #[cfg(feature = "dw1c-preemption-integration")]
+    fn complete_dw1c_workload(&mut self, digest: u64) -> Result<(), NativeError> {
+        submit_dw1c_workload_complete(digest)
     }
 }
 

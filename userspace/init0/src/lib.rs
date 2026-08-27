@@ -164,6 +164,17 @@ pub trait Init0System {
         hog_process: DwHandle,
         progress_process: DwHandle,
     ) -> Result<(), NativeError>;
+
+    /// Arms selector 28 after all ten distinct actor processes have reached
+    /// READY.  Kept selector-local: it is not part of the generated ABI.
+    #[cfg(feature = "dw1c-preemption-integration")]
+    fn arm_dw1c_preemption(
+        &mut self,
+        bindings: &[wyrmroot_runtime::Dw1cActorBindV1; wyrmroot_runtime::DW1C_ACTOR_COUNT],
+    ) -> Result<(), NativeError>;
+
+    #[cfg(feature = "dw1c-preemption-integration")]
+    fn complete_dw1c_workload(&mut self, digest: u64) -> Result<(), NativeError>;
 }
 
 /// Why the WYR0-G `init0` descendant transaction failed.
