@@ -189,6 +189,11 @@ impl EvidenceLog {
         self.len == EVIDENCE_RECORDS
     }
 
+    #[cfg(test)]
+    pub(crate) const fn recorded_events(&self) -> usize {
+        self.len
+    }
+
     /// Partial transcripts are deliberately withheld: without `Terminal`, the
     /// selector has no success evidence claim.
     #[must_use]

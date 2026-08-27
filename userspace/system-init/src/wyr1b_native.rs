@@ -2733,6 +2733,31 @@ where
     poll_job_dispatcher(system, loader, waits, authority, jobs, poll_now)
 }
 
+fn record_owner_job_reap(
+    evidence: &mut EvidenceLog,
+    owner: EndpointGrant,
+    job_id: u64,
+    result: ControllerJobResult,
+) -> Result<(), InitError> {
+    if result.classification != TerminationClassification::NormalExit.as_u32()
+        || result.application_code != 0
+        || result.cleanup_result != 0
+    {
+        return Err(InitError::Wyr1BGateMismatch);
+    }
+    evidence
+        .record(GateEvent::JobExitZero, job_id, owner.endpoint_generation, 0)
+        .map_err(InitError::Wyr1BEvidence)?;
+    evidence
+        .record(
+            GateEvent::JobReaped,
+            job_id,
+            owner.endpoint_generation,
+            owner.endpoint_id,
+        )
+        .map_err(InitError::Wyr1BEvidence)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_job_gate<S, L, W>(
     system: &mut S,
@@ -2836,28 +2861,7 @@ where
             job_id,
         )
         .map_err(InitError::Wyr1BModel)?;
-    if owner_result.classification != TerminationClassification::NormalExit.as_u32()
-        || owner_result.application_code != 0
-        || owner_result.cleanup_result != 0
-    {
-        return Err(InitError::Wyr1BGateMismatch);
-    }
-    evidence
-        .record(
-            GateEvent::JobExitZero,
-            job_id,
-            owner.grant.endpoint_generation,
-            0,
-        )
-        .map_err(InitError::Wyr1BEvidence)?;
-    evidence
-        .record(
-            GateEvent::JobReaped,
-            job_id,
-            owner.grant.endpoint_generation,
-            owner.grant.endpoint_id,
-        )
-        .map_err(InitError::Wyr1BEvidence)?;
+    record_owner_job_reap(&mut *evidence, owner.grant, job_id, owner_result)?;
     close_launch_client(system, waits, jobs, owner)?;
 
     let foreign =
@@ -4017,6 +4021,233 @@ mod tests {
             connection_id: 1,
             generation: 3,
             transaction_id,
+        }
+    }
+
+    fn evidence_through_job_accepted(
+        gate: GateConfig,
+        owner: EndpointGrant,
+        job_id: u64,
+    ) -> EvidenceLog {
+        let publisher1 = grant(EndpointKind::Publication, 10, 1);
+        let client = grant(EndpointKind::RegistryClient, 11, 1);
+        let publisher2 = grant(EndpointKind::Publication, 12, 2);
+        let mut evidence = EvidenceLog::new(gate.nonce).unwrap();
+        for (event, subject, generation, value) in [
+            (GateEvent::RegistryReady, RoleId::Registryd as u64, 7, 1),
+            (
+                GateEvent::PublisherReady,
+                publisher1.endpoint_id,
+                publisher1.endpoint_generation,
+                publisher1.role_generation,
+            ),
+            (
+                GateEvent::ClientReady,
+                client.endpoint_id,
+                client.endpoint_generation,
+                client.role_generation,
+            ),
+            (
+                GateEvent::Published,
+                publisher1.endpoint_id,
+                publisher1.endpoint_generation,
+                publisher1.role_generation,
+            ),
+            (
+                GateEvent::Connected,
+                client.endpoint_id,
+                client.endpoint_generation,
+                publisher1.endpoint_id,
+            ),
+            (
+                GateEvent::DirectExchange,
+                client.endpoint_id,
+                client.endpoint_generation,
+                gate.nonce,
+            ),
+            (
+                GateEvent::Retired,
+                publisher1.endpoint_id,
+                publisher1.endpoint_generation,
+                publisher1.role_generation,
+            ),
+            (
+                GateEvent::StaleRejected,
+                publisher1.endpoint_id,
+                publisher1.endpoint_generation,
+                publisher2.endpoint_id,
+            ),
+            (
+                GateEvent::JobAccepted,
+                job_id,
+                owner.endpoint_generation,
+                owner.endpoint_id,
+            ),
+        ] {
+            evidence.record(event, subject, generation, value).unwrap();
+        }
+        evidence
+    }
+
+    fn resident_with_wyr1b_evidence(evidence: EvidenceLog) -> ResidentSystemInit {
+        let (controller, _) = ready_registry();
+        ResidentSystemInit {
+            controller,
+            authority: LoadAuthority {
+                parent_root: DwHandle(1),
+                bootfs: DwHandle(2),
+                task_group: DwHandle(3),
+            },
+            result: RecoveryResult::Recovered,
+            active: [None; EARLY_ROLE_COUNT],
+            evidence_finalized: false,
+            last_tick_ns: 0,
+            wyr1b: None,
+            wyr1b_evidence: Some(evidence),
+        }
+    }
+
+    #[test]
+    fn native_gate_report_failure_exposes_no_partial_evidence() {
+        let gate = GateConfig { nonce: 0x27 };
+        let owner = grant(EndpointKind::LaunchSession, 1, 1);
+        let mut evidence = EvidenceLog::new(gate.nonce).unwrap();
+        evidence
+            .record(GateEvent::RegistryReady, RoleId::Registryd as u64, 7, 1)
+            .unwrap();
+        let expected = launch_gate_record(
+            GateMessageType::JobResult,
+            gate,
+            owner,
+            1,
+            owner.endpoint_generation,
+            3,
+        );
+        let mut mismatched = expected;
+        mismatched.value = 1;
+
+        assert_eq!(
+            expect_gate(mismatched, expected),
+            Err(InitError::Wyr1BGateMismatch)
+        );
+        assert_eq!(evidence.recorded_events(), 1);
+        let resident = resident_with_wyr1b_evidence(evidence);
+        for index in 0..crate::wyr1b_gate::EVIDENCE_RECORDS {
+            assert_eq!(resident.wyr1b_evidence_record(index), None);
+        }
+    }
+
+    #[test]
+    fn native_gate_mock_exposes_only_complete_clean_reap_transcript() {
+        let gate = GateConfig { nonce: 0x27 };
+        let owner = grant(EndpointKind::LaunchSession, 1, 1);
+        let mut jobs = JobDispatcher::new();
+        jobs.install_session(owner, DwHandle(90)).unwrap();
+        let launch = jobs.jobs.begin_launch(reservation(1)).unwrap();
+        jobs.jobs.commit_launch(launch, 101, 102, 103).unwrap();
+        let loaded = jobs.jobs.loaded_job(launch.job_id).unwrap();
+        let mut platform = MockPlatform::new();
+        let mut waits = TerminalWaits;
+        let result = reap_job(&mut platform, &mut waits, &mut jobs, loaded).unwrap();
+        assert_eq!(result.classification, TerminationClassification::NormalExit);
+        assert_eq!(result.application_code, 0);
+        assert_eq!(result.cleanup_result, 0);
+
+        let mut evidence = evidence_through_job_accepted(gate, owner, launch.job_id);
+        let owner_result = jobs
+            .jobs
+            .result_for_owner(owner.endpoint_id, owner.endpoint_generation, launch.job_id)
+            .unwrap();
+        record_owner_job_reap(&mut evidence, owner, launch.job_id, owner_result).unwrap();
+        evidence
+            .record(
+                GateEvent::ForeignRejected,
+                launch.job_id,
+                owner.endpoint_generation,
+                2,
+            )
+            .unwrap();
+        evidence
+            .record(
+                GateEvent::OrphanReaped,
+                launch.job_id + 1,
+                owner.endpoint_generation,
+                3,
+            )
+            .unwrap();
+        evidence.finish().unwrap();
+
+        let resident = resident_with_wyr1b_evidence(evidence);
+        let expected_events = [
+            GateEvent::RegistryReady,
+            GateEvent::PublisherReady,
+            GateEvent::ClientReady,
+            GateEvent::Published,
+            GateEvent::Connected,
+            GateEvent::DirectExchange,
+            GateEvent::Retired,
+            GateEvent::StaleRejected,
+            GateEvent::JobAccepted,
+            GateEvent::JobExitZero,
+            GateEvent::JobReaped,
+            GateEvent::ForeignRejected,
+            GateEvent::OrphanReaped,
+            GateEvent::Terminal,
+        ];
+        for (sequence, event) in expected_events.into_iter().enumerate() {
+            let record = resident.wyr1b_evidence_record(sequence).unwrap();
+            assert_eq!(
+                u64::from_str_radix(core::str::from_utf8(&record[25..33]).unwrap(), 16),
+                Ok(sequence as u64)
+            );
+            assert_eq!(
+                u64::from_str_radix(core::str::from_utf8(&record[34..36]).unwrap(), 16),
+                Ok(event as u64)
+            );
+        }
+        assert_eq!(resident.wyr1b_evidence_record(expected_events.len()), None);
+    }
+
+    #[test]
+    fn native_gate_cleanup_failure_records_neither_job_terminal_event() {
+        let gate = GateConfig { nonce: 0x27 };
+        let owner = grant(EndpointKind::LaunchSession, 1, 1);
+        let mut jobs = JobDispatcher::new();
+        jobs.install_session(owner, DwHandle(90)).unwrap();
+        let launch = jobs.jobs.begin_launch(reservation(1)).unwrap();
+        jobs.jobs.commit_launch(launch, 101, 102, 103).unwrap();
+        let loaded = jobs.jobs.loaded_job(launch.job_id).unwrap();
+        let mut platform = MockPlatform::new();
+        platform.fail_close = Some(DwHandle(103));
+        let mut waits = TerminalWaits;
+        let mut evidence = evidence_through_job_accepted(gate, owner, launch.job_id);
+
+        assert_eq!(
+            reap_job(&mut platform, &mut waits, &mut jobs, loaded),
+            Err(InitError::Cleanup)
+        );
+        assert_eq!(evidence.recorded_events(), 9);
+        assert_eq!(
+            resident_with_wyr1b_evidence(evidence).wyr1b_evidence_record(0),
+            None
+        );
+
+        platform.fail_close = None;
+        let retained = jobs.jobs.loaded_job(launch.job_id).unwrap();
+        let result = reap_job(&mut platform, &mut waits, &mut jobs, retained).unwrap();
+        assert_ne!(result.cleanup_result, 0);
+        let owner_result = jobs
+            .jobs
+            .result_for_owner(owner.endpoint_id, owner.endpoint_generation, launch.job_id)
+            .unwrap();
+        assert_eq!(
+            record_owner_job_reap(&mut evidence, owner, launch.job_id, owner_result),
+            Err(InitError::Wyr1BGateMismatch)
+        );
+        assert_eq!(evidence.recorded_events(), 9);
+        let resident = resident_with_wyr1b_evidence(evidence);
+        for index in 0..crate::wyr1b_gate::EVIDENCE_RECORDS {
+            assert_eq!(resident.wyr1b_evidence_record(index), None);
         }
     }
 
