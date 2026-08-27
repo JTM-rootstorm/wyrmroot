@@ -88,6 +88,11 @@ enum StartupSpec<'a> {
     },
 }
 
+enum StartupMaterialization<'a> {
+    Legacy(&'a [u8]),
+    JobV2(image::StartupBlockV2Plan<'a>),
+}
+
 #[derive(Clone, Copy)]
 struct InternalLoadRequest<'a> {
     image: &'a [u8],
@@ -229,6 +234,26 @@ pub trait LoaderPlatform {
         object_size: u64,
         destination_offset: u64,
         source: &[u8],
+    ) -> Result<ParentMapping, Self::Error> {
+        self.materialize_parent_with(
+            parent_root,
+            memory,
+            object_size,
+            destination_offset,
+            source.len(),
+            |destination| destination.copy_from_slice(source),
+        )
+    }
+    /// Maps and zeroes the complete object, then lends only the checked
+    /// destination extent to one bounded, non-escaping materializer.
+    fn materialize_parent_with(
+        &mut self,
+        parent_root: DwHandle,
+        memory: DwHandle,
+        object_size: u64,
+        destination_offset: u64,
+        destination_size: usize,
+        materialize: impl FnOnce(&mut [u8]),
     ) -> Result<ParentMapping, Self::Error>;
     fn unmap_parent(
         &mut self,
@@ -589,7 +614,7 @@ fn load_legacy_process_materialized<P: LoaderPlatform>(
         fault,
         delegated_channels_consumed,
         plan,
-        &startup_block,
+        StartupMaterialization::Legacy(&startup_block),
         INITIAL_STACK.startup_page_offset,
         INITIAL_STACK.stack_pointer,
         image::STARTUP_ABI_VERSION,
@@ -609,16 +634,14 @@ fn load_job_v2_process_materialized<P: LoaderPlatform>(
     delegated_channels_consumed: &mut bool,
     plan: elf::ElfLoadPlan<'_>,
 ) -> Result<LoadedProcess, LoadError<P::Error>> {
-    let mut startup_block = [0_u8; image::STARTUP_V2_BLOCK_BYTES];
-    image::write_startup_block_v2(
-        &mut startup_block,
+    let startup = image::StartupBlockV2Plan::new(
+        image::STARTUP_V2_BLOCK_BYTES,
         image::STARTUP_V2_BLOCK_ADDRESS,
         path,
         argv,
         environment,
     )
     .map_err(LoadError::Startup)?;
-    apply_startup_fault(&mut startup_block, fault);
     load_process_materialized(
         platform,
         authority,
@@ -626,7 +649,7 @@ fn load_job_v2_process_materialized<P: LoaderPlatform>(
         fault,
         delegated_channels_consumed,
         plan,
-        &startup_block,
+        StartupMaterialization::JobV2(startup),
         INITIAL_STACK.object_size - image::STARTUP_V2_BLOCK_BYTES as u64,
         image::STARTUP_V2_BLOCK_ADDRESS,
         image::STARTUP_ABI_V2,
@@ -641,7 +664,7 @@ fn load_process_materialized<P: LoaderPlatform>(
     fault: LoadFault,
     delegated_channels_consumed: &mut bool,
     plan: elf::ElfLoadPlan<'_>,
-    startup_block: &[u8],
+    startup: StartupMaterialization<'_>,
     startup_offset: u64,
     stack_pointer: u64,
     startup_abi: u64,
@@ -781,13 +804,27 @@ fn load_process_materialized<P: LoaderPlatform>(
         }
     };
     transaction.scratch_memory = Some(stack);
-    let parent_mapping = match platform.materialize_parent(
-        authority.parent_root,
-        stack,
-        INITIAL_STACK.object_size,
-        startup_offset,
-        startup_block,
-    ) {
+    let materialized = match startup {
+        StartupMaterialization::Legacy(startup_block) => platform.materialize_parent(
+            authority.parent_root,
+            stack,
+            INITIAL_STACK.object_size,
+            startup_offset,
+            startup_block,
+        ),
+        StartupMaterialization::JobV2(startup) => platform.materialize_parent_with(
+            authority.parent_root,
+            stack,
+            INITIAL_STACK.object_size,
+            startup_offset,
+            image::STARTUP_V2_BLOCK_BYTES,
+            |block| {
+                startup.write(block);
+                apply_startup_fault(block, fault);
+            },
+        ),
+    };
+    let parent_mapping = match materialized {
         Ok(mapping) => mapping,
         Err(cause) => {
             return Err(fail(

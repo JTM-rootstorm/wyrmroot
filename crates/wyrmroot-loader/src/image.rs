@@ -112,101 +112,130 @@ pub fn write_startup_block_v2(
     argv: &[&str],
     environment: &[&str],
 ) -> Result<(), StartupBlockError> {
-    const MAX_ARGV: usize = 64;
-    const MAX_ENVIRONMENT: usize = 64;
-    const MAX_STRING_BYTES: usize = 16 * 1024;
-    if block.len() != STARTUP_V2_BLOCK_BYTES {
-        return Err(StartupBlockError::PageSize);
-    }
-    if argv.is_empty() || argv.len() > MAX_ARGV {
-        return Err(StartupBlockError::TooManyArguments);
-    }
-    if environment.len() > MAX_ENVIRONMENT {
-        return Err(StartupBlockError::TooManyEnvironmentEntries);
-    }
-    if argv[0] != path {
-        return Err(StartupBlockError::Argv0Mismatch);
-    }
-    if path.is_empty() || path.as_bytes().contains(&0) {
-        return Err(if path.is_empty() {
-            StartupBlockError::EmptyDisplayPath
-        } else {
-            StartupBlockError::DisplayPathContainsNul
-        });
-    }
-    if argv
-        .iter()
-        .skip(1)
-        .chain(environment.iter())
-        .any(|value| value.as_bytes().contains(&0))
-    {
-        return Err(StartupBlockError::StringContainsNul);
-    }
-    let aggregate_string_bytes = argv
-        .iter()
-        .chain(environment.iter())
-        .try_fold(0usize, |sum, value| sum.checked_add(value.len()))
-        .ok_or(StartupBlockError::StringBytesExceeded)?;
-    if aggregate_string_bytes > MAX_STRING_BYTES {
-        return Err(StartupBlockError::StringBytesExceeded);
-    }
-    let encoded_string_bytes = aggregate_string_bytes
-        .checked_add(argv.len())
-        .and_then(|value| value.checked_add(environment.len()))
-        .ok_or(StartupBlockError::StringBytesExceeded)?;
-    for (index, value) in environment.iter().enumerate() {
-        let name = environment_name(value)?;
-        if environment[..index]
-            .iter()
-            .any(|other| environment_name(other).ok() == Some(name))
-        {
-            return Err(StartupBlockError::DuplicateEnvironment);
+    let plan = StartupBlockV2Plan::new(block.len(), block_address, path, argv, environment)?;
+    plan.write(block);
+    Ok(())
+}
+
+pub(crate) struct StartupBlockV2Plan<'a> {
+    block_address: u64,
+    argv: &'a [&'a str],
+    environment: &'a [&'a str],
+    string_start: usize,
+}
+
+impl<'a> StartupBlockV2Plan<'a> {
+    pub(crate) fn new(
+        block_len: usize,
+        block_address: u64,
+        path: &str,
+        argv: &'a [&'a str],
+        environment: &'a [&'a str],
+    ) -> Result<Self, StartupBlockError> {
+        const MAX_ARGV: usize = 64;
+        const MAX_ENVIRONMENT: usize = 64;
+        const MAX_STRING_BYTES: usize = 16 * 1024;
+        if block_len != STARTUP_V2_BLOCK_BYTES {
+            return Err(StartupBlockError::PageSize);
         }
+        if argv.is_empty() || argv.len() > MAX_ARGV {
+            return Err(StartupBlockError::TooManyArguments);
+        }
+        if environment.len() > MAX_ENVIRONMENT {
+            return Err(StartupBlockError::TooManyEnvironmentEntries);
+        }
+        if argv[0] != path {
+            return Err(StartupBlockError::Argv0Mismatch);
+        }
+        if path.is_empty() || path.as_bytes().contains(&0) {
+            return Err(if path.is_empty() {
+                StartupBlockError::EmptyDisplayPath
+            } else {
+                StartupBlockError::DisplayPathContainsNul
+            });
+        }
+        if argv
+            .iter()
+            .skip(1)
+            .chain(environment.iter())
+            .any(|value| value.as_bytes().contains(&0))
+        {
+            return Err(StartupBlockError::StringContainsNul);
+        }
+        let aggregate_string_bytes = argv
+            .iter()
+            .chain(environment.iter())
+            .try_fold(0usize, |sum, value| sum.checked_add(value.len()))
+            .ok_or(StartupBlockError::StringBytesExceeded)?;
+        if aggregate_string_bytes > MAX_STRING_BYTES {
+            return Err(StartupBlockError::StringBytesExceeded);
+        }
+        let encoded_string_bytes = aggregate_string_bytes
+            .checked_add(argv.len())
+            .and_then(|value| value.checked_add(environment.len()))
+            .ok_or(StartupBlockError::StringBytesExceeded)?;
+        for (index, value) in environment.iter().enumerate() {
+            let name = environment_name(value)?;
+            if environment[..index]
+                .iter()
+                .any(|other| environment_name(other).ok() == Some(name))
+            {
+                return Err(StartupBlockError::DuplicateEnvironment);
+            }
+        }
+
+        let vector_words = 1usize
+            .checked_add(argv.len())
+            .and_then(|value| value.checked_add(1))
+            .and_then(|value| value.checked_add(environment.len()))
+            .and_then(|value| value.checked_add(1 + 2))
+            .ok_or(StartupBlockError::StringBytesExceeded)?;
+        let string_start = vector_words
+            .checked_mul(8)
+            .ok_or(StartupBlockError::StringBytesExceeded)?;
+        if string_start + encoded_string_bytes > block_len {
+            return Err(StartupBlockError::StringBytesExceeded);
+        }
+        block_address
+            .checked_add((string_start + encoded_string_bytes) as u64)
+            .ok_or(StartupBlockError::PointerOverflow)?;
+        Ok(Self {
+            block_address,
+            argv,
+            environment,
+            string_start,
+        })
     }
 
-    let vector_words = 1usize
-        .checked_add(argv.len())
-        .and_then(|value| value.checked_add(1))
-        .and_then(|value| value.checked_add(environment.len()))
-        .and_then(|value| value.checked_add(1 + 2))
-        .ok_or(StartupBlockError::StringBytesExceeded)?;
-    let string_start = vector_words
-        .checked_mul(8)
-        .ok_or(StartupBlockError::StringBytesExceeded)?;
-    if string_start + encoded_string_bytes > block.len() {
-        return Err(StartupBlockError::StringBytesExceeded);
-    }
-    block.fill(0);
-    put_u64(block, 0, argv.len() as u64);
-    let mut word_offset = 8usize;
-    let mut string_offset = string_start;
-    for value in argv {
-        put_u64(
-            block,
-            word_offset,
-            block_address
-                .checked_add(string_offset as u64)
-                .ok_or(StartupBlockError::PointerOverflow)?,
-        );
+    pub(crate) fn write(self, block: &mut [u8]) {
+        debug_assert_eq!(block.len(), STARTUP_V2_BLOCK_BYTES);
+        block.fill(0);
+        put_u64(block, 0, self.argv.len() as u64);
+        let mut word_offset = 8usize;
+        let mut string_offset = self.string_start;
+        for value in self.argv {
+            put_u64(
+                block,
+                word_offset,
+                self.block_address + string_offset as u64,
+            );
+            word_offset += 8;
+            block[string_offset..string_offset + value.len()].copy_from_slice(value.as_bytes());
+            string_offset += value.len() + 1;
+        }
         word_offset += 8;
-        block[string_offset..string_offset + value.len()].copy_from_slice(value.as_bytes());
-        string_offset += value.len() + 1;
+        for value in self.environment {
+            put_u64(
+                block,
+                word_offset,
+                self.block_address + string_offset as u64,
+            );
+            word_offset += 8;
+            block[string_offset..string_offset + value.len()].copy_from_slice(value.as_bytes());
+            string_offset += value.len() + 1;
+        }
+        // envp NULL and terminal auxv pair remain zero.
     }
-    word_offset += 8;
-    for value in environment {
-        put_u64(
-            block,
-            word_offset,
-            block_address
-                .checked_add(string_offset as u64)
-                .ok_or(StartupBlockError::PointerOverflow)?,
-        );
-        word_offset += 8;
-        block[string_offset..string_offset + value.len()].copy_from_slice(value.as_bytes());
-        string_offset += value.len() + 1;
-    }
-    // envp NULL and terminal auxv pair remain zero.
-    Ok(())
 }
 
 fn environment_name(value: &str) -> Result<&str, StartupBlockError> {

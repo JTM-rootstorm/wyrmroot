@@ -46,6 +46,7 @@ struct Mock {
     fail_close_at: Option<usize>,
     fail_process_terminate: bool,
     materialized: Vec<Vec<u8>>,
+    direct_materializations: usize,
     sent_init: Vec<u8>,
     sent_transfers: Vec<DwHandleTransferV1>,
 }
@@ -70,6 +71,7 @@ impl Mock {
             fail_close_at: None,
             fail_process_terminate: false,
             materialized: Vec::new(),
+            direct_materializations: 0,
             sent_init: Vec::new(),
             sent_transfers: Vec::new(),
         }
@@ -144,6 +146,27 @@ impl LoaderPlatform for Mock {
     ) -> Result<ParentMapping, Self::Error> {
         self.events.push(Event::Materialize(memory.0, source.len()));
         self.materialized.push(source.to_vec());
+        self.check("materialize")?;
+        Ok(ParentMapping {
+            address: 0x6000_0000 + memory.0 * 0x1000,
+            bytes: 0x1000,
+        })
+    }
+    fn materialize_parent_with(
+        &mut self,
+        _: DwHandle,
+        memory: DwHandle,
+        _object_size: u64,
+        _: u64,
+        destination_size: usize,
+        materialize: impl FnOnce(&mut [u8]),
+    ) -> Result<ParentMapping, Self::Error> {
+        let mut destination = vec![0; destination_size];
+        materialize(&mut destination);
+        self.direct_materializations += 1;
+        self.events
+            .push(Event::Materialize(memory.0, destination.len()));
+        self.materialized.push(destination);
         self.check("materialize")?;
         Ok(ParentMapping {
             address: 0x6000_0000 + memory.0 * 0x1000,
@@ -393,6 +416,7 @@ fn bootstrap_registry_moves_self_root_and_controller_endpoint() {
         wyrmroot_loader::launch::CHILD_CHANNEL_RIGHTS
     );
     assert_eq!(&platform.sent_init[6..8], &3_u16.to_le_bytes());
+    assert_eq!(platform.direct_materializations, 0);
     assert_eq!(platform.started_abi, Some(1));
     assert_eq!(
         platform.started_stack_pointer,
@@ -408,6 +432,7 @@ fn bootstrap_registry_moves_self_root_and_controller_endpoint() {
 fn bootstrap_service_uses_startup_v2_for_controller_correlation_environment() {
     let mut platform = Mock::new(None);
     let image = executable();
+    let display_path = "test/wyr1-b/publisher";
     let correlation = CorrelationEnvironment::new(Correlation {
         registry_generation: 7,
         endpoint_id: 11,
@@ -419,7 +444,7 @@ fn bootstrap_service_uses_startup_v2_for_controller_correlation_environment() {
         authority(),
         ServiceLoadRequest {
             image: &image,
-            display_path: "test/wyr1-b/publisher",
+            display_path,
             profile: LaunchProfile::BootstrapService,
             service_channel: DwHandle(0x904),
             correlation: Some(&correlation),
@@ -433,6 +458,23 @@ fn bootstrap_service_uses_startup_v2_for_controller_correlation_environment() {
         Some(wyrmroot_loader::image::STARTUP_V2_BLOCK_ADDRESS)
     );
     assert_eq!(platform.materialized.last().unwrap().len(), 20 * 1024);
+    assert_eq!(platform.direct_materializations, 1);
+    let mut expected = vec![0; wyrmroot_loader::image::STARTUP_V2_BLOCK_BYTES];
+    let argv = [display_path];
+    let environment = [
+        correlation.entry(0).unwrap(),
+        correlation.entry(1).unwrap(),
+        correlation.entry(2).unwrap(),
+    ];
+    wyrmroot_loader::image::write_startup_block_v2(
+        &mut expected,
+        wyrmroot_loader::image::STARTUP_V2_BLOCK_ADDRESS,
+        display_path,
+        &argv,
+        &environment,
+    )
+    .unwrap();
+    assert_eq!(platform.materialized.last().unwrap(), &expected);
     assert!(
         platform
             .materialized

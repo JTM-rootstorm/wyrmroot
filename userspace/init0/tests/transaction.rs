@@ -374,6 +374,23 @@ impl LoaderPlatform for Loader {
         })
     }
 
+    fn materialize_parent_with(
+        &mut self,
+        _: DwHandle,
+        _: DwHandle,
+        object_size: u64,
+        _: u64,
+        destination_size: usize,
+        materialize: impl FnOnce(&mut [u8]),
+    ) -> Result<ParentMapping, Self::Error> {
+        let mut destination = vec![0; destination_size];
+        materialize(&mut destination);
+        Ok(ParentMapping {
+            address: 0x5000_0000,
+            bytes: object_size,
+        })
+    }
+
     fn unmap_parent(&mut self, _: DwHandle, _: ParentMapping) -> Result<(), Self::Error> {
         Ok(())
     }

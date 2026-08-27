@@ -3683,6 +3683,23 @@ mod tests {
             })
         }
 
+        fn materialize_parent_with(
+            &mut self,
+            _parent_root: DwHandle,
+            memory: DwHandle,
+            object_size: u64,
+            _destination_offset: u64,
+            destination_size: usize,
+            materialize: impl FnOnce(&mut [u8]),
+        ) -> Result<ParentMapping, Self::Error> {
+            let mut destination = vec![0; destination_size];
+            materialize(&mut destination);
+            Ok(ParentMapping {
+                address: 0x6000_0000 + memory.0 * 0x10_0000,
+                bytes: object_size,
+            })
+        }
+
         fn unmap_parent(
             &mut self,
             _parent_root: DwHandle,

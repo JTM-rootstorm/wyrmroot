@@ -86,20 +86,21 @@ impl LoaderPlatform for NativeLoaderPlatform {
         unsafe_code,
         reason = "a successful checked RW mapping owns this exact extent until the mandatory unmap below"
     )]
-    fn materialize_parent(
+    fn materialize_parent_with(
         &mut self,
         parent_root: DwHandle,
         memory: DwHandle,
         object_size: u64,
         destination_offset: u64,
-        source: &[u8],
+        destination_size: usize,
+        materialize: impl FnOnce(&mut [u8]),
     ) -> Result<ParentMapping, Self::Error> {
         let length = usize::try_from(object_size)
             .map_err(|_| NativeError::Output(NativeOutputError::InvalidMappedRange))?;
         let destination = usize::try_from(destination_offset)
             .map_err(|_| NativeError::Output(NativeOutputError::InvalidMappedRange))?;
         let end = destination
-            .checked_add(source.len())
+            .checked_add(destination_size)
             .filter(|end| *end <= length)
             .ok_or(NativeError::Output(NativeOutputError::InvalidMappedRange))?;
         let arguments = map_arguments(0, object_size, rw_protection(), DwAddressRegionMapFlags(0));
@@ -124,7 +125,7 @@ impl LoaderPlatform for NativeLoaderPlatform {
         // exclusively owned by this call until the mandatory unmap. The slice never escapes.
         let bytes = unsafe { core::slice::from_raw_parts_mut(address.0 as *mut u8, length) };
         bytes.fill(0);
-        bytes[destination..end].copy_from_slice(source);
+        materialize(&mut bytes[destination..end]);
         Ok(ParentMapping {
             address: address.0,
             bytes: object_size,
