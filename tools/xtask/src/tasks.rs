@@ -587,7 +587,7 @@ fn run_uefi_cargo(
     )?;
     let operation = invocation.operation.as_str();
     let mut command = Command::new(&toolchain.accepted.cargo);
-    command.arg(operation);
+    command.arg(operation).arg("--offline");
     if invocation.cargo_profile == UefiCargoProfile::Release {
         command.arg("--release");
     }

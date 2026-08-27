@@ -1,5 +1,5 @@
 schema_version = 5
-deepwyrm_revision = "18ddeef7dc118d1a5c830713e28206baac4c5c97"
+deepwyrm_revision = "0d7c928d845d3875a21e7f1d17e56b01617ff0c1"
 deepwyrm_abi_tree = "1c6a74f130e386eee95b3780c75950beefd0037d"
 wyrmroot_revision = "REPLACE_WITH_INTEGRATED_WYRMROOT_COMMIT"
 rust_revision = "a92dc7f7464ad6ddfece4402bd7b86dbfa86166d"

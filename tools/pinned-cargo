@@ -1,0 +1,166 @@
+#!/bin/sh
+set -eu
+PATH=/usr/lib/llvm/22/bin:/usr/bin:/bin
+export PATH
+
+fail() {
+    printf 'pinned-cargo: %s\n' "$*" >&2
+    exit 2
+}
+
+config_value() {
+    config_path=$1
+    config_key=$2
+    awk -F ' = ' -v key="$config_key" '
+        $1 == key {
+            value = $2
+            sub(/^"/, "", value)
+            sub(/"$/, "", value)
+            print value
+            found = 1
+        }
+        END { if (!found) exit 1 }
+    ' "$config_path" || fail "$config_path omits $config_key"
+}
+
+verify_file() {
+    file_path=$1
+    expected_sha=$2
+    file_label=$3
+    [ -f "$file_path" ] || fail "$file_label is not a regular file: $file_path"
+    actual_sha=$(sha256sum -- "$file_path" | awk '{ print $1 }')
+    [ "$actual_sha" = "$expected_sha" ] || fail "$file_label hash mismatch: $file_path"
+}
+
+[ "$#" -ge 1 ] || fail "missing Cargo arguments"
+[ -z "${CARGO_HOME:-}" ] || fail "CARGO_HOME is launcher-owned; do not supply it"
+[ -z "${WYRMROOT_RUSTC:-}" ] || fail "WYRMROOT_RUSTC is product-build-owned; do not supply it"
+
+safe_host_targets=false
+for argument in "$@"; do
+    case "$argument" in
+        +*) fail "toolchain selectors are forbidden; the launcher owns Rust 1.97.1" ;;
+        --features|--features=*|--all-features)
+            fail "host launcher rejects caller-selected features; use an explicit host gate or xtask"
+            ;;
+        --target|--target=*|x86_64-unknown-wyrmroot|x86_64-unknown-none|x86_64-unknown-uefi)
+            fail "host launcher rejects explicit guest/UEFI targets; use xtask"
+            ;;
+        --target-dir|--target-dir=*)
+            fail "target directory is launcher-owned; use WYRMROOT_PINNED_TARGET_DIR for an isolated lane"
+            ;;
+        --all-targets|--bin|--bin=*|--bins|--example|--example=*|--examples)
+            fail "host launcher rejects binary/all-target admission; use an explicit host test or xtask"
+            ;;
+        --manifest-path|--manifest-path=*|--config|--config=*)
+            fail "host launcher rejects manifest/config redirection"
+            ;;
+        --lib|--tests|--test|--test=*|--doc) safe_host_targets=true ;;
+    esac
+done
+
+case "$1" in
+    -V|--version|version|metadata|fmt|test|clippy|doc|rustdoc|check|build|xtask) ;;
+    *) fail "Cargo subcommand '$1' is not admitted by the host launcher" ;;
+esac
+
+case "$1" in
+    build|check|clippy|rustdoc)
+        [ "$safe_host_targets" = true ] || \
+            fail "host launcher rejects implicit $1 targets; select --lib, --tests, --test, or --doc"
+        ;;
+esac
+
+for variable in CARGO RUSTUP_TOOLCHAIN RUSTC_BOOTSTRAP RUSTC RUSTDOC RUSTFMT \
+    RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER CARGO_BUILD_RUSTC \
+    CARGO_BUILD_RUSTDOC CARGO_BUILD_RUSTC_WRAPPER \
+    CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER CARGO_BUILD_RUSTFLAGS RUSTFLAGS \
+    CARGO_BUILD_TARGET CARGO_ENCODED_RUSTFLAGS RUSTDOCFLAGS CARGO_TARGET_DIR; do
+    eval "value=\${$variable:-}"
+    [ -z "$value" ] || fail "$variable is launcher-owned; do not supply it"
+done
+if env | awk -F= 'BEGIN { found = 0 } $1 ~ /^CARGO_TARGET_/ { found = 1 } END { exit found ? 0 : 1 }'; then
+    fail "CARGO_TARGET_* overrides are launcher-owned; do not supply them"
+fi
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+repository=$(CDPATH='' cd -- "$script_dir/.." && pwd -P)
+project_root=$(CDPATH='' cd -- "$repository/.." && pwd -P)
+cd -- "$repository"
+identity="$repository/toolchain/host-rust-toolchain.toml"
+[ "$(config_value "$identity" schema)" = "wyrmroot-host-rust-toolchain-identity-v1" ] || \
+    fail "unexpected host toolchain identity schema"
+
+cargo=$(config_value "$identity" cargo_binary)
+rustc=$(config_value "$identity" rustc_binary)
+rustdoc=$(config_value "$identity" rustdoc_binary)
+rustfmt=$(config_value "$identity" rustfmt_binary)
+tool_bin=$(config_value "$identity" tool_bin_directory)
+verify_file "$cargo" "$(config_value "$identity" cargo_sha256)" "host Cargo"
+verify_file "$rustc" "$(config_value "$identity" rustc_sha256)" "host rustc"
+verify_file "$rustdoc" "$(config_value "$identity" rustdoc_sha256)" "host rustdoc"
+verify_file "$rustfmt" "$(config_value "$identity" rustfmt_sha256)" "host rustfmt"
+verify_file "$(config_value "$identity" cargo_fmt_binary)" \
+    "$(config_value "$identity" cargo_fmt_sha256)" "host cargo-fmt"
+verify_file "$(config_value "$identity" cargo_clippy_binary)" \
+    "$(config_value "$identity" cargo_clippy_sha256)" "host cargo-clippy"
+verify_file "$(config_value "$identity" clippy_driver_binary)" \
+    "$(config_value "$identity" clippy_driver_sha256)" "host clippy-driver"
+verify_file "$(config_value "$identity" rust_analyzer_binary)" \
+    "$(config_value "$identity" rust_analyzer_sha256)" "host rust-analyzer"
+rust_src_root=$(config_value "$identity" rust_src_root)
+[ -d "$rust_src_root" ] || fail "host rust-src root is not a directory: $rust_src_root"
+verify_file "$(config_value "$identity" rust_src_std_entry)" \
+    "$(config_value "$identity" rust_src_std_entry_sha256)" "host rust-src std entry"
+verify_file "$(config_value "$identity" rust_src_core_entry)" \
+    "$(config_value "$identity" rust_src_core_entry_sha256)" "host rust-src core entry"
+
+cargo_home_relative=$(config_value "$identity" cargo_home)
+case "$cargo_home_relative" in
+    /*|*..*) fail "Cargo home must be a non-traversing project-relative path" ;;
+esac
+cargo_home=$(realpath -m -- "$project_root/$cargo_home_relative")
+case "$cargo_home" in
+    "$project_root"/.tmp/*) ;;
+    *) fail "Cargo home must resolve beneath $project_root/.tmp" ;;
+esac
+[ -d "$cargo_home" ] && [ ! -L "$cargo_home" ] || \
+    fail "Cargo home is not a project-local non-symlink directory: $cargo_home"
+
+target_dir=${WYRMROOT_PINNED_TARGET_DIR:-}
+[ -n "$target_dir" ] || target_dir="$repository/$(config_value "$identity" target_dir)"
+case "$target_dir" in
+    /tmp/*|"$repository"/.tmp/*) ;;
+    *) fail "target directory must be beneath /tmp or $repository/.tmp" ;;
+esac
+normalized_target=$(realpath -m -- "$target_dir")
+[ "$normalized_target" = "$target_dir" ] || fail "target directory must already be normalized"
+[ "$normalized_target" != "$repository/target" ] || fail "canonical target/ is forbidden"
+mkdir -p -- "$normalized_target"
+target_marker="$normalized_target/.wyrmroot-pinned-cargo-v1"
+lane_identity="cargo_sha256=$(config_value "$identity" cargo_sha256)
+rustc_sha256=$(config_value "$identity" rustc_sha256)"
+if [ -e "$target_marker" ]; then
+    [ -f "$target_marker" ] && [ ! -L "$target_marker" ] || \
+        fail "target identity marker is not a regular non-symlink file"
+    [ "$(cat -- "$target_marker")" = "$lane_identity" ] || \
+        fail "target directory belongs to another pinned toolchain"
+else
+    if find "$normalized_target" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+        fail "target directory is nonempty but has no pinned Cargo identity marker"
+    fi
+    printf '%s\n' "$lane_identity" >"$target_marker"
+fi
+
+export CARGO_HOME="$cargo_home"
+export CARGO_INCREMENTAL=0
+export CARGO_NET_OFFLINE=true
+export PATH="$tool_bin:$PATH"
+unset LD_LIBRARY_PATH LD_PRELOAD
+
+target_config="build.target-dir=\"$normalized_target\""
+rustc_config="build.rustc=\"$rustc\""
+"$cargo" --config "$target_config" --config "$rustc_config" \
+    metadata --locked --offline --format-version=1 >/dev/null || \
+    fail "pinned Cargo home cannot resolve the locked offline dependency graph"
+exec "$cargo" --config "$target_config" --config "$rustc_config" "$@"

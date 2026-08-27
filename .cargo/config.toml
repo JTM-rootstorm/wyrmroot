@@ -1,2 +1,6 @@
 [alias]
 xtask = "run --quiet --locked --package xtask --"
+
+[build]
+rustc = "/opt/rust-bin-1.97.1/bin/rustc"
+target-dir = ".tmp/cargo-target/host-1.97.1"

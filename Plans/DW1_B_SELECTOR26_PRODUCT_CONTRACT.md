@@ -5,7 +5,7 @@ product. It does not extend Deepwyrm's public ABI. Wyrmroot's global generated
 ABI/syscall consumers remain pinned to `cfc69bd8a49819ce1cda1a132cf56e55c93f92e4`
 and ABI tree `1c6a74f130e386eee95b3780c75950beefd0037d`.
 The selector product separately requires kernel candidate
-`18ddeef7dc118d1a5c830713e28206baac4c5c97`; this is the canonical selector-26
+`0d7c928d845d3875a21e7f1d17e56b01617ff0c1`; this is the canonical selector-26
 kernel candidate. This contract does not claim that a Wyrmroot revision which
 has not yet been integrated and committed is final.
 
@@ -37,7 +37,7 @@ Schema 5 uses canonical request-relative paths with no traversal, symlink
 ancestry, hard-link substitution, or input/output/run-directory aliases. It
 binds nonzero exact revisions, the candidate and ABI tree, accepted Rust
 revision `a92dc7f7464ad6ddfece4402bd7b86dbfa86166d`, and the exact clean current
-Wyrmroot HEAD. Before a request is authored, `cargo xtask dw1b freeze --output
+Wyrmroot HEAD. Before a request is authored, `tools/pinned-cargo xtask dw1b freeze --output
 <new-directory>` refuses existing output and a dirty source tree, then produces
 the six request input artifacts plus the builder-owned Wyr source-build
 receipt. It uses the central deterministic UEFI builder for isolated release
@@ -89,7 +89,7 @@ kernel build. Its hash is itself request-bound. This proves agreement between
 the accepted build record and inspected artifacts; it does not claim to infer
 an unrecorded compiler invocation from an ELF file.
 
-`cargo xtask dw1b run --request <request>` is the canonical bounded execution
+`tools/pinned-cargo xtask dw1b run --request <request>` is the canonical bounded execution
 command. It reuses the central one-CPU q35/OVMF Wyrmroot runner, creates fresh
 run-local snapshots of the inspected ESP and exact OVMF code/variables, owns
 the serial and stderr outputs, observes timeout/process status, and only then

@@ -23,6 +23,21 @@ focused tests, `core`/compiler-builtins artifacts, and no-libc smoke ELF.
 
 ## Rust toolchain activation
 
+All operator-facing Cargo entry points use `tools/pinned-cargo`. The launcher pins
+the installed host Rust 1.97.1 identity recorded in
+`host-rust-toolchain.toml`, supplies the shared offline project Cargo home, and
+uses a reusable host-only target directory. Callers must omit `CARGO_HOME`,
+`WYRMROOT_RUSTC`, compiler wrappers, target selection, and Rust flags. The
+launcher rejects host invocations that could implicitly admit native, UEFI, or
+other freestanding binaries; product builds remain centralized inside `xtask`,
+which selects and verifies the accepted Wyrmroot fork itself.
+
+The reusable default target directory avoids rebuilding unchanged host tools
+and tests. Concurrent or disposable lanes may set
+`WYRMROOT_PINNED_TARGET_DIR` only to an already-normalized absolute path beneath
+`wyrmroot/.tmp` or `/tmp`; the launcher's identity marker prevents cross-
+toolchain reuse.
+
 The repository intentionally has no active root `rust-toolchain.toml` during
 bootstrap. A Rust commit cannot be selected accurately with an official
 moving-channel name, while activating a custom name before its compiler has
@@ -137,7 +152,5 @@ The host-only deterministic bootfs encoder accepts the exact native `init0` and
 existing path:
 
 ```text
-cargo run --locked --release -p wyrmroot-bootfs \
-  --features builder --bin wyrmroot-bootfs-build -- \
-  <init0-elf> <hello-elf> <output-bootfs>
+tools/pinned-cargo xtask build bootfs
 ```

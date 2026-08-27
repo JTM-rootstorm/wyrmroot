@@ -1735,6 +1735,14 @@ mod tests {
                     "wyrmroot-test".to_owned(),
                 ),
                 (
+                    "rust.accepted_artifact_root".to_owned(),
+                    "artifacts/toolchains/accepted/test".to_owned(),
+                ),
+                (
+                    "rust.project_cargo_home".to_owned(),
+                    ".tmp/cargo-home/offline-v1".to_owned(),
+                ),
+                (
                     "rust.native_target".to_owned(),
                     "x86_64-unknown-wyrmroot".to_owned(),
                 ),

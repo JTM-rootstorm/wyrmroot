@@ -1,5 +1,6 @@
 # Cargo and Rust build output
 /target/
+/.tmp/
 
 # Wyrmroot-generated build, image, and test output
 /artifacts/
