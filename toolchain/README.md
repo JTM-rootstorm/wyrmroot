@@ -186,3 +186,14 @@ The same freeze also creates disjoint
 selector-25 kernel scenario and nonce. Prepare their paired default/SMP run
 bundles with `tools/pinned-cargo xtask wyr1 prepare --request <request>`; selector-27 media
 and evidence identities are never reused for those regressions.
+
+The `native-bootstrap` binary is a no-std Wyrmroot target and must not be
+host-linked by `cargo test`. When changing its feature-selected library path,
+the corresponding compile-only developer check is:
+
+```text
+cargo check --locked --package wyrmroot-bootstrap --lib --features native-bootstrap,wyr0-init0-integration
+```
+
+Run that command only in an accepted host-toolchain environment. The canonical
+selector product remains the request-bound `wyr1b freeze` pipeline above.
