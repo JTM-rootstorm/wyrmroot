@@ -1,5 +1,6 @@
 use wyrmroot_loader::elf::{
-    self, ElfError, LoadSegment, MAX_LOAD_SEGMENTS, PAGE_SIZE, STACK_GUARD_START, SegmentProtection,
+    self, ElfError, LoadSegment, MAX_LOAD_SEGMENTS, PAGE_SIZE, STACK_BOTTOM, STACK_GUARD_START,
+    STACK_TOP, SegmentProtection,
 };
 
 const PH_OFFSET: usize = 64;
@@ -203,6 +204,29 @@ fn reserved_and_overlapping_virtual_ranges_are_rejected() {
     for headers in cases {
         let bytes = image(&headers, headers[0].address, 0x4000);
         let mut output = [empty_segment(); MAX_LOAD_SEGMENTS];
+        assert!(elf::plan(&bytes, &mut output).is_err());
+    }
+}
+
+#[test]
+fn expanded_stack_guard_boundaries_are_exact() {
+    let adjacent_address = STACK_GUARD_START - PAGE_SIZE;
+    let adjacent = image(
+        &[load(5, 0, adjacent_address, 1, PAGE_SIZE)],
+        adjacent_address,
+        0x1000,
+    );
+    let mut output = [empty_segment(); MAX_LOAD_SEGMENTS];
+    let plan = elf::plan(&adjacent, &mut output).unwrap();
+    assert_eq!(plan.segments[0].mapping_end(), STACK_GUARD_START);
+
+    for (address, memory_size) in [
+        (adjacent_address, PAGE_SIZE + 1),
+        (STACK_GUARD_START, PAGE_SIZE),
+        (STACK_BOTTOM, PAGE_SIZE),
+        (STACK_TOP - PAGE_SIZE, PAGE_SIZE),
+    ] {
+        let bytes = image(&[load(5, 0, address, 1, memory_size)], address, 0x1000);
         assert!(elf::plan(&bytes, &mut output).is_err());
     }
 }

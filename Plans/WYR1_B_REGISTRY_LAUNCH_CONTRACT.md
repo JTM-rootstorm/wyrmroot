@@ -14,6 +14,10 @@ handle transfer, waits, task lifecycle, and structured termination. It adds no
 Deepwyrm ABI, global process namespace, filesystem-aware kernel execution,
 POSIX descriptors/signals, D-Bus, or general dependency manager.
 
+The 2026-08-27 non-hard child-stack revision raises Wyrmroot-loaded child
+stacks to 128 KiB while preserving the fixed top, adjacent 4 KiB guard, and
+topmost startup blocks. It does not change Deepwyrm's primordial stack.
+
 ## 1. Ownership and trust
 
 - `registryd` is a separate static bootfs Process. It owns registry state and
@@ -76,8 +80,9 @@ string bytes
 Version 2 uses the highest five mapped stack pages as a 20 KiB startup block.
 `RSP` names the block's 16-byte-aligned beginning and every vector word,
 pointer, NUL-terminated string, and terminator must lie wholly inside that
-block. The existing 64 KiB RW/NX stack and guard page remain; at least 44 KiB
-of ordinary downward-growing stack remains below the startup block.
+block. The 128 KiB RW/NX child stack and immediately preceding 4 KiB guard
+remain; exactly 108 KiB of ordinary downward-growing stack remains below the
+startup block.
 
 The fixed limits in Section 2 fit by construction: at most 64 argv pointers,
 64 environment pointers, vector terminators/auxv, and 16 KiB of aggregate

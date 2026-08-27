@@ -17,6 +17,10 @@ The baseline hashes are pre-contract design inputs. The OS-Project coordination
 plan binds the final compatible Deepwyrm/Wyrmroot contract commit pair after both
 independent repositories commit H0.
 
+**2026-08-27 child-stack revision:** the non-hard Wyrmroot child-stack target is
+128 KiB with the fixed top and immediately preceding 4 KiB guard preserved.
+Deepwyrm's separately governed primordial stack is unchanged.
+
 ## 1. E0 disposition: compose the generated native ABI
 
 No new Deepwyrm syscall or object is required. `wyrmroot-loader` composes the
@@ -126,15 +130,15 @@ an unmap that this transaction requires.
 ## 4. Initial stack and startup state
 
 Every E-created child begins with one unmapped 4 KiB guard followed by exactly
-64 KiB of `READ | WRITE`/NX stack mapping. The fixed stack top for WYR0 is
+128 KiB of `READ | WRITE`/NX stack mapping. The fixed stack top for WYR0 is
 `0x0000_7fff_ffff_0000`; therefore the mapped stack is
-`[stack_top - 64 KiB, stack_top)` and the guard is the immediately preceding
+`[stack_top - 128 KiB, stack_top)` and the guard is the immediately preceding
 4 KiB page. An accepted ELF must not overlap either interval.
 
 The stack MemoryObject is zero-filled, materialized through a temporary parent
 RW alias, unmapped from the parent, then mapped into the child RW/NX. Its highest
 mapped page is the startup block. Initial `RSP` is the base of that page
-(`stack_top - 4096`), leaving 60 KiB below it for downward-growing stack use.
+(`stack_top - 4096`), leaving 124 KiB below it for downward-growing stack use.
 The startup block uses the WYR0-D0 little-endian `argc`/`argv`/`envp`/auxv
 layout, all pointers remain inside the same 4 KiB page, and unused bytes stay
 zero.

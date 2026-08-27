@@ -1,5 +1,6 @@
 use deepwyrm_syscall::{DwHandle, DwHandleTransferV1, DwMemoryProtection, DwRights};
 use wyrmroot_loader::{
+    elf::{STACK_BOTTOM, STACK_BYTES},
     launch::LaunchProfile,
     process::{
         JobLoadError, JobLoadRequest, LoadAuthority, LoadError, LoadFault, LoadRequest, LoadStage,
@@ -358,6 +359,8 @@ fn init0_construction_materializes_before_mapping_and_starts_last() {
     let send = position(&platform.events, |e| matches!(e, Event::Send(3)));
     let start = position(&platform.events, |e| matches!(e, Event::Start));
     assert!(materialize < unmap_parent && unmap_parent < map && map < send && send < start);
+    assert!(platform.events.contains(&Event::Memory(STACK_BYTES)));
+    assert!(platform.events.contains(&Event::Map(STACK_BOTTOM)));
     assert_eq!(platform.events.last(), Some(&Event::Close(18)));
 }
 
@@ -743,7 +746,7 @@ fn prepublication_failure_unmaps_and_terminates_in_reverse_order() {
             }
         })
         .collect();
-    assert_eq!(unmaps, vec![0x0000_7fff_fffe_0000, 0x0040_0000]);
+    assert_eq!(unmaps, vec![STACK_BOTTOM, 0x0040_0000]);
     assert!(platform.events.contains(&Event::TerminateProcess));
 }
 

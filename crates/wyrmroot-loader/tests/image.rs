@@ -1,5 +1,8 @@
 use wyrmroot_loader::{
-    elf::{LoadSegment, PAGE_SIZE, STACK_BYTES, STACK_TOP, SegmentProtection},
+    elf::{
+        LoadSegment, PAGE_SIZE, STACK_BOTTOM, STACK_BYTES, STACK_GUARD_BYTES, STACK_GUARD_START,
+        STACK_TOP, SegmentProtection,
+    },
     image::{
         INITIAL_STACK, INITIAL_STACK_POINTER, MaterializationPlan, STARTUP_V2_BLOCK_ADDRESS,
         STARTUP_V2_BLOCK_BYTES, StartupBlockError, write_startup_block, write_startup_block_v2,
@@ -29,10 +32,15 @@ fn materialization_preserves_checked_segment_layout() {
 
 #[test]
 fn fixed_stack_and_startup_block_match_the_contract() {
+    assert_eq!(STACK_BYTES, 128 * 1024);
     assert_eq!(INITIAL_STACK.object_size, STACK_BYTES);
-    assert_eq!(INITIAL_STACK.child_address, STACK_TOP - STACK_BYTES);
+    assert_eq!(INITIAL_STACK.child_address, STACK_BOTTOM);
+    assert_eq!(STACK_GUARD_BYTES, PAGE_SIZE);
+    assert_eq!(STACK_GUARD_START + STACK_GUARD_BYTES, STACK_BOTTOM);
     assert_eq!(INITIAL_STACK.startup_page_offset, STACK_BYTES - PAGE_SIZE);
     assert_eq!(INITIAL_STACK.stack_pointer, STACK_TOP - PAGE_SIZE);
+    assert_eq!(INITIAL_STACK.stack_pointer - STACK_BOTTOM, 124 * 1024);
+    assert_eq!(STARTUP_V2_BLOCK_ADDRESS - STACK_BOTTOM, 108 * 1024);
 
     let mut page = [0xaa; PAGE_SIZE as usize];
     write_startup_block(&mut page, INITIAL_STACK_POINTER, "/system/init0").unwrap();

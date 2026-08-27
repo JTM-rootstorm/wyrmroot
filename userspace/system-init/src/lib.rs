@@ -3283,11 +3283,11 @@ mod native_cleanup_tests {
         use core::mem::size_of;
 
         assert!(size_of::<ResidentSystemInit>() <= 20 * 1024);
-        assert_eq!(wyrmroot_loader::elf::STACK_BYTES, 64 * 1024);
+        assert_eq!(wyrmroot_loader::elf::STACK_BYTES, 128 * 1024);
         assert_eq!(wyrmroot_runtime::STARTUP_BLOCK_V2_SIZE, 20 * 1024);
         assert_eq!(
             wyrmroot_loader::elf::STACK_BYTES as usize - wyrmroot_runtime::STARTUP_BLOCK_V2_SIZE,
-            44 * 1024
+            108 * 1024
         );
     }
 }
