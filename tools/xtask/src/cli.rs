@@ -138,7 +138,13 @@ pub(crate) enum Action {
     },
     Dw1BEvidence(String),
     Dw1CPrepare(String),
-    Dw1CFreeze(String),
+    Dw1CFreeze {
+        output: String,
+        deep_repository: String,
+        deep_revision: String,
+        evidence_nonce: String,
+        progress_digest: String,
+    },
     Dw1CImage(String),
     Dw1CImageRebuild(String),
     Dw1CInspect(String),
@@ -199,8 +205,32 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
 
 fn dispatch_dw1c(arguments: &[String]) -> Result<Action, Failure> {
     match arguments {
-        [command, flag, output] if command == "freeze" && flag == "--output" => {
-            Ok(Action::Dw1CFreeze(output.clone()))
+        [
+            command,
+            output_flag,
+            output,
+            deep_flag,
+            deep_repository,
+            revision_flag,
+            deep_revision,
+            nonce_flag,
+            evidence_nonce,
+            digest_flag,
+            progress_digest,
+        ] if command == "freeze"
+            && output_flag == "--output"
+            && deep_flag == "--deep-repository"
+            && revision_flag == "--deep-revision"
+            && nonce_flag == "--evidence-nonce"
+            && digest_flag == "--progress-digest" =>
+        {
+            Ok(Action::Dw1CFreeze {
+                output: output.clone(),
+                deep_repository: deep_repository.clone(),
+                deep_revision: deep_revision.clone(),
+                evidence_nonce: evidence_nonce.clone(),
+                progress_digest: progress_digest.clone(),
+            })
         }
         [command, flag, request] if command == "image" && flag == "--request" => {
             Ok(Action::Dw1CImage(request.clone()))
@@ -215,7 +245,7 @@ fn dispatch_dw1c(arguments: &[String]) -> Result<Action, Failure> {
             Ok(Action::Dw1CPrepare(request.clone()))
         }
         _ => Err(Failure::usage(
-            "dw1c requires freeze --output <directory>, image|image-rebuild|inspect|prepare --request <dw1-c-request.toml>",
+            "dw1c requires freeze --output <fresh-dir> --deep-repository <path> --deep-revision <40-hex> --evidence-nonce <16-hex> --progress-digest <16-hex>, or image|image-rebuild|inspect|prepare --request <dw1-c-request.toml>",
         )),
     }
 }
@@ -669,8 +699,27 @@ mod tests {
     #[test]
     fn dw1c_product_commands_dispatch_to_request_bound_actions() {
         assert_eq!(
-            dispatch(&arguments(&["dw1c", "freeze", "--output", "freeze"])),
-            Ok(Action::Dw1CFreeze("freeze".into()))
+            dispatch(&arguments(&[
+                "dw1c",
+                "freeze",
+                "--output",
+                "freeze",
+                "--deep-repository",
+                "/deep",
+                "--deep-revision",
+                &"a".repeat(40),
+                "--evidence-nonce",
+                &"A".repeat(16),
+                "--progress-digest",
+                &"B".repeat(16),
+            ])),
+            Ok(Action::Dw1CFreeze {
+                output: "freeze".into(),
+                deep_repository: "/deep".into(),
+                deep_revision: "a".repeat(40),
+                evidence_nonce: "A".repeat(16),
+                progress_digest: "B".repeat(16)
+            })
         );
         assert_eq!(
             dispatch(&arguments(&["dw1c", "image", "--request", "request.toml"])),

@@ -255,12 +255,61 @@ pub fn inspect(request_path: &Path) -> Result<String, Failure> {
     Ok(format!("DW1_C_INSPECTION_PASS {result}"))
 }
 
-pub fn freeze(output: &Path) -> Result<String, Failure> {
+pub fn freeze(
+    output: &Path,
+    deep_repository: &Path,
+    deep_revision: &str,
+    evidence_nonce: &str,
+    progress_digest: &str,
+) -> Result<String, Failure> {
     if output.exists() {
         return Err(Failure::task("DW1-C freeze output already exists"));
     }
+    if !deep_repository.is_absolute()
+        || deep_repository
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
+        || deep_repository.is_symlink()
+    {
+        return Err(Failure::task("DW1-C Deep repository path is not canonical"));
+    }
+    let head = std::process::Command::new("git")
+        .args([
+            "-C",
+            &deep_repository.to_string_lossy(),
+            "rev-parse",
+            "HEAD",
+        ])
+        .output()
+        .map_err(io)?;
+    let observed = String::from_utf8(head.stdout)
+        .map_err(|_| Failure::task("DW1-C Deep revision is not UTF-8"))?
+        .trim()
+        .to_owned();
+    if !head.status.success() || observed != deep_revision {
+        return Err(Failure::task(
+            "DW1-C Deep repository HEAD does not match requested revision",
+        ));
+    }
+    for (label, value) in [
+        ("deep_revision", deep_revision),
+        ("evidence_nonce", evidence_nonce),
+        ("progress_digest", progress_digest),
+    ] {
+        let expected = if label == "deep_revision" { 40 } else { 16 };
+        let valid_case = if label == "deep_revision" {
+            value.bytes().all(|b| !b.is_ascii_uppercase())
+        } else {
+            value.bytes().all(|b| !b.is_ascii_lowercase())
+        };
+        if value.len() != expected || !value.bytes().all(|b| b.is_ascii_hexdigit()) || !valid_case {
+            return Err(Failure::task(format!(
+                "DW1-C {label} has invalid hexadecimal form"
+            )));
+        }
+    }
     Err(Failure::task(
-        "DW1-C freeze requires the isolated build lane to provide product artifacts",
+        "DW1-C build orchestration is not yet available in this checkout",
     ))
 }
 

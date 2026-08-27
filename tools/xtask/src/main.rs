@@ -142,7 +142,20 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
         .map(Some),
         Action::Dw1BEvidence(request) => dw1b::evidence(std::path::Path::new(&request)).map(Some),
         Action::Dw1CPrepare(request) => dw1c::prepare(std::path::Path::new(&request)).map(Some),
-        Action::Dw1CFreeze(output) => dw1c::freeze(std::path::Path::new(&output)).map(Some),
+        Action::Dw1CFreeze {
+            output,
+            deep_repository,
+            deep_revision,
+            evidence_nonce,
+            progress_digest,
+        } => dw1c::freeze(
+            std::path::Path::new(&output),
+            std::path::Path::new(&deep_repository),
+            &deep_revision,
+            &evidence_nonce,
+            &progress_digest,
+        )
+        .map(Some),
         Action::Dw1CImage(request) => dw1c::image(std::path::Path::new(&request)).map(Some),
         Action::Dw1CImageRebuild(request) => dw1c::image(std::path::Path::new(&request)).map(Some),
         Action::Dw1CInspect(request) => dw1c::inspect(std::path::Path::new(&request)).map(Some),
