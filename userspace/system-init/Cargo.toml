@@ -20,6 +20,7 @@ required-features = ["native-init"]
 default = []
 native-init = []
 wyr1-test-evidence = ["native-init", "wyrmroot-runtime/wyr1-test-evidence"]
+wyr1b-test-evidence = ["native-init", "wyrmroot-runtime/wyr1b-test-evidence"]
 
 [dependencies]
 deepwyrm-syscall.workspace = true

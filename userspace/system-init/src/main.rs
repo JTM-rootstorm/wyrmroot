@@ -137,6 +137,16 @@ fn main(startup: StartupBlock<'_>) -> u32 {
             return fatal_application_status(&error) as u32;
         }
     };
+    #[cfg(feature = "wyr1b-test-evidence")]
+    {
+        let mut index = 0;
+        while let Some(record) = resident.wyr1b_evidence_record(index) {
+            if wyrmroot_runtime::submit_wyr1b_evidence(record).is_err() {
+                return 0xAF1B_0001;
+            }
+            index += 1;
+        }
+    }
     #[cfg(feature = "wyr1-test-evidence")]
     let mut evidence_submitted = false;
     loop {

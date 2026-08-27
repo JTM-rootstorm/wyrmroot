@@ -1,0 +1,79 @@
+use {
+    deepwyrm_syscall as _, wyrmroot_bootfs as _, wyrmroot_launch_proto as _, wyrmroot_loader as _,
+    wyrmroot_registry_proto as _, wyrmroot_rrc_manifest as _, wyrmroot_runtime as _,
+    wyrmroot_system_init as _, wyrmroot_wyr1b_gate_proto as _,
+};
+
+const MAIN: &str = include_str!("../src/main.rs");
+const LIB: &str = include_str!("../src/lib.rs");
+const NATIVE: &str = include_str!("../src/wyr1b_native.rs");
+const MANIFEST: &str = include_str!("../Cargo.toml");
+
+#[test]
+fn selector_27_submission_feature_is_separate_from_selector_25() {
+    assert!(MANIFEST.contains(
+        "wyr1-test-evidence = [\"native-init\", \"wyrmroot-runtime/wyr1-test-evidence\"]"
+    ));
+    assert!(MANIFEST.contains(
+        "wyr1b-test-evidence = [\"native-init\", \"wyrmroot-runtime/wyr1b-test-evidence\"]"
+    ));
+    assert!(MAIN.contains("#[cfg(feature = \"wyr1b-test-evidence\")]"));
+    assert!(MAIN.contains("resident.wyr1b_evidence_record(index)"));
+    assert!(MAIN.contains("wyrmroot_runtime::submit_wyr1b_evidence(record)"));
+    assert!(MAIN.contains("#[cfg(feature = \"wyr1-test-evidence\")]"));
+    assert!(MAIN.contains("wyrmroot_runtime::submit_wyr1_evidence(record)"));
+    assert!(LIB.contains("wyr1b_evidence: None"));
+    assert!(LIB.contains("wyr1b_evidence: activation.evidence"));
+}
+
+#[test]
+fn controller_records_all_relational_joins_in_contract_order() {
+    let registry_start = NATIVE.find("fn run_registry_gate").unwrap();
+    let registry_end = NATIVE[registry_start..]
+        .find("fn launch_registry_replacement_with_gate")
+        .map(|offset| registry_start + offset)
+        .unwrap();
+    let registry = &NATIVE[registry_start..registry_end];
+    let mut cursor = 0;
+    for event in [
+        "GateEvent::RegistryReady",
+        "GateEvent::PublisherReady",
+        "GateEvent::ClientReady",
+        "GateEvent::Published",
+        "GateEvent::Connected",
+        "GateEvent::DirectExchange",
+        "GateEvent::Retired",
+        "GateEvent::StaleRejected",
+    ] {
+        let relative = registry[cursor..]
+            .find(event)
+            .unwrap_or_else(|| panic!("missing or reordered registry evidence join {event}"));
+        cursor += relative + event.len();
+    }
+
+    let job_start = NATIVE.find("fn run_job_gate").unwrap();
+    let job_end = NATIVE[job_start..]
+        .find("fn run_registry_gate")
+        .map(|offset| job_start + offset)
+        .unwrap();
+    let job = &NATIVE[job_start..job_end];
+    cursor = 0;
+    for event in [
+        "GateEvent::JobAccepted",
+        "GateEvent::JobExitZero",
+        "GateEvent::JobReaped",
+        "GateEvent::ForeignRejected",
+        "GateEvent::OrphanReaped",
+        ".finish()",
+    ] {
+        let relative = job[cursor..]
+            .find(event)
+            .unwrap_or_else(|| panic!("missing or reordered job evidence join {event}"));
+        cursor += relative + event.len();
+    }
+    assert!(NATIVE.contains("owner_result.application_code != 0"));
+    assert!(NATIVE.contains("owner_result.cleanup_result != 0"));
+    assert!(NATIVE.contains("orphan_result.cleanup_result != 0"));
+    assert!(NATIVE.contains("jobs.jobs.live_jobs() != 0"));
+    assert!(NATIVE.contains("jobs.jobs.orphan_jobs() != 0"));
+}

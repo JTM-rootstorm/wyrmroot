@@ -2,6 +2,7 @@
 
 pub const GATE_PATH: &str = "system/bootstrap/wyr1-b-gate-v1";
 pub const RECORD_BYTES: usize = 96;
+pub const EVIDENCE_RECORDS: usize = 14;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GateConfig {
@@ -35,6 +36,23 @@ pub enum GateEvent {
     OrphanReaped = 13,
     Terminal = 0xff,
 }
+
+const EVIDENCE_ORDER: [GateEvent; EVIDENCE_RECORDS] = [
+    GateEvent::RegistryReady,
+    GateEvent::PublisherReady,
+    GateEvent::ClientReady,
+    GateEvent::Published,
+    GateEvent::Connected,
+    GateEvent::DirectExchange,
+    GateEvent::Retired,
+    GateEvent::StaleRejected,
+    GateEvent::JobAccepted,
+    GateEvent::JobExitZero,
+    GateEvent::JobReaped,
+    GateEvent::ForeignRejected,
+    GateEvent::OrphanReaped,
+    GateEvent::Terminal,
+];
 
 pub fn parse_config(bytes: &[u8]) -> Result<GateConfig, GateError> {
     let text = core::str::from_utf8(bytes).map_err(|_| GateError::InvalidUtf8)?;
@@ -126,6 +144,62 @@ impl EvidenceProducer {
     }
 }
 
+/// Bounded selector-27 evidence which becomes claim-bearing only after every
+/// relational join and the terminal record have been produced in order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EvidenceLog {
+    producer: EvidenceProducer,
+    records: [[u8; RECORD_BYTES]; EVIDENCE_RECORDS],
+    len: usize,
+}
+
+impl EvidenceLog {
+    pub const fn new(nonce: u64) -> Result<Self, GateError> {
+        Ok(Self {
+            producer: match EvidenceProducer::new(nonce) {
+                Ok(producer) => producer,
+                Err(error) => return Err(error),
+            },
+            records: [[0; RECORD_BYTES]; EVIDENCE_RECORDS],
+            len: 0,
+        })
+    }
+
+    pub fn record(
+        &mut self,
+        event: GateEvent,
+        subject: u64,
+        generation: u64,
+        value: u64,
+    ) -> Result<(), GateError> {
+        if EVIDENCE_ORDER.get(self.len).copied() != Some(event) {
+            return Err(GateError::InvalidEvent);
+        }
+        self.records[self.len] = self.producer.encode(event, subject, generation, value)?;
+        self.len += 1;
+        Ok(())
+    }
+
+    pub fn finish(&mut self) -> Result<(), GateError> {
+        self.record(GateEvent::Terminal, 0, 0, 0)
+    }
+
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        self.len == EVIDENCE_RECORDS
+    }
+
+    /// Partial transcripts are deliberately withheld: without `Terminal`, the
+    /// selector has no success evidence claim.
+    #[must_use]
+    pub fn record_at(&self, index: usize) -> Option<&[u8; RECORD_BYTES]> {
+        if !self.is_complete() {
+            return None;
+        }
+        self.records.get(index)
+    }
+}
+
 fn put_hex(output: &mut [u8], value: u64) {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let width = output.len();
@@ -160,5 +234,39 @@ mod tests {
             producer.encode(GateEvent::Published, 1, 1, 0),
             Err(GateError::InvalidEvent)
         );
+    }
+
+    #[test]
+    fn bounded_log_requires_exact_order_and_withholds_partial_nonclaims() {
+        let mut log = EvidenceLog::new(1).unwrap();
+        assert_eq!(log.record_at(0), None);
+        assert_eq!(
+            log.record(GateEvent::PublisherReady, 1, 1, 0),
+            Err(GateError::InvalidEvent)
+        );
+        for (index, event) in EVIDENCE_ORDER[..EVIDENCE_RECORDS - 1]
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            log.record(event, index as u64 + 1, 1, index as u64)
+                .unwrap();
+            assert_eq!(log.record_at(index), None);
+        }
+        log.finish().unwrap();
+        assert!(log.is_complete());
+        for (sequence, expected) in EVIDENCE_ORDER.iter().copied().enumerate() {
+            let record = log.record_at(sequence).unwrap();
+            assert_eq!(
+                u64::from_str_radix(core::str::from_utf8(&record[25..33]).unwrap(), 16),
+                Ok(sequence as u64)
+            );
+            assert_eq!(
+                u64::from_str_radix(core::str::from_utf8(&record[34..36]).unwrap(), 16),
+                Ok(expected as u64)
+            );
+        }
+        assert_eq!(log.finish(), Err(GateError::InvalidEvent));
+        assert_eq!(log.record_at(EVIDENCE_RECORDS), None);
     }
 }

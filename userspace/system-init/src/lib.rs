@@ -121,6 +121,7 @@ pub const fn wyr1_test_failure_application_status(error: &InitError) -> u32 {
         InitError::Wyr1BGateProtocol(_) => 0x1b,
         InitError::Wyr1BGateMismatch => 0x1c,
         InitError::Wyr1BModel(_) => 0x1d,
+        InitError::Wyr1BEvidence(_) => 0x1e,
     };
     0xAF11_0000 | category
 }
@@ -137,6 +138,7 @@ pub struct ResidentSystemInit {
     evidence_finalized: bool,
     last_tick_ns: u64,
     wyr1b: Option<wyr1b_native::ResidentState>,
+    wyr1b_evidence: Option<wyr1b_gate::EvidenceLog>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -180,6 +182,13 @@ impl ResidentSystemInit {
     #[must_use]
     pub const fn evidence_finalized(&self) -> bool {
         self.evidence_finalized
+    }
+
+    /// Returns one completed selector-27 evidence record. Selector 25 and
+    /// incomplete selector-27 attempts expose no WRB1 record.
+    #[must_use]
+    pub fn wyr1b_evidence_record(&self, index: usize) -> Option<&[u8; wyr1b_gate::RECORD_BYTES]> {
+        self.wyr1b_evidence.as_ref()?.record_at(index)
     }
 
     /// Advances the permanent fixed-role control loop without inventing service
@@ -531,6 +540,7 @@ pub enum InitError {
     Wyr1BGateProtocol(wyrmroot_wyr1b_gate_proto::Error),
     Wyr1BGateMismatch,
     Wyr1BModel(wyr1b::JobError),
+    Wyr1BEvidence(wyr1b_gate::GateError),
 }
 
 impl From<RestartTransitionError> for InitError {
@@ -1257,6 +1267,7 @@ where
         evidence_finalized: false,
         last_tick_ns: system.now().map_err(InitError::Native)?,
         wyr1b: None,
+        wyr1b_evidence: None,
     })
 }
 
@@ -1321,6 +1332,7 @@ where
             evidence_finalized: false,
             last_tick_ns: now,
             wyr1b: None,
+            wyr1b_evidence: None,
         },
         ProductActivation::Wyr1B(activation) => ResidentSystemInit {
             controller: activation.controller,
@@ -1335,6 +1347,7 @@ where
                 gate: activation.gate,
                 jobs: activation.jobs,
             }),
+            wyr1b_evidence: activation.evidence,
         },
     })
 }
@@ -2543,6 +2556,7 @@ mod native_cleanup_tests {
             evidence_finalized: false,
             last_tick_ns: 9,
             wyr1b: None,
+            wyr1b_evidence: None,
         };
         let mut native = MockNative::new();
         let mut loader = wyrmroot_runtime::NativeLoaderPlatform;
@@ -2553,6 +2567,7 @@ mod native_cleanup_tests {
             Ok(SystemMode::Normal)
         );
         assert_eq!(native.wyr1b_calls, 0);
+        assert_eq!(resident.wyr1b_evidence_record(0), None);
         assert_eq!(resident.active, [None, Some(devmgr)]);
         assert_eq!(
             resident.controller.role_state(RoleId::Registryd),

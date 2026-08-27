@@ -6,7 +6,7 @@ use crate::wyr1b::{
     PolicyView, RegistryTopology, RequestTicket, commit_prepared_job, correlation_environment,
     observe_prepared_ready, prepare_reserved_job,
 };
-use crate::wyr1b_gate::{GATE_PATH, GateConfig, parse_config};
+use crate::wyr1b_gate::{EvidenceLog, GATE_PATH, GateConfig, GateEvent, parse_config};
 use crate::wyr1b_job::{JobDispatcher, SessionOwner};
 use deepwyrm_syscall::{
     DW_HANDLE_TRANSFER_MOVE, DW_OBJECT_TYPE_CHANNEL, DW_RIGHT_INSPECT, DW_RIGHT_READ,
@@ -191,6 +191,7 @@ pub(crate) struct Activation {
     pub topology: Option<RegistryTopology>,
     pub gate: GateConfig,
     pub jobs: JobDispatcher,
+    pub evidence: Option<EvidenceLog>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -300,6 +301,7 @@ where
             topology: None,
             gate,
             jobs,
+            evidence: None,
         });
     };
     let (devmgr, result) = match activate_role_until_ready(
@@ -321,12 +323,23 @@ where
             waits,
             authority,
             bootfs,
-            registry.control_channel,
+            registry,
             &mut topology,
             gate,
             &mut jobs,
         ) {
-            Ok(()) => break,
+            Ok(evidence) => {
+                return Ok(Activation {
+                    controller,
+                    result,
+                    active: [Some(registry.active), devmgr],
+                    registry_control: registry.control_channel,
+                    topology: Some(topology),
+                    gate,
+                    jobs,
+                    evidence: Some(evidence),
+                });
+            }
             Err(GateRunError::PreInstall(_error)) => {
                 return Ok(Activation {
                     controller,
@@ -336,6 +349,7 @@ where
                     topology: Some(topology),
                     gate,
                     jobs,
+                    evidence: None,
                 });
             }
             Err(GateRunError::CleanupFailed(_)) => {
@@ -348,6 +362,7 @@ where
                     topology: Some(topology),
                     gate,
                     jobs,
+                    evidence: None,
                 });
             }
             Err(GateRunError::InstallCommitted {
@@ -369,6 +384,7 @@ where
                         topology: Some(topology),
                         gate,
                         jobs,
+                        evidence: None,
                     });
                 }
                 let Some((replacement, _)) = launch_registry_until_ready(
@@ -388,6 +404,7 @@ where
                         topology: Some(topology),
                         gate,
                         jobs,
+                        evidence: None,
                     });
                 };
                 registry = restart_topology_or_poison(
@@ -400,15 +417,6 @@ where
             }
         }
     }
-    Ok(Activation {
-        controller,
-        result,
-        active: [Some(registry.active), devmgr],
-        registry_control: registry.control_channel,
-        topology: Some(topology),
-        gate,
-        jobs,
-    })
 }
 
 fn gate_record(
@@ -1448,14 +1456,13 @@ fn done_record(gate: GateConfig, peer: InstalledPeer, operation_id: u64) -> Gate
     }
 }
 
-fn complete_exchange<S: Wyr1BPlatform>(
+fn complete_direct_exchange<S: Wyr1BPlatform>(
     system: &mut S,
     publisher: InstalledPeer,
     client: InstalledPeer,
     publisher_config: GateRecord,
     client_config: GateRecord,
-) -> Result<(), InitError> {
-    expect_report(system, client, client_config, GateMessageType::Connected)?;
+) -> Result<u64, InitError> {
     let echoed =
         expect_challenge_report(system, publisher, publisher_config, GateMessageType::Echoed)?;
     let exchanged =
@@ -1463,7 +1470,7 @@ fn complete_exchange<S: Wyr1BPlatform>(
     if echoed.value != exchanged.value {
         return Err(InitError::Wyr1BGateMismatch);
     }
-    Ok(())
+    Ok(echoed.value)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2736,6 +2743,7 @@ fn run_job_gate<S, L, W>(
     topology: &mut RegistryTopology,
     gate: GateConfig,
     jobs: &mut JobDispatcher,
+    evidence: &mut EvidenceLog,
 ) -> Result<(), InitError>
 where
     S: Wyr1BPlatform,
@@ -2788,6 +2796,14 @@ where
             3,
         ),
     )?;
+    evidence
+        .record(
+            GateEvent::JobAccepted,
+            owner_job.job_id,
+            owner.grant.endpoint_generation,
+            owner.grant.endpoint_id,
+        )
+        .map_err(InitError::Wyr1BEvidence)?;
     wait_session_readable(system, owner_session)?;
     dispatch_owner_wait_then_poll(
         system,
@@ -2812,6 +2828,36 @@ where
             3,
         ),
     )?;
+    let owner_result = jobs
+        .jobs
+        .result_for_owner(
+            owner.grant.endpoint_id,
+            owner.grant.endpoint_generation,
+            job_id,
+        )
+        .map_err(InitError::Wyr1BModel)?;
+    if owner_result.classification != TerminationClassification::NormalExit.as_u32()
+        || owner_result.application_code != 0
+        || owner_result.cleanup_result != 0
+    {
+        return Err(InitError::Wyr1BGateMismatch);
+    }
+    evidence
+        .record(
+            GateEvent::JobExitZero,
+            job_id,
+            owner.grant.endpoint_generation,
+            0,
+        )
+        .map_err(InitError::Wyr1BEvidence)?;
+    evidence
+        .record(
+            GateEvent::JobReaped,
+            job_id,
+            owner.grant.endpoint_generation,
+            owner.grant.endpoint_id,
+        )
+        .map_err(InitError::Wyr1BEvidence)?;
     close_launch_client(system, waits, jobs, owner)?;
 
     let foreign =
@@ -2861,6 +2907,14 @@ where
             4,
         ),
     )?;
+    evidence
+        .record(
+            GateEvent::ForeignRejected,
+            foreign.grant.endpoint_id,
+            foreign.grant.endpoint_generation,
+            job_id,
+        )
+        .map_err(InitError::Wyr1BEvidence)?;
     close_launch_client(system, waits, jobs, foreign)?;
 
     let orphan = launch_launch_client(system, loader, waits, authority, bootfs, topology, jobs, 5)?;
@@ -2897,11 +2951,23 @@ where
         ),
     )?;
     close_launch_client(system, waits, jobs, orphan)?;
-    let _ = reap_job(system, waits, jobs, orphan_job)?;
+    let orphan_result = reap_job(system, waits, jobs, orphan_job)?;
+    if orphan_result.cleanup_result != 0 {
+        return Err(InitError::Cleanup);
+    }
+    evidence
+        .record(
+            GateEvent::OrphanReaped,
+            orphan_job.job_id,
+            orphan.grant.endpoint_generation,
+            orphan.grant.endpoint_id,
+        )
+        .map_err(InitError::Wyr1BEvidence)?;
     jobs.jobs.reclaim_closed_sessions();
     if jobs.session_count() != 0 || jobs.jobs.live_jobs() != 0 || jobs.jobs.orphan_jobs() != 0 {
         return Err(InitError::Accounting);
     }
+    evidence.finish().map_err(InitError::Wyr1BEvidence)?;
     Ok(())
 }
 
@@ -2912,11 +2978,11 @@ fn run_registry_gate<S, L, W>(
     waits: &mut W,
     authority: LoadAuthority,
     bootfs: &[u8],
-    registry_control: DwHandle,
+    registry: RegistryNativeAttempt,
     topology: &mut RegistryTopology,
     gate: GateConfig,
     jobs: &mut JobDispatcher,
-) -> Result<(), GateRunError>
+) -> Result<EvidenceLog, GateRunError>
 where
     S: Wyr1BPlatform,
     L: LoaderPlatform<Error = NativeError>,
@@ -2926,7 +2992,20 @@ where
     let mut publisher2 = None;
     let mut client = None;
     let mut install_committed = false;
+    let mut evidence = EvidenceLog::new(gate.nonce)
+        .map_err(|error| GateRunError::PreInstall(InitError::Wyr1BEvidence(error)))?;
     let outcome: Result<(), InitError> = (|| {
+        if registry.active.role != RoleId::Registryd || registry.active.generation == 0 {
+            return Err(InitError::Wyr1BGateMismatch);
+        }
+        evidence
+            .record(
+                GateEvent::RegistryReady,
+                RoleId::Registryd as u64,
+                registry.active.generation,
+                registry.active.transaction_id,
+            )
+            .map_err(InitError::Wyr1BEvidence)?;
         macro_rules! launch {
             ($slot:ident, $kind:expr) => {{
                 match retry_preinstall_once(|| {
@@ -2936,7 +3015,7 @@ where
                         waits,
                         authority,
                         bootfs,
-                        registry_control,
+                        registry.control_channel,
                         topology,
                         $kind,
                     )
@@ -2959,15 +3038,67 @@ where
         let first = publisher1.ok_or(InitError::Accounting)?;
         let client_peer = client.ok_or(InitError::Accounting)?;
         let publisher1_config = configure_publisher(system, gate, first, client_peer, 1)?;
+        if first.grant.registry_generation != registry.active.generation {
+            return Err(InitError::Wyr1BGateMismatch);
+        }
+        evidence
+            .record(
+                GateEvent::PublisherReady,
+                first.grant.endpoint_id,
+                first.grant.endpoint_generation,
+                first.grant.role_generation,
+            )
+            .map_err(InitError::Wyr1BEvidence)?;
         expect_report(system, first, publisher1_config, GateMessageType::Published)?;
         let client1_config = configure_client(system, gate, client_peer, first, 1)?;
-        complete_exchange(
+        if client_peer.grant.registry_generation != registry.active.generation {
+            return Err(InitError::Wyr1BGateMismatch);
+        }
+        evidence
+            .record(
+                GateEvent::ClientReady,
+                client_peer.grant.endpoint_id,
+                client_peer.grant.endpoint_generation,
+                client_peer.grant.role_generation,
+            )
+            .map_err(InitError::Wyr1BEvidence)?;
+        evidence
+            .record(
+                GateEvent::Published,
+                first.grant.endpoint_id,
+                first.grant.endpoint_generation,
+                first.grant.role_generation,
+            )
+            .map_err(InitError::Wyr1BEvidence)?;
+        expect_report(
+            system,
+            client_peer,
+            client1_config,
+            GateMessageType::Connected,
+        )?;
+        evidence
+            .record(
+                GateEvent::Connected,
+                client_peer.grant.endpoint_id,
+                client_peer.grant.endpoint_generation,
+                first.grant.endpoint_id,
+            )
+            .map_err(InitError::Wyr1BEvidence)?;
+        let challenge = complete_direct_exchange(
             system,
             first,
             client_peer,
             publisher1_config,
             client1_config,
         )?;
+        evidence
+            .record(
+                GateEvent::DirectExchange,
+                client_peer.grant.endpoint_id,
+                client_peer.grant.endpoint_generation,
+                challenge,
+            )
+            .map_err(InitError::Wyr1BEvidence)?;
 
         let retire = gate_record(
             GateMessageType::Retire,
@@ -2978,6 +3109,14 @@ where
         );
         send_gate(system, first.loaded.launch_channel, retire)?;
         expect_report(system, first, retire, GateMessageType::Retired)?;
+        evidence
+            .record(
+                GateEvent::Retired,
+                first.grant.endpoint_id,
+                first.grant.endpoint_generation,
+                first.grant.role_generation,
+            )
+            .map_err(InitError::Wyr1BEvidence)?;
 
         launch!(publisher2, PeerKind::Publisher { operation: 2 });
         let second = publisher2.ok_or(InitError::Accounting)?;
@@ -2989,7 +3128,13 @@ where
             GateMessageType::Published,
         )?;
         let client2_config = configure_client(system, gate, client_peer, second, 2)?;
-        complete_exchange(
+        expect_report(
+            system,
+            client_peer,
+            client2_config,
+            GateMessageType::Connected,
+        )?;
+        let _ = complete_direct_exchange(
             system,
             second,
             client_peer,
@@ -3006,6 +3151,14 @@ where
         );
         send_gate(system, first.loaded.launch_channel, stale)?;
         expect_report(system, first, stale, GateMessageType::StaleRejected)?;
+        evidence
+            .record(
+                GateEvent::StaleRejected,
+                first.grant.endpoint_id,
+                first.grant.endpoint_generation,
+                second.grant.endpoint_id,
+            )
+            .map_err(InitError::Wyr1BEvidence)?;
         send_gate(
             system,
             first.loaded.launch_channel,
@@ -3035,7 +3188,15 @@ where
             false,
         )?;
         run_job_gate(
-            system, loader, waits, authority, bootfs, topology, gate, jobs,
+            system,
+            loader,
+            waits,
+            authority,
+            bootfs,
+            topology,
+            gate,
+            jobs,
+            &mut evidence,
         )?;
         Ok(())
     })();
@@ -3054,7 +3215,7 @@ where
             error,
         ));
     }
-    Ok(())
+    Ok(evidence)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3082,17 +3243,9 @@ where
         };
         let registry = restart_topology_or_poison(system, waits, controller, topology, registry)?;
         match run_registry_gate(
-            system,
-            loader,
-            waits,
-            authority,
-            bootfs,
-            registry.control_channel,
-            topology,
-            gate,
-            jobs,
+            system, loader, waits, authority, bootfs, registry, topology, gate, jobs,
         ) {
-            Ok(()) => return Ok(Some((registry, true))),
+            Ok(_) => return Ok(Some((registry, true))),
             Err(GateRunError::PreInstall(_)) => return Ok(Some((registry, false))),
             Err(GateRunError::CleanupFailed(_)) => {
                 let _ = poison_registry_generation(system, waits, controller, registry, true)?;
