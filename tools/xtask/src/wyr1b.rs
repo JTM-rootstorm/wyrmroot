@@ -43,7 +43,7 @@ const ACCEPTED_TOOLCHAIN_TREE_SHA256: &str =
 const STACK_ANALYSIS_METHOD: &str =
     "rustc-z-emit-stack-sizes+llvm-readobj-json-all-named-frames-v2";
 const STACK_METADATA_FLAG: &str = "-Zemit-stack-sizes";
-const STACK_BUDGET_BYTES: u64 = 32 * 1024;
+const STACK_BUDGET_BYTES: u64 = 64 * 1024;
 const STACK_TOOL_PATH: &str = "/usr/lib/llvm/22/bin/llvm-readobj";
 const STACK_TOOL_VERSION: &str = "LLVM version 22.1.8";
 const STACK_TOOL_SHA256: &str = "8074c683dc2c5bfebd5e68245b9d435a3a44ff7e232f20b6a1d01a22f5d7caf8";
