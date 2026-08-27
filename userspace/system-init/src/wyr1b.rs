@@ -333,6 +333,13 @@ pub(crate) struct ExactReadyObservation {
     launch_channel: deepwyrm_syscall::DwHandle,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LaunchChannelRelease {
+    slot: usize,
+    job_id: u64,
+    launch_channel: u64,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum ReadyObservationError<E> {
     Ready(ObservedSupervisionError<E>),
@@ -682,6 +689,53 @@ impl JobController {
             .find(|job| job.id == job_id)
             .map(|job| job.terminal)
             .ok_or(JobError::UnknownJob)
+    }
+
+    /// Stages controller release of the launch Channel before the acceptance
+    /// response. Failed response/close paths restore the returned token;
+    /// successful physical close leaves terminal cleanup nothing to close.
+    pub(crate) fn release_launch_channel(
+        &mut self,
+        job_id: u64,
+        launch_channel: u64,
+    ) -> Result<LaunchChannelRelease, JobError> {
+        let slot = self
+            .jobs
+            .iter()
+            .position(|job| job.as_ref().is_some_and(|job| job.id == job_id))
+            .ok_or(JobError::UnknownJob)?;
+        let job = self.jobs[slot].as_mut().unwrap();
+        if job.phase != JobPhase::Running
+            || !job.published
+            || launch_channel == 0
+            || job.launch_channel != launch_channel
+        {
+            return Err(JobError::ResourceIdentity);
+        }
+        job.launch_channel = 0;
+        Ok(LaunchChannelRelease {
+            slot,
+            job_id,
+            launch_channel,
+        })
+    }
+
+    /// Restores an immediately preceding release transition when the physical
+    /// close failed. The dispatcher is serialized, so no intervening mutation
+    /// of this exact job is possible.
+    pub(crate) fn restore_launch_channel(&mut self, release: LaunchChannelRelease) {
+        let job = self.jobs[release.slot]
+            .as_mut()
+            .expect("released job remains present until its endpoint close resolves");
+        assert!(
+            job.id == release.job_id
+                && job.phase == JobPhase::Running
+                && job.published
+                && job.launch_channel == 0
+                && release.launch_channel != 0,
+            "serialized launch-channel release identity changed"
+        );
+        job.launch_channel = release.launch_channel;
     }
 
     pub(crate) fn apply_cleanup_progress(
@@ -1319,6 +1373,44 @@ mod tests {
         assert_eq!(
             jobs.result(reservation(1, 1, 4), ticket.job_id),
             Err(JobError::TransactionReplay)
+        );
+    }
+
+    #[test]
+    fn accepted_job_release_is_recorded_before_terminal_cleanup() {
+        let mut jobs = JobController::new();
+        jobs.open_connection(1, 1).unwrap();
+        let ticket = jobs.begin_launch(reservation(1, 1, 1)).unwrap();
+        jobs.commit_launch(ticket, 10, 11, 12).unwrap();
+
+        let release = jobs.release_launch_channel(ticket.job_id, 12).unwrap();
+        assert_eq!(
+            jobs.release_launch_channel(ticket.job_id, 12),
+            Err(JobError::ResourceIdentity)
+        );
+        assert_eq!(
+            jobs.loaded_job(ticket.job_id)
+                .unwrap()
+                .loaded
+                .launch_channel,
+            deepwyrm_syscall::DwHandle(0)
+        );
+        jobs.restore_launch_channel(release);
+        assert_eq!(
+            jobs.loaded_job(ticket.job_id)
+                .unwrap()
+                .loaded
+                .launch_channel,
+            deepwyrm_syscall::DwHandle(12)
+        );
+        let _release = jobs.release_launch_channel(ticket.job_id, 12).unwrap();
+        assert_eq!(
+            jobs.apply_cleanup_progress(ticket.job_id, normal(), (1 << 3) | (1 << 4), 0),
+            Ok(Some(normal()))
+        );
+        assert_eq!(
+            jobs.result(reservation(1, 1, 2), ticket.job_id),
+            Ok(normal())
         );
     }
 

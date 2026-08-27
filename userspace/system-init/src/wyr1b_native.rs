@@ -2,9 +2,9 @@
 
 use super::*;
 use crate::wyr1b::{
-    EndpointGrant, EndpointKind, JobError, JobResult as ControllerJobResult, LaunchEngineError,
-    PolicyView, RegistryTopology, RequestTicket, commit_prepared_job, correlation_environment,
-    observe_prepared_ready, prepare_reserved_job,
+    EndpointGrant, EndpointKind, JobError, JobResult as ControllerJobResult, LaunchChannelRelease,
+    LaunchEngineError, PolicyView, RegistryTopology, RequestTicket, commit_prepared_job,
+    correlation_environment, observe_prepared_ready, prepare_reserved_job,
 };
 use crate::wyr1b_gate::{EvidenceLog, GATE_PATH, GateConfig, GateEvent, parse_config};
 use crate::wyr1b_job::{JobDispatcher, SessionOwner};
@@ -1682,7 +1682,8 @@ fn publish_launch_accepted<S, W>(
     session: DwHandle,
     reservation: LaunchReservation,
     loaded: crate::wyr1b::LoadedJob,
-) -> Result<(), InitError>
+    release: LaunchChannelRelease,
+) -> Result<LaunchChannelRelease, InitError>
 where
     S: Wyr1BPlatform,
     W: SupervisionPlatform<Error = NativeError>,
@@ -1696,6 +1697,7 @@ where
     )
     .map_err(|_| InitError::Accounting)?;
     if let Err(error) = system.send_channel(session, &response[..size]) {
+        jobs.jobs.restore_launch_channel(release);
         let cleanup_failed = force_cleanup_job(system, waits, jobs, loaded).is_err();
         return Err(if cleanup_failed {
             InitError::Cleanup
@@ -1703,7 +1705,7 @@ where
             InitError::Native(error)
         });
     }
-    Ok(())
+    Ok(release)
 }
 
 fn force_cleanup_job<S, W>(
@@ -1890,7 +1892,36 @@ where
             );
         }
     };
-    publish_launch_accepted(system, waits, jobs, session, reservation, loaded)?;
+    let release = jobs
+        .jobs
+        .release_launch_channel(loaded.job_id, loaded.loaded.launch_channel.0)
+        .map_err(InitError::Wyr1BModel)?;
+    let release =
+        publish_launch_accepted(system, waits, jobs, session, reservation, loaded, release)?;
+    if system.close_handle(loaded.loaded.launch_channel).is_err() {
+        jobs.jobs.restore_launch_channel(release);
+        jobs.jobs
+            .record_cleanup_bits(loaded.job_id, 1 << 2)
+            .map_err(InitError::Wyr1BModel)?;
+        if system
+            .terminate_task_group(DwHandle(loaded.task_group))
+            .is_err()
+        {
+            jobs.jobs
+                .record_cleanup_bits(loaded.job_id, 1 << 0)
+                .map_err(InitError::Wyr1BModel)?;
+        } else {
+            let resources = jobs
+                .jobs
+                .forced_termination_resources(loaded.job_id)
+                .map_err(InitError::Wyr1BModel)?
+                .ok_or(InitError::Accounting)?;
+            jobs.jobs
+                .commit_forced_termination(loaded.job_id, resources)
+                .map_err(InitError::Wyr1BModel)?;
+        }
+        return Ok(loaded);
+    }
     Ok(loaded)
 }
 
@@ -4898,6 +4929,10 @@ mod tests {
         let ticket = jobs.jobs.begin_launch(reservation(1)).unwrap();
         jobs.jobs.commit_launch(ticket, 101, 102, 103).unwrap();
         let loaded = jobs.jobs.loaded_job(ticket.job_id).unwrap();
+        let release = jobs
+            .jobs
+            .release_launch_channel(ticket.job_id, 103)
+            .unwrap();
 
         assert_eq!(
             publish_launch_accepted(
@@ -4907,6 +4942,7 @@ mod tests {
                 DwHandle(90),
                 reservation(1),
                 loaded,
+                release,
             ),
             Err(InitError::Native(FAILURE))
         );

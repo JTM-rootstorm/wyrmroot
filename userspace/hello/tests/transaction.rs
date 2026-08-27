@@ -1,9 +1,11 @@
 use deepwyrm_syscall::{
     DW_OBJECT_TYPE_CHANNEL, DW_RIGHT_DUPLICATE, DW_RIGHT_INSPECT, DW_RIGHT_READ, DW_RIGHT_WAIT,
-    DW_RIGHT_WRITE, DW_STATUS_BAD_HANDLE, DW_STATUS_NO_RESOURCES, DwHandle, DwObjectType,
-    DwReceivedHandleInfoV1, DwRights,
+    DW_RIGHT_WRITE, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DW_STATUS_BAD_HANDLE,
+    DW_STATUS_NO_RESOURCES, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights, DwSignals,
 };
-use wyrmroot_hello::{HelloError, HelloNativeOperation, HelloSystem, run_hello, run_job_hello};
+use wyrmroot_hello::{
+    HelloError, HelloNativeOperation, HelloSystem, JobHelloSystem, run_hello, run_job_hello,
+};
 use wyrmroot_loader::launch::{LaunchProfile, encode_init, parse_ready, parse_ready_for_profile};
 use wyrmroot_runtime::{
     BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, CapabilityValidationError, NativeError,
@@ -38,6 +40,8 @@ fn live_exit_code_preserves_native_operation_and_cause() {
 
 struct Fixture {
     init: [u8; 40],
+    wait_signals: DwSignals,
+    wait_count: usize,
     received_handles: usize,
     channel_rights: DwRights,
     sent: Vec<u8>,
@@ -54,6 +58,8 @@ impl Fixture {
         encode_init(profile, 2, &mut init).unwrap();
         Self {
             init,
+            wait_signals: DW_SIGNAL_PEER_CLOSED,
+            wait_count: 0,
             received_handles: 0,
             channel_rights: BOOTSTRAP_CHANNEL_EXPECTATION.rights,
             sent: Vec::new(),
@@ -103,6 +109,22 @@ impl HelloSystem for Fixture {
     }
 }
 
+impl JobHelloSystem for Fixture {
+    fn wait_channel(
+        &mut self,
+        channel: DwHandle,
+        signals: DwSignals,
+    ) -> Result<DwSignals, NativeError> {
+        assert_eq!(channel, CHANNEL);
+        assert_eq!(
+            signals,
+            DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0)
+        );
+        self.wait_count += 1;
+        Ok(self.wait_signals)
+    }
+}
+
 #[test]
 fn hello_acknowledges_the_parent_channel_then_closes_it() {
     let mut fixture = Fixture::valid();
@@ -120,6 +142,18 @@ fn job_hello_uses_the_handle_free_wrlp_1_3_profile() {
         Ok(())
     );
     assert_eq!(fixture.closed, [CHANNEL]);
+    assert_eq!(fixture.wait_count, 1);
+}
+
+#[test]
+fn job_hello_rejects_readable_post_ready_data() {
+    let mut fixture = Fixture::profile(LaunchProfile::JobV2);
+    fixture.wait_signals = DW_SIGNAL_READABLE;
+    assert_eq!(
+        run_job_hello(&mut fixture, CHANNEL),
+        Err(HelloError::PostReadySignals(DW_SIGNAL_READABLE))
+    );
+    assert!(fixture.closed.is_empty());
 }
 
 #[test]

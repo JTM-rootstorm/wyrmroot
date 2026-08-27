@@ -3,12 +3,15 @@
 
 //! WYR0 `hello` descendant smoke-test application contract.
 //!
-//! `hello` accepts only its retained loader Channel, validates the handle-free `Hello` WRLP
-//! message, sends the matching READY reply, and then exits normally.  The reply is deliberately
-//! small: it proves a capability-mediated parent/child exchange without delegating authority to
-//! this smoke executable.
+//! `hello` accepts only its retained loader Channel and validates its handle-free WRLP message.
+//! The legacy profile sends READY and exits normally. The WYR1-B job profile remains alive after
+//! READY until the controller releases its Channel endpoint, preventing scheduler timing from
+//! turning readiness publication into a READY-and-exited race.
 
-use deepwyrm_syscall::{DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights};
+use deepwyrm_syscall::{
+    DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DwHandle, DwObjectType, DwReceivedHandleInfoV1,
+    DwRights, DwSignals,
+};
 use wyrmroot_loader::launch::{
     HEADER_BYTES, LaunchError, LaunchProfile, encode_ready_for_profile, parse_init,
 };
@@ -40,6 +43,16 @@ pub trait HelloSystem {
     fn close_handle(&mut self, handle: DwHandle) -> Result<(), NativeError>;
 }
 
+/// Additional blocking operation required only by the WYR1-B job profile.
+pub trait JobHelloSystem: HelloSystem {
+    /// Waits for the job controller to release its launch-Channel endpoint.
+    fn wait_channel(
+        &mut self,
+        channel: DwHandle,
+        signals: DwSignals,
+    ) -> Result<DwSignals, NativeError>;
+}
+
 /// Why the WYR0-G `hello` startup exchange failed.
 #[derive(Debug, Eq, PartialEq)]
 pub enum HelloError {
@@ -56,6 +69,8 @@ pub enum HelloError {
     ReceiveCounts(ReceiveCounts),
     /// The loader INIT or READY encoding violated WRLP.
     Launch(LaunchError),
+    /// The post-READY wait did not observe one clean peer closure.
+    PostReadySignals(DwSignals),
 }
 
 /// Exact hello-owned native operation associated with a live failure.
@@ -70,6 +85,8 @@ pub enum HelloNativeOperation {
     SendReady = 3,
     /// Close the caller-local bootstrap Channel handle.
     CloseBootstrapChannel = 4,
+    /// Wait for the controller's post-acceptance launch-Channel release.
+    WaitForRelease = 5,
 }
 
 impl HelloError {
@@ -84,6 +101,7 @@ impl HelloError {
             Self::BootstrapChannel(_) => PREFIX | 0x02,
             Self::ReceiveCounts(_) => PREFIX | 0x03,
             Self::Launch(_) => PREFIX | 0x04,
+            Self::PostReadySignals(_) => PREFIX | 0x05,
         }
     }
 }
@@ -97,11 +115,25 @@ pub fn run_hello<System: HelloSystem>(
 }
 
 /// Completes the WYR1-B startup exchange for policy-launched `bin/hello`.
-pub fn run_job_hello<System: HelloSystem>(
+pub fn run_job_hello<System: JobHelloSystem>(
     system: &mut System,
     bootstrap_channel: DwHandle,
 ) -> Result<(), HelloError> {
-    run_profile(system, bootstrap_channel, LaunchProfile::JobV2)
+    run_profile_ready(system, bootstrap_channel, LaunchProfile::JobV2)?;
+    let requested = DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0);
+    let observed = system
+        .wait_channel(bootstrap_channel, requested)
+        .map_err(|cause| HelloError::Native {
+            operation: HelloNativeOperation::WaitForRelease,
+            cause,
+        })?;
+    if observed.0 & DW_SIGNAL_READABLE.0 != 0
+        || observed.0 & DW_SIGNAL_PEER_CLOSED.0 == 0
+        || observed.0 & !requested.0 != 0
+    {
+        return Err(HelloError::PostReadySignals(observed));
+    }
+    close_bootstrap(system, bootstrap_channel)
 }
 
 fn run_profile<System: HelloSystem>(
@@ -109,6 +141,15 @@ fn run_profile<System: HelloSystem>(
     bootstrap_channel: DwHandle,
     profile: LaunchProfile,
 ) -> Result<(), HelloError> {
+    run_profile_ready(system, bootstrap_channel, profile)?;
+    close_bootstrap(system, bootstrap_channel)
+}
+
+fn run_profile_ready<System: HelloSystem>(
+    system: &mut System,
+    bootstrap_channel: DwHandle,
+    profile: LaunchProfile,
+) -> Result<u64, HelloError> {
     let channel = system
         .query_capability_info(bootstrap_channel)
         .map_err(|cause| HelloError::Native {
@@ -141,6 +182,13 @@ fn run_profile<System: HelloSystem>(
             operation: HelloNativeOperation::SendReady,
             cause,
         })?;
+    Ok(parsed.transaction_id)
+}
+
+fn close_bootstrap<System: HelloSystem>(
+    system: &mut System,
+    bootstrap_channel: DwHandle,
+) -> Result<(), HelloError> {
     system
         .close_handle(bootstrap_channel)
         .map_err(|cause| HelloError::Native {

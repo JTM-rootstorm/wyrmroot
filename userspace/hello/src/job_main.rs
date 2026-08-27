@@ -4,12 +4,14 @@
 
 use core::panic::PanicInfo;
 
-use deepwyrm_syscall::{DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights};
-use wyrmroot_hello::{HelloSystem, run_job_hello};
+use deepwyrm_syscall::{
+    DW_DEADLINE_INFINITE, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights, DwSignals,
+};
+use wyrmroot_hello::{HelloSystem, JobHelloSystem, run_job_hello};
 use wyrmroot_loader as _;
 use wyrmroot_runtime::{
     CapabilityInfo, NativeError, ReceiveCounts, StartupBlock, close_handle, panic_abort,
-    query_capability_info, receive_channel, send_channel,
+    query_capability_info, receive_channel, send_channel, wait_one,
 };
 
 struct NativeSystem;
@@ -37,6 +39,16 @@ impl HelloSystem for NativeSystem {
 
     fn close_handle(&mut self, handle: DwHandle) -> Result<(), NativeError> {
         close_handle(handle)
+    }
+}
+
+impl JobHelloSystem for NativeSystem {
+    fn wait_channel(
+        &mut self,
+        channel: DwHandle,
+        signals: DwSignals,
+    ) -> Result<DwSignals, NativeError> {
+        wait_one(channel, signals, DW_DEADLINE_INFINITE).map(|result| result.observed)
     }
 }
 

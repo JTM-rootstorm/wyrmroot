@@ -589,6 +589,13 @@ turn init into a general service manager.
   accepted merely because its Channel was readable. The READY observation is
   bound to the exact profile, request transaction, child Process, and launch
   Channel; no observation can publish another prepared child.
+- A `JobV2`/`JobV2Streams` child remains alive after READY until init has sent
+  `LAUNCH_ACCEPTED` and closes its retained launch-Channel endpoint. The child
+  accepts only clean peer closure as its completion release, then closes its
+  endpoint and exits. Readable post-READY data is a protocol failure. Init
+  records the released endpoint before terminal reap so cleanup never closes it
+  twice. This adds no WRLP message or authority and removes scheduler timing
+  from the READY-and-exited publication decision.
 - A fresh correlatable LAUNCH transaction is reserved before stream or launch
   policy validation. Semantic rejection aborts the invisible job reservation
   and retains the transaction in replay history, so retrying the same request
