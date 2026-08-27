@@ -91,6 +91,9 @@ fn payload_main(startup: StartupBlock<'_>) -> u32 {
         if receive_channel(channel, &mut byte, &mut []).is_err() {
             return 0xD1C0_0601;
         }
+        if byte[0] != 0xC6 {
+            return 0xD1C0_0602;
+        }
     }
     if TOKEN == 7 {
         let payload = [0xA7_u8; 128];

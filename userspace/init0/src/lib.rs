@@ -984,6 +984,11 @@ fn drive_dw1c_workload<
     system
         .send_channel(actor6.launch_channel, &go)
         .map_err(Init0Error::Native)?;
+    // GO releases actor6's gate; the second datagram is the controller's
+    // matching wake for its deliberately blocking wait.
+    system
+        .send_channel(actor6.launch_channel, &[0xC6])
+        .map_err(Init0Error::Native)?;
     wait_actor_signal(
         supervisor,
         actor6.launch_channel,
@@ -1002,13 +1007,21 @@ fn drive_dw1c_workload<
     system
         .send_channel(actor7.launch_channel, &go)
         .map_err(Init0Error::Native)?;
-    loop {
-        let payload = [0xA7_u8; 128];
-        match system.send_channel(actor7.launch_channel, &payload) {
-            Ok(()) => {}
-            Err(NativeError::Status(status)) if status == DW_STATUS_WOULD_BLOCK => break,
-            Err(error) => return Err(Init0Error::Native(error)),
-        }
+    // Actor7 fills its parent-facing channel.  Drain one complete datagram
+    // when it becomes full so the child can observe a writable transition.
+    wait_actor_signal(
+        supervisor,
+        actor7.launch_channel,
+        DW_SIGNAL_READABLE,
+        deadline,
+    )?;
+    let mut payload = [0_u8; 128];
+    let mut handles = [];
+    let counts = supervisor
+        .receive_channel(actor7.launch_channel, &mut payload, &mut handles)
+        .map_err(Init0Error::Native)?;
+    if counts.bytes != 128 || counts.handles != 0 {
+        return Err(Init0Error::ReceiveCounts(counts));
     }
     wait_actor_signal(
         supervisor,
