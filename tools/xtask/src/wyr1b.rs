@@ -518,7 +518,7 @@ fn build_frozen_artifacts(build_root: &Path, revision: &str) -> Result<FrozenArt
             cargo_profile: crate::tasks::UefiCargoProfile::Release,
         },
     )?;
-    let loader = read_bounded(&uefi.loader, "loader", 64 * 1024 * 1024)?;
+    let loader = read_cargo_build_output(&uefi.loader, "loader", 64 * 1024 * 1024)?;
     let specs = [
         NativeSpec {
             label: "bootstrap",
@@ -748,7 +748,7 @@ fn build_native(
         .join(NATIVE_TARGET)
         .join("release")
         .join(spec.artifact);
-    let bytes = read_bounded(&artifact, spec.label, 64 * 1024 * 1024)?;
+    let bytes = read_cargo_build_output(&artifact, spec.label, 64 * 1024 * 1024)?;
     Ok((bytes, format!("cargo {}", arguments.join(" "))))
 }
 
@@ -830,7 +830,7 @@ fn build_kernel(
             "WYR1-B canonical {label} Deepwyrm build failed"
         )));
     }
-    read_bounded(
+    read_cargo_build_output(
         &target.join(KERNEL_TARGET).join("release/deepwyrm-kernel"),
         label,
         64 * 1024 * 1024,
@@ -1917,6 +1917,24 @@ fn read_bounded(path: &Path, label: &str, maximum: usize) -> Result<Vec<u8>, Fai
     }
     read(path, label)
 }
+
+fn read_cargo_build_output(path: &Path, label: &str, maximum: usize) -> Result<Vec<u8>, Failure> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        Failure::task(format!(
+            "could not inspect WYR1-B Cargo build output {label}: {error}"
+        ))
+    })?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() == 0
+        || metadata.len() > maximum as u64
+    {
+        return Err(Failure::task(format!(
+            "WYR1-B {label} is not a bounded regular Cargo build output"
+        )));
+    }
+    read(path, label)
+}
 fn decode_digest(value: &str) -> Result<[u8; 32], Failure> {
     if value.len() != 64 {
         return Err(Failure::task("invalid WYR1-B request digest"));
@@ -2050,7 +2068,24 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), Failure> {
         .map_err(|error| Failure::task(format!("could not create WYR1-B product: {error}")))?;
     file.write_all(bytes)
         .and_then(|()| file.sync_all())
-        .map_err(|error| Failure::task(format!("could not write WYR1-B product: {error}")))
+        .map_err(|error| Failure::task(format!("could not write WYR1-B product: {error}")))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| Failure::task(format!("could not inspect WYR1-B product: {error}")))?;
+    let published = fs::symlink_metadata(path)
+        .map_err(|error| Failure::task(format!("could not inspect WYR1-B product: {error}")))?;
+    if !published.is_file()
+        || published.file_type().is_symlink()
+        || published.nlink() != 1
+        || published.len() != bytes.len() as u64
+        || published.dev() != opened.dev()
+        || published.ino() != opened.ino()
+    {
+        return Err(Failure::task(
+            "WYR1-B published product is not a fresh single-link regular file",
+        ));
+    }
+    Ok(())
 }
 
 fn receipt_values(request: &Request) -> Result<BTreeMap<String, String>, Failure> {
@@ -2441,6 +2476,34 @@ mod tests {
             .expect("kernel build boundary")
             .0;
         assert!(kernel_build.contains(".env_remove(\"CARGO_HOME\")"));
+    }
+
+    #[test]
+    fn hard_linked_cargo_outputs_are_copied_into_owned_single_link_products() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "wyr1b-cargo-output-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let source = root.join("cargo-artifact");
+        let alias = root.join("cargo-artifact-alias");
+        let published = root.join("frozen-artifact");
+        fs::write(&source, b"fresh artifact").unwrap();
+        fs::hard_link(&source, &alias).unwrap();
+
+        let owned = read_cargo_build_output(&source, "fixture", 1024).unwrap();
+        assert_eq!(owned, b"fresh artifact");
+        assert!(read_bounded(&source, "fixture", 1024).is_err());
+        write_new_file(&published, &owned).unwrap();
+        let metadata = fs::symlink_metadata(&published).unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(fs::read(&published).unwrap(), owned);
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn record(nonce: u64, sequence: u32, event: u8) -> [u8; 96] {
