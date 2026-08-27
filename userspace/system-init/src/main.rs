@@ -26,7 +26,9 @@ use wyrmroot_system_init::fatal_application_status;
 use wyrmroot_system_init::wyr1_test_failure_application_status;
 #[cfg(feature = "wyr1b-test-evidence")]
 use wyrmroot_system_init::wyr1b_test_failure_application_status;
-use wyrmroot_system_init::{InitPlatform, Wyr1BPlatform, run_system_init_product};
+use wyrmroot_system_init::{
+    InitPlatform, ResidentSystemInit, Wyr1BPlatform, continue_system_init_product,
+};
 use wyrmroot_wyr1b_gate_proto as _;
 
 struct NativeSystem;
@@ -124,14 +126,14 @@ fn main(startup: StartupBlock<'_>) -> u32 {
     let mut system = NativeSystem;
     let mut loader = NativeLoaderPlatform;
     let mut waits = NativeSupervisionPlatform;
-    let result = run_system_init_product(
+    match continue_system_init_product(
         &mut system,
         &mut loader,
         &mut waits,
         startup.bootstrap_channel().as_abi(),
-    );
-    let mut resident = match result {
-        Ok(resident) => resident,
+        continue_resident,
+    ) {
+        Ok(status) => status,
         Err(error) => {
             #[cfg(feature = "wyr1b-test-evidence")]
             return wyr1b_test_failure_application_status(&error);
@@ -140,7 +142,15 @@ fn main(startup: StartupBlock<'_>) -> u32 {
             #[cfg(not(any(feature = "wyr1-test-evidence", feature = "wyr1b-test-evidence")))]
             return fatal_application_status(&error) as u32;
         }
-    };
+    }
+}
+
+fn continue_resident(
+    resident: &mut ResidentSystemInit,
+    system: &mut NativeSystem,
+    loader: &mut NativeLoaderPlatform,
+    waits: &mut NativeSupervisionPlatform,
+) -> u32 {
     #[cfg(feature = "wyr1b-test-evidence")]
     {
         let mut index = 0;
@@ -161,7 +171,7 @@ fn main(startup: StartupBlock<'_>) -> u32 {
             return 0xAF01_0004;
         };
         if resident
-            .control_tick_product(&mut system, &mut loader, &mut waits, now)
+            .control_tick_product(system, loader, waits, now)
             .is_err()
         {
             return 0xAF01_0006;
@@ -180,7 +190,7 @@ fn main(startup: StartupBlock<'_>) -> u32 {
             }
             evidence_submitted = true;
         }
-        if InitPlatform::wait_until(&mut system, deadline).is_err() {
+        if InitPlatform::wait_until(system, deadline).is_err() {
             return 0xAF01_0005;
         }
     }

@@ -55,6 +55,7 @@ pub(crate) struct InstalledPeer {
 pub(crate) struct RegistryNativeAttempt {
     pub active: ActiveNativeRole,
     pub control_channel: DwHandle,
+    ready_at: u64,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -183,18 +184,6 @@ impl StagedChannelPair {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct Activation {
-    pub controller: SystemInit,
-    pub result: RecoveryResult,
-    pub active: [Option<ActiveNativeRole>; EARLY_ROLE_COUNT],
-    pub registry_control: DwHandle,
-    pub topology: Option<RegistryTopology>,
-    pub gate: GateConfig,
-    pub jobs: JobDispatcher,
-    pub evidence: Option<EvidenceLog>,
-}
-
-#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ResidentState {
     pub registry_control: DwHandle,
     pub topology: Option<RegistryTopology>,
@@ -248,22 +237,85 @@ pub(crate) fn validate_retained_bootfs(
     Ok((controller, gate))
 }
 
-pub(crate) fn activate<S, L, W>(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn activate_in_place<'a, S, L, W>(
     system: &mut S,
     loader: &mut L,
     waits: &mut W,
+    slot: &'a mut MaybeUninit<ResidentSystemInit>,
     authority: LoadAuthority,
     bootstrap_channel: DwHandle,
     parent_transaction: u64,
     bootfs: &[u8],
-) -> Result<Activation, InitError>
+) -> Result<&'a mut ResidentSystemInit, InitError>
 where
     S: Wyr1BPlatform,
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
-    let (mut controller, gate) = validate_retained_bootfs(bootfs)?;
-    let mut jobs = JobDispatcher::new();
+    let resident = initialize_resident_in_place(slot, authority, bootfs)?;
+    activate_resident(
+        system,
+        loader,
+        waits,
+        resident,
+        authority,
+        bootstrap_channel,
+        parent_transaction,
+        bootfs,
+    )?;
+    Ok(resident)
+}
+
+fn initialize_resident_in_place<'a>(
+    slot: &'a mut MaybeUninit<ResidentSystemInit>,
+    authority: LoadAuthority,
+    bootfs: &[u8],
+) -> Result<&'a mut ResidentSystemInit, InitError> {
+    let (controller, gate) = validate_retained_bootfs(bootfs)?;
+    Ok(slot.write(ResidentSystemInit {
+        controller,
+        authority,
+        result: RecoveryResult::Degraded,
+        active: [None; EARLY_ROLE_COUNT],
+        evidence_finalized: false,
+        last_tick_ns: 0,
+        wyr1b: Some(ResidentState {
+            registry_control: DwHandle(0),
+            topology: None,
+            gate,
+            jobs: JobDispatcher::new(),
+        }),
+        wyr1b_evidence: None,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn activate_resident<S, L, W>(
+    system: &mut S,
+    loader: &mut L,
+    waits: &mut W,
+    resident: &mut ResidentSystemInit,
+    authority: LoadAuthority,
+    bootstrap_channel: DwHandle,
+    parent_transaction: u64,
+    bootfs: &[u8],
+) -> Result<(), InitError>
+where
+    S: Wyr1BPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let ResidentSystemInit {
+        controller,
+        result,
+        active,
+        wyr1b,
+        wyr1b_evidence,
+        ..
+    } = resident;
+    let state = wyr1b.as_mut().ok_or(InitError::Accounting)?;
+    let gate = state.gate;
     controller.become_operational()?;
     let mut ready = [0u8; HEADER_BYTES];
     let ready_len =
@@ -290,23 +342,16 @@ where
         return Err(InitError::Supervision);
     }
     controller.begin_registry(system.now().map_err(InitError::Native)?, 1, 0x1001)?;
-    let Some((mut registry, mut topology)) =
-        launch_registry_until_ready(system, loader, waits, &mut controller, authority, bootfs)?
+    let Some(registry) =
+        launch_registry_until_ready(system, loader, waits, controller, authority, bootfs)?
     else {
-        return Ok(Activation {
-            controller,
-            result: RecoveryResult::Degraded,
-            active: [None, None],
-            registry_control: DwHandle(0),
-            topology: None,
-            gate,
-            jobs,
-            evidence: None,
-        });
+        return Ok(());
     };
-    let (devmgr, result) = match activate_role_until_ready(
+    let (mut registry, mut topology) =
+        establish_registry_topology(system, waits, controller, registry)?;
+    let (devmgr, activation_result) = match activate_role_until_ready(
         system,
-        &mut controller,
+        controller,
         loader,
         waits,
         authority,
@@ -316,6 +361,7 @@ where
         RoleActivation::Ready(active) => (Some(active), RecoveryResult::Recovered),
         RoleActivation::Degraded => (None, RecoveryResult::Degraded),
     };
+    *result = activation_result;
     loop {
         match run_registry_gate(
             system,
@@ -326,91 +372,53 @@ where
             registry,
             &mut topology,
             gate,
-            &mut jobs,
+            &mut state.jobs,
         ) {
             Ok(evidence) => {
-                return Ok(Activation {
-                    controller,
-                    result,
-                    active: [Some(registry.active), devmgr],
-                    registry_control: registry.control_channel,
-                    topology: Some(topology),
-                    gate,
-                    jobs,
-                    evidence: Some(evidence),
-                });
+                *active = [Some(registry.active), devmgr];
+                state.registry_control = registry.control_channel;
+                state.topology = Some(topology);
+                *wyr1b_evidence = Some(evidence);
+                return Ok(());
             }
             Err(GateRunError::PreInstall(_error)) => {
-                return Ok(Activation {
-                    controller,
-                    result: RecoveryResult::Degraded,
-                    active: [Some(registry.active), devmgr],
-                    registry_control: registry.control_channel,
-                    topology: Some(topology),
-                    gate,
-                    jobs,
-                    evidence: None,
-                });
+                *result = RecoveryResult::Degraded;
+                *active = [Some(registry.active), devmgr];
+                state.registry_control = registry.control_channel;
+                state.topology = Some(topology);
+                return Ok(());
             }
             Err(GateRunError::CleanupFailed(_)) => {
-                let _ = poison_registry_generation(system, waits, &mut controller, registry, true)?;
-                return Ok(Activation {
-                    controller,
-                    result: RecoveryResult::Degraded,
-                    active: [None, devmgr],
-                    registry_control: DwHandle(0),
-                    topology: Some(topology),
-                    gate,
-                    jobs,
-                    evidence: None,
-                });
+                let _ = poison_registry_generation(system, waits, controller, registry, true)?;
+                *result = RecoveryResult::Degraded;
+                *active = [None, devmgr];
+                state.topology = Some(topology);
+                return Ok(());
             }
             Err(GateRunError::InstallCommitted {
                 error: _,
                 cleanup_failed,
             }) => {
-                if poison_registry_generation(
-                    system,
-                    waits,
-                    &mut controller,
-                    registry,
-                    cleanup_failed,
-                )? {
-                    return Ok(Activation {
-                        controller,
-                        result: RecoveryResult::Degraded,
-                        active: [None, devmgr],
-                        registry_control: DwHandle(0),
-                        topology: Some(topology),
-                        gate,
-                        jobs,
-                        evidence: None,
-                    });
+                if poison_registry_generation(system, waits, controller, registry, cleanup_failed)?
+                {
+                    *result = RecoveryResult::Degraded;
+                    *active = [None, devmgr];
+                    state.topology = Some(topology);
+                    return Ok(());
                 }
-                let Some((replacement, _)) = launch_registry_until_ready(
-                    system,
-                    loader,
-                    waits,
-                    &mut controller,
-                    authority,
-                    bootfs,
+                let Some(replacement) = launch_registry_until_ready(
+                    system, loader, waits, controller, authority, bootfs,
                 )?
                 else {
-                    return Ok(Activation {
-                        controller,
-                        result: RecoveryResult::Degraded,
-                        active: [None, devmgr],
-                        registry_control: DwHandle(0),
-                        topology: Some(topology),
-                        gate,
-                        jobs,
-                        evidence: None,
-                    });
+                    *result = RecoveryResult::Degraded;
+                    *active = [None, devmgr];
+                    state.topology = Some(topology);
+                    return Ok(());
                 };
                 registry = restart_topology_or_poison(
                     system,
                     waits,
-                    &mut controller,
+                    controller,
                     &mut topology,
                     replacement,
                 )?;
@@ -608,7 +616,7 @@ fn launch_registry<S, L, W>(
     controller: &mut SystemInit,
     authority: LoadAuthority,
     bootfs: &[u8],
-) -> Result<(RegistryNativeAttempt, RegistryTopology), InitError>
+) -> Result<RegistryNativeAttempt, InitError>
 where
     S: Wyr1BPlatform,
     L: LoaderPlatform<Error = NativeError>,
@@ -850,38 +858,45 @@ where
             InitError::ResourceIdentityMismatch,
         ));
     }
-    let topology = match RegistryTopology::new(installed_generation).map_err(InitError::Wyr1BModel)
-    {
-        Ok(topology) => topology,
-        Err(error) => {
-            return Err(reconcile_failed_registry_launch(
-                system,
-                waits,
-                controller,
-                loaded,
-                task_group,
-                control_channel,
-                generation,
-                transaction_id,
-                ready_at,
-                AttemptFailure::WaitFailed,
-                error,
-            ));
-        }
-    };
-    Ok((
-        RegistryNativeAttempt {
-            active: ActiveNativeRole {
-                role: RoleId::Registryd,
-                generation,
-                transaction_id,
-                loaded,
-                task_group,
-            },
-            control_channel,
+    Ok(RegistryNativeAttempt {
+        active: ActiveNativeRole {
+            role: RoleId::Registryd,
+            generation,
+            transaction_id,
+            loaded,
+            task_group,
         },
-        topology,
-    ))
+        control_channel,
+        ready_at,
+    })
+}
+
+fn establish_registry_topology<S, W>(
+    system: &mut S,
+    waits: &mut W,
+    controller: &mut SystemInit,
+    registry: RegistryNativeAttempt,
+) -> Result<(RegistryNativeAttempt, RegistryTopology), InitError>
+where
+    S: InitPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    match RegistryTopology::new(registry.active.generation).map_err(InitError::Wyr1BModel) {
+        Ok(topology) => Ok((registry, topology)),
+        Err(error) => Err(reconcile_failed_registry_launch(
+            system,
+            waits,
+            controller,
+            registry.active.loaded,
+            registry.active.task_group,
+            registry.control_channel,
+            registry.active.generation,
+            registry.active.transaction_id,
+            registry.ready_at,
+            AttemptFailure::WaitFailed,
+            error,
+        )),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -954,7 +969,7 @@ fn launch_registry_until_ready<S, L, W>(
     controller: &mut SystemInit,
     authority: LoadAuthority,
     bootfs: &[u8],
-) -> Result<Option<(RegistryNativeAttempt, RegistryTopology)>, InitError>
+) -> Result<Option<RegistryNativeAttempt>, InitError>
 where
     S: Wyr1BPlatform,
     L: LoaderPlatform<Error = NativeError>,
@@ -3225,6 +3240,45 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn run_registry_replacement_gate<S, L, W>(
+    system: &mut S,
+    loader: &mut L,
+    waits: &mut W,
+    authority: LoadAuthority,
+    bootfs: &[u8],
+    registry: RegistryNativeAttempt,
+    topology: &mut RegistryTopology,
+    gate: GateConfig,
+    jobs: &mut JobDispatcher,
+) -> ReplacementGateOutcome
+where
+    S: Wyr1BPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    match run_registry_gate(
+        system, loader, waits, authority, bootfs, registry, topology, gate, jobs,
+    ) {
+        Ok(_) => ReplacementGateOutcome::Complete,
+        Err(GateRunError::PreInstall(_)) => ReplacementGateOutcome::PreInstall,
+        Err(GateRunError::CleanupFailed(_)) => ReplacementGateOutcome::CleanupFailed,
+        Err(GateRunError::InstallCommitted {
+            error: _,
+            cleanup_failed,
+        }) => ReplacementGateOutcome::InstallCommitted { cleanup_failed },
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReplacementGateOutcome {
+    Complete,
+    PreInstall,
+    CleanupFailed,
+    InstallCommitted { cleanup_failed: bool },
+}
+
+#[allow(clippy::too_many_arguments)]
 fn launch_registry_replacement_with_gate<S, L, W>(
     system: &mut S,
     loader: &mut L,
@@ -3242,25 +3296,22 @@ where
     W: SupervisionPlatform<Error = NativeError>,
 {
     loop {
-        let Some((registry, _)) =
+        let Some(registry) =
             launch_registry_until_ready(system, loader, waits, controller, authority, bootfs)?
         else {
             return Ok(None);
         };
         let registry = restart_topology_or_poison(system, waits, controller, topology, registry)?;
-        match run_registry_gate(
+        match run_registry_replacement_gate(
             system, loader, waits, authority, bootfs, registry, topology, gate, jobs,
         ) {
-            Ok(_) => return Ok(Some((registry, true))),
-            Err(GateRunError::PreInstall(_)) => return Ok(Some((registry, false))),
-            Err(GateRunError::CleanupFailed(_)) => {
+            ReplacementGateOutcome::Complete => return Ok(Some((registry, true))),
+            ReplacementGateOutcome::PreInstall => return Ok(Some((registry, false))),
+            ReplacementGateOutcome::CleanupFailed => {
                 let _ = poison_registry_generation(system, waits, controller, registry, true)?;
                 return Ok(None);
             }
-            Err(GateRunError::InstallCommitted {
-                error: _,
-                cleanup_failed,
-            }) => {
+            ReplacementGateOutcome::InstallCommitted { cleanup_failed } => {
                 if poison_registry_generation(system, waits, controller, registry, cleanup_failed)?
                 {
                     return Ok(None);
@@ -3288,205 +3339,186 @@ where
         return Err(InitError::WrongActivationOrder);
     }
     resident.last_tick_ns = now_ns;
-    let mut state = resident
-        .wyr1b
-        .take()
-        .ok_or(InitError::WrongActivationOrder)?;
-    let result = (|| {
-        for index in 0..resident.active.len() {
-            let Some(active) = resident.active[index] else {
-                continue;
-            };
-            let poll_items = [
-                DwWaitItemV1 {
-                    handle: active.loaded.launch_channel,
-                    signals: deepwyrm_syscall::DwSignals(
-                        DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0,
-                    ),
-                },
-                DwWaitItemV1 {
-                    handle: active.loaded.process,
-                    signals: DW_SIGNAL_EXITED,
-                },
-            ];
-            let profile = if active.role == RoleId::Registryd {
-                LaunchProfile::BootstrapRegistry
-            } else {
-                LaunchProfile::EarlyBootStub
-            };
-            let observed = match waits.wait_many(&poll_items, DwDeadline(now_ns)) {
-                Err(NativeError::Status(status)) if status == DW_STATUS_TIMED_OUT => continue,
-                Err(error) => Err(ObservedSupervisionError::Supervision(
-                    SupervisionError::Platform(error),
-                )),
-                Ok(_) => {
-                    let deadline = now_ns
-                        .checked_add(WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns)
-                        .ok_or(InitError::Accounting)?;
-                    supervise_ready_child_profile(
-                        waits,
-                        active.loaded.process,
-                        active.loaded.launch_channel,
-                        profile,
-                        active.transaction_id,
-                        DwDeadline(deadline),
-                    )
-                }
-            };
-            let (transition, terminate) = match observed {
-                Ok(info) => (
-                    AfterReadyTransition::Terminal(terminal_disposition(&info)),
-                    false,
+    let ResidentSystemInit {
+        controller,
+        authority,
+        result,
+        active: active_roles,
+        wyr1b,
+        ..
+    } = resident;
+    let state = wyr1b.as_mut().ok_or(InitError::WrongActivationOrder)?;
+    for active_slot in active_roles.iter_mut() {
+        let Some(active) = *active_slot else {
+            continue;
+        };
+        let poll_items = [
+            DwWaitItemV1 {
+                handle: active.loaded.launch_channel,
+                signals: deepwyrm_syscall::DwSignals(
+                    DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0,
                 ),
-                Err(error) => (
-                    classify_after_ready_observation(&error),
-                    !error.process_exit_observed(),
-                ),
-            };
-            match transition {
-                AfterReadyTransition::Terminal(disposition) => resident.controller.terminal(
-                    active.role,
-                    active.generation,
+            },
+            DwWaitItemV1 {
+                handle: active.loaded.process,
+                signals: DW_SIGNAL_EXITED,
+            },
+        ];
+        let profile = if active.role == RoleId::Registryd {
+            LaunchProfile::BootstrapRegistry
+        } else {
+            LaunchProfile::EarlyBootStub
+        };
+        let observed = match waits.wait_many(&poll_items, DwDeadline(now_ns)) {
+            Err(NativeError::Status(status)) if status == DW_STATUS_TIMED_OUT => continue,
+            Err(error) => Err(ObservedSupervisionError::Supervision(
+                SupervisionError::Platform(error),
+            )),
+            Ok(_) => {
+                let deadline = now_ns
+                    .checked_add(WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns)
+                    .ok_or(InitError::Accounting)?;
+                supervise_ready_child_profile(
+                    waits,
+                    active.loaded.process,
+                    active.loaded.launch_channel,
+                    profile,
                     active.transaction_id,
-                    now_ns,
-                    disposition,
-                )?,
-                AfterReadyTransition::Failure(failure) => resident.controller.fail(
-                    active.role,
-                    active.generation,
-                    active.transaction_id,
-                    now_ns,
-                    failure,
-                )?,
+                    DwDeadline(deadline),
+                )
             }
-            if active.role == RoleId::Devmgr {
-                complete_native_cleanup(
-                    system,
-                    waits,
-                    &mut resident.controller,
-                    active.loaded,
-                    active.task_group,
-                    terminate,
-                    active.role,
-                    active.generation,
-                    active.transaction_id,
-                    now_ns,
-                )?;
-                resident.active[index] = None;
-                if transition == AfterReadyTransition::Terminal(TerminalDisposition::NormalExit(0))
-                {
-                    continue;
-                }
-                if advance_or_degrade(
-                    system,
-                    &mut resident.controller,
-                    active.role,
-                    active.transaction_id,
-                )? {
-                    resident.result = RecoveryResult::Degraded;
-                    continue;
-                }
-                match remap_and_activate_role(
-                    system,
-                    loader,
-                    waits,
-                    resident.authority,
-                    &mut resident.controller,
-                    active.role,
-                )? {
-                    RoleActivation::Ready(replacement) => {
-                        resident.active[index] = Some(replacement)
-                    }
-                    RoleActivation::Degraded => resident.result = RecoveryResult::Degraded,
-                }
+        };
+        let (transition, terminate) = match observed {
+            Ok(info) => (
+                AfterReadyTransition::Terminal(terminal_disposition(&info)),
+                false,
+            ),
+            Err(error) => (
+                classify_after_ready_observation(&error),
+                !error.process_exit_observed(),
+            ),
+        };
+        match transition {
+            AfterReadyTransition::Terminal(disposition) => controller.terminal(
+                active.role,
+                active.generation,
+                active.transaction_id,
+                now_ns,
+                disposition,
+            )?,
+            AfterReadyTransition::Failure(failure) => controller.fail(
+                active.role,
+                active.generation,
+                active.transaction_id,
+                now_ns,
+                failure,
+            )?,
+        }
+        if active.role == RoleId::Devmgr {
+            complete_native_cleanup(
+                system,
+                waits,
+                controller,
+                active.loaded,
+                active.task_group,
+                terminate,
+                active.role,
+                active.generation,
+                active.transaction_id,
+                now_ns,
+            )?;
+            *active_slot = None;
+            if transition == AfterReadyTransition::Terminal(TerminalDisposition::NormalExit(0)) {
                 continue;
             }
+            if advance_or_degrade(system, controller, active.role, active.transaction_id)? {
+                *result = RecoveryResult::Degraded;
+                continue;
+            }
+            match remap_and_activate_role(
+                system,
+                loader,
+                waits,
+                *authority,
+                controller,
+                active.role,
+            )? {
+                RoleActivation::Ready(replacement) => *active_slot = Some(replacement),
+                RoleActivation::Degraded => *result = RecoveryResult::Degraded,
+            }
+            continue;
+        }
 
-            let cleanup_failed = drain_job_dispatcher(system, waits, &mut state.jobs).is_err()
-                | cleanup_loaded(system, waits, active.loaded, active.task_group, terminate)
-                    .is_err()
-                | system.close_handle(state.registry_control).is_err();
-            resident.active[index] = None;
-            state.registry_control = DwHandle(0);
-            let retired_at = now_ns.checked_add(1).ok_or(InitError::Accounting)?;
-            if cleanup_failed {
-                resident.controller.cleanup_failed(
-                    RoleId::Registryd,
-                    active.generation,
-                    active.transaction_id,
-                    retired_at,
-                )?;
-                resident.result = RecoveryResult::Degraded;
-                continue;
-            }
-            resident.controller.cleanup_complete(
+        let cleanup_failed = drain_job_dispatcher(system, waits, &mut state.jobs).is_err()
+            | cleanup_loaded(system, waits, active.loaded, active.task_group, terminate).is_err()
+            | system.close_handle(state.registry_control).is_err();
+        *active_slot = None;
+        state.registry_control = DwHandle(0);
+        let retired_at = now_ns.checked_add(1).ok_or(InitError::Accounting)?;
+        if cleanup_failed {
+            controller.cleanup_failed(
                 RoleId::Registryd,
                 active.generation,
                 active.transaction_id,
                 retired_at,
             )?;
-            if advance_registry_or_exhausted(
-                system,
-                &mut resident.controller,
-                active.transaction_id,
-            )? {
-                resident.result = RecoveryResult::Degraded;
-                continue;
-            }
-            let size = system
-                .query_memory_object_size(resident.authority.bootfs)
-                .map_err(InitError::Native)?;
-            let plan = MappingPlan::for_bootfs(size).map_err(|error| {
-                ordinary_mapping_error(MappingDiagnosticSite::RegistryReplacement, error, size)
-            })?;
-            let replacement = system
-                .with_bootfs_bytes(
-                    resident.authority.parent_root,
-                    resident.authority.bootfs,
-                    plan,
-                    |system, bootfs| {
-                        launch_registry_replacement_with_gate(
-                            system,
-                            loader,
-                            waits,
-                            &mut resident.controller,
-                            resident.authority,
-                            bootfs,
-                            state
-                                .topology
-                                .as_mut()
-                                .ok_or(InitError::WrongActivationOrder)?,
-                            state.gate,
-                            &mut state.jobs,
-                        )
-                    },
-                )
-                .map_err(InitError::Native)??;
-            if let Some((replacement, gate_complete)) = replacement {
-                state.registry_control = replacement.control_channel;
-                resident.active[index] = Some(replacement.active);
-                if !gate_complete {
-                    resident.result = RecoveryResult::Degraded;
-                }
-            } else {
-                resident.result = RecoveryResult::Degraded;
-            }
+            *result = RecoveryResult::Degraded;
+            continue;
         }
-        poll_job_dispatcher(
-            system,
-            loader,
-            waits,
-            resident.authority,
-            &mut state.jobs,
-            now_ns,
+        controller.cleanup_complete(
+            RoleId::Registryd,
+            active.generation,
+            active.transaction_id,
+            retired_at,
         )?;
-        if resident.controller.mode() == SystemMode::Degraded {
-            resident.result = RecoveryResult::Degraded;
+        if advance_registry_or_exhausted(system, controller, active.transaction_id)? {
+            *result = RecoveryResult::Degraded;
+            continue;
         }
-        Ok(resident.controller.mode())
-    })();
-    resident.wyr1b = Some(state);
-    result
+        let size = system
+            .query_memory_object_size(authority.bootfs)
+            .map_err(InitError::Native)?;
+        let plan = MappingPlan::for_bootfs(size).map_err(|error| {
+            ordinary_mapping_error(MappingDiagnosticSite::RegistryReplacement, error, size)
+        })?;
+        let replacement = system
+            .with_bootfs_bytes(
+                authority.parent_root,
+                authority.bootfs,
+                plan,
+                |system, bootfs| {
+                    launch_registry_replacement_with_gate(
+                        system,
+                        loader,
+                        waits,
+                        controller,
+                        *authority,
+                        bootfs,
+                        state
+                            .topology
+                            .as_mut()
+                            .ok_or(InitError::WrongActivationOrder)?,
+                        state.gate,
+                        &mut state.jobs,
+                    )
+                },
+            )
+            .map_err(InitError::Native)??;
+        if let Some((replacement, gate_complete)) = replacement {
+            state.registry_control = replacement.control_channel;
+            *active_slot = Some(replacement.active);
+            if !gate_complete {
+                *result = RecoveryResult::Degraded;
+            }
+        } else {
+            *result = RecoveryResult::Degraded;
+        }
+    }
+    poll_job_dispatcher(system, loader, waits, *authority, &mut state.jobs, now_ns)?;
+    if controller.mode() == SystemMode::Degraded {
+        *result = RecoveryResult::Degraded;
+    }
+    Ok(controller.mode())
 }
 
 #[cfg(test)]
@@ -5198,6 +5230,7 @@ mod tests {
                     task_group,
                 },
                 control_channel: DwHandle(33),
+                ready_at: 2,
             },
         )
     }

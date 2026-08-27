@@ -6,6 +6,8 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+use core::mem::MaybeUninit;
+
 pub mod evidence;
 pub mod gate;
 pub mod wyr1b;
@@ -1393,85 +1395,154 @@ where
     })
 }
 
-/// Selects the immutable product path from the retained bootfs. Selector 25
-/// remains the exact legacy path; only a canonical selector-27 gate admits the
-/// WYR1-B platform extension.
-pub fn run_system_init_product<S, L, W>(
+/// Selects the immutable product path, constructs one resident in place, and
+/// transfers control without returning or copying the resident value.
+/// Selector 25 remains the exact legacy path; only a canonical selector-27
+/// gate admits the WYR1-B platform extension.
+pub fn continue_system_init_product<S, L, W, R>(
     system: &mut S,
     loader: &mut L,
     waits: &mut W,
     bootstrap_channel: DwHandle,
-) -> Result<ResidentSystemInit, InitError>
+    continuation: impl FnOnce(&mut ResidentSystemInit, &mut S, &mut L, &mut W) -> R,
+) -> Result<R, InitError>
 where
     S: Wyr1BPlatform,
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
-    // The no-alloc primordial boundary keeps both fixed-capacity activation
-    // states inline; selector choice consumes the larger state exactly once.
-    #[allow(clippy::large_enum_variant)]
-    enum ProductActivation {
-        Wyr1A(ActivationState),
-        Wyr1B(wyr1b_native::Activation),
+    let mut slot = MaybeUninit::uninit();
+    let resident =
+        receive_and_activate_product_in_place(system, loader, waits, bootstrap_channel, &mut slot)?;
+    resident.last_tick_ns = system.now().map_err(InitError::Native)?;
+    Ok(continuation(resident, system, loader, waits))
+}
+
+fn receive_and_activate_product_in_place<'a, S, L, W>(
+    system: &mut S,
+    loader: &mut L,
+    waits: &mut W,
+    bootstrap_channel: DwHandle,
+    slot: &'a mut MaybeUninit<ResidentSystemInit>,
+) -> Result<&'a mut ResidentSystemInit, InitError>
+where
+    S: Wyr1BPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let channel = system
+        .query_capability_info(bootstrap_channel)
+        .map_err(InitError::Native)?;
+    validate_bootstrap_channel(channel, BOOTSTRAP_CHANNEL_EXPECTATION)
+        .map_err(InitError::Capability)?;
+    let mut init_bytes = [0; SUPERVISOR_BYTES];
+    let mut handles = [DwReceivedHandleInfoV1::default(); 3];
+    let counts = system
+        .receive_channel(bootstrap_channel, &mut init_bytes, &mut handles)
+        .map_err(InitError::Native)?;
+    if counts
+        != (ReceiveCounts {
+            bytes: SUPERVISOR_BYTES,
+            handles: 3,
+        })
+    {
+        let error = InitError::Launch(wyrmroot_loader::launch::LaunchError::HandleCount);
+        close_malformed_startup(system, &handles, counts.handles, bootstrap_channel)?;
+        return Err(error);
     }
-    let (authority, activation) = receive_and_activate(
+    let startup = activate_received_product_in_place(
         system,
+        loader,
+        waits,
+        slot,
         bootstrap_channel,
-        |system, authority, transaction_id, bootfs| {
-            let archive = Archive::new(bootfs).map_err(InitError::Bootfs)?;
-            match archive.lookup(wyr1b_gate::GATE_PATH.as_bytes()) {
-                Ok(_) => wyr1b_native::activate(
-                    system,
-                    loader,
-                    waits,
-                    authority,
-                    bootstrap_channel,
-                    transaction_id,
-                    bootfs,
-                )
-                .map(ProductActivation::Wyr1B),
-                Err(LookupError::NotFound) => activate_retained_bootfs(
-                    system,
-                    loader,
-                    waits,
-                    authority,
-                    bootstrap_channel,
-                    transaction_id,
-                    bootfs,
-                )
-                .map(ProductActivation::Wyr1A),
-                Err(error) => Err(map_lookup(error)),
-            }
-        },
-    )?;
-    let now = system.now().map_err(InitError::Native)?;
-    Ok(match activation {
-        ProductActivation::Wyr1A(activation) => ResidentSystemInit {
-            controller: activation.controller,
-            authority,
-            result: activation.result,
-            active: activation.active,
-            evidence_finalized: false,
-            last_tick_ns: now,
-            wyr1b: None,
-            wyr1b_evidence: None,
-        },
-        ProductActivation::Wyr1B(activation) => ResidentSystemInit {
-            controller: activation.controller,
-            authority,
-            result: activation.result,
-            active: activation.active,
-            evidence_finalized: false,
-            last_tick_ns: now,
-            wyr1b: Some(wyr1b_native::ResidentState {
-                registry_control: activation.registry_control,
-                topology: activation.topology,
-                gate: activation.gate,
-                jobs: activation.jobs,
-            }),
-            wyr1b_evidence: activation.evidence,
-        },
-    })
+        &init_bytes,
+        &handles,
+    );
+    let resident = match startup {
+        Ok(value) => value,
+        Err(error) => {
+            close_startup_failure(system, &handles, bootstrap_channel)?;
+            return Err(error);
+        }
+    };
+    system
+        .close_handle(bootstrap_channel)
+        .map_err(InitError::Native)?;
+    Ok(resident)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn activate_received_product_in_place<'a, S, L, W>(
+    system: &mut S,
+    loader: &mut L,
+    waits: &mut W,
+    slot: &'a mut MaybeUninit<ResidentSystemInit>,
+    bootstrap_channel: DwHandle,
+    init_bytes: &[u8; SUPERVISOR_BYTES],
+    handles: &[DwReceivedHandleInfoV1; 3],
+) -> Result<&'a mut ResidentSystemInit, InitError>
+where
+    S: Wyr1BPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let parsed =
+        parse_init(LaunchProfile::Supervisor, init_bytes, handles).map_err(InitError::Launch)?;
+    let capabilities = [
+        fresh_capability(system, handles[0])?,
+        fresh_capability(system, handles[1])?,
+        fresh_capability(system, handles[2])?,
+    ];
+    validate_init_capabilities_v2(
+        &capabilities,
+        SELF_ROOT_EXPECTATION,
+        BOOTFS_EXPECTATION,
+        LOADER_TASK_GROUP_EXPECTATION,
+    )
+    .map_err(InitError::Capability)?;
+    let authority = LoadAuthority {
+        parent_root: handles[0].handle,
+        bootfs: handles[1].handle,
+        task_group: handles[2].handle,
+    };
+    let size = system
+        .query_memory_object_size(authority.bootfs)
+        .map_err(InitError::Native)?;
+    let plan = MappingPlan::for_bootfs(size).map_err(|error| startup_mapping_error(error, size))?;
+    system
+        .with_bootfs_bytes(
+            authority.parent_root,
+            authority.bootfs,
+            plan,
+            |system, bootfs| {
+                let archive = Archive::new(bootfs).map_err(InitError::Bootfs)?;
+                match archive.lookup(wyr1b_gate::GATE_PATH.as_bytes()) {
+                    Ok(_) => wyr1b_native::activate_in_place(
+                        system,
+                        loader,
+                        waits,
+                        slot,
+                        authority,
+                        bootstrap_channel,
+                        parsed.transaction_id,
+                        bootfs,
+                    ),
+                    Err(LookupError::NotFound) => activate_retained_bootfs_in_place(
+                        system,
+                        loader,
+                        waits,
+                        slot,
+                        authority,
+                        bootstrap_channel,
+                        parsed.transaction_id,
+                        bootfs,
+                    ),
+                    Err(error) => Err(map_lookup(error)),
+                }
+            },
+        )
+        .map_err(InitError::Native)?
 }
 
 fn receive_and_activate<S, T>(
@@ -1629,6 +1700,83 @@ where
     W: SupervisionPlatform<Error = NativeError>,
 {
     let mut controller = validate_retained_bootfs(bootfs)?;
+    let mut active = [None; EARLY_ROLE_COUNT];
+    let result = activate_retained_bootfs_state(
+        system,
+        loader,
+        waits,
+        authority,
+        bootstrap_channel,
+        parent_transaction,
+        bootfs,
+        &mut controller,
+        &mut active,
+    )?;
+    Ok(ActivationState {
+        controller,
+        result,
+        active,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn activate_retained_bootfs_in_place<'a, S, L, W>(
+    system: &mut S,
+    loader: &mut L,
+    waits: &mut W,
+    slot: &'a mut MaybeUninit<ResidentSystemInit>,
+    authority: LoadAuthority,
+    bootstrap_channel: DwHandle,
+    parent_transaction: u64,
+    bootfs: &[u8],
+) -> Result<&'a mut ResidentSystemInit, InitError>
+where
+    S: InitPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let controller = validate_retained_bootfs(bootfs)?;
+    let resident = slot.write(ResidentSystemInit {
+        controller,
+        authority,
+        result: RecoveryResult::Degraded,
+        active: [None; EARLY_ROLE_COUNT],
+        evidence_finalized: false,
+        last_tick_ns: 0,
+        wyr1b: None,
+        wyr1b_evidence: None,
+    });
+    resident.result = activate_retained_bootfs_state(
+        system,
+        loader,
+        waits,
+        authority,
+        bootstrap_channel,
+        parent_transaction,
+        bootfs,
+        &mut resident.controller,
+        &mut resident.active,
+    )?;
+    Ok(resident)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn activate_retained_bootfs_state<S, L, W>(
+    system: &mut S,
+    loader: &mut L,
+    waits: &mut W,
+    authority: LoadAuthority,
+    bootstrap_channel: DwHandle,
+    parent_transaction: u64,
+    bootfs: &[u8],
+    controller: &mut SystemInit,
+    active: &mut [Option<ActiveNativeRole>; EARLY_ROLE_COUNT],
+) -> Result<RecoveryResult, InitError>
+where
+    S: InitPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+{
     controller.become_operational()?;
     let mut ready = [0; HEADER_BYTES];
     let ready_len =
@@ -1658,32 +1806,14 @@ where
     }
     let now = system.now().map_err(InitError::Native)?;
     controller.begin_registry(now, 1, 0x1001)?;
-    let mut active = [None; EARLY_ROLE_COUNT];
     for role in [RoleId::Registryd, RoleId::Devmgr] {
-        match activate_role_until_ready(
-            system,
-            &mut controller,
-            loader,
-            waits,
-            authority,
-            bootfs,
-            role,
-        )? {
+        match activate_role_until_ready(system, controller, loader, waits, authority, bootfs, role)?
+        {
             RoleActivation::Ready(attempt) => active[role_index(role)?] = Some(attempt),
-            RoleActivation::Degraded => {
-                return Ok(ActivationState {
-                    controller,
-                    result: RecoveryResult::Degraded,
-                    active,
-                });
-            }
+            RoleActivation::Degraded => return Ok(RecoveryResult::Degraded),
         }
     }
-    Ok(ActivationState {
-        controller,
-        result: RecoveryResult::Recovered,
-        active,
-    })
+    Ok(RecoveryResult::Recovered)
 }
 
 fn remap_and_activate_role<S, L, W>(
@@ -3145,5 +3275,18 @@ mod native_cleanup_tests {
         ] {
             assert_eq!(wyr1b_test_failure_application_status(&error), expected);
         }
+    }
+
+    #[test]
+    fn resident_fits_locked_native_stack_partition() {
+        use core::mem::size_of;
+
+        assert!(size_of::<ResidentSystemInit>() <= 20 * 1024);
+        assert_eq!(wyrmroot_loader::elf::STACK_BYTES, 64 * 1024);
+        assert_eq!(wyrmroot_runtime::STARTUP_BLOCK_V2_SIZE, 20 * 1024);
+        assert_eq!(
+            wyrmroot_loader::elf::STACK_BYTES as usize - wyrmroot_runtime::STARTUP_BLOCK_V2_SIZE,
+            44 * 1024
+        );
     }
 }

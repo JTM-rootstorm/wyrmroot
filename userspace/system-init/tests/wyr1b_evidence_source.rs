@@ -23,19 +23,56 @@ fn selector_27_submission_feature_is_separate_from_selector_25() {
     assert!(MAIN.contains("#[cfg(feature = \"wyr1-test-evidence\")]"));
     assert!(MAIN.contains("wyrmroot_runtime::submit_wyr1_evidence(record)"));
     assert!(LIB.contains("wyr1b_evidence: None"));
-    assert!(LIB.contains("wyr1b_evidence: activation.evidence"));
+    assert!(NATIVE.contains("*wyr1b_evidence = Some(evidence)"));
 }
 
 #[test]
 fn selector_27_startup_mapping_diagnostic_is_bound_to_the_initial_mapping_only() {
+    let product_start = LIB.find("fn activate_received_product_in_place").unwrap();
+    let product_end = LIB[product_start..]
+        .find("fn receive_and_activate<S, T>")
+        .map(|offset| product_start + offset)
+        .unwrap();
+    let product = &LIB[product_start..product_end];
     assert_eq!(
-        LIB.matches(".map_err(|error| startup_mapping_error(error, size))?")
+        product
+            .matches(".map_err(|error| startup_mapping_error(error, size))?")
             .count(),
         1
     );
     assert!(LIB.contains("fn startup_mapping_error(error: MappingPlanError, size: u64)"));
     assert!(LIB.contains("InitError::StartupMapping(StartupMappingDiagnostic"));
     assert!(MAIN.contains("return wyr1b_test_failure_application_status(&error);"));
+}
+
+#[test]
+fn native_product_activation_constructs_and_continues_one_resident_in_place() {
+    assert!(LIB.contains("pub fn continue_system_init_product"));
+    assert!(LIB.contains("let mut slot = MaybeUninit::uninit()"));
+    assert!(LIB.contains("slot.write(ResidentSystemInit"));
+    assert!(NATIVE.contains("slot.write(ResidentSystemInit"));
+    assert!(!LIB.contains("enum ProductActivation"));
+    assert!(!NATIVE.contains("struct Activation"));
+    assert!(!LIB.contains("pub fn run_system_init_product"));
+    assert!(MAIN.contains("continue_system_init_product("));
+    assert!(MAIN.contains("continue_resident,"));
+    assert!(!MAIN.contains("let mut resident = match"));
+}
+
+#[test]
+fn selector_27_resident_control_borrows_large_state_in_place() {
+    let control_start = NATIVE.find("pub(crate) fn control_tick").unwrap();
+    let control_end = NATIVE[control_start..]
+        .find("#[cfg(test)]")
+        .map(|offset| control_start + offset)
+        .unwrap();
+    let control = &NATIVE[control_start..control_end];
+    assert!(control.contains("let ResidentSystemInit {"));
+    assert!(control.contains("let state = wyr1b.as_mut()"));
+    assert!(!control.contains(".wyr1b.take()"));
+    assert!(NATIVE.contains("#[inline(never)]\nfn run_registry_replacement_gate"));
+    assert!(NATIVE.contains("enum ReplacementGateOutcome"));
+    assert!(NATIVE.contains(") -> Result<Option<RegistryNativeAttempt>, InitError>"));
 }
 
 #[test]
