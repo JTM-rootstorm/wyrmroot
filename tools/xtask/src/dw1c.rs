@@ -5,6 +5,7 @@
 //! persistent-domain lifecycle and the 46-record `DW1C` verifier.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -175,7 +176,8 @@ pub(crate) fn wyr_build_specs() -> [WyrBuildSpec; 12] {
             package: "wyrmroot-init0",
             binary: "wyrmroot-init0",
             features: DW1C_INIT_FEATURES,
-            requires_progress_digest: false,
+            // init0 uses `option_env!` to bind the controller's report.
+            requires_progress_digest: true,
         },
         WyrBuildSpec {
             label: "actor1",
@@ -667,6 +669,43 @@ pub fn inspect(request_path: &Path) -> Result<String, Failure> {
     Ok(format!("DW1_C_INSPECTION_PASS {result}"))
 }
 
+/// Reconstruct the ESP in a fresh request-local directory and compare bytes;
+/// this deliberately does not overwrite the frozen image.
+pub fn image_rebuild(request_path: &Path) -> Result<String, Failure> {
+    let request = Request::load(request_path)?;
+    let directory = request
+        .root
+        .join(format!(".dw1c-image-rebuild-{}", std::process::id()));
+    if directory.exists() {
+        return Err(Failure::task(
+            "DW1-C image-rebuild directory already exists",
+        ));
+    }
+    fs::create_dir(&directory).map_err(io)?;
+    let result = (|| {
+        let rebuilt = directory.join("esp.img");
+        let args = crate::cli::G3ImageArguments {
+            image: rebuilt.display().to_string(),
+            loader: request.path("loader")?.display().to_string(),
+            kernel: request.path("kernel")?.display().to_string(),
+            bootstrap: request.path("bootstrap")?.display().to_string(),
+            bootfs: request.path("bootfs")?.display().to_string(),
+        };
+        crate::g3_image::build(&args)?;
+        if read_regular(&rebuilt, "DW1-C rebuilt ESP")?
+            != read_regular(&request.path("esp")?, "DW1-C frozen ESP")?
+        {
+            return Err(Failure::task(
+                "DW1-C image-rebuild bytes differ from frozen ESP",
+            ));
+        }
+        Ok(())
+    })();
+    fs::remove_dir_all(&directory).map_err(io)?;
+    result?;
+    Ok("DW1_C_IMAGE_REBUILD_PASS byte_compare=equal".to_owned())
+}
+
 pub fn freeze(
     output: &Path,
     deep_repository: &Path,
@@ -677,15 +716,9 @@ pub fn freeze(
     if output.exists() {
         return Err(Failure::task("DW1-C freeze output already exists"));
     }
-    if !deep_repository.is_absolute()
-        || deep_repository
-            .components()
-            .any(|c| matches!(c, Component::ParentDir))
-        || deep_repository.is_symlink()
-    {
-        return Err(Failure::task("DW1-C Deep repository path is not canonical"));
-    }
-    verify_clean_repository(deep_repository, "Deepwyrm", deep_revision)?;
+    validate_dw1c_ambient_build_environment()?;
+    let deep_repository = canonical_repository_path(deep_repository, "Deepwyrm")?;
+    verify_clean_repository(&deep_repository, "Deepwyrm", deep_revision)?;
     verify_clean_repository(
         &crate::tasks::repository_root()?,
         "Wyrmroot",
@@ -695,11 +728,11 @@ pub fn freeze(
     // consumer.  It need not equal the later product-kernel revision, but the
     // candidate must expose the identical ABI tree before any build starts.
     let abi_tree = git_output(
-        deep_repository,
+        &deep_repository,
         &["rev-parse", &format!("{deep_revision}:abi")],
     )?;
     let generated_tree = git_output(
-        deep_repository,
+        &deep_repository,
         &["rev-parse", &format!("{GENERATED_ABI_REVISION}:abi")],
     )?;
     if abi_tree != DEEPWYRM_ABI_TREE || generated_tree != DEEPWYRM_ABI_TREE {
@@ -742,7 +775,7 @@ pub fn freeze(
     fs::create_dir(&output).map_err(io)?;
     let result = freeze_product(
         &output,
-        deep_repository,
+        &deep_repository,
         deep_revision,
         evidence_nonce,
         progress_digest,
@@ -780,14 +813,12 @@ fn freeze_product(
             "DW1-C measured bootfs page count is out of range",
         ));
     }
-    let kernel = build_kernel(
-        deep_repository,
-        &build_root.join("deepwyrm"),
-        evidence_nonce,
-        progress_digest,
-        pages,
-    )?;
+    let kernel = build_kernel(deep_repository, evidence_nonce, progress_digest, pages)?;
+    // Selector-26 established the canonical symbol contract: both named
+    // inputs are distinct immutable snapshots of the same unstripped ELF.
+    // Do not introduce a stripped-symbols pipeline here.
     let symbols = kernel.clone();
+    let source_values = scalars(&artifacts.source_receipt)?;
     let provenance = render_kernel_provenance(
         deep_revision,
         &rust_revision,
@@ -795,6 +826,7 @@ fn freeze_product(
         progress_digest,
         pages,
         &kernel,
+        &source_values,
     )?;
     let ovmf_code = read_pinned_firmware(OVMF_CODE_PATH, OVMF_CODE_SHA256, "OVMF code")?;
     let ovmf_vars = read_pinned_firmware(OVMF_VARS_PATH, OVMF_VARS_SHA256, "OVMF vars")?;
@@ -901,51 +933,62 @@ fn build_bootfs(init0: &[u8], actors: &[Vec<u8>; 10]) -> Result<Vec<u8>, Failure
 
 fn build_kernel(
     repository: &Path,
-    target: &Path,
     evidence_nonce: &str,
     progress_digest: &str,
     pages: usize,
 ) -> Result<Vec<u8>, Failure> {
-    fs::create_dir_all(target).map_err(io)?;
-    let status = Command::new(repository.join("tools/pinned-cargo"))
-        .arg("target")
-        .args([
-            "build",
-            "--locked",
-            "--offline",
-            "--release",
-            "--target",
-            KERNEL_TARGET,
-            "--package",
-            "deepwyrm-kernel",
-            "--bin",
-            "deepwyrm-kernel",
-            "--features",
-            "test-support",
-        ])
-        .env("DEEPWYRM_PINNED_TARGET_DIR", target)
-        .env("DEEPWYRM_GUEST_TEST_SELECTOR", SELECTOR)
-        .env("DEEPWYRM_DW1C_EVIDENCE_NONCE", evidence_nonce)
-        .env("DEEPWYRM_DW1C_PROGRESS_DIGEST", progress_digest)
-        .env("DEEPWYRM_DW1C_BOOTFS_MAX_PAGES", pages.to_string())
-        .env_remove("CARGO_HOME")
-        .env_remove("LD_AUDIT")
-        .env_remove("LD_LIBRARY_PATH")
-        .env_remove("LD_PRELOAD")
-        .current_dir(repository)
-        .stdin(Stdio::null())
-        .status()
-        .map_err(io)?;
-    if !status.success() {
-        return Err(Failure::task(
-            "DW1-C canonical Deepwyrm kernel build failed",
-        ));
+    let target = repository
+        .join(".tmp")
+        .join("dw1c-freeze")
+        .join(format!("{}-{evidence_nonce}", std::process::id()));
+    if target.exists() {
+        return Err(Failure::task("DW1-C kernel target already exists"));
     }
-    read_cargo_build_output(
-        &target.join(KERNEL_TARGET).join("release/deepwyrm-kernel"),
-        "kernel",
-        64 * 1024 * 1024,
-    )
+    fs::create_dir_all(target.parent().expect("target parent")).map_err(io)?;
+    fs::create_dir(&target).map_err(io)?;
+    let result = (|| {
+        let status = Command::new(repository.join("tools/pinned-cargo"))
+            .arg("target")
+            .args([
+                "build",
+                "--locked",
+                "--offline",
+                "--release",
+                "--target",
+                KERNEL_TARGET,
+                "--package",
+                "deepwyrm-kernel",
+                "--bin",
+                "deepwyrm-kernel",
+                "--features",
+                "test-support",
+            ])
+            .env("DEEPWYRM_PINNED_TARGET_DIR", &target)
+            .env("DEEPWYRM_GUEST_TEST_SELECTOR", SELECTOR)
+            .env("DEEPWYRM_DW1C_EVIDENCE_NONCE", evidence_nonce)
+            .env("DEEPWYRM_DW1C_PROGRESS_DIGEST", progress_digest)
+            .env("DEEPWYRM_DW1C_BOOTFS_MAX_PAGES", pages.to_string())
+            .env_remove("CARGO_HOME")
+            .env_remove("LD_AUDIT")
+            .env_remove("LD_LIBRARY_PATH")
+            .env_remove("LD_PRELOAD")
+            .current_dir(repository)
+            .stdin(Stdio::null())
+            .status()
+            .map_err(io)?;
+        if !status.success() {
+            return Err(Failure::task(
+                "DW1-C canonical Deepwyrm kernel build failed",
+            ));
+        }
+        read_cargo_build_output(
+            &target.join(KERNEL_TARGET).join("release/deepwyrm-kernel"),
+            "kernel",
+            64 * 1024 * 1024,
+        )
+    })();
+    fs::remove_dir_all(&target).map_err(io)?;
+    result
 }
 
 fn read_pinned_firmware(path: &str, expected: &str, label: &str) -> Result<Vec<u8>, Failure> {
@@ -965,6 +1008,7 @@ fn render_kernel_provenance(
     digest: &str,
     pages: usize,
     kernel: &[u8],
+    source: &BTreeMap<String, String>,
 ) -> Result<String, Failure> {
     let mut fields = BTreeMap::new();
     for (key, value) in [
@@ -974,7 +1018,29 @@ fn render_kernel_provenance(
         ("kernel_command", "tools/pinned-cargo target build --locked --offline --release --target x86_64-unknown-none --package deepwyrm-kernel --bin deepwyrm-kernel --features test-support".to_owned()),
         ("kernel_sha256", sha256::bytes_digest(kernel)), ("symbols_sha256", sha256::bytes_digest(kernel)),
         ("evidence_nonce", nonce.to_owned()), ("progress_digest", digest.to_owned()), ("bootfs_max_pages", pages.to_string()),
+        ("accepted_abi_tree", DEEPWYRM_ABI_TREE.to_owned()), ("kernel_target", KERNEL_TARGET.to_owned()),
+        ("kernel_output", "x86_64-unknown-none/release/deepwyrm-kernel".to_owned()),
     ] { fields.insert(key.to_owned(), value); }
+    for key in [
+        "rustc_sha256",
+        "cargo_sha256",
+        "rust_lld_sha256",
+        "toolchain_manifest_sha256",
+        "toolchain_tree_sha256",
+        "deep_layout_sha256",
+        "generated_layout_policy_sha256",
+        "uefi_effective_config_sha256",
+        "uefi_inspection_report_sha256",
+        "toolchain_validation_report_sha256",
+    ] {
+        fields.insert(
+            key.to_owned(),
+            source
+                .get(key)
+                .cloned()
+                .ok_or_else(|| Failure::task("DW1-C source receipt omits provenance identity"))?,
+        );
+    }
     render(&fields)
 }
 
@@ -1101,6 +1167,65 @@ fn render_freeze_request(
 
 fn current_revision(repository: &Path) -> Result<String, Failure> {
     git_output(repository, &["rev-parse", "HEAD"])
+}
+
+fn canonical_repository_path(path: &Path, label: &str) -> Result<PathBuf, Failure> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(Failure::task(format!(
+            "DW1-C {label} repository path is not canonical"
+        )));
+    }
+    let canonical = fs::canonicalize(path).map_err(io)?;
+    if canonical != path || canonical.is_symlink() {
+        return Err(Failure::task(format!(
+            "DW1-C {label} repository contains a symlink or escape"
+        )));
+    }
+    Ok(canonical)
+}
+
+fn validate_dw1c_ambient_build_environment() -> Result<(), Failure> {
+    for variable in [
+        "RUSTUP_TOOLCHAIN",
+        "RUSTC_BOOTSTRAP",
+        "RUSTC",
+        "RUSTDOC",
+        "RUSTFMT",
+        "RUSTFLAGS",
+        "RUSTDOCFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_BUILD_RUSTC",
+        "CARGO_BUILD_RUSTDOC",
+        "CARGO_BUILD_RUSTC_WRAPPER",
+        "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_BUILD_RUSTFLAGS",
+        "CARGO_BUILD_TARGET",
+        "CARGO_TARGET_DIR",
+        "WYRMROOT_RUSTC",
+        "WYRMROOT_DEEP_LAYOUT_POLICY_RS",
+        "DEEPWYRM_GUEST_TEST_SELECTOR",
+        "DEEPWYRM_DW1C_EVIDENCE_NONCE",
+        "DEEPWYRM_DW1C_PROGRESS_DIGEST",
+        "DEEPWYRM_DW1C_BOOTFS_MAX_PAGES",
+    ] {
+        if env::var_os(variable).is_some() {
+            return Err(Failure::task(format!(
+                "DW1-C canonical freeze refuses ambient {variable}"
+            )));
+        }
+    }
+    if env::vars_os().any(|(key, _)| key.as_encoded_bytes().starts_with(b"CARGO_TARGET_")) {
+        return Err(Failure::task(
+            "DW1-C canonical freeze refuses ambient CARGO_TARGET_*",
+        ));
+    }
+    Ok(())
 }
 
 fn git_output(repository: &Path, args: &[&str]) -> Result<String, Failure> {
@@ -1609,7 +1734,7 @@ mod tests {
                     package: "wyrmroot-init0",
                     binary: "wyrmroot-init0",
                     features: "native-init0,dw1c-preemption-integration",
-                    requires_progress_digest: false,
+                    requires_progress_digest: true,
                 },
             ]
         );
@@ -1631,7 +1756,10 @@ mod tests {
             );
         }
         assert_eq!(progress_digest_environment(specs[0], "A1"), None);
-        assert_eq!(progress_digest_environment(specs[1], "A1"), None);
+        assert_eq!(
+            progress_digest_environment(specs[1], "A1"),
+            Some(("DEEPWYRM_DW1C_PROGRESS_DIGEST", "A1"))
+        );
     }
 
     #[test]

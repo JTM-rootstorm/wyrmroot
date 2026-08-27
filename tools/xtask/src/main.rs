@@ -157,7 +157,9 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
         )
         .map(Some),
         Action::Dw1CImage(request) => dw1c::image(std::path::Path::new(&request)).map(Some),
-        Action::Dw1CImageRebuild(request) => dw1c::image(std::path::Path::new(&request)).map(Some),
+        Action::Dw1CImageRebuild(request) => {
+            dw1c::image_rebuild(std::path::Path::new(&request)).map(Some)
+        }
         Action::Dw1CInspect(request) => dw1c::inspect(std::path::Path::new(&request)).map(Some),
         Action::Unavailable(command) => Err(Failure::unavailable(command)),
     }
