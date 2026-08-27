@@ -15,6 +15,11 @@ use crate::sha256;
 
 const SELECTOR: &str = "normal-preemption-smp";
 const TEST_ID: &str = "28";
+// Wyrmroot's accepted toolchain/layout is tied to this generated ABI revision.
+// The product kernel is intentionally built from the explicit Deep candidate;
+// DW1-B uses the same two-revision split.
+const GENERATED_ABI_REVISION: &str = "cfc69bd8a49819ce1cda1a132cf56e55c93f92e4";
+const DEEPWYRM_ABI_TREE: &str = "1c6a74f130e386eee95b3780c75950beefd0037d";
 const MACHINE: &str = "pc-q35-10.2";
 const DOMAIN_UUID: &str = "33005e22-d7c2-4b13-b1ac-b82eda95e584";
 const O_NOFOLLOW: i32 = 0x2_0000;
@@ -273,22 +278,26 @@ pub fn freeze(
     {
         return Err(Failure::task("DW1-C Deep repository path is not canonical"));
     }
-    let head = std::process::Command::new("git")
-        .args([
-            "-C",
-            &deep_repository.to_string_lossy(),
-            "rev-parse",
-            "HEAD",
-        ])
-        .output()
-        .map_err(io)?;
-    let observed = String::from_utf8(head.stdout)
-        .map_err(|_| Failure::task("DW1-C Deep revision is not UTF-8"))?
-        .trim()
-        .to_owned();
-    if !head.status.success() || observed != deep_revision {
+    verify_clean_repository(deep_repository, "Deepwyrm", deep_revision)?;
+    verify_clean_repository(
+        &crate::tasks::repository_root()?,
+        "Wyrmroot",
+        &current_revision(&crate::tasks::repository_root()?)?,
+    )?;
+    // The generated ABI/layout identity belongs to the accepted Wyrmroot
+    // consumer.  It need not equal the later product-kernel revision, but the
+    // candidate must expose the identical ABI tree before any build starts.
+    let abi_tree = git_output(
+        deep_repository,
+        &["rev-parse", &format!("{deep_revision}:abi")],
+    )?;
+    let generated_tree = git_output(
+        deep_repository,
+        &["rev-parse", &format!("{GENERATED_ABI_REVISION}:abi")],
+    )?;
+    if abi_tree != DEEPWYRM_ABI_TREE || generated_tree != DEEPWYRM_ABI_TREE {
         return Err(Failure::task(
-            "DW1-C Deep repository HEAD does not match requested revision",
+            "DW1-C product Deep candidate does not match the accepted generated ABI tree",
         ));
     }
     for (label, value) in [
@@ -311,6 +320,49 @@ pub fn freeze(
     Err(Failure::task(
         "DW1-C build orchestration is not yet available in this checkout",
     ))
+}
+
+fn current_revision(repository: &Path) -> Result<String, Failure> {
+    git_output(repository, &["rev-parse", "HEAD"])
+}
+
+fn git_output(repository: &Path, args: &[&str]) -> Result<String, Failure> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(args)
+        .output()
+        .map_err(io)?;
+    if !output.status.success() {
+        return Err(Failure::task(format!(
+            "DW1-C git command failed for {}",
+            repository.display()
+        )));
+    }
+    String::from_utf8(output.stdout)
+        .map(|bytes| bytes.trim().to_owned())
+        .map_err(|_| Failure::task("DW1-C git output is not UTF-8"))
+}
+
+fn verify_clean_repository(repository: &Path, label: &str, expected: &str) -> Result<(), Failure> {
+    if repository.is_symlink() || !repository.is_absolute() {
+        return Err(Failure::task(format!(
+            "DW1-C {label} repository is not canonical"
+        )));
+    }
+    if current_revision(repository)? != expected {
+        return Err(Failure::task(format!(
+            "DW1-C {label} HEAD does not match the requested revision"
+        )));
+    }
+    let status = git_output(
+        repository,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    )?;
+    if !status.is_empty() {
+        return Err(Failure::task(format!("DW1-C {label} repository is dirty")));
+    }
+    Ok(())
 }
 
 fn verify_build_receipt(request: &Request, path: &Path) -> Result<(), Failure> {
