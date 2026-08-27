@@ -150,8 +150,8 @@ pub enum StartupBootfsSizeClass {
 #[cfg(feature = "wyr1b-test-evidence")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StartupMappingDiagnostic {
-    pub error: MappingPlanError,
-    pub size_class: StartupBootfsSizeClass,
+    error: MappingPlanError,
+    size_class: StartupBootfsSizeClass,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -186,20 +186,43 @@ const fn startup_bootfs_size_class(size: u64) -> StartupBootfsSizeClass {
     }
 }
 
-/// Selector-27 test evidence keeps mapping as low-byte category `0x11`. The
-/// preceding byte uses variant/size nibbles for startup, and bounded
-/// site/variant/size bit fields for post-startup mapping sites.
+#[cfg(feature = "wyr1b-test-evidence")]
+const fn mapping_failure_ordinal(
+    site: u32,
+    error: MappingPlanError,
+    size_class: StartupBootfsSizeClass,
+) -> u32 {
+    let outcome = match (error, size_class) {
+        (MappingPlanError::EmptyArchive, StartupBootfsSizeClass::Zero) => 0,
+        (MappingPlanError::ArchiveTooLarge, StartupBootfsSizeClass::OverMaximum) => 1,
+        (MappingPlanError::ArchiveTooLarge, StartupBootfsSizeClass::GarbageHigh) => 2,
+        _ => 0x1f,
+    };
+    if outcome == 0x1f {
+        outcome
+    } else {
+        site * 3 + outcome + 1
+    }
+}
+
+/// Selector-27 test evidence keeps supplementary mapping detail in the byte
+/// above the category. Its low five bits carry the claim-bearing ordinal that
+/// survives primordial application-summary compression: three reachable
+/// mapping outcomes for each of four ordered mapping sites produce `1..=12`.
 #[cfg(feature = "wyr1b-test-evidence")]
 #[must_use]
 pub const fn wyr1b_test_failure_application_status(error: &InitError) -> u32 {
-    let detail = match error {
+    let (detail, ordinal) = match error {
         InitError::StartupMapping(diagnostic) => {
             let variant = match diagnostic.error {
                 MappingPlanError::EmptyArchive => 1,
                 MappingPlanError::ArchiveTooLarge => 2,
                 MappingPlanError::RoundingOverflow => 3,
             };
-            (variant << 4) | diagnostic.size_class as u32
+            (
+                (variant << 4) | diagnostic.size_class as u32,
+                mapping_failure_ordinal(0, diagnostic.error, diagnostic.size_class),
+            )
         }
         InitError::OrdinaryMapping(diagnostic) => {
             let variant = match diagnostic.error {
@@ -207,11 +230,18 @@ pub const fn wyr1b_test_failure_application_status(error: &InitError) -> u32 {
                 MappingPlanError::ArchiveTooLarge => 2,
                 MappingPlanError::RoundingOverflow => 3,
             };
-            ((diagnostic.site as u32) << 6) | (variant << 3) | diagnostic.size_class as u32
+            (
+                ((diagnostic.site as u32) << 6) | (variant << 3) | diagnostic.size_class as u32,
+                mapping_failure_ordinal(
+                    diagnostic.site as u32,
+                    diagnostic.error,
+                    diagnostic.size_class,
+                ),
+            )
         }
-        _ => 0,
+        _ => (0, test_failure_category(error)),
     };
-    0xAF11_0000 | (detail << 8) | test_failure_category(error)
+    0xAF11_0000 | (detail << 8) | ordinal
 }
 
 /// Boot-lifetime owner of the fixed supervisor state and primordial authority.
@@ -3011,18 +3041,14 @@ mod native_cleanup_tests {
     #[test]
     fn wyr1b_startup_mapping_status_encodes_variant_and_size_class() {
         let cases = [
-            (MappingPlanError::EmptyArchive, 0, 0xAF11_1011),
-            (
-                MappingPlanError::ArchiveTooLarge,
-                wyrmroot_runtime::MAX_BOOTFS_LOGICAL_SIZE + 1,
-                0xAF11_2311,
-            ),
-            (MappingPlanError::RoundingOverflow, u64::MAX, 0xAF11_3411),
+            (0, 0xAF11_1001),
+            (wyrmroot_runtime::MAX_BOOTFS_LOGICAL_SIZE + 1, 0xAF11_2302),
+            (u64::MAX, 0xAF11_2403),
         ];
-        for (error, size, expected) in cases {
+        for (size, expected) in cases {
+            let error = MappingPlan::for_bootfs(size).unwrap_err();
             let status = wyr1b_test_failure_application_status(&startup_mapping_error(error, size));
             assert_eq!(status, expected);
-            assert_eq!(status & 0xff, 0x11);
         }
     }
 
@@ -3053,31 +3079,71 @@ mod native_cleanup_tests {
     #[cfg(feature = "wyr1b-test-evidence")]
     #[test]
     fn ordinary_mapping_status_encodes_site_variant_and_size_class() {
-        let cases = [
-            (
-                MappingDiagnosticSite::RoleRemap,
-                MappingPlanError::EmptyArchive,
-                0,
-                0xAF11_4811,
-            ),
-            (
-                MappingDiagnosticSite::JobDispatcher,
-                MappingPlanError::ArchiveTooLarge,
-                wyrmroot_runtime::MAX_BOOTFS_LOGICAL_SIZE + 1,
-                0xAF11_9311,
-            ),
-            (
-                MappingDiagnosticSite::RegistryReplacement,
-                MappingPlanError::RoundingOverflow,
-                u64::MAX,
-                0xAF11_DC11,
-            ),
+        let sites = [
+            MappingDiagnosticSite::RoleRemap,
+            MappingDiagnosticSite::JobDispatcher,
+            MappingDiagnosticSite::RegistryReplacement,
         ];
-        for (site, error, size, expected) in cases {
-            let status =
-                wyr1b_test_failure_application_status(&ordinary_mapping_error(site, error, size));
-            assert_eq!(status, expected);
-            assert_eq!(status & 0xff, 0x11);
+        let sizes = [0, wyrmroot_runtime::MAX_BOOTFS_LOGICAL_SIZE + 1, u64::MAX];
+        for (site_index, site) in sites.into_iter().enumerate() {
+            for (outcome_index, size) in sizes.into_iter().enumerate() {
+                let error = MappingPlan::for_bootfs(size).unwrap_err();
+                let expected_ordinal = 4 + (site_index as u32 * 3) + outcome_index as u32;
+                let status = wyr1b_test_failure_application_status(&ordinary_mapping_error(
+                    site, error, size,
+                ));
+                assert_eq!(status & 0x1f, expected_ordinal);
+            }
+        }
+    }
+
+    #[cfg(feature = "wyr1b-test-evidence")]
+    #[test]
+    fn mapping_ordinals_survive_kernel_application_summary_compression() {
+        let sizes = [0, wyrmroot_runtime::MAX_BOOTFS_LOGICAL_SIZE + 1, u64::MAX];
+        let mut statuses = [0_u32; 12];
+        for (index, size) in sizes.into_iter().enumerate() {
+            let error = MappingPlan::for_bootfs(size).unwrap_err();
+            statuses[index] =
+                wyr1b_test_failure_application_status(&startup_mapping_error(error, size));
+        }
+        for (site_index, site) in [
+            MappingDiagnosticSite::RoleRemap,
+            MappingDiagnosticSite::JobDispatcher,
+            MappingDiagnosticSite::RegistryReplacement,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (outcome_index, size) in sizes.into_iter().enumerate() {
+                let error = MappingPlan::for_bootfs(size).unwrap_err();
+                statuses[3 + site_index * 3 + outcome_index] =
+                    wyr1b_test_failure_application_status(&ordinary_mapping_error(
+                        site, error, size,
+                    ));
+            }
+        }
+        let mut seen = 0_u16;
+        for (index, status) in statuses.into_iter().enumerate() {
+            let ordinal = status & 0x1f;
+            let expected = index as u32 + 1;
+            assert_eq!(ordinal, expected);
+            assert_eq!(0x20 | ordinal, 0x21 + index as u32);
+            let bit = 1_u16 << ordinal;
+            assert_eq!(seen & bit, 0);
+            seen |= bit;
+        }
+        assert_eq!(seen, 0x1ffe);
+    }
+
+    #[cfg(feature = "wyr1b-test-evidence")]
+    #[test]
+    fn non_mapping_category_status_is_unchanged() {
+        for (error, expected) in [
+            (InitError::Cleanup, 0xAF11_0015),
+            (InitError::Accounting, 0xAF11_0016),
+        ] {
+            assert_eq!(wyr1b_test_failure_application_status(&error), expected);
         }
     }
 }

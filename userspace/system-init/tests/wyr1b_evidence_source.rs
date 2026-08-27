@@ -40,6 +40,9 @@ fn selector_27_startup_mapping_diagnostic_is_bound_to_the_initial_mapping_only()
 
 #[test]
 fn selector_27_ordinary_mapping_diagnostic_names_each_remaining_site() {
+    let production_lib = LIB.split("#[cfg(test)]").next().unwrap();
+    assert!(LIB.contains("low five bits carry the claim-bearing ordinal"));
+    assert!(LIB.contains("mapping_failure_ordinal(0, diagnostic.error"));
     assert!(LIB.contains("ordinary_mapping_error(MappingDiagnosticSite::RoleRemap, error, size)"));
     assert!(
         NATIVE
@@ -48,7 +51,7 @@ fn selector_27_ordinary_mapping_diagnostic_names_each_remaining_site() {
     assert!(NATIVE.contains(
         "ordinary_mapping_error(MappingDiagnosticSite::RegistryReplacement, error, size)"
     ));
-    assert_eq!(LIB.matches("ordinary_mapping_error(").count(), 3);
+    assert_eq!(production_lib.matches("ordinary_mapping_error(").count(), 2);
     assert_eq!(NATIVE.matches("ordinary_mapping_error(").count(), 2);
     assert!(!LIB.contains(".map_err(InitError::Mapping)?"));
     assert!(!NATIVE.contains(".map_err(InitError::Mapping)?"));
