@@ -3764,6 +3764,9 @@ pub(crate) struct CanonicalSelectorRun<'paths> {
 pub(crate) struct CanonicalSelectorOutcome {
     pub(crate) qemu_exit_status: Option<i32>,
     pub(crate) timed_out: bool,
+    pub(crate) cleanup_disposition: &'static str,
+    pub(crate) cleanup_killed: bool,
+    pub(crate) cleanup_reaped: bool,
 }
 
 pub(crate) fn run_canonical_one_cpu_selector(
@@ -3795,15 +3798,31 @@ pub(crate) fn run_canonical_one_cpu_selector(
             Failure::task(format!("could not launch canonical selector QEMU: {error}"))
         })?;
     match wait_bounded(&mut child, run.timeout_seconds) {
-        Ok(WaitOutcome::Exited(status)) => Ok(CanonicalSelectorOutcome {
-            qemu_exit_status: status.code(),
-            timed_out: false,
-        }),
-        Ok(WaitOutcome::TimedOut(_)) => Ok(CanonicalSelectorOutcome {
-            qemu_exit_status: None,
-            timed_out: true,
-        }),
-        Err(error) => Err(error.failure),
+        Ok(WaitOutcome::Exited(status)) => {
+            let cleanup = CleanupDisposition::exited();
+            Ok(CanonicalSelectorOutcome {
+                qemu_exit_status: status.code(),
+                timed_out: false,
+                cleanup_disposition: cleanup.name,
+                cleanup_killed: cleanup.killed,
+                cleanup_reaped: cleanup.reaped,
+            })
+        }
+        Ok(WaitOutcome::TimedOut(cleanup)) => Ok(timed_out_selector_outcome(cleanup)),
+        Err(error) => Err(Failure::task(format!(
+            "{}; cleanup_disposition={} cleanup_killed={} cleanup_reaped={}",
+            error.failure.message, error.cleanup.name, error.cleanup.killed, error.cleanup.reaped
+        ))),
+    }
+}
+
+fn timed_out_selector_outcome(cleanup: CleanupDisposition) -> CanonicalSelectorOutcome {
+    CanonicalSelectorOutcome {
+        qemu_exit_status: None,
+        timed_out: true,
+        cleanup_disposition: cleanup.name,
+        cleanup_killed: cleanup.killed,
+        cleanup_reaped: cleanup.reaped,
     }
 }
 
@@ -5987,6 +6006,19 @@ mod tests {
                 reaped: false,
             }
         );
+        let confirmed = timed_out_selector_outcome(cleanup_after_kill(true, true));
+        assert!(confirmed.timed_out);
+        assert_eq!(confirmed.cleanup_disposition, "killed_and_reaped");
+        assert!(confirmed.cleanup_killed);
+        assert!(confirmed.cleanup_reaped);
+        let unconfirmed =
+            timed_out_selector_outcome(cleanup_after_kill_failure(true, "reap_unconfirmed"));
+        assert_eq!(
+            unconfirmed.cleanup_disposition,
+            "kill_sent_reap_unconfirmed"
+        );
+        assert!(unconfirmed.cleanup_killed);
+        assert!(!unconfirmed.cleanup_reaped);
     }
 
     #[test]

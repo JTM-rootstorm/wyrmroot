@@ -14,15 +14,15 @@ Usage:
     cargo xtask test host [filter]
     cargo xtask test guest [filter]
     cargo xtask test integration wyr0 [default|smp] --request <wyr0-h-request.toml>
-    cargo xtask wyr1 image --request <wyr1-a-request.toml>
-    cargo xtask wyr1 inspect --request <wyr1-a-request.toml>
-    cargo xtask wyr1 prepare --request <wyr1-a-request.toml>
-    cargo xtask wyr1 evidence --request <wyr1-a-request.toml> --default <log> --smp <log>
-    cargo xtask wyr1b freeze --output <fresh-directory>
-    cargo xtask wyr1b image --request <wyr1-b-request.toml>
-    cargo xtask wyr1b inspect --request <wyr1-b-request.toml>
-    cargo xtask wyr1b run --request <wyr1-b-request.toml>
-    cargo xtask wyr1b evidence --request <wyr1-b-request.toml>
+    tools/pinned-cargo xtask wyr1 image --request <wyr1-a-request.toml>
+    tools/pinned-cargo xtask wyr1 inspect --request <wyr1-a-request.toml>
+    tools/pinned-cargo xtask wyr1 prepare --request <wyr1-a-request.toml>
+    tools/pinned-cargo xtask wyr1 evidence --request <wyr1-a-request.toml> --default <log> --smp <log>
+    tools/pinned-cargo xtask wyr1b freeze --output <fresh-directory>
+    tools/pinned-cargo xtask wyr1b image --request <wyr1-b-request.toml>
+    tools/pinned-cargo xtask wyr1b inspect --request <wyr1-b-request.toml>
+    tools/pinned-cargo xtask wyr1b run --request <wyr1-b-request.toml>
+    tools/pinned-cargo xtask wyr1b evidence --request <wyr1-b-request.toml>
     cargo xtask dw1b image --request <dw1-b-request.toml>
     cargo xtask dw1b image-rebuild --request <dw1-b-request.toml>
     cargo xtask dw1b freeze --output <directory>
@@ -605,7 +605,8 @@ mod tests {
             ])),
             Ok(Action::Wyr1Prepare("request.toml".into()))
         );
-        assert!(USAGE.contains("wyr1 prepare --request"));
+        assert!(USAGE.contains("tools/pinned-cargo xtask wyr1 prepare --request"));
+        assert!(!USAGE.contains("\n    cargo xtask wyr1 "));
     }
 
     #[test]
@@ -650,8 +651,16 @@ mod tests {
             ])),
             Ok(Action::Wyr1BEvidence("request.toml".into()))
         );
-        assert!(USAGE.contains("wyr1b freeze --output"));
-        assert!(USAGE.contains("wyr1b run --request"));
+        for command in [
+            "freeze --output",
+            "image --request",
+            "inspect --request",
+            "run --request",
+            "evidence --request",
+        ] {
+            assert!(USAGE.contains(&format!("tools/pinned-cargo xtask wyr1b {command}")));
+        }
+        assert!(!USAGE.contains("\n    cargo xtask wyr1b"));
     }
 
     #[test]

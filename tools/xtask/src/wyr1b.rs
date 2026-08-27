@@ -78,8 +78,12 @@ const OVMF_VARS_PATH: &str = "/usr/share/edk2/OvmfX64/OVMF_VARS.fd";
 const OVMF_VARS_SHA256: &str = "6ed987af3a3c155be71665f510eae3e007eda9b8b94afd59d45e91c4a11565cc";
 const NATIVE_TARGET: &str = "x86_64-unknown-wyrmroot";
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
+const KERNEL_COMMAND: &str = "tools/pinned-cargo target build --locked --offline --release --target x86_64-unknown-none --package deepwyrm-kernel --bin deepwyrm-kernel --features test-support";
 const MAX_REQUEST: usize = 64 * 1024;
 const MAX_EVIDENCE: usize = 16 * 1024 * 1024;
+const MAX_EXECUTABLE: usize = 64 * 1024 * 1024;
+const MAX_FIRMWARE: usize = 128 * 1024 * 1024;
+const MAX_BOOTFS: usize = crate::g3_image::IMAGE_BYTES as usize;
 const KEYS: &[&str] = &[
     "kind",
     "schema_version",
@@ -198,6 +202,9 @@ const RUN_RECEIPT_KEYS: &[&str] = &[
     "timeout_seconds",
     "qemu_exit_status",
     "timed_out",
+    "cleanup_disposition",
+    "cleanup_killed",
+    "cleanup_reaped",
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -255,6 +262,7 @@ pub struct Request {
     evidence_nonce: u64,
 }
 
+#[derive(Clone)]
 struct FrozenArtifacts {
     loader: Vec<u8>,
     bootstrap: Vec<u8>,
@@ -273,12 +281,121 @@ struct FrozenArtifacts {
     source_receipt: String,
 }
 
+#[derive(Clone)]
+struct Selector25Kernel {
+    scenario: &'static str,
+    nonce: u64,
+    kernel: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
 struct NativeSpec<'a> {
     label: &'a str,
     package: &'a str,
     binary: &'a str,
     features: &'a str,
     artifact: &'a str,
+}
+
+const NATIVE_SPECS: [NativeSpec<'static>; 13] = [
+    NativeSpec {
+        label: "bootstrap",
+        package: "wyrmroot-bootstrap",
+        binary: "wyrmroot-bootstrap",
+        features: "native-bootstrap",
+        artifact: "wyrmroot-bootstrap",
+    },
+    NativeSpec {
+        label: "init27",
+        package: "wyrmroot-system-init",
+        binary: "system-init",
+        features: "native-init,wyr1b-test-evidence",
+        artifact: "system-init",
+    },
+    NativeSpec {
+        label: "registryd",
+        package: "wyrmroot-registryd",
+        binary: "registryd",
+        features: "native-registryd",
+        artifact: "registryd",
+    },
+    NativeSpec {
+        label: "devmgr",
+        package: "wyrmroot-wyr1-bootstrap-stubs",
+        binary: "devmgr",
+        features: "native-stubs",
+        artifact: "devmgr",
+    },
+    NativeSpec {
+        label: "uart16550d",
+        package: "wyrmroot-wyr1-retained-stubs",
+        binary: "uart16550d",
+        features: "native-retained",
+        artifact: "uart16550d",
+    },
+    NativeSpec {
+        label: "consoled",
+        package: "wyrmroot-wyr1-retained-stubs",
+        binary: "consoled",
+        features: "native-retained",
+        artifact: "consoled",
+    },
+    NativeSpec {
+        label: "wyrmsh",
+        package: "wyrmroot-wyr1-retained-stubs",
+        binary: "wyrmsh",
+        features: "native-retained",
+        artifact: "wyrmsh",
+    },
+    NativeSpec {
+        label: "hello",
+        package: "wyrmroot-hello",
+        binary: "wyrmroot-job-hello",
+        features: "native-job-hello",
+        artifact: "wyrmroot-job-hello",
+    },
+    NativeSpec {
+        label: "publisher",
+        package: "wyrmroot-wyr1b-gate",
+        binary: "wyr1-b-publisher",
+        features: "native-gate",
+        artifact: "wyr1-b-publisher",
+    },
+    NativeSpec {
+        label: "client",
+        package: "wyrmroot-wyr1b-gate",
+        binary: "wyr1-b-client",
+        features: "native-gate",
+        artifact: "wyr1-b-client",
+    },
+    NativeSpec {
+        label: "init25",
+        package: "wyrmroot-system-init",
+        binary: "system-init",
+        features: "native-init,wyr1-test-evidence",
+        artifact: "system-init",
+    },
+    NativeSpec {
+        label: "registryd25",
+        package: "wyrmroot-wyr1-bootstrap-stubs",
+        binary: "registryd",
+        features: "native-stubs",
+        artifact: "registryd",
+    },
+    NativeSpec {
+        label: "registryd25-fail",
+        package: "wyrmroot-wyr1-bootstrap-stubs",
+        binary: "registryd-fail",
+        features: "native-stubs",
+        artifact: "registryd-fail",
+    },
+];
+
+fn native_command(spec: NativeSpec<'_>) -> String {
+    format!(
+        "cargo build --offline --locked --release --target {NATIVE_TARGET} --package {} --bin {} --features {}",
+        spec.package, spec.binary, spec.features
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -318,7 +435,7 @@ pub fn freeze(output: &Path) -> Result<String, Failure> {
     let build_root = output.join("build");
     fs::create_dir(&build_root)
         .map_err(|error| Failure::task(format!("could not create WYR1-B build root: {error}")))?;
-    let artifacts = build_frozen_artifacts(&build_root, &wyrmroot_revision)?;
+    let mut artifacts = build_frozen_artifacts(&build_root, &wyrmroot_revision)?;
     let nonce = 0xB001_B027_0000_0001;
     let generation_text = sha256::bytes_digest(
         format!(
@@ -339,9 +456,21 @@ pub fn freeze(output: &Path) -> Result<String, Failure> {
             ("DEEPWYRM_WYR1B_BOOTFS_MAX_PAGES", bootfs_pages.to_string()),
         ],
     )?;
+    let selector25_kernels = build_selector25_kernels(&deepwyrm, &build_root)?;
+    bind_selector25_lineage(
+        &mut artifacts.source_receipt,
+        &deepwyrm_revision,
+        &selector25_kernels,
+    );
+    verify_frozen_source_receipt(
+        &artifacts,
+        &selector25_kernels,
+        &deepwyrm_revision,
+        &wyrmroot_revision,
+    )?;
     let kernel_sha256 = sha256::bytes_digest(&kernel);
     let kernel_provenance = format!(
-        "kind = \"{KERNEL_PROVENANCE_KIND}\"\nschema_version = 1\nselector = \"{SELECTOR}\"\ntest_id = {TEST_ID}\ndeepwyrm_revision = \"{deepwyrm_revision}\"\nrust_revision = \"{ACCEPTED_RUST_REVISION}\"\nrustc_sha256 = \"{ACCEPTED_RUSTC_SHA256}\"\ncargo_sha256 = \"{ACCEPTED_CARGO_SHA256}\"\nrust_lld_sha256 = \"{ACCEPTED_RUST_LLD_SHA256}\"\ntoolchain_manifest_sha256 = \"{ACCEPTED_TOOLCHAIN_MANIFEST_SHA256}\"\ntoolchain_tree_sha256 = \"{ACCEPTED_TOOLCHAIN_TREE_SHA256}\"\nkernel_command = \"tools/pinned-cargo target build --locked --offline --release --target x86_64-unknown-none --package deepwyrm-kernel --bin deepwyrm-kernel --features test-support\"\nkernel_sha256 = \"{kernel_sha256}\"\nsymbols_sha256 = \"{kernel_sha256}\"\nDEEPWYRM_WYR1B_EVIDENCE_NONCE = \"{nonce:016X}\"\nDEEPWYRM_WYR1B_BOOTFS_MAX_PAGES = {bootfs_pages}\n"
+        "kind = \"{KERNEL_PROVENANCE_KIND}\"\nschema_version = 1\nselector = \"{SELECTOR}\"\ntest_id = {TEST_ID}\ndeepwyrm_revision = \"{deepwyrm_revision}\"\nrust_revision = \"{ACCEPTED_RUST_REVISION}\"\nrustc_sha256 = \"{ACCEPTED_RUSTC_SHA256}\"\ncargo_sha256 = \"{ACCEPTED_CARGO_SHA256}\"\nrust_lld_sha256 = \"{ACCEPTED_RUST_LLD_SHA256}\"\ntoolchain_manifest_sha256 = \"{ACCEPTED_TOOLCHAIN_MANIFEST_SHA256}\"\ntoolchain_tree_sha256 = \"{ACCEPTED_TOOLCHAIN_TREE_SHA256}\"\nkernel_command = \"{KERNEL_COMMAND}\"\nkernel_sha256 = \"{kernel_sha256}\"\nsymbols_sha256 = \"{kernel_sha256}\"\nDEEPWYRM_WYR1B_EVIDENCE_NONCE = \"{nonce:016X}\"\nDEEPWYRM_WYR1B_BOOTFS_MAX_PAGES = {bootfs_pages}\n"
     );
     let selector27 = output.join("selector27");
     let selector27_artifacts = selector27.join("artifacts");
@@ -389,11 +518,10 @@ pub fn freeze(output: &Path) -> Result<String, Failure> {
     let _ = inspect_recorded(&request_path)?;
     freeze_selector25_regressions(
         &output,
-        &build_root,
-        &deepwyrm,
         &deepwyrm_revision,
         &wyrmroot_revision,
         &artifacts,
+        &selector25_kernels,
         &ovmf_code,
         &ovmf_vars,
     )?;
@@ -558,103 +686,10 @@ fn build_frozen_artifacts(build_root: &Path, revision: &str) -> Result<FrozenArt
         },
     )?;
     let loader = read_cargo_build_output(&uefi.loader, "loader", 64 * 1024 * 1024)?;
-    let specs = [
-        NativeSpec {
-            label: "bootstrap",
-            package: "wyrmroot-bootstrap",
-            binary: "wyrmroot-bootstrap",
-            features: "native-bootstrap",
-            artifact: "wyrmroot-bootstrap",
-        },
-        NativeSpec {
-            label: "init27",
-            package: "wyrmroot-system-init",
-            binary: "system-init",
-            features: "native-init,wyr1b-test-evidence",
-            artifact: "system-init",
-        },
-        NativeSpec {
-            label: "registryd",
-            package: "wyrmroot-registryd",
-            binary: "registryd",
-            features: "native-registryd",
-            artifact: "registryd",
-        },
-        NativeSpec {
-            label: "devmgr",
-            package: "wyrmroot-wyr1-bootstrap-stubs",
-            binary: "devmgr",
-            features: "native-stubs",
-            artifact: "devmgr",
-        },
-        NativeSpec {
-            label: "uart16550d",
-            package: "wyrmroot-wyr1-retained-stubs",
-            binary: "uart16550d",
-            features: "native-retained",
-            artifact: "uart16550d",
-        },
-        NativeSpec {
-            label: "consoled",
-            package: "wyrmroot-wyr1-retained-stubs",
-            binary: "consoled",
-            features: "native-retained",
-            artifact: "consoled",
-        },
-        NativeSpec {
-            label: "wyrmsh",
-            package: "wyrmroot-wyr1-retained-stubs",
-            binary: "wyrmsh",
-            features: "native-retained",
-            artifact: "wyrmsh",
-        },
-        NativeSpec {
-            label: "hello",
-            package: "wyrmroot-hello",
-            binary: "wyrmroot-job-hello",
-            features: "native-job-hello",
-            artifact: "wyrmroot-job-hello",
-        },
-        NativeSpec {
-            label: "publisher",
-            package: "wyrmroot-wyr1b-gate",
-            binary: "wyr1-b-publisher",
-            features: "native-gate",
-            artifact: "wyr1-b-publisher",
-        },
-        NativeSpec {
-            label: "client",
-            package: "wyrmroot-wyr1b-gate",
-            binary: "wyr1-b-client",
-            features: "native-gate",
-            artifact: "wyr1-b-client",
-        },
-        NativeSpec {
-            label: "init25",
-            package: "wyrmroot-system-init",
-            binary: "system-init",
-            features: "native-init,wyr1-test-evidence",
-            artifact: "system-init",
-        },
-        NativeSpec {
-            label: "registryd25",
-            package: "wyrmroot-wyr1-bootstrap-stubs",
-            binary: "registryd",
-            features: "native-stubs",
-            artifact: "registryd",
-        },
-        NativeSpec {
-            label: "registryd25-fail",
-            package: "wyrmroot-wyr1-bootstrap-stubs",
-            binary: "registryd-fail",
-            features: "native-stubs",
-            artifact: "registryd-fail",
-        },
-    ];
-    let mut built = Vec::with_capacity(specs.len());
-    let mut commands = Vec::with_capacity(specs.len());
+    let mut built = Vec::with_capacity(NATIVE_SPECS.len());
+    let mut commands = Vec::with_capacity(NATIVE_SPECS.len());
     let mut init27_stack_report = None;
-    for spec in specs {
+    for spec in NATIVE_SPECS {
         toolchain.accepted().verify_unchanged()?;
         layout.verify_unchanged()?;
         let (bytes, command, stack_report) = build_native(
@@ -697,7 +732,7 @@ fn build_frozen_artifacts(build_root: &Path, revision: &str) -> Result<FrozenArt
     let rustc_sha256 = sha256::file_digest(&toolchain.accepted().rustc)
         .map_err(|error| Failure::task(format!("could not hash accepted rustc: {error}")))?;
     let mut source_receipt = format!(
-        "kind = \"{SOURCE_RECEIPT_KIND}\"\nschema_version = 2\nwyrmroot_revision = \"{revision}\"\nrust_revision = \"{ACCEPTED_RUST_REVISION}\"\nrustc_sha256 = \"{rustc_sha256}\"\ncargo_sha256 = \"{}\"\nrust_lld_sha256 = \"{}\"\ntoolchain_manifest_sha256 = \"{}\"\ntoolchain_tree_sha256 = \"{}\"\ncargo_lock_sha256 = \"{}\"\nloader_sha256 = \"{}\"\ninit27_stack_analysis_method = \"{STACK_ANALYSIS_METHOD}\"\ninit27_stack_metadata_flag = \"{STACK_METADATA_FLAG}\"\ninit27_stack_tool_path = \"{STACK_TOOL_PATH}\"\ninit27_stack_tool_version = \"{STACK_TOOL_VERSION}\"\ninit27_stack_tool_sha256 = \"{STACK_TOOL_SHA256}\"\ninit27_stack_budget_bytes = {STACK_BUDGET_BYTES}\ninit27_stack_result = \"pass\"\ninit27_stack_maximum_label = \"{}\"\ninit27_stack_maximum_bytes = {}\n",
+        "kind = \"{SOURCE_RECEIPT_KIND}\"\nschema_version = 3\nwyrmroot_revision = \"{revision}\"\nrust_revision = \"{ACCEPTED_RUST_REVISION}\"\nrustc_sha256 = \"{rustc_sha256}\"\ncargo_sha256 = \"{}\"\nrust_lld_sha256 = \"{}\"\ntoolchain_manifest_sha256 = \"{}\"\ntoolchain_tree_sha256 = \"{}\"\ncargo_lock_sha256 = \"{}\"\nloader_sha256 = \"{}\"\ninit27_stack_analysis_method = \"{STACK_ANALYSIS_METHOD}\"\ninit27_stack_metadata_flag = \"{STACK_METADATA_FLAG}\"\ninit27_stack_tool_path = \"{STACK_TOOL_PATH}\"\ninit27_stack_tool_version = \"{STACK_TOOL_VERSION}\"\ninit27_stack_tool_sha256 = \"{STACK_TOOL_SHA256}\"\ninit27_stack_budget_bytes = {STACK_BUDGET_BYTES}\ninit27_stack_result = \"pass\"\ninit27_stack_maximum_label = \"{}\"\ninit27_stack_maximum_bytes = {}\n",
         toolchain.accepted().cargo_sha256,
         toolchain.accepted().rust_lld_sha256,
         toolchain.accepted().manifest_sha256,
@@ -811,11 +846,7 @@ fn build_native(
     let stack_report = emit_stack_sizes
         .then(|| analyze_stack_budget(&artifact, &sha256::bytes_digest(&bytes)))
         .transpose()?;
-    Ok((
-        bytes,
-        format!("cargo {}", arguments.join(" ")),
-        stack_report,
-    ))
+    Ok((bytes, native_command(*spec), stack_report))
 }
 
 fn native_remap_flags(
@@ -1159,8 +1190,7 @@ fn build_kernel(
 }
 
 fn read_pinned_firmware(path: &str, expected: &str, label: &str) -> Result<Vec<u8>, Failure> {
-    let bytes = fs::read(path)
-        .map_err(|error| Failure::task(format!("could not read pinned {label}: {error}")))?;
+    let bytes = read_bounded(Path::new(path), label, MAX_FIRMWARE)?;
     if sha256::bytes_digest(&bytes) != expected {
         return Err(Failure::task(format!("pinned {label} identity mismatch")));
     }
@@ -1230,28 +1260,14 @@ fn render_request(
     text
 }
 
-#[allow(clippy::too_many_arguments)]
-fn freeze_selector25_regressions(
-    output: &Path,
-    build_root: &Path,
+fn build_selector25_kernels(
     deepwyrm: &Path,
-    deepwyrm_revision: &str,
-    wyrmroot_revision: &str,
-    artifacts: &FrozenArtifacts,
-    ovmf_code: &[u8],
-    ovmf_vars: &[u8],
-) -> Result<(), Failure> {
-    for (scenario, registry, nonce) in [
-        (
-            "normal",
-            artifacts.registryd25.as_slice(),
-            0xA025_0000_0000_0001u64,
-        ),
-        (
-            "degraded_recovery",
-            artifacts.registryd25_fail.as_slice(),
-            0xA025_0000_0000_0002u64,
-        ),
+    build_root: &Path,
+) -> Result<[Selector25Kernel; 2], Failure> {
+    let mut products = Vec::with_capacity(2);
+    for (scenario, nonce) in [
+        ("normal", 0xA025_0000_0000_0001u64),
+        ("degraded_recovery", 0xA025_0000_0000_0002u64),
     ] {
         let kernel = build_kernel(
             deepwyrm,
@@ -1263,21 +1279,128 @@ fn freeze_selector25_regressions(
                 ("DEEPWYRM_WYR1_EVIDENCE_SCENARIO", scenario.to_owned()),
             ],
         )?;
+        products.push(Selector25Kernel {
+            scenario,
+            nonce,
+            kernel,
+        });
+    }
+    products
+        .try_into()
+        .map_err(|_| Failure::task("WYR1-B selector-25 kernel count drifted"))
+}
+
+fn bind_selector25_lineage(
+    receipt: &mut String,
+    deepwyrm_revision: &str,
+    kernels: &[Selector25Kernel; 2],
+) {
+    receipt.push_str(&format!("deepwyrm_revision = \"{deepwyrm_revision}\"\n"));
+    for product in kernels {
+        let label = product.scenario;
+        receipt.push_str(&format!(
+            "selector25_{label}_kernel_command = \"{KERNEL_COMMAND}\"\nselector25_{label}_kernel_sha256 = \"{}\"\nselector25_{label}_evidence_nonce = \"{:016X}\"\nselector25_{label}_evidence_scenario = \"{}\"\n",
+            sha256::bytes_digest(&product.kernel), product.nonce, product.scenario
+        ));
+    }
+}
+
+fn verify_frozen_source_receipt(
+    artifacts: &FrozenArtifacts,
+    kernels: &[Selector25Kernel; 2],
+    deepwyrm_revision: &str,
+    wyrmroot_revision: &str,
+) -> Result<(), Failure> {
+    let values = parse_scalars(&artifacts.source_receipt)?;
+    if values.keys().cloned().collect::<BTreeSet<_>>() != source_receipt_keys() {
+        return Err(Failure::task(
+            "WYR1-B generated source receipt key set drifted",
+        ));
+    }
+    for (key, expected) in [
+        ("kind", SOURCE_RECEIPT_KIND),
+        ("schema_version", "3"),
+        ("deepwyrm_revision", deepwyrm_revision),
+        ("wyrmroot_revision", wyrmroot_revision),
+        ("rust_revision", ACCEPTED_RUST_REVISION),
+    ] {
+        if required(&values, key)? != expected {
+            return Err(Failure::task(format!(
+                "WYR1-B generated source receipt field {key} mismatch"
+            )));
+        }
+    }
+    for (spec, bytes) in NATIVE_SPECS.into_iter().zip([
+        artifacts.bootstrap.as_slice(),
+        artifacts.init27.as_slice(),
+        artifacts.registryd.as_slice(),
+        artifacts.devmgr.as_slice(),
+        artifacts.uart16550d.as_slice(),
+        artifacts.consoled.as_slice(),
+        artifacts.wyrmsh.as_slice(),
+        artifacts.hello.as_slice(),
+        artifacts.publisher.as_slice(),
+        artifacts.client.as_slice(),
+        artifacts.init25.as_slice(),
+        artifacts.registryd25.as_slice(),
+        artifacts.registryd25_fail.as_slice(),
+    ]) {
+        for (field, expected) in [
+            ("command", native_command(spec)),
+            ("sha256", sha256::bytes_digest(bytes)),
+        ] {
+            let key = format!("{}_{field}", spec.label);
+            if required(&values, &key)? != expected {
+                return Err(Failure::task(format!(
+                    "WYR1-B generated source receipt field {key} mismatch"
+                )));
+            }
+        }
+    }
+    if required(&values, "loader_sha256")? != sha256::bytes_digest(&artifacts.loader) {
+        return Err(Failure::task(
+            "WYR1-B generated source receipt loader hash mismatch",
+        ));
+    }
+    for product in kernels {
+        let key = format!("selector25_{}_kernel_sha256", product.scenario);
+        if required(&values, &key)? != sha256::bytes_digest(&product.kernel) {
+            return Err(Failure::task(format!(
+                "WYR1-B generated source receipt field {key} mismatch"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn freeze_selector25_regressions(
+    output: &Path,
+    deepwyrm_revision: &str,
+    wyrmroot_revision: &str,
+    artifacts: &FrozenArtifacts,
+    kernels: &[Selector25Kernel; 2],
+    ovmf_code: &[u8],
+    ovmf_vars: &[u8],
+) -> Result<(), Failure> {
+    for product in kernels {
+        let scenario = product.scenario;
+        let nonce = product.nonce;
+        let kernel = product.kernel.as_slice();
+        let registry = if scenario == "normal" {
+            artifacts.registryd25.as_slice()
+        } else {
+            artifacts.registryd25_fail.as_slice()
+        };
         let root = output.join("selector25").join(scenario);
         let input = root.join("artifacts");
         fs::create_dir_all(&input).map_err(|error| {
             Failure::task(format!("could not create selector-25 artifacts: {error}"))
         })?;
-        let provenance = format!(
-            "kind = \"wyrmroot-wyr1-a-regression-kernel-build\"\nschema_version = 1\nselector = \"{}\"\ntest_id = {}\nscenario = \"{scenario}\"\ndeepwyrm_revision = \"{deepwyrm_revision}\"\nwyrmroot_revision = \"{wyrmroot_revision}\"\nrust_revision = \"{ACCEPTED_RUST_REVISION}\"\nDEEPWYRM_WYR1_EVIDENCE_NONCE = \"{nonce:016X}\"\nDEEPWYRM_WYR1_EVIDENCE_SCENARIO = \"{scenario}\"\nkernel_sha256 = \"{}\"\n",
-            crate::wyr1::SELECTOR,
-            crate::wyr1::TEST_ID,
-            sha256::bytes_digest(&kernel),
-        );
         for (name, bytes) in [
             ("loader.efi", artifacts.loader.as_slice()),
-            ("deepwyrm.elf", kernel.as_slice()),
-            ("deepwyrm.symbols.elf", kernel.as_slice()),
+            ("deepwyrm.elf", kernel),
+            ("deepwyrm.symbols.elf", kernel),
             ("bootstrap.elf", artifacts.bootstrap.as_slice()),
             ("system-init.elf", artifacts.init25.as_slice()),
             ("registryd.elf", registry),
@@ -1285,7 +1408,7 @@ fn freeze_selector25_regressions(
             ("uart16550d.elf", artifacts.uart16550d.as_slice()),
             ("consoled.elf", artifacts.consoled.as_slice()),
             ("wyrmsh.elf", artifacts.wyrmsh.as_slice()),
-            ("provenance.toml", provenance.as_bytes()),
+            ("provenance.toml", artifacts.source_receipt.as_bytes()),
             ("OVMF_CODE.fd", ovmf_code),
             ("OVMF_VARS.fd", ovmf_vars),
         ] {
@@ -1545,7 +1668,7 @@ pub fn build(path: &Path) -> Result<String, Failure> {
     };
     let _ = crate::g3_image::build(&image_args)?;
     crate::g3_image::inspect(&image_args)?;
-    let esp = read(&request.esp, "ESP")?;
+    let esp = read_bounded(&request.esp, "ESP", MAX_BOOTFS)?;
     let receipt = receipt(ReceiptInput {
         request: &request,
         bootfs: &observed,
@@ -1721,6 +1844,7 @@ pub fn run(path: &Path) -> Result<String, Failure> {
     let snapshot_vars = request.run_directory.join("OVMF_VARS.fd");
     let snapshot_bootfs = request.run_directory.join("bootfs.img");
     let snapshot_receipt = request.run_directory.join("build-receipt.toml");
+    let snapshot_source_receipt = request.run_directory.join("wyr-source-build.toml");
     let stderr_log = request.run_directory.join("qemu.stderr.log");
     let esp_sha256 = receipt_value(&request, "esp_sha256")?;
     let bootfs_sha256 = receipt_value(&request, "bootfs_sha256")?;
@@ -1761,9 +1885,21 @@ pub fn run(path: &Path) -> Result<String, Failure> {
             None,
             "build receipt",
         ),
+        (
+            request.source_receipt.as_path(),
+            snapshot_source_receipt.as_path(),
+            Some(request.source_receipt_sha256.as_str()),
+            "source receipt",
+        ),
     ] {
         snapshot(source, destination, expected, label)?;
     }
+    let initial_code_sha256 = sha256::file_digest(&snapshot_code)
+        .map_err(|error| Failure::task(format!("could not hash run-local OVMF code: {error}")))?;
+    let initial_esp_sha256 = sha256::file_digest(&snapshot_esp)
+        .map_err(|error| Failure::task(format!("could not hash run-local ESP: {error}")))?;
+    let initial_vars_sha256 = sha256::file_digest(&snapshot_vars)
+        .map_err(|error| Failure::task(format!("could not hash run-local OVMF vars: {error}")))?;
     let outcome = crate::h_integration::run_canonical_one_cpu_selector(
         &crate::h_integration::CanonicalSelectorRun {
             ovmf_code: &snapshot_code,
@@ -1778,33 +1914,90 @@ pub fn run(path: &Path) -> Result<String, Failure> {
     let serial = read_bounded(&request.serial_log, "serial log", MAX_EVIDENCE)?;
     if sha256::file_digest(&snapshot_code)
         .map_err(|error| Failure::task(format!("could not rehash OVMF code: {error}")))?
-        != request.ovmf_code_sha256
+        != initial_code_sha256
         || sha256::file_digest(&snapshot_esp)
             .map_err(|error| Failure::task(format!("could not rehash booted ESP: {error}")))?
-            != receipt_value(&request, "esp_sha256")?
+            != initial_esp_sha256
     {
         return Err(Failure::task(
             "WYR1-B read-only firmware code or ESP changed during run",
         ));
     }
-    let _ = inspect_recorded(path)?;
+    for (live, snapshot_path, label, maximum) in [
+        (
+            request.path.as_path(),
+            snapshot_request.as_path(),
+            "request",
+            MAX_REQUEST,
+        ),
+        (
+            request.esp.as_path(),
+            snapshot_esp.as_path(),
+            "ESP",
+            MAX_BOOTFS,
+        ),
+        (
+            request.bootfs.as_path(),
+            snapshot_bootfs.as_path(),
+            "bootfs",
+            MAX_BOOTFS,
+        ),
+        (
+            request.receipt.as_path(),
+            snapshot_receipt.as_path(),
+            "build receipt",
+            MAX_REQUEST,
+        ),
+        (
+            request.source_receipt.as_path(),
+            snapshot_source_receipt.as_path(),
+            "source receipt",
+            MAX_REQUEST,
+        ),
+        (
+            request.ovmf_code.as_path(),
+            snapshot_code.as_path(),
+            "OVMF code",
+            MAX_FIRMWARE,
+        ),
+    ] {
+        compare_live_to_snapshot(live, snapshot_path, label, maximum)?;
+    }
+    if sha256::file_digest(&request.ovmf_vars)
+        .map_err(|error| Failure::task(format!("could not rehash live OVMF vars: {error}")))?
+        != initial_vars_sha256
+    {
+        return Err(Failure::task(
+            "WYR1-B OVMF vars template changed during canonical execution",
+        ));
+    }
+    let _ = inspect(path)?;
+    let snapshot_request_bytes = read_bounded(&snapshot_request, "request", MAX_REQUEST)?;
+    let snapshot_build_receipt = read_bounded(&snapshot_receipt, "build receipt", MAX_REQUEST)?;
+    let snapshot_bootfs_bytes = read_bounded(&snapshot_bootfs, "bootfs", MAX_BOOTFS)?;
     let receipt = format!(
-        "kind = \"{RUN_RECEIPT_KIND}\"\nschema_version = 1\nselector = \"{SELECTOR}\"\ntest_id = {TEST_ID}\nrequest_sha256 = \"{}\"\nbuild_receipt_sha256 = \"{}\"\nesp_sha256 = \"{}\"\nbootfs_sha256 = \"{}\"\nserial_log_sha256 = \"{}\"\novmf_code_sha256 = \"{}\"\novmf_vars_sha256 = \"{}\"\ntimeout_seconds = {}\nqemu_exit_status = {}\ntimed_out = {}\n",
-        request.request_sha256,
-        sha256::file_digest(&request.receipt)
-            .map_err(|error| Failure::task(format!("could not hash build receipt: {error}")))?,
-        sha256::file_digest(&snapshot_esp)
-            .map_err(|error| Failure::task(format!("could not hash booted ESP: {error}")))?,
-        sha256::file_digest(&snapshot_bootfs)
-            .map_err(|error| Failure::task(format!("could not hash run bootfs: {error}")))?,
+        "kind = \"{RUN_RECEIPT_KIND}\"\nschema_version = 1\nselector = \"{SELECTOR}\"\ntest_id = {TEST_ID}\nrequest_sha256 = \"{}\"\nbuild_receipt_sha256 = \"{}\"\nesp_sha256 = \"{}\"\nbootfs_sha256 = \"{}\"\nserial_log_sha256 = \"{}\"\novmf_code_sha256 = \"{}\"\novmf_vars_sha256 = \"{}\"\ntimeout_seconds = {}\nqemu_exit_status = {}\ntimed_out = {}\ncleanup_disposition = \"{}\"\ncleanup_killed = {}\ncleanup_reaped = {}\n",
+        sha256::bytes_digest(&snapshot_request_bytes),
+        sha256::bytes_digest(&snapshot_build_receipt),
+        initial_esp_sha256,
+        sha256::bytes_digest(&snapshot_bootfs_bytes),
         sha256::bytes_digest(&serial),
-        request.ovmf_code_sha256,
-        request.ovmf_vars_sha256,
+        initial_code_sha256,
+        initial_vars_sha256,
         request.timeout_seconds,
         outcome.qemu_exit_status.unwrap_or(-1),
         outcome.timed_out,
+        outcome.cleanup_disposition,
+        outcome.cleanup_killed,
+        outcome.cleanup_reaped,
     );
     write_new_file(&request.run_receipt, receipt.as_bytes())?;
+    if !outcome.cleanup_reaped {
+        return Err(Failure::task(format!(
+            "WYR1-B canonical QEMU cleanup is unconfirmed: {}",
+            outcome.cleanup_disposition
+        )));
+    }
     if outcome.timed_out {
         return Err(Failure::task(format!(
             "WYR1-B canonical QEMU timed out after {} seconds",
@@ -1818,6 +2011,22 @@ pub fn run(path: &Path) -> Result<String, Failure> {
         )));
     }
     parse_evidence(request.evidence_nonce, &verify_run_receipt(&request)?)
+}
+
+fn compare_live_to_snapshot(
+    live: &Path,
+    snapshot: &Path,
+    label: &str,
+    maximum: usize,
+) -> Result<(), Failure> {
+    let live = read_bounded(live, label, maximum)?;
+    let snapshot = read_bounded(snapshot, label, maximum)?;
+    if live != snapshot {
+        return Err(Failure::task(format!(
+            "WYR1-B {label} changed during canonical execution"
+        )));
+    }
+    Ok(())
 }
 
 fn verify_run_receipt(request: &Request) -> Result<Vec<u8>, Failure> {
@@ -1850,6 +2059,9 @@ fn verify_run_receipt(request: &Request) -> Result<Vec<u8>, Failure> {
         ("timeout_seconds", request.timeout_seconds.to_string()),
         ("qemu_exit_status", "33".to_owned()),
         ("timed_out", "false".to_owned()),
+        ("cleanup_disposition", "exited".to_owned()),
+        ("cleanup_killed", "false".to_owned()),
+        ("cleanup_reaped", "true".to_owned()),
     ] {
         if required(&values, key)? != expected {
             return Err(Failure::task(format!(
@@ -1911,17 +2123,45 @@ fn parse_evidence(evidence_nonce: u64, bytes: &[u8]) -> Result<String, Failure> 
     for (sequence, ((_, record), expected)) in records.iter().zip(expected_events).enumerate() {
         verify_record(record, evidence_nonce, sequence as u32, expected)?;
     }
-    let terminal = canonical_terminal(TEST_ID);
-    let terminal_offsets = find_all(bytes, &terminal);
-    if terminal_offsets.len() != 1 || terminal_offsets[0] < records.last().unwrap().0 + 96 {
+    let records_end = records.last().unwrap().0 + 96;
+    let mut terminals = Vec::new();
+    let mut offset = 0usize;
+    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        if line.starts_with(b"DWTEST1") {
+            terminals.push((offset, line));
+        }
+        offset = offset
+            .checked_add(line.len())
+            .ok_or_else(|| Failure::task("WYR1-B serial line offset overflow"))?;
+    }
+    let tail = &bytes[records_end..];
+    if tail.starts_with(b"DWTEST1") && !terminals.iter().any(|(offset, _)| *offset == records_end) {
+        let line_end = tail
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(tail.len(), |offset| offset + 1);
+        terminals.push((records_end, &tail[..line_end]));
+    }
+    terminals.sort_by_key(|(offset, _)| *offset);
+    if terminals.len() != 1 || terminals[0].0 < records_end {
         return Err(Failure::task(
             "WYR1-B requires one canonical selector-27 terminal after WRB1",
         ));
     }
+    verify_terminal_line(terminals[0].1)?;
     Ok(format!(
         "WYR1_B_EVIDENCE_PASS records={} test_id=27 detail=0 terminal=normal\n",
         expected_events.len()
     ))
+}
+
+fn verify_terminal_line(line: &[u8]) -> Result<(), Failure> {
+    if line != canonical_terminal(TEST_ID) {
+        return Err(Failure::task(
+            "WYR1-B DWTEST1 terminal is not the canonical selector-27 pass record",
+        ));
+    }
+    Ok(())
 }
 
 fn verify_archive(
@@ -2057,7 +2297,7 @@ fn verify_record(record: &[u8], nonce: u64, sequence: u32, event: u8) -> Result<
 fn parse_scalars(text: &str) -> Result<BTreeMap<String, String>, Failure> {
     let mut values = BTreeMap::new();
     for (line_no, raw) in text.lines().enumerate() {
-        let line = raw.split('#').next().unwrap_or("").trim();
+        let line = strip_comment(raw, line_no + 1)?.trim();
         if line.is_empty() {
             continue;
         }
@@ -2079,6 +2319,29 @@ fn parse_scalars(text: &str) -> Result<BTreeMap<String, String>, Failure> {
         }
     }
     Ok(values)
+}
+
+fn strip_comment(line: &str, line_number: usize) -> Result<&str, Failure> {
+    let mut quoted = false;
+    let mut escaped = false;
+    for (offset, character) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            '#' if !quoted => return Ok(&line[..offset]),
+            _ => {}
+        }
+    }
+    if quoted || escaped {
+        return Err(Failure::task(format!(
+            "WYR1-B line {line_number} has an unterminated quoted scalar"
+        )));
+    }
+    Ok(line)
 }
 fn exact_keys(
     values: &BTreeMap<String, String>,
@@ -2215,13 +2478,22 @@ fn read(path: &Path, label: &str) -> Result<Vec<u8>, Failure> {
     fs::read(path).map_err(|error| Failure::task(format!("could not read WYR1-B {label}: {error}")))
 }
 fn read_expected(path: &Path, label: &str, expected: &str) -> Result<Vec<u8>, Failure> {
-    let bytes = read(path, label)?;
+    let bytes = read_bounded(path, label, input_limit(label))?;
     if sha256::bytes_digest(&bytes) != expected {
         return Err(Failure::task(format!(
             "WYR1-B {label} does not match request-bound SHA-256"
         )));
     }
     Ok(bytes)
+}
+
+fn input_limit(label: &str) -> usize {
+    match label {
+        "request" | "build receipt" | "source receipt" | "kernel provenance" => MAX_REQUEST,
+        "OVMF code" | "OVMF vars" => MAX_FIRMWARE,
+        "bootfs" | "ESP" => MAX_BOOTFS,
+        _ => MAX_EXECUTABLE,
+    }
 }
 fn read_bounded(path: &Path, label: &str, maximum: usize) -> Result<Vec<u8>, Failure> {
     let metadata = fs::symlink_metadata(path)
@@ -2287,16 +2559,6 @@ fn parse_hex(bytes: &[u8]) -> Result<u64, Failure> {
 }
 fn encode_digest(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-fn find_all(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return Vec::new();
-    }
-    haystack
-        .windows(needle.len())
-        .enumerate()
-        .filter_map(|(offset, window)| (window == needle).then_some(offset))
-        .collect()
 }
 fn canonical_terminal(test_id: u32) -> Vec<u8> {
     let mut line = format!("DWTEST1|01|{test_id:08X}|00000000|").into_bytes();
@@ -2484,13 +2746,11 @@ fn verify_build_receipt(request: &Request, bootfs: &[u8]) -> Result<(), Failure>
     Ok(())
 }
 
-fn verify_source_receipt(request: &Request, receipt: &[u8]) -> Result<(), Failure> {
-    let text = std::str::from_utf8(receipt)
-        .map_err(|_| Failure::task("WYR1-B source receipt is not UTF-8"))?;
-    let values = parse_scalars(text)?;
+fn source_receipt_keys() -> BTreeSet<String> {
     let mut expected_keys = [
         "kind",
         "schema_version",
+        "deepwyrm_revision",
         "wyrmroot_revision",
         "rust_revision",
         "rustc_sha256",
@@ -2534,12 +2794,31 @@ fn verify_source_receipt(request: &Request, receipt: &[u8]) -> Result<(), Failur
     for (label, _) in DESIGNATED_STACK_FRAMES {
         expected_keys.insert(format!("init27_stack_{label}_bytes"));
     }
+    for scenario in ["normal", "degraded_recovery"] {
+        for field in [
+            "kernel_command",
+            "kernel_sha256",
+            "evidence_nonce",
+            "evidence_scenario",
+        ] {
+            expected_keys.insert(format!("selector25_{scenario}_{field}"));
+        }
+    }
+    expected_keys
+}
+
+fn verify_source_receipt(request: &Request, receipt: &[u8]) -> Result<(), Failure> {
+    let text = std::str::from_utf8(receipt)
+        .map_err(|_| Failure::task("WYR1-B source receipt is not UTF-8"))?;
+    let values = parse_scalars(text)?;
+    let expected_keys = source_receipt_keys();
     if values.keys().cloned().collect::<BTreeSet<_>>() != expected_keys {
         return Err(Failure::task("WYR1-B source receipt key set drifted"));
     }
     for (key, expected) in [
         ("kind", SOURCE_RECEIPT_KIND.to_owned()),
-        ("schema_version", "2".to_owned()),
+        ("schema_version", "3".to_owned()),
+        ("deepwyrm_revision", request.deepwyrm_revision.clone()),
         ("wyrmroot_revision", request.wyrmroot_revision.clone()),
         ("rust_revision", request.rust_revision.clone()),
         ("rustc_sha256", ACCEPTED_RUSTC_SHA256.to_owned()),
@@ -2558,23 +2837,11 @@ fn verify_source_receipt(request: &Request, receipt: &[u8]) -> Result<(), Failur
             "init27_stack_analysis_method",
             STACK_ANALYSIS_METHOD.to_owned(),
         ),
-        (
-            "init27_stack_metadata_flag",
-            STACK_METADATA_FLAG.to_owned(),
-        ),
+        ("init27_stack_metadata_flag", STACK_METADATA_FLAG.to_owned()),
         ("init27_stack_tool_path", STACK_TOOL_PATH.to_owned()),
-        (
-            "init27_stack_tool_version",
-            STACK_TOOL_VERSION.to_owned(),
-        ),
-        (
-            "init27_stack_tool_sha256",
-            STACK_TOOL_SHA256.to_owned(),
-        ),
-        (
-            "init27_stack_budget_bytes",
-            STACK_BUDGET_BYTES.to_string(),
-        ),
+        ("init27_stack_tool_version", STACK_TOOL_VERSION.to_owned()),
+        ("init27_stack_tool_sha256", STACK_TOOL_SHA256.to_owned()),
+        ("init27_stack_budget_bytes", STACK_BUDGET_BYTES.to_string()),
         ("init27_stack_result", "pass".to_owned()),
         ("bootstrap_sha256", request.bootstrap_sha256.clone()),
         ("init27_sha256", request.init_sha256.clone()),
@@ -2586,40 +2853,38 @@ fn verify_source_receipt(request: &Request, receipt: &[u8]) -> Result<(), Failur
         ("hello_sha256", request.hello_sha256.clone()),
         ("publisher_sha256", request.publisher_sha256.clone()),
         ("client_sha256", request.client_sha256.clone()),
-        (
-            "bootstrap_command",
-            "cargo build --offline --locked --release --target x86_64-unknown-wyrmroot --package wyrmroot-bootstrap --bin wyrmroot-bootstrap --features native-bootstrap".to_owned(),
-        ),
-        (
-            "init27_command",
-            "cargo build --offline --locked --release --target x86_64-unknown-wyrmroot --package wyrmroot-system-init --bin system-init --features native-init,wyr1b-test-evidence".to_owned(),
-        ),
-        (
-            "registryd_command",
-            "cargo build --offline --locked --release --target x86_64-unknown-wyrmroot --package wyrmroot-registryd --bin registryd --features native-registryd".to_owned(),
-        ),
-        (
-            "hello_command",
-            "cargo build --offline --locked --release --target x86_64-unknown-wyrmroot --package wyrmroot-hello --bin wyrmroot-job-hello --features native-job-hello".to_owned(),
-        ),
-        (
-            "publisher_command",
-            "cargo build --offline --locked --release --target x86_64-unknown-wyrmroot --package wyrmroot-wyr1b-gate --bin wyr1-b-publisher --features native-gate".to_owned(),
-        ),
-        (
-            "client_command",
-            "cargo build --offline --locked --release --target x86_64-unknown-wyrmroot --package wyrmroot-wyr1b-gate --bin wyr1-b-client --features native-gate".to_owned(),
-        ),
-        (
-            "init25_command",
-            "cargo build --offline --locked --release --target x86_64-unknown-wyrmroot --package wyrmroot-system-init --bin system-init --features native-init,wyr1-test-evidence".to_owned(),
-        ),
     ] {
         if required(&values, key)? != expected {
             return Err(Failure::task(format!(
                 "WYR1-B source receipt field {key} mismatch"
             )));
         }
+    }
+    for spec in NATIVE_SPECS {
+        let key = format!("{}_command", spec.label);
+        if required(&values, &key)? != native_command(spec) {
+            return Err(Failure::task(format!(
+                "WYR1-B source receipt field {key} mismatch"
+            )));
+        }
+    }
+    for (scenario, nonce) in [
+        ("normal", 0xA025_0000_0000_0001u64),
+        ("degraded_recovery", 0xA025_0000_0000_0002u64),
+    ] {
+        for (field, expected) in [
+            ("kernel_command", KERNEL_COMMAND.to_owned()),
+            ("evidence_nonce", format!("{nonce:016X}")),
+            ("evidence_scenario", scenario.to_owned()),
+        ] {
+            let key = format!("selector25_{scenario}_{field}");
+            if required(&values, &key)? != expected {
+                return Err(Failure::task(format!(
+                    "WYR1-B source receipt field {key} mismatch"
+                )));
+            }
+        }
+        let _ = digest(&values, &format!("selector25_{scenario}_kernel_sha256"))?;
     }
     let stack_report = analyze_stack_budget(&request.init, &request.init_sha256)?;
     for (label, size) in &stack_report.frames {
@@ -2649,6 +2914,146 @@ fn verify_source_receipt(request: &Request, receipt: &[u8]) -> Result<(), Failur
     if recorded_lock != current_lock {
         return Err(Failure::task(
             "WYR1-B source receipt Cargo.lock does not match current source",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn is_selector25_source_receipt(receipt: &[u8]) -> bool {
+    std::str::from_utf8(receipt).is_ok_and(|text| {
+        text.lines()
+            .any(|line| line.trim() == format!("kind = \"{SOURCE_RECEIPT_KIND}\""))
+    })
+}
+
+pub(crate) fn selector25_source_receipt_required(request: &crate::wyr1::Request) -> bool {
+    matches!(
+        (request.scenario, request.evidence_nonce),
+        (crate::wyr1::Scenario::Normal, 0xA025_0000_0000_0001u64)
+            | (
+                crate::wyr1::Scenario::DegradedRecovery,
+                0xA025_0000_0000_0002u64
+            )
+    )
+}
+
+pub(crate) fn verify_selector25_source_receipt(
+    request: &crate::wyr1::Request,
+    receipt: &[u8],
+) -> Result<(), Failure> {
+    let text = std::str::from_utf8(receipt)
+        .map_err(|_| Failure::task("WYR1-B selector-25 source receipt is not UTF-8"))?;
+    let values = parse_scalars(text)?;
+    if values.keys().cloned().collect::<BTreeSet<_>>() != source_receipt_keys() {
+        return Err(Failure::task(
+            "WYR1-B selector-25 source receipt key set drifted",
+        ));
+    }
+    for (key, expected) in [
+        ("kind", SOURCE_RECEIPT_KIND),
+        ("schema_version", "3"),
+        ("deepwyrm_revision", request.deepwyrm_revision.as_str()),
+        ("wyrmroot_revision", request.wyrmroot_revision.as_str()),
+        ("rust_revision", request.rust_revision.as_str()),
+        ("rustc_sha256", ACCEPTED_RUSTC_SHA256),
+        ("cargo_sha256", ACCEPTED_CARGO_SHA256),
+        ("rust_lld_sha256", ACCEPTED_RUST_LLD_SHA256),
+        (
+            "toolchain_manifest_sha256",
+            ACCEPTED_TOOLCHAIN_MANIFEST_SHA256,
+        ),
+        ("toolchain_tree_sha256", ACCEPTED_TOOLCHAIN_TREE_SHA256),
+        ("init27_stack_analysis_method", STACK_ANALYSIS_METHOD),
+        ("init27_stack_metadata_flag", STACK_METADATA_FLAG),
+        ("init27_stack_tool_path", STACK_TOOL_PATH),
+        ("init27_stack_tool_version", STACK_TOOL_VERSION),
+        ("init27_stack_tool_sha256", STACK_TOOL_SHA256),
+        ("init27_stack_result", "pass"),
+    ] {
+        if required(&values, key)? != expected {
+            return Err(Failure::task(format!(
+                "WYR1-B selector-25 source receipt field {key} mismatch"
+            )));
+        }
+    }
+    if required(&values, "init27_stack_budget_bytes")? != STACK_BUDGET_BYTES.to_string()
+        || number::<u64>(&values, "init27_stack_maximum_bytes")? > STACK_BUDGET_BYTES
+        || required(&values, "init27_stack_maximum_label")?.is_empty()
+    {
+        return Err(Failure::task(
+            "WYR1-B selector-25 source receipt stack metadata mismatch",
+        ));
+    }
+    for (label, _) in DESIGNATED_STACK_FRAMES {
+        if number::<u64>(&values, &format!("init27_stack_{label}_bytes"))? > STACK_BUDGET_BYTES {
+            return Err(Failure::task(
+                "WYR1-B selector-25 source receipt designated frame exceeds its cap",
+            ));
+        }
+    }
+    for spec in NATIVE_SPECS {
+        let key = format!("{}_command", spec.label);
+        if required(&values, &key)? != native_command(spec) {
+            return Err(Failure::task(format!(
+                "WYR1-B selector-25 source receipt field {key} mismatch"
+            )));
+        }
+        let _ = digest(&values, &format!("{}_sha256", spec.label))?;
+    }
+    let scenario = request.scenario.name();
+    let (registry_label, nonce) = match request.scenario {
+        crate::wyr1::Scenario::Normal => ("registryd25", 0xA025_0000_0000_0001u64),
+        crate::wyr1::Scenario::DegradedRecovery => ("registryd25-fail", 0xA025_0000_0000_0002u64),
+    };
+    for (label, artifact) in [
+        ("loader", &request.loader),
+        ("bootstrap", &request.bootstrap),
+        ("init25", &request.init),
+        (registry_label, &request.registryd),
+        ("devmgr", &request.devmgr),
+        ("uart16550d", &request.uart16550d),
+        ("consoled", &request.consoled),
+        ("wyrmsh", &request.wyrmsh),
+    ] {
+        let expected = required(&values, &format!("{label}_sha256"))?;
+        let observed = sha256::file_digest(artifact).map_err(|error| {
+            Failure::task(format!(
+                "could not hash selector-25 source artifact {label}: {error}"
+            ))
+        })?;
+        if expected != observed {
+            return Err(Failure::task(format!(
+                "WYR1-B selector-25 source artifact {label} mismatch"
+            )));
+        }
+    }
+    for artifact in [&request.kernel, &request.symbols] {
+        let observed = sha256::file_digest(artifact).map_err(|error| {
+            Failure::task(format!(
+                "could not hash selector-25 kernel artifact: {error}"
+            ))
+        })?;
+        if required(&values, &format!("selector25_{scenario}_kernel_sha256"))? != observed {
+            return Err(Failure::task(
+                "WYR1-B selector-25 kernel does not match shared source receipt",
+            ));
+        }
+    }
+    for (field, expected) in [
+        ("kernel_command", KERNEL_COMMAND.to_owned()),
+        ("evidence_nonce", format!("{nonce:016X}")),
+        ("evidence_scenario", scenario.to_owned()),
+    ] {
+        let key = format!("selector25_{scenario}_{field}");
+        if required(&values, &key)? != expected {
+            return Err(Failure::task(format!(
+                "WYR1-B selector-25 source receipt field {key} mismatch"
+            )));
+        }
+    }
+    if request.evidence_nonce != nonce {
+        return Err(Failure::task(
+            "WYR1-B selector-25 request nonce does not match shared source receipt",
         ));
     }
     Ok(())
@@ -2806,6 +3211,221 @@ mod tests {
             .collect()
     }
 
+    fn fixture_artifacts() -> (FrozenArtifacts, [Selector25Kernel; 2]) {
+        let bytes = |label: &str| format!("fixture-{label}\n").into_bytes();
+        let mut artifacts = FrozenArtifacts {
+            loader: bytes("loader"),
+            bootstrap: bytes("bootstrap"),
+            init27: bytes("init27"),
+            registryd: bytes("registryd"),
+            devmgr: bytes("devmgr"),
+            uart16550d: bytes("uart16550d"),
+            consoled: bytes("consoled"),
+            wyrmsh: bytes("wyrmsh"),
+            hello: bytes("hello"),
+            publisher: bytes("publisher"),
+            client: bytes("client"),
+            init25: bytes("init25"),
+            registryd25: bytes("registryd25"),
+            registryd25_fail: bytes("registryd25-fail"),
+            source_receipt: String::new(),
+        };
+        let kernels = [
+            Selector25Kernel {
+                scenario: "normal",
+                nonce: 0xA025_0000_0000_0001,
+                kernel: bytes("selector25-normal-kernel"),
+            },
+            Selector25Kernel {
+                scenario: "degraded_recovery",
+                nonce: 0xA025_0000_0000_0002,
+                kernel: bytes("selector25-degraded-kernel"),
+            },
+        ];
+        let deepwyrm_revision = "1".repeat(40);
+        let wyrmroot_revision = "2".repeat(40);
+        let mut values = source_receipt_keys()
+            .into_iter()
+            .map(|key| {
+                let value = if key.ends_with("_sha256") {
+                    "a".repeat(64)
+                } else if key.ends_with("_bytes") {
+                    "1".to_owned()
+                } else {
+                    "fixture".to_owned()
+                };
+                (key, value)
+            })
+            .collect::<BTreeMap<_, _>>();
+        for (key, value) in [
+            ("kind", SOURCE_RECEIPT_KIND.to_owned()),
+            ("schema_version", "3".to_owned()),
+            ("deepwyrm_revision", deepwyrm_revision),
+            ("wyrmroot_revision", wyrmroot_revision),
+            ("rust_revision", ACCEPTED_RUST_REVISION.to_owned()),
+            ("rustc_sha256", ACCEPTED_RUSTC_SHA256.to_owned()),
+            ("cargo_sha256", ACCEPTED_CARGO_SHA256.to_owned()),
+            ("rust_lld_sha256", ACCEPTED_RUST_LLD_SHA256.to_owned()),
+            (
+                "toolchain_manifest_sha256",
+                ACCEPTED_TOOLCHAIN_MANIFEST_SHA256.to_owned(),
+            ),
+            (
+                "toolchain_tree_sha256",
+                ACCEPTED_TOOLCHAIN_TREE_SHA256.to_owned(),
+            ),
+            ("loader_sha256", sha256::bytes_digest(&artifacts.loader)),
+            (
+                "init27_stack_analysis_method",
+                STACK_ANALYSIS_METHOD.to_owned(),
+            ),
+            ("init27_stack_metadata_flag", STACK_METADATA_FLAG.to_owned()),
+            ("init27_stack_tool_path", STACK_TOOL_PATH.to_owned()),
+            ("init27_stack_tool_version", STACK_TOOL_VERSION.to_owned()),
+            ("init27_stack_tool_sha256", STACK_TOOL_SHA256.to_owned()),
+            ("init27_stack_budget_bytes", STACK_BUDGET_BYTES.to_string()),
+            ("init27_stack_result", "pass".to_owned()),
+            (
+                "init27_stack_maximum_label",
+                "system_init::{closure#0}".to_owned(),
+            ),
+            ("init27_stack_maximum_bytes", "4096".to_owned()),
+        ] {
+            values.insert(key.to_owned(), value);
+        }
+        for (label, _) in DESIGNATED_STACK_FRAMES {
+            values.insert(format!("init27_stack_{label}_bytes"), "1024".to_owned());
+        }
+        for (spec, bytes) in NATIVE_SPECS.into_iter().zip([
+            artifacts.bootstrap.as_slice(),
+            artifacts.init27.as_slice(),
+            artifacts.registryd.as_slice(),
+            artifacts.devmgr.as_slice(),
+            artifacts.uart16550d.as_slice(),
+            artifacts.consoled.as_slice(),
+            artifacts.wyrmsh.as_slice(),
+            artifacts.hello.as_slice(),
+            artifacts.publisher.as_slice(),
+            artifacts.client.as_slice(),
+            artifacts.init25.as_slice(),
+            artifacts.registryd25.as_slice(),
+            artifacts.registryd25_fail.as_slice(),
+        ]) {
+            values.insert(format!("{}_command", spec.label), native_command(spec));
+            values.insert(
+                format!("{}_sha256", spec.label),
+                sha256::bytes_digest(bytes),
+            );
+        }
+        for product in &kernels {
+            for (field, value) in [
+                ("kernel_command", KERNEL_COMMAND.to_owned()),
+                ("kernel_sha256", sha256::bytes_digest(&product.kernel)),
+                ("evidence_nonce", format!("{:016X}", product.nonce)),
+                ("evidence_scenario", product.scenario.to_owned()),
+            ] {
+                values.insert(format!("selector25_{}_{}", product.scenario, field), value);
+            }
+        }
+        artifacts.source_receipt = values
+            .into_iter()
+            .map(|(key, value)| format!("{key} = \"{value}\"\n"))
+            .collect();
+        (artifacts, kernels)
+    }
+
+    fn write_fixture(path: &Path, bytes: &[u8]) -> PathBuf {
+        fs::write(path, bytes).unwrap();
+        path.to_path_buf()
+    }
+
+    fn selector25_request(
+        root: &Path,
+        scenario: crate::wyr1::Scenario,
+        artifacts: &FrozenArtifacts,
+        kernels: &[Selector25Kernel; 2],
+    ) -> crate::wyr1::Request {
+        fs::create_dir_all(root).unwrap();
+        let request_path = write_fixture(&root.join("request.toml"), b"selector25-request\n");
+        let kernel = match scenario {
+            crate::wyr1::Scenario::Normal => &kernels[0].kernel,
+            crate::wyr1::Scenario::DegradedRecovery => &kernels[1].kernel,
+        };
+        let registry = match scenario {
+            crate::wyr1::Scenario::Normal => &artifacts.registryd25,
+            crate::wyr1::Scenario::DegradedRecovery => &artifacts.registryd25_fail,
+        };
+        let file = |name: &str, bytes: &[u8]| write_fixture(&root.join(name), bytes);
+        let request = crate::wyr1::Request {
+            path: request_path.clone(),
+            request_sha256: sha256::file_digest(&request_path).unwrap(),
+            deepwyrm_revision: "1".repeat(40),
+            wyrmroot_revision: "2".repeat(40),
+            rust_revision: ACCEPTED_RUST_REVISION.to_owned(),
+            selector: crate::wyr1::SELECTOR.to_owned(),
+            test_id: crate::wyr1::TEST_ID,
+            scenario,
+            timeout_seconds: 120,
+            loader: file("loader.efi", &artifacts.loader),
+            kernel: file("deepwyrm.elf", kernel),
+            symbols: file("deepwyrm.symbols.elf", kernel),
+            bootstrap: file("bootstrap.elf", &artifacts.bootstrap),
+            init: file("system-init.elf", &artifacts.init25),
+            registryd: file("registryd.elf", registry),
+            devmgr: file("devmgr.elf", &artifacts.devmgr),
+            uart16550d: file("uart16550d.elf", &artifacts.uart16550d),
+            consoled: file("consoled.elf", &artifacts.consoled),
+            wyrmsh: file("wyrmsh.elf", &artifacts.wyrmsh),
+            rrc_manifest: file("rrc-a-v1.bin", b"manifest"),
+            bootfs: file("bootfs.img", b"bootfs"),
+            esp: file("esp.img", b"esp"),
+            provenance: file("provenance.toml", artifacts.source_receipt.as_bytes()),
+            ovmf_code: file("OVMF_CODE.fd", b"code"),
+            ovmf_vars_template: file("OVMF_VARS.fd", b"vars"),
+            run_directory: root.join("run"),
+            evidence_nonce: match scenario {
+                crate::wyr1::Scenario::Normal => kernels[0].nonce,
+                crate::wyr1::Scenario::DegradedRecovery => kernels[1].nonce,
+            },
+            receipt: root.join("build-receipt.toml"),
+        };
+        refresh_selector25_receipt(&request);
+        request
+    }
+
+    fn refresh_selector25_receipt(request: &crate::wyr1::Request) {
+        let manifest = sha256::file_digest(&request.rrc_manifest).unwrap();
+        let bootfs = sha256::file_digest(&request.bootfs).unwrap();
+        let receipt = crate::wyr1::receipt_text(
+            request,
+            &crate::wyr1::ProductIdentities {
+                manifest_expected: manifest.clone(),
+                manifest_observed: manifest,
+                bootfs_expected: bootfs.clone(),
+                bootfs_observed: bootfs,
+            },
+            &sha256::file_digest(&request.esp).unwrap(),
+            crate::wyr1::Profile::Default,
+        )
+        .unwrap();
+        fs::write(&request.receipt, receipt).unwrap();
+    }
+
+    fn replace_receipt_value(receipt: &str, key: &str, replacement: &str) -> String {
+        receipt
+            .lines()
+            .map(|line| {
+                if line.starts_with(&format!("{key} = ")) {
+                    format!("{key} = \"{replacement}\"")
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    }
+
     #[test]
     fn documented_pinned_launch_is_admitted_but_product_overrides_are_not() {
         let cargo_home = Path::new("/project/.tmp/cargo-home/offline-v1");
@@ -2856,6 +3476,109 @@ mod tests {
     }
 
     #[test]
+    fn generated_source_receipt_rejects_every_native_command_and_hash_mutation() {
+        let (mut artifacts, kernels) = fixture_artifacts();
+        let valid = artifacts.source_receipt.clone();
+        verify_frozen_source_receipt(&artifacts, &kernels, &"1".repeat(40), &"2".repeat(40))
+            .unwrap();
+        let wrong_hash = "f".repeat(64);
+        for spec in NATIVE_SPECS {
+            for field in ["command", "sha256"] {
+                artifacts.source_receipt = replace_receipt_value(
+                    &valid,
+                    &format!("{}_{field}", spec.label),
+                    if field == "command" {
+                        "cargo build --wrong-product"
+                    } else {
+                        &wrong_hash
+                    },
+                );
+                assert!(
+                    verify_frozen_source_receipt(
+                        &artifacts,
+                        &kernels,
+                        &"1".repeat(40),
+                        &"2".repeat(40),
+                    )
+                    .is_err(),
+                    "accepted mutated {}_{field}",
+                    spec.label
+                );
+            }
+        }
+        artifacts.source_receipt = valid;
+    }
+
+    #[test]
+    fn selector25_products_share_exact_source_lineage_but_reject_cross_scenario_substitution() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "wyr1b-selector25-lineage-{}-{unique}",
+            std::process::id()
+        ));
+        let (artifacts, kernels) = fixture_artifacts();
+        let normal = selector25_request(
+            &root.join("normal"),
+            crate::wyr1::Scenario::Normal,
+            &artifacts,
+            &kernels,
+        );
+        let degraded = selector25_request(
+            &root.join("degraded"),
+            crate::wyr1::Scenario::DegradedRecovery,
+            &artifacts,
+            &kernels,
+        );
+        for request in [&normal, &degraded] {
+            crate::wyr1::verify_receipt(request, crate::wyr1::Profile::Default).unwrap();
+            let bundles = crate::wyr1_vm::prepare(request).unwrap();
+            let handoff = fs::read_to_string(bundles.default).unwrap();
+            assert!(handoff.contains(&format!(
+                "provenance_sha256 = \"{}\"",
+                sha256::bytes_digest(artifacts.source_receipt.as_bytes())
+            )));
+        }
+        assert_eq!(
+            fs::read(&normal.provenance).unwrap(),
+            fs::read(&degraded.provenance).unwrap()
+        );
+
+        fs::write(&normal.registryd, &artifacts.registryd25_fail).unwrap();
+        refresh_selector25_receipt(&normal);
+        assert!(crate::wyr1::verify_receipt(&normal, crate::wyr1::Profile::Default).is_err());
+
+        fs::write(&normal.registryd, &artifacts.registryd25).unwrap();
+        let downgraded = replace_receipt_value(
+            &artifacts.source_receipt,
+            "kind",
+            "wyrmroot-wyr1-a-regression-kernel-build",
+        );
+        fs::write(&normal.provenance, downgraded).unwrap();
+        refresh_selector25_receipt(&normal);
+        assert_eq!(
+            crate::wyr1::verify_receipt(&normal, crate::wyr1::Profile::Default)
+                .unwrap_err()
+                .message,
+            "WYR1-B selector-25 regression request lacks its shared source receipt"
+        );
+
+        fs::write(&degraded.kernel, &kernels[0].kernel).unwrap();
+        fs::write(&degraded.symbols, &kernels[0].kernel).unwrap();
+        refresh_selector25_receipt(&degraded);
+        assert!(crate::wyr1::verify_receipt(&degraded, crate::wyr1::Profile::Default).is_err());
+
+        let mutated =
+            replace_receipt_value(&artifacts.source_receipt, "cargo_sha256", &"f".repeat(64));
+        fs::write(&degraded.provenance, mutated).unwrap();
+        refresh_selector25_receipt(&degraded);
+        assert!(crate::wyr1::verify_receipt(&degraded, crate::wyr1::Profile::Default).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn hard_linked_cargo_outputs_are_copied_into_owned_single_link_products() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2880,6 +3603,41 @@ mod tests {
         assert!(metadata.is_file());
         assert_eq!(metadata.nlink(), 1);
         assert_eq!(fs::read(&published).unwrap(), owned);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn quoted_hash_signs_round_trip_and_unquoted_comments_are_removed() {
+        let values = parse_scalars(
+            "label = \"system_init::{closure#0}\" # comment\nnumber = 64 # comment\n",
+        )
+        .unwrap();
+        assert_eq!(required(&values, "label"), Ok("system_init::{closure#0}"));
+        assert_eq!(required(&values, "number"), Ok("64"));
+        assert!(parse_scalars("label = \"unterminated#0\n").is_err());
+    }
+
+    #[test]
+    fn bounded_inputs_reject_oversize_before_hashing_and_snapshot_comparison_detects_mutation() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "wyr1b-bounded-input-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let live = root.join("live");
+        let snapshot_path = root.join("snapshot");
+        fs::write(&live, b"exact").unwrap();
+        fs::write(&snapshot_path, b"exact").unwrap();
+        assert!(compare_live_to_snapshot(&live, &snapshot_path, "request", 5).is_ok());
+        fs::write(&live, b"changed").unwrap();
+        assert!(compare_live_to_snapshot(&live, &snapshot_path, "request", 16).is_err());
+        assert!(read_expected(&live, "request", &sha256::bytes_digest(b"changed")).is_ok());
+        fs::write(&live, vec![0u8; MAX_REQUEST + 1]).unwrap();
+        assert!(read_expected(&live, "request", &sha256::bytes_digest(&[])).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2995,19 +3753,57 @@ mod tests {
         assert!(verify_record(&record, 1, 0, 1).is_err());
     }
 
-    #[test]
-    fn evidence_requires_fourteen_ordered_records_then_selector27_terminal() {
-        let nonce = 0xB001_B027_0000_0001;
+    fn valid_evidence(nonce: u64) -> Vec<u8> {
         let events = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 0xff];
         let mut serial = b"firmware diagnostic\n".to_vec();
         for (sequence, event) in events.into_iter().enumerate() {
             serial.extend_from_slice(&record(nonce, sequence as u32, event));
         }
         serial.extend_from_slice(&canonical_terminal(TEST_ID));
+        serial
+    }
+
+    #[test]
+    fn evidence_requires_fourteen_ordered_records_then_selector27_terminal() {
+        let nonce = 0xB001_B027_0000_0001;
+        let mut serial = valid_evidence(nonce);
         assert!(parse_evidence(nonce, &serial).is_ok());
         let offset = b"firmware diagnostic\n".len() + 3 * 96 + 34;
         serial[offset..offset + 2].copy_from_slice(b"05");
         assert!(parse_evidence(nonce, &serial).is_err());
+    }
+
+    #[test]
+    fn evidence_rejects_failure_duplicate_malformed_and_midline_terminals() {
+        let nonce = 0xB001_B027_0000_0001;
+        let valid = valid_evidence(nonce);
+        let terminal_offset = valid.len() - canonical_terminal(TEST_ID).len();
+
+        let mut failure_then_pass = valid[..terminal_offset].to_vec();
+        let mut failure = canonical_terminal(TEST_ID);
+        failure[8..10].copy_from_slice(b"00");
+        let checksum = fnv1a32(&failure[..29]);
+        failure[29..37].copy_from_slice(format!("{checksum:08X}").as_bytes());
+        failure_then_pass.extend_from_slice(&failure);
+        failure_then_pass.extend_from_slice(&canonical_terminal(TEST_ID));
+        assert!(parse_evidence(nonce, &failure_then_pass).is_err());
+
+        let mut duplicate = valid.clone();
+        duplicate.extend_from_slice(&canonical_terminal(TEST_ID));
+        assert!(parse_evidence(nonce, &duplicate).is_err());
+
+        let mut malformed = valid.clone();
+        malformed[terminal_offset + 37] = b'0';
+        assert!(parse_evidence(nonce, &malformed).is_err());
+
+        let mut midline = valid[..terminal_offset].to_vec();
+        midline.extend_from_slice(b"diagnostic-prefix:");
+        midline.extend_from_slice(&canonical_terminal(TEST_ID));
+        assert!(parse_evidence(nonce, &midline).is_err());
+
+        let mut wrong_id = valid;
+        wrong_id[terminal_offset + 18] = b'A';
+        assert!(parse_evidence(nonce, &wrong_id).is_err());
     }
 
     #[test]

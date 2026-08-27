@@ -1,5 +1,5 @@
-# Canonical selector-27 schema-6 acceptance request. `cargo xtask wyr1b
-# freeze --output <fresh-directory>` writes a complete request with exact
+# Canonical selector-27 schema-6 acceptance request. `tools/pinned-cargo xtask
+# wyr1b freeze --output <fresh-directory>` writes a complete request with exact
 # hashes; these placeholders are documentation, not an executable request.
 kind = "wyrmroot-wyr1-b-acceptance-request"
 schema_version = 6

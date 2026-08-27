@@ -974,6 +974,20 @@ pub fn verify_receipt(request: &Request, profile: Profile) -> Result<ProductIden
             check("manifest_sha256", &digest)?;
         }
     }
+    let provenance = fs::read(&request.provenance)
+        .map_err(|error| Failure::task(format!("could not read WYR1 provenance: {error}")))?;
+    if provenance.len() > MAX_REQUEST_BYTES {
+        return Err(Failure::task("WYR1 provenance exceeds its size limit"));
+    }
+    let has_selector25_lineage = crate::wyr1b::is_selector25_source_receipt(&provenance);
+    if crate::wyr1b::selector25_source_receipt_required(request) && !has_selector25_lineage {
+        return Err(Failure::task(
+            "WYR1-B selector-25 regression request lacks its shared source receipt",
+        ));
+    }
+    if has_selector25_lineage {
+        crate::wyr1b::verify_selector25_source_receipt(request, &provenance)?;
+    }
     Ok(ProductIdentities {
         manifest_expected: manifest_expected.to_owned(),
         manifest_observed,

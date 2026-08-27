@@ -174,6 +174,13 @@ contains the measured selector-27 bootfs, the kernel built with the matching
 `DEEPWYRM_WYR1B_EVIDENCE_NONCE` and
 `DEEPWYRM_WYR1B_BOOTFS_MAX_PAGES`, an independently inspected ESP, and exact
 source, kernel, product, and run receipts. Outputs and runs are one-shot.
+All request-bound artifacts are admitted through artifact-specific size caps
+before hashing. A run snapshots its request, source/build receipts, bootfs,
+firmware, and ESP into the fresh run directory; after QEMU exits it compares
+every immutable live input with the exact snapshot, repeats clean-source
+inspection, and renders the run receipt only from snapshot identities. Timeout
+receipts retain the exact kill/reap disposition, and an unconfirmed reap is a
+distinct failure rather than an ordinary timeout.
 The outer launcher's `CARGO` path and exact project `CARGO_HOME` are admitted
 only as host-launch state: native and UEFI product commands select the accepted
 product Cargo and canonical home explicitly, while the Deepwyrm launcher
@@ -198,8 +205,13 @@ The same freeze also creates disjoint
 `selector25/normal/request.toml` and
 `selector25/degraded_recovery/request.toml` products. Each has its own
 selector-25 kernel scenario and nonce. Prepare their paired default/SMP run
-bundles with `tools/pinned-cargo xtask wyr1 prepare --request <request>`; selector-27 media
-and evidence identities are never reused for those regressions.
+bundles with `tools/pinned-cargo xtask wyr1 prepare --request <request>`;
+selector-27 media and evidence identities are never reused for those
+regressions. Both selector-25 requests bind the byte-identical WYR1-B source
+receipt through their existing provenance input. WYR1 receipt inspection and
+VM handoff preparation therefore rejoin the accepted toolchain, every native
+build command, the selected scenario's native artifacts, kernel, nonce, and
+scenario before snapshotting that shared receipt into each handoff.
 
 The `native-bootstrap` binary is a no-std Wyrmroot target and must not be
 host-linked by `cargo test`. When changing its feature-selected library path,
