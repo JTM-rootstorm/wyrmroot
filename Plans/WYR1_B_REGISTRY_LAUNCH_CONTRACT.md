@@ -596,6 +596,18 @@ turn init into a general service manager.
   records the released endpoint before terminal reap so cleanup never closes it
   twice. This adds no WRLP message or authority and removes scheduler timing
   from the READY-and-exited publication decision.
+- A successful acceptance reports the job's post-release model state, not the
+  pre-release snapshot. The launch-Channel handle is already closed at that
+  point, so any caller that reaps directly from the acceptance result -- such as
+  a controller that closes and reaps immediately -- must see a zero
+  launch-Channel handle and can never close that endpoint a second time.
+- Preterminal reap observes the child's level-triggered EXITED task state over a
+  bounded budget of `max_attempts` rounds, each bounded by `ready_timeout_ns`. A
+  round that expires without the exit signal is not yet a cleanup failure and is
+  retried after a fresh task-state query; any other native wait failure ends the
+  attempt with cleanup bit 1 and retains the job. Terminal reap therefore does
+  not depend on one wait observing the exact EXITED transition, nor on the child
+  having been scheduled before the controller's first observation.
 - A fresh correlatable LAUNCH transaction is reserved before stream or launch
   policy validation. Semantic rejection aborts the invisible job reservation
   and retains the transaction in replay history, so retrying the same request

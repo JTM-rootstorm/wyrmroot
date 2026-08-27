@@ -1920,9 +1920,17 @@ where
                 .commit_forced_termination(loaded.job_id, resources)
                 .map_err(InitError::Wyr1BModel)?;
         }
-        return Ok(loaded);
+        return jobs
+            .jobs
+            .loaded_job(loaded.job_id)
+            .map_err(InitError::Wyr1BModel);
     }
-    Ok(loaded)
+    // The accepted job's retained resources are now owned by the model, which
+    // recorded the released launch Channel. Returning the pre-release snapshot
+    // would hand callers a closed launch-Channel handle to close again.
+    jobs.jobs
+        .loaded_job(loaded.job_id)
+        .map_err(InitError::Wyr1BModel)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1975,6 +1983,54 @@ fn classify_termination(
     })
 }
 
+/// Bounded preterminal observation rounds allowed for one child Process exit.
+///
+/// A scripted controller may close a child's launch Channel and reap immediately,
+/// so the child can still be pre-exit when the first observation runs. Each round
+/// is one `WYR0_I_SUPERVISION_POLICY.ready_timeout_ns` wait followed by a fresh
+/// level-triggered task-state query, which keeps the total bound explicit and
+/// removes the dependence on a single wait observing the exact EXITED transition.
+const JOB_EXIT_OBSERVATION_ROUNDS: u16 = WYR0_I_SUPERVISION_POLICY.max_attempts as u16;
+
+/// Observes one child Process reaching its level-triggered EXITED state within
+/// the bounded round budget above. `Err(())` means the caller must record
+/// cleanup bit 1 and leave the job retained for a later cleanup attempt.
+fn await_job_exit<S, W>(
+    system: &mut S,
+    waits: &mut W,
+    process: DwHandle,
+) -> Result<DwTaskTerminationInfoV1, ()>
+where
+    S: Wyr1BPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let mut info = waits.query_task_termination(process).map_err(|_| ())?;
+    let mut round = 0_u16;
+    while info.state != DW_TASK_STATE_EXITED {
+        if round == JOB_EXIT_OBSERVATION_ROUNDS {
+            return Err(());
+        }
+        round += 1;
+        let deadline = report_deadline(system).map_err(|_| ())?;
+        match waits.wait_many(
+            core::slice::from_ref(&DwWaitItemV1 {
+                handle: process,
+                signals: DW_SIGNAL_EXITED,
+            }),
+            deadline,
+        ) {
+            Ok(_) => {}
+            // A round that expires without the exit signal is not yet a cleanup
+            // failure: the child may simply not have been scheduled. Any other
+            // native wait failure stays fatal for this attempt.
+            Err(NativeError::Status(status)) if status == DW_STATUS_TIMED_OUT => {}
+            Err(_) => return Err(()),
+        }
+        info = waits.query_task_termination(process).map_err(|_| ())?;
+    }
+    Ok(info)
+}
+
 fn reap_job<S, W>(
     system: &mut S,
     waits: &mut W,
@@ -1995,56 +2051,15 @@ where
             if loaded.loaded.process.0 == 0 {
                 return Err(InitError::Accounting);
             }
-            let mut info = match waits.query_task_termination(loaded.loaded.process) {
+            let info = match await_job_exit(system, waits, loaded.loaded.process) {
                 Ok(info) => info,
-                Err(_) => {
+                Err(()) => {
                     jobs.jobs
                         .record_cleanup_bits(loaded.job_id, 1 << 1)
                         .map_err(InitError::Wyr1BModel)?;
                     return Err(InitError::Cleanup);
                 }
             };
-            if info.state != DW_TASK_STATE_EXITED {
-                let deadline = match report_deadline(system) {
-                    Ok(deadline) => deadline,
-                    Err(_) => {
-                        jobs.jobs
-                            .record_cleanup_bits(loaded.job_id, 1 << 1)
-                            .map_err(InitError::Wyr1BModel)?;
-                        return Err(InitError::Cleanup);
-                    }
-                };
-                if waits
-                    .wait_many(
-                        core::slice::from_ref(&DwWaitItemV1 {
-                            handle: loaded.loaded.process,
-                            signals: DW_SIGNAL_EXITED,
-                        }),
-                        deadline,
-                    )
-                    .is_err()
-                {
-                    jobs.jobs
-                        .record_cleanup_bits(loaded.job_id, 1 << 1)
-                        .map_err(InitError::Wyr1BModel)?;
-                    return Err(InitError::Cleanup);
-                }
-                info = match waits.query_task_termination(loaded.loaded.process) {
-                    Ok(info) => info,
-                    Err(_) => {
-                        jobs.jobs
-                            .record_cleanup_bits(loaded.job_id, 1 << 1)
-                            .map_err(InitError::Wyr1BModel)?;
-                        return Err(InitError::Cleanup);
-                    }
-                };
-            }
-            if info.state != DW_TASK_STATE_EXITED {
-                jobs.jobs
-                    .record_cleanup_bits(loaded.job_id, 1 << 1)
-                    .map_err(InitError::Wyr1BModel)?;
-                return Err(InitError::Cleanup);
-            }
             ControllerJobResult {
                 classification: classify_termination(&info)?.as_u32(),
                 application_code: info.application_code,
@@ -4012,6 +4027,109 @@ mod tests {
         }
     }
 
+    /// Drives one complete `JobV2` acceptance: the child publishes exact READY
+    /// for the reserved transaction and stays running until the caller marks it
+    /// exited, exactly like the live post-READY release wait.
+    struct AcceptedJobV2Waits {
+        transaction_id: u64,
+        exited: bool,
+    }
+
+    impl SupervisionPlatform for AcceptedJobV2Waits {
+        type Error = NativeError;
+
+        fn wait_many(
+            &mut self,
+            _items: &[DwWaitItemV1],
+            _deadline: DwDeadline,
+        ) -> Result<DwWaitResultV1, Self::Error> {
+            Ok(DwWaitResultV1 {
+                index: 0,
+                observed: DW_SIGNAL_READABLE,
+                ..DwWaitResultV1::default()
+            })
+        }
+
+        fn receive_channel(
+            &mut self,
+            _channel: DwHandle,
+            bytes: &mut [u8],
+            _handles: &mut [DwReceivedHandleInfoV1],
+        ) -> Result<ReceiveCounts, Self::Error> {
+            let size = wyrmroot_loader::launch::encode_ready_for_profile(
+                LaunchProfile::JobV2,
+                self.transaction_id,
+                bytes,
+            )
+            .map_err(|_| FAILURE)?;
+            Ok(ReceiveCounts {
+                bytes: size,
+                handles: 0,
+            })
+        }
+
+        fn query_task_termination(
+            &mut self,
+            _process: DwHandle,
+        ) -> Result<DwTaskTerminationInfoV1, Self::Error> {
+            Ok(DwTaskTerminationInfoV1 {
+                state: if self.exited {
+                    DW_TASK_STATE_EXITED
+                } else {
+                    deepwyrm_syscall::DW_TASK_STATE_RUNNING
+                },
+                reason: DW_TERMINATION_NORMAL_EXIT,
+                ..DwTaskTerminationInfoV1::default()
+            })
+        }
+    }
+
+    /// Models the live rapid-close scheduling gap: the controller reaps
+    /// immediately after releasing the launch Channel, so the child Process is
+    /// still pre-exit and each bounded observation round expires before the
+    /// child is scheduled.
+    struct ScheduledExitWaits {
+        waits: usize,
+        exit_after_waits: usize,
+    }
+
+    impl SupervisionPlatform for ScheduledExitWaits {
+        type Error = NativeError;
+
+        fn wait_many(
+            &mut self,
+            _items: &[DwWaitItemV1],
+            _deadline: DwDeadline,
+        ) -> Result<DwWaitResultV1, Self::Error> {
+            self.waits += 1;
+            Err(NativeError::Status(DW_STATUS_TIMED_OUT))
+        }
+
+        fn receive_channel(
+            &mut self,
+            _channel: DwHandle,
+            _bytes: &mut [u8],
+            _handles: &mut [DwReceivedHandleInfoV1],
+        ) -> Result<ReceiveCounts, Self::Error> {
+            Err(FAILURE)
+        }
+
+        fn query_task_termination(
+            &mut self,
+            _process: DwHandle,
+        ) -> Result<DwTaskTerminationInfoV1, Self::Error> {
+            Ok(DwTaskTerminationInfoV1 {
+                state: if self.waits >= self.exit_after_waits {
+                    DW_TASK_STATE_EXITED
+                } else {
+                    deepwyrm_syscall::DW_TASK_STATE_RUNNING
+                },
+                reason: DW_TERMINATION_NORMAL_EXIT,
+                ..DwTaskTerminationInfoV1::default()
+            })
+        }
+    }
+
     struct WaitFailureThenTerminal {
         query_count: usize,
     }
@@ -5199,6 +5317,170 @@ mod tests {
         let retained = jobs.jobs.loaded_job(launch.job_id).unwrap();
         let result = reap_job(&mut platform, &mut waits, &mut jobs, retained).unwrap();
         assert_eq!(result.cleanup_result, 1 << 1);
+        assert_eq!(jobs.jobs.live_jobs(), 0);
+    }
+
+    #[test]
+    fn accepted_launch_hands_back_released_state_so_a_scripted_orphan_reap_closes_once() {
+        let image = executable();
+        let (bootfs, generation) = job_policy_bootfs(&image);
+        let archive = Archive::new(&bootfs).unwrap();
+        let policy = PolicyView::from_bootfs(archive, generation).unwrap();
+        let mut platform = MockPlatform::new();
+        platform.fail_send = false;
+        platform.now = Some(1);
+        platform.task_group = Some(DwHandle(77));
+        let mut waits = AcceptedJobV2Waits {
+            transaction_id: reservation(1).transaction_id,
+            exited: false,
+        };
+        let mut loader = InitSendLoader::new();
+        loader.fail_init = false;
+        let mut jobs = JobDispatcher::new();
+        let owner = grant(EndpointKind::LaunchSession, 1, 1);
+        jobs.install_session(owner, DwHandle(90)).unwrap();
+        let authority = LoadAuthority {
+            parent_root: DwHandle(1),
+            bootfs: DwHandle(2),
+            task_group: DwHandle(3),
+        };
+        platform.inbound_len = wyrmroot_launch_proto::encode_launch(
+            reservation(1),
+            "bin/hello",
+            &["bin/hello"],
+            &[],
+            false,
+            &mut platform.inbound,
+        )
+        .unwrap();
+
+        let JobDispatchOutcome::Launched(accepted) = dispatch_one_job_request(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            authority,
+            Some(&policy),
+            &mut jobs,
+            DwHandle(90),
+            owner,
+        )
+        .unwrap() else {
+            panic!("an accepted launch must report its loaded job");
+        };
+
+        // The controller released and closed its launch-Channel endpoint before
+        // returning, so the value handed to a scripted orphan reap must not
+        // still name that handle.
+        assert_eq!(accepted.loaded.launch_channel, DwHandle(0));
+        assert_eq!(platform.close_count, 1);
+        let released = platform.closed[0];
+        assert_ne!(released, DwHandle(0));
+
+        waits.exited = true;
+        let result = reap_job(&mut platform, &mut waits, &mut jobs, accepted).unwrap();
+        assert_eq!(result.cleanup_result, 0);
+        assert_eq!(
+            platform.closed[1..platform.close_count]
+                .iter()
+                .filter(|handle| **handle == released)
+                .count(),
+            0
+        );
+        assert_eq!(jobs.jobs.live_jobs(), 0);
+    }
+
+    #[test]
+    fn late_scheduled_child_exit_is_reaped_within_the_bounded_round_budget() {
+        let mut platform = MockPlatform::new();
+        platform.now = Some(1);
+        let mut waits = ScheduledExitWaits {
+            waits: 0,
+            exit_after_waits: usize::from(WYR0_I_SUPERVISION_POLICY.max_attempts),
+        };
+        let mut jobs = JobDispatcher::new();
+        let owner = grant(EndpointKind::LaunchSession, 1, 1);
+        jobs.install_session(owner, DwHandle(90)).unwrap();
+        let launch = jobs.jobs.begin_launch(reservation(1)).unwrap();
+        jobs.jobs.commit_launch(launch, 101, 102, 103).unwrap();
+        let loaded = jobs.jobs.loaded_job(launch.job_id).unwrap();
+
+        let result = reap_job(&mut platform, &mut waits, &mut jobs, loaded).unwrap();
+        assert_eq!(result.cleanup_result, 0);
+        assert_eq!(
+            waits.waits,
+            usize::from(WYR0_I_SUPERVISION_POLICY.max_attempts)
+        );
+        assert_eq!(jobs.jobs.live_jobs(), 0);
+    }
+
+    #[test]
+    fn unscheduled_child_exit_fails_closed_after_the_bounded_round_budget() {
+        let mut platform = MockPlatform::new();
+        platform.now = Some(1);
+        let mut waits = ScheduledExitWaits {
+            waits: 0,
+            exit_after_waits: usize::MAX,
+        };
+        let mut jobs = JobDispatcher::new();
+        let owner = grant(EndpointKind::LaunchSession, 1, 1);
+        jobs.install_session(owner, DwHandle(90)).unwrap();
+        let launch = jobs.jobs.begin_launch(reservation(1)).unwrap();
+        jobs.jobs.commit_launch(launch, 101, 102, 103).unwrap();
+        let loaded = jobs.jobs.loaded_job(launch.job_id).unwrap();
+
+        assert_eq!(
+            reap_job(&mut platform, &mut waits, &mut jobs, loaded),
+            Err(InitError::Cleanup)
+        );
+        assert_eq!(waits.waits, usize::from(JOB_EXIT_OBSERVATION_ROUNDS));
+        assert_eq!(platform.close_count, 0);
+        assert_eq!(jobs.jobs.live_jobs(), 1);
+
+        let mut terminal = TerminalWaits;
+        let retained = jobs.jobs.loaded_job(launch.job_id).unwrap();
+        let result = reap_job(&mut platform, &mut terminal, &mut jobs, retained).unwrap();
+        assert_eq!(result.cleanup_result, 1 << 1);
+        assert_eq!(jobs.jobs.live_jobs(), 0);
+    }
+
+    #[test]
+    fn released_launch_channel_is_never_closed_again_by_a_scripted_orphan_reap() {
+        let mut platform = MockPlatform::new();
+        platform.now = Some(1);
+        let mut waits = ScheduledExitWaits {
+            waits: 0,
+            exit_after_waits: 1,
+        };
+        let mut jobs = JobDispatcher::new();
+        let owner = grant(EndpointKind::LaunchSession, 1, 1);
+        jobs.install_session(owner, DwHandle(90)).unwrap();
+        let launch = jobs.jobs.begin_launch(reservation(1)).unwrap();
+        jobs.jobs.commit_launch(launch, 101, 102, 103).unwrap();
+
+        // Exactly the accepted-launch tail: stage the release, then close the
+        // controller endpoint once.
+        let snapshot = jobs.jobs.loaded_job(launch.job_id).unwrap();
+        assert_eq!(snapshot.loaded.launch_channel, DwHandle(103));
+        jobs.jobs
+            .release_launch_channel(launch.job_id, 103)
+            .unwrap();
+        platform
+            .close_handle(snapshot.loaded.launch_channel)
+            .unwrap();
+
+        // The value `accept_reserved_launch` hands back to a scripted orphan
+        // caller must be the released model state, not the stale snapshot.
+        let accepted = jobs.jobs.loaded_job(launch.job_id).unwrap();
+        assert_eq!(accepted.loaded.launch_channel, DwHandle(0));
+        assert_eq!(accepted.loaded.process, DwHandle(101));
+        assert_eq!(accepted.task_group, 102);
+
+        let result = reap_job(&mut platform, &mut waits, &mut jobs, accepted).unwrap();
+        assert_eq!(result.cleanup_result, 0);
+        assert_eq!(
+            &platform.closed[..platform.close_count],
+            &[DwHandle(103), DwHandle(101), DwHandle(102)]
+        );
         assert_eq!(jobs.jobs.live_jobs(), 0);
     }
 
