@@ -16,8 +16,6 @@ extern crate std;
     feature = "dw1c-preemption-integration"
 ))]
 use deepwyrm_syscall::DW_SIGNAL_EXITED;
-#[cfg(feature = "dw1c-preemption-integration")]
-use deepwyrm_syscall::DwWaitItemV1;
 #[cfg(feature = "dw1b-preemption-integration")]
 use deepwyrm_syscall::{
     DW_OBJECT_TYPE_CHANNEL, DW_RIGHT_DUPLICATE, DW_RIGHT_INSPECT, DW_RIGHT_READ, DW_RIGHT_TRANSFER,
@@ -27,9 +25,15 @@ use deepwyrm_syscall::{
     feature = "i-capability-integration",
     feature = "dw1b-preemption-integration"
 ))]
-use deepwyrm_syscall::{DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DwSignals, DwWaitItemV1};
-#[cfg(feature = "i-capability-integration")]
-use deepwyrm_syscall::{DW_SIGNAL_WRITABLE, DW_STATUS_WOULD_BLOCK};
+use deepwyrm_syscall::{DW_SIGNAL_PEER_CLOSED, DwSignals};
+#[cfg(any(
+    feature = "i-capability-integration",
+    feature = "dw1b-preemption-integration",
+    feature = "dw1c-preemption-integration"
+))]
+use deepwyrm_syscall::{
+    DW_SIGNAL_READABLE, DW_SIGNAL_WRITABLE, DW_STATUS_WOULD_BLOCK, DwWaitItemV1,
+};
 use deepwyrm_syscall::{
     DW_TASK_STATE_EXITED, DwDeadline, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights,
     DwTaskTerminationInfoV1,
@@ -52,6 +56,8 @@ use wyrmroot_loader::{
     feature = "dw1c-preemption-integration"
 ))]
 use wyrmroot_runtime::await_child_ready_profile;
+#[cfg(feature = "dw1c-preemption-integration")]
+use wyrmroot_runtime::validate_successful_exit;
 use wyrmroot_runtime::{
     BOOTFS_EXPECTATION, BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, CapabilityValidationError,
     ExitObservedReadinessError, ExitValidationError, InitCapability, LOADER_TASK_GROUP_EXPECTATION,
@@ -942,7 +948,130 @@ fn run_dw1c_preemption<
             .process;
         index += 1;
     }
-    arm_dw1c_after_ready(system, processes)
+    arm_dw1c_after_ready(system, processes)?;
+    if let Err(error) = drive_dw1c_workload(system, loader, supervisor, actors, deadline) {
+        return Err(prefer_dw1c_cleanup(
+            error,
+            cleanup_dw1c_actors(loader, supervisor, actors, deadline),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "dw1c-preemption-integration")]
+fn drive_dw1c_workload<
+    System: Init0System,
+    Loader: LoaderPlatform<Error = NativeError>,
+    Supervisor: SupervisionPlatform<Error = NativeError>,
+>(
+    system: &mut System,
+    loader: &mut Loader,
+    supervisor: &mut Supervisor,
+    actors: [Option<LoadedProcess>; wyrmroot_runtime::DW1C_ACTOR_COUNT],
+    deadline: DwDeadline,
+) -> Result<(), Init0Error> {
+    let actor = |index: usize| actors[index].ok_or(Init0Error::MissingLoadedProcess);
+    let actor6 = actor(5)?;
+    wait_actor_signal(
+        supervisor,
+        actor6.launch_channel,
+        DW_SIGNAL_READABLE,
+        deadline,
+    )?;
+    let mut byte = [0_u8; 1];
+    let counts = supervisor
+        .receive_channel(actor6.launch_channel, &mut byte, &mut [])
+        .map_err(Init0Error::Native)?;
+    if counts.bytes != 1 || counts.handles != 0 {
+        return Err(Init0Error::ReceiveCounts(counts));
+    }
+
+    let actor7 = actor(6)?;
+    loop {
+        let payload = [0xA7_u8; 128];
+        match system.send_channel(actor7.launch_channel, &payload) {
+            Ok(()) => {}
+            Err(NativeError::Status(status)) if status == DW_STATUS_WOULD_BLOCK => break,
+            Err(error) => return Err(Init0Error::Native(error)),
+        }
+    }
+    wait_actor_signal(
+        supervisor,
+        actor7.launch_channel,
+        DW_SIGNAL_WRITABLE,
+        deadline,
+    )?;
+
+    let actor8 = actor(7)?;
+    loader
+        .process_terminate(actor8.process)
+        .map_err(Init0Error::Cleanup)?;
+    wait_actor_exit(supervisor, actor8.process, deadline)?;
+
+    let actor9 = actor(8)?;
+    wait_actor_exit(supervisor, actor9.process, deadline)?;
+    let actor10 = actor(9)?;
+    wait_actor_exit(supervisor, actor10.process, deadline)?;
+
+    // Actors 1..5 publish their progress claims directly to the selector
+    // collector.  The completion operation is the single controller commit
+    // after all ordered drive operations above have succeeded.
+    system
+        .complete_dw1c_workload(parse_dw1c_progress_digest())
+        .map_err(Init0Error::Native)
+}
+
+#[cfg(feature = "dw1c-preemption-integration")]
+const fn parse_dw1c_progress_digest() -> u64 {
+    let bytes = option_env!("DEEPWYRM_DW1C_PROGRESS_DIGEST");
+    let Some(text) = bytes else { return 0 };
+    let input = text.as_bytes();
+    let mut value = 0;
+    let mut index = 0;
+    while index < 16 {
+        value = (value << 4)
+            | match input[index] {
+                b'0'..=b'9' => (input[index] - b'0') as u64,
+                b'A'..=b'F' => (input[index] - b'A' + 10) as u64,
+                _ => 0,
+            };
+        index += 1;
+    }
+    value
+}
+
+#[cfg(feature = "dw1c-preemption-integration")]
+fn wait_actor_signal<Supervisor: SupervisionPlatform<Error = NativeError>>(
+    supervisor: &mut Supervisor,
+    handle: DwHandle,
+    signal: deepwyrm_syscall::DwSignals,
+    deadline: DwDeadline,
+) -> Result<(), Init0Error> {
+    let item = DwWaitItemV1 {
+        handle,
+        signals: signal,
+    };
+    let result = supervisor
+        .wait_many(core::slice::from_ref(&item), deadline)
+        .map_err(Init0Error::Native)?;
+    if result.index != 0 || result.observed.0 & signal.0 == 0 {
+        return Err(Init0Error::CapabilityEvidence);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "dw1c-preemption-integration")]
+fn wait_actor_exit<Supervisor: SupervisionPlatform<Error = NativeError>>(
+    supervisor: &mut Supervisor,
+    process: DwHandle,
+    deadline: DwDeadline,
+) -> Result<(), Init0Error> {
+    wait_actor_signal(supervisor, process, DW_SIGNAL_EXITED, deadline)?;
+    let info = supervisor
+        .query_task_termination(process)
+        .map_err(Init0Error::Native)?;
+    validate_successful_exit(&info)
+        .map_err(|error| Init0Error::Supervision(SupervisionError::Exit(error)))
 }
 
 #[cfg(feature = "dw1c-preemption-integration")]
