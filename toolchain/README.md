@@ -161,10 +161,10 @@ The selector-27 acceptance product is created only through the one-shot,
 request-bound pipeline:
 
 ```text
-cargo xtask wyr1b freeze --output /tmp/wyr1b-candidate-fresh
-cargo xtask wyr1b inspect --request /tmp/wyr1b-candidate-fresh/selector27/request.toml
-cargo xtask wyr1b run --request /tmp/wyr1b-candidate-fresh/selector27/request.toml
-cargo xtask wyr1b evidence --request /tmp/wyr1b-candidate-fresh/selector27/request.toml
+tools/pinned-cargo xtask wyr1b freeze --output /tmp/wyr1b-candidate-fresh
+tools/pinned-cargo xtask wyr1b inspect --request /tmp/wyr1b-candidate-fresh/selector27/request.toml
+tools/pinned-cargo xtask wyr1b run --request /tmp/wyr1b-candidate-fresh/selector27/request.toml
+tools/pinned-cargo xtask wyr1b evidence --request /tmp/wyr1b-candidate-fresh/selector27/request.toml
 ```
 
 Freeze requires exact clean Wyrmroot and canonical sibling Deepwyrm revisions,
@@ -179,5 +179,5 @@ The same freeze also creates disjoint
 `selector25/normal/request.toml` and
 `selector25/degraded_recovery/request.toml` products. Each has its own
 selector-25 kernel scenario and nonce. Prepare their paired default/SMP run
-bundles with `cargo xtask wyr1 prepare --request <request>`; selector-27 media
+bundles with `tools/pinned-cargo xtask wyr1 prepare --request <request>`; selector-27 media
 and evidence identities are never reused for those regressions.
