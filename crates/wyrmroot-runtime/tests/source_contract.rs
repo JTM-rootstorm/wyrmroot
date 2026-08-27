@@ -37,6 +37,29 @@ const BOUNDED_ACCOUNTING_SOURCE: &str = include_str!(concat!(
     "/src/bounded_accounting.rs"
 ));
 const MANIFEST: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
+const PRIMORDIAL_STARTUP_CONTRACT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../Plans/WYR0_D0_PRIMORDIAL_STARTUP_CONTRACT.md"
+));
+const CHILD_LOADING_CONTRACT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../Plans/WYR0_E0_USERSPACE_PROCESS_LOADING_CONTRACT.md"
+));
+const WYR1B_CONTRACT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../Plans/WYR1_B_REGISTRY_LAUNCH_CONTRACT.md"
+));
+
+#[test]
+fn coordinated_primordial_and_child_stack_targets_remain_separately_owned() {
+    assert!(PRIMORDIAL_STARTUP_CONTRACT.contains("Deepwyrm maps 128 KiB RW/NX"));
+    assert!(PRIMORDIAL_STARTUP_CONTRACT.contains("leaving 124 KiB"));
+    assert!(!PRIMORDIAL_STARTUP_CONTRACT.contains("Deepwyrm maps 64 KiB RW/NX"));
+    assert!(CHILD_LOADING_CONTRACT.contains("primordial stack target is also 128 KiB"));
+    assert!(WYR1B_CONTRACT.contains("production primordial stack\ntarget is also 128 KiB"));
+    assert!(CHILD_LOADING_CONTRACT.contains("implementation ownership"));
+    assert!(WYR1B_CONTRACT.contains("ownership remains separate"));
+}
 
 #[test]
 fn native_surface_uses_the_deepwyrm_owned_binding() {

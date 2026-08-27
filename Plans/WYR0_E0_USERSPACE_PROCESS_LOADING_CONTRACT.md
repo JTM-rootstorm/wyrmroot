@@ -19,7 +19,9 @@ independent repositories commit H0.
 
 **2026-08-27 child-stack revision:** the non-hard Wyrmroot child-stack target is
 128 KiB with the fixed top and immediately preceding 4 KiB guard preserved.
-Deepwyrm's separately governed primordial stack is unchanged.
+Deepwyrm's separately owned primordial stack target is also 128 KiB under the
+paired D0/G0 contract; this coordinated size does not merge construction or
+implementation ownership.
 
 ## 1. E0 disposition: compose the generated native ABI
 

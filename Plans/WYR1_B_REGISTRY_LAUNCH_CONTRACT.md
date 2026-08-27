@@ -16,7 +16,8 @@ POSIX descriptors/signals, D-Bus, or general dependency manager.
 
 The 2026-08-27 non-hard child-stack revision raises Wyrmroot-loaded child
 stacks to 128 KiB while preserving the fixed top, adjacent 4 KiB guard, and
-topmost startup blocks. It does not change Deepwyrm's primordial stack.
+topmost startup blocks. Deepwyrm's separately owned production primordial stack
+target is also 128 KiB under its paired contract; ownership remains separate.
 
 ## 1. Ownership and trust
 
