@@ -25,6 +25,7 @@ dw1b-preemption-integration = [
     "dep:wyrmroot-dw1b-preemption",
     "wyrmroot-runtime/dw1b-test-evidence",
 ]
+dw1c-preemption-integration = ["wyrmroot-runtime/dw1c-test-evidence"]
 
 [dependencies]
 deepwyrm-syscall.workspace = true

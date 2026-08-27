@@ -20,7 +20,8 @@ use deepwyrm_syscall::{
 };
 #[cfg(any(
     feature = "i-capability-integration",
-    feature = "dw1b-preemption-integration"
+    feature = "dw1b-preemption-integration",
+    feature = "dw1c-preemption-integration"
 ))]
 use deepwyrm_syscall::{DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DwSignals, DwWaitItemV1};
 #[cfg(feature = "i-capability-integration")]
@@ -83,7 +84,8 @@ static INIT0_PROFILE_MARKER: [u8; 29] = *b"WYRMINIT0-PROFILE-V1:ordinary";
     feature = "i2-stress-integration",
     not(any(
         feature = "i-capability-integration",
-        feature = "dw1b-preemption-integration"
+        feature = "dw1b-preemption-integration",
+        feature = "dw1c-preemption-integration"
     ))
 ))]
 #[used]
@@ -93,7 +95,8 @@ static INIT0_PROFILE_MARKER: [u8; 30] = *b"WYRMINIT0-PROFILE-V1:i2-stress";
     feature = "i-capability-integration",
     not(any(
         feature = "i2-stress-integration",
-        feature = "dw1b-preemption-integration"
+        feature = "dw1b-preemption-integration",
+        feature = "dw1c-preemption-integration"
     ))
 ))]
 #[used]
@@ -108,6 +111,17 @@ static INIT0_PROFILE_MARKER: [u8; 33] = *b"WYRMINIT0-PROFILE-V1:i-capability";
 ))]
 #[used]
 static INIT0_PROFILE_MARKER: [u8; 36] = *b"WYRMINIT0-PROFILE-V1:dw1b-preemption";
+
+#[cfg(all(
+    feature = "dw1c-preemption-integration",
+    not(any(
+        feature = "i2-stress-integration",
+        feature = "i-capability-integration",
+        feature = "dw1b-preemption-integration"
+    ))
+))]
+#[used]
+static INIT0_PROFILE_MARKER: [u8; 36] = *b"WYRMINIT0-PROFILE-V1:dw1c-preemption";
 
 /// Native operations used by the WYR0-G `init0` descendant transaction.
 pub trait Init0System {
