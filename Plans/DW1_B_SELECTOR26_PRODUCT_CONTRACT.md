@@ -45,11 +45,13 @@ no CodeView record, and no import directory. The freeze retains the audited
 debug EFI/PDB pair and normalized effective UEFI configuration and inspector
 reports for provenance, but those retained-debug files do not enter the ESP.
 
-The canonical `image`/`run` path independently rebuilds loader, bootstrap,
-init0, hello, CPU hog, and progress with the same isolated accepted workflow
-and requires byte-for-byte equality with the frozen inputs before it writes a
-product. It refuses pre-existing Wyrmroot outputs. Source-build receipt schema
-2 binds the clean source revision, Cargo lock, accepted toolchain identities,
+The canonical `image` path independently rebuilds loader, bootstrap, init0,
+hello, CPU hog, and progress with the same isolated accepted workflow and
+requires byte-for-byte equality with the frozen inputs before it writes a
+product. It refuses pre-existing Wyrmroot outputs. The canonical `run` path
+requires that completed product, revalidates it through the same strict
+inspection path before and after execution, and never rebuilds already-proven
+artifacts. Source-build receipt schema 2 binds the clean source revision, Cargo lock, accepted toolchain identities,
 generated Deep layout and policy hashes, normalized effective UEFI
 configuration digest, inspector and inspection-report hashes, exact separate
 release commands/profile, and all six production output hashes. The retained

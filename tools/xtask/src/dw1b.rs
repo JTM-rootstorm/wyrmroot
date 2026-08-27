@@ -495,7 +495,6 @@ fn inspect_canonical_esp(request: &Request) -> Result<(), Failure> {
 }
 
 pub fn run(request_path: &Path) -> Result<String, Failure> {
-    let _ = build(request_path)?;
     let (request, bytes) = execute_run(request_path, |run| {
         let outcome = crate::h_integration::run_canonical_one_cpu_selector(
             &crate::h_integration::CanonicalSelectorRun {
@@ -2348,6 +2347,20 @@ mod tests {
         let archive = Archive::new(&first).unwrap();
         assert_eq!(archive.lookup(b"system/init0").unwrap().data(), b"i");
         assert!(archive.lookup(b"system/init").is_err());
+    }
+
+    #[test]
+    fn canonical_run_reuses_the_inspected_product_without_rebuilding() {
+        let source = include_str!("dw1b.rs");
+        let body = source
+            .split_once("pub fn run(request_path: &Path)")
+            .expect("canonical run entry")
+            .1
+            .split_once("pub fn evidence(request_path: &Path)")
+            .expect("legacy evidence entry")
+            .0;
+        assert!(body.contains("execute_run(request_path"));
+        assert!(!body.contains("build(request_path"));
     }
 
     #[test]
