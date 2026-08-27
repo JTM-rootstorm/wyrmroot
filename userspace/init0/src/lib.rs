@@ -971,7 +971,19 @@ fn drive_dw1c_workload<
     deadline: DwDeadline,
 ) -> Result<(), Init0Error> {
     let actor = |index: usize| actors[index].ok_or(Init0Error::MissingLoadedProcess);
+    let go = [1_u8];
+    let mut index = 0;
+    while index < 5 {
+        let child = actor(index)?;
+        system
+            .send_channel(child.launch_channel, &go)
+            .map_err(Init0Error::Native)?;
+        index += 1;
+    }
     let actor6 = actor(5)?;
+    system
+        .send_channel(actor6.launch_channel, &go)
+        .map_err(Init0Error::Native)?;
     wait_actor_signal(
         supervisor,
         actor6.launch_channel,
@@ -987,6 +999,9 @@ fn drive_dw1c_workload<
     }
 
     let actor7 = actor(6)?;
+    system
+        .send_channel(actor7.launch_channel, &go)
+        .map_err(Init0Error::Native)?;
     loop {
         let payload = [0xA7_u8; 128];
         match system.send_channel(actor7.launch_channel, &payload) {
@@ -1003,14 +1018,23 @@ fn drive_dw1c_workload<
     )?;
 
     let actor8 = actor(7)?;
+    system
+        .send_channel(actor8.launch_channel, &go)
+        .map_err(Init0Error::Native)?;
     loader
         .process_terminate(actor8.process)
         .map_err(Init0Error::Cleanup)?;
     wait_actor_exit(supervisor, actor8.process, deadline)?;
 
     let actor9 = actor(8)?;
+    system
+        .send_channel(actor9.launch_channel, &go)
+        .map_err(Init0Error::Native)?;
     wait_actor_exit(supervisor, actor9.process, deadline)?;
     let actor10 = actor(9)?;
+    system
+        .send_channel(actor10.launch_channel, &go)
+        .map_err(Init0Error::Native)?;
     wait_actor_exit(supervisor, actor10.process, deadline)?;
 
     // Actors 1..5 publish their progress claims directly to the selector

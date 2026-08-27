@@ -52,6 +52,23 @@ fn payload_main(startup: StartupBlock<'_>) -> u32 {
     if send_channel(channel, &ready[..size], &[]).is_err() {
         return 0xD1C0_0005 | TOKEN as u32;
     }
+    let mut go = [0_u8; 1];
+    let gate = match wait_one(
+        channel,
+        DwSignals(DW_SIGNAL_READABLE.0),
+        DW_DEADLINE_INFINITE,
+    ) {
+        Ok(_) => {
+            let mut handles = [];
+            receive_channel(channel, &mut go, &mut handles)
+        }
+        Err(_) => return 0xD1C0_0006 | TOKEN as u32,
+    };
+    if gate.map_or(true, |counts| {
+        counts.bytes != 1 || counts.handles != 0 || go[0] != 1
+    }) {
+        return 0xD1C0_0007 | TOKEN as u32;
+    }
     if TOKEN <= 5 {
         if submit_dw1c_progress(TOKEN, 1, DIGEST).is_err() {
             return 0xD1C0_0100 | TOKEN as u32;
