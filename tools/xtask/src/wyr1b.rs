@@ -41,7 +41,7 @@ const ACCEPTED_TOOLCHAIN_MANIFEST_SHA256: &str =
 const ACCEPTED_TOOLCHAIN_TREE_SHA256: &str =
     "dce57d31def1f509ce537f96ae6b6dd320da11c9f321382cb93d142f558a32ca";
 const STACK_ANALYSIS_METHOD: &str =
-    "rustc-z-emit-stack-sizes+llvm-readobj-json-designated-frames-v1";
+    "rustc-z-emit-stack-sizes+llvm-readobj-json-all-named-frames-v2";
 const STACK_METADATA_FLAG: &str = "-Zemit-stack-sizes";
 const STACK_BUDGET_BYTES: u64 = 32 * 1024;
 const STACK_TOOL_PATH: &str = "/usr/lib/llvm/22/bin/llvm-readobj";
@@ -1053,8 +1053,22 @@ fn parse_json_string(bytes: &[u8], cursor: &mut usize) -> Result<String, Failure
 
 fn assess_stack_budget(sizes: &BTreeMap<String, u64>) -> Result<StackBudgetReport, Failure> {
     let mut frames = BTreeMap::new();
-    let mut maximum_label = String::new();
-    let mut maximum_bytes = 0;
+    let mut maximum = None;
+    for (symbol, size) in sizes {
+        if *size > STACK_BUDGET_BYTES {
+            return Err(Failure::task(format!(
+                "WYR1-B init27 named frame {symbol} uses {size} bytes, exceeding the {STACK_BUDGET_BYTES}-byte preflight cap"
+            )));
+        }
+        if maximum
+            .as_ref()
+            .is_none_or(|(_, maximum_bytes)| size > maximum_bytes)
+        {
+            maximum = Some((symbol.clone(), *size));
+        }
+    }
+    let (maximum_label, maximum_bytes) = maximum
+        .ok_or_else(|| Failure::task("WYR1-B init27 stack metadata contains no named frames"))?;
     for (label, prefix) in DESIGNATED_STACK_FRAMES {
         let matches = sizes
             .iter()
@@ -1072,15 +1086,6 @@ fn assess_stack_budget(sizes: &BTreeMap<String, u64>) -> Result<StackBudgetRepor
             )));
         }
         let size = *matches[0].1;
-        if size > STACK_BUDGET_BYTES {
-            return Err(Failure::task(format!(
-                "WYR1-B init27 designated frame {label} uses {size} bytes, exceeding the {STACK_BUDGET_BYTES}-byte preflight cap"
-            )));
-        }
-        if size > maximum_bytes {
-            maximum_label = (*label).to_owned();
-            maximum_bytes = size;
-        }
         frames.insert((*label).to_owned(), size);
     }
     Ok(StackBudgetReport {
@@ -2902,14 +2907,22 @@ mod tests {
     }
 
     #[test]
-    fn stack_budget_requires_unique_designated_frames_below_cap() {
-        let admitted = designated_stack_sizes(STACK_BUDGET_BYTES);
+    fn stack_budget_caps_every_named_frame_and_requires_designated_roots() {
+        let mut admitted = designated_stack_sizes(STACK_BUDGET_BYTES - 1);
+        admitted.insert(
+            "non_designated_global_maximum".to_owned(),
+            STACK_BUDGET_BYTES,
+        );
         let report = assess_stack_budget(&admitted).unwrap();
         assert_eq!(report.maximum_bytes, STACK_BUDGET_BYTES);
+        assert_eq!(report.maximum_label, "non_designated_global_maximum");
         assert_eq!(report.frames.len(), DESIGNATED_STACK_FRAMES.len());
 
         let mut oversized = admitted.clone();
-        oversized.insert("__wyrmroot_native_main".to_owned(), STACK_BUDGET_BYTES + 1);
+        oversized.insert(
+            "non_designated_oversized".to_owned(),
+            STACK_BUDGET_BYTES + 1,
+        );
         assert!(assess_stack_budget(&oversized).is_err());
 
         let mut missing = admitted.clone();

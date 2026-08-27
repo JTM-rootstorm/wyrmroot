@@ -182,16 +182,17 @@ home.
 
 Selector 27 additionally compiles `system-init` with rustc's
 `-Zemit-stack-sizes` metadata and fails the freeze unless pinned LLVM 22.1.8
-`llvm-readobj` can decode one unambiguous stack-size entry for each designated
-native main, product activation, registry/job gate, and resident control-loop
-frame. Every designated frame must be at most 32 KiB. The source receipt binds
-the compiler flag, analysis method, exact LLVM path/version/hash, cap, each
-frame size, and maximum observed designated frame; later inspect/run entry
-points repeat the artifact analysis. This is a conservative artifact-level
-per-frame preflight, not an aggregate call-chain proof. Because startup ABI v2
-leaves 44 KiB of ordinary stack, selector-27 acceptance still requires the
-runtime's exact-chain stack low-water/spare evidence; the tooling receipt does
-not substitute for it.
+`llvm-readobj` can decode the compiler-emitted stack sizes. Every named frame
+must be at most 32 KiB, and the designated native main, product activation,
+registry/job gate, and resident control-loop frames must each resolve to one
+unambiguous entry. The source receipt binds the compiler flag, analysis method,
+exact LLVM path/version/hash, cap, each designated frame size, and the global
+maximum named frame; later inspect/run entry points repeat the artifact
+analysis. This is a conservative artifact-level per-frame preflight, not an
+aggregate call-chain proof. The exact selector-27 execution together with
+Deepwyrm's bounded-RSP enforcement and 64 KiB RW-NX stack/absent-guard
+invariant is the exercised-chain runtime proof; the tooling receipt does not
+substitute for it.
 
 The same freeze also creates disjoint
 `selector25/normal/request.toml` and
