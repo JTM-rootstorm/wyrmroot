@@ -1,7 +1,10 @@
 use core::panic::PanicInfo;
 use deepwyrm_syscall as _;
-use wyrmroot_loader as _;
-use wyrmroot_runtime::{StartupBlock, panic_abort, submit_dw1c_progress};
+use deepwyrm_syscall::{DW_DEADLINE_INFINITE, DW_SIGNAL_READABLE, DW_SIGNAL_WRITABLE, DwSignals};
+use wyrmroot_loader::launch::{HEADER_BYTES, LaunchProfile, encode_ready_for_profile, parse_init};
+use wyrmroot_runtime::{
+    StartupBlock, panic_abort, receive_channel, send_channel, submit_dw1c_progress, wait_one,
+};
 
 const DIGEST: u64 = parse_hex(env!("DEEPWYRM_DW1C_PROGRESS_DIGEST"));
 
@@ -9,16 +12,90 @@ const fn parse_hex(text: &str) -> u64 {
     let bytes = text.as_bytes();
     let mut index = 0;
     let mut value = 0_u64;
-    while index < 16 { value = (value << 4) | hex(bytes[index]); index += 1; }
+    while index < 16 {
+        value = (value << 4) | hex(bytes[index]);
+        index += 1;
+    }
     value
 }
-const fn hex(byte: u8) -> u64 { match byte { b'0'..=b'9' => (byte - b'0') as u64, b'A'..=b'F' => (byte - b'A' + 10) as u64, _ => panic!("invalid digest") } }
+const fn hex(byte: u8) -> u64 {
+    match byte {
+        b'0'..=b'9' => (byte - b'0') as u64,
+        b'A'..=b'F' => (byte - b'A' + 10) as u64,
+        _ => panic!("invalid digest"),
+    }
+}
 
-fn payload_main(_: StartupBlock<'_>) -> u32 {
-    if TOKEN <= 5 { if submit_dw1c_progress(TOKEN, 1, DIGEST).is_err() { return 0xD1C0_0100 | TOKEN as u32; } }
-    if TOKEN >= 9 { return 0; }
-    loop { core::hint::spin_loop(); }
+fn payload_main(startup: StartupBlock<'_>) -> u32 {
+    let channel = startup.bootstrap_channel().as_abi();
+    let mut header = [0_u8; HEADER_BYTES];
+    let mut handles = [];
+    let counts = match receive_channel(channel, &mut header, &mut handles) {
+        Ok(value) => value,
+        Err(_) => return 0xD1C0_0001 | TOKEN as u32,
+    };
+    if counts.bytes != HEADER_BYTES || counts.handles != 0 {
+        return 0xD1C0_0002 | TOKEN as u32;
+    }
+    let init = match parse_init(LaunchProfile::Hello, &header, &[]) {
+        Ok(value) => value,
+        Err(_) => return 0xD1C0_0003 | TOKEN as u32,
+    };
+    let mut ready = [0_u8; HEADER_BYTES];
+    let size = match encode_ready_for_profile(LaunchProfile::Hello, init.transaction_id, &mut ready)
+    {
+        Ok(value) => value,
+        Err(_) => return 0xD1C0_0004 | TOKEN as u32,
+    };
+    if send_channel(channel, &ready[..size], &[]).is_err() {
+        return 0xD1C0_0005 | TOKEN as u32;
+    }
+    if TOKEN <= 5 {
+        if submit_dw1c_progress(TOKEN, 1, DIGEST).is_err() {
+            return 0xD1C0_0100 | TOKEN as u32;
+        }
+    }
+    if TOKEN >= 9 {
+        return 0;
+    }
+    if TOKEN == 6 {
+        if wait_one(
+            channel,
+            DwSignals(DW_SIGNAL_READABLE.0),
+            DW_DEADLINE_INFINITE,
+        )
+        .is_err()
+        {
+            return 0xD1C0_0600;
+        }
+        let mut byte = [0_u8; 1];
+        if receive_channel(channel, &mut byte, &mut []).is_err() {
+            return 0xD1C0_0601;
+        }
+    }
+    if TOKEN == 7 {
+        let payload = [0xA7_u8; 128];
+        loop {
+            if send_channel(channel, &payload, &[]).is_err() {
+                break;
+            }
+        }
+        if wait_one(
+            channel,
+            DwSignals(DW_SIGNAL_WRITABLE.0),
+            DW_DEADLINE_INFINITE,
+        )
+        .is_err()
+        {
+            return 0xD1C0_0700;
+        }
+    }
+    loop {
+        core::hint::spin_loop();
+    }
 }
 wyrmroot_runtime::native_entry!(crate::payload_main);
 #[panic_handler]
-fn panic(_: &PanicInfo<'_>) -> ! { panic_abort() }
+fn panic(_: &PanicInfo<'_>) -> ! {
+    panic_abort()
+}
