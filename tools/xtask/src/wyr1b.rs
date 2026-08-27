@@ -40,6 +40,38 @@ const ACCEPTED_TOOLCHAIN_MANIFEST_SHA256: &str =
     "cc78368219552cce8fdaad38ab419040cab945fe175aa774d6dca51eece84fd2";
 const ACCEPTED_TOOLCHAIN_TREE_SHA256: &str =
     "dce57d31def1f509ce537f96ae6b6dd320da11c9f321382cb93d142f558a32ca";
+const STACK_ANALYSIS_METHOD: &str =
+    "rustc-z-emit-stack-sizes+llvm-readobj-json-designated-frames-v1";
+const STACK_METADATA_FLAG: &str = "-Zemit-stack-sizes";
+const STACK_BUDGET_BYTES: u64 = 32 * 1024;
+const STACK_TOOL_PATH: &str = "/usr/lib/llvm/22/bin/llvm-readobj";
+const STACK_TOOL_VERSION: &str = "LLVM version 22.1.8";
+const STACK_TOOL_SHA256: &str = "8074c683dc2c5bfebd5e68245b9d435a3a44ff7e232f20b6a1d01a22f5d7caf8";
+const MAX_STACK_REPORT: usize = 8 * 1024 * 1024;
+const DESIGNATED_STACK_FRAMES: &[(&str, &str)] = &[
+    ("native_main", "__wyrmroot_native_main"),
+    (
+        "continue_system_init_product",
+        "wyrmroot_system_init::continue_system_init_product::<",
+    ),
+    (
+        "activate_in_place",
+        "wyrmroot_system_init::wyr1b_native::activate_in_place::<",
+    ),
+    (
+        "run_registry_gate",
+        "wyrmroot_system_init::wyr1b_native::run_registry_gate::<",
+    ),
+    (
+        "run_job_gate",
+        "wyrmroot_system_init::wyr1b_native::run_job_gate::<",
+    ),
+    (
+        "control_tick",
+        "wyrmroot_system_init::wyr1b_native::control_tick::<",
+    ),
+    ("continue_resident", "system_init::continue_resident"),
+];
 const OVMF_CODE_PATH: &str = "/usr/share/edk2/OvmfX64/OVMF_CODE.fd";
 const OVMF_CODE_SHA256: &str = "f3ff7e73448ed2845ee15356f394882f5618eb5dab92c9a30ec6ee0e1468553a";
 const OVMF_VARS_PATH: &str = "/usr/share/edk2/OvmfX64/OVMF_VARS.fd";
@@ -247,6 +279,13 @@ struct NativeSpec<'a> {
     binary: &'a str,
     features: &'a str,
     artifact: &'a str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StackBudgetReport {
+    frames: BTreeMap<String, u64>,
+    maximum_label: String,
+    maximum_bytes: u64,
 }
 
 pub fn freeze(output: &Path) -> Result<String, Failure> {
@@ -614,19 +653,29 @@ fn build_frozen_artifacts(build_root: &Path, revision: &str) -> Result<FrozenArt
     ];
     let mut built = Vec::with_capacity(specs.len());
     let mut commands = Vec::with_capacity(specs.len());
+    let mut init27_stack_report = None;
     for spec in specs {
         toolchain.accepted().verify_unchanged()?;
         layout.verify_unchanged()?;
-        let (bytes, command) = build_native(
+        let (bytes, command, stack_report) = build_native(
             &repository,
             &cargo_home,
             toolchain.accepted(),
             build_root,
             &spec,
         )?;
+        if let Some(report) = stack_report
+            && init27_stack_report.replace(report).is_some()
+        {
+            return Err(Failure::task(
+                "WYR1-B produced more than one init27 stack report",
+            ));
+        }
         built.push(bytes);
         commands.push((spec.label, command));
     }
+    let init27_stack_report = init27_stack_report
+        .ok_or_else(|| Failure::task("WYR1-B did not analyze the init27 stack metadata"))?;
     let [
         bootstrap,
         init27,
@@ -648,7 +697,7 @@ fn build_frozen_artifacts(build_root: &Path, revision: &str) -> Result<FrozenArt
     let rustc_sha256 = sha256::file_digest(&toolchain.accepted().rustc)
         .map_err(|error| Failure::task(format!("could not hash accepted rustc: {error}")))?;
     let mut source_receipt = format!(
-        "kind = \"{SOURCE_RECEIPT_KIND}\"\nschema_version = 1\nwyrmroot_revision = \"{revision}\"\nrust_revision = \"{ACCEPTED_RUST_REVISION}\"\nrustc_sha256 = \"{rustc_sha256}\"\ncargo_sha256 = \"{}\"\nrust_lld_sha256 = \"{}\"\ntoolchain_manifest_sha256 = \"{}\"\ntoolchain_tree_sha256 = \"{}\"\ncargo_lock_sha256 = \"{}\"\nloader_sha256 = \"{}\"\n",
+        "kind = \"{SOURCE_RECEIPT_KIND}\"\nschema_version = 2\nwyrmroot_revision = \"{revision}\"\nrust_revision = \"{ACCEPTED_RUST_REVISION}\"\nrustc_sha256 = \"{rustc_sha256}\"\ncargo_sha256 = \"{}\"\nrust_lld_sha256 = \"{}\"\ntoolchain_manifest_sha256 = \"{}\"\ntoolchain_tree_sha256 = \"{}\"\ncargo_lock_sha256 = \"{}\"\nloader_sha256 = \"{}\"\ninit27_stack_analysis_method = \"{STACK_ANALYSIS_METHOD}\"\ninit27_stack_metadata_flag = \"{STACK_METADATA_FLAG}\"\ninit27_stack_tool_path = \"{STACK_TOOL_PATH}\"\ninit27_stack_tool_version = \"{STACK_TOOL_VERSION}\"\ninit27_stack_tool_sha256 = \"{STACK_TOOL_SHA256}\"\ninit27_stack_budget_bytes = {STACK_BUDGET_BYTES}\ninit27_stack_result = \"pass\"\ninit27_stack_maximum_label = \"{}\"\ninit27_stack_maximum_bytes = {}\n",
         toolchain.accepted().cargo_sha256,
         toolchain.accepted().rust_lld_sha256,
         toolchain.accepted().manifest_sha256,
@@ -656,7 +705,16 @@ fn build_frozen_artifacts(build_root: &Path, revision: &str) -> Result<FrozenArt
         sha256::file_digest(&repository.join("Cargo.lock"))
             .map_err(|error| Failure::task(format!("could not hash Cargo.lock: {error}")))?,
         sha256::bytes_digest(&loader),
+        init27_stack_report.maximum_label,
+        init27_stack_report.maximum_bytes,
     );
+    for (label, _) in DESIGNATED_STACK_FRAMES {
+        let size = init27_stack_report
+            .frames
+            .get(*label)
+            .ok_or_else(|| Failure::task("WYR1-B stack report lost a designated frame"))?;
+        source_receipt.push_str(&format!("init27_stack_{label}_bytes = {size}\n"));
+    }
     for ((label, command), bytes) in commands.iter().zip([
         &bootstrap,
         &init27,
@@ -702,11 +760,12 @@ fn build_native(
     toolchain: &crate::toolchain_artifact::AcceptedToolchain,
     build_root: &Path,
     spec: &NativeSpec<'_>,
-) -> Result<(Vec<u8>, String), Failure> {
+) -> Result<(Vec<u8>, String, Option<StackBudgetReport>), Failure> {
     let target = build_root.join(spec.label);
     fs::create_dir(&target)
         .map_err(|error| Failure::task(format!("could not create native target: {error}")))?;
-    let flags = native_remap_flags(repository, cargo_home, &target)?;
+    let emit_stack_sizes = spec.label == "init27";
+    let flags = native_remap_flags(repository, cargo_home, &target, emit_stack_sizes)?;
     let arguments = [
         "build",
         "--offline",
@@ -749,13 +808,21 @@ fn build_native(
         .join("release")
         .join(spec.artifact);
     let bytes = read_cargo_build_output(&artifact, spec.label, 64 * 1024 * 1024)?;
-    Ok((bytes, format!("cargo {}", arguments.join(" "))))
+    let stack_report = emit_stack_sizes
+        .then(|| analyze_stack_budget(&artifact, &sha256::bytes_digest(&bytes)))
+        .transpose()?;
+    Ok((
+        bytes,
+        format!("cargo {}", arguments.join(" ")),
+        stack_report,
+    ))
 }
 
 fn native_remap_flags(
     repository: &Path,
     cargo_home: &Path,
     target: &Path,
+    emit_stack_sizes: bool,
 ) -> Result<String, Failure> {
     let repository = fs::canonicalize(repository)
         .map_err(|error| Failure::task(format!("could not resolve source root: {error}")))?;
@@ -763,15 +830,264 @@ fn native_remap_flags(
         .map_err(|error| Failure::task(format!("could not resolve Cargo home: {error}")))?;
     let target = fs::canonicalize(target)
         .map_err(|error| Failure::task(format!("could not resolve target root: {error}")))?;
-    Ok([
+    let mut flags = vec![
         format!(
             "--remap-path-prefix={}=/source/wyrmroot",
             repository.display()
         ),
         format!("--remap-path-prefix={}=/cargo-home", cargo_home.display()),
         format!("--remap-path-prefix={}=/cargo-target", target.display()),
-    ]
-    .join("\u{1f}"))
+    ];
+    if emit_stack_sizes {
+        flags.push(STACK_METADATA_FLAG.to_owned());
+    }
+    Ok(flags.join("\u{1f}"))
+}
+
+fn analyze_stack_budget(
+    artifact: &Path,
+    expected_sha256: &str,
+) -> Result<StackBudgetReport, Failure> {
+    let metadata = fs::symlink_metadata(artifact).map_err(|error| {
+        Failure::task(format!(
+            "could not inspect WYR1-B init27 stack-analysis artifact: {error}"
+        ))
+    })?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() == 0
+        || metadata.len() > 64 * 1024 * 1024
+    {
+        return Err(Failure::task(
+            "WYR1-B init27 stack analysis requires a bounded regular ELF",
+        ));
+    }
+    verify_stack_tool()?;
+    let output = Command::new(STACK_TOOL_PATH)
+        .args(["--elf-output-style=JSON", "--stack-sizes", "--demangle"])
+        .arg(artifact)
+        .env_clear()
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| Failure::task(format!("could not run WYR1-B stack analyzer: {error}")))?;
+    if !output.status.success()
+        || output.stdout.is_empty()
+        || output.stdout.len() > MAX_STACK_REPORT
+        || output.stderr.len() > MAX_STACK_REPORT
+    {
+        return Err(Failure::task(
+            "WYR1-B pinned stack analyzer failed or returned an invalid report",
+        ));
+    }
+    let sizes = parse_stack_sizes_json(&output.stdout)?;
+    let report = assess_stack_budget(&sizes)?;
+    verify_stack_tool()?;
+    let observed_sha256 = sha256::file_digest(artifact).map_err(|error| {
+        Failure::task(format!(
+            "could not rehash WYR1-B stack-analysis artifact: {error}"
+        ))
+    })?;
+    if observed_sha256 != expected_sha256 {
+        return Err(Failure::task(
+            "WYR1-B stack analysis did not inspect the exact hashed init27 artifact",
+        ));
+    }
+    Ok(report)
+}
+
+fn verify_stack_tool() -> Result<(), Failure> {
+    let path = Path::new(STACK_TOOL_PATH);
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| Failure::task(format!("could not inspect pinned LLVM tool: {error}")))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.nlink() != 1 {
+        return Err(Failure::task(
+            "WYR1-B stack analyzer is not the pinned regular LLVM tool",
+        ));
+    }
+    let digest = sha256::file_digest(path)
+        .map_err(|error| Failure::task(format!("could not hash pinned LLVM tool: {error}")))?;
+    if digest != STACK_TOOL_SHA256 {
+        return Err(Failure::task(
+            "WYR1-B stack analyzer does not match the pinned LLVM identity",
+        ));
+    }
+    let version = Command::new(path)
+        .arg("--version")
+        .env_clear()
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| Failure::task(format!("could not version pinned LLVM tool: {error}")))?;
+    let text = std::str::from_utf8(&version.stdout)
+        .map_err(|_| Failure::task("pinned LLVM version output is not UTF-8"))?;
+    if !version.status.success()
+        || version.stdout.len() > 4096
+        || version.stderr.len() > 4096
+        || !text.lines().any(|line| line.trim() == STACK_TOOL_VERSION)
+    {
+        return Err(Failure::task(
+            "WYR1-B stack analyzer version does not match the pinned LLVM identity",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_stack_sizes_json(bytes: &[u8]) -> Result<BTreeMap<String, u64>, Failure> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| Failure::task("WYR1-B LLVM stack report is not UTF-8"))?;
+    if !text.starts_with("[{\"FileSummary\":{")
+        || text.matches("\"Format\":\"elf64-x86-64\"").count() != 1
+        || text.matches("\"Arch\":\"x86_64\"").count() != 1
+    {
+        return Err(Failure::task(
+            "WYR1-B LLVM stack report does not describe one x86-64 ELF",
+        ));
+    }
+    let marker = "\"StackSizes\":[";
+    let mut markers = text.match_indices(marker);
+    let (start, _) = markers
+        .next()
+        .ok_or_else(|| Failure::task("WYR1-B LLVM stack report has no stack metadata"))?;
+    if markers.next().is_some() {
+        return Err(Failure::task(
+            "WYR1-B LLVM stack report has ambiguous stack metadata",
+        ));
+    }
+    let mut cursor = start + marker.len();
+    let bytes = text.as_bytes();
+    let mut sizes = BTreeMap::new();
+    let mut first = true;
+    loop {
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if bytes.get(cursor) == Some(&b']') {
+            cursor += 1;
+            break;
+        }
+        if !first {
+            expect_json(bytes, &mut cursor, b",")?;
+        }
+        first = false;
+        expect_json(bytes, &mut cursor, b"{\"Entry\":{\"Functions\":[")?;
+        let mut functions = Vec::new();
+        loop {
+            functions.push(parse_json_string(bytes, &mut cursor)?);
+            match bytes.get(cursor) {
+                Some(b',') => cursor += 1,
+                Some(b']') => {
+                    cursor += 1;
+                    break;
+                }
+                _ => {
+                    return Err(Failure::task(
+                        "WYR1-B LLVM stack report has malformed function names",
+                    ));
+                }
+            }
+        }
+        if functions.is_empty() {
+            return Err(Failure::task(
+                "WYR1-B LLVM stack report contains an unnamed frame",
+            ));
+        }
+        expect_json(bytes, &mut cursor, b",\"Size\":")?;
+        let number_start = cursor;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+            cursor += 1;
+        }
+        if cursor == number_start {
+            return Err(Failure::task(
+                "WYR1-B LLVM stack report contains a nonnumeric frame size",
+            ));
+        }
+        let size = text[number_start..cursor]
+            .parse::<u64>()
+            .map_err(|_| Failure::task("WYR1-B LLVM stack frame size overflowed"))?;
+        expect_json(bytes, &mut cursor, b"}}")?;
+        for function in functions {
+            if sizes.insert(function, size).is_some() {
+                return Err(Failure::task(
+                    "WYR1-B LLVM stack report contains a duplicate function",
+                ));
+            }
+        }
+    }
+    if text[cursor..].trim() != "}]" || sizes.is_empty() {
+        return Err(Failure::task(
+            "WYR1-B LLVM stack report has trailing or empty metadata",
+        ));
+    }
+    Ok(sizes)
+}
+
+fn expect_json(bytes: &[u8], cursor: &mut usize, expected: &[u8]) -> Result<(), Failure> {
+    if bytes.get(*cursor..*cursor + expected.len()) != Some(expected) {
+        return Err(Failure::task("WYR1-B LLVM stack report shape drifted"));
+    }
+    *cursor += expected.len();
+    Ok(())
+}
+
+fn parse_json_string(bytes: &[u8], cursor: &mut usize) -> Result<String, Failure> {
+    expect_json(bytes, cursor, b"\"")?;
+    let start = *cursor;
+    while let Some(byte) = bytes.get(*cursor) {
+        if *byte == b'"' {
+            let value = std::str::from_utf8(&bytes[start..*cursor])
+                .map_err(|_| Failure::task("WYR1-B LLVM symbol is not UTF-8"))?
+                .to_owned();
+            *cursor += 1;
+            return Ok(value);
+        }
+        if *byte == b'\\' || *byte < 0x20 {
+            return Err(Failure::task(
+                "WYR1-B LLVM symbol requires unsupported JSON escaping",
+            ));
+        }
+        *cursor += 1;
+    }
+    Err(Failure::task(
+        "WYR1-B LLVM stack report contains an unterminated symbol",
+    ))
+}
+
+fn assess_stack_budget(sizes: &BTreeMap<String, u64>) -> Result<StackBudgetReport, Failure> {
+    let mut frames = BTreeMap::new();
+    let mut maximum_label = String::new();
+    let mut maximum_bytes = 0;
+    for (label, prefix) in DESIGNATED_STACK_FRAMES {
+        let matches = sizes
+            .iter()
+            .filter(|(symbol, _)| {
+                if !prefix.ends_with("::<") {
+                    symbol.as_str() == *prefix
+                } else {
+                    symbol.starts_with(prefix)
+                }
+            })
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err(Failure::task(format!(
+                "WYR1-B init27 stack metadata does not uniquely name designated frame {label}"
+            )));
+        }
+        let size = *matches[0].1;
+        if size > STACK_BUDGET_BYTES {
+            return Err(Failure::task(format!(
+                "WYR1-B init27 designated frame {label} uses {size} bytes, exceeding the {STACK_BUDGET_BYTES}-byte preflight cap"
+            )));
+        }
+        if size > maximum_bytes {
+            maximum_label = (*label).to_owned();
+            maximum_bytes = size;
+        }
+        frames.insert((*label).to_owned(), size);
+    }
+    Ok(StackBudgetReport {
+        frames,
+        maximum_label,
+        maximum_bytes,
+    })
 }
 
 fn build_kernel(
@@ -2179,6 +2495,15 @@ fn verify_source_receipt(request: &Request, receipt: &[u8]) -> Result<(), Failur
         "toolchain_tree_sha256",
         "cargo_lock_sha256",
         "loader_sha256",
+        "init27_stack_analysis_method",
+        "init27_stack_metadata_flag",
+        "init27_stack_tool_path",
+        "init27_stack_tool_version",
+        "init27_stack_tool_sha256",
+        "init27_stack_budget_bytes",
+        "init27_stack_result",
+        "init27_stack_maximum_label",
+        "init27_stack_maximum_bytes",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -2201,12 +2526,15 @@ fn verify_source_receipt(request: &Request, receipt: &[u8]) -> Result<(), Failur
         expected_keys.insert(format!("{label}_command"));
         expected_keys.insert(format!("{label}_sha256"));
     }
+    for (label, _) in DESIGNATED_STACK_FRAMES {
+        expected_keys.insert(format!("init27_stack_{label}_bytes"));
+    }
     if values.keys().cloned().collect::<BTreeSet<_>>() != expected_keys {
         return Err(Failure::task("WYR1-B source receipt key set drifted"));
     }
     for (key, expected) in [
         ("kind", SOURCE_RECEIPT_KIND.to_owned()),
-        ("schema_version", "1".to_owned()),
+        ("schema_version", "2".to_owned()),
         ("wyrmroot_revision", request.wyrmroot_revision.clone()),
         ("rust_revision", request.rust_revision.clone()),
         ("rustc_sha256", ACCEPTED_RUSTC_SHA256.to_owned()),
@@ -2221,6 +2549,28 @@ fn verify_source_receipt(request: &Request, receipt: &[u8]) -> Result<(), Failur
             ACCEPTED_TOOLCHAIN_TREE_SHA256.to_owned(),
         ),
         ("loader_sha256", request.loader_sha256.clone()),
+        (
+            "init27_stack_analysis_method",
+            STACK_ANALYSIS_METHOD.to_owned(),
+        ),
+        (
+            "init27_stack_metadata_flag",
+            STACK_METADATA_FLAG.to_owned(),
+        ),
+        ("init27_stack_tool_path", STACK_TOOL_PATH.to_owned()),
+        (
+            "init27_stack_tool_version",
+            STACK_TOOL_VERSION.to_owned(),
+        ),
+        (
+            "init27_stack_tool_sha256",
+            STACK_TOOL_SHA256.to_owned(),
+        ),
+        (
+            "init27_stack_budget_bytes",
+            STACK_BUDGET_BYTES.to_string(),
+        ),
+        ("init27_stack_result", "pass".to_owned()),
         ("bootstrap_sha256", request.bootstrap_sha256.clone()),
         ("init27_sha256", request.init_sha256.clone()),
         ("registryd_sha256", request.registryd_sha256.clone()),
@@ -2259,6 +2609,28 @@ fn verify_source_receipt(request: &Request, receipt: &[u8]) -> Result<(), Failur
             "init25_command",
             "cargo build --offline --locked --release --target x86_64-unknown-wyrmroot --package wyrmroot-system-init --bin system-init --features native-init,wyr1-test-evidence".to_owned(),
         ),
+    ] {
+        if required(&values, key)? != expected {
+            return Err(Failure::task(format!(
+                "WYR1-B source receipt field {key} mismatch"
+            )));
+        }
+    }
+    let stack_report = analyze_stack_budget(&request.init, &request.init_sha256)?;
+    for (label, size) in &stack_report.frames {
+        if required(&values, &format!("init27_stack_{label}_bytes"))? != size.to_string() {
+            return Err(Failure::task(format!(
+                "WYR1-B source receipt init27 stack frame {label} mismatch"
+            )));
+        }
+    }
+    let maximum_bytes = stack_report.maximum_bytes.to_string();
+    for (key, expected) in [
+        (
+            "init27_stack_maximum_label",
+            stack_report.maximum_label.as_str(),
+        ),
+        ("init27_stack_maximum_bytes", maximum_bytes.as_str()),
     ] {
         if required(&values, key)? != expected {
             return Err(Failure::task(format!(
@@ -2503,6 +2875,81 @@ mod tests {
         assert!(metadata.is_file());
         assert_eq!(metadata.nlink(), 1);
         assert_eq!(fs::read(&published).unwrap(), owned);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn designated_stack_sizes(size: u64) -> BTreeMap<String, u64> {
+        DESIGNATED_STACK_FRAMES
+            .iter()
+            .map(|(_, prefix)| {
+                let symbol = if !prefix.ends_with("::<") {
+                    (*prefix).to_owned()
+                } else {
+                    format!("{prefix}NativeSystem>")
+                };
+                (symbol, size)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stack_metadata_parser_accepts_machine_readable_llvm_entries() {
+        let json = br#"[{"FileSummary":{"Format":"elf64-x86-64","Arch":"x86_64"},"StackSizes":[{"Entry":{"Functions":["__wyrmroot_native_main"],"Size":4096}},{"Entry":{"Functions":["alias","other"],"Size":8}}]}]"#;
+        let sizes = parse_stack_sizes_json(json).unwrap();
+        assert_eq!(sizes.get("__wyrmroot_native_main"), Some(&4096));
+        assert_eq!(sizes.get("alias"), Some(&8));
+        assert_eq!(sizes.get("other"), Some(&8));
+    }
+
+    #[test]
+    fn stack_budget_requires_unique_designated_frames_below_cap() {
+        let admitted = designated_stack_sizes(STACK_BUDGET_BYTES);
+        let report = assess_stack_budget(&admitted).unwrap();
+        assert_eq!(report.maximum_bytes, STACK_BUDGET_BYTES);
+        assert_eq!(report.frames.len(), DESIGNATED_STACK_FRAMES.len());
+
+        let mut oversized = admitted.clone();
+        oversized.insert("__wyrmroot_native_main".to_owned(), STACK_BUDGET_BYTES + 1);
+        assert!(assess_stack_budget(&oversized).is_err());
+
+        let mut missing = admitted.clone();
+        missing.remove("__wyrmroot_native_main");
+        assert!(assess_stack_budget(&missing).is_err());
+
+        let mut ambiguous = admitted;
+        ambiguous.insert(
+            "wyrmroot_system_init::wyr1b_native::activate_in_place::<OtherSystem>".to_owned(),
+            8,
+        );
+        assert!(assess_stack_budget(&ambiguous).is_err());
+    }
+
+    #[test]
+    fn only_init27_requests_compiler_stack_metadata() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("wyr1b-stack-flags-{}-{unique}", std::process::id()));
+        let repository = root.join("repository");
+        let cargo_home = root.join("cargo-home");
+        let target = root.join("target");
+        for path in [&repository, &cargo_home, &target] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let ordinary = native_remap_flags(&repository, &cargo_home, &target, false).unwrap();
+        let analyzed = native_remap_flags(&repository, &cargo_home, &target, true).unwrap();
+        assert!(
+            !ordinary
+                .split('\u{1f}')
+                .any(|flag| flag == STACK_METADATA_FLAG)
+        );
+        assert!(
+            analyzed
+                .split('\u{1f}')
+                .any(|flag| flag == STACK_METADATA_FLAG)
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
