@@ -98,6 +98,37 @@ const REQUEST_KEYS: [&str; 52] = [
     "ovmf_vars_template_path",
     "ovmf_vars_template_sha256",
 ];
+const BUILD_RECEIPT_KEYS: [&str; 29] = [
+    "schema_version",
+    "kind",
+    "selector",
+    "test_id",
+    "deepwyrm_revision",
+    "wyrmroot_revision",
+    "rust_revision",
+    "evidence_nonce",
+    "progress_digest",
+    "bootfs_max_pages",
+    "loader_sha256",
+    "kernel_sha256",
+    "symbols_sha256",
+    "bootstrap_sha256",
+    "actor1_sha256",
+    "actor2_sha256",
+    "actor3_sha256",
+    "actor4_sha256",
+    "actor5_sha256",
+    "actor6_sha256",
+    "actor7_sha256",
+    "actor8_sha256",
+    "actor9_sha256",
+    "actor10_sha256",
+    "provenance_sha256",
+    "bootfs_sha256",
+    "esp_sha256",
+    "ovmf_code_sha256",
+    "ovmf_vars_template_sha256",
+];
 
 /// Creates a fresh six-pass campaign containing immutable all-string TOML
 /// handoffs and exact q35/OVMF domain XML.  It never invokes QEMU or libvirt.
@@ -112,6 +143,7 @@ pub fn prepare(request_path: &Path) -> Result<String, Failure> {
         &request.values["build_receipt_sha256"],
         &immutable.join("build-receipt.toml"),
     )?;
+    verify_build_receipt(&request, &receipt_snapshot.path)?;
     let mut inputs = BTreeMap::new();
     for label in INPUTS {
         let source = request.path(label)?;
@@ -171,6 +203,63 @@ pub fn prepare(request_path: &Path) -> Result<String, Failure> {
         output.path.display(),
         output.sha256
     ))
+}
+
+fn verify_build_receipt(request: &Request, path: &Path) -> Result<(), Failure> {
+    let bytes = read_regular(path, "DW1-C build receipt")?;
+    let values = scalars(
+        core::str::from_utf8(&bytes)
+            .map_err(|_| Failure::task("DW1-C build receipt is not UTF-8"))?,
+    )?;
+    let expected = BUILD_RECEIPT_KEYS.into_iter().collect::<BTreeSet<_>>();
+    let actual = values.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err(Failure::task("DW1-C build receipt key set is not exact"));
+    }
+    for (key, expected) in [
+        ("schema_version", "1"),
+        ("kind", "wyrmroot-dw1-c-build-lineage"),
+        ("selector", SELECTOR),
+        ("test_id", TEST_ID),
+    ] {
+        if values.get(key).map(String::as_str) != Some(expected) {
+            return Err(Failure::task(format!(
+                "DW1-C build receipt requires {key}={expected}"
+            )));
+        }
+    }
+    for key in [
+        "deepwyrm_revision",
+        "wyrmroot_revision",
+        "rust_revision",
+        "evidence_nonce",
+        "progress_digest",
+    ] {
+        if values.get(key) != request.values.get(key) {
+            return Err(Failure::task(format!(
+                "DW1-C build receipt does not match request {key}"
+            )));
+        }
+    }
+    let pages = values
+        .get("bootfs_max_pages")
+        .ok_or_else(|| Failure::task("DW1-C build receipt omits bootfs_max_pages"))?
+        .parse::<usize>()
+        .map_err(|_| Failure::task("DW1-C build receipt bootfs_max_pages is not decimal"))?;
+    if !(1..=8192).contains(&pages) {
+        return Err(Failure::task(
+            "DW1-C build receipt bootfs_max_pages is out of range",
+        ));
+    }
+    for label in INPUTS {
+        let key = format!("{label}_sha256");
+        if values.get(&key) != request.values.get(&key) {
+            return Err(Failure::task(format!(
+                "DW1-C build receipt does not match request {key}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
