@@ -1,6 +1,8 @@
 use core::panic::PanicInfo;
 use deepwyrm_syscall as _;
-use deepwyrm_syscall::{DW_DEADLINE_INFINITE, DW_SIGNAL_READABLE, DW_SIGNAL_WRITABLE, DwSignals};
+use deepwyrm_syscall::{
+    DW_DEADLINE_INFINITE, DW_SIGNAL_READABLE, DW_SIGNAL_WRITABLE, DW_STATUS_WOULD_BLOCK, DwSignals,
+};
 use wyrmroot_loader::launch::{HEADER_BYTES, LaunchProfile, encode_ready_for_profile, parse_init};
 use wyrmroot_runtime::{
     StartupBlock, panic_abort, receive_channel, send_channel, submit_dw1c_progress, wait_one,
@@ -76,8 +78,14 @@ fn payload_main(startup: StartupBlock<'_>) -> u32 {
     if TOKEN == 7 {
         let payload = [0xA7_u8; 128];
         loop {
-            if send_channel(channel, &payload, &[]).is_err() {
-                break;
+            match send_channel(channel, &payload, &[]) {
+                Ok(()) => {}
+                Err(wyrmroot_runtime::NativeError::Status(status))
+                    if status == DW_STATUS_WOULD_BLOCK =>
+                {
+                    break;
+                }
+                Err(_) => return 0xD1C0_0701,
             }
         }
         if wait_one(
