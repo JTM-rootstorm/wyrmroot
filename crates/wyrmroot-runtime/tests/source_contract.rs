@@ -260,3 +260,24 @@ fn primordial_test_support_uses_generated_ids_and_is_feature_isolated() {
     assert!(!TEST_SUPPORT_SOURCE.contains("libc"));
     assert!(!TEST_SUPPORT_SOURCE.contains("std::"));
 }
+
+#[test]
+fn wyr1b_evidence_raw_call_is_exact_and_feature_isolated() {
+    assert!(MANIFEST.contains("wyr1b-test-evidence = []"));
+    for required in [
+        "#[cfg(feature = \"wyr1b-test-evidence\")]",
+        "DwSyscallId(0xffff_ff1b)",
+        "pub const WYR1B_EVIDENCE_RECORD_BYTES: usize = 96",
+        "pub fn submit_wyr1b_evidence",
+        "record.as_ptr() as u64",
+        "WYR1B_EVIDENCE_RECORD_BYTES as u64",
+    ] {
+        assert!(
+            CAPABILITY_NATIVE_SOURCE.contains(required),
+            "missing selector-27 evidence boundary marker {required}"
+        );
+    }
+    assert!(SOURCE.contains("submit_wyr1b_evidence"));
+    assert!(CAPABILITY_NATIVE_SOURCE.contains("DwSyscallId(0xffff_ff19)"));
+    assert!(CAPABILITY_NATIVE_SOURCE.contains("DwSyscallId(0xFFFF_FF1A)"));
+}

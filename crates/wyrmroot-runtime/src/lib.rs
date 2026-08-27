@@ -55,6 +55,8 @@ pub use capability_native::{
 };
 #[cfg(feature = "wyr1-test-evidence")]
 pub use capability_native::{WYR1_EVIDENCE_RECORD_BYTES, submit_wyr1_evidence};
+#[cfg(feature = "wyr1b-test-evidence")]
+pub use capability_native::{WYR1B_EVIDENCE_RECORD_BYTES, submit_wyr1b_evidence};
 #[cfg(feature = "dw1b-test-evidence")]
 pub use capability_native::{arm_dw1b_preemption, submit_dw1b_progress};
 pub use loader_native::NativeLoaderPlatform;

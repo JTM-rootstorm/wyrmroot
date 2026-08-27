@@ -18,6 +18,10 @@ use crate::{NativeError, NativeOutputError, PAGE_SIZE, wait_many};
 const WYR1_TEST_EVIDENCE_SYSCALL: DwSyscallId = DwSyscallId(0xffff_ff19);
 #[cfg(feature = "wyr1-test-evidence")]
 pub const WYR1_EVIDENCE_RECORD_BYTES: usize = 114;
+#[cfg(feature = "wyr1b-test-evidence")]
+const WYR1B_TEST_EVIDENCE_SYSCALL: DwSyscallId = DwSyscallId(0xffff_ff1b);
+#[cfg(feature = "wyr1b-test-evidence")]
+pub const WYR1B_EVIDENCE_RECORD_BYTES: usize = 96;
 
 /// One controller-owned mapping whose lifetime is explicit and whose writable alias can be
 /// irreversibly removed before publication.
@@ -285,6 +289,25 @@ pub fn submit_wyr1_evidence(record: &[u8; WYR1_EVIDENCE_RECORD_BYTES]) -> Result
         [
             record.as_ptr() as u64,
             WYR1_EVIDENCE_RECORD_BYTES as u64,
+            0,
+            0,
+            0,
+            0,
+        ],
+    ))
+}
+
+/// Submits one selector-27-only WRB1 record to the test collector.
+/// Production kernels and every other selector reject the reserved operation.
+#[cfg(feature = "wyr1b-test-evidence")]
+pub fn submit_wyr1b_evidence(
+    record: &[u8; WYR1B_EVIDENCE_RECORD_BYTES],
+) -> Result<(), NativeError> {
+    require_success(raw::call(
+        WYR1B_TEST_EVIDENCE_SYSCALL,
+        [
+            record.as_ptr() as u64,
+            WYR1B_EVIDENCE_RECORD_BYTES as u64,
             0,
             0,
             0,
