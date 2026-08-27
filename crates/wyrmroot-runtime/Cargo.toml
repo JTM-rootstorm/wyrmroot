@@ -15,6 +15,7 @@ primordial-test-support = []
 wyr1-test-evidence = []
 wyr1b-test-evidence = []
 dw1b-test-evidence = []
+dw1c-test-evidence = []
 
 [dependencies]
 deepwyrm-syscall.workspace = true

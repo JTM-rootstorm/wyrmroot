@@ -48,6 +48,11 @@ pub use bounded_accounting::{
     ReservationToken, ResourceBudget, TransactionToken, WYR0_I_RESOURCE_BUDGETS,
     kernel_channel_enforcement, validate_kernel_channel_envelope,
 };
+#[cfg(feature = "dw1c-test-evidence")]
+pub use capability_native::{
+    DW1C_ACTOR_COUNT, Dw1cActorBindV1, arm_dw1c_preemption, submit_dw1c_progress,
+    submit_dw1c_workload_complete,
+};
 pub use capability_native::{
     OwnedMemoryMapping, cancel_timer, create_channel, create_event, create_memory_object,
     create_task_group, create_timer, duplicate_handle, map_memory_read_only, map_memory_read_write,

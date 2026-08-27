@@ -30,6 +30,7 @@ Usage:
     cargo xtask dw1b run --request <dw1-b-request.toml>
     cargo xtask dw1b measure --init <elf> --hello <elf> --cpu-hog <elf> --progress <elf>
     cargo xtask dw1b evidence --request <dw1-b-request.toml>
+    cargo xtask dw1c prepare --request <dw1-c-request.toml>
 
 Host filters may name a component (bootfs, protocol, elf, runtime, bootstrap,
 efi, init0, hello, or xtask), package:<workspace-package>, or test:<substring>.
@@ -132,6 +133,7 @@ pub(crate) enum Action {
         progress: String,
     },
     Dw1BEvidence(String),
+    Dw1CPrepare(String),
     Unavailable(&'static str),
 }
 
@@ -180,9 +182,21 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
         "wyr1" => dispatch_wyr1(&arguments[1..]),
         "wyr1b" => dispatch_wyr1b(&arguments[1..]),
         "dw1b" => dispatch_dw1b(&arguments[1..]),
+        "dw1c" => dispatch_dw1c(&arguments[1..]),
         unknown => Err(Failure::usage(format!(
             "unknown command '{unknown}'\n\n{USAGE}"
         ))),
+    }
+}
+
+fn dispatch_dw1c(arguments: &[String]) -> Result<Action, Failure> {
+    match arguments {
+        [command, flag, request] if command == "prepare" && flag == "--request" => {
+            Ok(Action::Dw1CPrepare(request.clone()))
+        }
+        _ => Err(Failure::usage(
+            "dw1c requires prepare --request <dw1-c-request.toml>",
+        )),
     }
 }
 

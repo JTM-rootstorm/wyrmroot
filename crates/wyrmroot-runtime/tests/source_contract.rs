@@ -304,3 +304,24 @@ fn wyr1b_evidence_raw_call_is_exact_and_feature_isolated() {
     assert!(CAPABILITY_NATIVE_SOURCE.contains("DwSyscallId(0xffff_ff19)"));
     assert!(CAPABILITY_NATIVE_SOURCE.contains("DwSyscallId(0xFFFF_FF1A)"));
 }
+
+#[test]
+fn dw1c_private_veneer_has_only_the_three_frozen_operation_shapes() {
+    assert!(MANIFEST.contains("dw1c-test-evidence = []"));
+    for required in [
+        "DwSyscallId(0xFFFF_FF1C)",
+        "pub const DW1C_ACTOR_COUNT: usize = 10",
+        "bindings.as_ptr() as u64",
+        "DW1C_ACTOR_COUNT as u64",
+        "240,",
+        "[2, token, count, digest, 0, 0]",
+        "[3, 0x1f, digest, 0, 0, 0]",
+    ] {
+        assert!(
+            CAPABILITY_NATIVE_SOURCE.contains(required),
+            "missing DW1-C marker {required}"
+        );
+    }
+    assert!(SOURCE.contains("submit_dw1c_workload_complete"));
+    assert!(!NATIVE_SOURCE.contains("FFFF_FF1C"));
+}

@@ -1,6 +1,7 @@
 mod cli;
 mod deep_layout;
 mod dw1b;
+mod dw1c;
 mod elf_runtime;
 mod error;
 mod g3_image;
@@ -140,6 +141,7 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
         )
         .map(Some),
         Action::Dw1BEvidence(request) => dw1b::evidence(std::path::Path::new(&request)).map(Some),
+        Action::Dw1CPrepare(request) => dw1c::prepare(std::path::Path::new(&request)).map(Some),
         Action::Unavailable(command) => Err(Failure::unavailable(command)),
     }
 }

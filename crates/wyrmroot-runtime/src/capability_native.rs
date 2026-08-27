@@ -341,6 +341,67 @@ pub fn submit_dw1b_progress(digest: u64) -> Result<(), NativeError> {
     ))
 }
 
+// Selector 28 is a private kernel test protocol.  This deliberately lives
+// beside the other selector-private veneers and is never exported through the
+// generated Deepwyrm ABI.
+#[cfg(feature = "dw1c-test-evidence")]
+const DW1C_TEST_EVIDENCE_SYSCALL: deepwyrm_syscall::DwSyscallId =
+    deepwyrm_syscall::DwSyscallId(0xFFFF_FF1C);
+
+/// The fixed selector-28 controller table has ten entries, in token order.
+#[cfg(feature = "dw1c-test-evidence")]
+pub const DW1C_ACTOR_COUNT: usize = 10;
+
+/// Private ARM table entry consumed only by selector 28's collector.
+///
+/// The layout is explicitly little-endian `u64` fields at the syscall
+/// boundary; it is not a public ABI record.
+#[cfg(feature = "dw1c-test-evidence")]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Dw1cActorBindV1 {
+    pub token: u64,
+    pub role: u64,
+    pub process: DwHandle,
+}
+
+/// Arms selector 28 with its fixed ten actor bindings and 240-second bound.
+#[cfg(feature = "dw1c-test-evidence")]
+pub fn arm_dw1c_preemption(
+    bindings: &[Dw1cActorBindV1; DW1C_ACTOR_COUNT],
+) -> Result<(), NativeError> {
+    require_success(raw::call(
+        DW1C_TEST_EVIDENCE_SYSCALL,
+        [
+            1,
+            bindings.as_ptr() as u64,
+            DW1C_ACTOR_COUNT as u64,
+            240,
+            0,
+            0,
+        ],
+    ))
+}
+
+/// Submits one fixed-workload progress claim for a CPU-bound actor.
+#[cfg(feature = "dw1c-test-evidence")]
+pub fn submit_dw1c_progress(token: u64, count: u64, digest: u64) -> Result<(), NativeError> {
+    require_success(raw::call(
+        DW1C_TEST_EVIDENCE_SYSCALL,
+        [2, token, count, digest, 0, 0],
+    ))
+}
+
+/// Commits the completed selector-28 workload after tokens 1 through 5 have
+/// submitted their exact bounded progress claims.
+#[cfg(feature = "dw1c-test-evidence")]
+pub fn submit_dw1c_workload_complete(digest: u64) -> Result<(), NativeError> {
+    require_success(raw::call(
+        DW1C_TEST_EVIDENCE_SYSCALL,
+        [3, 0x1f, digest, 0, 0, 0],
+    ))
+}
+
 pub fn create_event(rights: DwRights) -> Result<DwHandle, NativeError> {
     let mut event = DwHandle(0);
     require_success(raw::call(
