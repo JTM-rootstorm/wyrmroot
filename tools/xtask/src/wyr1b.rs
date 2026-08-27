@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
+    ffi::{OsStr, OsString},
     fs::{self, OpenOptions},
     io::Write,
     os::unix::fs::MetadataExt,
@@ -425,15 +426,43 @@ fn product_bytes(
 }
 
 fn reject_ambient_build_environment() -> Result<(), Failure> {
+    let repository = crate::tasks::repository_root()?;
+    let manifest = crate::metadata::BuildManifest::load(&repository)?;
+    let product_cargo_home = crate::tasks::project_cargo_home(&repository, &manifest)?;
+    validate_ambient_build_environment(&product_cargo_home, env::vars_os())
+}
+
+fn validate_ambient_build_environment(
+    product_cargo_home: &Path,
+    environment: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Result<(), Failure> {
+    let environment = environment.into_iter().collect::<BTreeMap<_, _>>();
+    if let Some(cargo_home) = environment.get(OsStr::new("CARGO_HOME"))
+        && Path::new(cargo_home) != product_cargo_home
+    {
+        return Err(Failure::task(
+            "WYR1-B canonical freeze accepts only the pinned launcher's exact CARGO_HOME",
+        ));
+    }
     for variable in [
+        "RUSTUP_TOOLCHAIN",
+        "RUSTC_BOOTSTRAP",
         "RUSTC",
+        "RUSTDOC",
+        "RUSTFMT",
         "RUSTFLAGS",
+        "RUSTDOCFLAGS",
         "CARGO_ENCODED_RUSTFLAGS",
         "RUSTC_WRAPPER",
         "RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_BUILD_RUSTC",
+        "CARGO_BUILD_RUSTDOC",
+        "CARGO_BUILD_RUSTC_WRAPPER",
+        "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_BUILD_RUSTFLAGS",
         "CARGO_BUILD_TARGET",
         "CARGO_TARGET_DIR",
-        "CARGO_HOME",
+        "WYRMROOT_RUSTC",
         "WYRMROOT_DEEP_LAYOUT_POLICY_RS",
         "DEEPWYRM_GUEST_TEST_SELECTOR",
         "DEEPWYRM_GUEST_TEST_ID",
@@ -442,11 +471,19 @@ fn reject_ambient_build_environment() -> Result<(), Failure> {
         "DEEPWYRM_WYR1_EVIDENCE_NONCE",
         "DEEPWYRM_WYR1_EVIDENCE_SCENARIO",
     ] {
-        if env::var_os(variable).is_some() {
+        if environment.contains_key(OsStr::new(variable)) {
             return Err(Failure::task(format!(
                 "WYR1-B canonical freeze refuses ambient {variable}"
             )));
         }
+    }
+    if environment
+        .keys()
+        .any(|key| key.as_encoded_bytes().starts_with(b"CARGO_TARGET_"))
+    {
+        return Err(Failure::task(
+            "WYR1-B canonical freeze refuses ambient CARGO_TARGET_*",
+        ));
     }
     Ok(())
 }
@@ -774,6 +811,9 @@ fn build_kernel(
         ])
         .env("DEEPWYRM_PINNED_TARGET_DIR", &target)
         .env("DEEPWYRM_GUEST_TEST_SELECTOR", selector)
+        // The outer Wyrmroot launcher owns its Cargo home. Deepwyrm's target
+        // launcher must select and validate its own independently.
+        .env_remove("CARGO_HOME")
         .env_remove("LD_AUDIT")
         .env_remove("LD_LIBRARY_PATH")
         .env_remove("LD_PRELOAD")
@@ -2346,6 +2386,62 @@ fn fnv1a32(bytes: &[u8]) -> u32 {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn environment(values: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
+        values
+            .iter()
+            .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+            .collect()
+    }
+
+    #[test]
+    fn documented_pinned_launch_is_admitted_but_product_overrides_are_not() {
+        let cargo_home = Path::new("/project/.tmp/cargo-home/offline-v1");
+        let pinned_launch = environment(&[
+            ("CARGO", "/opt/rust-bin-1.97.1/bin/cargo"),
+            ("CARGO_HOME", "/project/.tmp/cargo-home/offline-v1"),
+            ("CARGO_INCREMENTAL", "0"),
+            ("CARGO_NET_OFFLINE", "true"),
+        ]);
+        assert!(validate_ambient_build_environment(cargo_home, pinned_launch).is_ok());
+
+        for override_name in [
+            "RUSTC",
+            "CARGO_BUILD_RUSTC",
+            "CARGO_TARGET_DIR",
+            "CARGO_TARGET_X86_64_UNKNOWN_WYRMROOT_LINKER",
+            "WYRMROOT_RUSTC",
+            "DEEPWYRM_GUEST_TEST_SELECTOR",
+        ] {
+            let mut hostile = environment(&[("CARGO_HOME", "/project/.tmp/cargo-home/offline-v1")]);
+            hostile.push((
+                OsString::from(override_name),
+                OsString::from("host-override"),
+            ));
+            assert!(
+                validate_ambient_build_environment(cargo_home, hostile).is_err(),
+                "accepted ambient product override {override_name}"
+            );
+        }
+        assert!(
+            validate_ambient_build_environment(
+                cargo_home,
+                environment(&[("CARGO_HOME", "/tmp/arbitrary-cargo-home")]),
+            )
+            .is_err()
+        );
+
+        let source = include_str!("wyr1b.rs");
+        assert!(source.contains(".env(\"CARGO_HOME\", cargo_home)"));
+        let kernel_build = source
+            .split_once("fn build_kernel(")
+            .expect("kernel build entry")
+            .1
+            .split_once("fn read_pinned_firmware(")
+            .expect("kernel build boundary")
+            .0;
+        assert!(kernel_build.contains(".env_remove(\"CARGO_HOME\")"));
+    }
 
     fn record(nonce: u64, sequence: u32, event: u8) -> [u8; 96] {
         let mut record = [b'|'; 96];

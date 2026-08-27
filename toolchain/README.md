@@ -174,6 +174,11 @@ contains the measured selector-27 bootfs, the kernel built with the matching
 `DEEPWYRM_WYR1B_EVIDENCE_NONCE` and
 `DEEPWYRM_WYR1B_BOOTFS_MAX_PAGES`, an independently inspected ESP, and exact
 source, kernel, product, and run receipts. Outputs and runs are one-shot.
+The outer launcher's `CARGO` path and exact project `CARGO_HOME` are admitted
+only as host-launch state: native and UEFI product commands select the accepted
+product Cargo and canonical home explicitly, while the Deepwyrm launcher
+receives no inherited `CARGO_HOME` and selects its own accepted target-lane
+home.
 
 The same freeze also creates disjoint
 `selector25/normal/request.toml` and
