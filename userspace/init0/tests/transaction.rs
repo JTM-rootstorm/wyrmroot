@@ -1,7 +1,8 @@
 #![cfg_attr(
     any(
         feature = "i-capability-integration",
-        feature = "dw1b-preemption-integration"
+        feature = "dw1b-preemption-integration",
+        feature = "dw1c-preemption-integration"
     ),
     allow(unused_crate_dependencies)
 )]
@@ -186,6 +187,10 @@ struct Fixture {
     close_failures: Vec<DwHandle>,
     sent: Vec<u8>,
     closed: Vec<DwHandle>,
+    #[cfg(feature = "dw1c-preemption-integration")]
+    dw1c_arm: Option<[wyrmroot_runtime::Dw1cActorBindV1; wyrmroot_runtime::DW1C_ACTOR_COUNT]>,
+    #[cfg(feature = "dw1c-preemption-integration")]
+    dw1c_complete: Option<u64>,
 }
 
 impl Fixture {
@@ -217,6 +222,10 @@ impl Fixture {
             close_failures: Vec::new(),
             sent: Vec::new(),
             closed: Vec::new(),
+            #[cfg(feature = "dw1c-preemption-integration")]
+            dw1c_arm: None,
+            #[cfg(feature = "dw1c-preemption-integration")]
+            dw1c_complete: None,
         }
     }
 }
@@ -297,6 +306,23 @@ impl Init0System for Fixture {
         } else {
             Ok(())
         }
+    }
+
+    #[cfg(feature = "dw1c-preemption-integration")]
+    fn arm_dw1c_preemption(
+        &mut self,
+        bindings: &[wyrmroot_runtime::Dw1cActorBindV1; wyrmroot_runtime::DW1C_ACTOR_COUNT],
+    ) -> Result<(), NativeError> {
+        assert!(self.dw1c_arm.is_none());
+        self.dw1c_arm = Some(*bindings);
+        Ok(())
+    }
+
+    #[cfg(feature = "dw1c-preemption-integration")]
+    fn complete_dw1c_workload(&mut self, digest: u64) -> Result<(), NativeError> {
+        assert!(self.dw1c_complete.is_none());
+        self.dw1c_complete = Some(digest);
+        Ok(())
     }
 }
 

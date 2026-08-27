@@ -75,7 +75,8 @@ pub const DW1B_PROGRESS_PATH: &[u8] = b"test/dw1-b/progress";
 #[cfg(not(any(
     feature = "i2-stress-integration",
     feature = "i-capability-integration",
-    feature = "dw1b-preemption-integration"
+    feature = "dw1b-preemption-integration",
+    feature = "dw1c-preemption-integration"
 )))]
 #[used]
 static INIT0_PROFILE_MARKER: [u8; 29] = *b"WYRMINIT0-PROFILE-V1:ordinary";
@@ -106,7 +107,8 @@ static INIT0_PROFILE_MARKER: [u8; 33] = *b"WYRMINIT0-PROFILE-V1:i-capability";
     feature = "dw1b-preemption-integration",
     not(any(
         feature = "i2-stress-integration",
-        feature = "i-capability-integration"
+        feature = "i-capability-integration",
+        feature = "dw1c-preemption-integration"
     ))
 ))]
 #[used]
@@ -122,6 +124,41 @@ static INIT0_PROFILE_MARKER: [u8; 36] = *b"WYRMINIT0-PROFILE-V1:dw1b-preemption"
 ))]
 #[used]
 static INIT0_PROFILE_MARKER: [u8; 36] = *b"WYRMINIT0-PROFILE-V1:dw1c-preemption";
+
+#[cfg(feature = "dw1c-preemption-integration")]
+const DW1C_ROLE_CODES: [u64; wyrmroot_runtime::DW1C_ACTOR_COUNT] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+
+/// Commits the selector-local ARM only after the controller has retained ten
+/// distinct live Process handles in fixed token order.  Process creation and
+/// READY supervision remain outside this small linear commit point so every
+/// earlier failure can use the ordinary loader cleanup path.
+#[cfg(feature = "dw1c-preemption-integration")]
+fn arm_dw1c_after_ready<System: Init0System>(
+    system: &mut System,
+    processes: [DwHandle; wyrmroot_runtime::DW1C_ACTOR_COUNT],
+) -> Result<(), Init0Error> {
+    let mut bindings = [wyrmroot_runtime::Dw1cActorBindV1 {
+        token: 0,
+        role: 0,
+        process: DwHandle(0),
+    }; wyrmroot_runtime::DW1C_ACTOR_COUNT];
+    let mut index = 0;
+    while index < bindings.len() {
+        let process = processes[index];
+        if process.0 == 0 || processes[..index].contains(&process) {
+            return Err(Init0Error::MissingLoadedProcess);
+        }
+        bindings[index] = wyrmroot_runtime::Dw1cActorBindV1 {
+            token: (index + 1) as u64,
+            role: DW1C_ROLE_CODES[index],
+            process,
+        };
+        index += 1;
+    }
+    system
+        .arm_dw1c_preemption(&bindings)
+        .map_err(Init0Error::Native)
+}
 
 /// Native operations used by the WYR0-G `init0` descendant transaction.
 pub trait Init0System {
