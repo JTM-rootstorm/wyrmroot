@@ -152,7 +152,7 @@ use wyrmroot_bootstrap_proto::{
     BOOTSTRAP_INIT_V2_SIZE, BOOTSTRAP_READY_V2_SIZE, BootstrapMessage, DecodeError, InitMessageV2,
     MAX_BOOTSTRAP_HANDLES, ReadyMessageV2, decode,
 };
-use wyrmroot_loader::launch::LaunchProfile;
+use wyrmroot_loader::launch::{LaunchError, LaunchProfile};
 use wyrmroot_loader::process::{
     LoadAuthority, LoadError, LoadRequest, LoadStage, LoadedProcess, LoaderPlatform,
 };
@@ -165,7 +165,9 @@ use wyrmroot_runtime::{
     ReceiveCounts, SELF_ROOT_EXPECTATION, validate_bootstrap_channel,
     validate_init_capabilities_v2,
 };
-use wyrmroot_runtime::{SupervisionError, SupervisionPlatform};
+use wyrmroot_runtime::{
+    ExitObservedReadinessError, ExitValidationError, SupervisionError, SupervisionPlatform,
+};
 
 /// Launches exactly `/system/init`, accepts its operational WRLP 1.2 READY,
 /// retires primordial authority, and reports READY to the kernel parent. The
@@ -379,14 +381,140 @@ impl BootstrapError {
                 rollback_failed,
             }) => loader_platform_exit_code(*stage, *cause, *rollback_failed),
             Self::Loader(_) => PREFIX | 0x01FF,
-            Self::Supervision(SupervisionError::Exit(
-                wyrmroot_runtime::ExitValidationError::NonzeroApplicationCode(code),
-            )) => *code,
-            Self::Supervision(_) => PREFIX | 0x0200,
+            Self::Supervision(error) => supervision_exit_code(error),
             Self::Cleanup(error) => cleanup_exit_code(*error),
             Self::MissingLoadedProcess => PREFIX | 0x0301,
         }
     }
+}
+
+/// Encodes the exact supervision stage in the low six bits so selector
+/// diagnostics that retain only the bootstrap family and bounded category do
+/// not collapse every READY failure to the old `0xB000_0200` value.
+///
+/// Bits 19..6 carry a bounded native, framing, or count detail. Bit 20 marks a
+/// malformed native output rather than a native status. Descendant nonzero
+/// application codes remain unchanged because they are already the most exact
+/// available diagnosis.
+const fn supervision_exit_code(error: &SupervisionError<NativeError>) -> u32 {
+    const UNBOUNDED_DEADLINE: u32 = 1;
+    const PLATFORM: u32 = 2;
+    const EXIT_QUERY: u32 = 3;
+    const INVALID_WAIT_RESULT: u32 = 4;
+    const INVALID_READY_RECEIVE: u32 = 5;
+    const READY: u32 = 6;
+    const EXITED_BEFORE_READY: u32 = 7;
+    const PEER_CLOSED_BEFORE_READY: u32 = 8;
+    const DUPLICATE_READY: u32 = 9;
+    const EXIT_INVALID_ENVELOPE: u32 = 10;
+    const EXIT_NOT_EXITED: u32 = 11;
+    const EXIT_NOT_NORMAL: u32 = 12;
+    const EXIT_NONZERO_EXCEPTION: u32 = 13;
+    const EXIT_DRAIN_PLATFORM: u32 = 14;
+    const EXIT_DRAIN_INVALID_WAIT: u32 = 15;
+    const EXIT_DRAIN_INVALID_RECEIVE: u32 = 16;
+    const EXIT_DRAIN_READY: u32 = 17;
+    const EXIT_DRAIN_DUPLICATE_READY: u32 = 18;
+
+    match error {
+        SupervisionError::UnboundedDeadline => supervision_code(UNBOUNDED_DEADLINE, 0),
+        SupervisionError::Platform(error) => supervision_native_code(PLATFORM, *error),
+        SupervisionError::ExitQuery(error) => supervision_native_code(EXIT_QUERY, *error),
+        SupervisionError::InvalidWaitResult => supervision_code(INVALID_WAIT_RESULT, 0),
+        SupervisionError::InvalidReadyReceive(counts) => {
+            supervision_code(INVALID_READY_RECEIVE, receive_counts_detail(*counts))
+        }
+        SupervisionError::Ready(error) => supervision_code(READY, launch_error_code(*error)),
+        SupervisionError::ExitedBeforeReady => supervision_code(EXITED_BEFORE_READY, 0),
+        SupervisionError::PeerClosedBeforeReady => supervision_code(PEER_CLOSED_BEFORE_READY, 0),
+        SupervisionError::DuplicateReady => supervision_code(DUPLICATE_READY, 0),
+        SupervisionError::Exit(ExitValidationError::InvalidEnvelope) => {
+            supervision_code(EXIT_INVALID_ENVELOPE, 0)
+        }
+        SupervisionError::Exit(ExitValidationError::NotExited) => {
+            supervision_code(EXIT_NOT_EXITED, 0)
+        }
+        SupervisionError::Exit(ExitValidationError::NotNormalExit) => {
+            supervision_code(EXIT_NOT_NORMAL, 0)
+        }
+        SupervisionError::Exit(ExitValidationError::NonzeroApplicationCode(code)) => *code,
+        SupervisionError::Exit(ExitValidationError::NonzeroExceptionFields) => {
+            supervision_code(EXIT_NONZERO_EXCEPTION, 0)
+        }
+        SupervisionError::ExitObservedReadiness(ExitObservedReadinessError::Platform(error)) => {
+            supervision_native_code(EXIT_DRAIN_PLATFORM, *error)
+        }
+        SupervisionError::ExitObservedReadiness(ExitObservedReadinessError::InvalidWaitResult) => {
+            supervision_code(EXIT_DRAIN_INVALID_WAIT, 0)
+        }
+        SupervisionError::ExitObservedReadiness(
+            ExitObservedReadinessError::InvalidReadyReceive(counts),
+        ) => supervision_code(EXIT_DRAIN_INVALID_RECEIVE, receive_counts_detail(*counts)),
+        SupervisionError::ExitObservedReadiness(ExitObservedReadinessError::Ready(error)) => {
+            supervision_code(EXIT_DRAIN_READY, launch_error_code(*error))
+        }
+        SupervisionError::ExitObservedReadiness(ExitObservedReadinessError::DuplicateReady) => {
+            supervision_code(EXIT_DRAIN_DUPLICATE_READY, 0)
+        }
+    }
+}
+
+const fn supervision_code(category: u32, detail: u32) -> u32 {
+    const PREFIX: u32 = 0xB020_0000;
+    const DETAIL_MAX: u32 = 0x3FFF;
+    let detail = if detail > DETAIL_MAX {
+        DETAIL_MAX
+    } else {
+        detail
+    };
+    PREFIX | (detail << 6) | category
+}
+
+const fn supervision_native_code(category: u32, error: NativeError) -> u32 {
+    const OUTPUT: u32 = 1 << 20;
+    match error {
+        NativeError::Status(status) => supervision_code(category, status.0.unsigned_abs()),
+        NativeError::Output(output) => {
+            supervision_code(category, native_output_code(output)) | OUTPUT
+        }
+    }
+}
+
+const fn receive_counts_detail(counts: ReceiveCounts) -> u32 {
+    const COUNT_MAX: usize = 0x7F;
+    let bytes = if counts.bytes > COUNT_MAX {
+        COUNT_MAX
+    } else {
+        counts.bytes
+    };
+    let handles = if counts.handles > COUNT_MAX {
+        COUNT_MAX
+    } else {
+        counts.handles
+    };
+    ((bytes as u32) << 7) | handles as u32
+}
+
+const fn launch_error_code(error: LaunchError) -> u32 {
+    match error {
+        LaunchError::BufferSize => 1,
+        LaunchError::BadMagic => 2,
+        LaunchError::BadVersion => 3,
+        LaunchError::BadType => 4,
+        LaunchError::NonzeroFlags => 5,
+        LaunchError::BadTotalSize => 6,
+        LaunchError::BadCapabilityCount => 7,
+        LaunchError::ZeroTransaction => 8,
+        LaunchError::TransactionMismatch => 9,
+        LaunchError::NonzeroReserved => 10,
+        LaunchError::BadCapabilityRole { index } => 0x100 | bounded_index(index),
+        LaunchError::HandleCount => 11,
+        LaunchError::HandleMetadata { index } => 0x200 | bounded_index(index),
+    }
+}
+
+const fn bounded_index(index: usize) -> u32 {
+    if index > 0xFF { 0xFF } else { index as u32 }
 }
 
 #[cfg(feature = "i-capability-relay")]

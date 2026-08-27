@@ -1,9 +1,7 @@
-#[cfg(feature = "i-capability-relay")]
-use deepwyrm_syscall::DW_STATUS_TIMED_OUT;
 use deepwyrm_syscall::DW_STATUS_WOULD_BLOCK;
 use deepwyrm_syscall::{
     DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL, DW_OBJECT_TYPE_MEMORY_OBJECT,
-    DW_OBJECT_TYPE_TASK_GROUP, DW_STATUS_BAD_HANDLE, DwHandle, DwObjectType,
+    DW_OBJECT_TYPE_TASK_GROUP, DW_STATUS_BAD_HANDLE, DW_STATUS_TIMED_OUT, DwHandle, DwObjectType,
     DwReceivedHandleInfoV1, DwRights,
 };
 use deepwyrm_syscall::{
@@ -45,7 +43,9 @@ use wyrmroot_runtime::{
     BOOTFS_EXPECTATION, BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo,
     LOADER_TASK_GROUP_EXPECTATION, MappingPlan, NativeError, ReceiveCounts, SELF_ROOT_EXPECTATION,
 };
-use wyrmroot_runtime::{ExitValidationError, SupervisionError, SupervisionPlatform};
+use wyrmroot_runtime::{
+    ExitObservedReadinessError, ExitValidationError, SupervisionError, SupervisionPlatform,
+};
 use wyrmroot_runtime::{StartupError, startup_error_exit_code};
 
 const CHANNEL: DwHandle = DwHandle(11);
@@ -131,6 +131,140 @@ fn live_exit_code_identifies_bootstrap_owned_failure() {
         BootstrapError::CapabilityRelay(Wrcap1RelayError::UnexpectedKind).exit_code(),
         0xB000_0D0A
     );
+}
+
+#[test]
+fn supervision_exit_codes_preserve_every_bounded_failure_category() {
+    let cases = [
+        (
+            BootstrapError::Supervision(SupervisionError::UnboundedDeadline),
+            0xB020_0001,
+        ),
+        (
+            BootstrapError::Supervision(SupervisionError::Platform(NativeError::Status(
+                DW_STATUS_TIMED_OUT,
+            ))),
+            0xB020_0242,
+        ),
+        (
+            BootstrapError::Supervision(SupervisionError::ExitQuery(NativeError::Output(
+                wyrmroot_runtime::NativeOutputError::InvalidTaskTerminationInfo,
+            ))),
+            0xB030_01C3,
+        ),
+        (
+            BootstrapError::Supervision(SupervisionError::InvalidWaitResult),
+            0xB020_0004,
+        ),
+        (
+            BootstrapError::Supervision(SupervisionError::InvalidReadyReceive(ReceiveCounts {
+                bytes: 40,
+                handles: 1,
+            })),
+            0xB025_0045,
+        ),
+        (
+            BootstrapError::Supervision(SupervisionError::Ready(
+                launch::LaunchError::TransactionMismatch,
+            )),
+            0xB020_0246,
+        ),
+        (
+            BootstrapError::Supervision(SupervisionError::ExitedBeforeReady),
+            0xB020_0007,
+        ),
+        (
+            BootstrapError::Supervision(SupervisionError::PeerClosedBeforeReady),
+            0xB020_0008,
+        ),
+        (
+            BootstrapError::Supervision(SupervisionError::DuplicateReady),
+            0xB020_0009,
+        ),
+        (
+            BootstrapError::Supervision(SupervisionError::Exit(
+                ExitValidationError::InvalidEnvelope,
+            )),
+            0xB020_000A,
+        ),
+        (
+            BootstrapError::Supervision(SupervisionError::Exit(ExitValidationError::NotExited)),
+            0xB020_000B,
+        ),
+        (
+            BootstrapError::Supervision(SupervisionError::Exit(ExitValidationError::NotNormalExit)),
+            0xB020_000C,
+        ),
+        (
+            BootstrapError::Supervision(SupervisionError::Exit(
+                ExitValidationError::NonzeroExceptionFields,
+            )),
+            0xB020_000D,
+        ),
+        (
+            BootstrapError::Supervision(SupervisionError::ExitObservedReadiness(
+                ExitObservedReadinessError::Platform(NativeError::Status(
+                    deepwyrm_syscall::DW_STATUS_BAD_HANDLE,
+                )),
+            )),
+            0xB020_008E,
+        ),
+        (
+            BootstrapError::Supervision(SupervisionError::ExitObservedReadiness(
+                ExitObservedReadinessError::InvalidWaitResult,
+            )),
+            0xB020_000F,
+        ),
+        (
+            BootstrapError::Supervision(SupervisionError::ExitObservedReadiness(
+                ExitObservedReadinessError::InvalidReadyReceive(ReceiveCounts {
+                    bytes: 0,
+                    handles: 1,
+                }),
+            )),
+            0xB020_0050,
+        ),
+        (
+            BootstrapError::Supervision(SupervisionError::ExitObservedReadiness(
+                ExitObservedReadinessError::Ready(launch::LaunchError::BadMagic),
+            )),
+            0xB020_0091,
+        ),
+        (
+            BootstrapError::Supervision(SupervisionError::ExitObservedReadiness(
+                ExitObservedReadinessError::DuplicateReady,
+            )),
+            0xB020_0012,
+        ),
+    ];
+
+    let mut categories = 0_u64;
+    for (error, expected) in cases {
+        let code = error.exit_code();
+        assert_eq!(code, expected);
+        let category = code & 0x3F;
+        assert_ne!(category, 0);
+        let bit = 1_u64 << category;
+        assert_eq!(
+            categories & bit,
+            0,
+            "duplicate supervision category {category}"
+        );
+        categories |= bit;
+    }
+}
+
+#[test]
+fn supervision_exit_code_preserves_exact_descendant_application_status() {
+    for code in [1, 0xAF01_0002, u32::MAX] {
+        assert_eq!(
+            BootstrapError::Supervision(SupervisionError::Exit(
+                ExitValidationError::NonzeroApplicationCode(code),
+            ))
+            .exit_code(),
+            code
+        );
+    }
 }
 
 struct Fixture {
