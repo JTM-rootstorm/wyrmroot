@@ -116,10 +116,10 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
             smp,
         } => wyr1_evidence(&request, &default, &smp).map(Some),
         Action::Wyr1BImage(request) => wyr1b::build(std::path::Path::new(&request)).map(Some),
+        Action::Wyr1BFreeze(output) => wyr1b::freeze(std::path::Path::new(&output)).map(Some),
         Action::Wyr1BInspect(request) => wyr1b::inspect(std::path::Path::new(&request)).map(Some),
-        Action::Wyr1BEvidence { request, log } => {
-            wyr1b::evidence(std::path::Path::new(&request), std::path::Path::new(&log)).map(Some)
-        }
+        Action::Wyr1BRun(request) => wyr1b::run(std::path::Path::new(&request)).map(Some),
+        Action::Wyr1BEvidence(request) => wyr1b::evidence(std::path::Path::new(&request)).map(Some),
         Action::Dw1BImage(request) => dw1b::build(std::path::Path::new(&request)).map(Some),
         Action::Dw1BImageRebuild(request) => {
             dw1b::rebuild(std::path::Path::new(&request)).map(Some)

@@ -18,9 +18,11 @@ Usage:
     cargo xtask wyr1 inspect --request <wyr1-a-request.toml>
     cargo xtask wyr1 prepare --request <wyr1-a-request.toml>
     cargo xtask wyr1 evidence --request <wyr1-a-request.toml> --default <log> --smp <log>
+    cargo xtask wyr1b freeze --output <fresh-directory>
     cargo xtask wyr1b image --request <wyr1-b-request.toml>
     cargo xtask wyr1b inspect --request <wyr1-b-request.toml>
-    cargo xtask wyr1b evidence --request <wyr1-b-request.toml> --log <evidence>
+    cargo xtask wyr1b run --request <wyr1-b-request.toml>
+    cargo xtask wyr1b evidence --request <wyr1-b-request.toml>
     cargo xtask dw1b image --request <dw1-b-request.toml>
     cargo xtask dw1b image-rebuild --request <dw1-b-request.toml>
     cargo xtask dw1b freeze --output <directory>
@@ -114,11 +116,10 @@ pub(crate) enum Action {
         smp: String,
     },
     Wyr1BImage(String),
+    Wyr1BFreeze(String),
     Wyr1BInspect(String),
-    Wyr1BEvidence {
-        request: String,
-        log: String,
-    },
+    Wyr1BRun(String),
+    Wyr1BEvidence(String),
     Dw1BImage(String),
     Dw1BImageRebuild(String),
     Dw1BFreeze(String),
@@ -236,22 +237,23 @@ fn dispatch_dw1b(arguments: &[String]) -> Result<Action, Failure> {
 
 fn dispatch_wyr1b(arguments: &[String]) -> Result<Action, Failure> {
     match arguments {
+        [command, flag, output] if command == "freeze" && flag == "--output" => {
+            Ok(Action::Wyr1BFreeze(output.clone()))
+        }
         [command, flag, request] if command == "image" && flag == "--request" => {
             Ok(Action::Wyr1BImage(request.clone()))
         }
         [command, flag, request] if command == "inspect" && flag == "--request" => {
             Ok(Action::Wyr1BInspect(request.clone()))
         }
-        [command, flag, request, log_flag, log]
-            if command == "evidence" && flag == "--request" && log_flag == "--log" =>
-        {
-            Ok(Action::Wyr1BEvidence {
-                request: request.clone(),
-                log: log.clone(),
-            })
+        [command, flag, request] if command == "run" && flag == "--request" => {
+            Ok(Action::Wyr1BRun(request.clone()))
+        }
+        [command, flag, request] if command == "evidence" && flag == "--request" => {
+            Ok(Action::Wyr1BEvidence(request.clone()))
         }
         _ => Err(Failure::usage(
-            "wyr1b requires image|inspect --request <path>, or evidence --request <path> --log <evidence>",
+            "wyr1b requires freeze --output <fresh-directory> or image|inspect|run|evidence --request <path>",
         )),
     }
 }
@@ -627,6 +629,29 @@ mod tests {
             ])),
             Ok(Action::Dw1BImageRebuild("request.toml".into()))
         );
+    }
+
+    #[test]
+    fn wyr1b_freeze_run_and_request_bound_evidence_dispatch() {
+        assert_eq!(
+            dispatch(&arguments(&["wyr1b", "freeze", "--output", "freeze"])),
+            Ok(Action::Wyr1BFreeze("freeze".into()))
+        );
+        assert_eq!(
+            dispatch(&arguments(&["wyr1b", "run", "--request", "request.toml"])),
+            Ok(Action::Wyr1BRun("request.toml".into()))
+        );
+        assert_eq!(
+            dispatch(&arguments(&[
+                "wyr1b",
+                "evidence",
+                "--request",
+                "request.toml"
+            ])),
+            Ok(Action::Wyr1BEvidence("request.toml".into()))
+        );
+        assert!(USAGE.contains("wyr1b freeze --output"));
+        assert!(USAGE.contains("wyr1b run --request"));
     }
 
     #[test]

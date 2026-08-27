@@ -154,3 +154,30 @@ existing path:
 ```text
 tools/pinned-cargo xtask build bootfs
 ```
+
+## WYR1-B acceptance freeze
+
+The selector-27 acceptance product is created only through the one-shot,
+request-bound pipeline:
+
+```text
+cargo xtask wyr1b freeze --output /tmp/wyr1b-candidate-fresh
+cargo xtask wyr1b inspect --request /tmp/wyr1b-candidate-fresh/selector27/request.toml
+cargo xtask wyr1b run --request /tmp/wyr1b-candidate-fresh/selector27/request.toml
+cargo xtask wyr1b evidence --request /tmp/wyr1b-candidate-fresh/selector27/request.toml
+```
+
+Freeze requires exact clean Wyrmroot and canonical sibling Deepwyrm revisions,
+the accepted Rust artifact, an offline dependency graph, pinned OVMF inputs,
+and no ambient compiler, target, selector, or evidence overrides. Its output
+contains the measured selector-27 bootfs, the kernel built with the matching
+`DEEPWYRM_WYR1B_EVIDENCE_NONCE` and
+`DEEPWYRM_WYR1B_BOOTFS_MAX_PAGES`, an independently inspected ESP, and exact
+source, kernel, product, and run receipts. Outputs and runs are one-shot.
+
+The same freeze also creates disjoint
+`selector25/normal/request.toml` and
+`selector25/degraded_recovery/request.toml` products. Each has its own
+selector-25 kernel scenario and nonce. Prepare their paired default/SMP run
+bundles with `cargo xtask wyr1 prepare --request <request>`; selector-27 media
+and evidence identities are never reused for those regressions.
