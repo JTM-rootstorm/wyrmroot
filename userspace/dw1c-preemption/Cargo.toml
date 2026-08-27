@@ -1,0 +1,60 @@
+[package]
+name = "wyrmroot-dw1c-preemption"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Selector-28 fixed ten-actor preemption workload"
+license = "GPL-3.0-or-later"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+native-payloads = ["wyrmroot-runtime/dw1c-test-evidence"]
+
+[dependencies]
+deepwyrm-syscall.workspace = true
+wyrmroot-loader = { path = "../../crates/wyrmroot-loader" }
+wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }
+
+[[bin]]
+name = "wyrmroot-dw1c-actor1"
+path = "src/bin/actor1.rs"
+required-features = ["native-payloads"]
+[[bin]]
+name = "wyrmroot-dw1c-actor2"
+path = "src/bin/actor2.rs"
+required-features = ["native-payloads"]
+[[bin]]
+name = "wyrmroot-dw1c-actor3"
+path = "src/bin/actor3.rs"
+required-features = ["native-payloads"]
+[[bin]]
+name = "wyrmroot-dw1c-actor4"
+path = "src/bin/actor4.rs"
+required-features = ["native-payloads"]
+[[bin]]
+name = "wyrmroot-dw1c-actor5"
+path = "src/bin/actor5.rs"
+required-features = ["native-payloads"]
+[[bin]]
+name = "wyrmroot-dw1c-actor6"
+path = "src/bin/actor6.rs"
+required-features = ["native-payloads"]
+[[bin]]
+name = "wyrmroot-dw1c-actor7"
+path = "src/bin/actor7.rs"
+required-features = ["native-payloads"]
+[[bin]]
+name = "wyrmroot-dw1c-actor8"
+path = "src/bin/actor8.rs"
+required-features = ["native-payloads"]
+[[bin]]
+name = "wyrmroot-dw1c-actor9"
+path = "src/bin/actor9.rs"
+required-features = ["native-payloads"]
+[[bin]]
+name = "wyrmroot-dw1c-actor10"
+path = "src/bin/actor10.rs"
+required-features = ["native-payloads"]
