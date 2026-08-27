@@ -535,44 +535,117 @@ fn load_process_internal<P: LoaderPlatform>(
         };
     }
     let plan = elf::plan(request.image, &mut segments).map_err(LoadError::Elf)?;
-    let mut startup_block = [0_u8; image::STARTUP_V2_BLOCK_BYTES];
-    let (startup_size, startup_offset, stack_pointer, startup_abi) = match request.startup {
-        StartupSpec::Legacy(display_path) => {
-            image::write_startup_block(
-                &mut startup_block[..PAGE_SIZE as usize],
-                image::INITIAL_STACK_POINTER,
-                display_path,
-            )
-            .map_err(LoadError::Startup)?;
-            (
-                PAGE_SIZE as usize,
-                INITIAL_STACK.startup_page_offset,
-                INITIAL_STACK.stack_pointer,
-                image::STARTUP_ABI_VERSION,
-            )
-        }
+    match request.startup {
+        StartupSpec::Legacy(display_path) => load_legacy_process_materialized(
+            platform,
+            authority,
+            request,
+            display_path,
+            fault,
+            delegated_channels_consumed,
+            plan,
+        ),
         StartupSpec::JobV2 {
             path,
             argv,
             environment,
-        } => {
-            image::write_startup_block_v2(
-                &mut startup_block,
-                image::STARTUP_V2_BLOCK_ADDRESS,
-                path,
-                argv,
-                environment,
-            )
-            .map_err(LoadError::Startup)?;
-            (
-                image::STARTUP_V2_BLOCK_BYTES,
-                INITIAL_STACK.object_size - image::STARTUP_V2_BLOCK_BYTES as u64,
-                image::STARTUP_V2_BLOCK_ADDRESS,
-                image::STARTUP_ABI_V2,
-            )
-        }
-    };
-    apply_startup_fault(&mut startup_block[..startup_size], fault);
+        } => load_job_v2_process_materialized(
+            platform,
+            authority,
+            request,
+            path,
+            argv,
+            environment,
+            fault,
+            delegated_channels_consumed,
+            plan,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn load_legacy_process_materialized<P: LoaderPlatform>(
+    platform: &mut P,
+    authority: LoadAuthority,
+    request: InternalLoadRequest<'_>,
+    display_path: &str,
+    fault: LoadFault,
+    delegated_channels_consumed: &mut bool,
+    plan: elf::ElfLoadPlan<'_>,
+) -> Result<LoadedProcess, LoadError<P::Error>> {
+    let mut startup_block = [0_u8; PAGE_SIZE as usize];
+    image::write_startup_block(
+        &mut startup_block,
+        image::INITIAL_STACK_POINTER,
+        display_path,
+    )
+    .map_err(LoadError::Startup)?;
+    apply_startup_fault(&mut startup_block, fault);
+    load_process_materialized(
+        platform,
+        authority,
+        request,
+        fault,
+        delegated_channels_consumed,
+        plan,
+        &startup_block,
+        INITIAL_STACK.startup_page_offset,
+        INITIAL_STACK.stack_pointer,
+        image::STARTUP_ABI_VERSION,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn load_job_v2_process_materialized<P: LoaderPlatform>(
+    platform: &mut P,
+    authority: LoadAuthority,
+    request: InternalLoadRequest<'_>,
+    path: &str,
+    argv: &[&str],
+    environment: &[&str],
+    fault: LoadFault,
+    delegated_channels_consumed: &mut bool,
+    plan: elf::ElfLoadPlan<'_>,
+) -> Result<LoadedProcess, LoadError<P::Error>> {
+    let mut startup_block = [0_u8; image::STARTUP_V2_BLOCK_BYTES];
+    image::write_startup_block_v2(
+        &mut startup_block,
+        image::STARTUP_V2_BLOCK_ADDRESS,
+        path,
+        argv,
+        environment,
+    )
+    .map_err(LoadError::Startup)?;
+    apply_startup_fault(&mut startup_block, fault);
+    load_process_materialized(
+        platform,
+        authority,
+        request,
+        fault,
+        delegated_channels_consumed,
+        plan,
+        &startup_block,
+        INITIAL_STACK.object_size - image::STARTUP_V2_BLOCK_BYTES as u64,
+        image::STARTUP_V2_BLOCK_ADDRESS,
+        image::STARTUP_ABI_V2,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_process_materialized<P: LoaderPlatform>(
+    platform: &mut P,
+    authority: LoadAuthority,
+    request: InternalLoadRequest<'_>,
+    fault: LoadFault,
+    delegated_channels_consumed: &mut bool,
+    plan: elf::ElfLoadPlan<'_>,
+    startup_block: &[u8],
+    startup_offset: u64,
+    stack_pointer: u64,
+    startup_abi: u64,
+) -> Result<LoadedProcess, LoadError<P::Error>> {
     let mut init = [0_u8; INIT0_BYTES];
     let init_len = launch::encode_init(request.profile, request.transaction_id, &mut init)
         .map_err(LoadError::Launch)?;
@@ -713,7 +786,7 @@ fn load_process_internal<P: LoaderPlatform>(
         stack,
         INITIAL_STACK.object_size,
         startup_offset,
-        &startup_block[..startup_size],
+        startup_block,
     ) {
         Ok(mapping) => mapping,
         Err(cause) => {

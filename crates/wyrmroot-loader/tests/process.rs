@@ -393,6 +393,15 @@ fn bootstrap_registry_moves_self_root_and_controller_endpoint() {
         wyrmroot_loader::launch::CHILD_CHANNEL_RIGHTS
     );
     assert_eq!(&platform.sent_init[6..8], &3_u16.to_le_bytes());
+    assert_eq!(platform.started_abi, Some(1));
+    assert_eq!(
+        platform.started_stack_pointer,
+        Some(wyrmroot_loader::image::INITIAL_STACK_POINTER)
+    );
+    assert_eq!(
+        platform.materialized.last().unwrap().len(),
+        wyrmroot_loader::elf::PAGE_SIZE as usize
+    );
 }
 
 #[test]
