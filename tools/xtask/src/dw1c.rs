@@ -9,9 +9,15 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use crate::error::Failure;
+use crate::metadata::BuildManifest;
 use crate::sha256;
+
+const NATIVE_TARGET: &str = "x86_64-unknown-wyrmroot";
+const DW1C_INIT_FEATURES: &str = "native-init0,dw1c-preemption-integration";
+const DW1C_ACTOR_FEATURES: &str = "native-payloads";
 
 const SELECTOR: &str = "normal-preemption-smp";
 const TEST_ID: &str = "28";
@@ -134,6 +140,399 @@ const BUILD_RECEIPT_KEYS: [&str; 29] = [
     "ovmf_code_sha256",
     "ovmf_vars_template_sha256",
 ];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WyrBuildSpec {
+    pub(crate) label: &'static str,
+    pub(crate) package: &'static str,
+    pub(crate) binary: &'static str,
+    pub(crate) features: &'static str,
+    pub(crate) requires_progress_digest: bool,
+}
+
+/// Ordered isolated native release builds for the selector-28 userspace half.
+/// Loader construction remains the shared deterministic UEFI pair; the caller
+/// uses these specs only after that pair and the accepted layout are prepared.
+pub(crate) fn wyr_build_specs() -> [WyrBuildSpec; 12] {
+    [
+        WyrBuildSpec {
+            label: "bootstrap",
+            package: "wyrmroot-bootstrap",
+            binary: "wyrmroot-bootstrap",
+            features: "native-bootstrap,wyr0-init0-integration",
+            requires_progress_digest: false,
+        },
+        WyrBuildSpec {
+            label: "init0",
+            package: "wyrmroot-init0",
+            binary: "wyrmroot-init0",
+            features: DW1C_INIT_FEATURES,
+            requires_progress_digest: false,
+        },
+        WyrBuildSpec {
+            label: "actor1",
+            package: "wyrmroot-dw1c-preemption",
+            binary: "wyrmroot-dw1c-actor1",
+            features: DW1C_ACTOR_FEATURES,
+            requires_progress_digest: true,
+        },
+        WyrBuildSpec {
+            label: "actor2",
+            package: "wyrmroot-dw1c-preemption",
+            binary: "wyrmroot-dw1c-actor2",
+            features: DW1C_ACTOR_FEATURES,
+            requires_progress_digest: true,
+        },
+        WyrBuildSpec {
+            label: "actor3",
+            package: "wyrmroot-dw1c-preemption",
+            binary: "wyrmroot-dw1c-actor3",
+            features: DW1C_ACTOR_FEATURES,
+            requires_progress_digest: true,
+        },
+        WyrBuildSpec {
+            label: "actor4",
+            package: "wyrmroot-dw1c-preemption",
+            binary: "wyrmroot-dw1c-actor4",
+            features: DW1C_ACTOR_FEATURES,
+            requires_progress_digest: true,
+        },
+        WyrBuildSpec {
+            label: "actor5",
+            package: "wyrmroot-dw1c-preemption",
+            binary: "wyrmroot-dw1c-actor5",
+            features: DW1C_ACTOR_FEATURES,
+            requires_progress_digest: true,
+        },
+        WyrBuildSpec {
+            label: "actor6",
+            package: "wyrmroot-dw1c-preemption",
+            binary: "wyrmroot-dw1c-actor6",
+            features: DW1C_ACTOR_FEATURES,
+            requires_progress_digest: true,
+        },
+        WyrBuildSpec {
+            label: "actor7",
+            package: "wyrmroot-dw1c-preemption",
+            binary: "wyrmroot-dw1c-actor7",
+            features: DW1C_ACTOR_FEATURES,
+            requires_progress_digest: true,
+        },
+        WyrBuildSpec {
+            label: "actor8",
+            package: "wyrmroot-dw1c-preemption",
+            binary: "wyrmroot-dw1c-actor8",
+            features: DW1C_ACTOR_FEATURES,
+            requires_progress_digest: true,
+        },
+        WyrBuildSpec {
+            label: "actor9",
+            package: "wyrmroot-dw1c-preemption",
+            binary: "wyrmroot-dw1c-actor9",
+            features: DW1C_ACTOR_FEATURES,
+            requires_progress_digest: true,
+        },
+        WyrBuildSpec {
+            label: "actor10",
+            package: "wyrmroot-dw1c-preemption",
+            binary: "wyrmroot-dw1c-actor10",
+            features: DW1C_ACTOR_FEATURES,
+            requires_progress_digest: true,
+        },
+    ]
+}
+
+/// Bytes and provenance from the Wyrmroot-owned half of a selector-28
+/// product build.  The final 29-field build-lineage receipt is deliberately
+/// rendered only after Deep/kernel, bootfs, ESP, and firmware inputs exist.
+pub(crate) struct WyrArtifactSet {
+    pub(crate) loader: Vec<u8>,
+    pub(crate) bootstrap: Vec<u8>,
+    pub(crate) init0: Vec<u8>,
+    pub(crate) actors: [Vec<u8>; 10],
+    pub(crate) debug_loader: Vec<u8>,
+    pub(crate) debug_symbols: Vec<u8>,
+    pub(crate) effective_uefi_config: String,
+    pub(crate) uefi_inspection_report: String,
+    pub(crate) source_receipt: String,
+}
+
+/// Build the deterministic Wyrmroot artifacts which precede selector-28
+/// kernel/bootfs assembly.  Each native executable has an isolated target
+/// directory, so no actor can borrow an incremental or feature-selected
+/// product from another invocation.
+pub(crate) fn build_wyr_artifact_set(
+    build_root: &Path,
+    source_revision: &str,
+    progress_digest: &str,
+) -> Result<WyrArtifactSet, Failure> {
+    validate_upper_hex(progress_digest, 16, "progress_digest")?;
+    fs::create_dir(build_root).map_err(|error| {
+        Failure::task(format!("could not create fresh DW1-C build root: {error}"))
+    })?;
+    let repository = crate::tasks::repository_root()?;
+    let manifest = BuildManifest::load(&repository)?;
+    let profile = manifest.validate_loader_build_readiness(&repository)?;
+    let layout = crate::deep_layout::prepare(
+        &repository,
+        manifest.deepwyrm_repository()?,
+        manifest.deepwyrm_revision()?,
+    )?;
+    let toolchain = crate::tasks::prepare_loader_toolchain(&repository, &profile, &manifest)?;
+    let cargo_home = crate::tasks::project_cargo_home(&repository, &manifest)?;
+    let uefi = crate::tasks::build_deterministic_uefi_pair(
+        &repository,
+        &toolchain,
+        &profile,
+        &layout,
+        &crate::tasks::IsolatedUefiBuild {
+            cargo_home: &cargo_home,
+            production_target: &build_root.join("uefi-production"),
+            retained_debug_target: &build_root.join("uefi-retained-debug"),
+            cargo_profile: crate::tasks::UefiCargoProfile::Release,
+        },
+    )?;
+    let loader = read_cargo_build_output(&uefi.loader, "loader", 64 * 1024 * 1024)?;
+    let debug_loader = read_cargo_build_output(
+        &uefi.debug_loader,
+        "retained debug loader",
+        64 * 1024 * 1024,
+    )?;
+    let debug_symbols =
+        read_cargo_build_output(&uefi.debug_symbols, "loader PDB", 512 * 1024 * 1024)?;
+
+    let mut artifacts = Vec::with_capacity(12);
+    for spec in wyr_build_specs() {
+        toolchain.accepted().verify_unchanged()?;
+        layout.verify_unchanged()?;
+        let target_dir = build_root.join(spec.label);
+        fs::create_dir(&target_dir).map_err(io)?;
+        let encoded_rustflags = native_remap_flags(&repository, &cargo_home, &target_dir)?;
+        let mut command = Command::new(&toolchain.accepted().cargo);
+        command
+            .args(["build", "--offline", "--locked", "--release", "--target"])
+            .arg(NATIVE_TARGET)
+            .args([
+                "--package",
+                spec.package,
+                "--bin",
+                spec.binary,
+                "--features",
+                spec.features,
+            ])
+            .arg("--target-dir")
+            .arg(&target_dir)
+            .env("RUSTC", &toolchain.accepted().rustc)
+            .env("CARGO_HOME", &cargo_home)
+            .env("CARGO_ENCODED_RUSTFLAGS", encoded_rustflags)
+            .env("CARGO_INCREMENTAL", "0")
+            .env("SOURCE_DATE_EPOCH", "0")
+            .env_remove("LD_AUDIT")
+            .env_remove("LD_LIBRARY_PATH")
+            .env_remove("LD_PRELOAD")
+            .current_dir(&repository)
+            .stdin(Stdio::null());
+        if let Some((key, value)) = progress_digest_environment(spec, progress_digest) {
+            command.env(key, value);
+        } else {
+            command.env_remove("DEEPWYRM_DW1C_PROGRESS_DIGEST");
+        }
+        let status = command.status().map_err(|error| {
+            Failure::task(format!("could not run DW1-C {} build: {error}", spec.label))
+        })?;
+        if !status.success() {
+            return Err(Failure::task(format!(
+                "DW1-C canonical {} release build failed",
+                spec.label
+            )));
+        }
+        let source = target_dir
+            .join(NATIVE_TARGET)
+            .join("release")
+            .join(spec.binary);
+        artifacts.push(read_cargo_build_output(
+            &source,
+            spec.label,
+            64 * 1024 * 1024,
+        )?);
+    }
+    let [
+        bootstrap,
+        init0,
+        actor1,
+        actor2,
+        actor3,
+        actor4,
+        actor5,
+        actor6,
+        actor7,
+        actor8,
+        actor9,
+        actor10,
+    ]: [Vec<u8>; 12] = artifacts
+        .try_into()
+        .map_err(|_| Failure::task("DW1-C build produced the wrong artifact count"))?;
+    verify_clean_repository(&repository, "Wyrmroot", source_revision)?;
+    toolchain.accepted().verify_unchanged()?;
+    layout.verify_unchanged()?;
+    let actors = [
+        actor1, actor2, actor3, actor4, actor5, actor6, actor7, actor8, actor9, actor10,
+    ];
+    let source_receipt = render_wyr_source_receipt(
+        source_revision,
+        progress_digest,
+        toolchain.accepted(),
+        &layout,
+        &uefi,
+        &loader,
+        &bootstrap,
+        &init0,
+        &actors,
+        &toolchain.validation_report_sha256(),
+    )?;
+    Ok(WyrArtifactSet {
+        loader,
+        bootstrap,
+        init0,
+        actors,
+        debug_loader,
+        debug_symbols,
+        effective_uefi_config: uefi.effective_config,
+        uefi_inspection_report: uefi.inspection_report,
+        source_receipt,
+    })
+}
+
+fn progress_digest_environment<'a>(
+    spec: WyrBuildSpec,
+    progress_digest: &'a str,
+) -> Option<(&'static str, &'a str)> {
+    spec.requires_progress_digest
+        .then_some(("DEEPWYRM_DW1C_PROGRESS_DIGEST", progress_digest))
+}
+
+fn render_wyr_source_receipt(
+    source_revision: &str,
+    progress_digest: &str,
+    toolchain: &crate::toolchain_artifact::AcceptedToolchain,
+    layout: &crate::deep_layout::DeepLayoutBuild,
+    uefi: &crate::tasks::DeterministicUefiArtifacts,
+    loader: &[u8],
+    bootstrap: &[u8],
+    init0: &[u8],
+    actors: &[Vec<u8>; 10],
+    toolchain_validation_report_sha256: &str,
+) -> Result<String, Failure> {
+    let repository = crate::tasks::repository_root()?;
+    let cargo_lock_sha256 = sha256::file_digest(&repository.join("Cargo.lock"))
+        .map_err(|error| Failure::task(format!("could not hash Cargo.lock: {error}")))?;
+    let mut fields = BTreeMap::new();
+    for (key, value) in [
+        ("schema_version", "1".to_owned()),
+        ("kind", "wyrmroot-dw1-c-wyr-source-build".to_owned()),
+        ("wyrmroot_revision", source_revision.to_owned()),
+        ("progress_digest", progress_digest.to_owned()),
+        ("profile", "release-separate-invocations".to_owned()),
+        (
+            "rustc_sha256",
+            sha256::file_digest(&toolchain.rustc).map_err(io)?,
+        ),
+        ("cargo_sha256", toolchain.cargo_sha256.clone()),
+        ("rust_lld_sha256", toolchain.rust_lld_sha256.clone()),
+        (
+            "toolchain_manifest_sha256",
+            toolchain.manifest_sha256.clone(),
+        ),
+        (
+            "toolchain_tree_sha256",
+            toolchain.toolchain_tree_sha256.clone(),
+        ),
+        ("cargo_lock_sha256", cargo_lock_sha256),
+        ("deep_layout_sha256", layout.layout_sha256.clone()),
+        (
+            "generated_layout_policy_sha256",
+            layout.policy_sha256.clone(),
+        ),
+        (
+            "uefi_effective_config_sha256",
+            uefi.effective_config_sha256.clone(),
+        ),
+        (
+            "uefi_inspection_report_sha256",
+            uefi.inspection_report_sha256.clone(),
+        ),
+        (
+            "toolchain_validation_report_sha256",
+            toolchain_validation_report_sha256.to_owned(),
+        ),
+        ("loader_sha256", sha256::bytes_digest(loader)),
+        ("bootstrap_sha256", sha256::bytes_digest(bootstrap)),
+        ("init0_sha256", sha256::bytes_digest(init0)),
+    ] {
+        fields.insert(key.to_owned(), value);
+    }
+    for (index, actor) in actors.iter().enumerate() {
+        fields.insert(
+            format!("actor{}_sha256", index + 1),
+            sha256::bytes_digest(actor),
+        );
+    }
+    for spec in wyr_build_specs() {
+        fields.insert(
+            format!("{}_command", spec.label),
+            native_build_command(spec),
+        );
+    }
+    render(&fields)
+}
+
+fn native_build_command(spec: WyrBuildSpec) -> String {
+    format!(
+        "cargo build --offline --locked --release --target {NATIVE_TARGET} --package {} --bin {} --features {}",
+        spec.package, spec.binary, spec.features
+    )
+}
+
+fn native_remap_flags(
+    repository: &Path,
+    cargo_home: &Path,
+    target: &Path,
+) -> Result<String, Failure> {
+    let repository = fs::canonicalize(repository).map_err(io)?;
+    let cargo_home = fs::canonicalize(cargo_home).map_err(io)?;
+    let target = fs::canonicalize(target).map_err(io)?;
+    for path in [&repository, &cargo_home, &target] {
+        if path.to_string_lossy().contains('\u{1f}') {
+            return Err(Failure::task(
+                "DW1-C build path contains Cargo's encoded-rustflags separator",
+            ));
+        }
+    }
+    Ok([
+        format!(
+            "--remap-path-prefix={}=/source/wyrmroot",
+            repository.display()
+        ),
+        format!("--remap-path-prefix={}=/cargo-home", cargo_home.display()),
+        format!("--remap-path-prefix={}=/cargo-target", target.display()),
+    ]
+    .join("\u{1f}"))
+}
+
+fn read_cargo_build_output(path: &Path, label: &str, maximum: u64) -> Result<Vec<u8>, Failure> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| Failure::task(format!("could not inspect DW1-C {label}: {error}")))?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() == 0
+        || metadata.len() > maximum
+    {
+        return Err(Failure::task(format!(
+            "DW1-C {label} is not a bounded regular Cargo build output"
+        )));
+    }
+    read_regular(path, label)
+}
 
 /// Creates a fresh six-pass campaign containing immutable all-string TOML
 /// handoffs and exact q35/OVMF domain XML.  It never invokes QEMU or libvirt.
@@ -757,6 +1156,19 @@ fn io(error: std::io::Error) -> Failure {
     Failure::task(format!("DW1-C I/O failure: {error}"))
 }
 
+fn validate_upper_hex(value: &str, expected_length: usize, label: &str) -> Result<(), Failure> {
+    if value.len() != expected_length
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_lowercase())
+    {
+        return Err(Failure::task(format!(
+            "DW1-C {label} is not uppercase {expected_length}-hex"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -798,6 +1210,50 @@ mod tests {
             render(&fields).unwrap(),
             "selector = \"normal-preemption-smp\"\n"
         );
+    }
+
+    #[test]
+    fn wyr_build_specs_are_ordered_and_bind_actor_digest_environment() {
+        let specs = wyr_build_specs();
+        assert_eq!(specs.len(), 12);
+        assert_eq!(
+            specs[..2],
+            [
+                WyrBuildSpec {
+                    label: "bootstrap",
+                    package: "wyrmroot-bootstrap",
+                    binary: "wyrmroot-bootstrap",
+                    features: "native-bootstrap,wyr0-init0-integration",
+                    requires_progress_digest: false,
+                },
+                WyrBuildSpec {
+                    label: "init0",
+                    package: "wyrmroot-init0",
+                    binary: "wyrmroot-init0",
+                    features: "native-init0,dw1c-preemption-integration",
+                    requires_progress_digest: false,
+                },
+            ]
+        );
+        for (index, spec) in specs[2..].iter().enumerate() {
+            assert_eq!(spec.label, format!("actor{}", index + 1));
+            assert_eq!(spec.package, "wyrmroot-dw1c-preemption");
+            assert_eq!(spec.binary, format!("wyrmroot-dw1c-actor{}", index + 1));
+            assert_eq!(spec.features, "native-payloads");
+            assert_eq!(
+                native_build_command(*spec),
+                format!(
+                    "cargo build --offline --locked --release --target {NATIVE_TARGET} --package wyrmroot-dw1c-preemption --bin wyrmroot-dw1c-actor{} --features native-payloads",
+                    index + 1
+                )
+            );
+            assert_eq!(
+                progress_digest_environment(*spec, "A1B2C3D4E5F60708"),
+                Some(("DEEPWYRM_DW1C_PROGRESS_DIGEST", "A1B2C3D4E5F60708"))
+            );
+        }
+        assert_eq!(progress_digest_environment(specs[0], "A1"), None);
+        assert_eq!(progress_digest_environment(specs[1], "A1"), None);
     }
 
     #[test]
