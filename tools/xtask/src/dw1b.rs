@@ -639,12 +639,12 @@ fn execute_run_loaded_with_validation(
 ) -> Result<(Request, Vec<u8>), Failure> {
     if request.serial_log.parent() != Some(request.run_directory.as_path())
         || request.run_receipt.parent() != Some(request.run_directory.as_path())
-        || !request.run_directory.is_dir()
     {
         return Err(Failure::task(
-            "DW1-B serial and run receipt must be direct children of the existing run directory",
+            "DW1-B serial and run receipt must be direct children of the run directory",
         ));
     }
+    ensure_run_directory(&request.run_directory)?;
     let snapshot_request = request.run_directory.join("request.toml");
     let snapshot_esp = request.run_directory.join("booted-esp.img");
     let snapshot_code = request.run_directory.join("OVMF_CODE.fd");
@@ -788,6 +788,25 @@ fn execute_run_loaded_with_validation(
     let verified =
         verify_run_receipt_against(&request, &esp, &bootfs, &build_receipt, &wyr_build_receipt)?;
     Ok((request, verified))
+}
+
+fn ensure_run_directory(path: &Path) -> Result<(), Failure> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(Failure::task("DW1-B run path is not a real directory"));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(path).map_err(io_failure)?;
+        }
+        Err(error) => {
+            return Err(Failure::task(format!(
+                "could not inspect DW1-B run directory: {error}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn render_run_receipt(
@@ -2407,6 +2426,7 @@ mod tests {
             .0;
         assert!(execution.contains("inspect_recorded(request_path)"));
         assert!(!execution.contains("inspect(request_path)"));
+        assert!(source.contains("ensure_run_directory(&request.run_directory)?"));
     }
 
     #[test]
