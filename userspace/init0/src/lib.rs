@@ -59,21 +59,13 @@ use wyrmroot_loader::{
     feature = "dw1c-preemption-integration"
 ))]
 use wyrmroot_runtime::await_child_ready_profile;
-#[cfg(feature = "dw1c-preemption-integration")]
-use wyrmroot_runtime::validate_successful_exit;
 use wyrmroot_runtime::{
     BOOTFS_EXPECTATION, BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, CapabilityValidationError,
     ExitObservedReadinessError, ExitValidationError, InitCapability, LOADER_TASK_GROUP_EXPECTATION,
     MappingPlan, MappingPlanError, NativeError, ReceiveCounts, SELF_ROOT_EXPECTATION,
-    SupervisionError, SupervisionPlatform, validate_bootstrap_channel,
-    validate_init_capabilities_v2,
+    SupervisionError, SupervisionPlatform, supervise_child, validate_bootstrap_channel,
+    validate_init_capabilities_v2, validate_successful_exit,
 };
-#[cfg(any(
-    feature = "i2-stress-integration",
-    feature = "i-capability-integration",
-    feature = "dw1b-preemption-integration"
-))]
-use wyrmroot_runtime::{supervise_child, validate_successful_exit};
 
 /// The only bootfs path selected by the WYR0-G descendant smoke chain.
 pub const HELLO_PATH: &[u8] = b"bin/hello";

@@ -5,6 +5,7 @@ edition = "2024"
 publish = false
 description = "Selector-28 fixed ten-actor preemption workload"
 license = "GPL-3.0-or-later"
+autobins = false
 
 [lib]
 path = "src/lib.rs"
