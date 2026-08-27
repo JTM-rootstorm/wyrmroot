@@ -317,6 +317,7 @@ pub fn build(path: &Path) -> Result<String, Failure> {
         &wyr_build_receipt,
         [&loader, &bootstrap, &init, &hello, &hog, &progress],
     )?;
+    verify_current_cargo_lock(&wyr_build_receipt)?;
     verify_product_inputs(
         &request,
         ProductInputs {
@@ -403,6 +404,21 @@ pub fn measure(init: &Path, hello: &Path, hog: &Path, progress: &Path) -> Result
 pub fn inspect(path: &Path) -> Result<String, Failure> {
     let request = load(path)?;
     verify_acceptance_source(&request)?;
+    let wyr_build_receipt = read_bounded(
+        &request.wyr_build_receipt,
+        "Wyr source-build receipt",
+        64 * 1024,
+    )?;
+    verify_current_cargo_lock(&wyr_build_receipt)?;
+    inspect_recorded_request(&request)
+}
+
+fn inspect_recorded(path: &Path) -> Result<String, Failure> {
+    let request = load(path)?;
+    inspect_recorded_request(&request)
+}
+
+fn inspect_recorded_request(request: &Request) -> Result<String, Failure> {
     let loader = read_expected(&request.loader, "loader", &request.loader_sha256)?;
     let kernel = read_expected(&request.kernel, "kernel", &request.kernel_sha256)?;
     let symbols = read_expected(&request.symbols, "symbols", &request.symbols_sha256)?;
@@ -426,7 +442,7 @@ pub fn inspect(path: &Path) -> Result<String, Failure> {
         64 * 1024,
     )?;
     verify_wyr_build_receipt(
-        &request,
+        request,
         &wyr_build_receipt,
         [
             &loader,
@@ -438,7 +454,7 @@ pub fn inspect(path: &Path) -> Result<String, Failure> {
         ],
     )?;
     verify_product_inputs(
-        &request,
+        request,
         ProductInputs {
             loader: &loader,
             kernel: &kernel,
@@ -460,9 +476,9 @@ pub fn inspect(path: &Path) -> Result<String, Failure> {
             "DW1-B inspected bootfs page count does not match request",
         ));
     }
-    inspect_canonical_esp(&request)?;
+    inspect_canonical_esp(request)?;
     verify_receipt(
-        &request,
+        request,
         &bootfs,
         [&artifacts[0], &artifacts[1], &artifacts[2], &artifacts[3]],
         [
@@ -572,10 +588,10 @@ fn execute_run(
     request_path: &Path,
     executor: impl FnOnce(&RunInvocation) -> Result<RunObservation, Failure>,
 ) -> Result<(Request, Vec<u8>), Failure> {
-    let _ = inspect(request_path)?;
+    let _ = inspect_recorded(request_path)?;
     let request = load(request_path)?;
     execute_run_loaded_with_validation(request_path, request, executor, || {
-        inspect(request_path).map(|_| ())
+        inspect_recorded(request_path).map(|_| ())
     })
 }
 
@@ -1290,9 +1306,7 @@ fn verify_wyr_build_receipt(
         WYR_BUILD_RECEIPT_KEYS,
         "DW1-B Wyr source-build receipt",
     )?;
-    let repository = crate::tasks::repository_root()?;
-    let cargo_lock_sha256 = sha256::file_digest(&repository.join("Cargo.lock"))
-        .map_err(|error| Failure::task(format!("could not hash Cargo.lock: {error}")))?;
+    require_sha256(required(&values, "cargo_lock_sha256")?, "cargo_lock_sha256")?;
     let expected = [
         ("kind", WYR_BUILD_KIND.to_owned()),
         ("schema_version", "2".to_owned()),
@@ -1309,7 +1323,6 @@ fn verify_wyr_build_receipt(
             "toolchain_tree_sha256",
             ACCEPTED_TOOLCHAIN_TREE_SHA256.to_owned(),
         ),
-        ("cargo_lock_sha256", cargo_lock_sha256),
         ("profile", "release-separate-invocations".to_owned()),
         ("loader_command", LOADER_COMMAND.to_owned()),
         ("bootstrap_command", BOOTSTRAP_COMMAND.to_owned()),
@@ -1340,6 +1353,23 @@ fn verify_wyr_build_receipt(
         "toolchain_validation_report_sha256",
     ] {
         require_sha256(required(&values, key)?, key)?;
+    }
+    Ok(())
+}
+
+fn verify_current_cargo_lock(receipt: &[u8]) -> Result<(), Failure> {
+    let text = core::str::from_utf8(receipt)
+        .map_err(|_| Failure::task("DW1-B Wyr source-build receipt is not UTF-8"))?;
+    let values = parse_scalars(text)?;
+    let recorded = required(&values, "cargo_lock_sha256")?;
+    require_sha256(recorded, "cargo_lock_sha256")?;
+    let repository = crate::tasks::repository_root()?;
+    let current = sha256::file_digest(&repository.join("Cargo.lock"))
+        .map_err(|error| Failure::task(format!("could not hash Cargo.lock: {error}")))?;
+    if recorded != current {
+        return Err(Failure::task(
+            "DW1-B Wyr source-build receipt Cargo.lock does not match current source",
+        ));
     }
     Ok(())
 }
@@ -2361,6 +2391,16 @@ mod tests {
             .0;
         assert!(body.contains("execute_run(request_path"));
         assert!(!body.contains("build(request_path"));
+
+        let execution = source
+            .split_once("fn execute_run(\n")
+            .expect("run execution boundary")
+            .1
+            .split_once("#[cfg(test)]\nfn execute_run_loaded(")
+            .expect("test execution boundary")
+            .0;
+        assert!(execution.contains("inspect_recorded(request_path)"));
+        assert!(!execution.contains("inspect(request_path)"));
     }
 
     #[test]
@@ -2714,6 +2754,34 @@ mod tests {
         assert!(
             require_matching_wyr_receipt(receipt.as_bytes(), config_mutation.as_bytes()).is_err()
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recorded_receipt_accepts_a_historical_cargo_lock() {
+        let root = fixture();
+        let request_path = root.join("request.toml");
+        fs::write(&request_path, request_text()).unwrap();
+        let request = load(&request_path).unwrap();
+        let loader = valid_pe();
+        let bootstrap = valid_elf(b"bootstrap");
+        let init = valid_elf(b"init");
+        let hello = valid_elf(b"hello");
+        let hog = valid_hog_elf(b"WYRMDW1B-HOG-V1:steady-spin-only");
+        let progress = valid_elf(b"progress");
+        let artifacts = [&loader[..], &bootstrap, &init, &hello, &hog, &progress];
+        let current_receipt = test_wyr_build_receipt(&request, artifacts);
+        let repository = crate::tasks::repository_root().unwrap();
+        let current_lock = sha256::file_digest(&repository.join("Cargo.lock")).unwrap();
+        let historical_lock = sha256::bytes_digest(b"historical Cargo.lock");
+        assert_ne!(current_lock, historical_lock);
+        let historical_receipt = current_receipt.replacen(&current_lock, &historical_lock, 1);
+
+        verify_wyr_build_receipt(&request, historical_receipt.as_bytes(), artifacts).unwrap();
+        assert!(verify_current_cargo_lock(historical_receipt.as_bytes()).is_err());
+
+        let invalid_receipt = historical_receipt.replacen(&historical_lock, SHA256_ZERO, 1);
+        assert!(verify_wyr_build_receipt(&request, invalid_receipt.as_bytes(), artifacts).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 

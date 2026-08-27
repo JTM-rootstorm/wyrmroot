@@ -50,8 +50,12 @@ hello, CPU hog, and progress with the same isolated accepted workflow and
 requires byte-for-byte equality with the frozen inputs before it writes a
 product. It refuses pre-existing Wyrmroot outputs. The canonical `run` path
 requires that completed product, revalidates it through the same strict
-inspection path before and after execution, and never rebuilds already-proven
-artifacts. Source-build receipt schema 2 binds the clean source revision, Cargo lock, accepted toolchain identities,
+recorded-artifact inspection path before and after execution, and never
+rebuilds already-proven artifacts. Candidate creation remains bound to the
+clean current Wyrmroot revision; later execution is bound to the immutable
+request, artifacts, and receipts rather than requiring the tooling checkout to
+remain parked at that historical product revision. Source-build receipt schema
+2 binds the clean source revision, Cargo lock, accepted toolchain identities,
 generated Deep layout and policy hashes, normalized effective UEFI
 configuration digest, inspector and inspection-report hashes, exact separate
 release commands/profile, and all six production output hashes. The retained
