@@ -5,8 +5,8 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fs::{self, OpenOptions},
-    io::Write,
-    os::unix::fs::MetadataExt,
+    io::{Read, Write},
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -84,6 +84,7 @@ const MAX_EVIDENCE: usize = 16 * 1024 * 1024;
 const MAX_EXECUTABLE: usize = 64 * 1024 * 1024;
 const MAX_FIRMWARE: usize = 128 * 1024 * 1024;
 const MAX_BOOTFS: usize = crate::g3_image::IMAGE_BYTES as usize;
+const O_NOFOLLOW: i32 = 0o400000;
 const KEYS: &[&str] = &[
     "kind",
     "schema_version",
@@ -1437,8 +1438,8 @@ fn freeze_selector25_regressions(
         };
         let _ = crate::g3_image::build(&image)?;
         crate::g3_image::inspect(&image)?;
-        let esp_sha256 = sha256::file_digest(&request.esp)
-            .map_err(|error| Failure::task(format!("could not hash selector-25 ESP: {error}")))?;
+        let esp_sha256 =
+            sha256::bytes_digest(&read_bounded(&request.esp, "selector-25 ESP", MAX_BOOTFS)?);
         let receipt = crate::wyr1::receipt_text(
             &request,
             &identities,
@@ -1452,11 +1453,7 @@ fn freeze_selector25_regressions(
 }
 
 pub fn load(path: &Path) -> Result<Request, Failure> {
-    let bytes = fs::read(path)
-        .map_err(|error| Failure::task(format!("could not read WYR1-B request: {error}")))?;
-    if bytes.is_empty() || bytes.len() > MAX_REQUEST {
-        return Err(Failure::task("WYR1-B request is empty or oversized"));
-    }
+    let bytes = read_bounded(path, "request", MAX_REQUEST)?;
     let values = parse_scalars(
         std::str::from_utf8(&bytes).map_err(|_| Failure::task("WYR1-B request is not UTF-8"))?,
     )?;
@@ -1645,8 +1642,7 @@ pub fn build(path: &Path) -> Result<String, Failure> {
         )));
     }
     write_new_file(&request.bootfs, &expected)?;
-    let observed = fs::read(&request.bootfs)
-        .map_err(|error| Failure::task(format!("could not reread WYR1-B bootfs: {error}")))?;
+    let observed = read_bounded(&request.bootfs, "bootfs", MAX_BOOTFS)?;
     verify_archive(
         &observed,
         &request.boot_generation,
@@ -1817,8 +1813,7 @@ fn inspect_loaded(request: &Request) -> Result<String, Failure> {
         "WYR1_B_INSPECTION_PASS entries=13 bootfs_pages={} bootfs_sha256={} esp_sha256={}\n",
         request.bootfs_pages,
         sha256::bytes_digest(&bootfs),
-        sha256::file_digest(&request.esp)
-            .map_err(|error| Failure::task(format!("could not hash WYR1-B ESP: {error}")))?,
+        sha256::bytes_digest(&read_bounded(&request.esp, "ESP", MAX_BOOTFS)?),
     ))
 }
 
@@ -1894,12 +1889,18 @@ pub fn run(path: &Path) -> Result<String, Failure> {
     ] {
         snapshot(source, destination, expected, label)?;
     }
-    let initial_code_sha256 = sha256::file_digest(&snapshot_code)
-        .map_err(|error| Failure::task(format!("could not hash run-local OVMF code: {error}")))?;
-    let initial_esp_sha256 = sha256::file_digest(&snapshot_esp)
-        .map_err(|error| Failure::task(format!("could not hash run-local ESP: {error}")))?;
-    let initial_vars_sha256 = sha256::file_digest(&snapshot_vars)
-        .map_err(|error| Failure::task(format!("could not hash run-local OVMF vars: {error}")))?;
+    let initial_code_sha256 = sha256::bytes_digest(&read_bounded(
+        &snapshot_code,
+        "run-local OVMF code",
+        MAX_FIRMWARE,
+    )?);
+    let initial_esp_sha256 =
+        sha256::bytes_digest(&read_bounded(&snapshot_esp, "run-local ESP", MAX_BOOTFS)?);
+    let initial_vars_sha256 = sha256::bytes_digest(&read_bounded(
+        &snapshot_vars,
+        "run-local OVMF vars",
+        MAX_FIRMWARE,
+    )?);
     let outcome = crate::h_integration::run_canonical_one_cpu_selector(
         &crate::h_integration::CanonicalSelectorRun {
             ovmf_code: &snapshot_code,
@@ -1912,11 +1913,12 @@ pub fn run(path: &Path) -> Result<String, Failure> {
         },
     )?;
     let serial = read_bounded(&request.serial_log, "serial log", MAX_EVIDENCE)?;
-    if sha256::file_digest(&snapshot_code)
-        .map_err(|error| Failure::task(format!("could not rehash OVMF code: {error}")))?
-        != initial_code_sha256
-        || sha256::file_digest(&snapshot_esp)
-            .map_err(|error| Failure::task(format!("could not rehash booted ESP: {error}")))?
+    if sha256::bytes_digest(&read_bounded(
+        &snapshot_code,
+        "run-local OVMF code",
+        MAX_FIRMWARE,
+    )?) != initial_code_sha256
+        || sha256::bytes_digest(&read_bounded(&snapshot_esp, "run-local ESP", MAX_BOOTFS)?)
             != initial_esp_sha256
     {
         return Err(Failure::task(
@@ -1963,9 +1965,11 @@ pub fn run(path: &Path) -> Result<String, Failure> {
     ] {
         compare_live_to_snapshot(live, snapshot_path, label, maximum)?;
     }
-    if sha256::file_digest(&request.ovmf_vars)
-        .map_err(|error| Failure::task(format!("could not rehash live OVMF vars: {error}")))?
-        != initial_vars_sha256
+    if sha256::bytes_digest(&read_bounded(
+        &request.ovmf_vars,
+        "OVMF vars",
+        MAX_FIRMWARE,
+    )?) != initial_vars_sha256
     {
         return Err(Failure::task(
             "WYR1-B OVMF vars template changed during canonical execution",
@@ -2048,8 +2052,11 @@ fn verify_run_receipt(request: &Request) -> Result<Vec<u8>, Failure> {
         ("request_sha256", request.request_sha256.clone()),
         (
             "build_receipt_sha256",
-            sha256::file_digest(&request.receipt)
-                .map_err(|error| Failure::task(format!("could not hash build receipt: {error}")))?,
+            sha256::bytes_digest(&read_bounded(
+                &request.receipt,
+                "build receipt",
+                MAX_REQUEST,
+            )?),
         ),
         ("esp_sha256", receipt_value(request, "esp_sha256")?),
         ("bootfs_sha256", receipt_value(request, "bootfs_sha256")?),
@@ -2474,9 +2481,6 @@ fn nonce(value: &str) -> Result<u64, Failure> {
     }
     Ok(value)
 }
-fn read(path: &Path, label: &str) -> Result<Vec<u8>, Failure> {
-    fs::read(path).map_err(|error| Failure::task(format!("could not read WYR1-B {label}: {error}")))
-}
 fn read_expected(path: &Path, label: &str, expected: &str) -> Result<Vec<u8>, Failure> {
     let bytes = read_bounded(path, label, input_limit(label))?;
     if sha256::bytes_digest(&bytes) != expected {
@@ -2496,37 +2500,93 @@ fn input_limit(label: &str) -> usize {
     }
 }
 fn read_bounded(path: &Path, label: &str, maximum: usize) -> Result<Vec<u8>, Failure> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| Failure::task(format!("could not inspect WYR1-B {label}: {error}")))?;
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.nlink() != 1
-        || metadata.len() == 0
-        || metadata.len() > maximum as u64
-    {
-        return Err(Failure::task(format!(
-            "WYR1-B {label} is not a bounded single-link regular file"
-        )));
-    }
-    read(path, label)
+    read_bounded_with_hook(path, label, maximum, true, || {})
 }
 
 fn read_cargo_build_output(path: &Path, label: &str, maximum: usize) -> Result<Vec<u8>, Failure> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        Failure::task(format!(
-            "could not inspect WYR1-B Cargo build output {label}: {error}"
-        ))
-    })?;
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.len() == 0
-        || metadata.len() > maximum as u64
-    {
+    read_bounded_with_hook(path, label, maximum, false, || {})
+}
+
+fn read_bounded_with_hook<F>(
+    path: &Path,
+    label: &str,
+    maximum: usize,
+    require_single_link: bool,
+    after_read: F,
+) -> Result<Vec<u8>, Failure>
+where
+    F: FnOnce(),
+{
+    let path_before = fs::symlink_metadata(path)
+        .map_err(|error| Failure::task(format!("could not inspect WYR1-B {label}: {error}")))?;
+    if !bounded_regular(&path_before, maximum, require_single_link) {
+        let qualifier = if require_single_link {
+            "single-link regular file"
+        } else {
+            "regular Cargo build output"
+        };
         return Err(Failure::task(format!(
-            "WYR1-B {label} is not a bounded regular Cargo build output"
+            "WYR1-B {label} is not a bounded {qualifier}"
         )));
     }
-    read(path, label)
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| Failure::task(format!("could not open WYR1-B {label}: {error}")))?;
+    let opened_before = file
+        .metadata()
+        .map_err(|error| Failure::task(format!("could not stat WYR1-B {label}: {error}")))?;
+    if file_identity(&opened_before) != file_identity(&path_before)
+        || !bounded_regular(&opened_before, maximum, require_single_link)
+    {
+        return Err(Failure::task(format!(
+            "WYR1-B {label} changed before opening"
+        )));
+    }
+    let mut bytes = Vec::with_capacity(opened_before.len() as usize);
+    Read::by_ref(&mut file)
+        .take(maximum as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| Failure::task(format!("could not read WYR1-B {label}: {error}")))?;
+    after_read();
+    let opened_after = file.metadata().map_err(|error| {
+        Failure::task(format!("could not recheck opened WYR1-B {label}: {error}"))
+    })?;
+    let path_after = fs::symlink_metadata(path)
+        .map_err(|error| Failure::task(format!("could not recheck WYR1-B {label}: {error}")))?;
+    if file_identity(&opened_before) != file_identity(&opened_after)
+        || file_identity(&opened_before) != file_identity(&path_after)
+        || !bounded_regular(&opened_after, maximum, require_single_link)
+        || !bounded_regular(&path_after, maximum, require_single_link)
+        || bytes.len() as u64 != opened_before.len()
+    {
+        return Err(Failure::task(format!(
+            "WYR1-B {label} changed while reading"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn bounded_regular(metadata: &fs::Metadata, maximum: usize, require_single_link: bool) -> bool {
+    metadata.is_file()
+        && !metadata.file_type().is_symlink()
+        && (!require_single_link || metadata.nlink() == 1)
+        && metadata.len() != 0
+        && metadata.len() <= maximum as u64
+}
+
+fn file_identity(metadata: &fs::Metadata) -> (u64, u64, u64, u64, i64, i64, i64, i64) {
+    (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.nlink(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    )
 }
 fn decode_digest(value: &str) -> Result<[u8; 32], Failure> {
     if value.len() != 64 {
@@ -2731,8 +2791,7 @@ fn verify_build_receipt(request: &Request, bootfs: &[u8]) -> Result<(), Failure>
         ("ovmf_vars_sha256", request.ovmf_vars_sha256.clone()),
         (
             "esp_sha256",
-            sha256::file_digest(&request.esp)
-                .map_err(|error| Failure::task(format!("could not hash WYR1-B ESP: {error}")))?,
+            sha256::bytes_digest(&read_bounded(&request.esp, "ESP", MAX_BOOTFS)?),
         ),
         ("evidence_nonce", format!("{:016X}", request.evidence_nonce)),
         ("timeout_seconds", request.timeout_seconds.to_string()),
@@ -3016,11 +3075,11 @@ pub(crate) fn verify_selector25_source_receipt(
         ("wyrmsh", &request.wyrmsh),
     ] {
         let expected = required(&values, &format!("{label}_sha256"))?;
-        let observed = sha256::file_digest(artifact).map_err(|error| {
-            Failure::task(format!(
-                "could not hash selector-25 source artifact {label}: {error}"
-            ))
-        })?;
+        let observed = sha256::bytes_digest(&read_bounded(
+            artifact,
+            &format!("selector-25 source artifact {label}"),
+            MAX_EXECUTABLE,
+        )?);
         if expected != observed {
             return Err(Failure::task(format!(
                 "WYR1-B selector-25 source artifact {label} mismatch"
@@ -3028,11 +3087,11 @@ pub(crate) fn verify_selector25_source_receipt(
         }
     }
     for artifact in [&request.kernel, &request.symbols] {
-        let observed = sha256::file_digest(artifact).map_err(|error| {
-            Failure::task(format!(
-                "could not hash selector-25 kernel artifact: {error}"
-            ))
-        })?;
+        let observed = sha256::bytes_digest(&read_bounded(
+            artifact,
+            "selector-25 kernel artifact",
+            MAX_EXECUTABLE,
+        )?);
         if required(&values, &format!("selector25_{scenario}_kernel_sha256"))? != observed {
             return Err(Failure::task(
                 "WYR1-B selector-25 kernel does not match shared source receipt",
@@ -3546,6 +3605,29 @@ mod tests {
             fs::read(&degraded.provenance).unwrap()
         );
 
+        let exact_provenance = fs::read(&normal.provenance).unwrap();
+        let symlink_target = root.join("selector25-provenance-target");
+        fs::write(&symlink_target, &exact_provenance).unwrap();
+        fs::remove_file(&normal.provenance).unwrap();
+        std::os::unix::fs::symlink(&symlink_target, &normal.provenance).unwrap();
+        let error = crate::wyr1::verify_receipt(&normal, crate::wyr1::Profile::Default)
+            .unwrap_err()
+            .message;
+        assert!(error.contains("provenance is not a bounded single-link regular file"));
+        fs::remove_file(&normal.provenance).unwrap();
+        fs::write(&normal.provenance, &exact_provenance).unwrap();
+
+        fs::write(
+            &normal.provenance,
+            vec![0u8; crate::wyr1::MAX_REQUEST_BYTES + 1],
+        )
+        .unwrap();
+        let error = crate::wyr1::verify_receipt(&normal, crate::wyr1::Profile::Default)
+            .unwrap_err()
+            .message;
+        assert!(error.contains("provenance is not a bounded single-link regular file"));
+        fs::write(&normal.provenance, &exact_provenance).unwrap();
+
         fs::write(&normal.registryd, &artifacts.registryd25_fail).unwrap();
         refresh_selector25_receipt(&normal);
         assert!(crate::wyr1::verify_receipt(&normal, crate::wyr1::Profile::Default).is_err());
@@ -3618,7 +3700,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_inputs_reject_oversize_before_hashing_and_snapshot_comparison_detects_mutation() {
+    fn bounded_inputs_reject_oversize_symlink_and_path_replacement() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -3638,6 +3720,21 @@ mod tests {
         assert!(read_expected(&live, "request", &sha256::bytes_digest(b"changed")).is_ok());
         fs::write(&live, vec![0u8; MAX_REQUEST + 1]).unwrap();
         assert!(read_expected(&live, "request", &sha256::bytes_digest(&[])).is_err());
+
+        let target = root.join("target");
+        let symlink = root.join("symlink");
+        fs::write(&target, b"exact").unwrap();
+        std::os::unix::fs::symlink(&target, &symlink).unwrap();
+        assert!(read_bounded(&symlink, "fixture", 16).is_err());
+
+        fs::write(&live, b"opened bytes").unwrap();
+        let displaced = root.join("displaced");
+        let error = read_bounded_with_hook(&live, "fixture", 16, true, || {
+            fs::rename(&live, &displaced).unwrap();
+            fs::write(&live, b"replacement").unwrap();
+        })
+        .unwrap_err();
+        assert_eq!(error.message, "WYR1-B fixture changed while reading");
         fs::remove_dir_all(root).unwrap();
     }
 

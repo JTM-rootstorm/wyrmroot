@@ -6,7 +6,9 @@
 //! output behavior.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Read;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use crate::error::Failure;
@@ -25,6 +27,10 @@ pub const EVIDENCE_PROTOCOL: &str = "wyr1evid1";
 pub const RECEIPT_KIND: &str = "wyrmroot-wyr1-a-build-lineage";
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 pub const MAX_EVIDENCE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_EXECUTABLE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_FIRMWARE_BYTES: usize = 128 * 1024 * 1024;
+const MAX_PRODUCT_BYTES: usize = crate::g3_image::IMAGE_BYTES as usize;
+const O_NOFOLLOW: i32 = 0o400000;
 
 const REQUIRED_KEYS: &[&str] = &[
     "schema_version",
@@ -151,13 +157,7 @@ impl Request {
 }
 
 pub fn load(path: &Path) -> Result<Request, Failure> {
-    let bytes = fs::read(path)
-        .map_err(|error| Failure::task(format!("could not read WYR1 request: {error}")))?;
-    if bytes.is_empty() || bytes.len() > MAX_REQUEST_BYTES {
-        return Err(Failure::task(
-            "WYR1 request is empty or exceeds its size limit",
-        ));
-    }
+    let bytes = read_bounded(path, "request", MAX_REQUEST_BYTES)?;
     let text =
         std::str::from_utf8(&bytes).map_err(|_| Failure::task("WYR1 request is not UTF-8"))?;
     let values = parse_scalars(text)?;
@@ -381,14 +381,102 @@ fn reject_output_aliases(request: &Request) -> Result<(), Failure> {
     Ok(())
 }
 
+fn input_limit(label: &str) -> usize {
+    match label {
+        "request" | "receipt" | "provenance" | "manifest" | "system/bootstrap/rrc-a-v1" => {
+            MAX_REQUEST_BYTES
+        }
+        "bootfs" | "ESP" => MAX_PRODUCT_BYTES,
+        "OVMF code" | "OVMF vars template" | "ovmf_code" | "ovmf_vars_template" => {
+            MAX_FIRMWARE_BYTES
+        }
+        _ => MAX_EXECUTABLE_BYTES,
+    }
+}
+
+fn read_bounded(path: &Path, label: &str, maximum: usize) -> Result<Vec<u8>, Failure> {
+    read_bounded_with_hook(path, label, maximum, || {})
+}
+
+fn read_bounded_with_hook<F>(
+    path: &Path,
+    label: &str,
+    maximum: usize,
+    after_read: F,
+) -> Result<Vec<u8>, Failure>
+where
+    F: FnOnce(),
+{
+    let path_before = fs::symlink_metadata(path)
+        .map_err(|error| Failure::task(format!("could not inspect WYR1 {label}: {error}")))?;
+    if !bounded_single_link_regular(&path_before, maximum) {
+        return Err(Failure::task(format!(
+            "WYR1 {label} is not a bounded single-link regular file"
+        )));
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| Failure::task(format!("could not open WYR1 {label}: {error}")))?;
+    let opened_before = file
+        .metadata()
+        .map_err(|error| Failure::task(format!("could not stat WYR1 {label}: {error}")))?;
+    if file_identity(&opened_before) != file_identity(&path_before)
+        || !bounded_single_link_regular(&opened_before, maximum)
+    {
+        return Err(Failure::task(format!(
+            "WYR1 {label} changed before opening"
+        )));
+    }
+    let mut bytes = Vec::with_capacity(opened_before.len() as usize);
+    file.by_ref()
+        .take(maximum as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| Failure::task(format!("could not read WYR1 {label}: {error}")))?;
+    after_read();
+    let opened_after = file.metadata().map_err(|error| {
+        Failure::task(format!("could not recheck opened WYR1 {label}: {error}"))
+    })?;
+    let path_after = fs::symlink_metadata(path)
+        .map_err(|error| Failure::task(format!("could not recheck WYR1 {label}: {error}")))?;
+    if file_identity(&opened_before) != file_identity(&opened_after)
+        || file_identity(&opened_before) != file_identity(&path_after)
+        || !bounded_single_link_regular(&opened_after, maximum)
+        || !bounded_single_link_regular(&path_after, maximum)
+        || bytes.len() as u64 != opened_before.len()
+    {
+        return Err(Failure::task(format!("WYR1 {label} changed while reading")));
+    }
+    Ok(bytes)
+}
+
+fn bounded_single_link_regular(metadata: &fs::Metadata, maximum: usize) -> bool {
+    metadata.is_file()
+        && !metadata.file_type().is_symlink()
+        && metadata.nlink() == 1
+        && metadata.len() != 0
+        && metadata.len() <= maximum as u64
+}
+
+fn file_identity(metadata: &fs::Metadata) -> (u64, u64, u64, u64, i64, i64, i64, i64) {
+    (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.nlink(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    )
+}
+
 /// Build the exact WYR1 archive from request artifacts. The manifest and gate
 /// configuration are generated from the request and artifact bytes; callers
 /// cannot supply semantic product inputs through either output path.
 pub fn build_bootfs(request: &Request) -> Result<ProductIdentities, Failure> {
-    let read = |path: &Path, label: &str| {
-        fs::read(path)
-            .map_err(|error| Failure::task(format!("could not read WYR1 {label}: {error}")))
-    };
+    let read = |path: &Path, label: &str| read_bounded(path, label, input_limit(label));
     let init = read(&request.init, "init")?;
     let registryd = read(&request.registryd, "registryd")?;
     let devmgr = read(&request.devmgr, "devmgr")?;
@@ -423,10 +511,8 @@ pub fn build_bootfs(request: &Request) -> Result<ProductIdentities, Failure> {
     })?;
     fs::write(&request.bootfs, &structural_archive)
         .map_err(|error| Failure::task(format!("could not write WYR1 bootfs: {error}")))?;
-    let observed_manifest = fs::read(&request.rrc_manifest)
-        .map_err(|error| Failure::task(format!("could not re-read WYR1 manifest: {error}")))?;
-    let observed_archive = fs::read(&request.bootfs)
-        .map_err(|error| Failure::task(format!("could not re-read WYR1 bootfs: {error}")))?;
+    let observed_manifest = read_bounded(&request.rrc_manifest, "manifest", MAX_REQUEST_BYTES)?;
+    let observed_archive = read_bounded(&request.bootfs, "bootfs", MAX_PRODUCT_BYTES)?;
     let observed_materials = observe_closure_from_archive(&observed_archive)?;
     let observed_manifest_digest = sha256::bytes_digest_array(&observed_manifest);
     let observed_bootfs_digest = sha256::bytes_digest_array(&observed_archive);
@@ -835,18 +921,18 @@ pub fn receipt_text(
         ("ovmf_code", &request.ovmf_code),
         ("ovmf_vars_template", &request.ovmf_vars_template),
     ] {
+        let bytes = read_bounded(artifact, label, input_limit(label))?;
         lines.push(format!(
             "{label}_sha256 = \"{}\"",
-            sha256::file_digest(artifact)
-                .map_err(|error| Failure::task(format!("could not hash {label}: {error}")))?
+            sha256::bytes_digest(&bytes)
         ));
     }
     for (path, artifact) in request.artifact_paths() {
+        let bytes = read_bounded(artifact, path, input_limit(path))?;
         lines.push(format!(
             "artifact_{}_sha256 = \"{}\"",
             artifact_key(path),
-            sha256::file_digest(artifact)
-                .map_err(|error| Failure::task(format!("could not hash {path}: {error}")))?
+            sha256::bytes_digest(&bytes)
         ));
     }
     Ok(format!("{}\n", lines.join("\n")))
@@ -860,8 +946,7 @@ pub fn write_receipt(request: &Request, text: &str) -> Result<(), Failure> {
 /// Re-read a receipt and compare every identity against the request and its
 /// current immutable inputs. Unknown/missing/duplicate keys are rejected.
 pub fn verify_receipt(request: &Request, profile: Profile) -> Result<ProductIdentities, Failure> {
-    let bytes = fs::read(&request.receipt)
-        .map_err(|error| Failure::task(format!("could not read WYR1 receipt: {error}")))?;
+    let bytes = read_bounded(&request.receipt, "receipt", MAX_REQUEST_BYTES)?;
     let text =
         std::str::from_utf8(&bytes).map_err(|_| Failure::task("WYR1 receipt is not UTF-8"))?;
     let values = parse_scalars(text)?;
@@ -919,8 +1004,8 @@ pub fn verify_receipt(request: &Request, profile: Profile) -> Result<ProductIden
     check("rust_revision", &request.rust_revision)?;
     check("scenario", request.scenario.name())?;
     check("profile", profile.name())?;
-    let bootfs_observed = sha256::file_digest(&request.bootfs)
-        .map_err(|error| Failure::task(format!("could not hash bootfs: {error}")))?;
+    let bootfs = read_bounded(&request.bootfs, "bootfs", MAX_PRODUCT_BYTES)?;
+    let bootfs_observed = sha256::bytes_digest(&bootfs);
     let bootfs_expected = required(&values, "bootfs_expected_sha256")?;
     check("bootfs_sha256", bootfs_expected)?;
     check("bootfs_observed_sha256", &bootfs_observed)?;
@@ -929,8 +1014,8 @@ pub fn verify_receipt(request: &Request, profile: Profile) -> Result<ProductIden
             "WYR1 bootfs expected/observed receipt identity mismatch",
         ));
     }
-    let manifest_observed = sha256::file_digest(&request.rrc_manifest)
-        .map_err(|error| Failure::task(format!("could not hash manifest: {error}")))?;
+    let manifest = read_bounded(&request.rrc_manifest, "manifest", MAX_REQUEST_BYTES)?;
+    let manifest_observed = sha256::bytes_digest(&manifest);
     let manifest_expected = required(&values, "manifest_expected_sha256")?;
     check("manifest_sha256", manifest_expected)?;
     check("manifest_observed_sha256", &manifest_observed)?;
@@ -939,11 +1024,8 @@ pub fn verify_receipt(request: &Request, profile: Profile) -> Result<ProductIden
             "WYR1 manifest expected/observed receipt identity mismatch",
         ));
     }
-    check(
-        "esp_sha256",
-        &sha256::file_digest(&request.esp)
-            .map_err(|error| Failure::task(format!("could not hash ESP: {error}")))?,
-    )?;
+    let esp = read_bounded(&request.esp, "ESP", MAX_PRODUCT_BYTES)?;
+    check("esp_sha256", &sha256::bytes_digest(&esp))?;
     check("evidence_protocol", EVIDENCE_PROTOCOL)?;
     check(
         "evidence_nonce",
@@ -953,6 +1035,7 @@ pub fn verify_receipt(request: &Request, profile: Profile) -> Result<ProductIden
         "gate_config_sha256",
         &sha256::bytes_digest(&gate_config_for_request(request)),
     )?;
+    let mut provenance = None;
     for (label, artifact) in [
         ("loader", &request.loader),
         ("kernel", &request.kernel),
@@ -962,23 +1045,25 @@ pub fn verify_receipt(request: &Request, profile: Profile) -> Result<ProductIden
         ("ovmf_code", &request.ovmf_code),
         ("ovmf_vars_template", &request.ovmf_vars_template),
     ] {
-        let digest = sha256::file_digest(artifact)
-            .map_err(|error| Failure::task(format!("could not hash {label}: {error}")))?;
+        let bytes = read_bounded(artifact, label, input_limit(label))?;
+        let digest = sha256::bytes_digest(&bytes);
         check(&format!("{label}_sha256"), &digest)?;
+        if label == "provenance" {
+            provenance = Some(bytes);
+        }
     }
     for (path, artifact) in request.artifact_paths() {
-        let digest = sha256::file_digest(artifact)
-            .map_err(|error| Failure::task(format!("could not hash {path}: {error}")))?;
+        let digest = if path == "system/bootstrap/rrc-a-v1" {
+            manifest_observed.clone()
+        } else {
+            sha256::bytes_digest(&read_bounded(artifact, path, input_limit(path))?)
+        };
         check(&format!("artifact_{}_sha256", artifact_key(path)), &digest)?;
         if path == "system/bootstrap/rrc-a-v1" {
             check("manifest_sha256", &digest)?;
         }
     }
-    let provenance = fs::read(&request.provenance)
-        .map_err(|error| Failure::task(format!("could not read WYR1 provenance: {error}")))?;
-    if provenance.len() > MAX_REQUEST_BYTES {
-        return Err(Failure::task("WYR1 provenance exceeds its size limit"));
-    }
+    let provenance = provenance.ok_or_else(|| Failure::task("WYR1 provenance was not read"))?;
     let has_selector25_lineage = crate::wyr1b::is_selector25_source_receipt(&provenance);
     if crate::wyr1b::selector25_source_receipt_required(request) && !has_selector25_lineage {
         return Err(Failure::task(
@@ -1406,6 +1491,38 @@ pub fn join_profiles(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_selector25_reads_reject_symlink_oversize_and_path_replacement() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "wyr1-bounded-input-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let live = root.join("live");
+        let target = root.join("target");
+        let symlink = root.join("symlink");
+        fs::write(&live, b"opened bytes").unwrap();
+        fs::write(&target, b"exact").unwrap();
+        std::os::unix::fs::symlink(&target, &symlink).unwrap();
+        assert!(read_bounded(&symlink, "provenance", MAX_REQUEST_BYTES).is_err());
+
+        fs::write(&target, vec![0u8; MAX_REQUEST_BYTES + 1]).unwrap();
+        assert!(read_bounded(&target, "provenance", MAX_REQUEST_BYTES).is_err());
+
+        let displaced = root.join("displaced");
+        let error = read_bounded_with_hook(&live, "provenance", MAX_REQUEST_BYTES, || {
+            fs::rename(&live, &displaced).unwrap();
+            fs::write(&live, b"replacement").unwrap();
+        })
+        .unwrap_err();
+        assert_eq!(error.message, "WYR1 provenance changed while reading");
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn observed_closure_is_measured_from_archive_and_mismatch_reaches_validator() {
