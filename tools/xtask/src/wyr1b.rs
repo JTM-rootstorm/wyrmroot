@@ -84,6 +84,7 @@ const MAX_EVIDENCE: usize = 16 * 1024 * 1024;
 const MAX_EXECUTABLE: usize = 64 * 1024 * 1024;
 const MAX_FIRMWARE: usize = 128 * 1024 * 1024;
 const MAX_BOOTFS: usize = crate::g3_image::IMAGE_BYTES as usize;
+const SELECTOR25_BOOTFS_MAX_PAGES: usize = 128;
 const O_NOFOLLOW: i32 = 0o400000;
 const KEYS: &[&str] = &[
     "kind",
@@ -1429,6 +1430,8 @@ fn freeze_selector25_regressions(
             ))
         })?;
         let identities = crate::wyr1::build_bootfs(&request)?;
+        let selector25_bootfs = read_bounded(&request.bootfs, "selector-25 bootfs", MAX_BOOTFS)?;
+        enforce_selector25_bootfs_capacity(selector25_bootfs.len())?;
         let image = crate::cli::G3ImageArguments {
             image: request.esp.display().to_string(),
             loader: request.loader.display().to_string(),
@@ -1450,6 +1453,16 @@ fn freeze_selector25_regressions(
         let _ = crate::wyr1::verify_receipt(&request, crate::wyr1::Profile::Default)?;
     }
     Ok(())
+}
+
+fn enforce_selector25_bootfs_capacity(byte_len: usize) -> Result<usize, Failure> {
+    let pages = byte_len.div_ceil(4096);
+    if !(1..=SELECTOR25_BOOTFS_MAX_PAGES).contains(&pages) {
+        return Err(Failure::task(format!(
+            "selector-25 bootfs uses {pages} pages; Deepwyrm selector-local ceiling is {SELECTOR25_BOOTFS_MAX_PAGES} pages"
+        )));
+    }
+    Ok(pages)
 }
 
 pub fn load(path: &Path) -> Result<Request, Failure> {
@@ -3262,6 +3275,19 @@ fn fnv1a32(bytes: &[u8]) -> u32 {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn selector25_bootfs_capacity_matches_the_deepwyrm_selector_local_ceiling() {
+        assert_eq!(enforce_selector25_bootfs_capacity(1).unwrap(), 1);
+        assert_eq!(
+            enforce_selector25_bootfs_capacity(SELECTOR25_BOOTFS_MAX_PAGES * 4096).unwrap(),
+            SELECTOR25_BOOTFS_MAX_PAGES
+        );
+        assert!(enforce_selector25_bootfs_capacity(0).is_err());
+        assert!(
+            enforce_selector25_bootfs_capacity(SELECTOR25_BOOTFS_MAX_PAGES * 4096 + 1).is_err()
+        );
+    }
 
     fn environment(values: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
         values

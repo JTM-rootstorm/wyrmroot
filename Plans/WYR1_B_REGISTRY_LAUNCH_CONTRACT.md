@@ -793,10 +793,15 @@ WYR1-B introduces:
 - request/receipt schema `6`; and
 - controller-originated structured evidence magic `WRB1`.
 
-Selector 25 and its measured 42-page capacity exception remain unchanged.
+Selector 25 retains its WYR1-A behavior and evidence contract, while its
+selector-local bootfs admission ceiling is widened from the historical
+42-page measurement to a functional-first 128 pages for the integrated WYR1-B
+regression product (currently 76 pages). The freeze tooling measures the final
+selector-25 bootfs and rejects products above that ceiling before ESP assembly.
+No ordinary, WYR0, selector-26, selector-27, loader-intake, or ABI limit changes.
 Selector 26 is reserved for Deepwyrm DW1-B one-CPU preemption. Any WYR1-B
-capacity increase is measured from clean release artifacts and admitted only
-for selector 27.
+capacity increase is measured from clean release artifacts and remains local
+to the selector whose regression or acceptance product requires it.
 
 Test clients and gate configuration are test content, not RRC-A merely because
 they appear in acceptance media. The RRC manifest retains only components that

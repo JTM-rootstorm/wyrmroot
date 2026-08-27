@@ -161,10 +161,10 @@ The selector-27 acceptance product is created only through the one-shot,
 request-bound pipeline:
 
 ```text
-tools/pinned-cargo xtask wyr1b freeze --output /tmp/wyr1b-candidate-fresh
-tools/pinned-cargo xtask wyr1b inspect --request /tmp/wyr1b-candidate-fresh/selector27/request.toml
-tools/pinned-cargo xtask wyr1b run --request /tmp/wyr1b-candidate-fresh/selector27/request.toml
-tools/pinned-cargo xtask wyr1b evidence --request /tmp/wyr1b-candidate-fresh/selector27/request.toml
+tools/pinned-cargo xtask wyr1b freeze --output ../artifacts/wyr1-b/candidate-fresh
+tools/pinned-cargo xtask wyr1b inspect --request ../artifacts/wyr1-b/candidate-fresh/selector27/request.toml
+tools/pinned-cargo xtask wyr1b run --request ../artifacts/wyr1-b/candidate-fresh/selector27/request.toml
+tools/pinned-cargo xtask wyr1b evidence --request ../artifacts/wyr1-b/candidate-fresh/selector27/request.toml
 ```
 
 Freeze requires exact clean Wyrmroot and canonical sibling Deepwyrm revisions,
@@ -212,6 +212,14 @@ receipt through their existing provenance input. WYR1 receipt inspection and
 VM handoff preparation therefore rejoin the accepted toolchain, every native
 build command, the selected scenario's native artifacts, kernel, nonce, and
 scenario before snapshotting that shared receipt into each handoff.
+
+Claim-bearing selector-25 handoffs must remain inside the resolved OS-Project
+boundary because the verified persistent-VM runner rejects external paths.
+Freeze directly into the project-root `artifacts/` tree as shown above. If an
+older frozen candidate was created elsewhere, copy only its immutable request,
+artifact, and product inputs into a fresh project-bound evidence directory and
+verify their hashes before running `wyr1 prepare`; never reuse an external
+prepared handoff as closure evidence.
 
 The `native-bootstrap` binary is a no-std Wyrmroot target and must not be
 host-linked by `cargo test`. When changing its feature-selected library path,
