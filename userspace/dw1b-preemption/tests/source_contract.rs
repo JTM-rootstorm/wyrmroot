@@ -83,7 +83,6 @@ enum Event {
     HogReady,
     ProgressCreateStart,
     ProgressReady,
-    ProgressWait,
     Arm,
     Exchange(u8),
     ProgressExitQueryReap,
@@ -95,12 +94,7 @@ enum Event {
 #[test]
 fn executable_mock_trace_proves_the_complete_selector_26_order() {
     let mut trace = vec![Event::HogCreateStart, Event::HogReady];
-    trace.extend([
-        Event::ProgressCreateStart,
-        Event::ProgressReady,
-        Event::ProgressWait,
-        Event::Arm,
-    ]);
+    trace.extend([Event::ProgressCreateStart, Event::ProgressReady, Event::Arm]);
     for round in 0..wyrmroot_dw1b_preemption::ROUND_COUNT {
         let request = wyrmroot_dw1b_preemption::encode_challenge(round);
         let reply = wyrmroot_dw1b_preemption::encode_reply(round);
@@ -115,12 +109,7 @@ fn executable_mock_trace_proves_the_complete_selector_26_order() {
         Event::InitReadyExit,
     ]);
     let mut expected = vec![Event::HogCreateStart, Event::HogReady];
-    expected.extend([
-        Event::ProgressCreateStart,
-        Event::ProgressReady,
-        Event::ProgressWait,
-        Event::Arm,
-    ]);
+    expected.extend([Event::ProgressCreateStart, Event::ProgressReady, Event::Arm]);
     expected.extend((0..8).map(Event::Exchange));
     expected.extend([
         Event::ProgressExitQueryReap,
