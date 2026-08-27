@@ -1,6 +1,6 @@
 # Wyrmroot WYR1-B Bootstrap Registry and Launch/Job Contract
 
-**Status:** Reached contract; authoritative for WYR1-B implementation
+**Status:** Complete and accepted on 2026-08-27; see `WYR1_B_VALIDATION.md`
 **Prepared:** 2026-08-26
 **Wyrmroot baseline:** `f6d4044be33a812a91eb7da2a8c9b9251e5736e0`
 **Paired Deepwyrm baseline:** `419af582b3beca0208dfa802a113e4547e4f5620`
