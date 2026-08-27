@@ -292,6 +292,7 @@ pub fn load(path: &Path) -> Result<Request, Failure> {
 pub fn build(path: &Path) -> Result<String, Failure> {
     let request = load(path)?;
     verify_acceptance_source(&request)?;
+    preflight_source_build_environment()?;
     fs::create_dir_all(&request.run_directory).map_err(io_failure)?;
     canonical_build_wyr_artifacts(&request)?;
     let loader = read_expected(&request.loader, "loader", &request.loader_sha256)?;
@@ -931,6 +932,7 @@ impl WyrArtifactSet {
 
 pub fn freeze(output: &Path) -> Result<String, Failure> {
     let revision = verify_clean_source()?;
+    preflight_source_build_environment()?;
     if fs::symlink_metadata(output).is_ok() {
         return Err(Failure::task(
             "DW1-B freeze refuses a pre-existing output path",
@@ -986,6 +988,13 @@ pub fn freeze(output: &Path) -> Result<String, Failure> {
         sha256::bytes_digest(&set.hog),
         sha256::bytes_digest(&set.progress),
     ))
+}
+
+fn preflight_source_build_environment() -> Result<(), Failure> {
+    let repository = crate::tasks::repository_root()?;
+    let manifest = crate::metadata::BuildManifest::load(&repository)?;
+    let _cargo_home = crate::tasks::project_cargo_home(&repository, &manifest)?;
+    Ok(())
 }
 
 fn render_freeze_hashes(artifacts: [&[u8]; 6]) -> String {
@@ -1085,7 +1094,7 @@ fn build_wyr_artifact_set(
         manifest.deepwyrm_revision()?,
     )?;
     let toolchain = crate::tasks::prepare_loader_toolchain(&repository, &profile, &manifest)?;
-    let cargo_home = canonical_environment_directory("CARGO_HOME")?;
+    let cargo_home = crate::tasks::project_cargo_home(&repository, &manifest)?;
     let uefi = crate::tasks::build_deterministic_uefi_pair(
         &repository,
         &toolchain,
@@ -2198,28 +2207,6 @@ fn read_expected(path: &Path, label: &str, expected: &str) -> Result<Vec<u8>, Fa
     Ok(bytes)
 }
 
-fn canonical_environment_directory(variable: &str) -> Result<PathBuf, Failure> {
-    let path = PathBuf::from(
-        env::var_os(variable)
-            .ok_or_else(|| Failure::task(format!("DW1-B source build requires {variable}")))?,
-    );
-    if !path.is_absolute() {
-        return Err(Failure::task(format!(
-            "DW1-B source build requires absolute {variable}"
-        )));
-    }
-    let canonical = fs::canonicalize(&path)
-        .map_err(|error| Failure::task(format!("could not resolve {variable}: {error}")))?;
-    let metadata = fs::symlink_metadata(&path)
-        .map_err(|error| Failure::task(format!("could not inspect {variable}: {error}")))?;
-    if canonical != path || !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(Failure::task(format!(
-            "DW1-B source build requires canonical non-symlink {variable}"
-        )));
-    }
-    Ok(canonical)
-}
-
 fn native_remap_flags(
     repository: &Path,
     cargo_home: &Path,
@@ -2401,6 +2388,38 @@ mod tests {
             .0;
         assert!(execution.contains("inspect_recorded(request_path)"));
         assert!(!execution.contains("inspect(request_path)"));
+    }
+
+    #[test]
+    fn source_build_preflights_the_project_cargo_home_before_outputs() {
+        let source = include_str!("dw1b.rs");
+        let build = source
+            .split_once("pub fn build(path: &Path)")
+            .expect("build entry")
+            .1
+            .split_once("pub fn measure(")
+            .expect("build boundary")
+            .0;
+        assert!(
+            build.find("preflight_source_build_environment()")
+                < build.find("fs::create_dir_all(&request.run_directory)")
+        );
+
+        let freeze = source
+            .split_once("pub fn freeze(output: &Path)")
+            .expect("freeze entry")
+            .1
+            .split_once("fn preflight_source_build_environment()")
+            .expect("freeze boundary")
+            .0;
+        assert!(
+            freeze.find("preflight_source_build_environment()")
+                < freeze.find("fs::create_dir(&output)")
+        );
+
+        let versions = include_str!("../../../toolchain/versions.toml");
+        assert!(versions.contains("project_cargo_home = \".tmp/cargo-home/offline-v1\""));
+        assert!(!source.contains("canonical_environment_directory(\"CARGO_HOME\")"));
     }
 
     #[test]

@@ -40,6 +40,7 @@ impl BuildManifest {
         self.require_nonempty("deepwyrm.repository")?;
         self.require_nonempty("rust.upstream_stable_release")?;
         self.require_nonempty("rust.local_toolchain_name")?;
+        self.require_nonempty("rust.project_cargo_home")?;
         self.require_nonempty("rust.native_target")?;
         self.require_nonempty("deepwyrm.abi_dependency_state")?;
         self.require_nonempty("rust.native_target_state")?;
@@ -137,6 +138,10 @@ impl BuildManifest {
 
     pub(crate) fn rust_toolchain_name(&self) -> Result<&str, Failure> {
         self.required("rust.local_toolchain_name")
+    }
+
+    pub(crate) fn project_cargo_home(&self) -> Result<&str, Failure> {
+        self.required("rust.project_cargo_home")
     }
 
     fn validate_phase_a_states(&self) -> Result<(), Failure> {

@@ -14,6 +14,7 @@ upstream_stable_revision = "8bab26f4f68e0e26f0bb7960be334d5b520ea452"
 fork_repository = "git@github.com:JTM-rootstorm/rust.git"
 wyrmroot_revision = "a92dc7f7464ad6ddfece4402bd7b86dbfa86166d"
 local_toolchain_name = "wyrmroot-1.97.1-a92dc7f7"
+project_cargo_home = ".tmp/cargo-home/offline-v1"
 native_target = "x86_64-unknown-wyrmroot"
 native_target_state = "available"
 

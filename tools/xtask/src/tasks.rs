@@ -171,7 +171,7 @@ pub(crate) fn run_loader_build(
     )?;
     let target_directory = repository.join(UEFI_TARGET_DIRECTORY);
     let debug_target_directory = repository.join(UEFI_DEBUG_TARGET_DIRECTORY);
-    let cargo_home = explicit_cargo_home()?;
+    let cargo_home = project_cargo_home(repository, manifest)?;
     let artifacts = build_deterministic_uefi_pair(
         repository,
         toolchain,
@@ -304,17 +304,32 @@ fn configured_rustc(repository: &Path) -> Result<PathBuf, Failure> {
     Ok(path)
 }
 
-fn explicit_cargo_home() -> Result<PathBuf, Failure> {
-    let path = PathBuf::from(
-        env::var_os("CARGO_HOME")
-            .ok_or_else(|| Failure::task("UEFI loader build requires an explicit CARGO_HOME"))?,
-    );
-    if !path.is_absolute() {
+pub(crate) fn project_cargo_home(
+    repository: &Path,
+    manifest: &BuildManifest,
+) -> Result<PathBuf, Failure> {
+    let relative = Path::new(manifest.project_cargo_home()?);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
         return Err(Failure::task(
-            "UEFI loader build requires CARGO_HOME to be an absolute path",
+            "toolchain Cargo home must be a canonical project-relative path",
         ));
     }
-    canonical_build_directory(&path, "Cargo home")
+    let project = repository
+        .parent()
+        .ok_or_else(|| Failure::task("Wyrmroot repository has no OS-Project parent"))?;
+    let project = canonical_build_directory(project, "OS-Project root")?;
+    let path = project.join(relative);
+    let cargo_home = canonical_build_directory(&path, "project Cargo home")?;
+    if !cargo_home.starts_with(project.join(".tmp")) {
+        return Err(Failure::task(
+            "toolchain Cargo home must remain beneath OS-Project/.tmp",
+        ));
+    }
+    Ok(cargo_home)
 }
 
 fn blocked_toolchain_failure(request: &str) -> Failure {
