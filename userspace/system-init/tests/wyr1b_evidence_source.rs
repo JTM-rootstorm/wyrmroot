@@ -33,11 +33,25 @@ fn selector_27_startup_mapping_diagnostic_is_bound_to_the_initial_mapping_only()
             .count(),
         1
     );
-    assert_eq!(LIB.matches(".map_err(InitError::Mapping)?").count(), 1);
     assert!(LIB.contains("fn startup_mapping_error(error: MappingPlanError, size: u64)"));
     assert!(LIB.contains("InitError::StartupMapping(StartupMappingDiagnostic"));
-    assert!(LIB.contains("let plan = MappingPlan::for_bootfs(size).map_err(InitError::Mapping)?;"));
     assert!(MAIN.contains("return wyr1b_test_failure_application_status(&error);"));
+}
+
+#[test]
+fn selector_27_ordinary_mapping_diagnostic_names_each_remaining_site() {
+    assert!(LIB.contains("ordinary_mapping_error(MappingDiagnosticSite::RoleRemap, error, size)"));
+    assert!(
+        NATIVE
+            .contains("ordinary_mapping_error(MappingDiagnosticSite::JobDispatcher, error, size)")
+    );
+    assert!(NATIVE.contains(
+        "ordinary_mapping_error(MappingDiagnosticSite::RegistryReplacement, error, size)"
+    ));
+    assert_eq!(LIB.matches("ordinary_mapping_error(").count(), 3);
+    assert_eq!(NATIVE.matches("ordinary_mapping_error(").count(), 2);
+    assert!(!LIB.contains(".map_err(InitError::Mapping)?"));
+    assert!(!NATIVE.contains(".map_err(InitError::Mapping)?"));
 }
 
 #[test]

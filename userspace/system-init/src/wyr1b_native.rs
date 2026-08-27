@@ -2418,7 +2418,9 @@ where
                 let size = system
                     .query_memory_object_size(authority.bootfs)
                     .map_err(InitError::Native)?;
-                let plan = MappingPlan::for_bootfs(size).map_err(InitError::Mapping)?;
+                let plan = MappingPlan::for_bootfs(size).map_err(|error| {
+                    ordinary_mapping_error(MappingDiagnosticSite::JobDispatcher, error, size)
+                })?;
                 let dispatched = system
                     .with_bootfs_bytes(
                         authority.parent_root,
@@ -3434,7 +3436,9 @@ where
             let size = system
                 .query_memory_object_size(resident.authority.bootfs)
                 .map_err(InitError::Native)?;
-            let plan = MappingPlan::for_bootfs(size).map_err(InitError::Mapping)?;
+            let plan = MappingPlan::for_bootfs(size).map_err(|error| {
+                ordinary_mapping_error(MappingDiagnosticSite::RegistryReplacement, error, size)
+            })?;
             let replacement = system
                 .with_bootfs_bytes(
                     resident.authority.parent_root,
