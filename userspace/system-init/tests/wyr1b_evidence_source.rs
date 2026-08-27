@@ -60,8 +60,7 @@ fn controller_records_all_relational_joins_in_contract_order() {
     cursor = 0;
     for event in [
         "GateEvent::JobAccepted",
-        "GateEvent::JobExitZero",
-        "GateEvent::JobReaped",
+        "record_owner_job_reap(&mut *evidence, owner.grant, job_id, owner_result)?",
         "GateEvent::ForeignRejected",
         "GateEvent::OrphanReaped",
         ".finish()",
@@ -71,8 +70,27 @@ fn controller_records_all_relational_joins_in_contract_order() {
             .unwrap_or_else(|| panic!("missing or reordered job evidence join {event}"));
         cursor += relative + event.len();
     }
-    assert!(NATIVE.contains("owner_result.application_code != 0"));
-    assert!(NATIVE.contains("owner_result.cleanup_result != 0"));
+    assert_eq!(job.matches("record_owner_job_reap(").count(), 1);
+
+    let reap_start = NATIVE.find("fn record_owner_job_reap").unwrap();
+    let reap_end = NATIVE[reap_start..]
+        .find("fn run_job_gate")
+        .map(|offset| reap_start + offset)
+        .unwrap();
+    let reap = &NATIVE[reap_start..reap_end];
+    cursor = 0;
+    for join in [
+        "result.classification != TerminationClassification::NormalExit.as_u32()",
+        "result.application_code != 0",
+        "result.cleanup_result != 0",
+        "GateEvent::JobExitZero",
+        "GateEvent::JobReaped",
+    ] {
+        let relative = reap[cursor..]
+            .find(join)
+            .unwrap_or_else(|| panic!("missing or reordered clean-reap evidence join {join}"));
+        cursor += relative + join.len();
+    }
     assert!(NATIVE.contains("orphan_result.cleanup_result != 0"));
     assert!(NATIVE.contains("jobs.jobs.live_jobs() != 0"));
     assert!(NATIVE.contains("jobs.jobs.orphan_jobs() != 0"));
