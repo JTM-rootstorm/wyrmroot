@@ -6,9 +6,9 @@ use deepwyrm_syscall::{
 };
 use deepwyrm_syscall::{
     DW_SIGNAL_EXITED, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DW_TASK_STATE_EXITED,
-    DW_TASK_STATE_RUNNING, DW_TASK_TERMINATION_INFO_V1_SIZE, DW_TERMINATION_NORMAL_EXIT,
-    DwDeadline, DwHandleTransferV1, DwMemoryProtection, DwTaskState, DwTaskTerminationInfoV1,
-    DwWaitItemV1, DwWaitResultV1,
+    DW_TASK_STATE_RUNNING, DW_TASK_TERMINATION_INFO_V1_SIZE, DW_TERMINATION_AUTHORIZED,
+    DW_TERMINATION_NORMAL_EXIT, DW_TERMINATION_UNHANDLED_EXCEPTION, DwDeadline, DwExceptionType,
+    DwHandleTransferV1, DwMemoryProtection, DwTaskTerminationInfoV1, DwWaitItemV1, DwWaitResultV1,
 };
 use wyrmroot_bootfs::builder::{Builder, FileMode};
 #[cfg(feature = "primordial-test-support")]
@@ -44,7 +44,8 @@ use wyrmroot_runtime::{
     LOADER_TASK_GROUP_EXPECTATION, MappingPlan, NativeError, ReceiveCounts, SELF_ROOT_EXPECTATION,
 };
 use wyrmroot_runtime::{
-    ExitObservedReadinessError, ExitValidationError, SupervisionError, SupervisionPlatform,
+    ExitObservedReadinessError, ExitValidationError, ObservedSupervisionError, SupervisionError,
+    SupervisionPlatform,
 };
 use wyrmroot_runtime::{StartupError, startup_error_exit_code};
 
@@ -720,8 +721,7 @@ struct SmokeSupervisor {
     received: usize,
     ready_handle_count: usize,
     termination_query_error: bool,
-    termination_state: DwTaskState,
-    termination_application_code: u32,
+    termination_info: DwTaskTerminationInfoV1,
     termination_queries: usize,
     exit_on_query: Option<usize>,
     transaction_id: u64,
@@ -742,8 +742,7 @@ impl SmokeSupervisor {
             received: 0,
             ready_handle_count: 0,
             termination_query_error: false,
-            termination_state: DW_TASK_STATE_EXITED,
-            termination_application_code: 0,
+            termination_info: successful_termination_info(),
             termination_queries: 0,
             exit_on_query: None,
             transaction_id: 2,
@@ -780,8 +779,7 @@ impl SmokeSupervisor {
             received: 0,
             ready_handle_count: 0,
             termination_query_error: false,
-            termination_state: DW_TASK_STATE_EXITED,
-            termination_application_code: 0,
+            termination_info: successful_termination_info(),
             termination_queries: 0,
             exit_on_query: None,
             transaction_id: 2,
@@ -902,22 +900,24 @@ impl SupervisionPlatform for SmokeSupervisor {
         if self.termination_query_error {
             return Err(NativeError::Status(DW_STATUS_BAD_HANDLE));
         }
-        let state = if self
+        let mut info = self.termination_info;
+        if self
             .exit_on_query
             .is_some_and(|query| self.termination_queries >= query)
         {
-            DW_TASK_STATE_EXITED
-        } else {
-            self.termination_state
-        };
-        Ok(DwTaskTerminationInfoV1 {
-            size: DW_TASK_TERMINATION_INFO_V1_SIZE,
-            version: 1,
-            state,
-            reason: DW_TERMINATION_NORMAL_EXIT,
-            application_code: self.termination_application_code,
-            ..DwTaskTerminationInfoV1::default()
-        })
+            info.state = DW_TASK_STATE_EXITED;
+        }
+        Ok(info)
+    }
+}
+
+fn successful_termination_info() -> DwTaskTerminationInfoV1 {
+    DwTaskTerminationInfoV1 {
+        size: DW_TASK_TERMINATION_INFO_V1_SIZE,
+        version: 1,
+        state: DW_TASK_STATE_EXITED,
+        reason: DW_TERMINATION_NORMAL_EXIT,
+        ..DwTaskTerminationInfoV1::default()
     }
 }
 
@@ -998,6 +998,122 @@ fn wyr1_primordial_launches_only_system_init_and_retires_after_operational_ready
             CHANNEL
         ]
     );
+}
+
+#[test]
+fn wyr1_primordial_preserves_observed_terminal_diagnostics_without_retermination() {
+    let mut unhandled = successful_termination_info();
+    unhandled.reason = DW_TERMINATION_UNHANDLED_EXCEPTION;
+    unhandled.exception_type = DwExceptionType(1);
+    unhandled.detail = 5;
+    unhandled.fault_address = 0x0000_0000_1234_5000;
+
+    let mut authorized = successful_termination_info();
+    authorized.reason = DW_TERMINATION_AUTHORIZED;
+    authorized.detail = 0xA5;
+
+    let mut malformed = successful_termination_info();
+    malformed.size = 0;
+
+    for (info, expected_code, expected_error) in [
+        (unhandled, 0xB44C_414C, ExitValidationError::NotNormalExit),
+        (authorized, 0xB408_294C, ExitValidationError::NotNormalExit),
+        (malformed, 0xB404_000A, ExitValidationError::InvalidEnvelope),
+    ] {
+        let image = executable();
+        let mut fixture = Fixture::valid();
+        fixture.bootfs = bootfs(&[(SYSTEM_INIT_PATH, &image)]);
+        let mut loader = SmokeLoader::supervisor();
+        let mut supervisor = SmokeSupervisor::successful_supervisor();
+        supervisor.events = &[false];
+        supervisor.termination_info = info;
+
+        let error = run_supervisor_bootstrap(
+            &mut fixture,
+            &mut loader,
+            &mut supervisor,
+            CHANNEL,
+            DwDeadline(99),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.exit_code(), expected_code);
+        match error {
+            BootstrapError::ObservedSupervision(ObservedSupervisionError::ExitedBeforeReady(
+                actual,
+            )) => {
+                assert_eq!(expected_error, ExitValidationError::NotNormalExit);
+                assert_eq!(actual, info);
+            }
+            BootstrapError::ObservedSupervision(ObservedSupervisionError::Exit(
+                actual_error,
+                actual,
+            )) => {
+                assert_eq!(actual_error, expected_error);
+                assert_eq!(actual, info);
+            }
+            other => panic!("unexpected terminal bootstrap result: {other:?}"),
+        }
+        assert!(loader.terminated.is_empty());
+        assert!(fixture.sent.is_empty());
+        assert_eq!(
+            fixture.closed,
+            [DwHandle(42), DwHandle(43), ROOT, BOOTFS, TASK_GROUP]
+        );
+    }
+}
+
+#[test]
+fn wyr1_terminal_diagnostic_bounds_fields_and_classifies_fault_addresses() {
+    let addresses = [
+        (0, 0),
+        (0x0000_0000_0000_1000, 1),
+        (0xFFFF_8000_0000_1000, 2),
+        (0x0000_8000_0000_0000, 3),
+    ];
+    for (fault_address, expected_class) in addresses {
+        let mut info = successful_termination_info();
+        info.reason.0 = u32::MAX;
+        info.exception_type.0 = u32::MAX;
+        info.detail = u32::MAX;
+        info.fault_address = fault_address;
+        let code =
+            BootstrapError::ObservedSupervision(ObservedSupervisionError::ExitedBeforeReady(info))
+                .exit_code();
+        assert_eq!(code & 0x3F, 12);
+        assert_eq!((code >> 6) & 0xFF, 0xFF);
+        assert_eq!((code >> 14) & 0xF, 0xF);
+        assert_eq!((code >> 18) & 0xF, 0xF);
+        assert_eq!((code >> 22) & 0x3, expected_class);
+    }
+}
+
+#[test]
+fn wyr1_observed_normal_nonzero_exit_preserves_descendant_application_code() {
+    let image = executable();
+    let mut fixture = Fixture::valid();
+    fixture.bootfs = bootfs(&[(SYSTEM_INIT_PATH, &image)]);
+    let mut loader = SmokeLoader::supervisor();
+    let mut supervisor = SmokeSupervisor::successful_supervisor();
+    supervisor.events = &[false];
+    supervisor.termination_info.application_code = 0x2408_0130;
+
+    let error = run_supervisor_bootstrap(
+        &mut fixture,
+        &mut loader,
+        &mut supervisor,
+        CHANNEL,
+        DwDeadline(99),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        &error,
+        BootstrapError::ObservedSupervision(ObservedSupervisionError::ExitedBeforeReady(_))
+    ));
+    assert_eq!(error.exit_code(), 0x2408_0130);
+    assert!(loader.terminated.is_empty());
+    assert!(fixture.sent.is_empty());
 }
 
 #[test]
@@ -1158,9 +1274,9 @@ fn capability_bootstrap_preserves_terminal_child_failure_before_relay_cleanup() 
     let mut loader = SmokeLoader::init0();
     let mut supervisor = SmokeSupervisor::successful_init0();
     supervisor.relay_events = &[DW_SIGNAL_PEER_CLOSED];
-    supervisor.termination_state = DW_TASK_STATE_RUNNING;
+    supervisor.termination_info.state = DW_TASK_STATE_RUNNING;
     supervisor.exit_on_query = Some(2);
-    supervisor.termination_application_code = 0x2408_0130;
+    supervisor.termination_info.application_code = 0x2408_0130;
 
     assert_eq!(
         run_init0_capability_bootstrap(
@@ -1532,7 +1648,7 @@ fn primordial_bootstrap_terminates_init0_after_unproven_readiness_failure() {
     let mut loader = SmokeLoader::init0();
     let mut supervisor = SmokeSupervisor::successful_init0();
     supervisor.ready_handle_count = 1;
-    supervisor.termination_state = DW_TASK_STATE_RUNNING;
+    supervisor.termination_info.state = DW_TASK_STATE_RUNNING;
 
     assert!(matches!(
         run_init0_bootstrap(
@@ -1588,7 +1704,7 @@ fn primordial_bootstrap_reconciles_exit_racing_failed_termination() {
     loader.fail_terminate = true;
     let mut supervisor = SmokeSupervisor::successful_init0();
     supervisor.ready_handle_count = 1;
-    supervisor.termination_state = DW_TASK_STATE_RUNNING;
+    supervisor.termination_info.state = DW_TASK_STATE_RUNNING;
     supervisor.exit_on_query = Some(2);
 
     assert!(matches!(
@@ -1714,7 +1830,7 @@ fn loader_smoke_surfaces_cleanup_failure_after_unproven_readiness_failure() {
     loader.fail_terminate = true;
     let mut supervisor = SmokeSupervisor::successful();
     supervisor.ready_handle_count = 1;
-    supervisor.termination_state = DW_TASK_STATE_RUNNING;
+    supervisor.termination_info.state = DW_TASK_STATE_RUNNING;
 
     assert_eq!(
         run_loader_smoke_bootstrap(

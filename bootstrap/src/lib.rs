@@ -146,6 +146,7 @@ pub use wyr0_compat::{
 
 use deepwyrm_syscall::{
     DW_TASK_STATE_EXITED, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights,
+    DwTaskTerminationInfoV1,
 };
 use wyrmroot_bootfs::archive::{Archive, LookupError, ParseError};
 use wyrmroot_bootstrap_proto::{
@@ -158,7 +159,7 @@ use wyrmroot_loader::process::{
 };
 #[cfg(feature = "primordial-test-support")]
 use wyrmroot_runtime::PrimordialTestError;
-use wyrmroot_runtime::await_child_ready_profile;
+use wyrmroot_runtime::await_child_ready_profile_observed;
 use wyrmroot_runtime::{
     BOOTFS_EXPECTATION, BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, CapabilityValidationError,
     InitCapability, LOADER_TASK_GROUP_EXPECTATION, MappingPlan, MappingPlanError, NativeError,
@@ -166,7 +167,8 @@ use wyrmroot_runtime::{
     validate_init_capabilities_v2,
 };
 use wyrmroot_runtime::{
-    ExitObservedReadinessError, ExitValidationError, SupervisionError, SupervisionPlatform,
+    ExitObservedReadinessError, ExitValidationError, ObservedSupervisionError, SupervisionError,
+    SupervisionPlatform, validate_successful_exit,
 };
 
 /// Launches exactly `/system/init`, accepts its operational WRLP 1.2 READY,
@@ -244,7 +246,7 @@ pub fn run_supervisor_bootstrap<
             })
             .map_err(BootstrapError::Native)??;
         let loaded = loaded.ok_or(BootstrapError::MissingLoadedProcess)?;
-        let ready = await_child_ready_profile(
+        let ready = await_child_ready_profile_observed(
             supervisor,
             loaded.process,
             loaded.launch_channel,
@@ -256,7 +258,10 @@ pub fn run_supervisor_bootstrap<
             let terminate = !error.process_exit_observed();
             cleanup_loaded_process(system, loader, loaded, terminate)
                 .map_err(BootstrapError::Cleanup)?;
-            return Err(BootstrapError::Supervision(error));
+            return Err(match error {
+                ObservedSupervisionError::Supervision(error) => BootstrapError::Supervision(error),
+                error => BootstrapError::ObservedSupervision(error),
+            });
         }
         // Closing primordial's observation handles does not terminate init;
         // init owns its delegated descendant TaskGroup and immutable bootfs.
@@ -336,6 +341,8 @@ pub enum BootstrapError {
     Loader(LoadError<NativeError>),
     /// Temporary WYR0-E child readiness or completion did not satisfy the exact contract.
     Supervision(SupervisionError<NativeError>),
+    /// Permanent supervisor readiness failed after retaining its exact terminal record.
+    ObservedSupervision(ObservedSupervisionError<NativeError>),
     /// Cleanup of an already-published temporary child failed.
     Cleanup(ChildCleanupError),
     /// A successful bootfs callback failed to retain the child it created.
@@ -382,8 +389,93 @@ impl BootstrapError {
             }) => loader_platform_exit_code(*stage, *cause, *rollback_failed),
             Self::Loader(_) => PREFIX | 0x01FF,
             Self::Supervision(error) => supervision_exit_code(error),
+            Self::ObservedSupervision(error) => observed_supervision_exit_code(error),
             Self::Cleanup(error) => cleanup_exit_code(*error),
             Self::MissingLoadedProcess => PREFIX | 0x0301,
+        }
+    }
+}
+
+/// Encodes a permanent supervisor's retained terminal record without widening
+/// the native ABI or emitting an ad-hoc diagnostic channel.
+///
+/// The high byte identifies the bounded terminal-record format. Bits 23..22
+/// classify the fault address as absent, lower-user-canonical,
+/// upper-canonical, or noncanonical. Bits 21..18 and 17..14 retain saturated
+/// termination-reason and exception-type values, bits 13..6 retain saturated
+/// reason-specific detail, and the existing supervision category remains in
+/// the low six bits consumed by selector diagnostics.
+const fn observed_terminal_code(category: u32, info: &DwTaskTerminationInfoV1) -> u32 {
+    const PREFIX: u32 = 0xB400_0000;
+    let reason = bounded_u32(info.reason.0, 0xF);
+    let exception_type = bounded_u32(info.exception_type.0, 0xF);
+    let detail = bounded_u32(info.detail, 0xFF);
+    PREFIX
+        | (fault_address_class(info.fault_address) << 22)
+        | (reason << 18)
+        | (exception_type << 14)
+        | (detail << 6)
+        | category
+}
+
+const fn bounded_u32(value: u32, maximum: u32) -> u32 {
+    if value > maximum { maximum } else { value }
+}
+
+const fn fault_address_class(address: u64) -> u32 {
+    if address == 0 {
+        0
+    } else if address < 0x0000_8000_0000_0000 {
+        1
+    } else if address >= 0xFFFF_8000_0000_0000 {
+        2
+    } else {
+        3
+    }
+}
+
+const fn observed_exit_validation_code(
+    error: &ExitValidationError,
+    info: &DwTaskTerminationInfoV1,
+) -> u32 {
+    match error {
+        ExitValidationError::InvalidEnvelope => observed_terminal_code(10, info),
+        ExitValidationError::NotExited => observed_terminal_code(11, info),
+        ExitValidationError::NotNormalExit => observed_terminal_code(12, info),
+        ExitValidationError::NonzeroApplicationCode(code) => *code,
+        ExitValidationError::NonzeroExceptionFields => observed_terminal_code(13, info),
+    }
+}
+
+fn observed_terminal_readiness_code(
+    info: &DwTaskTerminationInfoV1,
+    readiness_category: u32,
+) -> u32 {
+    match validate_successful_exit(info) {
+        Ok(()) => observed_terminal_code(readiness_category, info),
+        Err(error) => observed_exit_validation_code(&error, info),
+    }
+}
+
+fn observed_supervision_exit_code(error: &ObservedSupervisionError<NativeError>) -> u32 {
+    match error {
+        ObservedSupervisionError::Supervision(error) => supervision_exit_code(error),
+        ObservedSupervisionError::ExitedBeforeReady(info) => {
+            observed_terminal_readiness_code(info, 7)
+        }
+        ObservedSupervisionError::PeerClosedBeforeReady(info) => {
+            observed_terminal_readiness_code(info, 8)
+        }
+        ObservedSupervisionError::Exit(error, info) => observed_exit_validation_code(error, info),
+        ObservedSupervisionError::ExitObservedReadiness(error, info) => {
+            let category = match error {
+                ExitObservedReadinessError::Platform(_) => 14,
+                ExitObservedReadinessError::InvalidWaitResult => 15,
+                ExitObservedReadinessError::InvalidReadyReceive(_) => 16,
+                ExitObservedReadinessError::Ready(_) => 17,
+                ExitObservedReadinessError::DuplicateReady => 18,
+            };
+            observed_terminal_code(category, info)
         }
     }
 }
