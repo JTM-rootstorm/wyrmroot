@@ -88,10 +88,9 @@ pub const fn fatal_application_status(_error: &InitError) -> InitApplicationStat
 /// Test-only application status that preserves the top-level init failure
 /// category across the selector's process-exit boundary. These values are
 /// diagnostic evidence, not part of the production application-status ABI.
-#[cfg(feature = "wyr1-test-evidence")]
-#[must_use]
-pub const fn wyr1_test_failure_application_status(error: &InitError) -> u32 {
-    let category = match error {
+#[cfg(any(feature = "wyr1-test-evidence", feature = "wyr1b-test-evidence"))]
+const fn test_failure_category(error: &InitError) -> u32 {
+    match error {
         InitError::WrongManifestProfile => 0x01,
         InitError::UnlaunchableRole => 0x02,
         InitError::WrongActivationOrder => 0x03,
@@ -109,6 +108,8 @@ pub const fn wyr1_test_failure_application_status(error: &InitError) -> u32 {
         InitError::Native(_) => 0x0f,
         InitError::Capability(_) => 0x10,
         InitError::Mapping(_) => 0x11,
+        #[cfg(feature = "wyr1b-test-evidence")]
+        InitError::StartupMapping(_) => 0x11,
         InitError::Launch(_) => 0x12,
         InitError::Loader(_) => 0x13,
         InitError::Supervision => 0x14,
@@ -122,8 +123,67 @@ pub const fn wyr1_test_failure_application_status(error: &InitError) -> u32 {
         InitError::Wyr1BGateMismatch => 0x1c,
         InitError::Wyr1BModel(_) => 0x1d,
         InitError::Wyr1BEvidence(_) => 0x1e,
+    }
+}
+
+#[cfg(feature = "wyr1-test-evidence")]
+#[must_use]
+pub const fn wyr1_test_failure_application_status(error: &InitError) -> u32 {
+    0xAF11_0000 | test_failure_category(error)
+}
+
+/// Coarse, bounded classification of the queried startup bootfs size.
+#[cfg(feature = "wyr1b-test-evidence")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum StartupBootfsSizeClass {
+    Zero = 0,
+    SmallNonzero = 1,
+    Admitted = 2,
+    OverMaximum = 3,
+    GarbageHigh = 4,
+}
+
+/// Selector-27-only evidence for the initial bootfs mapping-plan failure.
+#[cfg(feature = "wyr1b-test-evidence")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StartupMappingDiagnostic {
+    pub error: MappingPlanError,
+    pub size_class: StartupBootfsSizeClass,
+}
+
+#[cfg(feature = "wyr1b-test-evidence")]
+const fn startup_bootfs_size_class(size: u64) -> StartupBootfsSizeClass {
+    if size == 0 {
+        StartupBootfsSizeClass::Zero
+    } else if size < wyrmroot_runtime::PAGE_SIZE {
+        StartupBootfsSizeClass::SmallNonzero
+    } else if size <= wyrmroot_runtime::MAX_BOOTFS_LOGICAL_SIZE {
+        StartupBootfsSizeClass::Admitted
+    } else if size < (1_u64 << 63) {
+        StartupBootfsSizeClass::OverMaximum
+    } else {
+        StartupBootfsSizeClass::GarbageHigh
+    }
+}
+
+/// Selector-27 test evidence keeps mapping as low-byte category `0x11` and
+/// uses the preceding byte as two bounded nibbles: error variant, size class.
+#[cfg(feature = "wyr1b-test-evidence")]
+#[must_use]
+pub const fn wyr1b_test_failure_application_status(error: &InitError) -> u32 {
+    let detail = match error {
+        InitError::StartupMapping(diagnostic) => {
+            let variant = match diagnostic.error {
+                MappingPlanError::EmptyArchive => 1,
+                MappingPlanError::ArchiveTooLarge => 2,
+                MappingPlanError::RoundingOverflow => 3,
+            };
+            (variant << 4) | diagnostic.size_class as u32
+        }
+        _ => 0,
     };
-    0xAF11_0000 | category
+    0xAF11_0000 | (detail << 8) | test_failure_category(error)
 }
 
 /// Boot-lifetime owner of the fixed supervisor state and primordial authority.
@@ -528,6 +588,8 @@ pub enum InitError {
     Native(NativeError),
     Capability(CapabilityValidationError),
     Mapping(MappingPlanError),
+    #[cfg(feature = "wyr1b-test-evidence")]
+    StartupMapping(StartupMappingDiagnostic),
     Launch(wyrmroot_loader::launch::LaunchError),
     Loader(LoadError<NativeError>),
     Supervision,
@@ -1403,7 +1465,8 @@ where
         let size = system
             .query_memory_object_size(authority.bootfs)
             .map_err(InitError::Native)?;
-        let plan = MappingPlan::for_bootfs(size).map_err(InitError::Mapping)?;
+        let plan =
+            MappingPlan::for_bootfs(size).map_err(|error| startup_mapping_error(error, size))?;
         let activation = system
             .with_bootfs_bytes(
                 authority.parent_root,
@@ -1425,6 +1488,21 @@ where
         .close_handle(bootstrap_channel)
         .map_err(InitError::Native)?;
     Ok((authority, activation))
+}
+
+fn startup_mapping_error(error: MappingPlanError, size: u64) -> InitError {
+    #[cfg(feature = "wyr1b-test-evidence")]
+    {
+        InitError::StartupMapping(StartupMappingDiagnostic {
+            error,
+            size_class: startup_bootfs_size_class(size),
+        })
+    }
+    #[cfg(not(feature = "wyr1b-test-evidence"))]
+    {
+        let _ = size;
+        InitError::Mapping(error)
+    }
 }
 
 fn close_startup_failure<S: InitPlatform>(
@@ -2875,6 +2953,60 @@ mod native_cleanup_tests {
         assert_eq!(
             wyr1_test_failure_application_status(&InitError::WrongActivationOrder),
             0xAF11_0003
+        );
+    }
+
+    #[cfg(feature = "wyr1b-test-evidence")]
+    #[test]
+    fn wyr1b_startup_mapping_status_encodes_variant_and_size_class() {
+        let cases = [
+            (MappingPlanError::EmptyArchive, 0, 0xAF11_1011),
+            (
+                MappingPlanError::ArchiveTooLarge,
+                wyrmroot_runtime::MAX_BOOTFS_LOGICAL_SIZE + 1,
+                0xAF11_2311,
+            ),
+            (MappingPlanError::RoundingOverflow, u64::MAX, 0xAF11_3411),
+        ];
+        for (error, size, expected) in cases {
+            let status = wyr1b_test_failure_application_status(&startup_mapping_error(error, size));
+            assert_eq!(status, expected);
+            assert_eq!(status & 0xff, 0x11);
+        }
+    }
+
+    #[cfg(feature = "wyr1b-test-evidence")]
+    #[test]
+    fn startup_bootfs_size_classes_cover_stable_boundaries() {
+        use wyrmroot_runtime::{MAX_BOOTFS_LOGICAL_SIZE, PAGE_SIZE};
+
+        let cases = [
+            (0, StartupBootfsSizeClass::Zero),
+            (1, StartupBootfsSizeClass::SmallNonzero),
+            (PAGE_SIZE - 1, StartupBootfsSizeClass::SmallNonzero),
+            (PAGE_SIZE, StartupBootfsSizeClass::Admitted),
+            (MAX_BOOTFS_LOGICAL_SIZE, StartupBootfsSizeClass::Admitted),
+            (
+                MAX_BOOTFS_LOGICAL_SIZE + 1,
+                StartupBootfsSizeClass::OverMaximum,
+            ),
+            ((1_u64 << 63) - 1, StartupBootfsSizeClass::OverMaximum),
+            (1_u64 << 63, StartupBootfsSizeClass::GarbageHigh),
+            (u64::MAX, StartupBootfsSizeClass::GarbageHigh),
+        ];
+        for (size, expected) in cases {
+            assert_eq!(startup_bootfs_size_class(size), expected);
+        }
+    }
+
+    #[cfg(feature = "wyr1b-test-evidence")]
+    #[test]
+    fn ordinary_mapping_failure_retains_category_only_status() {
+        assert_eq!(
+            wyr1b_test_failure_application_status(&InitError::Mapping(
+                MappingPlanError::ArchiveTooLarge,
+            )),
+            0xAF11_0011
         );
     }
 }

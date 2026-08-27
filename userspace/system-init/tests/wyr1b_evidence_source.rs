@@ -27,6 +27,20 @@ fn selector_27_submission_feature_is_separate_from_selector_25() {
 }
 
 #[test]
+fn selector_27_startup_mapping_diagnostic_is_bound_to_the_initial_mapping_only() {
+    assert_eq!(
+        LIB.matches(".map_err(|error| startup_mapping_error(error, size))?")
+            .count(),
+        1
+    );
+    assert_eq!(LIB.matches(".map_err(InitError::Mapping)?").count(), 1);
+    assert!(LIB.contains("fn startup_mapping_error(error: MappingPlanError, size: u64)"));
+    assert!(LIB.contains("InitError::StartupMapping(StartupMappingDiagnostic"));
+    assert!(LIB.contains("let plan = MappingPlan::for_bootfs(size).map_err(InitError::Mapping)?;"));
+    assert!(MAIN.contains("return wyr1b_test_failure_application_status(&error);"));
+}
+
+#[test]
 fn controller_records_all_relational_joins_in_contract_order() {
     let registry_start = NATIVE.find("fn run_registry_gate").unwrap();
     let registry_end = NATIVE[registry_start..]

@@ -20,10 +20,12 @@ use wyrmroot_runtime::{
     query_memory_object_size, receive_channel, send_channel, set_timer, unmap_bootfs, wait_many,
     wait_one,
 };
-#[cfg(not(feature = "wyr1-test-evidence"))]
+#[cfg(not(any(feature = "wyr1-test-evidence", feature = "wyr1b-test-evidence")))]
 use wyrmroot_system_init::fatal_application_status;
 #[cfg(feature = "wyr1-test-evidence")]
 use wyrmroot_system_init::wyr1_test_failure_application_status;
+#[cfg(feature = "wyr1b-test-evidence")]
+use wyrmroot_system_init::wyr1b_test_failure_application_status;
 use wyrmroot_system_init::{InitPlatform, Wyr1BPlatform, run_system_init_product};
 use wyrmroot_wyr1b_gate_proto as _;
 
@@ -131,9 +133,11 @@ fn main(startup: StartupBlock<'_>) -> u32 {
     let mut resident = match result {
         Ok(resident) => resident,
         Err(error) => {
-            #[cfg(feature = "wyr1-test-evidence")]
+            #[cfg(feature = "wyr1b-test-evidence")]
+            return wyr1b_test_failure_application_status(&error);
+            #[cfg(all(feature = "wyr1-test-evidence", not(feature = "wyr1b-test-evidence")))]
             return wyr1_test_failure_application_status(&error);
-            #[cfg(not(feature = "wyr1-test-evidence"))]
+            #[cfg(not(any(feature = "wyr1-test-evidence", feature = "wyr1b-test-evidence")))]
             return fatal_application_status(&error) as u32;
         }
     };
