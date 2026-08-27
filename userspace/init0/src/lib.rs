@@ -11,8 +11,13 @@
 #[cfg(test)]
 extern crate std;
 
-#[cfg(feature = "dw1b-preemption-integration")]
+#[cfg(any(
+    feature = "dw1b-preemption-integration",
+    feature = "dw1c-preemption-integration"
+))]
 use deepwyrm_syscall::DW_SIGNAL_EXITED;
+#[cfg(feature = "dw1c-preemption-integration")]
+use deepwyrm_syscall::DwWaitItemV1;
 #[cfg(feature = "dw1b-preemption-integration")]
 use deepwyrm_syscall::{
     DW_OBJECT_TYPE_CHANNEL, DW_RIGHT_DUPLICATE, DW_RIGHT_INSPECT, DW_RIGHT_READ, DW_RIGHT_TRANSFER,
@@ -20,8 +25,7 @@ use deepwyrm_syscall::{
 };
 #[cfg(any(
     feature = "i-capability-integration",
-    feature = "dw1b-preemption-integration",
-    feature = "dw1c-preemption-integration"
+    feature = "dw1b-preemption-integration"
 ))]
 use deepwyrm_syscall::{DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DwSignals, DwWaitItemV1};
 #[cfg(feature = "i-capability-integration")]
@@ -43,15 +47,24 @@ use wyrmroot_loader::{
         load_process,
     },
 };
-#[cfg(feature = "dw1b-preemption-integration")]
+#[cfg(any(
+    feature = "dw1b-preemption-integration",
+    feature = "dw1c-preemption-integration"
+))]
 use wyrmroot_runtime::await_child_ready_profile;
 use wyrmroot_runtime::{
     BOOTFS_EXPECTATION, BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, CapabilityValidationError,
     ExitObservedReadinessError, ExitValidationError, InitCapability, LOADER_TASK_GROUP_EXPECTATION,
     MappingPlan, MappingPlanError, NativeError, ReceiveCounts, SELF_ROOT_EXPECTATION,
-    SupervisionError, SupervisionPlatform, supervise_child, validate_bootstrap_channel,
-    validate_init_capabilities_v2, validate_successful_exit,
+    SupervisionError, SupervisionPlatform, validate_bootstrap_channel,
+    validate_init_capabilities_v2,
 };
+#[cfg(any(
+    feature = "i2-stress-integration",
+    feature = "i-capability-integration",
+    feature = "dw1b-preemption-integration"
+))]
+use wyrmroot_runtime::{supervise_child, validate_successful_exit};
 
 /// The only bootfs path selected by the WYR0-G descendant smoke chain.
 pub const HELLO_PATH: &[u8] = b"bin/hello";
@@ -137,6 +150,16 @@ fn arm_dw1c_after_ready<System: Init0System>(
     system: &mut System,
     processes: [DwHandle; wyrmroot_runtime::DW1C_ACTOR_COUNT],
 ) -> Result<(), Init0Error> {
+    let bindings = dw1c_bindings(processes)?;
+    system
+        .arm_dw1c_preemption(&bindings)
+        .map_err(Init0Error::Native)
+}
+
+#[cfg(feature = "dw1c-preemption-integration")]
+fn dw1c_bindings(
+    processes: [DwHandle; wyrmroot_runtime::DW1C_ACTOR_COUNT],
+) -> Result<[wyrmroot_runtime::Dw1cActorBindV1; wyrmroot_runtime::DW1C_ACTOR_COUNT], Init0Error> {
     let mut bindings = [wyrmroot_runtime::Dw1cActorBindV1 {
         token: 0,
         role: 0,
@@ -155,9 +178,33 @@ fn arm_dw1c_after_ready<System: Init0System>(
         };
         index += 1;
     }
-    system
-        .arm_dw1c_preemption(&bindings)
-        .map_err(Init0Error::Native)
+    Ok(bindings)
+}
+
+#[cfg(all(test, feature = "dw1c-preemption-integration"))]
+mod dw1c_binding_tests {
+    use super::dw1c_bindings;
+    use deepwyrm_syscall::DwHandle;
+
+    #[test]
+    fn bindings_are_distinct_and_follow_token_role_order() {
+        let processes = core::array::from_fn(|index| DwHandle(0x100 + index as u64));
+        let bindings = dw1c_bindings(processes).unwrap();
+        for (index, binding) in bindings.into_iter().enumerate() {
+            assert_eq!(binding.token, index as u64 + 1);
+            assert_eq!(binding.role, index as u64 + 1);
+            assert_eq!(binding.process, DwHandle(0x100 + index as u64));
+        }
+    }
+
+    #[test]
+    fn bindings_reject_zero_or_duplicate_process_handles() {
+        let mut processes = core::array::from_fn(|index| DwHandle(0x200 + index as u64));
+        processes[3] = DwHandle(0);
+        assert!(dw1c_bindings(processes).is_err());
+        processes[3] = processes[2];
+        assert!(dw1c_bindings(processes).is_err());
+    }
 }
 
 /// Native operations used by the WYR0-G `init0` descendant transaction.
@@ -478,7 +525,15 @@ pub fn run_init0<
             run_dw1b_preemption(system, loader, supervisor, authority, plan, deadline)?;
             Ok(message.transaction_id)
         }
-        #[cfg(not(feature = "dw1b-preemption-integration"))]
+        #[cfg(feature = "dw1c-preemption-integration")]
+        {
+            run_dw1c_preemption(system, loader, supervisor, authority, plan, deadline)?;
+            Ok(message.transaction_id)
+        }
+        #[cfg(not(any(
+            feature = "dw1b-preemption-integration",
+            feature = "dw1c-preemption-integration"
+        )))]
         {
             let mut loaded = None;
             let mapped =
@@ -784,6 +839,149 @@ fn run_dw1b_preemption<
 
     let cleanup = cleanup_dw1b_peers(system, loader, supervisor, peers, progress_reaped, deadline);
     finish_dw1b_operation(operation, cleanup)
+}
+
+#[cfg(feature = "dw1c-preemption-integration")]
+const DW1C_ACTOR_PATHS: [&[u8]; wyrmroot_runtime::DW1C_ACTOR_COUNT] = [
+    b"test/dw1-c/actor1",
+    b"test/dw1-c/actor2",
+    b"test/dw1-c/actor3",
+    b"test/dw1-c/actor4",
+    b"test/dw1-c/actor5",
+    b"test/dw1-c/actor6",
+    b"test/dw1-c/actor7",
+    b"test/dw1-c/actor8",
+    b"test/dw1-c/actor9",
+    b"test/dw1-c/actor10",
+];
+
+#[cfg(feature = "dw1c-preemption-integration")]
+fn run_dw1c_preemption<
+    System: Init0System,
+    Loader: LoaderPlatform<Error = NativeError>,
+    Supervisor: SupervisionPlatform<Error = NativeError>,
+>(
+    system: &mut System,
+    loader: &mut Loader,
+    supervisor: &mut Supervisor,
+    authority: LoadAuthority,
+    plan: MappingPlan,
+    deadline: DwDeadline,
+) -> Result<(), Init0Error> {
+    let mut actors = [None; wyrmroot_runtime::DW1C_ACTOR_COUNT];
+    let mapped =
+        system.with_bootfs_bytes(authority.parent_root, authority.bootfs, plan, |bootfs| {
+            let archive = Archive::new(bootfs).map_err(Init0Error::Bootfs)?;
+            let mut index = 0;
+            while index < DW1C_ACTOR_PATHS.len() {
+                let entry = archive
+                    .lookup(DW1C_ACTOR_PATHS[index])
+                    .map_err(|_| Init0Error::MissingHello)?;
+                if !entry.is_executable() || entry.data().is_empty() {
+                    return Err(Init0Error::HelloNotExecutable);
+                }
+                let display_path = entry.name_utf8().map_err(|_| Init0Error::MissingHello)?;
+                let transaction_id = 0xD1C0_0000_u64 + (index as u64 + 1);
+                actors[index] = Some(
+                    load_process(
+                        loader,
+                        authority,
+                        LoadRequest {
+                            image: entry.data(),
+                            display_path,
+                            profile: LaunchProfile::Hello,
+                            transaction_id,
+                        },
+                    )
+                    .map_err(Init0Error::Loader)?,
+                );
+                index += 1;
+            }
+            Ok(())
+        });
+    match mapped {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            return Err(prefer_dw1c_cleanup(
+                error,
+                cleanup_dw1c_actors(loader, supervisor, actors, deadline),
+            ));
+        }
+        Err(error) => {
+            return Err(prefer_dw1c_cleanup(
+                Init0Error::Native(error),
+                cleanup_dw1c_actors(loader, supervisor, actors, deadline),
+            ));
+        }
+    }
+    let mut index = 0;
+    while index < actors.len() {
+        let actor = actors[index].ok_or(Init0Error::MissingLoadedProcess)?;
+        if let Err(error) = await_child_ready_profile(
+            supervisor,
+            actor.process,
+            actor.launch_channel,
+            LaunchProfile::Hello,
+            0xD1C0_0000_u64 + (index as u64 + 1),
+            deadline,
+        ) {
+            return Err(prefer_dw1c_cleanup(
+                Init0Error::Supervision(error),
+                cleanup_dw1c_actors(loader, supervisor, actors, deadline),
+            ));
+        }
+        index += 1;
+    }
+    // The READY loop intentionally walks the same table to preserve token order;
+    // restart at zero before materializing the ARM bindings.
+    index = 0;
+    let mut processes = [DwHandle(0); wyrmroot_runtime::DW1C_ACTOR_COUNT];
+    while index < actors.len() {
+        processes[index] = actors[index]
+            .ok_or(Init0Error::MissingLoadedProcess)?
+            .process;
+        index += 1;
+    }
+    arm_dw1c_after_ready(system, processes)
+}
+
+#[cfg(feature = "dw1c-preemption-integration")]
+fn cleanup_dw1c_actors<
+    Loader: LoaderPlatform<Error = NativeError>,
+    Supervisor: SupervisionPlatform<Error = NativeError>,
+>(
+    loader: &mut Loader,
+    supervisor: &mut Supervisor,
+    actors: [Option<LoadedProcess>; wyrmroot_runtime::DW1C_ACTOR_COUNT],
+    deadline: DwDeadline,
+) -> Result<(), Init0Error> {
+    let mut first = None;
+    for actor in actors.into_iter().flatten() {
+        if let Err(error) = loader.process_terminate(actor.process) {
+            first.get_or_insert(Init0Error::Cleanup(error));
+        }
+        let item = DwWaitItemV1 {
+            handle: actor.process,
+            signals: DW_SIGNAL_EXITED,
+        };
+        if supervisor
+            .wait_many(core::slice::from_ref(&item), deadline)
+            .is_err()
+        {
+            first.get_or_insert(Init0Error::CapabilityEvidence);
+        }
+        for handle in [actor.launch_channel, actor.process] {
+            if let Err(error) = loader.close(handle) {
+                first.get_or_insert(Init0Error::Cleanup(error));
+            }
+        }
+    }
+    first.map_or(Ok(()), Err)
+}
+
+#[cfg(feature = "dw1c-preemption-integration")]
+fn prefer_dw1c_cleanup(primary: Init0Error, cleanup: Result<(), Init0Error>) -> Init0Error {
+    cleanup.err().unwrap_or(primary)
 }
 
 #[cfg(feature = "dw1b-preemption-integration")]
