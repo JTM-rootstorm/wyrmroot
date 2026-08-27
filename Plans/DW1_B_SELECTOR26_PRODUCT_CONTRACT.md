@@ -5,7 +5,7 @@ product. It does not extend Deepwyrm's public ABI. Wyrmroot's global generated
 ABI/syscall consumers remain pinned to `cfc69bd8a49819ce1cda1a132cf56e55c93f92e4`
 and ABI tree `1c6a74f130e386eee95b3780c75950beefd0037d`.
 The selector product separately requires kernel candidate
-`b203ba6d6a69443b9c51750369272446cb9604d9`; this is the canonical selector-26
+`18ddeef7dc118d1a5c830713e28206baac4c5c97`; this is the canonical selector-26
 kernel candidate. This contract does not claim that a Wyrmroot revision which
 has not yet been integrated and committed is final.
 
@@ -46,7 +46,8 @@ repository/Cargo-home/target remaps, `/Brepro`, and production `/debug:none`.
 The checked-in toolchain identity selects both the immutable accepted a92dc7f7
 compiler artifact and the existing project-local `.tmp/cargo-home/offline-v1`
 cache. Callers supply neither `WYRMROOT_RUSTC` nor `CARGO_HOME`; freeze/build
-validate those identities before creating their output directories.
+validate those identities and the exact clean sibling Deepwyrm candidate before
+creating their output directories.
 The central UEFI inspector must report a production loader with Repro metadata,
 no CodeView record, and no import directory. The freeze retains the audited
 debug EFI/PDB pair and normalized effective UEFI configuration and inspector

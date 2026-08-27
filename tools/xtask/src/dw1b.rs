@@ -20,7 +20,7 @@ pub const SCHEMA_VERSION: u32 = 5;
 pub const SELECTOR: &str = "normal-preemption-up";
 pub const TEST_ID: u32 = 26;
 pub const DIGEST: u64 = 0x5E4E_054B_5C24_4ACE;
-pub const DEEPWYRM_CANDIDATE: &str = "b203ba6d6a69443b9c51750369272446cb9604d9";
+pub const DEEPWYRM_CANDIDATE: &str = "18ddeef7dc118d1a5c830713e28206baac4c5c97";
 pub const DEEPWYRM_ABI_TREE: &str = "1c6a74f130e386eee95b3780c75950beefd0037d";
 pub const ACCEPTED_RUST_REVISION: &str = "a92dc7f7464ad6ddfece4402bd7b86dbfa86166d";
 const RECEIPT_KIND: &str = "wyrmroot-dw1-b-build-lineage";
@@ -1039,6 +1039,7 @@ fn preflight_source_build_environment() -> Result<(), Failure> {
     let repository = crate::tasks::repository_root()?;
     let manifest = crate::metadata::BuildManifest::load(&repository)?;
     let _cargo_home = crate::tasks::project_cargo_home(&repository, &manifest)?;
+    verify_clean_deepwyrm_revision(DEEPWYRM_CANDIDATE)?;
     Ok(())
 }
 
@@ -2290,37 +2291,59 @@ fn verify_clean_source() -> Result<String, Failure> {
 
 fn verify_clean_source_revision(expected: &str) -> Result<(), Failure> {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    verify_clean_repository_revision(&repository, "Wyrmroot", expected)
+}
+
+fn verify_clean_deepwyrm_revision(expected: &str) -> Result<(), Failure> {
+    let wyrmroot = crate::tasks::repository_root()?;
+    let project = wyrmroot
+        .parent()
+        .ok_or_else(|| Failure::task("Wyrmroot repository has no project parent"))?;
+    let repository = fs::canonicalize(project.join("deepwyrm"))
+        .map_err(|error| Failure::task(format!("could not resolve Deepwyrm checkout: {error}")))?;
+    if repository.parent() != Some(project) {
+        return Err(Failure::task(
+            "Deepwyrm checkout must be the canonical OS-Project sibling",
+        ));
+    }
+    verify_clean_repository_revision(&repository, "Deepwyrm", expected)
+}
+
+fn verify_clean_repository_revision(
+    repository: &Path,
+    label: &str,
+    expected: &str,
+) -> Result<(), Failure> {
     let revision = Command::new("git")
-        .args(["-C", repository.to_str().unwrap(), "rev-parse", "HEAD"])
+        .arg("-C")
+        .arg(repository)
+        .args(["rev-parse", "HEAD"])
         .output()
-        .map_err(|error| Failure::task(format!("could not inspect Wyrmroot HEAD: {error}")))?;
+        .map_err(|error| Failure::task(format!("could not inspect {label} HEAD: {error}")))?;
     let actual = core::str::from_utf8(&revision.stdout)
-        .map_err(|_| Failure::task("Wyrmroot HEAD is not UTF-8"))?
+        .map_err(|_| Failure::task(format!("{label} HEAD is not UTF-8")))?
         .trim();
     let status = Command::new("git")
-        .args([
-            "-C",
-            repository.to_str().unwrap(),
-            "status",
-            "--porcelain=v1",
-            "--untracked-files=all",
-        ])
+        .arg("-C")
+        .arg(repository)
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
         .output()
-        .map_err(|error| Failure::task(format!("could not inspect Wyrmroot status: {error}")))?;
+        .map_err(|error| Failure::task(format!("could not inspect {label} status: {error}")))?;
     if !revision.status.success()
         || actual != expected
         || !status.status.success()
         || !status.stdout.is_empty()
     {
-        return Err(Failure::task(
-            "DW1-B acceptance requires the exact clean Wyrmroot revision",
-        ));
+        return Err(Failure::task(format!(
+            "DW1-B acceptance requires the exact clean {label} revision"
+        )));
     }
     Ok(())
 }
 
 fn verify_acceptance_source(request: &Request) -> Result<(), Failure> {
-    verify_clean_source_revision(&request.wyrmroot_revision)
+    verify_clean_source_revision(&request.wyrmroot_revision)?;
+    verify_clean_deepwyrm_revision(&request.deepwyrm_revision)
 }
 fn read_bounded(path: &Path, label: &str, maximum: u64) -> Result<Vec<u8>, Failure> {
     let metadata = fs::symlink_metadata(path)
@@ -2482,6 +2505,23 @@ mod tests {
             freeze.find("preflight_source_build_environment()")
                 < freeze.find("fs::create_dir(&output)")
         );
+        let preflight = source
+            .split_once("fn preflight_source_build_environment()")
+            .expect("source build preflight")
+            .1
+            .split_once("fn render_freeze_hashes(")
+            .expect("source build preflight boundary")
+            .0;
+        assert!(preflight.contains("verify_clean_deepwyrm_revision(DEEPWYRM_CANDIDATE)?"));
+        let acceptance = source
+            .split_once("fn verify_acceptance_source(request: &Request)")
+            .expect("acceptance source gate")
+            .1
+            .split_once("fn read_bounded(")
+            .expect("acceptance source gate boundary")
+            .0;
+        assert!(acceptance.contains("verify_clean_source_revision(&request.wyrmroot_revision)?"));
+        assert!(acceptance.contains("verify_clean_deepwyrm_revision(&request.deepwyrm_revision)"));
 
         let versions = include_str!("../../../toolchain/versions.toml");
         assert!(versions.contains(
