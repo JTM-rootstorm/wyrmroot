@@ -2418,6 +2418,9 @@ mod tests {
         );
 
         let versions = include_str!("../../../toolchain/versions.toml");
+        assert!(versions.contains(
+            "accepted_artifact_root = \"artifacts/toolchains/accepted/RUST-WYR0-I-B-SYSROOTS-007\""
+        ));
         assert!(versions.contains("project_cargo_home = \".tmp/cargo-home/offline-v1\""));
         assert!(!source.contains("canonical_environment_directory(\"CARGO_HOME\")"));
     }

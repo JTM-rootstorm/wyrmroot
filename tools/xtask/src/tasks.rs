@@ -263,7 +263,7 @@ pub(crate) fn prepare_loader_toolchain(
     manifest: &BuildManifest,
 ) -> Result<LoaderToolchain, Failure> {
     reject_ambient_rust_overrides()?;
-    let configured = configured_rustc(repository)?;
+    let configured = configured_rustc(repository, manifest)?;
     let accepted = crate::toolchain_artifact::prepare(
         repository,
         &configured,
@@ -284,24 +284,45 @@ pub(crate) fn prepare_loader_toolchain(
     })
 }
 
-fn configured_rustc(repository: &Path) -> Result<PathBuf, Failure> {
-    let Some(configured) = env::var_os("WYRMROOT_RUSTC") else {
-        let request_path = repository.join(TOOLCHAIN_REQUEST);
-        let request = fs::read_to_string(&request_path).map_err(|error| {
-            Failure::task(format!(
-                "accepted WYR0-B rustc is unavailable and toolchain request {} could not be read: {error}",
-                request_path.display()
-            ))
-        })?;
-        return Err(blocked_toolchain_failure(&request));
-    };
-    let path = PathBuf::from(configured);
-    if !path.is_absolute() {
+fn configured_rustc(repository: &Path, manifest: &BuildManifest) -> Result<PathBuf, Failure> {
+    if env::var_os("WYRMROOT_RUSTC").is_some() {
         return Err(Failure::task(
-            "WYRMROOT_RUSTC must be an absolute path to the accepted compiler",
+            "WYRMROOT_RUSTC is toolchain-owned; do not supply it",
         ));
     }
-    Ok(path)
+    let artifact_root = Path::new(manifest.accepted_artifact_root()?);
+    if artifact_root.is_absolute()
+        || artifact_root
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(Failure::task(
+            "accepted Rust artifact root must be a canonical project-relative path",
+        ));
+    }
+    let project = repository
+        .parent()
+        .ok_or_else(|| Failure::task("Wyrmroot repository has no OS-Project parent"))?;
+    let rustc = project
+        .join(artifact_root)
+        .join("toolchains")
+        .join(manifest.rust_toolchain_name()?)
+        .join("bin/rustc");
+    let canonical = fs::canonicalize(&rustc).map_err(|error| {
+        let request_path = repository.join(TOOLCHAIN_REQUEST);
+        let request = fs::read_to_string(&request_path).unwrap_or_default();
+        Failure::task(format!(
+            "{}; accepted Rust compiler {} is unavailable: {error}",
+            blocked_toolchain_failure(&request).message,
+            rustc.display()
+        ))
+    })?;
+    if canonical != rustc {
+        return Err(Failure::task(
+            "accepted Rust compiler path is not canonical",
+        ));
+    }
+    Ok(canonical)
 }
 
 pub(crate) fn project_cargo_home(

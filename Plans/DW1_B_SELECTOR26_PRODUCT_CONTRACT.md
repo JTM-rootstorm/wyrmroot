@@ -43,9 +43,10 @@ the six request input artifacts plus the builder-owned Wyr source-build
 receipt. It uses the central deterministic UEFI builder for isolated release
 and retained-debug loader builds, the accepted Rust007 sysroot and `rust-lld`,
 repository/Cargo-home/target remaps, `/Brepro`, and production `/debug:none`.
-The checked-in toolchain identity selects the existing project-local
-`.tmp/cargo-home/offline-v1` cache; callers do not supply `CARGO_HOME`, and
-freeze/build validate that cache before creating their output directories.
+The checked-in toolchain identity selects both the immutable accepted a92dc7f7
+compiler artifact and the existing project-local `.tmp/cargo-home/offline-v1`
+cache. Callers supply neither `WYRMROOT_RUSTC` nor `CARGO_HOME`; freeze/build
+validate those identities before creating their output directories.
 The central UEFI inspector must report a production loader with Repro metadata,
 no CodeView record, and no import directory. The freeze retains the audited
 debug EFI/PDB pair and normalized effective UEFI configuration and inspector
