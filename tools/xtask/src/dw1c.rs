@@ -37,6 +37,8 @@ const GENERATED_ABI_REVISION: &str = "cfc69bd8a49819ce1cda1a132cf56e55c93f92e4";
 const DEEPWYRM_ABI_TREE: &str = "1c6a74f130e386eee95b3780c75950beefd0037d";
 const MACHINE: &str = "pc-q35-10.2";
 const DOMAIN_UUID: &str = "33005e22-d7c2-4b13-b1ac-b82eda95e584";
+const ESP_FD_GROUP: &str = "dw-f13-esp-v1";
+const VARS_FD_GROUP: &str = "dw-f13-ovmf-vars-v1";
 const O_NOFOLLOW: i32 = 0x2_0000;
 const MAX_INPUT_BYTES: u64 = 512 * 1024 * 1024;
 const ABSENT: &str = "absent";
@@ -1531,7 +1533,7 @@ fn base_fields(
 
 fn domain_xml(inputs: &BTreeMap<&str, Snapshot>, vars: &Snapshot) -> Result<String, Failure> {
     Ok(format!(
-        "<domain xmlns:qemu=\"http://libvirt.org/schemas/domain/qemu/1.0\" type=\"qemu\">\n  <name>OS-Project</name>\n  <uuid>{DOMAIN_UUID}</uuid>\n  <memory unit=\"KiB\">2097152</memory>\n  <currentMemory unit=\"KiB\">2097152</currentMemory>\n  <vcpu placement=\"static\">4</vcpu>\n  <sysinfo type=\"fwcfg\"><entry name=\"opt/org.deepwyrm.test.selector\">{SELECTOR}</entry><entry name=\"opt/org.deepwyrm.test.test_id\">{TEST_ID}</entry></sysinfo>\n  <os><type arch=\"x86_64\" machine=\"{MACHINE}\">hvm</type><loader readonly=\"yes\" secure=\"no\" type=\"pflash\" format=\"raw\">{}</loader><nvram type=\"file\" format=\"raw\"><source file=\"{}\"/></nvram><boot dev=\"hd\"/></os>\n  <features><acpi/><apic/></features>\n  <clock offset=\"utc\"><timer name=\"rtc\" tickpolicy=\"catchup\"/><timer name=\"pit\" tickpolicy=\"delay\"/><timer name=\"hpet\" present=\"no\"/></clock>\n  <on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>destroy</on_crash>\n  <pm><suspend-to-mem enabled=\"no\"/><suspend-to-disk enabled=\"no\"/></pm>\n  <devices><emulator>/usr/bin/qemu-system-x86_64</emulator><disk type=\"file\" device=\"disk\"><driver name=\"qemu\" type=\"raw\"/><source file=\"{}\"/><target dev=\"vda\" bus=\"virtio\"/><readonly/></disk><controller type=\"pci\" index=\"0\" model=\"pcie-root\"/><serial type=\"pty\"><target type=\"isa-serial\" port=\"0\"/></serial><console type=\"pty\"><target type=\"serial\" port=\"0\"/></console></devices>\n  <qemu:commandline><qemu:arg value=\"-device\"/><qemu:arg value=\"isa-debug-exit,iobase=0xf4,iosize=0x04\"/></qemu:commandline>\n</domain>\n",
+        "<domain xmlns:qemu=\"http://libvirt.org/schemas/domain/qemu/1.0\" type=\"qemu\">\n  <name>OS-Project</name>\n  <uuid>{DOMAIN_UUID}</uuid>\n  <memory unit=\"KiB\">2097152</memory>\n  <currentMemory unit=\"KiB\">2097152</currentMemory>\n  <vcpu placement=\"static\">4</vcpu>\n  <sysinfo type=\"fwcfg\"><entry name=\"opt/org.deepwyrm.test.selector\">{SELECTOR}</entry><entry name=\"opt/org.deepwyrm.test.test_id\">{TEST_ID}</entry></sysinfo>\n  <os><type arch=\"x86_64\" machine=\"{MACHINE}\">hvm</type><loader readonly=\"yes\" secure=\"no\" type=\"pflash\" format=\"raw\">{}</loader><nvram type=\"file\" format=\"raw\"><source file=\"{}\" fdgroup=\"{VARS_FD_GROUP}\"/></nvram><boot dev=\"hd\"/></os>\n  <features><acpi/><apic/></features>\n  <clock offset=\"utc\"><timer name=\"rtc\" tickpolicy=\"catchup\"/><timer name=\"pit\" tickpolicy=\"delay\"/><timer name=\"hpet\" present=\"no\"/></clock>\n  <on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>destroy</on_crash>\n  <pm><suspend-to-mem enabled=\"no\"/><suspend-to-disk enabled=\"no\"/></pm>\n  <devices><emulator>/usr/bin/qemu-system-x86_64</emulator><disk type=\"file\" device=\"disk\"><driver name=\"qemu\" type=\"raw\"/><source file=\"{}\" fdgroup=\"{ESP_FD_GROUP}\"/><target dev=\"vda\" bus=\"virtio\"/><readonly/></disk><controller type=\"pci\" index=\"0\" model=\"pcie-root\"/><serial type=\"pty\"><target type=\"isa-serial\" port=\"0\"/></serial><console type=\"pty\"><target type=\"serial\" port=\"0\"/></console></devices>\n  <qemu:commandline><qemu:arg value=\"-device\"/><qemu:arg value=\"isa-debug-exit,iobase=0xf4,iosize=0x04\"/></qemu:commandline>\n</domain>\n",
         xml(&inputs["ovmf_code"].path)?,
         xml(&vars.path)?,
         xml(&inputs["esp"].path)?
@@ -1714,6 +1716,8 @@ mod tests {
         assert!(xml.contains(DOMAIN_UUID));
         assert!(xml.contains("<vcpu placement=\"static\">4</vcpu>"));
         assert!(xml.contains("2097152"));
+        assert!(xml.contains(&format!("fdgroup=\"{VARS_FD_GROUP}\"")));
+        assert!(xml.contains(&format!("fdgroup=\"{ESP_FD_GROUP}\"")));
         for required in [
             "<clock offset=\"utc\">",
             "<on_poweroff>destroy</on_poweroff>",
