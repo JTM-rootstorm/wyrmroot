@@ -314,7 +314,8 @@ fn dw1c_private_veneer_has_only_the_four_frozen_operation_shapes() {
         "bindings.as_ptr() as u64",
         "DW1C_ACTOR_COUNT as u64",
         "240,",
-        "DW1C_PRIVATE_RETRY_LIMIT: usize = 1 << 20",
+        "crate::monotonic_active_now()? >= deadline.0",
+        "DW_STATUS_TIMED_OUT",
         "status != DW_STATUS_WOULD_BLOCK",
         "[2, token, count, digest, 0, 0]",
         "[3, 0x1f, digest, 0, 0, 0]",
@@ -327,10 +328,11 @@ fn dw1c_private_veneer_has_only_the_four_frozen_operation_shapes() {
     }
     assert_eq!(
         CAPABILITY_NATIVE_SOURCE
-            .matches("for _ in 0..DW1C_PRIVATE_RETRY_LIMIT")
+            .matches("crate::monotonic_active_now()? >= deadline.0")
             .count(),
         2
     );
+    assert!(!CAPABILITY_NATIVE_SOURCE.contains("DW1C_PRIVATE_RETRY_LIMIT"));
     assert!(SOURCE.contains("await_dw1c_token2_relay_ready"));
     assert!(SOURCE.contains("submit_dw1c_workload_complete"));
     assert!(!NATIVE_SOURCE.contains("FFFF_FF1C"));

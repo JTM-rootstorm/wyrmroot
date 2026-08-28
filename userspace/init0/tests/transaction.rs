@@ -324,14 +324,23 @@ impl Init0System for Fixture {
     }
 
     #[cfg(feature = "dw1c-preemption-integration")]
-    fn await_dw1c_token2_relay_ready(&mut self) -> Result<(), NativeError> {
+    fn await_dw1c_token2_relay_ready(&mut self, _: DwDeadline) -> Result<(), NativeError> {
         Ok(())
+    }
+
+    #[cfg(feature = "dw1c-preemption-integration")]
+    fn dw1c_deadline_after(
+        &mut self,
+        interval_nanoseconds: u64,
+    ) -> Result<DwDeadline, NativeError> {
+        Ok(DwDeadline(DEADLINE.0 + interval_nanoseconds))
     }
 
     #[cfg(feature = "dw1c-preemption-integration")]
     fn arm_dw1c_preemption(
         &mut self,
         bindings: &[wyrmroot_runtime::Dw1cActorBindV1; wyrmroot_runtime::DW1C_ACTOR_COUNT],
+        _: DwDeadline,
     ) -> Result<(), NativeError> {
         assert!(self.dw1c_arm.is_none());
         self.dw1c_arm = Some(*bindings);

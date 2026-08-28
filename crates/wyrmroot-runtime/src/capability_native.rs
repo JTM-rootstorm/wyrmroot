@@ -350,9 +350,6 @@ pub fn submit_dw1b_progress(digest: u64) -> Result<(), NativeError> {
 const DW1C_TEST_EVIDENCE_SYSCALL: deepwyrm_syscall::DwSyscallId =
     deepwyrm_syscall::DwSyscallId(0xFFFF_FF1C);
 
-#[cfg(feature = "dw1c-test-evidence")]
-const DW1C_PRIVATE_RETRY_LIMIT: usize = 1 << 20;
-
 /// The fixed selector-28 controller table has ten entries, in token order.
 #[cfg(feature = "dw1c-test-evidence")]
 pub const DW1C_ACTOR_COUNT: usize = 10;
@@ -374,8 +371,9 @@ pub struct Dw1cActorBindV1 {
 #[cfg(feature = "dw1c-test-evidence")]
 pub fn arm_dw1c_preemption(
     bindings: &[Dw1cActorBindV1; DW1C_ACTOR_COUNT],
+    deadline: DwDeadline,
 ) -> Result<(), NativeError> {
-    for _ in 0..DW1C_PRIVATE_RETRY_LIMIT {
+    loop {
         let status = raw::call(
             DW1C_TEST_EVIDENCE_SYSCALL,
             [
@@ -393,9 +391,11 @@ pub fn arm_dw1c_preemption(
         if status != DW_STATUS_WOULD_BLOCK {
             return Err(NativeError::Status(status));
         }
+        if crate::monotonic_active_now()? >= deadline.0 {
+            return Err(NativeError::Status(deepwyrm_syscall::DW_STATUS_TIMED_OUT));
+        }
         core::hint::spin_loop();
     }
-    Err(NativeError::Status(DW_STATUS_WOULD_BLOCK))
 }
 
 /// Submits one fixed-workload progress claim for a CPU-bound actor.
@@ -420,8 +420,8 @@ pub fn submit_dw1c_workload_complete(digest: u64) -> Result<(), NativeError> {
 /// Waits until token 2 has consumed its selector-private relay endpoint and
 /// committed a second, continuation-released Channel wait.
 #[cfg(feature = "dw1c-test-evidence")]
-pub fn await_dw1c_token2_relay_ready() -> Result<(), NativeError> {
-    for _ in 0..DW1C_PRIVATE_RETRY_LIMIT {
+pub fn await_dw1c_token2_relay_ready(deadline: DwDeadline) -> Result<(), NativeError> {
+    loop {
         let status = raw::call(DW1C_TEST_EVIDENCE_SYSCALL, [4, 0, 0, 0, 0, 0]);
         if status == DW_STATUS_SUCCESS {
             return Ok(());
@@ -429,9 +429,11 @@ pub fn await_dw1c_token2_relay_ready() -> Result<(), NativeError> {
         if status != DW_STATUS_WOULD_BLOCK {
             return Err(NativeError::Status(status));
         }
+        if crate::monotonic_active_now()? >= deadline.0 {
+            return Err(NativeError::Status(deepwyrm_syscall::DW_STATUS_TIMED_OUT));
+        }
         core::hint::spin_loop();
     }
-    Err(NativeError::Status(DW_STATUS_WOULD_BLOCK))
 }
 
 pub fn create_event(rights: DwRights) -> Result<DwHandle, NativeError> {

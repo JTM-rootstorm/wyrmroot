@@ -159,6 +159,10 @@ static INIT0_PROFILE_MARKER: [u8; 36] = *b"WYRMINIT0-PROFILE-V1:dw1c-preemption"
 
 #[cfg(feature = "dw1c-preemption-integration")]
 const DW1C_ROLE_CODES: [u64; wyrmroot_runtime::DW1C_ACTOR_COUNT] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+#[cfg(feature = "dw1c-preemption-integration")]
+const DW1C_WORKLOAD_DEADLINE_NS: u64 = 240_000_000_000;
+#[cfg(feature = "dw1c-preemption-integration")]
+const DW1C_CLEANUP_DEADLINE_NS: u64 = 5_000_000_000;
 
 /// Commits the selector-local ARM only after the controller has retained ten
 /// distinct live Process handles in fixed token order.  Process creation and
@@ -168,10 +172,11 @@ const DW1C_ROLE_CODES: [u64; wyrmroot_runtime::DW1C_ACTOR_COUNT] = [1, 2, 3, 4, 
 fn arm_dw1c_after_ready<System: Init0System>(
     system: &mut System,
     processes: [DwHandle; wyrmroot_runtime::DW1C_ACTOR_COUNT],
+    deadline: DwDeadline,
 ) -> Result<(), Init0Error> {
     let bindings = dw1c_bindings(processes)?;
     system
-        .arm_dw1c_preemption(&bindings)
+        .arm_dw1c_preemption(&bindings, deadline)
         .map_err(Init0Error::Native)
 }
 
@@ -273,7 +278,12 @@ pub trait Init0System {
     }
 
     #[cfg(feature = "dw1c-preemption-integration")]
-    fn await_dw1c_token2_relay_ready(&mut self) -> Result<(), NativeError> {
+    fn await_dw1c_token2_relay_ready(&mut self, _: DwDeadline) -> Result<(), NativeError> {
+        Err(NativeError::Status(deepwyrm_syscall::DW_STATUS_BAD_STATE))
+    }
+
+    #[cfg(feature = "dw1c-preemption-integration")]
+    fn dw1c_deadline_after(&mut self, _: u64) -> Result<DwDeadline, NativeError> {
         Err(NativeError::Status(deepwyrm_syscall::DW_STATUS_BAD_STATE))
     }
 
@@ -294,6 +304,7 @@ pub trait Init0System {
     fn arm_dw1c_preemption(
         &mut self,
         bindings: &[wyrmroot_runtime::Dw1cActorBindV1; wyrmroot_runtime::DW1C_ACTOR_COUNT],
+        deadline: DwDeadline,
     ) -> Result<(), NativeError>;
 
     #[cfg(feature = "dw1c-preemption-integration")]
@@ -1051,7 +1062,7 @@ mod dw1c_protocol_tests {
         let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
         let controller = &source[source.rfind("\nfn run_dw1c_preemption<").unwrap() + 1..];
         let arm = controller
-            .find("    if let Err(error) = arm_dw1c_after_ready(system, processes)")
+            .find("    if let Err(error) = arm_dw1c_after_ready(system, processes, deadline)")
             .unwrap();
         let first_go = controller[arm..].find("DW1C_GO").unwrap() + arm;
         let complete = controller
@@ -1171,16 +1182,38 @@ fn run_dw1c_preemption<
             .process;
         index += 1;
     }
-    if let Err(error) = arm_dw1c_after_ready(system, processes) {
+    if let Err(error) = arm_dw1c_after_ready(system, processes, deadline) {
         return Err(prefer_dw1c_cleanup(
             error,
-            cleanup_dw1c_actors(loader, supervisor, actors, deadline),
+            cleanup_dw1c_actors(
+                loader,
+                supervisor,
+                actors,
+                system
+                    .dw1c_deadline_after(DW1C_CLEANUP_DEADLINE_NS)
+                    .unwrap_or(deadline),
+            ),
         ));
     }
-    if let Err(error) = drive_dw1c_workload(system, loader, supervisor, actors, deadline) {
+    let workload_deadline = match system.dw1c_deadline_after(DW1C_WORKLOAD_DEADLINE_NS) {
+        Ok(deadline) => deadline,
+        Err(error) => {
+            let cleanup_deadline = system
+                .dw1c_deadline_after(DW1C_CLEANUP_DEADLINE_NS)
+                .unwrap_or(deadline);
+            return Err(prefer_dw1c_cleanup(
+                Init0Error::Native(error),
+                cleanup_dw1c_actors(loader, supervisor, actors, cleanup_deadline),
+            ));
+        }
+    };
+    if let Err(error) = drive_dw1c_workload(system, loader, supervisor, actors, workload_deadline) {
+        let cleanup_deadline = system
+            .dw1c_deadline_after(DW1C_CLEANUP_DEADLINE_NS)
+            .unwrap_or(workload_deadline);
         return Err(prefer_dw1c_cleanup(
             error,
-            cleanup_dw1c_actors(loader, supervisor, actors, deadline),
+            cleanup_dw1c_actors(loader, supervisor, actors, cleanup_deadline),
         ));
     }
     // Actors 1..7 deliberately remain live after publishing their workload
@@ -1188,7 +1221,10 @@ fn run_dw1c_preemption<
     // successful controller does not leave runnable children behind and can
     // reach the normal primordial terminal path. The cleanup helper accepts
     // the already-terminal actors 8..10 and still closes every retained handle.
-    cleanup_dw1c_actors(loader, supervisor, actors, deadline)
+    let cleanup_deadline = system
+        .dw1c_deadline_after(DW1C_CLEANUP_DEADLINE_NS)
+        .unwrap_or(workload_deadline);
+    cleanup_dw1c_actors(loader, supervisor, actors, cleanup_deadline)
 }
 
 #[cfg(feature = "dw1c-preemption-integration")]
@@ -1238,7 +1274,7 @@ fn drive_dw1c_workload<
             return Err(Init0Error::Native(error));
         }
     }
-    if let Err(error) = system.await_dw1c_token2_relay_ready() {
+    if let Err(error) = system.await_dw1c_token2_relay_ready(deadline) {
         let _ = system.close_handle(relay_writer);
         return Err(Init0Error::Native(error));
     }

@@ -90,8 +90,16 @@ impl Init0System for NativeSystem {
     }
 
     #[cfg(feature = "dw1c-preemption-integration")]
-    fn await_dw1c_token2_relay_ready(&mut self) -> Result<(), NativeError> {
-        await_dw1c_token2_relay_ready()
+    fn await_dw1c_token2_relay_ready(&mut self, deadline: DwDeadline) -> Result<(), NativeError> {
+        await_dw1c_token2_relay_ready(deadline)
+    }
+
+    #[cfg(feature = "dw1c-preemption-integration")]
+    fn dw1c_deadline_after(
+        &mut self,
+        interval_nanoseconds: u64,
+    ) -> Result<DwDeadline, NativeError> {
+        monotonic_deadline_after(interval_nanoseconds)
     }
 
     #[cfg(feature = "dw1b-preemption-integration")]
@@ -107,8 +115,9 @@ impl Init0System for NativeSystem {
     fn arm_dw1c_preemption(
         &mut self,
         bindings: &[Dw1cActorBindV1; DW1C_ACTOR_COUNT],
+        deadline: DwDeadline,
     ) -> Result<(), NativeError> {
-        arm_dw1c_preemption(bindings)
+        arm_dw1c_preemption(bindings, deadline)
     }
 
     #[cfg(feature = "dw1c-preemption-integration")]
