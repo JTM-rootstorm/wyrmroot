@@ -306,7 +306,7 @@ fn wyr1b_evidence_raw_call_is_exact_and_feature_isolated() {
 }
 
 #[test]
-fn dw1c_private_veneer_has_only_the_three_frozen_operation_shapes() {
+fn dw1c_private_veneer_has_only_the_four_frozen_operation_shapes() {
     assert!(MANIFEST.contains("dw1c-test-evidence = []"));
     for required in [
         "DwSyscallId(0xFFFF_FF1C)",
@@ -314,14 +314,24 @@ fn dw1c_private_veneer_has_only_the_three_frozen_operation_shapes() {
         "bindings.as_ptr() as u64",
         "DW1C_ACTOR_COUNT as u64",
         "240,",
+        "DW1C_PRIVATE_RETRY_LIMIT: usize = 1 << 20",
+        "status != DW_STATUS_WOULD_BLOCK",
         "[2, token, count, digest, 0, 0]",
         "[3, 0x1f, digest, 0, 0, 0]",
+        "[4, 0, 0, 0, 0, 0]",
     ] {
         assert!(
             CAPABILITY_NATIVE_SOURCE.contains(required),
             "missing DW1-C marker {required}"
         );
     }
+    assert_eq!(
+        CAPABILITY_NATIVE_SOURCE
+            .matches("for _ in 0..DW1C_PRIVATE_RETRY_LIMIT")
+            .count(),
+        2
+    );
+    assert!(SOURCE.contains("await_dw1c_token2_relay_ready"));
     assert!(SOURCE.contains("submit_dw1c_workload_complete"));
     assert!(!NATIVE_SOURCE.contains("FFFF_FF1C"));
 }

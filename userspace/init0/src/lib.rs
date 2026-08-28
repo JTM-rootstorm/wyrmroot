@@ -28,6 +28,11 @@ use deepwyrm_syscall::DW_SIGNAL_WRITABLE;
     feature = "dw1b-preemption-integration"
 ))]
 use deepwyrm_syscall::DW_STATUS_WOULD_BLOCK;
+#[cfg(feature = "dw1c-preemption-integration")]
+use deepwyrm_syscall::{
+    DW_HANDLE_TRANSFER_MOVE, DW_TASK_TERMINATION_INFO_V1_SIZE, DW_TERMINATION_AUTHORIZED,
+    DwHandleTransferV1,
+};
 #[cfg(any(
     feature = "dw1b-preemption-integration",
     feature = "dw1c-preemption-integration"
@@ -51,8 +56,6 @@ use deepwyrm_syscall::{
     DW_TASK_STATE_EXITED, DwDeadline, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights,
     DwTaskTerminationInfoV1,
 };
-#[cfg(feature = "dw1c-preemption-integration")]
-use deepwyrm_syscall::{DW_TASK_TERMINATION_INFO_V1_SIZE, DW_TERMINATION_AUTHORIZED};
 use wyrmroot_bootfs::archive::{Archive, LookupError, ParseError};
 #[cfg(feature = "dw1b-preemption-integration")]
 use wyrmroot_loader::{
@@ -252,6 +255,26 @@ pub trait Init0System {
 
     /// Sends one handle-free loader READY datagram.
     fn send_channel(&mut self, channel: DwHandle, bytes: &[u8]) -> Result<(), NativeError>;
+
+    #[cfg(feature = "dw1c-preemption-integration")]
+    fn create_dw1c_relay(&mut self, _: DwRights) -> Result<(DwHandle, DwHandle), NativeError> {
+        Err(NativeError::Status(deepwyrm_syscall::DW_STATUS_BAD_STATE))
+    }
+
+    #[cfg(feature = "dw1c-preemption-integration")]
+    fn send_dw1c_with_handles(
+        &mut self,
+        _: DwHandle,
+        _: &[u8],
+        _: &[DwHandleTransferV1],
+    ) -> Result<(), NativeError> {
+        Err(NativeError::Status(deepwyrm_syscall::DW_STATUS_BAD_STATE))
+    }
+
+    #[cfg(feature = "dw1c-preemption-integration")]
+    fn await_dw1c_token2_relay_ready(&mut self) -> Result<(), NativeError> {
+        Err(NativeError::Status(deepwyrm_syscall::DW_STATUS_BAD_STATE))
+    }
 
     /// Closes one caller-local handle.
     fn close_handle(&mut self, handle: DwHandle) -> Result<(), NativeError>;
@@ -873,6 +896,19 @@ const DW1C_ACTOR_PATHS: [&[u8]; wyrmroot_runtime::DW1C_ACTOR_COUNT] = [
 #[cfg(feature = "dw1c-preemption-integration")]
 const DW1C_GO: [u8; 1] = [1];
 #[cfg(feature = "dw1c-preemption-integration")]
+const DW1C_TOKEN2_RELAY_SETUP: [u8; 4] = [0xD1, 0xC5, 0x10, 2];
+#[cfg(feature = "dw1c-preemption-integration")]
+const DW1C_TOKEN7_RELAY_START: [u8; 4] = [0xD1, 0xC5, 0x11, 7];
+#[cfg(feature = "dw1c-preemption-integration")]
+const DW1C_RELAY_BROAD_RIGHTS: DwRights = DwRights(
+    DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_WAIT.0 | DW_RIGHT_INSPECT.0 | DW_RIGHT_TRANSFER.0,
+);
+#[cfg(feature = "dw1c-preemption-integration")]
+const DW1C_RELAY_READ_RIGHTS: DwRights =
+    DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WAIT.0 | DW_RIGHT_INSPECT.0);
+#[cfg(feature = "dw1c-preemption-integration")]
+const DW1C_RELAY_WRITE_RIGHTS: DwRights = DwRights(DW_RIGHT_WRITE.0 | DW_RIGHT_INSPECT.0);
+#[cfg(feature = "dw1c-preemption-integration")]
 const DW1C_ACTOR_ACK_PREFIX: u8 = 0xAC;
 #[cfg(feature = "dw1c-preemption-integration")]
 const DW1C_TOKEN7_SIDE_RIGHTS: DwRights = DwRights(
@@ -899,9 +935,9 @@ mod dw1c_protocol_tests {
     };
 
     use super::{
-        DW1C_ACTOR_ACK_PREFIX, DW1C_GO, DW1C_POST_ARM_ORDER, DW1C_TOKEN7_FULL, DW1C_TOKEN7_SETUP,
-        DW1C_TOKEN7_SETUP_ACK, DW1C_TOKEN7_WOKE, LOADER_ABORT_CODE,
-        valid_dw1c_authorized_termination,
+        DW1C_ACTOR_ACK_PREFIX, DW1C_GO, DW1C_POST_ARM_ORDER, DW1C_TOKEN2_RELAY_SETUP,
+        DW1C_TOKEN7_FULL, DW1C_TOKEN7_RELAY_START, DW1C_TOKEN7_SETUP, DW1C_TOKEN7_SETUP_ACK,
+        DW1C_TOKEN7_WOKE, LOADER_ABORT_CODE, valid_dw1c_authorized_termination,
     };
 
     #[test]
@@ -912,6 +948,8 @@ mod dw1c_protocol_tests {
         assert_eq!(DW1C_TOKEN7_SETUP_ACK, [0xA7, 0x02]);
         assert_eq!(DW1C_TOKEN7_FULL, [0xA7, 0x03]);
         assert_eq!(DW1C_TOKEN7_WOKE, [0xA7, 0x04]);
+        assert_eq!(DW1C_TOKEN2_RELAY_SETUP, [0xD1, 0xC5, 0x10, 2]);
+        assert_eq!(DW1C_TOKEN7_RELAY_START, [0xD1, 0xC5, 0x11, 7]);
         assert_eq!(DW1C_POST_ARM_ORDER, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         assert_eq!(&DW1C_POST_ARM_ORDER[8..], &[9, 10]);
     }
@@ -943,12 +981,14 @@ mod dw1c_protocol_tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../dw1c-preemption/src/bin/actor_body.rs"
         ));
-        let gate = actor.find("if gate.map_or").unwrap();
+        let gate = actor.find("let relay = match").unwrap();
         assert!(actor[gate..].contains("submit_dw1c_progress(TOKEN"));
         assert!(actor[gate..].contains("ACTOR_ACK_PREFIX, TOKEN"));
         assert!(actor[..gate].find("submit_dw1c_progress(TOKEN").is_none());
         assert!(!actor[gate..].contains("0xC6"));
         assert!(actor[gate..].contains("if TOKEN == 7"));
+        assert!(actor[gate..].contains("if TOKEN == 2"));
+        assert!(actor[gate..].contains("RELAY_GO"));
         assert!(actor[gate..].contains("DW_STATUS_WOULD_BLOCK"));
         assert!(actor[gate..].contains("TOKEN7_FULL"));
         assert!(actor[gate..].contains("TOKEN7_WOKE"));
@@ -963,9 +1003,10 @@ mod dw1c_protocol_tests {
             .unwrap();
         assert!(arm < first_go);
         assert!(first_go < complete);
-        assert!(controller[arm..complete].contains("actor6.launch_channel"));
+        assert!(controller[arm..complete].contains("DW1C_TOKEN2_RELAY_SETUP"));
+        assert!(controller[arm..complete].contains("await_dw1c_token2_relay_ready"));
         assert!(controller[arm..complete].contains("receive_dw1c_actor_ack"));
-        assert!(controller[arm..complete].contains("actor7.launch_channel"));
+        assert!(controller[arm..complete].contains("DW1C_TOKEN7_RELAY_START"));
         assert!(controller[arm..complete].contains("drive_dw1c_token7_capacity"));
         assert!(controller[arm..complete].contains("actor9.launch_channel"));
         assert!(controller[arm..complete].contains("actor10.launch_channel"));
@@ -1100,33 +1141,78 @@ fn drive_dw1c_workload<
 ) -> Result<(), Init0Error> {
     let actor = |index: usize| actors[index].ok_or(Init0Error::MissingLoadedProcess);
     let go = DW1C_GO;
-    let mut index = 0;
-    while index < 5 {
+    let actor1 = actor(0)?;
+    system
+        .send_channel(actor1.launch_channel, &go)
+        .map_err(Init0Error::Native)?;
+
+    let actor2 = actor(1)?;
+    let (relay_reader, relay_writer) = system
+        .create_dw1c_relay(DW1C_RELAY_BROAD_RIGHTS)
+        .map_err(Init0Error::Native)?;
+    let reader_transfer = DwHandleTransferV1 {
+        handle: relay_reader,
+        requested_rights: DW1C_RELAY_READ_RIGHTS,
+        operation: DW_HANDLE_TRANSFER_MOVE,
+        reserved0: 0,
+        reserved: [0; 2],
+    };
+    if let Err(error) = system.send_dw1c_with_handles(
+        actor2.launch_channel,
+        &DW1C_TOKEN2_RELAY_SETUP,
+        core::slice::from_ref(&reader_transfer),
+    ) {
+        let _ = system.close_handle(relay_reader);
+        let _ = system.close_handle(relay_writer);
+        return Err(Init0Error::Native(error));
+    }
+
+    for index in [2_usize, 4] {
+        let child = actor(index)?;
+        if let Err(error) = system.send_channel(child.launch_channel, &go) {
+            let _ = system.close_handle(relay_writer);
+            return Err(Init0Error::Native(error));
+        }
+    }
+    if let Err(error) = system.await_dw1c_token2_relay_ready() {
+        let _ = system.close_handle(relay_writer);
+        return Err(Init0Error::Native(error));
+    }
+
+    let actor7 = actor(6)?;
+    let writer_transfer = DwHandleTransferV1 {
+        handle: relay_writer,
+        requested_rights: DW1C_RELAY_WRITE_RIGHTS,
+        operation: DW_HANDLE_TRANSFER_MOVE,
+        reserved0: 0,
+        reserved: [0; 2],
+    };
+    if let Err(error) = system.send_dw1c_with_handles(
+        actor7.launch_channel,
+        &DW1C_TOKEN7_RELAY_START,
+        core::slice::from_ref(&writer_transfer),
+    ) {
+        let _ = system.close_handle(relay_writer);
+        return Err(Init0Error::Native(error));
+    }
+
+    for index in [3_usize, 5] {
         let child = actor(index)?;
         system
             .send_channel(child.launch_channel, &go)
             .map_err(Init0Error::Native)?;
-        index += 1;
     }
-    let actor6 = actor(5)?;
-    system
-        .send_channel(actor6.launch_channel, &go)
-        .map_err(Init0Error::Native)?;
 
     // GO only makes the actors eligible. Exact acknowledgements prove that
     // tokens 1..5 committed their progress syscalls and token 6 resumed from
     // its ARM-bound wait before the controller may claim workload completion.
-    index = 0;
+    let mut index = 0;
     while index < 6 {
         let child = actor(index)?;
         receive_dw1c_actor_ack(supervisor, child.launch_channel, index as u8 + 1, deadline)?;
         index += 1;
     }
 
-    let actor7 = actor(6)?;
-    system
-        .send_channel(actor7.launch_channel, &go)
-        .map_err(Init0Error::Native)?;
     drive_dw1c_token7_capacity(system, loader, supervisor, actor7.launch_channel, deadline)?;
 
     let actor8 = actor(7)?;

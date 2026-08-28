@@ -1,9 +1,10 @@
 use core::panic::PanicInfo;
 use deepwyrm_syscall as _;
 use deepwyrm_syscall::{
-    DW_DEADLINE_INFINITE, DW_HANDLE_TRANSFER_MOVE, DW_RIGHT_INSPECT, DW_RIGHT_READ,
-    DW_RIGHT_TRANSFER, DW_RIGHT_WAIT, DW_RIGHT_WRITE, DW_SIGNAL_READABLE, DW_SIGNAL_WRITABLE,
-    DW_STATUS_WOULD_BLOCK, DwHandleTransferV1, DwRights, DwSignals,
+    DW_DEADLINE_INFINITE, DW_HANDLE_TRANSFER_MOVE, DW_OBJECT_TYPE_CHANNEL, DW_RIGHT_INSPECT,
+    DW_RIGHT_READ, DW_RIGHT_TRANSFER, DW_RIGHT_WAIT, DW_RIGHT_WRITE, DW_SIGNAL_READABLE,
+    DW_SIGNAL_WRITABLE, DW_STATUS_WOULD_BLOCK, DwHandleTransferV1, DwReceivedHandleInfoV1,
+    DwRights, DwSignals,
 };
 use wyrmroot_loader::launch::{HEADER_BYTES, LaunchProfile, encode_ready_for_profile, parse_init};
 use wyrmroot_runtime::{
@@ -19,6 +20,12 @@ const TOKEN7_SETUP: [u8; 2] = [0xA7, 0x01];
 const TOKEN7_SETUP_ACK: [u8; 2] = [0xA7, 0x02];
 const TOKEN7_FULL: [u8; 2] = [0xA7, 0x03];
 const TOKEN7_WOKE: [u8; 2] = [0xA7, 0x04];
+const TOKEN2_RELAY_SETUP: [u8; 4] = [0xD1, 0xC5, 0x10, 2];
+const TOKEN7_RELAY_START: [u8; 4] = [0xD1, 0xC5, 0x11, 7];
+const RELAY_GO: [u8; 4] = [0xD1, 0xC5, 0x12, 2];
+const RELAY_READ_RIGHTS: DwRights =
+    DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WAIT.0 | DW_RIGHT_INSPECT.0);
+const RELAY_WRITE_RIGHTS: DwRights = DwRights(DW_RIGHT_WRITE.0 | DW_RIGHT_INSPECT.0);
 const ACTOR_ACK_PREFIX: u8 = 0xAC;
 const TOKEN_BYTE: u8 = {
     assert!(TOKEN <= u8::MAX as u64);
@@ -67,22 +74,78 @@ fn payload_main(startup: StartupBlock<'_>) -> u32 {
     if send_channel(channel, &ready[..size], &[]).is_err() {
         return 0xD1C0_0005 | TOKEN as u32;
     }
-    let mut go = [0_u8; 1];
+    let mut go = [0_u8; 4];
+    let mut gate_handles = [DwReceivedHandleInfoV1::default(); 1];
     let gate = match wait_one(
         channel,
         DwSignals(DW_SIGNAL_READABLE.0),
         DW_DEADLINE_INFINITE,
     ) {
         Ok(_) => {
-            let mut handles = [];
-            receive_channel(channel, &mut go, &mut handles)
+            receive_channel(channel, &mut go, &mut gate_handles)
         }
         Err(_) => return 0xD1C0_0006 | TOKEN as u32,
     };
-    if gate.map_or(true, |counts| {
-        counts.bytes != 1 || counts.handles != 0 || go[0] != 1
-    }) {
-        return 0xD1C0_0007 | TOKEN as u32;
+    let relay = match (TOKEN, gate) {
+        (2, Ok(counts))
+            if counts.bytes == TOKEN2_RELAY_SETUP.len()
+                && counts.handles == 1
+                && go == TOKEN2_RELAY_SETUP
+                && gate_handles[0].handle.0 != 0
+                && gate_handles[0].object_type == DW_OBJECT_TYPE_CHANNEL
+                && gate_handles[0].rights == RELAY_READ_RIGHTS =>
+        {
+            Some(gate_handles[0].handle)
+        }
+        (7, Ok(counts))
+            if counts.bytes == TOKEN7_RELAY_START.len()
+                && counts.handles == 1
+                && go == TOKEN7_RELAY_START
+                && gate_handles[0].handle.0 != 0
+                && gate_handles[0].object_type == DW_OBJECT_TYPE_CHANNEL
+                && gate_handles[0].rights == RELAY_WRITE_RIGHTS =>
+        {
+            Some(gate_handles[0].handle)
+        }
+        (_, Ok(counts))
+            if TOKEN != 2
+                && TOKEN != 7
+                && counts.bytes == 1
+                && counts.handles == 0
+                && go[0] == 1 =>
+        {
+            None
+        }
+        _ => return 0xD1C0_0007 | TOKEN as u32,
+    };
+    if TOKEN == 2 {
+        let relay = relay.expect("token 2 validated one relay handle");
+        if wait_one(
+            relay,
+            DwSignals(DW_SIGNAL_READABLE.0),
+            DW_DEADLINE_INFINITE,
+        )
+        .is_err()
+        {
+            let _ = close_handle(relay);
+            return 0xD1C0_0202;
+        }
+        let mut relay_go = [0_u8; RELAY_GO.len()];
+        let mut no_handles = [];
+        let counts = receive_channel(relay, &mut relay_go, &mut no_handles);
+        if counts.map_or(true, |counts| {
+            counts.bytes != RELAY_GO.len()
+                || counts.handles != 0
+                || relay_go != RELAY_GO
+        }) || close_handle(relay).is_err()
+        {
+            return 0xD1C0_0203;
+        }
+    } else if TOKEN == 7 {
+        let relay = relay.expect("token 7 validated one relay handle");
+        if send_channel(relay, &RELAY_GO, &[]).is_err() || close_handle(relay).is_err() {
+            return 0xD1C0_0700;
+        }
     }
     if TOKEN <= 5 {
         if submit_dw1c_progress(TOKEN, 1, DIGEST).is_err() {

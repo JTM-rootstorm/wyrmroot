@@ -4,7 +4,9 @@
 
 use core::panic::PanicInfo;
 
-use deepwyrm_syscall::{DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights};
+use deepwyrm_syscall::{
+    DwHandle, DwHandleTransferV1, DwObjectType, DwReceivedHandleInfoV1, DwRights,
+};
 use wyrmroot_bootfs as _;
 #[cfg(feature = "dw1b-preemption-integration")]
 use wyrmroot_dw1b_preemption as _;
@@ -16,13 +18,14 @@ use wyrmroot_loader as _;
 use wyrmroot_runtime::arm_dw1b_preemption;
 use wyrmroot_runtime::{
     CapabilityInfo, MappingPlan, NativeError, NativeLoaderPlatform, NativeSupervisionPlatform,
-    ReceiveCounts, StartupBlock, close_handle, map_bootfs_read_only, monotonic_deadline_after,
-    panic_abort, query_capability_info, query_memory_object_size, receive_channel, send_channel,
-    unmap_bootfs,
+    ReceiveCounts, StartupBlock, close_handle, create_channel, map_bootfs_read_only,
+    monotonic_deadline_after, panic_abort, query_capability_info, query_memory_object_size,
+    receive_channel, send_channel, unmap_bootfs,
 };
 #[cfg(feature = "dw1c-preemption-integration")]
 use wyrmroot_runtime::{
-    DW1C_ACTOR_COUNT, Dw1cActorBindV1, arm_dw1c_preemption, submit_dw1c_workload_complete,
+    DW1C_ACTOR_COUNT, Dw1cActorBindV1, arm_dw1c_preemption, await_dw1c_token2_relay_ready,
+    submit_dw1c_workload_complete,
 };
 
 const HELLO_DEADLINE_NS: u64 = 5_000_000_000;
@@ -69,6 +72,26 @@ impl Init0System for NativeSystem {
 
     fn close_handle(&mut self, handle: DwHandle) -> Result<(), NativeError> {
         close_handle(handle)
+    }
+
+    #[cfg(feature = "dw1c-preemption-integration")]
+    fn create_dw1c_relay(&mut self, rights: DwRights) -> Result<(DwHandle, DwHandle), NativeError> {
+        create_channel(rights)
+    }
+
+    #[cfg(feature = "dw1c-preemption-integration")]
+    fn send_dw1c_with_handles(
+        &mut self,
+        channel: DwHandle,
+        bytes: &[u8],
+        transfers: &[DwHandleTransferV1],
+    ) -> Result<(), NativeError> {
+        send_channel(channel, bytes, transfers)
+    }
+
+    #[cfg(feature = "dw1c-preemption-integration")]
+    fn await_dw1c_token2_relay_ready(&mut self) -> Result<(), NativeError> {
+        await_dw1c_token2_relay_ready()
     }
 
     #[cfg(feature = "dw1b-preemption-integration")]

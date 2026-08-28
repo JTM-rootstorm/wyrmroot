@@ -309,6 +309,26 @@ impl Init0System for Fixture {
     }
 
     #[cfg(feature = "dw1c-preemption-integration")]
+    fn create_dw1c_relay(&mut self, _: DwRights) -> Result<(DwHandle, DwHandle), NativeError> {
+        Ok((DwHandle(700), DwHandle(701)))
+    }
+
+    #[cfg(feature = "dw1c-preemption-integration")]
+    fn send_dw1c_with_handles(
+        &mut self,
+        _: DwHandle,
+        _: &[u8],
+        _: &[DwHandleTransferV1],
+    ) -> Result<(), NativeError> {
+        Ok(())
+    }
+
+    #[cfg(feature = "dw1c-preemption-integration")]
+    fn await_dw1c_token2_relay_ready(&mut self) -> Result<(), NativeError> {
+        Ok(())
+    }
+
+    #[cfg(feature = "dw1c-preemption-integration")]
     fn arm_dw1c_preemption(
         &mut self,
         bindings: &[wyrmroot_runtime::Dw1cActorBindV1; wyrmroot_runtime::DW1C_ACTOR_COUNT],
