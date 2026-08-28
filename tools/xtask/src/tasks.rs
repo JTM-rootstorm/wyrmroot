@@ -37,6 +37,16 @@ const BOOTFS_TEST_ARGUMENTS: &[&str] = &[
     "--features",
     BOOTFS_BUILDER_FEATURE,
 ];
+const DW1C_INIT0_TEST_ARGUMENTS: &[&str] = &[
+    "test",
+    "--locked",
+    "--package",
+    "wyrmroot-init0",
+    "--features",
+    "dw1c-preemption-integration",
+    "--lib",
+    "dw1c_protocol_tests",
+];
 
 pub(crate) struct LoaderToolchain {
     accepted: AcceptedToolchain,
@@ -803,6 +813,14 @@ pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<
 }
 
 fn host_test_commands(filter: Option<&str>) -> Result<Vec<Vec<String>>, Failure> {
+    if matches!(filter, Some("dw1c" | "dw1c-init0")) {
+        return Ok(vec![
+            DW1C_INIT0_TEST_ARGUMENTS
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect(),
+        ]);
+    }
     let mut commands = vec![host_test_arguments(filter)?];
     if filter.is_none() {
         commands.push(
@@ -898,9 +916,9 @@ fn child_status(code: Option<i32>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BOOTFS_BUILD_ARGUMENTS, BOOTFS_PACKAGE, BOOTFS_TEST_ARGUMENTS, LoaderLinkMode,
-        blocked_toolchain_failure, component_package, encoded_uefi_rustflags, explicit_test_filter,
-        host_test_arguments, host_test_commands, validate_regular_artifact,
+        BOOTFS_BUILD_ARGUMENTS, BOOTFS_PACKAGE, BOOTFS_TEST_ARGUMENTS, DW1C_INIT0_TEST_ARGUMENTS,
+        LoaderLinkMode, blocked_toolchain_failure, component_package, encoded_uefi_rustflags,
+        explicit_test_filter, host_test_arguments, host_test_commands, validate_regular_artifact,
     };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -966,6 +984,10 @@ mod tests {
         assert_eq!(
             host_test_commands(Some("bootfs")).unwrap(),
             [BOOTFS_TEST_ARGUMENTS.to_vec()]
+        );
+        assert_eq!(
+            host_test_commands(Some("dw1c")).unwrap(),
+            [DW1C_INIT0_TEST_ARGUMENTS.to_vec()]
         );
     }
 

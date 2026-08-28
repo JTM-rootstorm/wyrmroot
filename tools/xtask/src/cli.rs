@@ -37,7 +37,9 @@ Usage:
     cargo xtask dw1c inspect --request <dw1-c-request.toml>
 
 Host filters may name a component (bootfs, protocol, elf, runtime, bootstrap,
-efi, init0, hello, or xtask), package:<workspace-package>, or test:<substring>.
+efi, init0, hello, xtask, or dw1c-init0), package:<workspace-package>, or
+test:<substring>. The dw1c-init0 filter is the explicit feature-specific DW1C
+controller gate.
 
 The WYR0-H request path builds and inspects the exact init0/hello bootfs and
 paired ESP, records revision/hash provenance, and uses one q35/OVMF path for

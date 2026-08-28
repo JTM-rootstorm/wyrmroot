@@ -907,7 +907,7 @@ mod dw1c_protocol_tests {
     }
 
     #[test]
-    fn source_contract_keeps_work_after_ready_and_completion_last() {
+    fn source_contract_keeps_work_after_ready_and_retires_actors_after_completion() {
         let actor = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../dw1c-preemption/src/bin/actor_body.rs"
@@ -933,6 +933,18 @@ mod dw1c_protocol_tests {
         assert!(controller[arm..complete].contains("actor7.launch_channel"));
         assert!(controller[arm..complete].contains("actor9.launch_channel"));
         assert!(controller[arm..complete].contains("actor10.launch_channel"));
+
+        let drive = controller
+            .find("    if let Err(error) = drive_dw1c_workload(")
+            .unwrap();
+        let cleanup = "    cleanup_dw1c_actors(loader, supervisor, actors, deadline)";
+        let error_cleanup = controller[drive..].find(cleanup).unwrap() + drive;
+        let success_cleanup = controller[error_cleanup + cleanup.len()..]
+            .find(cleanup)
+            .unwrap()
+            + error_cleanup
+            + cleanup.len();
+        assert!(drive < success_cleanup);
     }
 }
 
@@ -1030,7 +1042,12 @@ fn run_dw1c_preemption<
             cleanup_dw1c_actors(loader, supervisor, actors, deadline),
         ));
     }
-    Ok(())
+    // Actors 1..7 deliberately remain live after publishing their workload
+    // facts. Retire the complete actor set after WORKLOAD_COMPLETE so the
+    // successful controller does not leave runnable children behind and can
+    // reach the normal primordial terminal path. The cleanup helper accepts
+    // the already-terminal actors 8..10 and still closes every retained handle.
+    cleanup_dw1c_actors(loader, supervisor, actors, deadline)
 }
 
 #[cfg(feature = "dw1c-preemption-integration")]
