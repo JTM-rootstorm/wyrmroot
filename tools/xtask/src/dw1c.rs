@@ -164,7 +164,7 @@ pub(crate) struct WyrBuildSpec {
 /// Ordered isolated native release builds for the selector-28 userspace half.
 /// Loader construction remains the shared deterministic UEFI pair; the caller
 /// uses these specs only after that pair and the accepted layout are prepared.
-pub(crate) fn wyr_build_specs() -> [WyrBuildSpec; 12] {
+pub(crate) fn wyr_build_specs() -> [WyrBuildSpec; 13] {
     [
         WyrBuildSpec {
             label: "bootstrap",
@@ -180,6 +180,13 @@ pub(crate) fn wyr_build_specs() -> [WyrBuildSpec; 12] {
             features: DW1C_INIT_FEATURES,
             // init0 uses `option_env!` to bind the controller's report.
             requires_progress_digest: true,
+        },
+        WyrBuildSpec {
+            label: "hello",
+            package: "wyrmroot-hello",
+            binary: "wyrmroot-hello",
+            features: "native-hello",
+            requires_progress_digest: false,
         },
         WyrBuildSpec {
             label: "actor1",
@@ -261,6 +268,7 @@ pub(crate) struct WyrArtifactSet {
     pub(crate) loader: Vec<u8>,
     pub(crate) bootstrap: Vec<u8>,
     pub(crate) init0: Vec<u8>,
+    pub(crate) hello: Vec<u8>,
     pub(crate) actors: [Vec<u8>; 10],
     pub(crate) debug_loader: Vec<u8>,
     pub(crate) debug_symbols: Vec<u8>,
@@ -313,7 +321,7 @@ pub(crate) fn build_wyr_artifact_set(
     let debug_symbols =
         read_cargo_build_output(&uefi.debug_symbols, "loader PDB", 512 * 1024 * 1024)?;
 
-    let mut artifacts = Vec::with_capacity(12);
+    let mut artifacts = Vec::with_capacity(13);
     for spec in wyr_build_specs() {
         toolchain.accepted().verify_unchanged()?;
         layout.verify_unchanged()?;
@@ -371,6 +379,7 @@ pub(crate) fn build_wyr_artifact_set(
     let [
         bootstrap,
         init0,
+        hello,
         actor1,
         actor2,
         actor3,
@@ -381,7 +390,7 @@ pub(crate) fn build_wyr_artifact_set(
         actor8,
         actor9,
         actor10,
-    ]: [Vec<u8>; 12] = artifacts
+    ]: [Vec<u8>; 13] = artifacts
         .try_into()
         .map_err(|_| Failure::task("DW1-C build produced the wrong artifact count"))?;
     verify_clean_repository(&repository, "Wyrmroot", source_revision)?;
@@ -400,6 +409,7 @@ pub(crate) fn build_wyr_artifact_set(
             loader: &loader,
             bootstrap: &bootstrap,
             init0: &init0,
+            hello: &hello,
             actors: &actors,
         },
         &toolchain.validation_report_sha256(),
@@ -408,6 +418,7 @@ pub(crate) fn build_wyr_artifact_set(
         loader,
         bootstrap,
         init0,
+        hello,
         actors,
         debug_loader,
         debug_symbols,
@@ -429,6 +440,7 @@ struct WyrReceiptArtifacts<'a> {
     loader: &'a [u8],
     bootstrap: &'a [u8],
     init0: &'a [u8],
+    hello: &'a [u8],
     actors: &'a [Vec<u8>; 10],
 }
 
@@ -492,6 +504,7 @@ fn render_wyr_source_receipt(
             sha256::bytes_digest(artifacts.bootstrap),
         ),
         ("init0_sha256", sha256::bytes_digest(artifacts.init0)),
+        ("hello_sha256", sha256::bytes_digest(artifacts.hello)),
     ] {
         fields.insert(key.to_owned(), value);
     }
@@ -820,7 +833,7 @@ fn freeze_product(
         &wyrmroot_revision,
         progress_digest,
     )?;
-    let bootfs = build_bootfs(&artifacts.init0, &artifacts.actors)?;
+    let bootfs = build_bootfs(&artifacts.init0, &artifacts.hello, &artifacts.actors)?;
     let pages = bootfs.len().div_ceil(4096);
     if !(1..=8192).contains(&pages) {
         return Err(Failure::task(
@@ -921,11 +934,14 @@ fn freeze_product(
     ))
 }
 
-fn build_bootfs(init0: &[u8], actors: &[Vec<u8>; 10]) -> Result<Vec<u8>, Failure> {
+fn build_bootfs(init0: &[u8], hello: &[u8], actors: &[Vec<u8>; 10]) -> Result<Vec<u8>, Failure> {
     let mut builder = Builder::new();
     builder
         .add(b"system/init0", init0, FileMode::Executable)
         .map_err(|error| Failure::task(format!("DW1-C bootfs init0 add failed: {error:?}")))?;
+    builder
+        .add(b"bin/hello", hello, FileMode::Executable)
+        .map_err(|error| Failure::task(format!("DW1-C bootfs hello add failed: {error:?}")))?;
     let paths = (1..=10)
         .map(|index| format!("test/dw1-c/actor{index}"))
         .collect::<Vec<_>>();
@@ -939,8 +955,18 @@ fn build_bootfs(init0: &[u8], actors: &[Vec<u8>; 10]) -> Result<Vec<u8>, Failure
         .map_err(|error| Failure::task(format!("DW1-C bootfs build failed: {error:?}")))?;
     let archive = Archive::new(&bootfs)
         .map_err(|error| Failure::task(format!("DW1-C bootfs invalid: {error:?}")))?;
-    if archive.entries().count() != 11 {
+    if archive.entries().count() != 12 {
         return Err(Failure::task("DW1-C bootfs entry count drifted"));
+    }
+    for path in [b"system/init0".as_slice(), b"bin/hello".as_slice()] {
+        let entry = archive
+            .lookup(path)
+            .map_err(|_| Failure::task("DW1-C bootfs omitted a primordial-required executable"))?;
+        if !entry.is_executable() || entry.data().is_empty() {
+            return Err(Failure::task(
+                "DW1-C bootfs primordial-required entry is not executable content",
+            ));
+        }
     }
     Ok(bootfs)
 }
@@ -1749,9 +1775,9 @@ mod tests {
     #[test]
     fn wyr_build_specs_are_ordered_and_bind_actor_digest_environment() {
         let specs = wyr_build_specs();
-        assert_eq!(specs.len(), 12);
+        assert_eq!(specs.len(), 13);
         assert_eq!(
-            specs[..2],
+            specs[..3],
             [
                 WyrBuildSpec {
                     label: "bootstrap",
@@ -1767,9 +1793,16 @@ mod tests {
                     features: "native-init0,dw1c-preemption-integration",
                     requires_progress_digest: true,
                 },
+                WyrBuildSpec {
+                    label: "hello",
+                    package: "wyrmroot-hello",
+                    binary: "wyrmroot-hello",
+                    features: "native-hello",
+                    requires_progress_digest: false,
+                },
             ]
         );
-        for (index, spec) in specs[2..].iter().enumerate() {
+        for (index, spec) in specs[3..].iter().enumerate() {
             assert_eq!(spec.label, format!("actor{}", index + 1));
             assert_eq!(spec.package, "wyrmroot-dw1c-preemption");
             assert_eq!(spec.binary, format!("wyrmroot-dw1c-actor{}", index + 1));
@@ -1787,6 +1820,7 @@ mod tests {
             );
         }
         assert_eq!(progress_digest_environment(specs[0], "A1"), None);
+        assert_eq!(progress_digest_environment(specs[2], "A1"), None);
         assert_eq!(
             progress_digest_environment(specs[1], "A1"),
             Some(("DEEPWYRM_DW1C_PROGRESS_DIGEST", "A1"))
@@ -1794,13 +1828,15 @@ mod tests {
     }
 
     #[test]
-    fn bootfs_has_only_the_fixed_init0_and_ten_actor_entries() {
+    fn bootfs_has_only_the_fixed_primordial_entries_and_ten_actor_entries() {
         let init0 = b"init0".to_vec();
+        let hello = b"hello".to_vec();
         let actors = core::array::from_fn(|index| format!("actor-{index}").into_bytes());
-        let bootfs = build_bootfs(&init0, &actors).unwrap();
+        let bootfs = build_bootfs(&init0, &hello, &actors).unwrap();
         let archive = Archive::new(&bootfs).unwrap();
-        assert_eq!(archive.entries().count(), 11);
+        assert_eq!(archive.entries().count(), 12);
         assert_eq!(archive.lookup(b"system/init0").unwrap().data(), init0);
+        assert_eq!(archive.lookup(b"bin/hello").unwrap().data(), hello);
         for (index, actor) in actors.iter().enumerate() {
             let path = format!("test/dw1-c/actor{}", index + 1);
             let entry = archive.lookup(path.as_bytes()).unwrap();
