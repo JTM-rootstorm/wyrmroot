@@ -20,6 +20,10 @@ const TOKEN7_SETUP_ACK: [u8; 2] = [0xA7, 0x02];
 const TOKEN7_FULL: [u8; 2] = [0xA7, 0x03];
 const TOKEN7_WOKE: [u8; 2] = [0xA7, 0x04];
 const ACTOR_ACK_PREFIX: u8 = 0xAC;
+const TOKEN_BYTE: u8 = {
+    assert!(TOKEN <= u8::MAX as u64);
+    TOKEN as u8
+};
 
 const fn parse_hex(text: &str) -> u64 {
     let bytes = text.as_bytes();
@@ -86,7 +90,7 @@ fn payload_main(startup: StartupBlock<'_>) -> u32 {
         }
     }
     if TOKEN <= 6 {
-        if send_channel(channel, &[ACTOR_ACK_PREFIX, TOKEN], &[]).is_err() {
+        if send_channel(channel, &[ACTOR_ACK_PREFIX, TOKEN_BYTE], &[]).is_err() {
             return 0xD1C0_0200 | TOKEN as u32;
         }
     }
