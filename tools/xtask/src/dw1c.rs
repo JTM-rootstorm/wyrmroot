@@ -323,57 +323,14 @@ pub(crate) fn build_wyr_artifact_set(
 
     let mut artifacts = Vec::with_capacity(13);
     for spec in wyr_build_specs() {
-        toolchain.accepted().verify_unchanged()?;
-        layout.verify_unchanged()?;
-        let target_dir = build_root.join(spec.label);
-        fs::create_dir(&target_dir).map_err(io)?;
-        let encoded_rustflags = native_remap_flags(&repository, &cargo_home, &target_dir)?;
-        let mut command = Command::new(&toolchain.accepted().cargo);
-        command
-            .args(["build", "--offline", "--locked", "--release", "--target"])
-            .arg(NATIVE_TARGET)
-            .args([
-                "--package",
-                spec.package,
-                "--bin",
-                spec.binary,
-                "--features",
-                spec.features,
-            ])
-            .arg("--target-dir")
-            .arg(&target_dir)
-            .env("RUSTC", &toolchain.accepted().rustc)
-            .env("CARGO_HOME", &cargo_home)
-            .env("CARGO_ENCODED_RUSTFLAGS", encoded_rustflags)
-            .env("CARGO_INCREMENTAL", "0")
-            .env("SOURCE_DATE_EPOCH", "0")
-            .env_remove("LD_AUDIT")
-            .env_remove("LD_LIBRARY_PATH")
-            .env_remove("LD_PRELOAD")
-            .current_dir(&repository)
-            .stdin(Stdio::null());
-        if let Some((key, value)) = progress_digest_environment(spec, progress_digest) {
-            command.env(key, value);
-        } else {
-            command.env_remove("DEEPWYRM_DW1C_PROGRESS_DIGEST");
-        }
-        let status = command.status().map_err(|error| {
-            Failure::task(format!("could not run DW1-C {} build: {error}", spec.label))
-        })?;
-        if !status.success() {
-            return Err(Failure::task(format!(
-                "DW1-C canonical {} release build failed",
-                spec.label
-            )));
-        }
-        let source = target_dir
-            .join(NATIVE_TARGET)
-            .join("release")
-            .join(spec.binary);
-        artifacts.push(read_cargo_build_output(
-            &source,
-            spec.label,
-            64 * 1024 * 1024,
+        artifacts.push(build_wyr_native_artifact(
+            &repository,
+            &toolchain,
+            &layout,
+            &cargo_home,
+            build_root,
+            spec,
+            progress_digest,
         )?);
     }
     let [
@@ -426,6 +383,65 @@ pub(crate) fn build_wyr_artifact_set(
         uefi_inspection_report: uefi.inspection_report,
         source_receipt,
     })
+}
+
+fn build_wyr_native_artifact(
+    repository: &Path,
+    toolchain: &crate::tasks::LoaderToolchain,
+    layout: &crate::deep_layout::DeepLayoutBuild,
+    cargo_home: &Path,
+    build_root: &Path,
+    spec: WyrBuildSpec,
+    progress_digest: &str,
+) -> Result<Vec<u8>, Failure> {
+    toolchain.accepted().verify_unchanged()?;
+    layout.verify_unchanged()?;
+    let target_dir = build_root.join(spec.label);
+    fs::create_dir(&target_dir).map_err(io)?;
+    let encoded_rustflags = native_remap_flags(repository, cargo_home, &target_dir)?;
+    let mut command = Command::new(&toolchain.accepted().cargo);
+    command
+        .args(["build", "--offline", "--locked", "--release", "--target"])
+        .arg(NATIVE_TARGET)
+        .args([
+            "--package",
+            spec.package,
+            "--bin",
+            spec.binary,
+            "--features",
+            spec.features,
+        ])
+        .arg("--target-dir")
+        .arg(&target_dir)
+        .env("RUSTC", &toolchain.accepted().rustc)
+        .env("CARGO_HOME", cargo_home)
+        .env("CARGO_ENCODED_RUSTFLAGS", encoded_rustflags)
+        .env("CARGO_INCREMENTAL", "0")
+        .env("SOURCE_DATE_EPOCH", "0")
+        .env_remove("LD_AUDIT")
+        .env_remove("LD_LIBRARY_PATH")
+        .env_remove("LD_PRELOAD")
+        .current_dir(repository)
+        .stdin(Stdio::null());
+    if let Some((key, value)) = progress_digest_environment(spec, progress_digest) {
+        command.env(key, value);
+    } else {
+        command.env_remove("DEEPWYRM_DW1C_PROGRESS_DIGEST");
+    }
+    let status = command.status().map_err(|error| {
+        Failure::task(format!("could not run DW1-C {} build: {error}", spec.label))
+    })?;
+    if !status.success() {
+        return Err(Failure::task(format!(
+            "DW1-C canonical {} release build failed",
+            spec.label
+        )));
+    }
+    let source = target_dir
+        .join(NATIVE_TARGET)
+        .join("release")
+        .join(spec.binary);
+    read_cargo_build_output(&source, spec.label, 64 * 1024 * 1024)
 }
 
 fn progress_digest_environment(
@@ -731,6 +747,90 @@ pub fn image_rebuild(request_path: &Path) -> Result<String, Failure> {
     fs::remove_dir_all(&directory).map_err(io)?;
     result?;
     Ok("DW1_C_IMAGE_REBUILD_PASS byte_compare=equal".to_owned())
+}
+
+/// Compiles the exact selector-28 native init0 binary with the accepted
+/// toolchain and target before the more expensive immutable freeze path.
+pub fn preflight(output: &Path, progress_digest: &str) -> Result<String, Failure> {
+    if output.exists() {
+        return Err(Failure::task("DW1-C preflight output already exists"));
+    }
+    validate_dw1c_ambient_build_environment()?;
+    validate_upper_hex(progress_digest, 16, "progress_digest")?;
+    if progress_digest == "0000000000000000" {
+        return Err(Failure::task("DW1-C progress digest must be nonzero"));
+    }
+    let repository = crate::tasks::repository_root()?;
+    let revision = current_revision(&repository)?;
+    verify_clean_repository(&repository, "Wyrmroot", &revision)?;
+    let parent = output
+        .parent()
+        .ok_or_else(|| Failure::task("DW1-C preflight output has no parent"))?;
+    let parent = fs::canonicalize(parent).map_err(io)?;
+    let name = output
+        .file_name()
+        .ok_or_else(|| Failure::task("DW1-C preflight output has no final component"))?;
+    let output = parent.join(name);
+    fs::create_dir(&output).map_err(io)?;
+    let result = (|| {
+        let manifest = BuildManifest::load(&repository)?;
+        let profile = manifest.validate_loader_build_readiness(&repository)?;
+        let layout = crate::deep_layout::prepare(
+            &repository,
+            manifest.deepwyrm_repository()?,
+            manifest.deepwyrm_revision()?,
+        )?;
+        let toolchain = crate::tasks::prepare_loader_toolchain(&repository, &profile, &manifest)?;
+        let cargo_home = crate::tasks::project_cargo_home(&repository, &manifest)?;
+        let build_root = output.join("build");
+        fs::create_dir(&build_root).map_err(io)?;
+        let spec = wyr_build_specs()[1];
+        if spec.label != "init0" || spec.features != DW1C_INIT_FEATURES {
+            return Err(Failure::task("DW1-C init0 preflight spec drifted"));
+        }
+        let init0 = build_wyr_native_artifact(
+            &repository,
+            &toolchain,
+            &layout,
+            &cargo_home,
+            &build_root,
+            spec,
+            progress_digest,
+        )?;
+        verify_clean_repository(&repository, "Wyrmroot", &revision)?;
+        toolchain.accepted().verify_unchanged()?;
+        layout.verify_unchanged()?;
+        let mut fields = BTreeMap::new();
+        for (key, value) in [
+            ("schema_version", "1".to_owned()),
+            ("kind", "wyrmroot-dw1-c-native-preflight".to_owned()),
+            ("wyrmroot_revision", revision.clone()),
+            ("progress_digest", progress_digest.to_owned()),
+            ("target", NATIVE_TARGET.to_owned()),
+            ("package", spec.package.to_owned()),
+            ("binary", spec.binary.to_owned()),
+            ("features", spec.features.to_owned()),
+            ("init0_sha256", sha256::bytes_digest(&init0)),
+        ] {
+            fields.insert(key.to_owned(), value);
+        }
+        let receipt = render(&fields)?;
+        let snapshot = write_new(
+            &output.join("preflight-receipt.toml"),
+            receipt.as_bytes(),
+            0o444,
+        )?;
+        Ok(format!(
+            "DW1_C_PREFLIGHT_PASS output={} receipt_sha256={} init0_sha256={}",
+            output.display(),
+            snapshot.sha256,
+            sha256::bytes_digest(&init0)
+        ))
+    })();
+    if result.is_err() {
+        fs::remove_dir_all(&output).map_err(io)?;
+    }
+    result
 }
 
 pub fn freeze(

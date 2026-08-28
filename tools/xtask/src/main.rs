@@ -141,6 +141,10 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
         )
         .map(Some),
         Action::Dw1BEvidence(request) => dw1b::evidence(std::path::Path::new(&request)).map(Some),
+        Action::Dw1CPreflight {
+            output,
+            progress_digest,
+        } => dw1c::preflight(std::path::Path::new(&output), &progress_digest).map(Some),
         Action::Dw1CPrepare(request) => dw1c::prepare(std::path::Path::new(&request)).map(Some),
         Action::Dw1CFreeze {
             output,

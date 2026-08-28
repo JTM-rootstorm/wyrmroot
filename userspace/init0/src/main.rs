@@ -4,9 +4,9 @@
 
 use core::panic::PanicInfo;
 
-use deepwyrm_syscall::{
-    DwHandle, DwHandleTransferV1, DwObjectType, DwReceivedHandleInfoV1, DwRights,
-};
+#[cfg(feature = "dw1c-preemption-integration")]
+use deepwyrm_syscall::{DwDeadline, DwHandleTransferV1};
+use deepwyrm_syscall::{DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights};
 use wyrmroot_bootfs as _;
 #[cfg(feature = "dw1b-preemption-integration")]
 use wyrmroot_dw1b_preemption as _;

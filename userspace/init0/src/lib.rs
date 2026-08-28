@@ -2035,6 +2035,18 @@ const fn selected_profile() -> LaunchProfile {
     all(
         feature = "i-capability-integration",
         feature = "dw1b-preemption-integration"
+    ),
+    all(
+        feature = "i2-stress-integration",
+        feature = "dw1c-preemption-integration"
+    ),
+    all(
+        feature = "i-capability-integration",
+        feature = "dw1c-preemption-integration"
+    ),
+    all(
+        feature = "dw1b-preemption-integration",
+        feature = "dw1c-preemption-integration"
     )
 ))]
 compile_error!("init0 selector integrations are mutually exclusive");

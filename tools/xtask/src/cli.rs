@@ -30,6 +30,7 @@ Usage:
     cargo xtask dw1b run --request <dw1-b-request.toml>
     cargo xtask dw1b measure --init <elf> --hello <elf> --cpu-hog <elf> --progress <elf>
     cargo xtask dw1b evidence --request <dw1-b-request.toml>
+    cargo xtask dw1c preflight --output <fresh-directory> --progress-digest <16-hex>
     cargo xtask dw1c prepare --request <dw1-c-request.toml>
     cargo xtask dw1c freeze --output <directory>
     cargo xtask dw1c image --request <dw1-c-request.toml>
@@ -139,6 +140,10 @@ pub(crate) enum Action {
         progress: String,
     },
     Dw1BEvidence(String),
+    Dw1CPreflight {
+        output: String,
+        progress_digest: String,
+    },
     Dw1CPrepare(String),
     Dw1CFreeze {
         output: String,
@@ -207,6 +212,16 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
 
 fn dispatch_dw1c(arguments: &[String]) -> Result<Action, Failure> {
     match arguments {
+        [command, output_flag, output, digest_flag, progress_digest]
+            if command == "preflight"
+                && output_flag == "--output"
+                && digest_flag == "--progress-digest" =>
+        {
+            Ok(Action::Dw1CPreflight {
+                output: output.clone(),
+                progress_digest: progress_digest.clone(),
+            })
+        }
         [
             command,
             output_flag,
@@ -247,7 +262,7 @@ fn dispatch_dw1c(arguments: &[String]) -> Result<Action, Failure> {
             Ok(Action::Dw1CPrepare(request.clone()))
         }
         _ => Err(Failure::usage(
-            "dw1c requires freeze --output <fresh-dir> --deep-repository <path> --deep-revision <40-hex> --evidence-nonce <16-hex> --progress-digest <16-hex>, or image|image-rebuild|inspect|prepare --request <dw1-c-request.toml>",
+            "dw1c requires preflight --output <fresh-dir> --progress-digest <16-hex>, freeze --output <fresh-dir> --deep-repository <path> --deep-revision <40-hex> --evidence-nonce <16-hex> --progress-digest <16-hex>, or image|image-rebuild|inspect|prepare --request <dw1-c-request.toml>",
         )),
     }
 }
@@ -700,6 +715,20 @@ mod tests {
 
     #[test]
     fn dw1c_product_commands_dispatch_to_request_bound_actions() {
+        assert_eq!(
+            dispatch(&arguments(&[
+                "dw1c",
+                "preflight",
+                "--output",
+                "preflight",
+                "--progress-digest",
+                &"B".repeat(16),
+            ])),
+            Ok(Action::Dw1CPreflight {
+                output: "preflight".into(),
+                progress_digest: "B".repeat(16),
+            })
+        );
         assert_eq!(
             dispatch(&arguments(&[
                 "dw1c",
