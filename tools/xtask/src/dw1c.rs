@@ -1646,7 +1646,7 @@ fn render(fields: &BTreeMap<String, String>) -> Result<String, Failure> {
         if key.is_empty()
             || !key
                 .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'))
             || value.contains(['\n', '\r', '\"', '\\'])
         {
             return Err(Failure::task(
@@ -1732,9 +1732,13 @@ mod tests {
     fn render_is_all_string_toml() {
         let mut fields = BTreeMap::new();
         fields.insert("selector".into(), SELECTOR.into());
+        fields.insert(
+            "stress-1_handoff_path".into(),
+            "campaign/stress-1/handoff.toml".into(),
+        );
         assert_eq!(
             render(&fields).unwrap(),
-            "selector = \"normal-preemption-smp\"\n"
+            "selector = \"normal-preemption-smp\"\nstress-1_handoff_path = \"campaign/stress-1/handoff.toml\"\n"
         );
     }
 
