@@ -4,13 +4,14 @@
 //! boundary exists because the accepted syscall consumer crate has not yet added typed wrappers
 //! for TaskGroup, Event, and Timer operations that are already present in the generated ABI.
 
+#[cfg(feature = "dw1c-test-evidence")]
+use deepwyrm_syscall::DW_STATUS_WOULD_BLOCK;
 use deepwyrm_syscall::{
     self, DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE, DW_ADDRESS_REGION_MAP_ARGS_V1_VERSION,
     DW_MEMORY_PROTECTION_READ, DW_MEMORY_PROTECTION_WRITE, DW_STATUS_SUCCESS,
-    DW_STATUS_WOULD_BLOCK, DW_WAIT_RESULT_V1_SIZE, DwAddressRegionMapArgsV1,
-    DwAddressRegionMapFlags, DwDeadline, DwHandle, DwMemoryObjectCreateFlags, DwMemoryProtection,
-    DwOffset, DwRights, DwSignals, DwSize, DwStatus, DwSyscallId, DwTerminationReason,
-    DwUserAddress, DwWaitItemV1, DwWaitResultV1,
+    DW_WAIT_RESULT_V1_SIZE, DwAddressRegionMapArgsV1, DwAddressRegionMapFlags, DwDeadline,
+    DwHandle, DwMemoryObjectCreateFlags, DwMemoryProtection, DwOffset, DwRights, DwSignals, DwSize,
+    DwStatus, DwSyscallId, DwTerminationReason, DwUserAddress, DwWaitItemV1, DwWaitResultV1,
 };
 
 use crate::{NativeError, NativeOutputError, PAGE_SIZE, wait_many};
