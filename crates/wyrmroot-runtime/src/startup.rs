@@ -96,7 +96,7 @@ pub enum StartupError {
     UnterminatedString,
     /// A referenced argv/environment string was not valid native UTF-8 text.
     InvalidUtf8,
-    /// ABI v2 exceeded the fixed argv bound or omitted argv[0].
+    /// ABI v2 exceeded the fixed argv bound or omitted `argv[0]`.
     ArgumentLimit,
     /// ABI v2 exceeded the fixed environment-entry bound.
     EnvironmentLimit,
