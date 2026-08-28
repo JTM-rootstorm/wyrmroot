@@ -1,14 +1,25 @@
 use core::panic::PanicInfo;
 use deepwyrm_syscall as _;
 use deepwyrm_syscall::{
-    DW_DEADLINE_INFINITE, DW_SIGNAL_READABLE, DW_SIGNAL_WRITABLE, DW_STATUS_WOULD_BLOCK, DwSignals,
+    DW_DEADLINE_INFINITE, DW_HANDLE_TRANSFER_MOVE, DW_RIGHT_INSPECT, DW_RIGHT_READ,
+    DW_RIGHT_TRANSFER, DW_RIGHT_WAIT, DW_RIGHT_WRITE, DW_SIGNAL_READABLE, DW_SIGNAL_WRITABLE,
+    DW_STATUS_WOULD_BLOCK, DwHandleTransferV1, DwRights, DwSignals,
 };
 use wyrmroot_loader::launch::{HEADER_BYTES, LaunchProfile, encode_ready_for_profile, parse_init};
 use wyrmroot_runtime::{
-    StartupBlock, panic_abort, receive_channel, send_channel, submit_dw1c_progress, wait_one,
+    StartupBlock, close_handle, create_channel, panic_abort, receive_channel, send_channel,
+    submit_dw1c_progress, wait_one,
 };
 
 const DIGEST: u64 = parse_hex(env!("DEEPWYRM_DW1C_PROGRESS_DIGEST"));
+const TOKEN7_SIDE_RIGHTS: DwRights = DwRights(
+    DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_WAIT.0 | DW_RIGHT_INSPECT.0 | DW_RIGHT_TRANSFER.0,
+);
+const TOKEN7_SETUP: [u8; 2] = [0xA7, 0x01];
+const TOKEN7_SETUP_ACK: [u8; 2] = [0xA7, 0x02];
+const TOKEN7_FULL: [u8; 2] = [0xA7, 0x03];
+const TOKEN7_WOKE: [u8; 2] = [0xA7, 0x04];
+const ACTOR_ACK_PREFIX: u8 = 0xAC;
 
 const fn parse_hex(text: &str) -> u64 {
     let bytes = text.as_bytes();
@@ -74,10 +85,52 @@ fn payload_main(startup: StartupBlock<'_>) -> u32 {
             return 0xD1C0_0100 | TOKEN as u32;
         }
     }
+    if TOKEN <= 6 {
+        if send_channel(channel, &[ACTOR_ACK_PREFIX, TOKEN], &[]).is_err() {
+            return 0xD1C0_0200 | TOKEN as u32;
+        }
+    }
     if TOKEN >= 9 {
         return 0;
     }
     if TOKEN == 7 {
+        let (side, offered) = match create_channel(TOKEN7_SIDE_RIGHTS) {
+            Ok(pair) => pair,
+            Err(_) => return 0xD1C0_0701,
+        };
+        let transfer = DwHandleTransferV1 {
+            handle: offered,
+            requested_rights: TOKEN7_SIDE_RIGHTS,
+            operation: DW_HANDLE_TRANSFER_MOVE,
+            reserved0: 0,
+            reserved: [0; 2],
+        };
+        if send_channel(channel, &TOKEN7_SETUP, &[transfer]).is_err() {
+            let _ = close_handle(side);
+            let _ = close_handle(offered);
+            return 0xD1C0_0702;
+        }
+        if wait_one(
+            channel,
+            DwSignals(DW_SIGNAL_READABLE.0),
+            DW_DEADLINE_INFINITE,
+        )
+        .is_err()
+        {
+            let _ = close_handle(side);
+            return 0xD1C0_0703;
+        }
+        let mut setup_ack = [0_u8; 2];
+        let mut no_handles = [];
+        let counts = receive_channel(channel, &mut setup_ack, &mut no_handles);
+        if counts.map_or(true, |counts| {
+            counts.bytes != TOKEN7_SETUP_ACK.len()
+                || counts.handles != 0
+                || setup_ack != TOKEN7_SETUP_ACK
+        }) {
+            let _ = close_handle(side);
+            return 0xD1C0_0704;
+        }
         let payload = [0xA7_u8; 128];
         loop {
             match send_channel(channel, &payload, &[]) {
@@ -87,8 +140,15 @@ fn payload_main(startup: StartupBlock<'_>) -> u32 {
                 {
                     break;
                 }
-                Err(_) => return 0xD1C0_0701,
+                Err(_) => {
+                    let _ = close_handle(side);
+                    return 0xD1C0_0705;
+                }
             }
+        }
+        if send_channel(side, &TOKEN7_FULL, &[]).is_err() {
+            let _ = close_handle(side);
+            return 0xD1C0_0706;
         }
         if wait_one(
             channel,
@@ -97,7 +157,15 @@ fn payload_main(startup: StartupBlock<'_>) -> u32 {
         )
         .is_err()
         {
-            return 0xD1C0_0700;
+            let _ = close_handle(side);
+            return 0xD1C0_0707;
+        }
+        if send_channel(side, &TOKEN7_WOKE, &[]).is_err() {
+            let _ = close_handle(side);
+            return 0xD1C0_0708;
+        }
+        if close_handle(side).is_err() {
+            return 0xD1C0_0709;
         }
     }
     loop {

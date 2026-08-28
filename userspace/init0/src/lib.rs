@@ -11,6 +11,8 @@
 #[cfg(test)]
 extern crate std;
 
+#[cfg(feature = "dw1b-preemption-integration")]
+use deepwyrm_syscall::DW_RIGHT_DUPLICATE;
 #[cfg(any(
     feature = "dw1b-preemption-integration",
     feature = "dw1c-preemption-integration"
@@ -20,11 +22,19 @@ use deepwyrm_syscall::DW_SIGNAL_EXITED;
     feature = "i-capability-integration",
     feature = "dw1b-preemption-integration"
 ))]
+use deepwyrm_syscall::DW_SIGNAL_WRITABLE;
+#[cfg(any(
+    feature = "i-capability-integration",
+    feature = "dw1b-preemption-integration"
+))]
 use deepwyrm_syscall::DW_STATUS_WOULD_BLOCK;
-#[cfg(feature = "dw1b-preemption-integration")]
+#[cfg(any(
+    feature = "dw1b-preemption-integration",
+    feature = "dw1c-preemption-integration"
+))]
 use deepwyrm_syscall::{
-    DW_OBJECT_TYPE_CHANNEL, DW_RIGHT_DUPLICATE, DW_RIGHT_INSPECT, DW_RIGHT_READ, DW_RIGHT_TRANSFER,
-    DW_RIGHT_WAIT, DW_RIGHT_WRITE,
+    DW_OBJECT_TYPE_CHANNEL, DW_RIGHT_INSPECT, DW_RIGHT_READ, DW_RIGHT_TRANSFER, DW_RIGHT_WAIT,
+    DW_RIGHT_WRITE,
 };
 #[cfg(any(
     feature = "i-capability-integration",
@@ -36,7 +46,7 @@ use deepwyrm_syscall::{DW_SIGNAL_PEER_CLOSED, DwSignals};
     feature = "dw1b-preemption-integration",
     feature = "dw1c-preemption-integration"
 ))]
-use deepwyrm_syscall::{DW_SIGNAL_READABLE, DW_SIGNAL_WRITABLE, DwWaitItemV1};
+use deepwyrm_syscall::{DW_SIGNAL_READABLE, DwWaitItemV1};
 use deepwyrm_syscall::{
     DW_TASK_STATE_EXITED, DwDeadline, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights,
     DwTaskTerminationInfoV1,
@@ -863,6 +873,20 @@ const DW1C_ACTOR_PATHS: [&[u8]; wyrmroot_runtime::DW1C_ACTOR_COUNT] = [
 #[cfg(feature = "dw1c-preemption-integration")]
 const DW1C_GO: [u8; 1] = [1];
 #[cfg(feature = "dw1c-preemption-integration")]
+const DW1C_ACTOR_ACK_PREFIX: u8 = 0xAC;
+#[cfg(feature = "dw1c-preemption-integration")]
+const DW1C_TOKEN7_SIDE_RIGHTS: DwRights = DwRights(
+    DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_WAIT.0 | DW_RIGHT_INSPECT.0 | DW_RIGHT_TRANSFER.0,
+);
+#[cfg(feature = "dw1c-preemption-integration")]
+const DW1C_TOKEN7_SETUP: [u8; 2] = [0xA7, 0x01];
+#[cfg(feature = "dw1c-preemption-integration")]
+const DW1C_TOKEN7_SETUP_ACK: [u8; 2] = [0xA7, 0x02];
+#[cfg(feature = "dw1c-preemption-integration")]
+const DW1C_TOKEN7_FULL: [u8; 2] = [0xA7, 0x03];
+#[cfg(feature = "dw1c-preemption-integration")]
+const DW1C_TOKEN7_WOKE: [u8; 2] = [0xA7, 0x04];
+#[cfg(feature = "dw1c-preemption-integration")]
 #[cfg(all(test, feature = "dw1c-preemption-integration"))]
 const DW1C_POST_ARM_ORDER: [u8; wyrmroot_runtime::DW1C_ACTOR_COUNT] =
     [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
@@ -875,12 +899,19 @@ mod dw1c_protocol_tests {
     };
 
     use super::{
-        DW1C_GO, DW1C_POST_ARM_ORDER, LOADER_ABORT_CODE, valid_dw1c_authorized_termination,
+        DW1C_ACTOR_ACK_PREFIX, DW1C_GO, DW1C_POST_ARM_ORDER, DW1C_TOKEN7_FULL, DW1C_TOKEN7_SETUP,
+        DW1C_TOKEN7_SETUP_ACK, DW1C_TOKEN7_WOKE, LOADER_ABORT_CODE,
+        valid_dw1c_authorized_termination,
     };
 
     #[test]
     fn post_arm_protocol_has_one_go_per_actor_and_orders_reaps() {
         assert_eq!(DW1C_GO, [1]);
+        assert_eq!(DW1C_ACTOR_ACK_PREFIX, 0xAC);
+        assert_eq!(DW1C_TOKEN7_SETUP, [0xA7, 0x01]);
+        assert_eq!(DW1C_TOKEN7_SETUP_ACK, [0xA7, 0x02]);
+        assert_eq!(DW1C_TOKEN7_FULL, [0xA7, 0x03]);
+        assert_eq!(DW1C_TOKEN7_WOKE, [0xA7, 0x04]);
         assert_eq!(DW1C_POST_ARM_ORDER, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         assert_eq!(&DW1C_POST_ARM_ORDER[8..], &[9, 10]);
     }
@@ -914,10 +945,13 @@ mod dw1c_protocol_tests {
         ));
         let gate = actor.find("if gate.map_or").unwrap();
         assert!(actor[gate..].contains("submit_dw1c_progress(TOKEN"));
+        assert!(actor[gate..].contains("ACTOR_ACK_PREFIX, TOKEN"));
         assert!(actor[..gate].find("submit_dw1c_progress(TOKEN").is_none());
         assert!(!actor[gate..].contains("0xC6"));
         assert!(actor[gate..].contains("if TOKEN == 7"));
         assert!(actor[gate..].contains("DW_STATUS_WOULD_BLOCK"));
+        assert!(actor[gate..].contains("TOKEN7_FULL"));
+        assert!(actor[gate..].contains("TOKEN7_WOKE"));
 
         let controller = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
         let arm = controller
@@ -930,7 +964,9 @@ mod dw1c_protocol_tests {
         assert!(arm < first_go);
         assert!(first_go < complete);
         assert!(controller[arm..complete].contains("actor6.launch_channel"));
+        assert!(controller[arm..complete].contains("receive_dw1c_actor_ack"));
         assert!(controller[arm..complete].contains("actor7.launch_channel"));
+        assert!(controller[arm..complete].contains("drive_dw1c_token7_capacity"));
         assert!(controller[arm..complete].contains("actor9.launch_channel"));
         assert!(controller[arm..complete].contains("actor10.launch_channel"));
 
@@ -1077,32 +1113,21 @@ fn drive_dw1c_workload<
         .send_channel(actor6.launch_channel, &go)
         .map_err(Init0Error::Native)?;
 
+    // GO only makes the actors eligible. Exact acknowledgements prove that
+    // tokens 1..5 committed their progress syscalls and token 6 resumed from
+    // its ARM-bound wait before the controller may claim workload completion.
+    index = 0;
+    while index < 6 {
+        let child = actor(index)?;
+        receive_dw1c_actor_ack(supervisor, child.launch_channel, index as u8 + 1, deadline)?;
+        index += 1;
+    }
+
     let actor7 = actor(6)?;
     system
         .send_channel(actor7.launch_channel, &go)
         .map_err(Init0Error::Native)?;
-    // Actor7 fills its parent-facing channel.  Drain one complete datagram
-    // when it becomes full so the child can observe a writable transition.
-    wait_actor_signal(
-        supervisor,
-        actor7.launch_channel,
-        DW_SIGNAL_READABLE,
-        deadline,
-    )?;
-    let mut payload = [0_u8; 128];
-    let mut handles = [];
-    let counts = supervisor
-        .receive_channel(actor7.launch_channel, &mut payload, &mut handles)
-        .map_err(Init0Error::Native)?;
-    if counts.bytes != 128 || counts.handles != 0 {
-        return Err(Init0Error::ReceiveCounts(counts));
-    }
-    wait_actor_signal(
-        supervisor,
-        actor7.launch_channel,
-        DW_SIGNAL_WRITABLE,
-        deadline,
-    )?;
+    drive_dw1c_token7_capacity(system, loader, supervisor, actor7.launch_channel, deadline)?;
 
     let actor8 = actor(7)?;
     system
@@ -1130,6 +1155,105 @@ fn drive_dw1c_workload<
     system
         .complete_dw1c_workload(parse_dw1c_progress_digest())
         .map_err(Init0Error::Native)
+}
+
+#[cfg(feature = "dw1c-preemption-integration")]
+fn receive_dw1c_actor_ack<Supervisor: SupervisionPlatform<Error = NativeError>>(
+    supervisor: &mut Supervisor,
+    channel: DwHandle,
+    token: u8,
+    deadline: DwDeadline,
+) -> Result<(), Init0Error> {
+    receive_dw1c_marker(
+        supervisor,
+        channel,
+        [DW1C_ACTOR_ACK_PREFIX, token],
+        deadline,
+    )
+}
+
+#[cfg(feature = "dw1c-preemption-integration")]
+fn drive_dw1c_token7_capacity<
+    System: Init0System,
+    Loader: LoaderPlatform<Error = NativeError>,
+    Supervisor: SupervisionPlatform<Error = NativeError>,
+>(
+    system: &mut System,
+    loader: &mut Loader,
+    supervisor: &mut Supervisor,
+    launch_channel: DwHandle,
+    deadline: DwDeadline,
+) -> Result<(), Init0Error> {
+    // The side Channel removes a four-CPU timing assumption from the capacity
+    // proof. Actor 7 explicitly reports that its launch Channel is full before
+    // init0 drains it, then acknowledges that the resulting WRITABLE wake has
+    // resumed userspace.
+    wait_actor_signal(supervisor, launch_channel, DW_SIGNAL_READABLE, deadline)?;
+    let mut setup = [0_u8; 2];
+    let mut handles = [DwReceivedHandleInfoV1::default(); 1];
+    let counts = supervisor
+        .receive_channel(launch_channel, &mut setup, &mut handles)
+        .map_err(Init0Error::Native)?;
+    if counts.bytes != DW1C_TOKEN7_SETUP.len()
+        || counts.handles != 1
+        || setup != DW1C_TOKEN7_SETUP
+        || handles[0].handle.0 == 0
+        || handles[0].object_type != DW_OBJECT_TYPE_CHANNEL
+        || handles[0].rights != DW1C_TOKEN7_SIDE_RIGHTS
+    {
+        if counts.handles == 1 && handles[0].handle.0 != 0 {
+            loader
+                .close(handles[0].handle)
+                .map_err(Init0Error::Cleanup)?;
+        }
+        return Err(Init0Error::ReceiveCounts(counts));
+    }
+    let side = handles[0].handle;
+    let operation = (|| {
+        system
+            .send_channel(launch_channel, &DW1C_TOKEN7_SETUP_ACK)
+            .map_err(Init0Error::Native)?;
+        receive_dw1c_marker(supervisor, side, DW1C_TOKEN7_FULL, deadline)?;
+
+        let mut payload = [0_u8; 128];
+        let mut no_handles = [];
+        let counts = supervisor
+            .receive_channel(launch_channel, &mut payload, &mut no_handles)
+            .map_err(Init0Error::Native)?;
+        if counts.bytes != payload.len()
+            || counts.handles != 0
+            || payload.iter().any(|byte| *byte != 0xA7)
+        {
+            return Err(Init0Error::ReceiveCounts(counts));
+        }
+
+        receive_dw1c_marker(supervisor, side, DW1C_TOKEN7_WOKE, deadline)
+    })();
+    let close = loader.close(side).map_err(Init0Error::Cleanup);
+    match (operation, close) {
+        (Err(primary), _) => Err(primary),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+#[cfg(feature = "dw1c-preemption-integration")]
+fn receive_dw1c_marker<Supervisor: SupervisionPlatform<Error = NativeError>>(
+    supervisor: &mut Supervisor,
+    channel: DwHandle,
+    expected: [u8; 2],
+    deadline: DwDeadline,
+) -> Result<(), Init0Error> {
+    wait_actor_signal(supervisor, channel, DW_SIGNAL_READABLE, deadline)?;
+    let mut marker = [0_u8; 2];
+    let mut handles = [];
+    let counts = supervisor
+        .receive_channel(channel, &mut marker, &mut handles)
+        .map_err(Init0Error::Native)?;
+    if counts.bytes != expected.len() || counts.handles != 0 || marker != expected {
+        return Err(Init0Error::ReceiveCounts(counts));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "dw1c-preemption-integration")]
