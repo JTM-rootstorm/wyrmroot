@@ -993,9 +993,10 @@ mod dw1c_protocol_tests {
         assert!(actor[gate..].contains("TOKEN7_FULL"));
         assert!(actor[gate..].contains("TOKEN7_WOKE"));
 
-        let controller = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
+        let controller = &source[source.rfind("\nfn run_dw1c_preemption<").unwrap() + 1..];
         let arm = controller
-            .find("    arm_dw1c_after_ready(system, processes)?;")
+            .find("    if let Err(error) = arm_dw1c_after_ready(system, processes)")
             .unwrap();
         let first_go = controller[arm..].find("DW1C_GO").unwrap() + arm;
         let complete = controller
@@ -1014,13 +1015,16 @@ mod dw1c_protocol_tests {
         let drive = controller
             .find("    if let Err(error) = drive_dw1c_workload(")
             .unwrap();
-        let cleanup = "    cleanup_dw1c_actors(loader, supervisor, actors, deadline)";
+        let cleanup = "cleanup_dw1c_actors(";
+        let arm_cleanup = controller[arm..drive].find(cleanup).unwrap() + arm;
         let error_cleanup = controller[drive..].find(cleanup).unwrap() + drive;
         let success_cleanup = controller[error_cleanup + cleanup.len()..]
             .find(cleanup)
             .unwrap()
             + error_cleanup
             + cleanup.len();
+        assert!(arm < arm_cleanup);
+        assert!(arm_cleanup < drive);
         assert!(drive < success_cleanup);
     }
 }
@@ -1112,7 +1116,12 @@ fn run_dw1c_preemption<
             .process;
         index += 1;
     }
-    arm_dw1c_after_ready(system, processes)?;
+    if let Err(error) = arm_dw1c_after_ready(system, processes) {
+        return Err(prefer_dw1c_cleanup(
+            error,
+            cleanup_dw1c_actors(loader, supervisor, actors, deadline),
+        ));
+    }
     if let Err(error) = drive_dw1c_workload(system, loader, supervisor, actors, deadline) {
         return Err(prefer_dw1c_cleanup(
             error,
