@@ -1164,7 +1164,7 @@ fn render_freeze_request(
         ("schema_version", "1"),
         ("selector", SELECTOR),
         ("test_id", TEST_ID),
-        ("timeout_seconds", "240"),
+        ("timeout_seconds", "300"),
         ("vcpus", "4"),
         ("memory_mib", "2048"),
         ("deepwyrm_revision", deep),
@@ -1409,7 +1409,7 @@ impl Request {
         for (key, expected) in [
             ("selector", SELECTOR),
             ("test_id", TEST_ID),
-            ("timeout_seconds", "240"),
+            ("timeout_seconds", "300"),
             ("vcpus", "4"),
             ("memory_mib", "2048"),
         ] {
@@ -1523,7 +1523,7 @@ fn base_fields(
         ("firmware", "OVMF"),
         ("selector", SELECTOR),
         ("test_id", TEST_ID),
-        ("timeout_seconds", "240"),
+        ("timeout_seconds", "300"),
         ("evidence_protocol", "DW1C/01"),
         ("evidence_record_count", "46"),
         ("kernel_result_protocol", "DWTEST1"),

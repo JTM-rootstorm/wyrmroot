@@ -25,13 +25,14 @@ use deepwyrm_syscall::DW_SIGNAL_EXITED;
 use deepwyrm_syscall::DW_SIGNAL_WRITABLE;
 #[cfg(any(
     feature = "i-capability-integration",
-    feature = "dw1b-preemption-integration"
+    feature = "dw1b-preemption-integration",
+    feature = "dw1c-preemption-integration"
 ))]
 use deepwyrm_syscall::DW_STATUS_WOULD_BLOCK;
 #[cfg(feature = "dw1c-preemption-integration")]
 use deepwyrm_syscall::{
-    DW_HANDLE_TRANSFER_MOVE, DW_TASK_TERMINATION_INFO_V1_SIZE, DW_TERMINATION_AUTHORIZED,
-    DwHandleTransferV1,
+    DW_HANDLE_TRANSFER_MOVE, DW_STATUS_TIMED_OUT, DW_TASK_TERMINATION_INFO_V1_SIZE,
+    DW_TERMINATION_AUTHORIZED, DwHandleTransferV1,
 };
 #[cfg(any(
     feature = "dw1b-preemption-integration",
@@ -930,14 +931,16 @@ const DW1C_POST_ARM_ORDER: [u8; wyrmroot_runtime::DW1C_ACTOR_COUNT] =
 #[cfg(all(test, feature = "dw1c-preemption-integration"))]
 mod dw1c_protocol_tests {
     use deepwyrm_syscall::{
-        DW_TASK_STATE_EXITED, DW_TASK_TERMINATION_INFO_V1_SIZE, DW_TERMINATION_AUTHORIZED,
+        DW_STATUS_BAD_STATE, DW_STATUS_TIMED_OUT, DW_STATUS_WOULD_BLOCK, DW_TASK_STATE_EXITED,
+        DW_TASK_TERMINATION_INFO_V1_SIZE, DW_TERMINATION_AUTHORIZED, DwDeadline,
         DwTaskTerminationInfoV1,
     };
 
     use super::{
         DW1C_ACTOR_ACK_PREFIX, DW1C_GO, DW1C_POST_ARM_ORDER, DW1C_TOKEN2_RELAY_SETUP,
         DW1C_TOKEN7_FULL, DW1C_TOKEN7_RELAY_START, DW1C_TOKEN7_SETUP, DW1C_TOKEN7_SETUP_ACK,
-        DW1C_TOKEN7_WOKE, LOADER_ABORT_CODE, valid_dw1c_authorized_termination,
+        DW1C_TOKEN7_WOKE, LOADER_ABORT_CODE, terminate_dw1c_token8_bounded,
+        valid_dw1c_authorized_termination,
     };
 
     #[test]
@@ -973,6 +976,58 @@ mod dw1c_protocol_tests {
         let mut wrong_detail = accepted;
         wrong_detail.detail ^= 1;
         assert!(!valid_dw1c_authorized_termination(&wrong_detail));
+    }
+
+    #[test]
+    fn actor8_termination_retries_would_block_across_syscall_boundaries() {
+        let mut attempts = 0;
+        let mut clock_reads = 0;
+        let result = terminate_dw1c_token8_bounded(
+            DwDeadline(100),
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(wyrmroot_runtime::NativeError::Status(DW_STATUS_WOULD_BLOCK))
+                } else {
+                    Ok(())
+                }
+            },
+            || {
+                clock_reads += 1;
+                Ok(10)
+            },
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(attempts, 3);
+        assert_eq!(clock_reads, 2);
+    }
+
+    #[test]
+    fn actor8_termination_timeout_and_nonretry_errors_are_bounded() {
+        let timed_out = terminate_dw1c_token8_bounded(
+            DwDeadline(10),
+            || Err(wyrmroot_runtime::NativeError::Status(DW_STATUS_WOULD_BLOCK)),
+            || Ok(10),
+        );
+        assert_eq!(
+            timed_out,
+            Err(wyrmroot_runtime::NativeError::Status(DW_STATUS_TIMED_OUT))
+        );
+
+        let mut clock_called = false;
+        let rejected = terminate_dw1c_token8_bounded(
+            DwDeadline(10),
+            || Err(wyrmroot_runtime::NativeError::Status(DW_STATUS_BAD_STATE)),
+            || {
+                clock_called = true;
+                Ok(0)
+            },
+        );
+        assert_eq!(
+            rejected,
+            Err(wyrmroot_runtime::NativeError::Status(DW_STATUS_BAD_STATE))
+        );
+        assert!(!clock_called);
     }
 
     #[test]
@@ -1228,9 +1283,12 @@ fn drive_dw1c_workload<
     system
         .send_channel(actor8.launch_channel, &go)
         .map_err(Init0Error::Native)?;
-    loader
-        .process_terminate(actor8.process)
-        .map_err(Init0Error::Cleanup)?;
+    terminate_dw1c_token8_bounded(
+        deadline,
+        || loader.process_terminate(actor8.process),
+        wyrmroot_runtime::monotonic_active_now,
+    )
+    .map_err(Init0Error::Cleanup)?;
     wait_actor_authorized_termination(supervisor, actor8.process, deadline)?;
 
     let actor9 = actor(8)?;
@@ -1250,6 +1308,25 @@ fn drive_dw1c_workload<
     system
         .complete_dw1c_workload(parse_dw1c_progress_digest())
         .map_err(Init0Error::Native)
+}
+
+#[cfg(feature = "dw1c-preemption-integration")]
+fn terminate_dw1c_token8_bounded(
+    deadline: DwDeadline,
+    mut terminate: impl FnMut() -> Result<(), NativeError>,
+    mut monotonic_now: impl FnMut() -> Result<u64, NativeError>,
+) -> Result<(), NativeError> {
+    loop {
+        match terminate() {
+            Ok(()) => return Ok(()),
+            Err(NativeError::Status(status)) if status == DW_STATUS_WOULD_BLOCK => {}
+            Err(error) => return Err(error),
+        }
+        if monotonic_now()? >= deadline.0 {
+            return Err(NativeError::Status(DW_STATUS_TIMED_OUT));
+        }
+        core::hint::spin_loop();
+    }
 }
 
 #[cfg(feature = "dw1c-preemption-integration")]

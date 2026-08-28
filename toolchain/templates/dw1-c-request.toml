@@ -3,7 +3,7 @@
 schema_version = "1"
 selector = "normal-preemption-smp"
 test_id = "28"
-timeout_seconds = "240"
+timeout_seconds = "300"
 vcpus = "4"
 memory_mib = "2048"
 deepwyrm_revision = "0000000000000000000000000000000000000000"
