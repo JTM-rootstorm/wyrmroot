@@ -15,7 +15,9 @@ use wyrmroot_loader::process::{
 
 use crate::{NativeError, NativeOutputError};
 
-const LOADER_ABORT_CODE: u32 = 0x5759_5230;
+/// Wyrmroot loader-owned detail recorded for an authorized rollback or
+/// controller-requested Process/Thread termination.
+pub const LOADER_ABORT_CODE: u32 = 0x5759_5230;
 
 /// Stateless syscall-backed implementation of the WYR0 loader platform boundary.
 pub struct NativeLoaderPlatform;

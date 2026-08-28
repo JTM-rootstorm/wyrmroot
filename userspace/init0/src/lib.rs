@@ -41,6 +41,8 @@ use deepwyrm_syscall::{
     DW_TASK_STATE_EXITED, DwDeadline, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights,
     DwTaskTerminationInfoV1,
 };
+#[cfg(feature = "dw1c-preemption-integration")]
+use deepwyrm_syscall::{DW_TASK_TERMINATION_INFO_V1_SIZE, DW_TERMINATION_AUTHORIZED};
 use wyrmroot_bootfs::archive::{Archive, LookupError, ParseError};
 #[cfg(feature = "dw1b-preemption-integration")]
 use wyrmroot_loader::{
@@ -54,6 +56,8 @@ use wyrmroot_loader::{
         load_process,
     },
 };
+#[cfg(feature = "dw1c-preemption-integration")]
+use wyrmroot_runtime::LOADER_ABORT_CODE;
 #[cfg(any(
     feature = "dw1b-preemption-integration",
     feature = "dw1c-preemption-integration"
@@ -865,13 +869,41 @@ const DW1C_POST_ARM_ORDER: [u8; wyrmroot_runtime::DW1C_ACTOR_COUNT] =
 
 #[cfg(all(test, feature = "dw1c-preemption-integration"))]
 mod dw1c_protocol_tests {
-    use super::{DW1C_GO, DW1C_POST_ARM_ORDER};
+    use deepwyrm_syscall::{
+        DW_TASK_STATE_EXITED, DW_TASK_TERMINATION_INFO_V1_SIZE, DW_TERMINATION_AUTHORIZED,
+        DwTaskTerminationInfoV1,
+    };
+
+    use super::{
+        DW1C_GO, DW1C_POST_ARM_ORDER, LOADER_ABORT_CODE, valid_dw1c_authorized_termination,
+    };
 
     #[test]
     fn post_arm_protocol_has_one_go_per_actor_and_orders_reaps() {
         assert_eq!(DW1C_GO, [1]);
         assert_eq!(DW1C_POST_ARM_ORDER, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         assert_eq!(&DW1C_POST_ARM_ORDER[8..], &[9, 10]);
+    }
+
+    #[test]
+    fn actor8_requires_the_exact_authorized_loader_termination_record() {
+        let accepted = DwTaskTerminationInfoV1 {
+            size: DW_TASK_TERMINATION_INFO_V1_SIZE,
+            version: 1,
+            state: DW_TASK_STATE_EXITED,
+            reason: DW_TERMINATION_AUTHORIZED,
+            detail: LOADER_ABORT_CODE,
+            ..DwTaskTerminationInfoV1::default()
+        };
+        assert!(valid_dw1c_authorized_termination(&accepted));
+
+        let mut wrong_reason = accepted;
+        wrong_reason.reason = deepwyrm_syscall::DW_TERMINATION_NORMAL_EXIT;
+        assert!(!valid_dw1c_authorized_termination(&wrong_reason));
+
+        let mut wrong_detail = accepted;
+        wrong_detail.detail ^= 1;
+        assert!(!valid_dw1c_authorized_termination(&wrong_detail));
     }
 
     #[test]
@@ -1062,7 +1094,7 @@ fn drive_dw1c_workload<
     loader
         .process_terminate(actor8.process)
         .map_err(Init0Error::Cleanup)?;
-    wait_actor_exit(supervisor, actor8.process, deadline)?;
+    wait_actor_authorized_termination(supervisor, actor8.process, deadline)?;
 
     let actor9 = actor(8)?;
     system
@@ -1137,6 +1169,36 @@ fn wait_actor_exit<Supervisor: SupervisionPlatform<Error = NativeError>>(
 }
 
 #[cfg(feature = "dw1c-preemption-integration")]
+fn wait_actor_authorized_termination<Supervisor: SupervisionPlatform<Error = NativeError>>(
+    supervisor: &mut Supervisor,
+    process: DwHandle,
+    deadline: DwDeadline,
+) -> Result<(), Init0Error> {
+    wait_actor_signal(supervisor, process, DW_SIGNAL_EXITED, deadline)?;
+    let info = supervisor
+        .query_task_termination(process)
+        .map_err(Init0Error::Native)?;
+    if !valid_dw1c_authorized_termination(&info) {
+        return Err(Init0Error::CapabilityEvidence);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "dw1c-preemption-integration")]
+fn valid_dw1c_authorized_termination(info: &DwTaskTerminationInfoV1) -> bool {
+    info.size == DW_TASK_TERMINATION_INFO_V1_SIZE
+        && info.version == 1
+        && info.state == DW_TASK_STATE_EXITED
+        && info.reason == DW_TERMINATION_AUTHORIZED
+        && info.application_code == 0
+        && info.exception_type.0 == 0
+        && info.detail == LOADER_ABORT_CODE
+        && info.reserved0 == 0
+        && info.fault_address == 0
+        && info.reserved == [0; 3]
+}
+
+#[cfg(feature = "dw1c-preemption-integration")]
 fn cleanup_dw1c_actors<
     Loader: LoaderPlatform<Error = NativeError>,
     Supervisor: SupervisionPlatform<Error = NativeError>,
@@ -1149,7 +1211,12 @@ fn cleanup_dw1c_actors<
     let mut first = None;
     for actor in actors.into_iter().flatten() {
         if let Err(error) = loader.process_terminate(actor.process) {
-            first.get_or_insert(Init0Error::Cleanup(error));
+            let already_exited = supervisor
+                .query_task_termination(actor.process)
+                .is_ok_and(|info| info.state == DW_TASK_STATE_EXITED);
+            if !already_exited {
+                first.get_or_insert(Init0Error::Cleanup(error));
+            }
         }
         let item = DwWaitItemV1 {
             handle: actor.process,
