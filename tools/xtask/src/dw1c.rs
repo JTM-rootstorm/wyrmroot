@@ -553,7 +553,7 @@ fn read_cargo_build_output(path: &Path, label: &str, maximum: u64) -> Result<Vec
             "DW1-C {label} is not a bounded regular Cargo build output"
         )));
     }
-    read_regular(path, label)
+    fs::read(path).map_err(io)
 }
 
 /// Creates a fresh six-pass campaign containing immutable all-string TOML
@@ -1882,6 +1882,22 @@ mod tests {
             fs::metadata(&target).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cargo_outputs_may_be_hard_linked_before_owned_snapshot() {
+        let root = std::env::temp_dir().join(format!("dw1c-cargo-output-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let source = root.join("artifact");
+        let alias = root.join("artifact-alias");
+        fs::write(&source, b"fresh cargo artifact").unwrap();
+        fs::hard_link(&source, &alias).unwrap();
+        assert_eq!(
+            read_cargo_build_output(&source, "fixture", 1024).unwrap(),
+            b"fresh cargo artifact"
+        );
+        assert!(read_regular(&source, "fixture").is_err());
         fs::remove_dir_all(root).unwrap();
     }
 }
