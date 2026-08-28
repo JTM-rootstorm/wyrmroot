@@ -14,10 +14,11 @@ The baseline hashes above are the pre-contract design inputs. Because independen
 
 It does not implement the runtime or protocol. D1 consumes this record to turn the existing deliberate scaffolds into tested code.
 
-**2026-08-27 primordial-stack revision:** Deepwyrm's separately owned
-production primordial stack target is 128 KiB. Wyrmroot-loaded child stacks use
-the same size under the separately owned E0 loader contract; their construction
-and implementation ownership remain distinct.
+**2026-08-27 DW1-C primordial-stack revision:** Deepwyrm's separately owned
+production primordial stack target is 256 KiB after live init0 actor loading
+exhausted the former 128 KiB mapping. Wyrmroot-loaded child stacks remain 128
+KiB under the separately owned E0 loader contract; their construction and
+implementation ownership remain distinct.
 
 ## 1. D0 disposition and dependency direction
 
@@ -80,9 +81,9 @@ The concrete primordial startup is:
 - `RSP` is 16-byte aligned; and
 - unused startup-block bytes are zero.
 
-Deepwyrm maps 128 KiB RW/NX for the primordial stack, with one unmapped 4 KiB
+Deepwyrm maps 256 KiB RW/NX for the primordial stack, with one unmapped 4 KiB
 guard page immediately below it. The startup block is the highest mapped page
-and `RSP = stack_top - 4096`, leaving 124 KiB of normal downward-growing stack
+and `RSP = stack_top - 4096`, leaving 252 KiB of normal downward-growing stack
 below `RSP`.
 
 D1 may test additional bounded nonempty argv/environment vectors for parser correctness, but no additional primordial startup data is implied by G0.
