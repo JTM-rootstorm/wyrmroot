@@ -394,10 +394,12 @@ pub(crate) fn build_wyr_artifact_set(
         toolchain.accepted(),
         &layout,
         &uefi,
-        &loader,
-        &bootstrap,
-        &init0,
-        &actors,
+        WyrReceiptArtifacts {
+            loader: &loader,
+            bootstrap: &bootstrap,
+            init0: &init0,
+            actors: &actors,
+        },
         &toolchain.validation_report_sha256(),
     )?;
     Ok(WyrArtifactSet {
@@ -413,12 +415,19 @@ pub(crate) fn build_wyr_artifact_set(
     })
 }
 
-fn progress_digest_environment<'a>(
+fn progress_digest_environment(
     spec: WyrBuildSpec,
-    progress_digest: &'a str,
-) -> Option<(&'static str, &'a str)> {
+    progress_digest: &str,
+) -> Option<(&'static str, &str)> {
     spec.requires_progress_digest
         .then_some(("DEEPWYRM_DW1C_PROGRESS_DIGEST", progress_digest))
+}
+
+struct WyrReceiptArtifacts<'a> {
+    loader: &'a [u8],
+    bootstrap: &'a [u8],
+    init0: &'a [u8],
+    actors: &'a [Vec<u8>; 10],
 }
 
 fn render_wyr_source_receipt(
@@ -427,10 +436,7 @@ fn render_wyr_source_receipt(
     toolchain: &crate::toolchain_artifact::AcceptedToolchain,
     layout: &crate::deep_layout::DeepLayoutBuild,
     uefi: &crate::tasks::DeterministicUefiArtifacts,
-    loader: &[u8],
-    bootstrap: &[u8],
-    init0: &[u8],
-    actors: &[Vec<u8>; 10],
+    artifacts: WyrReceiptArtifacts<'_>,
     toolchain_validation_report_sha256: &str,
 ) -> Result<String, Failure> {
     // C0 §9.1 binds nonce/digest/pages to the Deep selector build.  Native
@@ -478,13 +484,16 @@ fn render_wyr_source_receipt(
             "toolchain_validation_report_sha256",
             toolchain_validation_report_sha256.to_owned(),
         ),
-        ("loader_sha256", sha256::bytes_digest(loader)),
-        ("bootstrap_sha256", sha256::bytes_digest(bootstrap)),
-        ("init0_sha256", sha256::bytes_digest(init0)),
+        ("loader_sha256", sha256::bytes_digest(artifacts.loader)),
+        (
+            "bootstrap_sha256",
+            sha256::bytes_digest(artifacts.bootstrap),
+        ),
+        ("init0_sha256", sha256::bytes_digest(artifacts.init0)),
     ] {
         fields.insert(key.to_owned(), value);
     }
-    for (index, actor) in actors.iter().enumerate() {
+    for (index, actor) in artifacts.actors.iter().enumerate() {
         fields.insert(
             format!("actor{}_sha256", index + 1),
             sha256::bytes_digest(actor),
