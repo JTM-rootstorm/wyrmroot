@@ -18,7 +18,7 @@ use wyrmroot_device_proto::{
     controller::{
         ControllerMessage, StatusCode, encode as encode_controller, parse as parse_controller,
     },
-    manifest::{Manifest as DeviceManifest, SERIAL_CONSOLE_PUBLICATION_POLICY},
+    manifest::{ContentIdentity, Manifest as DeviceManifest, SERIAL_CONSOLE_PUBLICATION_POLICY},
 };
 use wyrmroot_loader::{
     launch::{DEVICE_MANIFEST_RIGHTS, LaunchProfile},
@@ -38,12 +38,74 @@ const PUBLICATION_TRANSACTION: u64 = 0xC1_1001;
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ResidentState {
-    registry: RegistryNativeAttempt,
-    _topology: RegistryTopology,
-    devmgr: ActiveNativeRole,
+    registry: Option<RegistryNativeAttempt>,
+    topology: RegistryTopology,
+    devmgr: Option<ActiveNativeRole>,
+    binding: Option<wyrmroot_device_proto::RegistryBinding>,
+    waiting_registry_observed: bool,
+    last_controller_transaction: u64,
+    next_controller_transaction: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DevmgrNativeAttempt {
+    active: ActiveNativeRole,
     binding: wyrmroot_device_proto::RegistryBinding,
     last_controller_transaction: u64,
     next_controller_transaction: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResidentPollEvent {
+    DevmgrExited,
+    DevmgrControlLost,
+    WaitingForRegistry,
+    RegistryLost,
+}
+
+fn classify_resident_poll(
+    result: DwWaitResultV1,
+    item_count: usize,
+) -> Result<ResidentPollEvent, InitError> {
+    if result.index >= item_count as u32 {
+        return Err(InitError::Supervision);
+    }
+    match result.index {
+        0 if result.observed.0 & DW_SIGNAL_EXITED.0 != 0 => Ok(ResidentPollEvent::DevmgrExited),
+        1 if result.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 => {
+            Ok(ResidentPollEvent::DevmgrControlLost)
+        }
+        1 if result.observed.0 & DW_SIGNAL_READABLE.0 != 0 => {
+            Ok(ResidentPollEvent::WaitingForRegistry)
+        }
+        2 if item_count == 4 && result.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 => {
+            Ok(ResidentPollEvent::RegistryLost)
+        }
+        3 if item_count == 4 && result.observed.0 & DW_SIGNAL_EXITED.0 != 0 => {
+            Ok(ResidentPollEvent::RegistryLost)
+        }
+        _ => Err(InitError::Supervision),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RegistryRecoveryStep {
+    Degraded,
+    AwaitStatus,
+    Restart,
+}
+
+const fn registry_recovery_step(
+    exhausted: bool,
+    status_already_consumed: bool,
+) -> RegistryRecoveryStep {
+    if exhausted {
+        RegistryRecoveryStep::Degraded
+    } else if status_already_consumed {
+        RegistryRecoveryStep::Restart
+    } else {
+        RegistryRecoveryStep::AwaitStatus
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -77,8 +139,13 @@ where
     if manifest_entry.is_executable() {
         return Err(InitError::WrongManifestProfile);
     }
-    DeviceManifest::parse(manifest_entry.data()).map_err(|_| InitError::WrongManifestProfile)?;
+    let device_manifest = DeviceManifest::parse(manifest_entry.data())
+        .map_err(|_| InitError::WrongManifestProfile)?;
     let manifest = crate::wyr1b_native::validate_retained_bootfs_c1(bootfs)?;
+    validate_device_identity(
+        device_manifest,
+        manifest.executable_identity(RoleId::Uart16550d)?,
+    )?;
     let resident = slot.write(ResidentSystemInit {
         controller: manifest,
         authority,
@@ -112,7 +179,7 @@ where
     .ok_or(InitError::WrongActivationOrder)?;
     let (registry, mut topology) =
         establish_registry_topology(system, waits, &mut resident.controller, registry)?;
-    let state = launch_devmgr(
+    let devmgr = match launch_devmgr(
         system,
         loader,
         waits,
@@ -122,11 +189,42 @@ where
         registry,
         &mut topology,
         manifest_entry.data(),
-    )?;
-    resident.active = [Some(state.registry.active), Some(state.devmgr)];
+    ) {
+        Ok(devmgr) => devmgr,
+        Err(error) => {
+            let poison = poison_registry_generation(
+                system,
+                waits,
+                &mut resident.controller,
+                registry,
+                false,
+            );
+            return Err(poison.err().unwrap_or(error));
+        }
+    };
+    let state = ResidentState {
+        registry: Some(registry),
+        topology,
+        devmgr: Some(devmgr.active),
+        binding: Some(devmgr.binding),
+        waiting_registry_observed: false,
+        last_controller_transaction: devmgr.last_controller_transaction,
+        next_controller_transaction: devmgr.next_controller_transaction,
+    };
+    resident.active = [Some(registry.active), Some(devmgr.active)];
     resident.result = RecoveryResult::Recovered;
     resident.wyr1c = Some(state);
     Ok(resident)
+}
+
+fn validate_device_identity(
+    manifest: DeviceManifest<'_>,
+    uart_identity: [u8; 32],
+) -> Result<(), InitError> {
+    manifest
+        .match_com2(ContentIdentity(uart_identity))
+        .map(|_| ())
+        .map_err(|_| InitError::WrongManifestProfile)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -140,7 +238,7 @@ fn launch_devmgr<S, L, W>(
     registry: RegistryNativeAttempt,
     topology: &mut RegistryTopology,
     manifest_bytes: &[u8],
-) -> Result<ResidentState, InitError>
+) -> Result<DevmgrNativeAttempt, InitError>
 where
     S: Wyr1BPlatform,
     L: LoaderPlatform<Error = NativeError>,
@@ -261,13 +359,11 @@ where
             if !failure.manifest_consumed {
                 cleanup_failed |= system.close_handle(manifest).is_err();
             }
-            let poison =
-                poison_registry_generation(system, waits, controller, registry, cleanup_failed);
-            return Err(poison.err().unwrap_or(if cleanup_failed {
+            return Err(if cleanup_failed {
                 InitError::Cleanup
             } else {
                 InitError::Loader(failure.error)
-            }));
+            });
         }
     };
     let resources = AttemptResources {
@@ -284,13 +380,11 @@ where
     };
     if let Err(error) = controller.install_attempt(resources) {
         let cleanup_failed = cleanup_loaded(system, waits, loaded, task_group, true).is_err();
-        let poison =
-            poison_registry_generation(system, waits, controller, registry, cleanup_failed);
-        return Err(poison.err().unwrap_or(if cleanup_failed {
+        return Err(if cleanup_failed {
             InitError::Cleanup
         } else {
             error
-        }));
+        });
     }
     let started = match system.now().map_err(InitError::Native) {
         Ok(value) => value,
@@ -299,7 +393,6 @@ where
                 system,
                 waits,
                 controller,
-                registry,
                 loaded,
                 task_group,
                 generation,
@@ -315,7 +408,6 @@ where
             system,
             waits,
             controller,
-            registry,
             loaded,
             task_group,
             generation,
@@ -340,7 +432,6 @@ where
             system,
             waits,
             controller,
-            registry,
             loaded,
             task_group,
             generation,
@@ -358,7 +449,6 @@ where
             system,
             waits,
             controller,
-            registry,
             loaded,
             task_group,
             generation,
@@ -377,7 +467,6 @@ where
             system,
             waits,
             controller,
-            registry,
             loaded,
             task_group,
             generation,
@@ -393,7 +482,6 @@ where
             system,
             waits,
             controller,
-            registry,
             loaded,
             task_group,
             generation,
@@ -408,7 +496,6 @@ where
                 system,
                 waits,
                 controller,
-                registry,
                 loaded,
                 task_group,
                 generation,
@@ -424,7 +511,6 @@ where
                 system,
                 waits,
                 controller,
-                registry,
                 loaded,
                 task_group,
                 generation,
@@ -449,7 +535,6 @@ where
                 system,
                 waits,
                 controller,
-                registry,
                 loaded,
                 task_group,
                 generation,
@@ -463,7 +548,6 @@ where
             system,
             waits,
             controller,
-            registry,
             loaded,
             task_group,
             generation,
@@ -471,53 +555,18 @@ where
             InitError::Supervision,
         );
     }
-    let mut status = [0u8; wyrmroot_device_proto::controller::STATUS_BYTES];
-    let mut handles = [DwReceivedHandleInfoV1::default(); 1];
-    let counts = match system
-        .receive_channel(loaded.launch_channel, &mut status, &mut handles)
-        .map_err(InitError::Native)
-    {
+    let response = match receive_controller_status(system, loaded.launch_channel) {
         Ok(value) => value,
         Err(error) => {
             return fail_loaded_devmgr(
                 system,
                 waits,
                 controller,
-                registry,
                 loaded,
                 task_group,
                 generation,
                 transaction_id,
                 error,
-            );
-        }
-    };
-    if counts.bytes != status.len() || counts.handles != 0 {
-        return fail_loaded_devmgr(
-            system,
-            waits,
-            controller,
-            registry,
-            loaded,
-            task_group,
-            generation,
-            transaction_id,
-            InitError::WrongManifestProfile,
-        );
-    }
-    let response = match parse_controller(&status) {
-        Ok(value) => value,
-        Err(_) => {
-            return fail_loaded_devmgr(
-                system,
-                waits,
-                controller,
-                registry,
-                loaded,
-                task_group,
-                generation,
-                transaction_id,
-                InitError::WrongManifestProfile,
             );
         }
     };
@@ -534,7 +583,6 @@ where
             system,
             waits,
             controller,
-            registry,
             loaded,
             task_group,
             generation,
@@ -542,10 +590,8 @@ where
             InitError::WrongManifestProfile,
         );
     }
-    Ok(ResidentState {
-        registry,
-        _topology: *topology,
-        devmgr: ActiveNativeRole {
+    Ok(DevmgrNativeAttempt {
+        active: ActiveNativeRole {
             role: RoleId::Devmgr,
             generation,
             transaction_id,
@@ -605,13 +651,12 @@ fn fail_loaded_devmgr<S, W>(
     system: &mut S,
     waits: &mut W,
     controller: &mut SystemInit,
-    registry: RegistryNativeAttempt,
     loaded: LoadedProcess,
     task_group: DwHandle,
     generation: u64,
     transaction_id: u64,
     original: InitError,
-) -> Result<ResidentState, InitError>
+) -> Result<DevmgrNativeAttempt, InitError>
 where
     S: Wyr1BPlatform,
     W: SupervisionPlatform<Error = NativeError>,
@@ -633,20 +678,11 @@ where
         || controller
             .cleanup_complete(RoleId::Devmgr, generation, transaction_id, retired_at)
             .is_err();
-    let poison = poison_registry_generation(
-        system,
-        waits,
-        controller,
-        registry,
-        cleanup_failed || controller_cleanup_failed,
-    );
-    Err(poison
-        .err()
-        .unwrap_or(if cleanup_failed || controller_cleanup_failed {
-            InitError::Cleanup
-        } else {
-            original
-        }))
+    Err(if cleanup_failed || controller_cleanup_failed {
+        InitError::Cleanup
+    } else {
+        original
+    })
 }
 
 fn await_waiting_for_registry<S, W>(
@@ -677,15 +713,22 @@ where
     if observed.index != 0 || observed.observed.0 & DW_SIGNAL_READABLE.0 == 0 {
         return Err(InitError::Supervision);
     }
-    let mut bytes = [0u8; wyrmroot_device_proto::controller::STATUS_BYTES];
-    let mut handles = [DwReceivedHandleInfoV1::default(); 1];
-    let counts = system
-        .receive_channel(devmgr.loaded.launch_channel, &mut bytes, &mut handles)
-        .map_err(InitError::Native)?;
-    if counts.bytes != bytes.len() || counts.handles != 0 {
-        return Err(InitError::WrongManifestProfile);
-    }
-    match parse_controller(&bytes).map_err(|_| InitError::WrongManifestProfile)? {
+    receive_waiting_for_registry(
+        system,
+        devmgr,
+        supervisor_generation,
+        last_controller_transaction,
+    )
+}
+
+fn receive_waiting_for_registry<S: InitPlatform>(
+    system: &mut S,
+    devmgr: ActiveNativeRole,
+    supervisor_generation: u64,
+    last_controller_transaction: u64,
+) -> Result<(), InitError> {
+    let message = receive_controller_status(system, devmgr.loaded.launch_channel)?;
+    match message {
         ControllerMessage::Status {
             supervisor_generation: received,
             binding: None,
@@ -699,6 +742,32 @@ where
         }
         _ => Err(InitError::WrongManifestProfile),
     }
+}
+
+fn receive_controller_status<S: InitPlatform>(
+    system: &mut S,
+    channel: DwHandle,
+) -> Result<ControllerMessage, InitError> {
+    let mut bytes = [0u8; wyrmroot_device_proto::controller::STATUS_BYTES];
+    let mut handles = [DwReceivedHandleInfoV1::default(); 1];
+    let counts = system
+        .receive_channel(channel, &mut bytes, &mut handles)
+        .map_err(InitError::Native)?;
+    if counts.handles != 0 {
+        let mut cleanup_failed = false;
+        for info in handles.iter().take(counts.handles.min(handles.len())).rev() {
+            cleanup_failed |= system.close_handle(info.handle).is_err();
+        }
+        return Err(if cleanup_failed {
+            InitError::Cleanup
+        } else {
+            InitError::WrongManifestProfile
+        });
+    }
+    if counts.bytes != bytes.len() {
+        return Err(InitError::WrongManifestProfile);
+    }
+    parse_controller(&bytes).map_err(|_| InitError::WrongManifestProfile)
 }
 
 fn expect_device_status<S, W>(
@@ -730,14 +799,6 @@ where
     if observed.index != 0 || observed.observed.0 & DW_SIGNAL_READABLE.0 == 0 {
         return Err(InitError::Supervision);
     }
-    let mut bytes = [0u8; wyrmroot_device_proto::controller::STATUS_BYTES];
-    let mut handles = [DwReceivedHandleInfoV1::default(); 1];
-    let counts = system
-        .receive_channel(devmgr.loaded.launch_channel, &mut bytes, &mut handles)
-        .map_err(InitError::Native)?;
-    if counts.bytes != bytes.len() || counts.handles != 0 {
-        return Err(InitError::WrongManifestProfile);
-    }
     let expected = ControllerMessage::Status {
         supervisor_generation: SupervisorGeneration(devmgr.generation),
         binding: Some(binding),
@@ -745,7 +806,7 @@ where
         status: expected_status,
         attempt_generation: None,
     };
-    if parse_controller(&bytes).map_err(|_| InitError::WrongManifestProfile)? != expected {
+    if receive_controller_status(system, devmgr.loaded.launch_channel)? != expected {
         return Err(InitError::WrongManifestProfile);
     }
     Ok(())
@@ -773,24 +834,38 @@ where
         .wyr1c
         .as_ref()
         .ok_or(InitError::WrongActivationOrder)?;
-    let observed = system.wait_many(
-        &[
-            DwWaitItemV1 {
-                handle: state.registry.control_channel,
-                signals: DW_SIGNAL_PEER_CLOSED,
-            },
-            DwWaitItemV1 {
-                handle: state.registry.active.loaded.process,
-                signals: DW_SIGNAL_EXITED,
-            },
-        ],
-        DwDeadline(now_ns),
-    );
+    let Some(devmgr) = state.devmgr else {
+        resident.result = RecoveryResult::Degraded;
+        return Ok(resident.controller.mode());
+    };
+    let mut items = [DwWaitItemV1::default(); 4];
+    items[0] = DwWaitItemV1 {
+        handle: devmgr.loaded.process,
+        signals: DW_SIGNAL_EXITED,
+    };
+    items[1] = DwWaitItemV1 {
+        handle: devmgr.loaded.launch_channel,
+        signals: deepwyrm_syscall::DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+    };
+    let item_count = if let Some(registry) = state.registry {
+        items[2] = DwWaitItemV1 {
+            handle: registry.control_channel,
+            signals: DW_SIGNAL_PEER_CLOSED,
+        };
+        items[3] = DwWaitItemV1 {
+            handle: registry.active.loaded.process,
+            signals: DW_SIGNAL_EXITED,
+        };
+        4
+    } else {
+        2
+    };
+    let observed = system.wait_many(&items[..item_count], DwDeadline(now_ns));
     match observed {
         Err(NativeError::Status(status)) if status == DW_STATUS_TIMED_OUT => {}
         Err(error) => return Err(InitError::Native(error)),
-        Ok(result) if result.index > 1 => return Err(InitError::Supervision),
-        Ok(_) => {
+        Ok(result) => {
+            let event = classify_resident_poll(result, item_count)?;
             let size = system
                 .query_memory_object_size(resident.authority.bootfs)
                 .map_err(InitError::Native)?;
@@ -802,8 +877,48 @@ where
                     resident.authority.parent_root,
                     resident.authority.bootfs,
                     plan,
-                    |system, bootfs| {
-                        rebind_after_registry_restart(resident, system, loader, waits, bootfs)
+                    |system, bootfs| match event {
+                        ResidentPollEvent::DevmgrExited | ResidentPollEvent::DevmgrControlLost => {
+                            recover_devmgr(resident, system, loader, waits, bootfs)
+                        }
+                        ResidentPollEvent::WaitingForRegistry => {
+                            let state = resident
+                                .wyr1c
+                                .as_ref()
+                                .ok_or(InitError::WrongActivationOrder)?;
+                            let devmgr = state.devmgr.ok_or(InitError::WrongActivationOrder)?;
+                            let duplicate =
+                                state.registry.is_none() && state.waiting_registry_observed;
+                            let status = receive_waiting_for_registry(
+                                system,
+                                devmgr,
+                                devmgr.generation,
+                                state.last_controller_transaction,
+                            );
+                            if duplicate || status.is_err() {
+                                return recover_devmgr_after_error(
+                                    resident,
+                                    system,
+                                    loader,
+                                    waits,
+                                    bootfs,
+                                    status.err().unwrap_or(InitError::WrongManifestProfile),
+                                );
+                            }
+                            if state.registry.is_some() {
+                                recover_registry(resident, system, loader, waits, bootfs, true)
+                            } else {
+                                resident
+                                    .wyr1c
+                                    .as_mut()
+                                    .ok_or(InitError::WrongActivationOrder)?
+                                    .waiting_registry_observed = true;
+                                Ok(())
+                            }
+                        }
+                        ResidentPollEvent::RegistryLost => {
+                            recover_registry(resident, system, loader, waits, bootfs, false)
+                        }
                     },
                 )
                 .map_err(InitError::Native)??;
@@ -812,7 +927,115 @@ where
     Ok(resident.controller.mode())
 }
 
-fn rebind_after_registry_restart<S, L, W>(
+fn recover_registry<S, L, W>(
+    resident: &mut ResidentSystemInit,
+    system: &mut S,
+    loader: &mut L,
+    waits: &mut W,
+    bootfs: &[u8],
+    status_already_consumed: bool,
+) -> Result<(), InitError>
+where
+    S: Wyr1BPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let registry = resident
+        .wyr1c
+        .as_mut()
+        .ok_or(InitError::WrongActivationOrder)?
+        .registry
+        .take()
+        .ok_or(InitError::WrongActivationOrder)?;
+    resident.active[0] = None;
+    resident
+        .wyr1c
+        .as_mut()
+        .ok_or(InitError::WrongActivationOrder)?
+        .binding = None;
+    let exhausted =
+        poison_registry_generation(system, waits, &mut resident.controller, registry, false)?;
+    let step = registry_recovery_step(exhausted, status_already_consumed);
+    match step {
+        RegistryRecoveryStep::Degraded => {
+            resident.result = RecoveryResult::Degraded;
+            return Ok(());
+        }
+        RegistryRecoveryStep::Restart | RegistryRecoveryStep::AwaitStatus => {}
+    }
+    let replacement = launch_registry_until_ready(
+        system,
+        loader,
+        waits,
+        &mut resident.controller,
+        resident.authority,
+        bootfs,
+    )?;
+    let Some(replacement) = replacement else {
+        resident.result = RecoveryResult::Degraded;
+        return Ok(());
+    };
+    let replacement = restart_topology_or_poison(
+        system,
+        waits,
+        &mut resident.controller,
+        &mut resident
+            .wyr1c
+            .as_mut()
+            .ok_or(InitError::WrongActivationOrder)?
+            .topology,
+        replacement,
+    )?;
+    resident
+        .wyr1c
+        .as_mut()
+        .ok_or(InitError::WrongActivationOrder)?
+        .registry = Some(replacement);
+    resident.active[0] = Some(replacement.active);
+    if step == RegistryRecoveryStep::AwaitStatus {
+        let state = resident
+            .wyr1c
+            .as_ref()
+            .ok_or(InitError::WrongActivationOrder)?;
+        let devmgr = state.devmgr.ok_or(InitError::WrongActivationOrder)?;
+        if let Err(error) = await_waiting_for_registry(
+            system,
+            waits,
+            devmgr,
+            devmgr.generation,
+            state.last_controller_transaction,
+        ) {
+            return recover_devmgr_after_error(resident, system, loader, waits, bootfs, error);
+        }
+    }
+    resident
+        .wyr1c
+        .as_mut()
+        .ok_or(InitError::WrongActivationOrder)?
+        .waiting_registry_observed = true;
+    if let Err(error) = rebind_publication(resident, system, waits) {
+        return recover_devmgr_after_error(resident, system, loader, waits, bootfs, error);
+    }
+    Ok(())
+}
+
+fn recover_devmgr_after_error<S, L, W>(
+    resident: &mut ResidentSystemInit,
+    system: &mut S,
+    loader: &mut L,
+    waits: &mut W,
+    bootfs: &[u8],
+    _error: InitError,
+) -> Result<(), InitError>
+where
+    S: Wyr1BPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    recover_devmgr(resident, system, loader, waits, bootfs)
+}
+
+fn recover_devmgr<S, L, W>(
     resident: &mut ResidentSystemInit,
     system: &mut S,
     loader: &mut L,
@@ -824,46 +1047,245 @@ where
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
-    let state = resident
+    let active = resident
         .wyr1c
         .as_mut()
+        .ok_or(InitError::WrongActivationOrder)?
+        .devmgr
+        .take()
         .ok_or(InitError::WrongActivationOrder)?;
-    if poison_registry_generation(
+    resident.active[1] = None;
+    {
+        let state = resident
+            .wyr1c
+            .as_mut()
+            .ok_or(InitError::WrongActivationOrder)?;
+        state.binding = None;
+        state.waiting_registry_observed = false;
+    }
+    let now = system.now().map_err(InitError::Native)?;
+    let transition = resident.controller.fail(
+        RoleId::Devmgr,
+        active.generation,
+        active.transaction_id,
+        now,
+        AttemptFailure::WaitFailed,
+    );
+    let cleanup_failed =
+        cleanup_loaded(system, waits, active.loaded, active.task_group, true).is_err();
+    if let Err(error) = transition {
+        let disposition = if cleanup_failed {
+            CleanupDisposition::Failed
+        } else {
+            CleanupDisposition::Complete
+        };
+        resident.controller.retire_active_fail_closed(
+            RoleId::Devmgr,
+            active.generation,
+            active.transaction_id,
+            now,
+            AttemptFailure::WaitFailed,
+            disposition,
+        )?;
+        resident.result = RecoveryResult::Degraded;
+        return if cleanup_failed {
+            Err(InitError::Cleanup)
+        } else {
+            Err(error)
+        };
+    }
+    let retired_at = now.checked_add(1).ok_or(InitError::Accounting)?;
+    if cleanup_failed {
+        resident.controller.cleanup_failed(
+            RoleId::Devmgr,
+            active.generation,
+            active.transaction_id,
+            retired_at,
+        )?;
+        resident.result = RecoveryResult::Degraded;
+        return Ok(());
+    }
+    resident.controller.cleanup_complete(
+        RoleId::Devmgr,
+        active.generation,
+        active.transaction_id,
+        retired_at,
+    )?;
+    if advance_or_degrade(
         system,
-        waits,
         &mut resident.controller,
-        state.registry,
-        false,
+        RoleId::Devmgr,
+        active.transaction_id,
     )? {
         resident.result = RecoveryResult::Degraded;
         return Ok(());
     }
-    let replacement = launch_registry_until_ready(
+    launch_devmgr_replacement(resident, system, loader, waits, bootfs)
+}
+
+fn launch_devmgr_replacement<S, L, W>(
+    resident: &mut ResidentSystemInit,
+    system: &mut S,
+    loader: &mut L,
+    waits: &mut W,
+    bootfs: &[u8],
+) -> Result<(), InitError>
+where
+    S: Wyr1BPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let manifest_entry = Archive::new(bootfs)
+        .map_err(InitError::Bootfs)?
+        .lookup(DEVICE_MANIFEST_PATH.as_bytes())
+        .map_err(map_lookup)?;
+    loop {
+        let attempt_transaction = match resident
+            .controller
+            .role_state(RoleId::Devmgr)
+            .ok_or(InitError::WrongActivationOrder)?
+        {
+            RestartState::Starting { transaction_id, .. } => transaction_id,
+            _ => return Err(InitError::WrongActivationOrder),
+        };
+        let registry = resident.wyr1c.as_ref().and_then(|state| state.registry);
+        let Some(registry) = registry else {
+            resident.result = RecoveryResult::Degraded;
+            return Ok(());
+        };
+        let attempt = {
+            let state = resident
+                .wyr1c
+                .as_mut()
+                .ok_or(InitError::WrongActivationOrder)?;
+            launch_devmgr(
+                system,
+                loader,
+                waits,
+                &mut resident.controller,
+                resident.authority,
+                bootfs,
+                registry,
+                &mut state.topology,
+                manifest_entry.data(),
+            )
+        };
+        match attempt {
+            Ok(attempt) => {
+                let state = resident
+                    .wyr1c
+                    .as_mut()
+                    .ok_or(InitError::WrongActivationOrder)?;
+                state.devmgr = Some(attempt.active);
+                state.binding = Some(attempt.binding);
+                state.last_controller_transaction = attempt.last_controller_transaction;
+                state.next_controller_transaction = attempt.next_controller_transaction;
+                state.waiting_registry_observed = false;
+                resident.active[1] = Some(attempt.active);
+                return Ok(());
+            }
+            Err(error) => {
+                let (generation, transaction_id) = match resident
+                    .controller
+                    .role_state(RoleId::Devmgr)
+                    .ok_or(InitError::WrongActivationOrder)?
+                {
+                    RestartState::Starting {
+                        generation,
+                        transaction_id,
+                        ..
+                    } => (generation, transaction_id),
+                    RestartState::Backoff { .. } => {
+                        if advance_or_degrade(
+                            system,
+                            &mut resident.controller,
+                            RoleId::Devmgr,
+                            attempt_transaction,
+                        )? {
+                            resident.result = RecoveryResult::Degraded;
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                    RestartState::PermanentFailure { .. } => {
+                        resident.result = RecoveryResult::Degraded;
+                        return Ok(());
+                    }
+                    _ => return Err(error),
+                };
+                let failed_at = system.now().map_err(InitError::Native)?;
+                resident.controller.fail(
+                    RoleId::Devmgr,
+                    generation,
+                    transaction_id,
+                    failed_at,
+                    AttemptFailure::CreationFailed,
+                )?;
+                resident.controller.cleanup_complete(
+                    RoleId::Devmgr,
+                    generation,
+                    transaction_id,
+                    failed_at.checked_add(1).ok_or(InitError::Accounting)?,
+                )?;
+                if advance_or_degrade(
+                    system,
+                    &mut resident.controller,
+                    RoleId::Devmgr,
+                    transaction_id,
+                )? {
+                    resident.result = RecoveryResult::Degraded;
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+fn rebind_publication<S, W>(
+    resident: &mut ResidentSystemInit,
+    system: &mut S,
+    waits: &mut W,
+) -> Result<(), InitError>
+where
+    S: Wyr1BPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let state = resident
+        .wyr1c
+        .as_mut()
+        .ok_or(InitError::WrongActivationOrder)?;
+    let registry = state.registry.ok_or(InitError::WrongActivationOrder)?;
+    let devmgr = state.devmgr.ok_or(InitError::WrongActivationOrder)?;
+    let (binding, transaction_id) = perform_rebind(
         system,
-        loader,
         waits,
-        &mut resident.controller,
-        resident.authority,
-        bootfs,
-    )?
-    .ok_or(InitError::WrongActivationOrder)?;
-    state.registry = restart_topology_or_poison(
-        system,
-        waits,
-        &mut resident.controller,
-        &mut state._topology,
-        replacement,
+        &mut state.topology,
+        registry.control_channel,
+        devmgr,
+        state.next_controller_transaction,
     )?;
-    await_waiting_for_registry(
-        system,
-        waits,
-        state.devmgr,
-        state.devmgr.generation,
-        state.last_controller_transaction,
-    )?;
-    let grant = state
-        ._topology
-        .issue(state.devmgr.generation, EndpointKind::Publication)
+    state.binding = Some(binding);
+    state.waiting_registry_observed = false;
+    state.last_controller_transaction = transaction_id;
+    state.next_controller_transaction =
+        transaction_id.checked_add(1).ok_or(InitError::Accounting)?;
+    Ok(())
+}
+
+fn perform_rebind<S, W>(
+    system: &mut S,
+    waits: &mut W,
+    topology: &mut RegistryTopology,
+    registry_control: DwHandle,
+    devmgr: ActiveNativeRole,
+    transaction_id: u64,
+) -> Result<(wyrmroot_device_proto::RegistryBinding, u64), InitError>
+where
+    S: Wyr1BPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let grant = topology
+        .issue(devmgr.generation, EndpointKind::Publication)
         .map_err(InitError::Wyr1BModel)?;
     let binding = wyrmroot_device_proto::RegistryBinding {
         generation: RegistryGeneration(grant.registry_generation),
@@ -873,12 +1295,7 @@ where
         },
     };
     let (registry_endpoint, devmgr_endpoint) = create_controller_channel_pair(system)?;
-    if let Err(error) = install_publication(
-        system,
-        state.registry.control_channel,
-        grant,
-        registry_endpoint,
-    ) {
+    if let Err(error) = install_publication(system, registry_control, grant, registry_endpoint) {
         let cleanup_failed = system.close_handle(devmgr_endpoint).is_err()
             | system.close_handle(registry_endpoint).is_err();
         return Err(if cleanup_failed {
@@ -888,12 +1305,18 @@ where
         });
     }
     let request = ControllerMessage::RebindPublication {
-        supervisor_generation: SupervisorGeneration(state.devmgr.generation),
+        supervisor_generation: SupervisorGeneration(devmgr.generation),
         binding,
-        transaction_id: state.next_controller_transaction,
+        transaction_id,
     };
     let mut bytes = [0u8; wyrmroot_device_proto::controller::INSTALL_BYTES];
-    encode_controller(request, &mut bytes).map_err(|_| InitError::WrongManifestProfile)?;
+    if encode_controller(request, &mut bytes).is_err() {
+        return Err(if system.close_handle(devmgr_endpoint).is_err() {
+            InitError::Cleanup
+        } else {
+            InitError::WrongManifestProfile
+        });
+    }
     let transfer = DwHandleTransferV1 {
         handle: devmgr_endpoint,
         requested_rights: wyrmroot_loader::launch::CHILD_CHANNEL_RIGHTS,
@@ -903,49 +1326,399 @@ where
     };
     if let Err(error) = system
         .send_channel_with_handles(
-            state.devmgr.loaded.launch_channel,
+            devmgr.loaded.launch_channel,
             &bytes,
             core::slice::from_ref(&transfer),
         )
         .map_err(InitError::Native)
     {
         let cleanup_failed = system.close_handle(devmgr_endpoint).is_err();
-        let poison = poison_registry_generation(
-            system,
-            waits,
-            &mut resident.controller,
-            state.registry,
-            cleanup_failed,
-        );
-        return Err(poison.err().unwrap_or(if cleanup_failed {
+        return Err(if cleanup_failed {
             InitError::Cleanup
         } else {
             error
-        }));
+        });
     }
-    if let Err(error) = expect_device_status(
+    expect_device_status(
         system,
         waits,
-        state.devmgr,
+        devmgr,
         binding,
-        state.next_controller_transaction,
+        transaction_id,
         StatusCode::OperationalWaitingForDeviceBundle,
-    ) {
-        let poison = poison_registry_generation(
-            system,
-            waits,
-            &mut resident.controller,
-            state.registry,
-            false,
-        );
-        return Err(poison.err().unwrap_or(error));
+    )?;
+    Ok((binding, transaction_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deepwyrm_syscall::{DW_SIGNAL_EXITED, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DwStatus};
+    use wyrmroot_device_proto::manifest::{
+        HEADER_BYTES as WRDM_HEADER_BYTES, MAGIC as WRDM_MAGIC, MAJOR as WRDM_MAJOR,
+        MINOR as WRDM_MINOR, PROFILE_Q35, PROFILE_Q35_VERSION, RECORD_BYTES as WRDM_RECORD_BYTES,
+        UART16550D_PATH,
+    };
+
+    const FAILURE: NativeError = NativeError::Status(DwStatus(-1));
+
+    struct RebindPlatform {
+        inbound: [u8; wyrmroot_device_proto::controller::STATUS_BYTES],
+        inbound_len: usize,
+        send_count: usize,
+        fail_send_at: usize,
+        closed: [DwHandle; 4],
+        close_count: usize,
     }
-    state.binding = binding;
-    state.last_controller_transaction = state.next_controller_transaction;
-    state.next_controller_transaction = state
-        .next_controller_transaction
-        .checked_add(1)
-        .ok_or(InitError::Accounting)?;
-    resident.active = [Some(state.registry.active), Some(state.devmgr)];
-    Ok(())
+
+    impl RebindPlatform {
+        fn with_status(message: ControllerMessage) -> Self {
+            let mut inbound = [0; wyrmroot_device_proto::controller::STATUS_BYTES];
+            encode_controller(message, &mut inbound).unwrap();
+            Self {
+                inbound,
+                inbound_len: wyrmroot_device_proto::controller::STATUS_BYTES,
+                send_count: 0,
+                fail_send_at: usize::MAX,
+                closed: [DwHandle(0); 4],
+                close_count: 0,
+            }
+        }
+    }
+
+    impl InitPlatform for RebindPlatform {
+        fn query_capability_info(
+            &mut self,
+            _handle: DwHandle,
+        ) -> Result<CapabilityInfo<DwObjectType, DwRights>, NativeError> {
+            Err(FAILURE)
+        }
+
+        fn receive_channel(
+            &mut self,
+            _channel: DwHandle,
+            bytes: &mut [u8],
+            _handles: &mut [DwReceivedHandleInfoV1],
+        ) -> Result<ReceiveCounts, NativeError> {
+            if self.inbound_len == 0 {
+                return Err(FAILURE);
+            }
+            bytes[..self.inbound_len].copy_from_slice(&self.inbound[..self.inbound_len]);
+            let counts = ReceiveCounts {
+                bytes: self.inbound_len,
+                handles: 0,
+            };
+            self.inbound_len = 0;
+            Ok(counts)
+        }
+
+        fn query_memory_object_size(&mut self, _handle: DwHandle) -> Result<u64, NativeError> {
+            Err(FAILURE)
+        }
+
+        fn with_bootfs_bytes<R>(
+            &mut self,
+            _root: DwHandle,
+            _bootfs: DwHandle,
+            _plan: MappingPlan,
+            _use_bytes: impl for<'a> FnOnce(&mut Self, &'a [u8]) -> R,
+        ) -> Result<R, NativeError> {
+            Err(FAILURE)
+        }
+
+        fn send_channel(&mut self, _channel: DwHandle, _bytes: &[u8]) -> Result<(), NativeError> {
+            Err(FAILURE)
+        }
+
+        fn close_handle(&mut self, handle: DwHandle) -> Result<(), NativeError> {
+            self.closed[self.close_count] = handle;
+            self.close_count += 1;
+            Ok(())
+        }
+
+        fn create_attempt_task_group(
+            &mut self,
+            _parent: DwHandle,
+        ) -> Result<DwHandle, NativeError> {
+            Err(FAILURE)
+        }
+
+        fn terminate_task_group(&mut self, _task_group: DwHandle) -> Result<(), NativeError> {
+            Err(FAILURE)
+        }
+
+        fn now(&mut self) -> Result<u64, NativeError> {
+            Ok(100)
+        }
+
+        fn wait_until(&mut self, _deadline_ns: u64) -> Result<(), NativeError> {
+            Err(FAILURE)
+        }
+    }
+
+    impl Wyr1BPlatform for RebindPlatform {
+        fn channel_create(
+            &mut self,
+            _rights: DwRights,
+        ) -> Result<(DwHandle, DwHandle), NativeError> {
+            Ok((DwHandle(50), DwHandle(51)))
+        }
+
+        fn send_channel_with_handles(
+            &mut self,
+            _channel: DwHandle,
+            _bytes: &[u8],
+            _transfers: &[DwHandleTransferV1],
+        ) -> Result<(), NativeError> {
+            self.send_count += 1;
+            if self.send_count == self.fail_send_at {
+                Err(FAILURE)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn wait_many(
+            &mut self,
+            _items: &[DwWaitItemV1],
+            _deadline: DwDeadline,
+        ) -> Result<DwWaitResultV1, NativeError> {
+            Err(FAILURE)
+        }
+
+        fn materialize_read_only_memory(
+            &mut self,
+            _root: DwHandle,
+            _bytes: &[u8],
+            _rights: DwRights,
+        ) -> Result<DwHandle, NativeError> {
+            Err(FAILURE)
+        }
+    }
+
+    struct StatusWaits {
+        fail: bool,
+    }
+
+    impl SupervisionPlatform for StatusWaits {
+        type Error = NativeError;
+
+        fn wait_many(
+            &mut self,
+            _items: &[DwWaitItemV1],
+            _deadline: DwDeadline,
+        ) -> Result<DwWaitResultV1, Self::Error> {
+            if self.fail {
+                Err(FAILURE)
+            } else {
+                Ok(DwWaitResultV1 {
+                    index: 0,
+                    observed: DW_SIGNAL_READABLE,
+                    ..DwWaitResultV1::default()
+                })
+            }
+        }
+
+        fn receive_channel(
+            &mut self,
+            _channel: DwHandle,
+            _bytes: &mut [u8],
+            _handles: &mut [DwReceivedHandleInfoV1],
+        ) -> Result<ReceiveCounts, Self::Error> {
+            Err(FAILURE)
+        }
+
+        fn query_task_termination(
+            &mut self,
+            _process: DwHandle,
+        ) -> Result<DwTaskTerminationInfoV1, Self::Error> {
+            Err(FAILURE)
+        }
+    }
+
+    const fn devmgr() -> ActiveNativeRole {
+        ActiveNativeRole {
+            role: RoleId::Devmgr,
+            generation: 7,
+            transaction_id: 8,
+            loaded: LoadedProcess {
+                process: DwHandle(20),
+                launch_channel: DwHandle(30),
+            },
+            task_group: DwHandle(10),
+        }
+    }
+
+    fn binding() -> wyrmroot_device_proto::RegistryBinding {
+        wyrmroot_device_proto::RegistryBinding {
+            generation: RegistryGeneration(2),
+            endpoint: RegistryEndpoint {
+                id: RegistryEndpointId(1),
+                generation: RegistryEndpointGeneration(1),
+            },
+        }
+    }
+
+    fn waiting_device_status() -> ControllerMessage {
+        ControllerMessage::Status {
+            supervisor_generation: SupervisorGeneration(7),
+            binding: Some(binding()),
+            transaction_id: 9,
+            status: StatusCode::OperationalWaitingForDeviceBundle,
+            attempt_generation: None,
+        }
+    }
+
+    #[test]
+    fn successful_rebind_preserves_devmgr_generation_and_commits_correlation() {
+        let mut platform = RebindPlatform::with_status(waiting_device_status());
+        let mut waits = StatusWaits { fail: false };
+        let mut topology = RegistryTopology::new(2).unwrap();
+        let result = perform_rebind(
+            &mut platform,
+            &mut waits,
+            &mut topology,
+            DwHandle(40),
+            devmgr(),
+            9,
+        )
+        .unwrap();
+        assert_eq!(result, (binding(), 9));
+        assert_eq!(platform.send_count, 2);
+        assert_eq!(platform.close_count, 0);
+        assert_eq!(devmgr().generation, 7);
+    }
+
+    #[test]
+    fn failed_rebind_send_closes_only_the_unmoved_devmgr_endpoint() {
+        let mut platform = RebindPlatform::with_status(waiting_device_status());
+        platform.fail_send_at = 2;
+        let error = perform_rebind(
+            &mut platform,
+            &mut StatusWaits { fail: false },
+            &mut RegistryTopology::new(2).unwrap(),
+            DwHandle(40),
+            devmgr(),
+            9,
+        )
+        .unwrap_err();
+        assert_eq!(error, InitError::Native(FAILURE));
+        assert_eq!(&platform.closed[..platform.close_count], &[DwHandle(51)]);
+    }
+
+    #[test]
+    fn failed_rebind_status_is_reported_after_both_moves_commit() {
+        let mut platform = RebindPlatform::with_status(waiting_device_status());
+        let error = perform_rebind(
+            &mut platform,
+            &mut StatusWaits { fail: true },
+            &mut RegistryTopology::new(2).unwrap(),
+            DwHandle(40),
+            devmgr(),
+            9,
+        )
+        .unwrap_err();
+        assert_eq!(error, InitError::Native(FAILURE));
+        assert_eq!(platform.send_count, 2);
+        assert_eq!(platform.close_count, 0);
+    }
+
+    #[test]
+    fn publication_peer_close_status_requires_exact_generation_and_transaction() {
+        let message = ControllerMessage::Status {
+            supervisor_generation: SupervisorGeneration(7),
+            binding: None,
+            transaction_id: 8,
+            status: StatusCode::OperationalWaitingForRegistry,
+            attempt_generation: None,
+        };
+        let mut platform = RebindPlatform::with_status(message);
+        receive_waiting_for_registry(&mut platform, devmgr(), 7, 8).unwrap();
+
+        let mut stale = RebindPlatform::with_status(message);
+        assert_eq!(
+            receive_waiting_for_registry(&mut stale, devmgr(), 7, 9),
+            Err(InitError::WrongManifestProfile)
+        );
+    }
+
+    #[test]
+    fn resident_poll_distinguishes_devmgr_and_registry_failures() {
+        let event = |index, observed| {
+            classify_resident_poll(
+                DwWaitResultV1 {
+                    index,
+                    observed,
+                    ..DwWaitResultV1::default()
+                },
+                4,
+            )
+            .unwrap()
+        };
+        assert_eq!(event(0, DW_SIGNAL_EXITED), ResidentPollEvent::DevmgrExited);
+        assert_eq!(
+            event(1, DW_SIGNAL_PEER_CLOSED),
+            ResidentPollEvent::DevmgrControlLost
+        );
+        assert_eq!(
+            event(1, DW_SIGNAL_READABLE),
+            ResidentPollEvent::WaitingForRegistry
+        );
+        assert_eq!(
+            event(2, DW_SIGNAL_PEER_CLOSED),
+            ResidentPollEvent::RegistryLost
+        );
+        assert_eq!(event(3, DW_SIGNAL_EXITED), ResidentPollEvent::RegistryLost);
+    }
+
+    #[test]
+    fn registry_exhaustion_enters_degraded_without_a_stale_status_wait() {
+        assert_eq!(
+            registry_recovery_step(true, false),
+            RegistryRecoveryStep::Degraded
+        );
+        assert_eq!(
+            registry_recovery_step(false, false),
+            RegistryRecoveryStep::AwaitStatus
+        );
+        assert_eq!(
+            registry_recovery_step(false, true),
+            RegistryRecoveryStep::Restart
+        );
+    }
+
+    fn wrdm(identity: [u8; 32]) -> [u8; WRDM_HEADER_BYTES + WRDM_RECORD_BYTES] {
+        let mut out = [0; WRDM_HEADER_BYTES + WRDM_RECORD_BYTES];
+        out[..4].copy_from_slice(&WRDM_MAGIC);
+        out[4..6].copy_from_slice(&WRDM_MAJOR.to_le_bytes());
+        out[6..8].copy_from_slice(&WRDM_MINOR.to_le_bytes());
+        let total = out.len() as u32;
+        out[8..12].copy_from_slice(&total.to_le_bytes());
+        out[12..14].copy_from_slice(&1u16.to_le_bytes());
+        out[16..20].copy_from_slice(&PROFILE_Q35.0.to_le_bytes());
+        out[20..24].copy_from_slice(&PROFILE_Q35_VERSION.0.to_le_bytes());
+        let base = WRDM_HEADER_BYTES;
+        out[base..base + 8].copy_from_slice(&1u64.to_le_bytes());
+        out[base + 8..base + 12].copy_from_slice(&2u32.to_le_bytes());
+        out[base + 12..base + 16].copy_from_slice(&1u32.to_le_bytes());
+        out[base + 16..base + 18].copy_from_slice(&0x2f8u16.to_le_bytes());
+        out[base + 18..base + 20].copy_from_slice(&8u16.to_le_bytes());
+        out[base + 20..base + 24].copy_from_slice(&3u32.to_le_bytes());
+        out[base + 24..base + 26].copy_from_slice(&(UART16550D_PATH.len() as u16).to_le_bytes());
+        out[base + 28..base + 60].copy_from_slice(&identity);
+        out[base + 60..base + 64].copy_from_slice(&1u32.to_le_bytes());
+        out[base + 72..base + 72 + UART16550D_PATH.len()].copy_from_slice(UART16550D_PATH);
+        out
+    }
+
+    #[test]
+    fn wrdm_uart_identity_must_match_the_independent_wrrm_identity() {
+        let bytes = wrdm([7; 32]);
+        let manifest = DeviceManifest::parse(&bytes).unwrap();
+        validate_device_identity(manifest, [7; 32]).unwrap();
+        assert_eq!(
+            validate_device_identity(manifest, [8; 32]),
+            Err(InitError::WrongManifestProfile)
+        );
+    }
 }
