@@ -101,6 +101,10 @@ pub struct Wyr1aProductProfile<'a> {
 /// its reached resident bootstrap profile.
 pub type Wyr1bProductProfile<'a> = Wyr1aProductProfile<'a>;
 
+/// WYR1-C1 retains the WYR1-B registry profile and closure while assigning
+/// devmgr its distinct resident device-coordinator startup profile.
+pub type Wyr1cProductProfile<'a> = Wyr1aProductProfile<'a>;
+
 impl<'a> Manifest<'a> {
     /// Parses structural WRRM v1 and then applies the exact initial WYR1-A
     /// product role graph, external receipts, and retained-material closure.
@@ -122,7 +126,7 @@ impl<'a> Manifest<'a> {
         profile: Wyr1aProductProfile<'_>,
     ) -> Result<(), ProductError> {
         validate_receipts(profile.receipts)?;
-        self.validate_product_roles(StartupProfile::EarlyBootStub)?;
+        self.validate_product_roles(StartupProfile::EarlyBootStub, StartupProfile::EarlyBootStub)?;
         self.validate_product_role_edges()?;
         self.validate_expected_closure(profile.expected_closure)?;
         validate_observed_materials(profile.expected_closure, profile.observed_materials)
@@ -144,13 +148,50 @@ impl<'a> Manifest<'a> {
         profile: Wyr1bProductProfile<'_>,
     ) -> Result<(), ProductError> {
         validate_receipts(profile.receipts)?;
-        self.validate_product_roles(StartupProfile::BootstrapRegistry)?;
+        self.validate_product_roles(
+            StartupProfile::BootstrapRegistry,
+            StartupProfile::EarlyBootStub,
+        )?;
         self.validate_product_role_edges()?;
         self.validate_expected_closure(profile.expected_closure)?;
         validate_observed_materials(profile.expected_closure, profile.observed_materials)
     }
 
-    fn validate_product_roles(self, registry_profile: StartupProfile) -> Result<(), ProductError> {
+    /// Parses structural WRRM v1 and then applies the exact WYR1-C1 product
+    /// role graph, external receipts, and retained-material closure.
+    pub fn parse_wyr1c_product(
+        bytes: &'a [u8],
+        expected_boot_generation: &[u8; 32],
+        profile: Wyr1cProductProfile<'_>,
+    ) -> Result<Self, ProductError> {
+        let manifest = Self::parse_structural(bytes, expected_boot_generation)
+            .map_err(ProductError::StructuralParse)?;
+        manifest.validate_wyr1c_product(profile)?;
+        Ok(manifest)
+    }
+
+    /// Validates the exact WYR1-C1 graph. Registryd retains WYR1-B's
+    /// BootstrapRegistry profile, devmgr gets the new DeviceCoordinator
+    /// profile, and every role edge and retained closure entry stays exact.
+    pub fn validate_wyr1c_product(
+        self,
+        profile: Wyr1cProductProfile<'_>,
+    ) -> Result<(), ProductError> {
+        validate_receipts(profile.receipts)?;
+        self.validate_product_roles(
+            StartupProfile::BootstrapRegistry,
+            StartupProfile::DeviceCoordinator,
+        )?;
+        self.validate_product_role_edges()?;
+        self.validate_expected_closure(profile.expected_closure)?;
+        validate_observed_materials(profile.expected_closure, profile.observed_materials)
+    }
+
+    fn validate_product_roles(
+        self,
+        registry_profile: StartupProfile,
+        devmgr_profile: StartupProfile,
+    ) -> Result<(), ProductError> {
         if self.role_count() != EXPECTED_ROLE_COUNT {
             return Err(ProductError::WrongRoleSet);
         }
@@ -169,7 +210,7 @@ impl<'a> Manifest<'a> {
             }
             let expected_profile = match expected_id {
                 RoleId::Registryd => (Activation::Early, registry_profile),
-                RoleId::Devmgr => (Activation::Early, StartupProfile::EarlyBootStub),
+                RoleId::Devmgr => (Activation::Early, devmgr_profile),
                 RoleId::Uart16550d => (Activation::DeviceBound, StartupProfile::Retained),
                 RoleId::Consoled | RoleId::Wyrmsh => {
                     (Activation::ConsoleBound, StartupProfile::Retained)

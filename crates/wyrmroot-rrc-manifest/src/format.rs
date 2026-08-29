@@ -86,6 +86,9 @@ pub enum StartupProfile {
     Retained = 0,
     EarlyBootStub = 1,
     BootstrapRegistry = 2,
+    /// WYR1-C resident device coordinator. This profile has no hardware
+    /// authority; its exact startup capabilities are owned by WRLP.
+    DeviceCoordinator = 3,
 }
 
 impl StartupProfile {
@@ -94,6 +97,7 @@ impl StartupProfile {
             0 => Ok(Self::Retained),
             1 => Ok(Self::EarlyBootStub),
             2 => Ok(Self::BootstrapRegistry),
+            3 => Ok(Self::DeviceCoordinator),
             _ => Err(ParseError::UnknownStartupProfile),
         }
     }
@@ -781,7 +785,9 @@ fn validate_activation_profile(
         (activation, profile),
         (
             Activation::Early,
-            StartupProfile::EarlyBootStub | StartupProfile::BootstrapRegistry,
+            StartupProfile::EarlyBootStub
+                | StartupProfile::BootstrapRegistry
+                | StartupProfile::DeviceCoordinator,
         ) | (
             Activation::DeviceBound | Activation::ConsoleBound,
             StartupProfile::Retained

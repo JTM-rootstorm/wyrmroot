@@ -120,6 +120,20 @@ fn wyr1b_product_builder() -> Builder<'static> {
     builder
 }
 
+fn wyr1c_product_builder() -> Builder<'static> {
+    let mut builder = Builder::new(BOOT_IDENTITY);
+    let mut roles = product_roles();
+    roles[0].startup_profile = StartupProfile::BootstrapRegistry;
+    roles[1].startup_profile = StartupProfile::DeviceCoordinator;
+    for role in roles {
+        builder.add_role(role).unwrap();
+    }
+    for edge in product_edges() {
+        builder.add_dependency(edge).unwrap();
+    }
+    builder
+}
+
 fn observed_material(path: &'static str, byte: u8) -> ObservedRetainedMaterial<'static> {
     ObservedRetainedMaterial {
         path,
@@ -283,6 +297,98 @@ fn wyr1a_and_wyr1b_registry_profile_matrices_are_distinct() {
             .startup_profile(),
         StartupProfile::EarlyBootStub
     );
+}
+
+#[test]
+fn wyr1c_requires_only_the_two_new_startup_profiles() {
+    let expected = expected_product_closure();
+    let observed = observed_product_materials();
+    let profile = product_profile(&expected, &observed);
+    let c1 = wyr1c_product_builder()
+        .build_wyr1c_product(profile)
+        .unwrap();
+    let parsed = Manifest::parse_wyr1c_product(&c1, &BOOT_IDENTITY, profile).unwrap();
+    assert_eq!(
+        parsed.role(RoleId::Registryd).unwrap().startup_profile(),
+        StartupProfile::BootstrapRegistry
+    );
+    assert_eq!(
+        parsed.role(RoleId::Devmgr).unwrap().startup_profile(),
+        StartupProfile::DeviceCoordinator
+    );
+    assert_eq!(
+        parsed
+            .edges()
+            .map(|edge| (edge.owner(), edge.target_role()))
+            .collect::<Vec<_>>(),
+        product_edges()
+            .into_iter()
+            .map(|edge| (edge.owner, edge.target_role))
+            .collect::<Vec<_>>()
+    );
+
+    let b = wyr1b_product_builder()
+        .build_wyr1b_product(profile)
+        .unwrap();
+    assert_eq!(
+        Manifest::parse_structural(&b, &BOOT_IDENTITY)
+            .unwrap()
+            .validate_wyr1c_product(profile),
+        Err(ProductError::WrongRoleActivationProfile)
+    );
+    let a = product_builder(false).build_wyr1a_product(profile).unwrap();
+    assert_eq!(
+        Manifest::parse_structural(&a, &BOOT_IDENTITY)
+            .unwrap()
+            .validate_wyr1c_product(profile),
+        Err(ProductError::WrongRoleActivationProfile)
+    );
+}
+
+#[test]
+fn wyr1c_rejects_profile_swaps_and_preserves_old_wire_values() {
+    let expected = expected_product_closure();
+    let observed = observed_product_materials();
+    let profile = product_profile(&expected, &observed);
+    let mut c1 = wyr1c_product_builder()
+        .build_wyr1c_product(profile)
+        .unwrap();
+
+    // The new value is distinct from every retained profile, while the old
+    // values remain exactly the values used by the historical golden.
+    assert_eq!(StartupProfile::Retained as u16, 0);
+    assert_eq!(StartupProfile::EarlyBootStub as u16, 1);
+    assert_eq!(StartupProfile::BootstrapRegistry as u16, 2);
+    assert_eq!(StartupProfile::DeviceCoordinator as u16, 3);
+
+    // Swapping either role's profile is rejected by the exact C1 product
+    // validator even though both bytes are structurally valid.
+    write_u16(
+        &mut c1,
+        HEADER_SIZE + 14,
+        StartupProfile::EarlyBootStub as u16,
+    );
+    let parsed = Manifest::parse_structural(&c1, &BOOT_IDENTITY).unwrap();
+    assert_eq!(
+        parsed.validate_wyr1c_product(profile),
+        Err(ProductError::WrongRoleActivationProfile)
+    );
+    let mut c1 = wyr1c_product_builder()
+        .build_wyr1c_product(profile)
+        .unwrap();
+    write_u16(
+        &mut c1,
+        HEADER_SIZE + ROLE_RECORD_SIZE + 14,
+        StartupProfile::BootstrapRegistry as u16,
+    );
+    let parsed = Manifest::parse_structural(&c1, &BOOT_IDENTITY).unwrap();
+    assert_eq!(
+        parsed.validate_wyr1c_product(profile),
+        Err(ProductError::WrongRoleActivationProfile)
+    );
+
+    let historical = product_builder(false).build_wyr1a_product(profile).unwrap();
+    assert_eq!(historical, decode_hex(FULL_FIVE_ROLE_GOLDEN_HEX));
 }
 
 #[test]
@@ -455,7 +561,7 @@ fn role_fields_paths_utf8_reserved_and_identities_fail_closed() {
         Err(ParseError::UnknownActivation)
     );
     let mut unknown_profile = original.clone();
-    write_u16(&mut unknown_profile, HEADER_SIZE + 14, 3);
+    write_u16(&mut unknown_profile, HEADER_SIZE + 14, 4);
     assert_eq!(
         Manifest::parse_structural(&unknown_profile, &BOOT_IDENTITY),
         Err(ParseError::UnknownStartupProfile)

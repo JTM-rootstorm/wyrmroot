@@ -233,6 +233,19 @@ impl<'a> Builder<'a> {
             .map_err(BuildError::InvalidProduct)?;
         Ok(output)
     }
+
+    pub fn build_wyr1c_product(
+        &self,
+        profile: crate::Wyr1cProductProfile<'_>,
+    ) -> Result<Vec<u8>, BuildError> {
+        let output = self.build_structural()?;
+        let manifest = Manifest::parse_structural(&output, &self.boot_generation_identity)
+            .map_err(BuildError::InvalidManifest)?;
+        manifest
+            .validate_wyr1c_product(profile)
+            .map_err(BuildError::InvalidProduct)?;
+        Ok(output)
+    }
 }
 
 /// Why deterministic host construction failed.

@@ -25,6 +25,15 @@ pub const RRC_MANIFEST_PATH: &str = "system/bootstrap/rrc-a-v1";
 pub const GATE_CONFIG_PATH: &str = "system/bootstrap/wyr1-a-gate-v1";
 pub const LAUNCH_POLICY_PATH: &str = "system/bootstrap/launch-policy-v1";
 pub const WYR1_B_GATE_PATH: &str = "system/bootstrap/wyr1-b-gate-v1";
+/// Distinct WYR1-C product marker. This is deliberately separate from the
+/// retained WYR1-A gate and WYR1-B gate entries.
+pub const WYR1_C_MARKER_PATH: &str = "system/bootstrap/wyr1-c-gate-v1";
+/// Fixed immutable WRDM v1 entry consumed by the resident device coordinator.
+pub const WYR1_C_DEVICE_MANIFEST_PATH: &str = "system/bootstrap/wyr1-c-device-manifest-v1";
+/// Short aliases for callers that name the two C1 product-surface entries by
+/// their protocol/product role.
+pub const WYR1_C_GATE_PATH: &str = WYR1_C_MARKER_PATH;
+pub const WRDM_PATH: &str = WYR1_C_DEVICE_MANIFEST_PATH;
 pub const HELLO_PATH: &str = "bin/hello";
 pub const WYR1_B_PUBLISHER_PATH: &str = "test/wyr1-b/publisher";
 pub const WYR1_B_CLIENT_PATH: &str = "test/wyr1-b/client";
@@ -168,6 +177,56 @@ pub fn build_b(product: ProductB<'_>) -> Result<Vec<u8>, BuildError> {
     builder.build()
 }
 
+/// Exact WYR1-C1 product inputs. The base retains the complete WYR1-A
+/// closure; the marker identifies this product generation and the final
+/// read-only entry is the canonical WRDM v1 device-role manifest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProductC1<'a> {
+    pub base: Product<'a>,
+    pub marker: &'a [u8],
+    pub device_manifest: &'a [u8],
+}
+
+impl<'a> ProductC1<'a> {
+    pub fn artifacts(self) -> [Artifact<'a>; 10] {
+        let base = self.base.artifacts();
+        [
+            base[0],
+            base[1],
+            base[2],
+            base[3],
+            base[4],
+            base[5],
+            base[6],
+            base[7],
+            Artifact::read_only(WYR1_C_MARKER_PATH, self.marker),
+            Artifact::read_only(WYR1_C_DEVICE_MANIFEST_PATH, self.device_manifest),
+        ]
+    }
+}
+
+/// Build the deterministic WYR1-C1 archive. The archive builder supplies the
+/// canonical path order and metadata; this layer only fixes product content
+/// membership and rejects empty entries.
+pub fn build_c1(product: ProductC1<'_>) -> Result<Vec<u8>, BuildError> {
+    let mut builder = Builder::new();
+    for artifact in product.artifacts() {
+        if artifact.bytes.is_empty() {
+            return Err(BuildError::EmptyArtifact);
+        }
+        builder.add(
+            artifact.path.as_bytes(),
+            artifact.bytes,
+            if artifact.executable {
+                FileMode::Executable
+            } else {
+                FileMode::ReadOnly
+            },
+        )?;
+    }
+    builder.build()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,6 +307,86 @@ mod tests {
                 .lookup(HELLO_PATH.as_bytes())
                 .unwrap()
                 .is_executable()
+        );
+    }
+
+    #[test]
+    fn wyr1_c1_is_deterministic_and_retains_old_closure() {
+        let product = ProductC1 {
+            base: Product {
+                init: b"init",
+                registryd: b"registry",
+                devmgr: b"devmgr",
+                uart16550d: b"uart",
+                consoled: b"console",
+                wyrmsh: b"shell",
+                rrc_manifest: b"WRRM",
+                gate_config: b"a",
+            },
+            marker: b"WYR1-C1",
+            device_manifest: b"WRDM\x01",
+        };
+        let first = build_c1(product).unwrap();
+        assert_eq!(first, build_c1(product).unwrap());
+        let archive = Archive::new(&first).unwrap();
+        let names: Vec<_> = archive.entries().map(|entry| entry.name()).collect();
+        assert_eq!(
+            names,
+            vec![
+                b"system/bootstrap/rrc-a-v1".as_slice(),
+                b"system/bootstrap/wyr1-a-gate-v1".as_slice(),
+                b"system/bootstrap/wyr1-c-device-manifest-v1".as_slice(),
+                b"system/bootstrap/wyr1-c-gate-v1".as_slice(),
+                b"system/consoled".as_slice(),
+                b"system/devmgr".as_slice(),
+                b"system/init".as_slice(),
+                b"system/registryd".as_slice(),
+                b"system/uart16550d".as_slice(),
+                b"system/wyrmsh".as_slice(),
+            ]
+        );
+        assert!(
+            !archive
+                .lookup(WYR1_C_MARKER_PATH.as_bytes())
+                .unwrap()
+                .is_executable()
+        );
+        assert_eq!(
+            archive
+                .lookup(WYR1_C_DEVICE_MANIFEST_PATH.as_bytes())
+                .unwrap()
+                .data(),
+            b"WRDM\x01"
+        );
+    }
+
+    #[test]
+    fn wyr1_c1_rejects_empty_marker_or_manifest() {
+        let base = Product {
+            init: b"init",
+            registryd: b"registry",
+            devmgr: b"devmgr",
+            uart16550d: b"uart",
+            consoled: b"console",
+            wyrmsh: b"shell",
+            rrc_manifest: b"WRRM",
+            gate_config: b"a",
+        };
+        assert_eq!(
+            build_c1(ProductC1 {
+                base,
+                marker: b"",
+                device_manifest: b"WRDM",
+            }),
+            Err(BuildError::EmptyArtifact)
+        );
+        assert_eq!(
+            build_c1(ProductC1 {
+                base,
+                marker: b"marker",
+                device_manifest: b"",
+            }),
+            Err(BuildError::EmptyArtifact)
         );
     }
 }
