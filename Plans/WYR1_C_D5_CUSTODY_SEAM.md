@@ -1,10 +1,10 @@
 # WYR1-C D5 custody seam
 
-**Status:** Deepwyrm's D5 primordial producer substrate is now implemented in
-the coordinator tree. This Wyrmroot lane provides only the corresponding
-host-model and protocol/profile substrate: it has not pinned or consumed an
-exact Deepwyrm producer revision, and no selected product performs live WRBP
-V3 intake.
+**Status:** D5 host substrate reached. Deepwyrm's primordial producer and
+Wyrmroot's corresponding host-model/protocol/profile seams are implemented.
+No selected product has yet pinned an exact pair or performed live WRBP V3
+intake; that remains downstream product integration rather than a D5 guest
+acceptance claim.
 
 ## Reached Wyrmroot substrate
 
@@ -20,7 +20,7 @@ V3 intake.
   the reduced `RESOURCE | INSPECT` authority. It rejects init and unrelated
   membership, so no ordinary loader path represents claim authority.
 
-## Exact remaining integration seam
+## Downstream selected-product integration seam
 
 The producer no longer waits on creation, but its selected-product
 four-capability output has not yet been consumed by an exact paired Wyrmroot
@@ -36,8 +36,8 @@ the historical V2 three-capability path. A coordinated integration change must:
    `RESOURCE | INSPECT`, and MOVE it using a new explicit devmgr startup
    profile.
 
-That future work is D5 custody integration only. It does not authorize C4
-resource claim, DeviceResource/Interrupt bundle, `DRIVER_READY`, UART, or
-selector evidence. In particular, this document makes no live intake, claim,
-or guest-acceptance assertion; its Wyrmroot evidence is limited to the host
-protocol/profile and custody model.
+That future work belongs to the consuming selected-product milestone. It does
+not authorize a C4 resource claim, DeviceResource/Interrupt bundle,
+`DRIVER_READY`, UART, or selector evidence. In particular, this document makes
+no live intake, claim, or guest-acceptance assertion; its Wyrmroot evidence is
+limited to the D5 host protocol/profile and custody model.
