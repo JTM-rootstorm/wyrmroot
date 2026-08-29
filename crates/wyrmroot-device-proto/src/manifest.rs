@@ -16,6 +16,33 @@ pub const COM2_ROLE_ID: RoleId = RoleId(1);
 pub const UART16550D_PATH: &[u8] = b"system/uart16550d";
 pub const SERIAL_TRANSPORT_METADATA_POLICY: MetadataPolicyId = MetadataPolicyId(1);
 
+/// Stable WYR1-C publication metadata installed by the controller before any
+/// device binding exists.  This names a typed device-metadata/control service;
+/// it is deliberately not a UART byte-stream protocol or a claim of COM2
+/// ownership.
+pub const SERIAL_CONSOLE_SERVICE_NAME: &[u8] = b"device.serial.console0";
+pub const SERIAL_CONSOLE_PROTOCOL_ID: u64 = 0x5345_5249_414c_4330;
+pub const SERIAL_CONSOLE_PROTOCOL_MAJOR: u16 = 1;
+pub const SERIAL_CONSOLE_PROTOCOL_MINOR: u16 = 0;
+pub const SERIAL_CONSOLE_SUPERVISOR_ROLE_ID: u32 = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PublicationPolicy {
+    pub service_name: &'static [u8],
+    pub protocol_id: u64,
+    pub protocol_major: u16,
+    pub protocol_minor: u16,
+    pub supervisor_role_id: u32,
+}
+
+pub const SERIAL_CONSOLE_PUBLICATION_POLICY: PublicationPolicy = PublicationPolicy {
+    service_name: SERIAL_CONSOLE_SERVICE_NAME,
+    protocol_id: SERIAL_CONSOLE_PROTOCOL_ID,
+    protocol_major: SERIAL_CONSOLE_PROTOCOL_MAJOR,
+    protocol_minor: SERIAL_CONSOLE_PROTOCOL_MINOR,
+    supervisor_role_id: SERIAL_CONSOLE_SUPERVISOR_ROLE_ID,
+};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProfileId(pub u32);
 
@@ -380,6 +407,25 @@ mod tests {
                 .pio
                 .end(),
             0x300
+        );
+    }
+
+    #[test]
+    fn serial_console_publication_policy_is_fixed_metadata_only() {
+        assert_eq!(SERIAL_CONSOLE_SERVICE_NAME, b"device.serial.console0");
+        assert_ne!(SERIAL_CONSOLE_PROTOCOL_ID, 0);
+        assert_eq!(SERIAL_CONSOLE_PROTOCOL_MAJOR, 1);
+        assert_eq!(SERIAL_CONSOLE_PROTOCOL_MINOR, 0);
+        assert_eq!(SERIAL_CONSOLE_SUPERVISOR_ROLE_ID, 2);
+        assert_eq!(
+            SERIAL_CONSOLE_PUBLICATION_POLICY,
+            PublicationPolicy {
+                service_name: SERIAL_CONSOLE_SERVICE_NAME,
+                protocol_id: SERIAL_CONSOLE_PROTOCOL_ID,
+                protocol_major: SERIAL_CONSOLE_PROTOCOL_MAJOR,
+                protocol_minor: SERIAL_CONSOLE_PROTOCOL_MINOR,
+                supervisor_role_id: SERIAL_CONSOLE_SUPERVISOR_ROLE_ID,
+            }
         );
     }
 

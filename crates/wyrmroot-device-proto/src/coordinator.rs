@@ -200,8 +200,8 @@ impl<'a> Coordinator<'a> {
                 return Err(CoordinatorError::StaleRegistry);
             }
             if binding.generation <= old.generation
-                || binding.endpoint.id == old.endpoint.id
-                || binding.endpoint.generation <= old.endpoint.generation
+                || (binding.endpoint.id == old.endpoint.id
+                    && binding.endpoint.generation <= old.endpoint.generation)
             {
                 return Err(CoordinatorError::StaleRegistry);
             }
@@ -606,13 +606,13 @@ mod tests {
                 generation: RegistryGeneration(2),
                 endpoint: RegistryEndpoint {
                     id: RegistryEndpointId(4),
-                    generation: RegistryEndpointGeneration(4),
+                    generation: RegistryEndpointGeneration(1),
                 },
             },
             RegistryBinding {
                 generation: RegistryGeneration(4),
                 endpoint: RegistryEndpoint {
-                    id: RegistryEndpointId(4),
+                    id: RegistryEndpointId(3),
                     generation: RegistryEndpointGeneration(2),
                 },
             },

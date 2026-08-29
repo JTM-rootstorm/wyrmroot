@@ -3,9 +3,10 @@ use wyrmroot_loader::{
     elf::{STACK_BOTTOM, STACK_BYTES},
     launch::LaunchProfile,
     process::{
-        JobLoadError, JobLoadRequest, LoadAuthority, LoadError, LoadFault, LoadRequest, LoadStage,
-        LoaderPlatform, ParentMapping, ProcessCreateRequest, ProcessCreateResult, ServiceLoadError,
-        ServiceLoadRequest, load_job_process, load_process, load_process_with_fault,
+        DeviceCoordinatorLoadError, DeviceCoordinatorLoadRequest, JobLoadError, JobLoadRequest,
+        LoadAuthority, LoadError, LoadFault, LoadRequest, LoadStage, LoaderPlatform, ParentMapping,
+        ProcessCreateRequest, ProcessCreateResult, ServiceLoadError, ServiceLoadRequest,
+        load_device_coordinator_process, load_job_process, load_process, load_process_with_fault,
         load_service_process,
     },
 };
@@ -392,6 +393,82 @@ fn probe_child_delegates_only_its_self_root_in_the_wrpl_1_1_init() {
     );
     assert!(!platform.events.contains(&Event::Duplicate(2)));
     assert!(!platform.events.contains(&Event::Duplicate(3)));
+}
+
+#[test]
+fn device_coordinator_moves_exact_self_root_endpoint_and_manifest() {
+    let mut platform = Mock::new(None);
+    let image = executable();
+    let publication_endpoint = DwHandle(0x910);
+    let manifest = DwHandle(0x911);
+    load_device_coordinator_process(
+        &mut platform,
+        authority(),
+        DeviceCoordinatorLoadRequest {
+            image: &image,
+            display_path: "/system/devmgr",
+            publication_endpoint,
+            manifest,
+            supervisor_generation: 0x55,
+            transaction_id: 0xc101,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(platform.sent_init.len(), 72);
+    assert_eq!(&platform.sent_init[6..8], &5_u16.to_le_bytes());
+    assert_eq!(&platform.sent_init[64..72], &0x55_u64.to_le_bytes());
+    assert_eq!(platform.sent_transfers.len(), 3);
+    assert_eq!(platform.sent_transfers[1].handle, publication_endpoint);
+    assert_eq!(
+        platform.sent_transfers[1].requested_rights,
+        wyrmroot_loader::launch::CHILD_CHANNEL_RIGHTS
+    );
+    assert_eq!(platform.sent_transfers[2].handle, manifest);
+    assert_eq!(
+        platform.sent_transfers[2].requested_rights,
+        wyrmroot_loader::launch::DEVICE_MANIFEST_RIGHTS
+    );
+    assert_eq!(platform.started_abi, Some(1));
+}
+
+#[test]
+fn device_coordinator_failed_init_move_retains_both_external_inputs() {
+    let mut platform = Mock::new(Some("send"));
+    let image = executable();
+    let publication_endpoint = DwHandle(0x920);
+    let manifest = DwHandle(0x921);
+    let error = load_device_coordinator_process(
+        &mut platform,
+        authority(),
+        DeviceCoordinatorLoadRequest {
+            image: &image,
+            display_path: "/system/devmgr",
+            publication_endpoint,
+            manifest,
+            supervisor_generation: 0x56,
+            transaction_id: 0xc102,
+        },
+    )
+    .expect_err("failed MOVE must retain both caller-owned inputs");
+    assert_eq!(
+        error,
+        DeviceCoordinatorLoadError {
+            error: LoadError::Platform {
+                stage: LoadStage::InitSend,
+                cause: "send",
+                rollback_failed: false,
+            },
+            publication_endpoint_consumed: false,
+            manifest_consumed: false,
+        }
+    );
+    assert!(
+        !platform
+            .events
+            .contains(&Event::Close(publication_endpoint.0))
+    );
+    assert!(!platform.events.contains(&Event::Close(manifest.0)));
 }
 
 #[test]

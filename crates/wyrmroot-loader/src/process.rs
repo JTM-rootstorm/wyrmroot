@@ -12,8 +12,8 @@ use crate::{
     elf::{self, ElfError, LoadSegment, MAX_LOAD_SEGMENTS, PAGE_SIZE, SegmentProtection},
     image::{self, INITIAL_STACK, MaterializationPlan, StartupBlockError},
     launch::{
-        self, BOOTFS_RIGHTS, INIT0_BYTES, LOADER_TASK_GROUP_RIGHTS, LaunchError, LaunchProfile,
-        SELF_ROOT_RIGHTS,
+        self, BOOTFS_RIGHTS, DEVICE_COORDINATOR_BYTES, LOADER_TASK_GROUP_RIGHTS, LaunchError,
+        LaunchProfile, SELF_ROOT_RIGHTS,
     },
 };
 
@@ -78,6 +78,19 @@ pub struct ServiceLoadRequest<'a> {
     pub transaction_id: u64,
 }
 
+/// WYR1-C device-coordinator launch request.  The publication endpoint and
+/// manifest are caller-owned until the INIT Channel MOVE succeeds; on a
+/// failed send the loader leaves both with the caller for one cleanup path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceCoordinatorLoadRequest<'a> {
+    pub image: &'a [u8],
+    pub display_path: &'a str,
+    pub publication_endpoint: DwHandle,
+    pub manifest: DwHandle,
+    pub supervisor_generation: u64,
+    pub transaction_id: u64,
+}
+
 #[derive(Clone, Copy)]
 enum StartupSpec<'a> {
     Legacy(&'a str),
@@ -100,6 +113,8 @@ struct InternalLoadRequest<'a> {
     transaction_id: u64,
     startup: StartupSpec<'a>,
     channels: &'a [DwHandle],
+    device_manifest: Option<DwHandle>,
+    supervisor_generation: Option<u64>,
 }
 
 /// Explicitly selected, test-only corruption of one child-launch boundary.
@@ -184,6 +199,25 @@ impl<E> ServiceLoadError<E> {
         Self {
             error,
             service_channel_consumed: false,
+        }
+    }
+}
+
+/// Device-coordinator launch failure with explicit ownership of both caller
+/// inputs at the atomic INIT boundary.
+#[derive(Debug, Eq, PartialEq)]
+pub struct DeviceCoordinatorLoadError<PlatformError> {
+    pub error: LoadError<PlatformError>,
+    pub publication_endpoint_consumed: bool,
+    pub manifest_consumed: bool,
+}
+
+impl<E> DeviceCoordinatorLoadError<E> {
+    const fn caller_retains(error: LoadError<E>) -> Self {
+        Self {
+            error,
+            publication_endpoint_consumed: false,
+            manifest_consumed: false,
         }
     }
 }
@@ -316,6 +350,7 @@ struct Transaction {
     delegated_bootfs: Option<DwHandle>,
     delegated_task_group: Option<DwHandle>,
     delegated_channels: [Option<DwHandle>; 3],
+    delegated_manifest: Option<DwHandle>,
     ranges: [Range; MAX_CHILD_RANGES],
     range_count: usize,
 }
@@ -335,6 +370,7 @@ impl Transaction {
             delegated_bootfs: None,
             delegated_task_group: None,
             delegated_channels: [None; 3],
+            delegated_manifest: None,
             ranges: [Range {
                 address: 0,
                 bytes: 0,
@@ -383,6 +419,7 @@ impl Transaction {
             self.delegated_channels[0].take(),
             self.delegated_channels[1].take(),
             self.delegated_channels[2].take(),
+            self.delegated_manifest.take(),
             self.child_endpoint.take(),
             self.broad_parent.take(),
             self.parent_channel.take(),
@@ -425,6 +462,8 @@ pub fn load_process_with_fault<P: LoaderPlatform>(
             transaction_id: request.transaction_id,
             startup: StartupSpec::Legacy(request.display_path),
             channels: &[],
+            device_manifest: None,
+            supervisor_generation: None,
         },
         fault,
         &mut delegated_channels_consumed,
@@ -460,6 +499,8 @@ pub fn load_job_process<P: LoaderPlatform>(
                 environment: request.environment,
             },
             channels: request.streams,
+            device_manifest: None,
+            supervisor_generation: None,
         },
         LoadFault::None,
         &mut delegated_channels_consumed,
@@ -524,6 +565,8 @@ pub fn load_service_process<P: LoaderPlatform>(
             transaction_id: request.transaction_id,
             startup,
             channels: &channels,
+            device_manifest: None,
+            supervisor_generation: None,
         },
         LoadFault::None,
         &mut service_channel_consumed,
@@ -531,6 +574,43 @@ pub fn load_service_process<P: LoaderPlatform>(
     .map_err(|error| ServiceLoadError {
         error,
         service_channel_consumed,
+    })
+}
+
+/// Launch the hardware-independent WYR1-C device coordinator.  Exactly one
+/// publication Channel and one immutable WRDM MemoryObject are moved beside
+/// the child self-root; no loader or hardware authority is included.
+pub fn load_device_coordinator_process<P: LoaderPlatform>(
+    platform: &mut P,
+    authority: LoadAuthority,
+    request: DeviceCoordinatorLoadRequest<'_>,
+) -> Result<LoadedProcess, DeviceCoordinatorLoadError<P::Error>> {
+    if request.publication_endpoint == request.manifest || request.supervisor_generation == 0 {
+        return Err(DeviceCoordinatorLoadError::caller_retains(
+            LoadError::Launch(LaunchError::HandleCount),
+        ));
+    }
+    let channels = [request.publication_endpoint];
+    let mut inputs_consumed = false;
+    load_process_internal(
+        platform,
+        authority,
+        InternalLoadRequest {
+            image: request.image,
+            profile: LaunchProfile::DeviceCoordinator,
+            transaction_id: request.transaction_id,
+            startup: StartupSpec::Legacy(request.display_path),
+            channels: &channels,
+            device_manifest: Some(request.manifest),
+            supervisor_generation: Some(request.supervisor_generation),
+        },
+        LoadFault::None,
+        &mut inputs_consumed,
+    )
+    .map_err(|error| DeviceCoordinatorLoadError {
+        error,
+        publication_endpoint_consumed: inputs_consumed,
+        manifest_consumed: inputs_consumed,
     })
 }
 
@@ -543,12 +623,17 @@ fn load_process_internal<P: LoaderPlatform>(
 ) -> Result<LoadedProcess, LoadError<P::Error>> {
     let expected_channels = if request.profile.channel_role().is_some() {
         1
+    } else if request.profile == LaunchProfile::DeviceCoordinator {
+        1
     } else if request.profile == LaunchProfile::JobV2Streams {
         3
     } else {
         0
     };
     if request.channels.len() != expected_channels {
+        return Err(LoadError::Launch(LaunchError::HandleCount));
+    }
+    if (request.profile == LaunchProfile::DeviceCoordinator) != request.device_manifest.is_some() {
         return Err(LoadError::Launch(LaunchError::HandleCount));
     }
     let mut segments = [empty_segment(); MAX_LOAD_SEGMENTS];
@@ -669,9 +754,19 @@ fn load_process_materialized<P: LoaderPlatform>(
     stack_pointer: u64,
     startup_abi: u64,
 ) -> Result<LoadedProcess, LoadError<P::Error>> {
-    let mut init = [0_u8; INIT0_BYTES];
-    let init_len = launch::encode_init(request.profile, request.transaction_id, &mut init)
-        .map_err(LoadError::Launch)?;
+    let mut init = [0_u8; DEVICE_COORDINATOR_BYTES];
+    let init_len = if request.profile == LaunchProfile::DeviceCoordinator {
+        launch::encode_device_coordinator_init(
+            request.transaction_id,
+            request
+                .supervisor_generation
+                .ok_or(LoadError::Launch(LaunchError::ZeroTransaction))?,
+            &mut init,
+        )
+    } else {
+        launch::encode_init(request.profile, request.transaction_id, &mut init)
+    }
+    .map_err(LoadError::Launch)?;
     apply_init_fault(&mut init[..init_len], fault);
 
     let mut transaction = Transaction::new(authority.parent_root);
@@ -916,6 +1011,16 @@ fn load_process_materialized<P: LoaderPlatform>(
         transaction.delegated_channels[0] = Some(request.channels[0]);
         transfers[0] = transfer(request.channels[0], launch::CHILD_CHANNEL_RIGHTS);
         1
+    } else if request.profile == LaunchProfile::DeviceCoordinator {
+        let manifest = request
+            .device_manifest
+            .ok_or(LoadError::Launch(LaunchError::HandleCount))?;
+        transaction.delegated_channels[0] = Some(request.channels[0]);
+        transaction.delegated_manifest = Some(manifest);
+        transfers[0] = transfer(created.root, SELF_ROOT_RIGHTS);
+        transfers[1] = transfer(request.channels[0], launch::CHILD_CHANNEL_RIGHTS);
+        transfers[2] = transfer(manifest, launch::DEVICE_MANIFEST_RIGHTS);
+        3
     } else if request.profile.channel_role().is_some() {
         transaction.delegated_channels[0] = Some(request.channels[0]);
         transfers[0] = transfer(created.root, SELF_ROOT_RIGHTS);
@@ -950,6 +1055,7 @@ fn load_process_materialized<P: LoaderPlatform>(
         for delegated in &mut transaction.delegated_channels {
             *delegated = None;
         }
+        transaction.delegated_manifest = None;
         return Err(fail(platform, &mut transaction, LoadStage::InitSend, cause));
     }
     // Successful Channel send consumed every externally supplied endpoint.
@@ -957,6 +1063,7 @@ fn load_process_materialized<P: LoaderPlatform>(
     for delegated in &mut transaction.delegated_channels {
         *delegated = None;
     }
+    transaction.delegated_manifest = None;
     if request.profile.needs_self_root() {
         transaction.root = None;
         if request.profile.has_loader_authority_trio() {
