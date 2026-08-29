@@ -1,0 +1,12 @@
+# Reviewed host policy for the immutable WYR1-C q35 COM2 role.
+schema = 1
+profile = "q35"
+profile_version = 1
+role = 1
+hardware = "com2"
+resource = "pio-interrupt"
+pio_base = 760
+pio_length = 8
+irq = 3
+driver = "system/uart16550d"
+metadata_policy = "serial-console-v1"

@@ -20,19 +20,7 @@ const WRDM_NAME: &str = "wrdm-c2-v1.bin";
 const CONFIG_NAME: &str = "inspection-policy.toml";
 const REQUEST_NAME: &str = "wyr1-c2-request.toml";
 const RECEIPT_NAME: &str = "c2-receipt.toml";
-const SOURCE: &str = concat!(
-    "schema = 1\n",
-    "profile = \"q35\"\n",
-    "profile_version = 1\n",
-    "role = 1\n",
-    "hardware = \"com2\"\n",
-    "resource = \"pio-interrupt\"\n",
-    "pio_base = 760\n",
-    "pio_length = 8\n",
-    "irq = 3\n",
-    "driver = \"system/uart16550d\"\n",
-    "metadata_policy = \"serial-console-v1\"\n",
-);
+const SOURCE: &[u8] = include_bytes!("../../../products/wyr1c/q35-com2-role.toml");
 const OBSERVATION: &str = concat!(
     "schema = 1\n",
     "selector = \"none\"\n",
@@ -50,11 +38,11 @@ pub(crate) fn freeze(output: &Path) -> Result<String, Failure> {
     let product = output.join("product");
     let source = product.join(SOURCE_NAME);
     let config = product.join(CONFIG_NAME);
-    write_new(&source, SOURCE.as_bytes())?;
+    write_new(&source, SOURCE)?;
     write_new(&config, OBSERVATION.as_bytes())?;
     let uart_hex_value = digest_file(&output.join("artifacts/uart16550d.elf"))?;
     let uart = hex_to_digest(&uart_hex_value)?;
-    let compiled = compile_source(SOURCE.as_bytes(), uart)?;
+    let compiled = compile_source(SOURCE, uart)?;
     let wrdm = product.join(WRDM_NAME);
     write_new(&wrdm, &compiled)?;
     let c1_wrdm = read_regular(&product.join("wrdm-c1-v1.bin"))?;
@@ -171,7 +159,7 @@ pub(crate) fn inspect(request: &Path) -> Result<String, Failure> {
 }
 
 fn compile_source(source: &[u8], uart: [u8; 32]) -> Result<Vec<u8>, Failure> {
-    if source != SOURCE.as_bytes() {
+    if source != SOURCE {
         return Err(Failure::task(
             "C2 device policy is not the reviewed exact q35 COM2 TOML",
         ));
@@ -243,8 +231,8 @@ mod tests {
     use super::*;
     #[test]
     fn reviewed_source_compiles_deterministically() {
-        let a = compile_source(SOURCE.as_bytes(), [7; 32]).unwrap();
-        assert_eq!(a, compile_source(SOURCE.as_bytes(), [7; 32]).unwrap());
+        let a = compile_source(SOURCE, [7; 32]).unwrap();
+        assert_eq!(a, compile_source(SOURCE, [7; 32]).unwrap());
         assert!(compile_source(b"hardware = \"com1\"\n", [7; 32]).is_err());
     }
     #[test]
