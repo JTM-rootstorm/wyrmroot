@@ -20,6 +20,8 @@ use crate::metadata::BuildManifest;
 use crate::sha256;
 
 const NATIVE_TARGET: &str = "x86_64-unknown-wyrmroot";
+const DW1C_BOOTSTRAP_FEATURES: &str =
+    "native-bootstrap,wyr0-init0-integration,dw1c-bootstrap-supervision";
 const DW1C_INIT_FEATURES: &str = "native-init0,dw1c-preemption-integration";
 const DW1C_ACTOR_FEATURES: &str = "native-payloads";
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
@@ -170,7 +172,7 @@ pub(crate) fn wyr_build_specs() -> [WyrBuildSpec; 13] {
             label: "bootstrap",
             package: "wyrmroot-bootstrap",
             binary: "wyrmroot-bootstrap",
-            features: "native-bootstrap,wyr0-init0-integration",
+            features: DW1C_BOOTSTRAP_FEATURES,
             requires_progress_digest: false,
         },
         WyrBuildSpec {
@@ -1883,7 +1885,7 @@ mod tests {
                     label: "bootstrap",
                     package: "wyrmroot-bootstrap",
                     binary: "wyrmroot-bootstrap",
-                    features: "native-bootstrap,wyr0-init0-integration",
+                    features: "native-bootstrap,wyr0-init0-integration,dw1c-bootstrap-supervision",
                     requires_progress_digest: false,
                 },
                 WyrBuildSpec {

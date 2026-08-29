@@ -64,6 +64,15 @@ fn production_path_stays_separate_from_test_only_hook_and_terminal_behaviors() {
 }
 
 #[test]
+fn dw1c_bootstrap_watchdog_contains_the_selector_transaction() {
+    assert!(MANIFEST.contains("dw1c-bootstrap-supervision = [\"wyr0-init0-integration\"]"));
+    assert!(MAIN_SOURCE.contains("cfg!(feature = \"dw1c-bootstrap-supervision\")"));
+    assert!(MAIN_SOURCE.contains("270_000_000_000"));
+    assert!(MAIN_SOURCE.contains("240-second workload"));
+    assert!(MAIN_SOURCE.contains("5_000_000_000"));
+}
+
+#[test]
 fn blocking_variant_does_not_import_the_ordinary_bootstrap_entry() {
     assert!(MAIN_SOURCE.contains("#[cfg(not(any("));
     assert!(MAIN_SOURCE.contains("feature = \"native-loader-smoke-integration\""));

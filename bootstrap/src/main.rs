@@ -84,7 +84,16 @@ use wyrmroot_runtime::{NativeLoaderPlatform, NativeSupervisionPlatform, monotoni
         feature = "primordial-invalid-return"
     ))
 ))]
-const BOOTSTRAP_SUPERVISION_TIMEOUT_NS: u64 = 5_000_000_000;
+const BOOTSTRAP_SUPERVISION_TIMEOUT_NS: u64 = if cfg!(feature = "dw1c-bootstrap-supervision") {
+    // Selector 28 deliberately sends init0 READY only after its complete
+    // transaction, matching the established selector-26 contract. Its own
+    // controller enforces separate setup/ARM, 240-second workload, and cleanup
+    // deadlines. This outer watchdog must contain those phases without
+    // replacing them or moving READY ahead of a possible selector failure.
+    270_000_000_000
+} else {
+    5_000_000_000
+};
 
 struct NativeSystem {
     failed_native_operation: u32,
