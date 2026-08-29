@@ -35,6 +35,7 @@ const MAX_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_BOOTFS_BYTES: usize = crate::g3_image::IMAGE_BYTES as usize;
 const MAX_REPORT_BYTES: usize = 64 * 1024;
 const O_NOFOLLOW: i32 = 0o400000;
+const INSPECTION_PATH: &str = "/usr/lib/llvm/22/bin:/usr/bin:/bin";
 const GATE_CONFIG: &[u8] =
     b"schema = 1\nproduct = \"wyr1-c1-host-only\"\nselector = \"none\"\nevidence = \"not-produced\"\n";
 
@@ -377,6 +378,7 @@ fn inspect_native(
         .arg(artifact)
         .current_dir(repository)
         .env_clear()
+        .env("PATH", INSPECTION_PATH)
         .stdin(Stdio::null())
         .output()
         .map_err(|error| Failure::task(format!("could not inspect WYR1-C1 {label}: {error}")))?;
@@ -862,5 +864,11 @@ mod tests {
             assert!(command.contains("--target x86_64-unknown-wyrmroot"));
             assert!(command.contains("--offline --locked --release"));
         }
+    }
+
+    #[test]
+    fn native_inspection_uses_only_the_pinned_host_tool_path() {
+        assert_eq!(INSPECTION_PATH, "/usr/lib/llvm/22/bin:/usr/bin:/bin");
+        assert!(!INSPECTION_PATH.contains("/usr/local"));
     }
 }
