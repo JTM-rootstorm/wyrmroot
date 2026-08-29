@@ -185,31 +185,28 @@ pub(crate) fn build_into(
         .map_err(|_| Failure::task("system clock is before the Unix epoch"))?
         .as_nanos();
     let scratch_name = format!("wyr1c-build-{}-{unique}", std::process::id());
-    let scratch = tmp.create_child(&scratch_name, 0o700, "WYR1-C1 build scratch")?;
+    let scratch = tmp.create_scratch(&scratch_name, "WYR1-C1 build scratch")?;
     let build_result = (|| {
         let mut artifacts = Vec::with_capacity(NATIVE_SPECS.len());
         for spec in NATIVE_SPECS {
             toolchain.accepted().verify_unchanged()?;
-            let mut artifact = build_native(
-                &repository,
-                &cargo_home,
-                toolchain.accepted(),
-                &scratch.anchor_path(),
-                spec,
-            )?;
-            let built_path = scratch
-                .anchor_path()
-                .join(spec.label)
-                .join(NATIVE_TARGET)
-                .join("release")
-                .join(spec.artifact);
-            artifact.inspection =
-                inspect_native(&repository, &built_path, &artifact.sha256, spec.label)?;
+            let artifact = scratch.with_inheritable_anchor("WYR1-C1 build scratch", |build| {
+                let mut artifact =
+                    build_native(&repository, &cargo_home, toolchain.accepted(), build, spec)?;
+                let built_path = build
+                    .join(spec.label)
+                    .join(NATIVE_TARGET)
+                    .join("release")
+                    .join(spec.artifact);
+                artifact.inspection =
+                    inspect_native(&repository, &built_path, &artifact.sha256, spec.label)?;
+                Ok(artifact)
+            })?;
             artifacts.push(artifact);
         }
         Ok::<_, Failure>(artifacts)
     })();
-    let artifacts = build_result?;
+    let artifacts = scratch.finish(build_result)?;
     toolchain.accepted().verify_unchanged()?;
     verify_repository_revision(&repository, &revision)?;
 
@@ -695,6 +692,7 @@ pub(crate) fn validate_frozen_product(
         .ok_or_else(|| Failure::task("WYR1-C1 receipt lacks Wyrmroot revision"))?
         .clone();
     validate_revision(&revision, "Wyrmroot")?;
+    validate_commit(repository, &revision, "Wyrmroot")?;
     let cargo_lock = git_file(repository, &revision, "Cargo.lock")?;
     if receipt.get("cargo_lock_sha256") != Some(&sha256::bytes_digest(&cargo_lock)) {
         return Err(Failure::task(
@@ -1010,6 +1008,29 @@ fn validate_revision(revision: &str, label: &str) -> Result<(), Failure> {
     {
         return Err(Failure::task(format!(
             "{label} revision is not a commit ID"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_commit(
+    repository: &Path,
+    revision: &str,
+    label: &str,
+) -> Result<(), Failure> {
+    validate_revision(revision, label)?;
+    let commit = format!("{revision}^{{commit}}");
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(["rev-parse", "--verify", &commit])
+        .output()
+        .map_err(|error| Failure::task(format!("could not inspect {label} commit: {error}")))?;
+    if !output.status.success()
+        || std::str::from_utf8(&output.stdout).ok().map(str::trim) != Some(revision)
+    {
+        return Err(Failure::task(format!(
+            "declared {label} revision is not that exact commit"
         )));
     }
     Ok(())
@@ -1373,5 +1394,56 @@ mod tests {
         assert!(parse_receipt("a = \"x\"\na = \"y\"\n").is_err());
         assert!(parse_receipt("bootfs_bytes = +17\n").is_err());
         assert!(parse_receipt("system/init = \"x\"\n").is_err());
+    }
+
+    #[test]
+    fn declared_revision_must_be_the_exact_commit_not_its_tree() {
+        let root = std::env::temp_dir().join(format!(
+            "wyr1c-commit-kind-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let git = |arguments: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(arguments)
+                .env("GIT_AUTHOR_NAME", "WYR1-C test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+                .env("GIT_COMMITTER_NAME", "WYR1-C test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+                .output()
+                .unwrap()
+        };
+        assert!(git(&["init", "--quiet"]).status.success());
+        fs::write(root.join("file"), b"fixture").unwrap();
+        assert!(git(&["add", "file"]).status.success());
+        assert!(
+            git(&[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "fixture"
+            ])
+            .status
+            .success()
+        );
+        let commit = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+        let tree = String::from_utf8(git(&["rev-parse", "HEAD^{tree}"]).stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+        assert!(validate_commit(&root, &commit, "fixture").is_ok());
+        assert!(validate_commit(&root, &tree, "fixture").is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 }

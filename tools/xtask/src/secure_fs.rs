@@ -4,6 +4,7 @@ use std::{
     ffi::{CString, c_char, c_int, c_uint},
     fs::{File, Metadata, Permissions},
     io::{Read, Seek, SeekFrom, Write},
+    ops::Deref,
     os::fd::{AsRawFd, FromRawFd},
     os::unix::{ffi::OsStrExt, fs::MetadataExt, fs::PermissionsExt},
     path::{Component, Path, PathBuf},
@@ -18,10 +19,16 @@ const O_EXCL: c_int = 0o200;
 const O_CLOEXEC: c_int = 0o2_000_000;
 const O_DIRECTORY: c_int = 0o200_000;
 const O_NOFOLLOW: c_int = 0o400_000;
+const O_NONBLOCK: c_int = 0o4_000;
+const O_PATH: c_int = 0o10_000_000;
+const F_DUPFD: c_int = 0;
+const AT_REMOVEDIR: c_int = 0x200;
 
 unsafe extern "C" {
     fn openat(dirfd: c_int, pathname: *const c_char, flags: c_int, ...) -> c_int;
     fn mkdirat(dirfd: c_int, pathname: *const c_char, mode: c_uint) -> c_int;
+    fn unlinkat(dirfd: c_int, pathname: *const c_char, flags: c_int) -> c_int;
+    fn fcntl(fd: c_int, command: c_int, ...) -> c_int;
 }
 
 pub(crate) struct Directory {
@@ -74,6 +81,21 @@ impl Directory {
         Ok(directory)
     }
 
+    pub(crate) fn create_scratch<'a>(
+        &'a self,
+        name: &str,
+        label: &str,
+    ) -> Result<ScratchDirectory<'a>, Failure> {
+        let directory = self.create_child(name, 0o700, label)?;
+        Ok(ScratchDirectory {
+            parent: self,
+            name: name.to_owned(),
+            label: label.to_owned(),
+            directory,
+            armed: true,
+        })
+    }
+
     pub(crate) fn open_child(&self, name: &str, label: &str) -> Result<Self, Failure> {
         let name = component(name, label)?;
         self.open_child_cstr(&name, label)
@@ -93,10 +115,48 @@ impl Directory {
         &self.display_path
     }
 
-    /// A stable procfs spelling for passing this already-open directory to
-    /// tools which do not expose descriptor-relative output APIs.
-    pub(crate) fn anchor_path(&self) -> PathBuf {
+    fn anchor_path(&self) -> PathBuf {
         PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+    }
+
+    pub(crate) fn with_inheritable_anchor<T>(
+        &self,
+        label: &str,
+        operation: impl FnOnce(&Path) -> Result<T, Failure>,
+    ) -> Result<T, Failure> {
+        // SAFETY: fcntl borrows the live directory fd and returns a fresh fd.
+        let duplicate = unsafe { fcntl(self.file.as_raw_fd(), F_DUPFD, 3) };
+        if duplicate < 0 {
+            return Err(Failure::task(format!(
+                "could not duplicate {label}: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: F_DUPFD returned a fresh owned descriptor without CLOEXEC.
+        let inherited = unsafe { File::from_raw_fd(duplicate) };
+        let before = inherited
+            .metadata()
+            .map_err(|error| Failure::task(format!("could not stat {label}: {error}")))?;
+        if object_identity(&before)
+            != object_identity(
+                &self
+                    .file
+                    .metadata()
+                    .map_err(|error| Failure::task(format!("could not stat {label}: {error}")))?,
+            )
+        {
+            return Err(Failure::task(format!("{label} duplicate changed identity")));
+        }
+        let anchor = PathBuf::from(format!("/proc/self/fd/{duplicate}"));
+        let result = operation(&anchor);
+        let after = inherited
+            .metadata()
+            .map_err(|error| Failure::task(format!("could not recheck {label}: {error}")))?;
+        drop(inherited);
+        if object_identity(&before) != object_identity(&after) {
+            return Err(Failure::task(format!("{label} changed during subprocess")));
+        }
+        result
     }
 
     pub(crate) fn create_file(&self, name: &str, mode: u32, label: &str) -> Result<File, Failure> {
@@ -178,13 +238,19 @@ impl Directory {
             openat(
                 self.file.as_raw_fd(),
                 name.as_ptr(),
-                O_RDONLY | O_CLOEXEC | O_NOFOLLOW,
+                O_PATH | O_CLOEXEC | O_NOFOLLOW,
                 0,
             )
         };
         if fd >= 0 {
             // SAFETY: the successful open returned an owned descriptor.
-            drop(unsafe { File::from_raw_fd(fd) });
+            let object = unsafe { File::from_raw_fd(fd) };
+            let metadata = object
+                .metadata()
+                .map_err(|error| Failure::task(format!("could not stat {label}: {error}")))?;
+            if !metadata.is_file() && !metadata.is_dir() {
+                return Err(Failure::task(format!("{label} has an unsafe special type")));
+            }
             return Ok(true);
         }
         let error = std::io::Error::last_os_error();
@@ -203,16 +269,16 @@ impl Directory {
         label: &str,
     ) -> Result<(File, Metadata), Failure> {
         let name = component(name, label)?;
-        let fd = openat_fd(
+        let path_fd = openat_fd(
             self.file.as_raw_fd(),
             &name,
-            O_RDONLY | O_CLOEXEC | O_NOFOLLOW,
+            O_PATH | O_CLOEXEC | O_NOFOLLOW,
             0,
             label,
         )?;
         // SAFETY: `openat_fd` returned a fresh owned descriptor.
-        let file = unsafe { File::from_raw_fd(fd) };
-        let metadata = file
+        let path_file = unsafe { File::from_raw_fd(path_fd) };
+        let metadata = path_file
             .metadata()
             .map_err(|error| Failure::task(format!("could not stat {label}: {error}")))?;
         if !bounded_regular(&metadata, maximum, exact) {
@@ -220,7 +286,26 @@ impl Directory {
                 "{label} is not a bounded single-link regular file"
             )));
         }
-        Ok((file, metadata))
+        let proc_path = CString::new(format!("/proc/self/fd/{path_fd}"))
+            .expect("decimal file descriptor contains no NUL");
+        let fd = openat_fd(
+            -100,
+            &proc_path,
+            O_RDONLY | O_CLOEXEC | O_NONBLOCK,
+            0,
+            label,
+        )?;
+        // SAFETY: `openat_fd` returned a fresh owned descriptor.
+        let file = unsafe { File::from_raw_fd(fd) };
+        let opened = file
+            .metadata()
+            .map_err(|error| Failure::task(format!("could not stat opened {label}: {error}")))?;
+        if object_identity(&metadata) != object_identity(&opened)
+            || !bounded_regular(&opened, maximum, exact)
+        {
+            return Err(Failure::task(format!("{label} changed before data open")));
+        }
+        Ok((file, opened))
     }
 
     fn verify_file_identity(
@@ -237,6 +322,176 @@ impl Directory {
         }
         Ok(())
     }
+
+    fn remove_child_tree_exact(
+        &self,
+        name: &str,
+        expected: &Directory,
+        label: &str,
+    ) -> Result<(), Failure> {
+        let named = self.open_child(name, label)?;
+        if directory_identity(&named)? != directory_identity(expected)? {
+            return Err(Failure::task(format!(
+                "{label} pathname changed before retirement"
+            )));
+        }
+        remove_directory_contents(expected, label)?;
+        let named = self.open_child(name, label)?;
+        if directory_identity(&named)? != directory_identity(expected)? {
+            return Err(Failure::task(format!(
+                "{label} pathname changed during retirement"
+            )));
+        }
+        unlink_component(self.file.as_raw_fd(), name.as_bytes(), AT_REMOVEDIR, label)
+    }
+}
+
+pub(crate) struct ScratchDirectory<'a> {
+    parent: &'a Directory,
+    name: String,
+    label: String,
+    directory: Directory,
+    armed: bool,
+}
+
+impl ScratchDirectory<'_> {
+    pub(crate) fn finish<T>(mut self, result: Result<T, Failure>) -> Result<T, Failure> {
+        let cleanup = self
+            .parent
+            .remove_child_tree_exact(&self.name, &self.directory, &self.label);
+        if cleanup.is_ok() {
+            self.armed = false;
+        }
+        match (result, cleanup) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(primary), Err(cleanup)) => Err(Failure::task(format!(
+                "{}; scratch cleanup also failed: {}",
+                primary.message, cleanup.message
+            ))),
+        }
+    }
+}
+
+impl Deref for ScratchDirectory<'_> {
+    type Target = Directory;
+
+    fn deref(&self) -> &Self::Target {
+        &self.directory
+    }
+}
+
+impl Drop for ScratchDirectory<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self
+                .parent
+                .remove_child_tree_exact(&self.name, &self.directory, &self.label);
+        }
+    }
+}
+
+fn directory_identity(directory: &Directory) -> Result<(u64, u64), Failure> {
+    directory
+        .file
+        .metadata()
+        .map(|metadata| object_identity(&metadata))
+        .map_err(|error| Failure::task(format!("could not stat scratch directory: {error}")))
+}
+
+fn remove_directory_contents(directory: &Directory, label: &str) -> Result<(), Failure> {
+    loop {
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(directory.anchor_path())
+            .map_err(|error| Failure::task(format!("could not enumerate {label}: {error}")))?
+        {
+            let entry = entry
+                .map_err(|error| Failure::task(format!("could not enumerate {label}: {error}")))?;
+            names.push(entry.file_name());
+        }
+        if names.is_empty() {
+            return Ok(());
+        }
+        for name in names {
+            let c_name = CString::new(name.as_bytes())
+                .map_err(|_| Failure::task(format!("{label} contains a NUL name")))?;
+            let path_fd = openat_fd(
+                directory.file.as_raw_fd(),
+                &c_name,
+                O_PATH | O_CLOEXEC | O_NOFOLLOW,
+                0,
+                label,
+            )?;
+            // SAFETY: openat_fd returned a fresh owned descriptor.
+            let path_file = unsafe { File::from_raw_fd(path_fd) };
+            let expected = path_file
+                .metadata()
+                .map_err(|error| Failure::task(format!("could not stat {label} entry: {error}")))?;
+            if expected.is_dir() {
+                let child_file =
+                    open_directory_at(Some(directory.file.as_raw_fd()), name.as_bytes(), label)?;
+                let child = Directory {
+                    file: child_file,
+                    display_path: directory.display_path.join(&name),
+                };
+                if directory_identity(&child)? != object_identity(&expected) {
+                    return Err(Failure::task(format!(
+                        "{label} entry changed before cleanup"
+                    )));
+                }
+                remove_directory_contents(&child, label)?;
+                let rechecked =
+                    open_directory_at(Some(directory.file.as_raw_fd()), name.as_bytes(), label)?;
+                let rechecked = rechecked.metadata().map_err(|error| {
+                    Failure::task(format!("could not recheck {label} entry: {error}"))
+                })?;
+                if object_identity(&expected) != object_identity(&rechecked) {
+                    return Err(Failure::task(format!(
+                        "{label} entry changed during cleanup"
+                    )));
+                }
+                unlink_component(
+                    directory.file.as_raw_fd(),
+                    name.as_bytes(),
+                    AT_REMOVEDIR,
+                    label,
+                )?;
+            } else {
+                let rechecked_fd = openat_fd(
+                    directory.file.as_raw_fd(),
+                    &c_name,
+                    O_PATH | O_CLOEXEC | O_NOFOLLOW,
+                    0,
+                    label,
+                )?;
+                // SAFETY: openat_fd returned a fresh owned descriptor.
+                let rechecked = unsafe { File::from_raw_fd(rechecked_fd) };
+                let rechecked = rechecked.metadata().map_err(|error| {
+                    Failure::task(format!("could not recheck {label} entry: {error}"))
+                })?;
+                if object_identity(&expected) != object_identity(&rechecked) {
+                    return Err(Failure::task(format!(
+                        "{label} entry changed during cleanup"
+                    )));
+                }
+                unlink_component(directory.file.as_raw_fd(), name.as_bytes(), 0, label)?;
+            }
+        }
+    }
+}
+
+fn unlink_component(parent: c_int, name: &[u8], flags: c_int, label: &str) -> Result<(), Failure> {
+    let name =
+        CString::new(name).map_err(|_| Failure::task(format!("{label} contains a NUL name")))?;
+    // SAFETY: name is NUL-terminated and parent is borrowed for this call.
+    if unsafe { unlinkat(parent, name.as_ptr(), flags) } != 0 {
+        return Err(Failure::task(format!(
+            "could not retire {label}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn hash_open_file_exact(
@@ -346,6 +601,8 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::symlink;
+    use std::os::unix::net::UnixListener;
+    use std::process::Command;
 
     fn temporary(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -414,6 +671,91 @@ mod tests {
         assert!(hash_open_file_exact(&mut file, crate::g3_image::IMAGE_BYTES, "image").is_err());
         assert_eq!(first.len(), 64);
         drop(file);
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn inheritable_scratch_anchor_survives_rename_without_redirecting() {
+        let parent = temporary("subprocess-anchor");
+        let original = parent.join("scratch");
+        let moved = parent.join("moved");
+        let outside = parent.join("outside");
+        fs::create_dir(&original).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let scratch = Directory::open_exact(&original, "scratch").unwrap();
+        fs::rename(&original, &moved).unwrap();
+        symlink(&outside, &original).unwrap();
+        scratch
+            .with_inheritable_anchor("scratch", |anchor| {
+                let status = Command::new("sh")
+                    .args(["-c", "printf child > \"$1/child\"", "sh"])
+                    .arg(anchor)
+                    .status()
+                    .map_err(|error| {
+                        Failure::task(format!("could not spawn test child: {error}"))
+                    })?;
+                if !status.success() {
+                    return Err(Failure::task("test child failed"));
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(fs::read(moved.join("child")).unwrap(), b"child");
+        assert!(!outside.join("child").exists());
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn scratch_raii_retires_nested_outputs_on_success_and_error() {
+        let parent = temporary("scratch-cleanup");
+        let directory = Directory::open_exact(&parent, "parent").unwrap();
+        for (name, succeed) in [("success", true), ("failure", false)] {
+            let scratch = directory.create_scratch(name, "scratch").unwrap();
+            scratch
+                .with_inheritable_anchor("scratch", |anchor| {
+                    let status = Command::new("sh")
+                        .args(["-c", "mkdir \"$1/nested\" && printf x > \"$1/nested/file\" && ln -s file \"$1/nested/link\"", "sh"])
+                        .arg(anchor)
+                        .status()
+                        .map_err(|error| Failure::task(format!("could not spawn test child: {error}")))?;
+                    if status.success() { Ok(()) } else { Err(Failure::task("test child failed")) }
+                })
+                .unwrap();
+            let result = if succeed {
+                Ok(())
+            } else {
+                Err(Failure::task("expected primary failure"))
+            };
+            assert_eq!(scratch.finish(result).is_ok(), succeed);
+            assert!(!directory.exists(name, "retired scratch").unwrap());
+        }
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn existence_and_bounded_open_reject_special_files_without_opening_data() {
+        let parent = temporary("special-files");
+        let fifo = parent.join("fifo");
+        let status = Command::new("mkfifo").arg(&fifo).status().unwrap();
+        assert!(status.success());
+        let socket = match UnixListener::bind(parent.join("socket")) {
+            Ok(socket) => Some(socket),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => None,
+            Err(error) => panic!("could not create test socket: {error}"),
+        };
+        let directory = Directory::open_exact(&parent, "special root").unwrap();
+        let mut names = vec!["fifo"];
+        if socket.is_some() {
+            names.push("socket");
+        }
+        for name in names {
+            assert!(directory.exists(name, name).is_err());
+            assert!(directory.read(name, 16, name).is_err());
+        }
+        let devices = Directory::open_exact(Path::new("/dev"), "device root").unwrap();
+        assert!(devices.exists("null", "device").is_err());
+        assert!(devices.read("null", 16, "device").is_err());
+        drop(socket);
         fs::remove_dir_all(parent).unwrap();
     }
 }

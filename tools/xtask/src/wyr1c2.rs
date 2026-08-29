@@ -92,24 +92,37 @@ pub(crate) fn freeze(output: &Path) -> Result<String, Failure> {
     let project_dir = Directory::open_exact(&project, "OS-Project root")?;
     let tmp = open_or_create_tmp(&project_dir)?;
     let scratch_name = unique_scratch_name()?;
-    let scratch = tmp.create_child(&scratch_name, 0o700, "WYR1-C2 build scratch")?;
-    let build = scratch.anchor_path();
-    let uefi = crate::tasks::build_deterministic_uefi_pair(
-        &repository,
-        &toolchain,
-        &profile,
-        &layout,
-        &crate::tasks::IsolatedUefiBuild {
-            cargo_home: &cargo_home,
-            production_target: &build.join("uefi-release"),
-            retained_debug_target: &build.join("uefi-debug"),
-            cargo_profile: crate::tasks::UefiCargoProfile::Release,
-        },
-    )?;
-    let loader = read_bounded_path(&uefi.loader, "loader", MAX_BYTES)?;
-    let bootstrap = build_bootstrap(&repository, &cargo_home, toolchain.accepted(), &build)?;
-    let kernel = build_kernel(&deep, &build.join("deepwyrm-target"))?;
-    let loader_inspection = uefi.inspection_report.into_bytes();
+    let scratch = tmp.create_scratch(&scratch_name, "WYR1-C2 build scratch")?;
+    let build_result = (|| {
+        let (loader, loader_inspection) =
+            scratch.with_inheritable_anchor("WYR1-C2 UEFI build scratch", |build| {
+                let uefi = crate::tasks::build_deterministic_uefi_pair(
+                    &repository,
+                    &toolchain,
+                    &profile,
+                    &layout,
+                    &crate::tasks::IsolatedUefiBuild {
+                        cargo_home: &cargo_home,
+                        production_target: &build.join("uefi-release"),
+                        retained_debug_target: &build.join("uefi-debug"),
+                        cargo_profile: crate::tasks::UefiCargoProfile::Release,
+                    },
+                )?;
+                Ok((
+                    read_bounded_path(&uefi.loader, "loader", MAX_BYTES)?,
+                    uefi.inspection_report.into_bytes(),
+                ))
+            })?;
+        let bootstrap = scratch
+            .with_inheritable_anchor("WYR1-C2 bootstrap build scratch", |build| {
+                build_bootstrap(&repository, &cargo_home, toolchain.accepted(), build)
+            })?;
+        let kernel = scratch.with_inheritable_anchor("WYR1-C2 kernel build scratch", |build| {
+            build_kernel(&deep, &build.join("deepwyrm-target"))
+        })?;
+        Ok::<_, Failure>((loader, loader_inspection, bootstrap, kernel))
+    })();
+    let (loader, loader_inspection, bootstrap, kernel) = scratch.finish(build_result)?;
     if loader_inspection.is_empty() || loader_inspection.len() as u64 > MAX_REPORT_BYTES {
         return Err(Failure::task("C2 loader inspection exceeds its bound"));
     }
@@ -679,8 +692,8 @@ fn validate_revision(revision: &str, label: &str) -> Result<(), Failure> {
 }
 
 fn validate_abi_tree(deep: &Path, kernel_revision: &str) -> Result<(), Failure> {
-    validate_revision(kernel_revision, "Deepwyrm")?;
-    validate_revision(GENERATED_ABI_REVISION, "generated ABI")?;
+    wyr1c::validate_commit(deep, kernel_revision, "Deepwyrm")?;
+    wyr1c::validate_commit(deep, GENERATED_ABI_REVISION, "generated ABI")?;
     let tree = |revision: &str| -> Result<String, Failure> {
         let object = format!("{revision}:abi");
         let bytes = git_output(deep, &["rev-parse", &object], "Deepwyrm ABI tree")?;
