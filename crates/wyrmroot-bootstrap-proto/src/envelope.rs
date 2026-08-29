@@ -8,23 +8,32 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 pub const PROTOCOL_MINOR: u16 = 0;
 /// Canonical H bootstrap protocol minor version with TaskGroup delegation.
 pub const PROTOCOL_MINOR_V2: u16 = 1;
+/// D5's explicit four-capability primordial profile.
+pub const PROTOCOL_MINOR_V3: u16 = 2;
 /// Fixed header size in bytes.
 pub const HEADER_SIZE: usize = 40;
 /// Exact `BOOTSTRAP_INIT_V1` payload size.
 pub const BOOTSTRAP_INIT_V1_SIZE: usize = 56;
 /// Exact `BOOTSTRAP_INIT_V2` payload size.
 pub const BOOTSTRAP_INIT_V2_SIZE: usize = 64;
+/// Exact D5 `BOOTSTRAP_INIT_V3` payload size.
+pub const BOOTSTRAP_INIT_V3_SIZE: usize = 72;
 /// Exact `BOOTSTRAP_READY_V1` payload size.
 pub const BOOTSTRAP_READY_V1_SIZE: usize = 40;
 /// Exact `BOOTSTRAP_READY_V2` payload size.
 pub const BOOTSTRAP_READY_V2_SIZE: usize = 40;
-/// The current H bootstrap envelope permits at most three INIT handles and no READY handles.
-pub const MAX_BOOTSTRAP_HANDLES: usize = 3;
+/// Exact D5 `BOOTSTRAP_READY_V3` payload size.
+pub const BOOTSTRAP_READY_V3_SIZE: usize = 40;
+/// Historical V2 INIT handle count.
+pub const MAX_BOOTSTRAP_V2_HANDLES: usize = 3;
+/// The largest reached primordial INIT profile has four handles.
+pub const MAX_BOOTSTRAP_HANDLES: usize = 4;
 
 const INIT_TYPE: u32 = 1;
 const READY_TYPE: u32 = 2;
 const INIT_CAPABILITY_COUNT: u32 = 2;
 const INIT_V2_CAPABILITY_COUNT: u32 = 3;
+const INIT_V3_CAPABILITY_COUNT: u32 = 4;
 const READY_CAPABILITY_COUNT: u32 = 0;
 const ROLE_DESCRIPTOR_SIZE: usize = 8;
 
@@ -39,6 +48,10 @@ pub enum MessageType {
     BootstrapInitV2,
     /// H's handle-free acknowledgement.
     BootstrapReadyV2,
+    /// D5's explicit four-capability primordial message.
+    BootstrapInitV3,
+    /// D5's handle-free acknowledgement.
+    BootstrapReadyV3,
 }
 
 /// Semantic position of a capability in `BOOTSTRAP_INIT_V1`.
@@ -51,6 +64,8 @@ pub enum CapabilityRole {
     BootfsMemoryObject = 2,
     /// Delegated authority to construct descendant processes.
     LoaderTaskGroup = 3,
+    /// Kernel-minted resource-domain custody; never ordinary loader authority.
+    ResourceDomainTaskGroup = 4,
 }
 
 /// Decoded INIT message. Its two roles are fixed by V1 and are not caller-selectable.
@@ -63,6 +78,12 @@ pub struct InitMessage {
 /// Decoded H INIT message with the exact three V2 roles.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InitMessageV2 {
+    pub transaction_id: u64,
+}
+
+/// Decoded D5 INIT message with the exact four V3 roles.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InitMessageV3 {
     pub transaction_id: u64,
 }
 
@@ -79,6 +100,12 @@ pub struct ReadyMessageV2 {
     pub transaction_id: u64,
 }
 
+/// D5 READY message echoing one V3 transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReadyMessageV3 {
+    pub transaction_id: u64,
+}
+
 /// A successfully decoded V1 bootstrap message.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BootstrapMessage {
@@ -90,6 +117,70 @@ pub enum BootstrapMessage {
     InitV2(InitMessageV2),
     /// A valid H READY.
     ReadyV2(ReadyMessageV2),
+    /// A valid D5 INIT with resource-domain custody.
+    InitV3(InitMessageV3),
+    /// A valid D5 READY.
+    ReadyV3(ReadyMessageV3),
+}
+
+impl InitMessageV3 {
+    pub const fn primordial() -> Self {
+        Self { transaction_id: 1 }
+    }
+
+    pub fn encode_into(self, output: &mut [u8]) -> Result<usize, DecodeError> {
+        if self.transaction_id == 0 {
+            return Err(DecodeError::ZeroTransactionId);
+        }
+        if output.len() < BOOTSTRAP_INIT_V3_SIZE {
+            return Err(DecodeError::EncodeBufferTooSmall);
+        }
+        write_header_version(
+            output,
+            MessageType::BootstrapInitV3,
+            PROTOCOL_MINOR_V3,
+            BOOTSTRAP_INIT_V3_SIZE as u32,
+            INIT_V3_CAPABILITY_COUNT,
+            self.transaction_id,
+        );
+        for (index, role) in [
+            CapabilityRole::SelfRootAddressRegion,
+            CapabilityRole::BootfsMemoryObject,
+            CapabilityRole::LoaderTaskGroup,
+            CapabilityRole::ResourceDomainTaskGroup,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            write_u32(
+                output,
+                HEADER_SIZE + index * ROLE_DESCRIPTOR_SIZE,
+                role as u32,
+            );
+            write_u32(output, HEADER_SIZE + index * ROLE_DESCRIPTOR_SIZE + 4, 0);
+        }
+        Ok(BOOTSTRAP_INIT_V3_SIZE)
+    }
+}
+
+impl ReadyMessageV3 {
+    pub fn encode_into(self, output: &mut [u8]) -> Result<usize, DecodeError> {
+        if self.transaction_id == 0 {
+            return Err(DecodeError::ZeroTransactionId);
+        }
+        if output.len() < BOOTSTRAP_READY_V3_SIZE {
+            return Err(DecodeError::EncodeBufferTooSmall);
+        }
+        write_header_version(
+            output,
+            MessageType::BootstrapReadyV3,
+            PROTOCOL_MINOR_V3,
+            BOOTSTRAP_READY_V3_SIZE as u32,
+            READY_CAPABILITY_COUNT,
+            self.transaction_id,
+        );
+        Ok(BOOTSTRAP_READY_V3_SIZE)
+    }
 }
 
 impl InitMessageV2 {
@@ -251,7 +342,10 @@ pub fn decode(input: &[u8], received_handle_count: usize) -> Result<BootstrapMes
         return Err(DecodeError::UnsupportedMajor);
     }
     let minor = read_u16(input, 6);
-    if !matches!(minor, PROTOCOL_MINOR | PROTOCOL_MINOR_V2) {
+    if !matches!(
+        minor,
+        PROTOCOL_MINOR | PROTOCOL_MINOR_V2 | PROTOCOL_MINOR_V3
+    ) {
         return Err(DecodeError::UnsupportedMinor);
     }
     if read_u32(input, 12) != 0 {
@@ -268,11 +362,17 @@ pub fn decode(input: &[u8], received_handle_count: usize) -> Result<BootstrapMes
         INIT_TYPE if minor == PROTOCOL_MINOR => {
             decode_init(input, received_handle_count, transaction_id)
         }
-        INIT_TYPE => decode_init_v2(input, received_handle_count, transaction_id),
+        INIT_TYPE if minor == PROTOCOL_MINOR_V2 => {
+            decode_init_v2(input, received_handle_count, transaction_id)
+        }
+        INIT_TYPE => decode_init_v3(input, received_handle_count, transaction_id),
         READY_TYPE if minor == PROTOCOL_MINOR => {
             decode_ready(input, received_handle_count, transaction_id)
         }
-        READY_TYPE => decode_ready_v2(input, received_handle_count, transaction_id),
+        READY_TYPE if minor == PROTOCOL_MINOR_V2 => {
+            decode_ready_v2(input, received_handle_count, transaction_id)
+        }
+        READY_TYPE => decode_ready_v3(input, received_handle_count, transaction_id),
         _ => Err(DecodeError::UnknownMessageType),
     }
 }
@@ -289,7 +389,7 @@ fn decode_init_v2(
     if read_u32(input, 20) != INIT_V2_CAPABILITY_COUNT {
         return Err(DecodeError::WrongCapabilityCount);
     }
-    if received_handle_count != MAX_BOOTSTRAP_HANDLES {
+    if received_handle_count != MAX_BOOTSTRAP_V2_HANDLES {
         return Err(DecodeError::WrongHandleCount);
     }
     for (index, role) in [
@@ -307,6 +407,38 @@ fn decode_init_v2(
         }
     }
     Ok(BootstrapMessage::InitV2(InitMessageV2 { transaction_id }))
+}
+
+fn decode_init_v3(
+    input: &[u8],
+    received_handle_count: usize,
+    transaction_id: u64,
+) -> Result<BootstrapMessage, DecodeError> {
+    if read_u32(input, 16) != BOOTSTRAP_INIT_V3_SIZE as u32 || input.len() != BOOTSTRAP_INIT_V3_SIZE
+    {
+        return Err(DecodeError::WrongTotalSize);
+    }
+    if read_u32(input, 20) != INIT_V3_CAPABILITY_COUNT
+        || received_handle_count != MAX_BOOTSTRAP_HANDLES
+    {
+        return Err(DecodeError::WrongCapabilityCount);
+    }
+    for (index, role) in [
+        CapabilityRole::SelfRootAddressRegion,
+        CapabilityRole::BootfsMemoryObject,
+        CapabilityRole::LoaderTaskGroup,
+        CapabilityRole::ResourceDomainTaskGroup,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if read_u32(input, HEADER_SIZE + index * ROLE_DESCRIPTOR_SIZE) != role as u32
+            || read_u32(input, HEADER_SIZE + index * ROLE_DESCRIPTOR_SIZE + 4) != 0
+        {
+            return Err(DecodeError::WrongCapabilityRoles);
+        }
+    }
+    Ok(BootstrapMessage::InitV3(InitMessageV3 { transaction_id }))
 }
 
 fn decode_init(
@@ -373,6 +505,22 @@ fn decode_ready_v2(
     Ok(BootstrapMessage::ReadyV2(ReadyMessageV2 { transaction_id }))
 }
 
+fn decode_ready_v3(
+    input: &[u8],
+    received_handle_count: usize,
+    transaction_id: u64,
+) -> Result<BootstrapMessage, DecodeError> {
+    if read_u32(input, 16) != BOOTSTRAP_READY_V3_SIZE as u32
+        || input.len() != BOOTSTRAP_READY_V3_SIZE
+    {
+        return Err(DecodeError::WrongTotalSize);
+    }
+    if read_u32(input, 20) != READY_CAPABILITY_COUNT || received_handle_count != 0 {
+        return Err(DecodeError::WrongHandleCount);
+    }
+    Ok(BootstrapMessage::ReadyV3(ReadyMessageV3 { transaction_id }))
+}
+
 fn write_header(
     output: &mut [u8],
     message_type: MessageType,
@@ -410,6 +558,8 @@ fn write_header_version(
             MessageType::BootstrapReadyV1 => READY_TYPE,
             MessageType::BootstrapInitV2 => INIT_TYPE,
             MessageType::BootstrapReadyV2 => READY_TYPE,
+            MessageType::BootstrapInitV3 => INIT_TYPE,
+            MessageType::BootstrapReadyV3 => READY_TYPE,
         },
     );
     write_u32(output, 16, total_size);
@@ -472,6 +622,34 @@ mod tests {
     ];
 
     #[test]
+    fn d5_v3_round_trip_preserves_the_explicit_fourth_role() {
+        let mut init = [0u8; BOOTSTRAP_INIT_V3_SIZE];
+        assert_eq!(
+            InitMessageV3::primordial().encode_into(&mut init),
+            Ok(BOOTSTRAP_INIT_V3_SIZE)
+        );
+        assert_eq!(
+            decode(&init, MAX_BOOTSTRAP_HANDLES),
+            Ok(BootstrapMessage::InitV3(InitMessageV3::primordial()))
+        );
+        assert_eq!(
+            decode(&init, MAX_BOOTSTRAP_V2_HANDLES),
+            Err(DecodeError::WrongCapabilityCount)
+        );
+        let mut ready = [0u8; BOOTSTRAP_READY_V3_SIZE];
+        assert_eq!(
+            ReadyMessageV3 { transaction_id: 1 }.encode_into(&mut ready),
+            Ok(BOOTSTRAP_READY_V3_SIZE)
+        );
+        assert_eq!(
+            decode(&ready, 0),
+            Ok(BootstrapMessage::ReadyV3(ReadyMessageV3 {
+                transaction_id: 1
+            }))
+        );
+    }
+
+    #[test]
     fn g0_golden_vectors_round_trip() {
         let mut init = [0u8; BOOTSTRAP_INIT_V1_SIZE];
         assert_eq!(
@@ -526,7 +704,7 @@ mod tests {
         let cases = [
             (0usize, 0x58, DecodeError::WrongMagic),
             (4, 2, DecodeError::UnsupportedMajor),
-            (6, 2, DecodeError::UnsupportedMinor),
+            (6, 3, DecodeError::UnsupportedMinor),
             (8, 3, DecodeError::UnknownMessageType),
             (12, 1, DecodeError::NonzeroFlags),
             (16, 55, DecodeError::WrongTotalSize),

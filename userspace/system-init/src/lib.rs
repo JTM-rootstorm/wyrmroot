@@ -26,7 +26,10 @@ use deepwyrm_syscall::{
 };
 use wyrmroot_bootfs::archive::{Archive, LookupError, ParseError};
 use wyrmroot_loader::{
-    launch::{HEADER_BYTES, LaunchProfile, SUPERVISOR_BYTES, encode_ready_for_profile, parse_init},
+    launch::{
+        HEADER_BYTES, LaunchProfile, RESOURCE_DOMAIN_CLAIM_RIGHTS, RESOURCE_DOMAIN_CUSTODY_RIGHTS,
+        SUPERVISOR_BYTES, encode_ready_for_profile, parse_init,
+    },
     process::{
         LoadAuthority, LoadError, LoadRequest, LoadedProcess, LoaderPlatform, ServiceLoadRequest,
         load_process, load_service_process,
@@ -262,6 +265,76 @@ pub struct ResidentSystemInit {
     wyr1b_evidence: Option<wyr1b_gate::EvidenceLog>,
     wyr1c: Option<wyr1c_native::ResidentState>,
 }
+
+/// Broad primordial resource-domain custody. It is intentionally not a field
+/// of [`LoadAuthority`]: ordinary process construction must not manufacture
+/// or absorb device-claim authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResourceDomainCustody {
+    resource_domain: DwHandle,
+}
+
+impl ResourceDomainCustody {
+    pub const fn new(resource_domain: DwHandle) -> Self {
+        Self { resource_domain }
+    }
+
+    pub const fn handle(self) -> DwHandle {
+        self.resource_domain
+    }
+
+    /// Models the only D5 reduction init may make for a devmgr-generation
+    /// descendant. Membership is kernel-authoritative; this seam refuses to
+    /// represent a claim capability for init itself or another outsider.
+    pub fn devmgr_claim_authority(
+        self,
+        membership: ResourceDomainMembership,
+    ) -> Result<ReducedResourceDomainAuthority, ResourceDomainCustodyError> {
+        match membership {
+            ResourceDomainMembership::InitOutsideDomain | ResourceDomainMembership::Unrelated => {
+                Err(ResourceDomainCustodyError::OutsideResourceDomain)
+            }
+            ResourceDomainMembership::DevmgrGenerationDescendant => {
+                Ok(ReducedResourceDomainAuthority {
+                    resource_domain: self.resource_domain,
+                    rights: RESOURCE_DOMAIN_CLAIM_RIGHTS,
+                })
+            }
+        }
+    }
+}
+
+/// D5 model membership relation. It records the kernel custody predicate but
+/// does not implement a userspace claim syscall.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResourceDomainMembership {
+    InitOutsideDomain,
+    Unrelated,
+    DevmgrGenerationDescendant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReducedResourceDomainAuthority {
+    resource_domain: DwHandle,
+    rights: DwRights,
+}
+
+impl ReducedResourceDomainAuthority {
+    pub const fn handle(self) -> DwHandle {
+        self.resource_domain
+    }
+    pub const fn rights(self) -> DwRights {
+        self.rights
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResourceDomainCustodyError {
+    OutsideResourceDomain,
+}
+
+/// Explicit broad-rights identity used by focused D5 model tests.
+pub const RESOURCE_DOMAIN_CUSTODY_PROFILE_RIGHTS: DwRights = RESOURCE_DOMAIN_CUSTODY_RIGHTS;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ActiveNativeRole {
@@ -2464,6 +2537,25 @@ pub const fn cleanup_is_permanent(state: RestartState) -> bool {
 #[cfg(test)]
 mod native_cleanup_tests {
     use super::*;
+
+    #[test]
+    fn resource_domain_custody_reduces_only_for_a_devmgr_descendant() {
+        let custody = ResourceDomainCustody::new(DwHandle(44));
+        assert_eq!(
+            custody.devmgr_claim_authority(ResourceDomainMembership::InitOutsideDomain),
+            Err(ResourceDomainCustodyError::OutsideResourceDomain)
+        );
+        assert_eq!(
+            custody.devmgr_claim_authority(ResourceDomainMembership::Unrelated),
+            Err(ResourceDomainCustodyError::OutsideResourceDomain)
+        );
+        let reduced = custody
+            .devmgr_claim_authority(ResourceDomainMembership::DevmgrGenerationDescendant)
+            .expect("devmgr descendant receives reduced claim authority");
+        assert_eq!(reduced.handle(), DwHandle(44));
+        assert_eq!(reduced.rights(), RESOURCE_DOMAIN_CLAIM_RIGHTS);
+        assert_ne!(reduced.rights(), RESOURCE_DOMAIN_CUSTODY_PROFILE_RIGHTS);
+    }
     use deepwyrm_syscall::{
         DW_TASK_STATE_EXITED, DW_TASK_TERMINATION_INFO_V1_SIZE, DW_WAIT_RESULT_V1_SIZE, DwStatus,
         DwTaskState, DwTaskTerminationInfoV1, DwWaitResultV1,

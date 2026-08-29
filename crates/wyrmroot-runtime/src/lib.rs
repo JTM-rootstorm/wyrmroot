@@ -38,8 +38,9 @@ mod test_support;
 pub use bootstrap::{
     BOOTFS_EXPECTATION, BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityExpectation, CapabilityInfo,
     CapabilityValidationError, InitCapability, LOADER_TASK_GROUP_EXPECTATION,
-    MAX_BOOTFS_LOGICAL_SIZE, MappingPlan, MappingPlanError, PAGE_SIZE, SELF_ROOT_EXPECTATION,
-    validate_bootstrap_channel, validate_init_capabilities, validate_init_capabilities_v2,
+    MAX_BOOTFS_LOGICAL_SIZE, MappingPlan, MappingPlanError, PAGE_SIZE,
+    RESOURCE_DOMAIN_TASK_GROUP_EXPECTATION, SELF_ROOT_EXPECTATION, validate_bootstrap_channel,
+    validate_init_capabilities, validate_init_capabilities_v2, validate_init_capabilities_v3,
 };
 pub use bounded_accounting::{
     AccountedResource, AccountingError, EnforcementClass, GenerationRetirement,

@@ -698,7 +698,8 @@ impl LoaderPlatform for SmokeLoader {
             | launch::LaunchProfile::Dw1bProgress
             | launch::LaunchProfile::JobV2Streams
             | launch::LaunchProfile::DeviceCoordinator
-            | launch::LaunchProfile::DeviceDriver => {
+            | launch::LaunchProfile::DeviceDriver
+            | launch::LaunchProfile::SupervisorResourceDomain => {
                 return Err(NativeError::Status(DW_STATUS_BAD_HANDLE));
             }
         };

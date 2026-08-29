@@ -235,7 +235,7 @@ fn run_init0_bootstrap_with_fault_and_before_supervision<
 
     let mut bytes = [0_u8; wyrmroot_bootstrap_proto::BOOTSTRAP_INIT_V2_SIZE];
     let mut handles =
-        [DwReceivedHandleInfoV1::default(); wyrmroot_bootstrap_proto::MAX_BOOTSTRAP_HANDLES];
+        [DwReceivedHandleInfoV1::default(); wyrmroot_bootstrap_proto::MAX_BOOTSTRAP_V2_HANDLES];
     let counts = system
         .receive_channel(bootstrap_channel, &mut bytes, &mut handles)
         .map_err(BootstrapError::Native)?;
@@ -561,7 +561,7 @@ pub fn run_loader_smoke_bootstrap<
 
     let mut bytes = [0_u8; wyrmroot_bootstrap_proto::BOOTSTRAP_INIT_V2_SIZE];
     let mut handles =
-        [DwReceivedHandleInfoV1::default(); wyrmroot_bootstrap_proto::MAX_BOOTSTRAP_HANDLES];
+        [DwReceivedHandleInfoV1::default(); wyrmroot_bootstrap_proto::MAX_BOOTSTRAP_V2_HANDLES];
     let counts = system
         .receive_channel(bootstrap_channel, &mut bytes, &mut handles)
         .map_err(BootstrapError::Native)?;

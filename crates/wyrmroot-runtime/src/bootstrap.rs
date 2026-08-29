@@ -3,8 +3,8 @@
 use deepwyrm_syscall::{
     DW_BASE_PAGE_SIZE, DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL,
     DW_OBJECT_TYPE_MEMORY_OBJECT, DW_OBJECT_TYPE_TASK_GROUP, DW_RIGHT_DUPLICATE, DW_RIGHT_INSPECT,
-    DW_RIGHT_MAP, DW_RIGHT_MODIFY, DW_RIGHT_READ, DW_RIGHT_TRANSFER, DW_RIGHT_WAIT, DW_RIGHT_WRITE,
-    DwObjectType, DwRights,
+    DW_RIGHT_MAP, DW_RIGHT_MODIFY, DW_RIGHT_READ, DW_RIGHT_RESOURCE, DW_RIGHT_TRANSFER,
+    DW_RIGHT_WAIT, DW_RIGHT_WRITE, DwObjectType, DwRights,
 };
 
 /// Native page size required by the D0 mapping contract.
@@ -63,6 +63,20 @@ pub const LOADER_TASK_GROUP_EXPECTATION: CapabilityExpectation<DwObjectType, DwR
         object_type: DW_OBJECT_TYPE_TASK_GROUP,
         rights: DwRights(
             DW_RIGHT_MODIFY.0 | DW_RIGHT_INSPECT.0 | DW_RIGHT_DUPLICATE.0 | DW_RIGHT_TRANSFER.0,
+        ),
+    };
+
+/// Exact D5 custody capability. It is deliberately distinct from ordinary
+/// loader construction authority, even though both name TaskGroup objects.
+pub const RESOURCE_DOMAIN_TASK_GROUP_EXPECTATION: CapabilityExpectation<DwObjectType, DwRights> =
+    CapabilityExpectation {
+        object_type: DW_OBJECT_TYPE_TASK_GROUP,
+        rights: DwRights(
+            DW_RIGHT_MODIFY.0
+                | DW_RIGHT_DUPLICATE.0
+                | DW_RIGHT_TRANSFER.0
+                | DW_RIGHT_INSPECT.0
+                | DW_RIGHT_RESOURCE.0,
         ),
     };
 
@@ -138,6 +152,37 @@ pub fn validate_init_capabilities_v2<ObjectType: Eq, Rights: Eq>(
         (&capabilities[0], &root),
         (&capabilities[1], &bootfs),
         (&capabilities[2], &task_group),
+    ] {
+        if capability.received.object_type != expected.object_type
+            || capability.received.rights != expected.rights
+        {
+            return Err(CapabilityValidationError::InvalidReceivedCapability);
+        }
+        if capability.fresh.object_type != expected.object_type
+            || capability.fresh.rights != expected.rights
+        {
+            return Err(CapabilityValidationError::InvalidFreshCapability);
+        }
+    }
+    Ok(())
+}
+
+/// Validates D5's explicit ordered four-capability primordial profile.
+pub fn validate_init_capabilities_v3<ObjectType: Eq, Rights: Eq>(
+    capabilities: &[InitCapability<ObjectType, Rights>],
+    root: CapabilityExpectation<ObjectType, Rights>,
+    bootfs: CapabilityExpectation<ObjectType, Rights>,
+    task_group: CapabilityExpectation<ObjectType, Rights>,
+    resource_domain: CapabilityExpectation<ObjectType, Rights>,
+) -> Result<(), CapabilityValidationError> {
+    if capabilities.len() != 4 {
+        return Err(CapabilityValidationError::WrongInitCapabilityCount);
+    }
+    for (capability, expected) in [
+        (&capabilities[0], &root),
+        (&capabilities[1], &bootfs),
+        (&capabilities[2], &task_group),
+        (&capabilities[3], &resource_domain),
     ] {
         if capability.received.object_type != expected.object_type
             || capability.received.rights != expected.rights
@@ -308,6 +353,43 @@ mod tests {
         );
         assert_eq!(
             validate_init_capabilities(&[cap(Object::Region, Rights(2))], ROOT, BOOTFS),
+            Err(CapabilityValidationError::WrongInitCapabilityCount)
+        );
+    }
+
+    #[test]
+    fn v3_requires_a_distinct_fourth_custody_capability() {
+        let custody = CapabilityExpectation {
+            object_type: Object::Memory,
+            rights: Rights(4),
+        };
+        assert_eq!(
+            validate_init_capabilities_v3(
+                &[
+                    cap(Object::Region, Rights(2)),
+                    cap(Object::Memory, Rights(3)),
+                    cap(Object::Channel, Rights(1)),
+                    cap(Object::Memory, Rights(4))
+                ],
+                ROOT,
+                BOOTFS,
+                CHANNEL,
+                custody,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_init_capabilities_v3(
+                &[
+                    cap(Object::Region, Rights(2)),
+                    cap(Object::Memory, Rights(3)),
+                    cap(Object::Channel, Rights(1))
+                ],
+                ROOT,
+                BOOTFS,
+                CHANNEL,
+                custody,
+            ),
             Err(CapabilityValidationError::WrongInitCapabilityCount)
         );
     }

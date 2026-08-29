@@ -151,7 +151,7 @@ use deepwyrm_syscall::{
 use wyrmroot_bootfs::archive::{Archive, LookupError, ParseError};
 use wyrmroot_bootstrap_proto::{
     BOOTSTRAP_INIT_V2_SIZE, BOOTSTRAP_READY_V2_SIZE, BootstrapMessage, DecodeError, InitMessageV2,
-    MAX_BOOTSTRAP_HANDLES, ReadyMessageV2, decode,
+    MAX_BOOTSTRAP_V2_HANDLES, ReadyMessageV2, decode,
 };
 use wyrmroot_loader::launch::{LaunchError, LaunchProfile};
 use wyrmroot_loader::process::{
@@ -191,7 +191,7 @@ pub fn run_supervisor_bootstrap<
     validate_bootstrap_channel(channel_info, BOOTSTRAP_CHANNEL_EXPECTATION)
         .map_err(BootstrapError::BootstrapChannel)?;
     let mut bytes = [0; BOOTSTRAP_INIT_V2_SIZE];
-    let mut handles = [DwReceivedHandleInfoV1::default(); MAX_BOOTSTRAP_HANDLES];
+    let mut handles = [DwReceivedHandleInfoV1::default(); MAX_BOOTSTRAP_V2_HANDLES];
     let counts = system
         .receive_channel(bootstrap_channel, &mut bytes, &mut handles)
         .map_err(BootstrapError::Native)?;
@@ -751,7 +751,7 @@ fn run_bootstrap_inner<System: BootstrapSystem>(
         .map_err(BootstrapError::BootstrapChannel)?;
 
     let mut bytes = [0_u8; BOOTSTRAP_INIT_V2_SIZE];
-    let mut handles = [DwReceivedHandleInfoV1::default(); MAX_BOOTSTRAP_HANDLES];
+    let mut handles = [DwReceivedHandleInfoV1::default(); MAX_BOOTSTRAP_V2_HANDLES];
     let counts = system
         .receive_channel(bootstrap_channel, &mut bytes, &mut handles)
         .map_err(BootstrapError::Native)?;
@@ -809,7 +809,7 @@ fn process_init<System: BootstrapSystem>(
     system: &mut System,
     handles: &[DwReceivedHandleInfoV1],
 ) -> Result<(), BootstrapError> {
-    if handles.len() != MAX_BOOTSTRAP_HANDLES {
+    if handles.len() != MAX_BOOTSTRAP_V2_HANDLES {
         return Err(BootstrapError::Capability(
             CapabilityValidationError::WrongInitCapabilityCount,
         ));
@@ -865,7 +865,7 @@ fn validated_load_authority<System: BootstrapSystem>(
     system: &mut System,
     handles: &[DwReceivedHandleInfoV1],
 ) -> Result<LoadAuthority, BootstrapError> {
-    if handles.len() != MAX_BOOTSTRAP_HANDLES {
+    if handles.len() != MAX_BOOTSTRAP_V2_HANDLES {
         return Err(BootstrapError::Capability(
             CapabilityValidationError::WrongInitCapabilityCount,
         ));

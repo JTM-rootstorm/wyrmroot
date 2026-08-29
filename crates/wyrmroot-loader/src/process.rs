@@ -51,6 +51,16 @@ pub struct LoadRequest<'a> {
     pub transaction_id: u64,
 }
 
+/// Explicit D5 `/system/init` request. Resource-domain custody is carried
+/// beside ordinary load authority and cannot be substituted for it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResourceDomainLoadRequest<'a> {
+    pub image: &'a [u8],
+    pub display_path: &'a str,
+    pub resource_domain: DwHandle,
+    pub transaction_id: u64,
+}
+
 /// WYR1-B launch request using startup ABI v2 and the WRLP 1.3 JobV2 profile.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JobLoadRequest<'a> {
@@ -131,6 +141,7 @@ struct InternalLoadRequest<'a> {
     device_manifest: Option<DwHandle>,
     supervisor_generation: Option<u64>,
     driver_correlation: Option<(u64, u64, u64, u64, u64, u64)>,
+    resource_domain: Option<DwHandle>,
 }
 
 /// Explicitly selected, test-only corruption of one child-launch boundary.
@@ -380,6 +391,7 @@ struct Transaction {
     parent_mapping: Option<ParentMapping>,
     delegated_bootfs: Option<DwHandle>,
     delegated_task_group: Option<DwHandle>,
+    delegated_resource_domain: Option<DwHandle>,
     delegated_channels: [Option<DwHandle>; 3],
     delegated_manifest: Option<DwHandle>,
     ranges: [Range; MAX_CHILD_RANGES],
@@ -400,6 +412,7 @@ impl Transaction {
             parent_mapping: None,
             delegated_bootfs: None,
             delegated_task_group: None,
+            delegated_resource_domain: None,
             delegated_channels: [None; 3],
             delegated_manifest: None,
             ranges: [Range {
@@ -446,6 +459,7 @@ impl Transaction {
         for handle in [
             self.scratch_memory.take(),
             self.delegated_task_group.take(),
+            self.delegated_resource_domain.take(),
             self.delegated_bootfs.take(),
             self.delegated_channels[0].take(),
             self.delegated_channels[1].take(),
@@ -472,6 +486,33 @@ pub fn load_process<P: LoaderPlatform>(
     load_process_with_fault(platform, authority, request, LoadFault::None)
 }
 
+/// Launches only the D5-selected supervisor profile with the resource-domain
+/// custodian. Historical callers remain on their exact three-capability path.
+pub fn load_resource_domain_process<P: LoaderPlatform>(
+    platform: &mut P,
+    authority: LoadAuthority,
+    request: ResourceDomainLoadRequest<'_>,
+) -> Result<LoadedProcess, LoadError<P::Error>> {
+    let mut consumed = false;
+    load_process_internal(
+        platform,
+        authority,
+        InternalLoadRequest {
+            image: request.image,
+            profile: LaunchProfile::SupervisorResourceDomain,
+            transaction_id: request.transaction_id,
+            startup: StartupSpec::Legacy(request.display_path),
+            channels: &[],
+            device_manifest: None,
+            supervisor_generation: None,
+            driver_correlation: None,
+            resource_domain: Some(request.resource_domain),
+        },
+        LoadFault::None,
+        &mut consumed,
+    )
+}
+
 /// Runs one child-construction transaction with an explicitly test-selected
 /// malformed-input boundary.
 ///
@@ -496,6 +537,7 @@ pub fn load_process_with_fault<P: LoaderPlatform>(
             device_manifest: None,
             supervisor_generation: None,
             driver_correlation: None,
+            resource_domain: None,
         },
         fault,
         &mut delegated_channels_consumed,
@@ -534,6 +576,7 @@ pub fn load_job_process<P: LoaderPlatform>(
             device_manifest: None,
             supervisor_generation: None,
             driver_correlation: None,
+            resource_domain: None,
         },
         LoadFault::None,
         &mut delegated_channels_consumed,
@@ -601,6 +644,7 @@ pub fn load_service_process<P: LoaderPlatform>(
             device_manifest: None,
             supervisor_generation: None,
             driver_correlation: None,
+            resource_domain: None,
         },
         LoadFault::None,
         &mut service_channel_consumed,
@@ -638,6 +682,7 @@ pub fn load_device_coordinator_process<P: LoaderPlatform>(
             device_manifest: Some(request.manifest),
             supervisor_generation: Some(request.supervisor_generation),
             driver_correlation: None,
+            resource_domain: None,
         },
         LoadFault::None,
         &mut inputs_consumed,
@@ -690,6 +735,7 @@ pub fn load_device_driver_process<P: LoaderPlatform>(
                 request.endpoint_id,
                 request.endpoint_generation,
             )),
+            resource_domain: None,
         },
         LoadFault::None,
         &mut consumed,
@@ -1082,8 +1128,10 @@ fn load_process_materialized<P: LoaderPlatform>(
     };
     transaction.thread = Some(thread);
 
-    let mut transfers = [DwHandleTransferV1::default(); 3];
-    let transfer_count = if request.profile.has_loader_authority_trio() {
+    let mut transfers = [DwHandleTransferV1::default(); 4];
+    let transfer_count = if request.profile.has_loader_authority_trio()
+        || request.profile.has_loader_authority_quartet()
+    {
         let bootfs = match platform.duplicate(authority.bootfs, BOOTFS_RIGHTS) {
             Ok(handle) => handle,
             Err(cause) => {
@@ -1111,7 +1159,27 @@ fn load_process_materialized<P: LoaderPlatform>(
         transfers[0] = transfer(created.root, SELF_ROOT_RIGHTS);
         transfers[1] = transfer(bootfs, BOOTFS_RIGHTS);
         transfers[2] = transfer(task_group, LOADER_TASK_GROUP_RIGHTS);
-        3
+        if request.profile.has_loader_authority_quartet() {
+            let domain = request
+                .resource_domain
+                .ok_or(LoadError::Launch(LaunchError::HandleCount))?;
+            let domain = match platform.duplicate(domain, launch::RESOURCE_DOMAIN_CUSTODY_RIGHTS) {
+                Ok(handle) => handle,
+                Err(cause) => {
+                    return Err(fail(
+                        platform,
+                        &mut transaction,
+                        LoadStage::CapabilityDuplicate,
+                        cause,
+                    ));
+                }
+            };
+            transaction.delegated_resource_domain = Some(domain);
+            transfers[3] = transfer(domain, launch::RESOURCE_DOMAIN_CUSTODY_RIGHTS);
+            4
+        } else {
+            3
+        }
     } else if request.profile == LaunchProfile::Dw1bProgress {
         transaction.delegated_channels[0] = Some(request.channels[0]);
         transfers[0] = transfer(request.channels[0], launch::CHILD_CHANNEL_RIGHTS);
@@ -1171,9 +1239,12 @@ fn load_process_materialized<P: LoaderPlatform>(
     transaction.delegated_manifest = None;
     if request.profile.needs_self_root() {
         transaction.root = None;
-        if request.profile.has_loader_authority_trio() {
+        if request.profile.has_loader_authority_trio()
+            || request.profile.has_loader_authority_quartet()
+        {
             transaction.delegated_bootfs = None;
             transaction.delegated_task_group = None;
+            transaction.delegated_resource_domain = None;
         }
     } else if let Err(cause) = platform.close(created.root) {
         return Err(fail(
