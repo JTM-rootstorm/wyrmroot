@@ -10,7 +10,7 @@ pub const MAJOR: u16 = 1;
 pub const MINOR: u16 = 0;
 pub const HEADER_BYTES: usize = 72;
 pub const CONFIGURE_BYTES: usize = HEADER_BYTES + 16;
-pub const RESOURCE_BUNDLE_BYTES: usize = HEADER_BYTES + 16;
+pub const RESOURCE_BUNDLE_BYTES: usize = HEADER_BYTES;
 pub const READY_BYTES: usize = HEADER_BYTES;
 pub const FAILURE_BYTES: usize = HEADER_BYTES + 8;
 pub const RETIRE_BYTES: usize = HEADER_BYTES;
@@ -21,7 +21,7 @@ pub const FAILURE_HANDLE_COUNT: u32 = 0;
 pub const RETIRE_HANDLE_COUNT: u32 = 0;
 
 use crate::coordinator::{AttemptGeneration, BundleGeneration, EndpointGeneration, EndpointId};
-use crate::manifest::{ProfileId, ProfileVersion, RoleId};
+use crate::manifest::{PROFILE_Q35, PROFILE_Q35_VERSION, ProfileId, ProfileVersion, RoleId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ControlEndpoint {
@@ -115,7 +115,8 @@ impl ControlMessage {
 
     pub const fn wire_size(self) -> usize {
         match self {
-            Self::Configure { .. } | Self::ResourceBundle { .. } => CONFIGURE_BYTES,
+            Self::Configure { .. } => CONFIGURE_BYTES,
+            Self::ResourceBundle { .. } => RESOURCE_BUNDLE_BYTES,
             Self::Ready { .. } | Self::Retire { .. } => HEADER_BYTES,
             Self::Failure { .. } => FAILURE_BYTES,
         }
@@ -166,7 +167,7 @@ pub fn parse(bytes: &[u8]) -> Result<ControlMessage, ControlParseError> {
     if get16(bytes, 4) != MAJOR || get16(bytes, 6) != MINOR {
         return Err(ControlParseError::WrongVersion);
     }
-    if get32(bytes, 12) != 0 || get32(bytes, 24) == 0 || get64(bytes, 64) == 0 {
+    if get32(bytes, 12) != 0 || get64(bytes, 64) == 0 {
         return Err(if get32(bytes, 12) != 0 {
             ControlParseError::NonzeroFlags
         } else {
@@ -186,24 +187,17 @@ pub fn parse(bytes: &[u8]) -> Result<ControlMessage, ControlParseError> {
         generation: EndpointGeneration(get64(bytes, 56)),
     };
     let transaction_id = get64(bytes, 64);
-    let common = (
-        role_id,
-        bundle_generation,
-        attempt_generation,
-        endpoint,
-        transaction_id,
-    );
     let message = match get32(bytes, 8) {
         1 => {
             if bytes.len() != CONFIGURE_BYTES
                 || handles != CONFIGURE_HANDLE_COUNT
-                || get_u64(bytes, HEADER_BYTES + 8) != 0
+                || get64(bytes, HEADER_BYTES + 8) != 0
             {
                 return Err(ControlParseError::WrongSize);
             }
             let profile = ProfileId(get32(bytes, HEADER_BYTES));
             let profile_version = ProfileVersion(get32(bytes, HEADER_BYTES + 4));
-            if profile.0 == 0 || profile_version.0 == 0 {
+            if profile != PROFILE_Q35 || profile_version != PROFILE_Q35_VERSION {
                 return Err(ControlParseError::InvalidProfile);
             }
             ControlMessage::Configure {
@@ -217,10 +211,7 @@ pub fn parse(bytes: &[u8]) -> Result<ControlMessage, ControlParseError> {
             }
         }
         2 => {
-            if bytes.len() != RESOURCE_BUNDLE_BYTES
-                || handles != RESOURCE_BUNDLE_HANDLE_COUNT
-                || get_u64(bytes, HEADER_BYTES + 8) != 0
-            {
+            if bytes.len() != RESOURCE_BUNDLE_BYTES || handles != RESOURCE_BUNDLE_HANDLE_COUNT {
                 return Err(ControlParseError::WrongHandleCount);
             }
             ControlMessage::ResourceBundle {
@@ -273,7 +264,6 @@ pub fn parse(bytes: &[u8]) -> Result<ControlMessage, ControlParseError> {
         }
         _ => return Err(ControlParseError::UnknownMessage),
     };
-    let _ = common;
     validate_identity(message)?;
     Ok(message)
 }
@@ -291,6 +281,15 @@ fn validate_identity(message: ControlMessage) -> Result<(), ControlParseError> {
         || transaction_id(message) == 0
     {
         return Err(ControlParseError::ZeroIdentity);
+    }
+    if let ControlMessage::Configure {
+        profile,
+        profile_version,
+        ..
+    } = message
+        && (profile != PROFILE_Q35 || profile_version != PROFILE_Q35_VERSION)
+    {
+        return Err(ControlParseError::InvalidProfile);
     }
     Ok(())
 }
@@ -388,10 +387,6 @@ fn get32(bytes: &[u8], offset: usize) -> u32 {
 fn get64(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("fixed header"))
 }
-fn get_u64(bytes: &[u8], offset: usize) -> u64 {
-    get64(bytes, offset)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

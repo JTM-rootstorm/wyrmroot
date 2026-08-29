@@ -62,7 +62,7 @@ pub enum CoordinatorState {
     Matched,
     LaunchingDriver,
     AwaitingDriverReady,
-    DriverReady,
+    AwaitingPublication,
     Published,
     CleaningUp,
     Backoff {
@@ -109,6 +109,7 @@ pub struct Coordinator<'a> {
     next_attempt: u64,
     next_session: u64,
     next_endpoint: u64,
+    last_bundle_generation: u64,
 }
 
 impl<'a> Coordinator<'a> {
@@ -131,6 +132,7 @@ impl<'a> Coordinator<'a> {
             next_attempt: 1,
             next_session: 1,
             next_endpoint: 1,
+            last_bundle_generation: 0,
         })
     }
 
@@ -175,14 +177,6 @@ impl<'a> Coordinator<'a> {
         Ok(())
     }
 
-    pub fn start(&mut self) -> Result<(), CoordinatorError> {
-        if self.state != CoordinatorState::Starting || self.role.is_none() {
-            return Err(CoordinatorError::InvalidState);
-        }
-        self.state = CoordinatorState::WaitingForRegistry;
-        Ok(())
-    }
-
     pub fn registry_ready(&mut self, binding: RegistryBinding) -> Result<(), CoordinatorError> {
         validate_registry(binding)?;
         if self.state != CoordinatorState::WaitingForRegistry {
@@ -208,6 +202,9 @@ impl<'a> Coordinator<'a> {
         self.registry = Some(binding);
         self.publication_endpoint = None;
         self.published_generation = None;
+        if self.state == CoordinatorState::Published {
+            self.state = CoordinatorState::AwaitingPublication;
+        }
         Ok(())
     }
 
@@ -218,6 +215,11 @@ impl<'a> Coordinator<'a> {
         if bundle.generation.0 == 0 || self.role.map(|role| role.role_id) != Some(bundle.role_id) {
             return Err(CoordinatorError::InvalidBundle);
         }
+        if bundle.generation.0 <= self.last_bundle_generation {
+            return Err(CoordinatorError::StaleBundle);
+        }
+        self.last_bundle_generation = bundle.generation.0;
+        self.attempts_started = 0;
         self.bundle = Some(bundle);
         self.state = CoordinatorState::Matched;
         Ok(())
@@ -276,7 +278,7 @@ impl<'a> Coordinator<'a> {
     }
 
     pub fn driver_ready(&mut self, endpoint: DriverEndpoint) -> Result<(), CoordinatorError> {
-        if self.state == CoordinatorState::DriverReady {
+        if self.state == CoordinatorState::AwaitingPublication {
             return Err(CoordinatorError::DriverAlreadyReady);
         }
         if self.state != CoordinatorState::AwaitingDriverReady {
@@ -285,7 +287,7 @@ impl<'a> Coordinator<'a> {
         if self.attempt.map(|attempt| attempt.endpoint) != Some(endpoint) {
             return Err(CoordinatorError::StaleDriverEndpoint);
         }
-        self.state = CoordinatorState::DriverReady;
+        self.state = CoordinatorState::AwaitingPublication;
         Ok(())
     }
 
@@ -294,7 +296,7 @@ impl<'a> Coordinator<'a> {
         endpoint: RegistryEndpoint,
         service_generation: PublishedServiceGeneration,
     ) -> Result<(), CoordinatorError> {
-        if self.state != CoordinatorState::DriverReady {
+        if self.state != CoordinatorState::AwaitingPublication {
             return Err(CoordinatorError::InvalidState);
         }
         if service_generation.0 == 0
@@ -309,7 +311,8 @@ impl<'a> Coordinator<'a> {
     }
 
     pub fn retire(&mut self) -> Result<(), CoordinatorError> {
-        if self.state != CoordinatorState::Published && self.state != CoordinatorState::DriverReady
+        if self.state != CoordinatorState::Published
+            && self.state != CoordinatorState::AwaitingPublication
         {
             return Err(CoordinatorError::InvalidState);
         }
@@ -333,7 +336,7 @@ impl<'a> Coordinator<'a> {
 
     pub fn driver_failed(&mut self, endpoint: DriverEndpoint) -> Result<(), CoordinatorError> {
         if self.state != CoordinatorState::AwaitingDriverReady
-            && self.state != CoordinatorState::DriverReady
+            && self.state != CoordinatorState::AwaitingPublication
         {
             return Err(CoordinatorError::InvalidState);
         }
@@ -412,16 +415,16 @@ mod tests {
         out[b + 18..b + 20].copy_from_slice(&8u16.to_le_bytes());
         out[b + 20..b + 24].copy_from_slice(&3u32.to_le_bytes());
         out[b + 24..b + 26].copy_from_slice(&(UART16550D_PATH.len() as u16).to_le_bytes());
-        out[b + 28..b + 36].copy_from_slice(&9u64.to_le_bytes());
-        out[b + 36..b + 40].copy_from_slice(&1u32.to_le_bytes());
-        out[b + 44..b + 44 + UART16550D_PATH.len()].copy_from_slice(UART16550D_PATH);
+        out[b + 28..b + 60].copy_from_slice(&[9; 32]);
+        out[b + 60..b + 64].copy_from_slice(&1u32.to_le_bytes());
+        out[b + 72..b + 72 + UART16550D_PATH.len()].copy_from_slice(UART16550D_PATH);
         out
     }
 
     fn ready_coordinator<'a>(input: &'a [u8]) -> Coordinator<'a> {
         let parsed = manifest::Manifest::parse(input).unwrap();
         let mut c = Coordinator::new(SupervisorGeneration(10)).unwrap();
-        c.intake_manifest(parsed, ContentIdentity(9)).unwrap();
+        c.intake_manifest(parsed, ContentIdentity([9; 32])).unwrap();
         c.registry_ready(RegistryBinding {
             generation: RegistryGeneration(1),
             endpoint: RegistryEndpoint {
@@ -475,12 +478,12 @@ mod tests {
             },
         })
         .unwrap();
-        assert_eq!(c.state(), CoordinatorState::Published);
+        assert_eq!(c.state(), CoordinatorState::AwaitingPublication);
         assert_eq!(c.attempt(), Some(old_attempt));
         assert_eq!(c.publication_endpoint(), None);
         assert_eq!(
             c.publish(old_registry.endpoint, PublishedServiceGeneration(2)),
-            Err(CoordinatorError::InvalidState)
+            Err(CoordinatorError::StalePublicationEndpoint)
         );
     }
 
@@ -494,8 +497,7 @@ mod tests {
             c.complete_failure_cleanup((expected - 1) * RETRY_BACKOFF_NS)
                 .unwrap();
             if expected != 4 {
-                c.backoff_elapsed(expected as u64 * RETRY_BACKOFF_NS)
-                    .unwrap();
+                c.backoff_elapsed(expected * RETRY_BACKOFF_NS).unwrap();
                 c.begin_launch().unwrap();
                 let next = c.attempt().unwrap().endpoint;
                 c.launch_accepted(next).unwrap();

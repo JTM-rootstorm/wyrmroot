@@ -177,6 +177,10 @@ name = "wyrmroot-bootstrap-proto"
 version = "0.0.0"
 
 [[package]]
+name = "wyrmroot-device-proto"
+version = "0.0.0"
+
+[[package]]
 name = "wyrmroot-dw1b-preemption"
 version = "0.0.0"
 dependencies = [

@@ -6,7 +6,7 @@ pub const MAGIC: [u8; 4] = *b"WRDM";
 pub const MAJOR: u16 = 1;
 pub const MINOR: u16 = 0;
 pub const HEADER_BYTES: usize = 32;
-pub const RECORD_BYTES: usize = 112;
+pub const RECORD_BYTES: usize = 144;
 pub const MAX_RECORDS: usize = 4;
 pub const MAX_DRIVER_PATH_BYTES: usize = 64;
 
@@ -14,6 +14,7 @@ pub const PROFILE_Q35: ProfileId = ProfileId(1);
 pub const PROFILE_Q35_VERSION: ProfileVersion = ProfileVersion(1);
 pub const COM2_ROLE_ID: RoleId = RoleId(1);
 pub const UART16550D_PATH: &[u8] = b"system/uart16550d";
+pub const SERIAL_TRANSPORT_METADATA_POLICY: MetadataPolicyId = MetadataPolicyId(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProfileId(pub u32);
@@ -25,7 +26,7 @@ pub struct ProfileVersion(pub u32);
 pub struct RoleId(pub u64);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ContentIdentity(pub u64);
+pub struct ContentIdentity(pub [u8; 32]);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MetadataPolicyId(pub u32);
@@ -66,7 +67,7 @@ pub enum Hardware {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResourceKind {
-    Pio,
+    PioInterrupt,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,6 +78,7 @@ pub struct Com2Policy {
     pub pio: PioRange,
     pub irq: u32,
     pub driver_path: &'static [u8],
+    pub metadata_policy: MetadataPolicyId,
 }
 
 pub const COM2_POLICY: Com2Policy = Com2Policy {
@@ -89,6 +91,7 @@ pub const COM2_POLICY: Com2Policy = Com2Policy {
     },
     irq: 3,
     driver_path: UART16550D_PATH,
+    metadata_policy: SERIAL_TRANSPORT_METADATA_POLICY,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -191,7 +194,7 @@ impl<'a> Manifest<'a> {
         if role.hardware != Hardware::Com2 {
             return Err(ManifestError::Com1Rejected);
         }
-        if role.resource_kind != ResourceKind::Pio
+        if role.resource_kind != ResourceKind::PioInterrupt
             || role.pio != COM2_POLICY.pio
             || role.irq != COM2_POLICY.irq
         {
@@ -199,6 +202,9 @@ impl<'a> Manifest<'a> {
         }
         if role.driver_path != COM2_POLICY.driver_path {
             return Err(ManifestError::WrongDriverPath);
+        }
+        if role.metadata_policy != COM2_POLICY.metadata_policy {
+            return Err(ManifestError::WrongMetadataPolicy);
         }
         if role.content_identity != expected_content {
             return Err(ManifestError::WrongContentIdentity);
@@ -233,6 +239,7 @@ pub enum ManifestError {
     Com1Rejected,
     WrongResource,
     WrongDriverPath,
+    WrongMetadataPolicy,
     WrongContentIdentity,
 }
 
@@ -247,7 +254,7 @@ fn parse_record<'a>(bytes: &'a [u8], base: usize) -> Result<DeviceRole<'a>, Mani
         _ => return Err(ManifestError::UnknownHardware),
     };
     let resource_kind = match get_u32(bytes, base + 12) {
-        1 => ResourceKind::Pio,
+        1 => ResourceKind::PioInterrupt,
         _ => return Err(ManifestError::UnknownResourceKind),
     };
     let pio = PioRange {
@@ -271,19 +278,28 @@ fn parse_record<'a>(bytes: &'a [u8], base: usize) -> Result<DeviceRole<'a>, Mani
     if path_len > MAX_DRIVER_PATH_BYTES {
         return Err(ManifestError::PathTooLong);
     }
-    if get_u16(bytes, base + 26) != 0 || get_u32(bytes, base + 40) != 0 {
+    if get_u16(bytes, base + 26) != 0
+        || bytes[base + 64..base + 72].iter().any(|byte| *byte != 0)
+        || bytes[base + 136..base + RECORD_BYTES]
+            .iter()
+            .any(|byte| *byte != 0)
+    {
         return Err(ManifestError::NonzeroReserved);
     }
-    let content_identity = ContentIdentity(get_u64(bytes, base + 28));
-    if content_identity.0 == 0 {
+    let content_identity = ContentIdentity(
+        bytes[base + 28..base + 60]
+            .try_into()
+            .expect("validated fixed record"),
+    );
+    if content_identity.0.iter().all(|byte| *byte == 0) {
         return Err(ManifestError::ZeroContentIdentity);
     }
-    let metadata_policy = MetadataPolicyId(get_u32(bytes, base + 36));
+    let metadata_policy = MetadataPolicyId(get_u32(bytes, base + 60));
     if metadata_policy.0 == 0 {
         return Err(ManifestError::ZeroMetadataPolicy);
     }
     let path = bytes
-        .get(base + 44..base + 44 + MAX_DRIVER_PATH_BYTES)
+        .get(base + 72..base + 72 + MAX_DRIVER_PATH_BYTES)
         .ok_or(ManifestError::WrongSize)?;
     if path[path_len..].iter().any(|byte| *byte != 0) {
         return Err(ManifestError::NonzeroPathPadding);
@@ -328,7 +344,7 @@ mod tests {
         base: u16,
         irq: u32,
         path: &[u8],
-        content: u64,
+        content: u8,
     ) -> [u8; HEADER_BYTES + RECORD_BYTES] {
         let mut out = [0u8; HEADER_BYTES + RECORD_BYTES];
         out[..4].copy_from_slice(&MAGIC);
@@ -347,9 +363,9 @@ mod tests {
         out[b + 18..b + 20].copy_from_slice(&8u16.to_le_bytes());
         out[b + 20..b + 24].copy_from_slice(&irq.to_le_bytes());
         out[b + 24..b + 26].copy_from_slice(&(path.len() as u16).to_le_bytes());
-        out[b + 28..b + 36].copy_from_slice(&content.to_le_bytes());
-        out[b + 36..b + 40].copy_from_slice(&1u32.to_le_bytes());
-        out[b + 44..b + 44 + path.len()].copy_from_slice(path);
+        out[b + 28..b + 60].copy_from_slice(&[content; 32]);
+        out[b + 60..b + 64].copy_from_slice(&1u32.to_le_bytes());
+        out[b + 72..b + 72 + path.len()].copy_from_slice(path);
         out
     }
 
@@ -358,7 +374,11 @@ mod tests {
         let bytes = manifest(1, 2, 0x2f8, 3, UART16550D_PATH, 9);
         let parsed = Manifest::parse(&bytes).unwrap();
         assert_eq!(
-            parsed.match_com2(ContentIdentity(9)).unwrap().pio.end(),
+            parsed
+                .match_com2(ContentIdentity([9; 32]))
+                .unwrap()
+                .pio
+                .end(),
             0x300
         );
     }
@@ -369,16 +389,16 @@ mod tests {
         assert_eq!(
             Manifest::parse(&bytes)
                 .unwrap()
-                .match_com2(ContentIdentity(9)),
+                .match_com2(ContentIdentity([9; 32])),
             Err(ManifestError::Com1Rejected)
         );
         bytes[HEADER_BYTES + 8..HEADER_BYTES + 12].copy_from_slice(&2u32.to_le_bytes());
         bytes[HEADER_BYTES + 16..HEADER_BYTES + 18].copy_from_slice(&0x2f8u16.to_le_bytes());
         bytes[HEADER_BYTES + 20..HEADER_BYTES + 24].copy_from_slice(&3u32.to_le_bytes());
-        bytes[HEADER_BYTES + 44] = b'x';
+        bytes[HEADER_BYTES + 72] = b'x';
         let parsed = Manifest::parse(&bytes).unwrap();
         assert_eq!(
-            parsed.match_com2(ContentIdentity(9)),
+            parsed.match_com2(ContentIdentity([9; 32])),
             Err(ManifestError::WrongDriverPath)
         );
     }
@@ -397,8 +417,23 @@ mod tests {
         assert_eq!(
             Manifest::parse(&bytes)
                 .unwrap()
-                .match_com2(ContentIdentity(8)),
+                .match_com2(ContentIdentity([8; 32])),
             Err(ManifestError::WrongContentIdentity)
         );
+    }
+
+    #[test]
+    fn rejects_wrong_metadata_and_unchecked_tail_bytes() {
+        let mut bytes = manifest(1, 2, 0x2f8, 3, UART16550D_PATH, 9);
+        bytes[HEADER_BYTES + 60..HEADER_BYTES + 64].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(
+            Manifest::parse(&bytes)
+                .unwrap()
+                .match_com2(ContentIdentity([9; 32])),
+            Err(ManifestError::WrongMetadataPolicy)
+        );
+        bytes[HEADER_BYTES + 60..HEADER_BYTES + 64].copy_from_slice(&1u32.to_le_bytes());
+        bytes[HEADER_BYTES + RECORD_BYTES - 1] = 1;
+        assert_eq!(Manifest::parse(&bytes), Err(ManifestError::NonzeroReserved));
     }
 }
