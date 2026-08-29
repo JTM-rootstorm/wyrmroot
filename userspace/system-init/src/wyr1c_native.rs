@@ -33,8 +33,52 @@ pub(crate) const MARKER_BYTES: &[u8] = b"WYR1-C1";
 pub(crate) const MARKER_PATH: &str = "system/bootstrap/wyr1-c-gate-v1";
 pub(crate) const DEVICE_MANIFEST_PATH: &str = "system/bootstrap/wyr1-c-device-manifest-v1";
 const DEVMGR_PATH: &str = "system/devmgr";
-const PUBLICATION_ID: u64 = 0xC1_0001;
-const PUBLICATION_TRANSACTION: u64 = 0xC1_1001;
+const PUBLICATION_ID_BASE: u64 = 0xC1_0000;
+const SERVICE_GENERATION_BASE: u64 = 0xC1_0800;
+const PUBLICATION_TRANSACTION_BASE: u64 = 0xC1_1000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PublicationCorrelation {
+    publication_id: u64,
+    service_generation: u64,
+    transaction_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PublicationAllocator {
+    next: PublicationCorrelation,
+}
+
+impl PublicationAllocator {
+    const fn new() -> Self {
+        Self {
+            next: PublicationCorrelation {
+                publication_id: PUBLICATION_ID_BASE + 1,
+                service_generation: SERVICE_GENERATION_BASE + 1,
+                transaction_id: PUBLICATION_TRANSACTION_BASE + 1,
+            },
+        }
+    }
+
+    fn issue(&mut self) -> Result<PublicationCorrelation, InitError> {
+        let issued = self.next;
+        self.next = PublicationCorrelation {
+            publication_id: issued
+                .publication_id
+                .checked_add(1)
+                .ok_or(InitError::Accounting)?,
+            service_generation: issued
+                .service_generation
+                .checked_add(1)
+                .ok_or(InitError::Accounting)?,
+            transaction_id: issued
+                .transaction_id
+                .checked_add(1)
+                .ok_or(InitError::Accounting)?,
+        };
+        Ok(issued)
+    }
+}
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ResidentState {
@@ -43,6 +87,7 @@ pub(crate) struct ResidentState {
     devmgr: Option<ActiveNativeRole>,
     binding: Option<wyrmroot_device_proto::RegistryBinding>,
     waiting_registry_observed: bool,
+    publication_allocator: PublicationAllocator,
     last_controller_transaction: u64,
     next_controller_transaction: u64,
 }
@@ -179,6 +224,7 @@ where
     .ok_or(InitError::WrongActivationOrder)?;
     let (registry, mut topology) =
         establish_registry_topology(system, waits, &mut resident.controller, registry)?;
+    let mut publication_allocator = PublicationAllocator::new();
     let devmgr = match launch_devmgr(
         system,
         loader,
@@ -188,6 +234,7 @@ where
         bootfs,
         registry,
         &mut topology,
+        &mut publication_allocator,
         manifest_entry.data(),
     ) {
         Ok(devmgr) => devmgr,
@@ -208,6 +255,7 @@ where
         devmgr: Some(devmgr.active),
         binding: Some(devmgr.binding),
         waiting_registry_observed: false,
+        publication_allocator,
         last_controller_transaction: devmgr.last_controller_transaction,
         next_controller_transaction: devmgr.next_controller_transaction,
     };
@@ -237,6 +285,7 @@ fn launch_devmgr<S, L, W>(
     bootfs: &[u8],
     registry: RegistryNativeAttempt,
     topology: &mut RegistryTopology,
+    publication_allocator: &mut PublicationAllocator,
     manifest_bytes: &[u8],
 ) -> Result<DevmgrNativeAttempt, InitError>
 where
@@ -257,6 +306,7 @@ where
     let grant = topology
         .issue(generation, EndpointKind::Publication)
         .map_err(InitError::Wyr1BModel)?;
+    let publication = publication_allocator.issue()?;
     let binding = wyrmroot_device_proto::RegistryBinding {
         generation: RegistryGeneration(grant.registry_generation),
         endpoint: RegistryEndpoint {
@@ -320,9 +370,13 @@ where
             });
         }
     };
-    if let Err(error) =
-        install_publication(system, registry.control_channel, grant, registry_endpoint)
-    {
+    if let Err(error) = install_publication(
+        system,
+        registry.control_channel,
+        grant,
+        publication,
+        registry_endpoint,
+    ) {
         let cleanup_failed = system.close_handle(registry_endpoint).is_err()
             | system.close_handle(devmgr_endpoint).is_err()
             | system.close_handle(manifest).is_err()
@@ -608,6 +662,7 @@ fn install_publication<S: Wyr1BPlatform>(
     system: &mut S,
     control: DwHandle,
     grant: crate::wyr1b::EndpointGrant,
+    correlation: PublicationCorrelation,
     endpoint: DwHandle,
 ) -> Result<(), InitError> {
     let mut bytes = [0u8; 256];
@@ -618,13 +673,13 @@ fn install_publication<S: Wyr1BPlatform>(
             registry_generation: grant.registry_generation,
             endpoint_id: 0,
             endpoint_generation: 0,
-            transaction_id: PUBLICATION_TRANSACTION,
+            transaction_id: correlation.transaction_id,
         },
         grant.endpoint_id,
         grant.endpoint_generation,
         policy.supervisor_role_id,
-        PUBLICATION_ID,
-        1,
+        correlation.publication_id,
+        correlation.service_generation,
         policy.protocol_id,
         &[ProtocolVersion {
             major: policy.protocol_major,
@@ -1167,6 +1222,7 @@ where
                 bootfs,
                 registry,
                 &mut state.topology,
+                &mut state.publication_allocator,
                 manifest_entry.data(),
             )
         };
@@ -1260,6 +1316,7 @@ where
         system,
         waits,
         &mut state.topology,
+        &mut state.publication_allocator,
         registry.control_channel,
         devmgr,
         state.next_controller_transaction,
@@ -1276,6 +1333,7 @@ fn perform_rebind<S, W>(
     system: &mut S,
     waits: &mut W,
     topology: &mut RegistryTopology,
+    publication_allocator: &mut PublicationAllocator,
     registry_control: DwHandle,
     devmgr: ActiveNativeRole,
     transaction_id: u64,
@@ -1287,6 +1345,7 @@ where
     let grant = topology
         .issue(devmgr.generation, EndpointKind::Publication)
         .map_err(InitError::Wyr1BModel)?;
+    let publication = publication_allocator.issue()?;
     let binding = wyrmroot_device_proto::RegistryBinding {
         generation: RegistryGeneration(grant.registry_generation),
         endpoint: RegistryEndpoint {
@@ -1295,7 +1354,13 @@ where
         },
     };
     let (registry_endpoint, devmgr_endpoint) = create_controller_channel_pair(system)?;
-    if let Err(error) = install_publication(system, registry_control, grant, registry_endpoint) {
+    if let Err(error) = install_publication(
+        system,
+        registry_control,
+        grant,
+        publication,
+        registry_endpoint,
+    ) {
         let cleanup_failed = system.close_handle(devmgr_endpoint).is_err()
             | system.close_handle(registry_endpoint).is_err();
         return Err(if cleanup_failed {
@@ -1578,6 +1643,7 @@ mod tests {
             &mut platform,
             &mut waits,
             &mut topology,
+            &mut PublicationAllocator::new(),
             DwHandle(40),
             devmgr(),
             9,
@@ -1597,6 +1663,7 @@ mod tests {
             &mut platform,
             &mut StatusWaits { fail: false },
             &mut RegistryTopology::new(2).unwrap(),
+            &mut PublicationAllocator::new(),
             DwHandle(40),
             devmgr(),
             9,
@@ -1613,6 +1680,7 @@ mod tests {
             &mut platform,
             &mut StatusWaits { fail: true },
             &mut RegistryTopology::new(2).unwrap(),
+            &mut PublicationAllocator::new(),
             DwHandle(40),
             devmgr(),
             9,
@@ -1685,6 +1753,24 @@ mod tests {
             registry_recovery_step(false, true),
             RegistryRecoveryStep::Restart
         );
+    }
+
+    #[test]
+    fn publication_correlations_advance_across_devmgr_and_registry_recovery() {
+        let mut allocator = PublicationAllocator::new();
+        let initial = allocator.issue().unwrap();
+        let after_devmgr_exit = allocator.issue().unwrap();
+        let after_registry_exit = allocator.issue().unwrap();
+
+        assert!(after_devmgr_exit.publication_id > initial.publication_id);
+        assert!(after_devmgr_exit.service_generation > initial.service_generation);
+        assert!(after_devmgr_exit.transaction_id > initial.transaction_id);
+        assert!(after_registry_exit.publication_id > after_devmgr_exit.publication_id);
+        assert!(after_registry_exit.service_generation > after_devmgr_exit.service_generation);
+        assert!(after_registry_exit.transaction_id > after_devmgr_exit.transaction_id);
+        assert_ne!(initial.publication_id, initial.service_generation);
+        assert_ne!(initial.publication_id, initial.transaction_id);
+        assert_ne!(initial.service_generation, initial.transaction_id);
     }
 
     fn wrdm(identity: [u8; 32]) -> [u8; WRDM_HEADER_BYTES + WRDM_RECORD_BYTES] {
