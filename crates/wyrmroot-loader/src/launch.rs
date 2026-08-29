@@ -17,6 +17,9 @@ pub const INIT0_BYTES: usize = 64;
 pub const SUPERVISOR_BYTES: usize = 64;
 pub const PROBE_CHILD_BYTES: usize = 48;
 pub const DEVICE_COORDINATOR_BYTES: usize = 72;
+/// WYR1-C3's driver launch record carries the complete control correlation.
+/// It is deliberately distinct from the coordinator's three-capability ABI.
+pub const DEVICE_DRIVER_BYTES: usize = 104;
 pub const MAX_CAPABILITIES: usize = 3;
 
 const MAGIC: &[u8; 4] = b"WRLP";
@@ -27,6 +30,7 @@ const MINOR_V1_2: u16 = 2;
 const MINOR_V1_3: u16 = 3;
 const MINOR_V1_4_TEST: u16 = 4;
 const MINOR_V1_5: u16 = 5;
+const MINOR_V1_6: u16 = 6;
 const TYPE_INIT: u32 = 1;
 const TYPE_READY: u32 = 2;
 const ROLE_SELF_ROOT: u32 = 1;
@@ -41,6 +45,7 @@ const ROLE_STDOUT: u32 = 9;
 const ROLE_STDERR: u32 = 10;
 const ROLE_DW1B_PROGRESS_DATA: u32 = 11;
 const ROLE_DEVICE_MANIFEST: u32 = 12;
+const ROLE_DEVICE_CONTROL: u32 = 13;
 
 pub const SELF_ROOT_RIGHTS: DwRights =
     DwRights(DW_RIGHT_MAP.0 | DW_RIGHT_MODIFY.0 | DW_RIGHT_INSPECT.0);
@@ -93,6 +98,9 @@ pub enum LaunchProfile {
     /// one immutable device-role manifest object. This profile contains no
     /// hardware authority.
     DeviceCoordinator,
+    /// WYR1-C3 acceptance driver.  It has self-root plus one reduced direct
+    /// devmgr control Channel; it never receives a device bundle at startup.
+    DeviceDriver,
     Hello,
 }
 
@@ -107,6 +115,7 @@ impl LaunchProfile {
             | Self::LaunchClient => 2,
             Self::JobV2Streams => 3,
             Self::DeviceCoordinator => 3,
+            Self::DeviceDriver => 2,
             Self::Hello | Self::EarlyBootStub | Self::JobV2 => 0,
         }
     }
@@ -123,6 +132,7 @@ impl LaunchProfile {
             | Self::JobV2Streams => MINOR_V1_3,
             Self::Dw1bProgress => MINOR_V1_4_TEST,
             Self::DeviceCoordinator => MINOR_V1_5,
+            Self::DeviceDriver => MINOR_V1_6,
             Self::Init0 | Self::I2Stress | Self::CapabilityController | Self::Hello => MINOR_V1_0,
         }
     }
@@ -130,6 +140,8 @@ impl LaunchProfile {
     pub const fn init_size(self) -> usize {
         if matches!(self, Self::DeviceCoordinator) {
             DEVICE_COORDINATOR_BYTES
+        } else if matches!(self, Self::DeviceDriver) {
+            DEVICE_DRIVER_BYTES
         } else {
             HEADER_BYTES + self.capability_count() * 8
         }
@@ -146,6 +158,17 @@ pub struct ParsedMessage {
 pub struct DeviceCoordinatorInit {
     pub transaction_id: u64,
     pub supervisor_generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceDriverInit {
+    pub transaction_id: u64,
+    pub supervisor_generation: u64,
+    pub role_id: u64,
+    pub attempt_generation: u64,
+    pub launch_session: u64,
+    pub endpoint_id: u64,
+    pub endpoint_generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -171,7 +194,10 @@ pub fn encode_init(
     transaction_id: u64,
     output: &mut [u8],
 ) -> Result<usize, LaunchError> {
-    if profile == LaunchProfile::DeviceCoordinator {
+    if matches!(
+        profile,
+        LaunchProfile::DeviceCoordinator | LaunchProfile::DeviceDriver
+    ) {
         return Err(LaunchError::ProfileSpecificEncoderRequired);
     }
     encode_init_inner(profile, transaction_id, output)
@@ -216,6 +242,13 @@ fn encode_init_inner(
         {
             put_u32(output, HEADER_BYTES + index * 8, role);
         }
+    } else if profile == LaunchProfile::DeviceDriver {
+        for (index, role) in [ROLE_SELF_ROOT, ROLE_DEVICE_CONTROL]
+            .into_iter()
+            .enumerate()
+        {
+            put_u32(output, HEADER_BYTES + index * 8, role);
+        }
     } else if profile == LaunchProfile::Dw1bProgress {
         put_u32(output, HEADER_BYTES, ROLE_DW1B_PROGRESS_DATA);
     } else if profile.needs_self_root() {
@@ -244,6 +277,36 @@ pub fn encode_device_coordinator_init(
     }
     let size = encode_init_inner(LaunchProfile::DeviceCoordinator, transaction_id, output)?;
     put_u64(output, 64, supervisor_generation);
+    Ok(size)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn encode_device_driver_init(
+    transaction_id: u64,
+    supervisor_generation: u64,
+    role_id: u64,
+    attempt_generation: u64,
+    launch_session: u64,
+    endpoint_id: u64,
+    endpoint_generation: u64,
+    output: &mut [u8],
+) -> Result<usize, LaunchError> {
+    if supervisor_generation == 0
+        || role_id == 0
+        || attempt_generation == 0
+        || launch_session == 0
+        || endpoint_id == 0
+        || endpoint_generation == 0
+    {
+        return Err(LaunchError::ZeroTransaction);
+    }
+    let size = encode_init_inner(LaunchProfile::DeviceDriver, transaction_id, output)?;
+    put_u64(output, 56, supervisor_generation);
+    put_u64(output, 64, role_id);
+    put_u64(output, 72, attempt_generation);
+    put_u64(output, 80, launch_session);
+    put_u64(output, 88, endpoint_id);
+    put_u64(output, 96, endpoint_generation);
     Ok(size)
 }
 
@@ -303,6 +366,29 @@ pub fn parse_init(
             ),
         ];
         for (index, (role, object_type, rights)) in expected.into_iter().enumerate() {
+            if get_u32(bytes, HEADER_BYTES + index * 8) != role
+                || get_u32(bytes, HEADER_BYTES + index * 8 + 4) != 0
+            {
+                return Err(LaunchError::BadCapabilityRole { index });
+            }
+            validate_handle(handles[index], object_type, rights, index)?;
+        }
+    } else if profile == LaunchProfile::DeviceDriver {
+        for (index, (role, object_type, rights)) in [
+            (
+                ROLE_SELF_ROOT,
+                DW_OBJECT_TYPE_ADDRESS_REGION,
+                SELF_ROOT_RIGHTS,
+            ),
+            (
+                ROLE_DEVICE_CONTROL,
+                DW_OBJECT_TYPE_CHANNEL,
+                CHILD_CHANNEL_RIGHTS,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
             if get_u32(bytes, HEADER_BYTES + index * 8) != role
                 || get_u32(bytes, HEADER_BYTES + index * 8 + 4) != 0
             {
@@ -372,6 +458,33 @@ pub fn parse_device_coordinator_init(
     })
 }
 
+pub fn parse_device_driver_init(
+    bytes: &[u8],
+    handles: &[DwReceivedHandleInfoV1],
+) -> Result<DeviceDriverInit, LaunchError> {
+    let parsed = parse_init(LaunchProfile::DeviceDriver, bytes, handles)?;
+    let fields = [
+        get_u64(bytes, 56),
+        get_u64(bytes, 64),
+        get_u64(bytes, 72),
+        get_u64(bytes, 80),
+        get_u64(bytes, 88),
+        get_u64(bytes, 96),
+    ];
+    if fields.contains(&0) {
+        return Err(LaunchError::ZeroTransaction);
+    }
+    Ok(DeviceDriverInit {
+        transaction_id: parsed.transaction_id,
+        supervisor_generation: fields[0],
+        role_id: fields[1],
+        attempt_generation: fields[2],
+        launch_session: fields[3],
+        endpoint_id: fields[4],
+        endpoint_generation: fields[5],
+    })
+}
+
 impl LaunchProfile {
     pub const fn has_loader_authority_trio(self) -> bool {
         matches!(
@@ -390,6 +503,7 @@ impl LaunchProfile {
                     | Self::RegistryClient
                     | Self::LaunchClient
                     | Self::DeviceCoordinator
+                    | Self::DeviceDriver
             )
     }
 
@@ -400,6 +514,7 @@ impl LaunchProfile {
             Self::RegistryClient => Some(ROLE_REGISTRY_CLIENT),
             Self::LaunchClient => Some(ROLE_LAUNCH_SESSION),
             Self::Dw1bProgress => Some(ROLE_DW1B_PROGRESS_DATA),
+            Self::DeviceDriver => Some(ROLE_DEVICE_CONTROL),
             _ => None,
         }
     }

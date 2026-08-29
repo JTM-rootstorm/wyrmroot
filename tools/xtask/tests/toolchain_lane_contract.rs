@@ -70,3 +70,20 @@ fn launcher_rejects_target_directory_bypass() {
     let error = rejected(&["test", "--target-dir", "/tmp/not-owned"], None);
     assert!(error.contains("target directory is launcher-owned"));
 }
+
+#[test]
+fn launcher_accepts_the_registered_wyrmroot_lane_layout() {
+    let target = std::env::temp_dir().join("wyrmroot-pinned-cargo-lane-contract");
+    let output = Command::new(repository().join("tools/pinned-cargo"))
+        .arg("--version")
+        .env_remove("CARGO_HOME")
+        .env_remove("CARGO")
+        .env("WYRMROOT_PINNED_TARGET_DIR", target)
+        .output()
+        .expect("run pinned Cargo launcher from this checkout");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

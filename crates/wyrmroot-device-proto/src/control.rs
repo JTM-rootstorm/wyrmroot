@@ -14,11 +14,14 @@ pub const RESOURCE_BUNDLE_BYTES: usize = HEADER_BYTES;
 pub const READY_BYTES: usize = HEADER_BYTES;
 pub const FAILURE_BYTES: usize = HEADER_BYTES + 8;
 pub const RETIRE_BYTES: usize = HEADER_BYTES;
+/// C3 pre-resource readiness: no bundle exists or is implied.
+pub const CONTROL_READY_BYTES: usize = HEADER_BYTES;
 pub const CONFIGURE_HANDLE_COUNT: u32 = 0;
 pub const RESOURCE_BUNDLE_HANDLE_COUNT: u32 = 2;
 pub const READY_HANDLE_COUNT: u32 = 0;
 pub const FAILURE_HANDLE_COUNT: u32 = 0;
 pub const RETIRE_HANDLE_COUNT: u32 = 0;
+pub const CONTROL_READY_HANDLE_COUNT: u32 = 0;
 
 use crate::coordinator::{AttemptGeneration, BundleGeneration, EndpointGeneration, EndpointId};
 use crate::manifest::{PROFILE_Q35, PROFILE_Q35_VERSION, ProfileId, ProfileVersion, RoleId};
@@ -74,6 +77,15 @@ pub enum ControlMessage {
         endpoint: ControlEndpoint,
         transaction_id: u64,
     },
+    /// The acceptance actor has validated its C3 startup profile and direct
+    /// endpoint.  `bundle_generation` is intentionally zero only here;
+    /// this is not `Ready` and cannot claim resource delivery.
+    ControlReady {
+        role_id: RoleId,
+        attempt_generation: AttemptGeneration,
+        endpoint: ControlEndpoint,
+        transaction_id: u64,
+    },
     Failure {
         role_id: RoleId,
         bundle_generation: BundleGeneration,
@@ -118,6 +130,7 @@ impl ControlMessage {
             Self::Configure { .. } => CONFIGURE_BYTES,
             Self::ResourceBundle { .. } => RESOURCE_BUNDLE_BYTES,
             Self::Ready { .. } | Self::Retire { .. } => HEADER_BYTES,
+            Self::ControlReady { .. } => CONTROL_READY_BYTES,
             Self::Failure { .. } => FAILURE_BYTES,
         }
     }
@@ -151,7 +164,9 @@ pub fn encode(message: ControlMessage, output: &mut [u8]) -> Result<(), ControlP
             put32(output, HEADER_BYTES + 4, profile_version.0);
         }
         ControlMessage::ResourceBundle { .. } => {}
-        ControlMessage::Ready { .. } | ControlMessage::Retire { .. } => {}
+        ControlMessage::Ready { .. }
+        | ControlMessage::Retire { .. }
+        | ControlMessage::ControlReady { .. } => {}
         ControlMessage::Failure { code, .. } => put32(output, HEADER_BYTES, code as u32),
     }
     Ok(())
@@ -262,6 +277,20 @@ pub fn parse(bytes: &[u8]) -> Result<ControlMessage, ControlParseError> {
                 transaction_id,
             }
         }
+        6 => {
+            if bytes.len() != CONTROL_READY_BYTES || handles != CONTROL_READY_HANDLE_COUNT {
+                return Err(ControlParseError::WrongHandleCount);
+            }
+            if bundle_generation.0 != 0 {
+                return Err(ControlParseError::NonzeroReserved);
+            }
+            ControlMessage::ControlReady {
+                role_id,
+                attempt_generation,
+                endpoint,
+                transaction_id,
+            }
+        }
         _ => return Err(ControlParseError::UnknownMessage),
     };
     validate_identity(message)?;
@@ -274,7 +303,7 @@ fn validate_identity(message: ControlMessage) -> Result<(), ControlParseError> {
     let attempt = attempt_generation(message);
     let endpoint = endpoint(message);
     if role.0 == 0
-        || bundle.0 == 0
+        || (!matches!(message, ControlMessage::ControlReady { .. }) && bundle.0 == 0)
         || attempt.0 == 0
         || endpoint.id.0 == 0
         || endpoint.generation.0 == 0
@@ -301,6 +330,7 @@ const fn message_type(message: ControlMessage) -> u32 {
         ControlMessage::Ready { .. } => 3,
         ControlMessage::Failure { .. } => 4,
         ControlMessage::Retire { .. } => 5,
+        ControlMessage::ControlReady { .. } => 6,
     }
 }
 const fn role_id(message: ControlMessage) -> RoleId {
@@ -310,6 +340,7 @@ const fn role_id(message: ControlMessage) -> RoleId {
         | ControlMessage::Ready { role_id, .. }
         | ControlMessage::Failure { role_id, .. }
         | ControlMessage::Retire { role_id, .. } => role_id,
+        ControlMessage::ControlReady { role_id, .. } => role_id,
     }
 }
 const fn bundle_generation(message: ControlMessage) -> BundleGeneration {
@@ -329,6 +360,7 @@ const fn bundle_generation(message: ControlMessage) -> BundleGeneration {
         | ControlMessage::Retire {
             bundle_generation, ..
         } => bundle_generation,
+        ControlMessage::ControlReady { .. } => BundleGeneration(0),
     }
 }
 const fn attempt_generation(message: ControlMessage) -> AttemptGeneration {
@@ -347,6 +379,9 @@ const fn attempt_generation(message: ControlMessage) -> AttemptGeneration {
         }
         | ControlMessage::Retire {
             attempt_generation, ..
+        }
+        | ControlMessage::ControlReady {
+            attempt_generation, ..
         } => attempt_generation,
     }
 }
@@ -357,6 +392,7 @@ const fn endpoint(message: ControlMessage) -> ControlEndpoint {
         | ControlMessage::Ready { endpoint, .. }
         | ControlMessage::Failure { endpoint, .. }
         | ControlMessage::Retire { endpoint, .. } => endpoint,
+        ControlMessage::ControlReady { endpoint, .. } => endpoint,
     }
 }
 const fn transaction_id(message: ControlMessage) -> u64 {
@@ -366,6 +402,7 @@ const fn transaction_id(message: ControlMessage) -> u64 {
         | ControlMessage::Ready { transaction_id, .. }
         | ControlMessage::Failure { transaction_id, .. }
         | ControlMessage::Retire { transaction_id, .. } => transaction_id,
+        ControlMessage::ControlReady { transaction_id, .. } => transaction_id,
     }
 }
 
@@ -476,5 +513,42 @@ mod tests {
         bytes[12] = 0;
         bytes[32..40].fill(0);
         assert_eq!(parse(&bytes), Err(ControlParseError::ZeroIdentity));
+    }
+
+    #[test]
+    fn control_ready_is_exactly_zero_bundle_zero_handle_and_reserved_clean() {
+        let (role, _, attempt, endpoint) = ids();
+        let message = ControlMessage::ControlReady {
+            role_id: role,
+            attempt_generation: attempt,
+            endpoint,
+            transaction_id: 10,
+        };
+        let mut bytes = [0; CONTROL_READY_BYTES];
+        encode(message, &mut bytes).unwrap();
+        assert_eq!(&bytes[32..40], &[0; 8]);
+        assert_eq!(&bytes[20..24], &[0; 4]);
+        assert_eq!(parse(&bytes), Ok(message));
+
+        let mut nonzero_bundle = bytes;
+        nonzero_bundle[32..40].copy_from_slice(&1u64.to_le_bytes());
+        assert_eq!(
+            parse(&nonzero_bundle),
+            Err(ControlParseError::NonzeroReserved)
+        );
+
+        let mut unexpected_handle = bytes;
+        unexpected_handle[20..24].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(
+            parse(&unexpected_handle),
+            Err(ControlParseError::WrongHandleCount)
+        );
+
+        let mut nonzero_reserved = bytes;
+        nonzero_reserved[12..16].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(
+            parse(&nonzero_reserved),
+            Err(ControlParseError::NonzeroFlags)
+        );
     }
 }

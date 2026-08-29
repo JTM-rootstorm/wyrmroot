@@ -31,6 +31,9 @@ native-retained = []
 
 [dependencies]
 wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }
+wyrmroot-device-proto = { path = "../../crates/wyrmroot-device-proto" }
+wyrmroot-loader = { path = "../../crates/wyrmroot-loader" }
+deepwyrm-syscall = { workspace = true }
 
 [lints.rust]
 unsafe_code = "deny"

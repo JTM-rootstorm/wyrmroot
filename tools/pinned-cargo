@@ -86,6 +86,24 @@ fi
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 repository=$(CDPATH='' cd -- "$script_dir/.." && pwd -P)
 project_root=$(CDPATH='' cd -- "$repository/.." && pwd -P)
+# A coordinator-owned lane is exactly
+#   <project>/.worktrees/wyrmroot/<lane>
+# and uses the same project-local offline Cargo home as canonical wyrmroot.
+# Do not infer a broader ancestor: that would let an arbitrary checkout borrow
+# a parent project's dependency cache.
+repository_parent=$(basename -- "$(dirname -- "$repository")")
+repository_grandparent=$(basename -- "$(dirname -- "$(dirname -- "$repository")")")
+if [ "$repository_parent" = "wyrmroot" ] && [ "$repository_grandparent" = ".worktrees" ]; then
+    lane_project_root=$(CDPATH='' cd -- "$repository/../../.." && pwd -P)
+    canonical_git_dir="$lane_project_root/wyrmroot/.git"
+    [ -d "$canonical_git_dir" ] && [ ! -L "$canonical_git_dir" ] || \
+        fail "lane layout has no canonical wyrmroot git directory"
+    common_git_dir=$(git -C "$repository" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || \
+        fail "lane worktree does not expose a common git directory"
+    [ "$common_git_dir" = "$canonical_git_dir" ] || \
+        fail "lane worktree is not registered to canonical wyrmroot"
+    project_root=$lane_project_root
+fi
 cd -- "$repository"
 identity="$repository/toolchain/host-rust-toolchain.toml"
 [ "$(config_value "$identity" schema)" = "wyrmroot-host-rust-toolchain-identity-v1" ] || \

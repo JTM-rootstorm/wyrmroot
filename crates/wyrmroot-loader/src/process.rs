@@ -12,8 +12,7 @@ use crate::{
     elf::{self, ElfError, LoadSegment, MAX_LOAD_SEGMENTS, PAGE_SIZE, SegmentProtection},
     image::{self, INITIAL_STACK, MaterializationPlan, StartupBlockError},
     launch::{
-        self, BOOTFS_RIGHTS, DEVICE_COORDINATOR_BYTES, LOADER_TASK_GROUP_RIGHTS, LaunchError,
-        LaunchProfile, SELF_ROOT_RIGHTS,
+        self, BOOTFS_RIGHTS, LOADER_TASK_GROUP_RIGHTS, LaunchError, LaunchProfile, SELF_ROOT_RIGHTS,
     },
 };
 
@@ -91,6 +90,22 @@ pub struct DeviceCoordinatorLoadRequest<'a> {
     pub transaction_id: u64,
 }
 
+/// C3 driver construction request.  The supplied Channel is the child half
+/// of a fresh direct pair; no resource bundle crosses this API.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceDriverLoadRequest<'a> {
+    pub image: &'a [u8],
+    pub display_path: &'a str,
+    pub control_endpoint: DwHandle,
+    pub supervisor_generation: u64,
+    pub role_id: u64,
+    pub attempt_generation: u64,
+    pub launch_session: u64,
+    pub endpoint_id: u64,
+    pub endpoint_generation: u64,
+    pub transaction_id: u64,
+}
+
 #[derive(Clone, Copy)]
 enum StartupSpec<'a> {
     Legacy(&'a str),
@@ -115,6 +130,7 @@ struct InternalLoadRequest<'a> {
     channels: &'a [DwHandle],
     device_manifest: Option<DwHandle>,
     supervisor_generation: Option<u64>,
+    driver_correlation: Option<(u64, u64, u64, u64, u64, u64)>,
 }
 
 /// Explicitly selected, test-only corruption of one child-launch boundary.
@@ -210,6 +226,21 @@ pub struct DeviceCoordinatorLoadError<PlatformError> {
     pub error: LoadError<PlatformError>,
     pub publication_endpoint_consumed: bool,
     pub manifest_consumed: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct DeviceDriverLoadError<PlatformError> {
+    pub error: LoadError<PlatformError>,
+    pub control_endpoint_consumed: bool,
+}
+
+impl<E> DeviceDriverLoadError<E> {
+    const fn caller_retains(error: LoadError<E>) -> Self {
+        Self {
+            error,
+            control_endpoint_consumed: false,
+        }
+    }
 }
 
 impl<E> DeviceCoordinatorLoadError<E> {
@@ -464,6 +495,7 @@ pub fn load_process_with_fault<P: LoaderPlatform>(
             channels: &[],
             device_manifest: None,
             supervisor_generation: None,
+            driver_correlation: None,
         },
         fault,
         &mut delegated_channels_consumed,
@@ -501,6 +533,7 @@ pub fn load_job_process<P: LoaderPlatform>(
             channels: request.streams,
             device_manifest: None,
             supervisor_generation: None,
+            driver_correlation: None,
         },
         LoadFault::None,
         &mut delegated_channels_consumed,
@@ -567,6 +600,7 @@ pub fn load_service_process<P: LoaderPlatform>(
             channels: &channels,
             device_manifest: None,
             supervisor_generation: None,
+            driver_correlation: None,
         },
         LoadFault::None,
         &mut service_channel_consumed,
@@ -603,6 +637,7 @@ pub fn load_device_coordinator_process<P: LoaderPlatform>(
             channels: &channels,
             device_manifest: Some(request.manifest),
             supervisor_generation: Some(request.supervisor_generation),
+            driver_correlation: None,
         },
         LoadFault::None,
         &mut inputs_consumed,
@@ -614,6 +649,57 @@ pub fn load_device_coordinator_process<P: LoaderPlatform>(
     })
 }
 
+/// Constructs only the acceptance driver's process and transfers only its
+/// reduced direct control endpoint.  Failure leaves that endpoint with the
+/// devmgr caller; hypothetical future resources are absent by type.
+pub fn load_device_driver_process<P: LoaderPlatform>(
+    platform: &mut P,
+    authority: LoadAuthority,
+    request: DeviceDriverLoadRequest<'_>,
+) -> Result<LoadedProcess, DeviceDriverLoadError<P::Error>> {
+    if request.display_path != "/system/uart16550d"
+        || request.supervisor_generation == 0
+        || request.role_id == 0
+        || request.attempt_generation == 0
+        || request.launch_session == 0
+        || request.endpoint_id == 0
+        || request.endpoint_generation == 0
+    {
+        return Err(DeviceDriverLoadError::caller_retains(LoadError::Launch(
+            LaunchError::HandleCount,
+        )));
+    }
+    let channels = [request.control_endpoint];
+    let mut consumed = false;
+    load_process_internal(
+        platform,
+        authority,
+        InternalLoadRequest {
+            image: request.image,
+            profile: LaunchProfile::DeviceDriver,
+            transaction_id: request.transaction_id,
+            startup: StartupSpec::Legacy(request.display_path),
+            channels: &channels,
+            device_manifest: None,
+            supervisor_generation: None,
+            driver_correlation: Some((
+                request.supervisor_generation,
+                request.role_id,
+                request.attempt_generation,
+                request.launch_session,
+                request.endpoint_id,
+                request.endpoint_generation,
+            )),
+        },
+        LoadFault::None,
+        &mut consumed,
+    )
+    .map_err(|error| DeviceDriverLoadError {
+        error,
+        control_endpoint_consumed: consumed,
+    })
+}
+
 fn load_process_internal<P: LoaderPlatform>(
     platform: &mut P,
     authority: LoadAuthority,
@@ -622,8 +708,10 @@ fn load_process_internal<P: LoaderPlatform>(
     delegated_channels_consumed: &mut bool,
 ) -> Result<LoadedProcess, LoadError<P::Error>> {
     let expected_channels = if request.profile.channel_role().is_some()
-        || request.profile == LaunchProfile::DeviceCoordinator
-    {
+        || matches!(
+            request.profile,
+            LaunchProfile::DeviceCoordinator | LaunchProfile::DeviceDriver
+        ) {
         1
     } else if request.profile == LaunchProfile::JobV2Streams {
         3
@@ -634,6 +722,9 @@ fn load_process_internal<P: LoaderPlatform>(
         return Err(LoadError::Launch(LaunchError::HandleCount));
     }
     if (request.profile == LaunchProfile::DeviceCoordinator) != request.device_manifest.is_some() {
+        return Err(LoadError::Launch(LaunchError::HandleCount));
+    }
+    if (request.profile == LaunchProfile::DeviceDriver) != request.driver_correlation.is_some() {
         return Err(LoadError::Launch(LaunchError::HandleCount));
     }
     let mut segments = [empty_segment(); MAX_LOAD_SEGMENTS];
@@ -754,13 +845,27 @@ fn load_process_materialized<P: LoaderPlatform>(
     stack_pointer: u64,
     startup_abi: u64,
 ) -> Result<LoadedProcess, LoadError<P::Error>> {
-    let mut init = [0_u8; DEVICE_COORDINATOR_BYTES];
+    let mut init = [0_u8; launch::DEVICE_DRIVER_BYTES];
     let init_len = if request.profile == LaunchProfile::DeviceCoordinator {
         launch::encode_device_coordinator_init(
             request.transaction_id,
             request
                 .supervisor_generation
                 .ok_or(LoadError::Launch(LaunchError::ZeroTransaction))?,
+            &mut init,
+        )
+    } else if request.profile == LaunchProfile::DeviceDriver {
+        let (supervisor, role, attempt, session, endpoint, endpoint_generation) = request
+            .driver_correlation
+            .ok_or(LoadError::Launch(LaunchError::ZeroTransaction))?;
+        launch::encode_device_driver_init(
+            request.transaction_id,
+            supervisor,
+            role,
+            attempt,
+            session,
+            endpoint,
+            endpoint_generation,
             &mut init,
         )
     } else {

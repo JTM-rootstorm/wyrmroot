@@ -10,6 +10,7 @@
 pub mod control;
 pub mod controller;
 pub mod coordinator;
+pub mod driver_launch;
 pub mod manifest;
 
 pub use control::{ControlEndpoint, ControlMessage, ControlParseError, FailureCode};
@@ -18,6 +19,11 @@ pub use controller::{
 };
 pub use coordinator::{
     Coordinator, CoordinatorError, CoordinatorState, RegistryBinding, RegistryEndpoint,
+};
+pub use driver_launch::{
+    DEVICE_DRIVER_PATH, DirectControlRights, DriverLaunch, DriverLaunchError, DriverLaunchRequest,
+    DriverLaunchState, LAUNCH_REQUEST_BYTES, LAUNCH_RESPONSE_BYTES, encode_constructed,
+    encode_request, parse_constructed, parse_request,
 };
 pub use manifest::{
     COM2_POLICY, COM2_ROLE_ID, DeviceRole, Manifest, ManifestError, PioRange, ProfileId,

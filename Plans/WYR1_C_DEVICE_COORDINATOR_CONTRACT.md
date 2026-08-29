@@ -1,10 +1,12 @@
 # Wyrmroot WYR1-C Device Coordinator Contract
 
-**Status:** Reached WYR1-C0 contract, WYR1-C1 host/native implementation, and
-WYR1-C2 deterministic unselected product isolation
+**Status:** Reached WYR1-C0 contract, WYR1-C1 host/native implementation,
+WYR1-C2 deterministic unselected product isolation, and WYR1-C3 host/native
+pre-resource driver construction
 **Reached:** 2026-08-29
-**Validation:** [`WYR1_C1_VALIDATION.md`](WYR1_C1_VALIDATION.md) and
-[`WYR1_C2_VALIDATION.md`](WYR1_C2_VALIDATION.md)
+**Validation:** [`WYR1_C1_VALIDATION.md`](WYR1_C1_VALIDATION.md),
+[`WYR1_C2_VALIDATION.md`](WYR1_C2_VALIDATION.md), and
+[`WYR1_C3_VALIDATION.md`](WYR1_C3_VALIDATION.md)
 **Scope:** Static q35 COM2 role policy, coordinator state and identity, manifest,
 driver-control protocol, restart ordering, and the truthful pre-DW1-D waiting
 state  
@@ -210,9 +212,13 @@ startup profile, but init never receives the later hardware handles. The devmgr
 peer remains outside init and registryd. Closing or replacing an endpoint
 invalidates every message correlated to it.
 
-The WYR1-C acceptance actor validates exact future handle metadata, reports
-READY, accepts intentional failure/retirement, and performs no UART I/O. It is
-not the production `uart16550d` implementation.
+The eventual post-resource WYR1-C acceptance actor validates exact handle
+metadata, reports READY, accepts intentional failure/retirement, and performs
+no UART I/O. C3's narrower synthetic pre-resource actor receives no resource
+bundle: it validates WRLP 1.6, reports only `CONTROL_READY`, and intentionally
+exits so init can prove terminal observation and reap. Post-resource
+failure/RETIRE handling remains C4+ after DW1-D authority exists. The C3 actor
+is not the production `uart16550d` implementation.
 
 ## 9. C1 startup and controller surface
 
@@ -242,7 +248,47 @@ loader construction authority. The C1 implementation may report:
 It cannot report successful match/publication before the later bundle seam is
 implemented and validated.
 
-## 10. Required model and C1 gates
+## 10. C3 private driver construction
+
+C3 adds WRLP 1.6 `DeviceDriver`, a new profile whose exact startup shape is
+self-root plus one reduced direct device-control Channel. Its startup record
+binds the supervisor generation, role, attempt, launch session, endpoint ID
+and generation, and transaction. The bounded loader request independently
+rejects every path except `/system/uart16550d`; the host launch model retains
+the product-bound acceptance-actor identity. It is a private devmgr-to-init
+construction request, not WYR1-B's public job protocol.
+
+Devmgr creates each direct pair and retains the peer. Init receives and moves
+only the child endpoint while constructing/reaping the process. It never sees a
+future resource bundle. The acceptance actor reports `CONTROL_READY` directly
+to devmgr after profile validation. That message alone has an explicit
+zero-bundle exception; it is not `DRIVER_READY`, and no other WRDC message may
+use a zero bundle. Stale endpoint, session, transaction, profile, or rights
+cannot satisfy the attempt. An unsuccessful construction or a reaped child
+therefore leaves the future bundle wholly with devmgr by construction.
+
+The private construction exchange is two fixed messages on the existing
+devmgr supervisor Channel. WRDL carries the complete correlation plus actor
+identity and exactly one reduced Channel. Init distinguishes it from WRCS by
+exact magic, validates both receive metadata and queried object identity,
+revalidates the WRRM/WRDM/bootfs actor join, and commits a bounded native
+attempt before replying. WRLA carries the same complete correlation and zero
+handles; it acknowledges process construction only. Devmgr must still receive
+the distinct correlation-exact `CONTROL_READY` from its retained direct peer.
+Driver exit is a separate resident wait event. Init reaps that exact process,
+task group, and loader Channel; devmgr/supervisor replacement cleans an old
+driver attempt before constructing a replacement.
+
+Construction acknowledgement and direct `CONTROL_READY` share one checked
+absolute monotonic-active deadline using the accepted one-second readiness
+interval. Completing WRLA late does not start a second readiness window.
+Driver correlation allocators use a supervisor-generation high 32-bit
+namespace already bound by WRLP 1.5 and WRDL. Within it, attempt, launch
+session, endpoint, and transaction each own a distinct nonoverlapping 30-bit
+lane. A replacement devmgr therefore starts above every previous per-type
+high-water mark without reusing one generation value as another identity.
+
+## 11. Required model and C1 gates
 
 Before C0 closes, host tests must prove:
 
@@ -266,7 +312,7 @@ hash. It provides freeze, image, and inspect only; selector-29 reservation,
 guest execution/evidence, hardware intake, and WYR1-C closure remain later work
 packages.
 
-## 11. Historical-product isolation and nonclaims
+## 12. Historical-product isolation and nonclaims
 
 Selectors 25 and 27 retain their existing devmgr artifact, WRRM profile,
 `EarlyBootStub` launch shape, bootfs bytes/meaning, and validation contracts.

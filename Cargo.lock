@@ -337,6 +337,9 @@ dependencies = [
 name = "wyrmroot-wyr1-retained-stubs"
 version = "0.0.0"
 dependencies = [
+ "deepwyrm-syscall",
+ "wyrmroot-device-proto",
+ "wyrmroot-loader",
  "wyrmroot-runtime",
 ]
 

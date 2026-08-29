@@ -14,12 +14,27 @@ use wyrmroot_device_proto::controller::{
     ControllerMessage, ControllerParseError, StatusCode, validate_binding_transition,
 };
 use wyrmroot_device_proto::coordinator::{
+    AttemptGeneration, EndpointGeneration, EndpointId, LaunchSessionGeneration,
+};
+use wyrmroot_device_proto::coordinator::{
     Coordinator, CoordinatorError, CoordinatorState, RegistryBinding, SupervisorGeneration,
 };
 use wyrmroot_device_proto::manifest::{
     ContentIdentity, Manifest, ManifestError, MetadataPolicyId, PioRange, ProfileId,
     ProfileVersion, RoleId,
 };
+use wyrmroot_device_proto::{
+    ControlEndpoint, DirectControlRights, DriverLaunch, DriverLaunchError, DriverLaunchRequest,
+};
+
+/// Each supervisor generation owns one disjoint 32-bit driver-correlation
+/// namespace. A replacement devmgr therefore cannot reset an identity below
+/// the previous resident high-water mark.
+const DRIVER_CORRELATION_STRIDE: u64 = 1u64 << 32;
+const DRIVER_ATTEMPT_OFFSET: u64 = 1;
+const DRIVER_SESSION_OFFSET: u64 = (1u64 << 30) + 1;
+const DRIVER_ENDPOINT_OFFSET: u64 = (2u64 << 30) + 1;
+const DRIVER_TRANSACTION_OFFSET: u64 = (3u64 << 30) + 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OperationalStatus {
@@ -57,6 +72,7 @@ pub enum DevmgrError {
     StartupCorrelation,
     StaleControllerTransaction,
     ControllerLifecycle,
+    DriverLaunch(DriverLaunchError),
 }
 
 impl From<ControllerParseError> for DevmgrError {
@@ -74,6 +90,12 @@ impl From<ManifestError> for DevmgrError {
 impl From<CoordinatorError> for DevmgrError {
     fn from(error: CoordinatorError) -> Self {
         Self::Coordinator(error)
+    }
+}
+
+impl From<DriverLaunchError> for DevmgrError {
+    fn from(error: DriverLaunchError) -> Self {
+        Self::DriverLaunch(error)
     }
 }
 
@@ -111,6 +133,11 @@ pub struct ResidentController {
     last_transaction_id: u64,
     last_binding: Option<RegistryBinding>,
     active_binding: Option<RegistryBinding>,
+    active_driver: Option<DriverLaunch>,
+    next_driver_attempt: u64,
+    next_driver_session: u64,
+    next_driver_endpoint: u64,
+    next_driver_transaction: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -130,12 +157,34 @@ impl ResidentController {
         if status.state != CoordinatorState::WaitingForRegistry {
             return Err(DevmgrError::ControllerLifecycle);
         }
+        let driver_namespace = status
+            .supervisor_generation
+            .0
+            .checked_mul(DRIVER_CORRELATION_STRIDE)
+            .ok_or(DevmgrError::StartupCorrelation)?;
+        let driver_attempt = driver_namespace
+            .checked_add(DRIVER_ATTEMPT_OFFSET)
+            .ok_or(DevmgrError::StartupCorrelation)?;
+        let driver_session = driver_namespace
+            .checked_add(DRIVER_SESSION_OFFSET)
+            .ok_or(DevmgrError::StartupCorrelation)?;
+        let driver_endpoint = driver_namespace
+            .checked_add(DRIVER_ENDPOINT_OFFSET)
+            .ok_or(DevmgrError::StartupCorrelation)?;
+        let driver_transaction = driver_namespace
+            .checked_add(DRIVER_TRANSACTION_OFFSET)
+            .ok_or(DevmgrError::StartupCorrelation)?;
         Ok(Self {
             status,
             startup_transaction_id,
             last_transaction_id: 0,
             last_binding: None,
             active_binding: None,
+            active_driver: None,
+            next_driver_attempt: driver_attempt,
+            next_driver_session: driver_session,
+            next_driver_endpoint: driver_endpoint,
+            next_driver_transaction: driver_transaction,
         })
     }
 
@@ -149,6 +198,81 @@ impl ResidentController {
 
     pub const fn last_transaction_id(&self) -> u64 {
         self.last_transaction_id
+    }
+
+    /// Issues exactly one pre-resource C3 launch correlation.  The caller
+    /// creates the Channel pair and retains its broad peer; this policy layer
+    /// can represent only the reduced child endpoint that crosses init.
+    pub fn issue_driver_launch(
+        &mut self,
+        child_is_channel: bool,
+        child_rights: DirectControlRights,
+    ) -> Result<DriverLaunchRequest, DevmgrError> {
+        if self.active_binding.is_none() || self.active_driver.is_some() {
+            return Err(DevmgrError::ControllerLifecycle);
+        }
+        let request = DriverLaunchRequest {
+            supervisor_generation: self.status.supervisor_generation,
+            role_id: self.status.role_id,
+            attempt_generation: AttemptGeneration(self.next_driver_attempt),
+            launch_session: LaunchSessionGeneration(self.next_driver_session),
+            endpoint: ControlEndpoint {
+                id: EndpointId(self.next_driver_endpoint),
+                generation: EndpointGeneration(1),
+            },
+            transaction_id: self.next_driver_transaction,
+            driver_path: wyrmroot_device_proto::DEVICE_DRIVER_PATH,
+            actor_identity: self.status.driver_identity,
+            child_is_channel,
+            child_rights,
+        };
+        let launch = DriverLaunch::new(request)?;
+        self.active_driver = Some(launch);
+        self.next_driver_attempt = self
+            .next_driver_attempt
+            .checked_add(1)
+            .ok_or(DevmgrError::ControllerLifecycle)?;
+        self.next_driver_session = self
+            .next_driver_session
+            .checked_add(1)
+            .ok_or(DevmgrError::ControllerLifecycle)?;
+        self.next_driver_endpoint = self
+            .next_driver_endpoint
+            .checked_add(1)
+            .ok_or(DevmgrError::ControllerLifecycle)?;
+        self.next_driver_transaction = self
+            .next_driver_transaction
+            .checked_add(1)
+            .ok_or(DevmgrError::ControllerLifecycle)?;
+        Ok(request)
+    }
+
+    pub fn driver_constructed(&mut self) -> Result<(), DevmgrError> {
+        self.active_driver
+            .as_mut()
+            .ok_or(DevmgrError::ControllerLifecycle)?
+            .constructed()?;
+        Ok(())
+    }
+
+    pub fn accept_driver_control_ready(
+        &mut self,
+        message: wyrmroot_device_proto::ControlMessage,
+    ) -> Result<(), DevmgrError> {
+        self.active_driver
+            .as_mut()
+            .ok_or(DevmgrError::ControllerLifecycle)?
+            .accept_control_ready(message)?;
+        Ok(())
+    }
+
+    pub fn reap_driver(&mut self) -> Result<(), DevmgrError> {
+        let mut launch = self
+            .active_driver
+            .take()
+            .ok_or(DevmgrError::ControllerLifecycle)?;
+        launch.reap()?;
+        Ok(())
     }
 
     /// Applies a syntactically validated WRCS controller message.  Handle
@@ -348,8 +472,16 @@ mod tests {
     }
 
     fn install(binding: RegistryBinding, transaction_id: u64) -> ControllerMessage {
+        install_for(7, binding, transaction_id)
+    }
+
+    fn install_for(
+        supervisor_generation: u64,
+        binding: RegistryBinding,
+        transaction_id: u64,
+    ) -> ControllerMessage {
         ControllerMessage::InstallPublication {
-            supervisor_generation: SupervisorGeneration(7),
+            supervisor_generation: SupervisorGeneration(supervisor_generation),
             binding,
             transaction_id,
         }
@@ -468,6 +600,132 @@ mod tests {
                 0,
             ),
             Err(DevmgrError::ControllerLifecycle)
+        );
+    }
+
+    #[test]
+    fn c3_launch_is_fresh_direct_and_ready_is_correlation_exact() {
+        let mut resident =
+            ResidentController::new(prepare_operational(&manifest(), 7).unwrap(), 41).unwrap();
+        resident.accept(install(binding(1, 7), 41), 0).unwrap();
+        let request = resident
+            .issue_driver_launch(true, DirectControlRights::ExactReduced)
+            .unwrap();
+        assert_eq!(request.supervisor_generation, SupervisorGeneration(7));
+        assert_eq!(request.role_id, RoleId(1));
+        assert_eq!(
+            request.attempt_generation.0,
+            7 * DRIVER_CORRELATION_STRIDE + DRIVER_ATTEMPT_OFFSET
+        );
+        assert_ne!(request.attempt_generation.0, request.launch_session.0);
+        assert_ne!(request.attempt_generation.0, request.endpoint.id.0);
+        assert_ne!(request.attempt_generation.0, request.transaction_id);
+        assert_ne!(request.launch_session.0, request.endpoint.id.0);
+        assert_ne!(request.launch_session.0, request.transaction_id);
+        assert_ne!(request.endpoint.id.0, request.transaction_id);
+        resident.driver_constructed().unwrap();
+        assert_eq!(
+            resident.accept_driver_control_ready(
+                wyrmroot_device_proto::ControlMessage::ControlReady {
+                    role_id: request.role_id,
+                    attempt_generation: request.attempt_generation,
+                    endpoint: request.endpoint,
+                    transaction_id: request.transaction_id,
+                }
+            ),
+            Ok(())
+        );
+        assert!(
+            resident
+                .issue_driver_launch(true, DirectControlRights::ExactReduced)
+                .is_err()
+        );
+        resident.reap_driver().unwrap();
+        let replacement = resident
+            .issue_driver_launch(true, DirectControlRights::ExactReduced)
+            .unwrap();
+        assert!(replacement.attempt_generation.0 > request.attempt_generation.0);
+        assert_ne!(replacement.endpoint, request.endpoint);
+    }
+
+    #[test]
+    fn replacement_devmgr_uses_a_supervisor_owned_monotonic_driver_namespace() {
+        let mut first =
+            ResidentController::new(prepare_operational(&manifest(), 7).unwrap(), 41).unwrap();
+        first.accept(install_for(7, binding(1, 7), 41), 0).unwrap();
+        let old = first
+            .issue_driver_launch(true, DirectControlRights::ExactReduced)
+            .unwrap();
+
+        let mut replacement =
+            ResidentController::new(prepare_operational(&manifest(), 8).unwrap(), 42).unwrap();
+        replacement
+            .accept(install_for(8, binding(2, 8), 42), 0)
+            .unwrap();
+        let fresh = replacement
+            .issue_driver_launch(true, DirectControlRights::ExactReduced)
+            .unwrap();
+        assert!(fresh.attempt_generation.0 > old.attempt_generation.0);
+        assert!(fresh.launch_session.0 > old.launch_session.0);
+        assert!(fresh.endpoint.id.0 > old.endpoint.id.0);
+        assert!(fresh.transaction_id > old.transaction_id);
+        assert_ne!(fresh.attempt_generation.0, fresh.launch_session.0);
+        assert_ne!(fresh.attempt_generation.0, fresh.endpoint.id.0);
+        assert_ne!(fresh.attempt_generation.0, fresh.transaction_id);
+        assert_ne!(fresh.launch_session.0, fresh.endpoint.id.0);
+        assert_ne!(fresh.launch_session.0, fresh.transaction_id);
+        assert_ne!(fresh.endpoint.id.0, fresh.transaction_id);
+        replacement.driver_constructed().unwrap();
+        assert_eq!(
+            replacement.accept_driver_control_ready(
+                wyrmroot_device_proto::ControlMessage::ControlReady {
+                    role_id: old.role_id,
+                    attempt_generation: old.attempt_generation,
+                    endpoint: old.endpoint,
+                    transaction_id: old.transaction_id,
+                }
+            ),
+            Err(DevmgrError::DriverLaunch(DriverLaunchError::StaleEndpoint))
+        );
+        assert_eq!(
+            replacement.accept_driver_control_ready(
+                wyrmroot_device_proto::ControlMessage::ControlReady {
+                    role_id: fresh.role_id,
+                    attempt_generation: fresh.attempt_generation,
+                    endpoint: fresh.endpoint,
+                    transaction_id: fresh.transaction_id,
+                }
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn c3_rejects_wrong_child_rights_and_stale_ready() {
+        let mut resident =
+            ResidentController::new(prepare_operational(&manifest(), 7).unwrap(), 41).unwrap();
+        resident.accept(install(binding(1, 7), 41), 0).unwrap();
+        assert_eq!(
+            resident.issue_driver_launch(true, DirectControlRights::Other),
+            Err(DevmgrError::DriverLaunch(DriverLaunchError::WrongRights))
+        );
+        let request = resident
+            .issue_driver_launch(true, DirectControlRights::ExactReduced)
+            .unwrap();
+        resident.driver_constructed().unwrap();
+        assert_eq!(
+            resident.accept_driver_control_ready(
+                wyrmroot_device_proto::ControlMessage::ControlReady {
+                    role_id: request.role_id,
+                    attempt_generation: request.attempt_generation,
+                    endpoint: ControlEndpoint {
+                        id: request.endpoint.id,
+                        generation: EndpointGeneration(9)
+                    },
+                    transaction_id: request.transaction_id,
+                }
+            ),
+            Err(DevmgrError::DriverLaunch(DriverLaunchError::StaleEndpoint))
         );
     }
 }

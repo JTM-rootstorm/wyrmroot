@@ -3,10 +3,11 @@ use wyrmroot_loader::{
     elf::{STACK_BOTTOM, STACK_BYTES},
     launch::LaunchProfile,
     process::{
-        DeviceCoordinatorLoadError, DeviceCoordinatorLoadRequest, JobLoadError, JobLoadRequest,
-        LoadAuthority, LoadError, LoadFault, LoadRequest, LoadStage, LoaderPlatform, ParentMapping,
-        ProcessCreateRequest, ProcessCreateResult, ServiceLoadError, ServiceLoadRequest,
-        load_device_coordinator_process, load_job_process, load_process, load_process_with_fault,
+        DeviceCoordinatorLoadError, DeviceCoordinatorLoadRequest, DeviceDriverLoadError,
+        DeviceDriverLoadRequest, JobLoadError, JobLoadRequest, LoadAuthority, LoadError, LoadFault,
+        LoadRequest, LoadStage, LoaderPlatform, ParentMapping, ProcessCreateRequest,
+        ProcessCreateResult, ServiceLoadError, ServiceLoadRequest, load_device_coordinator_process,
+        load_device_driver_process, load_job_process, load_process, load_process_with_fault,
         load_service_process,
     },
 };
@@ -469,6 +470,72 @@ fn device_coordinator_failed_init_move_retains_both_external_inputs() {
             .contains(&Event::Close(publication_endpoint.0))
     );
     assert!(!platform.events.contains(&Event::Close(manifest.0)));
+}
+
+#[test]
+fn device_driver_moves_only_self_root_and_direct_child_endpoint() {
+    let mut platform = Mock::new(None);
+    let image = executable();
+    let endpoint = DwHandle(0x930);
+    load_device_driver_process(
+        &mut platform,
+        authority(),
+        DeviceDriverLoadRequest {
+            image: &image,
+            display_path: "/system/uart16550d",
+            control_endpoint: endpoint,
+            supervisor_generation: 1,
+            role_id: 2,
+            attempt_generation: 3,
+            launch_session: 4,
+            endpoint_id: 5,
+            endpoint_generation: 6,
+            transaction_id: 7,
+        },
+    )
+    .unwrap();
+    assert_eq!(platform.sent_init.len(), 104);
+    assert_eq!(&platform.sent_init[6..8], &6_u16.to_le_bytes());
+    assert_eq!(platform.sent_transfers.len(), 2);
+    assert_eq!(platform.sent_transfers[1].handle, endpoint);
+    assert_eq!(
+        platform.sent_transfers[1].requested_rights,
+        wyrmroot_loader::launch::CHILD_CHANNEL_RIGHTS
+    );
+}
+
+#[test]
+fn device_driver_failed_init_move_retains_direct_endpoint() {
+    let mut platform = Mock::new(Some("send"));
+    let image = executable();
+    let error = load_device_driver_process(
+        &mut platform,
+        authority(),
+        DeviceDriverLoadRequest {
+            image: &image,
+            display_path: "/system/uart16550d",
+            control_endpoint: DwHandle(0x931),
+            supervisor_generation: 1,
+            role_id: 2,
+            attempt_generation: 3,
+            launch_session: 4,
+            endpoint_id: 5,
+            endpoint_generation: 6,
+            transaction_id: 7,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        error,
+        DeviceDriverLoadError {
+            error: LoadError::Platform {
+                stage: LoadStage::InitSend,
+                cause: "send",
+                rollback_failed: false,
+            },
+            control_endpoint_consumed: false
+        }
+    );
 }
 
 #[test]

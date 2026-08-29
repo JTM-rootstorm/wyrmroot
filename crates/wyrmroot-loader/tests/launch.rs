@@ -3,10 +3,37 @@ use deepwyrm_syscall::{
     DW_OBJECT_TYPE_TASK_GROUP, DwHandle, DwReceivedHandleInfoV1,
 };
 use wyrmroot_loader::launch::{
-    self, BOOTFS_RIGHTS, CHILD_CHANNEL_RIGHTS, DEVICE_COORDINATOR_BYTES, DEVICE_MANIFEST_RIGHTS,
-    HEADER_BYTES, INIT0_BYTES, LOADER_TASK_GROUP_RIGHTS, LaunchError, LaunchProfile,
-    PROBE_CHILD_BYTES, SELF_ROOT_RIGHTS, SUPERVISOR_BYTES,
+    self, BOOTFS_RIGHTS, CHILD_CHANNEL_RIGHTS, DEVICE_COORDINATOR_BYTES, DEVICE_DRIVER_BYTES,
+    DEVICE_MANIFEST_RIGHTS, HEADER_BYTES, INIT0_BYTES, LOADER_TASK_GROUP_RIGHTS, LaunchError,
+    LaunchProfile, PROBE_CHILD_BYTES, SELF_ROOT_RIGHTS, SUPERVISOR_BYTES,
 };
+
+#[test]
+fn wyr1_c3_driver_has_exact_reduced_direct_control_profile() {
+    let mut bytes = [0; DEVICE_DRIVER_BYTES];
+    let handles = [
+        received(1, DW_OBJECT_TYPE_ADDRESS_REGION, SELF_ROOT_RIGHTS),
+        received(2, DW_OBJECT_TYPE_CHANNEL, CHILD_CHANNEL_RIGHTS),
+    ];
+    launch::encode_device_driver_init(7, 1, 2, 3, 4, 5, 6, &mut bytes).unwrap();
+    assert_eq!(get16(&bytes, 6), 6);
+    assert_eq!(get32(&bytes, 20), 2);
+    let parsed = launch::parse_device_driver_init(&bytes, &handles).unwrap();
+    assert_eq!(
+        (
+            parsed.supervisor_generation,
+            parsed.role_id,
+            parsed.attempt_generation
+        ),
+        (1, 2, 3)
+    );
+    let mut wrong = handles;
+    wrong[1].rights = SELF_ROOT_RIGHTS;
+    assert_eq!(
+        launch::parse_device_driver_init(&bytes, &wrong),
+        Err(LaunchError::HandleMetadata { index: 1 })
+    );
+}
 
 #[test]
 fn exact_init0_round_trip_validates_roles_and_handles() {
