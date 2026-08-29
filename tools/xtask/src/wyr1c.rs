@@ -5,13 +5,15 @@
 //! guest selector, construct an ESP, or invoke QEMU/libvirt.
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     env,
     ffi::{OsStr, OsString},
     fs::{self, OpenOptions},
-    io::{Read, Write},
+    io::Read,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::{error::Failure, metadata::BuildManifest, sha256};
@@ -100,6 +102,24 @@ struct NativeArtifact {
     inspection: String,
 }
 
+pub(crate) struct FrozenSnapshot {
+    pub(crate) receipt: Vec<u8>,
+    pub(crate) rrc_manifest: Vec<u8>,
+    pub(crate) device_manifest: Vec<u8>,
+    pub(crate) bootfs: Vec<u8>,
+    pub(crate) artifacts: BTreeMap<String, Vec<u8>>,
+    pub(crate) inspections: BTreeMap<String, Vec<u8>>,
+}
+
+pub(crate) struct ValidatedFrozenProduct {
+    pub(crate) wyrmroot_revision: String,
+}
+
+pub(crate) struct BuiltFrozenProduct {
+    pub(crate) snapshot: FrozenSnapshot,
+    pub(crate) validated: ValidatedFrozenProduct,
+}
+
 pub(crate) fn product(output: &Path) -> Result<String, Failure> {
     reject_ambient_build_environment(env::vars_os())?;
     let repository = crate::tasks::repository_root()?;
@@ -109,6 +129,34 @@ pub(crate) fn product(output: &Path) -> Result<String, Failure> {
         .ok_or_else(|| Failure::task("WYR1-C1 source is not beneath OS-Project"))?
         .to_path_buf();
     let output = validate_fresh_output(&repository, &project, output)?;
+    let parent_path = output
+        .parent()
+        .ok_or_else(|| Failure::task("WYR1-C1 output has no parent"))?;
+    let name = output
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| Failure::task("WYR1-C1 output name is not UTF-8"))?;
+    let parent = crate::secure_fs::Directory::open_exact(parent_path, "WYR1-C1 output parent")?;
+    let output_directory = parent.create_child(name, 0o700, "WYR1-C1 output")?;
+    let built = build_into(&output_directory)?;
+    Ok(format!(
+        "WYR1_C1_HOST_PRODUCT_PASS product_kind={PRODUCT_KIND} selector=none evidence=not-produced wyrmroot_revision={} rust_revision={ACCEPTED_RUST_REVISION} bootfs_sha256={} receipt={}\n",
+        built.validated.wyrmroot_revision,
+        sha256::bytes_digest(&built.snapshot.bootfs),
+        output.join("product/build-receipt.toml").display(),
+    ))
+}
+
+pub(crate) fn build_into(
+    output: &crate::secure_fs::Directory,
+) -> Result<BuiltFrozenProduct, Failure> {
+    reject_ambient_build_environment(env::vars_os())?;
+    let repository = crate::tasks::repository_root()?;
+    let project = repository
+        .ancestors()
+        .find(|path| path.ends_with("OS-Project"))
+        .ok_or_else(|| Failure::task("WYR1-C1 source is not beneath OS-Project"))?
+        .to_path_buf();
     let revision = clean_repository_revision(&repository)?;
     let manifest = BuildManifest::load(&repository)?;
     if manifest.rust_revision()? != ACCEPTED_RUST_REVISION
@@ -127,58 +175,45 @@ pub(crate) fn product(output: &Path) -> Result<String, Failure> {
         ));
     }
 
-    fs::create_dir(&output)
-        .map_err(|error| Failure::task(format!("could not create WYR1-C1 output: {error}")))?;
-    let artifacts_directory = output.join("artifacts");
-    let product_directory = output.join("product");
-    let inspections_directory = output.join("inspections");
-    let build_directory = output.join("build");
-    for directory in [
-        &artifacts_directory,
-        &product_directory,
-        &inspections_directory,
-        &build_directory,
-    ] {
-        fs::create_dir(directory).map_err(|error| {
-            Failure::task(format!(
-                "could not create WYR1-C1 product directory: {error}"
-            ))
-        })?;
-    }
-
-    let mut artifacts = Vec::with_capacity(NATIVE_SPECS.len());
-    for spec in NATIVE_SPECS {
-        toolchain.accepted().verify_unchanged()?;
-        let artifact = build_native(
-            &repository,
-            &cargo_home,
-            toolchain.accepted(),
-            &build_directory,
-            spec,
-        )?;
-        let published = artifacts_directory.join(format!("{}.elf", spec.label));
-        write_new_file(&published, &artifact.bytes)?;
-        let inspection = inspect_native(&repository, &published, &artifact.sha256, spec.label)?;
-        write_new_file(
-            &inspections_directory.join(format!("{}.json", spec.label)),
-            inspection.as_bytes(),
-        )?;
-        artifacts.push(NativeArtifact {
-            inspection,
-            ..artifact
-        });
-    }
+    let project_directory = crate::secure_fs::Directory::open_exact(&project, "OS-Project root")?;
+    let tmp = match project_directory.open_child(".tmp", "project temporary root") {
+        Ok(directory) => directory,
+        Err(_) => project_directory.create_child(".tmp", 0o700, "project temporary root")?,
+    };
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Failure::task("system clock is before the Unix epoch"))?
+        .as_nanos();
+    let scratch_name = format!("wyr1c-build-{}-{unique}", std::process::id());
+    let scratch = tmp.create_child(&scratch_name, 0o700, "WYR1-C1 build scratch")?;
+    let build_result = (|| {
+        let mut artifacts = Vec::with_capacity(NATIVE_SPECS.len());
+        for spec in NATIVE_SPECS {
+            toolchain.accepted().verify_unchanged()?;
+            let mut artifact = build_native(
+                &repository,
+                &cargo_home,
+                toolchain.accepted(),
+                &scratch.anchor_path(),
+                spec,
+            )?;
+            let built_path = scratch
+                .anchor_path()
+                .join(spec.label)
+                .join(NATIVE_TARGET)
+                .join("release")
+                .join(spec.artifact);
+            artifact.inspection =
+                inspect_native(&repository, &built_path, &artifact.sha256, spec.label)?;
+            artifacts.push(artifact);
+        }
+        Ok::<_, Failure>(artifacts)
+    })();
+    let artifacts = build_result?;
     toolchain.accepted().verify_unchanged()?;
     verify_repository_revision(&repository, &revision)?;
 
     let product = assemble_product(&revision, &artifacts)?;
-    let manifest_path = product_directory.join("rrc-c1-v1.bin");
-    let device_manifest_path = product_directory.join("wrdm-c1-v1.bin");
-    let bootfs_path = product_directory.join("bootfs.img");
-    write_new_file(&manifest_path, &product.rrc_manifest)?;
-    write_new_file(&device_manifest_path, &product.device_manifest)?;
-    write_new_file(&bootfs_path, &product.bootfs)?;
-
     let receipt = render_receipt(
         &revision,
         &manifest,
@@ -189,29 +224,147 @@ pub(crate) fn product(output: &Path) -> Result<String, Failure> {
     if receipt.len() > MAX_REPORT_BYTES {
         return Err(Failure::task("WYR1-C1 receipt exceeds its fixed bound"));
     }
-    let receipt_path = product_directory.join("build-receipt.toml");
-    write_new_file(&receipt_path, receipt.as_bytes())?;
-    inspect_published_product(
-        &product_directory,
-        &artifacts_directory,
-        &inspections_directory,
-        &artifacts,
-        &product,
-        &receipt,
-    )?;
+    let snapshot = FrozenSnapshot {
+        receipt: receipt.into_bytes(),
+        rrc_manifest: product.rrc_manifest,
+        device_manifest: product.device_manifest,
+        bootfs: product.bootfs,
+        artifacts: artifacts
+            .iter()
+            .map(|artifact| (artifact.spec.label.to_owned(), artifact.bytes.clone()))
+            .collect(),
+        inspections: artifacts
+            .iter()
+            .map(|artifact| {
+                (
+                    artifact.spec.label.to_owned(),
+                    artifact.inspection.as_bytes().to_vec(),
+                )
+            })
+            .collect(),
+    };
+    let validated = validate_frozen_product(&repository, &snapshot)?;
+    publish_snapshot(output, &snapshot)?;
+    let published = snapshot_from_directory(output)?;
+    if published.receipt != snapshot.receipt
+        || published.rrc_manifest != snapshot.rrc_manifest
+        || published.device_manifest != snapshot.device_manifest
+        || published.bootfs != snapshot.bootfs
+        || published.artifacts != snapshot.artifacts
+        || published.inspections != snapshot.inspections
+    {
+        return Err(Failure::task("WYR1-C1 published snapshot changed"));
+    }
+    validate_frozen_product(&repository, &published)?;
     toolchain.accepted().verify_unchanged()?;
     verify_repository_revision(&repository, &revision)?;
+    Ok(BuiltFrozenProduct {
+        snapshot: published,
+        validated,
+    })
+}
 
-    fs::remove_dir_all(&build_directory).map_err(|error| {
-        Failure::task(format!(
-            "could not retire WYR1-C1 isolated build targets: {error}"
-        ))
-    })?;
-    Ok(format!(
-        "WYR1_C1_HOST_PRODUCT_PASS product_kind={PRODUCT_KIND} selector=none evidence=not-produced wyrmroot_revision={revision} rust_revision={ACCEPTED_RUST_REVISION} bootfs_sha256={} receipt={}\n",
-        product.bootfs_sha256,
-        receipt_path.display(),
-    ))
+fn publish_snapshot(
+    output: &crate::secure_fs::Directory,
+    snapshot: &FrozenSnapshot,
+) -> Result<(), Failure> {
+    let artifacts = output.create_child("artifacts", 0o700, "WYR1-C1 artifacts")?;
+    let inspections = output.create_child("inspections", 0o700, "WYR1-C1 inspections")?;
+    let product = output.create_child("product", 0o700, "WYR1-C1 product")?;
+    for spec in NATIVE_SPECS {
+        artifacts.write_new(
+            &format!("{}.elf", spec.label),
+            snapshot
+                .artifacts
+                .get(spec.label)
+                .ok_or_else(|| Failure::task("WYR1-C1 snapshot lacks an artifact"))?,
+            0o400,
+            "WYR1-C1 artifact",
+        )?;
+        inspections.write_new(
+            &format!("{}.json", spec.label),
+            snapshot
+                .inspections
+                .get(spec.label)
+                .ok_or_else(|| Failure::task("WYR1-C1 snapshot lacks an inspection"))?,
+            0o400,
+            "WYR1-C1 inspection",
+        )?;
+    }
+    for (name, bytes, maximum, label) in [
+        (
+            "rrc-c1-v1.bin",
+            snapshot.rrc_manifest.as_slice(),
+            MAX_REPORT_BYTES,
+            "WYR1-C1 WRRM",
+        ),
+        (
+            "wrdm-c1-v1.bin",
+            snapshot.device_manifest.as_slice(),
+            MAX_REPORT_BYTES,
+            "WYR1-C1 WRDM",
+        ),
+        (
+            "bootfs.img",
+            snapshot.bootfs.as_slice(),
+            MAX_BOOTFS_BYTES,
+            "WYR1-C1 bootfs",
+        ),
+        (
+            "build-receipt.toml",
+            snapshot.receipt.as_slice(),
+            MAX_REPORT_BYTES,
+            "WYR1-C1 receipt",
+        ),
+    ] {
+        if bytes.is_empty() || bytes.len() > maximum {
+            return Err(Failure::task(format!(
+                "{label} exceeds its publication bound"
+            )));
+        }
+        product.write_new(name, bytes, 0o400, label)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn snapshot_from_directory(
+    output: &crate::secure_fs::Directory,
+) -> Result<FrozenSnapshot, Failure> {
+    let artifacts = output.open_child("artifacts", "WYR1-C1 artifacts")?;
+    let inspections = output.open_child("inspections", "WYR1-C1 inspections")?;
+    let product = output.open_child("product", "WYR1-C1 product")?;
+    let mut artifact_bytes = BTreeMap::new();
+    let mut inspection_bytes = BTreeMap::new();
+    for spec in NATIVE_SPECS {
+        artifact_bytes.insert(
+            spec.label.to_owned(),
+            artifacts.read(
+                &format!("{}.elf", spec.label),
+                MAX_ARTIFACT_BYTES as u64,
+                "WYR1-C1 artifact",
+            )?,
+        );
+        inspection_bytes.insert(
+            spec.label.to_owned(),
+            inspections.read(
+                &format!("{}.json", spec.label),
+                MAX_REPORT_BYTES as u64,
+                "WYR1-C1 inspection",
+            )?,
+        );
+    }
+    Ok(FrozenSnapshot {
+        receipt: product.read(
+            "build-receipt.toml",
+            MAX_REPORT_BYTES as u64,
+            "WYR1-C1 receipt",
+        )?,
+        rrc_manifest: product.read("rrc-c1-v1.bin", MAX_REPORT_BYTES as u64, "WYR1-C1 WRRM")?,
+        device_manifest: product.read("wrdm-c1-v1.bin", MAX_REPORT_BYTES as u64, "WYR1-C1 WRDM")?,
+        bootfs: product.read("bootfs.img", MAX_BOOTFS_BYTES as u64, "WYR1-C1 bootfs")?,
+        artifacts: artifact_bytes,
+        inspections: inspection_bytes,
+    })
 }
 
 struct ProductBytes {
@@ -509,68 +662,136 @@ fn render_receipt(
     Ok(receipt)
 }
 
-fn inspect_published_product(
-    product_directory: &Path,
-    artifacts_directory: &Path,
-    inspections_directory: &Path,
-    artifacts: &[NativeArtifact],
-    product: &ProductBytes,
-    receipt: &str,
-) -> Result<(), Failure> {
-    for artifact in artifacts {
-        let path = artifacts_directory.join(format!("{}.elf", artifact.spec.label));
-        let observed = read_bounded(&path, artifact.spec.label, MAX_ARTIFACT_BYTES, true)?;
-        if sha256::bytes_digest(&observed) != artifact.sha256 {
-            return Err(Failure::task("WYR1-C1 published artifact digest drifted"));
-        }
-        let inspection = read_bounded(
-            &inspections_directory.join(format!("{}.json", artifact.spec.label)),
-            "native inspection report",
-            MAX_REPORT_BYTES,
-            true,
-        )?;
-        if inspection != artifact.inspection.as_bytes() {
-            return Err(Failure::task(
-                "WYR1-C1 published native inspection report drifted",
-            ));
+pub(crate) fn validate_frozen_product(
+    repository: &Path,
+    snapshot: &FrozenSnapshot,
+) -> Result<ValidatedFrozenProduct, Failure> {
+    let receipt_text = std::str::from_utf8(&snapshot.receipt)
+        .map_err(|_| Failure::task("WYR1-C1 receipt is not UTF-8"))?;
+    let receipt = parse_receipt(receipt_text)?;
+    let expected_keys = c1_receipt_keys();
+    if receipt.keys().cloned().collect::<BTreeSet<_>>() != expected_keys {
+        return Err(Failure::task("WYR1-C1 receipt key set drifted"));
+    }
+    for (key, expected) in [
+        ("kind", RECEIPT_KIND),
+        ("schema_version", "1"),
+        ("product_kind", PRODUCT_KIND),
+        ("selector", "none"),
+        ("evidence", "not-produced"),
+        ("rust_revision", ACCEPTED_RUST_REVISION),
+        ("rust_toolchain_name", ACCEPTED_TOOLCHAIN_NAME),
+        ("rrc_manifest_path", "product/rrc-c1-v1.bin"),
+        ("device_manifest_path", "product/wrdm-c1-v1.bin"),
+        ("bootfs_path", "product/bootfs.img"),
+    ] {
+        if receipt.get(key).map(String::as_str) != Some(expected) {
+            return Err(Failure::task(format!("WYR1-C1 receipt {key} drifted")));
         }
     }
-    let observed_rrc = read_bounded(
-        &product_directory.join("rrc-c1-v1.bin"),
-        "WRRM",
-        MAX_REPORT_BYTES,
-        true,
-    )?;
-    let observed_wrdm = read_bounded(
-        &product_directory.join("wrdm-c1-v1.bin"),
-        "WRDM",
-        MAX_REPORT_BYTES,
-        true,
-    )?;
-    let observed_bootfs = read_bounded(
-        &product_directory.join("bootfs.img"),
-        "bootfs",
-        MAX_BOOTFS_BYTES,
-        true,
-    )?;
-    let observed_receipt = read_bounded(
-        &product_directory.join("build-receipt.toml"),
-        "receipt",
-        MAX_REPORT_BYTES,
-        true,
-    )?;
-    if observed_rrc != product.rrc_manifest
-        || observed_wrdm != product.device_manifest
-        || observed_bootfs != product.bootfs
-        || observed_receipt != receipt.as_bytes()
-    {
+
+    let revision = receipt
+        .get("wyrmroot_revision")
+        .ok_or_else(|| Failure::task("WYR1-C1 receipt lacks Wyrmroot revision"))?
+        .clone();
+    validate_revision(&revision, "Wyrmroot")?;
+    let cargo_lock = git_file(repository, &revision, "Cargo.lock")?;
+    if receipt.get("cargo_lock_sha256") != Some(&sha256::bytes_digest(&cargo_lock)) {
         return Err(Failure::task(
-            "WYR1-C1 published product changed during re-read",
+            "WYR1-C1 receipt Cargo.lock hash is not from its declared revision",
         ));
     }
+
+    let manifest = BuildManifest::load(repository)?;
+    if manifest.rust_revision()? != ACCEPTED_RUST_REVISION
+        || manifest.rust_toolchain_name()? != ACCEPTED_TOOLCHAIN_NAME
+    {
+        return Err(Failure::task(
+            "current metadata lost the accepted C1 toolchain tuple",
+        ));
+    }
+    let profile = manifest.validate_loader_build_readiness(repository)?;
+    let toolchain = crate::tasks::prepare_loader_toolchain(repository, &profile, &manifest)?;
+    toolchain.accepted().verify_unchanged()?;
+    for (key, actual) in [
+        ("rustc_sha256", toolchain.accepted().rustc_sha256.as_str()),
+        ("cargo_sha256", toolchain.accepted().cargo_sha256.as_str()),
+        (
+            "rust_lld_sha256",
+            toolchain.accepted().rust_lld_sha256.as_str(),
+        ),
+        (
+            "toolchain_manifest_sha256",
+            toolchain.accepted().manifest_sha256.as_str(),
+        ),
+        (
+            "toolchain_tree_sha256",
+            toolchain.accepted().toolchain_tree_sha256.as_str(),
+        ),
+    ] {
+        if receipt.get(key).map(String::as_str) != Some(actual) {
+            return Err(Failure::task(format!("WYR1-C1 receipt {key} drifted")));
+        }
+    }
+
+    let mut artifacts = Vec::with_capacity(NATIVE_SPECS.len());
+    for spec in NATIVE_SPECS {
+        let bytes = snapshot
+            .artifacts
+            .get(spec.label)
+            .ok_or_else(|| Failure::task("WYR1-C1 snapshot lacks a native artifact"))?
+            .clone();
+        let inspection_bytes = snapshot
+            .inspections
+            .get(spec.label)
+            .ok_or_else(|| Failure::task("WYR1-C1 snapshot lacks an inspection"))?;
+        let digest = sha256::bytes_digest(&bytes);
+        let expected_path = format!("artifacts/{}.elf", spec.label);
+        if receipt.get(&format!("{}_path", spec.label)) != Some(&expected_path)
+            || receipt.get(&format!("{}_sha256", spec.label)) != Some(&digest)
+            || receipt.get(&format!("{}_command", spec.label)) != Some(&native_command(spec))
+            || receipt.get(&format!("{}_inspection_sha256", spec.label))
+                != Some(&sha256::bytes_digest(inspection_bytes))
+        {
+            return Err(Failure::task(format!(
+                "WYR1-C1 {} receipt binding drifted",
+                spec.label
+            )));
+        }
+        let inspection = std::str::from_utf8(inspection_bytes)
+            .map_err(|_| Failure::task("WYR1-C1 inspection is not UTF-8"))?
+            .to_owned();
+        validate_inspection(&inspection, spec.label, &digest, bytes.len())?;
+        artifacts.push(NativeArtifact {
+            spec,
+            bytes,
+            sha256: digest,
+            inspection,
+        });
+    }
+
+    for (key, bytes) in [
+        ("rrc_manifest_sha256", snapshot.rrc_manifest.as_slice()),
+        (
+            "device_manifest_sha256",
+            snapshot.device_manifest.as_slice(),
+        ),
+        ("bootfs_sha256", snapshot.bootfs.as_slice()),
+    ] {
+        if receipt.get(key) != Some(&sha256::bytes_digest(bytes)) {
+            return Err(Failure::task(format!("WYR1-C1 {key} drifted")));
+        }
+    }
+    if receipt.get("bootfs_bytes") != Some(&snapshot.bootfs.len().to_string()) {
+        return Err(Failure::task("WYR1-C1 bootfs byte count drifted"));
+    }
+    let generation = product_generation(&revision, &artifacts);
+    if receipt.get("boot_generation") != Some(&hex_digest(&generation)) {
+        return Err(Failure::task("WYR1-C1 boot generation was not recomputed"));
+    }
     validate_rrc(
-        &observed_rrc,
-        &product.generation,
+        &snapshot.rrc_manifest,
+        &generation,
         [
             digest_array(&artifacts[1].sha256)?,
             digest_array(&artifacts[2].sha256)?,
@@ -580,14 +801,234 @@ fn inspect_published_product(
         ],
     )?;
     let uart_identity = digest_array(&artifacts[3].sha256)?;
-    wyrmroot_device_proto::Manifest::parse(&observed_wrdm)
+    wyrmroot_device_proto::Manifest::parse(&snapshot.device_manifest)
         .and_then(|manifest| manifest.match_com2(ContentIdentity(uart_identity)))
-        .map_err(|error| {
-            Failure::task(format!(
-                "published WYR1-C1 WRDM failed inspection: {error:?}"
-            ))
-        })?;
-    inspect_archive(&observed_bootfs, artifacts, &observed_rrc, &observed_wrdm)
+        .map_err(|error| Failure::task(format!("WYR1-C1 WRDM failed inspection: {error:?}")))?;
+    inspect_archive(
+        &snapshot.bootfs,
+        &artifacts,
+        &snapshot.rrc_manifest,
+        &snapshot.device_manifest,
+    )?;
+    if snapshot.receipt != canonical_c1_receipt(&receipt)?.as_bytes() {
+        return Err(Failure::task("WYR1-C1 receipt is not canonically rendered"));
+    }
+    Ok(ValidatedFrozenProduct {
+        wyrmroot_revision: revision,
+    })
+}
+
+fn canonical_c1_receipt(values: &BTreeMap<String, String>) -> Result<String, Failure> {
+    let mut output = String::new();
+    for key in [
+        "kind",
+        "schema_version",
+        "product_kind",
+        "selector",
+        "evidence",
+        "wyrmroot_revision",
+        "cargo_lock_sha256",
+        "rust_revision",
+        "rust_toolchain_name",
+        "rustc_sha256",
+        "cargo_sha256",
+        "rust_lld_sha256",
+        "toolchain_manifest_sha256",
+        "toolchain_tree_sha256",
+        "boot_generation",
+        "rrc_manifest_path",
+        "rrc_manifest_sha256",
+        "device_manifest_path",
+        "device_manifest_sha256",
+        "bootfs_path",
+        "bootfs_sha256",
+        "bootfs_bytes",
+    ] {
+        let value = values
+            .get(key)
+            .ok_or_else(|| Failure::task("WYR1-C1 receipt lost a canonical field"))?;
+        if matches!(key, "schema_version" | "bootfs_bytes") {
+            output.push_str(&format!("{key} = {value}\n"));
+        } else {
+            output.push_str(&format!("{key} = \"{value}\"\n"));
+        }
+    }
+    for spec in NATIVE_SPECS {
+        for suffix in ["path", "sha256", "command", "inspection_sha256"] {
+            let key = format!("{}_{suffix}", spec.label);
+            let value = values
+                .get(&key)
+                .ok_or_else(|| Failure::task("WYR1-C1 receipt lost an artifact field"))?;
+            output.push_str(&format!("{key} = \"{value}\"\n"));
+        }
+    }
+    Ok(output)
+}
+
+fn c1_receipt_keys() -> BTreeSet<String> {
+    let mut keys = [
+        "kind",
+        "schema_version",
+        "product_kind",
+        "selector",
+        "evidence",
+        "wyrmroot_revision",
+        "cargo_lock_sha256",
+        "rust_revision",
+        "rust_toolchain_name",
+        "rustc_sha256",
+        "cargo_sha256",
+        "rust_lld_sha256",
+        "toolchain_manifest_sha256",
+        "toolchain_tree_sha256",
+        "boot_generation",
+        "rrc_manifest_path",
+        "rrc_manifest_sha256",
+        "device_manifest_path",
+        "device_manifest_sha256",
+        "bootfs_path",
+        "bootfs_sha256",
+        "bootfs_bytes",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<BTreeSet<_>>();
+    for spec in NATIVE_SPECS {
+        for suffix in ["path", "sha256", "command", "inspection_sha256"] {
+            keys.insert(format!("{}_{suffix}", spec.label));
+        }
+    }
+    keys
+}
+
+fn parse_receipt(text: &str) -> Result<BTreeMap<String, String>, Failure> {
+    if !text.ends_with('\n') || text.contains('\r') {
+        return Err(Failure::task("WYR1-C1 receipt line endings drifted"));
+    }
+    let mut values = BTreeMap::new();
+    for line in text.lines() {
+        let (key, raw) = line
+            .split_once(" = ")
+            .ok_or_else(|| Failure::task("WYR1-C1 receipt line is malformed"))?;
+        if key.is_empty()
+            || !key.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+            })
+            || values.contains_key(key)
+        {
+            return Err(Failure::task("WYR1-C1 receipt key is invalid or duplicate"));
+        }
+        let value = if raw.starts_with('"') && raw.ends_with('"') && raw.len() >= 2 {
+            let value = &raw[1..raw.len() - 1];
+            if value.contains(['"', '\\']) || value.is_empty() {
+                return Err(Failure::task("WYR1-C1 receipt string is malformed"));
+            }
+            value
+        } else if !raw.is_empty() && raw.bytes().all(|byte| byte.is_ascii_digit()) {
+            raw
+        } else {
+            return Err(Failure::task("WYR1-C1 receipt scalar is malformed"));
+        };
+        values.insert(key.to_owned(), value.to_owned());
+    }
+    Ok(values)
+}
+
+fn validate_inspection(
+    report: &str,
+    label: &str,
+    digest: &str,
+    size: usize,
+) -> Result<(), Failure> {
+    if !report.ends_with('\n') || report.contains('\r') {
+        return Err(Failure::task("WYR1-C1 inspection line endings drifted"));
+    }
+    let body = report
+        .strip_suffix('\n')
+        .and_then(|value| value.strip_prefix('{'))
+        .and_then(|value| value.strip_suffix('}'))
+        .ok_or_else(|| Failure::task("WYR1-C1 inspection JSON is malformed"))?;
+    let mut fields = BTreeMap::new();
+    for field in body.split(',') {
+        let (key, value) = field
+            .split_once(':')
+            .ok_or_else(|| Failure::task("WYR1-C1 inspection field is malformed"))?;
+        let key = key
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .ok_or_else(|| Failure::task("WYR1-C1 inspection key is malformed"))?;
+        if fields.insert(key, value).is_some() {
+            return Err(Failure::task("WYR1-C1 inspection key is duplicate"));
+        }
+    }
+    let expected_keys = [
+        "schema_version",
+        "report_kind",
+        "verified",
+        "artifact",
+        "sha256",
+        "size",
+        "osabi",
+        "abi_version",
+        "program_headers",
+        "load_segments",
+        "syscall_veneers",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let expected_artifact = format!("\"{label}\"");
+    let expected_digest = format!("\"{digest}\"");
+    let expected_size = size.to_string();
+    if fields.keys().copied().collect::<BTreeSet<_>>() != expected_keys
+        || fields.get("schema_version") != Some(&"1")
+        || fields.get("report_kind") != Some(&"\"wyrmroot-wyr0-native-artifact-inspection\"")
+        || fields.get("verified") != Some(&"true")
+        || fields.get("artifact") != Some(&expected_artifact.as_str())
+        || fields.get("sha256") != Some(&expected_digest.as_str())
+        || fields.get("size") != Some(&expected_size.as_str())
+        || fields.get("osabi") != Some(&"0")
+        || fields.get("abi_version") != Some(&"0")
+        || fields.get("syscall_veneers") != Some(&"1")
+        || !["program_headers", "load_segments"].into_iter().all(|key| {
+            fields
+                .get(key)
+                .is_some_and(|value| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+        })
+    {
+        return Err(Failure::task(format!(
+            "WYR1-C1 inspection did not exactly bind {label}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_revision(revision: &str, label: &str) -> Result<(), Failure> {
+    if revision.len() != 40
+        || !revision
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(Failure::task(format!(
+            "{label} revision is not a commit ID"
+        )));
+    }
+    Ok(())
+}
+
+fn git_file(repository: &Path, revision: &str, path: &str) -> Result<Vec<u8>, Failure> {
+    let object = format!("{revision}:{path}");
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(["show", &object])
+        .output()
+        .map_err(|error| Failure::task(format!("could not inspect historical {path}: {error}")))?;
+    if !output.status.success() {
+        return Err(Failure::task(format!(
+            "declared WYR1-C1 revision lacks {path}"
+        )));
+    }
+    Ok(output.stdout)
 }
 
 fn product_generation(revision: &str, artifacts: &[NativeArtifact]) -> [u8; 32] {
@@ -771,18 +1212,6 @@ fn read_bounded(
     Ok(bytes)
 }
 
-fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), Failure> {
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(path)
-        .map_err(|error| Failure::task(format!("could not create WYR1-C1 product: {error}")))?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|error| Failure::task(format!("could not write WYR1-C1 product: {error}")))?;
-    Ok(())
-}
-
 fn digest_array(value: &str) -> Result<[u8; 32], Failure> {
     crate::wyr1::decode_digest(value)
 }
@@ -870,5 +1299,79 @@ mod tests {
     fn native_inspection_uses_only_the_pinned_host_tool_path() {
         assert_eq!(INSPECTION_PATH, "/usr/lib/llvm/22/bin:/usr/bin:/bin");
         assert!(!INSPECTION_PATH.contains("/usr/local"));
+    }
+
+    #[test]
+    fn frozen_structure_rejects_generation_artifact_and_gate_mutation() {
+        let artifacts = fixture_artifacts();
+        let product = assemble_product(&"a".repeat(40), &artifacts).unwrap();
+        let mut wrong_generation = product.generation;
+        wrong_generation[0] ^= 1;
+        assert!(
+            validate_rrc(
+                &product.rrc_manifest,
+                &wrong_generation,
+                [
+                    digest_array(&artifacts[1].sha256).unwrap(),
+                    digest_array(&artifacts[2].sha256).unwrap(),
+                    digest_array(&artifacts[3].sha256).unwrap(),
+                    digest_array(&artifacts[4].sha256).unwrap(),
+                    digest_array(&artifacts[5].sha256).unwrap(),
+                ],
+            )
+            .is_err()
+        );
+        let mut substituted = fixture_artifacts();
+        substituted[2].bytes[0] ^= 1;
+        assert!(
+            inspect_archive(
+                &product.bootfs,
+                &substituted,
+                &product.rrc_manifest,
+                &product.device_manifest,
+            )
+            .is_err()
+        );
+        let mut changed_bootfs = product.bootfs.clone();
+        changed_bootfs[0] ^= 1;
+        assert!(
+            inspect_archive(
+                &changed_bootfs,
+                &artifacts,
+                &product.rrc_manifest,
+                &product.device_manifest,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn inspection_validator_binds_utf8_name_hash_size_and_verified_state() {
+        let digest = "ab".repeat(32);
+        let report = format!(
+            "{{\"schema_version\":1,\"report_kind\":\"wyrmroot-wyr0-native-artifact-inspection\",\"verified\":true,\"artifact\":\"devmgr\",\"sha256\":\"{digest}\",\"size\":17,\"osabi\":0,\"abi_version\":0,\"program_headers\":2,\"load_segments\":1,\"syscall_veneers\":1}}\n"
+        );
+        assert!(validate_inspection(&report, "devmgr", &digest, 17).is_ok());
+        assert!(validate_inspection(&report, "registryd", &digest, 17).is_err());
+        assert!(validate_inspection(&report, "devmgr", &digest, 18).is_err());
+        assert!(
+            validate_inspection(
+                &report.replace("\"verified\":true", "\"verified\":false"),
+                "devmgr",
+                &digest,
+                17,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn c1_receipt_parser_rejects_command_key_and_size_ambiguity() {
+        assert!(parse_receipt("bootfs_bytes = 17\n").is_ok());
+        assert!(parse_receipt("bootfs_bytes = \"17\"\n").is_ok());
+        assert!(parse_receipt("system-init_command = \"x\"\n").is_ok());
+        assert!(parse_receipt("a = \"x\"\na = \"y\"\n").is_err());
+        assert!(parse_receipt("bootfs_bytes = +17\n").is_err());
+        assert!(parse_receipt("system/init = \"x\"\n").is_err());
     }
 }

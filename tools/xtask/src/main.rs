@@ -10,6 +10,7 @@ mod h_request;
 mod i_b_closure;
 mod metadata;
 mod provenance;
+mod secure_fs;
 mod sha256;
 mod tasks;
 mod toolchain_artifact;

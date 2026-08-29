@@ -5,6 +5,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::cli::G3ImageArguments;
@@ -76,6 +77,34 @@ struct Inputs {
     bootfs: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Inspection {
+    pub(crate) image_sha256: String,
+    pub(crate) loader_sha256: String,
+    pub(crate) kernel_sha256: String,
+    pub(crate) bootstrap_sha256: String,
+    pub(crate) bootfs_sha256: String,
+}
+
+impl Inspection {
+    pub(crate) fn render(&self) -> String {
+        format!(
+            concat!(
+                "{{\"schema_version\":1,\"phase\":\"WYR0-G3\",",
+                "\"image_bytes\":{},\"image_sha256\":\"{}\",",
+                "\"loader_sha256\":\"{}\",\"kernel_sha256\":\"{}\",",
+                "\"bootstrap_sha256\":\"{}\",\"bootfs_sha256\":\"{}\"}}\n"
+            ),
+            IMAGE_BYTES,
+            self.image_sha256,
+            self.loader_sha256,
+            self.kernel_sha256,
+            self.bootstrap_sha256,
+            self.bootfs_sha256,
+        )
+    }
+}
+
 impl Inputs {
     fn load(arguments: &G3ImageArguments) -> Result<Self, Failure> {
         Ok(Self {
@@ -127,33 +156,24 @@ pub(crate) fn build_in_root(
     validate_output_path(arguments, Path::new(&arguments.image), output_root)?;
     let output_path = PathBuf::from(&arguments.image);
     let mut output = OpenOptions::new()
+        .read(true)
         .write(true)
         .create_new(true)
+        .custom_flags(0o400000)
         .open(&output_path)
         .map_err(|error| Failure::task(format!("could not create G3 ESP: {error}")))?;
-    let result = (|| {
-        output
-            .set_len(IMAGE_BYTES)
-            .map_err(|error| Failure::task(format!("could not size G3 ESP: {error}")))?;
-        write_boot_regions(&mut output, &geometry, used_clusters)?;
-        write_fats(&mut output, &geometry, &layouts)?;
-        write_directories(&mut output, &geometry, &layouts)?;
-        for layout in layouts {
-            write_file(&mut output, &geometry, layout)?;
-        }
-        output
-            .sync_all()
-            .map_err(|error| Failure::task(format!("could not sync G3 ESP: {error}")))?;
-        Ok(())
-    })();
+    let result = build_loaded(&mut output, geometry, used_clusters, layouts);
+    let report =
+        result.and_then(|()| inspect_loaded(&mut output, &inputs).map(|value| value.render()));
     drop(output);
-    if let Err(error) = result {
+    if let Err(error) = report {
         let _ = fs::remove_file(&output_path);
         return Err(error);
     }
-    inspect_created_or_remove(arguments, &output_path)
+    report
 }
 
+#[cfg(test)]
 fn inspect_created_or_remove(
     arguments: &G3ImageArguments,
     output_path: &Path,
@@ -169,8 +189,80 @@ fn inspect_created_or_remove(
 
 pub(crate) fn inspect(arguments: &G3ImageArguments) -> Result<String, Failure> {
     let inputs = Inputs::load(arguments)?;
-    let mut image = File::open(&arguments.image)
+    let mut image = OpenOptions::new()
+        .read(true)
+        .custom_flags(0o400000)
+        .open(&arguments.image)
         .map_err(|error| Failure::task(format!("could not open G3 ESP: {error}")))?;
+    inspect_loaded(&mut image, &inputs).map(|value| value.render())
+}
+
+pub(crate) fn build_open(
+    image: &mut File,
+    loader: &[u8],
+    kernel: &[u8],
+    bootstrap: &[u8],
+    bootfs: &[u8],
+) -> Result<Inspection, Failure> {
+    let inputs = Inputs {
+        loader: loader.to_vec(),
+        kernel: kernel.to_vec(),
+        bootstrap: bootstrap.to_vec(),
+        bootfs: bootfs.to_vec(),
+    };
+    let geometry = Geometry::fixed();
+    let used_clusters = 4_u32
+        .checked_add(inputs.total_clusters()?)
+        .ok_or_else(|| Failure::task("G3 image allocation overflowed"))?;
+    if used_clusters > geometry.cluster_count {
+        return Err(Failure::task("G3 artifacts do not fit the fixed FAT32 ESP"));
+    }
+    let layouts = layouts(&inputs)?;
+    build_loaded(image, geometry, used_clusters, layouts)?;
+    inspect_loaded(image, &inputs)
+}
+
+pub(crate) fn inspect_open(
+    image: &mut File,
+    loader: &[u8],
+    kernel: &[u8],
+    bootstrap: &[u8],
+    bootfs: &[u8],
+) -> Result<Inspection, Failure> {
+    let inputs = Inputs {
+        loader: loader.to_vec(),
+        kernel: kernel.to_vec(),
+        bootstrap: bootstrap.to_vec(),
+        bootfs: bootfs.to_vec(),
+    };
+    inspect_loaded(image, &inputs)
+}
+
+fn build_loaded(
+    output: &mut File,
+    geometry: Geometry,
+    used_clusters: u32,
+    layouts: [FileLayout<'_>; 4],
+) -> Result<(), Failure> {
+    output
+        .set_len(IMAGE_BYTES)
+        .map_err(|error| Failure::task(format!("could not size G3 ESP: {error}")))?;
+    write_boot_regions(output, &geometry, used_clusters)?;
+    write_fats(output, &geometry, &layouts)?;
+    write_directories(output, &geometry, &layouts)?;
+    for layout in layouts {
+        write_file(output, &geometry, layout)?;
+    }
+    output
+        .sync_all()
+        .map_err(|error| Failure::task(format!("could not sync G3 ESP: {error}")))?;
+    Ok(())
+}
+
+fn inspect_loaded(image: &mut File, inputs: &Inputs) -> Result<Inspection, Failure> {
+    image
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| Failure::task(format!("could not rewind G3 ESP: {error}")))?;
     let metadata = image
         .metadata()
         .map_err(|error| Failure::task(format!("could not stat G3 ESP: {error}")))?;
@@ -179,21 +271,22 @@ pub(crate) fn inspect(arguments: &G3ImageArguments) -> Result<String, Failure> {
             "G3 ESP has the wrong type or fixed byte length",
         ));
     }
-    let geometry = inspect_boot_regions(&mut image)?;
-    inspect_fat_copies(&mut image, &geometry)?;
-    let root = read_cluster(&mut image, &geometry, ROOT_CLUSTER)?;
+    let identity = stable_identity(&metadata);
+    let geometry = inspect_boot_regions(image)?;
+    inspect_fat_copies(image, &geometry)?;
+    let root = read_cluster(image, &geometry, ROOT_CLUSTER)?;
     let efi = directory_cluster(&root, *b"EFI        ")?;
     if efi != EFI_CLUSTER {
         return Err(Failure::task("G3 ESP EFI directory cluster drifted"));
     }
-    let efi_directory = read_cluster(&mut image, &geometry, efi)?;
+    let efi_directory = read_cluster(image, &geometry, efi)?;
     let boot = directory_cluster(&efi_directory, *b"BOOT       ")?;
     let wyrmroot = directory_cluster(&efi_directory, *b"WYRMROOT   ")?;
     if boot != BOOT_CLUSTER || wyrmroot != WYRMROOT_CLUSTER {
         return Err(Failure::task("G3 ESP canonical directory layout drifted"));
     }
-    let boot_directory = read_cluster(&mut image, &geometry, boot)?;
-    let wyrmroot_directory = read_cluster(&mut image, &geometry, wyrmroot)?;
+    let boot_directory = read_cluster(image, &geometry, boot)?;
+    let wyrmroot_directory = read_cluster(image, &geometry, wyrmroot)?;
     let expected_lfn = lfn_entry("bootstrap.elf", &BOOTSTRAP_SHORT)?;
     if wyrmroot_directory[3 * 32..4 * 32] != expected_lfn {
         return Err(Failure::task(
@@ -201,10 +294,10 @@ pub(crate) fn inspect(arguments: &G3ImageArguments) -> Result<String, Failure> {
         ));
     }
     let extracted = [
-        extract_file(&mut image, &geometry, &boot_directory, LOADER_SHORT)?,
-        extract_file(&mut image, &geometry, &wyrmroot_directory, KERNEL_SHORT)?,
-        extract_file(&mut image, &geometry, &wyrmroot_directory, BOOTSTRAP_SHORT)?,
-        extract_file(&mut image, &geometry, &wyrmroot_directory, BOOTFS_SHORT)?,
+        extract_file(image, &geometry, &boot_directory, LOADER_SHORT)?,
+        extract_file(image, &geometry, &wyrmroot_directory, KERNEL_SHORT)?,
+        extract_file(image, &geometry, &wyrmroot_directory, BOOTSTRAP_SHORT)?,
+        extract_file(image, &geometry, &wyrmroot_directory, BOOTFS_SHORT)?,
     ];
     let expected = [
         inputs.loader.as_slice(),
@@ -219,22 +312,20 @@ pub(crate) fn inspect(arguments: &G3ImageArguments) -> Result<String, Failure> {
             ));
         }
     }
-    let image_hash = sha256::file_digest(Path::new(&arguments.image))
-        .map_err(|error| Failure::task(format!("could not hash G3 ESP: {error}")))?;
-    Ok(format!(
-        concat!(
-            "{{\"schema_version\":1,\"phase\":\"WYR0-G3\",",
-            "\"image_bytes\":{},\"image_sha256\":\"{}\",",
-            "\"loader_sha256\":\"{}\",\"kernel_sha256\":\"{}\",",
-            "\"bootstrap_sha256\":\"{}\",\"bootfs_sha256\":\"{}\"}}\n"
-        ),
-        IMAGE_BYTES,
-        image_hash,
-        sha256::bytes_digest(&inputs.loader),
-        sha256::bytes_digest(&inputs.kernel),
-        sha256::bytes_digest(&inputs.bootstrap),
-        sha256::bytes_digest(&inputs.bootfs),
-    ))
+    let image_sha256 = crate::secure_fs::hash_open_file_exact(image, IMAGE_BYTES, "G3 ESP")?;
+    let after = image
+        .metadata()
+        .map_err(|error| Failure::task(format!("could not recheck G3 ESP: {error}")))?;
+    if identity != stable_identity(&after) {
+        return Err(Failure::task("G3 ESP changed during inspection"));
+    }
+    Ok(Inspection {
+        image_sha256,
+        loader_sha256: sha256::bytes_digest(&inputs.loader),
+        kernel_sha256: sha256::bytes_digest(&inputs.kernel),
+        bootstrap_sha256: sha256::bytes_digest(&inputs.bootstrap),
+        bootfs_sha256: sha256::bytes_digest(&inputs.bootfs),
+    })
 }
 
 fn layouts(inputs: &Inputs) -> Result<[FileLayout<'_>; 4], Failure> {
@@ -274,15 +365,46 @@ fn allocate_layout<'a>(
 
 fn read_artifact(path: &str, label: &str) -> Result<Vec<u8>, Failure> {
     let path = Path::new(path);
-    let metadata = fs::symlink_metadata(path)
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(0o400000)
+        .open(path)
+        .map_err(|error| Failure::task(format!("could not open {label} artifact: {error}")))?;
+    let before = file
+        .metadata()
         .map_err(|error| Failure::task(format!("could not stat {label} artifact: {error}")))?;
-    if !metadata.file_type().is_file() || metadata.len() == 0 {
+    if !before.is_file() || before.nlink() != 1 || before.len() == 0 || before.len() > IMAGE_BYTES {
         return Err(Failure::task(format!(
-            "{label} artifact must be a nonempty regular file"
+            "{label} artifact must be a bounded single-link regular file"
         )));
     }
-    fs::read(path)
-        .map_err(|error| Failure::task(format!("could not read {label} artifact: {error}")))
+    let mut bytes = Vec::with_capacity(before.len() as usize);
+    Read::by_ref(&mut file)
+        .take(IMAGE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| Failure::task(format!("could not read {label} artifact: {error}")))?;
+    let after = file
+        .metadata()
+        .map_err(|error| Failure::task(format!("could not recheck {label} artifact: {error}")))?;
+    if stable_identity(&before) != stable_identity(&after) || bytes.len() as u64 != before.len() {
+        return Err(Failure::task(format!(
+            "{label} artifact changed while reading"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn stable_identity(metadata: &fs::Metadata) -> (u64, u64, u64, u64, i64, i64, i64, i64) {
+    (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.nlink(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    )
 }
 
 fn validate_output_path(

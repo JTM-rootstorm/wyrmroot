@@ -1,32 +1,29 @@
 //! Selector-free WYR1-C2 product binding.
 //!
-//! C2 deliberately has no guest selector, run, or evidence command.  It
-//! freezes C1's exact native product and adds a reviewed host policy source,
-//! its canonical WRDM v1 compilation, and a bounded observation policy.  An
-//! ESP cannot be manufactured honestly until the separate selector/guest tuple
-//! is admitted. Its `image` action constructs only the selector-free,
-//! hash-bound production ESP; it never reuses selector 25 or 27.
+//! All frozen-product access is rooted in retained directory descriptors. C2
+//! receipts are witnesses to a validated byte snapshot, never its authority.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
-    ffi::OsStr,
-    fs::{self, OpenOptions},
-    io::{Read, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
-    path::{Path, PathBuf},
+    ffi::{OsStr, OsString},
+    fs::{self, File, Permissions},
+    io::Read,
+    os::unix::fs::{MetadataExt, PermissionsExt},
+    path::{Component, Path, PathBuf},
     process::{Command, Stdio},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::{error::Failure, sha256, wyr1c};
-use wyrmroot_bootfs::archive::Archive;
+use crate::{error::Failure, secure_fs::Directory, sha256, wyr1c};
 use wyrmroot_device_proto::manifest::{
     ContentIdentity, HEADER_BYTES, RECORD_BYTES, encode_com2_manifest,
 };
-use wyrmroot_rrc_manifest::{Manifest as RrcManifest, RoleId, StartupProfile};
 
 const REQUEST_KIND: &str = "wyrmroot-wyr1-c2-unselected-request";
-const RECEIPT_KIND: &str = "wyrmroot-wyr1-c2-unselected-receipt";
+const BASE_RECEIPT_KIND: &str = "wyrmroot-wyr1-c2-unselected-base-receipt";
+const IMAGE_RECEIPT_KIND: &str = "wyrmroot-wyr1-c2-unselected-image-receipt";
+const PROVENANCE_KIND: &str = "wyrmroot-wyr1-c2-production-provenance";
 const SOURCE_NAME: &str = "q35-com2-role.toml";
 const WRDM_NAME: &str = "wrdm-c2-v1.bin";
 const CONFIG_NAME: &str = "inspection-policy.toml";
@@ -35,10 +32,13 @@ const RECEIPT_NAME: &str = "c2-receipt.toml";
 const IMAGE_RECEIPT_NAME: &str = "c2-image-receipt.toml";
 const NATIVE_TARGET: &str = "x86_64-unknown-wyrmroot";
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
-const O_NOFOLLOW: i32 = 0o400000;
-const MAX_BYTES: usize = 64 * 1024 * 1024;
+const MAX_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_REPORT_BYTES: u64 = 64 * 1024;
 const GENERATED_ABI_REVISION: &str = "cfc69bd8a49819ce1cda1a132cf56e55c93f92e4";
 const ACCEPTED_ABI_TREE: &str = "1c6a74f130e386eee95b3780c75950beefd0037d";
+const LOADER_COMMAND: &str = "deterministic-release-uefi";
+const KERNEL_COMMAND: &str = "tools/pinned-cargo target build --locked --offline --release --target x86_64-unknown-none --package deepwyrm-kernel --bin deepwyrm-kernel";
+const BOOTSTRAP_COMMAND: &str = "accepted-cargo native bootstrap";
 const SOURCE: &[u8] = include_bytes!("../../../products/wyr1c/q35-com2-role.toml");
 const OBSERVATION: &str = concat!(
     "schema = 1\n",
@@ -48,22 +48,38 @@ const OBSERVATION: &str = concat!(
     "forbidden = \"DeviceBound,DriverLaunched,HardwareAccepted\"\n",
 );
 
+struct Snapshot {
+    request: Vec<u8>,
+    request_values: BTreeMap<String, String>,
+    c1: wyr1c::FrozenSnapshot,
+    loader: Vec<u8>,
+    kernel: Vec<u8>,
+    bootstrap: Vec<u8>,
+    loader_inspection: Vec<u8>,
+    provenance: Vec<u8>,
+    source: Vec<u8>,
+    wrdm: Vec<u8>,
+    observation: Vec<u8>,
+}
+
 pub(crate) fn freeze(output: &Path) -> Result<String, Failure> {
     reject_ambient()?;
-    reject_nonempty(output)?;
-    validate_freeze_output(output)?;
-    // C1 already enforces the accepted a92dc7f toolchain, clean Wyrmroot
-    // revision, isolated offline native builds, and fresh output.  C2 wraps
-    // that exact product rather than duplicating those assumptions.
-    wyr1c::product(output)?;
-    let repository = crate::tasks::repository_root()?;
-    let project = repository
-        .parent()
-        .ok_or_else(|| Failure::task("WYR1-C2 source has no project root"))?;
-    let deep = project.join("deepwyrm");
+    let (repository, project, deep, base) = project_context()?;
     let wyrm_revision = clean_revision(&repository, "Wyrmroot")?;
     let deep_revision = clean_revision(&deep, "Deepwyrm")?;
     validate_abi_tree(&deep, &deep_revision)?;
+    let output_name = direct_output_name(output, base.path())?;
+    if base.exists(&output_name, "C2 output")? {
+        return Err(Failure::task("C2 output must be a fresh nonexistent path"));
+    }
+    let root = base.create_child(&output_name, 0o700, "C2 output")?;
+    let c1 = wyr1c::build_into(&root)?;
+    if c1.validated.wyrmroot_revision != wyrm_revision {
+        return Err(Failure::task(
+            "C2 C1 product revision changed during freeze",
+        ));
+    }
+
     let manifest = crate::metadata::BuildManifest::load(&repository)?;
     let profile = manifest.validate_loader_build_readiness(&repository)?;
     let layout = crate::deep_layout::prepare(
@@ -73,9 +89,11 @@ pub(crate) fn freeze(output: &Path) -> Result<String, Failure> {
     )?;
     let toolchain = crate::tasks::prepare_loader_toolchain(&repository, &profile, &manifest)?;
     let cargo_home = crate::tasks::project_cargo_home(&repository, &manifest)?;
-    let build = output.join("build-c2");
-    fs::create_dir(&build)
-        .map_err(|e| Failure::task(format!("could not create C2 build root: {e}")))?;
+    let project_dir = Directory::open_exact(&project, "OS-Project root")?;
+    let tmp = open_or_create_tmp(&project_dir)?;
+    let scratch_name = unique_scratch_name()?;
+    let scratch = tmp.create_child(&scratch_name, 0o700, "WYR1-C2 build scratch")?;
+    let build = scratch.anchor_path();
     let uefi = crate::tasks::build_deterministic_uefi_pair(
         &repository,
         &toolchain,
@@ -88,236 +106,641 @@ pub(crate) fn freeze(output: &Path) -> Result<String, Failure> {
             cargo_profile: crate::tasks::UefiCargoProfile::Release,
         },
     )?;
-    let loader = read_regular_bounded(&uefi.loader, "loader")?;
+    let loader = read_bounded_path(&uefi.loader, "loader", MAX_BYTES)?;
     let bootstrap = build_bootstrap(&repository, &cargo_home, toolchain.accepted(), &build)?;
-    let kernel = build_kernel(&deep, &output.join("deepwyrm-target"))?;
-    let artifacts = output.join("artifacts");
-    write_new(&artifacts.join("loader.efi"), &loader)?;
-    write_new(&artifacts.join("bootstrap.elf"), &bootstrap)?;
-    write_new(&artifacts.join("deepwyrm.elf"), &kernel)?;
-    write_new(
-        &output.join("inspections/loader-c2.json"),
-        uefi.inspection_report.as_bytes(),
+    let kernel = build_kernel(&deep, &build.join("deepwyrm-target"))?;
+    let loader_inspection = uefi.inspection_report.into_bytes();
+    if loader_inspection.is_empty() || loader_inspection.len() as u64 > MAX_REPORT_BYTES {
+        return Err(Failure::task("C2 loader inspection exceeds its bound"));
+    }
+
+    let artifacts = root.open_child("artifacts", "C2 artifacts")?;
+    let inspections = root.open_child("inspections", "C2 inspections")?;
+    let product = root.open_child("product", "C2 product")?;
+    artifacts.write_new("loader.efi", &loader, 0o400, "C2 loader")?;
+    artifacts.write_new("bootstrap.elf", &bootstrap, 0o400, "C2 bootstrap")?;
+    artifacts.write_new("deepwyrm.elf", &kernel, 0o400, "C2 kernel")?;
+    inspections.write_new(
+        "loader-c2.json",
+        &loader_inspection,
+        0o400,
+        "C2 loader inspection",
     )?;
-    fs::remove_dir_all(&build)
-        .map_err(|e| Failure::task(format!("could not retire C2 build root: {e}")))?;
-    fs::remove_dir_all(output.join("deepwyrm-target"))
-        .map_err(|e| Failure::task(format!("could not retire C2 kernel target: {e}")))?;
-    write_new(&artifacts.join("provenance.toml"), format!("kind = \"wyrmroot-wyr1-c2-production-provenance\"\nwyrmroot_revision = \"{wyrm_revision}\"\ndeepwyrm_revision = \"{deep_revision}\"\nloader_command = \"deterministic-release-uefi\"\nkernel_command = \"tools/pinned-cargo target build --locked --offline --release --target x86_64-unknown-none --package deepwyrm-kernel --bin deepwyrm-kernel\"\nbootstrap_command = \"accepted-cargo native bootstrap\"\n").as_bytes())?;
-    let product = output.join("product");
-    let source = product.join(SOURCE_NAME);
-    let config = product.join(CONFIG_NAME);
-    write_new(&source, SOURCE)?;
-    write_new(&config, OBSERVATION.as_bytes())?;
-    let uart_hex_value = digest_file(&output.join("artifacts/uart16550d.elf"))?;
-    let uart = hex_to_digest(&uart_hex_value)?;
-    let compiled = compile_source(SOURCE, uart)?;
-    let wrdm = product.join(WRDM_NAME);
-    write_new(&wrdm, &compiled)?;
-    let c1_wrdm = read_regular(&product.join("wrdm-c1-v1.bin"))?;
-    if c1_wrdm != compiled {
+    let provenance = render_provenance(&wyrm_revision, &deep_revision);
+    artifacts.write_new(
+        "provenance.toml",
+        provenance.as_bytes(),
+        0o400,
+        "C2 provenance",
+    )?;
+    let uart_digest = sha256::bytes_digest(
+        c1.snapshot
+            .artifacts
+            .get("uart16550d")
+            .ok_or_else(|| Failure::task("C2 C1 snapshot lacks uart16550d"))?,
+    );
+    let compiled = compile_source(SOURCE, decode_digest(&uart_digest)?)?;
+    if compiled != c1.snapshot.device_manifest {
         return Err(Failure::task(
-            "C2 compiler output disagrees with the frozen C1 WRDM",
+            "C2 compiler output disagrees with frozen C1 WRDM",
         ));
     }
-    let values = [
-        ("source", digest_file(&source)?),
-        ("wrdm", digest_file(&wrdm)?),
-        ("observation", digest_file(&config)?),
-        ("devmgr", digest_file(&output.join("artifacts/devmgr.elf"))?),
-        ("uart16550d_retained_actor", uart_hex_value),
-        ("rrc_manifest", digest_file(&product.join("rrc-c1-v1.bin"))?),
-        ("bootfs", digest_file(&product.join("bootfs.img"))?),
-        (
-            "c1_receipt",
-            digest_file(&product.join("build-receipt.toml"))?,
-        ),
-        ("loader", digest_file(&artifacts.join("loader.efi"))?),
-        ("kernel", digest_file(&artifacts.join("deepwyrm.elf"))?),
-        ("bootstrap", digest_file(&artifacts.join("bootstrap.elf"))?),
-        (
-            "provenance",
-            digest_file(&artifacts.join("provenance.toml"))?,
-        ),
-        ("wyrmroot_revision", wyrm_revision),
-        ("deepwyrm_revision", deep_revision),
-        ("generated_abi_revision", GENERATED_ABI_REVISION.to_owned()),
-        ("generated_abi_tree", ACCEPTED_ABI_TREE.to_owned()),
-        ("output", ".".to_owned()),
-    ];
-    let request = render(REQUEST_KIND, &values);
-    let request_path = output.join(REQUEST_NAME);
-    write_new(&request_path, request.as_bytes())?;
-    let mut receipt_values = vec![("request", digest_file(&request_path)?)];
-    receipt_values.extend(values.iter().map(|(key, value)| (*key, value.clone())));
-    let receipt = render(RECEIPT_KIND, &receipt_values);
-    write_new(&output.join(RECEIPT_NAME), receipt.as_bytes())?;
-    clean_revision(&repository, "Wyrmroot")?;
-    clean_revision(&deep, "Deepwyrm")?;
+    product.write_new(SOURCE_NAME, SOURCE, 0o400, "C2 reviewed source")?;
+    product.write_new(WRDM_NAME, &compiled, 0o400, "C2 WRDM")?;
+    product.write_new(
+        CONFIG_NAME,
+        OBSERVATION.as_bytes(),
+        0o400,
+        "C2 observation policy",
+    )?;
+
+    let fields = request_fields(RequestMaterials {
+        c1: &c1.snapshot,
+        loader: &loader,
+        kernel: &kernel,
+        bootstrap: &bootstrap,
+        loader_inspection: &loader_inspection,
+        provenance: provenance.as_bytes(),
+        wyrm_revision: &wyrm_revision,
+        deep_revision: &deep_revision,
+    });
+    let request = render(REQUEST_KIND, &fields);
+    root.write_new(REQUEST_NAME, request.as_bytes(), 0o400, "C2 request")?;
+    let base_receipt = render_base_receipt(request.as_bytes(), &fields);
+    root.write_new(
+        RECEIPT_NAME,
+        base_receipt.as_bytes(),
+        0o400,
+        "C2 base receipt",
+    )?;
+
+    validate_root(&repository, &deep, &root)?;
+    verify_clean_revision(&repository, "Wyrmroot", &wyrm_revision)?;
+    verify_clean_revision(&deep, "Deepwyrm", &deep_revision)?;
     toolchain.accepted().verify_unchanged()?;
-    inspect(&request_path)?;
     Ok(format!(
         "WYR1_C2_FREEZE_PASS selector=none evidence=not-produced request={}\n",
-        request_path.display()
+        output.join(REQUEST_NAME).display()
     ))
 }
 
 pub(crate) fn image(request: &Path) -> Result<String, Failure> {
-    inspect(request)?;
-    let root = checked_root(request)?;
-    let product = root.join("product");
-    let image = product.join("esp.img");
-    if fs::symlink_metadata(&image).is_ok() {
-        return Err(Failure::task("C2 ESP output must be fresh"));
+    let (repository, _, deep, root) = open_request_root(request)?;
+    let initial = validate_root(&repository, &deep, &root)?;
+    let initial_request = initial.request.clone();
+    let product = root.open_child("product", "C2 product")?;
+    if product.exists("esp.img", "C2 ESP")?
+        || root.exists(IMAGE_RECEIPT_NAME, "C2 image receipt")?
+    {
+        return Err(Failure::task("C2 ESP and image receipt must both be fresh"));
     }
-    let args = crate::cli::G3ImageArguments {
-        image: image.display().to_string(),
-        loader: root.join("artifacts/loader.efi").display().to_string(),
-        kernel: root.join("artifacts/deepwyrm.elf").display().to_string(),
-        bootstrap: root.join("artifacts/bootstrap.elf").display().to_string(),
-        bootfs: product.join("bootfs.img").display().to_string(),
-    };
-    crate::g3_image::build_in_root(&args, Some(&root))?;
-    crate::g3_image::inspect(&args)?;
-    let request_bytes = read_regular(request)?;
-    let request_values = parse_request(&request_bytes)?;
-    let mut image_values = vec![
-        ("request", sha256::bytes_digest(&request_bytes)),
-        ("esp", digest_file(&image)?),
-    ];
-    image_values.extend(
-        request_values
-            .iter()
-            .filter(|(key, _)| !matches!(key.as_str(), "kind" | "schema" | "selector" | "evidence"))
-            .map(|(key, value)| (key.as_str(), value.clone())),
-    );
-    let receipt = render(RECEIPT_KIND, &image_values);
-    write_new(&root.join(IMAGE_RECEIPT_NAME), receipt.as_bytes())?;
+    let mut image = product.create_file("esp.img", 0o600, "C2 ESP")?;
+    let report = crate::g3_image::build_open(
+        &mut image,
+        &initial.loader,
+        &initial.kernel,
+        &initial.bootstrap,
+        &initial.c1.bootfs,
+    )?;
+    image
+        .set_permissions(Permissions::from_mode(0o400))
+        .map_err(|error| Failure::task(format!("could not seal C2 ESP: {error}")))?;
+    product.verify_file("esp.img", &image, "C2 ESP")?;
+    let fields = canonical_request_fields(&initial)?;
+    let receipt = render_image_receipt(&initial.request, &fields, &report);
+    root.write_new(
+        IMAGE_RECEIPT_NAME,
+        receipt.as_bytes(),
+        0o400,
+        "C2 image receipt",
+    )?;
+    let final_snapshot = validate_root(&repository, &deep, &root)?;
+    if final_snapshot.request != initial_request {
+        return Err(Failure::task(
+            "C2 request changed while constructing the ESP",
+        ));
+    }
     Ok(format!(
         "WYR1_C2_IMAGE_PASS selector=none evidence=not-produced esp={}\n",
-        image.display()
+        root.path().join("product/esp.img").display()
     ))
 }
 
 pub(crate) fn inspect(request: &Path) -> Result<String, Failure> {
-    let request_bytes = read_regular(request)?;
-    let root = checked_root(request)?;
-    let map = parse_request(&request_bytes)?;
-    if map.get("kind") != Some(&REQUEST_KIND.to_owned())
-        || map.get("selector") != Some(&"none".to_owned())
-        || map.contains_key("test_id")
-    {
-        return Err(Failure::task(
-            "C2 request is not an explicitly unselected product",
-        ));
-    }
-    let product = root.join("product");
-    let expected = [
-        ("source", product.join(SOURCE_NAME)),
-        ("wrdm", product.join(WRDM_NAME)),
-        ("observation", product.join(CONFIG_NAME)),
-        ("devmgr", root.join("artifacts/devmgr.elf")),
-        (
-            "uart16550d_retained_actor",
-            root.join("artifacts/uart16550d.elf"),
-        ),
-        ("rrc_manifest", product.join("rrc-c1-v1.bin")),
-        ("bootfs", product.join("bootfs.img")),
-        ("c1_receipt", product.join("build-receipt.toml")),
-        ("loader", root.join("artifacts/loader.efi")),
-        ("kernel", root.join("artifacts/deepwyrm.elf")),
-        ("bootstrap", root.join("artifacts/bootstrap.elf")),
-        ("provenance", root.join("artifacts/provenance.toml")),
-    ];
-    for (key, path) in expected {
-        let actual = digest_file(&path)?;
-        if map.get(key) != Some(&actual) {
-            return Err(Failure::task(format!("C2 request hash mismatch for {key}")));
-        }
-    }
-    let source = read_regular(&product.join(SOURCE_NAME))?;
-    let uart = hex_to_digest(
-        map.get("uart16550d_retained_actor")
-            .ok_or_else(|| Failure::task("missing C2 UART digest"))?,
-    )?;
-    if compile_source(&source, uart)? != read_regular(&product.join(WRDM_NAME))? {
-        return Err(Failure::task("C2 WRDM does not match reviewed source"));
-    }
-    validate_c1_tuple(&root, &map, uart)?;
-    if read_regular(&product.join(CONFIG_NAME))? != OBSERVATION.as_bytes() {
-        return Err(Failure::task("C2 observation policy drifted"));
-    }
-    let keys = map.keys().cloned().collect::<BTreeSet<_>>();
-    let expected_keys = [
-        "kind",
-        "schema",
-        "selector",
-        "evidence",
-        "source",
-        "wrdm",
-        "observation",
-        "devmgr",
-        "uart16550d_retained_actor",
-        "rrc_manifest",
-        "bootfs",
-        "c1_receipt",
-        "loader",
-        "kernel",
-        "bootstrap",
-        "provenance",
-        "wyrmroot_revision",
-        "deepwyrm_revision",
-        "generated_abi_revision",
-        "generated_abi_tree",
-        "output",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect();
-    if keys != expected_keys
-        || map.get("schema") != Some(&"1".to_owned())
-        || map.get("output") != Some(&".".to_owned())
-    {
-        return Err(Failure::task(
-            "C2 request key set or fixed path policy drifted",
-        ));
-    }
-    let receipt = parse_request(&read_regular(&root.join(RECEIPT_NAME))?)?;
-    if receipt.get("kind") != Some(&RECEIPT_KIND.to_owned())
-        || receipt.get("selector") != Some(&"none".to_owned())
-        || receipt.get("evidence") != Some(&"not-produced".to_owned())
-        || receipt.get("request") != Some(&sha256::bytes_digest(&request_bytes))
-        || !receipt_matches_request(&receipt, &map)
-    {
-        return Err(Failure::task(
-            "C2 receipt is not bound to unselected request",
-        ));
-    }
-    let image_receipt = root.join(IMAGE_RECEIPT_NAME);
-    if image_receipt.exists() {
-        let values = parse_request(&read_regular(&image_receipt)?)?;
-        let esp = product.join("esp.img");
-        if values.get("request") != Some(&sha256::bytes_digest(&request_bytes))
-            || values.get("esp") != Some(&digest_file(&esp)?)
-            || !receipt_matches_request(&values, &map)
-        {
-            return Err(Failure::task(
-                "C2 image receipt is not bound to current ESP",
-            ));
-        }
-        let args = crate::cli::G3ImageArguments {
-            image: esp.display().to_string(),
-            loader: root.join("artifacts/loader.efi").display().to_string(),
-            kernel: root.join("artifacts/deepwyrm.elf").display().to_string(),
-            bootstrap: root.join("artifacts/bootstrap.elf").display().to_string(),
-            bootfs: product.join("bootfs.img").display().to_string(),
-        };
-        crate::g3_image::inspect(&args)?;
-    }
+    let (repository, _, deep, root) = open_request_root(request)?;
+    let snapshot = validate_root(&repository, &deep, &root)?;
     Ok(format!(
         "WYR1_C2_INSPECTION_PASS selector=none evidence=not-produced request_sha256={}\n",
-        sha256::bytes_digest(&request_bytes)
+        sha256::bytes_digest(&snapshot.request)
     ))
+}
+
+fn validate_root(repository: &Path, deep: &Path, root: &Directory) -> Result<Snapshot, Failure> {
+    let artifacts = root.open_child("artifacts", "C2 artifacts")?;
+    let inspections = root.open_child("inspections", "C2 inspections")?;
+    let product = root.open_child("product", "C2 product")?;
+    let snapshot = Snapshot {
+        request: root.read(REQUEST_NAME, MAX_REPORT_BYTES, "C2 request")?,
+        request_values: BTreeMap::new(),
+        c1: wyr1c::snapshot_from_directory(root)?,
+        loader: artifacts.read("loader.efi", MAX_BYTES, "C2 loader")?,
+        kernel: artifacts.read("deepwyrm.elf", MAX_BYTES, "C2 kernel")?,
+        bootstrap: artifacts.read("bootstrap.elf", MAX_BYTES, "C2 bootstrap")?,
+        loader_inspection: inspections.read(
+            "loader-c2.json",
+            MAX_REPORT_BYTES,
+            "C2 loader inspection",
+        )?,
+        provenance: artifacts.read("provenance.toml", MAX_REPORT_BYTES, "C2 provenance")?,
+        source: product.read(SOURCE_NAME, MAX_REPORT_BYTES, "C2 source")?,
+        wrdm: product.read(WRDM_NAME, MAX_REPORT_BYTES, "C2 WRDM")?,
+        observation: product.read(CONFIG_NAME, MAX_REPORT_BYTES, "C2 observation")?,
+    };
+    validate_snapshot(repository, deep, root, snapshot)
+}
+
+fn validate_snapshot(
+    repository: &Path,
+    deep: &Path,
+    root: &Directory,
+    mut snapshot: Snapshot,
+) -> Result<Snapshot, Failure> {
+    let c1 = wyr1c::validate_frozen_product(repository, &snapshot.c1)?;
+    if snapshot.source != SOURCE {
+        return Err(Failure::task(
+            "C2 source bytes differ from the reviewed source",
+        ));
+    }
+    if snapshot.observation != OBSERVATION.as_bytes() {
+        return Err(Failure::task("C2 observation policy drifted"));
+    }
+    let uart = snapshot
+        .c1
+        .artifacts
+        .get("uart16550d")
+        .ok_or_else(|| Failure::task("C2 C1 snapshot lacks uart16550d"))?;
+    if compile_source(
+        &snapshot.source,
+        decode_digest(&sha256::bytes_digest(uart))?,
+    )? != snapshot.wrdm
+        || snapshot.wrdm != snapshot.c1.device_manifest
+    {
+        return Err(Failure::task(
+            "C2 WRDM is not the reviewed semantic compilation",
+        ));
+    }
+    let provenance = parse_scalars(&snapshot.provenance, "C2 provenance")?;
+    let expected_provenance = [
+        ("kind", PROVENANCE_KIND),
+        ("schema", "1"),
+        ("wyrmroot_revision", c1.wyrmroot_revision.as_str()),
+        (
+            "deepwyrm_revision",
+            provenance
+                .get("deepwyrm_revision")
+                .map(String::as_str)
+                .unwrap_or(""),
+        ),
+        ("loader_command", LOADER_COMMAND),
+        ("kernel_command", KERNEL_COMMAND),
+        ("bootstrap_command", BOOTSTRAP_COMMAND),
+    ];
+    if provenance.len() != expected_provenance.len()
+        || expected_provenance
+            .iter()
+            .any(|(key, value)| provenance.get(*key).map(String::as_str) != Some(*value))
+    {
+        return Err(Failure::task("C2 provenance key set or values drifted"));
+    }
+    let deep_revision = provenance
+        .get("deepwyrm_revision")
+        .ok_or_else(|| Failure::task("C2 provenance lacks Deepwyrm revision"))?;
+    validate_revision(deep_revision, "Deepwyrm")?;
+    validate_abi_tree(deep, deep_revision)?;
+    let canonical_provenance = render_provenance(&c1.wyrmroot_revision, deep_revision);
+    if snapshot.provenance != canonical_provenance.as_bytes() {
+        return Err(Failure::task("C2 provenance is not canonical"));
+    }
+    let fields = request_fields(RequestMaterials {
+        c1: &snapshot.c1,
+        loader: &snapshot.loader,
+        kernel: &snapshot.kernel,
+        bootstrap: &snapshot.bootstrap,
+        loader_inspection: &snapshot.loader_inspection,
+        provenance: &snapshot.provenance,
+        wyrm_revision: &c1.wyrmroot_revision,
+        deep_revision,
+    });
+    let request_values = parse_scalars(&snapshot.request, "C2 request")?;
+    if snapshot.request != render(REQUEST_KIND, &fields).as_bytes() {
+        return Err(Failure::task(
+            "C2 request is not the exact canonical binding",
+        ));
+    }
+    snapshot.request_values = request_values;
+    let receipt = root.read(RECEIPT_NAME, MAX_REPORT_BYTES, "C2 base receipt")?;
+    if receipt != render_base_receipt(&snapshot.request, &fields).as_bytes() {
+        return Err(Failure::task(
+            "C2 base receipt is not the canonical request witness",
+        ));
+    }
+
+    let product = root.open_child("product", "C2 product")?;
+    let image_exists = product.exists("esp.img", "C2 ESP")?;
+    let receipt_exists = root.exists(IMAGE_RECEIPT_NAME, "C2 image receipt")?;
+    require_image_pair(image_exists, receipt_exists)?;
+    if image_exists {
+        let mut image =
+            product.open_exact_file("esp.img", crate::g3_image::IMAGE_BYTES, "C2 ESP")?;
+        let report = crate::g3_image::inspect_open(
+            &mut image,
+            &snapshot.loader,
+            &snapshot.kernel,
+            &snapshot.bootstrap,
+            &snapshot.c1.bootfs,
+        )?;
+        product.verify_file("esp.img", &image, "C2 ESP")?;
+        let image_receipt = root.read(IMAGE_RECEIPT_NAME, MAX_REPORT_BYTES, "C2 image receipt")?;
+        if image_receipt != render_image_receipt(&snapshot.request, &fields, &report).as_bytes() {
+            return Err(Failure::task(
+                "C2 image receipt is not the canonical ESP witness",
+            ));
+        }
+    }
+    Ok(snapshot)
+}
+
+fn require_image_pair(image: bool, receipt: bool) -> Result<(), Failure> {
+    if image != receipt {
+        Err(Failure::task(
+            "C2 ESP and image receipt presence is inconsistent",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+struct RequestMaterials<'a> {
+    c1: &'a wyr1c::FrozenSnapshot,
+    loader: &'a [u8],
+    kernel: &'a [u8],
+    bootstrap: &'a [u8],
+    loader_inspection: &'a [u8],
+    provenance: &'a [u8],
+    wyrm_revision: &'a str,
+    deep_revision: &'a str,
+}
+
+fn request_fields(materials: RequestMaterials<'_>) -> Vec<(&'static str, String)> {
+    let c1 = materials.c1;
+    let artifact =
+        |name: &str| sha256::bytes_digest(c1.artifacts.get(name).expect("validated C1 artifact"));
+    vec![
+        ("output", ".".to_owned()),
+        ("source_path", format!("product/{SOURCE_NAME}")),
+        ("source_sha256", sha256::bytes_digest(SOURCE)),
+        ("wrdm_path", format!("product/{WRDM_NAME}")),
+        ("wrdm_sha256", sha256::bytes_digest(&c1.device_manifest)),
+        ("observation_path", format!("product/{CONFIG_NAME}")),
+        (
+            "observation_sha256",
+            sha256::bytes_digest(OBSERVATION.as_bytes()),
+        ),
+        ("devmgr_path", "artifacts/devmgr.elf".to_owned()),
+        ("devmgr_sha256", artifact("devmgr")),
+        (
+            "uart16550d_retained_actor_path",
+            "artifacts/uart16550d.elf".to_owned(),
+        ),
+        ("uart16550d_retained_actor_sha256", artifact("uart16550d")),
+        ("rrc_manifest_path", "product/rrc-c1-v1.bin".to_owned()),
+        (
+            "rrc_manifest_sha256",
+            sha256::bytes_digest(&c1.rrc_manifest),
+        ),
+        ("bootfs_path", "product/bootfs.img".to_owned()),
+        ("bootfs_sha256", sha256::bytes_digest(&c1.bootfs)),
+        ("c1_receipt_path", "product/build-receipt.toml".to_owned()),
+        ("c1_receipt_sha256", sha256::bytes_digest(&c1.receipt)),
+        ("loader_path", "artifacts/loader.efi".to_owned()),
+        ("loader_sha256", sha256::bytes_digest(materials.loader)),
+        ("kernel_path", "artifacts/deepwyrm.elf".to_owned()),
+        ("kernel_sha256", sha256::bytes_digest(materials.kernel)),
+        ("bootstrap_path", "artifacts/bootstrap.elf".to_owned()),
+        (
+            "bootstrap_sha256",
+            sha256::bytes_digest(materials.bootstrap),
+        ),
+        (
+            "loader_inspection_path",
+            "inspections/loader-c2.json".to_owned(),
+        ),
+        (
+            "loader_inspection_sha256",
+            sha256::bytes_digest(materials.loader_inspection),
+        ),
+        ("provenance_path", "artifacts/provenance.toml".to_owned()),
+        (
+            "provenance_sha256",
+            sha256::bytes_digest(materials.provenance),
+        ),
+        ("wyrmroot_revision", materials.wyrm_revision.to_owned()),
+        ("deepwyrm_revision", materials.deep_revision.to_owned()),
+        ("generated_abi_revision", GENERATED_ABI_REVISION.to_owned()),
+        ("generated_abi_tree", ACCEPTED_ABI_TREE.to_owned()),
+        ("loader_command", LOADER_COMMAND.to_owned()),
+        ("kernel_command", KERNEL_COMMAND.to_owned()),
+        ("bootstrap_command", BOOTSTRAP_COMMAND.to_owned()),
+    ]
+}
+
+fn canonical_request_fields(snapshot: &Snapshot) -> Result<Vec<(&'static str, String)>, Failure> {
+    let wyrm = snapshot
+        .request_values
+        .get("wyrmroot_revision")
+        .ok_or_else(|| Failure::task("C2 request lacks Wyrmroot revision"))?;
+    let deep = snapshot
+        .request_values
+        .get("deepwyrm_revision")
+        .ok_or_else(|| Failure::task("C2 request lacks Deepwyrm revision"))?;
+    Ok(request_fields(RequestMaterials {
+        c1: &snapshot.c1,
+        loader: &snapshot.loader,
+        kernel: &snapshot.kernel,
+        bootstrap: &snapshot.bootstrap,
+        loader_inspection: &snapshot.loader_inspection,
+        provenance: &snapshot.provenance,
+        wyrm_revision: wyrm,
+        deep_revision: deep,
+    }))
+}
+
+fn render(kind: &str, fields: &[(&str, String)]) -> String {
+    let mut text = format!(
+        "kind = \"{kind}\"\nschema = 1\nselector = \"none\"\nevidence = \"not-produced\"\n"
+    );
+    for (key, value) in fields {
+        text.push_str(&format!("{key} = \"{value}\"\n"));
+    }
+    text
+}
+
+fn render_base_receipt(request: &[u8], fields: &[(&str, String)]) -> String {
+    let mut values = vec![("request_sha256", sha256::bytes_digest(request))];
+    values.extend(fields.iter().cloned());
+    render(BASE_RECEIPT_KIND, &values)
+}
+
+fn render_image_receipt(
+    request: &[u8],
+    fields: &[(&str, String)],
+    report: &crate::g3_image::Inspection,
+) -> String {
+    let mut values = vec![
+        ("request_sha256", sha256::bytes_digest(request)),
+        ("esp_path", "product/esp.img".to_owned()),
+        ("esp_sha256", report.image_sha256.clone()),
+        ("image_bytes", crate::g3_image::IMAGE_BYTES.to_string()),
+        (
+            "g3_report_sha256",
+            sha256::bytes_digest(report.render().as_bytes()),
+        ),
+        ("g3_loader_sha256", report.loader_sha256.clone()),
+        ("g3_kernel_sha256", report.kernel_sha256.clone()),
+        ("g3_bootstrap_sha256", report.bootstrap_sha256.clone()),
+        ("g3_bootfs_sha256", report.bootfs_sha256.clone()),
+    ];
+    values.extend(fields.iter().cloned());
+    render(IMAGE_RECEIPT_KIND, &values)
+}
+
+fn render_provenance(wyrm: &str, deep: &str) -> String {
+    format!(
+        "kind = \"{PROVENANCE_KIND}\"\nschema = 1\nwyrmroot_revision = \"{wyrm}\"\ndeepwyrm_revision = \"{deep}\"\nloader_command = \"{LOADER_COMMAND}\"\nkernel_command = \"{KERNEL_COMMAND}\"\nbootstrap_command = \"{BOOTSTRAP_COMMAND}\"\n"
+    )
+}
+
+fn parse_scalars(bytes: &[u8], label: &str) -> Result<BTreeMap<String, String>, Failure> {
+    let text =
+        std::str::from_utf8(bytes).map_err(|_| Failure::task(format!("{label} is not UTF-8")))?;
+    if !text.ends_with('\n') || text.contains('\r') {
+        return Err(Failure::task(format!("{label} line endings drifted")));
+    }
+    let mut values = BTreeMap::new();
+    for line in text.lines() {
+        let (key, raw) = line
+            .split_once(" = ")
+            .ok_or_else(|| Failure::task(format!("{label} has a malformed line")))?;
+        if key.is_empty()
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+            || values.contains_key(key)
+        {
+            return Err(Failure::task(format!(
+                "{label} has an invalid or duplicate key"
+            )));
+        }
+        let value = if raw == "1" && key == "schema" {
+            raw
+        } else if raw.starts_with('"') && raw.ends_with('"') && raw.len() >= 2 {
+            let value = &raw[1..raw.len() - 1];
+            if value.is_empty() || value.contains(['"', '\\']) {
+                return Err(Failure::task(format!("{label} has a malformed string")));
+            }
+            value
+        } else {
+            return Err(Failure::task(format!("{label} has a noncanonical scalar")));
+        };
+        values.insert(key.to_owned(), value.to_owned());
+    }
+    Ok(values)
+}
+
+fn project_context() -> Result<(PathBuf, PathBuf, PathBuf, Directory), Failure> {
+    let repository = crate::tasks::repository_root()?;
+    let project = repository
+        .ancestors()
+        .find(|path| path.ends_with("OS-Project"))
+        .ok_or_else(|| Failure::task("C2 source is not beneath OS-Project"))?
+        .to_path_buf();
+    let project = fs::canonicalize(project)
+        .map_err(|error| Failure::task(format!("could not resolve OS-Project: {error}")))?;
+    let deep = project.join("deepwyrm");
+    let _deep_directory = Directory::open_exact(&deep, "Deepwyrm source")?;
+    let base_path = project.join("artifacts/wyr1-c");
+    let base = Directory::open_exact(&base_path, "C2 output base")?;
+    Ok((repository, project, deep, base))
+}
+
+fn direct_output_name(output: &Path, base: &Path) -> Result<String, Failure> {
+    if !output.is_absolute()
+        || output
+            .components()
+            .any(|part| !matches!(part, Component::RootDir | Component::Normal(_)))
+        || output.parent() != Some(base)
+    {
+        return Err(Failure::task(
+            "C2 output must be one canonical direct child of artifacts/wyr1-c",
+        ));
+    }
+    output
+        .file_name()
+        .and_then(OsStr::to_str)
+        .map(str::to_owned)
+        .ok_or_else(|| Failure::task("C2 output name is not UTF-8"))
+}
+
+fn open_request_root(request: &Path) -> Result<(PathBuf, PathBuf, PathBuf, Directory), Failure> {
+    let (repository, project, deep, base) = project_context()?;
+    if !request.is_absolute()
+        || request.file_name() != Some(OsStr::new(REQUEST_NAME))
+        || request
+            .components()
+            .any(|part| !matches!(part, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(Failure::task("C2 request path is not canonical"));
+    }
+    let parent = request
+        .parent()
+        .ok_or_else(|| Failure::task("C2 request has no product root"))?;
+    let name = direct_output_name(parent, base.path())?;
+    let root = base.open_child(&name, "C2 product root")?;
+    Ok((repository, project, deep, root))
+}
+
+fn open_or_create_tmp(project: &Directory) -> Result<Directory, Failure> {
+    if project.exists(".tmp", "project temporary root")? {
+        project.open_child(".tmp", "project temporary root")
+    } else {
+        project.create_child(".tmp", 0o700, "project temporary root")
+    }
+}
+
+fn unique_scratch_name() -> Result<String, Failure> {
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Failure::task("system clock is before the Unix epoch"))?
+        .as_nanos();
+    Ok(format!("wyr1c2-build-{}-{time}", std::process::id()))
+}
+
+fn clean_revision(repository: &Path, label: &str) -> Result<String, Failure> {
+    let head = git_output(repository, &["rev-parse", "HEAD"], label)?;
+    let revision = std::str::from_utf8(&head)
+        .map(str::trim)
+        .map(str::to_owned)
+        .map_err(|_| Failure::task(format!("{label} revision is not UTF-8")))?;
+    verify_clean_revision(repository, label, &revision)?;
+    Ok(revision)
+}
+
+fn verify_clean_revision(repository: &Path, label: &str, expected: &str) -> Result<(), Failure> {
+    let head = git_output(repository, &["rev-parse", "HEAD"], label)?;
+    let status = git_output(
+        repository,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+        label,
+    )?;
+    if !status.is_empty() || std::str::from_utf8(&head).ok().map(str::trim) != Some(expected) {
+        return Err(Failure::task(format!(
+            "C2 requires the captured clean {label} revision"
+        )));
+    }
+    Ok(())
+}
+
+fn git_output(repository: &Path, args: &[&str], label: &str) -> Result<Vec<u8>, Failure> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(args)
+        .output()
+        .map_err(|error| Failure::task(format!("could not inspect {label}: {error}")))?;
+    if !output.status.success() {
+        return Err(Failure::task(format!(
+            "could not resolve declared {label} commit"
+        )));
+    }
+    Ok(output.stdout)
+}
+
+fn validate_revision(revision: &str, label: &str) -> Result<(), Failure> {
+    if revision.len() != 40
+        || !revision
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(Failure::task(format!(
+            "{label} revision is not a commit ID"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_abi_tree(deep: &Path, kernel_revision: &str) -> Result<(), Failure> {
+    validate_revision(kernel_revision, "Deepwyrm")?;
+    validate_revision(GENERATED_ABI_REVISION, "generated ABI")?;
+    let tree = |revision: &str| -> Result<String, Failure> {
+        let object = format!("{revision}:abi");
+        let bytes = git_output(deep, &["rev-parse", &object], "Deepwyrm ABI tree")?;
+        std::str::from_utf8(&bytes)
+            .map(str::trim)
+            .map(str::to_owned)
+            .map_err(|_| Failure::task("C2 ABI tree is not UTF-8"))
+    };
+    if tree(kernel_revision)? != ACCEPTED_ABI_TREE
+        || tree(GENERATED_ABI_REVISION)? != ACCEPTED_ABI_TREE
+    {
+        return Err(Failure::task(
+            "C2 kernel and generated ABI trees are incompatible",
+        ));
+    }
+    Ok(())
+}
+
+fn read_bounded_path(path: &Path, label: &str, maximum: u64) -> Result<Vec<u8>, Failure> {
+    let mut file = File::open(path)
+        .map_err(|error| Failure::task(format!("could not open C2 {label}: {error}")))?;
+    let before = file
+        .metadata()
+        .map_err(|error| Failure::task(format!("could not stat C2 {label}: {error}")))?;
+    if !before.is_file() || before.nlink() != 1 || before.len() == 0 || before.len() > maximum {
+        return Err(Failure::task(format!(
+            "C2 {label} is not a bounded single-link regular file"
+        )));
+    }
+    let mut bytes = Vec::with_capacity(before.len() as usize);
+    file.by_ref()
+        .take(maximum + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| Failure::task(format!("could not read C2 {label}: {error}")))?;
+    let after = file
+        .metadata()
+        .map_err(|error| Failure::task(format!("could not recheck C2 {label}: {error}")))?;
+    if stable_file_identity(&before) != stable_file_identity(&after)
+        || bytes.len() as u64 != before.len()
+    {
+        return Err(Failure::task(format!("C2 {label} changed while reading")));
+    }
+    Ok(bytes)
+}
+
+fn stable_file_identity(metadata: &fs::Metadata) -> (u64, u64, u64, u64, i64, i64, i64, i64) {
+    (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.nlink(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    )
+}
+
+fn decode_digest(value: &str) -> Result<[u8; 32], Failure> {
+    crate::wyr1::decode_digest(value)
 }
 
 fn compile_source(source: &[u8], uart: [u8; 32]) -> Result<Vec<u8>, Failure> {
@@ -355,6 +778,7 @@ struct DevicePolicy<'a> {
     driver: &'a str,
     metadata_policy: &'a str,
 }
+
 fn parse_policy(source: &[u8]) -> Result<DevicePolicy<'_>, Failure> {
     let text = std::str::from_utf8(source).map_err(|_| Failure::task("C2 policy is not UTF-8"))?;
     if !text.starts_with("# Reviewed host policy for the immutable WYR1-C q35 COM2 role.\n")
@@ -368,10 +792,12 @@ fn parse_policy(source: &[u8]) -> Result<DevicePolicy<'_>, Failure> {
         let (key, raw) = line
             .split_once(" = ")
             .ok_or_else(|| Failure::task("C2 policy line is malformed"))?;
-        if !key.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+        if !key
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
             || values.insert(key, raw).is_some()
         {
-            return Err(Failure::task("C2 policy has duplicate or invalid key"));
+            return Err(Failure::task("C2 policy has a duplicate or invalid key"));
         }
     }
     let keys = [
@@ -396,7 +822,7 @@ fn parse_policy(source: &[u8]) -> Result<DevicePolicy<'_>, Failure> {
     let string = |key| -> Result<&str, Failure> {
         let raw = values
             .get(key)
-            .ok_or_else(|| Failure::task("C2 policy missing string"))?;
+            .ok_or_else(|| Failure::task("C2 policy lacks a string"))?;
         if raw.starts_with('"')
             && raw.ends_with('"')
             && raw.len() > 2
@@ -410,7 +836,7 @@ fn parse_policy(source: &[u8]) -> Result<DevicePolicy<'_>, Failure> {
     let integer = |key| -> Result<u64, Failure> {
         values
             .get(key)
-            .ok_or_else(|| Failure::task("C2 policy missing integer"))?
+            .ok_or_else(|| Failure::task("C2 policy lacks an integer"))?
             .parse()
             .map_err(|_| Failure::task("C2 policy integer is malformed"))
     };
@@ -428,453 +854,6 @@ fn parse_policy(source: &[u8]) -> Result<DevicePolicy<'_>, Failure> {
     })
 }
 
-fn parse_request(bytes: &[u8]) -> Result<BTreeMap<String, String>, Failure> {
-    let text = std::str::from_utf8(bytes).map_err(|_| Failure::task("C2 TOML is not UTF-8"))?;
-    if !text.ends_with('\n') || text.contains('\r') {
-        return Err(Failure::task(
-            "C2 TOML does not have canonical line endings",
-        ));
-    }
-    let mut map = BTreeMap::new();
-    for line in text.lines() {
-        let (key, value) = line
-            .split_once(" = ")
-            .ok_or_else(|| Failure::task("C2 TOML has malformed line"))?;
-        if key == "schema" && value == "1" {
-            if map.insert(key.to_owned(), value.to_owned()).is_some() {
-                return Err(Failure::task("C2 TOML has duplicate schema"));
-            }
-            continue;
-        }
-        if !value.starts_with('"') || !value.ends_with('"') || value.len() < 2 {
-            return Err(Failure::task("C2 TOML value is not a quoted scalar"));
-        }
-        let value = &value[1..value.len() - 1];
-        if value.contains('"') || value.contains('\\') || value.is_empty() {
-            return Err(Failure::task("C2 TOML scalar is malformed"));
-        }
-        if key.is_empty()
-            || !key
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
-            || map.insert(key.to_owned(), value.to_owned()).is_some()
-        {
-            return Err(Failure::task("C2 TOML has duplicate or invalid key"));
-        }
-    }
-    Ok(map)
-}
-
-fn render(kind: &str, values: &[(&str, String)]) -> String {
-    let mut text = format!(
-        "kind = \"{kind}\"\nschema = 1\nselector = \"none\"\nevidence = \"not-produced\"\n"
-    );
-    for (key, value) in values {
-        text.push_str(&format!("{key} = \"{value}\"\n"));
-    }
-    text
-}
-fn reject_nonempty(path: &Path) -> Result<(), Failure> {
-    if path.exists() {
-        Err(Failure::task("C2 output must be a fresh nonexistent path"))
-    } else {
-        Ok(())
-    }
-}
-fn write_new(path: &Path, bytes: &[u8]) -> Result<(), Failure> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .custom_flags(O_NOFOLLOW)
-        .open(path)
-        .map_err(|error| Failure::task(format!("could not create C2 product: {error}")))?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|error| Failure::task(format!("could not write C2 product: {error}")))
-}
-fn read_regular(path: &Path) -> Result<Vec<u8>, Failure> {
-    read_regular_bounded(path, "input")
-}
-fn read_regular_bounded(path: &Path, label: &str) -> Result<Vec<u8>, Failure> {
-    let m = fs::symlink_metadata(path)
-        .map_err(|e| Failure::task(format!("could not inspect C2 {label}: {e}")))?;
-    if !m.file_type().is_file()
-        || m.file_type().is_symlink()
-        || m.len() == 0
-        || m.len() > MAX_BYTES as u64
-        || m.nlink() != 1
-    {
-        return Err(Failure::task(
-            "C2 input is not a bounded single-link regular file",
-        ));
-    }
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(O_NOFOLLOW)
-        .open(path)
-        .map_err(|e| Failure::task(format!("could not open C2 {label}: {e}")))?;
-    let opened = file
-        .metadata()
-        .map_err(|e| Failure::task(format!("could not stat C2 {label}: {e}")))?;
-    if (m.dev(), m.ino()) != (opened.dev(), opened.ino()) {
-        return Err(Failure::task("C2 input changed before open"));
-    }
-    let mut bytes = Vec::with_capacity(opened.len() as usize);
-    file.take(MAX_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| Failure::task(format!("could not read C2 {label}: {e}")))?;
-    if bytes.len() != opened.len() as usize {
-        return Err(Failure::task("C2 input changed while reading"));
-    }
-    Ok(bytes)
-}
-fn digest_file(path: &Path) -> Result<String, Failure> {
-    Ok(sha256::bytes_digest(&read_regular(path)?))
-}
-fn hex_to_digest(value: &str) -> Result<[u8; 32], Failure> {
-    crate::wyr1::decode_digest(value)
-}
-
-fn checked_root(request: &Path) -> Result<PathBuf, Failure> {
-    let repository = crate::tasks::repository_root()?;
-    let project = fs::canonicalize(
-        repository
-            .parent()
-            .ok_or_else(|| Failure::task("C2 source has no project root"))?,
-    )
-    .map_err(|e| Failure::task(format!("could not resolve C2 project root: {e}")))?;
-    let source = fs::canonicalize(&repository)
-        .map_err(|e| Failure::task(format!("could not resolve C2 source root: {e}")))?;
-    let parent = request
-        .parent()
-        .ok_or_else(|| Failure::task("C2 request has no parent"))?;
-    let root = fs::canonicalize(parent)
-        .map_err(|e| Failure::task(format!("could not resolve C2 request root: {e}")))?;
-    let output_base = project.join("artifacts/wyr1-c");
-    if !root.starts_with(&output_base)
-        || root.starts_with(&source)
-        || request.file_name() != Some(OsStr::new(REQUEST_NAME))
-    {
-        return Err(Failure::task(
-            "C2 request root escapes the trusted project output boundary",
-        ));
-    }
-    Ok(root)
-}
-
-fn validate_freeze_output(output: &Path) -> Result<(), Failure> {
-    if output.file_name().is_none()
-        || output.components().any(|c| {
-            matches!(
-                c,
-                std::path::Component::ParentDir | std::path::Component::CurDir
-            )
-        })
-    {
-        return Err(Failure::task("C2 output path is not canonical"));
-    }
-    let repository = crate::tasks::repository_root()?;
-    let project = fs::canonicalize(
-        repository
-            .parent()
-            .ok_or_else(|| Failure::task("C2 source has no project root"))?,
-    )
-    .map_err(|e| Failure::task(format!("could not resolve C2 project root: {e}")))?;
-    let parent = output
-        .parent()
-        .ok_or_else(|| Failure::task("C2 output has no parent"))?;
-    let parent = fs::canonicalize(parent)
-        .map_err(|e| Failure::task(format!("could not resolve C2 output parent: {e}")))?;
-    if !parent.starts_with(project.join("artifacts/wyr1-c")) {
-        return Err(Failure::task(
-            "C2 output must be below canonical artifacts/wyr1-c",
-        ));
-    }
-    Ok(())
-}
-
-fn receipt_matches_request(
-    receipt: &BTreeMap<String, String>,
-    request: &BTreeMap<String, String>,
-) -> bool {
-    let mut expected = request
-        .keys()
-        .filter(|key| !matches!(key.as_str(), "kind" | "schema" | "selector" | "evidence"))
-        .cloned()
-        .chain(std::iter::once("request".to_owned()))
-        .collect::<BTreeSet<_>>();
-    if receipt.contains_key("esp") {
-        expected.insert("esp".to_owned());
-    }
-    let actual = receipt
-        .keys()
-        .filter(|key| !matches!(key.as_str(), "kind" | "schema" | "selector" | "evidence"))
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    actual == expected
-        && request
-            .iter()
-            .filter(|(key, _)| !matches!(key.as_str(), "kind" | "schema" | "selector" | "evidence"))
-            .all(|(key, value)| receipt.get(key) == Some(value))
-}
-
-fn validate_c1_tuple(
-    root: &Path,
-    request: &BTreeMap<String, String>,
-    uart: [u8; 32],
-) -> Result<(), Failure> {
-    let product = root.join("product");
-    let c1 = parse_scalars(&read_regular(&product.join("build-receipt.toml"))?)?;
-    let mut required = [
-        "kind",
-        "schema_version",
-        "product_kind",
-        "selector",
-        "evidence",
-        "wyrmroot_revision",
-        "cargo_lock_sha256",
-        "rust_revision",
-        "rust_toolchain_name",
-        "rustc_sha256",
-        "cargo_sha256",
-        "rust_lld_sha256",
-        "toolchain_manifest_sha256",
-        "toolchain_tree_sha256",
-        "boot_generation",
-        "rrc_manifest_path",
-        "rrc_manifest_sha256",
-        "device_manifest_path",
-        "device_manifest_sha256",
-        "bootfs_path",
-        "bootfs_sha256",
-        "bootfs_bytes",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect::<BTreeSet<_>>();
-    for label in [
-        "system-init",
-        "registryd",
-        "devmgr",
-        "uart16550d",
-        "consoled",
-        "wyrmsh",
-    ] {
-        for suffix in ["path", "sha256", "command", "inspection_sha256"] {
-            required.insert(format!("{label}_{suffix}"));
-        }
-    }
-    if c1.keys().cloned().collect::<BTreeSet<_>>() != required {
-        return Err(Failure::task("C2 C1 receipt key set drifted"));
-    }
-    for (key, value) in [
-        ("kind", "wyrmroot-wyr1-c1-host-product-receipt"),
-        ("schema_version", "1"),
-        ("product_kind", "wyrmroot-wyr1-c1-host-product"),
-        ("selector", "none"),
-        ("evidence", "not-produced"),
-    ] {
-        if c1.get(key) != Some(&value.to_owned()) {
-            return Err(Failure::task("C2 C1 receipt identity drifted"));
-        }
-    }
-    if c1.get("wyrmroot_revision") != request.get("wyrmroot_revision") {
-        return Err(Failure::task("C2 C1 receipt Wyrmroot revision drifted"));
-    }
-    let rrc = read_regular(&product.join("rrc-c1-v1.bin"))?;
-    let external = read_regular(&product.join("wrdm-c1-v1.bin"))?;
-    let bootfs = read_regular(&product.join("bootfs.img"))?;
-    for (key, bytes) in [
-        ("rrc_manifest_sha256", &rrc),
-        ("device_manifest_sha256", &external),
-        ("bootfs_sha256", &bootfs),
-    ] {
-        if c1.get(key) != Some(&sha256::bytes_digest(bytes)) {
-            return Err(Failure::task("C2 C1 product digest drifted"));
-        }
-    }
-    let archive = Archive::new(&bootfs)
-        .map_err(|e| Failure::task(format!("C2 bootfs is malformed: {e:?}")))?;
-    if archive.entries().count() != 10 {
-        return Err(Failure::task("C2 bootfs entry count drifted"));
-    }
-    let embedded_rrc = archive
-        .lookup(b"system/bootstrap/rrc-a-v1")
-        .map_err(|_| Failure::task("C2 bootfs lacks WRRM"))?;
-    let embedded_wrdm = archive
-        .lookup(b"system/bootstrap/wyr1-c-device-manifest-v1")
-        .map_err(|_| Failure::task("C2 bootfs lacks WRDM"))?;
-    let devmgr = archive
-        .lookup(b"system/devmgr")
-        .map_err(|_| Failure::task("C2 bootfs lacks devmgr"))?;
-    let retained = archive
-        .lookup(b"system/uart16550d")
-        .map_err(|_| Failure::task("C2 bootfs lacks retained actor"))?;
-    for (label, path) in [
-        ("system-init", b"system/init".as_slice()),
-        ("registryd", b"system/registryd".as_slice()),
-        ("devmgr", b"system/devmgr".as_slice()),
-        ("uart16550d", b"system/uart16550d".as_slice()),
-        ("consoled", b"system/consoled".as_slice()),
-        ("wyrmsh", b"system/wyrmsh".as_slice()),
-    ] {
-        let expected = c1
-            .get(&format!("{label}_sha256"))
-            .ok_or_else(|| Failure::task("C2 C1 lacks component hash"))?;
-        let artifact = read_regular(&root.join("artifacts").join(format!("{label}.elf")))?;
-        let inspection = read_regular(&root.join("inspections").join(format!("{label}.json")))?;
-        let embedded = archive
-            .lookup(path)
-            .map_err(|_| Failure::task("C2 bootfs lacks C1 component"))?
-            .data();
-        if sha256::bytes_digest(&artifact) != *expected
-            || artifact.as_slice() != embedded
-            || c1.get(&format!("{label}_path")) != Some(&format!("artifacts/{label}.elf"))
-            || c1.get(&format!("{label}_inspection_sha256"))
-                != Some(&sha256::bytes_digest(&inspection))
-            || !String::from_utf8_lossy(&inspection).contains(&format!("\"sha256\":\"{expected}\""))
-        {
-            return Err(Failure::task("C2 C1 component tuple drifted"));
-        }
-    }
-    if embedded_rrc.data() != rrc
-        || embedded_wrdm.data() != external
-        || external != read_regular(&product.join(WRDM_NAME))?
-    {
-        return Err(Failure::task("C2 embedded/external WRDM or WRRM drifted"));
-    }
-    if wyrmroot_device_proto::Manifest::parse(&external)
-        .and_then(|m| m.match_com2(ContentIdentity(uart)))
-        .is_err()
-    {
-        return Err(Failure::task("C2 WRDM semantics drifted"));
-    }
-    let generation = crate::wyr1::decode_digest(
-        c1.get("boot_generation")
-            .ok_or_else(|| Failure::task("C2 C1 receipt lacks generation"))?,
-    )?;
-    let manifest = RrcManifest::parse_structural(&rrc, &generation)
-        .map_err(|e| Failure::task(format!("C2 WRRM is malformed: {e:?}")))?;
-    for (role, profile, label, data) in [
-        (
-            RoleId::Registryd,
-            StartupProfile::BootstrapRegistry,
-            "registryd",
-            None,
-        ),
-        (
-            RoleId::Devmgr,
-            StartupProfile::DeviceCoordinator,
-            "devmgr",
-            Some(devmgr.data()),
-        ),
-        (
-            RoleId::Uart16550d,
-            StartupProfile::Retained,
-            "uart16550d",
-            Some(retained.data()),
-        ),
-    ] {
-        let entry = manifest
-            .role(role)
-            .ok_or_else(|| Failure::task("C2 WRRM lacks role"))?;
-        if entry.startup_profile() != profile {
-            return Err(Failure::task("C2 WRRM startup profile drifted"));
-        }
-        let expected = c1
-            .get(&format!("{label}_sha256"))
-            .ok_or_else(|| Failure::task("C2 C1 receipt lacks component digest"))?;
-        if entry.executable_identity() != &crate::wyr1::decode_digest(expected)?
-            || data.is_some_and(|bytes| sha256::bytes_digest(bytes) != *expected)
-        {
-            return Err(Failure::task("C2 WRRM component identity drifted"));
-        }
-    }
-    Ok(())
-}
-
-fn parse_scalars(bytes: &[u8]) -> Result<BTreeMap<String, String>, Failure> {
-    let text = std::str::from_utf8(bytes).map_err(|_| Failure::task("C2 receipt is not UTF-8"))?;
-    if !text.ends_with('\n') || text.contains('\r') {
-        return Err(Failure::task("C2 receipt line endings drifted"));
-    }
-    let mut values = BTreeMap::new();
-    for line in text.lines() {
-        let (key, raw) = line
-            .split_once(" = ")
-            .ok_or_else(|| Failure::task("C2 receipt has malformed line"))?;
-        if key.is_empty()
-            || !key.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
-            || values.contains_key(key)
-        {
-            return Err(Failure::task("C2 receipt has invalid or duplicate key"));
-        }
-        let value = if raw.starts_with('"') && raw.ends_with('"') && raw.len() >= 2 {
-            let value = &raw[1..raw.len() - 1];
-            if value.contains('"') || value.contains('\\') || value.is_empty() {
-                return Err(Failure::task("C2 receipt has malformed string"));
-            }
-            value
-        } else if raw.bytes().all(|b| b.is_ascii_digit()) && !raw.is_empty() {
-            raw
-        } else {
-            return Err(Failure::task("C2 receipt scalar type drifted"));
-        };
-        values.insert(key.to_owned(), value.to_owned());
-    }
-    Ok(values)
-}
-
-fn clean_revision(repository: &Path, label: &str) -> Result<String, Failure> {
-    let head = Command::new("git")
-        .arg("-C")
-        .arg(repository)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .map_err(|e| Failure::task(format!("could not inspect {label}: {e}")))?;
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(repository)
-        .args(["status", "--porcelain=v1", "--untracked-files=all"])
-        .output()
-        .map_err(|e| Failure::task(format!("could not inspect {label} status: {e}")))?;
-    if !head.status.success() || !status.status.success() || !status.stdout.is_empty() {
-        return Err(Failure::task(format!(
-            "C2 requires one exact clean {label} revision"
-        )));
-    }
-    std::str::from_utf8(&head.stdout)
-        .map(str::trim)
-        .map(str::to_owned)
-        .map_err(|_| Failure::task("git revision was not UTF-8"))
-}
-
-fn validate_abi_tree(deep: &Path, kernel_revision: &str) -> Result<(), Failure> {
-    let tree = |revision: &str| -> Result<String, Failure> {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(deep)
-            .args(["rev-parse", &format!("{revision}:abi")])
-            .output()
-            .map_err(|e| Failure::task(format!("could not inspect C2 ABI tree: {e}")))?;
-        if !output.status.success() {
-            return Err(Failure::task("C2 kernel revision has no ABI tree"));
-        }
-        std::str::from_utf8(&output.stdout)
-            .map(str::trim)
-            .map(str::to_owned)
-            .map_err(|_| Failure::task("C2 ABI tree was not UTF-8"))
-    };
-    if tree(kernel_revision)? != ACCEPTED_ABI_TREE
-        || tree(GENERATED_ABI_REVISION)? != ACCEPTED_ABI_TREE
-    {
-        return Err(Failure::task(
-            "C2 kernel and generated ABI trees are incompatible",
-        ));
-    }
-    Ok(())
-}
-
 fn build_bootstrap(
     repository: &Path,
     cargo_home: &Path,
@@ -883,7 +862,7 @@ fn build_bootstrap(
 ) -> Result<Vec<u8>, Failure> {
     let target = build.join("bootstrap");
     fs::create_dir(&target)
-        .map_err(|e| Failure::task(format!("could not create C2 bootstrap target: {e}")))?;
+        .map_err(|error| Failure::task(format!("could not create C2 bootstrap target: {error}")))?;
     let status = Command::new(&toolchain.cargo)
         .args([
             "build",
@@ -912,21 +891,22 @@ fn build_bootstrap(
         .current_dir(repository)
         .stdin(Stdio::null())
         .status()
-        .map_err(|e| Failure::task(format!("could not build C2 bootstrap: {e}")))?;
+        .map_err(|error| Failure::task(format!("could not build C2 bootstrap: {error}")))?;
     if !status.success() {
         return Err(Failure::task("C2 bootstrap build failed"));
     }
-    read_regular_bounded(
+    read_bounded_path(
         &target
             .join(NATIVE_TARGET)
             .join("release/wyrmroot-bootstrap"),
         "bootstrap",
+        MAX_BYTES,
     )
 }
 
 fn build_kernel(deep: &Path, target: &Path) -> Result<Vec<u8>, Failure> {
-    fs::create_dir_all(target)
-        .map_err(|e| Failure::task(format!("could not create C2 kernel target: {e}")))?;
+    fs::create_dir(target)
+        .map_err(|error| Failure::task(format!("could not create C2 kernel target: {error}")))?;
     let status = Command::new(deep.join("tools/pinned-cargo"))
         .args([
             "target",
@@ -951,17 +931,19 @@ fn build_kernel(deep: &Path, target: &Path) -> Result<Vec<u8>, Failure> {
         .current_dir(deep)
         .stdin(Stdio::null())
         .status()
-        .map_err(|e| Failure::task(format!("could not build C2 production kernel: {e}")))?;
+        .map_err(|error| Failure::task(format!("could not build C2 production kernel: {error}")))?;
     if !status.success() {
         return Err(Failure::task("C2 production kernel build failed"));
     }
-    read_regular_bounded(
+    read_bounded_path(
         &target.join(KERNEL_TARGET).join("release/deepwyrm-kernel"),
         "kernel",
+        MAX_BYTES,
     )
 }
 
 fn reject_ambient() -> Result<(), Failure> {
+    let variables = env::vars_os().collect::<BTreeMap<OsString, OsString>>();
     for name in [
         "DEEPWYRM_GUEST_TEST_SELECTOR",
         "DEEPWYRM_GUEST_TEST_ID",
@@ -972,15 +954,14 @@ fn reject_ambient() -> Result<(), Failure> {
         "RUSTC",
         "RUSTFLAGS",
     ] {
-        if env::var_os(name).is_some() {
+        if variables.contains_key(OsStr::new(name)) {
             return Err(Failure::task(format!("C2 freeze refuses ambient {name}")));
         }
     }
-    if env::vars_os().any(|(key, _)| {
-        key.as_os_str()
-            .as_encoded_bytes()
-            .starts_with(b"CARGO_TARGET_")
-    }) {
+    if variables
+        .keys()
+        .any(|key| key.as_encoded_bytes().starts_with(b"CARGO_TARGET_"))
+    {
         return Err(Failure::task("C2 freeze refuses ambient CARGO_TARGET_*"));
     }
     Ok(())
@@ -989,18 +970,59 @@ fn reject_ambient() -> Result<(), Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn reviewed_source_compiles_deterministically() {
-        let a = compile_source(SOURCE, [7; 32]).unwrap();
-        assert_eq!(a, compile_source(SOURCE, [7; 32]).unwrap());
-        assert!(compile_source(b"hardware = \"com1\"\n", [7; 32]).is_err());
+    fn reviewed_source_requires_byte_identity_and_semantic_identity() {
+        let compiled = compile_source(SOURCE, [7; 32]).unwrap();
+        assert_eq!(compiled, compile_source(SOURCE, [7; 32]).unwrap());
+        let mut changed = SOURCE.to_vec();
+        changed.extend_from_slice(b"# harmless-looking drift\n");
+        assert!(compile_source(&changed, [7; 32]).is_err());
     }
+
     #[test]
-    fn request_parser_rejects_duplicates_and_test_ids() {
-        assert!(parse_request(b"a = \"x\"\na = \"y\"\n").is_err());
-        assert!(parse_request(b"a = x\n").is_err());
-        assert!(parse_request(b"a = \"x\"\r\n").is_err());
-        let map = parse_request(b"kind = \"x\"\n").unwrap();
-        assert!(!map.contains_key("test_id"));
+    fn canonical_request_and_receipts_round_trip() {
+        let fields = vec![
+            ("output", ".".to_owned()),
+            ("source_sha256", "00".repeat(32)),
+        ];
+        let request = render(REQUEST_KIND, &fields);
+        assert_eq!(
+            parse_scalars(request.as_bytes(), "request").unwrap()["kind"],
+            REQUEST_KIND
+        );
+        let receipt = render_base_receipt(request.as_bytes(), &fields);
+        assert_eq!(
+            parse_scalars(receipt.as_bytes(), "receipt").unwrap()["kind"],
+            BASE_RECEIPT_KIND
+        );
+        let report = crate::g3_image::Inspection {
+            image_sha256: "11".repeat(32),
+            loader_sha256: "22".repeat(32),
+            kernel_sha256: "33".repeat(32),
+            bootstrap_sha256: "44".repeat(32),
+            bootfs_sha256: "55".repeat(32),
+        };
+        let image = render_image_receipt(request.as_bytes(), &fields, &report);
+        assert_eq!(
+            parse_scalars(image.as_bytes(), "image receipt").unwrap()["kind"],
+            IMAGE_RECEIPT_KIND
+        );
+    }
+
+    #[test]
+    fn scalar_parser_rejects_duplicate_noncanonical_and_test_fields() {
+        assert!(parse_scalars(b"a = \"x\"\na = \"y\"\n", "test").is_err());
+        assert!(parse_scalars(b"a = x\n", "test").is_err());
+        assert!(parse_scalars(b"a = \"x\"\r\n", "test").is_err());
+        assert!(parse_scalars(b"test-id = \"29\"\n", "test").is_err());
+    }
+
+    #[test]
+    fn esp_and_image_receipt_are_an_inseparable_pair() {
+        assert!(require_image_pair(false, false).is_ok());
+        assert!(require_image_pair(true, true).is_ok());
+        assert!(require_image_pair(true, false).is_err());
+        assert!(require_image_pair(false, true).is_err());
     }
 }

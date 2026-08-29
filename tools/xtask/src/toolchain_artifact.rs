@@ -30,6 +30,7 @@ struct ArtifactComponent {
 
 pub(crate) struct AcceptedToolchain {
     pub(crate) rustc: PathBuf,
+    pub(crate) rustc_sha256: String,
     pub(crate) cargo: PathBuf,
     pub(crate) rust_lld: PathBuf,
     pub(crate) sysroot: PathBuf,
@@ -275,6 +276,7 @@ pub(crate) fn prepare(
     ];
     let accepted = AcceptedToolchain {
         rustc: rustc.path.clone(),
+        rustc_sha256: rustc.sha256.clone(),
         cargo: cargo.path.clone(),
         rust_lld: rust_lld.path.clone(),
         sysroot,
