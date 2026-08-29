@@ -23,6 +23,7 @@ Usage:
     tools/pinned-cargo xtask wyr1b inspect --request <wyr1-b-request.toml>
     tools/pinned-cargo xtask wyr1b run --request <wyr1-b-request.toml>
     tools/pinned-cargo xtask wyr1b evidence --request <wyr1-b-request.toml>
+    tools/pinned-cargo xtask wyr1c1 product --output <fresh-directory>
     cargo xtask dw1b image --request <dw1-b-request.toml>
     cargo xtask dw1b image-rebuild --request <dw1-b-request.toml>
     cargo xtask dw1b freeze --output <directory>
@@ -128,6 +129,7 @@ pub(crate) enum Action {
     Wyr1BInspect(String),
     Wyr1BRun(String),
     Wyr1BEvidence(String),
+    Wyr1C1Product(String),
     Dw1BImage(String),
     Dw1BImageRebuild(String),
     Dw1BFreeze(String),
@@ -202,11 +204,23 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
         "test" => dispatch_test(&arguments[1..]),
         "wyr1" => dispatch_wyr1(&arguments[1..]),
         "wyr1b" => dispatch_wyr1b(&arguments[1..]),
+        "wyr1c1" => dispatch_wyr1c1(&arguments[1..]),
         "dw1b" => dispatch_dw1b(&arguments[1..]),
         "dw1c" => dispatch_dw1c(&arguments[1..]),
         unknown => Err(Failure::usage(format!(
             "unknown command '{unknown}'\n\n{USAGE}"
         ))),
+    }
+}
+
+fn dispatch_wyr1c1(arguments: &[String]) -> Result<Action, Failure> {
+    match arguments {
+        [command, flag, output] if command == "product" && flag == "--output" => {
+            Ok(Action::Wyr1C1Product(output.clone()))
+        }
+        _ => Err(Failure::usage(
+            "wyr1c1 requires product --output <fresh-directory>; it has no selector, run, or evidence command",
+        )),
     }
 }
 
@@ -805,6 +819,19 @@ mod tests {
             assert!(USAGE.contains(&format!("tools/pinned-cargo xtask wyr1b {command}")));
         }
         assert!(!USAGE.contains("\n    cargo xtask wyr1b"));
+    }
+
+    #[test]
+    fn wyr1c1_dispatch_is_product_only_and_unnumbered() {
+        assert_eq!(
+            dispatch(&arguments(&["wyr1c1", "product", "--output", "product",])),
+            Ok(Action::Wyr1C1Product("product".into()))
+        );
+        assert!(dispatch(&arguments(&["wyr1c1", "run", "--output", "product"])).is_err());
+        assert!(dispatch(&arguments(&["wyr1c1", "evidence", "--output", "product"])).is_err());
+        assert!(USAGE.contains("tools/pinned-cargo xtask wyr1c1 product --output"));
+        assert!(!USAGE.contains("wyr1c1 run"));
+        assert!(!USAGE.contains("wyr1c1 evidence"));
     }
 
     #[test]

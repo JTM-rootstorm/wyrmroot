@@ -121,6 +121,47 @@ pub const COM2_POLICY: Com2Policy = Com2Policy {
     metadata_policy: SERIAL_TRANSPORT_METADATA_POLICY,
 };
 
+/// Encode the one canonical WYR1-C1 q35 COM2 role.
+///
+/// The caller supplies only the immutable driver content identity. Every
+/// hardware and policy field is fixed here so host product tooling cannot
+/// accidentally mint a second dialect of WRDM v1.
+pub fn encode_com2_manifest(
+    content_identity: ContentIdentity,
+    output: &mut [u8],
+) -> Result<usize, ManifestError> {
+    const TOTAL: usize = HEADER_BYTES + RECORD_BYTES;
+    if output.len() < TOTAL {
+        return Err(ManifestError::WrongSize);
+    }
+    if content_identity.0.iter().all(|byte| *byte == 0) {
+        return Err(ManifestError::ZeroContentIdentity);
+    }
+    output[..TOTAL].fill(0);
+    output[..4].copy_from_slice(&MAGIC);
+    output[4..6].copy_from_slice(&MAJOR.to_le_bytes());
+    output[6..8].copy_from_slice(&MINOR.to_le_bytes());
+    output[8..12].copy_from_slice(&(TOTAL as u32).to_le_bytes());
+    output[12..14].copy_from_slice(&1u16.to_le_bytes());
+    output[16..20].copy_from_slice(&COM2_POLICY.profile.0.to_le_bytes());
+    output[20..24].copy_from_slice(&COM2_POLICY.profile_version.0.to_le_bytes());
+
+    let base = HEADER_BYTES;
+    output[base..base + 8].copy_from_slice(&COM2_POLICY.role_id.0.to_le_bytes());
+    output[base + 8..base + 12].copy_from_slice(&2u32.to_le_bytes());
+    output[base + 12..base + 16].copy_from_slice(&1u32.to_le_bytes());
+    output[base + 16..base + 18].copy_from_slice(&COM2_POLICY.pio.base.to_le_bytes());
+    output[base + 18..base + 20].copy_from_slice(&COM2_POLICY.pio.length.to_le_bytes());
+    output[base + 20..base + 24].copy_from_slice(&COM2_POLICY.irq.to_le_bytes());
+    output[base + 24..base + 26]
+        .copy_from_slice(&(COM2_POLICY.driver_path.len() as u16).to_le_bytes());
+    output[base + 28..base + 60].copy_from_slice(&content_identity.0);
+    output[base + 60..base + 64].copy_from_slice(&COM2_POLICY.metadata_policy.0.to_le_bytes());
+    output[base + 72..base + 72 + COM2_POLICY.driver_path.len()]
+        .copy_from_slice(COM2_POLICY.driver_path);
+    Ok(TOTAL)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Manifest<'a> {
     pub profile: ProfileId,
@@ -407,6 +448,27 @@ mod tests {
                 .pio
                 .end(),
             0x300
+        );
+    }
+
+    #[test]
+    fn canonical_com2_encoder_round_trips_and_zeroes_tail() {
+        let mut bytes = [0xa5; HEADER_BYTES + RECORD_BYTES + 7];
+        let size = encode_com2_manifest(ContentIdentity([9; 32]), &mut bytes).unwrap();
+        assert_eq!(size, HEADER_BYTES + RECORD_BYTES);
+        assert!(bytes[size..].iter().all(|byte| *byte == 0xa5));
+        let parsed = Manifest::parse(&bytes[..size]).unwrap();
+        assert_eq!(
+            parsed.match_com2(ContentIdentity([9; 32])).unwrap().pio,
+            COM2_POLICY.pio
+        );
+        assert_eq!(
+            encode_com2_manifest(ContentIdentity([0; 32]), &mut bytes),
+            Err(ManifestError::ZeroContentIdentity)
+        );
+        assert_eq!(
+            encode_com2_manifest(ContentIdentity([9; 32]), &mut bytes[..16]),
+            Err(ManifestError::WrongSize)
         );
     }
 

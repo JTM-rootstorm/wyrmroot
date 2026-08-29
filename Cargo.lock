@@ -362,6 +362,7 @@ version = "0.0.0"
 dependencies = [
  "deepwyrm-abi",
  "wyrmroot-bootfs",
+ "wyrmroot-device-proto",
  "wyrmroot-i-capability",
  "wyrmroot-loader",
  "wyrmroot-rrc-manifest",

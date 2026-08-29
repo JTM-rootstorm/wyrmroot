@@ -551,6 +551,20 @@ pub(super) fn fixed_builder_for_profile(
     role_hashes: [[u8; 32]; 5],
     registry_profile: StartupProfile,
 ) -> Result<Builder<'static>, Failure> {
+    fixed_builder_for_profiles(
+        boot_generation,
+        role_hashes,
+        registry_profile,
+        StartupProfile::EarlyBootStub,
+    )
+}
+
+pub(super) fn fixed_builder_for_profiles(
+    boot_generation: &[u8; 32],
+    role_hashes: [[u8; 32]; 5],
+    registry_profile: StartupProfile,
+    devmgr_profile: StartupProfile,
+) -> Result<Builder<'static>, Failure> {
     let mut builder = Builder::new(*boot_generation);
     let roles = [
         (
@@ -565,7 +579,7 @@ pub(super) fn fixed_builder_for_profile(
             "system/devmgr",
             ROLE_JUSTIFICATIONS[1],
             Activation::Early,
-            StartupProfile::EarlyBootStub,
+            devmgr_profile,
         ),
         (
             RoleId::Uart16550d,
