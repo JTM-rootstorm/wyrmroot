@@ -602,6 +602,7 @@ const fn launch_error_code(error: LaunchError) -> u32 {
         LaunchError::BadCapabilityRole { index } => 0x100 | bounded_index(index),
         LaunchError::HandleCount => 11,
         LaunchError::HandleMetadata { index } => 0x200 | bounded_index(index),
+        LaunchError::ProfileSpecificEncoderRequired => 0x300,
     }
 }
 
