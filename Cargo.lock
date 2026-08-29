@@ -181,6 +181,16 @@ name = "wyrmroot-device-proto"
 version = "0.0.0"
 
 [[package]]
+name = "wyrmroot-devmgr"
+version = "0.0.0"
+dependencies = [
+ "deepwyrm-syscall",
+ "wyrmroot-device-proto",
+ "wyrmroot-loader",
+ "wyrmroot-runtime",
+]
+
+[[package]]
 name = "wyrmroot-dw1b-preemption"
 version = "0.0.0"
 dependencies = [

@@ -1,0 +1,31 @@
+[package]
+name = "wyrmroot-devmgr"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+description = "Resident hardware-independent WYR1-C device coordinator"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "devmgr"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["native-devmgr"]
+
+[features]
+default = []
+native-devmgr = ["dep:deepwyrm-syscall", "dep:wyrmroot-loader", "dep:wyrmroot-runtime"]
+
+[dependencies]
+deepwyrm-syscall = { workspace = true, optional = true }
+wyrmroot-device-proto = { path = "../../crates/wyrmroot-device-proto" }
+wyrmroot-loader = { path = "../../crates/wyrmroot-loader", optional = true }
+wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime", optional = true }
+
+[lints.rust]
+unsafe_code = "deny"
+unused_crate_dependencies = "deny"

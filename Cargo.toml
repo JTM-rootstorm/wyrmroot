@@ -22,6 +22,7 @@ members = [
     "userspace/wyr1-retained-stubs",
     "userspace/loader-smoke",
     "userspace/registryd",
+    "userspace/devmgr",
     "userspace/dw1b-preemption",
     "userspace/dw1c-preemption",
     "userspace/wyr1b-gate",
