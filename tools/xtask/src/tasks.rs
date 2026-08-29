@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
@@ -9,6 +10,7 @@ use crate::deep_layout::DeepLayoutBuild;
 use crate::error::Failure;
 use crate::metadata::{BuildManifest, LoaderProfile};
 use crate::provenance::{LoaderProvenance, write_loader_provenance};
+use crate::secure_fs::{Directory, SealedFile};
 use crate::sha256::{bytes_digest, file_digest};
 use crate::toolchain_artifact::AcceptedToolchain;
 
@@ -113,6 +115,7 @@ struct UefiCargoInvocation<'a> {
 
 pub(crate) struct DeterministicUefiArtifacts {
     pub(crate) loader: PathBuf,
+    pub(crate) loader_bytes: Vec<u8>,
     pub(crate) debug_loader: PathBuf,
     pub(crate) debug_symbols: PathBuf,
     pub(crate) effective_config: String,
@@ -164,6 +167,51 @@ impl PreparedUefiTargetRoots {
             UefiTargetDirectory::Canonical(&self.retained_debug),
             |authority| UefiTargetDirectory::Retained(&authority.retained_debug),
         )
+    }
+
+    fn read_production(
+        &self,
+        relative: &Path,
+        maximum: u64,
+        label: &str,
+    ) -> Result<Vec<u8>, Failure> {
+        match &self.authority {
+            Some(authority) => authority.production.read_producer(relative, maximum, label),
+            None => Directory::open_exact(&self.production, "production UEFI target root")?
+                .read_producer(relative, maximum, label),
+        }
+    }
+
+    fn read_retained_debug(
+        &self,
+        relative: &Path,
+        maximum: u64,
+        label: &str,
+    ) -> Result<Vec<u8>, Failure> {
+        match &self.authority {
+            Some(authority) => authority
+                .retained_debug
+                .read_producer(relative, maximum, label),
+            None => Directory::open_exact(&self.retained_debug, "retained-debug UEFI target root")?
+                .read_producer(relative, maximum, label),
+        }
+    }
+
+    fn with_inheritance_disabled<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, Failure>,
+    ) -> Result<T, Failure> {
+        match &self.authority {
+            Some(authority) => authority.production.with_inheritance_disabled(
+                "production UEFI target root",
+                || {
+                    authority
+                        .retained_debug
+                        .with_inheritance_disabled("retained-debug UEFI target root", operation)
+                },
+            ),
+            None => operation(),
+        }
     }
 }
 
@@ -569,39 +617,51 @@ fn build_deterministic_uefi_pair_with_authority(
         },
     )?;
 
-    let loader = production_target
-        .join(&profile.rust_target)
+    let loader_relative = PathBuf::from(&profile.rust_target)
         .join(build.cargo_profile.directory())
         .join(&profile.artifact_name);
-    let debug_output = retained_debug_target
-        .join(&profile.rust_target)
-        .join(build.cargo_profile.directory());
-    let debug_loader = debug_output.join(&profile.artifact_name);
-    let debug_symbols = debug_output.join(format!("{}.pdb", profile.cargo_binary));
-    validate_regular_artifact(&loader, "UEFI loader", MAX_LOADER_BYTES)?;
-    validate_regular_artifact(
-        &debug_loader,
-        "retained debug UEFI loader",
+    let debug_output_relative =
+        PathBuf::from(&profile.rust_target).join(build.cargo_profile.directory());
+    let debug_loader_relative = debug_output_relative.join(&profile.artifact_name);
+    let debug_symbols_relative =
+        debug_output_relative.join(format!("{}.pdb", profile.cargo_binary));
+    let loader_bytes = target_roots.read_production(
+        &loader_relative,
         MAX_LOADER_BYTES,
+        "UEFI loader producer output",
     )?;
-    validate_regular_artifact(
-        &debug_symbols,
-        "UEFI loader debug symbols",
+    let debug_loader_bytes = target_roots.read_retained_debug(
+        &debug_loader_relative,
+        MAX_LOADER_BYTES,
+        "retained debug UEFI loader producer output",
+    )?;
+    let debug_symbols_bytes = target_roots.read_retained_debug(
+        &debug_symbols_relative,
         MAX_DEBUG_SYMBOL_BYTES,
+        "UEFI debug symbols producer output",
     )?;
-    let inspection_report = run_verified_report(
-        repository,
-        &profile.artifact_inspection,
-        [
-            loader.as_os_str(),
-            debug_loader.as_os_str(),
-            debug_symbols.as_os_str(),
-        ],
-        "UEFI artifact inspection",
-    )?;
+    let inspect = || {
+        target_roots.with_inheritance_disabled(|| {
+            inspect_uefi_snapshots(
+                repository,
+                &profile.artifact_inspection,
+                &loader_bytes,
+                &debug_loader_bytes,
+                &debug_symbols_bytes,
+            )
+        })
+    };
+    let inspection_report = match scratch {
+        Some(scratch) => scratch.with_inheritance_disabled("UEFI build scratch root", inspect)?,
+        None => inspect()?,
+    };
+    let loader = production_target.join(&loader_relative);
+    let debug_loader = retained_debug_target.join(&debug_loader_relative);
+    let debug_symbols = retained_debug_target.join(&debug_symbols_relative);
     let effective_config = normalized_uefi_config(profile, build.cargo_profile);
     Ok(DeterministicUefiArtifacts {
         loader,
+        loader_bytes,
         debug_loader,
         debug_symbols,
         effective_config_sha256: bytes_digest(effective_config.as_bytes()),
@@ -610,6 +670,249 @@ fn build_deterministic_uefi_pair_with_authority(
         inspection_report,
         _target_authority: target_roots.authority,
     })
+}
+
+fn inspect_uefi_snapshots(
+    repository: &Path,
+    script: &str,
+    loader: &[u8],
+    debug_loader: &[u8],
+    debug_symbols: &[u8],
+) -> Result<String, Failure> {
+    let sealed_loader = SealedFile::from_bytes(loader, "UEFI loader inspection input")?;
+    let sealed_debug_loader =
+        SealedFile::from_bytes(debug_loader, "debug UEFI loader inspection input")?;
+    let sealed_debug_symbols =
+        SealedFile::from_bytes(debug_symbols, "UEFI debug-symbol inspection input")?;
+    let report =
+        sealed_loader.with_inheritable_path("UEFI loader inspection input", |loader_path| {
+            sealed_debug_loader.with_inheritable_path(
+                "debug UEFI loader inspection input",
+                |debug_loader_path| {
+                    sealed_debug_symbols.with_inheritable_path(
+                        "UEFI debug-symbol inspection input",
+                        |debug_symbols_path| {
+                            run_verified_report(
+                                repository,
+                                script,
+                                [
+                                    loader_path.as_os_str(),
+                                    debug_loader_path.as_os_str(),
+                                    debug_symbols_path.as_os_str(),
+                                ],
+                                "UEFI artifact inspection",
+                            )
+                        },
+                    )
+                },
+            )
+        })?;
+    let expected = render_uefi_inspection_report(loader, debug_loader, debug_symbols);
+    if report != expected {
+        return Err(Failure::task(
+            "UEFI artifact inspection did not canonically bind the sealed inputs",
+        ));
+    }
+    Ok(report)
+}
+
+fn render_uefi_inspection_report(
+    loader: &[u8],
+    debug_loader: &[u8],
+    debug_symbols: &[u8],
+) -> String {
+    render_uefi_inspection_values(
+        &bytes_digest(loader),
+        loader.len(),
+        &bytes_digest(debug_loader),
+        debug_loader.len(),
+        &bytes_digest(debug_symbols),
+        debug_symbols.len(),
+    )
+}
+
+fn render_uefi_inspection_values(
+    loader_sha256: &str,
+    loader_size: usize,
+    debug_loader_sha256: &str,
+    debug_loader_size: usize,
+    debug_symbol_sha256: &str,
+    debug_symbol_size: usize,
+) -> String {
+    format!(
+        concat!(
+            "{{\n",
+            "  \"schema_version\": 2,\n",
+            "  \"report_kind\": \"wyrmroot-wyr0-uefi-artifact-inspection\",\n",
+            "  \"loader\": \"loader.efi\",\n",
+            "  \"debug_loader\": \"loader.efi\",\n",
+            "  \"debug_symbol_artifact\": \"loader.pdb\",\n",
+            "  \"loader_sha256\": \"{}\",\n",
+            "  \"loader_size\": {},\n",
+            "  \"debug_loader_sha256\": \"{}\",\n",
+            "  \"debug_loader_size\": {},\n",
+            "  \"debug_symbol_sha256\": \"{}\",\n",
+            "  \"debug_symbol_size\": {},\n",
+            "  \"pe32_plus\": true,\n",
+            "  \"amd64\": true,\n",
+            "  \"efi_application\": true,\n",
+            "  \"no_pe_imports\": true,\n",
+            "  \"production_reproducible\": true,\n",
+            "  \"production_codeview_absent\": true,\n",
+            "  \"debug_pair_linked\": true,\n",
+            "  \"pdb_has_symbols\": true,\n",
+            "  \"verified\": true\n",
+            "}}\n"
+        ),
+        loader_sha256,
+        loader_size,
+        debug_loader_sha256,
+        debug_loader_size,
+        debug_symbol_sha256,
+        debug_symbol_size,
+    )
+}
+
+pub(crate) fn validate_uefi_inspection_report(report: &[u8], loader: &[u8]) -> Result<(), Failure> {
+    let report = std::str::from_utf8(report)
+        .map_err(|_| Failure::task("UEFI inspection report is not UTF-8"))?;
+    if report.contains('\r') || !report.ends_with('\n') {
+        return Err(Failure::task(
+            "UEFI inspection report is not canonical text",
+        ));
+    }
+    let lines = report.lines().collect::<Vec<_>>();
+    if lines.first() != Some(&"{") || lines.last() != Some(&"}") || lines.len() < 3 {
+        return Err(Failure::task("UEFI inspection report framing is malformed"));
+    }
+    let field_lines = &lines[1..lines.len() - 1];
+    let mut fields = BTreeMap::new();
+    for (index, line) in field_lines.iter().enumerate() {
+        let comma = index + 1 != field_lines.len();
+        let line = if comma {
+            line.strip_suffix(',')
+                .ok_or_else(|| Failure::task("UEFI inspection report comma drifted"))?
+        } else if line.ends_with(',') {
+            return Err(Failure::task("UEFI inspection report has a trailing comma"));
+        } else {
+            line
+        };
+        let line = line
+            .strip_prefix("  \"")
+            .ok_or_else(|| Failure::task("UEFI inspection report indentation drifted"))?;
+        let (key, value) = line
+            .split_once("\": ")
+            .ok_or_else(|| Failure::task("UEFI inspection report field is malformed"))?;
+        if key.is_empty() || fields.insert(key, value).is_some() {
+            return Err(Failure::task(
+                "UEFI inspection report key is empty or duplicate",
+            ));
+        }
+    }
+    let expected_keys = [
+        "schema_version",
+        "report_kind",
+        "loader",
+        "debug_loader",
+        "debug_symbol_artifact",
+        "loader_sha256",
+        "loader_size",
+        "debug_loader_sha256",
+        "debug_loader_size",
+        "debug_symbol_sha256",
+        "debug_symbol_size",
+        "pe32_plus",
+        "amd64",
+        "efi_application",
+        "no_pe_imports",
+        "production_reproducible",
+        "production_codeview_absent",
+        "debug_pair_linked",
+        "pdb_has_symbols",
+        "verified",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    if fields.keys().copied().collect::<BTreeSet<_>>() != expected_keys {
+        return Err(Failure::task("UEFI inspection report key set drifted"));
+    }
+    for (key, expected) in [
+        ("schema_version", "2"),
+        ("report_kind", "\"wyrmroot-wyr0-uefi-artifact-inspection\""),
+        ("loader", "\"loader.efi\""),
+        ("debug_loader", "\"loader.efi\""),
+        ("debug_symbol_artifact", "\"loader.pdb\""),
+        ("pe32_plus", "true"),
+        ("amd64", "true"),
+        ("efi_application", "true"),
+        ("no_pe_imports", "true"),
+        ("production_reproducible", "true"),
+        ("production_codeview_absent", "true"),
+        ("debug_pair_linked", "true"),
+        ("pdb_has_symbols", "true"),
+        ("verified", "true"),
+    ] {
+        if fields.get(key).copied() != Some(expected) {
+            return Err(Failure::task(format!(
+                "UEFI inspection report {key} drifted"
+            )));
+        }
+    }
+    let digest = |key: &str| -> Result<&str, Failure> {
+        let quoted = fields
+            .get(key)
+            .copied()
+            .ok_or_else(|| Failure::task("UEFI inspection digest is missing"))?;
+        let value = quoted
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .ok_or_else(|| Failure::task("UEFI inspection digest is not quoted"))?;
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(Failure::task("UEFI inspection digest is malformed"));
+        }
+        Ok(value)
+    };
+    let size = |key: &str, maximum: usize| -> Result<usize, Failure> {
+        let raw = fields
+            .get(key)
+            .copied()
+            .ok_or_else(|| Failure::task("UEFI inspection size is missing"))?;
+        let value = raw
+            .parse::<usize>()
+            .map_err(|_| Failure::task("UEFI inspection size is malformed"))?;
+        if value == 0 || value > maximum || value.to_string() != raw {
+            return Err(Failure::task("UEFI inspection size is outside its bound"));
+        }
+        Ok(value)
+    };
+    let loader_hash = digest("loader_sha256")?;
+    let debug_loader_hash = digest("debug_loader_sha256")?;
+    let debug_symbol_hash = digest("debug_symbol_sha256")?;
+    let loader_size = size("loader_size", MAX_LOADER_BYTES as usize)?;
+    let debug_loader_size = size("debug_loader_size", MAX_LOADER_BYTES as usize)?;
+    let debug_symbol_size = size("debug_symbol_size", MAX_DEBUG_SYMBOL_BYTES as usize)?;
+    if loader_hash != bytes_digest(loader) || loader_size != loader.len() {
+        return Err(Failure::task(
+            "UEFI inspection report does not bind the published loader bytes",
+        ));
+    }
+    if report
+        != render_uefi_inspection_values(
+            loader_hash,
+            loader_size,
+            debug_loader_hash,
+            debug_loader_size,
+            debug_symbol_hash,
+            debug_symbol_size,
+        )
+    {
+        return Err(Failure::task("UEFI inspection report is not canonical"));
+    }
+    Ok(())
 }
 
 fn prepare_uefi_target_roots(
@@ -867,6 +1170,7 @@ fn canonical_build_directory(path: &Path, label: &str) -> Result<PathBuf, Failur
     Ok(canonical)
 }
 
+#[cfg(test)]
 fn validate_regular_artifact(path: &Path, label: &str, maximum: u64) -> Result<(), Failure> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| Failure::task(format!("missing {label} {}: {error}", path.display())))?;
@@ -1054,9 +1358,11 @@ mod tests {
         IsolatedUefiBuild, LoaderLinkMode, UefiCargoProfile, blocked_toolchain_failure,
         canonical_build_directory, component_package, encoded_uefi_rustflags,
         encoded_uefi_rustflags_for_target, explicit_test_filter, host_test_arguments,
-        host_test_commands, prepare_uefi_target_roots, validate_regular_artifact,
+        host_test_commands, prepare_uefi_target_roots, render_uefi_inspection_report,
+        validate_regular_artifact, validate_uefi_inspection_report,
     };
     use crate::error::Failure;
+    use crate::sha256::bytes_digest;
     use std::fs;
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1206,6 +1512,46 @@ mod tests {
         assert!(!debug_flags.contains("link-arg=/debug:none"));
 
         fs::remove_dir_all(&root).expect("remove isolated test directory");
+    }
+
+    #[test]
+    fn uefi_inspection_report_binds_all_snapshot_hashes_and_sizes() {
+        let first = render_uefi_inspection_report(b"loader", b"debug", b"symbols");
+        validate_uefi_inspection_report(first.as_bytes(), b"loader")
+            .expect("validate exact published loader binding");
+        assert!(first.contains(&format!(
+            "\"loader_sha256\": \"{}\"",
+            bytes_digest(b"loader")
+        )));
+        assert!(first.contains("\"loader_size\": 6"));
+        assert!(first.contains(&format!(
+            "\"debug_loader_sha256\": \"{}\"",
+            bytes_digest(b"debug")
+        )));
+        assert!(first.contains(&format!(
+            "\"debug_symbol_sha256\": \"{}\"",
+            bytes_digest(b"symbols")
+        )));
+        assert_ne!(
+            first,
+            render_uefi_inspection_report(b"loadeR", b"debug", b"symbols")
+        );
+        assert!(validate_uefi_inspection_report(first.as_bytes(), b"loadeR").is_err());
+
+        let false_verified = first.replace("\"verified\": true", "\"verified\": false");
+        assert!(validate_uefi_inspection_report(false_verified.as_bytes(), b"loader").is_err());
+        let extra_key = first.replace(
+            "  \"verified\": true\n",
+            "  \"verified\": true,\n  \"extra\": true\n",
+        );
+        assert!(validate_uefi_inspection_report(extra_key.as_bytes(), b"loader").is_err());
+        let malformed_debug_hash = first.replace(
+            &bytes_digest(b"debug"),
+            "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffG",
+        );
+        assert!(
+            validate_uefi_inspection_report(malformed_debug_hash.as_bytes(), b"loader").is_err()
+        );
     }
 
     #[test]

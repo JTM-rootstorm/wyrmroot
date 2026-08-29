@@ -10,19 +10,22 @@ if [ "$#" -ne 3 ] || [ ! -f "$1" ] || [ ! -s "$1" ] \
     exit 2
 fi
 
-json_escape() {
-    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/[[:cntrl:]]/ /g'
-}
-
 loader=$1
 debug_loader=$2
 debug_symbols=$3
-for tool in llvm-readobj llvm-pdbutil; do
+for tool in llvm-readobj llvm-pdbutil sha256sum wc; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         printf '{"schema_version":2,"report_kind":"wyrmroot-wyr0-uefi-artifact-inspection","verified":false,"failure":"%s unavailable"}\n' "$tool"
         exit 1
     fi
 done
+
+loader_sha256=$(sha256sum "$loader" | awk '{ print $1 }')
+loader_size=$(wc -c < "$loader" | tr -d ' ')
+debug_loader_sha256=$(sha256sum "$debug_loader" | awk '{ print $1 }')
+debug_loader_size=$(wc -c < "$debug_loader" | tr -d ' ')
+debug_symbol_sha256=$(sha256sum "$debug_symbols" | awk '{ print $1 }')
+debug_symbol_size=$(wc -c < "$debug_symbols" | tr -d ' ')
 
 headers=$(llvm-readobj --file-headers "$loader" 2>&1)
 header_status=$?
@@ -89,9 +92,15 @@ fi
 printf '{\n'
 printf '  "schema_version": 2,\n'
 printf '  "report_kind": "wyrmroot-wyr0-uefi-artifact-inspection",\n'
-printf '  "loader": "%s",\n' "$(json_escape "$(basename "$loader")")"
-printf '  "debug_loader": "%s",\n' "$(json_escape "$(basename "$debug_loader")")"
-printf '  "debug_symbol_artifact": "%s",\n' "$(json_escape "$(basename "$debug_symbols")")"
+printf '  "loader": "loader.efi",\n'
+printf '  "debug_loader": "loader.efi",\n'
+printf '  "debug_symbol_artifact": "loader.pdb",\n'
+printf '  "loader_sha256": "%s",\n' "$loader_sha256"
+printf '  "loader_size": %s,\n' "$loader_size"
+printf '  "debug_loader_sha256": "%s",\n' "$debug_loader_sha256"
+printf '  "debug_loader_size": %s,\n' "$debug_loader_size"
+printf '  "debug_symbol_sha256": "%s",\n' "$debug_symbol_sha256"
+printf '  "debug_symbol_size": %s,\n' "$debug_symbol_size"
 printf '  "pe32_plus": %s,\n' "$pe32_plus"
 printf '  "amd64": %s,\n' "$amd64"
 printf '  "efi_application": %s,\n' "$efi_application"

@@ -21,7 +21,33 @@ case "$#" in
         ;;
 esac
 
-if [ -L "$artifact" ] || [ ! -f "$artifact" ] || [ ! -s "$artifact" ]; then
+if [ "${WYRMROOT_INSPECTION_ARTIFACT_NAME+x}" = x ]; then
+    artifact_name=$WYRMROOT_INSPECTION_ARTIFACT_NAME
+    case "$artifact_name" in
+        ''|*[!a-z0-9_-]*)
+            printf '%s\n' 'native artifact report name is invalid' >&2
+            exit 2
+            ;;
+    esac
+else
+    # Preserve the established interface for non-sealed callers.
+    artifact_name=$(basename "$artifact")
+fi
+
+sealed_inspection=${WYRMROOT_SEALED_INSPECTION:-0}
+if [ "$sealed_inspection" = 1 ]; then
+    case "$artifact" in
+        /proc/self/fd/[0-9]*) ;;
+        *)
+            printf '%s\n' 'sealed native artifact must be a procfd path' >&2
+            exit 1
+            ;;
+    esac
+elif [ -L "$artifact" ]; then
+    printf '%s\n' 'native artifact must be a nonempty regular file, not a symbolic link' >&2
+    exit 1
+fi
+if [ ! -f "$artifact" ] || [ ! -s "$artifact" ]; then
     printf '%s\n' 'native artifact must be a nonempty regular file, not a symbolic link' >&2
     exit 1
 fi
@@ -222,8 +248,8 @@ fi
 sha256=$(sha256sum "$artifact" | awk '{ print $1 }')
 if [ "$inspection_mode" = production ]; then
     printf '{"schema_version":1,"report_kind":"wyrmroot-wyr0-native-artifact-inspection","verified":true,"artifact":"%s","sha256":"%s","size":%s,"osabi":%s,"abi_version":%s,"program_headers":%s,"load_segments":%s,"syscall_veneers":1}\n' \
-        "$(basename "$artifact")" "$sha256" "$size" "$osabi" "$abi_version" "$program_count" "$load_count"
+        "$artifact_name" "$sha256" "$size" "$osabi" "$abi_version" "$program_count" "$load_count"
 else
     printf '{"schema_version":1,"report_kind":"wyrmroot-wyr0-native-artifact-inspection","verified":true,"artifact":"%s","sha256":"%s","size":%s,"osabi":%s,"abi_version":%s,"program_headers":%s,"load_segments":%s,"syscall_veneers":1,"test_only_invalid_return_tails":1}\n' \
-        "$(basename "$artifact")" "$sha256" "$size" "$osabi" "$abi_version" "$program_count" "$load_count"
+        "$artifact_name" "$sha256" "$size" "$osabi" "$abi_version" "$program_count" "$load_count"
 fi

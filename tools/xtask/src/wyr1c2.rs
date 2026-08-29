@@ -7,9 +7,8 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env,
     ffi::{OsStr, OsString},
-    fs::{self, File, Permissions},
-    io::Read,
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    fs::{self, Permissions},
+    os::unix::fs::PermissionsExt,
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     time::{SystemTime, UNIX_EPOCH},
@@ -118,10 +117,7 @@ pub(crate) fn freeze(output: &Path) -> Result<String, Failure> {
                     },
                     scratch,
                 )?;
-                Ok((
-                    read_bounded_path(&uefi.loader, "loader", MAX_BYTES)?,
-                    uefi.inspection_report.into_bytes(),
-                ))
+                Ok((uefi.loader_bytes, uefi.inspection_report.into_bytes()))
             })?;
         let bootstrap_target = repository_tmp.create_scratch(
             &format!("{scratch_name}-bootstrap"),
@@ -209,6 +205,7 @@ pub(crate) fn freeze(output: &Path) -> Result<String, Failure> {
     verify_clean_revision(&repository, "Wyrmroot", &wyrm_revision)?;
     verify_clean_revision(&deep, "Deepwyrm", &deep_revision)?;
     toolchain.accepted().verify_unchanged()?;
+    verify_request_root_name(&base, &output_name, &root, &output.join(REQUEST_NAME))?;
     Ok(format!(
         "WYR1_C2_FREEZE_PASS selector=none evidence=not-produced request={}\n",
         output.join(REQUEST_NAME).display()
@@ -216,7 +213,7 @@ pub(crate) fn freeze(output: &Path) -> Result<String, Failure> {
 }
 
 pub(crate) fn image(request: &Path) -> Result<String, Failure> {
-    let (repository, _, deep, root) = open_request_root(request)?;
+    let (repository, _, deep, base, name, root) = open_request_root(request)?;
     let initial = validate_root(&repository, &deep, &root)?;
     let initial_request = initial.request.clone();
     let product = root.open_child("product", "C2 product")?;
@@ -251,6 +248,7 @@ pub(crate) fn image(request: &Path) -> Result<String, Failure> {
             "C2 request changed while constructing the ESP",
         ));
     }
+    verify_request_root_name(&base, &name, &root, request)?;
     Ok(format!(
         "WYR1_C2_IMAGE_PASS selector=none evidence=not-produced esp={}\n",
         root.path().join("product/esp.img").display()
@@ -258,8 +256,9 @@ pub(crate) fn image(request: &Path) -> Result<String, Failure> {
 }
 
 pub(crate) fn inspect(request: &Path) -> Result<String, Failure> {
-    let (repository, _, deep, root) = open_request_root(request)?;
+    let (repository, _, deep, base, name, root) = open_request_root(request)?;
     let snapshot = validate_root(&repository, &deep, &root)?;
+    verify_request_root_name(&base, &name, &root, request)?;
     Ok(format!(
         "WYR1_C2_INSPECTION_PASS selector=none evidence=not-produced request_sha256={}\n",
         sha256::bytes_digest(&snapshot.request)
@@ -297,6 +296,7 @@ fn validate_snapshot(
     mut snapshot: Snapshot,
 ) -> Result<Snapshot, Failure> {
     let c1 = wyr1c::validate_frozen_product(repository, &snapshot.c1)?;
+    crate::tasks::validate_uefi_inspection_report(&snapshot.loader_inspection, &snapshot.loader)?;
     if snapshot.source != SOURCE {
         return Err(Failure::task(
             "C2 source bytes differ from the reviewed source",
@@ -622,7 +622,9 @@ fn direct_output_name(output: &Path, base: &Path) -> Result<String, Failure> {
         .ok_or_else(|| Failure::task("C2 output name is not UTF-8"))
 }
 
-fn open_request_root(request: &Path) -> Result<(PathBuf, PathBuf, PathBuf, Directory), Failure> {
+fn open_request_root(
+    request: &Path,
+) -> Result<(PathBuf, PathBuf, PathBuf, Directory, String, Directory), Failure> {
     let (repository, project, deep, base) = project_context()?;
     if !request.is_absolute()
         || request.file_name() != Some(OsStr::new(REQUEST_NAME))
@@ -637,7 +639,23 @@ fn open_request_root(request: &Path) -> Result<(PathBuf, PathBuf, PathBuf, Direc
         .ok_or_else(|| Failure::task("C2 request has no product root"))?;
     let name = direct_output_name(parent, base.path())?;
     let root = base.open_child(&name, "C2 product root")?;
-    Ok((repository, project, deep, root))
+    verify_request_root_name(&base, &name, &root, request)?;
+    Ok((repository, project, deep, base, name, root))
+}
+
+fn verify_request_root_name(
+    base: &Directory,
+    name: &str,
+    root: &Directory,
+    request: &Path,
+) -> Result<(), Failure> {
+    base.verify_child_identity(name, root, 0o700, "C2 product root")?;
+    if request != root.path().join(REQUEST_NAME) {
+        return Err(Failure::task(
+            "C2 request path does not name the retained product generation",
+        ));
+    }
+    Ok(())
 }
 
 fn open_or_create_tmp(parent: &Directory, label: &str) -> Result<Directory, Failure> {
@@ -730,46 +748,6 @@ fn validate_abi_tree(deep: &Path, kernel_revision: &str) -> Result<(), Failure> 
         ));
     }
     Ok(())
-}
-
-fn read_bounded_path(path: &Path, label: &str, maximum: u64) -> Result<Vec<u8>, Failure> {
-    let mut file = File::open(path)
-        .map_err(|error| Failure::task(format!("could not open C2 {label}: {error}")))?;
-    let before = file
-        .metadata()
-        .map_err(|error| Failure::task(format!("could not stat C2 {label}: {error}")))?;
-    if !before.is_file() || before.nlink() != 1 || before.len() == 0 || before.len() > maximum {
-        return Err(Failure::task(format!(
-            "C2 {label} is not a bounded single-link regular file"
-        )));
-    }
-    let mut bytes = Vec::with_capacity(before.len() as usize);
-    file.by_ref()
-        .take(maximum + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| Failure::task(format!("could not read C2 {label}: {error}")))?;
-    let after = file
-        .metadata()
-        .map_err(|error| Failure::task(format!("could not recheck C2 {label}: {error}")))?;
-    if stable_file_identity(&before) != stable_file_identity(&after)
-        || bytes.len() as u64 != before.len()
-    {
-        return Err(Failure::task(format!("C2 {label} changed while reading")));
-    }
-    Ok(bytes)
-}
-
-fn stable_file_identity(metadata: &fs::Metadata) -> (u64, u64, u64, u64, i64, i64, i64, i64) {
-    (
-        metadata.dev(),
-        metadata.ino(),
-        metadata.nlink(),
-        metadata.len(),
-        metadata.mtime(),
-        metadata.mtime_nsec(),
-        metadata.ctime(),
-        metadata.ctime_nsec(),
-    )
 }
 
 fn decode_digest(value: &str) -> Result<[u8; 32], Failure> {
@@ -928,13 +906,10 @@ fn build_bootstrap(
     if !status.success() {
         return Err(Failure::task("C2 bootstrap build failed"));
     }
-    let artifact = read_bounded_path(
-        &target
-            .path()
-            .join(NATIVE_TARGET)
-            .join("release/wyrmroot-bootstrap"),
-        "bootstrap",
+    let artifact = target.read_producer(
+        &PathBuf::from(NATIVE_TARGET).join("release/wyrmroot-bootstrap"),
         MAX_BYTES,
+        "bootstrap",
     )?;
     target.verify_unchanged()?;
     Ok(artifact)
@@ -972,13 +947,10 @@ fn build_kernel(deep: &Path, target: &ScratchDirectory<'_>) -> Result<Vec<u8>, F
     if !status.success() {
         return Err(Failure::task("C2 production kernel build failed"));
     }
-    let artifact = read_bounded_path(
-        &target
-            .path()
-            .join(KERNEL_TARGET)
-            .join("release/deepwyrm-kernel"),
-        "kernel",
+    let artifact = target.read_producer(
+        &PathBuf::from(KERNEL_TARGET).join("release/deepwyrm-kernel"),
         MAX_BYTES,
+        "kernel",
     )?;
     target.verify_unchanged()?;
     Ok(artifact)
@@ -1012,7 +984,7 @@ fn reject_ambient() -> Result<(), Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{MetadataExt, symlink};
 
     #[test]
     fn reviewed_source_requires_byte_identity_and_semantic_identity() {
@@ -1160,5 +1132,30 @@ mod tests {
         let linked = Directory::open_exact(&linked, "linked parent").unwrap();
         assert!(open_or_create_tmp(&linked, "linked temporary root").is_err());
         fs::remove_dir_all(root).expect("remove container policy fixture");
+    }
+
+    #[test]
+    fn published_request_name_cannot_be_redirected_to_another_tree() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock precedes Unix epoch")
+            .as_nanos();
+        let parent = std::env::temp_dir().join(format!(
+            "wyrmroot-c2-published-name-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&parent).expect("create publication parent");
+        let base = Directory::open_exact(&parent, "publication parent").unwrap();
+        let root = base
+            .create_child("generation", 0o700, "generation")
+            .unwrap();
+        let request = parent.join("generation").join(REQUEST_NAME);
+        verify_request_root_name(&base, "generation", &root, &request).unwrap();
+
+        fs::rename(parent.join("generation"), parent.join("original")).unwrap();
+        fs::create_dir(parent.join("generation")).unwrap();
+        fs::set_permissions(parent.join("generation"), Permissions::from_mode(0o700)).unwrap();
+        assert!(verify_request_root_name(&base, "generation", &root, &request).is_err());
+        fs::remove_dir_all(parent).expect("remove publication fixture");
     }
 }

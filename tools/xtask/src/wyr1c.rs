@@ -8,15 +8,18 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env,
     ffi::{OsStr, OsString},
-    fs::{self, OpenOptions},
-    io::Read,
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    fs,
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::{error::Failure, metadata::BuildManifest, sha256};
+use crate::{
+    error::Failure,
+    metadata::BuildManifest,
+    secure_fs::{InheritableDirectory, SealedFile},
+    sha256,
+};
 use wyrmroot_bootfs::{
     archive::Archive,
     wyr1::{Product, ProductC1, WYR1_C1_MARKER, build_c1},
@@ -36,7 +39,6 @@ const NATIVE_TARGET: &str = "x86_64-unknown-wyrmroot";
 const MAX_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_BOOTFS_BYTES: usize = crate::g3_image::IMAGE_BYTES as usize;
 const MAX_REPORT_BYTES: usize = 64 * 1024;
-const O_NOFOLLOW: i32 = 0o400000;
 const INSPECTION_PATH: &str = "/usr/lib/llvm/22/bin:/usr/bin:/bin";
 const GATE_CONFIG: &[u8] =
     b"schema = 1\nproduct = \"wyr1-c1-host-only\"\nselector = \"none\"\nevidence = \"not-produced\"\n";
@@ -139,6 +141,7 @@ pub(crate) fn product(output: &Path) -> Result<String, Failure> {
     let parent = crate::secure_fs::Directory::open_exact(parent_path, "WYR1-C1 output parent")?;
     let output_directory = parent.create_child(name, 0o700, "WYR1-C1 output")?;
     let built = build_into(&output_directory)?;
+    parent.verify_child_identity(name, &output_directory, 0o700, "WYR1-C1 output")?;
     Ok(format!(
         "WYR1_C1_HOST_PRODUCT_PASS product_kind={PRODUCT_KIND} selector=none evidence=not-produced wyrmroot_revision={} rust_revision={ACCEPTED_RUST_REVISION} bootfs_sha256={} receipt={}\n",
         built.validated.wyrmroot_revision,
@@ -191,16 +194,15 @@ pub(crate) fn build_into(
         for spec in NATIVE_SPECS {
             toolchain.accepted().verify_unchanged()?;
             let artifact = scratch.with_inheritable_anchor("WYR1-C1 build scratch", |anchor| {
-                let build = anchor.path();
                 let mut artifact =
-                    build_native(&repository, &cargo_home, toolchain.accepted(), build, spec)?;
-                let built_path = build
-                    .join(spec.label)
-                    .join(NATIVE_TARGET)
-                    .join("release")
-                    .join(spec.artifact);
-                artifact.inspection =
-                    inspect_native(&repository, &built_path, &artifact.sha256, spec.label)?;
+                    build_native(&repository, &cargo_home, toolchain.accepted(), anchor, spec)?;
+                artifact.inspection = inspect_native(
+                    &repository,
+                    &artifact.bytes,
+                    &artifact.sha256,
+                    spec.label,
+                    anchor,
+                )?;
                 Ok(artifact)
             })?;
             artifacts.push(artifact);
@@ -438,10 +440,10 @@ fn build_native(
     repository: &Path,
     cargo_home: &Path,
     toolchain: &crate::toolchain_artifact::AcceptedToolchain,
-    build_directory: &Path,
+    build_directory: &InheritableDirectory,
     spec: NativeSpec,
 ) -> Result<NativeArtifact, Failure> {
-    let target = build_directory.join(spec.label);
+    let target = build_directory.path().join(spec.label);
     fs::create_dir(&target)
         .map_err(|error| Failure::task(format!("could not create native target: {error}")))?;
     let flags = native_remap_flags(repository, cargo_home, &target)?;
@@ -459,6 +461,7 @@ fn build_native(
         "--features",
         spec.features,
     ];
+    build_directory.verify_unchanged("WYR1-C1 build scratch")?;
     let status = Command::new(&toolchain.cargo)
         .args(arguments)
         .arg("--target-dir")
@@ -474,7 +477,9 @@ fn build_native(
         .env_remove("LD_PRELOAD")
         .current_dir(repository)
         .stdin(Stdio::null())
-        .status()
+        .status();
+    build_directory.verify_unchanged("WYR1-C1 build scratch")?;
+    let status = status
         .map_err(|error| Failure::task(format!("could not build {}: {error}", spec.label)))?;
     if !status.success() {
         return Err(Failure::task(format!(
@@ -482,11 +487,11 @@ fn build_native(
             spec.label
         )));
     }
-    let artifact = target
+    let artifact = PathBuf::from(spec.label)
         .join(NATIVE_TARGET)
         .join("release")
         .join(spec.artifact);
-    let bytes = read_bounded(&artifact, spec.label, MAX_ARTIFACT_BYTES, false)?;
+    let bytes = build_directory.read_producer(&artifact, MAX_ARTIFACT_BYTES as u64, spec.label)?;
     let sha256 = sha256::bytes_digest(&bytes);
     Ok(NativeArtifact {
         spec,
@@ -520,19 +525,29 @@ fn native_remap_flags(
 
 fn inspect_native(
     repository: &Path,
-    artifact: &Path,
+    bytes: &[u8],
     expected_sha256: &str,
     label: &str,
+    build_directory: &InheritableDirectory,
 ) -> Result<String, Failure> {
-    let output = Command::new("sh")
-        .arg(repository.join("toolchain/inspect-native-artifact.sh"))
-        .arg(artifact)
-        .current_dir(repository)
-        .env_clear()
-        .env("PATH", INSPECTION_PATH)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| Failure::task(format!("could not inspect WYR1-C1 {label}: {error}")))?;
+    let sealed = SealedFile::from_bytes(bytes, &format!("WYR1-C1 {label}"))?;
+    let output = build_directory.with_inheritance_disabled("WYR1-C1 build scratch", || {
+        sealed.with_inheritable_path(&format!("WYR1-C1 {label}"), |artifact| {
+            Command::new("sh")
+                .arg(repository.join("toolchain/inspect-native-artifact.sh"))
+                .arg(artifact)
+                .current_dir(repository)
+                .env_clear()
+                .env("PATH", INSPECTION_PATH)
+                .env("WYRMROOT_INSPECTION_ARTIFACT_NAME", label)
+                .env("WYRMROOT_SEALED_INSPECTION", "1")
+                .stdin(Stdio::null())
+                .output()
+                .map_err(|error| {
+                    Failure::task(format!("could not inspect WYR1-C1 {label}: {error}"))
+                })
+        })
+    })?;
     if !output.status.success()
         || output.stdout.is_empty()
         || output.stdout.len() > MAX_REPORT_BYTES
@@ -544,14 +559,7 @@ fn inspect_native(
     }
     let report = String::from_utf8(output.stdout)
         .map_err(|_| Failure::task("WYR1-C1 native inspection report is not UTF-8"))?;
-    if !report.contains("\"verified\":true")
-        || !report.contains(&format!("\"sha256\":\"{expected_sha256}\""))
-        || !report.ends_with('\n')
-    {
-        return Err(Failure::task(format!(
-            "WYR1-C1 native inspection did not bind the exact {label} artifact"
-        )));
-    }
+    validate_inspection(&report, label, expected_sha256, bytes.len())?;
     Ok(report)
 }
 
@@ -1188,50 +1196,6 @@ fn verify_repository_revision(repository: &Path, expected: &str) -> Result<(), F
         ));
     }
     Ok(())
-}
-
-fn read_bounded(
-    path: &Path,
-    label: &str,
-    maximum: usize,
-    require_single_link: bool,
-) -> Result<Vec<u8>, Failure> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| Failure::task(format!("could not inspect WYR1-C1 {label}: {error}")))?;
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.len() == 0
-        || metadata.len() > maximum as u64
-        || (require_single_link && metadata.nlink() != 1)
-    {
-        return Err(Failure::task(format!(
-            "WYR1-C1 {label} is not a bounded regular file"
-        )));
-    }
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(O_NOFOLLOW)
-        .open(path)
-        .map_err(|error| Failure::task(format!("could not open WYR1-C1 {label}: {error}")))?;
-    let opened = file
-        .metadata()
-        .map_err(|error| Failure::task(format!("could not stat WYR1-C1 {label}: {error}")))?;
-    if (metadata.dev(), metadata.ino()) != (opened.dev(), opened.ino()) {
-        return Err(Failure::task(format!(
-            "WYR1-C1 {label} changed before opening"
-        )));
-    }
-    let mut bytes = Vec::with_capacity(opened.len() as usize);
-    Read::by_ref(&mut file)
-        .take(maximum as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| Failure::task(format!("could not read WYR1-C1 {label}: {error}")))?;
-    if bytes.len() != opened.len() as usize {
-        return Err(Failure::task(format!(
-            "WYR1-C1 {label} changed while reading"
-        )));
-    }
-    Ok(bytes)
 }
 
 fn digest_array(value: &str) -> Result<[u8; 32], Failure> {
