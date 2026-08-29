@@ -1,7 +1,8 @@
 # Wyrmroot WYR1-C Device Coordinator Contract
 
-**Status:** Reached WYR1-C0 contract; hardware-independent C1 implementation may proceed  
-**Reached:** 2026-08-29  
+**Status:** Reached WYR1-C0 contract and WYR1-C1 host/native implementation
+**Reached:** 2026-08-29
+**Validation:** [`WYR1_C1_VALIDATION.md`](WYR1_C1_VALIDATION.md)
 **Scope:** Static q35 COM2 role policy, coordinator state and identity, manifest,
 driver-control protocol, restart ordering, and the truthful pre-DW1-D waiting
 state  
