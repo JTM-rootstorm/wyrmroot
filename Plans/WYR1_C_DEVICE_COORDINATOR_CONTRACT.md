@@ -1,8 +1,10 @@
 # Wyrmroot WYR1-C Device Coordinator Contract
 
-**Status:** Reached WYR1-C0 contract and WYR1-C1 host/native implementation
+**Status:** Reached WYR1-C0 contract, WYR1-C1 host/native implementation, and
+WYR1-C2 deterministic unselected product isolation
 **Reached:** 2026-08-29
-**Validation:** [`WYR1_C1_VALIDATION.md`](WYR1_C1_VALIDATION.md)
+**Validation:** [`WYR1_C1_VALIDATION.md`](WYR1_C1_VALIDATION.md) and
+[`WYR1_C2_VALIDATION.md`](WYR1_C2_VALIDATION.md)
 **Scope:** Static q35 COM2 role policy, coordinator state and identity, manifest,
 driver-control protocol, restart ordering, and the truthful pre-DW1-D waiting
 state  
@@ -257,9 +259,12 @@ Before C0 closes, host tests must prove:
 C1 then adds a separate static no_std `system/devmgr` artifact. Its focused
 host/native tests prove exact startup validation, operational READY, structured
 waiting status, blocking wait behavior, and inability to claim device-bound
-success. A WYR1-C-specific guest product is required before the C1 live gate,
-but selector-29 reservation, hardware intake, and WYR1-C closure remain later
-work packages.
+success. C2 adds a deterministic unselected product that binds the reviewed
+source and canonical WRDM, real devmgr, retained acceptance actor, WRRM,
+bootfs, production loader/kernel/bootstrap, observation policy, and ESP by
+hash. It provides freeze, image, and inspect only; selector-29 reservation,
+guest execution/evidence, hardware intake, and WYR1-C closure remain later work
+packages.
 
 ## 11. Historical-product isolation and nonclaims
 

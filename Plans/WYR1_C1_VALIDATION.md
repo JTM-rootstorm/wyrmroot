@@ -108,8 +108,9 @@ the execution-order contract: the real devmgr exists, is selected only by a
 new product, validates static policy, becomes operational, exposes bounded
 waiting/rebind status, and cannot claim device success.
 
-The product is deliberately unnumbered and host-only. C2 remains responsible
-for guest-product/request/inspection isolation and any admitted intermediate
+The product is deliberately unnumbered and host-only. C2 subsequently reached
+the deterministic unselected request/image/inspection product gate recorded in
+[`WYR1_C2_VALIDATION.md`](WYR1_C2_VALIDATION.md), still without a guest run or
 observation path. Selector 29 remains reserved for the later post-DW1-D device
 authority gate. Selectors 25, 27, and 28 are not reinterpreted. No manual boot
 or debugger observation is promoted to structured acceptance evidence.
