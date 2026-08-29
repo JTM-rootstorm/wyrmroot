@@ -1,4 +1,6 @@
-use deepwyrm_syscall::{DwHandle, DwHandleTransferV1, DwMemoryProtection, DwRights};
+use deepwyrm_syscall::{
+    DW_HANDLE_TRANSFER_MOVE, DwHandle, DwHandleTransferV1, DwMemoryProtection, DwRights,
+};
 use wyrmroot_loader::{
     elf::{STACK_BOTTOM, STACK_BYTES},
     launch::LaunchProfile,
@@ -6,9 +8,9 @@ use wyrmroot_loader::{
         DeviceCoordinatorLoadError, DeviceCoordinatorLoadRequest, DeviceDriverLoadError,
         DeviceDriverLoadRequest, JobLoadError, JobLoadRequest, LoadAuthority, LoadError, LoadFault,
         LoadRequest, LoadStage, LoaderPlatform, ParentMapping, ProcessCreateRequest,
-        ProcessCreateResult, ServiceLoadError, ServiceLoadRequest, load_device_coordinator_process,
-        load_device_driver_process, load_job_process, load_process, load_process_with_fault,
-        load_service_process,
+        ProcessCreateResult, ResourceDomainLoadRequest, ServiceLoadError, ServiceLoadRequest,
+        load_device_coordinator_process, load_device_driver_process, load_job_process,
+        load_process, load_process_with_fault, load_resource_domain_process, load_service_process,
     },
 };
 use wyrmroot_registry_proto::{Correlation, CorrelationEnvironment};
@@ -394,6 +396,138 @@ fn probe_child_delegates_only_its_self_root_in_the_wrpl_1_1_init() {
     );
     assert!(!platform.events.contains(&Event::Duplicate(2)));
     assert!(!platform.events.contains(&Event::Duplicate(3)));
+}
+
+#[test]
+fn resource_domain_process_moves_the_exact_four_capabilities() {
+    let mut platform = Mock::new(None);
+    let image = executable();
+    let resource_domain = DwHandle(0x940);
+    load_resource_domain_process(
+        &mut platform,
+        authority(),
+        ResourceDomainLoadRequest {
+            image: &image,
+            display_path: "/system/init",
+            resource_domain,
+            transaction_id: 0xd501,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(platform.sent_init.len(), 72);
+    assert_eq!(&platform.sent_init[6..8], &7_u16.to_le_bytes());
+    assert_eq!(&platform.sent_init[20..24], &4_u32.to_le_bytes());
+    assert_eq!(
+        platform
+            .sent_transfers
+            .iter()
+            .map(|transfer| transfer.operation)
+            .collect::<Vec<_>>(),
+        vec![DW_HANDLE_TRANSFER_MOVE; 4]
+    );
+    assert_eq!(
+        platform
+            .sent_transfers
+            .iter()
+            .map(|transfer| transfer.requested_rights)
+            .collect::<Vec<_>>(),
+        vec![
+            wyrmroot_loader::launch::SELF_ROOT_RIGHTS,
+            wyrmroot_loader::launch::BOOTFS_RIGHTS,
+            wyrmroot_loader::launch::LOADER_TASK_GROUP_RIGHTS,
+            wyrmroot_loader::launch::RESOURCE_DOMAIN_CUSTODY_RIGHTS,
+        ]
+    );
+    assert_eq!(
+        platform
+            .sent_transfers
+            .iter()
+            .map(|transfer| transfer.handle)
+            .collect::<Vec<_>>(),
+        vec![DwHandle(14), DwHandle(19), DwHandle(20), DwHandle(21)]
+    );
+    assert!(
+        platform
+            .events
+            .contains(&Event::Duplicate(resource_domain.0))
+    );
+}
+
+#[test]
+fn resource_domain_failed_move_closes_the_delegated_fourth_handle() {
+    let mut platform = Mock::new(Some("send"));
+    let image = executable();
+    let resource_domain = DwHandle(0x950);
+    let error = load_resource_domain_process(
+        &mut platform,
+        authority(),
+        ResourceDomainLoadRequest {
+            image: &image,
+            display_path: "/system/init",
+            resource_domain,
+            transaction_id: 0xd502,
+        },
+    )
+    .expect_err("failed MOVE must roll back the delegated resource-domain duplicate");
+
+    assert_eq!(
+        error,
+        LoadError::Platform {
+            stage: LoadStage::InitSend,
+            cause: "send",
+            rollback_failed: false,
+        }
+    );
+    assert_eq!(platform.sent_transfers.len(), 4);
+    let delegated_domain = platform.sent_transfers[3].handle;
+    assert_eq!(delegated_domain, DwHandle(21));
+    assert_eq!(
+        platform
+            .events
+            .iter()
+            .filter(|event| **event == Event::Close(delegated_domain.0))
+            .count(),
+        1
+    );
+    assert!(!platform.events.contains(&Event::Close(resource_domain.0)));
+}
+
+#[test]
+fn historical_supervisor_profile_remains_the_three_capability_wrpl_1_2_shape() {
+    let mut platform = Mock::new(None);
+    let image = executable();
+    load_process(
+        &mut platform,
+        authority(),
+        request(&image, LaunchProfile::Supervisor),
+    )
+    .unwrap();
+
+    assert_eq!(platform.sent_init.len(), 64);
+    assert_eq!(&platform.sent_init[6..8], &2_u16.to_le_bytes());
+    assert_eq!(&platform.sent_init[20..24], &3_u32.to_le_bytes());
+    assert_eq!(platform.sent_transfers.len(), 3);
+    assert_eq!(
+        platform
+            .sent_transfers
+            .iter()
+            .map(|transfer| transfer.operation)
+            .collect::<Vec<_>>(),
+        vec![DW_HANDLE_TRANSFER_MOVE; 3]
+    );
+    assert_eq!(
+        platform
+            .sent_transfers
+            .iter()
+            .map(|transfer| transfer.requested_rights)
+            .collect::<Vec<_>>(),
+        vec![
+            wyrmroot_loader::launch::SELF_ROOT_RIGHTS,
+            wyrmroot_loader::launch::BOOTFS_RIGHTS,
+            wyrmroot_loader::launch::LOADER_TASK_GROUP_RIGHTS,
+        ]
+    );
 }
 
 #[test]

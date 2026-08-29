@@ -1,7 +1,10 @@
 # WYR1-C D5 custody seam
 
-**Status:** Wyrmroot host-model and protocol/profile substrate reached; the
-kernel-side selected-product producer remains a Deepwyrm D5 dependency.
+**Status:** Deepwyrm's D5 primordial producer substrate is now implemented in
+the coordinator tree. This Wyrmroot lane provides only the corresponding
+host-model and protocol/profile substrate: it has not pinned or consumed an
+exact Deepwyrm producer revision, and no selected product performs live WRBP
+V3 intake.
 
 ## Reached Wyrmroot substrate
 
@@ -19,10 +22,10 @@ kernel-side selected-product producer remains a Deepwyrm D5 dependency.
 
 ## Exact remaining integration seam
 
-The current primordial kernel sender and the current Wyrmroot bootstrap/system
-init production intake remain the historical V2 three-capability path. They
-must be switched together only after Deepwyrm D5 creates and sends the
-kernel-minted resource-domain TaskGroup. The integration change must:
+The producer no longer waits on creation, but its selected-product
+four-capability output has not yet been consumed by an exact paired Wyrmroot
+revision. The current Wyrmroot bootstrap/system-init production intake remains
+the historical V2 three-capability path. A coordinated integration change must:
 
 1. select WRBP V3 only for the D5 product and preserve every historical V1/V2
    profile unchanged;
@@ -35,4 +38,6 @@ kernel-minted resource-domain TaskGroup. The integration change must:
 
 That future work is D5 custody integration only. It does not authorize C4
 resource claim, DeviceResource/Interrupt bundle, `DRIVER_READY`, UART, or
-selector evidence.
+selector evidence. In particular, this document makes no live intake, claim,
+or guest-acceptance assertion; its Wyrmroot evidence is limited to the host
+protocol/profile and custody model.
