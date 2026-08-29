@@ -51,6 +51,7 @@ const OBSERVATION: &str = concat!(
 pub(crate) fn freeze(output: &Path) -> Result<String, Failure> {
     reject_ambient()?;
     reject_nonempty(output)?;
+    validate_freeze_output(output)?;
     // C1 already enforces the accepted a92dc7f toolchain, clean Wyrmroot
     // revision, isolated offline native builds, and fresh output.  C2 wraps
     // that exact product rather than duplicating those assumptions.
@@ -98,6 +99,10 @@ pub(crate) fn freeze(output: &Path) -> Result<String, Failure> {
         &output.join("inspections/loader-c2.json"),
         uefi.inspection_report.as_bytes(),
     )?;
+    fs::remove_dir_all(&build)
+        .map_err(|e| Failure::task(format!("could not retire C2 build root: {e}")))?;
+    fs::remove_dir_all(output.join("deepwyrm-target"))
+        .map_err(|e| Failure::task(format!("could not retire C2 kernel target: {e}")))?;
     write_new(&artifacts.join("provenance.toml"), format!("kind = \"wyrmroot-wyr1-c2-production-provenance\"\nwyrmroot_revision = \"{wyrm_revision}\"\ndeepwyrm_revision = \"{deep_revision}\"\nloader_command = \"deterministic-release-uefi\"\nkernel_command = \"tools/pinned-cargo target build --locked --offline --release --target x86_64-unknown-none --package deepwyrm-kernel --bin deepwyrm-kernel\"\nbootstrap_command = \"accepted-cargo native bootstrap\"\n").as_bytes())?;
     let product = output.join("product");
     let source = product.join(SOURCE_NAME);
@@ -262,6 +267,8 @@ pub(crate) fn inspect(request: &Path) -> Result<String, Failure> {
         "provenance",
         "wyrmroot_revision",
         "deepwyrm_revision",
+        "generated_abi_revision",
+        "generated_abi_tree",
         "output",
     ]
     .into_iter()
@@ -555,6 +562,37 @@ fn checked_root(request: &Path) -> Result<PathBuf, Failure> {
     Ok(root)
 }
 
+fn validate_freeze_output(output: &Path) -> Result<(), Failure> {
+    if output.file_name().is_none()
+        || output.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(Failure::task("C2 output path is not canonical"));
+    }
+    let repository = crate::tasks::repository_root()?;
+    let project = fs::canonicalize(
+        repository
+            .parent()
+            .ok_or_else(|| Failure::task("C2 source has no project root"))?,
+    )
+    .map_err(|e| Failure::task(format!("could not resolve C2 project root: {e}")))?;
+    let parent = output
+        .parent()
+        .ok_or_else(|| Failure::task("C2 output has no parent"))?;
+    let parent = fs::canonicalize(parent)
+        .map_err(|e| Failure::task(format!("could not resolve C2 output parent: {e}")))?;
+    if !parent.starts_with(project.join("artifacts/wyr1-c")) {
+        return Err(Failure::task(
+            "C2 output must be below canonical artifacts/wyr1-c",
+        ));
+    }
+    Ok(())
+}
+
 fn receipt_matches_request(
     receipt: &BTreeMap<String, String>,
     request: &BTreeMap<String, String>,
@@ -684,6 +722,7 @@ fn validate_c1_tuple(
             .get(&format!("{label}_sha256"))
             .ok_or_else(|| Failure::task("C2 C1 lacks component hash"))?;
         let artifact = read_regular(&root.join("artifacts").join(format!("{label}.elf")))?;
+        let inspection = read_regular(&root.join("inspections").join(format!("{label}.json")))?;
         let embedded = archive
             .lookup(path)
             .map_err(|_| Failure::task("C2 bootfs lacks C1 component"))?
@@ -691,6 +730,9 @@ fn validate_c1_tuple(
         if sha256::bytes_digest(&artifact) != *expected
             || artifact.as_slice() != embedded
             || c1.get(&format!("{label}_path")) != Some(&format!("artifacts/{label}.elf"))
+            || c1.get(&format!("{label}_inspection_sha256"))
+                != Some(&sha256::bytes_digest(&inspection))
+            || !String::from_utf8_lossy(&inspection).contains(&format!("\"sha256\":\"{expected}\""))
         {
             return Err(Failure::task("C2 C1 component tuple drifted"));
         }
