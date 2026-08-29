@@ -119,6 +119,18 @@ pub(crate) struct DeterministicUefiArtifacts {
     pub(crate) effective_config_sha256: String,
     pub(crate) inspection_report: String,
     pub(crate) inspection_report_sha256: String,
+    _target_authority: Option<UefiTargetAuthority>,
+}
+
+struct UefiTargetAuthority {
+    _production: crate::secure_fs::InheritableDirectory,
+    _retained_debug: crate::secure_fs::InheritableDirectory,
+}
+
+struct PreparedUefiTargetRoots {
+    production: PathBuf,
+    retained_debug: PathBuf,
+    authority: Option<UefiTargetAuthority>,
 }
 
 impl LoaderToolchain {
@@ -448,23 +460,41 @@ pub(crate) fn build_deterministic_uefi_pair(
     layout: &DeepLayoutBuild,
     build: &IsolatedUefiBuild<'_>,
 ) -> Result<DeterministicUefiArtifacts, Failure> {
-    fs::create_dir_all(build.production_target).map_err(|error| {
-        Failure::task(format!(
-            "could not create production UEFI target root: {error}"
-        ))
-    })?;
-    fs::create_dir_all(build.retained_debug_target).map_err(|error| {
-        Failure::task(format!(
-            "could not create retained-debug UEFI target root: {error}"
-        ))
-    })?;
+    build_deterministic_uefi_pair_with_authority(
+        repository, toolchain, profile, layout, build, None,
+    )
+}
+
+pub(crate) fn build_deterministic_uefi_pair_in_scratch(
+    repository: &Path,
+    toolchain: &LoaderToolchain,
+    profile: &LoaderProfile,
+    layout: &DeepLayoutBuild,
+    build: &IsolatedUefiBuild<'_>,
+    scratch: &crate::secure_fs::InheritableDirectory,
+) -> Result<DeterministicUefiArtifacts, Failure> {
+    build_deterministic_uefi_pair_with_authority(
+        repository,
+        toolchain,
+        profile,
+        layout,
+        build,
+        Some(scratch),
+    )
+}
+
+fn build_deterministic_uefi_pair_with_authority(
+    repository: &Path,
+    toolchain: &LoaderToolchain,
+    profile: &LoaderProfile,
+    layout: &DeepLayoutBuild,
+    build: &IsolatedUefiBuild<'_>,
+    scratch: Option<&crate::secure_fs::InheritableDirectory>,
+) -> Result<DeterministicUefiArtifacts, Failure> {
     let cargo_home = canonical_build_directory(build.cargo_home, "Cargo home")?;
-    let production_target =
-        canonical_build_directory(build.production_target, "production UEFI target root")?;
-    let retained_debug_target = canonical_build_directory(
-        build.retained_debug_target,
-        "retained-debug UEFI target root",
-    )?;
+    let target_roots = prepare_uefi_target_roots(build, scratch)?;
+    let production_target = &target_roots.production;
+    let retained_debug_target = &target_roots.retained_debug;
     run_uefi_cargo(
         repository,
         toolchain,
@@ -472,7 +502,7 @@ pub(crate) fn build_deterministic_uefi_pair(
         layout,
         &UefiCargoInvocation {
             cargo_home: &cargo_home,
-            target_directory: &production_target,
+            target_directory: production_target,
             cargo_profile: build.cargo_profile,
             link_mode: LoaderLinkMode::Production,
             operation: UefiCargoOperation::Check,
@@ -485,7 +515,7 @@ pub(crate) fn build_deterministic_uefi_pair(
         layout,
         &UefiCargoInvocation {
             cargo_home: &cargo_home,
-            target_directory: &retained_debug_target,
+            target_directory: retained_debug_target,
             cargo_profile: build.cargo_profile,
             link_mode: LoaderLinkMode::RetainedDebug,
             operation: UefiCargoOperation::Build,
@@ -498,7 +528,7 @@ pub(crate) fn build_deterministic_uefi_pair(
         layout,
         &UefiCargoInvocation {
             cargo_home: &cargo_home,
-            target_directory: &production_target,
+            target_directory: production_target,
             cargo_profile: build.cargo_profile,
             link_mode: LoaderLinkMode::Production,
             operation: UefiCargoOperation::Build,
@@ -544,6 +574,50 @@ pub(crate) fn build_deterministic_uefi_pair(
         effective_config,
         inspection_report_sha256: bytes_digest(inspection_report.as_bytes()),
         inspection_report,
+        _target_authority: target_roots.authority,
+    })
+}
+
+fn prepare_uefi_target_roots(
+    build: &IsolatedUefiBuild<'_>,
+    scratch: Option<&crate::secure_fs::InheritableDirectory>,
+) -> Result<PreparedUefiTargetRoots, Failure> {
+    if let Some(scratch) = scratch {
+        let production = scratch
+            .create_inheritable_child(build.production_target, "production UEFI target root")?;
+        let retained_debug = scratch.create_inheritable_child(
+            build.retained_debug_target,
+            "retained-debug UEFI target root",
+        )?;
+        return Ok(PreparedUefiTargetRoots {
+            production: production.path().to_path_buf(),
+            retained_debug: retained_debug.path().to_path_buf(),
+            authority: Some(UefiTargetAuthority {
+                _production: production,
+                _retained_debug: retained_debug,
+            }),
+        });
+    }
+    fs::create_dir_all(build.production_target).map_err(|error| {
+        Failure::task(format!(
+            "could not create production UEFI target root: {error}"
+        ))
+    })?;
+    fs::create_dir_all(build.retained_debug_target).map_err(|error| {
+        Failure::task(format!(
+            "could not create retained-debug UEFI target root: {error}"
+        ))
+    })?;
+    Ok(PreparedUefiTargetRoots {
+        production: canonical_build_directory(
+            build.production_target,
+            "production UEFI target root",
+        )?,
+        retained_debug: canonical_build_directory(
+            build.retained_debug_target,
+            "retained-debug UEFI target root",
+        )?,
+        authority: None,
     })
 }
 
@@ -917,10 +991,14 @@ fn child_status(code: Option<i32>) -> String {
 mod tests {
     use super::{
         BOOTFS_BUILD_ARGUMENTS, BOOTFS_PACKAGE, BOOTFS_TEST_ARGUMENTS, DW1C_INIT0_TEST_ARGUMENTS,
-        LoaderLinkMode, blocked_toolchain_failure, component_package, encoded_uefi_rustflags,
-        explicit_test_filter, host_test_arguments, host_test_commands, validate_regular_artifact,
+        IsolatedUefiBuild, LoaderLinkMode, UefiCargoProfile, blocked_toolchain_failure,
+        canonical_build_directory, component_package, encoded_uefi_rustflags, explicit_test_filter,
+        host_test_arguments, host_test_commands, prepare_uefi_target_roots,
+        validate_regular_artifact,
     };
+    use crate::error::Failure;
     use std::fs;
+    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -1068,6 +1146,62 @@ mod tests {
         assert!(!debug_flags.contains("link-arg=/debug:none"));
 
         fs::remove_dir_all(&root).expect("remove isolated test directory");
+    }
+
+    #[test]
+    fn scoped_uefi_targets_accept_retained_procfd_and_reach_child_process() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock precedes Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "wyrmroot-xtask-scoped-uefi-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).expect("create isolated test directory");
+        let parent =
+            crate::secure_fs::Directory::open_exact(&root, "test root").expect("open test root");
+        let scratch = parent
+            .create_scratch("scratch", "test scratch")
+            .expect("create test scratch");
+        let result = scratch.with_inheritable_anchor("test scratch", |authority| {
+            let production = authority.path().join("uefi-production");
+            let retained = authority.path().join("uefi-retained");
+            assert!(
+                canonical_build_directory(&production, "ordinary target").is_err(),
+                "general canonical validator unexpectedly admitted procfd target"
+            );
+            let build = IsolatedUefiBuild {
+                cargo_home: &root,
+                production_target: &production,
+                retained_debug_target: &retained,
+                cargo_profile: UefiCargoProfile::Release,
+            };
+            let targets = prepare_uefi_target_roots(&build, Some(authority))?;
+            let production = &targets.production;
+            let retained = &targets.retained_debug;
+            let status = Command::new("sh")
+                .args([
+                    "-c",
+                    "printf production > \"$1/child\" && printf retained > \"$2/child\"",
+                    "sh",
+                ])
+                .arg(production)
+                .arg(retained)
+                .status()
+                .map_err(|error| Failure::task(format!("could not spawn target test: {error}")))?;
+            if !status.success() {
+                return Err(Failure::task("scoped target test child failed"));
+            }
+            if fs::read(production.join("child")).ok().as_deref() != Some(b"production")
+                || fs::read(retained.join("child")).ok().as_deref() != Some(b"retained")
+            {
+                return Err(Failure::task("scoped target child output drifted"));
+            }
+            Ok(())
+        });
+        scratch.finish(result).expect("retire test scratch");
+        fs::remove_dir_all(root).expect("remove isolated test directory");
     }
 
     #[cfg(unix)]

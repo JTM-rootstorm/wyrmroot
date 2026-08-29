@@ -95,8 +95,9 @@ pub(crate) fn freeze(output: &Path) -> Result<String, Failure> {
     let scratch = tmp.create_scratch(&scratch_name, "WYR1-C2 build scratch")?;
     let build_result = (|| {
         let (loader, loader_inspection) =
-            scratch.with_inheritable_anchor("WYR1-C2 UEFI build scratch", |build| {
-                let uefi = crate::tasks::build_deterministic_uefi_pair(
+            scratch.with_inheritable_anchor("WYR1-C2 UEFI build scratch", |scratch| {
+                let build = scratch.path();
+                let uefi = crate::tasks::build_deterministic_uefi_pair_in_scratch(
                     &repository,
                     &toolchain,
                     &profile,
@@ -107,19 +108,26 @@ pub(crate) fn freeze(output: &Path) -> Result<String, Failure> {
                         retained_debug_target: &build.join("uefi-debug"),
                         cargo_profile: crate::tasks::UefiCargoProfile::Release,
                     },
+                    scratch,
                 )?;
                 Ok((
                     read_bounded_path(&uefi.loader, "loader", MAX_BYTES)?,
                     uefi.inspection_report.into_bytes(),
                 ))
             })?;
-        let bootstrap = scratch
-            .with_inheritable_anchor("WYR1-C2 bootstrap build scratch", |build| {
-                build_bootstrap(&repository, &cargo_home, toolchain.accepted(), build)
+        let bootstrap =
+            scratch.with_inheritable_anchor("WYR1-C2 bootstrap build scratch", |scratch| {
+                build_bootstrap(
+                    &repository,
+                    &cargo_home,
+                    toolchain.accepted(),
+                    scratch.path(),
+                )
             })?;
-        let kernel = scratch.with_inheritable_anchor("WYR1-C2 kernel build scratch", |build| {
-            build_kernel(&deep, &build.join("deepwyrm-target"))
-        })?;
+        let kernel = scratch
+            .with_inheritable_anchor("WYR1-C2 kernel build scratch", |scratch| {
+                build_kernel(&deep, &scratch.path().join("deepwyrm-target"))
+            })?;
         Ok::<_, Failure>((loader, loader_inspection, bootstrap, kernel))
     })();
     let (loader, loader_inspection, bootstrap, kernel) = scratch.finish(build_result)?;

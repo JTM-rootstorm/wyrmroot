@@ -190,7 +190,8 @@ pub(crate) fn build_into(
         let mut artifacts = Vec::with_capacity(NATIVE_SPECS.len());
         for spec in NATIVE_SPECS {
             toolchain.accepted().verify_unchanged()?;
-            let artifact = scratch.with_inheritable_anchor("WYR1-C1 build scratch", |build| {
+            let artifact = scratch.with_inheritable_anchor("WYR1-C1 build scratch", |anchor| {
+                let build = anchor.path();
                 let mut artifact =
                     build_native(&repository, &cargo_home, toolchain.accepted(), build, spec)?;
                 let built_path = build

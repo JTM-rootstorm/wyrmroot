@@ -122,7 +122,7 @@ impl Directory {
     pub(crate) fn with_inheritable_anchor<T>(
         &self,
         label: &str,
-        operation: impl FnOnce(&Path) -> Result<T, Failure>,
+        operation: impl FnOnce(&InheritableDirectory) -> Result<T, Failure>,
     ) -> Result<T, Failure> {
         // SAFETY: fcntl borrows the live directory fd and returns a fresh fd.
         let duplicate = unsafe { fcntl(self.file.as_raw_fd(), F_DUPFD, 3) };
@@ -147,9 +147,13 @@ impl Directory {
         {
             return Err(Failure::task(format!("{label} duplicate changed identity")));
         }
-        let anchor = PathBuf::from(format!("/proc/self/fd/{duplicate}"));
-        let result = operation(&anchor);
+        let inherited = InheritableDirectory {
+            anchor: PathBuf::from(format!("/proc/self/fd/{duplicate}")),
+            file: inherited,
+        };
+        let result = operation(&inherited);
         let after = inherited
+            .file
             .metadata()
             .map_err(|error| Failure::task(format!("could not recheck {label}: {error}")))?;
         drop(inherited);
@@ -343,6 +347,71 @@ impl Directory {
             )));
         }
         unlink_component(self.file.as_raw_fd(), name.as_bytes(), AT_REMOVEDIR, label)
+    }
+}
+
+pub(crate) struct InheritableDirectory {
+    file: File,
+    anchor: PathBuf,
+}
+
+impl InheritableDirectory {
+    pub(crate) fn path(&self) -> &Path {
+        &self.anchor
+    }
+
+    pub(crate) fn create_inheritable_child(
+        &self,
+        path: &Path,
+        label: &str,
+    ) -> Result<InheritableDirectory, Failure> {
+        if path.parent() != Some(self.anchor.as_path()) {
+            return Err(Failure::task(format!(
+                "{label} is not a direct child of the retained scratch directory"
+            )));
+        }
+        let name = path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .ok_or_else(|| Failure::task(format!("{label} name is not UTF-8")))?;
+        let name = component(name, label)?;
+        // SAFETY: name is NUL-terminated and the inherited scratch fd remains
+        // live for this call and subsequent child execution.
+        if unsafe { mkdirat(self.file.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+            return Err(Failure::task(format!(
+                "could not create {label}: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let child = open_directory_at(Some(self.file.as_raw_fd()), name.as_bytes(), label)?;
+        let child_metadata = child
+            .metadata()
+            .map_err(|error| Failure::task(format!("could not stat {label}: {error}")))?;
+        if !child_metadata.is_dir() {
+            return Err(Failure::task(format!("{label} is not a real directory")));
+        }
+        // SAFETY: fcntl borrows the live child fd and returns a fresh fd. The
+        // non-CLOEXEC duplicate is intentionally scoped to the returned
+        // authority so spawned build tools can traverse its procfd anchor.
+        let duplicate = unsafe { fcntl(child.as_raw_fd(), F_DUPFD, 3) };
+        if duplicate < 0 {
+            return Err(Failure::task(format!(
+                "could not retain {label}: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: F_DUPFD returned a fresh owned descriptor without CLOEXEC.
+        let inherited = unsafe { File::from_raw_fd(duplicate) };
+        let inherited_metadata = inherited
+            .metadata()
+            .map_err(|error| Failure::task(format!("could not recheck {label}: {error}")))?;
+        if object_identity(&child_metadata) != object_identity(&inherited_metadata) {
+            return Err(Failure::task(format!("{label} changed while retaining it")));
+        }
+        Ok(InheritableDirectory {
+            file: inherited,
+            anchor: PathBuf::from(format!("/proc/self/fd/{duplicate}")),
+        })
     }
 }
 
@@ -686,10 +755,10 @@ mod tests {
         fs::rename(&original, &moved).unwrap();
         symlink(&outside, &original).unwrap();
         scratch
-            .with_inheritable_anchor("scratch", |anchor| {
+            .with_inheritable_anchor("scratch", |scratch| {
                 let status = Command::new("sh")
                     .args(["-c", "printf child > \"$1/child\"", "sh"])
-                    .arg(anchor)
+                    .arg(scratch.path())
                     .status()
                     .map_err(|error| {
                         Failure::task(format!("could not spawn test child: {error}"))
@@ -712,10 +781,10 @@ mod tests {
         for (name, succeed) in [("success", true), ("failure", false)] {
             let scratch = directory.create_scratch(name, "scratch").unwrap();
             scratch
-                .with_inheritable_anchor("scratch", |anchor| {
+                .with_inheritable_anchor("scratch", |scratch| {
                     let status = Command::new("sh")
                         .args(["-c", "mkdir \"$1/nested\" && printf x > \"$1/nested/file\" && ln -s file \"$1/nested/link\"", "sh"])
-                        .arg(anchor)
+                        .arg(scratch.path())
                         .status()
                         .map_err(|error| Failure::task(format!("could not spawn test child: {error}")))?;
                     if status.success() { Ok(()) } else { Err(Failure::task("test child failed")) }
