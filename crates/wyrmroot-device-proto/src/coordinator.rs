@@ -337,6 +337,7 @@ impl<'a> Coordinator<'a> {
     pub fn driver_failed(&mut self, endpoint: DriverEndpoint) -> Result<(), CoordinatorError> {
         if self.state != CoordinatorState::AwaitingDriverReady
             && self.state != CoordinatorState::AwaitingPublication
+            && self.state != CoordinatorState::Published
         {
             return Err(CoordinatorError::InvalidState);
         }
@@ -346,6 +347,16 @@ impl<'a> Coordinator<'a> {
         self.publication_endpoint = None;
         self.published_generation = None;
         self.state = CoordinatorState::CleaningUp;
+        Ok(())
+    }
+
+    /// A failed native cleanup is terminal for this coordinator generation;
+    /// replacement must never overlap state whose ownership cannot be proved.
+    pub fn cleanup_failed(&mut self) -> Result<(), CoordinatorError> {
+        if self.state != CoordinatorState::CleaningUp {
+            return Err(CoordinatorError::InvalidState);
+        }
+        self.state = CoordinatorState::PermanentFailure;
         Ok(())
     }
 
@@ -485,6 +496,10 @@ mod tests {
             c.publish(old_registry.endpoint, PublishedServiceGeneration(2)),
             Err(CoordinatorError::StalePublicationEndpoint)
         );
+        let replacement = c.registry().unwrap().endpoint;
+        c.publish(replacement, PublishedServiceGeneration(2))
+            .unwrap();
+        assert_eq!(c.state(), CoordinatorState::Published);
     }
 
     #[test]
@@ -504,6 +519,49 @@ mod tests {
                 c.driver_ready(next).unwrap();
             }
         }
+        assert_eq!(c.state(), CoordinatorState::PermanentFailure);
+    }
+
+    #[test]
+    fn cleanup_and_bundle_generation_gate_replacement() {
+        let data = bytes();
+        let mut c = ready_coordinator(&data);
+        let endpoint = c.attempt().unwrap().endpoint;
+        c.driver_failed(endpoint).unwrap();
+        assert_eq!(c.begin_launch(), Err(CoordinatorError::InvalidState));
+        c.complete_failure_cleanup(0).unwrap();
+        assert_eq!(
+            c.backoff_elapsed(RETRY_BACKOFF_NS - 1),
+            Err(CoordinatorError::BackoffNotElapsed)
+        );
+        c.backoff_elapsed(RETRY_BACKOFF_NS).unwrap();
+        c.begin_launch().unwrap();
+        let endpoint = c.attempt().unwrap().endpoint;
+        c.launch_accepted(endpoint).unwrap();
+        c.driver_ready(endpoint).unwrap();
+        c.retire().unwrap();
+        c.complete_retire_cleanup().unwrap();
+        assert_eq!(
+            c.accept_bundle(DeviceBundle {
+                role_id: RoleId(1),
+                generation: BundleGeneration(1),
+            }),
+            Err(CoordinatorError::StaleBundle)
+        );
+    }
+
+    #[test]
+    fn cleanup_failure_is_terminal_and_published_exit_is_retriable() {
+        let data = bytes();
+        let mut c = ready_coordinator(&data);
+        c.publish(
+            c.registry().unwrap().endpoint,
+            PublishedServiceGeneration(1),
+        )
+        .unwrap();
+        let endpoint = c.attempt().unwrap().endpoint;
+        c.driver_failed(endpoint).unwrap();
+        c.cleanup_failed().unwrap();
         assert_eq!(c.state(), CoordinatorState::PermanentFailure);
     }
 }

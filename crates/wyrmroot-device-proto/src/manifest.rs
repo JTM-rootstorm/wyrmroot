@@ -436,4 +436,58 @@ mod tests {
         bytes[HEADER_BYTES + RECORD_BYTES - 1] = 1;
         assert_eq!(Manifest::parse(&bytes), Err(ManifestError::NonzeroReserved));
     }
+
+    #[test]
+    fn structural_header_and_record_failures_are_closed() {
+        let baseline = manifest(1, 2, 0x2f8, 3, UART16550D_PATH, 9);
+        let mut bad = baseline;
+        bad[6] = 1;
+        assert_eq!(Manifest::parse(&bad), Err(ManifestError::WrongVersion));
+        bad = baseline;
+        bad[16..20].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(Manifest::parse(&bad), Err(ManifestError::WrongProfile));
+        bad = baseline;
+        bad[HEADER_BYTES..HEADER_BYTES + 8].fill(0);
+        assert_eq!(Manifest::parse(&bad), Err(ManifestError::ZeroRole));
+        bad = baseline;
+        bad[HEADER_BYTES + 12..HEADER_BYTES + 16].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(
+            Manifest::parse(&bad),
+            Err(ManifestError::UnknownResourceKind)
+        );
+        bad = baseline;
+        bad[HEADER_BYTES + 18..HEADER_BYTES + 20].fill(0);
+        assert_eq!(Manifest::parse(&bad), Err(ManifestError::ZeroPioLength));
+        bad = baseline;
+        bad[HEADER_BYTES + 28..HEADER_BYTES + 60].fill(0);
+        assert_eq!(
+            Manifest::parse(&bad),
+            Err(ManifestError::ZeroContentIdentity)
+        );
+        bad = baseline;
+        bad[HEADER_BYTES + 72 + UART16550D_PATH.len()] = 1;
+        assert_eq!(
+            Manifest::parse(&bad),
+            Err(ManifestError::NonzeroPathPadding)
+        );
+    }
+
+    #[test]
+    fn duplicate_and_overlap_relations_are_rejected() {
+        let one = manifest(1, 2, 0x2f8, 3, UART16550D_PATH, 9);
+        let mut two = [0u8; HEADER_BYTES + 2 * RECORD_BYTES];
+        two[..HEADER_BYTES].copy_from_slice(&one[..HEADER_BYTES]);
+        two[HEADER_BYTES..HEADER_BYTES + RECORD_BYTES].copy_from_slice(&one[HEADER_BYTES..]);
+        two[HEADER_BYTES + RECORD_BYTES..].copy_from_slice(&one[HEADER_BYTES..]);
+        let total = two.len() as u32;
+        two[8..12].copy_from_slice(&total.to_le_bytes());
+        two[12..14].copy_from_slice(&2u16.to_le_bytes());
+        assert_eq!(Manifest::parse(&two), Err(ManifestError::DuplicateRole));
+
+        let second = HEADER_BYTES + RECORD_BYTES;
+        two[second..second + 8].copy_from_slice(&2u64.to_le_bytes());
+        assert_eq!(Manifest::parse(&two), Err(ManifestError::DuplicateIrq));
+        two[second + 20..second + 24].copy_from_slice(&5u32.to_le_bytes());
+        assert_eq!(Manifest::parse(&two), Err(ManifestError::OverlappingPio));
+    }
 }

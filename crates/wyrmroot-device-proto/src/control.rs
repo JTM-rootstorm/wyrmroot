@@ -436,4 +436,45 @@ mod tests {
         bytes[6] = 1;
         assert_eq!(parse(&bytes), Err(ControlParseError::WrongVersion));
     }
+
+    #[test]
+    fn configure_is_exact_q35_and_reserved_bytes_fail_closed() {
+        let (role, bundle, attempt, endpoint) = ids();
+        let message = ControlMessage::Configure {
+            role_id: role,
+            bundle_generation: bundle,
+            attempt_generation: attempt,
+            endpoint,
+            transaction_id: 8,
+            profile: PROFILE_Q35,
+            profile_version: PROFILE_Q35_VERSION,
+        };
+        let mut bytes = [0; CONFIGURE_BYTES];
+        encode(message, &mut bytes).unwrap();
+        assert_eq!(parse(&bytes), Ok(message));
+        bytes[HEADER_BYTES + 8] = 1;
+        assert_eq!(parse(&bytes), Err(ControlParseError::WrongSize));
+        bytes[HEADER_BYTES + 8] = 0;
+        bytes[HEADER_BYTES..HEADER_BYTES + 4].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(parse(&bytes), Err(ControlParseError::InvalidProfile));
+    }
+
+    #[test]
+    fn every_common_identity_and_flag_is_required() {
+        let (role, bundle, attempt, endpoint) = ids();
+        let message = ControlMessage::Retire {
+            role_id: role,
+            bundle_generation: bundle,
+            attempt_generation: attempt,
+            endpoint,
+            transaction_id: 9,
+        };
+        let mut bytes = [0; RETIRE_BYTES];
+        encode(message, &mut bytes).unwrap();
+        bytes[12] = 1;
+        assert_eq!(parse(&bytes), Err(ControlParseError::NonzeroFlags));
+        bytes[12] = 0;
+        bytes[32..40].fill(0);
+        assert_eq!(parse(&bytes), Err(ControlParseError::ZeroIdentity));
+    }
 }
