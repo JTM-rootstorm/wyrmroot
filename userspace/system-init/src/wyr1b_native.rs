@@ -237,6 +237,48 @@ pub(crate) fn validate_retained_bootfs(
     Ok((controller, gate))
 }
 
+/// Validates the C1 retained closure while preserving the selector-27 gate's
+/// separate marker/configuration contract.
+pub(crate) fn validate_retained_bootfs_c1(bytes: &[u8]) -> Result<SystemInit, InitError> {
+    let archive = Archive::new(bytes).map_err(InitError::Bootfs)?;
+    let manifest_entry = archive
+        .lookup(MANIFEST_PATH.as_bytes())
+        .map_err(map_lookup)?;
+    let manifest_bytes = manifest_entry.data();
+    let encoded_generation: [u8; 32] = manifest_bytes
+        .get(48..80)
+        .ok_or(InitError::Manifest(ManifestParseError::TruncatedHeader))?
+        .try_into()
+        .expect("checked WRRM generation slice");
+    if encoded_generation == [0; 32] {
+        return Err(InitError::ZeroBootGeneration);
+    }
+    let manifest = Manifest::parse_structural(manifest_bytes, &encoded_generation)
+        .map_err(InitError::Manifest)?;
+    let controller = SystemInit::from_wyr1c_manifest(manifest)?;
+    for role in manifest.roles() {
+        let entry = archive.lookup(role.path().as_bytes()).map_err(map_lookup)?;
+        if !entry.is_executable() || entry.data().is_empty() {
+            return Err(InitError::NonExecutableRole);
+        }
+        if wyrmroot_runtime::sha256::digest(entry.data()) != *role.executable_identity() {
+            return Err(InitError::ArtifactIdentityMismatch(role.id()));
+        }
+    }
+    let init = archive
+        .lookup(SYSTEM_INIT_PATH.as_bytes())
+        .map_err(map_lookup)?;
+    if !init.is_executable() || init.data().is_empty() {
+        return Err(InitError::NonExecutableRole);
+    }
+    for edge in manifest.edges() {
+        if let Some(path) = edge.target_path() {
+            archive.lookup(path.as_bytes()).map_err(map_lookup)?;
+        }
+    }
+    Ok(controller)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn activate_in_place<'a, S, L, W>(
     system: &mut S,
@@ -287,6 +329,7 @@ fn initialize_resident_in_place<'a>(
             jobs: JobDispatcher::new(),
         }),
         wyr1b_evidence: None,
+        wyr1c: None,
     }))
 }
 
@@ -601,7 +644,7 @@ fn validate_controller_channel<S: InitPlatform>(
     Ok(())
 }
 
-fn create_controller_channel_pair<S: Wyr1BPlatform>(
+pub(crate) fn create_controller_channel_pair<S: Wyr1BPlatform>(
     system: &mut S,
 ) -> Result<(DwHandle, DwHandle), InitError> {
     system
@@ -871,7 +914,7 @@ where
     })
 }
 
-fn establish_registry_topology<S, W>(
+pub(crate) fn establish_registry_topology<S, W>(
     system: &mut S,
     waits: &mut W,
     controller: &mut SystemInit,
@@ -962,7 +1005,7 @@ fn reconcile_failed_registry_launch<
     }
 }
 
-fn launch_registry_until_ready<S, L, W>(
+pub(crate) fn launch_registry_until_ready<S, L, W>(
     system: &mut S,
     loader: &mut L,
     waits: &mut W,
@@ -1037,7 +1080,7 @@ where
     }
 }
 
-fn poison_registry_generation<S, W>(
+pub(crate) fn poison_registry_generation<S, W>(
     system: &mut S,
     waits: &mut W,
     controller: &mut SystemInit,
@@ -1143,7 +1186,7 @@ where
     advance_registry_or_exhausted(system, controller, registry.active.transaction_id)
 }
 
-fn restart_topology_or_poison<S, W>(
+pub(crate) fn restart_topology_or_poison<S, W>(
     system: &mut S,
     waits: &mut W,
     controller: &mut SystemInit,
@@ -3895,6 +3938,7 @@ mod tests {
             gate: None,
             evidence: None,
             registry_startup_profile: StartupProfile::BootstrapRegistry,
+            devmgr_startup_profile: StartupProfile::EarlyBootStub,
         };
         controller.become_operational().unwrap();
         controller.begin_registry(0, 1, 0x1001).unwrap();
@@ -4208,6 +4252,15 @@ mod tests {
                 Err(FAILURE)
             }
         }
+
+        fn materialize_read_only_memory(
+            &mut self,
+            _root: DwHandle,
+            _bytes: &[u8],
+            _rights: DwRights,
+        ) -> Result<DwHandle, NativeError> {
+            Ok(DwHandle(0x7fff))
+        }
     }
 
     fn grant(kind: EndpointKind, endpoint_id: u64, role_generation: u64) -> EndpointGrant {
@@ -4308,6 +4361,7 @@ mod tests {
             last_tick_ns: 0,
             wyr1b: None,
             wyr1b_evidence: Some(evidence),
+            wyr1c: None,
         }
     }
 
@@ -5527,6 +5581,7 @@ mod tests {
             gate: None,
             evidence: None,
             registry_startup_profile: StartupProfile::BootstrapRegistry,
+            devmgr_startup_profile: StartupProfile::EarlyBootStub,
         };
         controller.become_operational().unwrap();
         controller.begin_registry(0, 1, 0x1001).unwrap();

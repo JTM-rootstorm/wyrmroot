@@ -9,6 +9,7 @@ use deepwyrm_syscall::{
     DwWaitResultV1,
 };
 use wyrmroot_bootfs as _;
+use wyrmroot_device_proto as _;
 use wyrmroot_launch_proto as _;
 use wyrmroot_loader as _;
 use wyrmroot_registry_proto as _;
@@ -120,6 +121,15 @@ impl Wyr1BPlatform for NativeSystem {
         deadline: DwDeadline,
     ) -> Result<DwWaitResultV1, NativeError> {
         wait_many(items, deadline)
+    }
+
+    fn materialize_read_only_memory(
+        &mut self,
+        root: DwHandle,
+        bytes: &[u8],
+        rights: DwRights,
+    ) -> Result<DwHandle, NativeError> {
+        wyrmroot_runtime::materialize_read_only_memory(root, bytes, rights)
     }
 }
 

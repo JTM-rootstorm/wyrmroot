@@ -14,6 +14,7 @@ pub mod wyr1b;
 pub mod wyr1b_gate;
 mod wyr1b_job;
 pub mod wyr1b_native;
+pub mod wyr1c_native;
 
 use crate::evidence::{EvidenceError, EvidenceEvent, EvidenceLog};
 use crate::gate::{GATE_CONFIG_PATH, GateConfig, GateConfigError, parse_gate_config};
@@ -259,6 +260,7 @@ pub struct ResidentSystemInit {
     last_tick_ns: u64,
     wyr1b: Option<wyr1b_native::ResidentState>,
     wyr1b_evidence: Option<wyr1b_gate::EvidenceLog>,
+    wyr1c: Option<wyr1c_native::ResidentState>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -474,7 +476,9 @@ impl ResidentSystemInit {
         L: LoaderPlatform<Error = NativeError>,
         W: SupervisionPlatform<Error = NativeError>,
     {
-        if self.wyr1b.is_none() {
+        if self.wyr1c.is_some() {
+            wyr1c_native::control_tick(self, system, loader, waits, now_ns)
+        } else if self.wyr1b.is_none() {
             self.control_tick(system, loader, waits, now_ns)
         } else {
             wyr1b_native::control_tick(self, system, loader, waits, now_ns)
@@ -703,22 +707,40 @@ pub struct SystemInit {
     gate: Option<GateConfig>,
     evidence: Option<EvidenceLog>,
     registry_startup_profile: StartupProfile,
+    devmgr_startup_profile: StartupProfile,
 }
 
 impl SystemInit {
     /// Consumes an already product-validated WRRM manifest and binds exact
     /// executable identities to the two WYR1-A launchable roles.
     pub fn from_manifest(manifest: Manifest<'_>) -> Result<Self, InitError> {
-        Self::from_manifest_with_registry_profile(manifest, StartupProfile::EarlyBootStub)
+        Self::from_manifest_with_profiles(
+            manifest,
+            StartupProfile::EarlyBootStub,
+            StartupProfile::EarlyBootStub,
+        )
     }
 
     pub(crate) fn from_wyr1b_manifest(manifest: Manifest<'_>) -> Result<Self, InitError> {
-        Self::from_manifest_with_registry_profile(manifest, StartupProfile::BootstrapRegistry)
+        Self::from_manifest_with_profiles(
+            manifest,
+            StartupProfile::BootstrapRegistry,
+            StartupProfile::EarlyBootStub,
+        )
     }
 
-    fn from_manifest_with_registry_profile(
+    pub(crate) fn from_wyr1c_manifest(manifest: Manifest<'_>) -> Result<Self, InitError> {
+        Self::from_manifest_with_profiles(
+            manifest,
+            StartupProfile::BootstrapRegistry,
+            StartupProfile::DeviceCoordinator,
+        )
+    }
+
+    fn from_manifest_with_profiles(
         manifest: Manifest<'_>,
         registry_startup_profile: StartupProfile,
+        devmgr_startup_profile: StartupProfile,
     ) -> Result<Self, InitError> {
         if manifest.role_count() != 5 {
             return Err(InitError::WrongManifestProfile);
@@ -729,7 +751,7 @@ impl SystemInit {
             let expected_shape = if expected == RoleId::Registryd {
                 (Activation::Early, registry_startup_profile)
             } else if expected == RoleId::Devmgr {
-                (Activation::Early, StartupProfile::EarlyBootStub)
+                (Activation::Early, devmgr_startup_profile)
             } else if expected == RoleId::Uart16550d {
                 (Activation::DeviceBound, StartupProfile::Retained)
             } else {
@@ -782,6 +804,7 @@ impl SystemInit {
             gate: None,
             evidence: None,
             registry_startup_profile,
+            devmgr_startup_profile,
         })
     }
 
@@ -885,7 +908,7 @@ impl SystemInit {
         }
         let expected_profile = match resources.role {
             RoleId::Registryd => self.registry_startup_profile,
-            RoleId::Devmgr => StartupProfile::EarlyBootStub,
+            RoleId::Devmgr => self.devmgr_startup_profile,
             _ => return Err(InitError::UnlaunchableRole),
         };
         if resources.startup_profile != expected_profile
@@ -1354,6 +1377,15 @@ pub trait Wyr1BPlatform: InitPlatform {
         items: &[DwWaitItemV1],
         deadline: DwDeadline,
     ) -> Result<DwWaitResultV1, NativeError>;
+    /// Creates one unpublished, immutable manifest object and returns only
+    /// the reduced child capability.  The native implementation confines its
+    /// writable mapping to the runtime boundary.
+    fn materialize_read_only_memory(
+        &mut self,
+        root: DwHandle,
+        bytes: &[u8],
+        rights: DwRights,
+    ) -> Result<DwHandle, NativeError>;
 }
 
 /// Runs the native selected-generation activation through NORMAL or DEGRADED.
@@ -1393,6 +1425,7 @@ where
         last_tick_ns: system.now().map_err(InitError::Native)?,
         wyr1b: None,
         wyr1b_evidence: None,
+        wyr1c: None,
     })
 }
 
@@ -1518,27 +1551,45 @@ where
             plan,
             |system, bootfs| {
                 let archive = Archive::new(bootfs).map_err(InitError::Bootfs)?;
-                match archive.lookup(wyr1b_gate::GATE_PATH.as_bytes()) {
-                    Ok(_) => wyr1b_native::activate_in_place(
-                        system,
-                        loader,
-                        waits,
-                        slot,
-                        authority,
-                        bootstrap_channel,
-                        parsed.transaction_id,
-                        bootfs,
-                    ),
-                    Err(LookupError::NotFound) => activate_retained_bootfs_in_place(
-                        system,
-                        loader,
-                        waits,
-                        slot,
-                        authority,
-                        bootstrap_channel,
-                        parsed.transaction_id,
-                        bootfs,
-                    ),
+                match archive.lookup(wyr1c_native::MARKER_PATH.as_bytes()) {
+                    Ok(marker) if marker.data() == wyr1c_native::MARKER_BYTES => {
+                        wyr1c_native::activate_in_place(
+                            system,
+                            loader,
+                            waits,
+                            slot,
+                            authority,
+                            bootstrap_channel,
+                            parsed.transaction_id,
+                            bootfs,
+                        )
+                    }
+                    Ok(_) => Err(InitError::WrongManifestProfile),
+                    Err(LookupError::NotFound) => {
+                        match archive.lookup(wyr1b_gate::GATE_PATH.as_bytes()) {
+                            Ok(_) => wyr1b_native::activate_in_place(
+                                system,
+                                loader,
+                                waits,
+                                slot,
+                                authority,
+                                bootstrap_channel,
+                                parsed.transaction_id,
+                                bootfs,
+                            ),
+                            Err(LookupError::NotFound) => activate_retained_bootfs_in_place(
+                                system,
+                                loader,
+                                waits,
+                                slot,
+                                authority,
+                                bootstrap_channel,
+                                parsed.transaction_id,
+                                bootfs,
+                            ),
+                            Err(error) => Err(map_lookup(error)),
+                        }
+                    }
                     Err(error) => Err(map_lookup(error)),
                 }
             },
@@ -1746,6 +1797,7 @@ where
         last_tick_ns: 0,
         wyr1b: None,
         wyr1b_evidence: None,
+        wyr1c: None,
     });
     resident.result = activate_retained_bootfs_state(
         system,
@@ -2121,7 +2173,7 @@ fn load_role<L: LoaderPlatform<Error = NativeError>>(
     )
     .map_err(InitError::Loader)
 }
-fn cleanup_loaded<S: InitPlatform, W: SupervisionPlatform<Error = NativeError>>(
+pub(crate) fn cleanup_loaded<S: InitPlatform, W: SupervisionPlatform<Error = NativeError>>(
     system: &mut S,
     waits: &mut W,
     loaded: LoadedProcess,
@@ -2546,6 +2598,16 @@ mod native_cleanup_tests {
             self.wyr1b_calls += 1;
             Err(FAILURE)
         }
+
+        fn materialize_read_only_memory(
+            &mut self,
+            _root: DwHandle,
+            _bytes: &[u8],
+            _rights: DwRights,
+        ) -> Result<DwHandle, NativeError> {
+            self.wyr1b_calls += 1;
+            Err(FAILURE)
+        }
     }
 
     struct MockWaits {
@@ -2722,6 +2784,7 @@ mod native_cleanup_tests {
             gate: None,
             evidence: None,
             registry_startup_profile: StartupProfile::EarlyBootStub,
+            devmgr_startup_profile: StartupProfile::EarlyBootStub,
         };
         controller.become_operational().unwrap();
         controller.begin_registry(0, 1, 0x1001).unwrap();
@@ -2821,6 +2884,7 @@ mod native_cleanup_tests {
             gate: None,
             evidence: None,
             registry_startup_profile: StartupProfile::EarlyBootStub,
+            devmgr_startup_profile: StartupProfile::EarlyBootStub,
         };
         controller.become_operational().unwrap();
         controller.begin_registry(0, 1, 0x1001).unwrap();
@@ -2847,6 +2911,7 @@ mod native_cleanup_tests {
             last_tick_ns: 9,
             wyr1b: None,
             wyr1b_evidence: None,
+            wyr1c: None,
         };
         let mut native = MockNative::new();
         let mut loader = wyrmroot_runtime::NativeLoaderPlatform;

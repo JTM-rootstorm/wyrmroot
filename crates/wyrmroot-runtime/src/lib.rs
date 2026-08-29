@@ -56,7 +56,8 @@ pub use capability_native::{
 pub use capability_native::{
     OwnedMemoryMapping, cancel_timer, create_channel, create_event, create_memory_object,
     create_task_group, create_timer, duplicate_handle, map_memory_read_only, map_memory_read_write,
-    set_timer, signal_event, terminate_process, terminate_task_group, unmap_memory, wait_one,
+    materialize_read_only_memory, set_timer, signal_event, terminate_process, terminate_task_group,
+    unmap_memory, wait_one,
 };
 #[cfg(feature = "wyr1-test-evidence")]
 pub use capability_native::{WYR1_EVIDENCE_RECORD_BYTES, submit_wyr1_evidence};

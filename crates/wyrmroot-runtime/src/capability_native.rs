@@ -8,13 +8,37 @@
 use deepwyrm_syscall::DW_STATUS_WOULD_BLOCK;
 use deepwyrm_syscall::{
     self, DW_ADDRESS_REGION_MAP_ARGS_V1_SIZE, DW_ADDRESS_REGION_MAP_ARGS_V1_VERSION,
-    DW_MEMORY_PROTECTION_READ, DW_MEMORY_PROTECTION_WRITE, DW_STATUS_SUCCESS,
+    DW_MEMORY_PROTECTION_READ, DW_MEMORY_PROTECTION_WRITE, DW_RIGHT_DUPLICATE, DW_RIGHT_INSPECT,
+    DW_RIGHT_MAP, DW_RIGHT_READ, DW_RIGHT_TRANSFER, DW_RIGHT_WRITE, DW_STATUS_SUCCESS,
     DW_WAIT_RESULT_V1_SIZE, DwAddressRegionMapArgsV1, DwAddressRegionMapFlags, DwDeadline,
     DwHandle, DwMemoryObjectCreateFlags, DwMemoryProtection, DwOffset, DwRights, DwSignals, DwSize,
     DwStatus, DwSyscallId, DwTerminationReason, DwUserAddress, DwWaitItemV1, DwWaitResultV1,
 };
 
 use crate::{NativeError, NativeOutputError, PAGE_SIZE, wait_many};
+
+const MATERIALIZATION_PARENT_RIGHTS: DwRights = DwRights(
+    DW_RIGHT_READ.0
+        | DW_RIGHT_MAP.0
+        | DW_RIGHT_WRITE.0
+        | DW_RIGHT_INSPECT.0
+        | DW_RIGHT_DUPLICATE.0
+        | DW_RIGHT_TRANSFER.0,
+);
+
+fn materialization_lengths(source_len: usize) -> Result<(u64, u64), NativeError> {
+    if source_len == 0 {
+        return Err(NativeError::Output(NativeOutputError::InvalidMappedRange));
+    }
+    let logical = u64::try_from(source_len)
+        .map_err(|_| NativeError::Output(NativeOutputError::InvalidMappedRange))?;
+    let mapped = logical
+        .checked_add(PAGE_SIZE - 1)
+        .and_then(|value| value.checked_div(PAGE_SIZE))
+        .and_then(|pages| pages.checked_mul(PAGE_SIZE))
+        .ok_or(NativeError::Output(NativeOutputError::InvalidMappedRange))?;
+    Ok((logical, mapped))
+}
 
 #[cfg(feature = "wyr1-test-evidence")]
 const WYR1_TEST_EVIDENCE_SYSCALL: DwSyscallId = DwSyscallId(0xffff_ff19);
@@ -154,6 +178,65 @@ pub fn create_memory_object(bytes: u64, rights: DwRights) -> Result<DwHandle, Na
         return Err(NativeError::Output(NativeOutputError::InvalidObjectInfo));
     }
     Ok(memory)
+}
+
+/// Materialize immutable bytes in one unpublished `MemoryObject` and return a
+/// capability reduced to the supplied read-only child rights.
+///
+/// The only unsafe operation is bounded to the exclusive parent mapping: the
+/// object is freshly created, has no transferred handle, is zero-filled before
+/// copying, and write authority is removed before any reduced capability can
+/// escape.  This keeps callers such as permanent init `unsafe`-free while
+/// preserving the native ABI's explicit mapping lifetime rules.
+pub fn materialize_read_only_memory(
+    root: DwHandle,
+    source: &[u8],
+    child_rights: DwRights,
+) -> Result<DwHandle, NativeError> {
+    let (logical, mapped_bytes) = materialization_lengths(source.len())?;
+    let memory = create_memory_object(logical, MATERIALIZATION_PARENT_RIGHTS)?;
+    let mut mapping = match map_memory_read_write(root, memory, mapped_bytes) {
+        Ok(mapping) => mapping,
+        Err(error) => {
+            let _ = crate::close_handle(memory);
+            return Err(error);
+        }
+    };
+    // SAFETY: `memory` was created above and has not been shared or
+    // transferred. `mapping` is the sole writable mapping and remains live
+    // for this callback; the source slice is independent of its backing.
+    let copied = unsafe {
+        mapping.with_bytes_mut(|destination| {
+            destination.fill(0);
+            destination[..source.len()].copy_from_slice(source);
+        })
+    };
+    if let Err(error) = copied {
+        let _ = unmap_memory(mapping);
+        let _ = crate::close_handle(memory);
+        return Err(error);
+    }
+    if let Err(error) = mapping.protect_read_only() {
+        let _ = unmap_memory(mapping);
+        let _ = crate::close_handle(memory);
+        return Err(error);
+    }
+    if let Err(error) = unmap_memory(mapping) {
+        let _ = crate::close_handle(memory);
+        return Err(error);
+    }
+    let reduced = match duplicate_handle(memory, child_rights) {
+        Ok(handle) => handle,
+        Err(error) => {
+            let _ = crate::close_handle(memory);
+            return Err(error);
+        }
+    };
+    if let Err(error) = crate::close_handle(memory) {
+        let _ = crate::close_handle(reduced);
+        return Err(error);
+    }
+    Ok(reduced)
 }
 
 pub fn map_memory_read_write(
@@ -486,6 +569,31 @@ fn require_success(status: DwStatus) -> Result<(), NativeError> {
         Ok(())
     } else {
         Err(NativeError::Status(status))
+    }
+}
+
+#[cfg(test)]
+mod materialization_tests {
+    use super::*;
+
+    #[test]
+    fn immutable_materialization_preserves_logical_length_and_rounds_only_mapping() {
+        assert_eq!(materialization_lengths(1).unwrap(), (1, PAGE_SIZE));
+        assert_eq!(
+            materialization_lengths(PAGE_SIZE as usize + 1).unwrap(),
+            (PAGE_SIZE + 1, PAGE_SIZE * 2)
+        );
+        assert!(materialization_lengths(0).is_err());
+    }
+
+    #[test]
+    fn immutable_materialization_parent_has_write_but_child_can_be_exactly_reduced() {
+        assert_ne!(MATERIALIZATION_PARENT_RIGHTS.0 & DW_RIGHT_WRITE.0, 0);
+        let requested_child = DwRights(DW_RIGHT_READ.0 | DW_RIGHT_MAP.0 | DW_RIGHT_INSPECT.0);
+        assert_eq!(
+            requested_child.0,
+            DW_RIGHT_READ.0 | DW_RIGHT_MAP.0 | DW_RIGHT_INSPECT.0
+        );
     }
 }
 
