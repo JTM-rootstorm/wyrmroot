@@ -621,9 +621,9 @@ fn load_process_internal<P: LoaderPlatform>(
     fault: LoadFault,
     delegated_channels_consumed: &mut bool,
 ) -> Result<LoadedProcess, LoadError<P::Error>> {
-    let expected_channels = if request.profile.channel_role().is_some() {
-        1
-    } else if request.profile == LaunchProfile::DeviceCoordinator {
+    let expected_channels = if request.profile.channel_role().is_some()
+        || request.profile == LaunchProfile::DeviceCoordinator
+    {
         1
     } else if request.profile == LaunchProfile::JobV2Streams {
         3

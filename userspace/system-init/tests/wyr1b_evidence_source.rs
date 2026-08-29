@@ -1,7 +1,8 @@
 use {
-    deepwyrm_syscall as _, wyrmroot_bootfs as _, wyrmroot_launch_proto as _, wyrmroot_loader as _,
-    wyrmroot_registry_proto as _, wyrmroot_rrc_manifest as _, wyrmroot_runtime as _,
-    wyrmroot_system_init as _, wyrmroot_wyr1b_gate_proto as _,
+    deepwyrm_syscall as _, wyrmroot_bootfs as _, wyrmroot_device_proto as _,
+    wyrmroot_launch_proto as _, wyrmroot_loader as _, wyrmroot_registry_proto as _,
+    wyrmroot_rrc_manifest as _, wyrmroot_runtime as _, wyrmroot_system_init as _,
+    wyrmroot_wyr1b_gate_proto as _,
 };
 
 const MAIN: &str = include_str!("../src/main.rs");
