@@ -290,13 +290,12 @@ pub fn validate_binding_transition(
         ControllerMessage::Status { .. } => return Err(ControllerParseError::StaleBinding),
         _ => {}
     }
-    if let Some(old) = current {
-        if binding.generation.0 <= old.generation.0
+    if let Some(old) = current
+        && (binding.generation.0 <= old.generation.0
             || (binding.endpoint.id.0 == old.endpoint.id.0
-                && binding.endpoint.generation.0 <= old.endpoint.generation.0)
-        {
-            return Err(ControllerParseError::StaleBinding);
-        }
+                && binding.endpoint.generation.0 <= old.endpoint.generation.0))
+    {
+        return Err(ControllerParseError::StaleBinding);
     }
     Ok(binding)
 }
@@ -305,13 +304,12 @@ fn validate_message(message: ControllerMessage) -> Result<(), ControllerParseErr
     if supervisor_generation(message).0 == 0 || transaction_id(message) == 0 {
         return Err(ControllerParseError::ZeroIdentity);
     }
-    if let Some(binding) = binding(message) {
-        if binding.generation.0 == 0
+    if let Some(binding) = binding(message)
+        && (binding.generation.0 == 0
             || binding.endpoint.id.0 == 0
-            || binding.endpoint.generation.0 == 0
-        {
-            return Err(ControllerParseError::ZeroIdentity);
-        }
+            || binding.endpoint.generation.0 == 0)
+    {
+        return Err(ControllerParseError::ZeroIdentity);
     }
     if let ControllerMessage::Status {
         status,
