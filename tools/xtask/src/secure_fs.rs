@@ -262,6 +262,7 @@ impl Directory {
         Ok(file)
     }
 
+    #[cfg(test)]
     pub(crate) fn write_new(
         &self,
         name: &str,
@@ -293,6 +294,7 @@ impl Directory {
         Ok(file)
     }
 
+    #[cfg(test)]
     pub(crate) fn read(&self, name: &str, maximum: u64, label: &str) -> Result<Vec<u8>, Failure> {
         let (mut file, before) = self.open_bounded(name, maximum, None, label)?;
         let mut bytes = Vec::with_capacity(before.len() as usize);
@@ -382,6 +384,25 @@ impl Directory {
         let metadata = file
             .metadata()
             .map_err(|error| Failure::task(format!("could not stat {label}: {error}")))?;
+        self.verify_file_identity(name, &metadata, label)
+    }
+
+    pub(crate) fn verify_retained_file_exact(
+        &self,
+        name: &str,
+        file: &File,
+        exact_size: u64,
+        exact_mode: u32,
+        label: &str,
+    ) -> Result<(), Failure> {
+        let metadata = file
+            .metadata()
+            .map_err(|error| Failure::task(format!("could not stat {label}: {error}")))?;
+        if !bounded_regular(&metadata, exact_size, Some(exact_size))
+            || metadata.mode() & 0o7777 != exact_mode
+        {
+            return Err(Failure::task(format!("{label} retained metadata changed")));
+        }
         self.verify_file_identity(name, &metadata, label)
     }
 

@@ -10,7 +10,7 @@ use std::{
     ffi::{OsStr, OsString},
     fs::{self, File},
     path::{Component, Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Command, Output, Stdio},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -103,6 +103,7 @@ struct NativeArtifact {
     inspection: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FrozenSnapshot {
     pub(crate) receipt: Vec<u8>,
     pub(crate) rrc_manifest: Vec<u8>,
@@ -130,21 +131,12 @@ pub(crate) struct FrozenDirectories {
 
 pub(crate) struct FrozenPublication {
     pub(crate) directories: FrozenDirectories,
+    artifacts: BTreeMap<String, File>,
+    inspections: BTreeMap<String, File>,
+    rrc_manifest: File,
+    device_manifest: File,
+    bootfs: File,
     receipt: File,
-}
-
-impl BuiltFrozenProduct {
-    pub(crate) fn verify_published_contents(
-        &mut self,
-        output: &crate::secure_fs::Directory,
-    ) -> Result<(), Failure> {
-        verify_published_contents(
-            output,
-            &self.publication.directories,
-            &mut self.publication.receipt,
-            &self.snapshot.receipt,
-        )
-    }
 }
 
 pub(crate) fn product(output: &Path) -> Result<String, Failure> {
@@ -167,15 +159,19 @@ pub(crate) fn product(output: &Path) -> Result<String, Failure> {
     let parent_mode = parent.owned_container_mode("WYR1-C1 output parent")?;
     let output_directory = parent.create_child(name, 0o700, "WYR1-C1 output")?;
     let mut built = build_into(&output_directory)?;
-    verify_publication(
+    let accepted = accept_publication(
+        &repository,
         &parent,
         parent_mode,
         name,
         &output_directory,
-        &built.publication.directories,
-        &mut built.publication.receipt,
-        &built.snapshot.receipt,
+        &mut built.publication,
     )?;
+    if accepted != built.snapshot {
+        return Err(Failure::task(
+            "WYR1-C1 accepted publication differs from the built snapshot",
+        ));
+    }
     Ok(format!(
         "WYR1_C1_HOST_PRODUCT_PASS product_kind={PRODUCT_KIND} selector=none evidence=not-produced wyrmroot_revision={} rust_revision={ACCEPTED_RUST_REVISION} bootfs_sha256={} receipt={}\n",
         built.validated.wyrmroot_revision,
@@ -279,23 +275,12 @@ pub(crate) fn build_into(
     };
     let validated = validate_frozen_product(&repository, &snapshot)?;
     let mut publication = publish_snapshot(output, &snapshot)?;
-    let published = snapshot_from_directories(&publication.directories)?;
-    if published.receipt != snapshot.receipt
-        || published.rrc_manifest != snapshot.rrc_manifest
-        || published.device_manifest != snapshot.device_manifest
-        || published.bootfs != snapshot.bootfs
-        || published.artifacts != snapshot.artifacts
-        || published.inspections != snapshot.inspections
-    {
+    let published = snapshot_from_publication(&mut publication)?;
+    if published != snapshot {
         return Err(Failure::task("WYR1-C1 published snapshot changed"));
     }
     validate_frozen_product(&repository, &published)?;
-    verify_published_contents(
-        output,
-        &publication.directories,
-        &mut publication.receipt,
-        &published.receipt,
-    )?;
+    verify_published_directories(output, &publication.directories)?;
     toolchain.accepted().verify_unchanged()?;
     verify_repository_revision(&repository, &revision)?;
     Ok(BuiltFrozenProduct {
@@ -312,8 +297,10 @@ fn publish_snapshot(
     let artifacts = output.create_child("artifacts", 0o700, "WYR1-C1 artifacts")?;
     let inspections = output.create_child("inspections", 0o700, "WYR1-C1 inspections")?;
     let product = output.create_child("product", 0o700, "WYR1-C1 product")?;
+    let mut artifact_files = BTreeMap::new();
+    let mut inspection_files = BTreeMap::new();
     for spec in NATIVE_SPECS {
-        artifacts.write_new(
+        let artifact = artifacts.write_new_retained(
             &format!("{}.elf", spec.label),
             snapshot
                 .artifacts
@@ -322,7 +309,8 @@ fn publish_snapshot(
             0o400,
             "WYR1-C1 artifact",
         )?;
-        inspections.write_new(
+        artifact_files.insert(spec.label.to_owned(), artifact);
+        let inspection = inspections.write_new_retained(
             &format!("{}.json", spec.label),
             snapshot
                 .inspections
@@ -331,34 +319,22 @@ fn publish_snapshot(
             0o400,
             "WYR1-C1 inspection",
         )?;
+        inspection_files.insert(spec.label.to_owned(), inspection);
     }
-    for (name, bytes, maximum, label) in [
-        (
-            "rrc-c1-v1.bin",
-            snapshot.rrc_manifest.as_slice(),
-            MAX_REPORT_BYTES,
-            "WYR1-C1 WRRM",
-        ),
-        (
-            "wrdm-c1-v1.bin",
-            snapshot.device_manifest.as_slice(),
-            MAX_REPORT_BYTES,
-            "WYR1-C1 WRDM",
-        ),
-        (
-            "bootfs.img",
-            snapshot.bootfs.as_slice(),
-            MAX_BOOTFS_BYTES,
-            "WYR1-C1 bootfs",
-        ),
-    ] {
-        if bytes.is_empty() || bytes.len() > maximum {
-            return Err(Failure::task(format!(
-                "{label} exceeds its publication bound"
-            )));
-        }
-        product.write_new(name, bytes, 0o400, label)?;
-    }
+    let rrc_manifest = product.write_new_retained(
+        "rrc-c1-v1.bin",
+        &snapshot.rrc_manifest,
+        0o400,
+        "WYR1-C1 WRRM",
+    )?;
+    let device_manifest = product.write_new_retained(
+        "wrdm-c1-v1.bin",
+        &snapshot.device_manifest,
+        0o400,
+        "WYR1-C1 WRDM",
+    )?;
+    let bootfs =
+        product.write_new_retained("bootfs.img", &snapshot.bootfs, 0o400, "WYR1-C1 bootfs")?;
     let receipt = product.write_new_retained(
         "build-receipt.toml",
         &snapshot.receipt,
@@ -371,8 +347,21 @@ fn publish_snapshot(
             inspections,
             product,
         },
+        artifacts: artifact_files,
+        inspections: inspection_files,
+        rrc_manifest,
+        device_manifest,
+        bootfs,
         receipt,
     })
+}
+
+#[cfg(test)]
+pub(crate) fn publish_snapshot_for_test(
+    output: &crate::secure_fs::Directory,
+    snapshot: &FrozenSnapshot,
+) -> Result<FrozenPublication, Failure> {
+    publish_snapshot(output, snapshot)
 }
 
 pub(crate) fn open_frozen_directories(
@@ -385,67 +374,129 @@ pub(crate) fn open_frozen_directories(
     })
 }
 
-pub(crate) fn snapshot_from_directories(
-    directories: &FrozenDirectories,
-) -> Result<FrozenSnapshot, Failure> {
-    let artifacts = &directories.artifacts;
-    let inspections = &directories.inspections;
-    let product = &directories.product;
-    let mut artifact_bytes = BTreeMap::new();
-    let mut inspection_bytes = BTreeMap::new();
+pub(crate) fn open_frozen_publication(
+    output: &crate::secure_fs::Directory,
+) -> Result<FrozenPublication, Failure> {
+    let directories = open_frozen_directories(output)?;
+    let mut artifacts = BTreeMap::new();
+    let mut inspections = BTreeMap::new();
     for spec in NATIVE_SPECS {
-        artifact_bytes.insert(
+        artifacts.insert(
             spec.label.to_owned(),
-            artifacts.read(
+            directories.artifacts.open_retained_file(
                 &format!("{}.elf", spec.label),
                 MAX_ARTIFACT_BYTES as u64,
                 "WYR1-C1 artifact",
             )?,
         );
-        inspection_bytes.insert(
+        inspections.insert(
             spec.label.to_owned(),
-            inspections.read(
+            directories.inspections.open_retained_file(
                 &format!("{}.json", spec.label),
                 MAX_REPORT_BYTES as u64,
                 "WYR1-C1 inspection",
             )?,
         );
     }
+    let rrc_manifest = directories.product.open_retained_file(
+        "rrc-c1-v1.bin",
+        MAX_REPORT_BYTES as u64,
+        "WYR1-C1 WRRM",
+    )?;
+    let device_manifest = directories.product.open_retained_file(
+        "wrdm-c1-v1.bin",
+        MAX_REPORT_BYTES as u64,
+        "WYR1-C1 WRDM",
+    )?;
+    let bootfs = directories.product.open_retained_file(
+        "bootfs.img",
+        MAX_BOOTFS_BYTES as u64,
+        "WYR1-C1 bootfs",
+    )?;
+    let receipt = directories.product.open_retained_file(
+        "build-receipt.toml",
+        MAX_REPORT_BYTES as u64,
+        "WYR1-C1 receipt",
+    )?;
+    Ok(FrozenPublication {
+        directories,
+        artifacts,
+        inspections,
+        rrc_manifest,
+        device_manifest,
+        bootfs,
+        receipt,
+    })
+}
+
+pub(crate) fn snapshot_from_publication(
+    publication: &mut FrozenPublication,
+) -> Result<FrozenSnapshot, Failure> {
+    let mut artifact_bytes = BTreeMap::new();
+    let mut inspection_bytes = BTreeMap::new();
+    for spec in NATIVE_SPECS {
+        artifact_bytes.insert(
+            spec.label.to_owned(),
+            publication.directories.artifacts.read_retained_exact(
+                &format!("{}.elf", spec.label),
+                publication
+                    .artifacts
+                    .get_mut(spec.label)
+                    .ok_or_else(|| Failure::task("WYR1-C1 retained artifact is missing"))?,
+                MAX_ARTIFACT_BYTES as u64,
+                0o400,
+                "WYR1-C1 artifact",
+            )?,
+        );
+        inspection_bytes.insert(
+            spec.label.to_owned(),
+            publication.directories.inspections.read_retained_exact(
+                &format!("{}.json", spec.label),
+                publication
+                    .inspections
+                    .get_mut(spec.label)
+                    .ok_or_else(|| Failure::task("WYR1-C1 retained inspection is missing"))?,
+                MAX_REPORT_BYTES as u64,
+                0o400,
+                "WYR1-C1 inspection",
+            )?,
+        );
+    }
     Ok(FrozenSnapshot {
-        receipt: product.read(
+        receipt: publication.directories.product.read_retained_exact(
             "build-receipt.toml",
+            &mut publication.receipt,
             MAX_REPORT_BYTES as u64,
+            0o400,
             "WYR1-C1 receipt",
         )?,
-        rrc_manifest: product.read("rrc-c1-v1.bin", MAX_REPORT_BYTES as u64, "WYR1-C1 WRRM")?,
-        device_manifest: product.read("wrdm-c1-v1.bin", MAX_REPORT_BYTES as u64, "WYR1-C1 WRDM")?,
-        bootfs: product.read("bootfs.img", MAX_BOOTFS_BYTES as u64, "WYR1-C1 bootfs")?,
+        rrc_manifest: publication.directories.product.read_retained_exact(
+            "rrc-c1-v1.bin",
+            &mut publication.rrc_manifest,
+            MAX_REPORT_BYTES as u64,
+            0o400,
+            "WYR1-C1 WRRM",
+        )?,
+        device_manifest: publication.directories.product.read_retained_exact(
+            "wrdm-c1-v1.bin",
+            &mut publication.device_manifest,
+            MAX_REPORT_BYTES as u64,
+            0o400,
+            "WYR1-C1 WRDM",
+        )?,
+        bootfs: publication.directories.product.read_retained_exact(
+            "bootfs.img",
+            &mut publication.bootfs,
+            MAX_BOOTFS_BYTES as u64,
+            0o400,
+            "WYR1-C1 bootfs",
+        )?,
         artifacts: artifact_bytes,
         inspections: inspection_bytes,
     })
 }
 
-pub(crate) fn verify_published_contents(
-    output: &crate::secure_fs::Directory,
-    directories: &FrozenDirectories,
-    receipt: &mut File,
-    expected_receipt: &[u8],
-) -> Result<(), Failure> {
-    verify_published_contents_without_receipt(output, directories)?;
-    let receipt_bytes = directories.product.read_retained_exact(
-        "build-receipt.toml",
-        receipt,
-        MAX_REPORT_BYTES as u64,
-        0o400,
-        "WYR1-C1 receipt",
-    )?;
-    if receipt_bytes != expected_receipt {
-        return Err(Failure::task("WYR1-C1 retained receipt bytes changed"));
-    }
-    Ok(())
-}
-
-pub(crate) fn verify_published_contents_without_receipt(
+pub(crate) fn verify_published_directories(
     output: &crate::secure_fs::Directory,
     directories: &FrozenDirectories,
 ) -> Result<(), Failure> {
@@ -465,18 +516,48 @@ pub(crate) fn verify_published_contents_without_receipt(
     Ok(())
 }
 
+pub(crate) fn accept_publication(
+    repository: &Path,
+    parent: &crate::secure_fs::Directory,
+    parent_mode: u32,
+    name: &str,
+    output: &crate::secure_fs::Directory,
+    publication: &mut FrozenPublication,
+) -> Result<FrozenSnapshot, Failure> {
+    verify_publication(parent, parent_mode, name, output, &publication.directories)?;
+    let accepted = snapshot_from_publication(publication)?;
+    validate_frozen_product(repository, &accepted)?;
+    final_recheck_publication(output, publication, &accepted, || Ok(()))?;
+    verify_publication(parent, parent_mode, name, output, &publication.directories)?;
+    Ok(accepted)
+}
+
+fn final_recheck_publication(
+    output: &crate::secure_fs::Directory,
+    publication: &mut FrozenPublication,
+    accepted: &FrozenSnapshot,
+    hook: impl FnOnce() -> Result<(), Failure>,
+) -> Result<(), Failure> {
+    hook()?;
+    let final_snapshot = snapshot_from_publication(publication)?;
+    if &final_snapshot != accepted {
+        return Err(Failure::task(
+            "WYR1-C1 retained publication bytes changed after validation",
+        ));
+    }
+    verify_published_directories(output, &publication.directories)
+}
+
 fn verify_publication(
     parent: &crate::secure_fs::Directory,
     parent_mode: u32,
     name: &str,
     output: &crate::secure_fs::Directory,
     directories: &FrozenDirectories,
-    receipt: &mut File,
-    expected_receipt: &[u8],
 ) -> Result<(), Failure> {
     parent.verify_owned_container_path_mode(parent_mode, "WYR1-C1 output parent")?;
     parent.verify_child_identity(name, output, 0o700, "WYR1-C1 output")?;
-    verify_published_contents(output, directories, receipt, expected_receipt)
+    verify_published_directories(output, directories)
 }
 
 struct ProductBytes {
@@ -645,19 +726,12 @@ fn inspect_native(
     let sealed = SealedFile::from_bytes(bytes, &format!("WYR1-C1 {label}"))?;
     let output = build_directory.with_inheritance_disabled("WYR1-C1 build scratch", || {
         sealed.with_inheritable_path(&format!("WYR1-C1 {label}"), |artifact| {
-            Command::new("sh")
-                .arg(repository.join("toolchain/inspect-native-artifact.sh"))
-                .arg(artifact)
-                .current_dir(repository)
-                .env_clear()
-                .env("PATH", crate::tasks::INSPECTION_PATH)
-                .env("WYRMROOT_INSPECTION_ARTIFACT_NAME", label)
-                .env("WYRMROOT_SEALED_INSPECTION", "1")
-                .stdin(Stdio::null())
-                .output()
-                .map_err(|error| {
-                    Failure::task(format!("could not inspect WYR1-C1 {label}: {error}"))
-                })
+            run_native_inspector(
+                repository,
+                &repository.join("toolchain/inspect-native-artifact.sh"),
+                artifact,
+                label,
+            )
         })
     })?;
     if !output.status.success()
@@ -673,6 +747,40 @@ fn inspect_native(
         .map_err(|_| Failure::task("WYR1-C1 native inspection report is not UTF-8"))?;
     validate_inspection(&report, label, expected_sha256, bytes.len())?;
     Ok(report)
+}
+
+fn run_native_inspector(
+    repository: &Path,
+    script: &Path,
+    artifact: &Path,
+    label: &str,
+) -> Result<Output, Failure> {
+    Command::new(crate::tasks::INSPECTION_SHELL)
+        .arg(script)
+        .arg(artifact)
+        .current_dir(repository)
+        .env_clear()
+        .env("PATH", crate::tasks::INSPECTION_PATH)
+        .env("WYRMROOT_INSPECTION_ARTIFACT_NAME", label)
+        .env("WYRMROOT_SEALED_INSPECTION", "1")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| Failure::task(format!("could not inspect WYR1-C1 {label}: {error}")))
+}
+
+#[cfg(test)]
+pub(crate) fn run_native_inspector_environment_probe(
+    repository: &Path,
+    script: &Path,
+) -> Result<String, Failure> {
+    let output = run_native_inspector(repository, script, Path::new("/dev/null"), "probe")?;
+    if !output.status.success() {
+        return Err(Failure::task(
+            "WYR1-C1 native inspector environment probe failed",
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|_| Failure::task("WYR1-C1 native inspector environment probe is not UTF-8"))
 }
 
 fn validate_rrc(
@@ -1344,6 +1452,55 @@ mod tests {
             .collect()
     }
 
+    fn publication_snapshot() -> FrozenSnapshot {
+        FrozenSnapshot {
+            receipt: b"receipt bytes\n".to_vec(),
+            rrc_manifest: b"rrc bytes\n".to_vec(),
+            device_manifest: b"wrdm bytes\n".to_vec(),
+            bootfs: b"bootfs bytes\n".to_vec(),
+            artifacts: NATIVE_SPECS
+                .into_iter()
+                .map(|spec| {
+                    (
+                        spec.label.to_owned(),
+                        format!("{} elf\n", spec.label).into_bytes(),
+                    )
+                })
+                .collect(),
+            inspections: NATIVE_SPECS
+                .into_iter()
+                .map(|spec| {
+                    (
+                        spec.label.to_owned(),
+                        format!("{} inspection\n", spec.label).into_bytes(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn published_leaf_bytes<'a>(snapshot: &'a FrozenSnapshot, relative: &str) -> &'a [u8] {
+        if let Some(name) = relative
+            .strip_prefix("artifacts/")
+            .and_then(|value| value.strip_suffix(".elf"))
+        {
+            return &snapshot.artifacts[name];
+        }
+        if let Some(name) = relative
+            .strip_prefix("inspections/")
+            .and_then(|value| value.strip_suffix(".json"))
+        {
+            return &snapshot.inspections[name];
+        }
+        match relative {
+            "product/rrc-c1-v1.bin" => &snapshot.rrc_manifest,
+            "product/wrdm-c1-v1.bin" => &snapshot.device_manifest,
+            "product/bootfs.img" => &snapshot.bootfs,
+            "product/build-receipt.toml" => &snapshot.receipt,
+            _ => panic!("unknown C1 retained leaf {relative}"),
+        }
+    }
+
     #[test]
     fn c1_product_is_deterministic_and_uses_real_profiles() {
         let artifacts = fixture_artifacts();
@@ -1543,28 +1700,15 @@ mod tests {
         let parent = crate::secure_fs::Directory::open_exact(&parent_path, "parent").unwrap();
         let parent_mode = parent.owned_container_mode("parent").unwrap();
         let output = parent.create_child("generation", 0o700, "output").unwrap();
-        let directories = FrozenDirectories {
-            artifacts: output
-                .create_child("artifacts", 0o700, "artifacts")
-                .unwrap(),
-            inspections: output
-                .create_child("inspections", 0o700, "inspections")
-                .unwrap(),
-            product: output.create_child("product", 0o700, "product").unwrap(),
-        };
-        let receipt_bytes = b"receipt bytes\n";
-        let mut receipt = directories
-            .product
-            .write_new_retained("build-receipt.toml", receipt_bytes, 0o400, "receipt")
-            .unwrap();
+        let expected = publication_snapshot();
+        let mut publication = publish_snapshot(&output, &expected).unwrap();
+        final_recheck_publication(&output, &mut publication, &expected, || Ok(())).unwrap();
         verify_publication(
             &parent,
             parent_mode,
             "generation",
             &output,
-            &directories,
-            &mut receipt,
-            receipt_bytes,
+            &publication.directories,
         )
         .unwrap();
 
@@ -1575,9 +1719,7 @@ mod tests {
                 parent_mode,
                 "generation",
                 &output,
-                &directories,
-                &mut receipt,
-                receipt_bytes,
+                &publication.directories,
             )
             .is_err()
         );
@@ -1594,35 +1736,125 @@ mod tests {
                 parent_mode,
                 "generation",
                 &output,
-                &directories,
-                &mut receipt,
-                receipt_bytes,
+                &publication.directories,
             )
             .is_err()
         );
         fs::remove_dir(&inspections).unwrap();
         fs::rename(&moved_inspections, &inspections).unwrap();
 
-        let receipt_path = parent_path.join("generation/product/build-receipt.toml");
+        let artifact_path = parent_path.join("generation/artifacts/devmgr.elf");
+        fs::set_permissions(&artifact_path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&artifact_path, b"changed elf\n").unwrap();
+        fs::set_permissions(&artifact_path, fs::Permissions::from_mode(0o400)).unwrap();
+        assert_ne!(
+            snapshot_from_publication(&mut publication).unwrap(),
+            expected
+        );
+
+        let inspection_path = parent_path.join("generation/inspections/devmgr.json");
+        fs::set_permissions(&inspection_path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(snapshot_from_publication(&mut publication).is_err());
+        fs::set_permissions(&inspection_path, fs::Permissions::from_mode(0o400)).unwrap();
+
+        let rrc_path = parent_path.join("generation/product/rrc-c1-v1.bin");
         fs::rename(
-            &receipt_path,
-            parent_path.join("generation/product/original-receipt.toml"),
+            &rrc_path,
+            parent_path.join("generation/product/original-rrc.bin"),
         )
         .unwrap();
-        fs::write(&receipt_path, receipt_bytes).unwrap();
+        fs::write(&rrc_path, &expected.rrc_manifest).unwrap();
+        fs::set_permissions(&rrc_path, fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(snapshot_from_publication(&mut publication).is_err());
+        fs::remove_file(&rrc_path).unwrap();
+        fs::rename(
+            parent_path.join("generation/product/original-rrc.bin"),
+            &rrc_path,
+        )
+        .unwrap();
+
+        let receipt_path = parent_path.join("generation/product/build-receipt.toml");
+        fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&receipt_path, b"Receipt bytes\n").unwrap();
         fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o400)).unwrap();
-        assert!(
-            verify_publication(
-                &parent,
-                parent_mode,
-                "generation",
-                &output,
-                &directories,
-                &mut receipt,
-                receipt_bytes,
-            )
-            .is_err()
+        assert_ne!(
+            snapshot_from_publication(&mut publication).unwrap(),
+            expected
         );
         fs::remove_dir_all(parent_path).unwrap();
+    }
+
+    #[test]
+    fn every_c1_retained_leaf_is_rechecked_after_the_acceptance_hook() {
+        let mut leaves = NATIVE_SPECS
+            .into_iter()
+            .flat_map(|spec| {
+                [
+                    format!("artifacts/{}.elf", spec.label),
+                    format!("inspections/{}.json", spec.label),
+                ]
+            })
+            .collect::<Vec<_>>();
+        leaves.extend(
+            [
+                "product/rrc-c1-v1.bin",
+                "product/wrdm-c1-v1.bin",
+                "product/bootfs.img",
+                "product/build-receipt.toml",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+        for (index, relative) in leaves.iter().enumerate() {
+            for attack in ["replacement", "mode", "same-inode-bytes"] {
+                let parent_path = std::env::temp_dir().join(format!(
+                    "wyr1c-leaf-{index}-{attack}-{}-{}",
+                    std::process::id(),
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+                fs::create_dir(&parent_path).unwrap();
+                fs::set_permissions(&parent_path, fs::Permissions::from_mode(0o755)).unwrap();
+                let parent =
+                    crate::secure_fs::Directory::open_exact(&parent_path, "parent").unwrap();
+                let output = parent.create_child("generation", 0o700, "output").unwrap();
+                let expected = publication_snapshot();
+                let original = published_leaf_bytes(&expected, relative).to_vec();
+                let mut publication = publish_snapshot(&output, &expected).unwrap();
+                let path = parent_path.join("generation").join(relative);
+                assert!(
+                    final_recheck_publication(&output, &mut publication, &expected, move || {
+                        match attack {
+                            "replacement" => {
+                                fs::rename(&path, path.with_extension("original")).unwrap();
+                                fs::write(&path, &original).unwrap();
+                                fs::set_permissions(&path, fs::Permissions::from_mode(0o400))
+                                    .unwrap();
+                            }
+                            "mode" => {
+                                fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                                    .unwrap();
+                            }
+                            "same-inode-bytes" => {
+                                let mut changed = original;
+                                changed[0] ^= 0x20;
+                                fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                                    .unwrap();
+                                fs::write(&path, changed).unwrap();
+                                fs::set_permissions(&path, fs::Permissions::from_mode(0o400))
+                                    .unwrap();
+                            }
+                            _ => unreachable!(),
+                        }
+                        Ok(())
+                    })
+                    .is_err(),
+                    "C1 retained leaf admitted {attack} of {relative}"
+                );
+                fs::remove_dir_all(parent_path).unwrap();
+            }
+        }
     }
 }

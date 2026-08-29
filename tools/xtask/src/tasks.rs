@@ -20,7 +20,7 @@ const TOOLCHAIN_REQUEST: &str = "toolchain/requests/RUST-WYR0-I-B-SYSROOTS-007.t
 const MAX_LOADER_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DEBUG_SYMBOL_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const INSPECTION_PATH: &str = "/usr/lib/llvm/22/bin:/usr/bin:/bin";
-const INSPECTION_SHELL: &str = "/bin/sh";
+pub(crate) const INSPECTION_SHELL: &str = "/bin/sh";
 const DEEP_LAYOUT_POLICY_ENV: &str = "WYRMROOT_DEEP_LAYOUT_POLICY_RS";
 const BOOTFS_PACKAGE: &str = "wyrmroot-bootfs";
 const BOOTFS_BUILDER_FEATURE: &str = "builder";
@@ -1571,6 +1571,12 @@ mod tests {
             )
             .expect("fixed inspector environment must pass");
             assert_eq!(report, "{\"verified\": true}\n");
+            let native_report = crate::wyr1c::run_native_inspector_environment_probe(
+                &repository,
+                &repository.join("inspect.sh"),
+            )
+            .expect("fixed native inspector environment must pass");
+            assert_eq!(native_report, "{\"verified\": true}\n");
             return;
         }
 
