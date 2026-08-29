@@ -154,6 +154,22 @@ impl Directory {
         self.verify_owned_path(label, None)
     }
 
+    pub(crate) fn owned_container_mode(&self, label: &str) -> Result<u32, Failure> {
+        self.verify_owned_container_path(label)?;
+        self.file
+            .metadata()
+            .map(|metadata| metadata.mode() & 0o7777)
+            .map_err(|error| Failure::task(format!("could not stat {label}: {error}")))
+    }
+
+    pub(crate) fn verify_owned_container_path_mode(
+        &self,
+        exact_mode: u32,
+        label: &str,
+    ) -> Result<(), Failure> {
+        self.verify_owned_path(label, Some(exact_mode))
+    }
+
     fn verify_owned_private_path(&self, label: &str) -> Result<(), Failure> {
         self.verify_owned_path(label, Some(0o700))
     }
@@ -253,6 +269,16 @@ impl Directory {
         mode: u32,
         label: &str,
     ) -> Result<(), Failure> {
+        self.write_new_retained(name, bytes, mode, label).map(drop)
+    }
+
+    pub(crate) fn write_new_retained(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        mode: u32,
+        label: &str,
+    ) -> Result<File, Failure> {
         let mut file = self.create_file(name, mode, label)?;
         file.write_all(bytes)
             .and_then(|()| file.sync_all())
@@ -263,7 +289,8 @@ impl Directory {
         if !bounded_regular(&opened, bytes.len() as u64, Some(bytes.len() as u64)) {
             return Err(Failure::task(format!("{label} changed while writing")));
         }
-        self.verify_file_identity(name, &opened, label)
+        self.verify_file_identity(name, &opened, label)?;
+        Ok(file)
     }
 
     pub(crate) fn read(&self, name: &str, maximum: u64, label: &str) -> Result<Vec<u8>, Failure> {
@@ -277,6 +304,44 @@ impl Directory {
             .metadata()
             .map_err(|error| Failure::task(format!("could not recheck {label}: {error}")))?;
         if stable_identity(&before) != stable_identity(&after) || bytes.len() as u64 != before.len()
+        {
+            return Err(Failure::task(format!("{label} changed while reading")));
+        }
+        self.verify_file_identity(name, &after, label)?;
+        Ok(bytes)
+    }
+
+    pub(crate) fn read_retained_exact(
+        &self,
+        name: &str,
+        file: &mut File,
+        maximum: u64,
+        exact_mode: u32,
+        label: &str,
+    ) -> Result<Vec<u8>, Failure> {
+        let before = file
+            .metadata()
+            .map_err(|error| Failure::task(format!("could not stat {label}: {error}")))?;
+        if !bounded_regular(&before, maximum, None) || before.mode() & 0o7777 != exact_mode {
+            return Err(Failure::task(format!(
+                "{label} is not the expected retained regular file"
+            )));
+        }
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| Failure::task(format!("could not rewind {label}: {error}")))?;
+        let capacity = usize::try_from(before.len())
+            .map_err(|_| Failure::task(format!("{label} length exceeds host address space")))?;
+        let mut bytes = Vec::with_capacity(capacity);
+        Read::by_ref(file)
+            .take(maximum.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|error| Failure::task(format!("could not read {label}: {error}")))?;
+        let after = file
+            .metadata()
+            .map_err(|error| Failure::task(format!("could not recheck {label}: {error}")))?;
+        if stable_identity(&before) != stable_identity(&after)
+            || bytes.len() as u64 != before.len()
+            || after.mode() & 0o7777 != exact_mode
         {
             return Err(Failure::task(format!("{label} changed while reading")));
         }
@@ -300,6 +365,16 @@ impl Directory {
         label: &str,
     ) -> Result<File, Failure> {
         let (file, _) = self.open_bounded(name, exact, Some(exact), label)?;
+        Ok(file)
+    }
+
+    pub(crate) fn open_retained_file(
+        &self,
+        name: &str,
+        maximum: u64,
+        label: &str,
+    ) -> Result<File, Failure> {
+        let (file, _) = self.open_bounded(name, maximum, None, label)?;
         Ok(file)
     }
 

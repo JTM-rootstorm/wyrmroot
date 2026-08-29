@@ -7,7 +7,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env,
     ffi::{OsStr, OsString},
-    fs::{self, Permissions},
+    fs::{self, File, Permissions},
     os::unix::fs::PermissionsExt,
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
@@ -65,6 +65,17 @@ struct Snapshot {
     observation: Vec<u8>,
 }
 
+struct OpenedProduct {
+    repository: PathBuf,
+    deep: PathBuf,
+    base: Directory,
+    base_mode: u32,
+    name: String,
+    root: Directory,
+    directories: wyr1c::FrozenDirectories,
+    request: File,
+}
+
 pub(crate) fn freeze(output: &Path) -> Result<String, Failure> {
     reject_ambient()?;
     let (repository, project, deep, base) = project_context()?;
@@ -72,11 +83,12 @@ pub(crate) fn freeze(output: &Path) -> Result<String, Failure> {
     let deep_revision = clean_revision(&deep, "Deepwyrm")?;
     validate_abi_tree(&deep, &deep_revision)?;
     let output_name = direct_output_name(output, base.path())?;
+    let base_mode = base.owned_container_mode("C2 output base")?;
     if base.exists(&output_name, "C2 output")? {
         return Err(Failure::task("C2 output must be a fresh nonexistent path"));
     }
     let root = base.create_child(&output_name, 0o700, "C2 output")?;
-    let c1 = wyr1c::build_into(&root)?;
+    let mut c1 = wyr1c::build_into(&root)?;
     if c1.validated.wyrmroot_revision != wyrm_revision {
         return Err(Failure::task(
             "C2 C1 product revision changed during freeze",
@@ -141,9 +153,9 @@ pub(crate) fn freeze(output: &Path) -> Result<String, Failure> {
         return Err(Failure::task("C2 loader inspection exceeds its bound"));
     }
 
-    let artifacts = root.open_child("artifacts", "C2 artifacts")?;
-    let inspections = root.open_child("inspections", "C2 inspections")?;
-    let product = root.open_child("product", "C2 product")?;
+    let artifacts = &c1.publication.directories.artifacts;
+    let inspections = &c1.publication.directories.inspections;
+    let product = &c1.publication.directories.product;
     artifacts.write_new("loader.efi", &loader, 0o400, "C2 loader")?;
     artifacts.write_new("bootstrap.elf", &bootstrap, 0o400, "C2 bootstrap")?;
     artifacts.write_new("deepwyrm.elf", &kernel, 0o400, "C2 kernel")?;
@@ -192,7 +204,8 @@ pub(crate) fn freeze(output: &Path) -> Result<String, Failure> {
         deep_revision: &deep_revision,
     });
     let request = render(REQUEST_KIND, &fields);
-    root.write_new(REQUEST_NAME, request.as_bytes(), 0o400, "C2 request")?;
+    let mut request_file =
+        root.write_new_retained(REQUEST_NAME, request.as_bytes(), 0o400, "C2 request")?;
     let base_receipt = render_base_receipt(request.as_bytes(), &fields);
     root.write_new(
         RECEIPT_NAME,
@@ -201,11 +214,26 @@ pub(crate) fn freeze(output: &Path) -> Result<String, Failure> {
         "C2 base receipt",
     )?;
 
-    validate_root(&repository, &deep, &root)?;
+    validate_root(
+        &repository,
+        &deep,
+        &root,
+        &c1.publication.directories,
+        &mut request_file,
+    )?;
     verify_clean_revision(&repository, "Wyrmroot", &wyrm_revision)?;
     verify_clean_revision(&deep, "Deepwyrm", &deep_revision)?;
     toolchain.accepted().verify_unchanged()?;
-    verify_request_root_name(&base, &output_name, &root, &output.join(REQUEST_NAME))?;
+    c1.verify_published_contents(&root)?;
+    verify_request_publication(
+        (&base, base_mode),
+        &output_name,
+        &root,
+        &c1.publication.directories,
+        &mut request_file,
+        request.as_bytes(),
+        &output.join(REQUEST_NAME),
+    )?;
     Ok(format!(
         "WYR1_C2_FREEZE_PASS selector=none evidence=not-produced request={}\n",
         output.join(REQUEST_NAME).display()
@@ -213,12 +241,18 @@ pub(crate) fn freeze(output: &Path) -> Result<String, Failure> {
 }
 
 pub(crate) fn image(request: &Path) -> Result<String, Failure> {
-    let (repository, _, deep, base, name, root) = open_request_root(request)?;
-    let initial = validate_root(&repository, &deep, &root)?;
+    let mut opened = open_request_root(request)?;
+    let initial = validate_root(
+        &opened.repository,
+        &opened.deep,
+        &opened.root,
+        &opened.directories,
+        &mut opened.request,
+    )?;
     let initial_request = initial.request.clone();
-    let product = root.open_child("product", "C2 product")?;
+    let product = &opened.directories.product;
     if product.exists("esp.img", "C2 ESP")?
-        || root.exists(IMAGE_RECEIPT_NAME, "C2 image receipt")?
+        || opened.root.exists(IMAGE_RECEIPT_NAME, "C2 image receipt")?
     {
         return Err(Failure::task("C2 ESP and image receipt must both be fresh"));
     }
@@ -236,43 +270,83 @@ pub(crate) fn image(request: &Path) -> Result<String, Failure> {
     product.verify_file("esp.img", &image, "C2 ESP")?;
     let fields = canonical_request_fields(&initial)?;
     let receipt = render_image_receipt(&initial.request, &fields, &report);
-    root.write_new(
+    opened.root.write_new(
         IMAGE_RECEIPT_NAME,
         receipt.as_bytes(),
         0o400,
         "C2 image receipt",
     )?;
-    let final_snapshot = validate_root(&repository, &deep, &root)?;
+    let final_snapshot = validate_root(
+        &opened.repository,
+        &opened.deep,
+        &opened.root,
+        &opened.directories,
+        &mut opened.request,
+    )?;
     if final_snapshot.request != initial_request {
         return Err(Failure::task(
             "C2 request changed while constructing the ESP",
         ));
     }
-    verify_request_root_name(&base, &name, &root, request)?;
+    verify_request_publication(
+        (&opened.base, opened.base_mode),
+        &opened.name,
+        &opened.root,
+        &opened.directories,
+        &mut opened.request,
+        &initial_request,
+        request,
+    )?;
     Ok(format!(
         "WYR1_C2_IMAGE_PASS selector=none evidence=not-produced esp={}\n",
-        root.path().join("product/esp.img").display()
+        opened.root.path().join("product/esp.img").display()
     ))
 }
 
 pub(crate) fn inspect(request: &Path) -> Result<String, Failure> {
-    let (repository, _, deep, base, name, root) = open_request_root(request)?;
-    let snapshot = validate_root(&repository, &deep, &root)?;
-    verify_request_root_name(&base, &name, &root, request)?;
+    let mut opened = open_request_root(request)?;
+    let snapshot = validate_root(
+        &opened.repository,
+        &opened.deep,
+        &opened.root,
+        &opened.directories,
+        &mut opened.request,
+    )?;
+    verify_request_publication(
+        (&opened.base, opened.base_mode),
+        &opened.name,
+        &opened.root,
+        &opened.directories,
+        &mut opened.request,
+        &snapshot.request,
+        request,
+    )?;
     Ok(format!(
         "WYR1_C2_INSPECTION_PASS selector=none evidence=not-produced request_sha256={}\n",
         sha256::bytes_digest(&snapshot.request)
     ))
 }
 
-fn validate_root(repository: &Path, deep: &Path, root: &Directory) -> Result<Snapshot, Failure> {
-    let artifacts = root.open_child("artifacts", "C2 artifacts")?;
-    let inspections = root.open_child("inspections", "C2 inspections")?;
-    let product = root.open_child("product", "C2 product")?;
+fn validate_root(
+    repository: &Path,
+    deep: &Path,
+    root: &Directory,
+    directories: &wyr1c::FrozenDirectories,
+    request: &mut File,
+) -> Result<Snapshot, Failure> {
+    let artifacts = &directories.artifacts;
+    let inspections = &directories.inspections;
+    let product = &directories.product;
     let snapshot = Snapshot {
-        request: root.read(REQUEST_NAME, MAX_REPORT_BYTES, "C2 request")?,
+        request: root.read_retained_exact(
+            REQUEST_NAME,
+            request,
+            MAX_REPORT_BYTES,
+            0o400,
+            "C2 request",
+        )?,
         request_values: BTreeMap::new(),
-        c1: wyr1c::snapshot_from_directory(root)?,
+        c1: wyr1c::snapshot_from_directories(directories)?,
         loader: artifacts.read("loader.efi", MAX_BYTES, "C2 loader")?,
         kernel: artifacts.read("deepwyrm.elf", MAX_BYTES, "C2 kernel")?,
         bootstrap: artifacts.read("bootstrap.elf", MAX_BYTES, "C2 bootstrap")?,
@@ -286,13 +360,14 @@ fn validate_root(repository: &Path, deep: &Path, root: &Directory) -> Result<Sna
         wrdm: product.read(WRDM_NAME, MAX_REPORT_BYTES, "C2 WRDM")?,
         observation: product.read(CONFIG_NAME, MAX_REPORT_BYTES, "C2 observation")?,
     };
-    validate_snapshot(repository, deep, root, snapshot)
+    validate_snapshot(repository, deep, root, product, snapshot)
 }
 
 fn validate_snapshot(
     repository: &Path,
     deep: &Path,
     root: &Directory,
+    product: &Directory,
     mut snapshot: Snapshot,
 ) -> Result<Snapshot, Failure> {
     let c1 = wyr1c::validate_frozen_product(repository, &snapshot.c1)?;
@@ -376,7 +451,6 @@ fn validate_snapshot(
         ));
     }
 
-    let product = root.open_child("product", "C2 product")?;
     let image_exists = product.exists("esp.img", "C2 ESP")?;
     let receipt_exists = root.exists(IMAGE_RECEIPT_NAME, "C2 image receipt")?;
     require_image_pair(image_exists, receipt_exists)?;
@@ -622,10 +696,8 @@ fn direct_output_name(output: &Path, base: &Path) -> Result<String, Failure> {
         .ok_or_else(|| Failure::task("C2 output name is not UTF-8"))
 }
 
-fn open_request_root(
-    request: &Path,
-) -> Result<(PathBuf, PathBuf, PathBuf, Directory, String, Directory), Failure> {
-    let (repository, project, deep, base) = project_context()?;
+fn open_request_root(request: &Path) -> Result<OpenedProduct, Failure> {
+    let (repository, _, deep, base) = project_context()?;
     if !request.is_absolute()
         || request.file_name() != Some(OsStr::new(REQUEST_NAME))
         || request
@@ -638,22 +710,65 @@ fn open_request_root(
         .parent()
         .ok_or_else(|| Failure::task("C2 request has no product root"))?;
     let name = direct_output_name(parent, base.path())?;
+    let base_mode = base.owned_container_mode("C2 output base")?;
     let root = base.open_child(&name, "C2 product root")?;
-    verify_request_root_name(&base, &name, &root, request)?;
-    Ok((repository, project, deep, base, name, root))
+    let directories = wyr1c::open_frozen_directories(&root)?;
+    let mut request_file = root.open_retained_file(REQUEST_NAME, MAX_REPORT_BYTES, "C2 request")?;
+    let request_bytes = root.read_retained_exact(
+        REQUEST_NAME,
+        &mut request_file,
+        MAX_REPORT_BYTES,
+        0o400,
+        "C2 request",
+    )?;
+    verify_request_publication(
+        (&base, base_mode),
+        &name,
+        &root,
+        &directories,
+        &mut request_file,
+        &request_bytes,
+        request,
+    )?;
+    Ok(OpenedProduct {
+        repository,
+        deep,
+        base,
+        base_mode,
+        name,
+        root,
+        directories,
+        request: request_file,
+    })
 }
 
-fn verify_request_root_name(
-    base: &Directory,
+fn verify_request_publication(
+    base: (&Directory, u32),
     name: &str,
     root: &Directory,
+    directories: &wyr1c::FrozenDirectories,
+    request_file: &mut File,
+    expected_request: &[u8],
     request: &Path,
 ) -> Result<(), Failure> {
+    let (base, base_mode) = base;
+    base.verify_owned_container_path_mode(base_mode, "C2 output base")?;
     base.verify_child_identity(name, root, 0o700, "C2 product root")?;
     if request != root.path().join(REQUEST_NAME) {
         return Err(Failure::task(
             "C2 request path does not name the retained product generation",
         ));
+    }
+    wyr1c::verify_published_contents_without_receipt(root, directories)?;
+    let actual_request = root.read_retained_exact(
+        REQUEST_NAME,
+        request_file,
+        MAX_REPORT_BYTES,
+        0o400,
+        "C2 request",
+    )?;
+    if actual_request != expected_request {
+        return Err(Failure::task("C2 retained request bytes changed"));
     }
     Ok(())
 }
@@ -986,6 +1101,55 @@ mod tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt, symlink};
 
+    fn publication_fixture(
+        label: &str,
+    ) -> (
+        PathBuf,
+        Directory,
+        u32,
+        Directory,
+        wyr1c::FrozenDirectories,
+        File,
+        Vec<u8>,
+    ) {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock precedes Unix epoch")
+            .as_nanos();
+        let parent = std::env::temp_dir().join(format!(
+            "wyrmroot-c2-publication-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&parent).expect("create publication parent");
+        fs::set_permissions(&parent, Permissions::from_mode(0o755))
+            .expect("set publication parent mode");
+        let base = Directory::open_exact(&parent, "publication parent").unwrap();
+        let base_mode = base.owned_container_mode("publication parent").unwrap();
+        let root = base
+            .create_child("generation", 0o700, "generation")
+            .unwrap();
+        let directories = wyr1c::FrozenDirectories {
+            artifacts: root.create_child("artifacts", 0o700, "artifacts").unwrap(),
+            inspections: root
+                .create_child("inspections", 0o700, "inspections")
+                .unwrap(),
+            product: root.create_child("product", 0o700, "product").unwrap(),
+        };
+        let request_bytes = b"bound request\n".to_vec();
+        let request = root
+            .write_new_retained(REQUEST_NAME, &request_bytes, 0o400, "request")
+            .unwrap();
+        (
+            parent,
+            base,
+            base_mode,
+            root,
+            directories,
+            request,
+            request_bytes,
+        )
+    }
+
     #[test]
     fn reviewed_source_requires_byte_identity_and_semantic_identity() {
         let compiled = compile_source(SOURCE, [7; 32]).unwrap();
@@ -1135,27 +1299,191 @@ mod tests {
     }
 
     #[test]
-    fn published_request_name_cannot_be_redirected_to_another_tree() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock precedes Unix epoch")
-            .as_nanos();
-        let parent = std::env::temp_dir().join(format!(
-            "wyrmroot-c2-published-name-{}-{nonce}",
-            std::process::id()
-        ));
-        fs::create_dir(&parent).expect("create publication parent");
-        let base = Directory::open_exact(&parent, "publication parent").unwrap();
-        let root = base
-            .create_child("generation", 0o700, "generation")
-            .unwrap();
-        let request = parent.join("generation").join(REQUEST_NAME);
-        verify_request_root_name(&base, "generation", &root, &request).unwrap();
-
+    fn published_root_and_returned_request_path_cannot_be_redirected() {
+        let (parent, base, base_mode, root, directories, mut request_file, request_bytes) =
+            publication_fixture("root");
+        let request_path = parent.join("generation").join(REQUEST_NAME);
+        verify_request_publication(
+            (&base, base_mode),
+            "generation",
+            &root,
+            &directories,
+            &mut request_file,
+            &request_bytes,
+            &request_path,
+        )
+        .unwrap();
+        fs::set_permissions(parent.join("generation"), Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            verify_request_publication(
+                (&base, base_mode),
+                "generation",
+                &root,
+                &directories,
+                &mut request_file,
+                &request_bytes,
+                &request_path,
+            )
+            .is_err()
+        );
+        fs::set_permissions(parent.join("generation"), Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            verify_request_publication(
+                (&base, base_mode),
+                "generation",
+                &root,
+                &directories,
+                &mut request_file,
+                &request_bytes,
+                &parent.join("generation/not-the-request.toml"),
+            )
+            .is_err()
+        );
         fs::rename(parent.join("generation"), parent.join("original")).unwrap();
         fs::create_dir(parent.join("generation")).unwrap();
         fs::set_permissions(parent.join("generation"), Permissions::from_mode(0o700)).unwrap();
-        assert!(verify_request_root_name(&base, "generation", &root, &request).is_err());
+        assert!(
+            verify_request_publication(
+                (&base, base_mode),
+                "generation",
+                &root,
+                &directories,
+                &mut request_file,
+                &request_bytes,
+                &request_path,
+            )
+            .is_err()
+        );
         fs::remove_dir_all(parent).expect("remove publication fixture");
+    }
+
+    #[test]
+    fn published_child_and_request_replacements_are_rejected() {
+        let (parent, base, base_mode, root, directories, mut request_file, request_bytes) =
+            publication_fixture("child");
+        let request_path = parent.join("generation").join(REQUEST_NAME);
+        fs::set_permissions(
+            parent.join("generation/artifacts"),
+            Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert!(
+            verify_request_publication(
+                (&base, base_mode),
+                "generation",
+                &root,
+                &directories,
+                &mut request_file,
+                &request_bytes,
+                &request_path,
+            )
+            .is_err()
+        );
+        fs::set_permissions(
+            parent.join("generation/artifacts"),
+            Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        fs::rename(
+            parent.join("generation/artifacts"),
+            parent.join("generation/artifacts-original"),
+        )
+        .unwrap();
+        fs::create_dir(parent.join("generation/artifacts")).unwrap();
+        fs::set_permissions(
+            parent.join("generation/artifacts"),
+            Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        assert!(
+            verify_request_publication(
+                (&base, base_mode),
+                "generation",
+                &root,
+                &directories,
+                &mut request_file,
+                &request_bytes,
+                &request_path,
+            )
+            .is_err()
+        );
+        fs::remove_dir_all(parent).expect("remove child replacement fixture");
+
+        let (parent, base, base_mode, root, directories, mut request_file, request_bytes) =
+            publication_fixture("request");
+        let request_path = parent.join("generation").join(REQUEST_NAME);
+        fs::set_permissions(&request_path, Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            verify_request_publication(
+                (&base, base_mode),
+                "generation",
+                &root,
+                &directories,
+                &mut request_file,
+                &request_bytes,
+                &request_path,
+            )
+            .is_err()
+        );
+        fs::set_permissions(&request_path, Permissions::from_mode(0o400)).unwrap();
+        fs::rename(
+            &request_path,
+            parent.join("generation/request-original.toml"),
+        )
+        .unwrap();
+        fs::write(&request_path, &request_bytes).unwrap();
+        fs::set_permissions(&request_path, Permissions::from_mode(0o400)).unwrap();
+        assert!(
+            verify_request_publication(
+                (&base, base_mode),
+                "generation",
+                &root,
+                &directories,
+                &mut request_file,
+                &request_bytes,
+                &request_path,
+            )
+            .is_err()
+        );
+        fs::remove_dir_all(parent).expect("remove request replacement fixture");
+    }
+
+    #[test]
+    fn published_base_rename_and_replacement_is_rejected() {
+        let (parent, base, base_mode, root, directories, mut request_file, request_bytes) =
+            publication_fixture("base");
+        let request_path = parent.join("generation").join(REQUEST_NAME);
+        fs::set_permissions(&parent, Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            verify_request_publication(
+                (&base, base_mode),
+                "generation",
+                &root,
+                &directories,
+                &mut request_file,
+                &request_bytes,
+                &request_path,
+            )
+            .is_err()
+        );
+        fs::set_permissions(&parent, Permissions::from_mode(base_mode)).unwrap();
+        let moved = parent.with_extension("moved");
+        fs::rename(&parent, &moved).unwrap();
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            verify_request_publication(
+                (&base, base_mode),
+                "generation",
+                &root,
+                &directories,
+                &mut request_file,
+                &request_bytes,
+                &request_path,
+            )
+            .is_err()
+        );
+        fs::remove_dir_all(parent).expect("remove replacement base");
+        fs::remove_dir_all(moved).expect("remove original base");
     }
 }

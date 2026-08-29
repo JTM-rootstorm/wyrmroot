@@ -19,6 +19,8 @@ const UEFI_DEBUG_TARGET_DIRECTORY: &str = "target/wyr0-b-symbols";
 const TOOLCHAIN_REQUEST: &str = "toolchain/requests/RUST-WYR0-I-B-SYSROOTS-007.toml";
 const MAX_LOADER_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DEBUG_SYMBOL_BYTES: u64 = 512 * 1024 * 1024;
+pub(crate) const INSPECTION_PATH: &str = "/usr/lib/llvm/22/bin:/usr/bin:/bin";
+const INSPECTION_SHELL: &str = "/bin/sh";
 const DEEP_LAYOUT_POLICY_ENV: &str = "WYRMROOT_DEEP_LAYOUT_POLICY_RS";
 const BOOTFS_PACKAGE: &str = "wyrmroot-bootfs";
 const BOOTFS_BUILDER_FEATURE: &str = "builder";
@@ -513,12 +515,11 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let output = Command::new("sh")
+    let output = Command::new(INSPECTION_SHELL)
         .arg(script)
         .args(arguments)
-        .env_remove("LD_AUDIT")
-        .env_remove("LD_LIBRARY_PATH")
-        .env_remove("LD_PRELOAD")
+        .env_clear()
+        .env("PATH", INSPECTION_PATH)
         .current_dir(repository)
         .stdin(Stdio::null())
         .output()
@@ -1355,15 +1356,18 @@ fn child_status(code: Option<i32>) -> String {
 mod tests {
     use super::{
         BOOTFS_BUILD_ARGUMENTS, BOOTFS_PACKAGE, BOOTFS_TEST_ARGUMENTS, DW1C_INIT0_TEST_ARGUMENTS,
-        IsolatedUefiBuild, LoaderLinkMode, UefiCargoProfile, blocked_toolchain_failure,
-        canonical_build_directory, component_package, encoded_uefi_rustflags,
-        encoded_uefi_rustflags_for_target, explicit_test_filter, host_test_arguments,
-        host_test_commands, prepare_uefi_target_roots, render_uefi_inspection_report,
-        validate_regular_artifact, validate_uefi_inspection_report,
+        INSPECTION_PATH, INSPECTION_SHELL, IsolatedUefiBuild, LoaderLinkMode, UefiCargoProfile,
+        blocked_toolchain_failure, canonical_build_directory, component_package,
+        encoded_uefi_rustflags, encoded_uefi_rustflags_for_target, explicit_test_filter,
+        host_test_arguments, host_test_commands, prepare_uefi_target_roots,
+        render_uefi_inspection_report, run_verified_report, validate_regular_artifact,
+        validate_uefi_inspection_report,
     };
     use crate::error::Failure;
     use crate::sha256::bytes_digest;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1552,6 +1556,86 @@ mod tests {
         assert!(
             validate_uefi_inspection_report(malformed_debug_hash.as_bytes(), b"loader").is_err()
         );
+    }
+
+    #[test]
+    fn verified_inspector_ignores_hostile_ambient_path() {
+        const CHILD_ROOT: &str = "WYRMROOT_TEST_HERMETIC_INSPECTOR_ROOT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let repository = Path::new(&root).join("repository");
+            let report = run_verified_report(
+                &repository,
+                "inspect.sh",
+                std::iter::empty::<&str>(),
+                "hermetic inspector test",
+            )
+            .expect("fixed inspector environment must pass");
+            assert_eq!(report, "{\"verified\": true}\n");
+            return;
+        }
+
+        assert_eq!(INSPECTION_SHELL, "/bin/sh");
+        assert_eq!(INSPECTION_PATH, "/usr/lib/llvm/22/bin:/usr/bin:/bin");
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock precedes Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "wyrmroot-hermetic-inspector-{}-{nonce}",
+            std::process::id()
+        ));
+        let hostile = root.join("hostile");
+        let repository = root.join("repository");
+        fs::create_dir_all(&hostile).expect("create hostile PATH");
+        fs::create_dir(&repository).expect("create inspector repository");
+        for tool in [
+            "sh",
+            "llvm-readobj",
+            "llvm-pdbutil",
+            "sha256sum",
+            "wc",
+            "awk",
+            "grep",
+            "sed",
+            "tr",
+        ] {
+            let shim = hostile.join(tool);
+            fs::write(&shim, "#!/bin/sh\nexit 99\n").expect("write hostile shim");
+            fs::set_permissions(&shim, fs::Permissions::from_mode(0o755))
+                .expect("make hostile shim executable");
+        }
+        fs::write(
+            repository.join("inspect.sh"),
+            concat!(
+                "#!/bin/sh\nset -eu\n",
+                "test \"$PATH\" = '/usr/lib/llvm/22/bin:/usr/bin:/bin'\n",
+                "test \"$(command -v sh)\" = '/usr/bin/sh'\n",
+                "test \"$(command -v llvm-readobj)\" = '/usr/lib/llvm/22/bin/llvm-readobj'\n",
+                "test \"$(command -v llvm-pdbutil)\" = '/usr/lib/llvm/22/bin/llvm-pdbutil'\n",
+                "test \"$(command -v sha256sum)\" = '/usr/bin/sha256sum'\n",
+                "test \"$(command -v wc)\" = '/usr/bin/wc'\n",
+                "test \"$(command -v awk)\" = '/usr/bin/awk'\n",
+                "test \"$(command -v grep)\" = '/usr/bin/grep'\n",
+                "test \"$(command -v sed)\" = '/usr/bin/sed'\n",
+                "test \"$(command -v tr)\" = '/usr/bin/tr'\n",
+                "printf '%s\\n' '{\"verified\": true}'\n",
+            ),
+        )
+        .expect("write inspection script");
+
+        let status = Command::new(std::env::current_exe().expect("locate test executable"))
+            .args([
+                "--exact",
+                "tasks::tests::verified_inspector_ignores_hostile_ambient_path",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("PATH", &hostile)
+            .env(CHILD_ROOT, &root)
+            .status()
+            .expect("spawn hostile-environment test child");
+        assert!(status.success());
+        fs::remove_dir_all(root).expect("remove hermetic inspector fixture");
     }
 
     #[test]
