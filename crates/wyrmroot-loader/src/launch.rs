@@ -16,6 +16,7 @@ pub const HEADER_BYTES: usize = 40;
 pub const INIT0_BYTES: usize = 64;
 pub const SUPERVISOR_BYTES: usize = 64;
 pub const PROBE_CHILD_BYTES: usize = 48;
+pub const DEVICE_COORDINATOR_BYTES: usize = 72;
 pub const MAX_CAPABILITIES: usize = 3;
 
 const MAGIC: &[u8; 4] = b"WRLP";
@@ -127,7 +128,11 @@ impl LaunchProfile {
     }
 
     pub const fn init_size(self) -> usize {
-        HEADER_BYTES + self.capability_count() * 8
+        if matches!(self, Self::DeviceCoordinator) {
+            DEVICE_COORDINATOR_BYTES
+        } else {
+            HEADER_BYTES + self.capability_count() * 8
+        }
     }
 }
 
@@ -135,6 +140,12 @@ impl LaunchProfile {
 pub struct ParsedMessage {
     pub transaction_id: u64,
     pub profile: LaunchProfile,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceCoordinatorInit {
+    pub transaction_id: u64,
+    pub supervisor_generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -152,9 +163,21 @@ pub enum LaunchError {
     BadCapabilityRole { index: usize },
     HandleCount,
     HandleMetadata { index: usize },
+    ProfileSpecificEncoderRequired,
 }
 
 pub fn encode_init(
+    profile: LaunchProfile,
+    transaction_id: u64,
+    output: &mut [u8],
+) -> Result<usize, LaunchError> {
+    if profile == LaunchProfile::DeviceCoordinator {
+        return Err(LaunchError::ProfileSpecificEncoderRequired);
+    }
+    encode_init_inner(profile, transaction_id, output)
+}
+
+fn encode_init_inner(
     profile: LaunchProfile,
     transaction_id: u64,
     output: &mut [u8],
@@ -208,6 +231,19 @@ pub fn encode_init(
             put_u32(output, HEADER_BYTES + index * 8, role);
         }
     }
+    Ok(size)
+}
+
+pub fn encode_device_coordinator_init(
+    transaction_id: u64,
+    supervisor_generation: u64,
+    output: &mut [u8],
+) -> Result<usize, LaunchError> {
+    if supervisor_generation == 0 {
+        return Err(LaunchError::ZeroTransaction);
+    }
+    let size = encode_init_inner(LaunchProfile::DeviceCoordinator, transaction_id, output)?;
+    put_u64(output, 64, supervisor_generation);
     Ok(size)
 }
 
@@ -318,6 +354,21 @@ pub fn parse_init(
     Ok(ParsedMessage {
         transaction_id,
         profile,
+    })
+}
+
+pub fn parse_device_coordinator_init(
+    bytes: &[u8],
+    handles: &[DwReceivedHandleInfoV1],
+) -> Result<DeviceCoordinatorInit, LaunchError> {
+    let parsed = parse_init(LaunchProfile::DeviceCoordinator, bytes, handles)?;
+    let supervisor_generation = get_u64(bytes, 64);
+    if supervisor_generation == 0 {
+        return Err(LaunchError::ZeroTransaction);
+    }
+    Ok(DeviceCoordinatorInit {
+        transaction_id: parsed.transaction_id,
+        supervisor_generation,
     })
 }
 
