@@ -13,6 +13,9 @@ path = "src/lib.rs"
 default = []
 builder = []
 
+[dependencies]
+wyrmroot-device-proto = { path = "../wyrmroot-device-proto" }
+
 [[bin]]
 name = "wyrmroot-bootfs-build"
 path = "src/bin/build.rs"

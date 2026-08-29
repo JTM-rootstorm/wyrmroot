@@ -118,6 +118,13 @@ pub enum BuildError {
     ArchiveTooLarge,
     /// A host allocation failed before encoding could start.
     AllocationFailure,
+    /// The C1 product marker was not the exact fixed WYR1-C1 marker.
+    WrongC1Marker,
+    /// The supplied immutable WRDM v1 manifest was malformed or did not
+    /// describe the one fixed q35 COM2 role.
+    InvalidC1DeviceManifest,
+    /// The supplied expected UART identity was zero or did not match WRDM.
+    C1DriverIdentityMismatch,
 }
 
 /// The only regular-file metadata forms permitted in a WYR0 bootfs archive.

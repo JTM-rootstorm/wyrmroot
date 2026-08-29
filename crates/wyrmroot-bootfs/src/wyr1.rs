@@ -12,6 +12,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use crate::builder::{BuildError, Builder, FileMode};
+use wyrmroot_device_proto::{Manifest as DeviceManifest, manifest::ContentIdentity};
 
 /// Permanent supervisor executable.
 pub const INIT_PATH: &str = "system/init";
@@ -34,6 +35,8 @@ pub const WYR1_C_DEVICE_MANIFEST_PATH: &str = "system/bootstrap/wyr1-c-device-ma
 /// their protocol/product role.
 pub const WYR1_C_GATE_PATH: &str = WYR1_C_MARKER_PATH;
 pub const WRDM_PATH: &str = WYR1_C_DEVICE_MANIFEST_PATH;
+/// Exact, fixed content of the WYR1-C1 product marker entry.
+pub const WYR1_C1_MARKER: &[u8] = b"WYR1-C1";
 pub const HELLO_PATH: &str = "bin/hello";
 pub const WYR1_B_PUBLISHER_PATH: &str = "test/wyr1-b/publisher";
 pub const WYR1_B_CLIENT_PATH: &str = "test/wyr1-b/client";
@@ -185,6 +188,16 @@ pub struct ProductC1<'a> {
     pub base: Product<'a>,
     pub marker: &'a [u8],
     pub device_manifest: &'a [u8],
+    /// Independently supplied content identity of `system/uart16550d`.
+    ///
+    /// The product producer derives this from the same immutable artifact
+    /// identity used in the WRRM role record.  `build_c1` deliberately does
+    /// not parse WRRM: `wyrmroot-rrc-manifest` already owns that format and
+    /// depends on this crate for archive paths, so making bootfs parse WRRM
+    /// would create a dependency cycle.  This value is the bounded, explicit
+    /// cross-bind between the canonical WRDM role and that producer-owned
+    /// WRRM validation.
+    pub expected_uart16550d_identity: [u8; 32],
 }
 
 impl<'a> ProductC1<'a> {
@@ -205,10 +218,15 @@ impl<'a> ProductC1<'a> {
     }
 }
 
-/// Build the deterministic WYR1-C1 archive. The archive builder supplies the
-/// canonical path order and metadata; this layer only fixes product content
-/// membership and rejects empty entries.
+/// Build the deterministic WYR1-C1 archive.
+///
+/// This admits only the exact product marker and a structurally valid,
+/// canonical q35 COM2 WRDM role whose driver identity equals the independently
+/// supplied UART artifact identity.  Exact WRRM structural/profile validation
+/// remains owned by the RRC manifest product producer; see
+/// [`ProductC1::expected_uart16550d_identity`].
 pub fn build_c1(product: ProductC1<'_>) -> Result<Vec<u8>, BuildError> {
+    validate_c1_product(product)?;
     let mut builder = Builder::new();
     for artifact in product.artifacts() {
         if artifact.bytes.is_empty() {
@@ -227,11 +245,87 @@ pub fn build_c1(product: ProductC1<'_>) -> Result<Vec<u8>, BuildError> {
     builder.build()
 }
 
+fn validate_c1_product(product: ProductC1<'_>) -> Result<(), BuildError> {
+    if product.marker != WYR1_C1_MARKER {
+        return Err(BuildError::WrongC1Marker);
+    }
+    if product
+        .expected_uart16550d_identity
+        .iter()
+        .all(|byte| *byte == 0)
+    {
+        return Err(BuildError::C1DriverIdentityMismatch);
+    }
+    let manifest = DeviceManifest::parse(product.device_manifest)
+        .map_err(|_| BuildError::InvalidC1DeviceManifest)?;
+    manifest
+        .match_com2(ContentIdentity(product.expected_uart16550d_identity))
+        .map_err(|error| match error {
+            wyrmroot_device_proto::ManifestError::WrongContentIdentity => {
+                BuildError::C1DriverIdentityMismatch
+            }
+            _ => BuildError::InvalidC1DeviceManifest,
+        })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::archive::Archive;
     use alloc::vec;
+
+    const UART_IDENTITY: [u8; 32] = [0xa1; 32];
+
+    fn c1_base() -> Product<'static> {
+        Product {
+            init: b"init",
+            registryd: b"registry",
+            devmgr: b"devmgr",
+            uart16550d: b"uart",
+            consoled: b"console",
+            wyrmsh: b"shell",
+            rrc_manifest: b"WRRM",
+            gate_config: b"a",
+        }
+    }
+
+    fn canonical_wrdm(identity: [u8; 32]) -> [u8; 176] {
+        let mut bytes = [0u8; 176];
+        bytes[..4].copy_from_slice(b"WRDM");
+        bytes[4..6].copy_from_slice(&1u16.to_le_bytes());
+        bytes[8..12].copy_from_slice(&176u32.to_le_bytes());
+        bytes[12..14].copy_from_slice(&1u16.to_le_bytes());
+        bytes[16..20].copy_from_slice(&1u32.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+        let record = 32;
+        bytes[record..record + 8].copy_from_slice(&1u64.to_le_bytes());
+        bytes[record + 8..record + 12].copy_from_slice(&2u32.to_le_bytes());
+        bytes[record + 12..record + 16].copy_from_slice(&1u32.to_le_bytes());
+        bytes[record + 16..record + 18].copy_from_slice(&0x2f8u16.to_le_bytes());
+        bytes[record + 18..record + 20].copy_from_slice(&8u16.to_le_bytes());
+        bytes[record + 20..record + 24].copy_from_slice(&3u32.to_le_bytes());
+        bytes[record + 24..record + 26]
+            .copy_from_slice(&(b"system/uart16550d".len() as u16).to_le_bytes());
+        bytes[record + 28..record + 60].copy_from_slice(&identity);
+        bytes[record + 60..record + 64].copy_from_slice(&1u32.to_le_bytes());
+        bytes[record + 72..record + 72 + b"system/uart16550d".len()]
+            .copy_from_slice(b"system/uart16550d");
+        bytes
+    }
+
+    fn c1_product<'a>(
+        marker: &'a [u8],
+        device_manifest: &'a [u8],
+        expected_uart16550d_identity: [u8; 32],
+    ) -> ProductC1<'a> {
+        ProductC1 {
+            base: c1_base(),
+            marker,
+            device_manifest,
+            expected_uart16550d_identity,
+        }
+    }
 
     #[test]
     fn product_is_deterministic_and_has_exact_paths() {
@@ -312,20 +406,8 @@ mod tests {
 
     #[test]
     fn wyr1_c1_is_deterministic_and_retains_old_closure() {
-        let product = ProductC1 {
-            base: Product {
-                init: b"init",
-                registryd: b"registry",
-                devmgr: b"devmgr",
-                uart16550d: b"uart",
-                consoled: b"console",
-                wyrmsh: b"shell",
-                rrc_manifest: b"WRRM",
-                gate_config: b"a",
-            },
-            marker: b"WYR1-C1",
-            device_manifest: b"WRDM\x01",
-        };
+        let device_manifest = canonical_wrdm(UART_IDENTITY);
+        let product = c1_product(WYR1_C1_MARKER, &device_manifest, UART_IDENTITY);
         let first = build_c1(product).unwrap();
         assert_eq!(first, build_c1(product).unwrap());
         let archive = Archive::new(&first).unwrap();
@@ -356,37 +438,36 @@ mod tests {
                 .lookup(WYR1_C_DEVICE_MANIFEST_PATH.as_bytes())
                 .unwrap()
                 .data(),
-            b"WRDM\x01"
+            device_manifest
         );
     }
 
     #[test]
-    fn wyr1_c1_rejects_empty_marker_or_manifest() {
-        let base = Product {
-            init: b"init",
-            registryd: b"registry",
-            devmgr: b"devmgr",
-            uart16550d: b"uart",
-            consoled: b"console",
-            wyrmsh: b"shell",
-            rrc_manifest: b"WRRM",
-            gate_config: b"a",
-        };
+    fn wyr1_c1_rejects_wrong_marker_malformed_wrdm_policy_and_driver_identity() {
+        let device_manifest = canonical_wrdm(UART_IDENTITY);
         assert_eq!(
-            build_c1(ProductC1 {
-                base,
-                marker: b"",
-                device_manifest: b"WRDM",
-            }),
-            Err(BuildError::EmptyArtifact)
+            build_c1(c1_product(b"WYR1-C0", &device_manifest, UART_IDENTITY)),
+            Err(BuildError::WrongC1Marker)
+        );
+        let mut malformed = device_manifest;
+        malformed[..4].copy_from_slice(b"BAD!");
+        assert_eq!(
+            build_c1(c1_product(WYR1_C1_MARKER, &malformed, UART_IDENTITY)),
+            Err(BuildError::InvalidC1DeviceManifest)
+        );
+        let mut wrong_policy = device_manifest;
+        wrong_policy[32 + 16..32 + 18].copy_from_slice(&0x3f8u16.to_le_bytes());
+        assert_eq!(
+            build_c1(c1_product(WYR1_C1_MARKER, &wrong_policy, UART_IDENTITY)),
+            Err(BuildError::InvalidC1DeviceManifest)
         );
         assert_eq!(
-            build_c1(ProductC1 {
-                base,
-                marker: b"marker",
-                device_manifest: b"",
-            }),
-            Err(BuildError::EmptyArtifact)
+            build_c1(c1_product(WYR1_C1_MARKER, &device_manifest, [0xa2; 32])),
+            Err(BuildError::C1DriverIdentityMismatch)
+        );
+        assert_eq!(
+            build_c1(c1_product(WYR1_C1_MARKER, &device_manifest, [0; 32])),
+            Err(BuildError::C1DriverIdentityMismatch)
         );
     }
 }
