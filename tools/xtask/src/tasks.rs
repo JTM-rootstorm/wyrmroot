@@ -105,7 +105,7 @@ pub(crate) struct IsolatedUefiBuild<'a> {
 
 struct UefiCargoInvocation<'a> {
     cargo_home: &'a Path,
-    target_directory: &'a Path,
+    target_directory: UefiTargetDirectory<'a>,
     cargo_profile: UefiCargoProfile,
     link_mode: LoaderLinkMode,
     operation: UefiCargoOperation,
@@ -123,14 +123,48 @@ pub(crate) struct DeterministicUefiArtifacts {
 }
 
 struct UefiTargetAuthority {
-    _production: crate::secure_fs::InheritableDirectory,
-    _retained_debug: crate::secure_fs::InheritableDirectory,
+    production: crate::secure_fs::InheritableDirectory,
+    retained_debug: crate::secure_fs::InheritableDirectory,
 }
 
 struct PreparedUefiTargetRoots {
     production: PathBuf,
     retained_debug: PathBuf,
     authority: Option<UefiTargetAuthority>,
+}
+
+#[derive(Clone, Copy)]
+enum UefiTargetDirectory<'a> {
+    Canonical(&'a Path),
+    Retained(&'a crate::secure_fs::InheritableDirectory),
+}
+
+impl UefiTargetDirectory<'_> {
+    fn verified_path(self, label: &str) -> Result<PathBuf, Failure> {
+        match self {
+            Self::Canonical(path) => canonical_build_directory(path, label),
+            Self::Retained(directory) => {
+                directory.verify_unchanged(label)?;
+                Ok(directory.path().to_path_buf())
+            }
+        }
+    }
+}
+
+impl PreparedUefiTargetRoots {
+    fn production_target(&self) -> UefiTargetDirectory<'_> {
+        self.authority.as_ref().map_or(
+            UefiTargetDirectory::Canonical(&self.production),
+            |authority| UefiTargetDirectory::Retained(&authority.production),
+        )
+    }
+
+    fn retained_debug_target(&self) -> UefiTargetDirectory<'_> {
+        self.authority.as_ref().map_or(
+            UefiTargetDirectory::Canonical(&self.retained_debug),
+            |authority| UefiTargetDirectory::Retained(&authority.retained_debug),
+        )
+    }
 }
 
 impl LoaderToolchain {
@@ -502,7 +536,7 @@ fn build_deterministic_uefi_pair_with_authority(
         layout,
         &UefiCargoInvocation {
             cargo_home: &cargo_home,
-            target_directory: production_target,
+            target_directory: target_roots.production_target(),
             cargo_profile: build.cargo_profile,
             link_mode: LoaderLinkMode::Production,
             operation: UefiCargoOperation::Check,
@@ -515,7 +549,7 @@ fn build_deterministic_uefi_pair_with_authority(
         layout,
         &UefiCargoInvocation {
             cargo_home: &cargo_home,
-            target_directory: retained_debug_target,
+            target_directory: target_roots.retained_debug_target(),
             cargo_profile: build.cargo_profile,
             link_mode: LoaderLinkMode::RetainedDebug,
             operation: UefiCargoOperation::Build,
@@ -528,7 +562,7 @@ fn build_deterministic_uefi_pair_with_authority(
         layout,
         &UefiCargoInvocation {
             cargo_home: &cargo_home,
-            target_directory: production_target,
+            target_directory: target_roots.production_target(),
             cargo_profile: build.cargo_profile,
             link_mode: LoaderLinkMode::Production,
             operation: UefiCargoOperation::Build,
@@ -593,8 +627,8 @@ fn prepare_uefi_target_roots(
             production: production.path().to_path_buf(),
             retained_debug: retained_debug.path().to_path_buf(),
             authority: Some(UefiTargetAuthority {
-                _production: production,
-                _retained_debug: retained_debug,
+                production,
+                retained_debug,
             }),
         });
     }
@@ -661,6 +695,9 @@ fn run_uefi_cargo(
         .rust_lld
         .to_str()
         .ok_or_else(|| Failure::task("accepted rust-lld path is not valid UTF-8"))?;
+    let target_directory = invocation
+        .target_directory
+        .verified_path("Cargo target root")?;
     let encoded_rustflags = deterministic_uefi_rustflags(
         repository,
         invocation.cargo_home,
@@ -686,7 +723,7 @@ fn run_uefi_cargo(
         .arg("--target")
         .arg(&profile.rust_target)
         .arg("--target-dir")
-        .arg(invocation.target_directory)
+        .arg(&target_directory)
         .env("CARGO_HOME", invocation.cargo_home)
         .env("RUSTC", &toolchain.accepted.rustc)
         .env("CARGO_ENCODED_RUSTFLAGS", encoded_rustflags)
@@ -702,7 +739,11 @@ fn run_uefi_cargo(
         .env_remove("LD_PRELOAD")
         .current_dir(repository)
         .stdin(Stdio::null())
-        .status()
+        .status();
+    invocation
+        .target_directory
+        .verified_path("Cargo target root")?;
+    let status = status
         .map_err(|error| Failure::task(format!("could not run Cargo {operation}: {error}")))?;
     layout.verify_unchanged()?;
     toolchain.accepted.verify_unchanged()?;
@@ -719,12 +760,12 @@ fn run_uefi_cargo(
 fn deterministic_uefi_rustflags(
     repository: &Path,
     cargo_home: &Path,
-    target_directory: &Path,
+    target_directory: UefiTargetDirectory<'_>,
     sysroot: &str,
     rust_lld: &str,
     link_mode: LoaderLinkMode,
 ) -> Result<String, Failure> {
-    encoded_uefi_rustflags(
+    encoded_uefi_rustflags_for_target(
         repository,
         cargo_home,
         target_directory,
@@ -734,6 +775,7 @@ fn deterministic_uefi_rustflags(
     )
 }
 
+#[cfg(test)]
 fn encoded_uefi_rustflags(
     repository: &Path,
     cargo_home: &Path,
@@ -742,9 +784,27 @@ fn encoded_uefi_rustflags(
     rust_lld: &str,
     link_mode: LoaderLinkMode,
 ) -> Result<String, Failure> {
+    encoded_uefi_rustflags_for_target(
+        repository,
+        cargo_home,
+        UefiTargetDirectory::Canonical(target_directory),
+        sysroot,
+        rust_lld,
+        link_mode,
+    )
+}
+
+fn encoded_uefi_rustflags_for_target(
+    repository: &Path,
+    cargo_home: &Path,
+    target_directory: UefiTargetDirectory<'_>,
+    sysroot: &str,
+    rust_lld: &str,
+    link_mode: LoaderLinkMode,
+) -> Result<String, Failure> {
     let repository = canonical_build_directory(repository, "Wyrmroot repository")?;
     let cargo_home = canonical_build_directory(cargo_home, "Cargo home")?;
-    let target_directory = canonical_build_directory(target_directory, "Cargo target root")?;
+    let target_directory = target_directory.verified_path("Cargo target root")?;
     let repository = repository
         .to_str()
         .ok_or_else(|| Failure::task("Wyrmroot repository path is not valid UTF-8"))?;
@@ -992,9 +1052,9 @@ mod tests {
     use super::{
         BOOTFS_BUILD_ARGUMENTS, BOOTFS_PACKAGE, BOOTFS_TEST_ARGUMENTS, DW1C_INIT0_TEST_ARGUMENTS,
         IsolatedUefiBuild, LoaderLinkMode, UefiCargoProfile, blocked_toolchain_failure,
-        canonical_build_directory, component_package, encoded_uefi_rustflags, explicit_test_filter,
-        host_test_arguments, host_test_commands, prepare_uefi_target_roots,
-        validate_regular_artifact,
+        canonical_build_directory, component_package, encoded_uefi_rustflags,
+        encoded_uefi_rustflags_for_target, explicit_test_filter, host_test_arguments,
+        host_test_commands, prepare_uefi_target_roots, validate_regular_artifact,
     };
     use crate::error::Failure;
     use std::fs;
@@ -1180,6 +1240,36 @@ mod tests {
             let targets = prepare_uefi_target_roots(&build, Some(authority))?;
             let production = &targets.production;
             let retained = &targets.retained_debug;
+            if encoded_uefi_rustflags(
+                &root,
+                &root,
+                production,
+                "/accepted/sysroot",
+                "/accepted/rust-lld",
+                LoaderLinkMode::Production,
+            )
+            .is_ok()
+            {
+                return Err(Failure::task(
+                    "ordinary rustflags validator admitted a procfd target",
+                ));
+            }
+            let flags = encoded_uefi_rustflags_for_target(
+                &root,
+                &root,
+                targets.production_target(),
+                "/accepted/sysroot",
+                "/accepted/rust-lld",
+                LoaderLinkMode::Production,
+            )?;
+            if !flags.contains(&format!(
+                "--remap-path-prefix={}=/cargo-target",
+                production.display()
+            )) {
+                return Err(Failure::task(
+                    "scoped rustflags omitted the retained target root",
+                ));
+            }
             let status = Command::new("sh")
                 .args([
                     "-c",

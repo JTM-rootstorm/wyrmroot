@@ -29,6 +29,7 @@ unsafe extern "C" {
     fn mkdirat(dirfd: c_int, pathname: *const c_char, mode: c_uint) -> c_int;
     fn unlinkat(dirfd: c_int, pathname: *const c_char, flags: c_int) -> c_int;
     fn fcntl(fd: c_int, command: c_int, ...) -> c_int;
+    fn geteuid() -> c_uint;
 }
 
 pub(crate) struct Directory {
@@ -115,6 +116,26 @@ impl Directory {
         &self.display_path
     }
 
+    pub(crate) fn verify_owned_private_path(&self, label: &str) -> Result<(), Failure> {
+        let current = Self::open_exact(&self.display_path, label)?;
+        let metadata = self
+            .file
+            .metadata()
+            .map_err(|error| Failure::task(format!("could not stat {label}: {error}")))?;
+        // SAFETY: geteuid has no preconditions or side effects.
+        let effective_uid = unsafe { geteuid() };
+        if directory_identity(&current)? != object_identity(&metadata)
+            || !metadata.is_dir()
+            || metadata.uid() != effective_uid
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err(Failure::task(format!(
+                "{label} is not the retained owner-controlled directory"
+            )));
+        }
+        Ok(())
+    }
+
     fn anchor_path(&self) -> PathBuf {
         PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
     }
@@ -150,6 +171,7 @@ impl Directory {
         let inherited = InheritableDirectory {
             anchor: PathBuf::from(format!("/proc/self/fd/{duplicate}")),
             file: inherited,
+            identity: object_identity(&before),
         };
         let result = operation(&inherited);
         let after = inherited
@@ -353,11 +375,25 @@ impl Directory {
 pub(crate) struct InheritableDirectory {
     file: File,
     anchor: PathBuf,
+    identity: (u64, u64),
 }
 
 impl InheritableDirectory {
     pub(crate) fn path(&self) -> &Path {
         &self.anchor
+    }
+
+    pub(crate) fn verify_unchanged(&self, label: &str) -> Result<(), Failure> {
+        let metadata = self
+            .file
+            .metadata()
+            .map_err(|error| Failure::task(format!("could not recheck {label}: {error}")))?;
+        if !metadata.is_dir() || object_identity(&metadata) != self.identity {
+            return Err(Failure::task(format!(
+                "{label} retained directory identity changed"
+            )));
+        }
+        Ok(())
     }
 
     pub(crate) fn create_inheritable_child(
@@ -411,6 +447,7 @@ impl InheritableDirectory {
         Ok(InheritableDirectory {
             file: inherited,
             anchor: PathBuf::from(format!("/proc/self/fd/{duplicate}")),
+            identity: object_identity(&inherited_metadata),
         })
     }
 }
@@ -424,6 +461,26 @@ pub(crate) struct ScratchDirectory<'a> {
 }
 
 impl ScratchDirectory<'_> {
+    pub(crate) fn verify_unchanged(&self) -> Result<(), Failure> {
+        self.parent
+            .verify_owned_private_path(&format!("{} parent", self.label))?;
+        let named = self.parent.open_child(&self.name, &self.label)?;
+        let metadata =
+            self.directory.file.metadata().map_err(|error| {
+                Failure::task(format!("could not stat {}: {error}", self.label))
+            })?;
+        if directory_identity(&named)? != object_identity(&metadata)
+            || !metadata.is_dir()
+            || metadata.mode() & 0o7777 != 0o700
+        {
+            return Err(Failure::task(format!(
+                "{} identity or permissions changed",
+                self.label
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) fn finish<T>(mut self, result: Result<T, Failure>) -> Result<T, Failure> {
         let cleanup = self
             .parent

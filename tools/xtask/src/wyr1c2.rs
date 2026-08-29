@@ -15,7 +15,11 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::{error::Failure, secure_fs::Directory, sha256, wyr1c};
+use crate::{
+    error::Failure,
+    secure_fs::{Directory, ScratchDirectory},
+    sha256, wyr1c,
+};
 use wyrmroot_device_proto::manifest::{
     ContentIdentity, HEADER_BYTES, RECORD_BYTES, encode_com2_manifest,
 };
@@ -90,9 +94,13 @@ pub(crate) fn freeze(output: &Path) -> Result<String, Failure> {
     let toolchain = crate::tasks::prepare_loader_toolchain(&repository, &profile, &manifest)?;
     let cargo_home = crate::tasks::project_cargo_home(&repository, &manifest)?;
     let project_dir = Directory::open_exact(&project, "OS-Project root")?;
-    let tmp = open_or_create_tmp(&project_dir)?;
+    let tmp = open_or_create_tmp(&project_dir, "project temporary root")?;
     let scratch_name = unique_scratch_name()?;
     let scratch = tmp.create_scratch(&scratch_name, "WYR1-C2 build scratch")?;
+    let repository_dir = Directory::open_exact(&repository, "Wyrmroot source")?;
+    let repository_tmp = open_or_create_tmp(&repository_dir, "Wyrmroot temporary root")?;
+    let deep_dir = Directory::open_exact(&deep, "Deepwyrm source")?;
+    let deep_tmp = open_or_create_tmp(&deep_dir, "Deepwyrm temporary root")?;
     let build_result = (|| {
         let (loader, loader_inspection) =
             scratch.with_inheritable_anchor("WYR1-C2 UEFI build scratch", |scratch| {
@@ -115,19 +123,21 @@ pub(crate) fn freeze(output: &Path) -> Result<String, Failure> {
                     uefi.inspection_report.into_bytes(),
                 ))
             })?;
-        let bootstrap =
-            scratch.with_inheritable_anchor("WYR1-C2 bootstrap build scratch", |scratch| {
-                build_bootstrap(
-                    &repository,
-                    &cargo_home,
-                    toolchain.accepted(),
-                    scratch.path(),
-                )
-            })?;
-        let kernel = scratch
-            .with_inheritable_anchor("WYR1-C2 kernel build scratch", |scratch| {
-                build_kernel(&deep, &scratch.path().join("deepwyrm-target"))
-            })?;
+        let bootstrap_target = repository_tmp.create_scratch(
+            &format!("{scratch_name}-bootstrap"),
+            "WYR1-C2 bootstrap target",
+        )?;
+        let bootstrap_result = build_bootstrap(
+            &repository,
+            &cargo_home,
+            toolchain.accepted(),
+            &bootstrap_target,
+        );
+        let bootstrap = bootstrap_target.finish(bootstrap_result)?;
+        let kernel_target =
+            deep_tmp.create_scratch(&format!("{scratch_name}-kernel"), "WYR1-C2 kernel target")?;
+        let kernel_result = build_kernel(&deep, &kernel_target);
+        let kernel = kernel_target.finish(kernel_result)?;
         Ok::<_, Failure>((loader, loader_inspection, bootstrap, kernel))
     })();
     let (loader, loader_inspection, bootstrap, kernel) = scratch.finish(build_result)?;
@@ -630,12 +640,14 @@ fn open_request_root(request: &Path) -> Result<(PathBuf, PathBuf, PathBuf, Direc
     Ok((repository, project, deep, root))
 }
 
-fn open_or_create_tmp(project: &Directory) -> Result<Directory, Failure> {
-    if project.exists(".tmp", "project temporary root")? {
-        project.open_child(".tmp", "project temporary root")
+fn open_or_create_tmp(parent: &Directory, label: &str) -> Result<Directory, Failure> {
+    let directory = if parent.exists(".tmp", label)? {
+        parent.open_child(".tmp", label)?
     } else {
-        project.create_child(".tmp", 0o700, "project temporary root")
-    }
+        parent.create_child(".tmp", 0o700, label)?
+    };
+    directory.verify_owned_private_path(label)?;
+    Ok(directory)
 }
 
 fn unique_scratch_name() -> Result<String, Failure> {
@@ -879,11 +891,9 @@ fn build_bootstrap(
     repository: &Path,
     cargo_home: &Path,
     toolchain: &crate::toolchain_artifact::AcceptedToolchain,
-    build: &Path,
+    target: &ScratchDirectory<'_>,
 ) -> Result<Vec<u8>, Failure> {
-    let target = build.join("bootstrap");
-    fs::create_dir(&target)
-        .map_err(|error| Failure::task(format!("could not create C2 bootstrap target: {error}")))?;
+    target.verify_unchanged()?;
     let status = Command::new(&toolchain.cargo)
         .args([
             "build",
@@ -900,7 +910,7 @@ fn build_bootstrap(
             "native-bootstrap",
             "--target-dir",
         ])
-        .arg(&target)
+        .arg(target.path())
         .env("RUSTC", &toolchain.rustc)
         .env("CARGO_HOME", cargo_home)
         .env("CARGO_INCREMENTAL", "0")
@@ -911,23 +921,27 @@ fn build_bootstrap(
         .env_remove("LD_PRELOAD")
         .current_dir(repository)
         .stdin(Stdio::null())
-        .status()
-        .map_err(|error| Failure::task(format!("could not build C2 bootstrap: {error}")))?;
+        .status();
+    target.verify_unchanged()?;
+    let status =
+        status.map_err(|error| Failure::task(format!("could not build C2 bootstrap: {error}")))?;
     if !status.success() {
         return Err(Failure::task("C2 bootstrap build failed"));
     }
-    read_bounded_path(
+    let artifact = read_bounded_path(
         &target
+            .path()
             .join(NATIVE_TARGET)
             .join("release/wyrmroot-bootstrap"),
         "bootstrap",
         MAX_BYTES,
-    )
+    )?;
+    target.verify_unchanged()?;
+    Ok(artifact)
 }
 
-fn build_kernel(deep: &Path, target: &Path) -> Result<Vec<u8>, Failure> {
-    fs::create_dir(target)
-        .map_err(|error| Failure::task(format!("could not create C2 kernel target: {error}")))?;
+fn build_kernel(deep: &Path, target: &ScratchDirectory<'_>) -> Result<Vec<u8>, Failure> {
+    target.verify_unchanged()?;
     let status = Command::new(deep.join("tools/pinned-cargo"))
         .args([
             "target",
@@ -942,7 +956,7 @@ fn build_kernel(deep: &Path, target: &Path) -> Result<Vec<u8>, Failure> {
             "--bin",
             "deepwyrm-kernel",
         ])
-        .env("DEEPWYRM_PINNED_TARGET_DIR", target)
+        .env("DEEPWYRM_PINNED_TARGET_DIR", target.path())
         .env_remove("CARGO_HOME")
         .env_remove("DEEPWYRM_GUEST_TEST_SELECTOR")
         .env_remove("DEEPWYRM_GUEST_TEST_ID")
@@ -951,16 +965,23 @@ fn build_kernel(deep: &Path, target: &Path) -> Result<Vec<u8>, Failure> {
         .env_remove("LD_PRELOAD")
         .current_dir(deep)
         .stdin(Stdio::null())
-        .status()
+        .status();
+    target.verify_unchanged()?;
+    let status = status
         .map_err(|error| Failure::task(format!("could not build C2 production kernel: {error}")))?;
     if !status.success() {
         return Err(Failure::task("C2 production kernel build failed"));
     }
-    read_bounded_path(
-        &target.join(KERNEL_TARGET).join("release/deepwyrm-kernel"),
+    let artifact = read_bounded_path(
+        &target
+            .path()
+            .join(KERNEL_TARGET)
+            .join("release/deepwyrm-kernel"),
         "kernel",
         MAX_BYTES,
-    )
+    )?;
+    target.verify_unchanged()?;
+    Ok(artifact)
 }
 
 fn reject_ambient() -> Result<(), Failure> {
@@ -991,6 +1012,7 @@ fn reject_ambient() -> Result<(), Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
 
     #[test]
     fn reviewed_source_requires_byte_identity_and_semantic_identity() {
@@ -1045,5 +1067,62 @@ mod tests {
         assert!(require_image_pair(true, true).is_ok());
         assert!(require_image_pair(true, false).is_err());
         assert!(require_image_pair(false, true).is_err());
+    }
+
+    #[test]
+    fn canonical_build_targets_are_private_direct_children_and_detect_replacement() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock precedes Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "wyrmroot-c2-canonical-target-{}-{nonce}",
+            std::process::id()
+        ));
+        let deep = root.join("deepwyrm");
+        let outside = root.join("outside");
+        fs::create_dir_all(&deep).expect("create synthetic Deepwyrm root");
+        fs::create_dir(&outside).expect("create outside directory");
+        let deep_dir = Directory::open_exact(&deep, "synthetic Deepwyrm").unwrap();
+        let tmp = open_or_create_tmp(&deep_dir, "synthetic Deepwyrm temporary root").unwrap();
+        let target = tmp.create_scratch("c2-kernel", "C2 kernel target").unwrap();
+        assert_eq!(target.path(), deep.join(".tmp/c2-kernel"));
+        assert_eq!(
+            fs::symlink_metadata(target.path()).unwrap().mode() & 0o7777,
+            0o700
+        );
+        target.verify_unchanged().unwrap();
+
+        let moved = deep.join(".tmp/moved-kernel");
+        fs::rename(target.path(), &moved).unwrap();
+        symlink(&outside, target.path()).unwrap();
+        assert!(target.verify_unchanged().is_err());
+        drop(target);
+        fs::remove_dir_all(root).expect("remove synthetic Deepwyrm root");
+    }
+
+    #[test]
+    fn canonical_build_target_detects_temporary_parent_replacement() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock precedes Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "wyrmroot-c2-target-parent-{}-{nonce}",
+            std::process::id()
+        ));
+        let deep = root.join("deepwyrm");
+        let outside = root.join("outside");
+        fs::create_dir_all(&deep).expect("create synthetic Deepwyrm root");
+        fs::create_dir(&outside).expect("create outside directory");
+        let deep_dir = Directory::open_exact(&deep, "synthetic Deepwyrm").unwrap();
+        let tmp = open_or_create_tmp(&deep_dir, "synthetic Deepwyrm temporary root").unwrap();
+        let target = tmp.create_scratch("c2-kernel", "C2 kernel target").unwrap();
+        let moved_tmp = deep.join(".tmp-moved");
+        fs::rename(deep.join(".tmp"), &moved_tmp).unwrap();
+        symlink(&outside, deep.join(".tmp")).unwrap();
+        assert!(target.verify_unchanged().is_err());
+        drop(target);
+        fs::remove_dir_all(root).expect("remove synthetic Deepwyrm root");
     }
 }
