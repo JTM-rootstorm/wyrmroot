@@ -69,7 +69,7 @@ The integrated tree passed:
   tests;
 - 93 `wyrmroot-runtime`, 23 `wyrmroot-device-proto`, 7 `wyrmroot-devmgr`,
   15 loader-launch, 21 loader-process, 16 WRRM, and the focused bootfs suites;
-- 171 xtask tests with one expected accepted-toolchain fixture ignored, plus
+- 173 xtask tests with one expected accepted-toolchain fixture ignored, plus
   six toolchain-lane contract tests;
 - warnings-denied Clippy for the affected packages, formatting, and diff
   checks; and
