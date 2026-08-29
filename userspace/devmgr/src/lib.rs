@@ -10,8 +10,11 @@
 #[cfg(feature = "native-devmgr")]
 use {deepwyrm_syscall as _, wyrmroot_loader as _, wyrmroot_runtime as _};
 
+use wyrmroot_device_proto::controller::{
+    ControllerMessage, ControllerParseError, StatusCode, validate_binding_transition,
+};
 use wyrmroot_device_proto::coordinator::{
-    Coordinator, CoordinatorError, CoordinatorState, SupervisorGeneration,
+    Coordinator, CoordinatorError, CoordinatorState, RegistryBinding, SupervisorGeneration,
 };
 use wyrmroot_device_proto::manifest::{
     ContentIdentity, Manifest, ManifestError, MetadataPolicyId, PioRange, ProfileId,
@@ -50,6 +53,16 @@ pub enum DevmgrError {
     Manifest(ManifestError),
     Coordinator(CoordinatorError),
     MissingRole,
+    Controller(ControllerParseError),
+    StartupCorrelation,
+    StaleControllerTransaction,
+    ControllerLifecycle,
+}
+
+impl From<ControllerParseError> for DevmgrError {
+    fn from(error: ControllerParseError) -> Self {
+        Self::Controller(error)
+    }
 }
 
 impl From<ManifestError> for DevmgrError {
@@ -86,6 +99,165 @@ pub fn prepare_operational(
         driver_identity: role.content_identity,
         metadata_policy: role.metadata_policy,
     })
+}
+
+/// The allocation-free resident C1 control state.  The immutable manifest is
+/// checked before this is constructed; the resident state intentionally keeps
+/// only copied metadata, never a mapping borrowed from startup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidentController {
+    status: OperationalStatus,
+    startup_transaction_id: u64,
+    last_transaction_id: u64,
+    last_binding: Option<RegistryBinding>,
+    active_binding: Option<RegistryBinding>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControllerAction {
+    InitialPublicationBound,
+    PublicationRebound,
+}
+
+impl ResidentController {
+    pub fn new(
+        status: OperationalStatus,
+        startup_transaction_id: u64,
+    ) -> Result<Self, DevmgrError> {
+        if startup_transaction_id == 0 {
+            return Err(DevmgrError::StartupCorrelation);
+        }
+        if status.state != CoordinatorState::WaitingForRegistry {
+            return Err(DevmgrError::ControllerLifecycle);
+        }
+        Ok(Self {
+            status,
+            startup_transaction_id,
+            last_transaction_id: 0,
+            last_binding: None,
+            active_binding: None,
+        })
+    }
+
+    pub const fn status(&self) -> OperationalStatus {
+        self.status
+    }
+
+    pub const fn active_binding(&self) -> Option<RegistryBinding> {
+        self.active_binding
+    }
+
+    pub const fn last_transaction_id(&self) -> u64 {
+        self.last_transaction_id
+    }
+
+    /// Applies a syntactically validated WRCS controller message.  Handle
+    /// count is checked here; native code separately validates the moved
+    /// replacement Channel's type and exact rights before calling this.
+    pub fn accept(
+        &mut self,
+        message: ControllerMessage,
+        received_handles: u32,
+    ) -> Result<ControllerAction, DevmgrError> {
+        if received_handles != message.handle_count() {
+            return Err(DevmgrError::Controller(
+                ControllerParseError::WrongHandleCount,
+            ));
+        }
+        match message {
+            ControllerMessage::InstallPublication {
+                supervisor_generation,
+                binding,
+                transaction_id,
+            } => {
+                if transaction_id != self.startup_transaction_id
+                    || self.last_binding.is_some()
+                    || self.status.supervisor_generation != supervisor_generation
+                {
+                    return Err(DevmgrError::StartupCorrelation);
+                }
+                let binding = validate_binding_transition(
+                    self.status.supervisor_generation,
+                    None,
+                    ControllerMessage::InstallPublication {
+                        supervisor_generation,
+                        binding,
+                        transaction_id,
+                    },
+                )?;
+                self.last_transaction_id = transaction_id;
+                self.last_binding = Some(binding);
+                self.active_binding = Some(binding);
+                self.status.state = CoordinatorState::WaitingForDeviceBundle;
+                Ok(ControllerAction::InitialPublicationBound)
+            }
+            ControllerMessage::RebindPublication {
+                supervisor_generation,
+                binding,
+                transaction_id,
+            } => {
+                if self.status.supervisor_generation != supervisor_generation
+                    || self.last_binding.is_none()
+                    || self.active_binding.is_some()
+                    || transaction_id <= self.last_transaction_id
+                {
+                    return Err(DevmgrError::StaleControllerTransaction);
+                }
+                let binding = validate_binding_transition(
+                    self.status.supervisor_generation,
+                    self.last_binding,
+                    ControllerMessage::RebindPublication {
+                        supervisor_generation,
+                        binding,
+                        transaction_id,
+                    },
+                )?;
+                self.last_transaction_id = transaction_id;
+                self.last_binding = Some(binding);
+                self.active_binding = Some(binding);
+                self.status.state = CoordinatorState::WaitingForDeviceBundle;
+                Ok(ControllerAction::PublicationRebound)
+            }
+            ControllerMessage::Status { .. } => Err(DevmgrError::ControllerLifecycle),
+        }
+    }
+
+    /// The registry-side peer can disappear without replacing this devmgr
+    /// generation.  Keep the historical binding solely to enforce a monotonic
+    /// replacement later; it is no longer an active publication binding.
+    pub fn publication_peer_closed(&mut self) -> Result<(), DevmgrError> {
+        if self.active_binding.is_none() {
+            return Err(DevmgrError::ControllerLifecycle);
+        }
+        self.active_binding = None;
+        self.status.state = CoordinatorState::WaitingForRegistry;
+        Ok(())
+    }
+
+    pub fn report(&self, status: StatusCode) -> Result<ControllerMessage, DevmgrError> {
+        if status.is_device_bound() {
+            return Err(DevmgrError::Controller(
+                ControllerParseError::DeviceBoundStatus,
+            ));
+        }
+        let binding = match status {
+            StatusCode::OperationalWaitingForRegistry => None,
+            StatusCode::OperationalWaitingForDeviceBundle => self.active_binding,
+            StatusCode::CleaningUp | StatusCode::Backoff | StatusCode::PermanentFailure => {
+                return Err(DevmgrError::ControllerLifecycle);
+            }
+        };
+        if self.last_transaction_id == 0 {
+            return Err(DevmgrError::ControllerLifecycle);
+        }
+        Ok(ControllerMessage::Status {
+            supervisor_generation: self.status.supervisor_generation,
+            binding,
+            transaction_id: self.last_transaction_id,
+            status,
+            attempt_generation: None,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -162,6 +334,140 @@ mod tests {
             Err(DevmgrError::Coordinator(
                 CoordinatorError::InvalidSupervisorGeneration
             ))
+        );
+    }
+
+    fn binding(generation: u64, endpoint: u64) -> RegistryBinding {
+        RegistryBinding {
+            generation: wyrmroot_device_proto::coordinator::RegistryGeneration(generation),
+            endpoint: wyrmroot_device_proto::coordinator::RegistryEndpoint {
+                id: wyrmroot_device_proto::coordinator::RegistryEndpointId(endpoint),
+                generation: wyrmroot_device_proto::coordinator::RegistryEndpointGeneration(1),
+            },
+        }
+    }
+
+    fn install(binding: RegistryBinding, transaction_id: u64) -> ControllerMessage {
+        ControllerMessage::InstallPublication {
+            supervisor_generation: SupervisorGeneration(7),
+            binding,
+            transaction_id,
+        }
+    }
+
+    fn rebind(binding: RegistryBinding, transaction_id: u64) -> ControllerMessage {
+        ControllerMessage::RebindPublication {
+            supervisor_generation: SupervisorGeneration(7),
+            binding,
+            transaction_id,
+        }
+    }
+
+    #[test]
+    fn controller_correlates_zero_handle_install_to_startup_then_reports_waiting() {
+        let mut resident =
+            ResidentController::new(prepare_operational(&manifest(), 7).unwrap(), 41).unwrap();
+        let installed = binding(1, 7);
+        assert_eq!(
+            resident.accept(install(installed, 41), 0),
+            Ok(ControllerAction::InitialPublicationBound)
+        );
+        assert_eq!(
+            resident.status().state,
+            CoordinatorState::WaitingForDeviceBundle
+        );
+        assert_eq!(
+            resident.report(StatusCode::OperationalWaitingForDeviceBundle),
+            Ok(ControllerMessage::Status {
+                supervisor_generation: SupervisorGeneration(7),
+                binding: Some(installed),
+                transaction_id: 41,
+                status: StatusCode::OperationalWaitingForDeviceBundle,
+                attempt_generation: None,
+            })
+        );
+    }
+
+    #[test]
+    fn controller_rejects_wrong_install_correlation_or_handle_count() {
+        let mut resident =
+            ResidentController::new(prepare_operational(&manifest(), 7).unwrap(), 41).unwrap();
+        assert_eq!(
+            resident.accept(install(binding(1, 7), 40), 0),
+            Err(DevmgrError::StartupCorrelation)
+        );
+        assert_eq!(
+            resident.accept(install(binding(1, 7), 41), 1),
+            Err(DevmgrError::Controller(
+                ControllerParseError::WrongHandleCount
+            ))
+        );
+    }
+
+    #[test]
+    fn peer_close_keeps_generation_and_requires_monotonic_one_handle_rebind() {
+        let mut resident =
+            ResidentController::new(prepare_operational(&manifest(), 7).unwrap(), 41).unwrap();
+        let first = binding(1, 7);
+        resident.accept(install(first, 41), 0).unwrap();
+        resident.publication_peer_closed().unwrap();
+        assert_eq!(
+            resident.status().supervisor_generation,
+            SupervisorGeneration(7)
+        );
+        assert_eq!(
+            resident.status().state,
+            CoordinatorState::WaitingForRegistry
+        );
+        assert_eq!(resident.active_binding(), None);
+        assert_eq!(
+            resident.report(StatusCode::OperationalWaitingForRegistry),
+            Ok(ControllerMessage::Status {
+                supervisor_generation: SupervisorGeneration(7),
+                binding: None,
+                transaction_id: 41,
+                status: StatusCode::OperationalWaitingForRegistry,
+                attempt_generation: None,
+            })
+        );
+        assert_eq!(
+            resident.accept(rebind(first, 42), 1),
+            Err(DevmgrError::Controller(ControllerParseError::StaleBinding))
+        );
+        let second = binding(2, 8);
+        assert_eq!(
+            resident.accept(rebind(second, 42), 1),
+            Ok(ControllerAction::PublicationRebound)
+        );
+        assert_eq!(resident.active_binding(), Some(second));
+        assert_eq!(
+            resident.status().supervisor_generation,
+            SupervisorGeneration(7)
+        );
+    }
+
+    #[test]
+    fn status_and_replay_messages_cannot_drive_the_resident() {
+        let mut resident =
+            ResidentController::new(prepare_operational(&manifest(), 7).unwrap(), 41).unwrap();
+        let first = binding(1, 7);
+        resident.accept(install(first, 41), 0).unwrap();
+        assert_eq!(
+            resident.accept(rebind(binding(2, 8), 41), 1),
+            Err(DevmgrError::StaleControllerTransaction)
+        );
+        assert_eq!(
+            resident.accept(
+                ControllerMessage::Status {
+                    supervisor_generation: SupervisorGeneration(7),
+                    binding: Some(first),
+                    transaction_id: 42,
+                    status: StatusCode::OperationalWaitingForDeviceBundle,
+                    attempt_generation: None,
+                },
+                0,
+            ),
+            Err(DevmgrError::ControllerLifecycle)
         );
     }
 }
