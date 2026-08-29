@@ -85,7 +85,9 @@ pub enum CoordinatorError {
     AttemptBudgetExhausted,
     StaleDriverEndpoint,
     DriverAlreadyReady,
+    StaleDriverAttempt,
     StalePublicationEndpoint,
+    StalePublishedGeneration,
     BackoffNotElapsed,
     TimeOverflow,
 }
@@ -106,6 +108,7 @@ pub struct Coordinator<'a> {
     registry: Option<RegistryBinding>,
     publication_endpoint: Option<RegistryEndpoint>,
     published_generation: Option<PublishedServiceGeneration>,
+    last_published_generation: u64,
     next_attempt: u64,
     next_session: u64,
     next_endpoint: u64,
@@ -129,6 +132,7 @@ impl<'a> Coordinator<'a> {
             registry: None,
             publication_endpoint: None,
             published_generation: None,
+            last_published_generation: 0,
             next_attempt: 1,
             next_session: 1,
             next_endpoint: 1,
@@ -195,7 +199,10 @@ impl<'a> Coordinator<'a> {
             if old == binding {
                 return Err(CoordinatorError::StaleRegistry);
             }
-            if binding.generation == old.generation || binding.endpoint == old.endpoint {
+            if binding.generation <= old.generation
+                || binding.endpoint.id == old.endpoint.id
+                || binding.endpoint.generation <= old.endpoint.generation
+            {
                 return Err(CoordinatorError::StaleRegistry);
             }
         }
@@ -293,19 +300,25 @@ impl<'a> Coordinator<'a> {
 
     pub fn publish(
         &mut self,
+        attempt: DriverAttempt,
         endpoint: RegistryEndpoint,
         service_generation: PublishedServiceGeneration,
     ) -> Result<(), CoordinatorError> {
         if self.state != CoordinatorState::AwaitingPublication {
             return Err(CoordinatorError::InvalidState);
         }
-        if service_generation.0 == 0
-            || self.registry.map(|binding| binding.endpoint) != Some(endpoint)
-        {
+        if self.attempt != Some(attempt) {
+            return Err(CoordinatorError::StaleDriverAttempt);
+        }
+        if self.registry.map(|binding| binding.endpoint) != Some(endpoint) {
             return Err(CoordinatorError::StalePublicationEndpoint);
+        }
+        if service_generation.0 == 0 || service_generation.0 <= self.last_published_generation {
+            return Err(CoordinatorError::StalePublishedGeneration);
         }
         self.publication_endpoint = Some(endpoint);
         self.published_generation = Some(service_generation);
+        self.last_published_generation = service_generation.0;
         self.state = CoordinatorState::Published;
         Ok(())
     }
@@ -461,7 +474,8 @@ mod tests {
         let data = bytes();
         let mut c = ready_coordinator(&data);
         let reg = c.registry().unwrap().endpoint;
-        c.publish(reg, PublishedServiceGeneration(1)).unwrap();
+        c.publish(c.attempt().unwrap(), reg, PublishedServiceGeneration(1))
+            .unwrap();
         c.retire().unwrap();
         c.complete_retire_cleanup().unwrap();
         c.accept_bundle(DeviceBundle {
@@ -479,13 +493,17 @@ mod tests {
         let mut c = ready_coordinator(&data);
         let old_attempt = c.attempt().unwrap();
         let old_registry = c.registry().unwrap();
-        c.publish(old_registry.endpoint, PublishedServiceGeneration(1))
-            .unwrap();
+        c.publish(
+            old_attempt,
+            old_registry.endpoint,
+            PublishedServiceGeneration(1),
+        )
+        .unwrap();
         c.replace_registry(RegistryBinding {
             generation: RegistryGeneration(2),
             endpoint: RegistryEndpoint {
                 id: RegistryEndpointId(3),
-                generation: RegistryEndpointGeneration(1),
+                generation: RegistryEndpointGeneration(2),
             },
         })
         .unwrap();
@@ -493,11 +511,15 @@ mod tests {
         assert_eq!(c.attempt(), Some(old_attempt));
         assert_eq!(c.publication_endpoint(), None);
         assert_eq!(
-            c.publish(old_registry.endpoint, PublishedServiceGeneration(2)),
+            c.publish(
+                old_attempt,
+                old_registry.endpoint,
+                PublishedServiceGeneration(2)
+            ),
             Err(CoordinatorError::StalePublicationEndpoint)
         );
         let replacement = c.registry().unwrap().endpoint;
-        c.publish(replacement, PublishedServiceGeneration(2))
+        c.publish(old_attempt, replacement, PublishedServiceGeneration(2))
             .unwrap();
         assert_eq!(c.state(), CoordinatorState::Published);
     }
@@ -555,6 +577,7 @@ mod tests {
         let data = bytes();
         let mut c = ready_coordinator(&data);
         c.publish(
+            c.attempt().unwrap(),
             c.registry().unwrap().endpoint,
             PublishedServiceGeneration(1),
         )
@@ -563,5 +586,71 @@ mod tests {
         c.driver_failed(endpoint).unwrap();
         c.cleanup_failed().unwrap();
         assert_eq!(c.state(), CoordinatorState::PermanentFailure);
+    }
+
+    #[test]
+    fn registry_replay_and_endpoint_generation_downgrade_are_rejected() {
+        let data = bytes();
+        let mut c = ready_coordinator(&data);
+        c.replace_registry(RegistryBinding {
+            generation: RegistryGeneration(3),
+            endpoint: RegistryEndpoint {
+                id: RegistryEndpointId(3),
+                generation: RegistryEndpointGeneration(3),
+            },
+        })
+        .unwrap();
+        let old = c.registry().unwrap();
+        for replacement in [
+            RegistryBinding {
+                generation: RegistryGeneration(2),
+                endpoint: RegistryEndpoint {
+                    id: RegistryEndpointId(4),
+                    generation: RegistryEndpointGeneration(4),
+                },
+            },
+            RegistryBinding {
+                generation: RegistryGeneration(4),
+                endpoint: RegistryEndpoint {
+                    id: RegistryEndpointId(4),
+                    generation: RegistryEndpointGeneration(2),
+                },
+            },
+        ] {
+            assert_eq!(
+                c.replace_registry(replacement),
+                Err(CoordinatorError::StaleRegistry)
+            );
+            assert_eq!(c.registry(), Some(old));
+        }
+    }
+
+    #[test]
+    fn stale_attempt_cannot_publish_for_replacement_attempt() {
+        let data = bytes();
+        let mut c = ready_coordinator(&data);
+        let first = c.attempt().unwrap();
+        let registry = c.registry().unwrap().endpoint;
+        c.publish(first, registry, PublishedServiceGeneration(1))
+            .unwrap();
+        c.driver_failed(first.endpoint).unwrap();
+        c.complete_failure_cleanup(0).unwrap();
+        c.backoff_elapsed(RETRY_BACKOFF_NS).unwrap();
+        c.begin_launch().unwrap();
+        let second = c.attempt().unwrap();
+        c.launch_accepted(second.endpoint).unwrap();
+        c.driver_ready(second.endpoint).unwrap();
+
+        assert_eq!(
+            c.publish(first, registry, PublishedServiceGeneration(2)),
+            Err(CoordinatorError::StaleDriverAttempt)
+        );
+        assert_eq!(
+            c.publish(second, registry, PublishedServiceGeneration(1)),
+            Err(CoordinatorError::StalePublishedGeneration)
+        );
+        c.publish(second, registry, PublishedServiceGeneration(2))
+            .unwrap();
+        assert_eq!(c.state(), CoordinatorState::Published);
     }
 }

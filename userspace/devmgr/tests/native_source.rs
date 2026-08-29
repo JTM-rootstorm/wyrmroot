@@ -28,3 +28,16 @@ fn native_path_has_only_the_hardware_free_c1_startup_surface() {
     assert!(!NATIVE.contains("DW_OBJECT_TYPE_INTERRUPT"));
     assert!(!NATIVE.contains("pio_"));
 }
+
+#[test]
+fn registry_peer_close_preserves_the_devmgr_supervisor_generation() {
+    let replacement = NATIVE
+        .find("Registry replacement closes only the old publication binding")
+        .unwrap();
+    let tail = &NATIVE[replacement..];
+    let close_publication = tail.find("close_handle(publication)").unwrap();
+    let wait_controller = tail.find("wait_many(&controller_wait").unwrap();
+    let close_bootstrap = tail.find("close_handle(bootstrap)").unwrap();
+    assert!(close_publication < wait_controller);
+    assert!(wait_controller < close_bootstrap);
+}

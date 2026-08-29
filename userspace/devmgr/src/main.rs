@@ -103,12 +103,32 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
         {
             return Err(failure(18));
         }
-        // C1 has no reached post-READY controller or hardware-bundle envelope.
-        // Any message or peer loss is fail-closed; the infinite wait is the
-        // truthful non-polling hardware-free resident state.
-        close_handle(publication).map_err(|_| failure(19))?;
-        close_handle(bootstrap).map_err(|_| failure(20))?;
-        return Err(failure(21));
+        if index == 0 || observed.observed.0 & DW_SIGNAL_READABLE.0 != 0 {
+            // C1 has no reached post-READY controller or hardware-bundle
+            // envelope. Unexpected messages and loss of the supervisor
+            // relationship remain fail-closed.
+            close_handle(publication).map_err(|_| failure(19))?;
+            close_handle(bootstrap).map_err(|_| failure(20))?;
+            return Err(failure(21));
+        }
+
+        // Registry replacement closes only the old publication binding. Keep
+        // this devmgr generation resident and wait for the still-open
+        // supervisor relationship; the bounded rebind envelope remains an
+        // explicit later C1 integration step.
+        close_handle(publication).map_err(|_| failure(22))?;
+        let controller_wait = [wait_item(bootstrap)];
+        loop {
+            let controller =
+                wait_many(&controller_wait, DW_DEADLINE_INFINITE).map_err(|_| failure(23))?;
+            if controller.index != 0
+                || controller.observed.0 & (DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0) == 0
+            {
+                return Err(failure(24));
+            }
+            close_handle(bootstrap).map_err(|_| failure(25))?;
+            return Err(failure(26));
+        }
     }
 }
 
