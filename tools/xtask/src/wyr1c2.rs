@@ -646,7 +646,7 @@ fn open_or_create_tmp(parent: &Directory, label: &str) -> Result<Directory, Fail
     } else {
         parent.create_child(".tmp", 0o700, label)?
     };
-    directory.verify_owned_private_path(label)?;
+    directory.verify_owned_container_path(label)?;
     Ok(directory)
 }
 
@@ -1082,6 +1082,9 @@ mod tests {
         let deep = root.join("deepwyrm");
         let outside = root.join("outside");
         fs::create_dir_all(&deep).expect("create synthetic Deepwyrm root");
+        fs::create_dir(deep.join(".tmp")).expect("create shared temporary container");
+        fs::set_permissions(deep.join(".tmp"), Permissions::from_mode(0o755))
+            .expect("set shared temporary container mode");
         fs::create_dir(&outside).expect("create outside directory");
         let deep_dir = Directory::open_exact(&deep, "synthetic Deepwyrm").unwrap();
         let tmp = open_or_create_tmp(&deep_dir, "synthetic Deepwyrm temporary root").unwrap();
@@ -1091,6 +1094,12 @@ mod tests {
             fs::symlink_metadata(target.path()).unwrap().mode() & 0o7777,
             0o700
         );
+        target.verify_unchanged().unwrap();
+        fs::set_permissions(target.path(), Permissions::from_mode(0o755))
+            .expect("weaken task target mode");
+        assert!(target.verify_unchanged().is_err());
+        fs::set_permissions(target.path(), Permissions::from_mode(0o700))
+            .expect("restore task target mode");
         target.verify_unchanged().unwrap();
 
         let moved = deep.join(".tmp/moved-kernel");
@@ -1124,5 +1133,32 @@ mod tests {
         assert!(target.verify_unchanged().is_err());
         drop(target);
         fs::remove_dir_all(root).expect("remove synthetic Deepwyrm root");
+    }
+
+    #[test]
+    fn temporary_container_rejects_writable_and_symlink_paths() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock precedes Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "wyrmroot-c2-container-policy-{}-{nonce}",
+            std::process::id()
+        ));
+        let writable = root.join("writable");
+        let linked = root.join("linked");
+        let outside = root.join("outside");
+        fs::create_dir_all(writable.join(".tmp")).expect("create writable container");
+        fs::set_permissions(writable.join(".tmp"), Permissions::from_mode(0o777))
+            .expect("set writable container mode");
+        fs::create_dir_all(&linked).expect("create linked parent");
+        fs::create_dir(&outside).expect("create outside container");
+        symlink(&outside, linked.join(".tmp")).expect("link temporary container");
+
+        let writable = Directory::open_exact(&writable, "writable parent").unwrap();
+        assert!(open_or_create_tmp(&writable, "writable temporary root").is_err());
+        let linked = Directory::open_exact(&linked, "linked parent").unwrap();
+        assert!(open_or_create_tmp(&linked, "linked temporary root").is_err());
+        fs::remove_dir_all(root).expect("remove container policy fixture");
     }
 }

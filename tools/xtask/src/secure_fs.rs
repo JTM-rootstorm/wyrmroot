@@ -116,7 +116,15 @@ impl Directory {
         &self.display_path
     }
 
-    pub(crate) fn verify_owned_private_path(&self, label: &str) -> Result<(), Failure> {
+    pub(crate) fn verify_owned_container_path(&self, label: &str) -> Result<(), Failure> {
+        self.verify_owned_path(label, None)
+    }
+
+    fn verify_owned_private_path(&self, label: &str) -> Result<(), Failure> {
+        self.verify_owned_path(label, Some(0o700))
+    }
+
+    fn verify_owned_path(&self, label: &str, exact_mode: Option<u32>) -> Result<(), Failure> {
         let current = Self::open_exact(&self.display_path, label)?;
         let metadata = self
             .file
@@ -128,6 +136,7 @@ impl Directory {
             || !metadata.is_dir()
             || metadata.uid() != effective_uid
             || metadata.mode() & 0o022 != 0
+            || exact_mode.is_some_and(|mode| metadata.mode() & 0o7777 != mode)
         {
             return Err(Failure::task(format!(
                 "{label} is not the retained owner-controlled directory"
@@ -463,21 +472,19 @@ pub(crate) struct ScratchDirectory<'a> {
 impl ScratchDirectory<'_> {
     pub(crate) fn verify_unchanged(&self) -> Result<(), Failure> {
         self.parent
-            .verify_owned_private_path(&format!("{} parent", self.label))?;
+            .verify_owned_container_path(&format!("{} parent", self.label))?;
         let named = self.parent.open_child(&self.name, &self.label)?;
         let metadata =
             self.directory.file.metadata().map_err(|error| {
                 Failure::task(format!("could not stat {}: {error}", self.label))
             })?;
-        if directory_identity(&named)? != object_identity(&metadata)
-            || !metadata.is_dir()
-            || metadata.mode() & 0o7777 != 0o700
-        {
+        if directory_identity(&named)? != object_identity(&metadata) || !metadata.is_dir() {
             return Err(Failure::task(format!(
                 "{} identity or permissions changed",
                 self.label
             )));
         }
+        self.directory.verify_owned_private_path(&self.label)?;
         Ok(())
     }
 
