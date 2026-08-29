@@ -3,8 +3,9 @@ use deepwyrm_syscall::{
     DW_OBJECT_TYPE_TASK_GROUP, DwHandle, DwReceivedHandleInfoV1,
 };
 use wyrmroot_loader::launch::{
-    self, BOOTFS_RIGHTS, CHILD_CHANNEL_RIGHTS, HEADER_BYTES, INIT0_BYTES, LOADER_TASK_GROUP_RIGHTS,
-    LaunchError, LaunchProfile, PROBE_CHILD_BYTES, SELF_ROOT_RIGHTS, SUPERVISOR_BYTES,
+    self, BOOTFS_RIGHTS, CHILD_CHANNEL_RIGHTS, DEVICE_MANIFEST_RIGHTS, HEADER_BYTES, INIT0_BYTES,
+    LOADER_TASK_GROUP_RIGHTS, LaunchError, LaunchProfile, PROBE_CHILD_BYTES, SELF_ROOT_RIGHTS,
+    SUPERVISOR_BYTES,
 };
 
 #[test]
@@ -317,6 +318,40 @@ fn wyr1_b_profiles_are_exact_wrlp_1_3_shapes() {
         received(5, DW_OBJECT_TYPE_CHANNEL, CHILD_CHANNEL_RIGHTS),
     ];
     assert!(launch::parse_init(LaunchProfile::JobV2Streams, &streams, &handles).is_ok());
+}
+
+#[test]
+fn wyr1_c_device_coordinator_has_exact_hardware_free_startup_roles() {
+    let mut init = [0u8; 64];
+    assert_eq!(
+        launch::encode_init(LaunchProfile::DeviceCoordinator, 0xc100, &mut init),
+        Ok(64)
+    );
+    assert_eq!(get16(&init, 6), 5);
+    assert_eq!(
+        [get32(&init, 40), get32(&init, 48), get32(&init, 56)],
+        [1, 5, 12]
+    );
+    let handles = [
+        received(1, DW_OBJECT_TYPE_ADDRESS_REGION, SELF_ROOT_RIGHTS),
+        received(2, DW_OBJECT_TYPE_CHANNEL, CHILD_CHANNEL_RIGHTS),
+        received(3, DW_OBJECT_TYPE_MEMORY_OBJECT, DEVICE_MANIFEST_RIGHTS),
+    ];
+    assert!(launch::parse_init(LaunchProfile::DeviceCoordinator, &init, &handles).is_ok());
+
+    let mut wrong_manifest = handles;
+    wrong_manifest[2].rights = CHILD_CHANNEL_RIGHTS;
+    assert_eq!(
+        launch::parse_init(LaunchProfile::DeviceCoordinator, &init, &wrong_manifest),
+        Err(LaunchError::HandleMetadata { index: 2 })
+    );
+
+    let mut ready = [0u8; HEADER_BYTES];
+    launch::encode_ready_for_profile(LaunchProfile::DeviceCoordinator, 0xc100, &mut ready).unwrap();
+    assert!(
+        launch::parse_ready_for_profile(LaunchProfile::DeviceCoordinator, &ready, 0xc100).is_ok()
+    );
+    assert!(launch::parse_ready_for_profile(LaunchProfile::EarlyBootStub, &ready, 0xc100).is_err());
 }
 
 #[test]

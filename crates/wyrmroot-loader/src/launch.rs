@@ -25,6 +25,7 @@ const MINOR_V1_1: u16 = 1;
 const MINOR_V1_2: u16 = 2;
 const MINOR_V1_3: u16 = 3;
 const MINOR_V1_4_TEST: u16 = 4;
+const MINOR_V1_5: u16 = 5;
 const TYPE_INIT: u32 = 1;
 const TYPE_READY: u32 = 2;
 const ROLE_SELF_ROOT: u32 = 1;
@@ -38,6 +39,7 @@ const ROLE_STDIN: u32 = 8;
 const ROLE_STDOUT: u32 = 9;
 const ROLE_STDERR: u32 = 10;
 const ROLE_DW1B_PROGRESS_DATA: u32 = 11;
+const ROLE_DEVICE_MANIFEST: u32 = 12;
 
 pub const SELF_ROOT_RIGHTS: DwRights =
     DwRights(DW_RIGHT_MAP.0 | DW_RIGHT_MODIFY.0 | DW_RIGHT_INSPECT.0);
@@ -52,6 +54,9 @@ pub const LOADER_TASK_GROUP_RIGHTS: DwRights =
     DwRights(DW_RIGHT_MODIFY.0 | DW_RIGHT_INSPECT.0 | DW_RIGHT_DUPLICATE.0 | DW_RIGHT_TRANSFER.0);
 pub const CHILD_CHANNEL_RIGHTS: DwRights =
     DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_WAIT.0 | DW_RIGHT_INSPECT.0);
+/// Exact read-only manifest view delegated to the WYR1-C device coordinator.
+pub const DEVICE_MANIFEST_RIGHTS: DwRights =
+    DwRights(DW_RIGHT_READ.0 | DW_RIGHT_MAP.0 | DW_RIGHT_INSPECT.0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LaunchProfile {
@@ -83,6 +88,10 @@ pub enum LaunchProfile {
     JobV2Streams,
     /// Selector-26-only progress peer with exactly one test data Channel.
     Dw1bProgress,
+    /// WYR1-C device coordinator with self root, publication authority, and
+    /// one immutable device-role manifest object. This profile contains no
+    /// hardware authority.
+    DeviceCoordinator,
     Hello,
 }
 
@@ -96,6 +105,7 @@ impl LaunchProfile {
             | Self::RegistryClient
             | Self::LaunchClient => 2,
             Self::JobV2Streams => 3,
+            Self::DeviceCoordinator => 3,
             Self::Hello | Self::EarlyBootStub | Self::JobV2 => 0,
         }
     }
@@ -111,6 +121,7 @@ impl LaunchProfile {
             | Self::JobV2
             | Self::JobV2Streams => MINOR_V1_3,
             Self::Dw1bProgress => MINOR_V1_4_TEST,
+            Self::DeviceCoordinator => MINOR_V1_5,
             Self::Init0 | Self::I2Stress | Self::CapabilityController | Self::Hello => MINOR_V1_0,
         }
     }
@@ -171,6 +182,17 @@ pub fn encode_init(
         {
             put_u32(output, HEADER_BYTES + index * 8, role);
         }
+    } else if profile == LaunchProfile::DeviceCoordinator {
+        for (index, role) in [
+            ROLE_SELF_ROOT,
+            ROLE_PUBLICATION_AUTHORITY,
+            ROLE_DEVICE_MANIFEST,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            put_u32(output, HEADER_BYTES + index * 8, role);
+        }
     } else if profile == LaunchProfile::Dw1bProgress {
         put_u32(output, HEADER_BYTES, ROLE_DW1B_PROGRESS_DATA);
     } else if profile.needs_self_root() {
@@ -216,6 +238,32 @@ pub fn parse_init(
                 ROLE_LOADER_TASK_GROUP,
                 DW_OBJECT_TYPE_TASK_GROUP,
                 LOADER_TASK_GROUP_RIGHTS,
+            ),
+        ];
+        for (index, (role, object_type, rights)) in expected.into_iter().enumerate() {
+            if get_u32(bytes, HEADER_BYTES + index * 8) != role
+                || get_u32(bytes, HEADER_BYTES + index * 8 + 4) != 0
+            {
+                return Err(LaunchError::BadCapabilityRole { index });
+            }
+            validate_handle(handles[index], object_type, rights, index)?;
+        }
+    } else if profile == LaunchProfile::DeviceCoordinator {
+        let expected = [
+            (
+                ROLE_SELF_ROOT,
+                DW_OBJECT_TYPE_ADDRESS_REGION,
+                SELF_ROOT_RIGHTS,
+            ),
+            (
+                ROLE_PUBLICATION_AUTHORITY,
+                DW_OBJECT_TYPE_CHANNEL,
+                CHILD_CHANNEL_RIGHTS,
+            ),
+            (
+                ROLE_DEVICE_MANIFEST,
+                DW_OBJECT_TYPE_MEMORY_OBJECT,
+                DEVICE_MANIFEST_RIGHTS,
             ),
         ];
         for (index, (role, object_type, rights)) in expected.into_iter().enumerate() {
@@ -290,6 +338,7 @@ impl LaunchProfile {
                     | Self::BootstrapService
                     | Self::RegistryClient
                     | Self::LaunchClient
+                    | Self::DeviceCoordinator
             )
     }
 
