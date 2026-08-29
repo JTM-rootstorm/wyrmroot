@@ -24,6 +24,9 @@ Usage:
     tools/pinned-cargo xtask wyr1b run --request <wyr1-b-request.toml>
     tools/pinned-cargo xtask wyr1b evidence --request <wyr1-b-request.toml>
     tools/pinned-cargo xtask wyr1c1 product --output <fresh-directory>
+    tools/pinned-cargo xtask wyr1c2 freeze --output <fresh-directory>
+    tools/pinned-cargo xtask wyr1c2 image --request <wyr1-c2-request.toml>
+    tools/pinned-cargo xtask wyr1c2 inspect --request <wyr1-c2-request.toml>
     cargo xtask dw1b image --request <dw1-b-request.toml>
     cargo xtask dw1b image-rebuild --request <dw1-b-request.toml>
     cargo xtask dw1b freeze --output <directory>
@@ -130,6 +133,9 @@ pub(crate) enum Action {
     Wyr1BRun(String),
     Wyr1BEvidence(String),
     Wyr1C1Product(String),
+    Wyr1C2Freeze(String),
+    Wyr1C2Image(String),
+    Wyr1C2Inspect(String),
     Dw1BImage(String),
     Dw1BImageRebuild(String),
     Dw1BFreeze(String),
@@ -205,11 +211,29 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
         "wyr1" => dispatch_wyr1(&arguments[1..]),
         "wyr1b" => dispatch_wyr1b(&arguments[1..]),
         "wyr1c1" => dispatch_wyr1c1(&arguments[1..]),
+        "wyr1c2" => dispatch_wyr1c2(&arguments[1..]),
         "dw1b" => dispatch_dw1b(&arguments[1..]),
         "dw1c" => dispatch_dw1c(&arguments[1..]),
         unknown => Err(Failure::usage(format!(
             "unknown command '{unknown}'\n\n{USAGE}"
         ))),
+    }
+}
+
+fn dispatch_wyr1c2(arguments: &[String]) -> Result<Action, Failure> {
+    match arguments {
+        [command, flag, value] if command == "freeze" && flag == "--output" => {
+            Ok(Action::Wyr1C2Freeze(value.clone()))
+        }
+        [command, flag, value] if command == "image" && flag == "--request" => {
+            Ok(Action::Wyr1C2Image(value.clone()))
+        }
+        [command, flag, value] if command == "inspect" && flag == "--request" => {
+            Ok(Action::Wyr1C2Inspect(value.clone()))
+        }
+        _ => Err(Failure::usage(
+            "wyr1c2 requires freeze --output <fresh-directory>, image --request <request>, or inspect --request <request>; it has selector=none and no run or evidence command",
+        )),
     }
 }
 

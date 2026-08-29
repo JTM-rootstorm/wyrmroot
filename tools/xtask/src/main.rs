@@ -17,6 +17,7 @@ mod wyr1;
 mod wyr1_vm;
 mod wyr1b;
 mod wyr1c;
+mod wyr1c2;
 
 use std::env;
 use std::process::ExitCode;
@@ -123,6 +124,9 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
         Action::Wyr1BRun(request) => wyr1b::run(std::path::Path::new(&request)).map(Some),
         Action::Wyr1BEvidence(request) => wyr1b::evidence(std::path::Path::new(&request)).map(Some),
         Action::Wyr1C1Product(output) => wyr1c::product(std::path::Path::new(&output)).map(Some),
+        Action::Wyr1C2Freeze(output) => wyr1c2::freeze(std::path::Path::new(&output)).map(Some),
+        Action::Wyr1C2Image(request) => wyr1c2::image(std::path::Path::new(&request)).map(Some),
+        Action::Wyr1C2Inspect(request) => wyr1c2::inspect(std::path::Path::new(&request)).map(Some),
         Action::Dw1BImage(request) => dw1b::build(std::path::Path::new(&request)).map(Some),
         Action::Dw1BImageRebuild(request) => {
             dw1b::rebuild(std::path::Path::new(&request)).map(Some)
