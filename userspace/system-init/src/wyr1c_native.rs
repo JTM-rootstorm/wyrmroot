@@ -2024,6 +2024,23 @@ where
     recover_devmgr(resident, system, loader, waits, bootfs)
 }
 
+#[cfg(feature = "wyr1c6-selector29")]
+fn selector29_restarting_d1(
+    devmgr_generation: u64,
+    active_driver: Option<DriverLaunchRequest>,
+    last_reaped_driver: Option<DriverLaunchRequest>,
+) -> bool {
+    if devmgr_generation != wyrmroot_device_proto::SELECTOR29_FAILURE_SUPERVISOR_GENERATION {
+        return false;
+    }
+    active_driver.or(last_reaped_driver).is_some_and(|request| {
+        request.supervisor_generation.0
+            == wyrmroot_device_proto::SELECTOR29_FAILURE_SUPERVISOR_GENERATION
+            && request.attempt_generation.0
+                > wyrmroot_device_proto::SELECTOR29_FAILURE_ATTEMPT_GENERATION
+    })
+}
+
 fn recover_devmgr<S, L, W>(
     resident: &mut ResidentSystemInit,
     system: &mut S,
@@ -2037,14 +2054,20 @@ where
     W: SupervisionPlatform<Error = NativeError>,
 {
     #[cfg(feature = "wyr1c6-selector29")]
-    let restarting_d1 = resident
-        .wyr1c
-        .as_ref()
-        .and_then(|state| state.driver.as_ref())
-        .is_some_and(|driver| {
-            driver.request.attempt_generation.0
-                > wyrmroot_device_proto::SELECTOR29_FAILURE_ATTEMPT_GENERATION
-        });
+    let restarting_d1 = {
+        let state = resident
+            .wyr1c
+            .as_ref()
+            .ok_or(InitError::WrongActivationOrder)?;
+        selector29_restarting_d1(
+            state
+                .devmgr
+                .map(|devmgr| devmgr.generation)
+                .unwrap_or_default(),
+            state.driver.map(|driver| driver.request),
+            state.last_reaped_driver,
+        )
+    };
     if resident
         .wyr1c
         .as_ref()
@@ -3073,5 +3096,22 @@ mod tests {
             ),
             Ok(ResidentPollEvent::DriverExited)
         );
+    }
+
+    #[cfg(feature = "wyr1c6-selector29")]
+    #[test]
+    fn selector29_d1_restart_survives_u2_reaping_but_not_d2_replacement() {
+        let mut u1 = driver_request();
+        u1.supervisor_generation = SupervisorGeneration(1);
+        u1.attempt_generation = wyrmroot_device_proto::coordinator::AttemptGeneration(
+            wyrmroot_device_proto::SELECTOR29_FAILURE_ATTEMPT_GENERATION,
+        );
+        let mut u2 = u1;
+        u2.attempt_generation.0 += 1;
+
+        assert!(selector29_restarting_d1(1, Some(u2), Some(u1)));
+        assert!(selector29_restarting_d1(1, None, Some(u2)));
+        assert!(!selector29_restarting_d1(1, None, Some(u1)));
+        assert!(!selector29_restarting_d1(2, None, Some(u2)));
     }
 }
