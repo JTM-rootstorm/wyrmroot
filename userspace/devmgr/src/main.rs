@@ -418,9 +418,15 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
             // closure is the only reached notification path; no resource was
             // ever delegated, so reaping cannot lose future custody.
             #[cfg(feature = "wyr1c6-production")]
-            if observed.observed.0 & DW_SIGNAL_READABLE.0 != 0 {
+            if observed.observed.0 & (DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0) != 0 {
                 let request = resident.active_driver_request().ok_or(failure(40))?;
-                observe_driver_failure(control, request, &mut resident)?;
+                observe_driver_failure(
+                    control,
+                    request,
+                    &mut resident,
+                    observed.observed.0 & DW_SIGNAL_READABLE.0 != 0,
+                    observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0,
+                )?;
                 probe_stale_driver_endpoint(control, request, &resident)?;
                 close_handle(control).map_err(|_| failure(41))?;
                 retire_driver_publication(publication.ok_or(failure(42))?, request, &resident)?;
@@ -605,12 +611,24 @@ fn observe_driver_failure(
     control: DwHandle,
     request: wyrmroot_device_proto::DriverLaunchRequest,
     resident: &mut wyrmroot_devmgr::ResidentController,
+    readable: bool,
+    peer_closed: bool,
 ) -> Result<(), u32> {
+    if !readable {
+        return resident
+            .driver_failed(request.endpoint)
+            .map_err(|_| failure(105));
+    }
     let mut bytes = [0u8; wyrmroot_device_proto::control::FAILURE_BYTES];
     let mut handles = [DwReceivedHandleInfoV1::default(); 1];
     let counts = receive_channel(control, &mut bytes, &mut handles).map_err(|_| failure(100))?;
     if counts.bytes != bytes.len() || counts.handles != 0 {
         close_received(&handles, counts.handles);
+        if peer_closed && counts.bytes == 0 && counts.handles == 0 {
+            return resident
+                .driver_failed(request.endpoint)
+                .map_err(|_| failure(105));
+        }
         return Err(failure(101));
     }
     let message = wyrmroot_device_proto::control::parse(&bytes).map_err(|_| failure(102))?;
