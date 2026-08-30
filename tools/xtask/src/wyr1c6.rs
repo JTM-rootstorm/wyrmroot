@@ -297,10 +297,7 @@ fn build_produced_artifacts(
             )
         })?;
     let snapshot = crate::wyr1c::build_c6_snapshot(nonce)?;
-    let kernel = build_directory
-        .with_inheritable_anchor("WYR1-C6 build directory", |build_directory| {
-            build_selector29_kernel(deep_repository, build_directory, nonce)
-        })?;
+    let kernel = build_selector29_kernel(deep_repository, nonce)?;
     let table = boot_device_table();
     let code = pinned_firmware(OVMF_CODE_PATH, OVMF_CODE_SHA256, "OVMF code")?;
     let vars = pinned_firmware(OVMF_VARS_PATH, OVMF_VARS_SHA256, "OVMF vars")?;
@@ -980,56 +977,64 @@ fn build_c6_bootstrap(
     Ok(bytes)
 }
 
-fn build_selector29_kernel(
-    repository: &Path,
-    build: &InheritableDirectory,
-    nonce: &str,
-) -> Result<Vec<u8>, Failure> {
-    let target = build.path().join("deepwyrm-selector29");
-    fs::create_dir(&target)
-        .map_err(|error| Failure::task(format!("could not create C6 kernel target: {error}")))?;
-    let mut command = Command::new(repository.join("tools/pinned-cargo"));
-    command
-        .arg("target")
-        .args([
-            "build",
-            "--locked",
-            "--offline",
-            "--release",
-            "--target",
-            KERNEL_TARGET,
-            "--package",
-            "deepwyrm-kernel",
-            "--bin",
-            "deepwyrm-kernel",
-            "--features",
-            "test-support",
-        ])
-        .env("DEEPWYRM_PINNED_TARGET_DIR", &target)
-        .env_remove("CARGO_HOME")
-        .env_remove("LD_AUDIT")
-        .env_remove("LD_LIBRARY_PATH")
-        .env_remove("LD_PRELOAD")
-        .current_dir(repository)
-        .stdin(Stdio::null());
-    for (key, value) in selector29_kernel_environment(nonce) {
-        command.env(key, value);
-    }
-    let status = command
-        .status()
-        .map_err(|error| Failure::task(format!("could not build C6 kernel: {error}")))?;
-    if !status.success() {
-        return Err(Failure::task(
-            "WYR1-C6 selector-29 Deepwyrm kernel build failed",
-        ));
-    }
-    build.read_producer(
-        &PathBuf::from("deepwyrm-selector29")
-            .join(KERNEL_TARGET)
-            .join("release/deepwyrm-kernel"),
-        MAX_ARTIFACT_BYTES,
-        "selector-29 kernel",
-    )
+fn build_selector29_kernel(repository: &Path, nonce: &str) -> Result<Vec<u8>, Failure> {
+    let repository = Directory::open_exact(repository, "Deepwyrm source root")?;
+    let temporary = match repository.open_child(".tmp", "Deepwyrm temporary root") {
+        Ok(directory) => directory,
+        Err(_) => repository.create_child(".tmp", 0o700, "Deepwyrm temporary root")?,
+    };
+    temporary.verify_owned_container_path("Deepwyrm temporary root")?;
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Failure::task("system clock is before the Unix epoch"))?
+        .as_nanos();
+    let scratch = temporary.create_scratch(
+        &format!("wyr1c6-kernel-{}-{unique}", std::process::id()),
+        "WYR1-C6 Deepwyrm target",
+    )?;
+    let result = (|| {
+        let mut command = Command::new(repository.path().join("tools/pinned-cargo"));
+        command
+            .arg("target")
+            .args([
+                "build",
+                "--locked",
+                "--offline",
+                "--release",
+                "--target",
+                KERNEL_TARGET,
+                "--package",
+                "deepwyrm-kernel",
+                "--bin",
+                "deepwyrm-kernel",
+                "--features",
+                "test-support",
+            ])
+            .env("DEEPWYRM_PINNED_TARGET_DIR", scratch.path())
+            .env_remove("CARGO_HOME")
+            .env_remove("LD_AUDIT")
+            .env_remove("LD_LIBRARY_PATH")
+            .env_remove("LD_PRELOAD")
+            .current_dir(repository.path())
+            .stdin(Stdio::null());
+        for (key, value) in selector29_kernel_environment(nonce) {
+            command.env(key, value);
+        }
+        let status = command
+            .status()
+            .map_err(|error| Failure::task(format!("could not build C6 kernel: {error}")))?;
+        if !status.success() {
+            return Err(Failure::task(
+                "WYR1-C6 selector-29 Deepwyrm kernel build failed",
+            ));
+        }
+        scratch.read_producer(
+            &PathBuf::from(KERNEL_TARGET).join("release/deepwyrm-kernel"),
+            MAX_ARTIFACT_BYTES,
+            "selector-29 kernel",
+        )
+    })();
+    scratch.finish(result)
 }
 
 fn selector29_kernel_environment(nonce: &str) -> [(&'static str, String); 2] {
