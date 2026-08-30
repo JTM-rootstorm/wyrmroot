@@ -30,10 +30,15 @@ fn controller_requires_five_registered_delivery_cycles_then_race_stale_replaceme
         let next = controller
             .accept(message(MessageKind::OwnerWaitComplete, sequence, 0))
             .unwrap();
-        if sequence < DELIVERY_CYCLES {
-            assert_eq!(next, Some(owner_ack_permit(sequence)));
-        } else {
-            assert_eq!(next, Some(deliver_command(PENDING_DELIVERY_SEQUENCE, 0)));
+        assert_eq!(next, Some(owner_ack_permit(sequence)));
+        let after_ack = controller
+            .accept(message(MessageKind::OwnerAckComplete, sequence, 0))
+            .unwrap();
+        if sequence == DELIVERY_CYCLES {
+            assert_eq!(
+                after_ack,
+                Some(deliver_command(PENDING_DELIVERY_SEQUENCE, 0))
+            );
             assert_eq!(
                 controller.accept(message(
                     MessageKind::TriggerComplete,
@@ -48,13 +53,19 @@ fn controller_requires_five_registered_delivery_cycles_then_race_stale_replaceme
                     RACE_PERMIT_SEQUENCE,
                     0
                 )),
-                Ok(Some(owner_ack_permit(DELIVERY_CYCLES)))
+                Ok(Some(owner_ack_permit(RACE_PERMIT_SEQUENCE)))
             );
+            assert_eq!(
+                controller.accept(message(
+                    MessageKind::OwnerAckComplete,
+                    RACE_PERMIT_SEQUENCE,
+                    0,
+                )),
+                Ok(None)
+            );
+        } else {
+            assert_eq!(after_ack, None);
         }
-        assert_eq!(
-            controller.accept(message(MessageKind::OwnerAckComplete, sequence, 0)),
-            Ok(None)
-        );
     }
     assert_eq!(
         controller.accept(message(MessageKind::FirstOwnerClosed, 0, 0)),

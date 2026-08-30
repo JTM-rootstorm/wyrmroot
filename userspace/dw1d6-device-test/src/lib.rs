@@ -213,8 +213,8 @@ impl ControllerModel {
                     self.phase = Phase::TriggerComplete(RACE_PERMIT_SEQUENCE);
                     Some(deliver_command(RACE_PERMIT_SEQUENCE, 0))
                 } else {
-                    self.phase = Phase::OwnerAckComplete(DELIVERY_CYCLES);
-                    Some(owner_ack_permit(DELIVERY_CYCLES))
+                    self.phase = Phase::OwnerAckComplete(RACE_PERMIT_SEQUENCE);
+                    Some(owner_ack_permit(RACE_PERMIT_SEQUENCE))
                 }
             }
             (
@@ -225,13 +225,8 @@ impl ControllerModel {
                     status: 0,
                 },
             ) if sequence == expected => {
-                if sequence < DELIVERY_CYCLES {
-                    self.phase = Phase::OwnerAckComplete(sequence);
-                    Some(owner_ack_permit(sequence))
-                } else {
-                    self.phase = Phase::TriggerComplete(PENDING_DELIVERY_SEQUENCE);
-                    Some(deliver_command(PENDING_DELIVERY_SEQUENCE, 0))
-                }
+                self.phase = Phase::OwnerAckComplete(sequence);
+                Some(owner_ack_permit(sequence))
             }
             (
                 Phase::OwnerAckComplete(expected),
@@ -243,10 +238,14 @@ impl ControllerModel {
             ) if sequence == expected => {
                 if sequence < DELIVERY_CYCLES {
                     self.phase = Phase::OwnerWaitIntent(sequence + 1);
+                    None
+                } else if sequence == DELIVERY_CYCLES {
+                    self.phase = Phase::TriggerComplete(PENDING_DELIVERY_SEQUENCE);
+                    Some(deliver_command(PENDING_DELIVERY_SEQUENCE, 0))
                 } else {
                     self.phase = Phase::FirstOwnerClosed;
+                    None
                 }
-                None
             }
             (
                 Phase::FirstOwnerClosed,

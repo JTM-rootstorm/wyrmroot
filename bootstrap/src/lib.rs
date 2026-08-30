@@ -443,6 +443,20 @@ pub fn run_d6_synthetic_bootstrap<
                 0,
             ),
         )?;
+        send_d6_message(
+            system,
+            owner.launch_channel,
+            wyrmroot_dw1d6_device_test::owner_ack_permit(sequence),
+        )?;
+        expect_d6_message(
+            system,
+            owner.launch_channel,
+            wyrmroot_dw1d6_device_test::ControllerMessage::new(
+                wyrmroot_dw1d6_device_test::MessageKind::OwnerAckComplete,
+                sequence,
+                0,
+            ),
+        )?;
         if sequence == wyrmroot_dw1d6_device_test::DELIVERY_CYCLES {
             for race_sequence in [
                 wyrmroot_dw1d6_device_test::PENDING_DELIVERY_SEQUENCE,
@@ -463,21 +477,23 @@ pub fn run_d6_synthetic_bootstrap<
                     ),
                 )?;
             }
+            send_d6_message(
+                system,
+                owner.launch_channel,
+                wyrmroot_dw1d6_device_test::owner_ack_permit(
+                    wyrmroot_dw1d6_device_test::RACE_PERMIT_SEQUENCE,
+                ),
+            )?;
+            expect_d6_message(
+                system,
+                owner.launch_channel,
+                wyrmroot_dw1d6_device_test::ControllerMessage::new(
+                    wyrmroot_dw1d6_device_test::MessageKind::OwnerAckComplete,
+                    wyrmroot_dw1d6_device_test::RACE_PERMIT_SEQUENCE,
+                    0,
+                ),
+            )?;
         }
-        send_d6_message(
-            system,
-            owner.launch_channel,
-            wyrmroot_dw1d6_device_test::owner_ack_permit(sequence),
-        )?;
-        expect_d6_message(
-            system,
-            owner.launch_channel,
-            wyrmroot_dw1d6_device_test::ControllerMessage::new(
-                wyrmroot_dw1d6_device_test::MessageKind::OwnerAckComplete,
-                sequence,
-                0,
-            ),
-        )?;
     }
     expect_d6_message(
         system,

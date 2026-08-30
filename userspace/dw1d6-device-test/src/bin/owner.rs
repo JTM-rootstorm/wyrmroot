@@ -11,7 +11,8 @@ use deepwyrm_syscall::{
 };
 use wyrmroot_dw1d6_device_test::{
     BUILD_CHALLENGE, BUILD_NONCE, CONTROLLER_MESSAGE_BYTES, ControllerMessage, DELIVERY_CYCLES,
-    EXPECTED_SOURCE, MessageKind, PIO_WIDTH_1, RESOURCE_ID, SCRATCH_OFFSET, owner_start_permit,
+    EXPECTED_SOURCE, MessageKind, PIO_WIDTH_1, RACE_PERMIT_SEQUENCE, RESOURCE_ID, SCRATCH_OFFSET,
+    owner_start_permit,
 };
 use wyrmroot_loader::launch::{HEADER_BYTES, LaunchProfile, parse_init};
 use wyrmroot_runtime::{
@@ -220,6 +221,21 @@ fn owner_main(startup: StartupBlock<'_>) -> u32 {
             return fail(27);
         }
         sequence += 1;
+    }
+    if receive_command(channel)
+        != Some(ControllerMessage::new(
+            MessageKind::OwnerAckPermit,
+            RACE_PERMIT_SEQUENCE,
+            0,
+        ))
+    {
+        return fail(34);
+    }
+    if interrupt_ack(interrupt).is_err() {
+        return fail(35);
+    }
+    if !send_status(channel, MessageKind::OwnerAckComplete, RACE_PERMIT_SEQUENCE) {
+        return fail(36);
     }
     // Public finalization order is part of the proof: I1 first, then its
     // parent grant. Kernel hooks own events 0F and 10.
