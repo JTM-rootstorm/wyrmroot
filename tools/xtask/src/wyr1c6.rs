@@ -1027,10 +1027,9 @@ fn build_selector29_kernel(
     )
 }
 
-fn selector29_kernel_environment(nonce: &str) -> [(&'static str, String); 3] {
+fn selector29_kernel_environment(nonce: &str) -> [(&'static str, String); 2] {
     [
         ("DEEPWYRM_GUEST_TEST_SELECTOR", SELECTOR.to_owned()),
-        ("DEEPWYRM_GUEST_TEST_ID", TEST_ID.to_string()),
         ("DEEPWYRM_WYR1C_EVIDENCE_NONCE", nonce.to_owned()),
     ]
 }
@@ -2274,7 +2273,6 @@ mod tests {
             selector29_kernel_environment("0123456789ABCDEF"),
             [
                 ("DEEPWYRM_GUEST_TEST_SELECTOR", SELECTOR.to_owned()),
-                ("DEEPWYRM_GUEST_TEST_ID", "29".to_owned()),
                 (
                     "DEEPWYRM_WYR1C_EVIDENCE_NONCE",
                     "0123456789ABCDEF".to_owned()
