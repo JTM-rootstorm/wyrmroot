@@ -124,6 +124,8 @@ pub(crate) struct ResidentState {
     #[cfg(feature = "wyr1c6-selector29")]
     c6_d1_supervisor: Option<u64>,
     #[cfg(feature = "wyr1c6-selector29")]
+    c6_d1_cleanup_complete: bool,
+    #[cfg(feature = "wyr1c6-selector29")]
     c6_d2_lease: Option<u64>,
     #[cfg(feature = "wyr1c6-selector29")]
     c6_d2_supervisor: Option<u64>,
@@ -354,6 +356,8 @@ where
         c6_d1_lease: None,
         #[cfg(feature = "wyr1c6-selector29")]
         c6_d1_supervisor: None,
+        #[cfg(feature = "wyr1c6-selector29")]
+        c6_d1_cleanup_complete: false,
         #[cfg(feature = "wyr1c6-selector29")]
         c6_d2_lease: None,
         #[cfg(feature = "wyr1c6-selector29")]
@@ -1111,27 +1115,36 @@ fn close_received_native<S: InitPlatform>(
 fn accept_c6_fact(resident: &mut ResidentSystemInit, fact: C6Fact) -> Result<(), InitError> {
     #[cfg(feature = "wyr1c6-selector29")]
     if fact.event == 19 {
-        let d1_lease = resident
+        let (d1_lease, cleanup_complete) = resident
             .wyr1c
             .as_ref()
-            .and_then(|state| state.c6_d1_lease)
+            .map(|state| (state.c6_d1_lease, state.c6_d1_cleanup_complete))
             .ok_or(InitError::WrongActivationOrder)?;
-        if fact.lease > d1_lease
-            && fact.binding == 1
-            && fact.value != 0
-            && fact.aux == COM2_ROLE_ID.0
+        let d1_lease = d1_lease.ok_or(InitError::WrongActivationOrder)?;
+        if !cleanup_complete
+            || fact.lease <= d1_lease
+            || fact.binding != 1
+            || fact.value == 0
+            || fact.aux != COM2_ROLE_ID.0
         {
-            accept_c6_fact(
-                resident,
-                C6Fact {
-                    event: 18,
-                    lease: d1_lease,
-                    binding: 0,
-                    value: 1,
-                    aux: 0,
-                },
-            )?;
+            return Err(InitError::WrongManifestProfile);
         }
+        let state = resident
+            .wyr1c
+            .as_mut()
+            .ok_or(InitError::WrongActivationOrder)?;
+        state
+            .c6_evidence
+            .as_mut()
+            .ok_or(InitError::WrongActivationOrder)?
+            .record(
+                crate::wyr1c6_gate::GateEvent::D1GrantAvailable,
+                d1_lease,
+                0,
+                1,
+                0,
+            )
+            .map_err(|_| InitError::WrongManifestProfile)?;
     }
     let state = resident
         .wyr1c
@@ -1324,6 +1337,7 @@ fn accept_c6_fact(resident: &mut ResidentSystemInit, fact: C6Fact) -> Result<(),
             state.c6_d2_supervisor = Some(fact.value);
             state.c6_d2_role = Some(fact.aux);
         }
+        17 => state.c6_d1_cleanup_complete = true,
         _ => {}
     }
     Ok(())

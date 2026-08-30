@@ -146,6 +146,7 @@ pub struct ResidentController {
     last_binding: Option<RegistryBinding>,
     active_binding: Option<RegistryBinding>,
     retired_binding: Option<RegistryBinding>,
+    retired_driver_attempt: Option<u64>,
     active_driver: Option<DriverLaunch>,
     bundle_generation: Option<BundleGeneration>,
     driver_ready: bool,
@@ -201,6 +202,7 @@ impl ResidentController {
             last_binding: None,
             active_binding: None,
             retired_binding: None,
+            retired_driver_attempt: None,
             active_driver: None,
             bundle_generation: None,
             driver_ready: false,
@@ -226,6 +228,10 @@ impl ResidentController {
 
     pub const fn retired_binding(&self) -> Option<RegistryBinding> {
         self.retired_binding
+    }
+
+    pub const fn retired_driver_attempt(&self) -> Option<u64> {
+        self.retired_driver_attempt
     }
 
     pub const fn last_transaction_id(&self) -> u64 {
@@ -494,6 +500,9 @@ impl ResidentController {
             return Err(DevmgrError::ControllerLifecycle);
         }
         self.retired_binding = self.active_binding;
+        self.retired_driver_attempt = self
+            .active_driver_request()
+            .map(|request| request.attempt_generation.0);
         self.active_binding = None;
         Ok(())
     }

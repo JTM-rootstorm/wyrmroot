@@ -360,4 +360,24 @@ mod tests {
             Err(GateError::InvalidEvent)
         );
     }
+
+    #[test]
+    fn ordered_transcript_model_reaches_terminal_only_after_all_26_facts() {
+        let mut log = EvidenceLog::new(0x1234).unwrap();
+        for (index, event) in EVIDENCE_ORDER[..26].iter().copied().enumerate() {
+            let (lease, binding, value, aux) = if index == 25 {
+                (29, 0, 4, 25_000_000)
+            } else {
+                (29, index as u64 + 1, index as u64 + 1, index as u64 + 2)
+            };
+            log.record(event, lease, binding, value, aux).unwrap();
+        }
+        assert!(log.ready_for_terminal());
+        let mut record = [0; RECORD_BYTES];
+        assert_eq!(log.encode_record_at(25, &mut record), None);
+        log.finish().unwrap();
+        assert!(log.is_complete());
+        assert!(log.encode_record_at(25, &mut record).is_some());
+        assert_eq!(&record[34..36], b"1A");
+    }
 }

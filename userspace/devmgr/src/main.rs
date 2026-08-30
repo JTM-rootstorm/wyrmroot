@@ -407,6 +407,19 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                         aux: wyrmroot_device_proto::manifest::COM2_ROLE_ID.0,
                     },
                 )?;
+                for event in [20, 21, 22] {
+                    send_c6_fact(
+                        bootstrap,
+                        C6Fact {
+                            event,
+                            lease,
+                            binding: wyrmroot_devmgr::COM2_RESOURCE_ID,
+                            value: supervisor,
+                            aux: wyrmroot_device_proto::manifest::COM2_ROLE_ID.0,
+                        },
+                    )?;
+                }
+                emit_selector29_final_facts(bootstrap, &resident, lease)?;
             }
             #[cfg(not(any(feature = "wyr1c4-production", feature = "wyr1c5-production")))]
             if action == ControllerAction::InitialPublicationBound {
@@ -416,7 +429,10 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                 driver_control = Some(launch_driver(bootstrap, &mut resident)?);
             }
             #[cfg(feature = "wyr1c5-production")]
-            if action == ControllerAction::InitialPublicationBound {
+            if action == ControllerAction::InitialPublicationBound
+                && (cfg!(not(feature = "wyr1c6-selector29"))
+                    || resident.status().supervisor_generation.0 == 1)
+            {
                 let parent = device_resource.ok_or(failure(53))?;
                 let launched = launch_driver_with_bundle(
                     bootstrap,
@@ -1119,18 +1135,7 @@ fn launch_driver_with_bundle(
     }
 
     #[cfg(feature = "wyr1c6-selector29")]
-    if request.supervisor_generation.0 > 1 {
-        send_c6_fact(
-            bootstrap,
-            C6Fact {
-                event: 20,
-                lease: lease_generation,
-                binding: wyrmroot_devmgr::COM2_RESOURCE_ID,
-                value: request.supervisor_generation.0,
-                aux: wyrmroot_device_proto::manifest::COM2_ROLE_ID.0,
-            },
-        )?;
-    } else {
+    if request.supervisor_generation.0 == 1 {
         send_c6_fact(
             bootstrap,
             C6Fact {
@@ -1177,31 +1182,7 @@ fn launch_driver_with_bundle(
         return Err(failure(81));
     }
     #[cfg(feature = "wyr1c6-selector29")]
-    if request.supervisor_generation.0 > 1 {
-        send_c6_fact(
-            bootstrap,
-            C6Fact {
-                event: 21,
-                lease: lease_generation,
-                binding: wyrmroot_devmgr::COM2_RESOURCE_ID,
-                value: request.supervisor_generation.0,
-                aux: wyrmroot_device_proto::manifest::COM2_ROLE_ID.0,
-            },
-        )?;
-    }
-    #[cfg(feature = "wyr1c6-selector29")]
-    if request.supervisor_generation.0 > 1 {
-        send_c6_fact(
-            bootstrap,
-            C6Fact {
-                event: 22,
-                lease: lease_generation,
-                binding: wyrmroot_devmgr::COM2_RESOURCE_ID,
-                value: request.supervisor_generation.0,
-                aux: wyrmroot_device_proto::manifest::COM2_ROLE_ID.0,
-            },
-        )?;
-    } else {
+    if request.supervisor_generation.0 == 1 {
         send_c6_fact(
             bootstrap,
             C6Fact {
@@ -1214,23 +1195,6 @@ fn launch_driver_with_bundle(
                 binding: irq_binding,
                 value: request.attempt_generation.0,
                 aux: request.endpoint.generation.0,
-            },
-        )?;
-    }
-    #[cfg(feature = "wyr1c6-selector29")]
-    if request.attempt_generation.0 > 1
-        && request.supervisor_generation.0
-            == wyrmroot_device_proto::SELECTOR29_FAILURE_SUPERVISOR_GENERATION
-    {
-        let binding = resident.retired_binding().ok_or(failure(140))?;
-        send_c6_fact(
-            bootstrap,
-            C6Fact {
-                event: 13,
-                lease: lease_generation,
-                binding: binding.generation.0,
-                value: 1,
-                aux: 3,
             },
         )?;
     }
@@ -1262,6 +1226,19 @@ fn launch_driver_with_bundle(
                     aux: publication_binding.endpoint.generation.0,
                 },
             )?;
+            if request.attempt_generation.0 > 1 {
+                let binding = resident.retired_binding().ok_or(failure(140))?;
+                send_c6_fact(
+                    bootstrap,
+                    C6Fact {
+                        event: 13,
+                        lease: lease_generation,
+                        binding: binding.generation.0,
+                        value: resident.retired_driver_attempt().ok_or(failure(141))?,
+                        aux: 3,
+                    },
+                )?;
+            }
         }
     }
     #[cfg(feature = "wyr1c6-selector29")]
@@ -1374,6 +1351,57 @@ fn send_c6_fact(bootstrap: DwHandle, fact: C6Fact) -> Result<(), u32> {
     let mut bytes = [0u8; C6_FACT_BYTES];
     encode_c6_fact(fact, &mut bytes).map_err(|_| failure(127))?;
     send_channel(bootstrap, &bytes, &[]).map_err(|_| failure(128))
+}
+
+#[cfg(feature = "wyr1c6-selector29")]
+fn emit_selector29_final_facts(
+    bootstrap: DwHandle,
+    resident: &wyrmroot_devmgr::ResidentController,
+    lease: u64,
+) -> Result<(), u32> {
+    if resident.status().state != wyrmroot_device_proto::CoordinatorState::Matched
+        || resident.driver_ready()
+        || resident.driver_lease_generation().is_some()
+    {
+        return Err(failure(144));
+    }
+    // D2 intentionally does not construct a U3 actor.  Consequently the
+    // native path has inspected the three forbidden role classes without
+    // granting authority or invoking any PIO/IRQ operation.
+    let facts = [
+        C6Fact {
+            event: 23,
+            lease,
+            binding: 0,
+            value: 3,
+            aux: 0,
+        },
+        C6Fact {
+            event: 24,
+            lease,
+            binding: 0,
+            value: 0,
+            aux: 0,
+        },
+        C6Fact {
+            event: 25,
+            lease,
+            binding: 0,
+            value: u64::from(resident.driver_failures()),
+            aux: 0,
+        },
+        C6Fact {
+            event: 26,
+            lease,
+            binding: 0,
+            value: 4,
+            aux: 25_000_000,
+        },
+    ];
+    for fact in facts {
+        send_c6_fact(bootstrap, fact)?;
+    }
+    Ok(())
 }
 
 fn validate_fresh(handle: DwHandle, object_type: DwObjectType, rights: DwRights) -> Result<(), ()> {
