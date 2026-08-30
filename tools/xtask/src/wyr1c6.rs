@@ -604,7 +604,14 @@ pub(crate) fn inspect(path: &Path) -> Result<String, Failure> {
             .display()
             .to_string(),
     };
-    g3_image::inspect(&args)?;
+    g3_image::inspect_d6(
+        &args,
+        &request
+            .root
+            .join(request.value("boot_device_table")?)
+            .display()
+            .to_string(),
+    )?;
     let request_sha256 = sha256::bytes_digest(&read_regular_bounded(path, 64 * 1024, "request")?);
     for (profile, vcpus, key) in [
         ("default", 1_u8, "default_handoff"),

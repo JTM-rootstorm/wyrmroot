@@ -229,6 +229,22 @@ fn inspect_created_or_remove(
 
 pub(crate) fn inspect(arguments: &G3ImageArguments) -> Result<String, Failure> {
     let inputs = Inputs::load(arguments)?;
+    inspect_with_inputs(arguments, inputs)
+}
+
+/// Inspect the selector-30/C6 ESP while binding the separate immutable
+/// boot-device table. Historical callers retain the exact no-table rule.
+pub(crate) fn inspect_d6(
+    arguments: &G3ImageArguments,
+    boot_device_table: &str,
+) -> Result<String, Failure> {
+    inspect_with_inputs(
+        arguments,
+        Inputs::load_with_boot_device_table(arguments, boot_device_table)?,
+    )
+}
+
+fn inspect_with_inputs(arguments: &G3ImageArguments, inputs: Inputs) -> Result<String, Failure> {
     let mut image = OpenOptions::new()
         .read(true)
         .custom_flags(0o400000)
@@ -956,6 +972,10 @@ mod tests {
         fs::write(&table, b"exact immutable table bytes").expect("write table fixture");
         let report = build_d6(&arguments, &table.display().to_string()).expect("build D6 image");
         assert!(report.contains("\"phase\":\"WYR0-G3\""));
+        assert_eq!(
+            inspect_d6(&arguments, &table.display().to_string()).expect("inspect D6 image"),
+            report
+        );
         let inputs = Inputs::load_with_boot_device_table(&arguments, &table.display().to_string())
             .expect("reload D6 inputs");
         let mut image = OpenOptions::new()
