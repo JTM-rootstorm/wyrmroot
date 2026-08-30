@@ -37,7 +37,10 @@ fn materialization_lengths(source_len: usize) -> Result<(u64, u64), NativeError>
         .and_then(|value| value.checked_div(PAGE_SIZE))
         .and_then(|pages| pages.checked_mul(PAGE_SIZE))
         .ok_or(NativeError::Output(NativeOutputError::InvalidMappedRange))?;
-    Ok((logical, mapped))
+    // Deepwyrm MemoryObjects are page-granular. Preserve the protocol's
+    // logical length in its own header and zero-fill the rounded object tail;
+    // both creation and mapping must use the admitted page extent.
+    Ok((mapped, mapped))
 }
 
 #[cfg(feature = "wyr1-test-evidence")]
@@ -197,8 +200,8 @@ pub fn materialize_read_only_memory(
     source: &[u8],
     child_rights: DwRights,
 ) -> Result<DwHandle, NativeError> {
-    let (logical, mapped_bytes) = materialization_lengths(source.len())?;
-    let memory = create_memory_object(logical, MATERIALIZATION_PARENT_RIGHTS)?;
+    let (object_bytes, mapped_bytes) = materialization_lengths(source.len())?;
+    let memory = create_memory_object(object_bytes, MATERIALIZATION_PARENT_RIGHTS)?;
     let mut mapping = match map_memory_read_write(root, memory, mapped_bytes) {
         Ok(mapping) => mapping,
         Err(error) => {
@@ -608,11 +611,11 @@ mod materialization_tests {
     use super::*;
 
     #[test]
-    fn immutable_materialization_preserves_logical_length_and_rounds_only_mapping() {
-        assert_eq!(materialization_lengths(1).unwrap(), (1, PAGE_SIZE));
+    fn immutable_materialization_uses_page_granular_object_and_mapping_extents() {
+        assert_eq!(materialization_lengths(1).unwrap(), (PAGE_SIZE, PAGE_SIZE));
         assert_eq!(
             materialization_lengths(PAGE_SIZE as usize + 1).unwrap(),
-            (PAGE_SIZE + 1, PAGE_SIZE * 2)
+            (PAGE_SIZE * 2, PAGE_SIZE * 2)
         );
         assert!(materialization_lengths(0).is_err());
     }
