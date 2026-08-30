@@ -1,5 +1,7 @@
 use {wyrmroot_device_proto as _, wyrmroot_devmgr as _};
 
+use deepwyrm_syscall as _;
+
 const NATIVE: &str = include_str!("../src/main.rs");
 
 #[test]

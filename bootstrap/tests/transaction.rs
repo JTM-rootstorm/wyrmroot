@@ -706,6 +706,7 @@ impl LoaderPlatform for SmokeLoader {
             | launch::LaunchProfile::Dw1bProgress
             | launch::LaunchProfile::JobV2Streams
             | launch::LaunchProfile::DeviceCoordinator
+            | launch::LaunchProfile::DeviceCoordinatorResourceDomain
             | launch::LaunchProfile::DeviceDriver
             | launch::LaunchProfile::D6ResourceOwner
             | launch::LaunchProfile::SupervisorResourceDomain => {

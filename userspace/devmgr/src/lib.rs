@@ -10,11 +10,16 @@
 #[cfg(feature = "native-devmgr")]
 use {deepwyrm_syscall as _, wyrmroot_loader as _, wyrmroot_runtime as _};
 
+use deepwyrm_syscall::{
+    DW_DEVICE_RESOURCE_INFO_V1_SIZE, DW_DEVICE_RESOURCE_INFO_V1_VERSION,
+    DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT, DwDeviceResourceInfoV1,
+};
+
 use wyrmroot_device_proto::controller::{
     ControllerMessage, ControllerParseError, StatusCode, validate_binding_transition,
 };
 use wyrmroot_device_proto::coordinator::{
-    AttemptGeneration, EndpointGeneration, EndpointId, LaunchSessionGeneration,
+    AttemptGeneration, BundleGeneration, EndpointGeneration, EndpointId, LaunchSessionGeneration,
 };
 use wyrmroot_device_proto::coordinator::{
     Coordinator, CoordinatorError, CoordinatorState, RegistryBinding, SupervisorGeneration,
@@ -49,6 +54,8 @@ pub struct OperationalStatus {
     pub metadata_policy: MetadataPolicyId,
 }
 
+pub const COM2_RESOURCE_ID: u64 = 1;
+
 impl OperationalStatus {
     /// C1 cannot truthfully reach any device-bound phase.
     pub const fn is_device_bound(self) -> bool {
@@ -73,6 +80,7 @@ pub enum DevmgrError {
     StaleControllerTransaction,
     ControllerLifecycle,
     DriverLaunch(DriverLaunchError),
+    ResourceIdentity,
 }
 
 impl From<ControllerParseError> for DevmgrError {
@@ -134,6 +142,7 @@ pub struct ResidentController {
     last_binding: Option<RegistryBinding>,
     active_binding: Option<RegistryBinding>,
     active_driver: Option<DriverLaunch>,
+    bundle_generation: Option<BundleGeneration>,
     next_driver_attempt: u64,
     next_driver_session: u64,
     next_driver_endpoint: u64,
@@ -181,6 +190,7 @@ impl ResidentController {
             last_binding: None,
             active_binding: None,
             active_driver: None,
+            bundle_generation: None,
             next_driver_attempt: driver_attempt,
             next_driver_session: driver_session,
             next_driver_endpoint: driver_endpoint,
@@ -198,6 +208,39 @@ impl ResidentController {
 
     pub const fn last_transaction_id(&self) -> u64 {
         self.last_transaction_id
+    }
+
+    pub const fn bundle_generation(&self) -> Option<BundleGeneration> {
+        self.bundle_generation
+    }
+
+    /// Admits one exact queried COM2 resource for this devmgr generation.
+    /// The kernel lease generation is the Wyrmroot bundle generation; no
+    /// supervisor, endpoint, or driver-attempt identity may substitute for it.
+    pub fn admit_device_resource(
+        &mut self,
+        resource: DwDeviceResourceInfoV1,
+    ) -> Result<BundleGeneration, DevmgrError> {
+        if self.status.state != CoordinatorState::WaitingForDeviceBundle
+            || self.active_binding.is_none()
+            || self.bundle_generation.is_some()
+            || resource.size != DW_DEVICE_RESOURCE_INFO_V1_SIZE
+            || resource.version != DW_DEVICE_RESOURCE_INFO_V1_VERSION
+            || resource.kind != DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT
+            || resource.flags != 0
+            || resource.resource_id != COM2_RESOURCE_ID
+            || resource.lease_generation == 0
+            || resource.pio_base != self.status.pio.base
+            || resource.pio_length != self.status.pio.length
+            || resource.interrupt_source != self.status.irq
+            || resource.reserved != 0
+        {
+            return Err(DevmgrError::ResourceIdentity);
+        }
+        let generation = BundleGeneration(resource.lease_generation);
+        self.bundle_generation = Some(generation);
+        self.status.state = CoordinatorState::Matched;
+        Ok(generation)
     }
 
     /// Issues exactly one pre-resource C3 launch correlation.  The caller
@@ -495,6 +538,21 @@ mod tests {
         }
     }
 
+    fn exact_resource(lease_generation: u64) -> DwDeviceResourceInfoV1 {
+        DwDeviceResourceInfoV1 {
+            size: DW_DEVICE_RESOURCE_INFO_V1_SIZE,
+            version: DW_DEVICE_RESOURCE_INFO_V1_VERSION,
+            kind: DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT,
+            flags: 0,
+            resource_id: COM2_RESOURCE_ID,
+            lease_generation,
+            pio_base: 0x2f8,
+            pio_length: 8,
+            interrupt_source: 3,
+            reserved: 0,
+        }
+    }
+
     #[test]
     fn controller_correlates_zero_handle_install_to_startup_then_reports_waiting() {
         let mut resident =
@@ -517,6 +575,63 @@ mod tests {
                 status: StatusCode::OperationalWaitingForDeviceBundle,
                 attempt_generation: None,
             })
+        );
+    }
+
+    #[test]
+    fn c4_admits_exact_claimed_resource_and_uses_kernel_lease_generation() {
+        let mut resident =
+            ResidentController::new(prepare_operational(&manifest(), 7).unwrap(), 41).unwrap();
+        resident.accept(install(binding(1, 7), 41), 0).unwrap();
+        assert_eq!(
+            resident.admit_device_resource(exact_resource(19)),
+            Ok(BundleGeneration(19))
+        );
+        assert_eq!(resident.bundle_generation(), Some(BundleGeneration(19)));
+        assert_eq!(resident.status().state, CoordinatorState::Matched);
+        assert!(resident.status().is_device_bound());
+        assert_eq!(
+            resident.admit_device_resource(exact_resource(20)),
+            Err(DevmgrError::ResourceIdentity)
+        );
+    }
+
+    #[test]
+    fn c4_rejects_every_mismatched_resource_identity_field() {
+        let mut cases = [exact_resource(7); 10];
+        cases[0].size = 47;
+        cases[1].version = 2;
+        cases[2].kind = deepwyrm_syscall::DwDeviceResourceKind(2);
+        cases[3].flags = 1;
+        cases[4].resource_id = 2;
+        cases[5].lease_generation = 0;
+        cases[6].pio_base = 0x3f8;
+        cases[7].pio_length = 7;
+        cases[8].interrupt_source = 4;
+        cases[9].reserved = 1;
+        for resource in cases {
+            let mut resident =
+                ResidentController::new(prepare_operational(&manifest(), 7).unwrap(), 41).unwrap();
+            resident.accept(install(binding(1, 7), 41), 0).unwrap();
+            assert_eq!(
+                resident.admit_device_resource(resource),
+                Err(DevmgrError::ResourceIdentity)
+            );
+            assert_eq!(resident.bundle_generation(), None);
+            assert_eq!(
+                resident.status().state,
+                CoordinatorState::WaitingForDeviceBundle
+            );
+        }
+    }
+
+    #[test]
+    fn c4_cannot_claim_before_the_exact_registry_binding() {
+        let mut resident =
+            ResidentController::new(prepare_operational(&manifest(), 7).unwrap(), 41).unwrap();
+        assert_eq!(
+            resident.admit_device_resource(exact_resource(1)),
+            Err(DevmgrError::ResourceIdentity)
         );
     }
 

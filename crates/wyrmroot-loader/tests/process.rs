@@ -7,12 +7,13 @@ use wyrmroot_loader::{
     launch::{LaunchProfile, RESOURCE_DOMAIN_CLAIM_RIGHTS, RESOURCE_DOMAIN_CLAIM_TRANSFER_RIGHTS},
     process::{
         D6ResourceOwnerLoadRequest, DeviceCoordinatorLoadError, DeviceCoordinatorLoadRequest,
-        DeviceDriverLoadError, DeviceDriverLoadRequest, JobLoadError, JobLoadRequest,
-        LoadAuthority, LoadError, LoadFault, LoadRequest, LoadStage, LoaderPlatform, ParentMapping,
-        ProcessCreateRequest, ProcessCreateResult, ResourceDomainLoadRequest, ServiceLoadError,
-        ServiceLoadRequest, load_d6_resource_owner_process, load_device_coordinator_process,
-        load_device_driver_process, load_job_process, load_process, load_process_with_fault,
-        load_resource_domain_process, load_service_process,
+        DeviceCoordinatorResourceLoadRequest, DeviceDriverLoadError, DeviceDriverLoadRequest,
+        JobLoadError, JobLoadRequest, LoadAuthority, LoadError, LoadFault, LoadRequest, LoadStage,
+        LoaderPlatform, ParentMapping, ProcessCreateRequest, ProcessCreateResult,
+        ResourceDomainLoadRequest, ServiceLoadError, ServiceLoadRequest,
+        load_d6_resource_owner_process, load_device_coordinator_process,
+        load_device_coordinator_resource_process, load_device_driver_process, load_job_process,
+        load_process, load_process_with_fault, load_resource_domain_process, load_service_process,
     },
 };
 use wyrmroot_registry_proto::{Correlation, CorrelationEnvironment};
@@ -663,6 +664,139 @@ fn device_coordinator_failed_init_move_retains_both_external_inputs() {
             .contains(&Event::Close(publication_endpoint.0))
     );
     assert!(!platform.events.contains(&Event::Close(manifest.0)));
+}
+
+#[test]
+fn c4_device_coordinator_moves_only_the_reduced_staged_domain_duplicate() {
+    let mut platform = Mock::new(None);
+    let image = executable();
+    let publication_endpoint = DwHandle(0x924);
+    let manifest = DwHandle(0x925);
+    let resource_domain = DwHandle(0x926);
+    load_device_coordinator_resource_process(
+        &mut platform,
+        authority(),
+        DeviceCoordinatorResourceLoadRequest {
+            image: &image,
+            display_path: "/system/devmgr",
+            publication_endpoint,
+            manifest,
+            resource_domain,
+            supervisor_generation: 0x59,
+            transaction_id: 0xc401,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(platform.sent_init.len(), 80);
+    assert_eq!(&platform.sent_init[6..8], &9_u16.to_le_bytes());
+    assert_eq!(&platform.sent_init[72..80], &0x59_u64.to_le_bytes());
+    assert_eq!(platform.sent_transfers.len(), 4);
+    let (source, staged_rights, staged) = platform
+        .duplicates
+        .iter()
+        .copied()
+        .find(|(source, rights, _)| {
+            *source == resource_domain && *rights == RESOURCE_DOMAIN_CLAIM_TRANSFER_RIGHTS
+        })
+        .expect("resource-domain staging duplicate");
+    assert_eq!(source, resource_domain);
+    assert_eq!(staged_rights, RESOURCE_DOMAIN_CLAIM_TRANSFER_RIGHTS);
+    assert_ne!(staged, resource_domain);
+    assert_eq!(
+        platform.sent_transfers[3],
+        DwHandleTransferV1 {
+            handle: staged,
+            requested_rights: RESOURCE_DOMAIN_CLAIM_RIGHTS,
+            operation: DW_HANDLE_TRANSFER_MOVE,
+            reserved0: 0,
+            reserved: [0; 2],
+        }
+    );
+    assert!(!platform.events.contains(&Event::Close(resource_domain.0)));
+}
+
+#[test]
+fn c4_failed_init_move_closes_only_staged_domain_and_retains_callers_inputs() {
+    let mut platform = Mock::new(Some("send"));
+    let image = executable();
+    let publication_endpoint = DwHandle(0x927);
+    let manifest = DwHandle(0x928);
+    let resource_domain = DwHandle(0x929);
+    let error = load_device_coordinator_resource_process(
+        &mut platform,
+        authority(),
+        DeviceCoordinatorResourceLoadRequest {
+            image: &image,
+            display_path: "/system/devmgr",
+            publication_endpoint,
+            manifest,
+            resource_domain,
+            supervisor_generation: 0x5a,
+            transaction_id: 0xc402,
+        },
+    )
+    .expect_err("failed MOVE must retain all caller-owned handles");
+    assert!(!error.publication_endpoint_consumed);
+    assert!(!error.manifest_consumed);
+    let staged = platform
+        .duplicates
+        .iter()
+        .find(|(source, rights, _)| {
+            *source == resource_domain && *rights == RESOURCE_DOMAIN_CLAIM_TRANSFER_RIGHTS
+        })
+        .map(|(_, _, staged)| *staged)
+        .expect("resource-domain staging duplicate");
+    assert!(platform.events.contains(&Event::Close(staged.0)));
+    assert!(!platform.events.contains(&Event::Close(resource_domain.0)));
+    assert!(
+        !platform
+            .events
+            .contains(&Event::Close(publication_endpoint.0))
+    );
+    assert!(!platform.events.contains(&Event::Close(manifest.0)));
+}
+
+#[test]
+fn c4_domain_staging_failure_retains_every_caller_owned_input() {
+    let mut platform = Mock::new(None);
+    // The loader first reduces its own parent Channel. The next duplicate is
+    // the C4 resource-domain staging handle and fails before any caller-owned
+    // endpoint or manifest enters rollback ownership.
+    platform.fail_duplicate_at = Some(2);
+    let image = executable();
+    let publication_endpoint = DwHandle(0x92a);
+    let manifest = DwHandle(0x92b);
+    let resource_domain = DwHandle(0x92c);
+    let error = load_device_coordinator_resource_process(
+        &mut platform,
+        authority(),
+        DeviceCoordinatorResourceLoadRequest {
+            image: &image,
+            display_path: "/system/devmgr",
+            publication_endpoint,
+            manifest,
+            resource_domain,
+            supervisor_generation: 0x5b,
+            transaction_id: 0xc403,
+        },
+    )
+    .expect_err("failed domain staging must retain caller ownership");
+    assert_eq!(
+        error,
+        DeviceCoordinatorLoadError {
+            error: LoadError::Platform {
+                stage: LoadStage::CapabilityDuplicate,
+                cause: "duplicate",
+                rollback_failed: false,
+            },
+            publication_endpoint_consumed: false,
+            manifest_consumed: false,
+        }
+    );
+    for handle in [publication_endpoint, manifest, resource_domain] {
+        assert!(!platform.events.contains(&Event::Close(handle.0)));
+    }
 }
 
 #[test]

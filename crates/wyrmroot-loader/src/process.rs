@@ -110,6 +110,20 @@ pub struct DeviceCoordinatorLoadRequest<'a> {
     pub transaction_id: u64,
 }
 
+/// WYR1-C4 device-coordinator launch. The broad resource-domain custodian is
+/// never moved; the loader stages one duplicate and atomically MOVEs only
+/// `RESOURCE | INSPECT` into the exact coordinator generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceCoordinatorResourceLoadRequest<'a> {
+    pub image: &'a [u8],
+    pub display_path: &'a str,
+    pub publication_endpoint: DwHandle,
+    pub manifest: DwHandle,
+    pub resource_domain: DwHandle,
+    pub supervisor_generation: u64,
+    pub transaction_id: u64,
+}
+
 /// C3 driver construction request.  The supplied Channel is the child half
 /// of a fresh direct pair; no resource bundle crosses this API.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -733,6 +747,48 @@ pub fn load_device_coordinator_process<P: LoaderPlatform>(
     })
 }
 
+/// Launch the WYR1-C4 coordinator inside its generation TaskGroup and move
+/// only its reduced resource-domain claim authority at the INIT boundary.
+pub fn load_device_coordinator_resource_process<P: LoaderPlatform>(
+    platform: &mut P,
+    authority: LoadAuthority,
+    request: DeviceCoordinatorResourceLoadRequest<'_>,
+) -> Result<LoadedProcess, DeviceCoordinatorLoadError<P::Error>> {
+    if request.publication_endpoint == request.manifest
+        || request.publication_endpoint == request.resource_domain
+        || request.manifest == request.resource_domain
+        || request.supervisor_generation == 0
+    {
+        return Err(DeviceCoordinatorLoadError::caller_retains(
+            LoadError::Launch(LaunchError::HandleCount),
+        ));
+    }
+    let channels = [request.publication_endpoint];
+    let mut inputs_consumed = false;
+    load_process_internal(
+        platform,
+        authority,
+        InternalLoadRequest {
+            image: request.image,
+            profile: LaunchProfile::DeviceCoordinatorResourceDomain,
+            transaction_id: request.transaction_id,
+            startup: StartupSpec::Legacy(request.display_path),
+            channels: &channels,
+            device_manifest: Some(request.manifest),
+            supervisor_generation: Some(request.supervisor_generation),
+            driver_correlation: None,
+            resource_domain: Some(request.resource_domain),
+        },
+        LoadFault::None,
+        &mut inputs_consumed,
+    )
+    .map_err(|error| DeviceCoordinatorLoadError {
+        error,
+        publication_endpoint_consumed: inputs_consumed,
+        manifest_consumed: inputs_consumed,
+    })
+}
+
 /// Constructs only the acceptance driver's process and transfers only its
 /// reduced direct control endpoint.  Failure leaves that endpoint with the
 /// devmgr caller; hypothetical future resources are absent by type.
@@ -795,7 +851,9 @@ fn load_process_internal<P: LoaderPlatform>(
     let expected_channels = if request.profile.channel_role().is_some()
         || matches!(
             request.profile,
-            LaunchProfile::DeviceCoordinator | LaunchProfile::DeviceDriver
+            LaunchProfile::DeviceCoordinator
+                | LaunchProfile::DeviceCoordinatorResourceDomain
+                | LaunchProfile::DeviceDriver
         ) {
         1
     } else if request.profile == LaunchProfile::JobV2Streams {
@@ -806,7 +864,11 @@ fn load_process_internal<P: LoaderPlatform>(
     if request.channels.len() != expected_channels {
         return Err(LoadError::Launch(LaunchError::HandleCount));
     }
-    if (request.profile == LaunchProfile::DeviceCoordinator) != request.device_manifest.is_some() {
+    if matches!(
+        request.profile,
+        LaunchProfile::DeviceCoordinator | LaunchProfile::DeviceCoordinatorResourceDomain
+    ) != request.device_manifest.is_some()
+    {
         return Err(LoadError::Launch(LaunchError::HandleCount));
     }
     if (request.profile == LaunchProfile::DeviceDriver) != request.driver_correlation.is_some() {
@@ -933,6 +995,14 @@ fn load_process_materialized<P: LoaderPlatform>(
     let mut init = [0_u8; launch::DEVICE_DRIVER_BYTES];
     let init_len = if request.profile == LaunchProfile::DeviceCoordinator {
         launch::encode_device_coordinator_init(
+            request.transaction_id,
+            request
+                .supervisor_generation
+                .ok_or(LoadError::Launch(LaunchError::ZeroTransaction))?,
+            &mut init,
+        )
+    } else if request.profile == LaunchProfile::DeviceCoordinatorResourceDomain {
+        launch::encode_device_coordinator_resource_init(
             request.transaction_id,
             request
                 .supervisor_generation
@@ -1242,16 +1312,45 @@ fn load_process_materialized<P: LoaderPlatform>(
         transaction.delegated_channels[0] = Some(request.channels[0]);
         transfers[0] = transfer(request.channels[0], launch::CHILD_CHANNEL_RIGHTS);
         1
-    } else if request.profile == LaunchProfile::DeviceCoordinator {
+    } else if matches!(
+        request.profile,
+        LaunchProfile::DeviceCoordinator | LaunchProfile::DeviceCoordinatorResourceDomain
+    ) {
         let manifest = request
             .device_manifest
             .ok_or(LoadError::Launch(LaunchError::HandleCount))?;
+        let staged_domain = if request.profile == LaunchProfile::DeviceCoordinatorResourceDomain {
+            let domain = request
+                .resource_domain
+                .ok_or(LoadError::Launch(LaunchError::HandleCount))?;
+            let domain =
+                match platform.duplicate(domain, launch::RESOURCE_DOMAIN_CLAIM_TRANSFER_RIGHTS) {
+                    Ok(handle) => handle,
+                    Err(cause) => {
+                        return Err(fail(
+                            platform,
+                            &mut transaction,
+                            LoadStage::CapabilityDuplicate,
+                            cause,
+                        ));
+                    }
+                };
+            transaction.delegated_resource_domain = Some(domain);
+            Some(domain)
+        } else {
+            None
+        };
         transaction.delegated_channels[0] = Some(request.channels[0]);
         transaction.delegated_manifest = Some(manifest);
         transfers[0] = transfer(created.root, SELF_ROOT_RIGHTS);
         transfers[1] = transfer(request.channels[0], launch::CHILD_CHANNEL_RIGHTS);
         transfers[2] = transfer(manifest, launch::DEVICE_MANIFEST_RIGHTS);
-        3
+        if let Some(domain) = staged_domain {
+            transfers[3] = transfer(domain, launch::RESOURCE_DOMAIN_CLAIM_RIGHTS);
+            4
+        } else {
+            3
+        }
     } else if request.profile.channel_role().is_some() {
         transaction.delegated_channels[0] = Some(request.channels[0]);
         transfers[0] = transfer(created.root, SELF_ROOT_RIGHTS);
@@ -1295,6 +1394,9 @@ fn load_process_materialized<P: LoaderPlatform>(
         *delegated = None;
     }
     transaction.delegated_manifest = None;
+    if request.profile == LaunchProfile::DeviceCoordinatorResourceDomain {
+        transaction.delegated_resource_domain = None;
+    }
     if request.profile.needs_self_root() {
         transaction.root = None;
         if request.profile.has_loader_authority_trio()

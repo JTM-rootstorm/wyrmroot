@@ -17,6 +17,9 @@ pub const INIT0_BYTES: usize = 64;
 pub const SUPERVISOR_BYTES: usize = 64;
 pub const PROBE_CHILD_BYTES: usize = 48;
 pub const DEVICE_COORDINATOR_BYTES: usize = 72;
+/// WYR1-C4's coordinator startup adds one reduced resource-domain claim
+/// capability without reinterpreting the historical C1-C3 profile.
+pub const DEVICE_COORDINATOR_RESOURCE_BYTES: usize = 80;
 /// WYR1-C3's driver launch record carries the complete control correlation.
 /// It is deliberately distinct from the coordinator's three-capability ABI.
 pub const DEVICE_DRIVER_BYTES: usize = 104;
@@ -33,6 +36,7 @@ const MINOR_V1_5: u16 = 5;
 const MINOR_V1_6: u16 = 6;
 const MINOR_V1_7: u16 = 7;
 const MINOR_V1_8_TEST: u16 = 8;
+const MINOR_V1_9: u16 = 9;
 const TYPE_INIT: u32 = 1;
 const TYPE_READY: u32 = 2;
 const ROLE_SELF_ROOT: u32 = 1;
@@ -122,6 +126,9 @@ pub enum LaunchProfile {
     /// one immutable device-role manifest object. This profile contains no
     /// hardware authority.
     DeviceCoordinator,
+    /// WYR1-C4 device coordinator with the C1-C3 capabilities plus one exact
+    /// reduced resource-domain claim capability.
+    DeviceCoordinatorResourceDomain,
     /// WYR1-C3 acceptance driver.  It has self-root plus one reduced direct
     /// devmgr control Channel; it never receives a device bundle at startup.
     DeviceDriver,
@@ -145,6 +152,7 @@ impl LaunchProfile {
             | Self::LaunchClient => 2,
             Self::JobV2Streams => 3,
             Self::DeviceCoordinator => 3,
+            Self::DeviceCoordinatorResourceDomain => 4,
             Self::DeviceDriver => 2,
             Self::Hello | Self::EarlyBootStub | Self::JobV2 => 0,
         }
@@ -164,6 +172,7 @@ impl LaunchProfile {
             | Self::JobV2Streams => MINOR_V1_3,
             Self::Dw1bProgress => MINOR_V1_4_TEST,
             Self::DeviceCoordinator => MINOR_V1_5,
+            Self::DeviceCoordinatorResourceDomain => MINOR_V1_9,
             Self::DeviceDriver => MINOR_V1_6,
             Self::Init0 | Self::I2Stress | Self::CapabilityController | Self::Hello => MINOR_V1_0,
         }
@@ -172,6 +181,8 @@ impl LaunchProfile {
     pub const fn init_size(self) -> usize {
         if matches!(self, Self::DeviceCoordinator) {
             DEVICE_COORDINATOR_BYTES
+        } else if matches!(self, Self::DeviceCoordinatorResourceDomain) {
+            DEVICE_COORDINATOR_RESOURCE_BYTES
         } else if matches!(self, Self::DeviceDriver) {
             DEVICE_DRIVER_BYTES
         } else {
@@ -228,7 +239,9 @@ pub fn encode_init(
 ) -> Result<usize, LaunchError> {
     if matches!(
         profile,
-        LaunchProfile::DeviceCoordinator | LaunchProfile::DeviceDriver
+        LaunchProfile::DeviceCoordinator
+            | LaunchProfile::DeviceCoordinatorResourceDomain
+            | LaunchProfile::DeviceDriver
     ) {
         return Err(LaunchError::ProfileSpecificEncoderRequired);
     }
@@ -268,7 +281,10 @@ fn encode_init_inner(
         }
     } else if profile == LaunchProfile::D6ResourceOwner {
         put_u32(output, HEADER_BYTES, ROLE_D6_RESOURCE_DOMAIN);
-    } else if profile == LaunchProfile::DeviceCoordinator {
+    } else if matches!(
+        profile,
+        LaunchProfile::DeviceCoordinator | LaunchProfile::DeviceCoordinatorResourceDomain
+    ) {
         for (index, role) in [
             ROLE_SELF_ROOT,
             ROLE_PUBLICATION_AUTHORITY,
@@ -278,6 +294,9 @@ fn encode_init_inner(
         .enumerate()
         {
             put_u32(output, HEADER_BYTES + index * 8, role);
+        }
+        if profile == LaunchProfile::DeviceCoordinatorResourceDomain {
+            put_u32(output, HEADER_BYTES + 3 * 8, ROLE_RESOURCE_DOMAIN);
         }
     } else if profile == LaunchProfile::DeviceDriver {
         for (index, role) in [ROLE_SELF_ROOT, ROLE_DEVICE_CONTROL]
@@ -314,6 +333,23 @@ pub fn encode_device_coordinator_init(
     }
     let size = encode_init_inner(LaunchProfile::DeviceCoordinator, transaction_id, output)?;
     put_u64(output, 64, supervisor_generation);
+    Ok(size)
+}
+
+pub fn encode_device_coordinator_resource_init(
+    transaction_id: u64,
+    supervisor_generation: u64,
+    output: &mut [u8],
+) -> Result<usize, LaunchError> {
+    if supervisor_generation == 0 {
+        return Err(LaunchError::ZeroTransaction);
+    }
+    let size = encode_init_inner(
+        LaunchProfile::DeviceCoordinatorResourceDomain,
+        transaction_id,
+        output,
+    )?;
+    put_u64(output, 72, supervisor_generation);
     Ok(size)
 }
 
@@ -409,7 +445,10 @@ pub fn parse_init(
             RESOURCE_DOMAIN_CLAIM_RIGHTS,
             0,
         )?;
-    } else if profile == LaunchProfile::DeviceCoordinator {
+    } else if matches!(
+        profile,
+        LaunchProfile::DeviceCoordinator | LaunchProfile::DeviceCoordinatorResourceDomain
+    ) {
         let expected = [
             (
                 ROLE_SELF_ROOT,
@@ -434,6 +473,19 @@ pub fn parse_init(
                 return Err(LaunchError::BadCapabilityRole { index });
             }
             validate_handle(handles[index], object_type, rights, index)?;
+        }
+        if profile == LaunchProfile::DeviceCoordinatorResourceDomain {
+            if get_u32(bytes, HEADER_BYTES + 3 * 8) != ROLE_RESOURCE_DOMAIN
+                || get_u32(bytes, HEADER_BYTES + 3 * 8 + 4) != 0
+            {
+                return Err(LaunchError::BadCapabilityRole { index: 3 });
+            }
+            validate_handle(
+                handles[3],
+                DW_OBJECT_TYPE_TASK_GROUP,
+                RESOURCE_DOMAIN_CLAIM_RIGHTS,
+                3,
+            )?;
         }
     } else if profile == LaunchProfile::DeviceDriver {
         for (index, (role, object_type, rights)) in [
@@ -520,6 +572,25 @@ pub fn parse_device_coordinator_init(
     })
 }
 
+pub fn parse_device_coordinator_resource_init(
+    bytes: &[u8],
+    handles: &[DwReceivedHandleInfoV1],
+) -> Result<DeviceCoordinatorInit, LaunchError> {
+    let parsed = parse_init(
+        LaunchProfile::DeviceCoordinatorResourceDomain,
+        bytes,
+        handles,
+    )?;
+    let supervisor_generation = get_u64(bytes, 72);
+    if supervisor_generation == 0 {
+        return Err(LaunchError::ZeroTransaction);
+    }
+    Ok(DeviceCoordinatorInit {
+        transaction_id: parsed.transaction_id,
+        supervisor_generation,
+    })
+}
+
 pub fn parse_device_driver_init(
     bytes: &[u8],
     handles: &[DwReceivedHandleInfoV1],
@@ -570,6 +641,7 @@ impl LaunchProfile {
                     | Self::RegistryClient
                     | Self::LaunchClient
                     | Self::DeviceCoordinator
+                    | Self::DeviceCoordinatorResourceDomain
                     | Self::DeviceDriver
             )
     }

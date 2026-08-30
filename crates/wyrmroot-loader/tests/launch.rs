@@ -3,10 +3,10 @@ use deepwyrm_syscall::{
     DW_OBJECT_TYPE_TASK_GROUP, DwHandle, DwReceivedHandleInfoV1,
 };
 use wyrmroot_loader::launch::{
-    self, BOOTFS_RIGHTS, CHILD_CHANNEL_RIGHTS, DEVICE_COORDINATOR_BYTES, DEVICE_DRIVER_BYTES,
-    DEVICE_MANIFEST_RIGHTS, HEADER_BYTES, INIT0_BYTES, LOADER_TASK_GROUP_RIGHTS, LaunchError,
-    LaunchProfile, PROBE_CHILD_BYTES, RESOURCE_DOMAIN_CLAIM_RIGHTS, SELF_ROOT_RIGHTS,
-    SUPERVISOR_BYTES,
+    self, BOOTFS_RIGHTS, CHILD_CHANNEL_RIGHTS, DEVICE_COORDINATOR_BYTES,
+    DEVICE_COORDINATOR_RESOURCE_BYTES, DEVICE_DRIVER_BYTES, DEVICE_MANIFEST_RIGHTS, HEADER_BYTES,
+    INIT0_BYTES, LOADER_TASK_GROUP_RIGHTS, LaunchError, LaunchProfile, PROBE_CHILD_BYTES,
+    RESOURCE_DOMAIN_CLAIM_RIGHTS, SELF_ROOT_RIGHTS, SUPERVISOR_BYTES,
 };
 
 #[test]
@@ -420,6 +420,52 @@ fn wyr1_c_device_coordinator_has_exact_hardware_free_startup_roles() {
     assert_eq!(
         launch::parse_device_coordinator_init(&init, &handles),
         Err(LaunchError::ZeroTransaction)
+    );
+}
+
+#[test]
+fn wyr1_c4_resource_profile_is_exact_and_does_not_reinterpret_c3() {
+    let mut init = [0u8; DEVICE_COORDINATOR_RESOURCE_BYTES];
+    assert_eq!(
+        launch::encode_init(
+            LaunchProfile::DeviceCoordinatorResourceDomain,
+            0xc400,
+            &mut init
+        ),
+        Err(LaunchError::ProfileSpecificEncoderRequired)
+    );
+    assert_eq!(
+        launch::encode_device_coordinator_resource_init(0xc400, 9, &mut init),
+        Ok(DEVICE_COORDINATOR_RESOURCE_BYTES)
+    );
+    assert_eq!((get16(&init, 6), get32(&init, 20)), (9, 4));
+    assert_eq!(
+        [
+            get32(&init, 40),
+            get32(&init, 48),
+            get32(&init, 56),
+            get32(&init, 64),
+        ],
+        [1, 5, 12, 14]
+    );
+    let handles = [
+        received(1, DW_OBJECT_TYPE_ADDRESS_REGION, SELF_ROOT_RIGHTS),
+        received(2, DW_OBJECT_TYPE_CHANNEL, CHILD_CHANNEL_RIGHTS),
+        received(3, DW_OBJECT_TYPE_MEMORY_OBJECT, DEVICE_MANIFEST_RIGHTS),
+        received(4, DW_OBJECT_TYPE_TASK_GROUP, RESOURCE_DOMAIN_CLAIM_RIGHTS),
+    ];
+    assert_eq!(
+        launch::parse_device_coordinator_resource_init(&init, &handles)
+            .unwrap()
+            .supervisor_generation,
+        9
+    );
+    assert!(launch::parse_device_coordinator_init(&init, &handles[..3]).is_err());
+    let mut broad = handles;
+    broad[3].rights = LOADER_TASK_GROUP_RIGHTS;
+    assert_eq!(
+        launch::parse_device_coordinator_resource_init(&init, &broad),
+        Err(LaunchError::HandleMetadata { index: 3 })
     );
 }
 
