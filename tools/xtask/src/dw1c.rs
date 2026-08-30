@@ -1833,7 +1833,10 @@ mod tests {
     fn generated_abi_lineage_matches_the_current_workspace_dependency() {
         let manifest = include_str!("../../../Cargo.toml");
         assert!(manifest.contains(&format!("rev = \"{GENERATED_ABI_REVISION}\"")));
-        assert_eq!(DEEPWYRM_ABI_TREE, "a9b067107ec38e2be44630f4dce428dab0f48de8");
+        assert_eq!(
+            DEEPWYRM_ABI_TREE,
+            "a9b067107ec38e2be44630f4dce428dab0f48de8"
+        );
     }
 
     #[test]
