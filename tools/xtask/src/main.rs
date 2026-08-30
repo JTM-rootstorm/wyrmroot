@@ -130,20 +130,16 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
         Action::Wyr1C2Freeze(output) => wyr1c2::freeze(std::path::Path::new(&output)).map(Some),
         Action::Wyr1C2Image(request) => wyr1c2::image(std::path::Path::new(&request)).map(Some),
         Action::Wyr1C2Inspect(request) => wyr1c2::inspect(std::path::Path::new(&request)).map(Some),
-        Action::Wyr1C6Freeze {
+        Action::Wyr1C6Prepare {
             output,
-            artifacts,
+            deep_repository,
             deep_revision,
-            abi_revision,
-            abi_tree,
             nonce,
             challenge,
-        } => wyr1c6::freeze(
+        } => wyr1c6::prepare(
             std::path::Path::new(&output),
-            std::path::Path::new(&artifacts),
+            std::path::Path::new(&deep_repository),
             &deep_revision,
-            &abi_revision,
-            &abi_tree,
             &nonce,
             &challenge,
         )

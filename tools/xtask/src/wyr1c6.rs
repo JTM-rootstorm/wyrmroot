@@ -8,11 +8,22 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    env, fs,
+    io::Write,
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::{cli::G3ImageArguments, error::Failure, g3_image, sha256, tasks};
+use deepwyrm_abi::{
+    DW_BOOT_DEVICE_RESOURCE_FLAGS_SUPPORTED_MASK, DW_BOOT_DEVICE_RESOURCE_V1_SIZE,
+    DW_BOOT_DEVICE_RESOURCE_V1_VERSION, DW_BOOT_DEVICE_TABLE_FLAGS_SUPPORTED_MASK,
+    DW_BOOT_DEVICE_TABLE_RECORD_STRIDE, DW_BOOT_DEVICE_TABLE_V1_SIZE,
+    DW_BOOT_DEVICE_TABLE_V1_VERSION, DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT,
+    DwBootDeviceResourceV1, DwBootDeviceTableV1,
+};
 use wyrmroot_bootfs::archive::Archive;
 
 pub(crate) const SELECTOR: &str = "device-coordinator-restart";
@@ -32,6 +43,14 @@ const MACHINE: &str = "pc-q35-10.2";
 const DOMAIN_UUID: &str = "33005e22-d7c2-4b13-b1ac-b82eda95e584";
 const ESP_FD_GROUP: &str = "dw-f13-esp-v1";
 const VARS_FD_GROUP: &str = "dw-f13-ovmf-vars-v1";
+const NATIVE_TARGET: &str = "x86_64-unknown-wyrmroot";
+const KERNEL_TARGET: &str = "x86_64-unknown-none";
+const OVMF_CODE_PATH: &str = "/usr/share/edk2/OvmfX64/OVMF_CODE.fd";
+const OVMF_CODE_SHA256: &str = "f3ff7e73448ed2845ee15356f394882f5618eb5dab92c9a30ec6ee0e1468553a";
+const OVMF_VARS_PATH: &str = "/usr/share/edk2/OvmfX64/OVMF_VARS.fd";
+const OVMF_VARS_SHA256: &str = "6ed987af3a3c155be71665f510eae3e007eda9b8b94afd59d45e91c4a11565cc";
+const ACCEPTED_RUST_REVISION: &str = "a92dc7f7464ad6ddfece4402bd7b86dbfa86166d";
+const ACCEPTED_TOOLCHAIN_NAME: &str = "wyrmroot-1.97.1-a92dc7f7";
 
 const ARTIFACTS: &[(&str, &str, u64)] = &[
     ("loader", "loader.efi", MAX_ARTIFACT_BYTES),
@@ -138,24 +157,214 @@ struct Request {
     values: BTreeMap<String, String>,
 }
 
-/// Freeze an already built C6 artifact directory.
-///
-/// The build itself is intentionally an explicit preceding step: this makes
-/// the selected compiler/features visible in the source receipt supplied with
-/// the frozen artifacts, and avoids an xtask fallback to C3/C5 binaries.
-pub(crate) fn freeze(
+struct ProducedArtifacts {
+    directory: PathBuf,
+    deep_revision: String,
+    abi_revision: String,
+    abi_tree: String,
+}
+
+/// Build, inspect, measure, and freeze the selector-29 product in one
+/// producer-owned transaction.  There is deliberately no command that accepts
+/// an arbitrary artifacts directory: the receipt below is created only from
+/// the exact commands and bytes this function stages.
+pub(crate) fn prepare(
     output: &Path,
-    artifacts: &Path,
+    deep_repository: &Path,
     deep_revision: &str,
-    abi_revision: &str,
-    abi_tree: &str,
     nonce: &str,
     challenge: &str,
 ) -> Result<String, Failure> {
     reject_selector_environment()?;
     validate_revision(deep_revision, "Deepwyrm revision")?;
-    validate_revision(abi_revision, "generated ABI revision")?;
-    validate_revision(abi_tree, "generated ABI tree")?;
+    validate_upper_hex_nonzero(nonce, 16, "evidence nonce")?;
+    validate_upper_hex_nonzero(challenge, 16, "evidence challenge")?;
+    if output.exists() {
+        return Err(Failure::task("WYR1-C6 output must be a fresh path"));
+    }
+
+    let repository = tasks::repository_root()?;
+    let project = tasks::canonical_project_root(&repository)?;
+    let deep_repository = canonical_deep_repository(deep_repository, &project)?;
+    let wyrmroot_revision = clean_revision(&repository, "Wyrmroot")?;
+    verify_clean_revision(&deep_repository, "Deepwyrm", deep_revision)?;
+    let manifest = crate::metadata::BuildManifest::load(&repository)?;
+    if manifest.rust_revision()? != ACCEPTED_RUST_REVISION
+        || manifest.rust_toolchain_name()? != ACCEPTED_TOOLCHAIN_NAME
+    {
+        return Err(Failure::task(
+            "WYR1-C6 source metadata does not name the accepted Rust toolchain",
+        ));
+    }
+    if manifest.deepwyrm_revision()? != deep_revision {
+        return Err(Failure::task(
+            "WYR1-C6 requested Deepwyrm revision does not match generated ABI provenance",
+        ));
+    }
+    let abi_revision = manifest.deepwyrm_revision()?.to_owned();
+    let abi_tree = matching_abi_tree(&deep_repository, deep_revision, &abi_revision)?;
+    let output = canonical_new_output(output, &project, &repository, &deep_repository)?;
+    let tmp = project.join(".tmp");
+    fs::create_dir_all(&tmp).map_err(|error| {
+        Failure::task(format!("could not create project temporary root: {error}"))
+    })?;
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Failure::task("system clock is before the Unix epoch"))?
+        .as_nanos();
+    let staging = tmp.join(format!("wyr1c6-producer-{}-{unique}", std::process::id()));
+    fs::create_dir(&staging)
+        .map_err(|error| Failure::task(format!("could not create C6 producer staging: {error}")))?;
+
+    let result = (|| {
+        let produced = build_produced_artifacts(
+            &staging,
+            &repository,
+            &deep_repository,
+            &wyrmroot_revision,
+            deep_revision,
+            &abi_revision,
+            &abi_tree,
+            nonce,
+        )?;
+        freeze_produced(&output, &produced, nonce, challenge)
+    })();
+    if result.is_ok() {
+        fs::remove_dir_all(&staging).map_err(|error| {
+            Failure::task(format!("could not retire C6 producer staging: {error}"))
+        })?;
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_produced_artifacts(
+    staging: &Path,
+    repository: &Path,
+    deep_repository: &Path,
+    wyrmroot_revision: &str,
+    deep_revision: &str,
+    abi_revision: &str,
+    abi_tree: &str,
+    nonce: &str,
+) -> Result<ProducedArtifacts, Failure> {
+    let manifest = crate::metadata::BuildManifest::load(repository)?;
+    let profile = manifest.validate_loader_build_readiness(repository)?;
+    let layout = crate::deep_layout::prepare(
+        repository,
+        manifest.deepwyrm_repository()?,
+        manifest.deepwyrm_revision()?,
+    )?;
+    let toolchain = tasks::prepare_loader_toolchain(repository, &profile, &manifest)?;
+    let cargo_home = tasks::project_cargo_home(repository, &manifest)?;
+    if env::var_os("CARGO_HOME").as_deref() != Some(cargo_home.as_os_str()) {
+        return Err(Failure::task(
+            "WYR1-C6 prepare requires the pinned launcher exact CARGO_HOME",
+        ));
+    }
+    toolchain.accepted().verify_unchanged()?;
+    layout.verify_unchanged()?;
+    let build = staging.join("build");
+    fs::create_dir(&build)
+        .map_err(|error| Failure::task(format!("could not create C6 build directory: {error}")))?;
+    let uefi = tasks::build_deterministic_uefi_pair(
+        repository,
+        &toolchain,
+        &profile,
+        &layout,
+        &tasks::IsolatedUefiBuild {
+            cargo_home: &cargo_home,
+            production_target: &build.join("uefi-production"),
+            retained_debug_target: &build.join("uefi-retained-debug"),
+            cargo_profile: tasks::UefiCargoProfile::Release,
+        },
+    )?;
+    let loader = read_regular_bounded(&uefi.loader, MAX_ARTIFACT_BYTES, "loader")?;
+    let bootstrap = build_c6_bootstrap(repository, &toolchain, &layout, &cargo_home, &build)?;
+    let snapshot = crate::wyr1c::build_c6_snapshot(nonce)?;
+    let kernel = build_selector29_kernel(deep_repository, &build, nonce)?;
+    let table = boot_device_table();
+    let code = pinned_firmware(OVMF_CODE_PATH, OVMF_CODE_SHA256, "OVMF code")?;
+    let vars = pinned_firmware(OVMF_VARS_PATH, OVMF_VARS_SHA256, "OVMF vars")?;
+    let artifacts = staging.join("artifacts");
+    fs::create_dir(&artifacts).map_err(|error| {
+        Failure::task(format!("could not create C6 producer artifacts: {error}"))
+    })?;
+    let artifact = |name: &str| {
+        snapshot
+            .artifacts
+            .get(name)
+            .ok_or_else(|| Failure::task(format!("WYR1-C6 builder omitted {name}")))
+    };
+    for (name, bytes) in [
+        ("loader.efi", &loader),
+        ("deepwyrm.elf", &kernel),
+        ("deepwyrm.symbols.elf", &kernel),
+        ("bootstrap.elf", &bootstrap),
+        ("system-init.elf", artifact("system-init")?),
+        ("registryd.elf", artifact("registryd")?),
+        ("devmgr.elf", artifact("devmgr")?),
+        ("uart16550d.elf", artifact("uart16550d")?),
+        ("consoled.elf", artifact("consoled")?),
+        ("wyrmsh.elf", artifact("wyrmsh")?),
+        ("rrc-c6-v1.bin", &snapshot.rrc_manifest),
+        ("wrdm-c6-v1.bin", &snapshot.device_manifest),
+        ("boot-device-table.bin", &table),
+        ("bootfs.img", &snapshot.bootfs),
+        ("OVMF_CODE.fd", &code),
+        ("OVMF_VARS.fd", &vars),
+    ] {
+        write_new(&artifacts.join(name), bytes, name)?;
+    }
+    let receipt = render_source_receipt(
+        &manifest,
+        toolchain.accepted(),
+        deep_revision,
+        abi_revision,
+        abi_tree,
+        wyrmroot_revision,
+        nonce,
+        &artifacts,
+    )?;
+    write_new(
+        &artifacts.join(SOURCE_RECEIPT),
+        receipt.as_bytes(),
+        "C6 source receipt",
+    )?;
+    verify_source_receipt(
+        receipt.as_bytes(),
+        &artifacts,
+        deep_revision,
+        abi_revision,
+        abi_tree,
+        wyrmroot_revision,
+        manifest.rust_revision()?,
+        nonce,
+    )?;
+    toolchain.accepted().verify_unchanged()?;
+    layout.verify_unchanged()?;
+    verify_clean_revision(repository, "Wyrmroot", wyrmroot_revision)?;
+    verify_clean_revision(deep_repository, "Deepwyrm", deep_revision)?;
+    Ok(ProducedArtifacts {
+        directory: artifacts,
+        deep_revision: deep_revision.to_owned(),
+        abi_revision: abi_revision.to_owned(),
+        abi_tree: abi_tree.to_owned(),
+    })
+}
+
+/// Freeze only the private artifact directory produced by [`prepare`].
+fn freeze_produced(
+    output: &Path,
+    produced: &ProducedArtifacts,
+    nonce: &str,
+    challenge: &str,
+) -> Result<String, Failure> {
+    reject_selector_environment()?;
+    let artifacts = &produced.directory;
+    let deep_revision = &produced.deep_revision;
+    let abi_revision = &produced.abi_revision;
+    let abi_tree = &produced.abi_tree;
     validate_upper_hex_nonzero(nonce, 16, "evidence nonce")?;
     validate_upper_hex_nonzero(challenge, 16, "evidence challenge")?;
     if output.exists() {
@@ -195,6 +404,7 @@ pub(crate) fn freeze(
         abi_tree,
         &wyrmroot_revision,
         &rust_revision,
+        nonce,
     )?;
     write_new(
         &frozen.join(SOURCE_RECEIPT),
@@ -235,6 +445,7 @@ pub(crate) fn freeze(
         &image_args,
         &frozen.join("boot-device-table.bin").display().to_string(),
     )?;
+    seal_mode(&esp, 0o444, "ESP")?;
     values.insert("esp".into(), "artifacts/selector29-esp.img".into());
     values.insert(
         "esp_sha256".into(),
@@ -308,18 +519,19 @@ pub(crate) fn freeze(
 
 pub(crate) fn inspect(path: &Path) -> Result<String, Failure> {
     let request = load(path)?;
+    require_mode(path, 0o444, "request")?;
     for (key, _, maximum) in ARTIFACTS {
         let relative = request.value(key)?;
-        let bytes = read_regular_bounded(&request.root.join(relative), *maximum, key)?;
+        let artifact = request.root.join(relative);
+        require_mode(&artifact, 0o444, key)?;
+        let bytes = read_regular_bounded(&artifact, *maximum, key)?;
         if sha256::bytes_digest(&bytes) != request.value(&format!("{key}_sha256"))? {
             return Err(Failure::task(format!("WYR1-C6 {key} digest drifted")));
         }
     }
-    let source_receipt = read_regular_bounded(
-        &request.root.join(request.value("source_receipt")?),
-        64 * 1024,
-        "C6 source receipt",
-    )?;
+    let source_path = request.root.join(request.value("source_receipt")?);
+    require_mode(&source_path, 0o444, "source receipt")?;
+    let source_receipt = read_regular_bounded(&source_path, 64 * 1024, "C6 source receipt")?;
     if sha256::bytes_digest(&source_receipt) != request.value("source_receipt_sha256")? {
         return Err(Failure::task("WYR1-C6 source receipt digest drifted"));
     }
@@ -331,12 +543,11 @@ pub(crate) fn inspect(path: &Path) -> Result<String, Failure> {
         request.value("generated_abi_tree")?,
         request.value("wyrmroot_revision")?,
         request.value("rust_revision")?,
+        request.value("evidence_nonce")?,
     )?;
-    let esp = read_regular_bounded(
-        &request.root.join(request.value("esp")?),
-        g3_image::IMAGE_BYTES,
-        "ESP",
-    )?;
+    let esp_path = request.root.join(request.value("esp")?);
+    require_mode(&esp_path, 0o444, "ESP")?;
+    let esp = read_regular_bounded(&esp_path, g3_image::IMAGE_BYTES, "ESP")?;
     if sha256::bytes_digest(&esp) != request.value("esp_sha256")? {
         return Err(Failure::task("WYR1-C6 ESP digest drifted"));
     }
@@ -392,6 +603,12 @@ pub(crate) fn inspect(path: &Path) -> Result<String, Failure> {
             request.value("esp_sha256")?,
         )?;
     }
+    validate_profile_pair(&request.root, &request_sha256)?;
+    require_mode(
+        &request.root.join(request.value("receipt")?),
+        0o444,
+        "receipt",
+    )?;
     Ok(format!(
         "WYR1_C6_INSPECTION_PASS selector={SELECTOR} test_id={TEST_ID} evidence={EVIDENCE_PROTOCOL} physical_io=not-performed\n"
     ))
@@ -666,6 +883,472 @@ fn parse_evidence(bytes: &[u8], nonce: &str) -> Result<ParsedEvidence, Failure> 
     })
 }
 
+fn build_c6_bootstrap(
+    repository: &Path,
+    toolchain: &tasks::LoaderToolchain,
+    layout: &crate::deep_layout::DeepLayoutBuild,
+    cargo_home: &Path,
+    build: &Path,
+) -> Result<Vec<u8>, Failure> {
+    toolchain.accepted().verify_unchanged()?;
+    layout.verify_unchanged()?;
+    let target = build.join("bootstrap-native");
+    fs::create_dir(&target)
+        .map_err(|error| Failure::task(format!("could not create C6 bootstrap target: {error}")))?;
+    let source = fs::canonicalize(repository)
+        .map_err(|error| Failure::task(format!("could not resolve C6 source root: {error}")))?;
+    let cargo_home = fs::canonicalize(cargo_home)
+        .map_err(|error| Failure::task(format!("could not resolve C6 Cargo home: {error}")))?;
+    let target_identity = fs::canonicalize(&target).map_err(|error| {
+        Failure::task(format!("could not resolve C6 bootstrap target: {error}"))
+    })?;
+    let flags = [
+        format!("--remap-path-prefix={}=/source/wyrmroot", source.display()),
+        format!("--remap-path-prefix={}=/cargo-home", cargo_home.display()),
+        format!(
+            "--remap-path-prefix={}=/cargo-target",
+            target_identity.display()
+        ),
+    ]
+    .join("\u{1f}");
+    let status = Command::new(&toolchain.accepted().cargo)
+        .args([
+            "build",
+            "--offline",
+            "--locked",
+            "--release",
+            "--target",
+            NATIVE_TARGET,
+            "--package",
+            "wyrmroot-bootstrap",
+            "--bin",
+            "wyrmroot-bootstrap",
+            "--features",
+            "wyr1c6-production",
+        ])
+        .arg("--target-dir")
+        .arg(&target)
+        .env("RUSTC", &toolchain.accepted().rustc)
+        .env("CARGO_HOME", &cargo_home)
+        .env("CARGO_ENCODED_RUSTFLAGS", flags)
+        .env("CARGO_INCREMENTAL", "0")
+        .env("CARGO_NET_OFFLINE", "true")
+        .env("SOURCE_DATE_EPOCH", "0")
+        .env_remove("LD_AUDIT")
+        .env_remove("LD_LIBRARY_PATH")
+        .env_remove("LD_PRELOAD")
+        .current_dir(repository)
+        .stdin(Stdio::null())
+        .status()
+        .map_err(|error| Failure::task(format!("could not build C6 bootstrap: {error}")))?;
+    if !status.success() {
+        return Err(Failure::task("WYR1-C6 native bootstrap build failed"));
+    }
+    let bootstrap = target
+        .join(NATIVE_TARGET)
+        .join("release")
+        .join("wyrmroot-bootstrap");
+    let inspection = Command::new(tasks::INSPECTION_SHELL)
+        .arg(repository.join("toolchain/inspect-native-artifact.sh"))
+        .arg(&bootstrap)
+        .current_dir(repository)
+        .env_clear()
+        .env("PATH", tasks::INSPECTION_PATH)
+        .env("WYRMROOT_INSPECTION_ARTIFACT_NAME", "bootstrap")
+        .env("WYRMROOT_SEALED_INSPECTION", "1")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| Failure::task(format!("could not inspect C6 bootstrap: {error}")))?;
+    if !inspection.status.success()
+        || inspection.stdout.is_empty()
+        || inspection.stderr.len() > 64 * 1024
+    {
+        return Err(Failure::task("WYR1-C6 bootstrap inspection failed"));
+    }
+    toolchain.accepted().verify_unchanged()?;
+    layout.verify_unchanged()?;
+    read_regular_bounded(&bootstrap, MAX_ARTIFACT_BYTES, "bootstrap")
+}
+
+fn build_selector29_kernel(
+    repository: &Path,
+    build: &Path,
+    nonce: &str,
+) -> Result<Vec<u8>, Failure> {
+    let target = build.join("deepwyrm-selector29");
+    fs::create_dir(&target)
+        .map_err(|error| Failure::task(format!("could not create C6 kernel target: {error}")))?;
+    let mut command = Command::new(repository.join("tools/pinned-cargo"));
+    command
+        .arg("target")
+        .args([
+            "build",
+            "--locked",
+            "--offline",
+            "--release",
+            "--target",
+            KERNEL_TARGET,
+            "--package",
+            "deepwyrm-kernel",
+            "--bin",
+            "deepwyrm-kernel",
+            "--features",
+            "test-support",
+        ])
+        .env("DEEPWYRM_PINNED_TARGET_DIR", &target)
+        .env_remove("CARGO_HOME")
+        .env_remove("LD_AUDIT")
+        .env_remove("LD_LIBRARY_PATH")
+        .env_remove("LD_PRELOAD")
+        .current_dir(repository)
+        .stdin(Stdio::null());
+    for (key, value) in selector29_kernel_environment(nonce) {
+        command.env(key, value);
+    }
+    let status = command
+        .status()
+        .map_err(|error| Failure::task(format!("could not build C6 kernel: {error}")))?;
+    if !status.success() {
+        return Err(Failure::task(
+            "WYR1-C6 selector-29 Deepwyrm kernel build failed",
+        ));
+    }
+    read_regular_bounded(
+        &target.join(KERNEL_TARGET).join("release/deepwyrm-kernel"),
+        MAX_ARTIFACT_BYTES,
+        "selector-29 kernel",
+    )
+}
+
+fn selector29_kernel_environment(nonce: &str) -> [(&'static str, String); 3] {
+    [
+        ("DEEPWYRM_GUEST_TEST_SELECTOR", SELECTOR.to_owned()),
+        ("DEEPWYRM_GUEST_TEST_ID", TEST_ID.to_string()),
+        ("DEEPWYRM_WYR1C_EVIDENCE_NONCE", nonce.to_owned()),
+    ]
+}
+
+fn boot_device_table() -> Vec<u8> {
+    const RESOURCE_ID: u64 = 1;
+    const DEVICE_CORRELATION_ID: u64 = 1;
+    const PIO_BASE: u16 = 0x02f8;
+    const PIO_LENGTH: u16 = 8;
+    const INTERRUPT_SOURCE: u32 = 3;
+    let header = usize::try_from(DW_BOOT_DEVICE_TABLE_V1_SIZE).expect("table header fits");
+    let stride = usize::try_from(DW_BOOT_DEVICE_TABLE_RECORD_STRIDE).expect("table stride fits");
+    let total = header.checked_add(stride).expect("table length fits");
+    let mut table = vec![0; total];
+    write_u32(
+        &mut table,
+        core::mem::offset_of!(DwBootDeviceTableV1, size),
+        DW_BOOT_DEVICE_TABLE_V1_SIZE,
+    );
+    write_u32(
+        &mut table,
+        core::mem::offset_of!(DwBootDeviceTableV1, version),
+        DW_BOOT_DEVICE_TABLE_V1_VERSION,
+    );
+    write_u32(
+        &mut table,
+        core::mem::offset_of!(DwBootDeviceTableV1, resource_count),
+        1,
+    );
+    write_u32(
+        &mut table,
+        core::mem::offset_of!(DwBootDeviceTableV1, flags),
+        DW_BOOT_DEVICE_TABLE_FLAGS_SUPPORTED_MASK,
+    );
+    write_u32(
+        &mut table,
+        core::mem::offset_of!(DwBootDeviceTableV1, record_stride),
+        DW_BOOT_DEVICE_TABLE_RECORD_STRIDE,
+    );
+    write_u64(
+        &mut table,
+        core::mem::offset_of!(DwBootDeviceTableV1, total_byte_len),
+        u64::try_from(total).expect("table total fits"),
+    );
+    let record = header;
+    write_u32(
+        &mut table,
+        record + core::mem::offset_of!(DwBootDeviceResourceV1, size),
+        DW_BOOT_DEVICE_RESOURCE_V1_SIZE,
+    );
+    write_u32(
+        &mut table,
+        record + core::mem::offset_of!(DwBootDeviceResourceV1, version),
+        DW_BOOT_DEVICE_RESOURCE_V1_VERSION,
+    );
+    write_u32(
+        &mut table,
+        record + core::mem::offset_of!(DwBootDeviceResourceV1, kind),
+        DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT.0,
+    );
+    write_u32(
+        &mut table,
+        record + core::mem::offset_of!(DwBootDeviceResourceV1, flags),
+        DW_BOOT_DEVICE_RESOURCE_FLAGS_SUPPORTED_MASK,
+    );
+    write_u64(
+        &mut table,
+        record + core::mem::offset_of!(DwBootDeviceResourceV1, resource_id),
+        RESOURCE_ID,
+    );
+    write_u64(
+        &mut table,
+        record + core::mem::offset_of!(DwBootDeviceResourceV1, device_correlation_id),
+        DEVICE_CORRELATION_ID,
+    );
+    write_u16(
+        &mut table,
+        record + core::mem::offset_of!(DwBootDeviceResourceV1, pio_base),
+        PIO_BASE,
+    );
+    write_u16(
+        &mut table,
+        record + core::mem::offset_of!(DwBootDeviceResourceV1, pio_length),
+        PIO_LENGTH,
+    );
+    write_u32(
+        &mut table,
+        record + core::mem::offset_of!(DwBootDeviceResourceV1, interrupt_source),
+        INTERRUPT_SOURCE,
+    );
+    table
+}
+
+fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
+    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn pinned_firmware(path: &str, expected: &str, label: &str) -> Result<Vec<u8>, Failure> {
+    let bytes = read_regular_bounded(Path::new(path), MAX_FIRMWARE_BYTES, label)?;
+    if sha256::bytes_digest(&bytes) != expected {
+        return Err(Failure::task(format!(
+            "WYR1-C6 pinned {label} identity changed"
+        )));
+    }
+    Ok(bytes)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_source_receipt(
+    manifest: &crate::metadata::BuildManifest,
+    toolchain: &crate::toolchain_artifact::AcceptedToolchain,
+    deep_revision: &str,
+    abi_revision: &str,
+    abi_tree: &str,
+    wyrmroot_revision: &str,
+    nonce: &str,
+    artifacts: &Path,
+) -> Result<String, Failure> {
+    let mut values = BTreeMap::new();
+    for (key, value) in [
+        (
+            "kind",
+            "wyrmroot-wyr1-c6-selector29-source-build".to_owned(),
+        ),
+        ("schema_version", "1".to_owned()),
+        ("selector", SELECTOR.to_owned()),
+        ("test_id", TEST_ID.to_string()),
+        ("evidence_protocol", EVIDENCE_PROTOCOL.to_owned()),
+        ("deepwyrm_revision", deep_revision.to_owned()),
+        ("generated_abi_revision", abi_revision.to_owned()),
+        ("generated_abi_tree", abi_tree.to_owned()),
+        ("wyrmroot_revision", wyrmroot_revision.to_owned()),
+        ("evidence_nonce", nonce.to_owned()),
+        ("rust_revision", manifest.rust_revision()?.to_owned()),
+        (
+            "rust_toolchain_name",
+            manifest.rust_toolchain_name()?.to_owned(),
+        ),
+        (
+            "rustc_sha256",
+            sha256::file_digest(&toolchain.rustc).map_err(|error| {
+                Failure::task(format!("could not hash accepted rustc: {error}"))
+            })?,
+        ),
+        ("cargo_sha256", toolchain.cargo_sha256.clone()),
+        ("rust_lld_sha256", toolchain.rust_lld_sha256.clone()),
+        (
+            "toolchain_manifest_sha256",
+            toolchain.manifest_sha256.clone(),
+        ),
+        (
+            "toolchain_tree_sha256",
+            toolchain.toolchain_tree_sha256.clone(),
+        ),
+        (
+            "loader_command",
+            "accepted-cargo UEFI loader pair".to_owned(),
+        ),
+        (
+            "kernel_command",
+            "pinned-cargo selector29 ff1e WRC6".to_owned(),
+        ),
+        ("bootstrap_features", "wyr1c6-production".to_owned()),
+        (
+            "system_init_features",
+            "wyr1c6-production,wyr1c6-selector29".to_owned(),
+        ),
+        (
+            "devmgr_features",
+            "wyr1c6-production,wyr1c6-selector29".to_owned(),
+        ),
+        (
+            "uart16550d_features",
+            "wyr1c6-production,wyr1c6-selector29".to_owned(),
+        ),
+        ("registryd_features", "native-registryd".to_owned()),
+        ("consoled_features", "native-retained".to_owned()),
+        ("wyrmsh_features", "native-retained".to_owned()),
+        (
+            "bootstrap_command",
+            "accepted-cargo native bootstrap".to_owned(),
+        ),
+        (
+            "system_init_command",
+            "accepted-cargo native system-init".to_owned(),
+        ),
+        (
+            "registryd_command",
+            "accepted-cargo native registryd".to_owned(),
+        ),
+        ("devmgr_command", "accepted-cargo native devmgr".to_owned()),
+        (
+            "uart16550d_command",
+            "accepted-cargo native uart16550d".to_owned(),
+        ),
+        (
+            "consoled_command",
+            "accepted-cargo native consoled".to_owned(),
+        ),
+        ("wyrmsh_command", "accepted-cargo native wyrmsh".to_owned()),
+    ] {
+        values.insert(key.to_owned(), value);
+    }
+    for (key, name, maximum) in ARTIFACTS {
+        values.insert(
+            format!("{key}_sha256"),
+            sha256::bytes_digest(&read_regular_bounded(&artifacts.join(name), *maximum, key)?),
+        );
+    }
+    render_sorted(&values)
+}
+
+fn canonical_deep_repository(input: &Path, project: &Path) -> Result<PathBuf, Failure> {
+    if !input.is_absolute()
+        || input.components().any(|component| {
+            !matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        })
+    {
+        return Err(Failure::task(
+            "WYR1-C6 Deepwyrm repository path is not canonical",
+        ));
+    }
+    let canonical = fs::canonicalize(input).map_err(|error| {
+        Failure::task(format!("could not resolve Deepwyrm repository: {error}"))
+    })?;
+    let expected = fs::canonicalize(project.join("deepwyrm")).map_err(|error| {
+        Failure::task(format!(
+            "could not resolve canonical Deepwyrm repository: {error}"
+        ))
+    })?;
+    if canonical != input || canonical != expected {
+        return Err(Failure::task(
+            "WYR1-C6 Deepwyrm repository must be the canonical OS-Project sibling",
+        ));
+    }
+    Ok(canonical)
+}
+
+fn canonical_new_output(
+    output: &Path,
+    project: &Path,
+    repository: &Path,
+    deep_repository: &Path,
+) -> Result<PathBuf, Failure> {
+    let parent = output
+        .parent()
+        .ok_or_else(|| Failure::task("WYR1-C6 output has no parent"))?;
+    let parent = fs::canonicalize(parent)
+        .map_err(|error| Failure::task(format!("could not resolve C6 output parent: {error}")))?;
+    let name = output
+        .file_name()
+        .ok_or_else(|| Failure::task("WYR1-C6 output has no final component"))?;
+    let result = parent.join(name);
+    if !result.starts_with(project)
+        || result.starts_with(repository)
+        || result.starts_with(deep_repository)
+    {
+        return Err(Failure::task(
+            "WYR1-C6 output must be beneath OS-Project and outside source repositories",
+        ));
+    }
+    Ok(result)
+}
+
+fn matching_abi_tree(
+    deep_repository: &Path,
+    kernel_revision: &str,
+    generated_abi_revision: &str,
+) -> Result<String, Failure> {
+    let kernel_tree = git_revision(deep_repository, &format!("{kernel_revision}:abi"))?;
+    let generated_tree = git_revision(deep_repository, &format!("{generated_abi_revision}:abi"))?;
+    validate_revision(&kernel_tree, "Deepwyrm ABI tree")?;
+    validate_revision(&generated_tree, "generated ABI tree")?;
+    if kernel_tree != generated_tree {
+        return Err(Failure::task(
+            "WYR1-C6 selected kernel does not match the generated ABI tree",
+        ));
+    }
+    Ok(kernel_tree)
+}
+
+fn git_revision(repository: &Path, spec: &str) -> Result<String, Failure> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(["rev-parse", spec])
+        .output()
+        .map_err(|error| Failure::task(format!("could not query Git revision: {error}")))?;
+    if !output.status.success() {
+        return Err(Failure::task("WYR1-C6 Git revision query failed"));
+    }
+    String::from_utf8(output.stdout)
+        .map(|value| value.trim().to_owned())
+        .map_err(|_| Failure::task("WYR1-C6 Git revision is not UTF-8"))
+}
+
+fn verify_clean_revision(repository: &Path, label: &str, expected: &str) -> Result<(), Failure> {
+    if git_revision(repository, "HEAD")? != expected {
+        return Err(Failure::task(format!(
+            "WYR1-C6 {label} revision changed during production"
+        )));
+    }
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .output()
+        .map_err(|error| Failure::task(format!("could not inspect {label} status: {error}")))?;
+    if !output.status.success() || !output.stdout.is_empty() {
+        return Err(Failure::task(format!(
+            "WYR1-C6 {label} source tree is no longer clean"
+        )));
+    }
+    Ok(())
+}
+
 fn fnv1a(bytes: &[u8]) -> u32 {
     bytes.iter().fold(0x811c9dc5_u32, |hash, byte| {
         (hash ^ u32::from(*byte)).wrapping_mul(0x01000193)
@@ -711,6 +1394,7 @@ fn validate_gate(bootfs: &[u8], nonce: &str) -> Result<Vec<u8>, Failure> {
     Ok(gate.data().to_vec())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn verify_source_receipt(
     bytes: &[u8],
     artifacts: &Path,
@@ -719,6 +1403,7 @@ fn verify_source_receipt(
     abi_tree: &str,
     wyrmroot_revision: &str,
     rust_revision: &str,
+    nonce: &str,
 ) -> Result<(), Failure> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| Failure::task("WYR1-C6 source receipt is not UTF-8"))?;
@@ -733,6 +1418,7 @@ fn verify_source_receipt(
         "generated_abi_revision".to_owned(),
         "generated_abi_tree".to_owned(),
         "wyrmroot_revision".to_owned(),
+        "evidence_nonce".to_owned(),
         "rust_revision".to_owned(),
         "rust_toolchain_name".to_owned(),
         "rustc_sha256".to_owned(),
@@ -749,8 +1435,13 @@ fn verify_source_receipt(
         "wyrmsh_features".to_owned(),
         "bootstrap_command".to_owned(),
         "system_init_command".to_owned(),
+        "registryd_command".to_owned(),
         "devmgr_command".to_owned(),
         "uart16550d_command".to_owned(),
+        "consoled_command".to_owned(),
+        "wyrmsh_command".to_owned(),
+        "loader_command".to_owned(),
+        "kernel_command".to_owned(),
     ]);
     for (key, _, _) in ARTIFACTS {
         keys.insert(format!("{key}_sha256"));
@@ -768,9 +1459,14 @@ fn verify_source_receipt(
         ("generated_abi_revision", abi_revision),
         ("generated_abi_tree", abi_tree),
         ("wyrmroot_revision", wyrmroot_revision),
+        ("evidence_nonce", nonce),
         ("rust_revision", rust_revision),
+        ("rust_toolchain_name", ACCEPTED_TOOLCHAIN_NAME),
         ("bootstrap_features", "wyr1c6-production"),
-        ("system_init_features", "wyr1c6-production"),
+        (
+            "system_init_features",
+            "wyr1c6-production,wyr1c6-selector29",
+        ),
         ("devmgr_features", "wyr1c6-production,wyr1c6-selector29"),
         ("uart16550d_features", "wyr1c6-production,wyr1c6-selector29"),
         ("registryd_features", "native-registryd"),
@@ -778,8 +1474,13 @@ fn verify_source_receipt(
         ("wyrmsh_features", "native-retained"),
         ("bootstrap_command", "accepted-cargo native bootstrap"),
         ("system_init_command", "accepted-cargo native system-init"),
+        ("registryd_command", "accepted-cargo native registryd"),
         ("devmgr_command", "accepted-cargo native devmgr"),
         ("uart16550d_command", "accepted-cargo native uart16550d"),
+        ("consoled_command", "accepted-cargo native consoled"),
+        ("wyrmsh_command", "accepted-cargo native wyrmsh"),
+        ("loader_command", "accepted-cargo UEFI loader pair"),
+        ("kernel_command", "pinned-cargo selector29 ff1e WRC6"),
     ] {
         if values.get(key).map(String::as_str) != Some(expected) {
             return Err(Failure::task(format!(
@@ -854,14 +1555,27 @@ fn load(path: &Path) -> Result<Request, Failure> {
         16,
         "evidence challenge",
     )?;
-    for (key, _, _) in ARTIFACTS {
-        validate_relative(value(&values, key)?, key)?;
+    for (key, name, _) in ARTIFACTS {
+        let expected = format!("artifacts/{name}");
+        if value(&values, key)? != expected {
+            return Err(Failure::task(format!("WYR1-C6 request {key} path drifted")));
+        }
         validate_lower_hex(value(&values, &format!("{key}_sha256"))?, 64, key)?;
     }
-    validate_relative(value(&values, "esp")?, "ESP")?;
+    for (key, expected) in [
+        ("esp", "artifacts/selector29-esp.img"),
+        ("default_handoff", "default/handoff.toml"),
+        ("smp_handoff", "smp/handoff.toml"),
+        ("receipt", "build-receipt.toml"),
+        ("source_receipt", "artifacts/c6-source-build.toml"),
+        ("profile_pair", "profile-pair.toml"),
+    ] {
+        if value(&values, key)? != expected {
+            return Err(Failure::task(format!("WYR1-C6 request {key} path drifted")));
+        }
+    }
     validate_lower_hex(value(&values, "esp_sha256")?, 64, "ESP")?;
     validate_lower_hex(value(&values, "gate_config_sha256")?, 64, "bootfs gate")?;
-    validate_relative(value(&values, "source_receipt")?, "source receipt")?;
     validate_lower_hex(
         value(&values, "source_receipt_sha256")?,
         64,
@@ -894,7 +1608,7 @@ fn stage_profile(
         "OVMF variables template",
     )?;
     let vars_path = directory.join("OVMF_VARS.fd");
-    write_new(&vars_path, &vars, "profile OVMF variables")?;
+    write_new_mode(&vars_path, &vars, 0o600, "profile OVMF variables")?;
     let vars_sha256 = sha256::bytes_digest(&vars);
     let absolute_output = fs::canonicalize(output)
         .map_err(|error| Failure::task(format!("could not resolve C6 output: {error}")))?;
@@ -1042,6 +1756,7 @@ fn validate_handoff(
     request_sha256: &str,
     esp_sha256: &str,
 ) -> Result<(), Failure> {
+    require_mode(path, 0o444, "VM handoff")?;
     let text = String::from_utf8(read_regular_bounded(path, 64 * 1024, "VM handoff")?)
         .map_err(|_| Failure::task("WYR1-C6 VM handoff is not UTF-8"))?;
     let values = parse(&text)?;
@@ -1122,6 +1837,92 @@ fn validate_handoff(
     for key in ["domain_xml_sha256", "ovmf_vars_sha256"] {
         validate_lower_hex(value(&values, key)?, 64, key)?;
     }
+    let root = path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| Failure::task("WYR1-C6 VM handoff has no frozen root"))?;
+    let domain = root.join(value(&values, "domain_xml")?);
+    let vars = root.join(value(&values, "ovmf_vars")?);
+    require_mode(&domain, 0o444, "domain XML")?;
+    require_mode(&vars, 0o600, "profile OVMF vars")?;
+    if sha256::bytes_digest(&read_regular_bounded(&domain, 64 * 1024, "domain XML")?)
+        != value(&values, "domain_xml_sha256")?
+        || sha256::bytes_digest(&read_regular_bounded(
+            &vars,
+            MAX_FIRMWARE_BYTES,
+            "profile OVMF vars",
+        )?) != value(&values, "ovmf_vars_sha256")?
+    {
+        return Err(Failure::task(
+            "WYR1-C6 VM handoff local profile binding drifted",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_profile_pair(root: &Path, request_sha256: &str) -> Result<(), Failure> {
+    let path = root.join("profile-pair.toml");
+    require_mode(&path, 0o444, "profile pair")?;
+    let text = String::from_utf8(read_regular_bounded(&path, 64 * 1024, "profile pair")?)
+        .map_err(|_| Failure::task("WYR1-C6 profile pair is not UTF-8"))?;
+    let values = parse(&text)?;
+    let expected = [
+        "kind",
+        "schema_version",
+        "selector",
+        "test_id",
+        "machine",
+        "memory_mib",
+        "timeout_seconds",
+        "request",
+        "request_sha256",
+        "default_handoff",
+        "smp_handoff",
+        "evidence_protocol",
+        "scenario",
+        "physical_io",
+        "default_handoff_sha256",
+        "smp_handoff_sha256",
+    ];
+    if values.keys().map(String::as_str).collect::<BTreeSet<_>>()
+        != expected.iter().copied().collect()
+    {
+        return Err(Failure::task("WYR1-C6 profile pair key set drifted"));
+    }
+    for (key, expected) in [
+        ("kind", "wyrmroot-wyr1-c6-selector29-vm-profile-pair"),
+        ("schema_version", "1"),
+        ("selector", SELECTOR),
+        ("test_id", "29"),
+        ("machine", MACHINE),
+        ("memory_mib", "2048"),
+        ("timeout_seconds", "300"),
+        ("request", "request.toml"),
+        ("request_sha256", request_sha256),
+        ("default_handoff", "default/handoff.toml"),
+        ("smp_handoff", "smp/handoff.toml"),
+        ("evidence_protocol", EVIDENCE_PROTOCOL),
+        ("scenario", SCENARIO),
+        ("physical_io", "not-performed"),
+    ] {
+        if values.get(key).map(String::as_str) != Some(expected) {
+            return Err(Failure::task(format!("WYR1-C6 profile pair {key} drifted")));
+        }
+    }
+    for (key, relative) in [
+        ("default_handoff_sha256", "default/handoff.toml"),
+        ("smp_handoff_sha256", "smp/handoff.toml"),
+    ] {
+        validate_lower_hex(value(&values, key)?, 64, key)?;
+        if sha256::bytes_digest(&read_regular_bounded(
+            &root.join(relative),
+            64 * 1024,
+            "profile handoff",
+        )?) != value(&values, key)?
+        {
+            return Err(Failure::task("WYR1-C6 profile pair handoff digest drifted"));
+        }
+    }
     Ok(())
 }
 
@@ -1185,7 +1986,11 @@ fn value<'a>(values: &'a BTreeMap<String, String>, key: &str) -> Result<&'a str,
 fn read_regular_bounded(path: &Path, maximum: u64, label: &str) -> Result<Vec<u8>, Failure> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| Failure::task(format!("could not stat {label}: {error}")))?;
-    if !metadata.file_type().is_file() || metadata.len() == 0 || metadata.len() > maximum {
+    if !metadata.file_type().is_file()
+        || metadata.nlink() != 1
+        || metadata.len() == 0
+        || metadata.len() > maximum
+    {
         return Err(Failure::task(format!(
             "WYR1-C6 {label} is not a bounded regular file"
         )));
@@ -1193,31 +1998,51 @@ fn read_regular_bounded(path: &Path, maximum: u64, label: &str) -> Result<Vec<u8
     fs::read(path).map_err(|error| Failure::task(format!("could not read {label}: {error}")))
 }
 
+fn require_mode(path: &Path, expected: u32, label: &str) -> Result<(), Failure> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| Failure::task(format!("could not stat {label}: {error}")))?;
+    if !metadata.file_type().is_file()
+        || metadata.nlink() != 1
+        || metadata.permissions().mode() & 0o777 != expected
+    {
+        return Err(Failure::task(format!("WYR1-C6 {label} mode drifted")));
+    }
+    Ok(())
+}
+
 fn write_new(path: &Path, bytes: &[u8], label: &str) -> Result<(), Failure> {
+    write_new_mode(path, bytes, 0o444, label)
+}
+
+fn write_new_mode(path: &Path, bytes: &[u8], mode: u32, label: &str) -> Result<(), Failure> {
     if path.exists() {
         return Err(Failure::task(format!(
             "WYR1-C6 {label} output already exists"
         )));
     }
-    fs::write(path, bytes)
-        .map_err(|error| Failure::task(format!("could not write {label}: {error}")))
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .custom_flags(0x2_0000)
+        .open(path)
+        .map_err(|error| Failure::task(format!("could not create {label}: {error}")))?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| Failure::task(format!("could not write {label}: {error}")))?;
+    seal_mode(path, mode, label)
 }
 
-fn validate_relative(value: &str, label: &str) -> Result<(), Failure> {
-    let path = Path::new(value);
-    if path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::ParentDir
-                    | std::path::Component::RootDir
-                    | std::path::Component::Prefix(_)
-            )
-        })
+fn seal_mode(path: &Path, mode: u32, label: &str) -> Result<(), Failure> {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .map_err(|error| Failure::task(format!("could not seal {label}: {error}")))?;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| Failure::task(format!("could not recheck {label}: {error}")))?;
+    if !metadata.file_type().is_file()
+        || metadata.nlink() != 1
+        || metadata.permissions().mode() & 0o777 != mode
     {
-        return Err(Failure::task(format!(
-            "WYR1-C6 {label} path escapes the frozen root"
-        )));
+        return Err(Failure::task(format!("WYR1-C6 {label} mode drifted")));
     }
     Ok(())
 }
@@ -1229,7 +2054,7 @@ fn validate_lower_hex(value: &str, length: usize, label: &str) -> Result<(), Fai
     if value.len() != length
         || !value
             .bytes()
-            .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase())
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
     {
         return Err(Failure::task(format!(
             "WYR1-C6 {label} is not lowercase hexadecimal"
@@ -1241,7 +2066,7 @@ fn validate_upper_hex_nonzero(value: &str, length: usize, label: &str) -> Result
     if value.len() != length
         || !value
             .bytes()
-            .all(|byte| byte.is_ascii_digit() || byte.is_ascii_uppercase())
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'A'..=b'F'))
         || value.bytes().all(|byte| byte == b'0')
     {
         return Err(Failure::task(format!(
@@ -1349,6 +2174,175 @@ mod tests {
         assert_eq!(smp.get("vcpus").unwrap(), "4");
         assert_eq!(default.get("physical_io").unwrap(), "not-performed");
         assert_eq!(default.get("evidence_protocol").unwrap(), EVIDENCE_PROTOCOL);
+    }
+
+    #[test]
+    fn immutable_and_profile_vars_modes_are_sealed_exactly() {
+        let root = std::env::temp_dir().join(format!(
+            "wyr1c6-modes-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let immutable = root.join("immutable");
+        let vars = root.join("OVMF_VARS.fd");
+        write_new(&immutable, b"immutable", "immutable test").unwrap();
+        write_new_mode(&vars, b"vars", 0o600, "vars test").unwrap();
+        require_mode(&immutable, 0o444, "immutable test").unwrap();
+        require_mode(&vars, 0o600, "vars test").unwrap();
+        assert!(write_new(&immutable, b"replace", "immutable test").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selector29_hex_fields_reject_nonhex_letters_and_zero_challenges() {
+        assert!(validate_lower_hex(&"a".repeat(40), 40, "revision").is_ok());
+        assert!(validate_lower_hex(&format!("{}g", "a".repeat(39)), 40, "revision").is_err());
+        assert!(validate_upper_hex_nonzero("0123456789ABCDEF", 16, "nonce").is_ok());
+        assert!(validate_upper_hex_nonzero("0000000000000000", 16, "nonce").is_err());
+        assert!(validate_upper_hex_nonzero("0123456789ABCDEG", 16, "nonce").is_err());
+    }
+
+    #[test]
+    fn source_receipt_rejects_missing_or_forged_producer_binding() {
+        let root = source_fixture_directory();
+        let nonce = "0123456789ABCDEF";
+        let receipt = source_receipt_fixture(&root, nonce);
+        verify_source_receipt(
+            receipt.as_bytes(),
+            &root,
+            &"a".repeat(40),
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &"c".repeat(40),
+            ACCEPTED_RUST_REVISION,
+            nonce,
+        )
+        .unwrap();
+        let missing = receipt
+            .lines()
+            .filter(|line| !line.starts_with("evidence_nonce = "))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        assert!(
+            verify_source_receipt(
+                missing.as_bytes(),
+                &root,
+                &"a".repeat(40),
+                &"a".repeat(40),
+                &"b".repeat(40),
+                &"c".repeat(40),
+                ACCEPTED_RUST_REVISION,
+                nonce,
+            )
+            .is_err()
+        );
+        let loader = sha256::bytes_digest(
+            &read_regular_bounded(&root.join("loader.efi"), MAX_ARTIFACT_BYTES, "loader").unwrap(),
+        );
+        let forged = receipt.replace(&loader, &"0".repeat(64));
+        assert!(
+            verify_source_receipt(
+                forged.as_bytes(),
+                &root,
+                &"a".repeat(40),
+                &"a".repeat(40),
+                &"b".repeat(40),
+                &"c".repeat(40),
+                ACCEPTED_RUST_REVISION,
+                nonce,
+            )
+            .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selector29_kernel_environment_is_exact() {
+        assert_eq!(
+            selector29_kernel_environment("0123456789ABCDEF"),
+            [
+                ("DEEPWYRM_GUEST_TEST_SELECTOR", SELECTOR.to_owned()),
+                ("DEEPWYRM_GUEST_TEST_ID", "29".to_owned()),
+                (
+                    "DEEPWYRM_WYR1C_EVIDENCE_NONCE",
+                    "0123456789ABCDEF".to_owned()
+                ),
+            ]
+        );
+    }
+
+    fn source_fixture_directory() -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "wyr1c6-source-receipt-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        for (key, name, _) in ARTIFACTS {
+            write_new(&root.join(name), key.as_bytes(), key).unwrap();
+        }
+        root
+    }
+
+    fn source_receipt_fixture(root: &Path, nonce: &str) -> String {
+        let mut values = BTreeMap::new();
+        for (key, value) in [
+            ("kind", "wyrmroot-wyr1-c6-selector29-source-build"),
+            ("schema_version", "1"),
+            ("selector", SELECTOR),
+            ("test_id", "29"),
+            ("evidence_protocol", EVIDENCE_PROTOCOL),
+            ("deepwyrm_revision", &"a".repeat(40)),
+            ("generated_abi_revision", &"a".repeat(40)),
+            ("generated_abi_tree", &"b".repeat(40)),
+            ("wyrmroot_revision", &"c".repeat(40)),
+            ("evidence_nonce", nonce),
+            ("rust_revision", ACCEPTED_RUST_REVISION),
+            ("rust_toolchain_name", ACCEPTED_TOOLCHAIN_NAME),
+            ("rustc_sha256", &"d".repeat(64)),
+            ("cargo_sha256", &"e".repeat(64)),
+            ("rust_lld_sha256", &"f".repeat(64)),
+            ("toolchain_manifest_sha256", &"a".repeat(64)),
+            ("toolchain_tree_sha256", &"b".repeat(64)),
+            ("bootstrap_features", "wyr1c6-production"),
+            (
+                "system_init_features",
+                "wyr1c6-production,wyr1c6-selector29",
+            ),
+            ("devmgr_features", "wyr1c6-production,wyr1c6-selector29"),
+            ("uart16550d_features", "wyr1c6-production,wyr1c6-selector29"),
+            ("registryd_features", "native-registryd"),
+            ("consoled_features", "native-retained"),
+            ("wyrmsh_features", "native-retained"),
+            ("bootstrap_command", "accepted-cargo native bootstrap"),
+            ("system_init_command", "accepted-cargo native system-init"),
+            ("registryd_command", "accepted-cargo native registryd"),
+            ("devmgr_command", "accepted-cargo native devmgr"),
+            ("uart16550d_command", "accepted-cargo native uart16550d"),
+            ("consoled_command", "accepted-cargo native consoled"),
+            ("wyrmsh_command", "accepted-cargo native wyrmsh"),
+            ("loader_command", "accepted-cargo UEFI loader pair"),
+            ("kernel_command", "pinned-cargo selector29 ff1e WRC6"),
+        ] {
+            values.insert(key.to_owned(), value.to_owned());
+        }
+        for (key, name, maximum) in ARTIFACTS {
+            values.insert(
+                format!("{key}_sha256"),
+                sha256::bytes_digest(
+                    &read_regular_bounded(&root.join(name), *maximum, key).unwrap(),
+                ),
+            );
+        }
+        render_sorted(&values).unwrap()
     }
     #[test]
     fn evidence_requires_the_exact_kernel_collector_sequence() {

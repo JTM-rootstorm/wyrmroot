@@ -27,7 +27,7 @@ Usage:
     tools/pinned-cargo xtask wyr1c2 freeze --output <fresh-directory>
     tools/pinned-cargo xtask wyr1c2 image --request <wyr1-c2-request.toml>
     tools/pinned-cargo xtask wyr1c2 inspect --request <wyr1-c2-request.toml>
-    tools/pinned-cargo xtask wyr1c6 freeze --output <fresh-directory> --artifacts <c6-artifacts> --deep-revision <40-hex> --generated-abi-revision <40-hex> --generated-abi-tree <40-hex> --evidence-nonce <16-hex> --evidence-challenge <16-hex>
+    tools/pinned-cargo xtask wyr1c6 prepare --output <fresh-directory> --deep-repository <path> --deep-revision <40-hex> --evidence-nonce <16-hex> --evidence-challenge <16-hex>
     tools/pinned-cargo xtask wyr1c6 inspect --request <wyr1-c6-request.toml>
     tools/pinned-cargo xtask wyr1c6 run --request <wyr1-c6-request.toml>
     tools/pinned-cargo xtask wyr1c6 evidence --request <wyr1-c6-request.toml>
@@ -141,12 +141,10 @@ pub(crate) enum Action {
     Wyr1C2Freeze(String),
     Wyr1C2Image(String),
     Wyr1C2Inspect(String),
-    Wyr1C6Freeze {
+    Wyr1C6Prepare {
         output: String,
-        artifacts: String,
+        deep_repository: String,
         deep_revision: String,
-        abi_revision: String,
-        abi_tree: String,
         nonce: String,
         challenge: String,
     },
@@ -309,33 +307,25 @@ fn dispatch_wyr1c6(arguments: &[String]) -> Result<Action, Failure> {
             command,
             output_flag,
             output,
-            artifacts_flag,
-            artifacts,
+            deep_repository_flag,
+            deep_repository,
             deep_flag,
             deep_revision,
-            abi_flag,
-            abi_revision,
-            tree_flag,
-            abi_tree,
             nonce_flag,
             nonce,
             challenge_flag,
             challenge,
-        ] if command == "freeze"
+        ] if command == "prepare"
             && output_flag == "--output"
-            && artifacts_flag == "--artifacts"
+            && deep_repository_flag == "--deep-repository"
             && deep_flag == "--deep-revision"
-            && abi_flag == "--generated-abi-revision"
-            && tree_flag == "--generated-abi-tree"
             && nonce_flag == "--evidence-nonce"
             && challenge_flag == "--evidence-challenge" =>
         {
-            Ok(Action::Wyr1C6Freeze {
+            Ok(Action::Wyr1C6Prepare {
                 output: output.clone(),
-                artifacts: artifacts.clone(),
+                deep_repository: deep_repository.clone(),
                 deep_revision: deep_revision.clone(),
-                abi_revision: abi_revision.clone(),
-                abi_tree: abi_tree.clone(),
                 nonce: nonce.clone(),
                 challenge: challenge.clone(),
             })
@@ -370,7 +360,7 @@ fn dispatch_wyr1c6(arguments: &[String]) -> Result<Action, Failure> {
             })
         }
         _ => Err(Failure::usage(
-            "wyr1c6 requires freeze --output <fresh-directory> --artifacts <c6-artifacts> --deep-revision <40-hex> --generated-abi-revision <40-hex> --generated-abi-tree <40-hex> --evidence-nonce <16-hex> --evidence-challenge <16-hex>, inspect|run --request <path>, or evidence --request <path> --default <log> --smp <log> --output <fresh-receipt>",
+            "wyr1c6 requires prepare --output <fresh-directory> --deep-repository <path> --deep-revision <40-hex> --evidence-nonce <16-hex> --evidence-challenge <16-hex>, inspect|run --request <path>, or evidence --request <path> --default <log> --smp <log> --output <fresh-receipt>",
         )),
     }
 }
@@ -978,6 +968,36 @@ mod tests {
             })
         );
         assert!(USAGE.contains("tools/pinned-cargo xtask dw1d6 freeze --output"));
+    }
+
+    #[test]
+    fn wyr1c6_prepare_has_no_caller_supplied_artifact_directory() {
+        assert_eq!(
+            dispatch(&arguments(&[
+                "wyr1c6",
+                "prepare",
+                "--output",
+                "freeze",
+                "--deep-repository",
+                "/home/mike/Documents/Programming/OS-Project/deepwyrm",
+                "--deep-revision",
+                &"a".repeat(40),
+                "--evidence-nonce",
+                &"A".repeat(16),
+                "--evidence-challenge",
+                &"B".repeat(16),
+            ])),
+            Ok(Action::Wyr1C6Prepare {
+                output: "freeze".into(),
+                deep_repository: "/home/mike/Documents/Programming/OS-Project/deepwyrm".into(),
+                deep_revision: "a".repeat(40),
+                nonce: "A".repeat(16),
+                challenge: "B".repeat(16),
+            })
+        );
+        assert!(dispatch(&arguments(&["wyr1c6", "freeze", "--output", "freeze",])).is_err());
+        assert!(USAGE.contains("tools/pinned-cargo xtask wyr1c6 prepare --output"));
+        assert!(!USAGE.contains("wyr1c6 freeze --output"));
     }
 
     #[test]
