@@ -52,6 +52,17 @@ fn c6_resident_tick_leaves_time_for_the_ready_handshake() {
 }
 
 #[test]
+fn native_wait_until_accepts_only_a_clock_verified_timeout_fallback() {
+    let wait_until = &MAIN_SOURCE[MAIN_SOURCE.find("fn wait_until(").unwrap()
+        ..MAIN_SOURCE
+            .find("impl Wyr1BPlatform for NativeSystem")
+            .unwrap()];
+    assert!(wait_until.contains("DW_STATUS_TIMED_OUT"));
+    assert!(wait_until.contains("monotonic_active_now()?"));
+    assert!(wait_until.contains("validate_wait_until_completion("));
+}
+
+#[test]
 fn every_c4_devmgr_generation_is_parented_under_retained_custody() {
     assert!(NATIVE_SOURCE.contains(".map(ResourceDomainCustody::handle)"));
     assert!(NATIVE_SOURCE.contains(".create_attempt_task_group(task_group_parent)"));

@@ -1492,6 +1492,38 @@ pub trait InitPlatform {
     fn wait_until(&mut self, deadline_ns: u64) -> Result<(), NativeError>;
 }
 
+/// Accepts a timer signal or its finite wait timeout only after the active
+/// monotonic clock proves the requested deadline has elapsed. The timeout is
+/// a valid fallback wake for delay-only restart backoff; an early signal or
+/// early timeout remains a malformed wait result.
+pub fn validate_wait_until_completion(
+    deadline_ns: u64,
+    observed_now: u64,
+    wait_result: Result<(), NativeError>,
+) -> Result<(), NativeError> {
+    match wait_result {
+        Ok(()) => {
+            if observed_now >= deadline_ns {
+                Ok(())
+            } else {
+                Err(NativeError::Output(
+                    wyrmroot_runtime::NativeOutputError::InvalidWaitResult,
+                ))
+            }
+        }
+        Err(NativeError::Status(status)) if status == DW_STATUS_TIMED_OUT => {
+            if observed_now >= deadline_ns {
+                Ok(())
+            } else {
+                Err(NativeError::Output(
+                    wyrmroot_runtime::NativeOutputError::InvalidWaitResult,
+                ))
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Selector-27-only native operations used by the WYR1-B controller.
 ///
 /// The permanent selector-25 path remains bounded by [`InitPlatform`], so it
@@ -3339,6 +3371,21 @@ mod native_cleanup_tests {
         assert_eq!(
             wait_for_replacement(&mut native, 100),
             Err(InitError::WrongActivationOrder)
+        );
+    }
+
+    #[test]
+    fn elapsed_wait_accepts_timeout_fallback_but_rejects_early_completion() {
+        let timed_out = Err(NativeError::Status(DW_STATUS_TIMED_OUT));
+        assert_eq!(validate_wait_until_completion(100, 100, Ok(())), Ok(()));
+        assert_eq!(validate_wait_until_completion(100, 125, timed_out), Ok(()));
+        assert_eq!(
+            validate_wait_until_completion(100, 99, Ok(())),
+            Err(NativeError::Output(NativeOutputError::InvalidWaitResult))
+        );
+        assert_eq!(
+            validate_wait_until_completion(100, 99, timed_out),
+            Err(NativeError::Output(NativeOutputError::InvalidWaitResult))
         );
     }
 

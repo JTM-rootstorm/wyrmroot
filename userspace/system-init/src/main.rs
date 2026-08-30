@@ -33,6 +33,7 @@ use wyrmroot_system_init::continue_system_init_resource_product;
     feature = "wyr1c6-selector29"
 )))]
 use wyrmroot_system_init::fatal_application_status;
+use wyrmroot_system_init::validate_wait_until_completion;
 #[cfg(feature = "wyr1-test-evidence")]
 use wyrmroot_system_init::wyr1_test_failure_application_status;
 #[cfg(feature = "wyr1b-test-evidence")]
@@ -104,8 +105,24 @@ impl InitPlatform for NativeSystem {
                 .ok_or(NativeError::Output(
                     wyrmroot_runtime::NativeOutputError::DeadlineOverflow,
                 ))?;
-            wait_one(timer, DW_SIGNAL_SIGNALED, DwDeadline(end))?;
-            Ok(())
+            let wait_result = wait_one(timer, DW_SIGNAL_SIGNALED, DwDeadline(end)).map(|_| ());
+            match wait_result {
+                Ok(()) => validate_wait_until_completion(
+                    deadline_ns,
+                    monotonic_active_now()?,
+                    wait_result,
+                ),
+                Err(NativeError::Status(status))
+                    if status == deepwyrm_syscall::DW_STATUS_TIMED_OUT =>
+                {
+                    validate_wait_until_completion(
+                        deadline_ns,
+                        monotonic_active_now()?,
+                        wait_result,
+                    )
+                }
+                Err(error) => Err(error),
+            }
         })();
         result.and(close_handle(timer))
     }
