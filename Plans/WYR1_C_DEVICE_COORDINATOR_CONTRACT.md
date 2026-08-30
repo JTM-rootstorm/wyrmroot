@@ -206,11 +206,15 @@ Deepwyrm types, rights, order, generation evidence, and failed-MOVE ownership
 remain uninhabitable until the paired DW1-D contract reaches them. C0 code must
 not encode provisional object or right constants.
 
-The direct control Channel is fresh per driver attempt. Init may construct the
-driver process and transfer its reduced child endpoint under the future reached
-startup profile, but init never receives the later hardware handles. The devmgr
-peer remains outside init and registryd. Closing or replacing an endpoint
-invalidates every message correlated to it.
+The direct control Channel is fresh per driver attempt. When init is the
+construction intermediary, devmgr MOVEs the child endpoint to init with exact
+sender-side staging rights `READ | WRITE | WAIT | TRANSFER | INSPECT` (`0x193`).
+Init validates that exact staging tuple, then the loader MOVEs the endpoint once
+more with exact driver rights `READ | WRITE | WAIT | INSPECT` (`0x113`), so
+`TRANSFER` does not cross into the actor. Init never receives the later hardware
+handles. The devmgr peer remains outside init and registryd. Closing or
+replacing an endpoint invalidates every message correlated to it. The
+historical pre-resource C3 seam retains its existing direct `0x113` handoff.
 
 The eventual post-resource WYR1-C acceptance actor validates exact handle
 metadata, reports READY, accepts intentional failure/retirement, and performs

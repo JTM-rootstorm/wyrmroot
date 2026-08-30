@@ -68,6 +68,11 @@ pub const LOADER_TASK_GROUP_RIGHTS: DwRights =
     DwRights(DW_RIGHT_MODIFY.0 | DW_RIGHT_INSPECT.0 | DW_RIGHT_DUPLICATE.0 | DW_RIGHT_TRANSFER.0);
 pub const CHILD_CHANNEL_RIGHTS: DwRights =
     DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_WAIT.0 | DW_RIGHT_INSPECT.0);
+/// Sender-side staging authority for a Channel that an intermediary loader
+/// must MOVE once more. The final child still receives only
+/// [`CHILD_CHANNEL_RIGHTS`].
+pub const CHILD_CHANNEL_TRANSFER_RIGHTS: DwRights =
+    DwRights(CHILD_CHANNEL_RIGHTS.0 | DW_RIGHT_TRANSFER.0);
 /// Exact read-only manifest view delegated to the WYR1-C device coordinator.
 pub const DEVICE_MANIFEST_RIGHTS: DwRights =
     DwRights(DW_RIGHT_READ.0 | DW_RIGHT_MAP.0 | DW_RIGHT_INSPECT.0);

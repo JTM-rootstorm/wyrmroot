@@ -33,16 +33,25 @@ use wyrmroot_device_proto::{
         SERIAL_CONSOLE_PUBLICATION_POLICY,
     },
 };
+#[cfg(any(test, not(feature = "wyr1c5-production")))]
+use wyrmroot_loader::launch::CHILD_CHANNEL_RIGHTS;
+#[cfg(feature = "wyr1c5-production")]
+use wyrmroot_loader::launch::CHILD_CHANNEL_TRANSFER_RIGHTS;
 #[cfg(test)]
 use wyrmroot_loader::launch::DEVICE_MANIFEST_RIGHTS;
 use wyrmroot_loader::{
-    launch::{CHILD_CHANNEL_RIGHTS, DEVICE_MANIFEST_TRANSFER_RIGHTS, LaunchProfile},
+    launch::{DEVICE_MANIFEST_TRANSFER_RIGHTS, LaunchProfile},
     process::{
         DeviceCoordinatorLoadRequest, DeviceCoordinatorResourceLoadRequest,
         DeviceDriverLoadRequest, load_device_coordinator_process,
         load_device_coordinator_resource_process, load_device_driver_process,
     },
 };
+
+#[cfg(feature = "wyr1c5-production")]
+const DRIVER_CONTROL_INGRESS_RIGHTS: DwRights = CHILD_CHANNEL_TRANSFER_RIGHTS;
+#[cfg(not(feature = "wyr1c5-production"))]
+const DRIVER_CONTROL_INGRESS_RIGHTS: DwRights = CHILD_CHANNEL_RIGHTS;
 use wyrmroot_registry_proto::{
     Header as RegistryHeader, MessageType as RegistryMessageType, ProtocolVersion,
     encode_install_publication,
@@ -1056,7 +1065,7 @@ fn receive_devmgr_control<S: InitPlatform>(
             let info = handles[0];
             let metadata_valid = info.handle.0 != 0
                 && info.object_type == DW_OBJECT_TYPE_CHANNEL
-                && info.rights == CHILD_CHANNEL_RIGHTS
+                && info.rights == DRIVER_CONTROL_INGRESS_RIGHTS
                 && info.reserved0 == 0
                 && info.reserved == [0; 2];
             let queried = system.query_capability_info(info.handle);
@@ -1065,7 +1074,7 @@ fn receive_devmgr_control<S: InitPlatform>(
                     queried,
                     Ok(actual)
                         if actual.object_type == DW_OBJECT_TYPE_CHANNEL
-                            && actual.rights == CHILD_CHANNEL_RIGHTS
+                            && actual.rights == DRIVER_CONTROL_INGRESS_RIGHTS
                 )
             {
                 system
@@ -2908,14 +2917,14 @@ mod tests {
             received: DwReceivedHandleInfoV1 {
                 handle: DwHandle(91),
                 object_type: DW_OBJECT_TYPE_CHANNEL,
-                rights: CHILD_CHANNEL_RIGHTS,
+                rights: DRIVER_CONTROL_INGRESS_RIGHTS,
                 reserved0: 0,
                 reserved: [0; 2],
             },
             received_count: 1,
             queried: CapabilityInfo {
                 object_type: DW_OBJECT_TYPE_CHANNEL,
-                rights: CHILD_CHANNEL_RIGHTS,
+                rights: DRIVER_CONTROL_INGRESS_RIGHTS,
             },
             closed: None,
         }
@@ -2933,6 +2942,29 @@ mod tests {
             }
         );
         assert_eq!(platform.closed, None);
+    }
+
+    #[cfg(feature = "wyr1c5-production")]
+    #[test]
+    fn native_driver_request_requires_transfer_staging_before_actor_reduction() {
+        assert_eq!(DRIVER_CONTROL_INGRESS_RIGHTS.0, 0x193);
+        assert_eq!(CHILD_CHANNEL_RIGHTS.0, 0x113);
+        assert_ne!(
+            DRIVER_CONTROL_INGRESS_RIGHTS.0 & deepwyrm_syscall::DW_RIGHT_TRANSFER.0,
+            0
+        );
+
+        let mut final_actor_rights_are_not_staging = control_input_platform(driver_request());
+        final_actor_rights_are_not_staging.received.rights = CHILD_CHANNEL_RIGHTS;
+        final_actor_rights_are_not_staging.queried.rights = CHILD_CHANNEL_RIGHTS;
+        assert_eq!(
+            receive_devmgr_control(&mut final_actor_rights_are_not_staging, DwHandle(12)),
+            Err(InitError::ResourceIdentityMismatch)
+        );
+        assert_eq!(
+            final_actor_rights_are_not_staging.closed,
+            Some(DwHandle(91))
+        );
     }
 
     #[test]

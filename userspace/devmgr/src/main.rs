@@ -61,6 +61,8 @@ use wyrmroot_device_proto::{
     },
 };
 use wyrmroot_devmgr::ControllerAction;
+#[cfg(feature = "wyr1c5-production")]
+use wyrmroot_loader::launch::CHILD_CHANNEL_TRANSFER_RIGHTS;
 use wyrmroot_loader::launch::{
     CHILD_CHANNEL_RIGHTS, DEVICE_MANIFEST_RIGHTS, HEADER_BYTES, LaunchProfile, SELF_ROOT_RIGHTS,
     encode_ready_for_profile,
@@ -1020,7 +1022,7 @@ fn launch_driver_with_bundle(
     }
     let child_transfer = DwHandleTransferV1 {
         handle: child,
-        requested_rights: CHILD_CHANNEL_RIGHTS,
+        requested_rights: CHILD_CHANNEL_TRANSFER_RIGHTS,
         operation: DW_HANDLE_TRANSFER_MOVE,
         reserved0: 0,
         reserved: [0; 2],

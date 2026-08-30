@@ -790,7 +790,9 @@ pub fn load_device_coordinator_resource_process<P: LoaderPlatform>(
 }
 
 /// Constructs only the acceptance driver's process and transfers only its
-/// reduced direct control endpoint.  Failure leaves that endpoint with the
+/// reduced direct control endpoint. The caller supplies sender-side staging
+/// authority because the loader must MOVE the endpoint once; the driver still
+/// receives only `CHILD_CHANNEL_RIGHTS`. Failure leaves that endpoint with the
 /// devmgr caller; hypothetical future resources are absent by type.
 pub fn load_device_driver_process<P: LoaderPlatform>(
     platform: &mut P,

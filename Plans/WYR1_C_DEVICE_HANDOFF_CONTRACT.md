@@ -14,6 +14,13 @@ WYR1-C3 stops after a real `system/devmgr` generation constructs a synthetic
 pre-resource driver actor over one fresh direct control Channel and receives
 `CONTROL_READY`. That state remains truthful and unchanged.
 
+For C5 and later, the construction hop is explicitly two-stage: devmgr requests
+`READ | WRITE | WAIT | TRANSFER | INSPECT` (`0x193`) while MOVing the child
+control endpoint to init, init validates that sender-side staging authority, and
+the loader requests only `READ | WRITE | WAIT | INSPECT` (`0x113`) while MOVing
+the endpoint into the driver. Thus init can perform the required second MOVE,
+while the actor receives the same exact reduced control rights as C3.
+
 This contract reaches the next ownership seam without implementing it. WYR1-C4
 may begin only after DW1-D1 through D6 provide the exact generated ABI and
 runtime authority defined by the paired kernel contract. D0 itself does not

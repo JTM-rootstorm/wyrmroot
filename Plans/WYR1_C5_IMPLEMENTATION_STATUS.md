@@ -14,6 +14,11 @@ TaskGroup.
 
 For the exact COM2 claim, devmgr:
 
+Before the resource bundle, the C5 construction hop stages the fresh child
+control endpoint through init with `0x193` and the loader reduces it to the
+actor's exact `0x113`. This is sender-only `TRANSFER` authority; it does not
+change the actor startup profile or the C3 historical path.
+
 1. retains the broad `DeviceResource` with rights `0x3c3`;
 2. duplicates one sender-side staging resource with
    `READ | WRITE | TRANSFER | INSPECT = 0x183`, then requests the exact driver
