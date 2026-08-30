@@ -2,7 +2,7 @@ use deepwyrm_syscall as _;
 use wyrmroot_dw1d6_device_test::{
     BAD_STATE_STATUS, ControllerMessage, ControllerModel, ControllerProtocolError, DELIVERY_CYCLES,
     MessageKind, PENDING_DELIVERY_SEQUENCE, RACE_PERMIT_SEQUENCE, STALE_DELIVERY_SEQUENCE,
-    deliver_command, owner_ack_permit,
+    deliver_command, owner_ack_permit, owner_start_permit,
 };
 use wyrmroot_loader as _;
 use wyrmroot_runtime as _;
@@ -104,4 +104,11 @@ fn controller_rejects_the_race_permit_before_pending_delivery() {
         )),
         Err(ControllerProtocolError::OutOfOrder)
     );
+}
+
+#[test]
+fn owner_start_permit_is_an_exact_handle_free_controller_command() {
+    let permit = owner_start_permit();
+    assert_eq!(permit, message(MessageKind::OwnerStartPermit, 0, 0));
+    assert_eq!(ControllerMessage::decode(&permit.encode()), Ok(permit));
 }

@@ -396,6 +396,11 @@ pub fn run_d6_synthetic_bootstrap<
             return Err(BootstrapError::UnexpectedMessage);
         }
     }
+    send_d6_message(
+        system,
+        owner.launch_channel,
+        wyrmroot_dw1d6_device_test::owner_start_permit(),
+    )?;
     expect_d6_message(
         system,
         owner.launch_channel,
@@ -519,6 +524,11 @@ pub fn run_d6_synthetic_bootstrap<
     )?;
     d6_arm(replacement.process, trigger.process, nonce, challenge)
         .map_err(BootstrapError::Native)?;
+    send_d6_message(
+        system,
+        replacement.launch_channel,
+        wyrmroot_dw1d6_device_test::owner_start_permit(),
+    )?;
     expect_d6_message(
         system,
         replacement.launch_channel,

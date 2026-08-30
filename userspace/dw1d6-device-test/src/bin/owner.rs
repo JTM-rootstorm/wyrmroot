@@ -11,7 +11,7 @@ use deepwyrm_syscall::{
 };
 use wyrmroot_dw1d6_device_test::{
     BUILD_CHALLENGE, BUILD_NONCE, CONTROLLER_MESSAGE_BYTES, ControllerMessage, DELIVERY_CYCLES,
-    EXPECTED_SOURCE, MessageKind, PIO_WIDTH_1, RESOURCE_ID, SCRATCH_OFFSET,
+    EXPECTED_SOURCE, MessageKind, PIO_WIDTH_1, RESOURCE_ID, SCRATCH_OFFSET, owner_start_permit,
 };
 use wyrmroot_loader::launch::{HEADER_BYTES, LaunchProfile, parse_init};
 use wyrmroot_runtime::{
@@ -77,6 +77,9 @@ fn owner_main(startup: StartupBlock<'_>) -> u32 {
         return fail(3);
     }
     let domain = handles[0].handle;
+    if receive_command(channel) != Some(owner_start_permit()) {
+        return fail(33);
+    }
     let resource = match claim_device_resource(domain, RESOURCE_ID, RESOURCE_RIGHTS) {
         Ok(value) => value,
         Err(_) => return fail(4),

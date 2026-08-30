@@ -30,6 +30,18 @@ fn owner_roles_are_scoped_and_use_com2_scratch_only() {
     assert!(TRIGGER.contains("d6_deliver"));
     assert!(OWNER.contains("OwnerWaitIntent"));
     assert!(REPLACEMENT_OWNER.contains("ReplacementWaitIntent"));
+    for source in [OWNER, REPLACEMENT_OWNER] {
+        let permit = source
+            .find("owner_start_permit()")
+            .expect("owner waits for the controller start permit");
+        let claim = source
+            .find("claim_device_resource(domain")
+            .expect("owner claims the delegated resource domain");
+        assert!(
+            permit < claim,
+            "claim must follow the controller start permit"
+        );
+    }
 }
 
 #[test]

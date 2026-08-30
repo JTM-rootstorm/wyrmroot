@@ -321,3 +321,10 @@ The paired contract is reached, but WYR1-C4 remains blocked until DW1-D6 closes
 on an exact generated/runtime/evidence tuple. At that handoff, C4 may implement
 the startup claim handle, exact claim/info join, and current-generation bundle
 intake without revising the authority model defined here.
+
+Selector-30 owner processes are launch-runnable before the controller can arm
+its evidence identity. Therefore both the initial and replacement test owners
+must block on an exact handle-free controller start permit. The controller may
+send that permit only after the corresponding D6 `ARM`; for the initial owner,
+the required outside-domain denied-claim record must also precede the permit.
+This selector-only synchronization carries no resource authority.

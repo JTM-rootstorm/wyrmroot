@@ -38,6 +38,7 @@ pub enum MessageKind {
     TriggerFinished = 10,
     ReplacementBound = 11,
     ReplacementWaitIntent = 12,
+    OwnerStartPermit = 13,
 }
 
 impl MessageKind {
@@ -55,6 +56,7 @@ impl MessageKind {
             10 => Self::TriggerFinished,
             11 => Self::ReplacementBound,
             12 => Self::ReplacementWaitIntent,
+            13 => Self::OwnerStartPermit,
             _ => return None,
         })
     }
@@ -333,6 +335,10 @@ pub const fn deliver_command(sequence: u64, expected_status: i32) -> ControllerM
 
 pub const fn owner_ack_permit(sequence: u64) -> ControllerMessage {
     ControllerMessage::new(MessageKind::OwnerAckPermit, sequence, 0)
+}
+
+pub const fn owner_start_permit() -> ControllerMessage {
+    ControllerMessage::new(MessageKind::OwnerStartPermit, 0, 0)
 }
 
 pub const BUILD_NONCE: u64 = parse_hex(match option_env!("DEEPWYRM_DW1D6_BUILD_NONCE") {

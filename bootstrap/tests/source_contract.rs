@@ -86,6 +86,39 @@ fn d6_bootstrap_is_feature_gated_v3_and_keeps_actors_out_of_production_init() {
     assert!(LIB_SOURCE.contains("load_d6_resource_owner_process"));
     assert!(LIB_SOURCE.contains("LaunchProfile::Hello"));
     assert!(!LIB_SOURCE.contains("continue_system_init_product"));
+
+    let transaction = LIB_SOURCE
+        .split("pub fn run_d6_synthetic_bootstrap")
+        .nth(1)
+        .expect("D6 bootstrap transaction");
+    let first_arm = transaction
+        .find("d6_arm(owner.process")
+        .expect("first-owner ARM");
+    let denied = transaction
+        .find("BootstrapOutsideDomainClaimRejected")
+        .expect("outside-domain denial report");
+    let first_start = transaction
+        .find("owner_start_permit()")
+        .expect("first-owner start permit");
+    let first_bound = transaction
+        .find("MessageKind::FirstOwnerBound")
+        .expect("first-owner bound report");
+    assert!(first_arm < denied && denied < first_start && first_start < first_bound);
+
+    let replacement_load = transaction
+        .find("let replacement = load_d6_resource_owner")
+        .expect("replacement owner load");
+    let replacement = &transaction[replacement_load..];
+    let replacement_arm = replacement
+        .find("d6_arm(replacement.process")
+        .expect("replacement ARM");
+    let replacement_start = replacement
+        .find("owner_start_permit()")
+        .expect("replacement start permit");
+    let replacement_bound = replacement
+        .find("MessageKind::ReplacementBound")
+        .expect("replacement bound report");
+    assert!(replacement_arm < replacement_start && replacement_start < replacement_bound);
 }
 
 #[test]
