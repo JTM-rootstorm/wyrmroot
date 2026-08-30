@@ -1334,6 +1334,9 @@ pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<
     if matches!(filter, Some("wyr1c5" | "wyr1c5-native")) {
         return crate::wyr1c::run_c5_native_checks(repository);
     }
+    if matches!(filter, Some("wyr1c6" | "wyr1c6-native")) {
+        return crate::wyr1c::run_c6_native_checks(repository);
+    }
     for arguments in host_test_commands(filter)? {
         let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
         run_cargo(repository, &arguments)?;

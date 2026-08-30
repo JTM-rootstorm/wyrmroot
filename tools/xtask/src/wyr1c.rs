@@ -151,6 +151,41 @@ const C5_NATIVE_CHECK_SPECS: [NativeSpec; 4] = [
     },
 ];
 
+// C6 keeps the C5 resource-domain profile and adds only the bounded
+// selector-29 restart exercise.  This list is intentionally separate from
+// the C5 gate: a successful C5 build is not evidence that the C6 feature
+// selection or retained driver actor was compiled.
+const C6_NATIVE_CHECK_SPECS: [NativeSpec; 4] = [
+    NativeSpec {
+        label: "bootstrap-c6",
+        package: "wyrmroot-bootstrap",
+        binary: "wyrmroot-bootstrap",
+        features: "wyr1c6-production",
+        artifact: "wyrmroot-bootstrap",
+    },
+    NativeSpec {
+        label: "system-init-c6",
+        package: "wyrmroot-system-init",
+        binary: "system-init",
+        features: "wyr1c6-production",
+        artifact: "system-init",
+    },
+    NativeSpec {
+        label: "devmgr-c6",
+        package: "wyrmroot-devmgr",
+        binary: "devmgr",
+        features: "wyr1c6-production,wyr1c6-selector29",
+        artifact: "devmgr",
+    },
+    NativeSpec {
+        label: "uart16550d-c6",
+        package: "wyrmroot-wyr1-retained-stubs",
+        binary: "uart16550d",
+        features: "wyr1c6-production,wyr1c6-selector29",
+        artifact: "uart16550d",
+    },
+];
+
 struct NativeArtifact {
     spec: NativeSpec,
     bytes: Vec<u8>,
@@ -184,6 +219,10 @@ pub(crate) fn run_c4_native_checks(repository: &Path) -> Result<(), Failure> {
 
 pub(crate) fn run_c5_native_checks(repository: &Path) -> Result<(), Failure> {
     run_native_checks(repository, "WYR1-C5", "wyr1c5", &C5_NATIVE_CHECK_SPECS)
+}
+
+pub(crate) fn run_c6_native_checks(repository: &Path) -> Result<(), Failure> {
+    run_native_checks(repository, "WYR1-C6", "wyr1c6", &C6_NATIVE_CHECK_SPECS)
 }
 
 fn run_native_checks(

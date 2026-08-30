@@ -27,6 +27,10 @@ Usage:
     tools/pinned-cargo xtask wyr1c2 freeze --output <fresh-directory>
     tools/pinned-cargo xtask wyr1c2 image --request <wyr1-c2-request.toml>
     tools/pinned-cargo xtask wyr1c2 inspect --request <wyr1-c2-request.toml>
+    tools/pinned-cargo xtask wyr1c6 freeze --output <fresh-directory> --artifacts <c6-artifacts> --deep-revision <40-hex> --generated-abi-revision <40-hex> --generated-abi-tree <40-hex> --evidence-nonce <16-hex> --evidence-challenge <16-hex>
+    tools/pinned-cargo xtask wyr1c6 inspect --request <wyr1-c6-request.toml>
+    tools/pinned-cargo xtask wyr1c6 run --request <wyr1-c6-request.toml>
+    tools/pinned-cargo xtask wyr1c6 evidence --request <wyr1-c6-request.toml>
     cargo xtask dw1b image --request <dw1-b-request.toml>
     cargo xtask dw1b image-rebuild --request <dw1-b-request.toml>
     cargo xtask dw1b freeze --output <directory>
@@ -137,6 +141,23 @@ pub(crate) enum Action {
     Wyr1C2Freeze(String),
     Wyr1C2Image(String),
     Wyr1C2Inspect(String),
+    Wyr1C6Freeze {
+        output: String,
+        artifacts: String,
+        deep_revision: String,
+        abi_revision: String,
+        abi_tree: String,
+        nonce: String,
+        challenge: String,
+    },
+    Wyr1C6Inspect(String),
+    Wyr1C6Run(String),
+    Wyr1C6Evidence {
+        request: String,
+        default: String,
+        smp: String,
+        output: String,
+    },
     Dw1BImage(String),
     Dw1BImageRebuild(String),
     Dw1BFreeze(String),
@@ -220,6 +241,7 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
         "wyr1b" => dispatch_wyr1b(&arguments[1..]),
         "wyr1c1" => dispatch_wyr1c1(&arguments[1..]),
         "wyr1c2" => dispatch_wyr1c2(&arguments[1..]),
+        "wyr1c6" => dispatch_wyr1c6(&arguments[1..]),
         "dw1b" => dispatch_dw1b(&arguments[1..]),
         "dw1c" => dispatch_dw1c(&arguments[1..]),
         "dw1d6" => dispatch_dw1d6(&arguments[1..]),
@@ -277,6 +299,78 @@ fn dispatch_wyr1c2(arguments: &[String]) -> Result<Action, Failure> {
         }
         _ => Err(Failure::usage(
             "wyr1c2 requires freeze --output <fresh-directory>, image --request <request>, or inspect --request <request>; it has selector=none and no run or evidence command",
+        )),
+    }
+}
+
+fn dispatch_wyr1c6(arguments: &[String]) -> Result<Action, Failure> {
+    match arguments {
+        [
+            command,
+            output_flag,
+            output,
+            artifacts_flag,
+            artifacts,
+            deep_flag,
+            deep_revision,
+            abi_flag,
+            abi_revision,
+            tree_flag,
+            abi_tree,
+            nonce_flag,
+            nonce,
+            challenge_flag,
+            challenge,
+        ] if command == "freeze"
+            && output_flag == "--output"
+            && artifacts_flag == "--artifacts"
+            && deep_flag == "--deep-revision"
+            && abi_flag == "--generated-abi-revision"
+            && tree_flag == "--generated-abi-tree"
+            && nonce_flag == "--evidence-nonce"
+            && challenge_flag == "--evidence-challenge" =>
+        {
+            Ok(Action::Wyr1C6Freeze {
+                output: output.clone(),
+                artifacts: artifacts.clone(),
+                deep_revision: deep_revision.clone(),
+                abi_revision: abi_revision.clone(),
+                abi_tree: abi_tree.clone(),
+                nonce: nonce.clone(),
+                challenge: challenge.clone(),
+            })
+        }
+        [command, flag, request] if command == "inspect" && flag == "--request" => {
+            Ok(Action::Wyr1C6Inspect(request.clone()))
+        }
+        [command, flag, request] if command == "run" && flag == "--request" => {
+            Ok(Action::Wyr1C6Run(request.clone()))
+        }
+        [
+            command,
+            request_flag,
+            request,
+            default_flag,
+            default,
+            smp_flag,
+            smp,
+            output_flag,
+            output,
+        ] if command == "evidence"
+            && request_flag == "--request"
+            && default_flag == "--default"
+            && smp_flag == "--smp"
+            && output_flag == "--output" =>
+        {
+            Ok(Action::Wyr1C6Evidence {
+                request: request.clone(),
+                default: default.clone(),
+                smp: smp.clone(),
+                output: output.clone(),
+            })
+        }
+        _ => Err(Failure::usage(
+            "wyr1c6 requires freeze --output <fresh-directory> --artifacts <c6-artifacts> --deep-revision <40-hex> --generated-abi-revision <40-hex> --generated-abi-tree <40-hex> --evidence-nonce <16-hex> --evidence-challenge <16-hex>, inspect|run --request <path>, or evidence --request <path> --default <log> --smp <log> --output <fresh-receipt>",
         )),
     }
 }

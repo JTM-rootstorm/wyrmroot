@@ -20,6 +20,7 @@ mod wyr1_vm;
 mod wyr1b;
 mod wyr1c;
 mod wyr1c2;
+mod wyr1c6;
 
 use std::env;
 use std::process::ExitCode;
@@ -129,6 +130,38 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
         Action::Wyr1C2Freeze(output) => wyr1c2::freeze(std::path::Path::new(&output)).map(Some),
         Action::Wyr1C2Image(request) => wyr1c2::image(std::path::Path::new(&request)).map(Some),
         Action::Wyr1C2Inspect(request) => wyr1c2::inspect(std::path::Path::new(&request)).map(Some),
+        Action::Wyr1C6Freeze {
+            output,
+            artifacts,
+            deep_revision,
+            abi_revision,
+            abi_tree,
+            nonce,
+            challenge,
+        } => wyr1c6::freeze(
+            std::path::Path::new(&output),
+            std::path::Path::new(&artifacts),
+            &deep_revision,
+            &abi_revision,
+            &abi_tree,
+            &nonce,
+            &challenge,
+        )
+        .map(Some),
+        Action::Wyr1C6Inspect(request) => wyr1c6::inspect(std::path::Path::new(&request)).map(Some),
+        Action::Wyr1C6Run(request) => wyr1c6::run(std::path::Path::new(&request)).map(Some),
+        Action::Wyr1C6Evidence {
+            request,
+            default,
+            smp,
+            output,
+        } => wyr1c6::evidence(
+            std::path::Path::new(&request),
+            std::path::Path::new(&default),
+            std::path::Path::new(&smp),
+            std::path::Path::new(&output),
+        )
+        .map(Some),
         Action::Dw1BImage(request) => dw1b::build(std::path::Path::new(&request)).map(Some),
         Action::Dw1BImageRebuild(request) => {
             dw1b::rebuild(std::path::Path::new(&request)).map(Some)
