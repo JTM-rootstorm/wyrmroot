@@ -1509,9 +1509,10 @@ pub trait Wyr1BPlatform: InitPlatform {
         items: &[DwWaitItemV1],
         deadline: DwDeadline,
     ) -> Result<DwWaitResultV1, NativeError>;
-    /// Creates one unpublished, immutable manifest object and returns only
-    /// the reduced child capability.  The native implementation confines its
-    /// writable mapping to the runtime boundary.
+    /// Creates one unpublished, immutable manifest object with the exact
+    /// caller-requested staging rights. The native implementation confines
+    /// its writable mapping to the runtime boundary; the loader separately
+    /// reduces sender-only transfer authority at the child boundary.
     fn materialize_read_only_memory(
         &mut self,
         root: DwHandle,

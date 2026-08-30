@@ -188,7 +188,7 @@ pub fn create_memory_object(bytes: u64, rights: DwRights) -> Result<DwHandle, Na
 }
 
 /// Materialize immutable bytes in one unpublished `MemoryObject` and return a
-/// capability reduced to the supplied read-only child rights.
+/// capability reduced to the supplied immutable staging rights.
 ///
 /// The only unsafe operation is bounded to the exclusive parent mapping: the
 /// object is freshly created, has no transferred handle, is zero-filled before

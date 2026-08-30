@@ -61,6 +61,18 @@ fn every_c4_devmgr_generation_is_parented_under_retained_custody() {
 }
 
 #[test]
+fn c4_manifest_move_stages_transfer_without_delegating_it() {
+    assert!(NATIVE_SOURCE.contains("DEVICE_MANIFEST_TRANSFER_RIGHTS"));
+    assert!(
+        NATIVE_SOURCE.contains("manifest_bytes,\n            DEVICE_MANIFEST_TRANSFER_RIGHTS,")
+    );
+    let launch = include_str!("../../../crates/wyrmroot-loader/src/launch.rs");
+    assert!(launch.contains("DwRights(DEVICE_MANIFEST_RIGHTS.0 | DW_RIGHT_TRANSFER.0)"));
+    let process = include_str!("../../../crates/wyrmroot-loader/src/process.rs");
+    assert!(process.contains("transfers[2] = transfer(manifest, launch::DEVICE_MANIFEST_RIGHTS);"));
+}
+
+#[test]
 fn c5_driver_attempt_is_parented_under_the_current_devmgr_generation() {
     assert!(MANIFEST.contains("wyr1c5-production = [\"native-init\"]"));
     let construct = &NATIVE_SOURCE[NATIVE_SOURCE.find("fn construct_driver").unwrap()..];

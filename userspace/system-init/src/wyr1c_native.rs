@@ -33,8 +33,10 @@ use wyrmroot_device_proto::{
         SERIAL_CONSOLE_PUBLICATION_POLICY,
     },
 };
+#[cfg(test)]
+use wyrmroot_loader::launch::DEVICE_MANIFEST_RIGHTS;
 use wyrmroot_loader::{
-    launch::{CHILD_CHANNEL_RIGHTS, DEVICE_MANIFEST_RIGHTS, LaunchProfile},
+    launch::{CHILD_CHANNEL_RIGHTS, DEVICE_MANIFEST_TRANSFER_RIGHTS, LaunchProfile},
     process::{
         DeviceCoordinatorLoadRequest, DeviceCoordinatorResourceLoadRequest,
         DeviceDriverLoadRequest, load_device_coordinator_process,
@@ -462,7 +464,7 @@ where
         .materialize_read_only_memory(
             authority.parent_root,
             manifest_bytes,
-            DEVICE_MANIFEST_RIGHTS,
+            DEVICE_MANIFEST_TRANSFER_RIGHTS,
         )
         .map_err(InitError::Native)
     {

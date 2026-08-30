@@ -71,6 +71,11 @@ pub const CHILD_CHANNEL_RIGHTS: DwRights =
 /// Exact read-only manifest view delegated to the WYR1-C device coordinator.
 pub const DEVICE_MANIFEST_RIGHTS: DwRights =
     DwRights(DW_RIGHT_READ.0 | DW_RIGHT_MAP.0 | DW_RIGHT_INSPECT.0);
+/// Sender-side staging authority for the immutable manifest MOVE. The loader
+/// requests only [`DEVICE_MANIFEST_RIGHTS`] for the child, so `TRANSFER` does
+/// not cross the launch boundary.
+pub const DEVICE_MANIFEST_TRANSFER_RIGHTS: DwRights =
+    DwRights(DEVICE_MANIFEST_RIGHTS.0 | DW_RIGHT_TRANSFER.0);
 /// The sole reduced resource-domain claim authority a future devmgr generation
 /// may receive. It is not loader construction authority.
 pub const RESOURCE_DOMAIN_CLAIM_RIGHTS: DwRights =

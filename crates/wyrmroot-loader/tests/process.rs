@@ -4,7 +4,10 @@ use deepwyrm_syscall::{
 };
 use wyrmroot_loader::{
     elf::{STACK_BOTTOM, STACK_BYTES},
-    launch::{LaunchProfile, RESOURCE_DOMAIN_CLAIM_RIGHTS, RESOURCE_DOMAIN_CLAIM_TRANSFER_RIGHTS},
+    launch::{
+        DEVICE_MANIFEST_RIGHTS, DEVICE_MANIFEST_TRANSFER_RIGHTS, LaunchProfile,
+        RESOURCE_DOMAIN_CLAIM_RIGHTS, RESOURCE_DOMAIN_CLAIM_TRANSFER_RIGHTS,
+    },
     process::{
         D6ResourceOwnerLoadRequest, DeviceCoordinatorLoadError, DeviceCoordinatorLoadRequest,
         DeviceCoordinatorResourceLoadRequest, DeviceDriverLoadError, DeviceDriverLoadRequest,
@@ -692,6 +695,18 @@ fn c4_device_coordinator_moves_only_the_reduced_staged_domain_duplicate() {
     assert_eq!(&platform.sent_init[6..8], &9_u16.to_le_bytes());
     assert_eq!(&platform.sent_init[72..80], &0x59_u64.to_le_bytes());
     assert_eq!(platform.sent_transfers.len(), 4);
+    assert_eq!(
+        platform.sent_transfers[2].requested_rights,
+        DEVICE_MANIFEST_RIGHTS
+    );
+    assert_eq!(
+        platform.sent_transfers[2].requested_rights.0 & DW_RIGHT_TRANSFER.0,
+        0
+    );
+    assert_eq!(
+        DEVICE_MANIFEST_TRANSFER_RIGHTS.0,
+        DEVICE_MANIFEST_RIGHTS.0 | DW_RIGHT_TRANSFER.0
+    );
     let (source, staged_rights, staged) = platform
         .duplicates
         .iter()
