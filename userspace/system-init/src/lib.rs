@@ -148,7 +148,12 @@ const fn test_failure_category(error: &InitError) -> u32 {
 #[cfg(feature = "wyr1c6-selector29")]
 #[must_use]
 pub const fn wyr1c6_test_failure_application_status(error: &InitError) -> u32 {
-    0xAF1C_0000 | test_failure_category(error)
+    match error {
+        InitError::Native(error) => {
+            0xAF1D_0000 | wyrmroot_runtime::native_error_code(*error)
+        }
+        _ => 0xAF1C_0000 | test_failure_category(error),
+    }
 }
 
 #[cfg(feature = "wyr1-test-evidence")]
@@ -3531,6 +3536,12 @@ mod native_cleanup_tests {
         assert_eq!(
             wyr1c6_test_failure_application_status(&InitError::Accounting),
             0xAF1C_0016
+        );
+        assert_eq!(
+            wyr1c6_test_failure_application_status(&InitError::Native(NativeError::Status(
+                deepwyrm_syscall::DwStatus(-11),
+            ))),
+            0xAF1D_000B
         );
     }
 
