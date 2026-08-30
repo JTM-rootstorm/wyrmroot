@@ -1,7 +1,8 @@
-//! Native WYR1-C resident device-coordinator and C3 driver construction.
+//! Native WYR1-C resident device-coordinator ownership and construction.
 //!
-//! C3 constructs and reaps the synthetic acceptance driver using one direct
-//! child Channel. It still does not discover, receive, or bind hardware.
+//! Historical C3 keeps its direct, hardware-free construction path. The C4
+//! profile instead parents each devmgr generation under retained resource-
+//! domain custody and delegates only its reduced claim authority.
 
 use super::*;
 use crate::wyr1b::{EndpointKind, RegistryTopology};
@@ -30,8 +31,9 @@ use wyrmroot_device_proto::{
 use wyrmroot_loader::{
     launch::{CHILD_CHANNEL_RIGHTS, DEVICE_MANIFEST_RIGHTS, LaunchProfile},
     process::{
-        DeviceCoordinatorLoadRequest, DeviceDriverLoadRequest, load_device_coordinator_process,
-        load_device_driver_process,
+        DeviceCoordinatorLoadRequest, DeviceCoordinatorResourceLoadRequest,
+        DeviceDriverLoadRequest, load_device_coordinator_process,
+        load_device_coordinator_resource_process, load_device_driver_process,
     },
 };
 use wyrmroot_registry_proto::{
@@ -99,6 +101,7 @@ struct DriverNativeAttempt {
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ResidentState {
+    resource_domain: Option<ResourceDomainCustody>,
     registry: Option<RegistryNativeAttempt>,
     topology: RegistryTopology,
     devmgr: Option<ActiveNativeRole>,
@@ -192,6 +195,8 @@ pub(crate) fn activate_in_place<'a, S, L, W>(
     waits: &mut W,
     slot: &'a mut MaybeUninit<ResidentSystemInit>,
     authority: LoadAuthority,
+    resource_domain: Option<ResourceDomainCustody>,
+    parent_profile: LaunchProfile,
     bootstrap_channel: DwHandle,
     parent_transaction: u64,
     bootfs: &[u8],
@@ -236,9 +241,8 @@ where
     });
     resident.controller.become_operational()?;
     let mut ready = [0u8; HEADER_BYTES];
-    let ready_len =
-        encode_ready_for_profile(LaunchProfile::Supervisor, parent_transaction, &mut ready)
-            .map_err(InitError::Launch)?;
+    let ready_len = encode_ready_for_profile(parent_profile, parent_transaction, &mut ready)
+        .map_err(InitError::Launch)?;
     system
         .send_channel(bootstrap_channel, &ready[..ready_len])
         .map_err(InitError::Native)?;
@@ -263,6 +267,7 @@ where
         waits,
         &mut resident.controller,
         authority,
+        resource_domain,
         bootfs,
         registry,
         &mut topology,
@@ -282,6 +287,7 @@ where
         }
     };
     let state = ResidentState {
+        resource_domain,
         registry: Some(registry),
         topology,
         devmgr: Some(devmgr.active),
@@ -319,6 +325,7 @@ fn launch_devmgr<S, L, W>(
     waits: &mut W,
     controller: &mut SystemInit,
     authority: LoadAuthority,
+    resource_domain: Option<ResourceDomainCustody>,
     bootfs: &[u8],
     registry: RegistryNativeAttempt,
     topology: &mut RegistryTopology,
@@ -377,8 +384,11 @@ where
             });
         }
     };
+    let task_group_parent = resource_domain
+        .map(ResourceDomainCustody::handle)
+        .unwrap_or(authority.task_group);
     let task_group = match system
-        .create_attempt_task_group(authority.task_group)
+        .create_attempt_task_group(task_group_parent)
         .map_err(InitError::Native)
     {
         Ok(task_group) => task_group,
@@ -425,21 +435,42 @@ where
             error
         });
     }
-    let loaded = match load_device_coordinator_process(
-        loader,
-        LoadAuthority {
-            task_group,
-            ..authority
-        },
-        DeviceCoordinatorLoadRequest {
-            image: image.data(),
-            display_path: DEVMGR_PATH,
-            publication_endpoint: devmgr_endpoint,
-            manifest,
-            supervisor_generation: generation,
-            transaction_id,
-        },
-    ) {
+    let generation_authority = LoadAuthority {
+        task_group,
+        ..authority
+    };
+    let loaded_result = if let Some(custody) = resource_domain {
+        let reduced = custody
+            .devmgr_claim_authority(ResourceDomainMembership::DevmgrGenerationDescendant)
+            .map_err(|_| InitError::WrongActivationOrder)?;
+        load_device_coordinator_resource_process(
+            loader,
+            generation_authority,
+            DeviceCoordinatorResourceLoadRequest {
+                image: image.data(),
+                display_path: DEVMGR_PATH,
+                publication_endpoint: devmgr_endpoint,
+                manifest,
+                resource_domain: reduced.handle(),
+                supervisor_generation: generation,
+                transaction_id,
+            },
+        )
+    } else {
+        load_device_coordinator_process(
+            loader,
+            generation_authority,
+            DeviceCoordinatorLoadRequest {
+                image: image.data(),
+                display_path: DEVMGR_PATH,
+                publication_endpoint: devmgr_endpoint,
+                manifest,
+                supervisor_generation: generation,
+                transaction_id,
+            },
+        )
+    };
+    let loaded = match loaded_result {
         Ok(loaded) => loaded,
         Err(failure) => {
             let mut cleanup_failed = system.close_handle(task_group).is_err()
@@ -509,11 +540,16 @@ where
     let deadline = started
         .checked_add(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
         .ok_or(InitError::Accounting)?;
+    let launch_profile = if resource_domain.is_some() {
+        LaunchProfile::DeviceCoordinatorResourceDomain
+    } else {
+        LaunchProfile::DeviceCoordinator
+    };
     if await_child_ready_profile_observed(
         waits,
         loaded.process,
         loaded.launch_channel,
-        LaunchProfile::DeviceCoordinator,
+        launch_profile,
         transaction_id,
         DwDeadline(deadline),
     )
@@ -661,12 +697,17 @@ where
             );
         }
     };
+    let expected_status = if resource_domain.is_some() {
+        StatusCode::OperationalResourceOwned
+    } else {
+        StatusCode::OperationalWaitingForDeviceBundle
+    };
     if response
         != (ControllerMessage::Status {
             supervisor_generation: SupervisorGeneration(generation),
             binding: Some(binding),
             transaction_id,
-            status: StatusCode::OperationalWaitingForDeviceBundle,
+            status: expected_status,
             attempt_generation: None,
         })
     {
@@ -1575,6 +1616,10 @@ where
             _ => return Err(InitError::WrongActivationOrder),
         };
         let registry = resident.wyr1c.as_ref().and_then(|state| state.registry);
+        let resource_domain = resident
+            .wyr1c
+            .as_ref()
+            .and_then(|state| state.resource_domain);
         let Some(registry) = registry else {
             resident.result = RecoveryResult::Degraded;
             return Ok(());
@@ -1590,6 +1635,7 @@ where
                 waits,
                 &mut resident.controller,
                 resident.authority,
+                resource_domain,
                 bootfs,
                 registry,
                 &mut state.topology,

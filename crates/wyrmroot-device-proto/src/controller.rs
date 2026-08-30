@@ -3,8 +3,8 @@
 //! The controller installs the registry publication endpoint before any
 //! device resource exists.  Messages carry correlation only; the endpoint
 //! itself is transferred separately by the native Channel.  The status
-//! vocabulary contains waiting/operational outcomes only, so this codec
-//! cannot encode a device-bound success claim.
+//! vocabulary contains coordinator-owned waiting/operational outcomes only,
+//! so this codec cannot encode driver READY or publication success.
 
 use crate::coordinator::{
     AttemptGeneration, RegistryBinding, RegistryEndpoint, RegistryEndpointGeneration,
@@ -51,6 +51,9 @@ pub enum StatusCode {
     CleaningUp = 3,
     Backoff = 4,
     PermanentFailure = 5,
+    /// C4-only coordinator status: the exact current devmgr owns and has
+    /// validated its broad DeviceResource lease, but no driver has received it.
+    OperationalResourceOwned = 6,
 }
 
 impl StatusCode {
@@ -61,6 +64,7 @@ impl StatusCode {
             3 => Ok(Self::CleaningUp),
             4 => Ok(Self::Backoff),
             5 => Ok(Self::PermanentFailure),
+            6 => Ok(Self::OperationalResourceOwned),
             _ => Err(ControllerParseError::DeviceBoundStatus),
         }
     }
@@ -233,6 +237,7 @@ pub fn parse(bytes: &[u8]) -> Result<ControllerMessage, ControllerParseError> {
             if matches!(
                 status,
                 StatusCode::OperationalWaitingForDeviceBundle
+                    | StatusCode::OperationalResourceOwned
                     | StatusCode::CleaningUp
                     | StatusCode::Backoff
                     | StatusCode::PermanentFailure
@@ -313,12 +318,24 @@ fn validate_message(message: ControllerMessage) -> Result<(), ControllerParseErr
     }
     if let ControllerMessage::Status {
         status,
+        binding,
         attempt_generation,
         ..
     } = message
     {
         if status.is_device_bound() {
             return Err(ControllerParseError::DeviceBoundStatus);
+        }
+        if matches!(
+            status,
+            StatusCode::OperationalWaitingForDeviceBundle
+                | StatusCode::OperationalResourceOwned
+                | StatusCode::CleaningUp
+                | StatusCode::Backoff
+                | StatusCode::PermanentFailure
+        ) && binding.is_none()
+        {
+            return Err(ControllerParseError::StaleBinding);
         }
         if matches!(status, StatusCode::Backoff) && attempt_generation.is_none() {
             return Err(ControllerParseError::MissingAttempt);
@@ -451,6 +468,33 @@ mod tests {
         encode(status, &mut bytes).unwrap();
         assert_eq!(parse(&bytes), Ok(status));
         assert!(!StatusCode::OperationalWaitingForRegistry.is_device_bound());
+    }
+
+    #[test]
+    fn c4_resource_owned_status_requires_and_round_trips_exact_binding() {
+        let status = ControllerMessage::Status {
+            supervisor_generation: SUPERVISOR,
+            binding: Some(BINDING),
+            transaction_id: 4,
+            status: StatusCode::OperationalResourceOwned,
+            attempt_generation: None,
+        };
+        let mut bytes = [0; STATUS_BYTES];
+        encode(status, &mut bytes).unwrap();
+        assert_eq!(parse(&bytes), Ok(status));
+        assert!(!StatusCode::OperationalResourceOwned.is_device_bound());
+
+        let without_binding = ControllerMessage::Status {
+            supervisor_generation: SUPERVISOR,
+            binding: None,
+            transaction_id: 4,
+            status: StatusCode::OperationalResourceOwned,
+            attempt_generation: None,
+        };
+        assert_eq!(
+            encode(without_binding, &mut bytes),
+            Err(ControllerParseError::StaleBinding)
+        );
     }
 
     #[test]

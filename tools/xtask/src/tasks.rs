@@ -75,7 +75,6 @@ const DW1D6_ACTOR_TEST_ARGUMENTS: &[&str] = &[
     "wyrmroot-dw1d6-device-test",
     "--tests",
 ];
-
 pub(crate) struct LoaderToolchain {
     accepted: AcceptedToolchain,
     validation_report: String,
@@ -1326,6 +1325,12 @@ fn stderr_suffix(output: &Output) -> String {
 }
 
 pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<(), Failure> {
+    if matches!(filter, Some("wyr1c4" | "wyr1c4-native")) {
+        // WYR1-C4 is a guest-target compilation gate. The pinned host compiler
+        // intentionally does not know the x86_64-unknown-wyrmroot built-in
+        // target, so this must use the accepted immutable product compiler.
+        return crate::wyr1c::run_c4_native_checks(repository);
+    }
     for arguments in host_test_commands(filter)? {
         let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
         run_cargo(repository, &arguments)?;

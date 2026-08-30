@@ -49,7 +49,10 @@ use wyrmroot_bootstrap::run_init0_bootstrap_with_fault;
 use wyrmroot_bootstrap::run_init0_capability_bootstrap;
 #[cfg(feature = "native-loader-smoke-integration")]
 use wyrmroot_bootstrap::run_loader_smoke_bootstrap;
+#[cfg(not(feature = "wyr1c4-production"))]
 use wyrmroot_bootstrap::run_supervisor_bootstrap;
+#[cfg(feature = "wyr1c4-production")]
+use wyrmroot_bootstrap::run_supervisor_resource_domain_bootstrap;
 use wyrmroot_bootstrap::{BootstrapError, BootstrapSystem};
 use wyrmroot_bootstrap_proto as _;
 use wyrmroot_loader as _;
@@ -243,6 +246,7 @@ fn panic(_info: &PanicInfo<'_>) -> ! {
     feature = "i0-negative-capability-type",
     feature = "i0-negative-capability-rights",
     feature = "dw1d6-synthetic",
+    feature = "wyr1c4-production",
     feature = "i-capability-integration",
     feature = "wyr0-init0-integration"
 )))]
@@ -255,6 +259,27 @@ fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
     let mut loader = NativeLoaderPlatform;
     let mut supervisor = NativeSupervisionPlatform;
     match run_supervisor_bootstrap(
+        &mut system,
+        &mut loader,
+        &mut supervisor,
+        startup.bootstrap_channel().as_abi(),
+        deadline,
+    ) {
+        Ok(()) => 0,
+        Err(error) => system.exit_code(&error),
+    }
+}
+
+#[cfg(feature = "wyr1c4-production")]
+fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
+    let deadline = match monotonic_deadline_after(BOOTSTRAP_SUPERVISION_TIMEOUT_NS) {
+        Ok(deadline) => deadline,
+        Err(error) => return 0xB300_0000 | wyrmroot_runtime::native_error_code(error),
+    };
+    let mut system = NativeSystem::new();
+    let mut loader = NativeLoaderPlatform;
+    let mut supervisor = NativeSupervisionPlatform;
+    match run_supervisor_resource_domain_bootstrap(
         &mut system,
         &mut loader,
         &mut supervisor,

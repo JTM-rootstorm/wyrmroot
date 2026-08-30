@@ -30,9 +30,48 @@ fn native_path_keeps_the_c3_launch_surface_hardware_free() {
     assert!(NATIVE.contains("parse_constructed"));
     assert!(NATIVE.contains("accept_driver_control_ready"));
     assert!(NATIVE.contains("requested_rights: CHILD_CHANNEL_RIGHTS"));
-    assert!(!NATIVE.contains("DW_OBJECT_TYPE_DEVICE_RESOURCE"));
     assert!(!NATIVE.contains("DW_OBJECT_TYPE_INTERRUPT"));
     assert!(!NATIVE.contains("pio_"));
+}
+
+#[test]
+fn c4_claim_path_is_feature_gated_exact_and_stops_before_interrupt_creation() {
+    assert!(NATIVE.contains("#[cfg(feature = \"wyr1c4-production\")]"));
+    assert!(NATIVE.contains("parse_device_coordinator_resource_init"));
+    assert!(NATIVE.contains("RESOURCE_DOMAIN_CLAIM_RIGHTS"));
+    assert!(NATIVE.contains("require_device_resource_interrupt_feature"));
+    assert!(NATIVE.contains("claim_device_resource("));
+    assert!(NATIVE.contains("DEVICE_RESOURCE_CUSTODY_RIGHTS"));
+    assert!(NATIVE.contains("device_resource_info(resource)"));
+    assert!(NATIVE.contains("admit_device_resource(info)"));
+    assert!(NATIVE.contains("StatusCode::OperationalResourceOwned"));
+    let c4 = &NATIVE[NATIVE
+        .find("if action == ControllerAction::InitialPublicationBound")
+        .expect("C4 initial binding")..];
+    let feature = c4
+        .find("require_device_resource_interrupt_feature")
+        .expect("ABI feature gate");
+    let claim = c4.find("claim_device_resource(").expect("resource claim");
+    let owned = c4
+        .find("_device_resource = Some(resource)")
+        .expect("tracked ownership");
+    let metadata = c4
+        .find("device_resource_info(resource)")
+        .expect("typed resource metadata");
+    let retire_domain = c4
+        .find("if close_handle(domain).is_err()")
+        .expect("domain retirement");
+    let status = c4
+        .find("send_resident_status(bootstrap, &resident, status)")
+        .expect("resource-owned status");
+    assert!(feature < claim && claim < owned && owned < metadata);
+    assert!(metadata < retire_domain && retire_domain < status);
+    assert!(c4.contains("close_optional(_device_resource.take())"));
+    assert!(NATIVE.contains(
+        "#[cfg(not(feature = \"wyr1c4-production\"))]\n            if action == ControllerAction::InitialPublicationBound"
+    ));
+    assert!(!NATIVE.contains("create_interrupt("));
+    assert!(!NATIVE.contains("DW_OBJECT_TYPE_INTERRUPT"));
 }
 
 #[test]

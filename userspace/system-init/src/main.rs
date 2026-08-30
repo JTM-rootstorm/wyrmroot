@@ -21,15 +21,17 @@ use wyrmroot_runtime::{
     query_memory_object_size, receive_channel, send_channel, set_timer, unmap_bootfs, wait_many,
     wait_one,
 };
+#[cfg(not(feature = "wyr1c4-production"))]
+use wyrmroot_system_init::continue_system_init_product;
+#[cfg(feature = "wyr1c4-production")]
+use wyrmroot_system_init::continue_system_init_resource_product;
 #[cfg(not(any(feature = "wyr1-test-evidence", feature = "wyr1b-test-evidence")))]
 use wyrmroot_system_init::fatal_application_status;
 #[cfg(feature = "wyr1-test-evidence")]
 use wyrmroot_system_init::wyr1_test_failure_application_status;
 #[cfg(feature = "wyr1b-test-evidence")]
 use wyrmroot_system_init::wyr1b_test_failure_application_status;
-use wyrmroot_system_init::{
-    InitPlatform, ResidentSystemInit, Wyr1BPlatform, continue_system_init_product,
-};
+use wyrmroot_system_init::{InitPlatform, ResidentSystemInit, Wyr1BPlatform};
 use wyrmroot_wyr1b_gate_proto as _;
 
 struct NativeSystem;
@@ -137,13 +139,23 @@ fn main(startup: StartupBlock<'_>) -> u32 {
     let mut system = NativeSystem;
     let mut loader = NativeLoaderPlatform;
     let mut waits = NativeSupervisionPlatform;
-    match continue_system_init_product(
+    #[cfg(not(feature = "wyr1c4-production"))]
+    let result = continue_system_init_product(
         &mut system,
         &mut loader,
         &mut waits,
         startup.bootstrap_channel().as_abi(),
         continue_resident,
-    ) {
+    );
+    #[cfg(feature = "wyr1c4-production")]
+    let result = continue_system_init_resource_product(
+        &mut system,
+        &mut loader,
+        &mut waits,
+        startup.bootstrap_channel().as_abi(),
+        continue_resident,
+    );
+    match result {
         Ok(status) => status,
         Err(error) => {
             #[cfg(feature = "wyr1b-test-evidence")]

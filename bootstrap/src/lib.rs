@@ -123,6 +123,27 @@ compile_error!(
 ))]
 compile_error!("the WYR0-I capability relay is mutually exclusive with other bootstrap variants");
 
+#[cfg(all(
+    feature = "wyr1c4-production",
+    any(
+        feature = "dw1d6-synthetic",
+        feature = "wyr0-init0-integration",
+        feature = "native-loader-smoke-integration",
+        feature = "primordial-blocking-cleanup",
+        feature = "primordial-user-exception",
+        feature = "primordial-invalid-return",
+        feature = "i0-negative-malformed-elf",
+        feature = "i0-negative-malformed-startup",
+        feature = "i0-negative-capability-count",
+        feature = "i0-negative-capability-type",
+        feature = "i0-negative-capability-rights",
+        feature = "i-capability-integration"
+    )
+))]
+compile_error!(
+    "the WYR1-C4 production bootstrap is mutually exclusive with historical and test variants"
+);
+
 mod wyr0_compat;
 
 pub use wyr0_compat::{
@@ -154,16 +175,14 @@ use deepwyrm_syscall::{
 };
 use wyrmroot_bootfs::archive::{Archive, LookupError, ParseError};
 use wyrmroot_bootstrap_proto::{
-    BOOTSTRAP_INIT_V2_SIZE, BOOTSTRAP_READY_V2_SIZE, BootstrapMessage, DecodeError, InitMessageV2,
-    MAX_BOOTSTRAP_V2_HANDLES, ReadyMessageV2, decode,
-};
-#[cfg(feature = "dw1d6-synthetic")]
-use wyrmroot_bootstrap_proto::{
-    BOOTSTRAP_INIT_V3_SIZE, BOOTSTRAP_READY_V3_SIZE, MAX_BOOTSTRAP_HANDLES, ReadyMessageV3,
+    BOOTSTRAP_INIT_V2_SIZE, BOOTSTRAP_INIT_V3_SIZE, BOOTSTRAP_READY_V2_SIZE,
+    BOOTSTRAP_READY_V3_SIZE, BootstrapMessage, DecodeError, InitMessageV2, MAX_BOOTSTRAP_HANDLES,
+    MAX_BOOTSTRAP_V2_HANDLES, ReadyMessageV2, ReadyMessageV3, decode,
 };
 use wyrmroot_loader::launch::{LaunchError, LaunchProfile};
 use wyrmroot_loader::process::{
     LoadAuthority, LoadError, LoadRequest, LoadStage, LoadedProcess, LoaderPlatform,
+    ResourceDomainLoadRequest, load_resource_domain_process,
 };
 #[cfg(feature = "primordial-test-support")]
 use wyrmroot_runtime::PrimordialTestError;
@@ -174,7 +193,6 @@ use wyrmroot_runtime::{
     ReceiveCounts, SELF_ROOT_EXPECTATION, validate_bootstrap_channel,
     validate_init_capabilities_v2,
 };
-#[cfg(feature = "dw1d6-synthetic")]
 use wyrmroot_runtime::{RESOURCE_DOMAIN_TASK_GROUP_EXPECTATION, validate_init_capabilities_v3};
 
 #[cfg(feature = "dw1d6-synthetic")]
@@ -308,6 +326,106 @@ pub fn run_supervisor_bootstrap<
     send_primordial_ready(system, bootstrap_channel, transaction)
 }
 
+/// Launches the selected WYR1-C4 supervisor from an exact WRBP V3 handoff.
+/// Historical WRBP V2 media continue to use [`run_supervisor_bootstrap`].
+pub fn run_supervisor_resource_domain_bootstrap<
+    System: BootstrapSystem,
+    Loader: LoaderPlatform<Error = NativeError>,
+    Supervisor: SupervisionPlatform<Error = NativeError>,
+>(
+    system: &mut System,
+    loader: &mut Loader,
+    supervisor: &mut Supervisor,
+    bootstrap_channel: DwHandle,
+    deadline: deepwyrm_syscall::DwDeadline,
+) -> Result<(), BootstrapError> {
+    let channel_info = system
+        .query_capability_info(bootstrap_channel)
+        .map_err(BootstrapError::Native)?;
+    validate_bootstrap_channel(channel_info, BOOTSTRAP_CHANNEL_EXPECTATION)
+        .map_err(BootstrapError::BootstrapChannel)?;
+    let mut bytes = [0; BOOTSTRAP_INIT_V3_SIZE];
+    let mut handles = [DwReceivedHandleInfoV1::default(); MAX_BOOTSTRAP_HANDLES];
+    let counts = system
+        .receive_channel(bootstrap_channel, &mut bytes, &mut handles)
+        .map_err(BootstrapError::Native)?;
+    if counts.bytes > bytes.len() || counts.handles > handles.len() {
+        let initialized = core::cmp::min(counts.handles, handles.len());
+        let handles_cleanup = close_received_handles(system, &handles[..initialized]);
+        let channel_cleanup = system
+            .close_handle(bootstrap_channel)
+            .map_err(BootstrapError::Native);
+        handles_cleanup?;
+        channel_cleanup?;
+        return Err(BootstrapError::ReceiveCounts(counts));
+    }
+    let operation = (|| {
+        let message =
+            decode(&bytes[..counts.bytes], counts.handles).map_err(BootstrapError::Protocol)?;
+        let BootstrapMessage::InitV3(init) = message else {
+            return Err(BootstrapError::UnexpectedMessage);
+        };
+        if init.transaction_id != 1 {
+            return Err(BootstrapError::UnexpectedTransactionId);
+        }
+        let (authority, resource_domain) = validated_resource_domain_authority(system, &handles)?;
+        let plan = bootfs_mapping_plan(system, authority.bootfs)?;
+        let mut loaded = None;
+        system
+            .with_bootfs_bytes(authority.parent_root, authority.bootfs, plan, |bootfs| {
+                let archive = Archive::new(bootfs).map_err(BootstrapError::Bootfs)?;
+                let entry = archive
+                    .lookup(SYSTEM_INIT_PATH)
+                    .map_err(|_| BootstrapError::MissingRequiredEntry)?;
+                if !entry.is_executable() || entry.data().is_empty() {
+                    return Err(BootstrapError::RequiredEntryNotExecutable);
+                }
+                let display_path = entry
+                    .name_utf8()
+                    .map_err(|_| BootstrapError::MissingRequiredEntry)?;
+                loaded = Some(
+                    load_resource_domain_process(
+                        loader,
+                        authority,
+                        ResourceDomainLoadRequest {
+                            image: entry.data(),
+                            display_path,
+                            resource_domain,
+                            transaction_id: SYSTEM_INIT_TRANSACTION_ID,
+                        },
+                    )
+                    .map_err(BootstrapError::Loader)?,
+                );
+                Ok(())
+            })
+            .map_err(BootstrapError::Native)??;
+        let loaded = loaded.ok_or(BootstrapError::MissingLoadedProcess)?;
+        let ready = await_child_ready_profile_observed(
+            supervisor,
+            loaded.process,
+            loaded.launch_channel,
+            LaunchProfile::SupervisorResourceDomain,
+            SYSTEM_INIT_TRANSACTION_ID,
+            deadline,
+        );
+        if let Err(error) = ready {
+            let terminate = !error.process_exit_observed();
+            cleanup_loaded_process(system, loader, loaded, terminate)
+                .map_err(BootstrapError::Cleanup)?;
+            return Err(match error {
+                ObservedSupervisionError::Supervision(error) => BootstrapError::Supervision(error),
+                error => BootstrapError::ObservedSupervision(error),
+            });
+        }
+        cleanup_loaded_process(system, loader, loaded, false).map_err(BootstrapError::Cleanup)?;
+        Ok(init.transaction_id)
+    })();
+    let cleanup = close_received_handles(system, &handles[..counts.handles]);
+    let transaction = operation?;
+    cleanup?;
+    send_primordial_ready_v3(system, bootstrap_channel, transaction)
+}
+
 /// Runs the frozen selector-30 primordial transaction.  It consumes only WRBP
 /// V3, re-queries all four capabilities, creates the owner in the supplied
 /// resource domain, and never enters production `/system/init` behaviour.
@@ -342,7 +460,7 @@ pub fn run_d6_synthetic_bootstrap<
     if init.transaction_id != 1 {
         return Err(BootstrapError::UnexpectedTransactionId);
     }
-    let (authority, resource_domain) = validated_d6_authority(system, &handles)?;
+    let (authority, resource_domain) = validated_resource_domain_authority(system, &handles)?;
     let owner = load_d6_resource_owner(
         system,
         loader,
@@ -1370,8 +1488,7 @@ fn validated_load_authority<System: BootstrapSystem>(
     })
 }
 
-#[cfg(feature = "dw1d6-synthetic")]
-fn validated_d6_authority<System: BootstrapSystem>(
+fn validated_resource_domain_authority<System: BootstrapSystem>(
     system: &mut System,
     handles: &[DwReceivedHandleInfoV1; MAX_BOOTSTRAP_HANDLES],
 ) -> Result<(LoadAuthority, DwHandle), BootstrapError> {
@@ -1410,6 +1527,23 @@ fn validated_d6_authority<System: BootstrapSystem>(
         },
         handles[3].handle,
     ))
+}
+
+fn send_primordial_ready_v3<System: BootstrapSystem>(
+    system: &mut System,
+    bootstrap_channel: DwHandle,
+    transaction_id: u64,
+) -> Result<(), BootstrapError> {
+    let mut ready = [0_u8; BOOTSTRAP_READY_V3_SIZE];
+    let ready_size = ReadyMessageV3 { transaction_id }
+        .encode_into(&mut ready)
+        .map_err(BootstrapError::Protocol)?;
+    system
+        .send_channel(bootstrap_channel, &ready[..ready_size])
+        .map_err(BootstrapError::Native)?;
+    system
+        .close_handle(bootstrap_channel)
+        .map_err(BootstrapError::Native)
 }
 
 fn bootfs_mapping_plan<System: BootstrapSystem>(

@@ -122,6 +122,29 @@ fn d6_bootstrap_is_feature_gated_v3_and_keeps_actors_out_of_production_init() {
 }
 
 #[test]
+fn c4_bootstrap_is_a_distinct_production_v3_transaction() {
+    assert!(MANIFEST.contains("wyr1c4-production = [\"native-bootstrap\"]"));
+    assert!(MAIN_SOURCE.contains("run_supervisor_resource_domain_bootstrap"));
+    assert!(LIB_SOURCE.contains("pub fn run_supervisor_resource_domain_bootstrap"));
+    assert!(LIB_SOURCE.contains("let BootstrapMessage::InitV3(init) = message"));
+    assert!(LIB_SOURCE.contains("load_resource_domain_process("));
+    assert!(LIB_SOURCE.contains("LaunchProfile::SupervisorResourceDomain"));
+    assert!(LIB_SOURCE.contains("send_primordial_ready_v3"));
+    assert!(LIB_SOURCE.contains(
+        "the WYR1-C4 production bootstrap is mutually exclusive with historical and test variants"
+    ));
+
+    let production = LIB_SOURCE
+        .split("pub fn run_supervisor_resource_domain_bootstrap")
+        .nth(1)
+        .expect("C4 production bootstrap");
+    let d6 = production
+        .find("pub fn run_d6_synthetic_bootstrap")
+        .expect("D6 remains a later private transaction");
+    assert!(!production[..d6].contains("d6_"));
+}
+
+#[test]
 fn blocking_variant_does_not_import_the_ordinary_bootstrap_entry() {
     assert!(MAIN_SOURCE.contains("#[cfg(not(any("));
     assert!(MAIN_SOURCE.contains("feature = \"native-loader-smoke-integration\""));

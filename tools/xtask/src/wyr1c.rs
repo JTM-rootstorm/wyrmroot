@@ -96,6 +96,30 @@ const NATIVE_SPECS: [NativeSpec; 6] = [
     },
 ];
 
+const C4_NATIVE_CHECK_SPECS: [NativeSpec; 3] = [
+    NativeSpec {
+        label: "bootstrap-c4",
+        package: "wyrmroot-bootstrap",
+        binary: "wyrmroot-bootstrap",
+        features: "wyr1c4-production",
+        artifact: "wyrmroot-bootstrap",
+    },
+    NativeSpec {
+        label: "system-init-c4",
+        package: "wyrmroot-system-init",
+        binary: "system-init",
+        features: "wyr1c4-production",
+        artifact: "system-init",
+    },
+    NativeSpec {
+        label: "devmgr-c4",
+        package: "wyrmroot-devmgr",
+        binary: "devmgr",
+        features: "wyr1c4-production",
+        artifact: "devmgr",
+    },
+];
+
 struct NativeArtifact {
     spec: NativeSpec,
     bytes: Vec<u8>,
@@ -121,6 +145,78 @@ pub(crate) struct BuiltFrozenProduct {
     pub(crate) snapshot: FrozenSnapshot,
     pub(crate) validated: ValidatedFrozenProduct,
     pub(crate) publication: FrozenPublication,
+}
+
+pub(crate) fn run_c4_native_checks(repository: &Path) -> Result<(), Failure> {
+    reject_ambient_build_environment(env::vars_os())?;
+    let manifest = BuildManifest::load(repository)?;
+    let profile = manifest.validate_loader_build_readiness(repository)?;
+    let toolchain = crate::tasks::prepare_loader_toolchain(repository, &profile, &manifest)?;
+    let cargo_home = crate::tasks::project_cargo_home(repository, &manifest)?;
+    let project = crate::tasks::canonical_project_root(repository)?;
+    let project_directory = crate::secure_fs::Directory::open_exact(&project, "OS-Project root")?;
+    let tmp = match project_directory.open_child(".tmp", "project temporary root") {
+        Ok(directory) => directory,
+        Err(_) => project_directory.create_child(".tmp", 0o700, "project temporary root")?,
+    };
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Failure::task("system clock is before the Unix epoch"))?
+        .as_nanos();
+    let scratch_name = format!("wyr1c4-native-check-{}-{unique}", std::process::id());
+    let scratch = tmp.create_scratch(&scratch_name, "WYR1-C4 native-check scratch")?;
+    let check_result = scratch.with_inheritable_anchor("WYR1-C4 native-check scratch", |target| {
+        let flags = format!(
+            "{}\u{1f}-D\u{1f}warnings",
+            native_remap_flags(repository, &cargo_home, target.path())?
+        );
+        for spec in C4_NATIVE_CHECK_SPECS {
+            toolchain.accepted().verify_unchanged()?;
+            target.verify_unchanged("WYR1-C4 native-check scratch")?;
+            let status = Command::new(&toolchain.accepted().cargo)
+                .args([
+                    "check",
+                    "--offline",
+                    "--locked",
+                    "--target",
+                    NATIVE_TARGET,
+                    "--package",
+                    spec.package,
+                    "--bin",
+                    spec.binary,
+                    "--features",
+                    spec.features,
+                ])
+                .arg("--target-dir")
+                .arg(target.path())
+                .env("RUSTC", &toolchain.accepted().rustc)
+                .env("CARGO_HOME", &cargo_home)
+                .env("CARGO_ENCODED_RUSTFLAGS", &flags)
+                .env("CARGO_INCREMENTAL", "0")
+                .env("CARGO_NET_OFFLINE", "true")
+                .env("SOURCE_DATE_EPOCH", "0")
+                .env_remove("LD_AUDIT")
+                .env_remove("LD_LIBRARY_PATH")
+                .env_remove("LD_PRELOAD")
+                .current_dir(repository)
+                .stdin(Stdio::null())
+                .status()
+                .map_err(|error| {
+                    Failure::task(format!("could not check {}: {error}", spec.label))
+                })?;
+            target.verify_unchanged("WYR1-C4 native-check scratch")?;
+            if !status.success() {
+                return Err(Failure::task(format!(
+                    "WYR1-C4 canonical {} check failed",
+                    spec.label
+                )));
+            }
+        }
+        Ok(())
+    });
+    let result = scratch.finish(check_result);
+    toolchain.accepted().verify_unchanged()?;
+    result
 }
 
 pub(crate) struct FrozenDirectories {

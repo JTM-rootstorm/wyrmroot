@@ -572,10 +572,9 @@ fn require_success(status: DwStatus) -> Result<(), NativeError> {
     }
 }
 
-/// Selector-private facades may invoke generated syscall IDs through this
-/// crate-local boundary. It deliberately remains unavailable to ordinary
-/// runtime consumers.
-#[cfg(feature = "dw1d6-test-evidence")]
+/// Runtime facades may invoke generated syscall IDs through this crate-local
+/// boundary when the accepted consumer crate does not yet expose a typed
+/// wrapper. Public safe functions remain the only external surface.
 pub(crate) fn generated_raw_call(id: DwSyscallId, arguments: [u64; 6]) -> DwStatus {
     raw::call(id, arguments)
 }

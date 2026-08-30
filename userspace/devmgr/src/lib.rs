@@ -1,8 +1,8 @@
-//! Hardware-independent WYR1-C `/system/devmgr` foundation.
+//! WYR1-C `/system/devmgr` coordinator policy.
 //!
-//! Operational readiness means only that the exact immutable role manifest
-//! and the supervisor generation are valid. Hardware intake remains blocked on
-//! the separately reached DW1-D seam.
+//! Historical profiles stop after validating the immutable role manifest and
+//! supervisor generation. WYR1-C4 additionally admits one exact COM2
+//! DeviceResource claim without constructing an Interrupt or driver bundle.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -382,7 +382,11 @@ impl ResidentController {
                 self.last_transaction_id = transaction_id;
                 self.last_binding = Some(binding);
                 self.active_binding = Some(binding);
-                self.status.state = CoordinatorState::WaitingForDeviceBundle;
+                self.status.state = if self.bundle_generation.is_some() {
+                    CoordinatorState::Matched
+                } else {
+                    CoordinatorState::WaitingForDeviceBundle
+                };
                 Ok(ControllerAction::PublicationRebound)
             }
             ControllerMessage::Status { .. } => Err(DevmgrError::ControllerLifecycle),
@@ -410,6 +414,14 @@ impl ResidentController {
         let binding = match status {
             StatusCode::OperationalWaitingForRegistry => None,
             StatusCode::OperationalWaitingForDeviceBundle => self.active_binding,
+            StatusCode::OperationalResourceOwned => {
+                if self.status.state != CoordinatorState::Matched
+                    || self.bundle_generation.is_none()
+                {
+                    return Err(DevmgrError::ControllerLifecycle);
+                }
+                self.active_binding
+            }
             StatusCode::CleaningUp | StatusCode::Backoff | StatusCode::PermanentFailure => {
                 return Err(DevmgrError::ControllerLifecycle);
             }
@@ -582,7 +594,8 @@ mod tests {
     fn c4_admits_exact_claimed_resource_and_uses_kernel_lease_generation() {
         let mut resident =
             ResidentController::new(prepare_operational(&manifest(), 7).unwrap(), 41).unwrap();
-        resident.accept(install(binding(1, 7), 41), 0).unwrap();
+        let installed = binding(1, 7);
+        resident.accept(install(installed, 41), 0).unwrap();
         assert_eq!(
             resident.admit_device_resource(exact_resource(19)),
             Ok(BundleGeneration(19))
@@ -590,6 +603,48 @@ mod tests {
         assert_eq!(resident.bundle_generation(), Some(BundleGeneration(19)));
         assert_eq!(resident.status().state, CoordinatorState::Matched);
         assert!(resident.status().is_device_bound());
+        assert_eq!(
+            resident.report(StatusCode::OperationalResourceOwned),
+            Ok(ControllerMessage::Status {
+                supervisor_generation: SupervisorGeneration(7),
+                binding: Some(installed),
+                transaction_id: 41,
+                status: StatusCode::OperationalResourceOwned,
+                attempt_generation: None,
+            })
+        );
+        assert_eq!(
+            resident.admit_device_resource(exact_resource(20)),
+            Err(DevmgrError::ResourceIdentity)
+        );
+    }
+
+    #[test]
+    fn c4_registry_rebind_preserves_the_owned_resource_without_a_second_claim() {
+        let mut resident =
+            ResidentController::new(prepare_operational(&manifest(), 7).unwrap(), 41).unwrap();
+        let first = binding(1, 7);
+        resident.accept(install(first, 41), 0).unwrap();
+        resident.admit_device_resource(exact_resource(19)).unwrap();
+        resident.publication_peer_closed().unwrap();
+
+        let second = binding(2, 8);
+        assert_eq!(
+            resident.accept(rebind(second, 42), 1),
+            Ok(ControllerAction::PublicationRebound)
+        );
+        assert_eq!(resident.bundle_generation(), Some(BundleGeneration(19)));
+        assert_eq!(resident.status().state, CoordinatorState::Matched);
+        assert_eq!(
+            resident.report(StatusCode::OperationalResourceOwned),
+            Ok(ControllerMessage::Status {
+                supervisor_generation: SupervisorGeneration(7),
+                binding: Some(second),
+                transaction_id: 42,
+                status: StatusCode::OperationalResourceOwned,
+                attempt_generation: None,
+            })
+        );
         assert_eq!(
             resident.admit_device_resource(exact_resource(20)),
             Err(DevmgrError::ResourceIdentity)

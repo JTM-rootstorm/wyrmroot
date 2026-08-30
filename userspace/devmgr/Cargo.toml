@@ -19,6 +19,7 @@ required-features = ["native-devmgr"]
 [features]
 default = []
 native-devmgr = ["dep:wyrmroot-loader", "dep:wyrmroot-runtime"]
+wyr1c4-production = ["native-devmgr"]
 
 [dependencies]
 deepwyrm-syscall.workspace = true

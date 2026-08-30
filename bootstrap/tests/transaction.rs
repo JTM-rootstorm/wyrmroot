@@ -20,6 +20,7 @@ use wyrmroot_bootstrap::{
     I0_NEGATIVE_MALFORMED_STARTUP_DETAIL, INIT0_PATH, SYSTEM_INIT_PATH, SYSTEM_INIT_TRANSACTION_ID,
     i0_negative_terminal_detail, run_bootstrap, run_init0_bootstrap,
     run_init0_bootstrap_with_fault, run_supervisor_bootstrap,
+    run_supervisor_resource_domain_bootstrap,
 };
 #[cfg(feature = "loader-smoke-integration")]
 use wyrmroot_bootstrap::{LOADER_SMOKE_PATH, run_loader_smoke_bootstrap};
@@ -29,7 +30,8 @@ use wyrmroot_bootstrap::{
     run_init0_capability_bootstrap,
 };
 use wyrmroot_bootstrap_proto::{
-    BOOTSTRAP_INIT_V2_SIZE, BootstrapMessage, InitMessageV2, ReadyMessageV2, decode,
+    BOOTSTRAP_INIT_V2_SIZE, BOOTSTRAP_INIT_V3_SIZE, BootstrapMessage, InitMessageV2, InitMessageV3,
+    ReadyMessageV2, ReadyMessageV3, decode,
 };
 use wyrmroot_loader::{
     elf::ElfError,
@@ -41,7 +43,8 @@ use wyrmroot_loader::{
 };
 use wyrmroot_runtime::{
     BOOTFS_EXPECTATION, BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo,
-    LOADER_TASK_GROUP_EXPECTATION, MappingPlan, NativeError, ReceiveCounts, SELF_ROOT_EXPECTATION,
+    LOADER_TASK_GROUP_EXPECTATION, MappingPlan, NativeError,
+    RESOURCE_DOMAIN_TASK_GROUP_EXPECTATION, ReceiveCounts, SELF_ROOT_EXPECTATION,
 };
 use wyrmroot_runtime::{
     ExitObservedReadinessError, ExitValidationError, ObservedSupervisionError, SupervisionError,
@@ -53,6 +56,7 @@ const CHANNEL: DwHandle = DwHandle(11);
 const ROOT: DwHandle = DwHandle(21);
 const BOOTFS: DwHandle = DwHandle(22);
 const TASK_GROUP: DwHandle = DwHandle(23);
+const RESOURCE_DOMAIN: DwHandle = DwHandle(24);
 #[cfg(feature = "i-capability-relay")]
 const WRCAP1_READABLE_EVENTS: [deepwyrm_syscall::DwSignals; WRCAP1_RECORD_COUNT] =
     [DW_SIGNAL_READABLE; WRCAP1_RECORD_COUNT];
@@ -269,9 +273,10 @@ fn supervision_exit_code_preserves_exact_descendant_application_status() {
 }
 
 struct Fixture {
-    init: [u8; BOOTSTRAP_INIT_V2_SIZE],
+    init: [u8; BOOTSTRAP_INIT_V3_SIZE],
     init_size: usize,
-    handles: [DwReceivedHandleInfoV1; 3],
+    startup_handle_count: usize,
+    handles: [DwReceivedHandleInfoV1; 4],
     bootfs: Vec<u8>,
     sent: Vec<u8>,
     closed: Vec<DwHandle>,
@@ -287,11 +292,12 @@ struct Fixture {
 
 impl Fixture {
     fn valid() -> Self {
-        let mut init = [0_u8; BOOTSTRAP_INIT_V2_SIZE];
+        let mut init = [0_u8; BOOTSTRAP_INIT_V3_SIZE];
         let init_size = InitMessageV2::primordial().encode_into(&mut init).unwrap();
         Self {
             init,
             init_size,
+            startup_handle_count: 3,
             handles: [
                 DwReceivedHandleInfoV1 {
                     handle: ROOT,
@@ -311,6 +317,7 @@ impl Fixture {
                     object_type: DW_OBJECT_TYPE_TASK_GROUP,
                     ..DwReceivedHandleInfoV1::default()
                 },
+                DwReceivedHandleInfoV1::default(),
             ],
             bootfs: bootfs(&[(HELLO_PATH, b"hello"), (INIT0_PATH, b"init0")]),
             sent: Vec::new(),
@@ -324,6 +331,22 @@ impl Fixture {
             relay_send_would_block_once: false,
             startup_counts: None,
         }
+    }
+
+    fn valid_v3() -> Self {
+        let mut fixture = Self::valid();
+        fixture.init.fill(0);
+        fixture.init_size = InitMessageV3::primordial()
+            .encode_into(&mut fixture.init)
+            .unwrap();
+        fixture.startup_handle_count = 4;
+        fixture.handles[3] = DwReceivedHandleInfoV1 {
+            handle: RESOURCE_DOMAIN,
+            rights: RESOURCE_DOMAIN_TASK_GROUP_EXPECTATION.rights,
+            object_type: DW_OBJECT_TYPE_TASK_GROUP,
+            ..DwReceivedHandleInfoV1::default()
+        };
+        fixture
     }
 }
 
@@ -349,6 +372,10 @@ impl BootstrapSystem for Fixture {
                 object_type: DW_OBJECT_TYPE_TASK_GROUP,
                 rights: LOADER_TASK_GROUP_EXPECTATION.rights,
             }),
+            RESOURCE_DOMAIN => Ok(CapabilityInfo {
+                object_type: DW_OBJECT_TYPE_TASK_GROUP,
+                rights: RESOURCE_DOMAIN_TASK_GROUP_EXPECTATION.rights,
+            }),
             _ => Err(NativeError::Status(DW_STATUS_BAD_HANDLE)),
         }
     }
@@ -361,10 +388,11 @@ impl BootstrapSystem for Fixture {
     ) -> Result<ReceiveCounts, NativeError> {
         if channel == CHANNEL {
             bytes[..self.init_size].copy_from_slice(&self.init[..self.init_size]);
-            handles[..3].copy_from_slice(&self.handles);
+            handles[..self.startup_handle_count]
+                .copy_from_slice(&self.handles[..self.startup_handle_count]);
             return Ok(self.startup_counts.unwrap_or(ReceiveCounts {
                 bytes: self.init_size,
-                handles: 3,
+                handles: self.startup_handle_count,
             }));
         }
         let record = self
@@ -557,6 +585,14 @@ impl SmokeLoader {
         }
     }
 
+    fn resource_supervisor() -> Self {
+        Self {
+            expected_profile: launch::LaunchProfile::SupervisorResourceDomain,
+            expected_transaction: SYSTEM_INIT_TRANSACTION_ID,
+            ..Self::new()
+        }
+    }
+
     fn handle(&mut self) -> DwHandle {
         let handle = DwHandle(self.next);
         self.next += 1;
@@ -673,6 +709,12 @@ impl LoaderPlatform for SmokeLoader {
                 rights: wyrmroot_loader::launch::LOADER_TASK_GROUP_RIGHTS,
                 ..DwReceivedHandleInfoV1::default()
             },
+            DwReceivedHandleInfoV1 {
+                handle: DwHandle(4),
+                object_type: DW_OBJECT_TYPE_TASK_GROUP,
+                rights: wyrmroot_loader::launch::RESOURCE_DOMAIN_CUSTODY_RIGHTS,
+                ..DwReceivedHandleInfoV1::default()
+            },
         ];
         let handles = match self.expected_profile {
             launch::LaunchProfile::Hello
@@ -686,6 +728,13 @@ impl LoaderPlatform for SmokeLoader {
             | launch::LaunchProfile::CapabilityController
             | launch::LaunchProfile::Supervisor => {
                 assert_eq!(transfers.len(), 3);
+                assert!(transfers.iter().all(|transfer| {
+                    transfer.operation == deepwyrm_syscall::DW_HANDLE_TRANSFER_MOVE
+                }));
+                &received[..3]
+            }
+            launch::LaunchProfile::SupervisorResourceDomain => {
+                assert_eq!(transfers.len(), 4);
                 assert!(transfers.iter().all(|transfer| {
                     transfer.operation == deepwyrm_syscall::DW_HANDLE_TRANSFER_MOVE
                 }));
@@ -708,8 +757,7 @@ impl LoaderPlatform for SmokeLoader {
             | launch::LaunchProfile::DeviceCoordinator
             | launch::LaunchProfile::DeviceCoordinatorResourceDomain
             | launch::LaunchProfile::DeviceDriver
-            | launch::LaunchProfile::D6ResourceOwner
-            | launch::LaunchProfile::SupervisorResourceDomain => {
+            | launch::LaunchProfile::D6ResourceOwner => {
                 return Err(NativeError::Status(DW_STATUS_BAD_HANDLE));
             }
         };
@@ -798,6 +846,15 @@ impl SmokeSupervisor {
             events: &[true],
             transaction_id: SYSTEM_INIT_TRANSACTION_ID,
             ready_profile: launch::LaunchProfile::Supervisor,
+            ..Self::successful()
+        }
+    }
+
+    fn successful_resource_supervisor() -> Self {
+        Self {
+            events: &[true],
+            transaction_id: SYSTEM_INIT_TRANSACTION_ID,
+            ready_profile: launch::LaunchProfile::SupervisorResourceDomain,
             ..Self::successful()
         }
     }
@@ -1025,6 +1082,50 @@ fn wyr1_primordial_launches_only_system_init_and_retires_after_operational_ready
             ROOT,
             BOOTFS,
             TASK_GROUP,
+            CHANNEL
+        ]
+    );
+}
+
+#[test]
+fn c4_primordial_uses_exact_v3_resource_domain_launch_and_ready() {
+    let image = executable();
+    let mut fixture = Fixture::valid_v3();
+    fixture.bootfs = bootfs(&[(SYSTEM_INIT_PATH, &image)]);
+    let mut loader = SmokeLoader::resource_supervisor();
+    let mut supervisor = SmokeSupervisor::successful_resource_supervisor();
+
+    assert_eq!(
+        run_supervisor_resource_domain_bootstrap(
+            &mut fixture,
+            &mut loader,
+            &mut supervisor,
+            CHANNEL,
+            DwDeadline(99),
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        loader.init_profiles,
+        [launch::LaunchProfile::SupervisorResourceDomain]
+    );
+    assert!(loader.terminated.is_empty());
+    assert_eq!(supervisor.received, 1);
+    assert_eq!(
+        decode(&fixture.sent, 0),
+        Ok(BootstrapMessage::ReadyV3(ReadyMessageV3 {
+            transaction_id: 1
+        }))
+    );
+    assert_eq!(
+        fixture.closed,
+        [
+            DwHandle(42),
+            DwHandle(43),
+            ROOT,
+            BOOTFS,
+            TASK_GROUP,
+            RESOURCE_DOMAIN,
             CHANNEL
         ]
     );

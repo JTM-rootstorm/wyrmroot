@@ -35,6 +35,7 @@ i0-negative-capability-rights = ["native-bootstrap"]
 i-capability-relay = []
 i-capability-integration = ["native-bootstrap", "i-capability-relay"]
 dw1d6-synthetic = ["native-bootstrap", "wyrmroot-runtime/dw1d6-test-evidence", "dep:wyrmroot-dw1d6-device-test"]
+wyr1c4-production = ["native-bootstrap"]
 
 [dependencies]
 deepwyrm-syscall.workspace = true

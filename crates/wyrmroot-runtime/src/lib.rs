@@ -15,6 +15,7 @@ mod bounded_accounting;
     reason = "WYR0-I safe capability wrappers confine mapped-slice and generated raw-call boundaries"
 )]
 mod capability_native;
+mod device;
 mod diagnostics;
 #[cfg(feature = "dw1d6-test-evidence")]
 #[allow(
@@ -72,11 +73,12 @@ pub use capability_native::{WYR1_EVIDENCE_RECORD_BYTES, submit_wyr1_evidence};
 pub use capability_native::{WYR1B_EVIDENCE_RECORD_BYTES, submit_wyr1b_evidence};
 #[cfg(feature = "dw1b-test-evidence")]
 pub use capability_native::{arm_dw1b_preemption, submit_dw1b_progress};
-#[cfg(feature = "dw1d6-test-evidence")]
-pub use dw1d6::{
-    D6ReportEvent, claim_device_resource, create_interrupt, d6_arm, d6_bind, d6_deliver, d6_report,
-    device_pio_read, device_pio_write, device_resource_info, interrupt_ack, interrupt_info,
+pub use device::{
+    abi_info, claim_device_resource, create_interrupt, device_pio_read, device_pio_write,
+    device_resource_info, interrupt_ack, interrupt_info, require_device_resource_interrupt_feature,
 };
+#[cfg(feature = "dw1d6-test-evidence")]
+pub use dw1d6::{D6ReportEvent, d6_arm, d6_bind, d6_deliver, d6_report};
 pub use loader_native::{LOADER_ABORT_CODE, NativeLoaderPlatform};
 pub use native::{
     MappedBootfs, NativeError, NativeOutputError, PANIC_EXIT_CODE, ReceiveCounts, close_handle,
