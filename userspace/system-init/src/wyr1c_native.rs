@@ -15,6 +15,8 @@ use wyrmroot_device_proto::coordinator::{
     RegistryEndpoint, RegistryEndpointGeneration, RegistryEndpointId, RegistryGeneration,
     SupervisorGeneration,
 };
+#[cfg(feature = "wyr1c6-selector29")]
+use wyrmroot_device_proto::driver_launch::{C6_FACT_BYTES, C6Fact, parse_c6_fact};
 #[cfg(feature = "wyr1c6-production")]
 use wyrmroot_device_proto::driver_launch::{encode_reaped, parse_driver_retired};
 use wyrmroot_device_proto::{
@@ -115,6 +117,38 @@ pub(crate) struct ResidentState {
     next_controller_transaction: u64,
     driver: Option<DriverNativeAttempt>,
     last_reaped_driver: Option<DriverLaunchRequest>,
+    #[cfg(feature = "wyr1c6-selector29")]
+    pub(crate) c6_evidence: Option<crate::wyr1c6_gate::EvidenceLog>,
+    #[cfg(feature = "wyr1c6-selector29")]
+    c6_d1_lease: Option<u64>,
+    #[cfg(feature = "wyr1c6-selector29")]
+    c6_d1_supervisor: Option<u64>,
+    #[cfg(feature = "wyr1c6-selector29")]
+    c6_d2_lease: Option<u64>,
+    #[cfg(feature = "wyr1c6-selector29")]
+    c6_d2_supervisor: Option<u64>,
+    #[cfg(feature = "wyr1c6-selector29")]
+    c6_d2_role: Option<u64>,
+    #[cfg(feature = "wyr1c6-selector29")]
+    c6_u1_irq: Option<u64>,
+    #[cfg(feature = "wyr1c6-selector29")]
+    c6_u1_attempt: Option<u64>,
+    #[cfg(feature = "wyr1c6-selector29")]
+    c6_u1_endpoint: Option<u64>,
+    #[cfg(feature = "wyr1c6-selector29")]
+    c6_p1_binding: Option<u64>,
+    #[cfg(feature = "wyr1c6-selector29")]
+    c6_p1_endpoint: Option<u64>,
+    #[cfg(feature = "wyr1c6-selector29")]
+    c6_u2_irq: Option<u64>,
+    #[cfg(feature = "wyr1c6-selector29")]
+    c6_u2_attempt: Option<u64>,
+    #[cfg(feature = "wyr1c6-selector29")]
+    c6_u2_endpoint: Option<u64>,
+    #[cfg(feature = "wyr1c6-selector29")]
+    c6_p2_binding: Option<u64>,
+    #[cfg(feature = "wyr1c6-selector29")]
+    c6_p2_endpoint: Option<u64>,
     last_driver_attempt: u64,
     last_driver_session: u64,
     last_driver_endpoint: u64,
@@ -228,6 +262,18 @@ where
     let device_manifest = DeviceManifest::parse(manifest_entry.data())
         .map_err(|_| InitError::WrongManifestProfile)?;
     let manifest = crate::wyr1b_native::validate_retained_bootfs_c1(bootfs)?;
+    #[cfg(feature = "wyr1c6-selector29")]
+    let c6_evidence = {
+        let entry = archive
+            .lookup(crate::wyr1c6_gate::GATE_PATH.as_bytes())
+            .map_err(map_lookup)?;
+        let config =
+            crate::wyr1c6_gate::parse_config(entry.data()).map_err(InitError::Wyr1C6GateConfig)?;
+        Some(
+            crate::wyr1c6_gate::EvidenceLog::new(config.nonce)
+                .map_err(InitError::Wyr1C6GateConfig)?,
+        )
+    };
     validate_device_identity(
         device_manifest,
         manifest.executable_identity(RoleId::Uart16550d)?,
@@ -302,6 +348,38 @@ where
         next_controller_transaction: devmgr.next_controller_transaction,
         driver: None,
         last_reaped_driver: None,
+        #[cfg(feature = "wyr1c6-selector29")]
+        c6_evidence,
+        #[cfg(feature = "wyr1c6-selector29")]
+        c6_d1_lease: None,
+        #[cfg(feature = "wyr1c6-selector29")]
+        c6_d1_supervisor: None,
+        #[cfg(feature = "wyr1c6-selector29")]
+        c6_d2_lease: None,
+        #[cfg(feature = "wyr1c6-selector29")]
+        c6_d2_supervisor: None,
+        #[cfg(feature = "wyr1c6-selector29")]
+        c6_d2_role: None,
+        #[cfg(feature = "wyr1c6-selector29")]
+        c6_u1_irq: None,
+        #[cfg(feature = "wyr1c6-selector29")]
+        c6_u1_attempt: None,
+        #[cfg(feature = "wyr1c6-selector29")]
+        c6_u1_endpoint: None,
+        #[cfg(feature = "wyr1c6-selector29")]
+        c6_p1_binding: None,
+        #[cfg(feature = "wyr1c6-selector29")]
+        c6_p1_endpoint: None,
+        #[cfg(feature = "wyr1c6-selector29")]
+        c6_u2_irq: None,
+        #[cfg(feature = "wyr1c6-selector29")]
+        c6_u2_attempt: None,
+        #[cfg(feature = "wyr1c6-selector29")]
+        c6_u2_endpoint: None,
+        #[cfg(feature = "wyr1c6-selector29")]
+        c6_p2_binding: None,
+        #[cfg(feature = "wyr1c6-selector29")]
+        c6_p2_endpoint: None,
         last_driver_attempt: 0,
         last_driver_session: 0,
         last_driver_endpoint: 0,
@@ -911,6 +989,8 @@ fn receive_controller_status<S: InitPlatform>(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DevmgrControlInput {
     Status(ControllerMessage),
+    #[cfg(feature = "wyr1c6-selector29")]
+    C6Fact(C6Fact),
     DriverLaunch {
         request: DriverLaunchRequest,
         child_endpoint: DwHandle,
@@ -934,6 +1014,16 @@ fn receive_devmgr_control<S: InitPlatform>(
         return Err(InitError::WrongManifestProfile);
     }
     match &bytes[..4] {
+        #[cfg(feature = "wyr1c6-selector29")]
+        b"WRCF" => {
+            if counts.handles != 0 || counts.bytes != C6_FACT_BYTES {
+                close_received_native(system, &handles, counts.handles)?;
+                return Err(InitError::WrongManifestProfile);
+            }
+            let fact = parse_c6_fact(&bytes[..counts.bytes])
+                .map_err(|_| InitError::WrongManifestProfile)?;
+            Ok(DevmgrControlInput::C6Fact(fact))
+        }
         b"WRCS" => {
             if counts.handles != 0 {
                 close_received_native(system, &handles, counts.handles)?;
@@ -1015,6 +1105,245 @@ fn close_received_native<S: InitPlatform>(
     } else {
         Ok(())
     }
+}
+
+#[cfg(feature = "wyr1c6-selector29")]
+fn accept_c6_fact(resident: &mut ResidentSystemInit, fact: C6Fact) -> Result<(), InitError> {
+    #[cfg(feature = "wyr1c6-selector29")]
+    if fact.event == 19 {
+        let d1_lease = resident
+            .wyr1c
+            .as_ref()
+            .and_then(|state| state.c6_d1_lease)
+            .ok_or(InitError::WrongActivationOrder)?;
+        if fact.lease > d1_lease
+            && fact.binding == 1
+            && fact.value != 0
+            && fact.aux == COM2_ROLE_ID.0
+        {
+            accept_c6_fact(
+                resident,
+                C6Fact {
+                    event: 18,
+                    lease: d1_lease,
+                    binding: 0,
+                    value: 1,
+                    aux: 0,
+                },
+            )?;
+        }
+    }
+    let state = resident
+        .wyr1c
+        .as_mut()
+        .ok_or(InitError::WrongActivationOrder)?;
+    let valid = match fact.event {
+        1 => fact.lease != 0 && fact.binding == 1 && fact.value != 0 && fact.aux == COM2_ROLE_ID.0,
+        2 => Some(fact.lease) == state.c6_d1_lease && fact.binding == 1,
+        3 => {
+            fact.lease == state.c6_d1_lease.unwrap_or(0)
+                && fact.binding != 0
+                && fact.value != 0
+                && fact.aux != 0
+        }
+        4 | 6 | 8 => {
+            fact.lease == state.c6_d1_lease.unwrap_or(0)
+                && Some(fact.binding) == state.c6_u1_irq
+                && Some(fact.value) == state.c6_u1_attempt
+                && Some(fact.aux) == state.c6_u1_endpoint
+        }
+        5 => {
+            fact.lease == state.c6_d1_lease.unwrap_or(0)
+                && fact.binding != 0
+                && fact.value == state.c6_u1_attempt.unwrap_or(0)
+                && fact.aux != 0
+        }
+        7 => {
+            fact.lease == state.c6_d1_lease.unwrap_or(0)
+                && Some(fact.binding) == state.c6_p1_binding
+                && Some(fact.value) == state.c6_u1_attempt
+                && Some(fact.aux) == state.c6_p1_endpoint
+        }
+        9 => {
+            fact.lease == state.c6_d1_lease.unwrap_or(0)
+                && Some(fact.binding) == state.c6_u1_irq
+                && fact.value == 1
+                && fact.aux == 0
+        }
+        10 => {
+            fact.lease == state.c6_d1_lease.unwrap_or(0)
+                && fact.binding != 0
+                && Some(fact.binding) != state.c6_u1_irq
+                && fact.value > state.c6_u1_attempt.unwrap_or(0)
+                && fact.aux != 0
+        }
+        11 => {
+            fact.lease == state.c6_d1_lease.unwrap_or(0)
+                && Some(fact.binding) == state.c6_u2_irq
+                && Some(fact.value) == state.c6_u2_attempt
+                && Some(fact.aux) == state.c6_u2_endpoint
+        }
+        12 => {
+            fact.lease == state.c6_d1_lease.unwrap_or(0)
+                && fact.binding > state.c6_p1_binding.unwrap_or(0)
+                && Some(fact.value) == state.c6_u2_attempt
+                && fact.aux != 0
+        }
+        13 => {
+            fact.lease == state.c6_d1_lease.unwrap_or(0)
+                && Some(fact.binding) == state.c6_p1_binding
+                && Some(fact.value) == state.c6_u1_attempt
+                && fact.aux == 3
+        }
+        14 => {
+            fact.lease == state.c6_d1_lease.unwrap_or(0)
+                && Some(fact.binding) == state.c6_p2_binding
+                && Some(fact.value) == state.c6_d1_supervisor
+                && fact.aux == 0
+        }
+        15 => {
+            fact.lease == state.c6_d1_lease.unwrap_or(0)
+                && Some(fact.binding) == state.c6_p2_binding
+                && Some(fact.value) == state.c6_u2_attempt
+                && Some(fact.aux) == state.c6_p2_endpoint
+        }
+        16 => {
+            fact.lease == state.c6_d1_lease.unwrap_or(0)
+                && Some(fact.binding) == state.c6_u2_irq
+                && Some(fact.value) == state.c6_u2_attempt
+                && Some(fact.aux) == state.c6_u2_endpoint
+        }
+        17 => {
+            fact.lease == state.c6_d1_lease.unwrap_or(0)
+                && fact.binding == 0
+                && Some(fact.value) == state.c6_d1_supervisor
+                && fact.aux == 1
+        }
+        18 => {
+            fact.lease == state.c6_d1_lease.unwrap_or(0)
+                && fact.binding == 0
+                && fact.value == 1
+                && fact.aux == 0
+        }
+        19 => {
+            fact.lease > state.c6_d1_lease.unwrap_or(0)
+                && fact.binding == 1
+                && fact.value != 0
+                && fact.aux != 0
+        }
+        20..=22 => {
+            fact.lease == state.c6_d2_lease.unwrap_or(0)
+                && fact.binding == 1
+                && Some(fact.value) == state.c6_d2_supervisor
+                && Some(fact.aux) == state.c6_d2_role
+        }
+        23 => {
+            fact.lease == state.c6_d2_lease.unwrap_or(0)
+                && fact.binding == 0
+                && fact.value == 3
+                && fact.aux == 0
+        }
+        24 => {
+            fact.lease == state.c6_d2_lease.unwrap_or(0)
+                && fact.binding == 0
+                && fact.value == 0
+                && fact.aux == 0
+        }
+        25 => fact.lease == state.c6_d2_lease.unwrap_or(0) && fact.binding == 0,
+        26 => {
+            fact.lease == state.c6_d2_lease.unwrap_or(0)
+                && fact.binding == 0
+                && fact.value == 4
+                && fact.aux == 25_000_000
+        }
+        _ => false,
+    };
+    if !valid {
+        return Err(InitError::WrongManifestProfile);
+    }
+    let log = state
+        .c6_evidence
+        .as_mut()
+        .ok_or(InitError::WrongActivationOrder)?;
+    let event = match fact.event {
+        1 => crate::wyr1c6_gate::GateEvent::D1Begin,
+        2 => crate::wyr1c6_gate::GateEvent::D1Lease,
+        3 => crate::wyr1c6_gate::GateEvent::U1Start,
+        4 => crate::wyr1c6_gate::GateEvent::U1Ready,
+        5 => crate::wyr1c6_gate::GateEvent::P1Publish,
+        6 => crate::wyr1c6_gate::GateEvent::U1Failure,
+        7 => crate::wyr1c6_gate::GateEvent::P1Retire,
+        8 => crate::wyr1c6_gate::GateEvent::U1Reap,
+        9 => crate::wyr1c6_gate::GateEvent::OldIrqReleased,
+        10 => crate::wyr1c6_gate::GateEvent::U2Start,
+        11 => crate::wyr1c6_gate::GateEvent::U2Ready,
+        12 => crate::wyr1c6_gate::GateEvent::P2Publish,
+        13 => crate::wyr1c6_gate::GateEvent::StaleReject,
+        14 => crate::wyr1c6_gate::GateEvent::D1Failure,
+        15 => crate::wyr1c6_gate::GateEvent::P2Retire,
+        16 => crate::wyr1c6_gate::GateEvent::U2Reap,
+        17 => crate::wyr1c6_gate::GateEvent::D1GenerationClean,
+        18 => crate::wyr1c6_gate::GateEvent::D1GrantAvailable,
+        19 => crate::wyr1c6_gate::GateEvent::D2Lease,
+        20 => crate::wyr1c6_gate::GateEvent::D2Start,
+        21 => crate::wyr1c6_gate::GateEvent::D2Claim,
+        22 => crate::wyr1c6_gate::GateEvent::D2Ready,
+        23 => crate::wyr1c6_gate::GateEvent::NoAuthority,
+        24 => crate::wyr1c6_gate::GateEvent::NoIo,
+        25 => crate::wyr1c6_gate::GateEvent::Accounting,
+        26 => crate::wyr1c6_gate::GateEvent::Bounded,
+        _ => return Err(InitError::WrongManifestProfile),
+    };
+    log.record(event, fact.lease, fact.binding, fact.value, fact.aux)
+        .map_err(|_| InitError::WrongManifestProfile)?;
+    match fact.event {
+        1 => {
+            state.c6_d1_lease = Some(fact.lease);
+            state.c6_d1_supervisor = Some(fact.value);
+        }
+        3 => {
+            state.c6_u1_irq = Some(fact.binding);
+            state.c6_u1_attempt = Some(fact.value);
+            state.c6_u1_endpoint = Some(fact.aux);
+        }
+        5 => {
+            state.c6_p1_binding = Some(fact.binding);
+            state.c6_p1_endpoint = Some(fact.aux);
+        }
+        10 => {
+            state.c6_u2_irq = Some(fact.binding);
+            state.c6_u2_attempt = Some(fact.value);
+            state.c6_u2_endpoint = Some(fact.aux);
+        }
+        12 => {
+            state.c6_p2_binding = Some(fact.binding);
+            state.c6_p2_endpoint = Some(fact.aux);
+        }
+        19 => {
+            state.c6_d2_lease = Some(fact.lease);
+            state.c6_d2_supervisor = Some(fact.value);
+            state.c6_d2_role = Some(fact.aux);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[cfg(feature = "wyr1c6-selector29")]
+pub fn finish_c6_evidence(resident: &mut ResidentSystemInit) -> Result<bool, InitError> {
+    let state = resident
+        .wyr1c
+        .as_mut()
+        .ok_or(InitError::WrongActivationOrder)?;
+    let log = state
+        .c6_evidence
+        .as_mut()
+        .ok_or(InitError::WrongActivationOrder)?;
+    if !log.ready_for_terminal() {
+        return Ok(false);
+    }
+    log.finish().map_err(|_| InitError::WrongManifestProfile)?;
+    Ok(true)
 }
 
 fn validate_driver_actor(bootfs: &[u8], request: DriverLaunchRequest) -> Result<&[u8], InitError> {
@@ -1349,6 +1678,10 @@ where
                                 .ok_or(InitError::WrongActivationOrder)?;
                             let devmgr = state.devmgr.ok_or(InitError::WrongActivationOrder)?;
                             match receive_devmgr_control(system, devmgr.loaded.launch_channel) {
+                                #[cfg(feature = "wyr1c6-selector29")]
+                                Ok(DevmgrControlInput::C6Fact(fact)) => {
+                                    accept_c6_fact(resident, fact)
+                                }
                                 Ok(DevmgrControlInput::Status(message)) => {
                                     let duplicate =
                                         state.registry.is_none() && state.waiting_registry_observed;
@@ -1574,6 +1907,12 @@ where
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
+    #[cfg(feature = "wyr1c6-selector29")]
+    let restarting_d1 = resident
+        .wyr1c
+        .as_ref()
+        .and_then(|state| state.driver.as_ref())
+        .is_some_and(|driver| driver.request.attempt_generation.0 > 1);
     if resident
         .wyr1c
         .as_ref()
@@ -1582,6 +1921,48 @@ where
     {
         resident.result = RecoveryResult::Degraded;
         return Err(InitError::Cleanup);
+    }
+    #[cfg(feature = "wyr1c6-selector29")]
+    if restarting_d1 {
+        let (lease, p2_binding, p2_attempt, p2_endpoint, irq, u2_attempt, u2_endpoint) = {
+            let state = resident
+                .wyr1c
+                .as_ref()
+                .ok_or(InitError::WrongActivationOrder)?;
+            (
+                state.c6_d1_lease.ok_or(InitError::WrongActivationOrder)?,
+                state.c6_p2_binding.ok_or(InitError::WrongActivationOrder)?,
+                state.c6_u2_attempt.ok_or(InitError::WrongActivationOrder)?,
+                state
+                    .c6_p2_endpoint
+                    .ok_or(InitError::WrongActivationOrder)?,
+                state.c6_u2_irq.ok_or(InitError::WrongActivationOrder)?,
+                state.c6_u2_attempt.ok_or(InitError::WrongActivationOrder)?,
+                state
+                    .c6_u2_endpoint
+                    .ok_or(InitError::WrongActivationOrder)?,
+            )
+        };
+        accept_c6_fact(
+            resident,
+            C6Fact {
+                event: 15,
+                lease,
+                binding: p2_binding,
+                value: p2_attempt,
+                aux: p2_endpoint,
+            },
+        )?;
+        accept_c6_fact(
+            resident,
+            C6Fact {
+                event: 16,
+                lease,
+                binding: irq,
+                value: u2_attempt,
+                aux: u2_endpoint,
+            },
+        )?;
     }
     let active = resident
         .wyr1c
@@ -1647,6 +2028,24 @@ where
         active.transaction_id,
         retired_at,
     )?;
+    #[cfg(feature = "wyr1c6-selector29")]
+    if restarting_d1 {
+        let lease = resident
+            .wyr1c
+            .as_ref()
+            .and_then(|state| state.c6_d1_lease)
+            .ok_or(InitError::WrongActivationOrder)?;
+        accept_c6_fact(
+            resident,
+            C6Fact {
+                event: 17,
+                lease,
+                binding: 0,
+                value: active.generation,
+                aux: 1,
+            },
+        )?;
+    }
     if advance_or_degrade(
         system,
         &mut resident.controller,

@@ -14,6 +14,8 @@ pub mod wyr1b;
 pub mod wyr1b_gate;
 mod wyr1b_job;
 pub mod wyr1b_native;
+#[cfg(feature = "wyr1c6-selector29")]
+pub mod wyr1c6_gate;
 pub mod wyr1c_native;
 
 use crate::evidence::{EvidenceError, EvidenceEvent, EvidenceLog};
@@ -387,6 +389,22 @@ impl ResidentSystemInit {
         self.wyr1b_evidence.as_ref()?.record_at(index)
     }
 
+    /// Returns one completed selector-29 WRC6 record. Incomplete joins expose
+    /// no record and therefore cannot be submitted as acceptance evidence.
+    #[cfg(feature = "wyr1c6-selector29")]
+    #[must_use]
+    pub fn write_wyr1c6_evidence_record(
+        &self,
+        index: usize,
+        output: &mut [u8; wyr1c6_gate::RECORD_BYTES],
+    ) -> Option<()> {
+        self.wyr1c
+            .as_ref()?
+            .c6_evidence
+            .as_ref()?
+            .encode_record_at(index, output)
+    }
+
     /// Advances the permanent fixed-role control loop without inventing service
     /// manager policy. A zero-time probe keeps idle ticks nonblocking; once a
     /// role signal is pending, the exact terminal protocol is drained under the
@@ -744,6 +762,8 @@ pub enum InitError {
     Wyr1BGateMismatch,
     Wyr1BModel(wyr1b::JobError),
     Wyr1BEvidence(wyr1b_gate::GateError),
+    #[cfg(feature = "wyr1c6-selector29")]
+    Wyr1C6GateConfig(wyr1c6_gate::GateError),
 }
 
 impl From<RestartTransitionError> for InitError {

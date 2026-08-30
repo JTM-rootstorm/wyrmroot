@@ -32,6 +32,8 @@ use wyrmroot_system_init::wyr1_test_failure_application_status;
 #[cfg(feature = "wyr1b-test-evidence")]
 use wyrmroot_system_init::wyr1b_test_failure_application_status;
 use wyrmroot_system_init::{InitPlatform, ResidentSystemInit, Wyr1BPlatform};
+#[cfg(feature = "wyr1c6-selector29")]
+use wyrmroot_system_init::{wyr1c_native, wyr1c6_gate};
 use wyrmroot_wyr1b_gate_proto as _;
 
 struct NativeSystem;
@@ -186,6 +188,8 @@ fn continue_resident(
     }
     #[cfg(feature = "wyr1-test-evidence")]
     let mut evidence_submitted = false;
+    #[cfg(feature = "wyr1c6-selector29")]
+    let mut c6_evidence_submitted = false;
     loop {
         let Ok(now) = monotonic_active_now() else {
             return 0xAF01_0003;
@@ -198,6 +202,26 @@ fn continue_resident(
             .is_err()
         {
             return 0xAF01_0006;
+        }
+        #[cfg(feature = "wyr1c6-selector29")]
+        if !c6_evidence_submitted {
+            match wyr1c_native::finish_c6_evidence(resident) {
+                Ok(true) => {
+                    for index in 0..wyr1c6_gate::EVIDENCE_RECORDS {
+                        let mut record = [0u8; wyr1c6_gate::RECORD_BYTES];
+                        let Some(()) = resident.write_wyr1c6_evidence_record(index, &mut record)
+                        else {
+                            return 0xAF1C_0001;
+                        };
+                        if wyrmroot_runtime::submit_wyr1c6_evidence(&record).is_err() {
+                            return 0xAF1C_0002;
+                        }
+                    }
+                    c6_evidence_submitted = true;
+                }
+                Ok(false) => {}
+                Err(_) => return 0xAF1C_0003,
+            }
         }
         #[cfg(feature = "wyr1-test-evidence")]
         if resident.evidence_finalized() && !evidence_submitted {

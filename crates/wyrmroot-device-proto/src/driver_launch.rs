@@ -19,6 +19,7 @@ pub const LAUNCH_REQUEST_HANDLE_COUNT: u32 = 1;
 pub const LAUNCH_RESPONSE_BYTES: usize = 80;
 pub const REAPED_RESPONSE_BYTES: usize = LAUNCH_RESPONSE_BYTES;
 pub const DRIVER_RETIRED_BYTES: usize = LAUNCH_RESPONSE_BYTES;
+pub const C6_FACT_BYTES: usize = 96;
 /// Selector-29 intentionally fails only the first generation.  The trigger
 /// is carried by the exact typed launch identity and cannot match U2.
 pub const SELECTOR29_FAILURE_ATTEMPT_GENERATION: u64 = 1;
@@ -30,6 +31,63 @@ pub const fn selector29_should_fail(
 ) -> bool {
     supervisor_generation.0 == SELECTOR29_FAILURE_SUPERVISOR_GENERATION
         && attempt_generation.0 == SELECTOR29_FAILURE_ATTEMPT_GENERATION
+}
+
+/// Handle-free, generation-exact fact sent by devmgr to system-init. Init is
+/// the sole owner of turning these observed facts into selector evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct C6Fact {
+    pub event: u8,
+    pub lease: u64,
+    pub binding: u64,
+    pub value: u64,
+    pub aux: u64,
+}
+
+pub fn encode_c6_fact(fact: C6Fact, output: &mut [u8]) -> Result<(), DriverLaunchError> {
+    if output.len() != C6_FACT_BYTES || !(1..=26).contains(&fact.event) {
+        return Err(DriverLaunchError::WrongMessage);
+    }
+    output.fill(0);
+    output[..4].copy_from_slice(b"WRCF");
+    output[4..6].copy_from_slice(&1u16.to_le_bytes());
+    output[8..12].copy_from_slice(&4u32.to_le_bytes());
+    output[16..20].copy_from_slice(&(C6_FACT_BYTES as u32).to_le_bytes());
+    output[24] = fact.event;
+    for (offset, value) in [
+        (32, fact.lease),
+        (40, fact.binding),
+        (48, fact.value),
+        (56, fact.aux),
+    ] {
+        output[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    Ok(())
+}
+
+pub fn parse_c6_fact(bytes: &[u8]) -> Result<C6Fact, DriverLaunchError> {
+    if bytes.len() != C6_FACT_BYTES
+        || bytes[..4] != *b"WRCF"
+        || u16::from_le_bytes(bytes[4..6].try_into().unwrap()) != 1
+        || u16::from_le_bytes(bytes[6..8].try_into().unwrap()) != 0
+        || u32::from_le_bytes(bytes[8..12].try_into().unwrap()) != 4
+        || u32::from_le_bytes(bytes[12..16].try_into().unwrap()) != 0
+        || u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize != C6_FACT_BYTES
+        || bytes[20..24].iter().any(|byte| *byte != 0)
+        || !(1..=26).contains(&bytes[24])
+        || bytes[25..32].iter().any(|byte| *byte != 0)
+        || bytes[64..].iter().any(|byte| *byte != 0)
+    {
+        return Err(DriverLaunchError::WrongMessage);
+    }
+    let get = |offset| u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+    Ok(C6Fact {
+        event: bytes[24],
+        lease: get(32),
+        binding: get(40),
+        value: get(48),
+        aux: get(56),
+    })
 }
 
 /// Encodes init's generation-exact acknowledgement after the driver process,
@@ -653,5 +711,21 @@ mod tests {
             SupervisorGeneration(1),
             AttemptGeneration(2)
         ));
+    }
+
+    #[test]
+    fn c6_fact_is_bounded_and_generation_exact() {
+        let fact = C6Fact {
+            event: 22,
+            lease: 7,
+            binding: 8,
+            value: 9,
+            aux: 10,
+        };
+        let mut bytes = [0; C6_FACT_BYTES];
+        encode_c6_fact(fact, &mut bytes).unwrap();
+        assert_eq!(parse_c6_fact(&bytes), Ok(fact));
+        bytes[24] = 27;
+        assert_eq!(parse_c6_fact(&bytes), Err(DriverLaunchError::WrongMessage));
     }
 }

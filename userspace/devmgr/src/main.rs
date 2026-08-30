@@ -27,7 +27,8 @@ use deepwyrm_syscall::{
 };
 #[cfg(feature = "wyr1c6-production")]
 use wyrmroot_device_proto::driver_launch::{
-    REAPED_RESPONSE_BYTES, encode_driver_retired, parse_reaped,
+    C6_FACT_BYTES, C6Fact, REAPED_RESPONSE_BYTES, encode_c6_fact, encode_driver_retired,
+    parse_reaped,
 };
 #[cfg(feature = "wyr1c6-selector29")]
 use wyrmroot_device_proto::selector29_should_fail;
@@ -367,6 +368,46 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                 let _ = close_handle(bootstrap);
                 return Err(code);
             }
+            #[cfg(feature = "wyr1c6-selector29")]
+            if action == ControllerAction::InitialPublicationBound
+                && resident.status().supervisor_generation.0
+                    == wyrmroot_device_proto::SELECTOR29_FAILURE_SUPERVISOR_GENERATION
+            {
+                let supervisor = resident.status().supervisor_generation.0;
+                send_c6_fact(
+                    bootstrap,
+                    C6Fact {
+                        event: 1,
+                        lease: resident.bundle_generation().ok_or(failure(129))?.0,
+                        binding: wyrmroot_devmgr::COM2_RESOURCE_ID,
+                        value: supervisor,
+                        aux: wyrmroot_device_proto::manifest::COM2_ROLE_ID.0,
+                    },
+                )?;
+                send_c6_fact(
+                    bootstrap,
+                    C6Fact {
+                        event: 2,
+                        lease: resident.bundle_generation().ok_or(failure(130))?.0,
+                        binding: wyrmroot_devmgr::COM2_RESOURCE_ID,
+                        value: supervisor,
+                        aux: wyrmroot_device_proto::manifest::COM2_ROLE_ID.0,
+                    },
+                )?;
+            } else if action == ControllerAction::InitialPublicationBound {
+                let supervisor = resident.status().supervisor_generation.0;
+                let lease = resident.bundle_generation().ok_or(failure(131))?.0;
+                send_c6_fact(
+                    bootstrap,
+                    C6Fact {
+                        event: 19,
+                        lease,
+                        binding: wyrmroot_devmgr::COM2_RESOURCE_ID,
+                        value: supervisor,
+                        aux: wyrmroot_device_proto::manifest::COM2_ROLE_ID.0,
+                    },
+                )?;
+            }
             #[cfg(not(any(feature = "wyr1c4-production", feature = "wyr1c5-production")))]
             if action == ControllerAction::InitialPublicationBound {
                 if driver_control.is_some() {
@@ -427,12 +468,59 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                     observed.observed.0 & DW_SIGNAL_READABLE.0 != 0,
                     observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0,
                 )?;
+                #[cfg(feature = "wyr1c6-selector29")]
+                send_c6_fact(
+                    bootstrap,
+                    C6Fact {
+                        event: 6,
+                        lease: resident.driver_lease_generation().ok_or(failure(132))?,
+                        binding: resident.driver_irq_binding().ok_or(failure(133))?,
+                        value: request.attempt_generation.0,
+                        aux: request.endpoint.generation.0,
+                    },
+                )?;
                 probe_stale_driver_endpoint(control, request, &resident)?;
                 close_handle(control).map_err(|_| failure(41))?;
                 retire_driver_publication(publication.ok_or(failure(42))?, request, &resident)?;
+                #[cfg(feature = "wyr1c6-selector29")]
+                {
+                    let binding = resident.active_binding().ok_or(failure(134))?;
+                    send_c6_fact(
+                        bootstrap,
+                        C6Fact {
+                            event: 7,
+                            lease: resident.driver_lease_generation().ok_or(failure(135))?,
+                            binding: binding.generation.0,
+                            value: request.attempt_generation.0,
+                            aux: binding.endpoint.generation.0,
+                        },
+                    )?;
+                }
                 resident.publication_retired().map_err(|_| failure(43))?;
                 await_driver_reaped(bootstrap, request)?;
                 resident.reap_driver().map_err(|_| failure(44))?;
+                #[cfg(feature = "wyr1c6-selector29")]
+                send_c6_fact(
+                    bootstrap,
+                    C6Fact {
+                        event: 8,
+                        lease: resident.driver_lease_generation().ok_or(failure(136))?,
+                        binding: resident.driver_irq_binding().ok_or(failure(137))?,
+                        value: request.attempt_generation.0,
+                        aux: request.endpoint.generation.0,
+                    },
+                )?;
+                #[cfg(feature = "wyr1c6-selector29")]
+                send_c6_fact(
+                    bootstrap,
+                    C6Fact {
+                        event: 9,
+                        lease: resident.driver_lease_generation().ok_or(failure(138))?,
+                        binding: resident.driver_irq_binding().ok_or(failure(139))?,
+                        value: 1,
+                        aux: 0,
+                    },
+                )?;
                 send_driver_retired(bootstrap, request)?;
                 let rebind_deadline =
                     monotonic_deadline_after(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
@@ -481,6 +569,20 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                     .active_driver_request()
                     .is_some_and(|request| request.attempt_generation.0 > 1)
                 {
+                    #[cfg(feature = "wyr1c6-selector29")]
+                    {
+                        let binding = resident.active_binding().ok_or(failure(142))?;
+                        send_c6_fact(
+                            bootstrap,
+                            C6Fact {
+                                event: 14,
+                                lease: resident.driver_lease_generation().ok_or(failure(143))?,
+                                binding: binding.generation.0,
+                                value: resident.status().supervisor_generation.0,
+                                aux: 0,
+                            },
+                        )?;
+                    }
                     // U2 has reached READY and P2 has been committed by
                     // launch_driver_with_bundle. Returning now lets init's
                     // existing RRC-A path reap U2 and replace D1.
@@ -952,13 +1054,25 @@ fn launch_driver_with_bundle(
         {
             return Err(failure(73));
         }
-        Ok::<_, u32>(())
+        Ok::<_, u32>((resource.lease_generation, interrupt_info.binding_generation))
     })();
-    if let Err(code) = intake {
+    let (lease_generation, irq_binding) = match intake {
+        Ok(value) => value,
+        Err(code) => {
+            let _ = close_handle(interrupt);
+            let _ = close_handle(reduced);
+            let _ = close_handle(retained);
+            return Err(code);
+        }
+    };
+    if resident
+        .set_driver_bindings(lease_generation, irq_binding)
+        .is_err()
+    {
         let _ = close_handle(interrupt);
         let _ = close_handle(reduced);
         let _ = close_handle(retained);
-        return Err(code);
+        return Err(failure(74));
     }
 
     let bundle = match resident.resource_bundle_message() {
@@ -1004,6 +1118,35 @@ fn launch_driver_with_bundle(
         return Err(failure(92));
     }
 
+    #[cfg(feature = "wyr1c6-selector29")]
+    if request.supervisor_generation.0 > 1 {
+        send_c6_fact(
+            bootstrap,
+            C6Fact {
+                event: 20,
+                lease: lease_generation,
+                binding: wyrmroot_devmgr::COM2_RESOURCE_ID,
+                value: request.supervisor_generation.0,
+                aux: wyrmroot_device_proto::manifest::COM2_ROLE_ID.0,
+            },
+        )?;
+    } else {
+        send_c6_fact(
+            bootstrap,
+            C6Fact {
+                event: if request.attempt_generation.0 == 1 {
+                    3
+                } else {
+                    10
+                },
+                lease: lease_generation,
+                binding: irq_binding,
+                value: request.attempt_generation.0,
+                aux: request.endpoint.generation.0,
+            },
+        )?;
+    }
+
     if wait_readable(retained, deadline, 77).is_err() {
         let _ = close_handle(retained);
         return Err(failure(77));
@@ -1033,10 +1176,93 @@ fn launch_driver_with_bundle(
         let _ = close_handle(retained);
         return Err(failure(81));
     }
-    if let Err(code) = publish_driver(publication, request, resident) {
-        let _ = send_driver_retire(retained, resident);
-        let _ = close_handle(retained);
-        return Err(code);
+    #[cfg(feature = "wyr1c6-selector29")]
+    if request.supervisor_generation.0 > 1 {
+        send_c6_fact(
+            bootstrap,
+            C6Fact {
+                event: 21,
+                lease: lease_generation,
+                binding: wyrmroot_devmgr::COM2_RESOURCE_ID,
+                value: request.supervisor_generation.0,
+                aux: wyrmroot_device_proto::manifest::COM2_ROLE_ID.0,
+            },
+        )?;
+    }
+    #[cfg(feature = "wyr1c6-selector29")]
+    if request.supervisor_generation.0 > 1 {
+        send_c6_fact(
+            bootstrap,
+            C6Fact {
+                event: 22,
+                lease: lease_generation,
+                binding: wyrmroot_devmgr::COM2_RESOURCE_ID,
+                value: request.supervisor_generation.0,
+                aux: wyrmroot_device_proto::manifest::COM2_ROLE_ID.0,
+            },
+        )?;
+    } else {
+        send_c6_fact(
+            bootstrap,
+            C6Fact {
+                event: if request.attempt_generation.0 == 1 {
+                    4
+                } else {
+                    11
+                },
+                lease: lease_generation,
+                binding: irq_binding,
+                value: request.attempt_generation.0,
+                aux: request.endpoint.generation.0,
+            },
+        )?;
+    }
+    #[cfg(feature = "wyr1c6-selector29")]
+    if request.attempt_generation.0 > 1
+        && request.supervisor_generation.0
+            == wyrmroot_device_proto::SELECTOR29_FAILURE_SUPERVISOR_GENERATION
+    {
+        let binding = resident.retired_binding().ok_or(failure(140))?;
+        send_c6_fact(
+            bootstrap,
+            C6Fact {
+                event: 13,
+                lease: lease_generation,
+                binding: binding.generation.0,
+                value: 1,
+                aux: 3,
+            },
+        )?;
+    }
+    #[cfg(feature = "wyr1c6-selector29")]
+    let should_publish = request.supervisor_generation.0
+        == wyrmroot_device_proto::SELECTOR29_FAILURE_SUPERVISOR_GENERATION;
+    #[cfg(not(feature = "wyr1c6-selector29"))]
+    let should_publish = true;
+    if should_publish {
+        if let Err(code) = publish_driver(publication, request, resident) {
+            let _ = send_driver_retire(retained, resident);
+            let _ = close_handle(retained);
+            return Err(code);
+        }
+        #[cfg(feature = "wyr1c6-selector29")]
+        {
+            let publication_binding = resident.active_binding().ok_or(failure(131))?;
+            send_c6_fact(
+                bootstrap,
+                C6Fact {
+                    event: if request.attempt_generation.0 == 1 {
+                        5
+                    } else {
+                        12
+                    },
+                    lease: lease_generation,
+                    binding: publication_binding.generation.0,
+                    value: request.attempt_generation.0,
+                    aux: publication_binding.endpoint.generation.0,
+                },
+            )?;
+        }
     }
     #[cfg(feature = "wyr1c6-selector29")]
     if selector29_should_fail(request.supervisor_generation, request.attempt_generation) {
@@ -1141,6 +1367,13 @@ fn send_resident_status(
     let mut bytes = [0u8; STATUS_BYTES];
     encode_controller(message, &mut bytes).map_err(|_| failure(36))?;
     send_channel(bootstrap, &bytes, &[]).map_err(|_| failure(37))
+}
+
+#[cfg(feature = "wyr1c6-selector29")]
+fn send_c6_fact(bootstrap: DwHandle, fact: C6Fact) -> Result<(), u32> {
+    let mut bytes = [0u8; C6_FACT_BYTES];
+    encode_c6_fact(fact, &mut bytes).map_err(|_| failure(127))?;
+    send_channel(bootstrap, &bytes, &[]).map_err(|_| failure(128))
 }
 
 fn validate_fresh(handle: DwHandle, object_type: DwObjectType, rights: DwRights) -> Result<(), ()> {

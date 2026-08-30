@@ -145,6 +145,7 @@ pub struct ResidentController {
     last_transaction_id: u64,
     last_binding: Option<RegistryBinding>,
     active_binding: Option<RegistryBinding>,
+    retired_binding: Option<RegistryBinding>,
     active_driver: Option<DriverLaunch>,
     bundle_generation: Option<BundleGeneration>,
     driver_ready: bool,
@@ -155,6 +156,8 @@ pub struct ResidentController {
     next_driver_transaction: u64,
     driver_failures: u8,
     retry_until_ns: Option<u64>,
+    driver_lease_generation: Option<u64>,
+    driver_irq_binding: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -197,6 +200,7 @@ impl ResidentController {
             last_transaction_id: 0,
             last_binding: None,
             active_binding: None,
+            retired_binding: None,
             active_driver: None,
             bundle_generation: None,
             driver_ready: false,
@@ -207,6 +211,8 @@ impl ResidentController {
             next_driver_transaction: driver_transaction,
             driver_failures: 0,
             retry_until_ns: None,
+            driver_lease_generation: None,
+            driver_irq_binding: None,
         })
     }
 
@@ -218,12 +224,40 @@ impl ResidentController {
         self.active_binding
     }
 
+    pub const fn retired_binding(&self) -> Option<RegistryBinding> {
+        self.retired_binding
+    }
+
     pub const fn last_transaction_id(&self) -> u64 {
         self.last_transaction_id
     }
 
     pub const fn bundle_generation(&self) -> Option<BundleGeneration> {
         self.bundle_generation
+    }
+
+    pub const fn driver_lease_generation(&self) -> Option<u64> {
+        self.driver_lease_generation
+    }
+
+    pub const fn driver_irq_binding(&self) -> Option<u64> {
+        self.driver_irq_binding
+    }
+
+    pub fn set_driver_bindings(
+        &mut self,
+        lease_generation: u64,
+        irq_binding: u64,
+    ) -> Result<(), DevmgrError> {
+        if lease_generation == 0
+            || irq_binding == 0
+            || self.bundle_generation != Some(BundleGeneration(lease_generation))
+        {
+            return Err(DevmgrError::ResourceIdentity);
+        }
+        self.driver_lease_generation = Some(lease_generation);
+        self.driver_irq_binding = Some(irq_binding);
+        Ok(())
     }
 
     pub const fn driver_ready(&self) -> bool {
@@ -459,6 +493,7 @@ impl ResidentController {
         if self.status.state != CoordinatorState::CleaningUp || self.active_binding.is_none() {
             return Err(DevmgrError::ControllerLifecycle);
         }
+        self.retired_binding = self.active_binding;
         self.active_binding = None;
         Ok(())
     }

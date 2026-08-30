@@ -48,6 +48,10 @@ pub const WYR1_EVIDENCE_RECORD_BYTES: usize = 114;
 const WYR1B_TEST_EVIDENCE_SYSCALL: DwSyscallId = DwSyscallId(0xffff_ff1b);
 #[cfg(feature = "wyr1b-test-evidence")]
 pub const WYR1B_EVIDENCE_RECORD_BYTES: usize = 96;
+#[cfg(feature = "wyr1c6-test-evidence")]
+const WYR1C6_TEST_EVIDENCE_SYSCALL: DwSyscallId = DwSyscallId(0xffff_ff1e);
+#[cfg(feature = "wyr1c6-test-evidence")]
+pub const WYR1C6_EVIDENCE_RECORD_BYTES: usize = 113;
 
 /// One controller-owned mapping whose lifetime is explicit and whose writable alias can be
 /// irreversibly removed before publication.
@@ -393,6 +397,26 @@ pub fn submit_wyr1b_evidence(
         [
             record.as_ptr() as u64,
             WYR1B_EVIDENCE_RECORD_BYTES as u64,
+            0,
+            0,
+            0,
+            0,
+        ],
+    ))
+}
+
+/// Submits one selector-29-only WRC6 record to the private test collector.
+/// This veneer is deliberately feature-gated and is not part of the production
+/// runtime/public native ABI.
+#[cfg(feature = "wyr1c6-test-evidence")]
+pub fn submit_wyr1c6_evidence(
+    record: &[u8; WYR1C6_EVIDENCE_RECORD_BYTES],
+) -> Result<(), NativeError> {
+    require_success(raw::call(
+        WYR1C6_TEST_EVIDENCE_SYSCALL,
+        [
+            record.as_ptr() as u64,
+            WYR1C6_EVIDENCE_RECORD_BYTES as u64,
             0,
             0,
             0,
