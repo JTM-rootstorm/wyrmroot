@@ -430,9 +430,7 @@ fn configured_rustc(repository: &Path, manifest: &BuildManifest) -> Result<PathB
             "accepted Rust artifact root must be a canonical project-relative path",
         ));
     }
-    let project = repository
-        .parent()
-        .ok_or_else(|| Failure::task("Wyrmroot repository has no OS-Project parent"))?;
+    let project = canonical_project_root(repository)?;
     let rustc = project
         .join(artifact_root)
         .join("toolchains")
@@ -469,10 +467,7 @@ pub(crate) fn project_cargo_home(
             "toolchain Cargo home must be a canonical project-relative path",
         ));
     }
-    let project = repository
-        .parent()
-        .ok_or_else(|| Failure::task("Wyrmroot repository has no OS-Project parent"))?;
-    let project = canonical_build_directory(project, "OS-Project root")?;
+    let project = canonical_project_root(repository)?;
     let path = project.join(relative);
     let cargo_home = canonical_build_directory(&path, "project Cargo home")?;
     if !cargo_home.starts_with(project.join(".tmp")) {
@@ -481,6 +476,69 @@ pub(crate) fn project_cargo_home(
         ));
     }
     Ok(cargo_home)
+}
+
+pub(crate) fn canonical_project_root(repository: &Path) -> Result<PathBuf, Failure> {
+    let repository = fs::canonicalize(repository).map_err(|error| {
+        Failure::task(format!(
+            "could not resolve Wyrmroot repository root: {error}"
+        ))
+    })?;
+    let parent = repository
+        .parent()
+        .ok_or_else(|| Failure::task("Wyrmroot repository has no parent"))?;
+    let managed_lane = parent.file_name() == Some(OsStr::new("wyrmroot"))
+        && parent.parent().and_then(Path::file_name) == Some(OsStr::new(".worktrees"));
+    if !managed_lane {
+        return canonical_build_directory(parent, "OS-Project root");
+    }
+
+    let project = repository
+        .ancestors()
+        .nth(3)
+        .ok_or_else(|| Failure::task("managed Wyrmroot lane has no OS-Project root"))?;
+    let project = canonical_build_directory(project, "OS-Project root")?;
+    let canonical_git = project.join("wyrmroot/.git");
+    let metadata = fs::symlink_metadata(&canonical_git).map_err(|error| {
+        Failure::task(format!(
+            "managed Wyrmroot lane has no canonical Git directory: {error}"
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(Failure::task(
+            "managed Wyrmroot lane canonical Git path is not a regular directory",
+        ));
+    }
+    let output = Command::new("git")
+        .args([
+            "-C",
+            repository
+                .to_str()
+                .ok_or_else(|| Failure::task("Wyrmroot lane path is not UTF-8"))?,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ])
+        .output()
+        .map_err(|error| Failure::task(format!("could not inspect lane Git identity: {error}")))?;
+    if !output.status.success() {
+        return Err(Failure::task(
+            "managed Wyrmroot lane does not expose a common Git directory",
+        ));
+    }
+    let common = String::from_utf8(output.stdout)
+        .map_err(|_| Failure::task("managed Wyrmroot common Git path is not UTF-8"))?;
+    let common = fs::canonicalize(common.trim()).map_err(|error| {
+        Failure::task(format!(
+            "could not resolve managed lane Git identity: {error}"
+        ))
+    })?;
+    if common != canonical_git {
+        return Err(Failure::task(
+            "managed Wyrmroot lane is not registered to canonical Wyrmroot",
+        ));
+    }
+    Ok(project)
 }
 
 fn blocked_toolchain_failure(request: &str) -> Failure {
@@ -1399,10 +1457,10 @@ mod tests {
         DW1D6_ACTOR_TEST_ARGUMENTS, DW1D6_BOOTSTRAP_TEST_ARGUMENTS,
         DW1D6_SOURCE_CONTRACT_TEST_ARGUMENTS, INSPECTION_PATH, INSPECTION_SHELL, IsolatedUefiBuild,
         LoaderLinkMode, UefiCargoProfile, blocked_toolchain_failure, canonical_build_directory,
-        component_package, encoded_uefi_rustflags, encoded_uefi_rustflags_for_target,
-        explicit_test_filter, host_test_arguments, host_test_commands, prepare_uefi_target_roots,
-        render_uefi_inspection_report, run_verified_report, validate_regular_artifact,
-        validate_uefi_inspection_report,
+        canonical_project_root, component_package, encoded_uefi_rustflags,
+        encoded_uefi_rustflags_for_target, explicit_test_filter, host_test_arguments,
+        host_test_commands, prepare_uefi_target_roots, render_uefi_inspection_report,
+        run_verified_report, validate_regular_artifact, validate_uefi_inspection_report,
     };
     use crate::error::Failure;
     use crate::sha256::bytes_digest;
@@ -1411,6 +1469,17 @@ mod tests {
     use std::path::Path;
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn managed_lane_resolves_the_canonical_project_root() {
+        let repository = super::repository_root().expect("resolve Wyrmroot repository");
+        let project = canonical_project_root(&repository).expect("resolve OS-Project root");
+        assert_eq!(
+            project.file_name().and_then(|name| name.to_str()),
+            Some("OS-Project")
+        );
+        assert!(project.join("wyrmroot/.git").is_dir());
+    }
 
     #[test]
     fn component_filters_select_one_workspace_package() {
