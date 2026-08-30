@@ -1302,8 +1302,8 @@ fn accept_c6_fact(resident: &mut ResidentSystemInit, fact: C6Fact) -> Result<(),
         26 => {
             fact.lease == state.c6_d2_lease.unwrap_or(0)
                 && fact.binding == 0
-                && fact.value == 4
-                && fact.aux == 25_000_000
+                && fact.value == u64::from(WYR0_I_SUPERVISION_POLICY.max_attempts)
+                && fact.aux == WYR0_I_SUPERVISION_POLICY.backoff_ns
         }
         _ => false,
     };
@@ -1888,7 +1888,7 @@ where
                             recover_registry(resident, system, loader, waits, bootfs, false)
                         }
                         ResidentPollEvent::DriverExited => {
-                            let request = reap_driver(resident, system, waits, false)?;
+                            let _request = reap_driver(resident, system, waits, false)?;
                             #[cfg(feature = "wyr1c6-production")]
                             {
                                 let state = resident
@@ -1896,7 +1896,7 @@ where
                                     .as_ref()
                                     .ok_or(InitError::WrongActivationOrder)?;
                                 let devmgr = state.devmgr.ok_or(InitError::WrongActivationOrder)?;
-                                acknowledge_driver_reaped(system, devmgr, request)?;
+                                acknowledge_driver_reaped(system, devmgr, _request)?;
                             }
                             Ok(())
                         }

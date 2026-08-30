@@ -40,3 +40,23 @@ fn malformed_intake_and_retire_both_close_the_two_authority_handles() {
     assert!(c5.contains("ControlMessage::Retire"));
     assert!(c5.contains("let result = hold_until_retire(control, ready)"));
 }
+
+#[test]
+fn selector29_failure_is_triggered_only_after_ready_and_releases_both_handles() {
+    let actor = &ACTOR[ACTOR.find("fn run_c5_driver(").unwrap()..];
+    let ready = actor.find("send_channel(control, &ready_bytes").unwrap();
+    let selector = actor.find("selector29_should_fail(").unwrap();
+    let trigger = actor
+        .find("hold_until_failure_trigger(control, ready)")
+        .unwrap();
+    let failure = actor.find("FailureCode::IntentionalRestart").unwrap();
+    let close_interrupt = actor[trigger..]
+        .find("close_handle(handles[1].handle)")
+        .unwrap();
+    let close_resource = actor[trigger..]
+        .find("close_handle(handles[0].handle)")
+        .unwrap();
+    assert!(ready < selector && selector < trigger && trigger < failure);
+    assert!(close_interrupt < close_resource);
+    assert!(actor.contains("ControlMessage::TriggerFailure"));
+}

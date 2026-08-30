@@ -99,11 +99,17 @@ fn c5_moves_exact_reduced_bundle_then_requires_ready_before_publish() {
 
 #[test]
 fn selector29_stale_probes_run_after_p2_publication_and_close_before_probe() {
-    let p2 = NATIVE.find("event: 12").expect("P2 fact remains explicit");
-    let stale_control = NATIVE
+    let retry_start = NATIVE
+        .find("resident.driver_retry_ready(now)")
+        .expect("bounded retry path");
+    let retry = &NATIVE[retry_start..];
+    let launch = retry
+        .find("launch_driver_with_bundle(")
+        .expect("U2 launch and P2 publication complete before return");
+    let stale_control = retry
         .find("probe_stale_driver_endpoint(stale_control")
         .expect("post-P2 stale control probe");
-    let stale_publication = NATIVE
+    let stale_publication = retry
         .find("probe_stale_publication(stale_publication")
         .expect("post-P2 stale publication probe");
     let close_control = NATIVE
@@ -112,10 +118,16 @@ fn selector29_stale_probes_run_after_p2_publication_and_close_before_probe() {
     let close_publication = NATIVE
         .find("close_handle(stale_publication).map_err(|_| failure(149))")
         .expect("old publication closes at cleanup");
-    assert!(p2 < stale_control && stale_control < stale_publication);
-    assert!(close_control < stale_control);
-    assert!(close_publication < stale_publication);
+    assert!(launch < stale_control && stale_control < stale_publication);
+    assert!(close_control < retry_start);
+    assert!(close_publication < retry_start);
     assert!(!NATIVE.contains("if send_channel(publication, &bytes[..stale_size], &[]).is_ok()"));
+    let bundle = &NATIVE[NATIVE.find("fn launch_driver_with_bundle(").unwrap()..];
+    let publish = bundle.find("publish_driver(publication").unwrap();
+    let p2 = bundle
+        .find("} else {\n                        12")
+        .expect("P2 fact remains explicit");
+    assert!(publish < p2);
 }
 
 #[test]

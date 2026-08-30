@@ -1345,6 +1345,61 @@ pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<
 }
 
 fn host_test_commands(filter: Option<&str>) -> Result<Vec<Vec<String>>, Failure> {
+    if matches!(filter, Some("wyr1c6-clippy")) {
+        let command = |package: &str, features: Option<&str>| {
+            let mut arguments = vec![
+                "clippy".to_owned(),
+                "--locked".to_owned(),
+                "--offline".to_owned(),
+                "--package".to_owned(),
+                package.to_owned(),
+                "--lib".to_owned(),
+            ];
+            if let Some(features) = features {
+                arguments.extend(["--features".to_owned(), features.to_owned()]);
+            }
+            arguments.extend(["--".to_owned(), "-D".to_owned(), "warnings".to_owned()]);
+            arguments
+        };
+        return Ok(vec![
+            command("wyrmroot-device-proto", None),
+            command(
+                "wyrmroot-devmgr",
+                Some("wyr1c6-production,wyr1c6-selector29"),
+            ),
+            command(
+                "wyrmroot-system-init",
+                Some("wyr1c6-production,wyr1c6-selector29"),
+            ),
+        ]);
+    }
+    if matches!(filter, Some("wyr1c6-model")) {
+        let command = |package: &str, features: Option<&str>| {
+            let mut arguments = vec![
+                "test".to_owned(),
+                "--locked".to_owned(),
+                "--offline".to_owned(),
+                "--package".to_owned(),
+                package.to_owned(),
+                "--lib".to_owned(),
+            ];
+            if let Some(features) = features {
+                arguments.extend(["--features".to_owned(), features.to_owned()]);
+            }
+            arguments
+        };
+        return Ok(vec![
+            command("wyrmroot-device-proto", None),
+            command(
+                "wyrmroot-devmgr",
+                Some("wyr1c6-production,wyr1c6-selector29"),
+            ),
+            command(
+                "wyrmroot-system-init",
+                Some("wyr1c6-production,wyr1c6-selector29"),
+            ),
+        ]);
+    }
     if matches!(filter, Some("dw1c" | "dw1c-init0")) {
         return Ok(vec![
             DW1C_INIT0_TEST_ARGUMENTS
