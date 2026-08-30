@@ -32,8 +32,8 @@ const NATIVE_TARGET: &str = "x86_64-unknown-wyrmroot";
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
 const MACHINE: &str = "pc-q35-10.2";
 const DOMAIN_UUID: &str = "33005e22-d7c2-4b13-b1ac-b82eda95e584";
-const ESP_FD_GROUP: &str = "wyr1-esp-v1";
-const VARS_FD_GROUP: &str = "wyr1-ovmf-vars-v1";
+const ESP_FD_GROUP: &str = "dw-f13-esp-v1";
+const VARS_FD_GROUP: &str = "dw-f13-ovmf-vars-v1";
 const OVMF_CODE: &str = "/usr/share/edk2/OvmfX64/OVMF_CODE.fd";
 const OVMF_CODE_SHA256: &str = "f3ff7e73448ed2845ee15356f394882f5618eb5dab92c9a30ec6ee0e1468553a";
 const OVMF_VARS: &str = "/usr/share/edk2/OvmfX64/OVMF_VARS.fd";
@@ -1394,5 +1394,7 @@ mod tests {
         assert!(!text.contains("interface"));
         assert!(!text.contains("filesystem"));
         assert!(!text.contains("system_disk"));
+        assert!(text.contains("fdgroup=\"dw-f13-esp-v1\""));
+        assert!(text.contains("fdgroup=\"dw-f13-ovmf-vars-v1\""));
     }
 }
