@@ -196,11 +196,10 @@ pub(crate) fn prepare(
             "WYR1-C6 source metadata does not name the accepted Rust toolchain",
         ));
     }
-    if manifest.deepwyrm_revision()? != deep_revision {
-        return Err(Failure::task(
-            "WYR1-C6 requested Deepwyrm revision does not match generated ABI provenance",
-        ));
-    }
+    // Selector-29 code may live at a newer clean Deepwyrm commit than the
+    // generated ABI consumer pin.  The semantic join is the immutable `abi`
+    // tree, checked below; do not advance the generated ABI pin merely for
+    // private evidence code.
     let abi_revision = manifest.deepwyrm_revision()?.to_owned();
     let abi_tree = matching_abi_tree(&deep_repository, deep_revision, &abi_revision)?;
     let output = canonical_new_output(output, &project, &repository, &deep_repository)?;
@@ -2274,6 +2273,49 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn selected_kernel_may_differ_when_the_generated_abi_tree_matches() {
+        let root = std::env::temp_dir().join(format!(
+            "wyr1c6-abi-tree-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let git = |arguments: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {arguments:?} failed");
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "C6 Test"]);
+        git(&["config", "user.email", "c6@example.invalid"]);
+        fs::create_dir(root.join("abi")).unwrap();
+        fs::write(root.join("abi/schema"), b"stable").unwrap();
+        git(&["add", "abi/schema"]);
+        git(&["commit", "-q", "-m", "generated abi"]);
+        let generated = git(&["rev-parse", "HEAD"]);
+        fs::write(root.join("selector29-only"), b"private evidence").unwrap();
+        git(&["add", "selector29-only"]);
+        git(&["commit", "-q", "-m", "selector29 private evidence"]);
+        let selected = git(&["rev-parse", "HEAD"]);
+        assert_ne!(selected, generated);
+        assert!(matching_abi_tree(&root, &selected, &generated).is_ok());
+        fs::write(root.join("abi/schema"), b"drift").unwrap();
+        git(&["add", "abi/schema"]);
+        git(&["commit", "-q", "-m", "abi drift"]);
+        let mismatched = git(&["rev-parse", "HEAD"]);
+        assert!(matching_abi_tree(&root, &mismatched, &generated).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn source_fixture_directory() -> PathBuf {
