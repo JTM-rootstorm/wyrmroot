@@ -111,6 +111,7 @@ const REQUEST_KEYS: &[&str] = &[
     "gate_config_sha256",
     "source_receipt",
     "source_receipt_sha256",
+    "profile_pair",
 ];
 
 #[cfg(test)]
@@ -256,6 +257,7 @@ pub(crate) fn freeze(
     values.insert("default_handoff".into(), "default/handoff.toml".into());
     values.insert("smp_handoff".into(), "smp/handoff.toml".into());
     values.insert("receipt".into(), "build-receipt.toml".into());
+    values.insert("profile_pair".into(), "profile-pair.toml".into());
 
     let request_text = render(&values, REQUEST_KEYS)?;
     let request_path = output.join("request.toml");
@@ -267,6 +269,7 @@ pub(crate) fn freeze(
     for (profile, vcpus) in [("default", 1_u8), ("smp", 4)] {
         stage_profile(output, profile, vcpus, &request_sha256, esp_sha256, &values)?;
     }
+    write_profile_pair(output, &request_sha256)?;
     let mut receipt = BTreeMap::new();
     receipt.insert("kind".into(), RECEIPT_KIND.into());
     receipt.insert("schema_version".into(), SCHEMA_VERSION.to_string());
@@ -298,8 +301,8 @@ pub(crate) fn freeze(
     Ok(format!(
         "WYR1_C6_FREEZE_PASS selector={SELECTOR} test_id={TEST_ID} evidence={EVIDENCE_PROTOCOL} request={} default_handoff={} smp_handoff={} physical_io=not-performed\n",
         request_path.display(),
-        output.join("default-handoff.toml").display(),
-        output.join("smp-handoff.toml").display(),
+        output.join("default/handoff.toml").display(),
+        output.join("smp/handoff.toml").display(),
     ))
 }
 
@@ -949,6 +952,44 @@ fn stage_profile(
         "VM handoff",
     )?;
     Ok(())
+}
+
+fn write_profile_pair(output: &Path, request_sha256: &str) -> Result<(), Failure> {
+    let default = output.join("default/handoff.toml");
+    let smp = output.join("smp/handoff.toml");
+    let mut fields = BTreeMap::new();
+    for (key, value) in [
+        ("kind", "wyrmroot-wyr1-c6-selector29-vm-profile-pair"),
+        ("schema_version", "1"),
+        ("selector", SELECTOR),
+        ("test_id", "29"),
+        ("machine", MACHINE),
+        ("memory_mib", "2048"),
+        ("timeout_seconds", "300"),
+        ("request", "request.toml"),
+        ("request_sha256", request_sha256),
+        ("default_handoff", "default/handoff.toml"),
+        ("smp_handoff", "smp/handoff.toml"),
+        ("evidence_protocol", EVIDENCE_PROTOCOL),
+        ("scenario", SCENARIO),
+        ("physical_io", "not-performed"),
+    ] {
+        fields.insert(key.to_owned(), value.to_owned());
+    }
+    for (key, path) in [
+        ("default_handoff_sha256", &default),
+        ("smp_handoff_sha256", &smp),
+    ] {
+        fields.insert(
+            key.to_owned(),
+            sha256::bytes_digest(&read_regular_bounded(path, 64 * 1024, "profile handoff")?),
+        );
+    }
+    write_new(
+        &output.join("profile-pair.toml"),
+        render_sorted(&fields)?.as_bytes(),
+        "profile pair",
+    )
 }
 
 fn domain_xml(vcpus: u8, code: &Path, esp: &Path, vars: &Path) -> String {
