@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 use core::panic::PanicInfo;
-use {wyrmroot_device_proto as _, wyrmroot_loader as _};
+use {deepwyrm_syscall as _, wyrmroot_device_proto as _, wyrmroot_loader as _};
 fn main(_: wyrmroot_runtime::StartupBlock<'_>) -> u32 {
     0xAF04_0000
 }
