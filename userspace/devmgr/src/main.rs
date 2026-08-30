@@ -25,6 +25,8 @@ use deepwyrm_syscall::{
 use deepwyrm_syscall::{
     DW_OBJECT_TYPE_DEVICE_RESOURCE, DW_OBJECT_TYPE_TASK_GROUP, DW_RIGHT_MODIFY,
 };
+#[cfg(feature = "wyr1c6-selector29")]
+use deepwyrm_syscall::{DW_SIGNAL_WRITABLE, DW_STATUS_WOULD_BLOCK};
 #[cfg(feature = "wyr1c6-production")]
 use wyrmroot_device_proto::driver_launch::{
     C6_FACT_BYTES, C6Fact, REAPED_RESPONSE_BYTES, encode_c6_fact, encode_driver_retired,
@@ -1371,7 +1373,31 @@ fn send_resident_status(
 fn send_c6_fact(bootstrap: DwHandle, fact: C6Fact) -> Result<(), u32> {
     let mut bytes = [0u8; C6_FACT_BYTES];
     encode_c6_fact(fact, &mut bytes).map_err(|_| failure(127))?;
-    send_channel(bootstrap, &bytes, &[]).map_err(|_| failure(128))
+    let deadline = monotonic_deadline_after(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
+        .map_err(|_| failure(128))?;
+    for _ in 0..4 {
+        match send_channel(bootstrap, &bytes, &[]) {
+            Ok(()) => return Ok(()),
+            Err(NativeError::Status(status)) if status == DW_STATUS_WOULD_BLOCK => {
+                let writable = DwWaitItemV1 {
+                    handle: bootstrap,
+                    signals: deepwyrm_syscall::DwSignals(
+                        DW_SIGNAL_WRITABLE.0 | DW_SIGNAL_PEER_CLOSED.0,
+                    ),
+                };
+                let observed = wait_many(core::slice::from_ref(&writable), deadline)
+                    .map_err(|_| failure(128))?;
+                if observed.index != 0
+                    || observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0
+                    || observed.observed.0 & DW_SIGNAL_WRITABLE.0 == 0
+                {
+                    return Err(failure(128));
+                }
+            }
+            Err(_) => return Err(failure(128)),
+        }
+    }
+    Err(failure(128))
 }
 
 fn validate_fresh(handle: DwHandle, object_type: DwObjectType, rights: DwRights) -> Result<(), ()> {

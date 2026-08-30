@@ -138,6 +138,17 @@ fn selector29_native_path_has_no_physical_device_io_calls() {
 }
 
 #[test]
+fn selector29_fact_delivery_handles_bounded_channel_backpressure() {
+    let send = &NATIVE[NATIVE.find("fn send_c6_fact(").unwrap()..];
+    let send = &send[..send.find("fn validate_fresh(").unwrap()];
+    assert!(send.contains("for _ in 0..4"));
+    assert!(send.contains("DW_STATUS_WOULD_BLOCK"));
+    assert!(send.contains("DW_SIGNAL_WRITABLE.0 | DW_SIGNAL_PEER_CLOSED.0"));
+    assert!(send.contains("WYR0_I_SUPERVISION_POLICY.ready_timeout_ns"));
+    assert!(!send.contains("DW_DEADLINE_INFINITE"));
+}
+
+#[test]
 fn c3_construction_and_control_ready_share_one_finite_deadline() {
     let launch = &NATIVE[NATIVE.find("fn launch_driver(").unwrap()..];
     let launch = &launch[..launch.find("fn wait_readable(").unwrap()];
