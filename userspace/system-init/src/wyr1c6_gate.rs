@@ -12,6 +12,7 @@ pub const EVIDENCE_RECORDS: usize = 27;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GateConfig {
     pub nonce: u64,
+    pub physical_io_not_performed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -113,7 +114,10 @@ pub fn parse_config(bytes: &[u8]) -> Result<GateConfig, GateError> {
     if nonce == 0 {
         return Err(GateError::InvalidNonce);
     }
-    Ok(GateConfig { nonce })
+    Ok(GateConfig {
+        nonce,
+        physical_io_not_performed: true,
+    })
 }
 
 fn exact(actual: Option<&str>, expected: &str) -> Result<(), GateError> {
@@ -296,14 +300,16 @@ mod tests {
         assert_eq!(
             parse_config(CONFIG),
             Ok(GateConfig {
-                nonce: 0x0123_4567_89ab_cdef
+                nonce: 0x0123_4567_89ab_cdef,
+                physical_io_not_performed: true,
             })
         );
         assert_eq!(parse_config(b"schema = 6\n"), Err(GateError::WrongContract));
         assert_eq!(
             parse_config(&CONFIG[..CONFIG.len() - 1]),
             Ok(GateConfig {
-                nonce: 0x0123_4567_89ab_cdef
+                nonce: 0x0123_4567_89ab_cdef,
+                physical_io_not_performed: true,
             })
         );
         let mut extra = [0u8; CONFIG.len() + 6];

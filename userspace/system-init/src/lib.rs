@@ -923,6 +923,25 @@ impl SystemInit {
     pub fn role_state(&self, role: RoleId) -> Option<RestartState> {
         self.index(role).map(|i| self.roles[i].restart.state())
     }
+
+    #[cfg(feature = "wyr1c6-selector29")]
+    #[must_use]
+    pub const fn c6_startup_profiles_exclude_direct_device_authority(&self) -> bool {
+        matches!(
+            self.registry_startup_profile,
+            StartupProfile::BootstrapRegistry
+        ) && matches!(
+            self.devmgr_startup_profile,
+            StartupProfile::DeviceCoordinator
+        )
+    }
+
+    #[cfg(feature = "wyr1c6-selector29")]
+    #[must_use]
+    pub fn role_failure_count(&self, role: RoleId) -> Option<usize> {
+        self.index(role)
+            .map(|index| self.roles[index].restart.history().len())
+    }
     #[must_use]
     pub fn resources(&self, role: RoleId) -> Option<&AttemptResources> {
         self.index(role)

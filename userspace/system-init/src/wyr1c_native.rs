@@ -118,6 +118,8 @@ pub(crate) struct ResidentState {
     driver: Option<DriverNativeAttempt>,
     last_reaped_driver: Option<DriverLaunchRequest>,
     #[cfg(feature = "wyr1c6-selector29")]
+    c6_gate_config: crate::wyr1c6_gate::GateConfig,
+    #[cfg(feature = "wyr1c6-selector29")]
     pub(crate) c6_evidence: Option<crate::wyr1c6_gate::EvidenceLog>,
     #[cfg(feature = "wyr1c6-selector29")]
     c6_d1_lease: Option<u64>,
@@ -125,6 +127,8 @@ pub(crate) struct ResidentState {
     c6_d1_supervisor: Option<u64>,
     #[cfg(feature = "wyr1c6-selector29")]
     c6_d1_cleanup_complete: bool,
+    #[cfg(feature = "wyr1c6-selector29")]
+    c6_d1_driver_failures: u64,
     #[cfg(feature = "wyr1c6-selector29")]
     c6_d2_lease: Option<u64>,
     #[cfg(feature = "wyr1c6-selector29")]
@@ -265,16 +269,17 @@ where
         .map_err(|_| InitError::WrongManifestProfile)?;
     let manifest = crate::wyr1b_native::validate_retained_bootfs_c1(bootfs)?;
     #[cfg(feature = "wyr1c6-selector29")]
-    let c6_evidence = {
+    let (c6_gate_config, c6_evidence) = {
         let entry = archive
             .lookup(crate::wyr1c6_gate::GATE_PATH.as_bytes())
             .map_err(map_lookup)?;
         let config =
             crate::wyr1c6_gate::parse_config(entry.data()).map_err(InitError::Wyr1C6GateConfig)?;
-        Some(
+        let evidence = Some(
             crate::wyr1c6_gate::EvidenceLog::new(config.nonce)
                 .map_err(InitError::Wyr1C6GateConfig)?,
-        )
+        );
+        (config, evidence)
     };
     validate_device_identity(
         device_manifest,
@@ -351,6 +356,8 @@ where
         driver: None,
         last_reaped_driver: None,
         #[cfg(feature = "wyr1c6-selector29")]
+        c6_gate_config,
+        #[cfg(feature = "wyr1c6-selector29")]
         c6_evidence,
         #[cfg(feature = "wyr1c6-selector29")]
         c6_d1_lease: None,
@@ -358,6 +365,8 @@ where
         c6_d1_supervisor: None,
         #[cfg(feature = "wyr1c6-selector29")]
         c6_d1_cleanup_complete: false,
+        #[cfg(feature = "wyr1c6-selector29")]
+        c6_d1_driver_failures: 0,
         #[cfg(feature = "wyr1c6-selector29")]
         c6_d2_lease: None,
         #[cfg(feature = "wyr1c6-selector29")]
@@ -1239,30 +1248,57 @@ fn accept_c6_fact(resident: &mut ResidentSystemInit, fact: C6Fact) -> Result<(),
                 && fact.aux == 0
         }
         19 => {
+            let active = state.devmgr;
             fact.lease > state.c6_d1_lease.unwrap_or(0)
                 && fact.binding == 1
                 && fact.value != 0
                 && fact.aux != 0
+                && active.is_some_and(|active| {
+                    active.role == RoleId::Devmgr && active.generation == fact.value
+                })
         }
         20..=22 => {
+            let active = state.devmgr;
             fact.lease == state.c6_d2_lease.unwrap_or(0)
                 && fact.binding == 1
                 && Some(fact.value) == state.c6_d2_supervisor
                 && Some(fact.aux) == state.c6_d2_role
+                && active.is_some_and(|active| {
+                    active.role == RoleId::Devmgr && active.generation == fact.value
+                })
         }
         23 => {
             fact.lease == state.c6_d2_lease.unwrap_or(0)
                 && fact.binding == 0
                 && fact.value == 3
                 && fact.aux == 0
+                && resident
+                    .controller
+                    .c6_startup_profiles_exclude_direct_device_authority()
+                && state.resource_domain.is_some_and(|custody| {
+                    custody
+                        .devmgr_claim_authority(ResourceDomainMembership::InitOutsideDomain)
+                        .is_err()
+                })
+                && state.driver.is_none()
         }
         24 => {
             fact.lease == state.c6_d2_lease.unwrap_or(0)
                 && fact.binding == 0
                 && fact.value == 0
                 && fact.aux == 0
+                && state.c6_gate_config.physical_io_not_performed
         }
-        25 => fact.lease == state.c6_d2_lease.unwrap_or(0) && fact.binding == 0,
+        25 => {
+            let devmgr_failures = resident
+                .controller
+                .role_failure_count(RoleId::Devmgr)
+                .unwrap_or(usize::MAX);
+            fact.lease == state.c6_d2_lease.unwrap_or(0)
+                && fact.binding == 0
+                && fact.value == state.c6_d1_driver_failures
+                && fact.aux == devmgr_failures as u64
+        }
         26 => {
             fact.lease == state.c6_d2_lease.unwrap_or(0)
                 && fact.binding == 0
@@ -1323,6 +1359,12 @@ fn accept_c6_fact(resident: &mut ResidentSystemInit, fact: C6Fact) -> Result<(),
             state.c6_p1_binding = Some(fact.binding);
             state.c6_p1_endpoint = Some(fact.aux);
         }
+        6 => {
+            state.c6_d1_driver_failures = state
+                .c6_d1_driver_failures
+                .checked_add(1)
+                .ok_or(InitError::Accounting)?;
+        }
         10 => {
             state.c6_u2_irq = Some(fact.binding);
             state.c6_u2_attempt = Some(fact.value);
@@ -1339,6 +1381,71 @@ fn accept_c6_fact(resident: &mut ResidentSystemInit, fact: C6Fact) -> Result<(),
         }
         17 => state.c6_d1_cleanup_complete = true,
         _ => {}
+    }
+    if fact.event == 22 {
+        emit_c6_terminal_facts(resident)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "wyr1c6-selector29")]
+fn emit_c6_terminal_facts(resident: &mut ResidentSystemInit) -> Result<(), InitError> {
+    let (lease, driver_failures, devmgr_failures, max_attempts, backoff_ns) = {
+        let state = resident
+            .wyr1c
+            .as_ref()
+            .ok_or(InitError::WrongActivationOrder)?;
+        let devmgr = state.devmgr.ok_or(InitError::WrongActivationOrder)?;
+        if devmgr.role != RoleId::Devmgr
+            || state.driver.is_some()
+            || state.c6_d2_lease.is_none()
+            || state.c6_d2_supervisor != Some(devmgr.generation)
+            || state.c6_d2_role != Some(COM2_ROLE_ID.0)
+            || !state.c6_gate_config.physical_io_not_performed
+            || !resident
+                .controller
+                .c6_startup_profiles_exclude_direct_device_authority()
+            || !state.resource_domain.is_some_and(|custody| {
+                custody
+                    .devmgr_claim_authority(ResourceDomainMembership::InitOutsideDomain)
+                    .is_err()
+            })
+        {
+            return Err(InitError::WrongManifestProfile);
+        }
+        let lease = state.c6_d2_lease.ok_or(InitError::WrongActivationOrder)?;
+        let driver_failures = state.c6_d1_driver_failures;
+        let devmgr_failures = resident
+            .controller
+            .role_failure_count(RoleId::Devmgr)
+            .ok_or(InitError::Accounting)?;
+        if driver_failures == 0 || devmgr_failures == 0 {
+            return Err(InitError::Accounting);
+        }
+        (
+            lease,
+            driver_failures,
+            devmgr_failures as u64,
+            WYR0_I_SUPERVISION_POLICY.max_attempts,
+            WYR0_I_SUPERVISION_POLICY.backoff_ns,
+        )
+    };
+    for (event, value, aux) in [
+        (23, 3, 0),
+        (24, 0, 0),
+        (25, driver_failures, devmgr_failures),
+        (26, u64::from(max_attempts), backoff_ns),
+    ] {
+        accept_c6_fact(
+            resident,
+            C6Fact {
+                event,
+                lease,
+                binding: 0,
+                value,
+                aux,
+            },
+        )?;
     }
     Ok(())
 }

@@ -98,6 +98,34 @@ fn c5_moves_exact_reduced_bundle_then_requires_ready_before_publish() {
 }
 
 #[test]
+fn selector29_stale_probes_run_after_p2_publication_and_close_before_probe() {
+    let p2 = NATIVE.find("event: 12").expect("P2 fact remains explicit");
+    let stale_control = NATIVE
+        .find("probe_stale_driver_endpoint(stale_control")
+        .expect("post-P2 stale control probe");
+    let stale_publication = NATIVE
+        .find("probe_stale_publication(stale_publication")
+        .expect("post-P2 stale publication probe");
+    let close_control = NATIVE
+        .find("close_handle(control).map_err(|_| failure(41))")
+        .expect("old control closes at cleanup");
+    let close_publication = NATIVE
+        .find("close_handle(stale_publication).map_err(|_| failure(149))")
+        .expect("old publication closes at cleanup");
+    assert!(p2 < stale_control && stale_control < stale_publication);
+    assert!(close_control < stale_control);
+    assert!(close_publication < stale_publication);
+    assert!(!NATIVE.contains("if send_channel(publication, &bytes[..stale_size], &[]).is_ok()"));
+}
+
+#[test]
+fn selector29_native_path_has_no_physical_device_io_calls() {
+    assert!(!NATIVE.contains("device_pio_read"));
+    assert!(!NATIVE.contains("device_pio_write"));
+    assert!(!NATIVE.contains("interrupt_ack"));
+}
+
+#[test]
 fn c3_construction_and_control_ready_share_one_finite_deadline() {
     let launch = &NATIVE[NATIVE.find("fn launch_driver(").unwrap()..];
     let launch = &launch[..launch.find("fn wait_readable(").unwrap()];

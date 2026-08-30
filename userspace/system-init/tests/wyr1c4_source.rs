@@ -58,3 +58,16 @@ fn c5_driver_attempt_is_parented_under_the_current_devmgr_generation() {
     assert!(parent < create && create < load);
     assert!(construct.contains("#[cfg(feature = \"wyr1c5-production\")]"));
 }
+
+#[test]
+fn c6_terminal_facts_are_init_owned_and_bound_to_real_predicates() {
+    let devmgr = include_str!("../../devmgr/src/main.rs");
+    assert!(NATIVE_SOURCE.contains("emit_c6_terminal_facts(resident)"));
+    assert!(!devmgr.contains("emit_selector29_final_facts"));
+    assert!(NATIVE_SOURCE.contains("c6_startup_profiles_exclude_direct_device_authority"));
+    assert!(NATIVE_SOURCE.contains("ResourceDomainMembership::InitOutsideDomain"));
+    assert!(NATIVE_SOURCE.contains("physical_io_not_performed"));
+    assert!(NATIVE_SOURCE.contains("role_failure_count(RoleId::Devmgr)"));
+    assert!(NATIVE_SOURCE.contains("WYR0_I_SUPERVISION_POLICY.max_attempts"));
+    assert!(NATIVE_SOURCE.contains("WYR0_I_SUPERVISION_POLICY.backoff_ns"));
+}

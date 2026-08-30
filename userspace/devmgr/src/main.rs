@@ -419,7 +419,6 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                         },
                     )?;
                 }
-                emit_selector29_final_facts(bootstrap, &resident, lease)?;
             }
             #[cfg(not(any(feature = "wyr1c4-production", feature = "wyr1c5-production")))]
             if action == ControllerAction::InitialPublicationBound {
@@ -485,6 +484,8 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                     observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0,
                 )?;
                 #[cfg(feature = "wyr1c6-selector29")]
+                let stale_control = control;
+                #[cfg(feature = "wyr1c6-selector29")]
                 send_c6_fact(
                     bootstrap,
                     C6Fact {
@@ -495,9 +496,15 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                         aux: request.endpoint.generation.0,
                     },
                 )?;
-                probe_stale_driver_endpoint(control, request, &resident)?;
                 close_handle(control).map_err(|_| failure(41))?;
-                retire_driver_publication(publication.ok_or(failure(42))?, request, &resident)?;
+                let old_publication = publication.take().ok_or(failure(42))?;
+                retire_driver_publication(old_publication, request, &resident)?;
+                #[cfg(feature = "wyr1c6-selector29")]
+                let stale_publication = old_publication;
+                #[cfg(not(feature = "wyr1c6-selector29"))]
+                close_handle(old_publication).map_err(|_| failure(149))?;
+                #[cfg(feature = "wyr1c6-selector29")]
+                close_handle(stale_publication).map_err(|_| failure(149))?;
                 #[cfg(feature = "wyr1c6-selector29")]
                 {
                     let binding = resident.active_binding().ok_or(failure(134))?;
@@ -547,8 +554,8 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                     return Err(failure(47));
                 }
                 let replacement = replacement.ok_or(failure(48))?;
-                if let Some(old) = publication.replace(replacement) {
-                    close_handle(old).map_err(|_| failure(49))?;
+                if publication.replace(replacement).is_some() {
+                    return Err(failure(49));
                 }
                 let now = monotonic_active_now().map_err(|_| failure(50))?;
                 resident
@@ -585,9 +592,22 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                     .active_driver_request()
                     .is_some_and(|request| request.attempt_generation.0 > 1)
                 {
+                    probe_stale_driver_endpoint(stale_control, request, &resident)?;
+                    probe_stale_publication(stale_publication, request, &resident)?;
                     #[cfg(feature = "wyr1c6-selector29")]
                     {
+                        let old_binding = resident.retired_binding().ok_or(failure(145))?;
                         let binding = resident.active_binding().ok_or(failure(142))?;
+                        send_c6_fact(
+                            bootstrap,
+                            C6Fact {
+                                event: 13,
+                                lease: resident.driver_lease_generation().ok_or(failure(143))?,
+                                binding: old_binding.generation.0,
+                                value: resident.retired_driver_attempt().ok_or(failure(146))?,
+                                aux: 3,
+                            },
+                        )?;
                         send_c6_fact(
                             bootstrap,
                             C6Fact {
@@ -812,18 +832,10 @@ fn retire_driver_publication(
     {
         return Err(failure(114));
     }
-    let stale_publish = RegistryHeader {
-        message_type: RegistryMessageType::Publish,
-        ..header
-    };
-    let stale_size = encode_registry_empty(stale_publish, &mut bytes).map_err(|_| failure(115))?;
-    if send_channel(publication, &bytes[..stale_size], &[]).is_ok() {
-        return Err(failure(116));
-    }
     Ok(())
 }
 
-#[cfg(feature = "wyr1c6-production")]
+#[cfg(feature = "wyr1c6-selector29")]
 fn probe_stale_driver_endpoint(
     control: DwHandle,
     request: wyrmroot_device_proto::DriverLaunchRequest,
@@ -840,6 +852,28 @@ fn probe_stale_driver_endpoint(
     wyrmroot_device_proto::control::encode(message, &mut bytes).map_err(|_| failure(118))?;
     if send_channel(control, &bytes, &[]).is_ok() {
         return Err(failure(119));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "wyr1c6-selector29")]
+fn probe_stale_publication(
+    publication: DwHandle,
+    request: wyrmroot_device_proto::DriverLaunchRequest,
+    resident: &wyrmroot_devmgr::ResidentController,
+) -> Result<(), u32> {
+    let binding = resident.retired_binding().ok_or(failure(149))?;
+    let header = RegistryHeader {
+        message_type: RegistryMessageType::Publish,
+        registry_generation: binding.generation.0,
+        endpoint_id: binding.endpoint.id.0,
+        endpoint_generation: binding.endpoint.generation.0,
+        transaction_id: request.transaction_id,
+    };
+    let mut bytes = [0u8; REGISTRY_HEADER_BYTES];
+    let size = encode_registry_empty(header, &mut bytes).map_err(|_| failure(150))?;
+    if send_channel(publication, &bytes[..size], &[]).is_ok() {
+        return Err(failure(151));
     }
     Ok(())
 }
@@ -1226,19 +1260,6 @@ fn launch_driver_with_bundle(
                     aux: publication_binding.endpoint.generation.0,
                 },
             )?;
-            if request.attempt_generation.0 > 1 {
-                let binding = resident.retired_binding().ok_or(failure(140))?;
-                send_c6_fact(
-                    bootstrap,
-                    C6Fact {
-                        event: 13,
-                        lease: lease_generation,
-                        binding: binding.generation.0,
-                        value: resident.retired_driver_attempt().ok_or(failure(141))?,
-                        aux: 3,
-                    },
-                )?;
-            }
         }
     }
     #[cfg(feature = "wyr1c6-selector29")]
@@ -1351,57 +1372,6 @@ fn send_c6_fact(bootstrap: DwHandle, fact: C6Fact) -> Result<(), u32> {
     let mut bytes = [0u8; C6_FACT_BYTES];
     encode_c6_fact(fact, &mut bytes).map_err(|_| failure(127))?;
     send_channel(bootstrap, &bytes, &[]).map_err(|_| failure(128))
-}
-
-#[cfg(feature = "wyr1c6-selector29")]
-fn emit_selector29_final_facts(
-    bootstrap: DwHandle,
-    resident: &wyrmroot_devmgr::ResidentController,
-    lease: u64,
-) -> Result<(), u32> {
-    if resident.status().state != wyrmroot_device_proto::CoordinatorState::Matched
-        || resident.driver_ready()
-        || resident.driver_lease_generation().is_some()
-    {
-        return Err(failure(144));
-    }
-    // D2 intentionally does not construct a U3 actor.  Consequently the
-    // native path has inspected the three forbidden role classes without
-    // granting authority or invoking any PIO/IRQ operation.
-    let facts = [
-        C6Fact {
-            event: 23,
-            lease,
-            binding: 0,
-            value: 3,
-            aux: 0,
-        },
-        C6Fact {
-            event: 24,
-            lease,
-            binding: 0,
-            value: 0,
-            aux: 0,
-        },
-        C6Fact {
-            event: 25,
-            lease,
-            binding: 0,
-            value: u64::from(resident.driver_failures()),
-            aux: 0,
-        },
-        C6Fact {
-            event: 26,
-            lease,
-            binding: 0,
-            value: 4,
-            aux: 25_000_000,
-        },
-    ];
-    for fact in facts {
-        send_c6_fact(bootstrap, fact)?;
-    }
-    Ok(())
 }
 
 fn validate_fresh(handle: DwHandle, object_type: DwObjectType, rights: DwRights) -> Result<(), ()> {
