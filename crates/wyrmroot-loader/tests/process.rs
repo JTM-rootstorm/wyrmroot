@@ -465,7 +465,7 @@ fn d6_owner_move_uses_transfer_only_on_the_sender_side_staging_handle() {
     let mut platform = Mock::new(None);
     let image = executable();
     let resource_domain = DwHandle(0xd600);
-    load_d6_resource_owner_process(
+    let loaded = load_d6_resource_owner_process(
         &mut platform,
         authority(),
         D6ResourceOwnerLoadRequest {
@@ -491,6 +491,26 @@ fn d6_owner_move_uses_transfer_only_on_the_sender_side_staging_handle() {
     assert_eq!(transfer.operation, DW_HANDLE_TRANSFER_MOVE);
     assert_eq!(transfer.requested_rights, RESOURCE_DOMAIN_CLAIM_RIGHTS);
     assert_eq!(transfer.requested_rights.0 & DW_RIGHT_TRANSFER.0, 0);
+
+    // The mock allocates Process, root, and child bootstrap consecutively.
+    // A successful D6 load must close the parent-side root and retain only the
+    // Process plus launch Channel returned to bootstrap.
+    let created_root = DwHandle(loaded.process.0 + 1);
+    assert_eq!(created_root, DwHandle(14));
+    assert_eq!(
+        platform
+            .events
+            .iter()
+            .filter(|event| **event == Event::Close(created_root.0))
+            .count(),
+        1
+    );
+    let root_close = position(&platform.events, |event| {
+        *event == Event::Close(created_root.0)
+    });
+    let init_send = position(&platform.events, |event| matches!(event, Event::Send(1)));
+    let start = position(&platform.events, |event| matches!(event, Event::Start));
+    assert!(init_send < root_close && root_close < start);
 }
 
 #[test]

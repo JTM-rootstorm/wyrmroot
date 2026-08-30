@@ -1305,7 +1305,20 @@ fn load_process_materialized<P: LoaderPlatform>(
             transaction.delegated_resource_domain = None;
         }
     } else if request.profile == LaunchProfile::D6ResourceOwner {
+        // INIT consumed the staged resource-domain duplicate, but the
+        // parent-side Process root remains loader-owned.  Close it exactly as
+        // for other non-self-root profiles so each completed owner retains
+        // only the Process and launch Channel returned to bootstrap.
         transaction.delegated_resource_domain = None;
+        if let Err(cause) = platform.close(created.root) {
+            return Err(fail(
+                platform,
+                &mut transaction,
+                LoadStage::SuccessCleanup,
+                cause,
+            ));
+        }
+        transaction.root = None;
     } else if let Err(cause) = platform.close(created.root) {
         return Err(fail(
             platform,
