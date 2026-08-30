@@ -30,8 +30,10 @@ fn native_path_keeps_the_c3_launch_surface_hardware_free() {
     assert!(NATIVE.contains("parse_constructed"));
     assert!(NATIVE.contains("accept_driver_control_ready"));
     assert!(NATIVE.contains("requested_rights: CHILD_CHANNEL_RIGHTS"));
-    assert!(!NATIVE.contains("DW_OBJECT_TYPE_INTERRUPT"));
-    assert!(!NATIVE.contains("pio_"));
+    let c3 = &NATIVE[NATIVE.find("fn launch_driver(").unwrap()
+        ..NATIVE.find("fn launch_driver_with_bundle(").unwrap()];
+    assert!(!c3.contains("DW_OBJECT_TYPE_INTERRUPT"));
+    assert!(!c3.contains("pio_"));
 }
 
 #[test]
@@ -67,11 +69,32 @@ fn c4_claim_path_is_feature_gated_exact_and_stops_before_interrupt_creation() {
     assert!(feature < claim && claim < owned && owned < metadata);
     assert!(metadata < retire_domain && retire_domain < status);
     assert!(c4.contains("close_optional(_device_resource.take())"));
-    assert!(NATIVE.contains(
-        "#[cfg(not(feature = \"wyr1c4-production\"))]\n            if action == ControllerAction::InitialPublicationBound"
-    ));
-    assert!(!NATIVE.contains("create_interrupt("));
-    assert!(!NATIVE.contains("DW_OBJECT_TYPE_INTERRUPT"));
+    assert!(NATIVE.contains("#[cfg(not(any("));
+    let c4_branch = &NATIVE[..NATIVE.find("fn launch_driver_with_bundle(").unwrap()];
+    assert!(!c4_branch.contains("create_interrupt("));
+}
+
+#[test]
+fn c5_moves_exact_reduced_bundle_then_requires_ready_before_publish() {
+    let c5 = &NATIVE[NATIVE.find("fn launch_driver_with_bundle(").unwrap()..];
+    let duplicate = c5.find("duplicate_handle(parent_resource").unwrap();
+    let interrupt = c5.find("create_interrupt(parent_resource").unwrap();
+    let bundle = c5.find("resource_bundle_message()").unwrap();
+    let move_bundle = c5
+        .find("send_channel(retained, &bundle_bytes, &transfers)")
+        .unwrap();
+    let ready = c5.find("accept_driver_ready(ready)").unwrap();
+    let publish = c5
+        .find("publish_driver(publication, request, resident)")
+        .unwrap();
+    assert!(duplicate < interrupt && interrupt < bundle && bundle < move_bundle);
+    assert!(move_bundle < ready && ready < publish);
+    assert!(c5.contains("requested_rights: DEVICE_RESOURCE_DRIVER_RIGHTS"));
+    assert!(c5.contains("requested_rights: INTERRUPT_DRIVER_RIGHTS"));
+    assert!(c5.contains("DW_HANDLE_TRANSFER_MOVE"));
+    assert!(!c5.contains("device_pio_read"));
+    assert!(!c5.contains("device_pio_write"));
+    assert!(!c5.contains("interrupt_ack"));
 }
 
 #[test]

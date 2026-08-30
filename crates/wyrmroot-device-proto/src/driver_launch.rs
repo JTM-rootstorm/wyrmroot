@@ -46,6 +46,8 @@ pub enum DriverLaunchState {
     Constructed,
     AwaitingControlReady,
     ControlReady,
+    BundleTransferred,
+    DriverReady,
     Reaped,
 }
 
@@ -277,6 +279,30 @@ impl DriverLaunch {
         Ok(())
     }
 
+    /// Selects the post-resource C5 route after construction. C3 direct
+    /// readiness and C5 bundle ownership are mutually exclusive transitions.
+    pub fn bundle_transferred(&mut self) -> Result<(), DriverLaunchError> {
+        if self.state == DriverLaunchState::Reaped {
+            return Err(DriverLaunchError::AlreadyReaped);
+        }
+        if self.state != DriverLaunchState::AwaitingControlReady {
+            return Err(DriverLaunchError::Replay);
+        }
+        self.state = DriverLaunchState::BundleTransferred;
+        Ok(())
+    }
+
+    pub fn driver_ready(&mut self) -> Result<(), DriverLaunchError> {
+        if self.state == DriverLaunchState::Reaped {
+            return Err(DriverLaunchError::AlreadyReaped);
+        }
+        if self.state != DriverLaunchState::BundleTransferred {
+            return Err(DriverLaunchError::Replay);
+        }
+        self.state = DriverLaunchState::DriverReady;
+        Ok(())
+    }
+
     /// Terminal child exit is reaped by init.  As no bundle exists in this
     /// model, this transition cannot transfer or lose future hardware state.
     pub fn reap(&mut self) -> Result<(), DriverLaunchError> {
@@ -349,6 +375,22 @@ mod tests {
             launch.accept_control_ready(ready()),
             Err(DriverLaunchError::Replay)
         );
+    }
+    #[test]
+    fn c5_bundle_route_is_distinct_from_c3_control_ready() {
+        let mut launch = DriverLaunch::new(request()).unwrap();
+        launch.constructed().unwrap();
+        launch.bundle_transferred().unwrap();
+        assert_eq!(launch.state(), DriverLaunchState::BundleTransferred);
+        assert_eq!(
+            launch.accept_control_ready(ready()),
+            Err(DriverLaunchError::Replay)
+        );
+        launch.driver_ready().unwrap();
+        assert_eq!(launch.state(), DriverLaunchState::DriverReady);
+        assert_eq!(launch.driver_ready(), Err(DriverLaunchError::Replay));
+        launch.reap().unwrap();
+        assert_eq!(launch.state(), DriverLaunchState::Reaped);
     }
     #[test]
     fn rejects_profile_endpoint_and_rights_confusion() {

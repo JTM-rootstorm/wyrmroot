@@ -120,6 +120,37 @@ const C4_NATIVE_CHECK_SPECS: [NativeSpec; 3] = [
     },
 ];
 
+const C5_NATIVE_CHECK_SPECS: [NativeSpec; 4] = [
+    NativeSpec {
+        label: "bootstrap-c5",
+        package: "wyrmroot-bootstrap",
+        binary: "wyrmroot-bootstrap",
+        features: "wyr1c5-production",
+        artifact: "wyrmroot-bootstrap",
+    },
+    NativeSpec {
+        label: "system-init-c5",
+        package: "wyrmroot-system-init",
+        binary: "system-init",
+        features: "wyr1c5-production",
+        artifact: "system-init",
+    },
+    NativeSpec {
+        label: "devmgr-c5",
+        package: "wyrmroot-devmgr",
+        binary: "devmgr",
+        features: "wyr1c5-production",
+        artifact: "devmgr",
+    },
+    NativeSpec {
+        label: "uart16550d-c5",
+        package: "wyrmroot-wyr1-retained-stubs",
+        binary: "uart16550d",
+        features: "wyr1c5-production",
+        artifact: "uart16550d",
+    },
+];
+
 struct NativeArtifact {
     spec: NativeSpec,
     bytes: Vec<u8>,
@@ -148,6 +179,19 @@ pub(crate) struct BuiltFrozenProduct {
 }
 
 pub(crate) fn run_c4_native_checks(repository: &Path) -> Result<(), Failure> {
+    run_native_checks(repository, "WYR1-C4", "wyr1c4", &C4_NATIVE_CHECK_SPECS)
+}
+
+pub(crate) fn run_c5_native_checks(repository: &Path) -> Result<(), Failure> {
+    run_native_checks(repository, "WYR1-C5", "wyr1c5", &C5_NATIVE_CHECK_SPECS)
+}
+
+fn run_native_checks(
+    repository: &Path,
+    phase: &str,
+    slug: &str,
+    specs: &[NativeSpec],
+) -> Result<(), Failure> {
     reject_ambient_build_environment(env::vars_os())?;
     let manifest = BuildManifest::load(repository)?;
     let profile = manifest.validate_loader_build_readiness(repository)?;
@@ -163,16 +207,17 @@ pub(crate) fn run_c4_native_checks(repository: &Path) -> Result<(), Failure> {
         .duration_since(UNIX_EPOCH)
         .map_err(|_| Failure::task("system clock is before the Unix epoch"))?
         .as_nanos();
-    let scratch_name = format!("wyr1c4-native-check-{}-{unique}", std::process::id());
-    let scratch = tmp.create_scratch(&scratch_name, "WYR1-C4 native-check scratch")?;
-    let check_result = scratch.with_inheritable_anchor("WYR1-C4 native-check scratch", |target| {
+    let scratch_name = format!("{slug}-native-check-{}-{unique}", std::process::id());
+    let scratch_label = format!("{phase} native-check scratch");
+    let scratch = tmp.create_scratch(&scratch_name, &scratch_label)?;
+    let check_result = scratch.with_inheritable_anchor(&scratch_label, |target| {
         let flags = format!(
             "{}\u{1f}-D\u{1f}warnings",
             native_remap_flags(repository, &cargo_home, target.path())?
         );
-        for spec in C4_NATIVE_CHECK_SPECS {
+        for spec in specs {
             toolchain.accepted().verify_unchanged()?;
-            target.verify_unchanged("WYR1-C4 native-check scratch")?;
+            target.verify_unchanged(&scratch_label)?;
             let status = Command::new(&toolchain.accepted().cargo)
                 .args([
                     "check",
@@ -204,10 +249,10 @@ pub(crate) fn run_c4_native_checks(repository: &Path) -> Result<(), Failure> {
                 .map_err(|error| {
                     Failure::task(format!("could not check {}: {error}", spec.label))
                 })?;
-            target.verify_unchanged("WYR1-C4 native-check scratch")?;
+            target.verify_unchanged(&scratch_label)?;
             if !status.success() {
                 return Err(Failure::task(format!(
-                    "WYR1-C4 canonical {} check failed",
+                    "{phase} canonical {} check failed",
                     spec.label
                 )));
             }

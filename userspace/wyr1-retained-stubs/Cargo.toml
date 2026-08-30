@@ -28,6 +28,7 @@ required-features = ["native-retained"]
 [features]
 default = []
 native-retained = []
+wyr1c5-production = ["native-retained"]
 
 [dependencies]
 wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }

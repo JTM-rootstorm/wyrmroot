@@ -1089,7 +1089,11 @@ where
             return Err(error);
         }
     };
-    let task_group = match system.create_attempt_task_group(resident.authority.task_group) {
+    #[cfg(feature = "wyr1c5-production")]
+    let driver_parent = devmgr.task_group;
+    #[cfg(not(feature = "wyr1c5-production"))]
+    let driver_parent = resident.authority.task_group;
+    let task_group = match system.create_attempt_task_group(driver_parent) {
         Ok(handle) => handle,
         Err(error) => {
             system

@@ -21,9 +21,9 @@ use wyrmroot_runtime::{
     query_memory_object_size, receive_channel, send_channel, set_timer, unmap_bootfs, wait_many,
     wait_one,
 };
-#[cfg(not(feature = "wyr1c4-production"))]
+#[cfg(not(any(feature = "wyr1c4-production", feature = "wyr1c5-production")))]
 use wyrmroot_system_init::continue_system_init_product;
-#[cfg(feature = "wyr1c4-production")]
+#[cfg(any(feature = "wyr1c4-production", feature = "wyr1c5-production"))]
 use wyrmroot_system_init::continue_system_init_resource_product;
 #[cfg(not(any(feature = "wyr1-test-evidence", feature = "wyr1b-test-evidence")))]
 use wyrmroot_system_init::fatal_application_status;
@@ -139,7 +139,7 @@ fn main(startup: StartupBlock<'_>) -> u32 {
     let mut system = NativeSystem;
     let mut loader = NativeLoaderPlatform;
     let mut waits = NativeSupervisionPlatform;
-    #[cfg(not(feature = "wyr1c4-production"))]
+    #[cfg(not(any(feature = "wyr1c4-production", feature = "wyr1c5-production")))]
     let result = continue_system_init_product(
         &mut system,
         &mut loader,
@@ -147,7 +147,7 @@ fn main(startup: StartupBlock<'_>) -> u32 {
         startup.bootstrap_channel().as_abi(),
         continue_resident,
     );
-    #[cfg(feature = "wyr1c4-production")]
+    #[cfg(any(feature = "wyr1c4-production", feature = "wyr1c5-production"))]
     let result = continue_system_init_resource_product(
         &mut system,
         &mut loader,

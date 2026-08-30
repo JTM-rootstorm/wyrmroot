@@ -43,3 +43,18 @@ fn every_c4_devmgr_generation_is_parented_under_retained_custody() {
     assert!(replacement.contains("launch_devmgr("));
     assert!(replacement.contains("resource_domain,"));
 }
+
+#[test]
+fn c5_driver_attempt_is_parented_under_the_current_devmgr_generation() {
+    assert!(MANIFEST.contains("wyr1c5-production = [\"native-init\"]"));
+    let construct = &NATIVE_SOURCE[NATIVE_SOURCE.find("fn construct_driver").unwrap()..];
+    let parent = construct
+        .find("let driver_parent = devmgr.task_group")
+        .unwrap();
+    let create = construct
+        .find("create_attempt_task_group(driver_parent)")
+        .unwrap();
+    let load = construct.find("load_device_driver_process(").unwrap();
+    assert!(parent < create && create < load);
+    assert!(construct.contains("#[cfg(feature = \"wyr1c5-production\")]"));
+}

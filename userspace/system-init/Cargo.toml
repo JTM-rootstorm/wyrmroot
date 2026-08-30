@@ -22,6 +22,7 @@ native-init = []
 wyr1-test-evidence = ["native-init", "wyrmroot-runtime/wyr1-test-evidence"]
 wyr1b-test-evidence = ["native-init", "wyrmroot-runtime/wyr1b-test-evidence"]
 wyr1c4-production = ["native-init"]
+wyr1c5-production = ["native-init"]
 
 [dependencies]
 deepwyrm-syscall.workspace = true

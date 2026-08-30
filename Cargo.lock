@@ -191,6 +191,7 @@ dependencies = [
  "deepwyrm-syscall",
  "wyrmroot-device-proto",
  "wyrmroot-loader",
+ "wyrmroot-registry-proto",
  "wyrmroot-runtime",
 ]
 

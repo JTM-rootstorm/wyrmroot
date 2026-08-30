@@ -32,6 +32,7 @@ This file defines the minimum architecture reading set for Wyrmroot implementati
 ## Active implementation status
 
 - [`Plans/WYR1_C4_IMPLEMENTATION_STATUS.md`](WYR1_C4_IMPLEMENTATION_STATUS.md) records completed WYR1-C4 production/native intake: exact WRBP V3 and WRLP 1.7/1.9 custody, devmgr-generation resource-domain parenting, generated ABI feature and COM2 claim validation, restart ownership, accepted-product-compiler checks, and explicit C5/C6 nonclaims.
+- [`Plans/WYR1_C5_IMPLEMENTATION_STATUS.md`](WYR1_C5_IMPLEMENTATION_STATUS.md) records completed WYR1-C5 direct resource delegation: exact reduced DeviceResource plus fresh Interrupt MOVE, typed actor validation, generation-bound DRIVER_READY before registry publication, explicit retire/cleanup behavior, accepted-product-compiler checks, and the selector-29/live-I/O/restart boundary retained for C6.
 - [`Plans/WYR0_BOOTFS_FORMAT_CONTRACT.md`](WYR0_BOOTFS_FORMAT_CONTRACT.md) defines the canonical
   deterministic archive subset implemented by WYR0-C. Read it before changing bootfs builder,
   parser, lookup, content-manifest, or archive-intake behavior.

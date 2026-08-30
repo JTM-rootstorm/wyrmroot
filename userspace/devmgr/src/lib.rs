@@ -8,7 +8,10 @@
 #![forbid(unsafe_code)]
 
 #[cfg(feature = "native-devmgr")]
-use {deepwyrm_syscall as _, wyrmroot_loader as _, wyrmroot_runtime as _};
+use {
+    deepwyrm_syscall as _, wyrmroot_loader as _, wyrmroot_registry_proto as _,
+    wyrmroot_runtime as _,
+};
 
 use deepwyrm_syscall::{
     DW_DEVICE_RESOURCE_INFO_V1_SIZE, DW_DEVICE_RESOURCE_INFO_V1_VERSION,
@@ -30,6 +33,7 @@ use wyrmroot_device_proto::manifest::{
 };
 use wyrmroot_device_proto::{
     ControlEndpoint, DirectControlRights, DriverLaunch, DriverLaunchError, DriverLaunchRequest,
+    DriverLaunchState,
 };
 
 /// Each supervisor generation owns one disjoint 32-bit driver-correlation
@@ -143,6 +147,8 @@ pub struct ResidentController {
     active_binding: Option<RegistryBinding>,
     active_driver: Option<DriverLaunch>,
     bundle_generation: Option<BundleGeneration>,
+    driver_ready: bool,
+    publication_current: bool,
     next_driver_attempt: u64,
     next_driver_session: u64,
     next_driver_endpoint: u64,
@@ -191,6 +197,8 @@ impl ResidentController {
             active_binding: None,
             active_driver: None,
             bundle_generation: None,
+            driver_ready: false,
+            publication_current: false,
             next_driver_attempt: driver_attempt,
             next_driver_session: driver_session,
             next_driver_endpoint: driver_endpoint,
@@ -212,6 +220,17 @@ impl ResidentController {
 
     pub const fn bundle_generation(&self) -> Option<BundleGeneration> {
         self.bundle_generation
+    }
+
+    pub const fn driver_ready(&self) -> bool {
+        self.driver_ready
+    }
+
+    pub const fn active_driver_request(&self) -> Option<DriverLaunchRequest> {
+        match self.active_driver {
+            Some(launch) => Some(launch.request()),
+            None => None,
+        }
     }
 
     /// Admits one exact queried COM2 resource for this devmgr generation.
@@ -290,12 +309,130 @@ impl ResidentController {
         Ok(request)
     }
 
+    /// C5 entry point: construction is impossible until the exact broad
+    /// resource claim has been admitted for this devmgr generation.
+    pub fn issue_driver_launch_with_bundle(
+        &mut self,
+        child_is_channel: bool,
+        child_rights: DirectControlRights,
+    ) -> Result<DriverLaunchRequest, DevmgrError> {
+        if self.bundle_generation.is_none() || self.status.state != CoordinatorState::Matched {
+            return Err(DevmgrError::ControllerLifecycle);
+        }
+        self.issue_driver_launch(child_is_channel, child_rights)
+    }
+
     pub fn driver_constructed(&mut self) -> Result<(), DevmgrError> {
         self.active_driver
             .as_mut()
             .ok_or(DevmgrError::ControllerLifecycle)?
             .constructed()?;
         Ok(())
+    }
+
+    /// Binds the current resource lease to the one constructed driver attempt.
+    /// Native code moves the exact two-handle bundle only after this message is
+    /// produced and does not mutate this state when the Channel send fails.
+    pub fn resource_bundle_message(
+        &mut self,
+    ) -> Result<wyrmroot_device_proto::ControlMessage, DevmgrError> {
+        if self.status.state != CoordinatorState::Matched || self.driver_ready {
+            return Err(DevmgrError::ControllerLifecycle);
+        }
+        let launch = self.active_driver.ok_or(DevmgrError::ControllerLifecycle)?;
+        if launch.state() != DriverLaunchState::AwaitingControlReady {
+            return Err(DevmgrError::ControllerLifecycle);
+        }
+        let request = launch.request();
+        let bundle_generation = self
+            .bundle_generation
+            .ok_or(DevmgrError::ControllerLifecycle)?;
+        Ok(wyrmroot_device_proto::ControlMessage::ResourceBundle {
+            role_id: request.role_id,
+            bundle_generation,
+            attempt_generation: request.attempt_generation,
+            endpoint: request.endpoint,
+            transaction_id: request.transaction_id,
+        })
+    }
+
+    pub fn bundle_transferred(&mut self) -> Result<(), DevmgrError> {
+        if self.status.state != CoordinatorState::Matched || self.driver_ready {
+            return Err(DevmgrError::ControllerLifecycle);
+        }
+        self.active_driver
+            .as_mut()
+            .ok_or(DevmgrError::ControllerLifecycle)?
+            .bundle_transferred()?;
+        self.status.state = CoordinatorState::AwaitingDriverReady;
+        Ok(())
+    }
+
+    /// Accepts only the post-bundle, generation-exact DRIVER_READY.
+    pub fn accept_driver_ready(
+        &mut self,
+        message: wyrmroot_device_proto::ControlMessage,
+    ) -> Result<(), DevmgrError> {
+        if self.status.state != CoordinatorState::AwaitingDriverReady || self.driver_ready {
+            return Err(DevmgrError::ControllerLifecycle);
+        }
+        let request = self
+            .active_driver_request()
+            .ok_or(DevmgrError::ControllerLifecycle)?;
+        let expected = wyrmroot_device_proto::ControlMessage::Ready {
+            role_id: request.role_id,
+            bundle_generation: self
+                .bundle_generation
+                .ok_or(DevmgrError::ControllerLifecycle)?,
+            attempt_generation: request.attempt_generation,
+            endpoint: request.endpoint,
+            transaction_id: request.transaction_id,
+        };
+        if message != expected {
+            return Err(DevmgrError::ControllerLifecycle);
+        }
+        self.active_driver
+            .as_mut()
+            .ok_or(DevmgrError::ControllerLifecycle)?
+            .driver_ready()?;
+        self.driver_ready = true;
+        self.publication_current = false;
+        self.status.state = CoordinatorState::AwaitingPublication;
+        Ok(())
+    }
+
+    pub fn publication_committed(&mut self) -> Result<(), DevmgrError> {
+        if self.status.state != CoordinatorState::AwaitingPublication
+            || !self.driver_ready
+            || self.active_binding.is_none()
+            || self.publication_current
+        {
+            return Err(DevmgrError::ControllerLifecycle);
+        }
+        self.publication_current = true;
+        self.status.state = CoordinatorState::Published;
+        Ok(())
+    }
+
+    pub fn retire_message(&mut self) -> Result<wyrmroot_device_proto::ControlMessage, DevmgrError> {
+        if !self.driver_ready {
+            return Err(DevmgrError::ControllerLifecycle);
+        }
+        let request = self
+            .active_driver_request()
+            .ok_or(DevmgrError::ControllerLifecycle)?;
+        let message = wyrmroot_device_proto::ControlMessage::Retire {
+            role_id: request.role_id,
+            bundle_generation: self
+                .bundle_generation
+                .ok_or(DevmgrError::ControllerLifecycle)?,
+            attempt_generation: request.attempt_generation,
+            endpoint: request.endpoint,
+            transaction_id: request.transaction_id,
+        };
+        self.publication_current = false;
+        self.status.state = CoordinatorState::CleaningUp;
+        Ok(message)
     }
 
     pub fn accept_driver_control_ready(
@@ -315,6 +452,8 @@ impl ResidentController {
             .take()
             .ok_or(DevmgrError::ControllerLifecycle)?;
         launch.reap()?;
+        self.driver_ready = false;
+        self.publication_current = false;
         Ok(())
     }
 
@@ -382,7 +521,9 @@ impl ResidentController {
                 self.last_transaction_id = transaction_id;
                 self.last_binding = Some(binding);
                 self.active_binding = Some(binding);
-                self.status.state = if self.bundle_generation.is_some() {
+                self.status.state = if self.driver_ready {
+                    CoordinatorState::AwaitingPublication
+                } else if self.bundle_generation.is_some() {
                     CoordinatorState::Matched
                 } else {
                     CoordinatorState::WaitingForDeviceBundle
@@ -401,6 +542,7 @@ impl ResidentController {
             return Err(DevmgrError::ControllerLifecycle);
         }
         self.active_binding = None;
+        self.publication_current = false;
         self.status.state = CoordinatorState::WaitingForRegistry;
         Ok(())
     }
@@ -415,9 +557,7 @@ impl ResidentController {
             StatusCode::OperationalWaitingForRegistry => None,
             StatusCode::OperationalWaitingForDeviceBundle => self.active_binding,
             StatusCode::OperationalResourceOwned => {
-                if self.status.state != CoordinatorState::Matched
-                    || self.bundle_generation.is_none()
-                {
+                if self.bundle_generation.is_none() {
                     return Err(DevmgrError::ControllerLifecycle);
                 }
                 self.active_binding
@@ -687,6 +827,112 @@ mod tests {
         assert_eq!(
             resident.admit_device_resource(exact_resource(1)),
             Err(DevmgrError::ResourceIdentity)
+        );
+    }
+
+    #[test]
+    fn c5_requires_claim_then_constructed_bundle_before_generation_ready_and_publish() {
+        let mut resident =
+            ResidentController::new(prepare_operational(&manifest(), 7).unwrap(), 41).unwrap();
+        resident.accept(install(binding(1, 7), 41), 0).unwrap();
+        assert_eq!(
+            resident.issue_driver_launch_with_bundle(true, DirectControlRights::ExactReduced),
+            Err(DevmgrError::ControllerLifecycle)
+        );
+        resident.admit_device_resource(exact_resource(19)).unwrap();
+        let request = resident
+            .issue_driver_launch_with_bundle(true, DirectControlRights::ExactReduced)
+            .unwrap();
+        assert_eq!(
+            resident.resource_bundle_message(),
+            Err(DevmgrError::ControllerLifecycle)
+        );
+        resident.driver_constructed().unwrap();
+        let bundle = resident.resource_bundle_message().unwrap();
+        assert_eq!(
+            bundle,
+            wyrmroot_device_proto::ControlMessage::ResourceBundle {
+                role_id: request.role_id,
+                bundle_generation: BundleGeneration(19),
+                attempt_generation: request.attempt_generation,
+                endpoint: request.endpoint,
+                transaction_id: request.transaction_id,
+            }
+        );
+        assert_eq!(resident.status().state, CoordinatorState::Matched);
+        resident.bundle_transferred().unwrap();
+        assert_eq!(
+            resident.status().state,
+            CoordinatorState::AwaitingDriverReady
+        );
+        assert_eq!(
+            resident.accept_driver_ready(wyrmroot_device_proto::ControlMessage::Ready {
+                role_id: request.role_id,
+                bundle_generation: BundleGeneration(20),
+                attempt_generation: request.attempt_generation,
+                endpoint: request.endpoint,
+                transaction_id: request.transaction_id,
+            }),
+            Err(DevmgrError::ControllerLifecycle)
+        );
+        resident
+            .accept_driver_ready(wyrmroot_device_proto::ControlMessage::Ready {
+                role_id: request.role_id,
+                bundle_generation: BundleGeneration(19),
+                attempt_generation: request.attempt_generation,
+                endpoint: request.endpoint,
+                transaction_id: request.transaction_id,
+            })
+            .unwrap();
+        assert_eq!(
+            resident.status().state,
+            CoordinatorState::AwaitingPublication
+        );
+        resident.publication_committed().unwrap();
+        assert_eq!(resident.status().state, CoordinatorState::Published);
+        assert_eq!(
+            resident.publication_committed(),
+            Err(DevmgrError::ControllerLifecycle)
+        );
+    }
+
+    #[test]
+    fn c5_retire_is_generation_exact_and_cleanup_clears_driver_readiness() {
+        let mut resident =
+            ResidentController::new(prepare_operational(&manifest(), 7).unwrap(), 41).unwrap();
+        resident.accept(install(binding(1, 7), 41), 0).unwrap();
+        resident.admit_device_resource(exact_resource(19)).unwrap();
+        let request = resident
+            .issue_driver_launch_with_bundle(true, DirectControlRights::ExactReduced)
+            .unwrap();
+        resident.driver_constructed().unwrap();
+        resident.resource_bundle_message().unwrap();
+        resident.bundle_transferred().unwrap();
+        resident
+            .accept_driver_ready(wyrmroot_device_proto::ControlMessage::Ready {
+                role_id: request.role_id,
+                bundle_generation: BundleGeneration(19),
+                attempt_generation: request.attempt_generation,
+                endpoint: request.endpoint,
+                transaction_id: request.transaction_id,
+            })
+            .unwrap();
+        assert_eq!(
+            resident.retire_message(),
+            Ok(wyrmroot_device_proto::ControlMessage::Retire {
+                role_id: request.role_id,
+                bundle_generation: BundleGeneration(19),
+                attempt_generation: request.attempt_generation,
+                endpoint: request.endpoint,
+                transaction_id: request.transaction_id,
+            })
+        );
+        assert_eq!(resident.status().state, CoordinatorState::CleaningUp);
+        resident.reap_driver().unwrap();
+        assert!(!resident.driver_ready());
+        assert_eq!(
+            resident.retire_message(),
+            Err(DevmgrError::ControllerLifecycle)
         );
     }
 

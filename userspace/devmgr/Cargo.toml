@@ -18,14 +18,20 @@ required-features = ["native-devmgr"]
 
 [features]
 default = []
-native-devmgr = ["dep:wyrmroot-loader", "dep:wyrmroot-runtime"]
+native-devmgr = [
+    "dep:wyrmroot-loader",
+    "dep:wyrmroot-registry-proto",
+    "dep:wyrmroot-runtime",
+]
 wyr1c4-production = ["native-devmgr"]
+wyr1c5-production = ["native-devmgr"]
 
 [dependencies]
 deepwyrm-syscall.workspace = true
 wyrmroot-device-proto = { path = "../../crates/wyrmroot-device-proto" }
 wyrmroot-loader = { path = "../../crates/wyrmroot-loader", optional = true }
 wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime", optional = true }
+wyrmroot-registry-proto = { path = "../../crates/wyrmroot-registry-proto", optional = true }
 
 [lints.rust]
 unsafe_code = "deny"
