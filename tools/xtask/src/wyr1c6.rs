@@ -278,7 +278,7 @@ fn build_produced_artifacts(
             cargo_profile: tasks::UefiCargoProfile::Release,
         },
     )?;
-    let loader = read_regular_bounded(&uefi.loader, MAX_ARTIFACT_BYTES, "loader")?;
+    let loader = uefi.loader_bytes;
     let bootstrap = build_c6_bootstrap(repository, &toolchain, &layout, &cargo_home, &build)?;
     let snapshot = crate::wyr1c::build_c6_snapshot(nonce)?;
     let kernel = build_selector29_kernel(deep_repository, &build, nonce)?;
