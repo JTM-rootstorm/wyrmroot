@@ -117,7 +117,7 @@ pub fn prepare_operational(
     manifest_bytes: &[u8],
     supervisor_generation: u64,
 ) -> Result<OperationalStatus, DevmgrError> {
-    let manifest = Manifest::parse(manifest_bytes)?;
+    let manifest = Manifest::parse_padded(manifest_bytes)?;
     let candidate = manifest.get(0).ok_or(DevmgrError::MissingRole)?;
     let mut coordinator = Coordinator::new(SupervisorGeneration(supervisor_generation))?;
     coordinator.intake_manifest(manifest, candidate.content_identity)?;
@@ -762,6 +762,22 @@ mod tests {
         );
         assert_eq!(status.irq, 3);
         assert!(!status.is_device_bound());
+    }
+
+    #[test]
+    fn page_padded_manifest_becomes_operational_only_when_padding_is_zero() {
+        let exact = manifest();
+        let mut page = [0u8; 4096];
+        page[..exact.len()].copy_from_slice(&exact);
+        assert_eq!(
+            prepare_operational(&page, 7).unwrap().state,
+            CoordinatorState::WaitingForRegistry
+        );
+        page[exact.len()] = 1;
+        assert_eq!(
+            prepare_operational(&page, 7),
+            Err(DevmgrError::Manifest(ManifestError::NonzeroObjectPadding))
+        );
     }
 
     #[test]

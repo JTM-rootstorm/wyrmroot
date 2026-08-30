@@ -171,6 +171,31 @@ pub struct Manifest<'a> {
 }
 
 impl<'a> Manifest<'a> {
+    /// Parses a WRDM manifest from its page-granular immutable object view.
+    ///
+    /// The WRDM header remains the sole logical-length authority. Any bytes
+    /// beyond that exact logical extent must be zero, so page alignment cannot
+    /// smuggle a second policy payload past the strict [`Self::parse`] path.
+    pub fn parse_padded(bytes: &'a [u8]) -> Result<Self, ManifestError> {
+        if bytes.len() < HEADER_BYTES {
+            return Err(ManifestError::WrongSize);
+        }
+        if bytes[..4] != MAGIC {
+            return Err(ManifestError::WrongMagic);
+        }
+        if get_u16(bytes, 4) != MAJOR || get_u16(bytes, 6) != MINOR {
+            return Err(ManifestError::WrongVersion);
+        }
+        let total = get_u32(bytes, 8) as usize;
+        if total < HEADER_BYTES || total > bytes.len() {
+            return Err(ManifestError::WrongSize);
+        }
+        if bytes[total..].iter().any(|byte| *byte != 0) {
+            return Err(ManifestError::NonzeroObjectPadding);
+        }
+        Self::parse(&bytes[..total])
+    }
+
     pub fn parse(bytes: &'a [u8]) -> Result<Self, ManifestError> {
         if bytes.len() < HEADER_BYTES {
             return Err(ManifestError::WrongSize);
@@ -288,6 +313,7 @@ pub enum ManifestError {
     WrongVersion,
     WrongProfile,
     NonzeroReserved,
+    NonzeroObjectPadding,
     ZeroRole,
     UnknownHardware,
     UnknownResourceKind,
@@ -470,6 +496,25 @@ mod tests {
             encode_com2_manifest(ContentIdentity([9; 32]), &mut bytes[..16]),
             Err(ManifestError::WrongSize)
         );
+    }
+
+    #[test]
+    fn page_granular_object_view_uses_declared_extent_and_rejects_hidden_tail() {
+        let exact = manifest(1, 2, 0x2f8, 3, UART16550D_PATH, 9);
+        let mut page = [0u8; 4096];
+        page[..exact.len()].copy_from_slice(&exact);
+
+        assert_eq!(Manifest::parse(&page), Err(ManifestError::WrongSize));
+        assert_eq!(Manifest::parse_padded(&page).unwrap().len(), 1);
+
+        page[exact.len()] = 1;
+        assert_eq!(
+            Manifest::parse_padded(&page),
+            Err(ManifestError::NonzeroObjectPadding)
+        );
+        page[exact.len()] = 0;
+        page[8..12].copy_from_slice(&4097u32.to_le_bytes());
+        assert_eq!(Manifest::parse_padded(&page), Err(ManifestError::WrongSize));
     }
 
     #[test]
