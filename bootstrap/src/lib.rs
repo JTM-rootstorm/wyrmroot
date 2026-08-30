@@ -198,6 +198,8 @@ pub const D6_REPLACEMENT_OWNER_TRANSACTION: u64 = 0x4457_3144_365f_0003;
 #[cfg(feature = "dw1d6-synthetic")]
 const D6_RESOURCE_RIGHTS: DwRights =
     DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_MODIFY.0 | DW_RIGHT_INSPECT.0);
+#[cfg(feature = "dw1d6-synthetic")]
+const D6_TERMINATE_REGISTRATION_RETRIES: u32 = 1_000_000;
 use wyrmroot_runtime::{
     ExitObservedReadinessError, ExitValidationError, ObservedSupervisionError, SupervisionError,
     SupervisionPlatform, validate_successful_exit,
@@ -535,9 +537,7 @@ pub fn run_d6_synthetic_bootstrap<
             0,
         ),
     )?;
-    system
-        .terminate_process(replacement.process)
-        .map_err(BootstrapError::Native)?;
+    terminate_d6_replacement(system, replacement.process)?;
     system
         .wait_for_process_exit(replacement.process)
         .map_err(BootstrapError::Native)?;
@@ -665,6 +665,27 @@ fn receive_d6_controller_message<System: BootstrapSystem>(
             Ok(counts) => return Err(BootstrapError::ReceiveCounts(counts)),
             Err(NativeError::Status(status)) if status == DW_STATUS_WOULD_BLOCK => {
                 core::hint::spin_loop()
+            }
+            Err(error) => return Err(BootstrapError::Native(error)),
+        }
+    }
+}
+
+#[cfg(feature = "dw1d6-synthetic")]
+fn terminate_d6_replacement<System: BootstrapSystem>(
+    system: &mut System,
+    process: DwHandle,
+) -> Result<(), BootstrapError> {
+    let mut attempts = 0_u32;
+    loop {
+        match system.terminate_process(process) {
+            Ok(()) => return Ok(()),
+            Err(NativeError::Status(status))
+                if status == DW_STATUS_WOULD_BLOCK
+                    && attempts < D6_TERMINATE_REGISTRATION_RETRIES =>
+            {
+                attempts += 1;
+                core::hint::spin_loop();
             }
             Err(error) => return Err(BootstrapError::Native(error)),
         }

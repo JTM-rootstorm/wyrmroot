@@ -78,6 +78,9 @@ fn dw1c_bootstrap_watchdog_contains_the_selector_transaction() {
 fn d6_bootstrap_is_feature_gated_v3_and_keeps_actors_out_of_production_init() {
     assert!(MANIFEST.contains("dw1d6-synthetic = [\"native-bootstrap\""));
     assert!(MAIN_SOURCE.contains("#[cfg(feature = \"dw1d6-synthetic\")]"));
+    assert!(LIB_SOURCE.contains("terminate_d6_replacement(system, replacement.process)"));
+    assert!(LIB_SOURCE.contains("status == DW_STATUS_WOULD_BLOCK"));
+    assert!(LIB_SOURCE.contains("D6_TERMINATE_REGISTRATION_RETRIES"));
     assert!(LIB_SOURCE.contains("BootstrapMessage::InitV3"));
     assert!(LIB_SOURCE.contains("validate_init_capabilities_v3"));
     assert!(LIB_SOURCE.contains("load_d6_resource_owner_process"));
