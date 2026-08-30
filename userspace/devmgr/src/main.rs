@@ -808,12 +808,15 @@ fn retire_driver_publication(
     resident: &wyrmroot_devmgr::ResidentController,
 ) -> Result<(), u32> {
     let binding = resident.active_binding().ok_or(failure(106))?;
+    let retire_transaction = resident
+        .publication_retire_transaction(request)
+        .map_err(|_| failure(152))?;
     let header = RegistryHeader {
         message_type: RegistryMessageType::Retire,
         registry_generation: binding.generation.0,
         endpoint_id: binding.endpoint.id.0,
         endpoint_generation: binding.endpoint.generation.0,
-        transaction_id: request.transaction_id,
+        transaction_id: retire_transaction,
     };
     let mut bytes = [0u8; REGISTRY_HEADER_BYTES];
     let size = encode_registry_empty(header, &mut bytes).map_err(|_| failure(107))?;

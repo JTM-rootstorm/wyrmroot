@@ -493,6 +493,24 @@ impl ResidentController {
         Ok(())
     }
 
+    /// Allocates the endpoint-local registry transaction used to retire the
+    /// failed driver's publication. Publish has already completed with the
+    /// launch transaction, so replay protection requires a distinct identity.
+    pub fn publication_retire_transaction(
+        &self,
+        request: DriverLaunchRequest,
+    ) -> Result<u64, DevmgrError> {
+        if self.status.state != CoordinatorState::CleaningUp
+            || self.active_driver_request() != Some(request)
+        {
+            return Err(DevmgrError::ControllerLifecycle);
+        }
+        request
+            .transaction_id
+            .checked_add(1)
+            .ok_or(DevmgrError::ControllerLifecycle)
+    }
+
     /// Drops only the retired registry endpoint. The D1 resource lease and
     /// failed attempt identity remain until init confirms reaping.
     pub fn publication_retired(&mut self) -> Result<(), DevmgrError> {
@@ -1111,6 +1129,9 @@ mod tests {
             .unwrap();
         resident.publication_committed().unwrap();
         resident.driver_failed(request.endpoint).unwrap();
+        let retire_transaction = resident.publication_retire_transaction(request).unwrap();
+        assert_eq!(retire_transaction, request.transaction_id + 1);
+        assert_ne!(retire_transaction, request.transaction_id);
         resident.publication_retired().unwrap();
         resident.reap_driver().unwrap();
         assert_eq!(

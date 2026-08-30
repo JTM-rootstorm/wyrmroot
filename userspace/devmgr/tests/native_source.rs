@@ -134,6 +134,20 @@ fn selector29_stale_probes_run_after_p2_publication_and_close_before_probe() {
 }
 
 #[test]
+fn c6_retirement_uses_a_fresh_endpoint_local_registry_transaction() {
+    let retire = &NATIVE[NATIVE.find("fn retire_driver_publication(").unwrap()
+        ..NATIVE.find("fn probe_stale_driver_endpoint(").unwrap()];
+    let allocate = retire
+        .find("publication_retire_transaction(request)")
+        .expect("resident allocates the post-publish retirement transaction");
+    let header = retire
+        .find("transaction_id: retire_transaction")
+        .expect("Retire carries the fresh transaction");
+    assert!(allocate < header);
+    assert!(!retire.contains("transaction_id: request.transaction_id"));
+}
+
+#[test]
 fn selector29_native_path_has_no_physical_device_io_calls() {
     assert!(!NATIVE.contains("device_pio_read"));
     assert!(!NATIVE.contains("device_pio_write"));
