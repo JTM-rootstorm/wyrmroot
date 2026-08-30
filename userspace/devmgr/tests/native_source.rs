@@ -25,7 +25,7 @@ fn native_path_keeps_the_c3_launch_surface_hardware_free() {
     assert!(NATIVE.contains("LaunchProfile::DeviceCoordinator"));
     assert!(NATIVE.contains("DEVICE_MANIFEST_RIGHTS"));
     assert!(NATIVE.contains("DW_OBJECT_TYPE_MEMORY_OBJECT"));
-    assert!(NATIVE.contains("send_channel(bootstrap, &ready[..ready_len], &[])"));
+    assert!(NATIVE.contains("send_bootstrap_channel(bootstrap, &ready[..ready_len], &[], 15)"));
     assert!(NATIVE.contains("issue_driver_launch"));
     assert!(NATIVE.contains("parse_constructed"));
     assert!(NATIVE.contains("accept_driver_control_ready"));
@@ -139,13 +139,14 @@ fn selector29_native_path_has_no_physical_device_io_calls() {
 
 #[test]
 fn selector29_fact_delivery_handles_bounded_channel_backpressure() {
-    let send = &NATIVE[NATIVE.find("fn send_c6_fact(").unwrap()..];
-    let send = &send[..send.find("fn validate_fresh(").unwrap()];
+    let send = &NATIVE[NATIVE.find("fn send_bootstrap_channel(").unwrap()..];
+    let send = &send[..send.find("fn send_c6_fact(").unwrap()];
     assert!(send.contains("for _ in 0..4"));
     assert!(send.contains("DW_STATUS_WOULD_BLOCK"));
     assert!(send.contains("DW_SIGNAL_WRITABLE.0 | DW_SIGNAL_PEER_CLOSED.0"));
     assert!(send.contains("WYR0_I_SUPERVISION_POLICY.ready_timeout_ns"));
     assert!(!send.contains("DW_DEADLINE_INFINITE"));
+    assert!(NATIVE.contains("send_bootstrap_channel(\n        bootstrap,\n        &launch,"));
 }
 
 #[test]

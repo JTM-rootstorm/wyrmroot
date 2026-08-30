@@ -229,7 +229,7 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
     let launch_profile = LaunchProfile::DeviceCoordinatorResourceDomain;
     let ready_len = encode_ready_for_profile(launch_profile, parsed.transaction_id, &mut ready)
         .map_err(|_| failure(14))?;
-    send_channel(bootstrap, &ready[..ready_len], &[]).map_err(|_| failure(15))?;
+    send_bootstrap_channel(bootstrap, &ready[..ready_len], &[], 15)?;
 
     let mut publication = Some(publication);
     let mut driver_control = None;
@@ -905,7 +905,7 @@ fn send_driver_retired(
 ) -> Result<(), u32> {
     let mut bytes = [0u8; wyrmroot_device_proto::driver_launch::DRIVER_RETIRED_BYTES];
     encode_driver_retired(request, &mut bytes).map_err(|_| failure(120))?;
-    send_channel(bootstrap, &bytes, &[]).map_err(|_| failure(121))
+    send_bootstrap_channel(bootstrap, &bytes, &[], 121)
 }
 
 #[cfg(not(any(feature = "wyr1c4-production", feature = "wyr1c5-production")))]
@@ -942,7 +942,7 @@ fn launch_driver(
         reserved0: 0,
         reserved: [0; 2],
     };
-    if send_channel(bootstrap, &bytes, core::slice::from_ref(&transfer)).is_err() {
+    if send_bootstrap_channel(bootstrap, &bytes, core::slice::from_ref(&transfer), 48).is_err() {
         let _ = close_handle(child);
         let _ = close_handle(retained);
         return Err(failure(48));
@@ -1022,7 +1022,14 @@ fn launch_driver_with_bundle(
         reserved0: 0,
         reserved: [0; 2],
     };
-    if send_channel(bootstrap, &launch, core::slice::from_ref(&child_transfer)).is_err() {
+    if send_bootstrap_channel(
+        bootstrap,
+        &launch,
+        core::slice::from_ref(&child_transfer),
+        61,
+    )
+    .is_err()
+    {
         let _ = close_handle(child);
         let _ = close_handle(retained);
         return Err(failure(61));
@@ -1366,17 +1373,24 @@ fn send_resident_status(
     let message = resident.report(status).map_err(|_| failure(35))?;
     let mut bytes = [0u8; STATUS_BYTES];
     encode_controller(message, &mut bytes).map_err(|_| failure(36))?;
-    send_channel(bootstrap, &bytes, &[]).map_err(|_| failure(37))
+    send_bootstrap_channel(bootstrap, &bytes, &[], 37)
 }
 
-#[cfg(feature = "wyr1c6-selector29")]
-fn send_c6_fact(bootstrap: DwHandle, fact: C6Fact) -> Result<(), u32> {
-    let mut bytes = [0u8; C6_FACT_BYTES];
-    encode_c6_fact(fact, &mut bytes).map_err(|_| failure(127))?;
+fn send_bootstrap_channel(
+    bootstrap: DwHandle,
+    bytes: &[u8],
+    transfers: &[DwHandleTransferV1],
+    stage: u32,
+) -> Result<(), u32> {
+    #[cfg(not(feature = "wyr1c6-selector29"))]
+    return send_channel(bootstrap, bytes, transfers).map_err(|_| failure(stage));
+
+    #[cfg(feature = "wyr1c6-selector29")]
     let deadline = monotonic_deadline_after(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
-        .map_err(|_| failure(128))?;
+        .map_err(|_| failure(stage))?;
+    #[cfg(feature = "wyr1c6-selector29")]
     for _ in 0..4 {
-        match send_channel(bootstrap, &bytes, &[]) {
+        match send_channel(bootstrap, bytes, transfers) {
             Ok(()) => return Ok(()),
             Err(NativeError::Status(status)) if status == DW_STATUS_WOULD_BLOCK => {
                 let writable = DwWaitItemV1 {
@@ -1386,18 +1400,26 @@ fn send_c6_fact(bootstrap: DwHandle, fact: C6Fact) -> Result<(), u32> {
                     ),
                 };
                 let observed = wait_many(core::slice::from_ref(&writable), deadline)
-                    .map_err(|_| failure(128))?;
+                    .map_err(|_| failure(stage))?;
                 if observed.index != 0
                     || observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0
                     || observed.observed.0 & DW_SIGNAL_WRITABLE.0 == 0
                 {
-                    return Err(failure(128));
+                    return Err(failure(stage));
                 }
             }
-            Err(_) => return Err(failure(128)),
+            Err(_) => return Err(failure(stage)),
         }
     }
-    Err(failure(128))
+    #[cfg(feature = "wyr1c6-selector29")]
+    Err(failure(stage))
+}
+
+#[cfg(feature = "wyr1c6-selector29")]
+fn send_c6_fact(bootstrap: DwHandle, fact: C6Fact) -> Result<(), u32> {
+    let mut bytes = [0u8; C6_FACT_BYTES];
+    encode_c6_fact(fact, &mut bytes).map_err(|_| failure(127))?;
+    send_bootstrap_channel(bootstrap, &bytes, &[], 128)
 }
 
 fn validate_fresh(handle: DwHandle, object_type: DwObjectType, rights: DwRights) -> Result<(), ()> {
