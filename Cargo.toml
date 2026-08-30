@@ -36,6 +36,6 @@ license = "GPL-2.0-or-later"
 repository = "https://github.com/JTM-rootstorm/wyrmroot"
 
 [workspace.dependencies]
-deepwyrm-abi = { git = "https://github.com/JTM-rootstorm/deepwyrm.git", rev = "dc26df4a3d701e2cdf8b495e2c87ce979969a9c4" }
-deepwyrm-syscall = { git = "https://github.com/JTM-rootstorm/deepwyrm.git", rev = "dc26df4a3d701e2cdf8b495e2c87ce979969a9c4" }
+deepwyrm-abi = { git = "https://github.com/JTM-rootstorm/deepwyrm.git", rev = "085b184c32ae1fa3d5ec322c86957dd5d036595c" }
+deepwyrm-syscall = { git = "https://github.com/JTM-rootstorm/deepwyrm.git", rev = "085b184c32ae1fa3d5ec322c86957dd5d036595c" }
 uefi = { version = "=0.39.0", default-features = false, features = ["alloc", "global_allocator", "panic_handler"] }

@@ -16,7 +16,7 @@ use crate::h_request::{self, ExpectedOutcome, HRequest};
 use crate::metadata::BuildManifest;
 use crate::sha256;
 
-const DEEPWYRM_ABI_REVISION: &str = "dc26df4a3d701e2cdf8b495e2c87ce979969a9c4";
+const DEEPWYRM_ABI_REVISION: &str = "085b184c32ae1fa3d5ec322c86957dd5d036595c";
 const RUST_REVISION: &str = "a92dc7f7464ad6ddfece4402bd7b86dbfa86166d";
 const RUST_TOOLCHAIN_NAME: &str = "wyrmroot-1.97.1-a92dc7f7";
 const MAX_SOURCE_FILES: usize = 4096;
@@ -1243,7 +1243,7 @@ mod tests {
 
     #[test]
     fn artifact_audit_separates_product_revision_from_the_pinned_abi_revision() {
-        let later_product = "2a9a42b33b9a4d0c7587ee7e4b51314b351e0b74";
+        let later_product = "4a8b5c5930dc7f346c306e54cd277fd4f773e987";
         assert!(
             validate_request_source_pins(
                 later_product,
@@ -1259,7 +1259,7 @@ mod tests {
             validate_request_source_pins(
                 later_product,
                 RUST_REVISION,
-                "6b25d12e69f5bd6f5e1e9a983310c60a36af22fa",
+                "8eec089bd8c001456f0cf7d030f46b0b6c70dcac",
                 RUST_REVISION,
                 DEEPWYRM_ABI_REVISION,
                 RUST_REVISION,
@@ -1395,7 +1395,7 @@ mod tests {
     fn local_deepwyrm_transport_is_exact_and_process_scoped() {
         const SOURCE: &str = include_str!("../../../toolchain/cargo-with-local-deepwyrm.sh");
         for expected in [
-            "revision=dc26df4a3d701e2cdf8b495e2c87ce979969a9c4",
+            "revision=085b184c32ae1fa3d5ec322c86957dd5d036595c",
             "abi_tree=a9b067107ec38e2be44630f4dce428dab0f48de8",
             "abi_crate_tree=6f3d546436e10df79a17db610fe9a8383cc26abc",
             "syscall_crate_tree=a64290953ccc0548e908be88586969ac0b70b589",

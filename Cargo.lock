@@ -23,12 +23,12 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 [[package]]
 name = "deepwyrm-abi"
 version = "0.0.0"
-source = "git+https://github.com/JTM-rootstorm/deepwyrm.git?rev=dc26df4a3d701e2cdf8b495e2c87ce979969a9c4#dc26df4a3d701e2cdf8b495e2c87ce979969a9c4"
+source = "git+https://github.com/JTM-rootstorm/deepwyrm.git?rev=085b184c32ae1fa3d5ec322c86957dd5d036595c#085b184c32ae1fa3d5ec322c86957dd5d036595c"
 
 [[package]]
 name = "deepwyrm-syscall"
 version = "0.0.0"
-source = "git+https://github.com/JTM-rootstorm/deepwyrm.git?rev=dc26df4a3d701e2cdf8b495e2c87ce979969a9c4#dc26df4a3d701e2cdf8b495e2c87ce979969a9c4"
+source = "git+https://github.com/JTM-rootstorm/deepwyrm.git?rev=085b184c32ae1fa3d5ec322c86957dd5d036595c#085b184c32ae1fa3d5ec322c86957dd5d036595c"
 dependencies = [
  "deepwyrm-abi",
 ]

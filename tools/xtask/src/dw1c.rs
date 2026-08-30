@@ -35,7 +35,7 @@ const TEST_ID: &str = "28";
 // Wyrmroot's accepted toolchain/layout is tied to this generated ABI revision.
 // The product kernel is intentionally built from the explicit Deep candidate;
 // DW1-B uses the same two-revision split.
-const GENERATED_ABI_REVISION: &str = "dc26df4a3d701e2cdf8b495e2c87ce979969a9c4";
+const GENERATED_ABI_REVISION: &str = "085b184c32ae1fa3d5ec322c86957dd5d036595c";
 const DEEPWYRM_ABI_TREE: &str = "a9b067107ec38e2be44630f4dce428dab0f48de8";
 const MACHINE: &str = "pc-q35-10.2";
 const DOMAIN_UUID: &str = "33005e22-d7c2-4b13-b1ac-b82eda95e584";
