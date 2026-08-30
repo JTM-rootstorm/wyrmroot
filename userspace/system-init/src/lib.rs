@@ -97,7 +97,11 @@ pub const fn fatal_application_status(_error: &InitError) -> InitApplicationStat
 /// Test-only application status that preserves the top-level init failure
 /// category across the selector's process-exit boundary. These values are
 /// diagnostic evidence, not part of the production application-status ABI.
-#[cfg(any(feature = "wyr1-test-evidence", feature = "wyr1b-test-evidence"))]
+#[cfg(any(
+    feature = "wyr1-test-evidence",
+    feature = "wyr1b-test-evidence",
+    feature = "wyr1c6-selector29"
+))]
 const fn test_failure_category(error: &InitError) -> u32 {
     match error {
         InitError::WrongManifestProfile => 0x01,
@@ -134,7 +138,17 @@ const fn test_failure_category(error: &InitError) -> u32 {
         InitError::Wyr1BGateMismatch => 0x1c,
         InitError::Wyr1BModel(_) => 0x1d,
         InitError::Wyr1BEvidence(_) => 0x1e,
+        #[cfg(feature = "wyr1c6-selector29")]
+        InitError::Wyr1C6GateConfig(_) => 0x1f,
     }
+}
+
+/// Selector-29-only status preserving the pre-READY system-init failure
+/// category across the primordial Process-exit boundary.
+#[cfg(feature = "wyr1c6-selector29")]
+#[must_use]
+pub const fn wyr1c6_test_failure_application_status(error: &InitError) -> u32 {
+    0xAF1C_0000 | test_failure_category(error)
 }
 
 #[cfg(feature = "wyr1-test-evidence")]
@@ -3499,6 +3513,25 @@ mod native_cleanup_tests {
             InitApplicationStatus::FatalRebootRequired
         );
         assert_eq!(fatal_application_status(&error) as u32, 0xAF01_0002);
+    }
+
+    #[cfg(feature = "wyr1c6-selector29")]
+    #[test]
+    fn wyr1c6_test_failure_status_preserves_pre_ready_category() {
+        assert_eq!(
+            wyr1c6_test_failure_application_status(&InitError::WrongManifestProfile),
+            0xAF1C_0001
+        );
+        assert_eq!(
+            wyr1c6_test_failure_application_status(&InitError::Capability(
+                CapabilityValidationError::InvalidFreshCapability,
+            )),
+            0xAF1C_0010
+        );
+        assert_eq!(
+            wyr1c6_test_failure_application_status(&InitError::Accounting),
+            0xAF1C_0016
+        );
     }
 
     #[cfg(feature = "wyr1-test-evidence")]

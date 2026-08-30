@@ -25,7 +25,11 @@ use wyrmroot_runtime::{
 use wyrmroot_system_init::continue_system_init_product;
 #[cfg(any(feature = "wyr1c4-production", feature = "wyr1c5-production"))]
 use wyrmroot_system_init::continue_system_init_resource_product;
-#[cfg(not(any(feature = "wyr1-test-evidence", feature = "wyr1b-test-evidence")))]
+#[cfg(not(any(
+    feature = "wyr1-test-evidence",
+    feature = "wyr1b-test-evidence",
+    feature = "wyr1c6-selector29"
+)))]
 use wyrmroot_system_init::fatal_application_status;
 #[cfg(feature = "wyr1-test-evidence")]
 use wyrmroot_system_init::wyr1_test_failure_application_status;
@@ -33,7 +37,9 @@ use wyrmroot_system_init::wyr1_test_failure_application_status;
 use wyrmroot_system_init::wyr1b_test_failure_application_status;
 use wyrmroot_system_init::{InitPlatform, ResidentSystemInit, Wyr1BPlatform};
 #[cfg(feature = "wyr1c6-selector29")]
-use wyrmroot_system_init::{wyr1c_native, wyr1c6_gate};
+use wyrmroot_system_init::{
+    wyr1c_native, wyr1c6_gate, wyr1c6_test_failure_application_status,
+};
 use wyrmroot_wyr1b_gate_proto as _;
 
 struct NativeSystem;
@@ -160,11 +166,17 @@ fn main(startup: StartupBlock<'_>) -> u32 {
     match result {
         Ok(status) => status,
         Err(error) => {
+            #[cfg(feature = "wyr1c6-selector29")]
+            return wyr1c6_test_failure_application_status(&error);
             #[cfg(feature = "wyr1b-test-evidence")]
             return wyr1b_test_failure_application_status(&error);
             #[cfg(all(feature = "wyr1-test-evidence", not(feature = "wyr1b-test-evidence")))]
             return wyr1_test_failure_application_status(&error);
-            #[cfg(not(any(feature = "wyr1-test-evidence", feature = "wyr1b-test-evidence")))]
+            #[cfg(not(any(
+                feature = "wyr1-test-evidence",
+                feature = "wyr1b-test-evidence",
+                feature = "wyr1c6-selector29"
+            )))]
             return fatal_application_status(&error) as u32;
         }
     }
