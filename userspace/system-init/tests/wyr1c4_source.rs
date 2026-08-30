@@ -14,6 +14,8 @@ const LIB_SOURCE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/
 const MAIN_SOURCE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
 const NATIVE_SOURCE: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/wyr1c_native.rs"));
+const RETAINED_SOURCE: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/wyr1b_native.rs"));
 
 #[test]
 fn c4_product_selects_only_the_four_capability_resource_profile() {
@@ -24,6 +26,20 @@ fn c4_product_selects_only_the_four_capability_resource_profile() {
     assert!(LIB_SOURCE.contains("LaunchProfile::SupervisorResourceDomain"));
     assert!(LIB_SOURCE.contains("ResourceDomainCustody::new(handles[3].handle)"));
     assert!(LIB_SOURCE.contains("LaunchProfile::Supervisor,"));
+}
+
+#[test]
+fn c6_feature_composition_keeps_selector_29_on_the_resource_profile() {
+    assert!(MANIFEST.contains("wyr1c6-production = [\"wyr1c5-production\"]"));
+    assert!(
+        MANIFEST.contains("wyr1c6-selector29 = [\"wyr1c6-production\", \"wyr1c6-test-evidence\"]")
+    );
+    assert!(
+        MAIN_SOURCE.contains(
+            "#[cfg(any(feature = \"wyr1c4-production\", feature = \"wyr1c5-production\"))]"
+        )
+    );
+    assert!(MAIN_SOURCE.contains("continue_system_init_resource_product("));
 }
 
 #[test]
@@ -70,4 +86,16 @@ fn c6_terminal_facts_are_init_owned_and_bound_to_real_predicates() {
     assert!(NATIVE_SOURCE.contains("role_failure_count(RoleId::Devmgr)"));
     assert!(NATIVE_SOURCE.contains("WYR0_I_SUPERVISION_POLICY.max_attempts"));
     assert!(NATIVE_SOURCE.contains("WYR0_I_SUPERVISION_POLICY.backoff_ns"));
+}
+
+#[test]
+fn c6_joins_wrdm_to_the_validated_retained_uart_identity() {
+    assert!(RETAINED_SOURCE.contains("let uart_identity = *manifest"));
+    assert!(RETAINED_SOURCE.contains(".role(RoleId::Uart16550d)"));
+    assert!(RETAINED_SOURCE.contains("Ok((controller, uart_identity))"));
+    assert!(NATIVE_SOURCE.contains(
+        "let (manifest, uart_identity) = crate::wyr1b_native::validate_retained_bootfs_c1(bootfs)?;"
+    ));
+    assert!(NATIVE_SOURCE.contains("validate_device_identity(device_manifest, uart_identity)?;"));
+    assert!(!NATIVE_SOURCE.contains("manifest.executable_identity(RoleId::Uart16550d)"));
 }

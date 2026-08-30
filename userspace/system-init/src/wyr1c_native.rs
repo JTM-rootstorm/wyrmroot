@@ -267,7 +267,7 @@ where
     }
     let device_manifest = DeviceManifest::parse(manifest_entry.data())
         .map_err(|_| InitError::WrongManifestProfile)?;
-    let manifest = crate::wyr1b_native::validate_retained_bootfs_c1(bootfs)?;
+    let (manifest, uart_identity) = crate::wyr1b_native::validate_retained_bootfs_c1(bootfs)?;
     #[cfg(feature = "wyr1c6-selector29")]
     let (c6_gate_config, c6_evidence) = {
         let entry = archive
@@ -281,10 +281,7 @@ where
         );
         (config, evidence)
     };
-    validate_device_identity(
-        device_manifest,
-        manifest.executable_identity(RoleId::Uart16550d)?,
-    )?;
+    validate_device_identity(device_manifest, uart_identity)?;
     let resident = slot.write(ResidentSystemInit {
         controller: manifest,
         authority,
@@ -1471,7 +1468,7 @@ fn validate_driver_actor(bootfs: &[u8], request: DriverLaunchRequest) -> Result<
     // Re-run the complete retained WRRM/product validation at the construction
     // boundary, then join the request identity through WRDM to the exact
     // executable bytes actually supplied to the loader.
-    crate::wyr1b_native::validate_retained_bootfs_c1(bootfs)?;
+    let _ = crate::wyr1b_native::validate_retained_bootfs_c1(bootfs)?;
     let archive = Archive::new(bootfs).map_err(InitError::Bootfs)?;
     let device_manifest = archive
         .lookup(DEVICE_MANIFEST_PATH.as_bytes())

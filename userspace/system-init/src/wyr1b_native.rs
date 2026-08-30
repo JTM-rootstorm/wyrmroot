@@ -239,7 +239,12 @@ pub(crate) fn validate_retained_bootfs(
 
 /// Validates the C1 retained closure while preserving the selector-27 gate's
 /// separate marker/configuration contract.
-pub(crate) fn validate_retained_bootfs_c1(bytes: &[u8]) -> Result<SystemInit, InitError> {
+///
+/// The returned UART identity comes from the validated WRRM. Retained roles
+/// intentionally remain outside [`SystemInit`]'s early-role launch API.
+pub(crate) fn validate_retained_bootfs_c1(
+    bytes: &[u8],
+) -> Result<(SystemInit, [u8; 32]), InitError> {
     let archive = Archive::new(bytes).map_err(InitError::Bootfs)?;
     let manifest_entry = archive
         .lookup(MANIFEST_PATH.as_bytes())
@@ -255,6 +260,10 @@ pub(crate) fn validate_retained_bootfs_c1(bytes: &[u8]) -> Result<SystemInit, In
     }
     let manifest = Manifest::parse_structural(manifest_bytes, &encoded_generation)
         .map_err(InitError::Manifest)?;
+    let uart_identity = *manifest
+        .role(RoleId::Uart16550d)
+        .ok_or(InitError::WrongManifestProfile)?
+        .executable_identity();
     let controller = SystemInit::from_wyr1c_manifest(manifest)?;
     for role in manifest.roles() {
         let entry = archive.lookup(role.path().as_bytes()).map_err(map_lookup)?;
@@ -276,7 +285,7 @@ pub(crate) fn validate_retained_bootfs_c1(bytes: &[u8]) -> Result<SystemInit, In
             archive.lookup(path.as_bytes()).map_err(map_lookup)?;
         }
     }
-    Ok(controller)
+    Ok((controller, uart_identity))
 }
 
 #[allow(clippy::too_many_arguments)]
