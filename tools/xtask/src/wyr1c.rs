@@ -213,7 +213,7 @@ const C6_NATIVE_CHECK_SPECS: [NativeSpec; 4] = [
         label: "system-init-c6",
         package: "wyrmroot-system-init",
         binary: "system-init",
-        features: "wyr1c6-production",
+        features: "wyr1c6-production,wyr1c6-selector29",
         artifact: "system-init",
     },
     NativeSpec {
@@ -242,6 +242,18 @@ struct NativeArtifact {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FrozenSnapshot {
     pub(crate) receipt: Vec<u8>,
+    pub(crate) rrc_manifest: Vec<u8>,
+    pub(crate) device_manifest: Vec<u8>,
+    pub(crate) bootfs: Vec<u8>,
+    pub(crate) artifacts: BTreeMap<String, Vec<u8>>,
+    pub(crate) inspections: BTreeMap<String, Vec<u8>>,
+}
+
+/// Private output of the C6 native builder seam.  It intentionally contains
+/// no receipt: C6 prepare must emit its own producer-owned source receipt
+/// after staging and measuring the full selector-29 product.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct C6Snapshot {
     pub(crate) rrc_manifest: Vec<u8>,
     pub(crate) device_manifest: Vec<u8>,
     pub(crate) bootfs: Vec<u8>,
@@ -520,50 +532,62 @@ pub(crate) fn build_into(
 /// inspection, WRRM and WRDM construction rules as C1.  Publication and VM
 /// handoff remain owned by `wyr1c6`.
 #[allow(dead_code)] // crate-private seam for wyr1c6::prepare.
-pub(crate) fn build_c6_snapshot(nonce: &str) -> Result<FrozenSnapshot, Failure> {
-    if nonce.len() != 16
-        || !nonce
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || byte.is_ascii_uppercase())
-    {
-        return Err(Failure::task(
-            "WYR1-C6 gate nonce must be 16 uppercase hex characters",
-        ));
-    }
+pub(crate) fn build_c6_snapshot(nonce: &str) -> Result<C6Snapshot, Failure> {
+    validate_c6_nonce(nonce)?;
     reject_ambient_build_environment(env::vars_os())?;
     let repository = crate::tasks::repository_root()?;
     let project = crate::tasks::canonical_project_root(&repository)?;
     let revision = clean_repository_revision(&repository)?;
     let manifest = BuildManifest::load(&repository)?;
+    if manifest.rust_revision()? != ACCEPTED_RUST_REVISION
+        || manifest.rust_toolchain_name()? != ACCEPTED_TOOLCHAIN_NAME
+    {
+        return Err(Failure::task(
+            "WYR1-C6 product metadata does not name the accepted a92dc7f Rust toolchain",
+        ));
+    }
     let profile = manifest.validate_loader_build_readiness(&repository)?;
     let toolchain = crate::tasks::prepare_loader_toolchain(&repository, &profile, &manifest)?;
     let cargo_home = crate::tasks::project_cargo_home(&repository, &manifest)?;
+    if env::var_os("CARGO_HOME").as_deref() != Some(cargo_home.as_os_str()) {
+        return Err(Failure::task(
+            "WYR1-C6 product requires the pinned launcher's exact CARGO_HOME",
+        ));
+    }
+    toolchain.accepted().verify_unchanged()?;
     let project_directory = crate::secure_fs::Directory::open_exact(&project, "OS-Project root")?;
-    let tmp = project_directory.open_child(".tmp", "project temporary root")?;
+    let tmp = match project_directory.open_child(".tmp", "project temporary root") {
+        Ok(directory) => directory,
+        Err(_) => project_directory.create_child(".tmp", 0o700, "project temporary root")?,
+    };
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Failure::task("system clock is before the Unix epoch"))?
+        .as_nanos();
     let scratch = tmp.create_scratch(
-        &format!("wyr1c6-build-{}", std::process::id()),
+        &format!("wyr1c6-build-{}-{unique}", std::process::id()),
         "WYR1-C6 build scratch",
     )?;
-    let result = scratch.with_inheritable_anchor("WYR1-C6 build scratch", |anchor| {
+    let result = (|| {
         let mut artifacts = Vec::with_capacity(C6_PRODUCT_NATIVE_SPECS.len());
         for spec in C6_PRODUCT_NATIVE_SPECS {
-            let mut artifact =
-                build_native(&repository, &cargo_home, toolchain.accepted(), anchor, spec)?;
-            artifact.inspection = inspect_native(
-                &repository,
-                &artifact.bytes,
-                &artifact.sha256,
-                spec.label,
-                anchor,
-            )?;
+            toolchain.accepted().verify_unchanged()?;
+            let artifact = scratch.with_inheritable_anchor("WYR1-C6 build scratch", |anchor| {
+                let mut artifact =
+                    build_native(&repository, &cargo_home, toolchain.accepted(), anchor, spec)?;
+                artifact.inspection = inspect_native(
+                    &repository,
+                    &artifact.bytes,
+                    &artifact.sha256,
+                    spec.label,
+                    anchor,
+                )?;
+                Ok(artifact)
+            })?;
             artifacts.push(artifact);
         }
         let product = assemble_c6_product(&revision, &artifacts, nonce)?;
-        Ok(FrozenSnapshot {
-            receipt: format!(
-                "kind = \"wyrmroot-wyr1-c6-produced-snapshot\"\nnonce = \"{nonce}\"\n"
-            )
-            .into_bytes(),
+        Ok(C6Snapshot {
             rrc_manifest: product.rrc_manifest,
             device_manifest: product.device_manifest,
             bootfs: product.bootfs,
@@ -576,8 +600,11 @@ pub(crate) fn build_c6_snapshot(nonce: &str) -> Result<FrozenSnapshot, Failure> 
                 .map(|a| (a.spec.label.to_owned(), a.inspection.as_bytes().to_vec()))
                 .collect(),
         })
-    });
-    scratch.finish(result)
+    })();
+    let snapshot = scratch.finish(result)?;
+    toolchain.accepted().verify_unchanged()?;
+    verify_repository_revision(&repository, &revision)?;
+    Ok(snapshot)
 }
 
 fn publish_snapshot(
@@ -972,6 +999,17 @@ fn assemble_c6_product(
         gate: gate.as_bytes(),
     })
     .map_err(|error| Failure::task(format!("WYR1-C6 bootfs build failed: {error:?}")))?;
+    validate_rrc(&rrc_manifest, &generation, hashes)?;
+    wyrmroot_device_proto::Manifest::parse(&device_manifest)
+        .and_then(|manifest| manifest.match_com2(ContentIdentity(hashes[2])))
+        .map_err(|error| Failure::task(format!("WYR1-C6 WRDM inspection failed: {error:?}")))?;
+    inspect_c6_archive(
+        &bootfs,
+        artifacts,
+        &rrc_manifest,
+        &device_manifest,
+        gate.as_bytes(),
+    )?;
     Ok(ProductBytes {
         generation,
         rrc_manifest_sha256: sha256::bytes_digest(&rrc_manifest),
@@ -1197,6 +1235,56 @@ fn inspect_archive(
         if entry.data() != expected_bytes {
             return Err(Failure::task(format!("WYR1-C1 bootfs changed {path}")));
         }
+    }
+    Ok(())
+}
+
+fn inspect_c6_archive(
+    bytes: &[u8],
+    artifacts: &[NativeArtifact],
+    rrc: &[u8],
+    wrdm: &[u8],
+    gate: &[u8],
+) -> Result<(), Failure> {
+    let archive = Archive::new(bytes)
+        .map_err(|error| Failure::task(format!("WYR1-C6 bootfs inspection failed: {error:?}")))?;
+    if archive.entries().count() != 11 {
+        return Err(Failure::task("WYR1-C6 bootfs entry set drifted"));
+    }
+    let expected = [
+        ("system/init", artifacts[0].bytes.as_slice(), true),
+        ("system/registryd", artifacts[1].bytes.as_slice(), true),
+        ("system/devmgr", artifacts[2].bytes.as_slice(), true),
+        ("system/uart16550d", artifacts[3].bytes.as_slice(), true),
+        ("system/consoled", artifacts[4].bytes.as_slice(), true),
+        ("system/wyrmsh", artifacts[5].bytes.as_slice(), true),
+        ("system/bootstrap/rrc-a-v1", rrc, false),
+        ("system/bootstrap/wyr1-a-gate-v1", GATE_CONFIG, false),
+        ("system/bootstrap/wyr1-c-gate-v1", WYR1_C1_MARKER, false),
+        ("system/bootstrap/wyr1-c-device-manifest-v1", wrdm, false),
+        ("system/bootstrap/wyr1-c6-gate-v1", gate, false),
+    ];
+    for (path, expected_bytes, executable) in expected {
+        let entry = archive
+            .lookup(path.as_bytes())
+            .map_err(|_| Failure::task(format!("WYR1-C6 bootfs lacks {path}")))?;
+        if entry.data() != expected_bytes || entry.is_executable() != executable {
+            return Err(Failure::task(format!("WYR1-C6 bootfs changed {path}")));
+        }
+    }
+    Ok(())
+}
+
+fn validate_c6_nonce(nonce: &str) -> Result<(), Failure> {
+    if nonce.len() != 16
+        || !nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'A'..=b'F'))
+        || nonce.bytes().all(|byte| byte == b'0')
+    {
+        return Err(Failure::task(
+            "WYR1-C6 gate nonce must be 16 nonzero uppercase hexadecimal characters",
+        ));
     }
     Ok(())
 }
@@ -1875,6 +1963,55 @@ mod tests {
             ],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn c6_product_is_deterministic_and_adds_only_the_selector_gate() {
+        let artifacts = fixture_artifacts();
+        let nonce = "0123456789ABCDEF";
+        let first = assemble_c6_product(&"a".repeat(40), &artifacts, nonce).unwrap();
+        let second = assemble_c6_product(&"a".repeat(40), &artifacts, nonce).unwrap();
+        assert_eq!(first.rrc_manifest, second.rrc_manifest);
+        assert_eq!(first.device_manifest, second.device_manifest);
+        assert_eq!(first.bootfs, second.bootfs);
+        let gate = b"schema = 1\nselector = \"device-coordinator-restart\"\ntest_id = 29\nevidence_protocol = \"WRC6\"\nnonce = \"0123456789ABCDEF\"\nphysical_io = \"not-performed\"\n";
+        inspect_c6_archive(
+            &first.bootfs,
+            &artifacts,
+            &first.rrc_manifest,
+            &first.device_manifest,
+            gate,
+        )
+        .unwrap();
+        let archive = Archive::new(&first.bootfs).unwrap();
+        assert_eq!(archive.entries().count(), 11);
+        assert_eq!(
+            archive
+                .lookup(b"system/bootstrap/wyr1-c6-gate-v1")
+                .unwrap()
+                .data(),
+            gate
+        );
+        assert!(
+            !archive
+                .lookup(b"system/bootstrap/wyr1-c6-gate-v1")
+                .unwrap()
+                .is_executable()
+        );
+    }
+
+    #[test]
+    fn c6_nonce_is_exact_uppercase_hex_and_nonzero() {
+        assert!(validate_c6_nonce("0123456789ABCDEF").is_ok());
+        for nonce in [
+            "0000000000000000",
+            "0123456789abcdef",
+            "0123456789ABCDEG",
+            "0123456789ABCDE",
+            "0123456789ABCDEF0",
+        ] {
+            assert!(validate_c6_nonce(nonce).is_err(), "accepted {nonce}");
+        }
     }
 
     #[test]
