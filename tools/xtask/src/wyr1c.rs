@@ -1115,16 +1115,25 @@ fn inspect_native(
     label: &str,
     build_directory: &InheritableDirectory,
 ) -> Result<String, Failure> {
-    let sealed = SealedFile::from_bytes(bytes, &format!("WYR1-C1 {label}"))?;
-    let output = build_directory.with_inheritance_disabled("WYR1-C1 build scratch", || {
-        sealed.with_inheritable_path(&format!("WYR1-C1 {label}"), |artifact| {
-            run_native_inspector(
-                repository,
-                &repository.join("toolchain/inspect-native-artifact.sh"),
-                artifact,
-                label,
-            )
-        })
+    build_directory.with_inheritance_disabled("WYR1-C1 build scratch", || {
+        inspect_native_bytes(repository, bytes, expected_sha256, label)
+    })
+}
+
+pub(crate) fn inspect_native_bytes(
+    repository: &Path,
+    bytes: &[u8],
+    expected_sha256: &str,
+    label: &str,
+) -> Result<String, Failure> {
+    let sealed = SealedFile::from_bytes(bytes, &format!("WYR1-C {label}"))?;
+    let output = sealed.with_inheritable_path(&format!("WYR1-C {label}"), |artifact| {
+        run_native_inspector(
+            repository,
+            &repository.join("toolchain/inspect-native-artifact.sh"),
+            artifact,
+            label,
+        )
     })?;
     if !output.status.success()
         || output.stdout.is_empty()
@@ -1132,11 +1141,11 @@ fn inspect_native(
         || output.stderr.len() > MAX_REPORT_BYTES
     {
         return Err(Failure::task(format!(
-            "WYR1-C1 canonical inspection failed for {label}"
+            "WYR1-C canonical inspection failed for {label}"
         )));
     }
     let report = String::from_utf8(output.stdout)
-        .map_err(|_| Failure::task("WYR1-C1 native inspection report is not UTF-8"))?;
+        .map_err(|_| Failure::task("WYR1-C native inspection report is not UTF-8"))?;
     validate_inspection(&report, label, expected_sha256, bytes.len())?;
     Ok(report)
 }

@@ -947,26 +947,16 @@ fn build_c6_bootstrap(
         .join(NATIVE_TARGET)
         .join("release")
         .join("wyrmroot-bootstrap");
-    let inspection = Command::new(tasks::INSPECTION_SHELL)
-        .arg(repository.join("toolchain/inspect-native-artifact.sh"))
-        .arg(&bootstrap)
-        .current_dir(repository)
-        .env_clear()
-        .env("PATH", tasks::INSPECTION_PATH)
-        .env("WYRMROOT_INSPECTION_ARTIFACT_NAME", "bootstrap")
-        .env("WYRMROOT_SEALED_INSPECTION", "1")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| Failure::task(format!("could not inspect C6 bootstrap: {error}")))?;
-    if !inspection.status.success()
-        || inspection.stdout.is_empty()
-        || inspection.stderr.len() > 64 * 1024
-    {
-        return Err(Failure::task("WYR1-C6 bootstrap inspection failed"));
-    }
+    let bytes = read_regular_bounded(&bootstrap, MAX_ARTIFACT_BYTES, "bootstrap")?;
+    crate::wyr1c::inspect_native_bytes(
+        repository,
+        &bytes,
+        &sha256::bytes_digest(&bytes),
+        "bootstrap",
+    )?;
     toolchain.accepted().verify_unchanged()?;
     layout.verify_unchanged()?;
-    read_regular_bounded(&bootstrap, MAX_ARTIFACT_BYTES, "bootstrap")
+    Ok(bytes)
 }
 
 fn build_selector29_kernel(
