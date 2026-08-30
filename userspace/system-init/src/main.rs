@@ -14,6 +14,8 @@ use wyrmroot_launch_proto as _;
 use wyrmroot_loader as _;
 use wyrmroot_registry_proto as _;
 use wyrmroot_rrc_manifest as _;
+#[cfg(feature = "wyr1c6-selector29")]
+use wyrmroot_runtime::WYR0_I_SUPERVISION_POLICY;
 use wyrmroot_runtime::{
     CapabilityInfo, MappingPlan, NativeError, NativeLoaderPlatform, NativeSupervisionPlatform,
     ReceiveCounts, StartupBlock, close_handle, create_channel, create_task_group, create_timer,
@@ -37,9 +39,7 @@ use wyrmroot_system_init::wyr1_test_failure_application_status;
 use wyrmroot_system_init::wyr1b_test_failure_application_status;
 use wyrmroot_system_init::{InitPlatform, ResidentSystemInit, Wyr1BPlatform};
 #[cfg(feature = "wyr1c6-selector29")]
-use wyrmroot_system_init::{
-    wyr1c_native, wyr1c6_gate, wyr1c6_test_failure_application_status,
-};
+use wyrmroot_system_init::{wyr1c_native, wyr1c6_gate, wyr1c6_test_failure_application_status};
 use wyrmroot_wyr1b_gate_proto as _;
 
 struct NativeSystem;
@@ -206,7 +206,11 @@ fn continue_resident(
         let Ok(now) = monotonic_active_now() else {
             return 0xAF01_0003;
         };
-        let Some(deadline) = now.checked_add(1_000_000_000) else {
+        #[cfg(feature = "wyr1c6-selector29")]
+        let tick_ns = WYR0_I_SUPERVISION_POLICY.backoff_ns;
+        #[cfg(not(feature = "wyr1c6-selector29"))]
+        let tick_ns = 1_000_000_000;
+        let Some(deadline) = now.checked_add(tick_ns) else {
             return 0xAF01_0004;
         };
         if resident
