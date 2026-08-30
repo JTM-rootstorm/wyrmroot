@@ -28,6 +28,10 @@ const SCHEMA_VERSION: u32 = 1;
 const SCENARIO: &str = "driver-and-devmgr-restart-no-io";
 const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_FIRMWARE_BYTES: u64 = 128 * 1024 * 1024;
+const MACHINE: &str = "pc-q35-10.2";
+const DOMAIN_UUID: &str = "33005e22-d7c2-4b13-b1ac-b82eda95e584";
+const ESP_FD_GROUP: &str = "dw-f13-esp-v1";
+const VARS_FD_GROUP: &str = "dw-f13-ovmf-vars-v1";
 
 const ARTIFACTS: &[(&str, &str, u64)] = &[
     ("loader", "loader.efi", MAX_ARTIFACT_BYTES),
@@ -917,10 +921,10 @@ fn stage_profile(
         ("physical_io", "not-performed"),
         ("terminal_authority", "selector29-kernel-collector"),
         ("memory_mib", "2048"),
-        ("machine", "pc-q35-10.1"),
+        ("machine", MACHINE),
         ("timeout_seconds", "300"),
-        ("esp_fd_group", "wyr1c6-esp"),
-        ("vars_fd_group", "wyr1c6-vars"),
+        ("esp_fd_group", ESP_FD_GROUP),
+        ("vars_fd_group", VARS_FD_GROUP),
         ("domain_xml", &format!("{profile}/domain.xml")),
         ("domain_xml_sha256", &xml_sha256),
         ("ovmf_vars", &format!("{profile}/OVMF_VARS.fd")),
@@ -949,7 +953,7 @@ fn stage_profile(
 
 fn domain_xml(vcpus: u8, code: &Path, esp: &Path, vars: &Path) -> String {
     format!(
-        "<domain xmlns:qemu=\"http://libvirt.org/schemas/domain/qemu/1.0\" type=\"qemu\">\n  <name>OS-Project</name>\n  <memory unit=\"KiB\">2097152</memory><currentMemory unit=\"KiB\">2097152</currentMemory><vcpu placement=\"static\">{vcpus}</vcpu>\n  <sysinfo type=\"fwcfg\"><entry name=\"opt/org.deepwyrm.test.selector\">{SELECTOR}</entry><entry name=\"opt/org.deepwyrm.test.test_id\">{TEST_ID}</entry></sysinfo>\n  <os><type arch=\"x86_64\" machine=\"pc-q35-10.1\">hvm</type><loader readonly=\"yes\" secure=\"no\" type=\"pflash\" format=\"raw\">{}</loader><nvram type=\"file\" format=\"raw\"><source file=\"{}\" fdgroup=\"wyr1c6-vars\"/></nvram><boot dev=\"hd\"/></os>\n  <features><acpi/><apic/></features><devices><emulator>/usr/bin/qemu-system-x86_64</emulator><disk type=\"file\" device=\"disk\"><driver name=\"qemu\" type=\"raw\"/><source file=\"{}\" fdgroup=\"wyr1c6-esp\"/><target dev=\"vda\" bus=\"virtio\"/><readonly/></disk><controller type=\"pci\" index=\"0\" model=\"pcie-root\"/><serial type=\"pty\"><target type=\"isa-serial\" port=\"0\"/></serial><console type=\"pty\"><target type=\"serial\" port=\"0\"/></console></devices>\n  <qemu:commandline><qemu:arg value=\"-device\"/><qemu:arg value=\"isa-debug-exit,iobase=0xf4,iosize=0x04\"/></qemu:commandline>\n</domain>\n",
+        "<domain xmlns:qemu=\"http://libvirt.org/schemas/domain/qemu/1.0\" type=\"qemu\">\n  <name>OS-Project</name>\n  <uuid>{DOMAIN_UUID}</uuid>\n  <memory unit=\"KiB\">2097152</memory><currentMemory unit=\"KiB\">2097152</currentMemory><vcpu placement=\"static\">{vcpus}</vcpu>\n  <sysinfo type=\"fwcfg\"><entry name=\"opt/org.deepwyrm.test.selector\">{SELECTOR}</entry><entry name=\"opt/org.deepwyrm.test.test_id\">{TEST_ID}</entry></sysinfo>\n  <os><type arch=\"x86_64\" machine=\"{MACHINE}\">hvm</type><loader readonly=\"yes\" secure=\"no\" type=\"pflash\" format=\"raw\">{}</loader><nvram type=\"file\" format=\"raw\"><source file=\"{}\" fdgroup=\"{VARS_FD_GROUP}\"/></nvram><boot dev=\"hd\"/></os>\n  <features><acpi/><apic/></features><clock offset=\"utc\"><timer name=\"rtc\" tickpolicy=\"catchup\"/><timer name=\"pit\" tickpolicy=\"delay\"/><timer name=\"hpet\" present=\"no\"/></clock><on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>destroy</on_crash><pm><suspend-to-mem enabled=\"no\"/><suspend-to-disk enabled=\"no\"/></pm><devices><emulator>/usr/bin/qemu-system-x86_64</emulator><disk type=\"file\" device=\"disk\"><driver name=\"qemu\" type=\"raw\"/><source file=\"{}\" fdgroup=\"{ESP_FD_GROUP}\"/><target dev=\"vda\" bus=\"virtio\"/><readonly/></disk><controller type=\"pci\" index=\"0\" model=\"pcie-root\"/><serial type=\"pty\"><target type=\"isa-serial\" port=\"0\"/></serial><serial type=\"null\"><target type=\"isa-serial\" port=\"1\"/></serial><console type=\"pty\"><target type=\"serial\" port=\"0\"/></console></devices>\n  <qemu:commandline><qemu:arg value=\"-device\"/><qemu:arg value=\"isa-debug-exit,iobase=0xf4,iosize=0x04\"/></qemu:commandline>\n</domain>\n",
         code.display(),
         vars.display(),
         esp.display(),
@@ -1022,10 +1026,10 @@ fn validate_handoff(
     }
     for (key, expected) in [
         ("memory_mib", "2048"),
-        ("machine", "pc-q35-10.1"),
+        ("machine", MACHINE),
         ("timeout_seconds", "300"),
-        ("esp_fd_group", "wyr1c6-esp"),
-        ("vars_fd_group", "wyr1c6-vars"),
+        ("esp_fd_group", ESP_FD_GROUP),
+        ("vars_fd_group", VARS_FD_GROUP),
         ("domain_xml", &format!("{profile}/domain.xml")),
         ("ovmf_vars", &format!("{profile}/OVMF_VARS.fd")),
         ("serial_log", &format!("{profile}/serial.log")),
