@@ -16,7 +16,13 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::{cli::G3ImageArguments, error::Failure, g3_image, sha256, tasks};
+use crate::{
+    cli::G3ImageArguments,
+    error::Failure,
+    g3_image,
+    secure_fs::{Directory, InheritableDirectory},
+    sha256, tasks,
+};
 use deepwyrm_abi::{
     DW_BOOT_DEVICE_RESOURCE_FLAGS_SUPPORTED_MASK, DW_BOOT_DEVICE_RESOURCE_V1_SIZE,
     DW_BOOT_DEVICE_RESOURCE_V1_VERSION, DW_BOOT_DEVICE_TABLE_FLAGS_SUPPORTED_MASK,
@@ -279,7 +285,17 @@ fn build_produced_artifacts(
         },
     )?;
     let loader = uefi.loader_bytes;
-    let bootstrap = build_c6_bootstrap(repository, &toolchain, &layout, &cargo_home, &build)?;
+    let build_directory = Directory::open_exact(&build, "WYR1-C6 build directory")?;
+    let bootstrap =
+        build_directory.with_inheritable_anchor("WYR1-C6 build directory", |build_directory| {
+            build_c6_bootstrap(
+                repository,
+                &toolchain,
+                &layout,
+                &cargo_home,
+                build_directory,
+            )
+        })?;
     let snapshot = crate::wyr1c::build_c6_snapshot(nonce)?;
     let kernel = build_selector29_kernel(deep_repository, &build, nonce)?;
     let table = boot_device_table();
@@ -887,11 +903,11 @@ fn build_c6_bootstrap(
     toolchain: &tasks::LoaderToolchain,
     layout: &crate::deep_layout::DeepLayoutBuild,
     cargo_home: &Path,
-    build: &Path,
+    build: &InheritableDirectory,
 ) -> Result<Vec<u8>, Failure> {
     toolchain.accepted().verify_unchanged()?;
     layout.verify_unchanged()?;
-    let target = build.join("bootstrap-native");
+    let target = build.path().join("bootstrap-native");
     fs::create_dir(&target)
         .map_err(|error| Failure::task(format!("could not create C6 bootstrap target: {error}")))?;
     let source = fs::canonicalize(repository)
@@ -943,17 +959,19 @@ fn build_c6_bootstrap(
     if !status.success() {
         return Err(Failure::task("WYR1-C6 native bootstrap build failed"));
     }
-    let bootstrap = target
+    let bootstrap = PathBuf::from("bootstrap-native")
         .join(NATIVE_TARGET)
         .join("release")
         .join("wyrmroot-bootstrap");
-    let bytes = read_regular_bounded(&bootstrap, MAX_ARTIFACT_BYTES, "bootstrap")?;
-    crate::wyr1c::inspect_native_bytes(
-        repository,
-        &bytes,
-        &sha256::bytes_digest(&bytes),
-        "bootstrap",
-    )?;
+    let bytes = build.read_producer(&bootstrap, MAX_ARTIFACT_BYTES, "bootstrap")?;
+    build.with_inheritance_disabled("WYR1-C6 build directory", || {
+        crate::wyr1c::inspect_native_bytes(
+            repository,
+            &bytes,
+            &sha256::bytes_digest(&bytes),
+            "bootstrap",
+        )
+    })?;
     toolchain.accepted().verify_unchanged()?;
     layout.verify_unchanged()?;
     Ok(bytes)
