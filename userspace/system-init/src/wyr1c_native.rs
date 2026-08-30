@@ -15,13 +15,16 @@ use wyrmroot_device_proto::coordinator::{
     RegistryEndpoint, RegistryEndpointGeneration, RegistryEndpointId, RegistryGeneration,
     SupervisorGeneration,
 };
+#[cfg(feature = "wyr1c6-production")]
+use wyrmroot_device_proto::driver_launch::{encode_reaped, parse_driver_retired};
 use wyrmroot_device_proto::{
     DriverLaunchRequest,
     controller::{
         ControllerMessage, StatusCode, encode as encode_controller, parse as parse_controller,
     },
     driver_launch::{
-        LAUNCH_REQUEST_BYTES, LAUNCH_RESPONSE_BYTES, encode_constructed, parse_request,
+        DRIVER_RETIRED_BYTES, LAUNCH_REQUEST_BYTES, LAUNCH_RESPONSE_BYTES, encode_constructed,
+        parse_request,
     },
     manifest::{
         COM2_ROLE_ID, ContentIdentity, Manifest as DeviceManifest,
@@ -111,6 +114,7 @@ pub(crate) struct ResidentState {
     last_controller_transaction: u64,
     next_controller_transaction: u64,
     driver: Option<DriverNativeAttempt>,
+    last_reaped_driver: Option<DriverLaunchRequest>,
     last_driver_attempt: u64,
     last_driver_session: u64,
     last_driver_endpoint: u64,
@@ -297,6 +301,7 @@ where
         last_controller_transaction: devmgr.last_controller_transaction,
         next_controller_transaction: devmgr.next_controller_transaction,
         driver: None,
+        last_reaped_driver: None,
         last_driver_attempt: 0,
         last_driver_session: 0,
         last_driver_endpoint: 0,
@@ -910,6 +915,9 @@ enum DevmgrControlInput {
         request: DriverLaunchRequest,
         child_endpoint: DwHandle,
     },
+    DriverRetired {
+        bytes: [u8; DRIVER_RETIRED_BYTES],
+    },
 }
 
 fn receive_devmgr_control<S: InitPlatform>(
@@ -976,6 +984,15 @@ fn receive_devmgr_control<S: InitPlatform>(
                 request,
                 child_endpoint: info.handle,
             })
+        }
+        b"WRDT" => {
+            if counts.bytes != DRIVER_RETIRED_BYTES || counts.handles != 0 {
+                close_received_native(system, &handles, counts.handles)?;
+                return Err(InitError::WrongManifestProfile);
+            }
+            let mut retired = [0u8; DRIVER_RETIRED_BYTES];
+            retired.copy_from_slice(&bytes[..DRIVER_RETIRED_BYTES]);
+            Ok(DevmgrControlInput::DriverRetired { bytes: retired })
         }
         _ => {
             close_received_native(system, &handles, counts.handles)?;
@@ -1174,7 +1191,7 @@ fn reap_driver<S, W>(
     system: &mut S,
     waits: &mut W,
     terminate: bool,
-) -> Result<(), InitError>
+) -> Result<DriverLaunchRequest, InitError>
 where
     S: InitPlatform,
     W: SupervisionPlatform<Error = NativeError>,
@@ -1184,7 +1201,25 @@ where
         .as_mut()
         .and_then(|state| state.driver.take())
         .ok_or(InitError::WrongActivationOrder)?;
-    cleanup_loaded(system, waits, attempt.loaded, attempt.task_group, terminate)
+    let request = attempt.request;
+    cleanup_loaded(system, waits, attempt.loaded, attempt.task_group, terminate)?;
+    if let Some(state) = resident.wyr1c.as_mut() {
+        state.last_reaped_driver = Some(request);
+    }
+    Ok(request)
+}
+
+#[cfg(feature = "wyr1c6-production")]
+fn acknowledge_driver_reaped<S: InitPlatform>(
+    system: &mut S,
+    devmgr: ActiveNativeRole,
+    request: DriverLaunchRequest,
+) -> Result<(), InitError> {
+    let mut bytes = [0u8; wyrmroot_device_proto::driver_launch::REAPED_RESPONSE_BYTES];
+    encode_reaped(request, &mut bytes).map_err(|_| InitError::WrongManifestProfile)?;
+    system
+        .send_channel(devmgr.loaded.launch_channel, &bytes)
+        .map_err(InitError::Native)
 }
 
 fn expect_device_status<S, W>(
@@ -1370,6 +1405,26 @@ where
                                         Ok(())
                                     }
                                 }
+                                Ok(DevmgrControlInput::DriverRetired { bytes }) => {
+                                    #[cfg(feature = "wyr1c6-production")]
+                                    {
+                                        let state = resident
+                                            .wyr1c
+                                            .as_ref()
+                                            .ok_or(InitError::WrongActivationOrder)?;
+                                        let request = state
+                                            .last_reaped_driver
+                                            .ok_or(InitError::WrongActivationOrder)?;
+                                        parse_driver_retired(&bytes, request)
+                                            .map_err(|_| InitError::WrongManifestProfile)?;
+                                        rebind_publication(resident, system, waits)
+                                    }
+                                    #[cfg(not(feature = "wyr1c6-production"))]
+                                    {
+                                        let _ = bytes;
+                                        Err(InitError::WrongManifestProfile)
+                                    }
+                                }
                                 Err(error) => recover_devmgr_after_error(
                                     resident, system, loader, waits, bootfs, error,
                                 ),
@@ -1379,7 +1434,17 @@ where
                             recover_registry(resident, system, loader, waits, bootfs, false)
                         }
                         ResidentPollEvent::DriverExited => {
-                            reap_driver(resident, system, waits, false)
+                            let request = reap_driver(resident, system, waits, false)?;
+                            #[cfg(feature = "wyr1c6-production")]
+                            {
+                                let state = resident
+                                    .wyr1c
+                                    .as_ref()
+                                    .ok_or(InitError::WrongActivationOrder)?;
+                                let devmgr = state.devmgr.ok_or(InitError::WrongActivationOrder)?;
+                                acknowledge_driver_reaped(system, devmgr, request)?;
+                            }
+                            Ok(())
                         }
                     },
                 )

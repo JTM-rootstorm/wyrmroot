@@ -17,6 +17,151 @@ pub const DEVICE_DRIVER_PATH: &str = "/system/uart16550d";
 pub const LAUNCH_REQUEST_BYTES: usize = 128;
 pub const LAUNCH_REQUEST_HANDLE_COUNT: u32 = 1;
 pub const LAUNCH_RESPONSE_BYTES: usize = 80;
+pub const REAPED_RESPONSE_BYTES: usize = LAUNCH_RESPONSE_BYTES;
+pub const DRIVER_RETIRED_BYTES: usize = LAUNCH_RESPONSE_BYTES;
+/// Selector-29 intentionally fails only the first generation.  The trigger
+/// is carried by the exact typed launch identity and cannot match U2.
+pub const SELECTOR29_FAILURE_ATTEMPT_GENERATION: u64 = 1;
+pub const SELECTOR29_FAILURE_SUPERVISOR_GENERATION: u64 = 1;
+
+pub const fn selector29_should_fail(
+    supervisor_generation: SupervisorGeneration,
+    attempt_generation: AttemptGeneration,
+) -> bool {
+    supervisor_generation.0 == SELECTOR29_FAILURE_SUPERVISOR_GENERATION
+        && attempt_generation.0 == SELECTOR29_FAILURE_ATTEMPT_GENERATION
+}
+
+/// Encodes init's generation-exact acknowledgement after the driver process,
+/// launch Channel, and task group have all been reaped.
+pub fn encode_reaped(
+    request: DriverLaunchRequest,
+    output: &mut [u8],
+) -> Result<(), DriverLaunchError> {
+    let _ = DriverLaunch::new(request)?;
+    if output.len() != REAPED_RESPONSE_BYTES {
+        return Err(DriverLaunchError::WrongMessage);
+    }
+    output.fill(0);
+    output[..4].copy_from_slice(b"WRLR");
+    output[4..6].copy_from_slice(&1u16.to_le_bytes());
+    output[8..12].copy_from_slice(&2u32.to_le_bytes());
+    output[16..20].copy_from_slice(&(REAPED_RESPONSE_BYTES as u32).to_le_bytes());
+    for (offset, value) in [
+        (24, request.supervisor_generation.0),
+        (32, request.role_id.0),
+        (40, request.attempt_generation.0),
+        (48, request.launch_session.0),
+        (56, request.endpoint.id.0),
+        (64, request.endpoint.generation.0),
+        (72, request.transaction_id),
+    ] {
+        output[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    Ok(())
+}
+
+pub fn parse_reaped(bytes: &[u8], request: DriverLaunchRequest) -> Result<(), DriverLaunchError> {
+    if bytes.len() != REAPED_RESPONSE_BYTES
+        || bytes[..4] != *b"WRLR"
+        || u16::from_le_bytes(bytes[4..6].try_into().unwrap()) != 1
+        || u16::from_le_bytes(bytes[6..8].try_into().unwrap()) != 0
+        || u32::from_le_bytes(bytes[8..12].try_into().unwrap()) != 2
+        || u32::from_le_bytes(bytes[12..16].try_into().unwrap()) != 0
+        || u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize != REAPED_RESPONSE_BYTES
+        || bytes[20..24].iter().any(|byte| *byte != 0)
+    {
+        return Err(DriverLaunchError::WrongMessage);
+    }
+    let get = |offset| u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+    if [
+        get(24),
+        get(32),
+        get(40),
+        get(48),
+        get(56),
+        get(64),
+        get(72),
+    ] != [
+        request.supervisor_generation.0,
+        request.role_id.0,
+        request.attempt_generation.0,
+        request.launch_session.0,
+        request.endpoint.id.0,
+        request.endpoint.generation.0,
+        request.transaction_id,
+    ] {
+        return Err(DriverLaunchError::StaleEndpoint);
+    }
+    Ok(())
+}
+
+/// Records that P1 has been retired and init must provide a fresh publication
+/// endpoint before the next driver attempt can begin.
+pub fn encode_driver_retired(
+    request: DriverLaunchRequest,
+    output: &mut [u8],
+) -> Result<(), DriverLaunchError> {
+    let _ = DriverLaunch::new(request)?;
+    if output.len() != DRIVER_RETIRED_BYTES {
+        return Err(DriverLaunchError::WrongMessage);
+    }
+    output.fill(0);
+    output[..4].copy_from_slice(b"WRDT");
+    output[4..6].copy_from_slice(&1u16.to_le_bytes());
+    output[8..12].copy_from_slice(&3u32.to_le_bytes());
+    output[16..20].copy_from_slice(&(DRIVER_RETIRED_BYTES as u32).to_le_bytes());
+    for (offset, value) in [
+        (24, request.supervisor_generation.0),
+        (32, request.role_id.0),
+        (40, request.attempt_generation.0),
+        (48, request.launch_session.0),
+        (56, request.endpoint.id.0),
+        (64, request.endpoint.generation.0),
+        (72, request.transaction_id),
+    ] {
+        output[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    Ok(())
+}
+
+pub fn parse_driver_retired(
+    bytes: &[u8],
+    request: DriverLaunchRequest,
+) -> Result<(), DriverLaunchError> {
+    if bytes.len() != DRIVER_RETIRED_BYTES
+        || bytes[..4] != *b"WRDT"
+        || u16::from_le_bytes(bytes[4..6].try_into().unwrap()) != 1
+        || u16::from_le_bytes(bytes[6..8].try_into().unwrap()) != 0
+        || u32::from_le_bytes(bytes[8..12].try_into().unwrap()) != 3
+        || u32::from_le_bytes(bytes[12..16].try_into().unwrap()) != 0
+        || u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize != DRIVER_RETIRED_BYTES
+        || bytes[20..24].iter().any(|byte| *byte != 0)
+    {
+        return Err(DriverLaunchError::WrongMessage);
+    }
+    let get = |offset| u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+    if [
+        get(24),
+        get(32),
+        get(40),
+        get(48),
+        get(56),
+        get(64),
+        get(72),
+    ] != [
+        request.supervisor_generation.0,
+        request.role_id.0,
+        request.attempt_generation.0,
+        request.launch_session.0,
+        request.endpoint.id.0,
+        request.endpoint.generation.0,
+        request.transaction_id,
+    ] {
+        return Err(DriverLaunchError::StaleEndpoint);
+    }
+    Ok(())
+}
 
 /// Semantic witness supplied by the loader/native boundary, where generated
 /// ABI rights are available. This policy crate intentionally does not copy
@@ -466,5 +611,47 @@ mod tests {
             parse_constructed(&bytes, request()),
             Err(DriverLaunchError::StaleEndpoint)
         );
+    }
+
+    #[test]
+    fn reaped_ack_round_trips_exact_launch_identity() {
+        let request = request();
+        let mut bytes = [0; REAPED_RESPONSE_BYTES];
+        encode_reaped(request, &mut bytes).unwrap();
+        assert_eq!(parse_reaped(&bytes, request), Ok(()));
+        bytes[40] ^= 1;
+        assert_eq!(
+            parse_reaped(&bytes, request),
+            Err(DriverLaunchError::StaleEndpoint)
+        );
+    }
+
+    #[test]
+    fn retired_ack_round_trips_exact_launch_identity() {
+        let request = request();
+        let mut bytes = [0; DRIVER_RETIRED_BYTES];
+        encode_driver_retired(request, &mut bytes).unwrap();
+        assert_eq!(parse_driver_retired(&bytes, request), Ok(()));
+        bytes[72] ^= 1;
+        assert_eq!(
+            parse_driver_retired(&bytes, request),
+            Err(DriverLaunchError::StaleEndpoint)
+        );
+    }
+
+    #[test]
+    fn selector29_trigger_is_only_first_attempt() {
+        assert!(selector29_should_fail(
+            SupervisorGeneration(1),
+            AttemptGeneration(1)
+        ));
+        assert!(!selector29_should_fail(
+            SupervisorGeneration(2),
+            AttemptGeneration(1)
+        ));
+        assert!(!selector29_should_fail(
+            SupervisorGeneration(1),
+            AttemptGeneration(2)
+        ));
     }
 }

@@ -3,6 +3,8 @@
 #![deny(unsafe_code)]
 
 use core::panic::PanicInfo;
+#[cfg(feature = "wyr1c6-production")]
+use deepwyrm_syscall::DW_STATUS_TIMED_OUT;
 use deepwyrm_syscall::{
     DW_DEADLINE_INFINITE, DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL,
     DW_OBJECT_TYPE_MEMORY_OBJECT, DW_RIGHT_DUPLICATE, DW_RIGHT_INSPECT, DW_RIGHT_READ,
@@ -23,6 +25,14 @@ use deepwyrm_syscall::{
 use deepwyrm_syscall::{
     DW_OBJECT_TYPE_DEVICE_RESOURCE, DW_OBJECT_TYPE_TASK_GROUP, DW_RIGHT_MODIFY,
 };
+#[cfg(feature = "wyr1c6-production")]
+use wyrmroot_device_proto::driver_launch::{
+    REAPED_RESPONSE_BYTES, encode_driver_retired, parse_reaped,
+};
+#[cfg(feature = "wyr1c6-selector29")]
+use wyrmroot_device_proto::selector29_should_fail;
+#[cfg(feature = "wyr1c6-production")]
+use wyrmroot_device_proto::{ControlMessage, FailureCode};
 use wyrmroot_device_proto::{
     ControllerMessage, StatusCode,
     controller::{
@@ -67,6 +77,10 @@ use wyrmroot_registry_proto::{
     MessageType as RegistryMessageType, encode_empty as encode_registry_empty,
     parse as parse_registry,
 };
+#[cfg(feature = "wyr1c6-production")]
+use wyrmroot_runtime::NativeError;
+#[cfg(feature = "wyr1c6-production")]
+use wyrmroot_runtime::monotonic_active_now;
 use wyrmroot_runtime::{
     BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, MappingPlan, StartupBlock, close_handle,
     map_bootfs_read_only, panic_abort, query_capability_info, query_memory_object_size,
@@ -403,6 +417,72 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
             // The C3 acceptance actor may exit after its direct READY.  Peer
             // closure is the only reached notification path; no resource was
             // ever delegated, so reaping cannot lose future custody.
+            #[cfg(feature = "wyr1c6-production")]
+            if observed.observed.0 & DW_SIGNAL_READABLE.0 != 0 {
+                let request = resident.active_driver_request().ok_or(failure(40))?;
+                observe_driver_failure(control, request, &mut resident)?;
+                probe_stale_driver_endpoint(control, request, &resident)?;
+                close_handle(control).map_err(|_| failure(41))?;
+                retire_driver_publication(publication.ok_or(failure(42))?, request, &resident)?;
+                resident.publication_retired().map_err(|_| failure(43))?;
+                await_driver_reaped(bootstrap, request)?;
+                resident.reap_driver().map_err(|_| failure(44))?;
+                send_driver_retired(bootstrap, request)?;
+                let rebind_deadline =
+                    monotonic_deadline_after(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
+                        .map_err(|_| failure(45))?;
+                wait_readable(bootstrap, rebind_deadline, 46)?;
+                let (replacement, action) = receive_controller(bootstrap, &mut resident)?;
+                if action != ControllerAction::PublicationRebound {
+                    return Err(failure(47));
+                }
+                let replacement = replacement.ok_or(failure(48))?;
+                if let Some(old) = publication.replace(replacement) {
+                    close_handle(old).map_err(|_| failure(49))?;
+                }
+                let now = monotonic_active_now().map_err(|_| failure(50))?;
+                resident
+                    .complete_driver_failure_cleanup(now)
+                    .map_err(|_| failure(51))?;
+                if resident.status().state
+                    == wyrmroot_device_proto::CoordinatorState::PermanentFailure
+                {
+                    close_optional(device_resource.take());
+                    close_optional(publication.take());
+                    close_handle(bootstrap).map_err(|_| failure(52))?;
+                    return Err(failure(96));
+                }
+                let retry_until = resident.retry_until_ns().ok_or(failure(53))?;
+                match wait_many(
+                    core::slice::from_ref(&wait_item(bootstrap)),
+                    deepwyrm_syscall::DwDeadline(retry_until),
+                ) {
+                    Err(NativeError::Status(status)) if status == DW_STATUS_TIMED_OUT => {}
+                    Ok(_) | Err(_) => return Err(failure(54)),
+                }
+                let now = monotonic_active_now().map_err(|_| failure(55))?;
+                resident.driver_retry_ready(now).map_err(|_| failure(56))?;
+                let parent = device_resource.ok_or(failure(57))?;
+                let launched = launch_driver_with_bundle(
+                    bootstrap,
+                    publication.ok_or(failure(58))?,
+                    parent,
+                    &mut resident,
+                )?;
+                driver_control = Some(launched);
+                #[cfg(feature = "wyr1c6-selector29")]
+                if resident
+                    .active_driver_request()
+                    .is_some_and(|request| request.attempt_generation.0 > 1)
+                {
+                    // U2 has reached READY and P2 has been committed by
+                    // launch_driver_with_bundle. Returning now lets init's
+                    // existing RRC-A path reap U2 and replace D1.
+                    return Err(failure(126));
+                }
+                continue;
+            }
+            #[cfg(not(feature = "wyr1c6-production"))]
             if observed.observed.0 & DW_SIGNAL_READABLE.0 != 0 {
                 let _ = close_handle(control);
                 #[cfg(feature = "wyr1c5-production")]
@@ -518,6 +598,142 @@ fn receive_controller(
         }
     };
     Ok((replacement, action))
+}
+
+#[cfg(feature = "wyr1c6-production")]
+fn observe_driver_failure(
+    control: DwHandle,
+    request: wyrmroot_device_proto::DriverLaunchRequest,
+    resident: &mut wyrmroot_devmgr::ResidentController,
+) -> Result<(), u32> {
+    let mut bytes = [0u8; wyrmroot_device_proto::control::FAILURE_BYTES];
+    let mut handles = [DwReceivedHandleInfoV1::default(); 1];
+    let counts = receive_channel(control, &mut bytes, &mut handles).map_err(|_| failure(100))?;
+    if counts.bytes != bytes.len() || counts.handles != 0 {
+        close_received(&handles, counts.handles);
+        return Err(failure(101));
+    }
+    let message = wyrmroot_device_proto::control::parse(&bytes).map_err(|_| failure(102))?;
+    #[cfg(feature = "wyr1c6-selector29")]
+    let expected_code = FailureCode::IntentionalRestart;
+    #[cfg(not(feature = "wyr1c6-selector29"))]
+    let expected_code = FailureCode::DriverExited;
+    let expected = ControlMessage::Failure {
+        role_id: request.role_id,
+        bundle_generation: resident.bundle_generation().ok_or(failure(103))?,
+        attempt_generation: request.attempt_generation,
+        endpoint: request.endpoint,
+        transaction_id: request.transaction_id,
+        code: expected_code,
+    };
+    if message != expected {
+        return Err(failure(104));
+    }
+    #[cfg(feature = "wyr1c6-selector29")]
+    if !selector29_should_fail(request.supervisor_generation, request.attempt_generation) {
+        return Err(failure(104));
+    }
+    resident
+        .driver_failed(request.endpoint)
+        .map_err(|_| failure(105))
+}
+
+#[cfg(feature = "wyr1c6-production")]
+fn retire_driver_publication(
+    publication: DwHandle,
+    request: wyrmroot_device_proto::DriverLaunchRequest,
+    resident: &wyrmroot_devmgr::ResidentController,
+) -> Result<(), u32> {
+    let binding = resident.active_binding().ok_or(failure(106))?;
+    let header = RegistryHeader {
+        message_type: RegistryMessageType::Retire,
+        registry_generation: binding.generation.0,
+        endpoint_id: binding.endpoint.id.0,
+        endpoint_generation: binding.endpoint.generation.0,
+        transaction_id: request.transaction_id,
+    };
+    let mut bytes = [0u8; REGISTRY_HEADER_BYTES];
+    let size = encode_registry_empty(header, &mut bytes).map_err(|_| failure(107))?;
+    send_channel(publication, &bytes[..size], &[]).map_err(|_| failure(108))?;
+    let deadline = monotonic_deadline_after(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
+        .map_err(|_| failure(109))?;
+    wait_readable(publication, deadline, 110)?;
+    let mut response = [0u8; REGISTRY_HEADER_BYTES];
+    let mut handles = [DwReceivedHandleInfoV1::default(); 1];
+    let counts =
+        receive_channel(publication, &mut response, &mut handles).map_err(|_| failure(111))?;
+    if counts.bytes != response.len() || counts.handles != 0 {
+        close_received(&handles, counts.handles);
+        return Err(failure(112));
+    }
+    let parsed = parse_registry(&response, 0).map_err(|_| failure(113))?;
+    if parsed.header
+        != (RegistryHeader {
+            message_type: RegistryMessageType::Retired,
+            ..header
+        })
+        || parsed.message != RegistryMessage::Retired
+    {
+        return Err(failure(114));
+    }
+    let stale_publish = RegistryHeader {
+        message_type: RegistryMessageType::Publish,
+        ..header
+    };
+    let stale_size = encode_registry_empty(stale_publish, &mut bytes).map_err(|_| failure(115))?;
+    if send_channel(publication, &bytes[..stale_size], &[]).is_ok() {
+        return Err(failure(116));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "wyr1c6-production")]
+fn probe_stale_driver_endpoint(
+    control: DwHandle,
+    request: wyrmroot_device_proto::DriverLaunchRequest,
+    resident: &wyrmroot_devmgr::ResidentController,
+) -> Result<(), u32> {
+    let message = ControlMessage::Retire {
+        role_id: request.role_id,
+        bundle_generation: resident.bundle_generation().ok_or(failure(117))?,
+        attempt_generation: request.attempt_generation,
+        endpoint: request.endpoint,
+        transaction_id: request.transaction_id,
+    };
+    let mut bytes = [0u8; wyrmroot_device_proto::control::RETIRE_BYTES];
+    wyrmroot_device_proto::control::encode(message, &mut bytes).map_err(|_| failure(118))?;
+    if send_channel(control, &bytes, &[]).is_ok() {
+        return Err(failure(119));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "wyr1c6-production")]
+fn await_driver_reaped(
+    bootstrap: DwHandle,
+    request: wyrmroot_device_proto::DriverLaunchRequest,
+) -> Result<(), u32> {
+    let deadline = monotonic_deadline_after(WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns)
+        .map_err(|_| failure(115))?;
+    wait_readable(bootstrap, deadline, 116)?;
+    let mut bytes = [0u8; REAPED_RESPONSE_BYTES];
+    let mut handles = [DwReceivedHandleInfoV1::default(); 1];
+    let counts = receive_channel(bootstrap, &mut bytes, &mut handles).map_err(|_| failure(117))?;
+    if counts.bytes != bytes.len() || counts.handles != 0 {
+        close_received(&handles, counts.handles);
+        return Err(failure(118));
+    }
+    parse_reaped(&bytes, request).map_err(|_| failure(119))
+}
+
+#[cfg(feature = "wyr1c6-production")]
+fn send_driver_retired(
+    bootstrap: DwHandle,
+    request: wyrmroot_device_proto::DriverLaunchRequest,
+) -> Result<(), u32> {
+    let mut bytes = [0u8; wyrmroot_device_proto::driver_launch::DRIVER_RETIRED_BYTES];
+    encode_driver_retired(request, &mut bytes).map_err(|_| failure(120))?;
+    send_channel(bootstrap, &bytes, &[]).map_err(|_| failure(121))
 }
 
 #[cfg(not(any(feature = "wyr1c4-production", feature = "wyr1c5-production")))]
@@ -804,7 +1020,29 @@ fn launch_driver_with_bundle(
         let _ = close_handle(retained);
         return Err(code);
     }
+    #[cfg(feature = "wyr1c6-selector29")]
+    if selector29_should_fail(request.supervisor_generation, request.attempt_generation) {
+        send_failure_trigger(retained, request, resident)?;
+    }
     Ok(retained)
+}
+
+#[cfg(feature = "wyr1c6-selector29")]
+fn send_failure_trigger(
+    control: DwHandle,
+    request: wyrmroot_device_proto::DriverLaunchRequest,
+    resident: &wyrmroot_devmgr::ResidentController,
+) -> Result<(), u32> {
+    let message = ControlMessage::TriggerFailure {
+        role_id: request.role_id,
+        bundle_generation: resident.bundle_generation().ok_or(failure(97))?,
+        attempt_generation: request.attempt_generation,
+        endpoint: request.endpoint,
+        transaction_id: request.transaction_id,
+    };
+    let mut bytes = [0u8; wyrmroot_device_proto::control::TRIGGER_FAILURE_BYTES];
+    wyrmroot_device_proto::control::encode(message, &mut bytes).map_err(|_| failure(98))?;
+    send_channel(control, &bytes, &[]).map_err(|_| failure(99))
 }
 
 #[cfg(feature = "wyr1c5-production")]

@@ -14,6 +14,7 @@ pub const RESOURCE_BUNDLE_BYTES: usize = HEADER_BYTES;
 pub const READY_BYTES: usize = HEADER_BYTES;
 pub const FAILURE_BYTES: usize = HEADER_BYTES + 8;
 pub const RETIRE_BYTES: usize = HEADER_BYTES;
+pub const TRIGGER_FAILURE_BYTES: usize = HEADER_BYTES;
 /// C3 pre-resource readiness: no bundle exists or is implied.
 pub const CONTROL_READY_BYTES: usize = HEADER_BYTES;
 pub const CONFIGURE_HANDLE_COUNT: u32 = 0;
@@ -38,6 +39,9 @@ pub enum FailureCode {
     DriverRejected = 2,
     DriverExited = 3,
     CleanupFailed = 4,
+    /// Selector-29's generation-one actor failure trigger.  This is a typed
+    /// test stimulus, not a production hardware error.
+    IntentionalRestart = 5,
 }
 
 impl FailureCode {
@@ -47,6 +51,7 @@ impl FailureCode {
             2 => Ok(Self::DriverRejected),
             3 => Ok(Self::DriverExited),
             4 => Ok(Self::CleanupFailed),
+            5 => Ok(Self::IntentionalRestart),
             _ => Err(ControlParseError::UnknownFailure),
         }
     }
@@ -94,6 +99,15 @@ pub enum ControlMessage {
         transaction_id: u64,
         code: FailureCode,
     },
+    /// Selector-29-only deterministic restart stimulus. It is accepted only
+    /// for the exact active attempt after publication has committed.
+    TriggerFailure {
+        role_id: RoleId,
+        bundle_generation: BundleGeneration,
+        attempt_generation: AttemptGeneration,
+        endpoint: ControlEndpoint,
+        transaction_id: u64,
+    },
     Retire {
         role_id: RoleId,
         bundle_generation: BundleGeneration,
@@ -129,7 +143,7 @@ impl ControlMessage {
         match self {
             Self::Configure { .. } => CONFIGURE_BYTES,
             Self::ResourceBundle { .. } => RESOURCE_BUNDLE_BYTES,
-            Self::Ready { .. } | Self::Retire { .. } => HEADER_BYTES,
+            Self::Ready { .. } | Self::Retire { .. } | Self::TriggerFailure { .. } => HEADER_BYTES,
             Self::ControlReady { .. } => CONTROL_READY_BYTES,
             Self::Failure { .. } => FAILURE_BYTES,
         }
@@ -166,6 +180,7 @@ pub fn encode(message: ControlMessage, output: &mut [u8]) -> Result<(), ControlP
         ControlMessage::ResourceBundle { .. } => {}
         ControlMessage::Ready { .. }
         | ControlMessage::Retire { .. }
+        | ControlMessage::TriggerFailure { .. }
         | ControlMessage::ControlReady { .. } => {}
         ControlMessage::Failure { code, .. } => put32(output, HEADER_BYTES, code as u32),
     }
@@ -291,6 +306,18 @@ pub fn parse(bytes: &[u8]) -> Result<ControlMessage, ControlParseError> {
                 transaction_id,
             }
         }
+        7 => {
+            if bytes.len() != TRIGGER_FAILURE_BYTES || handles != 0 {
+                return Err(ControlParseError::WrongHandleCount);
+            }
+            ControlMessage::TriggerFailure {
+                role_id,
+                bundle_generation,
+                attempt_generation,
+                endpoint,
+                transaction_id,
+            }
+        }
         _ => return Err(ControlParseError::UnknownMessage),
     };
     validate_identity(message)?;
@@ -331,6 +358,7 @@ const fn message_type(message: ControlMessage) -> u32 {
         ControlMessage::Failure { .. } => 4,
         ControlMessage::Retire { .. } => 5,
         ControlMessage::ControlReady { .. } => 6,
+        ControlMessage::TriggerFailure { .. } => 7,
     }
 }
 const fn role_id(message: ControlMessage) -> RoleId {
@@ -339,7 +367,8 @@ const fn role_id(message: ControlMessage) -> RoleId {
         | ControlMessage::ResourceBundle { role_id, .. }
         | ControlMessage::Ready { role_id, .. }
         | ControlMessage::Failure { role_id, .. }
-        | ControlMessage::Retire { role_id, .. } => role_id,
+        | ControlMessage::Retire { role_id, .. }
+        | ControlMessage::TriggerFailure { role_id, .. } => role_id,
         ControlMessage::ControlReady { role_id, .. } => role_id,
     }
 }
@@ -358,6 +387,9 @@ const fn bundle_generation(message: ControlMessage) -> BundleGeneration {
             bundle_generation, ..
         }
         | ControlMessage::Retire {
+            bundle_generation, ..
+        }
+        | ControlMessage::TriggerFailure {
             bundle_generation, ..
         } => bundle_generation,
         ControlMessage::ControlReady { .. } => BundleGeneration(0),
@@ -380,6 +412,9 @@ const fn attempt_generation(message: ControlMessage) -> AttemptGeneration {
         | ControlMessage::Retire {
             attempt_generation, ..
         }
+        | ControlMessage::TriggerFailure {
+            attempt_generation, ..
+        }
         | ControlMessage::ControlReady {
             attempt_generation, ..
         } => attempt_generation,
@@ -391,7 +426,8 @@ const fn endpoint(message: ControlMessage) -> ControlEndpoint {
         | ControlMessage::ResourceBundle { endpoint, .. }
         | ControlMessage::Ready { endpoint, .. }
         | ControlMessage::Failure { endpoint, .. }
-        | ControlMessage::Retire { endpoint, .. } => endpoint,
+        | ControlMessage::Retire { endpoint, .. }
+        | ControlMessage::TriggerFailure { endpoint, .. } => endpoint,
         ControlMessage::ControlReady { endpoint, .. } => endpoint,
     }
 }
@@ -401,7 +437,8 @@ const fn transaction_id(message: ControlMessage) -> u64 {
         | ControlMessage::ResourceBundle { transaction_id, .. }
         | ControlMessage::Ready { transaction_id, .. }
         | ControlMessage::Failure { transaction_id, .. }
-        | ControlMessage::Retire { transaction_id, .. } => transaction_id,
+        | ControlMessage::Retire { transaction_id, .. }
+        | ControlMessage::TriggerFailure { transaction_id, .. } => transaction_id,
         ControlMessage::ControlReady { transaction_id, .. } => transaction_id,
     }
 }
@@ -550,5 +587,22 @@ mod tests {
             parse(&nonzero_reserved),
             Err(ControlParseError::NonzeroFlags)
         );
+    }
+
+    #[test]
+    fn selector29_failure_trigger_is_generation_exact_and_handle_free() {
+        let (role, bundle, attempt, endpoint) = ids();
+        let trigger = ControlMessage::TriggerFailure {
+            role_id: role,
+            bundle_generation: bundle,
+            attempt_generation: attempt,
+            endpoint,
+            transaction_id: 11,
+        };
+        let mut bytes = [0; TRIGGER_FAILURE_BYTES];
+        encode(trigger, &mut bytes).unwrap();
+        assert_eq!(parse(&bytes), Ok(trigger));
+        bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(parse(&bytes), Err(ControlParseError::WrongHandleCount));
     }
 }

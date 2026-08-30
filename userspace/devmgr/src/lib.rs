@@ -153,6 +153,8 @@ pub struct ResidentController {
     next_driver_session: u64,
     next_driver_endpoint: u64,
     next_driver_transaction: u64,
+    driver_failures: u8,
+    retry_until_ns: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -203,6 +205,8 @@ impl ResidentController {
             next_driver_session: driver_session,
             next_driver_endpoint: driver_endpoint,
             next_driver_transaction: driver_transaction,
+            driver_failures: 0,
+            retry_until_ns: None,
         })
     }
 
@@ -231,6 +235,14 @@ impl ResidentController {
             Some(launch) => Some(launch.request()),
             None => None,
         }
+    }
+
+    pub const fn retry_until_ns(&self) -> Option<u64> {
+        self.retry_until_ns
+    }
+
+    pub const fn driver_failures(&self) -> u8 {
+        self.driver_failures
     }
 
     /// Admits one exact queried COM2 resource for this devmgr generation.
@@ -414,6 +426,43 @@ impl ResidentController {
         Ok(())
     }
 
+    /// Records an exact failure from the active driver. Publication becomes
+    /// stale immediately, while the broad D1 lease remains resident for a
+    /// driver-only retry after cleanup.
+    pub fn driver_failed(
+        &mut self,
+        endpoint: wyrmroot_device_proto::ControlEndpoint,
+    ) -> Result<(), DevmgrError> {
+        if !matches!(
+            self.status.state,
+            CoordinatorState::AwaitingDriverReady
+                | CoordinatorState::AwaitingPublication
+                | CoordinatorState::Published
+        ) {
+            return Err(DevmgrError::ControllerLifecycle);
+        }
+        let request = self
+            .active_driver_request()
+            .ok_or(DevmgrError::ControllerLifecycle)?;
+        if request.endpoint != endpoint {
+            return Err(DevmgrError::ControllerLifecycle);
+        }
+        self.driver_ready = false;
+        self.publication_current = false;
+        self.status.state = CoordinatorState::CleaningUp;
+        Ok(())
+    }
+
+    /// Drops only the retired registry endpoint. The D1 resource lease and
+    /// failed attempt identity remain until init confirms reaping.
+    pub fn publication_retired(&mut self) -> Result<(), DevmgrError> {
+        if self.status.state != CoordinatorState::CleaningUp || self.active_binding.is_none() {
+            return Err(DevmgrError::ControllerLifecycle);
+        }
+        self.active_binding = None;
+        Ok(())
+    }
+
     pub fn retire_message(&mut self) -> Result<wyrmroot_device_proto::ControlMessage, DevmgrError> {
         if !self.driver_ready {
             return Err(DevmgrError::ControllerLifecycle);
@@ -454,6 +503,46 @@ impl ResidentController {
         launch.reap()?;
         self.driver_ready = false;
         self.publication_current = false;
+        Ok(())
+    }
+
+    /// Completes the native cleanup join and opens the bounded retry window.
+    /// The fourth failure is terminal; no replacement may overlap incomplete
+    /// cleanup or reuse an old driver identity.
+    pub fn complete_driver_failure_cleanup(&mut self, now_ns: u64) -> Result<(), DevmgrError> {
+        if self.status.state != CoordinatorState::CleaningUp {
+            return Err(DevmgrError::ControllerLifecycle);
+        }
+        self.driver_failures = self
+            .driver_failures
+            .checked_add(1)
+            .ok_or(DevmgrError::ControllerLifecycle)?;
+        if self.driver_failures >= wyrmroot_device_proto::coordinator::MAX_ATTEMPTS {
+            self.retry_until_ns = None;
+            self.status.state = CoordinatorState::PermanentFailure;
+            return Ok(());
+        }
+        self.retry_until_ns = Some(
+            now_ns
+                .checked_add(wyrmroot_device_proto::coordinator::RETRY_BACKOFF_NS)
+                .ok_or(DevmgrError::ControllerLifecycle)?,
+        );
+        self.status.state = CoordinatorState::Backoff {
+            attempt: AttemptGeneration(self.next_driver_attempt),
+            until_ns: self.retry_until_ns.unwrap(),
+        };
+        Ok(())
+    }
+
+    pub fn driver_retry_ready(&mut self, now_ns: u64) -> Result<(), DevmgrError> {
+        let until = self
+            .retry_until_ns
+            .ok_or(DevmgrError::ControllerLifecycle)?;
+        if now_ns < until || !matches!(self.status.state, CoordinatorState::Backoff { .. }) {
+            return Err(DevmgrError::ControllerLifecycle);
+        }
+        self.retry_until_ns = None;
+        self.status.state = CoordinatorState::Matched;
         Ok(())
     }
 
@@ -502,6 +591,7 @@ impl ResidentController {
                 binding,
                 transaction_id,
             } => {
+                let cleanup_rebind = self.status.state == CoordinatorState::CleaningUp;
                 if self.status.supervisor_generation != supervisor_generation
                     || self.last_binding.is_none()
                     || self.active_binding.is_some()
@@ -521,7 +611,9 @@ impl ResidentController {
                 self.last_transaction_id = transaction_id;
                 self.last_binding = Some(binding);
                 self.active_binding = Some(binding);
-                self.status.state = if self.driver_ready {
+                self.status.state = if cleanup_rebind {
+                    CoordinatorState::CleaningUp
+                } else if self.driver_ready {
                     CoordinatorState::AwaitingPublication
                 } else if self.bundle_generation.is_some() {
                     CoordinatorState::Matched
@@ -934,6 +1026,53 @@ mod tests {
             resident.retire_message(),
             Err(DevmgrError::ControllerLifecycle)
         );
+    }
+
+    #[test]
+    fn c6_failure_rebind_preserves_cleanup_gate_before_retry() {
+        let mut resident =
+            ResidentController::new(prepare_operational(&manifest(), 7).unwrap(), 41).unwrap();
+        resident.accept(install(binding(1, 7), 41), 0).unwrap();
+        resident.admit_device_resource(exact_resource(19)).unwrap();
+        let request = resident
+            .issue_driver_launch_with_bundle(true, DirectControlRights::ExactReduced)
+            .unwrap();
+        resident.driver_constructed().unwrap();
+        resident.resource_bundle_message().unwrap();
+        resident.bundle_transferred().unwrap();
+        resident
+            .accept_driver_ready(wyrmroot_device_proto::ControlMessage::Ready {
+                role_id: request.role_id,
+                bundle_generation: BundleGeneration(19),
+                attempt_generation: request.attempt_generation,
+                endpoint: request.endpoint,
+                transaction_id: request.transaction_id,
+            })
+            .unwrap();
+        resident.publication_committed().unwrap();
+        resident.driver_failed(request.endpoint).unwrap();
+        resident.publication_retired().unwrap();
+        resident.reap_driver().unwrap();
+        assert_eq!(
+            resident.accept(rebind(binding(2, 8), 42), 1),
+            Ok(ControllerAction::PublicationRebound)
+        );
+        assert_eq!(resident.status().state, CoordinatorState::CleaningUp);
+        resident.complete_driver_failure_cleanup(0).unwrap();
+        assert_eq!(
+            resident.status().state,
+            CoordinatorState::Backoff {
+                attempt: AttemptGeneration(request.attempt_generation.0 + 1),
+                until_ns: wyrmroot_device_proto::coordinator::RETRY_BACKOFF_NS,
+            }
+        );
+        resident
+            .driver_retry_ready(wyrmroot_device_proto::coordinator::RETRY_BACKOFF_NS)
+            .unwrap();
+        let next = resident
+            .issue_driver_launch_with_bundle(true, DirectControlRights::ExactReduced)
+            .unwrap();
+        assert!(next.attempt_generation.0 > request.attempt_generation.0);
     }
 
     #[test]

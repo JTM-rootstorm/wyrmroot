@@ -13,7 +13,9 @@ pub mod coordinator;
 pub mod driver_launch;
 pub mod manifest;
 
-pub use control::{ControlEndpoint, ControlMessage, ControlParseError, FailureCode};
+pub use control::{
+    ControlEndpoint, ControlMessage, ControlParseError, FailureCode, TRIGGER_FAILURE_BYTES,
+};
 pub use controller::{
     ControllerMessage, ControllerParseError, MessageType as ControllerMessageType, StatusCode,
 };
@@ -21,9 +23,12 @@ pub use coordinator::{
     Coordinator, CoordinatorError, CoordinatorState, RegistryBinding, RegistryEndpoint,
 };
 pub use driver_launch::{
-    DEVICE_DRIVER_PATH, DirectControlRights, DriverLaunch, DriverLaunchError, DriverLaunchRequest,
-    DriverLaunchState, LAUNCH_REQUEST_BYTES, LAUNCH_RESPONSE_BYTES, encode_constructed,
-    encode_request, parse_constructed, parse_request,
+    DEVICE_DRIVER_PATH, DRIVER_RETIRED_BYTES, DirectControlRights, DriverLaunch, DriverLaunchError,
+    DriverLaunchRequest, DriverLaunchState, LAUNCH_REQUEST_BYTES, LAUNCH_RESPONSE_BYTES,
+    REAPED_RESPONSE_BYTES, SELECTOR29_FAILURE_ATTEMPT_GENERATION,
+    SELECTOR29_FAILURE_SUPERVISOR_GENERATION, encode_constructed, encode_driver_retired,
+    encode_reaped, encode_request, parse_constructed, parse_driver_retired, parse_reaped,
+    parse_request, selector29_should_fail,
 };
 pub use manifest::{
     COM2_POLICY, COM2_ROLE_ID, DeviceRole, Manifest, ManifestError, PioRange, ProfileId,
