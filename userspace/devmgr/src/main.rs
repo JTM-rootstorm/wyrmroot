@@ -595,10 +595,10 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                 )?;
                 driver_control = Some(launched);
                 #[cfg(feature = "wyr1c6-selector29")]
-                if resident
-                    .active_driver_request()
-                    .is_some_and(|request| request.attempt_generation.0 > 1)
-                {
+                if resident.active_driver_request().is_some_and(|request| {
+                    request.attempt_generation.0
+                        > wyrmroot_device_proto::SELECTOR29_FAILURE_ATTEMPT_GENERATION
+                }) {
                     probe_stale_driver_endpoint(stale_control, request, &resident)?;
                     probe_stale_publication(stale_publication, request, &resident)?;
                     #[cfg(feature = "wyr1c6-selector29")]
@@ -1187,7 +1187,9 @@ fn launch_driver_with_bundle(
         send_c6_fact(
             bootstrap,
             C6Fact {
-                event: if request.attempt_generation.0 == 1 {
+                event: if request.attempt_generation.0
+                    == wyrmroot_device_proto::SELECTOR29_FAILURE_ATTEMPT_GENERATION
+                {
                     3
                 } else {
                     10
@@ -1234,7 +1236,9 @@ fn launch_driver_with_bundle(
         send_c6_fact(
             bootstrap,
             C6Fact {
-                event: if request.attempt_generation.0 == 1 {
+                event: if request.attempt_generation.0
+                    == wyrmroot_device_proto::SELECTOR29_FAILURE_ATTEMPT_GENERATION
+                {
                     4
                 } else {
                     11
@@ -1263,7 +1267,9 @@ fn launch_driver_with_bundle(
             send_c6_fact(
                 bootstrap,
                 C6Fact {
-                    event: if request.attempt_generation.0 == 1 {
+                    event: if request.attempt_generation.0
+                        == wyrmroot_device_proto::SELECTOR29_FAILURE_ATTEMPT_GENERATION
+                    {
                         5
                     } else {
                         12

@@ -1264,6 +1264,26 @@ mod tests {
     }
 
     #[test]
+    fn selector29_u1_is_the_first_supervisor_namespaced_attempt() {
+        let mut resident =
+            ResidentController::new(prepare_operational(&manifest(), 1).unwrap(), 41).unwrap();
+        resident
+            .accept(install_for(1, binding(1, 1), 41), 0)
+            .unwrap();
+        let request = resident
+            .issue_driver_launch(true, DirectControlRights::ExactReduced)
+            .unwrap();
+        assert_eq!(
+            request.attempt_generation.0,
+            wyrmroot_device_proto::SELECTOR29_FAILURE_ATTEMPT_GENERATION
+        );
+        assert!(wyrmroot_device_proto::selector29_should_fail(
+            request.supervisor_generation,
+            request.attempt_generation
+        ));
+    }
+
+    #[test]
     fn replacement_devmgr_uses_a_supervisor_owned_monotonic_driver_namespace() {
         let mut first =
             ResidentController::new(prepare_operational(&manifest(), 7).unwrap(), 41).unwrap();

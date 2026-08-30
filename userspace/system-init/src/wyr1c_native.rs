@@ -2041,7 +2041,10 @@ where
         .wyr1c
         .as_ref()
         .and_then(|state| state.driver.as_ref())
-        .is_some_and(|driver| driver.request.attempt_generation.0 > 1);
+        .is_some_and(|driver| {
+            driver.request.attempt_generation.0
+                > wyrmroot_device_proto::SELECTOR29_FAILURE_ATTEMPT_GENERATION
+        });
     if resident
         .wyr1c
         .as_ref()

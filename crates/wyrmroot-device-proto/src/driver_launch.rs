@@ -20,10 +20,12 @@ pub const LAUNCH_RESPONSE_BYTES: usize = 80;
 pub const REAPED_RESPONSE_BYTES: usize = LAUNCH_RESPONSE_BYTES;
 pub const DRIVER_RETIRED_BYTES: usize = LAUNCH_RESPONSE_BYTES;
 pub const C6_FACT_BYTES: usize = 96;
-/// Selector-29 intentionally fails only the first generation.  The trigger
-/// is carried by the exact typed launch identity and cannot match U2.
-pub const SELECTOR29_FAILURE_ATTEMPT_GENERATION: u64 = 1;
 pub const SELECTOR29_FAILURE_SUPERVISOR_GENERATION: u64 = 1;
+/// Selector-29 intentionally fails only D1's first driver generation. Driver
+/// correlations live in a supervisor-owned 32-bit namespace, so U1 is not the
+/// unqualified ordinal `1`: it is `(D1 << 32) + 1`.
+pub const SELECTOR29_FAILURE_ATTEMPT_GENERATION: u64 =
+    (SELECTOR29_FAILURE_SUPERVISOR_GENERATION << 32) + 1;
 
 pub const fn selector29_should_fail(
     supervisor_generation: SupervisorGeneration,
@@ -699,17 +701,18 @@ mod tests {
 
     #[test]
     fn selector29_trigger_is_only_first_attempt() {
+        assert_eq!(SELECTOR29_FAILURE_ATTEMPT_GENERATION, 0x1_0000_0001);
         assert!(selector29_should_fail(
             SupervisorGeneration(1),
-            AttemptGeneration(1)
+            AttemptGeneration(SELECTOR29_FAILURE_ATTEMPT_GENERATION)
         ));
         assert!(!selector29_should_fail(
             SupervisorGeneration(2),
-            AttemptGeneration(1)
+            AttemptGeneration(SELECTOR29_FAILURE_ATTEMPT_GENERATION)
         ));
         assert!(!selector29_should_fail(
             SupervisorGeneration(1),
-            AttemptGeneration(2)
+            AttemptGeneration(SELECTOR29_FAILURE_ATTEMPT_GENERATION + 1)
         ));
     }
 
