@@ -297,7 +297,10 @@ fn build_produced_artifacts(
             )
         })?;
     let snapshot = crate::wyr1c::build_c6_snapshot(nonce)?;
-    let kernel = build_selector29_kernel(deep_repository, &build, nonce)?;
+    let kernel = build_directory
+        .with_inheritable_anchor("WYR1-C6 build directory", |build_directory| {
+            build_selector29_kernel(deep_repository, build_directory, nonce)
+        })?;
     let table = boot_device_table();
     let code = pinned_firmware(OVMF_CODE_PATH, OVMF_CODE_SHA256, "OVMF code")?;
     let vars = pinned_firmware(OVMF_VARS_PATH, OVMF_VARS_SHA256, "OVMF vars")?;
@@ -979,10 +982,10 @@ fn build_c6_bootstrap(
 
 fn build_selector29_kernel(
     repository: &Path,
-    build: &Path,
+    build: &InheritableDirectory,
     nonce: &str,
 ) -> Result<Vec<u8>, Failure> {
-    let target = build.join("deepwyrm-selector29");
+    let target = build.path().join("deepwyrm-selector29");
     fs::create_dir(&target)
         .map_err(|error| Failure::task(format!("could not create C6 kernel target: {error}")))?;
     let mut command = Command::new(repository.join("tools/pinned-cargo"));
@@ -1020,8 +1023,10 @@ fn build_selector29_kernel(
             "WYR1-C6 selector-29 Deepwyrm kernel build failed",
         ));
     }
-    read_regular_bounded(
-        &target.join(KERNEL_TARGET).join("release/deepwyrm-kernel"),
+    build.read_producer(
+        &PathBuf::from("deepwyrm-selector29")
+            .join(KERNEL_TARGET)
+            .join("release/deepwyrm-kernel"),
         MAX_ARTIFACT_BYTES,
         "selector-29 kernel",
     )
