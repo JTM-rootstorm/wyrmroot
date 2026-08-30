@@ -176,8 +176,10 @@ Devmgr retains the broad claimed DeviceResource for its whole generation. It
 does not transfer that parent handle to init, registryd, or a driver. For each
 driver attempt it:
 
-1. duplicates one reduced DeviceResource with
-   `READ | WRITE | INSPECT` (`0x103`);
+1. duplicates one sender-side staging DeviceResource with
+   `READ | WRITE | TRANSFER | INSPECT` (`0x183`), then requests
+   `READ | WRITE | INSPECT` (`0x103`) on the atomic MOVE so `TRANSFER` cannot
+   cross into the driver;
 2. creates one fresh Interrupt from the broad parent with
    `WAIT | MODIFY | TRANSFER | INSPECT` (`0x390`);
 3. prepares to MOVE that Interrupt with

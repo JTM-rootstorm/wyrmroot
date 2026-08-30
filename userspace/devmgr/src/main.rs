@@ -127,6 +127,9 @@ const DEVICE_RESOURCE_CUSTODY_RIGHTS: DwRights = DwRights(
 const DEVICE_RESOURCE_DRIVER_RIGHTS: DwRights =
     DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_INSPECT.0);
 #[cfg(feature = "wyr1c5-production")]
+const DEVICE_RESOURCE_TRANSFER_RIGHTS: DwRights =
+    DwRights(DEVICE_RESOURCE_DRIVER_RIGHTS.0 | DW_RIGHT_TRANSFER.0);
+#[cfg(feature = "wyr1c5-production")]
 const INTERRUPT_CUSTODY_RIGHTS: DwRights =
     DwRights(DW_RIGHT_WAIT.0 | DW_RIGHT_MODIFY.0 | DW_RIGHT_TRANSFER.0 | DW_RIGHT_INSPECT.0);
 #[cfg(feature = "wyr1c5-production")]
@@ -1065,7 +1068,7 @@ fn launch_driver_with_bundle(
         return Err(failure(66));
     }
 
-    let reduced = match duplicate_handle(parent_resource, DEVICE_RESOURCE_DRIVER_RIGHTS) {
+    let reduced = match duplicate_handle(parent_resource, DEVICE_RESOURCE_TRANSFER_RIGHTS) {
         Ok(handle) => handle,
         Err(_) => {
             let _ = close_handle(retained);
@@ -1084,7 +1087,7 @@ fn launch_driver_with_bundle(
         validate_fresh(
             reduced,
             DW_OBJECT_TYPE_DEVICE_RESOURCE,
-            DEVICE_RESOURCE_DRIVER_RIGHTS,
+            DEVICE_RESOURCE_TRANSFER_RIGHTS,
         )
         .map_err(|_| failure(69))?;
         validate_fresh(

@@ -15,7 +15,9 @@ TaskGroup.
 For the exact COM2 claim, devmgr:
 
 1. retains the broad `DeviceResource` with rights `0x3c3`;
-2. duplicates one driver resource with `READ | WRITE | INSPECT = 0x103`;
+2. duplicates one sender-side staging resource with
+   `READ | WRITE | TRANSFER | INSPECT = 0x183`, then requests the exact driver
+   rights `READ | WRITE | INSPECT = 0x103` on MOVE;
 3. creates one fresh `Interrupt` with
    `WAIT | MODIFY | TRANSFER | INSPECT = 0x390`;
 4. freshly validates both objects and their resource, lease, source, state,

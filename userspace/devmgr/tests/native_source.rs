@@ -89,6 +89,8 @@ fn c5_moves_exact_reduced_bundle_then_requires_ready_before_publish() {
         .unwrap();
     assert!(duplicate < interrupt && interrupt < bundle && bundle < move_bundle);
     assert!(move_bundle < ready && ready < publish);
+    assert!(c5.contains("duplicate_handle(parent_resource, DEVICE_RESOURCE_TRANSFER_RIGHTS)"));
+    assert!(NATIVE.contains("DwRights(DEVICE_RESOURCE_DRIVER_RIGHTS.0 | DW_RIGHT_TRANSFER.0)"));
     assert!(c5.contains("requested_rights: DEVICE_RESOURCE_DRIVER_RIGHTS"));
     assert!(c5.contains("requested_rights: INTERRUPT_DRIVER_RIGHTS"));
     assert!(c5.contains("DW_HANDLE_TRANSFER_MOVE"));
