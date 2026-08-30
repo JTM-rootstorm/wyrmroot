@@ -9,6 +9,7 @@ use core::cmp::Ordering;
 
 use deepwyrm_abi::{
     DW_BOOT_BASE_PAGE_SIZE, DW_BOOT_MODULE_FLAG_READ_ONLY,
+    DW_BOOT_MODULE_KIND_DEEPWYRM_BOOT_DEVICE_TABLE_V1,
     DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1, DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS,
     DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP, DW_BOOT_MODULE_V1_SIZE, DW_BOOT_MODULE_V1_VERSION,
     DW_BOOT_X86_64_PAGING_HANDOFF_MAX_BYTE_LEN,
@@ -102,6 +103,7 @@ impl PlannedModule {
             kind: self.kind,
             flags: if self.kind == DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS
                 || self.kind == DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1
+                || self.kind == DW_BOOT_MODULE_KIND_DEEPWYRM_BOOT_DEVICE_TABLE_V1
             {
                 DW_BOOT_MODULE_FLAG_READ_ONLY
             } else {
@@ -180,6 +182,41 @@ pub fn plan_modules(
     Ok(ModulePlan {
         modules: [bootstrap, bootfs, paging_handoff],
     })
+}
+
+/// Validate and order the selector-30 modules. The optional boot-device table
+/// is deliberately appended after the historical three-module prefix so older
+/// products preserve their exact module count and ordering.
+pub fn plan_modules_with_boot_device_table(
+    bootstrap: ModuleInput,
+    bootfs: ModuleInput,
+    paging_handoff: ModuleInput,
+    boot_device_table: ModuleInput,
+) -> Result<[DwBootModuleV1; 4], ModulePlanError> {
+    require_kind(
+        boot_device_table,
+        DW_BOOT_MODULE_KIND_DEEPWYRM_BOOT_DEVICE_TABLE_V1,
+    )?;
+    let boot_device_table = PlannedModule::from_input(boot_device_table)?;
+    let historical = plan_modules(bootstrap, bootfs, paging_handoff)?;
+    let historical_modules = [
+        historical.bootstrap(),
+        historical.bootfs(),
+        historical.paging_handoff(),
+    ];
+    if historical_modules
+        .iter()
+        .copied()
+        .any(|module| ranges_overlap(module, boot_device_table))
+    {
+        return Err(ModulePlanError::OverlappingAllocations);
+    }
+    Ok([
+        historical_modules[0].to_abi(),
+        historical_modules[1].to_abi(),
+        historical_modules[2].to_abi(),
+        boot_device_table.to_abi(),
+    ])
 }
 
 fn require_kind(input: ModuleInput, expected: DwBootModuleKind) -> Result<(), ModulePlanError> {

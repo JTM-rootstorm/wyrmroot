@@ -34,11 +34,20 @@ pub const MAX_BOOTSTRAP_ARTIFACT_BYTES: usize = 8 * 1024 * 1024;
 /// Loader-local admission limit for the read-only bootfs image.
 pub const MAX_BOOTFS_ARTIFACT_BYTES: usize = 32 * 1024 * 1024;
 
+/// The optional D6 table is bounded entirely by generated ABI capacities.
+#[allow(dead_code)]
+pub const MAX_BOOT_DEVICE_TABLE_ARTIFACT_BYTES: usize = deepwyrm_abi::DW_BOOT_DEVICE_TABLE_V1_SIZE
+    as usize
+    + deepwyrm_abi::DW_BOOT_DEVICE_TABLE_MAX_RESOURCES as usize
+        * deepwyrm_abi::DW_BOOT_DEVICE_TABLE_RECORD_STRIDE as usize;
+
 /// Maximum combined required-artifact input held before the handoff builder
 /// consumes it. It is the exact sum of the per-artifact caps, preventing an
 /// accidental future cap increase from silently admitting an unbounded total.
-pub const MAX_TOTAL_ARTIFACT_BYTES: usize =
-    MAX_KERNEL_ARTIFACT_BYTES + MAX_BOOTSTRAP_ARTIFACT_BYTES + MAX_BOOTFS_ARTIFACT_BYTES;
+pub const MAX_TOTAL_ARTIFACT_BYTES: usize = MAX_KERNEL_ARTIFACT_BYTES
+    + MAX_BOOTSTRAP_ARTIFACT_BYTES
+    + MAX_BOOTFS_ARTIFACT_BYTES
+    + MAX_BOOT_DEVICE_TABLE_ARTIFACT_BYTES;
 
 /// ACPI RSDP v1 is exactly this many bytes.
 pub const ACPI_RSDP_V1_BYTES: usize = 20;
@@ -204,7 +213,9 @@ pub fn bounded_artifact_len(byte_len: u64, cap: usize) -> Result<usize, Preparat
 }
 
 /// Checks the aggregate input budget with overflow protection.
-pub fn total_artifact_bytes(lengths: [usize; 3]) -> Result<usize, PreparationError> {
+pub fn total_artifact_bytes(
+    lengths: impl IntoIterator<Item = usize>,
+) -> Result<usize, PreparationError> {
     let total = lengths.into_iter().try_fold(0_usize, |total, length| {
         total
             .checked_add(length)
@@ -565,6 +576,7 @@ mod firmware {
 
     #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
     use deepwyrm_abi::{
+        DW_BOOT_MODULE_KIND_DEEPWYRM_BOOT_DEVICE_TABLE_V1,
         DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1, DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS,
         DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP, DW_BOOT_X86_64_PAGING_HANDOFF_MAX_BYTE_LEN,
         DW_BOOT_X86_64_PAGING_HANDOFF_TABLE_FRAME_STRIDE,
@@ -582,7 +594,7 @@ mod firmware {
     use uefi::table::cfg::ConfigTableEntry;
     use uefi::{CString16, Status, system};
     use wyrmroot_efi_loader::artifacts::{
-        ArtifactInputs, BOOTFS_PATH, BOOTSTRAP_PATH, KERNEL_PATH,
+        ArtifactInputs, BOOT_DEVICE_TABLE_PATH, BOOTFS_PATH, BOOTSTRAP_PATH, KERNEL_PATH,
     };
     #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
     use wyrmroot_efi_loader::boot_info::{
@@ -1074,6 +1086,7 @@ mod firmware {
         kernel: Option<RetainedPages>,
         pub bootstrap: RetainedPages,
         pub bootfs: RetainedPages,
+        pub boot_device_table: Option<RetainedPages>,
         pub acpi_rsdp: Option<AcpiRsdp>,
         #[allow(dead_code)] // Canonical BootInfo consumes GOP metadata after integration.
         pub framebuffer: Option<FramebufferMetadata>,
@@ -1134,6 +1147,10 @@ mod firmware {
             unsafe { self.bootstrap.release() };
             // SAFETY: same ownership argument as for `kernel`.
             unsafe { self.bootfs.release() };
+            if let Some(boot_device_table) = self.boot_device_table {
+                // SAFETY: same ownership argument as for `bootfs`.
+                unsafe { boot_device_table.release() };
+            }
             if let Some(acpi) = self.acpi_rsdp {
                 // SAFETY: the retained copy is still pre-exit and uniquely owned.
                 unsafe { acpi.storage.release() };
@@ -1149,6 +1166,7 @@ mod firmware {
         kernel: Vec<u8>,
         bootstrap: Vec<u8>,
         bootfs: Vec<u8>,
+        boot_device_table: Option<Vec<u8>>,
         config: Option<Vec<u8>>,
     }
 
@@ -1177,6 +1195,7 @@ mod firmware {
             validated.kernel,
             validated.bootstrap,
             validated.bootfs,
+            files.boot_device_table.as_deref(),
             acpi_rsdp,
             framebuffer,
             entropy,
@@ -1332,7 +1351,14 @@ mod firmware {
                 .map_err(|_| FirmwarePreparationError::InvalidGeneratedPolicy)?;
             let module_cap = usize::try_from(policy.max_module_entries)
                 .map_err(|_| FirmwarePreparationError::InvalidGeneratedPolicy)?;
-            super::bounded_intake_count(3, policy.max_module_entries)
+            let module_count = 3 + usize::from(
+                self.prepared
+                    .as_ref()
+                    .ok_or(FirmwarePreparationError::KernelSourceReleased)?
+                    .boot_device_table
+                    .is_some(),
+            );
+            super::bounded_intake_count(module_count, policy.max_module_entries)
                 .map_err(FirmwarePreparationError::Artifact)?;
             self.boot_info = Some(allocate_typed_table::<DwBootInfoV1>(1)?);
             self.memory_map = Some(allocate_typed_table::<DwBootMemoryRangeV1>(map_cap)?);
@@ -1349,13 +1375,24 @@ mod firmware {
                 .prepared
                 .as_ref()
                 .ok_or(FirmwarePreparationError::KernelSourceReleased)?;
+            let bootstrap_range = original.bootstrap.retained_physical_range()?;
+            let bootfs_range = original.bootfs.retained_physical_range()?;
+            let paging_handoff_range = self
+                .paging_handoff
+                .as_ref()
+                .ok_or(FirmwarePreparationError::InvalidPreExitAllocation)?
+                .retained_physical_range()?;
+            let boot_device_table_range = original
+                .boot_device_table
+                .as_ref()
+                .map(RetainedPages::retained_physical_range)
+                .transpose()?
+                .unwrap_or(bootstrap_range);
             let module_ranges = [
-                original.bootstrap.retained_physical_range()?,
-                original.bootfs.retained_physical_range()?,
-                self.paging_handoff
-                    .as_ref()
-                    .ok_or(FirmwarePreparationError::InvalidPreExitAllocation)?
-                    .retained_physical_range()?,
+                bootstrap_range,
+                bootfs_range,
+                paging_handoff_range,
+                boot_device_table_range,
             ];
             let validated_rsdp = original
                 .acpi_rsdp
@@ -1387,6 +1424,7 @@ mod firmware {
             };
             let mapping_capacity = capacity
                 .checked_add(10)
+                .and_then(|value| value.checked_add(module_count - 3))
                 .ok_or(FirmwarePreparationError::InvalidPreExitAllocation)?;
             let mut mapping_output = fallible_mappings(mapping_capacity)?;
             let mut materialization_output = fallible_materializations(capacity)?;
@@ -1395,7 +1433,7 @@ mod firmware {
             let page_count = {
                 let identity = identity_inputs(
                     &self,
-                    &module_ranges,
+                    &module_ranges[..module_count],
                     validated_rsdp,
                     entropy_range,
                     framebuffer_pixels,
@@ -1423,7 +1461,7 @@ mod firmware {
             let (materializations, paging_handoff_byte_len) = {
                 let identity = identity_inputs(
                     &self,
-                    &module_ranges,
+                    &module_ranges[..module_count],
                     validated_rsdp,
                     entropy_range,
                     framebuffer_pixels,
@@ -1517,6 +1555,7 @@ mod firmware {
                 mapping_output,
                 materialization_output,
                 module_ranges,
+                module_count,
                 validated_rsdp,
                 entropy_range,
                 framebuffer_pixels,
@@ -1558,7 +1597,8 @@ mod firmware {
         kernel_segments: Vec<KernelSegmentPages>,
         mapping_output: Vec<TransitionMapping>,
         materialization_output: Vec<KernelMaterialization>,
-        module_ranges: [RetainedPhysicalRange; 3],
+        module_ranges: [RetainedPhysicalRange; 4],
+        module_count: usize,
         validated_rsdp: Option<ValidatedRsdpMappingInput>,
         entropy_range: Option<RetainedPhysicalRange>,
         framebuffer_pixels: Option<PhysicalRange>,
@@ -1605,6 +1645,7 @@ mod firmware {
                 mapping_output,
                 materialization_output,
                 module_ranges: self.module_ranges,
+                module_count: self.module_count,
                 validated_rsdp: self.validated_rsdp,
                 entropy_range: self.entropy_range,
                 framebuffer_pixels: self.framebuffer_pixels,
@@ -1647,7 +1688,8 @@ mod firmware {
         kernel_segments: Vec<KernelSegmentPages>,
         mapping_output: Vec<TransitionMapping>,
         materialization_output: Vec<KernelMaterialization>,
-        module_ranges: [RetainedPhysicalRange; 3],
+        module_ranges: [RetainedPhysicalRange; 4],
+        module_count: usize,
         validated_rsdp: Option<ValidatedRsdpMappingInput>,
         entropy_range: Option<RetainedPhysicalRange>,
         framebuffer_pixels: Option<PhysicalRange>,
@@ -1675,6 +1717,7 @@ mod firmware {
                 mut mapping_output,
                 mut materialization_output,
                 module_ranges,
+                module_count,
                 validated_rsdp,
                 entropy_range,
                 framebuffer_pixels,
@@ -1713,36 +1756,67 @@ mod firmware {
                 Ok(value) => value,
                 Err(_) => post_exit_halt(),
             };
-            let module_plan = match modules::plan_modules(
-                ModuleInput {
-                    kind: DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP,
-                    physical_start: inputs.bootstrap.physical_start(),
-                    byte_len: match u64::try_from(inputs.bootstrap.payload_byte_len) {
-                        Ok(value) => value,
-                        Err(_) => post_exit_halt(),
-                    },
+            let bootstrap_module = ModuleInput {
+                kind: DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP,
+                physical_start: inputs.bootstrap.physical_start(),
+                byte_len: match u64::try_from(inputs.bootstrap.payload_byte_len) {
+                    Ok(value) => value,
+                    Err(_) => post_exit_halt(),
                 },
-                ModuleInput {
-                    kind: DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS,
-                    physical_start: inputs.bootfs.physical_start(),
-                    byte_len: match u64::try_from(inputs.bootfs.payload_byte_len) {
-                        Ok(value) => value,
-                        Err(_) => post_exit_halt(),
-                    },
-                },
-                ModuleInput {
-                    kind: DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1,
-                    physical_start: paging_handoff.physical_start(),
-                    byte_len: match u64::try_from(paging_handoff_byte_len) {
-                        Ok(value) => value,
-                        Err(_) => post_exit_halt(),
-                    },
-                },
-            ) {
-                Ok(value) => value,
-                Err(_) => post_exit_halt(),
             };
-            let module_records = module_plan.to_abi_modules();
+            let bootfs_module = ModuleInput {
+                kind: DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS,
+                physical_start: inputs.bootfs.physical_start(),
+                byte_len: match u64::try_from(inputs.bootfs.payload_byte_len) {
+                    Ok(value) => value,
+                    Err(_) => post_exit_halt(),
+                },
+            };
+            let paging_handoff_module = ModuleInput {
+                kind: DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1,
+                physical_start: paging_handoff.physical_start(),
+                byte_len: match u64::try_from(paging_handoff_byte_len) {
+                    Ok(value) => value,
+                    Err(_) => post_exit_halt(),
+                },
+            };
+            let mut module_records = [DwBootModuleV1::default(); 4];
+            let planned_module_count = match inputs.boot_device_table.as_ref() {
+                Some(boot_device_table) => match modules::plan_modules_with_boot_device_table(
+                    bootstrap_module,
+                    bootfs_module,
+                    paging_handoff_module,
+                    ModuleInput {
+                        kind: DW_BOOT_MODULE_KIND_DEEPWYRM_BOOT_DEVICE_TABLE_V1,
+                        physical_start: boot_device_table.physical_start(),
+                        byte_len: match u64::try_from(boot_device_table.payload_byte_len) {
+                            Ok(value) => value,
+                            Err(_) => post_exit_halt(),
+                        },
+                    },
+                ) {
+                    Ok(value) => {
+                        module_records.copy_from_slice(&value);
+                        4
+                    }
+                    Err(_) => post_exit_halt(),
+                },
+                None => match modules::plan_modules(
+                    bootstrap_module,
+                    bootfs_module,
+                    paging_handoff_module,
+                ) {
+                    Ok(value) => {
+                        module_records[..3].copy_from_slice(&value.to_abi_modules());
+                        3
+                    }
+                    Err(_) => post_exit_halt(),
+                },
+            };
+            if planned_module_count != module_count {
+                post_exit_halt();
+            }
+            let module_records = &module_records[..planned_module_count];
             if super::bounded_intake_count(module_records.len(), policy.max_module_entries).is_err()
             {
                 post_exit_halt();
@@ -1889,7 +1963,7 @@ mod firmware {
                     Ok(value) => value,
                     Err(_) => post_exit_halt(),
                 },
-                module_data: &module_ranges,
+                module_data: &module_ranges[..planned_module_count],
                 command_line: None,
                 entropy: entropy_range,
                 validated_rsdp,
@@ -1941,7 +2015,7 @@ mod firmware {
                     memory_map: memory_map_storage,
                     module_table: module_table_storage,
                     module_records: &module_records,
-                    module_allocations: &module_ranges,
+                    module_allocations: &module_ranges[..planned_module_count],
                     entropy: entropy_coherence,
                     rsdp: rsdp_coherence,
                 },
@@ -2034,6 +2108,7 @@ mod firmware {
     struct MaterializedInputs {
         bootstrap: RetainedPages,
         bootfs: RetainedPages,
+        boot_device_table: Option<RetainedPages>,
         acpi_rsdp: Option<AcpiRsdp>,
         framebuffer: Option<FramebufferMetadata>,
         entropy: FirmwareEntropy,
@@ -2047,6 +2122,10 @@ mod firmware {
             unsafe { self.bootstrap.release() };
             // SAFETY: same unique pre-EBS ownership as `bootstrap`.
             unsafe { self.bootfs.release() };
+            if let Some(boot_device_table) = self.boot_device_table {
+                // SAFETY: same unique pre-EBS ownership as `bootfs`.
+                unsafe { boot_device_table.release() };
+            }
             if let Some(rsdp) = self.acpi_rsdp {
                 // SAFETY: the retained RSDP copy is still pre-EBS and unique.
                 unsafe { rsdp.storage.release() };
@@ -2081,6 +2160,7 @@ mod firmware {
             PostExitInputs {
                 bootstrap: self.bootstrap.into_post_exit(),
                 bootfs: self.bootfs.into_post_exit(),
+                boot_device_table: self.boot_device_table.map(RetainedPages::into_post_exit),
                 acpi_rsdp,
                 framebuffer: self.framebuffer,
                 entropy,
@@ -2227,6 +2307,7 @@ mod firmware {
     struct PostExitInputs {
         bootstrap: PostExitPages,
         bootfs: PostExitPages,
+        boot_device_table: Option<PostExitPages>,
         acpi_rsdp: Option<PostExitAcpiRsdp>,
         framebuffer: Option<FramebufferMetadata>,
         entropy: PostExitEntropy,
@@ -2337,6 +2418,7 @@ mod firmware {
         Ok(MaterializedInputs {
             bootstrap: prepared.bootstrap,
             bootfs: prepared.bootfs,
+            boot_device_table: prepared.boot_device_table,
             acpi_rsdp: prepared.acpi_rsdp,
             framebuffer: prepared.framebuffer,
             entropy: prepared.entropy,
@@ -2475,20 +2557,32 @@ mod firmware {
         let kernel_path = firmware_path(KERNEL_PATH)?;
         let bootstrap_path = firmware_path(BOOTSTRAP_PATH)?;
         let bootfs_path = firmware_path(BOOTFS_PATH)?;
+        let boot_device_table_path = firmware_path(BOOT_DEVICE_TABLE_PATH)?;
         let config_path = firmware_path(CONFIG_PATH)?;
 
         let kernel = read_bounded_file(&mut root, &kernel_path, MAX_KERNEL_ARTIFACT_BYTES)?;
         let bootstrap =
             read_bounded_file(&mut root, &bootstrap_path, MAX_BOOTSTRAP_ARTIFACT_BYTES)?;
         let bootfs = read_bounded_file(&mut root, &bootfs_path, MAX_BOOTFS_ARTIFACT_BYTES)?;
-        total_artifact_bytes([kernel.len(), bootstrap.len(), bootfs.len()])
-            .map_err(FirmwarePreparationError::Artifact)?;
+        let boot_device_table = read_optional_bounded_file(
+            &mut root,
+            &boot_device_table_path,
+            super::MAX_BOOT_DEVICE_TABLE_ARTIFACT_BYTES,
+        )?;
+        total_artifact_bytes([
+            kernel.len(),
+            bootstrap.len(),
+            bootfs.len(),
+            boot_device_table.as_ref().map_or(0, Vec::len),
+        ])
+        .map_err(FirmwarePreparationError::Artifact)?;
         let config = read_optional_bounded_file(&mut root, &config_path, MAX_CONFIG_BYTES)?;
 
         Ok(LoadedFiles {
             kernel,
             bootstrap,
             bootfs,
+            boot_device_table,
             config,
         })
     }
@@ -2557,6 +2651,7 @@ mod firmware {
         kernel: &[u8],
         bootstrap: &[u8],
         bootfs: &[u8],
+        boot_device_table: Option<&[u8]>,
         acpi_rsdp: Option<AcpiRsdp>,
         framebuffer: Option<FramebufferMetadata>,
         entropy: CollectedEntropy,
@@ -2588,9 +2683,26 @@ mod firmware {
                 return Err(error);
             }
         };
+        let boot_device_table = match boot_device_table.map(retain_payload).transpose() {
+            Ok(value) => value,
+            Err(error) => {
+                // SAFETY: no reference to the retained allocations escaped.
+                unsafe { bootfs.release() };
+                // SAFETY: no reference to the retained allocations escaped.
+                unsafe { bootstrap.release() };
+                // SAFETY: no reference to the retained allocations escaped.
+                unsafe { kernel.release() };
+                release_acpi(acpi_rsdp);
+                return Err(error);
+            }
+        };
         let entropy = match retain_entropy(entropy) {
             Ok(value) => value,
             Err(error) => {
+                if let Some(boot_device_table) = boot_device_table {
+                    // SAFETY: no reference to the retained allocation escaped.
+                    unsafe { boot_device_table.release() };
+                }
                 // SAFETY: no reference to the retained allocations escaped.
                 unsafe { bootfs.release() };
                 // SAFETY: no reference to the retained allocations escaped.
@@ -2606,6 +2718,7 @@ mod firmware {
             kernel: Some(kernel),
             bootstrap,
             bootfs,
+            boot_device_table,
             acpi_rsdp,
             framebuffer,
             entropy,

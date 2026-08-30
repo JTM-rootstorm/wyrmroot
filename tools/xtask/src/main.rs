@@ -2,6 +2,7 @@ mod cli;
 mod deep_layout;
 mod dw1b;
 mod dw1c;
+mod dw1d6;
 mod elf_runtime;
 mod error;
 mod g3_image;
@@ -172,6 +173,20 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
             dw1c::image_rebuild(std::path::Path::new(&request)).map(Some)
         }
         Action::Dw1CInspect(request) => dw1c::inspect(std::path::Path::new(&request)).map(Some),
+        Action::Dw1D6Freeze {
+            output,
+            deep_repository,
+            deep_revision,
+            evidence_nonce,
+            evidence_challenge,
+        } => dw1d6::freeze(
+            std::path::Path::new(&output),
+            std::path::Path::new(&deep_repository),
+            &deep_revision,
+            &evidence_nonce,
+            &evidence_challenge,
+        )
+        .map(Some),
         Action::Unavailable(command) => Err(Failure::unavailable(command)),
     }
 }

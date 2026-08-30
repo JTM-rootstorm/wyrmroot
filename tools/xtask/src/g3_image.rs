@@ -34,6 +34,7 @@ const LOADER_SHORT: [u8; 11] = *b"BOOTX64 EFI";
 const KERNEL_SHORT: [u8; 11] = *b"DEEPWYRMELF";
 const BOOTSTRAP_SHORT: [u8; 11] = *b"BOOTST~1ELF";
 const BOOTFS_SHORT: [u8; 11] = *b"BOOTFS  IMG";
+const BOOT_DEVICE_TABLE_SHORT: [u8; 11] = *b"BDEVICE BIN";
 
 struct Geometry {
     fat_sectors: u32,
@@ -75,6 +76,7 @@ struct Inputs {
     kernel: Vec<u8>,
     bootstrap: Vec<u8>,
     bootfs: Vec<u8>,
+    boot_device_table: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -112,12 +114,23 @@ impl Inputs {
             kernel: read_artifact(&arguments.kernel, "kernel")?,
             bootstrap: read_artifact(&arguments.bootstrap, "bootstrap")?,
             bootfs: read_artifact(&arguments.bootfs, "bootfs")?,
+            boot_device_table: None,
         })
+    }
+
+    fn load_with_boot_device_table(
+        arguments: &G3ImageArguments,
+        boot_device_table: &str,
+    ) -> Result<Self, Failure> {
+        let mut inputs = Self::load(arguments)?;
+        inputs.boot_device_table = Some(read_artifact(boot_device_table, "boot-device table")?);
+        Ok(inputs)
     }
 
     fn total_clusters(&self) -> Result<u32, Failure> {
         [&self.loader, &self.kernel, &self.bootstrap, &self.bootfs]
             .into_iter()
+            .chain(self.boot_device_table.iter())
             .try_fold(0_u32, |total, bytes| {
                 total
                     .checked_add(cluster_count(bytes.len())?)
@@ -139,11 +152,33 @@ pub(crate) fn build(arguments: &G3ImageArguments) -> Result<String, Failure> {
     build_in_root(arguments, None)
 }
 
+/// Build the selector-30 ESP with its separate immutable boot-device table.
+/// Ordinary callers cannot accidentally gain this fifth artifact.
+pub(crate) fn build_d6(
+    arguments: &G3ImageArguments,
+    boot_device_table: &str,
+) -> Result<String, Failure> {
+    build_with_inputs(
+        arguments,
+        Inputs::load_with_boot_device_table(arguments, boot_device_table)?,
+        None,
+        Some(boot_device_table),
+    )
+}
+
 pub(crate) fn build_in_root(
     arguments: &G3ImageArguments,
     output_root: Option<&Path>,
 ) -> Result<String, Failure> {
-    let inputs = Inputs::load(arguments)?;
+    build_with_inputs(arguments, Inputs::load(arguments)?, output_root, None)
+}
+
+fn build_with_inputs(
+    arguments: &G3ImageArguments,
+    inputs: Inputs,
+    output_root: Option<&Path>,
+    boot_device_table: Option<&str>,
+) -> Result<String, Failure> {
     let geometry = Geometry::fixed();
     let total_file_clusters = inputs.total_clusters()?;
     let used_clusters = 4_u32
@@ -153,7 +188,12 @@ pub(crate) fn build_in_root(
         return Err(Failure::task("G3 artifacts do not fit the fixed FAT32 ESP"));
     }
     let layouts = layouts(&inputs)?;
-    validate_output_path(arguments, Path::new(&arguments.image), output_root)?;
+    validate_output_path(
+        arguments,
+        Path::new(&arguments.image),
+        output_root,
+        boot_device_table,
+    )?;
     let output_path = PathBuf::from(&arguments.image);
     let mut output = OpenOptions::new()
         .read(true)
@@ -162,7 +202,7 @@ pub(crate) fn build_in_root(
         .custom_flags(0o400000)
         .open(&output_path)
         .map_err(|error| Failure::task(format!("could not create G3 ESP: {error}")))?;
-    let result = build_loaded(&mut output, geometry, used_clusters, layouts);
+    let result = build_loaded(&mut output, geometry, used_clusters, &layouts);
     let report =
         result.and_then(|()| inspect_loaded(&mut output, &inputs).map(|value| value.render()));
     drop(output);
@@ -209,6 +249,7 @@ pub(crate) fn build_open(
         kernel: kernel.to_vec(),
         bootstrap: bootstrap.to_vec(),
         bootfs: bootfs.to_vec(),
+        boot_device_table: None,
     };
     let geometry = Geometry::fixed();
     let used_clusters = 4_u32
@@ -218,7 +259,7 @@ pub(crate) fn build_open(
         return Err(Failure::task("G3 artifacts do not fit the fixed FAT32 ESP"));
     }
     let layouts = layouts(&inputs)?;
-    build_loaded(image, geometry, used_clusters, layouts)?;
+    build_loaded(image, geometry, used_clusters, &layouts)?;
     inspect_loaded(image, &inputs)
 }
 
@@ -234,6 +275,7 @@ pub(crate) fn inspect_open(
         kernel: kernel.to_vec(),
         bootstrap: bootstrap.to_vec(),
         bootfs: bootfs.to_vec(),
+        boot_device_table: None,
     };
     inspect_loaded(image, &inputs)
 }
@@ -242,16 +284,16 @@ fn build_loaded(
     output: &mut File,
     geometry: Geometry,
     used_clusters: u32,
-    layouts: [FileLayout<'_>; 4],
+    layouts: &[FileLayout<'_>],
 ) -> Result<(), Failure> {
     output
         .set_len(IMAGE_BYTES)
         .map_err(|error| Failure::task(format!("could not size G3 ESP: {error}")))?;
     write_boot_regions(output, &geometry, used_clusters)?;
-    write_fats(output, &geometry, &layouts)?;
-    write_directories(output, &geometry, &layouts)?;
+    write_fats(output, &geometry, layouts)?;
+    write_directories(output, &geometry, layouts)?;
     for layout in layouts {
-        write_file(output, &geometry, layout)?;
+        write_file(output, &geometry, *layout)?;
     }
     output
         .sync_all()
@@ -312,6 +354,30 @@ fn inspect_loaded(image: &mut File, inputs: &Inputs) -> Result<Inspection, Failu
             ));
         }
     }
+    match &inputs.boot_device_table {
+        Some(expected) => {
+            if extract_file(
+                image,
+                &geometry,
+                &wyrmroot_directory,
+                BOOT_DEVICE_TABLE_SHORT,
+            )? != *expected
+            {
+                return Err(Failure::task(
+                    "G3 ESP boot-device table bytes do not match the supplied input",
+                ));
+            }
+        }
+        None if wyrmroot_directory
+            .chunks_exact(32)
+            .any(|entry| entry[..11] == BOOT_DEVICE_TABLE_SHORT) =>
+        {
+            return Err(Failure::task(
+                "historical G3 ESP unexpectedly contains a boot-device table",
+            ));
+        }
+        None => {}
+    }
     let image_sha256 = crate::secure_fs::hash_open_file_exact(image, IMAGE_BYTES, "G3 ESP")?;
     let after = image
         .metadata()
@@ -328,9 +394,9 @@ fn inspect_loaded(image: &mut File, inputs: &Inputs) -> Result<Inspection, Failu
     })
 }
 
-fn layouts(inputs: &Inputs) -> Result<[FileLayout<'_>; 4], Failure> {
+fn layouts(inputs: &Inputs) -> Result<Vec<FileLayout<'_>>, Failure> {
     let mut next = FIRST_FILE_CLUSTER;
-    Ok([
+    let mut layouts = vec![
         allocate_layout(&mut next, LOADER_SHORT, None, &inputs.loader)?,
         allocate_layout(&mut next, KERNEL_SHORT, None, &inputs.kernel)?,
         allocate_layout(
@@ -340,7 +406,16 @@ fn layouts(inputs: &Inputs) -> Result<[FileLayout<'_>; 4], Failure> {
             &inputs.bootstrap,
         )?,
         allocate_layout(&mut next, BOOTFS_SHORT, None, &inputs.bootfs)?,
-    ])
+    ];
+    if let Some(boot_device_table) = &inputs.boot_device_table {
+        layouts.push(allocate_layout(
+            &mut next,
+            BOOT_DEVICE_TABLE_SHORT,
+            None,
+            boot_device_table,
+        )?);
+    }
+    Ok(layouts)
 }
 
 fn allocate_layout<'a>(
@@ -411,6 +486,7 @@ fn validate_output_path(
     arguments: &G3ImageArguments,
     output: &Path,
     output_root: Option<&Path>,
+    boot_device_table: Option<&str>,
 ) -> Result<(), Failure> {
     if fs::symlink_metadata(output).is_ok() {
         return Err(Failure::task("G3 ESP output already exists"));
@@ -442,6 +518,13 @@ fn validate_output_path(
         &arguments.bootstrap,
         &arguments.bootfs,
     ] {
+        let input = fs::canonicalize(input)
+            .map_err(|error| Failure::task(format!("could not resolve G3 input: {error}")))?;
+        if input == output {
+            return Err(Failure::task("G3 ESP output aliases an input artifact"));
+        }
+    }
+    if let Some(input) = boot_device_table {
         let input = fs::canonicalize(input)
             .map_err(|error| Failure::task(format!("could not resolve G3 input: {error}")))?;
         if input == output {
@@ -509,7 +592,7 @@ fn fs_info(free_clusters: u32, next_free: u32) -> [u8; SECTOR_BYTES_USIZE] {
 fn write_fats(
     image: &mut File,
     geometry: &Geometry,
-    layouts: &[FileLayout<'_>; 4],
+    layouts: &[FileLayout<'_>],
 ) -> Result<(), Failure> {
     let mut fat = vec![0_u8; geometry.fat_sectors as usize * SECTOR_BYTES_USIZE];
     set_fat(&mut fat, 0, 0x0fff_ff00 | u32::from(MEDIA));
@@ -538,7 +621,7 @@ fn write_fats(
 fn write_directories(
     image: &mut File,
     geometry: &Geometry,
-    layouts: &[FileLayout<'_>; 4],
+    layouts: &[FileLayout<'_>],
 ) -> Result<(), Failure> {
     let root = directory_bytes(&[
         short_entry(*b"WYRMG3 ESP ", 0x08, 0, 0),
@@ -560,7 +643,7 @@ fn write_directories(
             layouts[0].bytes.len() as u32,
         ),
     ]);
-    let wyrmroot = directory_bytes(&[
+    let mut wyrmroot_entries = vec![
         dot_entry(*b".          ", WYRMROOT_CLUSTER),
         dot_entry(*b"..         ", EFI_CLUSTER),
         short_entry(
@@ -585,7 +668,16 @@ fn write_directories(
             layouts[3].first_cluster,
             layouts[3].bytes.len() as u32,
         ),
-    ]);
+    ];
+    if let Some(table) = layouts.get(4) {
+        wyrmroot_entries.push(short_entry(
+            table.short_name,
+            0x20,
+            table.first_cluster,
+            table.bytes.len() as u32,
+        ));
+    }
+    let wyrmroot = directory_bytes(&wyrmroot_entries);
     for (cluster, bytes) in [
         (ROOT_CLUSTER, root),
         (EFI_CLUSTER, efi),
@@ -854,6 +946,28 @@ mod tests {
         assert_eq!(inspect(&arguments).unwrap(), report);
         let error = build(&arguments).expect_err("existing image was overwritten");
         assert!(error.message.contains("already exists"));
+        fs::remove_dir_all(root).expect("remove G3 image fixture");
+    }
+
+    #[test]
+    fn d6_image_places_and_inspects_the_separate_boot_device_table() {
+        let (root, arguments) = fixture();
+        let table = root.join("boot-device-table.bin");
+        fs::write(&table, b"exact immutable table bytes").expect("write table fixture");
+        let report = build_d6(&arguments, &table.display().to_string()).expect("build D6 image");
+        assert!(report.contains("\"phase\":\"WYR0-G3\""));
+        let inputs = Inputs::load_with_boot_device_table(&arguments, &table.display().to_string())
+            .expect("reload D6 inputs");
+        let mut image = OpenOptions::new()
+            .read(true)
+            .open(&arguments.image)
+            .expect("open D6 image");
+        assert_eq!(
+            inspect_loaded(&mut image, &inputs)
+                .expect("inspect D6 image")
+                .render(),
+            report
+        );
         fs::remove_dir_all(root).expect("remove G3 image fixture");
     }
 

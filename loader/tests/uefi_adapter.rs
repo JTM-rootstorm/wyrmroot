@@ -425,3 +425,91 @@ fn retained_records_and_transition_mappings_share_exact_addresses() {
         retained_addresses,
     );
 }
+
+#[test]
+fn retained_d6_table_is_the_fourth_exact_module_mapping() {
+    use wyrmroot_efi_loader::{
+        boot_info::{AllocationLifetime as BootLifetime, HandoffAllocation},
+        modules::{ModuleInput, plan_modules_with_boot_device_table},
+        transition::{
+            AllocationLifetime, MappingKind, MappingPermissions, RetainedPhysicalRange,
+            TransitionMapping,
+        },
+    };
+
+    let retained = |physical_start, byte_len| RetainedPhysicalRange {
+        physical_start,
+        byte_len,
+        lifetime: AllocationLifetime::RetainedUntilKernelPageTableReplacement,
+    };
+    let boot_storage = |physical_start, byte_len| HandoffAllocation {
+        physical_start,
+        byte_len,
+        lifetime: BootLifetime::RetainedUntilDeepwyrmPageTableReplacement,
+    };
+    let mapping = |kind, physical_start, byte_len| TransitionMapping {
+        kind,
+        physical_start,
+        virtual_start: physical_start,
+        byte_len,
+        permissions: MappingPermissions {
+            writable: false,
+            executable: false,
+        },
+        lifetime: AllocationLifetime::RetainedUntilKernelPageTableReplacement,
+    };
+    let module_records = plan_modules_with_boot_device_table(
+        ModuleInput {
+            kind: deepwyrm_abi::DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP,
+            physical_start: 0x4000,
+            byte_len: 7,
+        },
+        ModuleInput {
+            kind: deepwyrm_abi::DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS,
+            physical_start: 0x5000,
+            byte_len: 9,
+        },
+        ModuleInput {
+            kind: deepwyrm_abi::DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1,
+            physical_start: 0x8000,
+            byte_len: 144,
+        },
+        ModuleInput {
+            kind: deepwyrm_abi::DW_BOOT_MODULE_KIND_DEEPWYRM_BOOT_DEVICE_TABLE_V1,
+            physical_start: 0x9000,
+            byte_len: 80,
+        },
+    )
+    .unwrap();
+    let module_allocations = [
+        retained(0x4000, 0x1000),
+        retained(0x5000, 0x1000),
+        retained(0x8000, 0x1000),
+        retained(0x9000, 0x1000),
+    ];
+    let mut mappings = [
+        mapping(MappingKind::BootInfo, 0x1000, 0x1000),
+        mapping(MappingKind::MemoryMapTable, 0x2000, 0x1000),
+        mapping(MappingKind::ModuleTable, 0x3000, 0x1000),
+        mapping(MappingKind::ModuleData { index: 0 }, 0x4000, 0x1000),
+        mapping(MappingKind::ModuleData { index: 1 }, 0x5000, 0x1000),
+        mapping(MappingKind::ModuleData { index: 2 }, 0x8000, 0x1000),
+        mapping(MappingKind::ModuleData { index: 3 }, 0x9000, 0x1000),
+    ];
+    let facts = || RetainedAddressFacts {
+        boot_info: boot_storage(0x1000, 0x1000),
+        memory_map: boot_storage(0x2000, 0x1000),
+        module_table: boot_storage(0x3000, 0x1000),
+        module_records: module_records.as_ref(),
+        module_allocations: &module_allocations,
+        entropy: None,
+        rsdp: None,
+    };
+
+    assert!(validate_retained_address_coherence(&mappings, facts()).is_ok());
+    mappings[6].physical_start += 0x1000;
+    assert_eq!(
+        validate_retained_address_coherence(&mappings, facts()),
+        Err(RetainedAddressError::StorageMappingMismatch)
+    );
+}

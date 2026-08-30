@@ -10,6 +10,9 @@ pub const ARTIFACT_ROOT: &str = "/EFI/Wyrmroot";
 pub const KERNEL_PATH: &str = "/EFI/Wyrmroot/deepwyrm.elf";
 pub const BOOTSTRAP_PATH: &str = "/EFI/Wyrmroot/bootstrap.elf";
 pub const BOOTFS_PATH: &str = "/EFI/Wyrmroot/bootfs.img";
+/// Optional selector-specific immutable boot-device table. Historical products
+/// omit this file and therefore retain their three-module handoff.
+pub const BOOT_DEVICE_TABLE_PATH: &str = "/EFI/Wyrmroot/BDEVICE.BIN";
 
 /// Host-testable artifact inputs. Firmware loading is intentionally outside this boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

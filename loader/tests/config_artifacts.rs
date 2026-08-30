@@ -3,7 +3,9 @@ mod artifacts;
 #[path = "../src/config.rs"]
 mod config;
 
-use artifacts::{ArtifactError, ArtifactInputs, BOOTFS_PATH, BOOTSTRAP_PATH, KERNEL_PATH};
+use artifacts::{
+    ArtifactError, ArtifactInputs, BOOT_DEVICE_TABLE_PATH, BOOTFS_PATH, BOOTSTRAP_PATH, KERNEL_PATH,
+};
 use config::{ConfigError, LoaderConfig, MAX_CONFIG_BYTES, Profile};
 
 #[test]
@@ -11,6 +13,7 @@ fn canonical_paths_are_fixed_and_ordered() {
     assert_eq!(KERNEL_PATH, "/EFI/Wyrmroot/deepwyrm.elf");
     assert_eq!(BOOTSTRAP_PATH, "/EFI/Wyrmroot/bootstrap.elf");
     assert_eq!(BOOTFS_PATH, "/EFI/Wyrmroot/bootfs.img");
+    assert_eq!(BOOT_DEVICE_TABLE_PATH, "/EFI/Wyrmroot/BDEVICE.BIN");
 }
 
 #[test]

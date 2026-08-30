@@ -40,6 +40,7 @@ Usage:
     cargo xtask dw1c image --request <dw1-c-request.toml>
     cargo xtask dw1c image-rebuild --request <dw1-c-request.toml>
     cargo xtask dw1c inspect --request <dw1-c-request.toml>
+    tools/pinned-cargo xtask dw1d6 freeze --output <fresh-directory> --deep-repository <path> --deep-revision <40-hex> --evidence-nonce <16-hex> --evidence-challenge <16-hex>
 
 Host filters may name a component (bootfs, protocol, elf, runtime, bootstrap,
 efi, init0, hello, xtask, dw1c-init0, or dw1d6), package:<workspace-package>,
@@ -163,6 +164,13 @@ pub(crate) enum Action {
     Dw1CImage(String),
     Dw1CImageRebuild(String),
     Dw1CInspect(String),
+    Dw1D6Freeze {
+        output: String,
+        deep_repository: String,
+        deep_revision: String,
+        evidence_nonce: String,
+        evidence_challenge: String,
+    },
     Unavailable(&'static str),
 }
 
@@ -214,9 +222,45 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
         "wyr1c2" => dispatch_wyr1c2(&arguments[1..]),
         "dw1b" => dispatch_dw1b(&arguments[1..]),
         "dw1c" => dispatch_dw1c(&arguments[1..]),
+        "dw1d6" => dispatch_dw1d6(&arguments[1..]),
         unknown => Err(Failure::usage(format!(
             "unknown command '{unknown}'\n\n{USAGE}"
         ))),
+    }
+}
+
+fn dispatch_dw1d6(arguments: &[String]) -> Result<Action, Failure> {
+    match arguments {
+        [
+            command,
+            output_flag,
+            output,
+            deep_flag,
+            deep_repository,
+            revision_flag,
+            deep_revision,
+            nonce_flag,
+            evidence_nonce,
+            challenge_flag,
+            evidence_challenge,
+        ] if command == "freeze"
+            && output_flag == "--output"
+            && deep_flag == "--deep-repository"
+            && revision_flag == "--deep-revision"
+            && nonce_flag == "--evidence-nonce"
+            && challenge_flag == "--evidence-challenge" =>
+        {
+            Ok(Action::Dw1D6Freeze {
+                output: output.clone(),
+                deep_repository: deep_repository.clone(),
+                deep_revision: deep_revision.clone(),
+                evidence_nonce: evidence_nonce.clone(),
+                evidence_challenge: evidence_challenge.clone(),
+            })
+        }
+        _ => Err(Failure::usage(
+            "dw1d6 requires freeze --output <fresh-directory> --deep-repository <path> --deep-revision <40-hex> --evidence-nonce <16-hex> --evidence-challenge <16-hex>",
+        )),
     }
 }
 
@@ -812,6 +856,34 @@ mod tests {
             ])),
             Ok(Action::Dw1CInspect("request.toml".into()))
         );
+    }
+
+    #[test]
+    fn dw1d6_freeze_requires_the_explicit_candidate_and_evidence_pair() {
+        assert_eq!(
+            dispatch(&arguments(&[
+                "dw1d6",
+                "freeze",
+                "--output",
+                "freeze",
+                "--deep-repository",
+                "/home/mike/Documents/Programming/OS-Project/deepwyrm",
+                "--deep-revision",
+                &"a".repeat(40),
+                "--evidence-nonce",
+                &"A".repeat(16),
+                "--evidence-challenge",
+                &"B".repeat(16),
+            ])),
+            Ok(Action::Dw1D6Freeze {
+                output: "freeze".into(),
+                deep_repository: "/home/mike/Documents/Programming/OS-Project/deepwyrm".into(),
+                deep_revision: "a".repeat(40),
+                evidence_nonce: "A".repeat(16),
+                evidence_challenge: "B".repeat(16),
+            })
+        );
+        assert!(USAGE.contains("tools/pinned-cargo xtask dw1d6 freeze --output"));
     }
 
     #[test]

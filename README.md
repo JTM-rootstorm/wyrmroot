@@ -49,6 +49,20 @@ Wyrmroot consumes generated Deepwyrm ABI definitions from an exact pinned Deepwy
 
 Architecture documents define design contracts. Validation and security evidence applies only to the revisions and artifacts each record names; it does not imply production, VM, or physical-hardware acceptance.
 
+## DW1-D6 product handoff
+
+The selector-30 producer is preparation-only and creates a fresh immutable
+product plus root-verifier-compatible `smoke` (one vCPU) and `coexist` (four
+vCPU) handoffs. It does not run QEMU or libvirt:
+
+```text
+tools/pinned-cargo xtask dw1d6 freeze --output <fresh-directory> --deep-repository <canonical-deepwyrm-path> --deep-revision <40-lowercase-hex> --evidence-nonce <16-uppercase-hex> --evidence-challenge <16-uppercase-hex>
+```
+
+The producer requires the selected Wyrmroot revision to include the D6 EFI
+boot-device-table module handoff. It makes no claim about physical IRQ3/IOAPIC
+routing, UART RX/TX, selector-29, MMIO/DMA/IOMMU, or VM acceptance.
+
 ## License
 
 Wyrmroot currently uses a component-aware mix: the repository fallback and several existing foundations are [GPL-2.0-or-later](LICENSE), while selected applications and tools are `GPL-3.0-or-later`. New wholly first-party project code defaults to GPL-3.0-or-later; GPLv2-compatible lanes are selected when actual provenance or combination requirements call for them. See [LICENSING.md](LICENSING.md) for the authoritative current map and provenance rules.

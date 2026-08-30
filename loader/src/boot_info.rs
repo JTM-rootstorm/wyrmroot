@@ -20,6 +20,7 @@ use deepwyrm_abi::{
     DW_BOOT_MEMORY_KIND_RESERVED, DW_BOOT_MEMORY_KIND_RUNTIME_SERVICES,
     DW_BOOT_MEMORY_KIND_UNUSABLE, DW_BOOT_MEMORY_KIND_USABLE, DW_BOOT_MEMORY_RANGE_V1_SIZE,
     DW_BOOT_MEMORY_RANGE_V1_VERSION, DW_BOOT_MODULE_FLAG_READ_ONLY,
+    DW_BOOT_MODULE_KIND_DEEPWYRM_BOOT_DEVICE_TABLE_V1,
     DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1, DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS,
     DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP, DW_BOOT_MODULE_V1_SIZE, DW_BOOT_MODULE_V1_VERSION,
     DW_BOOT_PIXEL_FORMAT_BGRX8, DW_BOOT_PIXEL_FORMAT_BITMASK, DW_BOOT_PIXEL_FORMAT_RGBX8,
@@ -188,6 +189,7 @@ pub enum BootInfoError {
     MissingBootstrapModule,
     MissingBootfsModule,
     MissingPagingHandoffModule,
+    InvalidModuleOrder,
     DuplicateModule,
     ModuleMustBeReadOnly,
     UnsupportedModuleFlags,
@@ -659,6 +661,7 @@ fn validate_modules(modules: &[DwBootModuleV1]) -> Result<(), BootInfoError> {
     let mut bootstrap_seen = false;
     let mut bootfs_seen = false;
     let mut paging_handoff_seen = false;
+    let mut boot_device_table_seen = false;
     for (index, module) in modules.iter().enumerate() {
         if module.size != DW_BOOT_MODULE_V1_SIZE || module.version != DW_BOOT_MODULE_V1_VERSION {
             return Err(BootInfoError::InvalidHeader);
@@ -701,6 +704,14 @@ fn validate_modules(modules: &[DwBootModuleV1]) -> Result<(), BootInfoError> {
                 return Err(BootInfoError::InvalidHeader);
             }
             paging_handoff_seen = true;
+        } else if module.kind == DW_BOOT_MODULE_KIND_DEEPWYRM_BOOT_DEVICE_TABLE_V1 {
+            if boot_device_table_seen {
+                return Err(BootInfoError::DuplicateModule);
+            }
+            if module.flags != DW_BOOT_MODULE_FLAG_READ_ONLY {
+                return Err(BootInfoError::ModuleMustBeReadOnly);
+            }
+            boot_device_table_seen = true;
         } else {
             return Err(BootInfoError::InvalidHeader);
         }
@@ -723,6 +734,30 @@ fn validate_modules(modules: &[DwBootModuleV1]) -> Result<(), BootInfoError> {
     }
     if !paging_handoff_seen {
         return Err(BootInfoError::MissingPagingHandoffModule);
+    }
+    let expected_kinds = if boot_device_table_seen {
+        [
+            DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP,
+            DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS,
+            DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1,
+            DW_BOOT_MODULE_KIND_DEEPWYRM_BOOT_DEVICE_TABLE_V1,
+        ]
+        .as_slice()
+    } else {
+        [
+            DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP,
+            DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS,
+            DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1,
+        ]
+        .as_slice()
+    };
+    if modules.len() != expected_kinds.len()
+        || modules
+            .iter()
+            .zip(expected_kinds)
+            .any(|(module, kind)| module.kind != *kind)
+    {
+        return Err(BootInfoError::InvalidModuleOrder);
     }
     Ok(())
 }

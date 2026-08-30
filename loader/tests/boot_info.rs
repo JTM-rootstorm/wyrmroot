@@ -14,11 +14,12 @@ use deepwyrm_abi::{
     DW_BOOT_ENTROPY_SOURCE_UEFI_RNG_PROTOCOL, DW_BOOT_INFO_FLAG_FRAMEBUFFER_PRESENT,
     DW_BOOT_MEMORY_KIND_MMIO, DW_BOOT_MEMORY_KIND_RESERVED, DW_BOOT_MEMORY_KIND_USABLE,
     DW_BOOT_MEMORY_RANGE_V1_SIZE, DW_BOOT_MEMORY_RANGE_V1_VERSION,
+    DW_BOOT_MODULE_KIND_DEEPWYRM_BOOT_DEVICE_TABLE_V1,
     DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1, DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS,
     DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP, DwBootInfoV1, DwBootMemoryKind, DwBootMemoryRangeV1,
     DwBootModuleV1,
 };
-use modules::{ModuleInput, plan_modules};
+use modules::{ModuleInput, plan_modules, plan_modules_with_boot_device_table};
 
 fn retained(physical_start: u64, byte_len: u64) -> HandoffAllocation {
     HandoffAllocation {
@@ -73,6 +74,32 @@ fn canonical_modules() -> [DwBootModuleV1; 3] {
     )
     .unwrap()
     .to_abi_modules()
+}
+
+fn d6_modules() -> [DwBootModuleV1; 4] {
+    plan_modules_with_boot_device_table(
+        ModuleInput {
+            kind: DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP,
+            physical_start: 0x4000,
+            byte_len: 0x1000,
+        },
+        ModuleInput {
+            kind: DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS,
+            physical_start: 0x5000,
+            byte_len: 0x1000,
+        },
+        ModuleInput {
+            kind: DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1,
+            physical_start: 0xa000,
+            byte_len: 144,
+        },
+        ModuleInput {
+            kind: DW_BOOT_MODULE_KIND_DEEPWYRM_BOOT_DEVICE_TABLE_V1,
+            physical_start: 0xb000,
+            byte_len: 80,
+        },
+    )
+    .unwrap()
 }
 
 fn input<'a>(
@@ -160,6 +187,39 @@ fn builds_canonical_boot_info_and_copies_the_retained_module_table() {
     assert_eq!(copied_modules, modules);
     validate_boot_info(&info).unwrap();
     validate_tables(&info, &memory_map, &copied_modules).unwrap();
+}
+
+#[test]
+fn d6_builds_exact_four_module_table_and_rejects_reordered_or_writable_table() {
+    let memory_map = memory_map();
+    let modules = d6_modules();
+    let mut info = DwBootInfoV1::default();
+    let mut copied_modules = [DwBootModuleV1::default(); 4];
+    build(
+        &input(&memory_map, &modules),
+        &mut output(&mut info, &mut copied_modules),
+    )
+    .unwrap();
+    assert_eq!(info.module_count, 4);
+    assert_eq!(
+        copied_modules[3].kind,
+        DW_BOOT_MODULE_KIND_DEEPWYRM_BOOT_DEVICE_TABLE_V1
+    );
+    validate_tables(&info, &memory_map, &copied_modules).unwrap();
+
+    let mut reordered = modules;
+    reordered.swap(2, 3);
+    assert_eq!(
+        validate_tables(&info, &memory_map, &reordered),
+        Err(BootInfoError::InvalidModuleOrder)
+    );
+
+    let mut writable = modules;
+    writable[3].flags = deepwyrm_abi::DwBootModuleFlags(0);
+    assert_eq!(
+        validate_tables(&info, &memory_map, &writable),
+        Err(BootInfoError::ModuleMustBeReadOnly)
+    );
 }
 
 #[test]

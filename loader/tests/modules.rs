@@ -2,12 +2,14 @@
 mod modules;
 
 use deepwyrm_abi::{
-    DW_BOOT_MODULE_FLAG_READ_ONLY, DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1,
-    DW_BOOT_MODULE_KIND_UNSPECIFIED, DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS,
-    DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP, DW_BOOT_MODULE_V1_SIZE, DW_BOOT_MODULE_V1_VERSION,
-    DwBootModuleFlags, DwBootModuleKind,
+    DW_BOOT_MODULE_FLAG_READ_ONLY, DW_BOOT_MODULE_KIND_DEEPWYRM_BOOT_DEVICE_TABLE_V1,
+    DW_BOOT_MODULE_KIND_DEEPWYRM_X86_64_PAGING_HANDOFF_V1, DW_BOOT_MODULE_KIND_UNSPECIFIED,
+    DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS, DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP,
+    DW_BOOT_MODULE_V1_SIZE, DW_BOOT_MODULE_V1_VERSION, DwBootModuleFlags, DwBootModuleKind,
 };
-use modules::{ModuleInput, ModulePlanError, PAGE_SIZE, plan_modules};
+use modules::{
+    ModuleInput, ModulePlanError, PAGE_SIZE, plan_modules, plan_modules_with_boot_device_table,
+};
 
 fn input(kind: DwBootModuleKind, start: u64, len: u64) -> ModuleInput {
     ModuleInput {
@@ -214,4 +216,38 @@ fn paging_handoff_extent_is_exactly_header_plus_bounded_u64_frames() {
         .unwrap();
         assert_eq!(plan.paging_handoff().byte_len, byte_len);
     }
+}
+
+#[test]
+fn d6_appends_one_read_only_table_after_the_historical_three_modules() {
+    let modules = plan_modules_with_boot_device_table(
+        input(DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP, PAGE_SIZE, 1),
+        input(DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS, PAGE_SIZE * 2, 1),
+        paging_handoff(PAGE_SIZE * 3, 144),
+        input(
+            DW_BOOT_MODULE_KIND_DEEPWYRM_BOOT_DEVICE_TABLE_V1,
+            PAGE_SIZE * 4,
+            80,
+        ),
+    )
+    .unwrap();
+    assert_eq!(modules.len(), 4);
+    assert_eq!(
+        modules[3].kind,
+        DW_BOOT_MODULE_KIND_DEEPWYRM_BOOT_DEVICE_TABLE_V1
+    );
+    assert_eq!(modules[3].flags, DW_BOOT_MODULE_FLAG_READ_ONLY);
+
+    let err = plan_modules_with_boot_device_table(
+        input(DW_BOOT_MODULE_KIND_WYRMROOT_BOOTSTRAP, PAGE_SIZE, 1),
+        input(DW_BOOT_MODULE_KIND_WYRMROOT_BOOTFS, PAGE_SIZE * 2, 1),
+        paging_handoff(PAGE_SIZE * 3, 144),
+        input(
+            DW_BOOT_MODULE_KIND_DEEPWYRM_BOOT_DEVICE_TABLE_V1,
+            PAGE_SIZE * 3,
+            80,
+        ),
+    )
+    .unwrap_err();
+    assert_eq!(err, ModulePlanError::OverlappingAllocations);
 }
