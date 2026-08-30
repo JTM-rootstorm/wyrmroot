@@ -1045,6 +1045,44 @@ fn validate_handoff(
     let text = String::from_utf8(read_regular_bounded(path, 64 * 1024, "VM handoff")?)
         .map_err(|_| Failure::task("WYR1-C6 VM handoff is not UTF-8"))?;
     let values = parse(&text)?;
+    let mut expected = BTreeSet::from(
+        [
+            "kind",
+            "schema_version",
+            "profile",
+            "selector",
+            "test_id",
+            "evidence_protocol",
+            "request",
+            "request_sha256",
+            "esp",
+            "esp_sha256",
+            "vcpus",
+            "scenario",
+            "physical_io",
+            "terminal_authority",
+            "memory_mib",
+            "machine",
+            "timeout_seconds",
+            "esp_fd_group",
+            "vars_fd_group",
+            "domain_xml",
+            "domain_xml_sha256",
+            "ovmf_vars",
+            "ovmf_vars_sha256",
+            "serial_log",
+            "stderr_log",
+            "run_receipt",
+        ]
+        .map(str::to_owned),
+    );
+    for (name, _, _) in ARTIFACTS {
+        expected.insert(format!("{name}_path"));
+        expected.insert(format!("{name}_sha256"));
+    }
+    if values.keys().cloned().collect::<BTreeSet<_>>() != expected {
+        return Err(Failure::task("WYR1-C6 VM handoff key set drifted"));
+    }
     for (key, expected) in [
         ("kind", HANDOFF_KIND),
         ("schema_version", "1"),
