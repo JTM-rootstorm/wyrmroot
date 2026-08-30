@@ -526,7 +526,7 @@ fn parse_evidence(bytes: &[u8], nonce: &str) -> Result<ParsedEvidence, Failure> 
             if field.len() != length
                 || !field
                     .bytes()
-                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'A'..=b'F'))
             {
                 return Err(Failure::task("WRC6E1 hexadecimal field is invalid"));
             }
@@ -1398,6 +1398,11 @@ mod tests {
         }
         assert_eq!(stream.len(), 27 * 113);
         assert_eq!(parse_evidence(&stream, nonce).unwrap().records, 27);
+        let mut invalid_hex = stream.clone();
+        invalid_hex[37] = b'G';
+        let checksum = format!("{:08X}", fnv1a(&invalid_hex[..105]));
+        invalid_hex[105..113].copy_from_slice(checksum.as_bytes());
+        assert!(parse_evidence(&invalid_hex, nonce).is_err());
         stream[4 * 113 + 32] = b'F';
         assert!(parse_evidence(&stream, nonce).is_err());
     }
