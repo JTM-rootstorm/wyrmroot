@@ -71,6 +71,11 @@ pub const DEVICE_MANIFEST_RIGHTS: DwRights =
 /// may receive. It is not loader construction authority.
 pub const RESOURCE_DOMAIN_CLAIM_RIGHTS: DwRights =
     DwRights(DW_RIGHT_RESOURCE.0 | DW_RIGHT_INSPECT.0);
+/// Sender-side staging authority for one atomic MOVE. The child request still
+/// reduces this handle to [`RESOURCE_DOMAIN_CLAIM_RIGHTS`], so `TRANSFER`
+/// cannot survive the launch boundary.
+pub const RESOURCE_DOMAIN_CLAIM_TRANSFER_RIGHTS: DwRights =
+    DwRights(RESOURCE_DOMAIN_CLAIM_RIGHTS.0 | DW_RIGHT_TRANSFER.0);
 /// Broad custodian rights minted only by the primordial resource-domain path.
 pub const RESOURCE_DOMAIN_CUSTODY_RIGHTS: DwRights = DwRights(
     DW_RIGHT_MODIFY.0

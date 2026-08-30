@@ -127,7 +127,9 @@ For each devmgr generation, init:
 1. creates a fresh generation TaskGroup beneath the resource domain;
 2. constructs devmgr in that generation group;
 3. duplicates the exact resource-domain handle with only
-   `RESOURCE | INSPECT` (`0x500`);
+   sender-side `RESOURCE | INSPECT | TRANSFER` (`0x580`), then requests
+   `RESOURCE | INSPECT` (`0x500`) on the atomic MOVE so `TRANSFER` cannot
+   cross into the child;
 4. MOVEs that reduced handle through a new explicit DeviceCoordinator startup
    profile/minor; and
 5. retains only the broad domain custodian and generation construction/reap

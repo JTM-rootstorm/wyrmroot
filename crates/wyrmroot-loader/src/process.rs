@@ -1223,7 +1223,8 @@ fn load_process_materialized<P: LoaderPlatform>(
         let domain = request
             .resource_domain
             .ok_or(LoadError::Launch(LaunchError::HandleCount))?;
-        let domain = match platform.duplicate(domain, launch::RESOURCE_DOMAIN_CLAIM_RIGHTS) {
+        let domain = match platform.duplicate(domain, launch::RESOURCE_DOMAIN_CLAIM_TRANSFER_RIGHTS)
+        {
             Ok(handle) => handle,
             Err(cause) => {
                 return Err(fail(

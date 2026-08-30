@@ -1,16 +1,18 @@
 use deepwyrm_syscall::{
-    DW_HANDLE_TRANSFER_MOVE, DwHandle, DwHandleTransferV1, DwMemoryProtection, DwRights,
+    DW_HANDLE_TRANSFER_MOVE, DW_RIGHT_TRANSFER, DwHandle, DwHandleTransferV1, DwMemoryProtection,
+    DwRights,
 };
 use wyrmroot_loader::{
     elf::{STACK_BOTTOM, STACK_BYTES},
-    launch::LaunchProfile,
+    launch::{LaunchProfile, RESOURCE_DOMAIN_CLAIM_RIGHTS, RESOURCE_DOMAIN_CLAIM_TRANSFER_RIGHTS},
     process::{
-        DeviceCoordinatorLoadError, DeviceCoordinatorLoadRequest, DeviceDriverLoadError,
-        DeviceDriverLoadRequest, JobLoadError, JobLoadRequest, LoadAuthority, LoadError, LoadFault,
-        LoadRequest, LoadStage, LoaderPlatform, ParentMapping, ProcessCreateRequest,
-        ProcessCreateResult, ResourceDomainLoadRequest, ServiceLoadError, ServiceLoadRequest,
-        load_device_coordinator_process, load_device_driver_process, load_job_process,
-        load_process, load_process_with_fault, load_resource_domain_process, load_service_process,
+        D6ResourceOwnerLoadRequest, DeviceCoordinatorLoadError, DeviceCoordinatorLoadRequest,
+        DeviceDriverLoadError, DeviceDriverLoadRequest, JobLoadError, JobLoadRequest,
+        LoadAuthority, LoadError, LoadFault, LoadRequest, LoadStage, LoaderPlatform, ParentMapping,
+        ProcessCreateRequest, ProcessCreateResult, ResourceDomainLoadRequest, ServiceLoadError,
+        ServiceLoadRequest, load_d6_resource_owner_process, load_device_coordinator_process,
+        load_device_driver_process, load_job_process, load_process, load_process_with_fault,
+        load_resource_domain_process, load_service_process,
     },
 };
 use wyrmroot_registry_proto::{Correlation, CorrelationEnvironment};
@@ -54,6 +56,7 @@ struct Mock {
     direct_materializations: usize,
     sent_init: Vec<u8>,
     sent_transfers: Vec<DwHandleTransferV1>,
+    duplicates: Vec<(DwHandle, DwRights, DwHandle)>,
 }
 
 impl Mock {
@@ -79,6 +82,7 @@ impl Mock {
             direct_materializations: 0,
             sent_init: Vec::new(),
             sent_transfers: Vec::new(),
+            duplicates: Vec::new(),
         }
     }
     fn handle(&mut self) -> DwHandle {
@@ -103,14 +107,16 @@ impl LoaderPlatform for Mock {
         self.check("channel")?;
         Ok((self.handle(), self.handle()))
     }
-    fn duplicate(&mut self, handle: DwHandle, _: DwRights) -> Result<DwHandle, Self::Error> {
+    fn duplicate(&mut self, handle: DwHandle, rights: DwRights) -> Result<DwHandle, Self::Error> {
         self.events.push(Event::Duplicate(handle.0));
         self.duplicate_calls += 1;
         if self.fail_duplicate_at == Some(self.duplicate_calls) {
             return Err("duplicate");
         }
         self.check("duplicate")?;
-        Ok(self.handle())
+        let duplicate = self.handle();
+        self.duplicates.push((handle, rights, duplicate));
+        Ok(duplicate)
     }
     fn close(&mut self, handle: DwHandle) -> Result<(), Self::Error> {
         self.events.push(Event::Close(handle.0));
@@ -452,6 +458,39 @@ fn resource_domain_process_moves_the_exact_four_capabilities() {
             .events
             .contains(&Event::Duplicate(resource_domain.0))
     );
+}
+
+#[test]
+fn d6_owner_move_uses_transfer_only_on_the_sender_side_staging_handle() {
+    let mut platform = Mock::new(None);
+    let image = executable();
+    let resource_domain = DwHandle(0xd600);
+    load_d6_resource_owner_process(
+        &mut platform,
+        authority(),
+        D6ResourceOwnerLoadRequest {
+            image: &image,
+            display_path: "/test/dw1-d6/owner",
+            resource_domain,
+            transaction_id: 0xd601,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(platform.sent_transfers.len(), 1);
+    let transfer = platform.sent_transfers[0];
+    let (_, staging_rights, staging_handle) = platform
+        .duplicates
+        .iter()
+        .copied()
+        .find(|(source, _, _)| *source == resource_domain)
+        .expect("resource-domain staging duplicate");
+    assert_eq!(staging_rights, RESOURCE_DOMAIN_CLAIM_TRANSFER_RIGHTS);
+    assert_ne!(staging_rights.0 & DW_RIGHT_TRANSFER.0, 0);
+    assert_eq!(transfer.handle, staging_handle);
+    assert_eq!(transfer.operation, DW_HANDLE_TRANSFER_MOVE);
+    assert_eq!(transfer.requested_rights, RESOURCE_DOMAIN_CLAIM_RIGHTS);
+    assert_eq!(transfer.requested_rights.0 & DW_RIGHT_TRANSFER.0, 0);
 }
 
 #[test]
