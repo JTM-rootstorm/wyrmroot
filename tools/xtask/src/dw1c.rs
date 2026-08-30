@@ -35,8 +35,8 @@ const TEST_ID: &str = "28";
 // Wyrmroot's accepted toolchain/layout is tied to this generated ABI revision.
 // The product kernel is intentionally built from the explicit Deep candidate;
 // DW1-B uses the same two-revision split.
-const GENERATED_ABI_REVISION: &str = "cfc69bd8a49819ce1cda1a132cf56e55c93f92e4";
-const DEEPWYRM_ABI_TREE: &str = "1c6a74f130e386eee95b3780c75950beefd0037d";
+const GENERATED_ABI_REVISION: &str = "dc26df4a3d701e2cdf8b495e2c87ce979969a9c4";
+const DEEPWYRM_ABI_TREE: &str = "a9b067107ec38e2be44630f4dce428dab0f48de8";
 const MACHINE: &str = "pc-q35-10.2";
 const DOMAIN_UUID: &str = "33005e22-d7c2-4b13-b1ac-b82eda95e584";
 const ESP_FD_GROUP: &str = "dw-f13-esp-v1";
@@ -1828,6 +1828,14 @@ fn validate_upper_hex(value: &str, expected_length: usize, label: &str) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_abi_lineage_matches_the_current_workspace_dependency() {
+        let manifest = include_str!("../../../Cargo.toml");
+        assert!(manifest.contains(&format!("rev = \"{GENERATED_ABI_REVISION}\"")));
+        assert_eq!(DEEPWYRM_ABI_TREE, "a9b067107ec38e2be44630f4dce428dab0f48de8");
+    }
+
     #[test]
     fn domain_is_exact_four_cpu_no_nic_or_share() {
         let p = PathBuf::from("/tmp/a");
