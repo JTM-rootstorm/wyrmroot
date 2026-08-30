@@ -245,6 +245,43 @@ pub fn build_c1(product: ProductC1<'_>) -> Result<Vec<u8>, BuildError> {
     builder.build()
 }
 
+/// Exact WYR1-C6 archive extension.  It deliberately retains the C1 base
+/// entries and adds the selector-bound, read-only C6 gate as a distinct
+/// bootstrap input; C1 and C2 builders therefore remain byte-for-byte
+/// unchanged.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProductC6<'a> {
+    pub base: ProductC1<'a>,
+    pub gate: &'a [u8],
+}
+
+pub const WYR1_C6_GATE_PATH: &str = "system/bootstrap/wyr1-c6-gate-v1";
+
+pub fn build_c6(product: ProductC6<'_>) -> Result<Vec<u8>, BuildError> {
+    validate_c1_product(product.base)?;
+    if product.gate.is_empty() {
+        return Err(BuildError::EmptyArtifact);
+    }
+    let mut builder = Builder::new();
+    for artifact in product.base.artifacts() {
+        builder.add(
+            artifact.path.as_bytes(),
+            artifact.bytes,
+            if artifact.executable {
+                FileMode::Executable
+            } else {
+                FileMode::ReadOnly
+            },
+        )?;
+    }
+    builder.add(
+        WYR1_C6_GATE_PATH.as_bytes(),
+        product.gate,
+        FileMode::ReadOnly,
+    )?;
+    builder.build()
+}
+
 fn validate_c1_product(product: ProductC1<'_>) -> Result<(), BuildError> {
     if product.marker != WYR1_C1_MARKER {
         return Err(BuildError::WrongC1Marker);
