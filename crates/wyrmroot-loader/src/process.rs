@@ -61,6 +61,16 @@ pub struct ResourceDomainLoadRequest<'a> {
     pub transaction_id: u64,
 }
 
+/// Selector-30-only owner launch. The owner is created inside the supplied
+/// resource domain and receives only its reduced claim authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct D6ResourceOwnerLoadRequest<'a> {
+    pub image: &'a [u8],
+    pub display_path: &'a str,
+    pub resource_domain: DwHandle,
+    pub transaction_id: u64,
+}
+
 /// WYR1-B launch request using startup ABI v2 and the WRLP 1.3 JobV2 profile.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JobLoadRequest<'a> {
@@ -500,6 +510,35 @@ pub fn load_resource_domain_process<P: LoaderPlatform>(
         InternalLoadRequest {
             image: request.image,
             profile: LaunchProfile::SupervisorResourceDomain,
+            transaction_id: request.transaction_id,
+            startup: StartupSpec::Legacy(request.display_path),
+            channels: &[],
+            device_manifest: None,
+            supervisor_generation: None,
+            driver_correlation: None,
+            resource_domain: Some(request.resource_domain),
+        },
+        LoadFault::None,
+        &mut consumed,
+    )
+}
+
+/// Launches the selector-private resource owner in its exact resource domain.
+/// The caller keeps the domain handle; only a `RESOURCE | INSPECT` duplicate
+/// crosses the child startup boundary after a successful MOVE.
+pub fn load_d6_resource_owner_process<P: LoaderPlatform>(
+    platform: &mut P,
+    mut authority: LoadAuthority,
+    request: D6ResourceOwnerLoadRequest<'_>,
+) -> Result<LoadedProcess, LoadError<P::Error>> {
+    authority.task_group = request.resource_domain;
+    let mut consumed = false;
+    load_process_internal(
+        platform,
+        authority,
+        InternalLoadRequest {
+            image: request.image,
+            profile: LaunchProfile::D6ResourceOwner,
             transaction_id: request.transaction_id,
             startup: StartupSpec::Legacy(request.display_path),
             channels: &[],
@@ -1180,6 +1219,24 @@ fn load_process_materialized<P: LoaderPlatform>(
         } else {
             3
         }
+    } else if request.profile == LaunchProfile::D6ResourceOwner {
+        let domain = request
+            .resource_domain
+            .ok_or(LoadError::Launch(LaunchError::HandleCount))?;
+        let domain = match platform.duplicate(domain, launch::RESOURCE_DOMAIN_CLAIM_RIGHTS) {
+            Ok(handle) => handle,
+            Err(cause) => {
+                return Err(fail(
+                    platform,
+                    &mut transaction,
+                    LoadStage::CapabilityDuplicate,
+                    cause,
+                ));
+            }
+        };
+        transaction.delegated_resource_domain = Some(domain);
+        transfers[0] = transfer(domain, launch::RESOURCE_DOMAIN_CLAIM_RIGHTS);
+        1
     } else if request.profile == LaunchProfile::Dw1bProgress {
         transaction.delegated_channels[0] = Some(request.channels[0]);
         transfers[0] = transfer(request.channels[0], launch::CHILD_CHANNEL_RIGHTS);
@@ -1246,6 +1303,8 @@ fn load_process_materialized<P: LoaderPlatform>(
             transaction.delegated_task_group = None;
             transaction.delegated_resource_domain = None;
         }
+    } else if request.profile == LaunchProfile::D6ResourceOwner {
+        transaction.delegated_resource_domain = None;
     } else if let Err(cause) = platform.close(created.root) {
         return Err(fail(
             platform,

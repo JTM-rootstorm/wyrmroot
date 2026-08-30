@@ -51,6 +51,30 @@ const DW1C_INIT0_TEST_ARGUMENTS: &[&str] = &[
     "--lib",
     "dw1c_protocol_tests",
 ];
+const DW1D6_BOOTSTRAP_TEST_ARGUMENTS: &[&str] = &[
+    "test",
+    "--locked",
+    "--package",
+    "wyrmroot-bootstrap",
+    "--features",
+    "dw1d6-synthetic",
+    "--lib",
+];
+const DW1D6_SOURCE_CONTRACT_TEST_ARGUMENTS: &[&str] = &[
+    "test",
+    "--locked",
+    "--package",
+    "wyrmroot-bootstrap",
+    "--test",
+    "source_contract",
+];
+const DW1D6_ACTOR_TEST_ARGUMENTS: &[&str] = &[
+    "test",
+    "--locked",
+    "--package",
+    "wyrmroot-dw1d6-device-test",
+    "--tests",
+];
 
 pub(crate) struct LoaderToolchain {
     accepted: AcceptedToolchain,
@@ -1260,6 +1284,22 @@ fn host_test_commands(filter: Option<&str>) -> Result<Vec<Vec<String>>, Failure>
                 .collect(),
         ]);
     }
+    if matches!(filter, Some("dw1d6" | "dw1d6-synthetic")) {
+        return Ok(vec![
+            DW1D6_BOOTSTRAP_TEST_ARGUMENTS
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect(),
+            DW1D6_SOURCE_CONTRACT_TEST_ARGUMENTS
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect(),
+            DW1D6_ACTOR_TEST_ARGUMENTS
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect(),
+        ]);
+    }
     let mut commands = vec![host_test_arguments(filter)?];
     if filter.is_none() {
         commands.push(
@@ -1356,10 +1396,11 @@ fn child_status(code: Option<i32>) -> String {
 mod tests {
     use super::{
         BOOTFS_BUILD_ARGUMENTS, BOOTFS_PACKAGE, BOOTFS_TEST_ARGUMENTS, DW1C_INIT0_TEST_ARGUMENTS,
-        INSPECTION_PATH, INSPECTION_SHELL, IsolatedUefiBuild, LoaderLinkMode, UefiCargoProfile,
-        blocked_toolchain_failure, canonical_build_directory, component_package,
-        encoded_uefi_rustflags, encoded_uefi_rustflags_for_target, explicit_test_filter,
-        host_test_arguments, host_test_commands, prepare_uefi_target_roots,
+        DW1D6_ACTOR_TEST_ARGUMENTS, DW1D6_BOOTSTRAP_TEST_ARGUMENTS,
+        DW1D6_SOURCE_CONTRACT_TEST_ARGUMENTS, INSPECTION_PATH, INSPECTION_SHELL, IsolatedUefiBuild,
+        LoaderLinkMode, UefiCargoProfile, blocked_toolchain_failure, canonical_build_directory,
+        component_package, encoded_uefi_rustflags, encoded_uefi_rustflags_for_target,
+        explicit_test_filter, host_test_arguments, host_test_commands, prepare_uefi_target_roots,
         render_uefi_inspection_report, run_verified_report, validate_regular_artifact,
         validate_uefi_inspection_report,
     };
@@ -1436,6 +1477,14 @@ mod tests {
         assert_eq!(
             host_test_commands(Some("dw1c")).unwrap(),
             [DW1C_INIT0_TEST_ARGUMENTS.to_vec()]
+        );
+        assert_eq!(
+            host_test_commands(Some("dw1d6")).unwrap(),
+            [
+                DW1D6_BOOTSTRAP_TEST_ARGUMENTS.to_vec(),
+                DW1D6_SOURCE_CONTRACT_TEST_ARGUMENTS.to_vec(),
+                DW1D6_ACTOR_TEST_ARGUMENTS.to_vec(),
+            ]
         );
     }
 

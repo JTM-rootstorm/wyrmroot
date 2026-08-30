@@ -5,8 +5,35 @@ use deepwyrm_syscall::{
 use wyrmroot_loader::launch::{
     self, BOOTFS_RIGHTS, CHILD_CHANNEL_RIGHTS, DEVICE_COORDINATOR_BYTES, DEVICE_DRIVER_BYTES,
     DEVICE_MANIFEST_RIGHTS, HEADER_BYTES, INIT0_BYTES, LOADER_TASK_GROUP_RIGHTS, LaunchError,
-    LaunchProfile, PROBE_CHILD_BYTES, SELF_ROOT_RIGHTS, SUPERVISOR_BYTES,
+    LaunchProfile, PROBE_CHILD_BYTES, RESOURCE_DOMAIN_CLAIM_RIGHTS, SELF_ROOT_RIGHTS,
+    SUPERVISOR_BYTES,
 };
+
+#[test]
+fn d6_owner_is_a_private_single_claim_capability_profile() {
+    let mut bytes = [0_u8; HEADER_BYTES + 8];
+    assert_eq!(
+        launch::encode_init(LaunchProfile::D6ResourceOwner, 0xd6_01, &mut bytes),
+        Ok(HEADER_BYTES + 8)
+    );
+    assert_eq!(
+        (get16(&bytes, 6), get32(&bytes, 20), get32(&bytes, 40)),
+        (8, 1, 15)
+    );
+    let domain = [received(
+        1,
+        DW_OBJECT_TYPE_TASK_GROUP,
+        RESOURCE_DOMAIN_CLAIM_RIGHTS,
+    )];
+    assert!(launch::parse_init(LaunchProfile::D6ResourceOwner, &bytes, &domain).is_ok());
+    assert!(launch::parse_init(LaunchProfile::Supervisor, &bytes, &domain).is_err());
+    let mut broad = domain;
+    broad[0].rights = LOADER_TASK_GROUP_RIGHTS;
+    assert_eq!(
+        launch::parse_init(LaunchProfile::D6ResourceOwner, &bytes, &broad),
+        Err(LaunchError::HandleMetadata { index: 0 })
+    );
+}
 
 #[test]
 fn wyr1_c3_driver_has_exact_reduced_direct_control_profile() {

@@ -2,6 +2,8 @@ use deepwyrm_syscall as _;
 use wyrmroot_bootfs as _;
 use wyrmroot_bootstrap as _;
 use wyrmroot_bootstrap_proto as _;
+#[cfg(feature = "dw1d6-synthetic")]
+use wyrmroot_dw1d6_device_test as _;
 use wyrmroot_loader as _;
 use wyrmroot_runtime as _;
 
@@ -70,6 +72,17 @@ fn dw1c_bootstrap_watchdog_contains_the_selector_transaction() {
     assert!(MAIN_SOURCE.contains("270_000_000_000"));
     assert!(MAIN_SOURCE.contains("240-second workload"));
     assert!(MAIN_SOURCE.contains("5_000_000_000"));
+}
+
+#[test]
+fn d6_bootstrap_is_feature_gated_v3_and_keeps_actors_out_of_production_init() {
+    assert!(MANIFEST.contains("dw1d6-synthetic = [\"native-bootstrap\""));
+    assert!(MAIN_SOURCE.contains("#[cfg(feature = \"dw1d6-synthetic\")]"));
+    assert!(LIB_SOURCE.contains("BootstrapMessage::InitV3"));
+    assert!(LIB_SOURCE.contains("validate_init_capabilities_v3"));
+    assert!(LIB_SOURCE.contains("load_d6_resource_owner_process"));
+    assert!(LIB_SOURCE.contains("LaunchProfile::Hello"));
+    assert!(!LIB_SOURCE.contains("continue_system_init_product"));
 }
 
 #[test]

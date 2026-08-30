@@ -34,6 +34,7 @@ i0-negative-capability-type = ["native-bootstrap"]
 i0-negative-capability-rights = ["native-bootstrap"]
 i-capability-relay = []
 i-capability-integration = ["native-bootstrap", "i-capability-relay"]
+dw1d6-synthetic = ["native-bootstrap", "wyrmroot-runtime/dw1d6-test-evidence", "dep:wyrmroot-dw1d6-device-test"]
 
 [dependencies]
 deepwyrm-syscall.workspace = true
@@ -41,6 +42,7 @@ wyrmroot-bootfs = { path = "../crates/wyrmroot-bootfs" }
 wyrmroot-bootstrap-proto = { path = "../crates/wyrmroot-bootstrap-proto" }
 wyrmroot-loader = { path = "../crates/wyrmroot-loader" }
 wyrmroot-runtime = { path = "../crates/wyrmroot-runtime" }
+wyrmroot-dw1d6-device-test = { path = "../userspace/dw1d6-device-test", optional = true }
 
 [dev-dependencies]
 wyrmroot-bootfs = { path = "../crates/wyrmroot-bootfs", features = ["builder"] }

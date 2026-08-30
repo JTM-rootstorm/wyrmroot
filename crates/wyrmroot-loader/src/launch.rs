@@ -32,6 +32,7 @@ const MINOR_V1_4_TEST: u16 = 4;
 const MINOR_V1_5: u16 = 5;
 const MINOR_V1_6: u16 = 6;
 const MINOR_V1_7: u16 = 7;
+const MINOR_V1_8_TEST: u16 = 8;
 const TYPE_INIT: u32 = 1;
 const TYPE_READY: u32 = 2;
 const ROLE_SELF_ROOT: u32 = 1;
@@ -48,6 +49,7 @@ const ROLE_DW1B_PROGRESS_DATA: u32 = 11;
 const ROLE_DEVICE_MANIFEST: u32 = 12;
 const ROLE_DEVICE_CONTROL: u32 = 13;
 const ROLE_RESOURCE_DOMAIN: u32 = 14;
+const ROLE_D6_RESOURCE_DOMAIN: u32 = 15;
 
 pub const SELF_ROOT_RIGHTS: DwRights =
     DwRights(DW_RIGHT_MAP.0 | DW_RIGHT_MODIFY.0 | DW_RIGHT_INSPECT.0);
@@ -118,6 +120,10 @@ pub enum LaunchProfile {
     /// WYR1-C3 acceptance driver.  It has self-root plus one reduced direct
     /// devmgr control Channel; it never receives a device bundle at startup.
     DeviceDriver,
+    /// Selector-30 resource owner. This private profile receives only the
+    /// reduced resource-domain claim capability and is never selected by a
+    /// production product.
+    D6ResourceOwner,
     Hello,
 }
 
@@ -126,6 +132,7 @@ impl LaunchProfile {
         match self {
             Self::Init0 | Self::I2Stress | Self::CapabilityController | Self::Supervisor => 3,
             Self::SupervisorResourceDomain => 4,
+            Self::D6ResourceOwner => 1,
             Self::ProbeChild | Self::Dw1bProgress => 1,
             Self::BootstrapRegistry
             | Self::BootstrapService
@@ -143,6 +150,7 @@ impl LaunchProfile {
             Self::ProbeChild => MINOR_V1_1,
             Self::Supervisor | Self::EarlyBootStub => MINOR_V1_2,
             Self::SupervisorResourceDomain => MINOR_V1_7,
+            Self::D6ResourceOwner => MINOR_V1_8_TEST,
             Self::BootstrapRegistry
             | Self::BootstrapService
             | Self::RegistryClient
@@ -253,6 +261,8 @@ fn encode_init_inner(
         if profile.has_loader_authority_quartet() {
             put_u32(output, HEADER_BYTES + 3 * 8, ROLE_RESOURCE_DOMAIN);
         }
+    } else if profile == LaunchProfile::D6ResourceOwner {
+        put_u32(output, HEADER_BYTES, ROLE_D6_RESOURCE_DOMAIN);
     } else if profile == LaunchProfile::DeviceCoordinator {
         for (index, role) in [
             ROLE_SELF_ROOT,
@@ -382,6 +392,18 @@ pub fn parse_init(
                 3,
             )?;
         }
+    } else if profile == LaunchProfile::D6ResourceOwner {
+        if get_u32(bytes, HEADER_BYTES) != ROLE_D6_RESOURCE_DOMAIN
+            || get_u32(bytes, HEADER_BYTES + 4) != 0
+        {
+            return Err(LaunchError::BadCapabilityRole { index: 0 });
+        }
+        validate_handle(
+            handles[0],
+            DW_OBJECT_TYPE_TASK_GROUP,
+            RESOURCE_DOMAIN_CLAIM_RIGHTS,
+            0,
+        )?;
     } else if profile == LaunchProfile::DeviceCoordinator {
         let expected = [
             (

@@ -1,0 +1,36 @@
+[package]
+name = "wyrmroot-dw1d6-device-test"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Selector-30 DeviceResource and synthetic Interrupt actors"
+license = "GPL-3.0-or-later"
+autobins = false
+
+[features]
+default = []
+native-payloads = ["wyrmroot-runtime/dw1d6-test-evidence"]
+
+[dependencies]
+deepwyrm-syscall.workspace = true
+wyrmroot-loader = { path = "../../crates/wyrmroot-loader" }
+wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }
+
+[[bin]]
+name = "wyrmroot-dw1d6-owner"
+path = "src/bin/owner.rs"
+required-features = ["native-payloads"]
+
+[[bin]]
+name = "wyrmroot-dw1d6-trigger"
+path = "src/bin/trigger.rs"
+required-features = ["native-payloads"]
+
+[[bin]]
+name = "wyrmroot-dw1d6-replacement-owner"
+path = "src/bin/replacement_owner.rs"
+required-features = ["native-payloads"]
+
+[lints.rust]
+unsafe_code = "deny"
+unused_crate_dependencies = "deny"

@@ -21,6 +21,8 @@ use wyrmroot_bootstrap::i0_negative_terminal_detail;
 use wyrmroot_bootstrap::run_bootstrap;
 #[cfg(feature = "primordial-blocking-cleanup")]
 use wyrmroot_bootstrap::run_bootstrap_with_before_ready;
+#[cfg(feature = "dw1d6-synthetic")]
+use wyrmroot_bootstrap::run_d6_synthetic_bootstrap;
 #[cfg(not(any(
     feature = "primordial-blocking-cleanup",
     feature = "native-loader-smoke-integration",
@@ -63,6 +65,7 @@ use wyrmroot_runtime::{
     feature = "i0-negative-capability-count",
     feature = "i0-negative-capability-type",
     feature = "i0-negative-capability-rights",
+    feature = "dw1d6-synthetic",
     not(any(
         feature = "primordial-blocking-cleanup",
         feature = "primordial-user-exception",
@@ -189,6 +192,39 @@ impl BootstrapSystem for NativeSystem {
         }
         result
     }
+
+    fn terminate_process(&mut self, process: DwHandle) -> Result<(), NativeError> {
+        let result = wyrmroot_runtime::terminate_process(
+            process,
+            deepwyrm_syscall::DW_TERMINATION_AUTHORIZED,
+            0,
+        );
+        if result.is_err() {
+            self.failed_native_operation = 8;
+        }
+        result
+    }
+
+    fn wait_for_process_exit(&mut self, process: DwHandle) -> Result<(), NativeError> {
+        let result = (|| {
+            let observed = wyrmroot_runtime::wait_one(
+                process,
+                deepwyrm_syscall::DW_SIGNAL_EXITED,
+                deepwyrm_syscall::DW_DEADLINE_INFINITE,
+            )?;
+            if observed.observed.0 & deepwyrm_syscall::DW_SIGNAL_EXITED.0 == 0
+                || wyrmroot_runtime::query_task_termination_info(process)?.state
+                    != deepwyrm_syscall::DW_TASK_STATE_EXITED
+            {
+                return Err(NativeError::Status(deepwyrm_syscall::DW_STATUS_BAD_STATE));
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.failed_native_operation = 9;
+        }
+        result
+    }
 }
 
 #[panic_handler]
@@ -206,6 +242,7 @@ fn panic(_info: &PanicInfo<'_>) -> ! {
     feature = "i0-negative-capability-count",
     feature = "i0-negative-capability-type",
     feature = "i0-negative-capability-rights",
+    feature = "dw1d6-synthetic",
     feature = "i-capability-integration",
     feature = "wyr0-init0-integration"
 )))]
@@ -223,6 +260,21 @@ fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
         &mut supervisor,
         startup.bootstrap_channel().as_abi(),
         deadline,
+    ) {
+        Ok(()) => 0,
+        Err(error) => system.exit_code(&error),
+    }
+}
+
+#[cfg(feature = "dw1d6-synthetic")]
+fn bootstrap_main(startup: StartupBlock<'_>) -> u32 {
+    let mut system = NativeSystem::new();
+    match run_d6_synthetic_bootstrap(
+        &mut system,
+        &mut NativeLoaderPlatform,
+        startup.bootstrap_channel().as_abi(),
+        wyrmroot_dw1d6_device_test::BUILD_NONCE,
+        wyrmroot_dw1d6_device_test::BUILD_CHALLENGE,
     ) {
         Ok(()) => 0,
         Err(error) => system.exit_code(&error),

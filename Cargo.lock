@@ -171,6 +171,7 @@ dependencies = [
  "deepwyrm-syscall",
  "wyrmroot-bootfs",
  "wyrmroot-bootstrap-proto",
+ "wyrmroot-dw1d6-device-test",
  "wyrmroot-loader",
  "wyrmroot-runtime",
 ]
@@ -204,6 +205,15 @@ dependencies = [
 
 [[package]]
 name = "wyrmroot-dw1c-preemption"
+version = "0.0.0"
+dependencies = [
+ "deepwyrm-syscall",
+ "wyrmroot-loader",
+ "wyrmroot-runtime",
+]
+
+[[package]]
+name = "wyrmroot-dw1d6-device-test"
 version = "0.0.0"
 dependencies = [
  "deepwyrm-syscall",

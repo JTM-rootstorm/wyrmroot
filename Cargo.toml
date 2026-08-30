@@ -25,6 +25,7 @@ members = [
     "userspace/devmgr",
     "userspace/dw1b-preemption",
     "userspace/dw1c-preemption",
+    "userspace/dw1d6-device-test",
     "userspace/wyr1b-gate",
 ]
 

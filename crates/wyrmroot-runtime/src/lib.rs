@@ -16,6 +16,12 @@ mod bounded_accounting;
 )]
 mod capability_native;
 mod diagnostics;
+#[cfg(feature = "dw1d6-test-evidence")]
+#[allow(
+    unsafe_code,
+    reason = "selector-30 confines generated DW1-D calls and one private carrier to a test-only facade"
+)]
+mod dw1d6;
 mod entry;
 #[allow(
     unsafe_code,
@@ -66,6 +72,11 @@ pub use capability_native::{WYR1_EVIDENCE_RECORD_BYTES, submit_wyr1_evidence};
 pub use capability_native::{WYR1B_EVIDENCE_RECORD_BYTES, submit_wyr1b_evidence};
 #[cfg(feature = "dw1b-test-evidence")]
 pub use capability_native::{arm_dw1b_preemption, submit_dw1b_progress};
+#[cfg(feature = "dw1d6-test-evidence")]
+pub use dw1d6::{
+    D6ReportEvent, claim_device_resource, create_interrupt, d6_arm, d6_bind, d6_deliver, d6_report,
+    device_pio_read, device_pio_write, device_resource_info, interrupt_ack, interrupt_info,
+};
 pub use loader_native::{LOADER_ABORT_CODE, NativeLoaderPlatform};
 pub use native::{
     MappedBootfs, NativeError, NativeOutputError, PANIC_EXIT_CODE, ReceiveCounts, close_handle,

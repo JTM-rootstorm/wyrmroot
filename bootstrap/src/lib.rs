@@ -144,6 +144,10 @@ pub use wyr0_compat::{
     run_init0_capability_bootstrap,
 };
 
+#[cfg(feature = "dw1d6-synthetic")]
+use deepwyrm_syscall::{
+    DW_RIGHT_INSPECT, DW_RIGHT_MODIFY, DW_RIGHT_READ, DW_RIGHT_WRITE, DW_STATUS_WOULD_BLOCK,
+};
 use deepwyrm_syscall::{
     DW_TASK_STATE_EXITED, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights,
     DwTaskTerminationInfoV1,
@@ -152,6 +156,10 @@ use wyrmroot_bootfs::archive::{Archive, LookupError, ParseError};
 use wyrmroot_bootstrap_proto::{
     BOOTSTRAP_INIT_V2_SIZE, BOOTSTRAP_READY_V2_SIZE, BootstrapMessage, DecodeError, InitMessageV2,
     MAX_BOOTSTRAP_V2_HANDLES, ReadyMessageV2, decode,
+};
+#[cfg(feature = "dw1d6-synthetic")]
+use wyrmroot_bootstrap_proto::{
+    BOOTSTRAP_INIT_V3_SIZE, BOOTSTRAP_READY_V3_SIZE, MAX_BOOTSTRAP_HANDLES, ReadyMessageV3,
 };
 use wyrmroot_loader::launch::{LaunchError, LaunchProfile};
 use wyrmroot_loader::process::{
@@ -166,6 +174,30 @@ use wyrmroot_runtime::{
     ReceiveCounts, SELF_ROOT_EXPECTATION, validate_bootstrap_channel,
     validate_init_capabilities_v2,
 };
+#[cfg(feature = "dw1d6-synthetic")]
+use wyrmroot_runtime::{RESOURCE_DOMAIN_TASK_GROUP_EXPECTATION, validate_init_capabilities_v3};
+
+#[cfg(feature = "dw1d6-synthetic")]
+use wyrmroot_loader::process::{D6ResourceOwnerLoadRequest, load_d6_resource_owner_process};
+#[cfg(feature = "dw1d6-synthetic")]
+use wyrmroot_runtime::{D6ReportEvent, claim_device_resource, d6_arm, d6_report};
+
+/// Selector-30 paths only; none are part of the permanent supervisor product.
+#[cfg(feature = "dw1d6-synthetic")]
+pub const D6_OWNER_PATH: &[u8] = b"test/dw1-d6/owner";
+#[cfg(feature = "dw1d6-synthetic")]
+pub const D6_TRIGGER_PATH: &[u8] = b"test/dw1-d6/trigger";
+#[cfg(feature = "dw1d6-synthetic")]
+pub const D6_REPLACEMENT_OWNER_PATH: &[u8] = b"test/dw1-d6/replacement-owner";
+#[cfg(feature = "dw1d6-synthetic")]
+pub const D6_OWNER_TRANSACTION: u64 = 0x4457_3144_365f_0001;
+#[cfg(feature = "dw1d6-synthetic")]
+pub const D6_TRIGGER_TRANSACTION: u64 = 0x4457_3144_365f_0002;
+#[cfg(feature = "dw1d6-synthetic")]
+pub const D6_REPLACEMENT_OWNER_TRANSACTION: u64 = 0x4457_3144_365f_0003;
+#[cfg(feature = "dw1d6-synthetic")]
+const D6_RESOURCE_RIGHTS: DwRights =
+    DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_MODIFY.0 | DW_RIGHT_INSPECT.0);
 use wyrmroot_runtime::{
     ExitObservedReadinessError, ExitValidationError, ObservedSupervisionError, SupervisionError,
     SupervisionPlatform, validate_successful_exit,
@@ -274,6 +306,371 @@ pub fn run_supervisor_bootstrap<
     send_primordial_ready(system, bootstrap_channel, transaction)
 }
 
+/// Runs the frozen selector-30 primordial transaction.  It consumes only WRBP
+/// V3, re-queries all four capabilities, creates the owner in the supplied
+/// resource domain, and never enters production `/system/init` behaviour.
+#[cfg(feature = "dw1d6-synthetic")]
+pub fn run_d6_synthetic_bootstrap<
+    System: BootstrapSystem,
+    Loader: LoaderPlatform<Error = NativeError>,
+>(
+    system: &mut System,
+    loader: &mut Loader,
+    bootstrap_channel: DwHandle,
+    nonce: u64,
+    challenge: u64,
+) -> Result<(), BootstrapError> {
+    let channel_info = system
+        .query_capability_info(bootstrap_channel)
+        .map_err(BootstrapError::Native)?;
+    validate_bootstrap_channel(channel_info, BOOTSTRAP_CHANNEL_EXPECTATION)
+        .map_err(BootstrapError::BootstrapChannel)?;
+    let mut bytes = [0_u8; BOOTSTRAP_INIT_V3_SIZE];
+    let mut handles = [DwReceivedHandleInfoV1::default(); MAX_BOOTSTRAP_HANDLES];
+    let counts = system
+        .receive_channel(bootstrap_channel, &mut bytes, &mut handles)
+        .map_err(BootstrapError::Native)?;
+    if counts.bytes != bytes.len() || counts.handles != handles.len() {
+        return Err(BootstrapError::ReceiveCounts(counts));
+    }
+    let init = match decode(&bytes, counts.handles).map_err(BootstrapError::Protocol)? {
+        BootstrapMessage::InitV3(value) => value,
+        _ => return Err(BootstrapError::UnexpectedMessage),
+    };
+    if init.transaction_id != 1 {
+        return Err(BootstrapError::UnexpectedTransactionId);
+    }
+    let (authority, resource_domain) = validated_d6_authority(system, &handles)?;
+    let owner = load_d6_resource_owner(
+        system,
+        loader,
+        authority,
+        resource_domain,
+        D6_OWNER_PATH,
+        D6_OWNER_TRANSACTION,
+    )?;
+    let plan = bootfs_mapping_plan(system, authority.bootfs)?;
+    let mut trigger = None;
+    system
+        .with_bootfs_bytes(authority.parent_root, authority.bootfs, plan, |bootfs| {
+            let archive = Archive::new(bootfs).map_err(BootstrapError::Bootfs)?;
+            let trigger_entry = archive
+                .lookup(D6_TRIGGER_PATH)
+                .map_err(|_| BootstrapError::MissingRequiredEntry)?;
+            let trigger_path = trigger_entry
+                .name_utf8()
+                .map_err(|_| BootstrapError::MissingRequiredEntry)?;
+            trigger = Some(
+                wyrmroot_loader::process::load_process(
+                    loader,
+                    authority,
+                    LoadRequest {
+                        image: trigger_entry.data(),
+                        display_path: trigger_path,
+                        profile: LaunchProfile::Hello,
+                        transaction_id: D6_TRIGGER_TRANSACTION,
+                    },
+                )
+                .map_err(BootstrapError::Loader)?,
+            );
+            Ok(())
+        })
+        .map_err(BootstrapError::Native)??;
+    let trigger = trigger.ok_or(BootstrapError::MissingLoadedProcess)?;
+    d6_arm(owner.process, trigger.process, nonce, challenge).map_err(BootstrapError::Native)?;
+    match claim_device_resource(resource_domain, 1, D6_RESOURCE_RIGHTS) {
+        Err(_) => d6_report(
+            D6ReportEvent::BootstrapOutsideDomainClaimRejected,
+            1,
+            0,
+            nonce,
+            challenge,
+        )
+        .map_err(BootstrapError::Native)?,
+        Ok(unexpected) => {
+            system
+                .close_handle(unexpected)
+                .map_err(BootstrapError::Native)?;
+            return Err(BootstrapError::UnexpectedMessage);
+        }
+    }
+    expect_d6_message(
+        system,
+        owner.launch_channel,
+        wyrmroot_dw1d6_device_test::ControllerMessage::new(
+            wyrmroot_dw1d6_device_test::MessageKind::FirstOwnerBound,
+            0,
+            0,
+        ),
+    )?;
+    for sequence in 1..=wyrmroot_dw1d6_device_test::DELIVERY_CYCLES {
+        expect_d6_message(
+            system,
+            owner.launch_channel,
+            wyrmroot_dw1d6_device_test::ControllerMessage::new(
+                wyrmroot_dw1d6_device_test::MessageKind::OwnerWaitIntent,
+                sequence,
+                0,
+            ),
+        )?;
+        send_d6_message(
+            system,
+            trigger.launch_channel,
+            wyrmroot_dw1d6_device_test::deliver_command(sequence, 0),
+        )?;
+        expect_d6_message(
+            system,
+            trigger.launch_channel,
+            wyrmroot_dw1d6_device_test::ControllerMessage::new(
+                wyrmroot_dw1d6_device_test::MessageKind::TriggerComplete,
+                sequence,
+                0,
+            ),
+        )?;
+        expect_d6_message(
+            system,
+            owner.launch_channel,
+            wyrmroot_dw1d6_device_test::ControllerMessage::new(
+                wyrmroot_dw1d6_device_test::MessageKind::OwnerWaitComplete,
+                sequence,
+                0,
+            ),
+        )?;
+        if sequence == wyrmroot_dw1d6_device_test::DELIVERY_CYCLES {
+            for race_sequence in [
+                wyrmroot_dw1d6_device_test::PENDING_DELIVERY_SEQUENCE,
+                wyrmroot_dw1d6_device_test::RACE_PERMIT_SEQUENCE,
+            ] {
+                send_d6_message(
+                    system,
+                    trigger.launch_channel,
+                    wyrmroot_dw1d6_device_test::deliver_command(race_sequence, 0),
+                )?;
+                expect_d6_message(
+                    system,
+                    trigger.launch_channel,
+                    wyrmroot_dw1d6_device_test::ControllerMessage::new(
+                        wyrmroot_dw1d6_device_test::MessageKind::TriggerComplete,
+                        race_sequence,
+                        0,
+                    ),
+                )?;
+            }
+        }
+        send_d6_message(
+            system,
+            owner.launch_channel,
+            wyrmroot_dw1d6_device_test::owner_ack_permit(sequence),
+        )?;
+        expect_d6_message(
+            system,
+            owner.launch_channel,
+            wyrmroot_dw1d6_device_test::ControllerMessage::new(
+                wyrmroot_dw1d6_device_test::MessageKind::OwnerAckComplete,
+                sequence,
+                0,
+            ),
+        )?;
+    }
+    expect_d6_message(
+        system,
+        owner.launch_channel,
+        wyrmroot_dw1d6_device_test::ControllerMessage::new(
+            wyrmroot_dw1d6_device_test::MessageKind::FirstOwnerClosed,
+            0,
+            0,
+        ),
+    )?;
+    system
+        .wait_for_process_exit(owner.process)
+        .map_err(BootstrapError::Native)?;
+    system
+        .close_handle(owner.launch_channel)
+        .map_err(BootstrapError::Native)?;
+    system
+        .close_handle(owner.process)
+        .map_err(BootstrapError::Native)?;
+    send_d6_message(
+        system,
+        trigger.launch_channel,
+        wyrmroot_dw1d6_device_test::deliver_command(
+            wyrmroot_dw1d6_device_test::STALE_DELIVERY_SEQUENCE,
+            wyrmroot_dw1d6_device_test::BAD_STATE_STATUS,
+        ),
+    )?;
+    expect_d6_message(
+        system,
+        trigger.launch_channel,
+        wyrmroot_dw1d6_device_test::ControllerMessage::new(
+            wyrmroot_dw1d6_device_test::MessageKind::TriggerComplete,
+            wyrmroot_dw1d6_device_test::STALE_DELIVERY_SEQUENCE,
+            wyrmroot_dw1d6_device_test::BAD_STATE_STATUS,
+        ),
+    )?;
+    let replacement = load_d6_resource_owner(
+        system,
+        loader,
+        authority,
+        resource_domain,
+        D6_REPLACEMENT_OWNER_PATH,
+        D6_REPLACEMENT_OWNER_TRANSACTION,
+    )?;
+    d6_arm(replacement.process, trigger.process, nonce, challenge)
+        .map_err(BootstrapError::Native)?;
+    expect_d6_message(
+        system,
+        replacement.launch_channel,
+        wyrmroot_dw1d6_device_test::ControllerMessage::new(
+            wyrmroot_dw1d6_device_test::MessageKind::ReplacementBound,
+            0,
+            0,
+        ),
+    )?;
+    expect_d6_message(
+        system,
+        replacement.launch_channel,
+        wyrmroot_dw1d6_device_test::ControllerMessage::new(
+            wyrmroot_dw1d6_device_test::MessageKind::ReplacementWaitIntent,
+            0,
+            0,
+        ),
+    )?;
+    system
+        .terminate_process(replacement.process)
+        .map_err(BootstrapError::Native)?;
+    system
+        .wait_for_process_exit(replacement.process)
+        .map_err(BootstrapError::Native)?;
+    system
+        .close_handle(replacement.launch_channel)
+        .map_err(BootstrapError::Native)?;
+    system
+        .close_handle(replacement.process)
+        .map_err(BootstrapError::Native)?;
+    send_d6_message(
+        system,
+        trigger.launch_channel,
+        wyrmroot_dw1d6_device_test::ControllerMessage::new(
+            wyrmroot_dw1d6_device_test::MessageKind::TriggerFinish,
+            0,
+            0,
+        ),
+    )?;
+    expect_d6_message(
+        system,
+        trigger.launch_channel,
+        wyrmroot_dw1d6_device_test::ControllerMessage::new(
+            wyrmroot_dw1d6_device_test::MessageKind::TriggerFinished,
+            0,
+            0,
+        ),
+    )?;
+    system
+        .wait_for_process_exit(trigger.process)
+        .map_err(BootstrapError::Native)?;
+    system
+        .close_handle(trigger.launch_channel)
+        .map_err(BootstrapError::Native)?;
+    system
+        .close_handle(trigger.process)
+        .map_err(BootstrapError::Native)?;
+    let mut ready = [0_u8; BOOTSTRAP_READY_V3_SIZE];
+    let size = ReadyMessageV3 {
+        transaction_id: init.transaction_id,
+    }
+    .encode_into(&mut ready)
+    .map_err(BootstrapError::Protocol)?;
+    system
+        .send_channel(bootstrap_channel, &ready[..size])
+        .map_err(BootstrapError::Native)?;
+    d6_report(D6ReportEvent::BootstrapReady, 0, 0, nonce, challenge)
+        .map_err(BootstrapError::Native)?;
+    close_received_handles(system, &handles)?;
+    system
+        .close_handle(bootstrap_channel)
+        .map_err(BootstrapError::Native)
+}
+
+#[cfg(feature = "dw1d6-synthetic")]
+fn load_d6_resource_owner<System: BootstrapSystem, Loader: LoaderPlatform<Error = NativeError>>(
+    system: &mut System,
+    loader: &mut Loader,
+    authority: LoadAuthority,
+    resource_domain: DwHandle,
+    path: &[u8],
+    transaction_id: u64,
+) -> Result<LoadedProcess, BootstrapError> {
+    let plan = bootfs_mapping_plan(system, authority.bootfs)?;
+    system
+        .with_bootfs_bytes(authority.parent_root, authority.bootfs, plan, |bootfs| {
+            let archive = Archive::new(bootfs).map_err(BootstrapError::Bootfs)?;
+            let entry = archive
+                .lookup(path)
+                .map_err(|_| BootstrapError::MissingRequiredEntry)?;
+            let display_path = entry
+                .name_utf8()
+                .map_err(|_| BootstrapError::MissingRequiredEntry)?;
+            load_d6_resource_owner_process(
+                loader,
+                authority,
+                D6ResourceOwnerLoadRequest {
+                    image: entry.data(),
+                    display_path,
+                    resource_domain,
+                    transaction_id,
+                },
+            )
+            .map_err(BootstrapError::Loader)
+        })
+        .map_err(BootstrapError::Native)?
+}
+
+#[cfg(feature = "dw1d6-synthetic")]
+fn send_d6_message<System: BootstrapSystem>(
+    system: &mut System,
+    channel: DwHandle,
+    message: wyrmroot_dw1d6_device_test::ControllerMessage,
+) -> Result<(), BootstrapError> {
+    system
+        .send_channel(channel, &message.encode())
+        .map_err(BootstrapError::Native)
+}
+
+#[cfg(feature = "dw1d6-synthetic")]
+fn expect_d6_message<System: BootstrapSystem>(
+    system: &mut System,
+    channel: DwHandle,
+    expected: wyrmroot_dw1d6_device_test::ControllerMessage,
+) -> Result<(), BootstrapError> {
+    if receive_d6_controller_message(system, channel)? == expected {
+        Ok(())
+    } else {
+        return Err(BootstrapError::UnexpectedMessage);
+    }
+}
+
+#[cfg(feature = "dw1d6-synthetic")]
+fn receive_d6_controller_message<System: BootstrapSystem>(
+    system: &mut System,
+    channel: DwHandle,
+) -> Result<wyrmroot_dw1d6_device_test::ControllerMessage, BootstrapError> {
+    let mut bytes = [0_u8; wyrmroot_dw1d6_device_test::CONTROLLER_MESSAGE_BYTES];
+    let mut handles = [];
+    loop {
+        match system.receive_channel(channel, &mut bytes, &mut handles) {
+            Ok(counts) if counts.bytes == bytes.len() && counts.handles == 0 => {
+                return wyrmroot_dw1d6_device_test::ControllerMessage::decode(&bytes)
+                    .map_err(|_| BootstrapError::UnexpectedMessage);
+            }
+            Ok(counts) => return Err(BootstrapError::ReceiveCounts(counts)),
+            Err(NativeError::Status(status)) if status == DW_STATUS_WOULD_BLOCK => {
+                core::hint::spin_loop()
+            }
+            Err(error) => return Err(BootstrapError::Native(error)),
+        }
+    }
+}
+
 /// Native operations used by the shared bootstrap transaction.
 pub trait BootstrapSystem {
     /// Queries fresh basic object metadata.
@@ -307,6 +704,18 @@ pub trait BootstrapSystem {
 
     /// Closes one caller-local handle.
     fn close_handle(&mut self, handle: DwHandle) -> Result<(), NativeError>;
+
+    /// Terminates the exact selector-owned process only after it has announced
+    /// the pending replacement wait.
+    fn terminate_process(&mut self, _: DwHandle) -> Result<(), NativeError> {
+        Err(NativeError::Status(deepwyrm_syscall::DW_STATUS_BAD_STATE))
+    }
+
+    /// Waits for a process exit and freshly verifies its terminal task state
+    /// before the caller releases its process handle.
+    fn wait_for_process_exit(&mut self, _: DwHandle) -> Result<(), NativeError> {
+        Err(NativeError::Status(deepwyrm_syscall::DW_STATUS_BAD_STATE))
+    }
 }
 
 /// Why the primordial bootstrap transaction failed.
@@ -912,6 +1321,48 @@ fn validated_load_authority<System: BootstrapSystem>(
         bootfs: handles[1].handle,
         task_group: handles[2].handle,
     })
+}
+
+#[cfg(feature = "dw1d6-synthetic")]
+fn validated_d6_authority<System: BootstrapSystem>(
+    system: &mut System,
+    handles: &[DwReceivedHandleInfoV1; MAX_BOOTSTRAP_HANDLES],
+) -> Result<(LoadAuthority, DwHandle), BootstrapError> {
+    let mut capabilities = [InitCapability {
+        received: CapabilityInfo {
+            object_type: handles[0].object_type,
+            rights: handles[0].rights,
+        },
+        fresh: system
+            .query_capability_info(handles[0].handle)
+            .map_err(BootstrapError::Native)?,
+    }; MAX_BOOTSTRAP_HANDLES];
+    let mut index = 0;
+    while index < MAX_BOOTSTRAP_HANDLES {
+        capabilities[index] = InitCapability {
+            received: received_capability(handles[index]),
+            fresh: system
+                .query_capability_info(handles[index].handle)
+                .map_err(BootstrapError::Native)?,
+        };
+        index += 1;
+    }
+    validate_init_capabilities_v3(
+        &capabilities,
+        SELF_ROOT_EXPECTATION,
+        BOOTFS_EXPECTATION,
+        LOADER_TASK_GROUP_EXPECTATION,
+        RESOURCE_DOMAIN_TASK_GROUP_EXPECTATION,
+    )
+    .map_err(BootstrapError::Capability)?;
+    Ok((
+        LoadAuthority {
+            parent_root: handles[0].handle,
+            bootfs: handles[1].handle,
+            task_group: handles[2].handle,
+        },
+        handles[3].handle,
+    ))
 }
 
 fn bootfs_mapping_plan<System: BootstrapSystem>(

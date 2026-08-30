@@ -422,6 +422,14 @@ impl BootstrapSystem for Fixture {
         self.closed.push(handle);
         Ok(())
     }
+
+    fn terminate_process(&mut self, _: DwHandle) -> Result<(), NativeError> {
+        Ok(())
+    }
+
+    fn wait_for_process_exit(&mut self, _: DwHandle) -> Result<(), NativeError> {
+        Ok(())
+    }
 }
 
 fn bootfs(entries: &[(&[u8], &[u8])]) -> Vec<u8> {
@@ -699,6 +707,7 @@ impl LoaderPlatform for SmokeLoader {
             | launch::LaunchProfile::JobV2Streams
             | launch::LaunchProfile::DeviceCoordinator
             | launch::LaunchProfile::DeviceDriver
+            | launch::LaunchProfile::D6ResourceOwner
             | launch::LaunchProfile::SupervisorResourceDomain => {
                 return Err(NativeError::Status(DW_STATUS_BAD_HANDLE));
             }
