@@ -559,7 +559,7 @@ pub(super) fn fixed_builder_for_profile(
     )
 }
 
-pub(super) fn fixed_builder_for_profiles(
+pub(crate) fn fixed_builder_for_profiles(
     boot_generation: &[u8; 32],
     role_hashes: [[u8; 32]; 5],
     registry_profile: StartupProfile,

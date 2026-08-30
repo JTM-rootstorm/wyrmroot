@@ -22,7 +22,7 @@ use crate::{
 };
 use wyrmroot_bootfs::{
     archive::Archive,
-    wyr1::{Product, ProductC1, WYR1_C1_MARKER, build_c1},
+    wyr1::{Product, ProductC1, ProductC6, WYR1_C1_MARKER, build_c1, build_c6},
 };
 use wyrmroot_device_proto::manifest::{
     ContentIdentity, HEADER_BYTES as WRDM_HEADER_BYTES, RECORD_BYTES as WRDM_RECORD_BYTES,
@@ -78,6 +78,52 @@ const NATIVE_SPECS: [NativeSpec; 6] = [
         package: "wyrmroot-wyr1-retained-stubs",
         binary: "uart16550d",
         features: "native-retained",
+        artifact: "uart16550d",
+    },
+    NativeSpec {
+        label: "consoled",
+        package: "wyrmroot-wyr1-retained-stubs",
+        binary: "consoled",
+        features: "native-retained",
+        artifact: "consoled",
+    },
+    NativeSpec {
+        label: "wyrmsh",
+        package: "wyrmroot-wyr1-retained-stubs",
+        binary: "wyrmsh",
+        features: "native-retained",
+        artifact: "wyrmsh",
+    },
+];
+
+#[allow(dead_code)] // consumed by the follow-on wyr1c6 producer command.
+const C6_PRODUCT_NATIVE_SPECS: [NativeSpec; 6] = [
+    NativeSpec {
+        label: "system-init",
+        package: "wyrmroot-system-init",
+        binary: "system-init",
+        features: "wyr1c6-production,wyr1c6-selector29",
+        artifact: "system-init",
+    },
+    NativeSpec {
+        label: "registryd",
+        package: "wyrmroot-registryd",
+        binary: "registryd",
+        features: "native-registryd",
+        artifact: "registryd",
+    },
+    NativeSpec {
+        label: "devmgr",
+        package: "wyrmroot-devmgr",
+        binary: "devmgr",
+        features: "wyr1c6-production,wyr1c6-selector29",
+        artifact: "devmgr",
+    },
+    NativeSpec {
+        label: "uart16550d",
+        package: "wyrmroot-wyr1-retained-stubs",
+        binary: "uart16550d",
+        features: "wyr1c6-production,wyr1c6-selector29",
         artifact: "uart16550d",
     },
     NativeSpec {
@@ -470,6 +516,70 @@ pub(crate) fn build_into(
     })
 }
 
+/// Build the C6-native bootfs snapshot with the same accepted compiler,
+/// inspection, WRRM and WRDM construction rules as C1.  Publication and VM
+/// handoff remain owned by `wyr1c6`.
+#[allow(dead_code)] // crate-private seam for wyr1c6::prepare.
+pub(crate) fn build_c6_snapshot(nonce: &str) -> Result<FrozenSnapshot, Failure> {
+    if nonce.len() != 16
+        || !nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte.is_ascii_uppercase())
+    {
+        return Err(Failure::task(
+            "WYR1-C6 gate nonce must be 16 uppercase hex characters",
+        ));
+    }
+    reject_ambient_build_environment(env::vars_os())?;
+    let repository = crate::tasks::repository_root()?;
+    let project = crate::tasks::canonical_project_root(&repository)?;
+    let revision = clean_repository_revision(&repository)?;
+    let manifest = BuildManifest::load(&repository)?;
+    let profile = manifest.validate_loader_build_readiness(&repository)?;
+    let toolchain = crate::tasks::prepare_loader_toolchain(&repository, &profile, &manifest)?;
+    let cargo_home = crate::tasks::project_cargo_home(&repository, &manifest)?;
+    let project_directory = crate::secure_fs::Directory::open_exact(&project, "OS-Project root")?;
+    let tmp = project_directory.open_child(".tmp", "project temporary root")?;
+    let scratch = tmp.create_scratch(
+        &format!("wyr1c6-build-{}", std::process::id()),
+        "WYR1-C6 build scratch",
+    )?;
+    let result = scratch.with_inheritable_anchor("WYR1-C6 build scratch", |anchor| {
+        let mut artifacts = Vec::with_capacity(C6_PRODUCT_NATIVE_SPECS.len());
+        for spec in C6_PRODUCT_NATIVE_SPECS {
+            let mut artifact =
+                build_native(&repository, &cargo_home, toolchain.accepted(), anchor, spec)?;
+            artifact.inspection = inspect_native(
+                &repository,
+                &artifact.bytes,
+                &artifact.sha256,
+                spec.label,
+                anchor,
+            )?;
+            artifacts.push(artifact);
+        }
+        let product = assemble_c6_product(&revision, &artifacts, nonce)?;
+        Ok(FrozenSnapshot {
+            receipt: format!(
+                "kind = \"wyrmroot-wyr1-c6-produced-snapshot\"\nnonce = \"{nonce}\"\n"
+            )
+            .into_bytes(),
+            rrc_manifest: product.rrc_manifest,
+            device_manifest: product.device_manifest,
+            bootfs: product.bootfs,
+            artifacts: artifacts
+                .iter()
+                .map(|a| (a.spec.label.to_owned(), a.bytes.clone()))
+                .collect(),
+            inspections: artifacts
+                .iter()
+                .map(|a| (a.spec.label.to_owned(), a.inspection.as_bytes().to_vec()))
+                .collect(),
+        })
+    });
+    scratch.finish(result)
+}
+
 fn publish_snapshot(
     output: &crate::secure_fs::Directory,
     snapshot: &FrozenSnapshot,
@@ -798,6 +908,70 @@ fn assemble_product(revision: &str, artifacts: &[NativeArtifact]) -> Result<Prod
         return Err(Failure::task("WYR1-C1 bootfs exceeds the image bound"));
     }
     inspect_archive(&bootfs, artifacts, &rrc_manifest, &device_manifest)?;
+    Ok(ProductBytes {
+        generation,
+        rrc_manifest_sha256: sha256::bytes_digest(&rrc_manifest),
+        device_manifest_sha256: sha256::bytes_digest(&device_manifest),
+        bootfs_sha256: sha256::bytes_digest(&bootfs),
+        rrc_manifest,
+        device_manifest,
+        bootfs,
+    })
+}
+
+#[allow(dead_code)]
+fn assemble_c6_product(
+    revision: &str,
+    artifacts: &[NativeArtifact],
+    nonce: &str,
+) -> Result<ProductBytes, Failure> {
+    let [init, registryd, devmgr, uart, consoled, wyrmsh]: [&NativeArtifact; 6] = artifacts
+        .iter()
+        .collect::<Vec<_>>()
+        .try_into()
+        .map_err(|_| Failure::task("WYR1-C6 requires six native artifacts"))?;
+    let hashes = [
+        digest_array(&registryd.sha256)?,
+        digest_array(&devmgr.sha256)?,
+        digest_array(&uart.sha256)?,
+        digest_array(&consoled.sha256)?,
+        digest_array(&wyrmsh.sha256)?,
+    ];
+    let generation = product_generation(revision, artifacts);
+    let rrc_manifest = crate::wyr1::fixed_builder_for_profiles(
+        &generation,
+        hashes,
+        StartupProfile::BootstrapRegistry,
+        StartupProfile::DeviceCoordinator,
+    )?
+    .build_structural()
+    .map_err(|error| Failure::task(format!("WYR1-C6 WRRM build failed: {error:?}")))?;
+    let mut wrdm = [0u8; WRDM_HEADER_BYTES + WRDM_RECORD_BYTES];
+    let size = encode_com2_manifest(ContentIdentity(hashes[2]), &mut wrdm)
+        .map_err(|error| Failure::task(format!("WYR1-C6 WRDM build failed: {error:?}")))?;
+    let device_manifest = wrdm[..size].to_vec();
+    let gate = format!(
+        "schema = 1\nselector = \"device-coordinator-restart\"\ntest_id = 29\nevidence_protocol = \"WRC6\"\nnonce = \"{nonce}\"\nphysical_io = \"not-performed\"\n"
+    );
+    let bootfs = build_c6(ProductC6 {
+        base: ProductC1 {
+            base: Product {
+                init: &init.bytes,
+                registryd: &registryd.bytes,
+                devmgr: &devmgr.bytes,
+                uart16550d: &uart.bytes,
+                consoled: &consoled.bytes,
+                wyrmsh: &wyrmsh.bytes,
+                rrc_manifest: &rrc_manifest,
+                gate_config: GATE_CONFIG,
+            },
+            marker: WYR1_C1_MARKER,
+            device_manifest: &device_manifest,
+            expected_uart16550d_identity: hashes[2],
+        },
+        gate: gate.as_bytes(),
+    })
+    .map_err(|error| Failure::task(format!("WYR1-C6 bootfs build failed: {error:?}")))?;
     Ok(ProductBytes {
         generation,
         rrc_manifest_sha256: sha256::bytes_digest(&rrc_manifest),
