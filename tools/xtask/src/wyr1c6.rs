@@ -2288,6 +2288,7 @@ mod tests {
         fs::create_dir(&root).unwrap();
         let git = |arguments: &[&str]| {
             let output = Command::new("git")
+                .args(["-c", "commit.gpgsign=false"])
                 .arg("-C")
                 .arg(&root)
                 .args(arguments)
