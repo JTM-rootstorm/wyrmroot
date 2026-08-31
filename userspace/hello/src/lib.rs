@@ -17,8 +17,11 @@ use wyrmroot_loader::launch::{
 };
 use wyrmroot_runtime::{
     BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, CapabilityValidationError, NativeError,
-    ReceiveCounts, native_error_code, validate_bootstrap_channel,
+    NativeOutput, ReceiveCounts, StreamError, StreamSystem, extract_job_v2_streams,
+    native_error_code, validate_bootstrap_channel,
 };
+#[cfg(test)]
+use wyrmroot_stream_proto as _;
 
 /// Native operations used by the WYR0-G `hello` parent-channel exchange.
 pub trait HelloSystem {
@@ -53,6 +56,11 @@ pub trait JobHelloSystem: HelloSystem {
     ) -> Result<DwSignals, NativeError>;
 }
 
+/// The selected WYR1-D hello path receives the reached JobV2 stream roles and
+/// writes only via its native stdout Channel. It has no debug-write fallback.
+pub trait StreamHelloSystem: JobHelloSystem + StreamSystem {}
+impl<T: JobHelloSystem + StreamSystem> StreamHelloSystem for T {}
+
 /// Why the WYR0-G `hello` startup exchange failed.
 #[derive(Debug, Eq, PartialEq)]
 pub enum HelloError {
@@ -71,6 +79,10 @@ pub enum HelloError {
     Launch(LaunchError),
     /// The post-READY wait did not observe one clean peer closure.
     PostReadySignals(DwSignals),
+    /// The reached JobV2 stream-role handoff was malformed.
+    StreamLaunch(LaunchError),
+    /// Native stdout could not commit the bounded greeting record.
+    Stream(StreamError),
 }
 
 /// Exact hello-owned native operation associated with a live failure.
@@ -102,6 +114,8 @@ impl HelloError {
             Self::ReceiveCounts(_) => PREFIX | 0x03,
             Self::Launch(_) => PREFIX | 0x04,
             Self::PostReadySignals(_) => PREFIX | 0x05,
+            Self::StreamLaunch(_) => PREFIX | 0x06,
+            Self::Stream(_) => PREFIX | 0x07,
         }
     }
 }
@@ -133,6 +147,82 @@ pub fn run_job_hello<System: JobHelloSystem>(
     {
         return Err(HelloError::PostReadySignals(observed));
     }
+    close_bootstrap(system, bootstrap_channel)
+}
+
+/// Completes the D1 stream-profile hello exchange and writes a binary-safe
+/// greeting through the child stdout role. The child never writes diagnostic
+/// success through COM1 or a historical debug facility.
+pub fn run_stream_hello<System: StreamHelloSystem>(
+    system: &mut System,
+    bootstrap_channel: DwHandle,
+) -> Result<(), HelloError> {
+    let channel = system
+        .query_capability_info(bootstrap_channel)
+        .map_err(|cause| HelloError::Native {
+            operation: HelloNativeOperation::QueryBootstrapChannel,
+            cause,
+        })?;
+    validate_bootstrap_channel(channel, BOOTSTRAP_CHANNEL_EXPECTATION)
+        .map_err(HelloError::BootstrapChannel)?;
+    let mut init = [0_u8; 64];
+    let mut handles = [DwReceivedHandleInfoV1::default(); 3];
+    let counts = system
+        .receive_channel(bootstrap_channel, &mut init, &mut handles)
+        .map_err(|cause| HelloError::Native {
+            operation: HelloNativeOperation::ReceiveInit,
+            cause,
+        })?;
+    if counts.bytes > init.len() || counts.handles != handles.len() {
+        return Err(HelloError::ReceiveCounts(counts));
+    }
+    let streams = extract_job_v2_streams(&init[..counts.bytes], &handles)
+        .map_err(HelloError::StreamLaunch)?;
+    let mut stdout = NativeOutput::new(streams.stdout);
+    if stdout
+        .write(system, b"hello from native stdout\n")
+        .map_err(HelloError::Stream)?
+        != 25
+    {
+        return Err(HelloError::Stream(StreamError::Protocol));
+    }
+    system
+        .close_handle(streams.stdin.handle())
+        .map_err(|cause| HelloError::Native {
+            operation: HelloNativeOperation::CloseBootstrapChannel,
+            cause,
+        })?;
+    system
+        .close_handle(streams.stdout.handle())
+        .map_err(|cause| HelloError::Native {
+            operation: HelloNativeOperation::CloseBootstrapChannel,
+            cause,
+        })?;
+    system
+        .close_handle(streams.stderr.handle())
+        .map_err(|cause| HelloError::Native {
+            operation: HelloNativeOperation::CloseBootstrapChannel,
+            cause,
+        })?;
+    let mut ready = [0_u8; HEADER_BYTES];
+    let parsed = wyrmroot_loader::launch::parse_init(
+        LaunchProfile::JobV2Streams,
+        &init[..counts.bytes],
+        &handles,
+    )
+    .map_err(HelloError::Launch)?;
+    let size = encode_ready_for_profile(
+        LaunchProfile::JobV2Streams,
+        parsed.transaction_id,
+        &mut ready,
+    )
+    .map_err(HelloError::Launch)?;
+    system
+        .send_channel(bootstrap_channel, &ready[..size])
+        .map_err(|cause| HelloError::Native {
+            operation: HelloNativeOperation::SendReady,
+            cause,
+        })?;
     close_bootstrap(system, bootstrap_channel)
 }
 

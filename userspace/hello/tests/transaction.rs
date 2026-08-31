@@ -5,11 +5,12 @@ use deepwyrm_syscall::{
 };
 use wyrmroot_hello::{
     HelloError, HelloNativeOperation, HelloSystem, JobHelloSystem, run_hello, run_job_hello,
+    run_stream_hello,
 };
 use wyrmroot_loader::launch::{LaunchProfile, encode_init, parse_ready, parse_ready_for_profile};
 use wyrmroot_runtime::{
     BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, CapabilityValidationError, NativeError,
-    ReceiveCounts,
+    ReceiveCounts, StreamSystem,
 };
 
 const CHANNEL: DwHandle = DwHandle(11);
@@ -190,4 +191,100 @@ fn hello_rejects_bootstrap_channel_excess_rights() {
     );
     assert!(fixture.sent.is_empty());
     assert!(fixture.closed.is_empty());
+}
+
+struct StreamFixture {
+    init: [u8; 64],
+    handles: [DwReceivedHandleInfoV1; 3],
+    sent: Vec<Vec<u8>>,
+    closed: Vec<DwHandle>,
+}
+impl StreamFixture {
+    fn new() -> Self {
+        let mut init = [0; 64];
+        encode_init(LaunchProfile::JobV2Streams, 9, &mut init).unwrap();
+        let handle = |raw| DwReceivedHandleInfoV1 {
+            handle: DwHandle(raw),
+            object_type: DW_OBJECT_TYPE_CHANNEL,
+            rights: wyrmroot_loader::launch::CHILD_CHANNEL_RIGHTS,
+            ..DwReceivedHandleInfoV1::default()
+        };
+        Self {
+            init,
+            handles: [handle(21), handle(22), handle(23)],
+            sent: vec![],
+            closed: vec![],
+        }
+    }
+}
+impl HelloSystem for StreamFixture {
+    fn query_capability_info(
+        &mut self,
+        _: DwHandle,
+    ) -> Result<CapabilityInfo<DwObjectType, DwRights>, NativeError> {
+        Ok(CapabilityInfo {
+            object_type: DW_OBJECT_TYPE_CHANNEL,
+            rights: BOOTSTRAP_CHANNEL_EXPECTATION.rights,
+        })
+    }
+    fn receive_channel(
+        &mut self,
+        _: DwHandle,
+        bytes: &mut [u8],
+        handles: &mut [DwReceivedHandleInfoV1],
+    ) -> Result<ReceiveCounts, NativeError> {
+        bytes[..64].copy_from_slice(&self.init);
+        handles.copy_from_slice(&self.handles);
+        Ok(ReceiveCounts {
+            bytes: 64,
+            handles: 3,
+        })
+    }
+    fn send_channel(&mut self, _: DwHandle, bytes: &[u8]) -> Result<(), NativeError> {
+        self.sent.push(bytes.to_vec());
+        Ok(())
+    }
+    fn close_handle(&mut self, handle: DwHandle) -> Result<(), NativeError> {
+        self.closed.push(handle);
+        Ok(())
+    }
+}
+impl JobHelloSystem for StreamFixture {
+    fn wait_channel(&mut self, _: DwHandle, _: DwSignals) -> Result<DwSignals, NativeError> {
+        Ok(DW_SIGNAL_PEER_CLOSED)
+    }
+}
+impl StreamSystem for StreamFixture {
+    fn receive(
+        &mut self,
+        _: DwHandle,
+        _: &mut [u8],
+        _: &mut [DwReceivedHandleInfoV1],
+    ) -> Result<ReceiveCounts, NativeError> {
+        unreachable!()
+    }
+    fn send(&mut self, _: DwHandle, bytes: &[u8]) -> Result<(), NativeError> {
+        self.sent.push(bytes.to_vec());
+        Ok(())
+    }
+    fn close(&mut self, handle: DwHandle) -> Result<(), NativeError> {
+        self.closed.push(handle);
+        Ok(())
+    }
+}
+
+#[test]
+fn stream_hello_uses_only_a_validated_native_stdout_record() {
+    let mut fixture = StreamFixture::new();
+    assert_eq!(run_stream_hello(&mut fixture, CHANNEL), Ok(()));
+    assert_eq!(
+        wyrmroot_stream_proto::decode_data(&fixture.sent[0])
+            .unwrap()
+            .payload(),
+        b"hello from native stdout\n"
+    );
+    assert_eq!(
+        fixture.closed,
+        [DwHandle(21), DwHandle(22), DwHandle(23), CHANNEL]
+    );
 }

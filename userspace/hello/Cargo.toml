@@ -23,15 +23,26 @@ test = false
 bench = false
 required-features = ["native-job-hello"]
 
+[[bin]]
+name = "wyrmroot-stream-hello"
+path = "src/stream_main.rs"
+test = false
+bench = false
+required-features = ["native-stream-hello"]
+
 [features]
 default = []
 native-hello = []
 native-job-hello = []
+native-stream-hello = []
 
 [dependencies]
 deepwyrm-syscall.workspace = true
 wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }
 wyrmroot-loader = { path = "../../crates/wyrmroot-loader" }
+
+[dev-dependencies]
+wyrmroot-stream-proto = { path = "../../crates/wyrmroot-stream-proto" }
 
 [lints.rust]
 unsafe_code = "deny"

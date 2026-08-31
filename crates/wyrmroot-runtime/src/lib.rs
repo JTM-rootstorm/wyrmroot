@@ -34,6 +34,7 @@ mod memory;
 mod native;
 pub mod sha256;
 mod startup;
+mod stream;
 mod supervision;
 #[cfg(feature = "primordial-test-support")]
 #[allow(
@@ -93,6 +94,10 @@ pub use startup::{
     AUXILIARY_VECTOR_TERMINATOR, BootstrapChannelHandle, STARTUP_ABI_V1, STARTUP_ABI_V2,
     STARTUP_BLOCK_SIZE, STARTUP_BLOCK_V2_SIZE, StartupBlock, StartupError, StartupRegisters,
     StartupString, startup_error_exit_code, with_native_startup,
+};
+pub use stream::{
+    INPUT_WAIT_SIGNALS, JOB_V2_STREAM_RIGHTS, JobV2Streams, NativeInput, NativeOutput,
+    OUTPUT_WAIT_SIGNALS, StreamEndpoint, StreamError, StreamSystem, extract_job_v2_streams,
 };
 pub use supervision::{
     AttemptFailure, AttemptRecord, CleanupAction, CleanupDisposition, ExitObservedReadinessError,

@@ -1,6 +1,7 @@
 use deepwyrm_syscall as _;
 use wyrmroot_loader as _;
 use wyrmroot_runtime as _;
+use wyrmroot_stream_proto as _;
 
 const SOURCE: &str = concat!(
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs")),

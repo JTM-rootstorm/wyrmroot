@@ -22,6 +22,7 @@ wyr1c6-test-evidence = []
 [dependencies]
 deepwyrm-syscall.workspace = true
 wyrmroot-loader = { path = "../wyrmroot-loader" }
+wyrmroot-stream-proto = { path = "../wyrmroot-stream-proto" }
 
 [lints.rust]
 unsafe_code = "deny"

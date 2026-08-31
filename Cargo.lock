@@ -237,6 +237,7 @@ dependencies = [
  "deepwyrm-syscall",
  "wyrmroot-loader",
  "wyrmroot-runtime",
+ "wyrmroot-stream-proto",
 ]
 
 [[package]]
@@ -318,7 +319,12 @@ version = "0.0.0"
 dependencies = [
  "deepwyrm-syscall",
  "wyrmroot-loader",
+ "wyrmroot-stream-proto",
 ]
+
+[[package]]
+name = "wyrmroot-stream-proto"
+version = "0.0.0"
 
 [[package]]
 name = "wyrmroot-system-init"
