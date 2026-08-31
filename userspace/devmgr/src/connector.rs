@@ -4,6 +4,7 @@
 //! transition so the native adapter never infers cleanup from event order.
 
 use wyrmroot_device_proto::connector::{ConnectorErrorCode, ConnectorIdentity, ConnectorMessage};
+use wyrmroot_device_proto::control::FailureCode;
 use wyrmroot_device_proto::control_v1_1::{ControlIdentityV1_1, ControlMessageV1_1};
 use wyrmroot_device_proto::{PublicationPolicy, SERIAL_CONSOLE_CONNECTOR_PUBLICATION_POLICY};
 
@@ -134,6 +135,9 @@ pub enum ConnectorAction {
     /// Close the endpoint still retained by devmgr and ask the driver to close
     /// its already-moved peer.
     CloseRetainedClientAndRequestDriverRelease { attach: AttachCorrelation },
+    /// Exact driver-reap proof released the moved endpoint. Native code closes
+    /// only the client endpoint that never left devmgr custody.
+    CloseRetainedClient { attach: AttachCorrelation },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -302,6 +306,59 @@ impl ConnectorBroker {
         Ok(())
     }
 
+    /// A bounded wait for STREAM_READY expired after the driver endpoint MOVE.
+    /// Devmgr closes only its retained client endpoint and keeps the slot until
+    /// STREAM_DETACHED, direct-control peer close, or exact attempt reap proves
+    /// that the driver-owned endpoint was released.
+    pub fn pending_attach_timed_out(
+        &mut self,
+        observed: AttachCorrelation,
+    ) -> Result<ConnectorAction, ConnectorModelError> {
+        self.abort_post_move_pending(observed)
+    }
+
+    /// Accepts only an exact DRIVER_REJECTED response for the pending attach.
+    /// Other failure identities/codes cannot tear down the current slot.
+    pub fn pending_attach_rejected(
+        &mut self,
+        message: ControlMessageV1_1,
+    ) -> Result<ConnectorAction, ConnectorModelError> {
+        let ConnectorSlot::PostMovePending { attach, .. } = self.slot else {
+            return Err(ConnectorModelError::Stale);
+        };
+        let ControlMessageV1_1::Failure { identity, code } = message else {
+            return Err(ConnectorModelError::Stale);
+        };
+        if identity
+            != (ControlIdentityV1_1 {
+                transaction_id: attach.attach_transaction_id,
+                ..attach.driver.control
+            })
+            || code != FailureCode::DriverRejected
+        {
+            return Err(ConnectorModelError::Stale);
+        }
+        self.abort_post_move_pending(attach)
+    }
+
+    fn abort_post_move_pending(
+        &mut self,
+        observed: AttachCorrelation,
+    ) -> Result<ConnectorAction, ConnectorModelError> {
+        let ConnectorSlot::PostMovePending { attach, mut pair } = self.slot else {
+            return Err(ConnectorModelError::Stale);
+        };
+        if observed != attach
+            || pair.client != EndpointOwner::Devmgr
+            || pair.driver != EndpointOwner::Driver
+        {
+            return Err(ConnectorModelError::Stale);
+        }
+        pair.client = EndpointOwner::Released;
+        self.slot = ConnectorSlot::AwaitingDriverRelease { attach, pair };
+        Ok(ConnectorAction::CloseRetainedClientAndRequestDriverRelease { attach })
+    }
+
     pub fn connected_response(&self) -> Result<ConnectorMessage, ConnectorModelError> {
         let ConnectorSlot::ReadyToConnect { attach, .. } = self.slot else {
             return Err(ConnectorModelError::Stale);
@@ -396,6 +453,78 @@ impl ConnectorBroker {
         Ok(())
     }
 
+    /// Records supervisor/reaper proof that one exact driver attempt is
+    /// terminal. Process teardown, not devmgr, releases any endpoint that was
+    /// already MOVEd into the driver. Stale attempt evidence is non-mutating.
+    pub fn driver_attempt_reaped(
+        &mut self,
+        observed: PublishedDriver,
+    ) -> Result<Option<ConnectorAction>, ConnectorModelError> {
+        let slot_before = self.slot;
+        let slot_driver = match slot_before {
+            ConnectorSlot::Empty => None,
+            ConnectorSlot::PreMove { attach, .. }
+            | ConnectorSlot::PostMovePending { attach, .. }
+            | ConnectorSlot::ReadyToConnect { attach, .. }
+            | ConnectorSlot::Active { attach, .. }
+            | ConnectorSlot::AwaitingDriverRelease { attach, .. }
+            | ConnectorSlot::AwaitingClientRelease { attach, .. }
+            | ConnectorSlot::RetiringActive { attach, .. } => Some(attach.driver),
+        };
+        let exact_slot = slot_driver == Some(observed);
+        let exact_current = self.current == Some(observed);
+        if !exact_slot && !exact_current {
+            return Err(ConnectorModelError::Stale);
+        }
+
+        if exact_current {
+            self.current = None;
+        }
+        let action = match slot_before {
+            ConnectorSlot::Empty => None,
+            ConnectorSlot::PreMove { attach, .. } => {
+                self.slot = ConnectorSlot::Empty;
+                Some(ConnectorAction::ClosePreMovePair { attach })
+            }
+            ConnectorSlot::PostMovePending { attach, .. }
+            | ConnectorSlot::ReadyToConnect { attach, .. } => {
+                // Reaping proves the driver-owned endpoint is already gone.
+                // Only the still-local client endpoint may be closed here.
+                self.slot = ConnectorSlot::Empty;
+                Some(ConnectorAction::CloseRetainedClient { attach })
+            }
+            ConnectorSlot::Active { attach, mut pair }
+            | ConnectorSlot::AwaitingClientRelease { attach, mut pair } => {
+                pair.driver = EndpointOwner::Released;
+                self.slot = if pair.client == EndpointOwner::Released {
+                    ConnectorSlot::Empty
+                } else {
+                    ConnectorSlot::AwaitingClientRelease { attach, pair }
+                };
+                None
+            }
+            ConnectorSlot::AwaitingDriverRelease { attach, mut pair } => {
+                pair.driver = EndpointOwner::Released;
+                self.slot = if pair.client == EndpointOwner::Released {
+                    ConnectorSlot::Empty
+                } else {
+                    ConnectorSlot::AwaitingClientRelease { attach, pair }
+                };
+                None
+            }
+            ConnectorSlot::RetiringActive { attach, mut pair } => {
+                pair.driver = EndpointOwner::Released;
+                self.slot = if pair.client == EndpointOwner::Released {
+                    ConnectorSlot::Empty
+                } else {
+                    ConnectorSlot::RetiringActive { attach, pair }
+                };
+                None
+            }
+        };
+        Ok(action)
+    }
+
     /// Prevents new connection attempts immediately. Moved endpoints remain
     /// attributed to their owners until exact release observations arrive.
     pub fn retire_current(&mut self) -> Option<ConnectorAction> {
@@ -469,6 +598,20 @@ mod tests {
         attach
     }
 
+    fn begin_moved(broker: &mut ConnectorBroker, publication: u64, tx: u64) -> AttachCorrelation {
+        let ConnectorAction::AllocatePair { attach, .. } = broker
+            .begin_connect(ConnectorMessage::ConnectStream {
+                publication_generation: publication,
+                client_transaction_id: tx,
+            })
+            .unwrap()
+        else {
+            panic!("allocate pair");
+        };
+        broker.driver_endpoint_moved(attach).unwrap();
+        attach
+    }
+
     #[test]
     fn minor_one_policy_and_one_direct_client_reconnect_are_explicit() {
         assert_eq!(ConnectorBroker::publication_policy().protocol_minor, 1);
@@ -533,5 +676,135 @@ mod tests {
         broker.client_release_observed(active).unwrap();
         broker.replace_published_driver(driver(11, 2)).unwrap();
         assert_eq!(broker.current(), Some(driver(11, 2)));
+    }
+
+    #[test]
+    fn pending_timeout_closes_only_retained_client_until_exact_driver_release() {
+        let mut broker = ConnectorBroker::new(Some(driver(10, 1)), 100, 200).unwrap();
+        let attach = begin_moved(&mut broker, 10, 7);
+        assert_eq!(
+            broker.pending_attach_timed_out(attach).unwrap(),
+            ConnectorAction::CloseRetainedClientAndRequestDriverRelease { attach }
+        );
+        assert!(matches!(
+            broker.slot(),
+            ConnectorSlot::AwaitingDriverRelease {
+                pair: PairOwnership {
+                    client: EndpointOwner::Released,
+                    driver: EndpointOwner::Driver
+                },
+                ..
+            }
+        ));
+        assert_eq!(
+            broker.accept_stream_ready(attach.ready_message()),
+            Err(ConnectorModelError::Stale)
+        );
+        assert_eq!(
+            broker.begin_connect(ConnectorMessage::ConnectStream {
+                publication_generation: 10,
+                client_transaction_id: 8,
+            }),
+            Err(ConnectorModelError::Busy)
+        );
+        broker.driver_detached(attach.detached_message()).unwrap();
+        assert_eq!(broker.slot(), ConnectorSlot::Empty);
+        assert!(
+            broker
+                .begin_connect(ConnectorMessage::ConnectStream {
+                    publication_generation: 10,
+                    client_transaction_id: 8,
+                })
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn driver_rejection_requires_exact_identity_then_release_proof() {
+        let mut broker = ConnectorBroker::new(Some(driver(10, 1)), 100, 200).unwrap();
+        let attach = begin_moved(&mut broker, 10, 7);
+        let wrong_code = ControlMessageV1_1::Failure {
+            identity: ControlIdentityV1_1 {
+                transaction_id: attach.attach_transaction_id,
+                ..attach.driver.control
+            },
+            code: FailureCode::DriverExited,
+        };
+        assert_eq!(
+            broker.pending_attach_rejected(wrong_code),
+            Err(ConnectorModelError::Stale)
+        );
+        assert!(matches!(
+            broker.slot(),
+            ConnectorSlot::PostMovePending { .. }
+        ));
+
+        let rejection = ControlMessageV1_1::Failure {
+            identity: ControlIdentityV1_1 {
+                transaction_id: attach.attach_transaction_id,
+                ..attach.driver.control
+            },
+            code: FailureCode::DriverRejected,
+        };
+        assert_eq!(
+            broker.pending_attach_rejected(rejection).unwrap(),
+            ConnectorAction::CloseRetainedClientAndRequestDriverRelease { attach }
+        );
+        assert!(matches!(
+            broker.slot(),
+            ConnectorSlot::AwaitingDriverRelease { .. }
+        ));
+        broker.driver_detached(attach.detached_message()).unwrap();
+        assert_eq!(broker.slot(), ConnectorSlot::Empty);
+    }
+
+    #[test]
+    fn exact_reaped_pending_attempt_closes_only_retained_client_and_clears() {
+        let published = driver(10, 1);
+        let mut broker = ConnectorBroker::new(Some(published), 100, 200).unwrap();
+        let attach = begin_moved(&mut broker, 10, 7);
+        assert_eq!(
+            broker.driver_attempt_reaped(published).unwrap(),
+            Some(ConnectorAction::CloseRetainedClient { attach })
+        );
+        assert_eq!(broker.current(), None);
+        assert_eq!(broker.slot(), ConnectorSlot::Empty);
+        broker.replace_published_driver(driver(11, 2)).unwrap();
+    }
+
+    #[test]
+    fn exact_reaped_active_attempt_waits_for_client_peer_close_then_clears() {
+        let published = driver(10, 1);
+        let mut broker = ConnectorBroker::new(Some(published), 100, 200).unwrap();
+        let attach = attach_once(&mut broker, 10, 7);
+        assert_eq!(broker.driver_attempt_reaped(published).unwrap(), None);
+        assert_eq!(broker.current(), None);
+        assert!(matches!(
+            broker.slot(),
+            ConnectorSlot::AwaitingClientRelease {
+                pair: PairOwnership {
+                    client: EndpointOwner::Client,
+                    driver: EndpointOwner::Released
+                },
+                ..
+            }
+        ));
+        broker.client_release_observed(attach).unwrap();
+        assert_eq!(broker.slot(), ConnectorSlot::Empty);
+        broker.replace_published_driver(driver(11, 2)).unwrap();
+    }
+
+    #[test]
+    fn stale_reaped_attempt_cannot_mutate_current_or_active_slot() {
+        let published = driver(10, 1);
+        let mut broker = ConnectorBroker::new(Some(published), 100, 200).unwrap();
+        attach_once(&mut broker, 10, 7);
+        let before_slot = broker.slot();
+        assert_eq!(
+            broker.driver_attempt_reaped(driver(10, 2)),
+            Err(ConnectorModelError::Stale)
+        );
+        assert_eq!(broker.current(), Some(published));
+        assert_eq!(broker.slot(), before_slot);
     }
 }

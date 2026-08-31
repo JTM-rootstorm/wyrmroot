@@ -50,8 +50,15 @@ The devmgr connector broker makes native handle actions explicit:
   before `CONNECTED` may MOVE the retained client endpoint;
 - at most one pending or active stream exists; stale READY/detach events do not
   mutate the slot;
-- attach/reply failure, client-first or driver-first detach, and retirement
-  preserve the remaining endpoint owner until exact release is observed; and
+- pre-MOVE send failure, bounded post-MOVE timeout, typed driver rejection,
+  reply failure, client-first or driver-first detach, and retirement preserve
+  the remaining endpoint owner until exact release is observed;
+- post-MOVE timeout/rejection closes only devmgr's retained client endpoint and
+  cannot release the slot until correlation-exact `STREAM_DETACHED`, control
+  peer-close/reap proof, or another exact generation-terminal observation;
+- an exact supervisor/reaper observation makes the moved driver endpoint
+  released by process teardown, while stale attempt evidence is non-mutating;
+  an active client still must provide peer-close proof before replacement; and
 - a healthy driver generation may reconnect only after both endpoints from the
   prior stream are released, with fresh attach and stream generations.
 
@@ -71,7 +78,7 @@ lane-owned target directories under `/tmp/wyr1d-d3ac-*-target`:
 tools/pinned-cargo test -p wyrmroot-device-proto --lib --tests
 # 42 unit + 9 D0 model tests passed
 tools/pinned-cargo test -p wyrmroot-devmgr --lib --tests
-# 23 unit + 12 native-source regression tests passed
+# 28 unit + 12 native-source regression tests passed
 tools/pinned-cargo test -p wyrmroot-uart16550d --lib --tests
 # 3 unit + 1 joined D3C integration tests passed
 tools/pinned-cargo clippy -p wyrmroot-device-proto --lib --tests -- -D warnings
