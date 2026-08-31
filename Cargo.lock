@@ -336,6 +336,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrmroot-uart16550-core"
+version = "0.0.0"
+
+[[package]]
 name = "wyrmroot-wyr1-bootstrap-stubs"
 version = "0.0.0"
 dependencies = [

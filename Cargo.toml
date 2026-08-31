@@ -11,6 +11,7 @@ members = [
     "crates/wyrmroot-wyr1b-gate-proto",
     "crates/wyrmroot-rrc-manifest",
     "crates/wyrmroot-runtime",
+    "crates/wyrmroot-uart16550-core",
     "loader",
     "tools/xtask",
     "userspace/hello",
