@@ -45,6 +45,7 @@ Usage:
     cargo xtask dw1c image-rebuild --request <dw1-c-request.toml>
     cargo xtask dw1c inspect --request <dw1-c-request.toml>
     tools/pinned-cargo xtask dw1d6 freeze --output <fresh-directory> --deep-repository <path> --deep-revision <40-hex> --evidence-nonce <16-hex> --evidence-challenge <16-hex>
+    tools/pinned-cargo xtask dw1-e3a-prepare <fresh-directory> <deepwyrm-repository> <deepwyrm-revision> <16-hex-nonce>
 
 Host filters may name a component (bootfs, protocol, elf, runtime, bootstrap,
 efi, init0, hello, xtask, dw1c-init0, or dw1d6), package:<workspace-package>,
@@ -190,6 +191,12 @@ pub(crate) enum Action {
         evidence_nonce: String,
         evidence_challenge: String,
     },
+    Dw1E3APrepare {
+        output: String,
+        deep_repository: String,
+        deep_revision: String,
+        nonce: String,
+    },
     Unavailable(&'static str),
 }
 
@@ -243,9 +250,24 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
         "dw1b" => dispatch_dw1b(&arguments[1..]),
         "dw1c" => dispatch_dw1c(&arguments[1..]),
         "dw1d6" => dispatch_dw1d6(&arguments[1..]),
+        "dw1-e3a-prepare" => dispatch_dw1e3a_prepare(&arguments[1..]),
         unknown => Err(Failure::usage(format!(
             "unknown command '{unknown}'\n\n{USAGE}"
         ))),
+    }
+}
+
+fn dispatch_dw1e3a_prepare(arguments: &[String]) -> Result<Action, Failure> {
+    match arguments {
+        [output, deep_repository, deep_revision, nonce] => Ok(Action::Dw1E3APrepare {
+            output: output.clone(),
+            deep_repository: deep_repository.clone(),
+            deep_revision: deep_revision.clone(),
+            nonce: nonce.clone(),
+        }),
+        _ => Err(Failure::usage(
+            "dw1-e3a-prepare requires <fresh-directory> <deepwyrm-repository> <deepwyrm-revision> <16-hex-nonce>",
+        )),
     }
 }
 
@@ -998,6 +1020,27 @@ mod tests {
         assert!(dispatch(&arguments(&["wyr1c6", "freeze", "--output", "freeze",])).is_err());
         assert!(USAGE.contains("tools/pinned-cargo xtask wyr1c6 prepare --output"));
         assert!(!USAGE.contains("wyr1c6 freeze --output"));
+    }
+
+    #[test]
+    fn dw1e3a_prepare_dispatches_only_the_producer_owned_inputs() {
+        assert_eq!(
+            dispatch(&arguments(&[
+                "dw1-e3a-prepare",
+                "freeze",
+                "/home/mike/Documents/Programming/OS-Project/deepwyrm",
+                &"a".repeat(40),
+                "E300000000000001",
+            ])),
+            Ok(Action::Dw1E3APrepare {
+                output: "freeze".into(),
+                deep_repository: "/home/mike/Documents/Programming/OS-Project/deepwyrm".into(),
+                deep_revision: "a".repeat(40),
+                nonce: "E300000000000001".into(),
+            })
+        );
+        assert!(dispatch(&arguments(&["dw1-e3a-prepare", "freeze"])).is_err());
+        assert!(USAGE.contains("dw1-e3a-prepare <fresh-directory>"));
     }
 
     #[test]

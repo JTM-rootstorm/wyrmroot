@@ -1219,7 +1219,7 @@ fn assemble_e3a_product(
         .map_err(|error| Failure::task(format!("DW1-E3A WRDM build failed: {error:?}")))?;
     let device_manifest = wrdm[..size].to_vec();
     let gate = format!(
-        "schema = 1\nselector = \"q35-uart-com2-one-round-trip\"\ntest_id = 31\nevidence_protocol = \"DWE3E1\"\nnonce = \"{nonce}\"\npartial_evidence = true\nphysical_io = \"real-com2-irq3-intended\"\n"
+        "schema = 1\nselector = \"q35-com2-interrupt\"\ntest_id = 31\nevidence_protocol = \"DWE3E1\"\nnonce = \"{nonce}\"\npartial_evidence = true\nphysical_io = \"real-com2-irq3-intended\"\n"
     );
     let bootfs = build_e3a(ProductE3A {
         base: ProductC1 {

@@ -2,7 +2,7 @@
 
 Date: 2026-08-31
 
-DW1-E3A now has a selector-31-only Wyrmroot product path for the first raw
+DW1-E3A now has a `q35-com2-interrupt` selector-31-only Wyrmroot product path for the first raw
 COM2 challenge round trip. The public ABI and the normal five-role WRRM
 inventory are unchanged. The product keeps production `devmgr` and
 `uart16550d`, and adds `test/dw1e3/com2-probe` as explicit test-only bootfs
@@ -30,9 +30,11 @@ content.
   no prefix, suffix, or handshake byte;
 - the bootfs builder and xtask snapshot keep the five production WRRM roles
   while adding the separately named probe artifact; and
-- xtask freezes exact selector-31 request, default/SMP handoff, profile-pair,
-  and nine-record partial `DWE3E1` parser grammars. The partial grammar rejects
-  `DWTEST1` and does not create an acceptance receipt.
+- `dw1-e3a-prepare <output> <deep-repo> <deep-revision> <nonce>` builds and
+  freezes the immutable artifacts and ESP, profile-local domain XML and mutable
+  OVMF variables, source/build receipts, acyclic request/handoff/profile-pair
+  graph, and nine-record partial `DWE3E1` parser grammar. The partial grammar
+  rejects `DWTEST1` and does not create an acceptance receipt.
 
 ## Canonical raw payload
 

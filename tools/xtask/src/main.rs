@@ -217,6 +217,18 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
             &evidence_challenge,
         )
         .map(Some),
+        Action::Dw1E3APrepare {
+            output,
+            deep_repository,
+            deep_revision,
+            nonce,
+        } => dw1e3a::prepare(
+            std::path::Path::new(&output),
+            std::path::Path::new(&deep_repository),
+            &deep_revision,
+            &nonce,
+        )
+        .map(Some),
         Action::Unavailable(command) => Err(Failure::unavailable(command)),
     }
 }

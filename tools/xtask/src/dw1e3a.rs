@@ -6,11 +6,23 @@
 
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env, fs,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
-use crate::{error::Failure, sha256};
+use crate::{
+    cli::G3ImageArguments,
+    error::Failure,
+    g3_image,
+    secure_fs::{Directory, InheritableDirectory},
+    sha256, tasks, wyr1c6,
+};
 
-pub(crate) const SELECTOR: &str = "q35-uart-com2-one-round-trip";
+pub(crate) const SELECTOR: &str = "q35-com2-interrupt";
 pub(crate) const TEST_ID: &str = "31";
 pub(crate) const EVIDENCE_PROTOCOL: &str = "DWE3E1";
 pub(crate) const REQUEST_KIND: &str = "wyrmroot-dw1-e3a-selector31-request";
@@ -23,12 +35,220 @@ pub(crate) const READINESS_MARKER: &str =
     "DWE3READY|01|<NONCE16>|<STREAM16>|<CHALLENGE16>|<FNV16>|<FNV32>";
 pub(crate) const ACCEPTANCE_CLAIM: &str = "partial-non-acceptance";
 pub(crate) const TIMEOUT_SECONDS: &str = "120";
+const SOURCE_RECEIPT: &str = "e3a-source-build.toml";
+const NATIVE_TARGET: &str = "x86_64-unknown-wyrmroot";
+const KERNEL_TARGET: &str = "x86_64-unknown-none";
+const MACHINE: &str = "pc-q35-10.2";
+const DOMAIN_UUID: &str = "33005e22-d7c2-4b13-b1ac-b82eda95e584";
+const ESP_FD_GROUP: &str = "dw-f13-esp-v1";
+const VARS_FD_GROUP: &str = "dw-f13-ovmf-vars-v1";
+const COM1_FD_GROUP: &str = "dw-e3a-com1-evidence-v1";
+const COM2_FD_GROUP: &str = "dw-e3a-com2-raw-v1";
 
 /// Producer-owned entry into the accepted native product builder. The
 /// request freezer consumes this snapshot together with its kernel/firmware
 /// inputs; callers cannot substitute a sixth normal role for the probe.
 pub(crate) fn build_product_snapshot(nonce: &str) -> Result<crate::wyr1c::E3ASnapshot, Failure> {
     crate::wyr1c::build_e3a_snapshot(nonce)
+}
+
+struct ProducedArtifacts {
+    directory: PathBuf,
+    deep_revision: String,
+    abi_revision: String,
+    abi_tree: String,
+    wyrmroot_revision: String,
+    rust_revision: String,
+}
+
+/// Builds and freezes the complete selector-31 E3A handoff without starting
+/// a VM. The output is a fresh, project-local directory containing immutable
+/// shared inputs and two non-aliasing profile-local mutable-vars templates.
+pub(crate) fn prepare(
+    output: &Path,
+    deep_repository: &Path,
+    deep_revision: &str,
+    nonce: &str,
+) -> Result<String, Failure> {
+    reject_selector_environment()?;
+    wyr1c6::validate_revision(deep_revision, "Deepwyrm revision")?;
+    wyr1c6::validate_upper_hex_nonzero(nonce, 16, "DW1-E3A evidence nonce")?;
+    if output.exists() {
+        return Err(Failure::task("DW1-E3A output must be a fresh path"));
+    }
+
+    let repository = tasks::repository_root()?;
+    let project = tasks::canonical_project_root(&repository)?;
+    let deep_repository = wyr1c6::canonical_deep_repository(deep_repository, &project)?;
+    let wyrmroot_revision = wyr1c6::clean_revision(&repository, "Wyrmroot")?;
+    wyr1c6::verify_clean_revision(&deep_repository, "Deepwyrm", deep_revision)?;
+    let manifest = crate::metadata::BuildManifest::load(&repository)?;
+    if manifest.rust_revision()? != wyr1c6::ACCEPTED_RUST_REVISION
+        || manifest.rust_toolchain_name()? != wyr1c6::ACCEPTED_TOOLCHAIN_NAME
+    {
+        return Err(Failure::task(
+            "DW1-E3A source metadata does not name the accepted Rust toolchain",
+        ));
+    }
+    let abi_revision = manifest.deepwyrm_revision()?.to_owned();
+    let abi_tree = wyr1c6::matching_abi_tree(&deep_repository, deep_revision, &abi_revision)?;
+    let output = wyr1c6::canonical_new_output(output, &project, &repository, &deep_repository)?;
+    let temporary = project.join(".tmp");
+    fs::create_dir_all(&temporary).map_err(|error| {
+        Failure::task(format!("could not create project temporary root: {error}"))
+    })?;
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Failure::task("system clock is before the Unix epoch"))?
+        .as_nanos();
+    let staging = temporary.join(format!("dw1e3a-producer-{}-{unique}", std::process::id()));
+    fs::create_dir(&staging).map_err(|error| {
+        Failure::task(format!(
+            "could not create DW1-E3A producer staging: {error}"
+        ))
+    })?;
+
+    let result = (|| {
+        let produced = build_produced_artifacts(
+            &staging,
+            &repository,
+            &deep_repository,
+            &wyrmroot_revision,
+            deep_revision,
+            &abi_revision,
+            &abi_tree,
+            nonce,
+        )?;
+        freeze_produced(&output, &produced, nonce, build_esp)
+    })();
+    if result.is_ok() {
+        fs::remove_dir_all(&staging)
+            .map_err(|error| Failure::task(format!("could not retire DW1-E3A staging: {error}")))?;
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_produced_artifacts(
+    staging: &Path,
+    repository: &Path,
+    deep_repository: &Path,
+    wyrmroot_revision: &str,
+    deep_revision: &str,
+    abi_revision: &str,
+    abi_tree: &str,
+    nonce: &str,
+) -> Result<ProducedArtifacts, Failure> {
+    let manifest = crate::metadata::BuildManifest::load(repository)?;
+    let profile = manifest.validate_loader_build_readiness(repository)?;
+    let layout = crate::deep_layout::prepare(
+        repository,
+        manifest.deepwyrm_repository()?,
+        manifest.deepwyrm_revision()?,
+    )?;
+    let toolchain = tasks::prepare_loader_toolchain(repository, &profile, &manifest)?;
+    let cargo_home = tasks::project_cargo_home(repository, &manifest)?;
+    if env::var_os("CARGO_HOME").as_deref() != Some(cargo_home.as_os_str()) {
+        return Err(Failure::task(
+            "DW1-E3A prepare requires the pinned launcher's exact CARGO_HOME",
+        ));
+    }
+    toolchain.accepted().verify_unchanged()?;
+    layout.verify_unchanged()?;
+    let build = staging.join("build");
+    fs::create_dir(&build).map_err(|error| {
+        Failure::task(format!("could not create DW1-E3A build directory: {error}"))
+    })?;
+    let uefi = tasks::build_deterministic_uefi_pair(
+        repository,
+        &toolchain,
+        &profile,
+        &layout,
+        &tasks::IsolatedUefiBuild {
+            cargo_home: &cargo_home,
+            production_target: &build.join("uefi-production"),
+            retained_debug_target: &build.join("uefi-retained-debug"),
+            cargo_profile: tasks::UefiCargoProfile::Release,
+        },
+    )?;
+    let build_directory = Directory::open_exact(&build, "DW1-E3A build directory")?;
+    let bootstrap = build_directory
+        .with_inheritable_anchor("DW1-E3A build directory", |anchor| {
+            build_bootstrap(repository, &toolchain, &layout, &cargo_home, anchor)
+        })?;
+    let snapshot = build_product_snapshot(nonce)?;
+    let kernel = build_kernel(deep_repository, nonce)?;
+    let boot_device_table = wyr1c6::boot_device_table();
+    let ovmf_code = wyr1c6::pinned_firmware(
+        wyr1c6::OVMF_CODE_PATH,
+        wyr1c6::OVMF_CODE_SHA256,
+        "OVMF code",
+    )?;
+    let ovmf_vars = wyr1c6::pinned_firmware(
+        wyr1c6::OVMF_VARS_PATH,
+        wyr1c6::OVMF_VARS_SHA256,
+        "OVMF vars",
+    )?;
+    let artifacts = staging.join("artifacts");
+    fs::create_dir(&artifacts)
+        .map_err(|error| Failure::task(format!("could not create DW1-E3A artifacts: {error}")))?;
+    let artifact = |name: &str| {
+        snapshot
+            .artifacts
+            .get(name)
+            .ok_or_else(|| Failure::task(format!("DW1-E3A builder omitted {name}")))
+    };
+    for (name, bytes) in [
+        ("loader.efi", &uefi.loader_bytes),
+        ("deepwyrm.elf", &kernel),
+        ("deepwyrm.symbols.elf", &kernel),
+        ("bootstrap.elf", &bootstrap),
+        ("system-init.elf", artifact("system-init")?),
+        ("registryd.elf", artifact("registryd")?),
+        ("devmgr.elf", artifact("devmgr")?),
+        ("uart16550d.elf", artifact("uart16550d")?),
+        ("consoled.elf", artifact("consoled")?),
+        ("wyrmsh.elf", artifact("wyrmsh")?),
+        ("dw1e3-com2-test.elf", artifact("dw1e3-com2-test")?),
+        ("rrc-e3a-v1.bin", &snapshot.rrc_manifest),
+        ("wrdm-e3a-v1.bin", &snapshot.device_manifest),
+        ("boot-device-table.bin", &boot_device_table),
+        ("bootfs.img", &snapshot.bootfs),
+        ("OVMF_CODE.fd", &ovmf_code),
+        ("OVMF_VARS.fd", &ovmf_vars),
+    ] {
+        wyr1c6::write_new(&artifacts.join(name), bytes, name)?;
+    }
+    let (challenge, response) = challenge_pair(nonce)?;
+    let receipt = render_source_receipt(
+        &manifest,
+        toolchain.accepted(),
+        deep_revision,
+        abi_revision,
+        abi_tree,
+        wyrmroot_revision,
+        nonce,
+        &challenge,
+        &response,
+        &artifacts,
+    )?;
+    wyr1c6::write_new(
+        &artifacts.join(SOURCE_RECEIPT),
+        receipt.as_bytes(),
+        "DW1-E3A source receipt",
+    )?;
+    toolchain.accepted().verify_unchanged()?;
+    layout.verify_unchanged()?;
+    wyr1c6::verify_clean_revision(repository, "Wyrmroot", wyrmroot_revision)?;
+    wyr1c6::verify_clean_revision(deep_repository, "Deepwyrm", deep_revision)?;
+    Ok(ProducedArtifacts {
+        directory: artifacts,
+        deep_revision: deep_revision.to_owned(),
+        abi_revision: abi_revision.to_owned(),
+        abi_tree: abi_tree.to_owned(),
+        wyrmroot_revision: wyrmroot_revision.to_owned(),
+        rust_revision: manifest.rust_revision()?.to_owned(),
+    })
 }
 
 pub(crate) const ARTIFACTS: &[(&str, &str)] = &[
@@ -113,9 +333,7 @@ pub(crate) const REQUEST_KEYS: &[&str] = &[
     "esp",
     "esp_sha256",
     "default_handoff",
-    "default_handoff_sha256",
     "smp_handoff",
-    "smp_handoff_sha256",
     "profile_pair",
     "receipt",
     "source_receipt",
@@ -163,39 +381,39 @@ pub(crate) const HANDOFF_KEYS: &[&str] = &[
     "readiness_marker",
     "challenge_hex",
     "expected_response_hex",
-    "loader",
+    "loader_path",
     "loader_sha256",
-    "kernel",
+    "kernel_path",
     "kernel_sha256",
-    "symbols",
+    "symbols_path",
     "symbols_sha256",
-    "bootstrap",
+    "bootstrap_path",
     "bootstrap_sha256",
-    "system_init",
+    "system_init_path",
     "system_init_sha256",
-    "registryd",
+    "registryd_path",
     "registryd_sha256",
-    "devmgr",
+    "devmgr_path",
     "devmgr_sha256",
-    "uart16550d",
+    "uart16550d_path",
     "uart16550d_sha256",
-    "consoled",
+    "consoled_path",
     "consoled_sha256",
-    "wyrmsh",
+    "wyrmsh_path",
     "wyrmsh_sha256",
-    "dw1e3_com2_test",
+    "dw1e3_com2_test_path",
     "dw1e3_com2_test_sha256",
-    "rrc_manifest",
+    "rrc_manifest_path",
     "rrc_manifest_sha256",
-    "device_manifest",
+    "device_manifest_path",
     "device_manifest_sha256",
-    "boot_device_table",
+    "boot_device_table_path",
     "boot_device_table_sha256",
-    "bootfs",
+    "bootfs_path",
     "bootfs_sha256",
-    "ovmf_code",
+    "ovmf_code_path",
     "ovmf_code_sha256",
-    "ovmf_vars",
+    "ovmf_vars_path",
     "ovmf_vars_sha256",
 ];
 
@@ -221,6 +439,751 @@ pub(crate) const PROFILE_PAIR_KEYS: &[&str] = &[
     "firmware",
     "timeout_seconds",
 ];
+
+const BUILD_RECEIPT_KEYS: &[&str] = &[
+    "kind",
+    "schema_version",
+    "request_sha256",
+    "selector",
+    "test_id",
+    "evidence_protocol",
+    "scenario",
+    "partial_evidence",
+    "acceptance_claim",
+    "physical_io",
+];
+
+const SOURCE_RECEIPT_KEYS: &[&str] = &[
+    "kind",
+    "schema_version",
+    "selector",
+    "test_id",
+    "evidence_protocol",
+    "deepwyrm_revision",
+    "generated_abi_revision",
+    "generated_abi_tree",
+    "wyrmroot_revision",
+    "evidence_nonce",
+    "challenge_sha256",
+    "response_sha256",
+    "rust_revision",
+    "rust_toolchain_name",
+    "rustc_sha256",
+    "cargo_sha256",
+    "rust_lld_sha256",
+    "toolchain_manifest_sha256",
+    "toolchain_tree_sha256",
+    "loader_command",
+    "kernel_command",
+    "bootstrap_features",
+    "system_init_features",
+    "registryd_features",
+    "devmgr_features",
+    "uart16550d_features",
+    "consoled_features",
+    "wyrmsh_features",
+    "dw1e3_com2_test_features",
+    "bootstrap_command",
+    "system_init_command",
+    "registryd_command",
+    "devmgr_command",
+    "uart16550d_command",
+    "consoled_command",
+    "wyrmsh_command",
+    "dw1e3_com2_test_command",
+    "loader_sha256",
+    "kernel_sha256",
+    "symbols_sha256",
+    "bootstrap_sha256",
+    "system_init_sha256",
+    "registryd_sha256",
+    "devmgr_sha256",
+    "uart16550d_sha256",
+    "consoled_sha256",
+    "wyrmsh_sha256",
+    "dw1e3_com2_test_sha256",
+    "rrc_manifest_sha256",
+    "device_manifest_sha256",
+    "boot_device_table_sha256",
+    "bootfs_sha256",
+    "ovmf_code_sha256",
+    "ovmf_vars_sha256",
+];
+
+fn build_bootstrap(
+    repository: &Path,
+    toolchain: &tasks::LoaderToolchain,
+    layout: &crate::deep_layout::DeepLayoutBuild,
+    cargo_home: &Path,
+    build: &InheritableDirectory,
+) -> Result<Vec<u8>, Failure> {
+    toolchain.accepted().verify_unchanged()?;
+    layout.verify_unchanged()?;
+    let target = build.path().join("bootstrap-native");
+    fs::create_dir(&target).map_err(|error| {
+        Failure::task(format!(
+            "could not create DW1-E3A bootstrap target: {error}"
+        ))
+    })?;
+    let source = fs::canonicalize(repository).map_err(|error| {
+        Failure::task(format!("could not resolve DW1-E3A source root: {error}"))
+    })?;
+    let cargo_home = fs::canonicalize(cargo_home)
+        .map_err(|error| Failure::task(format!("could not resolve DW1-E3A Cargo home: {error}")))?;
+    let target_identity = fs::canonicalize(&target).map_err(|error| {
+        Failure::task(format!(
+            "could not resolve DW1-E3A bootstrap target: {error}"
+        ))
+    })?;
+    let flags = [
+        format!("--remap-path-prefix={}=/source/wyrmroot", source.display()),
+        format!("--remap-path-prefix={}=/cargo-home", cargo_home.display()),
+        format!(
+            "--remap-path-prefix={}=/cargo-target",
+            target_identity.display()
+        ),
+    ]
+    .join("\u{1f}");
+    let status = Command::new(&toolchain.accepted().cargo)
+        .args([
+            "build",
+            "--offline",
+            "--locked",
+            "--release",
+            "--target",
+            NATIVE_TARGET,
+            "--package",
+            "wyrmroot-bootstrap",
+            "--bin",
+            "wyrmroot-bootstrap",
+            "--features",
+            "wyr1c5-production",
+        ])
+        .arg("--target-dir")
+        .arg(&target)
+        .env("RUSTC", &toolchain.accepted().rustc)
+        .env("CARGO_HOME", &cargo_home)
+        .env("CARGO_ENCODED_RUSTFLAGS", flags)
+        .env("CARGO_INCREMENTAL", "0")
+        .env("CARGO_NET_OFFLINE", "true")
+        .env("SOURCE_DATE_EPOCH", "0")
+        .env_remove("LD_AUDIT")
+        .env_remove("LD_LIBRARY_PATH")
+        .env_remove("LD_PRELOAD")
+        .current_dir(repository)
+        .stdin(Stdio::null())
+        .status()
+        .map_err(|error| Failure::task(format!("could not build DW1-E3A bootstrap: {error}")))?;
+    if !status.success() {
+        return Err(Failure::task("DW1-E3A native bootstrap build failed"));
+    }
+    let relative = PathBuf::from("bootstrap-native")
+        .join(NATIVE_TARGET)
+        .join("release")
+        .join("wyrmroot-bootstrap");
+    let bytes = build.read_producer(&relative, wyr1c6::MAX_ARTIFACT_BYTES, "bootstrap")?;
+    build.with_inheritance_disabled("DW1-E3A build directory", || {
+        crate::wyr1c::inspect_native_bytes(
+            repository,
+            &bytes,
+            &sha256::bytes_digest(&bytes),
+            "bootstrap",
+        )
+    })?;
+    toolchain.accepted().verify_unchanged()?;
+    layout.verify_unchanged()?;
+    Ok(bytes)
+}
+
+fn build_kernel(repository: &Path, nonce: &str) -> Result<Vec<u8>, Failure> {
+    let repository = Directory::open_exact(repository, "Deepwyrm source root")?;
+    let temporary = match repository.open_child(".tmp", "Deepwyrm temporary root") {
+        Ok(directory) => directory,
+        Err(_) => repository.create_child(".tmp", 0o700, "Deepwyrm temporary root")?,
+    };
+    temporary.verify_owned_container_path("Deepwyrm temporary root")?;
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Failure::task("system clock is before the Unix epoch"))?
+        .as_nanos();
+    let scratch = temporary.create_scratch(
+        &format!("dw1e3a-kernel-{}-{unique}", std::process::id()),
+        "DW1-E3A Deepwyrm target",
+    )?;
+    let result = (|| {
+        let status = Command::new(repository.path().join("tools/pinned-cargo"))
+            .arg("target")
+            .args([
+                "build",
+                "--locked",
+                "--offline",
+                "--release",
+                "--target",
+                KERNEL_TARGET,
+                "--package",
+                "deepwyrm-kernel",
+                "--bin",
+                "deepwyrm-kernel",
+                "--features",
+                "test-support",
+            ])
+            .env("DEEPWYRM_PINNED_TARGET_DIR", scratch.path())
+            .env("DEEPWYRM_GUEST_TEST_SELECTOR", SELECTOR)
+            .env("DEEPWYRM_DW1E_EVIDENCE_NONCE", nonce)
+            .env_remove("CARGO_HOME")
+            .env_remove("LD_AUDIT")
+            .env_remove("LD_LIBRARY_PATH")
+            .env_remove("LD_PRELOAD")
+            .current_dir(repository.path())
+            .stdin(Stdio::null())
+            .status()
+            .map_err(|error| Failure::task(format!("could not build DW1-E3A kernel: {error}")))?;
+        if !status.success() {
+            return Err(Failure::task(
+                "DW1-E3A selector-31 Deepwyrm kernel build failed",
+            ));
+        }
+        scratch.read_producer(
+            &PathBuf::from(KERNEL_TARGET).join("release/deepwyrm-kernel"),
+            wyr1c6::MAX_ARTIFACT_BYTES,
+            "selector-31 kernel",
+        )
+    })();
+    scratch.finish(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_source_receipt(
+    manifest: &crate::metadata::BuildManifest,
+    toolchain: &crate::toolchain_artifact::AcceptedToolchain,
+    deep_revision: &str,
+    abi_revision: &str,
+    abi_tree: &str,
+    wyrmroot_revision: &str,
+    nonce: &str,
+    challenge: &[u8],
+    response: &[u8],
+    artifacts: &Path,
+) -> Result<String, Failure> {
+    let mut values = BTreeMap::new();
+    for (key, value) in [
+        ("kind", SOURCE_RECEIPT_KIND.to_owned()),
+        ("schema_version", "1".to_owned()),
+        ("selector", SELECTOR.to_owned()),
+        ("test_id", TEST_ID.to_owned()),
+        ("evidence_protocol", EVIDENCE_PROTOCOL.to_owned()),
+        ("deepwyrm_revision", deep_revision.to_owned()),
+        ("generated_abi_revision", abi_revision.to_owned()),
+        ("generated_abi_tree", abi_tree.to_owned()),
+        ("wyrmroot_revision", wyrmroot_revision.to_owned()),
+        ("evidence_nonce", nonce.to_owned()),
+        ("challenge_sha256", sha256::bytes_digest(challenge)),
+        ("response_sha256", sha256::bytes_digest(response)),
+        ("rust_revision", manifest.rust_revision()?.to_owned()),
+        (
+            "rust_toolchain_name",
+            manifest.rust_toolchain_name()?.to_owned(),
+        ),
+        (
+            "rustc_sha256",
+            sha256::file_digest(&toolchain.rustc).map_err(|error| {
+                Failure::task(format!("could not hash accepted rustc: {error}"))
+            })?,
+        ),
+        ("cargo_sha256", toolchain.cargo_sha256.clone()),
+        ("rust_lld_sha256", toolchain.rust_lld_sha256.clone()),
+        (
+            "toolchain_manifest_sha256",
+            toolchain.manifest_sha256.clone(),
+        ),
+        (
+            "toolchain_tree_sha256",
+            toolchain.toolchain_tree_sha256.clone(),
+        ),
+        (
+            "loader_command",
+            "accepted-cargo UEFI loader pair".to_owned(),
+        ),
+        (
+            "kernel_command",
+            "pinned-cargo selector31 ff1f DWE3E1".to_owned(),
+        ),
+        ("bootstrap_features", "wyr1c5-production".to_owned()),
+        ("system_init_features", "dw1e3-selector31".to_owned()),
+        ("registryd_features", "native-registryd".to_owned()),
+        ("devmgr_features", "dw1e3-selector31".to_owned()),
+        ("uart16550d_features", "dw1e3-selector31".to_owned()),
+        ("consoled_features", "native-retained".to_owned()),
+        ("wyrmsh_features", "native-retained".to_owned()),
+        ("dw1e3_com2_test_features", "native-probe".to_owned()),
+        (
+            "bootstrap_command",
+            "accepted-cargo native bootstrap".to_owned(),
+        ),
+        (
+            "system_init_command",
+            "accepted-cargo native system-init".to_owned(),
+        ),
+        (
+            "registryd_command",
+            "accepted-cargo native registryd".to_owned(),
+        ),
+        ("devmgr_command", "accepted-cargo native devmgr".to_owned()),
+        (
+            "uart16550d_command",
+            "accepted-cargo native uart16550d".to_owned(),
+        ),
+        (
+            "consoled_command",
+            "accepted-cargo native consoled".to_owned(),
+        ),
+        ("wyrmsh_command", "accepted-cargo native wyrmsh".to_owned()),
+        (
+            "dw1e3_com2_test_command",
+            "accepted-cargo native dw1e3-com2-test".to_owned(),
+        ),
+    ] {
+        values.insert(key.to_owned(), value);
+    }
+    for (key, name) in ARTIFACTS {
+        values.insert(
+            format!("{key}_sha256"),
+            sha256::bytes_digest(&wyr1c6::read_regular_bounded(
+                &artifacts.join(name),
+                artifact_maximum(key),
+                key,
+            )?),
+        );
+    }
+    render(&values, SOURCE_RECEIPT_KEYS)
+}
+
+fn freeze_produced(
+    output: &Path,
+    produced: &ProducedArtifacts,
+    nonce: &str,
+    esp_builder: impl FnOnce(&Path, &BTreeMap<String, String>) -> Result<(), Failure>,
+) -> Result<String, Failure> {
+    if output.exists() {
+        return Err(Failure::task("DW1-E3A output must be a fresh path"));
+    }
+    fs::create_dir(output)
+        .map_err(|error| Failure::task(format!("could not create DW1-E3A output: {error}")))?;
+    let frozen = output.join("artifacts");
+    fs::create_dir(&frozen).map_err(|error| {
+        Failure::task(format!(
+            "could not create DW1-E3A frozen artifacts: {error}"
+        ))
+    })?;
+    let mut values = BTreeMap::new();
+    let source = wyr1c6::read_regular_bounded(
+        &produced.directory.join(SOURCE_RECEIPT),
+        64 * 1024,
+        "DW1-E3A source receipt",
+    )?;
+    wyr1c6::write_new(
+        &frozen.join(SOURCE_RECEIPT),
+        &source,
+        "DW1-E3A source receipt",
+    )?;
+    values.insert(
+        "source_receipt".into(),
+        format!("artifacts/{SOURCE_RECEIPT}"),
+    );
+    values.insert(
+        "source_receipt_sha256".into(),
+        sha256::bytes_digest(&source),
+    );
+    for (key, name) in ARTIFACTS {
+        let bytes = wyr1c6::read_regular_bounded(
+            &produced.directory.join(name),
+            artifact_maximum(key),
+            key,
+        )?;
+        wyr1c6::write_new(&frozen.join(name), &bytes, key)?;
+        values.insert((*key).to_owned(), format!("artifacts/{name}"));
+        values.insert(format!("{key}_sha256"), sha256::bytes_digest(&bytes));
+    }
+    esp_builder(output, &values)?;
+    let esp = frozen.join("selector31-esp.img");
+    wyr1c6::seal_mode(&esp, 0o444, "DW1-E3A ESP")?;
+    values.insert("esp".into(), "artifacts/selector31-esp.img".into());
+    values.insert(
+        "esp_sha256".into(),
+        sha256::bytes_digest(&wyr1c6::read_regular_bounded(
+            &esp,
+            g3_image::IMAGE_BYTES,
+            "DW1-E3A ESP",
+        )?),
+    );
+    let (challenge, response) = challenge_pair(nonce)?;
+    for (key, value) in [
+        ("kind", REQUEST_KIND.to_owned()),
+        ("schema_version", "1".to_owned()),
+        ("selector", SELECTOR.to_owned()),
+        ("test_id", TEST_ID.to_owned()),
+        ("profile", "dw1e3a-selector31".to_owned()),
+        ("scenario", "one-production-raw-com2-round-trip".to_owned()),
+        ("evidence_protocol", EVIDENCE_PROTOCOL.to_owned()),
+        ("partial_evidence", "true".to_owned()),
+        ("acceptance_claim", ACCEPTANCE_CLAIM.to_owned()),
+        ("readiness_marker", READINESS_MARKER.to_owned()),
+        ("deepwyrm_revision", produced.deep_revision.clone()),
+        ("generated_abi_revision", produced.abi_revision.clone()),
+        ("generated_abi_tree", produced.abi_tree.clone()),
+        ("wyrmroot_revision", produced.wyrmroot_revision.clone()),
+        ("rust_revision", produced.rust_revision.clone()),
+        ("evidence_nonce", nonce.to_owned()),
+        ("challenge_hex", upper_hex(&challenge)),
+        ("challenge_length", challenge.len().to_string()),
+        ("challenge_fnv1a64", format!("{:016X}", fnv1a64(&challenge))),
+        ("challenge_sha256", sha256::bytes_digest(&challenge)),
+        ("response_hex", upper_hex(&response)),
+        ("response_length", response.len().to_string()),
+        ("response_fnv1a64", format!("{:016X}", fnv1a64(&response))),
+        ("response_sha256", sha256::bytes_digest(&response)),
+        ("default_handoff", "default/handoff.toml".to_owned()),
+        ("smp_handoff", "smp/handoff.toml".to_owned()),
+        ("profile_pair", "profile-pair.toml".to_owned()),
+        ("receipt", "build-receipt.toml".to_owned()),
+    ] {
+        values.insert(key.to_owned(), value);
+    }
+    let request_text = render_request(&values)?;
+    let request_path = output.join("request.toml");
+    wyr1c6::write_new(&request_path, request_text.as_bytes(), "DW1-E3A request")?;
+    let request_sha256 = sha256::bytes_digest(request_text.as_bytes());
+    for (profile, vcpus) in [("default", 1_u8), ("smp", 4)] {
+        stage_profile(output, profile, vcpus, &request_sha256, &values)?;
+    }
+    write_profile_pair(output, &request_sha256)?;
+    let mut receipt = BTreeMap::new();
+    for (key, value) in [
+        ("kind", RECEIPT_KIND),
+        ("schema_version", "1"),
+        ("request_sha256", request_sha256.as_str()),
+        ("selector", SELECTOR),
+        ("test_id", TEST_ID),
+        ("evidence_protocol", EVIDENCE_PROTOCOL),
+        ("scenario", "one-production-raw-com2-round-trip"),
+        ("partial_evidence", "true"),
+        ("acceptance_claim", ACCEPTANCE_CLAIM),
+        ("physical_io", "real-com2-irq3-intended"),
+    ] {
+        receipt.insert(key.to_owned(), value.to_owned());
+    }
+    wyr1c6::write_new(
+        &output.join("build-receipt.toml"),
+        render(&receipt, BUILD_RECEIPT_KEYS)?.as_bytes(),
+        "DW1-E3A build receipt",
+    )?;
+    validate_frozen_output(output, &values, &request_sha256)?;
+    Ok(format!(
+        "DW1_E3A_PREPARE_PASS selector={SELECTOR} test_id={TEST_ID} evidence={EVIDENCE_PROTOCOL} request={} default_handoff={} smp_handoff={} profile_pair={} partial_evidence=true acceptance_claim={ACCEPTANCE_CLAIM}\n",
+        request_path.display(),
+        output.join("default/handoff.toml").display(),
+        output.join("smp/handoff.toml").display(),
+        output.join("profile-pair.toml").display(),
+    ))
+}
+
+fn build_esp(output: &Path, values: &BTreeMap<String, String>) -> Result<(), Failure> {
+    let frozen = output.join("artifacts");
+    let arguments = G3ImageArguments {
+        image: frozen.join("selector31-esp.img").display().to_string(),
+        loader: output.join(value(values, "loader")?).display().to_string(),
+        kernel: output.join(value(values, "kernel")?).display().to_string(),
+        bootstrap: output
+            .join(value(values, "bootstrap")?)
+            .display()
+            .to_string(),
+        bootfs: output.join(value(values, "bootfs")?).display().to_string(),
+    };
+    g3_image::build_d6(
+        &arguments,
+        &output
+            .join(value(values, "boot_device_table")?)
+            .display()
+            .to_string(),
+    )?;
+    Ok(())
+}
+
+fn stage_profile(
+    output: &Path,
+    profile: &str,
+    vcpus: u8,
+    request_sha256: &str,
+    request: &BTreeMap<String, String>,
+) -> Result<(), Failure> {
+    let directory = output.join(profile);
+    fs::create_dir(&directory).map_err(|error| {
+        Failure::task(format!(
+            "could not create DW1-E3A {profile} profile: {error}"
+        ))
+    })?;
+    let vars = wyr1c6::read_regular_bounded(
+        &output.join(value(request, "ovmf_vars")?),
+        wyr1c6::MAX_FIRMWARE_BYTES,
+        "DW1-E3A OVMF vars template",
+    )?;
+    let vars_path = directory.join("OVMF_VARS.mutable.fd");
+    wyr1c6::write_new_mode(&vars_path, &vars, 0o600, "DW1-E3A mutable OVMF vars")?;
+    let absolute = fs::canonicalize(output)
+        .map_err(|error| Failure::task(format!("could not resolve DW1-E3A output: {error}")))?;
+    let xml = domain_xml(
+        vcpus,
+        &absolute.join(value(request, "ovmf_code")?),
+        &absolute.join(value(request, "esp")?),
+        &absolute.join(profile).join("OVMF_VARS.mutable.fd"),
+        &absolute.join(profile).join("com2.sock"),
+    );
+    let xml_path = directory.join("domain.xml");
+    wyr1c6::write_new(&xml_path, xml.as_bytes(), "DW1-E3A domain XML")?;
+    let xml_sha256 = sha256::bytes_digest(xml.as_bytes());
+    let vars_sha256 = sha256::bytes_digest(&vars);
+    let mut fields = BTreeMap::new();
+    for (key, field) in [
+        ("kind", HANDOFF_KIND),
+        ("schema_version", "1"),
+        ("profile", profile),
+        ("selector", SELECTOR),
+        ("test_id", TEST_ID),
+        ("evidence_protocol", EVIDENCE_PROTOCOL),
+        ("partial_evidence", "true"),
+        ("acceptance_claim", ACCEPTANCE_CLAIM),
+        ("request", "request.toml"),
+        ("request_sha256", request_sha256),
+        ("esp", value(request, "esp")?),
+        ("esp_sha256", value(request, "esp_sha256")?),
+        ("vcpus", if vcpus == 1 { "1" } else { "4" }),
+        ("memory_mib", "2048"),
+        ("machine", MACHINE),
+        ("firmware", "OVMF"),
+        ("timeout_seconds", TIMEOUT_SECONDS),
+        ("scenario", "one-production-raw-com2-round-trip"),
+        ("physical_io", "real-com2-irq3-intended"),
+        ("terminal_authority", "deepwyrm-selector31-partial-only"),
+        ("com1_role", "trusted-evidence-and-readiness"),
+        ("com2_role", "raw-challenge-response"),
+        ("com2_transport", "unix-socket-byte-stream"),
+        ("com1_fd_group", COM1_FD_GROUP),
+        ("com2_fd_group", COM2_FD_GROUP),
+        ("esp_fd_group", ESP_FD_GROUP),
+        ("vars_fd_group", VARS_FD_GROUP),
+        ("domain_xml", &format!("{profile}/domain.xml")),
+        ("domain_xml_sha256", &xml_sha256),
+        (
+            "mutable_ovmf_vars",
+            &format!("{profile}/OVMF_VARS.mutable.fd"),
+        ),
+        ("mutable_ovmf_vars_initial_sha256", &vars_sha256),
+        ("com2_socket", &format!("{profile}/com2.sock")),
+        ("com1_serial_log", &format!("{profile}/com1.log")),
+        ("com2_log", &format!("{profile}/com2.bin")),
+        (
+            "partial_evidence_log",
+            &format!("{profile}/partial-evidence.log"),
+        ),
+        ("result_path", &format!("{profile}/result.toml")),
+        (
+            "absent_receipt",
+            &format!("{profile}/acceptance-receipt.toml"),
+        ),
+        ("readiness_marker", READINESS_MARKER),
+        ("challenge_hex", value(request, "challenge_hex")?),
+        ("expected_response_hex", value(request, "response_hex")?),
+    ] {
+        fields.insert(key.to_owned(), field.to_owned());
+    }
+    for (key, _) in ARTIFACTS {
+        fields.insert(format!("{key}_path"), value(request, key)?.to_owned());
+        fields.insert(
+            format!("{key}_sha256"),
+            value(request, &format!("{key}_sha256"))?.to_owned(),
+        );
+    }
+    let handoff = render_handoff(&fields)?;
+    wyr1c6::write_new(
+        &directory.join("handoff.toml"),
+        handoff.as_bytes(),
+        "DW1-E3A handoff",
+    )
+}
+
+fn write_profile_pair(output: &Path, request_sha256: &str) -> Result<(), Failure> {
+    let mut fields = BTreeMap::new();
+    for (key, field) in [
+        ("kind", PROFILE_PAIR_KIND),
+        ("schema_version", "1"),
+        ("selector", SELECTOR),
+        ("test_id", TEST_ID),
+        ("evidence_protocol", EVIDENCE_PROTOCOL),
+        ("partial_evidence", "true"),
+        ("acceptance_claim", ACCEPTANCE_CLAIM),
+        ("request", "request.toml"),
+        ("request_sha256", request_sha256),
+        ("profiles", "default,smp"),
+        ("default_handoff", "default/handoff.toml"),
+        ("default_vcpus", "1"),
+        ("smp_handoff", "smp/handoff.toml"),
+        ("smp_vcpus", "4"),
+        ("memory_mib", "2048"),
+        ("machine", MACHINE),
+        ("firmware", "OVMF"),
+        ("timeout_seconds", TIMEOUT_SECONDS),
+    ] {
+        fields.insert(key.to_owned(), field.to_owned());
+    }
+    for (key, path) in [
+        (
+            "default_handoff_sha256",
+            output.join("default/handoff.toml"),
+        ),
+        ("smp_handoff_sha256", output.join("smp/handoff.toml")),
+    ] {
+        fields.insert(
+            key.to_owned(),
+            sha256::bytes_digest(&wyr1c6::read_regular_bounded(
+                &path,
+                64 * 1024,
+                "DW1-E3A handoff",
+            )?),
+        );
+    }
+    wyr1c6::write_new(
+        &output.join("profile-pair.toml"),
+        render_profile_pair(&fields)?.as_bytes(),
+        "DW1-E3A profile pair",
+    )
+}
+
+fn domain_xml(vcpus: u8, code: &Path, esp: &Path, vars: &Path, com2: &Path) -> String {
+    format!(
+        "<domain xmlns:qemu=\"http://libvirt.org/schemas/domain/qemu/1.0\" type=\"qemu\">\n  <name>OS-Project</name>\n  <uuid>{DOMAIN_UUID}</uuid>\n  <memory unit=\"KiB\">2097152</memory><currentMemory unit=\"KiB\">2097152</currentMemory><vcpu placement=\"static\">{vcpus}</vcpu>\n  <sysinfo type=\"fwcfg\"><entry name=\"opt/org.deepwyrm.test.selector\">{SELECTOR}</entry><entry name=\"opt/org.deepwyrm.test.test_id\">{TEST_ID}</entry></sysinfo>\n  <os><type arch=\"x86_64\" machine=\"{MACHINE}\">hvm</type><loader readonly=\"yes\" secure=\"no\" type=\"pflash\" format=\"raw\">{}</loader><nvram type=\"file\" format=\"raw\"><source file=\"{}\" fdgroup=\"{VARS_FD_GROUP}\"/></nvram><boot dev=\"hd\"/></os>\n  <features><acpi/><apic/></features><clock offset=\"utc\"><timer name=\"rtc\" tickpolicy=\"catchup\"/><timer name=\"pit\" tickpolicy=\"delay\"/><timer name=\"hpet\" present=\"no\"/></clock><on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>destroy</on_crash><pm><suspend-to-mem enabled=\"no\"/><suspend-to-disk enabled=\"no\"/></pm><devices><emulator>/usr/bin/qemu-system-x86_64</emulator><disk type=\"file\" device=\"disk\"><driver name=\"qemu\" type=\"raw\"/><source file=\"{}\" fdgroup=\"{ESP_FD_GROUP}\"/><target dev=\"vda\" bus=\"virtio\"/><readonly/></disk><controller type=\"pci\" index=\"0\" model=\"pcie-root\"/><serial type=\"pty\"><target type=\"isa-serial\" port=\"0\"/></serial><serial type=\"unix\"><source mode=\"bind\" path=\"{}\"/><target type=\"isa-serial\" port=\"1\"/></serial><console type=\"pty\"><target type=\"serial\" port=\"0\"/></console></devices>\n  <qemu:commandline><qemu:arg value=\"-device\"/><qemu:arg value=\"isa-debug-exit,iobase=0xf4,iosize=0x04\"/></qemu:commandline>\n</domain>\n",
+        xml_escape(code),
+        xml_escape(vars),
+        xml_escape(esp),
+        xml_escape(com2),
+    )
+}
+
+fn xml_escape(path: &Path) -> String {
+    path.display()
+        .to_string()
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn challenge_pair(nonce: &str) -> Result<([u8; 24], [u8; 24]), Failure> {
+    wyr1c6::validate_upper_hex_nonzero(nonce, 16, "DW1-E3A evidence nonce")?;
+    let number = u64::from_str_radix(nonce, 16)
+        .map_err(|_| Failure::task("DW1-E3A evidence nonce is invalid"))?;
+    let mut challenge = [0u8; 24];
+    challenge[..8].copy_from_slice(b"\r\n\0\x7fDW1E");
+    challenge[8..16].copy_from_slice(&number.to_le_bytes());
+    challenge[16..24].copy_from_slice(&number.rotate_left(17).to_le_bytes());
+    let mut response = [0u8; 24];
+    for (index, byte) in response.iter_mut().enumerate() {
+        *byte = challenge[23 - index] ^ 0xa5u8.wrapping_add(index as u8);
+    }
+    Ok((challenge, response))
+}
+
+fn upper_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        output.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
+const fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325;
+    let mut index = 0;
+    while index < bytes.len() {
+        hash ^= bytes[index] as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        index += 1;
+    }
+    hash
+}
+
+fn artifact_maximum(key: &str) -> u64 {
+    if matches!(key, "ovmf_code" | "ovmf_vars") {
+        wyr1c6::MAX_FIRMWARE_BYTES
+    } else if key == "bootfs" {
+        g3_image::IMAGE_BYTES
+    } else {
+        wyr1c6::MAX_ARTIFACT_BYTES
+    }
+}
+
+fn reject_selector_environment() -> Result<(), Failure> {
+    for key in [
+        "DEEPWYRM_GUEST_TEST_SELECTOR",
+        "DEEPWYRM_GUEST_TEST_ID",
+        "DEEPWYRM_DW1E_EVIDENCE_NONCE",
+        "CARGO_TARGET_DIR",
+    ] {
+        if env::var_os(key).is_some() {
+            return Err(Failure::task(format!(
+                "DW1-E3A prepare refuses ambient {key}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_frozen_output(
+    output: &Path,
+    request: &BTreeMap<String, String>,
+    request_sha256: &str,
+) -> Result<(), Failure> {
+    for (key, name) in ARTIFACTS {
+        let path = output.join(value(request, key)?);
+        let bytes = wyr1c6::read_regular_bounded(&path, artifact_maximum(key), key)?;
+        if sha256::bytes_digest(&bytes) != value(request, &format!("{key}_sha256"))?
+            || path.file_name().and_then(|name| name.to_str()) != Some(name)
+        {
+            return Err(Failure::task(format!(
+                "DW1-E3A frozen {key} identity drifted"
+            )));
+        }
+    }
+    for profile in ["default", "smp"] {
+        let bytes = wyr1c6::read_regular_bounded(
+            &output.join(profile).join("handoff.toml"),
+            64 * 1024,
+            "DW1-E3A handoff",
+        )?;
+        let text =
+            String::from_utf8(bytes).map_err(|_| Failure::task("DW1-E3A handoff is not UTF-8"))?;
+        if !text.contains(&format!("request_sha256 = \"{request_sha256}\""))
+            || text.contains("DWTEST1")
+        {
+            return Err(Failure::task("DW1-E3A handoff join drifted"));
+        }
+        for absent in [
+            "com2.sock",
+            "com1.log",
+            "com2.bin",
+            "partial-evidence.log",
+            "result.toml",
+            "acceptance-receipt.toml",
+        ] {
+            if output.join(profile).join(absent).exists() {
+                return Err(Failure::task("DW1-E3A runtime output exists before VM run"));
+            }
+        }
+    }
+    Ok(())
+}
 
 pub(crate) fn render_request(values: &BTreeMap<String, String>) -> Result<String, Failure> {
     require(values, "kind", REQUEST_KIND)?;
@@ -278,6 +1241,11 @@ pub(crate) fn render_handoff(values: &BTreeMap<String, String>) -> Result<String
         ("com2_fd_group", "dw-e3a-com2-raw-v1"),
         ("esp_fd_group", "dw-f13-esp-v1"),
         ("vars_fd_group", "dw-f13-ovmf-vars-v1"),
+        ("readiness_marker", READINESS_MARKER),
+    ] {
+        require(values, key, expected)?;
+    }
+    for (key, name) in [
         ("domain_xml", "domain.xml"),
         ("mutable_ovmf_vars", "OVMF_VARS.mutable.fd"),
         ("com2_socket", "com2.sock"),
@@ -286,12 +1254,21 @@ pub(crate) fn render_handoff(values: &BTreeMap<String, String>) -> Result<String
         ("partial_evidence_log", "partial-evidence.log"),
         ("result_path", "result.toml"),
         ("absent_receipt", "acceptance-receipt.toml"),
-        ("readiness_marker", READINESS_MARKER),
     ] {
-        require(values, key, expected)?;
+        require(values, key, &format!("{profile}/{name}"))?;
     }
     reject_terminal(values)?;
-    render(values, HANDOFF_KEYS)
+    render_with_integers(
+        values,
+        HANDOFF_KEYS,
+        &[
+            "schema_version",
+            "test_id",
+            "vcpus",
+            "memory_mib",
+            "timeout_seconds",
+        ],
+    )
 }
 
 pub(crate) fn render_profile_pair(values: &BTreeMap<String, String>) -> Result<String, Failure> {
@@ -316,7 +1293,18 @@ pub(crate) fn render_profile_pair(values: &BTreeMap<String, String>) -> Result<S
         require(values, key, expected)?;
     }
     reject_terminal(values)?;
-    render(values, PROFILE_PAIR_KEYS)
+    render_with_integers(
+        values,
+        PROFILE_PAIR_KEYS,
+        &[
+            "schema_version",
+            "test_id",
+            "default_vcpus",
+            "smp_vcpus",
+            "memory_mib",
+            "timeout_seconds",
+        ],
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -399,20 +1387,45 @@ fn reject_terminal(values: &BTreeMap<String, String>) -> Result<(), Failure> {
 }
 
 fn render(values: &BTreeMap<String, String>, keys: &[&str]) -> Result<String, Failure> {
+    render_with_integers(values, keys, &[])
+}
+
+fn render_with_integers(
+    values: &BTreeMap<String, String>,
+    keys: &[&str],
+    integer_keys: &[&str],
+) -> Result<String, Failure> {
     let expected: BTreeSet<_> = keys.iter().copied().collect();
     let actual: BTreeSet<_> = values.keys().map(String::as_str).collect();
     if actual != expected {
-        return Err(Failure::task("DW1-E3A schema key set drifted"));
+        let missing = expected.difference(&actual).copied().collect::<Vec<_>>();
+        let extra = actual.difference(&expected).copied().collect::<Vec<_>>();
+        return Err(Failure::task(format!(
+            "DW1-E3A schema key set drifted: missing={missing:?} extra={extra:?}"
+        )));
     }
     let mut output = String::new();
     for key in keys {
-        let escaped = value(values, key)?
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"");
+        let value = value(values, key)?;
         output.push_str(key);
-        output.push_str(" = \"");
-        output.push_str(&escaped);
-        output.push_str("\"\n");
+        output.push_str(" = ");
+        if integer_keys.contains(key) {
+            if value.is_empty()
+                || !value.bytes().all(|byte| byte.is_ascii_digit())
+                || (value.len() != 1 && value.starts_with('0'))
+            {
+                return Err(Failure::task(format!(
+                    "DW1-E3A {key} is not a canonical integer"
+                )));
+            }
+            output.push_str(value);
+            output.push('\n');
+        } else {
+            let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+            output.push('"');
+            output.push_str(&escaped);
+            output.push_str("\"\n");
+        }
     }
     Ok(output)
 }
@@ -460,6 +1473,8 @@ const fn fnv1a32(bytes: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
 
     fn values(keys: &[&str]) -> BTreeMap<String, String> {
@@ -542,6 +1557,8 @@ mod tests {
         let rendered = render_request(&fixed_request()).unwrap();
         assert!(rendered.contains("challenge_sha256"));
         assert!(rendered.contains("response_sha256"));
+        assert!(!rendered.contains("default_handoff_sha256"));
+        assert!(!rendered.contains("smp_handoff_sha256"));
         assert!(!rendered.contains("DWTEST1"));
         let mut extra = fixed_request();
         extra.insert("terminal".into(), "pass".into());
@@ -576,14 +1593,23 @@ mod tests {
                 ("com2_fd_group", "dw-e3a-com2-raw-v1"),
                 ("esp_fd_group", "dw-f13-esp-v1"),
                 ("vars_fd_group", "dw-f13-ovmf-vars-v1"),
-                ("domain_xml", "domain.xml"),
-                ("mutable_ovmf_vars", "OVMF_VARS.mutable.fd"),
-                ("com2_socket", "com2.sock"),
-                ("com1_serial_log", "com1.log"),
-                ("com2_log", "com2.bin"),
-                ("partial_evidence_log", "partial-evidence.log"),
-                ("result_path", "result.toml"),
-                ("absent_receipt", "acceptance-receipt.toml"),
+                ("domain_xml", &format!("{profile}/domain.xml")),
+                (
+                    "mutable_ovmf_vars",
+                    &format!("{profile}/OVMF_VARS.mutable.fd"),
+                ),
+                ("com2_socket", &format!("{profile}/com2.sock")),
+                ("com1_serial_log", &format!("{profile}/com1.log")),
+                ("com2_log", &format!("{profile}/com2.bin")),
+                (
+                    "partial_evidence_log",
+                    &format!("{profile}/partial-evidence.log"),
+                ),
+                ("result_path", &format!("{profile}/result.toml")),
+                (
+                    "absent_receipt",
+                    &format!("{profile}/acceptance-receipt.toml"),
+                ),
                 ("readiness_marker", READINESS_MARKER),
             ] {
                 map.insert(key.into(), value.into());
@@ -646,5 +1672,86 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn dispatched_prepare_freezes_exact_acyclic_partial_output() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "wyrmroot-dw1e3a-freezer-test-{}-{unique}",
+            std::process::id()
+        ));
+        let produced_root = root.join("produced");
+        let output = root.join("output");
+        fs::create_dir_all(&produced_root).unwrap();
+        for (_, name) in ARTIFACTS {
+            wyr1c6::write_new(&produced_root.join(name), name.as_bytes(), name).unwrap();
+        }
+        wyr1c6::write_new(
+            &produced_root.join(SOURCE_RECEIPT),
+            b"source-receipt\n",
+            "source receipt",
+        )
+        .unwrap();
+        let produced = ProducedArtifacts {
+            directory: produced_root,
+            deep_revision: "1".repeat(40),
+            abi_revision: "2".repeat(40),
+            abi_tree: "3".repeat(40),
+            wyrmroot_revision: "4".repeat(40),
+            rust_revision: "5".repeat(40),
+        };
+        let action = crate::cli::dispatch(&[
+            "dw1-e3a-prepare".into(),
+            output.display().to_string(),
+            "/deepwyrm".into(),
+            "1".repeat(40),
+            "E300000000000001".into(),
+        ])
+        .unwrap();
+        assert!(matches!(action, crate::cli::Action::Dw1E3APrepare { .. }));
+        let result = freeze_produced(&output, &produced, "E300000000000001", |output, _| {
+            wyr1c6::write_new(
+                &output.join("artifacts/selector31-esp.img"),
+                b"synthetic-esp",
+                "synthetic ESP",
+            )
+        })
+        .unwrap();
+        assert!(result.starts_with(
+            "DW1_E3A_PREPARE_PASS selector=q35-com2-interrupt test_id=31 evidence=DWE3E1"
+        ));
+        let request = fs::read_to_string(output.join("request.toml")).unwrap();
+        assert!(request.contains("selector = \"q35-com2-interrupt\""));
+        assert!(!request.contains("default_handoff_sha256"));
+        assert!(!request.contains("smp_handoff_sha256"));
+        assert!(!request.contains("profile_pair_sha256"));
+        assert!(!request.contains("DWTEST1"));
+        let request_hash = sha256::bytes_digest(request.as_bytes());
+        for profile in ["default", "smp"] {
+            let handoff = fs::read_to_string(output.join(profile).join("handoff.toml")).unwrap();
+            assert!(handoff.contains(&format!("request_sha256 = \"{request_hash}\"")));
+            assert!(handoff.contains(&format!("com2_socket = \"{profile}/com2.sock\"")));
+            assert!(!handoff.contains("DWTEST1"));
+            assert_eq!(
+                fs::metadata(output.join(profile).join("OVMF_VARS.mutable.fd"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        let pair = fs::read_to_string(output.join("profile-pair.toml")).unwrap();
+        assert!(pair.contains(&format!("request_sha256 = \"{request_hash}\"")));
+        assert!(pair.contains("default_handoff_sha256"));
+        assert!(pair.contains("smp_handoff_sha256"));
+        let receipt = fs::read_to_string(output.join("build-receipt.toml")).unwrap();
+        assert!(!receipt.contains("profile_pair_sha256"));
+        assert!(receipt.contains("partial_evidence = \"true\""));
+        fs::remove_dir_all(&root).unwrap();
     }
 }

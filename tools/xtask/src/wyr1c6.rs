@@ -43,20 +43,22 @@ const RECEIPT_KIND: &str = "wyrmroot-wyr1-c6-selector29-receipt";
 const HANDOFF_KIND: &str = "wyrmroot-wyr1-c6-selector29-vm-handoff";
 const SCHEMA_VERSION: u32 = 1;
 const SCENARIO: &str = "driver-and-devmgr-restart-no-io";
-const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_FIRMWARE_BYTES: u64 = 128 * 1024 * 1024;
+pub(crate) const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_FIRMWARE_BYTES: u64 = 128 * 1024 * 1024;
 const MACHINE: &str = "pc-q35-10.2";
 const DOMAIN_UUID: &str = "33005e22-d7c2-4b13-b1ac-b82eda95e584";
 const ESP_FD_GROUP: &str = "dw-f13-esp-v1";
 const VARS_FD_GROUP: &str = "dw-f13-ovmf-vars-v1";
 const NATIVE_TARGET: &str = "x86_64-unknown-wyrmroot";
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
-const OVMF_CODE_PATH: &str = "/usr/share/edk2/OvmfX64/OVMF_CODE.fd";
-const OVMF_CODE_SHA256: &str = "f3ff7e73448ed2845ee15356f394882f5618eb5dab92c9a30ec6ee0e1468553a";
-const OVMF_VARS_PATH: &str = "/usr/share/edk2/OvmfX64/OVMF_VARS.fd";
-const OVMF_VARS_SHA256: &str = "6ed987af3a3c155be71665f510eae3e007eda9b8b94afd59d45e91c4a11565cc";
-const ACCEPTED_RUST_REVISION: &str = "a92dc7f7464ad6ddfece4402bd7b86dbfa86166d";
-const ACCEPTED_TOOLCHAIN_NAME: &str = "wyrmroot-1.97.1-a92dc7f7";
+pub(crate) const OVMF_CODE_PATH: &str = "/usr/share/edk2/OvmfX64/OVMF_CODE.fd";
+pub(crate) const OVMF_CODE_SHA256: &str =
+    "f3ff7e73448ed2845ee15356f394882f5618eb5dab92c9a30ec6ee0e1468553a";
+pub(crate) const OVMF_VARS_PATH: &str = "/usr/share/edk2/OvmfX64/OVMF_VARS.fd";
+pub(crate) const OVMF_VARS_SHA256: &str =
+    "6ed987af3a3c155be71665f510eae3e007eda9b8b94afd59d45e91c4a11565cc";
+pub(crate) const ACCEPTED_RUST_REVISION: &str = "a92dc7f7464ad6ddfece4402bd7b86dbfa86166d";
+pub(crate) const ACCEPTED_TOOLCHAIN_NAME: &str = "wyrmroot-1.97.1-a92dc7f7";
 
 const ARTIFACTS: &[(&str, &str, u64)] = &[
     ("loader", "loader.efi", MAX_ARTIFACT_BYTES),
@@ -1053,7 +1055,7 @@ fn selector29_kernel_environment(nonce: &str) -> [(&'static str, String); 2] {
     ]
 }
 
-fn boot_device_table() -> Vec<u8> {
+pub(crate) fn boot_device_table() -> Vec<u8> {
     const RESOURCE_ID: u64 = 1;
     const DEVICE_CORRELATION_ID: u64 = 1;
     const PIO_BASE: u16 = 0x02f8;
@@ -1152,7 +1154,7 @@ fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
-fn pinned_firmware(path: &str, expected: &str, label: &str) -> Result<Vec<u8>, Failure> {
+pub(crate) fn pinned_firmware(path: &str, expected: &str, label: &str) -> Result<Vec<u8>, Failure> {
     let bytes = read_regular_bounded(Path::new(path), MAX_FIRMWARE_BYTES, label)?;
     if sha256::bytes_digest(&bytes) != expected {
         return Err(Failure::task(format!(
@@ -1267,7 +1269,7 @@ fn render_source_receipt(
     render_sorted(&values)
 }
 
-fn canonical_deep_repository(input: &Path, project: &Path) -> Result<PathBuf, Failure> {
+pub(crate) fn canonical_deep_repository(input: &Path, project: &Path) -> Result<PathBuf, Failure> {
     if !input.is_absolute()
         || input.components().any(|component| {
             !matches!(
@@ -1296,7 +1298,7 @@ fn canonical_deep_repository(input: &Path, project: &Path) -> Result<PathBuf, Fa
     Ok(canonical)
 }
 
-fn canonical_new_output(
+pub(crate) fn canonical_new_output(
     output: &Path,
     project: &Path,
     repository: &Path,
@@ -1322,7 +1324,7 @@ fn canonical_new_output(
     Ok(result)
 }
 
-fn matching_abi_tree(
+pub(crate) fn matching_abi_tree(
     deep_repository: &Path,
     kernel_revision: &str,
     generated_abi_revision: &str,
@@ -1354,7 +1356,11 @@ fn git_revision(repository: &Path, spec: &str) -> Result<String, Failure> {
         .map_err(|_| Failure::task("WYR1-C6 Git revision is not UTF-8"))
 }
 
-fn verify_clean_revision(repository: &Path, label: &str, expected: &str) -> Result<(), Failure> {
+pub(crate) fn verify_clean_revision(
+    repository: &Path,
+    label: &str,
+    expected: &str,
+) -> Result<(), Failure> {
     if git_revision(repository, "HEAD")? != expected {
         return Err(Failure::task(format!(
             "WYR1-C6 {label} revision changed during production"
@@ -2008,7 +2014,11 @@ fn value<'a>(values: &'a BTreeMap<String, String>, key: &str) -> Result<&'a str,
         .ok_or_else(|| Failure::task(format!("WYR1-C6 value {key} is missing")))
 }
 
-fn read_regular_bounded(path: &Path, maximum: u64, label: &str) -> Result<Vec<u8>, Failure> {
+pub(crate) fn read_regular_bounded(
+    path: &Path,
+    maximum: u64,
+    label: &str,
+) -> Result<Vec<u8>, Failure> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| Failure::task(format!("could not stat {label}: {error}")))?;
     if !metadata.file_type().is_file()
@@ -2035,11 +2045,16 @@ fn require_mode(path: &Path, expected: u32, label: &str) -> Result<(), Failure> 
     Ok(())
 }
 
-fn write_new(path: &Path, bytes: &[u8], label: &str) -> Result<(), Failure> {
+pub(crate) fn write_new(path: &Path, bytes: &[u8], label: &str) -> Result<(), Failure> {
     write_new_mode(path, bytes, 0o444, label)
 }
 
-fn write_new_mode(path: &Path, bytes: &[u8], mode: u32, label: &str) -> Result<(), Failure> {
+pub(crate) fn write_new_mode(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    label: &str,
+) -> Result<(), Failure> {
     if path.exists() {
         return Err(Failure::task(format!(
             "WYR1-C6 {label} output already exists"
@@ -2058,7 +2073,7 @@ fn write_new_mode(path: &Path, bytes: &[u8], mode: u32, label: &str) -> Result<(
     seal_mode(path, mode, label)
 }
 
-fn seal_mode(path: &Path, mode: u32, label: &str) -> Result<(), Failure> {
+pub(crate) fn seal_mode(path: &Path, mode: u32, label: &str) -> Result<(), Failure> {
     fs::set_permissions(path, fs::Permissions::from_mode(mode))
         .map_err(|error| Failure::task(format!("could not seal {label}: {error}")))?;
     let metadata = fs::symlink_metadata(path)
@@ -2072,7 +2087,7 @@ fn seal_mode(path: &Path, mode: u32, label: &str) -> Result<(), Failure> {
     Ok(())
 }
 
-fn validate_revision(value: &str, label: &str) -> Result<(), Failure> {
+pub(crate) fn validate_revision(value: &str, label: &str) -> Result<(), Failure> {
     validate_lower_hex(value, 40, label)
 }
 fn validate_lower_hex(value: &str, length: usize, label: &str) -> Result<(), Failure> {
@@ -2087,7 +2102,11 @@ fn validate_lower_hex(value: &str, length: usize, label: &str) -> Result<(), Fai
     }
     Ok(())
 }
-fn validate_upper_hex_nonzero(value: &str, length: usize, label: &str) -> Result<(), Failure> {
+pub(crate) fn validate_upper_hex_nonzero(
+    value: &str,
+    length: usize,
+    label: &str,
+) -> Result<(), Failure> {
     if value.len() != length
         || !value
             .bytes()
@@ -2100,7 +2119,7 @@ fn validate_upper_hex_nonzero(value: &str, length: usize, label: &str) -> Result
     }
     Ok(())
 }
-fn clean_revision(repository: &Path, label: &str) -> Result<String, Failure> {
+pub(crate) fn clean_revision(repository: &Path, label: &str) -> Result<String, Failure> {
     let output = std::process::Command::new("git")
         .args(["status", "--porcelain=v1", "--untracked-files=all"])
         .current_dir(repository)
