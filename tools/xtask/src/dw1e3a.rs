@@ -755,7 +755,7 @@ fn render_source_receipt(
             )?),
         );
     }
-    render(&values, SOURCE_RECEIPT_KEYS)
+    render_with_integers(&values, SOURCE_RECEIPT_KEYS, &["schema_version", "test_id"])
 }
 
 fn freeze_produced(
@@ -874,7 +874,8 @@ fn freeze_produced(
     }
     wyr1c6::write_new(
         &output.join("build-receipt.toml"),
-        render(&receipt, BUILD_RECEIPT_KEYS)?.as_bytes(),
+        render_with_integers(&receipt, BUILD_RECEIPT_KEYS, &["schema_version", "test_id"])?
+            .as_bytes(),
         "DW1-E3A build receipt",
     )?;
     validate_frozen_output(output, &values, &request_sha256)?;
@@ -1204,7 +1205,7 @@ pub(crate) fn render_request(values: &BTreeMap<String, String>) -> Result<String
     require(values, "receipt", "build-receipt.toml")?;
     require(values, "source_receipt", "artifacts/e3a-source-build.toml")?;
     reject_terminal(values)?;
-    render(values, REQUEST_KEYS)
+    render_with_integers(values, REQUEST_KEYS, &["schema_version", "test_id"])
 }
 
 pub(crate) fn render_handoff(values: &BTreeMap<String, String>) -> Result<String, Failure> {
@@ -1557,6 +1558,10 @@ mod tests {
         let rendered = render_request(&fixed_request()).unwrap();
         assert!(rendered.contains("challenge_sha256"));
         assert!(rendered.contains("response_sha256"));
+        assert!(rendered.contains("schema_version = 1\n"));
+        assert!(rendered.contains("test_id = 31\n"));
+        assert!(!rendered.contains("schema_version = \"1\""));
+        assert!(!rendered.contains("test_id = \"31\""));
         assert!(!rendered.contains("default_handoff_sha256"));
         assert!(!rendered.contains("smp_handoff_sha256"));
         assert!(!rendered.contains("DWTEST1"));
@@ -1752,6 +1757,8 @@ mod tests {
         let receipt = fs::read_to_string(output.join("build-receipt.toml")).unwrap();
         assert!(!receipt.contains("profile_pair_sha256"));
         assert!(receipt.contains("partial_evidence = \"true\""));
+        assert!(receipt.contains("schema_version = 1\n"));
+        assert!(receipt.contains("test_id = 31\n"));
         fs::remove_dir_all(&root).unwrap();
     }
 }
