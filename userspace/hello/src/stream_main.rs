@@ -59,6 +59,14 @@ impl StreamSystem for NativeSystem {
     fn close(&mut self, handle: DwHandle) -> Result<(), NativeError> {
         close_handle(handle)
     }
+    fn wait(
+        &mut self,
+        channel: DwHandle,
+        signals: deepwyrm_syscall::DwSignals,
+    ) -> Result<deepwyrm_syscall::DwSignals, NativeError> {
+        wait_one(channel, signals, deepwyrm_syscall::DW_DEADLINE_INFINITE)
+            .map(|result| result.observed)
+    }
 }
 fn hello_main(startup: StartupBlock<'_>) -> u32 {
     let mut system = NativeSystem;

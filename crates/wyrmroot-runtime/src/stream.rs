@@ -25,6 +25,8 @@ pub trait StreamSystem {
     ) -> Result<ReceiveCounts, NativeError>;
     fn send(&mut self, channel: DwHandle, bytes: &[u8]) -> Result<(), NativeError>;
     fn close(&mut self, handle: DwHandle) -> Result<(), NativeError>;
+    /// Waits through the reached native wait primitive for one stream endpoint.
+    fn wait(&mut self, channel: DwHandle, signals: DwSignals) -> Result<DwSignals, NativeError>;
 }
 
 /// Native-stream failure classes. Empty data records are never EOF.
@@ -36,6 +38,7 @@ pub enum StreamError {
     Broken,
     Protocol,
     ReceivedHandles,
+    Failed,
     Launch(LaunchError),
 }
 
@@ -82,6 +85,7 @@ pub struct NativeInput {
     offset: usize,
     used: usize,
     eof: bool,
+    failed: bool,
 }
 impl NativeInput {
     pub const fn new(endpoint: StreamEndpoint) -> Self {
@@ -91,6 +95,7 @@ impl NativeInput {
             offset: 0,
             used: 0,
             eof: false,
+            failed: false,
         }
     }
     pub const fn endpoint(&self) -> StreamEndpoint {
@@ -106,6 +111,17 @@ impl NativeInput {
         }
         Ok(())
     }
+    /// Waits for fresh input state. READABLE remains dominant over peer close;
+    /// callers must drain any record before interpreting EOF.
+    pub fn wait_readable<S: StreamSystem>(&mut self, system: &mut S) -> Result<(), StreamError> {
+        if self.failed {
+            return Err(StreamError::Failed);
+        }
+        let observed = system
+            .wait(self.endpoint.0, INPUT_WAIT_SIGNALS)
+            .map_err(classify)?;
+        self.observe_wait(observed)
+    }
     pub fn read<S: StreamSystem>(
         &mut self,
         system: &mut S,
@@ -114,32 +130,61 @@ impl NativeInput {
         if output.is_empty() {
             return Ok(0);
         }
-        if self.offset != self.used {
-            return Ok(self.drain(output));
+        if self.failed {
+            return Err(StreamError::Failed);
         }
-        if self.eof {
-            return Err(StreamError::Eof);
+        let mut copied = 0;
+        loop {
+            if self.offset != self.used {
+                copied += self.drain(&mut output[copied..]);
+                if copied == output.len() {
+                    return Ok(copied);
+                }
+                continue;
+            }
+            if self.eof {
+                return if copied == 0 {
+                    Err(StreamError::Eof)
+                } else {
+                    Ok(copied)
+                };
+            }
+            let mut wire = [0u8; MAX_RECORD_BYTES];
+            let mut handles = [DwReceivedHandleInfoV1::default(); MAX_RECEIVED_HANDLES];
+            let counts = match system.receive(self.endpoint.0, &mut wire, &mut handles) {
+                Ok(counts) => counts,
+                Err(error) => match classify(error) {
+                    StreamError::WouldBlock if copied != 0 => return Ok(copied),
+                    error => return Err(error),
+                },
+            };
+            if counts.bytes > wire.len() || counts.handles > handles.len() {
+                self.fail(system, &handles);
+                return Err(StreamError::Protocol);
+            }
+            if counts.handles != 0 {
+                self.fail(system, &handles[..counts.handles]);
+                return Err(StreamError::ReceivedHandles);
+            }
+            let data = match decode_data(&wire[..counts.bytes]) {
+                Ok(data) => data,
+                Err(_) => {
+                    self.failed = true;
+                    return Err(StreamError::Protocol);
+                }
+            };
+            self.used = data.payload().len();
+            self.offset = 0;
+            self.record[..self.used].copy_from_slice(data.payload());
         }
-        let mut wire = [0u8; MAX_RECORD_BYTES];
-        let mut handles = [DwReceivedHandleInfoV1::default(); MAX_RECEIVED_HANDLES];
-        let counts = match system.receive(self.endpoint.0, &mut wire, &mut handles) {
-            Ok(counts) => counts,
-            Err(error) => return Err(classify(error)),
-        };
-        if counts.bytes > wire.len() || counts.handles > handles.len() {
-            return Err(StreamError::Protocol);
-        }
-        if counts.handles != 0 {
-            for received in handles[..counts.handles].iter() {
+    }
+    fn fail<S: StreamSystem>(&mut self, system: &mut S, handles: &[DwReceivedHandleInfoV1]) {
+        self.failed = true;
+        for received in handles {
+            if received.handle.0 != 0 {
                 let _ = system.close(received.handle);
             }
-            return Err(StreamError::ReceivedHandles);
         }
-        let data = decode_data(&wire[..counts.bytes]).map_err(|_| StreamError::Protocol)?;
-        self.used = data.payload().len();
-        self.offset = 0;
-        self.record[..self.used].copy_from_slice(data.payload());
-        Ok(self.drain(output))
     }
     fn drain(&mut self, output: &mut [u8]) -> usize {
         let count = core::cmp::min(output.len(), self.used - self.offset);
@@ -173,6 +218,14 @@ impl NativeOutput {
         }
         Ok(())
     }
+    /// Waits through the reached native wait primitive. A peer close is broken
+    /// output, never a writable reservation.
+    pub fn wait_writable<S: StreamSystem>(&self, system: &mut S) -> Result<(), StreamError> {
+        let observed = system
+            .wait(self.endpoint.0, OUTPUT_WAIT_SIGNALS)
+            .map_err(classify)?;
+        self.observe_wait(observed)
+    }
     pub fn write<S: StreamSystem>(
         &mut self,
         system: &mut S,
@@ -181,13 +234,45 @@ impl NativeOutput {
         if bytes.is_empty() {
             return Ok(0);
         }
-        let committed = core::cmp::min(bytes.len(), MAX_PAYLOAD_BYTES);
-        let mut wire = [0u8; MAX_RECORD_BYTES];
-        let size =
-            encode_data(&bytes[..committed], &mut wire).map_err(|_| StreamError::Protocol)?;
-        system
-            .send(self.endpoint.0, &wire[..size])
-            .map_err(classify)?;
+        let mut committed = 0;
+        while committed != bytes.len() {
+            let packet = core::cmp::min(bytes.len() - committed, MAX_PAYLOAD_BYTES);
+            let mut wire = [0u8; MAX_RECORD_BYTES];
+            let size = encode_data(&bytes[committed..committed + packet], &mut wire)
+                .map_err(|_| StreamError::Protocol)?;
+            match system
+                .send(self.endpoint.0, &wire[..size])
+                .map_err(classify)
+            {
+                Ok(()) => committed += packet,
+                Err(StreamError::WouldBlock) if committed != 0 => return Ok(committed),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(committed)
+    }
+    /// Writes the complete caller buffer without spinning: it waits only after
+    /// a no-progress or partial-progress capacity race, then retries the
+    /// caller-owned suffix. A peer close remains [`StreamError::Broken`].
+    pub fn write_wait<S: StreamSystem>(
+        &mut self,
+        system: &mut S,
+        bytes: &[u8],
+    ) -> Result<usize, StreamError> {
+        let mut committed = 0;
+        while committed != bytes.len() {
+            match self.write(system, &bytes[committed..]) {
+                Ok(written) => {
+                    committed += written;
+                    if committed == bytes.len() {
+                        return Ok(committed);
+                    }
+                    self.wait_writable(system)?;
+                }
+                Err(StreamError::WouldBlock) => self.wait_writable(system)?,
+                Err(error) => return Err(error),
+            }
+        }
         Ok(committed)
     }
 }
@@ -217,9 +302,12 @@ mod tests {
     struct Fixture {
         incoming: Vec<Vec<u8>>,
         sends: Vec<Vec<u8>>,
-        block_send: bool,
+        send_attempts: usize,
+        block_send_at: Option<usize>,
         received_handles: usize,
         closed: Vec<DwHandle>,
+        waits: Vec<DwSignals>,
+        receive_calls: usize,
     }
     impl StreamSystem for Fixture {
         fn receive(
@@ -228,9 +316,13 @@ mod tests {
             bytes: &mut [u8],
             handles: &mut [DwReceivedHandleInfoV1],
         ) -> Result<ReceiveCounts, NativeError> {
-            let record = self.incoming.remove(0);
+            self.receive_calls += 1;
+            let Some(record) = self.incoming.first().cloned() else {
+                return Err(NativeError::Status(DW_STATUS_WOULD_BLOCK));
+            };
+            self.incoming.remove(0);
             bytes[..record.len()].copy_from_slice(&record);
-            for handle in handles[..self.received_handles].iter_mut() {
+            for handle in handles.iter_mut().take(self.received_handles) {
                 handle.handle = DwHandle(77);
             }
             Ok(ReceiveCounts {
@@ -239,7 +331,8 @@ mod tests {
             })
         }
         fn send(&mut self, _: DwHandle, bytes: &[u8]) -> Result<(), NativeError> {
-            if self.block_send {
+            self.send_attempts += 1;
+            if self.block_send_at == Some(self.send_attempts) {
                 return Err(NativeError::Status(DW_STATUS_WOULD_BLOCK));
             }
             self.sends.push(bytes.to_vec());
@@ -248,6 +341,9 @@ mod tests {
         fn close(&mut self, handle: DwHandle) -> Result<(), NativeError> {
             self.closed.push(handle);
             Ok(())
+        }
+        fn wait(&mut self, _: DwHandle, _: DwSignals) -> Result<DwSignals, NativeError> {
+            Ok(self.waits.remove(0))
         }
     }
     fn endpoint() -> StreamEndpoint {
@@ -263,9 +359,12 @@ mod tests {
         let mut system = Fixture {
             incoming: vec![record(b"abcdef")],
             sends: vec![],
-            block_send: false,
+            send_attempts: 0,
+            block_send_at: None,
             received_handles: 0,
             closed: vec![],
+            waits: vec![],
+            receive_calls: 0,
         };
         let mut input = NativeInput::new(endpoint());
         assert_eq!(input.read(&mut system, &mut []), Ok(0));
@@ -277,28 +376,47 @@ mod tests {
         assert_eq!(&rest[..4], b"cdef");
     }
     #[test]
-    fn output_bounds_packets_and_preserves_would_block() {
+    fn output_packets_all_input_and_returns_progress_before_would_block() {
         let mut system = Fixture {
             incoming: vec![],
             sends: vec![],
-            block_send: true,
+            send_attempts: 0,
+            block_send_at: Some(1),
             received_handles: 0,
             closed: vec![],
+            waits: vec![],
+            receive_calls: 0,
         };
         let mut output = NativeOutput::new(endpoint());
         assert_eq!(
             output.write(&mut system, b"x"),
             Err(StreamError::WouldBlock)
         );
-        system.block_send = false;
+        system.block_send_at = None;
         assert_eq!(
             output.write(&mut system, &[7; MAX_PAYLOAD_BYTES + 1]),
-            Ok(MAX_PAYLOAD_BYTES)
+            Ok(MAX_PAYLOAD_BYTES + 1)
         );
         assert_eq!(
-            decode_data(&system.sends[0]).unwrap().payload().len(),
-            MAX_PAYLOAD_BYTES
+            system
+                .sends
+                .iter()
+                .map(|record| decode_data(record).unwrap().payload().len())
+                .collect::<Vec<_>>(),
+            vec![1024, 1]
         );
+        assert_eq!(output.write(&mut system, &[7; 2049]), Ok(2049));
+        assert_eq!(
+            system
+                .sends
+                .iter()
+                .skip(2)
+                .map(|record| decode_data(record).unwrap().payload().len())
+                .collect::<Vec<_>>(),
+            vec![1024, 1024, 1]
+        );
+        system.block_send_at = Some(system.send_attempts + 2);
+        assert_eq!(output.write(&mut system, &[7; 2049]), Ok(1024));
     }
     #[test]
     fn peer_close_is_explicit_and_readable_precedes_eof() {
@@ -312,9 +430,12 @@ mod tests {
         let mut fixture = Fixture {
             incoming: vec![],
             sends: vec![],
-            block_send: false,
+            send_attempts: 0,
+            block_send_at: None,
             received_handles: 0,
             closed: vec![],
+            waits: vec![],
+            receive_calls: 0,
         };
         assert_eq!(closed.read(&mut fixture, &mut [0]), Err(StreamError::Eof));
     }
@@ -323,9 +444,12 @@ mod tests {
         let mut fixture = Fixture {
             incoming: vec![record(b"x")],
             sends: vec![],
-            block_send: false,
+            send_attempts: 0,
+            block_send_at: None,
             received_handles: 1,
             closed: vec![],
+            waits: vec![],
+            receive_calls: 0,
         };
         let mut input = NativeInput::new(endpoint());
         assert_eq!(
@@ -333,5 +457,126 @@ mod tests {
             Err(StreamError::ReceivedHandles)
         );
         assert_eq!(fixture.closed, [DwHandle(77)]);
+        assert_eq!(
+            input.read(&mut fixture, &mut [0; 1]),
+            Err(StreamError::Failed)
+        );
+        assert_eq!(fixture.receive_calls, 1);
+    }
+
+    #[test]
+    fn malformed_and_count_invalid_input_are_terminal() {
+        let mut malformed = Fixture {
+            incoming: vec![vec![0; 3]],
+            sends: vec![],
+            send_attempts: 0,
+            block_send_at: None,
+            received_handles: 0,
+            closed: vec![],
+            waits: vec![],
+            receive_calls: 0,
+        };
+        let mut input = NativeInput::new(endpoint());
+        assert_eq!(
+            input.read(&mut malformed, &mut [0; 1]),
+            Err(StreamError::Protocol)
+        );
+        assert_eq!(
+            input.read(&mut malformed, &mut [0; 1]),
+            Err(StreamError::Failed)
+        );
+        assert_eq!(malformed.receive_calls, 1);
+
+        let mut invalid = Fixture {
+            incoming: vec![record(b"x")],
+            sends: vec![],
+            send_attempts: 0,
+            block_send_at: None,
+            received_handles: MAX_RECEIVED_HANDLES + 1,
+            closed: vec![],
+            waits: vec![],
+            receive_calls: 0,
+        };
+        let mut input = NativeInput::new(endpoint());
+        assert_eq!(
+            input.read(&mut invalid, &mut [0; 1]),
+            Err(StreamError::Protocol)
+        );
+        assert_eq!(invalid.closed.len(), MAX_RECEIVED_HANDLES);
+        assert_eq!(
+            input.read(&mut invalid, &mut [0; 1]),
+            Err(StreamError::Failed)
+        );
+        assert_eq!(invalid.receive_calls, 1);
+    }
+
+    #[test]
+    fn input_concatenates_records_retains_final_partial_and_returns_progress_before_would_block() {
+        let mut fixture = Fixture {
+            incoming: vec![record(b"ab"), record(b"cdef")],
+            sends: vec![],
+            send_attempts: 0,
+            block_send_at: None,
+            received_handles: 0,
+            closed: vec![],
+            waits: vec![],
+            receive_calls: 0,
+        };
+        let mut input = NativeInput::new(endpoint());
+        let mut first = [0; 4];
+        assert_eq!(input.read(&mut fixture, &mut first), Ok(4));
+        assert_eq!(&first, b"abcd");
+        let mut last = [0; 8];
+        assert_eq!(input.read(&mut fixture, &mut last), Ok(2));
+        assert_eq!(&last[..2], b"ef");
+        assert_eq!(
+            input.read(&mut fixture, &mut last),
+            Err(StreamError::WouldBlock)
+        );
+    }
+    #[test]
+    fn wait_helpers_use_fresh_wait_and_honor_peer_close() {
+        let mut fixture = Fixture {
+            incoming: vec![],
+            sends: vec![],
+            send_attempts: 0,
+            block_send_at: None,
+            received_handles: 0,
+            closed: vec![],
+            waits: vec![DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_WRITABLE],
+            receive_calls: 0,
+        };
+        let mut input = NativeInput::new(endpoint());
+        assert_eq!(input.wait_readable(&mut fixture), Ok(()));
+        assert_eq!(input.read(&mut fixture, &mut [0]), Err(StreamError::Eof));
+        let output = NativeOutput::new(endpoint());
+        assert_eq!(output.wait_writable(&mut fixture), Ok(()));
+        let mut broken = Fixture {
+            incoming: vec![],
+            sends: vec![],
+            send_attempts: 0,
+            block_send_at: None,
+            received_handles: 0,
+            closed: vec![],
+            waits: vec![DW_SIGNAL_PEER_CLOSED],
+            receive_calls: 0,
+        };
+        assert_eq!(output.wait_writable(&mut broken), Err(StreamError::Broken));
+    }
+    #[test]
+    fn blocking_output_waits_after_a_racing_would_block_then_retries() {
+        let mut fixture = Fixture {
+            incoming: vec![],
+            sends: vec![],
+            send_attempts: 0,
+            block_send_at: Some(1),
+            received_handles: 0,
+            closed: vec![],
+            waits: vec![DW_SIGNAL_WRITABLE],
+            receive_calls: 0,
+        };
+        let mut output = NativeOutput::new(endpoint());
+        assert_eq!(output.write_wait(&mut fixture, b"abc"), Ok(3));
+        assert_eq!(fixture.sends.len(), 1);
     }
 }

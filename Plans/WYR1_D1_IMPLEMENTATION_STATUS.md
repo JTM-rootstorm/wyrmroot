@@ -18,12 +18,17 @@ size mismatch, trailing data, and oversized payload fail closed.
 `wyrmroot-runtime` exposes bounded wrappers around an exact child Channel:
 
 - `NativeInput` retains at most one decoded 1024-byte record, drains it across
-  caller-sized reads, treats a zero caller buffer as a no-op, and maps a
-  fresh peer-close-only wait to explicit EOF;
-- `NativeOutput` emits one at-most-1024-byte DATA record and returns only the
-  committed byte count; `WOULD_BLOCK` remains visible and WRITABLE remains a
-  retry hint, not a reservation;
-- received handles are closed before the stream fails closed; and
+  caller-sized reads and immediately available subsequent records until the
+  output fills or Channel `WOULD_BLOCK`, treats a zero caller buffer as a
+  no-op, and maps a fresh peer-close-only wait to explicit EOF;
+- `NativeOutput` packetizes arbitrary caller input into successive at-most-
+  1024-byte DATA records and returns the total committed count; a later
+  `WOULD_BLOCK` returns prior progress, while its bounded blocking helper waits
+  on the reached native wait primitive before retrying the caller-owned suffix;
+- runtime `wait_readable`/`wait_writable` helpers call the reached wait
+  primitive with the exact READABLE/WRITABLE plus PEER_CLOSED masks;
+- malformed/count-invalid/handle-bearing receives close all known transferred
+  handles before making the input endpoint terminally failed; and
 - `extract_job_v2_streams` first applies the reached WRLP JobV2Streams parser,
   then exposes only the validated stdin/stdout/stderr ordered tuple.
 
@@ -53,7 +58,9 @@ No external code, ABI, structure, or wire format was copied.
 The commit handoff records the exact Wyrmroot head and hashes of the changed
 source/status files. Host validation covers arbitrary binary bytes, a 1024-byte
 record, malformed headers/trailing bytes, partial input, zero-sized reads,
-`WOULD_BLOCK`, peer-close, and packetized output. Product/native compilation
+`WOULD_BLOCK`, peer-close, concatenated records, partial final records,
+multi-record output, terminal malformed-input behavior, wait/retry races, and
+packetized output. Product/native compilation
 is a source/build gate only; this status claims no VM or live serial behavior.
 
 Pre-commit source hashes:
@@ -61,9 +68,9 @@ Pre-commit source hashes:
 | File | SHA-256 |
 | --- | --- |
 | `crates/wyrmroot-stream-proto/src/lib.rs` | `3c26f597ef5be31e420146902ca288f52996ca896e6802189b3603d198d4bf45` |
-| `crates/wyrmroot-runtime/src/stream.rs` | `d2e93b3c773cca0f367cc8d3fba49bb679257bc7b545e8d2680c94d97f2b5f40` |
+| `crates/wyrmroot-runtime/src/stream.rs` | `642d36bcc20abd383d36bd7873451aafcb576ad0eb71494a34181acb60420227` |
 | `userspace/hello/src/lib.rs` | `ebde1dbc05622a00a4658de49a26fbc63e0ab9cefc9a90b864800fa24b0ce8e5` |
-| `userspace/hello/src/stream_main.rs` | `dc62afb817322d002b1ac4c3ac9272b42356b30b8c5aa927126c4c3b4c41ba49` |
+| `userspace/hello/src/stream_main.rs` | `cec66aabf01f727728406bf8a80b2dc93fb58d4f32449894135c707638a13776` |
 
 ## Nonclaims and released successors
 

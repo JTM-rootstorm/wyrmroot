@@ -271,6 +271,9 @@ impl StreamSystem for StreamFixture {
         self.closed.push(handle);
         Ok(())
     }
+    fn wait(&mut self, _: DwHandle, _: DwSignals) -> Result<DwSignals, NativeError> {
+        Ok(DW_SIGNAL_PEER_CLOSED)
+    }
 }
 
 #[test]
