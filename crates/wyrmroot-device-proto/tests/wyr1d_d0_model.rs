@@ -19,6 +19,9 @@ const MAX_RECONNECT_FAILURES: usize = 4;
 const RESTART_WINDOW_SECONDS: u64 = 60;
 const IIR_DRAIN_LIMIT: usize = 256;
 const STALE_INIT_DRAIN_LIMIT: usize = 256;
+const SELECTOR_ID: u64 = 32;
+const FNV1A64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 #[derive(Debug, Eq, PartialEq)]
 enum WrstError {
@@ -131,6 +134,37 @@ impl PartialInput {
         } else {
             ReadResult::WouldBlock
         }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum StageError {
+    Full,
+}
+
+struct FixedStage<const N: usize> {
+    bytes: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> FixedStage<N> {
+    fn new() -> Self {
+        Self {
+            bytes: [0; N],
+            len: 0,
+        }
+    }
+
+    fn try_append(&mut self, input: &[u8]) -> Result<(), StageError> {
+        let Some(end) = self.len.checked_add(input.len()) else {
+            return Err(StageError::Full);
+        };
+        if end > N {
+            return Err(StageError::Full);
+        }
+        self.bytes[self.len..end].copy_from_slice(input);
+        self.len = end;
+        Ok(())
     }
 }
 
@@ -437,6 +471,104 @@ impl OutputNewlines {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u64)]
+enum ObservationLeg {
+    InitialStdout = 1,
+    InitialStderr = 2,
+    PostDriverStdout = 3,
+    PostChildStdout = 4,
+}
+
+#[derive(Clone, Copy)]
+struct EvidenceIdentity {
+    bundle: u64,
+    attempt: u64,
+    stream: u64,
+    console: u64,
+    child: u64,
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = FNV1A64_OFFSET_BASIS;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV1A64_PRIME);
+    }
+    hash
+}
+
+fn observation_challenge(
+    selector_nonce: u64,
+    leg: ObservationLeg,
+    identity: EvidenceIdentity,
+) -> u64 {
+    let words = [
+        selector_nonce,
+        SELECTOR_ID,
+        leg as u64,
+        identity.bundle,
+        identity.attempt,
+        identity.stream,
+        identity.console,
+        identity.child,
+    ];
+    let mut hash = FNV1A64_OFFSET_BASIS;
+    for word in words {
+        for byte in word.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(FNV1A64_PRIME);
+        }
+    }
+    hash
+}
+
+fn exact_host_response(leg: ObservationLeg, challenge: u64) -> Vec<u8> {
+    let tag = match leg {
+        ObservationLeg::InitialStderr => "err",
+        ObservationLeg::InitialStdout
+        | ObservationLeg::PostDriverStdout
+        | ObservationLeg::PostChildStdout => "pong",
+    };
+    format!("{tag} {challenge:016X}\r\n").into_bytes()
+}
+
+fn exact_host_request(leg: ObservationLeg, challenge: u64) -> Vec<u8> {
+    let verb = match leg {
+        ObservationLeg::InitialStderr => "err",
+        ObservationLeg::InitialStdout
+        | ObservationLeg::PostDriverStdout
+        | ObservationLeg::PostChildStdout => "ping",
+    };
+    format!("{verb} {challenge:016X}\r\n").into_bytes()
+}
+
+fn exact_child_response(leg: ObservationLeg, challenge: u64) -> Vec<u8> {
+    let tag = match leg {
+        ObservationLeg::InitialStderr => "err",
+        ObservationLeg::InitialStdout
+        | ObservationLeg::PostDriverStdout
+        | ObservationLeg::PostChildStdout => "pong",
+    };
+    format!("{tag} {challenge:016X}\n").into_bytes()
+}
+
+fn validate_host_observation(
+    leg: ObservationLeg,
+    challenge: u64,
+    observed: &[u8],
+    record_value: u64,
+) -> bool {
+    let expected_len = match leg {
+        ObservationLeg::InitialStderr => 22,
+        ObservationLeg::InitialStdout
+        | ObservationLeg::PostDriverStdout
+        | ObservationLeg::PostChildStdout => 23,
+    };
+    let expected = exact_host_response(leg, challenge);
+    observed.len() == expected_len && observed == expected && fnv1a64(observed) == record_value
+}
+
 #[test]
 fn wrst_v1_accepts_only_exact_data_grammar() {
     for payload in [
@@ -484,6 +616,7 @@ fn partial_io_retains_one_record_and_rechecks_racing_would_block() {
     let mut input = PartialInput::default();
     input.push_record(b"abc");
     input.push_record(b"def");
+    input.peer_closed = true;
     let mut two = [0; 2];
     assert_eq!(input.read(&mut two), ReadResult::Count(2));
     assert_eq!(&two, b"ab");
@@ -492,7 +625,6 @@ fn partial_io_retains_one_record_and_rechecks_racing_would_block() {
     assert_eq!(input.read(&mut four), ReadResult::Count(4));
     assert_eq!(&four, b"cdef");
     assert!(input.retained.is_none());
-    input.peer_closed = true;
     assert_eq!(input.read(&mut [0; 1]), ReadResult::Eof);
 
     let mut output = PartialOutput {
@@ -636,6 +768,133 @@ fn fixed_bounds_drop_only_rx_overflow_and_backpressure_tx() {
     for byte in 0..UART_RING_BYTES {
         assert_eq!(tx.pop(), Some(byte as u8));
     }
+
+    fn prove_stage_bound<const N: usize>() {
+        let mut stage = FixedStage::<N>::new();
+        assert_eq!(stage.try_append(&vec![0xa5; N]), Ok(()));
+        assert_eq!(stage.try_append(&[0x5a]), Err(StageError::Full));
+        assert_eq!(stage.len, N);
+        assert!(stage.bytes.iter().all(|byte| *byte == 0xa5));
+    }
+    prove_stage_bound::<CONSOLE_INPUT_STAGE_BYTES>();
+    prove_stage_bound::<CONSOLE_STDOUT_STAGE_BYTES>();
+    prove_stage_bound::<CONSOLE_STDERR_STAGE_BYTES>();
+}
+
+#[test]
+fn selector_observations_bind_nonce_generation_leg_length_and_exact_bytes() {
+    let identity = EvidenceIdentity {
+        bundle: 2,
+        attempt: 3,
+        stream: 4,
+        console: 5,
+        child: 6,
+    };
+    let initial_stdout = observation_challenge(1, ObservationLeg::InitialStdout, identity);
+    assert_eq!(initial_stdout, 0x8297_83dd_99f2_1303);
+
+    let initial_stderr = observation_challenge(1, ObservationLeg::InitialStderr, identity);
+    let post_driver = observation_challenge(1, ObservationLeg::PostDriverStdout, identity);
+    let post_child = observation_challenge(1, ObservationLeg::PostChildStdout, identity);
+    assert_ne!(initial_stdout, initial_stderr);
+    assert_ne!(initial_stdout, post_driver);
+    assert_ne!(post_driver, post_child);
+    assert_ne!(
+        initial_stdout,
+        observation_challenge(2, ObservationLeg::InitialStdout, identity)
+    );
+    assert_ne!(
+        post_driver,
+        observation_challenge(
+            1,
+            ObservationLeg::PostDriverStdout,
+            EvidenceIdentity {
+                attempt: 7,
+                ..identity
+            },
+        )
+    );
+
+    let stdout_response = exact_host_response(ObservationLeg::InitialStdout, initial_stdout);
+    assert_eq!(stdout_response, b"pong 829783DD99F21303\r\n");
+    assert_eq!(stdout_response.len(), 23);
+    assert_eq!(fnv1a64(&stdout_response), 0x91d8_a214_63b4_25ba);
+    assert!(validate_host_observation(
+        ObservationLeg::InitialStdout,
+        initial_stdout,
+        &stdout_response,
+        0x91d8_a214_63b4_25ba,
+    ));
+
+    let stdout_request = exact_host_request(ObservationLeg::InitialStdout, initial_stdout);
+    assert_eq!(stdout_request, b"ping 829783DD99F21303\r\n");
+    let mut input_transform = InputNewlines::default();
+    let mut child_request = Vec::new();
+    input_transform.transform(&stdout_request, &mut child_request);
+    assert_eq!(child_request, b"ping 829783DD99F21303\n");
+    let mut output_transform = OutputNewlines::default();
+    let mut observed_stdout = Vec::new();
+    output_transform.transform(
+        &exact_child_response(ObservationLeg::InitialStdout, initial_stdout),
+        &mut observed_stdout,
+    );
+    assert_eq!(observed_stdout, stdout_response);
+
+    let stderr_response = exact_host_response(ObservationLeg::InitialStderr, initial_stderr);
+    assert_eq!(initial_stderr, 0x574d_f502_a2ad_4b40);
+    assert_eq!(stderr_response, b"err 574DF502A2AD4B40\r\n");
+    assert_eq!(stderr_response.len(), 22);
+    assert_eq!(fnv1a64(&stderr_response), 0xecdc_6873_15fd_8838);
+    assert!(validate_host_observation(
+        ObservationLeg::InitialStderr,
+        initial_stderr,
+        &stderr_response,
+        0xecdc_6873_15fd_8838,
+    ));
+    let stderr_request = exact_host_request(ObservationLeg::InitialStderr, initial_stderr);
+    assert_eq!(stderr_request, b"err 574DF502A2AD4B40\r\n");
+    let mut input_transform = InputNewlines::default();
+    let mut child_request = Vec::new();
+    input_transform.transform(&stderr_request, &mut child_request);
+    assert_eq!(child_request, b"err 574DF502A2AD4B40\n");
+    let mut output_transform = OutputNewlines::default();
+    let mut observed_stderr = Vec::new();
+    output_transform.transform(
+        &exact_child_response(ObservationLeg::InitialStderr, initial_stderr),
+        &mut observed_stderr,
+    );
+    assert_eq!(observed_stderr, stderr_response);
+
+    let post_driver_response = exact_host_response(ObservationLeg::PostDriverStdout, post_driver);
+    let post_driver_value = fnv1a64(&post_driver_response);
+    assert!(validate_host_observation(
+        ObservationLeg::PostDriverStdout,
+        post_driver,
+        &post_driver_response,
+        post_driver_value,
+    ));
+    assert!(!validate_host_observation(
+        ObservationLeg::PostDriverStdout,
+        post_driver,
+        &stdout_response,
+        fnv1a64(&stdout_response),
+    ));
+    let post_child_response = exact_host_response(ObservationLeg::PostChildStdout, post_child);
+    let post_child_value = fnv1a64(&post_child_response);
+    assert!(validate_host_observation(
+        ObservationLeg::PostChildStdout,
+        post_child,
+        &post_child_response,
+        post_child_value,
+    ));
+    let mut suffixed = post_child_response;
+    suffixed.push(b'!');
+    assert!(!validate_host_observation(
+        ObservationLeg::PostChildStdout,
+        post_child,
+        &suffixed,
+        fnv1a64(&suffixed),
+    ));
 }
 
 #[test]

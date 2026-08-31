@@ -306,8 +306,10 @@ The initial hardware policy is PC-compatible q35 COM2 at `0x2f8`, IRQ3,
 1.8432 MHz clock, divisor 1, 115200 baud, 8 data bits, no parity, one stop bit.
 FIFO is enabled with one-byte RX trigger and a 16-byte q35 TX FIFO. MCR is
 `OUT2 | RTS | DTR`, loopback is off. Baseline IER after activation is
-`RDI | RLSI`; THRI is enabled only while the TX ring is nonempty; MSI remains
-disabled. WYR1-D exposes no baud/format configuration.
+`RDI | RLSI`; THRI is enabled only while the TX ring is nonempty. The UART IER
+modem-status interrupt-enable bit (`MSI`) remains disabled. This is not PCI
+MSI; PCI MSI/MSI-X are unrelated and out of scope. WYR1-D exposes no
+baud/format configuration.
 
 `initialize_quiesced()` is exactly ordered:
 
@@ -329,8 +331,9 @@ On each Interrupt wake, read IIR and service all indicated causes until
 NO_INT, failing at 256 iterations. RLSI reads LSR, accounts OE/PE/FE/BI, and
 drains available data. RDI and receiver timeout drain while LSR.DR. THRI fills
 at most the known 16-byte FIFO and disables itself when the ring empties. An
-unexpected MSI cause reads MSR, records a bounded unexpected-modem fact, and
-continues. An unknown cause writes IER=0 and fails the driver.
+unexpected UART modem-status cause reads MSR, records a bounded
+unexpected-modem fact, and continues. An unknown cause writes IER=0 and fails
+the driver.
 
 Only after the complete bounded cause drain may the driver call
 `interrupt_ack`. One ack closes one software pending epoch, not one UART byte.
@@ -468,8 +471,9 @@ Every `WRD1` record is exactly 192 little-endian bytes:
 
 Record types are `1 DRIVER_READY`, `2 STREAM_ATTACHED`, `3 RAW_RX`,
 `4 RAW_TX`, `5 CONSOLE_GENERATION`, `6 CHILD_READY`,
-`7 STDOUT_OBSERVED`, `8 STDERR_OBSERVED`, `9 DRIVER_REPLACED`, and
-`10 CHILD_REPLACED`.
+`7 INITIAL_STDOUT_OBSERVED`, `8 INITIAL_STDERR_OBSERVED`,
+`9 DRIVER_REPLACED`, `10 POST_DRIVER_STDOUT_OBSERVED`,
+`11 CHILD_REPLACED`, and `12 POST_CHILD_STDOUT_OBSERVED`.
 
 - `DRIVER_READY` requires role/bundle/attempt/endpoint/transaction; later
   identities and all previous fields are zero.
@@ -477,15 +481,56 @@ Record types are `1 DRIVER_READY`, `2 STREAM_ATTACHED`, `3 RAW_RX`,
 - `RAW_RX`/`RAW_TX` require the same driver/stream tuple; value is a nonzero
   bounded committed-byte count, not byte content.
 - `CONSOLE_GENERATION` requires driver/stream/console correlation.
-- `CHILD_READY`, `STDOUT_OBSERVED`, and `STDERR_OBSERVED` require the complete
-  current tuple through child; observed records use committed byte count in
-  value.
+- `CHILD_READY` and all four observation types require the complete current
+  tuple through child.
 - `DRIVER_REPLACED` requires complete previous driver/stream/console/child
   identity and complete fresh current driver/stream/console/child identity.
   It is emitted only after old cleanup and new child READY.
 - `CHILD_REPLACED` requires the same current driver/bundle/attempt/endpoint/
   stream/console in both groups, distinct previous/current child generations,
   and zero value. It proves the healthy driver was preserved.
+- `POST_DRIVER_STDOUT_OBSERVED` must follow the corresponding
+  `DRIVER_REPLACED`; its current tuple must equal the replacement record's
+  current tuple. `POST_CHILD_STDOUT_OBSERVED` has the analogous requirement
+  for `CHILD_REPLACED`. Previous fields are zero in observation records.
+
+The four observation legs and their fixed identifiers are:
+
+| Leg ID | Record | Child output Channel |
+| ---: | --- | --- |
+| `1` | `INITIAL_STDOUT_OBSERVED` | stdout |
+| `2` | `INITIAL_STDERR_OBSERVED` | stderr |
+| `3` | `POST_DRIVER_STDOUT_OBSERVED` | stdout |
+| `4` | `POST_CHILD_STDOUT_OBSERVED` | stdout |
+
+For each leg, the host and trusted selector controller derive a 64-bit
+challenge as FNV-1a-64 over the concatenation of these eight little-endian
+`u64` values, in order:
+
+```text
+selector_nonce, 32, leg_id, bundle_generation, driver_attempt,
+stream_generation, console_generation, child_generation
+```
+
+FNV-1a uses offset basis `0xcbf29ce484222325`, prime
+`0x00000100000001b3`, XOR-before-multiply, and wrapping `u64`
+multiplication. The challenge is rendered as exactly 16 uppercase hexadecimal
+ASCII digits, including leading zeroes. For stdout legs 1, 3, and 4 the host
+sends exactly `ping <CHALLENGE>\r\n`; consoled presents exactly
+`ping <CHALLENGE>\n` to the child, and the child writes exactly
+`pong <CHALLENGE>\n` to stdout. The host must observe exactly
+`pong <CHALLENGE>\r\n`, 23 bytes. For stderr leg 2 the host sends exactly
+`err <CHALLENGE>\r\n`; consoled presents exactly `err <CHALLENGE>\n`, and the
+child writes exactly `err <CHALLENGE>\n` to stderr. The host must observe
+exactly `err <CHALLENGE>\r\n`, 22 bytes.
+
+For each observation record, type-specific value is FNV-1a-64 over the exact
+host-visible response bytes, including the final CRLF. Acceptance recomputes
+the challenge, requires the type-specific exact length and byte-for-byte
+response, recomputes its value, and rejects any prefix, suffix, case change,
+wrong Channel, wrong leg, wrong nonce, or wrong current generation tuple. A
+post-replacement challenge is therefore fresh even if an old console or child
+continues producing bytes.
 
 All fields forbidden for a record type are zero. Sequence is exact,
 monotonic, and gap-free for one nonce. The trusted controller emits a record
@@ -509,7 +554,11 @@ The D0 executable model is intentionally an integration test in
 - connector stale/not-ready/busy behavior, exact READY correlation, pending
   and active cleanup, reply failure, retirement, and moved-endpoint release;
 - exact 4096-byte RX/TX and staging bounds, drop-newest/saturating RX overflow,
-  and TX backpressure without drop; and
+  TX backpressure without drop, and all three console stages rejecting byte
+  4097 without mutation;
+- selector-nonce/generation/leg-specific challenges, exact stdout/stderr
+  response lengths and bytes, and type-specific response hashes across initial,
+  post-driver, and post-child legs; and
 - input/output CR/LF transforms when CR and LF cross record boundaries.
 
 D1 must replace the test-only WRST model with the production
@@ -568,6 +617,21 @@ was copied or adapted.
     and not reusing a dying host. BSD/MIT-style headers were observed. FIDL,
     Component Manager, dynamic linking, node topology, devfs, and colocation
     policy are **not-applicable**.
+  - Receipt for the eight driver-manager files: each exact-revision Gitiles
+    `...?format=TEXT` response was fetched read-only over HTTPS on 2026-08-31,
+    base64-decoded, read, and SHA-256 hashed. No mutable checkout or upstream
+    file was created. Decoded hashes are:
+
+    | Exact path under `src/devices/bin/driver_manager/` | SHA-256 |
+    | --- | --- |
+    | `resource.h` | `4d5eaf84f767cbe75fc75a6a15c8f28867d55a836635ff826deefa2457f68138` |
+    | `resource.cc` | `eae8e971b7cb01adce0ddcc0bd2cf34e38c83ea8ef164cb1c061fbe3c3d3a539` |
+    | `node.h` | `76e6e301c2c61058f7608798102f28aece3aa5e8d288f6df7d6ed6bf41df2708` |
+    | `node.cc` | `9f3223ccd90b4f797ebbf2848e6e6ffbedb7b80a11bd1081a429489828d46033` |
+    | `driver_host.h` | `c3bf9e54b6a8a82c9b59833aaee72c2a71ca4ff1140fddc630ff802b19e9f7ed` |
+    | `driver_host.cc` | `e5366cbf7797f537ebacb14b685a353db0cd33d6c3cc0a9d5a16ac0f20076bb9` |
+    | `driver_runner.h` | `912e086f3c14f7987c7743e0b55af678507e2d442b5ef49248d41d941c09e327` |
+    | `driver_runner.cc` | `7cce7060368df58f905d974f650754981941d798ba0d8e8927c5c17862bed846` |
 - xv6-riscv revision `35b088427ef37611c38afdeed5a52a278cae38f9`:
   - `kernel/uart.c`, `console.c`, `trap.c`, and `plic.c` — **concept**: disable
     interrupts during initialization, drain receive causes before controller
