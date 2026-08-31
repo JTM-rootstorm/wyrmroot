@@ -137,16 +137,25 @@ fn selector29_stale_probes_run_after_p2_publication_and_close_before_probe() {
 }
 
 #[test]
-fn selector29_malformed_mapping_probe_moves_fresh_handles_and_requires_typed_rejection() {
+fn selector29_malformed_mapping_probe_moves_wrong_second_type_and_requires_typed_rejection() {
     let probe = &NATIVE[NATIVE
         .find("fn probe_malformed_resource_mapping(")
         .expect("selector-29 malformed resource probe")
         ..NATIVE.find("fn publish_driver(").expect("next C5 helper")];
-    assert!(probe.contains("duplicate_handle(parent_resource, DEVICE_RESOURCE_TRANSFER_RIGHTS)"));
-    assert!(probe.contains("create_interrupt(parent_resource, INTERRUPT_CUSTODY_RIGHTS)"));
-    assert!(probe.contains("active_generation.0.checked_add(1)"));
-    assert!(probe.contains("requested_rights: DEVICE_RESOURCE_DRIVER_RIGHTS"));
-    assert!(probe.contains("requested_rights: INTERRUPT_DRIVER_RIGHTS"));
+    assert_eq!(
+        probe
+            .matches("duplicate_handle(parent_resource, DEVICE_RESOURCE_TRANSFER_RIGHTS)")
+            .count(),
+        2
+    );
+    assert!(!probe.contains("create_interrupt("));
+    assert!(probe.contains("bundle_generation: active_generation"));
+    assert_eq!(
+        probe
+            .matches("requested_rights: DEVICE_RESOURCE_DRIVER_RIGHTS")
+            .count(),
+        2
+    );
     assert!(probe.contains("operation: DW_HANDLE_TRANSFER_MOVE"));
     assert!(probe.contains("code: FailureCode::MalformedResource"));
     assert!(!probe.contains("device_pio_read"));

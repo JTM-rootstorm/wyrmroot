@@ -1335,50 +1335,50 @@ fn probe_malformed_resource_mapping(
     resident: &wyrmroot_devmgr::ResidentController,
 ) -> Result<(), u32> {
     let active_generation = resident.bundle_generation().ok_or(failure(154))?;
-    let malformed_generation = wyrmroot_device_proto::coordinator::BundleGeneration(
-        active_generation.0.checked_add(1).ok_or(failure(155))?,
-    );
-    let reduced = duplicate_handle(parent_resource, DEVICE_RESOURCE_TRANSFER_RIGHTS)
+    let first_resource = duplicate_handle(parent_resource, DEVICE_RESOURCE_TRANSFER_RIGHTS)
         .map_err(|_| failure(156))?;
-    let interrupt = match create_interrupt(parent_resource, INTERRUPT_CUSTODY_RIGHTS) {
+    // U2 already owns the lease's exclusive Interrupt binding. Exercise the
+    // typed bundle mapping instead by placing a second reduced DeviceResource
+    // in the Interrupt slot; the actor must reject it without disturbing U2.
+    let second_resource = match duplicate_handle(parent_resource, DEVICE_RESOURCE_TRANSFER_RIGHTS) {
         Ok(handle) => handle,
         Err(_) => {
-            let _ = close_handle(reduced);
+            let _ = close_handle(first_resource);
             return Err(failure(157));
         }
     };
     let message = ControlMessage::ResourceBundle {
         role_id: request.role_id,
-        bundle_generation: malformed_generation,
+        bundle_generation: active_generation,
         attempt_generation: request.attempt_generation,
         endpoint: request.endpoint,
         transaction_id: request.transaction_id,
     };
     let mut bytes = [0u8; RESOURCE_BUNDLE_BYTES];
     if encode_control(message, &mut bytes).is_err() {
-        let _ = close_handle(interrupt);
-        let _ = close_handle(reduced);
+        let _ = close_handle(second_resource);
+        let _ = close_handle(first_resource);
         return Err(failure(158));
     }
     let transfers = [
         DwHandleTransferV1 {
-            handle: reduced,
+            handle: first_resource,
             requested_rights: DEVICE_RESOURCE_DRIVER_RIGHTS,
             operation: DW_HANDLE_TRANSFER_MOVE,
             reserved0: 0,
             reserved: [0; 2],
         },
         DwHandleTransferV1 {
-            handle: interrupt,
-            requested_rights: INTERRUPT_DRIVER_RIGHTS,
+            handle: second_resource,
+            requested_rights: DEVICE_RESOURCE_DRIVER_RIGHTS,
             operation: DW_HANDLE_TRANSFER_MOVE,
             reserved0: 0,
             reserved: [0; 2],
         },
     ];
     if send_channel(control, &bytes, &transfers).is_err() {
-        let _ = close_handle(interrupt);
-        let _ = close_handle(reduced);
+        let _ = close_handle(second_resource);
+        let _ = close_handle(first_resource);
         return Err(failure(159));
     }
     let deadline = monotonic_deadline_after(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)

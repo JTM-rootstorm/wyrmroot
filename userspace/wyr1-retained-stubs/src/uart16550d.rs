@@ -331,7 +331,7 @@ fn hold_until_malformed_resource_probe(
             return Err(42);
         }
     };
-    let declared_generation = match parse(&bytes) {
+    match parse(&bytes) {
         Ok(ControlMessage::ResourceBundle {
             role_id: observed_role,
             bundle_generation,
@@ -342,45 +342,32 @@ fn hold_until_malformed_resource_probe(
             && observed_attempt == attempt_generation
             && observed_endpoint == endpoint
             && observed_transaction == transaction_id
-            && bundle_generation != active_generation =>
-        {
-            bundle_generation
-        }
+            && bundle_generation == active_generation => {}
         _ => {
             close_received(&handles, counts.handles);
             return Err(43);
         }
-    };
+    }
     let resource_rights = DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_INSPECT.0);
-    let interrupt_rights = DwRights(DW_RIGHT_WAIT.0 | DW_RIGHT_MODIFY.0 | DW_RIGHT_INSPECT.0);
     let valid_types = valid(handles[0], DW_OBJECT_TYPE_DEVICE_RESOURCE, resource_rights)
-        && valid(handles[1], DW_OBJECT_TYPE_INTERRUPT, interrupt_rights);
-    let resource = device_resource_info(handles[0].handle);
-    let interrupt = interrupt_info(handles[1].handle);
-    let valid_mapping = match (resource, interrupt) {
-        (Ok(resource), Ok(interrupt)) => {
-            resource.size == DW_DEVICE_RESOURCE_INFO_V1_SIZE
-                && resource.version == DW_DEVICE_RESOURCE_INFO_V1_VERSION
-                && resource.kind == DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT
-                && resource.flags == 0
-                && resource.resource_id == 1
-                && resource.lease_generation == active_generation.0
-                && resource.lease_generation != declared_generation.0
-                && resource.pio_base == 0x2f8
-                && resource.pio_length == 8
-                && resource.interrupt_source == 3
-                && resource.reserved == 0
-                && interrupt.size == DW_INTERRUPT_INFO_V1_SIZE
-                && interrupt.version == DW_INTERRUPT_INFO_V1_VERSION
-                && interrupt.source == 3
-                && interrupt.state == DW_INTERRUPT_STATE_ARMED
-                && interrupt.object_generation != 0
-                && interrupt.binding_generation != 0
-                && interrupt.parent_resource_id == resource.resource_id
-                && interrupt.parent_lease_generation == resource.lease_generation
-                && interrupt.flags.0 == 0
-                && interrupt.reserved0 == 0
-                && interrupt.reserved == 0
+        && valid(handles[1], DW_OBJECT_TYPE_DEVICE_RESOURCE, resource_rights);
+    let first_resource = device_resource_info(handles[0].handle);
+    let second_resource = device_resource_info(handles[1].handle);
+    let valid_mapping = match (first_resource, second_resource) {
+        (Ok(first), Ok(second)) => {
+            let valid_resource = |resource: deepwyrm_syscall::DwDeviceResourceInfoV1| {
+                resource.size == DW_DEVICE_RESOURCE_INFO_V1_SIZE
+                    && resource.version == DW_DEVICE_RESOURCE_INFO_V1_VERSION
+                    && resource.kind == DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT
+                    && resource.flags == 0
+                    && resource.resource_id == 1
+                    && resource.lease_generation == active_generation.0
+                    && resource.pio_base == 0x2f8
+                    && resource.pio_length == 8
+                    && resource.interrupt_source == 3
+                    && resource.reserved == 0
+            };
+            valid_resource(first) && valid_resource(second)
         }
         _ => false,
     };

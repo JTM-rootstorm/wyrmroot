@@ -68,9 +68,16 @@ fn selector29_u2_rejects_a_live_mismatched_bundle_and_keeps_the_valid_bundle() {
         .expect("selector-29 malformed resource probe")
         ..ACTOR.find("fn close_c5_intake(").expect("next C5 helper")];
     assert!(actor.contains("counts.bytes != bytes.len() || counts.handles != 2"));
-    assert!(actor.contains("bundle_generation != active_generation"));
+    assert!(actor.contains("bundle_generation == active_generation"));
+    assert_eq!(
+        actor
+            .matches("DW_OBJECT_TYPE_DEVICE_RESOURCE, resource_rights")
+            .count(),
+        2
+    );
+    assert_eq!(actor.matches("device_resource_info(handles[").count(), 2);
+    assert!(!actor.contains("interrupt_info("));
     assert!(actor.contains("resource.lease_generation == active_generation.0"));
-    assert!(actor.contains("resource.lease_generation != declared_generation.0"));
     assert!(actor.contains("close_handle(handles[1].handle)"));
     assert!(actor.contains("close_handle(handles[0].handle)"));
     assert!(actor.contains("FailureCode::MalformedResource"));
