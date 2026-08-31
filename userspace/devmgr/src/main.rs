@@ -3,6 +3,8 @@
 #![deny(unsafe_code)]
 
 use core::panic::PanicInfo;
+#[cfg(feature = "wyr1d-production")]
+use deepwyrm_syscall::DW_HANDLE_INVALID;
 #[cfg(feature = "wyr1c6-production")]
 use deepwyrm_syscall::DW_STATUS_TIMED_OUT;
 use deepwyrm_syscall::{
@@ -27,6 +29,18 @@ use deepwyrm_syscall::{
 };
 #[cfg(feature = "wyr1c6-selector29")]
 use deepwyrm_syscall::{DW_SIGNAL_WRITABLE, DW_STATUS_WOULD_BLOCK};
+#[cfg(any(feature = "wyr1c6-production", feature = "wyr1d-production"))]
+use wyrmroot_device_proto::ControlMessage;
+#[cfg(feature = "wyr1c6-production")]
+use wyrmroot_device_proto::FailureCode;
+#[cfg(all(feature = "wyr1c5-production", not(feature = "wyr1d-production")))]
+use wyrmroot_device_proto::control::{READY_BYTES, RESOURCE_BUNDLE_BYTES, parse as parse_control};
+#[cfg(feature = "wyr1d-production")]
+use wyrmroot_device_proto::control_v1_1::{
+    ControlIdentityV1_1, DEVICE_QUIESCED_BYTES as D3_DEVICE_QUIESCED_BYTES,
+    DEVICE_STAGE_BYTES as D3_DEVICE_STAGE_BYTES, INTERRUPT_STAGE_BYTES as D3_INTERRUPT_STAGE_BYTES,
+    READY_BYTES as D3_READY_BYTES, encode as encode_control_v1_1, parse as parse_control_v1_1,
+};
 #[cfg(feature = "wyr1c6-production")]
 use wyrmroot_device_proto::driver_launch::{
     C6_FACT_BYTES, C6Fact, REAPED_RESPONSE_BYTES, encode_c6_fact, encode_driver_retired,
@@ -34,12 +48,18 @@ use wyrmroot_device_proto::driver_launch::{
 };
 #[cfg(feature = "wyr1c6-selector29")]
 use wyrmroot_device_proto::selector29_should_fail;
-#[cfg(feature = "wyr1c6-production")]
-use wyrmroot_device_proto::{ControlMessage, FailureCode};
 use wyrmroot_device_proto::{
     ControllerMessage, StatusCode,
     controller::{
         INSTALL_BYTES, STATUS_BYTES, encode as encode_controller, parse as parse_controller,
+    },
+};
+#[cfg(feature = "wyr1c5-production")]
+use wyrmroot_device_proto::{
+    DirectControlRights,
+    control::encode as encode_control,
+    driver_launch::{
+        LAUNCH_REQUEST_BYTES, LAUNCH_RESPONSE_BYTES, encode_request, parse_constructed,
     },
 };
 #[cfg(not(any(feature = "wyr1c4-production", feature = "wyr1c5-production")))]
@@ -50,17 +70,9 @@ use wyrmroot_device_proto::{
         LAUNCH_REQUEST_BYTES, LAUNCH_RESPONSE_BYTES, encode_request, parse_constructed,
     },
 };
-#[cfg(feature = "wyr1c5-production")]
-use wyrmroot_device_proto::{
-    DirectControlRights,
-    control::{
-        READY_BYTES, RESOURCE_BUNDLE_BYTES, encode as encode_control, parse as parse_control,
-    },
-    driver_launch::{
-        LAUNCH_REQUEST_BYTES, LAUNCH_RESPONSE_BYTES, encode_request, parse_constructed,
-    },
-};
 use wyrmroot_devmgr::ControllerAction;
+#[cfg(feature = "wyr1d-production")]
+use wyrmroot_devmgr::staging::DeviceStageCoordinator;
 #[cfg(feature = "wyr1c5-production")]
 use wyrmroot_loader::launch::CHILD_CHANNEL_TRANSFER_RIGHTS;
 use wyrmroot_loader::launch::{
@@ -1012,6 +1024,267 @@ fn launch_driver(
 
 #[cfg(feature = "wyr1c5-production")]
 fn launch_driver_with_bundle(
+    bootstrap: DwHandle,
+    publication: DwHandle,
+    parent_resource: DwHandle,
+    resident: &mut wyrmroot_devmgr::ResidentController,
+) -> Result<DwHandle, u32> {
+    #[cfg(feature = "wyr1d-production")]
+    return launch_driver_staged(bootstrap, publication, parent_resource, resident);
+    #[cfg(not(feature = "wyr1d-production"))]
+    return launch_driver_with_historical_bundle(bootstrap, publication, parent_resource, resident);
+}
+
+#[cfg(feature = "wyr1d-production")]
+fn launch_driver_staged(
+    bootstrap: DwHandle,
+    publication: DwHandle,
+    parent_resource: DwHandle,
+    resident: &mut wyrmroot_devmgr::ResidentController,
+) -> Result<DwHandle, u32> {
+    struct OwnedHandle(DwHandle);
+
+    impl OwnedHandle {
+        const fn raw(&self) -> DwHandle {
+            self.0
+        }
+
+        fn moved(&mut self) {
+            self.0 = DW_HANDLE_INVALID;
+        }
+
+        fn into_raw(mut self) -> DwHandle {
+            let raw = self.0;
+            self.moved();
+            raw
+        }
+    }
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            if self.0 != DW_HANDLE_INVALID {
+                let _ = close_handle(self.0);
+            }
+        }
+    }
+
+    let (retained_raw, child_raw) =
+        create_channel(DIRECT_CONTROL_RIGHTS).map_err(|_| failure(57))?;
+    let retained = OwnedHandle(retained_raw);
+    let mut child = OwnedHandle(child_raw);
+    if validate_fresh(
+        retained.raw(),
+        DW_OBJECT_TYPE_CHANNEL,
+        DIRECT_CONTROL_RIGHTS,
+    )
+    .is_err()
+        || validate_fresh(child.raw(), DW_OBJECT_TYPE_CHANNEL, DIRECT_CONTROL_RIGHTS).is_err()
+    {
+        return Err(failure(58));
+    }
+    let request = resident
+        .issue_driver_launch_with_bundle(true, DirectControlRights::ExactReduced)
+        .map_err(|_| failure(59))?;
+    let mut launch = [0u8; LAUNCH_REQUEST_BYTES];
+    encode_request(request, &mut launch).map_err(|_| failure(60))?;
+    let child_transfer = DwHandleTransferV1 {
+        handle: child.raw(),
+        requested_rights: CHILD_CHANNEL_TRANSFER_RIGHTS,
+        operation: DW_HANDLE_TRANSFER_MOVE,
+        reserved0: 0,
+        reserved: [0; 2],
+    };
+    if send_bootstrap_channel(
+        bootstrap,
+        &launch,
+        core::slice::from_ref(&child_transfer),
+        61,
+    )
+    .is_err()
+    {
+        return Err(failure(61));
+    }
+    child.moved();
+    let deadline = monotonic_deadline_after(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
+        .map_err(|_| failure(62))?;
+    wait_readable(bootstrap, deadline, 63)?;
+    let mut constructed = [0u8; LAUNCH_RESPONSE_BYTES];
+    let mut constructed_handles = [DwReceivedHandleInfoV1::default(); 1];
+    let counts = receive_channel(bootstrap, &mut constructed, &mut constructed_handles)
+        .map_err(|_| failure(64))?;
+    if counts.bytes != constructed.len() || counts.handles != 0 {
+        close_received(&constructed_handles, counts.handles);
+        return Err(failure(65));
+    }
+    if parse_constructed(&constructed, request).is_err() || resident.driver_constructed().is_err() {
+        return Err(failure(66));
+    }
+
+    let correlations = resident
+        .reserve_d3_stage_correlations(request)
+        .map_err(|_| failure(68))?;
+    let ready_identity = ControlIdentityV1_1 {
+        role_id: request.role_id,
+        bundle_generation: resident.bundle_generation().ok_or(failure(67))?,
+        attempt_generation: request.attempt_generation,
+        endpoint: request.endpoint,
+        transaction_id: correlations.ready_transaction_id,
+    };
+    let mut staging =
+        DeviceStageCoordinator::new(ready_identity, correlations).map_err(|_| failure(68))?;
+
+    let reduced = OwnedHandle(
+        duplicate_handle(parent_resource, DEVICE_RESOURCE_TRANSFER_RIGHTS)
+            .map_err(|_| failure(69))?,
+    );
+    if validate_fresh(
+        reduced.raw(),
+        DW_OBJECT_TYPE_DEVICE_RESOURCE,
+        DEVICE_RESOURCE_TRANSFER_RIGHTS,
+    )
+    .is_err()
+    {
+        return Err(failure(70));
+    }
+    let resource = device_resource_info(reduced.raw()).map_err(|_| failure(71))?;
+    if resource.resource_id != wyrmroot_devmgr::COM2_RESOURCE_ID
+        || resource.lease_generation != ready_identity.bundle_generation.0
+        || resource.pio_base != 0x2f8
+        || resource.pio_length != 8
+        || resource.interrupt_source != 3
+        || resource.flags != 0
+        || resource.reserved != 0
+    {
+        return Err(failure(72));
+    }
+    let device_message = staging.device_stage_message().map_err(|_| failure(73))?;
+    let mut device_bytes = [0; D3_DEVICE_STAGE_BYTES];
+    encode_control_v1_1(device_message, &mut device_bytes).map_err(|_| failure(73))?;
+    let transfer = DwHandleTransferV1 {
+        handle: reduced.raw(),
+        requested_rights: DEVICE_RESOURCE_DRIVER_RIGHTS,
+        operation: DW_HANDLE_TRANSFER_MOVE,
+        reserved0: 0,
+        reserved: [0; 2],
+    };
+    if send_channel(
+        retained.raw(),
+        &device_bytes,
+        core::slice::from_ref(&transfer),
+    )
+    .is_err()
+    {
+        return Err(failure(74));
+    }
+    let mut reduced = reduced;
+    reduced.moved();
+    staging.device_stage_moved().map_err(|_| failure(75))?;
+    wait_readable(retained.raw(), deadline, 76)?;
+    let mut quiesced_bytes = [0; D3_DEVICE_QUIESCED_BYTES];
+    let mut response_handles = [DwReceivedHandleInfoV1::default(); 1];
+    let counts = receive_channel(retained.raw(), &mut quiesced_bytes, &mut response_handles)
+        .map_err(|_| failure(77))?;
+    if counts.bytes != quiesced_bytes.len() || counts.handles != 0 {
+        close_received(&response_handles, counts.handles);
+        return Err(failure(78));
+    }
+    let quiesced = parse_control_v1_1(&quiesced_bytes).map_err(|_| failure(79))?;
+    staging
+        .accept_device_quiesced(quiesced)
+        .map_err(|_| failure(80))?;
+
+    // Creating the route-committing Interrupt is deliberately after the exact
+    // DEVICE_QUIESCED reply above.
+    let interrupt = OwnedHandle(
+        create_interrupt(parent_resource, INTERRUPT_CUSTODY_RIGHTS).map_err(|_| failure(81))?,
+    );
+    if validate_fresh(
+        interrupt.raw(),
+        DW_OBJECT_TYPE_INTERRUPT,
+        INTERRUPT_CUSTODY_RIGHTS,
+    )
+    .is_err()
+    {
+        return Err(failure(82));
+    }
+    let interrupt_facts = interrupt_info(interrupt.raw()).map_err(|_| failure(83))?;
+    if interrupt_facts.size != DW_INTERRUPT_INFO_V1_SIZE
+        || interrupt_facts.version != DW_INTERRUPT_INFO_V1_VERSION
+        || interrupt_facts.source != resource.interrupt_source
+        || interrupt_facts.state != DW_INTERRUPT_STATE_ARMED
+        || interrupt_facts.object_generation == 0
+        || interrupt_facts.binding_generation == 0
+        || interrupt_facts.parent_resource_id != resource.resource_id
+        || interrupt_facts.parent_lease_generation != resource.lease_generation
+        || interrupt_facts.flags.0 != 0
+        || interrupt_facts.reserved0 != 0
+        || interrupt_facts.reserved != 0
+    {
+        return Err(failure(84));
+    }
+    resident
+        .set_driver_bindings(
+            resource.lease_generation,
+            interrupt_facts.binding_generation,
+        )
+        .map_err(|_| failure(85))?;
+    staging.interrupt_created().map_err(|_| failure(86))?;
+    let interrupt_message = staging.interrupt_stage_message().map_err(|_| failure(87))?;
+    let mut interrupt_bytes = [0; D3_INTERRUPT_STAGE_BYTES];
+    encode_control_v1_1(interrupt_message, &mut interrupt_bytes).map_err(|_| failure(87))?;
+    let transfer = DwHandleTransferV1 {
+        handle: interrupt.raw(),
+        requested_rights: INTERRUPT_DRIVER_RIGHTS,
+        operation: DW_HANDLE_TRANSFER_MOVE,
+        reserved0: 0,
+        reserved: [0; 2],
+    };
+    if send_channel(
+        retained.raw(),
+        &interrupt_bytes,
+        core::slice::from_ref(&transfer),
+    )
+    .is_err()
+    {
+        return Err(failure(88));
+    }
+    let mut interrupt = interrupt;
+    interrupt.moved();
+    staging.interrupt_stage_moved().map_err(|_| failure(89))?;
+    resident.bundle_transferred().map_err(|_| failure(90))?;
+    wait_readable(retained.raw(), deadline, 91)?;
+    let mut ready_bytes = [0; D3_READY_BYTES];
+    let mut ready_handles = [DwReceivedHandleInfoV1::default(); 1];
+    let counts = receive_channel(retained.raw(), &mut ready_bytes, &mut ready_handles)
+        .map_err(|_| failure(92))?;
+    if counts.bytes != ready_bytes.len() || counts.handles != 0 {
+        close_received(&ready_handles, counts.handles);
+        return Err(failure(93));
+    }
+    let ready = parse_control_v1_1(&ready_bytes).map_err(|_| failure(94))?;
+    staging
+        .accept_driver_ready(ready)
+        .map_err(|_| failure(95))?;
+    resident
+        .accept_driver_ready_for_transaction(
+            ControlMessage::Ready {
+                role_id: request.role_id,
+                bundle_generation: ready_identity.bundle_generation,
+                attempt_generation: request.attempt_generation,
+                endpoint: request.endpoint,
+                transaction_id: correlations.ready_transaction_id,
+            },
+            correlations.ready_transaction_id,
+        )
+        .map_err(|_| failure(96))?;
+    if let Err(code) = publish_driver(publication, request, resident) {
+        return Err(code);
+    }
+    Ok(retained.into_raw())
+}
+
+#[cfg(all(feature = "wyr1c5-production", not(feature = "wyr1d-production")))]
+fn launch_driver_with_historical_bundle(
     bootstrap: DwHandle,
     publication: DwHandle,
     parent_resource: DwHandle,

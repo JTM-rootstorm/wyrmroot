@@ -158,6 +158,7 @@ pub struct ResidentController {
     next_driver_session: u64,
     next_driver_endpoint: u64,
     next_driver_transaction: u64,
+    next_driver_stage_generation: u64,
     driver_failures: u8,
     retry_until_ns: Option<u64>,
     driver_lease_generation: Option<u64>,
@@ -214,6 +215,7 @@ impl ResidentController {
             next_driver_session: driver_session,
             next_driver_endpoint: driver_endpoint,
             next_driver_transaction: driver_transaction,
+            next_driver_stage_generation: driver_attempt,
             driver_failures: 0,
             retry_until_ns: None,
             driver_lease_generation: None,
@@ -377,6 +379,40 @@ impl ResidentController {
         self.issue_driver_launch(child_is_channel, child_rights)
     }
 
+    /// Reserves all D3 stage identities from resident-owned high-water marks.
+    /// The returned transaction interval is consumed even if later native
+    /// staging fails, so a replacement launch cannot reuse any stage identity.
+    pub fn reserve_d3_stage_correlations(
+        &mut self,
+        request: DriverLaunchRequest,
+    ) -> Result<staging::D3StageCorrelations, DevmgrError> {
+        if self.active_driver_request() != Some(request) {
+            return Err(DevmgrError::ControllerLifecycle);
+        }
+        let stage_generation = self.next_driver_stage_generation;
+        let device_transaction_id = self.next_driver_transaction;
+        let interrupt_transaction_id = device_transaction_id
+            .checked_add(1)
+            .ok_or(DevmgrError::ControllerLifecycle)?;
+        let ready_transaction_id = interrupt_transaction_id
+            .checked_add(1)
+            .ok_or(DevmgrError::ControllerLifecycle)?;
+        let next_transaction = ready_transaction_id
+            .checked_add(1)
+            .ok_or(DevmgrError::ControllerLifecycle)?;
+        let next_stage_generation = stage_generation
+            .checked_add(1)
+            .ok_or(DevmgrError::ControllerLifecycle)?;
+        self.next_driver_transaction = next_transaction;
+        self.next_driver_stage_generation = next_stage_generation;
+        Ok(staging::D3StageCorrelations {
+            stage_generation: staging::StageGeneration(stage_generation),
+            device_transaction_id,
+            interrupt_transaction_id,
+            ready_transaction_id,
+        })
+    }
+
     pub fn driver_constructed(&mut self) -> Result<(), DevmgrError> {
         self.active_driver
             .as_mut()
@@ -428,7 +464,24 @@ impl ResidentController {
         &mut self,
         message: wyrmroot_device_proto::ControlMessage,
     ) -> Result<(), DevmgrError> {
+        let request = self
+            .active_driver_request()
+            .ok_or(DevmgrError::ControllerLifecycle)?;
+        self.accept_driver_ready_for_transaction(message, request.transaction_id)
+    }
+
+    /// Accepts DRIVER_READY against an authority-reserved transaction. D3 uses
+    /// this entry point so its READY identity remains distinct from launch and
+    /// both staged MOVE transactions without changing the historical C5 path.
+    pub fn accept_driver_ready_for_transaction(
+        &mut self,
+        message: wyrmroot_device_proto::ControlMessage,
+        ready_transaction_id: u64,
+    ) -> Result<(), DevmgrError> {
         if self.status.state != CoordinatorState::AwaitingDriverReady || self.driver_ready {
+            return Err(DevmgrError::ControllerLifecycle);
+        }
+        if ready_transaction_id == 0 {
             return Err(DevmgrError::ControllerLifecycle);
         }
         let request = self
@@ -441,7 +494,7 @@ impl ResidentController {
                 .ok_or(DevmgrError::ControllerLifecycle)?,
             attempt_generation: request.attempt_generation,
             endpoint: request.endpoint,
-            transaction_id: request.transaction_id,
+            transaction_id: ready_transaction_id,
         };
         if message != expected {
             return Err(DevmgrError::ControllerLifecycle);
@@ -1167,6 +1220,51 @@ mod tests {
             .issue_driver_launch_with_bundle(true, DirectControlRights::ExactReduced)
             .unwrap();
         assert!(next.attempt_generation.0 > request.attempt_generation.0);
+    }
+
+    #[test]
+    fn d3_stage_reservation_advances_transaction_high_water_across_replacement() {
+        let mut resident =
+            ResidentController::new(prepare_operational(&manifest(), 7).unwrap(), 41).unwrap();
+        resident.accept(install(binding(1, 7), 41), 0).unwrap();
+        resident.admit_device_resource(exact_resource(19)).unwrap();
+        let request = resident
+            .issue_driver_launch_with_bundle(true, DirectControlRights::ExactReduced)
+            .unwrap();
+        let correlations = resident.reserve_d3_stage_correlations(request).unwrap();
+        assert!(correlations.stage_generation.0 != 0);
+        assert!(correlations.device_transaction_id > request.transaction_id);
+        assert!(correlations.interrupt_transaction_id > correlations.device_transaction_id);
+        assert!(correlations.ready_transaction_id > correlations.interrupt_transaction_id);
+
+        resident.driver_constructed().unwrap();
+        resident.resource_bundle_message().unwrap();
+        resident.bundle_transferred().unwrap();
+        resident
+            .accept_driver_ready_for_transaction(
+                wyrmroot_device_proto::ControlMessage::Ready {
+                    role_id: request.role_id,
+                    bundle_generation: BundleGeneration(19),
+                    attempt_generation: request.attempt_generation,
+                    endpoint: request.endpoint,
+                    transaction_id: correlations.ready_transaction_id,
+                },
+                correlations.ready_transaction_id,
+            )
+            .unwrap();
+        resident.publication_committed().unwrap();
+        resident.driver_failed(request.endpoint).unwrap();
+        resident.publication_retired().unwrap();
+        resident.reap_driver().unwrap();
+        resident.accept(rebind(binding(1, 8), 42), 1).unwrap();
+        resident.complete_driver_failure_cleanup(0).unwrap();
+        resident
+            .driver_retry_ready(wyrmroot_device_proto::coordinator::RETRY_BACKOFF_NS)
+            .unwrap();
+        let replacement = resident
+            .issue_driver_launch_with_bundle(true, DirectControlRights::ExactReduced)
+            .unwrap();
+        assert!(replacement.transaction_id > correlations.ready_transaction_id);
     }
 
     #[test]

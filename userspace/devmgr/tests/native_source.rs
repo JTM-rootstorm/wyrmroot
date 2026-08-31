@@ -76,7 +76,10 @@ fn c4_claim_path_is_feature_gated_exact_and_stops_before_interrupt_creation() {
 
 #[test]
 fn c5_moves_exact_reduced_bundle_then_requires_ready_before_publish() {
-    let c5 = &NATIVE[NATIVE.find("fn launch_driver_with_bundle(").unwrap()..];
+    let historical = NATIVE
+        .find("fn launch_driver_with_historical_bundle(")
+        .unwrap();
+    let c5 = &NATIVE[historical..];
     let duplicate = c5.find("duplicate_handle(parent_resource").unwrap();
     let interrupt = c5.find("create_interrupt(parent_resource").unwrap();
     let bundle = c5.find("resource_bundle_message()").unwrap();
