@@ -354,6 +354,7 @@ dependencies = [
  "wyrmroot-devmgr",
  "wyrmroot-loader",
  "wyrmroot-runtime",
+ "wyrmroot-stream-proto",
  "wyrmroot-uart16550-core",
 ]
 

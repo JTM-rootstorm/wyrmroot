@@ -9,6 +9,7 @@ use wyrmroot_device_proto::manifest::RoleId;
 use wyrmroot_devmgr::connector::{
     ConnectorAction, ConnectorBroker, ConnectorSlot, PublishedDriver,
 };
+use wyrmroot_stream_proto as _;
 use wyrmroot_uart16550_core as _;
 use wyrmroot_uart16550d::{RAW_STREAM_RIGHTS, ReceivedStreamEndpoint, StreamAttachment};
 

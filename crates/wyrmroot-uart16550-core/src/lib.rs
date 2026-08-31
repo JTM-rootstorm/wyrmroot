@@ -153,6 +153,21 @@ impl Ring {
         self.len -= 1;
         Some(byte)
     }
+
+    fn copy_to(&self, output: &mut [u8]) -> usize {
+        let count = core::cmp::min(self.len, output.len());
+        for (index, byte) in output[..count].iter_mut().enumerate() {
+            *byte = self.bytes[(self.head + index) % RING_CAPACITY];
+        }
+        count
+    }
+
+    fn discard(&mut self, count: usize) -> usize {
+        let count = core::cmp::min(count, self.len);
+        self.head = (self.head + count) % RING_CAPACITY;
+        self.len -= count;
+        count
+    }
 }
 
 /// Pure UART policy state, parameterized only by its byte-register adapter.
@@ -204,6 +219,17 @@ impl<I: ByteRegisterIo> Uart16550<I> {
     /// Removes one previously received byte without touching hardware.
     pub fn dequeue_rx(&mut self) -> Option<u8> {
         self.rx.pop()
+    }
+
+    /// Copies queued receive bytes without removing them. D3 uses this to
+    /// retain bytes in the UART ring across a WRST send `WOULD_BLOCK` race.
+    pub fn copy_rx(&self, output: &mut [u8]) -> usize {
+        self.rx.copy_to(output)
+    }
+
+    /// Removes exactly the prefix committed by a successful WRST send.
+    pub fn discard_rx(&mut self, count: usize) -> usize {
+        self.rx.discard(count)
     }
 
     /// Performs the exact silent initialization phase required before an
