@@ -32,6 +32,7 @@ This file defines the minimum architecture reading set for Wyrmroot implementati
 - [`Plans/WYR1_D_SERIAL_STREAM_CONSOLE_CONTRACT.md`](WYR1_D_SERIAL_STREAM_CONSOLE_CONTRACT.md) freezes WYR1-D's WRST v1 byte grammar, connector 1.1 and staged production UART handoff, fixed pressure bounds, q35 UART baseline, CR/LF translation, generation replacement/restart policy, selector-32 identity, structured WRD1 joins, and D0 host-model gate while preserving selector-29/WRDC-1.0 behavior.
 - [`Plans/WYR1_D1_IMPLEMENTATION_STATUS.md`](WYR1_D1_IMPLEMENTATION_STATUS.md) records the reached WYR1-D1 production WRST codec, bounded native stream wrappers, JobV2 role validation, and native-stdout hello seam.
 - [`Plans/WYR1_D2_IMPLEMENTATION_STATUS.md`](WYR1_D2_IMPLEMENTATION_STATUS.md) records the reached WYR1-D2 no-std, fake-register 16550 core: silent staged initialization, bounded interrupt draining, fixed rings, diagnostics, and the released D3 adapter seam without live I/O claims.
+- [`Plans/WYR1_D3A_D3C_IMPLEMENTATION_STATUS.md`](WYR1_D3A_D3C_IMPLEMENTATION_STATUS.md) records the reached D3A split DeviceResource/quiescence gate and D3C minor-1 direct-connector host/model gate, including separate WRDC 1.1/WRSC codecs, explicit endpoint-MOVE ownership, one-client reconnect, and preservation of selector-29 WRDC 1.0.
 
 ## Active implementation status
 
