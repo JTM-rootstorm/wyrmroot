@@ -364,6 +364,8 @@ pub(crate) const HANDOFF_KEYS: &[&str] = &[
     "com1_role",
     "com2_role",
     "com2_transport",
+    "com2_socket_mode",
+    "com2_socket_owner",
     "com1_fd_group",
     "com2_fd_group",
     "esp_fd_group",
@@ -968,6 +970,8 @@ fn stage_profile(
         ("com1_role", "trusted-evidence-and-readiness"),
         ("com2_role", "raw-challenge-response"),
         ("com2_transport", "unix-socket-byte-stream"),
+        ("com2_socket_mode", "connect"),
+        ("com2_socket_owner", "runner"),
         ("com1_fd_group", COM1_FD_GROUP),
         ("com2_fd_group", COM2_FD_GROUP),
         ("esp_fd_group", ESP_FD_GROUP),
@@ -1061,7 +1065,7 @@ fn write_profile_pair(output: &Path, request_sha256: &str) -> Result<(), Failure
 
 fn domain_xml(vcpus: u8, code: &Path, esp: &Path, vars: &Path, com2: &Path) -> String {
     format!(
-        "<domain xmlns:qemu=\"http://libvirt.org/schemas/domain/qemu/1.0\" type=\"qemu\">\n  <name>OS-Project</name>\n  <uuid>{DOMAIN_UUID}</uuid>\n  <memory unit=\"KiB\">2097152</memory><currentMemory unit=\"KiB\">2097152</currentMemory><vcpu placement=\"static\">{vcpus}</vcpu>\n  <sysinfo type=\"fwcfg\"><entry name=\"opt/org.deepwyrm.test.selector\">{SELECTOR}</entry><entry name=\"opt/org.deepwyrm.test.test_id\">{TEST_ID}</entry></sysinfo>\n  <os><type arch=\"x86_64\" machine=\"{MACHINE}\">hvm</type><loader readonly=\"yes\" secure=\"no\" type=\"pflash\" format=\"raw\">{}</loader><nvram type=\"file\" format=\"raw\"><source file=\"{}\" fdgroup=\"{VARS_FD_GROUP}\"/></nvram><boot dev=\"hd\"/></os>\n  <features><acpi/><apic/></features><clock offset=\"utc\"><timer name=\"rtc\" tickpolicy=\"catchup\"/><timer name=\"pit\" tickpolicy=\"delay\"/><timer name=\"hpet\" present=\"no\"/></clock><on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>destroy</on_crash><pm><suspend-to-mem enabled=\"no\"/><suspend-to-disk enabled=\"no\"/></pm><devices><emulator>/usr/bin/qemu-system-x86_64</emulator><disk type=\"file\" device=\"disk\"><driver name=\"qemu\" type=\"raw\"/><source file=\"{}\" fdgroup=\"{ESP_FD_GROUP}\"/><target dev=\"vda\" bus=\"virtio\"/><readonly/></disk><controller type=\"pci\" index=\"0\" model=\"pcie-root\"/><serial type=\"pty\"><target type=\"isa-serial\" port=\"0\"/></serial><serial type=\"unix\"><source mode=\"bind\" path=\"{}\"/><target type=\"isa-serial\" port=\"1\"/></serial><console type=\"pty\"><target type=\"serial\" port=\"0\"/></console></devices>\n  <qemu:commandline><qemu:arg value=\"-device\"/><qemu:arg value=\"isa-debug-exit,iobase=0xf4,iosize=0x04\"/></qemu:commandline>\n</domain>\n",
+        "<domain xmlns:qemu=\"http://libvirt.org/schemas/domain/qemu/1.0\" type=\"qemu\">\n  <name>OS-Project</name>\n  <uuid>{DOMAIN_UUID}</uuid>\n  <memory unit=\"KiB\">2097152</memory><currentMemory unit=\"KiB\">2097152</currentMemory><vcpu placement=\"static\">{vcpus}</vcpu>\n  <sysinfo type=\"fwcfg\"><entry name=\"opt/org.deepwyrm.test.selector\">{SELECTOR}</entry><entry name=\"opt/org.deepwyrm.test.test_id\">{TEST_ID}</entry></sysinfo>\n  <os><type arch=\"x86_64\" machine=\"{MACHINE}\">hvm</type><loader readonly=\"yes\" secure=\"no\" type=\"pflash\" format=\"raw\">{}</loader><nvram type=\"file\" format=\"raw\"><source file=\"{}\" fdgroup=\"{VARS_FD_GROUP}\"/></nvram><boot dev=\"hd\"/></os>\n  <features><acpi/><apic/></features><clock offset=\"utc\"><timer name=\"rtc\" tickpolicy=\"catchup\"/><timer name=\"pit\" tickpolicy=\"delay\"/><timer name=\"hpet\" present=\"no\"/></clock><on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>destroy</on_crash><pm><suspend-to-mem enabled=\"no\"/><suspend-to-disk enabled=\"no\"/></pm><devices><emulator>/usr/bin/qemu-system-x86_64</emulator><disk type=\"file\" device=\"disk\"><driver name=\"qemu\" type=\"raw\"/><source file=\"{}\" fdgroup=\"{ESP_FD_GROUP}\"/><target dev=\"vda\" bus=\"virtio\"/><readonly/></disk><controller type=\"pci\" index=\"0\" model=\"pcie-root\"/><serial type=\"pty\"><target type=\"isa-serial\" port=\"0\"/></serial><serial type=\"unix\"><source mode=\"connect\" path=\"{}\"/><target type=\"isa-serial\" port=\"1\"/></serial><console type=\"pty\"><target type=\"serial\" port=\"0\"/></console></devices>\n  <qemu:commandline><qemu:arg value=\"-device\"/><qemu:arg value=\"isa-debug-exit,iobase=0xf4,iosize=0x04\"/></qemu:commandline>\n</domain>\n",
         xml_escape(code),
         xml_escape(vars),
         xml_escape(esp),
@@ -1238,6 +1242,8 @@ pub(crate) fn render_handoff(values: &BTreeMap<String, String>) -> Result<String
         ("com1_role", "trusted-evidence-and-readiness"),
         ("com2_role", "raw-challenge-response"),
         ("com2_transport", "unix-socket-byte-stream"),
+        ("com2_socket_mode", "connect"),
+        ("com2_socket_owner", "runner"),
         ("com1_fd_group", "dw-e3a-com1-evidence-v1"),
         ("com2_fd_group", "dw-e3a-com2-raw-v1"),
         ("esp_fd_group", "dw-f13-esp-v1"),
@@ -1594,6 +1600,8 @@ mod tests {
                 ("com1_role", "trusted-evidence-and-readiness"),
                 ("com2_role", "raw-challenge-response"),
                 ("com2_transport", "unix-socket-byte-stream"),
+                ("com2_socket_mode", "connect"),
+                ("com2_socket_owner", "runner"),
                 ("com1_fd_group", "dw-e3a-com1-evidence-v1"),
                 ("com2_fd_group", "dw-e3a-com2-raw-v1"),
                 ("esp_fd_group", "dw-f13-esp-v1"),
@@ -1740,7 +1748,15 @@ mod tests {
             let handoff = fs::read_to_string(output.join(profile).join("handoff.toml")).unwrap();
             assert!(handoff.contains(&format!("request_sha256 = \"{request_hash}\"")));
             assert!(handoff.contains(&format!("com2_socket = \"{profile}/com2.sock\"")));
+            assert!(handoff.contains("com2_socket_mode = \"connect\""));
+            assert!(handoff.contains("com2_socket_owner = \"runner\""));
             assert!(!handoff.contains("DWTEST1"));
+            let domain = fs::read_to_string(output.join(profile).join("domain.xml")).unwrap();
+            assert!(domain.contains(&format!(
+                "<source mode=\"connect\" path=\"{}/com2.sock\"/>",
+                output.join(profile).display()
+            )));
+            assert!(!domain.contains("<source mode=\"bind\""));
             assert_eq!(
                 fs::metadata(output.join(profile).join("OVMF_VARS.mutable.fd"))
                     .unwrap()

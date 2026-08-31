@@ -34,7 +34,10 @@ content.
   freezes the immutable artifacts and ESP, profile-local domain XML and mutable
   OVMF variables, source/build receipts, acyclic request/handoff/profile-pair
   graph, and nine-record partial `DWE3E1` parser grammar. The partial grammar
-  rejects `DWTEST1` and does not create an acceptance receipt.
+  rejects `DWTEST1` and does not create an acceptance receipt. Each profile's
+  COM2 serial source uses libvirt `mode="connect"` to join the runner-owned
+  Unix-socket listener; the handoff freezes that mode and ownership explicitly,
+  and the generated domain never tries to bind the socket.
 
 ## Canonical raw payload
 
