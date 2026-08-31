@@ -22,7 +22,10 @@ use crate::{
 };
 use wyrmroot_bootfs::{
     archive::Archive,
-    wyr1::{Product, ProductC1, ProductC6, WYR1_C1_MARKER, build_c1, build_c6},
+    wyr1::{
+        DW1_E3A_COM2_PROBE_PATH, DW1_E3A_GATE_PATH, Product, ProductC1, ProductC6, ProductE3A,
+        WYR1_C1_MARKER, build_c1, build_c6, build_e3a,
+    },
 };
 use wyrmroot_device_proto::manifest::{
     ContentIdentity, HEADER_BYTES as WRDM_HEADER_BYTES, RECORD_BYTES as WRDM_RECORD_BYTES,
@@ -142,6 +145,58 @@ const C6_PRODUCT_NATIVE_SPECS: [NativeSpec; 6] = [
     },
 ];
 
+const E3A_PRODUCT_NATIVE_SPECS: [NativeSpec; 7] = [
+    NativeSpec {
+        label: "system-init",
+        package: "wyrmroot-system-init",
+        binary: "system-init",
+        features: "dw1e3-selector31",
+        artifact: "system-init",
+    },
+    NativeSpec {
+        label: "registryd",
+        package: "wyrmroot-registryd",
+        binary: "registryd",
+        features: "native-registryd",
+        artifact: "registryd",
+    },
+    NativeSpec {
+        label: "devmgr",
+        package: "wyrmroot-devmgr",
+        binary: "devmgr",
+        features: "dw1e3-selector31",
+        artifact: "devmgr",
+    },
+    NativeSpec {
+        label: "uart16550d",
+        package: "wyrmroot-uart16550d",
+        binary: "uart16550d",
+        features: "dw1e3-selector31",
+        artifact: "uart16550d",
+    },
+    NativeSpec {
+        label: "consoled",
+        package: "wyrmroot-wyr1-retained-stubs",
+        binary: "consoled",
+        features: "native-retained",
+        artifact: "consoled",
+    },
+    NativeSpec {
+        label: "wyrmsh",
+        package: "wyrmroot-wyr1-retained-stubs",
+        binary: "wyrmsh",
+        features: "native-retained",
+        artifact: "wyrmsh",
+    },
+    NativeSpec {
+        label: "dw1e3-com2-test",
+        package: "wyrmroot-dw1e3-com2-test",
+        binary: "dw1e3-com2-test",
+        features: "native-probe",
+        artifact: "dw1e3-com2-test",
+    },
+];
+
 const C4_NATIVE_CHECK_SPECS: [NativeSpec; 3] = [
     NativeSpec {
         label: "bootstrap-c4",
@@ -254,6 +309,17 @@ pub(crate) struct FrozenSnapshot {
 /// after staging and measuring the full selector-29 product.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct C6Snapshot {
+    pub(crate) rrc_manifest: Vec<u8>,
+    pub(crate) device_manifest: Vec<u8>,
+    pub(crate) bootfs: Vec<u8>,
+    pub(crate) artifacts: BTreeMap<String, Vec<u8>>,
+    pub(crate) inspections: BTreeMap<String, Vec<u8>>,
+}
+
+/// Private selector-31 product snapshot. The seventh artifact is explicit
+/// test content and remains outside the five-role WRRM inventory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct E3ASnapshot {
     pub(crate) rrc_manifest: Vec<u8>,
     pub(crate) device_manifest: Vec<u8>,
     pub(crate) bootfs: Vec<u8>,
@@ -462,8 +528,14 @@ pub(crate) fn build_into(
         for spec in NATIVE_SPECS {
             toolchain.accepted().verify_unchanged()?;
             let artifact = scratch.with_inheritable_anchor("WYR1-C1 build scratch", |anchor| {
-                let mut artifact =
-                    build_native(&repository, &cargo_home, toolchain.accepted(), anchor, spec)?;
+                let mut artifact = build_native(
+                    &repository,
+                    &cargo_home,
+                    toolchain.accepted(),
+                    anchor,
+                    spec,
+                    None,
+                )?;
                 artifact.inspection = inspect_native(
                     &repository,
                     &artifact.bytes,
@@ -573,8 +645,14 @@ pub(crate) fn build_c6_snapshot(nonce: &str) -> Result<C6Snapshot, Failure> {
         for spec in C6_PRODUCT_NATIVE_SPECS {
             toolchain.accepted().verify_unchanged()?;
             let artifact = scratch.with_inheritable_anchor("WYR1-C6 build scratch", |anchor| {
-                let mut artifact =
-                    build_native(&repository, &cargo_home, toolchain.accepted(), anchor, spec)?;
+                let mut artifact = build_native(
+                    &repository,
+                    &cargo_home,
+                    toolchain.accepted(),
+                    anchor,
+                    spec,
+                    None,
+                )?;
                 artifact.inspection = inspect_native(
                     &repository,
                     &artifact.bytes,
@@ -598,6 +676,95 @@ pub(crate) fn build_c6_snapshot(nonce: &str) -> Result<C6Snapshot, Failure> {
             inspections: artifacts
                 .iter()
                 .map(|a| (a.spec.label.to_owned(), a.inspection.as_bytes().to_vec()))
+                .collect(),
+        })
+    })();
+    let snapshot = scratch.finish(result)?;
+    toolchain.accepted().verify_unchanged()?;
+    verify_repository_revision(&repository, &revision)?;
+    Ok(snapshot)
+}
+
+/// Build the selector-31 E3A production userspace closure. This deliberately
+/// stops before ESP/VM handoff freezing; the dedicated E3A request producer
+/// owns those paths and the partial-evidence grammar.
+pub(crate) fn build_e3a_snapshot(nonce: &str) -> Result<E3ASnapshot, Failure> {
+    validate_c6_nonce(nonce)?;
+    reject_ambient_build_environment(env::vars_os())?;
+    let repository = crate::tasks::repository_root()?;
+    let project = crate::tasks::canonical_project_root(&repository)?;
+    let revision = clean_repository_revision(&repository)?;
+    let manifest = BuildManifest::load(&repository)?;
+    if manifest.rust_revision()? != ACCEPTED_RUST_REVISION
+        || manifest.rust_toolchain_name()? != ACCEPTED_TOOLCHAIN_NAME
+    {
+        return Err(Failure::task(
+            "DW1-E3A product metadata does not name the accepted a92dc7f Rust toolchain",
+        ));
+    }
+    let profile = manifest.validate_loader_build_readiness(&repository)?;
+    let toolchain = crate::tasks::prepare_loader_toolchain(&repository, &profile, &manifest)?;
+    let cargo_home = crate::tasks::project_cargo_home(&repository, &manifest)?;
+    if env::var_os("CARGO_HOME").as_deref() != Some(cargo_home.as_os_str()) {
+        return Err(Failure::task(
+            "DW1-E3A product requires the pinned launcher's exact CARGO_HOME",
+        ));
+    }
+    toolchain.accepted().verify_unchanged()?;
+    let project_directory = crate::secure_fs::Directory::open_exact(&project, "OS-Project root")?;
+    let tmp = match project_directory.open_child(".tmp", "project temporary root") {
+        Ok(directory) => directory,
+        Err(_) => project_directory.create_child(".tmp", 0o700, "project temporary root")?,
+    };
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Failure::task("system clock is before the Unix epoch"))?
+        .as_nanos();
+    let scratch = tmp.create_scratch(
+        &format!("dw1e3a-build-{}-{unique}", std::process::id()),
+        "DW1-E3A build scratch",
+    )?;
+    let result = (|| {
+        let mut artifacts = Vec::with_capacity(E3A_PRODUCT_NATIVE_SPECS.len());
+        for spec in E3A_PRODUCT_NATIVE_SPECS {
+            toolchain.accepted().verify_unchanged()?;
+            let artifact = scratch.with_inheritable_anchor("DW1-E3A build scratch", |anchor| {
+                let mut artifact = build_native(
+                    &repository,
+                    &cargo_home,
+                    toolchain.accepted(),
+                    anchor,
+                    spec,
+                    Some(nonce),
+                )?;
+                artifact.inspection = inspect_native(
+                    &repository,
+                    &artifact.bytes,
+                    &artifact.sha256,
+                    spec.label,
+                    anchor,
+                )?;
+                Ok(artifact)
+            })?;
+            artifacts.push(artifact);
+        }
+        let product = assemble_e3a_product(&revision, &artifacts, nonce)?;
+        Ok(E3ASnapshot {
+            rrc_manifest: product.rrc_manifest,
+            device_manifest: product.device_manifest,
+            bootfs: product.bootfs,
+            artifacts: artifacts
+                .iter()
+                .map(|artifact| (artifact.spec.label.to_owned(), artifact.bytes.clone()))
+                .collect(),
+            inspections: artifacts
+                .iter()
+                .map(|artifact| {
+                    (
+                        artifact.spec.label.to_owned(),
+                        artifact.inspection.as_bytes().to_vec(),
+                    )
+                })
                 .collect(),
         })
     })();
@@ -1021,12 +1188,88 @@ fn assemble_c6_product(
     })
 }
 
+fn assemble_e3a_product(
+    revision: &str,
+    artifacts: &[NativeArtifact],
+    nonce: &str,
+) -> Result<ProductBytes, Failure> {
+    let [init, registryd, devmgr, uart, consoled, wyrmsh, probe]: [&NativeArtifact; 7] = artifacts
+        .iter()
+        .collect::<Vec<_>>()
+        .try_into()
+        .map_err(|_| Failure::task("DW1-E3A requires seven explicit native artifacts"))?;
+    let hashes = [
+        digest_array(&registryd.sha256)?,
+        digest_array(&devmgr.sha256)?,
+        digest_array(&uart.sha256)?,
+        digest_array(&consoled.sha256)?,
+        digest_array(&wyrmsh.sha256)?,
+    ];
+    let generation = product_generation(revision, &artifacts[..6]);
+    let rrc_manifest = crate::wyr1::fixed_builder_for_profiles(
+        &generation,
+        hashes,
+        StartupProfile::BootstrapRegistry,
+        StartupProfile::DeviceCoordinator,
+    )?
+    .build_structural()
+    .map_err(|error| Failure::task(format!("DW1-E3A WRRM build failed: {error:?}")))?;
+    let mut wrdm = [0u8; WRDM_HEADER_BYTES + WRDM_RECORD_BYTES];
+    let size = encode_com2_manifest(ContentIdentity(hashes[2]), &mut wrdm)
+        .map_err(|error| Failure::task(format!("DW1-E3A WRDM build failed: {error:?}")))?;
+    let device_manifest = wrdm[..size].to_vec();
+    let gate = format!(
+        "schema = 1\nselector = \"q35-uart-com2-one-round-trip\"\ntest_id = 31\nevidence_protocol = \"DWE3E1\"\nnonce = \"{nonce}\"\npartial_evidence = true\nphysical_io = \"real-com2-irq3-intended\"\n"
+    );
+    let bootfs = build_e3a(ProductE3A {
+        base: ProductC1 {
+            base: Product {
+                init: &init.bytes,
+                registryd: &registryd.bytes,
+                devmgr: &devmgr.bytes,
+                uart16550d: &uart.bytes,
+                consoled: &consoled.bytes,
+                wyrmsh: &wyrmsh.bytes,
+                rrc_manifest: &rrc_manifest,
+                gate_config: GATE_CONFIG,
+            },
+            marker: WYR1_C1_MARKER,
+            device_manifest: &device_manifest,
+            expected_uart16550d_identity: hashes[2],
+        },
+        gate: gate.as_bytes(),
+        raw_com2_probe: &probe.bytes,
+    })
+    .map_err(|error| Failure::task(format!("DW1-E3A bootfs build failed: {error:?}")))?;
+    validate_rrc(&rrc_manifest, &generation, hashes)?;
+    wyrmroot_device_proto::Manifest::parse(&device_manifest)
+        .and_then(|manifest| manifest.match_com2(ContentIdentity(hashes[2])))
+        .map_err(|error| Failure::task(format!("DW1-E3A WRDM inspection failed: {error:?}")))?;
+    inspect_e3a_archive(
+        &bootfs,
+        artifacts,
+        &rrc_manifest,
+        &device_manifest,
+        gate.as_bytes(),
+    )?;
+    Ok(ProductBytes {
+        generation,
+        rrc_manifest_sha256: sha256::bytes_digest(&rrc_manifest),
+        device_manifest_sha256: sha256::bytes_digest(&device_manifest),
+        bootfs_sha256: sha256::bytes_digest(&bootfs),
+        rrc_manifest,
+        device_manifest,
+        bootfs,
+    })
+}
+
 fn build_native(
     repository: &Path,
     cargo_home: &Path,
     toolchain: &crate::toolchain_artifact::AcceptedToolchain,
     build_directory: &InheritableDirectory,
     spec: NativeSpec,
+    evidence_nonce: Option<&str>,
 ) -> Result<NativeArtifact, Failure> {
     let target = build_directory.path().join(spec.label);
     fs::create_dir(&target)
@@ -1047,7 +1290,8 @@ fn build_native(
         spec.features,
     ];
     build_directory.verify_unchanged("WYR1-C1 build scratch")?;
-    let status = Command::new(&toolchain.cargo)
+    let mut command = Command::new(&toolchain.cargo);
+    command
         .args(arguments)
         .arg("--target-dir")
         .arg(&target)
@@ -1061,8 +1305,13 @@ fn build_native(
         .env_remove("LD_LIBRARY_PATH")
         .env_remove("LD_PRELOAD")
         .current_dir(repository)
-        .stdin(Stdio::null())
-        .status();
+        .stdin(Stdio::null());
+    if let Some(nonce) = evidence_nonce {
+        command.env("DEEPWYRM_DW1E_EVIDENCE_NONCE", nonce);
+    } else {
+        command.env_remove("DEEPWYRM_DW1E_EVIDENCE_NONCE");
+    }
+    let status = command.status();
     build_directory.verify_unchanged("WYR1-C1 build scratch")?;
     let status = status
         .map_err(|error| Failure::task(format!("could not build {}: {error}", spec.label)))?;
@@ -1279,6 +1528,43 @@ fn inspect_c6_archive(
             .map_err(|_| Failure::task(format!("WYR1-C6 bootfs lacks {path}")))?;
         if entry.data() != expected_bytes || entry.is_executable() != executable {
             return Err(Failure::task(format!("WYR1-C6 bootfs changed {path}")));
+        }
+    }
+    Ok(())
+}
+
+fn inspect_e3a_archive(
+    bytes: &[u8],
+    artifacts: &[NativeArtifact],
+    rrc: &[u8],
+    wrdm: &[u8],
+    gate: &[u8],
+) -> Result<(), Failure> {
+    let archive = Archive::new(bytes)
+        .map_err(|error| Failure::task(format!("DW1-E3A bootfs inspection failed: {error:?}")))?;
+    if archive.entries().count() != 12 {
+        return Err(Failure::task("DW1-E3A bootfs entry set drifted"));
+    }
+    let expected = [
+        ("system/init", artifacts[0].bytes.as_slice(), true),
+        ("system/registryd", artifacts[1].bytes.as_slice(), true),
+        ("system/devmgr", artifacts[2].bytes.as_slice(), true),
+        ("system/uart16550d", artifacts[3].bytes.as_slice(), true),
+        ("system/consoled", artifacts[4].bytes.as_slice(), true),
+        ("system/wyrmsh", artifacts[5].bytes.as_slice(), true),
+        (DW1_E3A_COM2_PROBE_PATH, artifacts[6].bytes.as_slice(), true),
+        ("system/bootstrap/rrc-a-v1", rrc, false),
+        ("system/bootstrap/wyr1-a-gate-v1", GATE_CONFIG, false),
+        ("system/bootstrap/wyr1-c-gate-v1", WYR1_C1_MARKER, false),
+        ("system/bootstrap/wyr1-c-device-manifest-v1", wrdm, false),
+        (DW1_E3A_GATE_PATH, gate, false),
+    ];
+    for (path, expected_bytes, executable) in expected {
+        let entry = archive
+            .lookup(path.as_bytes())
+            .map_err(|_| Failure::task(format!("DW1-E3A bootfs lacks {path}")))?;
+        if entry.data() != expected_bytes || entry.is_executable() != executable {
+            return Err(Failure::task(format!("DW1-E3A bootfs changed {path}")));
         }
     }
     Ok(())

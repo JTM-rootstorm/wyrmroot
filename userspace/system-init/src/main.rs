@@ -10,6 +10,8 @@ use deepwyrm_syscall::{
 };
 use wyrmroot_bootfs as _;
 use wyrmroot_device_proto as _;
+#[cfg(feature = "dw1e3-selector31")]
+use wyrmroot_dw1e3_com2_test as _;
 use wyrmroot_launch_proto as _;
 use wyrmroot_loader as _;
 use wyrmroot_registry_proto as _;

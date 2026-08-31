@@ -8,6 +8,9 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "dw1e3-selector31")]
+use wyrmroot_dw1e3_com2_test as _;
+
 #[cfg(test)]
 extern crate std;
 
@@ -127,7 +130,7 @@ pub struct DrainedInterrupt {
 }
 
 impl DrainedInterrupt {
-    pub const fn work(self) -> InterruptWork {
+    pub const fn work(&self) -> InterruptWork {
         self.work
     }
 }
@@ -531,6 +534,14 @@ impl<I: ByteRegisterIo> ProductionDriver<I> {
 
     pub fn tx_free(&self) -> usize {
         RING_CAPACITY - self.uart.tx_len()
+    }
+
+    pub fn rx_len(&self) -> usize {
+        self.uart.rx_len()
+    }
+
+    pub fn copy_rx_from(&self, offset: usize, output: &mut [u8]) -> usize {
+        self.uart.copy_rx_from(offset, output)
     }
 
     pub fn wants_stream_readable(&self) -> bool {

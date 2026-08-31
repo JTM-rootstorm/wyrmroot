@@ -19,6 +19,11 @@ required-features = ["native-uart16550d"]
 [features]
 default = []
 native-uart16550d = ["dep:wyrmroot-loader", "dep:wyrmroot-runtime"]
+dw1e3-selector31 = [
+    "native-uart16550d",
+    "dep:wyrmroot-dw1e3-com2-test",
+    "wyrmroot-runtime/dw1e3-test-evidence",
+]
 
 [dependencies]
 deepwyrm-syscall.workspace = true
@@ -27,6 +32,7 @@ wyrmroot-loader = { path = "../../crates/wyrmroot-loader", optional = true }
 wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime", optional = true }
 wyrmroot-stream-proto = { path = "../../crates/wyrmroot-stream-proto" }
 wyrmroot-uart16550-core = { path = "../../crates/wyrmroot-uart16550-core" }
+wyrmroot-dw1e3-com2-test = { path = "../dw1e3-com2-test", optional = true }
 
 [dev-dependencies]
 wyrmroot-devmgr = { path = "../devmgr" }

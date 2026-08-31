@@ -1,0 +1,231 @@
+//! Selector-31-only DW1-E3 evidence carrier.
+//!
+//! The public Deepwyrm ABI remains unchanged. This module is compiled only
+//! into the selected q35 COM2 product and keeps the private `0xffff_ff1f`
+//! operation behind four typed, six-word calls.
+
+use deepwyrm_syscall::{DW_STATUS_SUCCESS, DwHandle, DwStatus, DwSyscallId};
+
+use crate::{NativeError, capability_native::generated_raw_call};
+
+const E3_PRIVATE_SYSCALL: DwSyscallId = DwSyscallId(0xffff_ff1f);
+
+/// Events whose facts are owned by a ring-3 selector actor. Kernel-owned
+/// route, delivery, acknowledgement, retirement, accounting, and terminal
+/// events deliberately have no variant here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Dw1e3ReportEvent {
+    Challenge1UartDrain,
+    Challenge1Response,
+    Driver1PeerClosed,
+    Challenge2UartDrain,
+    Challenge2Response,
+}
+
+impl Dw1e3ReportEvent {
+    const fn wire(self) -> u64 {
+        match self {
+            Self::Challenge1UartDrain => 0x07,
+            Self::Challenge1Response => 0x09,
+            Self::Driver1PeerClosed => 0x0a,
+            Self::Challenge2UartDrain => 0x15,
+            Self::Challenge2Response => 0x17,
+        }
+    }
+}
+
+/// Returns the required nonzero uppercase 16-hex build/run nonce.
+pub fn dw1e3_build_nonce() -> Result<u64, NativeError> {
+    parse_nonce(env!("DEEPWYRM_DW1E_EVIDENCE_NONCE")).ok_or(NativeError::Output(
+        crate::NativeOutputError::InvalidWaitResult,
+    ))
+}
+
+/// Binds the caller's exact Interrupt and attempt generation as the current
+/// driver reporter. Object, binding, lease, and reporter Process identities
+/// are resolved by the kernel from the real handle and caller.
+pub fn dw1e3_bind_driver(
+    interrupt: DwHandle,
+    attempt_generation: u64,
+    nonce: u64,
+) -> Result<(), NativeError> {
+    private_call(
+        bind_driver_arguments(interrupt, attempt_generation, nonce).ok_or_else(invalid_private)?,
+    )
+}
+
+/// Binds the calling Process as the controller-launched raw-probe reporter.
+pub fn dw1e3_bind_probe(nonce: u64) -> Result<(), NativeError> {
+    private_call(bind_probe_arguments(nonce).ok_or_else(invalid_private)?)
+}
+
+/// Arms one already-attached stream/challenge generation before host input.
+pub fn dw1e3_arm_challenge(
+    stream_generation: u64,
+    challenge_generation: u64,
+    expected_length: u64,
+    expected_fnv1a64: u64,
+    nonce: u64,
+) -> Result<(), NativeError> {
+    private_call(
+        arm_arguments(
+            stream_generation,
+            challenge_generation,
+            expected_length,
+            expected_fnv1a64,
+            nonce,
+        )
+        .ok_or_else(invalid_private)?,
+    )
+}
+
+/// Submits one actor-owned event. The kernel supplies the authenticated actor
+/// and complete generation tuple; userspace supplies only the event result.
+pub fn dw1e3_report(
+    event: Dw1e3ReportEvent,
+    value: u64,
+    auxiliary: u64,
+    nonce: u64,
+) -> Result<(), NativeError> {
+    private_call(report_arguments(event, value, auxiliary, nonce).ok_or_else(invalid_private)?)
+}
+
+const fn bind_driver_arguments(
+    interrupt: DwHandle,
+    attempt_generation: u64,
+    nonce: u64,
+) -> Option<[u64; 6]> {
+    if interrupt.0 == 0 || attempt_generation == 0 || nonce == 0 {
+        None
+    } else {
+        Some([1, interrupt.0, attempt_generation, nonce, 0, 0])
+    }
+}
+
+const fn bind_probe_arguments(nonce: u64) -> Option<[u64; 6]> {
+    if nonce == 0 {
+        None
+    } else {
+        Some([2, nonce, 0, 0, 0, 0])
+    }
+}
+
+const fn arm_arguments(
+    stream_generation: u64,
+    challenge_generation: u64,
+    expected_length: u64,
+    expected_fnv1a64: u64,
+    nonce: u64,
+) -> Option<[u64; 6]> {
+    if stream_generation == 0
+        || challenge_generation == 0
+        || expected_length == 0
+        || expected_fnv1a64 == 0
+        || nonce == 0
+    {
+        None
+    } else {
+        Some([
+            3,
+            stream_generation,
+            challenge_generation,
+            expected_length,
+            expected_fnv1a64,
+            nonce,
+        ])
+    }
+}
+
+const fn report_arguments(
+    event: Dw1e3ReportEvent,
+    value: u64,
+    auxiliary: u64,
+    nonce: u64,
+) -> Option<[u64; 6]> {
+    let result_valid = match event {
+        Dw1e3ReportEvent::Challenge1UartDrain
+        | Dw1e3ReportEvent::Challenge1Response
+        | Dw1e3ReportEvent::Challenge2UartDrain
+        | Dw1e3ReportEvent::Challenge2Response => value != 0 && auxiliary != 0,
+        Dw1e3ReportEvent::Driver1PeerClosed => value != 0 && auxiliary == 0,
+    };
+    if !result_valid || nonce == 0 {
+        None
+    } else {
+        Some([4, event.wire(), value, auxiliary, nonce, 0])
+    }
+}
+
+const fn invalid_private() -> NativeError {
+    NativeError::Output(crate::NativeOutputError::InvalidWaitResult)
+}
+
+fn private_call(arguments: [u64; 6]) -> Result<(), NativeError> {
+    require_success(generated_raw_call(E3_PRIVATE_SYSCALL, arguments))
+}
+
+fn require_success(status: DwStatus) -> Result<(), NativeError> {
+    if status == DW_STATUS_SUCCESS {
+        Ok(())
+    } else {
+        Err(NativeError::Status(status))
+    }
+}
+
+fn parse_nonce(text: &str) -> Option<u64> {
+    if text.len() != 16 {
+        return None;
+    }
+    let mut value = 0u64;
+    for byte in text.bytes() {
+        let digit = match byte {
+            b'0'..=b'9' => u64::from(byte - b'0'),
+            b'A'..=b'F' => u64::from(byte - b'A' + 10),
+            _ => return None,
+        };
+        value = value.checked_mul(16)?.checked_add(digit)?;
+    }
+    (value != 0).then_some(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use deepwyrm_syscall::DwHandle;
+
+    use super::{
+        Dw1e3ReportEvent, arm_arguments, bind_driver_arguments, bind_probe_arguments, parse_nonce,
+        report_arguments,
+    };
+
+    #[test]
+    fn nonce_is_exact_uppercase_nonzero_hex() {
+        assert_eq!(parse_nonce("0123456789ABCDEF"), Some(0x0123_4567_89ab_cdef));
+        assert_eq!(parse_nonce("0000000000000000"), None);
+        assert_eq!(parse_nonce("0123456789abcdef"), None);
+        assert_eq!(parse_nonce("1234"), None);
+    }
+
+    #[test]
+    fn selector_private_actions_are_exact_and_reject_zero_required_words() {
+        assert_eq!(
+            bind_driver_arguments(DwHandle(9), 10, 11),
+            Some([1, 9, 10, 11, 0, 0])
+        );
+        assert_eq!(bind_probe_arguments(11), Some([2, 11, 0, 0, 0, 0]));
+        assert_eq!(
+            arm_arguments(12, 13, 24, 14, 11),
+            Some([3, 12, 13, 24, 14, 11])
+        );
+        assert_eq!(
+            report_arguments(Dw1e3ReportEvent::Challenge1Response, 24, 15, 11),
+            Some([4, 9, 24, 15, 11, 0])
+        );
+        assert_eq!(bind_driver_arguments(DwHandle(0), 10, 11), None);
+        assert_eq!(bind_probe_arguments(0), None);
+        assert_eq!(arm_arguments(12, 0, 24, 14, 11), None);
+        assert_eq!(
+            report_arguments(Dw1e3ReportEvent::Challenge1UartDrain, 24, 0, 11),
+            None
+        );
+    }
+}

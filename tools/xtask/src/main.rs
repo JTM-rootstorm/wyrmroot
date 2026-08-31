@@ -3,6 +3,7 @@ mod deep_layout;
 mod dw1b;
 mod dw1c;
 mod dw1d6;
+mod dw1e3a;
 mod elf_runtime;
 mod error;
 mod g3_image;

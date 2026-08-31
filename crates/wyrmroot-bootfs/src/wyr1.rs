@@ -282,6 +282,49 @@ pub fn build_c6(product: ProductC6<'_>) -> Result<Vec<u8>, BuildError> {
     builder.build()
 }
 
+/// Selector-31 E3A extends the retained C1 production closure with one
+/// explicitly test-only RegistryClient actor. The actor is not a WRRM role
+/// and cannot displace or alias any member of [`ROLE_PATHS`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProductE3A<'a> {
+    pub base: ProductC1<'a>,
+    pub gate: &'a [u8],
+    pub raw_com2_probe: &'a [u8],
+}
+
+pub const DW1_E3A_GATE_PATH: &str = "system/bootstrap/dw1-e3a-gate-v1";
+pub const DW1_E3A_COM2_PROBE_PATH: &str = "test/dw1e3/com2-probe";
+
+pub fn build_e3a(product: ProductE3A<'_>) -> Result<Vec<u8>, BuildError> {
+    validate_c1_product(product.base)?;
+    if product.gate.is_empty() || product.raw_com2_probe.is_empty() {
+        return Err(BuildError::EmptyArtifact);
+    }
+    let mut builder = Builder::new();
+    for artifact in product.base.artifacts() {
+        builder.add(
+            artifact.path.as_bytes(),
+            artifact.bytes,
+            if artifact.executable {
+                FileMode::Executable
+            } else {
+                FileMode::ReadOnly
+            },
+        )?;
+    }
+    builder.add(
+        DW1_E3A_GATE_PATH.as_bytes(),
+        product.gate,
+        FileMode::ReadOnly,
+    )?;
+    builder.add(
+        DW1_E3A_COM2_PROBE_PATH.as_bytes(),
+        product.raw_com2_probe,
+        FileMode::Executable,
+    )?;
+    builder.build()
+}
+
 fn validate_c1_product(product: ProductC1<'_>) -> Result<(), BuildError> {
     if product.marker != WYR1_C1_MARKER {
         return Err(BuildError::WrongC1Marker);
@@ -506,5 +549,34 @@ mod tests {
             build_c1(c1_product(WYR1_C1_MARKER, &device_manifest, [0; 32])),
             Err(BuildError::C1DriverIdentityMismatch)
         );
+    }
+
+    #[test]
+    fn dw1_e3a_adds_one_test_actor_without_changing_the_five_role_inventory() {
+        let device_manifest = canonical_wrdm(UART_IDENTITY);
+        let bytes = build_e3a(ProductE3A {
+            base: c1_product(WYR1_C1_MARKER, &device_manifest, UART_IDENTITY),
+            gate: b"selector=31\npartial=true\n",
+            raw_com2_probe: b"probe-elf",
+        })
+        .unwrap();
+        let archive = Archive::new(&bytes).unwrap();
+        assert_eq!(ROLE_PATHS.len(), 5);
+        for path in ROLE_PATHS {
+            assert!(archive.lookup(path.as_bytes()).unwrap().is_executable());
+        }
+        assert!(
+            archive
+                .lookup(DW1_E3A_COM2_PROBE_PATH.as_bytes())
+                .unwrap()
+                .is_executable()
+        );
+        assert!(
+            !archive
+                .lookup(DW1_E3A_GATE_PATH.as_bytes())
+                .unwrap()
+                .is_executable()
+        );
+        assert!(archive.lookup(WYR1_C6_GATE_PATH.as_bytes()).is_err());
     }
 }

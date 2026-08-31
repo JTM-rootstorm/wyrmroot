@@ -162,6 +162,17 @@ impl Ring {
         count
     }
 
+    fn copy_from(&self, offset: usize, output: &mut [u8]) -> usize {
+        if offset >= self.len {
+            return 0;
+        }
+        let count = core::cmp::min(self.len - offset, output.len());
+        for (index, byte) in output[..count].iter_mut().enumerate() {
+            *byte = self.bytes[(self.head + offset + index) % RING_CAPACITY];
+        }
+        count
+    }
+
     fn discard(&mut self, count: usize) -> usize {
         let count = core::cmp::min(count, self.len);
         self.head = (self.head + count) % RING_CAPACITY;
@@ -225,6 +236,14 @@ impl<I: ByteRegisterIo> Uart16550<I> {
     /// retain bytes in the UART ring across a WRST send `WOULD_BLOCK` race.
     pub fn copy_rx(&self, output: &mut [u8]) -> usize {
         self.rx.copy_to(output)
+    }
+
+    /// Copies a bounded suffix of the current RX ring without consuming it.
+    /// Selector evidence uses this only to attribute bytes added by one
+    /// completed UART cause drain. Normal WRST transport remains the sole
+    /// owner of prefix removal.
+    pub fn copy_rx_from(&self, offset: usize, output: &mut [u8]) -> usize {
+        self.rx.copy_from(offset, output)
     }
 
     /// Removes exactly the prefix committed by a successful WRST send.

@@ -28,6 +28,11 @@ wyr1c5-production = ["native-devmgr"]
 wyr1c6-production = ["wyr1c5-production"]
 wyr1c6-selector29 = ["wyr1c6-production"]
 wyr1d-production = ["wyr1c5-production"]
+dw1e3-selector31 = [
+    "wyr1d-production",
+    "dep:wyrmroot-dw1e3-com2-test",
+    "wyrmroot-runtime/dw1e3-test-evidence",
+]
 
 [dependencies]
 deepwyrm-syscall.workspace = true
@@ -35,6 +40,7 @@ wyrmroot-device-proto = { path = "../../crates/wyrmroot-device-proto" }
 wyrmroot-loader = { path = "../../crates/wyrmroot-loader", optional = true }
 wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime", optional = true }
 wyrmroot-registry-proto = { path = "../../crates/wyrmroot-registry-proto", optional = true }
+wyrmroot-dw1e3-com2-test = { path = "../dw1e3-com2-test", optional = true }
 
 [lints.rust]
 unsafe_code = "deny"

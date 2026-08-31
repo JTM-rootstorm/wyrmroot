@@ -6,6 +6,8 @@
 
 use super::*;
 use crate::wyr1b::{EndpointKind, RegistryTopology};
+#[cfg(feature = "dw1e3-selector31")]
+use crate::wyr1b_native::{InstalledPeer, launch_registry_client_actor};
 use crate::wyr1b_native::{
     RegistryNativeAttempt, create_controller_channel_pair, establish_registry_topology,
     launch_registry_until_ready, poison_registry_generation, restart_topology_or_poison,
@@ -52,6 +54,14 @@ use wyrmroot_loader::{
 const DRIVER_CONTROL_INGRESS_RIGHTS: DwRights = CHILD_CHANNEL_TRANSFER_RIGHTS;
 #[cfg(not(feature = "wyr1c5-production"))]
 const DRIVER_CONTROL_INGRESS_RIGHTS: DwRights = CHILD_CHANNEL_RIGHTS;
+#[cfg(feature = "dw1e3-selector31")]
+use wyrmroot_dw1e3_com2_test::{
+    CHALLENGE_BYTES as E3A_CHALLENGE_BYTES, CHALLENGE_GENERATION as E3A_CHALLENGE_GENERATION,
+    CONTROL_BYTES as E3A_CONTROL_BYTES, ControllerMessage as E3AControllerMessage, DevmgrConfig,
+    challenge as e3a_challenge, encode as encode_e3a_controller,
+    encode_devmgr_config as encode_e3a_devmgr_config, fnv1a64 as e3a_fnv1a64,
+    parse as parse_e3a_controller,
+};
 use wyrmroot_registry_proto::{
     Header as RegistryHeader, MessageType as RegistryMessageType, ProtocolVersion,
     encode_install_publication,
@@ -64,6 +74,10 @@ const DEVMGR_PATH: &str = "system/devmgr";
 const PUBLICATION_ID_BASE: u64 = 0xC1_0000;
 const SERVICE_GENERATION_BASE: u64 = 0xC1_0800;
 const PUBLICATION_TRANSACTION_BASE: u64 = 0xC1_1000;
+#[cfg(feature = "dw1e3-selector31")]
+const E3A_PROBE_PATH: &str = "test/dw1e3/com2-probe";
+#[cfg(feature = "dw1e3-selector31")]
+const E3A_PROBE_TRANSACTION_ID: u64 = 0xE3A0_0001;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PublicationCorrelation {
@@ -129,6 +143,10 @@ pub(crate) struct ResidentState {
     next_controller_transaction: u64,
     driver: Option<DriverNativeAttempt>,
     last_reaped_driver: Option<DriverLaunchRequest>,
+    #[cfg(feature = "dw1e3-selector31")]
+    e3a_probe: Option<InstalledPeer>,
+    #[cfg(feature = "dw1e3-selector31")]
+    e3a_stream_generation: Option<u64>,
     #[cfg(feature = "wyr1c6-selector29")]
     c6_gate_config: crate::wyr1c6_gate::GateConfig,
     #[cfg(feature = "wyr1c6-selector29")]
@@ -370,6 +388,10 @@ where
         next_controller_transaction: devmgr.next_controller_transaction,
         driver: None,
         last_reaped_driver: None,
+        #[cfg(feature = "dw1e3-selector31")]
+        e3a_probe: None,
+        #[cfg(feature = "dw1e3-selector31")]
+        e3a_stream_generation: None,
         #[cfg(feature = "wyr1c6-selector29")]
         c6_gate_config,
         #[cfg(feature = "wyr1c6-selector29")]
@@ -1689,6 +1711,185 @@ where
     Ok(())
 }
 
+#[cfg(feature = "dw1e3-selector31")]
+fn start_e3a_probe<S, L, W>(
+    resident: &mut ResidentSystemInit,
+    system: &mut S,
+    loader: &mut L,
+    waits: &mut W,
+    bootfs: &[u8],
+) -> Result<(), InitError>
+where
+    S: Wyr1BPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let (devmgr, registry_control, publication_generation, already_started) = {
+        let state = resident
+            .wyr1c
+            .as_ref()
+            .ok_or(InitError::WrongActivationOrder)?;
+        (
+            state.devmgr.ok_or(InitError::WrongActivationOrder)?,
+            state
+                .registry
+                .ok_or(InitError::WrongActivationOrder)?
+                .control_channel,
+            state.publication_service_generation,
+            state.e3a_probe.is_some(),
+        )
+    };
+    if already_started || publication_generation == 0 {
+        return Err(InitError::WrongActivationOrder);
+    }
+    let nonce = wyrmroot_runtime::dw1e3_build_nonce().map_err(InitError::Native)?;
+    let challenge = e3a_challenge(nonce);
+    let expected_hash = e3a_fnv1a64(&challenge);
+
+    // The config is queued only after init has accepted the real driver launch.
+    // devmgr completes DEVICE/INTERRUPT staging and publication before returning
+    // to this channel, so its selector broker cannot precede driver readiness.
+    let mut devmgr_config = [0u8; wyrmroot_dw1e3_com2_test::DEVMGR_CONFIG_BYTES];
+    encode_e3a_devmgr_config(
+        DevmgrConfig {
+            nonce,
+            publication_generation,
+        },
+        &mut devmgr_config,
+    )
+    .map_err(|_| InitError::WrongManifestProfile)?;
+    system
+        .send_channel(devmgr.loaded.launch_channel, &devmgr_config)
+        .map_err(InitError::Native)?;
+
+    let authority = resident.authority;
+    let probe = {
+        let state = resident
+            .wyr1c
+            .as_mut()
+            .ok_or(InitError::WrongActivationOrder)?;
+        launch_registry_client_actor(
+            system,
+            loader,
+            waits,
+            authority,
+            bootfs,
+            registry_control,
+            &mut state.topology,
+            E3A_PROBE_PATH,
+            publication_generation,
+            E3A_PROBE_TRANSACTION_ID,
+        )?
+    };
+    let result = (|| {
+        let configure = E3AControllerMessage::Configure {
+            nonce,
+            publication_generation,
+            challenge_generation: E3A_CHALLENGE_GENERATION,
+            expected_length: E3A_CHALLENGE_BYTES as u64,
+            expected_hash,
+        };
+        let mut bytes = [0u8; E3A_CONTROL_BYTES];
+        encode_e3a_controller(configure, &mut bytes)
+            .map_err(|_| InitError::WrongManifestProfile)?;
+        system
+            .send_channel(probe.loaded.launch_channel, &bytes)
+            .map_err(InitError::Native)?;
+
+        let now = system.now().map_err(InitError::Native)?;
+        let deadline = now
+            .checked_add(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
+            .ok_or(InitError::Accounting)?;
+        let observed = waits
+            .wait_many(
+                &[
+                    DwWaitItemV1 {
+                        handle: probe.loaded.launch_channel,
+                        signals: DW_SIGNAL_READABLE,
+                    },
+                    DwWaitItemV1 {
+                        handle: probe.loaded.process,
+                        signals: DW_SIGNAL_EXITED,
+                    },
+                ],
+                DwDeadline(deadline),
+            )
+            .map_err(InitError::Native)?;
+        if observed.index != 0 || observed.observed.0 & DW_SIGNAL_READABLE.0 == 0 {
+            return Err(InitError::Supervision);
+        }
+        let mut handles = [DwReceivedHandleInfoV1::default(); 1];
+        let counts = system
+            .receive_channel(probe.loaded.launch_channel, &mut bytes, &mut handles)
+            .map_err(InitError::Native)?;
+        if counts.bytes != bytes.len() || counts.handles != 0 {
+            close_received_native(system, &handles, counts.handles)?;
+            return Err(InitError::WrongManifestProfile);
+        }
+        let attached = parse_e3a_controller(&bytes).map_err(|_| InitError::WrongManifestProfile)?;
+        let E3AControllerMessage::Attached {
+            nonce: received_nonce,
+            publication_generation: received_publication,
+            stream_generation,
+            challenge_generation,
+        } = attached
+        else {
+            return Err(InitError::WrongManifestProfile);
+        };
+        if received_nonce != nonce
+            || received_publication != publication_generation
+            || challenge_generation != E3A_CHALLENGE_GENERATION
+        {
+            return Err(InitError::WrongManifestProfile);
+        }
+
+        // Successful action 3 is the sole host-transmit readiness point. The
+        // selector-private kernel emits DWE3READY on trusted COM1 only after
+        // this exact state has been accepted; COM2 receives no handshake bytes.
+        wyrmroot_runtime::dw1e3_arm_challenge(
+            stream_generation,
+            challenge_generation,
+            E3A_CHALLENGE_BYTES as u64,
+            expected_hash,
+            nonce,
+        )
+        .map_err(InitError::Native)?;
+        let permit = E3AControllerMessage::ArmPermit {
+            nonce,
+            publication_generation,
+            stream_generation,
+            challenge_generation,
+            expected_length: E3A_CHALLENGE_BYTES as u64,
+            expected_hash,
+        };
+        encode_e3a_controller(permit, &mut bytes).map_err(|_| InitError::WrongManifestProfile)?;
+        system
+            .send_channel(probe.loaded.launch_channel, &bytes)
+            .map_err(InitError::Native)?;
+        Ok(stream_generation)
+    })();
+    match result {
+        Ok(stream_generation) => {
+            let state = resident
+                .wyr1c
+                .as_mut()
+                .ok_or(InitError::WrongActivationOrder)?;
+            state.e3a_probe = Some(probe);
+            state.e3a_stream_generation = Some(stream_generation);
+            Ok(())
+        }
+        Err(error) => {
+            let cleanup_failed =
+                cleanup_loaded(system, waits, probe.loaded, probe.task_group, true).is_err();
+            Err(if cleanup_failed {
+                InitError::Cleanup
+            } else {
+                error
+            })
+        }
+    }
+}
+
 fn reap_driver<S, W>(
     resident: &mut ResidentSystemInit,
     system: &mut S,
@@ -1909,7 +2110,14 @@ where
                                             resident, system, loader, waits, bootfs, error,
                                         )
                                     } else {
-                                        Ok(())
+                                        #[cfg(feature = "dw1e3-selector31")]
+                                        {
+                                            start_e3a_probe(resident, system, loader, waits, bootfs)
+                                        }
+                                        #[cfg(not(feature = "dw1e3-selector31"))]
+                                        {
+                                            Ok(())
+                                        }
                                     }
                                 }
                                 Ok(DevmgrControlInput::DriverRetired { bytes }) => {

@@ -1232,8 +1232,14 @@ fn advance_registry_or_exhausted<S: InitPlatform>(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PeerKind {
-    Publisher { operation: u64 },
-    Client,
+    Publisher {
+        operation: u64,
+    },
+    Client {
+        path: &'static str,
+        role_generation: u64,
+        transaction_id: u64,
+    },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1260,12 +1266,16 @@ where
             LaunchProfile::BootstrapService,
             0x2000 + operation,
         ),
-        PeerKind::Client => (
+        PeerKind::Client {
+            path,
+            role_generation,
+            transaction_id,
+        } => (
             EndpointKind::RegistryClient,
-            1,
-            CLIENT_PATH,
+            role_generation,
+            path,
             LaunchProfile::RegistryClient,
-            0x3001,
+            transaction_id,
         ),
     };
     let archive = Archive::new(bootfs)
@@ -1310,7 +1320,9 @@ where
             registry_endpoint,
             operation,
         ),
-        PeerKind::Client => install_client(system, registry_control, grant, registry_endpoint),
+        PeerKind::Client { .. } => {
+            install_client(system, registry_control, grant, registry_endpoint)
+        }
     };
     if let Err(error) = install {
         let mut failed = !channels.cleanup(system);
@@ -1422,6 +1434,44 @@ where
         grant,
         loaded,
         task_group,
+    })
+}
+
+#[cfg(feature = "dw1e3-selector31")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_registry_client_actor<S, L, W>(
+    system: &mut S,
+    loader: &mut L,
+    waits: &mut W,
+    authority: LoadAuthority,
+    bootfs: &[u8],
+    registry_control: DwHandle,
+    topology: &mut RegistryTopology,
+    path: &'static str,
+    role_generation: u64,
+    transaction_id: u64,
+) -> Result<InstalledPeer, InitError>
+where
+    S: Wyr1BPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    launch_peer(
+        system,
+        loader,
+        waits,
+        authority,
+        bootfs,
+        registry_control,
+        topology,
+        PeerKind::Client {
+            path,
+            role_generation,
+            transaction_id,
+        },
+    )
+    .map_err(|error| match error {
+        PeerLaunchError::PreInstall(error) | PeerLaunchError::InstallCommitted(error) => error,
     })
 }
 
@@ -3155,7 +3205,14 @@ where
         }
 
         launch!(publisher1, PeerKind::Publisher { operation: 1 });
-        launch!(client, PeerKind::Client);
+        launch!(
+            client,
+            PeerKind::Client {
+                path: CLIENT_PATH,
+                role_generation: 1,
+                transaction_id: 0x3001,
+            }
+        );
         let first = publisher1.ok_or(InitError::Accounting)?;
         let client_peer = client.ok_or(InitError::Accounting)?;
         let publisher1_config = configure_publisher(system, gate, first, client_peer, 1)?;

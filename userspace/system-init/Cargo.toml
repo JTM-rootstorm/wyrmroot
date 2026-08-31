@@ -26,11 +26,17 @@ wyr1c5-production = ["native-init"]
 wyr1c6-production = ["wyr1c5-production"]
 wyr1c6-test-evidence = ["native-init", "wyrmroot-runtime/wyr1c6-test-evidence"]
 wyr1c6-selector29 = ["wyr1c6-production", "wyr1c6-test-evidence"]
+dw1e3-selector31 = [
+    "wyr1c5-production",
+    "dep:wyrmroot-dw1e3-com2-test",
+    "wyrmroot-runtime/dw1e3-test-evidence",
+]
 
 [dependencies]
 deepwyrm-syscall.workspace = true
 wyrmroot-bootfs = { path = "../../crates/wyrmroot-bootfs" }
 wyrmroot-device-proto = { path = "../../crates/wyrmroot-device-proto" }
+wyrmroot-dw1e3-com2-test = { path = "../dw1e3-com2-test", optional = true }
 wyrmroot-loader = { path = "../../crates/wyrmroot-loader" }
 wyrmroot-launch-proto = { path = "../../crates/wyrmroot-launch-proto" }
 wyrmroot-registry-proto = { path = "../../crates/wyrmroot-registry-proto" }

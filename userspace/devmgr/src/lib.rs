@@ -7,6 +7,9 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "dw1e3-selector31")]
+use wyrmroot_dw1e3_com2_test as _;
+
 pub mod connector;
 pub mod staging;
 
@@ -411,6 +414,27 @@ impl ResidentController {
             interrupt_transaction_id,
             ready_transaction_id,
         })
+    }
+
+    /// Reserves the first direct-connector attach transaction and stream
+    /// generation from resident-owned high-water marks. The broker owns later
+    /// checked increments for the same live driver generation.
+    pub fn reserve_d3_connector_correlations(
+        &mut self,
+        request: DriverLaunchRequest,
+    ) -> Result<(u64, u64), DevmgrError> {
+        if self.active_driver_request() != Some(request) || !self.publication_current {
+            return Err(DevmgrError::ControllerLifecycle);
+        }
+        let attach_transaction = self.next_driver_transaction;
+        let stream_generation = self.next_driver_stage_generation;
+        self.next_driver_transaction = attach_transaction
+            .checked_add(1)
+            .ok_or(DevmgrError::ControllerLifecycle)?;
+        self.next_driver_stage_generation = stream_generation
+            .checked_add(1)
+            .ok_or(DevmgrError::ControllerLifecycle)?;
+        Ok((attach_transaction, stream_generation))
     }
 
     pub fn driver_constructed(&mut self) -> Result<(), DevmgrError> {

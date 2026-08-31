@@ -17,6 +17,7 @@ wyr1b-test-evidence = []
 dw1b-test-evidence = []
 dw1c-test-evidence = []
 dw1d6-test-evidence = []
+dw1e3-test-evidence = []
 wyr1c6-test-evidence = []
 
 [dependencies]

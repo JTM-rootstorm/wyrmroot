@@ -186,7 +186,7 @@ fn c6_inline_publication_rebind_is_acknowledged_before_driver_backoff() {
         .find("send_driver_retired(bootstrap, request)?")
         .expect("driver retirement notification")..];
     let receive = cleanup
-        .find("let (replacement, action) = receive_controller")
+        .find("let received = receive_controller")
         .expect("inline rebind receive");
     let install = cleanup
         .find("publication.replace(replacement)")

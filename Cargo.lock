@@ -190,6 +190,7 @@ version = "0.0.0"
 dependencies = [
  "deepwyrm-syscall",
  "wyrmroot-device-proto",
+ "wyrmroot-dw1e3-com2-test",
  "wyrmroot-loader",
  "wyrmroot-registry-proto",
  "wyrmroot-runtime",
@@ -220,6 +221,18 @@ dependencies = [
  "deepwyrm-syscall",
  "wyrmroot-loader",
  "wyrmroot-runtime",
+]
+
+[[package]]
+name = "wyrmroot-dw1e3-com2-test"
+version = "0.0.0"
+dependencies = [
+ "deepwyrm-syscall",
+ "wyrmroot-device-proto",
+ "wyrmroot-loader",
+ "wyrmroot-registry-proto",
+ "wyrmroot-runtime",
+ "wyrmroot-stream-proto",
 ]
 
 [[package]]
@@ -333,6 +346,7 @@ dependencies = [
  "deepwyrm-syscall",
  "wyrmroot-bootfs",
  "wyrmroot-device-proto",
+ "wyrmroot-dw1e3-com2-test",
  "wyrmroot-launch-proto",
  "wyrmroot-loader",
  "wyrmroot-registry-proto",
@@ -352,6 +366,7 @@ dependencies = [
  "deepwyrm-syscall",
  "wyrmroot-device-proto",
  "wyrmroot-devmgr",
+ "wyrmroot-dw1e3-com2-test",
  "wyrmroot-loader",
  "wyrmroot-runtime",
  "wyrmroot-stream-proto",

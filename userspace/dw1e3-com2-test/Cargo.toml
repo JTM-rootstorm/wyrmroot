@@ -1,0 +1,41 @@
+[package]
+name = "wyrmroot-dw1e3-com2-test"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+description = "Selector-31-only raw COM2 registry client and challenge probe"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "dw1e3-com2-test"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["native-probe"]
+
+[features]
+default = []
+native-probe = [
+    "dep:deepwyrm-syscall",
+    "dep:wyrmroot-device-proto",
+    "dep:wyrmroot-loader",
+    "dep:wyrmroot-registry-proto",
+    "dep:wyrmroot-runtime",
+    "dep:wyrmroot-stream-proto",
+    "wyrmroot-runtime/dw1e3-test-evidence",
+]
+
+[dependencies]
+deepwyrm-syscall = { workspace = true, optional = true }
+wyrmroot-device-proto = { path = "../../crates/wyrmroot-device-proto", optional = true }
+wyrmroot-loader = { path = "../../crates/wyrmroot-loader", optional = true }
+wyrmroot-registry-proto = { path = "../../crates/wyrmroot-registry-proto", optional = true }
+wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime", optional = true }
+wyrmroot-stream-proto = { path = "../../crates/wyrmroot-stream-proto", optional = true }
+
+[lints.rust]
+unsafe_code = "deny"
+unused_crate_dependencies = "deny"

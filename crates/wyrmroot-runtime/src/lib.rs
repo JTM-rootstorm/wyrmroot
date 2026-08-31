@@ -23,6 +23,12 @@ mod diagnostics;
     reason = "selector-30 confines generated DW1-D calls and one private carrier to a test-only facade"
 )]
 mod dw1d6;
+#[cfg(feature = "dw1e3-test-evidence")]
+#[allow(
+    unsafe_code,
+    reason = "selector-31 confines one private six-word evidence carrier to a test-only facade"
+)]
+mod dw1e3;
 mod entry;
 #[allow(
     unsafe_code,
@@ -82,6 +88,11 @@ pub use device::{
 };
 #[cfg(feature = "dw1d6-test-evidence")]
 pub use dw1d6::{D6ReportEvent, d6_arm, d6_bind, d6_deliver, d6_report};
+#[cfg(feature = "dw1e3-test-evidence")]
+pub use dw1e3::{
+    Dw1e3ReportEvent, dw1e3_arm_challenge, dw1e3_bind_driver, dw1e3_bind_probe, dw1e3_build_nonce,
+    dw1e3_report,
+};
 pub use loader_native::{LOADER_ABORT_CODE, NativeLoaderPlatform};
 pub use native::{
     MappedBootfs, NativeError, NativeOutputError, PANIC_EXIT_CODE, ReceiveCounts, close_handle,
