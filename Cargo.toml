@@ -12,6 +12,7 @@ members = [
     "crates/wyrmroot-rrc-manifest",
     "crates/wyrmroot-runtime",
     "crates/wyrmroot-stream-proto",
+    "crates/wyrmroot-uart16550-core",
     "loader",
     "tools/xtask",
     "userspace/hello",
