@@ -41,9 +41,13 @@ fn native_loop_checks_control_and_pio_before_interrupt_ack() {
 fn startup_and_stream_peer_close_precedence_is_explicit() {
     assert_eq!(DRIVER.matches("!startup_control_is_readable(").count(), 2);
 
-    let simultaneous = DRIVER.find("if peer_closed && readable").unwrap();
-    let drain = simultaneous
-        + DRIVER[simultaneous..]
+    let pending = DRIVER.find("peer_close_drain.is_pending()").unwrap();
+    let capacity = pending
+        + DRIVER[pending..]
+            .find("while driver.wants_stream_readable()")
+            .unwrap();
+    let drain = capacity
+        + DRIVER[capacity..]
             .find("service_stream_read(driver, control, pio_failed)")
             .unwrap();
     let blocked = drain
@@ -54,7 +58,12 @@ fn startup_and_stream_peer_close_precedence_is_explicit() {
         + DRIVER[blocked..]
             .find("isolate_stream(driver, control)")
             .unwrap();
-    assert!(simultaneous < drain && drain < blocked && blocked < detach);
+    assert!(pending < capacity && capacity < drain && drain < blocked && blocked < detach);
+
+    let suppress = DRIVER
+        .find("peer_close_drain.include_stream_wait(receive_capacity)")
+        .unwrap();
+    assert!(suppress < pending);
 }
 
 #[test]

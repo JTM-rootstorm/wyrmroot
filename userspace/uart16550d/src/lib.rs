@@ -47,6 +47,37 @@ pub const fn startup_control_is_readable(index: u32, signals: DwSignals) -> bool
     index == 0 && signals.0 & DW_SIGNAL_PEER_CLOSED.0 == 0 && signals.0 & DW_SIGNAL_READABLE.0 != 0
 }
 
+/// Tracks a closed stream whose final queued DATA cannot yet be received
+/// without violating the 1024-byte TX admission gate.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PeerCloseDrain {
+    pending: bool,
+}
+
+impl PeerCloseDrain {
+    pub const fn new() -> Self {
+        Self { pending: false }
+    }
+
+    pub fn observe(&mut self) {
+        self.pending = true;
+    }
+
+    pub fn clear(&mut self) {
+        self.pending = false;
+    }
+
+    pub const fn is_pending(self) -> bool {
+        self.pending
+    }
+
+    /// Omits the stream wait item while a sticky PEER_CLOSED signal would
+    /// hot-loop but TX capacity cannot admit the next maximum DATA record.
+    pub const fn include_stream_wait(self, receive_capacity: bool) -> bool {
+        !self.pending || receive_capacity
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReceivedDeviceResource {
     pub handle: DwHandle,
@@ -1194,5 +1225,77 @@ mod tests {
         let (_, detached) = driver.detach_stream().unwrap();
         assert_eq!(detached, endpoint);
         assert_eq!(driver.uart().tx_len(), payload.len());
+    }
+
+    #[test]
+    fn peer_close_drain_pauses_at_capacity_then_accepts_the_fifth_record() {
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let mut io = ScriptedIo::new(trace);
+        let interrupt_reads = core::iter::once(1).chain((0..64).flat_map(|_| [2, 1]));
+        io.push_reads(2, interrupt_reads);
+        let mut driver = production(io);
+        driver.activate().unwrap();
+        let endpoint = ReceivedStreamEndpoint {
+            handle: DwHandle(20),
+            object_type: DW_OBJECT_TYPE_CHANNEL,
+            rights: RAW_STREAM_RIGHTS,
+            reserved0: 0,
+            reserved: [0; 2],
+        };
+        driver
+            .attach_stream(
+                ControlMessageV1_1::AttachStream {
+                    identity: identity(21),
+                    stream_generation: 22,
+                    publication_generation: 23,
+                },
+                endpoint,
+            )
+            .unwrap();
+
+        let payload = [0x5a; MAX_PAYLOAD_BYTES];
+        let mut wire = [0; MAX_RECORD_BYTES];
+        let size = encode_data(&payload, &mut wire).unwrap();
+        let mut queued = VecDeque::from([wire; 5]);
+        let mut drain = PeerCloseDrain::new();
+        drain.observe();
+        while drain.is_pending() && driver.wants_stream_readable() && !queued.is_empty() {
+            assert_eq!(
+                driver.accept_stream_record(&queued.front().unwrap()[..size], 0),
+                Ok(payload.len())
+            );
+            queued.pop_front();
+        }
+        assert_eq!(queued.len(), 1);
+        assert_eq!(driver.uart().tx_len(), RING_CAPACITY);
+        assert!(!drain.include_stream_wait(driver.wants_stream_readable()));
+        assert_eq!(driver.stream_endpoint(), Some(endpoint));
+
+        let mut transmitted = 0;
+        for _ in 0..64 {
+            let drained = driver.drain_interrupt().unwrap();
+            transmitted += driver
+                .acknowledge_interrupt(drained, true, |_| Ok(()))
+                .unwrap()
+                .transmitted;
+        }
+        assert!(driver.wants_stream_readable());
+        assert!(drain.include_stream_wait(driver.wants_stream_readable()));
+        assert_eq!(
+            driver.accept_stream_record(&queued.front().unwrap()[..size], 0),
+            Ok(payload.len())
+        );
+        queued.pop_front();
+        assert!(queued.is_empty());
+
+        drain.clear();
+        let (_, detached) = driver.detach_stream().unwrap();
+        assert_eq!(detached, endpoint);
+        assert_eq!(transmitted, 1024);
+        assert_eq!(driver.uart().tx_len(), RING_CAPACITY);
+        assert_eq!(
+            usize::from(transmitted) + driver.uart().tx_len(),
+            5 * MAX_PAYLOAD_BYTES
+        );
     }
 }

@@ -30,7 +30,7 @@ use wyrmroot_runtime::{
 use wyrmroot_stream_proto::MAX_RECORD_BYTES;
 use wyrmroot_uart16550_core::ByteRegisterIo;
 use wyrmroot_uart16550d::{
-    DeviceStage, ProductionDriver, ReceivedDeviceResource, ReceivedInterrupt,
+    DeviceStage, PeerCloseDrain, ProductionDriver, ReceivedDeviceResource, ReceivedInterrupt,
     ReceivedStreamEndpoint, startup_control_is_readable,
 };
 
@@ -273,6 +273,7 @@ fn run_event_loop<I: ByteRegisterIo>(
     control: DwHandle,
     pio_failed: &Cell<bool>,
 ) -> Result<u32, u32> {
+    let mut peer_close_drain = PeerCloseDrain::new();
     loop {
         let mut items = [DwWaitItemV1::default(); 3];
         items[0] = DwWaitItemV1 {
@@ -285,18 +286,21 @@ fn run_event_loop<I: ByteRegisterIo>(
         };
         let mut count = 2;
         if let Some(stream) = driver.stream_endpoint() {
-            let mut signals = DW_SIGNAL_PEER_CLOSED.0;
-            if driver.wants_stream_readable() {
-                signals |= DW_SIGNAL_READABLE.0;
+            let receive_capacity = driver.wants_stream_readable();
+            if peer_close_drain.include_stream_wait(receive_capacity) {
+                let mut signals = DW_SIGNAL_PEER_CLOSED.0;
+                if receive_capacity {
+                    signals |= DW_SIGNAL_READABLE.0;
+                }
+                if !peer_close_drain.is_pending() && driver.wants_stream_writable() {
+                    signals |= DW_SIGNAL_WRITABLE.0;
+                }
+                items[2] = DwWaitItemV1 {
+                    handle: stream.handle,
+                    signals: DwSignals(signals),
+                };
+                count = 3;
             }
-            if driver.wants_stream_writable() {
-                signals |= DW_SIGNAL_WRITABLE.0;
-            }
-            items[2] = DwWaitItemV1 {
-                handle: stream.handle,
-                signals: DwSignals(signals),
-            };
-            count = 3;
         }
         let observed = match wait_many(&items[..count], DW_DEADLINE_INFINITE) {
             Ok(observed) => observed,
@@ -348,32 +352,36 @@ fn run_event_loop<I: ByteRegisterIo>(
         if observed.index == 2 {
             let peer_closed = observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0;
             let readable = observed.observed.0 & DW_SIGNAL_READABLE.0 != 0;
-            if peer_closed && readable {
-                loop {
+            if peer_closed {
+                peer_close_drain.observe();
+            }
+            if peer_close_drain.is_pending() {
+                while driver.wants_stream_readable() {
                     match service_stream_read(driver, control, pio_failed) {
                         Ok(StreamReadOutcome::Accepted) => {}
                         Ok(StreamReadOutcome::WouldBlock) => {
                             if isolate_stream(driver, control).is_err() {
                                 return fail_driver(driver, control, 41);
                             }
+                            peer_close_drain.clear();
                             break;
                         }
-                        Ok(StreamReadOutcome::Detached) => break,
+                        Ok(StreamReadOutcome::Detached) => {
+                            peer_close_drain.clear();
+                            break;
+                        }
                         Err(()) => return fail_driver(driver, control, 42),
                     }
-                }
-                continue;
-            }
-            if peer_closed {
-                if isolate_stream(driver, control).is_err() {
-                    return fail_driver(driver, control, 41);
                 }
                 continue;
             }
             if readable {
                 match service_stream_read(driver, control, pio_failed) {
                     Ok(StreamReadOutcome::Accepted | StreamReadOutcome::WouldBlock) => {}
-                    Ok(StreamReadOutcome::Detached) => continue,
+                    Ok(StreamReadOutcome::Detached) => {
+                        peer_close_drain.clear();
+                        continue;
+                    }
                     Err(()) => return fail_driver(driver, control, 42),
                 }
             }
@@ -460,7 +468,10 @@ fn service_stream_read<I: ByteRegisterIo>(
     let mut handles = [DwReceivedHandleInfoV1::default(); 16];
     let counts = match receive_channel(endpoint.handle, &mut bytes, &mut handles) {
         Ok(counts) => counts,
-        Err(error) if status_is(error, DW_STATUS_WOULD_BLOCK) => {
+        Err(error)
+            if status_is(error, DW_STATUS_WOULD_BLOCK)
+                || status_is(error, DW_STATUS_PEER_CLOSED) =>
+        {
             return Ok(StreamReadOutcome::WouldBlock);
         }
         Err(_) => {
