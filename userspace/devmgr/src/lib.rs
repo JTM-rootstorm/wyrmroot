@@ -1138,6 +1138,16 @@ mod tests {
             resident.accept(rebind(binding(2, 8), 42), 1),
             Ok(ControllerAction::PublicationRebound)
         );
+        assert_eq!(
+            resident.report(StatusCode::OperationalWaitingForDeviceBundle),
+            Ok(ControllerMessage::Status {
+                supervisor_generation: SupervisorGeneration(7),
+                binding: Some(binding(2, 8)),
+                transaction_id: 42,
+                status: StatusCode::OperationalWaitingForDeviceBundle,
+                attempt_generation: None,
+            })
+        );
         assert_eq!(resident.status().state, CoordinatorState::CleaningUp);
         resident.complete_driver_failure_cleanup(0).unwrap();
         assert_eq!(

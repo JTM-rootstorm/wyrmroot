@@ -148,6 +148,49 @@ fn c6_retirement_uses_a_fresh_endpoint_local_registry_transaction() {
 }
 
 #[test]
+fn c6_inline_publication_rebind_is_acknowledged_before_driver_backoff() {
+    let cleanup = &NATIVE[NATIVE
+        .find("send_driver_retired(bootstrap, request)?")
+        .expect("driver retirement notification")..];
+    let receive = cleanup
+        .find("let (replacement, action) = receive_controller")
+        .expect("inline rebind receive");
+    let install = cleanup
+        .find("publication.replace(replacement)")
+        .expect("replacement publication install");
+    let acknowledge = cleanup
+        .find("StatusCode::OperationalWaitingForDeviceBundle")
+        .expect("rebind acknowledgement status");
+    let acknowledge_failure = cleanup
+        .find("if let Err(code) = acknowledged")
+        .expect("failed acknowledgement cleanup");
+    let close_resource = cleanup
+        .find("close_optional(device_resource.take())")
+        .expect("failed acknowledgement closes the retained resource");
+    let close_publication = cleanup
+        .find("close_optional(publication.take())")
+        .expect("failed acknowledgement closes the replacement publication");
+    let close_bootstrap = cleanup
+        .find("let _ = close_handle(bootstrap)")
+        .expect("failed acknowledgement closes the bootstrap channel");
+    let cleanup_complete = cleanup
+        .find("complete_driver_failure_cleanup(now)")
+        .expect("cleanup completion");
+    let retry = cleanup
+        .find("resident.driver_retry_ready(now)")
+        .expect("bounded retry transition");
+    assert!(receive < install);
+    assert!(install < acknowledge);
+    assert!(acknowledge < acknowledge_failure);
+    assert!(acknowledge_failure < close_resource);
+    assert!(close_resource < close_publication);
+    assert!(close_publication < close_bootstrap);
+    assert!(close_bootstrap < cleanup_complete);
+    assert!(acknowledge < cleanup_complete);
+    assert!(cleanup_complete < retry);
+}
+
+#[test]
 fn selector29_native_path_has_no_physical_device_io_calls() {
     assert!(!NATIVE.contains("device_pio_read"));
     assert!(!NATIVE.contains("device_pio_write"));

@@ -564,6 +564,21 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                 if publication.replace(replacement).is_some() {
                     return Err(failure(49));
                 }
+                // This cleanup path consumes the rebind synchronously instead
+                // of returning to the outer controller loop.  Acknowledge the
+                // committed binding here so init can finish the same WRCS
+                // transaction before the bounded driver backoff begins.
+                let acknowledged = send_resident_status(
+                    bootstrap,
+                    &resident,
+                    StatusCode::OperationalWaitingForDeviceBundle,
+                );
+                if let Err(code) = acknowledged {
+                    close_optional(device_resource.take());
+                    close_optional(publication.take());
+                    let _ = close_handle(bootstrap);
+                    return Err(code);
+                }
                 let now = monotonic_active_now().map_err(|_| failure(50))?;
                 resident
                     .complete_driver_failure_cleanup(now)
