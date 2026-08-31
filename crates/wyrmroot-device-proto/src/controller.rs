@@ -295,8 +295,12 @@ pub fn validate_binding_transition(
         ControllerMessage::Status { .. } => return Err(ControllerParseError::StaleBinding),
         _ => {}
     }
+    // Registry generation identifies the resident registryd lifetime, not a
+    // publication incarnation. A driver-only rebind therefore keeps that
+    // generation and advances the boot-monotonic endpoint identity.
     if let Some(old) = current
-        && (binding.generation.0 <= old.generation.0
+        && (binding.generation.0 < old.generation.0
+            || binding.endpoint.id.0 < old.endpoint.id.0
             || (binding.endpoint.id.0 == old.endpoint.id.0
                 && binding.endpoint.generation.0 <= old.endpoint.generation.0))
     {
@@ -545,6 +549,60 @@ mod tests {
         };
         assert_eq!(
             validate_binding_transition(SUPERVISOR, Some(BINDING), replay),
+            Err(ControllerParseError::StaleBinding)
+        );
+
+        let same_registry_fresh_endpoint = ControllerMessage::RebindPublication {
+            supervisor_generation: SUPERVISOR,
+            binding: RegistryBinding {
+                generation: BINDING.generation,
+                endpoint: RegistryEndpoint {
+                    id: RegistryEndpointId(BINDING.endpoint.id.0 + 1),
+                    generation: RegistryEndpointGeneration(1),
+                },
+            },
+            transaction_id: 7,
+        };
+        assert_eq!(
+            validate_binding_transition(SUPERVISOR, Some(BINDING), same_registry_fresh_endpoint,),
+            Ok(RegistryBinding {
+                generation: BINDING.generation,
+                endpoint: RegistryEndpoint {
+                    id: RegistryEndpointId(BINDING.endpoint.id.0 + 1),
+                    generation: RegistryEndpointGeneration(1),
+                },
+            })
+        );
+
+        let endpoint_id_rollback = ControllerMessage::RebindPublication {
+            supervisor_generation: SUPERVISOR,
+            binding: RegistryBinding {
+                generation: BINDING.generation,
+                endpoint: RegistryEndpoint {
+                    id: RegistryEndpointId(BINDING.endpoint.id.0 - 1),
+                    generation: RegistryEndpointGeneration(1),
+                },
+            },
+            transaction_id: 8,
+        };
+        assert_eq!(
+            validate_binding_transition(SUPERVISOR, Some(BINDING), endpoint_id_rollback),
+            Err(ControllerParseError::StaleBinding)
+        );
+
+        let registry_generation_rollback = ControllerMessage::RebindPublication {
+            supervisor_generation: SUPERVISOR,
+            binding: RegistryBinding {
+                generation: RegistryGeneration(BINDING.generation.0 - 1),
+                endpoint: RegistryEndpoint {
+                    id: RegistryEndpointId(BINDING.endpoint.id.0 + 1),
+                    generation: RegistryEndpointGeneration(1),
+                },
+            },
+            transaction_id: 9,
+        };
+        assert_eq!(
+            validate_binding_transition(SUPERVISOR, Some(BINDING), registry_generation_rollback,),
             Err(ControllerParseError::StaleBinding)
         );
     }

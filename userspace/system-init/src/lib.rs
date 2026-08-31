@@ -149,9 +149,7 @@ const fn test_failure_category(error: &InitError) -> u32 {
 #[must_use]
 pub const fn wyr1c6_test_failure_application_status(error: &InitError) -> u32 {
     match error {
-        InitError::Native(error) => {
-            0xAF1D_0000 | wyrmroot_runtime::native_error_code(*error)
-        }
+        InitError::Native(error) => 0xAF1D_0000 | wyrmroot_runtime::native_error_code(*error),
         _ => 0xAF1C_0000 | test_failure_category(error),
     }
 }

@@ -122,6 +122,7 @@ pub(crate) struct ResidentState {
     topology: RegistryTopology,
     devmgr: Option<ActiveNativeRole>,
     binding: Option<wyrmroot_device_proto::RegistryBinding>,
+    publication_service_generation: u64,
     waiting_registry_observed: bool,
     publication_allocator: PublicationAllocator,
     last_controller_transaction: u64,
@@ -153,9 +154,11 @@ pub(crate) struct ResidentState {
     #[cfg(feature = "wyr1c6-selector29")]
     c6_u1_endpoint: Option<u64>,
     #[cfg(feature = "wyr1c6-selector29")]
-    c6_p1_binding: Option<u64>,
+    c6_p1_service_generation: u64,
     #[cfg(feature = "wyr1c6-selector29")]
-    c6_p1_endpoint: Option<u64>,
+    c6_p1_registry_generation: u64,
+    #[cfg(feature = "wyr1c6-selector29")]
+    c6_p1_endpoint_generation: u64,
     #[cfg(feature = "wyr1c6-selector29")]
     c6_u2_irq: Option<u64>,
     #[cfg(feature = "wyr1c6-selector29")]
@@ -163,9 +166,11 @@ pub(crate) struct ResidentState {
     #[cfg(feature = "wyr1c6-selector29")]
     c6_u2_endpoint: Option<u64>,
     #[cfg(feature = "wyr1c6-selector29")]
-    c6_p2_binding: Option<u64>,
+    c6_p2_service_generation: u64,
     #[cfg(feature = "wyr1c6-selector29")]
-    c6_p2_endpoint: Option<u64>,
+    c6_p2_registry_generation: u64,
+    #[cfg(feature = "wyr1c6-selector29")]
+    c6_p2_endpoint_generation: u64,
     last_driver_attempt: u64,
     last_driver_session: u64,
     last_driver_endpoint: u64,
@@ -176,6 +181,7 @@ pub(crate) struct ResidentState {
 struct DevmgrNativeAttempt {
     active: ActiveNativeRole,
     binding: wyrmroot_device_proto::RegistryBinding,
+    publication_service_generation: u64,
     last_controller_transaction: u64,
     next_controller_transaction: u64,
 }
@@ -357,6 +363,7 @@ where
         topology,
         devmgr: Some(devmgr.active),
         binding: Some(devmgr.binding),
+        publication_service_generation: devmgr.publication_service_generation,
         waiting_registry_observed: false,
         publication_allocator,
         last_controller_transaction: devmgr.last_controller_transaction,
@@ -388,9 +395,11 @@ where
         #[cfg(feature = "wyr1c6-selector29")]
         c6_u1_endpoint: None,
         #[cfg(feature = "wyr1c6-selector29")]
-        c6_p1_binding: None,
+        c6_p1_service_generation: 0,
         #[cfg(feature = "wyr1c6-selector29")]
-        c6_p1_endpoint: None,
+        c6_p1_registry_generation: 0,
+        #[cfg(feature = "wyr1c6-selector29")]
+        c6_p1_endpoint_generation: 0,
         #[cfg(feature = "wyr1c6-selector29")]
         c6_u2_irq: None,
         #[cfg(feature = "wyr1c6-selector29")]
@@ -398,9 +407,11 @@ where
         #[cfg(feature = "wyr1c6-selector29")]
         c6_u2_endpoint: None,
         #[cfg(feature = "wyr1c6-selector29")]
-        c6_p2_binding: None,
+        c6_p2_service_generation: 0,
         #[cfg(feature = "wyr1c6-selector29")]
-        c6_p2_endpoint: None,
+        c6_p2_registry_generation: 0,
+        #[cfg(feature = "wyr1c6-selector29")]
+        c6_p2_endpoint_generation: 0,
         last_driver_attempt: 0,
         last_driver_session: 0,
         last_driver_endpoint: 0,
@@ -835,6 +846,7 @@ where
             task_group,
         },
         binding,
+        publication_service_generation: publication.service_generation,
         last_controller_transaction: transaction_id,
         next_controller_transaction: transaction_id.checked_add(1).ok_or(InitError::Accounting)?,
     })
@@ -1183,16 +1195,20 @@ fn accept_c6_fact(resident: &mut ResidentSystemInit, fact: C6Fact) -> Result<(),
                 && Some(fact.aux) == state.c6_u1_endpoint
         }
         5 => {
+            let binding = state.binding;
             fact.lease == state.c6_d1_lease.unwrap_or(0)
-                && fact.binding != 0
+                && binding.is_some_and(|binding| {
+                    fact.binding == binding.generation.0
+                        && fact.aux == binding.endpoint.generation.0
+                })
                 && fact.value == state.c6_u1_attempt.unwrap_or(0)
-                && fact.aux != 0
+                && state.publication_service_generation != 0
         }
         7 => {
             fact.lease == state.c6_d1_lease.unwrap_or(0)
-                && Some(fact.binding) == state.c6_p1_binding
+                && fact.binding == state.c6_p1_registry_generation
                 && Some(fact.value) == state.c6_u1_attempt
-                && Some(fact.aux) == state.c6_p1_endpoint
+                && fact.aux == state.c6_p1_endpoint_generation
         }
         9 => {
             fact.lease == state.c6_d1_lease.unwrap_or(0)
@@ -1214,28 +1230,32 @@ fn accept_c6_fact(resident: &mut ResidentSystemInit, fact: C6Fact) -> Result<(),
                 && Some(fact.aux) == state.c6_u2_endpoint
         }
         12 => {
+            let binding = state.binding;
             fact.lease == state.c6_d1_lease.unwrap_or(0)
-                && fact.binding > state.c6_p1_binding.unwrap_or(0)
+                && binding.is_some_and(|binding| {
+                    fact.binding == binding.generation.0
+                        && fact.aux == binding.endpoint.generation.0
+                })
                 && Some(fact.value) == state.c6_u2_attempt
-                && fact.aux != 0
+                && state.publication_service_generation > state.c6_p1_service_generation
         }
         13 => {
             fact.lease == state.c6_d1_lease.unwrap_or(0)
-                && Some(fact.binding) == state.c6_p1_binding
+                && fact.binding == state.c6_p1_registry_generation
                 && Some(fact.value) == state.c6_u1_attempt
                 && fact.aux == 3
         }
         14 => {
             fact.lease == state.c6_d1_lease.unwrap_or(0)
-                && Some(fact.binding) == state.c6_p2_binding
+                && fact.binding == state.c6_p2_registry_generation
                 && Some(fact.value) == state.c6_d1_supervisor
                 && fact.aux == 0
         }
         15 => {
             fact.lease == state.c6_d1_lease.unwrap_or(0)
-                && Some(fact.binding) == state.c6_p2_binding
+                && fact.binding == state.c6_p2_service_generation
                 && Some(fact.value) == state.c6_u2_attempt
-                && Some(fact.aux) == state.c6_p2_endpoint
+                && fact.aux == state.c6_p2_endpoint_generation
         }
         16 => {
             fact.lease == state.c6_d1_lease.unwrap_or(0)
@@ -1318,10 +1338,6 @@ fn accept_c6_fact(resident: &mut ResidentSystemInit, fact: C6Fact) -> Result<(),
     if !valid {
         return Err(InitError::WrongManifestProfile);
     }
-    let log = state
-        .c6_evidence
-        .as_mut()
-        .ok_or(InitError::WrongActivationOrder)?;
     let event = match fact.event {
         1 => crate::wyr1c6_gate::GateEvent::D1Begin,
         2 => crate::wyr1c6_gate::GateEvent::D1Lease,
@@ -1351,7 +1367,18 @@ fn accept_c6_fact(resident: &mut ResidentSystemInit, fact: C6Fact) -> Result<(),
         26 => crate::wyr1c6_gate::GateEvent::Bounded,
         _ => return Err(InitError::WrongManifestProfile),
     };
-    log.record(event, fact.lease, fact.binding, fact.value, fact.aux)
+    let evidence_binding = c6_evidence_binding(
+        fact.event,
+        fact.binding,
+        state.publication_service_generation,
+        state.c6_p1_service_generation,
+        state.c6_p2_service_generation,
+    );
+    let log = state
+        .c6_evidence
+        .as_mut()
+        .ok_or(InitError::WrongActivationOrder)?;
+    log.record(event, fact.lease, evidence_binding, fact.value, fact.aux)
         .map_err(|_| InitError::WrongManifestProfile)?;
     match fact.event {
         1 => {
@@ -1364,8 +1391,9 @@ fn accept_c6_fact(resident: &mut ResidentSystemInit, fact: C6Fact) -> Result<(),
             state.c6_u1_endpoint = Some(fact.aux);
         }
         5 => {
-            state.c6_p1_binding = Some(fact.binding);
-            state.c6_p1_endpoint = Some(fact.aux);
+            state.c6_p1_service_generation = state.publication_service_generation;
+            state.c6_p1_registry_generation = fact.binding;
+            state.c6_p1_endpoint_generation = fact.aux;
         }
         6 => {
             state.c6_d1_driver_failures = state
@@ -1379,8 +1407,9 @@ fn accept_c6_fact(resident: &mut ResidentSystemInit, fact: C6Fact) -> Result<(),
             state.c6_u2_endpoint = Some(fact.aux);
         }
         12 => {
-            state.c6_p2_binding = Some(fact.binding);
-            state.c6_p2_endpoint = Some(fact.aux);
+            state.c6_p2_service_generation = state.publication_service_generation;
+            state.c6_p2_registry_generation = fact.binding;
+            state.c6_p2_endpoint_generation = fact.aux;
         }
         19 => {
             state.c6_d2_lease = Some(fact.lease);
@@ -1394,6 +1423,22 @@ fn accept_c6_fact(resident: &mut ResidentSystemInit, fact: C6Fact) -> Result<(),
         emit_c6_terminal_facts(resident)?;
     }
     Ok(())
+}
+
+#[cfg(feature = "wyr1c6-selector29")]
+const fn c6_evidence_binding(
+    event: u8,
+    observed_registry_generation: u64,
+    current_service_generation: u64,
+    p1_service_generation: u64,
+    p2_service_generation: u64,
+) -> u64 {
+    match event {
+        5 | 12 => current_service_generation,
+        7 | 13 => p1_service_generation,
+        14 => p2_service_generation,
+        _ => observed_registry_generation,
+    }
 }
 
 #[cfg(feature = "wyr1c6-selector29")]
@@ -2086,11 +2131,17 @@ where
                 .ok_or(InitError::WrongActivationOrder)?;
             (
                 state.c6_d1_lease.ok_or(InitError::WrongActivationOrder)?,
-                state.c6_p2_binding.ok_or(InitError::WrongActivationOrder)?,
+                if state.c6_p2_service_generation == 0 {
+                    return Err(InitError::WrongActivationOrder);
+                } else {
+                    state.c6_p2_service_generation
+                },
                 state.c6_u2_attempt.ok_or(InitError::WrongActivationOrder)?,
-                state
-                    .c6_p2_endpoint
-                    .ok_or(InitError::WrongActivationOrder)?,
+                if state.c6_p2_endpoint_generation == 0 {
+                    return Err(InitError::WrongActivationOrder);
+                } else {
+                    state.c6_p2_endpoint_generation
+                },
                 state.c6_u2_irq.ok_or(InitError::WrongActivationOrder)?,
                 state.c6_u2_attempt.ok_or(InitError::WrongActivationOrder)?,
                 state
@@ -2274,6 +2325,7 @@ where
                     .ok_or(InitError::WrongActivationOrder)?;
                 state.devmgr = Some(attempt.active);
                 state.binding = Some(attempt.binding);
+                state.publication_service_generation = attempt.publication_service_generation;
                 state.last_controller_transaction = attempt.last_controller_transaction;
                 state.next_controller_transaction = attempt.next_controller_transaction;
                 state.waiting_registry_observed = false;
@@ -2352,7 +2404,7 @@ where
         .ok_or(InitError::WrongActivationOrder)?;
     let registry = state.registry.ok_or(InitError::WrongActivationOrder)?;
     let devmgr = state.devmgr.ok_or(InitError::WrongActivationOrder)?;
-    let (binding, transaction_id) = perform_rebind(
+    let (binding, publication_service_generation, transaction_id) = perform_rebind(
         system,
         waits,
         &mut state.topology,
@@ -2362,6 +2414,7 @@ where
         state.next_controller_transaction,
     )?;
     state.binding = Some(binding);
+    state.publication_service_generation = publication_service_generation;
     state.waiting_registry_observed = false;
     state.last_controller_transaction = transaction_id;
     state.next_controller_transaction =
@@ -2377,7 +2430,7 @@ fn perform_rebind<S, W>(
     registry_control: DwHandle,
     devmgr: ActiveNativeRole,
     transaction_id: u64,
-) -> Result<(wyrmroot_device_proto::RegistryBinding, u64), InitError>
+) -> Result<(wyrmroot_device_proto::RegistryBinding, u64, u64), InitError>
 where
     S: Wyr1BPlatform,
     W: SupervisionPlatform<Error = NativeError>,
@@ -2452,7 +2505,7 @@ where
         transaction_id,
         StatusCode::OperationalWaitingForDeviceBundle,
     )?;
-    Ok((binding, transaction_id))
+    Ok((binding, publication.service_generation, transaction_id))
 }
 
 #[cfg(test)]
@@ -2664,6 +2717,16 @@ mod tests {
         }
     }
 
+    fn rebound_binding() -> wyrmroot_device_proto::RegistryBinding {
+        wyrmroot_device_proto::RegistryBinding {
+            generation: RegistryGeneration(2),
+            endpoint: RegistryEndpoint {
+                id: RegistryEndpointId(2),
+                generation: RegistryEndpointGeneration(1),
+            },
+        }
+    }
+
     fn waiting_device_status() -> ControllerMessage {
         ControllerMessage::Status {
             supervisor_generation: SupervisorGeneration(7),
@@ -2676,20 +2739,33 @@ mod tests {
 
     #[test]
     fn successful_rebind_preserves_devmgr_generation_and_commits_correlation() {
-        let mut platform = RebindPlatform::with_status(waiting_device_status());
+        let status = ControllerMessage::Status {
+            supervisor_generation: SupervisorGeneration(7),
+            binding: Some(rebound_binding()),
+            transaction_id: 9,
+            status: StatusCode::OperationalWaitingForDeviceBundle,
+            attempt_generation: None,
+        };
+        let mut platform = RebindPlatform::with_status(status);
         let mut waits = StatusWaits { fail: false };
         let mut topology = RegistryTopology::new(2).unwrap();
+        let initial_grant = topology.issue(7, EndpointKind::Publication).unwrap();
+        assert_eq!(initial_grant.endpoint_id, 1);
+        let mut publications = PublicationAllocator::new();
+        let initial_publication = publications.issue().unwrap();
         let result = perform_rebind(
             &mut platform,
             &mut waits,
             &mut topology,
-            &mut PublicationAllocator::new(),
+            &mut publications,
             DwHandle(40),
             devmgr(),
             9,
         )
         .unwrap();
-        assert_eq!(result, (binding(), 9));
+        assert_eq!(result.0, rebound_binding());
+        assert!(result.1 > initial_publication.service_generation);
+        assert_eq!(result.2, 9);
         assert_eq!(platform.send_count, 2);
         assert_eq!(platform.close_count, 0);
         assert_eq!(devmgr().generation, 7);
@@ -2812,6 +2888,51 @@ mod tests {
         assert_ne!(initial.publication_id, initial.service_generation);
         assert_ne!(initial.publication_id, initial.transaction_id);
         assert_ne!(initial.service_generation, initial.transaction_id);
+    }
+
+    #[cfg(feature = "wyr1c6-selector29")]
+    #[test]
+    fn c6_publication_records_use_service_generation_not_registry_generation() {
+        let registry_generation = 7;
+        let p1_service_generation = 0xC1_0801;
+        let p2_service_generation = 0xC1_0802;
+
+        assert_eq!(
+            c6_evidence_binding(5, registry_generation, p1_service_generation, 0, 0),
+            p1_service_generation
+        );
+        assert_eq!(
+            c6_evidence_binding(
+                7,
+                registry_generation,
+                p2_service_generation,
+                p1_service_generation,
+                0,
+            ),
+            p1_service_generation
+        );
+        assert_eq!(
+            c6_evidence_binding(
+                12,
+                registry_generation,
+                p2_service_generation,
+                p1_service_generation,
+                0,
+            ),
+            p2_service_generation
+        );
+        assert_eq!(
+            c6_evidence_binding(
+                14,
+                registry_generation,
+                p2_service_generation,
+                p1_service_generation,
+                p2_service_generation,
+            ),
+            p2_service_generation
+        );
+        assert!(p2_service_generation > p1_service_generation);
+        assert_ne!(p1_service_generation, registry_generation);
     }
 
     fn wrdm(identity: [u8; 32]) -> [u8; WRDM_HEADER_BYTES + WRDM_RECORD_BYTES] {

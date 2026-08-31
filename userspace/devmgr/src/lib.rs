@@ -938,7 +938,7 @@ mod tests {
         resident.admit_device_resource(exact_resource(19)).unwrap();
         resident.publication_peer_closed().unwrap();
 
-        let second = binding(2, 8);
+        let second = binding(1, 8);
         assert_eq!(
             resident.accept(rebind(second, 42), 1),
             Ok(ControllerAction::PublicationRebound)
@@ -1135,14 +1135,14 @@ mod tests {
         resident.publication_retired().unwrap();
         resident.reap_driver().unwrap();
         assert_eq!(
-            resident.accept(rebind(binding(2, 8), 42), 1),
+            resident.accept(rebind(binding(1, 8), 42), 1),
             Ok(ControllerAction::PublicationRebound)
         );
         assert_eq!(
             resident.report(StatusCode::OperationalWaitingForDeviceBundle),
             Ok(ControllerMessage::Status {
                 supervisor_generation: SupervisorGeneration(7),
-                binding: Some(binding(2, 8)),
+                binding: Some(binding(1, 8)),
                 transaction_id: 42,
                 status: StatusCode::OperationalWaitingForDeviceBundle,
                 attempt_generation: None,
@@ -1212,7 +1212,7 @@ mod tests {
             resident.accept(rebind(first, 42), 1),
             Err(DevmgrError::Controller(ControllerParseError::StaleBinding))
         );
-        let second = binding(2, 8);
+        let second = binding(1, 8);
         assert_eq!(
             resident.accept(rebind(second, 42), 1),
             Ok(ControllerAction::PublicationRebound)
