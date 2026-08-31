@@ -46,9 +46,13 @@ optional stream. Control peer-close or exact `RETIRE` wins when readiness
 coexists. Stream readable interest is exposed only with at least 1024 bytes of
 TX-ring capacity, and writable interest only while RX bytes are pending. RX
 bytes are copied without removal and leave the core ring only after the WRST
-send commits; `WOULD_BLOCK` retains them. Malformed or handle-bearing WRST,
-stream transport failure, and stream peer-close detach and isolate only that
-stream so the healthy hardware generation can reconnect.
+send commits; `WOULD_BLOCK` retains them. Malformed or handle-bearing WRST and
+stream transport failure detach and isolate only that stream so the healthy
+hardware generation can reconnect. A peer-closed stream first drains
+already-queued records under the same 1024-byte admission gate; if TX capacity
+is exhausted, the loop suppresses the sticky peer-close wake until Interrupt
+progress restores capacity, then resumes draining and detaches only after the
+queue is empty.
 
 Teardown is bounded and ordered: best-effort IER zero while the resource is
 usable, close local stream state, close Interrupt, close DeviceResource, and
@@ -67,7 +71,7 @@ tools/pinned-cargo test -p wyrmroot-device-proto --lib --tests
 tools/pinned-cargo test -p wyrmroot-devmgr --lib --tests
 # 30 unit + 12 native-source regression tests passed
 tools/pinned-cargo test -p wyrmroot-uart16550d --lib --tests
-# 8 unit + 3 native-source + 1 D3C joined test passed
+# 10 unit + 4 native-source + 1 D3C joined test passed
 tools/pinned-cargo clippy -p wyrmroot-device-proto --lib --tests -- -D warnings
 tools/pinned-cargo clippy -p wyrmroot-uart16550-core --lib --tests -- -D warnings
 tools/pinned-cargo clippy -p wyrmroot-devmgr --lib --tests -- -D warnings
@@ -86,7 +90,10 @@ accepted-cargo check --offline --locked --target x86_64-unknown-wyrmroot \
   --features native-uart16550d
 accepted-cargo check --offline --locked --target x86_64-unknown-wyrmroot \
   --package wyrmroot-devmgr --bin devmgr --features wyr1d-production
-# both passed
+accepted-cargo check --offline --locked --target x86_64-unknown-wyrmroot \
+  --package wyrmroot-devmgr --bin devmgr \
+  --features wyr1c6-production,wyr1c6-selector29
+# all passed; the third command is the historical selector-29 target regression
 ```
 
 ## Required-source receipt and provenance
