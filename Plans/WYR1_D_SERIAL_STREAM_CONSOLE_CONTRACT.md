@@ -174,7 +174,9 @@ publication fails closed and closes every received handle.
 
 At most one attach is pending and at most one raw stream is active.
 
-1. Validate the connector endpoint and exact current publication generation.
+1. Validate the complete connector record, including nonzero client transaction
+   and exact current publication generation, before allocating identities or a
+   Channel pair.
 2. Reject a second pending/active request as `BUSY` without creating a pair.
 3. Mint a boot-monotonic nonzero attach transaction and stream generation.
 4. Create one broad pair, retain the client endpoint, and atomically MOVE only
@@ -188,8 +190,16 @@ close. After a successful driver-endpoint MOVE, devmgr never closes that moved
 handle: rejection, timeout, client-reply failure, retirement, or cleanup closes
 the retained client endpoint, and the driver closes its endpoint after exact
 cancel/retire/control close or observed peer close. Cleanup does not report
-complete until both sides are known released or the whole driver generation is
-terminal and reaped.
+complete until both sides are known released. A whole driver generation that
+is terminal and reaped proves the moved driver endpoint released, but does not
+by itself prove an externally owned client endpoint closed.
+
+The host model names the ownership states explicitly: pre-MOVE (both endpoints
+owned by devmgr), post-MOVE pending (client owned by devmgr, driver endpoint
+owned by the driver), ready-to-connect, active, and awaiting release. A stale
+READY/detach leaves the exact current state unchanged. For an active stream,
+driver-generation reap proves only driver-endpoint release; cleanup remains
+incomplete until client release is also observed, in either order.
 
 If the `CONNECTED` MOVE fails atomically, devmgr still owns and closes the
 client endpoint; the driver observes peer close and releases the moved peer.
@@ -405,7 +415,10 @@ child generation with fresh stdin/stdout/stderr endpoints.
 The child restart window contains failure timestamps, not launch attempts.
 Four failures in any rolling 60-second active-monotonic interval exhaust the
 local policy. On exhaustion consoled reports bounded failure to its supervisor
-and stops automatic child restart.
+and stops automatic child restart; a fifth launch is not attempted. The window
+is the half-open interval `(now - 60 seconds, now]`: before recording a failure,
+timestamps whose elapsed time is exactly 60 seconds or more are discarded.
+Active-monotonic clock regression fails closed.
 
 A **stable run** is exactly 60 continuous seconds beginning only after
 correlation-exact child READY while the same raw stream, console generation,
@@ -413,12 +426,18 @@ child generation, and all three child stream peers remain live. At that
 deadline consoled clears the child-failure timestamp window and restart count.
 Construction time, pre-READY time, a replaced serial generation, a closed
 stream, or a child that exits before the deadline cannot reset the window.
+Correlation-exact READY creates one stable-run token. Any raw-stream, console,
+child, or child-stream-peer loss or identity drift permanently invalidates that
+token; apparent recovery cannot revive it. A new exact READY is required to
+start another 60-second interval.
 
 Serial lookup/attach recovery separately permits four failed attempts in a
 rolling 60-second window with 25,000,000 ns between attempts. Successful
 correlation-exact `CONNECTED` clears that reconnect window. Exhaustion
-escalates to supervisor/recovery; it does not hot-loop. Restart windows are
-current-boot state and are not persisted across reboot.
+on the fourth still-active failure prevents a fifth attempt and escalates to
+supervisor/recovery; it does not hot-loop. Reconnect uses the same half-open
+expiry and clock-regression rules. Restart windows are current-boot state and
+are not persisted across reboot.
 
 ## 9. Selector 32 and structured Wyrmroot evidence
 
@@ -551,14 +570,19 @@ The D0 executable model is intentionally an integration test in
   trailing bytes, and unexpected-handle rejection;
 - one-record partial retention, queued-final-byte drain before EOF, partial
   writes, and a WRITABLE/send `WOULD_BLOCK` race;
-- connector stale/not-ready/busy behavior, exact READY correlation, pending
-  and active cleanup, reply failure, retirement, and moved-endpoint release;
+- connector zero/stale/not-ready/busy behavior, exact READY correlation,
+  explicit pre-/post-MOVE ownership, attach/reply failures, timeouts, active
+  detach, order-independent retirement cleanup, and deferred moved-endpoint
+  release without stale-event mutation;
 - exact 4096-byte RX/TX and staging bounds, drop-newest/saturating RX overflow,
   TX backpressure without drop, and all three console stages rejecting byte
   4097 without mutation;
 - selector-nonce/generation/leg-specific challenges, exact stdout/stderr
   response lengths and bytes, and type-specific response hashes across initial,
-  post-driver, and post-child legs; and
+  post-driver, and post-child legs;
+- fourth-failure exhaustion, exact 60-second expiry, continuous stable-run and
+  exact-CONNECTED reset policy, plus both UART drain budgets accepting 256
+  iterations and failing before iteration 257; and
 - input/output CR/LF transforms when CR and LF cross record boundaries.
 
 D1 must replace the test-only WRST model with the production

@@ -254,9 +254,12 @@ struct EndpointPair {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Slot {
     Empty,
-    Pending { attach: Attach, pair: EndpointPair },
+    PreMove { attach: Attach, pair: EndpointPair },
+    PostMovePending { attach: Attach, pair: EndpointPair },
     ReadyToConnect { attach: Attach, pair: EndpointPair },
     Active { attach: Attach, pair: EndpointPair },
+    AwaitingDriverRelease { attach: Attach, pair: EndpointPair },
+    RetiringActive { attach: Attach, pair: EndpointPair },
 }
 
 struct Connector {
@@ -285,6 +288,9 @@ impl Connector {
         if request.publication != current.publication {
             return Err(ConnectError::Stale);
         }
+        if request.transaction == 0 {
+            return Err(ConnectError::Stale);
+        }
         if !matches!(self.slot, Slot::Empty) {
             return Err(ConnectError::Busy);
         }
@@ -302,22 +308,48 @@ impl Connector {
         };
         self.next_attach_transaction = next_attach_transaction;
         self.next_stream_generation = next_stream_generation;
-        self.slot = Slot::Pending {
+        self.slot = Slot::PreMove {
             attach,
             pair: EndpointPair {
                 client: EndpointOwner::Devmgr,
-                driver: EndpointOwner::Driver,
+                driver: EndpointOwner::Devmgr,
             },
         };
         Ok(attach)
     }
 
+    fn attach_sent(&mut self, observed: Attach) -> Result<(), ConnectError> {
+        let Slot::PreMove { attach, mut pair } = self.slot else {
+            return Err(ConnectError::Stale);
+        };
+        if observed != attach {
+            return Err(ConnectError::Stale);
+        }
+        pair.driver = EndpointOwner::Driver;
+        self.slot = Slot::PostMovePending { attach, pair };
+        Ok(())
+    }
+
+    fn attach_send_failed(&mut self, observed: Attach) -> Result<(), ConnectError> {
+        let Slot::PreMove { attach, pair } = self.slot else {
+            return Err(ConnectError::Stale);
+        };
+        if observed != attach {
+            return Err(ConnectError::Stale);
+        }
+        self.closed_endpoints = self.closed_endpoints.saturating_add(
+            usize::from(pair.client == EndpointOwner::Devmgr)
+                + usize::from(pair.driver == EndpointOwner::Devmgr),
+        );
+        self.slot = Slot::Empty;
+        Ok(())
+    }
+
     fn ready(&mut self, observed: Attach) -> Result<(), ConnectError> {
-        let Slot::Pending { attach, pair } = self.slot else {
+        let Slot::PostMovePending { attach, pair } = self.slot else {
             return Err(ConnectError::Stale);
         };
         if attach != observed {
-            self.cleanup_uncommitted();
             return Err(ConnectError::Stale);
         }
         self.slot = Slot::ReadyToConnect { attach, pair };
@@ -334,46 +366,149 @@ impl Connector {
     }
 
     fn connected_send_failed(&mut self) -> ConnectError {
-        self.cleanup_uncommitted();
+        if let Slot::ReadyToConnect { attach, pair } = self.slot {
+            self.begin_post_move_cleanup(attach, pair);
+        }
         ConnectError::InternalFailure
     }
 
-    fn cleanup_uncommitted(&mut self) {
-        if let Slot::Pending { pair, .. } | Slot::ReadyToConnect { pair, .. } = self.slot {
-            // The driver owns the moved endpoint. Closing the retained peer
-            // makes PEER_CLOSED observable; driver cleanup then closes it.
-            self.closed_endpoints = self.closed_endpoints.saturating_add(
-                usize::from(pair.client != EndpointOwner::Closed)
-                    + usize::from(pair.driver != EndpointOwner::Closed),
-            );
-            self.slot = Slot::Empty;
+    fn timeout_current(&mut self, observed: Attach) -> Result<(), ConnectError> {
+        let (attach, pair) = match self.slot {
+            Slot::PostMovePending { attach, pair } | Slot::ReadyToConnect { attach, pair } => {
+                (attach, pair)
+            }
+            _ => return Err(ConnectError::Stale),
+        };
+        if observed != attach {
+            return Err(ConnectError::Stale);
         }
+        self.begin_post_move_cleanup(attach, pair);
+        Ok(())
     }
 
-    fn peer_closed(&mut self) {
-        if let Slot::Active { pair, .. } = self.slot {
-            self.closed_endpoints = self.closed_endpoints.saturating_add(
-                usize::from(pair.client != EndpointOwner::Closed)
-                    + usize::from(pair.driver != EndpointOwner::Closed),
-            );
+    fn driver_rejected_current(&mut self, observed: Attach) -> Result<(), ConnectError> {
+        self.timeout_current(observed)
+    }
+
+    fn begin_post_move_cleanup(&mut self, attach: Attach, mut pair: EndpointPair) {
+        assert_eq!(pair.client, EndpointOwner::Devmgr);
+        assert_eq!(pair.driver, EndpointOwner::Driver);
+        pair.client = EndpointOwner::Closed;
+        self.closed_endpoints = self.closed_endpoints.saturating_add(1);
+        self.slot = Slot::AwaitingDriverRelease { attach, pair };
+    }
+
+    fn active_client_closed(&mut self, observed: Attach) -> Result<(), ConnectError> {
+        let Slot::Active { attach, mut pair } = self.slot else {
+            return Err(ConnectError::Stale);
+        };
+        if observed != attach {
+            return Err(ConnectError::Stale);
+        }
+        pair.client = EndpointOwner::Closed;
+        self.closed_endpoints = self.closed_endpoints.saturating_add(1);
+        self.slot = Slot::AwaitingDriverRelease { attach, pair };
+        Ok(())
+    }
+
+    fn driver_release_observed(&mut self, observed: Attach) -> Result<(), ConnectError> {
+        let Slot::AwaitingDriverRelease { attach, mut pair } = self.slot else {
+            return Err(ConnectError::Stale);
+        };
+        if observed != attach {
+            return Err(ConnectError::Stale);
+        }
+        assert_eq!(pair.driver, EndpointOwner::Driver);
+        pair.driver = EndpointOwner::Closed;
+        self.closed_endpoints = self.closed_endpoints.saturating_add(1);
+        self.finish_or_wait(attach, pair);
+        Ok(())
+    }
+
+    fn client_release_observed(&mut self, observed: Attach) -> Result<(), ConnectError> {
+        let Slot::RetiringActive { attach, mut pair } = self.slot else {
+            return Err(ConnectError::Stale);
+        };
+        if observed != attach || pair.client != EndpointOwner::Client {
+            return Err(ConnectError::Stale);
+        }
+        pair.client = EndpointOwner::Closed;
+        self.closed_endpoints = self.closed_endpoints.saturating_add(1);
+        if pair.driver == EndpointOwner::Closed {
             self.slot = Slot::Empty;
+        } else {
+            self.slot = Slot::RetiringActive { attach, pair };
+        }
+        Ok(())
+    }
+
+    fn finish_or_wait(&mut self, attach: Attach, pair: EndpointPair) {
+        if pair.client == EndpointOwner::Closed && pair.driver == EndpointOwner::Closed {
+            self.slot = Slot::Empty;
+        } else {
+            self.slot = Slot::AwaitingDriverRelease { attach, pair };
         }
     }
 
     fn retire_generation(&mut self) {
         match self.slot {
-            Slot::Pending { .. } | Slot::ReadyToConnect { .. } => self.cleanup_uncommitted(),
-            Slot::Active { .. } => self.peer_closed(),
-            Slot::Empty => {}
+            Slot::PreMove { pair, .. } => {
+                self.closed_endpoints = self.closed_endpoints.saturating_add(
+                    usize::from(pair.client == EndpointOwner::Devmgr)
+                        + usize::from(pair.driver == EndpointOwner::Devmgr),
+                );
+                self.slot = Slot::Empty;
+            }
+            Slot::PostMovePending { attach, pair } | Slot::ReadyToConnect { attach, pair } => {
+                self.begin_post_move_cleanup(attach, pair);
+            }
+            Slot::Active { attach, pair } => {
+                self.slot = Slot::RetiringActive { attach, pair };
+            }
+            Slot::AwaitingDriverRelease { .. } | Slot::RetiringActive { .. } | Slot::Empty => {}
         }
         self.current = None;
     }
 
+    fn generation_terminal_reaped(&mut self) {
+        match self.slot {
+            Slot::AwaitingDriverRelease { attach, mut pair } => {
+                if pair.driver == EndpointOwner::Closed {
+                    return;
+                }
+                assert_eq!(pair.driver, EndpointOwner::Driver);
+                pair.driver = EndpointOwner::Closed;
+                self.closed_endpoints = self.closed_endpoints.saturating_add(1);
+                self.finish_or_wait(attach, pair);
+            }
+            Slot::RetiringActive { attach, mut pair } => {
+                if pair.driver != EndpointOwner::Closed {
+                    assert_eq!(pair.driver, EndpointOwner::Driver);
+                    pair.driver = EndpointOwner::Closed;
+                    self.closed_endpoints = self.closed_endpoints.saturating_add(1);
+                }
+                if pair.client == EndpointOwner::Closed {
+                    self.slot = Slot::Empty;
+                } else {
+                    self.slot = Slot::RetiringActive { attach, pair };
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn cleanup_complete(&self) -> bool {
+        matches!(self.slot, Slot::Empty)
+    }
+
     fn live_handles(&self) -> usize {
         let pair = match self.slot {
-            Slot::Pending { pair, .. }
+            Slot::PreMove { pair, .. }
+            | Slot::PostMovePending { pair, .. }
             | Slot::ReadyToConnect { pair, .. }
-            | Slot::Active { pair, .. } => pair,
+            | Slot::Active { pair, .. }
+            | Slot::AwaitingDriverRelease { pair, .. }
+            | Slot::RetiringActive { pair, .. } => pair,
             Slot::Empty => return 0,
         };
         usize::from(pair.client != EndpointOwner::Closed)
@@ -427,6 +562,138 @@ impl RxModel {
             self.software_overrun_bytes = self.software_overrun_bytes.saturating_add(1);
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RestartDecision {
+    Retry,
+    Exhausted,
+    ClockRegression,
+}
+
+#[derive(Default)]
+struct FailureWindow<const N: usize> {
+    timestamps: VecDeque<u64>,
+    last_observed_second: Option<u64>,
+}
+
+impl<const N: usize> FailureWindow<N> {
+    fn advance(&mut self, now: u64) -> Result<(), RestartDecision> {
+        if self
+            .last_observed_second
+            .is_some_and(|previous| now < previous)
+        {
+            return Err(RestartDecision::ClockRegression);
+        }
+        self.last_observed_second = Some(now);
+        while self
+            .timestamps
+            .front()
+            .is_some_and(|timestamp| now - timestamp >= RESTART_WINDOW_SECONDS)
+        {
+            self.timestamps.pop_front();
+        }
+        Ok(())
+    }
+
+    fn record_failure(&mut self, now: u64) -> RestartDecision {
+        if let Err(error) = self.advance(now) {
+            return error;
+        }
+        if self.timestamps.len() >= N {
+            return RestartDecision::Exhausted;
+        }
+        self.timestamps.push_back(now);
+        if self.timestamps.len() == N {
+            RestartDecision::Exhausted
+        } else {
+            RestartDecision::Retry
+        }
+    }
+
+    fn active_failures(&mut self, now: u64) -> Result<usize, RestartDecision> {
+        self.advance(now)?;
+        Ok(self.timestamps.len())
+    }
+
+    fn exact_connected(&mut self, correlated: bool) -> bool {
+        if !correlated {
+            return false;
+        }
+        self.timestamps.clear();
+        true
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StableChildIdentity {
+    raw_stream: u64,
+    console: u64,
+    child: u64,
+}
+
+struct StableRunToken {
+    ready_at: u64,
+    identity: StableChildIdentity,
+    intact: bool,
+}
+
+impl StableRunToken {
+    fn begin(
+        ready_at: u64,
+        identity: StableChildIdentity,
+        correlation_exact: bool,
+        all_three_peers_live: bool,
+    ) -> Option<Self> {
+        if !correlation_exact || !all_three_peers_live {
+            return None;
+        }
+        Some(Self {
+            ready_at,
+            identity,
+            intact: true,
+        })
+    }
+
+    fn observe(&mut self, identity: StableChildIdentity, all_three_peers_live: bool) {
+        if identity != self.identity || !all_three_peers_live {
+            self.intact = false;
+        }
+    }
+
+    fn clear_if_mature(
+        &mut self,
+        failures: &mut FailureWindow<MAX_CHILD_FAILURES>,
+        now: u64,
+        identity: StableChildIdentity,
+        all_three_peers_live: bool,
+    ) -> bool {
+        self.observe(identity, all_three_peers_live);
+        if !self.intact || now < self.ready_at || now - self.ready_at < RESTART_WINDOW_SECONDS {
+            return false;
+        }
+        failures.timestamps.clear();
+        failures.last_observed_second = Some(now);
+        self.intact = false;
+        true
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DrainResult {
+    Complete(usize),
+    FailSafe { serviced: usize },
+}
+
+fn bounded_drain(indicated_causes: usize, limit: usize) -> DrainResult {
+    let mut serviced = 0;
+    while serviced < indicated_causes {
+        if serviced == limit {
+            return DrainResult::FailSafe { serviced };
+        }
+        serviced = serviced.checked_add(1).expect("bounded drain count fits");
+    }
+    DrainResult::Complete(serviced)
 }
 
 #[derive(Default)]
@@ -656,6 +923,18 @@ fn connector_correlates_ready_busy_stale_and_cleanup_without_handle_leaks() {
     let mut connector = Connector::new(Some(driver));
     assert_eq!(
         connector.connect(ConnectRequest {
+            publication: 11,
+            transaction: 0,
+        }),
+        Err(ConnectError::Stale)
+    );
+    assert_eq!(connector.next_attach_transaction, 1);
+    assert_eq!(connector.next_stream_generation, 1);
+    assert!(connector.cleanup_complete());
+    assert_eq!(connector.live_handles(), 0);
+
+    assert_eq!(
+        connector.connect(ConnectRequest {
             publication: 10,
             transaction: 1,
         }),
@@ -670,6 +949,7 @@ fn connector_correlates_ready_busy_stale_and_cleanup_without_handle_leaks() {
         })
         .unwrap();
     assert_eq!(connector.live_handles(), 2);
+    assert!(matches!(connector.slot, Slot::PreMove { .. }));
     assert_eq!(
         connector.connect(ConnectRequest {
             publication: 11,
@@ -677,9 +957,8 @@ fn connector_correlates_ready_busy_stale_and_cleanup_without_handle_leaks() {
         }),
         Err(ConnectError::Busy)
     );
-    let mut stale = attach;
-    stale.stream_generation += 1;
-    assert_eq!(connector.ready(stale), Err(ConnectError::Stale));
+    assert_eq!(connector.attach_send_failed(attach), Ok(()));
+    assert!(connector.cleanup_complete());
     assert_eq!(connector.live_handles(), 0);
     assert_eq!(connector.closed_endpoints, 2);
 
@@ -689,27 +968,36 @@ fn connector_correlates_ready_busy_stale_and_cleanup_without_handle_leaks() {
             transaction: 4,
         })
         .unwrap();
-    assert_eq!(connector.ready(attach), Ok(()));
+    assert_eq!(connector.attach_sent(attach), Ok(()));
+    assert!(matches!(connector.slot, Slot::PostMovePending { .. }));
+    let mut stale = attach;
+    stale.stream_generation += 1;
+    let current_slot = connector.slot;
+    assert_eq!(connector.ready(stale), Err(ConnectError::Stale));
+    assert_eq!(connector.slot, current_slot);
     assert_eq!(connector.live_handles(), 2);
+    assert_eq!(connector.timeout_current(stale), Err(ConnectError::Stale));
+    assert_eq!(connector.slot, current_slot);
+    assert_eq!(connector.timeout_current(attach), Ok(()));
+    assert!(matches!(connector.slot, Slot::AwaitingDriverRelease { .. }));
+    assert!(!connector.cleanup_complete());
+    assert_eq!(connector.live_handles(), 1);
+    assert_eq!(connector.closed_endpoints, 3);
     assert_eq!(
-        connector.connected_send_failed(),
-        ConnectError::InternalFailure
-    );
-    assert_eq!(connector.live_handles(), 0);
-    assert_eq!(connector.closed_endpoints, 4);
-
-    let attach = connector
-        .connect(ConnectRequest {
+        connector.connect(ConnectRequest {
             publication: 11,
             transaction: 5,
-        })
-        .unwrap();
-    assert_eq!(connector.ready(attach), Ok(()));
-    assert_eq!(connector.connected(), Ok(()));
-    assert_eq!(connector.live_handles(), 2);
-    connector.peer_closed();
-    assert_eq!(connector.live_handles(), 0);
-    assert_eq!(connector.closed_endpoints, 6);
+        }),
+        Err(ConnectError::Busy)
+    );
+    assert_eq!(
+        connector.driver_release_observed(stale),
+        Err(ConnectError::Stale)
+    );
+    assert!(!connector.cleanup_complete());
+    assert_eq!(connector.driver_release_observed(attach), Ok(()));
+    assert!(connector.cleanup_complete());
+    assert_eq!(connector.closed_endpoints, 4);
 
     let attach = connector
         .connect(ConnectRequest {
@@ -717,19 +1005,114 @@ fn connector_correlates_ready_busy_stale_and_cleanup_without_handle_leaks() {
             transaction: 6,
         })
         .unwrap();
-    assert_eq!(attach.stream_generation, 4);
+    assert_eq!(connector.attach_sent(attach), Ok(()));
+    assert_eq!(connector.driver_rejected_current(attach), Ok(()));
+    assert!(!connector.cleanup_complete());
+    assert_eq!(connector.live_handles(), 1);
+    assert_eq!(connector.driver_release_observed(attach), Ok(()));
+    assert!(connector.cleanup_complete());
+    assert_eq!(connector.closed_endpoints, 6);
+
+    let attach = connector
+        .connect(ConnectRequest {
+            publication: 11,
+            transaction: 7,
+        })
+        .unwrap();
+    assert_eq!(connector.attach_sent(attach), Ok(()));
+    assert_eq!(connector.ready(attach), Ok(()));
+    assert_eq!(connector.live_handles(), 2);
+    assert_eq!(
+        connector.connected_send_failed(),
+        ConnectError::InternalFailure
+    );
+    assert!(!connector.cleanup_complete());
+    assert_eq!(connector.live_handles(), 1);
+    assert_eq!(connector.closed_endpoints, 7);
+    assert_eq!(connector.driver_release_observed(attach), Ok(()));
+    assert!(connector.cleanup_complete());
+    assert_eq!(connector.closed_endpoints, 8);
+
+    let attach = connector
+        .connect(ConnectRequest {
+            publication: 11,
+            transaction: 8,
+        })
+        .unwrap();
+    assert_eq!(connector.attach_sent(attach), Ok(()));
+    assert_eq!(connector.ready(attach), Ok(()));
+    assert_eq!(connector.connected(), Ok(()));
+    assert_eq!(connector.live_handles(), 2);
+    assert_eq!(connector.active_client_closed(attach), Ok(()));
+    assert!(!connector.cleanup_complete());
+    assert_eq!(connector.live_handles(), 1);
+    assert_eq!(connector.closed_endpoints, 9);
+    assert_eq!(connector.driver_release_observed(attach), Ok(()));
+    assert!(connector.cleanup_complete());
+    assert_eq!(connector.closed_endpoints, 10);
+
+    let attach = connector
+        .connect(ConnectRequest {
+            publication: 11,
+            transaction: 9,
+        })
+        .unwrap();
+    assert_eq!(attach.stream_generation, 6);
+    assert_eq!(connector.attach_sent(attach), Ok(()));
     assert_eq!(connector.ready(attach), Ok(()));
     assert_eq!(connector.connected(), Ok(()));
     connector.retire_generation();
-    assert_eq!(connector.live_handles(), 0);
-    assert_eq!(connector.closed_endpoints, 8);
+    assert!(!connector.cleanup_complete());
+    assert!(matches!(connector.slot, Slot::RetiringActive { .. }));
     assert_eq!(
         connector.connect(ConnectRequest {
             publication: 11,
-            transaction: 7,
+            transaction: 10,
         }),
         Err(ConnectError::NotReady)
     );
+    connector.generation_terminal_reaped();
+    assert!(!connector.cleanup_complete());
+    assert_eq!(connector.live_handles(), 1);
+    assert_eq!(connector.client_release_observed(attach), Ok(()));
+    assert!(connector.cleanup_complete());
+    assert_eq!(connector.live_handles(), 0);
+    assert_eq!(connector.closed_endpoints, 12);
+
+    let mut pending_retirement = Connector::new(Some(driver));
+    let attach = pending_retirement
+        .connect(ConnectRequest {
+            publication: 11,
+            transaction: 11,
+        })
+        .unwrap();
+    assert_eq!(pending_retirement.attach_sent(attach), Ok(()));
+    pending_retirement.retire_generation();
+    assert!(!pending_retirement.cleanup_complete());
+    assert_eq!(pending_retirement.live_handles(), 1);
+    pending_retirement.generation_terminal_reaped();
+    assert!(pending_retirement.cleanup_complete());
+    assert_eq!(pending_retirement.live_handles(), 0);
+    assert_eq!(pending_retirement.closed_endpoints, 2);
+
+    let mut reverse_retirement = Connector::new(Some(driver));
+    let attach = reverse_retirement
+        .connect(ConnectRequest {
+            publication: 11,
+            transaction: 12,
+        })
+        .unwrap();
+    assert_eq!(reverse_retirement.attach_sent(attach), Ok(()));
+    assert_eq!(reverse_retirement.ready(attach), Ok(()));
+    assert_eq!(reverse_retirement.connected(), Ok(()));
+    reverse_retirement.retire_generation();
+    assert_eq!(reverse_retirement.client_release_observed(attach), Ok(()));
+    assert!(!reverse_retirement.cleanup_complete());
+    assert_eq!(reverse_retirement.live_handles(), 1);
+    reverse_retirement.generation_terminal_reaped();
+    assert!(reverse_retirement.cleanup_complete());
+    assert_eq!(reverse_retirement.live_handles(), 0);
+    assert_eq!(reverse_retirement.closed_endpoints, 2);
 }
 
 #[test]
@@ -779,6 +1162,85 @@ fn fixed_bounds_drop_only_rx_overflow_and_backpressure_tx() {
     prove_stage_bound::<CONSOLE_INPUT_STAGE_BYTES>();
     prove_stage_bound::<CONSOLE_STDOUT_STAGE_BYTES>();
     prove_stage_bound::<CONSOLE_STDERR_STAGE_BYTES>();
+}
+
+#[test]
+fn restart_windows_exhaust_on_four_and_reset_only_on_exact_policy_events() {
+    let mut child = FailureWindow::<MAX_CHILD_FAILURES>::default();
+    assert_eq!(child.record_failure(0), RestartDecision::Retry);
+    assert_eq!(child.record_failure(10), RestartDecision::Retry);
+    assert_eq!(child.record_failure(20), RestartDecision::Retry);
+    assert_eq!(child.record_failure(30), RestartDecision::Exhausted);
+    assert_eq!(child.timestamps.len(), 4);
+    assert_eq!(child.record_failure(31), RestartDecision::Exhausted);
+    assert_eq!(child.timestamps.len(), 4, "no fifth launch is admitted");
+    assert_eq!(child.active_failures(59), Ok(4));
+    assert_eq!(child.active_failures(60), Ok(3));
+    assert_eq!(child.record_failure(59), RestartDecision::ClockRegression);
+
+    let identity = StableChildIdentity {
+        raw_stream: 1,
+        console: 2,
+        child: 3,
+    };
+    let mut broken = StableRunToken::begin(100, identity, true, true).unwrap();
+    broken.observe(identity, false);
+    broken.observe(identity, true);
+    assert!(!broken.clear_if_mature(&mut child, 160, identity, true));
+    assert_eq!(
+        child.timestamps.len(),
+        3,
+        "apparent recovery cannot revive a token"
+    );
+
+    let mut too_short = StableRunToken::begin(200, identity, true, true).unwrap();
+    assert!(!too_short.clear_if_mature(&mut child, 259, identity, true));
+    let mut drifted = StableRunToken::begin(200, identity, true, true).unwrap();
+    assert!(!drifted.clear_if_mature(
+        &mut child,
+        260,
+        StableChildIdentity {
+            child: 4,
+            ..identity
+        },
+        true,
+    ));
+    let mut stable = StableRunToken::begin(200, identity, true, true).unwrap();
+    assert!(stable.clear_if_mature(&mut child, 260, identity, true));
+    assert!(child.timestamps.is_empty());
+    assert!(StableRunToken::begin(300, identity, false, true).is_none());
+
+    let mut reconnect = FailureWindow::<MAX_RECONNECT_FAILURES>::default();
+    assert_eq!(reconnect.record_failure(0), RestartDecision::Retry);
+    assert_eq!(reconnect.record_failure(1), RestartDecision::Retry);
+    assert_eq!(reconnect.record_failure(2), RestartDecision::Retry);
+    assert_eq!(reconnect.record_failure(3), RestartDecision::Exhausted);
+    assert_eq!(reconnect.record_failure(4), RestartDecision::Exhausted);
+    assert_eq!(reconnect.timestamps.len(), 4);
+    assert!(!reconnect.exact_connected(false));
+    assert_eq!(reconnect.timestamps.len(), 4);
+    assert!(reconnect.exact_connected(true));
+    assert!(reconnect.timestamps.is_empty());
+}
+
+#[test]
+fn uart_drain_budgets_accept_256_and_fail_before_257() {
+    assert_eq!(
+        bounded_drain(IIR_DRAIN_LIMIT, IIR_DRAIN_LIMIT),
+        DrainResult::Complete(256)
+    );
+    assert_eq!(
+        bounded_drain(IIR_DRAIN_LIMIT + 1, IIR_DRAIN_LIMIT),
+        DrainResult::FailSafe { serviced: 256 }
+    );
+    assert_eq!(
+        bounded_drain(STALE_INIT_DRAIN_LIMIT, STALE_INIT_DRAIN_LIMIT),
+        DrainResult::Complete(256)
+    );
+    assert_eq!(
+        bounded_drain(STALE_INIT_DRAIN_LIMIT + 1, STALE_INIT_DRAIN_LIMIT),
+        DrainResult::FailSafe { serviced: 256 }
+    );
 }
 
 #[test]
