@@ -23,7 +23,10 @@ pub const SERIAL_TRANSPORT_METADATA_POLICY: MetadataPolicyId = MetadataPolicyId(
 pub const SERIAL_CONSOLE_SERVICE_NAME: &[u8] = b"device.serial.console0";
 pub const SERIAL_CONSOLE_PROTOCOL_ID: u64 = 0x5345_5249_414c_4330;
 pub const SERIAL_CONSOLE_PROTOCOL_MAJOR: u16 = 1;
+/// Historical selector-29 metadata/control profile. This remains byte-exact.
 pub const SERIAL_CONSOLE_PROTOCOL_MINOR: u16 = 0;
+/// WYR1-D selected-product profile with the direct WRSC connector.
+pub const SERIAL_CONSOLE_CONNECTOR_PROTOCOL_MINOR: u16 = 1;
 pub const SERIAL_CONSOLE_SUPERVISOR_ROLE_ID: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,6 +43,16 @@ pub const SERIAL_CONSOLE_PUBLICATION_POLICY: PublicationPolicy = PublicationPoli
     protocol_id: SERIAL_CONSOLE_PROTOCOL_ID,
     protocol_major: SERIAL_CONSOLE_PROTOCOL_MAJOR,
     protocol_minor: SERIAL_CONSOLE_PROTOCOL_MINOR,
+    supervisor_role_id: SERIAL_CONSOLE_SUPERVISOR_ROLE_ID,
+};
+
+/// Product-gated WYR1-D connector publication. The stable service and protocol
+/// identity are shared with 1.0, but the minor is intentionally distinct.
+pub const SERIAL_CONSOLE_CONNECTOR_PUBLICATION_POLICY: PublicationPolicy = PublicationPolicy {
+    service_name: SERIAL_CONSOLE_SERVICE_NAME,
+    protocol_id: SERIAL_CONSOLE_PROTOCOL_ID,
+    protocol_major: SERIAL_CONSOLE_PROTOCOL_MAJOR,
+    protocol_minor: SERIAL_CONSOLE_CONNECTOR_PROTOCOL_MINOR,
     supervisor_role_id: SERIAL_CONSOLE_SUPERVISOR_ROLE_ID,
 };
 
@@ -532,6 +545,14 @@ mod tests {
                 protocol_major: SERIAL_CONSOLE_PROTOCOL_MAJOR,
                 protocol_minor: SERIAL_CONSOLE_PROTOCOL_MINOR,
                 supervisor_role_id: SERIAL_CONSOLE_SUPERVISOR_ROLE_ID,
+            }
+        );
+        assert_eq!(SERIAL_CONSOLE_CONNECTOR_PROTOCOL_MINOR, 1);
+        assert_eq!(
+            SERIAL_CONSOLE_CONNECTOR_PUBLICATION_POLICY,
+            PublicationPolicy {
+                protocol_minor: 1,
+                ..SERIAL_CONSOLE_PUBLICATION_POLICY
             }
         );
     }

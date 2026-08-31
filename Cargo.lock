@@ -346,6 +346,18 @@ name = "wyrmroot-uart16550-core"
 version = "0.0.0"
 
 [[package]]
+name = "wyrmroot-uart16550d"
+version = "0.0.0"
+dependencies = [
+ "deepwyrm-syscall",
+ "wyrmroot-device-proto",
+ "wyrmroot-devmgr",
+ "wyrmroot-loader",
+ "wyrmroot-runtime",
+ "wyrmroot-uart16550-core",
+]
+
+[[package]]
 name = "wyrmroot-wyr1-bootstrap-stubs"
 version = "0.0.0"
 dependencies = [

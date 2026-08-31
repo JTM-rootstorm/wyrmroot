@@ -7,6 +7,9 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod connector;
+pub mod staging;
+
 #[cfg(feature = "native-devmgr")]
 use {
     deepwyrm_syscall as _, wyrmroot_loader as _, wyrmroot_registry_proto as _,

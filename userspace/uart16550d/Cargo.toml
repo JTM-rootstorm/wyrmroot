@@ -1,0 +1,35 @@
+[package]
+name = "wyrmroot-uart16550d"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+description = "Production WYR1-D staged COM2 UART driver"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "uart16550d"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["native-uart16550d"]
+
+[features]
+default = []
+native-uart16550d = ["dep:wyrmroot-loader", "dep:wyrmroot-runtime"]
+
+[dependencies]
+deepwyrm-syscall.workspace = true
+wyrmroot-device-proto = { path = "../../crates/wyrmroot-device-proto" }
+wyrmroot-loader = { path = "../../crates/wyrmroot-loader", optional = true }
+wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime", optional = true }
+wyrmroot-uart16550-core = { path = "../../crates/wyrmroot-uart16550-core" }
+
+[dev-dependencies]
+wyrmroot-devmgr = { path = "../devmgr" }
+
+[lints.rust]
+unsafe_code = "deny"
+unused_crate_dependencies = "deny"

@@ -1,0 +1,537 @@
+//! Devmgr-owned WYR1-D direct serial connector transaction model.
+//!
+//! Native code owns actual Channel handles. This module names every ownership
+//! transition so the native adapter never infers cleanup from event order.
+
+use wyrmroot_device_proto::connector::{ConnectorErrorCode, ConnectorIdentity, ConnectorMessage};
+use wyrmroot_device_proto::control_v1_1::{ControlIdentityV1_1, ControlMessageV1_1};
+use wyrmroot_device_proto::{PublicationPolicy, SERIAL_CONSOLE_CONNECTOR_PUBLICATION_POLICY};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PublishedDriver {
+    pub publication_generation: u64,
+    pub control: ControlIdentityV1_1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AttachCorrelation {
+    pub driver: PublishedDriver,
+    pub client_transaction_id: u64,
+    pub attach_transaction_id: u64,
+    pub stream_generation: u64,
+}
+
+impl AttachCorrelation {
+    pub const fn connector_identity(self) -> ConnectorIdentity {
+        ConnectorIdentity {
+            publication_generation: self.driver.publication_generation,
+            client_transaction_id: self.client_transaction_id,
+            device_role_id: self.driver.control.role_id.0,
+            bundle_generation: self.driver.control.bundle_generation.0,
+            driver_attempt_generation: self.driver.control.attempt_generation.0,
+            driver_control_endpoint_id: self.driver.control.endpoint.id.0,
+            driver_control_endpoint_generation: self.driver.control.endpoint.generation.0,
+            attach_transaction_id: self.attach_transaction_id,
+            stream_generation: self.stream_generation,
+        }
+    }
+
+    pub const fn attach_message(self) -> ControlMessageV1_1 {
+        ControlMessageV1_1::AttachStream {
+            identity: ControlIdentityV1_1 {
+                transaction_id: self.attach_transaction_id,
+                ..self.driver.control
+            },
+            stream_generation: self.stream_generation,
+            publication_generation: self.driver.publication_generation,
+        }
+    }
+
+    const fn ready_message(self) -> ControlMessageV1_1 {
+        ControlMessageV1_1::StreamReady {
+            identity: ControlIdentityV1_1 {
+                transaction_id: self.attach_transaction_id,
+                ..self.driver.control
+            },
+            stream_generation: self.stream_generation,
+            publication_generation: self.driver.publication_generation,
+        }
+    }
+
+    const fn detached_message(self) -> ControlMessageV1_1 {
+        ControlMessageV1_1::StreamDetached {
+            identity: ControlIdentityV1_1 {
+                transaction_id: self.attach_transaction_id,
+                ..self.driver.control
+            },
+            stream_generation: self.stream_generation,
+            publication_generation: self.driver.publication_generation,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EndpointOwner {
+    Devmgr,
+    Driver,
+    Client,
+    Released,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PairOwnership {
+    pub client: EndpointOwner,
+    pub driver: EndpointOwner,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorSlot {
+    Empty,
+    PreMove {
+        attach: AttachCorrelation,
+        pair: PairOwnership,
+    },
+    PostMovePending {
+        attach: AttachCorrelation,
+        pair: PairOwnership,
+    },
+    ReadyToConnect {
+        attach: AttachCorrelation,
+        pair: PairOwnership,
+    },
+    Active {
+        attach: AttachCorrelation,
+        pair: PairOwnership,
+    },
+    AwaitingDriverRelease {
+        attach: AttachCorrelation,
+        pair: PairOwnership,
+    },
+    AwaitingClientRelease {
+        attach: AttachCorrelation,
+        pair: PairOwnership,
+    },
+    RetiringActive {
+        attach: AttachCorrelation,
+        pair: PairOwnership,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorAction {
+    /// Native code creates one broad Channel pair; devmgr owns both endpoints.
+    AllocatePair {
+        attach: AttachCorrelation,
+        driver_message: ControlMessageV1_1,
+    },
+    /// Native code atomically MOVEs only the driver endpoint over direct WRDC.
+    MoveDriverEndpoint { attach: AttachCorrelation },
+    /// Native code atomically MOVEs only the retained client endpoint in WRSC.
+    MoveClientEndpoint { response: ConnectorMessage },
+    /// Both endpoints remain in devmgr custody and must be closed in reverse
+    /// construction order; neither handle ever crossed a Channel.
+    ClosePreMovePair { attach: AttachCorrelation },
+    /// Close the endpoint still retained by devmgr and ask the driver to close
+    /// its already-moved peer.
+    CloseRetainedClientAndRequestDriverRelease { attach: AttachCorrelation },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorModelError {
+    Busy,
+    NotReady,
+    Stale,
+    InternalFailure,
+}
+
+impl ConnectorModelError {
+    pub const fn wire_code(self) -> ConnectorErrorCode {
+        match self {
+            Self::Busy => ConnectorErrorCode::Busy,
+            Self::NotReady => ConnectorErrorCode::NotReady,
+            Self::Stale => ConnectorErrorCode::Stale,
+            Self::InternalFailure => ConnectorErrorCode::InternalFailure,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectorBroker {
+    current: Option<PublishedDriver>,
+    next_attach_transaction: u64,
+    next_stream_generation: u64,
+    slot: ConnectorSlot,
+}
+
+impl ConnectorBroker {
+    pub const fn new(
+        current: Option<PublishedDriver>,
+        first_attach_transaction: u64,
+        first_stream_generation: u64,
+    ) -> Result<Self, ConnectorModelError> {
+        if first_attach_transaction == 0 || first_stream_generation == 0 {
+            return Err(ConnectorModelError::InternalFailure);
+        }
+        Ok(Self {
+            current,
+            next_attach_transaction: first_attach_transaction,
+            next_stream_generation: first_stream_generation,
+            slot: ConnectorSlot::Empty,
+        })
+    }
+
+    /// The only publication metadata native WYR1-D connector routing may use.
+    /// Historical selector-29 continues to use the separate 1.0 constant.
+    pub const fn publication_policy() -> PublicationPolicy {
+        SERIAL_CONSOLE_CONNECTOR_PUBLICATION_POLICY
+    }
+
+    pub const fn slot(&self) -> ConnectorSlot {
+        self.slot
+    }
+
+    pub const fn current(&self) -> Option<PublishedDriver> {
+        self.current
+    }
+
+    pub fn replace_published_driver(
+        &mut self,
+        replacement: PublishedDriver,
+    ) -> Result<(), ConnectorModelError> {
+        if !matches!(self.slot, ConnectorSlot::Empty)
+            || self.current.is_some_and(|current| {
+                replacement.publication_generation <= current.publication_generation
+            })
+            || replacement.publication_generation == 0
+        {
+            return Err(ConnectorModelError::Stale);
+        }
+        self.current = Some(replacement);
+        Ok(())
+    }
+
+    pub fn begin_connect(
+        &mut self,
+        request: ConnectorMessage,
+    ) -> Result<ConnectorAction, ConnectorModelError> {
+        let ConnectorMessage::ConnectStream {
+            publication_generation,
+            client_transaction_id,
+        } = request
+        else {
+            return Err(ConnectorModelError::Stale);
+        };
+        let current = self.current.ok_or(ConnectorModelError::NotReady)?;
+        if publication_generation != current.publication_generation || client_transaction_id == 0 {
+            return Err(ConnectorModelError::Stale);
+        }
+        if !matches!(self.slot, ConnectorSlot::Empty) {
+            return Err(ConnectorModelError::Busy);
+        }
+        let next_attach = self
+            .next_attach_transaction
+            .checked_add(1)
+            .ok_or(ConnectorModelError::InternalFailure)?;
+        let next_stream = self
+            .next_stream_generation
+            .checked_add(1)
+            .ok_or(ConnectorModelError::InternalFailure)?;
+        let attach = AttachCorrelation {
+            driver: current,
+            client_transaction_id,
+            attach_transaction_id: self.next_attach_transaction,
+            stream_generation: self.next_stream_generation,
+        };
+        self.next_attach_transaction = next_attach;
+        self.next_stream_generation = next_stream;
+        self.slot = ConnectorSlot::PreMove {
+            attach,
+            pair: PairOwnership {
+                client: EndpointOwner::Devmgr,
+                driver: EndpointOwner::Devmgr,
+            },
+        };
+        Ok(ConnectorAction::AllocatePair {
+            attach,
+            driver_message: attach.attach_message(),
+        })
+    }
+
+    /// Records the atomic WRDC MOVE only after native Channel send succeeds.
+    pub fn driver_endpoint_moved(
+        &mut self,
+        observed: AttachCorrelation,
+    ) -> Result<ConnectorAction, ConnectorModelError> {
+        let ConnectorSlot::PreMove { attach, mut pair } = self.slot else {
+            return Err(ConnectorModelError::Stale);
+        };
+        if observed != attach {
+            return Err(ConnectorModelError::Stale);
+        }
+        pair.driver = EndpointOwner::Driver;
+        self.slot = ConnectorSlot::PostMovePending { attach, pair };
+        Ok(ConnectorAction::MoveDriverEndpoint { attach })
+    }
+
+    /// Failed pre-MOVE sends leave both endpoints in devmgr custody for close.
+    pub fn attach_send_failed(
+        &mut self,
+        observed: AttachCorrelation,
+    ) -> Result<ConnectorAction, ConnectorModelError> {
+        let ConnectorSlot::PreMove { attach, .. } = self.slot else {
+            return Err(ConnectorModelError::Stale);
+        };
+        if observed != attach {
+            return Err(ConnectorModelError::Stale);
+        }
+        self.slot = ConnectorSlot::Empty;
+        Ok(ConnectorAction::ClosePreMovePair { attach })
+    }
+
+    pub fn accept_stream_ready(
+        &mut self,
+        message: ControlMessageV1_1,
+    ) -> Result<(), ConnectorModelError> {
+        let ConnectorSlot::PostMovePending { attach, pair } = self.slot else {
+            return Err(ConnectorModelError::Stale);
+        };
+        if message != attach.ready_message() {
+            return Err(ConnectorModelError::Stale);
+        }
+        self.slot = ConnectorSlot::ReadyToConnect { attach, pair };
+        Ok(())
+    }
+
+    pub fn connected_response(&self) -> Result<ConnectorMessage, ConnectorModelError> {
+        let ConnectorSlot::ReadyToConnect { attach, .. } = self.slot else {
+            return Err(ConnectorModelError::Stale);
+        };
+        Ok(ConnectorMessage::Connected {
+            identity: attach.connector_identity(),
+        })
+    }
+
+    /// Records the atomic WRSC client-endpoint MOVE only after send succeeds.
+    pub fn client_endpoint_moved(&mut self) -> Result<ConnectorAction, ConnectorModelError> {
+        let ConnectorSlot::ReadyToConnect { attach, mut pair } = self.slot else {
+            return Err(ConnectorModelError::Stale);
+        };
+        pair.client = EndpointOwner::Client;
+        self.slot = ConnectorSlot::Active { attach, pair };
+        Ok(ConnectorAction::MoveClientEndpoint {
+            response: ConnectorMessage::Connected {
+                identity: attach.connector_identity(),
+            },
+        })
+    }
+
+    pub fn connected_send_failed(&mut self) -> Result<ConnectorAction, ConnectorModelError> {
+        let ConnectorSlot::ReadyToConnect { attach, mut pair } = self.slot else {
+            return Err(ConnectorModelError::Stale);
+        };
+        pair.client = EndpointOwner::Released;
+        self.slot = ConnectorSlot::AwaitingDriverRelease { attach, pair };
+        Ok(ConnectorAction::CloseRetainedClientAndRequestDriverRelease { attach })
+    }
+
+    pub fn active_client_released(
+        &mut self,
+        observed: AttachCorrelation,
+    ) -> Result<(), ConnectorModelError> {
+        let ConnectorSlot::Active { attach, mut pair } = self.slot else {
+            return Err(ConnectorModelError::Stale);
+        };
+        if observed != attach {
+            return Err(ConnectorModelError::Stale);
+        }
+        pair.client = EndpointOwner::Released;
+        self.slot = ConnectorSlot::AwaitingDriverRelease { attach, pair };
+        Ok(())
+    }
+
+    pub fn driver_detached(
+        &mut self,
+        message: ControlMessageV1_1,
+    ) -> Result<(), ConnectorModelError> {
+        let (attach, mut pair, retiring) = match self.slot {
+            ConnectorSlot::Active { attach, pair } => (attach, pair, false),
+            ConnectorSlot::AwaitingDriverRelease { attach, pair } => (attach, pair, false),
+            ConnectorSlot::RetiringActive { attach, pair } => (attach, pair, true),
+            _ => return Err(ConnectorModelError::Stale),
+        };
+        if message != attach.detached_message() || pair.driver != EndpointOwner::Driver {
+            return Err(ConnectorModelError::Stale);
+        }
+        pair.driver = EndpointOwner::Released;
+        if pair.client == EndpointOwner::Released {
+            self.slot = ConnectorSlot::Empty;
+        } else if retiring {
+            self.slot = ConnectorSlot::RetiringActive { attach, pair };
+        } else {
+            self.slot = ConnectorSlot::AwaitingClientRelease { attach, pair };
+        }
+        Ok(())
+    }
+
+    pub fn client_release_observed(
+        &mut self,
+        observed: AttachCorrelation,
+    ) -> Result<(), ConnectorModelError> {
+        let (attach, mut pair, retiring) = match self.slot {
+            ConnectorSlot::AwaitingClientRelease { attach, pair } => (attach, pair, false),
+            ConnectorSlot::RetiringActive { attach, pair } => (attach, pair, true),
+            _ => return Err(ConnectorModelError::Stale),
+        };
+        if observed != attach || pair.client != EndpointOwner::Client {
+            return Err(ConnectorModelError::Stale);
+        }
+        pair.client = EndpointOwner::Released;
+        if pair.driver == EndpointOwner::Released {
+            self.slot = ConnectorSlot::Empty;
+        } else if retiring {
+            self.slot = ConnectorSlot::RetiringActive { attach, pair };
+        } else {
+            self.slot = ConnectorSlot::AwaitingDriverRelease { attach, pair };
+        }
+        Ok(())
+    }
+
+    /// Prevents new connection attempts immediately. Moved endpoints remain
+    /// attributed to their owners until exact release observations arrive.
+    pub fn retire_current(&mut self) -> Option<ConnectorAction> {
+        self.current = None;
+        match self.slot {
+            ConnectorSlot::PreMove { attach, .. } => {
+                self.slot = ConnectorSlot::Empty;
+                Some(ConnectorAction::ClosePreMovePair { attach })
+            }
+            ConnectorSlot::PostMovePending { attach, mut pair }
+            | ConnectorSlot::ReadyToConnect { attach, mut pair } => {
+                pair.client = EndpointOwner::Released;
+                self.slot = ConnectorSlot::AwaitingDriverRelease { attach, pair };
+                Some(ConnectorAction::CloseRetainedClientAndRequestDriverRelease { attach })
+            }
+            ConnectorSlot::Active { attach, pair }
+            | ConnectorSlot::AwaitingClientRelease { attach, pair }
+            | ConnectorSlot::AwaitingDriverRelease { attach, pair } => {
+                self.slot = ConnectorSlot::RetiringActive { attach, pair };
+                None
+            }
+            ConnectorSlot::RetiringActive { .. } | ConnectorSlot::Empty => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wyrmroot_device_proto::control::ControlEndpoint;
+    use wyrmroot_device_proto::coordinator::{
+        AttemptGeneration, BundleGeneration, EndpointGeneration, EndpointId,
+    };
+    use wyrmroot_device_proto::manifest::RoleId;
+
+    fn driver(publication: u64, attempt: u64) -> PublishedDriver {
+        PublishedDriver {
+            publication_generation: publication,
+            control: ControlIdentityV1_1 {
+                role_id: RoleId(1),
+                bundle_generation: BundleGeneration(2),
+                attempt_generation: AttemptGeneration(attempt),
+                endpoint: ControlEndpoint {
+                    id: EndpointId(4),
+                    generation: EndpointGeneration(attempt),
+                },
+                transaction_id: 5,
+            },
+        }
+    }
+
+    fn attach_once(broker: &mut ConnectorBroker, publication: u64, tx: u64) -> AttachCorrelation {
+        let ConnectorAction::AllocatePair { attach, .. } = broker
+            .begin_connect(ConnectorMessage::ConnectStream {
+                publication_generation: publication,
+                client_transaction_id: tx,
+            })
+            .unwrap()
+        else {
+            panic!("allocate pair");
+        };
+        broker.driver_endpoint_moved(attach).unwrap();
+        broker.accept_stream_ready(attach.ready_message()).unwrap();
+        assert_eq!(
+            broker.connected_response().unwrap(),
+            ConnectorMessage::Connected {
+                identity: attach.connector_identity()
+            }
+        );
+        broker.client_endpoint_moved().unwrap();
+        attach
+    }
+
+    #[test]
+    fn minor_one_policy_and_one_direct_client_reconnect_are_explicit() {
+        assert_eq!(ConnectorBroker::publication_policy().protocol_minor, 1);
+        let mut broker = ConnectorBroker::new(Some(driver(10, 1)), 100, 200).unwrap();
+        let first = attach_once(&mut broker, 10, 7);
+        assert_eq!(
+            broker.begin_connect(ConnectorMessage::ConnectStream {
+                publication_generation: 10,
+                client_transaction_id: 8,
+            }),
+            Err(ConnectorModelError::Busy)
+        );
+        broker.active_client_released(first).unwrap();
+        broker.driver_detached(first.detached_message()).unwrap();
+        assert_eq!(broker.slot(), ConnectorSlot::Empty);
+        let second = attach_once(&mut broker, 10, 9);
+        assert!(second.stream_generation > first.stream_generation);
+        assert!(second.attach_transaction_id > first.attach_transaction_id);
+    }
+
+    #[test]
+    fn stale_ready_and_post_move_failure_do_not_lose_ownership() {
+        let mut broker = ConnectorBroker::new(Some(driver(10, 1)), 100, 200).unwrap();
+        let ConnectorAction::AllocatePair { attach, .. } = broker
+            .begin_connect(ConnectorMessage::ConnectStream {
+                publication_generation: 10,
+                client_transaction_id: 7,
+            })
+            .unwrap()
+        else {
+            panic!("allocate pair");
+        };
+        broker.driver_endpoint_moved(attach).unwrap();
+        let stale = AttachCorrelation {
+            stream_generation: attach.stream_generation + 1,
+            ..attach
+        };
+        assert_eq!(
+            broker.accept_stream_ready(stale.ready_message()),
+            Err(ConnectorModelError::Stale)
+        );
+        broker.accept_stream_ready(attach.ready_message()).unwrap();
+        let action = broker.connected_send_failed().unwrap();
+        assert_eq!(
+            action,
+            ConnectorAction::CloseRetainedClientAndRequestDriverRelease { attach }
+        );
+        broker.driver_detached(attach.detached_message()).unwrap();
+        assert_eq!(broker.slot(), ConnectorSlot::Empty);
+    }
+
+    #[test]
+    fn replacement_requires_empty_cleanup_and_strictly_new_publication() {
+        let mut broker = ConnectorBroker::new(Some(driver(10, 1)), 100, 200).unwrap();
+        let active = attach_once(&mut broker, 10, 7);
+        assert_eq!(
+            broker.replace_published_driver(driver(11, 2)),
+            Err(ConnectorModelError::Stale)
+        );
+        broker.retire_current();
+        broker.driver_detached(active.detached_message()).unwrap();
+        broker.client_release_observed(active).unwrap();
+        broker.replace_published_driver(driver(11, 2)).unwrap();
+        assert_eq!(broker.current(), Some(driver(11, 2)));
+    }
+}
