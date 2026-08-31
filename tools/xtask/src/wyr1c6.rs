@@ -835,10 +835,12 @@ fn parse_evidence(bytes: &[u8], nonce: &str) -> Result<ParsedEvidence, Failure> 
         return Err(Failure::task("WRC6E1 old interrupt release tuple drifted"));
     }
     let u2 = (bindings[9], values[9], auxiliaries[9]);
+    // A fresh boot-monotonic endpoint ID begins at endpoint generation one,
+    // so that field can equal U1's. The new Interrupt binding and strictly
+    // newer attempt are the WRC6 freshness proof.
     if (bindings[10], values[10], auxiliaries[10]) != u2
         || (bindings[15], values[15], auxiliaries[15]) != u2
         || u2.0 == u1.0
-        || u2.2 == u1.2
         || number(u2.1)? <= number(u1.1)?
     {
         return Err(Failure::task("WRC6E1 U2 tuple is not fresh"));
@@ -2436,7 +2438,10 @@ mod tests {
                     2 | 3 | 5 | 7 => (11, 101, 111),
                     4 | 6 => (21, 101, 121),
                     8 => (11, 1, 0),
-                    9 | 10 | 15 => (12, 102, 112),
+                    // Each fresh boot-monotonic endpoint ID begins at endpoint
+                    // generation one. U2 freshness is instead proved by its
+                    // newer attempt and distinct Interrupt binding.
+                    9 | 10 | 15 => (12, 102, 111),
                     11 | 14 => (22, 102, 122),
                     12 => (21, 101, 3),
                     13 => (22, 100, 0),
@@ -2458,6 +2463,17 @@ mod tests {
         }
         assert_eq!(stream.len(), 27 * 113);
         assert_eq!(parse_evidence(&stream, nonce).unwrap().records, 27);
+        for (field, replacement) in [
+            (54..70, b"000000000000000B".as_slice()),
+            (71..87, b"0000000000000065".as_slice()),
+        ] {
+            let mut stale_u2 = stream.clone();
+            let record = &mut stale_u2[9 * 113..10 * 113];
+            record[field].copy_from_slice(replacement);
+            let checksum = format!("{:08X}", fnv1a(&record[..105]));
+            record[105..113].copy_from_slice(checksum.as_bytes());
+            assert!(parse_evidence(&stale_u2, nonce).is_err());
+        }
         let mut invalid_hex = stream.clone();
         invalid_hex[37] = b'G';
         let checksum = format!("{:08X}", fnv1a(&invalid_hex[..105]));
