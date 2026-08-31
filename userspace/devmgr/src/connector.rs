@@ -308,8 +308,9 @@ impl ConnectorBroker {
 
     /// A bounded wait for STREAM_READY expired after the driver endpoint MOVE.
     /// Devmgr closes only its retained client endpoint and keeps the slot until
-    /// STREAM_DETACHED, direct-control peer close, or exact attempt reap proves
-    /// that the driver-owned endpoint was released.
+    /// STREAM_DETACHED or exact terminal-and-reaped attempt evidence proves the
+    /// driver-owned endpoint was released. Direct-control peer close starts
+    /// cleanup but is not stream-release proof by itself.
     pub fn pending_attach_timed_out(
         &mut self,
         observed: AttachCorrelation,
