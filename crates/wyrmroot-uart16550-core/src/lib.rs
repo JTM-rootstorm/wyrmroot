@@ -222,11 +222,16 @@ impl<I: ByteRegisterIo> Uart16550<I> {
         self.stale_drain()
     }
 
-    /// Enables exactly RDI and RLSI.  THRI remains disabled until transmit
-    /// work changes from empty to nonempty.
+    /// Enables RDI and RLSI, plus THRI exactly when transmit work was queued
+    /// during the quiesced stage.
     pub fn activate_interrupts(&mut self) {
         if self.state == CoreState::Quiesced {
-            self.io.write(IER_DLM, IER_RDI_RLSI);
+            let ier = if self.tx.is_empty() {
+                IER_RDI_RLSI
+            } else {
+                IER_RDI_RLSI | IER_THRI
+            };
+            self.io.write(IER_DLM, ier);
             self.state = CoreState::Active;
         }
     }
@@ -440,6 +445,28 @@ mod tests {
         let uart = active();
         assert_eq!(uart.state(), CoreState::Active);
         assert_eq!(uart.into_io().writes.last(), Some(&(IER_DLM, IER_RDI_RLSI)));
+    }
+
+    #[test]
+    fn queued_quiesced_tx_enables_thri_on_activation_and_drains() {
+        let mut uart = Uart16550::new(FakeIo::new());
+        uart.initialize_quiesced().unwrap();
+        let writes_before_queue = uart.test_io_mut().writes.len();
+        assert_eq!(uart.enqueue_tx(&[0x41, 0x42]), 2);
+        assert_eq!(uart.test_io_mut().writes.len(), writes_before_queue);
+        uart.activate_interrupts();
+        assert_eq!(
+            uart.test_io_mut().writes.last(),
+            Some(&(IER_DLM, IER_RDI_RLSI | IER_THRI))
+        );
+        uart.test_io_mut()
+            .push_reads(IIR_FCR, [IIR_THRI, IIR_NO_INTERRUPT]);
+        assert_eq!(uart.handle_interrupt().unwrap().transmitted, 2);
+        assert_eq!(uart.tx_len(), 0);
+        assert_eq!(
+            uart.test_io_mut().writes.last(),
+            Some(&(IER_DLM, IER_RDI_RLSI))
+        );
     }
 
     #[test]

@@ -33,9 +33,9 @@ production syscall dependency. Its adapter trait is only `read(offset)` and
 - `initialize_quiesced()` writes IER zero first; programs divisor one, 8N1,
   enabled/cleared FIFO, and `OUT2 | RTS | DTR`; drains stale state with a 256
   cause limit; and returns with IER still zero.
-- `activate_interrupts()` separately enables exactly RDI and RLSI. THRI is
-  enabled only when a nonempty TX transition occurs and is disabled immediately
-  after the TX ring empties.
+- `activate_interrupts()` separately enables RDI and RLSI, plus THRI if bytes
+  were queued during the quiesced stage. While active, THRI is enabled exactly
+  when TX is nonempty and is disabled immediately after the TX ring empties.
 - RX and TX are separate 4096-byte fixed rings. RX continues consuming RBR on
   overflow, drops newest bytes, and saturates a distinct software-overrun
   counter. TX returns the unsent suffix to its caller by accepting only the
