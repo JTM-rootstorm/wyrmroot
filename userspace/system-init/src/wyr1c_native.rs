@@ -2086,6 +2086,48 @@ fn selector29_restarting_d1(
     })
 }
 
+#[cfg(feature = "wyr1c6-selector29")]
+const fn selector29_terminal_fact_for_event(
+    next: crate::wyr1c6_gate::GateEvent,
+) -> Result<Option<u8>, InitError> {
+    match next {
+        crate::wyr1c6_gate::GateEvent::StaleReject => Ok(Some(13)),
+        crate::wyr1c6_gate::GateEvent::D1Failure => Ok(Some(14)),
+        crate::wyr1c6_gate::GateEvent::P2Retire => Ok(None),
+        _ => Err(InitError::WrongManifestProfile),
+    }
+}
+
+#[cfg(feature = "wyr1c6-selector29")]
+fn selector29_next_d1_terminal_fact(
+    resident: &ResidentSystemInit,
+) -> Result<Option<u8>, InitError> {
+    let next = resident
+        .wyr1c
+        .as_ref()
+        .and_then(|state| state.c6_evidence.as_ref())
+        .and_then(crate::wyr1c6_gate::EvidenceLog::next_expected_event)
+        .ok_or(InitError::WrongActivationOrder)?;
+    selector29_terminal_fact_for_event(next)
+}
+
+#[cfg(feature = "wyr1c6-selector29")]
+fn drain_selector29_d1_terminal_facts<S: InitPlatform>(
+    resident: &mut ResidentSystemInit,
+    system: &mut S,
+    devmgr: ActiveNativeRole,
+) -> Result<(), InitError> {
+    while let Some(expected) = selector29_next_d1_terminal_fact(resident)? {
+        match receive_devmgr_control(system, devmgr.loaded.launch_channel)? {
+            DevmgrControlInput::C6Fact(fact) if fact.event == expected => {
+                accept_c6_fact(resident, fact)?;
+            }
+            _ => return Err(InitError::WrongManifestProfile),
+        }
+    }
+    Ok(())
+}
+
 fn recover_devmgr<S, L, W>(
     resident: &mut ResidentSystemInit,
     system: &mut S,
@@ -2113,6 +2155,19 @@ where
             state.last_reaped_driver,
         )
     };
+    #[cfg(feature = "wyr1c6-selector29")]
+    if restarting_d1 {
+        let devmgr = resident
+            .wyr1c
+            .as_ref()
+            .and_then(|state| state.devmgr)
+            .ok_or(InitError::WrongActivationOrder)?;
+        // D1 sends the final stale-rejection and failure facts immediately
+        // before exiting. A process-exit wait may win over the readable launch
+        // channel, so drain those already-buffered facts before synthesizing
+        // P2 retirement and U2 reap evidence.
+        drain_selector29_d1_terminal_facts(resident, system, devmgr)?;
+    }
     if resident
         .wyr1c
         .as_ref()
@@ -3234,5 +3289,26 @@ mod tests {
         assert!(selector29_restarting_d1(1, None, Some(u2)));
         assert!(!selector29_restarting_d1(1, None, Some(u1)));
         assert!(!selector29_restarting_d1(2, None, Some(u2)));
+    }
+
+    #[cfg(feature = "wyr1c6-selector29")]
+    #[test]
+    fn selector29_d1_exit_drains_stale_and_failure_before_p2_retirement() {
+        assert_eq!(
+            selector29_terminal_fact_for_event(crate::wyr1c6_gate::GateEvent::StaleReject),
+            Ok(Some(13))
+        );
+        assert_eq!(
+            selector29_terminal_fact_for_event(crate::wyr1c6_gate::GateEvent::D1Failure),
+            Ok(Some(14))
+        );
+        assert_eq!(
+            selector29_terminal_fact_for_event(crate::wyr1c6_gate::GateEvent::P2Retire),
+            Ok(None)
+        );
+        assert_eq!(
+            selector29_terminal_fact_for_event(crate::wyr1c6_gate::GateEvent::P2Publish),
+            Err(InitError::WrongManifestProfile)
+        );
     }
 }

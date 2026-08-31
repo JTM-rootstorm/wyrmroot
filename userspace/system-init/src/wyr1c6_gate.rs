@@ -234,6 +234,15 @@ impl EvidenceLog {
         self.len == EVIDENCE_RECORDS - 1
     }
 
+    #[must_use]
+    pub const fn next_expected_event(&self) -> Option<GateEvent> {
+        if self.len < EVIDENCE_RECORDS {
+            Some(EVIDENCE_ORDER[self.len])
+        } else {
+            None
+        }
+    }
+
     #[cfg(test)]
     const fn recorded_events(&self) -> usize {
         self.len
@@ -385,5 +394,16 @@ mod tests {
         assert!(log.is_complete());
         assert!(log.encode_record_at(25, &mut record).is_some());
         assert_eq!(&record[34..36], b"1A");
+    }
+
+    #[test]
+    fn next_expected_event_tracks_the_frozen_sequence() {
+        let mut log = EvidenceLog::new(0x1234).unwrap();
+        assert_eq!(log.next_expected_event(), Some(GateEvent::D1Begin));
+        for event in EVIDENCE_ORDER[..EVIDENCE_RECORDS - 1].iter().copied() {
+            log.record(event, 1, 1, 1, 1).unwrap();
+        }
+        log.finish().unwrap();
+        assert_eq!(log.next_expected_event(), None);
     }
 }
