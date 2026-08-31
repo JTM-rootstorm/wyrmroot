@@ -31,7 +31,7 @@ use wyrmroot_stream_proto::MAX_RECORD_BYTES;
 use wyrmroot_uart16550_core::ByteRegisterIo;
 use wyrmroot_uart16550d::{
     DeviceStage, ProductionDriver, ReceivedDeviceResource, ReceivedInterrupt,
-    ReceivedStreamEndpoint,
+    ReceivedStreamEndpoint, startup_control_is_readable,
 };
 
 const FAILURE_BASE: u32 = 0xD3A0_0000;
@@ -127,7 +127,7 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
             return Err(8);
         }
     };
-    if observed.index != 0 || observed.observed.0 & DW_SIGNAL_READABLE.0 == 0 {
+    if !startup_control_is_readable(observed.index, observed.observed) {
         close_handle(control).map_err(|_| 9u32)?;
         return Err(10);
     }
@@ -211,7 +211,7 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
         Ok(observed) => observed,
         Err(_) => return fail_owned_stage(control, received.handle, 25),
     };
-    if observed.index != 0 || observed.observed.0 & DW_SIGNAL_READABLE.0 == 0 {
+    if !startup_control_is_readable(observed.index, observed.observed) {
         let _ = device_pio_write(received.handle, 1, 1, 0);
         return fail_owned_stage(control, received.handle, 26);
     }
@@ -346,16 +346,36 @@ fn run_event_loop<I: ByteRegisterIo>(
         }
 
         if observed.index == 2 {
-            if observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 {
+            let peer_closed = observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0;
+            let readable = observed.observed.0 & DW_SIGNAL_READABLE.0 != 0;
+            if peer_closed && readable {
+                loop {
+                    match service_stream_read(driver, control, pio_failed) {
+                        Ok(StreamReadOutcome::Accepted) => {}
+                        Ok(StreamReadOutcome::WouldBlock) => {
+                            if isolate_stream(driver, control).is_err() {
+                                return fail_driver(driver, control, 41);
+                            }
+                            break;
+                        }
+                        Ok(StreamReadOutcome::Detached) => break,
+                        Err(()) => return fail_driver(driver, control, 42),
+                    }
+                }
+                continue;
+            }
+            if peer_closed {
                 if isolate_stream(driver, control).is_err() {
                     return fail_driver(driver, control, 41);
                 }
                 continue;
             }
-            if observed.observed.0 & DW_SIGNAL_READABLE.0 != 0
-                && service_stream_read(driver, control, pio_failed).is_err()
-            {
-                return fail_driver(driver, control, 42);
+            if readable {
+                match service_stream_read(driver, control, pio_failed) {
+                    Ok(StreamReadOutcome::Accepted | StreamReadOutcome::WouldBlock) => {}
+                    Ok(StreamReadOutcome::Detached) => continue,
+                    Err(()) => return fail_driver(driver, control, 42),
+                }
             }
             if driver.stream_endpoint().is_some()
                 && observed.observed.0 & DW_SIGNAL_WRITABLE.0 != 0
@@ -432,32 +452,45 @@ fn service_stream_read<I: ByteRegisterIo>(
     driver: &mut ProductionDriver<I>,
     control: DwHandle,
     pio_failed: &Cell<bool>,
-) -> Result<(), ()> {
+) -> Result<StreamReadOutcome, ()> {
     let Some(endpoint) = driver.stream_endpoint() else {
-        return Ok(());
+        return Ok(StreamReadOutcome::Detached);
     };
     let mut bytes = [0; MAX_RECORD_BYTES];
     let mut handles = [DwReceivedHandleInfoV1::default(); 16];
     let counts = match receive_channel(endpoint.handle, &mut bytes, &mut handles) {
         Ok(counts) => counts,
-        Err(error) if status_is(error, DW_STATUS_WOULD_BLOCK) => return Ok(()),
-        Err(_) => return isolate_stream(driver, control),
+        Err(error) if status_is(error, DW_STATUS_WOULD_BLOCK) => {
+            return Ok(StreamReadOutcome::WouldBlock);
+        }
+        Err(_) => {
+            isolate_stream(driver, control)?;
+            return Ok(StreamReadOutcome::Detached);
+        }
     };
     if counts.bytes > bytes.len() || counts.handles > handles.len() {
         close_received(&handles, counts.handles);
-        return isolate_stream(driver, control);
+        isolate_stream(driver, control)?;
+        return Ok(StreamReadOutcome::Detached);
     }
     if driver
         .accept_stream_record(&bytes[..counts.bytes], counts.handles)
         .is_err()
     {
         close_received(&handles, counts.handles);
-        return isolate_stream(driver, control);
+        isolate_stream(driver, control)?;
+        return Ok(StreamReadOutcome::Detached);
     }
     if pio_failed.get() {
         return Err(());
     }
-    Ok(())
+    Ok(StreamReadOutcome::Accepted)
+}
+
+enum StreamReadOutcome {
+    Accepted,
+    WouldBlock,
+    Detached,
 }
 
 fn service_stream_write<I: ByteRegisterIo>(

@@ -38,6 +38,26 @@ fn native_loop_checks_control_and_pio_before_interrupt_ack() {
 }
 
 #[test]
+fn startup_and_stream_peer_close_precedence_is_explicit() {
+    assert_eq!(DRIVER.matches("!startup_control_is_readable(").count(), 2);
+
+    let simultaneous = DRIVER.find("if peer_closed && readable").unwrap();
+    let drain = simultaneous
+        + DRIVER[simultaneous..]
+            .find("service_stream_read(driver, control, pio_failed)")
+            .unwrap();
+    let blocked = drain
+        + DRIVER[drain..]
+            .find("StreamReadOutcome::WouldBlock")
+            .unwrap();
+    let detach = blocked
+        + DRIVER[blocked..]
+            .find("isolate_stream(driver, control)")
+            .unwrap();
+    assert!(simultaneous < drain && drain < blocked && blocked < detach);
+}
+
+#[test]
 fn native_stream_and_teardown_paths_preserve_commit_and_close_order() {
     let prepare = DRIVER.find("driver.prepare_stream_send").unwrap();
     let send = DRIVER

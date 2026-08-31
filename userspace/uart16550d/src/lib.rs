@@ -21,8 +21,8 @@ use deepwyrm_syscall::{
     DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT, DW_INTERRUPT_INFO_V1_SIZE,
     DW_INTERRUPT_INFO_V1_VERSION, DW_INTERRUPT_STATE_ARMED, DW_OBJECT_TYPE_CHANNEL,
     DW_OBJECT_TYPE_DEVICE_RESOURCE, DW_OBJECT_TYPE_INTERRUPT, DW_RIGHT_INSPECT, DW_RIGHT_MODIFY,
-    DW_RIGHT_READ, DW_RIGHT_WAIT, DW_RIGHT_WRITE, DwDeviceResourceInfoV1, DwHandle,
-    DwInterruptInfoV1, DwObjectType, DwRights,
+    DW_RIGHT_READ, DW_RIGHT_WAIT, DW_RIGHT_WRITE, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE,
+    DwDeviceResourceInfoV1, DwHandle, DwInterruptInfoV1, DwObjectType, DwRights, DwSignals,
 };
 use wyrmroot_device_proto::control_v1_1::{ControlIdentityV1_1, ControlMessageV1_1};
 use wyrmroot_stream_proto::{MAX_PAYLOAD_BYTES, MAX_RECORD_BYTES, decode_data, encode_data};
@@ -40,6 +40,12 @@ pub const RAW_STREAM_RIGHTS: DwRights =
     DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_WAIT.0 | DW_RIGHT_INSPECT.0);
 pub const INTERRUPT_RIGHTS: DwRights =
     DwRights(DW_RIGHT_WAIT.0 | DW_RIGHT_MODIFY.0 | DW_RIGHT_INSPECT.0);
+
+/// Both startup handoff waits are fail-closed: once the control peer has
+/// closed, queued readability cannot authorize further hardware activation.
+pub const fn startup_control_is_readable(index: u32, signals: DwSignals) -> bool {
+    index == 0 && signals.0 & DW_SIGNAL_PEER_CLOSED.0 == 0 && signals.0 & DW_SIGNAL_READABLE.0 != 0
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReceivedDeviceResource {
@@ -435,10 +441,10 @@ impl ReadySet {
             Some(ReadyWork::ControlReadable)
         } else if self.interrupt {
             Some(ReadyWork::Interrupt)
-        } else if self.stream_peer_closed {
-            Some(ReadyWork::StreamPeerClosed)
         } else if self.stream_readable {
             Some(ReadyWork::StreamReadable)
+        } else if self.stream_peer_closed {
+            Some(ReadyWork::StreamPeerClosed)
         } else if self.stream_writable {
             Some(ReadyWork::StreamWritable)
         } else {
@@ -1140,5 +1146,53 @@ mod tests {
             .acknowledge_interrupt(drained, true, |_| Ok(()))
             .unwrap();
         assert_eq!(driver.counters().interrupt_wakes, u32::MAX);
+    }
+
+    #[test]
+    fn startup_peer_close_wins_and_stream_readable_drains_before_detach() {
+        let both = DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0);
+        assert!(!startup_control_is_readable(0, both));
+        assert!(!startup_control_is_readable(1, DW_SIGNAL_READABLE));
+        assert!(startup_control_is_readable(0, DW_SIGNAL_READABLE));
+
+        assert_eq!(
+            ReadySet {
+                stream_peer_closed: true,
+                stream_readable: true,
+                ..ReadySet::default()
+            }
+            .highest_priority(),
+            Some(ReadyWork::StreamReadable)
+        );
+
+        let mut driver = production(FakeIo::new());
+        driver.activate().unwrap();
+        let endpoint = ReceivedStreamEndpoint {
+            handle: DwHandle(20),
+            object_type: DW_OBJECT_TYPE_CHANNEL,
+            rights: RAW_STREAM_RIGHTS,
+            reserved0: 0,
+            reserved: [0; 2],
+        };
+        driver
+            .attach_stream(
+                ControlMessageV1_1::AttachStream {
+                    identity: identity(21),
+                    stream_generation: 22,
+                    publication_generation: 23,
+                },
+                endpoint,
+            )
+            .unwrap();
+        let payload = b"final queued WRST data";
+        let mut wire = [0; MAX_RECORD_BYTES];
+        let size = encode_data(payload, &mut wire).unwrap();
+        assert_eq!(
+            driver.accept_stream_record(&wire[..size], 0),
+            Ok(payload.len())
+        );
+        let (_, detached) = driver.detach_stream().unwrap();
+        assert_eq!(detached, endpoint);
+        assert_eq!(driver.uart().tx_len(), payload.len());
     }
 }
