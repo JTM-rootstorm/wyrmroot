@@ -29,7 +29,7 @@ content.
   `DWE3READY|01|<NONCE16>|<STREAM16>|<CHALLENGE16>|<FNV16>|<FNV32>`; COM2 has
   no prefix, suffix, or handshake byte;
 - the bootfs builder and xtask snapshot keep the five production WRRM roles
-  while adding the separately named probe artifact; and
+  while adding the separately named probe artifact;
 - `dw1-e3a-prepare <output> <deep-repo> <deep-revision> <nonce>` builds and
   freezes the immutable artifacts and ESP, profile-local domain XML and mutable
   OVMF variables, source/build receipts, acyclic request/handoff/profile-pair
@@ -37,7 +37,12 @@ content.
   rejects `DWTEST1` and does not create an acceptance receipt. Each profile's
   COM2 serial source uses libvirt `mode="connect"` to join the runner-owned
   Unix-socket listener; the handoff freezes that mode and ownership explicitly,
-  and the generated domain never tries to bind the socket.
+  and the generated domain never tries to bind the socket; and
+- the request freezes the exact 354-byte `ovmf-bds-session-banner` COM2
+  prelude as uppercase hexadecimal plus its length and SHA-256 alongside the
+  OVMF/ESP identities. Both profile handoffs rejoin its kind, length, and hash
+  through the request identity rather than treating firmware output as an
+  unbound runner assumption.
 
 ## Canonical raw payload
 

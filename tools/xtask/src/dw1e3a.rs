@@ -44,6 +44,21 @@ const ESP_FD_GROUP: &str = "dw-f13-esp-v1";
 const VARS_FD_GROUP: &str = "dw-f13-ovmf-vars-v1";
 const COM1_FD_GROUP: &str = "dw-e3a-com1-evidence-v1";
 const COM2_FD_GROUP: &str = "dw-e3a-com2-raw-v1";
+const COM2_PRELUDE_KIND: &str = "ovmf-bds-session-banner";
+const COM2_PRELUDE_LENGTH: &str = "354";
+const COM2_PRELUDE_SHA256: &str =
+    "8cf1a7eba89309b5ee101cbe77935604572151fb79f4e009a327125c5da8cb47";
+const COM2_PRELUDE: &[u8] = concat!(
+    "\x1b[2J\x1b[01;01H\x1b[=3h\x1b[2J\x1b[01;01H",
+    "\x1b[2J\x1b[01;01H\x1b[=3h\x1b[2J\x1b[01;01H",
+    "BdsDxe: loading Boot0001 \"UEFI Non-Block Boot Device\" from ",
+    "PciRoot(0x0)/Pci(0x1,0x1)/Pci(0x0,0x0)\r\n",
+    "BdsDxe: starting Boot0001 \"UEFI Non-Block Boot Device\" from ",
+    "PciRoot(0x0)/Pci(0x1,0x1)/Pci(0x0,0x0)\r\n",
+    "wyrmroot-loader: UEFI adapter online\r\n",
+    "wyrmroot-loader: final UEFI memory map / ExitBootServices\r\n",
+)
+.as_bytes();
 
 /// Producer-owned entry into the accepted native product builder. The
 /// request freezer consumes this snapshot together with its kernel/firmware
@@ -282,6 +297,10 @@ pub(crate) const REQUEST_KEYS: &[&str] = &[
     "partial_evidence",
     "acceptance_claim",
     "readiness_marker",
+    "com2_prelude_kind",
+    "com2_prelude_hex",
+    "com2_prelude_length",
+    "com2_prelude_sha256",
     "deepwyrm_revision",
     "generated_abi_revision",
     "generated_abi_tree",
@@ -366,6 +385,9 @@ pub(crate) const HANDOFF_KEYS: &[&str] = &[
     "com2_transport",
     "com2_socket_mode",
     "com2_socket_owner",
+    "com2_prelude_kind",
+    "com2_prelude_length",
+    "com2_prelude_sha256",
     "com1_fd_group",
     "com2_fd_group",
     "esp_fd_group",
@@ -830,6 +852,10 @@ fn freeze_produced(
         ("partial_evidence", "true".to_owned()),
         ("acceptance_claim", ACCEPTANCE_CLAIM.to_owned()),
         ("readiness_marker", READINESS_MARKER.to_owned()),
+        ("com2_prelude_kind", COM2_PRELUDE_KIND.to_owned()),
+        ("com2_prelude_hex", upper_hex(COM2_PRELUDE)),
+        ("com2_prelude_length", COM2_PRELUDE_LENGTH.to_owned()),
+        ("com2_prelude_sha256", COM2_PRELUDE_SHA256.to_owned()),
         ("deepwyrm_revision", produced.deep_revision.clone()),
         ("generated_abi_revision", produced.abi_revision.clone()),
         ("generated_abi_tree", produced.abi_tree.clone()),
@@ -972,6 +998,15 @@ fn stage_profile(
         ("com2_transport", "unix-socket-byte-stream"),
         ("com2_socket_mode", "connect"),
         ("com2_socket_owner", "runner"),
+        ("com2_prelude_kind", value(request, "com2_prelude_kind")?),
+        (
+            "com2_prelude_length",
+            value(request, "com2_prelude_length")?,
+        ),
+        (
+            "com2_prelude_sha256",
+            value(request, "com2_prelude_sha256")?,
+        ),
         ("com1_fd_group", COM1_FD_GROUP),
         ("com2_fd_group", COM2_FD_GROUP),
         ("esp_fd_group", ESP_FD_GROUP),
@@ -1201,6 +1236,10 @@ pub(crate) fn render_request(values: &BTreeMap<String, String>) -> Result<String
     require(values, "partial_evidence", "true")?;
     require(values, "acceptance_claim", ACCEPTANCE_CLAIM)?;
     require(values, "readiness_marker", READINESS_MARKER)?;
+    require(values, "com2_prelude_kind", COM2_PRELUDE_KIND)?;
+    require(values, "com2_prelude_hex", &upper_hex(COM2_PRELUDE))?;
+    require(values, "com2_prelude_length", COM2_PRELUDE_LENGTH)?;
+    require(values, "com2_prelude_sha256", COM2_PRELUDE_SHA256)?;
     require(values, "challenge_length", "24")?;
     require(values, "response_length", "24")?;
     require(values, "default_handoff", "default/handoff.toml")?;
@@ -1244,6 +1283,9 @@ pub(crate) fn render_handoff(values: &BTreeMap<String, String>) -> Result<String
         ("com2_transport", "unix-socket-byte-stream"),
         ("com2_socket_mode", "connect"),
         ("com2_socket_owner", "runner"),
+        ("com2_prelude_kind", COM2_PRELUDE_KIND),
+        ("com2_prelude_length", COM2_PRELUDE_LENGTH),
+        ("com2_prelude_sha256", COM2_PRELUDE_SHA256),
         ("com1_fd_group", "dw-e3a-com1-evidence-v1"),
         ("com2_fd_group", "dw-e3a-com2-raw-v1"),
         ("esp_fd_group", "dw-f13-esp-v1"),
@@ -1503,6 +1545,10 @@ mod tests {
             ("partial_evidence", "true"),
             ("acceptance_claim", ACCEPTANCE_CLAIM),
             ("readiness_marker", READINESS_MARKER),
+            ("com2_prelude_kind", COM2_PRELUDE_KIND),
+            ("com2_prelude_hex", &upper_hex(COM2_PRELUDE)),
+            ("com2_prelude_length", COM2_PRELUDE_LENGTH),
+            ("com2_prelude_sha256", COM2_PRELUDE_SHA256),
             ("challenge_length", "24"),
             ("response_length", "24"),
             ("default_handoff", "default/handoff.toml"),
@@ -1577,6 +1623,18 @@ mod tests {
     }
 
     #[test]
+    fn com2_prelude_is_the_exact_ovmf_bds_session_banner() {
+        assert_eq!(COM2_PRELUDE.len(), 354);
+        assert_eq!(sha256::bytes_digest(COM2_PRELUDE), COM2_PRELUDE_SHA256);
+        assert_eq!(upper_hex(COM2_PRELUDE).len(), 708);
+        assert!(COM2_PRELUDE.starts_with(b"\x1b[2J\x1b[01;01H\x1b[=3h"));
+        assert!(
+            COM2_PRELUDE
+                .ends_with(b"wyrmroot-loader: final UEFI memory map / ExitBootServices\r\n")
+        );
+    }
+
+    #[test]
     fn handoff_and_pair_freeze_profiles_transport_and_absent_receipt() {
         for (profile, vcpus) in [("default", "1"), ("smp", "4")] {
             let mut map = values(HANDOFF_KEYS);
@@ -1602,6 +1660,9 @@ mod tests {
                 ("com2_transport", "unix-socket-byte-stream"),
                 ("com2_socket_mode", "connect"),
                 ("com2_socket_owner", "runner"),
+                ("com2_prelude_kind", COM2_PRELUDE_KIND),
+                ("com2_prelude_length", COM2_PRELUDE_LENGTH),
+                ("com2_prelude_sha256", COM2_PRELUDE_SHA256),
                 ("com1_fd_group", "dw-e3a-com1-evidence-v1"),
                 ("com2_fd_group", "dw-e3a-com2-raw-v1"),
                 ("esp_fd_group", "dw-f13-esp-v1"),
@@ -1739,6 +1800,13 @@ mod tests {
         ));
         let request = fs::read_to_string(output.join("request.toml")).unwrap();
         assert!(request.contains("selector = \"q35-com2-interrupt\""));
+        assert!(request.contains("com2_prelude_kind = \"ovmf-bds-session-banner\""));
+        assert!(request.contains("com2_prelude_length = \"354\""));
+        assert!(request.contains(&format!(
+            "com2_prelude_hex = \"{}\"",
+            upper_hex(COM2_PRELUDE)
+        )));
+        assert!(request.contains(&format!("com2_prelude_sha256 = \"{COM2_PRELUDE_SHA256}\"")));
         assert!(!request.contains("default_handoff_sha256"));
         assert!(!request.contains("smp_handoff_sha256"));
         assert!(!request.contains("profile_pair_sha256"));
@@ -1750,6 +1818,9 @@ mod tests {
             assert!(handoff.contains(&format!("com2_socket = \"{profile}/com2.sock\"")));
             assert!(handoff.contains("com2_socket_mode = \"connect\""));
             assert!(handoff.contains("com2_socket_owner = \"runner\""));
+            assert!(handoff.contains("com2_prelude_kind = \"ovmf-bds-session-banner\""));
+            assert!(handoff.contains("com2_prelude_length = \"354\""));
+            assert!(handoff.contains(&format!("com2_prelude_sha256 = \"{COM2_PRELUDE_SHA256}\"")));
             assert!(!handoff.contains("DWTEST1"));
             let domain = fs::read_to_string(output.join(profile).join("domain.xml")).unwrap();
             assert!(domain.contains(&format!(
