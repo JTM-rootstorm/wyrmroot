@@ -259,6 +259,7 @@ enum Slot {
     ReadyToConnect { attach: Attach, pair: EndpointPair },
     Active { attach: Attach, pair: EndpointPair },
     AwaitingDriverRelease { attach: Attach, pair: EndpointPair },
+    AwaitingClientRelease { attach: Attach, pair: EndpointPair },
     RetiringActive { attach: Attach, pair: EndpointPair },
 }
 
@@ -411,6 +412,27 @@ impl Connector {
         Ok(())
     }
 
+    fn driver_detached(&mut self, observed: Attach) -> Result<(), ConnectError> {
+        let (attach, mut pair, retiring) = match self.slot {
+            Slot::Active { attach, pair } => (attach, pair, false),
+            Slot::RetiringActive { attach, pair } => (attach, pair, true),
+            _ => return Err(ConnectError::Stale),
+        };
+        if observed != attach || pair.driver != EndpointOwner::Driver {
+            return Err(ConnectError::Stale);
+        }
+        pair.driver = EndpointOwner::Closed;
+        self.closed_endpoints = self.closed_endpoints.saturating_add(1);
+        if retiring && pair.client == EndpointOwner::Closed {
+            self.slot = Slot::Empty;
+        } else if retiring {
+            self.slot = Slot::RetiringActive { attach, pair };
+        } else {
+            self.slot = Slot::AwaitingClientRelease { attach, pair };
+        }
+        Ok(())
+    }
+
     fn driver_release_observed(&mut self, observed: Attach) -> Result<(), ConnectError> {
         let Slot::AwaitingDriverRelease { attach, mut pair } = self.slot else {
             return Err(ConnectError::Stale);
@@ -426,8 +448,10 @@ impl Connector {
     }
 
     fn client_release_observed(&mut self, observed: Attach) -> Result<(), ConnectError> {
-        let Slot::RetiringActive { attach, mut pair } = self.slot else {
-            return Err(ConnectError::Stale);
+        let (attach, mut pair, retiring) = match self.slot {
+            Slot::AwaitingClientRelease { attach, pair } => (attach, pair, false),
+            Slot::RetiringActive { attach, pair } => (attach, pair, true),
+            _ => return Err(ConnectError::Stale),
         };
         if observed != attach || pair.client != EndpointOwner::Client {
             return Err(ConnectError::Stale);
@@ -436,8 +460,10 @@ impl Connector {
         self.closed_endpoints = self.closed_endpoints.saturating_add(1);
         if pair.driver == EndpointOwner::Closed {
             self.slot = Slot::Empty;
-        } else {
+        } else if retiring {
             self.slot = Slot::RetiringActive { attach, pair };
+        } else {
+            self.slot = Slot::AwaitingClientRelease { attach, pair };
         }
         Ok(())
     }
@@ -463,6 +489,9 @@ impl Connector {
                 self.begin_post_move_cleanup(attach, pair);
             }
             Slot::Active { attach, pair } => {
+                self.slot = Slot::RetiringActive { attach, pair };
+            }
+            Slot::AwaitingClientRelease { attach, pair } => {
                 self.slot = Slot::RetiringActive { attach, pair };
             }
             Slot::AwaitingDriverRelease { .. } | Slot::RetiringActive { .. } | Slot::Empty => {}
@@ -508,6 +537,7 @@ impl Connector {
             | Slot::ReadyToConnect { pair, .. }
             | Slot::Active { pair, .. }
             | Slot::AwaitingDriverRelease { pair, .. }
+            | Slot::AwaitingClientRelease { pair, .. }
             | Slot::RetiringActive { pair, .. } => pair,
             Slot::Empty => return 0,
         };
@@ -1071,7 +1101,16 @@ fn connector_correlates_ready_busy_stale_and_cleanup_without_handle_leaks() {
         }),
         Err(ConnectError::NotReady)
     );
-    connector.generation_terminal_reaped();
+    let mut stale_retiring_detach = attach;
+    stale_retiring_detach.stream_generation += 1;
+    let retiring_slot = connector.slot;
+    assert_eq!(
+        connector.driver_detached(stale_retiring_detach),
+        Err(ConnectError::Stale)
+    );
+    assert_eq!(connector.slot, retiring_slot);
+    assert_eq!(connector.current, None);
+    assert_eq!(connector.driver_detached(attach), Ok(()));
     assert!(!connector.cleanup_complete());
     assert_eq!(connector.live_handles(), 1);
     assert_eq!(connector.client_release_observed(attach), Ok(()));
@@ -1109,10 +1148,59 @@ fn connector_correlates_ready_busy_stale_and_cleanup_without_handle_leaks() {
     assert_eq!(reverse_retirement.client_release_observed(attach), Ok(()));
     assert!(!reverse_retirement.cleanup_complete());
     assert_eq!(reverse_retirement.live_handles(), 1);
-    reverse_retirement.generation_terminal_reaped();
+    assert_eq!(reverse_retirement.current, None);
+    assert_eq!(reverse_retirement.driver_detached(attach), Ok(()));
     assert!(reverse_retirement.cleanup_complete());
     assert_eq!(reverse_retirement.live_handles(), 0);
     assert_eq!(reverse_retirement.closed_endpoints, 2);
+
+    let mut driver_first = Connector::new(Some(driver));
+    let attach = driver_first
+        .connect(ConnectRequest {
+            publication: 11,
+            transaction: 13,
+        })
+        .unwrap();
+    assert_eq!(driver_first.attach_sent(attach), Ok(()));
+    assert_eq!(driver_first.ready(attach), Ok(()));
+    assert_eq!(driver_first.connected(), Ok(()));
+    let mut stale = attach;
+    stale.stream_generation += 1;
+    let active_slot = driver_first.slot;
+    assert_eq!(
+        driver_first.driver_detached(stale),
+        Err(ConnectError::Stale)
+    );
+    assert_eq!(driver_first.slot, active_slot);
+    assert_eq!(driver_first.live_handles(), 2);
+    assert_eq!(driver_first.driver_detached(attach), Ok(()));
+    assert!(matches!(
+        driver_first.slot,
+        Slot::AwaitingClientRelease { .. }
+    ));
+    assert!(!driver_first.cleanup_complete());
+    assert_eq!(driver_first.live_handles(), 1);
+    assert_eq!(driver_first.current, Some(driver));
+    assert_eq!(
+        driver_first.connect(ConnectRequest {
+            publication: 11,
+            transaction: 14,
+        }),
+        Err(ConnectError::Busy)
+    );
+    assert_eq!(driver_first.client_release_observed(attach), Ok(()));
+    assert!(driver_first.cleanup_complete());
+    assert_eq!(driver_first.live_handles(), 0);
+    assert_eq!(driver_first.current, Some(driver));
+    let fresh = driver_first
+        .connect(ConnectRequest {
+            publication: 11,
+            transaction: 15,
+        })
+        .unwrap();
+    assert_eq!(driver_first.attach_send_failed(fresh), Ok(()));
+    assert!(driver_first.cleanup_complete());
+    assert_eq!(driver_first.closed_endpoints, 4);
 }
 
 #[test]

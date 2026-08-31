@@ -196,10 +196,15 @@ by itself prove an externally owned client endpoint closed.
 
 The host model names the ownership states explicitly: pre-MOVE (both endpoints
 owned by devmgr), post-MOVE pending (client owned by devmgr, driver endpoint
-owned by the driver), ready-to-connect, active, and awaiting release. A stale
-READY/detach leaves the exact current state unchanged. For an active stream,
-driver-generation reap proves only driver-endpoint release; cleanup remains
-incomplete until client release is also observed, in either order.
+owned by the driver), ready-to-connect, active, awaiting driver release,
+awaiting client release, and retiring-active. A stale READY/detach leaves the
+exact current state unchanged. For an ordinary active detach, either endpoint
+may release first; the slot remains busy until the correlation-exact other
+release is observed, then a fresh connect may reuse the still-healthy driver
+generation. Retirement is separate: it clears the current publication and
+cannot restore it. Driver-generation reap proves only driver-endpoint release;
+retirement cleanup remains incomplete until client release is also observed,
+in either order.
 
 If the `CONNECTED` MOVE fails atomically, devmgr still owns and closes the
 client endpoint; the driver observes peer close and releases the moved peer.
@@ -572,8 +577,9 @@ The D0 executable model is intentionally an integration test in
   writes, and a WRITABLE/send `WOULD_BLOCK` race;
 - connector zero/stale/not-ready/busy behavior, exact READY correlation,
   explicit pre-/post-MOVE ownership, attach/reply failures, timeouts, active
-  detach, order-independent retirement cleanup, and deferred moved-endpoint
-  release without stale-event mutation;
+  client-first and driver-first detach with healthy-generation reuse,
+  order-independent retirement cleanup, and deferred moved-endpoint release
+  without stale-event mutation;
 - exact 4096-byte RX/TX and staging bounds, drop-newest/saturating RX overflow,
   TX backpressure without drop, and all three console stages rejecting byte
   4097 without mutation;
