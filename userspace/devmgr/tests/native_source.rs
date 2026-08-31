@@ -109,6 +109,9 @@ fn selector29_stale_probes_run_after_p2_publication_and_close_before_probe() {
     let launch = retry
         .find("launch_driver_with_bundle(")
         .expect("U2 launch and P2 publication complete before return");
+    let malformed = retry
+        .find("probe_malformed_resource_mapping(launched")
+        .expect("post-P2 malformed resource mapping probe");
     let stale_control = retry
         .find("probe_stale_driver_endpoint(stale_control")
         .expect("post-P2 stale control probe");
@@ -121,7 +124,7 @@ fn selector29_stale_probes_run_after_p2_publication_and_close_before_probe() {
     let close_publication = NATIVE
         .find("close_handle(stale_publication).map_err(|_| failure(149))")
         .expect("old publication closes at cleanup");
-    assert!(launch < stale_control && stale_control < stale_publication);
+    assert!(launch < malformed && malformed < stale_control && stale_control < stale_publication);
     assert!(close_control < retry_start);
     assert!(close_publication < retry_start);
     assert!(!NATIVE.contains("if send_channel(publication, &bytes[..stale_size], &[]).is_ok()"));
@@ -131,6 +134,24 @@ fn selector29_stale_probes_run_after_p2_publication_and_close_before_probe() {
         .find("} else {\n                        12")
         .expect("P2 fact remains explicit");
     assert!(publish < p2);
+}
+
+#[test]
+fn selector29_malformed_mapping_probe_moves_fresh_handles_and_requires_typed_rejection() {
+    let probe = &NATIVE[NATIVE
+        .find("fn probe_malformed_resource_mapping(")
+        .expect("selector-29 malformed resource probe")
+        ..NATIVE.find("fn publish_driver(").expect("next C5 helper")];
+    assert!(probe.contains("duplicate_handle(parent_resource, DEVICE_RESOURCE_TRANSFER_RIGHTS)"));
+    assert!(probe.contains("create_interrupt(parent_resource, INTERRUPT_CUSTODY_RIGHTS)"));
+    assert!(probe.contains("active_generation.0.checked_add(1)"));
+    assert!(probe.contains("requested_rights: DEVICE_RESOURCE_DRIVER_RIGHTS"));
+    assert!(probe.contains("requested_rights: INTERRUPT_DRIVER_RIGHTS"));
+    assert!(probe.contains("operation: DW_HANDLE_TRANSFER_MOVE"));
+    assert!(probe.contains("code: FailureCode::MalformedResource"));
+    assert!(!probe.contains("device_pio_read"));
+    assert!(!probe.contains("device_pio_write"));
+    assert!(!probe.contains("interrupt_ack"));
 }
 
 #[test]

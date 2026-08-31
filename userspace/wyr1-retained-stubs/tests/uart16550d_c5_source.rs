@@ -38,7 +38,7 @@ fn malformed_intake_and_retire_both_close_the_two_authority_handles() {
     let control = cleanup.find("close_handle(control)").unwrap();
     assert!(interrupt < resource && resource < control);
     assert!(c5.contains("ControlMessage::Retire"));
-    assert!(c5.contains("let result = hold_until_retire(control, ready)"));
+    assert!(c5.contains("let result = probe.and_then(|()| hold_until_retire(control, ready))"));
 }
 
 #[test]
@@ -59,4 +59,20 @@ fn selector29_failure_is_triggered_only_after_ready_and_releases_both_handles() 
     assert!(ready < selector && selector < trigger && trigger < failure);
     assert!(close_interrupt < close_resource);
     assert!(actor.contains("ControlMessage::TriggerFailure"));
+}
+
+#[test]
+fn selector29_u2_rejects_a_live_mismatched_bundle_and_keeps_the_valid_bundle() {
+    let actor = &ACTOR[ACTOR
+        .find("fn hold_until_malformed_resource_probe(")
+        .expect("selector-29 malformed resource probe")
+        ..ACTOR.find("fn close_c5_intake(").expect("next C5 helper")];
+    assert!(actor.contains("counts.bytes != bytes.len() || counts.handles != 2"));
+    assert!(actor.contains("bundle_generation != active_generation"));
+    assert!(actor.contains("resource.lease_generation == active_generation.0"));
+    assert!(actor.contains("resource.lease_generation != declared_generation.0"));
+    assert!(actor.contains("close_handle(handles[1].handle)"));
+    assert!(actor.contains("close_handle(handles[0].handle)"));
+    assert!(actor.contains("FailureCode::MalformedResource"));
+    assert!(ACTOR.contains("probe.and_then(|()| hold_until_retire(control, ready))"));
 }

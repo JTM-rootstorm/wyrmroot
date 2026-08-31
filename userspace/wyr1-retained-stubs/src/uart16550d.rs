@@ -232,7 +232,11 @@ fn run_c5_driver(
         };
     }
 
-    let result = hold_until_retire(control, ready);
+    #[cfg(feature = "wyr1c6-selector29")]
+    let probe = hold_until_malformed_resource_probe(control, ready);
+    #[cfg(not(feature = "wyr1c6-selector29"))]
+    let probe = Ok(());
+    let result = probe.and_then(|()| hold_until_retire(control, ready));
     let mut cleanup_failed = close_handle(handles[1].handle).is_err();
     cleanup_failed |= close_handle(handles[0].handle).is_err();
     cleanup_failed |= close_handle(control).is_err();
@@ -283,6 +287,119 @@ fn hold_until_failure_trigger(
     } else {
         Err(37)
     }
+}
+
+#[cfg(feature = "wyr1c6-selector29")]
+fn hold_until_malformed_resource_probe(
+    control: deepwyrm_syscall::DwHandle,
+    ready: ControlMessage,
+) -> Result<(), u32> {
+    let observed = wait_many(
+        core::slice::from_ref(&DwWaitItemV1 {
+            handle: control,
+            signals: deepwyrm_syscall::DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+        }),
+        deepwyrm_syscall::DW_DEADLINE_INFINITE,
+    )
+    .map_err(|_| 38u32)?;
+    if observed.index != 0 || observed.observed.0 & DW_SIGNAL_READABLE.0 == 0 {
+        return Err(39);
+    }
+    let mut bytes = [0u8; RESOURCE_BUNDLE_BYTES];
+    let mut handles = [DwReceivedHandleInfoV1::default(); 2];
+    let counts = receive_channel(control, &mut bytes, &mut handles).map_err(|_| 40u32)?;
+    if counts.bytes != bytes.len() || counts.handles != 2 {
+        close_received(&handles, counts.handles);
+        return Err(41);
+    }
+    let (role_id, active_generation, attempt_generation, endpoint, transaction_id) = match ready {
+        ControlMessage::Ready {
+            role_id,
+            bundle_generation,
+            attempt_generation,
+            endpoint,
+            transaction_id,
+        } => (
+            role_id,
+            bundle_generation,
+            attempt_generation,
+            endpoint,
+            transaction_id,
+        ),
+        _ => {
+            close_received(&handles, counts.handles);
+            return Err(42);
+        }
+    };
+    let declared_generation = match parse(&bytes) {
+        Ok(ControlMessage::ResourceBundle {
+            role_id: observed_role,
+            bundle_generation,
+            attempt_generation: observed_attempt,
+            endpoint: observed_endpoint,
+            transaction_id: observed_transaction,
+        }) if observed_role == role_id
+            && observed_attempt == attempt_generation
+            && observed_endpoint == endpoint
+            && observed_transaction == transaction_id
+            && bundle_generation != active_generation =>
+        {
+            bundle_generation
+        }
+        _ => {
+            close_received(&handles, counts.handles);
+            return Err(43);
+        }
+    };
+    let resource_rights = DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_INSPECT.0);
+    let interrupt_rights = DwRights(DW_RIGHT_WAIT.0 | DW_RIGHT_MODIFY.0 | DW_RIGHT_INSPECT.0);
+    let valid_types = valid(handles[0], DW_OBJECT_TYPE_DEVICE_RESOURCE, resource_rights)
+        && valid(handles[1], DW_OBJECT_TYPE_INTERRUPT, interrupt_rights);
+    let resource = device_resource_info(handles[0].handle);
+    let interrupt = interrupt_info(handles[1].handle);
+    let valid_mapping = match (resource, interrupt) {
+        (Ok(resource), Ok(interrupt)) => {
+            resource.size == DW_DEVICE_RESOURCE_INFO_V1_SIZE
+                && resource.version == DW_DEVICE_RESOURCE_INFO_V1_VERSION
+                && resource.kind == DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT
+                && resource.flags == 0
+                && resource.resource_id == 1
+                && resource.lease_generation == active_generation.0
+                && resource.lease_generation != declared_generation.0
+                && resource.pio_base == 0x2f8
+                && resource.pio_length == 8
+                && resource.interrupt_source == 3
+                && resource.reserved == 0
+                && interrupt.size == DW_INTERRUPT_INFO_V1_SIZE
+                && interrupt.version == DW_INTERRUPT_INFO_V1_VERSION
+                && interrupt.source == 3
+                && interrupt.state == DW_INTERRUPT_STATE_ARMED
+                && interrupt.object_generation != 0
+                && interrupt.binding_generation != 0
+                && interrupt.parent_resource_id == resource.resource_id
+                && interrupt.parent_lease_generation == resource.lease_generation
+                && interrupt.flags.0 == 0
+                && interrupt.reserved0 == 0
+                && interrupt.reserved == 0
+        }
+        _ => false,
+    };
+    let mut cleanup_failed = close_handle(handles[1].handle).is_err();
+    cleanup_failed |= close_handle(handles[0].handle).is_err();
+    if !valid_types || !valid_mapping || cleanup_failed {
+        return Err(44);
+    }
+    let failure = ControlMessage::Failure {
+        role_id,
+        bundle_generation: active_generation,
+        attempt_generation,
+        endpoint,
+        transaction_id,
+        code: wyrmroot_device_proto::FailureCode::MalformedResource,
+    };
+    let mut failure_bytes = [0u8; FAILURE_BYTES];
+    encode(failure, &mut failure_bytes).map_err(|_| 45u32)?;
+    send_channel(control, &failure_bytes, &[]).map_err(|_| 46u32)
 }
 
 #[cfg(feature = "wyr1c5-production")]
