@@ -274,7 +274,10 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
         }
     };
     #[cfg(feature = "dw1e3-selector31")]
-    let evidence_nonce = dw1e3_build_nonce().map_err(|_| 60u32)?;
+    let evidence_nonce = match dw1e3_build_nonce() {
+        Ok(nonce) => nonce,
+        Err(_) => return fail_driver(&mut driver, control, 60),
+    };
     #[cfg(feature = "dw1e3-selector31")]
     dw1e3_bind_driver(
         driver.interrupt().handle,
@@ -289,6 +292,9 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
     if send_control(control, ready).is_err() {
         return fail_driver(&mut driver, control, 34);
     }
+    #[cfg(feature = "dw1e3-selector31")]
+    return run_event_loop(&mut driver, control, &pio_failed, evidence_nonce);
+    #[cfg(not(feature = "dw1e3-selector31"))]
     run_event_loop(&mut driver, control, &pio_failed)
 }
 
@@ -296,14 +302,15 @@ fn run_event_loop<I: ByteRegisterIo>(
     driver: &mut ProductionDriver<I>,
     control: DwHandle,
     pio_failed: &Cell<bool>,
+    #[cfg(feature = "dw1e3-selector31")] evidence_nonce: u64,
 ) -> Result<u32, u32> {
     let mut peer_close_drain = PeerCloseDrain::new();
-    #[cfg(feature = "dw1e3-selector31")]
-    let evidence_nonce = dw1e3_build_nonce().map_err(|_| 62u32)?;
     #[cfg(feature = "dw1e3-selector31")]
     let mut evidence = None;
     #[cfg(feature = "dw1e3-selector31")]
     let mut selector_retiring = false;
+    #[cfg(feature = "dw1e3-selector31")]
+    let mut selector_retirement_binding = None;
     loop {
         let mut items = [DwWaitItemV1::default(); 3];
         items[0] = DwWaitItemV1 {
@@ -416,7 +423,14 @@ fn run_event_loop<I: ByteRegisterIo>(
                         if !same_binding(driver, evidence_nonce, evidence, binding) {
                             return fail_driver(driver, control, 86);
                         }
-                        if let Some((detached, endpoint)) = driver.begin_selector_retire() {
+                        driver.begin_selector_retire();
+                        if pio_failed.get()
+                            || !driver.selector_interrupts_disabled()
+                            || pio_failed.get()
+                        {
+                            return fail_driver(driver, control, 87);
+                        }
+                        if let Some((detached, endpoint)) = driver.detach_stream() {
                             let mut ready =
                                 [0u8; wyrmroot_dw1e3_com2_test::TRANSPORT_EMPTY_FACT_BYTES];
                             if wyrmroot_dw1e3_com2_test::encode_retire_stage1_ready(
@@ -424,28 +438,24 @@ fn run_event_loop<I: ByteRegisterIo>(
                             )
                             .is_err()
                             {
-                                return fail_driver(driver, control, 87);
-                            }
-                            if close_handle(endpoint.handle).is_err() {
                                 return fail_driver(driver, control, 88);
                             }
-                            if send_channel(control, &ready, &[]).is_err() {
+                            if close_handle(endpoint.handle).is_err() {
                                 return fail_driver(driver, control, 89);
+                            }
+                            if send_channel(control, &ready, &[]).is_err() {
+                                return fail_driver(driver, control, 90);
                             }
                             let _ = detached;
                             selector_retiring = true;
+                            selector_retirement_binding = Some(binding);
                             continue;
                         }
-                        return fail_driver(driver, control, 90);
+                        return fail_driver(driver, control, 91);
                     }
                     #[cfg(feature = "dw1e3-selector31")]
                     Ok(ControlOutcome::FinalizeRetire(binding)) => {
-                        let Some(evidence) = evidence.as_ref() else {
-                            return fail_driver(driver, control, 91);
-                        };
-                        if !selector_retiring
-                            || !same_binding(driver, evidence_nonce, evidence, binding)
-                        {
+                        if !selector_retiring || selector_retirement_binding != Some(binding) {
                             return fail_driver(driver, control, 92);
                         }
                         return graceful_shutdown(driver, control, 0);
@@ -493,8 +503,17 @@ fn run_event_loop<I: ByteRegisterIo>(
                 && work.transmitted != 0
                 && driver.tx_free() == wyrmroot_uart16550_core::RING_CAPACITY
             {
-                let Some(evidence) = evidence.as_mut() else {
+                // The TX ring being empty does not prove that the stream
+                // receive queue has no later WRST DATA.  Re-enter receive at
+                // the exact post-ack boundary: only WOULD_BLOCK/clean close
+                // proves no extra record can be hidden behind the response.
+                if selector_response_input_drained(driver, control, pio_failed, &mut evidence)
+                    .is_err()
+                {
                     return fail_driver(driver, control, 82);
+                }
+                let Some(evidence) = evidence.as_mut() else {
+                    return fail_driver(driver, control, 83);
                 };
                 if let Err(code) = prove_transport_empty(driver, control, pio_failed, evidence) {
                     return fail_driver(driver, control, code);
@@ -562,6 +581,22 @@ fn run_event_loop<I: ByteRegisterIo>(
             continue;
         }
         return fail_driver(driver, control, 44);
+    }
+}
+
+#[cfg(feature = "dw1e3-selector31")]
+fn selector_response_input_drained<I: ByteRegisterIo>(
+    driver: &mut ProductionDriver<I>,
+    control: DwHandle,
+    pio_failed: &Cell<bool>,
+    evidence: &mut Option<EvidenceDrain>,
+) -> Result<(), ()> {
+    match service_stream_read(driver, control, pio_failed, evidence) {
+        // A fresh receive-side empty/closed observation is the only positive
+        // proof. Any record after the exact response (including malformed or
+        // handle-bearing input) fails before the TEMT fact is emitted.
+        Ok(StreamReadOutcome::WouldBlock) => Ok(()),
+        Ok(StreamReadOutcome::Accepted | StreamReadOutcome::Detached) | Err(()) => Err(()),
     }
 }
 
@@ -654,8 +689,13 @@ impl EvidenceDrain {
 
     fn record_response(&mut self, bytes: &[u8]) -> Result<(), ()> {
         let expected = response(&self.expected);
-        if bytes.is_empty()
-            || self.response_bytes == expected.len()
+        // A legal zero-length WRST DATA record does not alter the exact
+        // response accumulator.  Nonempty data after completion remains an
+        // error, including at the post-ack queue-empty proof.
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if self.response_bytes == expected.len()
             || self.response_bytes.checked_add(bytes.len()).ok_or(())? > expected.len()
         {
             return Err(());

@@ -376,7 +376,12 @@ fn receive_exact_stream(stream: DwHandle, output: &mut [u8]) -> Result<(), u32> 
         let payload = decode_data(&wire[..counts.bytes])
             .map_err(|_| 48u32)?
             .payload();
-        if payload.is_empty() || payload.len() > output.len() - used {
+        // WRST permits zero-length DATA as a no-op.  It must neither advance
+        // nor invalidate the exact fixed challenge accumulation.
+        if payload.is_empty() {
+            continue;
+        }
+        if payload.len() > output.len() - used {
             return Err(49);
         }
         output[used..used + payload.len()].copy_from_slice(payload);

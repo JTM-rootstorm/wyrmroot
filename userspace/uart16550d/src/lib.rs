@@ -659,11 +659,15 @@ impl<I: ByteRegisterIo> ProductionDriver<I> {
     /// Selector-private stage-1 retirement: IER is zero and only the raw
     /// stream endpoint is detached. The caller deliberately retains the
     /// Interrupt/resource/control handles for controller-authorized stage 2.
-    pub fn begin_selector_retire(
-        &mut self,
-    ) -> Option<(ControlMessageV1_1, ReceivedStreamEndpoint)> {
+    pub fn begin_selector_retire(&mut self) {
         self.uart.disable_interrupts();
-        self.detach_stream()
+    }
+
+    /// Exact stage-1 IER readback. The caller must fail closed rather than
+    /// advertise retirement readiness if the hardware still exposes any
+    /// enabled source.
+    pub fn selector_interrupts_disabled(&mut self) -> bool {
+        self.uart.interrupts_disabled()
     }
 
     /// Accepts one complete handle-free WRST record only while the maximum

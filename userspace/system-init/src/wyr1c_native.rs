@@ -236,6 +236,10 @@ enum ResidentPollEvent {
     DriverExited,
     #[cfg(feature = "dw1e3-selector31")]
     ProbeControlReadable,
+    #[cfg(feature = "dw1e3-selector31")]
+    ProbeControlLost,
+    #[cfg(feature = "dw1e3-selector31")]
+    ProbeExited,
 }
 
 fn classify_resident_poll(
@@ -247,7 +251,7 @@ fn classify_resident_poll(
     let item_count = 2 + usize::from(registry_present) * 2 + usize::from(driver_present) + {
         #[cfg(feature = "dw1e3-selector31")]
         {
-            usize::from(probe_present)
+            usize::from(probe_present) * 2
         }
         #[cfg(not(feature = "dw1e3-selector31"))]
         {
@@ -282,9 +286,25 @@ fn classify_resident_poll(
         index
             if probe_present
                 && index == 2 + u32::from(registry_present) * 2 + u32::from(driver_present)
+                && result.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 =>
+        {
+            Ok(ResidentPollEvent::ProbeControlLost)
+        }
+        #[cfg(feature = "dw1e3-selector31")]
+        index
+            if probe_present
+                && index == 2 + u32::from(registry_present) * 2 + u32::from(driver_present)
                 && result.observed.0 & DW_SIGNAL_READABLE.0 != 0 =>
         {
             Ok(ResidentPollEvent::ProbeControlReadable)
+        }
+        #[cfg(feature = "dw1e3-selector31")]
+        index
+            if probe_present
+                && index == 3 + u32::from(registry_present) * 2 + u32::from(driver_present)
+                && result.observed.0 & DW_SIGNAL_EXITED.0 != 0 =>
+        {
+            Ok(ResidentPollEvent::ProbeExited)
         }
         _ => Err(InitError::Supervision),
     }
@@ -2275,10 +2295,47 @@ fn receive_e3a_probe_message<S: InitPlatform>(
 }
 
 #[cfg(feature = "dw1e3-selector31")]
+fn validate_e3a_u1_finalize_exit<W>(
+    resident: &ResidentSystemInit,
+    waits: &mut W,
+) -> Result<(), InitError>
+where
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let state = resident
+        .wyr1c
+        .as_ref()
+        .ok_or(InitError::WrongActivationOrder)?;
+    let binding = state.e3a_binding.ok_or(InitError::WrongManifestProfile)?;
+    let driver = state.driver.ok_or(InitError::WrongManifestProfile)?;
+    if binding.challenge_generation != 1
+        || !state.e3a_response_committed
+        || !state.e3a_begin_retire_sent
+        || !state.e3a_stage1_ready
+        || !state.e3a_peer_closed
+        || !state.e3a_finalize_retire_sent
+        || state.e3a_terminal_claimed
+    {
+        return Err(InitError::WrongManifestProfile);
+    }
+    exact_transport_empty(
+        binding,
+        state
+            .e3a_transport_empty
+            .ok_or(InitError::WrongManifestProfile)?,
+    )?;
+    let exit = waits
+        .query_task_termination(driver.loaded.process)
+        .map_err(InitError::Native)?;
+    wyrmroot_runtime::validate_successful_exit(&exit).map_err(|_| InitError::WrongManifestProfile)
+}
+
+#[cfg(feature = "dw1e3-selector31")]
 fn reap_e3a_probe<S, W>(
     resident: &mut ResidentSystemInit,
     system: &mut S,
     waits: &mut W,
+    admit_u2: bool,
 ) -> Result<(), InitError>
 where
     S: InitPlatform,
@@ -2350,7 +2407,11 @@ where
         state.e3a_stage1_ready = false;
         state.e3a_peer_closed = false;
         state.e3a_finalize_retire_sent = false;
-        if retired_generation == 1 {
+        if !admit_u2 {
+            // Any unexpected probe loss poisons the selector lifecycle.  A
+            // later event must not recycle the retained identity into U2.
+            state.e3a_next_challenge_generation = 0;
+        } else if retired_generation == 1 {
             state.e3a_next_challenge_generation = 2;
         }
     }
@@ -2358,6 +2419,117 @@ where
         Err(InitError::Cleanup)
     } else {
         Ok(())
+    }
+}
+
+/// The fresh U2 probe exits normally after it has committed its response.  It
+/// is no longer the active reporter, but its successful exit must be reaped
+/// without clearing the U2 binding or a TEMT fact that is still in flight.
+#[cfg(feature = "dw1e3-selector31")]
+fn reap_e3a_u2_probe_after_response<S, W>(
+    resident: &mut ResidentSystemInit,
+    system: &mut S,
+    waits: &mut W,
+) -> Result<(), InitError>
+where
+    S: InitPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let probe = {
+        let state = resident
+            .wyr1c
+            .as_mut()
+            .ok_or(InitError::WrongActivationOrder)?;
+        let binding = state.e3a_binding.ok_or(InitError::WrongManifestProfile)?;
+        if binding.challenge_generation != 2
+            || !state.e3a_response_committed
+            || state.e3a_terminal_claimed
+        {
+            return Err(InitError::WrongManifestProfile);
+        }
+        state
+            .e3a_probe
+            .take()
+            .ok_or(InitError::WrongManifestProfile)?
+    };
+    let deadline = system
+        .now()
+        .map_err(InitError::Native)?
+        .checked_add(WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns)
+        .ok_or(InitError::Accounting)?;
+    let mut failed = system.close_handle(probe.loaded.launch_channel).is_err();
+    let exited = matches!(
+        waits.wait_many(
+            core::slice::from_ref(&DwWaitItemV1 {
+                handle: probe.loaded.process,
+                signals: DW_SIGNAL_EXITED,
+            }),
+            DwDeadline(deadline),
+        ),
+        Ok(result) if result.index == 0 && result.observed.0 & DW_SIGNAL_EXITED.0 != 0
+    ) && matches!(
+        waits.query_task_termination(probe.loaded.process),
+        Ok(exit) if wyrmroot_runtime::validate_successful_exit(&exit).is_ok()
+    );
+    if !exited {
+        failed |= system.terminate_task_group(probe.task_group).is_err();
+    }
+    for handle in [probe.loaded.process, probe.task_group] {
+        failed |= system.close_handle(handle).is_err();
+    }
+    if failed {
+        Err(InitError::Cleanup)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "dw1e3-selector31")]
+fn e3a_u2_probe_may_exit(resident: &ResidentSystemInit) -> bool {
+    resident.wyr1c.as_ref().is_some_and(|state| {
+        state
+            .e3a_binding
+            .is_some_and(|binding| binding.challenge_generation == 2)
+            && state.e3a_response_committed
+            && !state.e3a_terminal_claimed
+    })
+}
+
+/// A probe channel close or process exit is never a normal lifecycle edge.
+/// Take both owned lifetimes down before returning failure so neither a stale
+/// reporter nor a surviving driver can later advance the selector.
+#[cfg(feature = "dw1e3-selector31")]
+fn fail_e3a_probe_supervision<S, W>(
+    resident: &mut ResidentSystemInit,
+    system: &mut S,
+    waits: &mut W,
+    validate_exit: bool,
+) -> Result<(), InitError>
+where
+    S: InitPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let exit_error = if validate_exit {
+        let probe = resident
+            .wyr1c
+            .as_ref()
+            .and_then(|state| state.e3a_probe)
+            .ok_or(InitError::WrongActivationOrder)?;
+        match waits.query_task_termination(probe.loaded.process) {
+            Ok(exit) => wyrmroot_runtime::validate_successful_exit(&exit)
+                .map_err(|_| InitError::WrongManifestProfile)
+                .err(),
+            Err(error) => Some(InitError::Native(error)),
+        }
+    } else {
+        None
+    };
+    let probe_cleanup = reap_e3a_probe(resident, system, waits, false);
+    let driver_cleanup = reap_driver(resident, system, waits, true);
+    if probe_cleanup.is_err() || driver_cleanup.is_err() {
+        Err(InitError::Cleanup)
+    } else {
+        Err(exit_error.unwrap_or(InitError::WrongManifestProfile))
     }
 }
 
@@ -2442,7 +2614,7 @@ where
         resident.result = RecoveryResult::Degraded;
         return Ok(resident.controller.mode());
     };
-    let mut items = [DwWaitItemV1::default(); 6];
+    let mut items = [DwWaitItemV1::default(); 7];
     items[0] = DwWaitItemV1 {
         handle: devmgr.loaded.process,
         signals: DW_SIGNAL_EXITED,
@@ -2477,7 +2649,12 @@ where
     if let Some(probe) = state.e3a_probe {
         items[item_count] = DwWaitItemV1 {
             handle: probe.loaded.launch_channel,
-            signals: DW_SIGNAL_READABLE,
+            signals: DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+        };
+        item_count += 1;
+        items[item_count] = DwWaitItemV1 {
+            handle: probe.loaded.process,
+            signals: DW_SIGNAL_EXITED,
         };
         item_count += 1;
     }
@@ -2660,9 +2837,19 @@ where
                             recover_registry(resident, system, loader, waits, bootfs, false)
                         }
                         ResidentPollEvent::DriverExited => {
+                            #[cfg(feature = "dw1e3-selector31")]
+                            if let Err(error) = validate_e3a_u1_finalize_exit(resident, waits) {
+                                let driver_cleanup = reap_driver(resident, system, waits, false);
+                                let probe_cleanup = reap_e3a_probe(resident, system, waits, false);
+                                return Err(if driver_cleanup.is_err() || probe_cleanup.is_err() {
+                                    InitError::Cleanup
+                                } else {
+                                    error
+                                });
+                            }
                             let _request = reap_driver(resident, system, waits, false)?;
                             #[cfg(feature = "dw1e3-selector31")]
-                            reap_e3a_probe(resident, system, waits)?;
+                            reap_e3a_probe(resident, system, waits, true)?;
                             #[cfg(any(
                                 feature = "wyr1c6-production",
                                 feature = "dw1e3-selector31"
@@ -2748,6 +2935,22 @@ where
                                     send_e3a_finalize_retire(resident, system)
                                 }
                                 _ => Err(InitError::WrongManifestProfile),
+                            }
+                        }
+                        #[cfg(feature = "dw1e3-selector31")]
+                        ResidentPollEvent::ProbeControlLost => {
+                            if e3a_u2_probe_may_exit(resident) {
+                                reap_e3a_u2_probe_after_response(resident, system, waits)
+                            } else {
+                                fail_e3a_probe_supervision(resident, system, waits, false)
+                            }
+                        }
+                        #[cfg(feature = "dw1e3-selector31")]
+                        ResidentPollEvent::ProbeExited => {
+                            if e3a_u2_probe_may_exit(resident) {
+                                reap_e3a_u2_probe_after_response(resident, system, waits)
+                            } else {
+                                fail_e3a_probe_supervision(resident, system, waits, true)
                             }
                         }
                     },

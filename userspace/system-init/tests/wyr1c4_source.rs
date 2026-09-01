@@ -155,8 +155,83 @@ fn selector31_controller_rejoins_response_temt_then_retires_u1_before_fresh_u2()
     assert!(begin < temt && begin < response);
     assert!(temt < stage1 && stage1 < closed && closed < report);
     assert!(finalize < closed);
-    assert!(NATIVE_SOURCE.contains("reap_e3a_probe(resident, system, waits)?"));
+    assert!(NATIVE_SOURCE.contains("reap_e3a_probe(resident, system, waits, true)?"));
+    assert!(NATIVE_SOURCE.contains("if !admit_u2 {"));
+    assert!(NATIVE_SOURCE.contains("state.e3a_next_challenge_generation = 0;"));
+    assert!(NATIVE_SOURCE.contains("} else if retired_generation == 1 {"));
     assert!(NATIVE_SOURCE.contains("state.e3a_next_challenge_generation = 2;"));
+}
+
+#[test]
+fn selector31_u1_exit_requires_complete_finalize_state_and_zero_normal_exit() {
+    let validate = NATIVE_SOURCE
+        .find("fn validate_e3a_u1_finalize_exit")
+        .unwrap();
+    let body = &NATIVE_SOURCE[validate..];
+    for requirement in [
+        "!state.e3a_response_committed",
+        "!state.e3a_begin_retire_sent",
+        "!state.e3a_stage1_ready",
+        "!state.e3a_peer_closed",
+        "!state.e3a_finalize_retire_sent",
+        "validate_successful_exit(&exit)",
+    ] {
+        assert!(body.contains(requirement), "missing {requirement}");
+    }
+    let exit = NATIVE_SOURCE
+        .find("ResidentPollEvent::DriverExited =>")
+        .unwrap();
+    let gate = NATIVE_SOURCE[exit..]
+        .find("validate_e3a_u1_finalize_exit(resident, waits)")
+        .unwrap()
+        + exit;
+    let reap = NATIVE_SOURCE[exit..]
+        .find("let _request = reap_driver")
+        .unwrap()
+        + exit;
+    assert!(gate < reap);
+}
+
+#[test]
+fn selector31_supervises_probe_channel_and_process_failure_without_advancement() {
+    // The probe can die before C1 response, after stage1 but before its close
+    // proof, or during U2.  All three paths share the same exact cleanup
+    // fence: no lifecycle edge may turn such a death into a new admission.
+    for required in [
+        "ProbeControlLost",
+        "ProbeExited",
+        "DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0)",
+        "handle: probe.loaded.process",
+        "signals: DW_SIGNAL_EXITED",
+        "fn fail_e3a_probe_supervision",
+        "fn reap_e3a_u2_probe_after_response",
+        "fn e3a_u2_probe_may_exit",
+        "validate_successful_exit(&exit)",
+        "reap_e3a_probe(resident, system, waits, false)",
+        "reap_driver(resident, system, waits, true)",
+        "state.e3a_next_challenge_generation = 0;",
+    ] {
+        assert!(NATIVE_SOURCE.contains(required), "missing {required}");
+    }
+    let lost = NATIVE_SOURCE
+        .find("ResidentPollEvent::ProbeControlLost")
+        .unwrap();
+    let exited = NATIVE_SOURCE
+        .find("ResidentPollEvent::ProbeExited")
+        .unwrap();
+    let failed = NATIVE_SOURCE.find("fail_e3a_probe_supervision").unwrap();
+    let u2 = NATIVE_SOURCE
+        .find("start_e3a_probe(resident, system, loader, waits, bootfs)")
+        .unwrap();
+    assert!(lost < u2 && exited < u2 && failed < u2);
+    let u2_reap = NATIVE_SOURCE
+        .find("reap_e3a_u2_probe_after_response(resident, system, waits)")
+        .unwrap();
+    let u2_failure = NATIVE_SOURCE[u2_reap..]
+        .find("fail_e3a_probe_supervision(resident, system, waits")
+        .unwrap()
+        + u2_reap;
+    assert!(u2_reap < u2_failure);
 }
 
 #[test]

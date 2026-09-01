@@ -134,9 +134,25 @@ impl Selector31Lifecycle {
         final_fifo_fill: bool,
         interrupt_ack_succeeded: bool,
     ) -> Result<(), LifecycleError> {
+        self.begin_transport_empty_barrier_after_input(
+            final_fifo_fill,
+            interrupt_ack_succeeded,
+            true,
+        )
+    }
+
+    /// The final post-ack receive must prove that no later WRST DATA is still
+    /// queued before TEMT can authorize closing the stream.
+    pub fn begin_transport_empty_barrier_after_input(
+        &mut self,
+        final_fifo_fill: bool,
+        interrupt_ack_succeeded: bool,
+        response_input_drained: bool,
+    ) -> Result<(), LifecycleError> {
         if self.state != LifecycleState::Challenge1Responded
             || !final_fifo_fill
             || !interrupt_ack_succeeded
+            || !response_input_drained
         {
             return Err(LifecycleError::WrongOrder);
         }
@@ -184,6 +200,16 @@ impl Selector31Lifecycle {
     }
 
     pub fn u1_reaped(&mut self) -> Result<(), LifecycleError> {
+        self.u1_finalize_exit(true)
+    }
+
+    /// Models the controller's exact post-FinalizeRetire Process exit join.
+    /// A nonzero/crashed exit or a zero exit before the ordered peer-close
+    /// proof cannot clear U1 state or admit U2.
+    pub fn u1_finalize_exit(&mut self, successful_exit_record: bool) -> Result<(), LifecycleError> {
+        if !successful_exit_record {
+            return Err(LifecycleError::WrongOrder);
+        }
         advance(
             &mut self.state,
             LifecycleState::U1PeerClosed,
@@ -1317,6 +1343,10 @@ mod tests {
             lifecycle.begin_transport_empty_barrier(false, true),
             Err(LifecycleError::WrongOrder)
         );
+        assert_eq!(
+            lifecycle.begin_transport_empty_barrier_after_input(true, true, false),
+            Err(LifecycleError::WrongOrder)
+        );
         lifecycle.begin_transport_empty_barrier(true, true).unwrap();
         assert_eq!(lifecycle.timer_paced_temt_poll(false), Ok(()));
         assert_eq!(lifecycle.timer_paced_temt_poll(false), Ok(()));
@@ -1324,6 +1354,41 @@ mod tests {
             lifecycle.timer_paced_temt_poll(false),
             Err(LifecycleError::BarrierTimedOut)
         );
+    }
+
+    #[test]
+    fn u1_exit_requires_the_ordered_close_and_successful_terminal_record() {
+        let u1 = DriverIdentity {
+            attempt_generation: 1,
+            publication_generation: 2,
+            stream_generation: 3,
+            challenge_generation: 1,
+        };
+        let mut lifecycle = Selector31Lifecycle::new(
+            u1,
+            ProbeIdentity {
+                process_generation: 4,
+            },
+        )
+        .unwrap();
+        // A premature zero exit cannot skip the response/TEMT/close sequence.
+        assert_eq!(
+            lifecycle.u1_finalize_exit(true),
+            Err(LifecycleError::WrongOrder)
+        );
+        lifecycle.challenge1_responded().unwrap();
+        lifecycle
+            .begin_transport_empty_barrier_after_input(true, true, true)
+            .unwrap();
+        lifecycle.timer_paced_temt_poll(true).unwrap();
+        lifecycle.queued_data_before_peer_close().unwrap();
+        lifecycle.u1_peer_closed().unwrap();
+        // A nonzero/crashed exit after peer close still cannot admit U2.
+        assert_eq!(
+            lifecycle.u1_finalize_exit(false),
+            Err(LifecycleError::WrongOrder)
+        );
+        lifecycle.u1_finalize_exit(true).unwrap();
     }
 
     #[test]

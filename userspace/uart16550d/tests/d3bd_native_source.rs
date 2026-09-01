@@ -57,7 +57,7 @@ fn selector31_stage1_blocks_stale_finalize_and_post_ier_interrupt_drains() {
         .find("Ok(ControlOutcome::FinalizeRetire(binding))")
         .unwrap();
     let exact = DRIVER[finalize..]
-        .find("!same_binding(driver, evidence_nonce, evidence, binding)")
+        .find("selector_retirement_binding != Some(binding)")
         .unwrap()
         + finalize;
     assert!(begin < retired && retired < finalize && finalize < exact);
@@ -68,6 +68,13 @@ fn selector31_stage1_blocks_stale_finalize_and_post_ier_interrupt_drains() {
     let interrupt_gate = DRIVER[wait_gate..].find("if !selector_retiring").unwrap() + wait_gate;
     let interrupt_drain = DRIVER.find("if observed.index == 1").unwrap();
     assert!(wait_gate < interrupt_gate && interrupt_gate < interrupt_drain);
+
+    let ier_readback = DRIVER[begin..]
+        .find("!driver.selector_interrupts_disabled()")
+        .unwrap()
+        + begin;
+    let stage1_ready = DRIVER[begin..].find("encode_retire_stage1_ready").unwrap() + begin;
+    assert!(begin < ier_readback && ier_readback < stage1_ready);
 }
 
 #[test]
@@ -84,6 +91,32 @@ fn selector31_temt_wait_requires_the_timer_signal_and_checks_sticky_pio_after_ls
         .unwrap();
     let sticky = body[lsr..].find("if pio_failed.get() {").unwrap() + lsr;
     assert!(waited < signaled && signaled < lsr && lsr < sticky);
+}
+
+#[test]
+fn selector31_rechecks_stream_input_after_final_ack_before_temt() {
+    let input_proof = DRIVER.find("fn selector_response_input_drained").unwrap();
+    let post_ack = DRIVER
+        .find("selector_response_input_drained(driver, control, pio_failed, &mut evidence)")
+        .unwrap();
+    let temt = DRIVER[post_ack..]
+        .find("prove_transport_empty(driver, control, pio_failed, evidence)")
+        .unwrap()
+        + post_ack;
+    assert!(post_ack < temt);
+    let proof = &DRIVER[input_proof..];
+    assert!(proof.contains("Ok(StreamReadOutcome::WouldBlock) => Ok(())"));
+    assert!(proof.contains("StreamReadOutcome::Accepted | StreamReadOutcome::Detached"));
+}
+
+#[test]
+fn selector31_zero_length_stream_data_is_a_noop_but_not_post_response_data() {
+    assert!(DRIVER.contains("fn record_response"));
+    let record = DRIVER.find("fn record_response").unwrap();
+    let body = &DRIVER[record..];
+    assert!(body.contains("if bytes.is_empty()"));
+    assert!(body.contains("return Ok(());"));
+    assert!(body.contains("self.response_bytes == expected.len()"));
 }
 
 #[test]

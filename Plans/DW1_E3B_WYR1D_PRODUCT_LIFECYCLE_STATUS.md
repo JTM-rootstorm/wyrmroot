@@ -15,29 +15,46 @@ The Wyrmroot product model now requires the following causal order:
 
 1. U1 completes challenge 1, then makes its final FIFO fill and successfully
    acknowledges its exact Interrupt.
-2. Only after those two facts, a bounded timer-paced UART `LSR.TEMT` poll
+2. Before TEMT polling, the driver performs one fresh receive-side probe of
+   the raw stream. Only a clean `WOULD_BLOCK`/peer-close result proves that
+   no extra WRST DATA record is queued behind the exact response; any such
+   record fails the selector before stream retirement.
+3. Only after those facts, a bounded timer-paced UART `LSR.TEMT` poll
    waits for the first exact `TEMT=1` to establish the U1 transport-empty
    barrier. A `TEMT=0` result retains the barrier state; exhausting the fixed
    poll/deadline budget fails the selector rather than assuming transport is
    empty.
-3. The active stream's queued inbound DATA is observed before U1 peer close.
+4. The active stream's queued inbound DATA is observed before U1 peer close.
    Handle-bearing datagrams and nonempty post-challenge data fail closed; a
-   close is never permission to discard them.
-4. The controller first requests selector-private U1 stage-1 retirement:
-   disable IER and detach the stream while retaining the Interrupt/resource/
+   close is never permission to discard them. Zero-length WRST DATA remains a
+   legal no-op while either fixed challenge or response is being accumulated.
+5. The controller first requests selector-private U1 stage-1 retirement:
+   disable IER, read back exact IER=0, and detach the stream while retaining the Interrupt/resource/
    control/process. The retained probe then observes queued-data drain and
    peer close; only after controller report `0x0a` may stage-2 finalize close
    the remaining driver objects and permit exact reap. Neither one endpoint
    release nor reap proves the other endpoint.
-5. System-init takes U1 probe ownership after the ordered peer-close report:
+6. System-init accepts U1 Process exit only after every Q1 causal join,
+   controller FinalizeRetire, and an exact zero normal-exit record. A
+   premature or nonzero exit performs fail-closed cleanup and cannot advance
+   challenge generation.
+7. System-init takes U1 probe ownership after the ordered peer-close report:
    it closes the controller launch endpoint for graceful exit, boundedly
    reaps the exact task group/process, and uses hard termination only as the
    bounded fallback. A separately launched U2 probe is then bound as the
    fresh reporter.
-6. U2, P2, and its raw stream identity must each differ from U1/P1. Only then
+   A probe launch-channel `PEER_CLOSED` or Process `EXITED` signal at any
+   earlier point (C1 pre-response, pre-peer-close, or U2) is instead an exact
+   fail-closed supervision event: validate an observed exit when present,
+   clean up the probe and active driver with bounded fallback, and do not
+   advance the selector lifecycle.
+   The intentional U2 probe exit after `ResponseCommitted` is separately
+   reaped with an exact successful-exit check while retaining the U2
+   binding/TEMT join for the controller terminal claim.
+8. U2, P2, and its raw stream identity must each differ from U1/P1. Only then
    can the existing action 1 bind U2 and action 3 arm the fresh nonce-bound
    challenge 2.
-7. Challenge 2 has its own acknowledged final-FIFO/TEMT proof. Only after
+9. Challenge 2 has its own acknowledged final-FIFO/TEMT proof. Only after
    joining U2 response plus that fact does system-init make the controller-only
    existing action-4 terminal claim (`E=0xff,V=0,X=0`). The kernel then owns
    saved-U1 replay rejection, accounting, and terminal records.
@@ -63,6 +80,12 @@ before the controller-only terminal claim.
 Freestanding product build and live selector-record exercise still need the
 paired Deepwyrm E3B interface revision. No VM or physical-I/O claim is made
 by this status.
+
+All lane validation must set a fresh absolute
+`WYRMROOT_PINNED_TARGET_DIR` below this lane's `.tmp/` directory (for example,
+`$PWD/.tmp/dw1e3b-native-check`); the canonical pinned target is not an
+admitted shared output. This applies to formatting as well as test, clippy,
+and freestanding preparation commands.
 
 ## Required-source disposition
 

@@ -297,6 +297,13 @@ impl<I: ByteRegisterIo> Uart16550<I> {
         self.state = CoreState::Quiesced;
     }
 
+    /// Reads back the hardware interrupt-enable register after an explicit
+    /// quiesce transition. Selector-31 uses this before acknowledging its
+    /// stage-1 retirement barrier; a write alone is not a proof.
+    pub fn interrupts_disabled(&mut self) -> bool {
+        self.io.read(IER_DLM) == 0
+    }
+
     /// Enqueues as many bytes as fit.  Unlike RX, callers retain the suffix
     /// when this fixed ring fills; no transmit byte is silently dropped.
     pub fn enqueue_tx(&mut self, bytes: &[u8]) -> usize {
@@ -506,6 +513,16 @@ mod tests {
         let uart = active();
         assert_eq!(uart.state(), CoreState::Active);
         assert_eq!(uart.into_io().writes.last(), Some(&(IER_DLM, IER_RDI_RLSI)));
+    }
+
+    #[test]
+    fn selector_retirement_requires_ier_zero_readback() {
+        let mut uart = active();
+        uart.disable_interrupts();
+        uart.test_io_mut().push_reads(IER_DLM, [0]);
+        assert!(uart.interrupts_disabled());
+        uart.test_io_mut().push_reads(IER_DLM, [IER_RDI_RLSI]);
+        assert!(!uart.interrupts_disabled());
     }
 
     #[test]
