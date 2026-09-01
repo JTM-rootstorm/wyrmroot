@@ -279,7 +279,7 @@ pub(crate) fn prepare(
         // The two leg identities are build-owned for this E3B snapshot: guest
         // products receive them only while their Cargo processes run so
         // system-init can arm the frozen payload hashes. Deepwyrm receives
-        // only the selector evidence nonce.
+        // only the selector evidence nonce plus its exact E3B-full selector.
         let produced = dw1e3a::build_e3b_produced_artifacts(
             &staging,
             &repository,

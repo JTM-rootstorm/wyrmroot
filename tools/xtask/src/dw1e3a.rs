@@ -39,6 +39,7 @@ pub(crate) const TIMEOUT_SECONDS: &str = "120";
 const SOURCE_RECEIPT: &str = "e3a-source-build.toml";
 pub(crate) const E3B_CHALLENGE_1_NONCE_ENV: &str = "WYRMROOT_DW1E3_CHALLENGE_1_NONCE";
 pub(crate) const E3B_CHALLENGE_2_NONCE_ENV: &str = "WYRMROOT_DW1E3_CHALLENGE_2_NONCE";
+pub(crate) const E3B_FULL_KERNEL_ENV: &str = "DEEPWYRM_DW1E_E3B_FULL";
 const NATIVE_TARGET: &str = "x86_64-unknown-wyrmroot";
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
 const MACHINE: &str = "pc-q35-10.2";
@@ -132,6 +133,12 @@ pub(crate) struct ProducedArtifacts {
     pub(crate) rust_revision: String,
 }
 
+#[derive(Clone, Copy)]
+enum KernelMode {
+    E3A,
+    E3BFull,
+}
+
 /// Builds and freezes the complete selector-31 E3A handoff without starting
 /// a VM. The output is a fresh, project-local directory containing immutable
 /// shared inputs and two non-aliasing profile-local mutable-vars templates.
@@ -219,6 +226,7 @@ pub(crate) fn build_produced_artifacts(
         abi_revision,
         abi_tree,
         nonce,
+        KernelMode::E3A,
         || build_product_snapshot(nonce),
     )
 }
@@ -247,6 +255,7 @@ pub(crate) fn build_e3b_produced_artifacts(
         abi_revision,
         abi_tree,
         evidence_nonce,
+        KernelMode::E3BFull,
         || build_e3b_product_snapshot(evidence_nonce, challenge_1_nonce, challenge_2_nonce),
     )
 }
@@ -261,8 +270,13 @@ fn build_produced_artifacts_with_snapshot(
     abi_revision: &str,
     abi_tree: &str,
     nonce: &str,
+    kernel_mode: KernelMode,
     build_snapshot: impl FnOnce() -> Result<crate::wyr1c::E3ASnapshot, Failure>,
 ) -> Result<ProducedArtifacts, Failure> {
+    // No Wyrmroot-side build accepts the Deepwyrm-only E3B selector (or the
+    // payload bindings) from its caller. E3B scopes its bindings later, only
+    // around the native product snapshot.
+    reject_e3b_payload_environment()?;
     let manifest = crate::metadata::BuildManifest::load(repository)?;
     let profile = manifest.validate_loader_build_readiness(repository)?;
     let layout = crate::deep_layout::prepare(
@@ -301,7 +315,7 @@ fn build_produced_artifacts_with_snapshot(
             build_bootstrap(repository, &toolchain, &layout, &cargo_home, anchor)
         })?;
     let snapshot = build_snapshot()?;
-    let kernel = build_kernel(deep_repository, nonce)?;
+    let kernel = build_kernel(deep_repository, nonce, kernel_mode)?;
     let boot_device_table = wyr1c6::boot_device_table();
     let ovmf_code = wyr1c6::pinned_firmware(
         wyr1c6::OVMF_CODE_PATH,
@@ -728,7 +742,7 @@ fn build_bootstrap(
     Ok(bytes)
 }
 
-fn build_kernel(repository: &Path, nonce: &str) -> Result<Vec<u8>, Failure> {
+fn build_kernel(repository: &Path, nonce: &str, mode: KernelMode) -> Result<Vec<u8>, Failure> {
     let repository = Directory::open_exact(repository, "Deepwyrm source root")?;
     let temporary = match repository.open_child(".tmp", "Deepwyrm temporary root") {
         Ok(directory) => directory,
@@ -763,7 +777,7 @@ fn build_kernel(repository: &Path, nonce: &str) -> Result<Vec<u8>, Failure> {
             ])
             .current_dir(repository.path())
             .stdin(Stdio::null());
-        configure_kernel_environment(&mut command, scratch.path(), nonce);
+        configure_kernel_environment(&mut command, scratch.path(), nonce, mode);
         let status = command
             .status()
             .map_err(|error| Failure::task(format!("could not build DW1-E3A kernel: {error}")))?;
@@ -781,17 +795,26 @@ fn build_kernel(repository: &Path, nonce: &str) -> Result<Vec<u8>, Failure> {
     scratch.finish(result)
 }
 
-fn configure_kernel_environment(command: &mut Command, scratch: &Path, nonce: &str) {
+fn configure_kernel_environment(
+    command: &mut Command,
+    scratch: &Path,
+    nonce: &str,
+    mode: KernelMode,
+) {
     command
         .env("DEEPWYRM_PINNED_TARGET_DIR", scratch)
         .env("DEEPWYRM_GUEST_TEST_SELECTOR", SELECTOR)
         .env("DEEPWYRM_DW1E_EVIDENCE_NONCE", nonce)
+        .env_remove(E3B_FULL_KERNEL_ENV)
         .env_remove(E3B_CHALLENGE_1_NONCE_ENV)
         .env_remove(E3B_CHALLENGE_2_NONCE_ENV)
         .env_remove("CARGO_HOME")
         .env_remove("LD_AUDIT")
         .env_remove("LD_LIBRARY_PATH")
         .env_remove("LD_PRELOAD");
+    if matches!(mode, KernelMode::E3BFull) {
+        command.env(E3B_FULL_KERNEL_ENV, "1");
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1287,6 +1310,7 @@ pub(crate) fn reject_selector_environment() -> Result<(), Failure> {
         "DEEPWYRM_GUEST_TEST_SELECTOR",
         "DEEPWYRM_GUEST_TEST_ID",
         "DEEPWYRM_DW1E_EVIDENCE_NONCE",
+        E3B_FULL_KERNEL_ENV,
         E3B_CHALLENGE_1_NONCE_ENV,
         E3B_CHALLENGE_2_NONCE_ENV,
         "CARGO_TARGET_DIR",
@@ -1301,7 +1325,11 @@ pub(crate) fn reject_selector_environment() -> Result<(), Failure> {
 }
 
 fn reject_e3b_payload_environment() -> Result<(), Failure> {
-    for key in [E3B_CHALLENGE_1_NONCE_ENV, E3B_CHALLENGE_2_NONCE_ENV] {
+    for key in [
+        E3B_CHALLENGE_1_NONCE_ENV,
+        E3B_CHALLENGE_2_NONCE_ENV,
+        E3B_FULL_KERNEL_ENV,
+    ] {
         if env::var_os(key).is_some() {
             return Err(Failure::task(format!(
                 "DW1-E3A product build refuses ambient {key}"
@@ -1666,6 +1694,23 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    fn with_ambient_e3b_kernel_mode<T>(test: impl FnOnce() -> T) -> T {
+        // SAFETY: callers hold `E3B_PAYLOAD_ENVIRONMENT_TEST_LOCK` for this
+        // scoped test-only process-environment mutation.
+        unsafe { env::set_var(E3B_FULL_KERNEL_ENV, "unexpected") };
+        let _environment = ScopedTestE3BKernelMode;
+        test()
+    }
+
+    struct ScopedTestE3BKernelMode;
+
+    impl Drop for ScopedTestE3BKernelMode {
+        fn drop(&mut self) {
+            // SAFETY: this guard clears only the test value installed above.
+            unsafe { env::remove_var(E3B_FULL_KERNEL_ENV) };
+        }
+    }
+
     fn values(keys: &[&str]) -> BTreeMap<String, String> {
         keys.iter()
             .map(|key| ((*key).to_owned(), "x".to_owned()))
@@ -1782,6 +1827,10 @@ mod tests {
             Ok(())
         })
         .unwrap();
+        with_ambient_e3b_kernel_mode(|| {
+            assert!(reject_selector_environment().is_err());
+            assert!(build_product_snapshot("E300000000000001").is_err());
+        });
     }
 
     #[test]
@@ -1796,19 +1845,22 @@ mod tests {
         let environment = String::from_utf8(output.stdout).unwrap();
         assert!(environment.contains("WYRMROOT_DW1E3_CHALLENGE_1_NONCE=E300000000000002\n"));
         assert!(environment.contains("WYRMROOT_DW1E3_CHALLENGE_2_NONCE=E300000000000003\n"));
+        assert!(!environment.contains(E3B_FULL_KERNEL_ENV));
         assert!(env::var_os(E3B_CHALLENGE_1_NONCE_ENV).is_none());
         assert!(env::var_os(E3B_CHALLENGE_2_NONCE_ENV).is_none());
     }
 
     #[test]
-    fn kernel_environment_clears_e3b_payload_nonces() {
+    fn kernel_environment_selects_only_the_e3b_full_build() {
         let _lock = payload_environment_test_lock();
         let output = with_e3b_payload_environment("E300000000000002", "E300000000000003", || {
             let mut command = Command::new("/usr/bin/env");
+            command.env(E3B_FULL_KERNEL_ENV, "ambient");
             configure_kernel_environment(
                 &mut command,
                 Path::new("/tmp/dw1e3a-kernel-test"),
                 "E300000000000001",
+                KernelMode::E3A,
             );
             command.output().map_err(|error| {
                 Failure::task(format!("could not inspect kernel environment: {error}"))
@@ -1817,6 +1869,21 @@ mod tests {
         .unwrap();
         let environment = String::from_utf8(output.stdout).unwrap();
         assert!(environment.contains("DEEPWYRM_DW1E_EVIDENCE_NONCE=E300000000000001\n"));
+        assert!(!environment.contains(E3B_FULL_KERNEL_ENV));
+        assert!(!environment.contains(E3B_CHALLENGE_1_NONCE_ENV));
+        assert!(!environment.contains(E3B_CHALLENGE_2_NONCE_ENV));
+
+        let mut command = Command::new("/usr/bin/env");
+        command.env(E3B_FULL_KERNEL_ENV, "ambient");
+        configure_kernel_environment(
+            &mut command,
+            Path::new("/tmp/dw1e3b-kernel-test"),
+            "E300000000000001",
+            KernelMode::E3BFull,
+        );
+        let output = command.output().unwrap();
+        let environment = String::from_utf8(output.stdout).unwrap();
+        assert!(environment.contains("DEEPWYRM_DW1E_E3B_FULL=1\n"));
         assert!(!environment.contains(E3B_CHALLENGE_1_NONCE_ENV));
         assert!(!environment.contains(E3B_CHALLENGE_2_NONCE_ENV));
     }
