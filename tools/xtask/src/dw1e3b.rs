@@ -183,6 +183,7 @@ const RESULT_KEYS: &[&str] = &[
     "challenge_2_sha256",
     "response_2_sha256",
     "challenge_2_transcript_sha256",
+    "com2_raw_sha256",
     "u1_route_generation",
     "u1_object_generation",
     "u1_binding_generation",
@@ -198,6 +199,25 @@ const RESULT_KEYS: &[&str] = &[
     "u2_stream_generation",
     "u2_challenge_generation",
     "acceptance",
+];
+
+// The runner owns every result value. These names fix the byte inputs it must
+// hash: each leg transcript is SHA256(challenge_i_bytes || response_i_bytes),
+// while COM2 raw is SHA256(the exact frozen OVMF prelude || response_1_bytes
+// || response_2_bytes). No framing, logging, or terminal bytes participate.
+const RESULT_DIGEST_CONTRACTS: &[(&str, &str)] = &[
+    (
+        "challenge_1_transcript_sha256",
+        "SHA256(challenge_1_bytes || response_1_bytes)",
+    ),
+    (
+        "challenge_2_transcript_sha256",
+        "SHA256(challenge_2_bytes || response_2_bytes)",
+    ),
+    (
+        "com2_raw_sha256",
+        "SHA256(exact_frozen_ovmf_prelude || response_1_bytes || response_2_bytes)",
+    ),
 ];
 
 pub(crate) fn prepare(
@@ -221,9 +241,7 @@ pub(crate) fn prepare(
             wyr1c6::validate_upper_hex_nonzero(value, 16, name)?;
         }
     }
-    if challenge_1_nonce == challenge_2_nonce {
-        return Err(Failure::task("DW1-E3B challenge nonces must be distinct"));
-    }
+    validate_pairwise_nonces(evidence_nonce, challenge_1_nonce, challenge_2_nonce)?;
     if output.exists() {
         return Err(Failure::task("DW1-E3B output must be a fresh path"));
     }
@@ -804,9 +822,11 @@ fn render_request(values: &BTreeMap<String, String>) -> Result<String, Failure> 
         require(values, &format!("challenge_{leg}_length"), "24")?;
         require(values, &format!("response_{leg}_length"), "24")?;
     }
-    if value(values, "challenge_1_nonce")? == value(values, "challenge_2_nonce")? {
-        return Err(Failure::task("DW1-E3B request repeats challenge nonce"));
-    }
+    validate_pairwise_nonces(
+        value(values, "evidence_nonce")?,
+        value(values, "challenge_1_nonce")?,
+        value(values, "challenge_2_nonce")?,
+    )?;
     render_dynamic(
         values,
         &request_keys(),
@@ -820,6 +840,22 @@ fn render_request(values: &BTreeMap<String, String>) -> Result<String, Failure> 
         ],
         "DW1-E3B request",
     )
+}
+
+fn validate_pairwise_nonces(
+    evidence_nonce: &str,
+    challenge_1_nonce: &str,
+    challenge_2_nonce: &str,
+) -> Result<(), Failure> {
+    if evidence_nonce == challenge_1_nonce
+        || evidence_nonce == challenge_2_nonce
+        || challenge_1_nonce == challenge_2_nonce
+    {
+        return Err(Failure::task(
+            "DW1-E3B evidence and challenge nonces must be pairwise distinct",
+        ));
+    }
+    Ok(())
 }
 
 fn render_handoff(values: &BTreeMap<String, String>) -> Result<String, Failure> {
@@ -875,6 +911,13 @@ fn render_handoff(values: &BTreeMap<String, String>) -> Result<String, Failure> 
 }
 
 fn render_result_schema() -> Result<String, Failure> {
+    for (key, _) in RESULT_DIGEST_CONTRACTS {
+        if !RESULT_KEYS.contains(key) {
+            return Err(Failure::task(format!(
+                "DW1-E3B result schema omitted required digest {key}"
+            )));
+        }
+    }
     let mut values = BTreeMap::new();
     for key in RESULT_KEYS {
         values.insert(
@@ -1296,7 +1339,7 @@ mod tests {
         assert_eq!(parsed.u2, u2);
     }
     #[test]
-    fn schema_rejects_same_payload_nonce() {
+    fn schema_requires_pairwise_distinct_evidence_and_payload_nonces() {
         let mut values = BTreeMap::new();
         for key in request_keys() {
             values.insert(key.to_owned(), "x".to_owned());
@@ -1316,13 +1359,67 @@ mod tests {
             ("response_1_length", "24"),
             ("challenge_2_length", "24"),
             ("response_2_length", "24"),
-            ("challenge_1_nonce", "E300000000000001"),
-            ("challenge_2_nonce", "E300000000000001"),
+            ("evidence_nonce", "E300000000000001"),
+            ("challenge_1_nonce", "E300000000000002"),
+            ("challenge_2_nonce", "E300000000000003"),
         ] {
             values.insert(k.into(), v.into());
         }
+        assert!(render_request(&values).is_ok());
+        values.insert("challenge_2_nonce".into(), "E300000000000002".into());
+        assert!(render_request(&values).is_err());
+        values.insert("challenge_2_nonce".into(), "E300000000000003".into());
+        values.insert("challenge_1_nonce".into(), "E300000000000001".into());
+        assert!(render_request(&values).is_err());
+        values.insert("challenge_1_nonce".into(), "E300000000000002".into());
+        values.insert("challenge_2_nonce".into(), "E300000000000001".into());
         assert!(render_request(&values).is_err());
     }
+
+    #[test]
+    fn result_schema_is_exact_flat_and_freezes_runner_digest_meanings() {
+        assert_eq!(RESULT_KEYS.len(), 37);
+        assert_eq!(
+            RESULT_DIGEST_CONTRACTS,
+            [
+                (
+                    "challenge_1_transcript_sha256",
+                    "SHA256(challenge_1_bytes || response_1_bytes)",
+                ),
+                (
+                    "challenge_2_transcript_sha256",
+                    "SHA256(challenge_2_bytes || response_2_bytes)",
+                ),
+                (
+                    "com2_raw_sha256",
+                    "SHA256(exact_frozen_ovmf_prelude || response_1_bytes || response_2_bytes)",
+                ),
+            ]
+        );
+        let schema = render_result_schema().unwrap();
+        let keys = schema
+            .lines()
+            .map(|line| {
+                let (key, value) = line.split_once(" = ").unwrap();
+                assert!(value.starts_with('"') && value.ends_with('"'));
+                key
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(keys, RESULT_KEYS);
+        assert!(schema.contains("com2_raw_sha256 = \"<runner:com2_raw_sha256>\"\n"));
+
+        let mut values = RESULT_KEYS
+            .iter()
+            .map(|key| ((*key).to_owned(), "runner-value".to_owned()))
+            .collect::<BTreeMap<_, _>>();
+        assert!(render(&values, RESULT_KEYS, &[], "DW1-E3B result schema").is_ok());
+        values.remove("com2_raw_sha256");
+        assert!(render(&values, RESULT_KEYS, &[], "DW1-E3B result schema").is_err());
+        values.insert("com2_raw_sha256".to_owned(), "runner-value".to_owned());
+        values.insert("unexpected".to_owned(), "runner-value".to_owned());
+        assert!(render(&values, RESULT_KEYS, &[], "DW1-E3B result schema").is_err());
+    }
+
     #[test]
     fn freezer_seals_two_nonce_distinct_legs_and_runner_schema() {
         let unique = SystemTime::now()
@@ -1403,6 +1500,7 @@ mod tests {
         assert!(swapped_request.contains("challenge_2_nonce = \"E300000000000002\""));
         let schema = fs::read_to_string(output.join("result-schema.toml")).unwrap();
         assert!(schema.contains("evidence_records = \"26\""));
+        assert!(schema.contains("com2_raw_sha256 = \"<runner:com2_raw_sha256>\""));
         assert!(schema.contains("acceptance = \"pass\""));
         for profile in ["default", "smp"] {
             let handoff = fs::read_to_string(output.join(profile).join("handoff.toml")).unwrap();

@@ -1654,8 +1654,17 @@ const fn fnv1a32(bytes: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Mutex, MutexGuard};
 
     use super::*;
+
+    static E3B_PAYLOAD_ENVIRONMENT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn payload_environment_test_lock() -> MutexGuard<'static, ()> {
+        E3B_PAYLOAD_ENVIRONMENT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn values(keys: &[&str]) -> BTreeMap<String, String> {
         keys.iter()
@@ -1767,6 +1776,7 @@ mod tests {
 
     #[test]
     fn e3a_product_path_rejects_e3b_payload_environment() {
+        let _lock = payload_environment_test_lock();
         with_e3b_payload_environment("E300000000000002", "E300000000000003", || {
             assert!(build_product_snapshot("E300000000000001").is_err());
             Ok(())
@@ -1776,6 +1786,7 @@ mod tests {
 
     #[test]
     fn e3b_product_environment_binds_two_distinct_payload_nonces() {
+        let _lock = payload_environment_test_lock();
         let output = with_e3b_payload_environment("E300000000000002", "E300000000000003", || {
             Command::new("/usr/bin/env").output().map_err(|error| {
                 Failure::task(format!("could not inspect test environment: {error}"))
@@ -1791,6 +1802,7 @@ mod tests {
 
     #[test]
     fn kernel_environment_clears_e3b_payload_nonces() {
+        let _lock = payload_environment_test_lock();
         let output = with_e3b_payload_environment("E300000000000002", "E300000000000003", || {
             let mut command = Command::new("/usr/bin/env");
             configure_kernel_environment(
