@@ -46,6 +46,7 @@ const LSR_OE: u8 = 0x02;
 const LSR_PE: u8 = 0x04;
 const LSR_FE: u8 = 0x08;
 const LSR_BI: u8 = 0x10;
+const LSR_THRE: u8 = 0x20;
 
 /// Injectable, byte-oriented UART register access.
 pub trait ByteRegisterIo {
@@ -293,7 +294,17 @@ impl<I: ByteRegisterIo> Uart16550<I> {
             count += 1;
         }
         if count != 0 && was_empty && self.state == CoreState::Active {
-            self.io.write(IER_DLM, IER_RDI_RLSI | IER_THRI);
+            let lsr = self.io.read(LSR);
+            self.account_line_status(lsr);
+            if lsr & LSR_THRE != 0 {
+                let mut work = InterruptWork::default();
+                self.fill_transmit(&mut work);
+                if !self.tx.is_empty() {
+                    self.io.write(IER_DLM, IER_RDI_RLSI | IER_THRI);
+                }
+            } else {
+                self.io.write(IER_DLM, IER_RDI_RLSI | IER_THRI);
+            }
         }
         count
     }
@@ -594,6 +605,51 @@ mod tests {
         assert_eq!(uart.handle_interrupt().unwrap().transmitted, 3);
         let fake = uart.into_io();
         assert_eq!(fake.writes.last(), Some(&(IER_DLM, IER_RDI_RLSI)));
+    }
+
+    #[test]
+    fn empty_to_nonempty_primes_one_ready_fifo_then_arms_thri() {
+        let mut uart = active();
+        let writes_before_queue = uart.test_io_mut().writes.len();
+        uart.test_io_mut().push_reads(LSR, [LSR_THRE]);
+        let bytes = [0x5a; TX_FIFO_CAPACITY + 1];
+        assert_eq!(uart.enqueue_tx(&bytes), bytes.len());
+        assert_eq!(uart.tx_len(), 1);
+        let writes = &uart.test_io_mut().writes[writes_before_queue..];
+        assert_eq!(
+            writes
+                .iter()
+                .filter(|(offset, _)| *offset == RBR_THR_DLL)
+                .count(),
+            TX_FIFO_CAPACITY
+        );
+        assert_eq!(writes.last(), Some(&(IER_DLM, IER_RDI_RLSI | IER_THRI)));
+
+        uart.test_io_mut()
+            .push_reads(IIR_FCR, [IIR_THRI, IIR_NO_INTERRUPT]);
+        assert_eq!(uart.handle_interrupt().unwrap().transmitted, 1);
+        assert_eq!(uart.tx_len(), 0);
+        assert_eq!(
+            uart.test_io_mut().writes.last(),
+            Some(&(IER_DLM, IER_RDI_RLSI))
+        );
+    }
+
+    #[test]
+    fn empty_to_nonempty_ready_short_write_needs_no_thri_epoch() {
+        let mut uart = active();
+        let writes_before_queue = uart.test_io_mut().writes.len();
+        uart.test_io_mut().push_reads(LSR, [LSR_THRE]);
+        assert_eq!(uart.enqueue_tx(&[0x41, 0x42]), 2);
+        assert_eq!(uart.tx_len(), 0);
+        assert_eq!(
+            &uart.test_io_mut().writes[writes_before_queue..],
+            [
+                (RBR_THR_DLL, 0x41),
+                (RBR_THR_DLL, 0x42),
+                (IER_DLM, IER_RDI_RLSI),
+            ]
+        );
     }
 
     #[test]
