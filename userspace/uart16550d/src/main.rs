@@ -412,11 +412,20 @@ fn run_event_loop<I: ByteRegisterIo>(
                     Err(()) => return fail_driver(driver, control, 42),
                 }
             }
-            if driver.stream_endpoint().is_some()
-                && observed.observed.0 & DW_SIGNAL_WRITABLE.0 != 0
-                && service_stream_write(driver, control).is_err()
+            if driver.stream_endpoint().is_some() && observed.observed.0 & DW_SIGNAL_WRITABLE.0 != 0
             {
-                return fail_driver(driver, control, 43);
+                match service_stream_write(driver, control) {
+                    Ok(StreamWriteOutcome::Continue) => {}
+                    Ok(StreamWriteOutcome::PeerClosed) => {
+                        peer_close_drain.observe();
+                        continue;
+                    }
+                    Ok(StreamWriteOutcome::Detached) => {
+                        peer_close_drain.clear();
+                        continue;
+                    }
+                    Err(()) => return fail_driver(driver, control, 43),
+                }
             }
             continue;
         }
@@ -592,25 +601,34 @@ enum StreamReadOutcome {
     Detached,
 }
 
+enum StreamWriteOutcome {
+    Continue,
+    PeerClosed,
+    Detached,
+}
+
 fn service_stream_write<I: ByteRegisterIo>(
     driver: &mut ProductionDriver<I>,
     control: DwHandle,
-) -> Result<(), ()> {
+) -> Result<StreamWriteOutcome, ()> {
     let Some(endpoint) = driver.stream_endpoint() else {
-        return Ok(());
+        return Ok(StreamWriteOutcome::Detached);
     };
     let mut bytes = [0; MAX_RECORD_BYTES];
     let Some(size) = driver.prepare_stream_send(&mut bytes).map_err(|_| ())? else {
-        return Ok(());
+        return Ok(StreamWriteOutcome::Continue);
     };
     match send_channel(endpoint.handle, &bytes[..size], &[]) {
         Ok(()) => {
             driver.commit_stream_send();
-            Ok(())
+            Ok(StreamWriteOutcome::Continue)
         }
-        Err(error) if status_is(error, DW_STATUS_WOULD_BLOCK) => Ok(()),
-        Err(error) if status_is(error, DW_STATUS_PEER_CLOSED) => isolate_stream(driver, control),
-        Err(_) => isolate_stream(driver, control),
+        Err(error) if status_is(error, DW_STATUS_WOULD_BLOCK) => Ok(StreamWriteOutcome::Continue),
+        Err(error) if status_is(error, DW_STATUS_PEER_CLOSED) => Ok(StreamWriteOutcome::PeerClosed),
+        Err(_) => {
+            isolate_stream(driver, control)?;
+            Ok(StreamWriteOutcome::Detached)
+        }
     }
 }
 

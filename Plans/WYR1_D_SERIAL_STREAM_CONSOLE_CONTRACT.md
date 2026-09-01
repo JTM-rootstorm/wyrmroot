@@ -309,6 +309,13 @@ the ring is full it stops reading client DATA so Channel pressure reaches the
 writer. A WRST RX send removes ring bytes only after send commit; racing
 `WOULD_BLOCK` retains them.
 
+An outbound WRST send which races `PEER_CLOSED` enters the same bounded
+peer-close drain state as a wait observation; it does not detach the stream
+immediately. The driver suppresses further writable work, drains every queued
+inbound DATA record under the TX admission gate, and detaches only after a
+fresh receive proves the peer-closed queue empty. Other transport failures
+still isolate the stream immediately.
+
 Consoled stops raw-serial reads while its 4096-byte input stage is full and
 stops stdout/stderr reads while the respective stage is full. Backpressure may
 therefore reach the UART RX loss boundary or child writers, but memory remains

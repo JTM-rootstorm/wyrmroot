@@ -54,6 +54,13 @@ is exhausted, the loop suppresses the sticky peer-close wake until Interrupt
 progress restores capacity, then resumes draining and detaches only after the
 queue is empty.
 
+Selector-31 UP integration exposed the matching send-side race: an outbound
+WRST send could return `PEER_CLOSED` after its peer had queued final inbound
+DATA, and the driver detached before receiving that queue. Send-side
+`PEER_CLOSED` now enters the same peer-close drain state, suppresses further
+writable work, and preserves queued inbound DATA until the receive side proves
+the closed queue empty. SMP scheduling had masked this ordering bug.
+
 Teardown is bounded and ordered: best-effort IER zero while the resource is
 usable, close local stream state, close Interrupt, close DeviceResource, and
 close control last. It does not wait indefinitely for TX drain. Diagnostics
@@ -74,7 +81,7 @@ tools/pinned-cargo test -p wyrmroot-device-proto --lib --tests
 tools/pinned-cargo test -p wyrmroot-devmgr --lib --tests
 # 30 unit + 12 native-source regression tests passed
 tools/pinned-cargo test -p wyrmroot-uart16550d --lib --tests
-# 10 unit + 5 native-source + 1 D3C joined test passed
+# 10 unit + 6 native-source + 1 D3C joined test passed
 tools/pinned-cargo clippy -p wyrmroot-device-proto --lib --tests -- -D warnings
 tools/pinned-cargo clippy -p wyrmroot-uart16550-core --lib --tests -- -D warnings
 tools/pinned-cargo clippy -p wyrmroot-devmgr --lib --tests -- -D warnings

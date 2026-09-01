@@ -76,6 +76,29 @@ fn startup_and_stream_peer_close_precedence_is_explicit() {
 }
 
 #[test]
+fn send_side_peer_close_enters_receive_drain_before_detach() {
+    let writer_start = DRIVER.find("fn service_stream_write").unwrap();
+    let writer = &DRIVER[writer_start..];
+    let send_peer_closed = writer
+        .find("status_is(error, DW_STATUS_PEER_CLOSED)")
+        .unwrap();
+    let pending_outcome = writer[send_peer_closed..]
+        .find("Ok(StreamWriteOutcome::PeerClosed)")
+        .unwrap();
+    let isolate = writer[send_peer_closed..].find("isolate_stream").unwrap();
+    assert!(pending_outcome < isolate);
+
+    let dispatch = DRIVER
+        .find("Ok(StreamWriteOutcome::PeerClosed) =>")
+        .unwrap();
+    let observe = dispatch
+        + DRIVER[dispatch..]
+            .find("peer_close_drain.observe()")
+            .unwrap();
+    assert!(dispatch < observe && observe < writer_start);
+}
+
+#[test]
 fn native_stream_and_teardown_paths_preserve_commit_and_close_order() {
     let prepare = DRIVER.find("driver.prepare_stream_send").unwrap();
     let send = DRIVER
