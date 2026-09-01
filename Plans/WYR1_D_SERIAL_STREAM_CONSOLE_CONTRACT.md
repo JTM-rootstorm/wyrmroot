@@ -339,13 +339,8 @@ baud/format configuration.
 9. return only with IER=0.
 
 `activate_interrupts()` is a separate operation after exact Interrupt intake.
-It writes exactly RDI|RLSI. At an active empty-to-nonempty TX transition, the
-driver reads LSR exactly once. When THRE is already set, it immediately primes
-at most the known 16-byte FIFO and enables THRI only if software-ring work
-remains; otherwise it enables THRI directly. Draining the last TX byte disables
-THRI. This bounded event-driven kick prevents a newly queued transmission from
-depending on a fresh edge while the preceding UART interrupt line is
-collapsing.
+It writes exactly RDI|RLSI. The empty-to-nonempty TX transition enables THRI;
+draining the last TX byte disables THRI.
 
 On each Interrupt wake, read IIR and service all indicated causes until
 NO_INT, failing at 256 iterations. RLSI reads LSR, accounts OE/PE/FE/BI, and
@@ -358,8 +353,7 @@ the driver.
 Only after the complete bounded cause drain may the driver call
 `interrupt_ack`. One ack closes one software pending epoch, not one UART byte.
 Ack failure fails the driver; no uncertain generation continues. There is no
-idle UART polling outside bounded init/drain work and the single LSR read at an
-active empty-to-nonempty TX transition.
+idle UART polling outside bounded init/drain work.
 
 Retirement writes IER=0 first when the DeviceResource remains usable, closes
 stream-local state, then Interrupt, DeviceResource, and control last. Kernel

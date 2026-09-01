@@ -54,14 +54,6 @@ is exhausted, the loop suppresses the sticky peer-close wake until Interrupt
 progress restores capacity, then resumes draining and detaches only after the
 queue is empty.
 
-Live selector-31 integration refined the active empty-to-nonempty TX boundary.
-Enabling THRI while the preceding receive interrupt line was collapsing could
-leave a UP guest with queued response bytes and no new interrupt edge. The core
-now reads LSR once at that event boundary, immediately primes at most one
-16-byte FIFO when THRE is already set, and enables THRI only for any remaining
-software-ring bytes. This is finite event-driven work, not an idle polling
-loop; the existing interrupt path remains responsible for later FIFO service.
-
 Teardown is bounded and ordered: best-effort IER zero while the resource is
 usable, close local stream state, close Interrupt, close DeviceResource, and
 close control last. It does not wait indefinitely for TX drain. Diagnostics
@@ -76,7 +68,7 @@ marker.
 
 ```text
 tools/pinned-cargo test -p wyrmroot-uart16550-core --lib --tests
-# 12 tests passed after the selector-31 TX-kick refinement
+# 10 tests passed
 tools/pinned-cargo test -p wyrmroot-device-proto --lib --tests
 # 42 unit + 9 D0 model tests passed
 tools/pinned-cargo test -p wyrmroot-devmgr --lib --tests
