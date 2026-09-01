@@ -22,7 +22,7 @@ use wyrmroot_dw1e3_com2_test::{
     parse as parse_controller, response,
 };
 use wyrmroot_loader::launch::{
-    CHILD_CHANNEL_RIGHTS, HEADER_BYTES as WRLP_BYTES, LaunchProfile, SELF_ROOT_RIGHTS,
+    CHILD_CHANNEL_RIGHTS, HEADER_BYTES as WRLP_HEADER_BYTES, LaunchProfile, SELF_ROOT_RIGHTS,
     encode_ready_for_profile, parse_init,
 };
 use wyrmroot_registry_proto::{
@@ -38,6 +38,7 @@ use wyrmroot_runtime::{
 use wyrmroot_stream_proto::{MAX_RECORD_BYTES, decode_data, encode_data};
 
 const FAILURE_BASE: u32 = 0xE3A2_0000;
+const PROBE_INIT_BYTES: usize = LaunchProfile::RegistryClient.init_size();
 const BROAD_CHANNEL_RIGHTS: DwRights = DwRights(
     DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_WAIT.0 | DW_RIGHT_INSPECT.0 | DW_RIGHT_TRANSFER.0,
 );
@@ -64,7 +65,7 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
     let correlation = parse_correlation_environment(&environment).map_err(|_| 5u32)?;
 
     wait_readable(parent, 6)?;
-    let mut init = [0u8; WRLP_BYTES];
+    let mut init = [0u8; PROBE_INIT_BYTES];
     let mut handles = [DwReceivedHandleInfoV1::default(); 2];
     let counts = receive_channel(parent, &mut init, &mut handles).map_err(|_| 7u32)?;
     if counts.bytes != init.len() || counts.handles != 2 {
@@ -86,7 +87,7 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
     }
     let registry = handles[1].handle;
     close_handle(handles[0].handle).map_err(|_| 11u32)?;
-    let mut ready = [0; WRLP_BYTES];
+    let mut ready = [0; WRLP_HEADER_BYTES];
     let ready_size = encode_ready_for_profile(
         LaunchProfile::RegistryClient,
         parsed.transaction_id,
@@ -342,6 +343,8 @@ fn close_received(handles: &[DwReceivedHandleInfoV1], count: usize) {
 }
 
 wyrmroot_runtime::native_entry!(crate::probe_main);
+
+const _: () = assert!(PROBE_INIT_BYTES == WRLP_HEADER_BYTES + 2 * 8);
 
 #[panic_handler]
 fn panic(_: &PanicInfo<'_>) -> ! {
