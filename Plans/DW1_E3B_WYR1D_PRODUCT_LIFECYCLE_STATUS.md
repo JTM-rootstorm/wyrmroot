@@ -14,9 +14,11 @@ The Wyrmroot product model now requires the following causal order:
 
 1. U1 completes challenge 1, then makes its final FIFO fill and successfully
    acknowledges its exact Interrupt.
-2. Only after those two facts, three bounded timer-paced UART `LSR.TEMT`
-   observations establish the U1 transport-empty barrier. A non-TEMT sample
-   resets the bounded observation count.
+2. Only after those two facts, a bounded timer-paced UART `LSR.TEMT` poll
+   waits for the first exact `TEMT=1` to establish the U1 transport-empty
+   barrier. A `TEMT=0` result retains the barrier state; exhausting the fixed
+   poll/deadline budget fails the selector rather than assuming transport is
+   empty.
 3. The active stream's queued inbound DATA is observed before U1 peer close.
    This keeps the D3D peer-close drain ordering intact rather than turning a
    close into permission to discard queued bytes.
@@ -28,8 +30,10 @@ The Wyrmroot product model now requires the following causal order:
 6. U2, P2, and its raw stream identity must each differ from U1/P1. Only then
    can the existing action 1 bind U2 and action 3 arm the fresh nonce-bound
    challenge 2.
-7. Challenge 2 completes before the controlled stale-U1 report, accounting,
-   and the existing trusted terminal path.
+7. Challenge 2 completes before the controller observes the kernel-owned
+   saved-U1 replay rejection, accounting, and the existing trusted terminal
+   path. This observation is neither a Wyrmroot raw report nor a private
+   action.
 
 The fixed private kernel interface stays four actions: action 1 binds U1/U2,
 action 2 binds the one current probe reporter, action 3 arms either challenge,
@@ -41,9 +45,9 @@ kernel seams.
 ## Validation
 
 The `wyrmroot-dw1e3-com2-test` host/model gate verifies the full ordered U1 to
-U2 lifecycle and negative cases for pre-ack TEMT, skipped queued-data
-observation, premature U2 admission, stale identities, and reusing the U1
-probe reporter.
+U2 lifecycle and negative cases for pre-ack TEMT, a timed-out TEMT poll,
+skipped queued-data observation, premature U2 admission, stale identities,
+and reusing the U1 probe reporter.
 
 The native product still needs the paired Deepwyrm E3B interface revision to
 exercise the existing action calls against live selector records. No VM or

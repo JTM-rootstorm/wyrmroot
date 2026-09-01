@@ -54,7 +54,7 @@ pub enum LifecycleError {
     WrongOrder,
     NotFresh,
     StaleIdentity,
-    BarrierIncomplete,
+    BarrierTimedOut,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,6 +62,7 @@ enum LifecycleState {
     Challenge1Active,
     Challenge1Responded,
     TransportEmpty,
+    TransportEmptyTimedOut,
     U1PeerClosed,
     U1Reaped,
     U1EndpointsReleased,
@@ -72,10 +73,10 @@ enum LifecycleState {
     Complete,
 }
 
-/// The bounded number of timer-paced `LSR.TEMT` observations required by the
-/// selector product after the last FIFO fill and a successful Interrupt ack.
-/// It is a product bound, not a UART driver retry policy.
-pub const TRANSPORT_EMPTY_TEMT_SAMPLES: u8 = 3;
+/// Maximum timer-paced `LSR.TEMT` polls after final FIFO fill and a successful
+/// Interrupt acknowledgement. The first exact `TEMT=1` crosses the barrier;
+/// false observations retain state until this bounded budget expires.
+pub const TRANSPORT_EMPTY_TEMT_MAX_POLLS: u8 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Selector31Lifecycle {
@@ -84,7 +85,8 @@ pub struct Selector31Lifecycle {
     u1_probe: ProbeIdentity,
     u2: Option<DriverIdentity>,
     u2_probe: Option<ProbeIdentity>,
-    temt_samples: u8,
+    transport_empty_armed: bool,
+    temt_polls: u8,
     queued_data_observed: bool,
     u1_driver_endpoint_released: bool,
     u1_client_endpoint_released: bool,
@@ -101,7 +103,8 @@ impl Selector31Lifecycle {
             u1_probe,
             u2: None,
             u2_probe: None,
-            temt_samples: 0,
+            transport_empty_armed: false,
+            temt_polls: 0,
             queued_data_observed: false,
             u1_driver_endpoint_released: false,
             u1_client_endpoint_released: false,
@@ -117,13 +120,11 @@ impl Selector31Lifecycle {
     }
 
     /// The final FIFO fill and successful Interrupt acknowledgement must both
-    /// be proven before a timer-paced TEMT sample can count toward the exact
-    /// U1 transport-empty barrier.
-    pub fn timer_paced_temt(
+    /// be proven before the bounded timer-paced TEMT barrier starts.
+    pub fn begin_transport_empty_barrier(
         &mut self,
         final_fifo_fill: bool,
         interrupt_ack_succeeded: bool,
-        temt: bool,
     ) -> Result<(), LifecycleError> {
         if self.state != LifecycleState::Challenge1Responded
             || !final_fifo_fill
@@ -131,16 +132,29 @@ impl Selector31Lifecycle {
         {
             return Err(LifecycleError::WrongOrder);
         }
-        if !temt {
-            self.temt_samples = 0;
+        self.transport_empty_armed = true;
+        Ok(())
+    }
+
+    /// One timer-paced `LSR.TEMT` poll. A false result keeps the barrier
+    /// pending; the first true result crosses it. Exhausting the fixed poll
+    /// budget fails the selector lifecycle rather than assuming the UART is
+    /// empty.
+    pub fn timer_paced_temt_poll(&mut self, temt: bool) -> Result<(), LifecycleError> {
+        if self.state != LifecycleState::Challenge1Responded || !self.transport_empty_armed {
+            return Err(LifecycleError::WrongOrder);
+        }
+        self.temt_polls = self
+            .temt_polls
+            .checked_add(1)
+            .ok_or(LifecycleError::BarrierTimedOut)?;
+        if temt {
+            self.state = LifecycleState::TransportEmpty;
             return Ok(());
         }
-        self.temt_samples = self
-            .temt_samples
-            .checked_add(1)
-            .ok_or(LifecycleError::BarrierIncomplete)?;
-        if self.temt_samples == TRANSPORT_EMPTY_TEMT_SAMPLES {
-            self.state = LifecycleState::TransportEmpty;
+        if self.temt_polls == TRANSPORT_EMPTY_TEMT_MAX_POLLS {
+            self.state = LifecycleState::TransportEmptyTimedOut;
+            return Err(LifecycleError::BarrierTimedOut);
         }
         Ok(())
     }
@@ -228,7 +242,13 @@ impl Selector31Lifecycle {
         )
     }
 
-    pub fn stale_u1_report(&mut self, identity: DriverIdentity) -> Result<(), LifecycleError> {
+    /// Accepts the kernel-owned saved-U1 replay observation after challenge 2.
+    /// This is not a Wyrmroot raw report or a private action: the kernel must
+    /// derive rejection with zero wakes from its retained real U1 delivery.
+    pub fn observe_kernel_stale_u1_rejection(
+        &mut self,
+        identity: DriverIdentity,
+    ) -> Result<(), LifecycleError> {
         if self.state != LifecycleState::Challenge2Responded {
             return Err(LifecycleError::WrongOrder);
         }
@@ -696,9 +716,9 @@ mod tests {
         let mut lifecycle = Selector31Lifecycle::new(u1, probe1).unwrap();
         lifecycle.challenge1_responded().unwrap();
         assert_eq!(lifecycle.u1_peer_closed(), Err(LifecycleError::WrongOrder));
-        for _ in 0..TRANSPORT_EMPTY_TEMT_SAMPLES {
-            lifecycle.timer_paced_temt(true, true, true).unwrap();
-        }
+        lifecycle.begin_transport_empty_barrier(true, true).unwrap();
+        lifecycle.timer_paced_temt_poll(false).unwrap();
+        lifecycle.timer_paced_temt_poll(true).unwrap();
         lifecycle.queued_data_before_peer_close().unwrap();
         lifecycle.u1_peer_closed().unwrap();
         lifecycle.u1_reaped().unwrap();
@@ -732,7 +752,7 @@ mod tests {
             )
             .unwrap();
         lifecycle.challenge2_responded().unwrap();
-        lifecycle.stale_u1_report(u1).unwrap();
+        lifecycle.observe_kernel_stale_u1_rejection(u1).unwrap();
         lifecycle.finish().unwrap();
         assert!(lifecycle.complete());
     }
@@ -750,34 +770,19 @@ mod tests {
         let mut lifecycle = Selector31Lifecycle::new(u1, probe1).unwrap();
         lifecycle.challenge1_responded().unwrap();
         assert_eq!(
-            lifecycle.timer_paced_temt(true, false, true),
+            lifecycle.begin_transport_empty_barrier(true, false),
             Err(LifecycleError::WrongOrder)
         );
         assert_eq!(
-            lifecycle.timer_paced_temt(false, true, true),
+            lifecycle.begin_transport_empty_barrier(false, true),
             Err(LifecycleError::WrongOrder)
         );
-        for _ in 0..TRANSPORT_EMPTY_TEMT_SAMPLES {
-            lifecycle.timer_paced_temt(true, true, true).unwrap();
-        }
-        lifecycle.queued_data_before_peer_close().unwrap();
-        lifecycle.u1_peer_closed().unwrap();
-        lifecycle.u1_reaped().unwrap();
-        lifecycle.u1_endpoint_released(true).unwrap();
-        lifecycle.u1_endpoint_released(false).unwrap();
-        lifecycle.u1_probe_reaped(probe1).unwrap();
+        lifecycle.begin_transport_empty_barrier(true, true).unwrap();
+        assert_eq!(lifecycle.timer_paced_temt_poll(false), Ok(()));
+        assert_eq!(lifecycle.timer_paced_temt_poll(false), Ok(()));
         assert_eq!(
-            lifecycle.admit_u2(
-                DriverIdentity {
-                    attempt_generation: 1,
-                    publication_generation: 5,
-                    stream_generation: 6,
-                },
-                ProbeIdentity {
-                    process_generation: 7,
-                },
-            ),
-            Err(LifecycleError::NotFresh)
+            lifecycle.timer_paced_temt_poll(false),
+            Err(LifecycleError::BarrierTimedOut)
         );
     }
 }
