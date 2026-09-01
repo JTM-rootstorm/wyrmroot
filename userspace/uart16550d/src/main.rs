@@ -449,6 +449,14 @@ impl EvidenceDrain {
     }
 
     fn record(&mut self, bytes: &[u8]) -> Result<(), ()> {
+        // One physical burst may coalesce while the first pending epoch is
+        // being drained. The follow-up ack epoch can therefore contain no new
+        // UART bytes; it must remain admissible so the driver can rearm the
+        // exact Interrupt. Any bytes after the challenge was reported still
+        // fail closed as an unexpected second challenge.
+        if bytes.is_empty() {
+            return Ok(());
+        }
         if self.reported || self.bytes.checked_add(bytes.len()).ok_or(())? > CHALLENGE_BYTES {
             return Err(());
         }

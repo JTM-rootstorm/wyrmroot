@@ -38,6 +38,15 @@ fn native_loop_checks_control_and_pio_before_interrupt_ack() {
 }
 
 #[test]
+fn selector31_allows_an_empty_coalesced_ack_epoch_after_the_challenge_drain() {
+    let record = DRIVER.find("fn record(&mut self, bytes: &[u8])").unwrap();
+    let body = &DRIVER[record..];
+    let empty = body.find("if bytes.is_empty()").unwrap();
+    let reported = body.find("if self.reported").unwrap();
+    assert!(empty < reported);
+}
+
+#[test]
 fn startup_and_stream_peer_close_precedence_is_explicit() {
     assert_eq!(DRIVER.matches("!startup_control_is_readable(").count(), 2);
 
