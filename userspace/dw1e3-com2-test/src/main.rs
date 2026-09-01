@@ -97,7 +97,6 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
     send_channel(parent, &ready[..ready_size], &[]).map_err(|_| 13u32)?;
 
     let nonce = dw1e3_build_nonce().map_err(|_| 14u32)?;
-    dw1e3_bind_probe(nonce).map_err(|_| 15u32)?;
     let configure = receive_controller(parent, 16)?;
     let ControllerMessage::Configure {
         nonce: configured_nonce,
@@ -201,6 +200,12 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
     }
     close_handle(direct).map_err(|_| 36u32)?;
     let stream = stream_handles[0].handle;
+
+    // A successful connector exchange proves the production driver has
+    // completed staging, bound its Interrupt evidence identity, activated,
+    // and published this exact stream generation. Binding before this point
+    // races the independently scheduled driver during SMP startup.
+    dw1e3_bind_probe(nonce).map_err(|_| 15u32)?;
 
     send_controller(
         parent,
