@@ -225,6 +225,25 @@ fn native_stream_and_teardown_paths_preserve_commit_and_close_order() {
 }
 
 #[test]
+fn native_stream_commit_consumes_uart_prefix_in_optimized_builds() {
+    let commit = DRIVER_POLICY.find("pub fn commit_stream_send").unwrap();
+    let body = &DRIVER_POLICY[commit
+        ..DRIVER_POLICY[commit..]
+            .find("pub const fn pending_stream_bytes")
+            .unwrap()
+            + commit];
+    let discard = body
+        .find("let discarded = self.uart.discard_rx(self.pending_rx_len)")
+        .unwrap();
+    let invariant = body
+        .find("assert_eq!(\n                discarded, self.pending_rx_len")
+        .unwrap();
+    let clear = body.find("self.pending_rx_len = 0").unwrap();
+    assert!(discard < invariant && invariant < clear);
+    assert!(!body.contains("debug_assert_eq!"));
+}
+
+#[test]
 fn d3_product_gate_cannot_select_the_historical_selector29_actor() {
     assert!(DEVMGR_MANIFEST.contains("wyr1d-production = [\"wyr1c5-production\"]"));
     assert!(DEVMGR_MANIFEST.contains("wyr1c6-selector29 = [\"wyr1c6-production\"]"));

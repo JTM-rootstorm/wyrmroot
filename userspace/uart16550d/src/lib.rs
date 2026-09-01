@@ -723,9 +723,10 @@ impl<I: ByteRegisterIo> ProductionDriver<I> {
     /// Commits a prepared record only after the Channel send succeeds.
     pub fn commit_stream_send(&mut self) {
         if self.pending_rx_len != 0 {
-            debug_assert_eq!(
-                self.uart.discard_rx(self.pending_rx_len),
-                self.pending_rx_len
+            let discarded = self.uart.discard_rx(self.pending_rx_len);
+            assert_eq!(
+                discarded, self.pending_rx_len,
+                "prepared UART RX prefix must remain queued until commit"
             );
             self.pending_rx_len = 0;
             self.counters.tx_records = self.counters.tx_records.saturating_add(1);
