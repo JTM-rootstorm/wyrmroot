@@ -1333,6 +1333,64 @@ mod tests {
     }
 
     #[test]
+    fn fresh_client_id_is_accepted_after_prior_client_reap_in_same_generation() {
+        let mut state = RegistryState::new(7).unwrap();
+        let u1 = EndpointIdentity {
+            id: 41,
+            generation: 1,
+        };
+        let u2 = EndpointIdentity {
+            id: 42,
+            generation: 1,
+        };
+        let u1_client_id = 0x2_e3a1;
+        let u2_client_id = 0x2_e3a2;
+
+        state
+            .install_client(
+                7,
+                1001,
+                InstallClient {
+                    endpoint_id: u1.id,
+                    endpoint_generation: u1.generation,
+                    client_id: u1_client_id,
+                    client_generation: 1,
+                    scope: EnumerationScope::None,
+                },
+            )
+            .unwrap();
+        assert_eq!(state.peer_closed(u1).unwrap().kind, EndpointKind::Client);
+
+        state
+            .install_client(
+                7,
+                1002,
+                InstallClient {
+                    endpoint_id: u2.id,
+                    endpoint_generation: u2.generation,
+                    client_id: u2_client_id,
+                    client_generation: 2,
+                    scope: EnumerationScope::None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            state.install_client(
+                7,
+                1003,
+                InstallClient {
+                    endpoint_id: 43,
+                    endpoint_generation: 1,
+                    client_id: u1_client_id,
+                    client_generation: 2,
+                    scope: EnumerationScope::None,
+                },
+            ),
+            Err(RegistryError::DuplicateClient)
+        );
+    }
+
+    #[test]
     fn thirty_two_services_enumerate_in_raw_name_order() {
         let mut state = RegistryState::new(7).unwrap();
         let client = EndpointIdentity {

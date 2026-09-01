@@ -160,6 +160,11 @@ fn selector31_controller_rejoins_response_temt_then_retires_u1_before_fresh_u2()
     assert!(NATIVE_SOURCE.contains("state.e3a_next_challenge_generation = 0;"));
     assert!(NATIVE_SOURCE.contains("} else if retired_generation == 1 {"));
     assert!(NATIVE_SOURCE.contains("state.e3a_next_challenge_generation = 2;"));
+    assert!(NATIVE_SOURCE.contains("fn e3a_probe_client_id(challenge_generation: u64)"));
+    assert!(
+        NATIVE_SOURCE.contains("let probe_client_id = e3a_probe_client_id(challenge_generation)?;")
+    );
+    assert!(NATIVE_SOURCE.contains("E3A_PROBE_TRANSACTION_ID,\n            probe_client_id,"));
 }
 
 #[test]

@@ -598,6 +598,7 @@ fn install_client<S: Wyr1BPlatform>(
     control: DwHandle,
     grant: EndpointGrant,
     registry_endpoint: DwHandle,
+    client_id: u64,
 ) -> Result<(), InitError> {
     let mut bytes = [0u8; 104];
     let size = encode_install_client(
@@ -611,7 +612,7 @@ fn install_client<S: Wyr1BPlatform>(
         InstallClient {
             endpoint_id: grant.endpoint_id,
             endpoint_generation: grant.endpoint_generation,
-            client_id: CLIENT_ID,
+            client_id,
             client_generation: grant.role_generation,
             scope: EnumerationScope::None,
         },
@@ -1239,6 +1240,7 @@ enum PeerKind {
         path: &'static str,
         role_generation: u64,
         transaction_id: u64,
+        client_id: u64,
     },
 }
 
@@ -1270,6 +1272,7 @@ where
             path,
             role_generation,
             transaction_id,
+            client_id: _,
         } => (
             EndpointKind::RegistryClient,
             role_generation,
@@ -1320,9 +1323,13 @@ where
             registry_endpoint,
             operation,
         ),
-        PeerKind::Client { .. } => {
-            install_client(system, registry_control, grant, registry_endpoint)
-        }
+        PeerKind::Client { client_id, .. } => install_client(
+            system,
+            registry_control,
+            grant,
+            registry_endpoint,
+            client_id,
+        ),
     };
     if let Err(error) = install {
         let mut failed = !channels.cleanup(system);
@@ -1450,6 +1457,7 @@ pub(crate) fn launch_registry_client_actor<S, L, W>(
     path: &'static str,
     role_generation: u64,
     transaction_id: u64,
+    client_id: u64,
 ) -> Result<InstalledPeer, InitError>
 where
     S: Wyr1BPlatform,
@@ -1468,6 +1476,7 @@ where
             path,
             role_generation,
             transaction_id,
+            client_id,
         },
     )
     .map_err(|error| match error {
@@ -3211,6 +3220,7 @@ where
                 path: CLIENT_PATH,
                 role_generation: 1,
                 transaction_id: 0x3001,
+                client_id: CLIENT_ID,
             }
         );
         let first = publisher1.ok_or(InitError::Accounting)?;
@@ -6002,10 +6012,16 @@ mod tests {
         assert_eq!(platform.created_rights, CONTROLLER_CHANNEL_RIGHTS);
 
         let client = grant(EndpointKind::RegistryClient, 44, 5);
-        install_client(&mut platform, DwHandle(10), client, DwHandle(20)).unwrap();
+        let client_id = CLIENT_ID + 1;
+        install_client(&mut platform, DwHandle(10), client, DwHandle(20), client_id).unwrap();
         assert_eq!(platform.queried[0], DwHandle(20));
         assert_eq!(platform.transfer.requested_rights, CHILD_CHANNEL_RIGHTS);
         assert_ne!(CONTROLLER_CHANNEL_RIGHTS, CHILD_CHANNEL_RIGHTS);
+        let parsed = parse(&platform.sent[..platform.sent_len], 1).unwrap();
+        let Message::InstallClient(install) = parsed.message else {
+            panic!("wrong install type")
+        };
+        assert_eq!(install.client_id, client_id);
     }
 
     #[test]
@@ -6111,7 +6127,7 @@ mod tests {
         platform.fresh_rights = CHILD_CHANNEL_RIGHTS;
         let client = grant(EndpointKind::RegistryClient, 44, 5);
         assert_eq!(
-            install_client(&mut platform, DwHandle(10), client, DwHandle(20)),
+            install_client(&mut platform, DwHandle(10), client, DwHandle(20), CLIENT_ID,),
             Err(InitError::ResourceIdentityMismatch)
         );
         assert_eq!(platform.sent_len, 0);

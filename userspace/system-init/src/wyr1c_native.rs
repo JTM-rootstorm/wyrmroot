@@ -83,6 +83,18 @@ const PUBLICATION_TRANSACTION_BASE: u64 = 0xC1_1000;
 const E3A_PROBE_PATH: &str = "test/dw1e3/com2-probe";
 #[cfg(feature = "dw1e3-selector31")]
 const E3A_PROBE_TRANSACTION_ID: u64 = 0xE3A0_0001;
+#[cfg(feature = "dw1e3-selector31")]
+const E3A_PROBE_CLIENT_ID_BASE: u64 = 0x2_E3A0;
+
+#[cfg(feature = "dw1e3-selector31")]
+fn e3a_probe_client_id(challenge_generation: u64) -> Result<u64, InitError> {
+    match challenge_generation {
+        1 | 2 => E3A_PROBE_CLIENT_ID_BASE
+            .checked_add(challenge_generation)
+            .ok_or(InitError::Accounting),
+        _ => Err(InitError::WrongActivationOrder),
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PublicationCorrelation {
@@ -1880,6 +1892,7 @@ where
         wyrmroot_runtime::dw1e3_challenge_nonce(challenge_generation).map_err(InitError::Native)?,
     );
     let expected_hash = e3a_fnv1a64(&challenge);
+    let probe_client_id = e3a_probe_client_id(challenge_generation)?;
 
     // Constructing the process only unblocks devmgr's synchronous staging path;
     // it does not mean the Interrupt is bound or the registry publication is
@@ -1960,6 +1973,7 @@ where
             E3A_PROBE_PATH,
             publication_generation,
             E3A_PROBE_TRANSACTION_ID,
+            probe_client_id,
         )?
     };
     let result = (|| {
@@ -3817,6 +3831,16 @@ mod tests {
     };
 
     const FAILURE: NativeError = NativeError::Status(DwStatus(-1));
+
+    #[cfg(feature = "dw1e3-selector31")]
+    #[test]
+    fn selector31_probe_generations_use_distinct_sticky_registry_client_ids() {
+        let u1 = e3a_probe_client_id(1).unwrap();
+        let u2 = e3a_probe_client_id(2).unwrap();
+        assert_ne!(u1, u2);
+        assert_eq!(e3a_probe_client_id(0), Err(InitError::WrongActivationOrder));
+        assert_eq!(e3a_probe_client_id(3), Err(InitError::WrongActivationOrder));
+    }
 
     struct RebindPlatform {
         inbound: [u8; wyrmroot_device_proto::controller::STATUS_BYTES],
