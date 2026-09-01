@@ -70,7 +70,9 @@ The Wyrmroot product model now requires the following causal order:
    than being forgotten. Devmgr/registry recovery while either selector leg is
    active likewise reaps the retained probe and driver, poisons all E3B
    correlations, then terminally consumes both devmgr and registry lifetimes;
-   it cannot relaunch or resume a stale Q1/Q2 lifecycle.
+   it cannot relaunch or resume a stale Q1/Q2 lifecycle. A failed probe or
+   driver terminate/reap remains `Cleanup` even when that root-actor cleanup
+   later succeeds.
 8. U2, P2, and its raw stream identity must each differ from U1/P1. Only then
    can the existing action 1 bind U2 and action 3 arm the fresh nonce-bound
    challenge 2.

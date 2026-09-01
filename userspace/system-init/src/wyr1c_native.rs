@@ -2625,7 +2625,7 @@ fn fail_closed_e3a_recovery<S, W>(
     resident: &mut ResidentSystemInit,
     system: &mut S,
     waits: &mut W,
-) -> bool
+) -> Option<bool>
 where
     S: InitPlatform,
     W: SupervisionPlatform<Error = NativeError>,
@@ -2636,10 +2636,10 @@ where
             || state.e3a_stream_generation.is_some()
     });
     if !active {
-        return false;
+        return None;
     }
-    let _probe_cleanup = reap_e3a_probe(resident, system, waits, false);
-    let _driver_cleanup = if resident
+    let probe_cleanup = reap_e3a_probe(resident, system, waits, false);
+    let driver_cleanup = if resident
         .wyr1c
         .as_ref()
         .is_some_and(|state| state.driver.is_some())
@@ -2653,7 +2653,7 @@ where
     // caller. Leave a fatal-cleanup disposition for that caller to consume
     // both actor lifetimes before this resident can return.
     resident.result = RecoveryResult::Fatal;
-    true
+    Some(probe_cleanup.is_err() || driver_cleanup.is_err())
 }
 
 /// Selector-31 recovery is terminal when a Q1/Q2 correlation was active: no
@@ -2665,6 +2665,7 @@ fn finish_e3a_fatal_recovery<S, W>(
     resident: &mut ResidentSystemInit,
     system: &mut S,
     waits: &mut W,
+    child_cleanup_failed: bool,
 ) -> Result<(), InitError>
 where
     S: InitPlatform,
@@ -2683,7 +2684,10 @@ where
     };
     resident.active[0] = None;
     resident.active[1] = None;
-    let mut cleanup_failed = false;
+    // A child probe/driver failure remains fatal even when both root roles
+    // subsequently terminate and reap cleanly. Do not erase the originating
+    // cleanup failure while consuming the root actors.
+    let mut cleanup_failed = child_cleanup_failed;
     if let Some(devmgr) = devmgr {
         cleanup_failed |=
             cleanup_loaded(system, waits, devmgr.loaded, devmgr.task_group, true).is_err();
@@ -3206,8 +3210,8 @@ where
     W: SupervisionPlatform<Error = NativeError>,
 {
     #[cfg(feature = "dw1e3-selector31")]
-    if fail_closed_e3a_recovery(resident, system, waits) {
-        return finish_e3a_fatal_recovery(resident, system, waits);
+    if let Some(child_cleanup_failed) = fail_closed_e3a_recovery(resident, system, waits) {
+        return finish_e3a_fatal_recovery(resident, system, waits, child_cleanup_failed);
     }
     let registry = resident
         .wyr1c
@@ -3376,8 +3380,8 @@ where
     W: SupervisionPlatform<Error = NativeError>,
 {
     #[cfg(feature = "dw1e3-selector31")]
-    if fail_closed_e3a_recovery(resident, system, waits) {
-        return finish_e3a_fatal_recovery(resident, system, waits);
+    if let Some(child_cleanup_failed) = fail_closed_e3a_recovery(resident, system, waits) {
+        return finish_e3a_fatal_recovery(resident, system, waits, child_cleanup_failed);
     }
     #[cfg(feature = "wyr1c6-selector29")]
     let restarting_d1 = {

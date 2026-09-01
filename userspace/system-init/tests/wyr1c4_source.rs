@@ -274,6 +274,7 @@ fn selector31_devmgr_or_registry_loss_poison_active_q1_and_q2_before_recovery() 
         "reap_driver(resident, system, waits, true)",
         "poison_e3a_lifecycle(resident)",
         "resident.result = RecoveryResult::Fatal;",
+        "Some(probe_cleanup.is_err() || driver_cleanup.is_err())",
     ] {
         assert!(body.contains(required), "missing {required}");
     }
@@ -290,6 +291,7 @@ fn selector31_devmgr_or_registry_loss_poison_active_q1_and_q2_before_recovery() 
         "retire_attempt_after_fatal(RoleId::Registryd)",
         "resident.controller.fatal();",
         "resident.result = RecoveryResult::Fatal;",
+        "let mut cleanup_failed = child_cleanup_failed;",
     ] {
         assert!(terminal_body.contains(required), "missing {required}");
     }
@@ -297,16 +299,19 @@ fn selector31_devmgr_or_registry_loss_poison_active_q1_and_q2_before_recovery() 
     let devmgr = NATIVE_SOURCE.find("fn recover_devmgr").unwrap();
     assert!(
         NATIVE_SOURCE[registry..]
-            .contains("if fail_closed_e3a_recovery(resident, system, waits) {")
+            .contains("if let Some(child_cleanup_failed) = fail_closed_e3a_recovery")
     );
     assert!(
-        NATIVE_SOURCE[registry..].contains("finish_e3a_fatal_recovery(resident, system, waits);")
+        NATIVE_SOURCE[registry..]
+            .contains("finish_e3a_fatal_recovery(resident, system, waits, child_cleanup_failed);")
     );
     assert!(
-        NATIVE_SOURCE[devmgr..].contains("if fail_closed_e3a_recovery(resident, system, waits) {")
+        NATIVE_SOURCE[devmgr..]
+            .contains("if let Some(child_cleanup_failed) = fail_closed_e3a_recovery")
     );
     assert!(
-        NATIVE_SOURCE[devmgr..].contains("finish_e3a_fatal_recovery(resident, system, waits);")
+        NATIVE_SOURCE[devmgr..]
+            .contains("finish_e3a_fatal_recovery(resident, system, waits, child_cleanup_failed);")
     );
 }
 
