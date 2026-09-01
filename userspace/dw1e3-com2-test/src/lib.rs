@@ -30,6 +30,247 @@ pub const CHALLENGE_GENERATION: u64 = 1;
 pub const DEVMGR_CONFIG_BYTES: usize = 48;
 pub const DEVMGR_CONFIG_MAGIC: [u8; 4] = *b"WDE3";
 
+/// Selector-31 product-side ownership model for the U1 -> U2 replacement
+/// leg.  This intentionally contains no kernel-private action numbers: the
+/// kernel observes the separately authenticated bind/arm/report calls, while
+/// Wyrmroot owns the causal lifetime facts needed before it makes those calls.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DriverIdentity {
+    pub attempt_generation: u64,
+    pub publication_generation: u64,
+    pub stream_generation: u64,
+}
+
+/// The selector reporter is a separately launched probe process.  Its
+/// generation is deliberately independent of the UART attempt and stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProbeIdentity {
+    pub process_generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LifecycleError {
+    ZeroIdentity,
+    WrongOrder,
+    NotFresh,
+    StaleIdentity,
+    BarrierIncomplete,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LifecycleState {
+    Challenge1Active,
+    Challenge1Responded,
+    TransportEmpty,
+    U1PeerClosed,
+    U1Reaped,
+    U1EndpointsReleased,
+    U1ProbeReaped,
+    Challenge2Active,
+    Challenge2Responded,
+    StaleU1Reported,
+    Complete,
+}
+
+/// The bounded number of timer-paced `LSR.TEMT` observations required by the
+/// selector product after the last FIFO fill and a successful Interrupt ack.
+/// It is a product bound, not a UART driver retry policy.
+pub const TRANSPORT_EMPTY_TEMT_SAMPLES: u8 = 3;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Selector31Lifecycle {
+    state: LifecycleState,
+    u1: DriverIdentity,
+    u1_probe: ProbeIdentity,
+    u2: Option<DriverIdentity>,
+    u2_probe: Option<ProbeIdentity>,
+    temt_samples: u8,
+    queued_data_observed: bool,
+    u1_driver_endpoint_released: bool,
+    u1_client_endpoint_released: bool,
+}
+
+impl Selector31Lifecycle {
+    pub const fn new(u1: DriverIdentity, u1_probe: ProbeIdentity) -> Result<Self, LifecycleError> {
+        if !identity_is_nonzero(u1) || u1_probe.process_generation == 0 {
+            return Err(LifecycleError::ZeroIdentity);
+        }
+        Ok(Self {
+            state: LifecycleState::Challenge1Active,
+            u1,
+            u1_probe,
+            u2: None,
+            u2_probe: None,
+            temt_samples: 0,
+            queued_data_observed: false,
+            u1_driver_endpoint_released: false,
+            u1_client_endpoint_released: false,
+        })
+    }
+
+    pub fn challenge1_responded(&mut self) -> Result<(), LifecycleError> {
+        advance(
+            &mut self.state,
+            LifecycleState::Challenge1Active,
+            LifecycleState::Challenge1Responded,
+        )
+    }
+
+    /// The final FIFO fill and successful Interrupt acknowledgement must both
+    /// be proven before a timer-paced TEMT sample can count toward the exact
+    /// U1 transport-empty barrier.
+    pub fn timer_paced_temt(
+        &mut self,
+        final_fifo_fill: bool,
+        interrupt_ack_succeeded: bool,
+        temt: bool,
+    ) -> Result<(), LifecycleError> {
+        if self.state != LifecycleState::Challenge1Responded
+            || !final_fifo_fill
+            || !interrupt_ack_succeeded
+        {
+            return Err(LifecycleError::WrongOrder);
+        }
+        if !temt {
+            self.temt_samples = 0;
+            return Ok(());
+        }
+        self.temt_samples = self
+            .temt_samples
+            .checked_add(1)
+            .ok_or(LifecycleError::BarrierIncomplete)?;
+        if self.temt_samples == TRANSPORT_EMPTY_TEMT_SAMPLES {
+            self.state = LifecycleState::TransportEmpty;
+        }
+        Ok(())
+    }
+
+    pub fn queued_data_before_peer_close(&mut self) -> Result<(), LifecycleError> {
+        if self.state != LifecycleState::TransportEmpty {
+            return Err(LifecycleError::WrongOrder);
+        }
+        self.queued_data_observed = true;
+        Ok(())
+    }
+
+    pub fn u1_peer_closed(&mut self) -> Result<(), LifecycleError> {
+        if self.state != LifecycleState::TransportEmpty || !self.queued_data_observed {
+            return Err(LifecycleError::WrongOrder);
+        }
+        self.state = LifecycleState::U1PeerClosed;
+        Ok(())
+    }
+
+    pub fn u1_reaped(&mut self) -> Result<(), LifecycleError> {
+        advance(
+            &mut self.state,
+            LifecycleState::U1PeerClosed,
+            LifecycleState::U1Reaped,
+        )
+    }
+
+    pub fn u1_endpoint_released(&mut self, driver_endpoint: bool) -> Result<(), LifecycleError> {
+        if self.state != LifecycleState::U1Reaped
+            && self.state != LifecycleState::U1EndpointsReleased
+        {
+            return Err(LifecycleError::WrongOrder);
+        }
+        if driver_endpoint {
+            self.u1_driver_endpoint_released = true;
+        } else {
+            self.u1_client_endpoint_released = true;
+        }
+        if self.u1_driver_endpoint_released && self.u1_client_endpoint_released {
+            self.state = LifecycleState::U1EndpointsReleased;
+        }
+        Ok(())
+    }
+
+    /// The U1 probe remains live only to report the ordered peer close.  It
+    /// must then be terminated/reaped; action 2 binds a fresh U2 reporter.
+    pub fn u1_probe_reaped(&mut self, probe: ProbeIdentity) -> Result<(), LifecycleError> {
+        if self.state != LifecycleState::U1EndpointsReleased || probe != self.u1_probe {
+            return Err(LifecycleError::WrongOrder);
+        }
+        self.state = LifecycleState::U1ProbeReaped;
+        Ok(())
+    }
+
+    pub fn admit_u2(
+        &mut self,
+        u2: DriverIdentity,
+        u2_probe: ProbeIdentity,
+    ) -> Result<(), LifecycleError> {
+        if self.state != LifecycleState::U1ProbeReaped {
+            return Err(LifecycleError::WrongOrder);
+        }
+        if !identity_is_nonzero(u2) || u2_probe.process_generation == 0 {
+            return Err(LifecycleError::ZeroIdentity);
+        }
+        if u2.attempt_generation == self.u1.attempt_generation
+            || u2.publication_generation == self.u1.publication_generation
+            || u2.stream_generation == self.u1.stream_generation
+            || u2_probe == self.u1_probe
+        {
+            return Err(LifecycleError::NotFresh);
+        }
+        self.u2 = Some(u2);
+        self.u2_probe = Some(u2_probe);
+        self.state = LifecycleState::Challenge2Active;
+        Ok(())
+    }
+
+    pub fn challenge2_responded(&mut self) -> Result<(), LifecycleError> {
+        advance(
+            &mut self.state,
+            LifecycleState::Challenge2Active,
+            LifecycleState::Challenge2Responded,
+        )
+    }
+
+    pub fn stale_u1_report(&mut self, identity: DriverIdentity) -> Result<(), LifecycleError> {
+        if self.state != LifecycleState::Challenge2Responded {
+            return Err(LifecycleError::WrongOrder);
+        }
+        if identity != self.u1 {
+            return Err(LifecycleError::StaleIdentity);
+        }
+        self.state = LifecycleState::StaleU1Reported;
+        Ok(())
+    }
+
+    pub fn finish(&mut self) -> Result<(), LifecycleError> {
+        advance(
+            &mut self.state,
+            LifecycleState::StaleU1Reported,
+            LifecycleState::Complete,
+        )
+    }
+
+    #[must_use]
+    pub fn complete(&self) -> bool {
+        self.state == LifecycleState::Complete
+    }
+}
+
+const fn identity_is_nonzero(identity: DriverIdentity) -> bool {
+    identity.attempt_generation != 0
+        && identity.publication_generation != 0
+        && identity.stream_generation != 0
+}
+
+fn advance(
+    state: &mut LifecycleState,
+    expected: LifecycleState,
+    next: LifecycleState,
+) -> Result<(), LifecycleError> {
+    if *state != expected {
+        return Err(LifecycleError::WrongOrder);
+    }
+    *state = next;
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DevmgrConfig {
     pub nonce: u64,
@@ -439,6 +680,104 @@ mod tests {
         assert_eq!(
             parse_devmgr_ready(&bytes),
             Err(ProtocolError::NonzeroReserved)
+        );
+    }
+
+    #[test]
+    fn lifecycle_requires_the_exact_u1_retirement_before_a_fresh_u2_reporter() {
+        let u1 = DriverIdentity {
+            attempt_generation: 11,
+            publication_generation: 21,
+            stream_generation: 31,
+        };
+        let probe1 = ProbeIdentity {
+            process_generation: 41,
+        };
+        let mut lifecycle = Selector31Lifecycle::new(u1, probe1).unwrap();
+        lifecycle.challenge1_responded().unwrap();
+        assert_eq!(lifecycle.u1_peer_closed(), Err(LifecycleError::WrongOrder));
+        for _ in 0..TRANSPORT_EMPTY_TEMT_SAMPLES {
+            lifecycle.timer_paced_temt(true, true, true).unwrap();
+        }
+        lifecycle.queued_data_before_peer_close().unwrap();
+        lifecycle.u1_peer_closed().unwrap();
+        lifecycle.u1_reaped().unwrap();
+        lifecycle.u1_endpoint_released(true).unwrap();
+        lifecycle.u1_endpoint_released(false).unwrap();
+        assert_eq!(
+            lifecycle.admit_u2(
+                DriverIdentity {
+                    attempt_generation: 12,
+                    publication_generation: 22,
+                    stream_generation: 32,
+                },
+                ProbeIdentity {
+                    process_generation: 42,
+                },
+            ),
+            Err(LifecycleError::WrongOrder)
+        );
+        lifecycle.u1_probe_reaped(probe1).unwrap();
+        let u2 = DriverIdentity {
+            attempt_generation: 12,
+            publication_generation: 22,
+            stream_generation: 32,
+        };
+        lifecycle
+            .admit_u2(
+                u2,
+                ProbeIdentity {
+                    process_generation: 42,
+                },
+            )
+            .unwrap();
+        lifecycle.challenge2_responded().unwrap();
+        lifecycle.stale_u1_report(u1).unwrap();
+        lifecycle.finish().unwrap();
+        assert!(lifecycle.complete());
+    }
+
+    #[test]
+    fn lifecycle_rejects_non_fresh_u2_and_non_timer_temt_barriers() {
+        let u1 = DriverIdentity {
+            attempt_generation: 1,
+            publication_generation: 2,
+            stream_generation: 3,
+        };
+        let probe1 = ProbeIdentity {
+            process_generation: 4,
+        };
+        let mut lifecycle = Selector31Lifecycle::new(u1, probe1).unwrap();
+        lifecycle.challenge1_responded().unwrap();
+        assert_eq!(
+            lifecycle.timer_paced_temt(true, false, true),
+            Err(LifecycleError::WrongOrder)
+        );
+        assert_eq!(
+            lifecycle.timer_paced_temt(false, true, true),
+            Err(LifecycleError::WrongOrder)
+        );
+        for _ in 0..TRANSPORT_EMPTY_TEMT_SAMPLES {
+            lifecycle.timer_paced_temt(true, true, true).unwrap();
+        }
+        lifecycle.queued_data_before_peer_close().unwrap();
+        lifecycle.u1_peer_closed().unwrap();
+        lifecycle.u1_reaped().unwrap();
+        lifecycle.u1_endpoint_released(true).unwrap();
+        lifecycle.u1_endpoint_released(false).unwrap();
+        lifecycle.u1_probe_reaped(probe1).unwrap();
+        assert_eq!(
+            lifecycle.admit_u2(
+                DriverIdentity {
+                    attempt_generation: 1,
+                    publication_generation: 5,
+                    stream_generation: 6,
+                },
+                ProbeIdentity {
+                    process_generation: 7,
+                },
+            ),
+            Err(LifecycleError::NotFresh)
         );
     }
 }

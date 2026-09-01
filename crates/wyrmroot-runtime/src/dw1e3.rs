@@ -43,7 +43,9 @@ pub fn dw1e3_build_nonce() -> Result<u64, NativeError> {
 
 /// Binds the caller's exact Interrupt and attempt generation as the current
 /// driver reporter. Object, binding, lease, and reporter Process identities
-/// are resolved by the kernel from the real handle and caller.
+/// are resolved by the kernel from the real handle and caller. Selector-31
+/// reuses this exact action for U2 only after the kernel has finalized U1's
+/// binding; callers must never treat it as a rebinding escape hatch.
 pub fn dw1e3_bind_driver(
     interrupt: DwHandle,
     attempt_generation: u64,
@@ -55,7 +57,9 @@ pub fn dw1e3_bind_driver(
 }
 
 /// Binds the caller as controller and resolves its exact launched raw-probe
-/// reporter from the retained Process handle.
+/// reporter from the retained Process handle. The retained U1 probe is bound
+/// only long enough to report its ordered peer close. E3B then reuses this
+/// action for a separately launched U2 probe; an old reporter is stale.
 pub fn dw1e3_bind_probe(probe: DwHandle, nonce: u64) -> Result<(), NativeError> {
     private_call(bind_probe_arguments(probe, nonce).ok_or_else(invalid_private)?)
 }
