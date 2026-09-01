@@ -54,9 +54,10 @@ pub fn dw1e3_bind_driver(
     )
 }
 
-/// Binds the calling Process as the controller-launched raw-probe reporter.
-pub fn dw1e3_bind_probe(nonce: u64) -> Result<(), NativeError> {
-    private_call(bind_probe_arguments(nonce).ok_or_else(invalid_private)?)
+/// Binds the caller as controller and resolves its exact launched raw-probe
+/// reporter from the retained Process handle.
+pub fn dw1e3_bind_probe(probe: DwHandle, nonce: u64) -> Result<(), NativeError> {
+    private_call(bind_probe_arguments(probe, nonce).ok_or_else(invalid_private)?)
 }
 
 /// Arms one already-attached stream/challenge generation before host input.
@@ -102,11 +103,11 @@ const fn bind_driver_arguments(
     }
 }
 
-const fn bind_probe_arguments(nonce: u64) -> Option<[u64; 6]> {
-    if nonce == 0 {
+const fn bind_probe_arguments(probe: DwHandle, nonce: u64) -> Option<[u64; 6]> {
+    if probe.0 == 0 || nonce == 0 {
         None
     } else {
-        Some([2, nonce, 0, 0, 0, 0])
+        Some([2, probe.0, nonce, 0, 0, 0])
     }
 }
 
@@ -211,7 +212,10 @@ mod tests {
             bind_driver_arguments(DwHandle(9), 10, 11),
             Some([1, 9, 10, 11, 0, 0])
         );
-        assert_eq!(bind_probe_arguments(11), Some([2, 11, 0, 0, 0, 0]));
+        assert_eq!(
+            bind_probe_arguments(DwHandle(12), 11),
+            Some([2, 12, 11, 0, 0, 0])
+        );
         assert_eq!(
             arm_arguments(12, 13, 24, 14, 11),
             Some([3, 12, 13, 24, 14, 11])
@@ -221,7 +225,8 @@ mod tests {
             Some([4, 9, 24, 15, 11, 0])
         );
         assert_eq!(bind_driver_arguments(DwHandle(0), 10, 11), None);
-        assert_eq!(bind_probe_arguments(0), None);
+        assert_eq!(bind_probe_arguments(DwHandle(0), 11), None);
+        assert_eq!(bind_probe_arguments(DwHandle(12), 0), None);
         assert_eq!(arm_arguments(12, 0, 24, 14, 11), None);
         assert_eq!(
             report_arguments(Dw1e3ReportEvent::Challenge1UartDrain, 24, 0, 11),

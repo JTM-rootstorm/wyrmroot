@@ -12,7 +12,10 @@ content.
 
 - the private `0xffff_ff1f` runtime wrapper uses the exact six-word
   BindDriver, BindProbe, ArmChallenge, and Report records, rejects zero
-  required values, and leaves reserved words zero;
+  required values, and leaves reserved words zero. BindProbe is issued by
+  system-init with its retained probe Process handle, so the kernel resolves
+  both the controller caller and controller-launched probe instead of guessing
+  a primordial identity;
 - system-init launches the probe through the existing RegistryClient grant
   path after accepting the real driver construction request;
 - devmgr configures one existing `ConnectorBroker`, receives WRRG

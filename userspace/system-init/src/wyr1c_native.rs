@@ -1832,6 +1832,12 @@ where
         )?
     };
     let result = (|| {
+        // Bind both selector reporters from the controller's retained Process
+        // custody. Deepwyrm resolves this handle in system-init's table, so
+        // neither the probe nor a guessed primordial identity can claim the
+        // controller role.
+        wyrmroot_runtime::dw1e3_bind_probe(probe.loaded.process, nonce)
+            .map_err(InitError::Native)?;
         let configure = E3AControllerMessage::Configure {
             nonce,
             publication_generation,

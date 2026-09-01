@@ -5,16 +5,9 @@ const DEVMGR: &str = include_str!("../../devmgr/src/main.rs");
 const SYSTEM_INIT: &str = include_str!("../../system-init/src/wyr1c_native.rs");
 
 #[test]
-fn evidence_probe_binds_only_after_the_production_stream_is_attached() {
+fn evidence_probe_uses_canonical_registry_geometry() {
     assert!(PROBE.contains("let mut connected_bytes = [0; REGISTRY_HEADER_BYTES];"));
-
-    let connected = PROBE
-        .find("let stream = stream_handles[0].handle;")
-        .unwrap();
-    let bind = PROBE.find("dw1e3_bind_probe(nonce)").unwrap();
-    let attached = PROBE.find("ControllerMessage::Attached {").unwrap();
-
-    assert!(connected < bind && bind < attached);
+    assert!(!PROBE.contains("dw1e3_bind_probe"));
 }
 
 #[test]
@@ -27,6 +20,11 @@ fn controller_waits_for_generation_exact_devmgr_readiness_before_launching_the_p
     let ready = start.find("parse_devmgr_ready(&devmgr_ready)").unwrap();
     let launch = start.find("launch_registry_client_actor(").unwrap();
     assert!(config < ready && ready < launch);
+    let bind = start
+        .find("dw1e3_bind_probe(probe.loaded.process, nonce)")
+        .unwrap();
+    let configure = start.find("encode_e3a_controller(configure").unwrap();
+    assert!(launch < bind && bind < configure);
 
     let configure = DEVMGR
         .split("ControllerInput::Dw1e3(config) =>")

@@ -32,8 +32,8 @@ use wyrmroot_registry_proto::{
 };
 use wyrmroot_runtime::{
     BOOTSTRAP_CHANNEL_EXPECTATION, Dw1e3ReportEvent, NativeError, StartupBlock, close_handle,
-    create_channel, dw1e3_bind_probe, dw1e3_build_nonce, dw1e3_report, panic_abort,
-    query_capability_info, receive_channel, send_channel, validate_bootstrap_channel, wait_one,
+    create_channel, dw1e3_build_nonce, dw1e3_report, panic_abort, query_capability_info,
+    receive_channel, send_channel, validate_bootstrap_channel, wait_one,
 };
 use wyrmroot_stream_proto::{MAX_RECORD_BYTES, decode_data, encode_data};
 
@@ -200,12 +200,6 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
     }
     close_handle(direct).map_err(|_| 36u32)?;
     let stream = stream_handles[0].handle;
-
-    // A successful connector exchange proves the production driver has
-    // completed staging, bound its Interrupt evidence identity, activated,
-    // and published this exact stream generation. Binding before this point
-    // races the independently scheduled driver during SMP startup.
-    dw1e3_bind_probe(nonce).map_err(|_| 15u32)?;
 
     send_controller(
         parent,
