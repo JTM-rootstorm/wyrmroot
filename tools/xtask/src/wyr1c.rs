@@ -197,6 +197,29 @@ const E3A_PRODUCT_NATIVE_SPECS: [NativeSpec; 7] = [
     },
 ];
 
+const E3B_NATIVE_CHECK_SPECS: [NativeSpec; 8] = [
+    NativeSpec {
+        label: "bootstrap",
+        package: "wyrmroot-bootstrap",
+        binary: "wyrmroot-bootstrap",
+        features: "wyr1c5-production",
+        artifact: "wyrmroot-bootstrap",
+    },
+    E3A_PRODUCT_NATIVE_SPECS[0],
+    E3A_PRODUCT_NATIVE_SPECS[1],
+    E3A_PRODUCT_NATIVE_SPECS[2],
+    E3A_PRODUCT_NATIVE_SPECS[3],
+    E3A_PRODUCT_NATIVE_SPECS[4],
+    E3A_PRODUCT_NATIVE_SPECS[5],
+    E3A_PRODUCT_NATIVE_SPECS[6],
+];
+
+const E3B_NATIVE_CHECK_ENVIRONMENT: [(&str, &str); 3] = [
+    ("DEEPWYRM_DW1E_EVIDENCE_NONCE", "E300000000000001"),
+    ("WYRMROOT_DW1E3_CHALLENGE_1_NONCE", "E300000000000002"),
+    ("WYRMROOT_DW1E3_CHALLENGE_2_NONCE", "E300000000000003"),
+];
+
 const C4_NATIVE_CHECK_SPECS: [NativeSpec; 3] = [
     NativeSpec {
         label: "bootstrap-c4",
@@ -338,15 +361,25 @@ pub(crate) struct BuiltFrozenProduct {
 }
 
 pub(crate) fn run_c4_native_checks(repository: &Path) -> Result<(), Failure> {
-    run_native_checks(repository, "WYR1-C4", "wyr1c4", &C4_NATIVE_CHECK_SPECS)
+    run_native_checks(repository, "WYR1-C4", "wyr1c4", &C4_NATIVE_CHECK_SPECS, &[])
 }
 
 pub(crate) fn run_c5_native_checks(repository: &Path) -> Result<(), Failure> {
-    run_native_checks(repository, "WYR1-C5", "wyr1c5", &C5_NATIVE_CHECK_SPECS)
+    run_native_checks(repository, "WYR1-C5", "wyr1c5", &C5_NATIVE_CHECK_SPECS, &[])
 }
 
 pub(crate) fn run_c6_native_checks(repository: &Path) -> Result<(), Failure> {
-    run_native_checks(repository, "WYR1-C6", "wyr1c6", &C6_NATIVE_CHECK_SPECS)
+    run_native_checks(repository, "WYR1-C6", "wyr1c6", &C6_NATIVE_CHECK_SPECS, &[])
+}
+
+pub(crate) fn run_e3b_native_checks(repository: &Path) -> Result<(), Failure> {
+    run_native_checks(
+        repository,
+        "DW1-E3B",
+        "dw1e3b",
+        &E3B_NATIVE_CHECK_SPECS,
+        &E3B_NATIVE_CHECK_ENVIRONMENT,
+    )
 }
 
 fn run_native_checks(
@@ -354,6 +387,7 @@ fn run_native_checks(
     phase: &str,
     slug: &str,
     specs: &[NativeSpec],
+    environment: &[(&str, &str)],
 ) -> Result<(), Failure> {
     reject_ambient_build_environment(env::vars_os())?;
     let manifest = BuildManifest::load(repository)?;
@@ -381,7 +415,8 @@ fn run_native_checks(
         for spec in specs {
             toolchain.accepted().verify_unchanged()?;
             target.verify_unchanged(&scratch_label)?;
-            let status = Command::new(&toolchain.accepted().cargo)
+            let mut command = Command::new(&toolchain.accepted().cargo);
+            command
                 .args([
                     "check",
                     "--offline",
@@ -392,6 +427,7 @@ fn run_native_checks(
                     spec.package,
                     "--bin",
                     spec.binary,
+                    "--no-default-features",
                     "--features",
                     spec.features,
                 ])
@@ -407,11 +443,13 @@ fn run_native_checks(
                 .env_remove("LD_LIBRARY_PATH")
                 .env_remove("LD_PRELOAD")
                 .current_dir(repository)
-                .stdin(Stdio::null())
-                .status()
-                .map_err(|error| {
-                    Failure::task(format!("could not check {}: {error}", spec.label))
-                })?;
+                .stdin(Stdio::null());
+            for (name, value) in environment {
+                command.env(name, value);
+            }
+            let status = command.status().map_err(|error| {
+                Failure::task(format!("could not check {}: {error}", spec.label))
+            })?;
             target.verify_unchanged(&scratch_label)?;
             if !status.success() {
                 return Err(Failure::task(format!(
@@ -1286,6 +1324,7 @@ fn build_native(
         spec.package,
         "--bin",
         spec.binary,
+        "--no-default-features",
         "--features",
         spec.features,
     ];
@@ -2030,7 +2069,7 @@ fn product_generation(revision: &str, artifacts: &[NativeArtifact]) -> [u8; 32] 
 
 fn native_command(spec: NativeSpec) -> String {
     format!(
-        "cargo build --offline --locked --release --target {NATIVE_TARGET} --package {} --bin {} --features {}",
+        "cargo build --offline --locked --release --target {NATIVE_TARGET} --package {} --bin {} --no-default-features --features {}",
         spec.package, spec.binary, spec.features
     )
 }
@@ -2172,6 +2211,55 @@ fn hex_digest(value: &[u8; 32]) -> String {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn e3b_native_gate_covers_the_exact_product_and_nonce_inputs() {
+        let specs = E3B_NATIVE_CHECK_SPECS
+            .iter()
+            .map(|spec| (spec.package, spec.binary, spec.features))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            specs,
+            vec![
+                (
+                    "wyrmroot-bootstrap",
+                    "wyrmroot-bootstrap",
+                    "wyr1c5-production",
+                ),
+                ("wyrmroot-system-init", "system-init", "dw1e3-selector31",),
+                ("wyrmroot-registryd", "registryd", "native-registryd",),
+                ("wyrmroot-devmgr", "devmgr", "dw1e3-selector31"),
+                ("wyrmroot-uart16550d", "uart16550d", "dw1e3-selector31",),
+                (
+                    "wyrmroot-wyr1-retained-stubs",
+                    "consoled",
+                    "native-retained",
+                ),
+                ("wyrmroot-wyr1-retained-stubs", "wyrmsh", "native-retained",),
+                (
+                    "wyrmroot-dw1e3-com2-test",
+                    "dw1e3-com2-test",
+                    "native-probe",
+                ),
+            ]
+        );
+        assert_eq!(
+            E3B_NATIVE_CHECK_ENVIRONMENT.map(|(name, _)| name),
+            [
+                "DEEPWYRM_DW1E_EVIDENCE_NONCE",
+                "WYRMROOT_DW1E3_CHALLENGE_1_NONCE",
+                "WYRMROOT_DW1E3_CHALLENGE_2_NONCE",
+            ]
+        );
+        assert_eq!(
+            E3B_NATIVE_CHECK_ENVIRONMENT
+                .map(|(_, value)| value)
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+                .len(),
+            3
+        );
+    }
 
     fn fixture_artifacts() -> Vec<NativeArtifact> {
         NATIVE_SPECS

@@ -49,6 +49,8 @@ use wyrmroot_device_proto::control_v1_1::{
     DEVICE_STAGE_BYTES as D3_DEVICE_STAGE_BYTES, INTERRUPT_STAGE_BYTES as D3_INTERRUPT_STAGE_BYTES,
     READY_BYTES as D3_READY_BYTES, encode as encode_control_v1_1, parse as parse_control_v1_1,
 };
+#[cfg(not(feature = "dw1e3-selector31"))]
+use wyrmroot_device_proto::controller::INSTALL_BYTES;
 #[cfg(feature = "wyr1c6-production")]
 use wyrmroot_device_proto::driver_launch::{C6_FACT_BYTES, C6Fact, encode_c6_fact};
 #[cfg(any(feature = "wyr1c6-production", feature = "dw1e3-selector31"))]
@@ -59,9 +61,7 @@ use wyrmroot_device_proto::driver_launch::{
 use wyrmroot_device_proto::selector29_should_fail;
 use wyrmroot_device_proto::{
     ControllerMessage, StatusCode,
-    controller::{
-        INSTALL_BYTES, STATUS_BYTES, encode as encode_controller, parse as parse_controller,
-    },
+    controller::{STATUS_BYTES, encode as encode_controller, parse as parse_controller},
 };
 #[cfg(feature = "wyr1c5-production")]
 use wyrmroot_device_proto::{
@@ -116,11 +116,11 @@ use wyrmroot_registry_proto::{
 };
 #[cfg(feature = "dw1e3-selector31")]
 use wyrmroot_registry_proto::{Lookup, ProtocolVersion};
-#[cfg(feature = "wyr1c6-production")]
+#[cfg(any(feature = "wyr1c6-production", feature = "dw1e3-selector31"))]
 use wyrmroot_runtime::NativeError;
 #[cfg(feature = "dw1e3-selector31")]
 use wyrmroot_runtime::dw1e3_build_nonce;
-#[cfg(feature = "wyr1c6-production")]
+#[cfg(any(feature = "wyr1c6-production", feature = "dw1e3-selector31"))]
 use wyrmroot_runtime::monotonic_active_now;
 use wyrmroot_runtime::{
     BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, MappingPlan, StartupBlock, close_handle,
