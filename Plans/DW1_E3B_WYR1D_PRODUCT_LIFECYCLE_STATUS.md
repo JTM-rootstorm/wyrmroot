@@ -29,11 +29,17 @@ The Wyrmroot product model now requires the following causal order:
    close is never permission to discard them. Zero-length WRST DATA remains a
    legal no-op while either fixed challenge or response is being accumulated.
 5. The controller first requests selector-private U1 stage-1 retirement:
-   disable IER, read back exact IER=0, and detach the stream while retaining the Interrupt/resource/
-   control/process. The retained probe then observes queued-data drain and
-   peer close; only after controller report `0x0a` may stage-2 finalize close
-   the remaining driver objects and permit exact reap. Neither one endpoint
-   release nor reap proves the other endpoint.
+   disable IER, read back exact IER=0, and detach the stream while retaining
+   the Interrupt/resource/control/process. The retained probe then observes
+   queued-data drain and peer close, closes its externally owned client stream
+   endpoint, and only then emits its exact `StreamPeerClosed` correlation.
+   System-init submits `0x0a` and sends the existing type-7 `FinalizeRetire`
+   tuple. Devmgr accepts type 7 as the client-release certificate only when
+   its full nonce/T/P/G/Q/length/hash tuple matches the current active attach;
+   it retires the broker and records client release before forwarding stage-2
+   finalize to the driver. Exact `DriverReaped` then releases the driver
+   endpoint; devmgr requires an Empty broker before discarding it or admitting
+   U2. Neither endpoint release nor reap proves the other endpoint.
 6. System-init accepts U1 Process exit only after every Q1 causal join,
    controller FinalizeRetire, and an exact zero normal-exit record. A
    premature or nonzero exit performs fail-closed cleanup and cannot advance
@@ -73,9 +79,10 @@ U2 lifecycle and negative cases for pre-ack TEMT, a timed-out TEMT poll,
 skipped queued-data observation, premature U2 admission, descending/stale
 identities, and reusing the U1 probe reporter. Native source gates additionally
 cover BindingReady-before-arm, the observed response accumulator, exact WDE3
-type routing, stage-1/FinalizeRetire correlation, the post-IER0 interrupt
-race, U1 probe reaping, fresh U2 admission, and the U2 response/TEMT join
-before the controller-only terminal claim.
+type routing, type-7 client-release custody, stage-1/FinalizeRetire
+correlation, the post-IER0 interrupt race, U1 probe reaping, fresh U2
+admission, and the U2 response/TEMT join before the controller-only terminal
+claim.
 
 Freestanding product build and live selector-record exercise still need the
 paired Deepwyrm E3B interface revision. No VM or physical-I/O claim is made

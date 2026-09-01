@@ -261,6 +261,10 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
     )?;
     if challenge_generation == CHALLENGE_GENERATION {
         await_stream_peer_closed(stream)?;
+        // Type-7 is the controller's client-endpoint-release certificate.
+        // Close our externally owned stream endpoint before reporting the
+        // exact peer-close tuple, never after FinalizeRetire has started.
+        close_handle(stream).map_err(|_| 41u32)?;
         send_controller(
             parent,
             ControllerMessage::StreamPeerClosed {
@@ -271,8 +275,9 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
             },
         )?;
         wait_peer_closed(parent, 41)?;
+    } else {
+        close_handle(stream).map_err(|_| 41u32)?;
     }
-    close_handle(stream).map_err(|_| 41u32)?;
     close_handle(parent).map_err(|_| 42u32)?;
     Ok(0)
 }

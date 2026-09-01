@@ -280,6 +280,12 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
     let mut driver_control = None;
     #[cfg(feature = "dw1e3-selector31")]
     let mut connector_broker = None;
+    #[cfg(feature = "dw1e3-selector31")]
+    let mut selector_binding = None;
+    #[cfg(feature = "dw1e3-selector31")]
+    let mut selector_binding_ready = false;
+    #[cfg(feature = "dw1e3-selector31")]
+    let mut selector_retiring_driver = None;
     #[cfg(feature = "wyr1c4-production")]
     let mut _device_resource = None;
     #[cfg(feature = "wyr1c5-production")]
@@ -369,15 +375,19 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                 ControllerInput::Dw1e3Binding(binding) => {
                     let request = resident.active_driver_request().ok_or(failure(211))?;
                     let control = driver_control.ok_or(failure(212))?;
+                    let broker = connector_broker.as_ref().ok_or(failure(213))?;
                     if binding.nonce != dw1e3_build_nonce().map_err(|_| failure(213))?
                         || binding.attempt_generation != request.attempt_generation.0
-                        || connector_broker.is_none()
+                        || selector_binding.is_some()
+                        || broker.current().is_none()
                     {
                         return Err(failure(213));
                     }
                     let mut bytes = [0u8; TRANSPORT_EMPTY_FACT_BYTES];
                     encode_challenge_binding(binding, &mut bytes).map_err(|_| failure(214))?;
                     send_channel(control, &bytes, &[]).map_err(|_| failure(215))?;
+                    selector_binding = Some(binding);
+                    selector_binding_ready = false;
                     continue;
                 }
                 ControllerInput::Dw1e3DriverCommand(binding, message_type) => {
@@ -385,9 +395,25 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                     let control = driver_control.ok_or(failure(219))?;
                     if binding.nonce != dw1e3_build_nonce().map_err(|_| failure(220))?
                         || binding.attempt_generation != request.attempt_generation.0
-                        || connector_broker.is_none()
+                        || selector_binding != Some(binding)
+                        || !selector_binding_ready
                     {
                         return Err(failure(220));
+                    }
+                    let broker = connector_broker.as_mut().ok_or(failure(220))?;
+                    let current = broker.current().ok_or(failure(220))?;
+                    if current.control.attempt_generation != request.attempt_generation
+                        || current.publication_generation != binding.publication_generation
+                    {
+                        return Err(failure(220));
+                    }
+                    if message_type == 7 {
+                        broker
+                            .selector_finalize_client_release(current, binding.stream_generation)
+                            .map_err(|_| failure(221))?;
+                        selector_retiring_driver = Some(current);
+                    } else if message_type != 6 {
+                        return Err(failure(221));
                     }
                     let mut bytes = [0u8; TRANSPORT_EMPTY_FACT_BYTES];
                     match message_type {
@@ -598,6 +624,8 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                     control,
                     bootstrap,
                     connector_broker.as_mut().ok_or(failure(169))?,
+                    selector_binding,
+                    &mut selector_binding_ready,
                 )?;
                 driver_control = Some(control);
                 continue;
@@ -652,14 +680,29 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                     )?;
                 }
                 resident.publication_retired().map_err(|_| failure(43))?;
-                #[cfg(feature = "dw1e3-selector31")]
-                {
-                    // U1's stream endpoint was already detached by stage 1;
-                    // do not let its broker correlations authorize U2.
-                    connector_broker = None;
-                }
                 await_driver_reaped(bootstrap, request)?;
                 resident.reap_driver().map_err(|_| failure(44))?;
+                #[cfg(feature = "dw1e3-selector31")]
+                {
+                    // The controller's type-7 certificate released the
+                    // external client endpoint before FinalizeRetire.  The
+                    // exact DriverReaped reply now proves the moved driver
+                    // endpoint is gone; only an Empty broker may admit U2.
+                    let reaped = selector_retiring_driver.take().ok_or(failure(224))?;
+                    let broker = connector_broker.as_mut().ok_or(failure(224))?;
+                    if reaped.control.attempt_generation != request.attempt_generation
+                        || broker
+                            .driver_attempt_reaped(reaped)
+                            .map_err(|_| failure(225))?
+                            .is_some()
+                        || !matches!(broker.slot(), ConnectorSlot::Empty)
+                    {
+                        return Err(failure(225));
+                    }
+                    connector_broker = None;
+                    selector_binding = None;
+                    selector_binding_ready = false;
+                }
                 #[cfg(feature = "wyr1c6-selector29")]
                 send_c6_fact(
                     bootstrap,
@@ -1113,6 +1156,8 @@ fn service_selector31_driver_control(
     driver_control: DwHandle,
     bootstrap: DwHandle,
     broker: &mut ConnectorBroker,
+    binding: Option<ChallengeBinding>,
+    binding_ready: &mut bool,
 ) -> Result<(), u32> {
     // This endpoint multiplexes selector-private WDE3 facts and ordinary
     // 112-byte D3 control. Never size the receive buffer to WDE3: doing so
@@ -1148,7 +1193,11 @@ fn service_selector31_driver_control(
         && bytes[..4] == wyrmroot_dw1e3_com2_test::DEVMGR_CONFIG_MAGIC
         && u16::from_le_bytes([bytes[6], bytes[7]]) == 5
     {
-        parse_binding_ready(&bytes[..counts.bytes]).map_err(|_| failure(207))?;
+        let ready = parse_binding_ready(&bytes[..counts.bytes]).map_err(|_| failure(207))?;
+        if binding != Some(ready) || *binding_ready {
+            return Err(failure(207));
+        }
+        *binding_ready = true;
         send_channel(bootstrap, &bytes[..counts.bytes], &[]).map_err(|_| failure(208))?;
         return Ok(());
     }

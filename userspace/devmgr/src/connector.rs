@@ -454,6 +454,30 @@ impl ConnectorBroker {
         Ok(())
     }
 
+    /// Selector-31 type-7 FinalizeRetire is the controller's certificate that
+    /// the externally-owned client endpoint was closed by the retained probe.
+    /// It is valid only for the current active attach; validate everything
+    /// before changing ownership so an early, stale, or duplicate certificate
+    /// cannot make a replacement admissible.
+    pub fn selector_finalize_client_release(
+        &mut self,
+        observed_driver: PublishedDriver,
+        observed_stream_generation: u64,
+    ) -> Result<AttachCorrelation, ConnectorModelError> {
+        let ConnectorSlot::Active { attach, .. } = self.slot else {
+            return Err(ConnectorModelError::Stale);
+        };
+        if self.current != Some(observed_driver)
+            || attach.driver != observed_driver
+            || attach.stream_generation != observed_stream_generation
+        {
+            return Err(ConnectorModelError::Stale);
+        }
+        let _ = self.retire_current();
+        self.client_release_observed(attach)?;
+        Ok(attach)
+    }
+
     /// Records supervisor/reaper proof that one exact driver attempt is
     /// terminal. Process teardown, not devmgr, releases any endpoint that was
     /// already MOVEd into the driver. Stale attempt evidence is non-mutating.
@@ -793,6 +817,77 @@ mod tests {
         broker.client_release_observed(attach).unwrap();
         assert_eq!(broker.slot(), ConnectorSlot::Empty);
         broker.replace_published_driver(driver(11, 2)).unwrap();
+    }
+
+    #[test]
+    fn selector_finalize_certifies_client_release_then_exact_reap_opens_replacement() {
+        let published = driver(10, 1);
+        let mut broker = ConnectorBroker::new(Some(published), 100, 200).unwrap();
+        let attach = attach_once(&mut broker, 10, 7);
+        assert_eq!(
+            broker
+                .selector_finalize_client_release(published, attach.stream_generation)
+                .unwrap(),
+            attach
+        );
+        assert!(matches!(
+            broker.slot(),
+            ConnectorSlot::RetiringActive { .. }
+        ));
+        assert_eq!(
+            broker.begin_connect(ConnectorMessage::ConnectStream {
+                publication_generation: 10,
+                client_transaction_id: 8,
+            }),
+            Err(ConnectorModelError::NotReady)
+        );
+        assert_eq!(broker.driver_attempt_reaped(published).unwrap(), None);
+        assert_eq!(broker.slot(), ConnectorSlot::Empty);
+        broker.replace_published_driver(driver(11, 2)).unwrap();
+    }
+
+    #[test]
+    fn selector_finalize_rejects_early_duplicate_and_mismatched_attach_without_mutation() {
+        let published = driver(10, 1);
+        let mut broker = ConnectorBroker::new(Some(published), 100, 200).unwrap();
+        assert_eq!(
+            broker.selector_finalize_client_release(published, 200),
+            Err(ConnectorModelError::Stale)
+        );
+        let attach = attach_once(&mut broker, 10, 7);
+        let before = broker.slot();
+        assert_eq!(
+            broker.selector_finalize_client_release(published, attach.stream_generation + 1),
+            Err(ConnectorModelError::Stale)
+        );
+        assert_eq!(broker.slot(), before);
+        broker
+            .selector_finalize_client_release(published, attach.stream_generation)
+            .unwrap();
+        let after = broker.slot();
+        assert_eq!(
+            broker.selector_finalize_client_release(published, attach.stream_generation),
+            Err(ConnectorModelError::Stale)
+        );
+        assert_eq!(broker.slot(), after);
+    }
+
+    #[test]
+    fn selector_reap_before_client_certificate_keeps_u2_blocked() {
+        let published = driver(10, 1);
+        let mut broker = ConnectorBroker::new(Some(published), 100, 200).unwrap();
+        let attach = attach_once(&mut broker, 10, 7);
+        assert_eq!(broker.driver_attempt_reaped(published).unwrap(), None);
+        let before = broker.slot();
+        assert_eq!(
+            broker.selector_finalize_client_release(published, attach.stream_generation),
+            Err(ConnectorModelError::Stale)
+        );
+        assert_eq!(broker.slot(), before);
+        assert_eq!(
+            broker.replace_published_driver(driver(11, 2)),
+            Err(ConnectorModelError::Stale)
+        );
     }
 
     #[test]
