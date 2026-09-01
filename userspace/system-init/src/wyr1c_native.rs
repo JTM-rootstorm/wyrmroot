@@ -2874,7 +2874,7 @@ where
     if let Some(probe) = state.e3a_probe {
         items[item_count] = DwWaitItemV1 {
             handle: probe.loaded.launch_channel,
-            signals: DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+            signals: deepwyrm_syscall::DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
         };
         item_count += 1;
         items[item_count] = DwWaitItemV1 {
