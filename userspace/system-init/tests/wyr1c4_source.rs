@@ -235,6 +235,28 @@ fn selector31_supervises_probe_channel_and_process_failure_without_advancement()
 }
 
 #[test]
+fn selector31_drains_queued_u2_response_before_a_combined_peer_close_is_classified() {
+    let classifier = NATIVE_SOURCE.find("fn classify_resident_poll").unwrap();
+    let readable = NATIVE_SOURCE[classifier..]
+        .find("Ok(ResidentPollEvent::ProbeControlReadable)")
+        .unwrap()
+        + classifier;
+    let closed = NATIVE_SOURCE[classifier..]
+        .find("Ok(ResidentPollEvent::ProbeControlLost)")
+        .unwrap()
+        + classifier;
+    assert!(readable < closed);
+    let response = NATIVE_SOURCE
+        .find("E3AControllerMessage::ResponseCommitted")
+        .unwrap();
+    let u2_exit = NATIVE_SOURCE
+        .find("e3a_u2_probe_may_exit(resident)")
+        .unwrap();
+    assert!(response < u2_exit);
+    assert!(NATIVE_SOURCE.contains("combined READABLE|PEER_CLOSED wake"));
+}
+
+#[test]
 fn selector31_u2_temt_join_is_the_only_terminal_claim_path() {
     let terminal = NATIVE_SOURCE
         .find("dw1e3_terminal_claim(binding.nonce)")

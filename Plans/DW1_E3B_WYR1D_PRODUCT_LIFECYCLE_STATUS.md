@@ -54,6 +54,9 @@ The Wyrmroot product model now requires the following causal order:
    fail-closed supervision event: validate an observed exit when present,
    clean up the probe and active driver with bounded fallback, and do not
    advance the selector lifecycle.
+   When `READABLE|PEER_CLOSED` arrives together, system-init drains the queued
+   exact controller message first; a subsequent fresh close then receives the
+   normal lifecycle classification.
    The intentional U2 probe exit after `ResponseCommitted` is separately
    reaped with an exact successful-exit check while retaining the U2
    binding/TEMT join for the controller terminal claim.

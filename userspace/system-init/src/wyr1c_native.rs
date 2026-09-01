@@ -286,17 +286,21 @@ fn classify_resident_poll(
         index
             if probe_present
                 && index == 2 + u32::from(registry_present) * 2 + u32::from(driver_present)
-                && result.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 =>
+                && result.observed.0 & DW_SIGNAL_READABLE.0 != 0 =>
         {
-            Ok(ResidentPollEvent::ProbeControlLost)
+            // A probe may write ResponseCommitted and close immediately. On
+            // a combined READABLE|PEER_CLOSED wake, consume that queued,
+            // exact message first; a fresh close wake then classifies the
+            // post-response lifetime normally.
+            Ok(ResidentPollEvent::ProbeControlReadable)
         }
         #[cfg(feature = "dw1e3-selector31")]
         index
             if probe_present
                 && index == 2 + u32::from(registry_present) * 2 + u32::from(driver_present)
-                && result.observed.0 & DW_SIGNAL_READABLE.0 != 0 =>
+                && result.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 =>
         {
-            Ok(ResidentPollEvent::ProbeControlReadable)
+            Ok(ResidentPollEvent::ProbeControlLost)
         }
         #[cfg(feature = "dw1e3-selector31")]
         index
