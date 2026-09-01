@@ -16,7 +16,7 @@ fn command() -> Command {
 }
 
 #[test]
-fn command_rejects_non_distinct_payload_nonces_before_creating_output() {
+fn command_rejects_non_distinct_evidence_and_payload_nonces_before_creating_output() {
     let output = std::env::temp_dir().join(format!("dw1e3b-cli-invalid-{}", std::process::id()));
     assert!(!output.exists());
     let result = command()
@@ -35,7 +35,7 @@ fn command_rejects_non_distinct_payload_nonces_before_creating_output() {
     assert!(
         String::from_utf8(result.stderr)
             .unwrap()
-            .contains("DW1-E3B challenge nonces must be distinct")
+            .contains("DW1-E3B evidence and challenge nonces must be pairwise distinct")
     );
     assert!(!output.exists());
 }
