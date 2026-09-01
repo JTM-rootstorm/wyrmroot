@@ -229,8 +229,14 @@ fn select_challenge_nonce(
     challenge1_text: Option<&str>,
     challenge2_text: Option<&str>,
 ) -> Option<u64> {
-    let challenge1 = challenge1_text.map(parse_nonce).transpose()?;
-    let challenge2 = challenge2_text.map(parse_nonce).transpose()?;
+    let challenge1 = match challenge1_text {
+        Some(text) => Some(parse_nonce(text)?),
+        None => None,
+    };
+    let challenge2 = match challenge2_text {
+        Some(text) => Some(parse_nonce(text)?),
+        None => None,
+    };
     match (challenge1, challenge2) {
         (None, None) if generation == 1 => Some(evidence),
         (Some(challenge1), Some(challenge2))
@@ -277,6 +283,18 @@ mod tests {
             Some(0x9999_aaaa_bbbb_cccc)
         );
         assert_eq!(select_challenge_nonce(2, evidence, None, None), None);
+        assert_eq!(
+            select_challenge_nonce(1, evidence, None, None),
+            Some(evidence)
+        );
+        assert_eq!(
+            select_challenge_nonce(1, evidence, Some(challenge1), None),
+            None
+        );
+        assert_eq!(
+            select_challenge_nonce(1, evidence, Some("not-a-hex-nonce"), Some(challenge2)),
+            None
+        );
         assert_eq!(
             select_challenge_nonce(1, evidence, Some("1111222233334444"), Some(challenge2)),
             None
