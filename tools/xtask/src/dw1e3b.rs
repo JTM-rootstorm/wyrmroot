@@ -995,11 +995,7 @@ fn render_dynamic(
     render(values, &names, integers, label)
 }
 
-fn require<'a>(
-    values: &'a BTreeMap<String, String>,
-    key: &str,
-    expected: &str,
-) -> Result<(), Failure> {
+fn require(values: &BTreeMap<String, String>, key: &str, expected: &str) -> Result<(), Failure> {
     if value(values, key)? != expected {
         return Err(Failure::task(format!("DW1-E3B {key} drifted")));
     }
@@ -1020,19 +1016,26 @@ pub(crate) struct FullEvidence {
     pub(crate) u2: [u64; 7],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LegPayloadIdentity {
+    pub(crate) challenge_length: u64,
+    pub(crate) challenge_fnv: u64,
+    pub(crate) response_length: u64,
+    pub(crate) response_fnv: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FullEvidenceInputs<'a> {
+    pub(crate) nonce: &'a str,
+    pub(crate) challenge_1: LegPayloadIdentity,
+    pub(crate) challenge_2: LegPayloadIdentity,
+}
+
 /// Parses the byte-defined E0 section-11 transaction and its trusted terminal.
 #[allow(dead_code)]
 pub(crate) fn parse_full_evidence(
     bytes: &[u8],
-    nonce: &str,
-    c1_len: u64,
-    c1_fnv: u64,
-    r1_len: u64,
-    r1_fnv: u64,
-    c2_len: u64,
-    c2_fnv: u64,
-    r2_len: u64,
-    r2_fnv: u64,
+    inputs: FullEvidenceInputs<'_>,
 ) -> Result<FullEvidence, Failure> {
     const EVENTS: [u8; 26] = [
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
@@ -1041,7 +1044,9 @@ pub(crate) fn parse_full_evidence(
     const ACTORS: [u8; 26] = [
         0, 0, 0, 0, 0, 0, 1, 0, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 2, 0, 0, 0,
     ];
-    if nonce.len() != 16 || bytes.len() != 26 * 204 + 13 || &bytes[26 * 204..] != b"DWTEST1 31 0\n"
+    if inputs.nonce.len() != 16
+        || bytes.len() != 26 * 204 + 13
+        || &bytes[26 * 204..] != b"DWTEST1 31 0\n"
     {
         return Err(Failure::task(
             "DW1-E3B evidence lacks exact 26-record DWTEST1 31/0 terminal",
@@ -1053,7 +1058,7 @@ pub(crate) fn parse_full_evidence(
         if &record[..6] != b"DWE3E1"
             || &record[7..9] != b"01"
             || record[203] != b'\n'
-            || &record[10..26] != nonce.as_bytes()
+            || &record[10..26] != inputs.nonce.as_bytes()
             || parse_hex(&record[27..35])? != sequence as u64
             || parse_hex(&record[36..38])? != EVENTS[sequence] as u64
             || parse_hex(&record[39..41])? != ACTORS[sequence] as u64
@@ -1082,28 +1087,25 @@ pub(crate) fn parse_full_evidence(
     let u2: [u64; 7] = rows[17][..7].try_into().unwrap();
     if rows[0].iter().any(|value| *value != 0)
         || rows[25].iter().any(|value| *value != 0)
-        || u1.iter().any(|value| *value == 0)
-        || u2.iter().any(|value| *value == 0)
+        || u1.contains(&0)
+        || u2.contains(&0)
     {
         return Err(Failure::task(
             "DW1-E3B evidence zero-generation rule drifted",
         ));
     }
     for sequence in [1, 2] {
-        if rows[sequence][..5].iter().any(|value| *value == 0)
-            || rows[sequence][5] != 0
-            || rows[sequence][6] != 0
-        {
+        if rows[sequence][..5].contains(&0) || rows[sequence][5] != 0 || rows[sequence][6] != 0 {
             return Err(Failure::task("DW1-E3B U1 reserve/commit tuple drifted"));
         }
     }
-    for sequence in 3..=14 {
-        if rows[sequence][..7] != u1 {
+    for row in rows.iter().take(15).skip(3) {
+        if row[..7] != u1 {
             return Err(Failure::task("DW1-E3B U1 tuple join drifted"));
         }
     }
     for sequence in [15, 16] {
-        if rows[sequence][..5].iter().any(|value| *value == 0)
+        if rows[sequence][..5].contains(&0)
             || rows[sequence][5] != 0
             || rows[sequence][6] != 0
             || rows[sequence][3] != u1[3]
@@ -1111,8 +1113,8 @@ pub(crate) fn parse_full_evidence(
             return Err(Failure::task("DW1-E3B U2 reserve/commit tuple drifted"));
         }
     }
-    for sequence in 17..=22 {
-        if rows[sequence][..7] != u2 {
+    for row in rows.iter().take(23).skip(17) {
+        if row[..7] != u2 {
             return Err(Failure::task("DW1-E3B U2 tuple join drifted"));
         }
     }
@@ -1132,10 +1134,26 @@ pub(crate) fn parse_full_evidence(
         return Err(Failure::task("DW1-E3B replacement/stale relation drifted"));
     }
     for (sequence, length, hash) in [
-        (6, c1_len, c1_fnv),
-        (8, r1_len, r1_fnv),
-        (20, c2_len, c2_fnv),
-        (22, r2_len, r2_fnv),
+        (
+            6,
+            inputs.challenge_1.challenge_length,
+            inputs.challenge_1.challenge_fnv,
+        ),
+        (
+            8,
+            inputs.challenge_1.response_length,
+            inputs.challenge_1.response_fnv,
+        ),
+        (
+            20,
+            inputs.challenge_2.challenge_length,
+            inputs.challenge_2.challenge_fnv,
+        ),
+        (
+            22,
+            inputs.challenge_2.response_length,
+            inputs.challenge_2.response_fnv,
+        ),
     ] {
         if rows[sequence][7] != length || rows[sequence][8] != hash {
             return Err(Failure::task("DW1-E3B raw leg identity drifted"));
@@ -1254,15 +1272,21 @@ mod tests {
         bytes.extend_from_slice(b"DWTEST1 31 0\n");
         let parsed = parse_full_evidence(
             &bytes,
-            "0123456789ABCDEF",
-            24,
-            dw1e3a::fnv1a64(&c1.0),
-            24,
-            dw1e3a::fnv1a64(&c1.1),
-            24,
-            dw1e3a::fnv1a64(&c2.0),
-            24,
-            dw1e3a::fnv1a64(&c2.1),
+            FullEvidenceInputs {
+                nonce: "0123456789ABCDEF",
+                challenge_1: LegPayloadIdentity {
+                    challenge_length: 24,
+                    challenge_fnv: dw1e3a::fnv1a64(&c1.0),
+                    response_length: 24,
+                    response_fnv: dw1e3a::fnv1a64(&c1.1),
+                },
+                challenge_2: LegPayloadIdentity {
+                    challenge_length: 24,
+                    challenge_fnv: dw1e3a::fnv1a64(&c2.0),
+                    response_length: 24,
+                    response_fnv: dw1e3a::fnv1a64(&c2.1),
+                },
+            },
         )
         .unwrap();
         assert_eq!(parsed.u2, u2);
