@@ -537,6 +537,8 @@ fn run_event_loop<I: ByteRegisterIo>(
                     let stream_result = service_stream_read(driver, control, pio_failed);
                     match stream_result {
                         Ok(StreamReadOutcome::Accepted) => {}
+                        #[cfg(feature = "dw1e3-selector31")]
+                        Ok(StreamReadOutcome::EmptyData) => {}
                         Ok(StreamReadOutcome::WouldBlock) => {
                             if isolate_stream(driver, control).is_err() {
                                 return fail_driver(driver, control, 41);
@@ -560,6 +562,8 @@ fn run_event_loop<I: ByteRegisterIo>(
                 let stream_result = service_stream_read(driver, control, pio_failed);
                 match stream_result {
                     Ok(StreamReadOutcome::Accepted | StreamReadOutcome::WouldBlock) => {}
+                    #[cfg(feature = "dw1e3-selector31")]
+                    Ok(StreamReadOutcome::EmptyData) => {}
                     Ok(StreamReadOutcome::Detached) => {
                         peer_close_drain.clear();
                         continue;
@@ -591,12 +595,18 @@ fn selector_response_input_drained<I: ByteRegisterIo>(
     pio_failed: &Cell<bool>,
     evidence: &mut Option<EvidenceDrain>,
 ) -> Result<(), ()> {
-    match service_stream_read(driver, control, pio_failed, evidence) {
-        // A fresh receive-side empty/closed observation is the only positive
-        // proof. Any record after the exact response (including malformed or
-        // handle-bearing input) fails before the TEMT fact is emitted.
-        Ok(StreamReadOutcome::WouldBlock) => Ok(()),
-        Ok(StreamReadOutcome::Accepted | StreamReadOutcome::Detached) | Err(()) => Err(()),
+    loop {
+        match service_stream_read(driver, control, pio_failed, evidence) {
+            // A fresh receive-side empty/closed observation is the only
+            // positive proof. Legal empty DATA records are no-ops and must be
+            // drained first; any nonempty/handle-bearing/malformed record
+            // after the exact response fails before TEMT is emitted.
+            Ok(StreamReadOutcome::WouldBlock) => return Ok(()),
+            Ok(StreamReadOutcome::EmptyData) => continue,
+            Ok(StreamReadOutcome::Accepted | StreamReadOutcome::Detached) | Err(()) => {
+                return Err(());
+            }
+        }
     }
 }
 
@@ -923,6 +933,13 @@ fn service_stream_read<I: ByteRegisterIo>(
         let payload = decode_data(&bytes[..counts.bytes])
             .map_err(|_| ())?
             .payload();
+        if payload.is_empty() {
+            evidence.as_mut().ok_or(())?.record_response(payload)?;
+            if pio_failed.get() {
+                return Err(());
+            }
+            return Ok(StreamReadOutcome::EmptyData);
+        }
         evidence.as_mut().ok_or(())?.record_response(payload)?;
     }
     if pio_failed.get() {
@@ -933,6 +950,8 @@ fn service_stream_read<I: ByteRegisterIo>(
 
 enum StreamReadOutcome {
     Accepted,
+    #[cfg(feature = "dw1e3-selector31")]
+    EmptyData,
     WouldBlock,
     Detached,
 }

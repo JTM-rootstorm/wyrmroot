@@ -170,6 +170,8 @@ pub(crate) struct ResidentState {
     e3a_next_challenge_generation: u64,
     #[cfg(feature = "dw1e3-selector31")]
     e3a_terminal_claimed: bool,
+    #[cfg(feature = "dw1e3-selector31")]
+    e3a_u2_probe_reaped_successfully: bool,
     #[cfg(feature = "wyr1c6-selector29")]
     c6_gate_config: crate::wyr1c6_gate::GateConfig,
     #[cfg(feature = "wyr1c6-selector29")]
@@ -477,6 +479,8 @@ where
         e3a_next_challenge_generation: E3A_CHALLENGE_GENERATION,
         #[cfg(feature = "dw1e3-selector31")]
         e3a_terminal_claimed: false,
+        #[cfg(feature = "dw1e3-selector31")]
+        e3a_u2_probe_reaped_successfully: false,
         #[cfg(feature = "wyr1c6-selector29")]
         c6_gate_config,
         #[cfg(feature = "wyr1c6-selector29")]
@@ -2101,6 +2105,7 @@ where
             state.e3a_stage1_ready = false;
             state.e3a_peer_closed = false;
             state.e3a_finalize_retire_sent = false;
+            state.e3a_u2_probe_reaped_successfully = false;
             Ok(())
         }
         Err(error) => {
@@ -2177,7 +2182,14 @@ fn maybe_begin_e3a_retire<S: InitPlatform>(
     resident: &mut ResidentSystemInit,
     system: &mut S,
 ) -> Result<(), InitError> {
-    let (devmgr, binding, response_committed, transport_empty, already_sent) = {
+    let (
+        devmgr,
+        binding,
+        response_committed,
+        transport_empty,
+        already_sent,
+        u2_probe_reaped_successfully,
+    ) = {
         let state = resident
             .wyr1c
             .as_ref()
@@ -2188,12 +2200,19 @@ fn maybe_begin_e3a_retire<S: InitPlatform>(
             state.e3a_response_committed,
             state.e3a_transport_empty,
             state.e3a_begin_retire_sent,
+            state.e3a_u2_probe_reaped_successfully,
         )
     };
     if !response_committed || transport_empty.is_none() {
         return Ok(());
     }
     if binding.challenge_generation == 2 {
+        if !u2_probe_reaped_successfully {
+            // A TEMT wake can win the resident poll before a simultaneously
+            // queued nonzero probe exit.  The exact normal-zero reap is a
+            // controller-side causal join, not merely cleanup.
+            return Ok(());
+        }
         let terminal_claimed = resident
             .wyr1c
             .as_ref()
@@ -2359,8 +2378,8 @@ where
         .ok_or(InitError::Accounting)?;
     // Closing only the controller endpoint asks the probe to take its normal
     // parent-peer-close exit. It has already supplied its close proof.
-    let mut failed = system.close_handle(probe.loaded.launch_channel).is_err();
-    let exited = matches!(
+    let mut cleanup_failed = system.close_handle(probe.loaded.launch_channel).is_err();
+    let observed_exit = matches!(
         waits.wait_many(
             core::slice::from_ref(&DwWaitItemV1 {
                 handle: probe.loaded.process,
@@ -2373,8 +2392,8 @@ where
         waits.query_task_termination(probe.loaded.process),
         Ok(info) if info.state == DW_TASK_STATE_EXITED
     );
-    if !exited {
-        failed |= system.terminate_task_group(probe.task_group).is_err();
+    if !observed_exit {
+        cleanup_failed |= system.terminate_task_group(probe.task_group).is_err();
         let fallback_deadline = system
             .now()
             .ok()
@@ -2388,15 +2407,17 @@ where
                 DwDeadline(fallback_deadline),
             );
         } else {
-            failed = true;
+            cleanup_failed = true;
         }
     }
-    failed |= !matches!(
+    cleanup_failed |= !matches!(
         waits.query_task_termination(probe.loaded.process),
-        Ok(info) if info.state == DW_TASK_STATE_EXITED
+        Ok(info)
+            if info.state == DW_TASK_STATE_EXITED
+                && (!admit_u2 || wyrmroot_runtime::validate_successful_exit(&info).is_ok())
     );
     for handle in [probe.loaded.process, probe.task_group] {
-        failed |= system.close_handle(handle).is_err();
+        cleanup_failed |= system.close_handle(handle).is_err();
     }
     if let Some(state) = resident.wyr1c.as_mut() {
         let retired_generation = state
@@ -2411,6 +2432,7 @@ where
         state.e3a_stage1_ready = false;
         state.e3a_peer_closed = false;
         state.e3a_finalize_retire_sent = false;
+        state.e3a_u2_probe_reaped_successfully = false;
         if !admit_u2 {
             // Any unexpected probe loss poisons the selector lifecycle.  A
             // later event must not recycle the retained identity into U2.
@@ -2419,7 +2441,7 @@ where
             state.e3a_next_challenge_generation = 2;
         }
     }
-    if failed {
+    if cleanup_failed {
         Err(InitError::Cleanup)
     } else {
         Ok(())
@@ -2461,8 +2483,8 @@ where
         .map_err(InitError::Native)?
         .checked_add(WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns)
         .ok_or(InitError::Accounting)?;
-    let mut failed = system.close_handle(probe.loaded.launch_channel).is_err();
-    let exited = matches!(
+    let mut cleanup_failed = system.close_handle(probe.loaded.launch_channel).is_err();
+    let observed_exit = matches!(
         waits.wait_many(
             core::slice::from_ref(&DwWaitItemV1 {
                 handle: probe.loaded.process,
@@ -2471,21 +2493,55 @@ where
             DwDeadline(deadline),
         ),
         Ok(result) if result.index == 0 && result.observed.0 & DW_SIGNAL_EXITED.0 != 0
-    ) && matches!(
-        waits.query_task_termination(probe.loaded.process),
-        Ok(exit) if wyrmroot_runtime::validate_successful_exit(&exit).is_ok()
     );
-    if !exited {
-        failed |= system.terminate_task_group(probe.task_group).is_err();
-    }
-    for handle in [probe.loaded.process, probe.task_group] {
-        failed |= system.close_handle(handle).is_err();
-    }
-    if failed {
-        Err(InitError::Cleanup)
+    let terminal_result = if observed_exit {
+        match waits.query_task_termination(probe.loaded.process) {
+            Ok(exit) => wyrmroot_runtime::validate_successful_exit(&exit)
+                .map_err(|_| InitError::WrongManifestProfile),
+            Err(error) => Err(InitError::Native(error)),
+        }
     } else {
-        Ok(())
+        // No exit by the bounded deadline is a selector failure.  Terminate
+        // only in this timeout-cleanup case, then wait/requery so every owned
+        // handle is reconciled before returning the original failure.
+        cleanup_failed |= system.terminate_task_group(probe.task_group).is_err();
+        let fallback_deadline = system
+            .now()
+            .ok()
+            .and_then(|now| now.checked_add(WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns));
+        if let Some(fallback_deadline) = fallback_deadline {
+            let _ = waits.wait_many(
+                core::slice::from_ref(&DwWaitItemV1 {
+                    handle: probe.loaded.process,
+                    signals: DW_SIGNAL_EXITED,
+                }),
+                DwDeadline(fallback_deadline),
+            );
+            // A late record is inspected but cannot turn the original
+            // timeout into an admissible U2 terminal path.
+            let _ = waits
+                .query_task_termination(probe.loaded.process)
+                .map(|exit| wyrmroot_runtime::validate_successful_exit(&exit));
+        } else {
+            cleanup_failed = true;
+        }
+        Err(InitError::Supervision)
+    };
+    for handle in [probe.loaded.process, probe.task_group] {
+        cleanup_failed |= system.close_handle(handle).is_err();
     }
+    if cleanup_failed {
+        return Err(InitError::Cleanup);
+    }
+    terminal_result?;
+    resident
+        .wyr1c
+        .as_mut()
+        .ok_or(InitError::WrongActivationOrder)?
+        .e3a_u2_probe_reaped_successfully = true;
+    // TEMT may already be present when the exit is observed. Re-run the
+    // controller join only after this exact normal-zero reap has committed.
+    maybe_begin_e3a_retire(resident, system)
 }
 
 #[cfg(feature = "dw1e3-selector31")]
@@ -2497,6 +2553,90 @@ fn e3a_u2_probe_may_exit(resident: &ResidentSystemInit) -> bool {
             && state.e3a_response_committed
             && !state.e3a_terminal_claimed
     })
+}
+
+#[cfg(feature = "dw1e3-selector31")]
+fn poison_e3a_lifecycle(resident: &mut ResidentSystemInit) {
+    if let Some(state) = resident.wyr1c.as_mut() {
+        state.e3a_next_challenge_generation = 0;
+        state.e3a_stream_generation = None;
+        state.e3a_binding = None;
+        state.e3a_response_committed = false;
+        state.e3a_transport_empty = None;
+        state.e3a_begin_retire_sent = false;
+        state.e3a_stage1_ready = false;
+        state.e3a_peer_closed = false;
+        state.e3a_finalize_retire_sent = false;
+        state.e3a_u2_probe_reaped_successfully = false;
+    }
+}
+
+#[cfg(feature = "dw1e3-selector31")]
+fn fail_e3a_u2_probe_exit<S, W>(
+    resident: &mut ResidentSystemInit,
+    system: &mut S,
+    waits: &mut W,
+    error: InitError,
+) -> Result<(), InitError>
+where
+    S: InitPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    poison_e3a_lifecycle(resident);
+    let driver_cleanup = if resident
+        .wyr1c
+        .as_ref()
+        .is_some_and(|state| state.driver.is_some())
+    {
+        reap_driver(resident, system, waits, true).map(|_| ())
+    } else {
+        Ok(())
+    };
+    if driver_cleanup.is_err() {
+        Err(InitError::Cleanup)
+    } else {
+        Err(error)
+    }
+}
+
+/// A devmgr or registry recovery cannot inherit an in-flight selector probe.
+/// Consume its exact owners first and poison all selector correlations so a
+/// delayed report cannot advance Q1/Q2 or make a terminal claim.
+#[cfg(feature = "dw1e3-selector31")]
+fn fail_closed_e3a_recovery<S, W>(
+    resident: &mut ResidentSystemInit,
+    system: &mut S,
+    waits: &mut W,
+) -> Result<(), InitError>
+where
+    S: InitPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let active = resident.wyr1c.as_ref().is_some_and(|state| {
+        state.e3a_probe.is_some()
+            || state.e3a_binding.is_some()
+            || state.e3a_stream_generation.is_some()
+    });
+    if !active {
+        return Ok(());
+    }
+    let probe_cleanup = reap_e3a_probe(resident, system, waits, false);
+    let driver_cleanup = if resident
+        .wyr1c
+        .as_ref()
+        .is_some_and(|state| state.driver.is_some())
+    {
+        reap_driver(resident, system, waits, true).map(|_| ())
+    } else {
+        Ok(())
+    };
+    poison_e3a_lifecycle(resident);
+    resident.result = RecoveryResult::Degraded;
+    if probe_cleanup.is_err() || driver_cleanup.is_err() {
+        Err(InitError::Cleanup)
+    } else {
+        Err(InitError::WrongManifestProfile)
+    }
 }
 
 /// A probe channel close or process exit is never a normal lifecycle edge.
@@ -2944,7 +3084,12 @@ where
                         #[cfg(feature = "dw1e3-selector31")]
                         ResidentPollEvent::ProbeControlLost => {
                             if e3a_u2_probe_may_exit(resident) {
-                                reap_e3a_u2_probe_after_response(resident, system, waits)
+                                match reap_e3a_u2_probe_after_response(resident, system, waits) {
+                                    Ok(()) => Ok(()),
+                                    Err(error) => {
+                                        fail_e3a_u2_probe_exit(resident, system, waits, error)
+                                    }
+                                }
                             } else {
                                 fail_e3a_probe_supervision(resident, system, waits, false)
                             }
@@ -2952,7 +3097,12 @@ where
                         #[cfg(feature = "dw1e3-selector31")]
                         ResidentPollEvent::ProbeExited => {
                             if e3a_u2_probe_may_exit(resident) {
-                                reap_e3a_u2_probe_after_response(resident, system, waits)
+                                match reap_e3a_u2_probe_after_response(resident, system, waits) {
+                                    Ok(()) => Ok(()),
+                                    Err(error) => {
+                                        fail_e3a_u2_probe_exit(resident, system, waits, error)
+                                    }
+                                }
                             } else {
                                 fail_e3a_probe_supervision(resident, system, waits, true)
                             }
@@ -2978,6 +3128,8 @@ where
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
+    #[cfg(feature = "dw1e3-selector31")]
+    fail_closed_e3a_recovery(resident, system, waits)?;
     let registry = resident
         .wyr1c
         .as_mut()
@@ -3144,6 +3296,8 @@ where
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
+    #[cfg(feature = "dw1e3-selector31")]
+    fail_closed_e3a_recovery(resident, system, waits)?;
     #[cfg(feature = "wyr1c6-selector29")]
     let restarting_d1 = {
         let state = resident

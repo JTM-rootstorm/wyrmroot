@@ -15,10 +15,12 @@ The Wyrmroot product model now requires the following causal order:
 
 1. U1 completes challenge 1, then makes its final FIFO fill and successfully
    acknowledges its exact Interrupt.
-2. Before TEMT polling, the driver performs one fresh receive-side probe of
-   the raw stream. Only a clean `WOULD_BLOCK`/peer-close result proves that
-   no extra WRST DATA record is queued behind the exact response; any such
-   record fails the selector before stream retirement.
+2. Before TEMT polling, the driver performs a fresh receive-side drain of the
+   raw stream. It continues through any legal zero-length WRST DATA records
+   and accepts only a subsequent clean `WOULD_BLOCK`/peer-close result as
+   proof that no extra record is queued behind the exact response; any
+   nonempty/handle-bearing/malformed record fails the selector before stream
+   retirement.
 3. Only after those facts, a bounded timer-paced UART `LSR.TEMT` poll
    waits for the first exact `TEMT=1` to establish the U1 transport-empty
    barrier. A `TEMT=0` result retains the barrier state; exhausting the fixed
@@ -59,14 +61,20 @@ The Wyrmroot product model now requires the following causal order:
    normal lifecycle classification.
    The intentional U2 probe exit after `ResponseCommitted` is separately
    reaped with an exact successful-exit check while retaining the U2
-   binding/TEMT join for the controller terminal claim.
+   binding/TEMT join for the controller terminal claim. A timeout or nonzero
+   exit remains a failed supervision event even if bounded cleanup later
+   observes termination. Devmgr/registry recovery while either selector leg is
+   active likewise reaps the retained probe and driver, poisons all E3B
+   correlations, and cannot resume a stale Q1/Q2 lifecycle.
 8. U2, P2, and its raw stream identity must each differ from U1/P1. Only then
    can the existing action 1 bind U2 and action 3 arm the fresh nonce-bound
    challenge 2.
 9. Challenge 2 has its own acknowledged final-FIFO/TEMT proof. Only after
-   joining U2 response plus that fact does system-init make the controller-only
-   existing action-4 terminal claim (`E=0xff,V=0,X=0`). The kernel then owns
-   saved-U1 replay rejection, accounting, and terminal records.
+   joining U2 response, that fact, and the separately observed exact normal
+   U2 probe reap does system-init make the controller-only existing action-4
+   terminal claim (`E=0xff,V=0,X=0`). This prevents a TEMT wake from winning a
+   raced nonzero probe exit. The kernel then owns saved-U1 replay rejection,
+   accounting, and terminal records.
 
 The fixed private kernel interface stays four actions: action 1 binds U1/U2,
 action 2 binds the one current probe reporter, action 3 arms either challenge,

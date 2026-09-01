@@ -206,6 +206,8 @@ fn selector31_supervises_probe_channel_and_process_failure_without_advancement()
         "fn fail_e3a_probe_supervision",
         "fn reap_e3a_u2_probe_after_response",
         "fn e3a_u2_probe_may_exit",
+        "fn fail_e3a_u2_probe_exit",
+        "fn fail_closed_e3a_recovery",
         "validate_successful_exit(&exit)",
         "reap_e3a_probe(resident, system, waits, false)",
         "reap_driver(resident, system, waits, true)",
@@ -235,6 +237,54 @@ fn selector31_supervises_probe_channel_and_process_failure_without_advancement()
 }
 
 #[test]
+fn selector31_reaps_only_exact_normal_u1_or_u2_probe_exits() {
+    let u1_reap = NATIVE_SOURCE.find("fn reap_e3a_probe").unwrap();
+    let u1_body = &NATIVE_SOURCE[u1_reap..];
+    assert!(
+        u1_body.contains("!admit_u2 || wyrmroot_runtime::validate_successful_exit(&info).is_ok()")
+    );
+
+    let u2_reap = NATIVE_SOURCE
+        .find("fn reap_e3a_u2_probe_after_response")
+        .unwrap();
+    let u2_body = &NATIVE_SOURCE[u2_reap..];
+    assert!(u2_body.contains("validate_successful_exit(&exit)"));
+    assert!(u2_body.contains("if observed_exit"));
+    assert!(u2_body.contains("terminate_task_group(probe.task_group)"));
+    assert!(u2_body.contains("Err(InitError::Supervision)"));
+    assert!(u2_body.contains("e3a_u2_probe_reaped_successfully = true"));
+    assert!(u2_body.contains("maybe_begin_e3a_retire(resident, system)"));
+    let nonzero = u2_body.find("validate_successful_exit(&exit)").unwrap();
+    let terminate = u2_body
+        .find("terminate_task_group(probe.task_group)")
+        .unwrap();
+    assert!(nonzero < terminate);
+}
+
+#[test]
+fn selector31_devmgr_or_registry_loss_poison_active_q1_and_q2_before_recovery() {
+    let cleanup = NATIVE_SOURCE.find("fn fail_closed_e3a_recovery").unwrap();
+    let body = &NATIVE_SOURCE[cleanup..];
+    for required in [
+        "reap_e3a_probe(resident, system, waits, false)",
+        "reap_driver(resident, system, waits, true)",
+        "poison_e3a_lifecycle(resident)",
+        "resident.result = RecoveryResult::Degraded;",
+    ] {
+        assert!(body.contains(required), "missing {required}");
+    }
+    assert!(NATIVE_SOURCE.contains("state.e3a_next_challenge_generation = 0;"));
+    let registry = NATIVE_SOURCE.find("fn recover_registry").unwrap();
+    let devmgr = NATIVE_SOURCE.find("fn recover_devmgr").unwrap();
+    assert!(
+        NATIVE_SOURCE[registry..].contains("fail_closed_e3a_recovery(resident, system, waits)?;")
+    );
+    assert!(
+        NATIVE_SOURCE[devmgr..].contains("fail_closed_e3a_recovery(resident, system, waits)?;")
+    );
+}
+
+#[test]
 fn selector31_drains_queued_u2_response_before_a_combined_peer_close_is_classified() {
     let classifier = NATIVE_SOURCE.find("fn classify_resident_poll").unwrap();
     let readable = NATIVE_SOURCE[classifier..]
@@ -257,7 +307,7 @@ fn selector31_drains_queued_u2_response_before_a_combined_peer_close_is_classifi
 }
 
 #[test]
-fn selector31_u2_temt_join_is_the_only_terminal_claim_path() {
+fn selector31_u2_temt_and_normal_probe_reap_join_before_the_only_terminal_claim_path() {
     let terminal = NATIVE_SOURCE
         .find("dw1e3_terminal_claim(binding.nonce)")
         .unwrap();
@@ -267,5 +317,8 @@ fn selector31_u2_temt_join_is_the_only_terminal_claim_path() {
     let response = NATIVE_SOURCE[..terminal]
         .rfind("if !response_committed || transport_empty.is_none()")
         .unwrap();
-    assert!(response < join && join < terminal);
+    let u2_reaped = NATIVE_SOURCE[..terminal]
+        .rfind("if !u2_probe_reaped_successfully")
+        .unwrap();
+    assert!(response < u2_reaped && u2_reaped < join && join < terminal);
 }

@@ -105,7 +105,9 @@ fn selector31_rechecks_stream_input_after_final_ack_before_temt() {
         + post_ack;
     assert!(post_ack < temt);
     let proof = &DRIVER[input_proof..];
-    assert!(proof.contains("Ok(StreamReadOutcome::WouldBlock) => Ok(())"));
+    assert!(proof.contains("loop {"));
+    assert!(proof.contains("Ok(StreamReadOutcome::WouldBlock) => return Ok(())"));
+    assert!(proof.contains("Ok(StreamReadOutcome::EmptyData) => continue"));
     assert!(proof.contains("StreamReadOutcome::Accepted | StreamReadOutcome::Detached"));
 }
 
@@ -117,6 +119,27 @@ fn selector31_zero_length_stream_data_is_a_noop_but_not_post_response_data() {
     assert!(body.contains("if bytes.is_empty()"));
     assert!(body.contains("return Ok(());"));
     assert!(body.contains("self.response_bytes == expected.len()"));
+    let receive = DRIVER.find("fn service_stream_read").unwrap();
+    let receive_body = &DRIVER[receive..];
+    assert!(receive_body.contains("return Ok(StreamReadOutcome::EmptyData);"));
+}
+
+#[test]
+fn selector31_queue_proof_drains_one_or_many_empty_records_but_rejects_nonempty_data() {
+    let proof = DRIVER.find("fn selector_response_input_drained").unwrap();
+    let body = &DRIVER[proof..];
+    let empty = body
+        .find("Ok(StreamReadOutcome::EmptyData) => continue")
+        .unwrap();
+    let clear = body
+        .find("Ok(StreamReadOutcome::WouldBlock) => return Ok(())")
+        .unwrap();
+    let reject = body
+        .find("StreamReadOutcome::Accepted | StreamReadOutcome::Detached")
+        .unwrap();
+    // The clean observation is the only return-success arm; empty records
+    // loop back into the same receive proof and nonempty records fail.
+    assert!(clear < empty && empty < reject);
 }
 
 #[test]

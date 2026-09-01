@@ -93,6 +93,7 @@ pub struct Selector31Lifecycle {
     temt_polls: u8,
     challenge2_transport_empty_armed: bool,
     challenge2_temt_polls: u8,
+    u2_probe_reaped_successfully: bool,
     queued_data_observed: bool,
     u1_driver_endpoint_released: bool,
     u1_client_endpoint_released: bool,
@@ -113,6 +114,7 @@ impl Selector31Lifecycle {
             temt_polls: 0,
             challenge2_transport_empty_armed: false,
             challenge2_temt_polls: 0,
+            u2_probe_reaped_successfully: false,
             queued_data_observed: false,
             u1_driver_endpoint_released: false,
             u1_client_endpoint_released: false,
@@ -265,6 +267,7 @@ impl Selector31Lifecycle {
         }
         self.u2 = Some(u2);
         self.u2_probe = Some(u2_probe);
+        self.u2_probe_reaped_successfully = false;
         self.state = LifecycleState::Challenge2Active;
         Ok(())
     }
@@ -324,13 +327,38 @@ impl Selector31Lifecycle {
         Ok(())
     }
 
+    /// The U2 reporter may leave only after committing its response. Its
+    /// exact normal-zero reap is a distinct controller join: a TEMT wake
+    /// must not claim the terminal while a raced nonzero probe exit remains
+    /// unclassified.
+    pub fn u2_probe_reaped(
+        &mut self,
+        probe: ProbeIdentity,
+        successful_exit_record: bool,
+    ) -> Result<(), LifecycleError> {
+        if !successful_exit_record
+            || self.u2_probe != Some(probe)
+            || !matches!(
+                self.state,
+                LifecycleState::Challenge2Responded | LifecycleState::Challenge2TransportEmpty
+            )
+        {
+            return Err(LifecycleError::WrongOrder);
+        }
+        self.u2_probe_reaped_successfully = true;
+        Ok(())
+    }
+
     /// Represents only the controller's existing action-4 terminal claim.
     /// The probe cannot make this transition and there is no fifth action.
     pub fn controller_terminal_claim(
         &mut self,
         identity: DriverIdentity,
     ) -> Result<(), LifecycleError> {
-        if self.state != LifecycleState::Challenge2TransportEmpty || self.u2 != Some(identity) {
+        if self.state != LifecycleState::Challenge2TransportEmpty
+            || self.u2 != Some(identity)
+            || !self.u2_probe_reaped_successfully
+        {
             return Err(LifecycleError::WrongOrder);
         }
         self.state = LifecycleState::TerminalClaimed;
@@ -1316,6 +1344,18 @@ mod tests {
         lifecycle
             .timer_paced_challenge2_temt_poll(u2, true)
             .unwrap();
+        assert_eq!(
+            lifecycle.controller_terminal_claim(u2),
+            Err(LifecycleError::WrongOrder)
+        );
+        lifecycle
+            .u2_probe_reaped(
+                ProbeIdentity {
+                    process_generation: 42,
+                },
+                true,
+            )
+            .unwrap();
         lifecycle.controller_terminal_claim(u2).unwrap();
         lifecycle.observe_kernel_stale_u1_rejection(u1).unwrap();
         lifecycle.finish().unwrap();
@@ -1468,6 +1508,60 @@ mod tests {
         assert_eq!(
             lifecycle.timer_paced_challenge2_temt_poll(u2, false),
             Err(LifecycleError::BarrierTimedOut)
+        );
+    }
+
+    #[test]
+    fn u2_nonzero_exit_cannot_claim_after_a_prior_temt_wake() {
+        let u1 = DriverIdentity {
+            attempt_generation: 1,
+            publication_generation: 2,
+            stream_generation: 3,
+            challenge_generation: 1,
+        };
+        let u2 = DriverIdentity {
+            attempt_generation: 4,
+            publication_generation: 5,
+            stream_generation: 6,
+            challenge_generation: 2,
+        };
+        let probe1 = ProbeIdentity {
+            process_generation: 7,
+        };
+        let probe2 = ProbeIdentity {
+            process_generation: 8,
+        };
+        let mut lifecycle = Selector31Lifecycle::new(u1, probe1).unwrap();
+        lifecycle.challenge1_responded().unwrap();
+        lifecycle.begin_transport_empty_barrier(true, true).unwrap();
+        lifecycle.timer_paced_temt_poll(true).unwrap();
+        lifecycle.queued_data_before_peer_close().unwrap();
+        lifecycle.u1_peer_closed().unwrap();
+        lifecycle.u1_reaped().unwrap();
+        lifecycle.u1_endpoint_released(true).unwrap();
+        lifecycle.u1_endpoint_released(false).unwrap();
+        lifecycle.u1_probe_reaped(probe1).unwrap();
+        lifecycle.admit_u2(u2, probe2).unwrap();
+        lifecycle.challenge2_responded().unwrap();
+        lifecycle
+            .begin_challenge2_transport_empty_barrier(u2, true, true)
+            .unwrap();
+        // Model the TEMT branch winning the resident poll before the queued
+        // U2 process EXITED signal is classified.
+        lifecycle
+            .timer_paced_challenge2_temt_poll(u2, true)
+            .unwrap();
+        assert_eq!(
+            lifecycle.controller_terminal_claim(u2),
+            Err(LifecycleError::WrongOrder)
+        );
+        assert_eq!(
+            lifecycle.u2_probe_reaped(probe2, false),
+            Err(LifecycleError::WrongOrder)
+        );
+        assert_eq!(
+            lifecycle.controller_terminal_claim(u2),
+            Err(LifecycleError::WrongOrder)
         );
     }
 }
