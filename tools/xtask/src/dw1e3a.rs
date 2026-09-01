@@ -67,13 +67,13 @@ pub(crate) fn build_product_snapshot(nonce: &str) -> Result<crate::wyr1c::E3ASna
     crate::wyr1c::build_e3a_snapshot(nonce)
 }
 
-struct ProducedArtifacts {
-    directory: PathBuf,
-    deep_revision: String,
-    abi_revision: String,
-    abi_tree: String,
-    wyrmroot_revision: String,
-    rust_revision: String,
+pub(crate) struct ProducedArtifacts {
+    pub(crate) directory: PathBuf,
+    pub(crate) deep_revision: String,
+    pub(crate) abi_revision: String,
+    pub(crate) abi_tree: String,
+    pub(crate) wyrmroot_revision: String,
+    pub(crate) rust_revision: String,
 }
 
 /// Builds and freezes the complete selector-31 E3A handoff without starting
@@ -144,7 +144,7 @@ pub(crate) fn prepare(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_produced_artifacts(
+pub(crate) fn build_produced_artifacts(
     staging: &Path,
     repository: &Path,
     deep_repository: &Path,
@@ -916,7 +916,7 @@ fn freeze_produced(
     ))
 }
 
-fn build_esp(output: &Path, values: &BTreeMap<String, String>) -> Result<(), Failure> {
+pub(crate) fn build_esp(output: &Path, values: &BTreeMap<String, String>) -> Result<(), Failure> {
     let frozen = output.join("artifacts");
     let arguments = G3ImageArguments {
         image: frozen.join("selector31-esp.img").display().to_string(),
@@ -1098,7 +1098,7 @@ fn write_profile_pair(output: &Path, request_sha256: &str) -> Result<(), Failure
     )
 }
 
-fn domain_xml(vcpus: u8, code: &Path, esp: &Path, vars: &Path, com2: &Path) -> String {
+pub(crate) fn domain_xml(vcpus: u8, code: &Path, esp: &Path, vars: &Path, com2: &Path) -> String {
     format!(
         "<domain xmlns:qemu=\"http://libvirt.org/schemas/domain/qemu/1.0\" type=\"qemu\">\n  <name>OS-Project</name>\n  <uuid>{DOMAIN_UUID}</uuid>\n  <memory unit=\"KiB\">2097152</memory><currentMemory unit=\"KiB\">2097152</currentMemory><vcpu placement=\"static\">{vcpus}</vcpu>\n  <sysinfo type=\"fwcfg\"><entry name=\"opt/org.deepwyrm.test.selector\">{SELECTOR}</entry><entry name=\"opt/org.deepwyrm.test.test_id\">{TEST_ID}</entry></sysinfo>\n  <os><type arch=\"x86_64\" machine=\"{MACHINE}\">hvm</type><loader readonly=\"yes\" secure=\"no\" type=\"pflash\" format=\"raw\">{}</loader><nvram type=\"file\" format=\"raw\"><source file=\"{}\" fdgroup=\"{VARS_FD_GROUP}\"/></nvram><boot dev=\"hd\"/></os>\n  <features><acpi/><apic/></features><clock offset=\"utc\"><timer name=\"rtc\" tickpolicy=\"catchup\"/><timer name=\"pit\" tickpolicy=\"delay\"/><timer name=\"hpet\" present=\"no\"/></clock><on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>destroy</on_crash><pm><suspend-to-mem enabled=\"no\"/><suspend-to-disk enabled=\"no\"/></pm><devices><emulator>/usr/bin/qemu-system-x86_64</emulator><disk type=\"file\" device=\"disk\"><driver name=\"qemu\" type=\"raw\"/><source file=\"{}\" fdgroup=\"{ESP_FD_GROUP}\"/><target dev=\"vda\" bus=\"virtio\"/><readonly/></disk><controller type=\"pci\" index=\"0\" model=\"pcie-root\"/><serial type=\"pty\"><target type=\"isa-serial\" port=\"0\"/></serial><serial type=\"unix\"><source mode=\"connect\" path=\"{}\"/><target type=\"isa-serial\" port=\"1\"/></serial><console type=\"pty\"><target type=\"serial\" port=\"0\"/></console></devices>\n  <qemu:commandline><qemu:arg value=\"-device\"/><qemu:arg value=\"isa-debug-exit,iobase=0xf4,iosize=0x04\"/></qemu:commandline>\n</domain>\n",
         xml_escape(code),
@@ -1118,7 +1118,7 @@ fn xml_escape(path: &Path) -> String {
         .replace('\'', "&apos;")
 }
 
-fn challenge_pair(nonce: &str) -> Result<([u8; 24], [u8; 24]), Failure> {
+pub(crate) fn challenge_pair(nonce: &str) -> Result<([u8; 24], [u8; 24]), Failure> {
     wyr1c6::validate_upper_hex_nonzero(nonce, 16, "DW1-E3A evidence nonce")?;
     let number = u64::from_str_radix(nonce, 16)
         .map_err(|_| Failure::task("DW1-E3A evidence nonce is invalid"))?;
@@ -1133,7 +1133,7 @@ fn challenge_pair(nonce: &str) -> Result<([u8; 24], [u8; 24]), Failure> {
     Ok((challenge, response))
 }
 
-fn upper_hex(bytes: &[u8]) -> String {
+pub(crate) fn upper_hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789ABCDEF";
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -1143,7 +1143,7 @@ fn upper_hex(bytes: &[u8]) -> String {
     output
 }
 
-const fn fnv1a64(bytes: &[u8]) -> u64 {
+pub(crate) const fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325;
     let mut index = 0;
     while index < bytes.len() {
@@ -1154,7 +1154,7 @@ const fn fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
-fn artifact_maximum(key: &str) -> u64 {
+pub(crate) fn artifact_maximum(key: &str) -> u64 {
     if matches!(key, "ovmf_code" | "ovmf_vars") {
         wyr1c6::MAX_FIRMWARE_BYTES
     } else if key == "bootfs" {
@@ -1164,7 +1164,7 @@ fn artifact_maximum(key: &str) -> u64 {
     }
 }
 
-fn reject_selector_environment() -> Result<(), Failure> {
+pub(crate) fn reject_selector_environment() -> Result<(), Failure> {
     for key in [
         "DEEPWYRM_GUEST_TEST_SELECTOR",
         "DEEPWYRM_GUEST_TEST_ID",

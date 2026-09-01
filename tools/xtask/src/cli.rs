@@ -46,6 +46,7 @@ Usage:
     cargo xtask dw1c inspect --request <dw1-c-request.toml>
     tools/pinned-cargo xtask dw1d6 freeze --output <fresh-directory> --deep-repository <path> --deep-revision <40-hex> --evidence-nonce <16-hex> --evidence-challenge <16-hex>
     tools/pinned-cargo xtask dw1-e3a-prepare <fresh-directory> <deepwyrm-repository> <deepwyrm-revision> <16-hex-nonce>
+    tools/pinned-cargo xtask dw1-e3b-prepare <fresh-directory> <deepwyrm-repository> <deepwyrm-revision> <16-hex-evidence-nonce> <16-hex-challenge-1-nonce> <16-hex-challenge-2-nonce>
 
 Host filters may name a component (bootfs, protocol, elf, runtime, bootstrap,
 efi, init0, hello, xtask, dw1c-init0, or dw1d6), package:<workspace-package>,
@@ -197,6 +198,14 @@ pub(crate) enum Action {
         deep_revision: String,
         nonce: String,
     },
+    Dw1E3BPrepare {
+        output: String,
+        deep_repository: String,
+        deep_revision: String,
+        evidence_nonce: String,
+        challenge_1_nonce: String,
+        challenge_2_nonce: String,
+    },
     Unavailable(&'static str),
 }
 
@@ -251,6 +260,7 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
         "dw1c" => dispatch_dw1c(&arguments[1..]),
         "dw1d6" => dispatch_dw1d6(&arguments[1..]),
         "dw1-e3a-prepare" => dispatch_dw1e3a_prepare(&arguments[1..]),
+        "dw1-e3b-prepare" => dispatch_dw1e3b_prepare(&arguments[1..]),
         unknown => Err(Failure::usage(format!(
             "unknown command '{unknown}'\n\n{USAGE}"
         ))),
@@ -267,6 +277,29 @@ fn dispatch_dw1e3a_prepare(arguments: &[String]) -> Result<Action, Failure> {
         }),
         _ => Err(Failure::usage(
             "dw1-e3a-prepare requires <fresh-directory> <deepwyrm-repository> <deepwyrm-revision> <16-hex-nonce>",
+        )),
+    }
+}
+
+fn dispatch_dw1e3b_prepare(arguments: &[String]) -> Result<Action, Failure> {
+    match arguments {
+        [
+            output,
+            deep_repository,
+            deep_revision,
+            evidence_nonce,
+            challenge_1_nonce,
+            challenge_2_nonce,
+        ] => Ok(Action::Dw1E3BPrepare {
+            output: output.clone(),
+            deep_repository: deep_repository.clone(),
+            deep_revision: deep_revision.clone(),
+            evidence_nonce: evidence_nonce.clone(),
+            challenge_1_nonce: challenge_1_nonce.clone(),
+            challenge_2_nonce: challenge_2_nonce.clone(),
+        }),
+        _ => Err(Failure::usage(
+            "dw1-e3b-prepare requires <fresh-directory> <deepwyrm-repository> <deepwyrm-revision> <16-hex-evidence-nonce> <16-hex-challenge-1-nonce> <16-hex-challenge-2-nonce>",
         )),
     }
 }

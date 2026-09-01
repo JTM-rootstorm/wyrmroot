@@ -4,6 +4,7 @@ mod dw1b;
 mod dw1c;
 mod dw1d6;
 mod dw1e3a;
+mod dw1e3b;
 mod elf_runtime;
 mod error;
 mod g3_image;
@@ -227,6 +228,22 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
             std::path::Path::new(&deep_repository),
             &deep_revision,
             &nonce,
+        )
+        .map(Some),
+        Action::Dw1E3BPrepare {
+            output,
+            deep_repository,
+            deep_revision,
+            evidence_nonce,
+            challenge_1_nonce,
+            challenge_2_nonce,
+        } => dw1e3b::prepare(
+            std::path::Path::new(&output),
+            std::path::Path::new(&deep_repository),
+            &deep_revision,
+            &evidence_nonce,
+            &challenge_1_nonce,
+            &challenge_2_nonce,
         )
         .map(Some),
         Action::Unavailable(command) => Err(Failure::unavailable(command)),
