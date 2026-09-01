@@ -10,6 +10,8 @@ use deepwyrm_syscall::{
     DW_STATUS_PEER_CLOSED, DW_STATUS_TIMED_OUT, DW_STATUS_WOULD_BLOCK, DwDeadline, DwHandle,
     DwReceivedHandleInfoV1, DwSignals, DwWaitItemV1,
 };
+#[cfg(feature = "dw1e3-selector31")]
+use deepwyrm_syscall::{DW_RIGHT_INSPECT, DW_RIGHT_MODIFY, DW_RIGHT_WAIT, DwRights};
 use wyrmroot_device_proto::control::ControlEndpoint;
 use wyrmroot_device_proto::control_v1_1::{
     ControlIdentityV1_1, ControlMessageV1_1, DEVICE_QUIESCED_BYTES, DEVICE_STAGE_BYTES,
@@ -20,7 +22,11 @@ use wyrmroot_device_proto::coordinator::{
 };
 use wyrmroot_device_proto::manifest::RoleId;
 #[cfg(feature = "dw1e3-selector31")]
-use wyrmroot_dw1e3_com2_test::{CHALLENGE_BYTES, challenge, fnv1a64};
+use wyrmroot_dw1e3_com2_test::{
+    CHALLENGE_BYTES, CHALLENGE_GENERATION, ChallengeBinding, TRANSPORT_EMPTY_TEMT_MAX_POLLS,
+    TransportEmptyFact, challenge, encode_binding_ready, encode_transport_empty_fact, fnv1a64,
+    parse_begin_retire, parse_challenge_binding, parse_finalize_retire, response,
+};
 use wyrmroot_loader::launch::{
     CHILD_CHANNEL_RIGHTS, DEVICE_DRIVER_BYTES, SELF_ROOT_RIGHTS, parse_device_driver_init,
 };
@@ -30,8 +36,13 @@ use wyrmroot_runtime::{
     query_capability_info, receive_channel, send_channel, validate_bootstrap_channel, wait_many,
 };
 #[cfg(feature = "dw1e3-selector31")]
-use wyrmroot_runtime::{Dw1e3ReportEvent, dw1e3_bind_driver, dw1e3_build_nonce, dw1e3_report};
+use wyrmroot_runtime::{
+    Dw1e3ReportEvent, create_timer, dw1e3_bind_driver, dw1e3_build_nonce, dw1e3_challenge_nonce,
+    dw1e3_report, monotonic_active_now, set_timer, wait_one,
+};
 use wyrmroot_stream_proto::MAX_RECORD_BYTES;
+#[cfg(feature = "dw1e3-selector31")]
+use wyrmroot_stream_proto::decode_data;
 use wyrmroot_uart16550_core::ByteRegisterIo;
 use wyrmroot_uart16550d::{
     DeviceStage, PeerCloseDrain, ProductionDriver, ReceivedDeviceResource, ReceivedInterrupt,
@@ -288,18 +299,35 @@ fn run_event_loop<I: ByteRegisterIo>(
 ) -> Result<u32, u32> {
     let mut peer_close_drain = PeerCloseDrain::new();
     #[cfg(feature = "dw1e3-selector31")]
-    let mut evidence = EvidenceDrain::new(dw1e3_build_nonce().map_err(|_| 62u32)?);
+    let evidence_nonce = dw1e3_build_nonce().map_err(|_| 62u32)?;
+    #[cfg(feature = "dw1e3-selector31")]
+    let mut evidence = None;
+    #[cfg(feature = "dw1e3-selector31")]
+    let mut selector_retiring = false;
     loop {
         let mut items = [DwWaitItemV1::default(); 3];
         items[0] = DwWaitItemV1 {
             handle: control,
             signals: DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
         };
-        items[1] = DwWaitItemV1 {
-            handle: driver.interrupt().handle,
-            signals: DW_SIGNAL_SIGNALED,
-        };
+        #[cfg(not(feature = "dw1e3-selector31"))]
         let mut count = 2;
+        #[cfg(not(feature = "dw1e3-selector31"))]
+        {
+            items[1] = DwWaitItemV1 {
+                handle: driver.interrupt().handle,
+                signals: DW_SIGNAL_SIGNALED,
+            };
+        }
+        #[cfg(feature = "dw1e3-selector31")]
+        let mut count = if selector_retiring { 1 } else { 2 };
+        #[cfg(feature = "dw1e3-selector31")]
+        if !selector_retiring {
+            items[1] = DwWaitItemV1 {
+                handle: driver.interrupt().handle,
+                signals: DW_SIGNAL_SIGNALED,
+            };
+        }
         if let Some(stream) = driver.stream_endpoint() {
             let receive_capacity = driver.wants_stream_readable();
             if peer_close_drain.include_stream_wait(receive_capacity) {
@@ -341,6 +369,87 @@ fn run_event_loop<I: ByteRegisterIo>(
                 match service_control(driver, control) {
                     Ok(ControlOutcome::Continue) => continue,
                     Ok(ControlOutcome::Retire) => return graceful_shutdown(driver, control, 0),
+                    #[cfg(feature = "dw1e3-selector31")]
+                    Ok(ControlOutcome::ChallengeBinding(binding)) => {
+                        if evidence.is_some() {
+                            return fail_driver(driver, control, 77);
+                        }
+                        let (stream_generation, publication_generation) =
+                            driver.stream_generations().ok_or(78u32)?;
+                        if binding.nonce != evidence_nonce
+                            || binding.attempt_generation != driver.identity().attempt_generation.0
+                            || binding.publication_generation != publication_generation
+                            || binding.stream_generation != stream_generation
+                        {
+                            return fail_driver(driver, control, 79);
+                        }
+                        let challenge_nonce =
+                            match dw1e3_challenge_nonce(binding.challenge_generation) {
+                                Ok(nonce) => nonce,
+                                Err(_) => return fail_driver(driver, control, 80),
+                            };
+                        let candidate = EvidenceDrain::new(
+                            evidence_nonce,
+                            binding.challenge_generation,
+                            challenge_nonce,
+                        );
+                        if binding.expected_length != CHALLENGE_BYTES as u64
+                            || binding.expected_hash != candidate.expected_hash
+                        {
+                            return fail_driver(driver, control, 81);
+                        }
+                        evidence = Some(candidate);
+                        let mut ready = [0u8; wyrmroot_dw1e3_com2_test::TRANSPORT_EMPTY_FACT_BYTES];
+                        if encode_binding_ready(binding, &mut ready).is_err() {
+                            return fail_driver(driver, control, 83);
+                        }
+                        if send_channel(control, &ready, &[]).is_err() {
+                            return fail_driver(driver, control, 84);
+                        }
+                        continue;
+                    }
+                    #[cfg(feature = "dw1e3-selector31")]
+                    Ok(ControlOutcome::BeginRetire(binding)) => {
+                        let Some(evidence) = evidence.as_ref() else {
+                            return fail_driver(driver, control, 85);
+                        };
+                        if !same_binding(driver, evidence_nonce, evidence, binding) {
+                            return fail_driver(driver, control, 86);
+                        }
+                        if let Some((detached, endpoint)) = driver.begin_selector_retire() {
+                            let mut ready =
+                                [0u8; wyrmroot_dw1e3_com2_test::TRANSPORT_EMPTY_FACT_BYTES];
+                            if wyrmroot_dw1e3_com2_test::encode_retire_stage1_ready(
+                                binding, &mut ready,
+                            )
+                            .is_err()
+                            {
+                                return fail_driver(driver, control, 87);
+                            }
+                            if close_handle(endpoint.handle).is_err() {
+                                return fail_driver(driver, control, 88);
+                            }
+                            if send_channel(control, &ready, &[]).is_err() {
+                                return fail_driver(driver, control, 89);
+                            }
+                            let _ = detached;
+                            selector_retiring = true;
+                            continue;
+                        }
+                        return fail_driver(driver, control, 90);
+                    }
+                    #[cfg(feature = "dw1e3-selector31")]
+                    Ok(ControlOutcome::FinalizeRetire(binding)) => {
+                        let Some(evidence) = evidence.as_ref() else {
+                            return fail_driver(driver, control, 91);
+                        };
+                        if !selector_retiring
+                            || !same_binding(driver, evidence_nonce, evidence, binding)
+                        {
+                            return fail_driver(driver, control, 92);
+                        }
+                        return graceful_shutdown(driver, control, 0);
+                    }
                     Err(code) => return fail_driver(driver, control, code),
                 }
             }
@@ -361,6 +470,9 @@ fn run_event_loop<I: ByteRegisterIo>(
             {
                 let mut added = [0u8; CHALLENGE_BYTES];
                 let copied = driver.copy_rx_from(rx_before, &mut added);
+                let Some(evidence) = evidence.as_mut() else {
+                    return fail_driver(driver, control, 63);
+                };
                 if copied != usize::from(drained.work().received)
                     || evidence.record(&added[..copied]).is_err()
                 {
@@ -370,8 +482,23 @@ fn run_event_loop<I: ByteRegisterIo>(
             let acked = driver.acknowledge_interrupt(drained, !pio_failed.get(), |handle| {
                 interrupt_ack(handle).map_err(|_| ())
             });
-            if acked.is_err() {
-                return fail_driver(driver, control, 40);
+            let work = match acked {
+                Ok(work) => work,
+                Err(_) => return fail_driver(driver, control, 40),
+            };
+            #[cfg(feature = "dw1e3-selector31")]
+            if evidence
+                .as_ref()
+                .is_some_and(EvidenceDrain::response_reported)
+                && work.transmitted != 0
+                && driver.tx_free() == wyrmroot_uart16550_core::RING_CAPACITY
+            {
+                let Some(evidence) = evidence.as_mut() else {
+                    return fail_driver(driver, control, 82);
+                };
+                if let Err(code) = prove_transport_empty(driver, control, pio_failed, evidence) {
+                    return fail_driver(driver, control, code);
+                }
             }
             continue;
         }
@@ -384,7 +511,12 @@ fn run_event_loop<I: ByteRegisterIo>(
             }
             if peer_close_drain.is_pending() {
                 while driver.wants_stream_readable() {
-                    match service_stream_read(driver, control, pio_failed) {
+                    #[cfg(feature = "dw1e3-selector31")]
+                    let stream_result =
+                        service_stream_read(driver, control, pio_failed, &mut evidence);
+                    #[cfg(not(feature = "dw1e3-selector31"))]
+                    let stream_result = service_stream_read(driver, control, pio_failed);
+                    match stream_result {
                         Ok(StreamReadOutcome::Accepted) => {}
                         Ok(StreamReadOutcome::WouldBlock) => {
                             if isolate_stream(driver, control).is_err() {
@@ -403,7 +535,11 @@ fn run_event_loop<I: ByteRegisterIo>(
                 continue;
             }
             if readable {
-                match service_stream_read(driver, control, pio_failed) {
+                #[cfg(feature = "dw1e3-selector31")]
+                let stream_result = service_stream_read(driver, control, pio_failed, &mut evidence);
+                #[cfg(not(feature = "dw1e3-selector31"))]
+                let stream_result = service_stream_read(driver, control, pio_failed);
+                match stream_result {
                     Ok(StreamReadOutcome::Accepted | StreamReadOutcome::WouldBlock) => {}
                     Ok(StreamReadOutcome::Detached) => {
                         peer_close_drain.clear();
@@ -432,24 +568,32 @@ fn run_event_loop<I: ByteRegisterIo>(
 #[cfg(feature = "dw1e3-selector31")]
 struct EvidenceDrain {
     nonce: u64,
+    challenge_generation: u64,
     expected: [u8; CHALLENGE_BYTES],
     expected_hash: u64,
     bytes: usize,
     hash: u64,
     reported: bool,
+    transport_empty_reported: bool,
+    response_bytes: usize,
+    response_hash: u64,
 }
 
 #[cfg(feature = "dw1e3-selector31")]
 impl EvidenceDrain {
-    fn new(nonce: u64) -> Self {
-        let expected = challenge(nonce);
+    fn new(nonce: u64, challenge_generation: u64, challenge_nonce: u64) -> Self {
+        let expected = challenge(challenge_nonce);
         Self {
             nonce,
+            challenge_generation,
             expected,
             expected_hash: fnv1a64(&expected),
             bytes: 0,
             hash: 0xcbf2_9ce4_8422_2325,
             reported: false,
+            transport_empty_reported: false,
+            response_bytes: 0,
+            response_hash: 0xcbf2_9ce4_8422_2325,
         }
     }
 
@@ -478,7 +622,11 @@ impl EvidenceDrain {
                 return Err(());
             }
             dw1e3_report(
-                Dw1e3ReportEvent::Challenge1UartDrain,
+                if self.challenge_generation == CHALLENGE_GENERATION {
+                    Dw1e3ReportEvent::Challenge1UartDrain
+                } else {
+                    Dw1e3ReportEvent::Challenge2UartDrain
+                },
                 self.bytes as u64,
                 self.hash,
                 self.nonce,
@@ -488,11 +636,137 @@ impl EvidenceDrain {
         }
         Ok(())
     }
+
+    fn response_reported(&self) -> bool {
+        self.reported
+            && self.response_bytes == CHALLENGE_BYTES
+            && self.response_hash == fnv1a64(&response(&self.expected))
+            && !self.transport_empty_reported
+    }
+
+    fn mark_transport_empty(&mut self) {
+        self.transport_empty_reported = true;
+    }
+
+    fn response_hash(&self) -> u64 {
+        self.response_hash
+    }
+
+    fn record_response(&mut self, bytes: &[u8]) -> Result<(), ()> {
+        let expected = response(&self.expected);
+        if bytes.is_empty()
+            || self.response_bytes == expected.len()
+            || self.response_bytes.checked_add(bytes.len()).ok_or(())? > expected.len()
+        {
+            return Err(());
+        }
+        for (offset, byte) in bytes.iter().enumerate() {
+            if *byte != expected[self.response_bytes + offset] {
+                return Err(());
+            }
+            self.response_hash ^= u64::from(*byte);
+            self.response_hash = self.response_hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        self.response_bytes += bytes.len();
+        Ok(())
+    }
+}
+
+#[cfg(feature = "dw1e3-selector31")]
+fn same_binding<I: ByteRegisterIo>(
+    driver: &ProductionDriver<I>,
+    nonce: u64,
+    evidence: &EvidenceDrain,
+    binding: ChallengeBinding,
+) -> bool {
+    driver
+        .stream_generations()
+        .is_some_and(|(stream, publication)| {
+            binding.nonce == nonce
+                && binding.attempt_generation == driver.identity().attempt_generation.0
+                && binding.stream_generation == stream
+                && binding.publication_generation == publication
+                && binding.challenge_generation == evidence.challenge_generation
+                && binding.expected_length == CHALLENGE_BYTES as u64
+                && binding.expected_hash == evidence.expected_hash
+        })
+}
+
+#[cfg(feature = "dw1e3-selector31")]
+fn prove_transport_empty<I: ByteRegisterIo>(
+    driver: &mut ProductionDriver<I>,
+    control: DwHandle,
+    pio_failed: &Cell<bool>,
+    evidence: &mut EvidenceDrain,
+) -> Result<(), u32> {
+    let (stream_generation, publication_generation) = driver.stream_generations().ok_or(64u32)?;
+    let timer = create_timer(DwRights(
+        DW_RIGHT_WAIT.0 | DW_RIGHT_MODIFY.0 | DW_RIGHT_INSPECT.0,
+    ))
+    .map_err(|_| 65u32)?;
+    let result = (|| {
+        for _ in 0..TRANSPORT_EMPTY_TEMT_MAX_POLLS {
+            let deadline = monotonic_active_now()
+                .map_err(|_| 66u32)?
+                .checked_add(1_000_000)
+                .ok_or(67u32)?;
+            set_timer(timer, DwDeadline(deadline)).map_err(|_| 68u32)?;
+            let waited = wait_one(
+                timer,
+                DW_SIGNAL_SIGNALED,
+                DwDeadline(deadline.checked_add(1_000_000).ok_or(69u32)?),
+            )
+            .map_err(|_| 70u32)?;
+            if waited.observed.0 & DW_SIGNAL_SIGNALED.0 == 0 {
+                return Err(70);
+            }
+            if pio_failed.get() {
+                return Err(71);
+            }
+            let temt = driver.uart_mut().transport_empty();
+            // Check the sticky I/O failure immediately after LSR before a
+            // false TEMT sample is allowed to schedule another paced poll.
+            if pio_failed.get() {
+                return Err(72);
+            }
+            if temt {
+                if pio_failed.get() {
+                    return Err(73);
+                }
+                let mut bytes = [0u8; wyrmroot_dw1e3_com2_test::TRANSPORT_EMPTY_FACT_BYTES];
+                encode_transport_empty_fact(
+                    TransportEmptyFact {
+                        nonce: evidence.nonce,
+                        attempt_generation: driver.identity().attempt_generation.0,
+                        publication_generation,
+                        stream_generation,
+                        challenge_generation: evidence.challenge_generation,
+                        response_length: CHALLENGE_BYTES as u64,
+                        response_hash: evidence.response_hash(),
+                    },
+                    &mut bytes,
+                )
+                .map_err(|_| 74u32)?;
+                send_channel(control, &bytes, &[]).map_err(|_| 75u32)?;
+                evidence.mark_transport_empty();
+                return Ok(());
+            }
+        }
+        Err(76)
+    })();
+    let closed = close_handle(timer).map_err(|_| 77u32);
+    result.and(closed)
 }
 
 enum ControlOutcome {
     Continue,
     Retire,
+    #[cfg(feature = "dw1e3-selector31")]
+    ChallengeBinding(ChallengeBinding),
+    #[cfg(feature = "dw1e3-selector31")]
+    BeginRetire(ChallengeBinding),
+    #[cfg(feature = "dw1e3-selector31")]
+    FinalizeRetire(ChallengeBinding),
 }
 
 fn service_control<I: ByteRegisterIo>(
@@ -505,6 +779,24 @@ fn service_control<I: ByteRegisterIo>(
     if counts.bytes > bytes.len() || counts.handles > handles.len() {
         close_received(&handles, counts.handles);
         return Err(46);
+    }
+    #[cfg(feature = "dw1e3-selector31")]
+    if counts.handles == 0
+        && counts.bytes == wyrmroot_dw1e3_com2_test::TRANSPORT_EMPTY_FACT_BYTES
+        && bytes[..4] == wyrmroot_dw1e3_com2_test::DEVMGR_CONFIG_MAGIC
+    {
+        return match u16::from_le_bytes([bytes[6], bytes[7]]) {
+            4 => parse_challenge_binding(&bytes[..counts.bytes])
+                .map(ControlOutcome::ChallengeBinding)
+                .map_err(|_| 47),
+            6 => parse_begin_retire(&bytes[..counts.bytes])
+                .map(ControlOutcome::BeginRetire)
+                .map_err(|_| 47),
+            7 => parse_finalize_retire(&bytes[..counts.bytes])
+                .map(ControlOutcome::FinalizeRetire)
+                .map_err(|_| 47),
+            _ => Err(47),
+        };
     }
     let message = match parse(&bytes[..counts.bytes]) {
         Ok(message) => message,
@@ -553,6 +845,7 @@ fn service_stream_read<I: ByteRegisterIo>(
     driver: &mut ProductionDriver<I>,
     control: DwHandle,
     pio_failed: &Cell<bool>,
+    #[cfg(feature = "dw1e3-selector31")] evidence: &mut Option<EvidenceDrain>,
 ) -> Result<StreamReadOutcome, ()> {
     let Some(endpoint) = driver.stream_endpoint() else {
         return Ok(StreamReadOutcome::Detached);
@@ -584,6 +877,13 @@ fn service_stream_read<I: ByteRegisterIo>(
         close_received(&handles, counts.handles);
         isolate_stream(driver, control)?;
         return Ok(StreamReadOutcome::Detached);
+    }
+    #[cfg(feature = "dw1e3-selector31")]
+    {
+        let payload = decode_data(&bytes[..counts.bytes])
+            .map_err(|_| ())?
+            .payload();
+        evidence.as_mut().ok_or(())?.record_response(payload)?;
     }
     if pio_failed.get() {
         return Err(());

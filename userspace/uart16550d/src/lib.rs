@@ -210,6 +210,15 @@ impl StreamAttachment {
         }
     }
 
+    pub const fn active_generations(&self) -> Option<(u64, u64)> {
+        match self.active {
+            Some((_, stream_generation, publication_generation, _)) => {
+                Some((stream_generation, publication_generation))
+            }
+            None => None,
+        }
+    }
+
     /// Accepts only the exact current ATTACH_STREAM and one moved Channel.
     /// D3C does not read or write WRST bytes; D3D owns that event loop.
     pub fn attach(
@@ -546,6 +555,10 @@ impl<I: ByteRegisterIo> ProductionDriver<I> {
         self.stream.active_endpoint()
     }
 
+    pub const fn stream_generations(&self) -> Option<(u64, u64)> {
+        self.stream.active_generations()
+    }
+
     pub fn tx_free(&self) -> usize {
         RING_CAPACITY - self.uart.tx_len()
     }
@@ -641,6 +654,16 @@ impl<I: ByteRegisterIo> ProductionDriver<I> {
             self.counters.stream_detaches = self.counters.stream_detaches.saturating_add(1);
         }
         detached
+    }
+
+    /// Selector-private stage-1 retirement: IER is zero and only the raw
+    /// stream endpoint is detached. The caller deliberately retains the
+    /// Interrupt/resource/control handles for controller-authorized stage 2.
+    pub fn begin_selector_retire(
+        &mut self,
+    ) -> Option<(ControlMessageV1_1, ReceivedStreamEndpoint)> {
+        self.uart.disable_interrupts();
+        self.detach_stream()
     }
 
     /// Accepts one complete handle-free WRST record only while the maximum

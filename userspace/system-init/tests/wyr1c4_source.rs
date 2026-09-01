@@ -131,3 +131,44 @@ fn c6_joins_wrdm_to_the_validated_retained_uart_identity() {
     assert!(NATIVE_SOURCE.contains("validate_device_identity(device_manifest, uart_identity)?;"));
     assert!(!NATIVE_SOURCE.contains("manifest.executable_identity(RoleId::Uart16550d)"));
 }
+
+#[test]
+fn selector31_controller_rejoins_response_temt_then_retires_u1_before_fresh_u2() {
+    let response = NATIVE_SOURCE
+        .find("E3AControllerMessage::ResponseCommitted")
+        .unwrap();
+    let temt = NATIVE_SOURCE
+        .find("DevmgrControlInput::TransportEmpty(fact)")
+        .unwrap();
+    let begin = NATIVE_SOURCE.find("fn maybe_begin_e3a_retire").unwrap();
+    let stage1 = NATIVE_SOURCE[temt..]
+        .find("DevmgrControlInput::RetireStage1Ready")
+        .unwrap()
+        + temt;
+    let closed = NATIVE_SOURCE
+        .find("E3AControllerMessage::StreamPeerClosed")
+        .unwrap();
+    let report = NATIVE_SOURCE
+        .find("Dw1e3ReportEvent::Driver1PeerClosed")
+        .unwrap();
+    let finalize = NATIVE_SOURCE.find("fn send_e3a_finalize_retire").unwrap();
+    assert!(begin < temt && begin < response);
+    assert!(temt < stage1 && stage1 < closed && closed < report);
+    assert!(finalize < closed);
+    assert!(NATIVE_SOURCE.contains("reap_e3a_probe(resident, system, waits)?"));
+    assert!(NATIVE_SOURCE.contains("state.e3a_next_challenge_generation = 2;"));
+}
+
+#[test]
+fn selector31_u2_temt_join_is_the_only_terminal_claim_path() {
+    let terminal = NATIVE_SOURCE
+        .find("dw1e3_terminal_claim(binding.nonce)")
+        .unwrap();
+    let join = NATIVE_SOURCE[..terminal]
+        .rfind("exact_transport_empty(")
+        .unwrap();
+    let response = NATIVE_SOURCE[..terminal]
+        .rfind("if !response_committed || transport_empty.is_none()")
+        .unwrap();
+    assert!(response < join && join < terminal);
+}

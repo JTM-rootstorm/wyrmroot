@@ -41,6 +41,21 @@ pub fn dw1e3_build_nonce() -> Result<u64, NativeError> {
     ))
 }
 
+/// Returns the frozen raw-payload nonce for one selector-31 challenge leg.
+/// E3A has no separate payload nonce and therefore retains the evidence nonce
+/// for generation one. E3B must provide both distinct payload nonces so the
+/// build/evidence correlation never becomes raw-wire payload authority.
+pub fn dw1e3_challenge_nonce(generation: u64) -> Result<u64, NativeError> {
+    let evidence = dw1e3_build_nonce()?;
+    select_challenge_nonce(
+        generation,
+        evidence,
+        option_env!("WYRMROOT_DW1E3_CHALLENGE_1_NONCE"),
+        option_env!("WYRMROOT_DW1E3_CHALLENGE_2_NONCE"),
+    )
+    .ok_or_else(invalid_private)
+}
+
 /// Binds the caller's exact Interrupt and attempt generation as the current
 /// driver reporter. Object, binding, lease, and reporter Process identities
 /// are resolved by the kernel from the real handle and caller. Selector-31
@@ -93,6 +108,13 @@ pub fn dw1e3_report(
     nonce: u64,
 ) -> Result<(), NativeError> {
     private_call(report_arguments(event, value, auxiliary, nonce).ok_or_else(invalid_private)?)
+}
+
+/// Makes the controller-only selector terminal claim through the existing
+/// action-4 carrier. It is neither a probe report nor a fifth private action;
+/// callers must have independently joined U2 response and TEMT facts first.
+pub fn dw1e3_terminal_claim(nonce: u64) -> Result<(), NativeError> {
+    private_call(terminal_claim_arguments(nonce).ok_or_else(invalid_private)?)
 }
 
 const fn bind_driver_arguments(
@@ -161,6 +183,14 @@ const fn report_arguments(
     }
 }
 
+const fn terminal_claim_arguments(nonce: u64) -> Option<[u64; 6]> {
+    if nonce == 0 {
+        None
+    } else {
+        Some([4, 0xff, 0, 0, nonce, 0])
+    }
+}
+
 const fn invalid_private() -> NativeError {
     NativeError::Output(crate::NativeOutputError::InvalidWaitResult)
 }
@@ -193,13 +223,36 @@ fn parse_nonce(text: &str) -> Option<u64> {
     (value != 0).then_some(value)
 }
 
+fn select_challenge_nonce(
+    generation: u64,
+    evidence: u64,
+    challenge1_text: Option<&str>,
+    challenge2_text: Option<&str>,
+) -> Option<u64> {
+    let challenge1 = challenge1_text.map(parse_nonce).transpose()?;
+    let challenge2 = challenge2_text.map(parse_nonce).transpose()?;
+    match (challenge1, challenge2) {
+        (None, None) if generation == 1 => Some(evidence),
+        (Some(challenge1), Some(challenge2))
+            if challenge1 != evidence && challenge2 != evidence && challenge1 != challenge2 =>
+        {
+            match generation {
+                1 => Some(challenge1),
+                2 => Some(challenge2),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use deepwyrm_syscall::DwHandle;
 
     use super::{
         Dw1e3ReportEvent, arm_arguments, bind_driver_arguments, bind_probe_arguments, parse_nonce,
-        report_arguments,
+        report_arguments, select_challenge_nonce, terminal_claim_arguments,
     };
 
     #[test]
@@ -208,6 +261,26 @@ mod tests {
         assert_eq!(parse_nonce("0000000000000000"), None);
         assert_eq!(parse_nonce("0123456789abcdef"), None);
         assert_eq!(parse_nonce("1234"), None);
+    }
+
+    #[test]
+    fn payload_nonces_are_distinct_from_evidence_and_each_other() {
+        let evidence = 0x1111_2222_3333_4444;
+        let challenge1 = "5555666677778888";
+        let challenge2 = "9999AAAABBBBCCCC";
+        assert_eq!(
+            select_challenge_nonce(1, evidence, Some(challenge1), Some(challenge2)),
+            Some(0x5555_6666_7777_8888)
+        );
+        assert_eq!(
+            select_challenge_nonce(2, evidence, Some(challenge1), Some(challenge2)),
+            Some(0x9999_aaaa_bbbb_cccc)
+        );
+        assert_eq!(select_challenge_nonce(2, evidence, None, None), None);
+        assert_eq!(
+            select_challenge_nonce(1, evidence, Some("1111222233334444"), Some(challenge2)),
+            None
+        );
     }
 
     #[test]
@@ -232,6 +305,8 @@ mod tests {
         assert_eq!(bind_probe_arguments(DwHandle(0), 11), None);
         assert_eq!(bind_probe_arguments(DwHandle(12), 0), None);
         assert_eq!(arm_arguments(12, 0, 24, 14, 11), None);
+        assert_eq!(terminal_claim_arguments(11), Some([4, 0xff, 0, 0, 11, 0]));
+        assert_eq!(terminal_claim_arguments(0), None);
         assert_eq!(
             report_arguments(Dw1e3ReportEvent::Challenge1UartDrain, 24, 0, 11),
             None

@@ -48,6 +48,45 @@ fn selector31_allows_an_empty_coalesced_ack_epoch_after_the_challenge_drain() {
 }
 
 #[test]
+fn selector31_stage1_blocks_stale_finalize_and_post_ier_interrupt_drains() {
+    let begin = DRIVER
+        .find("Ok(ControlOutcome::BeginRetire(binding))")
+        .unwrap();
+    let retired = DRIVER[begin..].find("selector_retiring = true").unwrap() + begin;
+    let finalize = DRIVER
+        .find("Ok(ControlOutcome::FinalizeRetire(binding))")
+        .unwrap();
+    let exact = DRIVER[finalize..]
+        .find("!same_binding(driver, evidence_nonce, evidence, binding)")
+        .unwrap()
+        + finalize;
+    assert!(begin < retired && retired < finalize && finalize < exact);
+
+    let wait_gate = DRIVER
+        .find("let mut count = if selector_retiring { 1 } else { 2 };")
+        .unwrap();
+    let interrupt_gate = DRIVER[wait_gate..].find("if !selector_retiring").unwrap() + wait_gate;
+    let interrupt_drain = DRIVER.find("if observed.index == 1").unwrap();
+    assert!(wait_gate < interrupt_gate && interrupt_gate < interrupt_drain);
+}
+
+#[test]
+fn selector31_temt_wait_requires_the_timer_signal_and_checks_sticky_pio_after_lsr() {
+    let prove = DRIVER.find("fn prove_transport_empty").unwrap();
+    let body = &DRIVER[prove..];
+    let waited = body.find("let waited = wait_one(").unwrap();
+    let signaled = body[waited..]
+        .find("waited.observed.0 & DW_SIGNAL_SIGNALED.0 == 0")
+        .unwrap()
+        + waited;
+    let lsr = body
+        .find("let temt = driver.uart_mut().transport_empty();")
+        .unwrap();
+    let sticky = body[lsr..].find("if pio_failed.get() {").unwrap() + lsr;
+    assert!(waited < signaled && signaled < lsr && lsr < sticky);
+}
+
+#[test]
 fn startup_and_stream_peer_close_precedence_is_explicit() {
     assert_eq!(DRIVER.matches("!startup_control_is_readable(").count(), 2);
 

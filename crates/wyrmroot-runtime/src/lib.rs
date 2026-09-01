@@ -91,7 +91,7 @@ pub use dw1d6::{D6ReportEvent, d6_arm, d6_bind, d6_deliver, d6_report};
 #[cfg(feature = "dw1e3-test-evidence")]
 pub use dw1e3::{
     Dw1e3ReportEvent, dw1e3_arm_challenge, dw1e3_bind_driver, dw1e3_bind_probe, dw1e3_build_nonce,
-    dw1e3_report,
+    dw1e3_challenge_nonce, dw1e3_report, dw1e3_terminal_claim,
 };
 pub use loader_native::{LOADER_ABORT_CODE, NativeLoaderPlatform};
 pub use native::{

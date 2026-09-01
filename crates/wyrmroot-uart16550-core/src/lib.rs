@@ -46,6 +46,7 @@ const LSR_OE: u8 = 0x02;
 const LSR_PE: u8 = 0x04;
 const LSR_FE: u8 = 0x08;
 const LSR_BI: u8 = 0x10;
+const LSR_TEMT: u8 = 0x40;
 
 /// Injectable, byte-oriented UART register access.
 pub trait ByteRegisterIo {
@@ -227,6 +228,13 @@ impl<I: ByteRegisterIo> Uart16550<I> {
     pub fn tx_len(&self) -> usize {
         self.tx.len()
     }
+
+    /// Reads the exact 16550 transport-empty (`LSR.TEMT`) bit. This is kept
+    /// out of normal interrupt draining because selector-31 polls it only
+    /// after final FIFO fill and a successful interrupt acknowledgement.
+    pub fn transport_empty(&mut self) -> bool {
+        self.io.read(LSR) & LSR_TEMT != 0
+    }
     /// Removes one previously received byte without touching hardware.
     pub fn dequeue_rx(&mut self) -> Option<u8> {
         self.rx.pop()
@@ -279,6 +287,14 @@ impl<I: ByteRegisterIo> Uart16550<I> {
             self.io.write(IER_DLM, ier);
             self.state = CoreState::Active;
         }
+    }
+
+    /// Stops UART interrupts without touching the staged resource, interrupt,
+    /// or control ownership. Selector-31 uses this for stage-1 retirement so
+    /// a retained stream peer can prove its ordered close before stage-2.
+    pub fn disable_interrupts(&mut self) {
+        self.io.write(IER_DLM, 0);
+        self.state = CoreState::Quiesced;
     }
 
     /// Enqueues as many bytes as fit.  Unlike RX, callers retain the suffix

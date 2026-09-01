@@ -17,9 +17,9 @@ use wyrmroot_device_proto::{
     },
 };
 use wyrmroot_dw1e3_com2_test::{
-    CHALLENGE_BYTES, CLIENT_TRANSACTION_ID, CONNECT_TRANSACTION_ID, CONTROL_BYTES,
-    ControllerMessage, challenge as expected_challenge, encode as encode_controller, fnv1a64,
-    parse as parse_controller, response,
+    CHALLENGE_BYTES, CHALLENGE_GENERATION, CLIENT_TRANSACTION_ID, CONNECT_TRANSACTION_ID,
+    CONTROL_BYTES, ControllerMessage, challenge_matches_commitment, encode as encode_controller,
+    fnv1a64, parse as parse_controller, response,
 };
 use wyrmroot_loader::launch::{
     CHILD_CHANNEL_RIGHTS, HEADER_BYTES as WRLP_HEADER_BYTES, LaunchProfile, SELF_ROOT_RIGHTS,
@@ -227,22 +227,121 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
 
     let mut challenge = [0u8; CHALLENGE_BYTES];
     receive_exact_stream(stream, &mut challenge)?;
-    if challenge != expected_challenge(nonce) || fnv1a64(&challenge) != expected_hash {
+    // The selector build/evidence nonce is deliberately distinct from either
+    // frozen raw challenge nonce in E3B. The controller's exact commitment is
+    // therefore the only payload authority here; COM2 carries no control tag.
+    if !challenge_matches_commitment(&challenge, expected_length, expected_hash) {
         let _ = close_handle(stream);
         return Err(39);
     }
     let response = response(&challenge);
     send_stream(stream, &response)?;
+    let report_event = if challenge_generation == CHALLENGE_GENERATION {
+        Dw1e3ReportEvent::Challenge1Response
+    } else {
+        Dw1e3ReportEvent::Challenge2Response
+    };
     dw1e3_report(
-        Dw1e3ReportEvent::Challenge1Response,
+        report_event,
         response.len() as u64,
         fnv1a64(&response),
         nonce,
     )
     .map_err(|_| 40u32)?;
+    send_controller(
+        parent,
+        ControllerMessage::ResponseCommitted {
+            nonce,
+            publication_generation,
+            stream_generation: identity.stream_generation,
+            challenge_generation,
+            response_length: response.len() as u64,
+            response_hash: fnv1a64(&response),
+        },
+    )?;
+    if challenge_generation == CHALLENGE_GENERATION {
+        await_stream_peer_closed(stream)?;
+        send_controller(
+            parent,
+            ControllerMessage::StreamPeerClosed {
+                nonce,
+                publication_generation,
+                stream_generation: identity.stream_generation,
+                challenge_generation,
+            },
+        )?;
+        wait_peer_closed(parent, 41)?;
+    }
     close_handle(stream).map_err(|_| 41u32)?;
     close_handle(parent).map_err(|_| 42u32)?;
     Ok(0)
+}
+
+/// A peer-close is not sufficient: consume any queued records first and only
+/// report closure after a fresh receive proves the transport queue empty.
+fn await_stream_peer_closed(stream: DwHandle) -> Result<(), u32> {
+    loop {
+        let observed = wait_one(
+            stream,
+            DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+            deepwyrm_syscall::DW_DEADLINE_INFINITE,
+        )
+        .map_err(|_| 54u32)?;
+        if observed.observed.0 & DW_SIGNAL_READABLE.0 != 0 {
+            let mut wire = [0; MAX_RECORD_BYTES];
+            let mut handles = [DwReceivedHandleInfoV1::default(); 1];
+            let counts = receive_channel(stream, &mut wire, &mut handles).map_err(|_| 55u32)?;
+            if counts.bytes > wire.len() || counts.handles != 0 {
+                close_received(&handles, counts.handles);
+                return Err(56);
+            }
+            let data = decode_data(&wire[..counts.bytes]).map_err(|_| 57u32)?;
+            if !data.payload().is_empty() {
+                return Err(57);
+            }
+            continue;
+        }
+        if observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 {
+            let mut wire = [0; MAX_RECORD_BYTES];
+            let mut handles = [DwReceivedHandleInfoV1::default(); 1];
+            match receive_channel(stream, &mut wire, &mut handles) {
+                Err(NativeError::Status(status))
+                    if status == deepwyrm_syscall::DW_STATUS_PEER_CLOSED =>
+                {
+                    return Ok(());
+                }
+                Ok(counts) => {
+                    if counts.handles != 0 || counts.bytes > wire.len() {
+                        close_received(&handles, counts.handles);
+                        return Err(58);
+                    }
+                    // `PEER_CLOSED` can coexist with one final queued record.
+                    // Decode and drain it before the next fresh receive proves
+                    // the queue empty; silently accepting that record would
+                    // make peer-close evidence weaker than the contract.
+                    let data = decode_data(&wire[..counts.bytes]).map_err(|_| 58u32)?;
+                    if !data.payload().is_empty() {
+                        return Err(58);
+                    }
+                    continue;
+                }
+                Err(_) => return Err(59),
+            }
+        }
+    }
+}
+
+fn wait_peer_closed(handle: DwHandle, stage: u32) -> Result<(), u32> {
+    let observed = wait_one(
+        handle,
+        DwSignals(DW_SIGNAL_PEER_CLOSED.0),
+        deepwyrm_syscall::DW_DEADLINE_INFINITE,
+    )
+    .map_err(|_| stage)?;
+    if observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 == 0 {
+        return Err(stage);
+    }
+    Ok(())
 }
 
 fn receive_controller(parent: DwHandle, stage: u32) -> Result<ControllerMessage, u32> {

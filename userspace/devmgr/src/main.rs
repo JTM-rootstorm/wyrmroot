@@ -5,7 +5,7 @@
 use core::panic::PanicInfo;
 #[cfg(feature = "wyr1d-production")]
 use deepwyrm_syscall::DW_HANDLE_INVALID;
-#[cfg(feature = "wyr1c6-production")]
+#[cfg(any(feature = "wyr1c6-production", feature = "dw1e3-selector31"))]
 use deepwyrm_syscall::DW_STATUS_TIMED_OUT;
 use deepwyrm_syscall::{
     DW_DEADLINE_INFINITE, DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL,
@@ -29,9 +29,13 @@ use deepwyrm_syscall::{
 };
 #[cfg(feature = "wyr1c6-selector29")]
 use deepwyrm_syscall::{DW_SIGNAL_WRITABLE, DW_STATUS_WOULD_BLOCK};
-#[cfg(any(feature = "wyr1c6-production", feature = "wyr1d-production"))]
+#[cfg(any(
+    feature = "wyr1c6-production",
+    feature = "wyr1d-production",
+    feature = "dw1e3-selector31"
+))]
 use wyrmroot_device_proto::ControlMessage;
-#[cfg(feature = "wyr1c6-production")]
+#[cfg(any(feature = "wyr1c6-production", feature = "dw1e3-selector31"))]
 use wyrmroot_device_proto::FailureCode;
 #[cfg(feature = "dw1e3-selector31")]
 use wyrmroot_device_proto::connector::{
@@ -46,9 +50,10 @@ use wyrmroot_device_proto::control_v1_1::{
     READY_BYTES as D3_READY_BYTES, encode as encode_control_v1_1, parse as parse_control_v1_1,
 };
 #[cfg(feature = "wyr1c6-production")]
+use wyrmroot_device_proto::driver_launch::{C6_FACT_BYTES, C6Fact, encode_c6_fact};
+#[cfg(any(feature = "wyr1c6-production", feature = "dw1e3-selector31"))]
 use wyrmroot_device_proto::driver_launch::{
-    C6_FACT_BYTES, C6Fact, REAPED_RESPONSE_BYTES, encode_c6_fact, encode_driver_retired,
-    parse_reaped,
+    REAPED_RESPONSE_BYTES, encode_driver_retired, parse_reaped,
 };
 #[cfg(feature = "wyr1c6-selector29")]
 use wyrmroot_device_proto::selector29_should_fail;
@@ -83,7 +88,10 @@ use wyrmroot_devmgr::connector::{
 use wyrmroot_devmgr::staging::DeviceStageCoordinator;
 #[cfg(feature = "dw1e3-selector31")]
 use wyrmroot_dw1e3_com2_test::{
-    DEVMGR_CONFIG_BYTES, DevmgrConfig, DevmgrReady, encode_devmgr_ready, parse_devmgr_config,
+    ChallengeBinding, DEVMGR_CONFIG_BYTES, DevmgrConfig, DevmgrReady, TRANSPORT_EMPTY_FACT_BYTES,
+    encode_challenge_binding, encode_devmgr_ready, parse_begin_retire, parse_binding_ready,
+    parse_challenge_binding, parse_devmgr_config, parse_finalize_retire, parse_retire_stage1_ready,
+    parse_transport_empty_fact,
 };
 #[cfg(feature = "wyr1c5-production")]
 use wyrmroot_loader::launch::CHILD_CHANNEL_TRANSFER_RIGHTS;
@@ -358,6 +366,39 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                     send_channel(bootstrap, &ready_bytes, &[]).map_err(|_| failure(210))?;
                     continue;
                 }
+                ControllerInput::Dw1e3Binding(binding) => {
+                    let request = resident.active_driver_request().ok_or(failure(211))?;
+                    let control = driver_control.ok_or(failure(212))?;
+                    if binding.nonce != dw1e3_build_nonce().map_err(|_| failure(213))?
+                        || binding.attempt_generation != request.attempt_generation.0
+                        || connector_broker.is_none()
+                    {
+                        return Err(failure(213));
+                    }
+                    let mut bytes = [0u8; TRANSPORT_EMPTY_FACT_BYTES];
+                    encode_challenge_binding(binding, &mut bytes).map_err(|_| failure(214))?;
+                    send_channel(control, &bytes, &[]).map_err(|_| failure(215))?;
+                    continue;
+                }
+                ControllerInput::Dw1e3DriverCommand(binding, message_type) => {
+                    let request = resident.active_driver_request().ok_or(failure(218))?;
+                    let control = driver_control.ok_or(failure(219))?;
+                    if binding.nonce != dw1e3_build_nonce().map_err(|_| failure(220))?
+                        || binding.attempt_generation != request.attempt_generation.0
+                        || connector_broker.is_none()
+                    {
+                        return Err(failure(220));
+                    }
+                    let mut bytes = [0u8; TRANSPORT_EMPTY_FACT_BYTES];
+                    match message_type {
+                        6 => wyrmroot_dw1e3_com2_test::encode_begin_retire(binding, &mut bytes),
+                        7 => wyrmroot_dw1e3_com2_test::encode_finalize_retire(binding, &mut bytes),
+                        _ => return Err(failure(221)),
+                    }
+                    .map_err(|_| failure(221))?;
+                    send_channel(control, &bytes, &[]).map_err(|_| failure(222))?;
+                    continue;
+                }
                 ControllerInput::Controller(received) => received,
             };
             #[cfg(not(feature = "dw1e3-selector31"))]
@@ -552,13 +593,10 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
         if Some(index) == driver_index {
             let control = driver_control.take().ok_or(failure(39))?;
             #[cfg(feature = "dw1e3-selector31")]
-            if observed.observed.0 & DW_SIGNAL_READABLE.0 != 0
-                && connector_broker
-                    .as_ref()
-                    .is_some_and(|broker| !matches!(broker.slot(), ConnectorSlot::Empty))
-            {
-                service_connector_driver_release(
+            if observed.observed.0 & DW_SIGNAL_READABLE.0 != 0 && connector_broker.is_some() {
+                service_selector31_driver_control(
                     control,
+                    bootstrap,
                     connector_broker.as_mut().ok_or(failure(169))?,
                 )?;
                 driver_control = Some(control);
@@ -567,7 +605,7 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
             // The C3 acceptance actor may exit after its direct READY.  Peer
             // closure is the only reached notification path; no resource was
             // ever delegated, so reaping cannot lose future custody.
-            #[cfg(feature = "wyr1c6-production")]
+            #[cfg(any(feature = "wyr1c6-production", feature = "dw1e3-selector31"))]
             if observed.observed.0 & (DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0) != 0 {
                 let request = resident.active_driver_request().ok_or(failure(40))?;
                 observe_driver_failure(
@@ -614,6 +652,12 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                     )?;
                 }
                 resident.publication_retired().map_err(|_| failure(43))?;
+                #[cfg(feature = "dw1e3-selector31")]
+                {
+                    // U1's stream endpoint was already detached by stage 1;
+                    // do not let its broker correlations authorize U2.
+                    connector_broker = None;
+                }
                 await_driver_reaped(bootstrap, request)?;
                 resident.reap_driver().map_err(|_| failure(44))?;
                 #[cfg(feature = "wyr1c6-selector29")]
@@ -648,6 +692,8 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                 let (replacement, action) = match received {
                     ControllerInput::Controller(received) => received,
                     ControllerInput::Dw1e3(_) => return Err(failure(173)),
+                    ControllerInput::Dw1e3Binding(_) => return Err(failure(217)),
+                    ControllerInput::Dw1e3DriverCommand(_, _) => return Err(failure(223)),
                 };
                 #[cfg(not(feature = "dw1e3-selector31"))]
                 let (replacement, action) = received;
@@ -818,6 +864,8 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
 enum ControllerInput {
     Controller((Option<DwHandle>, ControllerAction)),
     Dw1e3(DevmgrConfig),
+    Dw1e3Binding(ChallengeBinding),
+    Dw1e3DriverCommand(ChallengeBinding, u16),
 }
 
 #[cfg(not(feature = "dw1e3-selector31"))]
@@ -827,6 +875,9 @@ fn receive_controller(
     bootstrap: DwHandle,
     resident: &mut wyrmroot_devmgr::ResidentController,
 ) -> Result<ControllerInput, u32> {
+    #[cfg(feature = "dw1e3-selector31")]
+    let mut bytes = [0u8; D3_DEVICE_STAGE_BYTES];
+    #[cfg(not(feature = "dw1e3-selector31"))]
     let mut bytes = [0u8; INSTALL_BYTES];
     let mut handles = [DwReceivedHandleInfoV1::default(); 1];
     let counts = receive_channel(bootstrap, &mut bytes, &mut handles).map_err(|_| failure(27))?;
@@ -844,6 +895,27 @@ fn receive_controller(
         }
         let config = parse_devmgr_config(&bytes[..counts.bytes]).map_err(|_| failure(163))?;
         return Ok(ControllerInput::Dw1e3(config));
+    }
+    #[cfg(feature = "dw1e3-selector31")]
+    if counts.bytes == TRANSPORT_EMPTY_FACT_BYTES
+        && bytes[..4] == wyrmroot_dw1e3_com2_test::DEVMGR_CONFIG_MAGIC
+    {
+        if counts.handles != 0 {
+            close_received(&handles, counts.handles);
+            return Err(failure(216));
+        }
+        return match u16::from_le_bytes([bytes[6], bytes[7]]) {
+            4 => parse_challenge_binding(&bytes[..counts.bytes])
+                .map(ControllerInput::Dw1e3Binding)
+                .map_err(|_| failure(216)),
+            6 => parse_begin_retire(&bytes[..counts.bytes])
+                .map(|binding| ControllerInput::Dw1e3DriverCommand(binding, 6))
+                .map_err(|_| failure(216)),
+            7 => parse_finalize_retire(&bytes[..counts.bytes])
+                .map(|binding| ControllerInput::Dw1e3DriverCommand(binding, 7))
+                .map_err(|_| failure(216)),
+            _ => Err(failure(216)),
+        };
     }
     let message = match parse_controller(&bytes[..counts.bytes]) {
         Ok(message) => message,
@@ -1037,14 +1109,14 @@ fn service_connector_offer(
 }
 
 #[cfg(feature = "dw1e3-selector31")]
-fn service_connector_driver_release(
+fn service_selector31_driver_control(
     driver_control: DwHandle,
+    bootstrap: DwHandle,
     broker: &mut ConnectorBroker,
 ) -> Result<(), u32> {
-    let attach = match broker.slot() {
-        ConnectorSlot::Active { attach, .. } => attach,
-        _ => return Err(failure(202)),
-    };
+    // This endpoint multiplexes selector-private WDE3 facts and ordinary
+    // 112-byte D3 control. Never size the receive buffer to WDE3: doing so
+    // would truncate STREAM_DETACHED and lose connector custody.
     let mut bytes = [0u8; D3_DEVICE_STAGE_BYTES];
     let mut handles = [DwReceivedHandleInfoV1::default(); 1];
     let counts =
@@ -1053,6 +1125,37 @@ fn service_connector_driver_release(
         close_received(&handles, counts.handles);
         return Err(failure(204));
     }
+    if counts.bytes == TRANSPORT_EMPTY_FACT_BYTES
+        && bytes[..4] == wyrmroot_dw1e3_com2_test::DEVMGR_CONFIG_MAGIC
+        && u16::from_le_bytes([bytes[6], bytes[7]]) == 3
+    {
+        // The current exact driver-control endpoint is authenticated by the
+        // outer resident loop. Parse for framing only, then relay the same
+        // bytes: devmgr does not construct or reinterpret a TEMT fact.
+        parse_transport_empty_fact(&bytes[..counts.bytes]).map_err(|_| failure(205))?;
+        send_channel(bootstrap, &bytes[..counts.bytes], &[]).map_err(|_| failure(206))?;
+        return Ok(());
+    }
+    if counts.bytes == TRANSPORT_EMPTY_FACT_BYTES
+        && bytes[..4] == wyrmroot_dw1e3_com2_test::DEVMGR_CONFIG_MAGIC
+        && u16::from_le_bytes([bytes[6], bytes[7]]) == 8
+    {
+        parse_retire_stage1_ready(&bytes[..counts.bytes]).map_err(|_| failure(209))?;
+        send_channel(bootstrap, &bytes[..counts.bytes], &[]).map_err(|_| failure(210))?;
+        return Ok(());
+    }
+    if counts.bytes == TRANSPORT_EMPTY_FACT_BYTES
+        && bytes[..4] == wyrmroot_dw1e3_com2_test::DEVMGR_CONFIG_MAGIC
+        && u16::from_le_bytes([bytes[6], bytes[7]]) == 5
+    {
+        parse_binding_ready(&bytes[..counts.bytes]).map_err(|_| failure(207))?;
+        send_channel(bootstrap, &bytes[..counts.bytes], &[]).map_err(|_| failure(208))?;
+        return Ok(());
+    }
+    let attach = match broker.slot() {
+        ConnectorSlot::Active { attach, .. } => attach,
+        _ => return Err(failure(202)),
+    };
     let message = parse_control_v1_1(&bytes[..counts.bytes]).map_err(|_| failure(205))?;
     broker
         .active_client_released(attach)
@@ -1064,7 +1167,7 @@ fn service_connector_driver_release(
     Ok(())
 }
 
-#[cfg(feature = "wyr1c6-production")]
+#[cfg(any(feature = "wyr1c6-production", feature = "dw1e3-selector31"))]
 fn observe_driver_failure(
     control: DwHandle,
     request: wyrmroot_device_proto::DriverLaunchRequest,
@@ -1114,7 +1217,7 @@ fn observe_driver_failure(
         .map_err(|_| failure(105))
 }
 
-#[cfg(feature = "wyr1c6-production")]
+#[cfg(any(feature = "wyr1c6-production", feature = "dw1e3-selector31"))]
 fn retire_driver_publication(
     publication: DwHandle,
     request: wyrmroot_device_proto::DriverLaunchRequest,
@@ -1201,7 +1304,7 @@ fn probe_stale_publication(
     Ok(())
 }
 
-#[cfg(feature = "wyr1c6-production")]
+#[cfg(any(feature = "wyr1c6-production", feature = "dw1e3-selector31"))]
 fn await_driver_reaped(
     bootstrap: DwHandle,
     request: wyrmroot_device_proto::DriverLaunchRequest,
@@ -1219,7 +1322,7 @@ fn await_driver_reaped(
     parse_reaped(&bytes, request).map_err(|_| failure(119))
 }
 
-#[cfg(feature = "wyr1c6-production")]
+#[cfg(any(feature = "wyr1c6-production", feature = "dw1e3-selector31"))]
 fn send_driver_retired(
     bootstrap: DwHandle,
     request: wyrmroot_device_proto::DriverLaunchRequest,
