@@ -13,6 +13,10 @@ use crate::wyr1b_native::{
     launch_registry_until_ready, poison_registry_generation, restart_topology_or_poison,
 };
 use deepwyrm_syscall::{DW_HANDLE_TRANSFER_MOVE, DW_OBJECT_TYPE_CHANNEL, DwHandleTransferV1};
+#[cfg(feature = "dw1e3-selector31")]
+use wyrmroot_device_proto::SERIAL_CONSOLE_CONNECTOR_PUBLICATION_POLICY;
+#[cfg(not(feature = "dw1e3-selector31"))]
+use wyrmroot_device_proto::SERIAL_CONSOLE_PUBLICATION_POLICY;
 use wyrmroot_device_proto::coordinator::{
     RegistryEndpoint, RegistryEndpointGeneration, RegistryEndpointId, RegistryGeneration,
     SupervisorGeneration,
@@ -30,10 +34,7 @@ use wyrmroot_device_proto::{
         DRIVER_RETIRED_BYTES, LAUNCH_REQUEST_BYTES, LAUNCH_RESPONSE_BYTES, encode_constructed,
         parse_request,
     },
-    manifest::{
-        COM2_ROLE_ID, ContentIdentity, Manifest as DeviceManifest,
-        SERIAL_CONSOLE_PUBLICATION_POLICY,
-    },
+    manifest::{COM2_ROLE_ID, ContentIdentity, Manifest as DeviceManifest},
 };
 #[cfg(any(test, not(feature = "wyr1c5-production")))]
 use wyrmroot_loader::launch::CHILD_CHANNEL_RIGHTS;
@@ -882,6 +883,9 @@ fn install_publication<S: Wyr1BPlatform>(
     endpoint: DwHandle,
 ) -> Result<(), InitError> {
     let mut bytes = [0u8; 256];
+    #[cfg(feature = "dw1e3-selector31")]
+    let policy = SERIAL_CONSOLE_CONNECTOR_PUBLICATION_POLICY;
+    #[cfg(not(feature = "dw1e3-selector31"))]
     let policy = SERIAL_CONSOLE_PUBLICATION_POLICY;
     let size = encode_install_publication(
         RegistryHeader {
