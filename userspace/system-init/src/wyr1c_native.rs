@@ -58,9 +58,9 @@ const DRIVER_CONTROL_INGRESS_RIGHTS: DwRights = CHILD_CHANNEL_RIGHTS;
 use wyrmroot_dw1e3_com2_test::{
     CHALLENGE_BYTES as E3A_CHALLENGE_BYTES, CHALLENGE_GENERATION as E3A_CHALLENGE_GENERATION,
     CONTROL_BYTES as E3A_CONTROL_BYTES, ControllerMessage as E3AControllerMessage, DevmgrConfig,
-    challenge as e3a_challenge, encode as encode_e3a_controller,
+    DevmgrReady, challenge as e3a_challenge, encode as encode_e3a_controller,
     encode_devmgr_config as encode_e3a_devmgr_config, fnv1a64 as e3a_fnv1a64,
-    parse as parse_e3a_controller,
+    parse as parse_e3a_controller, parse_devmgr_ready,
 };
 use wyrmroot_registry_proto::{
     Header as RegistryHeader, MessageType as RegistryMessageType, ProtocolVersion,
@@ -1746,9 +1746,10 @@ where
     let challenge = e3a_challenge(nonce);
     let expected_hash = e3a_fnv1a64(&challenge);
 
-    // The config is queued only after init has accepted the real driver launch.
-    // devmgr completes DEVICE/INTERRUPT staging and publication before returning
-    // to this channel, so its selector broker cannot precede driver readiness.
+    // Constructing the process only unblocks devmgr's synchronous staging path;
+    // it does not mean the Interrupt is bound or the registry publication is
+    // committed. The selector-private ready reply is emitted by devmgr only
+    // after both facts hold and its connector broker owns the exact generation.
     let mut devmgr_config = [0u8; wyrmroot_dw1e3_com2_test::DEVMGR_CONFIG_BYTES];
     encode_e3a_devmgr_config(
         DevmgrConfig {
@@ -1761,6 +1762,51 @@ where
     system
         .send_channel(devmgr.loaded.launch_channel, &devmgr_config)
         .map_err(InitError::Native)?;
+
+    let now = system.now().map_err(InitError::Native)?;
+    let deadline = now
+        .checked_add(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
+        .ok_or(InitError::Accounting)?;
+    let observed = waits
+        .wait_many(
+            &[
+                DwWaitItemV1 {
+                    handle: devmgr.loaded.launch_channel,
+                    signals: DW_SIGNAL_READABLE,
+                },
+                DwWaitItemV1 {
+                    handle: devmgr.loaded.process,
+                    signals: DW_SIGNAL_EXITED,
+                },
+            ],
+            DwDeadline(deadline),
+        )
+        .map_err(InitError::Native)?;
+    if observed.index != 0 || observed.observed.0 & DW_SIGNAL_READABLE.0 == 0 {
+        return Err(InitError::Supervision);
+    }
+    let mut devmgr_ready = [0u8; wyrmroot_dw1e3_com2_test::DEVMGR_CONFIG_BYTES];
+    let mut ready_handles = [DwReceivedHandleInfoV1::default(); 1];
+    let counts = system
+        .receive_channel(
+            devmgr.loaded.launch_channel,
+            &mut devmgr_ready,
+            &mut ready_handles,
+        )
+        .map_err(InitError::Native)?;
+    if counts.bytes != devmgr_ready.len() || counts.handles != 0 {
+        close_received_native(system, &ready_handles, counts.handles)?;
+        return Err(InitError::WrongManifestProfile);
+    }
+    let ready = parse_devmgr_ready(&devmgr_ready).map_err(|_| InitError::WrongManifestProfile)?;
+    if ready
+        != (DevmgrReady {
+            nonce,
+            publication_generation,
+        })
+    {
+        return Err(InitError::WrongManifestProfile);
+    }
 
     let authority = resident.authority;
     let probe = {

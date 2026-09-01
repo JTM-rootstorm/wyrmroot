@@ -36,44 +36,80 @@ pub struct DevmgrConfig {
     pub publication_generation: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DevmgrReady {
+    pub nonce: u64,
+    pub publication_generation: u64,
+}
+
 pub fn encode_devmgr_config(config: DevmgrConfig, output: &mut [u8]) -> Result<(), ProtocolError> {
+    encode_devmgr_record(1, config.nonce, config.publication_generation, output)
+}
+
+pub fn parse_devmgr_config(bytes: &[u8]) -> Result<DevmgrConfig, ProtocolError> {
+    let (nonce, publication_generation) = parse_devmgr_record(bytes, 1)?;
+    Ok(DevmgrConfig {
+        nonce,
+        publication_generation,
+    })
+}
+
+pub fn encode_devmgr_ready(ready: DevmgrReady, output: &mut [u8]) -> Result<(), ProtocolError> {
+    encode_devmgr_record(2, ready.nonce, ready.publication_generation, output)
+}
+
+pub fn parse_devmgr_ready(bytes: &[u8]) -> Result<DevmgrReady, ProtocolError> {
+    let (nonce, publication_generation) = parse_devmgr_record(bytes, 2)?;
+    Ok(DevmgrReady {
+        nonce,
+        publication_generation,
+    })
+}
+
+fn encode_devmgr_record(
+    message_type: u16,
+    nonce: u64,
+    publication_generation: u64,
+    output: &mut [u8],
+) -> Result<(), ProtocolError> {
     if output.len() != DEVMGR_CONFIG_BYTES {
         return Err(ProtocolError::WrongSize);
     }
-    if config.nonce == 0 || config.publication_generation == 0 {
+    if nonce == 0 || publication_generation == 0 {
         return Err(ProtocolError::ZeroIdentity);
     }
     output.fill(0);
     output[..4].copy_from_slice(&DEVMGR_CONFIG_MAGIC);
     put16(output, 4, CONTROL_VERSION);
-    put16(output, 6, 1);
+    put16(output, 6, message_type);
     put32(output, 8, DEVMGR_CONFIG_BYTES as u32);
-    put64(output, 16, config.nonce);
-    put64(output, 24, config.publication_generation);
+    put64(output, 16, nonce);
+    put64(output, 24, publication_generation);
     Ok(())
 }
 
-pub fn parse_devmgr_config(bytes: &[u8]) -> Result<DevmgrConfig, ProtocolError> {
+fn parse_devmgr_record(bytes: &[u8], expected_type: u16) -> Result<(u64, u64), ProtocolError> {
     if bytes.len() != DEVMGR_CONFIG_BYTES || get32(bytes, 8) != DEVMGR_CONFIG_BYTES as u32 {
         return Err(ProtocolError::WrongSize);
     }
     if bytes[..4] != DEVMGR_CONFIG_MAGIC {
         return Err(ProtocolError::WrongMagic);
     }
-    if get16(bytes, 4) != CONTROL_VERSION || get16(bytes, 6) != 1 {
+    if get16(bytes, 4) != CONTROL_VERSION {
         return Err(ProtocolError::WrongVersion);
+    }
+    if get16(bytes, 6) != expected_type {
+        return Err(ProtocolError::WrongType);
     }
     if get32(bytes, 12) != 0 || bytes[32..].iter().any(|byte| *byte != 0) {
         return Err(ProtocolError::NonzeroReserved);
     }
-    let config = DevmgrConfig {
-        nonce: get64(bytes, 16),
-        publication_generation: get64(bytes, 24),
-    };
-    if config.nonce == 0 || config.publication_generation == 0 {
+    let nonce = get64(bytes, 16);
+    let publication_generation = get64(bytes, 24);
+    if nonce == 0 || publication_generation == 0 {
         return Err(ProtocolError::ZeroIdentity);
     }
-    Ok(config)
+    Ok((nonce, publication_generation))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -382,7 +418,7 @@ mod tests {
     }
 
     #[test]
-    fn devmgr_config_carries_actual_controller_publication_generation() {
+    fn devmgr_config_and_ready_are_directional_and_generation_exact() {
         let config = DevmgrConfig {
             nonce: 7,
             publication_generation: 9,
@@ -390,9 +426,18 @@ mod tests {
         let mut bytes = [0; DEVMGR_CONFIG_BYTES];
         encode_devmgr_config(config, &mut bytes).unwrap();
         assert_eq!(parse_devmgr_config(&bytes), Ok(config));
+        assert_eq!(parse_devmgr_ready(&bytes), Err(ProtocolError::WrongType));
+
+        let ready = DevmgrReady {
+            nonce: config.nonce,
+            publication_generation: config.publication_generation,
+        };
+        encode_devmgr_ready(ready, &mut bytes).unwrap();
+        assert_eq!(parse_devmgr_ready(&bytes), Ok(ready));
+        assert_eq!(parse_devmgr_config(&bytes), Err(ProtocolError::WrongType));
         bytes[47] = 1;
         assert_eq!(
-            parse_devmgr_config(&bytes),
+            parse_devmgr_ready(&bytes),
             Err(ProtocolError::NonzeroReserved)
         );
     }

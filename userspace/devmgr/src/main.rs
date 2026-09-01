@@ -82,7 +82,9 @@ use wyrmroot_devmgr::connector::{
 #[cfg(feature = "wyr1d-production")]
 use wyrmroot_devmgr::staging::DeviceStageCoordinator;
 #[cfg(feature = "dw1e3-selector31")]
-use wyrmroot_dw1e3_com2_test::{DEVMGR_CONFIG_BYTES, DevmgrConfig, parse_devmgr_config};
+use wyrmroot_dw1e3_com2_test::{
+    DEVMGR_CONFIG_BYTES, DevmgrConfig, DevmgrReady, encode_devmgr_ready, parse_devmgr_config,
+};
 #[cfg(feature = "wyr1c5-production")]
 use wyrmroot_loader::launch::CHILD_CHANNEL_TRANSFER_RIGHTS;
 use wyrmroot_loader::launch::{
@@ -347,6 +349,13 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                         ConnectorBroker::new(Some(current), attach, stream)
                             .map_err(|_| failure(168))?,
                     );
+                    let ready = DevmgrReady {
+                        nonce: config.nonce,
+                        publication_generation: config.publication_generation,
+                    };
+                    let mut ready_bytes = [0; DEVMGR_CONFIG_BYTES];
+                    encode_devmgr_ready(ready, &mut ready_bytes).map_err(|_| failure(209))?;
+                    send_channel(bootstrap, &ready_bytes, &[]).map_err(|_| failure(210))?;
                     continue;
                 }
                 ControllerInput::Controller(received) => received,
