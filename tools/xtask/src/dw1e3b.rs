@@ -258,9 +258,11 @@ pub(crate) fn prepare(
         ))
     })?;
     let result = (|| {
-        // Product build configuration takes only the selector evidence nonce. The two
-        // leg nonces are runner-owned payload identities, never product build flags.
-        let produced = dw1e3a::build_produced_artifacts(
+        // The two leg identities are build-owned for this E3B snapshot: guest
+        // products receive them only while their Cargo processes run so
+        // system-init can arm the frozen payload hashes. Deepwyrm receives
+        // only the selector evidence nonce.
+        let produced = dw1e3a::build_e3b_produced_artifacts(
             &staging,
             &repository,
             &deep_repository,
@@ -269,6 +271,8 @@ pub(crate) fn prepare(
             &abi_revision,
             &abi_tree,
             evidence_nonce,
+            challenge_1_nonce,
+            challenge_2_nonce,
         )?;
         freeze_produced(
             &output,
@@ -1369,6 +1373,34 @@ mod tests {
         assert!(request.contains("challenge_1_nonce = \"E300000000000002\""));
         assert!(request.contains("challenge_2_nonce = \"E300000000000003\""));
         assert!(request.contains("terminal_line = \"DWTEST1 31 0\""));
+        let swapped_output = root.join("output-swapped");
+        freeze_produced(
+            &swapped_output,
+            &produced,
+            "E300000000000001",
+            "E300000000000003",
+            "E300000000000002",
+            |output, _| {
+                wyr1c6::write_new(
+                    &output.join("artifacts/selector31-esp.img"),
+                    b"synthetic-esp",
+                    "synthetic ESP",
+                )
+            },
+        )
+        .unwrap();
+        let swapped_request = fs::read_to_string(swapped_output.join("request.toml")).unwrap();
+        let source_receipt_hash = request
+            .lines()
+            .find(|line| line.starts_with("source_receipt_sha256 = "))
+            .unwrap();
+        let swapped_source_receipt_hash = swapped_request
+            .lines()
+            .find(|line| line.starts_with("source_receipt_sha256 = "))
+            .unwrap();
+        assert_ne!(source_receipt_hash, swapped_source_receipt_hash);
+        assert!(swapped_request.contains("challenge_1_nonce = \"E300000000000003\""));
+        assert!(swapped_request.contains("challenge_2_nonce = \"E300000000000002\""));
         let schema = fs::read_to_string(output.join("result-schema.toml")).unwrap();
         assert!(schema.contains("evidence_records = \"26\""));
         assert!(schema.contains("acceptance = \"pass\""));

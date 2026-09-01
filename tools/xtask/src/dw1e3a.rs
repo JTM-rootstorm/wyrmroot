@@ -11,6 +11,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -36,6 +37,8 @@ pub(crate) const READINESS_MARKER: &str =
 pub(crate) const ACCEPTANCE_CLAIM: &str = "partial-non-acceptance";
 pub(crate) const TIMEOUT_SECONDS: &str = "120";
 const SOURCE_RECEIPT: &str = "e3a-source-build.toml";
+pub(crate) const E3B_CHALLENGE_1_NONCE_ENV: &str = "WYRMROOT_DW1E3_CHALLENGE_1_NONCE";
+pub(crate) const E3B_CHALLENGE_2_NONCE_ENV: &str = "WYRMROOT_DW1E3_CHALLENGE_2_NONCE";
 const NATIVE_TARGET: &str = "x86_64-unknown-wyrmroot";
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
 const MACHINE: &str = "pc-q35-10.2";
@@ -60,11 +63,64 @@ const COM2_PRELUDE: &[u8] = concat!(
 )
 .as_bytes();
 
+static E3B_PAYLOAD_ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
+
 /// Producer-owned entry into the accepted native product builder. The
 /// request freezer consumes this snapshot together with its kernel/firmware
 /// inputs; callers cannot substitute a sixth normal role for the probe.
 pub(crate) fn build_product_snapshot(nonce: &str) -> Result<crate::wyr1c::E3ASnapshot, Failure> {
+    reject_e3b_payload_environment()?;
     crate::wyr1c::build_e3a_snapshot(nonce)
+}
+
+/// Builds the E3B product snapshot with the two frozen raw-payload identities
+/// scoped to the native Cargo invocations. This leaves the E3A build path and
+/// its public interface unchanged.
+fn build_e3b_product_snapshot(
+    evidence_nonce: &str,
+    challenge_1_nonce: &str,
+    challenge_2_nonce: &str,
+) -> Result<crate::wyr1c::E3ASnapshot, Failure> {
+    with_e3b_payload_environment(challenge_1_nonce, challenge_2_nonce, || {
+        crate::wyr1c::build_e3a_snapshot(evidence_nonce)
+    })
+}
+
+fn with_e3b_payload_environment<T>(
+    challenge_1_nonce: &str,
+    challenge_2_nonce: &str,
+    build: impl FnOnce() -> Result<T, Failure>,
+) -> Result<T, Failure> {
+    wyr1c6::validate_upper_hex_nonzero(challenge_1_nonce, 16, "DW1-E3B challenge 1 nonce")?;
+    wyr1c6::validate_upper_hex_nonzero(challenge_2_nonce, 16, "DW1-E3B challenge 2 nonce")?;
+    if challenge_1_nonce == challenge_2_nonce {
+        return Err(Failure::task("DW1-E3B challenge nonces must be distinct"));
+    }
+    let _lock = E3B_PAYLOAD_ENVIRONMENT_LOCK
+        .lock()
+        .map_err(|_| Failure::task("DW1-E3B payload environment lock is poisoned"))?;
+    reject_e3b_payload_environment()?;
+    // SAFETY: the process-wide mutex serializes this narrow build-only scope.
+    // The guard clears both values before the mutex is released.
+    unsafe {
+        env::set_var(E3B_CHALLENGE_1_NONCE_ENV, challenge_1_nonce);
+        env::set_var(E3B_CHALLENGE_2_NONCE_ENV, challenge_2_nonce);
+    }
+    let _environment = ScopedE3BPayloadEnvironment;
+    build()
+}
+
+struct ScopedE3BPayloadEnvironment;
+
+impl Drop for ScopedE3BPayloadEnvironment {
+    fn drop(&mut self) {
+        // SAFETY: this guard only clears values installed by
+        // `with_e3b_payload_environment` while its mutex remains held.
+        unsafe {
+            env::remove_var(E3B_CHALLENGE_1_NONCE_ENV);
+            env::remove_var(E3B_CHALLENGE_2_NONCE_ENV);
+        }
+    }
 }
 
 pub(crate) struct ProducedArtifacts {
@@ -154,6 +210,59 @@ pub(crate) fn build_produced_artifacts(
     abi_tree: &str,
     nonce: &str,
 ) -> Result<ProducedArtifacts, Failure> {
+    build_produced_artifacts_with_snapshot(
+        staging,
+        repository,
+        deep_repository,
+        wyrmroot_revision,
+        deep_revision,
+        abi_revision,
+        abi_tree,
+        nonce,
+        || build_product_snapshot(nonce),
+    )
+}
+
+/// E3B-only producer path. It binds the frozen leg nonces to every Cargo
+/// process used by the Wyrmroot product snapshot, but never to Deepwyrm.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_e3b_produced_artifacts(
+    staging: &Path,
+    repository: &Path,
+    deep_repository: &Path,
+    wyrmroot_revision: &str,
+    deep_revision: &str,
+    abi_revision: &str,
+    abi_tree: &str,
+    evidence_nonce: &str,
+    challenge_1_nonce: &str,
+    challenge_2_nonce: &str,
+) -> Result<ProducedArtifacts, Failure> {
+    build_produced_artifacts_with_snapshot(
+        staging,
+        repository,
+        deep_repository,
+        wyrmroot_revision,
+        deep_revision,
+        abi_revision,
+        abi_tree,
+        evidence_nonce,
+        || build_e3b_product_snapshot(evidence_nonce, challenge_1_nonce, challenge_2_nonce),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_produced_artifacts_with_snapshot(
+    staging: &Path,
+    repository: &Path,
+    deep_repository: &Path,
+    wyrmroot_revision: &str,
+    deep_revision: &str,
+    abi_revision: &str,
+    abi_tree: &str,
+    nonce: &str,
+    build_snapshot: impl FnOnce() -> Result<crate::wyr1c::E3ASnapshot, Failure>,
+) -> Result<ProducedArtifacts, Failure> {
     let manifest = crate::metadata::BuildManifest::load(repository)?;
     let profile = manifest.validate_loader_build_readiness(repository)?;
     let layout = crate::deep_layout::prepare(
@@ -191,7 +300,7 @@ pub(crate) fn build_produced_artifacts(
         .with_inheritable_anchor("DW1-E3A build directory", |anchor| {
             build_bootstrap(repository, &toolchain, &layout, &cargo_home, anchor)
         })?;
-    let snapshot = build_product_snapshot(nonce)?;
+    let snapshot = build_snapshot()?;
     let kernel = build_kernel(deep_repository, nonce)?;
     let boot_device_table = wyr1c6::boot_device_table();
     let ovmf_code = wyr1c6::pinned_firmware(
@@ -635,7 +744,8 @@ fn build_kernel(repository: &Path, nonce: &str) -> Result<Vec<u8>, Failure> {
         "DW1-E3A Deepwyrm target",
     )?;
     let result = (|| {
-        let status = Command::new(repository.path().join("tools/pinned-cargo"))
+        let mut command = Command::new(repository.path().join("tools/pinned-cargo"));
+        command
             .arg("target")
             .args([
                 "build",
@@ -651,15 +761,10 @@ fn build_kernel(repository: &Path, nonce: &str) -> Result<Vec<u8>, Failure> {
                 "--features",
                 "test-support",
             ])
-            .env("DEEPWYRM_PINNED_TARGET_DIR", scratch.path())
-            .env("DEEPWYRM_GUEST_TEST_SELECTOR", SELECTOR)
-            .env("DEEPWYRM_DW1E_EVIDENCE_NONCE", nonce)
-            .env_remove("CARGO_HOME")
-            .env_remove("LD_AUDIT")
-            .env_remove("LD_LIBRARY_PATH")
-            .env_remove("LD_PRELOAD")
             .current_dir(repository.path())
-            .stdin(Stdio::null())
+            .stdin(Stdio::null());
+        configure_kernel_environment(&mut command, scratch.path(), nonce);
+        let status = command
             .status()
             .map_err(|error| Failure::task(format!("could not build DW1-E3A kernel: {error}")))?;
         if !status.success() {
@@ -674,6 +779,19 @@ fn build_kernel(repository: &Path, nonce: &str) -> Result<Vec<u8>, Failure> {
         )
     })();
     scratch.finish(result)
+}
+
+fn configure_kernel_environment(command: &mut Command, scratch: &Path, nonce: &str) {
+    command
+        .env("DEEPWYRM_PINNED_TARGET_DIR", scratch)
+        .env("DEEPWYRM_GUEST_TEST_SELECTOR", SELECTOR)
+        .env("DEEPWYRM_DW1E_EVIDENCE_NONCE", nonce)
+        .env_remove(E3B_CHALLENGE_1_NONCE_ENV)
+        .env_remove(E3B_CHALLENGE_2_NONCE_ENV)
+        .env_remove("CARGO_HOME")
+        .env_remove("LD_AUDIT")
+        .env_remove("LD_LIBRARY_PATH")
+        .env_remove("LD_PRELOAD");
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1169,11 +1287,24 @@ pub(crate) fn reject_selector_environment() -> Result<(), Failure> {
         "DEEPWYRM_GUEST_TEST_SELECTOR",
         "DEEPWYRM_GUEST_TEST_ID",
         "DEEPWYRM_DW1E_EVIDENCE_NONCE",
+        E3B_CHALLENGE_1_NONCE_ENV,
+        E3B_CHALLENGE_2_NONCE_ENV,
         "CARGO_TARGET_DIR",
     ] {
         if env::var_os(key).is_some() {
             return Err(Failure::task(format!(
                 "DW1-E3A prepare refuses ambient {key}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn reject_e3b_payload_environment() -> Result<(), Failure> {
+    for key in [E3B_CHALLENGE_1_NONCE_ENV, E3B_CHALLENGE_2_NONCE_ENV] {
+        if env::var_os(key).is_some() {
+            return Err(Failure::task(format!(
+                "DW1-E3A product build refuses ambient {key}"
             )));
         }
     }
@@ -1632,6 +1763,50 @@ mod tests {
             COM2_PRELUDE
                 .ends_with(b"wyrmroot-loader: final UEFI memory map / ExitBootServices\r\n")
         );
+    }
+
+    #[test]
+    fn e3a_product_path_rejects_e3b_payload_environment() {
+        with_e3b_payload_environment("E300000000000002", "E300000000000003", || {
+            assert!(build_product_snapshot("E300000000000001").is_err());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn e3b_product_environment_binds_two_distinct_payload_nonces() {
+        let output = with_e3b_payload_environment("E300000000000002", "E300000000000003", || {
+            Command::new("/usr/bin/env").output().map_err(|error| {
+                Failure::task(format!("could not inspect test environment: {error}"))
+            })
+        })
+        .unwrap();
+        let environment = String::from_utf8(output.stdout).unwrap();
+        assert!(environment.contains("WYRMROOT_DW1E3_CHALLENGE_1_NONCE=E300000000000002\n"));
+        assert!(environment.contains("WYRMROOT_DW1E3_CHALLENGE_2_NONCE=E300000000000003\n"));
+        assert!(env::var_os(E3B_CHALLENGE_1_NONCE_ENV).is_none());
+        assert!(env::var_os(E3B_CHALLENGE_2_NONCE_ENV).is_none());
+    }
+
+    #[test]
+    fn kernel_environment_clears_e3b_payload_nonces() {
+        let output = with_e3b_payload_environment("E300000000000002", "E300000000000003", || {
+            let mut command = Command::new("/usr/bin/env");
+            configure_kernel_environment(
+                &mut command,
+                Path::new("/tmp/dw1e3a-kernel-test"),
+                "E300000000000001",
+            );
+            command.output().map_err(|error| {
+                Failure::task(format!("could not inspect kernel environment: {error}"))
+            })
+        })
+        .unwrap();
+        let environment = String::from_utf8(output.stdout).unwrap();
+        assert!(environment.contains("DEEPWYRM_DW1E_EVIDENCE_NONCE=E300000000000001\n"));
+        assert!(!environment.contains(E3B_CHALLENGE_1_NONCE_ENV));
+        assert!(!environment.contains(E3B_CHALLENGE_2_NONCE_ENV));
     }
 
     #[test]
