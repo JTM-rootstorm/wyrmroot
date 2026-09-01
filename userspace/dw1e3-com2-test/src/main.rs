@@ -26,9 +26,9 @@ use wyrmroot_loader::launch::{
     encode_ready_for_profile, parse_init,
 };
 use wyrmroot_registry_proto::{
-    Header as RegistryHeader, Lookup, Message as RegistryMessage,
-    MessageType as RegistryMessageType, ProtocolVersion, encode_lookup, parse as parse_registry,
-    parse_correlation_environment,
+    HEADER_BYTES as REGISTRY_HEADER_BYTES, Header as RegistryHeader, Lookup,
+    Message as RegistryMessage, MessageType as RegistryMessageType, ProtocolVersion, encode_lookup,
+    parse as parse_registry, parse_correlation_environment,
 };
 use wyrmroot_runtime::{
     BOOTSTRAP_CHANNEL_EXPECTATION, Dw1e3ReportEvent, NativeError, StartupBlock, close_handle,
@@ -145,7 +145,7 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
         return Err(21);
     }
     wait_readable(registry, 22)?;
-    let mut connected_bytes = [0; 72];
+    let mut connected_bytes = [0; REGISTRY_HEADER_BYTES];
     let mut no_handles = [DwReceivedHandleInfoV1::default(); 1];
     let counts =
         receive_channel(registry, &mut connected_bytes, &mut no_handles).map_err(|_| 23u32)?;

@@ -6,6 +6,8 @@ const SYSTEM_INIT: &str = include_str!("../../system-init/src/wyr1c_native.rs");
 
 #[test]
 fn evidence_probe_binds_only_after_the_production_stream_is_attached() {
+    assert!(PROBE.contains("let mut connected_bytes = [0; REGISTRY_HEADER_BYTES];"));
+
     let connected = PROBE
         .find("let stream = stream_handles[0].handle;")
         .unwrap();
