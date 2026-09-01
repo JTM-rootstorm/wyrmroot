@@ -2,6 +2,9 @@
 
 Date: 2026-08-31
 
+Status: exact default/UP and four-vCPU/SMP live extraction both
+`PARTIAL_PASS`; this is E3A evidence only and not selector acceptance.
+
 DW1-E3A now has a `q35-com2-interrupt` selector-31-only Wyrmroot product path for the first raw
 COM2 challenge round trip. The public ABI and the normal five-role WRRM
 inventory are unchanged. The product keeps production `devmgr` and
@@ -72,8 +75,21 @@ GPL-3.0-or-later.
 
 ## Explicit nonclaims and E3B seams
 
-This status does not claim a VM run, physical IRQ3 observation, UP/SMP guest
-evidence, the U1-to-U2 replacement leg, stale-U1 rejection, final accounting,
-the full 26-record collector, `DWTEST1 31 0`, or selector acceptance. E3B
-still owns probe/driver replacement cleanup, challenge 2, stale binding proof,
-final accounting, and terminal closure.
+The accepted live extraction used Wyrmroot
+`6587baa0c999e4db089338f8707099e11298fe34` with Deepwyrm
+`6b00f82ca075571581532bb3c15f5b2ff57d3ec3`. Both profiles joined the exact
+24-byte response SHA-256
+`3e6d96cb77a7aadea4a092f52d2d9e277814f08e07f4493c127f047e05ad0c9e`
+with all nine E3A records. The default evidence SHA-256 is
+`b4ee0b4750e46ec424aa8b6ca4a86fe7e5e2a8978eb5fb79d2ff84dd794678f8`;
+the SMP evidence SHA-256 is
+`b21ab0800a4ebfabdf9f36041989036cad5529b590a73a6bd346bc1e8bb54750`.
+The exact request and both profile results are preserved under root project
+path `.tmp/dw1e3a-6b00f82-6587baa-selector31/`, and the designated VM was
+restored to canonical shutoff state after each run.
+
+This status does not claim the U1-to-U2 replacement leg, stale-U1 rejection,
+final accounting, the full 26-record collector, `DWTEST1 31 0`, or selector
+acceptance. E3B still owns probe/driver replacement cleanup, challenge 2,
+stale binding proof, final accounting, and terminal closure. The live
+`PARTIAL_PASS` result remains explicit non-acceptance.
