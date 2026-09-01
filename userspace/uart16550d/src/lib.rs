@@ -82,6 +82,20 @@ impl PeerCloseDrain {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamSendResult {
+    Sent,
+    WouldBlock,
+    PeerClosed,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamSendAction {
+    Continue,
+    Detached(ControlMessageV1_1, ReceivedStreamEndpoint),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReceivedDeviceResource {
     pub handle: DwHandle,
     pub object_type: DwObjectType,
@@ -693,6 +707,34 @@ impl<I: ByteRegisterIo> ProductionDriver<I> {
 
     pub const fn pending_stream_bytes(&self) -> usize {
         self.pending_rx_len
+    }
+
+    /// Applies the state transition for one attempted WRST send. A peer-close
+    /// result preserves both the endpoint and prepared UART RX prefix so the
+    /// receive side can drain final queued DATA before detaching.
+    pub fn resolve_stream_send(
+        &mut self,
+        drain: &mut PeerCloseDrain,
+        result: StreamSendResult,
+    ) -> StreamSendAction {
+        match result {
+            StreamSendResult::Sent => {
+                self.commit_stream_send();
+                StreamSendAction::Continue
+            }
+            StreamSendResult::WouldBlock => StreamSendAction::Continue,
+            StreamSendResult::PeerClosed => {
+                drain.observe();
+                StreamSendAction::Continue
+            }
+            StreamSendResult::Failed => {
+                drain.clear();
+                match self.detach_stream() {
+                    Some((message, endpoint)) => StreamSendAction::Detached(message, endpoint),
+                    None => StreamSendAction::Continue,
+                }
+            }
+        }
     }
 
     /// Produces the exact graceful-close order. The caller performs the first
@@ -1308,5 +1350,115 @@ mod tests {
             usize::from(transmitted) + driver.uart().tx_len(),
             5 * MAX_PAYLOAD_BYTES
         );
+    }
+
+    #[test]
+    fn send_peer_close_preserves_final_inbound_data_until_empty_queue_proof() {
+        fn driver_with_pending_rx() -> (ProductionDriver<ScriptedIo>, ReceivedStreamEndpoint) {
+            let trace = Rc::new(RefCell::new(Vec::new()));
+            let mut io = ScriptedIo::new(trace);
+            io.push_reads(2, [1, 4, 1]);
+            io.push_reads(5, [0, 1, 0]);
+            io.push_reads(0, [0x41]);
+            let mut driver = production(io);
+            driver.activate().unwrap();
+            let endpoint = ReceivedStreamEndpoint {
+                handle: DwHandle(20),
+                object_type: DW_OBJECT_TYPE_CHANNEL,
+                rights: RAW_STREAM_RIGHTS,
+                reserved0: 0,
+                reserved: [0; 2],
+            };
+            driver
+                .attach_stream(
+                    ControlMessageV1_1::AttachStream {
+                        identity: identity(21),
+                        stream_generation: 22,
+                        publication_generation: 23,
+                    },
+                    endpoint,
+                )
+                .unwrap();
+            let drained = driver.drain_interrupt().unwrap();
+            assert_eq!(drained.work().received, 1);
+            driver
+                .acknowledge_interrupt(drained, true, |_| Ok(()))
+                .unwrap();
+            let mut wire = [0; MAX_RECORD_BYTES];
+            assert!(driver.prepare_stream_send(&mut wire).unwrap().is_some());
+            (driver, endpoint)
+        }
+
+        let (mut driver, endpoint) = driver_with_pending_rx();
+        let mut drain = PeerCloseDrain::new();
+        assert_eq!(driver.pending_stream_bytes(), 1);
+        assert_eq!(driver.rx_len(), 1);
+        assert!(driver.wants_stream_writable());
+        assert_eq!(driver.counters().tx_records, 0);
+
+        assert_eq!(
+            driver.resolve_stream_send(&mut drain, StreamSendResult::PeerClosed),
+            StreamSendAction::Continue
+        );
+        assert_eq!(driver.stream_endpoint(), Some(endpoint));
+        assert!(drain.is_pending());
+        assert_eq!(driver.pending_stream_bytes(), 1);
+        assert_eq!(driver.rx_len(), 1);
+        assert_eq!(driver.counters().tx_records, 0);
+        assert!(!(!drain.is_pending() && driver.wants_stream_writable()));
+        assert!(drain.include_stream_wait(driver.wants_stream_readable()));
+
+        let payload = b"final queued WRST data";
+        let mut wire = [0; MAX_RECORD_BYTES];
+        let size = encode_data(payload, &mut wire).unwrap();
+        assert_eq!(
+            driver.accept_stream_record(&wire[..size], 0),
+            Ok(payload.len())
+        );
+        assert_eq!(driver.stream_endpoint(), Some(endpoint));
+        assert_eq!(driver.uart().tx_len(), payload.len());
+
+        let (_, detached) = driver.detach_stream().unwrap();
+        drain.clear();
+        assert_eq!(detached, endpoint);
+        assert_eq!(driver.stream_endpoint(), None);
+        assert_eq!(driver.uart().tx_len(), payload.len());
+        assert_eq!(driver.pending_stream_bytes(), 0);
+        assert_eq!(driver.rx_len(), 1);
+        assert_eq!(driver.counters().tx_records, 0);
+        assert_eq!(driver.counters().rx_records, 1);
+
+        let (mut failed, endpoint) = driver_with_pending_rx();
+        let mut failed_drain = PeerCloseDrain::new();
+        failed_drain.observe();
+        let StreamSendAction::Detached(_, detached) =
+            failed.resolve_stream_send(&mut failed_drain, StreamSendResult::Failed)
+        else {
+            panic!("non-peer send failure must detach");
+        };
+        assert_eq!(detached, endpoint);
+        assert!(!failed_drain.is_pending());
+        assert_eq!(failed.stream_endpoint(), None);
+        assert_eq!(failed.pending_stream_bytes(), 0);
+        assert_eq!(failed.rx_len(), 1);
+        assert_eq!(failed.counters().tx_records, 0);
+
+        let (mut blocked, endpoint) = driver_with_pending_rx();
+        let mut blocked_drain = PeerCloseDrain::new();
+        assert_eq!(
+            blocked.resolve_stream_send(&mut blocked_drain, StreamSendResult::WouldBlock),
+            StreamSendAction::Continue
+        );
+        assert_eq!(blocked.stream_endpoint(), Some(endpoint));
+        assert_eq!(blocked.pending_stream_bytes(), 1);
+        assert_eq!(blocked.rx_len(), 1);
+
+        assert_eq!(
+            blocked.resolve_stream_send(&mut blocked_drain, StreamSendResult::Sent),
+            StreamSendAction::Continue
+        );
+        assert_eq!(blocked.pending_stream_bytes(), 0);
+        assert_eq!(blocked.rx_len(), 0);
+        assert_eq!(blocked.counters().tx_records, 1);
     }
 }

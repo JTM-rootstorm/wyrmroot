@@ -81,7 +81,7 @@ tools/pinned-cargo test -p wyrmroot-device-proto --lib --tests
 tools/pinned-cargo test -p wyrmroot-devmgr --lib --tests
 # 30 unit + 12 native-source regression tests passed
 tools/pinned-cargo test -p wyrmroot-uart16550d --lib --tests
-# 10 unit + 6 native-source + 1 D3C joined test passed
+# 11 unit + 6 native-source + 1 D3C joined test passed
 tools/pinned-cargo clippy -p wyrmroot-device-proto --lib --tests -- -D warnings
 tools/pinned-cargo clippy -p wyrmroot-uart16550-core --lib --tests -- -D warnings
 tools/pinned-cargo clippy -p wyrmroot-devmgr --lib --tests -- -D warnings

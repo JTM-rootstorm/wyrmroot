@@ -6,6 +6,7 @@ use wyrmroot_uart16550_core as _;
 use wyrmroot_uart16550d as _;
 
 const DRIVER: &str = include_str!("../src/main.rs");
+const DRIVER_POLICY: &str = include_str!("../src/lib.rs");
 const DEVMGR: &str = include_str!("../../devmgr/src/main.rs");
 const DEVMGR_MANIFEST: &str = include_str!("../../devmgr/Cargo.toml");
 const RETAINED_MANIFEST: &str = include_str!("../../wyr1-retained-stubs/Cargo.toml");
@@ -82,20 +83,19 @@ fn send_side_peer_close_enters_receive_drain_before_detach() {
     let send_peer_closed = writer
         .find("status_is(error, DW_STATUS_PEER_CLOSED)")
         .unwrap();
-    let pending_outcome = writer[send_peer_closed..]
-        .find("Ok(StreamWriteOutcome::PeerClosed)")
+    let pending_result = writer[send_peer_closed..]
+        .find("StreamSendResult::PeerClosed")
         .unwrap();
-    let isolate = writer[send_peer_closed..].find("isolate_stream").unwrap();
-    assert!(pending_outcome < isolate);
+    let resolution = writer[send_peer_closed..]
+        .find("driver.resolve_stream_send(peer_close_drain, result)")
+        .unwrap();
+    assert!(pending_result < resolution);
 
-    let dispatch = DRIVER
-        .find("Ok(StreamWriteOutcome::PeerClosed) =>")
+    let dispatch = DRIVER.find("service_stream_write(driver, control").unwrap();
+    let suppression = DRIVER
+        .find("!peer_close_drain.is_pending() && driver.wants_stream_writable()")
         .unwrap();
-    let observe = dispatch
-        + DRIVER[dispatch..]
-            .find("peer_close_drain.observe()")
-            .unwrap();
-    assert!(dispatch < observe && observe < writer_start);
+    assert!(suppression < dispatch && dispatch < writer_start);
 }
 
 #[test]
@@ -104,8 +104,16 @@ fn native_stream_and_teardown_paths_preserve_commit_and_close_order() {
     let send = DRIVER
         .find("send_channel(endpoint.handle, &bytes[..size], &[])")
         .unwrap();
-    let commit = DRIVER.find("driver.commit_stream_send()").unwrap();
-    assert!(prepare < send && send < commit);
+    let resolve = DRIVER
+        .find("driver.resolve_stream_send(peer_close_drain, result)")
+        .unwrap();
+    assert!(prepare < send && send < resolve);
+
+    let sent = DRIVER_POLICY.find("StreamSendResult::Sent =>").unwrap();
+    let commit = DRIVER_POLICY[sent..]
+        .find("self.commit_stream_send()")
+        .unwrap();
+    assert!(commit != 0);
 
     let disable = DRIVER
         .rfind("device_pio_write(driver.resource().handle, 1, 1, 0)")
