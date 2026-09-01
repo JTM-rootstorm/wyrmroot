@@ -156,7 +156,7 @@ fn selector31_controller_rejoins_response_temt_then_retires_u1_before_fresh_u2()
     assert!(temt < stage1 && stage1 < closed && closed < report);
     assert!(finalize < closed);
     assert!(NATIVE_SOURCE.contains("reap_e3a_probe(resident, system, waits, true)?"));
-    assert!(NATIVE_SOURCE.contains("if !admit_u2 {"));
+    assert!(NATIVE_SOURCE.contains("if cleanup_failed || !admit_u2 {"));
     assert!(NATIVE_SOURCE.contains("state.e3a_next_challenge_generation = 0;"));
     assert!(NATIVE_SOURCE.contains("} else if retired_generation == 1 {"));
     assert!(NATIVE_SOURCE.contains("state.e3a_next_challenge_generation = 2;"));
@@ -243,6 +243,8 @@ fn selector31_reaps_only_exact_normal_u1_or_u2_probe_exits() {
     assert!(
         u1_body.contains("!admit_u2 || wyrmroot_runtime::validate_successful_exit(&info).is_ok()")
     );
+    assert!(u1_body.contains("if cleanup_failed || !admit_u2"));
+    assert!(u1_body.contains("state.e3a_next_challenge_generation = 0;"));
 
     let u2_reap = NATIVE_SOURCE
         .find("fn reap_e3a_u2_probe_after_response")
@@ -252,6 +254,8 @@ fn selector31_reaps_only_exact_normal_u1_or_u2_probe_exits() {
     assert!(u2_body.contains("if observed_exit"));
     assert!(u2_body.contains("terminate_task_group(probe.task_group)"));
     assert!(u2_body.contains("Err(InitError::Supervision)"));
+    assert!(u2_body.contains("let fallback_exited"));
+    assert!(u2_body.contains("e3a_probe = Some(probe)"));
     assert!(u2_body.contains("e3a_u2_probe_reaped_successfully = true"));
     assert!(u2_body.contains("maybe_begin_e3a_retire(resident, system)"));
     let nonzero = u2_body.find("validate_successful_exit(&exit)").unwrap();
@@ -269,18 +273,40 @@ fn selector31_devmgr_or_registry_loss_poison_active_q1_and_q2_before_recovery() 
         "reap_e3a_probe(resident, system, waits, false)",
         "reap_driver(resident, system, waits, true)",
         "poison_e3a_lifecycle(resident)",
-        "resident.result = RecoveryResult::Degraded;",
+        "resident.result = RecoveryResult::Fatal;",
     ] {
         assert!(body.contains(required), "missing {required}");
     }
     assert!(NATIVE_SOURCE.contains("state.e3a_next_challenge_generation = 0;"));
+    let terminal_cleanup = NATIVE_SOURCE.find("fn finish_e3a_fatal_recovery").unwrap();
+    let terminal_body = &NATIVE_SOURCE[terminal_cleanup..];
+    for required in [
+        "state.registry.take()",
+        "state.devmgr.take()",
+        "cleanup_loaded(system, waits, devmgr.loaded, devmgr.task_group, true)",
+        "registry.active.loaded",
+        "system.close_handle(registry.control_channel)",
+        "retire_attempt_after_fatal(RoleId::Devmgr)",
+        "retire_attempt_after_fatal(RoleId::Registryd)",
+        "resident.controller.fatal();",
+        "resident.result = RecoveryResult::Fatal;",
+    ] {
+        assert!(terminal_body.contains(required), "missing {required}");
+    }
     let registry = NATIVE_SOURCE.find("fn recover_registry").unwrap();
     let devmgr = NATIVE_SOURCE.find("fn recover_devmgr").unwrap();
     assert!(
-        NATIVE_SOURCE[registry..].contains("fail_closed_e3a_recovery(resident, system, waits)?;")
+        NATIVE_SOURCE[registry..]
+            .contains("if fail_closed_e3a_recovery(resident, system, waits) {")
     );
     assert!(
-        NATIVE_SOURCE[devmgr..].contains("fail_closed_e3a_recovery(resident, system, waits)?;")
+        NATIVE_SOURCE[registry..].contains("finish_e3a_fatal_recovery(resident, system, waits);")
+    );
+    assert!(
+        NATIVE_SOURCE[devmgr..].contains("if fail_closed_e3a_recovery(resident, system, waits) {")
+    );
+    assert!(
+        NATIVE_SOURCE[devmgr..].contains("finish_e3a_fatal_recovery(resident, system, waits);")
     );
 }
 

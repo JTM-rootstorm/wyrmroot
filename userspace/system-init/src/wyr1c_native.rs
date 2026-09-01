@@ -2433,9 +2433,10 @@ where
         state.e3a_peer_closed = false;
         state.e3a_finalize_retire_sent = false;
         state.e3a_u2_probe_reaped_successfully = false;
-        if !admit_u2 {
+        if cleanup_failed || !admit_u2 {
             // Any unexpected probe loss poisons the selector lifecycle.  A
-            // later event must not recycle the retained identity into U2.
+            // failed cleanup must likewise never expose an intermediate U2
+            // admission after a nonzero or incomplete U1 probe exit.
             state.e3a_next_challenge_generation = 0;
         } else if retired_generation == 1 {
             state.e3a_next_challenge_generation = 2;
@@ -2509,21 +2510,34 @@ where
             .now()
             .ok()
             .and_then(|now| now.checked_add(WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns));
-        if let Some(fallback_deadline) = fallback_deadline {
-            let _ = waits.wait_many(
+        let fallback_exited = if let Some(fallback_deadline) = fallback_deadline {
+            matches!(
+                waits.wait_many(
                 core::slice::from_ref(&DwWaitItemV1 {
                     handle: probe.loaded.process,
                     signals: DW_SIGNAL_EXITED,
                 }),
                 DwDeadline(fallback_deadline),
-            );
-            // A late record is inspected but cannot turn the original
-            // timeout into an admissible U2 terminal path.
-            let _ = waits
-                .query_task_termination(probe.loaded.process)
-                .map(|exit| wyrmroot_runtime::validate_successful_exit(&exit));
+            ),
+                Ok(result) if result.index == 0 && result.observed.0 & DW_SIGNAL_EXITED.0 != 0
+            ) && matches!(
+                waits.query_task_termination(probe.loaded.process),
+                Ok(info) if info.state == DW_TASK_STATE_EXITED
+            )
         } else {
-            cleanup_failed = true;
+            false
+        };
+        if !fallback_exited {
+            // We have already closed the controller endpoint, but process and
+            // task-group ownership remain live until a later cleanup/reap can
+            // prove EXITED. Do not forget them on a successful-but-ineffective
+            // terminate request.
+            resident
+                .wyr1c
+                .as_mut()
+                .ok_or(InitError::WrongActivationOrder)?
+                .e3a_probe = Some(probe);
+            return Err(InitError::Cleanup);
         }
         Err(InitError::Supervision)
     };
@@ -2582,6 +2596,10 @@ where
     S: InitPlatform,
     W: SupervisionPlatform<Error = NativeError>,
 {
+    // A timed-out U2 reap can retain the process/task-group for a second
+    // bounded cleanup attempt. Consume that owner before poisoning its
+    // correlations so a live probe is never orphaned by this failure path.
+    let probe_cleanup = reap_e3a_probe(resident, system, waits, false);
     poison_e3a_lifecycle(resident);
     let driver_cleanup = if resident
         .wyr1c
@@ -2592,7 +2610,7 @@ where
     } else {
         Ok(())
     };
-    if driver_cleanup.is_err() {
+    if probe_cleanup.is_err() || driver_cleanup.is_err() {
         Err(InitError::Cleanup)
     } else {
         Err(error)
@@ -2607,7 +2625,7 @@ fn fail_closed_e3a_recovery<S, W>(
     resident: &mut ResidentSystemInit,
     system: &mut S,
     waits: &mut W,
-) -> Result<(), InitError>
+) -> bool
 where
     S: InitPlatform,
     W: SupervisionPlatform<Error = NativeError>,
@@ -2618,10 +2636,10 @@ where
             || state.e3a_stream_generation.is_some()
     });
     if !active {
-        return Ok(());
+        return false;
     }
-    let probe_cleanup = reap_e3a_probe(resident, system, waits, false);
-    let driver_cleanup = if resident
+    let _probe_cleanup = reap_e3a_probe(resident, system, waits, false);
+    let _driver_cleanup = if resident
         .wyr1c
         .as_ref()
         .is_some_and(|state| state.driver.is_some())
@@ -2631,11 +2649,70 @@ where
         Ok(())
     };
     poison_e3a_lifecycle(resident);
-    resident.result = RecoveryResult::Degraded;
-    if probe_cleanup.is_err() || driver_cleanup.is_err() {
+    // The triggering registry/devmgr role is still owned by its recovery
+    // caller. Leave a fatal-cleanup disposition for that caller to consume
+    // both actor lifetimes before this resident can return.
+    resident.result = RecoveryResult::Fatal;
+    true
+}
+
+/// Selector-31 recovery is terminal when a Q1/Q2 correlation was active: no
+/// replacement may inherit the poisoned state.  Consume both root actors even
+/// if only one delivered the triggering failure, then permanently retire their
+/// controller reservations without relaunching either role.
+#[cfg(feature = "dw1e3-selector31")]
+fn finish_e3a_fatal_recovery<S, W>(
+    resident: &mut ResidentSystemInit,
+    system: &mut S,
+    waits: &mut W,
+) -> Result<(), InitError>
+where
+    S: InitPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let (registry, devmgr) = {
+        let state = resident
+            .wyr1c
+            .as_mut()
+            .ok_or(InitError::WrongActivationOrder)?;
+        let registry = state.registry.take();
+        let devmgr = state.devmgr.take();
+        state.binding = None;
+        state.waiting_registry_observed = false;
+        (registry, devmgr)
+    };
+    resident.active[0] = None;
+    resident.active[1] = None;
+    let mut cleanup_failed = false;
+    if let Some(devmgr) = devmgr {
+        cleanup_failed |=
+            cleanup_loaded(system, waits, devmgr.loaded, devmgr.task_group, true).is_err();
+        cleanup_failed |= resident
+            .controller
+            .retire_attempt_after_fatal(RoleId::Devmgr)
+            .is_err();
+    }
+    if let Some(registry) = registry {
+        cleanup_failed |= cleanup_loaded(
+            system,
+            waits,
+            registry.active.loaded,
+            registry.active.task_group,
+            true,
+        )
+        .is_err();
+        cleanup_failed |= system.close_handle(registry.control_channel).is_err();
+        cleanup_failed |= resident
+            .controller
+            .retire_attempt_after_fatal(RoleId::Registryd)
+            .is_err();
+    }
+    resident.controller.fatal();
+    resident.result = RecoveryResult::Fatal;
+    if cleanup_failed {
         Err(InitError::Cleanup)
     } else {
-        Err(InitError::WrongManifestProfile)
+        Ok(())
     }
 }
 
@@ -3129,7 +3206,9 @@ where
     W: SupervisionPlatform<Error = NativeError>,
 {
     #[cfg(feature = "dw1e3-selector31")]
-    fail_closed_e3a_recovery(resident, system, waits)?;
+    if fail_closed_e3a_recovery(resident, system, waits) {
+        return finish_e3a_fatal_recovery(resident, system, waits);
+    }
     let registry = resident
         .wyr1c
         .as_mut()
@@ -3297,7 +3376,9 @@ where
     W: SupervisionPlatform<Error = NativeError>,
 {
     #[cfg(feature = "dw1e3-selector31")]
-    fail_closed_e3a_recovery(resident, system, waits)?;
+    if fail_closed_e3a_recovery(resident, system, waits) {
+        return finish_e3a_fatal_recovery(resident, system, waits);
+    }
     #[cfg(feature = "wyr1c6-selector29")]
     let restarting_d1 = {
         let state = resident

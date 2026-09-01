@@ -49,8 +49,10 @@ The Wyrmroot product model now requires the following causal order:
 7. System-init takes U1 probe ownership after the ordered peer-close report:
    it closes the controller launch endpoint for graceful exit, boundedly
    reaps the exact task group/process, and uses hard termination only as the
-   bounded fallback. A separately launched U2 probe is then bound as the
-   fresh reporter.
+   bounded fallback. U2 admission is committed only after that normal-zero
+   reap and all handle cleanup succeed; any failed close/reap/nonzero exit
+   poisons Q=0. A separately launched U2 probe is then bound as the fresh
+   reporter.
    A probe launch-channel `PEER_CLOSED` or Process `EXITED` signal at any
    earlier point (C1 pre-response, pre-peer-close, or U2) is instead an exact
    fail-closed supervision event: validate an observed exit when present,
@@ -63,9 +65,12 @@ The Wyrmroot product model now requires the following causal order:
    reaped with an exact successful-exit check while retaining the U2
    binding/TEMT join for the controller terminal claim. A timeout or nonzero
    exit remains a failed supervision event even if bounded cleanup later
-   observes termination. Devmgr/registry recovery while either selector leg is
+   observes termination. A terminated-but-still-running U2 probe retains its
+   process/task-group ownership for a further bounded cleanup attempt rather
+   than being forgotten. Devmgr/registry recovery while either selector leg is
    active likewise reaps the retained probe and driver, poisons all E3B
-   correlations, and cannot resume a stale Q1/Q2 lifecycle.
+   correlations, then terminally consumes both devmgr and registry lifetimes;
+   it cannot relaunch or resume a stale Q1/Q2 lifecycle.
 8. U2, P2, and its raw stream identity must each differ from U1/P1. Only then
    can the existing action 1 bind U2 and action 3 arm the fresh nonce-bound
    challenge 2.
