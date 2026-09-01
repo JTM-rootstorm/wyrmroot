@@ -1055,32 +1055,38 @@ fn value<'a>(values: &'a BTreeMap<String, String>, key: &str) -> Result<&'a str,
         .ok_or_else(|| Failure::task(format!("DW1-E3B omitted {key}")))
 }
 
-#[allow(dead_code)]
+// Per the DW1E WYR1D plan section 9, the root canonical runner owns live COM1
+// capture and acceptance. Wyrmroot xtask freezes only the product/handoff/result
+// contract, so this is a test-only E0 section-11 reference verifier rather than
+// a dormant acceptance path in the freezer.
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct FullEvidence {
-    pub(crate) sha256: String,
-    pub(crate) u1: [u64; 7],
-    pub(crate) u2: [u64; 7],
+struct FullEvidence {
+    sha256: String,
+    u1: [u64; 7],
+    u2: [u64; 7],
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct LegPayloadIdentity {
-    pub(crate) challenge_length: u64,
-    pub(crate) challenge_fnv: u64,
-    pub(crate) response_length: u64,
-    pub(crate) response_fnv: u64,
+struct LegPayloadIdentity {
+    challenge_length: u64,
+    challenge_fnv: u64,
+    response_length: u64,
+    response_fnv: u64,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct FullEvidenceInputs<'a> {
-    pub(crate) nonce: &'a str,
-    pub(crate) challenge_1: LegPayloadIdentity,
-    pub(crate) challenge_2: LegPayloadIdentity,
+struct FullEvidenceInputs<'a> {
+    nonce: &'a str,
+    challenge_1: LegPayloadIdentity,
+    challenge_2: LegPayloadIdentity,
 }
 
-/// Parses the byte-defined E0 section-11 transaction and its trusted terminal.
-#[allow(dead_code)]
-pub(crate) fn parse_full_evidence(
+#[cfg(test)]
+/// Validates the byte-defined E0 section-11 transaction and trusted terminal.
+fn parse_full_evidence(
     bytes: &[u8],
     inputs: FullEvidenceInputs<'_>,
 ) -> Result<FullEvidence, Failure> {
@@ -1091,10 +1097,8 @@ pub(crate) fn parse_full_evidence(
     const ACTORS: [u8; 26] = [
         0, 0, 0, 0, 0, 0, 1, 0, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 2, 0, 0, 0,
     ];
-    if inputs.nonce.len() != 16
-        || bytes.len() != 26 * 204 + 13
-        || &bytes[26 * 204..] != b"DWTEST1 31 0\n"
-    {
+    wyr1c6::validate_upper_hex_nonzero(inputs.nonce, 16, "DW1-E3B evidence nonce")?;
+    if bytes.len() != 26 * 204 + 13 || &bytes[26 * 204..] != b"DWTEST1 31 0\n" {
         return Err(Failure::task(
             "DW1-E3B evidence lacks exact 26-record DWTEST1 31/0 terminal",
         ));
@@ -1105,6 +1109,11 @@ pub(crate) fn parse_full_evidence(
         if &record[..6] != b"DWE3E1"
             || &record[7..9] != b"01"
             || record[203] != b'\n'
+            || [
+                6, 9, 26, 35, 38, 41, 58, 75, 92, 109, 126, 143, 160, 177, 194,
+            ]
+            .into_iter()
+            .any(|offset| record[offset] != b'|')
             || &record[10..26] != inputs.nonce.as_bytes()
             || parse_hex(&record[27..35])? != sequence as u64
             || parse_hex(&record[36..38])? != EVENTS[sequence] as u64
@@ -1132,7 +1141,13 @@ pub(crate) fn parse_full_evidence(
     }
     let u1: [u64; 7] = rows[3][..7].try_into().unwrap();
     let u2: [u64; 7] = rows[17][..7].try_into().unwrap();
-    if rows[0].iter().any(|value| *value != 0)
+    if rows[0][..7].iter().any(|value| *value != 0)
+        || ((rows[0][7] >> 32) & 0xff) != 0x30
+        || (rows[0][7] >> 48) != 0
+        || (rows[0][8] & 0xffff) != 3
+        || ((rows[0][8] >> 16) & 0x3) != 1
+        || ((rows[0][8] >> 18) & 0x3) != 1
+        || (rows[0][8] >> 60) != 0
         || rows[25].iter().any(|value| *value != 0)
         || u1.contains(&0)
         || u2.contains(&0)
@@ -1142,7 +1157,13 @@ pub(crate) fn parse_full_evidence(
         ));
     }
     for sequence in [1, 2] {
-        if rows[sequence][..5].contains(&0) || rows[sequence][5] != 0 || rows[sequence][6] != 0 {
+        if rows[sequence][..5] != u1[..5]
+            || rows[sequence][..5].contains(&0)
+            || rows[sequence][5] != 0
+            || rows[sequence][6] != 0
+            || rows[sequence][7] != 0
+            || rows[sequence][8] != 0
+        {
             return Err(Failure::task("DW1-E3B U1 reserve/commit tuple drifted"));
         }
     }
@@ -1152,9 +1173,12 @@ pub(crate) fn parse_full_evidence(
         }
     }
     for sequence in [15, 16] {
-        if rows[sequence][..5].contains(&0)
+        if rows[sequence][..5] != u2[..5]
+            || rows[sequence][..5].contains(&0)
             || rows[sequence][5] != 0
             || rows[sequence][6] != 0
+            || rows[sequence][7] != 0
+            || rows[sequence][8] != 0
             || rows[sequence][3] != u1[3]
         {
             return Err(Failure::task("DW1-E3B U2 reserve/commit tuple drifted"));
@@ -1206,6 +1230,81 @@ pub(crate) fn parse_full_evidence(
             return Err(Failure::task("DW1-E3B raw leg identity drifted"));
         }
     }
+    if inputs.challenge_1.challenge_fnv == inputs.challenge_2.challenge_fnv
+        || inputs.challenge_1.response_fnv == inputs.challenge_2.response_fnv
+    {
+        return Err(Failure::task(
+            "DW1-E3B nonce-distinct legs reuse a payload identity",
+        ));
+    }
+
+    let c1_physical = rows[3][7];
+    let c1_pending = rows[4][7];
+    let c1_repeat = rows[4][8];
+    let c1_ack = rows[7][7];
+    let c2_physical = rows[17][7];
+    let c2_pending = rows[18][7];
+    let c2_repeat = rows[18][8];
+    let c2_ack = rows[21][7];
+    if !(1..=254).contains(&c1_physical)
+        || rows[3][8] != 0
+        || c1_pending != c1_physical
+        || c1_repeat >= c1_pending
+        || rows[5][7] != 1
+        || rows[5][8] != 0
+        || !(1..=c1_pending).contains(&c1_ack)
+        || rows[7][8] != 0
+        || rows[9][7] != u1[5]
+        || rows[9][8] != 0
+        || rows[10][7] != 0
+        || rows[10][8] != 0
+        || rows[11][7] != 3
+        || !(1..=65_536).contains(&rows[11][8])
+        || rows[12][7] != 0
+        || rows[12][8] != 0
+        || rows[13][7] != 3
+        || rows[13][8] != 0
+        || rows[14][7] != 1
+        || rows[14][8] != 0
+        || !(1..=254).contains(&c2_physical)
+        || rows[17][8] != 0
+        || c2_pending != c2_physical
+        || c2_repeat >= c2_pending
+        || rows[19][7] != 1
+        || rows[19][8] != 0
+        || !(1..=c2_pending).contains(&c2_ack)
+        || rows[21][8] != 0
+    {
+        return Err(Failure::task("DW1-E3B evidence scalar relation drifted"));
+    }
+    let accounting = rows[24][7];
+    let counters = [
+        accounting & 0xff,
+        (accounting >> 8) & 0xff,
+        (accounting >> 16) & 0xff,
+        (accounting >> 24) & 0xff,
+        (accounting >> 32) & 0xff,
+        (accounting >> 40) & 0xff,
+        (accounting >> 48) & 0xff,
+        (accounting >> 56) & 0xff,
+    ];
+    if counters.contains(&0xff)
+        || !(2..=254).contains(&counters[0])
+        || counters[1] != counters[0]
+        || counters[2] > counters[0] - 2
+        || !(2..=counters[0]).contains(&counters[3])
+        || !(1..=254).contains(&counters[4])
+        || !(2..=254).contains(&counters[5])
+        || counters[6] != 2
+        || counters[7] != 1
+        || rows[24][8] != 1
+        || counters[0] != c1_physical + c2_physical
+        || counters[1] != c1_pending + c2_pending
+        || counters[2] != c1_repeat + c2_repeat
+        || counters[3] != c1_ack + c2_ack
+    {
+        return Err(Failure::task("DW1-E3B final accounting drifted"));
+    }
     Ok(FullEvidence {
         sha256: sha256::bytes_digest(bytes),
         u1,
@@ -1213,7 +1312,7 @@ pub(crate) fn parse_full_evidence(
     })
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn parse_hex(bytes: &[u8]) -> Result<u64, Failure> {
     let mut value = 0u64;
     for byte in bytes {
@@ -1229,7 +1328,7 @@ fn parse_hex(bytes: &[u8]) -> Result<u64, Failure> {
     }
     Ok(value)
 }
-#[allow(dead_code)]
+#[cfg(test)]
 const fn fnv1a32(bytes: &[u8]) -> u32 {
     let mut hash = 0x811c_9dc5u32;
     let mut i = 0;
@@ -1291,12 +1390,26 @@ mod tests {
         r[203] = b'\n';
         r
     }
-    #[test]
-    fn full_parser_accepts_exact_restart_tuple_and_terminal() {
+    fn patch_field(bytes: &mut [u8], sequence: usize, range: std::ops::Range<usize>, value: u64) {
+        let start = sequence * 204;
+        put_hex(&mut bytes[start + range.start..start + range.end], value);
+        let checksum = fnv1a32(&bytes[start..start + 195]) as u64;
+        put_hex(&mut bytes[start + 195..start + 203], checksum);
+    }
+
+    fn full_fixture() -> (Vec<u8>, FullEvidenceInputs<'static>, [u64; 7]) {
         let c1 = dw1e3a::challenge_pair("E300000000000001").unwrap();
         let c2 = dw1e3a::challenge_pair("E300000000000002").unwrap();
         let u1 = [1, 11, 1, 7, 3, 5, 9];
         let u2 = [2, 12, 2, 7, 4, 6, 10];
+        let accounting = 5_u64
+            | (5_u64 << 8)
+            | (2_u64 << 16)
+            | (5_u64 << 24)
+            | (1_u64 << 32)
+            | (2_u64 << 40)
+            | (2_u64 << 48)
+            | (1_u64 << 56);
         let mut bytes = Vec::new();
         for s in 0..26 {
             let tuple = match s {
@@ -1307,18 +1420,32 @@ mod tests {
                 _ => u2,
             };
             let (v, x) = match s {
+                0 => (3 | (0x30_u64 << 32), 3 | (1_u64 << 16) | (1_u64 << 18)),
+                3 => (2, 0),
+                4 => (2, 1),
+                5 => (1, 0),
                 6 => (c1.0.len() as u64, dw1e3a::fnv1a64(&c1.0)),
+                7 => (2, 0),
                 8 => (c1.1.len() as u64, dw1e3a::fnv1a64(&c1.1)),
+                9 => (u1[5], 0),
+                11 => (3, 4),
+                13 => (3, 0),
+                14 => (1, 0),
+                17 => (3, 0),
+                18 => (3, 1),
+                19 => (1, 0),
                 20 => (c2.0.len() as u64, dw1e3a::fnv1a64(&c2.0)),
+                21 => (3, 0),
                 22 => (c2.1.len() as u64, dw1e3a::fnv1a64(&c2.1)),
                 23 => (u2[2], u2[1]),
+                24 => (accounting, 1),
                 _ => (0, 0),
             };
             bytes.extend_from_slice(&record(s, tuple, v, x));
         }
         bytes.extend_from_slice(b"DWTEST1 31 0\n");
-        let parsed = parse_full_evidence(
-            &bytes,
+        (
+            bytes,
             FullEvidenceInputs {
                 nonce: "0123456789ABCDEF",
                 challenge_1: LegPayloadIdentity {
@@ -1334,9 +1461,91 @@ mod tests {
                     response_fnv: dw1e3a::fnv1a64(&c2.1),
                 },
             },
+            u2,
         )
-        .unwrap();
+    }
+
+    fn assert_scalar_mutation_rejected(
+        sequence: usize,
+        value: Option<u64>,
+        auxiliary: Option<u64>,
+    ) {
+        let (mut bytes, inputs, _) = full_fixture();
+        if let Some(value) = value {
+            patch_field(&mut bytes, sequence, 161..177, value);
+        }
+        if let Some(auxiliary) = auxiliary {
+            patch_field(&mut bytes, sequence, 178..194, auxiliary);
+        }
+        assert!(parse_full_evidence(&bytes, inputs).is_err());
+    }
+
+    #[test]
+    fn full_parser_accepts_exact_restart_tuple_and_terminal() {
+        let (bytes, inputs, u2) = full_fixture();
+        let parsed = parse_full_evidence(&bytes, inputs).unwrap();
         assert_eq!(parsed.u2, u2);
+        assert_eq!(parsed.u1, [1, 11, 1, 7, 3, 5, 9]);
+        assert_eq!(parsed.sha256, sha256::bytes_digest(&bytes));
+    }
+
+    #[test]
+    fn full_parser_rejects_route_and_event_scalar_mutations() {
+        for (sequence, value, auxiliary) in [
+            (0, Some(3), None),
+            (0, None, Some(3)),
+            (1, Some(1), None),
+            (3, Some(0), None),
+            (4, Some(1), None),
+            (4, None, Some(2)),
+            (5, Some(0), None),
+            (7, Some(3), None),
+            (9, Some(0), None),
+            (10, Some(1), None),
+            (11, Some(1), None),
+            (11, None, Some(0)),
+            (12, Some(1), None),
+            (13, None, Some(1)),
+            (14, Some(0), None),
+            (15, Some(1), None),
+            (17, Some(0), None),
+            (18, None, Some(3)),
+            (19, Some(0), None),
+            (21, Some(4), None),
+            (23, Some(1), None),
+        ] {
+            assert_scalar_mutation_rejected(sequence, value, auxiliary);
+        }
+    }
+
+    #[test]
+    fn full_parser_rejects_each_final_accounting_counter_relation() {
+        let (_, inputs, _) = full_fixture();
+        let accounting = 5_u64
+            | (5_u64 << 8)
+            | (2_u64 << 16)
+            | (5_u64 << 24)
+            | (1_u64 << 32)
+            | (2_u64 << 40)
+            | (2_u64 << 48)
+            | (1_u64 << 56);
+        for (shift, replacement) in [
+            (0, 1),
+            (8, 4),
+            (16, 4),
+            (24, 1),
+            (32, 0),
+            (40, 1),
+            (48, 1),
+            (56, 0),
+        ] {
+            let (mut bytes, _, _) = full_fixture();
+            let value = (accounting & !(0xff_u64 << shift)) | (replacement << shift);
+            patch_field(&mut bytes, 24, 161..177, value);
+            assert!(parse_full_evidence(&bytes, inputs).is_err());
+        }
+        assert_scalar_mutation_rejected(24, None, Some(2));
+        assert_scalar_mutation_rejected(24, None, Some(1_u64 << 8));
     }
     #[test]
     fn schema_requires_pairwise_distinct_evidence_and_payload_nonces() {
