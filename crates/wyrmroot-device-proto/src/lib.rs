@@ -11,6 +11,7 @@ pub mod connector;
 pub mod control;
 pub mod control_v1_1;
 pub mod controller;
+pub mod controller_v1_1;
 pub mod coordinator;
 pub mod d5_controller;
 pub mod driver_launch;
