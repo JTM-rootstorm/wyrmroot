@@ -42,6 +42,11 @@ Neighbor selector-31 native checks also require the compile-time
 `DEEPWYRM_DW1E_EVIDENCE_NONCE` (for example `0000000000000106`). Omitting it
 fails the existing runtime `env!` before the selected binary is checked;
 selector 32 obtains its nonce from the frozen gate configuration instead.
+The exact neighbor feature names are
+`wyrmroot-system-init/dw1e3-selector31,wyrmroot-devmgr/dw1e3-selector31`;
+`dw1e-selector31` is not a feature. Read Cargo manifests before selecting a
+neighbor profile; a rejected feature name is an invocation failure, not a
+product regression.
 The acceptance child additionally requires
 `wyrmroot-console-echo/native-console-echo`; selecting its package with
 `--bins` but omitting that feature silently skips the guest binary. An exact
@@ -199,3 +204,26 @@ consoled37/devmgr37/init105, workspace Clippy, formatting, and all five native
 D5 actors including console-echo with warnings denied. Full workspace results
 and fresh A4 UP/SMP acceptance must still be recorded; none of these host
 reproductions or debugger runs substitutes for live acceptance.
+
+## A4 completed-job termination race
+
+A4 completes the first three exact COM2 responses on both profiles, including
+driver replacement, then fails during child-only cleanup. GDB captures a
+CANCELLED reply followed by ERROR(ForeignOrUnknownJob) for TERMINATE. Init
+acknowledged cancellation before reaping the normally exited child in the
+same poll, then its active-only terminate lookup missed the still-visible
+completed result.
+
+The correction stays in JobController termination authorization: visible
+same-owner completed jobs and active jobs with staged terminal cleanup return
+WrongState/InvalidState without native termination. Foreign/hidden/closed/
+disconnected/stale/replayed cases retain their existing rejection. Consoled
+remains strict, and QUERY/LIST/shared lookup behavior is unchanged. The native
+dispatcher regression reproduces CANCELLED -> reap -> TERMINATE InvalidState
+-> WAIT exact result -> CLOSE_JOB and checks zero native termination calls.
+
+The A5 preparation source passes 1,086 default workspace executions across
+76 summaries, zero failures and one existing ignore; selected consoled37/
+devmgr37/init109, workspace Clippy and all five native D5 actor checks pass.
+The neighboring selector-31 init/devmgr check also passes after using the exact
+feature names above. Fresh A5 live acceptance remains required.
