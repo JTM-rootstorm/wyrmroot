@@ -3,10 +3,10 @@
 use super::*;
 use crate::wyr1b_job::{JobDispatcher, SessionOwner};
 use crate::wyr1b_native::{InstalledPeer, install_client, poll_job_dispatcher};
-use crate::wyr1d_gate::Gate;
+use crate::wyr1d_gate::{Batch, DrainFence, Gate};
 use wyrmroot_consoled::selector32::{READY, RELEASED, STATUS_BYTES, Status};
 use wyrmroot_device_proto::d5_controller::{
-    self, D5ControllerMessage, D5DriverIdentity, D5StreamIdentity,
+    self, D5ControllerMessage, D5DrainIdentity, D5DriverIdentity, D5StreamIdentity,
 };
 use wyrmroot_loader::process::{ConsoledLoadRequest, load_consoled_process};
 
@@ -24,6 +24,8 @@ pub(super) struct State {
     first_driver: Option<D5DriverIdentity>,
     last_ready: Option<Status>,
     pending_release: Option<Status>,
+    pending_fence: Option<DrainFence>,
+    fence_deadline: u64,
     released: bool,
 }
 
@@ -48,6 +50,8 @@ impl State {
             first_driver: None,
             last_ready: None,
             pending_release: None,
+            pending_fence: None,
+            fence_deadline: 0,
             released: false,
         })
     }
@@ -328,6 +332,9 @@ where
     let Some(console) = d5.console else {
         return Ok(());
     };
+    if d5.pending_fence.is_some() && now >= d5.fence_deadline {
+        return Err(InitError::Supervision);
+    }
     poll_job_dispatcher(system, loader, waits, context.authority, &mut d5.jobs, now)?;
     // Console release and process EXITED are independent observations. Retain
     // the exact console fact until the resident has sent the driver-reaped
@@ -383,6 +390,9 @@ where
     }
     let status =
         Status::parse(&bytes[..counts.bytes]).map_err(|_| InitError::WrongManifestProfile)?;
+    if d5.pending_fence.is_some() {
+        return Err(InitError::WrongManifestProfile);
+    }
     let devmgr = context.devmgr.ok_or(InitError::WrongActivationOrder)?;
     if status.kind == RELEASED {
         let old = d5.last_ready.ok_or(InitError::WrongActivationOrder)?;
@@ -446,6 +456,100 @@ where
     if status.kind == READY {
         d5.last_ready = Some(status);
     }
+    if matches!(status.leg, 2 | 4) {
+        hold_for_drain(d5, system, devmgr, driver, status, batch, now)?;
+        return Ok(());
+    }
+    publish_batch(system, devmgr, driver, &batch)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn hold_for_drain<S: InitPlatform>(
+    d5: &mut State,
+    system: &mut S,
+    devmgr: ActiveNativeRole,
+    driver: D5DriverIdentity,
+    status: Status,
+    batch: Batch,
+    now: u64,
+) -> Result<(), InitError> {
+    if d5.pending_fence.is_some() {
+        return Err(InitError::WrongManifestProfile);
+    }
+    let deadline = now
+        .checked_add(WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns)
+        .ok_or(InitError::Accounting)?;
+    d5.pending_fence =
+        Some(DrainFence::new(driver, status, batch).map_err(|_| InitError::WrongManifestProfile)?);
+    d5.fence_deadline = deadline;
+    send_pending_drain(d5, system, devmgr)
+}
+
+fn send_pending_drain<S: InitPlatform>(
+    d5: &mut State,
+    system: &mut S,
+    devmgr: ActiveNativeRole,
+) -> Result<(), InitError> {
+    let fence = d5
+        .pending_fence
+        .as_mut()
+        .ok_or(InitError::WrongActivationOrder)?;
+    send_devmgr(
+        system,
+        devmgr,
+        fence
+            .request()
+            .map_err(|_| InitError::WrongManifestProfile)?,
+    )?;
+    fence
+        .mark_requested()
+        .map_err(|_| InitError::WrongManifestProfile)
+}
+
+pub(super) fn tx_drained<S: InitPlatform>(
+    resident: &mut ResidentSystemInit,
+    system: &mut S,
+    identity: D5DrainIdentity,
+) -> Result<(), InitError> {
+    let state = resident
+        .wyr1c
+        .as_mut()
+        .ok_or(InitError::WrongActivationOrder)?;
+    let devmgr = state.devmgr.ok_or(InitError::WrongActivationOrder)?;
+    let d5 = state.d5.as_mut().ok_or(InitError::WrongActivationOrder)?;
+    let fence = take_completed_fence(d5, identity, system.now().map_err(InitError::Native)?)?;
+    let batch = fence
+        .completed(identity)
+        .map_err(|_| InitError::WrongManifestProfile)?;
+    publish_batch(system, devmgr, identity.driver, batch)
+}
+
+fn take_completed_fence(
+    d5: &mut State,
+    identity: D5DrainIdentity,
+    now: u64,
+) -> Result<DrainFence, InitError> {
+    if d5.driver != Some(identity.driver) || now >= d5.fence_deadline {
+        return Err(InitError::WrongManifestProfile);
+    }
+    d5.pending_fence
+        .as_ref()
+        .ok_or(InitError::WrongManifestProfile)?
+        .completed(identity)
+        .map_err(|_| InitError::WrongManifestProfile)?;
+    // Consume once before externally publishing. A submission/send failure is
+    // fatal; another completion cannot replay an already submitted record.
+    d5.pending_fence
+        .take()
+        .ok_or(InitError::WrongManifestProfile)
+}
+
+fn publish_batch<S: InitPlatform>(
+    system: &mut S,
+    devmgr: ActiveNativeRole,
+    driver: D5DriverIdentity,
+    batch: &Batch,
+) -> Result<(), InitError> {
     for record in &batch.records[..batch.count] {
         wyrmroot_runtime::submit_wyr1d_evidence(record).map_err(InitError::Native)?;
     }
@@ -574,7 +678,7 @@ mod tests {
     }
 
     #[test]
-    fn release_waits_for_exact_reap_and_commits_only_after_send() {
+    fn release_and_drain_wait_for_exact_facts_and_commit_only_after_send() {
         let driver = D5DriverIdentity {
             device_role_id: COM2_ROLE_ID.0,
             bundle_generation: 2,
@@ -616,6 +720,8 @@ mod tests {
             first_driver: Some(driver),
             last_ready: Some(status),
             pending_release: Some(status),
+            pending_fence: None,
+            fence_deadline: 0,
             released: false,
         };
         let mut context = PollContext {
@@ -706,6 +812,99 @@ mod tests {
             }))
         );
         flush_release(&mut state, context, &mut sender).unwrap();
+        assert_eq!(sender.sent, 1);
+
+        let ready = Status {
+            kind: READY,
+            sequence: 1,
+            ..status
+        };
+        state.gate.accept(ready, false).unwrap();
+        let mut batch = None;
+        let mut final_status = ready;
+        for (sequence, leg) in [(2, 1), (3, 2)] {
+            let (bytes, size) = wyrmroot_consoled::selector32::response(42, leg, status.tuple);
+            final_status = Status {
+                kind: wyrmroot_consoled::selector32::OBSERVED,
+                sequence,
+                leg,
+                rx: size as u64,
+                tx: size as u64,
+                value: wyrmroot_consoled::selector32::fnv(&bytes[..size]),
+                ..status
+            };
+            batch = Some(state.gate.accept(final_status, false).unwrap());
+        }
+        let batch = batch.unwrap();
+        let identity = D5DrainIdentity {
+            driver,
+            attach_transaction_id: status.tuple.transaction,
+            stream_generation: status.tuple.stream,
+            target_tx_bytes: 45,
+            leg: 2,
+        };
+        let devmgr = context.devmgr.unwrap();
+        let mut sender = Sender {
+            fail: true,
+            ..Sender::default()
+        };
+        assert!(
+            hold_for_drain(
+                &mut state,
+                &mut sender,
+                devmgr,
+                driver,
+                final_status,
+                batch,
+                1
+            )
+            .is_err()
+        );
+        assert_eq!(sender.sent, 0);
+        assert!(state.pending_fence.is_some());
+        assert!(take_completed_fence(&mut state, identity, 2).is_err());
+        assert!(
+            hold_for_drain(
+                &mut state,
+                &mut sender,
+                devmgr,
+                driver,
+                final_status,
+                batch,
+                2
+            )
+            .is_err()
+        );
+        sender.fail = false;
+        send_pending_drain(&mut state, &mut sender, devmgr).unwrap();
+        assert_eq!(
+            sender.last,
+            Some(D5ControllerMessage::RequestDrain(identity))
+        );
+        assert_eq!(sender.sent, 1);
+        assert!(send_pending_drain(&mut state, &mut sender, devmgr).is_err());
+        assert_eq!(sender.sent, 1);
+        assert!(
+            take_completed_fence(
+                &mut state,
+                D5DrainIdentity {
+                    attach_transaction_id: identity.attach_transaction_id + 1,
+                    ..identity
+                },
+                2
+            )
+            .is_err()
+        );
+        let expired = state.fence_deadline;
+        assert!(take_completed_fence(&mut state, identity, expired).is_err());
+        assert!(state.pending_fence.is_some());
+        let completed = take_completed_fence(&mut state, identity, 2).unwrap();
+        assert_eq!(completed.completed(identity).unwrap(), &batch);
+        assert!(state.pending_fence.is_none());
+        assert!(take_completed_fence(&mut state, identity, 2).is_err());
+        // Obtaining a completed batch is the only path that can expose its
+        // retirement flag; no RequestRetire was sent while the fence waited.
+        assert!(completed.completed(identity).unwrap().retire_driver);
         assert_eq!(sender.sent, 1);
     }
 }

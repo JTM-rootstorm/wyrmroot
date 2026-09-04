@@ -2,6 +2,9 @@
 //! driver custody and JobV2 readiness before supplying a console status.
 
 use wyrmroot_consoled::selector32::{Error, OBSERVED, READY, Status, Tuple, fnv, response};
+use wyrmroot_device_proto::d5_controller::{
+    D5ControllerMessage, D5DrainIdentity, D5DriverIdentity, RECORD_BYTES, encode,
+};
 
 pub const GATE_PATH: &str = "system/bootstrap/wyr1-d5-gate-v1";
 
@@ -54,6 +57,79 @@ impl Batch {
             ready: None,
             retire_driver: false,
         }
+    }
+}
+
+/// One withheld observation. Neither retirement nor terminal publication may
+/// consume its batch until the exact requested UART drain has completed.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct DrainFence {
+    identity: D5DrainIdentity,
+    batch: Batch,
+    requested: bool,
+}
+
+impl DrainFence {
+    pub(crate) fn new(
+        driver: D5DriverIdentity,
+        status: Status,
+        batch: Batch,
+    ) -> Result<Self, Error> {
+        let (record, target) = match status.leg {
+            2 => (8u32, 45),
+            4 => (12u32, 46),
+            _ => return Err(Error),
+        };
+        if status.kind != OBSERVED
+            || batch.count != 1
+            || batch.ready.is_some()
+            || batch.retire_driver != (status.leg == 2)
+            || batch.records[0][8..12] != record.to_le_bytes()
+            || status.tuple.role != driver.device_role_id
+            || status.tuple.bundle != driver.bundle_generation
+            || status.tuple.attempt != driver.driver_attempt_generation
+            || status.tuple.endpoint != driver.driver_control_endpoint_id
+            || status.tuple.endpoint_generation != driver.driver_control_endpoint_generation
+        {
+            return Err(Error);
+        }
+        let identity = D5DrainIdentity {
+            driver,
+            attach_transaction_id: status.tuple.transaction,
+            stream_generation: status.tuple.stream,
+            target_tx_bytes: target,
+            leg: status.leg,
+        };
+        encode(
+            D5ControllerMessage::RequestDrain(identity),
+            &mut [0; RECORD_BYTES],
+        )
+        .map_err(|_| Error)?;
+        Ok(Self {
+            identity,
+            batch,
+            requested: false,
+        })
+    }
+
+    pub(crate) fn request(&self) -> Result<D5ControllerMessage, Error> {
+        if self.requested {
+            return Err(Error);
+        }
+        Ok(D5ControllerMessage::RequestDrain(self.identity))
+    }
+
+    pub(crate) fn mark_requested(&mut self) -> Result<(), Error> {
+        self.request()?;
+        self.requested = true;
+        Ok(())
+    }
+
+    pub(crate) fn completed(&self, identity: D5DrainIdentity) -> Result<&Batch, Error> {
+        if !self.requested || identity != self.identity {
+            return Err(Error);
+        }
+        Ok(&self.batch)
     }
 }
 
@@ -412,5 +488,104 @@ mod tests {
         bad[valid.len() - 3] = b'a';
         assert!(parse_config(&bad).is_err());
         assert!(parse_config(b"schema = 1").is_err());
+    }
+
+    fn driver(t: Tuple) -> D5DriverIdentity {
+        D5DriverIdentity {
+            device_role_id: t.role,
+            bundle_generation: t.bundle,
+            driver_attempt_generation: t.attempt,
+            driver_control_endpoint_id: t.endpoint,
+            driver_control_endpoint_generation: t.endpoint_generation,
+            launch_transaction_id: 100 + t.attempt,
+        }
+    }
+
+    #[test]
+    fn full_sequence_withholds_retire_and_terminal_until_exact_requested_drain() {
+        let first = tuple();
+        let second = Tuple {
+            attempt: first.attempt + 1,
+            endpoint: first.endpoint + 1,
+            transaction: first.transaction + 1,
+            stream: first.stream + 1,
+            console: first.console + 1,
+            child: first.child + 1,
+            ..first
+        };
+        let third = Tuple {
+            child: second.child + 1,
+            ..second
+        };
+        let mut gate = Gate::new(42).unwrap();
+        let mut published = 0;
+        let mut retirements = 0;
+        for (status, old_clean) in [
+            (ready(1, first, 1), false),
+            (observation(2, 1, first, 1), false),
+            (observation(3, 2, first, 1), false),
+            (ready(4, second, 2), true),
+            (observation(5, 3, second, 2), false),
+            (ready(6, third, 3), true),
+            (observation(7, 4, third, 3), false),
+        ] {
+            let batch = gate.accept(status, old_clean).unwrap();
+            if matches!(status.leg, 2 | 4) {
+                assert_eq!(published, if status.leg == 2 { 7 } else { 11 });
+                let mut fence = DrainFence::new(driver(status.tuple), status, batch).unwrap();
+                let D5ControllerMessage::RequestDrain(identity) = fence.request().unwrap() else {
+                    panic!()
+                };
+                assert_eq!(identity.attach_transaction_id, status.tuple.transaction);
+                assert_ne!(
+                    identity.attach_transaction_id,
+                    identity.driver.launch_transaction_id
+                );
+                assert_eq!(
+                    identity.target_tx_bytes,
+                    if status.leg == 2 { 45 } else { 46 }
+                );
+                assert!(fence.completed(identity).is_err());
+                assert_eq!(retirements, if status.leg == 2 { 0 } else { 1 });
+                fence.mark_requested().unwrap();
+                assert!(fence.request().is_err());
+                assert!(fence.mark_requested().is_err());
+                for stale in [
+                    D5DrainIdentity {
+                        attach_transaction_id: identity.attach_transaction_id + 1,
+                        ..identity
+                    },
+                    D5DrainIdentity {
+                        stream_generation: identity.stream_generation + 1,
+                        ..identity
+                    },
+                    D5DrainIdentity {
+                        target_tx_bytes: identity.target_tx_bytes + 1,
+                        ..identity
+                    },
+                    D5DrainIdentity {
+                        leg: identity.leg + 1,
+                        ..identity
+                    },
+                    D5DrainIdentity {
+                        driver: D5DriverIdentity {
+                            launch_transaction_id: identity.driver.launch_transaction_id + 1,
+                            ..identity.driver
+                        },
+                        ..identity
+                    },
+                ] {
+                    assert!(fence.completed(stale).is_err());
+                }
+                let committed = fence.completed(identity).unwrap();
+                published += committed.count;
+                retirements += usize::from(committed.retire_driver);
+            } else {
+                published += batch.count;
+                assert!(!batch.retire_driver);
+            }
+        }
+        assert_eq!(published, 12);
+        assert_eq!(retirements, 1);
     }
 }

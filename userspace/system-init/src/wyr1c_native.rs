@@ -1160,6 +1160,8 @@ fn receive_controller_status<S: InitPlatform>(
 enum DevmgrControlInput {
     #[cfg(feature = "wyr1d-selector32")]
     D5Ready(wyrmroot_device_proto::d5_controller::D5DriverIdentity),
+    #[cfg(feature = "wyr1d-selector32")]
+    D5TxDrained(wyrmroot_device_proto::d5_controller::D5DrainIdentity),
     Status(ControllerMessage),
     #[cfg(feature = "wyr1c6-selector29")]
     C6Fact(C6Fact),
@@ -1204,6 +1206,9 @@ fn receive_devmgr_control<S: InitPlatform>(
                 wyrmroot_device_proto::d5_controller::D5ControllerMessage::DriverReady(
                     identity,
                 ) => Ok(DevmgrControlInput::D5Ready(identity)),
+                wyrmroot_device_proto::d5_controller::D5ControllerMessage::TxDrained(identity) => {
+                    Ok(DevmgrControlInput::D5TxDrained(identity))
+                }
                 _ => Err(InitError::WrongManifestProfile),
             }
         }
@@ -2968,6 +2973,10 @@ where
                                     selector32::driver_ready(
                                         resident, system, loader, waits, bootfs, identity,
                                     )
+                                }
+                                #[cfg(feature = "wyr1d-selector32")]
+                                Ok(DevmgrControlInput::D5TxDrained(identity)) => {
+                                    selector32::tx_drained(resident, system, identity)
                                 }
                                 #[cfg(feature = "dw1e3-selector31")]
                                 Ok(DevmgrControlInput::TransportEmpty(fact)) => {

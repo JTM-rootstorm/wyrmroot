@@ -62,15 +62,30 @@ passed 94 system-init unit tests, 37 system-init integration/source tests,
 27 consoled tests, and 120 runtime unit/source tests. Selector Clippy and both
 native binary checks passed with warnings denied.
 
+The subsequent transport-drain fence raises the system-init selector suite to
+100 tests. One retained batch withholds record 8/U1 retirement and record 12
+until the exact devmgr-forwarded UART `TxDrained` completion. Its identity
+includes the driver launch transaction and the distinct connector attach
+transaction, stream, fixed target (45/46 bytes), and leg (2/4). A request is
+marked sent only after Channel commit; an unsolicited, stale, duplicate,
+expired, or unsent completion cannot release the batch. Completion consumes
+the pending fence before publication, so a later submission/send failure
+cannot replay its record. The supervisor uses the existing bounded cleanup
+deadline while normal dispatcher polling continues. Tests cover the complete
+four-leg sequence, held retirement/terminal action, failed request send,
+wrong identity, duplicate request/completion, and deadline equality.
+
 ## Stack budget and remaining evidence
 
-The selector-enabled resident is 32,072 bytes on x86-64. Its specification-only
+The selector-enabled resident including the pending drain batch is 33,320 bytes
+on x86-64 (previously 32,072). Its specification-only
 resident partition is raised from 20 KiB to 40 KiB with headroom. The physical
 128 KiB child stack and 20 KiB JobV2 startup block remain unchanged. The D5
 dispatcher is no longer moved out of its resident on each tick. Consolidating
 the mutually exclusive B/D dispatchers is deferred optimization; actual guest
 stack usage and live UP/SMP operation still require product validation.
 
-The consoled observation establishes committed raw Channel output. It does not
-prove the UART has emptied its software queue, FIFO, or shift register. The
-coordinator must reconcile this with U1 retirement before live acceptance.
+The consoled observation establishes committed raw Channel output. UART
+transmission completion is supplied through the selector-private drain fence
+specified in `Plans/WYR1_D5_DRAIN_FENCE.md`. The paired devmgr/UART implementation
+must be integrated and the full frozen product validated live before acceptance.
