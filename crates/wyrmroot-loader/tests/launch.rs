@@ -3,12 +3,61 @@ use deepwyrm_syscall::{
     DW_OBJECT_TYPE_TASK_GROUP, DwHandle, DwReceivedHandleInfoV1,
 };
 use wyrmroot_loader::launch::{
-    self, BOOTFS_RIGHTS, CHILD_CHANNEL_RIGHTS, CHILD_CHANNEL_TRANSFER_RIGHTS,
+    self, BOOTFS_RIGHTS, CHILD_CHANNEL_RIGHTS, CHILD_CHANNEL_TRANSFER_RIGHTS, CONSOLED_BYTES,
     DEVICE_COORDINATOR_BYTES, DEVICE_COORDINATOR_RESOURCE_BYTES, DEVICE_DRIVER_BYTES,
     DEVICE_MANIFEST_RIGHTS, HEADER_BYTES, INIT0_BYTES, LOADER_TASK_GROUP_RIGHTS, LaunchError,
     LaunchProfile, PROBE_CHILD_BYTES, RESOURCE_DOMAIN_CLAIM_RIGHTS, SELF_ROOT_RIGHTS,
     SUPERVISOR_BYTES,
 };
+
+#[test]
+fn wyr1_d4_consoled_has_exact_hardware_free_multi_endpoint_profile() {
+    let mut init = [0xaa; CONSOLED_BYTES];
+    assert_eq!(
+        launch::encode_init(LaunchProfile::Consoled, 0xd400, &mut init),
+        Err(LaunchError::ProfileSpecificEncoderRequired)
+    );
+    assert_eq!(
+        launch::encode_consoled_init(0xd400, 2, 3, 4, 5, 6, &mut init),
+        Ok(CONSOLED_BYTES)
+    );
+    assert_eq!(
+        (get16(&init, 6), get32(&init, 16), get32(&init, 20)),
+        (10, 128, 3)
+    );
+    assert_eq!(
+        [get32(&init, 40), get32(&init, 48), get32(&init, 56)],
+        [1, 6, 7]
+    );
+    let handles = [
+        received(1, DW_OBJECT_TYPE_ADDRESS_REGION, SELF_ROOT_RIGHTS),
+        received(2, DW_OBJECT_TYPE_CHANNEL, CHILD_CHANNEL_RIGHTS),
+        received(3, DW_OBJECT_TYPE_CHANNEL, CHILD_CHANNEL_RIGHTS),
+    ];
+    let parsed = launch::parse_consoled_init(&init, &handles).unwrap();
+    assert_eq!(
+        (
+            parsed.transaction_id,
+            parsed.registry_generation,
+            parsed.registry_endpoint_id,
+            parsed.registry_endpoint_generation,
+            parsed.launch_connection_id,
+            parsed.launch_connection_generation,
+        ),
+        (0xd400, 2, 3, 4, 5, 6)
+    );
+    let mut wrong = handles;
+    wrong[2].rights = SELF_ROOT_RIGHTS;
+    assert_eq!(
+        launch::parse_consoled_init(&init, &wrong),
+        Err(LaunchError::HandleMetadata { index: 2 })
+    );
+    init[120..128].fill(0);
+    assert_eq!(
+        launch::parse_consoled_init(&init, &handles),
+        Err(LaunchError::ZeroTransaction)
+    );
+}
 
 #[test]
 fn child_channel_transfer_rights_are_sender_only_staging_authority() {

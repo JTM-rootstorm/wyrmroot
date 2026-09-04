@@ -9,11 +9,12 @@ use wyrmroot_loader::{
         RESOURCE_DOMAIN_CLAIM_RIGHTS, RESOURCE_DOMAIN_CLAIM_TRANSFER_RIGHTS,
     },
     process::{
-        D6ResourceOwnerLoadRequest, DeviceCoordinatorLoadError, DeviceCoordinatorLoadRequest,
+        ConsoledLoadError, ConsoledLoadRequest, D6ResourceOwnerLoadRequest,
+        DeviceCoordinatorLoadError, DeviceCoordinatorLoadRequest,
         DeviceCoordinatorResourceLoadRequest, DeviceDriverLoadError, DeviceDriverLoadRequest,
         JobLoadError, JobLoadRequest, LoadAuthority, LoadError, LoadFault, LoadRequest, LoadStage,
         LoaderPlatform, ParentMapping, ProcessCreateRequest, ProcessCreateResult,
-        ResourceDomainLoadRequest, ServiceLoadError, ServiceLoadRequest,
+        ResourceDomainLoadRequest, ServiceLoadError, ServiceLoadRequest, load_consoled_process,
         load_d6_resource_owner_process, load_device_coordinator_process,
         load_device_coordinator_resource_process, load_device_driver_process, load_job_process,
         load_process, load_process_with_fault, load_resource_domain_process, load_service_process,
@@ -353,6 +354,58 @@ fn owned_service_load_reports_the_exact_atomic_init_boundary() {
         }
     );
     assert!(!post_send.events.contains(&Event::Close(service_channel.0)));
+}
+
+#[test]
+fn consoled_moves_exactly_two_controller_endpoints_atomically() {
+    let image = executable();
+    let registry = DwHandle(0xd401);
+    let launch = DwHandle(0xd402);
+    let request = || ConsoledLoadRequest {
+        image: &image,
+        display_path: "/system/consoled",
+        registry_endpoint: registry,
+        registry_generation: 2,
+        registry_endpoint_id: 3,
+        registry_endpoint_generation: 4,
+        launch_endpoint: launch,
+        launch_connection_id: 5,
+        launch_connection_generation: 6,
+        transaction_id: 0xd400,
+    };
+
+    let mut failed = Mock::new(Some("send"));
+    assert_eq!(
+        load_consoled_process(&mut failed, authority(), request()).unwrap_err(),
+        ConsoledLoadError {
+            error: LoadError::Platform {
+                stage: LoadStage::InitSend,
+                cause: "send",
+                rollback_failed: false,
+            },
+            registry_endpoint_consumed: false,
+            launch_endpoint_consumed: false,
+        }
+    );
+    assert!(!failed.events.contains(&Event::Close(registry.0)));
+    assert!(!failed.events.contains(&Event::Close(launch.0)));
+
+    let mut platform = Mock::new(None);
+    load_consoled_process(&mut platform, authority(), request()).unwrap();
+    assert_eq!(platform.sent_init.len(), 128);
+    assert_eq!(&platform.sent_init[6..8], &10_u16.to_le_bytes());
+    assert_eq!(&platform.sent_init[20..24], &3_u32.to_le_bytes());
+    assert_eq!(platform.sent_transfers.len(), 3);
+    assert_eq!(platform.sent_transfers[1].handle, registry);
+    assert_eq!(platform.sent_transfers[2].handle, launch);
+    assert_eq!(
+        platform.sent_transfers[1].requested_rights,
+        wyrmroot_loader::launch::CHILD_CHANNEL_RIGHTS
+    );
+    assert_eq!(
+        platform.sent_transfers[2].requested_rights,
+        wyrmroot_loader::launch::CHILD_CHANNEL_RIGHTS
+    );
 }
 
 #[test]

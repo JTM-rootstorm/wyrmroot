@@ -97,6 +97,22 @@ pub struct ServiceLoadRequest<'a> {
     pub transaction_id: u64,
 }
 
+/// WYR1-D4 console-broker launch request. The two endpoints are distinct,
+/// caller-owned staging capabilities until the atomic INIT MOVE commits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConsoledLoadRequest<'a> {
+    pub image: &'a [u8],
+    pub display_path: &'a str,
+    pub registry_endpoint: DwHandle,
+    pub registry_generation: u64,
+    pub registry_endpoint_id: u64,
+    pub registry_endpoint_generation: u64,
+    pub launch_endpoint: DwHandle,
+    pub launch_connection_id: u64,
+    pub launch_connection_generation: u64,
+    pub transaction_id: u64,
+}
+
 /// WYR1-C device-coordinator launch request.  The publication endpoint and
 /// manifest are caller-owned until the INIT Channel MOVE succeeds; on a
 /// failed send the loader leaves both with the caller for one cleanup path.
@@ -165,6 +181,7 @@ struct InternalLoadRequest<'a> {
     device_manifest: Option<DwHandle>,
     supervisor_generation: Option<u64>,
     driver_correlation: Option<(u64, u64, u64, u64, u64, u64)>,
+    consoled_correlation: Option<(u64, u64, u64, u64, u64)>,
     resource_domain: Option<DwHandle>,
 }
 
@@ -267,6 +284,25 @@ pub struct DeviceCoordinatorLoadError<PlatformError> {
 pub struct DeviceDriverLoadError<PlatformError> {
     pub error: LoadError<PlatformError>,
     pub control_endpoint_consumed: bool,
+}
+
+/// D4 consoled-launch failure with exact ownership at the all-or-nothing INIT
+/// MOVE boundary.
+#[derive(Debug, Eq, PartialEq)]
+pub struct ConsoledLoadError<PlatformError> {
+    pub error: LoadError<PlatformError>,
+    pub registry_endpoint_consumed: bool,
+    pub launch_endpoint_consumed: bool,
+}
+
+impl<E> ConsoledLoadError<E> {
+    const fn caller_retains(error: LoadError<E>) -> Self {
+        Self {
+            error,
+            registry_endpoint_consumed: false,
+            launch_endpoint_consumed: false,
+        }
+    }
 }
 
 impl<E> DeviceDriverLoadError<E> {
@@ -530,6 +566,7 @@ pub fn load_resource_domain_process<P: LoaderPlatform>(
             device_manifest: None,
             supervisor_generation: None,
             driver_correlation: None,
+            consoled_correlation: None,
             resource_domain: Some(request.resource_domain),
         },
         LoadFault::None,
@@ -559,6 +596,7 @@ pub fn load_d6_resource_owner_process<P: LoaderPlatform>(
             device_manifest: None,
             supervisor_generation: None,
             driver_correlation: None,
+            consoled_correlation: None,
             resource_domain: Some(request.resource_domain),
         },
         LoadFault::None,
@@ -590,6 +628,7 @@ pub fn load_process_with_fault<P: LoaderPlatform>(
             device_manifest: None,
             supervisor_generation: None,
             driver_correlation: None,
+            consoled_correlation: None,
             resource_domain: None,
         },
         fault,
@@ -629,6 +668,7 @@ pub fn load_job_process<P: LoaderPlatform>(
             device_manifest: None,
             supervisor_generation: None,
             driver_correlation: None,
+            consoled_correlation: None,
             resource_domain: None,
         },
         LoadFault::None,
@@ -697,6 +737,7 @@ pub fn load_service_process<P: LoaderPlatform>(
             device_manifest: None,
             supervisor_generation: None,
             driver_correlation: None,
+            consoled_correlation: None,
             resource_domain: None,
         },
         LoadFault::None,
@@ -705,6 +746,64 @@ pub fn load_service_process<P: LoaderPlatform>(
     .map_err(|error| ServiceLoadError {
         error,
         service_channel_consumed,
+    })
+}
+
+/// Launches the D4 console broker with exactly its registry-client and
+/// launch-session endpoints. Both handles cross one atomic INIT MOVE, so a
+/// failure leaves both with the caller and a success consumes both.
+pub fn load_consoled_process<P: LoaderPlatform>(
+    platform: &mut P,
+    authority: LoadAuthority,
+    request: ConsoledLoadRequest<'_>,
+) -> Result<LoadedProcess, ConsoledLoadError<P::Error>> {
+    if request.display_path != "/system/consoled"
+        || request.registry_endpoint.0 == 0
+        || request.launch_endpoint.0 == 0
+        || request.registry_endpoint == request.launch_endpoint
+        || [
+            request.registry_generation,
+            request.registry_endpoint_id,
+            request.registry_endpoint_generation,
+            request.launch_connection_id,
+            request.launch_connection_generation,
+        ]
+        .contains(&0)
+    {
+        return Err(ConsoledLoadError::caller_retains(LoadError::Launch(
+            LaunchError::HandleCount,
+        )));
+    }
+    let channels = [request.registry_endpoint, request.launch_endpoint];
+    let mut endpoints_consumed = false;
+    load_process_internal(
+        platform,
+        authority,
+        InternalLoadRequest {
+            image: request.image,
+            profile: LaunchProfile::Consoled,
+            transaction_id: request.transaction_id,
+            startup: StartupSpec::Legacy(request.display_path),
+            channels: &channels,
+            device_manifest: None,
+            supervisor_generation: None,
+            driver_correlation: None,
+            consoled_correlation: Some((
+                request.registry_generation,
+                request.registry_endpoint_id,
+                request.registry_endpoint_generation,
+                request.launch_connection_id,
+                request.launch_connection_generation,
+            )),
+            resource_domain: None,
+        },
+        LoadFault::None,
+        &mut endpoints_consumed,
+    )
+    .map_err(|error| ConsoledLoadError {
+        error,
+        registry_endpoint_consumed: endpoints_consumed,
+        launch_endpoint_consumed: endpoints_consumed,
     })
 }
 
@@ -735,6 +834,7 @@ pub fn load_device_coordinator_process<P: LoaderPlatform>(
             device_manifest: Some(request.manifest),
             supervisor_generation: Some(request.supervisor_generation),
             driver_correlation: None,
+            consoled_correlation: None,
             resource_domain: None,
         },
         LoadFault::None,
@@ -777,6 +877,7 @@ pub fn load_device_coordinator_resource_process<P: LoaderPlatform>(
             device_manifest: Some(request.manifest),
             supervisor_generation: Some(request.supervisor_generation),
             driver_correlation: None,
+            consoled_correlation: None,
             resource_domain: Some(request.resource_domain),
         },
         LoadFault::None,
@@ -832,6 +933,7 @@ pub fn load_device_driver_process<P: LoaderPlatform>(
                 request.endpoint_id,
                 request.endpoint_generation,
             )),
+            consoled_correlation: None,
             resource_domain: None,
         },
         LoadFault::None,
@@ -850,13 +952,16 @@ fn load_process_internal<P: LoaderPlatform>(
     fault: LoadFault,
     delegated_channels_consumed: &mut bool,
 ) -> Result<LoadedProcess, LoadError<P::Error>> {
-    let expected_channels = if request.profile.channel_role().is_some()
+    let expected_channels = if request.profile == LaunchProfile::Consoled {
+        2
+    } else if request.profile.channel_role().is_some()
         || matches!(
             request.profile,
             LaunchProfile::DeviceCoordinator
                 | LaunchProfile::DeviceCoordinatorResourceDomain
                 | LaunchProfile::DeviceDriver
-        ) {
+        )
+    {
         1
     } else if request.profile == LaunchProfile::JobV2Streams {
         3
@@ -874,6 +979,9 @@ fn load_process_internal<P: LoaderPlatform>(
         return Err(LoadError::Launch(LaunchError::HandleCount));
     }
     if (request.profile == LaunchProfile::DeviceDriver) != request.driver_correlation.is_some() {
+        return Err(LoadError::Launch(LaunchError::HandleCount));
+    }
+    if (request.profile == LaunchProfile::Consoled) != request.consoled_correlation.is_some() {
         return Err(LoadError::Launch(LaunchError::HandleCount));
     }
     let mut segments = [empty_segment(); MAX_LOAD_SEGMENTS];
@@ -994,8 +1102,21 @@ fn load_process_materialized<P: LoaderPlatform>(
     stack_pointer: u64,
     startup_abi: u64,
 ) -> Result<LoadedProcess, LoadError<P::Error>> {
-    let mut init = [0_u8; launch::DEVICE_DRIVER_BYTES];
-    let init_len = if request.profile == LaunchProfile::DeviceCoordinator {
+    let mut init = [0_u8; launch::CONSOLED_BYTES];
+    let init_len = if request.profile == LaunchProfile::Consoled {
+        let (registry, registry_id, registry_generation, launch_id, launch_generation) = request
+            .consoled_correlation
+            .ok_or(LoadError::Launch(LaunchError::ZeroTransaction))?;
+        launch::encode_consoled_init(
+            request.transaction_id,
+            registry,
+            registry_id,
+            registry_generation,
+            launch_id,
+            launch_generation,
+            &mut init,
+        )
+    } else if request.profile == LaunchProfile::DeviceCoordinator {
         launch::encode_device_coordinator_init(
             request.transaction_id,
             request
@@ -1353,6 +1474,14 @@ fn load_process_materialized<P: LoaderPlatform>(
         } else {
             3
         }
+    } else if request.profile == LaunchProfile::Consoled {
+        for (index, handle) in request.channels.iter().copied().enumerate() {
+            transaction.delegated_channels[index] = Some(handle);
+        }
+        transfers[0] = transfer(created.root, SELF_ROOT_RIGHTS);
+        transfers[1] = transfer(request.channels[0], launch::CHILD_CHANNEL_RIGHTS);
+        transfers[2] = transfer(request.channels[1], launch::CHILD_CHANNEL_RIGHTS);
+        3
     } else if request.profile.channel_role().is_some() {
         transaction.delegated_channels[0] = Some(request.channels[0]);
         transfers[0] = transfer(created.root, SELF_ROOT_RIGHTS);

@@ -755,6 +755,24 @@ pub fn encode_lookup(header: Header, lookup: Lookup<'_>, out: &mut [u8]) -> Resu
     Ok(size)
 }
 
+/// Encodes one generation watch. Generation zero is the canonical first
+/// observation and also represents an absent publication in the reply.
+pub fn encode_watch(header: Header, watch: Watch<'_>, out: &mut [u8]) -> Result<usize, Error> {
+    if header.message_type != MessageType::Watch || watch.protocol_id == 0 {
+        return Err(Error::InvalidProtocolId);
+    }
+    validate_name(watch.service_name)?;
+    let size = 88usize
+        .checked_add(watch.service_name.len())
+        .ok_or(Error::ArithmeticOverflow)?;
+    encode_header(header, 0, size, out)?;
+    put_u64(out, 64, watch.protocol_id)?;
+    put_u64(out, 72, watch.last_observed_generation)?;
+    put_u16(out, 80, watch.service_name.len() as u16)?;
+    out[88..size].copy_from_slice(watch.service_name);
+    Ok(size)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn encode_install_publication(
     header: Header,
@@ -1315,6 +1333,18 @@ mod tests {
         assert_eq!(
             parse(&bytes[..size], 1).unwrap().message,
             Message::ConnectOffer(lookup)
+        );
+
+        endpoint.message_type = MessageType::Watch;
+        let watch = Watch {
+            protocol_id: 0x1300,
+            last_observed_generation: 19,
+            service_name: b"org.wyrmroot.echo",
+        };
+        let size = encode_watch(endpoint, watch, &mut bytes).unwrap();
+        assert_eq!(
+            parse(&bytes[..size], 0).unwrap().message,
+            Message::Watch(watch)
         );
 
         endpoint.message_type = MessageType::Cancelled;

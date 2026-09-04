@@ -23,6 +23,9 @@ pub const DEVICE_COORDINATOR_RESOURCE_BYTES: usize = 80;
 /// WYR1-C3's driver launch record carries the complete control correlation.
 /// It is deliberately distinct from the coordinator's three-capability ABI.
 pub const DEVICE_DRIVER_BYTES: usize = 104;
+/// WYR1-D4 `consoled` startup carries its two controller-issued endpoint
+/// correlations beside the exact self-root/registry/launch capability roles.
+pub const CONSOLED_BYTES: usize = 128;
 pub const MAX_CAPABILITIES: usize = 4;
 
 const MAGIC: &[u8; 4] = b"WRLP";
@@ -37,6 +40,7 @@ const MINOR_V1_6: u16 = 6;
 const MINOR_V1_7: u16 = 7;
 const MINOR_V1_8_TEST: u16 = 8;
 const MINOR_V1_9: u16 = 9;
+const MINOR_V1_10: u16 = 10;
 const TYPE_INIT: u32 = 1;
 const TYPE_READY: u32 = 2;
 const ROLE_SELF_ROOT: u32 = 1;
@@ -126,6 +130,9 @@ pub enum LaunchProfile {
     RegistryClient,
     /// WYR1-B launch client with self root and one launch-session endpoint.
     LaunchClient,
+    /// WYR1-D console broker with self root plus exact registry-client and
+    /// launch-session endpoints. It carries no device or debug authority.
+    Consoled,
     /// WYR1-B launched job with no startup stream roles.
     JobV2,
     /// WYR1-B launched job with exact stdin/stdout/stderr Channel roles.
@@ -160,6 +167,7 @@ impl LaunchProfile {
             | Self::BootstrapService
             | Self::RegistryClient
             | Self::LaunchClient => 2,
+            Self::Consoled => 3,
             Self::JobV2Streams => 3,
             Self::DeviceCoordinator => 3,
             Self::DeviceCoordinatorResourceDomain => 4,
@@ -183,13 +191,16 @@ impl LaunchProfile {
             Self::Dw1bProgress => MINOR_V1_4_TEST,
             Self::DeviceCoordinator => MINOR_V1_5,
             Self::DeviceCoordinatorResourceDomain => MINOR_V1_9,
+            Self::Consoled => MINOR_V1_10,
             Self::DeviceDriver => MINOR_V1_6,
             Self::Init0 | Self::I2Stress | Self::CapabilityController | Self::Hello => MINOR_V1_0,
         }
     }
 
     pub const fn init_size(self) -> usize {
-        if matches!(self, Self::DeviceCoordinator) {
+        if matches!(self, Self::Consoled) {
+            CONSOLED_BYTES
+        } else if matches!(self, Self::DeviceCoordinator) {
             DEVICE_COORDINATOR_BYTES
         } else if matches!(self, Self::DeviceCoordinatorResourceDomain) {
             DEVICE_COORDINATOR_RESOURCE_BYTES
@@ -224,6 +235,19 @@ pub struct DeviceDriverInit {
     pub endpoint_generation: u64,
 }
 
+/// Numeric correlation for the two endpoints moved in the D4 consoled INIT.
+/// These fields never manufacture authority; the capability records and
+/// received handle metadata remain authoritative.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConsoledInit {
+    pub transaction_id: u64,
+    pub registry_generation: u64,
+    pub registry_endpoint_id: u64,
+    pub registry_endpoint_generation: u64,
+    pub launch_connection_id: u64,
+    pub launch_connection_generation: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LaunchError {
     BufferSize,
@@ -252,6 +276,7 @@ pub fn encode_init(
         LaunchProfile::DeviceCoordinator
             | LaunchProfile::DeviceCoordinatorResourceDomain
             | LaunchProfile::DeviceDriver
+            | LaunchProfile::Consoled
     ) {
         return Err(LaunchError::ProfileSpecificEncoderRequired);
     }
@@ -288,6 +313,13 @@ fn encode_init_inner(
         }
         if profile.has_loader_authority_quartet() {
             put_u32(output, HEADER_BYTES + 3 * 8, ROLE_RESOURCE_DOMAIN);
+        }
+    } else if profile == LaunchProfile::Consoled {
+        for (index, role) in [ROLE_SELF_ROOT, ROLE_REGISTRY_CLIENT, ROLE_LAUNCH_SESSION]
+            .into_iter()
+            .enumerate()
+        {
+            put_u32(output, HEADER_BYTES + index * 8, role);
         }
     } else if profile == LaunchProfile::D6ResourceOwner {
         put_u32(output, HEADER_BYTES, ROLE_D6_RESOURCE_DOMAIN);
@@ -393,6 +425,43 @@ pub fn encode_device_driver_init(
     Ok(size)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn encode_consoled_init(
+    transaction_id: u64,
+    registry_generation: u64,
+    registry_endpoint_id: u64,
+    registry_endpoint_generation: u64,
+    launch_connection_id: u64,
+    launch_connection_generation: u64,
+    output: &mut [u8],
+) -> Result<usize, LaunchError> {
+    if [
+        registry_generation,
+        registry_endpoint_id,
+        registry_endpoint_generation,
+        launch_connection_id,
+        launch_connection_generation,
+    ]
+    .contains(&0)
+    {
+        return Err(LaunchError::ZeroTransaction);
+    }
+    let size = encode_init_inner(LaunchProfile::Consoled, transaction_id, output)?;
+    for (index, value) in [
+        registry_generation,
+        registry_endpoint_id,
+        registry_endpoint_generation,
+        launch_connection_id,
+        launch_connection_generation,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        put_u64(output, 88 + index * 8, value);
+    }
+    Ok(size)
+}
+
 pub fn parse_init(
     profile: LaunchProfile,
     bytes: &[u8],
@@ -442,6 +511,34 @@ pub fn parse_init(
                 RESOURCE_DOMAIN_CUSTODY_RIGHTS,
                 3,
             )?;
+        }
+    } else if profile == LaunchProfile::Consoled {
+        for (index, (role, object_type, rights)) in [
+            (
+                ROLE_SELF_ROOT,
+                DW_OBJECT_TYPE_ADDRESS_REGION,
+                SELF_ROOT_RIGHTS,
+            ),
+            (
+                ROLE_REGISTRY_CLIENT,
+                DW_OBJECT_TYPE_CHANNEL,
+                CHILD_CHANNEL_RIGHTS,
+            ),
+            (
+                ROLE_LAUNCH_SESSION,
+                DW_OBJECT_TYPE_CHANNEL,
+                CHILD_CHANNEL_RIGHTS,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if get_u32(bytes, HEADER_BYTES + index * 8) != role
+                || get_u32(bytes, HEADER_BYTES + index * 8 + 4) != 0
+            {
+                return Err(LaunchError::BadCapabilityRole { index });
+            }
+            validate_handle(handles[index], object_type, rights, index)?;
         }
     } else if profile == LaunchProfile::D6ResourceOwner {
         if get_u32(bytes, HEADER_BYTES) != ROLE_D6_RESOURCE_DOMAIN
@@ -582,6 +679,31 @@ pub fn parse_device_coordinator_init(
     })
 }
 
+pub fn parse_consoled_init(
+    bytes: &[u8],
+    handles: &[DwReceivedHandleInfoV1],
+) -> Result<ConsoledInit, LaunchError> {
+    let parsed = parse_init(LaunchProfile::Consoled, bytes, handles)?;
+    let fields = [
+        get_u64(bytes, 88),
+        get_u64(bytes, 96),
+        get_u64(bytes, 104),
+        get_u64(bytes, 112),
+        get_u64(bytes, 120),
+    ];
+    if fields.contains(&0) {
+        return Err(LaunchError::ZeroTransaction);
+    }
+    Ok(ConsoledInit {
+        transaction_id: parsed.transaction_id,
+        registry_generation: fields[0],
+        registry_endpoint_id: fields[1],
+        registry_endpoint_generation: fields[2],
+        launch_connection_id: fields[3],
+        launch_connection_generation: fields[4],
+    })
+}
+
 pub fn parse_device_coordinator_resource_init(
     bytes: &[u8],
     handles: &[DwReceivedHandleInfoV1],
@@ -653,6 +775,7 @@ impl LaunchProfile {
                     | Self::DeviceCoordinator
                     | Self::DeviceCoordinatorResourceDomain
                     | Self::DeviceDriver
+                    | Self::Consoled
             )
     }
 
