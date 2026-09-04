@@ -1,0 +1,18 @@
+[package]
+name = "wyrmroot-consoled"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+description = "Bounded WYR1-D serial console supervision model"
+
+[lib]
+path = "src/lib.rs"
+
+# This crate is intentionally tested standalone until the coordinator wires the
+# production binary into the Wyrmroot workspace.
+[workspace]
+
+[lints.rust]
+unsafe_code = "deny"
+unused_crate_dependencies = "deny"
