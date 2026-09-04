@@ -214,7 +214,7 @@ impl LineBuffer {
     }
 
     fn push(&mut self, byte: u8) -> Result<Option<Command>, ConsoleEchoError> {
-        if self.used == self.bytes.len() {
+        if self.used == self.bytes.len() || (self.used + 1 == self.bytes.len() && byte != b'\n') {
             return Err(ConsoleEchoError::LineTooLong);
         }
         self.bytes[self.used] = byte;
@@ -264,8 +264,8 @@ mod tests {
 
     use super::*;
     use deepwyrm_syscall::{
-        DW_OBJECT_TYPE_CHANNEL, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DW_SIGNAL_WRITABLE,
-        DW_STATUS_WOULD_BLOCK,
+        DW_OBJECT_TYPE_CHANNEL, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_WRITABLE, DW_STATUS_WOULD_BLOCK,
+        DwSignals,
     };
     use std::collections::VecDeque;
     use std::vec;
