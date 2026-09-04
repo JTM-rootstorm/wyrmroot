@@ -3689,6 +3689,10 @@ where
 }
 
 #[cfg(test)]
+#[path = "../../consoled/src/stream_transfer.rs"]
+mod consoled_stream_transfer;
+
+#[cfg(test)]
 mod tests {
     extern crate alloc;
 
@@ -3765,6 +3769,8 @@ mod tests {
         closed: [DwHandle; 32],
         close_count: usize,
         transferred_service: Option<DwHandle>,
+        sent_init: Vec<u8>,
+        sent_transfers: Vec<DwHandleTransferV1>,
         fail_init: bool,
     }
 
@@ -3775,6 +3781,8 @@ mod tests {
                 closed: [DwHandle(0); 32],
                 close_count: 0,
                 transferred_service: None,
+                sent_init: Vec::new(),
+                sent_transfers: Vec::new(),
                 fail_init: true,
             }
         }
@@ -3906,10 +3914,12 @@ mod tests {
         fn send_init(
             &mut self,
             _channel: DwHandle,
-            _bytes: &[u8],
+            bytes: &[u8],
             transfers: &[DwHandleTransferV1],
         ) -> Result<(), Self::Error> {
             self.transferred_service = transfers.last().map(|transfer| transfer.handle);
+            self.sent_init = bytes.to_vec();
+            self.sent_transfers = transfers.to_vec();
             if self.fail_init { Err(FAILURE) } else { Ok(()) }
         }
 
@@ -6000,6 +6010,86 @@ mod tests {
         assert_eq!(install.endpoint_generation, publication.endpoint_generation);
         assert_eq!(install.publication_id, FIRST_PUBLICATION_ID);
         assert_ne!(install.publication_id, install.endpoint_id);
+    }
+
+    #[test]
+    fn consoled_stream_descriptors_survive_init_then_reduce_at_actual_loader_move() {
+        use deepwyrm_syscall::DW_RIGHT_DUPLICATE;
+        use wyrmroot_loader::launch::{CHILD_CHANNEL_TRANSFER_RIGHTS, parse_init};
+        use wyrmroot_loader::process::{JobLoadRequest, load_job_process};
+
+        let streams = [DwHandle(0x901), DwHandle(0x902), DwHandle(0x903)];
+        let mut platform = MockPlatform::new();
+        for stream in streams {
+            let transfer = consoled_stream_transfer::move_transfer(stream);
+            assert_eq!(transfer.handle, stream);
+            assert_eq!(transfer.operation, DW_HANDLE_TRANSFER_MOVE);
+            assert_eq!(transfer.requested_rights, CHILD_CHANNEL_TRANSFER_RIGHTS);
+            assert_eq!(transfer.requested_rights.0 & DW_RIGHT_DUPLICATE.0, 0);
+            assert_eq!((transfer.reserved0, transfer.reserved), (0, [0; 2]));
+            // Query the authority delivered by the actual first-hop descriptor.
+            platform.fresh_rights = transfer.requested_rights;
+            validate_controller_channel(&mut platform, stream).unwrap();
+        }
+        assert_eq!(platform.queried[..platform.query_count], streams);
+
+        let image = executable();
+        let mut loader = InitSendLoader::new();
+        loader.fail_init = false;
+        load_job_process(
+            &mut loader,
+            LoadAuthority {
+                parent_root: DwHandle(1),
+                task_group: DwHandle(2),
+                bootfs: DwHandle(3),
+            },
+            JobLoadRequest {
+                image: &image,
+                policy_path: "bin/console-echo",
+                argv: &["bin/console-echo"],
+                environment: &[],
+                streams: &streams,
+                transaction_id: 0xd500,
+            },
+        )
+        .unwrap();
+        assert_eq!(loader.sent_transfers.len(), 3);
+        let mut received = [DwReceivedHandleInfoV1::default(); 3];
+        for (index, transfer) in loader.sent_transfers.iter().enumerate() {
+            assert_eq!(transfer.handle, streams[index]);
+            assert_eq!(transfer.operation, DW_HANDLE_TRANSFER_MOVE);
+            assert_eq!(transfer.requested_rights, CHILD_CHANNEL_RIGHTS);
+            assert_eq!(
+                transfer.requested_rights.0 & (DW_RIGHT_TRANSFER.0 | DW_RIGHT_DUPLICATE.0),
+                0
+            );
+            received[index] = DwReceivedHandleInfoV1 {
+                handle: transfer.handle,
+                rights: transfer.requested_rights,
+                object_type: DW_OBJECT_TYPE_CHANNEL,
+                ..DwReceivedHandleInfoV1::default()
+            };
+        }
+        parse_init(LaunchProfile::JobV2Streams, &loader.sent_init, &received).unwrap();
+    }
+
+    #[test]
+    fn consoled_stream_ingress_rejects_early_reduction_and_duplicate_authority() {
+        use deepwyrm_syscall::DW_RIGHT_DUPLICATE;
+
+        let transfer = consoled_stream_transfer::move_transfer(DwHandle(0x901));
+        for rights in [
+            DwRights(transfer.requested_rights.0 & !DW_RIGHT_TRANSFER.0),
+            DwRights(transfer.requested_rights.0 | DW_RIGHT_DUPLICATE.0),
+        ] {
+            let mut platform = MockPlatform::new();
+            platform.fresh_rights = rights;
+            assert_eq!(
+                validate_controller_channel(&mut platform, transfer.handle),
+                Err(InitError::ResourceIdentityMismatch)
+            );
+            assert_eq!(platform.query_count, 1);
+        }
     }
 
     #[test]

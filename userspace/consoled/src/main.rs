@@ -4,6 +4,9 @@
 
 use core::panic::PanicInfo;
 
+mod stream_transfer;
+use stream_transfer::move_transfer;
+
 use deepwyrm_syscall::{
     DW_HANDLE_TRANSFER_MOVE, DW_OBJECT_TYPE_CHANNEL, DW_RIGHT_DUPLICATE, DW_RIGHT_INSPECT,
     DW_RIGHT_READ, DW_RIGHT_TRANSFER, DW_RIGHT_WAIT, DW_RIGHT_WRITE, DW_SIGNAL_PEER_CLOSED,
@@ -48,8 +51,8 @@ const EVENT_TICK_NS: u64 = 1_000_000_000;
 const NANOS_PER_MILLI: u64 = 1_000_000;
 const FATAL_ATTACH_BASE: u32 = 0x0000_0100;
 
-/// Construction rights are local only. Every endpoint retained by consoled or
-/// moved to a child is reduced to the exact WRLP child-Channel rights.
+/// DUPLICATE stays local. The retained endpoint has final child-Channel rights;
+/// the peer keeps TRANSFER through init until the loader's final child MOVE.
 const CHANNEL_CONSTRUCTION_RIGHTS: DwRights =
     DwRights(CHILD_CHANNEL_RIGHTS.0 | DW_RIGHT_TRANSFER.0 | DW_RIGHT_DUPLICATE.0);
 const CONNECTOR_PAIR_RIGHTS: DwRights = DwRights(
@@ -2019,16 +2022,6 @@ fn create_reduced_stream_pair() -> Result<(DwHandle, DwHandle), u32> {
 
 fn validated_stream_endpoint(handle: DwHandle) -> Result<StreamEndpoint, StreamError> {
     StreamEndpoint::from_validated_handle(handle)
-}
-
-fn move_transfer(handle: DwHandle) -> DwHandleTransferV1 {
-    DwHandleTransferV1 {
-        handle,
-        requested_rights: CHILD_CHANNEL_RIGHTS,
-        operation: DW_HANDLE_TRANSFER_MOVE,
-        reserved0: 0,
-        reserved: [0; 2],
-    }
 }
 
 fn registry_header(
