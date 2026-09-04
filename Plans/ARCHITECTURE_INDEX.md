@@ -35,6 +35,7 @@ This file defines the minimum architecture reading set for Wyrmroot implementati
 - [`Plans/WYR1_D3A_D3C_IMPLEMENTATION_STATUS.md`](WYR1_D3A_D3C_IMPLEMENTATION_STATUS.md) records the reached D3A split DeviceResource/quiescence gate and D3C minor-1 direct-connector host/model gate, including separate WRDC 1.1/WRSC codecs, explicit endpoint-MOVE ownership, one-client reconnect, and preservation of selector-29 WRDC 1.0.
 - [`Plans/WYR1_D3B_D3D_IMPLEMENTATION_STATUS.md`](WYR1_D3B_D3D_IMPLEMENTATION_STATUS.md) records the reached D3B exact post-quiescence Interrupt activation and D3D bounded UART/WRST loop, including resident-owned correlation reservation, drain-before-ack PIO health, commit-after-send RX ownership, stream isolation/reconnect, and explicit product/live nonclaims.
 - [`Plans/WYR1_D4_IMPLEMENTATION_STATUS.md`](WYR1_D4_IMPLEMENTATION_STATUS.md) records the reached production `consoled` startup profile, generation-exact serial/child supervision model, bounded and fair native WRST/JobV2 brokerage, cleanup-before-replacement joins, accepted native-target build, and explicit selector-32/live nonclaims.
+- [`Plans/WYR1_D5_IMPLEMENTATION_STATUS.md`](WYR1_D5_IMPLEMENTATION_STATUS.md) records the accepted selector-32 UP/SMP native stdin/stdout/stderr product, driver and child-only replacement joins, GDB-guided broad regression repairs, exact A5 evidence/artifact identities and VM cleanup; D6 and overall WYR1-D closure remain pending.
 
 ## Active implementation status
 

@@ -1,6 +1,10 @@
 # D5 supervision validation checkpoint
 
-Date: 2026-09-04. Construction and host evidence only; no live acceptance.
+Date: 2026-09-04. The historical checkpoints below distinguish construction,
+host and failed live attempts. Final A5 live acceptance is recorded in
+[WYR1_D5_IMPLEMENTATION_STATUS.md](../../Plans/WYR1_D5_IMPLEMENTATION_STATUS.md):
+all four native console legs passed on both canonical UP/SMP profiles.
+D6 and overall WYR1-D closure remain pending.
 
 The selector retains the consoled launch-session owner before polling its first
 JobV2 launch. The existing dispatcher maps the retained bootfs authority and
