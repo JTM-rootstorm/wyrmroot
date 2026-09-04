@@ -1,0 +1,33 @@
+[package]
+name = "wyrmroot-console-echo"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+description = "Bounded WYR1-D native console acceptance client"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "console-echo"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["native-console-echo"]
+
+[features]
+default = []
+native-console-echo = []
+
+[dependencies]
+deepwyrm-syscall.workspace = true
+wyrmroot-loader = { path = "../../crates/wyrmroot-loader" }
+wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }
+
+[dev-dependencies]
+wyrmroot-stream-proto = { path = "../../crates/wyrmroot-stream-proto" }
+
+[lints.rust]
+unsafe_code = "deny"
+unused_crate_dependencies = "deny"
