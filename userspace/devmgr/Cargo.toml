@@ -33,6 +33,7 @@ dw1e3-selector31 = [
     "dep:wyrmroot-dw1e3-com2-test",
     "wyrmroot-runtime/dw1e3-test-evidence",
 ]
+wyr1d-selector32 = ["wyr1d-production", "wyr1c6-production"]
 
 [dependencies]
 deepwyrm-syscall.workspace = true
