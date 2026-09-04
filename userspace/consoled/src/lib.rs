@@ -10,6 +10,13 @@
 #[cfg(test)]
 extern crate std;
 
+#[cfg(feature = "native-consoled")]
+use {
+    deepwyrm_syscall as _, wyrmroot_device_proto as _, wyrmroot_launch_proto as _,
+    wyrmroot_loader as _, wyrmroot_registry_proto as _, wyrmroot_runtime as _,
+    wyrmroot_stream_proto as _,
+};
+
 pub const STAGING_CAPACITY: usize = 4096;
 pub const FAIR_SOURCE_BYTES_PER_TURN: usize = 1024;
 pub const RESTART_WINDOW_MILLIS: u64 = 60_000;
@@ -69,7 +76,7 @@ impl StreamKind {
 
 /// The complete correlation carried from registry lookup through raw WRST
 /// attachment. Every field is nonzero for an active connection.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SerialCorrelation {
     pub registry_generation: u64,
     pub registry_endpoint_id: u64,
@@ -101,9 +108,56 @@ impl SerialCorrelation {
             && self.stream_generation != 0
     }
 
-    /// A lexicographically newer complete tuple rejects A -> B -> A reuse.
-    pub fn strictly_after(self, previous: Self) -> bool {
-        self > previous
+    fn valid_transition_from(self, previous: Self) -> bool {
+        if self.registry_generation != previous.registry_generation
+            || self.registry_endpoint_id != previous.registry_endpoint_id
+            || self.registry_endpoint_generation != previous.registry_endpoint_generation
+            || self.device_role != previous.device_role
+            || self.connector_client_transaction <= previous.connector_client_transaction
+        {
+            return false;
+        }
+        if self.publication_generation == previous.publication_generation {
+            return self.device_bundle == previous.device_bundle
+                && self.driver_attempt == previous.driver_attempt
+                && self.driver_control_endpoint_id == previous.driver_control_endpoint_id
+                && self.driver_control_endpoint_generation
+                    == previous.driver_control_endpoint_generation
+                && self.attach_transaction > previous.attach_transaction
+                && self.stream_generation > previous.stream_generation;
+        }
+        self.publication_generation > previous.publication_generation
+            && self.driver_attempt > previous.driver_attempt
+            && self.driver_control_endpoint_generation > previous.driver_control_endpoint_generation
+            && self.attach_transaction > previous.attach_transaction
+            && self.stream_generation > previous.stream_generation
+            && self.device_bundle >= previous.device_bundle
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectRequest {
+    pub registry_generation: u64,
+    pub registry_endpoint_id: u64,
+    pub registry_endpoint_generation: u64,
+    pub requested_publication_generation: u64,
+    pub connector_client_transaction: u64,
+}
+
+impl ConnectRequest {
+    pub const fn valid(self) -> bool {
+        self.registry_generation != 0
+            && self.registry_endpoint_id != 0
+            && self.registry_endpoint_generation != 0
+            && self.requested_publication_generation != 0
+            && self.connector_client_transaction != 0
+    }
+    const fn matches(self, connected: SerialCorrelation) -> bool {
+        self.registry_generation == connected.registry_generation
+            && self.registry_endpoint_id == connected.registry_endpoint_id
+            && self.registry_endpoint_generation == connected.registry_endpoint_generation
+            && self.requested_publication_generation == connected.publication_generation
+            && self.connector_client_transaction == connected.connector_client_transaction
     }
 }
 
@@ -187,6 +241,19 @@ pub struct LaunchCleanup {
     pub entries: [EndpointCleanup; 6],
 }
 
+/// Non-copy proof that the caller completed the six explicit abort actions.
+#[derive(Debug, Eq, PartialEq)]
+pub struct LaunchCleanupToken {
+    identity: LaunchIdentity,
+    cleanup: LaunchCleanup,
+}
+
+impl LaunchCleanupToken {
+    pub const fn cleanup(&self) -> &LaunchCleanup {
+        &self.cleanup
+    }
+}
+
 /// Not `Copy` or `Clone`: this is exactly one JobV2 MOVE transaction.
 #[derive(Debug, Eq, PartialEq)]
 pub struct LaunchTransaction {
@@ -199,6 +266,14 @@ pub struct LaunchTransaction {
     child_peers: [Endpoint; 3],
     moved: [bool; 3],
     committed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LaunchIdentity {
+    serial: SerialCorrelation,
+    console_generation: u64,
+    child_generation: u64,
+    child_launch: u64,
 }
 
 impl LaunchTransaction {
@@ -469,6 +544,7 @@ pub struct Reservation {
     token: u64,
     source: Option<OutputSource>,
     length: usize,
+    event: EventGeneration,
 }
 
 impl Reservation {
@@ -513,12 +589,16 @@ pub struct ConsoleModel {
     next_output: OutputSource,
     pending_stdin: Option<Reservation>,
     pending_tx: Option<Reservation>,
+    pending_launch: Option<LaunchIdentity>,
+    pending_connect: Option<ConnectRequest>,
     child_window: RestartWindow,
     serial_window: RestartWindow,
     stable: Option<(ReadyToken, u64)>,
+    ready_observed: Option<EventGeneration>,
     serial_cleanup: bool,
     child_terminated: bool,
     child_reaped: bool,
+    child_failure_at: Option<u64>,
     last_now: Option<u64>,
     next_generation: u64,
     next_endpoint: u64,
@@ -555,12 +635,16 @@ impl ConsoleModel {
             next_output: OutputSource::Stdout,
             pending_stdin: None,
             pending_tx: None,
+            pending_launch: None,
+            pending_connect: None,
             child_window: RestartWindow::new(),
             serial_window: RestartWindow::new(),
             stable: None,
+            ready_observed: None,
             serial_cleanup: true,
             child_terminated: true,
             child_reaped: true,
+            child_failure_at: None,
             last_now: None,
             next_generation: 1,
             next_endpoint: 1,
@@ -570,6 +654,30 @@ impl ConsoleModel {
     }
     pub const fn state(&self) -> ConnectionState {
         self.state
+    }
+
+    /// Binds the exact registry/connector correlation expected to echo in the
+    /// CONNECTED reply. No later CONNECTED may substitute a merely newer tuple.
+    pub fn begin_connect(&mut self, expected: ConnectRequest) -> Result<(), ModelError> {
+        if self.state == ConnectionState::Exhausted {
+            return Err(ModelError::RestartExhausted);
+        }
+        if self.state != ConnectionState::Reconnecting || self.pending_connect.is_some() {
+            return Err(ModelError::WrongConnectionState);
+        }
+        if !expected.valid() {
+            return Err(ModelError::ZeroCorrelation);
+        }
+        self.pending_connect = Some(expected);
+        Ok(())
+    }
+
+    pub fn abort_connect(&mut self, request: ConnectRequest) -> Result<(), ModelError> {
+        if self.state != ConnectionState::Reconnecting || self.pending_connect != Some(request) {
+            return Err(ModelError::StaleCorrelation);
+        }
+        self.pending_connect = None;
+        Ok(())
     }
 
     /// CONNECTED clears the serial reconnect budget only.
@@ -586,19 +694,20 @@ impl ConsoleModel {
         {
             return Err(ModelError::WrongConnectionState);
         }
-        if !serial.connected() {
-            return Err(ModelError::ZeroCorrelation);
-        }
-        if self
-            .last_serial
-            .map(|old| !serial.strictly_after(old))
-            .unwrap_or(false)
+        let request = self.pending_connect.ok_or(ModelError::StaleCorrelation)?;
+        if !serial.connected()
+            || !request.matches(serial)
+            || self
+                .last_serial
+                .map(|previous| !serial.valid_transition_from(previous))
+                .unwrap_or(false)
         {
             return Err(ModelError::StaleCorrelation);
         }
         let console = self.allocate_generation()?;
         self.serial = Some(serial);
         self.last_serial = Some(serial);
+        self.pending_connect = None;
         self.console_generation = Some(console);
         self.state = ConnectionState::Active;
         self.serial_window.clear();
@@ -616,11 +725,14 @@ impl ConsoleModel {
         if self.state != ConnectionState::Active || self.serial.is_none() || self.child.is_some() {
             return Err(ModelError::WrongConnectionState);
         }
+        if self.pending_launch.is_some() {
+            return Err(ModelError::WrongConnectionState);
+        }
         if child_launch == 0 {
             return Err(ModelError::ZeroCorrelation);
         }
         let child_generation = self.allocate_generation()?;
-        Ok(LaunchTransaction {
+        let transaction = LaunchTransaction {
             serial: self.serial.ok_or(ModelError::WrongConnectionState)?,
             console_generation: self
                 .console_generation
@@ -640,7 +752,14 @@ impl ConsoleModel {
             ],
             moved: [false; 3],
             committed: false,
-        })
+        };
+        self.pending_launch = Some(LaunchIdentity {
+            serial: transaction.serial,
+            console_generation: transaction.console_generation,
+            child_generation: transaction.child_generation,
+            child_launch: transaction.child_launch,
+        });
+        Ok(transaction)
     }
 
     pub fn commit_child_launch(
@@ -658,6 +777,13 @@ impl ConsoleModel {
             || self.serial != Some(tx.serial)
             || self.console_generation != Some(tx.console_generation)
             || child_job == 0
+            || self.pending_launch
+                != Some(LaunchIdentity {
+                    serial: tx.serial,
+                    console_generation: tx.console_generation,
+                    child_generation: tx.child_generation,
+                    child_launch: tx.child_launch,
+                })
         {
             return Err(ModelError::StaleCorrelation);
         }
@@ -688,8 +814,41 @@ impl ConsoleModel {
         };
         tx.committed = true;
         self.child = Some(child);
+        self.pending_launch = None;
         self.stable = None;
         Ok(child)
+    }
+
+    pub fn abort_child_launch(
+        &mut self,
+        transaction: LaunchTransaction,
+    ) -> Result<LaunchCleanupToken, ModelError> {
+        let identity = LaunchIdentity {
+            serial: transaction.serial,
+            console_generation: transaction.console_generation,
+            child_generation: transaction.child_generation,
+            child_launch: transaction.child_launch,
+        };
+        if self.state != ConnectionState::Active
+            || self.child.is_some()
+            || self.serial != Some(identity.serial)
+            || self.console_generation != Some(identity.console_generation)
+            || self.pending_launch != Some(identity)
+        {
+            return Err(ModelError::StaleCorrelation);
+        }
+        let cleanup = transaction.abort_cleanup()?;
+        Ok(LaunchCleanupToken { identity, cleanup })
+    }
+    pub fn complete_abort_child_launch(
+        &mut self,
+        token: LaunchCleanupToken,
+    ) -> Result<LaunchCleanup, ModelError> {
+        if self.state != ConnectionState::Active || self.pending_launch != Some(token.identity) {
+            return Err(ModelError::StaleCorrelation);
+        }
+        self.pending_launch = None;
+        Ok(token.cleanup)
     }
 
     pub fn event_is_current(&self, event: EventGeneration) -> bool {
@@ -725,7 +884,7 @@ impl ConsoleModel {
         self.time(now)?;
         self.require_current(event)?;
         self.last_failure = Some(ModelError::WrongDirection);
-        self.start_child_retirement(false)
+        self.start_child_retirement(false, true, now)
     }
     pub fn child_peer_closed(
         &mut self,
@@ -736,7 +895,7 @@ impl ConsoleModel {
         self.time(now)?;
         self.require_current(event)?;
         self.mark_child_peer_closed(event, kind)?;
-        self.start_child_retirement(false)
+        self.start_child_retirement(false, true, now)
     }
     /// Cleanup evidence is accepted while a child is retiring, but remains
     /// bound to the exact child session rather than treated as fresh DATA.
@@ -774,25 +933,37 @@ impl ConsoleModel {
         self.mark_child_peer_closed(event, StreamKind::Stderr)
     }
     /// A raw close consumes no restart budget. Reconnect failure does.
-    pub fn serial_peer_closed(&mut self, now: u64) -> Result<RecoveryAction, ModelError> {
+    pub fn serial_peer_closed(
+        &mut self,
+        serial: SerialCorrelation,
+        console_generation: u64,
+        now: u64,
+    ) -> Result<RecoveryAction, ModelError> {
         self.time(now)?;
-        if self.state != ConnectionState::Active {
+        if self.state != ConnectionState::Active
+            || self.serial != Some(serial)
+            || self.console_generation != Some(console_generation)
+        {
             return Err(ModelError::WrongConnectionState);
         }
         self.serial_cleanup = false;
         self.stable = None;
         self.clear_reservations();
         if self.child.is_some() {
-            self.start_child_retirement(true)
+            self.start_child_retirement(true, false, now)
         } else {
             self.child_terminated = true;
             self.child_reaped = true;
             self.finish_serial_cleanup(now)
         }
     }
-    pub fn child_terminated(&mut self, now: u64) -> Result<RecoveryAction, ModelError> {
+    pub fn child_terminated(
+        &mut self,
+        event: EventGeneration,
+        now: u64,
+    ) -> Result<RecoveryAction, ModelError> {
         self.time(now)?;
-        if self.state != ConnectionState::RetiringChild {
+        if self.state != ConnectionState::RetiringChild || !self.event_matches_child(event) {
             return Err(ModelError::WrongConnectionState);
         }
         self.child_terminated = true;
@@ -801,17 +972,33 @@ impl ConsoleModel {
             self.child.map(|value| value.ids.child_job).unwrap_or(0),
         ))
     }
-    pub fn child_reaped(&mut self, now: u64) -> Result<RecoveryAction, ModelError> {
+    pub fn child_reaped(
+        &mut self,
+        event: EventGeneration,
+        now: u64,
+    ) -> Result<RecoveryAction, ModelError> {
         self.time(now)?;
-        if self.state != ConnectionState::AwaitingReap || !self.child_terminated {
+        if self.state != ConnectionState::AwaitingReap
+            || !self.child_terminated
+            || !self.event_matches_child(event)
+        {
             return Err(ModelError::WrongConnectionState);
         }
         self.child_reaped = true;
         self.complete_retirement(now)
     }
-    pub fn complete_serial_cleanup(&mut self, now: u64) -> Result<RecoveryAction, ModelError> {
+    pub fn complete_serial_cleanup(
+        &mut self,
+        serial: SerialCorrelation,
+        console_generation: u64,
+        now: u64,
+    ) -> Result<RecoveryAction, ModelError> {
         self.time(now)?;
-        if self.state != ConnectionState::AwaitingReap || self.serial_cleanup || !self.child_reaped
+        if self.state != ConnectionState::AwaitingReap
+            || self.serial_cleanup
+            || !self.child_reaped
+            || self.serial != Some(serial)
+            || self.console_generation != Some(console_generation)
         {
             return Err(ModelError::WrongConnectionState);
         }
@@ -830,6 +1017,9 @@ impl ConsoleModel {
         if self.state != ConnectionState::Reconnecting {
             return Err(ModelError::WrongConnectionState);
         }
+        // Covers both a failed reserved connector attempt and an earlier
+        // registry lookup/watch failure where no request existed yet.
+        self.pending_connect = None;
         if self.serial_window.add(now) {
             self.state = ConnectionState::Exhausted;
             self.last_failure = Some(ModelError::RestartExhausted);
@@ -845,6 +1035,10 @@ impl ConsoleModel {
         &mut self,
         output: &mut [u8],
     ) -> Result<Option<Reservation>, ModelError> {
+        if output.is_empty() {
+            return Ok(None);
+        }
+        let event = self.live_event()?;
         if self.pending_stdin.is_some() {
             return Err(ModelError::AlreadyReserved);
         }
@@ -856,12 +1050,13 @@ impl ConsoleModel {
             token: self.allocate_reservation()?,
             source: None,
             length,
+            event,
         };
         self.pending_stdin = Some(reservation);
         Ok(Some(reservation))
     }
     pub fn commit_child_stdin(&mut self, reservation: Reservation) -> Result<(), ModelError> {
-        if self.pending_stdin != Some(reservation) {
+        if self.pending_stdin != Some(reservation) || self.live_event()? != reservation.event {
             return Err(ModelError::UnknownReservation);
         }
         self.input.consume(reservation.length);
@@ -869,7 +1064,7 @@ impl ConsoleModel {
         Ok(())
     }
     pub fn release_child_stdin(&mut self, reservation: Reservation) -> Result<(), ModelError> {
-        if self.pending_stdin != Some(reservation) {
+        if self.pending_stdin != Some(reservation) || self.live_event()? != reservation.event {
             return Err(ModelError::UnknownReservation);
         }
         self.pending_stdin = None;
@@ -880,6 +1075,10 @@ impl ConsoleModel {
         &mut self,
         output: &mut [u8],
     ) -> Result<Option<Reservation>, ModelError> {
+        if output.is_empty() {
+            return Ok(None);
+        }
+        let event = self.live_event()?;
         if self.pending_tx.is_some() {
             return Err(ModelError::AlreadyReserved);
         }
@@ -899,12 +1098,13 @@ impl ConsoleModel {
             token: self.allocate_reservation()?,
             source: Some(source),
             length,
+            event,
         };
         self.pending_tx = Some(reservation);
         Ok(Some(reservation))
     }
     pub fn commit_serial_tx(&mut self, reservation: Reservation) -> Result<(), ModelError> {
-        if self.pending_tx != Some(reservation) {
+        if self.pending_tx != Some(reservation) || self.live_event()? != reservation.event {
             return Err(ModelError::UnknownReservation);
         }
         let source = reservation.source.ok_or(ModelError::UnknownReservation)?;
@@ -914,7 +1114,7 @@ impl ConsoleModel {
         Ok(())
     }
     pub fn release_serial_tx(&mut self, reservation: Reservation) -> Result<(), ModelError> {
-        if self.pending_tx != Some(reservation) {
+        if self.pending_tx != Some(reservation) || self.live_event()? != reservation.event {
             return Err(ModelError::UnknownReservation);
         }
         self.pending_tx = None;
@@ -923,7 +1123,10 @@ impl ConsoleModel {
 
     pub fn ready_token(&self) -> Option<ReadyToken> {
         let child = self.child?;
-        if self.state != ConnectionState::Active || !child.ids.complete() || !child.all_peers_live()
+        if self.state != ConnectionState::Active
+            || !child.ids.complete()
+            || !child.all_peers_live()
+            || self.ready_observed != Some(EventGeneration::from(child.ids))
         {
             return None;
         }
@@ -936,11 +1139,26 @@ impl ConsoleModel {
             ],
         })
     }
+    /// Exact child READY begins a stable interval; stale READY cannot alter a
+    /// newer session's token or restart budget.
+    pub fn observe_child_ready(
+        &mut self,
+        event: EventGeneration,
+        now: u64,
+    ) -> Result<ReadyToken, ModelError> {
+        self.time(now)?;
+        if !self.event_is_current(event) {
+            return Err(ModelError::StaleCorrelation);
+        }
+        self.ready_observed = Some(event);
+        let token = self.ready_token().ok_or(ModelError::WrongConnectionState)?;
+        self.stable = Some((token, now));
+        Ok(token)
+    }
     /// Exact READY identity clears only child failures after 60 continuous seconds.
     pub fn observe_ready(&mut self, now: u64, token: ReadyToken) -> Result<bool, ModelError> {
         self.time(now)?;
         if self.ready_token() != Some(token) {
-            self.stable = None;
             return Err(ModelError::StaleCorrelation);
         }
         match self.stable {
@@ -991,9 +1209,19 @@ impl ConsoleModel {
             Ok(())
         } else {
             self.last_failure = Some(ModelError::StaleCorrelation);
-            self.stable = None;
             Err(ModelError::StaleCorrelation)
         }
+    }
+    fn event_matches_child(&self, event: EventGeneration) -> bool {
+        self.child.map(|value| EventGeneration::from(value.ids)) == Some(event)
+    }
+    fn live_event(&self) -> Result<EventGeneration, ModelError> {
+        let child = self.child.ok_or(ModelError::NoChild)?;
+        let event = EventGeneration::from(child.ids);
+        if self.state != ConnectionState::Active || !child.all_peers_live() {
+            return Err(ModelError::WrongConnectionState);
+        }
+        Ok(event)
     }
     fn mark_child_peer_closed(
         &mut self,
@@ -1011,11 +1239,15 @@ impl ConsoleModel {
     fn start_child_retirement(
         &mut self,
         serial_cleanup: bool,
+        capture_child_failure: bool,
+        now: u64,
     ) -> Result<RecoveryAction, ModelError> {
-        self.stable = None;
-        self.clear_reservations();
+        self.clear_volatile();
         self.child_terminated = false;
         self.child_reaped = false;
+        if capture_child_failure && self.child_failure_at.is_none() {
+            self.child_failure_at = Some(now);
+        }
         if serial_cleanup {
             self.serial_cleanup = false;
         }
@@ -1034,7 +1266,8 @@ impl ConsoleModel {
         }
         self.child = None;
         self.clear_volatile();
-        if self.child_window.add(now) {
+        let failure_at = self.child_failure_at.take().unwrap_or(now);
+        if self.child_window.add(failure_at) {
             self.state = ConnectionState::Exhausted;
             self.last_failure = Some(ModelError::RestartExhausted);
             Ok(RecoveryAction::Escalate)
@@ -1064,6 +1297,7 @@ impl ConsoleModel {
         self.next_output = OutputSource::Stdout;
         self.clear_reservations();
         self.stable = None;
+        self.ready_observed = None;
     }
     fn clear_reservations(&mut self) {
         self.pending_stdin = None;
@@ -1137,12 +1371,12 @@ mod tests {
     use super::*;
     fn correlation(value: u64) -> SerialCorrelation {
         SerialCorrelation {
-            registry_generation: value,
-            registry_endpoint_id: value,
-            registry_endpoint_generation: value,
+            registry_generation: 1,
+            registry_endpoint_id: 1,
+            registry_endpoint_generation: 1,
             publication_generation: value,
             connector_client_transaction: value,
-            device_role: value,
+            device_role: 1,
             device_bundle: value,
             driver_attempt: value,
             driver_control_endpoint_id: value,
@@ -1150,6 +1384,29 @@ mod tests {
             attach_transaction: value,
             stream_generation: value,
         }
+    }
+    fn connect(model: &mut ConsoleModel, value: u64, now: u64) {
+        let serial = correlation(value);
+        model
+            .begin_connect(ConnectRequest {
+                registry_generation: serial.registry_generation,
+                registry_endpoint_id: serial.registry_endpoint_id,
+                registry_endpoint_generation: serial.registry_endpoint_generation,
+                requested_publication_generation: serial.publication_generation,
+                connector_client_transaction: serial.connector_client_transaction,
+            })
+            .unwrap();
+        model.attach_connected(serial, now).unwrap();
+    }
+    fn close_serial(model: &mut ConsoleModel, now: u64) -> RecoveryAction {
+        let snapshot = model.snapshot();
+        model
+            .serial_peer_closed(
+                snapshot.serial.unwrap(),
+                snapshot.console_generation.unwrap(),
+                now,
+            )
+            .unwrap()
     }
     fn launch(model: &mut ConsoleModel) -> EventGeneration {
         let mut tx = model.begin_child_launch(100).unwrap();
@@ -1160,7 +1417,7 @@ mod tests {
     }
     fn live() -> (ConsoleModel, EventGeneration) {
         let mut model = ConsoleModel::new();
-        model.attach_connected(correlation(1), 0).unwrap();
+        connect(&mut model, 1, 0);
         let event = launch(&mut model);
         (model, event)
     }
@@ -1193,7 +1450,7 @@ mod tests {
     #[test]
     fn launch_binds_caller_supplied_transaction_and_accepted_job() {
         let mut model = ConsoleModel::new();
-        model.attach_connected(correlation(1), 0).unwrap();
+        connect(&mut model, 1, 0);
         let mut transaction = model.begin_child_launch(91).unwrap();
         for kind in [StreamKind::Stdin, StreamKind::Stdout, StreamKind::Stderr] {
             transaction.move_child_peer(kind).unwrap();
@@ -1264,10 +1521,11 @@ mod tests {
     #[test]
     fn partial_move_cleanup_accounts_for_exactly_six_unique_endpoints() {
         let mut model = ConsoleModel::new();
-        model.attach_connected(correlation(1), 0).unwrap();
+        connect(&mut model, 1, 0);
         let mut tx = model.begin_child_launch(101).unwrap();
         tx.move_child_peer(StreamKind::Stdin).unwrap();
-        let cleanup = tx.abort_cleanup().unwrap();
+        let token = model.abort_child_launch(tx).unwrap();
+        let cleanup = token.cleanup();
         let mut index = 0;
         while index < 6 {
             let mut other = index + 1;
@@ -1288,17 +1546,24 @@ mod tests {
             cleanup.entries[4].disposition,
             CleanupDisposition::CloseUnmovedChildPeer
         );
-        assert!(model.begin_child_launch(102).is_ok());
+        assert_eq!(
+            model.begin_child_launch(102),
+            Err(ModelError::WrongConnectionState)
+        );
+        let _cleanup = model.complete_abort_child_launch(token).unwrap();
+        let retry = model.begin_child_launch(102).unwrap();
+        let token = model.abort_child_launch(retry).unwrap();
+        assert!(model.complete_abort_child_launch(token).is_ok());
     }
     #[test]
     fn launch_correlation_rejects_drift_before_commit() {
         let mut model = ConsoleModel::new();
-        model.attach_connected(correlation(1), 0).unwrap();
+        connect(&mut model, 1, 0);
         let mut tx = model.begin_child_launch(102).unwrap();
         for kind in [StreamKind::Stdin, StreamKind::Stdout, StreamKind::Stderr] {
             tx.move_child_peer(kind).unwrap();
         }
-        model.serial_peer_closed(1).unwrap();
+        close_serial(&mut model, 1);
         assert_eq!(
             model.commit_child_launch(&mut tx, 202),
             Err(ModelError::StaleCorrelation)
@@ -1314,12 +1579,18 @@ mod tests {
             Ok(RecoveryAction::TerminateChild(job))
         );
         assert_eq!(
-            model.child_terminated(1),
+            model.child_terminated(event, 1),
             Ok(RecoveryAction::ReapChild(job))
         );
-        assert_eq!(model.child_reaped(1), Err(ModelError::IncompleteCleanup));
+        assert_eq!(
+            model.child_reaped(event, 1),
+            Err(ModelError::IncompleteCleanup)
+        );
         model.child_streams_closed(event, 1).unwrap();
-        assert_eq!(model.child_reaped(1), Ok(RecoveryAction::ReplaceChild));
+        assert_eq!(
+            model.child_reaped(event, 1),
+            Ok(RecoveryAction::ReplaceChild)
+        );
         assert_eq!(model.state(), ConnectionState::Active);
     }
     #[test]
@@ -1337,21 +1608,23 @@ mod tests {
     #[test]
     fn raw_loss_requires_complete_reap_before_fresh_attach_and_does_not_count() {
         let (mut model, event) = live();
-        model.serial_peer_closed(1).unwrap();
-        model.child_terminated(1).unwrap();
+        let serial = model.snapshot().serial.unwrap();
+        let console = model.snapshot().console_generation.unwrap();
+        close_serial(&mut model, 1);
+        model.child_terminated(event, 1).unwrap();
         model.child_streams_closed(event, 1).unwrap();
-        model.child_reaped(1).unwrap();
+        model.child_reaped(event, 1).unwrap();
         assert_eq!(model.state(), ConnectionState::AwaitingReap);
         assert_eq!(
             model.attach_connected(correlation(2), 1),
             Err(ModelError::WrongConnectionState)
         );
         assert_eq!(
-            model.complete_serial_cleanup(1),
+            model.complete_serial_cleanup(serial, console, 1),
             Ok(RecoveryAction::RetrySerialAt(26))
         );
         assert_eq!(model.snapshot().serial_failures, 0);
-        model.attach_connected(correlation(2), 2).unwrap();
+        connect(&mut model, 2, 2);
     }
     #[test]
     fn reconnect_failure_budget_exhausts_and_blocks_fifth_attach_or_launch() {
@@ -1377,10 +1650,10 @@ mod tests {
     #[test]
     fn correlation_is_full_monotonic_and_rejects_a_b_a() {
         let mut model = ConsoleModel::new();
-        model.attach_connected(correlation(1), 0).unwrap();
-        model.serial_peer_closed(1).unwrap();
-        model.attach_connected(correlation(2), 2).unwrap();
-        model.serial_peer_closed(3).unwrap();
+        connect(&mut model, 1, 0);
+        close_serial(&mut model, 1);
+        connect(&mut model, 2, 2);
+        close_serial(&mut model, 3);
         assert_eq!(
             model.attach_connected(correlation(1), 4),
             Err(ModelError::StaleCorrelation)
@@ -1392,12 +1665,11 @@ mod tests {
         model
             .child_peer_closed(event, StreamKind::Stdin, 1)
             .unwrap();
-        model.child_terminated(1).unwrap();
+        model.child_terminated(event, 1).unwrap();
         model.child_streams_closed(event, 1).unwrap();
-        model.child_reaped(1).unwrap();
+        model.child_reaped(event, 1).unwrap();
         let event = launch(&mut model);
-        let token = model.ready_token().unwrap();
-        assert!(!model.observe_ready(2, token).unwrap());
+        let token = model.observe_child_ready(event, 2).unwrap();
         assert!(!model.observe_ready(60_001, token).unwrap());
         assert!(model.observe_ready(60_002, token).unwrap());
         model
@@ -1417,10 +1689,70 @@ mod tests {
             .unwrap();
         let before = model.snapshot();
         assert_eq!(
-            model.child_terminated(9),
+            model.child_terminated(event, 9),
             Err(ModelError::MonotonicRegression)
         );
         assert_eq!(model.state(), ConnectionState::FailClosed);
         assert_eq!(model.snapshot().input_queued, before.input_queued);
+    }
+    #[test]
+    fn empty_transport_buffers_do_not_reserve_or_rotate_fairness() {
+        let (mut model, event) = live();
+        model
+            .stage_child_output(event, OutputSource::Stdout, b"a")
+            .unwrap();
+        model
+            .stage_child_output(event, OutputSource::Stderr, b"b")
+            .unwrap();
+        assert_eq!(model.reserve_serial_tx(&mut []), Ok(None));
+        let mut bytes = [0; 8];
+        assert_eq!(
+            model
+                .reserve_serial_tx(&mut bytes)
+                .unwrap()
+                .unwrap()
+                .output_source(),
+            Some(OutputSource::Stdout)
+        );
+        assert_eq!(model.reserve_child_stdin(&mut []), Ok(None));
+    }
+    #[test]
+    fn failed_connect_attempt_releases_pending_request_for_retry() {
+        let mut model = ConsoleModel::new();
+        let request = ConnectRequest {
+            registry_generation: 1,
+            registry_endpoint_id: 1,
+            registry_endpoint_generation: 1,
+            requested_publication_generation: 1,
+            connector_client_transaction: 1,
+        };
+        model.begin_connect(request).unwrap();
+        assert_eq!(
+            model.serial_reconnect_failed(0),
+            Ok(RecoveryAction::RetrySerialAt(25))
+        );
+        let retry = ConnectRequest {
+            connector_client_transaction: 2,
+            ..request
+        };
+        model.begin_connect(retry).unwrap();
+        model.abort_connect(retry).unwrap();
+    }
+    #[test]
+    fn ready_requires_exact_ready_event_and_stale_ready_preserves_new_proof() {
+        let (mut model, event) = live();
+        assert_eq!(model.ready_token(), None);
+        let token = model.observe_child_ready(event, 1).unwrap();
+        assert_eq!(
+            model.observe_child_ready(
+                EventGeneration {
+                    child_generation: event.child_generation + 1,
+                    ..event
+                },
+                2
+            ),
+            Err(ModelError::StaleCorrelation)
+        );
+        assert!(!model.observe_ready(2, token).unwrap());
     }
 }
