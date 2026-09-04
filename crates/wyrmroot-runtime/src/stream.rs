@@ -26,6 +26,7 @@ pub trait StreamSystem {
     fn send(&mut self, channel: DwHandle, bytes: &[u8]) -> Result<(), NativeError>;
     fn close(&mut self, handle: DwHandle) -> Result<(), NativeError>;
     /// Waits through the reached native wait primitive for one stream endpoint.
+    /// Returns the full Channel signal snapshot, not only the requested bits.
     fn wait(&mut self, channel: DwHandle, signals: DwSignals) -> Result<DwSignals, NativeError>;
 }
 
@@ -89,6 +90,12 @@ pub const INPUT_WAIT_SIGNALS: DwSignals = DwSignals(DW_SIGNAL_READABLE.0 | DW_SI
 pub const OUTPUT_WAIT_SIGNALS: DwSignals =
     DwSignals(DW_SIGNAL_WRITABLE.0 | DW_SIGNAL_PEER_CLOSED.0);
 
+// DwWaitResultV1.observed is the full selected-object signal state. A stream's
+// opposite direction can therefore be ready even when it was not requested.
+// Keep the accepted object vocabulary separate from the directional interest.
+const CHANNEL_OBSERVED_SIGNALS: DwSignals =
+    DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_WRITABLE.0 | DW_SIGNAL_PEER_CLOSED.0);
+
 /// One bounded byte reader retaining at most one decoded 1024-byte record.
 pub struct NativeInput {
     endpoint: StreamEndpoint,
@@ -112,9 +119,10 @@ impl NativeInput {
     pub const fn endpoint(&self) -> StreamEndpoint {
         self.endpoint
     }
-    /// Consumes a fresh wait result. A READABLE bit takes precedence because queued bytes must drain first.
+    /// Consumes a full Channel snapshot. WRITABLE does not affect input;
+    /// READABLE takes precedence over peer close because queued bytes drain first.
     pub fn observe_wait(&mut self, observed: DwSignals) -> Result<(), StreamError> {
-        if observed.0 & !INPUT_WAIT_SIGNALS.0 != 0 {
+        if observed.0 & !CHANNEL_OBSERVED_SIGNALS.0 != 0 {
             return Err(StreamError::Protocol);
         }
         if observed.0 & DW_SIGNAL_READABLE.0 == 0 && observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 {
@@ -220,8 +228,10 @@ impl NativeOutput {
     pub const fn endpoint(&self) -> StreamEndpoint {
         self.endpoint
     }
+    /// Consumes a full Channel snapshot. READABLE does not affect output;
+    /// peer close is broken output even if other signals are also present.
     pub fn observe_wait(&self, observed: DwSignals) -> Result<(), StreamError> {
-        if observed.0 & !OUTPUT_WAIT_SIGNALS.0 != 0 {
+        if observed.0 & !CHANNEL_OBSERVED_SIGNALS.0 != 0 {
             return Err(StreamError::Protocol);
         }
         if observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 {
@@ -310,6 +320,7 @@ mod tests {
     use std::vec;
     use std::vec::Vec;
 
+    #[derive(Default)]
     struct Fixture {
         incoming: Vec<Vec<u8>>,
         sends: Vec<Vec<u8>>,
@@ -597,11 +608,132 @@ mod tests {
             block_send_at: Some(1),
             received_handles: 0,
             closed: vec![],
-            waits: vec![DW_SIGNAL_WRITABLE],
+            waits: vec![DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_WRITABLE.0)],
             receive_calls: 0,
         };
         let mut output = NativeOutput::new(endpoint());
         assert_eq!(output.write_wait(&mut fixture, b"abc"), Ok(3));
         assert_eq!(fixture.sends.len(), 1);
+        assert_eq!(decode_data(&fixture.sends[0]).unwrap().payload(), b"abc");
+        assert!(fixture.waits.is_empty());
+    }
+
+    #[test]
+    fn input_wait_accepts_full_snapshot_and_drains_readable_before_eof() {
+        for writable in [0, DW_SIGNAL_WRITABLE.0] {
+            for peer_closed in [0, DW_SIGNAL_PEER_CLOSED.0] {
+                let mut fixture = Fixture {
+                    incoming: vec![record(b"abc")],
+                    waits: vec![
+                        DwSignals(DW_SIGNAL_READABLE.0 | writable | peer_closed),
+                        DW_SIGNAL_PEER_CLOSED,
+                    ],
+                    ..Fixture::default()
+                };
+                let mut input = NativeInput::new(endpoint());
+                input.wait_readable(&mut fixture).unwrap();
+                let mut bytes = [0; 3];
+                assert_eq!(input.read(&mut fixture, &mut bytes), Ok(3));
+                assert_eq!(&bytes, b"abc");
+                input.wait_readable(&mut fixture).unwrap();
+                assert_eq!(input.read(&mut fixture, &mut bytes), Err(StreamError::Eof));
+                assert_eq!(fixture.receive_calls, 1);
+                assert!(fixture.waits.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn channel_snapshot_combinations_preserve_directional_semantics() {
+        assert_eq!(
+            INPUT_WAIT_SIGNALS.0,
+            DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0
+        );
+        assert_eq!(
+            OUTPUT_WAIT_SIGNALS.0,
+            DW_SIGNAL_WRITABLE.0 | DW_SIGNAL_PEER_CLOSED.0
+        );
+        for readable in [0, DW_SIGNAL_READABLE.0] {
+            for writable in [0, DW_SIGNAL_WRITABLE.0] {
+                for peer_closed in [0, DW_SIGNAL_PEER_CLOSED.0] {
+                    let observed = DwSignals(readable | writable | peer_closed);
+                    let mut input = NativeInput::new(endpoint());
+                    assert_eq!(input.observe_wait(observed), Ok(()));
+                    let expected = if readable == 0 && peer_closed != 0 {
+                        StreamError::Eof
+                    } else {
+                        StreamError::WouldBlock
+                    };
+                    assert_eq!(input.read(&mut Fixture::default(), &mut [0]), Err(expected));
+                    let output = NativeOutput::new(endpoint());
+                    assert_eq!(
+                        output.observe_wait(observed),
+                        if peer_closed != 0 {
+                            Err(StreamError::Broken)
+                        } else {
+                            Ok(())
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn output_wait_peer_close_prevents_retry_for_every_other_channel_bit() {
+        for readable in [0, DW_SIGNAL_READABLE.0] {
+            for writable in [0, DW_SIGNAL_WRITABLE.0] {
+                let mut fixture = Fixture {
+                    block_send_at: Some(1),
+                    waits: vec![DwSignals(DW_SIGNAL_PEER_CLOSED.0 | readable | writable)],
+                    ..Fixture::default()
+                };
+                let mut output = NativeOutput::new(endpoint());
+                assert_eq!(
+                    output.write_wait(&mut fixture, b"abc"),
+                    Err(StreamError::Broken)
+                );
+                assert_eq!(fixture.send_attempts, 1);
+                assert!(fixture.sends.is_empty());
+                assert!(fixture.waits.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn wait_helpers_reject_every_non_channel_bit_even_with_ready_and_closed() {
+        for shift in 0..64 {
+            let invalid = 1u64 << shift;
+            if invalid & CHANNEL_OBSERVED_SIGNALS.0 != 0 {
+                continue;
+            }
+            for valid in [0, CHANNEL_OBSERVED_SIGNALS.0] {
+                let observed = DwSignals(invalid | valid);
+                let mut fixture = Fixture {
+                    incoming: vec![record(b"x")],
+                    block_send_at: Some(1),
+                    waits: vec![observed, observed],
+                    ..Fixture::default()
+                };
+                let mut input = NativeInput::new(endpoint());
+                assert_eq!(
+                    input.wait_readable(&mut fixture),
+                    Err(StreamError::Protocol)
+                );
+                // A rejected snapshot must not set EOF or consume queued data.
+                assert_eq!(fixture.receive_calls, 0);
+                let mut bytes = [0];
+                assert_eq!(input.read(&mut fixture, &mut bytes), Ok(1));
+                assert_eq!(&bytes, b"x");
+                let mut output = NativeOutput::new(endpoint());
+                assert_eq!(
+                    output.write_wait(&mut fixture, b"abc"),
+                    Err(StreamError::Protocol)
+                );
+                assert_eq!(fixture.send_attempts, 1);
+                assert!(fixture.sends.is_empty());
+                assert!(fixture.waits.is_empty());
+            }
+        }
     }
 }
