@@ -5213,7 +5213,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_wait_cancel_succeeds_and_never_emits_a_late_result() {
+    fn cancelled_wait_then_reap_terminate_reports_invalid_state_and_preserves_result() {
         let mut platform = MockPlatform::new();
         platform.fail_send = false;
         let mut waits = TerminalWaits;
@@ -5269,6 +5269,133 @@ mod tests {
         service_pending_wait(&mut platform, &mut waits, &mut jobs).unwrap();
         assert_eq!(platform.sent_len, cancelled_len);
         assert_eq!(&platform.sent[..cancelled_len], &cancelled[..cancelled_len]);
+
+        for (transaction, message) in [
+            (
+                4,
+                LaunchMessage::Terminate {
+                    job_id: launch.job_id,
+                },
+            ),
+            (
+                5,
+                LaunchMessage::Wait {
+                    job_id: launch.job_id,
+                },
+            ),
+            (
+                6,
+                LaunchMessage::CloseJob {
+                    job_id: launch.job_id,
+                },
+            ),
+        ] {
+            let request = reservation(transaction);
+            let ticket = jobs.jobs.reserve_request(request).unwrap();
+            dispatch_reserved_operation(
+                &mut platform,
+                &mut waits,
+                &mut jobs,
+                DwHandle(90),
+                owner,
+                request,
+                ticket,
+                message,
+            )
+            .unwrap();
+            let response = parse_launch_message(&platform.sent[..platform.sent_len], 0).unwrap();
+            assert_eq!(response.reservation, request);
+            match transaction {
+                4 => assert_eq!(
+                    response.message,
+                    LaunchMessage::Error {
+                        code: LaunchErrorCode::InvalidState
+                    }
+                ),
+                5 => assert_eq!(
+                    response.message,
+                    LaunchMessage::JobResult {
+                        job_id: launch.job_id,
+                        result: TerminationResult {
+                            classification: TerminationClassification::NormalExit,
+                            application_code: 0,
+                            exception_class: 0,
+                            exception_detail: 0,
+                            exception_address: 0,
+                            cleanup_result: 0,
+                        },
+                    }
+                ),
+                6 => assert_eq!(
+                    response.message,
+                    LaunchMessage::Closed {
+                        job_id: launch.job_id
+                    }
+                ),
+                _ => unreachable!(),
+            }
+        }
+        assert_eq!(platform.terminate_count, 0);
+        assert_eq!(platform.close_count, 3);
+        assert_eq!(
+            jobs.jobs.result(reservation(7), launch.job_id),
+            Err(JobError::UnknownJob)
+        );
+        assert_eq!(
+            jobs.jobs.terminate(reservation(8), launch.job_id),
+            Err(JobError::UnknownJob)
+        );
+    }
+
+    #[test]
+    fn terminate_during_staged_terminal_cleanup_never_calls_native_termination() {
+        let mut platform = MockPlatform::new();
+        platform.fail_send = false;
+        let mut waits = TerminalWaits;
+        let mut jobs = JobDispatcher::new();
+        let owner = grant(EndpointKind::LaunchSession, 1, 1);
+        jobs.install_session(owner, DwHandle(90)).unwrap();
+        let launch = jobs.jobs.begin_launch(reservation(1)).unwrap();
+        jobs.jobs.commit_launch(launch, 101, 102, 103).unwrap();
+        let terminal = ControllerJobResult {
+            classification: 1,
+            application_code: 0,
+            exception_class: 0,
+            exception_detail: 0,
+            exception_address: 0,
+            cleanup_result: 0,
+        };
+        assert_eq!(
+            jobs.jobs
+                .apply_cleanup_progress(launch.job_id, terminal, 1 << 3, 0),
+            Ok(None)
+        );
+        let before = jobs.jobs.loaded_job(launch.job_id).unwrap();
+        let ticket = jobs.jobs.reserve_request(reservation(2)).unwrap();
+        dispatch_reserved_operation(
+            &mut platform,
+            &mut waits,
+            &mut jobs,
+            DwHandle(90),
+            owner,
+            reservation(2),
+            ticket,
+            LaunchMessage::Terminate {
+                job_id: launch.job_id,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            parse_launch_message(&platform.sent[..platform.sent_len], 0)
+                .unwrap()
+                .message,
+            LaunchMessage::Error {
+                code: LaunchErrorCode::InvalidState
+            }
+        );
+        assert_eq!(platform.terminate_count, 0);
+        assert_eq!(jobs.jobs.loaded_job(launch.job_id), Ok(before));
+        assert_eq!(jobs.jobs.terminal_result(launch.job_id), Ok(Some(terminal)));
     }
 
     #[test]

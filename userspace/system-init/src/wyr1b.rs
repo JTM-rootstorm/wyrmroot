@@ -603,9 +603,14 @@ impl JobController {
         request: RequestTicket,
         job_id: u64,
     ) -> Result<JobResources, JobError> {
+        // Completion may win after a pending WAIT is cancelled. The owning
+        // session still sees that result, but there is no live job to terminate.
+        if self.result_reserved(request, job_id).is_ok() {
+            return Err(JobError::WrongState);
+        }
         let index = self.owned_job_index(request.owner, job_id)?;
         let job = self.jobs[index].as_ref().unwrap();
-        if job.phase != JobPhase::Running {
+        if job.phase != JobPhase::Running || job.terminal.is_some() {
             return Err(JobError::WrongState);
         }
         Ok(JobResources {
@@ -1374,6 +1379,115 @@ mod tests {
             jobs.result(reservation(1, 1, 4), ticket.job_id),
             Err(JobError::TransactionReplay)
         );
+    }
+
+    #[test]
+    fn completed_terminate_is_invalid_state_only_for_visible_exact_owner() {
+        let mut jobs = JobController::new();
+        jobs.open_connection(1, 7).unwrap();
+        jobs.open_connection(2, 9).unwrap();
+        let launch = jobs.begin_launch(reservation(1, 7, 1)).unwrap();
+        jobs.commit_launch(launch, 10, 11, 12).unwrap();
+        jobs.complete(launch.job_id, 10, 11, 12, normal()).unwrap();
+        assert_eq!(
+            jobs.terminate(reservation(1, 7, 2), launch.job_id),
+            Err(JobError::WrongState)
+        );
+        assert_eq!(
+            jobs.terminate(reservation(1, 7, 2), launch.job_id),
+            Err(JobError::TransactionReplay)
+        );
+        assert_eq!(
+            jobs.terminate(reservation(2, 9, 1), launch.job_id),
+            Err(JobError::UnknownJob)
+        );
+        assert_eq!(
+            jobs.terminate(reservation(1, 8, 3), launch.job_id),
+            Err(JobError::StaleGeneration)
+        );
+        assert_eq!(
+            jobs.terminate(reservation(3, 7, 1), launch.job_id),
+            Err(JobError::UnknownConnection)
+        );
+        // QUERY remains the active-job operation; only TERMINATE distinguishes
+        // a visible terminal record from an unknown job.
+        assert_eq!(
+            jobs.query(reservation(1, 7, 3), launch.job_id),
+            Err(JobError::UnknownJob)
+        );
+        assert_eq!(
+            jobs.result(reservation(1, 7, 4), launch.job_id),
+            Ok(normal())
+        );
+        jobs.close_job(reservation(1, 7, 5), launch.job_id).unwrap();
+        assert_eq!(
+            jobs.terminate(reservation(1, 7, 6), launch.job_id),
+            Err(JobError::UnknownJob)
+        );
+        assert_eq!(
+            jobs.result(reservation(1, 7, 7), launch.job_id),
+            Err(JobError::UnknownJob)
+        );
+    }
+
+    #[test]
+    fn completed_terminate_stays_unknown_after_connection_replacement() {
+        let mut jobs = JobController::new();
+        jobs.open_connection(1, 7).unwrap();
+        let launch = jobs.begin_launch(reservation(1, 7, 1)).unwrap();
+        jobs.commit_launch(launch, 10, 11, 12).unwrap();
+        jobs.complete(launch.job_id, 10, 11, 12, normal()).unwrap();
+        jobs.disconnect(1, 7).unwrap();
+        assert_eq!(
+            jobs.terminate(reservation(1, 7, 2), launch.job_id),
+            Err(JobError::ClosedConnection)
+        );
+        jobs.reclaim_closed_sessions();
+        jobs.open_connection(1, 8).unwrap();
+        assert_eq!(
+            jobs.terminate(reservation(1, 8, 1), launch.job_id),
+            Err(JobError::UnknownJob)
+        );
+        assert_eq!(
+            jobs.terminate(reservation(1, 7, 3), launch.job_id),
+            Err(JobError::StaleGeneration)
+        );
+    }
+
+    #[test]
+    fn staged_terminal_terminate_preserves_hidden_and_disconnected_rejections() {
+        for (published, hidden, disconnected, expected) in [
+            (true, false, false, JobError::WrongState),
+            (true, true, false, JobError::ForeignJob),
+            (true, false, true, JobError::ClosedConnection),
+            (false, false, false, JobError::UnknownJob),
+        ] {
+            let mut jobs = JobController::new();
+            jobs.open_connection(1, 7).unwrap();
+            let launch = jobs.begin_launch(reservation(1, 7, 1)).unwrap();
+            if published {
+                jobs.commit_launch(launch, 10, 11, 12).unwrap();
+            } else {
+                jobs.stage_launch(launch, 10, 11, 12).unwrap();
+            }
+            assert_eq!(
+                jobs.apply_cleanup_progress(launch.job_id, normal(), 1 << 3, 0),
+                Ok(None)
+            );
+            if hidden {
+                jobs.close_job(reservation(1, 7, 2), launch.job_id).unwrap();
+            }
+            if disconnected {
+                jobs.disconnect(1, 7).unwrap();
+            }
+            let before = jobs.loaded_job(launch.job_id).unwrap();
+            assert_eq!(
+                jobs.terminate(reservation(1, 7, 3), launch.job_id),
+                Err(expected)
+            );
+            assert_eq!(jobs.loaded_job(launch.job_id), Ok(before));
+            assert_eq!(jobs.terminal_result(launch.job_id), Ok(Some(normal())));
+        }
     }
 
     #[test]

@@ -562,6 +562,15 @@ It never derives success from text, a PID, or a synthetic POSIX signal status.
 terminate a job. `CLOSE_JOB` releases a completed record or the connection's
 visibility of an active job; supervisor ownership and reaping remain.
 
+If completion wins after a pending `WAIT` is cancelled, a fresh `TERMINATE`
+for that same connection's visible completed job returns `ERROR(INVALID_STATE)`.
+The client can then `WAIT` for the exact `JOB_RESULT` and `CLOSE_JOB` normally.
+A job with an observed terminal result still awaiting cleanup also rejects
+`TERMINATE` as invalid state before any native termination request. This does
+not change active-only `QUERY` semantics or restore visibility for foreign,
+closed, disconnected, unpublished, or stale-generation jobs. Replayed
+transactions retain their existing rejection.
+
 ### 9.4 Orphan policy
 
 WYR1-B uses retain-and-reap. On launch-client peer closure, init revokes future
