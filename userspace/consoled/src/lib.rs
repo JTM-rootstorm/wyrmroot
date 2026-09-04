@@ -252,7 +252,7 @@ pub struct LaunchCleanupToken {
 pub struct LaunchCleanupEvidence {
     pub consoled_peers_closed: [bool; 3],
     pub unmoved_child_peers_closed: [bool; 3],
-    pub moved_child_peers_rejected: [bool; 3],
+    pub moved_child_peers_revoked: [bool; 3],
 }
 
 impl LaunchCleanupEvidence {
@@ -263,9 +263,9 @@ impl LaunchCleanupEvidence {
             && self.unmoved_child_peers_closed[0]
             && self.unmoved_child_peers_closed[1]
             && self.unmoved_child_peers_closed[2]
-            && self.moved_child_peers_rejected[0]
-            && self.moved_child_peers_rejected[1]
-            && self.moved_child_peers_rejected[2]
+            && self.moved_child_peers_revoked[0]
+            && self.moved_child_peers_revoked[1]
+            && self.moved_child_peers_revoked[2]
     }
 }
 
@@ -311,7 +311,7 @@ impl LaunchTransaction {
         self.moved[0] && self.moved[1] && self.moved[2]
     }
 
-    pub fn abort_cleanup(self) -> Result<LaunchCleanup, ModelError> {
+    fn abort_cleanup(self) -> Result<LaunchCleanup, ModelError> {
         if self.committed {
             return Err(ModelError::WrongConnectionState);
         }
@@ -365,7 +365,7 @@ fn evidence_matches_cleanup(cleanup: &LaunchCleanup, evidence: LaunchCleanupEvid
                 evidence.unmoved_child_peers_closed[index - 3]
             }
             CleanupDisposition::RevokeMovedChildPeerFromLaunch => {
-                evidence.moved_child_peers_rejected[index - 3]
+                evidence.moved_child_peers_revoked[index - 3]
             }
         };
         if !satisfied {
@@ -618,6 +618,7 @@ pub struct ConsoleSnapshot {
     pub child_restart_exhausted: bool,
     pub serial_restart_exhausted: bool,
     pub last_failure: Option<ModelError>,
+    pub pending_recovery: Option<RecoveryAction>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -655,6 +656,7 @@ pub struct ConsoleModel {
     next_endpoint: u64,
     next_reservation: u64,
     last_failure: Option<ModelError>,
+    pending_recovery: Option<RecoveryAction>,
 }
 
 impl Default for ConsoleModel {
@@ -705,6 +707,7 @@ impl ConsoleModel {
             next_endpoint: 1,
             next_reservation: 1,
             last_failure: None,
+            pending_recovery: None,
         }
     }
     pub const fn state(&self) -> ConnectionState {
@@ -904,9 +907,11 @@ impl ConsoleModel {
     ) -> Result<LaunchCleanup, ModelError> {
         if self.pending_launch != Some(token.identity)
             || self.pending_launch_cleanup != Some(token.identity)
-            || !evidence_matches_cleanup(&token.cleanup, evidence)
         {
             return Err(ModelError::StaleCorrelation);
+        }
+        if !evidence_matches_cleanup(&token.cleanup, evidence) {
+            return Err(ModelError::IncompleteCleanup);
         }
         self.pending_launch = None;
         self.pending_launch_cleanup = None;
@@ -948,6 +953,17 @@ impl ConsoleModel {
         self.time(now)?;
         self.require_current(event)?;
         self.last_failure = Some(ModelError::WrongDirection);
+        self.start_child_retirement(false, true, now)
+    }
+    /// A JobV2 terminal notification is an active-child failure even when all
+    /// three stream peers remain open; retirement/reap owns the cleanup.
+    pub fn child_terminal(
+        &mut self,
+        event: EventGeneration,
+        now: u64,
+    ) -> Result<RecoveryAction, ModelError> {
+        self.time(now)?;
+        self.require_current(event)?;
         self.start_child_retirement(false, true, now)
     }
     pub fn child_peer_closed(
@@ -1225,7 +1241,9 @@ impl ConsoleModel {
         }
         self.ready_observed = Some(event);
         let token = self.ready_token().ok_or(ModelError::WrongConnectionState)?;
-        self.stable = Some((token, now));
+        if self.stable.map(|(existing, _)| existing) != Some(token) {
+            self.stable = Some((token, now));
+        }
         Ok(token)
     }
     /// Exact READY identity clears only child failures after 60 continuous seconds.
@@ -1279,7 +1297,11 @@ impl ConsoleModel {
             child_restart_exhausted: self.child_exhausted,
             serial_restart_exhausted: self.serial_exhausted,
             last_failure: self.last_failure,
+            pending_recovery: self.pending_recovery,
         }
+    }
+    pub fn take_recovery_action(&mut self) -> Option<RecoveryAction> {
+        self.pending_recovery.take()
     }
 
     fn require_current(&mut self, event: EventGeneration) -> Result<(), ModelError> {
@@ -1364,7 +1386,7 @@ impl ConsoleModel {
             let now = self
                 .last_now
                 .ok_or_else(|| self.fail(ModelError::MonotonicRegression))?;
-            let _ = self.finish_serial_cleanup(now)?;
+            self.pending_recovery = Some(self.finish_serial_cleanup(now)?);
         }
         Ok(())
     }
@@ -1505,7 +1527,7 @@ mod tests {
         LaunchCleanupEvidence {
             consoled_peers_closed: [true; 3],
             unmoved_child_peers_closed: [true; 3],
-            moved_child_peers_rejected: [true; 3],
+            moved_child_peers_revoked: [true; 3],
         }
     }
     fn launch(model: &mut ConsoleModel) -> EventGeneration {
@@ -1674,7 +1696,12 @@ mod tests {
             model.commit_child_launch(&mut tx, 202),
             Err(ModelError::StaleCorrelation)
         );
-        assert!(tx.abort_cleanup().is_ok());
+        let token = model.abort_child_launch(tx).unwrap();
+        assert!(
+            model
+                .complete_abort_child_launch(token, cleanup_evidence())
+                .is_ok()
+        );
     }
     #[test]
     fn individual_peer_close_requires_termination_reap_and_all_peer_cleanup() {
@@ -1860,5 +1887,21 @@ mod tests {
             Err(ModelError::StaleCorrelation)
         );
         assert!(!model.observe_ready(2, token).unwrap());
+    }
+    #[test]
+    fn duplicate_ready_preserves_original_stable_since() {
+        let (mut model, event) = live();
+        let token = model.observe_child_ready(event, 10).unwrap();
+        assert_eq!(model.observe_child_ready(event, 59_999), Ok(token));
+        assert!(model.observe_ready(60_010, token).unwrap());
+    }
+    #[test]
+    fn active_terminal_starts_reap_without_peer_close() {
+        let (mut model, event) = live();
+        assert!(matches!(
+            model.child_terminal(event, 1),
+            Ok(RecoveryAction::TerminateChild(_))
+        ));
+        assert_eq!(model.state(), ConnectionState::RetiringChild);
     }
 }
