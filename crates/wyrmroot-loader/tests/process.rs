@@ -363,7 +363,7 @@ fn consoled_moves_exactly_two_controller_endpoints_atomically() {
     let launch = DwHandle(0xd402);
     let request = || ConsoledLoadRequest {
         image: &image,
-        display_path: "/system/consoled",
+        display_path: "system/consoled",
         registry_endpoint: registry,
         registry_generation: 2,
         registry_endpoint_id: 3,
@@ -406,6 +406,22 @@ fn consoled_moves_exactly_two_controller_endpoints_atomically() {
         platform.sent_transfers[2].requested_rights,
         wyrmroot_loader::launch::CHILD_CHANNEL_RIGHTS
     );
+
+    let mut start_failed = Mock::new(Some("start"));
+    assert_eq!(
+        load_consoled_process(&mut start_failed, authority(), request()).unwrap_err(),
+        ConsoledLoadError {
+            error: LoadError::Platform {
+                stage: LoadStage::ThreadStart,
+                cause: "start",
+                rollback_failed: false,
+            },
+            registry_endpoint_consumed: true,
+            launch_endpoint_consumed: true,
+        }
+    );
+    assert!(!start_failed.events.contains(&Event::Close(registry.0)));
+    assert!(!start_failed.events.contains(&Event::Close(launch.0)));
 }
 
 #[test]

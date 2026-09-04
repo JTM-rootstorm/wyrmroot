@@ -46,6 +46,22 @@ fn wyr1_d4_consoled_has_exact_hardware_free_multi_endpoint_profile() {
         ),
         (0xd400, 2, 3, 4, 5, 6)
     );
+    assert_eq!(
+        launch::parse_consoled_init(&init, &handles[..2]),
+        Err(LaunchError::HandleCount)
+    );
+    let mut wrong_role = init;
+    wrong_role[40..44].copy_from_slice(&7_u32.to_le_bytes());
+    assert_eq!(
+        launch::parse_consoled_init(&wrong_role, &handles),
+        Err(LaunchError::BadCapabilityRole { index: 0 })
+    );
+    let mut reserved_role = init;
+    reserved_role[52..56].copy_from_slice(&1_u32.to_le_bytes());
+    assert_eq!(
+        launch::parse_consoled_init(&reserved_role, &handles),
+        Err(LaunchError::BadCapabilityRole { index: 1 })
+    );
     let mut wrong = handles;
     wrong[2].rights = SELF_ROOT_RIGHTS;
     assert_eq!(
@@ -56,6 +72,13 @@ fn wyr1_d4_consoled_has_exact_hardware_free_multi_endpoint_profile() {
     assert_eq!(
         launch::parse_consoled_init(&init, &handles),
         Err(LaunchError::ZeroTransaction)
+    );
+
+    let mut ready = [0; HEADER_BYTES];
+    launch::encode_ready_for_profile(LaunchProfile::Consoled, 0xd400, &mut ready).unwrap();
+    assert_eq!(
+        launch::parse_ready_for_profile(LaunchProfile::LaunchClient, &ready, 0xd400),
+        Err(LaunchError::BadVersion)
     );
 }
 

@@ -757,7 +757,7 @@ pub fn load_consoled_process<P: LoaderPlatform>(
     authority: LoadAuthority,
     request: ConsoledLoadRequest<'_>,
 ) -> Result<LoadedProcess, ConsoledLoadError<P::Error>> {
-    if request.display_path != "/system/consoled"
+    if request.display_path != "system/consoled"
         || request.registry_endpoint.0 == 0
         || request.launch_endpoint.0 == 0
         || request.registry_endpoint == request.launch_endpoint
