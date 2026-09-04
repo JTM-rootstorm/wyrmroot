@@ -13,6 +13,8 @@ pub const RECORD_BYTES: usize = 96;
 const DRIVER_READY: u16 = 1;
 const REQUEST_RETIRE: u16 = 2;
 const CLIENT_RELEASED: u16 = 3;
+const REQUEST_DRAIN: u16 = 4;
+const TX_DRAINED: u16 = 5;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct D5DriverIdentity {
@@ -33,11 +35,24 @@ pub struct D5StreamIdentity {
     pub stream_generation: u64,
 }
 
+/// A selector-private transport fence, not a public WRST flush operation.
+/// Targets count response bytes accepted during this driver attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct D5DrainIdentity {
+    pub driver: D5DriverIdentity,
+    pub attach_transaction_id: u64,
+    pub stream_generation: u64,
+    pub target_tx_bytes: u64,
+    pub leg: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum D5ControllerMessage {
     DriverReady(D5DriverIdentity),
     RequestRetire(D5DriverIdentity),
     ClientReleased(D5StreamIdentity),
+    RequestDrain(D5DrainIdentity),
+    TxDrained(D5DrainIdentity),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,6 +64,7 @@ pub enum D5ControllerParseError {
     NonzeroFlags,
     ZeroIdentity,
     NonzeroReserved,
+    InvalidDrainTarget,
 }
 
 pub fn encode(
@@ -71,6 +87,14 @@ pub fn encode(
         put64(output, 72, identity.client_transaction_id);
         put64(output, 80, identity.attach_transaction_id);
         put64(output, 88, identity.stream_generation);
+    }
+    if let D5ControllerMessage::RequestDrain(identity) | D5ControllerMessage::TxDrained(identity) =
+        message
+    {
+        put64(output, 64, identity.attach_transaction_id);
+        put64(output, 72, identity.stream_generation);
+        put64(output, 80, identity.target_tx_bytes);
+        put64(output, 88, identity.leg);
     }
     Ok(())
 }
@@ -108,6 +132,20 @@ pub fn parse(bytes: &[u8]) -> Result<D5ControllerMessage, D5ControllerParseError
             attach_transaction_id: get64(bytes, 80),
             stream_generation: get64(bytes, 88),
         }),
+        kind @ (REQUEST_DRAIN | TX_DRAINED) => {
+            let identity = D5DrainIdentity {
+                driver,
+                attach_transaction_id: get64(bytes, 64),
+                stream_generation: get64(bytes, 72),
+                target_tx_bytes: get64(bytes, 80),
+                leg: get64(bytes, 88),
+            };
+            if kind == REQUEST_DRAIN {
+                D5ControllerMessage::RequestDrain(identity)
+            } else {
+                D5ControllerMessage::TxDrained(identity)
+            }
+        }
         _ => return Err(D5ControllerParseError::UnknownMessage),
     };
     validate(message)?;
@@ -141,6 +179,16 @@ fn validate(message: D5ControllerMessage) -> Result<(), D5ControllerParseError> 
     {
         return Err(D5ControllerParseError::ZeroIdentity);
     }
+    if let D5ControllerMessage::RequestDrain(identity) | D5ControllerMessage::TxDrained(identity) =
+        message
+    {
+        if identity.attach_transaction_id == 0 || identity.stream_generation == 0 {
+            return Err(D5ControllerParseError::ZeroIdentity);
+        }
+        if !matches!((identity.leg, identity.target_tx_bytes), (2, 45) | (4, 46)) {
+            return Err(D5ControllerParseError::InvalidDrainTarget);
+        }
+    }
     Ok(())
 }
 
@@ -149,6 +197,8 @@ const fn message_type(message: D5ControllerMessage) -> u16 {
         D5ControllerMessage::DriverReady(_) => DRIVER_READY,
         D5ControllerMessage::RequestRetire(_) => REQUEST_RETIRE,
         D5ControllerMessage::ClientReleased(_) => CLIENT_RELEASED,
+        D5ControllerMessage::RequestDrain(_) => REQUEST_DRAIN,
+        D5ControllerMessage::TxDrained(_) => TX_DRAINED,
     }
 }
 
@@ -157,6 +207,9 @@ const fn driver_identity(message: D5ControllerMessage) -> D5DriverIdentity {
         D5ControllerMessage::DriverReady(identity)
         | D5ControllerMessage::RequestRetire(identity) => identity,
         D5ControllerMessage::ClientReleased(identity) => identity.driver,
+        D5ControllerMessage::RequestDrain(identity) | D5ControllerMessage::TxDrained(identity) => {
+            identity.driver
+        }
     }
 }
 
@@ -256,6 +309,51 @@ mod tests {
         roundtrip(D5ControllerMessage::DriverReady(DRIVER));
         roundtrip(D5ControllerMessage::RequestRetire(DRIVER));
         roundtrip(D5ControllerMessage::ClientReleased(STREAM));
+        for (leg, target_tx_bytes) in [(2, 45), (4, 46)] {
+            let identity = D5DrainIdentity {
+                driver: DRIVER,
+                attach_transaction_id: 4,
+                stream_generation: 5,
+                target_tx_bytes,
+                leg,
+            };
+            roundtrip(D5ControllerMessage::RequestDrain(identity));
+            roundtrip(D5ControllerMessage::TxDrained(identity));
+        }
+    }
+
+    #[test]
+    fn drain_fence_requires_exact_nonzero_stream_and_fixed_leg_target() {
+        let identity = D5DrainIdentity {
+            driver: DRIVER,
+            attach_transaction_id: 4,
+            stream_generation: 5,
+            target_tx_bytes: 45,
+            leg: 2,
+        };
+        for changed in [
+            D5DrainIdentity {
+                attach_transaction_id: 0,
+                ..identity
+            },
+            D5DrainIdentity {
+                stream_generation: 0,
+                ..identity
+            },
+            D5DrainIdentity {
+                target_tx_bytes: 46,
+                ..identity
+            },
+            D5DrainIdentity { leg: 3, ..identity },
+        ] {
+            assert!(
+                encode(
+                    D5ControllerMessage::RequestDrain(changed),
+                    &mut [0; RECORD_BYTES]
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]
