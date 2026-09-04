@@ -241,7 +241,7 @@ const D5_PRODUCT_NATIVE_SPECS: [NativeSpec; 7] = [
         label: "devmgr",
         package: "wyrmroot-devmgr",
         binary: "devmgr",
-        features: "wyr1d-production",
+        features: "wyr1d-selector32",
         artifact: "devmgr",
     },
     NativeSpec {
@@ -255,7 +255,7 @@ const D5_PRODUCT_NATIVE_SPECS: [NativeSpec; 7] = [
         label: "consoled",
         package: "wyrmroot-consoled",
         binary: "consoled",
-        features: "wyr1d-selector32",
+        features: "native-consoled,wyr1d-selector32",
         artifact: "consoled",
     },
     NativeSpec {
@@ -2720,6 +2720,12 @@ mod tests {
 
     #[test]
     fn d5_product_binds_console_echo_policy_and_excludes_selector31() {
+        assert_eq!(D5_PRODUCT_NATIVE_SPECS[0].features, "wyr1d-selector32");
+        assert_eq!(D5_PRODUCT_NATIVE_SPECS[2].features, "wyr1d-selector32");
+        assert_eq!(
+            D5_PRODUCT_NATIVE_SPECS[4].features,
+            "native-consoled,wyr1d-selector32"
+        );
         let artifacts = d5_fixture_artifacts();
         let nonce = "0123456789ABCDEF";
         let (first, first_policy) =

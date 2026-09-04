@@ -570,12 +570,13 @@ fn stage_profile(
     wyr1c6::write_new_mode(&vars_path, &vars, 0o600, "WYR1-D5 mutable OVMF vars")?;
     let absolute = fs::canonicalize(output)
         .map_err(|error| Failure::task(format!("could not resolve WYR1-D5 output: {error}")))?;
-    let xml = crate::dw1e3a::domain_xml(
+    let xml = crate::dw1e3a::selected_domain_xml(
         vcpus,
         &absolute.join(value(request, "ovmf_code")?),
         &absolute.join(value(request, "esp")?),
         &absolute.join(profile).join("OVMF_VARS.mutable.fd"),
         &absolute.join(profile).join("com2.sock"),
+        (SELECTOR, TEST_ID),
     );
     wyr1c6::write_new(
         &directory.join("domain.xml"),
@@ -1058,6 +1059,32 @@ fn value<'a>(values: &'a BTreeMap<String, String>, key: &str) -> Result<&'a str,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn d5_profile_selects_test32_without_changing_the_q35_transport() {
+        let path = Path::new("/project/artifact");
+        for vcpus in [1, 4] {
+            let xml = crate::dw1e3a::selected_domain_xml(
+                vcpus,
+                path,
+                path,
+                path,
+                path,
+                (SELECTOR, TEST_ID),
+            );
+            assert!(xml.contains(
+                "name=\"opt/org.deepwyrm.test.selector\">native-console-streams</entry>"
+            ));
+            assert!(xml.contains("name=\"opt/org.deepwyrm.test.test_id\">32</entry>"));
+            let original = crate::dw1e3a::domain_xml(vcpus, path, path, path, path);
+            assert_eq!(
+                xml,
+                original
+                    .replace("q35-com2-interrupt", SELECTOR)
+                    .replace("test.test_id\">31", "test.test_id\">32")
+            );
+        }
+    }
 
     #[test]
     fn selector32_schema_is_distinct_and_has_four_dynamic_legs() {

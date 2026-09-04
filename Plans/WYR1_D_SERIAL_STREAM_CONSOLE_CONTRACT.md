@@ -569,6 +569,13 @@ wrong Channel, wrong leg, wrong nonce, or wrong current generation tuple. A
 post-replacement challenge is therefore fresh even if an old console or child
 continues producing bytes.
 
+The canonical q35/OVMF profile emits the already pinned 354-byte
+`ovmf-bds-session-banner` prelude used by selector 31 before application COM2
+traffic. D5 requires that exact prelude once, byte-for-byte, before sending
+the first challenge. It is retained in the raw COM2 transcript but excluded
+from the four response lengths and hashes. Arbitrary banners, altered or
+duplicate preludes, and application prefix/suffix bytes remain rejected.
+
 All fields forbidden for a record type are zero. Sequence is exact,
 monotonic, and gap-free for one nonce. The trusted controller emits a record
 only after validating the underlying direct status/Channel/launch fact; a
