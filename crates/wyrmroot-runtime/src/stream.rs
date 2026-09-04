@@ -46,6 +46,17 @@ pub enum StreamError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StreamEndpoint(DwHandle);
 impl StreamEndpoint {
+    /// Wraps a nonzero Channel handle after the caller has validated or
+    /// constructed it with [`JOB_V2_STREAM_RIGHTS`]. This does not manufacture
+    /// authority and deliberately cannot widen rights.
+    pub const fn from_validated_handle(handle: DwHandle) -> Result<Self, StreamError> {
+        if handle.0 == 0 {
+            Err(StreamError::Protocol)
+        } else {
+            Ok(Self(handle))
+        }
+    }
+
     pub const fn handle(self) -> DwHandle {
         self.0
     }
@@ -347,7 +358,21 @@ mod tests {
         }
     }
     fn endpoint() -> StreamEndpoint {
-        StreamEndpoint(DwHandle(9))
+        StreamEndpoint::from_validated_handle(DwHandle(9)).unwrap()
+    }
+
+    #[test]
+    fn validated_stream_endpoint_rejects_the_zero_sentinel() {
+        assert_eq!(
+            StreamEndpoint::from_validated_handle(DwHandle(0)),
+            Err(StreamError::Protocol)
+        );
+        assert_eq!(
+            StreamEndpoint::from_validated_handle(DwHandle(9))
+                .unwrap()
+                .handle(),
+            DwHandle(9)
+        );
     }
     fn record(payload: &[u8]) -> Vec<u8> {
         let mut bytes = [0u8; MAX_RECORD_BYTES];

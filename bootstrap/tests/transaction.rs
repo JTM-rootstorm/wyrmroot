@@ -757,6 +757,7 @@ impl LoaderPlatform for SmokeLoader {
             | launch::LaunchProfile::DeviceCoordinator
             | launch::LaunchProfile::DeviceCoordinatorResourceDomain
             | launch::LaunchProfile::DeviceDriver
+            | launch::LaunchProfile::Consoled
             | launch::LaunchProfile::D6ResourceOwner => {
                 return Err(NativeError::Status(DW_STATUS_BAD_HANDLE));
             }
