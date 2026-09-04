@@ -46,10 +46,17 @@ fn selector31_finalize_is_the_exact_client_release_certificate_before_driver_rea
     let peer_closed = PROBE.find("ControllerMessage::StreamPeerClosed").unwrap();
     assert!(close < peer_closed);
 
-    let report = SYSTEM_INIT
+    let peer_close = SYSTEM_INIT
+        .split("E3AControllerMessage::StreamPeerClosed {")
+        .nth(1)
+        .unwrap()
+        .split("_ => Err(InitError::WrongManifestProfile)")
+        .next()
+        .unwrap();
+    let report = peer_close
         .find("Dw1e3ReportEvent::Driver1PeerClosed")
         .unwrap();
-    let finalize = SYSTEM_INIT
+    let finalize = peer_close
         .find("send_e3a_finalize_retire(resident, system)")
         .unwrap();
     assert!(report < finalize);
@@ -84,6 +91,31 @@ fn selector31_finalize_is_the_exact_client_release_certificate_before_driver_rea
         + broker_reaped;
     let clear = DEVMGR[empty..].find("connector_broker = None;").unwrap() + empty;
     assert!(reaped < broker_reaped && broker_reaped < empty && empty < clear);
+}
+
+#[test]
+fn selector31_finalize_rejoins_stage1_and_peer_close_in_either_arrival_order() {
+    let stage1 = SYSTEM_INIT
+        .split("Ok(DevmgrControlInput::RetireStage1Ready(binding)) =>")
+        .nth(1)
+        .unwrap()
+        .split("Ok(DevmgrControlInput::Status(message)) =>")
+        .next()
+        .unwrap();
+    assert!(stage1.contains("state.e3a_stage1_ready = true;"));
+    assert!(stage1.contains("send_e3a_finalize_retire(resident, system)"));
+
+    let peer_close = SYSTEM_INIT
+        .split("E3AControllerMessage::StreamPeerClosed {")
+        .nth(1)
+        .unwrap()
+        .split("_ => Err(InitError::WrongManifestProfile)")
+        .next()
+        .unwrap();
+    assert!(peer_close.contains("!state.e3a_response_committed"));
+    assert!(!peer_close.contains("!state.e3a_stage1_ready"));
+    assert!(peer_close.contains(".e3a_peer_closed = true;"));
+    assert!(peer_close.contains("send_e3a_finalize_retire(resident, system)"));
 }
 
 #[test]

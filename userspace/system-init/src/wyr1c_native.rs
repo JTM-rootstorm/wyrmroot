@@ -2972,7 +2972,12 @@ where
                                         return Err(InitError::WrongManifestProfile);
                                     }
                                     state.e3a_stage1_ready = true;
-                                    Ok(())
+                                    // The probe's peer-close report and devmgr's
+                                    // stage-1 relay travel over independent
+                                    // channels. Rejoin the exact facts here as
+                                    // well as in the peer-close branch so either
+                                    // valid arrival order can release U1.
+                                    send_e3a_finalize_retire(resident, system)
                                 }
                                 #[cfg(feature = "wyr1c6-selector29")]
                                 Ok(DevmgrControlInput::C6Fact(fact)) => {
@@ -3149,8 +3154,7 @@ where
                                         .wyr1c
                                         .as_ref()
                                         .ok_or(InitError::WrongActivationOrder)?;
-                                    if !state.e3a_stage1_ready
-                                        || !state.e3a_response_committed
+                                    if !state.e3a_response_committed
                                         || state.e3a_peer_closed
                                         || nonce != binding.nonce
                                         || publication_generation != binding.publication_generation

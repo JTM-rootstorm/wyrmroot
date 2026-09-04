@@ -43,10 +43,17 @@ fn c6_feature_composition_keeps_selector_29_on_the_resource_profile() {
 }
 
 #[test]
-fn c6_resident_tick_leaves_time_for_the_ready_handshake() {
+fn bounded_resident_ticks_leave_headroom_for_selector_handshakes() {
     let resident = &MAIN_SOURCE[MAIN_SOURCE.find("fn continue_resident(").unwrap()..];
-    assert!(resident.contains("#[cfg(feature = \"wyr1c6-selector29\")]"));
+    assert!(
+        resident.contains(
+            "#[cfg(any(feature = \"wyr1c6-selector29\", feature = \"dw1e3-selector31\"))]"
+        )
+    );
     assert!(resident.contains("let tick_ns = WYR0_I_SUPERVISION_POLICY.backoff_ns;"));
+    assert!(resident.contains(
+        "#[cfg(not(any(feature = \"wyr1c6-selector29\", feature = \"dw1e3-selector31\")))]"
+    ));
     assert!(resident.contains("let tick_ns = 1_000_000_000;"));
     assert!(resident.contains("now.checked_add(tick_ns)"));
 }
