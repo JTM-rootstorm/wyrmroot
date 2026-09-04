@@ -42,6 +42,11 @@ Neighbor selector-31 native checks also require the compile-time
 `DEEPWYRM_DW1E_EVIDENCE_NONCE` (for example `0000000000000106`). Omitting it
 fails the existing runtime `env!` before the selected binary is checked;
 selector 32 obtains its nonce from the frozen gate configuration instead.
+The acceptance child additionally requires
+`wyrmroot-console-echo/native-console-echo`; selecting its package with
+`--bins` but omitting that feature silently skips the guest binary. An exact
+child check uses `-p wyrmroot-console-echo --bin console-echo --features
+native-console-echo` with the same accepted native target/compiler settings.
 
 ```text
 cargo test --offline --locked -p wyrmroot-system-init -p wyrmroot-consoled \
@@ -164,3 +169,33 @@ recorded separately; A2 remains immutable and not accepted. Broader review
 found no additional demonstrated defect in policy/artifact matching, startup
 ordering, bootfs mapping lifetime, or static stack/resource estimates. Those
 estimates are not live high-water measurements.
+
+## A3 first-input failure and broader stream joins
+
+A3 reaches initial D5READY on both profiles, then fails before the first COM2
+response. GDB A3-03 captures echo at CR3 `0x272000`, instruction `0x2020f3`,
+with actual wait snapshot `0x3` (READABLE|WRITABLE), requested interest `0x5`
+(READABLE|PEER_CLOSED), followed by `CE000005`. The stream observer confused
+interest with the full native snapshot. Both directional observers now admit
+only the complete Channel signal vocabulary while retaining their separate
+progress/closure semantics. Kernel ABI and generic wait validation are unchanged.
+
+The expanded review also found independently reproduced incremental-input
+issues. Capture now joins raw RX, committed child stdin, channel-specific
+child output and committed raw TX regardless of which fact completes last.
+CR may trigger a response before its trailing LF. The next host command may
+then coalesce with that LF in one raw record; regressions cover every prefix
+of both the next stderr command and the child-exit command. A pending new-child
+READY waits for the complete exit command. The actual input normalizer, scoped
+to the surviving raw console generation, preserves CR/LF state across child
+replacement and aborted child launch; only serial loss/rebind resets it.
+No selector-only byte suppression or changed host grammar establishes success.
+
+Review additionally identified native receive PEER_CLOSED after a final packet
+as a separate partial-I/O boundary absent from old queue-empty mocks. The
+stream-closure repair tests native receive/send close statuses directly. The
+integrated candidate passes runtime 115 units/16 source tests, selected
+consoled37/devmgr37/init105, workspace Clippy, formatting, and all five native
+D5 actors including console-echo with warnings denied. Full workspace results
+and fresh A4 UP/SMP acceptance must still be recorded; none of these host
+reproductions or debugger runs substitutes for live acceptance.

@@ -85,6 +85,9 @@ unconsumed bytes from the retained record remain.
   receive would block.
 - If at least one byte was copied, return that partial count rather than
   `WOULD_BLOCK` or EOF.
+- A native receive `PEER_CLOSED` after draining the queue latches EOF. Any
+  bytes already copied by that call are returned first; the next nonempty
+  read reports EOF without receiving again.
 - If no byte was copied and no record is available, return `WOULD_BLOCK` unless
   a fresh observation proves peer close with no `READABLE` data.
 - `READABLE | PEER_CLOSED` means drain readable datagrams first. Peer close is
@@ -92,6 +95,13 @@ unconsumed bytes from the retained record remain.
   record. This prevents loss of already-queued final bytes.
 - A malformed datagram or received handle fails the endpoint after closing all
   received handles. Bytes from that malformed datagram are never exposed.
+
+Wait interest is not a filter on the returned snapshot. The native ABI returns
+the full selected Channel state, so input may observe `WRITABLE` alongside
+`READABLE`, and output may observe `READABLE` alongside `WRITABLE`. Stream
+observers admit only the three Channel signal bits, ignore the opposite
+direction for progress, and retain the input drain-before-EOF and output
+peer-close-is-broken rules. Non-Channel bits remain invalid.
 
 ### 2.3 Bounded output semantics and wait races
 
@@ -102,6 +112,9 @@ maintains no unbounded retry queue.
 - Each successful Channel send commits that packet's byte count exactly once.
 - If a later send returns `WOULD_BLOCK`, return the already committed partial
   count; if none committed, return `WOULD_BLOCK`.
+- Native send `PEER_CLOSED` is broken output. A nonblocking write that already
+  committed earlier packets returns that partial count once; a subsequent
+  write observes closure as broken instead of retrying committed bytes.
 - A failed atomic send retains all handles and bytes at the sender. WRST sends
   no handles, so retry state is only the caller-owned unsent byte suffix.
 - `DW_SIGNAL_WRITABLE` is a capacity wake hint, never a reservation. A sender
@@ -420,9 +433,12 @@ and launch a fresh child. Old output is never spliced into the replacement.
 
 ### 8.2 Child-only loss
 
-Child loss closes its three stream pairs and transform state but preserves a
-healthy raw serial stream and driver generation. Consoled launches a fresh
-child generation with fresh stdin/stdout/stderr endpoints.
+Child loss closes its three stream pairs and child-output transform state but
+preserves a healthy raw serial stream and driver generation. The input CR/LF
+state belongs to that retained console generation under section 7; it is not
+reset by child-only cleanup or a failed child launch. Staged child bytes are
+still discarded, never replayed into the replacement. Consoled launches a
+fresh child generation with fresh stdin/stdout/stderr endpoints.
 
 The child restart window contains failure timestamps, not launch attempts.
 Four failures in any rolling 60-second active-monotonic interval exhaust the
