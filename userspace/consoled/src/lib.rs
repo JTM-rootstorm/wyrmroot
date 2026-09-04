@@ -38,6 +38,8 @@ pub enum ModelError {
     MonotonicRegression,
     ArithmeticOverflow,
     RestartExhausted,
+    SerialDisconnected,
+    ChildDisconnected,
     WrongDirection,
 }
 
@@ -959,6 +961,7 @@ impl ConsoleModel {
     ) -> Result<RecoveryAction, ModelError> {
         self.time(now)?;
         self.require_current(event)?;
+        self.last_failure = Some(ModelError::ChildDisconnected);
         self.clear_volatile();
         self.child_failure_at = Some(now);
         self.child_terminated = true;
@@ -974,6 +977,7 @@ impl ConsoleModel {
     ) -> Result<RecoveryAction, ModelError> {
         self.time(now)?;
         self.require_current(event)?;
+        self.last_failure = Some(ModelError::ChildDisconnected);
         self.mark_child_peer_closed(event, kind)?;
         self.start_child_retirement(false, true, now)
     }
@@ -1031,6 +1035,12 @@ impl ConsoleModel {
         {
             return Err(ModelError::WrongConnectionState);
         }
+        self.last_failure = Some(ModelError::SerialDisconnected);
+        // Once the serial generation is invalidated, its mandatory child
+        // replacement dominates any child-only failure observed first in the
+        // same retirement. Do not carry that timestamp into the next serial
+        // generation's independent child restart window.
+        self.child_failure_at = None;
         self.serial_cleanup = false;
         self.serial_invalidated = true;
         self.stable = None;
@@ -2059,8 +2069,66 @@ mod tests {
                 Ok(RecoveryAction::RetrySerialAt(32))
             );
             assert_eq!(model.state(), ConnectionState::Reconnecting);
+            let retired = model.snapshot();
+            assert_eq!(retired.child_failures, 0);
+            assert_eq!(retired.last_failure, Some(ModelError::SerialDisconnected));
+            assert_eq!(model.child_failure_at, None);
             assert!(model.validate_invariants());
         }
+    }
+
+    #[test]
+    fn serial_dominant_retirement_cannot_age_a_replacement_child_failure() {
+        let (mut model, old_event) = live();
+        let old_serial = model.snapshot();
+        model
+            .child_peer_closed(old_event, StreamKind::Stdout, 1)
+            .unwrap();
+        model
+            .serial_peer_closed(
+                old_serial.serial.unwrap(),
+                old_serial.console_generation.unwrap(),
+                2,
+            )
+            .unwrap();
+        model.child_terminated(old_event, 3).unwrap();
+        model.child_streams_closed(old_event, 3).unwrap();
+        model.child_reaped(old_event, 3).unwrap();
+        model
+            .complete_serial_cleanup(
+                old_serial.serial.unwrap(),
+                old_serial.console_generation.unwrap(),
+                4,
+            )
+            .unwrap();
+        connect(&mut model, 2, 5);
+
+        let replacement = launch(&mut model);
+        model
+            .child_peer_closed(replacement, StreamKind::Stdin, 70_000)
+            .unwrap();
+        assert_eq!(
+            model.snapshot().last_failure,
+            Some(ModelError::ChildDisconnected)
+        );
+        model.child_terminated(replacement, 70_000).unwrap();
+        model.child_streams_closed(replacement, 70_000).unwrap();
+        assert_eq!(
+            model.child_reaped(replacement, 70_000),
+            Ok(RecoveryAction::ReplaceChild)
+        );
+
+        let next = launch(&mut model);
+        model
+            .child_peer_closed(next, StreamKind::Stdin, 70_001)
+            .unwrap();
+        model.child_terminated(next, 70_001).unwrap();
+        model.child_streams_closed(next, 70_001).unwrap();
+        assert_eq!(
+            model.child_reaped(next, 70_001),
+            Ok(RecoveryAction::ReplaceChild)
+        );
+        assert_eq!(model.snapshot().child_failures, 2);
     }
 
     #[test]
