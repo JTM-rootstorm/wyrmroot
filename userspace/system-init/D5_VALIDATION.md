@@ -140,3 +140,27 @@ one-shot rebind and post-reap observation identity. They do not substitute for
 the full native callback/VM sequence. Source review found no further blocker
 in the prescribed D5 path. General registry-only broker refresh remains the
 separate limitation recorded in the publication handoff.
+
+## A2 GDB and JobV2 stream-hop correction
+
+The exact A2 product still failed both live profiles before D5READY. This was
+a different demonstrated cause: low-overhead GDB traced consoled exit
+`D400002F`, and its actual 56-byte WRLJ reply contained `ERROR` code 7
+(`PolicyRejected`). Init's existing exact Channel validator rejected the
+three streams before task-group or loader construction: consoled had removed
+`TRANSFER` on the first hop instead of the final child hop.
+
+Consoled now uses the existing authoritative
+`CHILD_CHANNEL_TRANSFER_RIGHTS` in its native descriptor constructor. Init's
+validator and the loader's final reduction remain unchanged. The regression
+compiles that same constructor and executes it through actual init validation,
+actual `load_job_process` INIT/MOVE generation, and the actual JobV2 child
+parser. It also rejects early reduction and excess `DUPLICATE` at ingress.
+This connects the previously isolated native sender and consumer assumptions.
+
+The selected suites now pass devmgr 37/init 105 tests, and all four native D5
+actors check with warnings denied. Full workspace and VM results must be
+recorded separately; A2 remains immutable and not accepted. Broader review
+found no additional demonstrated defect in policy/artifact matching, startup
+ordering, bootfs mapping lifetime, or static stack/resource estimates. Those
+estimates are not live high-water measurements.
