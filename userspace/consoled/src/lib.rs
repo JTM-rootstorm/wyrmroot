@@ -601,6 +601,9 @@ pub struct ConsoleSnapshot {
     pub serial_invalidated: bool,
     pub pending_launch: bool,
     pub pending_launch_cleanup: bool,
+    pub pending_connect: bool,
+    pub pending_stdin_reservation: bool,
+    pub pending_tx_reservation: bool,
     pub child_restart_exhausted: bool,
     pub serial_restart_exhausted: bool,
     pub last_failure: Option<ModelError>,
@@ -717,7 +720,11 @@ impl ConsoleModel {
     }
 
     pub fn abort_connect(&mut self, request: ConnectRequest) -> Result<(), ModelError> {
-        if self.state != ConnectionState::Reconnecting || self.pending_connect != Some(request) {
+        if !matches!(
+            self.state,
+            ConnectionState::Reconnecting | ConnectionState::FailClosed
+        ) || self.pending_connect != Some(request)
+        {
             return Err(ModelError::StaleCorrelation);
         }
         self.pending_connect = None;
@@ -874,7 +881,10 @@ impl ConsoleModel {
             child_generation: transaction.child_generation,
             child_launch: transaction.child_launch,
         };
-        if self.state != ConnectionState::Active
+        if !matches!(
+            self.state,
+            ConnectionState::Active | ConnectionState::FailClosed
+        )
             || self.child.is_some()
             || self.serial != Some(identity.serial)
             || self.console_generation != Some(identity.console_generation)
@@ -1285,6 +1295,9 @@ impl ConsoleModel {
             serial_invalidated: self.serial_invalidated,
             pending_launch: self.pending_launch.is_some(),
             pending_launch_cleanup: self.pending_launch_cleanup.is_some(),
+            pending_connect: self.pending_connect.is_some(),
+            pending_stdin_reservation: self.pending_stdin.is_some(),
+            pending_tx_reservation: self.pending_tx.is_some(),
             child_restart_exhausted: self.child_exhausted,
             serial_restart_exhausted: self.serial_exhausted,
             last_failure: self.last_failure,
@@ -1472,20 +1485,49 @@ impl ConsoleModel {
             return false;
         }
         if self.pending_launch.is_some()
-            && (self.serial.is_none() || self.console_generation.is_none())
+            && (self.serial.is_none()
+                || self.console_generation.is_none()
+                || self.child.is_some()
+                || self.pending_connect.is_some())
         {
             return false;
         }
-        if self.state == ConnectionState::Reconnecting && self.child.is_some() {
+        if self.state == ConnectionState::Reconnecting
+            && (self.serial.is_some()
+                || self.console_generation.is_some()
+                || self.child.is_some()
+                || self.pending_launch.is_some()
+                || self.serial_invalidated
+                || !self.serial_cleanup)
+        {
             return false;
         }
         if self.state == ConnectionState::Active && self.serial.is_none() {
             return false;
         }
-        if self.state != ConnectionState::FailClosed
-            && self.pending_connect.is_some()
-            && self.state != ConnectionState::Reconnecting
+        if self.pending_connect.is_some()
+            && (!matches!(
+                self.state,
+                ConnectionState::Reconnecting | ConnectionState::FailClosed
+            ) || self.serial.is_some()
+                || self.console_generation.is_some()
+                || self.child.is_some()
+                || self.pending_launch.is_some())
         {
+            return false;
+        }
+        if self.child.is_some()
+            && (self.serial.is_none()
+                || self.console_generation.is_none()
+                || self.pending_connect.is_some()
+                || self.pending_launch.is_some())
+        {
+            return false;
+        }
+        if self.serial.is_some() != self.console_generation.is_some() {
+            return false;
+        }
+        if self.serial_invalidated && self.serial_cleanup {
             return false;
         }
         true
@@ -1976,5 +2018,160 @@ mod tests {
             assert!(model.abort_child_launch(launch_b).is_ok());
             assert!(model.validate_invariants());
         }
+    }
+
+    #[test]
+    fn serial_loss_dominates_both_child_retirement_orderings() {
+        for serial_after_termination in [false, true] {
+            let (mut model, event) = live();
+            let snapshot = model.snapshot();
+            assert!(matches!(
+                model.child_peer_closed(event, StreamKind::Stdout, 1),
+                Ok(RecoveryAction::TerminateChild(_))
+            ));
+            if serial_after_termination {
+                assert!(matches!(
+                    model.child_terminated(event, 2),
+                    Ok(RecoveryAction::ReapChild(_))
+                ));
+            }
+            assert_eq!(
+                model.serial_peer_closed(
+                    snapshot.serial.unwrap(),
+                    snapshot.console_generation.unwrap(),
+                    3,
+                ),
+                Ok(RecoveryAction::None)
+            );
+            if !serial_after_termination {
+                assert!(matches!(
+                    model.child_terminated(event, 4),
+                    Ok(RecoveryAction::ReapChild(_))
+                ));
+            }
+            model.child_streams_closed(event, 5).unwrap();
+            assert_eq!(model.child_reaped(event, 6), Ok(RecoveryAction::None));
+            assert_eq!(
+                model.complete_serial_cleanup(
+                    snapshot.serial.unwrap(),
+                    snapshot.console_generation.unwrap(),
+                    7,
+                ),
+                Ok(RecoveryAction::RetrySerialAt(32))
+            );
+            assert_eq!(model.state(), ConnectionState::Reconnecting);
+            assert!(model.validate_invariants());
+        }
+    }
+
+    #[test]
+    fn child_exhaustion_survives_serial_replacement_and_blocks_a_fifth_child() {
+        let mut model = ConsoleModel::new();
+        connect(&mut model, 1, 0);
+        for failure in 0u64..4 {
+            let event = launch(&mut model);
+            let now = failure + 1;
+            model
+                .child_peer_closed(event, StreamKind::Stdin, now)
+                .unwrap();
+            model.child_terminated(event, now).unwrap();
+            model.child_streams_closed(event, now).unwrap();
+            let expected = if failure == 3 {
+                RecoveryAction::Escalate
+            } else {
+                RecoveryAction::ReplaceChild
+            };
+            assert_eq!(model.child_reaped(event, now), Ok(expected));
+        }
+        let exhausted = model.snapshot();
+        assert!(exhausted.child_restart_exhausted);
+        assert!(!exhausted.serial_restart_exhausted);
+        assert_eq!(
+            model.serial_peer_closed(
+                exhausted.serial.unwrap(),
+                exhausted.console_generation.unwrap(),
+                5,
+            ),
+            Ok(RecoveryAction::RetrySerialAt(30))
+        );
+        connect(&mut model, 2, 6);
+        assert_eq!(
+            model.begin_child_launch(999),
+            Err(ModelError::RestartExhausted)
+        );
+        assert!(model.validate_invariants());
+    }
+
+    #[test]
+    fn exact_restart_window_boundary_expires_the_old_failure() {
+        let mut model = ConsoleModel::new();
+        connect(&mut model, 1, 0);
+        for now in [0, RESTART_WINDOW_MILLIS] {
+            let event = launch(&mut model);
+            model
+                .child_peer_closed(event, StreamKind::Stdin, now)
+                .unwrap();
+            model.child_terminated(event, now).unwrap();
+            model.child_streams_closed(event, now).unwrap();
+            assert_eq!(
+                model.child_reaped(event, now),
+                Ok(RecoveryAction::ReplaceChild)
+            );
+        }
+        assert_eq!(model.snapshot().child_failures, 1);
+    }
+
+    #[test]
+    fn stale_ready_from_replaced_child_cannot_change_new_stability() {
+        let (mut model, old_event) = live();
+        let old_token = model.observe_child_ready(old_event, 1).unwrap();
+        model
+            .child_peer_closed(old_event, StreamKind::Stdin, 2)
+            .unwrap();
+        model.child_terminated(old_event, 2).unwrap();
+        model.child_streams_closed(old_event, 2).unwrap();
+        model.child_reaped(old_event, 2).unwrap();
+        let new_event = launch(&mut model);
+        let new_token = model.observe_child_ready(new_event, 3).unwrap();
+        assert_eq!(
+            model.observe_ready(4, old_token),
+            Err(ModelError::StaleCorrelation)
+        );
+        assert!(model
+            .observe_ready(3 + STABLE_RUN_MILLIS, new_token)
+            .unwrap());
+    }
+
+    #[test]
+    fn fail_closed_launch_still_exposes_and_completes_endpoint_cleanup() {
+        let mut model = ConsoleModel::new();
+        connect(&mut model, 1, 10);
+        let mut launch = model.begin_child_launch(101).unwrap();
+        launch.move_child_peer(StreamKind::Stdin).unwrap();
+        let snapshot = model.snapshot();
+        assert_eq!(
+            model.serial_peer_closed(
+                snapshot.serial.unwrap(),
+                snapshot.console_generation.unwrap(),
+                9,
+            ),
+            Err(ModelError::MonotonicRegression)
+        );
+        let pending = model.snapshot();
+        assert_eq!(pending.state, ConnectionState::FailClosed);
+        assert!(pending.pending_launch);
+        let token = model.abort_child_launch(launch).unwrap();
+        let evidence = LaunchCleanupEvidence {
+            consoled_peers_closed: [true; 3],
+            unmoved_child_peers_closed: [false, true, true],
+            moved_child_peers_revoked: [true, false, false],
+        };
+        model
+            .complete_abort_child_launch(&token, evidence)
+            .unwrap();
+        let cleaned = model.snapshot();
+        assert!(!cleaned.pending_launch);
+        assert!(!cleaned.pending_launch_cleanup);
+        assert!(model.validate_invariants());
     }
 }
