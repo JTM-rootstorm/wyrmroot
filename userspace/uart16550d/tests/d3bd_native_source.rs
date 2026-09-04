@@ -151,10 +151,7 @@ fn startup_and_stream_peer_close_precedence_is_explicit() {
         + DRIVER[pending..]
             .find("while driver.wants_stream_readable()")
             .unwrap();
-    let drain = capacity
-        + DRIVER[capacity..]
-            .find("service_stream_read(driver, control, pio_failed)")
-            .unwrap();
+    let drain = capacity + DRIVER[capacity..].find("service_stream_read(").unwrap();
     let blocked = drain
         + DRIVER[drain..]
             .find("StreamReadOutcome::WouldBlock")
@@ -169,6 +166,51 @@ fn startup_and_stream_peer_close_precedence_is_explicit() {
         .find("peer_close_drain.include_stream_wait(receive_capacity)")
         .unwrap();
     assert!(suppress < pending);
+}
+
+#[test]
+fn selector32_drain_is_post_ack_fresh_queue_and_hardware_proof() {
+    let proof = DRIVER
+        .split("fn service_d5_drain")
+        .nth(1)
+        .unwrap()
+        .split("fn selector_response_input_drained")
+        .next()
+        .unwrap();
+    let receive = proof
+        .find("service_stream_read(driver, control, pio_failed, fence)")
+        .unwrap();
+    let empty = proof.find("channel_empty = true").unwrap();
+    let software = proof.find("let software_empty").unwrap();
+    let hardware = proof.find("driver.uart_mut().transport_empty()").unwrap();
+    let send = proof.find("send_channel(control, &bytes, &[])").unwrap();
+    let commit = proof.find("fence.sent(identity)").unwrap();
+    assert!(
+        receive < empty
+            && empty < software
+            && software < hardware
+            && hardware < send
+            && send < commit
+    );
+    assert!(proof.contains("fence.ready(channel_empty, software_empty, true).is_none()"));
+    assert!(proof.contains("fence.ready(channel_empty, software_empty, temt)"));
+    let ack = DRIVER.find("driver.acknowledge_interrupt(drained").unwrap();
+    let recorded = DRIVER.find("d5.irq_acknowledged()").unwrap();
+    assert!(ack < recorded);
+    assert!(DEVMGR.contains("!selector32_drain.permits_retire(identity)"));
+    let relay = DEVMGR
+        .split("fn service_selector32_driver_control")
+        .nth(1)
+        .unwrap();
+    assert!(
+        relay
+            .find(".validate_completion(identity, broker)")
+            .unwrap()
+            < relay.find("send_d5_controller").unwrap()
+    );
+    assert!(
+        relay.find("send_d5_controller").unwrap() < relay.find(".forwarded(identity)").unwrap()
+    );
 }
 
 #[test]

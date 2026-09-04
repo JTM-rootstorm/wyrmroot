@@ -980,4 +980,61 @@ mod tests {
         assert_eq!(broker.current(), Some(published));
         assert_eq!(broker.slot(), before_slot);
     }
+
+    #[cfg(feature = "wyr1d-selector32")]
+    #[test]
+    fn selector32_drain_relay_requires_exact_pending_active_fence_once() {
+        use crate::d5_drain::DrainRelay;
+        use wyrmroot_device_proto::d5_controller::D5DrainIdentity;
+        let published = driver(10, 1);
+        let mut broker = ConnectorBroker::new(Some(published), 100, 200).unwrap();
+        let attach = attach_once(&mut broker, 10, 7);
+        let identity = D5DrainIdentity {
+            driver: published.d5_identity(),
+            attach_transaction_id: attach.attach_transaction_id,
+            stream_generation: attach.stream_generation,
+            target_tx_bytes: 45,
+            leg: 2,
+        };
+        let mut relay = DrainRelay::default();
+        assert!(!relay.permits_retire(identity.driver));
+        assert!(relay.validate_completion(identity, &broker).is_err());
+        assert!(
+            relay
+                .request(
+                    D5DrainIdentity {
+                        attach_transaction_id: 99,
+                        ..identity
+                    },
+                    &broker
+                )
+                .is_err()
+        );
+        relay.request(identity, &broker).unwrap();
+        assert!(relay.request(identity, &broker).is_err());
+        assert!(!relay.permits_retire(identity.driver));
+        assert!(
+            relay
+                .validate_completion(
+                    D5DrainIdentity {
+                        stream_generation: 99,
+                        ..identity
+                    },
+                    &broker
+                )
+                .is_err()
+        );
+        relay.validate_completion(identity, &broker).unwrap();
+        // Failed forwarding cannot enable retirement or consume the pending fence.
+        assert!(!relay.permits_retire(identity.driver));
+        relay.validate_completion(identity, &broker).unwrap();
+        relay.forwarded(identity).unwrap();
+        assert!(relay.permits_retire(identity.driver));
+        assert!(relay.validate_completion(identity, &broker).is_err());
+        assert!(relay.forwarded(identity).is_err());
+        assert!(relay.request(identity, &broker).is_err());
+        broker.driver_attempt_reaped(published).unwrap();
+        let mut stale = DrainRelay::default();
+        assert!(stale.request(identity, &broker).is_err());
+    }
 }

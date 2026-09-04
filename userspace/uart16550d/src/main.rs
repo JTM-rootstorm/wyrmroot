@@ -20,6 +20,11 @@ use wyrmroot_device_proto::control_v1_1::{
 use wyrmroot_device_proto::coordinator::{
     AttemptGeneration, BundleGeneration, EndpointGeneration, EndpointId,
 };
+#[cfg(feature = "wyr1d-selector32")]
+use wyrmroot_device_proto::d5_controller::{
+    D5ControllerMessage, D5DrainIdentity, D5DriverIdentity, RECORD_BYTES as D5_BYTES,
+    encode as encode_d5, parse as parse_d5,
+};
 use wyrmroot_device_proto::manifest::RoleId;
 #[cfg(feature = "dw1e3-selector31")]
 use wyrmroot_dw1e3_com2_test::{
@@ -30,6 +35,8 @@ use wyrmroot_dw1e3_com2_test::{
 use wyrmroot_loader::launch::{
     CHILD_CHANNEL_RIGHTS, DEVICE_DRIVER_BYTES, SELF_ROOT_RIGHTS, parse_device_driver_init,
 };
+#[cfg(feature = "wyr1d-selector32")]
+use wyrmroot_runtime::monotonic_active_now;
 use wyrmroot_runtime::{
     BOOTSTRAP_CHANNEL_EXPECTATION, NativeError, StartupBlock, close_handle, device_pio_read,
     device_pio_write, device_resource_info, interrupt_ack, interrupt_info, panic_abort,
@@ -44,6 +51,8 @@ use wyrmroot_stream_proto::MAX_RECORD_BYTES;
 #[cfg(feature = "dw1e3-selector31")]
 use wyrmroot_stream_proto::decode_data;
 use wyrmroot_uart16550_core::ByteRegisterIo;
+#[cfg(feature = "wyr1d-selector32")]
+use wyrmroot_uart16550d::d5_drain::DrainFence;
 use wyrmroot_uart16550d::{
     DeviceStage, PeerCloseDrain, ProductionDriver, ReceivedDeviceResource, ReceivedInterrupt,
     ReceivedStreamEndpoint, StreamSendAction, StreamSendResult, startup_control_is_readable,
@@ -295,7 +304,13 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
     #[cfg(feature = "dw1e3-selector31")]
     return run_event_loop(&mut driver, control, &pio_failed, evidence_nonce);
     #[cfg(not(feature = "dw1e3-selector31"))]
-    run_event_loop(&mut driver, control, &pio_failed)
+    run_event_loop(
+        &mut driver,
+        control,
+        &pio_failed,
+        #[cfg(feature = "wyr1d-selector32")]
+        startup_identity,
+    )
 }
 
 fn run_event_loop<I: ByteRegisterIo>(
@@ -303,8 +318,20 @@ fn run_event_loop<I: ByteRegisterIo>(
     control: DwHandle,
     pio_failed: &Cell<bool>,
     #[cfg(feature = "dw1e3-selector31")] evidence_nonce: u64,
+    #[cfg(feature = "wyr1d-selector32")] startup_identity: ControlIdentityV1_1,
 ) -> Result<u32, u32> {
     let mut peer_close_drain = PeerCloseDrain::new();
+    #[cfg(feature = "wyr1d-selector32")]
+    let mut d5 = DrainFence::new(D5DriverIdentity {
+        device_role_id: startup_identity.role_id.0,
+        bundle_generation: startup_identity.bundle_generation.0,
+        driver_attempt_generation: startup_identity.attempt_generation.0,
+        driver_control_endpoint_id: startup_identity.endpoint.id.0,
+        driver_control_endpoint_generation: startup_identity.endpoint.generation.0,
+        launch_transaction_id: startup_identity.transaction_id,
+    });
+    #[cfg(feature = "wyr1d-selector32")]
+    let mut d5_polls = 0u32;
     #[cfg(feature = "dw1e3-selector31")]
     let mut evidence = None;
     #[cfg(feature = "dw1e3-selector31")]
@@ -312,6 +339,12 @@ fn run_event_loop<I: ByteRegisterIo>(
     #[cfg(feature = "dw1e3-selector31")]
     let mut selector_retirement_binding = None;
     loop {
+        #[cfg(feature = "wyr1d-selector32")]
+        if d5.pending().is_some() {
+            if let Err(code) = service_d5_drain(driver, control, pio_failed, &mut d5) {
+                return fail_driver(driver, control, code);
+            }
+        }
         let mut items = [DwWaitItemV1::default(); 3];
         items[0] = DwWaitItemV1 {
             handle: control,
@@ -352,8 +385,28 @@ fn run_event_loop<I: ByteRegisterIo>(
                 count = 3;
             }
         }
-        let observed = match wait_many(&items[..count], DW_DEADLINE_INFINITE) {
+        let deadline = DW_DEADLINE_INFINITE;
+        #[cfg(feature = "wyr1d-selector32")]
+        let deadline = if d5.pending().is_some() {
+            DwDeadline(
+                monotonic_active_now()
+                    .map_err(|_| 100u32)?
+                    .checked_add(1_000_000)
+                    .ok_or(101u32)?,
+            )
+        } else {
+            deadline
+        };
+        let observed = match wait_many(&items[..count], deadline) {
             Ok(observed) => observed,
+            #[cfg(feature = "wyr1d-selector32")]
+            Err(error) if d5.pending().is_some() && status_is(error, DW_STATUS_TIMED_OUT) => {
+                d5_polls += 1;
+                if d5_polls > 2000 {
+                    return fail_driver(driver, control, 102);
+                }
+                continue;
+            }
             Err(_) => return fail_driver(driver, control, 35),
         };
 
@@ -376,6 +429,16 @@ fn run_event_loop<I: ByteRegisterIo>(
                 match service_control(driver, control) {
                     Ok(ControlOutcome::Continue) => continue,
                     Ok(ControlOutcome::Retire) => return graceful_shutdown(driver, control, 0),
+                    #[cfg(feature = "wyr1d-selector32")]
+                    Ok(ControlOutcome::Drain(identity)) => {
+                        if d5
+                            .request(identity, driver.stream_attach_identity())
+                            .is_err()
+                        {
+                            return fail_driver(driver, control, 103);
+                        }
+                        continue;
+                    }
                     #[cfg(feature = "dw1e3-selector31")]
                     Ok(ControlOutcome::ChallengeBinding(binding)) => {
                         if evidence.is_some() {
@@ -496,6 +559,10 @@ fn run_event_loop<I: ByteRegisterIo>(
                 Ok(work) => work,
                 Err(_) => return fail_driver(driver, control, 40),
             };
+            #[cfg(not(feature = "dw1e3-selector31"))]
+            let _ = work;
+            #[cfg(feature = "wyr1d-selector32")]
+            d5.irq_acknowledged();
             #[cfg(feature = "dw1e3-selector31")]
             if evidence
                 .as_ref()
@@ -531,10 +598,22 @@ fn run_event_loop<I: ByteRegisterIo>(
             if peer_close_drain.is_pending() {
                 while driver.wants_stream_readable() {
                     #[cfg(feature = "dw1e3-selector31")]
-                    let stream_result =
-                        service_stream_read(driver, control, pio_failed, &mut evidence);
+                    let stream_result = service_stream_read(
+                        driver,
+                        control,
+                        pio_failed,
+                        &mut evidence,
+                        #[cfg(feature = "wyr1d-selector32")]
+                        &mut d5,
+                    );
                     #[cfg(not(feature = "dw1e3-selector31"))]
-                    let stream_result = service_stream_read(driver, control, pio_failed);
+                    let stream_result = service_stream_read(
+                        driver,
+                        control,
+                        pio_failed,
+                        #[cfg(feature = "wyr1d-selector32")]
+                        &mut d5,
+                    );
                     match stream_result {
                         Ok(StreamReadOutcome::Accepted) => {}
                         #[cfg(feature = "dw1e3-selector31")]
@@ -557,9 +636,22 @@ fn run_event_loop<I: ByteRegisterIo>(
             }
             if readable {
                 #[cfg(feature = "dw1e3-selector31")]
-                let stream_result = service_stream_read(driver, control, pio_failed, &mut evidence);
+                let stream_result = service_stream_read(
+                    driver,
+                    control,
+                    pio_failed,
+                    &mut evidence,
+                    #[cfg(feature = "wyr1d-selector32")]
+                    &mut d5,
+                );
                 #[cfg(not(feature = "dw1e3-selector31"))]
-                let stream_result = service_stream_read(driver, control, pio_failed);
+                let stream_result = service_stream_read(
+                    driver,
+                    control,
+                    pio_failed,
+                    #[cfg(feature = "wyr1d-selector32")]
+                    &mut d5,
+                );
                 match stream_result {
                     Ok(StreamReadOutcome::Accepted | StreamReadOutcome::WouldBlock) => {}
                     #[cfg(feature = "dw1e3-selector31")]
@@ -586,6 +678,51 @@ fn run_event_loop<I: ByteRegisterIo>(
         }
         return fail_driver(driver, control, 44);
     }
+}
+
+#[cfg(feature = "wyr1d-selector32")]
+fn service_d5_drain<I: ByteRegisterIo>(
+    driver: &mut ProductionDriver<I>,
+    control: DwHandle,
+    pio_failed: &Cell<bool>,
+    fence: &mut DrainFence,
+) -> Result<(), u32> {
+    let Some(identity) = fence.pending() else {
+        return Ok(());
+    };
+    if driver.stream_attach_identity()
+        != Some((identity.attach_transaction_id, identity.stream_generation))
+    {
+        return Err(106);
+    }
+    // Control may arrive before the final WRST DATA. Keep receiving it before
+    // considering retirement; fresh WOULD_BLOCK is required on every probe.
+    let mut channel_empty = false;
+    while driver.wants_stream_readable() {
+        match service_stream_read(driver, control, pio_failed, fence) {
+            Ok(StreamReadOutcome::Accepted) => {}
+            Ok(StreamReadOutcome::WouldBlock) => {
+                channel_empty = true;
+                break;
+            }
+            Ok(StreamReadOutcome::Detached) | Err(()) => return Err(107),
+        }
+    }
+    let software_empty = driver.tx_free() == wyrmroot_uart16550_core::RING_CAPACITY;
+    if fence.ready(channel_empty, software_empty, true).is_none() {
+        return Ok(());
+    }
+    let temt = driver.uart_mut().transport_empty();
+    if pio_failed.get() {
+        return Err(108);
+    }
+    if let Some(identity) = fence.ready(channel_empty, software_empty, temt) {
+        let mut bytes = [0; D5_BYTES];
+        encode_d5(D5ControllerMessage::TxDrained(identity), &mut bytes).map_err(|_| 109u32)?;
+        send_channel(control, &bytes, &[]).map_err(|_| 110u32)?;
+        fence.sent(identity).map_err(|_| 111u32)?;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "dw1e3-selector31")]
@@ -811,6 +948,8 @@ fn prove_transport_empty<I: ByteRegisterIo>(
 enum ControlOutcome {
     Continue,
     Retire,
+    #[cfg(feature = "wyr1d-selector32")]
+    Drain(D5DrainIdentity),
     #[cfg(feature = "dw1e3-selector31")]
     ChallengeBinding(ChallengeBinding),
     #[cfg(feature = "dw1e3-selector31")]
@@ -829,6 +968,17 @@ fn service_control<I: ByteRegisterIo>(
     if counts.bytes > bytes.len() || counts.handles > handles.len() {
         close_received(&handles, counts.handles);
         return Err(46);
+    }
+    #[cfg(feature = "wyr1d-selector32")]
+    if counts.bytes == D5_BYTES && bytes[..4] == *b"WDR5" {
+        if counts.handles != 0 {
+            close_received(&handles, counts.handles);
+            return Err(104);
+        }
+        return match parse_d5(&bytes[..counts.bytes]) {
+            Ok(D5ControllerMessage::RequestDrain(identity)) => Ok(ControlOutcome::Drain(identity)),
+            _ => Err(105),
+        };
     }
     #[cfg(feature = "dw1e3-selector31")]
     if counts.handles == 0
@@ -896,6 +1046,7 @@ fn service_stream_read<I: ByteRegisterIo>(
     control: DwHandle,
     pio_failed: &Cell<bool>,
     #[cfg(feature = "dw1e3-selector31")] evidence: &mut Option<EvidenceDrain>,
+    #[cfg(feature = "wyr1d-selector32")] d5: &mut DrainFence,
 ) -> Result<StreamReadOutcome, ()> {
     let Some(endpoint) = driver.stream_endpoint() else {
         return Ok(StreamReadOutcome::Detached);
@@ -920,14 +1071,18 @@ fn service_stream_read<I: ByteRegisterIo>(
         isolate_stream(driver, control)?;
         return Ok(StreamReadOutcome::Detached);
     }
-    if driver
-        .accept_stream_record(&bytes[..counts.bytes], counts.handles)
-        .is_err()
-    {
-        close_received(&handles, counts.handles);
-        isolate_stream(driver, control)?;
-        return Ok(StreamReadOutcome::Detached);
-    }
+    let accepted = match driver.accept_stream_record(&bytes[..counts.bytes], counts.handles) {
+        Ok(accepted) => accepted,
+        Err(_) => {
+            close_received(&handles, counts.handles);
+            isolate_stream(driver, control)?;
+            return Ok(StreamReadOutcome::Detached);
+        }
+    };
+    #[cfg(feature = "wyr1d-selector32")]
+    d5.accept(accepted).map_err(|_| ())?;
+    #[cfg(not(feature = "wyr1d-selector32"))]
+    let _ = accepted;
     #[cfg(feature = "dw1e3-selector31")]
     {
         let payload = decode_data(&bytes[..counts.bytes])

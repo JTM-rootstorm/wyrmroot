@@ -293,6 +293,8 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
     let mut selector_retiring_driver = None;
     #[cfg(feature = "wyr1d-selector32")]
     let mut selector32_retire_requested = None;
+    #[cfg(feature = "wyr1d-selector32")]
+    let mut selector32_drain = wyrmroot_devmgr::d5_drain::DrainRelay::default();
     #[cfg(feature = "wyr1c4-production")]
     let mut _device_resource = None;
     #[cfg(feature = "wyr1c5-production")]
@@ -358,6 +360,7 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                             ConnectorSlot::Active { attach, .. } if attach.driver == current
                         )
                         || selector32_retire_requested.is_some()
+                        || !selector32_drain.permits_retire(identity)
                     {
                         return Err(failure(229));
                     }
@@ -375,7 +378,22 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                     continue;
                 }
                 #[cfg(feature = "wyr1d-selector32")]
-                ControllerInput::D5(D5ControllerMessage::DriverReady(_)) => {
+                ControllerInput::D5(D5ControllerMessage::RequestDrain(identity)) => {
+                    let control = driver_control.ok_or(failure(263))?;
+                    let broker = connector_broker.as_ref().ok_or(failure(264))?;
+                    if selector32_retire_requested.is_some() {
+                        return Err(failure(265));
+                    }
+                    selector32_drain
+                        .request(identity, broker)
+                        .map_err(|_| failure(266))?;
+                    send_d5_controller(control, D5ControllerMessage::RequestDrain(identity))?;
+                    continue;
+                }
+                #[cfg(feature = "wyr1d-selector32")]
+                ControllerInput::D5(
+                    D5ControllerMessage::DriverReady(_) | D5ControllerMessage::TxDrained(_),
+                ) => {
                     return Err(failure(232));
                 }
                 #[cfg(feature = "dw1e3-selector31")]
@@ -679,7 +697,9 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
             if observed.observed.0 & DW_SIGNAL_READABLE.0 != 0 && connector_broker.is_some() {
                 service_selector32_driver_control(
                     control,
+                    bootstrap,
                     connector_broker.as_mut().ok_or(failure(252))?,
+                    &mut selector32_drain,
                 )?;
                 driver_control = Some(control);
                 continue;
@@ -1416,7 +1436,9 @@ fn service_selector31_driver_control(
 #[cfg(feature = "wyr1d-selector32")]
 fn service_selector32_driver_control(
     driver_control: DwHandle,
+    bootstrap: DwHandle,
     broker: &mut ConnectorBroker,
+    drain: &mut wyrmroot_devmgr::d5_drain::DrainRelay,
 ) -> Result<(), u32> {
     let mut bytes = [0u8; D3_DEVICE_STAGE_BYTES];
     let mut handles = [DwReceivedHandleInfoV1::default(); 1];
@@ -1425,6 +1447,19 @@ fn service_selector32_driver_control(
     if counts.bytes > bytes.len() || counts.handles != 0 {
         close_received(&handles, counts.handles);
         return Err(failure(254));
+    }
+    if counts.bytes == D5_CONTROLLER_BYTES && bytes[..4] == *b"WDR5" {
+        let D5ControllerMessage::TxDrained(identity) =
+            parse_d5_controller(&bytes[..counts.bytes]).map_err(|_| failure(267))?
+        else {
+            return Err(failure(268));
+        };
+        drain
+            .validate_completion(identity, broker)
+            .map_err(|_| failure(269))?;
+        send_d5_controller(bootstrap, D5ControllerMessage::TxDrained(identity))?;
+        drain.forwarded(identity).map_err(|_| failure(270))?;
+        return Ok(());
     }
     let message = parse_control_v1_1(&bytes[..counts.bytes]).map_err(|_| failure(255))?;
     broker.driver_detached(message).map_err(|_| failure(256))

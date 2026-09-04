@@ -8,6 +8,9 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "wyr1d-selector32")]
+pub mod d5_drain;
+
 #[cfg(feature = "dw1e3-selector31")]
 use wyrmroot_dw1e3_com2_test as _;
 
@@ -557,6 +560,14 @@ impl<I: ByteRegisterIo> ProductionDriver<I> {
 
     pub const fn stream_generations(&self) -> Option<(u64, u64)> {
         self.stream.active_generations()
+    }
+
+    #[cfg(feature = "wyr1d-selector32")]
+    pub const fn stream_attach_identity(&self) -> Option<(u64, u64)> {
+        match self.stream.active {
+            Some((attach, stream, _, _)) => Some((attach, stream)),
+            None => None,
+        }
     }
 
     pub fn tx_free(&self) -> usize {
@@ -1152,6 +1163,52 @@ mod tests {
             )))
         ));
         assert!(matches!(driver.uart().state(), CoreState::Failed(_)));
+    }
+
+    #[cfg(feature = "wyr1d-selector32")]
+    #[test]
+    fn selector32_fake_uart_needs_all_fifo_epochs_then_real_temt() {
+        use crate::d5_drain::DrainFence;
+        use wyrmroot_device_proto::d5_controller::{D5DrainIdentity, D5DriverIdentity};
+        let mut io = ScriptedIo::new(Rc::new(RefCell::new(Vec::new())));
+        io.push_reads(2, [1, 2, 1, 2, 1, 2, 1]);
+        // Initialization first samples LSR while draining stale state.
+        io.push_reads(5, [0, 0, 0x40]);
+        let mut driver = production(io);
+        driver.activate().unwrap();
+        let identity = D5DrainIdentity {
+            driver: D5DriverIdentity {
+                device_role_id: 1,
+                bundle_generation: 1,
+                driver_attempt_generation: 1,
+                driver_control_endpoint_id: 1,
+                driver_control_endpoint_generation: 1,
+                launch_transaction_id: 99,
+            },
+            attach_transaction_id: 5,
+            stream_generation: 6,
+            target_tx_bytes: 45,
+            leg: 2,
+        };
+        let mut fence = DrainFence::new(identity.driver);
+        assert_eq!(driver.uart_mut().enqueue_tx(&[b'x'; 45]), 45);
+        fence.accept(45).unwrap();
+        fence.request(identity, Some((5, 6))).unwrap();
+        for remaining in [29, 13, 0] {
+            let drained = driver.drain_interrupt().unwrap();
+            driver
+                .acknowledge_interrupt(drained, true, |_| Ok(()))
+                .unwrap();
+            fence.irq_acknowledged();
+            assert_eq!(driver.uart().tx_len(), remaining);
+            if remaining != 0 {
+                assert_eq!(fence.ready(true, false, true), None);
+            }
+        }
+        assert!(!driver.uart_mut().transport_empty());
+        assert_eq!(fence.ready(true, true, false), None);
+        assert!(driver.uart_mut().transport_empty());
+        assert_eq!(fence.ready(true, true, true), Some(identity));
     }
 
     #[test]

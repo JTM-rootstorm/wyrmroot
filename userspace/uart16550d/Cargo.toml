@@ -19,6 +19,7 @@ required-features = ["native-uart16550d"]
 [features]
 default = []
 native-uart16550d = ["dep:wyrmroot-loader", "dep:wyrmroot-runtime"]
+wyr1d-selector32 = ["native-uart16550d"]
 dw1e3-selector31 = [
     "native-uart16550d",
     "dep:wyrmroot-dw1e3-com2-test",
