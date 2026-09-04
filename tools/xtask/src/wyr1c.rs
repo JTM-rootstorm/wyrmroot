@@ -248,7 +248,7 @@ const D5_PRODUCT_NATIVE_SPECS: [NativeSpec; 7] = [
         label: "uart16550d",
         package: "wyrmroot-uart16550d",
         binary: "uart16550d",
-        features: "native-uart16550d",
+        features: "wyr1d-selector32",
         artifact: "uart16550d",
     },
     NativeSpec {
@@ -2722,6 +2722,7 @@ mod tests {
     fn d5_product_binds_console_echo_policy_and_excludes_selector31() {
         assert_eq!(D5_PRODUCT_NATIVE_SPECS[0].features, "wyr1d-selector32");
         assert_eq!(D5_PRODUCT_NATIVE_SPECS[2].features, "wyr1d-selector32");
+        assert_eq!(D5_PRODUCT_NATIVE_SPECS[3].features, "wyr1d-selector32");
         assert_eq!(
             D5_PRODUCT_NATIVE_SPECS[4].features,
             "native-consoled,wyr1d-selector32"
