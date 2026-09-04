@@ -1,0 +1,2144 @@
+#![no_std]
+#![no_main]
+#![deny(unsafe_code)]
+
+use core::panic::PanicInfo;
+
+use deepwyrm_syscall::{
+    DW_HANDLE_TRANSFER_MOVE, DW_OBJECT_TYPE_CHANNEL, DW_RIGHT_DUPLICATE, DW_RIGHT_INSPECT,
+    DW_RIGHT_READ, DW_RIGHT_TRANSFER, DW_RIGHT_WAIT, DW_RIGHT_WRITE, DW_SIGNAL_PEER_CLOSED,
+    DW_SIGNAL_READABLE, DW_SIGNAL_WRITABLE, DW_STATUS_TIMED_OUT, DwDeadline, DwHandle,
+    DwHandleTransferV1, DwReceivedHandleInfoV1, DwRights, DwSignals, DwWaitItemV1,
+};
+use wyrmroot_consoled::{
+    CleanupDisposition, ConnectRequest, ConsoleModel, EventGeneration, FAIR_SOURCE_BYTES_PER_TURN,
+    LaunchCleanupEvidence, LaunchTransaction, OutputSource, RecoveryAction, Reservation,
+    STAGING_CAPACITY, SerialCorrelation, StreamKind,
+};
+use wyrmroot_device_proto::connector::{ConnectorIdentity, ConnectorMessage, RECORD_BYTES};
+use wyrmroot_device_proto::{
+    COM2_ROLE_ID, SERIAL_CONSOLE_CONNECTOR_PUBLICATION_POLICY,
+    connector::{encode as encode_connector, parse as parse_connector},
+};
+use wyrmroot_launch_proto::{
+    ErrorCode as LaunchErrorCode, MAX_LAUNCH_MESSAGE_BYTES, Message as LaunchMessage,
+    MessageType as LaunchMessageType, Reservation as LaunchReservation, encode_job_message,
+    encode_launch, parse_message as parse_launch_message,
+};
+use wyrmroot_loader::launch::{
+    CHILD_CHANNEL_RIGHTS, CONSOLED_BYTES, LaunchProfile, encode_ready_for_profile,
+    parse_consoled_init,
+};
+use wyrmroot_registry_proto::{
+    ErrorCode as RegistryErrorCode, Header as RegistryHeader, Lookup, Message as RegistryMessage,
+    MessageType as RegistryMessageType, ProtocolVersion, Watch, encode_cancel, encode_lookup,
+    encode_watch, parse as parse_registry,
+};
+use wyrmroot_runtime::{
+    BOOTSTRAP_CHANNEL_EXPECTATION, NativeError, NativeInput, NativeOutput, ReceiveCounts,
+    StartupBlock, StreamEndpoint, StreamError, StreamSystem, WYR0_I_SUPERVISION_POLICY,
+    close_handle, create_channel, duplicate_handle, monotonic_active_now, panic_abort,
+    query_capability_info, receive_channel, send_channel, validate_bootstrap_channel, wait_many,
+    wait_one,
+};
+
+const FAILURE_BASE: u32 = 0xD400_0000;
+const CHILD_PATH: &str = "bin/console-echo";
+const EVENT_TICK_NS: u64 = 1_000_000_000;
+const NANOS_PER_MILLI: u64 = 1_000_000;
+const FATAL_ATTACH_BASE: u32 = 0x0000_0100;
+
+/// Construction rights are local only. Every endpoint retained by consoled or
+/// moved to a child is reduced to the exact WRLP child-Channel rights.
+const CHANNEL_CONSTRUCTION_RIGHTS: DwRights =
+    DwRights(CHILD_CHANNEL_RIGHTS.0 | DW_RIGHT_TRANSFER.0 | DW_RIGHT_DUPLICATE.0);
+const CONNECTOR_PAIR_RIGHTS: DwRights = DwRights(
+    DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_WAIT.0 | DW_RIGHT_INSPECT.0 | DW_RIGHT_TRANSFER.0,
+);
+
+#[derive(Clone, Copy)]
+struct StartupAuthorities {
+    registry: DwHandle,
+    launch: DwHandle,
+    registry_generation: u64,
+    registry_endpoint_id: u64,
+    registry_endpoint_generation: u64,
+    launch_connection_id: u64,
+    launch_connection_generation: u64,
+    startup_transaction: u64,
+}
+
+struct SerialSession {
+    identity: ConnectorIdentity,
+    watch: Option<ActiveWatch>,
+    input: NativeInput,
+    output: NativeOutput,
+}
+
+impl SerialSession {
+    const fn endpoint(&self) -> DwHandle {
+        self.input.endpoint().handle()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ActiveWatch {
+    transaction_id: u64,
+    publication_generation: u64,
+}
+
+struct ChildSession {
+    job_id: u64,
+    event: EventGeneration,
+    wait: Option<LaunchReservation>,
+    stdin: NativeOutput,
+    stdout: NativeInput,
+    stderr: NativeInput,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LaunchReply {
+    LaunchAccepted(u64),
+    TerminationAccepted(u64),
+    JobResult(u64),
+    Cancelled(u64),
+    Closed(u64),
+    Error(LaunchErrorCode),
+}
+
+#[derive(Clone, Copy)]
+enum ChildFault {
+    Peer(StreamKind),
+    WrongDirection,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChildWaitResolution {
+    Cancelled,
+    Terminal,
+}
+
+enum LaunchChildOutcome {
+    Child(ChildSession),
+    SerialLost(u64),
+}
+
+enum LaunchWaitOutcome {
+    Reply(LaunchReply),
+    SerialLost,
+}
+
+#[derive(Clone, Copy)]
+enum DataClass {
+    Raw,
+    Stdin,
+    Stdout,
+    Stderr,
+}
+
+impl DataClass {
+    const fn next(self) -> Self {
+        match self {
+            Self::Raw => Self::Stdin,
+            Self::Stdin => Self::Stdout,
+            Self::Stdout => Self::Stderr,
+            Self::Stderr => Self::Raw,
+        }
+    }
+
+    const fn order(self) -> [Self; 4] {
+        [
+            self,
+            self.next(),
+            self.next().next(),
+            self.next().next().next(),
+        ]
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Pending {
+    bytes: [u8; FAIR_SOURCE_BYTES_PER_TURN],
+    used: usize,
+    reservation: Option<Reservation>,
+}
+
+impl Pending {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; FAIR_SOURCE_BYTES_PER_TURN],
+            used: 0,
+            reservation: None,
+        }
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.used == 0
+    }
+
+    fn clear(&mut self) {
+        self.used = 0;
+        self.reservation = None;
+    }
+}
+
+struct TransactionIds {
+    next: u64,
+}
+
+impl TransactionIds {
+    fn after(startup: u64) -> Result<Self, u32> {
+        let next = startup.checked_add(1).ok_or(1u32)?;
+        if next == 0 {
+            return Err(1);
+        }
+        Ok(Self { next })
+    }
+
+    fn take(&mut self) -> Result<u64, u32> {
+        let value = self.next;
+        self.next = value.checked_add(1).ok_or(2u32)?;
+        if value == 0 {
+            return Err(2);
+        }
+        Ok(value)
+    }
+}
+
+struct NativeStreams;
+
+impl StreamSystem for NativeStreams {
+    fn receive(
+        &mut self,
+        channel: DwHandle,
+        bytes: &mut [u8],
+        handles: &mut [DwReceivedHandleInfoV1],
+    ) -> Result<ReceiveCounts, NativeError> {
+        receive_channel(channel, bytes, handles)
+    }
+
+    fn send(&mut self, channel: DwHandle, bytes: &[u8]) -> Result<(), NativeError> {
+        send_channel(channel, bytes, &[])
+    }
+
+    fn close(&mut self, handle: DwHandle) -> Result<(), NativeError> {
+        close_handle(handle)
+    }
+
+    fn wait(&mut self, channel: DwHandle, signals: DwSignals) -> Result<DwSignals, NativeError> {
+        let deadline = monotonic_active_now()?
+            .checked_add(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
+            .ok_or(NativeError::Output(
+                wyrmroot_runtime::NativeOutputError::DeadlineOverflow,
+            ))?;
+        Ok(wait_one(channel, signals, DwDeadline(deadline))?.observed)
+    }
+}
+
+fn main(startup: StartupBlock<'_>) -> u32 {
+    run(startup).unwrap_or_else(|step| FAILURE_BASE | step)
+}
+
+fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
+    let bootstrap = startup.bootstrap_channel().as_abi();
+    validate_bootstrap_channel(
+        query_capability_info(bootstrap).map_err(|_| 3u32)?,
+        BOOTSTRAP_CHANNEL_EXPECTATION,
+    )
+    .map_err(|_| 4u32)?;
+
+    let mut init_bytes = [0u8; CONSOLED_BYTES];
+    let mut init_handles = [DwReceivedHandleInfoV1::default(); 3];
+    let counts =
+        receive_channel(bootstrap, &mut init_bytes, &mut init_handles).map_err(|_| 5u32)?;
+    if counts.bytes != CONSOLED_BYTES || counts.handles != 3 {
+        close_received(&init_handles, counts.handles);
+        let _ = close_handle(bootstrap);
+        return Err(6);
+    }
+    let init = match parse_consoled_init(&init_bytes, &init_handles) {
+        Ok(init) => init,
+        Err(_) => {
+            close_received(&init_handles, 3);
+            let _ = close_handle(bootstrap);
+            return Err(7);
+        }
+    };
+    let authorities = StartupAuthorities {
+        registry: init_handles[1].handle,
+        launch: init_handles[2].handle,
+        registry_generation: init.registry_generation,
+        registry_endpoint_id: init.registry_endpoint_id,
+        registry_endpoint_generation: init.registry_endpoint_generation,
+        launch_connection_id: init.launch_connection_id,
+        launch_connection_generation: init.launch_connection_generation,
+        startup_transaction: init.transaction_id,
+    };
+    if close_handle(init_handles[0].handle).is_err() {
+        close_authorities(authorities);
+        let _ = close_handle(bootstrap);
+        return Err(8);
+    }
+
+    let mut transactions = TransactionIds::after(authorities.startup_transaction)?;
+    let mut model = ConsoleModel::new();
+    let mut serial = match attach_serial_bounded(authorities, &mut transactions, &mut model, None) {
+        Ok(serial) => serial,
+        Err(error) => {
+            close_authorities(authorities);
+            let _ = close_handle(bootstrap);
+            return Err(error);
+        }
+    };
+    let child = match launch_child(authorities, &mut transactions, &mut model, &mut serial) {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = close_handle(serial.endpoint());
+            close_authorities(authorities);
+            let _ = close_handle(bootstrap);
+            return Err(error);
+        }
+    };
+    let mut child = child;
+    if observe_exact_ready(&mut model, &serial, &child, 9).is_err() {
+        let _ = cleanup_child_for_exit(authorities, &mut transactions, &mut child);
+        let _ = close_handle(serial.endpoint());
+        close_authorities(authorities);
+        let _ = close_handle(bootstrap);
+        return Err(9);
+    }
+
+    let mut ready = [0u8; 64];
+    let ready_size = match encode_ready_for_profile(
+        LaunchProfile::Consoled,
+        authorities.startup_transaction,
+        &mut ready,
+    ) {
+        Ok(size) => size,
+        Err(_) => {
+            let _ = cleanup_child_for_exit(authorities, &mut transactions, &mut child);
+            let _ = close_handle(serial.endpoint());
+            close_authorities(authorities);
+            let _ = close_handle(bootstrap);
+            return Err(10);
+        }
+    };
+    if send_channel(bootstrap, &ready[..ready_size], &[]).is_err() {
+        let _ = cleanup_child_for_exit(authorities, &mut transactions, &mut child);
+        let _ = close_handle(serial.endpoint());
+        close_authorities(authorities);
+        let _ = close_handle(bootstrap);
+        return Err(11);
+    }
+    if close_handle(bootstrap).is_err() {
+        let _ = cleanup_child_for_exit(authorities, &mut transactions, &mut child);
+        let _ = close_handle(serial.endpoint());
+        close_authorities(authorities);
+        return Err(12);
+    }
+
+    event_loop(authorities, &mut transactions, &mut model, serial, child)
+}
+
+fn attach_serial(
+    authorities: StartupAuthorities,
+    transactions: &mut TransactionIds,
+    model: &mut ConsoleModel,
+) -> Result<SerialSession, u32> {
+    let publication_generation = watch_publication(authorities, transactions)?;
+    if publication_generation == 0 {
+        return Err(13);
+    }
+    let direct = lookup_connector(authorities, transactions)?;
+    let connector_transaction = match transactions.take() {
+        Ok(value) => value,
+        Err(error) => {
+            close_attempt_handles(core::slice::from_ref(&direct))?;
+            return Err(error);
+        }
+    };
+    let request = ConnectorMessage::ConnectStream {
+        publication_generation,
+        client_transaction_id: connector_transaction,
+    };
+    let connect_request = ConnectRequest {
+        registry_generation: authorities.registry_generation,
+        registry_endpoint_id: authorities.registry_endpoint_id,
+        registry_endpoint_generation: authorities.registry_endpoint_generation,
+        requested_publication_generation: publication_generation,
+        connector_client_transaction: connector_transaction,
+    };
+    if model.begin_connect(connect_request).is_err() {
+        close_attempt_handles(core::slice::from_ref(&direct))?;
+        return Err(14);
+    }
+    let mut connector_bytes = [0u8; RECORD_BYTES];
+    if encode_connector(request, &mut connector_bytes).is_err() {
+        finish_connect_abort(model, connect_request, core::slice::from_ref(&direct))?;
+        return Err(14);
+    }
+    if send_channel(direct, &connector_bytes, &[]).is_err() {
+        finish_connect_abort(model, connect_request, core::slice::from_ref(&direct))?;
+        return Err(15);
+    }
+    if wait_readable(direct).is_err() {
+        finish_connect_abort(model, connect_request, core::slice::from_ref(&direct))?;
+        return Err(16);
+    }
+    let mut received = [DwReceivedHandleInfoV1::default(); 1];
+    let counts = match receive_channel(direct, &mut connector_bytes, &mut received) {
+        Ok(counts) => counts,
+        Err(_) => {
+            finish_connect_abort(model, connect_request, core::slice::from_ref(&direct))?;
+            return Err(17);
+        }
+    };
+    if counts.bytes != RECORD_BYTES
+        || counts.handles != 1
+        || !valid_received_channel(received[0], CHILD_CHANNEL_RIGHTS)
+    {
+        let handles = [direct, received[0].handle];
+        finish_connect_abort(model, connect_request, &handles)?;
+        return Err(18);
+    }
+    let identity = match parse_connector(&connector_bytes) {
+        Ok(ConnectorMessage::Connected { identity }) => identity,
+        _ => {
+            let handles = [direct, received[0].handle];
+            finish_connect_abort(model, connect_request, &handles)?;
+            return Err(20);
+        }
+    };
+    if !valid_connector_identity(identity, publication_generation, connector_transaction) {
+        let handles = [direct, received[0].handle];
+        finish_connect_abort(model, connect_request, &handles)?;
+        return Err(21);
+    }
+    if validate_exact_channel(received[0].handle, CHILD_CHANNEL_RIGHTS).is_err() {
+        let handles = [direct, received[0].handle];
+        finish_connect_abort(model, connect_request, &handles)?;
+        return Err(22);
+    }
+    if close_handle(direct).is_err() {
+        let _ = close_handle(received[0].handle);
+        let _ = model.abort_connect(connect_request);
+        return Err(FATAL_ATTACH_BASE | 23);
+    }
+    let active_watch =
+        match begin_publication_watch(authorities, transactions, publication_generation) {
+            Ok(watch) => watch,
+            Err(error) => {
+                finish_connect_abort(
+                    model,
+                    connect_request,
+                    core::slice::from_ref(&received[0].handle),
+                )?;
+                return Err(error);
+            }
+        };
+    let correlation = serial_correlation(authorities, identity);
+    if model.attach_connected(correlation, now_millis()?).is_err() {
+        if cancel_registry_watch(authorities, transactions, active_watch.transaction_id).is_err() {
+            let _ = close_handle(received[0].handle);
+            let _ = model.abort_connect(connect_request);
+            return Err(FATAL_ATTACH_BASE | 24);
+        }
+        finish_connect_abort(
+            model,
+            connect_request,
+            core::slice::from_ref(&received[0].handle),
+        )?;
+        return Err(24);
+    }
+    Ok(SerialSession {
+        identity,
+        watch: Some(active_watch),
+        input: NativeInput::new(validated_stream_endpoint(received[0].handle).map_err(|_| 24u32)?),
+        output: NativeOutput::new(
+            validated_stream_endpoint(received[0].handle).map_err(|_| 24u32)?,
+        ),
+    })
+}
+
+fn begin_publication_watch(
+    authorities: StartupAuthorities,
+    transactions: &mut TransactionIds,
+    publication_generation: u64,
+) -> Result<ActiveWatch, u32> {
+    let transaction_id = transactions.take()?;
+    let policy = SERIAL_CONSOLE_CONNECTOR_PUBLICATION_POLICY;
+    let header = registry_header(authorities, RegistryMessageType::Watch, transaction_id);
+    let mut bytes = [0u8; 256];
+    let size = encode_watch(
+        header,
+        Watch {
+            protocol_id: policy.protocol_id,
+            last_observed_generation: publication_generation,
+            service_name: policy.service_name,
+        },
+        &mut bytes,
+    )
+    .map_err(|_| 25u32)?;
+    send_channel(authorities.registry, &bytes[..size], &[]).map_err(|_| 26u32)?;
+    Ok(ActiveWatch {
+        transaction_id,
+        publication_generation,
+    })
+}
+
+fn attach_serial_bounded(
+    authorities: StartupAuthorities,
+    transactions: &mut TransactionIds,
+    model: &mut ConsoleModel,
+    first_deadline_ms: Option<u64>,
+) -> Result<SerialSession, u32> {
+    if let Some(deadline) = first_deadline_ms {
+        wait_backoff(authorities.registry, deadline)?;
+    }
+    loop {
+        match attach_serial(authorities, transactions, model) {
+            Ok(serial) => return Ok(serial),
+            Err(error) if error & FATAL_ATTACH_BASE != 0 => return Err(error),
+            Err(_) => match model
+                .serial_reconnect_failed(now_millis()?)
+                .map_err(|_| 25u32)?
+            {
+                RecoveryAction::RetrySerialAt(deadline) => {
+                    wait_backoff(authorities.registry, deadline)?;
+                }
+                RecoveryAction::Escalate => return Err(26),
+                _ => return Err(27),
+            },
+        }
+    }
+}
+
+fn watch_publication(
+    authorities: StartupAuthorities,
+    transactions: &mut TransactionIds,
+) -> Result<u64, u32> {
+    let transaction_id = transactions.take()?;
+    let policy = SERIAL_CONSOLE_CONNECTOR_PUBLICATION_POLICY;
+    let header = registry_header(authorities, RegistryMessageType::Watch, transaction_id);
+    let mut bytes = [0u8; 256];
+    let size = encode_watch(
+        header,
+        Watch {
+            protocol_id: policy.protocol_id,
+            // Zero requests an immediate exact observation when a publication
+            // is present and becomes a blocking watch while it is absent.
+            last_observed_generation: 0,
+            service_name: policy.service_name,
+        },
+        &mut bytes,
+    )
+    .map_err(|_| 25u32)?;
+    send_channel(authorities.registry, &bytes[..size], &[]).map_err(|_| 26u32)?;
+    if wait_readable(authorities.registry).is_err() {
+        return match cancel_registry_watch(authorities, transactions, transaction_id) {
+            Ok(Some(generation)) if generation != 0 => Ok(generation),
+            Ok(_) => Err(27),
+            Err(_) => Err(FATAL_ATTACH_BASE | 27),
+        };
+    }
+    let mut received = [DwReceivedHandleInfoV1::default(); 1];
+    let counts = receive_channel(authorities.registry, &mut bytes, &mut received)
+        .map_err(|_| FATAL_ATTACH_BASE | 28)?;
+    if counts.handles != 0 {
+        close_attempt_handles(core::slice::from_ref(&received[0].handle))?;
+        return Err(FATAL_ATTACH_BASE | 29);
+    }
+    let reply = parse_registry(&bytes[..counts.bytes], 0).map_err(|_| FATAL_ATTACH_BASE | 30)?;
+    if reply.header
+        != (RegistryHeader {
+            message_type: RegistryMessageType::GenerationChanged,
+            ..header
+        })
+    {
+        return Err(FATAL_ATTACH_BASE | 31);
+    }
+    match reply.message {
+        RegistryMessage::GenerationChanged { service_generation } => Ok(service_generation),
+        _ => Err(FATAL_ATTACH_BASE | 32),
+    }
+}
+
+fn cancel_registry_watch(
+    authorities: StartupAuthorities,
+    transactions: &mut TransactionIds,
+    target: u64,
+) -> Result<Option<u64>, u32> {
+    let transaction_id = transactions.take()?;
+    let header = registry_header(authorities, RegistryMessageType::Cancel, transaction_id);
+    let mut bytes = [0u8; 72];
+    let size = encode_cancel(header, target, &mut bytes).map_err(|_| FATAL_ATTACH_BASE | 28)?;
+    send_channel(authorities.registry, &bytes[..size], &[]).map_err(|_| FATAL_ATTACH_BASE | 29)?;
+    let mut changed = None;
+    let mut received_count = 0;
+    while received_count < 2 {
+        wait_readable(authorities.registry).map_err(|_| FATAL_ATTACH_BASE | 30)?;
+        let mut handles = [DwReceivedHandleInfoV1::default(); 1];
+        let counts = receive_channel(authorities.registry, &mut bytes, &mut handles)
+            .map_err(|_| FATAL_ATTACH_BASE | 31)?;
+        if counts.handles != 0 {
+            close_attempt_handles(core::slice::from_ref(&handles[0].handle))?;
+            return Err(FATAL_ATTACH_BASE | 32);
+        }
+        let reply =
+            parse_registry(&bytes[..counts.bytes], 0).map_err(|_| FATAL_ATTACH_BASE | 33)?;
+        let common = reply.header.registry_generation == authorities.registry_generation
+            && reply.header.endpoint_id == authorities.registry_endpoint_id
+            && reply.header.endpoint_generation == authorities.registry_endpoint_generation;
+        if !common {
+            return Err(FATAL_ATTACH_BASE | 34);
+        }
+        if reply.header.transaction_id == target
+            && reply.header.message_type == RegistryMessageType::GenerationChanged
+        {
+            let RegistryMessage::GenerationChanged { service_generation } = reply.message else {
+                return Err(FATAL_ATTACH_BASE | 34);
+            };
+            changed = Some(service_generation);
+            received_count += 1;
+            continue;
+        }
+        if reply.header
+            == (RegistryHeader {
+                message_type: RegistryMessageType::Cancelled,
+                ..header
+            })
+            && reply.message
+                == (RegistryMessage::Cancelled {
+                    target_transaction_id: target,
+                })
+        {
+            return Ok(changed);
+        }
+        if reply.header
+            == (RegistryHeader {
+                message_type: RegistryMessageType::Error,
+                ..header
+            })
+            && reply.message
+                == (RegistryMessage::Error {
+                    code: RegistryErrorCode::UnknownTransaction,
+                })
+            && changed.is_some()
+        {
+            return Ok(changed);
+        }
+        return Err(FATAL_ATTACH_BASE | 34);
+    }
+    Err(FATAL_ATTACH_BASE | 34)
+}
+
+fn receive_publication_change(
+    authorities: StartupAuthorities,
+    serial: &mut SerialSession,
+) -> Result<u64, u32> {
+    let watch = serial.watch.ok_or(FATAL_ATTACH_BASE | 35)?;
+    let mut bytes = [0u8; 256];
+    let mut handles = [DwReceivedHandleInfoV1::default(); 1];
+    let counts = receive_channel(authorities.registry, &mut bytes, &mut handles)
+        .map_err(|_| FATAL_ATTACH_BASE | 35)?;
+    if counts.handles != 0 {
+        close_attempt_handles(core::slice::from_ref(&handles[0].handle))?;
+        return Err(FATAL_ATTACH_BASE | 35);
+    }
+    let reply = parse_registry(&bytes[..counts.bytes], 0).map_err(|_| FATAL_ATTACH_BASE | 35)?;
+    let expected = RegistryHeader {
+        message_type: RegistryMessageType::GenerationChanged,
+        registry_generation: authorities.registry_generation,
+        endpoint_id: authorities.registry_endpoint_id,
+        endpoint_generation: authorities.registry_endpoint_generation,
+        transaction_id: watch.transaction_id,
+    };
+    let RegistryMessage::GenerationChanged { service_generation } = reply.message else {
+        return Err(FATAL_ATTACH_BASE | 35);
+    };
+    if reply.header != expected || service_generation == watch.publication_generation {
+        return Err(FATAL_ATTACH_BASE | 35);
+    }
+    serial.watch = None;
+    Ok(service_generation)
+}
+
+fn retire_publication_watch(
+    authorities: StartupAuthorities,
+    transactions: &mut TransactionIds,
+    serial: &mut SerialSession,
+) -> Result<(), u32> {
+    let Some(watch) = serial.watch else {
+        return Ok(());
+    };
+    cancel_registry_watch(authorities, transactions, watch.transaction_id)?;
+    serial.watch = None;
+    Ok(())
+}
+
+fn lookup_connector(
+    authorities: StartupAuthorities,
+    transactions: &mut TransactionIds,
+) -> Result<DwHandle, u32> {
+    let (direct, service) = create_channel(CONNECTOR_PAIR_RIGHTS).map_err(|_| 33u32)?;
+    let transaction_id = transactions.take()?;
+    let policy = SERIAL_CONSOLE_CONNECTOR_PUBLICATION_POLICY;
+    let header = registry_header(
+        authorities,
+        RegistryMessageType::LookupConnect,
+        transaction_id,
+    );
+    let mut bytes = [0u8; 256];
+    let size = match encode_lookup(
+        header,
+        Lookup {
+            protocol_id: policy.protocol_id,
+            version: ProtocolVersion {
+                major: policy.protocol_major,
+                minor: policy.protocol_minor,
+            },
+            service_name: policy.service_name,
+        },
+        &mut bytes,
+    ) {
+        Ok(size) => size,
+        Err(_) => {
+            close_attempt_handles(&[direct, service])?;
+            return Err(34);
+        }
+    };
+    let transfer = DwHandleTransferV1 {
+        handle: service,
+        // Registryd must forward this endpoint once more; it receives the
+        // exact broad intermediary rights and reduces them to child rights in
+        // the CONNECT_OFFER MOVE.
+        requested_rights: CONNECTOR_PAIR_RIGHTS,
+        operation: DW_HANDLE_TRANSFER_MOVE,
+        reserved0: 0,
+        reserved: [0; 2],
+    };
+    if send_channel(authorities.registry, &bytes[..size], &[transfer]).is_err() {
+        close_attempt_handles(&[direct, service])?;
+        return Err(35);
+    }
+    if wait_readable(authorities.registry).is_err() {
+        close_attempt_handles(core::slice::from_ref(&direct))?;
+        return Err(FATAL_ATTACH_BASE | 36);
+    }
+    let mut received = [DwReceivedHandleInfoV1::default(); 1];
+    let counts = match receive_channel(authorities.registry, &mut bytes, &mut received) {
+        Ok(counts) => counts,
+        Err(_) => {
+            close_attempt_handles(core::slice::from_ref(&direct))?;
+            return Err(FATAL_ATTACH_BASE | 37);
+        }
+    };
+    if counts.handles != 0 {
+        close_attempt_handles(&[direct, received[0].handle])?;
+        return Err(38);
+    }
+    let reply = match parse_registry(&bytes[..counts.bytes], 0) {
+        Ok(reply) => reply,
+        Err(_) => {
+            close_attempt_handles(core::slice::from_ref(&direct))?;
+            return Err(39);
+        }
+    };
+    if reply.header
+        != (RegistryHeader {
+            message_type: RegistryMessageType::Connected,
+            ..header
+        })
+        || reply.message != RegistryMessage::Connected
+    {
+        close_attempt_handles(core::slice::from_ref(&direct))?;
+        return Err(40);
+    }
+    Ok(direct)
+}
+
+fn launch_child(
+    authorities: StartupAuthorities,
+    transactions: &mut TransactionIds,
+    model: &mut ConsoleModel,
+    serial: &mut SerialSession,
+) -> Result<ChildSession, u32> {
+    loop {
+        match launch_child_once(authorities, transactions, model, serial)? {
+            LaunchChildOutcome::Child(child) => return Ok(child),
+            LaunchChildOutcome::SerialLost(deadline) => {
+                *serial = attach_serial_bounded(authorities, transactions, model, Some(deadline))?;
+            }
+        }
+    }
+}
+
+fn launch_child_once(
+    authorities: StartupAuthorities,
+    transactions: &mut TransactionIds,
+    model: &mut ConsoleModel,
+    serial: &mut SerialSession,
+) -> Result<LaunchChildOutcome, u32> {
+    let transaction_id = transactions.take()?;
+    let mut retained = [DwHandle(0); 3];
+    let mut child = [DwHandle(0); 3];
+    for index in 0..3 {
+        match create_reduced_stream_pair() {
+            Ok((local, peer)) => {
+                retained[index] = local;
+                child[index] = peer;
+            }
+            Err(_) => {
+                close_handle_array_reverse(&retained);
+                close_handle_array_reverse(&child);
+                return Err(42);
+            }
+        }
+    }
+    let mut model_launch = match model.begin_child_launch(transaction_id) {
+        Ok(launch) => launch,
+        Err(_) => {
+            close_handle_array_reverse(&retained);
+            close_handle_array_reverse(&child);
+            return Err(41);
+        }
+    };
+
+    let reservation = LaunchReservation {
+        connection_id: authorities.launch_connection_id,
+        generation: authorities.launch_connection_generation,
+        transaction_id,
+    };
+    let mut bytes = [0u8; MAX_LAUNCH_MESSAGE_BYTES];
+    let size = match encode_launch(
+        reservation,
+        CHILD_PATH,
+        &[CHILD_PATH],
+        &[],
+        true,
+        &mut bytes,
+    ) {
+        Ok(size) => size,
+        Err(_) => {
+            finish_launch_abort(model, model_launch, &retained, &child, false)?;
+            return Err(43);
+        }
+    };
+    let transfers = [
+        move_transfer(child[0]),
+        move_transfer(child[1]),
+        move_transfer(child[2]),
+    ];
+    if send_channel(authorities.launch, &bytes[..size], &transfers).is_err() {
+        // Channel MOVE is atomic: a failed send leaves every child peer local.
+        finish_launch_abort(model, model_launch, &retained, &child, false)?;
+        return Err(44);
+    }
+    for kind in [StreamKind::Stdin, StreamKind::Stdout, StreamKind::Stderr] {
+        if model_launch.move_child_peer(kind).is_err() {
+            close_handle_array_reverse(&retained);
+            // The native MOVE already committed, but no correlated launch
+            // response proves revocation. Closing the launch session on fatal
+            // process exit is the only truthful cleanup remaining.
+            return Err(48);
+        }
+    }
+    let response = match wait_launch_with_serial(authorities, serial, reservation) {
+        Ok(LaunchWaitOutcome::Reply(response)) => response,
+        Ok(LaunchWaitOutcome::SerialLost) => {
+            let old_serial = serial_correlation(authorities, serial.identity);
+            let old_console = model.snapshot().console_generation.ok_or(45u32)?;
+            if model
+                .serial_peer_closed(old_serial, old_console, now_millis()?)
+                .map_err(|_| 45u32)?
+                != RecoveryAction::None
+            {
+                return Err(45);
+            }
+            retire_publication_watch(authorities, transactions, serial)?;
+            close_attempt_handles(core::slice::from_ref(&serial.endpoint()))?;
+            let resolved = match receive_launch(authorities.launch, reservation) {
+                Ok(reply) => reply,
+                Err(_) => {
+                    close_handle_array_reverse(&retained);
+                    return Err(45);
+                }
+            };
+            match resolved {
+                LaunchReply::LaunchAccepted(job_id) => {
+                    if cleanup_unmodeled_job(authorities, transactions, job_id).is_err() {
+                        close_handle_array_reverse(&retained);
+                        return Err(45);
+                    }
+                }
+                LaunchReply::Error(code) if code != LaunchErrorCode::CleanupFailure => {}
+                _ => {
+                    close_handle_array_reverse(&retained);
+                    return Err(45);
+                }
+            }
+            finish_launch_abort(model, model_launch, &retained, &child, true)?;
+            return match model.take_recovery_action() {
+                Some(RecoveryAction::RetrySerialAt(deadline)) => {
+                    Ok(LaunchChildOutcome::SerialLost(deadline))
+                }
+                _ => Err(45),
+            };
+        }
+        Err(_) => {
+            close_handle_array_reverse(&retained);
+            // Do not complete the model abort without proof that launchd
+            // revoked the three moved peers.
+            return Err(45);
+        }
+    };
+    let job_id = match response {
+        LaunchReply::LaunchAccepted(job_id) => job_id,
+        LaunchReply::Error(code) if code != LaunchErrorCode::CleanupFailure => {
+            // An exact correlated rejection is proof that launchd completed
+            // cleanup for every moved child peer before replying.
+            finish_launch_abort(model, model_launch, &retained, &child, true)?;
+            return Err(47);
+        }
+        _ => {
+            close_handle_array_reverse(&retained);
+            return Err(47);
+        }
+    };
+
+    let modeled = match model.commit_child_launch(&mut model_launch, job_id) {
+        Ok(modeled) => modeled,
+        Err(_) => {
+            if cleanup_unmodeled_job(authorities, transactions, job_id).is_err() {
+                close_handle_array_reverse(&retained);
+                return Err(49);
+            }
+            finish_launch_abort(model, model_launch, &retained, &child, true)?;
+            return Err(49);
+        }
+    };
+    let event: EventGeneration = modeled.ids.into();
+    let endpoints = match (
+        validated_stream_endpoint(retained[0]),
+        validated_stream_endpoint(retained[1]),
+        validated_stream_endpoint(retained[2]),
+    ) {
+        (Ok(stdin), Ok(stdout), Ok(stderr)) => (stdin, stdout, stderr),
+        _ => {
+            close_handle_array_reverse(&retained);
+            if let Ok(now) = now_millis() {
+                let _ = model.wrong_direction_data(event, now);
+                let _ = model.child_streams_closed(event, now);
+                let _ = cleanup_job(authorities, transactions, model, event, job_id);
+            } else {
+                let _ = cleanup_unmodeled_job(authorities, transactions, job_id);
+            }
+            return Err(50);
+        }
+    };
+    let ready = match model.observe_child_ready(event, now_millis()?) {
+        Ok(ready) => ready,
+        Err(_) => {
+            close_handle_array_reverse(&retained);
+            let _ = cleanup_unmodeled_job(authorities, transactions, job_id);
+            return Err(51);
+        }
+    };
+    if EventGeneration::from(ready.ids) != event {
+        close_handle_array_reverse(&retained);
+        let _ = cleanup_unmodeled_job(authorities, transactions, job_id);
+        return Err(52);
+    }
+    let wait = match start_job_wait(authorities, transactions, job_id) {
+        Ok(wait) => wait,
+        Err(_) => {
+            close_handle_array_reverse(&retained);
+            let _ = cleanup_unmodeled_job(authorities, transactions, job_id);
+            return Err(52);
+        }
+    };
+    Ok(LaunchChildOutcome::Child(ChildSession {
+        job_id,
+        event,
+        wait: Some(wait),
+        stdin: NativeOutput::new(endpoints.0),
+        stdout: NativeInput::new(endpoints.1),
+        stderr: NativeInput::new(endpoints.2),
+    }))
+}
+
+fn wait_launch_with_serial(
+    authorities: StartupAuthorities,
+    serial: &mut SerialSession,
+    reservation: LaunchReservation,
+) -> Result<LaunchWaitOutcome, u32> {
+    let deadline = monotonic_active_now()
+        .map_err(|_| 45u32)?
+        .checked_add(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
+        .ok_or(45u32)?;
+    let items = [
+        wait_item(
+            authorities.registry,
+            DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+        ),
+        wait_item(serial.endpoint(), DW_SIGNAL_PEER_CLOSED),
+        wait_item(
+            authorities.launch,
+            DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+        ),
+    ];
+    let observed = wait_many(&items, DwDeadline(deadline)).map_err(|_| 45u32)?;
+    match observed.index {
+        0 if observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 => Err(45),
+        0 => {
+            receive_publication_change(authorities, serial)?;
+            Ok(LaunchWaitOutcome::SerialLost)
+        }
+        1 => Ok(LaunchWaitOutcome::SerialLost),
+        2 if observed.observed.0 & DW_SIGNAL_READABLE.0 != 0 => {
+            receive_launch(authorities.launch, reservation).map(LaunchWaitOutcome::Reply)
+        }
+        2 => Err(45),
+        _ => Err(45),
+    }
+}
+
+fn event_loop(
+    authorities: StartupAuthorities,
+    transactions: &mut TransactionIds,
+    model: &mut ConsoleModel,
+    mut serial: SerialSession,
+    mut child: ChildSession,
+) -> Result<u32, u32> {
+    let mut streams = NativeStreams;
+    let mut input_pending = Pending::new();
+    let mut output_pending = Pending::new();
+    let mut next_data = DataClass::Raw;
+    loop {
+        // Fill only an empty retry buffer. Queue removal is committed only
+        // after the corresponding native DATA datagram commits.
+        reserve_input(model, &mut input_pending)?;
+        reserve_output(model, &mut output_pending)?;
+
+        let now = monotonic_active_now().map_err(|_| 53u32)?;
+        // Stability is time-based, not idleness-based. Continuous serial or
+        // child traffic must not prevent the exact READY tuple from clearing
+        // an expired child-restart window.
+        observe_exact_ready(model, &serial, &child, 55)?;
+        let deadline = now.checked_add(EVENT_TICK_NS).ok_or(54u32)?;
+        let snapshot = model.snapshot();
+        let mut items = [DwWaitItemV1::default(); 10];
+        let mut data_classes = [DataClass::Raw; 4];
+        // Control and every retirement signal precede rotating data work.
+        items[0] = wait_item(
+            authorities.registry,
+            DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+        );
+        items[1] = wait_item(serial.endpoint(), DW_SIGNAL_PEER_CLOSED);
+        items[2] = wait_item(
+            authorities.launch,
+            DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+        );
+        items[3] = wait_item(
+            child.stdin.endpoint().handle(),
+            DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+        );
+        items[4] = wait_item(child.stdout.endpoint().handle(), DW_SIGNAL_PEER_CLOSED);
+        items[5] = wait_item(child.stderr.endpoint().handle(), DW_SIGNAL_PEER_CLOSED);
+
+        let raw_writable = if output_pending.is_empty() {
+            0
+        } else {
+            DW_SIGNAL_WRITABLE.0
+        };
+        let raw_readable = if snapshot.input_queued
+            <= STAGING_CAPACITY.saturating_sub(FAIR_SOURCE_BYTES_PER_TURN)
+        {
+            DW_SIGNAL_READABLE.0
+        } else {
+            0
+        };
+        let stdin_writable = if input_pending.is_empty() {
+            0
+        } else {
+            DW_SIGNAL_WRITABLE.0
+        };
+        let stdout_readable = snapshot.stdout_queued
+            <= STAGING_CAPACITY.saturating_sub(2 * FAIR_SOURCE_BYTES_PER_TURN);
+        let stderr_readable = snapshot.stderr_queued
+            <= STAGING_CAPACITY.saturating_sub(2 * FAIR_SOURCE_BYTES_PER_TURN);
+        let mut used = 6;
+        for class in next_data.order() {
+            let (handle, signals) = match class {
+                DataClass::Raw => (serial.endpoint(), DwSignals(raw_readable | raw_writable)),
+                DataClass::Stdin => (child.stdin.endpoint().handle(), DwSignals(stdin_writable)),
+                DataClass::Stdout => (
+                    child.stdout.endpoint().handle(),
+                    DwSignals(if stdout_readable {
+                        DW_SIGNAL_READABLE.0
+                    } else {
+                        0
+                    }),
+                ),
+                DataClass::Stderr => (
+                    child.stderr.endpoint().handle(),
+                    DwSignals(if stderr_readable {
+                        DW_SIGNAL_READABLE.0
+                    } else {
+                        0
+                    }),
+                ),
+            };
+            if signals.0 != 0 {
+                items[used] = wait_item(handle, signals);
+                data_classes[used - 6] = class;
+                used += 1;
+            }
+        }
+
+        let observed = match wait_many(&items[..used], DwDeadline(deadline)) {
+            Ok(observed) => observed,
+            Err(NativeError::Status(status)) if status == DW_STATUS_TIMED_OUT => {
+                observe_exact_ready(model, &serial, &child, 55)?;
+                continue;
+            }
+            Err(_) => return Err(56),
+        };
+        let signals = observed.observed.0;
+
+        match observed.index {
+            // Registry retirement and raw close invalidate the serial tuple
+            // before a co-ready launch response may use it.
+            0 => {
+                if signals & DW_SIGNAL_PEER_CLOSED.0 != 0 {
+                    return Err(57);
+                }
+                receive_publication_change(authorities, &mut serial)?;
+                recover_serial(
+                    authorities,
+                    transactions,
+                    model,
+                    &mut serial,
+                    &mut child,
+                    &mut input_pending,
+                    &mut output_pending,
+                )?;
+                next_data = DataClass::Raw;
+                continue;
+            }
+            1 => {
+                recover_serial(
+                    authorities,
+                    transactions,
+                    model,
+                    &mut serial,
+                    &mut child,
+                    &mut input_pending,
+                    &mut output_pending,
+                )?;
+                next_data = DataClass::Raw;
+                continue;
+            }
+            2 => {
+                if signals & DW_SIGNAL_READABLE.0 == 0 {
+                    return Err(57);
+                }
+                recover_terminal_child(
+                    authorities,
+                    transactions,
+                    model,
+                    &mut serial,
+                    &mut child,
+                    &mut input_pending,
+                    &mut output_pending,
+                )?;
+                next_data = DataClass::Raw;
+                continue;
+            }
+            3 => {
+                let fault = if signals & DW_SIGNAL_PEER_CLOSED.0 != 0 {
+                    ChildFault::Peer(StreamKind::Stdin)
+                } else {
+                    discard_one_record(child.stdin.endpoint().handle());
+                    ChildFault::WrongDirection
+                };
+                recover_child(
+                    authorities,
+                    transactions,
+                    model,
+                    &mut serial,
+                    &mut child,
+                    &mut input_pending,
+                    &mut output_pending,
+                    fault,
+                )?;
+                next_data = DataClass::Raw;
+                continue;
+            }
+            4 | 5 => {
+                let kind = if observed.index == 4 {
+                    StreamKind::Stdout
+                } else {
+                    StreamKind::Stderr
+                };
+                recover_child(
+                    authorities,
+                    transactions,
+                    model,
+                    &mut serial,
+                    &mut child,
+                    &mut input_pending,
+                    &mut output_pending,
+                    ChildFault::Peer(kind),
+                )?;
+                next_data = DataClass::Raw;
+                continue;
+            }
+            _ => {}
+        }
+
+        let class_index =
+            usize::try_from(observed.index.checked_sub(6).ok_or(61u32)?).map_err(|_| 61u32)?;
+        let class = *data_classes.get(class_index).ok_or(61u32)?;
+        next_data = class.next();
+        match class {
+            DataClass::Raw => {
+                if signals & DW_SIGNAL_READABLE.0 != 0 {
+                    let input_signals =
+                        DwSignals(signals & (DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0));
+                    if serial.input.observe_wait(input_signals).is_err() {
+                        recover_serial(
+                            authorities,
+                            transactions,
+                            model,
+                            &mut serial,
+                            &mut child,
+                            &mut input_pending,
+                            &mut output_pending,
+                        )?;
+                        next_data = DataClass::Raw;
+                        continue;
+                    }
+                    let mut payload = [0u8; FAIR_SOURCE_BYTES_PER_TURN];
+                    match serial.input.read(&mut streams, &mut payload) {
+                        Ok(count) => model
+                            .stage_serial_input(child.event, &payload[..count])
+                            .map_err(|_| 58u32)?,
+                        Err(StreamError::WouldBlock) => {}
+                        Err(_) => {
+                            recover_serial(
+                                authorities,
+                                transactions,
+                                model,
+                                &mut serial,
+                                &mut child,
+                                &mut input_pending,
+                                &mut output_pending,
+                            )?;
+                            next_data = DataClass::Raw;
+                            continue;
+                        }
+                    }
+                }
+                if signals & DW_SIGNAL_WRITABLE.0 != 0 && !output_pending.is_empty() {
+                    match serial
+                        .output
+                        .write(&mut streams, &output_pending.bytes[..output_pending.used])
+                    {
+                        Ok(written) if written == output_pending.used => {
+                            commit_output(model, &output_pending)?;
+                            output_pending.clear();
+                        }
+                        Ok(_) => return Err(59),
+                        Err(StreamError::WouldBlock) => {
+                            release_output(model, &output_pending)?;
+                            output_pending.clear();
+                        }
+                        Err(_) => {
+                            recover_serial(
+                                authorities,
+                                transactions,
+                                model,
+                                &mut serial,
+                                &mut child,
+                                &mut input_pending,
+                                &mut output_pending,
+                            )?;
+                            next_data = DataClass::Raw;
+                        }
+                    }
+                }
+            }
+            DataClass::Stdin => {
+                if signals & DW_SIGNAL_WRITABLE.0 != 0 && !input_pending.is_empty() {
+                    match child
+                        .stdin
+                        .write(&mut streams, &input_pending.bytes[..input_pending.used])
+                    {
+                        Ok(written) if written == input_pending.used => {
+                            commit_input(model, &input_pending)?;
+                            input_pending.clear();
+                        }
+                        Ok(_) => return Err(59),
+                        Err(StreamError::WouldBlock) => {
+                            release_input(model, &input_pending)?;
+                            input_pending.clear();
+                        }
+                        Err(_) => {
+                            recover_child(
+                                authorities,
+                                transactions,
+                                model,
+                                &mut serial,
+                                &mut child,
+                                &mut input_pending,
+                                &mut output_pending,
+                                ChildFault::Peer(StreamKind::Stdin),
+                            )?;
+                            next_data = DataClass::Raw;
+                        }
+                    }
+                }
+            }
+            DataClass::Stdout | DataClass::Stderr => {
+                let source = match class {
+                    DataClass::Stdout => OutputSource::Stdout,
+                    DataClass::Stderr => OutputSource::Stderr,
+                    _ => return Err(61),
+                };
+                let input = match source {
+                    OutputSource::Stdout => &mut child.stdout,
+                    OutputSource::Stderr => &mut child.stderr,
+                };
+                if input.observe_wait(observed.observed).is_err() {
+                    recover_child(
+                        authorities,
+                        transactions,
+                        model,
+                        &mut serial,
+                        &mut child,
+                        &mut input_pending,
+                        &mut output_pending,
+                        ChildFault::Peer(output_kind(source)),
+                    )?;
+                    next_data = DataClass::Raw;
+                    continue;
+                }
+                let mut payload = [0u8; FAIR_SOURCE_BYTES_PER_TURN];
+                match input.read(&mut streams, &mut payload) {
+                    Ok(count) => {
+                        model
+                            .stage_child_output(child.event, source, &payload[..count])
+                            .map_err(|_| 60u32)?;
+                    }
+                    Err(StreamError::WouldBlock) => {}
+                    Err(_) => {
+                        recover_child(
+                            authorities,
+                            transactions,
+                            model,
+                            &mut serial,
+                            &mut child,
+                            &mut input_pending,
+                            &mut output_pending,
+                            ChildFault::Peer(output_kind(source)),
+                        )?;
+                        next_data = DataClass::Raw;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn recover_terminal_child(
+    authorities: StartupAuthorities,
+    transactions: &mut TransactionIds,
+    model: &mut ConsoleModel,
+    serial: &mut SerialSession,
+    child: &mut ChildSession,
+    input_pending: &mut Pending,
+    output_pending: &mut Pending,
+) -> Result<(), u32> {
+    let wait = child.wait.take().ok_or(61u32)?;
+    if receive_launch(authorities.launch, wait)? != LaunchReply::JobResult(child.job_id) {
+        return Err(61);
+    }
+    if !matches!(model.child_terminal(child.event, now_millis()?), Ok(RecoveryAction::ReapChild(job)) if job == child.job_id)
+    {
+        return Err(62);
+    }
+    let stream_failed = close_child_streams(child).is_err();
+    let observed_failed = model
+        .child_streams_closed(child.event, now_millis()?)
+        .is_err();
+    input_pending.clear();
+    output_pending.clear();
+    if stream_failed || observed_failed {
+        return Err(64);
+    }
+    match close_reaped_job(authorities, transactions, model, child.event, child.job_id)? {
+        RecoveryAction::ReplaceChild => {
+            *child = launch_child(authorities, transactions, model, serial)?;
+            observe_exact_ready_without_serial(model, child, 65)
+        }
+        RecoveryAction::Escalate => Err(66),
+        _ => Err(67),
+    }
+}
+
+fn recover_child(
+    authorities: StartupAuthorities,
+    transactions: &mut TransactionIds,
+    model: &mut ConsoleModel,
+    serial: &mut SerialSession,
+    child: &mut ChildSession,
+    input_pending: &mut Pending,
+    output_pending: &mut Pending,
+    fault: ChildFault,
+) -> Result<(), u32> {
+    let action = match fault {
+        ChildFault::Peer(kind) => model.child_peer_closed(child.event, kind, now_millis()?),
+        ChildFault::WrongDirection => model.wrong_direction_data(child.event, now_millis()?),
+    }
+    .map_err(|_| 62u32)?;
+    if !matches!(action, RecoveryAction::TerminateChild(job) if job == child.job_id) {
+        return Err(63);
+    }
+    let wait_resolution = cancel_child_wait(authorities, transactions, child)?;
+    let stream_failed = close_child_streams(child).is_err();
+    let observed_failed = model
+        .child_streams_closed(child.event, now_millis()?)
+        .is_err();
+    if stream_failed || observed_failed {
+        return Err(64);
+    }
+    input_pending.clear();
+    output_pending.clear();
+    let cleanup = match wait_resolution {
+        ChildWaitResolution::Cancelled => {
+            cleanup_job(authorities, transactions, model, child.event, child.job_id)?
+        }
+        ChildWaitResolution::Terminal => {
+            complete_terminal_reap(authorities, transactions, model, child.event, child.job_id)?
+        }
+    };
+    match cleanup {
+        RecoveryAction::ReplaceChild => {
+            *child = launch_child(authorities, transactions, model, serial)?;
+            observe_exact_ready_without_serial(model, child, 65)?;
+            Ok(())
+        }
+        RecoveryAction::Escalate => Err(66),
+        _ => Err(67),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recover_serial(
+    authorities: StartupAuthorities,
+    transactions: &mut TransactionIds,
+    model: &mut ConsoleModel,
+    serial: &mut SerialSession,
+    child: &mut ChildSession,
+    input_pending: &mut Pending,
+    output_pending: &mut Pending,
+) -> Result<(), u32> {
+    let old_serial = child.event.serial;
+    let old_console = child.event.console_generation;
+    let action = model
+        .serial_peer_closed(old_serial, old_console, now_millis()?)
+        .map_err(|_| 68u32)?;
+    if !matches!(action, RecoveryAction::TerminateChild(job) if job == child.job_id) {
+        return Err(69);
+    }
+    retire_publication_watch(authorities, transactions, serial)?;
+    let wait_resolution = cancel_child_wait(authorities, transactions, child)?;
+    let raw_failed = close_handle(serial.endpoint()).is_err();
+    let streams_failed = close_child_streams(child).is_err();
+    let observed_failed = model
+        .child_streams_closed(child.event, now_millis()?)
+        .is_err();
+    input_pending.clear();
+    output_pending.clear();
+    if raw_failed || streams_failed || observed_failed {
+        return Err(70);
+    }
+    let retired = match wait_resolution {
+        ChildWaitResolution::Cancelled => {
+            cleanup_job(authorities, transactions, model, child.event, child.job_id)?
+        }
+        ChildWaitResolution::Terminal => {
+            complete_terminal_reap(authorities, transactions, model, child.event, child.job_id)?
+        }
+    };
+    if retired != RecoveryAction::None {
+        return Err(72);
+    }
+    match model
+        .complete_serial_cleanup(old_serial, old_console, now_millis()?)
+        .map_err(|_| 72u32)?
+    {
+        RecoveryAction::RetrySerialAt(deadline_ms) => {
+            *serial = attach_serial_bounded(authorities, transactions, model, Some(deadline_ms))?;
+            *child = launch_child(authorities, transactions, model, serial)?;
+            observe_exact_ready(model, serial, child, 67)?;
+            Ok(())
+        }
+        RecoveryAction::Escalate => Err(71),
+        _ => Err(72),
+    }
+}
+
+fn cleanup_job(
+    authorities: StartupAuthorities,
+    transactions: &mut TransactionIds,
+    model: &mut ConsoleModel,
+    event: EventGeneration,
+    job_id: u64,
+) -> Result<RecoveryAction, u32> {
+    let terminate = job_request(
+        authorities,
+        transactions,
+        LaunchMessageType::Terminate,
+        job_id,
+    )?;
+    match terminate {
+        LaunchReply::TerminationAccepted(response) if response == job_id => {}
+        // A child which exited before its stream close reached us is already
+        // terminal; WAIT remains the authoritative reap/result operation.
+        LaunchReply::Error(LaunchErrorCode::InvalidState) => {}
+        _ => return Err(73),
+    }
+    let waited = job_request(authorities, transactions, LaunchMessageType::Wait, job_id)?;
+    if !matches!(waited, LaunchReply::JobResult(response) if response == job_id) {
+        return Err(75);
+    }
+    if !matches!(model.child_terminated(event, now_millis()?), Ok(RecoveryAction::ReapChild(job)) if job == job_id)
+    {
+        return Err(74);
+    }
+    let closed = job_request(
+        authorities,
+        transactions,
+        LaunchMessageType::CloseJob,
+        job_id,
+    )?;
+    if !matches!(closed, LaunchReply::Closed(response) if response == job_id) {
+        return Err(76);
+    }
+    model.child_reaped(event, now_millis()?).map_err(|_| 77)
+}
+
+fn complete_terminal_reap(
+    authorities: StartupAuthorities,
+    transactions: &mut TransactionIds,
+    model: &mut ConsoleModel,
+    event: EventGeneration,
+    job_id: u64,
+) -> Result<RecoveryAction, u32> {
+    if !matches!(model.child_terminated(event, now_millis()?), Ok(RecoveryAction::ReapChild(job)) if job == job_id)
+    {
+        return Err(74);
+    }
+    close_reaped_job(authorities, transactions, model, event, job_id)
+}
+
+fn close_reaped_job(
+    authorities: StartupAuthorities,
+    transactions: &mut TransactionIds,
+    model: &mut ConsoleModel,
+    event: EventGeneration,
+    job_id: u64,
+) -> Result<RecoveryAction, u32> {
+    let closed = job_request(
+        authorities,
+        transactions,
+        LaunchMessageType::CloseJob,
+        job_id,
+    )?;
+    if !matches!(closed, LaunchReply::Closed(response) if response == job_id) {
+        return Err(76);
+    }
+    model.child_reaped(event, now_millis()?).map_err(|_| 77)
+}
+
+fn cleanup_unmodeled_job(
+    authorities: StartupAuthorities,
+    transactions: &mut TransactionIds,
+    job_id: u64,
+) -> Result<(), u32> {
+    let terminate = job_request(
+        authorities,
+        transactions,
+        LaunchMessageType::Terminate,
+        job_id,
+    )?;
+    if !matches!(
+        terminate,
+        LaunchReply::TerminationAccepted(response) if response == job_id
+    ) && terminate != LaunchReply::Error(LaunchErrorCode::InvalidState)
+    {
+        return Err(78);
+    }
+    let waited = job_request(authorities, transactions, LaunchMessageType::Wait, job_id)?;
+    if !matches!(waited, LaunchReply::JobResult(response) if response == job_id) {
+        return Err(79);
+    }
+    let closed = job_request(
+        authorities,
+        transactions,
+        LaunchMessageType::CloseJob,
+        job_id,
+    )?;
+    if !matches!(closed, LaunchReply::Closed(response) if response == job_id) {
+        return Err(80);
+    }
+    Ok(())
+}
+
+fn start_job_wait(
+    authorities: StartupAuthorities,
+    transactions: &mut TransactionIds,
+    job_id: u64,
+) -> Result<LaunchReservation, u32> {
+    let reservation = LaunchReservation {
+        connection_id: authorities.launch_connection_id,
+        generation: authorities.launch_connection_generation,
+        transaction_id: transactions.take()?,
+    };
+    let mut bytes = [0u8; 64];
+    let size = encode_job_message(reservation, LaunchMessageType::Wait, job_id, &mut bytes)
+        .map_err(|_| 78u32)?;
+    send_channel(authorities.launch, &bytes[..size], &[]).map_err(|_| 79u32)?;
+    Ok(reservation)
+}
+
+fn cancel_child_wait(
+    authorities: StartupAuthorities,
+    transactions: &mut TransactionIds,
+    child: &mut ChildSession,
+) -> Result<ChildWaitResolution, u32> {
+    let target = child.wait.ok_or(78u32)?;
+    let cancellation = LaunchReservation {
+        connection_id: authorities.launch_connection_id,
+        generation: authorities.launch_connection_generation,
+        transaction_id: transactions.take()?,
+    };
+    let mut bytes = [0u8; 64];
+    let size = encode_job_message(
+        cancellation,
+        LaunchMessageType::Cancel,
+        target.transaction_id,
+        &mut bytes,
+    )
+    .map_err(|_| 79u32)?;
+    send_channel(authorities.launch, &bytes[..size], &[]).map_err(|_| 80u32)?;
+
+    let mut terminal = false;
+    let mut received = 0;
+    while received < 2 {
+        let (reservation, reply) = receive_launch_any(authorities.launch)?;
+        if reservation == target && reply == LaunchReply::JobResult(child.job_id) {
+            terminal = true;
+            received += 1;
+            continue;
+        }
+        if reservation == cancellation
+            && reply == LaunchReply::Cancelled(target.transaction_id)
+            && !terminal
+        {
+            child.wait = None;
+            return Ok(ChildWaitResolution::Cancelled);
+        }
+        if reservation == cancellation
+            && reply == LaunchReply::Error(LaunchErrorCode::CancellationUnavailable)
+            && terminal
+        {
+            child.wait = None;
+            return Ok(ChildWaitResolution::Terminal);
+        }
+        return Err(81);
+    }
+    Err(81)
+}
+
+fn cleanup_child_for_exit(
+    authorities: StartupAuthorities,
+    transactions: &mut TransactionIds,
+    child: &mut ChildSession,
+) -> Result<(), u32> {
+    let resolution = cancel_child_wait(authorities, transactions, child);
+    let streams_closed = close_child_streams(child);
+    let result = match resolution? {
+        ChildWaitResolution::Cancelled => {
+            cleanup_unmodeled_job(authorities, transactions, child.job_id)
+        }
+        ChildWaitResolution::Terminal => {
+            let reply = job_request(
+                authorities,
+                transactions,
+                LaunchMessageType::CloseJob,
+                child.job_id,
+            )?;
+            if reply == LaunchReply::Closed(child.job_id) {
+                Ok(())
+            } else {
+                Err(80)
+            }
+        }
+    };
+    streams_closed?;
+    result
+}
+
+fn job_request(
+    authorities: StartupAuthorities,
+    transactions: &mut TransactionIds,
+    kind: LaunchMessageType,
+    job_id: u64,
+) -> Result<LaunchReply, u32> {
+    let reservation = LaunchReservation {
+        connection_id: authorities.launch_connection_id,
+        generation: authorities.launch_connection_generation,
+        transaction_id: transactions.take()?,
+    };
+    let mut bytes = [0u8; 128];
+    let size = encode_job_message(reservation, kind, job_id, &mut bytes).map_err(|_| 73u32)?;
+    send_channel(authorities.launch, &bytes[..size], &[]).map_err(|_| 74u32)?;
+    receive_launch(authorities.launch, reservation)
+}
+
+fn receive_launch(channel: DwHandle, expected: LaunchReservation) -> Result<LaunchReply, u32> {
+    let (reservation, reply) = receive_launch_any(channel)?;
+    if reservation != expected {
+        return Err(79);
+    }
+    Ok(reply)
+}
+
+fn receive_launch_any(channel: DwHandle) -> Result<(LaunchReservation, LaunchReply), u32> {
+    wait_readable(channel).map_err(|_| 75u32)?;
+    let mut bytes = [0u8; 128];
+    let mut handles = [DwReceivedHandleInfoV1::default(); 1];
+    let counts = receive_channel(channel, &mut bytes, &mut handles).map_err(|_| 76u32)?;
+    if counts.handles != 0 {
+        close_received(&handles, counts.handles);
+        return Err(77);
+    }
+    let parsed = parse_launch_message(&bytes[..counts.bytes], 0).map_err(|_| 78u32)?;
+    let reply = match parsed.message {
+        LaunchMessage::LaunchAccepted { job_id } => LaunchReply::LaunchAccepted(job_id),
+        LaunchMessage::TerminationAccepted { job_id } => LaunchReply::TerminationAccepted(job_id),
+        LaunchMessage::JobResult { job_id, .. } => LaunchReply::JobResult(job_id),
+        LaunchMessage::Cancelled {
+            target_transaction_id,
+        } => LaunchReply::Cancelled(target_transaction_id),
+        LaunchMessage::Closed { job_id } => LaunchReply::Closed(job_id),
+        LaunchMessage::Error { code } => LaunchReply::Error(code),
+        _ => return Err(80),
+    };
+    Ok((parsed.reservation, reply))
+}
+
+fn reserve_input(model: &mut ConsoleModel, pending: &mut Pending) -> Result<(), u32> {
+    if !pending.is_empty() {
+        return Ok(());
+    }
+    let Some(reservation) = model
+        .reserve_child_stdin(&mut pending.bytes)
+        .map_err(|_| 81u32)?
+    else {
+        return Ok(());
+    };
+    pending.used = reservation.length();
+    pending.reservation = Some(reservation);
+    Ok(())
+}
+
+fn commit_input(model: &mut ConsoleModel, pending: &Pending) -> Result<(), u32> {
+    let reservation = pending.reservation.ok_or(82u32)?;
+    if reservation.length() != pending.used {
+        return Err(83);
+    }
+    model.commit_child_stdin(reservation).map_err(|_| 84)
+}
+
+fn release_input(model: &mut ConsoleModel, pending: &Pending) -> Result<(), u32> {
+    model
+        .release_child_stdin(pending.reservation.ok_or(85u32)?)
+        .map_err(|_| 86)
+}
+
+fn reserve_output(model: &mut ConsoleModel, pending: &mut Pending) -> Result<(), u32> {
+    if !pending.is_empty() {
+        return Ok(());
+    }
+    let Some(reservation) = model
+        .reserve_serial_tx(&mut pending.bytes)
+        .map_err(|_| 87u32)?
+    else {
+        return Ok(());
+    };
+    if reservation.output_source().is_none() {
+        return Err(88);
+    }
+    pending.used = reservation.length();
+    pending.reservation = Some(reservation);
+    Ok(())
+}
+
+fn commit_output(model: &mut ConsoleModel, pending: &Pending) -> Result<(), u32> {
+    let reservation = pending.reservation.ok_or(89u32)?;
+    if reservation.length() != pending.used {
+        return Err(90);
+    }
+    model.commit_serial_tx(reservation).map_err(|_| 91)
+}
+
+fn release_output(model: &mut ConsoleModel, pending: &Pending) -> Result<(), u32> {
+    model
+        .release_serial_tx(pending.reservation.ok_or(92u32)?)
+        .map_err(|_| 93)
+}
+
+fn finish_launch_abort(
+    model: &mut ConsoleModel,
+    transaction: LaunchTransaction,
+    retained: &[DwHandle; 3],
+    child: &[DwHandle; 3],
+    moved_peers_revoked: bool,
+) -> Result<(), u32> {
+    let token = model.abort_child_launch(transaction).map_err(|_| 95u32)?;
+    let cleanup = token.cleanup();
+    let mut index = 0;
+    while index < cleanup.entries.len() {
+        if cleanup.entries[index].endpoint.0 == 0 {
+            return Err(96);
+        }
+        let mut other = index + 1;
+        while other < cleanup.entries.len() {
+            if cleanup.entries[index].endpoint == cleanup.entries[other].endpoint {
+                return Err(96);
+            }
+            other += 1;
+        }
+        index += 1;
+    }
+    if cleanup.entries[..3]
+        .iter()
+        .any(|entry| entry.disposition != CleanupDisposition::CloseConsoledPeer)
+    {
+        return Err(96);
+    }
+    for index in 0..3 {
+        match cleanup.entries[index + 3].disposition {
+            CleanupDisposition::CloseUnmovedChildPeer => {}
+            CleanupDisposition::RevokeMovedChildPeerFromLaunch if moved_peers_revoked => {}
+            _ => return Err(96),
+        }
+    }
+    let mut close_failed = false;
+    let mut evidence = LaunchCleanupEvidence {
+        consoled_peers_closed: [false; 3],
+        unmoved_child_peers_closed: [false; 3],
+        moved_child_peers_revoked: [false; 3],
+    };
+    for index in (0..3).rev() {
+        if cleanup.entries[index + 3].disposition == CleanupDisposition::CloseUnmovedChildPeer {
+            let closed = close_handle(child[index]).is_ok();
+            close_failed |= !closed;
+            evidence.unmoved_child_peers_closed[index] = closed;
+        } else {
+            evidence.moved_child_peers_revoked[index] = moved_peers_revoked;
+        }
+    }
+    for index in (0..3).rev() {
+        let closed = close_handle(retained[index]).is_ok();
+        close_failed |= !closed;
+        evidence.consoled_peers_closed[index] = closed;
+    }
+    if close_failed {
+        return Err(97);
+    }
+    model
+        .complete_abort_child_launch(&token, evidence)
+        .map(|_| ())
+        .map_err(|_| 98)
+}
+
+fn close_attempt_handles(handles: &[DwHandle]) -> Result<(), u32> {
+    let mut failed = false;
+    for handle in handles.iter().rev() {
+        if handle.0 != 0 {
+            failed |= close_handle(*handle).is_err();
+        }
+    }
+    if failed {
+        Err(FATAL_ATTACH_BASE | 99)
+    } else {
+        Ok(())
+    }
+}
+
+fn finish_connect_abort(
+    model: &mut ConsoleModel,
+    request: ConnectRequest,
+    handles: &[DwHandle],
+) -> Result<(), u32> {
+    let handles_closed = close_attempt_handles(handles).is_ok();
+    let model_released = model.abort_connect(request).is_ok();
+    if handles_closed && model_released {
+        Ok(())
+    } else {
+        Err(FATAL_ATTACH_BASE | 100)
+    }
+}
+
+fn create_reduced_stream_pair() -> Result<(DwHandle, DwHandle), u32> {
+    let (retained_broad, child_broad) =
+        create_channel(CHANNEL_CONSTRUCTION_RIGHTS).map_err(|_| 82u32)?;
+    let retained = match duplicate_handle(retained_broad, CHILD_CHANNEL_RIGHTS) {
+        Ok(handle) => handle,
+        Err(_) => {
+            let _ = close_handle(child_broad);
+            let _ = close_handle(retained_broad);
+            return Err(83);
+        }
+    };
+    if close_handle(retained_broad).is_err() {
+        let _ = close_handle(retained);
+        let _ = close_handle(child_broad);
+        return Err(84);
+    }
+    if validate_exact_channel(retained, CHILD_CHANNEL_RIGHTS).is_err() {
+        let _ = close_handle(child_broad);
+        let _ = close_handle(retained);
+        return Err(85);
+    }
+    Ok((retained, child_broad))
+}
+
+fn validated_stream_endpoint(handle: DwHandle) -> Result<StreamEndpoint, StreamError> {
+    StreamEndpoint::from_validated_handle(handle)
+}
+
+fn move_transfer(handle: DwHandle) -> DwHandleTransferV1 {
+    DwHandleTransferV1 {
+        handle,
+        requested_rights: CHILD_CHANNEL_RIGHTS,
+        operation: DW_HANDLE_TRANSFER_MOVE,
+        reserved0: 0,
+        reserved: [0; 2],
+    }
+}
+
+fn registry_header(
+    authorities: StartupAuthorities,
+    message_type: RegistryMessageType,
+    transaction_id: u64,
+) -> RegistryHeader {
+    RegistryHeader {
+        message_type,
+        registry_generation: authorities.registry_generation,
+        endpoint_id: authorities.registry_endpoint_id,
+        endpoint_generation: authorities.registry_endpoint_generation,
+        transaction_id,
+    }
+}
+
+fn valid_connector_identity(
+    identity: ConnectorIdentity,
+    publication_generation: u64,
+    client_transaction_id: u64,
+) -> bool {
+    identity.publication_generation == publication_generation
+        && identity.client_transaction_id == client_transaction_id
+        && identity.device_role_id == COM2_ROLE_ID.0
+        && identity.bundle_generation != 0
+        && identity.driver_attempt_generation != 0
+        && identity.driver_control_endpoint_id != 0
+        && identity.driver_control_endpoint_generation != 0
+        && identity.attach_transaction_id != 0
+        && identity.stream_generation != 0
+}
+
+fn serial_correlation(
+    authorities: StartupAuthorities,
+    identity: ConnectorIdentity,
+) -> SerialCorrelation {
+    SerialCorrelation {
+        registry_generation: authorities.registry_generation,
+        registry_endpoint_id: authorities.registry_endpoint_id,
+        registry_endpoint_generation: authorities.registry_endpoint_generation,
+        publication_generation: identity.publication_generation,
+        connector_client_transaction: identity.client_transaction_id,
+        device_role: identity.device_role_id,
+        device_bundle: identity.bundle_generation,
+        driver_attempt: identity.driver_attempt_generation,
+        driver_control_endpoint_id: identity.driver_control_endpoint_id,
+        driver_control_endpoint_generation: identity.driver_control_endpoint_generation,
+        attach_transaction: identity.attach_transaction_id,
+        stream_generation: identity.stream_generation,
+    }
+}
+
+fn serial_correlates(serial: &SerialSession, event: EventGeneration) -> bool {
+    serial.identity.publication_generation == event.serial.publication_generation
+        && serial.identity.client_transaction_id == event.serial.connector_client_transaction
+        && serial.identity.device_role_id == event.serial.device_role
+        && serial.identity.bundle_generation == event.serial.device_bundle
+        && serial.identity.driver_attempt_generation == event.serial.driver_attempt
+        && serial.identity.driver_control_endpoint_id == event.serial.driver_control_endpoint_id
+        && serial.identity.driver_control_endpoint_generation
+            == event.serial.driver_control_endpoint_generation
+        && serial.identity.attach_transaction_id == event.serial.attach_transaction
+        && serial.identity.stream_generation == event.serial.stream_generation
+}
+
+fn observe_exact_ready(
+    model: &mut ConsoleModel,
+    serial: &SerialSession,
+    child: &ChildSession,
+    error: u32,
+) -> Result<(), u32> {
+    if !serial_correlates(serial, child.event) {
+        return Err(error);
+    }
+    observe_exact_ready_without_serial(model, child, error)
+}
+
+fn observe_exact_ready_without_serial(
+    model: &mut ConsoleModel,
+    child: &ChildSession,
+    error: u32,
+) -> Result<(), u32> {
+    if !model.event_is_current(child.event)
+        || child.stdin.endpoint().handle().0 == 0
+        || child.stdout.endpoint().handle().0 == 0
+        || child.stderr.endpoint().handle().0 == 0
+    {
+        return Err(error);
+    }
+    let token = model.ready_token().ok_or(error)?;
+    if EventGeneration::from(token.ids) != child.event {
+        return Err(error);
+    }
+    model
+        .observe_ready(now_millis()?, token)
+        .map(|_| ())
+        .map_err(|_| error)
+}
+
+fn valid_received_channel(info: DwReceivedHandleInfoV1, rights: DwRights) -> bool {
+    info.handle.0 != 0
+        && info.object_type == DW_OBJECT_TYPE_CHANNEL
+        && info.rights == rights
+        && info.reserved0 == 0
+        && info.reserved == [0; 2]
+}
+
+fn validate_exact_channel(handle: DwHandle, rights: DwRights) -> Result<(), NativeError> {
+    let info = query_capability_info(handle)?;
+    if info.object_type == DW_OBJECT_TYPE_CHANNEL && info.rights == rights {
+        Ok(())
+    } else {
+        Err(NativeError::Output(
+            wyrmroot_runtime::NativeOutputError::InvalidObjectInfo,
+        ))
+    }
+}
+
+fn wait_readable(handle: DwHandle) -> Result<(), NativeError> {
+    let deadline = monotonic_active_now()?
+        .checked_add(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
+        .ok_or(NativeError::Output(
+            wyrmroot_runtime::NativeOutputError::DeadlineOverflow,
+        ))?;
+    let observed = wait_one(
+        handle,
+        DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+        DwDeadline(deadline),
+    )?;
+    if observed.observed.0 & DW_SIGNAL_READABLE.0 != 0 {
+        Ok(())
+    } else {
+        Err(NativeError::Status(deepwyrm_syscall::DW_STATUS_PEER_CLOSED))
+    }
+}
+
+fn wait_backoff(registry: DwHandle, deadline_ms: u64) -> Result<(), u32> {
+    let deadline_ns = deadline_ms.checked_mul(NANOS_PER_MILLI).ok_or(86u32)?;
+    let item = wait_item(registry, DwSignals(DW_SIGNAL_PEER_CLOSED.0));
+    match wait_many(core::slice::from_ref(&item), DwDeadline(deadline_ns)) {
+        Err(NativeError::Status(status)) if status == DW_STATUS_TIMED_OUT => Ok(()),
+        Ok(observed) if observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 => Err(87),
+        _ => Err(88),
+    }
+}
+
+fn discard_one_record(endpoint: DwHandle) {
+    let mut bytes = [0u8; wyrmroot_stream_proto::MAX_RECORD_BYTES];
+    let mut handles = [DwReceivedHandleInfoV1::default(); 1];
+    if let Ok(counts) = receive_channel(endpoint, &mut bytes, &mut handles) {
+        close_received(&handles, counts.handles);
+    }
+}
+
+fn close_child_streams(child: &mut ChildSession) -> Result<(), u32> {
+    let handles = [
+        child.stdin.endpoint().handle(),
+        child.stdout.endpoint().handle(),
+        child.stderr.endpoint().handle(),
+    ];
+    let mut failed = false;
+    for handle in handles.into_iter().rev() {
+        failed |= close_handle(handle).is_err();
+    }
+    if failed { Err(93) } else { Ok(()) }
+}
+
+fn close_received(handles: &[DwReceivedHandleInfoV1], count: usize) {
+    for info in handles[..count.min(handles.len())].iter().rev() {
+        if info.handle.0 != 0 {
+            let _ = close_handle(info.handle);
+        }
+    }
+}
+
+fn close_handle_array_reverse(handles: &[DwHandle]) {
+    for handle in handles.iter().rev() {
+        if handle.0 != 0 {
+            let _ = close_handle(*handle);
+        }
+    }
+}
+
+fn close_authorities(authorities: StartupAuthorities) {
+    let _ = close_handle(authorities.launch);
+    let _ = close_handle(authorities.registry);
+}
+
+const fn wait_item(handle: DwHandle, signals: DwSignals) -> DwWaitItemV1 {
+    DwWaitItemV1 { handle, signals }
+}
+
+const fn output_kind(source: OutputSource) -> StreamKind {
+    match source {
+        OutputSource::Stdout => StreamKind::Stdout,
+        OutputSource::Stderr => StreamKind::Stderr,
+    }
+}
+
+fn now_millis() -> Result<u64, u32> {
+    monotonic_active_now()
+        .map(|now| now / NANOS_PER_MILLI)
+        .map_err(|_| 94)
+}
+
+wyrmroot_runtime::native_entry!(crate::main);
+
+#[panic_handler]
+fn panic(_: &PanicInfo<'_>) -> ! {
+    panic_abort()
+}

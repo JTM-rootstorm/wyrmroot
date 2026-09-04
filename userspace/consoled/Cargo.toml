@@ -9,9 +9,33 @@ description = "Bounded WYR1-D serial console supervision model"
 [lib]
 path = "src/lib.rs"
 
-# This crate is intentionally tested standalone until the coordinator wires the
-# production binary into the Wyrmroot workspace.
-[workspace]
+[[bin]]
+name = "consoled"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["native-consoled"]
+
+[features]
+default = []
+native-consoled = [
+    "dep:deepwyrm-syscall",
+    "dep:wyrmroot-device-proto",
+    "dep:wyrmroot-launch-proto",
+    "dep:wyrmroot-loader",
+    "dep:wyrmroot-registry-proto",
+    "dep:wyrmroot-runtime",
+    "dep:wyrmroot-stream-proto",
+]
+
+[target.'cfg(target_os = "wyrmroot")'.dependencies]
+deepwyrm-syscall = { workspace = true, optional = true }
+wyrmroot-device-proto = { path = "../../crates/wyrmroot-device-proto", optional = true }
+wyrmroot-launch-proto = { path = "../../crates/wyrmroot-launch-proto", optional = true }
+wyrmroot-loader = { path = "../../crates/wyrmroot-loader", optional = true }
+wyrmroot-registry-proto = { path = "../../crates/wyrmroot-registry-proto", optional = true }
+wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime", optional = true }
+wyrmroot-stream-proto = { path = "../../crates/wyrmroot-stream-proto", optional = true }
 
 [lints.rust]
 unsafe_code = "deny"
