@@ -99,7 +99,7 @@ fn selector_27_dispatcher_keeps_one_protocol_sized_payload_and_stream_set() {
     );
     assert!(!dispatch.contains("MAX_STRING_BYTES + 2048"));
     assert!(NATIVE.contains("#[inline(always)]\nfn accept_reserved_launch"));
-    assert!(NATIVE.contains("#[inline(always)]\nfn poll_job_dispatcher"));
+    assert!(NATIVE.contains("#[inline(always)]\npub(crate) fn poll_job_dispatcher"));
     assert!(WYR1B_MODEL.contains("#[inline(always)]\npub(crate) fn prepare_reserved_job"));
     assert!(LIB.contains("#[inline(always)]\n    pub fn control_tick_product"));
     assert!(MAIN.contains(

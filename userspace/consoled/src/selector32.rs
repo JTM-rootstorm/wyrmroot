@@ -425,4 +425,58 @@ mod tests {
         assert_eq!(observed.value, fnv(&response[..len]));
         assert!(c.raw_rx(b"stale").is_err());
     }
+
+    fn round_trip(capture: &mut Capture, leg: u64, tuple: Tuple) -> Status {
+        let (response, len) = response(42, leg, tuple);
+        let mut input = response;
+        if leg != 2 {
+            input[..5].copy_from_slice(b"ping ");
+        }
+        capture.raw_rx(&input[..len - 1]).unwrap();
+        capture.raw_rx(&input[len - 1..len]).unwrap();
+        let mut child = response;
+        child[len - 2] = b'\n';
+        capture.child_output(leg == 2, &child[..len - 1]).unwrap();
+        assert!(capture.raw_tx(&response[..len - 1]).unwrap().is_none());
+        capture.raw_tx(&response[len - 1..len]).unwrap().unwrap()
+    }
+
+    #[test]
+    fn all_four_legs_rejoin_driver_and_child_replacement_without_stale_bytes() {
+        let first = tuple();
+        let mut capture = Capture::new(42).unwrap();
+        assert_eq!(
+            capture.ready(first, 1, 10, 11).unwrap().unwrap().sequence,
+            1
+        );
+        assert_eq!(round_trip(&mut capture, 1, first).sequence, 2);
+        assert_eq!(round_trip(&mut capture, 2, first).sequence, 3);
+        let second = Tuple {
+            attempt: first.attempt + 1,
+            endpoint: first.endpoint + 1,
+            transaction: first.transaction + 1,
+            stream: first.stream + 1,
+            console: first.console + 1,
+            child: first.child + 1,
+            ..first
+        };
+        assert_eq!(
+            capture.ready(second, 2, 12, 13).unwrap().unwrap().sequence,
+            4
+        );
+        assert_eq!(round_trip(&mut capture, 3, second).sequence, 5);
+        let third = Tuple {
+            child: second.child + 1,
+            ..second
+        };
+        assert!(capture.ready(third, 3, 12, 13).is_err());
+        capture.raw_rx(b"ex").unwrap();
+        capture.raw_rx(b"it\r\n").unwrap();
+        assert_eq!(
+            capture.ready(third, 3, 12, 13).unwrap().unwrap().sequence,
+            6
+        );
+        assert!(capture.ready(third, 3, 12, 13).unwrap().is_none());
+        assert_eq!(round_trip(&mut capture, 4, third).sequence, 7);
+    }
 }

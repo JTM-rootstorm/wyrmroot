@@ -134,10 +134,10 @@ impl Gate {
                 if !old_clean
                     || status.job == self.job
                     || new.role != old.role
-                    || new.bundle <= old.bundle
+                    || new.bundle != old.bundle
                     || new.attempt <= old.attempt
-                    || new.endpoint == old.endpoint
-                    || new.endpoint_generation <= old.endpoint_generation
+                    || (new.endpoint, new.endpoint_generation)
+                        == (old.endpoint, old.endpoint_generation)
                     || new.transaction <= old.transaction
                     || new.stream <= old.stream
                     || new.console <= old.console
@@ -278,7 +278,7 @@ mod tests {
             bundle: 2,
             attempt: 3,
             endpoint: 4,
-            endpoint_generation: 5,
+            endpoint_generation: 1,
             transaction: 6,
             stream: 7,
             console: 8,
@@ -336,10 +336,8 @@ mod tests {
                 .retire_driver
         );
         let second = Tuple {
-            bundle: 12,
             attempt: 13,
             endpoint: 14,
-            endpoint_generation: 15,
             transaction: 16,
             stream: 17,
             console: 18,
@@ -347,12 +345,47 @@ mod tests {
             ..first
         };
         assert!(gate.accept(ready(4, second, 2), false).is_err());
+        let before = gate;
+        for invalid in [
+            Tuple {
+                bundle: first.bundle + 1,
+                ..second
+            },
+            Tuple {
+                endpoint: first.endpoint,
+                endpoint_generation: first.endpoint_generation,
+                ..second
+            },
+            Tuple {
+                transaction: first.transaction,
+                ..second
+            },
+        ] {
+            assert!(gate.accept(ready(4, invalid, 2), true).is_err());
+            assert_eq!(gate, before);
+        }
         assert_eq!(gate.accept(ready(4, second, 2), true).unwrap().count, 1);
         gate.accept(observation(5, 3, second, 2), false).unwrap();
         let third = Tuple {
             child: 20,
             ..second
         };
+        let before = gate;
+        assert!(
+            gate.accept(
+                ready(
+                    6,
+                    Tuple {
+                        transaction: third.transaction + 1,
+                        ..third
+                    },
+                    3
+                ),
+                true
+            )
+            .is_err()
+        );
+        assert_eq!(gate, before);
         gate.accept(ready(6, third, 3), true).unwrap();
         gate.accept(observation(7, 4, third, 3), false).unwrap();
         assert_eq!(gate.record_count(), 12);

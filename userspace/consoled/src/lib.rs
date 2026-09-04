@@ -130,7 +130,13 @@ impl SerialCorrelation {
         }
         self.publication_generation > previous.publication_generation
             && self.driver_attempt > previous.driver_attempt
-            && self.driver_control_endpoint_generation > previous.driver_control_endpoint_generation
+            && (
+                self.driver_control_endpoint_id,
+                self.driver_control_endpoint_generation,
+            ) != (
+                previous.driver_control_endpoint_id,
+                previous.driver_control_endpoint_generation,
+            )
             && self.attach_transaction > previous.attach_transaction
             && self.stream_generation > previous.stream_generation
             && self.device_bundle >= previous.device_bundle
@@ -1859,6 +1865,30 @@ mod tests {
         assert_eq!(
             model.attach_connected(correlation(1), 4),
             Err(ModelError::StaleCorrelation)
+        );
+    }
+    #[test]
+    fn fresh_endpoint_can_start_at_same_object_generation_in_retained_bundle() {
+        let old = correlation(1);
+        let new = SerialCorrelation {
+            device_bundle: old.device_bundle,
+            driver_control_endpoint_generation: old.driver_control_endpoint_generation,
+            ..correlation(2)
+        };
+        assert!(new.valid_transition_from(old));
+        assert!(
+            !SerialCorrelation {
+                driver_control_endpoint_id: old.driver_control_endpoint_id,
+                ..new
+            }
+            .valid_transition_from(old)
+        );
+        assert!(
+            !SerialCorrelation {
+                attach_transaction: old.attach_transaction,
+                ..new
+            }
+            .valid_transition_from(old)
         );
     }
     #[test]
