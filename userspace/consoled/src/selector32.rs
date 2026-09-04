@@ -353,15 +353,22 @@ impl Capture {
     }
 
     pub fn raw_rx(&mut self, mut bytes: &[u8]) -> Result<Option<Status>, Error> {
-        if self.awaiting_ready && self.leg == 4 {
-            compare(b"exit\r\n", &mut self.exit, bytes)?;
-            return self.try_pending_ready();
-        }
         if bytes.is_empty() {
             return Err(Error);
         }
         let mut observed = None;
         while !bytes.is_empty() {
+            // Completing leg 3 can expose an already coalesced exit command
+            // in this same raw record; dispatch the current phase each time.
+            if self.awaiting_ready && self.leg == 4 {
+                compare(b"exit\r\n", &mut self.exit, bytes)?;
+                if let Some(status) = self.try_pending_ready()? {
+                    if observed.replace(status).is_some() {
+                        return Err(Error);
+                    }
+                }
+                break;
+            }
             self.require_active()?;
             let (mut expected, len) = response(self.nonce, self.leg, self.tuple);
             if self.leg != 2 {
@@ -691,6 +698,39 @@ mod tests {
         assert_eq!(ready.tuple, third);
         assert_eq!(c.ready(third, 3, 12, 13), Ok(None));
         assert_eq!(round_trip(&mut c, 4, third).sequence, 7);
+    }
+
+    #[test]
+    fn delayed_leg_three_lf_and_exit_prefix_can_share_one_raw_record() {
+        for exit_prefix in 1..=6 {
+            let (mut c, second) = at_leg(3);
+            let (pong, len) = response(42, 3, second);
+            let mut command = pong;
+            command[..5].copy_from_slice(b"ping ");
+            c.raw_rx(&command[..len - 1]).unwrap();
+            command[len - 2] = b'\n';
+            c.stdin_commit(&command[..len - 1]).unwrap();
+            let mut child = pong;
+            child[len - 2] = b'\n';
+            c.child_output(false, &child[..len - 1]).unwrap();
+            assert_eq!(c.raw_tx(&pong[..len]), Ok(None));
+            let mut joined = [0; 7];
+            joined[0] = b'\n';
+            joined[1..1 + exit_prefix].copy_from_slice(&b"exit\r\n"[..exit_prefix]);
+            let observed = c.raw_rx(&joined[..1 + exit_prefix]).unwrap().unwrap();
+            assert_eq!(observed.leg, 3);
+            if exit_prefix != 6 {
+                assert_eq!(c.raw_rx(&b"exit\r\n"[exit_prefix..]), Ok(None));
+            }
+            assert_eq!(c.stdin_commit(b"exit\n"), Ok(None));
+            let third = Tuple {
+                child: second.child + 1,
+                ..second
+            };
+            let ready = c.ready(third, 3, 12, 13).unwrap().unwrap();
+            assert_eq!(ready.kind, READY);
+            assert_eq!(round_trip(&mut c, 4, third).sequence, 7);
+        }
     }
 
     #[test]
