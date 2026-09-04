@@ -516,10 +516,16 @@ Record types are `1 DRIVER_READY`, `2 STREAM_ATTACHED`, `3 RAW_RX`,
   tuple through child.
 - `DRIVER_REPLACED` requires complete previous driver/stream/console/child
   identity and complete fresh current driver/stream/console/child identity.
-  It is emitted only after old cleanup and new child READY.
+  Driver-only replacement preserves the role and healthy devmgr bundle/lease;
+  the attempt, connector attach transaction, stream, console, and child are
+  strictly newer. The control endpoint `(ID, generation)` pair must be distinct;
+  the generation alone need not increase because a new endpoint ID starts at
+  generation one. It is emitted only after old cleanup and new child READY.
+- The operation transaction in WRD1 is the connector attach transaction, not
+  the driver's launch transaction or the child's JobV2 transaction.
 - `CHILD_REPLACED` requires the same current driver/bundle/attempt/endpoint/
-  stream/console in both groups, distinct previous/current child generations,
-  and zero value. It proves the healthy driver was preserved.
+  attach transaction/stream/console in both groups, a strictly newer current
+  child generation, and zero value. It proves the healthy driver was preserved.
 - `POST_DRIVER_STDOUT_OBSERVED` must follow the corresponding
   `DRIVER_REPLACED`; its current tuple must equal the replacement record's
   current tuple. `POST_CHILD_STDOUT_OBSERVED` has the analogous requirement
