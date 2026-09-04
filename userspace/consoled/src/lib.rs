@@ -457,7 +457,7 @@ impl InputNormalizer {
                 }
             }
             if byte == b'\r' {
-                queue.push(&[b'\n']);
+                queue.push(b"\n");
                 self.suppress_lf_after_cr = true;
             } else {
                 queue.push(&[byte]);
@@ -500,7 +500,7 @@ impl OutputNormalizer {
         while index < input.len() {
             let byte = input[index];
             if byte == b'\n' && !self.previous_was_cr {
-                queue.push(&[b'\r']);
+                queue.push(b"\r");
             }
             queue.push(&[byte]);
             self.previous_was_cr = byte == b'\r';
@@ -884,8 +884,7 @@ impl ConsoleModel {
         if !matches!(
             self.state,
             ConnectionState::Active | ConnectionState::FailClosed
-        )
-            || self.child.is_some()
+        ) || self.child.is_some()
             || self.serial != Some(identity.serial)
             || self.console_generation != Some(identity.console_generation)
             || self.pending_launch != Some(identity)
@@ -2137,9 +2136,11 @@ mod tests {
             model.observe_ready(4, old_token),
             Err(ModelError::StaleCorrelation)
         );
-        assert!(model
-            .observe_ready(3 + STABLE_RUN_MILLIS, new_token)
-            .unwrap());
+        assert!(
+            model
+                .observe_ready(3 + STABLE_RUN_MILLIS, new_token)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -2166,9 +2167,7 @@ mod tests {
             unmoved_child_peers_closed: [false, true, true],
             moved_child_peers_revoked: [true, false, false],
         };
-        model
-            .complete_abort_child_launch(&token, evidence)
-            .unwrap();
+        model.complete_abort_child_launch(&token, evidence).unwrap();
         let cleaned = model.snapshot();
         assert!(!cleaned.pending_launch);
         assert!(!cleaned.pending_launch_cleanup);

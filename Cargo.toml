@@ -26,6 +26,7 @@ members = [
     "userspace/registryd",
     "userspace/devmgr",
     "userspace/uart16550d",
+    "userspace/consoled",
     "userspace/dw1b-preemption",
     "userspace/dw1c-preemption",
     "userspace/dw1d6-device-test",
