@@ -44,8 +44,9 @@ the joined state space rather than accepting only each observed schedule:
 
 - WRCS 1.1 carries the owner-issued service publication generation separately
   from registry incarnation; normal connector errors do not terminate devmgr.
-- Selector 32 has 32 wait registrations for its measured 20/21-registration
-  actor graph, with a regression against the actual kernel registry.
+- Selector 32 has 32 wait registrations for its source-derived
+  20/21-registration lower bound, with a regression against the actual kernel
+  registry. This is not a native peak-usage measurement.
 - Driver retirement joins the actually committed client-release notification
   before rebind while ordinary supervision continues. Delayed observations
   rejoin the retained exact READY tuple after child reap.
