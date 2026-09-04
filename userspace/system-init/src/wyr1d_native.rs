@@ -3,8 +3,8 @@
 use super::*;
 use crate::wyr1b_job::{JobDispatcher, SessionOwner};
 use crate::wyr1b_native::{InstalledPeer, install_client, poll_job_dispatcher};
-use crate::wyr1d_gate::{Batch, DrainFence, Gate};
-use wyrmroot_consoled::selector32::{READY, RELEASED, STATUS_BYTES, Status};
+use crate::wyr1d_gate::{Batch, DrainFence, Gate, RetirementJoin};
+use wyrmroot_consoled::selector32::{OBSERVED, READY, RELEASED, STATUS_BYTES, Status};
 use wyrmroot_device_proto::d5_controller::{
     self, D5ControllerMessage, D5DrainIdentity, D5DriverIdentity, D5StreamIdentity,
 };
@@ -27,6 +27,7 @@ pub(super) struct State {
     pending_fence: Option<DrainFence>,
     fence_deadline: u64,
     released: bool,
+    retirement: Option<RetirementJoin>,
 }
 
 impl State {
@@ -53,6 +54,7 @@ impl State {
             pending_fence: None,
             fence_deadline: 0,
             released: false,
+            retirement: None,
         })
     }
 }
@@ -422,21 +424,7 @@ where
     {
         return Err(InitError::WrongManifestProfile);
     }
-    let loaded = d5
-        .jobs
-        .jobs
-        .loaded_job(status.job)
-        .map_err(InitError::Wyr1BModel)?;
-    if loaded.loaded.process.0 == 0
-        || d5
-            .jobs
-            .jobs
-            .terminal_result(status.job)
-            .map_err(InitError::Wyr1BModel)?
-            .is_some()
-    {
-        return Err(InitError::WrongManifestProfile);
-    }
+    validate_status_job(&d5.jobs.jobs, status, d5.last_ready)?;
     let old_clean = match d5.gate.record_count() {
         8 => {
             d5.released
@@ -461,6 +449,82 @@ where
         return Ok(());
     }
     publish_batch(system, devmgr, driver, &batch)
+}
+
+fn validate_status_job(
+    jobs: &crate::wyr1b::JobController,
+    status: Status,
+    last_ready: Option<Status>,
+) -> Result<(), InitError> {
+    if status.kind == READY {
+        let loaded = jobs.loaded_job(status.job).map_err(InitError::Wyr1BModel)?;
+        if loaded.loaded.process.0 != 0
+            && jobs
+                .terminal_result(status.job)
+                .map_err(InitError::Wyr1BModel)?
+                .is_none()
+        {
+            return Ok(());
+        }
+    } else if status.kind == OBSERVED
+        && last_ready.is_some_and(|ready| {
+            ready.kind == READY
+                && ready.job == status.job
+                && ready.tuple == status.tuple
+                && ready.nonce == status.nonce
+                && ready.publication == status.publication
+                && ready.client_transaction == status.client_transaction
+        })
+    {
+        // The accepted READY already joined this exact JobV2 to its streams.
+        // A queued byte observation remains valid after that job exits/reaps;
+        // Gate::accept still checks sequence, leg, tuple and response hash.
+        return Ok(());
+    }
+    Err(InitError::WrongManifestProfile)
+}
+
+pub(super) fn observe_driver_retired(
+    resident: &mut ResidentSystemInit,
+    request: DriverLaunchRequest,
+) -> Result<(), InitError> {
+    let d5 = resident
+        .wyr1c
+        .as_mut()
+        .and_then(|s| s.d5.as_mut())
+        .ok_or(InitError::WrongActivationOrder)?;
+    let old = d5.first_driver.ok_or(InitError::WrongActivationOrder)?;
+    if !same_driver_request(old, request) {
+        return Err(InitError::WrongManifestProfile);
+    }
+    d5.retirement
+        .as_mut()
+        .ok_or(InitError::WrongActivationOrder)?
+        .observe_retired(old)
+        .map_err(|_| InitError::WrongManifestProfile)
+}
+
+pub(super) fn claim_publication_rebind(
+    resident: &mut ResidentSystemInit,
+    now: u64,
+) -> Result<bool, InitError> {
+    let d5 = resident
+        .wyr1c
+        .as_mut()
+        .and_then(|s| s.d5.as_mut())
+        .ok_or(InitError::WrongActivationOrder)?;
+    match d5.retirement.as_mut() {
+        Some(join) => join.claim_rebind(now).map_err(|_| InitError::Supervision),
+        None => Ok(false),
+    }
+}
+
+fn same_driver_request(driver: D5DriverIdentity, request: DriverLaunchRequest) -> bool {
+    request.role_id.0 == driver.device_role_id
+        && request.attempt_generation.0 == driver.driver_attempt_generation
+        && request.endpoint.id.0 == driver.driver_control_endpoint_id
+        && request.endpoint.generation.0 == driver.driver_control_endpoint_generation
+        && request.transaction_id == driver.launch_transaction_id
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -521,7 +585,26 @@ pub(super) fn tx_drained<S: InitPlatform>(
     let batch = fence
         .completed(identity)
         .map_err(|_| InitError::WrongManifestProfile)?;
-    publish_batch(system, devmgr, identity.driver, batch)
+    let retirement = if batch.retire_driver {
+        if d5.retirement.is_some() {
+            return Err(InitError::WrongManifestProfile);
+        }
+        Some(
+            RetirementJoin::new(
+                identity.driver,
+                system.now().map_err(InitError::Native)?,
+                WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns,
+            )
+            .map_err(|_| InitError::Accounting)?,
+        )
+    } else {
+        None
+    };
+    publish_batch(system, devmgr, identity.driver, batch)?;
+    if retirement.is_some() {
+        d5.retirement = retirement;
+    }
+    Ok(())
 }
 
 fn take_completed_fence(
@@ -574,12 +657,7 @@ fn flush_release<S: InitPlatform>(
     let Some(reaped) = context.last_reaped_driver else {
         return Ok(());
     };
-    if reaped.role_id.0 != old.device_role_id
-        || reaped.attempt_generation.0 != old.driver_attempt_generation
-        || reaped.endpoint.id.0 != old.driver_control_endpoint_id
-        || reaped.endpoint.generation.0 != old.driver_control_endpoint_generation
-        || reaped.transaction_id != old.launch_transaction_id
-    {
+    if !same_driver_request(old, reaped) {
         return Err(InitError::WrongManifestProfile);
     }
     send_devmgr(
@@ -593,6 +671,11 @@ fn flush_release<S: InitPlatform>(
             stream_generation: status.tuple.stream,
         }),
     )?;
+    d5.retirement
+        .as_mut()
+        .ok_or(InitError::WrongActivationOrder)?
+        .release_sent(old)
+        .map_err(|_| InitError::WrongManifestProfile)?;
     d5.pending_release = None;
     d5.released = true;
     Ok(())
@@ -613,6 +696,73 @@ fn send_devmgr<S: InitPlatform>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn queued_observation_uses_exact_accepted_ready_after_job_reap() {
+        use wyrmroot_consoled::selector32::Tuple;
+        let ready = Status {
+            kind: READY,
+            sequence: 4,
+            nonce: 42,
+            tuple: Tuple {
+                role: 1,
+                bundle: 2,
+                attempt: 3,
+                endpoint: 4,
+                endpoint_generation: 1,
+                transaction: 6,
+                stream: 7,
+                console: 8,
+                child: 9,
+            },
+            job: 10,
+            rx: 0,
+            tx: 0,
+            leg: 0,
+            value: 0,
+            publication: 11,
+            client_transaction: 12,
+        };
+        // A completed JobV2 has been removed by the cleanup dispatcher. Its
+        // previously validated READY remains the exact authority join.
+        let jobs = crate::wyr1b::JobController::new();
+        assert_eq!(jobs.live_jobs(), 0);
+        let observed = Status {
+            kind: OBSERVED,
+            sequence: 5,
+            leg: 3,
+            ..ready
+        };
+        assert!(validate_status_job(&jobs, observed, Some(ready)).is_ok());
+        assert!(validate_status_job(&jobs, ready, Some(ready)).is_err());
+        assert!(validate_status_job(&jobs, observed, None).is_err());
+        for stale in [
+            Status {
+                job: 13,
+                ..observed
+            },
+            Status {
+                publication: 13,
+                ..observed
+            },
+            Status {
+                client_transaction: 13,
+                ..observed
+            },
+            Status {
+                nonce: 43,
+                ..observed
+            },
+            Status {
+                tuple: Tuple {
+                    child: 10,
+                    ..observed.tuple
+                },
+                ..observed
+            },
+        ] {
+            assert!(validate_status_job(&jobs, stale, Some(ready)).is_err());
+        }
+    }
     use wyrmroot_consoled::selector32::Tuple;
     use wyrmroot_device_proto::coordinator::{
         AttemptGeneration, EndpointGeneration, EndpointId, LaunchSessionGeneration,
@@ -723,6 +873,7 @@ mod tests {
             pending_fence: None,
             fence_deadline: 0,
             released: false,
+            retirement: Some(RetirementJoin::new(driver, 0, 1_000_000).unwrap()),
         };
         let mut context = PollContext {
             authority: LoadAuthority {
@@ -797,6 +948,7 @@ mod tests {
         assert!(flush_release(&mut state, context, &mut sender).is_err());
         assert_eq!(state.pending_release, Some(status));
         assert!(!state.released);
+        assert!(!state.retirement.as_mut().unwrap().claim_rebind(1).unwrap());
         sender.fail = false;
         flush_release(&mut state, context, &mut sender).unwrap();
         assert!(state.released);
@@ -813,6 +965,15 @@ mod tests {
         );
         flush_release(&mut state, context, &mut sender).unwrap();
         assert_eq!(sender.sent, 1);
+        assert!(!state.retirement.as_mut().unwrap().claim_rebind(2).unwrap());
+        state
+            .retirement
+            .as_mut()
+            .unwrap()
+            .observe_retired(driver)
+            .unwrap();
+        assert!(state.retirement.as_mut().unwrap().claim_rebind(3).unwrap());
+        assert!(!state.retirement.as_mut().unwrap().claim_rebind(4).unwrap());
 
         let ready = Status {
             kind: READY,

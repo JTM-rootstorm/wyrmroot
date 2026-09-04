@@ -29,6 +29,8 @@ use deepwyrm_syscall::{
 };
 #[cfg(feature = "wyr1c6-selector29")]
 use deepwyrm_syscall::{DW_SIGNAL_WRITABLE, DW_STATUS_WOULD_BLOCK};
+#[cfg(any(feature = "dw1e3-selector31", feature = "wyr1d-selector32"))]
+use wyrmroot_device_proto::ConnectorMessage;
 #[cfg(any(
     feature = "wyr1c6-production",
     feature = "wyr1d-production",
@@ -51,6 +53,8 @@ use wyrmroot_device_proto::control_v1_1::{
 };
 #[cfg(not(any(feature = "dw1e3-selector31", feature = "wyr1d-selector32")))]
 use wyrmroot_device_proto::controller::INSTALL_BYTES;
+#[cfg(not(feature = "wyr1d-selector32"))]
+use wyrmroot_device_proto::controller::parse as parse_controller;
 #[cfg(feature = "wyr1d-selector32")]
 use wyrmroot_device_proto::d5_controller::{
     D5ControllerMessage, RECORD_BYTES as D5_CONTROLLER_BYTES, encode as encode_d5_controller,
@@ -66,7 +70,7 @@ use wyrmroot_device_proto::driver_launch::{
 use wyrmroot_device_proto::selector29_should_fail;
 use wyrmroot_device_proto::{
     ControllerMessage, StatusCode,
-    controller::{STATUS_BYTES, encode as encode_controller, parse as parse_controller},
+    controller::{STATUS_BYTES, encode as encode_controller},
 };
 #[cfg(feature = "wyr1c5-production")]
 use wyrmroot_device_proto::{
@@ -1095,6 +1099,17 @@ fn receive_controller(
             .map(ControllerInput::D5)
             .map_err(|_| failure(233));
     }
+    #[cfg(feature = "wyr1d-selector32")]
+    let publication = match wyrmroot_device_proto::controller_v1_1::parse(&bytes[..counts.bytes]) {
+        Ok(publication) => publication,
+        Err(_) => {
+            close_received(&handles, counts.handles);
+            return Err(failure(29));
+        }
+    };
+    #[cfg(feature = "wyr1d-selector32")]
+    let message = publication.controller;
+    #[cfg(not(feature = "wyr1d-selector32"))]
     let message = match parse_controller(&bytes[..counts.bytes]) {
         Ok(message) => message,
         Err(_) => {
@@ -1133,7 +1148,11 @@ fn receive_controller(
             return Err(failure(33));
         }
     };
-    let action = match resident.accept(message, counts.handles as u32) {
+    #[cfg(feature = "wyr1d-selector32")]
+    let accepted = resident.accept_publication(publication, counts.handles as u32);
+    #[cfg(not(feature = "wyr1d-selector32"))]
+    let accepted = resident.accept(message, counts.handles as u32);
+    let action = match accepted {
         Ok(action) => action,
         Err(_) => {
             if counts.handles == 1 {
@@ -1159,7 +1178,9 @@ fn published_driver(
         return Err(failure(242));
     }
     Ok(PublishedDriver {
-        publication_generation: resident.active_binding().ok_or(failure(243))?.generation.0,
+        publication_generation: resident
+            .publication_service_generation()
+            .ok_or(failure(243))?,
         control: ControlIdentityV1_1 {
             role_id: request.role_id,
             bundle_generation: resident.bundle_generation().ok_or(failure(244))?,
@@ -1302,11 +1323,33 @@ fn service_connector_offer(
         let _ = close_handle(direct);
         return Err(failure(184));
     }
-    let request = parse_connector(&request_bytes).map_err(|_| failure(185))?;
+    let request = match parse_connector(&request_bytes) {
+        Ok(request @ ConnectorMessage::ConnectStream { .. }) => request,
+        _ => {
+            let _ = close_handle(direct);
+            return Err(failure(185));
+        }
+    };
+    let action = match broker.begin_connect(request) {
+        Ok(action) => action,
+        Err(error) => {
+            let reply = error.reply(request).ok_or(failure(186))?;
+            let mut bytes = [0u8; CONNECTOR_BYTES];
+            let encoded = encode_connector(reply, &mut bytes);
+            if encoded.is_ok() {
+                // A rejected request owns no raw pair. A disconnected client
+                // cannot turn a normal negative response into driver loss.
+                let _ = send_channel(direct, &bytes, &[]);
+            }
+            close_handle(direct).map_err(|_| failure(186))?;
+            encoded.map_err(|_| failure(186))?;
+            return Ok(());
+        }
+    };
     let ConnectorAction::AllocatePair {
         attach,
         driver_message,
-    } = broker.begin_connect(request).map_err(|_| failure(186))?
+    } = action
     else {
         let _ = close_handle(direct);
         return Err(failure(187));

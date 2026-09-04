@@ -30,6 +30,19 @@ use the verified `/opt/rust-bin-1.97.1/bin/cargo` directly with the project
 offline Cargo home, host compiler from `.cargo/config.toml`, and explicit
 isolated `CARGO_TARGET_DIR`:
 
+The exact offline home is
+`/home/mike/Documents/Programming/OS-Project/.tmp/cargo-home/offline-v1`,
+not `wyrmroot/.tmp/cargo-home/offline-v1`. A checkout-relative guess produces
+an offline dependency-checkout error before compilation; it is not a product
+failure. For direct feature checks set `CARGO_HOME` to that absolute root
+path, and prefix `PATH` with `/opt/rust-bin-1.97.1/bin` so Clippy also uses the
+verified host version. Default gates continue through the launcher, which
+owns these settings and rejects a caller-supplied `CARGO_HOME`.
+Neighbor selector-31 native checks also require the compile-time
+`DEEPWYRM_DW1E_EVIDENCE_NONCE` (for example `0000000000000106`). Omitting it
+fails the existing runtime `env!` before the selected binary is checked;
+selector 32 obtains its nonce from the frozen gate configuration instead.
+
 ```text
 cargo test --offline --locked -p wyrmroot-system-init -p wyrmroot-consoled \
   --lib --features wyrmroot-system-init/wyr1d-selector32,wyrmroot-consoled/wyr1d-selector32
@@ -77,8 +90,9 @@ wrong identity, duplicate request/completion, and deadline equality.
 
 ## Stack budget and remaining evidence
 
-The selector-enabled resident including the pending drain batch is 33,320 bytes
-on x86-64 (previously 32,072). Its specification-only
+The selector-enabled resident including the pending drain batch and retirement
+join is 33,384 bytes on x86-64 (GDB host type inspection; previously 33,320).
+Its specification-only
 resident partition is raised from 20 KiB to 40 KiB with headroom. The physical
 128 KiB child stack and 20 KiB JobV2 startup block remain unchanged. The D5
 dispatcher is no longer moved out of its resident on each tick. Consolidating
@@ -89,3 +103,40 @@ The consoled observation establishes committed raw Channel output. UART
 transmission completion is supplied through the selector-private drain fence
 specified in `Plans/WYR1_D5_DRAIN_FENCE.md`. The paired devmgr/UART implementation
 must be integrated and the full frozen product validated live before acceptance.
+
+## A1 GDB and broader join corrections
+
+The frozen A1 pair failed before D5READY. GDB A1-02 captured the exact connector
+STALE branch: the request publication was `0xC10801`, but devmgr had incorrectly
+substituted registry lifetime `1`. WRCS 1.1 now carries the owner-issued service
+generation; see `Plans/WYR1_D5_PUBLICATION_HANDOFF.md`. A1-01 also recorded
+devmgr `C10100BA` and consoled's eventual `D400001A`. Its wait-capacity trap
+did not fire. The independent kernel wait-budget correction is justified by
+the full actor graph, not attributed to that early failure.
+
+Broader transition review identified two independent races before another
+freeze. A selector-owned retirement join now records DriverRetired without
+blocking, continues job/status polling, and claims rebind once only after exact
+ClientReleased has successfully been sent. This preserves same-Channel FIFO
+release-before-rebind in either fact arrival order. Its absolute cleanup
+deadline begins after the retirement request commits; failure/expiry cannot
+open a second replacement. Driver-reap remains a separate prerequisite for
+the release send.
+
+A queued OBSERVED status may arrive after the same child has exited/reaped.
+It now uses the retained exact accepted READY identity instead of requiring
+the historical child to remain live. The Gate still checks sequence, nonce,
+full tuple, job, publication, client transaction, leg and response hash. New
+READY still requires a current nonterminal JobV2, and replacement READY still
+requires old cleanup. No sleep or host timing assumption establishes success.
+
+At the A2 preparation checkpoint: default devmgr 35 and init 95 tests pass;
+selector-32 devmgr 37 and init 103 pass; full default workspace reports 1,067
+passing executions across 76 summaries, zero failures and one existing ignore.
+Default workspace and selected-library Clippy pass with warnings denied, as
+do native checks of all four D5 actors and neighboring selector-31 init/devmgr.
+Tests cover helper joins, both fact orders, failed-send retention, timeout,
+one-shot rebind and post-reap observation identity. They do not substitute for
+the full native callback/VM sequence. Source review found no further blocker
+in the prescribed D5 path. General registry-only broker refresh remains the
+separate limitation recorded in the publication handoff.

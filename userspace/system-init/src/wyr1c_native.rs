@@ -20,6 +20,8 @@ use deepwyrm_syscall::{DW_HANDLE_TRANSFER_MOVE, DW_OBJECT_TYPE_CHANNEL, DwHandle
 use wyrmroot_device_proto::SERIAL_CONSOLE_CONNECTOR_PUBLICATION_POLICY;
 #[cfg(not(any(feature = "dw1e3-selector31", feature = "wyr1d-selector32")))]
 use wyrmroot_device_proto::SERIAL_CONSOLE_PUBLICATION_POLICY;
+#[cfg(any(test, not(feature = "wyr1d-selector32")))]
+use wyrmroot_device_proto::controller::encode as encode_controller;
 use wyrmroot_device_proto::coordinator::{
     RegistryEndpoint, RegistryEndpointGeneration, RegistryEndpointId, RegistryGeneration,
     SupervisorGeneration,
@@ -34,9 +36,7 @@ use wyrmroot_device_proto::driver_launch::{C6_FACT_BYTES, C6Fact, parse_c6_fact}
 use wyrmroot_device_proto::driver_launch::{encode_reaped, parse_driver_retired};
 use wyrmroot_device_proto::{
     DriverLaunchRequest,
-    controller::{
-        ControllerMessage, StatusCode, encode as encode_controller, parse as parse_controller,
-    },
+    controller::{ControllerMessage, StatusCode, parse as parse_controller},
     driver_launch::{
         DRIVER_RETIRED_BYTES, LAUNCH_REQUEST_BYTES, LAUNCH_RESPONSE_BYTES, encode_constructed,
         parse_request,
@@ -837,19 +837,21 @@ where
         binding,
         transaction_id,
     };
-    let mut bytes = [0u8; wyrmroot_device_proto::controller::INSTALL_BYTES];
-    if encode_controller(request, &mut bytes).is_err() {
-        return fail_loaded_devmgr(
-            system,
-            waits,
-            controller,
-            loaded,
-            task_group,
-            generation,
-            transaction_id,
-            InitError::WrongManifestProfile,
-        );
-    }
+    let bytes = match encode_publication_request(request, publication.service_generation) {
+        Ok(bytes) => bytes,
+        Err(()) => {
+            return fail_loaded_devmgr(
+                system,
+                waits,
+                controller,
+                loaded,
+                task_group,
+                generation,
+                transaction_id,
+                InitError::WrongManifestProfile,
+            );
+        }
+    };
     if let Err(error) = system
         .send_channel(loaded.launch_channel, &bytes)
         .map_err(InitError::Native)
@@ -984,6 +986,33 @@ where
         last_controller_transaction: transaction_id,
         next_controller_transaction: transaction_id.checked_add(1).ok_or(InitError::Accounting)?,
     })
+}
+
+#[cfg(feature = "wyr1d-selector32")]
+const PUBLICATION_REQUEST_BYTES: usize = wyrmroot_device_proto::controller_v1_1::RECORD_BYTES;
+#[cfg(not(feature = "wyr1d-selector32"))]
+const PUBLICATION_REQUEST_BYTES: usize = wyrmroot_device_proto::controller::INSTALL_BYTES;
+
+fn encode_publication_request(
+    controller: ControllerMessage,
+    service_generation: u64,
+) -> Result<[u8; PUBLICATION_REQUEST_BYTES], ()> {
+    let mut bytes = [0u8; PUBLICATION_REQUEST_BYTES];
+    #[cfg(feature = "wyr1d-selector32")]
+    wyrmroot_device_proto::controller_v1_1::encode(
+        wyrmroot_device_proto::controller_v1_1::PublicationMessage {
+            controller,
+            service_generation,
+        },
+        &mut bytes,
+    )
+    .map_err(|_| ())?;
+    #[cfg(not(feature = "wyr1d-selector32"))]
+    {
+        let _ = service_generation;
+        encode_controller(controller, &mut bytes).map_err(|_| ())?;
+    }
+    Ok(bytes)
 }
 
 fn install_publication<S: Wyr1BPlatform>(
@@ -3109,6 +3138,11 @@ where
                                             .ok_or(InitError::WrongActivationOrder)?;
                                         parse_driver_retired(&bytes, request)
                                             .map_err(|_| InitError::WrongManifestProfile)?;
+                                        #[cfg(feature = "wyr1d-selector32")]
+                                        return selector32::observe_driver_retired(
+                                            resident, request,
+                                        );
+                                        #[cfg(not(feature = "wyr1d-selector32"))]
                                         rebind_publication(resident, system, waits)
                                     }
                                     #[cfg(not(any(
@@ -3262,7 +3296,13 @@ where
         }
     }
     #[cfg(feature = "wyr1d-selector32")]
-    selector32::poll(resident, system, loader, waits, now_ns)?;
+    {
+        selector32::poll(resident, system, loader, waits, now_ns)?;
+        if selector32::claim_publication_rebind(resident, system.now().map_err(InitError::Native)?)?
+        {
+            rebind_publication(resident, system, waits)?;
+        }
+    }
     Ok(resident.controller.mode())
 }
 
@@ -3835,14 +3875,16 @@ where
         binding,
         transaction_id,
     };
-    let mut bytes = [0u8; wyrmroot_device_proto::controller::INSTALL_BYTES];
-    if encode_controller(request, &mut bytes).is_err() {
-        return Err(if system.close_handle(devmgr_endpoint).is_err() {
-            InitError::Cleanup
-        } else {
-            InitError::WrongManifestProfile
-        });
-    }
+    let bytes = match encode_publication_request(request, publication.service_generation) {
+        Ok(bytes) => bytes,
+        Err(()) => {
+            return Err(if system.close_handle(devmgr_endpoint).is_err() {
+                InitError::Cleanup
+            } else {
+                InitError::WrongManifestProfile
+            });
+        }
+    };
     let transfer = DwHandleTransferV1 {
         handle: devmgr_endpoint,
         requested_rights: wyrmroot_loader::launch::CHILD_CHANNEL_RIGHTS,
@@ -3905,6 +3947,9 @@ mod tests {
         fail_send_at: usize,
         closed: [DwHandle; 4],
         close_count: usize,
+        registry_service_generation: Option<u64>,
+        controller_service_generation: Option<u64>,
+        controller_request: Option<ControllerMessage>,
     }
 
     impl RebindPlatform {
@@ -3918,6 +3963,9 @@ mod tests {
                 fail_send_at: usize::MAX,
                 closed: [DwHandle(0); 4],
                 close_count: 0,
+                registry_service_generation: None,
+                controller_service_generation: None,
+                controller_request: None,
             }
         }
     }
@@ -4002,11 +4050,45 @@ mod tests {
 
         fn send_channel_with_handles(
             &mut self,
-            _channel: DwHandle,
-            _bytes: &[u8],
-            _transfers: &[DwHandleTransferV1],
+            channel: DwHandle,
+            bytes: &[u8],
+            transfers: &[DwHandleTransferV1],
         ) -> Result<(), NativeError> {
             self.send_count += 1;
+            assert_eq!(transfers.len(), 1);
+            assert_eq!(transfers[0].operation, DW_HANDLE_TRANSFER_MOVE);
+            assert_eq!(transfers[0].requested_rights, CHILD_CHANNEL_RIGHTS);
+            assert_eq!(transfers[0].reserved0, 0);
+            assert_eq!(transfers[0].reserved, [0; 2]);
+            if self.send_count == 1 {
+                assert_eq!(channel, DwHandle(40));
+                assert_eq!(transfers[0].handle, DwHandle(50));
+                let parsed = wyrmroot_registry_proto::parse(bytes, 1).unwrap();
+                let wyrmroot_registry_proto::Message::InstallPublication(publication) =
+                    parsed.message
+                else {
+                    panic!("registry must receive publication installation");
+                };
+                self.registry_service_generation = Some(publication.service_generation);
+            } else {
+                assert_eq!(self.send_count, 2);
+                assert_eq!(channel, devmgr().loaded.launch_channel);
+                assert_eq!(transfers[0].handle, DwHandle(51));
+                #[cfg(feature = "wyr1d-selector32")]
+                {
+                    let parsed = wyrmroot_device_proto::controller_v1_1::parse(bytes).unwrap();
+                    self.controller_request = Some(parsed.controller);
+                    self.controller_service_generation = Some(parsed.service_generation);
+                    assert_eq!(
+                        self.controller_service_generation,
+                        self.registry_service_generation
+                    );
+                }
+                #[cfg(not(feature = "wyr1d-selector32"))]
+                {
+                    self.controller_request = Some(parse_controller(bytes).unwrap());
+                }
+            }
             if self.send_count == self.fail_send_at {
                 Err(FAILURE)
             } else {
@@ -4147,6 +4229,39 @@ mod tests {
         assert_eq!(platform.send_count, 2);
         assert_eq!(platform.close_count, 0);
         assert_eq!(devmgr().generation, 7);
+        assert_eq!(platform.registry_service_generation, Some(result.1));
+        assert_eq!(
+            platform.controller_request,
+            Some(ControllerMessage::RebindPublication {
+                supervisor_generation: SupervisorGeneration(7),
+                binding: result.0,
+                transaction_id: result.2,
+            })
+        );
+        #[cfg(feature = "wyr1d-selector32")]
+        assert_eq!(platform.controller_service_generation, Some(result.1));
+        #[cfg(not(feature = "wyr1d-selector32"))]
+        assert_eq!(platform.controller_service_generation, None);
+    }
+
+    #[test]
+    fn selected_initial_publication_request_keeps_issued_namespace() {
+        let request = ControllerMessage::InstallPublication {
+            supervisor_generation: SupervisorGeneration(7),
+            binding: binding(),
+            transaction_id: 9,
+        };
+        let bytes = encode_publication_request(request, 0xC1_0801).unwrap();
+        #[cfg(feature = "wyr1d-selector32")]
+        {
+            let parsed = wyrmroot_device_proto::controller_v1_1::parse(&bytes).unwrap();
+            assert_eq!(parsed.controller, request);
+            assert_eq!(parsed.service_generation, 0xC1_0801);
+            assert_ne!(parsed.service_generation, binding().generation.0);
+            assert!(parse_controller(&bytes).is_err());
+        }
+        #[cfg(not(feature = "wyr1d-selector32"))]
+        assert_eq!(parse_controller(&bytes), Ok(request));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # WYR1-D5 publication-generation handoff
 
 **Date:** 2026-09-04  
-**Status:** WRCS 1.1 codec and consumer contract; consumer integration and live D5 acceptance remain separate gates.
+**Status:** WRCS 1.1 codec and prescribed D5 consumers integrated and host/native checked; live D5 acceptance remains a separate gate.
 
 ## Failure and ownership
 
@@ -99,10 +99,26 @@ adapted; this extension reuses the project's existing codec and stays under
 the crate's `GPL-3.0-or-later` license.
 
 Native system-init issuance/handoff, devmgr resident storage and acceptance,
-connector binding, and received-handle rejection cleanup are separate
-coordinator-owned integration changes. They must preserve the single issued
-generation across the registry and connector paths and prove U2 freshness.
-The codec alone cannot establish those runtime properties.
+connector binding, and received-handle rejection cleanup are now integrated.
+The native initial/rebind encoder receives the same allocated record used for
+registry installation. Devmgr's resident keeps its high-water mark after
+publication loss/retirement, masks the inactive value, and accepts a fresh
+generation only after all binding/transaction/handle-count checks succeed.
+The D5 broker consumes that explicit service identity. Pre-allocation connector
+rejections return an exact request-correlated ERROR and close only the direct
+request endpoint; a disconnected requester does not terminate healthy devmgr.
+
+The consumer regression mock decodes actual registry installation and selected
+WRCS bytes and verifies generation equality, binding, transaction and exact
+MOVE metadata. Additional tests cover initial selected-version encoding,
+zero/stale/reused generations, legacy downgrade, atomic failed acceptance, and
+non-mutating STALE/BUSY/NOT_READY replies with actual wire roundtrips.
+
+The prescribed D5 driver-only replacement refreshes the broker after complete
+retirement. General registry-only replacement while retaining a live driver
+is not covered by this acceptance path: the existing outer republish branch
+does not yet refresh/invalidate the live connector broker. It remains a known
+separate recovery limitation, not a claimed result of these tests.
 
 ## Codec validation
 

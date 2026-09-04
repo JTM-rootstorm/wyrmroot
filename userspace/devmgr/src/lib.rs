@@ -152,6 +152,8 @@ pub struct ResidentController {
     startup_transaction_id: u64,
     last_transaction_id: u64,
     last_binding: Option<RegistryBinding>,
+    // Owner-issued service generation high-water mark survives retirement.
+    publication_service_generation: u64,
     active_binding: Option<RegistryBinding>,
     retired_binding: Option<RegistryBinding>,
     retired_driver_attempt: Option<u64>,
@@ -209,6 +211,7 @@ impl ResidentController {
             startup_transaction_id,
             last_transaction_id: 0,
             last_binding: None,
+            publication_service_generation: 0,
             active_binding: None,
             retired_binding: None,
             retired_driver_attempt: None,
@@ -234,6 +237,14 @@ impl ResidentController {
 
     pub const fn active_binding(&self) -> Option<RegistryBinding> {
         self.active_binding
+    }
+
+    pub const fn publication_service_generation(&self) -> Option<u64> {
+        if self.active_binding.is_some() && self.publication_service_generation != 0 {
+            Some(self.publication_service_generation)
+        } else {
+            None
+        }
     }
 
     pub const fn retired_binding(&self) -> Option<RegistryBinding> {
@@ -698,6 +709,32 @@ impl ResidentController {
         message: ControllerMessage,
         received_handles: u32,
     ) -> Result<ControllerAction, DevmgrError> {
+        // Once an explicit service identity has been installed, a legacy
+        // message cannot silently discard that namespace on replacement.
+        if self.publication_service_generation != 0 {
+            return Err(DevmgrError::StaleControllerTransaction);
+        }
+        self.accept_controller(message, received_handles)
+    }
+
+    pub fn accept_publication(
+        &mut self,
+        message: wyrmroot_device_proto::controller_v1_1::PublicationMessage,
+        received_handles: u32,
+    ) -> Result<ControllerAction, DevmgrError> {
+        if message.service_generation <= self.publication_service_generation {
+            return Err(DevmgrError::StaleControllerTransaction);
+        }
+        let action = self.accept_controller(message.controller, received_handles)?;
+        self.publication_service_generation = message.service_generation;
+        Ok(action)
+    }
+
+    fn accept_controller(
+        &mut self,
+        message: ControllerMessage,
+        received_handles: u32,
+    ) -> Result<ControllerAction, DevmgrError> {
         if received_handles != message.handle_count() {
             return Err(DevmgrError::Controller(
                 ControllerParseError::WrongHandleCount,
@@ -955,6 +992,54 @@ mod tests {
             interrupt_source: 3,
             reserved: 0,
         }
+    }
+
+    #[test]
+    fn publication_install_keeps_service_namespace_and_rebind_high_water() {
+        use wyrmroot_device_proto::controller_v1_1::{self, PublicationMessage};
+        let mut resident =
+            ResidentController::new(prepare_operational(&manifest(), 7).unwrap(), 41).unwrap();
+        let first = PublicationMessage {
+            controller: install(binding(1, 7), 41),
+            service_generation: 0xC1_0801,
+        };
+        let mut wire = [0; controller_v1_1::RECORD_BYTES];
+        controller_v1_1::encode(first, &mut wire).unwrap();
+        resident
+            .accept_publication(controller_v1_1::parse(&wire).unwrap(), 0)
+            .unwrap();
+        assert_eq!(resident.active_binding().unwrap().generation.0, 1);
+        assert_eq!(resident.publication_service_generation(), Some(0xC1_0801));
+        resident.publication_peer_closed().unwrap();
+        assert_eq!(resident.publication_service_generation(), None);
+        let unchanged = resident;
+        let second = PublicationMessage {
+            controller: rebind(binding(1, 8), 42),
+            service_generation: 0xC1_0802,
+        };
+        for generation in [0, 1, 0xC1_0800, 0xC1_0801] {
+            assert!(
+                resident
+                    .accept_publication(
+                        PublicationMessage {
+                            service_generation: generation,
+                            ..second
+                        },
+                        1
+                    )
+                    .is_err()
+            );
+            assert_eq!(resident, unchanged);
+        }
+        assert!(resident.accept(second.controller, 1).is_err());
+        assert!(resident.accept_publication(second, 0).is_err());
+        assert_eq!(resident, unchanged);
+        resident.accept_publication(second, 1).unwrap();
+        assert_eq!(resident.active_binding().unwrap().generation.0, 1);
+        assert_eq!(resident.publication_service_generation(), Some(0xC1_0802));
+        let installed = resident;
+        assert!(resident.accept_publication(second, 1).is_err());
+        assert_eq!(resident, installed);
     }
 
     #[test]

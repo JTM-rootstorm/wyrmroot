@@ -176,6 +176,22 @@ pub enum ConnectorModelError {
 }
 
 impl ConnectorModelError {
+    /// A pre-allocation rejection retains the request's namespace and carries
+    /// no handle. Non-request messages have no connector reply correlation.
+    pub const fn reply(self, request: ConnectorMessage) -> Option<ConnectorMessage> {
+        match request {
+            ConnectorMessage::ConnectStream {
+                publication_generation,
+                client_transaction_id,
+            } => Some(ConnectorMessage::Error {
+                publication_generation,
+                client_transaction_id,
+                code: self.wire_code(),
+            }),
+            _ => None,
+        }
+    }
+
     pub const fn wire_code(self) -> ConnectorErrorCode {
         match self {
             Self::Busy => ConnectorErrorCode::Busy,
@@ -732,6 +748,41 @@ mod tests {
         );
         broker.driver_detached(attach.detached_message()).unwrap();
         assert_eq!(broker.slot(), ConnectorSlot::Empty);
+    }
+
+    #[test]
+    fn negative_connect_replies_preserve_request_identity_and_all_broker_state() {
+        let request = ConnectorMessage::ConnectStream {
+            publication_generation: 0xC1_0801,
+            client_transaction_id: 0xD500_0004,
+        };
+        let mut unavailable = ConnectorBroker::new(None, 100, 200).unwrap();
+        let mut stale = ConnectorBroker::new(Some(driver(1, 1)), 100, 200).unwrap();
+        let mut busy = ConnectorBroker::new(Some(driver(0xC1_0801, 1)), 100, 200).unwrap();
+        attach_once(&mut busy, 0xC1_0801, 7);
+        for (broker, expected) in [
+            (&mut unavailable, ConnectorModelError::NotReady),
+            (&mut stale, ConnectorModelError::Stale),
+            (&mut busy, ConnectorModelError::Busy),
+        ] {
+            let before = *broker;
+            let error = broker.begin_connect(request).unwrap_err();
+            assert_eq!(error, expected);
+            assert_eq!(*broker, before);
+            let reply = error.reply(request).unwrap();
+            assert_eq!(
+                reply,
+                ConnectorMessage::Error {
+                    publication_generation: 0xC1_0801,
+                    client_transaction_id: 0xD500_0004,
+                    code: expected.wire_code(),
+                }
+            );
+            let mut bytes = [0; wyrmroot_device_proto::connector::RECORD_BYTES];
+            wyrmroot_device_proto::connector::encode(reply, &mut bytes).unwrap();
+            assert_eq!(wyrmroot_device_proto::connector::parse(&bytes), Ok(reply));
+            assert_eq!(error.reply(reply), None);
+        }
     }
 
     #[test]

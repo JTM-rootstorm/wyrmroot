@@ -8,6 +8,64 @@ use wyrmroot_device_proto::d5_controller::{
 
 pub const GATE_PATH: &str = "system/bootstrap/wyr1-d5-gate-v1";
 
+/// The two independent retirement facts join before a single rebind claim.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct RetirementJoin {
+    driver: D5DriverIdentity,
+    deadline: u64,
+    retired: bool,
+    released: bool,
+    claimed: bool,
+}
+
+impl RetirementJoin {
+    pub(crate) fn new(driver: D5DriverIdentity, now: u64, timeout: u64) -> Result<Self, Error> {
+        encode(
+            D5ControllerMessage::RequestRetire(driver),
+            &mut [0; RECORD_BYTES],
+        )
+        .map_err(|_| Error)?;
+        let deadline = now.checked_add(timeout).filter(|v| *v > now).ok_or(Error)?;
+        Ok(Self {
+            driver,
+            deadline,
+            retired: false,
+            released: false,
+            claimed: false,
+        })
+    }
+
+    pub(crate) fn observe_retired(&mut self, driver: D5DriverIdentity) -> Result<(), Error> {
+        if driver != self.driver || self.retired || self.claimed {
+            return Err(Error);
+        }
+        self.retired = true;
+        Ok(())
+    }
+
+    pub(crate) fn release_sent(&mut self, driver: D5DriverIdentity) -> Result<(), Error> {
+        if driver != self.driver || self.released || self.claimed {
+            return Err(Error);
+        }
+        self.released = true;
+        Ok(())
+    }
+
+    pub(crate) fn claim_rebind(&mut self, now: u64) -> Result<bool, Error> {
+        if self.claimed {
+            return Ok(false);
+        }
+        if now >= self.deadline {
+            return Err(Error);
+        }
+        if !self.retired || !self.released {
+            return Ok(false);
+        }
+        self.claimed = true;
+        Ok(true)
+    }
+}
+
 pub fn parse_config(bytes: &[u8]) -> Result<u64, Error> {
     let text = core::str::from_utf8(bytes).map_err(|_| Error)?;
     let mut lines = text.lines();
@@ -348,6 +406,53 @@ pub fn ready_line(nonce: u64, tuple: Tuple) -> [u8; 178] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retirement_joins_both_orders_before_one_rebind_and_bounds_missing_facts() {
+        let driver = D5DriverIdentity {
+            device_role_id: 1,
+            bundle_generation: 2,
+            driver_attempt_generation: 3,
+            driver_control_endpoint_id: 4,
+            driver_control_endpoint_generation: 1,
+            launch_transaction_id: 6,
+        };
+        for release_first in [false, true] {
+            let mut join = RetirementJoin::new(driver, 100, 100).unwrap();
+            let wrong = D5DriverIdentity {
+                driver_attempt_generation: 4,
+                ..driver
+            };
+            assert!(join.observe_retired(wrong).is_err());
+            assert!(join.release_sent(wrong).is_err());
+            assert!(!join.claim_rebind(110).unwrap());
+            if release_first {
+                join.release_sent(driver).unwrap();
+            } else {
+                join.observe_retired(driver).unwrap();
+            }
+            // Multiple job/control ticks can run while the other channel's
+            // exact fact has not arrived; none starts synchronous rebind.
+            for now in 111..150 {
+                assert!(!join.claim_rebind(now).unwrap());
+            }
+            if release_first {
+                join.observe_retired(driver).unwrap();
+            } else {
+                join.release_sent(driver).unwrap();
+            }
+            assert!(join.claim_rebind(150).unwrap());
+            assert!(!join.claim_rebind(151).unwrap());
+            assert!(!join.claim_rebind(300).unwrap());
+            assert!(join.observe_retired(driver).is_err());
+            assert!(join.release_sent(driver).is_err());
+        }
+        let mut expired = RetirementJoin::new(driver, 100, 100).unwrap();
+        expired.observe_retired(driver).unwrap();
+        assert!(expired.claim_rebind(200).is_err());
+        assert!(RetirementJoin::new(driver, u64::MAX, 1).is_err());
+        assert!(RetirementJoin::new(driver, 100, 0).is_err());
+    }
+
     fn tuple() -> Tuple {
         Tuple {
             role: 1,
