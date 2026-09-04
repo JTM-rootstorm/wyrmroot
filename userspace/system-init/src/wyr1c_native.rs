@@ -5,6 +5,9 @@
 //! domain custody and delegates only its reduced claim authority.
 
 use super::*;
+#[cfg(feature = "wyr1d-selector32")]
+#[path = "wyr1d_native.rs"]
+mod selector32;
 use crate::wyr1b::{EndpointKind, RegistryTopology};
 #[cfg(feature = "dw1e3-selector31")]
 use crate::wyr1b_native::{InstalledPeer, launch_registry_client_actor};
@@ -13,9 +16,9 @@ use crate::wyr1b_native::{
     launch_registry_until_ready, poison_registry_generation, restart_topology_or_poison,
 };
 use deepwyrm_syscall::{DW_HANDLE_TRANSFER_MOVE, DW_OBJECT_TYPE_CHANNEL, DwHandleTransferV1};
-#[cfg(feature = "dw1e3-selector31")]
+#[cfg(any(feature = "dw1e3-selector31", feature = "wyr1d-selector32"))]
 use wyrmroot_device_proto::SERIAL_CONSOLE_CONNECTOR_PUBLICATION_POLICY;
-#[cfg(not(feature = "dw1e3-selector31"))]
+#[cfg(not(any(feature = "dw1e3-selector31", feature = "wyr1d-selector32")))]
 use wyrmroot_device_proto::SERIAL_CONSOLE_PUBLICATION_POLICY;
 use wyrmroot_device_proto::coordinator::{
     RegistryEndpoint, RegistryEndpointGeneration, RegistryEndpointId, RegistryGeneration,
@@ -23,7 +26,11 @@ use wyrmroot_device_proto::coordinator::{
 };
 #[cfg(feature = "wyr1c6-selector29")]
 use wyrmroot_device_proto::driver_launch::{C6_FACT_BYTES, C6Fact, parse_c6_fact};
-#[cfg(any(feature = "wyr1c6-production", feature = "dw1e3-selector31"))]
+#[cfg(any(
+    feature = "wyr1c6-production",
+    feature = "dw1e3-selector31",
+    feature = "wyr1d-selector32"
+))]
 use wyrmroot_device_proto::driver_launch::{encode_reaped, parse_driver_retired};
 use wyrmroot_device_proto::{
     DriverLaunchRequest,
@@ -148,6 +155,8 @@ struct DriverNativeAttempt {
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ResidentState {
+    #[cfg(feature = "wyr1d-selector32")]
+    d5: Option<selector32::State>,
     resource_domain: Option<ResourceDomainCustody>,
     registry: Option<RegistryNativeAttempt>,
     topology: RegistryTopology,
@@ -457,6 +466,8 @@ where
         }
     };
     let state = ResidentState {
+        #[cfg(feature = "wyr1d-selector32")]
+        d5: Some(selector32::State::new(bootfs)?),
         resource_domain,
         registry: Some(registry),
         topology,
@@ -983,9 +994,9 @@ fn install_publication<S: Wyr1BPlatform>(
     endpoint: DwHandle,
 ) -> Result<(), InitError> {
     let mut bytes = [0u8; 256];
-    #[cfg(feature = "dw1e3-selector31")]
+    #[cfg(any(feature = "dw1e3-selector31", feature = "wyr1d-selector32"))]
     let policy = SERIAL_CONSOLE_CONNECTOR_PUBLICATION_POLICY;
-    #[cfg(not(feature = "dw1e3-selector31"))]
+    #[cfg(not(any(feature = "dw1e3-selector31", feature = "wyr1d-selector32")))]
     let policy = SERIAL_CONSOLE_PUBLICATION_POLICY;
     let size = encode_install_publication(
         RegistryHeader {
@@ -1147,6 +1158,8 @@ fn receive_controller_status<S: InitPlatform>(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DevmgrControlInput {
+    #[cfg(feature = "wyr1d-selector32")]
+    D5Ready(wyrmroot_device_proto::d5_controller::D5DriverIdentity),
     Status(ControllerMessage),
     #[cfg(feature = "wyr1c6-selector29")]
     C6Fact(C6Fact),
@@ -1179,6 +1192,21 @@ fn receive_devmgr_control<S: InitPlatform>(
         return Err(InitError::WrongManifestProfile);
     }
     match &bytes[..4] {
+        #[cfg(feature = "wyr1d-selector32")]
+        b"WDR5" => {
+            if counts.handles != 0 {
+                close_received_native(system, &handles, counts.handles)?;
+                return Err(InitError::WrongManifestProfile);
+            }
+            match wyrmroot_device_proto::d5_controller::parse(&bytes[..counts.bytes])
+                .map_err(|_| InitError::WrongManifestProfile)?
+            {
+                wyrmroot_device_proto::d5_controller::D5ControllerMessage::DriverReady(
+                    identity,
+                ) => Ok(DevmgrControlInput::D5Ready(identity)),
+                _ => Err(InitError::WrongManifestProfile),
+            }
+        }
         #[cfg(feature = "dw1e3-selector31")]
         b"WDE3" => {
             if counts.handles != 0 || counts.bytes != TRANSPORT_EMPTY_FACT_BYTES {
@@ -2772,7 +2800,11 @@ where
     }
 }
 
-#[cfg(any(feature = "wyr1c6-production", feature = "dw1e3-selector31"))]
+#[cfg(any(
+    feature = "wyr1c6-production",
+    feature = "dw1e3-selector31",
+    feature = "wyr1d-selector32"
+))]
 fn acknowledge_driver_reaped<S: InitPlatform>(
     system: &mut S,
     devmgr: ActiveNativeRole,
@@ -2931,6 +2963,12 @@ where
                                 .ok_or(InitError::WrongActivationOrder)?;
                             let devmgr = state.devmgr.ok_or(InitError::WrongActivationOrder)?;
                             match receive_devmgr_control(system, devmgr.loaded.launch_channel) {
+                                #[cfg(feature = "wyr1d-selector32")]
+                                Ok(DevmgrControlInput::D5Ready(identity)) => {
+                                    selector32::driver_ready(
+                                        resident, system, loader, waits, bootfs, identity,
+                                    )
+                                }
                                 #[cfg(feature = "dw1e3-selector31")]
                                 Ok(DevmgrControlInput::TransportEmpty(fact)) => {
                                     let binding = resident
@@ -3049,7 +3087,8 @@ where
                                 Ok(DevmgrControlInput::DriverRetired { bytes }) => {
                                     #[cfg(any(
                                         feature = "wyr1c6-production",
-                                        feature = "dw1e3-selector31"
+                                        feature = "dw1e3-selector31",
+                                        feature = "wyr1d-selector32"
                                     ))]
                                     {
                                         let state = resident
@@ -3065,7 +3104,8 @@ where
                                     }
                                     #[cfg(not(any(
                                         feature = "wyr1c6-production",
-                                        feature = "dw1e3-selector31"
+                                        feature = "dw1e3-selector31",
+                                        feature = "wyr1d-selector32"
                                     )))]
                                     {
                                         let _ = bytes;
@@ -3096,7 +3136,8 @@ where
                             reap_e3a_probe(resident, system, waits, true)?;
                             #[cfg(any(
                                 feature = "wyr1c6-production",
-                                feature = "dw1e3-selector31"
+                                feature = "dw1e3-selector31",
+                                feature = "wyr1d-selector32"
                             ))]
                             {
                                 let state = resident
@@ -3211,6 +3252,8 @@ where
                 .map_err(InitError::Native)??;
         }
     }
+    #[cfg(feature = "wyr1d-selector32")]
+    selector32::poll(resident, system, loader, waits, now_ns)?;
     Ok(resident.controller.mode())
 }
 

@@ -58,6 +58,10 @@ const CONNECTOR_PAIR_RIGHTS: DwRights = DwRights(
 
 #[derive(Clone, Copy)]
 struct StartupAuthorities {
+    #[cfg(feature = "wyr1d-selector32")]
+    selector_control: DwHandle,
+    #[cfg(feature = "wyr1d-selector32")]
+    selector_nonce: u64,
     registry: DwHandle,
     launch: DwHandle,
     registry_generation: u64,
@@ -265,6 +269,10 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
         }
     };
     let authorities = StartupAuthorities {
+        #[cfg(feature = "wyr1d-selector32")]
+        selector_control: bootstrap,
+        #[cfg(feature = "wyr1d-selector32")]
+        selector_nonce: selector_configure(bootstrap)?,
         registry: init_handles[1].handle,
         launch: init_handles[2].handle,
         registry_generation: init.registry_generation,
@@ -330,6 +338,7 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
         let _ = close_handle(bootstrap);
         return Err(11);
     }
+    #[cfg(not(feature = "wyr1d-selector32"))]
     if close_handle(bootstrap).is_err() {
         let _ = cleanup_child_for_exit(authorities, &mut transactions, &mut child);
         let _ = close_handle(serial.endpoint());
@@ -1010,11 +1019,26 @@ fn event_loop(
     mut serial: SerialSession,
     mut child: ChildSession,
 ) -> Result<u32, u32> {
+    #[cfg(feature = "wyr1d-selector32")]
+    let mut capture = wyrmroot_consoled::selector32::Capture::new(authorities.selector_nonce)
+        .map_err(|_| 120u32)?;
     let mut streams = NativeStreams;
     let mut input_pending = Pending::new();
     let mut output_pending = Pending::new();
     let mut next_data = DataClass::Raw;
     loop {
+        #[cfg(feature = "wyr1d-selector32")]
+        if let Some(status) = capture
+            .ready(
+                selector_tuple(child.event),
+                child.job_id,
+                child.event.serial.publication_generation,
+                child.event.serial.connector_client_transaction,
+            )
+            .map_err(|_| 121u32)?
+        {
+            selector_report(authorities.selector_control, status)?;
+        }
         // Fill only an empty retry buffer. Queue removal is committed only
         // after the corresponding native DATA datagram commits.
         reserve_input(model, &mut input_pending)?;
@@ -1221,9 +1245,13 @@ fn event_loop(
                     }
                     let mut payload = [0u8; FAIR_SOURCE_BYTES_PER_TURN];
                     match serial.input.read(&mut streams, &mut payload) {
-                        Ok(count) => model
-                            .stage_serial_input(child.event, &payload[..count])
-                            .map_err(|_| 58u32)?,
+                        Ok(count) => {
+                            #[cfg(feature = "wyr1d-selector32")]
+                            capture.raw_rx(&payload[..count]).map_err(|_| 122u32)?;
+                            model
+                                .stage_serial_input(child.event, &payload[..count])
+                                .map_err(|_| 58u32)?;
+                        }
                         Err(StreamError::WouldBlock) => {}
                         Err(_) => {
                             recover_serial(
@@ -1247,6 +1275,13 @@ fn event_loop(
                     {
                         Ok(written) if written == output_pending.used => {
                             commit_output(model, &output_pending)?;
+                            #[cfg(feature = "wyr1d-selector32")]
+                            if let Some(status) = capture
+                                .raw_tx(&output_pending.bytes[..written])
+                                .map_err(|_| 123u32)?
+                            {
+                                selector_report(authorities.selector_control, status)?;
+                            }
                             output_pending.clear();
                         }
                         Ok(_) => return Err(59),
@@ -1327,6 +1362,10 @@ fn event_loop(
                 let mut payload = [0u8; FAIR_SOURCE_BYTES_PER_TURN];
                 match input.read(&mut streams, &mut payload) {
                     Ok(count) => {
+                        #[cfg(feature = "wyr1d-selector32")]
+                        capture
+                            .child_output(matches!(source, OutputSource::Stderr), &payload[..count])
+                            .map_err(|_| 124u32)?;
                         model
                             .stage_child_output(child.event, source, &payload[..count])
                             .map_err(|_| 60u32)?;
@@ -1349,6 +1388,48 @@ fn event_loop(
             }
         }
     }
+}
+
+#[cfg(feature = "wyr1d-selector32")]
+fn selector_configure(channel: DwHandle) -> Result<u64, u32> {
+    use wyrmroot_consoled::selector32::{CONFIGURE, STATUS_BYTES, Status};
+    wait_readable(channel).map_err(|_| 120u32)?;
+    let mut bytes = [0; STATUS_BYTES];
+    let mut handles = [DwReceivedHandleInfoV1::default(); 1];
+    let counts = receive_channel(channel, &mut bytes, &mut handles).map_err(|_| 120u32)?;
+    if counts.bytes != STATUS_BYTES || counts.handles != 0 {
+        close_received(&handles, counts.handles);
+        return Err(120);
+    }
+    let config = Status::parse(&bytes).map_err(|_| 120u32)?;
+    if config.kind != CONFIGURE {
+        return Err(120);
+    }
+    Ok(config.nonce)
+}
+
+#[cfg(feature = "wyr1d-selector32")]
+fn selector_tuple(event: EventGeneration) -> wyrmroot_consoled::selector32::Tuple {
+    wyrmroot_consoled::selector32::Tuple {
+        role: event.serial.device_role,
+        bundle: event.serial.device_bundle,
+        attempt: event.serial.driver_attempt,
+        endpoint: event.serial.driver_control_endpoint_id,
+        endpoint_generation: event.serial.driver_control_endpoint_generation,
+        transaction: event.serial.attach_transaction,
+        stream: event.serial.stream_generation,
+        console: event.console_generation,
+        child: event.child_generation,
+    }
+}
+
+#[cfg(feature = "wyr1d-selector32")]
+fn selector_report(
+    channel: DwHandle,
+    status: wyrmroot_consoled::selector32::Status,
+) -> Result<(), u32> {
+    let bytes = status.encode().map_err(|_| 125u32)?;
+    send_channel(channel, &bytes, &[]).map_err(|_| 125u32)
 }
 
 fn recover_terminal_child(
@@ -1475,6 +1556,23 @@ fn recover_serial(
     if retired != RecoveryAction::None {
         return Err(72);
     }
+    #[cfg(feature = "wyr1d-selector32")]
+    selector_report(
+        authorities.selector_control,
+        wyrmroot_consoled::selector32::Status {
+            kind: wyrmroot_consoled::selector32::RELEASED,
+            sequence: 0,
+            nonce: authorities.selector_nonce,
+            tuple: selector_tuple(child.event),
+            job: child.job_id,
+            rx: 0,
+            tx: 0,
+            leg: 0,
+            value: 0,
+            publication: old_serial.publication_generation,
+            client_transaction: old_serial.connector_client_transaction,
+        },
+    )?;
     match model
         .complete_serial_cleanup(old_serial, old_console, now_millis()?)
         .map_err(|_| 72u32)?

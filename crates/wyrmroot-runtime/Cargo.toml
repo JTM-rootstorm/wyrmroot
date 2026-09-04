@@ -19,6 +19,7 @@ dw1c-test-evidence = []
 dw1d6-test-evidence = []
 dw1e3-test-evidence = []
 wyr1c6-test-evidence = []
+wyr1d-test-evidence = []
 
 [dependencies]
 deepwyrm-syscall.workspace = true

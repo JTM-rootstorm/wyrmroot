@@ -17,6 +17,8 @@ pub mod wyr1b_native;
 #[cfg(feature = "wyr1c6-selector29")]
 pub mod wyr1c6_gate;
 pub mod wyr1c_native;
+#[cfg(feature = "wyr1d-selector32")]
+pub mod wyr1d_gate;
 
 use crate::evidence::{EvidenceError, EvidenceEvent, EvidenceLog};
 use crate::gate::{GATE_CONFIG_PATH, GateConfig, GateConfigError, parse_gate_config};

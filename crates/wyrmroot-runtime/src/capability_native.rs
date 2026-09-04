@@ -53,8 +53,28 @@ const WYR1B_TEST_EVIDENCE_SYSCALL: DwSyscallId = DwSyscallId(0xffff_ff1b);
 pub const WYR1B_EVIDENCE_RECORD_BYTES: usize = 96;
 #[cfg(feature = "wyr1c6-test-evidence")]
 const WYR1C6_TEST_EVIDENCE_SYSCALL: DwSyscallId = DwSyscallId(0xffff_ff1e);
+#[cfg(feature = "wyr1d-test-evidence")]
+const WYR1D_TEST_EVIDENCE_SYSCALL: DwSyscallId = DwSyscallId(0xffff_ff20);
 #[cfg(feature = "wyr1c6-test-evidence")]
 pub const WYR1C6_EVIDENCE_RECORD_BYTES: usize = 113;
+
+/// Submit one selector32 WRD1 record from the trusted system-init controller.
+#[cfg(feature = "wyr1d-test-evidence")]
+pub fn submit_wyr1d_evidence(record: &[u8; 192]) -> Result<(), NativeError> {
+    require_success(raw::call(
+        WYR1D_TEST_EVIDENCE_SYSCALL,
+        [record.as_ptr() as u64, 192, 0, 0, 0, 0],
+    ))
+}
+
+/// Announce the next host challenge tuple through the private selector32 carrier.
+#[cfg(feature = "wyr1d-test-evidence")]
+pub fn announce_wyr1d_ready(record: &[u8; 178]) -> Result<(), NativeError> {
+    require_success(raw::call(
+        WYR1D_TEST_EVIDENCE_SYSCALL,
+        [record.as_ptr() as u64, 178, 1, 0, 0, 0],
+    ))
+}
 
 /// One controller-owned mapping whose lifetime is explicit and whose writable alias can be
 /// irreversibly removed before publication.

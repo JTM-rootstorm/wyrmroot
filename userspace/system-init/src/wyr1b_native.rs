@@ -593,7 +593,7 @@ fn install_publication<S: Wyr1BPlatform>(
     move_endpoint(system, control, &bytes[..size], registry_endpoint)
 }
 
-fn install_client<S: Wyr1BPlatform>(
+pub(crate) fn install_client<S: Wyr1BPlatform>(
     system: &mut S,
     control: DwHandle,
     grant: EndpointGrant,
@@ -2567,7 +2567,7 @@ where
 }
 
 #[inline(always)]
-fn poll_job_dispatcher<S, L, W>(
+pub(crate) fn poll_job_dispatcher<S, L, W>(
     system: &mut S,
     loader: &mut L,
     waits: &mut W,

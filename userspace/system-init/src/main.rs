@@ -9,6 +9,8 @@ use deepwyrm_syscall::{
     DwWaitResultV1,
 };
 use wyrmroot_bootfs as _;
+#[cfg(feature = "wyr1d-selector32")]
+use wyrmroot_consoled as _;
 use wyrmroot_device_proto as _;
 #[cfg(feature = "dw1e3-selector31")]
 use wyrmroot_dw1e3_com2_test as _;
@@ -16,7 +18,11 @@ use wyrmroot_launch_proto as _;
 use wyrmroot_loader as _;
 use wyrmroot_registry_proto as _;
 use wyrmroot_rrc_manifest as _;
-#[cfg(any(feature = "wyr1c6-selector29", feature = "dw1e3-selector31"))]
+#[cfg(any(
+    feature = "wyr1c6-selector29",
+    feature = "dw1e3-selector31",
+    feature = "wyr1d-selector32"
+))]
 use wyrmroot_runtime::WYR0_I_SUPERVISION_POLICY;
 use wyrmroot_runtime::{
     CapabilityInfo, MappingPlan, NativeError, NativeLoaderPlatform, NativeSupervisionPlatform,
@@ -225,9 +231,17 @@ fn continue_resident(
         let Ok(now) = monotonic_active_now() else {
             return 0xAF01_0003;
         };
-        #[cfg(any(feature = "wyr1c6-selector29", feature = "dw1e3-selector31"))]
+        #[cfg(any(
+            feature = "wyr1c6-selector29",
+            feature = "dw1e3-selector31",
+            feature = "wyr1d-selector32"
+        ))]
         let tick_ns = WYR0_I_SUPERVISION_POLICY.backoff_ns;
-        #[cfg(not(any(feature = "wyr1c6-selector29", feature = "dw1e3-selector31")))]
+        #[cfg(not(any(
+            feature = "wyr1c6-selector29",
+            feature = "dw1e3-selector31",
+            feature = "wyr1d-selector32"
+        )))]
         let tick_ns = 1_000_000_000;
         let Some(deadline) = now.checked_add(tick_ns) else {
             return 0xAF01_0004;

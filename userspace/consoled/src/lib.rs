@@ -2242,3 +2242,5 @@ mod tests {
         assert!(model.validate_invariants());
     }
 }
+#[cfg(feature = "wyr1d-selector32")]
+pub mod selector32;
