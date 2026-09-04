@@ -1,9 +1,13 @@
 //! Bounded typed wrappers for WYR1-D WRST byte streams.
+//!
+//! Native receive closure latches EOF after returning any bytes already copied.
+//! Native send closure is broken output; previously committed packets are
+//! returned as partial progress and must not be retried by the caller.
 
 use deepwyrm_syscall::{
     DW_OBJECT_TYPE_CHANNEL, DW_RIGHT_INSPECT, DW_RIGHT_READ, DW_RIGHT_WAIT, DW_RIGHT_WRITE,
-    DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DW_SIGNAL_WRITABLE, DW_STATUS_WOULD_BLOCK, DwHandle,
-    DwReceivedHandleInfoV1, DwRights, DwSignals,
+    DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DW_SIGNAL_WRITABLE, DW_STATUS_PEER_CLOSED,
+    DW_STATUS_WOULD_BLOCK, DwHandle, DwReceivedHandleInfoV1, DwRights, DwSignals,
 };
 use wyrmroot_loader::launch::{CHILD_CHANNEL_RIGHTS, LaunchError, LaunchProfile, parse_init};
 use wyrmroot_stream_proto::{MAX_PAYLOAD_BYTES, MAX_RECORD_BYTES, decode_data, encode_data};
@@ -172,6 +176,12 @@ impl NativeInput {
             let mut handles = [DwReceivedHandleInfoV1::default(); MAX_RECEIVED_HANDLES];
             let counts = match system.receive(self.endpoint.0, &mut wire, &mut handles) {
                 Ok(counts) => counts,
+                Err(NativeError::Status(status)) if status == DW_STATUS_PEER_CLOSED => {
+                    // Native receive returns PEER_CLOSED only after queued
+                    // datagrams drain. Latch EOF, preserving this call's bytes.
+                    self.eof = true;
+                    continue;
+                }
                 Err(error) => match classify(error) {
                     StreamError::WouldBlock if copied != 0 => return Ok(copied),
                     error => return Err(error),
@@ -263,10 +273,16 @@ impl NativeOutput {
                 .map_err(|_| StreamError::Protocol)?;
             match system
                 .send(self.endpoint.0, &wire[..size])
-                .map_err(classify)
-            {
+                .map_err(|error| match error {
+                    NativeError::Status(status) if status == DW_STATUS_PEER_CLOSED => {
+                        StreamError::Broken
+                    }
+                    error => classify(error),
+                }) {
                 Ok(()) => committed += packet,
-                Err(StreamError::WouldBlock) if committed != 0 => return Ok(committed),
+                Err(StreamError::WouldBlock | StreamError::Broken) if committed != 0 => {
+                    return Ok(committed);
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -368,6 +384,47 @@ mod tests {
             Ok(self.waits.remove(0))
         }
     }
+
+    /// Injects an actual native status after queued receives or committed sends.
+    struct NativeFailureFixture(Fixture, NativeError, usize);
+    impl StreamSystem for NativeFailureFixture {
+        fn receive(
+            &mut self,
+            channel: DwHandle,
+            bytes: &mut [u8],
+            handles: &mut [DwReceivedHandleInfoV1],
+        ) -> Result<ReceiveCounts, NativeError> {
+            if self.0.incoming.is_empty() {
+                self.0.receive_calls += 1;
+                Err(self.1)
+            } else {
+                self.0.receive(channel, bytes, handles)
+            }
+        }
+        fn send(&mut self, channel: DwHandle, bytes: &[u8]) -> Result<(), NativeError> {
+            if self.0.sends.len() < self.2 {
+                self.0.send(channel, bytes)
+            } else {
+                self.0.send_attempts += 1;
+                Err(self.1)
+            }
+        }
+        fn close(&mut self, handle: DwHandle) -> Result<(), NativeError> {
+            self.0.close(handle)
+        }
+        fn wait(
+            &mut self,
+            channel: DwHandle,
+            signals: DwSignals,
+        ) -> Result<DwSignals, NativeError> {
+            self.0.wait(channel, signals)
+        }
+    }
+
+    fn closed_fixture(inner: Fixture) -> NativeFailureFixture {
+        NativeFailureFixture(inner, NativeError::Status(DW_STATUS_PEER_CLOSED), 0)
+    }
+
     fn endpoint() -> StreamEndpoint {
         StreamEndpoint::from_validated_handle(DwHandle(9)).unwrap()
     }
@@ -411,6 +468,67 @@ mod tests {
         assert_eq!(input.read(&mut system, &mut rest), Ok(4));
         assert_eq!(&rest[..4], b"cdef");
     }
+
+    #[test]
+    fn closed_empty_receive_latches_eof_without_repeated_native_calls() {
+        let mut system = closed_fixture(Fixture::default());
+        let mut input = NativeInput::new(endpoint());
+        assert_eq!(input.read(&mut system, &mut []), Ok(0));
+        assert_eq!(system.0.receive_calls, 0);
+        assert_eq!(input.read(&mut system, &mut [0]), Err(StreamError::Eof));
+        assert_eq!(system.0.receive_calls, 1);
+        assert_eq!(input.read(&mut system, &mut [0]), Err(StreamError::Eof));
+        assert_eq!(input.read(&mut system, &mut []), Ok(0));
+        assert_eq!(system.0.receive_calls, 1);
+    }
+
+    #[test]
+    fn closed_receive_returns_final_short_payload_before_eof() {
+        let mut system = closed_fixture(Fixture {
+            incoming: vec![record(b"final")],
+            ..Fixture::default()
+        });
+        let mut input = NativeInput::new(endpoint());
+        let mut bytes = [0; 16];
+        assert_eq!(input.read(&mut system, &mut bytes), Ok(5));
+        assert_eq!(&bytes[..5], b"final");
+        assert_eq!(system.0.receive_calls, 2);
+        assert_eq!(input.read(&mut system, &mut bytes), Err(StreamError::Eof));
+        assert_eq!(system.0.receive_calls, 2);
+    }
+
+    #[test]
+    fn closed_receive_drains_retained_and_multiple_queued_records_before_eof() {
+        for first_read in [1, 4, 5, 8] {
+            let mut system = closed_fixture(Fixture {
+                incoming: vec![record(b"abcd"), record(b""), record(b"efgh")],
+                waits: vec![DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0)],
+                ..Fixture::default()
+            });
+            let mut input = NativeInput::new(endpoint());
+            input.wait_readable(&mut system).unwrap();
+            let mut first = [0; 8];
+            assert_eq!(
+                input.read(&mut system, &mut first[..first_read]),
+                Ok(first_read)
+            );
+            assert_eq!(&first[..first_read], &b"abcdefgh"[..first_read]);
+            if first_read < 4 {
+                assert_eq!(system.0.receive_calls, 1);
+            }
+            let mut rest = [0; 16];
+            if first_read < 8 {
+                assert_eq!(input.read(&mut system, &mut rest), Ok(8 - first_read));
+                assert_eq!(&rest[..8 - first_read], &b"abcdefgh"[first_read..]);
+            }
+            assert_eq!(input.read(&mut system, &mut rest), Err(StreamError::Eof));
+            assert_eq!(system.0.receive_calls, 4);
+            assert_eq!(input.read(&mut system, &mut rest), Err(StreamError::Eof));
+            assert_eq!(system.0.receive_calls, 4);
+            assert!(system.0.waits.is_empty());
+        }
+    }
+
     #[test]
     fn output_packets_all_input_and_returns_progress_before_would_block() {
         let mut system = Fixture {
@@ -453,6 +571,84 @@ mod tests {
         );
         system.block_send_at = Some(system.send_attempts + 2);
         assert_eq!(output.write(&mut system, &[7; 2049]), Ok(1024));
+    }
+
+    #[test]
+    fn native_send_closed_matches_wait_closed_without_committing_bytes() {
+        let mut system = closed_fixture(Fixture {
+            waits: vec![DW_SIGNAL_PEER_CLOSED],
+            ..Fixture::default()
+        });
+        let mut output = NativeOutput::new(endpoint());
+        assert_eq!(output.write(&mut system, &[]), Ok(0));
+        assert_eq!(system.0.send_attempts, 0);
+        assert_eq!(output.write(&mut system, b"abc"), Err(StreamError::Broken));
+        assert_eq!(
+            output.write_wait(&mut system, b"abc"),
+            Err(StreamError::Broken)
+        );
+        assert_eq!(output.wait_writable(&mut system), Err(StreamError::Broken));
+        assert_eq!(system.0.send_attempts, 2);
+        assert!(system.0.sends.is_empty());
+        assert!(system.0.waits.is_empty());
+    }
+
+    #[test]
+    fn native_send_closed_returns_committed_packet_once_before_broken_suffix() {
+        let mut system = closed_fixture(Fixture::default());
+        system.2 = 1;
+        let mut output = NativeOutput::new(endpoint());
+        let bytes = [7; MAX_PAYLOAD_BYTES + 1];
+        assert_eq!(output.write(&mut system, &bytes), Ok(MAX_PAYLOAD_BYTES));
+        assert_eq!(
+            output.write(&mut system, &bytes[MAX_PAYLOAD_BYTES..]),
+            Err(StreamError::Broken)
+        );
+        assert_eq!(system.0.sends.len(), 1);
+        assert_eq!(
+            decode_data(&system.0.sends[0]).unwrap().payload(),
+            &bytes[..MAX_PAYLOAD_BYTES]
+        );
+        assert_eq!(system.0.send_attempts, 3);
+    }
+
+    #[test]
+    fn blocking_write_reports_close_after_progress_without_replaying_packets() {
+        let mut system = closed_fixture(Fixture {
+            waits: vec![DW_SIGNAL_PEER_CLOSED],
+            ..Fixture::default()
+        });
+        system.2 = 1;
+        let mut output = NativeOutput::new(endpoint());
+        assert_eq!(
+            output.write_wait(&mut system, &[7; MAX_PAYLOAD_BYTES + 1]),
+            Err(StreamError::Broken)
+        );
+        assert_eq!(system.0.send_attempts, 2);
+        assert_eq!(system.0.sends.len(), 1);
+        assert!(system.0.waits.is_empty());
+    }
+
+    #[test]
+    fn unrelated_native_errors_keep_their_original_stream_classification() {
+        let error = NativeError::Status(deepwyrm_syscall::DW_STATUS_TIMED_OUT);
+        let mut system = NativeFailureFixture(Fixture::default(), error, 0);
+        let mut input = NativeInput::new(endpoint());
+        assert_eq!(
+            input.read(&mut system, &mut [0]),
+            Err(StreamError::Native(error))
+        );
+        assert!(!input.eof);
+        let mut output = NativeOutput::new(endpoint());
+        assert_eq!(
+            output.write(&mut system, b"abc"),
+            Err(StreamError::Native(error))
+        );
+        assert_eq!(
+            output.write_wait(&mut system, b"abc"),
+            Err(StreamError::Native(error))
+        );
+        assert!(system.0.sends.is_empty());
     }
     #[test]
     fn peer_close_is_explicit_and_readable_precedes_eof() {
