@@ -1250,7 +1250,11 @@ fn event_loop(
                     match serial.input.read(&mut streams, &mut payload) {
                         Ok(count) => {
                             #[cfg(feature = "wyr1d-selector32")]
-                            capture.raw_rx(&payload[..count]).map_err(|_| 122u32)?;
+                            if let Some(status) =
+                                capture.raw_rx(&payload[..count]).map_err(|_| 122u32)?
+                            {
+                                selector_report(authorities.selector_control, status)?;
+                            }
                             model
                                 .stage_serial_input(child.event, &payload[..count])
                                 .map_err(|_| 58u32)?;
@@ -1315,6 +1319,13 @@ fn event_loop(
                     {
                         Ok(written) if written == input_pending.used => {
                             commit_input(model, &input_pending)?;
+                            #[cfg(feature = "wyr1d-selector32")]
+                            if let Some(status) = capture
+                                .stdin_commit(&input_pending.bytes[..written])
+                                .map_err(|_| 125u32)?
+                            {
+                                selector_report(authorities.selector_control, status)?;
+                            }
                             input_pending.clear();
                         }
                         Ok(_) => return Err(59),
@@ -1366,9 +1377,12 @@ fn event_loop(
                 match input.read(&mut streams, &mut payload) {
                     Ok(count) => {
                         #[cfg(feature = "wyr1d-selector32")]
-                        capture
+                        if let Some(status) = capture
                             .child_output(matches!(source, OutputSource::Stderr), &payload[..count])
-                            .map_err(|_| 124u32)?;
+                            .map_err(|_| 124u32)?
+                        {
+                            selector_report(authorities.selector_control, status)?;
+                        }
                         model
                             .stage_child_output(child.event, source, &payload[..count])
                             .map_err(|_| 60u32)?;

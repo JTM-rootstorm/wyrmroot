@@ -771,6 +771,7 @@ impl ConsoleModel {
         self.state = ConnectionState::Active;
         self.serial_window.clear();
         self.clear_volatile();
+        self.input_normalizer.reset();
         Ok(console)
     }
 
@@ -1049,6 +1050,7 @@ impl ConsoleModel {
         self.child_failure_at = None;
         self.serial_cleanup = false;
         self.serial_invalidated = true;
+        self.input_normalizer.reset();
         self.stable = None;
         self.clear_reservations();
         if self.child.is_some() && self.state == ConnectionState::Active {
@@ -1419,13 +1421,16 @@ impl ConsoleModel {
         self.serial_invalidated = false;
         self.state = ConnectionState::Reconnecting;
         self.clear_volatile();
+        self.input_normalizer.reset();
         Ok(RecoveryAction::RetrySerialAt(retry))
     }
     fn clear_volatile(&mut self) {
         self.input.clear();
         self.stdout.clear();
         self.stderr.clear();
-        self.input_normalizer.reset();
+        // Input CR/LF state belongs to the healthy serial/console generation.
+        // Child replacement clears staged bytes and child-output transforms,
+        // but a delayed LF must still pair with an already consumed raw CR.
         self.stdout_normalizer.reset();
         self.stderr_normalizer.reset();
         self.next_output = OutputSource::Stdout;
@@ -1655,6 +1660,72 @@ mod tests {
         let child = model.commit_child_launch(&mut transaction, 92).unwrap();
         assert_eq!(child.ids.child_launch, 91);
         assert_eq!(child.ids.child_job, 92);
+    }
+
+    #[test]
+    fn input_crlf_state_survives_child_replacement_and_aborted_launch() {
+        for (terminal, abort) in [(false, false), (false, true), (true, false), (true, true)] {
+            let (mut model, old) = live();
+            model.stage_serial_input(old, b"exit\r").unwrap();
+            let mut bytes = [0; 32];
+            let input = model.reserve_child_stdin(&mut bytes).unwrap().unwrap();
+            assert_eq!(&bytes[..input.length()], b"exit\n");
+            model.commit_child_stdin(input).unwrap();
+            model
+                .stage_child_output(old, OutputSource::Stdout, b"\r")
+                .unwrap();
+            if terminal {
+                model.child_terminal(old, 1).unwrap();
+            } else {
+                model.child_peer_closed(old, StreamKind::Stdout, 1).unwrap();
+                model.child_terminated(old, 1).unwrap();
+            }
+            model.child_streams_closed(old, 2).unwrap();
+            assert_eq!(model.child_reaped(old, 3), Ok(RecoveryAction::ReplaceChild));
+            if abort {
+                let transaction = model.begin_child_launch(101).unwrap();
+                let token = model.abort_child_launch(transaction).unwrap();
+                model
+                    .complete_abort_child_launch(&token, cleanup_evidence())
+                    .unwrap();
+            }
+            let replacement = launch(&mut model);
+            assert_eq!(replacement.serial, old.serial);
+            model.stage_serial_input(replacement, b"\n").unwrap();
+            assert_eq!(model.reserve_child_stdin(&mut bytes), Ok(None));
+            model.stage_serial_input(replacement, b"ping\r\n").unwrap();
+            let input = model.reserve_child_stdin(&mut bytes).unwrap().unwrap();
+            assert_eq!(&bytes[..input.length()], b"ping\n");
+            model
+                .stage_child_output(replacement, OutputSource::Stdout, b"\n")
+                .unwrap();
+            let output = model.reserve_serial_tx(&mut bytes).unwrap().unwrap();
+            assert_eq!(&bytes[..output.length()], b"\r\n");
+        }
+    }
+
+    #[test]
+    fn serial_replacement_resets_input_crlf_state() {
+        let (mut model, old) = live();
+        model.stage_serial_input(old, b"exit\r").unwrap();
+        let snapshot = model.snapshot();
+        close_serial(&mut model, 1);
+        model.child_terminated(old, 2).unwrap();
+        model.child_streams_closed(old, 3).unwrap();
+        model.child_reaped(old, 4).unwrap();
+        model
+            .complete_serial_cleanup(
+                snapshot.serial.unwrap(),
+                snapshot.console_generation.unwrap(),
+                5,
+            )
+            .unwrap();
+        connect(&mut model, 2, 30);
+        let replacement = launch(&mut model);
+        model.stage_serial_input(replacement, b"\n").unwrap();
+        let mut bytes = [0; 8];
+        let input = model.reserve_child_stdin(&mut bytes).unwrap().unwrap();
+        assert_eq!(&bytes[..input.length()], b"\n");
     }
     #[test]
     fn exact_preflight_admits_normalized_one_byte_when_one_slot_remains() {

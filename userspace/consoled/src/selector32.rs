@@ -221,7 +221,8 @@ pub fn response(nonce: u64, leg: u64, tuple: Tuple) -> ([u8; 23], usize) {
 }
 
 /// Each byte is checked when crossing its actual native stream boundary.
-/// Reporting waits for both the channel-specific child payload and raw TX commit.
+/// Reporting joins full raw RX, committed normalized stdin, channel-specific
+/// child output, and raw TX without imposing an order between those streams.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Capture {
     nonce: u64,
@@ -230,9 +231,13 @@ pub struct Capture {
     job: u64,
     leg: u64,
     rx: usize,
+    stdin: usize,
     child: usize,
     tx: usize,
     exit: usize,
+    exit_stdin: usize,
+    awaiting_ready: bool,
+    pending_ready: Option<(Tuple, u64, u64, u64)>,
     publication: u64,
     client_transaction: u64,
 }
@@ -249,9 +254,13 @@ impl Capture {
             job: 0,
             leg: 0,
             rx: 0,
+            stdin: 0,
             child: 0,
             tx: 0,
             exit: 0,
+            exit_stdin: 0,
+            awaiting_ready: false,
+            pending_ready: None,
             publication: 0,
             client_transaction: 0,
         })
@@ -264,23 +273,48 @@ impl Capture {
         publication: u64,
         client_transaction: u64,
     ) -> Result<Option<Status>, Error> {
+        if !tuple.complete() || job == 0 || publication == 0 || client_transaction == 0 {
+            return Err(Error);
+        }
         if tuple == self.tuple && job == self.job {
-            return Ok(None);
+            return if publication == self.publication
+                && client_transaction == self.client_transaction
+            {
+                Ok(None)
+            } else {
+                Err(Error)
+            };
         }
         let leg = if self.sequence == 0 {
             1
-        } else if self.leg == 3
+        } else if self.awaiting_ready
+            && self.leg == 3
             && tuple.stream != self.tuple.stream
             && tuple.console > self.tuple.console
             && tuple.child > self.tuple.child
         {
             3
-        } else if self.leg == 4
-            && tuple.stream == self.tuple.stream
-            && tuple.console == self.tuple.console
+        } else if self.awaiting_ready
+            && self.leg == 4
+            && tuple
+                == (Tuple {
+                    child: tuple.child,
+                    ..self.tuple
+                })
             && tuple.child > self.tuple.child
-            && self.exit == 6
+            && publication == self.publication
+            && client_transaction == self.client_transaction
+            && self.exit >= 5
+            && self.exit_stdin == 5
         {
+            let pending = (tuple, job, publication, client_transaction);
+            if self.pending_ready.is_some_and(|old| old != pending) {
+                return Err(Error);
+            }
+            if self.exit != 6 || self.exit_stdin != 5 {
+                self.pending_ready = Some(pending);
+                return Ok(None);
+            }
             4
         } else {
             return Err(Error);
@@ -291,9 +325,13 @@ impl Capture {
         self.publication = publication;
         self.client_transaction = client_transaction;
         self.rx = 0;
+        self.stdin = 0;
         self.child = 0;
         self.tx = 0;
         self.exit = 0;
+        self.exit_stdin = 0;
+        self.awaiting_ready = false;
+        self.pending_ready = None;
         self.sequence = self.sequence.checked_add(1).ok_or(Error)?;
         let status = Status {
             kind: READY,
@@ -314,34 +352,88 @@ impl Capture {
         Ok(Some(status))
     }
 
-    pub fn raw_rx(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        if self.leg == 4 && self.tx != 0 {
-            return compare(b"exit\r\n", &mut self.exit, bytes);
+    pub fn raw_rx(&mut self, mut bytes: &[u8]) -> Result<Option<Status>, Error> {
+        if self.awaiting_ready && self.leg == 4 {
+            compare(b"exit\r\n", &mut self.exit, bytes)?;
+            return self.try_pending_ready();
         }
+        if bytes.is_empty() {
+            return Err(Error);
+        }
+        let mut observed = None;
+        while !bytes.is_empty() {
+            self.require_active()?;
+            let (mut expected, len) = response(self.nonce, self.leg, self.tuple);
+            if self.leg != 2 {
+                expected[..5].copy_from_slice(b"ping ");
+            }
+            let count = core::cmp::min(len.checked_sub(self.rx).ok_or(Error)?, bytes.len());
+            if count == 0 {
+                return Err(Error);
+            }
+            compare(&expected[..len], &mut self.rx, &bytes[..count])?;
+            bytes = &bytes[count..];
+            if let Some(status) = self.try_observed()?
+                && observed.replace(status).is_some()
+            {
+                return Err(Error);
+            }
+        }
+        Ok(observed)
+    }
+
+    pub fn stdin_commit(&mut self, bytes: &[u8]) -> Result<Option<Status>, Error> {
+        if self.awaiting_ready && self.leg == 4 {
+            compare(b"exit\n", &mut self.exit_stdin, bytes)?;
+            return self.try_pending_ready();
+        }
+        self.require_active()?;
         let (mut expected, len) = response(self.nonce, self.leg, self.tuple);
         if self.leg != 2 {
             expected[..5].copy_from_slice(b"ping ");
         }
-        compare(&expected[..len], &mut self.rx, bytes)
+        expected[len - 2] = b'\n';
+        compare(&expected[..len - 1], &mut self.stdin, bytes)?;
+        self.try_observed()
     }
 
-    pub fn child_output(&mut self, stderr: bool, bytes: &[u8]) -> Result<(), Error> {
+    fn try_pending_ready(&mut self) -> Result<Option<Status>, Error> {
+        let Some((tuple, job, publication, client)) = self.pending_ready else {
+            return Ok(None);
+        };
+        self.ready(tuple, job, publication, client)
+    }
+
+    fn require_active(&self) -> Result<(), Error> {
+        if self.awaiting_ready || !(1..=4).contains(&self.leg) {
+            Err(Error)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn child_output(&mut self, stderr: bool, bytes: &[u8]) -> Result<Option<Status>, Error> {
+        self.require_active()?;
         if stderr != (self.leg == 2) {
             return Err(Error);
         }
         let (mut expected, len) = response(self.nonce, self.leg, self.tuple);
         expected[len - 2] = b'\n';
-        compare(&expected[..len - 1], &mut self.child, bytes)
+        compare(&expected[..len - 1], &mut self.child, bytes)?;
+        self.try_observed()
     }
 
     pub fn raw_tx(&mut self, bytes: &[u8]) -> Result<Option<Status>, Error> {
+        self.require_active()?;
         let (expected, len) = response(self.nonce, self.leg, self.tuple);
         compare(&expected[..len], &mut self.tx, bytes)?;
-        if self.tx != len {
+        self.try_observed()
+    }
+
+    fn try_observed(&mut self) -> Result<Option<Status>, Error> {
+        let (expected, len) = response(self.nonce, self.leg, self.tuple);
+        if self.tx != len || self.rx != len || self.stdin != len - 1 || self.child != len - 1 {
             return Ok(None);
-        }
-        if self.rx != len || self.child != len - 1 {
-            return Err(Error);
         }
         self.sequence = self.sequence.checked_add(1).ok_or(Error)?;
         let status = Status {
@@ -358,8 +450,10 @@ impl Capture {
             client_transaction: self.client_transaction,
         };
         self.leg += 1;
+        self.awaiting_ready = self.leg != 2;
         if self.leg == 2 {
             self.rx = 0;
+            self.stdin = 0;
             self.child = 0;
             self.tx = 0;
         }
@@ -415,6 +509,8 @@ mod tests {
         input[..5].copy_from_slice(b"ping ");
         c.raw_rx(&input[..5]).unwrap();
         c.raw_rx(&input[5..len]).unwrap();
+        input[len - 2] = b'\n';
+        c.stdin_commit(&input[..len - 1]).unwrap();
         let mut child = response;
         child[len - 2] = b'\n';
         assert!(c.child_output(true, &child[..len - 1]).is_err());
@@ -426,6 +522,29 @@ mod tests {
         assert!(c.raw_rx(b"stale").is_err());
     }
 
+    #[test]
+    fn response_commit_can_precede_the_final_raw_command_lf() {
+        let mut capture = Capture::new(42).unwrap();
+        let t = tuple();
+        capture.ready(t, 1, 10, 11).unwrap();
+        let (response, len) = response(42, 1, t);
+        let mut command = response;
+        command[..5].copy_from_slice(b"ping ");
+        capture.raw_rx(&command[..len - 1]).unwrap();
+        let mut stdin = command;
+        stdin[len - 2] = b'\n';
+        capture.stdin_commit(&stdin[..len - 1]).unwrap();
+        let mut child = response;
+        child[len - 2] = b'\n';
+        capture.child_output(false, &child[..len - 1]).unwrap();
+        assert_eq!(capture.raw_tx(&response[..len]), Ok(None));
+        let observed = capture.raw_rx(&command[len - 1..len]).unwrap().unwrap();
+        assert_eq!(observed.kind, OBSERVED);
+        assert_eq!(observed.leg, 1);
+        assert_eq!(observed.value, fnv(&response[..len]));
+        assert!(capture.raw_rx(b"\n").is_err());
+    }
+
     fn round_trip(capture: &mut Capture, leg: u64, tuple: Tuple) -> Status {
         let (response, len) = response(42, leg, tuple);
         let mut input = response;
@@ -434,11 +553,144 @@ mod tests {
         }
         capture.raw_rx(&input[..len - 1]).unwrap();
         capture.raw_rx(&input[len - 1..len]).unwrap();
+        input[len - 2] = b'\n';
+        capture.stdin_commit(&input[..len - 1]).unwrap();
         let mut child = response;
         child[len - 2] = b'\n';
         capture.child_output(leg == 2, &child[..len - 1]).unwrap();
         assert!(capture.raw_tx(&response[..len - 1]).unwrap().is_none());
         capture.raw_tx(&response[len - 1..len]).unwrap().unwrap()
+    }
+
+    fn at_leg(leg: u64) -> (Capture, Tuple) {
+        let first = tuple();
+        let mut c = Capture::new(42).unwrap();
+        c.ready(first, 1, 10, 11).unwrap();
+        if leg == 1 {
+            return (c, first);
+        }
+        round_trip(&mut c, 1, first);
+        if leg == 2 {
+            return (c, first);
+        }
+        round_trip(&mut c, 2, first);
+        let second = Tuple {
+            attempt: first.attempt + 1,
+            endpoint: first.endpoint + 1,
+            transaction: first.transaction + 1,
+            stream: first.stream + 1,
+            console: first.console + 1,
+            child: first.child + 1,
+            ..first
+        };
+        c.ready(second, 2, 12, 13).unwrap();
+        if leg == 3 {
+            return (c, second);
+        }
+        round_trip(&mut c, 3, second);
+        c.raw_rx(b"exit\r\n").unwrap();
+        c.stdin_commit(b"exit\n").unwrap();
+        let third = Tuple {
+            child: second.child + 1,
+            ..second
+        };
+        c.ready(third, 3, 12, 13).unwrap();
+        (c, third)
+    }
+
+    #[test]
+    fn every_leg_joins_from_whichever_stream_fact_completes_last() {
+        for leg in 1..=4 {
+            for last in 0..4 {
+                let (mut c, t) = at_leg(leg);
+                let (response, len) = response(42, leg, t);
+                let mut raw = response;
+                if leg != 2 {
+                    raw[..5].copy_from_slice(b"ping ");
+                }
+                let mut stdin = raw;
+                stdin[len - 2] = b'\n';
+                let mut child = response;
+                child[len - 2] = b'\n';
+                assert_eq!(c.raw_rx(&raw[..len - 1]), Ok(None));
+                let mut result = None;
+                for event in (0..4)
+                    .filter(|event| *event != last)
+                    .chain(core::iter::once(last))
+                {
+                    let next = match event {
+                        0 => c.raw_rx(&raw[len - 1..len]),
+                        1 => c.stdin_commit(&stdin[..len - 1]),
+                        2 => c.child_output(leg == 2, &child[..len - 1]),
+                        _ => c.raw_tx(&response[..len]),
+                    }
+                    .unwrap();
+                    if event != last {
+                        assert_eq!(next, None);
+                    } else {
+                        result = next;
+                    }
+                }
+                let status = result.unwrap();
+                assert_eq!(status.leg, leg);
+                assert_eq!(status.value, fnv(&response[..len]));
+                assert!(c.raw_tx(&response[..len]).is_err());
+                assert!(c.child_output(leg == 2, &child[..len - 1]).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn delayed_ping_lf_and_next_err_command_can_share_one_raw_record() {
+        for next_prefix in 1..=22 {
+            let (mut c, t) = at_leg(1);
+            let (pong, len) = response(42, 1, t);
+            let mut command = pong;
+            command[..5].copy_from_slice(b"ping ");
+            c.raw_rx(&command[..len - 1]).unwrap();
+            command[len - 2] = b'\n';
+            c.stdin_commit(&command[..len - 1]).unwrap();
+            let mut child = pong;
+            child[len - 2] = b'\n';
+            c.child_output(false, &child[..len - 1]).unwrap();
+            assert_eq!(c.raw_tx(&pong[..len]), Ok(None));
+            let (err, err_len) = response(42, 2, t);
+            let mut joined = [0; 23];
+            joined[0] = b'\n';
+            joined[1..1 + next_prefix].copy_from_slice(&err[..next_prefix]);
+            let first = c.raw_rx(&joined[..1 + next_prefix]).unwrap().unwrap();
+            assert_eq!(first.leg, 1);
+            if next_prefix < err_len {
+                assert_eq!(c.raw_rx(&err[next_prefix..err_len]), Ok(None));
+            }
+            let mut normalized = err;
+            normalized[err_len - 2] = b'\n';
+            assert_eq!(c.stdin_commit(&normalized[..err_len - 1]), Ok(None));
+            assert_eq!(c.child_output(true, &normalized[..err_len - 1]), Ok(None));
+            assert_eq!(c.raw_tx(&err[..err_len]).unwrap().unwrap().leg, 2);
+        }
+    }
+
+    #[test]
+    fn exit_cr_child_replacement_and_final_lf_join_ready_once() {
+        let (mut c, second) = at_leg(3);
+        round_trip(&mut c, 3, second);
+        c.raw_rx(b"exit\r").unwrap();
+        c.stdin_commit(b"exit\n").unwrap();
+        let third = Tuple {
+            child: second.child + 1,
+            ..second
+        };
+        assert_eq!(c.ready(third, 3, 12, 13), Ok(None));
+        assert_eq!(c.ready(third, 3, 12, 13), Ok(None));
+        assert!(c.ready(third, 4, 12, 13).is_err());
+        assert!(c.raw_rx(b"x").is_err());
+        let ready = c.raw_rx(b"\n").unwrap().unwrap();
+        assert_eq!(ready.kind, READY);
+        assert_eq!(ready.sequence, 6);
+        assert_eq!(ready.tuple, third);
+        assert_eq!(c.ready(third, 3, 12, 13), Ok(None));
+        assert_eq!(round_trip(&mut c, 4, third).sequence, 7);
     }
 
     #[test]
@@ -472,6 +724,7 @@ mod tests {
         assert!(capture.ready(third, 3, 12, 13).is_err());
         capture.raw_rx(b"ex").unwrap();
         capture.raw_rx(b"it\r\n").unwrap();
+        capture.stdin_commit(b"exit\n").unwrap();
         assert_eq!(
             capture.ready(third, 3, 12, 13).unwrap().unwrap().sequence,
             6
