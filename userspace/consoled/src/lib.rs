@@ -248,6 +248,27 @@ pub struct LaunchCleanupToken {
     cleanup: LaunchCleanup,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LaunchCleanupEvidence {
+    pub consoled_peers_closed: [bool; 3],
+    pub unmoved_child_peers_closed: [bool; 3],
+    pub moved_child_peers_rejected: [bool; 3],
+}
+
+impl LaunchCleanupEvidence {
+    pub const fn complete(self) -> bool {
+        self.consoled_peers_closed[0]
+            && self.consoled_peers_closed[1]
+            && self.consoled_peers_closed[2]
+            && self.unmoved_child_peers_closed[0]
+            && self.unmoved_child_peers_closed[1]
+            && self.unmoved_child_peers_closed[2]
+            && self.moved_child_peers_rejected[0]
+            && self.moved_child_peers_rejected[1]
+            && self.moved_child_peers_rejected[2]
+    }
+}
+
 impl LaunchCleanupToken {
     pub const fn cleanup(&self) -> &LaunchCleanup {
         &self.cleanup
@@ -332,6 +353,27 @@ const fn child_cleanup(moved: bool) -> CleanupDisposition {
     } else {
         CleanupDisposition::CloseUnmovedChildPeer
     }
+}
+
+fn evidence_matches_cleanup(cleanup: &LaunchCleanup, evidence: LaunchCleanupEvidence) -> bool {
+    let mut index = 0;
+    while index < 6 {
+        let entry = cleanup.entries[index];
+        let satisfied = match entry.disposition {
+            CleanupDisposition::CloseConsoledPeer => evidence.consoled_peers_closed[index],
+            CleanupDisposition::CloseUnmovedChildPeer => {
+                evidence.unmoved_child_peers_closed[index - 3]
+            }
+            CleanupDisposition::RevokeMovedChildPeerFromLaunch => {
+                evidence.moved_child_peers_rejected[index - 3]
+            }
+        };
+        if !satisfied {
+            return false;
+        }
+        index += 1;
+    }
+    true
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -570,6 +612,11 @@ pub struct ConsoleSnapshot {
     pub stderr_queued: usize,
     pub child_failures: usize,
     pub serial_failures: usize,
+    pub serial_invalidated: bool,
+    pub pending_launch: bool,
+    pub pending_launch_cleanup: bool,
+    pub child_restart_exhausted: bool,
+    pub serial_restart_exhausted: bool,
     pub last_failure: Option<ModelError>,
 }
 
@@ -590,12 +637,16 @@ pub struct ConsoleModel {
     pending_stdin: Option<Reservation>,
     pending_tx: Option<Reservation>,
     pending_launch: Option<LaunchIdentity>,
+    pending_launch_cleanup: Option<LaunchIdentity>,
     pending_connect: Option<ConnectRequest>,
     child_window: RestartWindow,
     serial_window: RestartWindow,
     stable: Option<(ReadyToken, u64)>,
     ready_observed: Option<EventGeneration>,
     serial_cleanup: bool,
+    serial_invalidated: bool,
+    child_exhausted: bool,
+    serial_exhausted: bool,
     child_terminated: bool,
     child_reaped: bool,
     child_failure_at: Option<u64>,
@@ -636,12 +687,16 @@ impl ConsoleModel {
             pending_stdin: None,
             pending_tx: None,
             pending_launch: None,
+            pending_launch_cleanup: None,
             pending_connect: None,
             child_window: RestartWindow::new(),
             serial_window: RestartWindow::new(),
             stable: None,
             ready_observed: None,
             serial_cleanup: true,
+            serial_invalidated: false,
+            child_exhausted: false,
+            serial_exhausted: false,
             child_terminated: true,
             child_reaped: true,
             child_failure_at: None,
@@ -659,7 +714,7 @@ impl ConsoleModel {
     /// Binds the exact registry/connector correlation expected to echo in the
     /// CONNECTED reply. No later CONNECTED may substitute a merely newer tuple.
     pub fn begin_connect(&mut self, expected: ConnectRequest) -> Result<(), ModelError> {
-        if self.state == ConnectionState::Exhausted {
+        if self.state == ConnectionState::Exhausted && self.serial_exhausted {
             return Err(ModelError::RestartExhausted);
         }
         if self.state != ConnectionState::Reconnecting || self.pending_connect.is_some() {
@@ -687,7 +742,7 @@ impl ConsoleModel {
         now: u64,
     ) -> Result<u64, ModelError> {
         self.time(now)?;
-        if self.state == ConnectionState::Exhausted {
+        if self.state == ConnectionState::Exhausted && self.serial_exhausted {
             return Err(ModelError::RestartExhausted);
         }
         if self.state != ConnectionState::Reconnecting || !self.serial_cleanup || !self.child_reaped
@@ -719,7 +774,7 @@ impl ConsoleModel {
         &mut self,
         child_launch: u64,
     ) -> Result<LaunchTransaction, ModelError> {
-        if self.state == ConnectionState::Exhausted {
+        if self.state == ConnectionState::Exhausted || self.child_exhausted {
             return Err(ModelError::RestartExhausted);
         }
         if self.state != ConnectionState::Active || self.serial.is_none() || self.child.is_some() {
@@ -767,13 +822,14 @@ impl ConsoleModel {
         tx: &mut LaunchTransaction,
         child_job: u64,
     ) -> Result<ChildSession, ModelError> {
-        if self.state == ConnectionState::Exhausted {
+        if self.state == ConnectionState::Exhausted || self.child_exhausted {
             return Err(ModelError::RestartExhausted);
         }
         if self.state != ConnectionState::Active
             || tx.committed
             || !tx.all_moved()
             || self.child.is_some()
+            || self.serial_invalidated
             || self.serial != Some(tx.serial)
             || self.console_generation != Some(tx.console_generation)
             || child_job == 0
@@ -838,17 +894,25 @@ impl ConsoleModel {
             return Err(ModelError::StaleCorrelation);
         }
         let cleanup = transaction.abort_cleanup()?;
+        self.pending_launch_cleanup = Some(identity);
         Ok(LaunchCleanupToken { identity, cleanup })
     }
     pub fn complete_abort_child_launch(
         &mut self,
         token: LaunchCleanupToken,
+        evidence: LaunchCleanupEvidence,
     ) -> Result<LaunchCleanup, ModelError> {
-        if self.state != ConnectionState::Active || self.pending_launch != Some(token.identity) {
+        if self.pending_launch != Some(token.identity)
+            || self.pending_launch_cleanup != Some(token.identity)
+            || !evidence_matches_cleanup(&token.cleanup, evidence)
+        {
             return Err(ModelError::StaleCorrelation);
         }
         self.pending_launch = None;
-        Ok(token.cleanup)
+        self.pending_launch_cleanup = None;
+        let cleanup = token.cleanup;
+        self.maybe_finish_serial_invalidation()?;
+        Ok(cleanup)
     }
 
     pub fn event_is_current(&self, event: EventGeneration) -> bool {
@@ -940,21 +1004,29 @@ impl ConsoleModel {
         now: u64,
     ) -> Result<RecoveryAction, ModelError> {
         self.time(now)?;
-        if self.state != ConnectionState::Active
-            || self.serial != Some(serial)
+        if !matches!(
+            self.state,
+            ConnectionState::Active
+                | ConnectionState::RetiringChild
+                | ConnectionState::AwaitingReap
+                | ConnectionState::Exhausted
+        ) || self.serial != Some(serial)
             || self.console_generation != Some(console_generation)
         {
             return Err(ModelError::WrongConnectionState);
         }
         self.serial_cleanup = false;
+        self.serial_invalidated = true;
         self.stable = None;
         self.clear_reservations();
-        if self.child.is_some() {
+        if self.child.is_some() && self.state == ConnectionState::Active {
             self.start_child_retirement(true, false, now)
-        } else {
+        } else if self.child.is_none() && self.pending_launch.is_none() {
             self.child_terminated = true;
             self.child_reaped = true;
             self.finish_serial_cleanup(now)
+        } else {
+            Ok(RecoveryAction::None)
         }
     }
     pub fn child_terminated(
@@ -1022,6 +1094,7 @@ impl ConsoleModel {
         self.pending_connect = None;
         if self.serial_window.add(now) {
             self.state = ConnectionState::Exhausted;
+            self.serial_exhausted = true;
             self.last_failure = Some(ModelError::RestartExhausted);
             return Ok(RecoveryAction::Escalate);
         }
@@ -1200,6 +1273,11 @@ impl ConsoleModel {
             stderr_queued: self.stderr.len(),
             child_failures: self.child_window.failures(),
             serial_failures: self.serial_window.failures(),
+            serial_invalidated: self.serial_invalidated,
+            pending_launch: self.pending_launch.is_some(),
+            pending_launch_cleanup: self.pending_launch_cleanup.is_some(),
+            child_restart_exhausted: self.child_exhausted,
+            serial_restart_exhausted: self.serial_exhausted,
             last_failure: self.last_failure,
         }
     }
@@ -1269,12 +1347,26 @@ impl ConsoleModel {
         let failure_at = self.child_failure_at.take().unwrap_or(now);
         if self.child_window.add(failure_at) {
             self.state = ConnectionState::Exhausted;
+            self.child_exhausted = true;
             self.last_failure = Some(ModelError::RestartExhausted);
             Ok(RecoveryAction::Escalate)
         } else {
             self.state = ConnectionState::Active;
             Ok(RecoveryAction::ReplaceChild)
         }
+    }
+    fn maybe_finish_serial_invalidation(&mut self) -> Result<(), ModelError> {
+        if self.serial_invalidated
+            && self.child.is_none()
+            && self.pending_launch.is_none()
+            && self.pending_launch_cleanup.is_none()
+        {
+            let now = self
+                .last_now
+                .ok_or_else(|| self.fail(ModelError::MonotonicRegression))?;
+            let _ = self.finish_serial_cleanup(now)?;
+        }
+        Ok(())
     }
     fn finish_serial_cleanup(&mut self, now: u64) -> Result<RecoveryAction, ModelError> {
         let retry = now
@@ -1283,6 +1375,7 @@ impl ConsoleModel {
         self.serial = None;
         self.console_generation = None;
         self.serial_cleanup = true;
+        self.serial_invalidated = false;
         self.state = ConnectionState::Reconnecting;
         self.clear_volatile();
         Ok(RecoveryAction::RetrySerialAt(retry))
@@ -1407,6 +1500,13 @@ mod tests {
                 now,
             )
             .unwrap()
+    }
+    const fn cleanup_evidence() -> LaunchCleanupEvidence {
+        LaunchCleanupEvidence {
+            consoled_peers_closed: [true; 3],
+            unmoved_child_peers_closed: [true; 3],
+            moved_child_peers_rejected: [true; 3],
+        }
     }
     fn launch(model: &mut ConsoleModel) -> EventGeneration {
         let mut tx = model.begin_child_launch(100).unwrap();
@@ -1550,10 +1650,16 @@ mod tests {
             model.begin_child_launch(102),
             Err(ModelError::WrongConnectionState)
         );
-        let _cleanup = model.complete_abort_child_launch(token).unwrap();
+        let _cleanup = model
+            .complete_abort_child_launch(token, cleanup_evidence())
+            .unwrap();
         let retry = model.begin_child_launch(102).unwrap();
         let token = model.abort_child_launch(retry).unwrap();
-        assert!(model.complete_abort_child_launch(token).is_ok());
+        assert!(
+            model
+                .complete_abort_child_launch(token, cleanup_evidence())
+                .is_ok()
+        );
     }
     #[test]
     fn launch_correlation_rejects_drift_before_commit() {
