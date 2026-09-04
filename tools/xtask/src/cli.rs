@@ -47,6 +47,7 @@ Usage:
     tools/pinned-cargo xtask dw1d6 freeze --output <fresh-directory> --deep-repository <path> --deep-revision <40-hex> --evidence-nonce <16-hex> --evidence-challenge <16-hex>
     tools/pinned-cargo xtask dw1-e3a-prepare <fresh-directory> <deepwyrm-repository> <deepwyrm-revision> <16-hex-nonce>
     tools/pinned-cargo xtask dw1-e3b-prepare <fresh-directory> <deepwyrm-repository> <deepwyrm-revision> <16-hex-evidence-nonce> <16-hex-challenge-1-nonce> <16-hex-challenge-2-nonce>
+    tools/pinned-cargo xtask wyr1-d5-prepare <fresh-directory> <deepwyrm-repository> <deepwyrm-revision> <16-hex-evidence-nonce>
 
 Host filters may name a component (bootfs, protocol, elf, runtime, bootstrap,
 efi, init0, hello, xtask, dw1c-init0, or dw1d6), package:<workspace-package>,
@@ -206,6 +207,12 @@ pub(crate) enum Action {
         challenge_1_nonce: String,
         challenge_2_nonce: String,
     },
+    Wyr1D5Prepare {
+        output: String,
+        deep_repository: String,
+        deep_revision: String,
+        evidence_nonce: String,
+    },
     Unavailable(&'static str),
 }
 
@@ -261,6 +268,7 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
         "dw1d6" => dispatch_dw1d6(&arguments[1..]),
         "dw1-e3a-prepare" => dispatch_dw1e3a_prepare(&arguments[1..]),
         "dw1-e3b-prepare" => dispatch_dw1e3b_prepare(&arguments[1..]),
+        "wyr1-d5-prepare" => dispatch_wyr1d5_prepare(&arguments[1..]),
         unknown => Err(Failure::usage(format!(
             "unknown command '{unknown}'\n\n{USAGE}"
         ))),
@@ -300,6 +308,20 @@ fn dispatch_dw1e3b_prepare(arguments: &[String]) -> Result<Action, Failure> {
         }),
         _ => Err(Failure::usage(
             "dw1-e3b-prepare requires <fresh-directory> <deepwyrm-repository> <deepwyrm-revision> <16-hex-evidence-nonce> <16-hex-challenge-1-nonce> <16-hex-challenge-2-nonce>",
+        )),
+    }
+}
+
+fn dispatch_wyr1d5_prepare(arguments: &[String]) -> Result<Action, Failure> {
+    match arguments {
+        [output, deep_repository, deep_revision, evidence_nonce] => Ok(Action::Wyr1D5Prepare {
+            output: output.clone(),
+            deep_repository: deep_repository.clone(),
+            deep_revision: deep_revision.clone(),
+            evidence_nonce: evidence_nonce.clone(),
+        }),
+        _ => Err(Failure::usage(
+            "wyr1-d5-prepare requires <fresh-directory> <deepwyrm-repository> <deepwyrm-revision> <16-hex-evidence-nonce>",
         )),
     }
 }
@@ -1074,6 +1096,27 @@ mod tests {
         );
         assert!(dispatch(&arguments(&["dw1-e3a-prepare", "freeze"])).is_err());
         assert!(USAGE.contains("dw1-e3a-prepare <fresh-directory>"));
+    }
+
+    #[test]
+    fn wyr1d5_prepare_accepts_only_source_and_selector_nonce_inputs() {
+        assert_eq!(
+            dispatch(&arguments(&[
+                "wyr1-d5-prepare",
+                "freeze",
+                "/home/mike/Documents/Programming/OS-Project/deepwyrm",
+                &"a".repeat(40),
+                "D500000000000001",
+            ])),
+            Ok(Action::Wyr1D5Prepare {
+                output: "freeze".into(),
+                deep_repository: "/home/mike/Documents/Programming/OS-Project/deepwyrm".into(),
+                deep_revision: "a".repeat(40),
+                evidence_nonce: "D500000000000001".into(),
+            })
+        );
+        assert!(dispatch(&arguments(&["wyr1-d5-prepare", "freeze"])).is_err());
+        assert!(USAGE.contains("wyr1-d5-prepare <fresh-directory>"));
     }
 
     #[test]

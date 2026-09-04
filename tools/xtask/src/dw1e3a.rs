@@ -657,7 +657,7 @@ const SOURCE_RECEIPT_KEYS: &[&str] = &[
     "ovmf_vars_sha256",
 ];
 
-fn build_bootstrap(
+pub(crate) fn build_bootstrap(
     repository: &Path,
     toolchain: &tasks::LoaderToolchain,
     layout: &crate::deep_layout::DeepLayoutBuild,

@@ -23,6 +23,7 @@ mod wyr1b;
 mod wyr1c;
 mod wyr1c2;
 mod wyr1c6;
+mod wyr1d5;
 
 use std::env;
 use std::process::ExitCode;
@@ -244,6 +245,18 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
             &evidence_nonce,
             &challenge_1_nonce,
             &challenge_2_nonce,
+        )
+        .map(Some),
+        Action::Wyr1D5Prepare {
+            output,
+            deep_repository,
+            deep_revision,
+            evidence_nonce,
+        } => wyr1d5::prepare(
+            std::path::Path::new(&output),
+            std::path::Path::new(&deep_repository),
+            &deep_revision,
+            &evidence_nonce,
         )
         .map(Some),
         Action::Unavailable(command) => Err(Failure::unavailable(command)),

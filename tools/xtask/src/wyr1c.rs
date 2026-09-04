@@ -22,9 +22,11 @@ use crate::{
 };
 use wyrmroot_bootfs::{
     archive::Archive,
+    launch_policy::{LaunchPolicy, LaunchPolicyEntry, encode as encode_launch_policy},
     wyr1::{
-        DW1_E3A_COM2_PROBE_PATH, DW1_E3A_GATE_PATH, Product, ProductC1, ProductC6, ProductE3A,
-        WYR1_C1_MARKER, build_c1, build_c6, build_e3a,
+        CONSOLE_ECHO_PATH, DW1_E3A_COM2_PROBE_PATH, DW1_E3A_GATE_PATH, LAUNCH_POLICY_PATH, Product,
+        ProductC1, ProductC6, ProductD5, ProductE3A, WYR1_C1_MARKER, WYR1_D5_GATE_PATH, build_c1,
+        build_c6, build_d5, build_e3a,
     },
 };
 use wyrmroot_device_proto::manifest::{
@@ -220,6 +222,58 @@ const E3B_NATIVE_CHECK_ENVIRONMENT: [(&str, &str); 3] = [
     ("WYRMROOT_DW1E3_CHALLENGE_2_NONCE", "E300000000000003"),
 ];
 
+const D5_PRODUCT_NATIVE_SPECS: [NativeSpec; 7] = [
+    NativeSpec {
+        label: "system-init",
+        package: "wyrmroot-system-init",
+        binary: "system-init",
+        features: "wyr1d-selector32",
+        artifact: "system-init",
+    },
+    NativeSpec {
+        label: "registryd",
+        package: "wyrmroot-registryd",
+        binary: "registryd",
+        features: "native-registryd",
+        artifact: "registryd",
+    },
+    NativeSpec {
+        label: "devmgr",
+        package: "wyrmroot-devmgr",
+        binary: "devmgr",
+        features: "wyr1d-production",
+        artifact: "devmgr",
+    },
+    NativeSpec {
+        label: "uart16550d",
+        package: "wyrmroot-uart16550d",
+        binary: "uart16550d",
+        features: "native-uart16550d",
+        artifact: "uart16550d",
+    },
+    NativeSpec {
+        label: "consoled",
+        package: "wyrmroot-consoled",
+        binary: "consoled",
+        features: "wyr1d-selector32",
+        artifact: "consoled",
+    },
+    NativeSpec {
+        label: "wyrmsh",
+        package: "wyrmroot-wyr1-retained-stubs",
+        binary: "wyrmsh",
+        features: "native-retained",
+        artifact: "wyrmsh",
+    },
+    NativeSpec {
+        label: "console-echo",
+        package: "wyrmroot-console-echo",
+        binary: "console-echo",
+        features: "native-console-echo",
+        artifact: "console-echo",
+    },
+];
+
 const C4_NATIVE_CHECK_SPECS: [NativeSpec; 3] = [
     NativeSpec {
         label: "bootstrap-c4",
@@ -345,6 +399,18 @@ pub(crate) struct C6Snapshot {
 pub(crate) struct E3ASnapshot {
     pub(crate) rrc_manifest: Vec<u8>,
     pub(crate) device_manifest: Vec<u8>,
+    pub(crate) bootfs: Vec<u8>,
+    pub(crate) artifacts: BTreeMap<String, Vec<u8>>,
+    pub(crate) inspections: BTreeMap<String, Vec<u8>>,
+}
+
+/// Private selector-32 product snapshot.  `console-echo` is explicit
+/// acceptance content outside the five-role WRRM inventory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct D5Snapshot {
+    pub(crate) rrc_manifest: Vec<u8>,
+    pub(crate) device_manifest: Vec<u8>,
+    pub(crate) launch_policy: Vec<u8>,
     pub(crate) bootfs: Vec<u8>,
     pub(crate) artifacts: BTreeMap<String, Vec<u8>>,
     pub(crate) inspections: BTreeMap<String, Vec<u8>>,
@@ -790,6 +856,96 @@ pub(crate) fn build_e3a_snapshot(nonce: &str) -> Result<E3ASnapshot, Failure> {
         Ok(E3ASnapshot {
             rrc_manifest: product.rrc_manifest,
             device_manifest: product.device_manifest,
+            bootfs: product.bootfs,
+            artifacts: artifacts
+                .iter()
+                .map(|artifact| (artifact.spec.label.to_owned(), artifact.bytes.clone()))
+                .collect(),
+            inspections: artifacts
+                .iter()
+                .map(|artifact| {
+                    (
+                        artifact.spec.label.to_owned(),
+                        artifact.inspection.as_bytes().to_vec(),
+                    )
+                })
+                .collect(),
+        })
+    })();
+    let snapshot = scratch.finish(result)?;
+    toolchain.accepted().verify_unchanged()?;
+    verify_repository_revision(&repository, &revision)?;
+    Ok(snapshot)
+}
+
+/// Build the selector-32 production userspace closure.  This is a distinct
+/// product from selector 31 and therefore never compiles or admits the DWE3
+/// probe actor.
+pub(crate) fn build_d5_snapshot(nonce: &str) -> Result<D5Snapshot, Failure> {
+    validate_c6_nonce(nonce)?;
+    reject_ambient_build_environment(env::vars_os())?;
+    let repository = crate::tasks::repository_root()?;
+    let project = crate::tasks::canonical_project_root(&repository)?;
+    let revision = clean_repository_revision(&repository)?;
+    let manifest = BuildManifest::load(&repository)?;
+    if manifest.rust_revision()? != ACCEPTED_RUST_REVISION
+        || manifest.rust_toolchain_name()? != ACCEPTED_TOOLCHAIN_NAME
+    {
+        return Err(Failure::task(
+            "WYR1-D5 product metadata does not name the accepted a92dc7f Rust toolchain",
+        ));
+    }
+    let profile = manifest.validate_loader_build_readiness(&repository)?;
+    let toolchain = crate::tasks::prepare_loader_toolchain(&repository, &profile, &manifest)?;
+    let cargo_home = crate::tasks::project_cargo_home(&repository, &manifest)?;
+    if env::var_os("CARGO_HOME").as_deref() != Some(cargo_home.as_os_str()) {
+        return Err(Failure::task(
+            "WYR1-D5 product requires the pinned launcher's exact CARGO_HOME",
+        ));
+    }
+    toolchain.accepted().verify_unchanged()?;
+    let project_directory = crate::secure_fs::Directory::open_exact(&project, "OS-Project root")?;
+    let tmp = match project_directory.open_child(".tmp", "project temporary root") {
+        Ok(directory) => directory,
+        Err(_) => project_directory.create_child(".tmp", 0o700, "project temporary root")?,
+    };
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Failure::task("system clock is before the Unix epoch"))?
+        .as_nanos();
+    let scratch = tmp.create_scratch(
+        &format!("wyr1d5-build-{}-{unique}", std::process::id()),
+        "WYR1-D5 build scratch",
+    )?;
+    let result = (|| {
+        let mut artifacts = Vec::with_capacity(D5_PRODUCT_NATIVE_SPECS.len());
+        for spec in D5_PRODUCT_NATIVE_SPECS {
+            toolchain.accepted().verify_unchanged()?;
+            let artifact = scratch.with_inheritable_anchor("WYR1-D5 build scratch", |anchor| {
+                let mut artifact = build_native(
+                    &repository,
+                    &cargo_home,
+                    toolchain.accepted(),
+                    anchor,
+                    spec,
+                    None,
+                )?;
+                artifact.inspection = inspect_native(
+                    &repository,
+                    &artifact.bytes,
+                    &artifact.sha256,
+                    spec.label,
+                    anchor,
+                )?;
+                Ok(artifact)
+            })?;
+            artifacts.push(artifact);
+        }
+        let (product, launch_policy) = assemble_d5_product(&revision, &artifacts, nonce)?;
+        Ok(D5Snapshot {
+            rrc_manifest: product.rrc_manifest,
+            device_manifest: product.device_manifest,
+            launch_policy,
             bootfs: product.bootfs,
             artifacts: artifacts
                 .iter()
@@ -1301,6 +1457,125 @@ fn assemble_e3a_product(
     })
 }
 
+fn assemble_d5_product(
+    revision: &str,
+    artifacts: &[NativeArtifact],
+    nonce: &str,
+) -> Result<(ProductBytes, Vec<u8>), Failure> {
+    let [
+        init,
+        registryd,
+        devmgr,
+        uart,
+        consoled,
+        wyrmsh,
+        console_echo,
+    ]: [&NativeArtifact; 7] = artifacts
+        .iter()
+        .collect::<Vec<_>>()
+        .try_into()
+        .map_err(|_| Failure::task("WYR1-D5 requires seven explicit native artifacts"))?;
+    let hashes = [
+        digest_array(&registryd.sha256)?,
+        digest_array(&devmgr.sha256)?,
+        digest_array(&uart.sha256)?,
+        digest_array(&consoled.sha256)?,
+        digest_array(&wyrmsh.sha256)?,
+    ];
+    let generation = product_generation(revision, artifacts);
+    let rrc_manifest = crate::wyr1::fixed_builder_for_profiles(
+        &generation,
+        hashes,
+        StartupProfile::BootstrapRegistry,
+        StartupProfile::DeviceCoordinator,
+    )?
+    .build_structural()
+    .map_err(|error| Failure::task(format!("WYR1-D5 WRRM build failed: {error:?}")))?;
+    let mut wrdm = [0u8; WRDM_HEADER_BYTES + WRDM_RECORD_BYTES];
+    let size = encode_com2_manifest(ContentIdentity(hashes[2]), &mut wrdm)
+        .map_err(|error| Failure::task(format!("WYR1-D5 WRDM build failed: {error:?}")))?;
+    let device_manifest = wrdm[..size].to_vec();
+    let mut policy = [0u8; 512];
+    let policy_size = encode_launch_policy(
+        generation,
+        &[LaunchPolicyEntry {
+            path: CONSOLE_ECHO_PATH,
+            content_sha256: digest_array(&console_echo.sha256)?,
+            startup_abi: 2,
+            profile_id: 1,
+            allow_no_streams: false,
+            allow_three_streams: true,
+        }],
+        &mut policy,
+    )
+    .map_err(|error| Failure::task(format!("WYR1-D5 launch policy failed: {error:?}")))?;
+    let launch_policy = policy[..policy_size].to_vec();
+    let gate = format!(
+        "schema = 1\nselector = \"native-console-streams\"\ntest_id = 32\nevidence_protocol = \"WRD1\"\nnonce = \"{nonce}\"\n"
+    );
+    let bootfs = build_d5(ProductD5 {
+        base: ProductC1 {
+            base: Product {
+                init: &init.bytes,
+                registryd: &registryd.bytes,
+                devmgr: &devmgr.bytes,
+                uart16550d: &uart.bytes,
+                consoled: &consoled.bytes,
+                wyrmsh: &wyrmsh.bytes,
+                rrc_manifest: &rrc_manifest,
+                gate_config: GATE_CONFIG,
+            },
+            marker: WYR1_C1_MARKER,
+            device_manifest: &device_manifest,
+            expected_uart16550d_identity: hashes[2],
+        },
+        gate: gate.as_bytes(),
+        launch_policy: &launch_policy,
+        console_echo: &console_echo.bytes,
+    })
+    .map_err(|error| Failure::task(format!("WYR1-D5 bootfs build failed: {error:?}")))?;
+    validate_rrc(&rrc_manifest, &generation, hashes)?;
+    wyrmroot_device_proto::Manifest::parse(&device_manifest)
+        .and_then(|manifest| manifest.match_com2(ContentIdentity(hashes[2])))
+        .map_err(|error| Failure::task(format!("WYR1-D5 WRDM inspection failed: {error:?}")))?;
+    let parsed_policy = LaunchPolicy::parse(&launch_policy).map_err(|error| {
+        Failure::task(format!(
+            "WYR1-D5 launch-policy inspection failed: {error:?}"
+        ))
+    })?;
+    let entry = parsed_policy
+        .find(CONSOLE_ECHO_PATH)
+        .ok_or_else(|| Failure::task("WYR1-D5 launch policy lacks console-echo"))?;
+    if parsed_policy.len() != 1
+        || parsed_policy.boot_generation_sha256() != generation
+        || entry.content_sha256 != digest_array(&console_echo.sha256)?
+        || entry.allow_no_streams
+        || !entry.allow_three_streams
+    {
+        return Err(Failure::task("WYR1-D5 launch-policy authority drifted"));
+    }
+    inspect_d5_archive(
+        &bootfs,
+        artifacts,
+        &rrc_manifest,
+        &device_manifest,
+        &launch_policy,
+        gate.as_bytes(),
+    )?;
+    Ok((
+        ProductBytes {
+            generation,
+            rrc_manifest_sha256: sha256::bytes_digest(&rrc_manifest),
+            device_manifest_sha256: sha256::bytes_digest(&device_manifest),
+            bootfs_sha256: sha256::bytes_digest(&bootfs),
+            rrc_manifest,
+            device_manifest,
+            bootfs,
+        },
+        launch_policy,
+    ))
+}
+
 fn build_native(
     repository: &Path,
     cargo_home: &Path,
@@ -1605,6 +1880,50 @@ fn inspect_e3a_archive(
         if entry.data() != expected_bytes || entry.is_executable() != executable {
             return Err(Failure::task(format!("DW1-E3A bootfs changed {path}")));
         }
+    }
+    Ok(())
+}
+
+fn inspect_d5_archive(
+    bytes: &[u8],
+    artifacts: &[NativeArtifact],
+    rrc: &[u8],
+    wrdm: &[u8],
+    launch_policy: &[u8],
+    gate: &[u8],
+) -> Result<(), Failure> {
+    let archive = Archive::new(bytes)
+        .map_err(|error| Failure::task(format!("WYR1-D5 bootfs inspection failed: {error:?}")))?;
+    if archive.entries().count() != 13 {
+        return Err(Failure::task("WYR1-D5 bootfs entry set drifted"));
+    }
+    let expected = [
+        ("system/init", artifacts[0].bytes.as_slice(), true),
+        ("system/registryd", artifacts[1].bytes.as_slice(), true),
+        ("system/devmgr", artifacts[2].bytes.as_slice(), true),
+        ("system/uart16550d", artifacts[3].bytes.as_slice(), true),
+        ("system/consoled", artifacts[4].bytes.as_slice(), true),
+        ("system/wyrmsh", artifacts[5].bytes.as_slice(), true),
+        (CONSOLE_ECHO_PATH, artifacts[6].bytes.as_slice(), true),
+        ("system/bootstrap/rrc-a-v1", rrc, false),
+        ("system/bootstrap/wyr1-a-gate-v1", GATE_CONFIG, false),
+        ("system/bootstrap/wyr1-c-gate-v1", WYR1_C1_MARKER, false),
+        ("system/bootstrap/wyr1-c-device-manifest-v1", wrdm, false),
+        (LAUNCH_POLICY_PATH, launch_policy, false),
+        (WYR1_D5_GATE_PATH, gate, false),
+    ];
+    for (path, expected_bytes, executable) in expected {
+        let entry = archive
+            .lookup(path.as_bytes())
+            .map_err(|_| Failure::task(format!("WYR1-D5 bootfs lacks {path}")))?;
+        if entry.data() != expected_bytes || entry.is_executable() != executable {
+            return Err(Failure::task(format!("WYR1-D5 bootfs changed {path}")));
+        }
+    }
+    if archive.lookup(DW1_E3A_GATE_PATH.as_bytes()).is_ok()
+        || archive.lookup(DW1_E3A_COM2_PROBE_PATH.as_bytes()).is_ok()
+    {
+        return Err(Failure::task("WYR1-D5 bootfs inherited selector31 content"));
     }
     Ok(())
 }
@@ -2277,6 +2596,22 @@ mod tests {
             .collect()
     }
 
+    fn d5_fixture_artifacts() -> Vec<NativeArtifact> {
+        D5_PRODUCT_NATIVE_SPECS
+            .into_iter()
+            .enumerate()
+            .map(|(index, spec)| {
+                let bytes = vec![index as u8 + 11; index + 5];
+                NativeArtifact {
+                    spec,
+                    sha256: sha256::bytes_digest(&bytes),
+                    bytes,
+                    inspection: format!("{{\"verified\":true,\"artifact\":\"{}\"}}\n", spec.label),
+                }
+            })
+            .collect()
+    }
+
     fn publication_snapshot() -> FrozenSnapshot {
         FrozenSnapshot {
             receipt: b"receipt bytes\n".to_vec(),
@@ -2380,6 +2715,34 @@ mod tests {
                 .lookup(b"system/bootstrap/wyr1-c6-gate-v1")
                 .unwrap()
                 .is_executable()
+        );
+    }
+
+    #[test]
+    fn d5_product_binds_console_echo_policy_and_excludes_selector31() {
+        let artifacts = d5_fixture_artifacts();
+        let nonce = "0123456789ABCDEF";
+        let (first, first_policy) =
+            assemble_d5_product(&"b".repeat(40), &artifacts, nonce).unwrap();
+        let (second, second_policy) =
+            assemble_d5_product(&"b".repeat(40), &artifacts, nonce).unwrap();
+        assert_eq!(first.bootfs, second.bootfs);
+        assert_eq!(first_policy, second_policy);
+        let policy = LaunchPolicy::parse(&first_policy).unwrap();
+        let entry = policy.find(CONSOLE_ECHO_PATH).unwrap();
+        assert_eq!(policy.len(), 1);
+        assert!(!entry.allow_no_streams);
+        assert!(entry.allow_three_streams);
+        assert_eq!(
+            entry.content_sha256,
+            digest_array(&artifacts[6].sha256).unwrap()
+        );
+        let archive = Archive::new(&first.bootfs).unwrap();
+        assert!(archive.lookup(DW1_E3A_GATE_PATH.as_bytes()).is_err());
+        assert!(archive.lookup(DW1_E3A_COM2_PROBE_PATH.as_bytes()).is_err());
+        assert_eq!(
+            archive.lookup(WYR1_D5_GATE_PATH.as_bytes()).unwrap().data(),
+            b"schema = 1\nselector = \"native-console-streams\"\ntest_id = 32\nevidence_protocol = \"WRD1\"\nnonce = \"0123456789ABCDEF\"\n"
         );
     }
 

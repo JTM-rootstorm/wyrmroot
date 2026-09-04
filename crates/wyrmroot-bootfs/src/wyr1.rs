@@ -294,6 +294,11 @@ pub struct ProductE3A<'a> {
 
 pub const DW1_E3A_GATE_PATH: &str = "system/bootstrap/dw1-e3a-gate-v1";
 pub const DW1_E3A_COM2_PROBE_PATH: &str = "test/dw1e3/com2-probe";
+/// Selector-32 native console-stream acceptance inputs.  This product is
+/// separate from selector 31: it carries no DWE3 probe and cannot silently
+/// inherit selector-31 evidence semantics.
+pub const WYR1_D5_GATE_PATH: &str = "system/bootstrap/wyr1-d5-gate-v1";
+pub const CONSOLE_ECHO_PATH: &str = "bin/console-echo";
 
 pub fn build_e3a(product: ProductE3A<'_>) -> Result<Vec<u8>, BuildError> {
     validate_c1_product(product.base)?;
@@ -320,6 +325,56 @@ pub fn build_e3a(product: ProductE3A<'_>) -> Result<Vec<u8>, BuildError> {
     builder.add(
         DW1_E3A_COM2_PROBE_PATH.as_bytes(),
         product.raw_com2_probe,
+        FileMode::Executable,
+    )?;
+    builder.build()
+}
+
+/// Exact selector-32 extension of the retained production device closure.
+/// `base.base.consoled` is the real console service selected by the producer;
+/// the acceptance client is explicit non-role content and therefore cannot
+/// displace any canonical WRRM role.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProductD5<'a> {
+    pub base: ProductC1<'a>,
+    pub gate: &'a [u8],
+    pub launch_policy: &'a [u8],
+    pub console_echo: &'a [u8],
+}
+
+pub fn build_d5(product: ProductD5<'_>) -> Result<Vec<u8>, BuildError> {
+    validate_c1_product(product.base)?;
+    if product.gate.is_empty()
+        || product.launch_policy.is_empty()
+        || product.console_echo.is_empty()
+    {
+        return Err(BuildError::EmptyArtifact);
+    }
+    let mut builder = Builder::new();
+    for artifact in product.base.artifacts() {
+        builder.add(
+            artifact.path.as_bytes(),
+            artifact.bytes,
+            if artifact.executable {
+                FileMode::Executable
+            } else {
+                FileMode::ReadOnly
+            },
+        )?;
+    }
+    builder.add(
+        WYR1_D5_GATE_PATH.as_bytes(),
+        product.gate,
+        FileMode::ReadOnly,
+    )?;
+    builder.add(
+        LAUNCH_POLICY_PATH.as_bytes(),
+        product.launch_policy,
+        FileMode::ReadOnly,
+    )?;
+    builder.add(
+        CONSOLE_ECHO_PATH.as_bytes(),
+        product.console_echo,
         FileMode::Executable,
     )?;
     builder.build()
@@ -578,5 +633,43 @@ mod tests {
                 .is_executable()
         );
         assert!(archive.lookup(WYR1_C6_GATE_PATH.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn wyr1_d5_is_distinct_from_selector31_and_admits_console_echo() {
+        let device_manifest = canonical_wrdm(UART_IDENTITY);
+        let product = ProductD5 {
+            base: c1_product(WYR1_C1_MARKER, &device_manifest, UART_IDENTITY),
+            gate: b"selector=32\nevidence=WRD1\n",
+            launch_policy: b"WRJP selector32 console-echo",
+            console_echo: b"console-echo-elf",
+        };
+        let first = build_d5(product).unwrap();
+        assert_eq!(first, build_d5(product).unwrap());
+        let archive = Archive::new(&first).unwrap();
+        assert_eq!(archive.entries().count(), 13);
+        assert!(
+            archive
+                .lookup(CONSOLE_ECHO_PATH.as_bytes())
+                .unwrap()
+                .is_executable()
+        );
+        assert!(
+            !archive
+                .lookup(WYR1_D5_GATE_PATH.as_bytes())
+                .unwrap()
+                .is_executable()
+        );
+        assert!(
+            !archive
+                .lookup(LAUNCH_POLICY_PATH.as_bytes())
+                .unwrap()
+                .is_executable()
+        );
+        assert!(archive.lookup(DW1_E3A_GATE_PATH.as_bytes()).is_err());
+        assert!(archive.lookup(DW1_E3A_COM2_PROBE_PATH.as_bytes()).is_err());
+        for path in ROLE_PATHS {
+            assert!(archive.lookup(path.as_bytes()).unwrap().is_executable());
+        }
     }
 }
