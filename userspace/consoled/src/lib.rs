@@ -255,20 +255,6 @@ pub struct LaunchCleanupEvidence {
     pub moved_child_peers_revoked: [bool; 3],
 }
 
-impl LaunchCleanupEvidence {
-    pub const fn complete(self) -> bool {
-        self.consoled_peers_closed[0]
-            && self.consoled_peers_closed[1]
-            && self.consoled_peers_closed[2]
-            && self.unmoved_child_peers_closed[0]
-            && self.unmoved_child_peers_closed[1]
-            && self.unmoved_child_peers_closed[2]
-            && self.moved_child_peers_revoked[0]
-            && self.moved_child_peers_revoked[1]
-            && self.moved_child_peers_revoked[2]
-    }
-}
-
 impl LaunchCleanupToken {
     pub const fn cleanup(&self) -> &LaunchCleanup {
         &self.cleanup
@@ -902,7 +888,7 @@ impl ConsoleModel {
     }
     pub fn complete_abort_child_launch(
         &mut self,
-        token: LaunchCleanupToken,
+        token: &LaunchCleanupToken,
         evidence: LaunchCleanupEvidence,
     ) -> Result<LaunchCleanup, ModelError> {
         if self.pending_launch != Some(token.identity)
@@ -964,7 +950,12 @@ impl ConsoleModel {
     ) -> Result<RecoveryAction, ModelError> {
         self.time(now)?;
         self.require_current(event)?;
-        self.start_child_retirement(false, true, now)
+        self.clear_volatile();
+        self.child_failure_at = Some(now);
+        self.child_terminated = true;
+        self.child_reaped = false;
+        self.state = ConnectionState::AwaitingReap;
+        Ok(RecoveryAction::ReapChild(event.child_job))
     }
     pub fn child_peer_closed(
         &mut self,
@@ -1472,6 +1463,33 @@ impl ConsoleModel {
         self.stable = None;
         error
     }
+
+    #[cfg(test)]
+    fn validate_invariants(&self) -> bool {
+        if self.pending_launch_cleanup.is_some()
+            && self.pending_launch_cleanup != self.pending_launch
+        {
+            return false;
+        }
+        if self.pending_launch.is_some()
+            && (self.serial.is_none() || self.console_generation.is_none())
+        {
+            return false;
+        }
+        if self.state == ConnectionState::Reconnecting && self.child.is_some() {
+            return false;
+        }
+        if self.state == ConnectionState::Active && self.serial.is_none() {
+            return false;
+        }
+        if self.state != ConnectionState::FailClosed
+            && self.pending_connect.is_some()
+            && self.state != ConnectionState::Reconnecting
+        {
+            return false;
+        }
+        true
+    }
 }
 
 const fn other(source: OutputSource) -> OutputSource {
@@ -1673,13 +1691,13 @@ mod tests {
             Err(ModelError::WrongConnectionState)
         );
         let _cleanup = model
-            .complete_abort_child_launch(token, cleanup_evidence())
+            .complete_abort_child_launch(&token, cleanup_evidence())
             .unwrap();
         let retry = model.begin_child_launch(102).unwrap();
         let token = model.abort_child_launch(retry).unwrap();
         assert!(
             model
-                .complete_abort_child_launch(token, cleanup_evidence())
+                .complete_abort_child_launch(&token, cleanup_evidence())
                 .is_ok()
         );
     }
@@ -1699,7 +1717,7 @@ mod tests {
         let token = model.abort_child_launch(tx).unwrap();
         assert!(
             model
-                .complete_abort_child_launch(token, cleanup_evidence())
+                .complete_abort_child_launch(&token, cleanup_evidence())
                 .is_ok()
         );
     }
@@ -1900,8 +1918,63 @@ mod tests {
         let (mut model, event) = live();
         assert!(matches!(
             model.child_terminal(event, 1),
-            Ok(RecoveryAction::TerminateChild(_))
+            Ok(RecoveryAction::ReapChild(_))
         ));
-        assert_eq!(model.state(), ConnectionState::RetiringChild);
+        assert_eq!(model.state(), ConnectionState::AwaitingReap);
+    }
+    #[test]
+    fn pending_launch_serial_loss_matrix_requires_exact_cleanup_before_b() {
+        let kinds = [StreamKind::Stdin, StreamKind::Stdout, StreamKind::Stderr];
+        for moved_count in 0usize..=3 {
+            let mut model = ConsoleModel::new();
+            connect(&mut model, 1, 0);
+            let mut launch_a = model.begin_child_launch(100 + moved_count as u64).unwrap();
+            for kind in kinds.iter().take(moved_count) {
+                launch_a.move_child_peer(*kind).unwrap();
+            }
+            let snapshot = model.snapshot();
+            model
+                .serial_peer_closed(
+                    snapshot.serial.unwrap(),
+                    snapshot.console_generation.unwrap(),
+                    1,
+                )
+                .unwrap();
+            assert!(model.snapshot().serial_invalidated);
+            let token = model.abort_child_launch(launch_a).unwrap();
+            let mut evidence = LaunchCleanupEvidence {
+                consoled_peers_closed: [true; 3],
+                unmoved_child_peers_closed: [false; 3],
+                moved_child_peers_revoked: [false; 3],
+            };
+            for index in 0..3 {
+                if index < moved_count {
+                    evidence.moved_child_peers_revoked[index] = true;
+                } else {
+                    evidence.unmoved_child_peers_closed[index] = true;
+                }
+            }
+            let mut incomplete = evidence;
+            incomplete.consoled_peers_closed[0] = false;
+            assert_eq!(
+                model.complete_abort_child_launch(&token, incomplete),
+                Err(ModelError::IncompleteCleanup)
+            );
+            // The rejected completion retains the token obligation, so prepare
+            // a fresh equivalent transaction is intentionally still blocked.
+            assert_eq!(
+                model.begin_child_launch(999),
+                Err(ModelError::WrongConnectionState)
+            );
+            assert!(model.complete_abort_child_launch(&token, evidence).is_ok());
+            assert_eq!(
+                model.take_recovery_action(),
+                Some(RecoveryAction::RetrySerialAt(26))
+            );
+            connect(&mut model, 2, 2);
+            let launch_b = model.begin_child_launch(200 + moved_count as u64).unwrap();
+            assert!(model.abort_child_launch(launch_b).is_ok());
+            assert!(model.validate_invariants());
+        }
     }
 }
