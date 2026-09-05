@@ -135,7 +135,13 @@ impl Editor {
     }
 
     fn left(&mut self) -> EditOutcome {
-        let Some(ch) = self.line()[..self.cursor].chars().next_back() else {
+        let Some(ch) = self
+            .line()
+            .get(..self.cursor)
+            .expect("editor cursor is a valid character boundary")
+            .chars()
+            .next_back()
+        else {
             return EditOutcome::Unchanged;
         };
         self.cursor -= ch.len_utf8();
@@ -143,7 +149,13 @@ impl Editor {
     }
 
     fn right(&mut self) -> EditOutcome {
-        let Some(ch) = self.line()[self.cursor..].chars().next() else {
+        let Some(ch) = self
+            .line()
+            .get(self.cursor..)
+            .expect("editor cursor is a valid character boundary")
+            .chars()
+            .next()
+        else {
             return EditOutcome::Unchanged;
         };
         self.cursor += ch.len_utf8();
@@ -160,7 +172,13 @@ impl Editor {
     }
 
     fn delete(&mut self) -> EditOutcome {
-        let Some(ch) = self.line()[self.cursor..].chars().next() else {
+        let Some(ch) = self
+            .line()
+            .get(self.cursor..)
+            .expect("editor cursor is a valid character boundary")
+            .chars()
+            .next()
+        else {
             return EditOutcome::Unchanged;
         };
         let end = self.cursor + ch.len_utf8();
@@ -170,7 +188,13 @@ impl Editor {
     }
 
     fn backspace(&mut self) -> EditOutcome {
-        let Some(ch) = self.line()[..self.cursor].chars().next_back() else {
+        let Some(ch) = self
+            .line()
+            .get(..self.cursor)
+            .expect("editor cursor is a valid character boundary")
+            .chars()
+            .next_back()
+        else {
             return EditOutcome::Unchanged;
         };
         let start = self.cursor - ch.len_utf8();

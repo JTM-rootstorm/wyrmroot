@@ -54,7 +54,11 @@ impl<'a> Arguments<'a> {
 
     pub fn iter(self) -> impl ExactSizeIterator<Item = &'a str> + 'a {
         // Only the parser can construct this view; it validates every range.
-        self.ranges.iter().map(move |r| &self.text[r.start..r.end])
+        self.ranges.iter().map(move |range| {
+            self.text
+                .get(range.start..range.end)
+                .expect("parser validated every argument range")
+        })
     }
 
     pub(crate) fn tail(self) -> Self {
