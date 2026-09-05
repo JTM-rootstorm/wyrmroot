@@ -21,14 +21,22 @@ pub struct Redraw<'a> {
 
 impl<'a> Redraw<'a> {
     pub(crate) fn new(line: &'a str, cursor: usize) -> Self {
-        let cursor_scalars = line[..cursor].chars().count();
+        let cursor_scalars = line
+            .get(..cursor)
+            .expect("redraw cursor is a valid character boundary")
+            .chars()
+            .count();
         let total_scalars = line.chars().count();
         let visible_start_scalar = cursor_scalars
             .saturating_sub(VISIBLE_SCALARS / 2)
             .min(total_scalars.saturating_sub(VISIBLE_SCALARS));
         let visible_start = byte_at_scalar(line, visible_start_scalar);
         let visible_end = byte_at_scalar_from(line, visible_start, VISIBLE_SCALARS);
-        let visible_scalars = line[visible_start..visible_end].chars().count();
+        let visible_scalars = line
+            .get(visible_start..visible_end)
+            .expect("redraw window is a valid character range")
+            .chars()
+            .count();
         let cursor_in_window = cursor_scalars - visible_start_scalar;
         let back = visible_scalars - cursor_in_window;
         let (cursor_back, cursor_back_len) = cursor_back_sequence(back);
@@ -81,7 +89,8 @@ fn byte_at_scalar(text: &str, scalar: usize) -> usize {
 }
 
 fn byte_at_scalar_from(text: &str, start: usize, count: usize) -> usize {
-    text[start..]
+    text.get(start..)
+        .expect("redraw scalar start is a valid character boundary")
         .char_indices()
         .nth(count)
         .map_or(text.len(), |(index, _)| start + index)
