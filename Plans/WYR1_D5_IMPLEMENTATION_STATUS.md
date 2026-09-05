@@ -4,6 +4,10 @@
 
 **Reached:** 2026-09-04
 
+This is the historical D5 checkpoint. The later exact-pair D6 regression and
+WYR1-D closure are recorded in [WYR1_D_VALIDATION.md](WYR1_D_VALIDATION.md);
+the original D5 identities and evidence below remain unchanged.
+
 **Scope:** native console stdin/stdout/stderr, driver replacement, child-only
 replacement, exact generation evidence, and canonical VM cleanup. WYR1-D6
 and overall WYR1-D closure remain pending.
