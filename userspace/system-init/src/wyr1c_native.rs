@@ -3211,7 +3211,7 @@ where
                             }
                             #[cfg(feature = "wyr1e-production")]
                             wyr1e::retire_dependents(resident, system, waits, false)?;
-                            let request = reap_driver(resident, system, waits, false)?;
+                            let _request = reap_driver(resident, system, waits, false)?;
                             #[cfg(feature = "wyr1e-production")]
                             {
                                 let state = resident
@@ -3219,7 +3219,7 @@ where
                                     .as_ref()
                                     .ok_or(InitError::WrongActivationOrder)?;
                                 let devmgr = state.devmgr.ok_or(InitError::WrongActivationOrder)?;
-                                acknowledge_driver_reaped(system, devmgr, request)
+                                acknowledge_driver_reaped(system, devmgr, _request)
                             }
                             #[cfg(not(feature = "wyr1e-production"))]
                             {
@@ -3237,7 +3237,7 @@ where
                                         .ok_or(InitError::WrongActivationOrder)?;
                                     let devmgr =
                                         state.devmgr.ok_or(InitError::WrongActivationOrder)?;
-                                    acknowledge_driver_reaped(system, devmgr, request)?;
+                                    acknowledge_driver_reaped(system, devmgr, _request)?;
                                 }
                                 Ok(())
                             }
