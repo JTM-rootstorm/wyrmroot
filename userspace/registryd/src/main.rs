@@ -7,7 +7,8 @@ use deepwyrm_syscall::{
     DW_CHANNEL_MAX_HANDLES, DW_DEADLINE_INFINITE, DW_HANDLE_TRANSFER_MOVE,
     DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL, DW_RIGHT_INSPECT, DW_RIGHT_READ,
     DW_RIGHT_TRANSFER, DW_RIGHT_WAIT, DW_RIGHT_WRITE, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE,
-    DwHandle, DwHandleTransferV1, DwReceivedHandleInfoV1, DwRights, DwSignals, DwWaitItemV1,
+    DW_STATUS_TIMED_OUT, DwDeadline, DwHandle, DwHandleTransferV1, DwReceivedHandleInfoV1,
+    DwRights, DwSignals, DwWaitItemV1,
 };
 use wyrmroot_loader::launch::{
     CHILD_CHANNEL_RIGHTS, HEADER_BYTES as WRLP_HEADER_BYTES, LaunchProfile,
@@ -16,12 +17,13 @@ use wyrmroot_loader::launch::{
 use wyrmroot_registry_proto as _;
 use wyrmroot_registryd::InstalledEndpoint;
 use wyrmroot_registryd::service::{
-    ChannelRights, MAX_RECEIVED_HANDLES, ReceiveCounts, ReceivedHandle, RegistryService, Transport,
-    WaitEvent,
+    ChannelRights, MAX_RECEIVED_HANDLES, ProbeSignals, ReceiveCounts, ReceivedHandle,
+    RegistryService, Transport, WaitEvent,
 };
 use wyrmroot_runtime::{
-    BOOTSTRAP_CHANNEL_EXPECTATION, StartupBlock, close_handle, panic_abort, query_capability_info,
-    receive_channel, send_channel, validate_bootstrap_channel, wait_many,
+    BOOTSTRAP_CHANNEL_EXPECTATION, NativeError, StartupBlock, close_handle, panic_abort,
+    query_capability_info, receive_channel, send_channel, validate_bootstrap_channel, wait_many,
+    wait_one,
 };
 
 const BROAD_CHANNEL_RIGHTS: DwRights = DwRights(
@@ -109,6 +111,23 @@ impl Transport for NativeTransport {
         })
     }
 
+    fn probe(&mut self, endpoint: InstalledEndpoint) -> Result<ProbeSignals, u32> {
+        match wait_one(
+            DwHandle(endpoint.handle),
+            DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+            DwDeadline(0),
+        ) {
+            Ok(observed) => Ok(ProbeSignals {
+                readable: observed.observed.0 & DW_SIGNAL_READABLE.0 != 0,
+                peer_closed: observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0,
+            }),
+            Err(NativeError::Status(status)) if status == DW_STATUS_TIMED_OUT => {
+                Ok(ProbeSignals::default())
+            }
+            Err(_) => Err(0xB101_0019_u32),
+        }
+    }
+
     fn receive(
         &mut self,
         channel: u64,
@@ -177,8 +196,8 @@ impl Transport for NativeTransport {
         send_channel(DwHandle(channel), bytes, &[transfer]).map_err(|_| 0xB101_0018_u32)
     }
 
-    fn close(&mut self, handle: u64) {
-        let _ = close_handle(DwHandle(handle));
+    fn close(&mut self, handle: u64) -> Result<(), u32> {
+        close_handle(DwHandle(handle)).map_err(|_| 0xB101_001A_u32)
     }
 }
 
