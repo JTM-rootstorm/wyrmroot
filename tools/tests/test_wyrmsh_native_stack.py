@@ -41,7 +41,9 @@ class StackProofTests(unittest.TestCase):
                 (0x1100, "pushq", "%rbp"),
                 (0x1101, "movq", "%rsp, %rbp"),
                 (0x1104, "subq", "$0x18, %rsp"),
-                (0x1108, "callq", "0x1200 <leaf>"),
+                (0x1108, "pushq", "0x8(%rsp)"),
+                (0x1109, "addq", "$0x8, %rsp"),
+                (0x110A, "callq", "0x1200 <leaf>"),
                 (0x110D, "addq", "$0x18, %rsp"),
                 (0x1111, "popq", "%rbp"),
                 (0x1112, "retq", ""),
@@ -102,7 +104,7 @@ class StackProofTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "recursive_call_chain")
 
     def test_rejects_metadata_mismatch_and_allows_exact_disassembly_fallback(self):
-        mismatch = {0x1000: function(0x1000, 5, "named", 8, [
+        mismatch = {0x1000: function(0x1000, 5, "named", 24, [
             (0x1000, "subq", "$0x10, %rsp"),
             (0x1004, "ud2", ""),
         ])}
