@@ -21,6 +21,7 @@ The following paths are explicitly licensed `GPL-3.0-or-later`:
 - `userspace/init0/**` — the temporary WYR0 init application;
 - `userspace/hello/**` — the WYR0 hello smoke-test application;
 - `crates/wyrmroot-wyrmsh-core/**` — the pure WYR1 shell grammar and command model;
+- `crates/wyrmroot-console-proto/**` — the syscall-independent WRCN console status protocol;
 - `userspace/i-capability/**` — the WYR0-I native capability controller and probe payload;
 - `tools/xtask/**` — Wyrmroot host-side repository orchestration tooling;
 - `tools/wyrmsh-core-measure.py` and `tools/wyrmsh-core-measure.rs` — host-only E2 memory measurement tooling;
