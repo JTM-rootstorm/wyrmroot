@@ -23,6 +23,7 @@ The following paths are explicitly licensed `GPL-3.0-or-later`:
 - `crates/wyrmroot-wyrmsh-core/**` — the pure WYR1 shell grammar and command model;
 - `userspace/i-capability/**` — the WYR0-I native capability controller and probe payload;
 - `tools/xtask/**` — Wyrmroot host-side repository orchestration tooling;
+- `tools/wyrmsh-core-measure.py` and `tools/wyrmsh-core-measure.rs` — host-only E2 memory measurement tooling;
 - `toolchain/inspect-uefi-artifact.sh`;
 - `toolchain/verify-host-tools.sh`; and
 - `toolchain/verify-uefi-toolchain.sh`.
