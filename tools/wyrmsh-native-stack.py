@@ -16,9 +16,11 @@ import json
 import os
 from pathlib import Path
 import re
+import selectors
 import signal
 import stat
 import subprocess
+import time
 from typing import NoReturn
 
 
@@ -136,20 +138,49 @@ def _run(command: list[str], *, cwd: Path) -> bytes:
         stderr=subprocess.PIPE,
         start_new_session=True,
     )
-    timed_out = False
+    assert process.stdout is not None and process.stderr is not None
+    streams = selectors.DefaultSelector()
+    streams.register(process.stdout, selectors.EVENT_READ, "stdout")
+    streams.register(process.stderr, selectors.EVENT_READ, "stderr")
+    captured = {"stdout": bytearray(), "stderr": bytearray()}
+    deadline = time.monotonic() + TOOL_TIMEOUT_SECONDS
     try:
-        stdout, stderr = process.communicate(timeout=TOOL_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
-        timed_out = True
+        while streams.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            events = streams.select(remaining)
+            if not events:
+                raise TimeoutError
+            for key, _ in events:
+                captured_bytes = sum(len(value) for value in captured.values())
+                read_limit = min(65536, MAX_TOOL_OUTPUT_BYTES - captured_bytes + 1)
+                chunk = os.read(key.fileobj.fileno(), read_limit)
+                if not chunk:
+                    streams.unregister(key.fileobj)
+                    continue
+                captured[key.data].extend(chunk)
+                if sum(len(value) for value in captured.values()) > MAX_TOOL_OUTPUT_BYTES:
+                    raise OverflowError
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError
+        process.wait(timeout=remaining)
+    except (TimeoutError, subprocess.TimeoutExpired, OverflowError) as error:
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        stdout, stderr = process.communicate()
-    if timed_out:
-        raise RuntimeError(f"LLVM tool exceeded {TOOL_TIMEOUT_SECONDS}s")
-    if len(stdout) > MAX_TOOL_OUTPUT_BYTES or len(stderr) > MAX_TOOL_OUTPUT_BYTES:
-        raise RuntimeError("LLVM tool output exceeded bounded size")
+        process.wait()
+        if isinstance(error, OverflowError):
+            raise RuntimeError("LLVM tool output exceeded bounded size") from error
+        raise RuntimeError(f"LLVM tool exceeded {TOOL_TIMEOUT_SECONDS}s") from error
+    finally:
+        streams.close()
+        process.stdout.close()
+        process.stderr.close()
+    stdout = bytes(captured["stdout"])
+    stderr = bytes(captured["stderr"])
     if process.returncode:
         message = stderr.decode("utf-8", "replace").strip().splitlines()
         suffix = message[0] if message else "no diagnostic"
