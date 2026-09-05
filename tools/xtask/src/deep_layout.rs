@@ -844,6 +844,10 @@ fn verify_exact_cargo_git_source(
             "Git database",
         )?;
     }
+    reject_path_presence(
+        &git_directory.join("info/attributes"),
+        "Cargo-selected Deepwyrm Git attribute overlay",
+    )?;
     let tree = fixed_git_output_bounded(
         root,
         cargo_home,
@@ -1429,6 +1433,8 @@ fn hardened_fixed_git(repository: &Path, temp_directory: &Path) -> Command {
     command
         .arg("-C")
         .arg(repository)
+        .args(["-c", "core.fsmonitor=false"])
+        .args(["-c", "core.attributesFile=/dev/null"])
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("TMPDIR", temp_directory)
@@ -1436,6 +1442,7 @@ fn hardened_fixed_git(repository: &Path, temp_directory: &Path) -> Command {
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_ATTR_NOSYSTEM", "1")
         .stdin(Stdio::null());
     command
 }
@@ -3348,6 +3355,7 @@ mod tests {
     #[test]
     fn exact_cargo_source_identity_binds_checkout_tree_and_database_location() {
         use std::fs;
+        use std::os::unix::fs::PermissionsExt;
         use std::process::Command;
         use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -3504,6 +3512,39 @@ mod tests {
         assert!(verify_exact_cargo_git_source(&checkout, &cargo_home, revision).is_err());
         fs::remove_file(checkout.join("ignored-extra")).expect("remove ignored source");
         fs::write(checkout.join("rogue"), b"untracked\n").expect("write rogue source");
+        assert!(verify_exact_cargo_git_source(&checkout, &cargo_home, revision).is_err());
+        fs::remove_file(checkout.join("rogue")).expect("remove rogue source");
+
+        let fsmonitor = cargo_home.join("hostile-fsmonitor.sh");
+        fs::write(&fsmonitor, b"#!/bin/sh\nprintf invoked > \"$0.invoked\"\n")
+            .expect("write hostile fsmonitor");
+        fs::set_permissions(&fsmonitor, fs::Permissions::from_mode(0o700))
+            .expect("make hostile fsmonitor executable");
+        let attributes = cargo_home.join("hostile-attributes");
+        fs::write(&attributes, b"* export-ignore\n").expect("write hostile attributes");
+        for (key, value) in [
+            ("core.fsmonitor", fsmonitor.as_os_str()),
+            ("core.attributesFile", attributes.as_os_str()),
+        ] {
+            assert!(
+                Command::new(super::FIXED_GIT)
+                    .arg("-C")
+                    .arg(&checkout)
+                    .args(["config", key])
+                    .arg(value)
+                    .env("TMPDIR", &cargo_home)
+                    .status()
+                    .expect("set hostile local Git configuration")
+                    .success()
+            );
+        }
+        let hardened = verify_exact_cargo_git_source(&checkout, &cargo_home, revision)
+            .expect("hardened Git inspection consumed hostile local configuration");
+        assert_eq!(hardened.archive_sha256, identity.archive_sha256);
+        assert!(!fsmonitor.with_extension("sh.invoked").exists());
+
+        fs::write(database.join("info/attributes"), b"* export-ignore\n")
+            .expect("write Git-directory attribute overlay");
         assert!(verify_exact_cargo_git_source(&checkout, &cargo_home, revision).is_err());
         fs::remove_dir_all(cargo_home).expect("remove isolated Cargo source fixture");
     }
