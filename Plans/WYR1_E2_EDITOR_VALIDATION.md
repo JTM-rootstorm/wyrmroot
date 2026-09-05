@@ -71,10 +71,14 @@ Commands from Wyrmroot, with a task-local `WYRMROOT_PINNED_TARGET_DIR` and a
 ```text
 tools/pinned-cargo test --locked --offline -p wyrmroot-wyrmsh-core --test e2_properties
 tools/pinned-cargo fmt -p wyrmroot-wyrmsh-core -- --check
-tools/pinned-cargo clippy --locked --offline -p wyrmroot-wyrmsh-core --all-targets -- -D warnings
+tools/pinned-cargo clippy --locked --offline -p wyrmroot-wyrmsh-core --lib --tests -- -D warnings
 tools/pinned-cargo test --locked --offline -p wyrmroot-wyrmsh-core
 tools/pinned-cargo check --locked --offline -p wyrmroot-wyrmsh-core --lib
 ```
+
+The Clippy command was corrected during E3A/B preflight to match the actual
+E2 invocation (`--lib --tests`); the launcher rejects `--all-targets`. This is a
+command-receipt correction, not a new E2 test run.
 
 All passed on the joined lane; the coordinator independently repeated the full
 44-test suite successfully on canonical `0e99afa`. Logs were copied before lane
