@@ -11,6 +11,7 @@ const MAX_FAILED_GENERATIONS: u8 = 4;
 const MAX_METADATA_PAGES: u16 = 16;
 const MAX_METADATA_RECORDS: u16 = 32;
 const MAX_REGISTRY_ENDPOINTS: usize = 64;
+const MAX_REGISTRY_CLIENTS: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct ResourceId(u64);
@@ -488,6 +489,7 @@ struct Model {
     outer_connection: u64,
     outer_connection_generation: u64,
     poisoned_registry_generation: Option<u64>,
+    console_recovery_required: bool,
     next_seed: u64,
     next_job_id: u64,
     failed_generations: u8,
@@ -506,6 +508,7 @@ impl Model {
             outer_connection: 70_001,
             outer_connection_generation: 70_002,
             poisoned_registry_generation: None,
+            console_recovery_required: false,
             next_seed: 100,
             next_job_id: 10_000,
             failed_generations: 0,
@@ -517,6 +520,7 @@ impl Model {
     fn begin(&mut self) -> Result<EventIdentity, ModelError> {
         if self.current.is_some()
             || self.poisoned_registry_generation.is_some()
+            || self.console_recovery_required
             || self.cleanup_permanently_blocked
         {
             return Err(ModelError::CleanupBlocked);
@@ -716,7 +720,6 @@ impl Model {
                     })
                     .count(),
             )
-            .and_then(|count| count.checked_add(1))
             .ok_or(ModelError::Exhausted)?;
         if installed > MAX_REGISTRY_ENDPOINTS {
             return Err(ModelError::Exhausted);
@@ -790,11 +793,9 @@ impl Model {
     fn commit_registry_move(&mut self) -> Result<(), ModelError> {
         self.require_phase(Phase::RegistryPairPrepared)?;
         let generation = self.attempt().ids.registry_generation;
-        for attempt in self
-            .retired
-            .iter()
-            .filter(|attempt| attempt.ids.registry_generation == generation)
-        {
+        for attempt in self.retired.iter().filter(|attempt| {
+            attempt.ids.registry_generation == generation && attempt.registry_move_committed
+        }) {
             let client_destroyed = attempt
                 .registry_client
                 .is_none_or(|client| self.ledger.owner(client) == Ok(Owner::Closed));
@@ -843,6 +844,29 @@ impl Model {
                 && !attempt.registry_slot_retired
         }) {
             return Err(ModelError::CleanupBlocked);
+        }
+        let installed_clients = self
+            .retired
+            .iter()
+            .filter(|attempt| {
+                attempt.ids.registry_generation == generation
+                    && attempt.registry_server.is_some_and(|server| {
+                        self.ledger.owner(server) == Ok(Owner::Registryd(generation))
+                    })
+            })
+            .count()
+            .checked_add(
+                self.unrelated_registry_slots
+                    .iter()
+                    .filter(|slot| {
+                        slot.generation == generation
+                            && self.ledger.owner(slot.server) == Ok(Owner::Registryd(generation))
+                    })
+                    .count(),
+            )
+            .ok_or(ModelError::Exhausted)?;
+        if installed_clients >= MAX_REGISTRY_CLIENTS {
+            return Err(ModelError::Exhausted);
         }
         let attempt = self.attempt_mut();
         attempt.registry_install_processed = true;
@@ -1353,6 +1377,7 @@ impl Model {
             .active_registry_generation
             .checked_add(1)
             .ok_or(ModelError::Identity)?;
+        self.console_recovery_required = true;
         if self
             .current
             .as_ref()
@@ -1361,6 +1386,26 @@ impl Model {
             self.attempt_mut().phase = Phase::Cleaned;
             self.finish_current(false)?;
         }
+        Ok(())
+    }
+
+    fn rebuild_console_launcher_authority(&mut self) -> Result<(), ModelError> {
+        if !self.console_recovery_required || self.current.is_some() {
+            return Err(ModelError::WrongState);
+        }
+        self.active_console_generation = self
+            .active_console_generation
+            .checked_add(1)
+            .ok_or(ModelError::Identity)?;
+        self.outer_connection = self
+            .outer_connection
+            .checked_add(2)
+            .ok_or(ModelError::Identity)?;
+        self.outer_connection_generation = self
+            .outer_connection_generation
+            .checked_add(2)
+            .ok_or(ModelError::Identity)?;
+        self.console_recovery_required = false;
         Ok(())
     }
 
@@ -1606,6 +1651,8 @@ fn complete_poisoned_failure(model: &mut Model, event: EventIdentity) {
     model
         .registry_generation_terminal_reaped(event.registry_generation)
         .unwrap();
+    assert_eq!(model.begin(), Err(ModelError::CleanupBlocked));
+    model.rebuild_console_launcher_authority().unwrap();
 }
 
 fn launch_operating(model: &mut Model) -> EventIdentity {
@@ -1715,6 +1762,7 @@ fn every_prepare_and_commit_edge_has_a_cleanup_path() {
             model
                 .registry_generation_terminal_reaped(event.registry_generation)
                 .unwrap();
+            model.rebuild_console_launcher_authority().unwrap();
         }
         assert!(model.current.is_none(), "boundary {boundary:?}");
         model.ledger.assert_exact_accounting();
@@ -1903,6 +1951,8 @@ fn registry_install_is_local_before_move_and_poisoned_after_ambiguous_move() {
         .registry_generation_terminal_reaped(event.registry_generation)
         .unwrap();
     assert_eq!(ambiguous.ledger.resource(registry_server).close_count, 1);
+    assert_eq!(ambiguous.begin(), Err(ModelError::CleanupBlocked));
+    ambiguous.rebuild_console_launcher_authority().unwrap();
     assert!(ambiguous.begin().is_ok());
 }
 
@@ -2019,6 +2069,7 @@ fn delayed_cleanup_and_failure_exhaustion_block_overlap() {
         model
             .registry_generation_terminal_reaped(event.registry_generation)
             .unwrap();
+        model.rebuild_console_launcher_authority().unwrap();
         if generation + 1 < MAX_FAILED_GENERATIONS {
             assert!(model.current.is_none());
         }
@@ -2084,4 +2135,82 @@ fn status_loss_is_fatal_and_ready_has_no_circular_job_dependency() {
         (Some(Failure::StatusLost), Some(Failure::StatusLost))
     );
     complete_poisoned_failure(&mut model, event);
+}
+
+#[test]
+fn pre_registry_rejection_does_not_block_a_later_install() {
+    let mut model = Model::new();
+    model.stage_to(Phase::OuterMoveCommitted).unwrap();
+    model.receiver_policy_rejects_after_move().unwrap();
+    let replacement = launch_operating(&mut model);
+    model.normal_exit(TerminalEvent(replacement)).unwrap();
+    model
+        .registry_actor_observes_client_peer_close(replacement)
+        .unwrap();
+    model.ledger.assert_exact_accounting();
+}
+
+#[test]
+fn registry_recovery_refreshes_console_and_outer_launcher_authority() {
+    let mut model = Model::new();
+    let old = model.stage_to(Phase::RegistryMoveCommitted).unwrap();
+    model
+        .fail_current(Failure::Injected(Phase::RegistryMoveCommitted))
+        .unwrap();
+    model.cleanup_after_failure().unwrap();
+    model
+        .registry_generation_terminal_reaped(old.registry_generation)
+        .unwrap();
+    assert_eq!(model.begin(), Err(ModelError::CleanupBlocked));
+    model.rebuild_console_launcher_authority().unwrap();
+    let new = model.begin().unwrap();
+    assert_ne!(old.console, new.console);
+    assert_ne!(old.outer_connection, new.outer_connection);
+    assert_ne!(
+        old.outer_connection_generation,
+        new.outer_connection_generation
+    );
+}
+
+#[test]
+fn registry_sweep_and_client_admission_use_separate_bounds() {
+    let mut full_snapshot = Model::new();
+    let event = full_snapshot
+        .stage_to(Phase::RegistryMoveCommitted)
+        .unwrap();
+    let mut first = None;
+    for _ in 0..MAX_REGISTRY_ENDPOINTS {
+        let slot = full_snapshot.install_unrelated_registry_slot().unwrap();
+        first.get_or_insert(slot);
+    }
+    let first = first.unwrap();
+    full_snapshot.ledger.close(first.peer, Owner::Init).unwrap();
+    full_snapshot.registry_sweep().unwrap();
+    assert_eq!(full_snapshot.ledger.owner(first.server), Ok(Owner::Closed));
+    assert!(full_snapshot.attempt().matches(event));
+
+    let mut within_client_limit = Model::new();
+    within_client_limit
+        .stage_to(Phase::RegistryMoveCommitted)
+        .unwrap();
+    for _ in 0..(MAX_REGISTRY_CLIENTS - 1) {
+        within_client_limit
+            .install_unrelated_registry_slot()
+            .unwrap();
+    }
+    within_client_limit.registry_sweep().unwrap();
+    within_client_limit.registry_process_install().unwrap();
+
+    let mut exhausted_clients = Model::new();
+    exhausted_clients
+        .stage_to(Phase::RegistryMoveCommitted)
+        .unwrap();
+    for _ in 0..MAX_REGISTRY_CLIENTS {
+        exhausted_clients.install_unrelated_registry_slot().unwrap();
+    }
+    exhausted_clients.registry_sweep().unwrap();
+    assert_eq!(
+        exhausted_clients.registry_process_install(),
+        Err(ModelError::Exhausted)
+    );
 }
