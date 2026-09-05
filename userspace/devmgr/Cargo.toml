@@ -28,6 +28,7 @@ wyr1c5-production = ["native-devmgr"]
 wyr1c6-production = ["wyr1c5-production"]
 wyr1c6-selector29 = ["wyr1c6-production"]
 wyr1d-production = ["wyr1c5-production"]
+wyr1e-production = ["wyr1d-production", "wyr1c6-production"]
 dw1e3-selector31 = [
     "wyr1d-production",
     "dep:wyrmroot-dw1e3-com2-test",

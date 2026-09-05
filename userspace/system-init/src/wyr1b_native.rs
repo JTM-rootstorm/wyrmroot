@@ -130,7 +130,7 @@ impl ShellControllerState {
         Ok(())
     }
 
-    fn poison(&mut self, generation: u64) {
+    pub(crate) fn poison(&mut self, generation: u64) {
         if self.health == (ShellRegistryHealth::Healthy { generation }) {
             self.health = ShellRegistryHealth::Poisoned { generation };
         }
@@ -139,6 +139,17 @@ impl ShellControllerState {
     pub(crate) fn install_replacement(
         &mut self,
         topology: &mut RegistryTopology,
+        generation: u64,
+    ) -> Result<(), InitError> {
+        self.reserve_replacement_generation(generation)?;
+        topology
+            .restart(generation)
+            .map_err(InitError::Wyr1BModel)?;
+        self.commit_replacement_generation(generation)
+    }
+
+    pub(crate) fn reserve_replacement_generation(
+        &mut self,
         generation: u64,
     ) -> Result<(), InitError> {
         let ShellRegistryHealth::Poisoned {
@@ -158,9 +169,22 @@ impl ShellControllerState {
             self.health = ShellRegistryHealth::Exhausted;
             return Err(InitError::Cleanup);
         }
-        topology
-            .restart(generation)
-            .map_err(InitError::Wyr1BModel)?;
+        Ok(())
+    }
+
+    pub(crate) fn commit_replacement_generation(
+        &mut self,
+        generation: u64,
+    ) -> Result<(), InitError> {
+        let ShellRegistryHealth::Poisoned {
+            generation: previous,
+        } = self.health
+        else {
+            return Err(InitError::WrongActivationOrder);
+        };
+        if generation <= previous {
+            return Err(InitError::Accounting);
+        }
         self.health = ShellRegistryHealth::Healthy { generation };
         self.next_install_transaction = WYRMSH_FIRST_INSTALL_TRANSACTION;
         Ok(())
@@ -393,6 +417,9 @@ pub(crate) fn validate_retained_bootfs_c1(
         .role(RoleId::Uart16550d)
         .ok_or(InitError::WrongManifestProfile)?
         .executable_identity();
+    #[cfg(feature = "wyr1e-production")]
+    let controller = SystemInit::from_wyr1e_manifest(manifest)?;
+    #[cfg(not(feature = "wyr1e-production"))]
     let controller = SystemInit::from_wyr1c_manifest(manifest)?;
     for role in manifest.roles() {
         let entry = archive.lookup(role.path().as_bytes()).map_err(map_lookup)?;
@@ -3667,6 +3694,51 @@ where
         )
         .is_err()
     })
+}
+
+/// Retires one product consoled generation and its foreground shell while
+/// preserving already-published background jobs as invisible controller-owned
+/// orphans. The caller retains the dispatcher so those jobs can still reap.
+#[cfg(feature = "wyr1e-production")]
+pub(crate) fn retire_console_product<S, W>(
+    system: &mut S,
+    waits: &mut W,
+    jobs: &mut JobDispatcher,
+    peer: InstalledPeer,
+    terminate: bool,
+) -> Result<(), InitError>
+where
+    S: Wyr1BPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let outer = jobs
+        .jobs
+        .loaded_job_for_owner(peer.grant.endpoint_id, peer.grant.endpoint_generation)
+        .map_err(InitError::Wyr1BModel)?;
+    let disconnected = jobs
+        .disconnect_owned_session(peer.grant)
+        .map_err(InitError::Wyr1BModel)?;
+    let expected_owner = SessionOwner {
+        process: peer.loaded.process,
+        launch_channel: peer.loaded.launch_channel,
+        task_group: peer.task_group,
+    };
+    // Accounting disagreement must not short-circuit cleanup of resources we
+    // still own. Preserve the mismatch as a cleanup failure after attempting
+    // every independent close in this generation.
+    let owner_mismatch = disconnected.owner != Some(expected_owner);
+    let outer_mismatch = disconnected.outer_job.is_some();
+    let channel_close_failed = system.close_handle(disconnected.channel).is_err();
+    let owner_cleanup_failed = cleanup_session_owner(system, waits, disconnected.owner, terminate);
+    let mut failed = owner_mismatch | outer_mismatch | channel_close_failed | owner_cleanup_failed;
+    if let Some(outer) = outer {
+        failed |= cleanup_shell_before_publication(system, waits, jobs, outer).is_err();
+    }
+    if failed {
+        Err(InitError::Cleanup)
+    } else {
+        Ok(())
+    }
 }
 
 fn drain_job_dispatcher<S, W>(
@@ -7222,6 +7294,128 @@ mod tests {
         );
         assert_eq!(state.health(), ShellRegistryHealth::Exhausted);
         assert_eq!(topology.generation(), generation);
+    }
+
+    #[cfg(feature = "wyr1e-production")]
+    #[test]
+    fn e6_console_accounting_mismatch_still_closes_every_owned_resource() {
+        let grant = grant(EndpointKind::LaunchSession, 1, 1);
+        let actual_owner = SessionOwner {
+            process: DwHandle(201),
+            launch_channel: DwHandle(202),
+            task_group: DwHandle(203),
+        };
+        let mut jobs = JobDispatcher::new();
+        jobs.install_scoped_session(grant, DwHandle(90), LaunchSessionScope::ConsoleLauncher)
+            .unwrap();
+        jobs.attach_session_owner(grant, actual_owner).unwrap();
+        let mismatched_peer = InstalledPeer {
+            grant,
+            loaded: LoadedProcess {
+                process: DwHandle(101),
+                launch_channel: DwHandle(102),
+            },
+            task_group: DwHandle(103),
+        };
+        let mut platform = MockPlatform::new();
+        let mut waits = TerminalWaits;
+
+        assert_eq!(
+            retire_console_product(&mut platform, &mut waits, &mut jobs, mismatched_peer, false,),
+            Err(InitError::Cleanup)
+        );
+        assert_eq!(jobs.session_count(), 0);
+        assert_eq!(
+            &platform.closed[..platform.close_count],
+            &[
+                DwHandle(90),
+                actual_owner.launch_channel,
+                actual_owner.process,
+                actual_owner.task_group,
+            ]
+        );
+    }
+
+    #[cfg(feature = "wyr1e-production")]
+    #[test]
+    fn e6_console_retirement_orphans_background_jobs_without_draining_them() {
+        let console = grant(EndpointKind::LaunchSession, 1, 1);
+        let shell_jobs = grant(EndpointKind::LaunchSession, 2, 2);
+        let console_owner = SessionOwner {
+            process: DwHandle(201),
+            launch_channel: DwHandle(202),
+            task_group: DwHandle(203),
+        };
+        let mut jobs = JobDispatcher::new();
+        jobs.install_scoped_session(console, DwHandle(90), LaunchSessionScope::ConsoleLauncher)
+            .unwrap();
+        jobs.attach_session_owner(console, console_owner).unwrap();
+
+        let outer = jobs
+            .jobs
+            .begin_launch(LaunchReservation {
+                connection_id: console.endpoint_id,
+                generation: console.endpoint_generation,
+                transaction_id: 1,
+            })
+            .unwrap();
+        jobs.jobs.commit_launch(outer, 301, 302, 303).unwrap();
+        jobs.install_scoped_session(shell_jobs, DwHandle(91), LaunchSessionScope::ShellJobs)
+            .unwrap();
+        jobs.attach_outer_job(shell_jobs, outer.job_id).unwrap();
+        let background = jobs
+            .jobs
+            .begin_launch(LaunchReservation {
+                connection_id: shell_jobs.endpoint_id,
+                generation: shell_jobs.endpoint_generation,
+                transaction_id: 1,
+            })
+            .unwrap();
+        jobs.jobs.commit_launch(background, 401, 402, 403).unwrap();
+
+        let mut platform = MockPlatform::new();
+        let mut waits = TerminalWaits;
+        retire_console_product(
+            &mut platform,
+            &mut waits,
+            &mut jobs,
+            InstalledPeer {
+                grant: console,
+                loaded: LoadedProcess {
+                    process: console_owner.process,
+                    launch_channel: console_owner.launch_channel,
+                },
+                task_group: console_owner.task_group,
+            },
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(jobs.session_count(), 0);
+        assert_eq!(jobs.jobs.live_jobs(), 1);
+        assert_eq!(jobs.jobs.orphan_jobs(), 1);
+        assert_eq!(
+            jobs.jobs.loaded_job(background.job_id).unwrap().loaded,
+            LoadedProcess {
+                process: DwHandle(401),
+                launch_channel: DwHandle(403),
+            }
+        );
+        for retained in [DwHandle(401), DwHandle(402), DwHandle(403)] {
+            assert!(!platform.closed[..platform.close_count].contains(&retained));
+        }
+        for retired in [
+            DwHandle(90),
+            DwHandle(91),
+            console_owner.launch_channel,
+            console_owner.process,
+            console_owner.task_group,
+            DwHandle(301),
+            DwHandle(302),
+            DwHandle(303),
+        ] {
+            assert!(platform.closed[..platform.close_count].contains(&retired));
+        }
     }
 
     #[test]
