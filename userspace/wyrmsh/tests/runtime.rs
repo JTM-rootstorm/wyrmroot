@@ -92,6 +92,7 @@ struct Fixture {
     next_handle: u64,
     created: Vec<(DwHandle, DwRights)>,
     moved: Vec<Vec<DwHandleTransferV1>>,
+    handle_send_attempts: Vec<Vec<DwHandleTransferV1>>,
     child_incoming: VecDeque<(DwHandle, Option<Vec<u8>>)>,
     child_receive_trace: Vec<(DwHandle, bool)>,
     fail_move_send: bool,
@@ -155,6 +156,7 @@ impl Fixture {
             next_handle: 1000,
             created: vec![],
             moved: vec![],
+            handle_send_attempts: vec![],
             child_incoming: VecDeque::new(),
             child_receive_trace: vec![],
             fail_move_send: false,
@@ -338,13 +340,18 @@ impl WyrmshSystem for Fixture {
         bytes: &[u8],
         transfers: &[DwHandleTransferV1],
     ) -> Result<(), NativeError> {
-        if self.fail_move_send && !transfers.is_empty() {
-            self.fail_move_send = false;
-            return Err(NativeError::Status(DW_STATUS_PEER_CLOSED));
-        }
         if channel == SHELL_JOBS && !transfers.is_empty() {
             let kind = request_kind(bytes, transfers.len());
             self.last_job_kind = Some(kind);
+            self.handle_send_attempts.push(transfers.to_vec());
+            if self.fail_move_send {
+                self.fail_move_send = false;
+                return Err(NativeError::Status(DW_STATUS_PEER_CLOSED));
+            }
+            if self.control_send_would_block.front() == Some(&channel) {
+                self.control_send_would_block.pop_front();
+                return Err(NativeError::Status(DW_STATUS_WOULD_BLOCK));
+            }
             self.trace.push(Trace::JobSend(kind));
         }
         self.moved.push(transfers.to_vec());
@@ -1854,6 +1861,72 @@ fn foreground_run_moves_staging_rights_drains_both_outputs_then_closes() {
             .windows(10)
             .any(|bytes| bytes == b"hello-err\n")
     );
+}
+
+#[test]
+fn handle_bearing_launch_retries_the_same_moves_and_commits_once() {
+    let mut fixture = Fixture::new(&[b"run bin/hello\nexit\n"]);
+    fixture.control_send_would_block.push_back(SHELL_JOBS);
+    fixture.queue_control(
+        SHELL_JOBS,
+        &job_reply(1, LaunchMessageType::LaunchAccepted, 41),
+    );
+    fixture.queue_control(SHELL_JOBS, &terminal_reply(2, 41, normal_result(0)));
+    fixture.queue_control(SHELL_JOBS, &job_reply(3, LaunchMessageType::Closed, 41));
+    fixture
+        .child_incoming
+        .extend([(CHILD_STDOUT_RETAINED, None), (CHILD_STDERR_RETAINED, None)]);
+
+    assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+    assert_eq!(fixture.handle_send_attempts.len(), 2);
+    assert_eq!(
+        fixture.handle_send_attempts[0],
+        fixture.handle_send_attempts[1]
+    );
+    assert_eq!(fixture.handle_send_attempts[0].len(), 3);
+    assert_eq!(
+        fixture
+            .moved
+            .iter()
+            .filter(|transfers| !transfers.is_empty())
+            .count(),
+        1
+    );
+    assert_eq!(
+        fixture
+            .trace
+            .iter()
+            .filter(|event| **event == Trace::JobSend(LaunchMessageType::Launch))
+            .count(),
+        1
+    );
+    assert_eq!(
+        fixture
+            .control_requests
+            .iter()
+            .filter_map(|(handle, bytes)| {
+                (*handle == SHELL_JOBS)
+                    .then(|| parse_launch_message(bytes, 3).ok())
+                    .flatten()
+            })
+            .filter(|parsed| matches!(parsed.message, LaunchMessage::Launch(_)))
+            .count(),
+        1
+    );
+    for retained in [
+        CHILD_STDIN_RETAINED,
+        CHILD_STDOUT_RETAINED,
+        CHILD_STDERR_RETAINED,
+    ] {
+        assert_eq!(
+            fixture
+                .closed
+                .iter()
+                .filter(|actual| **actual == retained)
+                .count(),
+            1
+        );
+    }
 }
 
 #[test]
