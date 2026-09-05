@@ -8,10 +8,12 @@
 #![forbid(unsafe_code)]
 
 mod command;
+mod input;
 mod parser;
 
 pub use command::{
     Arity, COMMANDS, Command, CommandName, CommandSpec, JobIdError, MAX_PATH_BYTES, UsageError,
     parse_job_id, validate_path,
 };
+pub use input::{InputDecoder, InputError, InputEvent};
 pub use parser::{ArgRange, Arguments, MAX_ARGUMENTS, MAX_LINE_BYTES, ParseError, Parser};
