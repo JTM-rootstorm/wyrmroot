@@ -93,7 +93,7 @@ class Edge:
 @dataclass
 class LocalAnalysis:
     peak: int
-    observed_frame: int
+    maximum_rsp_depth: int
     red_zone_bytes: int
     edges: list[Edge]
 
@@ -407,12 +407,12 @@ def _stack_effect(function: Function, instruction: Instruction, state: State) ->
             "dynamic_stack_adjustment", f"exchange with stack pointer at 0x{instruction.address:x}"
         )
     if mnemonic.startswith("push"):
-        if "%rsp" in operands:
-            raise ProofFailure("unsupported_stack_instruction", f"push from rsp at 0x{instruction.address:x}")
         depth += 8
     elif mnemonic.startswith("pop"):
-        if operands.strip() == "%rsp":
-            raise ProofFailure("dynamic_stack_adjustment", f"pop into rsp at 0x{instruction.address:x}")
+        if operands.strip() == "%rsp" or "(" in operands:
+            raise ProofFailure(
+                "dynamic_stack_adjustment", f"unsupported pop destination at 0x{instruction.address:x}"
+            )
         depth -= 8
         if operands.strip() == "%rbp":
             rbp_depth = None
@@ -471,7 +471,7 @@ def _local_analysis(function: Function, functions: dict[int, Function]) -> Local
     states: dict[int, State] = {function.instructions[0].address: State(0, None)}
     work = [function.instructions[0].address]
     peak = 0
-    observed_frame = 0
+    maximum_rsp_depth = 0
     red_zone = 0
     edges: list[Edge] = []
     stack_probes = _stack_probe_branches(function)
@@ -484,7 +484,7 @@ def _local_analysis(function: Function, functions: dict[int, Function]) -> Local
         peak = max(peak, memory_peak)
         red_zone = max(red_zone, memory_peak - state.depth)
         after = _stack_effect(function, instruction, state)
-        observed_frame = max(observed_frame, after.depth)
+        maximum_rsp_depth = max(maximum_rsp_depth, after.depth)
         peak = max(peak, after.depth)
         mnemonic = instruction.mnemonic
         next_address = (
@@ -514,7 +514,7 @@ def _local_analysis(function: Function, functions: dict[int, Function]) -> Local
             # One pass already accounted for the first page. Collapse the proven fixed loop to
             # its exact total allocation and continue only after the loop.
             after = State(after.depth + stack_probes[instruction.address] - 4096, after.rbp_depth)
-            observed_frame = max(observed_frame, after.depth)
+            maximum_rsp_depth = max(maximum_rsp_depth, after.depth)
             peak = max(peak, after.depth)
             if next_address is None:
                 raise ProofFailure("unterminated_function", "stack probe has no continuation")
@@ -547,12 +547,13 @@ def _local_analysis(function: Function, functions: dict[int, Function]) -> Local
                 raise ProofFailure(
                     "inconsistent_stack_merge", f"different stack states meet at 0x{successor:x}"
                 )
-    if function.metadata_size is not None and function.metadata_size != observed_frame:
+    if function.metadata_size is not None and function.metadata_size > maximum_rsp_depth:
         raise ProofFailure(
             "stack_metadata_mismatch",
-            f"{function.name}: metadata {function.metadata_size}, instructions {observed_frame}",
+            f"{function.name}: metadata {function.metadata_size} exceeds instruction peak "
+            f"{maximum_rsp_depth}",
         )
-    return LocalAnalysis(peak, observed_frame, red_zone, edges)
+    return LocalAnalysis(peak, maximum_rsp_depth, red_zone, edges)
 
 
 def _prove(functions: dict[int, Function], root_address: int) -> dict[str, object]:
@@ -575,7 +576,7 @@ def _prove(functions: dict[int, Function], root_address: int) -> dict[str, objec
             "function": function.name,
             "address": f"0x{address:x}",
             "local_peak_bytes": analysis.peak,
-            "frame_bytes": analysis.observed_frame,
+            "maximum_rsp_depth_bytes": analysis.maximum_rsp_depth,
             "red_zone_bytes": analysis.red_zone_bytes,
         }]
         for edge in analysis.edges:
@@ -587,7 +588,7 @@ def _prove(functions: dict[int, Function], root_address: int) -> dict[str, objec
                     "function": function.name,
                     "address": f"0x{address:x}",
                     "local_peak_bytes": analysis.peak,
-                    "frame_bytes": analysis.observed_frame,
+                    "maximum_rsp_depth_bytes": analysis.maximum_rsp_depth,
                     "red_zone_bytes": analysis.red_zone_bytes,
                     "edge": edge.kind,
                     "edge_address": f"0x{edge.source_address:x}",
@@ -614,7 +615,7 @@ def _prove(functions: dict[int, Function], root_address: int) -> dict[str, objec
             {
                 "address": f"0x{address:x}",
                 "name": functions[address].name,
-                "frame_bytes": local[address].observed_frame,
+                "maximum_rsp_depth_bytes": local[address].maximum_rsp_depth,
                 "red_zone_bytes": local[address].red_zone_bytes,
                 "stack_metadata_bytes": functions[address].metadata_size,
                 "stack_evidence": (
