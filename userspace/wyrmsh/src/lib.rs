@@ -4,11 +4,15 @@
 
 //! Allocation-free WYR1-E shell startup and local-command runtime.
 
+mod inspection;
+
 use deepwyrm_syscall::{
     DW_DEADLINE_INFINITE, DW_DEADLINE_NOW, DW_OBJECT_TYPE_CHANNEL, DW_SIGNAL_PEER_CLOSED,
-    DW_SIGNAL_READABLE, DW_STATUS_TIMED_OUT, DwDeadline, DwHandle, DwObjectType,
-    DwReceivedHandleInfoV1, DwRights, DwSignals, DwWaitItemV1, DwWaitResultV1,
+    DW_SIGNAL_READABLE, DW_SIGNAL_WRITABLE, DW_STATUS_TIMED_OUT, DW_STATUS_WOULD_BLOCK, DwDeadline,
+    DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights, DwSignals, DwWaitItemV1,
+    DwWaitResultV1,
 };
+use inspection::{InspectionError, RegistrySequence, TransactionIds};
 use wyrmroot_loader::launch::{
     CHILD_CHANNEL_RIGHTS, HEADER_BYTES, LaunchError, LaunchProfile, WYRMSH_BYTES,
     encode_ready_for_profile, parse_wyrmsh_init,
@@ -29,6 +33,11 @@ use wyrmroot_wyrmsh_core::{
 const HANDLE_COUNT: usize = 6;
 const CLEAR_DISPLAY: &[u8] = b"\x1b[2J\x1b[H";
 const SUBMISSION_NEWLINE: &[u8] = b"\n";
+const CONTROL_HANDLE_CAPACITY: usize = 4;
+const REGISTRY_REPLY_BYTES: usize = wyrmroot_registry_proto::SERVICE_LIST_PREFIX_BYTES
+    + wyrmroot_registry_proto::MAX_SERVICE_LIST_RECORDS
+        * wyrmroot_registry_proto::SERVICE_LIST_RECORD_BYTES;
+const JOB_REPLY_BYTES: usize = 56 + wyrmroot_launch_proto::MAX_LIVE_JOBS * 8;
 
 /// Native operations that can fail before or during one shell generation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,6 +51,9 @@ pub enum NativeOperation {
     CloseBootstrap = 6,
     Wait = 7,
     Cleanup = 8,
+    ControlSend = 9,
+    ControlReceive = 10,
+    MonotonicClock = 11,
 }
 
 /// The endpoint whose loss makes the shell generation unusable.
@@ -87,6 +99,9 @@ pub enum ShellError {
     UnexpectedBootstrapRelease(DwSignals),
     RequiredEndpointLost(EndpointRole),
     Stream(StreamError),
+    InspectionProtocol,
+    InspectionTimeout,
+    TransactionExhausted,
 }
 
 impl ShellError {
@@ -117,6 +132,9 @@ impl ShellError {
                     }
             }
             Self::Stream(_) => PREFIX | 7,
+            Self::InspectionProtocol => PREFIX | 8,
+            Self::InspectionTimeout => PREFIX | 9,
+            Self::TransactionExhausted => PREFIX | 10,
         }
     }
 }
@@ -140,6 +158,7 @@ pub trait WyrmshSystem: StreamSystem {
         items: &[DwWaitItemV1],
         deadline: DwDeadline,
     ) -> Result<DwWaitResultV1, NativeError>;
+    fn monotonic_active_now(&mut self) -> Result<u64, NativeError>;
 }
 
 /// Validates the native ABI and the exact canonical shell argv/environment.
@@ -310,6 +329,7 @@ struct Shell {
     stdout: NativeOutput,
     stderr: NativeOutput,
     controls: Controls,
+    transactions: TransactionIds,
 }
 
 impl Shell {
@@ -327,6 +347,7 @@ impl Shell {
             stdout: NativeOutput::new(endpoints[1]),
             stderr: NativeOutput::new(endpoints[2]),
             controls,
+            transactions: TransactionIds::new(),
         }
     }
 
@@ -417,12 +438,16 @@ impl Shell {
             .parse(self.editor.line().as_bytes())
             .map_err(CommandError::Parse)
             .and_then(|arguments| arguments.command().map_err(CommandError::Usage));
+        let stderr_handle = self.stderr.endpoint().handle();
         let exit = match command {
             Ok(command) => dispatch_local(
                 system,
                 &mut self.stdout,
-                self.stderr.endpoint().handle(),
+                &mut self.stderr,
+                stderr_handle,
+                self.identity,
                 self.controls,
+                &mut self.transactions,
                 command,
             )?,
             Err(error) => {
@@ -468,11 +493,18 @@ enum CommandError {
     Usage(UsageError),
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "explicit shell capability custody"
+)]
 fn dispatch_local<System: WyrmshSystem>(
     system: &mut System,
     stdout: &mut NativeOutput,
+    stderr: &mut NativeOutput,
     stderr_handle: DwHandle,
+    identity: ShellIdentity,
     controls: Controls,
+    transactions: &mut TransactionIds,
     command: Command<'_>,
 ) -> Result<bool, ShellError> {
     match command {
@@ -502,13 +534,14 @@ fn dispatch_local<System: WyrmshSystem>(
             write_stdout(system, stdout, stderr_handle, controls, CLEAR_DISPLAY)?;
         }
         Command::Exit => return Ok(true),
-        Command::Services
-        | Command::Tasks
-        | Command::Status
-        | Command::Run { .. }
-        | Command::Spawn { .. }
-        | Command::Wait(_)
-        | Command::Terminate(_) => {
+        Command::Services => {
+            inspect_services(system, stdout, stderr, identity, controls, transactions)?
+        }
+        Command::Tasks => inspect_tasks(system, stdout, stderr, identity, controls, transactions)?,
+        Command::Status => {
+            inspect_status(system, stdout, stderr, identity, controls, transactions)?
+        }
+        Command::Run { .. } | Command::Spawn { .. } | Command::Wait(_) | Command::Terminate(_) => {
             let name = command_name(command);
             write_stdout(system, stdout, stderr_handle, controls, b"unavailable: ")?;
             write_stdout(system, stdout, stderr_handle, controls, name.as_bytes())?;
@@ -516,6 +549,745 @@ fn dispatch_local<System: WyrmshSystem>(
         }
     }
     Ok(false)
+}
+
+fn inspect_services<System: WyrmshSystem>(
+    system: &mut System,
+    stdout: &mut NativeOutput,
+    stderr: &mut NativeOutput,
+    identity: ShellIdentity,
+    controls: Controls,
+    transactions: &mut TransactionIds,
+) -> Result<(), ShellError> {
+    let transaction = match transactions.registry() {
+        Ok(value) => value,
+        Err(error) => {
+            return inspection_failure(system, stderr, stdout, controls, "services", error);
+        }
+    };
+    let mut request = [0_u8; wyrmroot_registry_proto::HEADER_BYTES];
+    let size = inspection::encode_registry_request(identity, transaction, &mut request)
+        .map_err(|_| ShellError::InspectionProtocol)?;
+    let deadline = control_deadline(system)?;
+    if let Err(error) = send_control(
+        system,
+        controls.registry,
+        EndpointRole::Registry,
+        controls,
+        stdout.endpoint().handle(),
+        stderr.endpoint().handle(),
+        &request[..size],
+        deadline,
+    ) {
+        return control_transport_failure(system, stderr, stdout, controls, "services", error);
+    }
+
+    let mut sequence = RegistrySequence::new();
+    loop {
+        let mut response = [0_u8; REGISTRY_REPLY_BYTES];
+        let used = match receive_control(
+            system,
+            controls.registry,
+            EndpointRole::Registry,
+            controls,
+            stdout.endpoint().handle(),
+            stderr.endpoint().handle(),
+            &mut response,
+            deadline,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                return control_transport_failure(
+                    system, stderr, stdout, controls, "services", error,
+                );
+            }
+        };
+        match sequence.accept(identity, transaction, &response[..used], 0) {
+            Ok(complete) => {
+                if let Err(error) = ensure_before_control_deadline(system, deadline) {
+                    return control_transport_failure(
+                        system, stderr, stdout, controls, "services", error,
+                    );
+                }
+                if complete {
+                    break;
+                }
+            }
+            Err(error) => {
+                return inspection_failure(system, stderr, stdout, controls, "services", error);
+            }
+        }
+    }
+
+    if sequence.len() == 0 {
+        return write_stdout(
+            system,
+            stdout,
+            stderr.endpoint().handle(),
+            controls,
+            b"services: empty\n",
+        );
+    }
+    for index in 0..sequence.len() {
+        let record = sequence
+            .record(index)
+            .ok_or(ShellError::InspectionProtocol)?;
+        write_stdout(
+            system,
+            stdout,
+            stderr.endpoint().handle(),
+            controls,
+            b"service name=",
+        )?;
+        write_stdout(
+            system,
+            stdout,
+            stderr.endpoint().handle(),
+            controls,
+            record.name(),
+        )?;
+        write_stdout(
+            system,
+            stdout,
+            stderr.endpoint().handle(),
+            controls,
+            b" protocol=",
+        )?;
+        write_u64(
+            system,
+            stdout,
+            stderr.endpoint().handle(),
+            controls,
+            record.protocol_id,
+        )?;
+        write_stdout(
+            system,
+            stdout,
+            stderr.endpoint().handle(),
+            controls,
+            b" versions=",
+        )?;
+        for version_index in 0..usize::from(record.version_count) {
+            if version_index != 0 {
+                write_stdout(system, stdout, stderr.endpoint().handle(), controls, b",")?;
+            }
+            let version = record.versions[version_index];
+            write_u64(
+                system,
+                stdout,
+                stderr.endpoint().handle(),
+                controls,
+                u64::from(version.major),
+            )?;
+            write_stdout(system, stdout, stderr.endpoint().handle(), controls, b".")?;
+            write_u64(
+                system,
+                stdout,
+                stderr.endpoint().handle(),
+                controls,
+                u64::from(version.minor),
+            )?;
+        }
+        write_stdout(
+            system,
+            stdout,
+            stderr.endpoint().handle(),
+            controls,
+            b" generation=",
+        )?;
+        write_u64(
+            system,
+            stdout,
+            stderr.endpoint().handle(),
+            controls,
+            record.service_generation,
+        )?;
+        write_stdout(system, stdout, stderr.endpoint().handle(), controls, b"\n")?;
+    }
+    Ok(())
+}
+
+fn inspect_tasks<System: WyrmshSystem>(
+    system: &mut System,
+    stdout: &mut NativeOutput,
+    stderr: &mut NativeOutput,
+    identity: ShellIdentity,
+    controls: Controls,
+    transactions: &mut TransactionIds,
+) -> Result<(), ShellError> {
+    let transaction = match transactions.launch() {
+        Ok(value) => value,
+        Err(error) => return inspection_failure(system, stderr, stdout, controls, "tasks", error),
+    };
+    let mut request = [0_u8; wyrmroot_launch_proto::HEADER_BYTES];
+    let size = inspection::encode_launch_request(identity, transaction, &mut request)
+        .map_err(|_| ShellError::InspectionProtocol)?;
+    let deadline = control_deadline(system)?;
+    if let Err(error) = send_control(
+        system,
+        controls.shell_jobs,
+        EndpointRole::ShellJobs,
+        controls,
+        stdout.endpoint().handle(),
+        stderr.endpoint().handle(),
+        &request[..size],
+        deadline,
+    ) {
+        return control_transport_failure(system, stderr, stdout, controls, "tasks", error);
+    }
+    let mut response = [0_u8; JOB_REPLY_BYTES];
+    let used = match receive_control(
+        system,
+        controls.shell_jobs,
+        EndpointRole::ShellJobs,
+        controls,
+        stdout.endpoint().handle(),
+        stderr.endpoint().handle(),
+        &mut response,
+        deadline,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            return control_transport_failure(system, stderr, stdout, controls, "tasks", error);
+        }
+    };
+    let jobs = match inspection::decode_jobs(identity, transaction, &response[..used], 0) {
+        Ok(value) => value,
+        Err(error) => return inspection_failure(system, stderr, stdout, controls, "tasks", error),
+    };
+    if let Err(error) = ensure_before_control_deadline(system, deadline) {
+        return control_transport_failure(system, stderr, stdout, controls, "tasks", error);
+    }
+    if jobs.is_empty() {
+        return write_stdout(
+            system,
+            stdout,
+            stderr.endpoint().handle(),
+            controls,
+            b"tasks: empty\n",
+        );
+    }
+    for index in 0..jobs.len() {
+        let job = jobs.get(index).ok_or(ShellError::InspectionProtocol)?;
+        write_stdout(
+            system,
+            stdout,
+            stderr.endpoint().handle(),
+            controls,
+            b"task job=",
+        )?;
+        write_u64(system, stdout, stderr.endpoint().handle(), controls, job)?;
+        // LIST_JOBS membership means active and visible to this exact ShellJobs
+        // connection. It does not distinguish Running from Terminating.
+        write_stdout(
+            system,
+            stdout,
+            stderr.endpoint().handle(),
+            controls,
+            b" state=active\n",
+        )?;
+    }
+    Ok(())
+}
+
+fn inspect_status<System: WyrmshSystem>(
+    system: &mut System,
+    stdout: &mut NativeOutput,
+    stderr: &mut NativeOutput,
+    identity: ShellIdentity,
+    controls: Controls,
+    transactions: &mut TransactionIds,
+) -> Result<(), ShellError> {
+    let transaction = match transactions.status() {
+        Ok(value) => value,
+        Err(error) => return inspection_failure(system, stderr, stdout, controls, "status", error),
+    };
+    let deadline = control_deadline(system)?;
+    let mut request = [0_u8; wyrmroot_console_proto::HEADER_BYTES];
+    let size = inspection::encode_status_request(identity, transaction, &mut request)
+        .map_err(|_| ShellError::InspectionProtocol)?;
+    if let Err(error) = send_control(
+        system,
+        controls.console_status,
+        EndpointRole::ConsoleStatus,
+        controls,
+        stdout.endpoint().handle(),
+        stderr.endpoint().handle(),
+        &request[..size],
+        deadline,
+    ) {
+        return control_transport_failure(system, stderr, stdout, controls, "status", error);
+    }
+    let mut response = [0_u8; wyrmroot_console_proto::MAX_MESSAGE_BYTES];
+    let used = match receive_control(
+        system,
+        controls.console_status,
+        EndpointRole::ConsoleStatus,
+        controls,
+        stdout.endpoint().handle(),
+        stderr.endpoint().handle(),
+        &mut response,
+        deadline,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            return control_transport_failure(system, stderr, stdout, controls, "status", error);
+        }
+    };
+    let snapshot = match inspection::decode_status(identity, transaction, &response[..used], 0) {
+        Ok(value) => value,
+        Err(error) => return inspection_failure(system, stderr, stdout, controls, "status", error),
+    };
+    if let Err(error) = ensure_before_control_deadline(system, deadline) {
+        return control_transport_failure(system, stderr, stdout, controls, "status", error);
+    }
+
+    write_stdout(
+        system,
+        stdout,
+        stderr.endpoint().handle(),
+        controls,
+        b"status state=",
+    )?;
+    write_stdout(
+        system,
+        stdout,
+        stderr.endpoint().handle(),
+        controls,
+        status_state_name(snapshot.state),
+    )?;
+    write_stdout(
+        system,
+        stdout,
+        stderr.endpoint().handle(),
+        controls,
+        b" shell-generation=",
+    )?;
+    write_u64(
+        system,
+        stdout,
+        stderr.endpoint().handle(),
+        controls,
+        identity.child_generation,
+    )?;
+    write_stdout(
+        system,
+        stdout,
+        stderr.endpoint().handle(),
+        controls,
+        b" endpoints=healthy flags=",
+    )?;
+    write_u64(
+        system,
+        stdout,
+        stderr.endpoint().handle(),
+        controls,
+        u64::from(snapshot.flags),
+    )?;
+    if snapshot.flags & wyrmroot_console_proto::FLAG_SERIAL_PRESENT != 0 {
+        write_stdout(
+            system,
+            stdout,
+            stderr.endpoint().handle(),
+            controls,
+            b" registry-generation=",
+        )?;
+        write_u64(
+            system,
+            stdout,
+            stderr.endpoint().handle(),
+            controls,
+            snapshot.serial_registry_generation,
+        )?;
+        write_stdout(
+            system,
+            stdout,
+            stderr.endpoint().handle(),
+            controls,
+            b" serial-generation=",
+        )?;
+        write_u64(
+            system,
+            stdout,
+            stderr.endpoint().handle(),
+            controls,
+            snapshot.raw_stream_generation,
+        )?;
+        write_stdout(
+            system,
+            stdout,
+            stderr.endpoint().handle(),
+            controls,
+            b" publication-generation=",
+        )?;
+        write_u64(
+            system,
+            stdout,
+            stderr.endpoint().handle(),
+            controls,
+            snapshot.publication_generation,
+        )?;
+        write_stdout(
+            system,
+            stdout,
+            stderr.endpoint().handle(),
+            controls,
+            b" driver-attempt=",
+        )?;
+        write_u64(
+            system,
+            stdout,
+            stderr.endpoint().handle(),
+            controls,
+            snapshot.driver_attempt,
+        )?;
+    }
+    if snapshot.flags & wyrmroot_console_proto::FLAG_CHILD_PRESENT != 0 {
+        write_stdout(
+            system,
+            stdout,
+            stderr.endpoint().handle(),
+            controls,
+            b" child-generation=",
+        )?;
+        write_u64(
+            system,
+            stdout,
+            stderr.endpoint().handle(),
+            controls,
+            snapshot.child_generation,
+        )?;
+        write_stdout(
+            system,
+            stdout,
+            stderr.endpoint().handle(),
+            controls,
+            b" outer-job=",
+        )?;
+        write_u64(
+            system,
+            stdout,
+            stderr.endpoint().handle(),
+            controls,
+            snapshot.outer_job,
+        )?;
+    }
+    write_stdout(
+        system,
+        stdout,
+        stderr.endpoint().handle(),
+        controls,
+        b" peers=",
+    )?;
+    write_u64(
+        system,
+        stdout,
+        stderr.endpoint().handle(),
+        controls,
+        u64::from(snapshot.live_peer_mask),
+    )?;
+    write_stdout(
+        system,
+        stdout,
+        stderr.endpoint().handle(),
+        controls,
+        b" queues=",
+    )?;
+    for (index, value) in [
+        snapshot.input_queue_bytes,
+        snapshot.stdout_queue_bytes,
+        snapshot.stderr_queue_bytes,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if index != 0 {
+            write_stdout(system, stdout, stderr.endpoint().handle(), controls, b",")?;
+        }
+        write_u64(
+            system,
+            stdout,
+            stderr.endpoint().handle(),
+            controls,
+            u64::from(value),
+        )?;
+    }
+    write_stdout(
+        system,
+        stdout,
+        stderr.endpoint().handle(),
+        controls,
+        b" failures=",
+    )?;
+    write_u64(
+        system,
+        stdout,
+        stderr.endpoint().handle(),
+        controls,
+        u64::from(snapshot.child_failures),
+    )?;
+    write_stdout(system, stdout, stderr.endpoint().handle(), controls, b",")?;
+    write_u64(
+        system,
+        stdout,
+        stderr.endpoint().handle(),
+        controls,
+        u64::from(snapshot.serial_failures),
+    )?;
+    write_stdout(
+        system,
+        stdout,
+        stderr.endpoint().handle(),
+        controls,
+        b" last=",
+    )?;
+    write_u64(
+        system,
+        stdout,
+        stderr.endpoint().handle(),
+        controls,
+        snapshot.last_failure as u64,
+    )?;
+    write_stdout(system, stdout, stderr.endpoint().handle(), controls, b"\n")
+}
+
+fn inspection_failure<System: WyrmshSystem>(
+    system: &mut System,
+    stderr: &mut NativeOutput,
+    stdout: &NativeOutput,
+    controls: Controls,
+    command: &str,
+    error: InspectionError,
+) -> Result<(), ShellError> {
+    match error {
+        InspectionError::Registry(_) | InspectionError::Launch(_) | InspectionError::Console(_) => {
+            write_stderr(
+                system,
+                stderr,
+                stdout.endpoint().handle(),
+                controls,
+                b"unavailable: ",
+            )?;
+            write_stderr(
+                system,
+                stderr,
+                stdout.endpoint().handle(),
+                controls,
+                command.as_bytes(),
+            )?;
+            write_stderr(system, stderr, stdout.endpoint().handle(), controls, b"\n")?;
+            Err(ShellError::InspectionProtocol)
+        }
+        InspectionError::CounterOverflow => Err(ShellError::TransactionExhausted),
+        InspectionError::Encode
+        | InspectionError::Malformed
+        | InspectionError::Correlation
+        | InspectionError::Sequence => Err(ShellError::InspectionProtocol),
+    }
+}
+
+fn control_transport_failure<System: WyrmshSystem>(
+    system: &mut System,
+    stderr: &mut NativeOutput,
+    stdout: &NativeOutput,
+    controls: Controls,
+    command: &str,
+    error: ShellError,
+) -> Result<(), ShellError> {
+    if !matches!(error, ShellError::InspectionTimeout) {
+        return Err(error);
+    }
+    write_stderr(
+        system,
+        stderr,
+        stdout.endpoint().handle(),
+        controls,
+        b"unavailable: ",
+    )?;
+    write_stderr(
+        system,
+        stderr,
+        stdout.endpoint().handle(),
+        controls,
+        command.as_bytes(),
+    )?;
+    write_stderr(system, stderr, stdout.endpoint().handle(), controls, b"\n")?;
+    Err(ShellError::InspectionTimeout)
+}
+
+fn control_deadline<System: WyrmshSystem>(system: &mut System) -> Result<DwDeadline, ShellError> {
+    let deadline = system
+        .monotonic_active_now()
+        .map_err(|cause| native(NativeOperation::MonotonicClock, cause))?
+        .checked_add(inspection::STATUS_TIMEOUT_NS)
+        .ok_or(ShellError::InspectionProtocol)?;
+    if deadline == DW_DEADLINE_INFINITE.0 {
+        return Err(ShellError::InspectionProtocol);
+    }
+    Ok(DwDeadline(deadline))
+}
+
+fn ensure_before_control_deadline<System: WyrmshSystem>(
+    system: &mut System,
+    deadline: DwDeadline,
+) -> Result<(), ShellError> {
+    if system
+        .monotonic_active_now()
+        .map_err(|cause| native(NativeOperation::MonotonicClock, cause))?
+        >= deadline.0
+    {
+        return Err(ShellError::InspectionTimeout);
+    }
+    Ok(())
+}
+
+fn status_state_name(state: wyrmroot_console_proto::State) -> &'static [u8] {
+    match state {
+        wyrmroot_console_proto::State::Active => b"active",
+        wyrmroot_console_proto::State::RetiringChild => b"retiring-child",
+        wyrmroot_console_proto::State::AwaitingReap => b"awaiting-reap",
+        wyrmroot_console_proto::State::Reconnecting => b"reconnecting",
+        wyrmroot_console_proto::State::Exhausted => b"exhausted",
+        wyrmroot_console_proto::State::FailClosed => b"fail-closed",
+    }
+}
+
+fn write_u64<System: WyrmshSystem>(
+    system: &mut System,
+    stdout: &mut NativeOutput,
+    stderr_handle: DwHandle,
+    controls: Controls,
+    mut value: u64,
+) -> Result<(), ShellError> {
+    let mut bytes = [0_u8; 20];
+    let mut cursor = bytes.len();
+    loop {
+        cursor -= 1;
+        bytes[cursor] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            return write_stdout(system, stdout, stderr_handle, controls, &bytes[cursor..]);
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "explicit control and output peer custody"
+)]
+fn send_control<System: WyrmshSystem>(
+    system: &mut System,
+    target: DwHandle,
+    role: EndpointRole,
+    controls: Controls,
+    stdout: DwHandle,
+    stderr: DwHandle,
+    bytes: &[u8],
+    deadline: DwDeadline,
+) -> Result<(), ShellError> {
+    ensure_before_control_deadline(system, deadline)?;
+    match system.send_channel(target, bytes) {
+        Ok(()) => return Ok(()),
+        Err(NativeError::Status(status)) if status == DW_STATUS_WOULD_BLOCK => {}
+        Err(cause) => return Err(native(NativeOperation::ControlSend, cause)),
+    }
+    wait_for_control(
+        system,
+        target,
+        role,
+        controls,
+        stdout,
+        stderr,
+        DW_SIGNAL_WRITABLE,
+        deadline,
+    )?;
+    match system.send_channel(target, bytes) {
+        Ok(()) => Ok(()),
+        Err(NativeError::Status(status)) if status == DW_STATUS_WOULD_BLOCK => {
+            ensure_before_control_deadline(system, deadline)?;
+            Err(ShellError::InspectionProtocol)
+        }
+        Err(cause) => Err(native(NativeOperation::ControlSend, cause)),
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "explicit control and output peer custody"
+)]
+fn receive_control<System: WyrmshSystem>(
+    system: &mut System,
+    target: DwHandle,
+    role: EndpointRole,
+    controls: Controls,
+    stdout: DwHandle,
+    stderr: DwHandle,
+    bytes: &mut [u8],
+    deadline: DwDeadline,
+) -> Result<usize, ShellError> {
+    wait_for_control(
+        system,
+        target,
+        role,
+        controls,
+        stdout,
+        stderr,
+        DW_SIGNAL_READABLE,
+        deadline,
+    )?;
+    let mut handles = [DwReceivedHandleInfoV1::default(); CONTROL_HANDLE_CAPACITY];
+    let counts = system
+        .receive_channel(target, bytes, &mut handles)
+        .map_err(|cause| native(NativeOperation::ControlReceive, cause))?;
+    if counts.handles != 0 {
+        let cleanup = close_received(system, &handles, counts.handles.min(handles.len()));
+        if let Some(cause) = cleanup {
+            return Err(native(NativeOperation::Cleanup, cause));
+        }
+        return Err(ShellError::InspectionProtocol);
+    }
+    if counts.bytes > bytes.len() {
+        return Err(ShellError::InspectionProtocol);
+    }
+    Ok(counts.bytes)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wait_for_control<System: WyrmshSystem>(
+    system: &mut System,
+    target: DwHandle,
+    role: EndpointRole,
+    controls: Controls,
+    stdout: DwHandle,
+    stderr: DwHandle,
+    signal: DwSignals,
+    deadline: DwDeadline,
+) -> Result<(), ShellError> {
+    let mut items = health_items(controls, stdout, stderr);
+    let target_index = match role {
+        EndpointRole::ConsoleStatus if target == controls.console_status => 0,
+        EndpointRole::Registry if target == controls.registry => 1,
+        EndpointRole::ShellJobs if target == controls.shell_jobs => 2,
+        _ => return Err(ShellError::InspectionProtocol),
+    };
+    items[target_index] = wait_item(target, DwSignals(signal.0 | DW_SIGNAL_PEER_CLOSED.0));
+    let result = match system.wait_many(&items, deadline) {
+        Ok(result) => result,
+        Err(NativeError::Status(status)) if status == DW_STATUS_TIMED_OUT => {
+            return Err(ShellError::InspectionTimeout);
+        }
+        Err(cause) => return Err(native(NativeOperation::Wait, cause)),
+    };
+    if usize::try_from(result.index).ok() != Some(target_index) {
+        return classify_health(result);
+    }
+    if result.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 {
+        return Err(ShellError::RequiredEndpointLost(role));
+    }
+    if result.observed.0 & signal.0 == 0 {
+        return Err(ShellError::InspectionProtocol);
+    }
+    ensure_before_control_deadline(system, deadline)
 }
 
 fn command_name(command: Command<'_>) -> &'static str {
@@ -738,9 +1510,9 @@ const fn wait_item(handle: DwHandle, signals: DwSignals) -> DwWaitItemV1 {
     DwWaitItemV1 { handle, signals }
 }
 
-fn close_received<System: WyrmshSystem>(
+fn close_received<System: WyrmshSystem, const N: usize>(
     system: &mut System,
-    handles: &[DwReceivedHandleInfoV1; HANDLE_COUNT],
+    handles: &[DwReceivedHandleInfoV1; N],
     count: usize,
 ) -> Option<NativeError> {
     let mut failure = None;

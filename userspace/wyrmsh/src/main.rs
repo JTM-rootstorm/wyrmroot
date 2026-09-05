@@ -9,10 +9,14 @@ use deepwyrm_syscall::{
     DW_DEADLINE_INFINITE, DwDeadline, DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights,
     DwSignals, DwWaitItemV1, DwWaitResultV1,
 };
+use wyrmroot_console_proto as _;
+use wyrmroot_launch_proto as _;
 use wyrmroot_loader as _;
+use wyrmroot_registry_proto as _;
 use wyrmroot_runtime::{
     CapabilityInfo, NativeError, ReceiveCounts, StartupBlock, StreamSystem, close_handle,
-    panic_abort, query_capability_info, receive_channel, send_channel, wait_many, wait_one,
+    monotonic_active_now, panic_abort, query_capability_info, receive_channel, send_channel,
+    wait_many, wait_one,
 };
 use wyrmroot_wyrmsh::{WyrmshSystem, run_wyrmsh};
 use wyrmroot_wyrmsh_core as _;
@@ -50,6 +54,10 @@ impl WyrmshSystem for NativeSystem {
         deadline: DwDeadline,
     ) -> Result<DwWaitResultV1, NativeError> {
         wait_many(items, deadline)
+    }
+
+    fn monotonic_active_now(&mut self) -> Result<u64, NativeError> {
+        monotonic_active_now()
     }
 }
 

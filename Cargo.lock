@@ -442,7 +442,10 @@ name = "wyrmroot-wyrmsh"
 version = "0.0.0"
 dependencies = [
  "deepwyrm-syscall",
+ "wyrmroot-console-proto",
+ "wyrmroot-launch-proto",
  "wyrmroot-loader",
+ "wyrmroot-registry-proto",
  "wyrmroot-runtime",
  "wyrmroot-stream-proto",
  "wyrmroot-wyrmsh-core",

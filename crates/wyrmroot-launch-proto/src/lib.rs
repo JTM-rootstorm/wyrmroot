@@ -719,6 +719,16 @@ pub fn encode_job_message(
     Ok(56)
 }
 
+/// Encodes a handle-free request for the current connection's visible jobs.
+pub fn encode_list_jobs(reservation: Reservation, out: &mut [u8]) -> Result<usize, Error> {
+    if out.len() < HEADER_BYTES {
+        return Err(Error::WrongSize);
+    }
+    out[..HEADER_BYTES].fill(0);
+    encode_prefix(reservation, MessageType::ListJobs, out)?;
+    Ok(HEADER_BYTES)
+}
+
 /// Encodes a terminal or current job phase response.
 pub fn encode_job_state(
     reservation: Reservation,
@@ -1460,6 +1470,20 @@ mod tests {
     #[test]
     fn job_operations_remain_connection_scoped() {
         let mut bytes = [0u8; 56];
+        let list_size = encode_list_jobs(R, &mut bytes).unwrap();
+        assert_eq!(list_size, HEADER_BYTES);
+        assert_eq!(
+            parse_message(&bytes[..list_size], 0).unwrap(),
+            ParsedMessage {
+                reservation: R,
+                message: Message::ListJobs,
+            }
+        );
+        assert_eq!(
+            encode_list_jobs(R, &mut bytes[..HEADER_BYTES - 1]),
+            Err(Error::WrongSize)
+        );
+
         let size = encode_job_message(R, MessageType::Query, 17, &mut bytes).unwrap();
         assert_eq!(
             parse_message(&bytes[..size], 0).unwrap().message,

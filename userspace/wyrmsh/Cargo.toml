@@ -16,6 +16,9 @@ deepwyrm-syscall.workspace = true
 wyrmroot-loader = { path = "../../crates/wyrmroot-loader" }
 wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }
 wyrmroot-wyrmsh-core = { path = "../../crates/wyrmroot-wyrmsh-core" }
+wyrmroot-console-proto = { path = "../../crates/wyrmroot-console-proto" }
+wyrmroot-launch-proto = { path = "../../crates/wyrmroot-launch-proto" }
+wyrmroot-registry-proto = { path = "../../crates/wyrmroot-registry-proto" }
 
 [dev-dependencies]
 wyrmroot-stream-proto = { path = "../../crates/wyrmroot-stream-proto" }
