@@ -41,7 +41,8 @@ This file defines the minimum architecture reading set for Wyrmroot implementati
 ## Active implementation status
 
 - [`Plans/WYR1_E4AB_VALIDATION.md`](WYR1_E4AB_VALIDATION.md) records the separate production wyrmsh startup/READY/release/editor runtime, local help/echo/clear/exit, shared startup-version accessor, stateful WRST harness, partial-output correction and accepted native compilation at the E4A/B checkpoint.
-- [`Plans/WYR1_E4C_VALIDATION.md`](WYR1_E4C_VALIDATION.md) closes E4 with scoped services/tasks/status, canonical LIST_JOBS encoding, finite inspection deadlines and their reviewed correction, 73 shell/core plus 250 protocol/server tests, and accepted native compilation. E5 job operations and E6 product/stack selection remain pending.
+- [`Plans/WYR1_E4C_VALIDATION.md`](WYR1_E4C_VALIDATION.md) closes E4 with scoped services/tasks/status, canonical LIST_JOBS encoding, finite inspection deadlines and their reviewed correction, 73 shell/core plus 250 protocol/server tests, and accepted native compilation.
+- [`Plans/WYR1_E5_VALIDATION.md`](WYR1_E5_VALIDATION.md) closes E5A/B/C with the shared ShellJobs adapter, foreground stream bridge, spawn/wait/terminate, controller eviction/orphan regressions, reviewed custody/fairness/deadline corrections, 98 shell/core tests, 445 broader regressions and accepted native compilation. E6 product/stack integration remains next; guest acceptance remains later.
 
 - [`Plans/WYR1_E3AB_LAUNCH_VALIDATION.md`](WYR1_E3AB_LAUNCH_VALIDATION.md) records additive ShellV1 wire/session scopes and the six-role Wyrmsh loader boundary at the E3A/B checkpoint.
 - [`Plans/WYR1_E3CD_VALIDATION.md`](WYR1_E3CD_VALIDATION.md) records transactional shell construction, bounded registry preflight, WRCN/consoled status, fresh replacement identities, scoped review and host/native checks; production resident-loop selection remains E6 and guest acceptance remains E7/E8.
