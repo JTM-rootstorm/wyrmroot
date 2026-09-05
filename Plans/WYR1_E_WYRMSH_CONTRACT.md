@@ -395,7 +395,12 @@ evidence types against the registry it remeasures then.
 
 ## 7. Parser, editor and command contract
 
-The active plan's Sections 3.8-3.14 are incorporated with these exact decisions:
+The active plan's Sections 3.8-3.14 are incorporated with these exact decisions.
+E2's [input/editor contract](WYR1_E2_EDITOR_CONTRACT.md) now freezes decoder
+resynchronization, printable-scalar filtering, history draft restoration and
+80-column viewport redraw. It explicitly adds one fixed 4096-byte draft buffer
+and resolves full-line redraw as the complete visible viewport, preserving the
+4096-byte logical line and all parser/history bounds:
 
 - Input is valid UTF-8, at most 4096 bytes; argv has at most 64 entries. NUL
   is rejected. One bounded, nonrecursive scan separates ASCII whitespace
@@ -418,10 +423,10 @@ The active plan's Sections 3.8-3.14 are incorporated with these exact decisions:
   full grapheme and display-width semantics remain deferred.
 - Fixed storage: 4096-byte line, 4096 parser scratch, 64 argv descriptors,
   32 history descriptors with a 16 KiB byte arena, 16 pending decoder bytes,
-  4096 output/redraw scratch. Evict oldest history to fit; failure to retain a
-  line never prevents otherwise valid execution. Redraw output may be emitted
-  incrementally through bounded scratch; a 4096-byte line plus ANSI framing
-  need not fit one 4096-byte output buffer or one 1024-byte WRST message.
+  4096 output/redraw scratch, plus E2's 4096-byte history draft. Evict oldest history to fit; failure to retain a
+  line never prevents otherwise valid execution. E2 redraw uses a fixed 80-column horizontal viewport with at most 71 visible
+  scalars and may emit it incrementally through bounded scratch. The full logical
+  line remains stored and editable; no terminal-width query is introduced.
 - The reached 128 KiB child mapping has a 20 KiB ABI-2 startup block: actual
   downward-growing working stack is **108 KiB**. E2/E6 must measure stack use;
   E0's buffer totals are not a stack measurement or native execution proof.
