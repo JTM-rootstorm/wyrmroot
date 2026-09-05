@@ -1351,6 +1351,9 @@ pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<
     if matches!(filter, Some("wyr1e4-native" | "wyr1e5-native")) {
         return crate::wyr1c::run_wyrmsh_native_checks(repository, filter.unwrap());
     }
+    if matches!(filter, Some("wyr1e6-native")) {
+        return crate::wyr1c::run_wyr1e6_native_checks(repository);
+    }
     if matches!(filter, Some("dw1e3b-native")) {
         return crate::wyr1c::run_e3b_native_checks(repository);
     }
@@ -1364,11 +1367,30 @@ pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<
 fn host_test_commands(filter: Option<&str>) -> Result<Vec<Vec<String>>, Failure> {
     if matches!(
         filter,
-        Some("wyr1e4-model" | "wyr1e4-clippy" | "wyr1e5-model" | "wyr1e5-clippy")
+        Some(
+            "wyr1e4-model"
+                | "wyr1e4-clippy"
+                | "wyr1e5-model"
+                | "wyr1e5-clippy"
+                | "wyr1e6-model"
+                | "wyr1e6-clippy"
+        )
     ) {
         let lint = filter.is_some_and(|value| value.ends_with("clippy"));
-        return Ok(["wyrmroot-wyrmsh", "wyrmroot-wyrmsh-core"]
-            .into_iter()
+        let packages: &[&str] = if filter.is_some_and(|value| value.starts_with("wyr1e6")) {
+            &[
+                "wyrmroot-wyrmsh",
+                "wyrmroot-wyrmsh-core",
+                "wyrmroot-rrc-manifest",
+                "wyrmroot-bootfs",
+                "xtask",
+            ]
+        } else {
+            &["wyrmroot-wyrmsh", "wyrmroot-wyrmsh-core"]
+        };
+        return Ok(packages
+            .iter()
+            .copied()
             .map(|package| {
                 let mut arguments = vec![
                     if lint { "clippy" } else { "test" }.to_owned(),
@@ -1376,9 +1398,14 @@ fn host_test_commands(filter: Option<&str>) -> Result<Vec<Vec<String>>, Failure>
                     "--offline".to_owned(),
                     "--package".to_owned(),
                     package.to_owned(),
-                    "--lib".to_owned(),
-                    "--tests".to_owned(),
                 ];
+                if matches!(package, "wyrmroot-rrc-manifest" | "wyrmroot-bootfs") {
+                    arguments.extend(["--features".to_owned(), "builder".to_owned()]);
+                }
+                if package != "xtask" {
+                    arguments.push("--lib".to_owned());
+                }
+                arguments.push("--tests".to_owned());
                 if lint {
                     arguments.extend(["--".to_owned(), "-D".to_owned(), "warnings".to_owned()]);
                 }
@@ -1655,6 +1682,55 @@ mod tests {
                 assert!(command.iter().any(|arg| arg == "--offline"));
                 assert!(!command.iter().any(|arg| arg == "--features"));
             }
+        }
+    }
+
+    #[test]
+    fn wyr1e6_host_filters_cover_product_codecs_and_producer() {
+        for filter in ["wyr1e6-model", "wyr1e6-clippy"] {
+            let commands = host_test_commands(Some(filter)).unwrap();
+            assert_eq!(commands.len(), 5);
+            for package in [
+                "wyrmroot-wyrmsh",
+                "wyrmroot-wyrmsh-core",
+                "wyrmroot-rrc-manifest",
+                "wyrmroot-bootfs",
+                "xtask",
+            ] {
+                assert!(
+                    commands
+                        .iter()
+                        .any(|command| command.iter().any(|arg| arg == package))
+                );
+            }
+            for command in &commands {
+                assert_eq!(
+                    command[0],
+                    if filter.ends_with("clippy") {
+                        "clippy"
+                    } else {
+                        "test"
+                    }
+                );
+                assert!(command.iter().any(|arg| arg == "--tests"));
+                assert!(!command.iter().any(|arg| arg == "--all-targets"));
+            }
+            for package in ["wyrmroot-rrc-manifest", "wyrmroot-bootfs"] {
+                let command = commands
+                    .iter()
+                    .find(|command| command.iter().any(|arg| arg == package))
+                    .unwrap();
+                assert!(
+                    command
+                        .windows(2)
+                        .any(|args| args == ["--features", "builder"])
+                );
+            }
+            let xtask = commands
+                .iter()
+                .find(|command| command.iter().any(|arg| arg == "xtask"))
+                .unwrap();
+            assert!(!xtask.iter().any(|arg| arg == "--lib"));
         }
     }
 
