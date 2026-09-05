@@ -394,8 +394,6 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
             wait_count += 1;
         }
         #[cfg(not(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32"))))]
-        let witness_index: Option<usize> = None;
-        #[cfg(not(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32"))))]
         let driver_index = driver_control.map(|handle| {
             let index = wait_count;
             waits[index] = wait_item(handle);
@@ -415,9 +413,9 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
             .map_or(DW_DEADLINE_INFINITE, deepwyrm_syscall::DwDeadline);
         #[cfg(not(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32"))))]
         let wait_deadline = DW_DEADLINE_INFINITE;
-        let observed = wait_many(&waits[..wait_count], wait_deadline).map_err(|error| {
+        let observed = wait_many(&waits[..wait_count], wait_deadline).map_err(|_error| {
             #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
-            if matches!(error, NativeError::Status(status) if status == DW_STATUS_TIMED_OUT) {
+            if matches!(_error, NativeError::Status(status) if status == DW_STATUS_TIMED_OUT) {
                 return failure(276);
             }
             failure(16)
