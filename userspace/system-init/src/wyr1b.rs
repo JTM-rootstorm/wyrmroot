@@ -1401,6 +1401,30 @@ mod tests {
             cleanup_result: 0,
         }
     }
+    fn normal_with_code(application_code: u32) -> JobResult {
+        JobResult {
+            application_code,
+            ..normal()
+        }
+    }
+    fn finish_cleanup_exactly_once(jobs: &mut JobController, job_id: u64, result: JobResult) {
+        assert_eq!(
+            jobs.apply_cleanup_progress(job_id, result, 1 << 2, 0),
+            Ok(None)
+        );
+        assert_eq!(
+            jobs.apply_cleanup_progress(job_id, result, 1 << 3, 0),
+            Ok(None)
+        );
+        assert_eq!(
+            jobs.apply_cleanup_progress(job_id, result, 1 << 4, 0),
+            Ok(Some(result))
+        );
+        assert_eq!(
+            jobs.apply_cleanup_progress(job_id, result, 1 << 4, 0),
+            Err(JobError::UnknownJob)
+        );
+    }
 
     #[test]
     fn launch_is_transactional_owner_scoped_and_structured() {
@@ -1509,6 +1533,76 @@ mod tests {
         assert_eq!(
             jobs.terminate(reservation(1, 7, 3), launch.job_id),
             Err(JobError::StaleGeneration)
+        );
+    }
+
+    #[test]
+    fn completed_ring_eviction_cannot_fabricate_an_owner_result_or_hide_live_jobs() {
+        let mut jobs = JobController::new();
+        jobs.open_connection(1, 7).unwrap();
+        jobs.open_connection(2, 9).unwrap();
+
+        let active_first = jobs.begin_launch(reservation(1, 7, 1)).unwrap();
+        jobs.commit_launch(active_first, 10, 11, 12).unwrap();
+        let completed = jobs.begin_launch(reservation(1, 7, 2)).unwrap();
+        jobs.commit_launch(completed, 20, 21, 22).unwrap();
+        let completed_result = normal_with_code(17);
+        jobs.complete(completed.job_id, 20, 21, 22, completed_result)
+            .unwrap();
+        let active_second = jobs.begin_launch(reservation(1, 7, 3)).unwrap();
+        jobs.commit_launch(active_second, 30, 31, 32).unwrap();
+
+        let expected_live = [active_first.job_id, active_second.job_id];
+        let mut listed = [0; MAX_LIVE_JOBS];
+        assert_eq!(jobs.list(reservation(1, 7, 4), &mut listed), Ok(2));
+        assert_eq!(&listed[..2], &expected_live);
+        assert!(!listed[..2].contains(&completed.job_id));
+        assert_eq!(
+            jobs.result(reservation(1, 7, 5), completed.job_id),
+            Ok(completed_result)
+        );
+
+        for index in 0..MAX_COMPLETED_JOBS {
+            let ticket = jobs
+                .begin_launch(reservation(2, 9, u64::try_from(index + 1).unwrap()))
+                .unwrap();
+            let resource = 100 + u64::try_from(index).unwrap() * 3;
+            jobs.commit_launch(ticket, resource, resource + 1, resource + 2)
+                .unwrap();
+            jobs.complete(
+                ticket.job_id,
+                resource,
+                resource + 1,
+                resource + 2,
+                normal_with_code(u32::try_from(index + 100).unwrap()),
+            )
+            .unwrap();
+        }
+        assert_eq!(jobs.completed_results(), MAX_COMPLETED_JOBS);
+
+        listed.fill(0);
+        assert_eq!(jobs.list(reservation(1, 7, 6), &mut listed), Ok(2));
+        assert_eq!(&listed[..2], &expected_live);
+        assert!(!listed[..2].contains(&completed.job_id));
+        assert_eq!(jobs.live_jobs(), 2);
+        assert_eq!(jobs.orphan_jobs(), 0);
+
+        // UnknownJob and ForeignJob both map to WRLJ ForeignOrUnknownJob.
+        assert_eq!(
+            jobs.result(reservation(1, 7, 7), completed.job_id),
+            Err(JobError::UnknownJob)
+        );
+        assert_eq!(
+            jobs.result_for_owner(1, 7, completed.job_id),
+            Err(JobError::UnknownJob)
+        );
+        assert_eq!(
+            jobs.terminate(reservation(1, 7, 8), completed.job_id),
+            Err(JobError::UnknownJob)
+        );
+        assert_eq!(
+            jobs.close_job(reservation(1, 7, 9), completed.job_id),
+            Err(JobError::ForeignJob)
         );
     }
 
@@ -1863,11 +1957,71 @@ mod tests {
             jobs.query(reservation(1, 1, 2), ticket.job_id),
             Err(JobError::ClosedConnection)
         );
-        jobs.complete(ticket.job_id, 10, 11, 12, normal()).unwrap();
-        assert_eq!(jobs.live_jobs(), 0);
         jobs.open_connection(2, 1).unwrap();
+        let mut listed = [0; MAX_LIVE_JOBS];
+        assert_eq!(jobs.list(reservation(2, 1, 1), &mut listed), Ok(0));
         assert_eq!(
-            jobs.result(reservation(2, 1, 1), ticket.job_id),
+            jobs.query(reservation(2, 1, 2), ticket.job_id),
+            Err(JobError::ForeignJob)
+        );
+        finish_cleanup_exactly_once(&mut jobs, ticket.job_id, normal());
+        assert_eq!(jobs.live_jobs(), 0);
+        assert_eq!(jobs.orphan_jobs(), 0);
+        assert_eq!(
+            jobs.result_for_owner(1, 1, ticket.job_id),
+            Err(JobError::UnknownJob)
+        );
+        assert_eq!(
+            jobs.result(reservation(2, 1, 3), ticket.job_id),
+            Err(JobError::UnknownJob)
+        );
+        jobs.reclaim_closed_sessions();
+        jobs.open_connection(1, 2).unwrap();
+        assert_eq!(jobs.list(reservation(1, 2, 1), &mut listed), Ok(0));
+        assert_eq!(
+            jobs.query(reservation(1, 2, 2), ticket.job_id),
+            Err(JobError::UnknownJob)
+        );
+    }
+
+    #[test]
+    fn active_close_hides_job_but_retains_single_cleanup_without_reattachment() {
+        let mut jobs = JobController::new();
+        jobs.open_connection(1, 7).unwrap();
+        jobs.open_connection(2, 9).unwrap();
+        let ticket = jobs.begin_launch(reservation(1, 7, 1)).unwrap();
+        jobs.commit_launch(ticket, 10, 11, 12).unwrap();
+
+        jobs.close_job(reservation(1, 7, 2), ticket.job_id).unwrap();
+        assert_eq!(jobs.live_jobs(), 1);
+        assert_eq!(jobs.orphan_jobs(), 1);
+        let mut listed = [0; MAX_LIVE_JOBS];
+        assert_eq!(jobs.list(reservation(1, 7, 3), &mut listed), Ok(0));
+        assert_eq!(jobs.list(reservation(2, 9, 1), &mut listed), Ok(0));
+        assert_eq!(
+            jobs.query(reservation(1, 7, 4), ticket.job_id),
+            Err(JobError::ForeignJob)
+        );
+        assert_eq!(
+            jobs.query(reservation(2, 9, 2), ticket.job_id),
+            Err(JobError::ForeignJob)
+        );
+
+        finish_cleanup_exactly_once(&mut jobs, ticket.job_id, normal());
+        assert_eq!(jobs.live_jobs(), 0);
+        assert_eq!(jobs.orphan_jobs(), 0);
+        assert_eq!(jobs.completed_results(), 1);
+        assert_eq!(
+            jobs.result_for_owner(1, 7, ticket.job_id),
+            Err(JobError::UnknownJob)
+        );
+
+        jobs.disconnect(1, 7).unwrap();
+        jobs.reclaim_closed_sessions();
+        jobs.open_connection(1, 8).unwrap();
+        assert_eq!(jobs.list(reservation(1, 8, 1), &mut listed), Ok(0));
+        assert_eq!(
+            jobs.query(reservation(1, 8, 2), ticket.job_id),
             Err(JobError::UnknownJob)
         );
     }
