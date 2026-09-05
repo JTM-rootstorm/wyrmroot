@@ -143,9 +143,9 @@ pub const fn startup_error_exit_code(error: StartupError) -> u32 {
 ///
 /// # Safety
 ///
-/// `address` must identify the initial, immutable, readable [`STARTUP_BLOCK_SIZE`]-byte page for
-/// the complete call. It must be the initial stack address supplied by Deepwyrm rather than an
-/// arbitrary userspace pointer.
+/// `address` must identify the initial, immutable, readable block whose size is selected by
+/// [`startup_block_size`] for the complete call. It must be the initial stack address supplied by
+/// Deepwyrm rather than an arbitrary userspace pointer.
 #[allow(
     unsafe_code,
     reason = "the native entry shim supplies the validated initial stack pointer and the higher-ranked callback prevents startup borrows from escaping"
@@ -166,8 +166,9 @@ pub unsafe fn with_native_startup<R>(
         .checked_add(block_size as u64)
         .ok_or(StartupError::AddressOverflow)?;
     let pointer = address as *const u8;
-    // SAFETY: the caller guarantees that the initial startup page is readable and immutable for
-    // this call. The higher-ranked callback prevents `StartupBlock` or its strings from escaping.
+    // SAFETY: the caller guarantees that the complete version-selected startup block is readable
+    // and immutable for this call. The higher-ranked callback prevents `StartupBlock` or its
+    // strings from escaping.
     let bytes = unsafe { core::slice::from_raw_parts(pointer, block_size) };
     StartupBlock::parse(registers, address, bytes).map(use_block)
 }
