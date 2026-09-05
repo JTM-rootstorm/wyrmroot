@@ -2,7 +2,10 @@
 
 use wyrmroot_bootfs::{
     archive::{Archive, LookupError},
-    launch_policy::{LAUNCH_POLICY_PATH, LaunchPolicy, PolicyError},
+    launch_policy::{
+        JOB_V2_PROFILE_ID, LAUNCH_POLICY_PATH, LaunchPolicy, PolicyError, WYRMSH_PATH,
+        WYRMSH_PROFILE_ID,
+    },
 };
 use wyrmroot_launch_proto::{MAX_COMPLETED_JOBS, MAX_LIVE_JOBS, Reservation};
 use wyrmroot_loader::{
@@ -85,6 +88,10 @@ impl RegistryTopology {
     pub const fn accepts(&self, grant: EndpointGrant) -> bool {
         grant.registry_generation == self.registry_generation
     }
+
+    pub const fn generation(&self) -> u64 {
+        self.registry_generation
+    }
 }
 
 pub fn correlation_environment(grant: EndpointGrant) -> Result<CorrelationEnvironment, JobError> {
@@ -140,6 +147,9 @@ impl<'a> PolicyView<'a> {
 
     pub fn authorize(&self, path: &str, streams: usize) -> Result<&'a [u8], JobError> {
         let entry = self.policy.find(path).ok_or(JobError::PolicyMissing)?;
+        if entry.startup_abi != 2 || entry.profile_id != JOB_V2_PROFILE_ID {
+            return Err(JobError::PolicyMissing);
+        }
         match streams {
             0 if entry.allow_no_streams => {}
             3 if entry.allow_three_streams => {}
@@ -148,6 +158,28 @@ impl<'a> PolicyView<'a> {
         let artifact = self
             .archive
             .lookup(path.as_bytes())
+            .map_err(JobError::Bootfs)?;
+        if !artifact.is_executable() || sha256::digest(artifact.data()) != entry.content_sha256 {
+            return Err(JobError::ArtifactIdentityMismatch);
+        }
+        Ok(artifact.data())
+    }
+
+    pub fn authorize_wyrmsh(&self) -> Result<&'a [u8], JobError> {
+        let entry = self
+            .policy
+            .find(WYRMSH_PATH)
+            .ok_or(JobError::PolicyMissing)?;
+        if entry.startup_abi != 2
+            || entry.profile_id != WYRMSH_PROFILE_ID
+            || entry.allow_no_streams
+            || !entry.allow_three_streams
+        {
+            return Err(JobError::PolicyMissing);
+        }
+        let artifact = self
+            .archive
+            .lookup(WYRMSH_PATH.as_bytes())
             .map_err(JobError::Bootfs)?;
         if !artifact.is_executable() || sha256::digest(artifact.data()) != entry.content_sha256 {
             return Err(JobError::ArtifactIdentityMismatch);
@@ -193,6 +225,12 @@ pub struct LaunchTicket {
     pub job_id: u64,
     owner: ConnectionIdentity,
     transaction_id: u64,
+}
+
+impl LaunchTicket {
+    pub(crate) const fn job_id(self) -> u64 {
+        self.job_id
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -967,6 +1005,26 @@ impl JobController {
             },
             task_group: job.task_group,
         })
+    }
+
+    pub(crate) fn loaded_job_for_owner(
+        &self,
+        connection_id: u64,
+        generation: u64,
+    ) -> Result<Option<LoadedJob>, JobError> {
+        let owner = identity(connection_id, generation)?;
+        Ok(self.jobs.iter().flatten().find_map(|job| {
+            (job.owner == owner
+                && (job.process != 0 || job.task_group != 0 || job.launch_channel != 0))
+                .then_some(LoadedJob {
+                    job_id: job.id,
+                    loaded: LoadedProcess {
+                        process: deepwyrm_syscall::DwHandle(job.process),
+                        launch_channel: deepwyrm_syscall::DwHandle(job.launch_channel),
+                    },
+                    task_group: job.task_group,
+                })
+        }))
     }
 
     pub(crate) fn forced_termination_resources(
