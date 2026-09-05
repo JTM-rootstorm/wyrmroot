@@ -489,7 +489,9 @@ pub(crate) fn run_e3b_native_checks(repository: &Path) -> Result<(), Failure> {
 }
 
 pub(crate) fn run_wyr1e3_native_checks(repository: &Path, filter: &str) -> Result<(), Failure> {
+    let controller_specs = [WYR1E3_NATIVE_CHECK_SPECS[0], WYR1E3_NATIVE_CHECK_SPECS[4]];
     let specs = match filter {
+        "wyr1e3-controller-native" => controller_specs.as_slice(),
         "wyr1e3-native" => WYR1E3_NATIVE_CHECK_SPECS.as_slice(),
         "wyr1e3-consoled-native" => &WYR1E3_NATIVE_CHECK_SPECS[2..4],
         "wyr1e3-registry-native" => &WYR1E3_NATIVE_CHECK_SPECS[1..2],

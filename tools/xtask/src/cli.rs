@@ -17,6 +17,9 @@ Usage:
     tools/pinned-cargo xtask test host wyr1e3-native
     tools/pinned-cargo xtask test host wyr1e3-consoled-native
     tools/pinned-cargo xtask test host wyr1e3-registry-native
+    tools/pinned-cargo xtask test host wyr1e3-controller-native
+    tools/pinned-cargo xtask test host wyr1e3-controller-model
+    tools/pinned-cargo xtask test host wyr1e3-controller-clippy
     cargo xtask test guest [filter]
     cargo xtask test integration wyr0 [default|smp] --request <wyr0-h-request.toml>
     tools/pinned-cargo xtask wyr1 image --request <wyr1-a-request.toml>

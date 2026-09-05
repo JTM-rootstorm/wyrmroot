@@ -1339,7 +1339,12 @@ pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<
     }
     if matches!(
         filter,
-        Some("wyr1e3-native" | "wyr1e3-consoled-native" | "wyr1e3-registry-native")
+        Some(
+            "wyr1e3-native"
+                | "wyr1e3-consoled-native"
+                | "wyr1e3-registry-native"
+                | "wyr1e3-controller-native"
+        )
     ) {
         return crate::wyr1c::run_wyr1e3_native_checks(repository, filter.unwrap());
     }
@@ -1354,8 +1359,17 @@ pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<
 }
 
 fn host_test_commands(filter: Option<&str>) -> Result<Vec<Vec<String>>, Failure> {
-    if matches!(filter, Some("wyr1e3-model" | "wyr1e3-clippy")) {
-        let lint = filter == Some("wyr1e3-clippy");
+    if matches!(
+        filter,
+        Some(
+            "wyr1e3-model"
+                | "wyr1e3-clippy"
+                | "wyr1e3-controller-model"
+                | "wyr1e3-controller-clippy"
+        )
+    ) {
+        let lint = filter.is_some_and(|value| value.ends_with("clippy"));
+        let controller_only = filter.is_some_and(|value| value.contains("controller"));
         return Ok([
             ("wyrmroot-console-proto", None),
             ("wyrmroot-consoled", Some("wyr1e-wyrmsh")),
@@ -1364,6 +1378,9 @@ fn host_test_commands(filter: Option<&str>) -> Result<Vec<Vec<String>>, Failure>
             ("wyrmroot-bootfs", Some("builder")),
         ]
         .into_iter()
+        .filter(|(package, _)| {
+            !controller_only || matches!(*package, "wyrmroot-system-init" | "wyrmroot-bootfs")
+        })
         .map(|(package, features)| {
             let mut arguments = vec![
                 if lint { "clippy" } else { "test" }.to_owned(),
@@ -1621,6 +1638,22 @@ mod tests {
                     "test"
                 }
             );
+        }
+    }
+
+    #[test]
+    fn wyr1e3_controller_model_filter_excludes_the_parallel_console_lane() {
+        for filter in ["wyr1e3-controller-model", "wyr1e3-controller-clippy"] {
+            let commands = host_test_commands(Some(filter)).unwrap();
+            assert_eq!(commands.len(), 2);
+            assert!(commands[0].iter().any(|arg| arg == "wyrmroot-system-init"));
+            assert!(
+                commands[0]
+                    .iter()
+                    .any(|arg| arg == "wyr1e-shell-controller")
+            );
+            assert!(commands[1].iter().any(|arg| arg == "wyrmroot-bootfs"));
+            assert!(commands[1].iter().any(|arg| arg == "builder"));
         }
     }
 
