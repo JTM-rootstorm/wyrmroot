@@ -944,6 +944,7 @@ pub(crate) fn build_c6_snapshot(nonce: &str) -> Result<C6Snapshot, Failure> {
     validate_c6_nonce(nonce)?;
     reject_ambient_build_environment(env::vars_os())?;
     let repository = crate::tasks::repository_root()?;
+    let project = crate::tasks::canonical_project_root(&repository)?;
     let revision = clean_repository_revision(&repository)?;
     let manifest = BuildManifest::load(&repository)?;
     if manifest.rust_revision()? != ACCEPTED_RUST_REVISION
@@ -962,11 +963,10 @@ pub(crate) fn build_c6_snapshot(nonce: &str) -> Result<C6Snapshot, Failure> {
         ));
     }
     toolchain.accepted().verify_unchanged()?;
-    let repository_directory =
-        crate::secure_fs::Directory::open_exact(&repository, "Wyrmroot source")?;
-    let tmp = match repository_directory.open_child(".tmp", "WYR1-E6 temporary root") {
+    let project_directory = crate::secure_fs::Directory::open_exact(&project, "OS-Project root")?;
+    let tmp = match project_directory.open_child(".tmp", "project temporary root") {
         Ok(directory) => directory,
-        Err(_) => repository_directory.create_child(".tmp", 0o700, "WYR1-E6 temporary root")?,
+        Err(_) => project_directory.create_child(".tmp", 0o700, "project temporary root")?,
     };
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1205,7 +1205,6 @@ pub(crate) fn build_d5_snapshot(nonce: &str) -> Result<D5Snapshot, Failure> {
 pub(crate) fn build_e6_snapshot() -> Result<E6Snapshot, Failure> {
     reject_ambient_build_environment(env::vars_os())?;
     let repository = crate::tasks::repository_root()?;
-    let project = crate::tasks::canonical_project_root(&repository)?;
     let revision = clean_repository_revision(&repository)?;
     let manifest = BuildManifest::load(&repository)?;
     if manifest.rust_revision()? != ACCEPTED_RUST_REVISION
@@ -1224,10 +1223,11 @@ pub(crate) fn build_e6_snapshot() -> Result<E6Snapshot, Failure> {
         ));
     }
     toolchain.accepted().verify_unchanged()?;
-    let project_directory = crate::secure_fs::Directory::open_exact(&project, "OS-Project root")?;
-    let tmp = match project_directory.open_child(".tmp", "project temporary root") {
+    let repository_directory =
+        crate::secure_fs::Directory::open_exact(&repository, "Wyrmroot source")?;
+    let tmp = match repository_directory.open_child(".tmp", "WYR1-E6 temporary root") {
         Ok(directory) => directory,
-        Err(_) => project_directory.create_child(".tmp", 0o700, "project temporary root")?,
+        Err(_) => repository_directory.create_child(".tmp", 0o700, "WYR1-E6 temporary root")?,
     };
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1267,14 +1267,24 @@ pub(crate) fn build_e6_snapshot() -> Result<E6Snapshot, Failure> {
                 Ok(artifact)
             })?;
             if spec.label == "wyrmsh" {
+                let stack_input = scratch.write_new_retained(
+                    "wyrmsh.elf",
+                    &artifact.bytes,
+                    0o400,
+                    "WYR1-E6 stack input",
+                )?;
                 stack_report = Some(run_wyrmsh_stack_analyzer(
                     &repository,
                     &scratch,
-                    &PathBuf::from(spec.label)
-                        .join(NATIVE_TARGET)
-                        .join("release")
-                        .join(spec.artifact),
+                    Path::new("wyrmsh.elf"),
                 )?);
+                scratch.verify_retained_file_exact(
+                    "wyrmsh.elf",
+                    &stack_input,
+                    artifact.bytes.len() as u64,
+                    0o400,
+                    "WYR1-E6 stack input",
+                )?;
             }
             artifacts.push(artifact);
         }
