@@ -19,7 +19,9 @@ use wyrmroot_launch_proto::{
     ErrorCode as LaunchErrorCode, Message as LaunchMessage, MessageType as LaunchMessageType,
     Reservation as LaunchReservation, TerminationClassification, TerminationResult,
     encode_error as encode_launch_error, encode_job_list, encode_job_message, encode_job_result,
-    encode_job_state, parse_message as parse_launch_message, parse_reservation_prefix,
+    encode_job_state, encode_shell_v1_error as encode_shell_v1_error_reply,
+    parse_message as parse_launch_message, parse_reservation_prefix, parse_shell_v1_request,
+    parse_shell_v1_reservation_prefix,
 };
 use wyrmroot_loader::launch::CHILD_CHANNEL_RIGHTS;
 use wyrmroot_registry_proto::{
@@ -1891,7 +1893,7 @@ fn accept_reserved_launch<S, L, W>(
     reservation: LaunchReservation,
     request_ticket: RequestTicket,
     request: wyrmroot_launch_proto::LaunchRequest<'_>,
-    received: &[DwReceivedHandleInfoV1; wyrmroot_launch_proto::STREAM_COUNT],
+    received: &[DwReceivedHandleInfoV1],
     handle_count: usize,
 ) -> Result<crate::wyr1b::LoadedJob, InitError>
 where
@@ -2262,6 +2264,20 @@ fn send_job_error<S: InitPlatform>(
         .map_err(InitError::Native)
 }
 
+fn send_shell_v1_error<S: InitPlatform>(
+    system: &mut S,
+    session: DwHandle,
+    reservation: LaunchReservation,
+    code: LaunchErrorCode,
+) -> Result<(), InitError> {
+    let mut response = [0_u8; wyrmroot_launch_proto::SHELL_V1_REPLY_BYTES];
+    let size = encode_shell_v1_error_reply(reservation, code, &mut response)
+        .map_err(|_| InitError::Accounting)?;
+    system
+        .send_channel(session, &response[..size])
+        .map_err(InitError::Native)
+}
+
 fn controller_result_to_wire(result: ControllerJobResult) -> Result<TerminationResult, InitError> {
     let classification = match result.classification {
         1 => TerminationClassification::NormalExit,
@@ -2426,6 +2442,25 @@ enum JobDispatchOutcome {
     Launched(crate::wyr1b::LoadedJob),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JobWireVersion {
+    Legacy,
+    ShellV1,
+}
+
+fn send_versioned_job_error<S: InitPlatform>(
+    system: &mut S,
+    session: DwHandle,
+    reservation: LaunchReservation,
+    version: JobWireVersion,
+    code: LaunchErrorCode,
+) -> Result<(), InitError> {
+    match version {
+        JobWireVersion::Legacy => send_job_error(system, session, reservation, code),
+        JobWireVersion::ShellV1 => send_shell_v1_error(system, session, reservation, code),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch_one_job_request<S, L, W>(
     system: &mut S,
@@ -2442,8 +2477,11 @@ where
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
+    let scope = jobs.session_scope(grant).map_err(InitError::Wyr1BModel)?;
+    let legacy_handle_limit = wyrmroot_launch_proto::STREAM_COUNT;
     let mut bytes = [0_u8; wyrmroot_launch_proto::MAX_LAUNCH_MESSAGE_BYTES];
-    let mut received = [DwReceivedHandleInfoV1::default(); wyrmroot_launch_proto::STREAM_COUNT];
+    let mut received =
+        [DwReceivedHandleInfoV1::default(); wyrmroot_launch_proto::SHELL_V1_HANDLE_COUNT];
     let counts = system
         .receive_channel(session, &mut bytes, &mut received)
         .map_err(InitError::Native)?;
@@ -2455,17 +2493,30 @@ where
             InitError::Wyr1BModel(JobError::StreamPolicy)
         });
     }
-    let reservation = match parse_reservation_prefix(&bytes[..counts.bytes]) {
-        Ok(reservation) => reservation,
-        Err(_) => {
-            let failed = close_received_reverse(system, &received, counts.handles);
-            return Err(if failed {
-                InitError::Cleanup
-            } else {
-                InitError::Wyr1BModel(JobError::WrongState)
-            });
-        }
+    let (version, reservation) = match parse_reservation_prefix(&bytes[..counts.bytes]) {
+        Ok(reservation) => (JobWireVersion::Legacy, reservation),
+        Err(_) => match parse_shell_v1_reservation_prefix(&bytes[..counts.bytes]) {
+            Ok(reservation) => (JobWireVersion::ShellV1, reservation),
+            Err(_) => {
+                let failed = close_received_reverse(system, &received, counts.handles);
+                return Err(if failed {
+                    InitError::Cleanup
+                } else if counts.handles > legacy_handle_limit {
+                    InitError::Wyr1BModel(JobError::StreamPolicy)
+                } else {
+                    InitError::Wyr1BModel(JobError::WrongState)
+                });
+            }
+        },
     };
+    if version == JobWireVersion::Legacy && counts.handles > legacy_handle_limit {
+        let failed = close_received_reverse(system, &received, counts.handles);
+        return Err(if failed {
+            InitError::Cleanup
+        } else {
+            InitError::Wyr1BModel(JobError::StreamPolicy)
+        });
+    }
     if reservation.connection_id != grant.endpoint_id
         || reservation.generation != grant.endpoint_generation
     {
@@ -2473,10 +2524,11 @@ where
         if failed {
             return Err(InitError::Cleanup);
         }
-        send_job_error(
+        send_versioned_job_error(
             system,
             session,
             reservation,
+            version,
             LaunchErrorCode::StaleOrUnknownSession,
         )?;
         return Ok(JobDispatchOutcome::Responded);
@@ -2488,10 +2540,54 @@ where
             if failed {
                 return Err(InitError::Cleanup);
             }
-            send_job_error(system, session, reservation, job_error_code(error))?;
+            send_versioned_job_error(system, session, reservation, version, job_error_code(error))?;
             return Ok(JobDispatchOutcome::Responded);
         }
     };
+    if version == JobWireVersion::ShellV1 {
+        if parse_shell_v1_request(&bytes[..counts.bytes], counts.handles).is_err() {
+            let failed = close_received_reverse(system, &received, counts.handles);
+            if failed {
+                return Err(InitError::Cleanup);
+            }
+            send_shell_v1_error(
+                system,
+                session,
+                reservation,
+                LaunchErrorCode::MalformedRequest,
+            )?;
+            return Ok(JobDispatchOutcome::Responded);
+        }
+        if !scope.admits_shell_v1() {
+            if close_received_reverse(system, &received, counts.handles) {
+                return Err(InitError::Cleanup);
+            }
+            send_shell_v1_error(
+                system,
+                session,
+                reservation,
+                LaunchErrorCode::PolicyRejected,
+            )?;
+            return Ok(JobDispatchOutcome::Responded);
+        }
+        for info in &received[..counts.handles] {
+            if let Err(error) = validate_controller_channel(system, info.handle) {
+                if close_received_reverse(system, &received, counts.handles) {
+                    return Err(InitError::Cleanup);
+                }
+                send_shell_v1_error(system, session, reservation, launch_error_code(&error))?;
+                return Ok(JobDispatchOutcome::Responded);
+            }
+        }
+        if close_received_reverse(system, &received, counts.handles) {
+            return Err(InitError::Cleanup);
+        }
+        // E3A proves the actual codec, replay, scope, and MOVE-cleanup seam.
+        // E3C must verify the immutable policy/content identity and construct
+        // the child before this branch may ever emit LAUNCH_ACCEPTED.
+        send_shell_v1_error(system, session, reservation, LaunchErrorCode::LoaderFailure)?;
+        return Ok(JobDispatchOutcome::Responded);
+    }
     let parsed = match parse_launch_message(&bytes[..counts.bytes], counts.handles) {
         Ok(parsed) => parsed,
         Err(_) => {
@@ -2510,6 +2606,18 @@ where
     };
     match parsed.message {
         LaunchMessage::Launch(request) => {
+            if !scope.admits_legacy_launch(request.path) {
+                if close_received_reverse(system, &received, counts.handles) {
+                    return Err(InitError::Cleanup);
+                }
+                send_job_error(
+                    system,
+                    session,
+                    reservation,
+                    LaunchErrorCode::PolicyRejected,
+                )?;
+                return Ok(JobDispatchOutcome::Responded);
+            }
             let Some(policy) = policy else {
                 if close_received_reverse(system, &received, counts.handles) {
                     return Err(InitError::Cleanup);
@@ -2533,7 +2641,7 @@ where
                 reservation,
                 request_ticket,
                 request,
-                &received,
+                &received[..legacy_handle_limit],
                 counts.handles,
             ) {
                 Ok(loaded) => Ok(JobDispatchOutcome::Launched(loaded)),
@@ -3697,6 +3805,7 @@ mod tests {
     extern crate alloc;
 
     use super::*;
+    use crate::wyr1b_job::LaunchSessionScope;
     use alloc::{vec, vec::Vec};
     use deepwyrm_syscall::{DwMemoryProtection, DwStatus, DwWaitResultV1};
     use wyrmroot_bootfs::builder::{Builder as BootfsBuilder, FileMode};
@@ -4050,6 +4159,9 @@ mod tests {
             handles: &mut [DwReceivedHandleInfoV1],
         ) -> Result<ReceiveCounts, NativeError> {
             if self.inbound_len == 0 {
+                return Err(FAILURE);
+            }
+            if self.inbound_len > bytes.len() || self.inbound_handle_count > handles.len() {
                 return Err(FAILURE);
             }
             bytes[..self.inbound_len].copy_from_slice(&self.inbound[..self.inbound_len]);
@@ -5114,6 +5226,428 @@ mod tests {
         ));
         assert_eq!(jobs.jobs.live_jobs(), 0);
         assert_eq!(jobs.session_count(), 1);
+    }
+
+    #[test]
+    fn console_shell_v1_admission_cleans_handles_and_stops_at_e3c_boundary() {
+        let mut platform = MockPlatform::new();
+        platform.fail_send = false;
+        let mut waits = TerminalWaits;
+        let mut loader = InitSendLoader::new();
+        let mut jobs = JobDispatcher::new();
+        let owner = grant(EndpointKind::LaunchSession, 1, 1);
+        jobs.install_scoped_session(owner, DwHandle(90), LaunchSessionScope::ConsoleLauncher)
+            .unwrap();
+        let authority = LoadAuthority {
+            parent_root: DwHandle(1),
+            bootfs: DwHandle(2),
+            task_group: DwHandle(3),
+        };
+        let request = wyrmroot_launch_proto::ShellV1Request {
+            console_generation: 2,
+            status_generation: 3,
+            requested_child_generation: 4,
+        };
+
+        platform.inbound_len = wyrmroot_launch_proto::encode_shell_v1_request(
+            reservation(1),
+            request,
+            &mut platform.inbound,
+        )
+        .unwrap();
+        platform.inbound_handle_count = 4;
+        for (index, info) in platform.inbound_handles[..4].iter_mut().enumerate() {
+            info.handle = DwHandle(41 + index as u64);
+        }
+        assert_eq!(
+            dispatch_one_job_request(
+                &mut platform,
+                &mut loader,
+                &mut waits,
+                authority,
+                None,
+                &mut jobs,
+                DwHandle(90),
+                owner,
+            ),
+            Ok(JobDispatchOutcome::Responded)
+        );
+        assert_eq!(
+            platform.closed[..4],
+            [DwHandle(44), DwHandle(43), DwHandle(42), DwHandle(41)]
+        );
+        assert_eq!(
+            platform.queried,
+            [DwHandle(41), DwHandle(42), DwHandle(43), DwHandle(44)]
+        );
+        assert_eq!(platform.query_count, 4);
+        assert_eq!(
+            CONTROLLER_CHANNEL_RIGHTS.0 & deepwyrm_syscall::DW_RIGHT_DUPLICATE.0,
+            0
+        );
+        assert_eq!(
+            wyrmroot_launch_proto::parse_shell_v1_reply(&platform.sent[..platform.sent_len], 0)
+                .unwrap()
+                .reply,
+            wyrmroot_launch_proto::ShellV1Reply::Error {
+                code: LaunchErrorCode::LoaderFailure,
+            }
+        );
+        assert_eq!(jobs.jobs.live_jobs(), 0);
+
+        platform.inbound_len = wyrmroot_launch_proto::encode_shell_v1_request(
+            reservation(1),
+            request,
+            &mut platform.inbound,
+        )
+        .unwrap();
+        platform.inbound_handle_count = 4;
+        for (index, info) in platform.inbound_handles[..4].iter_mut().enumerate() {
+            info.handle = DwHandle(51 + index as u64);
+        }
+        dispatch_one_job_request(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            authority,
+            None,
+            &mut jobs,
+            DwHandle(90),
+            owner,
+        )
+        .unwrap();
+        assert_eq!(
+            platform.closed[4..8],
+            [DwHandle(54), DwHandle(53), DwHandle(52), DwHandle(51)]
+        );
+        assert_eq!(
+            wyrmroot_launch_proto::parse_shell_v1_reply(&platform.sent[..platform.sent_len], 0)
+                .unwrap()
+                .reply,
+            wyrmroot_launch_proto::ShellV1Reply::Error {
+                code: LaunchErrorCode::TransactionReplay,
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_shell_v1_is_cleaned_and_its_fresh_transaction_replays() {
+        let mut platform = MockPlatform::new();
+        platform.fail_send = false;
+        let mut waits = TerminalWaits;
+        let mut loader = InitSendLoader::new();
+        let mut jobs = JobDispatcher::new();
+        let owner = grant(EndpointKind::LaunchSession, 1, 1);
+        jobs.install_scoped_session(owner, DwHandle(90), LaunchSessionScope::ConsoleLauncher)
+            .unwrap();
+        let authority = LoadAuthority {
+            parent_root: DwHandle(1),
+            bootfs: DwHandle(2),
+            task_group: DwHandle(3),
+        };
+        let request = wyrmroot_launch_proto::ShellV1Request {
+            console_generation: 2,
+            status_generation: 3,
+            requested_child_generation: 4,
+        };
+        platform.inbound_len = wyrmroot_launch_proto::encode_shell_v1_request(
+            reservation(1),
+            request,
+            &mut platform.inbound,
+        )
+        .unwrap();
+        platform.inbound[112] ^= 1;
+        platform.inbound_handle_count = 4;
+        for (index, info) in platform.inbound_handles[..4].iter_mut().enumerate() {
+            info.handle = DwHandle(41 + index as u64);
+        }
+        dispatch_one_job_request(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            authority,
+            None,
+            &mut jobs,
+            DwHandle(90),
+            owner,
+        )
+        .unwrap();
+        assert_eq!(
+            wyrmroot_launch_proto::parse_shell_v1_reply(&platform.sent[..platform.sent_len], 0)
+                .unwrap()
+                .reply,
+            wyrmroot_launch_proto::ShellV1Reply::Error {
+                code: LaunchErrorCode::MalformedRequest,
+            }
+        );
+        assert_eq!(platform.close_count, 4);
+        assert_eq!(platform.query_count, 0);
+
+        platform.inbound_len = wyrmroot_launch_proto::encode_shell_v1_request(
+            reservation(1),
+            request,
+            &mut platform.inbound,
+        )
+        .unwrap();
+        platform.inbound_handle_count = 4;
+        for (index, info) in platform.inbound_handles[..4].iter_mut().enumerate() {
+            info.handle = DwHandle(51 + index as u64);
+        }
+        dispatch_one_job_request(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            authority,
+            None,
+            &mut jobs,
+            DwHandle(90),
+            owner,
+        )
+        .unwrap();
+        assert_eq!(
+            wyrmroot_launch_proto::parse_shell_v1_reply(&platform.sent[..platform.sent_len], 0)
+                .unwrap()
+                .reply,
+            wyrmroot_launch_proto::ShellV1Reply::Error {
+                code: LaunchErrorCode::TransactionReplay,
+            }
+        );
+        assert_eq!(platform.close_count, 8);
+        assert_eq!(platform.query_count, 0);
+    }
+
+    #[test]
+    fn shell_v1_receive_failure_retains_uncommitted_sender_handles() {
+        let mut platform = MockPlatform::new();
+        platform.fail_send = false;
+        let mut waits = TerminalWaits;
+        let mut loader = InitSendLoader::new();
+        let mut jobs = JobDispatcher::new();
+        let owner = grant(EndpointKind::LaunchSession, 1, 1);
+        jobs.install_scoped_session(owner, DwHandle(90), LaunchSessionScope::ConsoleLauncher)
+            .unwrap();
+        let authority = LoadAuthority {
+            parent_root: DwHandle(1),
+            bootfs: DwHandle(2),
+            task_group: DwHandle(3),
+        };
+        platform.inbound_len = wyrmroot_launch_proto::encode_shell_v1_request(
+            reservation(1),
+            wyrmroot_launch_proto::ShellV1Request {
+                console_generation: 2,
+                status_generation: 3,
+                requested_child_generation: 4,
+            },
+            &mut platform.inbound,
+        )
+        .unwrap();
+        platform.inbound_handle_count = 5;
+        for (index, info) in platform.inbound_handles[..5].iter_mut().enumerate() {
+            info.handle = DwHandle(41 + index as u64);
+        }
+
+        assert_eq!(
+            dispatch_one_job_request(
+                &mut platform,
+                &mut loader,
+                &mut waits,
+                authority,
+                None,
+                &mut jobs,
+                DwHandle(90),
+                owner,
+            ),
+            Err(InitError::Native(FAILURE))
+        );
+        assert_eq!(platform.inbound_handle_count, 5);
+        assert_eq!(platform.close_count, 0);
+        assert_eq!(platform.sent_len, 0);
+    }
+
+    #[test]
+    fn shell_v1_rejects_duplicate_rights_after_committed_move_cleanup() {
+        let mut platform = MockPlatform::new();
+        platform.fail_send = false;
+        platform.fresh_rights =
+            DwRights(CONTROLLER_CHANNEL_RIGHTS.0 | deepwyrm_syscall::DW_RIGHT_DUPLICATE.0);
+        let mut waits = TerminalWaits;
+        let mut loader = InitSendLoader::new();
+        let mut jobs = JobDispatcher::new();
+        let owner = grant(EndpointKind::LaunchSession, 1, 1);
+        jobs.install_scoped_session(owner, DwHandle(90), LaunchSessionScope::ConsoleLauncher)
+            .unwrap();
+        platform.inbound_len = wyrmroot_launch_proto::encode_shell_v1_request(
+            reservation(1),
+            wyrmroot_launch_proto::ShellV1Request {
+                console_generation: 2,
+                status_generation: 3,
+                requested_child_generation: 4,
+            },
+            &mut platform.inbound,
+        )
+        .unwrap();
+        platform.inbound_handle_count = 4;
+        for (index, info) in platform.inbound_handles[..4].iter_mut().enumerate() {
+            info.handle = DwHandle(41 + index as u64);
+        }
+        dispatch_one_job_request(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            LoadAuthority {
+                parent_root: DwHandle(1),
+                bootfs: DwHandle(2),
+                task_group: DwHandle(3),
+            },
+            None,
+            &mut jobs,
+            DwHandle(90),
+            owner,
+        )
+        .unwrap();
+        assert_eq!(platform.query_count, 1);
+        assert_eq!(platform.close_count, 4);
+        assert_eq!(
+            wyrmroot_launch_proto::parse_shell_v1_reply(&platform.sent[..platform.sent_len], 0)
+                .unwrap()
+                .reply,
+            wyrmroot_launch_proto::ShellV1Reply::Error {
+                code: LaunchErrorCode::PolicyRejected,
+            }
+        );
+    }
+
+    #[test]
+    fn launch_session_scopes_reject_crossed_protocols_without_fallback() {
+        let authority = LoadAuthority {
+            parent_root: DwHandle(1),
+            bootfs: DwHandle(2),
+            task_group: DwHandle(3),
+        };
+        for scope in [
+            LaunchSessionScope::Historical,
+            LaunchSessionScope::ShellJobs,
+        ] {
+            let mut platform = MockPlatform::new();
+            platform.fail_send = false;
+            let mut waits = TerminalWaits;
+            let mut loader = InitSendLoader::new();
+            let mut jobs = JobDispatcher::new();
+            let owner = grant(EndpointKind::LaunchSession, 1, 1);
+            jobs.install_scoped_session(owner, DwHandle(90), scope)
+                .unwrap();
+            platform.inbound_len = wyrmroot_launch_proto::encode_shell_v1_request(
+                reservation(1),
+                wyrmroot_launch_proto::ShellV1Request {
+                    console_generation: 2,
+                    status_generation: 3,
+                    requested_child_generation: 4,
+                },
+                &mut platform.inbound,
+            )
+            .unwrap();
+            platform.inbound_handle_count = 4;
+            dispatch_one_job_request(
+                &mut platform,
+                &mut loader,
+                &mut waits,
+                authority,
+                None,
+                &mut jobs,
+                DwHandle(90),
+                owner,
+            )
+            .unwrap();
+            assert_eq!(
+                wyrmroot_launch_proto::parse_shell_v1_reply(&platform.sent[..platform.sent_len], 0)
+                    .unwrap()
+                    .reply,
+                wyrmroot_launch_proto::ShellV1Reply::Error {
+                    code: LaunchErrorCode::PolicyRejected,
+                }
+            );
+        }
+
+        let mut platform = MockPlatform::new();
+        platform.fail_send = false;
+        let mut waits = TerminalWaits;
+        let mut loader = InitSendLoader::new();
+        let mut jobs = JobDispatcher::new();
+        let owner = grant(EndpointKind::LaunchSession, 1, 1);
+        jobs.install_scoped_session(owner, DwHandle(90), LaunchSessionScope::ConsoleLauncher)
+            .unwrap();
+        platform.inbound_len = wyrmroot_launch_proto::encode_launch(
+            reservation(1),
+            "bin/hello",
+            &["bin/hello"],
+            &[],
+            false,
+            &mut platform.inbound,
+        )
+        .unwrap();
+        dispatch_one_job_request(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            authority,
+            None,
+            &mut jobs,
+            DwHandle(90),
+            owner,
+        )
+        .unwrap();
+        assert!(matches!(
+            parse_launch_message(&platform.sent[..platform.sent_len], 0)
+                .unwrap()
+                .message,
+            LaunchMessage::Error {
+                code: LaunchErrorCode::PolicyRejected
+            }
+        ));
+    }
+
+    #[test]
+    fn scoped_sessions_keep_minor_zero_job_operations() {
+        let authority = LoadAuthority {
+            parent_root: DwHandle(1),
+            bootfs: DwHandle(2),
+            task_group: DwHandle(3),
+        };
+        for scope in [
+            LaunchSessionScope::ConsoleLauncher,
+            LaunchSessionScope::ShellJobs,
+        ] {
+            let mut platform = MockPlatform::new();
+            platform.fail_send = false;
+            let mut waits = TerminalWaits;
+            let mut loader = InitSendLoader::new();
+            let mut jobs = JobDispatcher::new();
+            let owner = grant(EndpointKind::LaunchSession, 1, 1);
+            jobs.install_scoped_session(owner, DwHandle(90), scope)
+                .unwrap();
+            platform.inbound[..wyrmroot_launch_proto::HEADER_BYTES].fill(0);
+            wyrmroot_launch_proto::encode(reservation(1), &mut platform.inbound).unwrap();
+            platform.inbound[40..44]
+                .copy_from_slice(&(LaunchMessageType::ListJobs as u32).to_le_bytes());
+            platform.inbound_len = wyrmroot_launch_proto::HEADER_BYTES;
+            dispatch_one_job_request(
+                &mut platform,
+                &mut loader,
+                &mut waits,
+                authority,
+                None,
+                &mut jobs,
+                DwHandle(90),
+                owner,
+            )
+            .unwrap();
+            assert!(matches!(
+                parse_launch_message(&platform.sent[..platform.sent_len], 0)
+                    .unwrap()
+                    .message,
+                LaunchMessage::JobList(ids) if ids.is_empty()
+            ));
+        }
     }
 
     #[test]

@@ -16,10 +16,18 @@ pub const MAX_ENVIRONMENT: usize = 64;
 pub const MAX_STRING_BYTES: usize = 16 * 1024;
 pub const MAX_PATH_BYTES: usize = 256;
 pub const STREAM_COUNT: usize = 3;
+pub const SHELL_V1_HANDLE_COUNT: usize = 4;
+pub const SHELL_V1_REQUEST_BYTES: usize = 128;
+pub const SHELL_V1_REPLY_BYTES: usize = 56;
+pub const SHELL_V1_PATH: &str = "system/wyrmsh";
+pub const SHELL_V1_STARTUP_ABI: u16 = 2;
+pub const SHELL_V1_POLICY_PROFILE: u16 = 2;
 
 const MAGIC: [u8; 4] = *b"WRLJ";
 const MAJOR: u16 = 1;
 const MINOR: u16 = 0;
+const SHELL_V1_MINOR: u16 = 1;
+const SHELL_V1_MESSAGE_TYPE: u32 = 16;
 const RECORD_BYTES: usize = 8;
 const LAUNCH_FIXED_BYTES: usize = 72;
 /// Exact largest admitted LAUNCH message without reducing any argv,
@@ -35,6 +43,31 @@ pub struct Reservation {
     pub connection_id: u64,
     pub generation: u64,
     pub transaction_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ShellV1Request {
+    pub console_generation: u64,
+    pub status_generation: u64,
+    pub requested_child_generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ParsedShellV1Request {
+    pub reservation: Reservation,
+    pub request: ShellV1Request,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShellV1Reply {
+    LaunchAccepted { job_id: u64 },
+    Error { code: ErrorCode },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ParsedShellV1Reply {
+    pub reservation: Reservation,
+    pub reply: ShellV1Reply,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -337,6 +370,148 @@ pub fn parse_reservation_prefix(bytes: &[u8]) -> Result<Reservation, Error> {
         return Err(Error::WrongSize);
     }
     parse_envelope(bytes)
+}
+
+/// Parses the correlatable WRLJ 1.1 envelope used only by `LAUNCH_SHELL_V1`.
+pub fn parse_shell_v1_reservation_prefix(bytes: &[u8]) -> Result<Reservation, Error> {
+    if bytes.len() < ENVELOPE_BYTES {
+        return Err(Error::WrongSize);
+    }
+    parse_envelope_version(bytes, SHELL_V1_MINOR)
+}
+
+pub fn encode_shell_v1_request(
+    reservation: Reservation,
+    request: ShellV1Request,
+    out: &mut [u8],
+) -> Result<usize, Error> {
+    nonzero(request.console_generation)?;
+    nonzero(request.status_generation)?;
+    nonzero(request.requested_child_generation)?;
+    if out.len() < SHELL_V1_REQUEST_BYTES {
+        return Err(Error::WrongSize);
+    }
+    out[..SHELL_V1_REQUEST_BYTES].fill(0);
+    encode_prefix_version(reservation, SHELL_V1_MINOR, SHELL_V1_MESSAGE_TYPE, out)?;
+    put_u64(out, 48, request.console_generation)?;
+    put_u64(out, 56, request.status_generation)?;
+    put_u64(out, 64, request.requested_child_generation)?;
+    put_u16(out, 72, SHELL_V1_PATH.len() as u16)?;
+    put_u16(out, 74, SHELL_V1_STARTUP_ABI)?;
+    put_u16(out, 76, SHELL_V1_POLICY_PROFILE)?;
+    for (index, role) in [1_u32, 2, 3, 4].into_iter().enumerate() {
+        put_u32(out, 80 + index * RECORD_BYTES, role)?;
+    }
+    out[112..112 + SHELL_V1_PATH.len()].copy_from_slice(SHELL_V1_PATH.as_bytes());
+    Ok(SHELL_V1_REQUEST_BYTES)
+}
+
+pub fn parse_shell_v1_request(
+    bytes: &[u8],
+    received_handles: usize,
+) -> Result<ParsedShellV1Request, Error> {
+    require_size(bytes, SHELL_V1_REQUEST_BYTES)?;
+    require_handles(received_handles, SHELL_V1_HANDLE_COUNT)?;
+    let reservation = parse_envelope_version(bytes, SHELL_V1_MINOR)?;
+    if read_u32(bytes, 40)? != SHELL_V1_MESSAGE_TYPE {
+        return Err(Error::UnknownMessageType);
+    }
+    if read_u32(bytes, 44)? != 0 {
+        return Err(Error::NonzeroFlags);
+    }
+    let request = ShellV1Request {
+        console_generation: nonzero(read_u64(bytes, 48)?)?,
+        status_generation: nonzero(read_u64(bytes, 56)?)?,
+        requested_child_generation: nonzero(read_u64(bytes, 64)?)?,
+    };
+    if read_u16(bytes, 72)? != SHELL_V1_PATH.len() as u16
+        || read_u16(bytes, 74)? != SHELL_V1_STARTUP_ABI
+        || read_u16(bytes, 76)? != SHELL_V1_POLICY_PROFILE
+        || read_u16(bytes, 78)? != 0
+    {
+        return Err(Error::NonzeroReserved);
+    }
+    for (index, expected_role) in [1_u32, 2, 3, 4].into_iter().enumerate() {
+        let offset = 80 + index * RECORD_BYTES;
+        if read_u32(bytes, offset)? != expected_role {
+            return Err(Error::InvalidStreamRoles);
+        }
+        if read_u32(bytes, offset + 4)? != 0 {
+            return Err(Error::NonzeroReserved);
+        }
+    }
+    if &bytes[112..112 + SHELL_V1_PATH.len()] != SHELL_V1_PATH.as_bytes() {
+        return Err(Error::InvalidPath);
+    }
+    if bytes[112 + SHELL_V1_PATH.len()..]
+        .iter()
+        .any(|byte| *byte != 0)
+    {
+        return Err(Error::NonzeroReserved);
+    }
+    Ok(ParsedShellV1Request {
+        reservation,
+        request,
+    })
+}
+
+pub fn encode_shell_v1_accepted(
+    reservation: Reservation,
+    job_id: u64,
+    out: &mut [u8],
+) -> Result<usize, Error> {
+    nonzero(job_id)?;
+    encode_shell_v1_reply(reservation, MessageType::LaunchAccepted as u32, job_id, out)
+}
+
+pub fn encode_shell_v1_error(
+    reservation: Reservation,
+    code: ErrorCode,
+    out: &mut [u8],
+) -> Result<usize, Error> {
+    encode_shell_v1_reply(
+        reservation,
+        MessageType::Error as u32,
+        u64::from(code.as_u32()),
+        out,
+    )
+}
+
+pub fn parse_shell_v1_reply(
+    bytes: &[u8],
+    received_handles: usize,
+) -> Result<ParsedShellV1Reply, Error> {
+    require_size(bytes, SHELL_V1_REPLY_BYTES)?;
+    require_handles(received_handles, 0)?;
+    let reservation = parse_envelope_version(bytes, SHELL_V1_MINOR)?;
+    if read_u32(bytes, 44)? != 0 || read_u32(bytes, 52)? != 0 {
+        return Err(Error::NonzeroReserved);
+    }
+    let reply = match read_u32(bytes, 40)? {
+        value if value == MessageType::LaunchAccepted as u32 => ShellV1Reply::LaunchAccepted {
+            job_id: nonzero(read_u64(bytes, 48)?)?,
+        },
+        value if value == MessageType::Error as u32 => ShellV1Reply::Error {
+            code: ErrorCode::parse(read_u32(bytes, 48)?)?,
+        },
+        _ => return Err(Error::UnknownMessageType),
+    };
+    Ok(ParsedShellV1Reply { reservation, reply })
+}
+
+fn encode_shell_v1_reply(
+    reservation: Reservation,
+    message_type: u32,
+    value: u64,
+    out: &mut [u8],
+) -> Result<usize, Error> {
+    if out.len() < SHELL_V1_REPLY_BYTES {
+        return Err(Error::WrongSize);
+    }
+    out[..SHELL_V1_REPLY_BYTES].fill(0);
+    encode_prefix_version(reservation, SHELL_V1_MINOR, message_type, out)?;
+    put_u64(out, 48, value)?;
+    Ok(SHELL_V1_REPLY_BYTES)
 }
 
 pub fn parse_message(bytes: &[u8], received_handles: usize) -> Result<ParsedMessage<'_>, Error> {
@@ -845,6 +1020,10 @@ fn parse_job_id(bytes: &[u8], handles: usize) -> Result<u64, Error> {
 }
 
 fn encode_envelope(value: Reservation, output: &mut [u8]) -> Result<(), Error> {
+    encode_envelope_version(value, MINOR, output)
+}
+
+fn encode_envelope_version(value: Reservation, minor: u16, output: &mut [u8]) -> Result<(), Error> {
     if output.len() < ENVELOPE_BYTES {
         return Err(Error::WrongSize);
     }
@@ -854,7 +1033,7 @@ fn encode_envelope(value: Reservation, output: &mut [u8]) -> Result<(), Error> {
     output[..ENVELOPE_BYTES].fill(0);
     output[..4].copy_from_slice(&MAGIC);
     put_u16(output, 4, MAJOR)?;
-    put_u16(output, 6, MINOR)?;
+    put_u16(output, 6, minor)?;
     put_u64(output, 8, value.connection_id)?;
     put_u64(output, 16, value.generation)?;
     put_u64(output, 24, value.transaction_id)?;
@@ -874,14 +1053,32 @@ fn encode_prefix(
     Ok(())
 }
 
+fn encode_prefix_version(
+    value: Reservation,
+    minor: u16,
+    message_type: u32,
+    output: &mut [u8],
+) -> Result<(), Error> {
+    if output.len() < HEADER_BYTES {
+        return Err(Error::WrongSize);
+    }
+    encode_envelope_version(value, minor, output)?;
+    put_u32(output, 40, message_type)?;
+    Ok(())
+}
+
 fn parse_envelope(bytes: &[u8]) -> Result<Reservation, Error> {
+    parse_envelope_version(bytes, MINOR)
+}
+
+fn parse_envelope_version(bytes: &[u8], minor: u16) -> Result<Reservation, Error> {
     if bytes.len() < ENVELOPE_BYTES {
         return Err(Error::WrongSize);
     }
     if bytes[..4] != MAGIC {
         return Err(Error::WrongMagic);
     }
-    if read_u16(bytes, 4)? != MAJOR || read_u16(bytes, 6)? != MINOR {
+    if read_u16(bytes, 4)? != MAJOR || read_u16(bytes, 6)? != minor {
         return Err(Error::UnsupportedVersion);
     }
     if read_u64(bytes, 32)? != 0 {
@@ -1002,6 +1199,164 @@ mod tests {
             parse_reservation_prefix(&complete[..ENVELOPE_BYTES - 1]),
             Err(Error::WrongSize)
         );
+    }
+
+    #[test]
+    fn legacy_launch_golden_vector_remains_minor_zero() {
+        let mut bytes = [0_u8; 128];
+        let size = encode_launch(R, "bin/hello", &["bin/hello"], &[], false, &mut bytes).unwrap();
+        assert_eq!(size, 98);
+        let mut expected = [0_u8; 98];
+        expected[..4].copy_from_slice(b"WRLJ");
+        expected[4..6].copy_from_slice(&1_u16.to_le_bytes());
+        expected[6..8].copy_from_slice(&0_u16.to_le_bytes());
+        expected[8..16].copy_from_slice(&7_u64.to_le_bytes());
+        expected[16..24].copy_from_slice(&9_u64.to_le_bytes());
+        expected[24..32].copy_from_slice(&11_u64.to_le_bytes());
+        expected[40..44].copy_from_slice(&1_u32.to_le_bytes());
+        expected[48..52].copy_from_slice(&98_u32.to_le_bytes());
+        expected[56..58].copy_from_slice(&9_u16.to_le_bytes());
+        expected[58..60].copy_from_slice(&1_u16.to_le_bytes());
+        expected[64..68].copy_from_slice(&9_u32.to_le_bytes());
+        expected[72..76].copy_from_slice(&0_u32.to_le_bytes());
+        expected[76..78].copy_from_slice(&9_u16.to_le_bytes());
+        expected[80..89].copy_from_slice(b"bin/hello");
+        expected[89..98].copy_from_slice(b"bin/hello");
+        assert_eq!(&bytes[..size], &expected);
+        assert!(matches!(
+            parse_message(&expected, 0),
+            Ok(ParsedMessage {
+                message: Message::Launch(_),
+                ..
+            })
+        ));
+        assert_eq!(
+            parse_shell_v1_reservation_prefix(&expected),
+            Err(Error::UnsupportedVersion)
+        );
+    }
+
+    #[test]
+    fn shell_v1_request_has_the_frozen_golden_layout() {
+        let request = ShellV1Request {
+            console_generation: 13,
+            status_generation: 15,
+            requested_child_generation: 17,
+        };
+        let mut bytes = [0xaa; SHELL_V1_REQUEST_BYTES];
+        assert_eq!(
+            encode_shell_v1_request(R, request, &mut bytes),
+            Ok(SHELL_V1_REQUEST_BYTES)
+        );
+        let mut expected = [0_u8; SHELL_V1_REQUEST_BYTES];
+        expected[..4].copy_from_slice(b"WRLJ");
+        expected[4..6].copy_from_slice(&1_u16.to_le_bytes());
+        expected[6..8].copy_from_slice(&1_u16.to_le_bytes());
+        expected[8..16].copy_from_slice(&7_u64.to_le_bytes());
+        expected[16..24].copy_from_slice(&9_u64.to_le_bytes());
+        expected[24..32].copy_from_slice(&11_u64.to_le_bytes());
+        expected[40..44].copy_from_slice(&16_u32.to_le_bytes());
+        expected[48..56].copy_from_slice(&13_u64.to_le_bytes());
+        expected[56..64].copy_from_slice(&15_u64.to_le_bytes());
+        expected[64..72].copy_from_slice(&17_u64.to_le_bytes());
+        expected[72..74].copy_from_slice(&13_u16.to_le_bytes());
+        expected[74..76].copy_from_slice(&2_u16.to_le_bytes());
+        expected[76..78].copy_from_slice(&2_u16.to_le_bytes());
+        for (index, role) in [1_u32, 2, 3, 4].into_iter().enumerate() {
+            expected[80 + index * 8..84 + index * 8].copy_from_slice(&role.to_le_bytes());
+        }
+        expected[112..125].copy_from_slice(b"system/wyrmsh");
+        assert_eq!(bytes, expected);
+        assert_eq!(
+            parse_shell_v1_request(&bytes, SHELL_V1_HANDLE_COUNT),
+            Ok(ParsedShellV1Request {
+                reservation: R,
+                request,
+            })
+        );
+        assert_eq!(
+            parse_reservation_prefix(&bytes),
+            Err(Error::UnsupportedVersion)
+        );
+        assert_eq!(parse_message(&bytes, 4), Err(Error::UnsupportedVersion));
+    }
+
+    #[test]
+    fn shell_v1_rejects_malformed_fixed_fields_and_handle_shapes() {
+        let request = ShellV1Request {
+            console_generation: 13,
+            status_generation: 15,
+            requested_child_generation: 17,
+        };
+        let mut bytes = [0_u8; SHELL_V1_REQUEST_BYTES];
+        encode_shell_v1_request(R, request, &mut bytes).unwrap();
+        assert_eq!(
+            parse_shell_v1_request(&bytes, 3),
+            Err(Error::WrongHandleCount)
+        );
+        assert_eq!(
+            parse_shell_v1_request(&bytes[..127], 4),
+            Err(Error::WrongSize)
+        );
+        for offset in [
+            40, 44, 72, 74, 76, 78, 80, 84, 88, 92, 96, 100, 104, 108, 112, 125,
+        ] {
+            let mut malformed = bytes;
+            malformed[offset] ^= 1;
+            assert!(
+                parse_shell_v1_request(&malformed, 4).is_err(),
+                "offset {offset}"
+            );
+        }
+        for offset in [48, 56, 64] {
+            let mut malformed = bytes;
+            malformed[offset..offset + 8].fill(0);
+            assert_eq!(
+                parse_shell_v1_request(&malformed, 4),
+                Err(Error::ZeroIdentity)
+            );
+        }
+        assert_eq!(
+            encode_shell_v1_request(
+                R,
+                ShellV1Request {
+                    console_generation: 0,
+                    ..request
+                },
+                &mut bytes,
+            ),
+            Err(Error::ZeroIdentity)
+        );
+    }
+
+    #[test]
+    fn shell_v1_replies_are_handle_free_minor_one_only() {
+        let mut bytes = [0_u8; SHELL_V1_REPLY_BYTES];
+        assert_eq!(encode_shell_v1_accepted(R, 19, &mut bytes), Ok(56));
+        assert_eq!(
+            parse_shell_v1_reply(&bytes, 0),
+            Ok(ParsedShellV1Reply {
+                reservation: R,
+                reply: ShellV1Reply::LaunchAccepted { job_id: 19 },
+            })
+        );
+        assert_eq!(parse_message(&bytes, 0), Err(Error::UnsupportedVersion));
+        assert_eq!(
+            parse_shell_v1_reply(&bytes, 1),
+            Err(Error::WrongHandleCount)
+        );
+        assert_eq!(
+            encode_shell_v1_error(R, ErrorCode::PolicyRejected, &mut bytes),
+            Ok(56)
+        );
+        assert_eq!(
+            parse_shell_v1_reply(&bytes, 0).unwrap().reply,
+            ShellV1Reply::Error {
+                code: ErrorCode::PolicyRejected,
+            }
+        );
+        bytes[52] = 1;
+        assert_eq!(parse_shell_v1_reply(&bytes, 0), Err(Error::NonzeroReserved));
     }
 
     #[test]
