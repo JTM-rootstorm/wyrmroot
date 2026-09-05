@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
@@ -15,6 +15,8 @@ use crate::sha256::bytes_digest;
 
 const PACKAGE_NAME: &str = "deepwyrm-abi";
 const PACKAGE_MANIFEST: &str = "crates/deepwyrm-abi/Cargo.toml";
+const SYSCALL_PACKAGE_NAME: &str = "deepwyrm-syscall";
+const SYSCALL_PACKAGE_MANIFEST: &str = "crates/deepwyrm-syscall/Cargo.toml";
 const LAYOUT_PATH: &str = "kernel/arch/x86_64/layout.toml";
 const GENERATED_POLICY_PATH: &str = "target/wyr0-b/generated/deepwyrm_layout_policy.rs";
 const MAX_LAYOUT_BYTES: u64 = 1024 * 1024;
@@ -27,6 +29,9 @@ const MAX_GIT_STATUS_STDOUT_BYTES: u64 = 1024;
 const MAX_GIT_PATH_STDOUT_BYTES: u64 = 256;
 const MAX_GIT_STDERR_BYTES: u64 = 64 * 1024;
 const MAX_GIT_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_GIT_TREE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_GIT_BLOB_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_TRACKED_SOURCE_BYTES: u64 = 128 * 1024 * 1024;
 const GIT_COMMAND_DEADLINE: Duration = Duration::from_secs(10);
 const GIT_ARCHIVE_DEADLINE: Duration = Duration::from_secs(30);
 pub(crate) const FIXED_GIT: &str = "/usr/libexec/git-core/git";
@@ -53,9 +58,17 @@ pub(crate) struct DeepLayoutBuild {
 }
 
 pub(crate) struct CargoGitSourceIdentity {
+    repository: PathBuf,
     source_root: PathBuf,
     cargo_home: PathBuf,
     expected_revision: String,
+    tree: String,
+    archive_sha256: String,
+    git_sha256: String,
+    cargo_config_sha256: String,
+}
+
+struct GitSourceState {
     tree: String,
     archive_sha256: String,
     git_sha256: String,
@@ -74,15 +87,21 @@ impl CargoGitSourceIdentity {
         &self.git_sha256
     }
 
+    pub(crate) fn cargo_config_sha256(&self) -> &str {
+        &self.cargo_config_sha256
+    }
+
     pub(crate) fn verify_unchanged(&self) -> Result<(), Failure> {
         let current = verify_exact_cargo_git_source(
             &self.source_root,
             &self.cargo_home,
             &self.expected_revision,
         )?;
+        let cargo_config_sha256 = verify_cargo_configuration(&self.repository, &self.cargo_home)?;
         if current.tree != self.tree
             || current.archive_sha256 != self.archive_sha256
             || current.git_sha256 != self.git_sha256
+            || cargo_config_sha256 != self.cargo_config_sha256
         {
             return Err(Failure::task(
                 "Cargo-selected Deepwyrm source identity changed",
@@ -123,6 +142,7 @@ pub(crate) fn inspect_cargo_git_source(
             "E6 dependency metadata temporary directory is outside the Wyrmroot source",
         ));
     }
+    let cargo_config_sha256 = verify_cargo_configuration(repository, cargo_home)?;
     let cargo_bin = cargo
         .parent()
         .ok_or_else(|| Failure::task("accepted Cargo has no parent directory"))?;
@@ -142,6 +162,13 @@ pub(crate) fn inspect_cargo_git_source(
         &fixed_path,
     )?;
     let package = locate_package(&metadata, expected_repository, expected_revision)?;
+    let syscall_package = locate_named_package(
+        &metadata,
+        expected_repository,
+        expected_revision,
+        SYSCALL_PACKAGE_NAME,
+        SYSCALL_PACKAGE_MANIFEST,
+    )?;
     let source_root = package
         .manifest_path
         .ancestors()
@@ -158,7 +185,32 @@ pub(crate) fn inspect_cargo_git_source(
             "deepwyrm-abi manifest is not at canonical repository path {PACKAGE_MANIFEST}"
         )));
     }
-    verify_exact_cargo_git_source(&source_root, cargo_home, expected_revision)
+    if source_root.join(SYSCALL_PACKAGE_MANIFEST) != syscall_package.manifest_path {
+        return Err(Failure::task(format!(
+            "deepwyrm-syscall manifest is not at canonical repository path {SYSCALL_PACKAGE_MANIFEST}"
+        )));
+    }
+    let syscall_root = syscall_package
+        .manifest_path
+        .ancestors()
+        .nth(3)
+        .ok_or_else(|| Failure::task("deepwyrm-syscall manifest has no source root"))?;
+    if syscall_root != source_root {
+        return Err(Failure::task(
+            "deepwyrm-abi and deepwyrm-syscall resolve from different source checkouts",
+        ));
+    }
+    let state = verify_exact_cargo_git_source(&source_root, cargo_home, expected_revision)?;
+    Ok(CargoGitSourceIdentity {
+        repository: repository.to_path_buf(),
+        source_root,
+        cargo_home: cargo_home.to_path_buf(),
+        expected_revision: expected_revision.to_owned(),
+        tree: state.tree,
+        archive_sha256: state.archive_sha256,
+        git_sha256: state.git_sha256,
+        cargo_config_sha256,
+    })
 }
 
 impl DeepLayoutBuild {
@@ -563,6 +615,22 @@ fn locate_package(
     expected_repository: &str,
     expected_revision: &str,
 ) -> Result<PackageSource, Failure> {
+    locate_named_package(
+        metadata,
+        expected_repository,
+        expected_revision,
+        PACKAGE_NAME,
+        PACKAGE_MANIFEST,
+    )
+}
+
+fn locate_named_package(
+    metadata: &str,
+    expected_repository: &str,
+    expected_revision: &str,
+    package_name: &str,
+    package_manifest: &str,
+) -> Result<PackageSource, Failure> {
     let root = JsonParser::new(metadata).parse()?;
     let packages = root
         .object_field("packages")?
@@ -577,57 +645,56 @@ fn locate_package(
         format!("git+{normalized_repository}?rev={expected_revision}#{expected_revision}");
     let mut selected = None;
     for package in packages {
-        if package.object_field("name")?.as_string("package name")? != PACKAGE_NAME {
+        if package.object_field("name")?.as_string("package name")? != package_name {
             continue;
         }
         if selected.is_some() {
             return Err(Failure::task(
-                "locked Cargo metadata contains multiple deepwyrm-abi packages",
+                "locked Cargo metadata contains multiple {package_name} packages",
             ));
         }
         let source = package.object_field("source")?;
-        let actual_source = source.as_string("deepwyrm-abi source").map_err(|_| {
+        let actual_source = source.as_string("Deepwyrm package source").map_err(|_| {
             Failure::task(
-                "deepwyrm-abi must resolve from the exact pinned Git source, not a path or registry",
+                format!("{package_name} must resolve from the exact pinned Git source, not a path or registry"),
             )
         })?;
         if actual_source != expected_source {
             return Err(Failure::task(format!(
-                "deepwyrm-abi source is '{actual_source}', expected exact locked source '{expected_source}'"
+                "{package_name} source is '{actual_source}', expected exact locked source '{expected_source}'"
             )));
         }
         let manifest = package
             .object_field("manifest_path")?
-            .as_string("deepwyrm-abi manifest path")?;
+            .as_string("Deepwyrm package manifest path")?;
         let manifest_path = PathBuf::from(manifest);
-        validate_metadata_manifest_path(&manifest_path)?;
+        validate_named_metadata_manifest_path(&manifest_path, package_manifest)?;
         selected = Some(PackageSource { manifest_path });
     }
     selected.ok_or_else(|| {
-        Failure::task("locked Cargo metadata does not contain the pinned deepwyrm-abi package")
+        Failure::task(format!(
+            "locked Cargo metadata does not contain the pinned {package_name} package"
+        ))
     })
 }
 
+#[cfg(test)]
 fn validate_metadata_manifest_path(path: &Path) -> Result<(), Failure> {
+    validate_named_metadata_manifest_path(path, PACKAGE_MANIFEST)
+}
+
+fn validate_named_metadata_manifest_path(
+    path: &Path,
+    expected_manifest: &str,
+) -> Result<(), Failure> {
     if !path.is_absolute()
         || path
             .components()
             .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
-        || path.file_name().and_then(OsStr::to_str) != Some("Cargo.toml")
-        || path
-            .parent()
-            .and_then(Path::file_name)
-            .and_then(OsStr::to_str)
-            != Some("deepwyrm-abi")
-        || path
-            .parent()
-            .and_then(Path::parent)
-            .and_then(Path::file_name)
-            .and_then(OsStr::to_str)
-            != Some("crates")
+        || !path.ends_with(expected_manifest)
     {
         return Err(Failure::task(format!(
-            "deepwyrm-abi metadata manifest path is not an absolute non-traversing crates/deepwyrm-abi/Cargo.toml path: {}",
+            "Deepwyrm metadata manifest path is not absolute, non-traversing, and suffixed by {expected_manifest}: {}",
             path.display()
         )));
     }
@@ -700,7 +767,7 @@ fn verify_exact_cargo_git_source(
     root: &Path,
     cargo_home: &Path,
     expected_revision: &str,
-) -> Result<CargoGitSourceIdentity, Failure> {
+) -> Result<GitSourceState, Failure> {
     validate_directory(root, "Cargo-selected Deepwyrm source root")?;
     let canonical_root = fs::canonicalize(root).map_err(|error| {
         Failure::task(format!(
@@ -723,6 +790,12 @@ fn verify_exact_cargo_git_source(
     }
     let git_sha256 = crate::sha256::file_digest(fixed_git)
         .map_err(|error| Failure::task(format!("could not hash fixed Git: {error}")))?;
+    let git_directory = resolve_checkout_git_directory(root, cargo_home)?;
+    reject_path_presence(
+        &git_directory.join("info/attributes"),
+        "Cargo-selected Deepwyrm Git attribute overlay",
+    )?;
+    reject_local_git_includes(&git_directory, cargo_home)?;
     let revision = fixed_git_output_bounded(
         root,
         cargo_home,
@@ -745,20 +818,18 @@ fn verify_exact_cargo_git_source(
         "Cargo-selected Deepwyrm status inspection",
     )?;
     validate_git_status(root, &status)?;
-    let git_directory = fixed_git_output_bounded(
+    let reported_git_directory = fixed_git_output_bounded(
         root,
         cargo_home,
         ["rev-parse", "--absolute-git-dir"],
         MAX_GIT_ROOT_STDOUT_BYTES,
         "Cargo-selected Deepwyrm Git directory inspection",
     )?;
-    let git_directory = PathBuf::from(git_directory.trim());
-    validate_cargo_owned_path(
-        cargo_home,
-        &git_directory,
-        Path::new("git/db"),
-        "Git database",
-    )?;
+    if Path::new(reported_git_directory.trim()) != git_directory {
+        return Err(Failure::task(
+            "Git reports a different directory than the validated checkout metadata",
+        ));
+    }
     let tree = fixed_git_output_bounded(
         root,
         cargo_home,
@@ -776,15 +847,10 @@ fn verify_exact_cargo_git_source(
             "Cargo-selected Deepwyrm tree identity is invalid",
         ));
     }
+    verify_git_index_flags(root, cargo_home)?;
+    verify_worktree_matches_head(root, cargo_home)?;
     let archive = bounded_command_output(
-        Command::new(fixed_git)
-            .arg("-C")
-            .arg(root)
-            .args(["archive", "--format=tar", "HEAD"])
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("TMPDIR", cargo_home)
-            .stdin(Stdio::null()),
+        hardened_fixed_git(root, cargo_home).args(["archive", "--format=tar", "HEAD"]),
         MAX_GIT_ARCHIVE_BYTES,
         MAX_GIT_STDERR_BYTES,
         GIT_ARCHIVE_DEADLINE,
@@ -810,15 +876,483 @@ fn verify_exact_cargo_git_source(
             "fixed Git changed during source verification",
         ));
     }
-    let identity = CargoGitSourceIdentity {
-        source_root: root.to_path_buf(),
-        cargo_home: cargo_home.to_path_buf(),
-        expected_revision: expected_revision.to_owned(),
+    let identity = GitSourceState {
         tree,
         archive_sha256,
         git_sha256,
     };
     Ok(identity)
+}
+
+fn resolve_checkout_git_directory(root: &Path, cargo_home: &Path) -> Result<PathBuf, Failure> {
+    let dot_git = root.join(".git");
+    let metadata = fs::symlink_metadata(&dot_git).map_err(|error| {
+        Failure::task(format!("could not inspect Cargo checkout .git: {error}"))
+    })?;
+    let root_owner = fs::symlink_metadata(root)
+        .map_err(|error| Failure::task(format!("could not inspect Cargo checkout: {error}")))?
+        .uid();
+    if metadata.file_type().is_symlink() || metadata.uid() != root_owner {
+        return Err(Failure::task(
+            "Cargo checkout .git is not owned or is a symlink",
+        ));
+    }
+    let git_directory = if metadata.is_dir() {
+        validate_cargo_owned_path(root, &dot_git, Path::new(".git"), "Git directory")?;
+        dot_git
+    } else if metadata.is_file() {
+        let contents = read_bounded(&dot_git, MAX_GIT_ROOT_STDOUT_BYTES, "Cargo checkout .git")?;
+        let contents = std::str::from_utf8(&contents)
+            .map_err(|_| Failure::task("Cargo checkout .git is not UTF-8"))?;
+        let value = contents
+            .strip_prefix("gitdir: ")
+            .and_then(|value| value.strip_suffix('\n').or(Some(value)))
+            .ok_or_else(|| Failure::task("Cargo checkout .git has invalid syntax"))?;
+        if value.is_empty() || value.contains('\n') || value.contains('\r') {
+            return Err(Failure::task("Cargo checkout .git has invalid syntax"));
+        }
+        let value = Path::new(value);
+        if value
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+        {
+            return Err(Failure::task("Cargo checkout .git path contains traversal"));
+        }
+        let candidate = if value.is_absolute() {
+            value.to_path_buf()
+        } else {
+            root.join(value)
+        };
+        let canonical = fs::canonicalize(&candidate).map_err(|error| {
+            Failure::task(format!(
+                "could not resolve Cargo checkout Git directory: {error}"
+            ))
+        })?;
+        if canonical != candidate {
+            return Err(Failure::task(
+                "Cargo checkout Git directory path is not canonical",
+            ));
+        }
+        validate_cargo_owned_path(cargo_home, &canonical, Path::new("git/db"), "Git database")?;
+        canonical
+    } else {
+        return Err(Failure::task(
+            "Cargo checkout .git is not a regular file or directory",
+        ));
+    };
+    Ok(git_directory)
+}
+
+fn reject_local_git_includes(git_directory: &Path, temp_directory: &Path) -> Result<(), Failure> {
+    let config = git_directory.join("config");
+    validate_regular_path(
+        git_directory,
+        &config,
+        "Cargo checkout local Git configuration",
+    )?;
+    let directory_owner = fs::symlink_metadata(git_directory)
+        .map_err(|error| Failure::task(format!("could not inspect Git directory: {error}")))?
+        .uid();
+    let config_owner = fs::symlink_metadata(&config)
+        .map_err(|error| Failure::task(format!("could not inspect local Git config: {error}")))?
+        .uid();
+    if config_owner != directory_owner {
+        return Err(Failure::task(
+            "Cargo checkout local Git configuration has an unexpected owner",
+        ));
+    }
+    let output = bounded_command_output(
+        hardened_fixed_git_without_repository(temp_directory)
+            .args(["config", "--file"])
+            .arg(&config)
+            .args(["--no-includes", "--name-only", "--null", "--list"]),
+        MAX_GIT_TREE_BYTES,
+        MAX_GIT_STDERR_BYTES,
+        GIT_COMMAND_DEADLINE,
+        "Cargo checkout local Git configuration inspection",
+    )?;
+    if !output.status.success() {
+        return Err(Failure::task(format!(
+            "Cargo checkout local Git configuration inspection failed with exit code {}",
+            output.status.code().unwrap_or(-1)
+        )));
+    }
+    if !output.stderr.is_empty() {
+        return Err(Failure::task(
+            "Cargo checkout local Git configuration inspection produced stderr",
+        ));
+    }
+    for name in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+    {
+        let name = std::str::from_utf8(name)
+            .map_err(|_| Failure::task("local Git configuration name is not UTF-8"))?
+            .to_ascii_lowercase();
+        if name == "include.path" || (name.starts_with("includeif.") && name.ends_with(".path")) {
+            return Err(Failure::task(
+                "Cargo checkout local Git configuration contains an external include",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_cargo_configuration(repository: &Path, cargo_home: &Path) -> Result<String, Failure> {
+    let repository_config = repository.join(".cargo/config.toml");
+    validate_regular_path(
+        repository,
+        &repository_config,
+        "Wyrmroot Cargo configuration",
+    )?;
+    reject_path_presence(
+        &repository.join(".cargo/config"),
+        "legacy repository Cargo config",
+    )?;
+    for candidate in [cargo_home.join("config"), cargo_home.join("config.toml")] {
+        reject_path_presence(&candidate, "Cargo-home configuration")?;
+    }
+    let mut ancestor = repository.parent();
+    while let Some(directory) = ancestor {
+        for name in ["config", "config.toml"] {
+            reject_path_presence(
+                &directory.join(".cargo").join(name),
+                "ancestor Cargo configuration",
+            )?;
+        }
+        ancestor = directory.parent();
+    }
+    crate::sha256::file_digest(&repository_config).map_err(|error| {
+        Failure::task(format!(
+            "could not hash Wyrmroot Cargo configuration: {error}"
+        ))
+    })
+}
+
+fn reject_path_presence(path: &Path, label: &str) -> Result<(), Failure> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Err(Failure::task(format!(
+            "E6 product rejects {label} at {}",
+            path.display()
+        ))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Failure::task(format!(
+            "could not inspect {label} at {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+#[derive(Clone)]
+struct TrackedSource {
+    path: PathBuf,
+    object: String,
+    executable: bool,
+}
+
+fn verify_git_index_flags(root: &Path, cargo_home: &Path) -> Result<(), Failure> {
+    let tree = read_head_tree(root, cargo_home)?;
+    let output = fixed_git_bytes_bounded(
+        root,
+        cargo_home,
+        ["ls-files", "-v", "-z", "--full-name"],
+        MAX_GIT_TREE_BYTES,
+        "Cargo-selected Deepwyrm index flag inspection",
+    )?;
+    let mut paths = BTreeSet::new();
+    for record in output
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        if !record.starts_with(b"H ") {
+            return Err(Failure::task(
+                "Cargo-selected Deepwyrm index contains assume-unchanged, skip-worktree, or non-canonical state",
+            ));
+        }
+        let path = std::str::from_utf8(&record[2..])
+            .map_err(|_| Failure::task("Cargo-selected Deepwyrm index path is not UTF-8"))?;
+        let path = validate_relative_source_path(path)?;
+        if !paths.insert(path) {
+            return Err(Failure::task(
+                "Cargo-selected Deepwyrm index repeats a tracked path",
+            ));
+        }
+    }
+    let expected = tree
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect::<BTreeSet<_>>();
+    if paths != expected {
+        return Err(Failure::task(
+            "Cargo-selected Deepwyrm index path set differs from HEAD",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_worktree_matches_head(root: &Path, cargo_home: &Path) -> Result<(), Failure> {
+    let tracked = read_head_tree(root, cargo_home)?;
+    let tracked_paths = tracked
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect::<BTreeSet<_>>();
+    let mut tracked_directories = BTreeSet::new();
+    for path in &tracked_paths {
+        let mut parent = path.parent();
+        while let Some(directory) = parent {
+            if directory.as_os_str().is_empty() {
+                break;
+            }
+            tracked_directories.insert(directory.to_path_buf());
+            parent = directory.parent();
+        }
+    }
+    verify_worktree_entries(root, root, &tracked_paths, &tracked_directories)?;
+    let mut batch_input = Vec::with_capacity(tracked.len() * 41);
+    for entry in &tracked {
+        batch_input.extend_from_slice(entry.object.as_bytes());
+        batch_input.push(b'\n');
+    }
+    let expected_blobs = fixed_git_bytes_with_stdin_bounded(
+        root,
+        cargo_home,
+        ["cat-file", "--batch"],
+        &batch_input,
+        MAX_TRACKED_SOURCE_BYTES + MAX_GIT_TREE_BYTES,
+        "Cargo-selected Deepwyrm object batch inspection",
+    )?;
+    let mut batch_offset = 0usize;
+    let mut total = 0u64;
+    for entry in tracked {
+        let actual_path = root.join(&entry.path);
+        let metadata = fs::symlink_metadata(&actual_path).map_err(|error| {
+            Failure::task(format!(
+                "could not inspect tracked Deepwyrm source {}: {error}",
+                entry.path.display()
+            ))
+        })?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(Failure::task(format!(
+                "tracked Deepwyrm source is not a regular non-symlink file: {}",
+                entry.path.display()
+            )));
+        }
+        let executable = metadata.mode() & 0o111 != 0;
+        if executable != entry.executable {
+            return Err(Failure::task(format!(
+                "tracked Deepwyrm source executable mode differs from HEAD: {}",
+                entry.path.display()
+            )));
+        }
+        total = total
+            .checked_add(metadata.len())
+            .ok_or_else(|| Failure::task("tracked Deepwyrm source size overflow"))?;
+        if total > MAX_TRACKED_SOURCE_BYTES {
+            return Err(Failure::task(
+                "tracked Deepwyrm source exceeds its aggregate byte bound",
+            ));
+        }
+        let actual = read_bounded(&actual_path, MAX_GIT_BLOB_BYTES, "tracked Deepwyrm source")?;
+        let (expected, next_offset) = parse_batch_blob(&expected_blobs, batch_offset, &entry)?;
+        batch_offset = next_offset;
+        if actual != expected {
+            return Err(Failure::task(format!(
+                "tracked Deepwyrm worktree bytes differ from HEAD: {}",
+                entry.path.display()
+            )));
+        }
+    }
+    if batch_offset != expected_blobs.len() {
+        return Err(Failure::task(
+            "Cargo-selected Deepwyrm object batch contains trailing bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_batch_blob<'a>(
+    output: &'a [u8],
+    offset: usize,
+    entry: &TrackedSource,
+) -> Result<(&'a [u8], usize), Failure> {
+    let header_end = output[offset..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .and_then(|relative| offset.checked_add(relative))
+        .ok_or_else(|| Failure::task("truncated Deepwyrm cat-file batch header"))?;
+    let header = std::str::from_utf8(&output[offset..header_end])
+        .map_err(|_| Failure::task("Deepwyrm cat-file batch header is not UTF-8"))?;
+    let mut fields = header.split(' ');
+    let object = fields.next().unwrap_or_default();
+    let kind = fields.next().unwrap_or_default();
+    let size = fields
+        .next()
+        .ok_or_else(|| Failure::task("Deepwyrm cat-file batch header omits size"))?
+        .parse::<usize>()
+        .map_err(|_| Failure::task("Deepwyrm cat-file batch size is invalid"))?;
+    if fields.next().is_some()
+        || object != entry.object
+        || kind != "blob"
+        || size as u64 > MAX_GIT_BLOB_BYTES
+    {
+        return Err(Failure::task(
+            "Deepwyrm cat-file batch header does not match HEAD",
+        ));
+    }
+    let content_start = header_end
+        .checked_add(1)
+        .ok_or_else(|| Failure::task("Deepwyrm cat-file batch offset overflow"))?;
+    let content_end = content_start
+        .checked_add(size)
+        .ok_or_else(|| Failure::task("Deepwyrm cat-file batch size overflow"))?;
+    let next_offset = content_end
+        .checked_add(1)
+        .ok_or_else(|| Failure::task("Deepwyrm cat-file batch offset overflow"))?;
+    if next_offset > output.len() || output[content_end] != b'\n' {
+        return Err(Failure::task("truncated Deepwyrm cat-file batch object"));
+    }
+    Ok((&output[content_start..content_end], next_offset))
+}
+
+fn read_head_tree(root: &Path, cargo_home: &Path) -> Result<Vec<TrackedSource>, Failure> {
+    let output = fixed_git_bytes_bounded(
+        root,
+        cargo_home,
+        ["ls-tree", "-r", "-z", "--full-tree", "HEAD"],
+        MAX_GIT_TREE_BYTES,
+        "Cargo-selected Deepwyrm HEAD tree inspection",
+    )?;
+    let mut tracked = Vec::new();
+    for record in output
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        let tab = record
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or_else(|| Failure::task("invalid Deepwyrm ls-tree record"))?;
+        let header = std::str::from_utf8(&record[..tab])
+            .map_err(|_| Failure::task("Deepwyrm ls-tree header is not UTF-8"))?;
+        let mut fields = header.split(' ');
+        let mode = fields.next().unwrap_or_default();
+        let kind = fields.next().unwrap_or_default();
+        let object = fields.next().unwrap_or_default();
+        if fields.next().is_some()
+            || !matches!(mode, "100644" | "100755")
+            || kind != "blob"
+            || object.len() != 40
+            || !object.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(Failure::task(
+                "Deepwyrm HEAD contains an unsupported tree entry",
+            ));
+        }
+        let path = std::str::from_utf8(&record[tab + 1..])
+            .map_err(|_| Failure::task("Deepwyrm tree path is not UTF-8"))?;
+        tracked.push(TrackedSource {
+            path: validate_relative_source_path(path)?,
+            object: object.to_owned(),
+            executable: mode == "100755",
+        });
+    }
+    tracked.sort_by(|left, right| left.path.cmp(&right.path));
+    if tracked.is_empty()
+        || tracked
+            .windows(2)
+            .any(|entries| entries[0].path == entries[1].path)
+    {
+        return Err(Failure::task(
+            "Deepwyrm HEAD tree is empty or contains duplicate paths",
+        ));
+    }
+    Ok(tracked)
+}
+
+fn validate_relative_source_path(path: &str) -> Result<PathBuf, Failure> {
+    let path = PathBuf::from(path);
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        || path.starts_with(".git")
+        || path == Path::new(".cargo-ok")
+    {
+        return Err(Failure::task(
+            "Deepwyrm source tree contains an invalid path",
+        ));
+    }
+    Ok(path)
+}
+
+fn verify_worktree_entries(
+    root: &Path,
+    directory: &Path,
+    tracked_paths: &BTreeSet<PathBuf>,
+    tracked_directories: &BTreeSet<PathBuf>,
+) -> Result<(), Failure> {
+    let entries = fs::read_dir(directory).map_err(|error| {
+        Failure::task(format!("could not enumerate Deepwyrm worktree: {error}"))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            Failure::task(format!(
+                "could not inspect Deepwyrm worktree entry: {error}"
+            ))
+        })?;
+        let path = entry.path();
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| Failure::task("Deepwyrm worktree entry escaped its root"))?;
+        if relative == Path::new(".git") {
+            let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                Failure::task(format!("could not inspect Deepwyrm .git: {error}"))
+            })?;
+            if metadata.file_type().is_symlink() || !(metadata.is_file() || metadata.is_dir()) {
+                return Err(Failure::task(
+                    "Deepwyrm .git is not a regular file or directory",
+                ));
+            }
+            continue;
+        }
+        if relative == Path::new(".cargo-ok") {
+            let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                Failure::task(format!("could not inspect Cargo checkout marker: {error}"))
+            })?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() != 0 {
+                return Err(Failure::task(
+                    "Cargo checkout .cargo-ok marker must be a regular non-symlink zero-byte file",
+                ));
+            }
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            Failure::task(format!(
+                "could not inspect Deepwyrm worktree entry: {error}"
+            ))
+        })?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            if !tracked_directories.contains(relative) {
+                return Err(Failure::task(format!(
+                    "Deepwyrm worktree contains an untracked directory: {}",
+                    relative.display()
+                )));
+            }
+            verify_worktree_entries(root, &path, tracked_paths, tracked_directories)?;
+        } else if !metadata.file_type().is_symlink()
+            && metadata.is_file()
+            && tracked_paths.contains(relative)
+        {
+            continue;
+        } else {
+            return Err(Failure::task(format!(
+                "Deepwyrm worktree contains an untracked or unsupported entry: {}",
+                relative.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_cargo_owned_path(
@@ -920,19 +1454,103 @@ where
     S: AsRef<OsStr>,
 {
     let output = bounded_command_output(
-        Command::new(FIXED_GIT)
-            .arg("-C")
-            .arg(repository)
-            .args(arguments)
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("TMPDIR", temp_directory),
+        hardened_fixed_git(repository, temp_directory).args(arguments),
         stdout_maximum,
         MAX_GIT_STDERR_BYTES,
         GIT_COMMAND_DEADLINE,
         label,
     )?;
+    if output.status.success() && !output.stderr.is_empty() {
+        return Err(Failure::task(format!("{label} produced stderr")));
+    }
     output_stdout(output, label)
+}
+
+fn fixed_git_bytes_bounded<I, S>(
+    repository: &Path,
+    temp_directory: &Path,
+    arguments: I,
+    stdout_maximum: u64,
+    label: &str,
+) -> Result<Vec<u8>, Failure>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let output = bounded_command_output(
+        hardened_fixed_git(repository, temp_directory).args(arguments),
+        stdout_maximum,
+        MAX_GIT_STDERR_BYTES,
+        GIT_COMMAND_DEADLINE,
+        label,
+    )?;
+    if !output.status.success() {
+        return Err(Failure::task(format!(
+            "{label} failed with exit code {}",
+            output.status.code().unwrap_or(-1)
+        )));
+    }
+    if !output.stderr.is_empty() {
+        return Err(Failure::task(format!("{label} produced stderr")));
+    }
+    Ok(output.stdout)
+}
+
+fn fixed_git_bytes_with_stdin_bounded<I, S>(
+    repository: &Path,
+    temp_directory: &Path,
+    arguments: I,
+    stdin: &[u8],
+    stdout_maximum: u64,
+    label: &str,
+) -> Result<Vec<u8>, Failure>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let output = bounded_command_output_with_stdin(
+        hardened_fixed_git(repository, temp_directory).args(arguments),
+        stdin,
+        stdout_maximum,
+        MAX_GIT_STDERR_BYTES,
+        GIT_ARCHIVE_DEADLINE,
+        label,
+    )?;
+    if !output.status.success() {
+        return Err(Failure::task(format!(
+            "{label} failed with exit code {}",
+            output.status.code().unwrap_or(-1)
+        )));
+    }
+    if !output.stderr.is_empty() {
+        return Err(Failure::task(format!("{label} produced stderr")));
+    }
+    Ok(output.stdout)
+}
+
+fn hardened_fixed_git(repository: &Path, temp_directory: &Path) -> Command {
+    let mut command = hardened_fixed_git_without_repository(temp_directory);
+    command
+        .arg("-C")
+        .arg(repository)
+        .args(["-c", "core.fsmonitor=false"])
+        .args(["-c", "core.attributesFile=/dev/null"]);
+    command
+}
+
+fn hardened_fixed_git_without_repository(temp_directory: &Path) -> Command {
+    let mut command = Command::new(FIXED_GIT);
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", temp_directory)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .stdin(Stdio::null());
+    command
 }
 
 fn output_stdout(output: BoundedCommandOutput, label: &str) -> Result<String, Failure> {
@@ -2192,9 +2810,9 @@ mod tests {
         DeepLayoutBuild, JsonParser, LayoutPolicy, MAX_METADATA_CONTAINER_ENTRIES,
         MAX_METADATA_JSON_DEPTH, MAX_METADATA_STRING_BYTES, bounded_command_output, locate_package,
         open_stable_regular_file, read_pipe_bounded, validate_git_status,
-        validate_metadata_manifest_path, validate_regular_path, verify_exact_cargo_git_source,
-        verify_open_file_identity, verify_tracked_bytes, write_generated_policy,
-        x86_64_page_table_indices,
+        validate_metadata_manifest_path, validate_regular_path, verify_cargo_configuration,
+        verify_exact_cargo_git_source, verify_open_file_identity, verify_tracked_bytes,
+        write_generated_policy, x86_64_page_table_indices,
     };
     use crate::sha256::bytes_digest;
     use std::path::Path;
@@ -2843,6 +3461,7 @@ mod tests {
     #[test]
     fn exact_cargo_source_identity_binds_checkout_tree_and_database_location() {
         use std::fs;
+        use std::os::unix::fs::PermissionsExt;
         use std::process::Command;
         use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2883,8 +3502,9 @@ mod tests {
             b"[package]\nname = \"deepwyrm-abi\"\nversion = \"0.0.0\"\n",
         )
         .expect("write package fixture");
+        fs::write(checkout.join(".gitignore"), b"ignored-extra\n").expect("write ignore fixture");
         for arguments in [
-            vec!["add", super::PACKAGE_MANIFEST],
+            vec!["add", "--all"],
             vec![
                 "-c",
                 "user.name=Wyrmroot test",
@@ -2922,23 +3542,255 @@ mod tests {
             .trim();
         let identity = verify_exact_cargo_git_source(&checkout, &cargo_home, revision)
             .expect("exact Cargo source fixture rejected");
-        assert_eq!(identity.tree().len(), 40);
-        assert_eq!(identity.archive_sha256().len(), 64);
-        assert_eq!(identity.git_sha256().len(), 64);
-        identity
-            .verify_unchanged()
+        assert_eq!(identity.tree.len(), 40);
+        assert_eq!(identity.archive_sha256.len(), 64);
+        assert_eq!(identity.git_sha256.len(), 64);
+        verify_exact_cargo_git_source(&checkout, &cargo_home, revision)
             .expect("stable identity changed");
 
+        assert!(
+            Command::new(super::FIXED_GIT)
+                .arg("-C")
+                .arg(&checkout)
+                .args([
+                    "update-index",
+                    "--assume-unchanged",
+                    super::PACKAGE_MANIFEST
+                ])
+                .env("TMPDIR", &cargo_home)
+                .status()
+                .expect("set assume-unchanged")
+                .success()
+        );
         fs::write(&manifest, b"modified\n").expect("modify tracked source");
-        assert!(identity.verify_unchanged().is_err());
+        assert!(verify_exact_cargo_git_source(&checkout, &cargo_home, revision).is_err());
+        assert!(
+            Command::new(super::FIXED_GIT)
+                .arg("-C")
+                .arg(&checkout)
+                .args([
+                    "update-index",
+                    "--no-assume-unchanged",
+                    super::PACKAGE_MANIFEST
+                ])
+                .env("TMPDIR", &cargo_home)
+                .status()
+                .expect("clear assume-unchanged")
+                .success()
+        );
         fs::write(
             &manifest,
             b"[package]\nname = \"deepwyrm-abi\"\nversion = \"0.0.0\"\n",
         )
         .expect("restore tracked source");
+        assert!(
+            Command::new(super::FIXED_GIT)
+                .arg("-C")
+                .arg(&checkout)
+                .args(["update-index", "--skip-worktree", super::PACKAGE_MANIFEST])
+                .env("TMPDIR", &cargo_home)
+                .status()
+                .expect("set skip-worktree")
+                .success()
+        );
+        fs::write(&manifest, b"skip-worktree modification\n").expect("modify skip-worktree source");
+        assert!(verify_exact_cargo_git_source(&checkout, &cargo_home, revision).is_err());
+        assert!(
+            Command::new(super::FIXED_GIT)
+                .arg("-C")
+                .arg(&checkout)
+                .args([
+                    "update-index",
+                    "--no-skip-worktree",
+                    super::PACKAGE_MANIFEST
+                ])
+                .env("TMPDIR", &cargo_home)
+                .status()
+                .expect("clear skip-worktree")
+                .success()
+        );
+        fs::write(
+            &manifest,
+            b"[package]\nname = \"deepwyrm-abi\"\nversion = \"0.0.0\"\n",
+        )
+        .expect("restore skip-worktree source");
+        fs::write(checkout.join("ignored-extra"), b"ignored\n").expect("write ignored source");
+        assert!(verify_exact_cargo_git_source(&checkout, &cargo_home, revision).is_err());
+        fs::remove_file(checkout.join("ignored-extra")).expect("remove ignored source");
         fs::write(checkout.join("rogue"), b"untracked\n").expect("write rogue source");
-        assert!(identity.verify_unchanged().is_err());
+        assert!(verify_exact_cargo_git_source(&checkout, &cargo_home, revision).is_err());
+        fs::remove_file(checkout.join("rogue")).expect("remove rogue source");
+
+        let fsmonitor = cargo_home.join("hostile-fsmonitor.sh");
+        fs::write(&fsmonitor, b"#!/bin/sh\nprintf invoked > \"$0.invoked\"\n")
+            .expect("write hostile fsmonitor");
+        fs::set_permissions(&fsmonitor, fs::Permissions::from_mode(0o700))
+            .expect("make hostile fsmonitor executable");
+        let attributes = cargo_home.join("hostile-attributes");
+        fs::write(&attributes, b"* export-ignore\n").expect("write hostile attributes");
+        for (key, value) in [
+            ("core.fsmonitor", fsmonitor.as_os_str()),
+            ("core.attributesFile", attributes.as_os_str()),
+        ] {
+            assert!(
+                Command::new(super::FIXED_GIT)
+                    .arg("-C")
+                    .arg(&checkout)
+                    .args(["config", key])
+                    .arg(value)
+                    .env("TMPDIR", &cargo_home)
+                    .status()
+                    .expect("set hostile local Git configuration")
+                    .success()
+            );
+        }
+        let hardened = verify_exact_cargo_git_source(&checkout, &cargo_home, revision)
+            .expect("hardened Git inspection consumed hostile local configuration");
+        assert_eq!(hardened.archive_sha256, identity.archive_sha256);
+        assert!(!fsmonitor.with_extension("sh.invoked").exists());
+
+        let included = cargo_home.join("included-config");
+        fs::write(&included, b"[core]\nfsmonitor = true\n")
+            .expect("write included Git configuration");
+        for key in ["include.path", "includeIf.onbranch:master.path"] {
+            assert!(
+                Command::new(super::FIXED_GIT)
+                    .arg("-C")
+                    .arg(&checkout)
+                    .args(["config", "--add", key])
+                    .arg(&included)
+                    .env("TMPDIR", &cargo_home)
+                    .status()
+                    .expect("set local Git include")
+                    .success()
+            );
+            assert!(verify_exact_cargo_git_source(&checkout, &cargo_home, revision).is_err());
+            assert!(
+                Command::new(super::FIXED_GIT)
+                    .arg("-C")
+                    .arg(&checkout)
+                    .args(["config", "--unset-all", key])
+                    .env("TMPDIR", &cargo_home)
+                    .status()
+                    .expect("clear local Git include")
+                    .success()
+            );
+        }
+
+        fs::write(database.join("info/attributes"), b"* export-ignore\n")
+            .expect("write Git-directory attribute overlay");
+        assert!(verify_exact_cargo_git_source(&checkout, &cargo_home, revision).is_err());
         fs::remove_dir_all(cargo_home).expect("remove isolated Cargo source fixture");
+    }
+
+    #[test]
+    fn exact_cargo_source_identity_accepts_owned_checkout_local_git_directory() {
+        use std::fs;
+        use std::process::Command;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock precedes Unix epoch")
+            .as_nanos();
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("xtask manifest has a repository root");
+        let cargo_home = repository.join(".tmp").join(format!(
+            "wyrmroot-local-git-source-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let checkout = cargo_home.join("git/checkouts/deepwyrm-fixture/revision");
+        fs::create_dir_all(&checkout).expect("create checkout fixture");
+        assert!(
+            Command::new(super::FIXED_GIT)
+                .args(["init", "-q"])
+                .arg(&checkout)
+                .env("TMPDIR", &cargo_home)
+                .status()
+                .expect("initialize local Git fixture")
+                .success()
+        );
+        let manifest = checkout.join(super::PACKAGE_MANIFEST);
+        fs::create_dir_all(manifest.parent().expect("manifest parent"))
+            .expect("create package fixture");
+        fs::write(&manifest, b"[package]\nname = \"deepwyrm-abi\"\n")
+            .expect("write package fixture");
+        assert!(
+            Command::new(super::FIXED_GIT)
+                .arg("-C")
+                .arg(&checkout)
+                .args(["add", "--all"])
+                .env("TMPDIR", &cargo_home)
+                .status()
+                .expect("add local Git fixture")
+                .success()
+        );
+        assert!(
+            Command::new(super::FIXED_GIT)
+                .arg("-C")
+                .arg(&checkout)
+                .args([
+                    "-c",
+                    "user.name=Wyrmroot test",
+                    "-c",
+                    "user.email=wyrmroot-test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "fixture",
+                ])
+                .env("TMPDIR", &cargo_home)
+                .status()
+                .expect("commit local Git fixture")
+                .success()
+        );
+        let revision = Command::new(super::FIXED_GIT)
+            .arg("-C")
+            .arg(&checkout)
+            .args(["rev-parse", "HEAD"])
+            .env("TMPDIR", &cargo_home)
+            .output()
+            .expect("read fixture revision");
+        let revision = std::str::from_utf8(&revision.stdout)
+            .expect("fixture revision UTF-8")
+            .trim();
+        verify_exact_cargo_git_source(&checkout, &cargo_home, revision)
+            .expect("owned checkout-local Git directory rejected");
+        fs::remove_dir_all(cargo_home).expect("remove local Git fixture");
+    }
+
+    #[test]
+    fn e6_cargo_home_wrapper_configuration_is_rejected_before_execution() {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock precedes Unix epoch")
+            .as_nanos();
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("xtask manifest has a repository root");
+        let cargo_home = repository.join(".tmp").join(format!(
+            "wyrmroot-cargo-config-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&cargo_home).expect("create Cargo-home fixture");
+        let hash = verify_cargo_configuration(repository, &cargo_home)
+            .expect("tracked repository Cargo configuration rejected");
+        assert_eq!(hash.len(), 64);
+        fs::write(
+            cargo_home.join("config.toml"),
+            b"[build]\nrustc-wrapper = \"/tmp/untrusted-wrapper\"\n",
+        )
+        .expect("write hostile Cargo wrapper configuration");
+        assert!(verify_cargo_configuration(repository, &cargo_home).is_err());
+        fs::remove_dir_all(cargo_home).expect("remove Cargo configuration fixture");
     }
 
     fn metadata(source: &str, manifest: &str) -> String {

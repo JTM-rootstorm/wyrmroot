@@ -137,13 +137,14 @@ fn render_source_receipt(
     let analyzer = repository.join("tools/wyrmsh-native-stack.py");
     let assembled = wyr1c::reassemble_e6_snapshot(&product.wyrmroot_revision, &product.artifacts)?;
     let mut output = format!(
-        "kind = \"{SOURCE_KIND}\"\nschema_version = 1\nproduct_kind = \"{PRODUCT_KIND}\"\nselector = \"none\"\nevidence = \"not-produced\"\nwyrmroot_revision = \"{}\"\ndeepwyrm_abi_revision = \"{}\"\ndeepwyrm_source_tree = \"{}\"\ndeepwyrm_source_archive_sha256 = \"{}\"\ngit_path = \"{}\"\ngit_sha256 = \"{}\"\ncargo_lock_sha256 = \"{}\"\nrust_revision = \"{}\"\nrust_toolchain_name = \"{}\"\nrustc_sha256 = \"{}\"\ncargo_sha256 = \"{}\"\nrust_lld_sha256 = \"{}\"\ntoolchain_manifest_sha256 = \"{}\"\ntoolchain_tree_sha256 = \"{}\"\nbuild_environment = \"env-clear PATH=accepted-toolchain-bin:/usr/lib/llvm/22/bin:/usr/bin:/bin LC_ALL=C CARGO_HOME=canonical-project-offline-v1 CARGO_INCREMENTAL=0 CARGO_NET_OFFLINE=true SOURCE_DATE_EPOCH=0 RUSTC=accepted-rustc TMPDIR=per-operation-project-scratch LD_AUDIT=unset LD_LIBRARY_PATH=unset LD_PRELOAD=unset\"\npath_remaps = \"wyrmroot=/source/wyrmroot cargo-home=/cargo-home per-artifact-target=/cargo-target\"\nstack_analyzer_path = \"tools/wyrmsh-native-stack.py\"\nstack_analyzer_sha256 = \"{}\"\nboot_generation = \"{}\"\n",
+        "kind = \"{SOURCE_KIND}\"\nschema_version = 1\nproduct_kind = \"{PRODUCT_KIND}\"\nselector = \"none\"\nevidence = \"not-produced\"\nwyrmroot_revision = \"{}\"\ndeepwyrm_abi_revision = \"{}\"\ndeepwyrm_source_tree = \"{}\"\ndeepwyrm_source_archive_sha256 = \"{}\"\ngit_path = \"{}\"\ngit_sha256 = \"{}\"\ncargo_config_sha256 = \"{}\"\ncargo_lock_sha256 = \"{}\"\nrust_revision = \"{}\"\nrust_toolchain_name = \"{}\"\nrustc_sha256 = \"{}\"\ncargo_sha256 = \"{}\"\nrust_lld_sha256 = \"{}\"\ntoolchain_manifest_sha256 = \"{}\"\ntoolchain_tree_sha256 = \"{}\"\nbuild_environment = \"env-clear PATH=accepted-toolchain-bin:/usr/lib/llvm/22/bin:/usr/bin:/bin LC_ALL=C CARGO_HOME=canonical-project-offline-v1 CARGO_INCREMENTAL=0 CARGO_NET_OFFLINE=true SOURCE_DATE_EPOCH=0 RUSTC=accepted-rustc TMPDIR=per-operation-project-scratch cargo-config=tracked-repository-only LD_AUDIT=unset LD_LIBRARY_PATH=unset LD_PRELOAD=unset\"\npath_remaps = \"wyrmroot=/source/wyrmroot cargo-home=/cargo-home per-artifact-target=/cargo-target\"\nstack_analyzer_path = \"tools/wyrmsh-native-stack.py\"\nstack_analyzer_sha256 = \"{}\"\nboot_generation = \"{}\"\n",
         product.wyrmroot_revision,
         manifest.deepwyrm_revision()?,
         deep_source.tree(),
         deep_source.archive_sha256(),
         crate::deep_layout::FIXED_GIT,
         deep_source.git_sha256(),
+        deep_source.cargo_config_sha256(),
         sha256::file_digest(&repository.join("Cargo.lock"))
             .map_err(|error| Failure::task(format!("could not hash Cargo.lock: {error}")))?,
         manifest.rust_revision()?,

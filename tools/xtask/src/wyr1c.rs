@@ -3267,6 +3267,22 @@ pub(crate) fn inspect_e6_dependency_source(
     toolchain: &crate::toolchain_artifact::AcceptedToolchain,
     cargo_home: &Path,
 ) -> Result<crate::deep_layout::CargoGitSourceIdentity, Failure> {
+    inspect_e6_dependency_source_with_tools(
+        repository,
+        manifest,
+        &toolchain.cargo,
+        &toolchain.rustc,
+        cargo_home,
+    )
+}
+
+fn inspect_e6_dependency_source_with_tools(
+    repository: &Path,
+    manifest: &BuildManifest,
+    cargo: &Path,
+    rustc: &Path,
+    cargo_home: &Path,
+) -> Result<crate::deep_layout::CargoGitSourceIdentity, Failure> {
     let repository_directory =
         crate::secure_fs::Directory::open_exact(repository, "Wyrmroot source")?;
     let tmp = match repository_directory.open_child(".tmp", "WYR1-E6 temporary root") {
@@ -3283,8 +3299,8 @@ pub(crate) fn inspect_e6_dependency_source(
     )?;
     let result = crate::deep_layout::inspect_cargo_git_source(
         repository,
-        &toolchain.cargo,
-        &toolchain.rustc,
+        cargo,
+        rustc,
         cargo_home,
         scratch.path(),
         manifest.deepwyrm_repository()?,
@@ -3350,6 +3366,40 @@ fn hex_digest(value: &[u8; 32]) -> String {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn e6_actual_dependency_source_preflight() {
+        let repository = crate::tasks::repository_root().expect("resolve Wyrmroot source");
+        let manifest = BuildManifest::load(&repository).expect("load build manifest");
+        let project = crate::tasks::canonical_project_root(&repository)
+            .expect("resolve canonical project root");
+        let toolchain = project
+            .join(
+                manifest
+                    .accepted_artifact_root()
+                    .expect("resolve accepted artifact root"),
+            )
+            .join("toolchains")
+            .join(
+                manifest
+                    .rust_toolchain_name()
+                    .expect("resolve accepted toolchain name"),
+            )
+            .join("bin");
+        let cargo_home = crate::tasks::project_cargo_home(&repository, &manifest)
+            .expect("resolve project Cargo home");
+        let source = inspect_e6_dependency_source_with_tools(
+            &repository,
+            &manifest,
+            &toolchain.join("cargo"),
+            &toolchain.join("rustc"),
+            &cargo_home,
+        )
+        .expect("verify actual Cargo-selected Deepwyrm source");
+        source
+            .verify_unchanged()
+            .expect("actual Cargo-selected Deepwyrm source changed");
+    }
 
     #[test]
     fn wyrmsh_native_check_selects_the_separate_production_shell() {
