@@ -5,6 +5,7 @@ use wyrmroot_rrc_manifest::{
     ExpectedObservedIdentity, HEADER_SIZE, ImmutableDependencyKind, MAX_EDGES, MAX_TOTAL_BYTES,
     Manifest, MaterialResidence, ObservedRetainedMaterial, ParseError, ProductError,
     ProductReceiptIdentities, ROLE_RECORD_SIZE, RoleId, StartupProfile, Wyr1aProductProfile,
+    Wyr1eProductProfile,
     builder::{BuildError, Builder, DependencySpec, RoleSpec},
 };
 
@@ -134,6 +135,22 @@ fn wyr1c_product_builder() -> Builder<'static> {
     builder
 }
 
+fn wyr1e_product_builder(wyrmsh_identity: [u8; 32]) -> Builder<'static> {
+    let mut builder = Builder::new(BOOT_IDENTITY);
+    let mut roles = product_roles();
+    roles[0].startup_profile = StartupProfile::BootstrapRegistry;
+    roles[1].startup_profile = StartupProfile::DeviceCoordinator;
+    roles[4].startup_profile = StartupProfile::Wyrmsh;
+    roles[4].executable_identity = wyrmsh_identity;
+    for role in roles {
+        builder.add_role(role).unwrap();
+    }
+    for edge in product_edges() {
+        builder.add_dependency(edge).unwrap();
+    }
+    builder
+}
+
 fn observed_material(path: &'static str, byte: u8) -> ObservedRetainedMaterial<'static> {
     ObservedRetainedMaterial {
         path,
@@ -209,6 +226,17 @@ fn product_profile<'a>(
         },
         expected_closure,
         observed_materials,
+    }
+}
+
+fn wyr1e_product_profile<'a>(
+    expected_closure: &'a [ExpectedClosureEntry<'a>],
+    observed_materials: &'a [ObservedRetainedMaterial<'a>],
+    production_wyrmsh_identity: [u8; 32],
+) -> Wyr1eProductProfile<'a> {
+    Wyr1eProductProfile {
+        base: product_profile(expected_closure, observed_materials),
+        production_wyrmsh_identity,
     }
 }
 
@@ -360,6 +388,7 @@ fn wyr1c_rejects_profile_swaps_and_preserves_old_wire_values() {
     assert_eq!(StartupProfile::EarlyBootStub as u16, 1);
     assert_eq!(StartupProfile::BootstrapRegistry as u16, 2);
     assert_eq!(StartupProfile::DeviceCoordinator as u16, 3);
+    assert_eq!(StartupProfile::Wyrmsh as u16, 4);
 
     // Swapping either role's profile is rejected by the exact C1 product
     // validator even though both bytes are structurally valid.
@@ -389,6 +418,109 @@ fn wyr1c_rejects_profile_swaps_and_preserves_old_wire_values() {
 
     let historical = product_builder(false).build_wyr1a_product(profile).unwrap();
     assert_eq!(historical, decode_hex(FULL_FIVE_ROLE_GOLDEN_HEX));
+}
+
+#[test]
+fn wyr1e_selects_only_the_production_shell_profile_and_identity() {
+    let expected = expected_product_closure();
+    let observed = observed_product_materials();
+    let profile = wyr1e_product_profile(&expected, &observed, [0x55; 32]);
+    let encoded = wyr1e_product_builder([0x55; 32])
+        .build_wyr1e_product(profile)
+        .unwrap();
+    let parsed = Manifest::parse_wyr1e_product(&encoded, &BOOT_IDENTITY, profile).unwrap();
+
+    for (role, activation, startup_profile) in [
+        (
+            RoleId::Registryd,
+            Activation::Early,
+            StartupProfile::BootstrapRegistry,
+        ),
+        (
+            RoleId::Devmgr,
+            Activation::Early,
+            StartupProfile::DeviceCoordinator,
+        ),
+        (
+            RoleId::Uart16550d,
+            Activation::DeviceBound,
+            StartupProfile::Retained,
+        ),
+        (
+            RoleId::Consoled,
+            Activation::ConsoleBound,
+            StartupProfile::Retained,
+        ),
+        (
+            RoleId::Wyrmsh,
+            Activation::ConsoleBound,
+            StartupProfile::Wyrmsh,
+        ),
+    ] {
+        let record = parsed.role(role).unwrap();
+        assert_eq!(
+            (record.activation(), record.startup_profile()),
+            (activation, startup_profile)
+        );
+    }
+    assert_eq!(parsed.role(RoleId::Wyrmsh).unwrap().path(), "system/wyrmsh");
+    assert_eq!(
+        parsed.role(RoleId::Wyrmsh).unwrap().executable_identity(),
+        &[0x55; 32]
+    );
+    assert_eq!(
+        parsed.validate_wyr1c_product(profile.base),
+        Err(ProductError::WrongRoleActivationProfile)
+    );
+}
+
+#[test]
+fn wyr1e_rejects_substituted_hash_profile_and_role() {
+    let expected = expected_product_closure();
+    let observed = observed_product_materials();
+    let profile = wyr1e_product_profile(&expected, &observed, [0x55; 32]);
+
+    assert_eq!(
+        wyr1e_product_builder([0x55; 32]).build_wyr1e_product(Wyr1eProductProfile {
+            production_wyrmsh_identity: [0; 32],
+            ..profile
+        }),
+        Err(BuildError::InvalidProduct(
+            ProductError::ZeroProductionWyrmshIdentity
+        ))
+    );
+
+    let mut substituted_expected = expected.clone();
+    substituted_expected.last_mut().unwrap().identity = [0x56; 32];
+    let mut substituted_observed = observed.clone();
+    substituted_observed.last_mut().unwrap().identity = [0x56; 32];
+    let substituted =
+        wyr1e_product_profile(&substituted_expected, &substituted_observed, [0x55; 32]);
+    assert_eq!(
+        wyr1e_product_builder([0x56; 32]).build_wyr1e_product(substituted),
+        Err(BuildError::InvalidProduct(
+            ProductError::ProductionWyrmshIdentityMismatch
+        ))
+    );
+
+    let mut wrong_role = wyr1e_product_builder([0x55; 32])
+        .build_structural()
+        .unwrap();
+    write_u16(
+        &mut wrong_role,
+        HEADER_SIZE + 3 * ROLE_RECORD_SIZE + 14,
+        StartupProfile::Wyrmsh as u16,
+    );
+    write_u16(
+        &mut wrong_role,
+        HEADER_SIZE + 4 * ROLE_RECORD_SIZE + 14,
+        StartupProfile::Retained as u16,
+    );
+    let parsed = Manifest::parse_structural(&wrong_role, &BOOT_IDENTITY).unwrap();
+    assert_eq!(
+        parsed.validate_wyr1e_product(profile),
+        Err(ProductError::WrongRoleActivationProfile)
+    );
 }
 
 #[test]
@@ -561,7 +693,7 @@ fn role_fields_paths_utf8_reserved_and_identities_fail_closed() {
         Err(ParseError::UnknownActivation)
     );
     let mut unknown_profile = original.clone();
-    write_u16(&mut unknown_profile, HEADER_SIZE + 14, 4);
+    write_u16(&mut unknown_profile, HEADER_SIZE + 14, 5);
     assert_eq!(
         Manifest::parse_structural(&unknown_profile, &BOOT_IDENTITY),
         Err(ParseError::UnknownStartupProfile)

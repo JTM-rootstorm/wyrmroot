@@ -11,7 +11,12 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-use crate::builder::{BuildError, Builder, FileMode};
+use crate::{
+    builder::{BuildError, Builder, FileMode},
+    launch_policy::{
+        JOB_V2_PROFILE_ID, LaunchPolicy, WYRMSH_PATH as POLICY_WYRMSH_PATH, WYRMSH_PROFILE_ID,
+    },
+};
 use wyrmroot_device_proto::{Manifest as DeviceManifest, manifest::ContentIdentity};
 
 /// Permanent supervisor executable.
@@ -380,6 +385,107 @@ pub fn build_d5(product: ProductD5<'_>) -> Result<Vec<u8>, BuildError> {
     builder.build()
 }
 
+/// Exact normal WYR1-E product. It extends the reached C1 recovery closure
+/// with the immutable WRJP 1.1 policy and the one normal shell-approved
+/// payload. Selector-33 test actors remain outside this product.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProductE6<'a> {
+    pub base: ProductC1<'a>,
+    pub launch_policy: &'a [u8],
+    pub hello: &'a [u8],
+    /// Producer-computed identity of `base.base.wyrmsh`, independently bound
+    /// to the WRRM role and WRJP shell entry by the E6 product producer.
+    pub expected_wyrmsh_identity: [u8; 32],
+    /// Producer-computed identity of `hello`, bound to the WRJP JobV2 entry.
+    pub expected_hello_identity: [u8; 32],
+}
+
+impl<'a> ProductE6<'a> {
+    /// The exact normal E6 archive has seven executables and five read-only
+    /// manifest/policy inputs.
+    pub fn artifacts(self) -> [Artifact<'a>; 12] {
+        let base = self.base.artifacts();
+        [
+            base[0],
+            base[1],
+            base[2],
+            base[3],
+            base[4],
+            base[5],
+            base[6],
+            base[7],
+            base[8],
+            base[9],
+            Artifact::read_only(LAUNCH_POLICY_PATH, self.launch_policy),
+            Artifact::executable(HELLO_PATH, self.hello),
+        ]
+    }
+}
+
+/// Builds the deterministic normal WYR1-E archive after validating the
+/// retained C1 policy and the exact two-entry WRJP 1.1 admission set.
+pub fn build_e6(product: ProductE6<'_>) -> Result<Vec<u8>, BuildError> {
+    validate_e6_product(product)?;
+    let mut builder = Builder::new();
+    for artifact in product.artifacts() {
+        if artifact.bytes.is_empty() {
+            return Err(BuildError::EmptyArtifact);
+        }
+        builder.add(
+            artifact.path.as_bytes(),
+            artifact.bytes,
+            if artifact.executable {
+                FileMode::Executable
+            } else {
+                FileMode::ReadOnly
+            },
+        )?;
+    }
+    builder.build()
+}
+
+fn validate_e6_product(product: ProductE6<'_>) -> Result<(), BuildError> {
+    validate_c1_product(product.base)?;
+    if product.launch_policy.is_empty() || product.hello.is_empty() {
+        return Err(BuildError::EmptyArtifact);
+    }
+    if product.expected_wyrmsh_identity == [0; 32] {
+        return Err(BuildError::E6WyrmshIdentityMismatch);
+    }
+    if product.expected_hello_identity == [0; 32] {
+        return Err(BuildError::E6HelloIdentityMismatch);
+    }
+    let policy = LaunchPolicy::parse(product.launch_policy)
+        .map_err(|_| BuildError::InvalidE6LaunchPolicy)?;
+    if policy.version_minor() != 1 || policy.len() != 2 {
+        return Err(BuildError::InvalidE6LaunchPolicy);
+    }
+    let hello = policy
+        .find(HELLO_PATH)
+        .ok_or(BuildError::InvalidE6LaunchPolicy)?;
+    let wyrmsh = policy
+        .find(POLICY_WYRMSH_PATH)
+        .ok_or(BuildError::InvalidE6LaunchPolicy)?;
+    if hello.startup_abi != 2
+        || hello.profile_id != JOB_V2_PROFILE_ID
+        || hello.allow_no_streams
+        || !hello.allow_three_streams
+        || wyrmsh.startup_abi != 2
+        || wyrmsh.profile_id != WYRMSH_PROFILE_ID
+        || wyrmsh.allow_no_streams
+        || !wyrmsh.allow_three_streams
+    {
+        return Err(BuildError::InvalidE6LaunchPolicy);
+    }
+    if wyrmsh.content_sha256 != product.expected_wyrmsh_identity {
+        return Err(BuildError::E6WyrmshIdentityMismatch);
+    }
+    if hello.content_sha256 != product.expected_hello_identity {
+        return Err(BuildError::E6HelloIdentityMismatch);
+    }
+    Ok(())
+}
+
 fn validate_c1_product(product: ProductC1<'_>) -> Result<(), BuildError> {
     if product.marker != WYR1_C1_MARKER {
         return Err(BuildError::WrongC1Marker);
@@ -408,6 +514,7 @@ fn validate_c1_product(product: ProductC1<'_>) -> Result<(), BuildError> {
 mod tests {
     use super::*;
     use crate::archive::Archive;
+    use crate::launch_policy::{LaunchPolicyEntry, encode_wyrmsh};
     use alloc::vec;
 
     const UART_IDENTITY: [u8; 32] = [0xa1; 32];
@@ -460,6 +567,35 @@ mod tests {
             device_manifest,
             expected_uart16550d_identity,
         }
+    }
+
+    fn e6_policy(
+        wyrmsh_identity: [u8; 32],
+        hello_identity: [u8; 32],
+        hello_no_streams: bool,
+    ) -> Vec<u8> {
+        let entries = [
+            LaunchPolicyEntry {
+                path: HELLO_PATH,
+                content_sha256: hello_identity,
+                startup_abi: 2,
+                profile_id: JOB_V2_PROFILE_ID,
+                allow_no_streams: hello_no_streams,
+                allow_three_streams: true,
+            },
+            LaunchPolicyEntry {
+                path: WYRMSH_PATH,
+                content_sha256: wyrmsh_identity,
+                startup_abi: 2,
+                profile_id: WYRMSH_PROFILE_ID,
+                allow_no_streams: false,
+                allow_three_streams: true,
+            },
+        ];
+        let mut output = vec![0; 512];
+        let used = encode_wyrmsh([0x42; 32], &entries, &mut output).unwrap();
+        output.truncate(used);
+        output
     }
 
     #[test]
@@ -671,5 +807,123 @@ mod tests {
         for path in ROLE_PATHS {
             assert!(archive.lookup(path.as_bytes()).unwrap().is_executable());
         }
+    }
+
+    #[test]
+    fn wyr1_e6_builds_only_the_normal_twelve_entry_product() {
+        const WYRMSH_IDENTITY: [u8; 32] = [0xe6; 32];
+        const HELLO_IDENTITY: [u8; 32] = [0x10; 32];
+        let device_manifest = canonical_wrdm(UART_IDENTITY);
+        let policy = e6_policy(WYRMSH_IDENTITY, HELLO_IDENTITY, false);
+        let product = ProductE6 {
+            base: c1_product(WYR1_C1_MARKER, &device_manifest, UART_IDENTITY),
+            launch_policy: &policy,
+            hello: b"hello-elf",
+            expected_wyrmsh_identity: WYRMSH_IDENTITY,
+            expected_hello_identity: HELLO_IDENTITY,
+        };
+
+        let first = build_e6(product).unwrap();
+        assert_eq!(first, build_e6(product).unwrap());
+        let archive = Archive::new(&first).unwrap();
+        assert_eq!(archive.entries().count(), 12);
+        let executable_count = archive
+            .entries()
+            .filter(|entry| entry.is_executable())
+            .count();
+        assert_eq!(executable_count, 7);
+        assert_eq!(
+            archive.lookup(WYRMSH_PATH.as_bytes()).unwrap().data(),
+            b"shell"
+        );
+        assert_eq!(
+            archive.lookup(HELLO_PATH.as_bytes()).unwrap().data(),
+            b"hello-elf"
+        );
+        assert_eq!(
+            archive
+                .lookup(LAUNCH_POLICY_PATH.as_bytes())
+                .unwrap()
+                .data(),
+            policy
+        );
+        assert!(archive.lookup(CONSOLE_ECHO_PATH.as_bytes()).is_err());
+        assert!(archive.lookup(WYR1_D5_GATE_PATH.as_bytes()).is_err());
+        assert!(archive.lookup(DW1_E3A_COM2_PROBE_PATH.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn wyr1_e6_rejects_policy_shape_and_identity_substitution() {
+        const WYRMSH_IDENTITY: [u8; 32] = [0xe6; 32];
+        const HELLO_IDENTITY: [u8; 32] = [0x10; 32];
+        let device_manifest = canonical_wrdm(UART_IDENTITY);
+        let base = c1_product(WYR1_C1_MARKER, &device_manifest, UART_IDENTITY);
+        let policy = e6_policy(WYRMSH_IDENTITY, HELLO_IDENTITY, false);
+        let product = ProductE6 {
+            base,
+            launch_policy: &policy,
+            hello: b"hello-elf",
+            expected_wyrmsh_identity: WYRMSH_IDENTITY,
+            expected_hello_identity: HELLO_IDENTITY,
+        };
+
+        assert_eq!(
+            build_e6(ProductE6 {
+                expected_wyrmsh_identity: [0; 32],
+                ..product
+            }),
+            Err(BuildError::E6WyrmshIdentityMismatch)
+        );
+        assert_eq!(
+            build_e6(ProductE6 {
+                expected_hello_identity: [0; 32],
+                ..product
+            }),
+            Err(BuildError::E6HelloIdentityMismatch)
+        );
+        assert_eq!(
+            build_e6(ProductE6 {
+                expected_wyrmsh_identity: [0xe7; 32],
+                ..product
+            }),
+            Err(BuildError::E6WyrmshIdentityMismatch)
+        );
+        assert_eq!(
+            build_e6(ProductE6 {
+                expected_hello_identity: [0x11; 32],
+                ..product
+            }),
+            Err(BuildError::E6HelloIdentityMismatch)
+        );
+
+        let no_streams = e6_policy(WYRMSH_IDENTITY, HELLO_IDENTITY, true);
+        assert_eq!(
+            build_e6(ProductE6 {
+                launch_policy: &no_streams,
+                ..product
+            }),
+            Err(BuildError::InvalidE6LaunchPolicy)
+        );
+        let historical = {
+            let entries = [LaunchPolicyEntry {
+                path: HELLO_PATH,
+                content_sha256: HELLO_IDENTITY,
+                startup_abi: 2,
+                profile_id: JOB_V2_PROFILE_ID,
+                allow_no_streams: false,
+                allow_three_streams: true,
+            }];
+            let mut output = vec![0; 256];
+            let used = crate::launch_policy::encode([0x42; 32], &entries, &mut output).unwrap();
+            output.truncate(used);
+            output
+        };
+        assert_eq!(
+            build_e6(ProductE6 {
+                launch_policy: &historical,
+                ..product
+            }),
+            Err(BuildError::InvalidE6LaunchPolicy)
+        );
     }
 }

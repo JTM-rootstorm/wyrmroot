@@ -125,6 +125,15 @@ pub enum BuildError {
     InvalidC1DeviceManifest,
     /// The supplied expected UART identity was zero or did not match WRDM.
     C1DriverIdentityMismatch,
+    /// The WYR1-E launch policy was malformed or did not contain exactly the
+    /// normal production shell and hello admission records.
+    InvalidE6LaunchPolicy,
+    /// The WYR1-E shell policy identity was zero or did not match the selected
+    /// production shell identity supplied by the product producer.
+    E6WyrmshIdentityMismatch,
+    /// The WYR1-E hello policy identity was zero or did not match the selected
+    /// hello identity supplied by the product producer.
+    E6HelloIdentityMismatch,
 }
 
 /// The only regular-file metadata forms permitted in a WYR0 bootfs archive.

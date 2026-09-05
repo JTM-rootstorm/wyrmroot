@@ -105,6 +105,15 @@ pub type Wyr1bProductProfile<'a> = Wyr1aProductProfile<'a>;
 /// devmgr its distinct resident device-coordinator startup profile.
 pub type Wyr1cProductProfile<'a> = Wyr1aProductProfile<'a>;
 
+/// WYR1-E selected-product inputs. The production shell identity is supplied
+/// independently of WRRM so admission cannot accept a consistently substituted
+/// retained-stub identity in the manifest and closure inventory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Wyr1eProductProfile<'a> {
+    pub base: Wyr1aProductProfile<'a>,
+    pub production_wyrmsh_identity: [u8; 32],
+}
+
 impl<'a> Manifest<'a> {
     /// Parses structural WRRM v1 and then applies the exact initial WYR1-A
     /// product role graph, external receipts, and retained-material closure.
@@ -126,7 +135,11 @@ impl<'a> Manifest<'a> {
         profile: Wyr1aProductProfile<'_>,
     ) -> Result<(), ProductError> {
         validate_receipts(profile.receipts)?;
-        self.validate_product_roles(StartupProfile::EarlyBootStub, StartupProfile::EarlyBootStub)?;
+        self.validate_product_roles(
+            StartupProfile::EarlyBootStub,
+            StartupProfile::EarlyBootStub,
+            StartupProfile::Retained,
+        )?;
         self.validate_product_role_edges()?;
         self.validate_expected_closure(profile.expected_closure)?;
         validate_observed_materials(profile.expected_closure, profile.observed_materials)
@@ -151,6 +164,7 @@ impl<'a> Manifest<'a> {
         self.validate_product_roles(
             StartupProfile::BootstrapRegistry,
             StartupProfile::EarlyBootStub,
+            StartupProfile::Retained,
         )?;
         self.validate_product_role_edges()?;
         self.validate_expected_closure(profile.expected_closure)?;
@@ -181,16 +195,61 @@ impl<'a> Manifest<'a> {
         self.validate_product_roles(
             StartupProfile::BootstrapRegistry,
             StartupProfile::DeviceCoordinator,
+            StartupProfile::Retained,
         )?;
         self.validate_product_role_edges()?;
         self.validate_expected_closure(profile.expected_closure)?;
         validate_observed_materials(profile.expected_closure, profile.observed_materials)
     }
 
+    /// Parses structural WRRM v1 and applies the exact WYR1-E selected-product
+    /// graph, retained closure, receipts, and independent production shell
+    /// identity.
+    pub fn parse_wyr1e_product(
+        bytes: &'a [u8],
+        expected_boot_generation: &[u8; 32],
+        profile: Wyr1eProductProfile<'_>,
+    ) -> Result<Self, ProductError> {
+        let manifest = Self::parse_structural(bytes, expected_boot_generation)
+            .map_err(ProductError::StructuralParse)?;
+        manifest.validate_wyr1e_product(profile)?;
+        Ok(manifest)
+    }
+
+    /// Validates the new WYR1-E product without weakening the historical
+    /// WYR1-A/B/C requirement that role 5 use the Retained profile.
+    pub fn validate_wyr1e_product(
+        self,
+        profile: Wyr1eProductProfile<'_>,
+    ) -> Result<(), ProductError> {
+        if is_zero_identity(&profile.production_wyrmsh_identity) {
+            return Err(ProductError::ZeroProductionWyrmshIdentity);
+        }
+        validate_receipts(profile.base.receipts)?;
+        self.validate_product_roles(
+            StartupProfile::BootstrapRegistry,
+            StartupProfile::DeviceCoordinator,
+            StartupProfile::Wyrmsh,
+        )?;
+        let wyrmsh = self
+            .role(RoleId::Wyrmsh)
+            .ok_or(ProductError::WrongRoleSet)?;
+        if wyrmsh.executable_identity() != &profile.production_wyrmsh_identity {
+            return Err(ProductError::ProductionWyrmshIdentityMismatch);
+        }
+        self.validate_product_role_edges()?;
+        self.validate_expected_closure(profile.base.expected_closure)?;
+        validate_observed_materials(
+            profile.base.expected_closure,
+            profile.base.observed_materials,
+        )
+    }
+
     fn validate_product_roles(
         self,
         registry_profile: StartupProfile,
         devmgr_profile: StartupProfile,
+        wyrmsh_profile: StartupProfile,
     ) -> Result<(), ProductError> {
         if self.role_count() != EXPECTED_ROLE_COUNT {
             return Err(ProductError::WrongRoleSet);
@@ -212,9 +271,8 @@ impl<'a> Manifest<'a> {
                 RoleId::Registryd => (Activation::Early, registry_profile),
                 RoleId::Devmgr => (Activation::Early, devmgr_profile),
                 RoleId::Uart16550d => (Activation::DeviceBound, StartupProfile::Retained),
-                RoleId::Consoled | RoleId::Wyrmsh => {
-                    (Activation::ConsoleBound, StartupProfile::Retained)
-                }
+                RoleId::Consoled => (Activation::ConsoleBound, StartupProfile::Retained),
+                RoleId::Wyrmsh => (Activation::ConsoleBound, wyrmsh_profile),
             };
             if (role.activation(), role.startup_profile()) != expected_profile {
                 return Err(ProductError::WrongRoleActivationProfile);
@@ -361,6 +419,8 @@ pub enum ProductError {
     ManifestReceiptIdentityMismatch,
     ZeroBootfsReceiptIdentity,
     BootfsReceiptIdentityMismatch,
+    ZeroProductionWyrmshIdentity,
+    ProductionWyrmshIdentityMismatch,
     WrongRoleSet,
     WrongRoleFlags,
     WrongRoleActivationProfile,

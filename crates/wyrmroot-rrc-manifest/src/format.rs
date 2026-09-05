@@ -89,6 +89,9 @@ pub enum StartupProfile {
     /// WYR1-C resident device coordinator. This profile has no hardware
     /// authority; its exact startup capabilities are owned by WRLP.
     DeviceCoordinator = 3,
+    /// WYR1-E production recovery shell. Historical products continue to use
+    /// [`Self::Retained`] for their non-launchable shell stub.
+    Wyrmsh = 4,
 }
 
 impl StartupProfile {
@@ -98,6 +101,7 @@ impl StartupProfile {
             1 => Ok(Self::EarlyBootStub),
             2 => Ok(Self::BootstrapRegistry),
             3 => Ok(Self::DeviceCoordinator),
+            4 => Ok(Self::Wyrmsh),
             _ => Err(ParseError::UnknownStartupProfile),
         }
     }
@@ -791,7 +795,7 @@ fn validate_activation_profile(
         ) | (
             Activation::DeviceBound | Activation::ConsoleBound,
             StartupProfile::Retained
-        )
+        ) | (Activation::ConsoleBound, StartupProfile::Wyrmsh)
     ) {
         Ok(())
     } else {
