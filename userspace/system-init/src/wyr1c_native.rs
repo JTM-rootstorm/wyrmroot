@@ -8,6 +8,9 @@ use super::*;
 #[cfg(feature = "wyr1d-selector32")]
 #[path = "wyr1d_native.rs"]
 mod selector32;
+#[cfg(feature = "wyr1e-production")]
+#[path = "wyr1e_native.rs"]
+mod wyr1e;
 use crate::wyr1b::{EndpointKind, RegistryTopology};
 #[cfg(feature = "dw1e3-selector31")]
 use crate::wyr1b_native::{InstalledPeer, launch_registry_client_actor};
@@ -16,9 +19,17 @@ use crate::wyr1b_native::{
     launch_registry_until_ready, poison_registry_generation, restart_topology_or_poison,
 };
 use deepwyrm_syscall::{DW_HANDLE_TRANSFER_MOVE, DW_OBJECT_TYPE_CHANNEL, DwHandleTransferV1};
-#[cfg(any(feature = "dw1e3-selector31", feature = "wyr1d-selector32"))]
+#[cfg(any(
+    feature = "dw1e3-selector31",
+    feature = "wyr1d-selector32",
+    feature = "wyr1e-production"
+))]
 use wyrmroot_device_proto::SERIAL_CONSOLE_CONNECTOR_PUBLICATION_POLICY;
-#[cfg(not(any(feature = "dw1e3-selector31", feature = "wyr1d-selector32")))]
+#[cfg(not(any(
+    feature = "dw1e3-selector31",
+    feature = "wyr1d-selector32",
+    feature = "wyr1e-production"
+)))]
 use wyrmroot_device_proto::SERIAL_CONSOLE_PUBLICATION_POLICY;
 #[cfg(any(test, not(feature = "wyr1d-selector32")))]
 use wyrmroot_device_proto::controller::encode as encode_controller;
@@ -26,14 +37,20 @@ use wyrmroot_device_proto::coordinator::{
     RegistryEndpoint, RegistryEndpointGeneration, RegistryEndpointId, RegistryGeneration,
     SupervisorGeneration,
 };
-#[cfg(feature = "wyr1c6-selector29")]
-use wyrmroot_device_proto::driver_launch::{C6_FACT_BYTES, C6Fact, parse_c6_fact};
 #[cfg(any(
     feature = "wyr1c6-production",
     feature = "dw1e3-selector31",
     feature = "wyr1d-selector32"
 ))]
-use wyrmroot_device_proto::driver_launch::{encode_reaped, parse_driver_retired};
+use wyrmroot_device_proto::driver_launch::encode_reaped;
+#[cfg(any(
+    feature = "wyr1c6-production",
+    feature = "dw1e3-selector31",
+    feature = "wyr1d-selector32"
+))]
+use wyrmroot_device_proto::driver_launch::parse_driver_retired;
+#[cfg(feature = "wyr1c6-selector29")]
+use wyrmroot_device_proto::driver_launch::{C6_FACT_BYTES, C6Fact, parse_c6_fact};
 use wyrmroot_device_proto::{
     DriverLaunchRequest,
     controller::{ControllerMessage, StatusCode, parse as parse_controller},
@@ -157,6 +174,8 @@ struct DriverNativeAttempt {
 pub(crate) struct ResidentState {
     #[cfg(feature = "wyr1d-selector32")]
     d5: Option<selector32::State>,
+    #[cfg(feature = "wyr1e-production")]
+    e6: Option<wyr1e::State>,
     resource_domain: Option<ResourceDomainCustody>,
     registry: Option<RegistryNativeAttempt>,
     topology: RegistryTopology,
@@ -465,9 +484,13 @@ where
             return Err(poison.err().unwrap_or(error));
         }
     };
+    #[cfg(feature = "wyr1e-production")]
+    let e6 = Some(wyr1e::State::new(topology.generation())?);
     let state = ResidentState {
         #[cfg(feature = "wyr1d-selector32")]
         d5: Some(selector32::State::new(bootfs)?),
+        #[cfg(feature = "wyr1e-production")]
+        e6,
         resource_domain,
         registry: Some(registry),
         topology,
@@ -1023,9 +1046,17 @@ fn install_publication<S: Wyr1BPlatform>(
     endpoint: DwHandle,
 ) -> Result<(), InitError> {
     let mut bytes = [0u8; 256];
-    #[cfg(any(feature = "dw1e3-selector31", feature = "wyr1d-selector32"))]
+    #[cfg(any(
+        feature = "dw1e3-selector31",
+        feature = "wyr1d-selector32",
+        feature = "wyr1e-production"
+    ))]
     let policy = SERIAL_CONSOLE_CONNECTOR_PUBLICATION_POLICY;
-    #[cfg(not(any(feature = "dw1e3-selector31", feature = "wyr1d-selector32")))]
+    #[cfg(not(any(
+        feature = "dw1e3-selector31",
+        feature = "wyr1d-selector32",
+        feature = "wyr1e-production"
+    )))]
     let policy = SERIAL_CONSOLE_PUBLICATION_POLICY;
     let size = encode_install_publication(
         RegistryHeader {
@@ -3112,6 +3143,10 @@ where
                                             resident, system, loader, waits, bootfs, error,
                                         )
                                     } else {
+                                        #[cfg(feature = "wyr1e-production")]
+                                        start_wyr1e_or_recover_registry(
+                                            resident, system, loader, waits, bootfs,
+                                        )?;
                                         #[cfg(feature = "dw1e3-selector31")]
                                         {
                                             start_e3a_probe(resident, system, loader, waits, bootfs)
@@ -3174,23 +3209,38 @@ where
                                     error
                                 });
                             }
+                            #[cfg(feature = "wyr1e-production")]
+                            wyr1e::retire_dependents(resident, system, waits, false)?;
                             let _request = reap_driver(resident, system, waits, false)?;
-                            #[cfg(feature = "dw1e3-selector31")]
-                            reap_e3a_probe(resident, system, waits, true)?;
-                            #[cfg(any(
-                                feature = "wyr1c6-production",
-                                feature = "dw1e3-selector31",
-                                feature = "wyr1d-selector32"
-                            ))]
+                            #[cfg(feature = "wyr1e-production")]
                             {
                                 let state = resident
                                     .wyr1c
                                     .as_ref()
                                     .ok_or(InitError::WrongActivationOrder)?;
                                 let devmgr = state.devmgr.ok_or(InitError::WrongActivationOrder)?;
-                                acknowledge_driver_reaped(system, devmgr, _request)?;
+                                acknowledge_driver_reaped(system, devmgr, _request)
                             }
-                            Ok(())
+                            #[cfg(not(feature = "wyr1e-production"))]
+                            {
+                                #[cfg(feature = "dw1e3-selector31")]
+                                reap_e3a_probe(resident, system, waits, true)?;
+                                #[cfg(any(
+                                    feature = "wyr1c6-production",
+                                    feature = "dw1e3-selector31",
+                                    feature = "wyr1d-selector32"
+                                ))]
+                                {
+                                    let state = resident
+                                        .wyr1c
+                                        .as_ref()
+                                        .ok_or(InitError::WrongActivationOrder)?;
+                                    let devmgr =
+                                        state.devmgr.ok_or(InitError::WrongActivationOrder)?;
+                                    acknowledge_driver_reaped(system, devmgr, _request)?;
+                                }
+                                Ok(())
+                            }
                         }
                         #[cfg(feature = "dw1e3-selector31")]
                         ResidentPollEvent::ProbeControlReadable => {
@@ -3303,6 +3353,42 @@ where
             rebind_publication(resident, system, waits)?;
         }
     }
+    #[cfg(feature = "wyr1e-production")]
+    {
+        let outcome = wyr1e::poll(resident, system, loader, waits, now_ns)?;
+        if outcome != wyr1e::PollOutcome::Stable {
+            let size = system
+                .query_memory_object_size(resident.authority.bootfs)
+                .map_err(InitError::Native)?;
+            let plan = MappingPlan::for_bootfs(size).map_err(|error| {
+                ordinary_mapping_error(MappingDiagnosticSite::RegistryReplacement, error, size)
+            })?;
+            return system
+                .with_bootfs_bytes(
+                    resident.authority.parent_root,
+                    resident.authority.bootfs,
+                    plan,
+                    |system, bootfs| {
+                        match outcome {
+                            wyr1e::PollOutcome::Stable => Ok(()),
+                            wyr1e::PollOutcome::LaunchConsole => {
+                                wyr1e::launch_after_publication_observed(
+                                    resident, system, loader, waits, bootfs,
+                                )
+                            }
+                            wyr1e::PollOutcome::RecoverDevmgr => {
+                                recover_devmgr(resident, system, loader, waits, bootfs)
+                            }
+                            wyr1e::PollOutcome::RecoverRegistry => {
+                                recover_registry(resident, system, loader, waits, bootfs, false)
+                            }
+                        }?;
+                        Ok(resident.controller.mode())
+                    },
+                )
+                .map_err(InitError::Native)?;
+        }
+    }
     Ok(resident.controller.mode())
 }
 
@@ -3323,6 +3409,10 @@ where
     if let Some(child_cleanup_failed) = fail_closed_e3a_recovery(resident, system, waits) {
         return finish_e3a_fatal_recovery(resident, system, waits, child_cleanup_failed);
     }
+    #[cfg(feature = "wyr1e-production")]
+    let dependent_cleanup_failed = wyr1e::retire_dependents(resident, system, waits, true).is_err();
+    #[cfg(not(feature = "wyr1e-production"))]
+    let dependent_cleanup_failed = false;
     let registry = resident
         .wyr1c
         .as_mut()
@@ -3336,8 +3426,13 @@ where
         .as_mut()
         .ok_or(InitError::WrongActivationOrder)?
         .binding = None;
-    let exhausted =
-        poison_registry_generation(system, waits, &mut resident.controller, registry, false)?;
+    let exhausted = poison_registry_generation(
+        system,
+        waits,
+        &mut resident.controller,
+        registry,
+        dependent_cleanup_failed,
+    )?;
     let step = registry_recovery_step(exhausted, status_already_consumed);
     match step {
         RegistryRecoveryStep::Degraded => {
@@ -3358,6 +3453,8 @@ where
         resident.result = RecoveryResult::Degraded;
         return Ok(());
     };
+    #[cfg(feature = "wyr1e-production")]
+    wyr1e::reserve_registry_replacement(resident, replacement.active.generation)?;
     let replacement = restart_topology_or_poison(
         system,
         waits,
@@ -3369,6 +3466,8 @@ where
             .topology,
         replacement,
     )?;
+    #[cfg(feature = "wyr1e-production")]
+    wyr1e::commit_registry_replacement(resident, replacement.active.generation)?;
     resident
         .wyr1c
         .as_mut()
@@ -3399,7 +3498,37 @@ where
     if let Err(error) = rebind_publication(resident, system, waits) {
         return recover_devmgr_after_error(resident, system, loader, waits, bootfs, error);
     }
+    #[cfg(feature = "wyr1e-production")]
+    if resident
+        .wyr1c
+        .as_ref()
+        .is_some_and(|state| state.driver.is_some())
+    {
+        start_wyr1e_or_recover_registry(resident, system, loader, waits, bootfs)?;
+    }
     Ok(())
+}
+
+#[cfg(feature = "wyr1e-production")]
+fn start_wyr1e_or_recover_registry<S, L, W>(
+    resident: &mut ResidentSystemInit,
+    system: &mut S,
+    loader: &mut L,
+    waits: &mut W,
+    bootfs: &[u8],
+) -> Result<(), InitError>
+where
+    S: Wyr1BPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    match wyr1e::start_after_driver_constructed(resident, system) {
+        Ok(()) => Ok(()),
+        Err(_) if wyr1e::registry_recovery_required(resident) => {
+            recover_registry(resident, system, loader, waits, bootfs, false)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn recover_devmgr_after_error<S, L, W>(
@@ -3492,6 +3621,11 @@ where
     #[cfg(feature = "dw1e3-selector31")]
     if let Some(child_cleanup_failed) = fail_closed_e3a_recovery(resident, system, waits) {
         return finish_e3a_fatal_recovery(resident, system, waits, child_cleanup_failed);
+    }
+    #[cfg(feature = "wyr1e-production")]
+    if wyr1e::retire_dependents(resident, system, waits, false).is_err() {
+        resident.result = RecoveryResult::Degraded;
+        return Err(InitError::Cleanup);
     }
     #[cfg(feature = "wyr1c6-selector29")]
     let restarting_d1 = {

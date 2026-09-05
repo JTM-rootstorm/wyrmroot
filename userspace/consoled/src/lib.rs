@@ -28,6 +28,51 @@ pub const SERIAL_RETRY_BACKOFF_MILLIS: u64 = 25;
 pub const MAX_FAILURES_PER_WINDOW: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReleaseWitnessEvent {
+    Released,
+    Malformed,
+}
+
+/// The retained direct CONNECT endpoint carries no messages. Only a pure
+/// peer-close observation certifies release; data remains malformed even when
+/// it is co-observed with peer close.
+pub const fn classify_release_witness(readable: bool, peer_closed: bool) -> ReleaseWitnessEvent {
+    if !readable && peer_closed {
+        ReleaseWitnessEvent::Released
+    } else {
+        ReleaseWitnessEvent::Malformed
+    }
+}
+
+/// Executes the mandatory post-CONNECTED cleanup order while still attempting
+/// both releases when the raw endpoint close fails.
+pub fn release_raw_then_witness<H: Copy>(
+    raw: H,
+    witness: Option<H>,
+    mut close: impl FnMut(H) -> bool,
+) -> bool {
+    let raw_closed = close(raw);
+    let witness_closed = witness.is_none_or(close);
+    raw_closed && witness_closed
+}
+
+/// Runs fatal event-loop cleanup in the only safe ownership order. Callers
+/// supply their native effects so the sequencing remains executable in the
+/// allocation-free model and in host tests.
+pub fn cleanup_after_event_loop_failure<S, C>(
+    serial: &mut S,
+    child: &mut C,
+    close_serial: impl FnOnce(&mut S) -> bool,
+    retire_watch: impl FnOnce(&mut S) -> bool,
+    close_child: impl FnOnce(&mut C) -> bool,
+) -> bool {
+    let serial_closed = close_serial(serial);
+    let watch_retired = retire_watch(serial);
+    let child_closed = close_child(child);
+    serial_closed && watch_retired && child_closed
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChildPolicy {
     ConsoleEcho,
     Wyrmsh,
@@ -1709,6 +1754,72 @@ const fn other(source: OutputSource) -> OutputSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_release_witness_is_message_free_and_raw_closes_first() {
+        assert_eq!(
+            classify_release_witness(false, true),
+            ReleaseWitnessEvent::Released
+        );
+        for (readable, peer_closed) in [(false, false), (true, false), (true, true)] {
+            assert_eq!(
+                classify_release_witness(readable, peer_closed),
+                ReleaseWitnessEvent::Malformed
+            );
+        }
+
+        let mut order = [0u64; 2];
+        let mut count = 0;
+        assert!(release_raw_then_witness(41, Some(42), |handle| {
+            order[count] = handle;
+            count += 1;
+            true
+        }));
+        assert_eq!(order, [41, 42]);
+
+        count = 0;
+        assert!(release_raw_then_witness(43, None, |handle| {
+            order[count] = handle;
+            count += 1;
+            true
+        }));
+        assert_eq!(count, 1);
+        assert_eq!(order[0], 43);
+
+        count = 0;
+        assert!(!release_raw_then_witness(51, Some(52), |handle| {
+            order[count] = handle;
+            count += 1;
+            handle != 51
+        }));
+        assert_eq!(order, [51, 52]);
+    }
+
+    #[test]
+    fn fatal_event_loop_cleanup_orders_serial_before_watch_and_child() {
+        let log = std::cell::Cell::new(0u16);
+        let mut serial = ();
+        let mut child = ();
+        let cleaned = cleanup_after_event_loop_failure(
+            &mut serial,
+            &mut child,
+            |_| {
+                log.set(log.get() * 10 + 1);
+                false
+            },
+            |_| {
+                log.set(log.get() * 10 + 2);
+                true
+            },
+            |_| {
+                log.set(log.get() * 10 + 3);
+                true
+            },
+        );
+        assert!(!cleaned);
+        assert_eq!(log.get(), 123);
+    }
+
     fn correlation(value: u64) -> SerialCorrelation {
         SerialCorrelation {
             registry_generation: 1,

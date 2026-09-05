@@ -6,7 +6,17 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+#[cfg(any(
+    all(feature = "wyr1e-production", feature = "wyr1d-selector32"),
+    all(feature = "wyr1e-production", feature = "dw1e3-selector31"),
+    all(feature = "wyr1e-production", feature = "wyr1c6-selector29")
+))]
+compile_error!("WYR1-E production and selector-only init policies are mutually exclusive");
+
 use core::mem::MaybeUninit;
+
+#[cfg(feature = "wyr1e-production")]
+use wyrmroot_consoled as _;
 
 pub mod evidence;
 pub mod gate;
@@ -831,6 +841,7 @@ impl SystemInit {
             manifest,
             StartupProfile::EarlyBootStub,
             StartupProfile::EarlyBootStub,
+            StartupProfile::Retained,
         )
     }
 
@@ -839,14 +850,33 @@ impl SystemInit {
             manifest,
             StartupProfile::BootstrapRegistry,
             StartupProfile::EarlyBootStub,
+            StartupProfile::Retained,
         )
     }
 
+    #[cfg_attr(
+        all(feature = "wyr1e-production", not(test)),
+        allow(
+            dead_code,
+            reason = "retained for explicit historical-profile isolation in the E6 binary build"
+        )
+    )]
     pub(crate) fn from_wyr1c_manifest(manifest: Manifest<'_>) -> Result<Self, InitError> {
         Self::from_manifest_with_profiles(
             manifest,
             StartupProfile::BootstrapRegistry,
             StartupProfile::DeviceCoordinator,
+            StartupProfile::Retained,
+        )
+    }
+
+    #[cfg(feature = "wyr1e-production")]
+    pub(crate) fn from_wyr1e_manifest(manifest: Manifest<'_>) -> Result<Self, InitError> {
+        Self::from_manifest_with_profiles(
+            manifest,
+            StartupProfile::BootstrapRegistry,
+            StartupProfile::DeviceCoordinator,
+            StartupProfile::Wyrmsh,
         )
     }
 
@@ -854,6 +884,7 @@ impl SystemInit {
         manifest: Manifest<'_>,
         registry_startup_profile: StartupProfile,
         devmgr_startup_profile: StartupProfile,
+        wyrmsh_startup_profile: StartupProfile,
     ) -> Result<Self, InitError> {
         if manifest.role_count() != 5 {
             return Err(InitError::WrongManifestProfile);
@@ -867,6 +898,8 @@ impl SystemInit {
                 (Activation::Early, devmgr_startup_profile)
             } else if expected == RoleId::Uart16550d {
                 (Activation::DeviceBound, StartupProfile::Retained)
+            } else if expected == RoleId::Wyrmsh {
+                (Activation::ConsoleBound, wyrmsh_startup_profile)
             } else {
                 (Activation::ConsoleBound, StartupProfile::Retained)
             };
@@ -2783,6 +2816,82 @@ pub const fn cleanup_is_permanent(state: RestartState) -> bool {
 mod native_cleanup_tests {
     use super::*;
 
+    #[cfg(feature = "wyr1e-production")]
+    #[test]
+    fn e6_manifest_constructor_admits_only_the_production_shell_profile() {
+        use wyrmroot_rrc_manifest::builder::{Builder, DependencySpec, RoleSpec};
+
+        let boot_generation = [0x42; 32];
+        let mut builder = Builder::new(boot_generation);
+        for (id, path, activation, profile) in [
+            (
+                RoleId::Registryd,
+                "system/registryd",
+                Activation::Early,
+                StartupProfile::BootstrapRegistry,
+            ),
+            (
+                RoleId::Devmgr,
+                "system/devmgr",
+                Activation::Early,
+                StartupProfile::DeviceCoordinator,
+            ),
+            (
+                RoleId::Uart16550d,
+                "system/uart16550d",
+                Activation::DeviceBound,
+                StartupProfile::Retained,
+            ),
+            (
+                RoleId::Consoled,
+                "system/consoled",
+                Activation::ConsoleBound,
+                StartupProfile::Retained,
+            ),
+            (
+                RoleId::Wyrmsh,
+                "system/wyrmsh",
+                Activation::ConsoleBound,
+                StartupProfile::Wyrmsh,
+            ),
+        ] {
+            builder
+                .add_role(RoleSpec {
+                    id,
+                    required: true,
+                    requires_ready: true,
+                    activation,
+                    startup_profile: profile,
+                    path,
+                    justification: "fixed retained recovery closure",
+                    executable_identity: [id as u8; 32],
+                })
+                .unwrap();
+        }
+        for (owner, target) in [
+            (RoleId::Devmgr, RoleId::Registryd),
+            (RoleId::Uart16550d, RoleId::Devmgr),
+            (RoleId::Consoled, RoleId::Uart16550d),
+            (RoleId::Wyrmsh, RoleId::Consoled),
+        ] {
+            builder
+                .add_dependency(DependencySpec {
+                    owner,
+                    kind: DependencyKind::RoleReady,
+                    target_role: Some(target),
+                    target_path: None,
+                })
+                .unwrap();
+        }
+        let bytes = builder.build_structural().unwrap();
+        let manifest = Manifest::parse_structural(&bytes, &boot_generation).unwrap();
+        assert!(SystemInit::from_wyr1e_manifest(manifest).is_ok());
+        assert_eq!(
+            SystemInit::from_wyr1c_manifest(manifest),
+            Err(InitError::WrongManifestProfile)
+        );
+    }
+
     #[test]
     fn resource_domain_custody_reduces_only_for_a_devmgr_descendant() {
         let custody = ResourceDomainCustody::new(DwHandle(44));
@@ -3730,7 +3839,10 @@ mod native_cleanup_tests {
         // Selector 32 retains a JobV2 dispatcher alongside the device resident.
         // Reserve 40 KiB of the existing 108 KiB execution stack for residency;
         // this partition is a userspace budget, not a startup ABI limit.
-        let resident_budget = if cfg!(feature = "wyr1d-selector32") {
+        let resident_budget = if cfg!(any(
+            feature = "wyr1d-selector32",
+            feature = "wyr1e-production"
+        )) {
             40
         } else {
             20
