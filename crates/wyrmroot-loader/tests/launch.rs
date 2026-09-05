@@ -78,7 +78,7 @@ fn wyrmsh_has_exact_wrlp_1_11_six_role_correlated_profile() {
 }
 
 #[test]
-fn wyrmsh_rejects_every_role_handle_and_correlation_mismatch() {
+fn wyrmsh_rejects_mismatches_and_accepts_equal_independent_transactions() {
     let mut init = [0; WYRMSH_BYTES];
     launch::encode_wyrmsh_init(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, &mut init).unwrap();
     let handles = wyrmsh_handles();
@@ -117,15 +117,17 @@ fn wyrmsh_rejects_every_role_handle_and_correlation_mismatch() {
             Err(LaunchError::ZeroTransaction)
         );
     }
-    let mut alias = init;
-    alias[152..160].copy_from_slice(&1_u64.to_le_bytes());
+    let mut equal_across_namespaces = init;
+    equal_across_namespaces[152..160].copy_from_slice(&1_u64.to_le_bytes());
     assert_eq!(
-        launch::parse_wyrmsh_init(&alias, &handles),
-        Err(LaunchError::TransactionAlias)
+        launch::parse_wyrmsh_init(&equal_across_namespaces, &handles)
+            .unwrap()
+            .outer_launch_transaction,
+        1
     );
     assert_eq!(
         launch::encode_wyrmsh_init(1, 2, 3, 4, 5, 6, 7, 8, 9, 1, &mut init),
-        Err(LaunchError::TransactionAlias)
+        Ok(WYRMSH_BYTES)
     );
     assert_eq!(
         launch::encode_wyrmsh_init(1, 2, 3, 4, 5, 6, 7, 8, 0, 10, &mut init),
