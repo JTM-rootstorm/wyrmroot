@@ -26,7 +26,10 @@ pub const DEVICE_DRIVER_BYTES: usize = 104;
 /// WYR1-D4 `consoled` startup carries its two controller-issued endpoint
 /// correlations beside the exact self-root/registry/launch capability roles.
 pub const CONSOLED_BYTES: usize = 128;
-pub const MAX_CAPABILITIES: usize = 4;
+/// WYR1-E3 `wyrmsh` startup carries six exact scoped Channel roles and nine
+/// non-authoritative correlation values.
+pub const WYRMSH_BYTES: usize = 160;
+pub const MAX_CAPABILITIES: usize = 6;
 
 const MAGIC: &[u8; 4] = b"WRLP";
 const MAJOR: u16 = 1;
@@ -41,6 +44,7 @@ const MINOR_V1_7: u16 = 7;
 const MINOR_V1_8_TEST: u16 = 8;
 const MINOR_V1_9: u16 = 9;
 const MINOR_V1_10: u16 = 10;
+const MINOR_V1_11: u16 = 11;
 const TYPE_INIT: u32 = 1;
 const TYPE_READY: u32 = 2;
 const ROLE_SELF_ROOT: u32 = 1;
@@ -58,6 +62,7 @@ const ROLE_DEVICE_MANIFEST: u32 = 12;
 const ROLE_DEVICE_CONTROL: u32 = 13;
 const ROLE_RESOURCE_DOMAIN: u32 = 14;
 const ROLE_D6_RESOURCE_DOMAIN: u32 = 15;
+const ROLE_CONSOLE_STATUS: u32 = 16;
 
 pub const SELF_ROOT_RIGHTS: DwRights =
     DwRights(DW_RIGHT_MAP.0 | DW_RIGHT_MODIFY.0 | DW_RIGHT_INSPECT.0);
@@ -133,6 +138,10 @@ pub enum LaunchProfile {
     /// WYR1-D console broker with self root plus exact registry-client and
     /// launch-session endpoints. It carries no device or debug authority.
     Consoled,
+    /// WYR1-E recovery shell with exact stdio, console-status, registry, and
+    /// nested launch-session Channels. It receives no self-root or loader
+    /// construction authority.
+    Wyrmsh,
     /// WYR1-B launched job with no startup stream roles.
     JobV2,
     /// WYR1-B launched job with exact stdin/stdout/stderr Channel roles.
@@ -168,6 +177,7 @@ impl LaunchProfile {
             | Self::RegistryClient
             | Self::LaunchClient => 2,
             Self::Consoled => 3,
+            Self::Wyrmsh => 6,
             Self::JobV2Streams => 3,
             Self::DeviceCoordinator => 3,
             Self::DeviceCoordinatorResourceDomain => 4,
@@ -192,13 +202,16 @@ impl LaunchProfile {
             Self::DeviceCoordinator => MINOR_V1_5,
             Self::DeviceCoordinatorResourceDomain => MINOR_V1_9,
             Self::Consoled => MINOR_V1_10,
+            Self::Wyrmsh => MINOR_V1_11,
             Self::DeviceDriver => MINOR_V1_6,
             Self::Init0 | Self::I2Stress | Self::CapabilityController | Self::Hello => MINOR_V1_0,
         }
     }
 
     pub const fn init_size(self) -> usize {
-        if matches!(self, Self::Consoled) {
+        if matches!(self, Self::Wyrmsh) {
+            WYRMSH_BYTES
+        } else if matches!(self, Self::Consoled) {
             CONSOLED_BYTES
         } else if matches!(self, Self::DeviceCoordinator) {
             DEVICE_COORDINATOR_BYTES
@@ -248,6 +261,22 @@ pub struct ConsoledInit {
     pub launch_connection_generation: u64,
 }
 
+/// Correlations bound to one exact WYR1-E shell generation. Possessing these
+/// numbers conveys no authority; the six validated Channels remain decisive.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WyrmshInit {
+    pub transaction_id: u64,
+    pub registry_generation: u64,
+    pub registry_endpoint_id: u64,
+    pub registry_endpoint_generation: u64,
+    pub launch_connection_id: u64,
+    pub launch_connection_generation: u64,
+    pub console_generation: u64,
+    pub status_generation: u64,
+    pub child_generation: u64,
+    pub outer_launch_transaction: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LaunchError {
     BufferSize,
@@ -258,6 +287,7 @@ pub enum LaunchError {
     BadTotalSize,
     BadCapabilityCount,
     ZeroTransaction,
+    TransactionAlias,
     TransactionMismatch,
     NonzeroReserved,
     BadCapabilityRole { index: usize },
@@ -277,6 +307,7 @@ pub fn encode_init(
             | LaunchProfile::DeviceCoordinatorResourceDomain
             | LaunchProfile::DeviceDriver
             | LaunchProfile::Consoled
+            | LaunchProfile::Wyrmsh
     ) {
         return Err(LaunchError::ProfileSpecificEncoderRequired);
     }
@@ -318,6 +349,20 @@ fn encode_init_inner(
         for (index, role) in [ROLE_SELF_ROOT, ROLE_REGISTRY_CLIENT, ROLE_LAUNCH_SESSION]
             .into_iter()
             .enumerate()
+        {
+            put_u32(output, HEADER_BYTES + index * 8, role);
+        }
+    } else if profile == LaunchProfile::Wyrmsh {
+        for (index, role) in [
+            ROLE_STDIN,
+            ROLE_STDOUT,
+            ROLE_STDERR,
+            ROLE_CONSOLE_STATUS,
+            ROLE_REGISTRY_CLIENT,
+            ROLE_LAUNCH_SESSION,
+        ]
+        .into_iter()
+        .enumerate()
         {
             put_u32(output, HEADER_BYTES + index * 8, role);
         }
@@ -462,6 +507,44 @@ pub fn encode_consoled_init(
     Ok(size)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn encode_wyrmsh_init(
+    transaction_id: u64,
+    registry_generation: u64,
+    registry_endpoint_id: u64,
+    registry_endpoint_generation: u64,
+    launch_connection_id: u64,
+    launch_connection_generation: u64,
+    console_generation: u64,
+    status_generation: u64,
+    child_generation: u64,
+    outer_launch_transaction: u64,
+    output: &mut [u8],
+) -> Result<usize, LaunchError> {
+    let correlations = [
+        registry_generation,
+        registry_endpoint_id,
+        registry_endpoint_generation,
+        launch_connection_id,
+        launch_connection_generation,
+        console_generation,
+        status_generation,
+        child_generation,
+        outer_launch_transaction,
+    ];
+    if correlations.contains(&0) {
+        return Err(LaunchError::ZeroTransaction);
+    }
+    if transaction_id == outer_launch_transaction {
+        return Err(LaunchError::TransactionAlias);
+    }
+    let size = encode_init_inner(LaunchProfile::Wyrmsh, transaction_id, output)?;
+    for (index, value) in correlations.into_iter().enumerate() {
+        put_u64(output, 88 + index * 8, value);
+    }
+    Ok(size)
+}
+
 pub fn parse_init(
     profile: LaunchProfile,
     bytes: &[u8],
@@ -539,6 +622,37 @@ pub fn parse_init(
                 return Err(LaunchError::BadCapabilityRole { index });
             }
             validate_handle(handles[index], object_type, rights, index)?;
+        }
+    } else if profile == LaunchProfile::Wyrmsh {
+        for (index, role) in [
+            ROLE_STDIN,
+            ROLE_STDOUT,
+            ROLE_STDERR,
+            ROLE_CONSOLE_STATUS,
+            ROLE_REGISTRY_CLIENT,
+            ROLE_LAUNCH_SESSION,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if get_u32(bytes, HEADER_BYTES + index * 8) != role
+                || get_u32(bytes, HEADER_BYTES + index * 8 + 4) != 0
+            {
+                return Err(LaunchError::BadCapabilityRole { index });
+            }
+            validate_handle(
+                handles[index],
+                DW_OBJECT_TYPE_CHANNEL,
+                CHILD_CHANNEL_RIGHTS,
+                index,
+            )?;
+        }
+        let correlations = core::array::from_fn::<_, 9, _>(|index| get_u64(bytes, 88 + index * 8));
+        if correlations.contains(&0) {
+            return Err(LaunchError::ZeroTransaction);
+        }
+        if transaction_id == correlations[8] {
+            return Err(LaunchError::TransactionAlias);
         }
     } else if profile == LaunchProfile::D6ResourceOwner {
         if get_u32(bytes, HEADER_BYTES) != ROLE_D6_RESOURCE_DOMAIN
@@ -701,6 +815,26 @@ pub fn parse_consoled_init(
         registry_endpoint_generation: fields[2],
         launch_connection_id: fields[3],
         launch_connection_generation: fields[4],
+    })
+}
+
+pub fn parse_wyrmsh_init(
+    bytes: &[u8],
+    handles: &[DwReceivedHandleInfoV1],
+) -> Result<WyrmshInit, LaunchError> {
+    let parsed = parse_init(LaunchProfile::Wyrmsh, bytes, handles)?;
+    let fields = core::array::from_fn::<_, 9, _>(|index| get_u64(bytes, 88 + index * 8));
+    Ok(WyrmshInit {
+        transaction_id: parsed.transaction_id,
+        registry_generation: fields[0],
+        registry_endpoint_id: fields[1],
+        registry_endpoint_generation: fields[2],
+        launch_connection_id: fields[3],
+        launch_connection_generation: fields[4],
+        console_generation: fields[5],
+        status_generation: fields[6],
+        child_generation: fields[7],
+        outer_launch_transaction: fields[8],
     })
 }
 

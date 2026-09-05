@@ -14,10 +14,11 @@ use wyrmroot_loader::{
         DeviceCoordinatorResourceLoadRequest, DeviceDriverLoadError, DeviceDriverLoadRequest,
         JobLoadError, JobLoadRequest, LoadAuthority, LoadError, LoadFault, LoadRequest, LoadStage,
         LoaderPlatform, ParentMapping, ProcessCreateRequest, ProcessCreateResult,
-        ResourceDomainLoadRequest, ServiceLoadError, ServiceLoadRequest, load_consoled_process,
-        load_d6_resource_owner_process, load_device_coordinator_process,
-        load_device_coordinator_resource_process, load_device_driver_process, load_job_process,
-        load_process, load_process_with_fault, load_resource_domain_process, load_service_process,
+        ResourceDomainLoadRequest, ServiceLoadError, ServiceLoadRequest, WyrmshLoadError,
+        WyrmshLoadRequest, load_consoled_process, load_d6_resource_owner_process,
+        load_device_coordinator_process, load_device_coordinator_resource_process,
+        load_device_driver_process, load_job_process, load_process, load_process_with_fault,
+        load_resource_domain_process, load_service_process, load_wyrmsh_process,
     },
 };
 use wyrmroot_registry_proto::{Correlation, CorrelationEnvironment};
@@ -261,6 +262,161 @@ impl LoaderPlatform for Mock {
             Ok(())
         }
     }
+}
+
+#[test]
+fn wyrmsh_moves_six_roles_in_order_with_exact_abi2_startup() {
+    let image = executable();
+    let request = wyrmsh_request(&image);
+    let mut platform = Mock::new(None);
+    load_wyrmsh_process(&mut platform, authority(), request).unwrap();
+
+    assert_eq!(
+        platform.sent_init.len(),
+        wyrmroot_loader::launch::WYRMSH_BYTES
+    );
+    assert_eq!(&platform.sent_init[6..8], &11_u16.to_le_bytes());
+    assert_eq!(
+        core::array::from_fn::<_, 9, _>(|index| {
+            u64::from_le_bytes(
+                platform.sent_init[88 + index * 8..96 + index * 8]
+                    .try_into()
+                    .unwrap(),
+            )
+        }),
+        [2, 3, 4, 5, 6, 7, 8, 9, 10]
+    );
+    assert_eq!(platform.sent_transfers.len(), 6);
+    assert_eq!(
+        platform
+            .sent_transfers
+            .iter()
+            .map(|transfer| transfer.handle)
+            .collect::<Vec<_>>(),
+        vec![
+            request.stdin,
+            request.stdout,
+            request.stderr,
+            request.console_status,
+            request.registry_client,
+            request.launch_session,
+        ]
+    );
+    assert!(platform.sent_transfers.iter().all(|transfer| {
+        transfer.operation == DW_HANDLE_TRANSFER_MOVE
+            && transfer.requested_rights == wyrmroot_loader::launch::CHILD_CHANNEL_RIGHTS
+    }));
+    assert_eq!(platform.started_abi, Some(2));
+    assert_eq!(
+        platform.started_stack_pointer,
+        Some(wyrmroot_loader::image::STARTUP_V2_BLOCK_ADDRESS)
+    );
+    let mut expected = vec![0; wyrmroot_loader::image::STARTUP_V2_BLOCK_BYTES];
+    wyrmroot_loader::image::write_startup_block_v2(
+        &mut expected,
+        wyrmroot_loader::image::STARTUP_V2_BLOCK_ADDRESS,
+        "system/wyrmsh",
+        &["system/wyrmsh"],
+        &[],
+    )
+    .unwrap();
+    assert_eq!(platform.materialized.last(), Some(&expected));
+}
+
+#[test]
+fn wyrmsh_reports_all_six_roles_on_both_sides_of_atomic_init_move() {
+    let image = executable();
+    let request = wyrmsh_request(&image);
+
+    let mut failed_send = Mock::new(Some("send"));
+    let before = load_wyrmsh_process(&mut failed_send, authority(), request)
+        .expect_err("failed INIT MOVE accepted");
+    assert_eq!(
+        before,
+        WyrmshLoadError {
+            error: LoadError::Platform {
+                stage: LoadStage::InitSend,
+                cause: "send",
+                rollback_failed: false,
+            },
+            stdin_consumed: false,
+            stdout_consumed: false,
+            stderr_consumed: false,
+            console_status_consumed: false,
+            registry_client_consumed: false,
+            launch_session_consumed: false,
+        }
+    );
+    for handle in [
+        request.stdin,
+        request.stdout,
+        request.stderr,
+        request.console_status,
+        request.registry_client,
+        request.launch_session,
+    ] {
+        assert!(!failed_send.events.contains(&Event::Close(handle.0)));
+    }
+
+    let mut post_send = Mock::new(None);
+    post_send.post_start_thread_close_failures = 1;
+    let after = load_wyrmsh_process(&mut post_send, authority(), request)
+        .expect_err("post-INIT cleanup failure accepted");
+    assert_eq!(
+        after,
+        WyrmshLoadError {
+            error: LoadError::Platform {
+                stage: LoadStage::SuccessCleanup,
+                cause: "close-thread",
+                rollback_failed: false,
+            },
+            stdin_consumed: true,
+            stdout_consumed: true,
+            stderr_consumed: true,
+            console_status_consumed: true,
+            registry_client_consumed: true,
+            launch_session_consumed: true,
+        }
+    );
+}
+
+#[test]
+fn wyrmsh_rejects_invalid_handle_and_correlation_sets_before_construction() {
+    let image = executable();
+    let mut duplicate = wyrmsh_request(&image);
+    duplicate.launch_session = duplicate.stdin;
+    let mut platform = Mock::new(None);
+    assert!(matches!(
+        load_wyrmsh_process(&mut platform, authority(), duplicate),
+        Err(WyrmshLoadError {
+            error: LoadError::Launch(wyrmroot_loader::launch::LaunchError::HandleCount),
+            stdin_consumed: false,
+            ..
+        })
+    ));
+    assert!(platform.events.is_empty());
+
+    let mut zero = wyrmsh_request(&image);
+    zero.status_generation = 0;
+    assert!(matches!(
+        load_wyrmsh_process(&mut platform, authority(), zero),
+        Err(WyrmshLoadError {
+            error: LoadError::Launch(wyrmroot_loader::launch::LaunchError::ZeroTransaction),
+            ..
+        })
+    ));
+    assert!(platform.events.is_empty());
+
+    let mut alias = wyrmsh_request(&image);
+    alias.outer_launch_transaction = alias.transaction_id;
+    assert!(matches!(
+        load_wyrmsh_process(&mut platform, authority(), alias),
+        Err(WyrmshLoadError {
+            error: LoadError::Launch(wyrmroot_loader::launch::LaunchError::TransactionAlias),
+            ..
+        })
+    ));
+    assert!(platform.events.is_empty());
 }
 
 #[test]
@@ -1595,6 +1751,28 @@ fn request(image: &[u8], profile: LaunchProfile) -> LoadRequest<'_> {
         image,
         display_path: "/bin/test",
         profile,
+        transaction_id: 1,
+    }
+}
+
+fn wyrmsh_request(image: &[u8]) -> WyrmshLoadRequest<'_> {
+    WyrmshLoadRequest {
+        image,
+        stdin: DwHandle(0xe301),
+        stdout: DwHandle(0xe302),
+        stderr: DwHandle(0xe303),
+        console_status: DwHandle(0xe304),
+        registry_client: DwHandle(0xe305),
+        launch_session: DwHandle(0xe306),
+        registry_generation: 2,
+        registry_endpoint_id: 3,
+        registry_endpoint_generation: 4,
+        launch_connection_id: 5,
+        launch_connection_generation: 6,
+        console_generation: 7,
+        status_generation: 8,
+        child_generation: 9,
+        outer_launch_transaction: 10,
         transaction_id: 1,
     }
 }

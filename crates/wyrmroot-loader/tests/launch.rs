@@ -7,8 +7,131 @@ use wyrmroot_loader::launch::{
     DEVICE_COORDINATOR_BYTES, DEVICE_COORDINATOR_RESOURCE_BYTES, DEVICE_DRIVER_BYTES,
     DEVICE_MANIFEST_RIGHTS, HEADER_BYTES, INIT0_BYTES, LOADER_TASK_GROUP_RIGHTS, LaunchError,
     LaunchProfile, PROBE_CHILD_BYTES, RESOURCE_DOMAIN_CLAIM_RIGHTS, SELF_ROOT_RIGHTS,
-    SUPERVISOR_BYTES,
+    SUPERVISOR_BYTES, WYRMSH_BYTES,
 };
+
+#[test]
+fn wyrmsh_has_exact_wrlp_1_11_six_role_correlated_profile() {
+    let mut init = [0xaa; WYRMSH_BYTES];
+    assert_eq!(
+        launch::encode_init(LaunchProfile::Wyrmsh, 1, &mut init),
+        Err(LaunchError::ProfileSpecificEncoderRequired)
+    );
+    assert_eq!(
+        launch::encode_wyrmsh_init(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, &mut init),
+        Ok(WYRMSH_BYTES)
+    );
+    assert_eq!(&init[..4], b"WRLP");
+    assert_eq!(
+        (
+            get16(&init, 4),
+            get16(&init, 6),
+            get32(&init, 8),
+            get32(&init, 16),
+            get32(&init, 20),
+            get64(&init, 24),
+        ),
+        (1, 11, 1, 160, 6, 1)
+    );
+    assert_eq!(
+        core::array::from_fn::<_, 6, _>(|index| get32(&init, 40 + index * 8)),
+        [8, 9, 10, 16, 6, 7]
+    );
+    assert_eq!(
+        core::array::from_fn::<_, 6, _>(|index| get32(&init, 44 + index * 8)),
+        [0; 6]
+    );
+    assert_eq!(
+        core::array::from_fn::<_, 9, _>(|index| get64(&init, 88 + index * 8)),
+        [2, 3, 4, 5, 6, 7, 8, 9, 10]
+    );
+    let parsed = launch::parse_wyrmsh_init(&init, &wyrmsh_handles()).unwrap();
+    assert_eq!(parsed.transaction_id, 1);
+    assert_eq!(parsed.registry_generation, 2);
+    assert_eq!(parsed.registry_endpoint_id, 3);
+    assert_eq!(parsed.registry_endpoint_generation, 4);
+    assert_eq!(parsed.launch_connection_id, 5);
+    assert_eq!(parsed.launch_connection_generation, 6);
+    assert_eq!(parsed.console_generation, 7);
+    assert_eq!(parsed.status_generation, 8);
+    assert_eq!(parsed.child_generation, 9);
+    assert_eq!(parsed.outer_launch_transaction, 10);
+
+    let mut ready = [0xaa; HEADER_BYTES];
+    assert_eq!(
+        launch::encode_ready_for_profile(LaunchProfile::Wyrmsh, 1, &mut ready),
+        Ok(HEADER_BYTES)
+    );
+    assert_eq!((get16(&ready, 6), get32(&ready, 8)), (11, 2));
+    assert_eq!(
+        launch::parse_ready_for_profile(LaunchProfile::Wyrmsh, &ready, 1),
+        Ok(())
+    );
+    assert_eq!(
+        launch::parse_ready_for_profile(LaunchProfile::Consoled, &ready, 1),
+        Err(LaunchError::BadVersion)
+    );
+    assert_eq!(
+        launch::parse_ready_for_profile(LaunchProfile::Wyrmsh, &ready, 2),
+        Err(LaunchError::TransactionMismatch)
+    );
+}
+
+#[test]
+fn wyrmsh_rejects_every_role_handle_and_correlation_mismatch() {
+    let mut init = [0; WYRMSH_BYTES];
+    launch::encode_wyrmsh_init(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, &mut init).unwrap();
+    let handles = wyrmsh_handles();
+
+    for index in 0..6 {
+        let mut wrong = init;
+        wrong[40 + index * 8..44 + index * 8].copy_from_slice(&99_u32.to_le_bytes());
+        assert_eq!(
+            launch::parse_wyrmsh_init(&wrong, &handles),
+            Err(LaunchError::BadCapabilityRole { index })
+        );
+
+        let mut wrong = handles;
+        wrong[index].rights = CHILD_CHANNEL_TRANSFER_RIGHTS;
+        assert_eq!(
+            launch::parse_wyrmsh_init(&init, &wrong),
+            Err(LaunchError::HandleMetadata { index })
+        );
+
+        let mut wrong = handles;
+        wrong[index].object_type = DW_OBJECT_TYPE_TASK_GROUP;
+        assert_eq!(
+            launch::parse_wyrmsh_init(&init, &wrong),
+            Err(LaunchError::HandleMetadata { index })
+        );
+    }
+    assert_eq!(
+        launch::parse_wyrmsh_init(&init, &handles[..5]),
+        Err(LaunchError::HandleCount)
+    );
+    for index in 0..9 {
+        let mut wrong = init;
+        wrong[88 + index * 8..96 + index * 8].fill(0);
+        assert_eq!(
+            launch::parse_wyrmsh_init(&wrong, &handles),
+            Err(LaunchError::ZeroTransaction)
+        );
+    }
+    let mut alias = init;
+    alias[152..160].copy_from_slice(&1_u64.to_le_bytes());
+    assert_eq!(
+        launch::parse_wyrmsh_init(&alias, &handles),
+        Err(LaunchError::TransactionAlias)
+    );
+    assert_eq!(
+        launch::encode_wyrmsh_init(1, 2, 3, 4, 5, 6, 7, 8, 9, 1, &mut init),
+        Err(LaunchError::TransactionAlias)
+    );
+    assert_eq!(
+        launch::encode_wyrmsh_init(1, 2, 3, 4, 5, 6, 7, 8, 0, 10, &mut init),
+        Err(LaunchError::ZeroTransaction)
+    );
+}
 
 #[test]
 fn wyr1_d4_consoled_has_exact_hardware_free_multi_endpoint_profile() {
@@ -636,6 +759,16 @@ fn init0_handles() -> [DwReceivedHandleInfoV1; 3] {
         received(2, DW_OBJECT_TYPE_MEMORY_OBJECT, BOOTFS_RIGHTS),
         received(3, DW_OBJECT_TYPE_TASK_GROUP, LOADER_TASK_GROUP_RIGHTS),
     ]
+}
+
+fn wyrmsh_handles() -> [DwReceivedHandleInfoV1; 6] {
+    core::array::from_fn(|index| {
+        received(
+            index as u64 + 1,
+            DW_OBJECT_TYPE_CHANNEL,
+            CHILD_CHANNEL_RIGHTS,
+        )
+    })
 }
 
 fn received(

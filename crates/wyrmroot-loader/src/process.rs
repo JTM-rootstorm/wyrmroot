@@ -113,6 +113,29 @@ pub struct ConsoledLoadRequest<'a> {
     pub transaction_id: u64,
 }
 
+/// WYR1-E shell construction request. All six caller-owned Channels move in
+/// one atomic INIT send after exact path, handle, and correlation validation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WyrmshLoadRequest<'a> {
+    pub image: &'a [u8],
+    pub stdin: DwHandle,
+    pub stdout: DwHandle,
+    pub stderr: DwHandle,
+    pub console_status: DwHandle,
+    pub registry_client: DwHandle,
+    pub launch_session: DwHandle,
+    pub registry_generation: u64,
+    pub registry_endpoint_id: u64,
+    pub registry_endpoint_generation: u64,
+    pub launch_connection_id: u64,
+    pub launch_connection_generation: u64,
+    pub console_generation: u64,
+    pub status_generation: u64,
+    pub child_generation: u64,
+    pub outer_launch_transaction: u64,
+    pub transaction_id: u64,
+}
+
 /// WYR1-C device-coordinator launch request.  The publication endpoint and
 /// manifest are caller-owned until the INIT Channel MOVE succeeds; on a
 /// failed send the loader leaves both with the caller for one cleanup path.
@@ -172,6 +195,19 @@ enum StartupMaterialization<'a> {
 }
 
 #[derive(Clone, Copy)]
+struct WyrmshCorrelation {
+    registry_generation: u64,
+    registry_endpoint_id: u64,
+    registry_endpoint_generation: u64,
+    launch_connection_id: u64,
+    launch_connection_generation: u64,
+    console_generation: u64,
+    status_generation: u64,
+    child_generation: u64,
+    outer_launch_transaction: u64,
+}
+
+#[derive(Clone, Copy)]
 struct InternalLoadRequest<'a> {
     image: &'a [u8],
     profile: LaunchProfile,
@@ -182,6 +218,7 @@ struct InternalLoadRequest<'a> {
     supervisor_generation: Option<u64>,
     driver_correlation: Option<(u64, u64, u64, u64, u64, u64)>,
     consoled_correlation: Option<(u64, u64, u64, u64, u64)>,
+    wyrmsh_correlation: Option<WyrmshCorrelation>,
     resource_domain: Option<DwHandle>,
 }
 
@@ -293,6 +330,33 @@ pub struct ConsoledLoadError<PlatformError> {
     pub error: LoadError<PlatformError>,
     pub registry_endpoint_consumed: bool,
     pub launch_endpoint_consumed: bool,
+}
+
+/// WYR1-E shell-load failure with explicit all-six endpoint custody at the
+/// atomic INIT boundary.
+#[derive(Debug, Eq, PartialEq)]
+pub struct WyrmshLoadError<PlatformError> {
+    pub error: LoadError<PlatformError>,
+    pub stdin_consumed: bool,
+    pub stdout_consumed: bool,
+    pub stderr_consumed: bool,
+    pub console_status_consumed: bool,
+    pub registry_client_consumed: bool,
+    pub launch_session_consumed: bool,
+}
+
+impl<E> WyrmshLoadError<E> {
+    const fn with_custody(error: LoadError<E>, consumed: bool) -> Self {
+        Self {
+            error,
+            stdin_consumed: consumed,
+            stdout_consumed: consumed,
+            stderr_consumed: consumed,
+            console_status_consumed: consumed,
+            registry_client_consumed: consumed,
+            launch_session_consumed: consumed,
+        }
+    }
 }
 
 impl<E> ConsoledLoadError<E> {
@@ -452,7 +516,7 @@ struct Transaction {
     delegated_bootfs: Option<DwHandle>,
     delegated_task_group: Option<DwHandle>,
     delegated_resource_domain: Option<DwHandle>,
-    delegated_channels: [Option<DwHandle>; 3],
+    delegated_channels: [Option<DwHandle>; launch::MAX_CAPABILITIES],
     delegated_manifest: Option<DwHandle>,
     ranges: [Range; MAX_CHILD_RANGES],
     range_count: usize,
@@ -473,7 +537,7 @@ impl Transaction {
             delegated_bootfs: None,
             delegated_task_group: None,
             delegated_resource_domain: None,
-            delegated_channels: [None; 3],
+            delegated_channels: [None; launch::MAX_CAPABILITIES],
             delegated_manifest: None,
             ranges: [Range {
                 address: 0,
@@ -521,9 +585,18 @@ impl Transaction {
             self.delegated_task_group.take(),
             self.delegated_resource_domain.take(),
             self.delegated_bootfs.take(),
-            self.delegated_channels[0].take(),
-            self.delegated_channels[1].take(),
-            self.delegated_channels[2].take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            failed |= platform.close(handle).is_err();
+        }
+        for slot in &mut self.delegated_channels {
+            if let Some(handle) = slot.take() {
+                failed |= platform.close(handle).is_err();
+            }
+        }
+        for handle in [
             self.delegated_manifest.take(),
             self.child_endpoint.take(),
             self.broad_parent.take(),
@@ -567,6 +640,7 @@ pub fn load_resource_domain_process<P: LoaderPlatform>(
             supervisor_generation: None,
             driver_correlation: None,
             consoled_correlation: None,
+            wyrmsh_correlation: None,
             resource_domain: Some(request.resource_domain),
         },
         LoadFault::None,
@@ -597,6 +671,7 @@ pub fn load_d6_resource_owner_process<P: LoaderPlatform>(
             supervisor_generation: None,
             driver_correlation: None,
             consoled_correlation: None,
+            wyrmsh_correlation: None,
             resource_domain: Some(request.resource_domain),
         },
         LoadFault::None,
@@ -629,6 +704,7 @@ pub fn load_process_with_fault<P: LoaderPlatform>(
             supervisor_generation: None,
             driver_correlation: None,
             consoled_correlation: None,
+            wyrmsh_correlation: None,
             resource_domain: None,
         },
         fault,
@@ -669,6 +745,7 @@ pub fn load_job_process<P: LoaderPlatform>(
             supervisor_generation: None,
             driver_correlation: None,
             consoled_correlation: None,
+            wyrmsh_correlation: None,
             resource_domain: None,
         },
         LoadFault::None,
@@ -738,6 +815,7 @@ pub fn load_service_process<P: LoaderPlatform>(
             supervisor_generation: None,
             driver_correlation: None,
             consoled_correlation: None,
+            wyrmsh_correlation: None,
             resource_domain: None,
         },
         LoadFault::None,
@@ -795,6 +873,7 @@ pub fn load_consoled_process<P: LoaderPlatform>(
                 request.launch_connection_id,
                 request.launch_connection_generation,
             )),
+            wyrmsh_correlation: None,
             resource_domain: None,
         },
         LoadFault::None,
@@ -805,6 +884,98 @@ pub fn load_consoled_process<P: LoaderPlatform>(
         registry_endpoint_consumed: endpoints_consumed,
         launch_endpoint_consumed: endpoints_consumed,
     })
+}
+
+/// Launches one `system/wyrmsh` generation with startup ABI v2 and exactly six
+/// scoped Channel roles. The returned error reports all-or-none caller custody
+/// across the single kernel MOVE.
+pub fn load_wyrmsh_process<P: LoaderPlatform>(
+    platform: &mut P,
+    authority: LoadAuthority,
+    request: WyrmshLoadRequest<'_>,
+) -> Result<LoadedProcess, WyrmshLoadError<P::Error>> {
+    const PATH: &str = "system/wyrmsh";
+    let channels = [
+        request.stdin,
+        request.stdout,
+        request.stderr,
+        request.console_status,
+        request.registry_client,
+        request.launch_session,
+    ];
+    if channels.iter().any(|handle| handle.0 == 0)
+        || channels
+            .iter()
+            .enumerate()
+            .any(|(index, handle)| channels[..index].contains(handle))
+    {
+        return Err(WyrmshLoadError::with_custody(
+            LoadError::Launch(LaunchError::HandleCount),
+            false,
+        ));
+    }
+    let correlation = WyrmshCorrelation {
+        registry_generation: request.registry_generation,
+        registry_endpoint_id: request.registry_endpoint_id,
+        registry_endpoint_generation: request.registry_endpoint_generation,
+        launch_connection_id: request.launch_connection_id,
+        launch_connection_generation: request.launch_connection_generation,
+        console_generation: request.console_generation,
+        status_generation: request.status_generation,
+        child_generation: request.child_generation,
+        outer_launch_transaction: request.outer_launch_transaction,
+    };
+    if [
+        correlation.registry_generation,
+        correlation.registry_endpoint_id,
+        correlation.registry_endpoint_generation,
+        correlation.launch_connection_id,
+        correlation.launch_connection_generation,
+        correlation.console_generation,
+        correlation.status_generation,
+        correlation.child_generation,
+        correlation.outer_launch_transaction,
+        request.transaction_id,
+    ]
+    .contains(&0)
+    {
+        return Err(WyrmshLoadError::with_custody(
+            LoadError::Launch(LaunchError::ZeroTransaction),
+            false,
+        ));
+    }
+    if request.transaction_id == request.outer_launch_transaction {
+        return Err(WyrmshLoadError::with_custody(
+            LoadError::Launch(LaunchError::TransactionAlias),
+            false,
+        ));
+    }
+    let argv = [PATH];
+    let mut consumed = false;
+    load_process_internal(
+        platform,
+        authority,
+        InternalLoadRequest {
+            image: request.image,
+            profile: LaunchProfile::Wyrmsh,
+            transaction_id: request.transaction_id,
+            startup: StartupSpec::JobV2 {
+                path: PATH,
+                argv: &argv,
+                environment: &[],
+            },
+            channels: &channels,
+            device_manifest: None,
+            supervisor_generation: None,
+            driver_correlation: None,
+            consoled_correlation: None,
+            wyrmsh_correlation: Some(correlation),
+            resource_domain: None,
+        },
+        LoadFault::None,
+        &mut consumed,
+    )
+    .map_err(|error| WyrmshLoadError::with_custody(error, consumed))
 }
 
 /// Launch the hardware-independent WYR1-C device coordinator.  Exactly one
@@ -835,6 +1006,7 @@ pub fn load_device_coordinator_process<P: LoaderPlatform>(
             supervisor_generation: Some(request.supervisor_generation),
             driver_correlation: None,
             consoled_correlation: None,
+            wyrmsh_correlation: None,
             resource_domain: None,
         },
         LoadFault::None,
@@ -878,6 +1050,7 @@ pub fn load_device_coordinator_resource_process<P: LoaderPlatform>(
             supervisor_generation: Some(request.supervisor_generation),
             driver_correlation: None,
             consoled_correlation: None,
+            wyrmsh_correlation: None,
             resource_domain: Some(request.resource_domain),
         },
         LoadFault::None,
@@ -934,6 +1107,7 @@ pub fn load_device_driver_process<P: LoaderPlatform>(
                 request.endpoint_generation,
             )),
             consoled_correlation: None,
+            wyrmsh_correlation: None,
             resource_domain: None,
         },
         LoadFault::None,
@@ -952,7 +1126,9 @@ fn load_process_internal<P: LoaderPlatform>(
     fault: LoadFault,
     delegated_channels_consumed: &mut bool,
 ) -> Result<LoadedProcess, LoadError<P::Error>> {
-    let expected_channels = if request.profile == LaunchProfile::Consoled {
+    let expected_channels = if request.profile == LaunchProfile::Wyrmsh {
+        launch::MAX_CAPABILITIES
+    } else if request.profile == LaunchProfile::Consoled {
         2
     } else if request.profile.channel_role().is_some()
         || matches!(
@@ -982,6 +1158,9 @@ fn load_process_internal<P: LoaderPlatform>(
         return Err(LoadError::Launch(LaunchError::HandleCount));
     }
     if (request.profile == LaunchProfile::Consoled) != request.consoled_correlation.is_some() {
+        return Err(LoadError::Launch(LaunchError::HandleCount));
+    }
+    if (request.profile == LaunchProfile::Wyrmsh) != request.wyrmsh_correlation.is_some() {
         return Err(LoadError::Launch(LaunchError::HandleCount));
     }
     let mut segments = [empty_segment(); MAX_LOAD_SEGMENTS];
@@ -1102,8 +1281,25 @@ fn load_process_materialized<P: LoaderPlatform>(
     stack_pointer: u64,
     startup_abi: u64,
 ) -> Result<LoadedProcess, LoadError<P::Error>> {
-    let mut init = [0_u8; launch::CONSOLED_BYTES];
-    let init_len = if request.profile == LaunchProfile::Consoled {
+    let mut init = [0_u8; launch::WYRMSH_BYTES];
+    let init_len = if request.profile == LaunchProfile::Wyrmsh {
+        let correlation = request
+            .wyrmsh_correlation
+            .ok_or(LoadError::Launch(LaunchError::ZeroTransaction))?;
+        launch::encode_wyrmsh_init(
+            request.transaction_id,
+            correlation.registry_generation,
+            correlation.registry_endpoint_id,
+            correlation.registry_endpoint_generation,
+            correlation.launch_connection_id,
+            correlation.launch_connection_generation,
+            correlation.console_generation,
+            correlation.status_generation,
+            correlation.child_generation,
+            correlation.outer_launch_transaction,
+            &mut init,
+        )
+    } else if request.profile == LaunchProfile::Consoled {
         let (registry, registry_id, registry_generation, launch_id, launch_generation) = request
             .consoled_correlation
             .ok_or(LoadError::Launch(LaunchError::ZeroTransaction))?;
@@ -1360,7 +1556,7 @@ fn load_process_materialized<P: LoaderPlatform>(
     };
     transaction.thread = Some(thread);
 
-    let mut transfers = [DwHandleTransferV1::default(); 4];
+    let mut transfers = [DwHandleTransferV1::default(); launch::MAX_CAPABILITIES];
     let transfer_count = if request.profile.has_loader_authority_trio()
         || request.profile.has_loader_authority_quartet()
     {
@@ -1474,6 +1670,12 @@ fn load_process_materialized<P: LoaderPlatform>(
         } else {
             3
         }
+    } else if request.profile == LaunchProfile::Wyrmsh {
+        for (index, handle) in request.channels.iter().copied().enumerate() {
+            transaction.delegated_channels[index] = Some(handle);
+            transfers[index] = transfer(handle, launch::CHILD_CHANNEL_RIGHTS);
+        }
+        launch::MAX_CAPABILITIES
     } else if request.profile == LaunchProfile::Consoled {
         for (index, handle) in request.channels.iter().copied().enumerate() {
             transaction.delegated_channels[index] = Some(handle);
