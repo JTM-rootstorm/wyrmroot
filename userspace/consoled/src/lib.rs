@@ -7,6 +7,9 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+#[cfg(all(feature = "wyr1d-selector32", feature = "wyr1e-wyrmsh"))]
+compile_error!("selector-32 console-echo and WYR1-E wyrmsh policies are mutually exclusive");
+
 #[cfg(test)]
 extern crate std;
 
@@ -23,6 +26,29 @@ pub const RESTART_WINDOW_MILLIS: u64 = 60_000;
 pub const STABLE_RUN_MILLIS: u64 = 60_000;
 pub const SERIAL_RETRY_BACKOFF_MILLIS: u64 = 25;
 pub const MAX_FAILURES_PER_WINDOW: usize = 4;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChildPolicy {
+    ConsoleEcho,
+    Wyrmsh,
+}
+
+impl ChildPolicy {
+    pub const fn selected() -> Self {
+        if cfg!(feature = "wyr1e-wyrmsh") {
+            Self::Wyrmsh
+        } else {
+            Self::ConsoleEcho
+        }
+    }
+
+    pub const fn path(self) -> &'static str {
+        match self {
+            Self::ConsoleEcho => "bin/console-echo",
+            Self::Wyrmsh => wyrmroot_console_proto::SHELL_PATH,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModelError {
@@ -292,6 +318,18 @@ struct LaunchIdentity {
 }
 
 impl LaunchTransaction {
+    pub const fn console_generation(&self) -> u64 {
+        self.console_generation
+    }
+
+    pub const fn child_generation(&self) -> u64 {
+        self.child_generation
+    }
+
+    pub const fn outer_launch_transaction(&self) -> u64 {
+        self.child_launch
+    }
+
     pub fn move_child_peer(&mut self, kind: StreamKind) -> Result<Endpoint, ModelError> {
         let index = kind.index();
         if self.committed || self.moved[index] {
@@ -988,6 +1026,16 @@ impl ConsoleModel {
         self.mark_child_peer_closed(event, kind)?;
         self.start_child_retirement(false, true, now)
     }
+    pub fn status_peer_closed(
+        &mut self,
+        event: EventGeneration,
+        now: u64,
+    ) -> Result<RecoveryAction, ModelError> {
+        self.time(now)?;
+        self.require_current(event)?;
+        self.last_failure = Some(ModelError::ChildDisconnected);
+        self.start_child_retirement(false, true, now)
+    }
     /// Cleanup evidence is accepted while a child is retiring, but remains
     /// bound to the exact child session rather than treated as fresh DATA.
     pub fn observe_child_peer_closed(
@@ -1321,6 +1369,70 @@ impl ConsoleModel {
             pending_recovery: self.pending_recovery,
         }
     }
+
+    pub fn status_snapshot(&self) -> Result<wyrmroot_console_proto::Snapshot, ModelError> {
+        use wyrmroot_console_proto::{
+            FLAG_CHILD_PRESENT, FLAG_CHILD_RESTART_EXHAUSTED, FLAG_PENDING_LAUNCH,
+            FLAG_PENDING_LAUNCH_CLEANUP, FLAG_SERIAL_INVALIDATED, FLAG_SERIAL_PRESENT,
+            FLAG_SERIAL_RESTART_EXHAUSTED,
+        };
+
+        let snapshot = self.snapshot();
+        let mut flags = 0;
+        if snapshot.serial.is_some() {
+            flags |= FLAG_SERIAL_PRESENT;
+        }
+        if snapshot.child_generation.is_some() {
+            flags |= FLAG_CHILD_PRESENT;
+        }
+        if snapshot.serial_invalidated {
+            flags |= FLAG_SERIAL_INVALIDATED;
+        }
+        if snapshot.pending_launch {
+            flags |= FLAG_PENDING_LAUNCH;
+        }
+        if snapshot.pending_launch_cleanup {
+            flags |= FLAG_PENDING_LAUNCH_CLEANUP;
+        }
+        if snapshot.child_restart_exhausted {
+            flags |= FLAG_CHILD_RESTART_EXHAUSTED;
+        }
+        if snapshot.serial_restart_exhausted {
+            flags |= FLAG_SERIAL_RESTART_EXHAUSTED;
+        }
+        let serial = snapshot.serial;
+        let wire = wyrmroot_console_proto::Snapshot {
+            state: status_state(snapshot.state),
+            flags,
+            serial_registry_generation: serial.map_or(0, |value| value.registry_generation),
+            publication_generation: serial.map_or(0, |value| value.publication_generation),
+            device_bundle: serial.map_or(0, |value| value.device_bundle),
+            driver_attempt: serial.map_or(0, |value| value.driver_attempt),
+            raw_stream_generation: serial.map_or(0, |value| value.stream_generation),
+            child_generation: snapshot.child_generation.unwrap_or(0),
+            outer_job: snapshot.child_job.unwrap_or(0),
+            outer_launch_transaction: snapshot.child_launch.unwrap_or(0),
+            live_peer_mask: snapshot
+                .peers_live
+                .into_iter()
+                .enumerate()
+                .fold(0, |mask, (index, live)| mask | (u32::from(live) << index)),
+            input_queue_bytes: u32::try_from(snapshot.input_queued)
+                .map_err(|_| ModelError::TooLarge)?,
+            stdout_queue_bytes: u32::try_from(snapshot.stdout_queued)
+                .map_err(|_| ModelError::TooLarge)?,
+            stderr_queue_bytes: u32::try_from(snapshot.stderr_queued)
+                .map_err(|_| ModelError::TooLarge)?,
+            child_failures: u32::try_from(snapshot.child_failures)
+                .map_err(|_| ModelError::TooLarge)?,
+            serial_failures: u32::try_from(snapshot.serial_failures)
+                .map_err(|_| ModelError::TooLarge)?,
+            last_failure: status_failure(snapshot.last_failure),
+        };
+        wire.validate()
+            .map_err(|_| ModelError::WrongConnectionState)?;
+        Ok(wire)
+    }
     pub fn take_recovery_action(&mut self) -> Option<RecoveryAction> {
         self.pending_recovery.take()
     }
@@ -1554,6 +1666,39 @@ impl ConsoleModel {
     }
 }
 
+const fn status_state(state: ConnectionState) -> wyrmroot_console_proto::State {
+    match state {
+        ConnectionState::Active => wyrmroot_console_proto::State::Active,
+        ConnectionState::RetiringChild => wyrmroot_console_proto::State::RetiringChild,
+        ConnectionState::AwaitingReap => wyrmroot_console_proto::State::AwaitingReap,
+        ConnectionState::Reconnecting => wyrmroot_console_proto::State::Reconnecting,
+        ConnectionState::Exhausted => wyrmroot_console_proto::State::Exhausted,
+        ConnectionState::FailClosed => wyrmroot_console_proto::State::FailClosed,
+    }
+}
+
+const fn status_failure(error: Option<ModelError>) -> wyrmroot_console_proto::LastFailure {
+    use wyrmroot_console_proto::LastFailure;
+    match error {
+        None => LastFailure::None,
+        Some(ModelError::ZeroCorrelation) => LastFailure::ZeroCorrelation,
+        Some(ModelError::StaleCorrelation) => LastFailure::StaleCorrelation,
+        Some(ModelError::WrongConnectionState) => LastFailure::WrongConnectionState,
+        Some(ModelError::NoChild) => LastFailure::NoChild,
+        Some(ModelError::IncompleteCleanup) => LastFailure::IncompleteCleanup,
+        Some(ModelError::AlreadyReserved) => LastFailure::AlreadyReserved,
+        Some(ModelError::UnknownReservation) => LastFailure::UnknownReservation,
+        Some(ModelError::Backpressure) => LastFailure::Backpressure,
+        Some(ModelError::TooLarge) => LastFailure::TooLarge,
+        Some(ModelError::MonotonicRegression) => LastFailure::MonotonicRegression,
+        Some(ModelError::ArithmeticOverflow) => LastFailure::ArithmeticOverflow,
+        Some(ModelError::RestartExhausted) => LastFailure::RestartExhausted,
+        Some(ModelError::SerialDisconnected) => LastFailure::SerialDisconnected,
+        Some(ModelError::ChildDisconnected) => LastFailure::ChildDisconnected,
+        Some(ModelError::WrongDirection) => LastFailure::WrongDirection,
+    }
+}
+
 const fn other(source: OutputSource) -> OutputSource {
     match source {
         OutputSource::Stdout => OutputSource::Stderr,
@@ -1622,6 +1767,150 @@ mod tests {
         connect(&mut model, 1, 0);
         let event = launch(&mut model);
         (model, event)
+    }
+
+    #[test]
+    fn selected_child_policy_preserves_historical_default() {
+        #[cfg(not(feature = "wyr1e-wyrmsh"))]
+        assert_eq!(
+            (ChildPolicy::selected(), ChildPolicy::selected().path()),
+            (ChildPolicy::ConsoleEcho, "bin/console-echo")
+        );
+        #[cfg(feature = "wyr1e-wyrmsh")]
+        assert_eq!(
+            (ChildPolicy::selected(), ChildPolicy::selected().path()),
+            (ChildPolicy::Wyrmsh, "system/wyrmsh")
+        );
+    }
+
+    #[test]
+    fn status_snapshot_maps_exact_local_state_without_authority_ids() {
+        use wyrmroot_console_proto::{
+            FLAG_CHILD_PRESENT, FLAG_PENDING_LAUNCH, FLAG_SERIAL_PRESENT, State,
+        };
+
+        let (model, event) = live();
+        let snapshot = model.status_snapshot().unwrap();
+        assert_eq!(snapshot.state, State::Active);
+        assert_eq!(
+            snapshot.flags & (FLAG_SERIAL_PRESENT | FLAG_CHILD_PRESENT),
+            FLAG_SERIAL_PRESENT | FLAG_CHILD_PRESENT
+        );
+        assert_eq!(snapshot.flags & FLAG_PENDING_LAUNCH, 0);
+        assert_eq!(
+            snapshot.serial_registry_generation,
+            event.serial.registry_generation
+        );
+        assert_eq!(
+            snapshot.publication_generation,
+            event.serial.publication_generation
+        );
+        assert_eq!(snapshot.device_bundle, event.serial.device_bundle);
+        assert_eq!(snapshot.driver_attempt, event.serial.driver_attempt);
+        assert_eq!(
+            snapshot.raw_stream_generation,
+            event.serial.stream_generation
+        );
+        assert_eq!(snapshot.child_generation, event.child_generation);
+        assert_eq!(snapshot.outer_job, event.child_job);
+        assert_eq!(snapshot.outer_launch_transaction, event.child_launch);
+        assert_eq!(snapshot.live_peer_mask, 0b111);
+    }
+
+    #[test]
+    fn pending_launch_snapshot_has_no_child_identity() {
+        use wyrmroot_console_proto::{
+            FLAG_CHILD_PRESENT, FLAG_PENDING_LAUNCH, FLAG_SERIAL_PRESENT,
+        };
+
+        let mut model = ConsoleModel::new();
+        connect(&mut model, 1, 0);
+        let launch = model.begin_child_launch(91).unwrap();
+        let snapshot = model.status_snapshot().unwrap();
+        assert_eq!(snapshot.flags & FLAG_SERIAL_PRESENT, FLAG_SERIAL_PRESENT);
+        assert_eq!(snapshot.flags & FLAG_PENDING_LAUNCH, FLAG_PENDING_LAUNCH);
+        assert_eq!(snapshot.flags & FLAG_CHILD_PRESENT, 0);
+        assert_eq!(snapshot.child_generation, 0);
+        assert_eq!(snapshot.outer_job, 0);
+        assert_eq!(snapshot.outer_launch_transaction, 0);
+        assert_eq!(snapshot.live_peer_mask, 0);
+        let token = model.abort_child_launch(launch).unwrap();
+        model
+            .complete_abort_child_launch(&token, cleanup_evidence())
+            .unwrap();
+    }
+
+    #[test]
+    fn status_codec_session_and_console_model_form_one_read_only_transport() {
+        use wyrmroot_console_proto::{
+            FLAG_CHILD_PRESENT, Header, Message, Relationship, SNAPSHOT_BYTES, StatusSession,
+            decode, encode_query, encode_snapshot,
+        };
+
+        let mut model = ConsoleModel::new();
+        connect(&mut model, 1, 0);
+        let mut launch = model.begin_child_launch(91).unwrap();
+        let relationship = Relationship {
+            console_generation: launch.console_generation(),
+            status_generation: 77,
+            child_generation: launch.child_generation(),
+            outer_launch_transaction: launch.outer_launch_transaction(),
+        };
+        let mut session = StatusSession::new(relationship).unwrap();
+        let mut wire = [0u8; SNAPSHOT_BYTES];
+
+        for (transaction_id, child_present) in [(1, false), (2, true)] {
+            if child_present {
+                for kind in [StreamKind::Stdin, StreamKind::Stdout, StreamKind::Stderr] {
+                    launch.move_child_peer(kind).unwrap();
+                }
+                model.commit_child_launch(&mut launch, 92).unwrap();
+            }
+            let header = Header {
+                transaction_id,
+                console_generation: relationship.console_generation,
+                status_generation: relationship.status_generation,
+            };
+            let query_size = encode_query(header, &mut wire).unwrap();
+            assert_eq!(decode(&wire[..query_size], 0), Ok(Message::Query(header)));
+            let ticket = session.admit(header).unwrap();
+            let snapshot = model.status_snapshot().unwrap();
+            assert_eq!(snapshot.flags & FLAG_CHILD_PRESENT != 0, child_present);
+            if child_present {
+                assert_eq!(snapshot.child_generation, relationship.child_generation);
+                assert_eq!(
+                    snapshot.outer_launch_transaction,
+                    relationship.outer_launch_transaction
+                );
+            }
+            let response_size = encode_snapshot(header, snapshot, &mut wire).unwrap();
+            assert_eq!(
+                decode(&wire[..response_size], 0),
+                Ok(Message::Snapshot(header, snapshot))
+            );
+            session.complete(ticket).unwrap();
+        }
+    }
+
+    #[test]
+    fn status_peer_close_is_current_child_fatal_and_generation_bound() {
+        let (mut model, event) = live();
+        let stale = EventGeneration {
+            child_generation: event.child_generation + 1,
+            ..event
+        };
+        assert_eq!(
+            model.status_peer_closed(stale, 1),
+            Err(ModelError::StaleCorrelation)
+        );
+        assert!(matches!(
+            model.status_peer_closed(event, 2),
+            Ok(RecoveryAction::TerminateChild(job)) if job == event.child_job
+        ));
+        assert_eq!(
+            model.snapshot().last_failure,
+            Some(ModelError::ChildDisconnected)
+        );
     }
 
     #[test]

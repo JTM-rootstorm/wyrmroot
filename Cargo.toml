@@ -4,6 +4,7 @@ members = [
     "bootstrap",
     "crates/wyrmroot-bootfs",
     "crates/wyrmroot-bootstrap-proto",
+    "crates/wyrmroot-console-proto",
     "crates/wyrmroot-device-proto",
     "crates/wyrmroot-loader",
     "crates/wyrmroot-launch-proto",

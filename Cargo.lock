@@ -191,10 +191,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrmroot-console-proto"
+version = "0.0.0"
+
+[[package]]
 name = "wyrmroot-consoled"
 version = "0.0.0"
 dependencies = [
  "deepwyrm-syscall",
+ "wyrmroot-console-proto",
  "wyrmroot-device-proto",
  "wyrmroot-launch-proto",
  "wyrmroot-loader",
