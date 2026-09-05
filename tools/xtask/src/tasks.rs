@@ -1337,6 +1337,12 @@ pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<
     if matches!(filter, Some("wyr1c6" | "wyr1c6-native")) {
         return crate::wyr1c::run_c6_native_checks(repository);
     }
+    if matches!(
+        filter,
+        Some("wyr1e3-native" | "wyr1e3-consoled-native" | "wyr1e3-registry-native")
+    ) {
+        return crate::wyr1c::run_wyr1e3_native_checks(repository, filter.unwrap());
+    }
     if matches!(filter, Some("dw1e3b-native")) {
         return crate::wyr1c::run_e3b_native_checks(repository);
     }
@@ -1348,6 +1354,36 @@ pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<
 }
 
 fn host_test_commands(filter: Option<&str>) -> Result<Vec<Vec<String>>, Failure> {
+    if matches!(filter, Some("wyr1e3-model" | "wyr1e3-clippy")) {
+        let lint = filter == Some("wyr1e3-clippy");
+        return Ok([
+            ("wyrmroot-console-proto", None),
+            ("wyrmroot-consoled", Some("wyr1e-wyrmsh")),
+            ("wyrmroot-system-init", Some("wyr1e-shell-controller")),
+            ("wyrmroot-registryd", None),
+            ("wyrmroot-bootfs", Some("builder")),
+        ]
+        .into_iter()
+        .map(|(package, features)| {
+            let mut arguments = vec![
+                if lint { "clippy" } else { "test" }.to_owned(),
+                "--locked".to_owned(),
+                "--offline".to_owned(),
+                "--package".to_owned(),
+                package.to_owned(),
+                "--lib".to_owned(),
+                "--tests".to_owned(),
+            ];
+            if let Some(features) = features {
+                arguments.extend(["--features".to_owned(), features.to_owned()]);
+            }
+            if lint {
+                arguments.extend(["--".to_owned(), "-D".to_owned(), "warnings".to_owned()]);
+            }
+            arguments
+        })
+        .collect());
+    }
     if matches!(filter, Some("wyr1c6-clippy")) {
         let command = |package: &str, features: Option<&str>| {
             let mut arguments = vec![
@@ -1548,6 +1584,44 @@ mod tests {
             Some("OS-Project")
         );
         assert!(project.join("wyrmroot/.git").is_dir());
+    }
+
+    #[test]
+    fn wyr1e3_host_filters_select_models_without_native_or_selector_features() {
+        for filter in ["wyr1e3-model", "wyr1e3-clippy"] {
+            let commands = host_test_commands(Some(filter)).unwrap();
+            assert_eq!(commands.len(), 5);
+            for command in &commands {
+                assert!(command.iter().any(|arg| arg == "--lib"));
+                assert!(command.iter().any(|arg| arg == "--tests"));
+                assert!(
+                    !command
+                        .iter()
+                        .any(|arg| arg == "--bin" || arg == "--all-targets")
+                );
+                assert!(
+                    !command
+                        .iter()
+                        .any(|arg| arg.contains("native-") || arg.contains("selector32"))
+                );
+                assert!(command.iter().any(|arg| arg == "--locked"));
+                assert!(command.iter().any(|arg| arg == "--offline"));
+            }
+            assert!(commands[1].iter().any(|arg| arg == "wyr1e-wyrmsh"));
+            assert!(
+                commands[2]
+                    .iter()
+                    .any(|arg| arg == "wyr1e-shell-controller")
+            );
+            assert_eq!(
+                commands[0][0],
+                if filter.ends_with("clippy") {
+                    "clippy"
+                } else {
+                    "test"
+                }
+            );
+        }
     }
 
     #[test]

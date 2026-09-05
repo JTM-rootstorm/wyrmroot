@@ -216,6 +216,46 @@ const E3B_NATIVE_CHECK_SPECS: [NativeSpec; 8] = [
     E3A_PRODUCT_NATIVE_SPECS[6],
 ];
 
+// Unselected WYR1-E3 adapters plus the historical selector32 compilation path.
+// This gate checks native code; it does not construct a product or run a guest.
+const WYR1E3_NATIVE_CHECK_SPECS: [NativeSpec; 5] = [
+    NativeSpec {
+        label: "system-init-shell-controller",
+        package: "wyrmroot-system-init",
+        binary: "system-init",
+        features: "native-init,wyr1e-shell-controller",
+        artifact: "system-init",
+    },
+    NativeSpec {
+        label: "registryd-shell-preflight",
+        package: "wyrmroot-registryd",
+        binary: "registryd",
+        features: "native-registryd",
+        artifact: "registryd",
+    },
+    NativeSpec {
+        label: "consoled-wyrmsh",
+        package: "wyrmroot-consoled",
+        binary: "consoled",
+        features: "native-consoled,wyr1e-wyrmsh",
+        artifact: "consoled",
+    },
+    NativeSpec {
+        label: "consoled-selector32",
+        package: "wyrmroot-consoled",
+        binary: "consoled",
+        features: "native-consoled,wyr1d-selector32",
+        artifact: "consoled",
+    },
+    NativeSpec {
+        label: "system-init-selector32",
+        package: "wyrmroot-system-init",
+        binary: "system-init",
+        features: "wyr1d-selector32",
+        artifact: "system-init",
+    },
+];
+
 const E3B_NATIVE_CHECK_ENVIRONMENT: [(&str, &str); 3] = [
     ("DEEPWYRM_DW1E_EVIDENCE_NONCE", "E300000000000001"),
     ("WYRMROOT_DW1E3_CHALLENGE_1_NONCE", "E300000000000002"),
@@ -446,6 +486,16 @@ pub(crate) fn run_e3b_native_checks(repository: &Path) -> Result<(), Failure> {
         &E3B_NATIVE_CHECK_SPECS,
         &E3B_NATIVE_CHECK_ENVIRONMENT,
     )
+}
+
+pub(crate) fn run_wyr1e3_native_checks(repository: &Path, filter: &str) -> Result<(), Failure> {
+    let specs = match filter {
+        "wyr1e3-native" => WYR1E3_NATIVE_CHECK_SPECS.as_slice(),
+        "wyr1e3-consoled-native" => &WYR1E3_NATIVE_CHECK_SPECS[2..4],
+        "wyr1e3-registry-native" => &WYR1E3_NATIVE_CHECK_SPECS[1..2],
+        _ => return Err(Failure::usage("unknown WYR1-E3 native check selection")),
+    };
+    run_native_checks(repository, "WYR1-E3", filter, specs, &[])
 }
 
 fn run_native_checks(
@@ -2530,6 +2580,29 @@ fn hex_digest(value: &[u8; 32]) -> String {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn wyr1e3_native_checks_keep_shell_and_historical_selections_separate() {
+        assert_eq!(WYR1E3_NATIVE_CHECK_SPECS.len(), 5);
+        for spec in WYR1E3_NATIVE_CHECK_SPECS {
+            assert!(!(spec.features.contains("wyr1e-") && spec.features.contains("selector32")));
+            assert!(!spec.package.contains("retained-stubs"));
+        }
+        assert_eq!(
+            WYR1E3_NATIVE_CHECK_SPECS[0].features,
+            "native-init,wyr1e-shell-controller"
+        );
+        assert_eq!(WYR1E3_NATIVE_CHECK_SPECS[1].features, "native-registryd");
+        assert_eq!(
+            WYR1E3_NATIVE_CHECK_SPECS[2].features,
+            "native-consoled,wyr1e-wyrmsh"
+        );
+        assert_eq!(
+            WYR1E3_NATIVE_CHECK_SPECS[3].features,
+            "native-consoled,wyr1d-selector32"
+        );
+        assert_eq!(WYR1E3_NATIVE_CHECK_SPECS[4].features, "wyr1d-selector32");
+    }
 
     #[test]
     fn e3b_native_gate_covers_the_exact_product_and_nonce_inputs() {
