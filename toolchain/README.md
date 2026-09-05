@@ -24,13 +24,19 @@ focused tests, `core`/compiler-builtins artifacts, and no-libc smoke ELF.
 ## Rust toolchain activation
 
 All operator-facing Cargo entry points use `tools/pinned-cargo`. The launcher pins
-the installed host Rust 1.97.1 identity recorded in
+the installed host Rust 1.98.1 identity recorded in
 `host-rust-toolchain.toml`, supplies the shared offline project Cargo home, and
 uses a reusable host-only target directory. Callers must omit `CARGO_HOME`,
 `WYRMROOT_RUSTC`, compiler wrappers, target selection, and Rust flags. The
 launcher rejects host invocations that could implicitly admit native, UEFI, or
 other freestanding binaries; product builds remain centralized inside `xtask`,
 which selects and verifies the accepted Wyrmroot fork itself.
+
+The installed host package must include matching `rust-src` and
+`rust-analyzer` components as well as Clippy and rustfmt. An incomplete host
+update blocks the launcher: retain every identity check and install the
+matching components before validation. The accepted guest fork is independent
+of this host-only update.
 
 The reusable default target directory avoids rebuilding unchanged host tools
 and tests. Concurrent or disposable lanes may set

@@ -4,7 +4,10 @@ Date: 2026-09-04. The historical checkpoints below distinguish construction,
 host and failed live attempts. Final A5 live acceptance is recorded in
 [WYR1_D5_IMPLEMENTATION_STATUS.md](../../Plans/WYR1_D5_IMPLEMENTATION_STATUS.md):
 all four native console legs passed on both canonical UP/SMP profiles.
-D6 and overall WYR1-D closure remain pending.
+D6 and WYR1-D closure are recorded in
+[WYR1_D_VALIDATION.md](../../Plans/WYR1_D_VALIDATION.md). Historical results
+below retain their original toolchain identities; current invocations follow
+the active host pin.
 
 The selector retains the consoled launch-session owner before polling its first
 JobV2 launch. The existing dispatcher maps the retained bootfs authority and
@@ -28,9 +31,9 @@ of one across distinct endpoints in the same bundle.
 
 Run from the Wyrmroot checkout. Every command uses a fresh normalized absolute
 target directory inside that checkout's `.tmp`. Host identity verification is
-performed by `tools/pinned-cargo`; its compiler is Rust 1.97.1. The launcher
+performed by `tools/pinned-cargo`; its compiler is Rust 1.98.1. The launcher
 intentionally rejects caller-selected features. For the selector library gate,
-use the verified `/opt/rust-bin-1.97.1/bin/cargo` directly with the project
+use the verified `/opt/rust-bin-1.98.1/bin/cargo` directly with the project
 offline Cargo home, host compiler from `.cargo/config.toml`, and explicit
 isolated `CARGO_TARGET_DIR`:
 
@@ -39,7 +42,7 @@ The exact offline home is
 not `wyrmroot/.tmp/cargo-home/offline-v1`. A checkout-relative guess produces
 an offline dependency-checkout error before compilation; it is not a product
 failure. For direct feature checks set `CARGO_HOME` to that absolute root
-path, and prefix `PATH` with `/opt/rust-bin-1.97.1/bin` so Clippy also uses the
+path, and prefix `PATH` with `/opt/rust-bin-1.98.1/bin` so Clippy also uses the
 verified host version. Default gates continue through the launcher, which
 owns these settings and rejects a caller-supplied `CARGO_HOME`.
 Neighbor selector-31 native checks also require the compile-time

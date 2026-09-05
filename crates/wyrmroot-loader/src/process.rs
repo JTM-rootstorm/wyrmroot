@@ -1513,17 +1513,13 @@ fn load_process_materialized<P: LoaderPlatform>(
         // caller, so it retains every externally supplied endpoint for one
         // exact cleanup path rather than letting loader rollback take partial
         // ownership.
-        for delegated in &mut transaction.delegated_channels {
-            *delegated = None;
-        }
+        transaction.delegated_channels.fill(None);
         transaction.delegated_manifest = None;
         return Err(fail(platform, &mut transaction, LoadStage::InitSend, cause));
     }
     // Successful Channel send consumed every externally supplied endpoint.
     *delegated_channels_consumed = !request.channels.is_empty();
-    for delegated in &mut transaction.delegated_channels {
-        *delegated = None;
-    }
+    transaction.delegated_channels.fill(None);
     transaction.delegated_manifest = None;
     if request.profile == LaunchProfile::DeviceCoordinatorResourceDomain {
         transaction.delegated_resource_domain = None;

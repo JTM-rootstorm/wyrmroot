@@ -1057,7 +1057,9 @@ fn byte_mutations_never_panic() {
 fn decode_hex(encoded: &str) -> Vec<u8> {
     encoded
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|p| (nibble(p[0]) << 4) | nibble(p[1]))
         .collect()
 }

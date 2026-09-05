@@ -2606,7 +2606,7 @@ fn decode_digest(value: &str) -> Result<[u8; 32], Failure> {
         return Err(Failure::task("invalid WYR1-B request digest"));
     }
     let mut out = [0; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         out[index] = ((pair[0] as char)
             .to_digit(16)
             .ok_or_else(|| Failure::task("invalid digest"))?
@@ -3515,7 +3515,7 @@ mod tests {
     fn documented_pinned_launch_is_admitted_but_product_overrides_are_not() {
         let cargo_home = Path::new("/project/.tmp/cargo-home/offline-v1");
         let pinned_launch = environment(&[
-            ("CARGO", "/opt/rust-bin-1.97.1/bin/cargo"),
+            ("CARGO", "/opt/rust-bin-1.98.1/bin/cargo"),
             ("CARGO_HOME", "/project/.tmp/cargo-home/offline-v1"),
             ("CARGO_INCREMENTAL", "0"),
             ("CARGO_NET_OFFLINE", "true"),

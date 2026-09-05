@@ -1677,7 +1677,7 @@ fn elf_symbols(bytes: &[u8]) -> Result<Vec<ElfSymbol>, Failure> {
                     .ok_or_else(|| Failure::task("DW1-B ELF section table overflow"))?,
         )
         .ok_or_else(|| Failure::task("DW1-B ELF section table is truncated"))?;
-    let sections = table.chunks_exact(64).collect::<Vec<_>>();
+    let sections = table.as_chunks::<64>().0.iter().collect::<Vec<_>>();
     let symtab = sections
         .iter()
         .filter(|section| u32::from_le_bytes(section[4..8].try_into().unwrap()) == 2)
@@ -1692,7 +1692,7 @@ fn elf_symbols(bytes: &[u8]) -> Result<Vec<ElfSymbol>, Failure> {
     let strings_section = sections
         .get(string_index)
         .ok_or_else(|| Failure::task("DW1-B ELF symbol strings are absent"))?;
-    let strings = section_bytes(bytes, strings_section)?;
+    let strings = section_bytes(bytes, *strings_section)?;
     if u64::from_le_bytes(symtab[56..64].try_into().unwrap()) != 24 {
         return Err(Failure::task("DW1-B ELF symbol entry size is invalid"));
     }
@@ -1701,7 +1701,7 @@ fn elf_symbols(bytes: &[u8]) -> Result<Vec<ElfSymbol>, Failure> {
         return Err(Failure::task("DW1-B ELF symbol table is invalid"));
     }
     let mut symbols = Vec::new();
-    for entry in entries.chunks_exact(24) {
+    for entry in entries.as_chunks::<24>().0 {
         if entry[4] & 0x0f != 2 || u16::from_le_bytes(entry[6..8].try_into().unwrap()) == 0 {
             continue;
         }
@@ -1792,7 +1792,7 @@ fn verify_efi_loader(bytes: &[u8]) -> Result<(), Failure> {
     let sections = bytes
         .get(table..table_end)
         .ok_or_else(|| Failure::task("DW1-B loader section table is truncated"))?;
-    for section in sections.chunks_exact(40) {
+    for section in sections.as_chunks::<40>().0 {
         let raw_size = usize::try_from(u32::from_le_bytes(section[16..20].try_into().unwrap()))
             .map_err(|_| Failure::task("DW1-B loader section size overflow"))?;
         let raw_offset = usize::try_from(u32::from_le_bytes(section[20..24].try_into().unwrap()))
@@ -1819,7 +1819,7 @@ fn verify_efi_loader(bytes: &[u8]) -> Result<(), Failure> {
             "DW1-B production loader lacks a canonical PE debug directory",
         ));
     }
-    let debug_offset = sections.chunks_exact(40).find_map(|section| {
+    let debug_offset = sections.as_chunks::<40>().0.iter().find_map(|section| {
         let virtual_size = u32::from_le_bytes(section[8..12].try_into().unwrap());
         let virtual_address = u32::from_le_bytes(section[12..16].try_into().unwrap());
         let raw_size = u32::from_le_bytes(section[16..20].try_into().unwrap());
@@ -1839,7 +1839,7 @@ fn verify_efi_loader(bytes: &[u8]) -> Result<(), Failure> {
         .get(debug_offset..debug_end)
         .ok_or_else(|| Failure::task("DW1-B loader debug directory is truncated"))?;
     let mut repro = 0;
-    for entry in debug.chunks_exact(28) {
+    for entry in debug.as_chunks::<28>().0 {
         let kind = u32::from_le_bytes(entry[12..16].try_into().unwrap());
         if kind == 2 {
             return Err(Failure::task(

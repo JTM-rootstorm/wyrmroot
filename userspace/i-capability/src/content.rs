@@ -99,7 +99,7 @@ fn parse_digest(bytes: &[u8]) -> Option<[u8; 32]> {
         return None;
     }
     let mut output = [0_u8; 32];
-    for (index, pair) in bytes.chunks_exact(2).enumerate() {
+    for (index, pair) in bytes.as_chunks::<2>().0.iter().enumerate() {
         output[index] = nibble(pair[0])?
             .checked_mul(16)?
             .checked_add(nibble(pair[1])?)?;

@@ -207,4 +207,5 @@ All D5 worktree lanes were integrated and retired. Strict zero-lane audit finds
 no registered lane but reports the pre-existing unregistered
 `.worktrees/deepwyrm/.tmp`; it was preserved, so the strict audit is not claimed
 clean. Unrelated Glasswyrm files and previous failed A1-A4/GDB evidence remain
-untouched. The root `WYR1D5_PHASE_HANDOFF.md` retains the investigation lineage.
+untouched. The root [development workflow](../../validations/DEVELOPMENT_WORKFLOW.md)
+retains investigation-lineage recovery instructions for the retired D5 handoff.

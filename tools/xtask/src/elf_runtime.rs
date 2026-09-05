@@ -135,7 +135,7 @@ pub(crate) fn inspect(file: &mut File, label: &str) -> Result<RuntimeMetadata, F
     let mut needed_offsets = Vec::new();
     let mut runpath_offset = None;
     let mut terminated = false;
-    for entry in dynamic_bytes.chunks_exact(16) {
+    for entry in dynamic_bytes.as_chunks::<16>().0 {
         let tag = u64_at(entry, 0);
         let value = u64_at(entry, 8);
         match tag {

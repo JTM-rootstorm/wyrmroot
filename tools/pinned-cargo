@@ -39,7 +39,7 @@ verify_file() {
 safe_host_targets=false
 for argument in "$@"; do
     case "$argument" in
-        +*) fail "toolchain selectors are forbidden; the launcher owns Rust 1.97.1" ;;
+        +*) fail "toolchain selectors are forbidden; the launcher owns Rust 1.98.1" ;;
         --features|--features=*|--all-features)
             fail "host launcher rejects caller-selected features; use an explicit host gate or xtask"
             ;;

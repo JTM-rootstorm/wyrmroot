@@ -22,10 +22,12 @@ Use `tools/pinned-cargo` for default host tests with a fresh absolute
 must use the pinned Cargo directly, as the wrapper rejects feature overrides.
 Set `CARGO_HOME` to the OS-Project `.tmp/cargo-home/offline-v1` and use a fresh
 absolute checkout-local `CARGO_TARGET_DIR` per compiler/mode. Explicitly prefix
-`PATH` with `/opt/rust-bin-1.97.1/bin` for direct Cargo Clippy: Cargo resolves
+`PATH` with `/opt/rust-bin-1.98.1/bin` for direct Cargo Clippy: Cargo resolves
 `cargo-clippy`/`clippy-driver` through PATH even if Cargo and build.rustc are
-pinned. Omitting that prefix selected host Clippy 1.98.1 and caused an
-incompatible-metadata error; that was a tooling failure, not a code failure.
+pinned. Historically, omitting that prefix mixed Clippy 1.98.1 with the then
+pinned Rust 1.97.1 and caused an incompatible-metadata error. Keep compiler and
+Clippy identities aligned after every host update; that mismatch was a tooling
+failure, not a code failure.
 
 Default gate:
 

@@ -76,8 +76,10 @@ all selectors.
 
 The active root `DW1E_WYR1D_IMPLEMENTATION_PLAN.md` D5 phase requires the
 initial native stream, stderr, driver-replacement, and child-replacement legs
-on both default and SMP q35. Root `WYR1D5_PHASE_HANDOFF.md` preserves the
-current join and diagnostic-only GDB boundary. Root
+on both default and SMP q35. The [D5 status](WYR1_D5_IMPLEMENTATION_STATUS.md)
+records the accepted join; the root
+[development workflow](../../validations/DEVELOPMENT_WORKFLOW.md) preserves
+the diagnostic-only GDB boundary and retired handoff recovery instructions. Root
 `BOOTSTRAP_AND_RECOVERY_ARCHITECTURE.md` requires fresh generations and
 reconstructed topology, bounded recovery, and cleanup of affected clients.
 

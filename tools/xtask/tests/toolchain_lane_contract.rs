@@ -73,12 +73,24 @@ fn launcher_rejects_target_directory_bypass() {
 
 #[test]
 fn launcher_accepts_the_registered_wyrmroot_lane_layout() {
-    let target = std::env::temp_dir().join("wyrmroot-pinned-cargo-lane-contract");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock must be after the epoch")
+        .as_nanos();
+    let scratch = repository().join(".tmp");
+    std::fs::create_dir_all(&scratch).expect("create repository scratch parent");
+    let target = scratch.join(format!(
+        "pinned-cargo-lane-contract-{}-{nonce}",
+        std::process::id()
+    ));
+    // A fixed temporary path retains an incompatible marker across host repins.
+    std::fs::create_dir(&target).expect("reserve a fresh test-owned target");
     let output = Command::new(repository().join("tools/pinned-cargo"))
         .arg("--version")
+        .current_dir(repository())
         .env_remove("CARGO_HOME")
         .env_remove("CARGO")
-        .env("WYRMROOT_PINNED_TARGET_DIR", target)
+        .env("WYRMROOT_PINNED_TARGET_DIR", &target)
         .output()
         .expect("run pinned Cargo launcher from this checkout");
     assert!(
@@ -86,4 +98,5 @@ fn launcher_accepts_the_registered_wyrmroot_lane_layout() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    std::fs::remove_dir_all(target).expect("remove this test's fresh target");
 }

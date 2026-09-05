@@ -81,28 +81,23 @@ const ROUND: [u32; 64] = [
 #[must_use]
 pub fn digest(bytes: &[u8]) -> [u8; 32] {
     let mut state = INITIAL;
-    let mut chunks = bytes.chunks_exact(64);
-    for chunk in &mut chunks {
-        let mut block = [0_u8; 64];
-        block.copy_from_slice(chunk);
-        compress(&mut state, &block);
+    let (blocks, remainder) = bytes.as_chunks::<64>();
+    for block in blocks {
+        compress(&mut state, block);
     }
 
-    let remainder = chunks.remainder();
     let mut final_blocks = [0_u8; 128];
     final_blocks[..remainder.len()].copy_from_slice(remainder);
     final_blocks[remainder.len()] = 0x80;
     let final_len = if remainder.len() < 56 { 64 } else { 128 };
     let bit_len = (bytes.len() as u64).wrapping_mul(8);
     final_blocks[final_len - 8..final_len].copy_from_slice(&bit_len.to_be_bytes());
-    for chunk in final_blocks[..final_len].chunks_exact(64) {
-        let mut block = [0_u8; 64];
-        block.copy_from_slice(chunk);
-        compress(&mut state, &block);
+    for block in final_blocks[..final_len].as_chunks::<64>().0 {
+        compress(&mut state, block);
     }
 
     let mut output = [0_u8; 32];
-    for (word, destination) in state.into_iter().zip(output.chunks_exact_mut(4)) {
+    for (word, destination) in state.into_iter().zip(output.as_chunks_mut::<4>().0) {
         destination.copy_from_slice(&word.to_be_bytes());
     }
     output
@@ -119,8 +114,8 @@ pub fn prefix_u64(digest: &[u8; 32]) -> u64 {
 
 fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
     let mut words = [0_u32; 64];
-    for (index, source) in block.chunks_exact(4).enumerate() {
-        words[index] = u32::from_be_bytes(source.try_into().expect("SHA-256 word is four bytes"));
+    for (index, source) in block.as_chunks::<4>().0.iter().enumerate() {
+        words[index] = u32::from_be_bytes(*source);
     }
     for index in 16..64 {
         let s0 = words[index - 15].rotate_right(7)

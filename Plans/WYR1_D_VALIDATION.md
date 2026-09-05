@@ -49,7 +49,7 @@ through `38-*`, and `../../.tmp/d6-root-tests-r6.log`.
 
 Use the exact canonical invocations and project-root offline home in
 [`D5_VALIDATION.md`](../userspace/system-init/D5_VALIDATION.md), together with
-the preserved [D6 operational constraints](../../WYR1D6_PHASE_HANDOFF.md):
+the preserved [development workflow](../../validations/DEVELOPMENT_WORKFLOW.md):
 separate fresh target directories from logs, pass absolute manifest paths,
 serialize image preparation, and place selector28's campaign result beside
 `campaign.toml`. Reusing a consumed output directory is not a valid retry.

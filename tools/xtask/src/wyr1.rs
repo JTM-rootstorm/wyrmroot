@@ -660,7 +660,7 @@ pub(crate) fn decode_digest(value: &str) -> Result<[u8; 32], Failure> {
         return Err(Failure::task("request identity is not a SHA-256 digest"));
     }
     let mut output = [0; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         output[index] = (hex(pair[0])? << 4) | hex(pair[1])?;
     }
     Ok(output)
@@ -892,7 +892,7 @@ pub fn receipt_text(
     profile: Profile,
 ) -> Result<String, Failure> {
     let mut lines = vec![
-        format!("schema_version = \"1\""),
+        "schema_version = \"1\"".to_owned(),
         format!("kind = \"{RECEIPT_KIND}\""),
         format!("request_sha256 = \"{}\"", request.request_sha256),
         format!("deepwyrm_revision = \"{}\"", request.deepwyrm_revision),
@@ -1171,7 +1171,7 @@ pub fn parse_evidence(
     if !bytes.len().is_multiple_of(114) {
         return Err(Failure::task("WYR1 evidence record size is invalid"));
     }
-    for (expected_sequence, record_bytes) in bytes.chunks_exact(114).enumerate() {
+    for (expected_sequence, record_bytes) in bytes.as_chunks::<114>().0.iter().enumerate() {
         if terminal.is_some() {
             return Err(Failure::task("WYR1 evidence has records after terminal"));
         }

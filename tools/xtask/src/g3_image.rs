@@ -385,7 +385,9 @@ fn inspect_loaded(image: &mut File, inputs: &Inputs) -> Result<Inspection, Failu
             }
         }
         None if wyrmroot_directory
-            .chunks_exact(32)
+            .as_chunks::<32>()
+            .0
+            .iter()
             .any(|entry| entry[..11] == BOOT_DEVICE_TABLE_SHORT) =>
         {
             return Err(Failure::task(
@@ -825,7 +827,9 @@ fn read_cluster(image: &mut File, geometry: &Geometry, cluster: u32) -> Result<V
 
 fn directory_cluster(directory: &[u8], name: [u8; 11]) -> Result<u32, Failure> {
     let entry = directory
-        .chunks_exact(32)
+        .as_chunks::<32>()
+        .0
+        .iter()
         .find(|entry| entry[..11] == name && entry[11] == 0x10)
         .ok_or_else(|| Failure::task("G3 ESP canonical directory is missing"))?;
     Ok(u32::from(u16::from_le_bytes([entry[26], entry[27]]))
@@ -839,7 +843,9 @@ fn extract_file(
     name: [u8; 11],
 ) -> Result<Vec<u8>, Failure> {
     let entry = directory
-        .chunks_exact(32)
+        .as_chunks::<32>()
+        .0
+        .iter()
         .find(|entry| entry[..11] == name && entry[11] == 0x20)
         .ok_or_else(|| Failure::task("G3 ESP canonical artifact is missing"))?;
     let first = u32::from(u16::from_le_bytes([entry[26], entry[27]]))
