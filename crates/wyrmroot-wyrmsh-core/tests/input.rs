@@ -151,6 +151,106 @@ fn unknown_and_overlong_sequences_are_consumed() {
 }
 
 #[test]
+fn unsupported_ss3_sequences_are_quarantined_through_their_final() {
+    for final_byte in *b"ABCDHF" {
+        let input = [27, b'O', final_byte, b'x'];
+        assert_eq!(
+            events(&input),
+            [
+                InputEvent::Rejected(InputError::UnsupportedEscape),
+                InputEvent::Insert('x'),
+            ]
+        );
+    }
+    assert_eq!(
+        events(b"\x1bO1;2Ax"),
+        [
+            InputEvent::Rejected(InputError::UnsupportedEscape),
+            InputEvent::Insert('x'),
+        ]
+    );
+}
+
+#[test]
+fn unsupported_esc_intermediates_are_quarantined_through_their_final() {
+    assert_eq!(
+        events(b"\x1b(\x80Ax"),
+        [
+            InputEvent::Rejected(InputError::UnsupportedEscape),
+            InputEvent::Insert('x'),
+        ]
+    );
+}
+
+#[test]
+fn csi_discard_cannot_restart_as_a_supported_key() {
+    assert_eq!(
+        events(b"\x1b[\x80\x1b[Ax"),
+        [
+            InputEvent::Rejected(InputError::UnsupportedEscape),
+            InputEvent::Insert('A'),
+            InputEvent::Insert('x'),
+        ]
+    );
+
+    let mut input = b"\x1b[".to_vec();
+    input.extend([b'1'; 11]);
+    input.extend(b"\x1b[Ax");
+    assert_eq!(
+        events(&input),
+        [
+            InputEvent::Rejected(InputError::EscapeTooLong),
+            InputEvent::Insert('A'),
+            InputEvent::Insert('x'),
+        ]
+    );
+}
+
+#[test]
+fn unicode_control_categories_cannot_enter_text() {
+    for ch in [
+        '\u{009c}',
+        '\u{00ad}',
+        '\u{0600}',
+        '\u{061c}',
+        '\u{06dd}',
+        '\u{070f}',
+        '\u{0890}',
+        '\u{08e2}',
+        '\u{180e}',
+        '\u{200b}',
+        '\u{202e}',
+        '\u{2060}',
+        '\u{2066}',
+        '\u{feff}',
+        '\u{fff9}',
+        '\u{110bd}',
+        '\u{110cd}',
+        '\u{13430}',
+        '\u{1bca0}',
+        '\u{1d173}',
+        '\u{e0001}',
+        '\u{e007f}',
+        '\u{2028}',
+        '\u{2029}',
+    ] {
+        let mut encoded = [0; 4];
+        assert_eq!(
+            events(ch.encode_utf8(&mut encoded).as_bytes()),
+            [InputEvent::Rejected(InputError::UnsupportedControl)]
+        );
+    }
+
+    for ch in ['é', '🐉', '\u{0301}', '\u{fe0f}'] {
+        let mut encoded = [0; 4];
+        assert_eq!(
+            events(ch.encode_utf8(&mut encoded).as_bytes()),
+            [InputEvent::Insert(ch)]
+        );
+    }
+}
+
+#[test]
 fn unsupported_control_strings_and_paste_never_become_text() {
     for input in [
         b"\x1b]title\nexit\x07x".as_slice(),

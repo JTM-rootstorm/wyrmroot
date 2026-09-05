@@ -1,5 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+mod unicode_format;
+
+/// Returns whether WYR1-E admits a scalar as printable command text.
+///
+/// This excludes Unicode general categories Cc, Cf, Zl, and Zp. The complete
+/// Unicode 17.0.0 Cf/Zl/Zp ranges live in the separately licensed data module.
+pub fn is_printable_scalar(ch: char) -> bool {
+    !ch.is_control() && !unicode_format::is_format_or_line_separator(ch)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputError {
     InvalidUtf8,
@@ -35,7 +45,9 @@ enum Escape {
     Start,
     Intermediate,
     Csi,
+    DiscardIntermediate,
     DiscardCsi,
+    DiscardSs3,
     String { osc: bool, escaped: bool },
     Paste { matched: usize },
 }
@@ -175,7 +187,7 @@ impl InputDecoder {
             self.utf8_len = 0;
             self.utf8_need = 0;
             return match scalar {
-                Some(ch) if !ch.is_control() => InputEvent::Insert(ch),
+                Some(ch) if is_printable_scalar(ch) => InputEvent::Insert(ch),
                 Some(_) => InputEvent::Rejected(InputError::UnsupportedControl),
                 None => InputEvent::Rejected(InputError::InvalidUtf8),
             };
@@ -220,20 +232,35 @@ impl InputDecoder {
     }
 
     fn escape_byte(&mut self, byte: u8) -> InputEvent {
-        if byte == 27 {
-            self.begin_escape();
-            return InputEvent::Rejected(InputError::IncompleteEscape);
+        if self.escape == Escape::DiscardIntermediate {
+            if (0x30..=0x7e).contains(&byte) {
+                self.end_escape();
+            }
+            return InputEvent::None;
         }
-        if self.escape == Escape::DiscardCsi {
+        if matches!(self.escape, Escape::DiscardCsi | Escape::DiscardSs3) {
             if (0x40..=0x7e).contains(&byte) {
                 self.end_escape();
             }
             return InputEvent::None;
         }
+        if byte == 27 {
+            self.begin_escape();
+            return InputEvent::Rejected(InputError::IncompleteEscape);
+        }
         if self.escape_len == self.escape_bytes.len() {
-            self.escape = Escape::DiscardCsi;
+            self.escape = if self.escape == Escape::Intermediate {
+                Escape::DiscardIntermediate
+            } else {
+                Escape::DiscardCsi
+            };
             self.escape_len = 0;
-            if (0x40..=0x7e).contains(&byte) {
+            let final_byte = if self.escape == Escape::DiscardIntermediate {
+                (0x30..=0x7e).contains(&byte)
+            } else {
+                (0x40..=0x7e).contains(&byte)
+            };
+            if final_byte {
                 self.end_escape();
             }
             return InputEvent::Rejected(InputError::EscapeTooLong);
@@ -246,6 +273,11 @@ impl InputDecoder {
                 b'[' => {
                     self.escape = Escape::Csi;
                     InputEvent::None
+                }
+                b'O' => {
+                    self.escape = Escape::DiscardSs3;
+                    self.escape_len = 0;
+                    InputEvent::Rejected(InputError::UnsupportedEscape)
                 }
                 b']' | b'P' | b'X' | b'^' | b'_' => {
                     self.escape = Escape::String {
@@ -267,8 +299,12 @@ impl InputDecoder {
             Escape::Intermediate => {
                 if (0x20..=0x2f).contains(&byte) {
                     InputEvent::None
-                } else {
+                } else if (0x30..=0x7e).contains(&byte) {
                     self.end_escape();
+                    InputEvent::Rejected(InputError::UnsupportedEscape)
+                } else {
+                    self.escape = Escape::DiscardIntermediate;
+                    self.escape_len = 0;
                     InputEvent::Rejected(InputError::UnsupportedEscape)
                 }
             }

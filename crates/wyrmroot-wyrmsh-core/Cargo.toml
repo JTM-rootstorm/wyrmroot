@@ -2,7 +2,7 @@
 name = "wyrmroot-wyrmsh-core"
 version = "0.0.0"
 edition = "2024"
-license = "GPL-3.0-or-later"
+license = "GPL-3.0-or-later AND Unicode-3.0"
 publish = false
 description = "Allocation-free WYR1 shell grammar and command model"
 

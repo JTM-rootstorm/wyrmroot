@@ -10,6 +10,7 @@ The full license texts carried by this repository are:
 
 - `LICENSES/GPL-2.0-or-later.txt`
 - `LICENSES/GPL-3.0-or-later.txt`
+- `LICENSES/Unicode-3.0.txt`
 
 ## Current GPL-3.0-or-later components
 
@@ -27,6 +28,16 @@ The following paths are explicitly licensed `GPL-3.0-or-later`:
 - `toolchain/verify-uefi-toolchain.sh`.
 
 Cargo packages in this list use explicit `license = "GPL-3.0-or-later"` declarations. Standalone scripts should carry an SPDX identifier.
+
+`crates/wyrmroot-wyrmsh-core/src/input/unicode_format.rs` contains the Unicode
+17.0.0 general-category ranges for `Cf`, `Zl`, and `Zp`, adapted from the
+Unicode Character Database's versioned
+`extracted/DerivedGeneralCategory.txt` dated 2025-07-24, at
+`https://www.unicode.org/Public/17.0.0/ucd/extracted/DerivedGeneralCategory.txt`.
+That narrow data file
+retains the `Unicode-3.0` license and copyright notice. The surrounding decoder
+remains `GPL-3.0-or-later`; the package metadata records the combined
+`GPL-3.0-or-later AND Unicode-3.0` distribution terms.
 
 ## Current GPL-2.0-or-later components
 
