@@ -6485,7 +6485,11 @@ mod tests {
                     .expect("system clock before epoch")
                     .as_nanos()
             ));
-        fs::create_dir(&root).expect("create test root");
+        // The pinned launcher places build output under the project-local
+        // `.tmp` tree, so a fresh worktree need not already have `target/`.
+        // Create the complete unique fixture path rather than depending on
+        // another test or an earlier unpinned build to create its parent.
+        fs::create_dir_all(&root).expect("create test root");
         for name in [
             "request.toml",
             "loader.efi",

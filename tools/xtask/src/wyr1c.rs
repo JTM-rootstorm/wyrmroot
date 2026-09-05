@@ -264,6 +264,75 @@ const WYRMSH_NATIVE_CHECK_SPECS: [NativeSpec; 1] = [NativeSpec {
     artifact: "wyrmsh",
 }];
 
+// The normal WYR1-E product and the historical selector-32 product are
+// compiled together at the E6 join so a product-selection change cannot make
+// the retained console path silently stop compiling.
+const WYR1E6_NATIVE_CHECK_SPECS: [NativeSpec; 9] = [
+    NativeSpec {
+        label: "system-init-e6",
+        package: "wyrmroot-system-init",
+        binary: "system-init",
+        features: "wyr1e-production",
+        artifact: "system-init",
+    },
+    NativeSpec {
+        label: "registryd-e6",
+        package: "wyrmroot-registryd",
+        binary: "registryd",
+        features: "native-registryd",
+        artifact: "registryd",
+    },
+    NativeSpec {
+        label: "devmgr-e6",
+        package: "wyrmroot-devmgr",
+        binary: "devmgr",
+        features: "wyr1e-production",
+        artifact: "devmgr",
+    },
+    NativeSpec {
+        label: "uart16550d-e6",
+        package: "wyrmroot-uart16550d",
+        binary: "uart16550d",
+        features: "native-uart16550d",
+        artifact: "uart16550d",
+    },
+    NativeSpec {
+        label: "consoled-e6",
+        package: "wyrmroot-consoled",
+        binary: "consoled",
+        features: "native-consoled,wyr1e-wyrmsh",
+        artifact: "consoled",
+    },
+    NativeSpec {
+        label: "wyrmsh-e6",
+        package: "wyrmroot-wyrmsh",
+        binary: "wyrmsh",
+        features: "native-wyrmsh",
+        artifact: "wyrmsh",
+    },
+    NativeSpec {
+        label: "hello-e6",
+        package: "wyrmroot-hello",
+        binary: "wyrmroot-stream-hello",
+        features: "native-stream-hello",
+        artifact: "wyrmroot-stream-hello",
+    },
+    NativeSpec {
+        label: "consoled-selector32-e6-regression",
+        package: "wyrmroot-consoled",
+        binary: "consoled",
+        features: "native-consoled,wyr1d-selector32",
+        artifact: "consoled",
+    },
+    NativeSpec {
+        label: "system-init-selector32-e6-regression",
+        package: "wyrmroot-system-init",
+        binary: "system-init",
+        features: "wyr1d-selector32",
+        artifact: "system-init",
+    },
+];
+
 const E3B_NATIVE_CHECK_ENVIRONMENT: [(&str, &str); 3] = [
     ("DEEPWYRM_DW1E_EVIDENCE_NONCE", "E300000000000001"),
     ("WYRMROOT_DW1E3_CHALLENGE_1_NONCE", "E300000000000002"),
@@ -515,6 +584,16 @@ pub(crate) fn run_wyrmsh_native_checks(repository: &Path, filter: &str) -> Resul
         _ => return Err(Failure::usage("unknown Wyrmsh native check selection")),
     };
     run_native_checks(repository, phase, slug, &WYRMSH_NATIVE_CHECK_SPECS, &[])
+}
+
+pub(crate) fn run_wyr1e6_native_checks(repository: &Path) -> Result<(), Failure> {
+    run_native_checks(
+        repository,
+        "WYR1-E6",
+        "wyr1e6",
+        &WYR1E6_NATIVE_CHECK_SPECS,
+        &[],
+    )
 }
 
 fn run_native_checks(
@@ -2607,6 +2686,45 @@ mod tests {
         assert_eq!(spec.package, "wyrmroot-wyrmsh");
         assert_eq!(spec.binary, "wyrmsh");
         assert_eq!(spec.features, "native-wyrmsh");
+    }
+
+    #[test]
+    fn wyr1e6_native_gate_selects_one_normal_product_and_historical_regressions() {
+        let specs = WYR1E6_NATIVE_CHECK_SPECS
+            .iter()
+            .map(|spec| (spec.package, spec.binary, spec.features))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &specs[..7],
+            &[
+                ("wyrmroot-system-init", "system-init", "wyr1e-production"),
+                ("wyrmroot-registryd", "registryd", "native-registryd"),
+                ("wyrmroot-devmgr", "devmgr", "wyr1e-production"),
+                ("wyrmroot-uart16550d", "uart16550d", "native-uart16550d",),
+                (
+                    "wyrmroot-consoled",
+                    "consoled",
+                    "native-consoled,wyr1e-wyrmsh",
+                ),
+                ("wyrmroot-wyrmsh", "wyrmsh", "native-wyrmsh"),
+                (
+                    "wyrmroot-hello",
+                    "wyrmroot-stream-hello",
+                    "native-stream-hello",
+                ),
+            ]
+        );
+        assert_eq!(
+            &specs[7..],
+            &[
+                (
+                    "wyrmroot-consoled",
+                    "consoled",
+                    "native-consoled,wyr1d-selector32",
+                ),
+                ("wyrmroot-system-init", "system-init", "wyr1d-selector32"),
+            ]
+        );
     }
 
     #[test]
