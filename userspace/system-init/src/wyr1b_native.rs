@@ -3426,7 +3426,11 @@ where
 /// current registry generation and poison state; request bytes cannot select
 /// either authority.
 #[cfg(feature = "wyr1e-shell-controller")]
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    dead_code,
+    clippy::too_many_arguments,
+    reason = "E6 wires this E3C adapter into the selected resident product"
+)]
 pub(crate) fn poll_job_dispatcher_with_shell<S, L, W>(
     system: &mut S,
     loader: &mut L,
@@ -4662,6 +4666,7 @@ mod tests {
         session_peer_closed: bool,
         fail_move: bool,
         fail_send_on: Option<DwHandle>,
+        bootfs: Option<Vec<u8>>,
     }
 
     impl ShellPlatform {
@@ -4726,7 +4731,7 @@ mod tests {
         }
 
         fn query_memory_object_size(&mut self, _handle: DwHandle) -> Result<u64, NativeError> {
-            Err(FAILURE)
+            u64::try_from(self.bootfs.as_ref().ok_or(FAILURE)?.len()).map_err(|_| FAILURE)
         }
 
         fn with_bootfs_bytes<R>(
@@ -4734,9 +4739,12 @@ mod tests {
             _root: DwHandle,
             _bootfs: DwHandle,
             _plan: MappingPlan,
-            _use_bytes: impl for<'a> FnOnce(&mut Self, &'a [u8]) -> R,
+            use_bytes: impl for<'a> FnOnce(&mut Self, &'a [u8]) -> R,
         ) -> Result<R, NativeError> {
-            Err(FAILURE)
+            let bootfs = self.bootfs.take().ok_or(FAILURE)?;
+            let result = use_bytes(self, &bootfs);
+            self.bootfs = Some(bootfs);
+            Ok(result)
         }
 
         fn send_channel(&mut self, channel: DwHandle, bytes: &[u8]) -> Result<(), NativeError> {
@@ -5172,6 +5180,8 @@ mod tests {
 
     fn wyrmsh_policy_bootfs(image: &[u8]) -> (Vec<u8>, [u8; 32]) {
         let generation = [0x45; 32];
+        let mut manifest = [0_u8; 80];
+        manifest[48..80].copy_from_slice(&generation);
         let entry = LaunchPolicyEntry {
             path: WYRMSH_PATH,
             content_sha256: wyrmroot_runtime::sha256::digest(image),
@@ -5192,6 +5202,9 @@ mod tests {
                 &policy[..policy_size],
                 FileMode::ReadOnly,
             )
+            .unwrap();
+        builder
+            .add(MANIFEST_PATH.as_bytes(), &manifest, FileMode::ReadOnly)
             .unwrap();
         (builder.build().unwrap(), generation)
     }
@@ -6701,6 +6714,77 @@ mod tests {
             replacement_init.transaction_id,
             WYRMSH_FIRST_INSTALL_TRANSACTION + 1
         );
+    }
+
+    #[cfg(feature = "wyr1e-shell-controller")]
+    #[test]
+    fn e3c_controller_feature_runs_the_transport_injected_poll_adapter() {
+        let image = executable();
+        let (bootfs, _) = wyrmsh_policy_bootfs(&image);
+        let owner = grant(EndpointKind::LaunchSession, 1, 1);
+        let reservation = LaunchReservation {
+            connection_id: owner.endpoint_id,
+            generation: owner.endpoint_generation,
+            transaction_id: 11,
+        };
+        let (request, handles) = shell_request(reservation, 4);
+        let registry_grant = EndpointGrant {
+            registry_generation: 7,
+            endpoint_id: 1,
+            endpoint_generation: 1,
+            role_generation: 4,
+            kind: EndpointKind::RegistryClient,
+        };
+        let mut platform = ShellPlatform::new();
+        platform.bootfs = Some(bootfs);
+        platform.push(DwHandle(90), request, &handles);
+        platform.push(DwHandle(101), empty_service_page(registry_grant), &[]);
+        let mut loader = InitSendLoader::new();
+        loader.fail_init = false;
+        let mut waits = ShellWaits {
+            transaction: WYRMSH_FIRST_INSTALL_TRANSACTION,
+            exited: false,
+            exit_after_running_check: false,
+            query_count: 0,
+        };
+        let mut jobs = JobDispatcher::new();
+        jobs.install_scoped_session(owner, DwHandle(90), LaunchSessionScope::ConsoleLauncher)
+            .unwrap();
+        let mut topology = RegistryTopology::new(7).unwrap();
+        let mut state = ShellControllerState::new(7).unwrap();
+        let mut context = ShellLaunchContext {
+            registry_control: DwHandle(70),
+            topology: &mut topology,
+            state: &mut state,
+        };
+
+        poll_job_dispatcher_with_shell(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            LoadAuthority {
+                parent_root: DwHandle(1),
+                bootfs: DwHandle(2),
+                task_group: DwHandle(3),
+            },
+            &mut jobs,
+            10,
+            &mut context,
+        )
+        .unwrap();
+
+        assert_eq!(jobs.jobs.live_jobs(), 1);
+        assert_eq!(jobs.session_count(), 2);
+        assert_eq!(platform.inbound_cursor, 2);
+        assert!(platform.sent.iter().any(|(channel, bytes)| {
+            *channel == DwHandle(90)
+                && matches!(
+                    wyrmroot_launch_proto::parse_shell_v1_reply(bytes, 0)
+                        .unwrap()
+                        .reply,
+                    wyrmroot_launch_proto::ShellV1Reply::LaunchAccepted { job_id: 1 }
+                )
+        }));
     }
 
     #[test]
