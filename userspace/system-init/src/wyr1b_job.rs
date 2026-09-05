@@ -12,6 +12,33 @@ struct Session {
     grant: EndpointGrant,
     channel: DwHandle,
     owner: Option<SessionOwner>,
+    scope: LaunchSessionScope,
+}
+
+/// Controller-owned authority for one installed launch session.
+///
+/// The scope is fixed at installation and is never selected from request bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LaunchSessionScope {
+    Historical,
+    #[allow(dead_code, reason = "E3C installs the console launch session")]
+    ConsoleLauncher,
+    #[allow(dead_code, reason = "E3C installs child shell job sessions")]
+    ShellJobs,
+}
+
+impl LaunchSessionScope {
+    pub(crate) fn admits_legacy_launch(self, path: &str) -> bool {
+        match self {
+            Self::Historical => true,
+            Self::ConsoleLauncher => false,
+            Self::ShellJobs => matches!(path, "bin/hello" | "bin/cpu-hog"),
+        }
+    }
+
+    pub(crate) const fn admits_shell_v1(self) -> bool {
+        matches!(self, Self::ConsoleLauncher)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -61,6 +88,15 @@ impl JobDispatcher {
         grant: EndpointGrant,
         channel: DwHandle,
     ) -> Result<(), JobError> {
+        self.install_scoped_session(grant, channel, LaunchSessionScope::Historical)
+    }
+
+    pub(crate) fn install_scoped_session(
+        &mut self,
+        grant: EndpointGrant,
+        channel: DwHandle,
+        scope: LaunchSessionScope,
+    ) -> Result<(), JobError> {
         if grant.kind != EndpointKind::LaunchSession || channel.0 == 0 {
             return Err(JobError::ResourceIdentity);
         }
@@ -75,8 +111,21 @@ impl JobDispatcher {
             grant,
             channel,
             owner: None,
+            scope,
         });
         Ok(())
+    }
+
+    pub(crate) fn session_scope(
+        &self,
+        grant: EndpointGrant,
+    ) -> Result<LaunchSessionScope, JobError> {
+        self.sessions
+            .iter()
+            .flatten()
+            .find(|session| session.grant == grant)
+            .map(|session| session.scope)
+            .ok_or(JobError::UnknownConnection)
     }
 
     pub(crate) fn attach_session_owner(
@@ -309,6 +358,39 @@ mod tests {
             dispatcher.install_session(grant(17), DwHandle(117)),
             Err(JobError::Capacity)
         );
+    }
+
+    #[test]
+    fn session_scope_is_controller_owned_and_defaults_to_historical() {
+        let mut dispatcher = JobDispatcher::new();
+        dispatcher.install_session(grant(1), DwHandle(101)).unwrap();
+        dispatcher
+            .install_scoped_session(grant(2), DwHandle(102), LaunchSessionScope::ConsoleLauncher)
+            .unwrap();
+        dispatcher
+            .install_scoped_session(grant(3), DwHandle(103), LaunchSessionScope::ShellJobs)
+            .unwrap();
+
+        assert_eq!(
+            dispatcher.session_scope(grant(1)),
+            Ok(LaunchSessionScope::Historical)
+        );
+        assert_eq!(
+            dispatcher.session_scope(grant(2)),
+            Ok(LaunchSessionScope::ConsoleLauncher)
+        );
+        assert_eq!(
+            dispatcher.session_scope(grant(3)),
+            Ok(LaunchSessionScope::ShellJobs)
+        );
+        assert!(LaunchSessionScope::Historical.admits_legacy_launch("bin/other"));
+        assert!(!LaunchSessionScope::ConsoleLauncher.admits_legacy_launch("bin/hello"));
+        assert!(LaunchSessionScope::ShellJobs.admits_legacy_launch("bin/hello"));
+        assert!(LaunchSessionScope::ShellJobs.admits_legacy_launch("bin/cpu-hog"));
+        assert!(!LaunchSessionScope::ShellJobs.admits_legacy_launch("bin/hello-extra"));
+        assert!(LaunchSessionScope::ConsoleLauncher.admits_shell_v1());
+        assert!(!LaunchSessionScope::Historical.admits_shell_v1());
+        assert!(!LaunchSessionScope::ShellJobs.admits_shell_v1());
     }
 
     #[test]
