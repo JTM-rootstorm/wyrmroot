@@ -7,8 +7,8 @@ use wyrmroot_registry_proto::{
 };
 use wyrmroot_registryd::InstalledEndpoint;
 use wyrmroot_registryd::service::{
-    ChannelRights, ReceiveCounts, ReceivedHandle, RegistryService, ServiceError, Transport,
-    WaitEvent,
+    ChannelRights, ProbeSignals, ReceiveCounts, ReceivedHandle, RegistryService, ServiceError,
+    Transport, WaitEvent,
 };
 
 #[derive(Default)]
@@ -23,6 +23,9 @@ struct Mock {
     moves: Vec<u64>,
     fail_move: bool,
     closed: Vec<u64>,
+    fail_closes: Vec<u64>,
+    probes: Vec<(u64, Result<ProbeSignals, ()>)>,
+    probe_calls: Vec<u64>,
 }
 
 impl Transport for Mock {
@@ -30,6 +33,15 @@ impl Transport for Mock {
 
     fn wait(&mut self, _control: u64, _endpoints: &[InstalledEndpoint]) -> Result<WaitEvent, ()> {
         Ok(self.event.take().unwrap())
+    }
+
+    fn probe(&mut self, endpoint: InstalledEndpoint) -> Result<ProbeSignals, ()> {
+        self.probe_calls.push(endpoint.handle);
+        self.probes
+            .iter()
+            .position(|(handle, _)| *handle == endpoint.handle)
+            .map(|index| self.probes.remove(index).1)
+            .unwrap_or(Ok(ProbeSignals::default()))
     }
 
     fn receive(
@@ -95,8 +107,11 @@ impl Transport for Mock {
         Ok(())
     }
 
-    fn close(&mut self, handle: u64) {
+    fn close(&mut self, handle: u64) -> Result<(), ()> {
         self.closed.push(handle);
+        (!self.fail_closes.contains(&handle))
+            .then_some(())
+            .ok_or(())
     }
 }
 
@@ -196,6 +211,78 @@ fn install_client(service: &mut RegistryService, mock: &mut Mock) {
         event(None, true, false),
         &bytes[..size],
         Some(handle(141, 1)),
+    )
+    .unwrap();
+}
+
+fn install_client_with(
+    service: &mut RegistryService,
+    mock: &mut Mock,
+    endpoint_id: u64,
+    client_id: u64,
+    installed_handle: u64,
+    transaction: u64,
+) -> Result<(), ServiceError<()>> {
+    let mut bytes = [0u8; 128];
+    let size = encode_install_client(
+        Header {
+            message_type: MessageType::InstallClient,
+            registry_generation: 7,
+            endpoint_id: 0,
+            endpoint_generation: 0,
+            transaction_id: transaction,
+        },
+        InstallClient {
+            endpoint_id,
+            endpoint_generation: 1,
+            client_id,
+            client_generation: 1,
+            scope: EnumerationScope::BootstrapMetadata,
+        },
+        &mut bytes,
+    )
+    .unwrap();
+    drive(
+        service,
+        mock,
+        event(None, true, false),
+        &bytes[..size],
+        Some(handle(installed_handle, 1)),
+    )
+}
+
+fn install_publication_with(service: &mut RegistryService, mock: &mut Mock, ordinal: u64) {
+    let mut bytes = [0u8; 256];
+    let name = [
+        b'p',
+        b'0' + ((ordinal / 10) as u8),
+        b'0' + ((ordinal % 10) as u8),
+    ];
+    let size = encode_install_publication(
+        Header {
+            message_type: MessageType::InstallPublication,
+            registry_generation: 7,
+            endpoint_id: 0,
+            endpoint_generation: 0,
+            transaction_id: 100 + ordinal,
+        },
+        1_000 + ordinal,
+        1,
+        1,
+        2_000 + ordinal,
+        1,
+        100 + ordinal,
+        &[ProtocolVersion { major: 1, minor: 0 }],
+        &name,
+        &mut bytes,
+    )
+    .unwrap();
+    drive(
+        service,
+        mock,
+        event(None, true, false),
+        &bytes[..size],
+        Some(handle(10_000 + ordinal, 1)),
     )
     .unwrap();
 }
@@ -506,4 +593,165 @@ fn five_and_sixteen_handles_are_recoverable_but_oversize_removes_endpoint() {
     .unwrap();
     assert_eq!(mock.closed.iter().filter(|value| **value == 141).count(), 1);
     assert!(service.state().unwrap().installed_endpoint(0).is_none());
+}
+
+#[test]
+fn install_client_sweeps_full_snapshot_once_and_readable_does_not_mask_close() {
+    let mut service = RegistryService::new(1);
+    let mut mock = Mock::default();
+    for ordinal in 0..32 {
+        install_publication_with(&mut service, &mut mock, ordinal);
+    }
+    for ordinal in 0..32 {
+        install_client_with(
+            &mut service,
+            &mut mock,
+            3_000 + ordinal,
+            4_000 + ordinal,
+            20_000 + ordinal,
+            300 + ordinal,
+        )
+        .unwrap();
+    }
+    assert!(service.state().unwrap().installed_endpoint(63).is_some());
+    assert!(service.state().unwrap().installed_endpoint(64).is_none());
+
+    mock.probe_calls.clear();
+    mock.probes.push((
+        20_000,
+        Ok(ProbeSignals {
+            readable: true,
+            peer_closed: true,
+        }),
+    ));
+    let sent_before = mock.sent.len();
+    install_client_with(&mut service, &mut mock, 5_000, 6_000, 30_000, 500).unwrap();
+
+    assert_eq!(mock.probe_calls.len(), 64);
+    let mut probed = mock.probe_calls.clone();
+    probed.sort_unstable();
+    probed.dedup();
+    assert_eq!(probed.len(), 64);
+    assert_eq!(
+        mock.closed
+            .iter()
+            .filter(|handle| **handle == 20_000)
+            .count(),
+        1
+    );
+    assert_eq!(
+        mock.sent.len(),
+        sent_before,
+        "INSTALL remains acknowledgement-free"
+    );
+    let endpoints: Vec<_> = (0..64)
+        .filter_map(|index| service.state().unwrap().installed_endpoint(index))
+        .collect();
+    assert!(endpoints.iter().any(|endpoint| {
+        endpoint.identity.id == 5_000
+            && endpoint.identity.generation == 1
+            && endpoint.handle == 30_000
+    }));
+    assert!(!endpoints.iter().any(|endpoint| endpoint.handle == 20_000));
+}
+
+#[test]
+fn sweep_probe_and_cleanup_failures_terminate_before_install() {
+    let mut service = RegistryService::new(1);
+    let mut mock = Mock::default();
+    install_client_with(&mut service, &mut mock, 41, 51, 141, 1).unwrap();
+    mock.probe_calls.clear();
+    mock.probes.push((141, Err(())));
+
+    assert_eq!(
+        install_client_with(&mut service, &mut mock, 42, 52, 142, 2),
+        Err(ServiceError::Transport(()))
+    );
+    assert_eq!(mock.probe_calls, [141]);
+    assert_eq!(
+        mock.closed.iter().filter(|handle| **handle == 142).count(),
+        1
+    );
+    assert!(service.state().unwrap().installed_endpoint(1).is_none());
+
+    let mut service = RegistryService::new(1);
+    let mut mock = Mock::default();
+    install_client_with(&mut service, &mut mock, 41, 51, 141, 1).unwrap();
+    mock.probes.push((
+        141,
+        Ok(ProbeSignals {
+            readable: false,
+            peer_closed: true,
+        }),
+    ));
+    mock.fail_closes.push(141);
+
+    assert_eq!(
+        install_client_with(&mut service, &mut mock, 42, 52, 142, 2),
+        Err(ServiceError::Transport(()))
+    );
+    assert_eq!(
+        mock.closed.iter().filter(|handle| **handle == 141).count(),
+        1
+    );
+    assert_eq!(
+        mock.closed.iter().filter(|handle| **handle == 142).count(),
+        1
+    );
+    assert!(service.state().unwrap().installed_endpoint(0).is_none());
+
+    let mut service = RegistryService::new(1);
+    let mut mock = Mock::default();
+    install_publication(&mut service, &mut mock, 31, 13);
+    install_client(&mut service, &mut mock);
+    drive(
+        &mut service,
+        &mut mock,
+        event(Some(0), true, false),
+        &empty(MessageType::Publish, 31, 1),
+        None,
+    )
+    .unwrap();
+    drive(
+        &mut service,
+        &mut mock,
+        event(Some(1), true, false),
+        &watch(3, 13),
+        None,
+    )
+    .unwrap();
+    mock.probes.push((
+        131,
+        Ok(ProbeSignals {
+            readable: false,
+            peer_closed: true,
+        }),
+    ));
+    mock.probes.push((
+        141,
+        Ok(ProbeSignals {
+            readable: false,
+            peer_closed: true,
+        }),
+    ));
+    mock.fail_sends.push(mock.send_attempts + 1);
+
+    assert_eq!(
+        install_client_with(&mut service, &mut mock, 42, 52, 142, 2),
+        Err(ServiceError::State(
+            wyrmroot_registryd::RegistryError::UnknownEndpoint
+        ))
+    );
+    assert_eq!(
+        mock.closed.iter().filter(|handle| **handle == 131).count(),
+        1
+    );
+    assert_eq!(
+        mock.closed.iter().filter(|handle| **handle == 141).count(),
+        1
+    );
+    assert_eq!(
+        mock.closed.iter().filter(|handle| **handle == 142).count(),
+        1
+    );
 }

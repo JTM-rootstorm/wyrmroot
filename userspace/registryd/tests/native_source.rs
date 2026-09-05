@@ -10,6 +10,11 @@ fn native_registry_is_resident_and_uses_only_channel_routing_primitives() {
     assert!(NATIVE.contains("LaunchProfile::BootstrapRegistry"));
     assert!(NATIVE.contains("loop {"));
     assert!(NATIVE.contains("wait_many"));
+    assert!(NATIVE.contains("fn probe("));
+    assert!(NATIVE.contains("DwDeadline(0)"));
+    assert!(NATIVE.contains("DW_SIGNAL_PEER_CLOSED"));
+    assert!(NATIVE.contains("DW_STATUS_TIMED_OUT"));
+    assert!(NATIVE.contains("close_handle(DwHandle(handle)).map_err"));
     assert!(NATIVE.contains("RegistryService::new"));
     assert!(NATIVE.contains("service.step"));
     assert!(SERVICE.contains("Message::InstallPublication"));
