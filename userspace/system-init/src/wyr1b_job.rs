@@ -13,6 +13,7 @@ struct Session {
     channel: DwHandle,
     owner: Option<SessionOwner>,
     scope: LaunchSessionScope,
+    outer_job: Option<u64>,
 }
 
 /// Controller-owned authority for one installed launch session.
@@ -52,6 +53,7 @@ pub(crate) struct SessionOwner {
 pub(crate) struct DisconnectedSession {
     pub(crate) channel: DwHandle,
     pub(crate) owner: Option<SessionOwner>,
+    pub(crate) outer_job: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -112,6 +114,7 @@ impl JobDispatcher {
             channel,
             owner: None,
             scope,
+            outer_job: None,
         });
         Ok(())
     }
@@ -147,6 +150,44 @@ impl JobDispatcher {
         }
         session.owner = Some(owner);
         Ok(())
+    }
+
+    pub(crate) fn attach_outer_job(
+        &mut self,
+        grant: EndpointGrant,
+        job_id: u64,
+    ) -> Result<(), JobError> {
+        if job_id == 0 {
+            return Err(JobError::ResourceIdentity);
+        }
+        let session = self
+            .sessions
+            .iter_mut()
+            .flatten()
+            .find(|session| session.grant == grant)
+            .ok_or(JobError::UnknownConnection)?;
+        if session.scope != LaunchSessionScope::ShellJobs
+            || session.owner.is_some()
+            || session.outer_job.is_some()
+        {
+            return Err(JobError::WrongState);
+        }
+        session.outer_job = Some(job_id);
+        Ok(())
+    }
+
+    pub(crate) fn has_shell_session(&self) -> bool {
+        self.sessions
+            .iter()
+            .flatten()
+            .any(|session| session.scope == LaunchSessionScope::ShellJobs)
+    }
+
+    pub(crate) fn shell_session_for_outer_job(&self, job_id: u64) -> Option<EndpointGrant> {
+        self.sessions.iter().flatten().find_map(|session| {
+            (session.scope == LaunchSessionScope::ShellJobs && session.outer_job == Some(job_id))
+                .then_some(session.grant)
+        })
     }
 
     pub(crate) fn disconnect_session(
@@ -185,6 +226,7 @@ impl JobDispatcher {
         Ok(DisconnectedSession {
             channel: session.channel,
             owner: session.owner,
+            outer_job: session.outer_job,
         })
     }
 
@@ -314,6 +356,7 @@ impl JobDispatcher {
                 out[count] = Some(DisconnectedSession {
                     channel: session.channel,
                     owner: session.owner,
+                    outer_job: session.outer_job,
                 });
                 count += 1;
             }

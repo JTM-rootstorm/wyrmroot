@@ -9,6 +9,12 @@ pub const RECORD_BYTES: usize = 64;
 pub const MAX_ENTRIES: usize = 32;
 pub const MAX_PATH_BYTES: usize = 256;
 const MAGIC: [u8; 4] = *b"WRJP";
+const VERSION_MAJOR: u16 = 1;
+const VERSION_MINOR_HISTORICAL: u16 = 0;
+const VERSION_MINOR_WYRMSH: u16 = 1;
+pub const JOB_V2_PROFILE_ID: u16 = 1;
+pub const WYRMSH_PROFILE_ID: u16 = 2;
+pub const WYRMSH_PATH: &str = "system/wyrmsh";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LaunchPolicyEntry<'a> {
@@ -26,6 +32,7 @@ pub struct LaunchPolicy<'a> {
     count: usize,
     strings_offset: usize,
     boot_generation_sha256: [u8; 32],
+    minor: u16,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -54,7 +61,10 @@ impl<'a> LaunchPolicy<'a> {
                 PolicyError::WrongMagic
             });
         }
-        if get_u16(bytes, 4)? != 1 || get_u16(bytes, 6)? != 0 {
+        let minor = get_u16(bytes, 6)?;
+        if get_u16(bytes, 4)? != VERSION_MAJOR
+            || !matches!(minor, VERSION_MINOR_HISTORICAL | VERSION_MINOR_WYRMSH)
+        {
             return Err(PolicyError::UnsupportedVersion);
         }
         if get_u16(bytes, 8)? as usize != HEADER_BYTES
@@ -97,6 +107,7 @@ impl<'a> LaunchPolicy<'a> {
             count,
             strings_offset,
             boot_generation_sha256,
+            minor,
         };
         let mut previous = None;
         let mut expected_offset = 0usize;
@@ -130,6 +141,10 @@ impl<'a> LaunchPolicy<'a> {
 
     pub const fn boot_generation_sha256(self) -> [u8; 32] {
         self.boot_generation_sha256
+    }
+
+    pub const fn version_minor(self) -> u16 {
+        self.minor
     }
 
     pub fn entry(self, index: usize) -> Option<Result<LaunchPolicyEntry<'a>, PolicyError>> {
@@ -169,11 +184,23 @@ impl<'a> LaunchPolicy<'a> {
             core::str::from_utf8(self.bytes.get(start..end).ok_or(PolicyError::InvalidPath)?)
                 .map_err(|_| PolicyError::InvalidPath)?;
         validate_path(path)?;
-        if get_u16(record, 6)? != 2 || get_u16(record, 8)? != 1 {
+        let startup_abi = get_u16(record, 6)?;
+        let profile_id = get_u16(record, 8)?;
+        if startup_abi != 2
+            || match (self.minor, profile_id) {
+                (VERSION_MINOR_HISTORICAL, JOB_V2_PROFILE_ID) => false,
+                (VERSION_MINOR_WYRMSH, JOB_V2_PROFILE_ID) => path == WYRMSH_PATH,
+                (VERSION_MINOR_WYRMSH, WYRMSH_PROFILE_ID) => path != WYRMSH_PATH,
+                _ => true,
+            }
+        {
             return Err(PolicyError::InvalidStartupProfile);
         }
         let stream_modes = get_u16(record, 10)?;
-        if stream_modes == 0 || stream_modes & !0b11 != 0 {
+        if stream_modes == 0
+            || stream_modes & !0b11 != 0
+            || (profile_id == WYRMSH_PROFILE_ID && stream_modes != 0b10)
+        {
             return Err(PolicyError::InvalidStreamModes);
         }
         if get_u32(record, 12)? != 1 {
@@ -187,8 +214,8 @@ impl<'a> LaunchPolicy<'a> {
         Ok(LaunchPolicyEntry {
             path,
             content_sha256,
-            startup_abi: 2,
-            profile_id: 1,
+            startup_abi,
+            profile_id,
             allow_no_streams: stream_modes & 1 != 0,
             allow_three_streams: stream_modes & 2 != 0,
         })
@@ -213,6 +240,35 @@ pub fn encode(
     entries: &[LaunchPolicyEntry<'_>],
     output: &mut [u8],
 ) -> Result<usize, PolicyError> {
+    encode_version(
+        VERSION_MINOR_HISTORICAL,
+        boot_generation_sha256,
+        entries,
+        output,
+    )
+}
+
+/// Encodes the additive WRJP 1.1 policy which may contain the exact Wyrmsh
+/// profile beside historical JobV2 entries.
+pub fn encode_wyrmsh(
+    boot_generation_sha256: [u8; 32],
+    entries: &[LaunchPolicyEntry<'_>],
+    output: &mut [u8],
+) -> Result<usize, PolicyError> {
+    encode_version(
+        VERSION_MINOR_WYRMSH,
+        boot_generation_sha256,
+        entries,
+        output,
+    )
+}
+
+fn encode_version(
+    minor: u16,
+    boot_generation_sha256: [u8; 32],
+    entries: &[LaunchPolicyEntry<'_>],
+    output: &mut [u8],
+) -> Result<usize, PolicyError> {
     if boot_generation_sha256 == [0; 32] {
         return Err(PolicyError::InvalidBootGeneration);
     }
@@ -232,7 +288,8 @@ pub fn encode(
     }
     output[..total].fill(0);
     output[..4].copy_from_slice(&MAGIC);
-    put_u16(output, 4, 1)?;
+    put_u16(output, 4, VERSION_MAJOR)?;
+    put_u16(output, 6, minor)?;
     put_u16(output, 8, HEADER_BYTES as u16)?;
     put_u16(output, 10, RECORD_BYTES as u16)?;
     put_u16(output, 12, entries.len() as u16)?;
@@ -250,19 +307,26 @@ pub fn encode(
         if entry.content_sha256 == [0; 32] {
             return Err(PolicyError::InvalidDigest);
         }
-        if entry.startup_abi != 2 || entry.profile_id != 1 {
+        if entry.startup_abi != 2
+            || match (minor, entry.profile_id) {
+                (VERSION_MINOR_HISTORICAL, JOB_V2_PROFILE_ID) => false,
+                (VERSION_MINOR_WYRMSH, JOB_V2_PROFILE_ID) => entry.path == WYRMSH_PATH,
+                (VERSION_MINOR_WYRMSH, WYRMSH_PROFILE_ID) => entry.path != WYRMSH_PATH,
+                _ => true,
+            }
+        {
             return Err(PolicyError::InvalidStartupProfile);
         }
         let stream_modes =
             u16::from(entry.allow_no_streams) | (u16::from(entry.allow_three_streams) << 1);
-        if stream_modes == 0 {
+        if stream_modes == 0 || (entry.profile_id == WYRMSH_PROFILE_ID && stream_modes != 0b10) {
             return Err(PolicyError::InvalidStreamModes);
         }
         let record = HEADER_BYTES + index * RECORD_BYTES;
         put_u32(output, record, string_offset as u32)?;
         put_u16(output, record + 4, entry.path.len() as u16)?;
         put_u16(output, record + 6, 2)?;
-        put_u16(output, record + 8, 1)?;
+        put_u16(output, record + 8, entry.profile_id)?;
         put_u16(output, record + 10, stream_modes)?;
         put_u32(output, record + 12, 1)?;
         output[record + 16..record + 48].copy_from_slice(&entry.content_sha256);
@@ -353,5 +417,78 @@ mod tests {
         let mut malformed = bytes;
         malformed[56] = 1;
         assert!(LaunchPolicy::parse(&malformed[..size]).is_err());
+    }
+
+    #[test]
+    fn wyrmsh_policy_is_additive_and_version_selected() {
+        let historical = LaunchPolicyEntry {
+            path: "bin/hello",
+            content_sha256: [0x22; 32],
+            startup_abi: 2,
+            profile_id: JOB_V2_PROFILE_ID,
+            allow_no_streams: true,
+            allow_three_streams: true,
+        };
+        let wyrmsh = LaunchPolicyEntry {
+            path: WYRMSH_PATH,
+            content_sha256: [0x33; 32],
+            startup_abi: 2,
+            profile_id: WYRMSH_PROFILE_ID,
+            allow_no_streams: false,
+            allow_three_streams: true,
+        };
+        let mut bytes = [0_u8; 512];
+        let size = encode_wyrmsh([0x11; 32], &[historical, wyrmsh], &mut bytes).unwrap();
+        let parsed = LaunchPolicy::parse(&bytes[..size]).unwrap();
+        assert_eq!(parsed.version_minor(), VERSION_MINOR_WYRMSH);
+        assert_eq!(parsed.find("bin/hello"), Some(historical));
+        assert_eq!(parsed.find(WYRMSH_PATH), Some(wyrmsh));
+
+        assert_eq!(
+            encode([0x11; 32], &[wyrmsh], &mut bytes),
+            Err(PolicyError::InvalidStartupProfile)
+        );
+        let mut wrong_modes = wyrmsh;
+        wrong_modes.allow_no_streams = true;
+        assert_eq!(
+            encode_wyrmsh([0x11; 32], &[wrong_modes], &mut bytes),
+            Err(PolicyError::InvalidStreamModes)
+        );
+        let mut wrong_path = wyrmsh;
+        wrong_path.path = "system/other";
+        assert_eq!(
+            encode_wyrmsh([0x11; 32], &[wrong_path], &mut bytes),
+            Err(PolicyError::InvalidStartupProfile)
+        );
+        let mut wrong_profile = wyrmsh;
+        wrong_profile.profile_id = JOB_V2_PROFILE_ID;
+        assert_eq!(
+            encode_wyrmsh([0x11; 32], &[wrong_profile], &mut bytes),
+            Err(PolicyError::InvalidStartupProfile)
+        );
+    }
+
+    #[test]
+    fn version_mutation_cannot_reinterpret_profile_two() {
+        let wyrmsh = LaunchPolicyEntry {
+            path: WYRMSH_PATH,
+            content_sha256: [0x33; 32],
+            startup_abi: 2,
+            profile_id: WYRMSH_PROFILE_ID,
+            allow_no_streams: false,
+            allow_three_streams: true,
+        };
+        let mut bytes = [0_u8; 512];
+        let size = encode_wyrmsh([0x11; 32], &[wyrmsh], &mut bytes).unwrap();
+        bytes[6..8].copy_from_slice(&VERSION_MINOR_HISTORICAL.to_le_bytes());
+        assert_eq!(
+            LaunchPolicy::parse(&bytes[..size]),
+            Err(PolicyError::InvalidStartupProfile)
+        );
+        bytes[6..8].copy_from_slice(&2_u16.to_le_bytes());
+        assert_eq!(
+            LaunchPolicy::parse(&bytes[..size]),
+            Err(PolicyError::UnsupportedVersion)
+        );
     }
 }

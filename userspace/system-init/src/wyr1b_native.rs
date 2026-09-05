@@ -19,14 +19,20 @@ use wyrmroot_launch_proto::{
     ErrorCode as LaunchErrorCode, Message as LaunchMessage, MessageType as LaunchMessageType,
     Reservation as LaunchReservation, TerminationClassification, TerminationResult,
     encode_error as encode_launch_error, encode_job_list, encode_job_message, encode_job_result,
-    encode_job_state, encode_shell_v1_error as encode_shell_v1_error_reply,
-    parse_message as parse_launch_message, parse_reservation_prefix, parse_shell_v1_request,
-    parse_shell_v1_reservation_prefix,
+    encode_job_state, encode_shell_v1_accepted,
+    encode_shell_v1_error as encode_shell_v1_error_reply, parse_message as parse_launch_message,
+    parse_reservation_prefix, parse_shell_v1_request, parse_shell_v1_reservation_prefix,
 };
-use wyrmroot_loader::launch::CHILD_CHANNEL_RIGHTS;
+use wyrmroot_loader::{
+    launch::{CHILD_CHANNEL_RIGHTS, LaunchProfile},
+    process::{WyrmshLoadRequest, load_wyrmsh_process},
+};
 use wyrmroot_registry_proto::{
-    EnumerationScope, Header as RegistryHeader, InstallClient, MessageType as RegistryMessageType,
-    ProtocolVersion, encode_install_client, encode_install_publication,
+    EnumerationScope, HEADER_BYTES as REGISTRY_HEADER_BYTES, Header as RegistryHeader,
+    InstallClient, MAX_SERVICE_LIST_PAGES, Message as RegistryMessage,
+    MessageType as RegistryMessageType, ProtocolVersion, SERVICE_LIST_PREFIX_BYTES,
+    SERVICE_LIST_RECORD_BYTES, encode_empty as encode_registry_empty, encode_install_client,
+    encode_install_publication, parse as parse_registry_message,
 };
 use wyrmroot_wyr1b_gate_proto::{
     Direction, ECHO_PROTOCOL_ID, ECHO_SERVICE_NAME, ECHO_VERSION_MAJOR, ECHO_VERSION_MINOR,
@@ -45,6 +51,127 @@ const INSTALL_CLIENT_TRANSACTION: u64 = 3;
 const CONTROLLER_CHANNEL_RIGHTS: DwRights = DwRights(
     DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_WAIT.0 | DW_RIGHT_INSPECT.0 | DW_RIGHT_TRANSFER.0,
 );
+const WYRMSH_REGISTRY_DEADLINE_NS: u64 = 1_000_000_000;
+#[allow(
+    dead_code,
+    reason = "used by the E3C controller feature and host matrix"
+)]
+const WYRMSH_FIRST_INSTALL_TRANSACTION: u64 = 0xE300_0001;
+
+#[allow(
+    dead_code,
+    reason = "used by the E3C controller feature and host matrix"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ShellRegistryHealth {
+    Healthy { generation: u64 },
+    Poisoned { generation: u64 },
+    Exhausted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ShellControllerState {
+    health: ShellRegistryHealth,
+    next_install_transaction: u64,
+    replacement_attempts: u16,
+    last_console_generation: u64,
+    last_status_generation: u64,
+    last_child_generation: u64,
+}
+
+#[allow(
+    dead_code,
+    reason = "used by the E3C controller feature and host matrix"
+)]
+impl ShellControllerState {
+    pub(crate) fn new(registry_generation: u64) -> Result<Self, InitError> {
+        if registry_generation == 0 {
+            return Err(InitError::Accounting);
+        }
+        Ok(Self {
+            health: ShellRegistryHealth::Healthy {
+                generation: registry_generation,
+            },
+            next_install_transaction: WYRMSH_FIRST_INSTALL_TRANSACTION,
+            replacement_attempts: 0,
+            last_console_generation: 0,
+            last_status_generation: 0,
+            last_child_generation: 0,
+        })
+    }
+
+    pub(crate) const fn health(&self) -> ShellRegistryHealth {
+        self.health
+    }
+
+    fn reserve_install_transaction(&mut self, generation: u64) -> Result<u64, InitError> {
+        if self.health != (ShellRegistryHealth::Healthy { generation }) {
+            return Err(InitError::Cleanup);
+        }
+        let transaction = self.next_install_transaction;
+        self.next_install_transaction = transaction.checked_add(1).ok_or(InitError::Accounting)?;
+        Ok(transaction)
+    }
+
+    fn reserve_shell_generation(
+        &mut self,
+        request: wyrmroot_launch_proto::ShellV1Request,
+    ) -> Result<(), InitError> {
+        if self.last_console_generation != 0
+            && (request.console_generation < self.last_console_generation
+                || request.status_generation <= self.last_status_generation
+                || request.requested_child_generation <= self.last_child_generation)
+        {
+            return Err(InitError::Wyr1BModel(JobError::StaleGeneration));
+        }
+        self.last_console_generation = request.console_generation;
+        self.last_status_generation = request.status_generation;
+        self.last_child_generation = request.requested_child_generation;
+        Ok(())
+    }
+
+    fn poison(&mut self, generation: u64) {
+        if self.health == (ShellRegistryHealth::Healthy { generation }) {
+            self.health = ShellRegistryHealth::Poisoned { generation };
+        }
+    }
+
+    pub(crate) fn install_replacement(
+        &mut self,
+        topology: &mut RegistryTopology,
+        generation: u64,
+    ) -> Result<(), InitError> {
+        let ShellRegistryHealth::Poisoned {
+            generation: previous,
+        } = self.health
+        else {
+            return Err(InitError::WrongActivationOrder);
+        };
+        if generation <= previous {
+            return Err(InitError::Accounting);
+        }
+        self.replacement_attempts = self
+            .replacement_attempts
+            .checked_add(1)
+            .ok_or(InitError::Accounting)?;
+        if self.replacement_attempts > u16::from(WYR0_I_SUPERVISION_POLICY.max_attempts) {
+            self.health = ShellRegistryHealth::Exhausted;
+            return Err(InitError::Cleanup);
+        }
+        topology
+            .restart(generation)
+            .map_err(InitError::Wyr1BModel)?;
+        self.health = ShellRegistryHealth::Healthy { generation };
+        self.next_install_transaction = WYRMSH_FIRST_INSTALL_TRANSACTION;
+        Ok(())
+    }
+}
+
+pub(crate) struct ShellLaunchContext<'a> {
+    pub(crate) registry_control: DwHandle,
+    pub(crate) topology: &'a mut RegistryTopology,
+    pub(crate) state: &'a mut ShellControllerState,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct InstalledPeer {
@@ -622,6 +749,147 @@ pub(crate) fn install_client<S: Wyr1BPlatform>(
     )
     .map_err(InitError::RegistryProtocol)?;
     move_endpoint(system, control, &bytes[..size], registry_endpoint)
+}
+
+fn install_wyrmsh_registry_client<S: Wyr1BPlatform>(
+    system: &mut S,
+    control: DwHandle,
+    grant: EndpointGrant,
+    registry_endpoint: DwHandle,
+    client_id: u64,
+    transaction_id: u64,
+) -> Result<(), InitError> {
+    let mut bytes = [0_u8; 104];
+    let size = encode_install_client(
+        RegistryHeader {
+            message_type: RegistryMessageType::InstallClient,
+            registry_generation: grant.registry_generation,
+            endpoint_id: 0,
+            endpoint_generation: 0,
+            transaction_id,
+        },
+        InstallClient {
+            endpoint_id: grant.endpoint_id,
+            endpoint_generation: grant.endpoint_generation,
+            client_id,
+            client_generation: grant.role_generation,
+            scope: EnumerationScope::BootstrapMetadata,
+        },
+        &mut bytes,
+    )
+    .map_err(InitError::RegistryProtocol)?;
+    move_endpoint(system, control, &bytes[..size], registry_endpoint)
+}
+
+fn preflight_wyrmsh_registry<S: Wyr1BPlatform>(
+    system: &mut S,
+    client: DwHandle,
+    grant: EndpointGrant,
+) -> Result<(), InitError> {
+    let header = RegistryHeader {
+        message_type: RegistryMessageType::Enumerate,
+        registry_generation: grant.registry_generation,
+        endpoint_id: grant.endpoint_id,
+        endpoint_generation: grant.endpoint_generation,
+        transaction_id: 1,
+    };
+    let mut request = [0_u8; REGISTRY_HEADER_BYTES];
+    let request_size =
+        encode_registry_empty(header, &mut request).map_err(InitError::RegistryProtocol)?;
+    system
+        .send_channel(client, &request[..request_size])
+        .map_err(InitError::Native)?;
+    let deadline = DwDeadline(
+        system
+            .now()
+            .map_err(InitError::Native)?
+            .checked_add(WYRMSH_REGISTRY_DEADLINE_NS)
+            .ok_or(InitError::Accounting)?,
+    );
+    let mut expected_page = 0_u16;
+    let mut expected_page_count = None;
+    let mut expected_total = None;
+    let mut observed_total = 0_u16;
+    let mut previous_name = [0_u8; wyrmroot_registry_proto::MAX_SERVICE_NAME_BYTES];
+    let mut previous_name_len = 0_usize;
+    loop {
+        let observed = system
+            .wait_many(
+                core::slice::from_ref(&DwWaitItemV1 {
+                    handle: client,
+                    signals: deepwyrm_syscall::DwSignals(
+                        DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0,
+                    ),
+                }),
+                deadline,
+            )
+            .map_err(InitError::Native)?;
+        if observed.index != 0
+            || observed.observed.0 & DW_SIGNAL_READABLE.0 == 0
+            || observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0
+        {
+            return Err(InitError::Supervision);
+        }
+        let mut bytes = [0_u8;
+            SERVICE_LIST_PREFIX_BYTES
+                + wyrmroot_registry_proto::MAX_SERVICE_LIST_RECORDS * SERVICE_LIST_RECORD_BYTES];
+        let mut handles = [DwReceivedHandleInfoV1::default(); 1];
+        let counts = system
+            .receive_channel(client, &mut bytes, &mut handles)
+            .map_err(InitError::Native)?;
+        if counts.bytes > bytes.len() || counts.handles != 0 {
+            if counts.handles != 0 && handles[0].handle.0 != 0 {
+                system
+                    .close_handle(handles[0].handle)
+                    .map_err(|_| InitError::Cleanup)?;
+            }
+            return Err(InitError::RegistryProtocol(
+                wyrmroot_registry_proto::Error::WrongHandleCount,
+            ));
+        }
+        let parsed = parse_registry_message(&bytes[..counts.bytes], counts.handles)
+            .map_err(InitError::RegistryProtocol)?;
+        if parsed.header.registry_generation != grant.registry_generation
+            || parsed.header.endpoint_id != grant.endpoint_id
+            || parsed.header.endpoint_generation != grant.endpoint_generation
+            || parsed.header.transaction_id != 1
+        {
+            return Err(InitError::ResourceIdentityMismatch);
+        }
+        let RegistryMessage::ServiceList(page) = parsed.message else {
+            return Err(InitError::WrongManifestProfile);
+        };
+        if page.page_index != expected_page
+            || expected_page_count.is_some_and(|count| count != page.page_count)
+            || expected_total.is_some_and(|count| count != page.total_count)
+        {
+            return Err(InitError::WrongManifestProfile);
+        }
+        expected_page_count = Some(page.page_count);
+        expected_total = Some(page.total_count);
+        for index in 0..usize::from(page.record_count) {
+            let record = page.record(index).ok_or(InitError::WrongManifestProfile)?;
+            if previous_name_len != 0 && previous_name[..previous_name_len] >= *record.service_name
+            {
+                return Err(InitError::WrongManifestProfile);
+            }
+            previous_name[..record.service_name.len()].copy_from_slice(record.service_name);
+            previous_name_len = record.service_name.len();
+        }
+        observed_total = observed_total
+            .checked_add(page.record_count)
+            .ok_or(InitError::Accounting)?;
+        expected_page = expected_page.checked_add(1).ok_or(InitError::Accounting)?;
+        if expected_page == page.page_count {
+            if observed_total != page.total_count {
+                return Err(InitError::WrongManifestProfile);
+            }
+            return Ok(());
+        }
+        if usize::from(expected_page) >= MAX_SERVICE_LIST_PAGES {
+            return Err(InitError::WrongManifestProfile);
+        }
+    }
 }
 
 fn move_endpoint<S: Wyr1BPlatform>(
@@ -2250,6 +2518,14 @@ const fn launch_error_code(error: &InitError) -> LaunchErrorCode {
     }
 }
 
+const fn shell_launch_error_code(error: &InitError) -> LaunchErrorCode {
+    match error {
+        InitError::Wyr1BModel(error) => job_error_code(*error),
+        InitError::Cleanup | InitError::Accounting => LaunchErrorCode::CleanupFailure,
+        _ => LaunchErrorCode::LoaderFailure,
+    }
+}
+
 fn send_job_error<S: InitPlatform>(
     system: &mut S,
     session: DwHandle,
@@ -2448,6 +2724,342 @@ enum JobWireVersion {
     ShellV1,
 }
 
+fn close_shell_session_for_job<S: InitPlatform>(
+    system: &mut S,
+    jobs: &mut JobDispatcher,
+    job_id: u64,
+) -> Result<(), InitError> {
+    let Some(grant) = jobs.shell_session_for_outer_job(job_id) else {
+        return Ok(());
+    };
+    let disconnected = jobs
+        .disconnect_owned_session(grant)
+        .map_err(InitError::Wyr1BModel)?;
+    if disconnected.owner.is_some()
+        || disconnected.outer_job != Some(job_id)
+        || system.close_handle(disconnected.channel).is_err()
+    {
+        return Err(InitError::Cleanup);
+    }
+    Ok(())
+}
+
+fn cleanup_shell_before_publication<S, W>(
+    system: &mut S,
+    waits: &mut W,
+    jobs: &mut JobDispatcher,
+    loaded: crate::wyr1b::LoadedJob,
+) -> Result<(), InitError>
+where
+    S: Wyr1BPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let cleanup = force_cleanup_job(system, waits, jobs, loaded);
+    let session_cleanup = close_shell_session_for_job(system, jobs, loaded.job_id);
+    if cleanup.is_err() || session_cleanup.is_err() {
+        Err(InitError::Cleanup)
+    } else {
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accept_reserved_shell<S, L, W>(
+    system: &mut S,
+    loader: &mut L,
+    waits: &mut W,
+    authority: LoadAuthority,
+    policy: &PolicyView<'_>,
+    jobs: &mut JobDispatcher,
+    reservation: LaunchReservation,
+    request_ticket: RequestTicket,
+    request: wyrmroot_launch_proto::ShellV1Request,
+    received: &[DwReceivedHandleInfoV1],
+    context: &mut ShellLaunchContext<'_>,
+) -> Result<crate::wyr1b::LoadedJob, InitError>
+where
+    S: Wyr1BPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    if jobs.has_shell_session() {
+        let failed = close_received_reverse(system, received, received.len());
+        return Err(if failed {
+            InitError::Cleanup
+        } else {
+            InitError::Wyr1BModel(JobError::Capacity)
+        });
+    }
+    let image = match policy.authorize_wyrmsh() {
+        Ok(image) => image,
+        Err(error) => {
+            let failed = close_received_reverse(system, received, received.len());
+            return Err(if failed {
+                InitError::Cleanup
+            } else {
+                InitError::Wyr1BModel(error)
+            });
+        }
+    };
+    let ticket = match jobs.jobs.begin_reserved_launch(request_ticket) {
+        Ok(ticket) => ticket,
+        Err(error) => {
+            let failed = close_received_reverse(system, received, received.len());
+            return Err(if failed {
+                InitError::Cleanup
+            } else {
+                InitError::Wyr1BModel(error)
+            });
+        }
+    };
+    if let Err(error) = context.state.reserve_shell_generation(request) {
+        let failed = close_received_reverse(system, received, received.len())
+            | jobs.jobs.abort_launch(ticket).is_err();
+        return Err(if failed { InitError::Cleanup } else { error });
+    }
+    let group = match system.create_attempt_task_group(authority.task_group) {
+        Ok(group) => group,
+        Err(error) => {
+            let failed = close_received_reverse(system, received, received.len())
+                | jobs.jobs.abort_launch(ticket).is_err();
+            return Err(if failed {
+                InitError::Cleanup
+            } else {
+                InitError::Native(error)
+            });
+        }
+    };
+    let install_transaction = match context
+        .state
+        .reserve_install_transaction(context.topology.generation())
+    {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            let failed = close_received_reverse(system, received, received.len())
+                | system.close_handle(group).is_err()
+                | jobs.jobs.abort_launch(ticket).is_err();
+            return Err(if failed { InitError::Cleanup } else { error });
+        }
+    };
+    let registry_grant = match context.topology.issue(
+        request.requested_child_generation,
+        EndpointKind::RegistryClient,
+    ) {
+        Ok(grant) => grant,
+        Err(error) => {
+            let failed = close_received_reverse(system, received, received.len())
+                | system.close_handle(group).is_err()
+                | jobs.jobs.abort_launch(ticket).is_err();
+            return Err(if failed {
+                InitError::Cleanup
+            } else {
+                InitError::Wyr1BModel(error)
+            });
+        }
+    };
+    let (registry_server, registry_client) = match create_controller_channel_pair(system) {
+        Ok(pair) => pair,
+        Err(error) => {
+            let failed = close_received_reverse(system, received, received.len())
+                | system.close_handle(group).is_err()
+                | jobs.jobs.abort_launch(ticket).is_err();
+            return Err(if failed { InitError::Cleanup } else { error });
+        }
+    };
+    if let Err(error) = install_wyrmsh_registry_client(
+        system,
+        context.registry_control,
+        registry_grant,
+        registry_server,
+        request.requested_child_generation,
+        install_transaction,
+    ) {
+        let failed = close_received_reverse(system, received, received.len())
+            | system.close_handle(registry_server).is_err()
+            | system.close_handle(registry_client).is_err()
+            | system.close_handle(group).is_err()
+            | jobs.jobs.abort_launch(ticket).is_err();
+        return Err(if failed { InitError::Cleanup } else { error });
+    }
+    let fail_after_install = |system: &mut S,
+                              jobs: &mut JobDispatcher,
+                              context: &mut ShellLaunchContext<'_>,
+                              original: InitError,
+                              close_client: bool|
+     -> InitError {
+        context.state.poison(registry_grant.registry_generation);
+        let failed = close_received_reverse(system, received, received.len())
+            | (close_client && system.close_handle(registry_client).is_err())
+            | system.close_handle(group).is_err()
+            | jobs.jobs.abort_launch(ticket).is_err();
+        if failed { InitError::Cleanup } else { original }
+    };
+    if let Err(error) = preflight_wyrmsh_registry(system, registry_client, registry_grant) {
+        return Err(fail_after_install(system, jobs, context, error, true));
+    }
+    let shell_grant = match context.topology.issue(
+        request.requested_child_generation,
+        EndpointKind::LaunchSession,
+    ) {
+        Ok(grant) => grant,
+        Err(error) => {
+            return Err(fail_after_install(
+                system,
+                jobs,
+                context,
+                InitError::Wyr1BModel(error),
+                true,
+            ));
+        }
+    };
+    let (shell_controller, shell_child) = match create_controller_channel_pair(system) {
+        Ok(pair) => pair,
+        Err(error) => {
+            return Err(fail_after_install(system, jobs, context, error, true));
+        }
+    };
+    if let Err(error) = jobs.install_scoped_session(
+        shell_grant,
+        shell_controller,
+        crate::wyr1b_job::LaunchSessionScope::ShellJobs,
+    ) {
+        let failed = system.close_handle(shell_controller).is_err()
+            | system.close_handle(shell_child).is_err();
+        return Err(fail_after_install(
+            system,
+            jobs,
+            context,
+            if failed {
+                InitError::Cleanup
+            } else {
+                InitError::Wyr1BModel(error)
+            },
+            true,
+        ));
+    }
+    let loaded = match load_wyrmsh_process(
+        loader,
+        LoadAuthority {
+            task_group: group,
+            ..authority
+        },
+        WyrmshLoadRequest {
+            image,
+            stdin: received[0].handle,
+            stdout: received[1].handle,
+            stderr: received[2].handle,
+            console_status: received[3].handle,
+            registry_client,
+            launch_session: shell_child,
+            registry_generation: registry_grant.registry_generation,
+            registry_endpoint_id: registry_grant.endpoint_id,
+            registry_endpoint_generation: registry_grant.endpoint_generation,
+            launch_connection_id: shell_grant.endpoint_id,
+            launch_connection_generation: shell_grant.endpoint_generation,
+            console_generation: request.console_generation,
+            status_generation: request.status_generation,
+            child_generation: request.requested_child_generation,
+            outer_launch_transaction: reservation.transaction_id,
+            transaction_id: install_transaction,
+        },
+    ) {
+        Ok(loaded) => loaded,
+        Err(failure) => {
+            let disconnected = jobs.disconnect_session(shell_grant);
+            let mut failed =
+                disconnected.map_or(true, |channel| system.close_handle(channel).is_err());
+            if !failure.stdin_consumed {
+                failed |= close_received_reverse(system, received, received.len());
+                failed |= system.close_handle(registry_client).is_err();
+                failed |= system.close_handle(shell_child).is_err();
+            }
+            failed |= system.close_handle(group).is_err();
+            failed |= jobs.jobs.abort_launch(ticket).is_err();
+            context.state.poison(registry_grant.registry_generation);
+            return Err(if failed {
+                InitError::Cleanup
+            } else {
+                InitError::Loader(failure.error)
+            });
+        }
+    };
+    if let Err(error) =
+        jobs.jobs
+            .stage_launch(ticket, loaded.process.0, group.0, loaded.launch_channel.0)
+    {
+        let failed = cleanup_loaded(system, waits, loaded, group, true).is_err()
+            | jobs
+                .disconnect_session(shell_grant)
+                .map_or(true, |channel| system.close_handle(channel).is_err())
+            | jobs.jobs.abort_launch(ticket).is_err();
+        context.state.poison(registry_grant.registry_generation);
+        return Err(if failed {
+            InitError::Cleanup
+        } else {
+            InitError::Wyr1BModel(error)
+        });
+    }
+    let loaded_job = crate::wyr1b::LoadedJob {
+        job_id: ticket.job_id(),
+        loaded,
+        task_group: group.0,
+    };
+    if let Err(error) = jobs.attach_outer_job(shell_grant, loaded_job.job_id) {
+        let failed = force_cleanup_job(system, waits, jobs, loaded_job).is_err()
+            | jobs
+                .disconnect_session(shell_grant)
+                .map_or(true, |channel| system.close_handle(channel).is_err());
+        context.state.poison(registry_grant.registry_generation);
+        return Err(if failed {
+            InitError::Cleanup
+        } else {
+            InitError::Wyr1BModel(error)
+        });
+    }
+    let ready_deadline = match report_deadline(system) {
+        Ok(deadline) => deadline,
+        Err(error) => {
+            let failed = cleanup_shell_before_publication(system, waits, jobs, loaded_job).is_err();
+            context.state.poison(registry_grant.registry_generation);
+            return Err(if failed { InitError::Cleanup } else { error });
+        }
+    };
+    let exact_ready = await_child_ready_profile_observed(
+        waits,
+        loaded.process,
+        loaded.launch_channel,
+        LaunchProfile::Wyrmsh,
+        install_transaction,
+        ready_deadline,
+    )
+    .is_ok();
+    let running = waits
+        .query_task_termination(loaded.process)
+        .is_ok_and(|info| info.state == deepwyrm_syscall::DW_TASK_STATE_RUNNING);
+    if !exact_ready || !running {
+        let failed = cleanup_shell_before_publication(system, waits, jobs, loaded_job).is_err();
+        context.state.poison(registry_grant.registry_generation);
+        return Err(if failed {
+            InitError::Cleanup
+        } else {
+            InitError::Supervision
+        });
+    }
+    if let Err(error) =
+        jobs.jobs
+            .commit_launch(ticket, loaded.process.0, group.0, loaded.launch_channel.0)
+    {
+        let failed = cleanup_shell_before_publication(system, waits, jobs, loaded_job).is_err();
+        context.state.poison(registry_grant.registry_generation);
+        return Err(if failed {
+            InitError::Cleanup
+        } else {
+            InitError::Wyr1BModel(error)
+        });
+    }
+    Ok(loaded_job)
+}
+
 fn send_versioned_job_error<S: InitPlatform>(
     system: &mut S,
     session: DwHandle,
@@ -2471,6 +3083,62 @@ fn dispatch_one_job_request<S, L, W>(
     jobs: &mut JobDispatcher,
     session: DwHandle,
     grant: EndpointGrant,
+) -> Result<JobDispatchOutcome, InitError>
+where
+    S: Wyr1BPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    dispatch_one_job_request_inner(
+        system, loader, waits, authority, policy, jobs, session, grant, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(
+    dead_code,
+    reason = "E6 wires this E3C adapter into the selected resident product"
+)]
+fn dispatch_one_job_request_with_shell<S, L, W>(
+    system: &mut S,
+    loader: &mut L,
+    waits: &mut W,
+    authority: LoadAuthority,
+    policy: Option<&PolicyView<'_>>,
+    jobs: &mut JobDispatcher,
+    session: DwHandle,
+    grant: EndpointGrant,
+    shell: &mut ShellLaunchContext<'_>,
+) -> Result<JobDispatchOutcome, InitError>
+where
+    S: Wyr1BPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    dispatch_one_job_request_inner(
+        system,
+        loader,
+        waits,
+        authority,
+        policy,
+        jobs,
+        session,
+        grant,
+        Some(shell),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_one_job_request_inner<S, L, W>(
+    system: &mut S,
+    loader: &mut L,
+    waits: &mut W,
+    authority: LoadAuthority,
+    policy: Option<&PolicyView<'_>>,
+    jobs: &mut JobDispatcher,
+    session: DwHandle,
+    grant: EndpointGrant,
+    shell: Option<&mut ShellLaunchContext<'_>>,
 ) -> Result<JobDispatchOutcome, InitError>
 where
     S: Wyr1BPlatform,
@@ -2545,19 +3213,22 @@ where
         }
     };
     if version == JobWireVersion::ShellV1 {
-        if parse_shell_v1_request(&bytes[..counts.bytes], counts.handles).is_err() {
-            let failed = close_received_reverse(system, &received, counts.handles);
-            if failed {
-                return Err(InitError::Cleanup);
+        let parsed_shell = match parse_shell_v1_request(&bytes[..counts.bytes], counts.handles) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                let failed = close_received_reverse(system, &received, counts.handles);
+                if failed {
+                    return Err(InitError::Cleanup);
+                }
+                send_shell_v1_error(
+                    system,
+                    session,
+                    reservation,
+                    LaunchErrorCode::MalformedRequest,
+                )?;
+                return Ok(JobDispatchOutcome::Responded);
             }
-            send_shell_v1_error(
-                system,
-                session,
-                reservation,
-                LaunchErrorCode::MalformedRequest,
-            )?;
-            return Ok(JobDispatchOutcome::Responded);
-        }
+        };
         if !scope.admits_shell_v1() {
             if close_received_reverse(system, &received, counts.handles) {
                 return Err(InitError::Cleanup);
@@ -2579,14 +3250,74 @@ where
                 return Ok(JobDispatchOutcome::Responded);
             }
         }
-        if close_received_reverse(system, &received, counts.handles) {
+        let (Some(policy), Some(shell)) = (policy, shell) else {
+            if close_received_reverse(system, &received, counts.handles) {
+                return Err(InitError::Cleanup);
+            }
+            send_shell_v1_error(system, session, reservation, LaunchErrorCode::LoaderFailure)?;
+            return Ok(JobDispatchOutcome::Responded);
+        };
+        let loaded = match accept_reserved_shell(
+            system,
+            loader,
+            waits,
+            authority,
+            policy,
+            jobs,
+            reservation,
+            request_ticket,
+            parsed_shell.request,
+            &received[..counts.handles],
+            shell,
+        ) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                let response = send_shell_v1_error(
+                    system,
+                    session,
+                    reservation,
+                    shell_launch_error_code(&error),
+                );
+                return if error == InitError::Cleanup {
+                    Err(error)
+                } else {
+                    response?;
+                    Ok(JobDispatchOutcome::Responded)
+                };
+            }
+        };
+        let release = jobs
+            .jobs
+            .release_launch_channel(loaded.job_id, loaded.loaded.launch_channel.0)
+            .map_err(InitError::Wyr1BModel)?;
+        let mut response = [0_u8; wyrmroot_launch_proto::SHELL_V1_REPLY_BYTES];
+        let response_size = encode_shell_v1_accepted(reservation, loaded.job_id, &mut response)
+            .map_err(|_| InitError::Accounting)?;
+        if let Err(error) = system.send_channel(session, &response[..response_size]) {
+            jobs.jobs.restore_launch_channel(release);
+            shell.state.poison(shell.topology.generation());
+            return Err(
+                if cleanup_shell_before_publication(system, waits, jobs, loaded).is_err() {
+                    InitError::Cleanup
+                } else {
+                    InitError::Native(error)
+                },
+            );
+        }
+        if system.close_handle(loaded.loaded.launch_channel).is_err() {
+            jobs.jobs.restore_launch_channel(release);
+            jobs.jobs
+                .record_cleanup_bits(loaded.job_id, 1 << 2)
+                .map_err(InitError::Wyr1BModel)?;
+            shell.state.poison(shell.topology.generation());
+            let _ = cleanup_shell_before_publication(system, waits, jobs, loaded);
             return Err(InitError::Cleanup);
         }
-        // E3A proves the actual codec, replay, scope, and MOVE-cleanup seam.
-        // E3C must verify the immutable policy/content identity and construct
-        // the child before this branch may ever emit LAUNCH_ACCEPTED.
-        send_shell_v1_error(system, session, reservation, LaunchErrorCode::LoaderFailure)?;
-        return Ok(JobDispatchOutcome::Responded);
+        return Ok(JobDispatchOutcome::Launched(
+            jobs.jobs
+                .loaded_job(loaded.job_id)
+                .map_err(InitError::Wyr1BModel)?,
+        ));
     }
     let parsed = match parse_launch_message(&bytes[..counts.bytes], counts.handles) {
         Ok(parsed) => parsed,
@@ -2688,6 +3419,46 @@ where
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
+    poll_job_dispatcher_inner(system, loader, waits, authority, jobs, now_ns, None)
+}
+
+/// E3C adapter for the selected console controller. The caller supplies the
+/// current registry generation and poison state; request bytes cannot select
+/// either authority.
+#[cfg(feature = "wyr1e-shell-controller")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn poll_job_dispatcher_with_shell<S, L, W>(
+    system: &mut S,
+    loader: &mut L,
+    waits: &mut W,
+    authority: LoadAuthority,
+    jobs: &mut JobDispatcher,
+    now_ns: u64,
+    shell: &mut ShellLaunchContext<'_>,
+) -> Result<(), InitError>
+where
+    S: Wyr1BPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    poll_job_dispatcher_inner(system, loader, waits, authority, jobs, now_ns, Some(shell))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn poll_job_dispatcher_inner<S, L, W>(
+    system: &mut S,
+    loader: &mut L,
+    waits: &mut W,
+    authority: LoadAuthority,
+    jobs: &mut JobDispatcher,
+    now_ns: u64,
+    shell: Option<&mut ShellLaunchContext<'_>>,
+) -> Result<(), InitError>
+where
+    S: Wyr1BPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+{
     if let Some((grant, session)) = jobs.next_session() {
         let item = DwWaitItemV1 {
             handle: session,
@@ -2721,16 +3492,30 @@ where
                                 .map_err(|_| InitError::Accounting)?;
                             let policy = PolicyView::from_bootfs(archive, boot_generation)
                                 .map_err(InitError::Wyr1BModel)?;
-                            dispatch_one_job_request(
-                                system,
-                                loader,
-                                waits,
-                                authority,
-                                Some(&policy),
-                                jobs,
-                                session,
-                                grant,
-                            )
+                            if let Some(shell) = shell {
+                                dispatch_one_job_request_with_shell(
+                                    system,
+                                    loader,
+                                    waits,
+                                    authority,
+                                    Some(&policy),
+                                    jobs,
+                                    session,
+                                    grant,
+                                    shell,
+                                )
+                            } else {
+                                dispatch_one_job_request(
+                                    system,
+                                    loader,
+                                    waits,
+                                    authority,
+                                    Some(&policy),
+                                    jobs,
+                                    session,
+                                    grant,
+                                )
+                            }
                         },
                     )
                     .map_err(InitError::Native)?;
@@ -2747,12 +3532,29 @@ where
                 }
             }
             Ok(observed) if observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 => {
+                let scope = jobs.session_scope(grant).map_err(InitError::Wyr1BModel)?;
+                let outer = if scope == crate::wyr1b_job::LaunchSessionScope::ConsoleLauncher {
+                    jobs.jobs
+                        .loaded_job_for_owner(grant.endpoint_id, grant.endpoint_generation)
+                        .map_err(InitError::Wyr1BModel)?
+                } else {
+                    None
+                };
                 let disconnected = jobs
                     .disconnect_owned_session(grant)
                     .map_err(InitError::Wyr1BModel)?;
-                if system.close_handle(disconnected.channel).is_err()
+                let mut failed = system.close_handle(disconnected.channel).is_err()
                     | cleanup_session_owner(system, waits, disconnected.owner, true)
-                {
+                    | disconnected.outer_job.is_some_and(|job_id| {
+                        let loaded = jobs.jobs.loaded_job(job_id);
+                        loaded.map_or(true, |loaded| {
+                            force_cleanup_job(system, waits, jobs, loaded).is_err()
+                        })
+                    });
+                if let Some(outer) = outer {
+                    failed |= cleanup_shell_before_publication(system, waits, jobs, outer).is_err();
+                }
+                if failed {
                     return Err(InitError::Cleanup);
                 }
             }
@@ -2782,7 +3584,8 @@ where
         };
         if exited {
             let result = reap_job(system, waits, jobs, loaded)?;
-            if result.cleanup_result != 0 {
+            let nested = close_shell_session_for_job(system, jobs, loaded.job_id);
+            if result.cleanup_result != 0 || nested.is_err() {
                 return Err(InitError::Cleanup);
             }
         }
@@ -3810,10 +4613,14 @@ mod tests {
     use deepwyrm_syscall::{DwMemoryProtection, DwStatus, DwWaitResultV1};
     use wyrmroot_bootfs::builder::{Builder as BootfsBuilder, FileMode};
     use wyrmroot_bootfs::launch_policy::{
-        LAUNCH_POLICY_PATH, LaunchPolicyEntry, encode as encode_launch_policy,
+        LAUNCH_POLICY_PATH, LaunchPolicyEntry, WYRMSH_PATH, WYRMSH_PROFILE_ID,
+        encode as encode_launch_policy, encode_wyrmsh as encode_wyrmsh_policy,
     };
     use wyrmroot_loader::process::{ParentMapping, ProcessCreateRequest, ProcessCreateResult};
-    use wyrmroot_registry_proto::{Message, parse};
+    use wyrmroot_registry_proto::{
+        Message, ProtocolVersion as RegistryProtocolVersion, ServiceListRecord,
+        encode_service_list, parse,
+    };
 
     const FAILURE: NativeError = NativeError::Status(DwStatus(-1));
 
@@ -3841,6 +4648,250 @@ mod tests {
         inbound_handle_count: usize,
         bootfs: Option<Vec<u8>>,
         session_poll_readable: bool,
+    }
+
+    #[derive(Default)]
+    struct ShellPlatform {
+        inbound: Vec<(DwHandle, Vec<u8>, Vec<DwReceivedHandleInfoV1>)>,
+        inbound_cursor: usize,
+        sent: Vec<(DwHandle, Vec<u8>)>,
+        moved: Vec<(DwHandle, Vec<u8>, DwHandleTransferV1)>,
+        closed: Vec<DwHandle>,
+        next_channel: u64,
+        session_readable: bool,
+        session_peer_closed: bool,
+        fail_move: bool,
+        fail_send_on: Option<DwHandle>,
+    }
+
+    impl ShellPlatform {
+        fn new() -> Self {
+            Self {
+                next_channel: 100,
+                session_readable: true,
+                ..Self::default()
+            }
+        }
+
+        fn push(&mut self, channel: DwHandle, bytes: Vec<u8>, handles: &[DwHandle]) {
+            self.inbound.push((
+                channel,
+                bytes,
+                handles
+                    .iter()
+                    .copied()
+                    .map(|handle| DwReceivedHandleInfoV1 {
+                        handle,
+                        object_type: DW_OBJECT_TYPE_CHANNEL,
+                        rights: CONTROLLER_CHANNEL_RIGHTS,
+                        ..DwReceivedHandleInfoV1::default()
+                    })
+                    .collect(),
+            ));
+        }
+    }
+
+    impl InitPlatform for ShellPlatform {
+        fn query_capability_info(
+            &mut self,
+            _handle: DwHandle,
+        ) -> Result<CapabilityInfo<DwObjectType, DwRights>, NativeError> {
+            Ok(CapabilityInfo {
+                object_type: DW_OBJECT_TYPE_CHANNEL,
+                rights: CONTROLLER_CHANNEL_RIGHTS,
+            })
+        }
+
+        fn receive_channel(
+            &mut self,
+            channel: DwHandle,
+            bytes: &mut [u8],
+            handles: &mut [DwReceivedHandleInfoV1],
+        ) -> Result<ReceiveCounts, NativeError> {
+            let (expected_channel, source, source_handles) =
+                self.inbound.get(self.inbound_cursor).ok_or(FAILURE)?;
+            if *expected_channel != channel
+                || source.len() > bytes.len()
+                || source_handles.len() > handles.len()
+            {
+                return Err(FAILURE);
+            }
+            bytes[..source.len()].copy_from_slice(source);
+            handles[..source_handles.len()].copy_from_slice(source_handles);
+            self.inbound_cursor += 1;
+            Ok(ReceiveCounts {
+                bytes: source.len(),
+                handles: source_handles.len(),
+            })
+        }
+
+        fn query_memory_object_size(&mut self, _handle: DwHandle) -> Result<u64, NativeError> {
+            Err(FAILURE)
+        }
+
+        fn with_bootfs_bytes<R>(
+            &mut self,
+            _root: DwHandle,
+            _bootfs: DwHandle,
+            _plan: MappingPlan,
+            _use_bytes: impl for<'a> FnOnce(&mut Self, &'a [u8]) -> R,
+        ) -> Result<R, NativeError> {
+            Err(FAILURE)
+        }
+
+        fn send_channel(&mut self, channel: DwHandle, bytes: &[u8]) -> Result<(), NativeError> {
+            if self.fail_send_on == Some(channel) {
+                return Err(FAILURE);
+            }
+            self.sent.push((channel, bytes.to_vec()));
+            Ok(())
+        }
+
+        fn close_handle(&mut self, handle: DwHandle) -> Result<(), NativeError> {
+            self.closed.push(handle);
+            Ok(())
+        }
+
+        fn create_attempt_task_group(
+            &mut self,
+            _parent: DwHandle,
+        ) -> Result<DwHandle, NativeError> {
+            Ok(DwHandle(300))
+        }
+
+        fn terminate_task_group(&mut self, _task_group: DwHandle) -> Result<(), NativeError> {
+            Ok(())
+        }
+
+        fn now(&mut self) -> Result<u64, NativeError> {
+            Ok(10)
+        }
+
+        fn wait_until(&mut self, _deadline_ns: u64) -> Result<(), NativeError> {
+            Err(FAILURE)
+        }
+    }
+
+    impl Wyr1BPlatform for ShellPlatform {
+        fn channel_create(
+            &mut self,
+            rights: DwRights,
+        ) -> Result<(DwHandle, DwHandle), NativeError> {
+            assert_eq!(rights, CONTROLLER_CHANNEL_RIGHTS);
+            let first = DwHandle(self.next_channel);
+            let second = DwHandle(self.next_channel + 1);
+            self.next_channel += 2;
+            Ok((first, second))
+        }
+
+        fn send_channel_with_handles(
+            &mut self,
+            channel: DwHandle,
+            bytes: &[u8],
+            transfers: &[DwHandleTransferV1],
+        ) -> Result<(), NativeError> {
+            if transfers.len() != 1 {
+                return Err(FAILURE);
+            }
+            if self.fail_move {
+                return Err(FAILURE);
+            }
+            self.moved.push((channel, bytes.to_vec(), transfers[0]));
+            Ok(())
+        }
+
+        fn wait_many(
+            &mut self,
+            _items: &[DwWaitItemV1],
+            _deadline: DwDeadline,
+        ) -> Result<DwWaitResultV1, NativeError> {
+            if self.session_readable {
+                Ok(DwWaitResultV1 {
+                    index: 0,
+                    observed: DW_SIGNAL_READABLE,
+                    ..DwWaitResultV1::default()
+                })
+            } else if self.session_peer_closed {
+                Ok(DwWaitResultV1 {
+                    index: 0,
+                    observed: DW_SIGNAL_PEER_CLOSED,
+                    ..DwWaitResultV1::default()
+                })
+            } else {
+                Err(NativeError::Status(DW_STATUS_TIMED_OUT))
+            }
+        }
+
+        fn materialize_read_only_memory(
+            &mut self,
+            _root: DwHandle,
+            _bytes: &[u8],
+            _rights: DwRights,
+        ) -> Result<DwHandle, NativeError> {
+            Err(FAILURE)
+        }
+    }
+
+    struct ShellWaits {
+        transaction: u64,
+        exited: bool,
+        exit_after_running_check: bool,
+        query_count: usize,
+    }
+
+    impl SupervisionPlatform for ShellWaits {
+        type Error = NativeError;
+
+        fn wait_many(
+            &mut self,
+            _items: &[DwWaitItemV1],
+            _deadline: DwDeadline,
+        ) -> Result<DwWaitResultV1, Self::Error> {
+            Ok(DwWaitResultV1 {
+                index: 0,
+                observed: if self.exited {
+                    DW_SIGNAL_EXITED
+                } else {
+                    DW_SIGNAL_READABLE
+                },
+                ..DwWaitResultV1::default()
+            })
+        }
+
+        fn receive_channel(
+            &mut self,
+            _channel: DwHandle,
+            bytes: &mut [u8],
+            _handles: &mut [DwReceivedHandleInfoV1],
+        ) -> Result<ReceiveCounts, Self::Error> {
+            let size = wyrmroot_loader::launch::encode_ready_for_profile(
+                LaunchProfile::Wyrmsh,
+                self.transaction,
+                bytes,
+            )
+            .map_err(|_| FAILURE)?;
+            Ok(ReceiveCounts {
+                bytes: size,
+                handles: 0,
+            })
+        }
+
+        fn query_task_termination(
+            &mut self,
+            _process: DwHandle,
+        ) -> Result<DwTaskTerminationInfoV1, Self::Error> {
+            let exited = self.exited || (self.exit_after_running_check && self.query_count != 0);
+            self.query_count += 1;
+            Ok(DwTaskTerminationInfoV1 {
+                state: if exited {
+                    DW_TASK_STATE_EXITED
+                } else {
+                    deepwyrm_syscall::DW_TASK_STATE_RUNNING
+                },
+                reason: DW_TERMINATION_NORMAL_EXIT,
+                ..DwTaskTerminationInfoV1::default()
+            })
+        }
     }
 
     impl MockPlatform {
@@ -4117,6 +5168,73 @@ mod tests {
             .add(MANIFEST_PATH.as_bytes(), &manifest, FileMode::ReadOnly)
             .unwrap();
         (builder.build().unwrap(), generation)
+    }
+
+    fn wyrmsh_policy_bootfs(image: &[u8]) -> (Vec<u8>, [u8; 32]) {
+        let generation = [0x45; 32];
+        let entry = LaunchPolicyEntry {
+            path: WYRMSH_PATH,
+            content_sha256: wyrmroot_runtime::sha256::digest(image),
+            startup_abi: 2,
+            profile_id: WYRMSH_PROFILE_ID,
+            allow_no_streams: false,
+            allow_three_streams: true,
+        };
+        let mut policy = [0_u8; 512];
+        let policy_size = encode_wyrmsh_policy(generation, &[entry], &mut policy).unwrap();
+        let mut builder = BootfsBuilder::new();
+        builder
+            .add(WYRMSH_PATH.as_bytes(), image, FileMode::Executable)
+            .unwrap();
+        builder
+            .add(
+                LAUNCH_POLICY_PATH.as_bytes(),
+                &policy[..policy_size],
+                FileMode::ReadOnly,
+            )
+            .unwrap();
+        (builder.build().unwrap(), generation)
+    }
+
+    fn shell_request(
+        reservation: LaunchReservation,
+        child_generation: u64,
+    ) -> (Vec<u8>, [DwHandle; 4]) {
+        let mut bytes = [0_u8; wyrmroot_launch_proto::SHELL_V1_REQUEST_BYTES];
+        let size = wyrmroot_launch_proto::encode_shell_v1_request(
+            reservation,
+            wyrmroot_launch_proto::ShellV1Request {
+                console_generation: 2,
+                status_generation: child_generation - 1,
+                requested_child_generation: child_generation,
+            },
+            &mut bytes,
+        )
+        .unwrap();
+        (
+            bytes[..size].to_vec(),
+            [DwHandle(500), DwHandle(501), DwHandle(502), DwHandle(503)],
+        )
+    }
+
+    fn empty_service_page(grant: EndpointGrant) -> Vec<u8> {
+        let mut bytes = [0_u8; SERVICE_LIST_PREFIX_BYTES];
+        let size = encode_service_list(
+            RegistryHeader {
+                message_type: RegistryMessageType::ServiceList,
+                registry_generation: grant.registry_generation,
+                endpoint_id: grant.endpoint_id,
+                endpoint_generation: grant.endpoint_generation,
+                transaction_id: 1,
+            },
+            0,
+            1,
+            0,
+            &[],
+            &mut bytes,
+        )
+        .unwrap();
+        bytes[..size].to_vec()
     }
 
     fn starting_registry(image: &[u8]) -> SystemInit {
@@ -5327,6 +6445,859 @@ mod tests {
             wyrmroot_launch_proto::ShellV1Reply::Error {
                 code: LaunchErrorCode::TransactionReplay,
             }
+        );
+    }
+
+    #[test]
+    fn e3c_shell_transaction_installs_preflights_loads_and_publishes() {
+        let image = executable();
+        let (bootfs, generation) = wyrmsh_policy_bootfs(&image);
+        let archive = Archive::new(&bootfs).unwrap();
+        let policy = PolicyView::from_bootfs(archive, generation).unwrap();
+        assert_eq!(
+            policy.authorize(WYRMSH_PATH, 3),
+            Err(JobError::PolicyMissing)
+        );
+        assert_eq!(policy.authorize_wyrmsh(), Ok(image.as_slice()));
+
+        let owner = grant(EndpointKind::LaunchSession, 1, 1);
+        let reservation = LaunchReservation {
+            connection_id: owner.endpoint_id,
+            generation: owner.endpoint_generation,
+            transaction_id: 11,
+        };
+        let (request, handles) = shell_request(reservation, 4);
+        let registry_grant = EndpointGrant {
+            registry_generation: 7,
+            endpoint_id: 1,
+            endpoint_generation: 1,
+            role_generation: 4,
+            kind: EndpointKind::RegistryClient,
+        };
+        let mut platform = ShellPlatform::new();
+        platform.push(DwHandle(90), request, &handles);
+        platform.push(DwHandle(101), empty_service_page(registry_grant), &[]);
+        let mut loader = InitSendLoader::new();
+        loader.fail_init = false;
+        let mut waits = ShellWaits {
+            transaction: WYRMSH_FIRST_INSTALL_TRANSACTION,
+            exited: false,
+            exit_after_running_check: false,
+            query_count: 0,
+        };
+        let mut jobs = JobDispatcher::new();
+        jobs.install_scoped_session(owner, DwHandle(90), LaunchSessionScope::ConsoleLauncher)
+            .unwrap();
+        let mut topology = RegistryTopology::new(7).unwrap();
+        let mut state = ShellControllerState::new(7).unwrap();
+        let mut context = ShellLaunchContext {
+            registry_control: DwHandle(70),
+            topology: &mut topology,
+            state: &mut state,
+        };
+
+        let outcome = dispatch_one_job_request_with_shell(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            LoadAuthority {
+                parent_root: DwHandle(1),
+                bootfs: DwHandle(2),
+                task_group: DwHandle(3),
+            },
+            Some(&policy),
+            &mut jobs,
+            DwHandle(90),
+            owner,
+            &mut context,
+        )
+        .unwrap();
+        let JobDispatchOutcome::Launched(loaded) = outcome else {
+            panic!("E3C shell must reach publication")
+        };
+        assert_eq!(loaded.job_id, 1);
+        assert_eq!(jobs.session_count(), 2);
+        assert_eq!(
+            state.health(),
+            ShellRegistryHealth::Healthy { generation: 7 }
+        );
+
+        assert_eq!(platform.moved.len(), 1);
+        let (control, install, transfer) = &platform.moved[0];
+        assert_eq!(*control, DwHandle(70));
+        assert_eq!(transfer.handle, DwHandle(100));
+        assert_eq!(transfer.operation, DW_HANDLE_TRANSFER_MOVE);
+        let installed = parse(install, 1).unwrap();
+        assert_eq!(
+            installed.header.transaction_id,
+            WYRMSH_FIRST_INSTALL_TRANSACTION
+        );
+        assert!(matches!(
+            installed.message,
+            RegistryMessage::InstallClient(InstallClient {
+                endpoint_id: 1,
+                endpoint_generation: 1,
+                client_id: 4,
+                client_generation: 4,
+                scope: EnumerationScope::BootstrapMetadata,
+            })
+        ));
+        let enumerate = platform
+            .sent
+            .iter()
+            .find(|(channel, _)| *channel == DwHandle(101))
+            .unwrap();
+        assert!(matches!(
+            parse(&enumerate.1, 0).unwrap().message,
+            RegistryMessage::Enumerate
+        ));
+        let accepted = platform
+            .sent
+            .iter()
+            .find(|(channel, _)| *channel == DwHandle(90))
+            .unwrap();
+        assert!(matches!(
+            wyrmroot_launch_proto::parse_shell_v1_reply(&accepted.1, 0)
+                .unwrap()
+                .reply,
+            wyrmroot_launch_proto::ShellV1Reply::LaunchAccepted { job_id: 1 }
+        ));
+
+        assert_eq!(loader.sent_transfers.len(), 6);
+        assert_eq!(
+            loader
+                .sent_transfers
+                .iter()
+                .map(|transfer| transfer.handle)
+                .collect::<Vec<_>>(),
+            [
+                DwHandle(500),
+                DwHandle(501),
+                DwHandle(502),
+                DwHandle(503),
+                DwHandle(101),
+                DwHandle(103),
+            ]
+        );
+        let received: Vec<_> = loader
+            .sent_transfers
+            .iter()
+            .map(|transfer| DwReceivedHandleInfoV1 {
+                handle: transfer.handle,
+                object_type: DW_OBJECT_TYPE_CHANNEL,
+                rights: transfer.requested_rights,
+                ..DwReceivedHandleInfoV1::default()
+            })
+            .collect();
+        let init =
+            wyrmroot_loader::launch::parse_wyrmsh_init(&loader.sent_init, &received).unwrap();
+        assert_eq!(init.registry_generation, 7);
+        assert_eq!(init.registry_endpoint_id, 1);
+        assert_eq!(init.launch_connection_id, 2);
+        assert_eq!(init.console_generation, 2);
+        assert_eq!(init.status_generation, 3);
+        assert_eq!(init.child_generation, 4);
+        assert_eq!(init.outer_launch_transaction, 11);
+        assert_eq!(init.transaction_id, WYRMSH_FIRST_INSTALL_TRANSACTION);
+
+        let first_shell = EndpointGrant {
+            registry_generation: 7,
+            endpoint_id: 2,
+            endpoint_generation: 1,
+            role_generation: 4,
+            kind: EndpointKind::LaunchSession,
+        };
+        let orphan_ticket = jobs
+            .jobs
+            .begin_launch(LaunchReservation {
+                connection_id: first_shell.endpoint_id,
+                generation: first_shell.endpoint_generation,
+                transaction_id: 2,
+            })
+            .unwrap();
+        jobs.jobs
+            .commit_launch(orphan_ticket, 801, 802, 803)
+            .unwrap();
+        platform.session_readable = false;
+        waits.exited = true;
+        poll_job_dispatcher(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            LoadAuthority {
+                parent_root: DwHandle(1),
+                bootfs: DwHandle(2),
+                task_group: DwHandle(3),
+            },
+            &mut jobs,
+            20,
+        )
+        .unwrap();
+        assert_eq!(jobs.session_count(), 1);
+        assert!(!jobs.has_shell_session());
+        assert_eq!(jobs.jobs.orphan_jobs(), 1);
+
+        let replacement_reservation = LaunchReservation {
+            transaction_id: 12,
+            ..reservation
+        };
+        let (replacement_request, replacement_handles) = shell_request(replacement_reservation, 5);
+        let replacement_registry = EndpointGrant {
+            registry_generation: 7,
+            endpoint_id: 3,
+            endpoint_generation: 1,
+            role_generation: 5,
+            kind: EndpointKind::RegistryClient,
+        };
+        platform.push(DwHandle(90), replacement_request, &replacement_handles);
+        platform.push(DwHandle(105), empty_service_page(replacement_registry), &[]);
+        platform.session_readable = true;
+        waits.transaction = WYRMSH_FIRST_INSTALL_TRANSACTION + 1;
+        waits.exited = false;
+        let mut replacement_context = ShellLaunchContext {
+            registry_control: DwHandle(70),
+            topology: &mut topology,
+            state: &mut state,
+        };
+        let replacement = dispatch_one_job_request_with_shell(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            LoadAuthority {
+                parent_root: DwHandle(1),
+                bootfs: DwHandle(2),
+                task_group: DwHandle(3),
+            },
+            Some(&policy),
+            &mut jobs,
+            DwHandle(90),
+            owner,
+            &mut replacement_context,
+        )
+        .unwrap();
+        assert!(matches!(replacement, JobDispatchOutcome::Launched(_)));
+        assert_eq!(jobs.session_count(), 2);
+        assert_eq!(jobs.jobs.orphan_jobs(), 1);
+        let replacement_init = wyrmroot_loader::launch::parse_wyrmsh_init(
+            &loader.sent_init,
+            &loader
+                .sent_transfers
+                .iter()
+                .map(|transfer| DwReceivedHandleInfoV1 {
+                    handle: transfer.handle,
+                    object_type: DW_OBJECT_TYPE_CHANNEL,
+                    rights: transfer.requested_rights,
+                    ..DwReceivedHandleInfoV1::default()
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(replacement_init.registry_endpoint_id, 3);
+        assert_eq!(replacement_init.launch_connection_id, 4);
+        assert_eq!(replacement_init.status_generation, 4);
+        assert_eq!(replacement_init.child_generation, 5);
+        assert_eq!(replacement_init.outer_launch_transaction, 12);
+        assert_eq!(
+            replacement_init.transaction_id,
+            WYRMSH_FIRST_INSTALL_TRANSACTION + 1
+        );
+    }
+
+    #[test]
+    fn e3c_post_install_preflight_failure_poison_is_finite_and_cleans_custody() {
+        let image = executable();
+        let (bootfs, generation) = wyrmsh_policy_bootfs(&image);
+        let policy = PolicyView::from_bootfs(Archive::new(&bootfs).unwrap(), generation).unwrap();
+        let owner = grant(EndpointKind::LaunchSession, 1, 1);
+        let reservation = LaunchReservation {
+            connection_id: owner.endpoint_id,
+            generation: owner.endpoint_generation,
+            transaction_id: 12,
+        };
+        let (request, handles) = shell_request(reservation, 4);
+        let stale = EndpointGrant {
+            registry_generation: 7,
+            endpoint_id: 9,
+            endpoint_generation: 1,
+            role_generation: 4,
+            kind: EndpointKind::RegistryClient,
+        };
+        let mut platform = ShellPlatform::new();
+        platform.push(DwHandle(90), request, &handles);
+        platform.push(DwHandle(101), empty_service_page(stale), &[]);
+        let mut loader = InitSendLoader::new();
+        let mut waits = ShellWaits {
+            transaction: WYRMSH_FIRST_INSTALL_TRANSACTION,
+            exited: false,
+            exit_after_running_check: false,
+            query_count: 0,
+        };
+        let mut jobs = JobDispatcher::new();
+        jobs.install_scoped_session(owner, DwHandle(90), LaunchSessionScope::ConsoleLauncher)
+            .unwrap();
+        let mut topology = RegistryTopology::new(7).unwrap();
+        let mut state = ShellControllerState::new(7).unwrap();
+        let mut context = ShellLaunchContext {
+            registry_control: DwHandle(70),
+            topology: &mut topology,
+            state: &mut state,
+        };
+        assert_eq!(
+            dispatch_one_job_request_with_shell(
+                &mut platform,
+                &mut loader,
+                &mut waits,
+                LoadAuthority {
+                    parent_root: DwHandle(1),
+                    bootfs: DwHandle(2),
+                    task_group: DwHandle(3),
+                },
+                Some(&policy),
+                &mut jobs,
+                DwHandle(90),
+                owner,
+                &mut context,
+            ),
+            Ok(JobDispatchOutcome::Responded)
+        );
+        assert_eq!(
+            state.health(),
+            ShellRegistryHealth::Poisoned { generation: 7 }
+        );
+        assert_eq!(jobs.session_count(), 1);
+        assert_eq!(jobs.jobs.live_jobs(), 0);
+        for handle in [
+            DwHandle(101),
+            DwHandle(503),
+            DwHandle(502),
+            DwHandle(501),
+            DwHandle(500),
+            DwHandle(300),
+        ] {
+            assert_eq!(
+                platform
+                    .closed
+                    .iter()
+                    .filter(|closed| **closed == handle)
+                    .count(),
+                1,
+                "handle {handle:?}"
+            );
+        }
+        assert!(!platform.closed.contains(&DwHandle(100)));
+        assert_eq!(
+            state.install_replacement(&mut topology, 7),
+            Err(InitError::Accounting)
+        );
+        state.install_replacement(&mut topology, 8).unwrap();
+        assert_eq!(
+            state.health(),
+            ShellRegistryHealth::Healthy { generation: 8 }
+        );
+        assert_eq!(topology.generation(), 8);
+    }
+
+    #[test]
+    fn e3c_registry_install_move_failure_is_precommit_and_keeps_registry_healthy() {
+        let image = executable();
+        let (bootfs, generation) = wyrmsh_policy_bootfs(&image);
+        let policy = PolicyView::from_bootfs(Archive::new(&bootfs).unwrap(), generation).unwrap();
+        let owner = grant(EndpointKind::LaunchSession, 1, 1);
+        let reservation = LaunchReservation {
+            connection_id: owner.endpoint_id,
+            generation: owner.endpoint_generation,
+            transaction_id: 13,
+        };
+        let (request, handles) = shell_request(reservation, 4);
+        let mut platform = ShellPlatform::new();
+        platform.fail_move = true;
+        platform.push(DwHandle(90), request, &handles);
+        let mut loader = InitSendLoader::new();
+        let mut waits = ShellWaits {
+            transaction: WYRMSH_FIRST_INSTALL_TRANSACTION,
+            exited: false,
+            exit_after_running_check: false,
+            query_count: 0,
+        };
+        let mut jobs = JobDispatcher::new();
+        jobs.install_scoped_session(owner, DwHandle(90), LaunchSessionScope::ConsoleLauncher)
+            .unwrap();
+        let mut topology = RegistryTopology::new(7).unwrap();
+        let mut state = ShellControllerState::new(7).unwrap();
+        let mut context = ShellLaunchContext {
+            registry_control: DwHandle(70),
+            topology: &mut topology,
+            state: &mut state,
+        };
+
+        assert_eq!(
+            dispatch_one_job_request_with_shell(
+                &mut platform,
+                &mut loader,
+                &mut waits,
+                LoadAuthority {
+                    parent_root: DwHandle(1),
+                    bootfs: DwHandle(2),
+                    task_group: DwHandle(3),
+                },
+                Some(&policy),
+                &mut jobs,
+                DwHandle(90),
+                owner,
+                &mut context,
+            ),
+            Ok(JobDispatchOutcome::Responded)
+        );
+        assert_eq!(
+            state.health(),
+            ShellRegistryHealth::Healthy { generation: 7 }
+        );
+        assert!(platform.moved.is_empty());
+        assert_eq!(jobs.jobs.live_jobs(), 0);
+        assert_eq!(jobs.session_count(), 1);
+        for handle in [
+            DwHandle(101),
+            DwHandle(100),
+            DwHandle(300),
+            DwHandle(503),
+            DwHandle(502),
+            DwHandle(501),
+            DwHandle(500),
+        ] {
+            assert_eq!(
+                platform
+                    .closed
+                    .iter()
+                    .filter(|closed| **closed == handle)
+                    .count(),
+                1,
+                "handle {handle:?}"
+            );
+        }
+        let reply = platform
+            .sent
+            .iter()
+            .find(|(channel, _)| *channel == DwHandle(90))
+            .unwrap();
+        assert_eq!(
+            wyrmroot_launch_proto::parse_shell_v1_reply(&reply.1, 0)
+                .unwrap()
+                .reply,
+            wyrmroot_launch_proto::ShellV1Reply::Error {
+                code: LaunchErrorCode::LoaderFailure,
+            }
+        );
+    }
+
+    #[test]
+    fn e3c_post_install_loader_failure_poison_cleans_unpublished_shell() {
+        let image = executable();
+        let (bootfs, generation) = wyrmsh_policy_bootfs(&image);
+        let policy = PolicyView::from_bootfs(Archive::new(&bootfs).unwrap(), generation).unwrap();
+        let owner = grant(EndpointKind::LaunchSession, 1, 1);
+        let reservation = LaunchReservation {
+            connection_id: owner.endpoint_id,
+            generation: owner.endpoint_generation,
+            transaction_id: 14,
+        };
+        let (request, handles) = shell_request(reservation, 4);
+        let registry_grant = EndpointGrant {
+            registry_generation: 7,
+            endpoint_id: 1,
+            endpoint_generation: 1,
+            role_generation: 4,
+            kind: EndpointKind::RegistryClient,
+        };
+        let mut platform = ShellPlatform::new();
+        platform.push(DwHandle(90), request, &handles);
+        platform.push(DwHandle(101), empty_service_page(registry_grant), &[]);
+        let mut loader = InitSendLoader::new();
+        let mut waits = ShellWaits {
+            transaction: WYRMSH_FIRST_INSTALL_TRANSACTION,
+            exited: false,
+            exit_after_running_check: false,
+            query_count: 0,
+        };
+        let mut jobs = JobDispatcher::new();
+        jobs.install_scoped_session(owner, DwHandle(90), LaunchSessionScope::ConsoleLauncher)
+            .unwrap();
+        let mut topology = RegistryTopology::new(7).unwrap();
+        let mut state = ShellControllerState::new(7).unwrap();
+        let mut context = ShellLaunchContext {
+            registry_control: DwHandle(70),
+            topology: &mut topology,
+            state: &mut state,
+        };
+
+        assert_eq!(
+            dispatch_one_job_request_with_shell(
+                &mut platform,
+                &mut loader,
+                &mut waits,
+                LoadAuthority {
+                    parent_root: DwHandle(1),
+                    bootfs: DwHandle(2),
+                    task_group: DwHandle(3),
+                },
+                Some(&policy),
+                &mut jobs,
+                DwHandle(90),
+                owner,
+                &mut context,
+            ),
+            Ok(JobDispatchOutcome::Responded)
+        );
+        assert_eq!(
+            state.health(),
+            ShellRegistryHealth::Poisoned { generation: 7 }
+        );
+        assert_eq!(jobs.jobs.live_jobs(), 0);
+        assert_eq!(jobs.session_count(), 1);
+        assert!(!jobs.has_shell_session());
+        let reply = platform
+            .sent
+            .iter()
+            .find(|(channel, _)| *channel == DwHandle(90))
+            .unwrap();
+        assert_eq!(
+            wyrmroot_launch_proto::parse_shell_v1_reply(&reply.1, 0)
+                .unwrap()
+                .reply,
+            wyrmroot_launch_proto::ShellV1Reply::Error {
+                code: LaunchErrorCode::LoaderFailure,
+            }
+        );
+    }
+
+    #[test]
+    fn e3c_wrong_ready_correlation_tears_down_before_publication() {
+        let image = executable();
+        let (bootfs, generation) = wyrmsh_policy_bootfs(&image);
+        let policy = PolicyView::from_bootfs(Archive::new(&bootfs).unwrap(), generation).unwrap();
+        let owner = grant(EndpointKind::LaunchSession, 1, 1);
+        let reservation = LaunchReservation {
+            connection_id: owner.endpoint_id,
+            generation: owner.endpoint_generation,
+            transaction_id: 15,
+        };
+        let (request, handles) = shell_request(reservation, 4);
+        let registry_grant = EndpointGrant {
+            registry_generation: 7,
+            endpoint_id: 1,
+            endpoint_generation: 1,
+            role_generation: 4,
+            kind: EndpointKind::RegistryClient,
+        };
+        let mut platform = ShellPlatform::new();
+        platform.push(DwHandle(90), request, &handles);
+        platform.push(DwHandle(101), empty_service_page(registry_grant), &[]);
+        let mut loader = InitSendLoader::new();
+        loader.fail_init = false;
+        let mut waits = ShellWaits {
+            transaction: WYRMSH_FIRST_INSTALL_TRANSACTION + 1,
+            exited: false,
+            exit_after_running_check: true,
+            query_count: 0,
+        };
+        let mut jobs = JobDispatcher::new();
+        jobs.install_scoped_session(owner, DwHandle(90), LaunchSessionScope::ConsoleLauncher)
+            .unwrap();
+        let mut topology = RegistryTopology::new(7).unwrap();
+        let mut state = ShellControllerState::new(7).unwrap();
+        let mut context = ShellLaunchContext {
+            registry_control: DwHandle(70),
+            topology: &mut topology,
+            state: &mut state,
+        };
+
+        assert_eq!(
+            dispatch_one_job_request_with_shell(
+                &mut platform,
+                &mut loader,
+                &mut waits,
+                LoadAuthority {
+                    parent_root: DwHandle(1),
+                    bootfs: DwHandle(2),
+                    task_group: DwHandle(3),
+                },
+                Some(&policy),
+                &mut jobs,
+                DwHandle(90),
+                owner,
+                &mut context,
+            ),
+            Ok(JobDispatchOutcome::Responded)
+        );
+        assert_eq!(
+            state.health(),
+            ShellRegistryHealth::Poisoned { generation: 7 }
+        );
+        assert_eq!(jobs.jobs.live_jobs(), 0);
+        assert_eq!(jobs.session_count(), 1);
+        assert!(!jobs.has_shell_session());
+        let reply = platform
+            .sent
+            .iter()
+            .find(|(channel, _)| *channel == DwHandle(90))
+            .unwrap();
+        assert_eq!(
+            wyrmroot_launch_proto::parse_shell_v1_reply(&reply.1, 0)
+                .unwrap()
+                .reply,
+            wyrmroot_launch_proto::ShellV1Reply::Error {
+                code: LaunchErrorCode::LoaderFailure,
+            }
+        );
+    }
+
+    #[test]
+    fn e3c_accepted_reply_loss_tears_down_shell_and_poisons_registry() {
+        let image = executable();
+        let (bootfs, generation) = wyrmsh_policy_bootfs(&image);
+        let policy = PolicyView::from_bootfs(Archive::new(&bootfs).unwrap(), generation).unwrap();
+        let owner = grant(EndpointKind::LaunchSession, 1, 1);
+        let reservation = LaunchReservation {
+            connection_id: owner.endpoint_id,
+            generation: owner.endpoint_generation,
+            transaction_id: 16,
+        };
+        let (request, handles) = shell_request(reservation, 4);
+        let registry_grant = EndpointGrant {
+            registry_generation: 7,
+            endpoint_id: 1,
+            endpoint_generation: 1,
+            role_generation: 4,
+            kind: EndpointKind::RegistryClient,
+        };
+        let mut platform = ShellPlatform::new();
+        platform.fail_send_on = Some(DwHandle(90));
+        platform.push(DwHandle(90), request, &handles);
+        platform.push(DwHandle(101), empty_service_page(registry_grant), &[]);
+        let mut loader = InitSendLoader::new();
+        loader.fail_init = false;
+        let mut waits = ShellWaits {
+            transaction: WYRMSH_FIRST_INSTALL_TRANSACTION,
+            exited: false,
+            exit_after_running_check: true,
+            query_count: 0,
+        };
+        let mut jobs = JobDispatcher::new();
+        jobs.install_scoped_session(owner, DwHandle(90), LaunchSessionScope::ConsoleLauncher)
+            .unwrap();
+        let mut topology = RegistryTopology::new(7).unwrap();
+        let mut state = ShellControllerState::new(7).unwrap();
+        let mut context = ShellLaunchContext {
+            registry_control: DwHandle(70),
+            topology: &mut topology,
+            state: &mut state,
+        };
+
+        assert!(matches!(
+            dispatch_one_job_request_with_shell(
+                &mut platform,
+                &mut loader,
+                &mut waits,
+                LoadAuthority {
+                    parent_root: DwHandle(1),
+                    bootfs: DwHandle(2),
+                    task_group: DwHandle(3),
+                },
+                Some(&policy),
+                &mut jobs,
+                DwHandle(90),
+                owner,
+                &mut context,
+            ),
+            Err(InitError::Native(_))
+        ));
+        assert_eq!(
+            state.health(),
+            ShellRegistryHealth::Poisoned { generation: 7 }
+        );
+        assert_eq!(jobs.jobs.live_jobs(), 0);
+        assert_eq!(jobs.session_count(), 1);
+        assert!(!jobs.has_shell_session());
+    }
+
+    #[test]
+    fn e3c_registry_replacement_ladder_exhausts_after_bounded_attempts() {
+        let mut topology = RegistryTopology::new(1).unwrap();
+        let mut state = ShellControllerState::new(1).unwrap();
+        let mut generation = 1_u64;
+        for _ in 0..WYR0_I_SUPERVISION_POLICY.max_attempts {
+            state.poison(generation);
+            generation += 1;
+            state
+                .install_replacement(&mut topology, generation)
+                .unwrap();
+        }
+        state.poison(generation);
+        assert_eq!(
+            state.install_replacement(&mut topology, generation + 1),
+            Err(InitError::Cleanup)
+        );
+        assert_eq!(state.health(), ShellRegistryHealth::Exhausted);
+        assert_eq!(topology.generation(), generation);
+    }
+
+    #[test]
+    fn e3c_shell_identity_namespaces_are_independently_fresh() {
+        let mut state = ShellControllerState::new(1).unwrap();
+        state
+            .reserve_shell_generation(wyrmroot_launch_proto::ShellV1Request {
+                console_generation: 2,
+                status_generation: 3,
+                requested_child_generation: 4,
+            })
+            .unwrap();
+        assert_eq!(
+            state.reserve_shell_generation(wyrmroot_launch_proto::ShellV1Request {
+                console_generation: 3,
+                status_generation: 3,
+                requested_child_generation: 5,
+            }),
+            Err(InitError::Wyr1BModel(JobError::StaleGeneration))
+        );
+        assert_eq!(
+            state.reserve_shell_generation(wyrmroot_launch_proto::ShellV1Request {
+                console_generation: 3,
+                status_generation: 4,
+                requested_child_generation: 4,
+            }),
+            Err(InitError::Wyr1BModel(JobError::StaleGeneration))
+        );
+        state
+            .reserve_shell_generation(wyrmroot_launch_proto::ShellV1Request {
+                console_generation: 2,
+                status_generation: 4,
+                requested_child_generation: 5,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn e3c_shelljobs_peer_loss_forces_its_correlated_outer_shell() {
+        let console = grant(EndpointKind::LaunchSession, 1, 1);
+        let shell = EndpointGrant {
+            registry_generation: 7,
+            endpoint_id: 2,
+            endpoint_generation: 1,
+            role_generation: 4,
+            kind: EndpointKind::LaunchSession,
+        };
+        let mut jobs = JobDispatcher::new();
+        jobs.install_scoped_session(console, DwHandle(90), LaunchSessionScope::ConsoleLauncher)
+            .unwrap();
+        jobs.install_scoped_session(shell, DwHandle(91), LaunchSessionScope::ShellJobs)
+            .unwrap();
+        let ticket = jobs
+            .jobs
+            .begin_launch(LaunchReservation {
+                connection_id: console.endpoint_id,
+                generation: console.endpoint_generation,
+                transaction_id: 1,
+            })
+            .unwrap();
+        jobs.jobs.commit_launch(ticket, 700, 701, 702).unwrap();
+        jobs.attach_outer_job(shell, ticket.job_id()).unwrap();
+        assert_eq!(jobs.next_session(), Some((console, DwHandle(90))));
+
+        let mut platform = ShellPlatform::new();
+        platform.session_readable = false;
+        platform.session_peer_closed = true;
+        let mut loader = InitSendLoader::new();
+        let mut waits = ShellWaits {
+            transaction: 1,
+            exited: true,
+            exit_after_running_check: false,
+            query_count: 0,
+        };
+        poll_job_dispatcher(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            LoadAuthority {
+                parent_root: DwHandle(1),
+                bootfs: DwHandle(2),
+                task_group: DwHandle(3),
+            },
+            &mut jobs,
+            10,
+        )
+        .unwrap();
+        assert_eq!(jobs.session_count(), 1);
+        assert_eq!(jobs.jobs.live_jobs(), 0);
+        assert!(!jobs.has_shell_session());
+        assert_eq!(
+            platform
+                .closed
+                .iter()
+                .filter(|handle| **handle == DwHandle(91))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn e3c_registry_preflight_drains_every_canonical_page() {
+        fn page(grant: EndpointGrant, page_index: u16, names: &[&[u8]]) -> Vec<u8> {
+            let versions = [
+                RegistryProtocolVersion { major: 1, minor: 0 },
+                RegistryProtocolVersion::default(),
+                RegistryProtocolVersion::default(),
+                RegistryProtocolVersion::default(),
+            ];
+            let records: Vec<_> = names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| ServiceListRecord {
+                    protocol_id: 10 + usize::from(page_index) as u64 * 2 + index as u64,
+                    service_generation: 1,
+                    versions,
+                    version_count: 1,
+                    service_name: name,
+                })
+                .collect();
+            let mut bytes = [0_u8;
+                SERVICE_LIST_PREFIX_BYTES
+                    + wyrmroot_registry_proto::MAX_SERVICE_LIST_RECORDS * SERVICE_LIST_RECORD_BYTES];
+            let size = encode_service_list(
+                RegistryHeader {
+                    message_type: RegistryMessageType::ServiceList,
+                    registry_generation: grant.registry_generation,
+                    endpoint_id: grant.endpoint_id,
+                    endpoint_generation: grant.endpoint_generation,
+                    transaction_id: 1,
+                },
+                page_index,
+                2,
+                3,
+                &records,
+                &mut bytes,
+            )
+            .unwrap();
+            bytes[..size].to_vec()
+        }
+
+        let grant = EndpointGrant {
+            registry_generation: 7,
+            endpoint_id: 4,
+            endpoint_generation: 1,
+            role_generation: 9,
+            kind: EndpointKind::RegistryClient,
+        };
+        let mut platform = ShellPlatform::new();
+        platform.push(DwHandle(101), page(grant, 0, &[b"alpha", b"beta"]), &[]);
+        platform.push(DwHandle(101), page(grant, 1, &[b"gamma"]), &[]);
+        preflight_wyrmsh_registry(&mut platform, DwHandle(101), grant).unwrap();
+        assert_eq!(platform.inbound_cursor, 2);
+
+        let mut noncanonical = ShellPlatform::new();
+        noncanonical.push(DwHandle(101), page(grant, 0, &[b"alpha", b"beta"]), &[]);
+        noncanonical.push(DwHandle(101), page(grant, 1, &[b"aardvark"]), &[]);
+        assert_eq!(
+            preflight_wyrmsh_registry(&mut noncanonical, DwHandle(101), grant),
+            Err(InitError::WrongManifestProfile)
         );
     }
 
