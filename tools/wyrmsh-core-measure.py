@@ -9,7 +9,9 @@ Use a fresh output path directly beneath the repository's .tmp directory.
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
+import signal
 import stat
 import subprocess
 import tomllib
@@ -31,14 +33,26 @@ def regular(path, unique=True):
 
 
 def run(command, output, env, name, timeout=60):
-    result = subprocess.run([str(arg) for arg in command], cwd=REPO, env=env,
-                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, timeout=timeout, check=False)
-    (output / f'{name}.stdout').write_bytes(result.stdout)
-    (output / f'{name}.stderr').write_bytes(result.stderr)
-    if result.returncode:
-        raise RuntimeError(f'{name} exited {result.returncode}; see {output}')
-    return result.stdout
+    process = subprocess.Popen([str(arg) for arg in command], cwd=REPO, env=env,
+                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, start_new_session=True)
+    timed_out = False
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        stdout, stderr = process.communicate()
+    (output / f'{name}.stdout').write_bytes(stdout)
+    (output / f'{name}.stderr').write_bytes(stderr)
+    if timed_out:
+        raise TimeoutError(f'{name} exceeded {timeout}s; process group terminated; see {output}')
+    if process.returncode:
+        raise RuntimeError(f'{name} exited {process.returncode}; see {output}')
+    return stdout
 
 
 def frames(value):
@@ -94,8 +108,13 @@ def main():
     temporary.mkdir()
     env = {'PATH': '/usr/lib/llvm/22/bin:/usr/bin:/bin', 'TMPDIR': str(temporary),
            'LC_ALL': 'C', 'WYRMROOT_PINNED_TARGET_DIR': str(output / 'cargo-target')}
-    run([REPO / 'tools/pinned-cargo', 'check', '--locked', '--offline',
+    pinned_cargo = REPO / 'tools/pinned-cargo'
+    regular(pinned_cargo)
+    pinned_cargo_sha = digest(pinned_cargo)
+    run([pinned_cargo, 'check', '--locked', '--offline',
          '-p', 'wyrmroot-wyrmsh-core', '--lib'], output, env, 'pinned-preflight')
+    if digest(pinned_cargo) != pinned_cargo_sha:
+        raise ValueError('pinned Cargo launcher changed during preflight')
     version = run([rustc, '-vV'], output, env, 'rustc-version').decode()
     if 'host: x86_64-unknown-linux-gnu' not in version or accepted['source_commit'] not in version:
         raise ValueError('measurement requires exact pinned x86_64 Linux host compiler')
@@ -114,8 +133,8 @@ def main():
     source = REPO / 'crates/wyrmroot-wyrmsh-core/src/lib.rs'
     fixture = REPO / 'tools/wyrmsh-core-measure.rs'
     source_paths = sorted(source.parent.rglob('*.rs')) + [
-        fixture, Path(__file__).resolve(), source.parent.parent / 'Cargo.toml',
-        REPO / 'toolchain/host-rust-toolchain.toml']
+        fixture, Path(__file__).resolve(), pinned_cargo,
+        source.parent.parent / 'Cargo.toml', REPO / 'toolchain/host-rust-toolchain.toml']
     for path in source_paths:
         regular(path)
     source_hashes = {str(p.relative_to(REPO)): digest(p) for p in source_paths}
