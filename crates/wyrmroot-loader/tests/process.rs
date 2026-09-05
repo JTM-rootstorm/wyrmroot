@@ -381,7 +381,7 @@ fn wyrmsh_reports_all_six_roles_on_both_sides_of_atomic_init_move() {
 }
 
 #[test]
-fn wyrmsh_rejects_invalid_handle_and_correlation_sets_before_construction() {
+fn wyrmsh_rejects_invalid_sets_and_accepts_equal_independent_transactions() {
     let image = executable();
     let mut duplicate = wyrmsh_request(&image);
     duplicate.launch_session = duplicate.stdin;
@@ -407,16 +407,17 @@ fn wyrmsh_rejects_invalid_handle_and_correlation_sets_before_construction() {
     ));
     assert!(platform.events.is_empty());
 
-    let mut alias = wyrmsh_request(&image);
-    alias.outer_launch_transaction = alias.transaction_id;
-    assert!(matches!(
-        load_wyrmsh_process(&mut platform, authority(), alias),
-        Err(WyrmshLoadError {
-            error: LoadError::Launch(wyrmroot_loader::launch::LaunchError::TransactionAlias),
-            ..
-        })
-    ));
-    assert!(platform.events.is_empty());
+    let mut equal_across_namespaces = wyrmsh_request(&image);
+    equal_across_namespaces.outer_launch_transaction = equal_across_namespaces.transaction_id;
+    load_wyrmsh_process(&mut platform, authority(), equal_across_namespaces)
+        .expect("independent transaction namespaces incorrectly require unequal counters");
+    assert_eq!(
+        (
+            u64::from_le_bytes(platform.sent_init[24..32].try_into().unwrap()),
+            u64::from_le_bytes(platform.sent_init[152..160].try_into().unwrap()),
+        ),
+        (1, 1)
+    );
 }
 
 #[test]

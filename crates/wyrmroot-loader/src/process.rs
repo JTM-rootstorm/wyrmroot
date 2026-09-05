@@ -944,12 +944,6 @@ pub fn load_wyrmsh_process<P: LoaderPlatform>(
             false,
         ));
     }
-    if request.transaction_id == request.outer_launch_transaction {
-        return Err(WyrmshLoadError::with_custody(
-            LoadError::Launch(LaunchError::TransactionAlias),
-            false,
-        ));
-    }
     let argv = [PATH];
     let mut consumed = false;
     load_process_internal(

@@ -287,7 +287,6 @@ pub enum LaunchError {
     BadTotalSize,
     BadCapabilityCount,
     ZeroTransaction,
-    TransactionAlias,
     TransactionMismatch,
     NonzeroReserved,
     BadCapabilityRole { index: usize },
@@ -535,9 +534,6 @@ pub fn encode_wyrmsh_init(
     if correlations.contains(&0) {
         return Err(LaunchError::ZeroTransaction);
     }
-    if transaction_id == outer_launch_transaction {
-        return Err(LaunchError::TransactionAlias);
-    }
     let size = encode_init_inner(LaunchProfile::Wyrmsh, transaction_id, output)?;
     for (index, value) in correlations.into_iter().enumerate() {
         put_u64(output, 88 + index * 8, value);
@@ -650,9 +646,6 @@ pub fn parse_init(
         let correlations = core::array::from_fn::<_, 9, _>(|index| get_u64(bytes, 88 + index * 8));
         if correlations.contains(&0) {
             return Err(LaunchError::ZeroTransaction);
-        }
-        if transaction_id == correlations[8] {
-            return Err(LaunchError::TransactionAlias);
         }
     } else if profile == LaunchProfile::D6ResourceOwner {
         if get_u32(bytes, HEADER_BYTES) != ROLE_D6_RESOURCE_DOMAIN
