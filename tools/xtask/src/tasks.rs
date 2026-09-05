@@ -1385,7 +1385,6 @@ fn host_test_commands(filter: Option<&str>) -> Result<Vec<Vec<String>>, Failure>
                 "--features".to_owned(),
                 feature.to_owned(),
                 "--lib".to_owned(),
-                "--tests".to_owned(),
             ];
             if lint {
                 arguments.extend(["--".to_owned(), "-D".to_owned(), "warnings".to_owned()]);
@@ -1779,7 +1778,7 @@ mod tests {
                         .any(|arguments| arguments == ["--features", "wyr1e-production"])
                 );
                 assert!(command.iter().any(|argument| argument == "--lib"));
-                assert!(command.iter().any(|argument| argument == "--tests"));
+                assert!(!command.iter().any(|argument| argument == "--tests"));
                 assert!(!command.iter().any(|argument| argument == "--bin"));
             }
         }
