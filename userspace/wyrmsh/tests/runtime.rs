@@ -50,6 +50,9 @@ struct Fixture {
     trace: Vec<Trace>,
     release_signals: DwSignals,
     block_send_once: bool,
+    block_second_long_packet: bool,
+    long_packet_attempts: usize,
+    control_loss_on_output_wait: Option<usize>,
     physical_eof: bool,
     control_loss_after_receives: Option<(usize, usize)>,
     receive_calls: usize,
@@ -87,6 +90,9 @@ impl Fixture {
             trace: vec![],
             release_signals: DW_SIGNAL_PEER_CLOSED,
             block_send_once: false,
+            block_second_long_packet: false,
+            long_packet_attempts: 0,
+            control_loss_on_output_wait: None,
             physical_eof: false,
             control_loss_after_receives: None,
             receive_calls: 0,
@@ -182,6 +188,9 @@ impl WyrmshSystem for Fixture {
             .enumerate()
             .find(|(_, item)| item.handle == STDOUT && item.signals.0 & DW_SIGNAL_WRITABLE.0 != 0)
         {
+            if let Some(loss) = self.control_loss_on_output_wait {
+                return Ok(wait_result(loss, DW_SIGNAL_PEER_CLOSED));
+            }
             return Ok(wait_result(index, DW_SIGNAL_WRITABLE));
         }
         if let Some((index, _)) = items
@@ -232,6 +241,16 @@ impl StreamSystem for Fixture {
     fn send(&mut self, channel: DwHandle, bytes: &[u8]) -> Result<(), NativeError> {
         assert!(channel == STDOUT || channel == STDERR);
         self.trace.push(Trace::StreamSend(channel));
+        let payload = decode_data(bytes).unwrap().payload();
+        if channel == STDOUT
+            && payload.len() == MAX_PAYLOAD_BYTES
+            && payload.iter().all(|byte| *byte == b'x')
+        {
+            self.long_packet_attempts += 1;
+            if self.block_second_long_packet && self.long_packet_attempts == 2 {
+                return Err(NativeError::Status(DW_STATUS_WOULD_BLOCK));
+            }
+        }
         if self.block_send_once {
             self.block_send_once = false;
             return Err(NativeError::Status(DW_STATUS_WOULD_BLOCK));
@@ -404,6 +423,45 @@ fn output_backpressure_retries_only_the_uncommitted_suffix() {
     assert_eq!(run_v2(&mut blocked, "system/wyrmsh", &[]), Ok(()));
     assert_eq!(blocked.output(STDOUT), expected);
     assert!(blocked.trace.contains(&Trace::ControlWait));
+}
+
+#[test]
+fn partial_long_echo_waits_then_retries_only_the_uncommitted_suffix() {
+    let mut input = vec![];
+    input.extend_from_slice(b"echo ");
+    input.extend(std::iter::repeat_n(b'x', 4091));
+    input.extend_from_slice(b"\nexit\n");
+    let fragments: Vec<&[u8]> = input.chunks(MAX_PAYLOAD_BYTES).collect();
+
+    let mut fixture = Fixture::new(&fragments);
+    fixture.block_second_long_packet = true;
+    assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+    let stdout = fixture.output(STDOUT);
+    assert!(
+        stdout
+            .windows(4092)
+            .any(|window| window[..4091].iter().all(|byte| *byte == b'x') && window[4091] == b'\n')
+    );
+    assert_eq!(fixture.long_packet_attempts, 4);
+    assert!(fixture.trace.contains(&Trace::ControlWait));
+}
+
+#[test]
+fn required_control_loss_wins_while_partial_output_is_blocked() {
+    let mut input = vec![];
+    input.extend_from_slice(b"echo ");
+    input.extend(std::iter::repeat_n(b'x', 2048));
+    input.push(b'\n');
+    let fragments: Vec<&[u8]> = input.chunks(MAX_PAYLOAD_BYTES).collect();
+
+    let mut fixture = Fixture::new(&fragments);
+    fixture.block_second_long_packet = true;
+    fixture.control_loss_on_output_wait = Some(1);
+    assert_eq!(
+        run_v2(&mut fixture, "system/wyrmsh", &[]),
+        Err(ShellError::RequiredEndpointLost(EndpointRole::Registry))
+    );
+    assert_eq!(fixture.long_packet_attempts, 2);
 }
 
 #[test]

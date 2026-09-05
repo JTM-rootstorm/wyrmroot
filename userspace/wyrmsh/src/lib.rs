@@ -617,7 +617,12 @@ fn write_all<System: WyrmshSystem>(
         poll_health(system, controls, stdout, stderr)?;
         match output.write(system, &bytes[committed..]) {
             Ok(0) => return Err(ShellError::Stream(StreamError::Protocol)),
-            Ok(written) => committed += written,
+            Ok(written) => {
+                committed += written;
+                if committed != bytes.len() {
+                    wait_for_output(system, output, role, stdout, stderr, controls)?;
+                }
+            }
             Err(StreamError::WouldBlock) => {
                 wait_for_output(system, output, role, stdout, stderr, controls)?;
             }
