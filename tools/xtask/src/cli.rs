@@ -28,6 +28,8 @@ Usage:
     tools/pinned-cargo xtask test host wyr1e5-native
     tools/pinned-cargo xtask test host wyr1e6-model
     tools/pinned-cargo xtask test host wyr1e6-clippy
+    tools/pinned-cargo xtask test host wyr1e6-controller-model
+    tools/pinned-cargo xtask test host wyr1e6-controller-clippy
     tools/pinned-cargo xtask test host wyr1e6-native
     cargo xtask test guest [filter]
     cargo xtask test integration wyr0 [default|smp] --request <wyr0-h-request.toml>
@@ -74,9 +76,10 @@ controller and console model features; wyr1e3-native checks the unselected
 new adapters and historical selector32 with the accepted native compiler.
 WYR1-E4/E5 model/clippy filters check the production shell and its pure core;
 wyr1e4-native and wyr1e5-native check the shell with the accepted native compiler.
-WYR1-E6 model/clippy includes the selected product codecs and producer, while
+WYR1-E6 model/clippy includes the selected product codecs and producer;
+wyr1e6-controller-model/clippy runs the selected resident init/devmgr features;
 wyr1e6-native compiles the exact normal product matrix plus selector-32 regressions.
-These E3/E4/E5 filters do not create a product or run a guest.
+These E3-E6 filters do not create a product or run a guest.
 
 The WYR0-H request path builds and inspects the exact init0/hello bootfs and
 paired ESP, records revision/hash provenance, and uses one q35/OVMF path for

@@ -1367,6 +1367,35 @@ pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<
 fn host_test_commands(filter: Option<&str>) -> Result<Vec<Vec<String>>, Failure> {
     if matches!(
         filter,
+        Some("wyr1e6-controller-model" | "wyr1e6-controller-clippy")
+    ) {
+        let lint = filter.is_some_and(|value| value.ends_with("clippy"));
+        return Ok([
+            ("wyrmroot-system-init", "wyr1e-production"),
+            ("wyrmroot-devmgr", "wyr1e-production"),
+        ]
+        .into_iter()
+        .map(|(package, feature)| {
+            let mut arguments = vec![
+                if lint { "clippy" } else { "test" }.to_owned(),
+                "--locked".to_owned(),
+                "--offline".to_owned(),
+                "--package".to_owned(),
+                package.to_owned(),
+                "--features".to_owned(),
+                feature.to_owned(),
+                "--lib".to_owned(),
+                "--tests".to_owned(),
+            ];
+            if lint {
+                arguments.extend(["--".to_owned(), "-D".to_owned(), "warnings".to_owned()]);
+            }
+            arguments
+        })
+        .collect());
+    }
+    if matches!(
+        filter,
         Some(
             "wyr1e4-model"
                 | "wyr1e4-clippy"
@@ -1731,6 +1760,28 @@ mod tests {
                 .find(|command| command.iter().any(|arg| arg == "xtask"))
                 .unwrap();
             assert!(!xtask.iter().any(|arg| arg == "--lib"));
+        }
+    }
+
+    #[test]
+    fn wyr1e6_controller_filters_execute_selected_resident_features() {
+        for filter in ["wyr1e6-controller-model", "wyr1e6-controller-clippy"] {
+            let commands = host_test_commands(Some(filter)).unwrap();
+            assert_eq!(commands.len(), 2);
+            for (command, package) in commands
+                .iter()
+                .zip(["wyrmroot-system-init", "wyrmroot-devmgr"])
+            {
+                assert!(command.iter().any(|argument| argument == package));
+                assert!(
+                    command
+                        .windows(2)
+                        .any(|arguments| arguments == ["--features", "wyr1e-production"])
+                );
+                assert!(command.iter().any(|argument| argument == "--lib"));
+                assert!(command.iter().any(|argument| argument == "--tests"));
+                assert!(!command.iter().any(|argument| argument == "--bin"));
+            }
         }
     }
 
