@@ -256,7 +256,7 @@ const WYR1E3_NATIVE_CHECK_SPECS: [NativeSpec; 5] = [
     },
 ];
 
-const WYR1E4_NATIVE_CHECK_SPECS: [NativeSpec; 1] = [NativeSpec {
+const WYRMSH_NATIVE_CHECK_SPECS: [NativeSpec; 1] = [NativeSpec {
     label: "wyrmsh",
     package: "wyrmroot-wyrmsh",
     binary: "wyrmsh",
@@ -508,14 +508,13 @@ pub(crate) fn run_wyr1e3_native_checks(repository: &Path, filter: &str) -> Resul
     run_native_checks(repository, "WYR1-E3", filter, specs, &[])
 }
 
-pub(crate) fn run_wyr1e4_native_checks(repository: &Path) -> Result<(), Failure> {
-    run_native_checks(
-        repository,
-        "WYR1-E4",
-        "wyr1e4",
-        &WYR1E4_NATIVE_CHECK_SPECS,
-        &[],
-    )
+pub(crate) fn run_wyrmsh_native_checks(repository: &Path, filter: &str) -> Result<(), Failure> {
+    let (phase, slug) = match filter {
+        "wyr1e4-native" => ("WYR1-E4", "wyr1e4"),
+        "wyr1e5-native" => ("WYR1-E5", "wyr1e5"),
+        _ => return Err(Failure::usage("unknown Wyrmsh native check selection")),
+    };
+    run_native_checks(repository, phase, slug, &WYRMSH_NATIVE_CHECK_SPECS, &[])
 }
 
 fn run_native_checks(
@@ -2602,9 +2601,9 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
-    fn wyr1e4_native_check_selects_the_separate_production_shell() {
-        assert_eq!(WYR1E4_NATIVE_CHECK_SPECS.len(), 1);
-        let spec = &WYR1E4_NATIVE_CHECK_SPECS[0];
+    fn wyrmsh_native_check_selects_the_separate_production_shell() {
+        assert_eq!(WYRMSH_NATIVE_CHECK_SPECS.len(), 1);
+        let spec = &WYRMSH_NATIVE_CHECK_SPECS[0];
         assert_eq!(spec.package, "wyrmroot-wyrmsh");
         assert_eq!(spec.binary, "wyrmsh");
         assert_eq!(spec.features, "native-wyrmsh");

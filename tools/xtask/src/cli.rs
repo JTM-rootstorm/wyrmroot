@@ -23,6 +23,9 @@ Usage:
     tools/pinned-cargo xtask test host wyr1e4-model
     tools/pinned-cargo xtask test host wyr1e4-clippy
     tools/pinned-cargo xtask test host wyr1e4-native
+    tools/pinned-cargo xtask test host wyr1e5-model
+    tools/pinned-cargo xtask test host wyr1e5-clippy
+    tools/pinned-cargo xtask test host wyr1e5-native
     cargo xtask test guest [filter]
     cargo xtask test integration wyr0 [default|smp] --request <wyr0-h-request.toml>
     tools/pinned-cargo xtask wyr1 image --request <wyr1-a-request.toml>
@@ -66,9 +69,9 @@ or test:<substring>. The dw1c-init0 and dw1d6 filters are explicit
 feature-specific controller gates. WYR1-E3 model/clippy filters select the shell
 controller and console model features; wyr1e3-native checks the unselected
 new adapters and historical selector32 with the accepted native compiler.
-WYR1-E4 model/clippy filters check the production shell and its pure core;
-wyr1e4-native checks the new shell with the accepted native compiler.
-These E3/E4 filters do not create a product or run a guest.
+WYR1-E4/E5 model/clippy filters check the production shell and its pure core;
+wyr1e4-native and wyr1e5-native check the shell with the accepted native compiler.
+These E3/E4/E5 filters do not create a product or run a guest.
 
 The WYR0-H request path builds and inspects the exact init0/hello bootfs and
 paired ESP, records revision/hash provenance, and uses one q35/OVMF path for

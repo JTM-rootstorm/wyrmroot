@@ -1348,8 +1348,8 @@ pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<
     ) {
         return crate::wyr1c::run_wyr1e3_native_checks(repository, filter.unwrap());
     }
-    if filter == Some("wyr1e4-native") {
-        return crate::wyr1c::run_wyr1e4_native_checks(repository);
+    if matches!(filter, Some("wyr1e4-native" | "wyr1e5-native")) {
+        return crate::wyr1c::run_wyrmsh_native_checks(repository, filter.unwrap());
     }
     if matches!(filter, Some("dw1e3b-native")) {
         return crate::wyr1c::run_e3b_native_checks(repository);
@@ -1362,8 +1362,11 @@ pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<
 }
 
 fn host_test_commands(filter: Option<&str>) -> Result<Vec<Vec<String>>, Failure> {
-    if matches!(filter, Some("wyr1e4-model" | "wyr1e4-clippy")) {
-        let lint = filter == Some("wyr1e4-clippy");
+    if matches!(
+        filter,
+        Some("wyr1e4-model" | "wyr1e4-clippy" | "wyr1e5-model" | "wyr1e5-clippy")
+    ) {
+        let lint = filter.is_some_and(|value| value.ends_with("clippy"));
         return Ok(["wyrmroot-wyrmsh", "wyrmroot-wyrmsh-core"]
             .into_iter()
             .map(|package| {
@@ -1628,13 +1631,26 @@ mod tests {
     }
 
     #[test]
-    fn wyr1e4_host_filters_select_shell_and_core_without_native_features() {
-        for filter in ["wyr1e4-model", "wyr1e4-clippy"] {
+    fn wyrmsh_host_filters_select_shell_and_core_without_native_features() {
+        for filter in [
+            "wyr1e4-model",
+            "wyr1e4-clippy",
+            "wyr1e5-model",
+            "wyr1e5-clippy",
+        ] {
             let commands = host_test_commands(Some(filter)).unwrap();
             assert_eq!(commands.len(), 2);
             assert!(commands[0].iter().any(|arg| arg == "wyrmroot-wyrmsh"));
             assert!(commands[1].iter().any(|arg| arg == "wyrmroot-wyrmsh-core"));
             for command in &commands {
+                assert_eq!(
+                    command[0],
+                    if filter.ends_with("clippy") {
+                        "clippy"
+                    } else {
+                        "test"
+                    }
+                );
                 assert!(command.iter().any(|arg| arg == "--locked"));
                 assert!(command.iter().any(|arg| arg == "--offline"));
                 assert!(!command.iter().any(|arg| arg == "--features"));
