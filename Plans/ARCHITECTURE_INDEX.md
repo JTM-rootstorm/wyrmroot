@@ -40,6 +40,7 @@ This file defines the minimum architecture reading set for Wyrmroot implementati
 
 ## Active implementation status
 
+- [`Plans/WYR1_E1_PARSER_VALIDATION.md`](WYR1_E1_PARSER_VALIDATION.md) records the E1A/E1B pure parser and typed command model, exact grammar/path/arity decisions, bounded property corpus and validation limits. Editor/runtime/product integration remains later work.
 - [`Plans/WYR1_E_WYRMSH_CONTRACT.md`](WYR1_E_WYRMSH_CONTRACT.md) defines the frozen E0B shell scopes, ShellV1 WRLJ 1.1, six-role WRLP 1.11, WRCN status protocol, transactional registry/session ownership, immutable product reservations and parser/editor/job semantics. Production implementation remains E3 and later.
 - [`Plans/WYR1_E0_TRANSITION_INVENTORY.md`](WYR1_E0_TRANSITION_INVENTORY.md) records E0A's source-bound transition inventory, measured toolchain/revision preflight, required-source dispositions, current gaps and the accepted E0B host-model validation and scoped review receipt.
 
