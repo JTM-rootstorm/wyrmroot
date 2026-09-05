@@ -42,7 +42,8 @@ macro_rules! native_entry {
                     startup_argument1,
                 };
                 // SAFETY: `_start` passes the unmodified initial RSP supplied by Deepwyrm. The
-                // startup ABI guarantees that it names the immutable, readable 4 KiB block.
+                // startup ABI guarantees that it names the immutable, readable block whose size
+                // is selected by the ABI version.
                 let exit_code = match unsafe {
                     $crate::with_native_startup(registers, startup_address, $handler)
                 } {
