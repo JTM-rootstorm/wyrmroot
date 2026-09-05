@@ -45,8 +45,10 @@ enum Escape {
     Start,
     Intermediate,
     Csi,
+    DiscardStart,
     DiscardIntermediate,
     DiscardCsi,
+    DiscardNestedCsi { paste_matched: u8 },
     DiscardSs3,
     String { osc: bool, escaped: bool },
     Paste { matched: usize },
@@ -232,14 +234,60 @@ impl InputDecoder {
     }
 
     fn escape_byte(&mut self, byte: u8) -> InputEvent {
+        if self.escape == Escape::DiscardStart {
+            match byte {
+                27 => {}
+                b'[' => self.escape = Escape::DiscardNestedCsi { paste_matched: 0 },
+                b'O' => self.escape = Escape::DiscardSs3,
+                b']' | b'P' | b'X' | b'^' | b'_' => {
+                    self.escape = Escape::String {
+                        osc: byte == b']',
+                        escaped: false,
+                    };
+                }
+                0x20..=0x2f => self.escape = Escape::DiscardIntermediate,
+                0x30..=0x7e => self.end_escape(),
+                _ => {}
+            }
+            return InputEvent::None;
+        }
+        if let Escape::DiscardNestedCsi { paste_matched } = self.escape {
+            if byte == 27 {
+                self.escape = Escape::DiscardStart;
+                return InputEvent::None;
+            }
+
+            const PASTE_START: &[u8] = b"200~";
+            let matched = usize::from(paste_matched);
+            let next = if matched < PASTE_START.len() && byte == PASTE_START[matched] {
+                paste_matched + 1
+            } else {
+                u8::MAX
+            };
+            if (0x40..=0x7e).contains(&byte) {
+                self.end_escape();
+                if usize::from(next) == PASTE_START.len() {
+                    self.escape = Escape::Paste { matched: 0 };
+                }
+            } else {
+                self.escape = Escape::DiscardNestedCsi {
+                    paste_matched: next,
+                };
+            }
+            return InputEvent::None;
+        }
         if self.escape == Escape::DiscardIntermediate {
-            if (0x30..=0x7e).contains(&byte) {
+            if byte == 27 {
+                self.escape = Escape::DiscardStart;
+            } else if (0x30..=0x7e).contains(&byte) {
                 self.end_escape();
             }
             return InputEvent::None;
         }
         if matches!(self.escape, Escape::DiscardCsi | Escape::DiscardSs3) {
-            if (0x40..=0x7e).contains(&byte) {
+            if byte == 27 {
+                self.escape = Escape::DiscardStart;
+            } else if (0x40..=0x7e).contains(&byte) {
                 self.end_escape();
             }
             return InputEvent::None;

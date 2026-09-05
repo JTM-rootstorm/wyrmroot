@@ -183,15 +183,21 @@ fn unsupported_esc_intermediates_are_quarantined_through_their_final() {
 }
 
 #[test]
-fn csi_discard_cannot_restart_as_a_supported_key() {
-    assert_eq!(
-        events(b"\x1b[\x80\x1b[Ax"),
-        [
-            InputEvent::Rejected(InputError::UnsupportedEscape),
-            InputEvent::Insert('A'),
-            InputEvent::Insert('x'),
-        ]
-    );
+fn csi_discard_quarantines_nested_control_sequences() {
+    for input in [
+        b"\x1b[\x80\x1b[Ax".as_slice(),
+        b"\x1b(\x80\x1b[Ax",
+        b"\x1bO\x1b[Ax",
+        b"\x1b[\x80\x1bOAx",
+    ] {
+        assert_eq!(
+            events(input),
+            [
+                InputEvent::Rejected(InputError::UnsupportedEscape),
+                InputEvent::Insert('x'),
+            ]
+        );
+    }
 
     let mut input = b"\x1b[".to_vec();
     input.extend([b'1'; 11]);
@@ -200,10 +206,22 @@ fn csi_discard_cannot_restart_as_a_supported_key() {
         events(&input),
         [
             InputEvent::Rejected(InputError::EscapeTooLong),
-            InputEvent::Insert('A'),
             InputEvent::Insert('x'),
         ]
     );
+
+    for nested in [
+        b"\x1b[\x80\x1b]Ax\x07z".as_slice(),
+        b"\x1b[\x80\x1b[200~Ax\x1b[201~z",
+    ] {
+        assert_eq!(
+            events(nested),
+            [
+                InputEvent::Rejected(InputError::UnsupportedEscape),
+                InputEvent::Insert('z'),
+            ]
+        );
+    }
 }
 
 #[test]
