@@ -3,6 +3,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Take, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
@@ -25,7 +26,10 @@ const MAX_GIT_REVISION_STDOUT_BYTES: u64 = 64;
 const MAX_GIT_STATUS_STDOUT_BYTES: u64 = 1024;
 const MAX_GIT_PATH_STDOUT_BYTES: u64 = 256;
 const MAX_GIT_STDERR_BYTES: u64 = 64 * 1024;
+const MAX_GIT_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
 const GIT_COMMAND_DEADLINE: Duration = Duration::from_secs(10);
+const GIT_ARCHIVE_DEADLINE: Duration = Duration::from_secs(30);
+pub(crate) const FIXED_GIT: &str = "/usr/libexec/git-core/git";
 const MAX_METADATA_JSON_DEPTH: usize = 32;
 const MAX_METADATA_JSON_VALUES: usize = 262_144;
 const MAX_METADATA_CONTAINER_ENTRIES: usize = 65_536;
@@ -46,6 +50,115 @@ pub(crate) struct DeepLayoutBuild {
     pub(crate) policy_sha256: String,
     source_root: PathBuf,
     expected_revision: String,
+}
+
+pub(crate) struct CargoGitSourceIdentity {
+    source_root: PathBuf,
+    cargo_home: PathBuf,
+    expected_revision: String,
+    tree: String,
+    archive_sha256: String,
+    git_sha256: String,
+}
+
+impl CargoGitSourceIdentity {
+    pub(crate) fn tree(&self) -> &str {
+        &self.tree
+    }
+
+    pub(crate) fn archive_sha256(&self) -> &str {
+        &self.archive_sha256
+    }
+
+    pub(crate) fn git_sha256(&self) -> &str {
+        &self.git_sha256
+    }
+
+    pub(crate) fn verify_unchanged(&self) -> Result<(), Failure> {
+        let current = verify_exact_cargo_git_source(
+            &self.source_root,
+            &self.cargo_home,
+            &self.expected_revision,
+        )?;
+        if current.tree != self.tree
+            || current.archive_sha256 != self.archive_sha256
+            || current.git_sha256 != self.git_sha256
+        {
+            return Err(Failure::task(
+                "Cargo-selected Deepwyrm source identity changed",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn inspect_cargo_git_source(
+    repository: &Path,
+    cargo: &Path,
+    rustc: &Path,
+    cargo_home: &Path,
+    temp_directory: &Path,
+    expected_repository: &str,
+    expected_revision: &str,
+) -> Result<CargoGitSourceIdentity, Failure> {
+    validate_regular_file(cargo, "accepted Cargo")?;
+    validate_regular_file(rustc, "accepted rustc")?;
+    validate_directory(cargo_home, "project Cargo home")?;
+    validate_directory(temp_directory, "E6 dependency metadata temporary directory")?;
+    for (path, label) in [
+        (cargo, "accepted Cargo"),
+        (rustc, "accepted rustc"),
+        (cargo_home, "project Cargo home"),
+        (temp_directory, "E6 dependency metadata temporary directory"),
+    ] {
+        if fs::canonicalize(path)
+            .map_err(|error| Failure::task(format!("could not resolve {label}: {error}")))?
+            != path
+        {
+            return Err(Failure::task(format!("{label} path is not canonical")));
+        }
+    }
+    if !temp_directory.starts_with(repository) {
+        return Err(Failure::task(
+            "E6 dependency metadata temporary directory is outside the Wyrmroot source",
+        ));
+    }
+    let cargo_bin = cargo
+        .parent()
+        .ok_or_else(|| Failure::task("accepted Cargo has no parent directory"))?;
+    let fixed_path = env::join_paths([
+        cargo_bin,
+        Path::new("/usr/lib/llvm/22/bin"),
+        Path::new("/usr/bin"),
+        Path::new("/bin"),
+    ])
+    .map_err(|_| Failure::task("accepted Cargo path cannot be encoded for subprocess use"))?;
+    let metadata = exact_cargo_metadata(
+        repository,
+        cargo,
+        rustc,
+        cargo_home,
+        temp_directory,
+        &fixed_path,
+    )?;
+    let package = locate_package(&metadata, expected_repository, expected_revision)?;
+    let source_root = package
+        .manifest_path
+        .ancestors()
+        .nth(3)
+        .ok_or_else(|| Failure::task("deepwyrm-abi manifest has no source root"))?
+        .to_path_buf();
+    validate_regular_path(
+        &source_root,
+        &package.manifest_path,
+        "deepwyrm-abi manifest",
+    )?;
+    if source_root.join(PACKAGE_MANIFEST) != package.manifest_path {
+        return Err(Failure::task(format!(
+            "deepwyrm-abi manifest is not at canonical repository path {PACKAGE_MANIFEST}"
+        )));
+    }
+    verify_exact_cargo_git_source(&source_root, cargo_home, expected_revision)
 }
 
 impl DeepLayoutBuild {
@@ -133,6 +246,50 @@ fn cargo_metadata(repository: &Path) -> Result<String, Failure> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(Failure::task(format!(
             "locked Cargo metadata failed with exit code {}{}",
+            output.status.code().unwrap_or(-1),
+            if stderr.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {}", stderr.trim())
+            }
+        )))
+    }
+}
+
+fn exact_cargo_metadata(
+    repository: &Path,
+    cargo: &Path,
+    rustc: &Path,
+    cargo_home: &Path,
+    temp_directory: &Path,
+    fixed_path: &OsStr,
+) -> Result<String, Failure> {
+    let output = bounded_command_output(
+        Command::new(cargo)
+            .args(["metadata", "--offline", "--locked", "--format-version", "1"])
+            .current_dir(repository)
+            .env_clear()
+            .env("PATH", fixed_path)
+            .env("CARGO_HOME", cargo_home)
+            .env("CARGO_NET_OFFLINE", "true")
+            .env("CARGO_INCREMENTAL", "0")
+            .env("RUSTC", rustc)
+            .env("SOURCE_DATE_EPOCH", "0")
+            .env("TMPDIR", temp_directory)
+            .stdin(Stdio::null()),
+        MAX_METADATA_STDOUT_BYTES,
+        MAX_METADATA_STDERR_BYTES,
+        METADATA_COMMAND_DEADLINE,
+        "exact locked Cargo metadata",
+    )?;
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|_| Failure::task("exact locked Cargo metadata produced non-UTF-8 stdout"))?;
+    if output.status.success() {
+        Ok(stdout)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(Failure::task(format!(
+            "exact locked Cargo metadata failed with exit code {}{}",
             output.status.code().unwrap_or(-1),
             if stderr.trim().is_empty() {
                 String::new()
@@ -539,6 +696,175 @@ fn verify_git_source_identity(root: &Path, expected_revision: &str) -> Result<()
     validate_git_status(root, &status)
 }
 
+fn verify_exact_cargo_git_source(
+    root: &Path,
+    cargo_home: &Path,
+    expected_revision: &str,
+) -> Result<CargoGitSourceIdentity, Failure> {
+    validate_directory(root, "Cargo-selected Deepwyrm source root")?;
+    let canonical_root = fs::canonicalize(root).map_err(|error| {
+        Failure::task(format!(
+            "could not canonicalize Cargo-selected Deepwyrm source root: {error}"
+        ))
+    })?;
+    if canonical_root != root {
+        return Err(Failure::task(
+            "Cargo-selected Deepwyrm source root is not canonical",
+        ));
+    }
+    validate_cargo_owned_path(cargo_home, root, Path::new("git/checkouts"), "checkout")?;
+    let fixed_git = Path::new(FIXED_GIT);
+    validate_regular_file(fixed_git, "fixed Git")?;
+    if fs::canonicalize(fixed_git)
+        .map_err(|error| Failure::task(format!("could not resolve fixed Git: {error}")))?
+        != fixed_git
+    {
+        return Err(Failure::task("fixed Git path is not canonical"));
+    }
+    let git_sha256 = crate::sha256::file_digest(fixed_git)
+        .map_err(|error| Failure::task(format!("could not hash fixed Git: {error}")))?;
+    let revision = fixed_git_output_bounded(
+        root,
+        cargo_home,
+        ["rev-parse", "HEAD"],
+        MAX_GIT_REVISION_STDOUT_BYTES,
+        "Cargo-selected Deepwyrm revision inspection",
+    )?;
+    if revision.trim() != expected_revision {
+        return Err(Failure::task(format!(
+            "Cargo-selected Deepwyrm revision is '{}', expected '{}'",
+            revision.trim(),
+            expected_revision
+        )));
+    }
+    let status = fixed_git_output_bounded(
+        root,
+        cargo_home,
+        ["status", "--porcelain=v1", "--untracked-files=all"],
+        MAX_GIT_STATUS_STDOUT_BYTES,
+        "Cargo-selected Deepwyrm status inspection",
+    )?;
+    validate_git_status(root, &status)?;
+    let git_directory = fixed_git_output_bounded(
+        root,
+        cargo_home,
+        ["rev-parse", "--absolute-git-dir"],
+        MAX_GIT_ROOT_STDOUT_BYTES,
+        "Cargo-selected Deepwyrm Git directory inspection",
+    )?;
+    let git_directory = PathBuf::from(git_directory.trim());
+    validate_cargo_owned_path(
+        cargo_home,
+        &git_directory,
+        Path::new("git/db"),
+        "Git database",
+    )?;
+    let tree = fixed_git_output_bounded(
+        root,
+        cargo_home,
+        ["rev-parse", "HEAD^{tree}"],
+        MAX_GIT_REVISION_STDOUT_BYTES,
+        "Cargo-selected Deepwyrm tree inspection",
+    )?;
+    let tree = tree.trim().to_owned();
+    if tree.len() != 40
+        || !tree
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(Failure::task(
+            "Cargo-selected Deepwyrm tree identity is invalid",
+        ));
+    }
+    let archive = bounded_command_output(
+        Command::new(fixed_git)
+            .arg("-C")
+            .arg(root)
+            .args(["archive", "--format=tar", "HEAD"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("TMPDIR", cargo_home)
+            .stdin(Stdio::null()),
+        MAX_GIT_ARCHIVE_BYTES,
+        MAX_GIT_STDERR_BYTES,
+        GIT_ARCHIVE_DEADLINE,
+        "Cargo-selected Deepwyrm source archive",
+    )?;
+    if !archive.status.success() {
+        return Err(Failure::task(format!(
+            "Cargo-selected Deepwyrm source archive failed with exit code {}",
+            archive.status.code().unwrap_or(-1)
+        )));
+    }
+    if !archive.stderr.is_empty() {
+        return Err(Failure::task(
+            "Cargo-selected Deepwyrm source archive produced stderr",
+        ));
+    }
+    let archive_sha256 = bytes_digest(&archive.stdout);
+    if crate::sha256::file_digest(fixed_git)
+        .map_err(|error| Failure::task(format!("could not rehash fixed Git: {error}")))?
+        != git_sha256
+    {
+        return Err(Failure::task(
+            "fixed Git changed during source verification",
+        ));
+    }
+    let identity = CargoGitSourceIdentity {
+        source_root: root.to_path_buf(),
+        cargo_home: cargo_home.to_path_buf(),
+        expected_revision: expected_revision.to_owned(),
+        tree,
+        archive_sha256,
+        git_sha256,
+    };
+    Ok(identity)
+}
+
+fn validate_cargo_owned_path(
+    cargo_home: &Path,
+    path: &Path,
+    required_prefix: &Path,
+    label: &str,
+) -> Result<(), Failure> {
+    let cargo_metadata = fs::symlink_metadata(cargo_home)
+        .map_err(|error| Failure::task(format!("could not inspect project Cargo home: {error}")))?;
+    let relative = path.strip_prefix(cargo_home).map_err(|_| {
+        Failure::task(format!(
+            "Cargo-selected Deepwyrm {label} is outside project Cargo home"
+        ))
+    })?;
+    if !relative.starts_with(required_prefix) {
+        return Err(Failure::task(format!(
+            "Cargo-selected Deepwyrm {label} is outside {}",
+            required_prefix.display()
+        )));
+    }
+    let mut current = cargo_home.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(Failure::task(format!(
+                "Cargo-selected Deepwyrm {label} path is not canonical"
+            )));
+        };
+        current.push(component);
+        let metadata = fs::symlink_metadata(&current).map_err(|error| {
+            Failure::task(format!(
+                "could not inspect Cargo-selected Deepwyrm {label} path: {error}"
+            ))
+        })?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || metadata.uid() != cargo_metadata.uid()
+        {
+            return Err(Failure::task(format!(
+                "Cargo-selected Deepwyrm {label} path is not an owned non-symlink directory"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_git_status(root: &Path, status: &str) -> Result<(), Failure> {
     for line in status.lines() {
         if line != "?? .cargo-ok" {
@@ -574,6 +900,33 @@ where
             .arg("-C")
             .arg(repository)
             .args(arguments),
+        stdout_maximum,
+        MAX_GIT_STDERR_BYTES,
+        GIT_COMMAND_DEADLINE,
+        label,
+    )?;
+    output_stdout(output, label)
+}
+
+fn fixed_git_output_bounded<I, S>(
+    repository: &Path,
+    temp_directory: &Path,
+    arguments: I,
+    stdout_maximum: u64,
+    label: &str,
+) -> Result<String, Failure>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let output = bounded_command_output(
+        Command::new(FIXED_GIT)
+            .arg("-C")
+            .arg(repository)
+            .args(arguments)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("TMPDIR", temp_directory),
         stdout_maximum,
         MAX_GIT_STDERR_BYTES,
         GIT_COMMAND_DEADLINE,
@@ -1839,8 +2192,9 @@ mod tests {
         DeepLayoutBuild, JsonParser, LayoutPolicy, MAX_METADATA_CONTAINER_ENTRIES,
         MAX_METADATA_JSON_DEPTH, MAX_METADATA_STRING_BYTES, bounded_command_output, locate_package,
         open_stable_regular_file, read_pipe_bounded, validate_git_status,
-        validate_metadata_manifest_path, validate_regular_path, verify_open_file_identity,
-        verify_tracked_bytes, write_generated_policy, x86_64_page_table_indices,
+        validate_metadata_manifest_path, validate_regular_path, verify_exact_cargo_git_source,
+        verify_open_file_identity, verify_tracked_bytes, write_generated_policy,
+        x86_64_page_table_indices,
     };
     use crate::sha256::bytes_digest;
     use std::path::Path;
@@ -2484,6 +2838,107 @@ mod tests {
         fs::write(root.join(".cargo-ok"), b"contaminated").expect("replace marker content");
         assert!(validate_git_status(&root, "?? .cargo-ok\n").is_err());
         fs::remove_dir_all(root).expect("remove isolated checkout root");
+    }
+
+    #[test]
+    fn exact_cargo_source_identity_binds_checkout_tree_and_database_location() {
+        use std::fs;
+        use std::process::Command;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock precedes Unix epoch")
+            .as_nanos();
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("xtask manifest has a repository root");
+        let temporary_root = repository.join(".tmp");
+        fs::create_dir_all(&temporary_root).expect("create repository temporary root");
+        let cargo_home = temporary_root.join(format!(
+            "wyrmroot-cargo-source-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let checkout = cargo_home.join("git/checkouts/deepwyrm-fixture/revision");
+        let database = cargo_home.join("git/db/deepwyrm-fixture");
+        fs::create_dir_all(&checkout).expect("create checkout fixture");
+        fs::create_dir_all(database.parent().expect("database parent"))
+            .expect("create database parent");
+        assert!(
+            Command::new(super::FIXED_GIT)
+                .args(["init", "-q", "--separate-git-dir"])
+                .arg(&database)
+                .arg(&checkout)
+                .env("TMPDIR", &cargo_home)
+                .status()
+                .expect("initialize separate Git fixture")
+                .success()
+        );
+        let manifest = checkout.join(super::PACKAGE_MANIFEST);
+        fs::create_dir_all(manifest.parent().expect("manifest parent"))
+            .expect("create package fixture");
+        fs::write(
+            &manifest,
+            b"[package]\nname = \"deepwyrm-abi\"\nversion = \"0.0.0\"\n",
+        )
+        .expect("write package fixture");
+        for arguments in [
+            vec!["add", super::PACKAGE_MANIFEST],
+            vec![
+                "-c",
+                "user.name=Wyrmroot test",
+                "-c",
+                "user.email=wyrmroot-test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "fixture",
+            ],
+        ] {
+            assert!(
+                Command::new(super::FIXED_GIT)
+                    .arg("-C")
+                    .arg(&checkout)
+                    .args(arguments)
+                    .env("TMPDIR", &cargo_home)
+                    .status()
+                    .expect("commit source fixture")
+                    .success()
+            );
+        }
+        fs::write(checkout.join(".cargo-ok"), []).expect("write Cargo marker");
+        let revision = Command::new(super::FIXED_GIT)
+            .arg("-C")
+            .arg(&checkout)
+            .args(["rev-parse", "HEAD"])
+            .env("TMPDIR", &cargo_home)
+            .output()
+            .expect("read fixture revision");
+        let revision = std::str::from_utf8(&revision.stdout)
+            .expect("fixture revision UTF-8")
+            .trim();
+        let identity = verify_exact_cargo_git_source(&checkout, &cargo_home, revision)
+            .expect("exact Cargo source fixture rejected");
+        assert_eq!(identity.tree().len(), 40);
+        assert_eq!(identity.archive_sha256().len(), 64);
+        assert_eq!(identity.git_sha256().len(), 64);
+        identity
+            .verify_unchanged()
+            .expect("stable identity changed");
+
+        fs::write(&manifest, b"modified\n").expect("modify tracked source");
+        assert!(identity.verify_unchanged().is_err());
+        fs::write(
+            &manifest,
+            b"[package]\nname = \"deepwyrm-abi\"\nversion = \"0.0.0\"\n",
+        )
+        .expect("restore tracked source");
+        fs::write(checkout.join("rogue"), b"untracked\n").expect("write rogue source");
+        assert!(identity.verify_unchanged().is_err());
+        fs::remove_dir_all(cargo_home).expect("remove isolated Cargo source fixture");
     }
 
     fn metadata(source: &str, manifest: &str) -> String {
