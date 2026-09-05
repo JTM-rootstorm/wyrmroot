@@ -790,6 +790,12 @@ fn verify_exact_cargo_git_source(
     }
     let git_sha256 = crate::sha256::file_digest(fixed_git)
         .map_err(|error| Failure::task(format!("could not hash fixed Git: {error}")))?;
+    let git_directory = resolve_checkout_git_directory(root, cargo_home)?;
+    reject_path_presence(
+        &git_directory.join("info/attributes"),
+        "Cargo-selected Deepwyrm Git attribute overlay",
+    )?;
+    reject_local_git_includes(&git_directory, cargo_home)?;
     let revision = fixed_git_output_bounded(
         root,
         cargo_home,
@@ -812,42 +818,18 @@ fn verify_exact_cargo_git_source(
         "Cargo-selected Deepwyrm status inspection",
     )?;
     validate_git_status(root, &status)?;
-    let git_directory = fixed_git_output_bounded(
+    let reported_git_directory = fixed_git_output_bounded(
         root,
         cargo_home,
         ["rev-parse", "--absolute-git-dir"],
         MAX_GIT_ROOT_STDOUT_BYTES,
         "Cargo-selected Deepwyrm Git directory inspection",
     )?;
-    let git_directory = PathBuf::from(git_directory.trim());
-    let local_git_directory = root.join(".git");
-    if git_directory == local_git_directory {
-        validate_cargo_owned_path(root, &git_directory, Path::new(".git"), "Git directory")?;
-    } else {
-        let dot_git = fs::symlink_metadata(&local_git_directory).map_err(|error| {
-            Failure::task(format!(
-                "could not inspect Cargo checkout .git file: {error}"
-            ))
-        })?;
-        let root_owner = fs::symlink_metadata(root)
-            .map_err(|error| Failure::task(format!("could not inspect Cargo checkout: {error}")))?
-            .uid();
-        if !dot_git.is_file() || dot_git.file_type().is_symlink() || dot_git.uid() != root_owner {
-            return Err(Failure::task(
-                "Cargo checkout .git link is not an owned regular non-symlink file",
-            ));
-        }
-        validate_cargo_owned_path(
-            cargo_home,
-            &git_directory,
-            Path::new("git/db"),
-            "Git database",
-        )?;
+    if Path::new(reported_git_directory.trim()) != git_directory {
+        return Err(Failure::task(
+            "Git reports a different directory than the validated checkout metadata",
+        ));
     }
-    reject_path_presence(
-        &git_directory.join("info/attributes"),
-        "Cargo-selected Deepwyrm Git attribute overlay",
-    )?;
     let tree = fixed_git_output_bounded(
         root,
         cargo_home,
@@ -900,6 +882,121 @@ fn verify_exact_cargo_git_source(
         git_sha256,
     };
     Ok(identity)
+}
+
+fn resolve_checkout_git_directory(root: &Path, cargo_home: &Path) -> Result<PathBuf, Failure> {
+    let dot_git = root.join(".git");
+    let metadata = fs::symlink_metadata(&dot_git).map_err(|error| {
+        Failure::task(format!("could not inspect Cargo checkout .git: {error}"))
+    })?;
+    let root_owner = fs::symlink_metadata(root)
+        .map_err(|error| Failure::task(format!("could not inspect Cargo checkout: {error}")))?
+        .uid();
+    if metadata.file_type().is_symlink() || metadata.uid() != root_owner {
+        return Err(Failure::task(
+            "Cargo checkout .git is not owned or is a symlink",
+        ));
+    }
+    let git_directory = if metadata.is_dir() {
+        validate_cargo_owned_path(root, &dot_git, Path::new(".git"), "Git directory")?;
+        dot_git
+    } else if metadata.is_file() {
+        let contents = read_bounded(&dot_git, MAX_GIT_ROOT_STDOUT_BYTES, "Cargo checkout .git")?;
+        let contents = std::str::from_utf8(&contents)
+            .map_err(|_| Failure::task("Cargo checkout .git is not UTF-8"))?;
+        let value = contents
+            .strip_prefix("gitdir: ")
+            .and_then(|value| value.strip_suffix('\n').or(Some(value)))
+            .ok_or_else(|| Failure::task("Cargo checkout .git has invalid syntax"))?;
+        if value.is_empty() || value.contains('\n') || value.contains('\r') {
+            return Err(Failure::task("Cargo checkout .git has invalid syntax"));
+        }
+        let value = Path::new(value);
+        if value
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+        {
+            return Err(Failure::task("Cargo checkout .git path contains traversal"));
+        }
+        let candidate = if value.is_absolute() {
+            value.to_path_buf()
+        } else {
+            root.join(value)
+        };
+        let canonical = fs::canonicalize(&candidate).map_err(|error| {
+            Failure::task(format!(
+                "could not resolve Cargo checkout Git directory: {error}"
+            ))
+        })?;
+        if canonical != candidate {
+            return Err(Failure::task(
+                "Cargo checkout Git directory path is not canonical",
+            ));
+        }
+        validate_cargo_owned_path(cargo_home, &canonical, Path::new("git/db"), "Git database")?;
+        canonical
+    } else {
+        return Err(Failure::task(
+            "Cargo checkout .git is not a regular file or directory",
+        ));
+    };
+    Ok(git_directory)
+}
+
+fn reject_local_git_includes(git_directory: &Path, temp_directory: &Path) -> Result<(), Failure> {
+    let config = git_directory.join("config");
+    validate_regular_path(
+        git_directory,
+        &config,
+        "Cargo checkout local Git configuration",
+    )?;
+    let directory_owner = fs::symlink_metadata(git_directory)
+        .map_err(|error| Failure::task(format!("could not inspect Git directory: {error}")))?
+        .uid();
+    let config_owner = fs::symlink_metadata(&config)
+        .map_err(|error| Failure::task(format!("could not inspect local Git config: {error}")))?
+        .uid();
+    if config_owner != directory_owner {
+        return Err(Failure::task(
+            "Cargo checkout local Git configuration has an unexpected owner",
+        ));
+    }
+    let output = bounded_command_output(
+        hardened_fixed_git_without_repository(temp_directory)
+            .args(["config", "--file"])
+            .arg(&config)
+            .args(["--no-includes", "--name-only", "--null", "--list"]),
+        MAX_GIT_TREE_BYTES,
+        MAX_GIT_STDERR_BYTES,
+        GIT_COMMAND_DEADLINE,
+        "Cargo checkout local Git configuration inspection",
+    )?;
+    if !output.status.success() {
+        return Err(Failure::task(format!(
+            "Cargo checkout local Git configuration inspection failed with exit code {}",
+            output.status.code().unwrap_or(-1)
+        )));
+    }
+    if !output.stderr.is_empty() {
+        return Err(Failure::task(
+            "Cargo checkout local Git configuration inspection produced stderr",
+        ));
+    }
+    for name in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+    {
+        let name = std::str::from_utf8(name)
+            .map_err(|_| Failure::task("local Git configuration name is not UTF-8"))?
+            .to_ascii_lowercase();
+        if name == "include.path" || (name.starts_with("includeif.") && name.ends_with(".path")) {
+            return Err(Failure::task(
+                "Cargo checkout local Git configuration contains an external include",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn verify_cargo_configuration(repository: &Path, cargo_home: &Path) -> Result<String, Failure> {
@@ -1363,6 +1460,9 @@ where
         GIT_COMMAND_DEADLINE,
         label,
     )?;
+    if output.status.success() && !output.stderr.is_empty() {
+        return Err(Failure::task(format!("{label} produced stderr")));
+    }
     output_stdout(output, label)
 }
 
@@ -1429,12 +1529,18 @@ where
 }
 
 fn hardened_fixed_git(repository: &Path, temp_directory: &Path) -> Command {
-    let mut command = Command::new(FIXED_GIT);
+    let mut command = hardened_fixed_git_without_repository(temp_directory);
     command
         .arg("-C")
         .arg(repository)
         .args(["-c", "core.fsmonitor=false"])
-        .args(["-c", "core.attributesFile=/dev/null"])
+        .args(["-c", "core.attributesFile=/dev/null"]);
+    command
+}
+
+fn hardened_fixed_git_without_repository(temp_directory: &Path) -> Command {
+    let mut command = Command::new(FIXED_GIT);
+    command
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("TMPDIR", temp_directory)
@@ -3542,6 +3648,34 @@ mod tests {
             .expect("hardened Git inspection consumed hostile local configuration");
         assert_eq!(hardened.archive_sha256, identity.archive_sha256);
         assert!(!fsmonitor.with_extension("sh.invoked").exists());
+
+        let included = cargo_home.join("included-config");
+        fs::write(&included, b"[core]\nfsmonitor = true\n")
+            .expect("write included Git configuration");
+        for key in ["include.path", "includeIf.onbranch:master.path"] {
+            assert!(
+                Command::new(super::FIXED_GIT)
+                    .arg("-C")
+                    .arg(&checkout)
+                    .args(["config", "--add", key])
+                    .arg(&included)
+                    .env("TMPDIR", &cargo_home)
+                    .status()
+                    .expect("set local Git include")
+                    .success()
+            );
+            assert!(verify_exact_cargo_git_source(&checkout, &cargo_home, revision).is_err());
+            assert!(
+                Command::new(super::FIXED_GIT)
+                    .arg("-C")
+                    .arg(&checkout)
+                    .args(["config", "--unset-all", key])
+                    .env("TMPDIR", &cargo_home)
+                    .status()
+                    .expect("clear local Git include")
+                    .success()
+            );
+        }
 
         fs::write(database.join("info/attributes"), b"* export-ignore\n")
             .expect("write Git-directory attribute overlay");
