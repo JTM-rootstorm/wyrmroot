@@ -256,6 +256,14 @@ const WYR1E3_NATIVE_CHECK_SPECS: [NativeSpec; 5] = [
     },
 ];
 
+const WYR1E4_NATIVE_CHECK_SPECS: [NativeSpec; 1] = [NativeSpec {
+    label: "wyrmsh",
+    package: "wyrmroot-wyrmsh",
+    binary: "wyrmsh",
+    features: "native-wyrmsh",
+    artifact: "wyrmsh",
+}];
+
 const E3B_NATIVE_CHECK_ENVIRONMENT: [(&str, &str); 3] = [
     ("DEEPWYRM_DW1E_EVIDENCE_NONCE", "E300000000000001"),
     ("WYRMROOT_DW1E3_CHALLENGE_1_NONCE", "E300000000000002"),
@@ -498,6 +506,16 @@ pub(crate) fn run_wyr1e3_native_checks(repository: &Path, filter: &str) -> Resul
         _ => return Err(Failure::usage("unknown WYR1-E3 native check selection")),
     };
     run_native_checks(repository, "WYR1-E3", filter, specs, &[])
+}
+
+pub(crate) fn run_wyr1e4_native_checks(repository: &Path) -> Result<(), Failure> {
+    run_native_checks(
+        repository,
+        "WYR1-E4",
+        "wyr1e4",
+        &WYR1E4_NATIVE_CHECK_SPECS,
+        &[],
+    )
 }
 
 fn run_native_checks(
@@ -2582,6 +2600,15 @@ fn hex_digest(value: &[u8; 32]) -> String {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn wyr1e4_native_check_selects_the_separate_production_shell() {
+        assert_eq!(WYR1E4_NATIVE_CHECK_SPECS.len(), 1);
+        let spec = &WYR1E4_NATIVE_CHECK_SPECS[0];
+        assert_eq!(spec.package, "wyrmroot-wyrmsh");
+        assert_eq!(spec.binary, "wyrmsh");
+        assert_eq!(spec.features, "native-wyrmsh");
+    }
 
     #[test]
     fn wyr1e3_native_checks_keep_shell_and_historical_selections_separate() {
