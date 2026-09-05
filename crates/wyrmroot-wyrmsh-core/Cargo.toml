@@ -1,0 +1,11 @@
+[package]
+name = "wyrmroot-wyrmsh-core"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+description = "Allocation-free WYR1 shell grammar and command model"
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_crate_dependencies = "deny"
