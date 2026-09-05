@@ -9,6 +9,7 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fs::{self, File},
+    os::unix::fs::PermissionsExt,
     path::{Component, Path, PathBuf},
     process::{Command, Output, Stdio},
     time::{SystemTime, UNIX_EPOCH},
@@ -1203,7 +1204,7 @@ pub(crate) fn build_d5_snapshot(nonce: &str) -> Result<D5Snapshot, Failure> {
 /// Build the normal selector-free WYR1-E product. The returned snapshot is
 /// still unpublished; `wyr1e` owns the immutable directory and receipts.
 pub(crate) fn build_e6_snapshot() -> Result<E6Snapshot, Failure> {
-    reject_ambient_build_environment(env::vars_os())?;
+    reject_e6_ambient_build_environment(env::vars_os())?;
     let repository = crate::tasks::repository_root()?;
     let revision = clean_repository_revision(&repository)?;
     let manifest = BuildManifest::load(&repository)?;
@@ -1223,6 +1224,8 @@ pub(crate) fn build_e6_snapshot() -> Result<E6Snapshot, Failure> {
         ));
     }
     toolchain.accepted().verify_unchanged()?;
+    let deep_source =
+        inspect_e6_dependency_source(&repository, &manifest, toolchain.accepted(), &cargo_home)?;
     let repository_directory =
         crate::secure_fs::Directory::open_exact(&repository, "Wyrmroot source")?;
     let tmp = match repository_directory.open_child(".tmp", "WYR1-E6 temporary root") {
@@ -1242,6 +1245,7 @@ pub(crate) fn build_e6_snapshot() -> Result<E6Snapshot, Failure> {
         let mut stack_report = None;
         for spec in WYR1E6_PRODUCT_NATIVE_SPECS {
             toolchain.accepted().verify_unchanged()?;
+            deep_source.verify_unchanged()?;
             let artifact = scratch.with_inheritable_anchor("WYR1-E6 build scratch", |anchor| {
                 let extra_flags = if spec.label == "wyrmsh" {
                     &["-Cjump-tables=no", "-Zemit-stack-sizes"][..]
@@ -1255,7 +1259,7 @@ pub(crate) fn build_e6_snapshot() -> Result<E6Snapshot, Failure> {
                     anchor,
                     spec,
                     None,
-                    extra_flags,
+                    NativeBuildOptions::exact(extra_flags),
                 )?;
                 artifact.inspection = inspect_native(
                     &repository,
@@ -1314,6 +1318,7 @@ pub(crate) fn build_e6_snapshot() -> Result<E6Snapshot, Failure> {
     })();
     let snapshot = scratch.finish(result)?;
     toolchain.accepted().verify_unchanged()?;
+    deep_source.verify_unchanged()?;
     verify_repository_revision(&repository, &revision)?;
     Ok(snapshot)
 }
@@ -2090,8 +2095,30 @@ fn build_native(
         build_directory,
         spec,
         evidence_nonce,
-        &[],
+        NativeBuildOptions::historical(),
     )
+}
+
+#[derive(Clone, Copy)]
+struct NativeBuildOptions<'a> {
+    extra_flags: &'a [&'a str],
+    exact_environment: bool,
+}
+
+impl NativeBuildOptions<'_> {
+    const fn historical() -> Self {
+        Self {
+            extra_flags: &[],
+            exact_environment: false,
+        }
+    }
+
+    const fn exact(extra_flags: &'static [&'static str]) -> Self {
+        Self {
+            extra_flags,
+            exact_environment: true,
+        }
+    }
 }
 
 fn build_native_with_flags(
@@ -2101,13 +2128,26 @@ fn build_native_with_flags(
     build_directory: &InheritableDirectory,
     spec: NativeSpec,
     evidence_nonce: Option<&str>,
-    extra_flags: &[&str],
+    options: NativeBuildOptions<'_>,
 ) -> Result<NativeArtifact, Failure> {
     let target = build_directory.path().join(spec.label);
     fs::create_dir(&target)
         .map_err(|error| Failure::task(format!("could not create native target: {error}")))?;
+    let exact_temp = target.join(".tmp");
+    if options.exact_environment {
+        fs::create_dir(&exact_temp).map_err(|error| {
+            Failure::task(format!(
+                "could not create E6 native temporary directory: {error}"
+            ))
+        })?;
+        fs::set_permissions(&exact_temp, fs::Permissions::from_mode(0o700)).map_err(|error| {
+            Failure::task(format!(
+                "could not seal E6 native temporary directory: {error}"
+            ))
+        })?;
+    }
     let mut flags = native_remap_flags(repository, cargo_home, &target)?;
-    for flag in extra_flags {
+    for flag in options.extra_flags {
         flags.push('\u{1f}');
         flags.push_str(flag);
     }
@@ -2128,6 +2168,21 @@ fn build_native_with_flags(
     ];
     build_directory.verify_unchanged("WYR1-C1 build scratch")?;
     let mut command = Command::new(&toolchain.cargo);
+    if options.exact_environment {
+        let cargo_bin = toolchain
+            .cargo
+            .parent()
+            .ok_or_else(|| Failure::task("accepted Cargo has no parent directory"))?;
+        let path = env::join_paths([
+            cargo_bin,
+            Path::new("/usr/lib/llvm/22/bin"),
+            Path::new("/usr/bin"),
+            Path::new("/bin"),
+        ])
+        .map_err(|_| Failure::task("accepted Cargo path cannot be encoded for subprocess use"))?;
+        command.env_clear().env("PATH", path).env("LC_ALL", "C");
+        command.env("TMPDIR", &exact_temp);
+    }
     command
         .args(arguments)
         .arg("--target-dir")
@@ -2200,6 +2255,7 @@ fn run_wyrmsh_stack_analyzer_path(
         .current_dir(repository)
         .env_clear()
         .env("PATH", crate::tasks::INSPECTION_PATH)
+        .env("TMPDIR", build_directory.path())
         .stdin(Stdio::null())
         .output()
         .map_err(|error| Failure::task(format!("could not run Wyrmsh stack proof: {error}")))?;
@@ -3184,6 +3240,59 @@ pub(crate) fn reject_ambient_build_environment(
     Ok(())
 }
 
+pub(crate) fn reject_e6_ambient_build_environment(
+    environment: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Result<(), Failure> {
+    let environment = environment.into_iter().collect::<Vec<_>>();
+    reject_ambient_build_environment(environment.iter().cloned())?;
+    for (key, _) in environment {
+        let display = key.to_string_lossy();
+        let key = key.as_encoded_bytes();
+        if [b"CARGO_PROFILE_".as_slice(), b"CARGO_BUILD_".as_slice()]
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+        {
+            return Err(Failure::task(format!(
+                "WYR1-E6 product refuses ambient {}",
+                display
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn inspect_e6_dependency_source(
+    repository: &Path,
+    manifest: &BuildManifest,
+    toolchain: &crate::toolchain_artifact::AcceptedToolchain,
+    cargo_home: &Path,
+) -> Result<crate::deep_layout::CargoGitSourceIdentity, Failure> {
+    let repository_directory =
+        crate::secure_fs::Directory::open_exact(repository, "Wyrmroot source")?;
+    let tmp = match repository_directory.open_child(".tmp", "WYR1-E6 temporary root") {
+        Ok(directory) => directory,
+        Err(_) => repository_directory.create_child(".tmp", 0o700, "WYR1-E6 temporary root")?,
+    };
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Failure::task("system clock is before the Unix epoch"))?
+        .as_nanos();
+    let scratch = tmp.create_scratch(
+        &format!("wyr1e6-source-{}-{unique}", std::process::id()),
+        "WYR1-E6 source inspection scratch",
+    )?;
+    let result = crate::deep_layout::inspect_cargo_git_source(
+        repository,
+        &toolchain.cargo,
+        &toolchain.rustc,
+        cargo_home,
+        scratch.path(),
+        manifest.deepwyrm_repository()?,
+        manifest.deepwyrm_revision()?,
+    );
+    scratch.finish(result)
+}
+
 pub(crate) fn clean_repository_revision(repository: &Path) -> Result<String, Failure> {
     let revision = Command::new("git")
         .arg("-C")
@@ -3598,6 +3707,30 @@ mod tests {
         fs::create_dir(&output).unwrap();
         assert!(validate_fresh_output(&repository, &root.join("OS-Project"), &output).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn e6_environment_rejects_unrecorded_cargo_build_configuration() {
+        for variable in [
+            "CARGO_PROFILE_RELEASE_LTO",
+            "CARGO_PROFILE_RELEASE_CODEGEN_UNITS",
+            "CARGO_PROFILE_RELEASE_OPT_LEVEL",
+            "CARGO_PROFILE_RELEASE_PANIC",
+            "CARGO_PROFILE_RELEASE_STRIP",
+            "CARGO_BUILD_JOBS",
+            "CARGO_BUILD_RUSTFLAGS",
+            "CARGO_BUILD_RUSTC_WRAPPER",
+        ] {
+            assert!(
+                reject_e6_ambient_build_environment([(
+                    OsString::from(variable),
+                    OsString::from("hostile"),
+                )])
+                .is_err(),
+                "accepted unrecorded E6 build variable {variable}"
+            );
+        }
+        assert!(reject_e6_ambient_build_environment([]).is_ok());
     }
 
     #[test]
