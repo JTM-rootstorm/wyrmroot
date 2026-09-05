@@ -56,6 +56,22 @@ pub fn release_raw_then_witness<H: Copy>(
     raw_closed && witness_closed
 }
 
+/// Runs fatal event-loop cleanup in the only safe ownership order. Callers
+/// supply their native effects so the sequencing remains executable in the
+/// allocation-free model and in host tests.
+pub fn cleanup_after_event_loop_failure<S, C>(
+    serial: &mut S,
+    child: &mut C,
+    close_serial: impl FnOnce(&mut S) -> bool,
+    retire_watch: impl FnOnce(&mut S) -> bool,
+    close_child: impl FnOnce(&mut C) -> bool,
+) -> bool {
+    let serial_closed = close_serial(serial);
+    let watch_retired = retire_watch(serial);
+    let child_closed = close_child(child);
+    serial_closed && watch_retired && child_closed
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChildPolicy {
     ConsoleEcho,
@@ -1777,6 +1793,31 @@ mod tests {
             handle != 51
         }));
         assert_eq!(order, [51, 52]);
+    }
+
+    #[test]
+    fn fatal_event_loop_cleanup_orders_serial_before_watch_and_child() {
+        let log = std::cell::Cell::new(0u16);
+        let mut serial = ();
+        let mut child = ();
+        let cleaned = cleanup_after_event_loop_failure(
+            &mut serial,
+            &mut child,
+            |_| {
+                log.set(log.get() * 10 + 1);
+                false
+            },
+            |_| {
+                log.set(log.get() * 10 + 2);
+                true
+            },
+            |_| {
+                log.set(log.get() * 10 + 3);
+                true
+            },
+        );
+        assert!(!cleaned);
+        assert_eq!(log.get(), 123);
     }
 
     fn correlation(value: u64) -> SerialCorrelation {

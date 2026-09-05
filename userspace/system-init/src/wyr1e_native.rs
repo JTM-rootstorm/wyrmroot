@@ -7,6 +7,7 @@ use crate::wyr1b_native::{
     InstalledPeer, ShellControllerState, ShellLaunchContext, create_controller_channel_pair,
     install_client, poll_job_dispatcher_with_shell, retire_console_product,
 };
+use deepwyrm_syscall::DW_TASK_STATE_RUNNING;
 use wyrmroot_loader::process::{ConsoledLoadRequest, load_consoled_process};
 use wyrmroot_registry_proto::{
     Header as RegistryHeader, Message as RegistryMessage, MessageType as RegistryMessageType,
@@ -566,7 +567,7 @@ where
             });
         }
     };
-    if current.request != observer.expected_driver || info.state == DW_TASK_STATE_EXITED {
+    if current.request != observer.expected_driver || info.state != DW_TASK_STATE_RUNNING {
         clear_publication_observer(e6, system, registry_generation, false)?;
         return Ok(Some(PollOutcome::RecoverDevmgr));
     }
@@ -828,7 +829,8 @@ pub(super) fn commit_registry_replacement(
 mod tests {
     use super::*;
     use deepwyrm_syscall::{
-        DW_SIGNAL_READABLE, DW_TASK_STATE_RUNNING, DW_TERMINATION_NORMAL_EXIT, DwStatus,
+        DW_SIGNAL_READABLE, DW_TASK_STATE_CREATED, DW_TASK_STATE_RUNNING,
+        DW_TERMINATION_NORMAL_EXIT, DwStatus,
     };
 
     const FAILURE: NativeError = NativeError::Status(DwStatus(-1));
@@ -1204,6 +1206,32 @@ mod tests {
         let mut platform = ObserverPlatform::generation(observed, observed.deadline - 1);
         let mut waits = ObserverWaits {
             state: DW_TASK_STATE_EXITED,
+            query_count: 0,
+        };
+        assert_eq!(
+            poll_publication_observer_state(
+                &mut e6,
+                Some(driver_attempt()),
+                observed.grant.registry_generation,
+                &mut platform,
+                &mut waits,
+                observed.deadline - 1,
+            ),
+            Ok(Some(PollOutcome::RecoverDevmgr))
+        );
+        assert_eq!(waits.query_count, 1);
+        assert_eq!(platform.closed[..platform.close_count], [observed.client]);
+        assert!(e6.publication_observer.is_none());
+    }
+
+    #[test]
+    fn exact_queued_watch_requires_driver_to_be_running() {
+        let observed = observer();
+        let mut e6 = State::new(observed.grant.registry_generation).unwrap();
+        e6.publication_observer = Some(observed);
+        let mut platform = ObserverPlatform::generation(observed, observed.deadline - 1);
+        let mut waits = ObserverWaits {
+            state: DW_TASK_STATE_CREATED,
             query_count: 0,
         };
         assert_eq!(

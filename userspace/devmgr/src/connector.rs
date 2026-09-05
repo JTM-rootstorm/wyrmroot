@@ -220,6 +220,29 @@ pub enum DirectClientReleaseEvent {
     Malformed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProductionPublicationEvent {
+    Offer,
+    Retire,
+    Malformed,
+}
+
+/// Classifies the old registry publication endpoint before any connector
+/// offer is received. Peer closure invalidates the generation and dominates
+/// co-observed readable data.
+pub const fn classify_production_publication(
+    readable: bool,
+    peer_closed: bool,
+) -> ProductionPublicationEvent {
+    if peer_closed {
+        ProductionPublicationEvent::Retire
+    } else if readable {
+        ProductionPublicationEvent::Offer
+    } else {
+        ProductionPublicationEvent::Malformed
+    }
+}
+
 /// The retained direct CONNECT endpoint is only a lifetime witness. Data on
 /// it is never a release certificate, including when READABLE and PEER_CLOSED
 /// are co-observed.
@@ -925,6 +948,42 @@ mod tests {
             production_cleanup_deadline(u64::MAX - PRODUCTION_CLEANUP_TIMEOUT_NS),
             Err(ConnectorModelError::InternalFailure)
         );
+    }
+
+    #[test]
+    fn production_publication_peer_close_dominates_co_ready_offer() {
+        assert_eq!(
+            classify_production_publication(true, true),
+            ProductionPublicationEvent::Retire
+        );
+        assert_eq!(
+            classify_production_publication(true, false),
+            ProductionPublicationEvent::Offer
+        );
+        assert_eq!(
+            classify_production_publication(false, true),
+            ProductionPublicationEvent::Retire
+        );
+        assert_eq!(
+            classify_production_publication(false, false),
+            ProductionPublicationEvent::Malformed
+        );
+
+        let mut broker = ConnectorBroker::new(Some(driver(10, 1)), 100, 200).unwrap();
+        let attach = attach_once(&mut broker, 10, 7);
+        let mut offers_consumed = 0;
+        match classify_production_publication(true, true) {
+            ProductionPublicationEvent::Offer => offers_consumed += 1,
+            ProductionPublicationEvent::Retire => {
+                assert_eq!(broker.retire_current(), None);
+            }
+            ProductionPublicationEvent::Malformed => panic!("valid co-ready retirement"),
+        }
+        assert_eq!(offers_consumed, 0);
+        assert!(matches!(
+            broker.slot(),
+            ConnectorSlot::RetiringActive { attach: current, .. } if current == attach
+        ));
     }
 
     #[test]

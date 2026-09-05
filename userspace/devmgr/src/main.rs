@@ -106,9 +106,9 @@ use wyrmroot_device_proto::{
 use wyrmroot_devmgr::ControllerAction;
 #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
 use wyrmroot_devmgr::connector::{
-    AttachCorrelation, DirectClientReleaseEvent, ProductionWaitSource,
-    classify_direct_client_release, cleanup_deadline_live, production_cleanup_deadline,
-    production_wait_plan,
+    AttachCorrelation, DirectClientReleaseEvent, ProductionPublicationEvent, ProductionWaitSource,
+    classify_direct_client_release, classify_production_publication, cleanup_deadline_live,
+    production_cleanup_deadline, production_wait_plan,
 };
 #[cfg(any(
     feature = "dw1e3-selector31",
@@ -1181,7 +1181,18 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
         if Some(index) != publication_index {
             return Err(failure(43));
         }
-        if observed.observed.0 & DW_SIGNAL_READABLE.0 != 0 {
+        #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
+        let service_offer = match classify_production_publication(
+            observed.observed.0 & DW_SIGNAL_READABLE.0 != 0,
+            observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0,
+        ) {
+            ProductionPublicationEvent::Offer => true,
+            ProductionPublicationEvent::Retire => false,
+            ProductionPublicationEvent::Malformed => return Err(failure(312)),
+        };
+        #[cfg(not(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32"))))]
+        let service_offer = observed.observed.0 & DW_SIGNAL_READABLE.0 != 0;
+        if service_offer {
             #[cfg(any(
                 feature = "dw1e3-selector31",
                 feature = "wyr1d-selector32",

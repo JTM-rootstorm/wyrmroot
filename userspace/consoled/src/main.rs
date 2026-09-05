@@ -17,7 +17,7 @@ use wyrmroot_consoled::{
     ChildPolicy, CleanupDisposition, ConnectRequest, ConsoleModel, EventGeneration,
     FAIR_SOURCE_BYTES_PER_TURN, LaunchCleanupEvidence, LaunchTransaction, OutputSource,
     RecoveryAction, Reservation, STAGING_CAPACITY, SerialCorrelation, StreamKind,
-    release_raw_then_witness,
+    cleanup_after_event_loop_failure, release_raw_then_witness,
 };
 #[cfg(feature = "wyr1e-wyrmsh")]
 use wyrmroot_consoled::{ReleaseWitnessEvent, classify_release_witness};
@@ -82,6 +82,7 @@ struct StartupAuthorities {
 struct SerialSession {
     identity: ConnectorIdentity,
     watch: Option<ActiveWatch>,
+    raw_owned: bool,
     #[cfg(feature = "wyr1e-wyrmsh")]
     release_witness: Option<DwHandle>,
     input: NativeInput,
@@ -102,9 +103,15 @@ fn close_serial_session(serial: &mut SerialSession) -> Result<(), u32> {
     let witness = serial.release_witness.take();
     #[cfg(not(feature = "wyr1e-wyrmsh"))]
     let witness: Option<DwHandle> = None;
-    if !release_raw_then_witness(serial.endpoint(), witness, |handle| {
-        close_handle(handle).is_ok()
-    }) {
+    let raw = serial.raw_owned.then(|| serial.endpoint());
+    // A failed close leaves ownership ambiguous. Consume it before the
+    // attempt so outer fatal cleanup cannot retry a possibly released handle.
+    serial.raw_owned = false;
+    let closed = match raw {
+        Some(raw) => release_raw_then_witness(raw, witness, |handle| close_handle(handle).is_ok()),
+        None => witness.is_none_or(|handle| close_handle(handle).is_ok()),
+    };
+    if !closed {
         Err(FATAL_ATTACH_BASE | 101)
     } else {
         Ok(())
@@ -398,7 +405,31 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
         return Err(12);
     }
 
-    event_loop(authorities, &mut transactions, &mut model, serial, child)
+    let result = event_loop(
+        authorities,
+        &mut transactions,
+        &mut model,
+        &mut serial,
+        &mut child,
+    );
+    if let Err(error) = result {
+        // Event-loop failures still own the exact serial generation. Release
+        // raw and witness first, then its watch and child stream custody.
+        let cleaned = cleanup_after_event_loop_failure(
+            &mut serial,
+            &mut child,
+            |serial| close_serial_session(serial).is_ok(),
+            |serial| retire_publication_watch(authorities, &mut transactions, serial).is_ok(),
+            |child| close_child_streams(child).is_ok(),
+        );
+        close_authorities(authorities);
+        return if !cleaned {
+            Err(FATAL_ATTACH_BASE | 104)
+        } else {
+            Err(error)
+        };
+    }
+    result
 }
 
 fn attach_serial(
@@ -529,6 +560,7 @@ fn attach_serial(
     Ok(SerialSession {
         identity,
         watch: Some(active_watch),
+        raw_owned: true,
         #[cfg(feature = "wyr1e-wyrmsh")]
         release_witness: Some(direct),
         input: NativeInput::new(validated_stream_endpoint(received[0].handle).map_err(|_| 24u32)?),
@@ -1222,8 +1254,8 @@ fn event_loop(
     authorities: StartupAuthorities,
     transactions: &mut TransactionIds,
     model: &mut ConsoleModel,
-    mut serial: SerialSession,
-    mut child: ChildSession,
+    serial: &mut SerialSession,
+    child: &mut ChildSession,
 ) -> Result<u32, u32> {
     #[cfg(feature = "wyr1d-selector32")]
     let mut capture = wyrmroot_consoled::selector32::Capture::new(authorities.selector_nonce)
