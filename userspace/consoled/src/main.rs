@@ -1254,8 +1254,8 @@ fn event_loop(
     authorities: StartupAuthorities,
     transactions: &mut TransactionIds,
     model: &mut ConsoleModel,
-    serial: &mut SerialSession,
-    child: &mut ChildSession,
+    mut serial: &mut SerialSession,
+    mut child: &mut ChildSession,
 ) -> Result<u32, u32> {
     #[cfg(feature = "wyr1d-selector32")]
     let mut capture = wyrmroot_consoled::selector32::Capture::new(authorities.selector_nonce)
