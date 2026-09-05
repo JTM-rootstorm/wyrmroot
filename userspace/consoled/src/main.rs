@@ -10,13 +10,13 @@ use stream_transfer::move_transfer;
 use deepwyrm_syscall::{
     DW_HANDLE_TRANSFER_MOVE, DW_OBJECT_TYPE_CHANNEL, DW_RIGHT_DUPLICATE, DW_RIGHT_INSPECT,
     DW_RIGHT_READ, DW_RIGHT_TRANSFER, DW_RIGHT_WAIT, DW_RIGHT_WRITE, DW_SIGNAL_PEER_CLOSED,
-    DW_SIGNAL_READABLE, DW_SIGNAL_WRITABLE, DW_STATUS_TIMED_OUT, DwDeadline, DwHandle,
-    DwHandleTransferV1, DwReceivedHandleInfoV1, DwRights, DwSignals, DwWaitItemV1,
+    DW_SIGNAL_READABLE, DW_SIGNAL_WRITABLE, DW_STATUS_TIMED_OUT, DW_STATUS_WOULD_BLOCK, DwDeadline,
+    DwHandle, DwHandleTransferV1, DwReceivedHandleInfoV1, DwRights, DwSignals, DwWaitItemV1,
 };
 use wyrmroot_consoled::{
-    CleanupDisposition, ConnectRequest, ConsoleModel, EventGeneration, FAIR_SOURCE_BYTES_PER_TURN,
-    LaunchCleanupEvidence, LaunchTransaction, OutputSource, RecoveryAction, Reservation,
-    STAGING_CAPACITY, SerialCorrelation, StreamKind,
+    ChildPolicy, CleanupDisposition, ConnectRequest, ConsoleModel, EventGeneration,
+    FAIR_SOURCE_BYTES_PER_TURN, LaunchCleanupEvidence, LaunchTransaction, OutputSource,
+    RecoveryAction, Reservation, STAGING_CAPACITY, SerialCorrelation, StreamKind,
 };
 use wyrmroot_device_proto::connector::{ConnectorIdentity, ConnectorMessage, RECORD_BYTES};
 use wyrmroot_device_proto::{
@@ -25,8 +25,9 @@ use wyrmroot_device_proto::{
 };
 use wyrmroot_launch_proto::{
     ErrorCode as LaunchErrorCode, MAX_LAUNCH_MESSAGE_BYTES, Message as LaunchMessage,
-    MessageType as LaunchMessageType, Reservation as LaunchReservation, encode_job_message,
-    encode_launch, parse_message as parse_launch_message,
+    MessageType as LaunchMessageType, Reservation as LaunchReservation, ShellV1Reply,
+    ShellV1Request, encode_job_message, encode_launch, encode_shell_v1_request,
+    parse_message as parse_launch_message, parse_shell_v1_reply,
 };
 use wyrmroot_loader::launch::{
     CHILD_CHANNEL_RIGHTS, CONSOLED_BYTES, LaunchProfile, encode_ready_for_profile,
@@ -46,8 +47,8 @@ use wyrmroot_runtime::{
 };
 
 const FAILURE_BASE: u32 = 0xD400_0000;
-const CHILD_PATH: &str = "bin/console-echo";
 const EVENT_TICK_NS: u64 = 1_000_000_000;
+const STATUS_SEND_TIMEOUT_NS: u64 = 1_000_000_000;
 const NANOS_PER_MILLI: u64 = 1_000_000;
 const FATAL_ATTACH_BASE: u32 = 0x0000_0100;
 
@@ -101,6 +102,12 @@ struct ChildSession {
     stdin: NativeOutput,
     stdout: NativeInput,
     stderr: NativeInput,
+    status: Option<StatusChannel>,
+}
+
+struct StatusChannel {
+    endpoint: DwHandle,
+    session: wyrmroot_console_proto::StatusSession,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -116,6 +123,7 @@ enum LaunchReply {
 #[derive(Clone, Copy)]
 enum ChildFault {
     Peer(StreamKind),
+    Status,
     WrongDirection,
 }
 
@@ -791,6 +799,7 @@ fn launch_child_once(
     model: &mut ConsoleModel,
     serial: &mut SerialSession,
 ) -> Result<LaunchChildOutcome, u32> {
+    let policy = ChildPolicy::selected();
     let transaction_id = transactions.take()?;
     let mut retained = [DwHandle(0); 3];
     let mut child = [DwHandle(0); 3];
@@ -816,22 +825,73 @@ fn launch_child_once(
         }
     };
 
+    let mut status_retained = DwHandle(0);
+    let mut status_child = DwHandle(0);
+    let mut status_generation = 0;
+    let mut status_session = None;
+    if policy == ChildPolicy::Wyrmsh {
+        status_generation = match transactions.take() {
+            Ok(value) => value,
+            Err(error) => {
+                finish_launch_abort(model, model_launch, &retained, &child, false)?;
+                return Err(error);
+            }
+        };
+        match create_reduced_stream_pair() {
+            Ok((local, peer)) => {
+                status_retained = local;
+                status_child = peer;
+            }
+            Err(_) => {
+                finish_launch_abort(model, model_launch, &retained, &child, false)?;
+                return Err(42);
+            }
+        }
+        status_session =
+            match wyrmroot_console_proto::StatusSession::new(wyrmroot_console_proto::Relationship {
+                console_generation: model_launch.console_generation(),
+                status_generation,
+                child_generation: model_launch.child_generation(),
+                outer_launch_transaction: model_launch.outer_launch_transaction(),
+            }) {
+                Ok(session) => Some(session),
+                Err(_) => {
+                    close_status_pair(status_retained, status_child)?;
+                    finish_launch_abort(model, model_launch, &retained, &child, false)?;
+                    return Err(42);
+                }
+            };
+    }
+
     let reservation = LaunchReservation {
         connection_id: authorities.launch_connection_id,
         generation: authorities.launch_connection_generation,
         transaction_id,
     };
     let mut bytes = [0u8; MAX_LAUNCH_MESSAGE_BYTES];
-    let size = match encode_launch(
-        reservation,
-        CHILD_PATH,
-        &[CHILD_PATH],
-        &[],
-        true,
-        &mut bytes,
-    ) {
+    let encoded = match policy {
+        ChildPolicy::ConsoleEcho => encode_launch(
+            reservation,
+            policy.path(),
+            &[policy.path()],
+            &[],
+            true,
+            &mut bytes,
+        ),
+        ChildPolicy::Wyrmsh => encode_shell_v1_request(
+            reservation,
+            ShellV1Request {
+                console_generation: model_launch.console_generation(),
+                status_generation,
+                requested_child_generation: model_launch.child_generation(),
+            },
+            &mut bytes,
+        ),
+    };
+    let size = match encoded {
         Ok(size) => size,
         Err(_) => {
+            close_status_pair(status_retained, status_child)?;
             finish_launch_abort(model, model_launch, &retained, &child, false)?;
             return Err(43);
         }
@@ -840,14 +900,24 @@ fn launch_child_once(
         move_transfer(child[0]),
         move_transfer(child[1]),
         move_transfer(child[2]),
+        move_transfer(status_child),
     ];
-    if send_channel(authorities.launch, &bytes[..size], &transfers).is_err() {
+    let transfer_count = if policy == ChildPolicy::Wyrmsh { 4 } else { 3 };
+    if send_channel(
+        authorities.launch,
+        &bytes[..size],
+        &transfers[..transfer_count],
+    )
+    .is_err()
+    {
         // Channel MOVE is atomic: a failed send leaves every child peer local.
+        close_status_pair(status_retained, status_child)?;
         finish_launch_abort(model, model_launch, &retained, &child, false)?;
         return Err(44);
     }
     for kind in [StreamKind::Stdin, StreamKind::Stdout, StreamKind::Stderr] {
         if model_launch.move_child_peer(kind).is_err() {
+            close_status_retained(status_retained, status_session.as_mut())?;
             close_handle_array_reverse(&retained);
             // The native MOVE already committed, but no correlated launch
             // response proves revocation. Closing the launch session on fatal
@@ -855,7 +925,15 @@ fn launch_child_once(
             return Err(48);
         }
     }
-    let response = match wait_launch_with_serial(authorities, serial, reservation) {
+    let response = match wait_launch_with_serial(
+        authorities,
+        serial,
+        reservation,
+        policy,
+        model,
+        status_retained,
+        status_session.as_mut(),
+    ) {
         Ok(LaunchWaitOutcome::Reply(response)) => response,
         Ok(LaunchWaitOutcome::SerialLost) => {
             let old_serial = serial_correlation(authorities, serial.identity);
@@ -869,9 +947,10 @@ fn launch_child_once(
             }
             retire_publication_watch(authorities, transactions, serial)?;
             close_attempt_handles(core::slice::from_ref(&serial.endpoint()))?;
-            let resolved = match receive_launch(authorities.launch, reservation) {
+            let resolved = match receive_initial_launch(authorities.launch, reservation, policy) {
                 Ok(reply) => reply,
                 Err(_) => {
+                    close_status_retained(status_retained, status_session.as_mut())?;
                     close_handle_array_reverse(&retained);
                     return Err(45);
                 }
@@ -879,16 +958,19 @@ fn launch_child_once(
             match resolved {
                 LaunchReply::LaunchAccepted(job_id) => {
                     if cleanup_unmodeled_job(authorities, transactions, job_id).is_err() {
+                        close_status_retained(status_retained, status_session.as_mut())?;
                         close_handle_array_reverse(&retained);
                         return Err(45);
                     }
                 }
                 LaunchReply::Error(code) if code != LaunchErrorCode::CleanupFailure => {}
                 _ => {
+                    close_status_retained(status_retained, status_session.as_mut())?;
                     close_handle_array_reverse(&retained);
                     return Err(45);
                 }
             }
+            close_status_retained(status_retained, status_session.as_mut())?;
             finish_launch_abort(model, model_launch, &retained, &child, true)?;
             return match model.take_recovery_action() {
                 Some(RecoveryAction::RetrySerialAt(deadline)) => {
@@ -898,6 +980,7 @@ fn launch_child_once(
             };
         }
         Err(_) => {
+            close_status_retained(status_retained, status_session.as_mut())?;
             close_handle_array_reverse(&retained);
             // Do not complete the model abort without proof that launchd
             // revoked the three moved peers.
@@ -909,10 +992,12 @@ fn launch_child_once(
         LaunchReply::Error(code) if code != LaunchErrorCode::CleanupFailure => {
             // An exact correlated rejection is proof that launchd completed
             // cleanup for every moved child peer before replying.
+            close_status_retained(status_retained, status_session.as_mut())?;
             finish_launch_abort(model, model_launch, &retained, &child, true)?;
             return Err(47);
         }
         _ => {
+            close_status_retained(status_retained, status_session.as_mut())?;
             close_handle_array_reverse(&retained);
             return Err(47);
         }
@@ -922,9 +1007,11 @@ fn launch_child_once(
         Ok(modeled) => modeled,
         Err(_) => {
             if cleanup_unmodeled_job(authorities, transactions, job_id).is_err() {
+                close_status_retained(status_retained, status_session.as_mut())?;
                 close_handle_array_reverse(&retained);
                 return Err(49);
             }
+            close_status_retained(status_retained, status_session.as_mut())?;
             finish_launch_abort(model, model_launch, &retained, &child, true)?;
             return Err(49);
         }
@@ -937,6 +1024,7 @@ fn launch_child_once(
     ) {
         (Ok(stdin), Ok(stdout), Ok(stderr)) => (stdin, stdout, stderr),
         _ => {
+            close_status_retained(status_retained, status_session.as_mut())?;
             close_handle_array_reverse(&retained);
             if let Ok(now) = now_millis() {
                 let _ = model.wrong_direction_data(event, now);
@@ -951,12 +1039,14 @@ fn launch_child_once(
     let ready = match model.observe_child_ready(event, now_millis()?) {
         Ok(ready) => ready,
         Err(_) => {
+            close_status_retained(status_retained, status_session.as_mut())?;
             close_handle_array_reverse(&retained);
             let _ = cleanup_unmodeled_job(authorities, transactions, job_id);
             return Err(51);
         }
     };
     if EventGeneration::from(ready.ids) != event {
+        close_status_retained(status_retained, status_session.as_mut())?;
         close_handle_array_reverse(&retained);
         let _ = cleanup_unmodeled_job(authorities, transactions, job_id);
         return Err(52);
@@ -964,6 +1054,7 @@ fn launch_child_once(
     let wait = match start_job_wait(authorities, transactions, job_id) {
         Ok(wait) => wait,
         Err(_) => {
+            close_status_retained(status_retained, status_session.as_mut())?;
             close_handle_array_reverse(&retained);
             let _ = cleanup_unmodeled_job(authorities, transactions, job_id);
             return Err(52);
@@ -976,6 +1067,10 @@ fn launch_child_once(
         stdin: NativeOutput::new(endpoints.0),
         stdout: NativeInput::new(endpoints.1),
         stderr: NativeInput::new(endpoints.2),
+        status: status_session.map(|session| StatusChannel {
+            endpoint: status_retained,
+            session,
+        }),
     }))
 }
 
@@ -983,35 +1078,59 @@ fn wait_launch_with_serial(
     authorities: StartupAuthorities,
     serial: &mut SerialSession,
     reservation: LaunchReservation,
+    policy: ChildPolicy,
+    model: &ConsoleModel,
+    status_endpoint: DwHandle,
+    mut status_session: Option<&mut wyrmroot_console_proto::StatusSession>,
 ) -> Result<LaunchWaitOutcome, u32> {
     let deadline = monotonic_active_now()
         .map_err(|_| 45u32)?
         .checked_add(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
         .ok_or(45u32)?;
-    let items = [
-        wait_item(
+    loop {
+        let mut items = [DwWaitItemV1::default(); 4];
+        items[0] = wait_item(
             authorities.registry,
             DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
-        ),
-        wait_item(serial.endpoint(), DW_SIGNAL_PEER_CLOSED),
-        wait_item(
+        );
+        items[1] = wait_item(serial.endpoint(), DW_SIGNAL_PEER_CLOSED);
+        items[2] = wait_item(
             authorities.launch,
             DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
-        ),
-    ];
-    let observed = wait_many(&items, DwDeadline(deadline)).map_err(|_| 45u32)?;
-    match observed.index {
-        0 if observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 => Err(45),
-        0 => {
-            receive_publication_change(authorities, serial)?;
-            Ok(LaunchWaitOutcome::SerialLost)
+        );
+        let used = if let Some(session) = status_session.as_deref() {
+            if !session.is_open() || status_endpoint.0 == 0 {
+                return Err(45);
+            }
+            items[3] = wait_item(
+                status_endpoint,
+                DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+            );
+            4
+        } else {
+            3
+        };
+        let observed = wait_many(&items[..used], DwDeadline(deadline)).map_err(|_| 45u32)?;
+        match observed.index {
+            0 if observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 => return Err(45),
+            0 => {
+                receive_publication_change(authorities, serial)?;
+                return Ok(LaunchWaitOutcome::SerialLost);
+            }
+            1 => return Ok(LaunchWaitOutcome::SerialLost),
+            2 if observed.observed.0 & DW_SIGNAL_READABLE.0 != 0 => {
+                return receive_initial_launch(authorities.launch, reservation, policy)
+                    .map(LaunchWaitOutcome::Reply);
+            }
+            2 => return Err(45),
+            3 if observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 => return Err(45),
+            3 => serve_status(
+                status_endpoint,
+                status_session.as_deref_mut().ok_or(45u32)?,
+                model,
+            )?,
+            _ => return Err(45),
         }
-        1 => Ok(LaunchWaitOutcome::SerialLost),
-        2 if observed.observed.0 & DW_SIGNAL_READABLE.0 != 0 => {
-            receive_launch(authorities.launch, reservation).map(LaunchWaitOutcome::Reply)
-        }
-        2 => Err(45),
-        _ => Err(45),
     }
 }
 
@@ -1054,7 +1173,7 @@ fn event_loop(
         observe_exact_ready(model, &serial, &child, 55)?;
         let deadline = now.checked_add(EVENT_TICK_NS).ok_or(54u32)?;
         let snapshot = model.snapshot();
-        let mut items = [DwWaitItemV1::default(); 10];
+        let mut items = [DwWaitItemV1::default(); 11];
         let mut data_classes = [DataClass::Raw; 4];
         // Control and every retirement signal precede rotating data work.
         items[0] = wait_item(
@@ -1072,6 +1191,15 @@ fn event_loop(
         );
         items[4] = wait_item(child.stdout.endpoint().handle(), DW_SIGNAL_PEER_CLOSED);
         items[5] = wait_item(child.stderr.endpoint().handle(), DW_SIGNAL_PEER_CLOSED);
+        let data_base = if let Some(status) = child.status.as_ref() {
+            items[6] = wait_item(
+                status.endpoint,
+                DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+            );
+            7
+        } else {
+            6
+        };
 
         let raw_writable = if output_pending.is_empty() {
             0
@@ -1094,7 +1222,7 @@ fn event_loop(
             <= STAGING_CAPACITY.saturating_sub(2 * FAIR_SOURCE_BYTES_PER_TURN);
         let stderr_readable = snapshot.stderr_queued
             <= STAGING_CAPACITY.saturating_sub(2 * FAIR_SOURCE_BYTES_PER_TURN);
-        let mut used = 6;
+        let mut used = data_base;
         for class in next_data.order() {
             let (handle, signals) = match class {
                 DataClass::Raw => (serial.endpoint(), DwSignals(raw_readable | raw_writable)),
@@ -1118,7 +1246,7 @@ fn event_loop(
             };
             if signals.0 != 0 {
                 items[used] = wait_item(handle, signals);
-                data_classes[used - 6] = class;
+                data_classes[used - data_base] = class;
                 used += 1;
             }
         }
@@ -1221,11 +1349,40 @@ fn event_loop(
                 next_data = DataClass::Raw;
                 continue;
             }
+            6 if data_base == 7 => {
+                let failed = if signals & DW_SIGNAL_PEER_CLOSED.0 != 0 {
+                    true
+                } else if signals & DW_SIGNAL_READABLE.0 != 0 {
+                    let status = child.status.as_mut().ok_or(61u32)?;
+                    serve_status(status.endpoint, &mut status.session, model).is_err()
+                } else {
+                    true
+                };
+                if failed {
+                    recover_child(
+                        authorities,
+                        transactions,
+                        model,
+                        &mut serial,
+                        &mut child,
+                        &mut input_pending,
+                        &mut output_pending,
+                        ChildFault::Status,
+                    )?;
+                }
+                next_data = DataClass::Raw;
+                continue;
+            }
             _ => {}
         }
 
-        let class_index =
-            usize::try_from(observed.index.checked_sub(6).ok_or(61u32)?).map_err(|_| 61u32)?;
+        let class_index = usize::try_from(
+            observed
+                .index
+                .checked_sub(u32::try_from(data_base).map_err(|_| 61u32)?)
+                .ok_or(61u32)?,
+        )
+        .map_err(|_| 61u32)?;
         let class = *data_classes.get(class_index).ok_or(61u32)?;
         next_data = class.next();
         match class {
@@ -1497,12 +1654,14 @@ fn recover_child(
 ) -> Result<(), u32> {
     let action = match fault {
         ChildFault::Peer(kind) => model.child_peer_closed(child.event, kind, now_millis()?),
+        ChildFault::Status => model.status_peer_closed(child.event, now_millis()?),
         ChildFault::WrongDirection => model.wrong_direction_data(child.event, now_millis()?),
     }
     .map_err(|_| 62u32)?;
     if !matches!(action, RecoveryAction::TerminateChild(job) if job == child.job_id) {
         return Err(63);
     }
+    close_child_status(child)?;
     let wait_resolution = cancel_child_wait(authorities, transactions, child)?;
     let stream_failed = close_child_streams(child).is_err();
     let observed_failed = model
@@ -1830,6 +1989,133 @@ fn receive_launch(channel: DwHandle, expected: LaunchReservation) -> Result<Laun
         return Err(79);
     }
     Ok(reply)
+}
+
+fn receive_initial_launch(
+    channel: DwHandle,
+    expected: LaunchReservation,
+    policy: ChildPolicy,
+) -> Result<LaunchReply, u32> {
+    if policy == ChildPolicy::ConsoleEcho {
+        return receive_launch(channel, expected);
+    }
+    wait_readable(channel).map_err(|_| 75u32)?;
+    let mut bytes = [0u8; 128];
+    let mut handles = [DwReceivedHandleInfoV1::default(); 1];
+    let counts = receive_channel(channel, &mut bytes, &mut handles).map_err(|_| 76u32)?;
+    if counts.handles != 0 {
+        close_received(&handles, counts.handles);
+        return Err(77);
+    }
+    let parsed = parse_shell_v1_reply(&bytes[..counts.bytes], 0).map_err(|_| 78u32)?;
+    if parsed.reservation != expected {
+        return Err(79);
+    }
+    match parsed.reply {
+        ShellV1Reply::LaunchAccepted { job_id } => Ok(LaunchReply::LaunchAccepted(job_id)),
+        ShellV1Reply::Error { code } => Ok(LaunchReply::Error(code)),
+    }
+}
+
+fn serve_status(
+    endpoint: DwHandle,
+    session: &mut wyrmroot_console_proto::StatusSession,
+    model: &ConsoleModel,
+) -> Result<(), u32> {
+    let mut bytes = [0u8; wyrmroot_console_proto::MAX_MESSAGE_BYTES];
+    let mut handles = [DwReceivedHandleInfoV1::default(); 1];
+    let counts = receive_channel(endpoint, &mut bytes, &mut handles).map_err(|_| 101u32)?;
+    if counts.handles != 0 {
+        close_received(&handles, counts.handles);
+        return Err(102);
+    }
+    let message = &bytes[..counts.bytes];
+    let header = wyrmroot_console_proto::parse_header(message, 0).map_err(|_| 103u32)?;
+    let decoded = wyrmroot_console_proto::decode(message, 0);
+    let ticket = match session.admit(header) {
+        Ok(ticket) => ticket,
+        Err(code) => {
+            let size = wyrmroot_console_proto::encode_error(header, code, &mut bytes)
+                .map_err(|_| 104u32)?;
+            return send_status_bounded(endpoint, &bytes[..size], header);
+        }
+    };
+    if decoded != Ok(wyrmroot_console_proto::Message::Query(header)) {
+        let size = wyrmroot_console_proto::encode_error(
+            header,
+            wyrmroot_console_proto::ErrorCode::Malformed,
+            &mut bytes,
+        )
+        .map_err(|_| 104u32)?;
+        send_status_bounded(endpoint, &bytes[..size], header)?;
+        session.complete(ticket).map_err(|_| 105u32)?;
+        return Ok(());
+    }
+    let snapshot = match model.status_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            let size = wyrmroot_console_proto::encode_error(
+                header,
+                wyrmroot_console_proto::ErrorCode::Unavailable,
+                &mut bytes,
+            )
+            .map_err(|_| 106u32)?;
+            send_status_bounded(endpoint, &bytes[..size], header)?;
+            session.complete(ticket).map_err(|_| 106u32)?;
+            return Ok(());
+        }
+    };
+    let relationship = session.relationship();
+    if snapshot.flags & wyrmroot_console_proto::FLAG_CHILD_PRESENT != 0
+        && (snapshot.child_generation != relationship.child_generation
+            || snapshot.outer_launch_transaction != relationship.outer_launch_transaction)
+    {
+        return Err(107);
+    }
+    let size = wyrmroot_console_proto::encode_snapshot(header, snapshot, &mut bytes)
+        .map_err(|_| 108u32)?;
+    send_status_bounded(endpoint, &bytes[..size], header)?;
+    session.complete(ticket).map_err(|_| 109)
+}
+
+fn send_status_bounded(
+    endpoint: DwHandle,
+    bytes: &[u8],
+    header: wyrmroot_console_proto::Header,
+) -> Result<(), u32> {
+    match send_channel(endpoint, bytes, &[]) {
+        Ok(()) => return Ok(()),
+        Err(NativeError::Status(status)) if status == DW_STATUS_WOULD_BLOCK => {}
+        Err(_) => return Err(110),
+    }
+    let deadline = monotonic_active_now()
+        .map_err(|_| 110u32)?
+        .checked_add(STATUS_SEND_TIMEOUT_NS)
+        .ok_or(110u32)?;
+    match wait_one(
+        endpoint,
+        DwSignals(DW_SIGNAL_WRITABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+        DwDeadline(deadline),
+    ) {
+        Ok(observed)
+            if observed.observed.0 & DW_SIGNAL_WRITABLE.0 != 0
+                && observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 == 0 =>
+        {
+            send_channel(endpoint, bytes, &[]).map_err(|_| 111)
+        }
+        Err(NativeError::Status(status)) if status == DW_STATUS_TIMED_OUT => {
+            let mut unavailable = [0u8; wyrmroot_console_proto::ERROR_BYTES];
+            if let Ok(size) = wyrmroot_console_proto::encode_error(
+                header,
+                wyrmroot_console_proto::ErrorCode::Unavailable,
+                &mut unavailable,
+            ) {
+                let _ = send_channel(endpoint, &unavailable[..size], &[]);
+            }
+            Err(112)
+        }
+        _ => Err(113),
+    }
 }
 
 fn receive_launch_any(channel: DwHandle) -> Result<(LaunchReservation, LaunchReply), u32> {
@@ -2191,14 +2477,47 @@ fn discard_one_record(endpoint: DwHandle) {
 }
 
 fn close_child_streams(child: &mut ChildSession) -> Result<(), u32> {
+    let mut failed = close_child_status(child).is_err();
     let handles = [
         child.stdin.endpoint().handle(),
         child.stdout.endpoint().handle(),
         child.stderr.endpoint().handle(),
     ];
-    let mut failed = false;
     for handle in handles.into_iter().rev() {
         failed |= close_handle(handle).is_err();
+    }
+    if failed { Err(93) } else { Ok(()) }
+}
+
+fn close_child_status(child: &mut ChildSession) -> Result<(), u32> {
+    let Some(mut status) = child.status.take() else {
+        return Ok(());
+    };
+    status.session.close();
+    close_handle(status.endpoint).map_err(|_| 93)
+}
+
+fn close_status_retained(
+    endpoint: DwHandle,
+    session: Option<&mut wyrmroot_console_proto::StatusSession>,
+) -> Result<(), u32> {
+    if let Some(session) = session {
+        session.close();
+    }
+    if endpoint.0 != 0 && close_handle(endpoint).is_err() {
+        Err(93)
+    } else {
+        Ok(())
+    }
+}
+
+fn close_status_pair(retained: DwHandle, child: DwHandle) -> Result<(), u32> {
+    let mut failed = false;
+    if child.0 != 0 {
+        failed |= close_handle(child).is_err();
+    }
+    if retained.0 != 0 {
+        failed |= close_handle(retained).is_err();
     }
     if failed { Err(93) } else { Ok(()) }
 }

@@ -19,6 +19,7 @@ required-features = ["native-consoled"]
 [features]
 default = []
 wyr1d-selector32 = []
+wyr1e-wyrmsh = []
 native-consoled = [
     "dep:deepwyrm-syscall",
     "dep:wyrmroot-device-proto",
@@ -28,6 +29,9 @@ native-consoled = [
     "dep:wyrmroot-runtime",
     "dep:wyrmroot-stream-proto",
 ]
+
+[dependencies]
+wyrmroot-console-proto = { path = "../../crates/wyrmroot-console-proto" }
 
 [target.'cfg(target_os = "wyrmroot")'.dependencies]
 deepwyrm-syscall = { workspace = true, optional = true }
