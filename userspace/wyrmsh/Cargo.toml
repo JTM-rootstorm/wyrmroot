@@ -1,0 +1,32 @@
+[package]
+name = "wyrmroot-wyrmsh"
+version.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later"
+repository.workspace = true
+publish = false
+description = "Allocation-free WYR1-E native recovery shell"
+
+[features]
+default = []
+native-wyrmsh = []
+
+[dependencies]
+deepwyrm-syscall.workspace = true
+wyrmroot-loader = { path = "../../crates/wyrmroot-loader" }
+wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }
+wyrmroot-wyrmsh-core = { path = "../../crates/wyrmroot-wyrmsh-core" }
+
+[dev-dependencies]
+wyrmroot-stream-proto = { path = "../../crates/wyrmroot-stream-proto" }
+
+[[bin]]
+name = "wyrmsh"
+path = "src/main.rs"
+required-features = ["native-wyrmsh"]
+test = false
+bench = false
+
+[lints.rust]
+unsafe_code = "deny"
+unused_crate_dependencies = "deny"

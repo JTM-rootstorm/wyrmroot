@@ -62,6 +62,7 @@ impl<'a> StartupString<'a> {
 pub struct StartupBlock<'a> {
     bytes: &'a [u8],
     address: u64,
+    version: u64,
     bootstrap_channel: BootstrapChannelHandle,
     argv_offset: usize,
     argc: usize,
@@ -232,6 +233,7 @@ impl<'a> StartupBlock<'a> {
         Ok(Self {
             bytes,
             address,
+            version: registers.startup_argument1,
             bootstrap_channel: BootstrapChannelHandle(DwHandle(registers.startup_argument0)),
             argv_offset,
             argc,
@@ -240,6 +242,11 @@ impl<'a> StartupBlock<'a> {
             auxv_offset,
             auxc,
         })
+    }
+
+    /// Returns the validated native startup ABI version selected by RSI.
+    pub const fn version(self) -> u64 {
+        self.version
     }
 
     /// Returns the actual opaque Channel handle passed in RDI.
@@ -559,12 +566,32 @@ mod tests {
     fn parses_empty_environment_and_auxv() {
         let block = valid_block();
         let parsed = StartupBlock::parse(registers(), BASE, &block).unwrap();
+        assert_eq!(parsed.version(), STARTUP_ABI_V1);
         assert_eq!(parsed.bootstrap_channel().raw(), 77);
         assert_eq!(parsed.bootstrap_channel().as_abi(), DwHandle(77));
         assert_eq!(parsed.arg(0).unwrap().as_bytes(), b"arg");
         assert_eq!(parsed.arg(0).unwrap().as_str(), "arg");
         assert_eq!(parsed.envc(), 0);
         assert_eq!(parsed.auxc(), 0);
+    }
+
+    #[test]
+    fn preserves_the_validated_v2_version() {
+        let mut block = [0u8; STARTUP_BLOCK_V2_SIZE];
+        let strings = 48usize;
+        put_word(&mut block, 0, 1);
+        put_word(&mut block, 8, BASE + strings as u64);
+        block[strings..strings + 4].copy_from_slice(b"arg\0");
+        let parsed = StartupBlock::parse(
+            StartupRegisters {
+                startup_argument1: STARTUP_ABI_V2,
+                ..registers()
+            },
+            BASE,
+            &block,
+        )
+        .unwrap();
+        assert_eq!(parsed.version(), STARTUP_ABI_V2);
     }
     #[test]
     fn parses_bounded_nonempty_vectors() {

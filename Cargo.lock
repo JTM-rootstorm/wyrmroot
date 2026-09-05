@@ -438,6 +438,17 @@ name = "wyrmroot-wyr1b-gate-proto"
 version = "0.0.0"
 
 [[package]]
+name = "wyrmroot-wyrmsh"
+version = "0.0.0"
+dependencies = [
+ "deepwyrm-syscall",
+ "wyrmroot-loader",
+ "wyrmroot-runtime",
+ "wyrmroot-stream-proto",
+ "wyrmroot-wyrmsh-core",
+]
+
+[[package]]
 name = "wyrmroot-wyrmsh-core"
 version = "0.0.0"
 
