@@ -40,10 +40,11 @@ This file defines the minimum architecture reading set for Wyrmroot implementati
 
 ## Active implementation status
 
+- [`Plans/WYR1_E3AB_LAUNCH_VALIDATION.md`](WYR1_E3AB_LAUNCH_VALIDATION.md) records additive ShellV1 wire/session scopes and the six-role Wyrmsh loader boundary; full shell construction and consoled/status integration remain E3C/E3D.
 - [`Plans/WYR1_E2_EDITOR_CONTRACT.md`](WYR1_E2_EDITOR_CONTRACT.md) fixes incremental input resynchronization, printable-scalar policy, editor/history submission state and bounded viewport redraw.
 - [`Plans/WYR1_E2_EDITOR_VALIDATION.md`](WYR1_E2_EDITOR_VALIDATION.md) records E2A/E2B host tests, scoped review, source provenance and measured fixed-state/stack-frame evidence; native integration remains later work.
-- [`Plans/WYR1_E1_PARSER_VALIDATION.md`](WYR1_E1_PARSER_VALIDATION.md) records the E1A/E1B pure parser and typed command model, exact grammar/path/arity decisions, bounded property corpus and validation limits. Editor/runtime/product integration remains later work.
-- [`Plans/WYR1_E_WYRMSH_CONTRACT.md`](WYR1_E_WYRMSH_CONTRACT.md) defines the frozen E0B shell scopes, ShellV1 WRLJ 1.1, six-role WRLP 1.11, WRCN status protocol, transactional registry/session ownership, immutable product reservations and parser/editor/job semantics. Production implementation remains E3 and later.
+- [`Plans/WYR1_E1_PARSER_VALIDATION.md`](WYR1_E1_PARSER_VALIDATION.md) records the E1A/E1B pure parser and typed command model, exact grammar/path/arity decisions, bounded property corpus and validation limits. Runtime/product integration remains later work.
+- [`Plans/WYR1_E_WYRMSH_CONTRACT.md`](WYR1_E_WYRMSH_CONTRACT.md) defines the frozen E0B shell scopes, ShellV1 WRLJ 1.1, six-role WRLP 1.11, WRCN status protocol, transactional registry/session ownership, immutable product reservations and parser/editor/job semantics. Reached codec/scope/loader implementation is recorded in the E3A/B validation; construction and later runtime/product work remain pending.
 - [`Plans/WYR1_E0_TRANSITION_INVENTORY.md`](WYR1_E0_TRANSITION_INVENTORY.md) records E0A's source-bound transition inventory, measured toolchain/revision preflight, required-source dispositions, current gaps and the accepted E0B host-model validation and scoped review receipt.
 
 - [`Plans/WYR1_C4_IMPLEMENTATION_STATUS.md`](WYR1_C4_IMPLEMENTATION_STATUS.md) records completed WYR1-C4 production/native intake: exact WRBP V3 and WRLP 1.7/1.9 custody, devmgr-generation resource-domain parenting, generated ABI feature and COM2 claim validation, restart ownership, accepted-product-compiler checks, and explicit C5/C6 nonclaims.
