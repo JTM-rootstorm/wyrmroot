@@ -17,7 +17,10 @@ use wyrmroot_consoled::{
     ChildPolicy, CleanupDisposition, ConnectRequest, ConsoleModel, EventGeneration,
     FAIR_SOURCE_BYTES_PER_TURN, LaunchCleanupEvidence, LaunchTransaction, OutputSource,
     RecoveryAction, Reservation, STAGING_CAPACITY, SerialCorrelation, StreamKind,
+    release_raw_then_witness,
 };
+#[cfg(feature = "wyr1e-wyrmsh")]
+use wyrmroot_consoled::{ReleaseWitnessEvent, classify_release_witness};
 use wyrmroot_device_proto::connector::{ConnectorIdentity, ConnectorMessage, RECORD_BYTES};
 use wyrmroot_device_proto::{
     COM2_ROLE_ID, SERIAL_CONSOLE_CONNECTOR_PUBLICATION_POLICY,
@@ -79,6 +82,8 @@ struct StartupAuthorities {
 struct SerialSession {
     identity: ConnectorIdentity,
     watch: Option<ActiveWatch>,
+    #[cfg(feature = "wyr1e-wyrmsh")]
+    release_witness: Option<DwHandle>,
     input: NativeInput,
     output: NativeOutput,
 }
@@ -87,6 +92,42 @@ impl SerialSession {
     const fn endpoint(&self) -> DwHandle {
         self.input.endpoint().handle()
     }
+}
+
+fn close_serial_session(serial: &mut SerialSession) -> Result<(), u32> {
+    // The raw endpoint is always released first. The retained registry
+    // CONNECT peer is the devmgr-observed certificate for this exact client
+    // generation and therefore cannot be closed before raw custody ends.
+    #[cfg(feature = "wyr1e-wyrmsh")]
+    let witness = serial.release_witness.take();
+    #[cfg(not(feature = "wyr1e-wyrmsh"))]
+    let witness: Option<DwHandle> = None;
+    if !release_raw_then_witness(serial.endpoint(), witness, |handle| {
+        close_handle(handle).is_ok()
+    }) {
+        Err(FATAL_ATTACH_BASE | 101)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "wyr1e-wyrmsh")]
+fn observe_release_witness(serial: &SerialSession, signals: DwSignals) -> Result<(), u32> {
+    let readable = signals.0 & DW_SIGNAL_READABLE.0 != 0;
+    let peer_closed = signals.0 & DW_SIGNAL_PEER_CLOSED.0 != 0;
+    if classify_release_witness(readable, peer_closed) == ReleaseWitnessEvent::Malformed {
+        if !readable {
+            return Err(FATAL_ATTACH_BASE | 103);
+        }
+        let witness = serial.release_witness.ok_or(FATAL_ATTACH_BASE | 102)?;
+        let mut bytes = [0u8; 1];
+        let mut handles = [DwReceivedHandleInfoV1::default(); 1];
+        if let Ok(counts) = receive_channel(witness, &mut bytes, &mut handles) {
+            close_received(&handles, counts.handles);
+        }
+        return Err(FATAL_ATTACH_BASE | 102);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -312,7 +353,7 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
     let child = match launch_child(authorities, &mut transactions, &mut model, &mut serial) {
         Ok(child) => child,
         Err(error) => {
-            let _ = close_handle(serial.endpoint());
+            let _ = close_serial_session(&mut serial);
             close_authorities(authorities);
             let _ = close_handle(bootstrap);
             return Err(error);
@@ -320,8 +361,8 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
     };
     let mut child = child;
     if observe_exact_ready(&mut model, &serial, &child, 9).is_err() {
+        let _ = close_serial_session(&mut serial);
         let _ = cleanup_child_for_exit(authorities, &mut transactions, &mut child);
-        let _ = close_handle(serial.endpoint());
         close_authorities(authorities);
         let _ = close_handle(bootstrap);
         return Err(9);
@@ -335,24 +376,24 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
     ) {
         Ok(size) => size,
         Err(_) => {
+            let _ = close_serial_session(&mut serial);
             let _ = cleanup_child_for_exit(authorities, &mut transactions, &mut child);
-            let _ = close_handle(serial.endpoint());
             close_authorities(authorities);
             let _ = close_handle(bootstrap);
             return Err(10);
         }
     };
     if send_channel(bootstrap, &ready[..ready_size], &[]).is_err() {
+        let _ = close_serial_session(&mut serial);
         let _ = cleanup_child_for_exit(authorities, &mut transactions, &mut child);
-        let _ = close_handle(serial.endpoint());
         close_authorities(authorities);
         let _ = close_handle(bootstrap);
         return Err(11);
     }
     #[cfg(not(feature = "wyr1d-selector32"))]
     if close_handle(bootstrap).is_err() {
+        let _ = close_serial_session(&mut serial);
         let _ = cleanup_child_for_exit(authorities, &mut transactions, &mut child);
-        let _ = close_handle(serial.endpoint());
         close_authorities(authorities);
         return Err(12);
     }
@@ -439,40 +480,57 @@ fn attach_serial(
         finish_connect_abort(model, connect_request, &handles)?;
         return Err(22);
     }
+    #[cfg(not(feature = "wyr1e-wyrmsh"))]
     if close_handle(direct).is_err() {
         let _ = close_handle(received[0].handle);
         let _ = model.abort_connect(connect_request);
         return Err(FATAL_ATTACH_BASE | 23);
     }
+    let attached_at = match now_millis() {
+        Ok(now) => now,
+        Err(error) => {
+            #[cfg(feature = "wyr1e-wyrmsh")]
+            let cleanup = [direct, received[0].handle];
+            #[cfg(not(feature = "wyr1e-wyrmsh"))]
+            let cleanup = [received[0].handle, DwHandle(0)];
+            finish_connect_abort(model, connect_request, &cleanup)?;
+            return Err(error);
+        }
+    };
     let active_watch =
         match begin_publication_watch(authorities, transactions, publication_generation) {
             Ok(watch) => watch,
             Err(error) => {
-                finish_connect_abort(
-                    model,
-                    connect_request,
-                    core::slice::from_ref(&received[0].handle),
-                )?;
+                #[cfg(feature = "wyr1e-wyrmsh")]
+                let cleanup = [direct, received[0].handle];
+                #[cfg(not(feature = "wyr1e-wyrmsh"))]
+                let cleanup = [received[0].handle, DwHandle(0)];
+                finish_connect_abort(model, connect_request, &cleanup)?;
                 return Err(error);
             }
         };
     let correlation = serial_correlation(authorities, identity);
-    if model.attach_connected(correlation, now_millis()?).is_err() {
+    if model.attach_connected(correlation, attached_at).is_err() {
         if cancel_registry_watch(authorities, transactions, active_watch.transaction_id).is_err() {
-            let _ = close_handle(received[0].handle);
-            let _ = model.abort_connect(connect_request);
+            #[cfg(feature = "wyr1e-wyrmsh")]
+            let cleanup = [direct, received[0].handle];
+            #[cfg(not(feature = "wyr1e-wyrmsh"))]
+            let cleanup = [received[0].handle, DwHandle(0)];
+            let _ = finish_connect_abort(model, connect_request, &cleanup);
             return Err(FATAL_ATTACH_BASE | 24);
         }
-        finish_connect_abort(
-            model,
-            connect_request,
-            core::slice::from_ref(&received[0].handle),
-        )?;
+        #[cfg(feature = "wyr1e-wyrmsh")]
+        let cleanup = [direct, received[0].handle];
+        #[cfg(not(feature = "wyr1e-wyrmsh"))]
+        let cleanup = [received[0].handle, DwHandle(0)];
+        finish_connect_abort(model, connect_request, &cleanup)?;
         return Err(24);
     }
     Ok(SerialSession {
         identity,
         watch: Some(active_watch),
+        #[cfg(feature = "wyr1e-wyrmsh")]
+        release_witness: Some(direct),
         input: NativeInput::new(validated_stream_endpoint(received[0].handle).map_err(|_| 24u32)?),
         output: NativeOutput::new(
             validated_stream_endpoint(received[0].handle).map_err(|_| 24u32)?,
@@ -945,8 +1003,8 @@ fn launch_child_once(
             {
                 return Err(45);
             }
+            close_serial_session(serial)?;
             retire_publication_watch(authorities, transactions, serial)?;
-            close_attempt_handles(core::slice::from_ref(&serial.endpoint()))?;
             let resolved = match receive_initial_launch(authorities.launch, reservation, policy) {
                 Ok(reply) => reply,
                 Err(_) => {
@@ -1088,7 +1146,7 @@ fn wait_launch_with_serial(
         .checked_add(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
         .ok_or(45u32)?;
     loop {
-        let mut items = [DwWaitItemV1::default(); 4];
+        let mut items = [DwWaitItemV1::default(); 5];
         items[0] = wait_item(
             authorities.registry,
             DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
@@ -1098,20 +1156,52 @@ fn wait_launch_with_serial(
             authorities.launch,
             DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
         );
-        let used = if let Some(session) = status_session.as_deref() {
+        let mut used = 3;
+        #[cfg(feature = "wyr1e-wyrmsh")]
+        let witness_index = {
+            let index = used;
+            items[index] = wait_item(
+                serial.release_witness.ok_or(45u32)?,
+                DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+            );
+            used += 1;
+            Some(index)
+        };
+        #[cfg(not(feature = "wyr1e-wyrmsh"))]
+        let witness_index: Option<usize> = None;
+        let status_index = if let Some(session) = status_session.as_deref() {
             if !session.is_open() || status_endpoint.0 == 0 {
                 return Err(45);
             }
-            items[3] = wait_item(
+            let index = used;
+            items[index] = wait_item(
                 status_endpoint,
                 DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
             );
-            4
+            used += 1;
+            Some(index)
         } else {
-            3
+            None
         };
         let observed = wait_many(&items[..used], DwDeadline(deadline)).map_err(|_| 45u32)?;
-        match observed.index {
+        let index = usize::try_from(observed.index).map_err(|_| 45u32)?;
+        if witness_index == Some(index) {
+            #[cfg(feature = "wyr1e-wyrmsh")]
+            observe_release_witness(serial, observed.observed)?;
+            return Ok(LaunchWaitOutcome::SerialLost);
+        }
+        if status_index == Some(index) {
+            if observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 {
+                return Err(45);
+            }
+            serve_status(
+                status_endpoint,
+                status_session.as_deref_mut().ok_or(45u32)?,
+                model,
+            )?;
+            continue;
+        }
+        match index {
             0 if observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 => return Err(45),
             0 => {
                 receive_publication_change(authorities, serial)?;
@@ -1123,12 +1213,6 @@ fn wait_launch_with_serial(
                     .map(LaunchWaitOutcome::Reply);
             }
             2 => return Err(45),
-            3 if observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 => return Err(45),
-            3 => serve_status(
-                status_endpoint,
-                status_session.as_deref_mut().ok_or(45u32)?,
-                model,
-            )?,
             _ => return Err(45),
         }
     }
@@ -1173,7 +1257,7 @@ fn event_loop(
         observe_exact_ready(model, &serial, &child, 55)?;
         let deadline = now.checked_add(EVENT_TICK_NS).ok_or(54u32)?;
         let snapshot = model.snapshot();
-        let mut items = [DwWaitItemV1::default(); 11];
+        let mut items = [DwWaitItemV1::default(); 12];
         let mut data_classes = [DataClass::Raw; 4];
         // Control and every retirement signal precede rotating data work.
         items[0] = wait_item(
@@ -1191,7 +1275,7 @@ fn event_loop(
         );
         items[4] = wait_item(child.stdout.endpoint().handle(), DW_SIGNAL_PEER_CLOSED);
         items[5] = wait_item(child.stderr.endpoint().handle(), DW_SIGNAL_PEER_CLOSED);
-        let data_base = if let Some(status) = child.status.as_ref() {
+        let initial_data_base = if let Some(status) = child.status.as_ref() {
             items[6] = wait_item(
                 status.endpoint,
                 DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
@@ -1200,6 +1284,22 @@ fn event_loop(
         } else {
             6
         };
+        #[cfg(feature = "wyr1e-wyrmsh")]
+        let mut data_base = initial_data_base;
+        #[cfg(not(feature = "wyr1e-wyrmsh"))]
+        let data_base = initial_data_base;
+        #[cfg(feature = "wyr1e-wyrmsh")]
+        let witness_index = {
+            let index = data_base;
+            items[index] = wait_item(
+                serial.release_witness.ok_or(61u32)?,
+                DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+            );
+            data_base += 1;
+            Some(index)
+        };
+        #[cfg(not(feature = "wyr1e-wyrmsh"))]
+        let witness_index: Option<usize> = None;
 
         let raw_writable = if output_pending.is_empty() {
             0
@@ -1260,6 +1360,23 @@ fn event_loop(
             Err(_) => return Err(56),
         };
         let signals = observed.observed.0;
+        let observed_index = usize::try_from(observed.index).map_err(|_| 61u32)?;
+
+        if witness_index == Some(observed_index) {
+            #[cfg(feature = "wyr1e-wyrmsh")]
+            observe_release_witness(&serial, observed.observed)?;
+            recover_serial(
+                authorities,
+                transactions,
+                model,
+                &mut serial,
+                &mut child,
+                &mut input_pending,
+                &mut output_pending,
+            )?;
+            next_data = DataClass::Raw;
+            continue;
+        }
 
         match observed.index {
             // Registry retirement and raw close invalidate the serial tuple
@@ -1349,7 +1466,7 @@ fn event_loop(
                 next_data = DataClass::Raw;
                 continue;
             }
-            6 if data_base == 7 => {
+            6 if child.status.is_some() => {
                 let failed = if signals & DW_SIGNAL_PEER_CLOSED.0 != 0 {
                     true
                 } else if signals & DW_SIGNAL_READABLE.0 != 0 {
@@ -1709,16 +1826,16 @@ fn recover_serial(
     if !matches!(action, RecoveryAction::TerminateChild(job) if job == child.job_id) {
         return Err(69);
     }
-    retire_publication_watch(authorities, transactions, serial)?;
+    let raw_failed = close_serial_session(serial).is_err();
+    let watch_failed = retire_publication_watch(authorities, transactions, serial).is_err();
     let wait_resolution = cancel_child_wait(authorities, transactions, child)?;
-    let raw_failed = close_handle(serial.endpoint()).is_err();
     let streams_failed = close_child_streams(child).is_err();
     let observed_failed = model
         .child_streams_closed(child.event, now_millis()?)
         .is_err();
     input_pending.clear();
     output_pending.clear();
-    if raw_failed || streams_failed || observed_failed {
+    if raw_failed || watch_failed || streams_failed || observed_failed {
         return Err(70);
     }
     let retired = match wait_resolution {

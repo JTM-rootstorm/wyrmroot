@@ -104,6 +104,12 @@ use wyrmroot_device_proto::{
     },
 };
 use wyrmroot_devmgr::ControllerAction;
+#[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
+use wyrmroot_devmgr::connector::{
+    AttachCorrelation, DirectClientReleaseEvent, ProductionWaitSource,
+    classify_direct_client_release, cleanup_deadline_live, production_cleanup_deadline,
+    production_wait_plan,
+};
 #[cfg(any(
     feature = "dw1e3-selector31",
     feature = "wyr1d-selector32",
@@ -172,6 +178,13 @@ use wyrmroot_runtime::{
 use wyrmroot_runtime::{create_interrupt, duplicate_handle, interrupt_info};
 
 const FAILURE_BASE: u32 = 0xC101_0000;
+
+#[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
+#[derive(Clone, Copy)]
+struct ProductionClientWitness {
+    handle: DwHandle,
+    attach: AttachCorrelation,
+}
 #[cfg(any(
     not(any(feature = "wyr1c4-production", feature = "wyr1c5-production")),
     feature = "wyr1c5-production"
@@ -320,6 +333,12 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
         feature = "wyr1e-production"
     ))]
     let mut connector_broker: Option<ConnectorBroker> = None;
+    #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
+    let mut production_witness: Option<ProductionClientWitness> = None;
+    #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
+    let mut connector_cleanup_deadline: Option<u64> = None;
+    #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
+    let mut waiting_registry_status_sent = false;
     #[cfg(feature = "dw1e3-selector31")]
     let mut selector_binding = None;
     #[cfg(feature = "dw1e3-selector31")]
@@ -335,26 +354,105 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
     #[cfg(feature = "wyr1c5-production")]
     let mut device_resource = None;
     loop {
-        let mut waits = [DwWaitItemV1::default(); 3];
+        let mut waits = [DwWaitItemV1::default(); 4];
         waits[0] = wait_item(bootstrap);
-        let publication_index = publication.map(|handle| {
-            waits[1] = wait_item(handle);
-            1
-        });
+        let mut wait_count = 1;
+        #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
+        let plan = production_wait_plan(
+            connector_broker
+                .as_ref()
+                .map_or(ConnectorSlot::Empty, ConnectorBroker::slot),
+            production_witness.is_some(),
+            driver_control.is_some(),
+            publication.is_some(),
+            connector_cleanup_deadline,
+        )
+        .map_err(|_| failure(308))?;
+        #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
+        let mut witness_index = None;
+        #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
+        let mut driver_index = None;
+        #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
+        let mut publication_index = None;
+        #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
+        for source in plan.sources()[..plan.len()].iter().flatten() {
+            let index = wait_count;
+            waits[index] = match source {
+                ProductionWaitSource::Witness => {
+                    witness_index = Some(index);
+                    wait_item(production_witness.ok_or(failure(309))?.handle)
+                }
+                ProductionWaitSource::Driver => {
+                    driver_index = Some(index);
+                    wait_item(driver_control.ok_or(failure(310))?)
+                }
+                ProductionWaitSource::Publication => {
+                    publication_index = Some(index);
+                    wait_item(publication.ok_or(failure(311))?)
+                }
+            };
+            wait_count += 1;
+        }
+        #[cfg(not(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32"))))]
+        let witness_index: Option<usize> = None;
+        #[cfg(not(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32"))))]
         let driver_index = driver_control.map(|handle| {
-            let index = 1 + usize::from(publication.is_some());
+            let index = wait_count;
             waits[index] = wait_item(handle);
+            wait_count += 1;
             index
         });
-        let wait_count =
-            1 + usize::from(publication.is_some()) + usize::from(driver_control.is_some());
-        let observed =
-            wait_many(&waits[..wait_count], DW_DEADLINE_INFINITE).map_err(|_| failure(16))?;
+        #[cfg(not(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32"))))]
+        let publication_index = publication.map(|handle| {
+            let index = wait_count;
+            waits[index] = wait_item(handle);
+            wait_count += 1;
+            index
+        });
+        #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
+        let wait_deadline = plan
+            .deadline()
+            .map_or(DW_DEADLINE_INFINITE, deepwyrm_syscall::DwDeadline);
+        #[cfg(not(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32"))))]
+        let wait_deadline = DW_DEADLINE_INFINITE;
+        let observed = wait_many(&waits[..wait_count], wait_deadline).map_err(|error| {
+            #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
+            if matches!(error, NativeError::Status(status) if status == DW_STATUS_TIMED_OUT) {
+                return failure(276);
+            }
+            failure(16)
+        })?;
         let index = usize::try_from(observed.index).map_err(|_| failure(17))?;
         if index >= wait_count
             || observed.observed.0 & (DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0) == 0
         {
             return Err(failure(18));
+        }
+        #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
+        if let Some(deadline) = connector_cleanup_deadline
+            && !cleanup_deadline_live(monotonic_active_now().map_err(|_| failure(277))?, deadline)
+        {
+            return Err(failure(278));
+        }
+        #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
+        if Some(index) == witness_index {
+            observe_production_client_release(
+                &mut production_witness,
+                connector_broker.as_mut().ok_or(failure(279))?,
+                observed.observed,
+            )?;
+            update_production_cleanup(
+                connector_broker.as_ref().ok_or(failure(280))?,
+                &mut connector_cleanup_deadline,
+            )?;
+            maybe_send_waiting_for_registry(
+                bootstrap,
+                &resident,
+                publication,
+                connector_broker.as_ref().ok_or(failure(281))?,
+                &mut waiting_registry_status_sent,
+            )?;
+            continue;
         }
         if index == 0 {
             if observed.observed.0 & DW_SIGNAL_READABLE.0 == 0 {
@@ -534,6 +632,20 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                     let _ = close_handle(bootstrap);
                     return Err(failure(21));
                 }
+                #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
+                {
+                    if action == ControllerAction::PublicationRebound {
+                        if !waiting_registry_status_sent
+                            || !matches!(
+                                connector_broker.as_ref().map(ConnectorBroker::slot),
+                                Some(ConnectorSlot::Empty)
+                            )
+                        {
+                            return Err(failure(293));
+                        }
+                        waiting_registry_status_sent = false;
+                    }
+                }
             }
             #[cfg(any(feature = "wyr1c4-production", feature = "wyr1c5-production"))]
             if action == ControllerAction::InitialPublicationBound {
@@ -712,6 +824,8 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                     let _ = close_handle(bootstrap);
                     return Err(code);
                 }
+                #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
+                activate_connector_broker(&mut resident, &mut connector_broker)?;
             }
             continue;
         }
@@ -747,6 +861,17 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                     control,
                     connector_broker.as_mut().ok_or(failure(271))?,
                 )?;
+                update_production_cleanup(
+                    connector_broker.as_ref().ok_or(failure(288))?,
+                    &mut connector_cleanup_deadline,
+                )?;
+                maybe_send_waiting_for_registry(
+                    bootstrap,
+                    &resident,
+                    publication,
+                    connector_broker.as_ref().ok_or(failure(289))?,
+                    &mut waiting_registry_status_sent,
+                )?;
                 driver_control = Some(control);
                 continue;
             }
@@ -756,6 +881,8 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
             #[cfg(any(feature = "wyr1c6-production", feature = "dw1e3-selector31"))]
             if observed.observed.0 & (DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0) != 0 {
                 let request = resident.active_driver_request().ok_or(failure(40))?;
+                #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
+                let production_retiring_driver = published_driver(&resident, request)?;
                 observe_driver_failure(
                     control,
                     request,
@@ -763,6 +890,16 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                     observed.observed.0 & DW_SIGNAL_READABLE.0 != 0,
                     observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0,
                 )?;
+                #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
+                {
+                    let broker = connector_broker.as_mut().ok_or(failure(294))?;
+                    if broker.current() != Some(production_retiring_driver)
+                        || broker.retire_current().is_some()
+                    {
+                        return Err(failure(295));
+                    }
+                    update_production_cleanup(broker, &mut connector_cleanup_deadline)?;
+                }
                 #[cfg(feature = "wyr1c6-selector29")]
                 let stale_control = control;
                 #[cfg(feature = "wyr1c6-selector29")]
@@ -802,6 +939,26 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                 resident.publication_retired().map_err(|_| failure(43))?;
                 await_driver_reaped(bootstrap, request)?;
                 resident.reap_driver().map_err(|_| failure(44))?;
+                #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
+                {
+                    let broker = connector_broker.as_mut().ok_or(failure(296))?;
+                    if broker
+                        .driver_attempt_reaped(production_retiring_driver)
+                        .map_err(|_| failure(297))?
+                        .is_some()
+                    {
+                        return Err(failure(298));
+                    }
+                    update_production_cleanup(broker, &mut connector_cleanup_deadline)?;
+                    await_production_witness_release(
+                        &mut production_witness,
+                        broker,
+                        &mut connector_cleanup_deadline,
+                    )?;
+                    if !matches!(broker.slot(), ConnectorSlot::Empty) {
+                        return Err(failure(299));
+                    }
+                }
                 #[cfg(feature = "dw1e3-selector31")]
                 {
                     // The controller's type-7 certificate released the
@@ -1038,6 +1195,8 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                     control,
                     &resident,
                     broker,
+                    #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
+                    &mut production_witness,
                 )?;
                 continue;
             }
@@ -1063,10 +1222,31 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
         // coordinator generation remains resident; a later WRCS rebind moves
         // one exact child Channel over the still-open bootstrap relationship.
         let old = publication.take().ok_or(failure(24))?;
+        #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
+        {
+            let broker = connector_broker.as_mut().ok_or(failure(290))?;
+            if broker.retire_current().is_some() {
+                return Err(failure(291));
+            }
+            update_production_cleanup(broker, &mut connector_cleanup_deadline)?;
+            waiting_registry_status_sent = false;
+        }
         close_handle(old).map_err(|_| failure(25))?;
         resident
             .publication_peer_closed()
             .map_err(|_| failure(26))?;
+        #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
+        {
+            maybe_send_waiting_for_registry(
+                bootstrap,
+                &resident,
+                publication,
+                connector_broker.as_ref().ok_or(failure(292))?,
+                &mut waiting_registry_status_sent,
+            )?;
+            continue;
+        }
+        #[cfg(not(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32"))))]
         send_resident_status(
             bootstrap,
             &resident,
@@ -1324,6 +1504,8 @@ fn service_connector_offer(
     driver_control: DwHandle,
     resident: &wyrmroot_devmgr::ResidentController,
     broker: &mut ConnectorBroker,
+    #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
+    witness: &mut Option<ProductionClientWitness>,
 ) -> Result<(), u32> {
     let mut offer_bytes = [0u8; 256];
     let mut offer_handles = [DwReceivedHandleInfoV1::default(); 1];
@@ -1419,6 +1601,12 @@ fn service_connector_offer(
         let _ = close_handle(direct);
         return Err(failure(187));
     };
+    #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
+    if witness.is_some() {
+        let _ = broker.attach_send_failed(attach);
+        let _ = close_handle(direct);
+        return Err(failure(276));
+    }
     let (client_endpoint, driver_endpoint) =
         create_channel(STREAM_BROAD_RIGHTS).map_err(|_| failure(188))?;
     let mut driver_bytes = [0u8; D3_DEVICE_STAGE_BYTES];
@@ -1473,7 +1661,132 @@ fn service_connector_offer(
         return Err(failure(199));
     }
     broker.client_endpoint_moved().map_err(|_| failure(200))?;
+    #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
+    {
+        *witness = Some(ProductionClientWitness {
+            handle: direct,
+            attach,
+        });
+        Ok(())
+    }
+    #[cfg(not(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32"))))]
     close_handle(direct).map_err(|_| failure(201))
+}
+
+#[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
+fn observe_production_client_release(
+    witness: &mut Option<ProductionClientWitness>,
+    broker: &mut ConnectorBroker,
+    signals: deepwyrm_syscall::DwSignals,
+) -> Result<(), u32> {
+    let observed = (*witness).ok_or(failure(279))?;
+    let readable = signals.0 & DW_SIGNAL_READABLE.0 != 0;
+    let peer_closed = signals.0 & DW_SIGNAL_PEER_CLOSED.0 != 0;
+    if classify_direct_client_release(readable, peer_closed) == DirectClientReleaseEvent::Malformed
+    {
+        if !readable {
+            return Err(failure(281));
+        }
+        let mut bytes = [0u8; 1];
+        let mut handles = [DwReceivedHandleInfoV1::default(); 1];
+        if let Ok(counts) = receive_channel(observed.handle, &mut bytes, &mut handles) {
+            close_received(&handles, counts.handles);
+        }
+        return Err(failure(280));
+    }
+    match broker.slot() {
+        ConnectorSlot::Active { attach, .. } if attach == observed.attach => broker
+            .active_client_released(observed.attach)
+            .map_err(|_| failure(282))?,
+        ConnectorSlot::AwaitingClientRelease { attach, .. }
+        | ConnectorSlot::RetiringActive { attach, .. }
+            if attach == observed.attach =>
+        {
+            broker
+                .client_release_observed(observed.attach)
+                .map_err(|_| failure(283))?
+        }
+        _ => return Err(failure(284)),
+    }
+    close_handle(observed.handle).map_err(|_| failure(285))?;
+    *witness = None;
+    Ok(())
+}
+
+#[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
+fn update_production_cleanup(
+    broker: &ConnectorBroker,
+    deadline: &mut Option<u64>,
+) -> Result<(), u32> {
+    if matches!(broker.slot(), ConnectorSlot::Empty) {
+        *deadline = None;
+        return Ok(());
+    }
+    if matches!(
+        broker.slot(),
+        ConnectorSlot::AwaitingDriverRelease { .. }
+            | ConnectorSlot::AwaitingClientRelease { .. }
+            | ConnectorSlot::RetiringActive { .. }
+    ) && deadline.is_none()
+    {
+        *deadline = Some(
+            production_cleanup_deadline(monotonic_active_now().map_err(|_| failure(286))?)
+                .map_err(|_| failure(287))?,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
+fn maybe_send_waiting_for_registry(
+    bootstrap: DwHandle,
+    resident: &wyrmroot_devmgr::ResidentController,
+    publication: Option<DwHandle>,
+    broker: &ConnectorBroker,
+    sent: &mut bool,
+) -> Result<(), u32> {
+    if publication.is_none() && matches!(broker.slot(), ConnectorSlot::Empty) && !*sent {
+        send_resident_status(
+            bootstrap,
+            resident,
+            StatusCode::OperationalWaitingForRegistry,
+        )?;
+        *sent = true;
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
+fn await_production_witness_release(
+    witness: &mut Option<ProductionClientWitness>,
+    broker: &mut ConnectorBroker,
+    deadline: &mut Option<u64>,
+) -> Result<(), u32> {
+    let Some(observed) = *witness else {
+        return if matches!(broker.slot(), ConnectorSlot::Empty) {
+            *deadline = None;
+            Ok(())
+        } else {
+            Err(failure(300))
+        };
+    };
+    update_production_cleanup(broker, deadline)?;
+    let absolute = (*deadline).ok_or(failure(301))?;
+    if !cleanup_deadline_live(monotonic_active_now().map_err(|_| failure(302))?, absolute) {
+        return Err(failure(303));
+    }
+    let result = wait_many(
+        core::slice::from_ref(&wait_item(observed.handle)),
+        deepwyrm_syscall::DwDeadline(absolute),
+    )
+    .map_err(|_| failure(304))?;
+    if result.index != 0
+        || !cleanup_deadline_live(monotonic_active_now().map_err(|_| failure(305))?, absolute)
+    {
+        return Err(failure(306));
+    }
+    observe_production_client_release(witness, broker, result.observed)?;
+    update_production_cleanup(broker, deadline)
 }
 
 #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]

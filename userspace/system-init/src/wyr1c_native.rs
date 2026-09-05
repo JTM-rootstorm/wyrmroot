@@ -37,13 +37,10 @@ use wyrmroot_device_proto::coordinator::{
     RegistryEndpoint, RegistryEndpointGeneration, RegistryEndpointId, RegistryGeneration,
     SupervisorGeneration,
 };
-#[cfg(all(
-    not(feature = "wyr1e-production"),
-    any(
-        feature = "wyr1c6-production",
-        feature = "dw1e3-selector31",
-        feature = "wyr1d-selector32"
-    )
+#[cfg(any(
+    feature = "wyr1c6-production",
+    feature = "dw1e3-selector31",
+    feature = "wyr1d-selector32"
 ))]
 use wyrmroot_device_proto::driver_launch::encode_reaped;
 #[cfg(any(
@@ -2873,7 +2870,6 @@ where
     feature = "dw1e3-selector31",
     feature = "wyr1d-selector32"
 ))]
-#[cfg(not(feature = "wyr1e-production"))]
 fn acknowledge_driver_reaped<S: InitPlatform>(
     system: &mut S,
     devmgr: ActiveNativeRole,
@@ -3215,10 +3211,15 @@ where
                             }
                             #[cfg(feature = "wyr1e-production")]
                             wyr1e::retire_dependents(resident, system, waits, false)?;
-                            let _request = reap_driver(resident, system, waits, false)?;
+                            let request = reap_driver(resident, system, waits, false)?;
                             #[cfg(feature = "wyr1e-production")]
                             {
-                                recover_devmgr(resident, system, loader, waits, bootfs)
+                                let state = resident
+                                    .wyr1c
+                                    .as_ref()
+                                    .ok_or(InitError::WrongActivationOrder)?;
+                                let devmgr = state.devmgr.ok_or(InitError::WrongActivationOrder)?;
+                                acknowledge_driver_reaped(system, devmgr, request)
                             }
                             #[cfg(not(feature = "wyr1e-production"))]
                             {
@@ -3236,7 +3237,7 @@ where
                                         .ok_or(InitError::WrongActivationOrder)?;
                                     let devmgr =
                                         state.devmgr.ok_or(InitError::WrongActivationOrder)?;
-                                    acknowledge_driver_reaped(system, devmgr, _request)?;
+                                    acknowledge_driver_reaped(system, devmgr, request)?;
                                 }
                                 Ok(())
                             }
@@ -3370,9 +3371,14 @@ where
                     |system, bootfs| {
                         match outcome {
                             wyr1e::PollOutcome::Stable => Ok(()),
-                            wyr1e::PollOutcome::RelaunchConsole => start_wyr1e_or_recover_registry(
-                                resident, system, loader, waits, bootfs,
-                            ),
+                            wyr1e::PollOutcome::LaunchConsole => {
+                                wyr1e::launch_after_publication_observed(
+                                    resident, system, loader, waits, bootfs,
+                                )
+                            }
+                            wyr1e::PollOutcome::RecoverDevmgr => {
+                                recover_devmgr(resident, system, loader, waits, bootfs)
+                            }
                             wyr1e::PollOutcome::RecoverRegistry => {
                                 recover_registry(resident, system, loader, waits, bootfs, false)
                             }
@@ -3516,7 +3522,7 @@ where
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
-    match wyr1e::start_after_driver_constructed(resident, system, loader, waits, bootfs) {
+    match wyr1e::start_after_driver_constructed(resident, system) {
         Ok(()) => Ok(()),
         Err(_) if wyr1e::registry_recovery_required(resident) => {
             recover_registry(resident, system, loader, waits, bootfs, false)

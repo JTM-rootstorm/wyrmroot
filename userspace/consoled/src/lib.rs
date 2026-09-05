@@ -28,6 +28,35 @@ pub const SERIAL_RETRY_BACKOFF_MILLIS: u64 = 25;
 pub const MAX_FAILURES_PER_WINDOW: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReleaseWitnessEvent {
+    Released,
+    Malformed,
+}
+
+/// The retained direct CONNECT endpoint carries no messages. Only a pure
+/// peer-close observation certifies release; data remains malformed even when
+/// it is co-observed with peer close.
+pub const fn classify_release_witness(readable: bool, peer_closed: bool) -> ReleaseWitnessEvent {
+    if !readable && peer_closed {
+        ReleaseWitnessEvent::Released
+    } else {
+        ReleaseWitnessEvent::Malformed
+    }
+}
+
+/// Executes the mandatory post-CONNECTED cleanup order while still attempting
+/// both releases when the raw endpoint close fails.
+pub fn release_raw_then_witness<H: Copy>(
+    raw: H,
+    witness: Option<H>,
+    mut close: impl FnMut(H) -> bool,
+) -> bool {
+    let raw_closed = close(raw);
+    let witness_closed = witness.is_none_or(close);
+    raw_closed && witness_closed
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChildPolicy {
     ConsoleEcho,
     Wyrmsh,
@@ -1709,6 +1738,47 @@ const fn other(source: OutputSource) -> OutputSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_release_witness_is_message_free_and_raw_closes_first() {
+        assert_eq!(
+            classify_release_witness(false, true),
+            ReleaseWitnessEvent::Released
+        );
+        for (readable, peer_closed) in [(false, false), (true, false), (true, true)] {
+            assert_eq!(
+                classify_release_witness(readable, peer_closed),
+                ReleaseWitnessEvent::Malformed
+            );
+        }
+
+        let mut order = [0u64; 2];
+        let mut count = 0;
+        assert!(release_raw_then_witness(41, Some(42), |handle| {
+            order[count] = handle;
+            count += 1;
+            true
+        }));
+        assert_eq!(order, [41, 42]);
+
+        count = 0;
+        assert!(release_raw_then_witness(43, None, |handle| {
+            order[count] = handle;
+            count += 1;
+            true
+        }));
+        assert_eq!(count, 1);
+        assert_eq!(order[0], 43);
+
+        count = 0;
+        assert!(!release_raw_then_witness(51, Some(52), |handle| {
+            order[count] = handle;
+            count += 1;
+            handle != 51
+        }));
+        assert_eq!(order, [51, 52]);
+    }
+
     fn correlation(value: u64) -> SerialCorrelation {
         SerialCorrelation {
             registry_generation: 1,

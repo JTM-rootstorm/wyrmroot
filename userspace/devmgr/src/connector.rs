@@ -210,6 +210,112 @@ pub struct ConnectorBroker {
     slot: ConnectorSlot,
 }
 
+/// Fixed production cleanup bound for joining the independent raw-driver and
+/// direct-client release observations.
+pub const PRODUCTION_CLEANUP_TIMEOUT_NS: u64 = 1_000_000_000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectClientReleaseEvent {
+    Released,
+    Malformed,
+}
+
+/// The retained direct CONNECT endpoint is only a lifetime witness. Data on
+/// it is never a release certificate, including when READABLE and PEER_CLOSED
+/// are co-observed.
+pub const fn classify_direct_client_release(
+    readable: bool,
+    peer_closed: bool,
+) -> DirectClientReleaseEvent {
+    if !readable && peer_closed {
+        DirectClientReleaseEvent::Released
+    } else {
+        DirectClientReleaseEvent::Malformed
+    }
+}
+
+pub const fn production_cleanup_deadline(now: u64) -> Result<u64, ConnectorModelError> {
+    match now.checked_add(PRODUCTION_CLEANUP_TIMEOUT_NS) {
+        Some(deadline) if deadline != u64::MAX => Ok(deadline),
+        _ => Err(ConnectorModelError::InternalFailure),
+    }
+}
+
+pub const fn cleanup_deadline_live(now: u64, deadline: u64) -> bool {
+    now < deadline && deadline != u64::MAX
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProductionWaitSource {
+    Witness,
+    Driver,
+    Publication,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProductionWaitPlan {
+    sources: [Option<ProductionWaitSource>; 3],
+    len: usize,
+    deadline: Option<u64>,
+}
+
+impl ProductionWaitPlan {
+    pub const fn sources(&self) -> &[Option<ProductionWaitSource>; 3] {
+        &self.sources
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub const fn deadline(&self) -> Option<u64> {
+        self.deadline
+    }
+}
+
+pub fn production_wait_plan(
+    slot: ConnectorSlot,
+    witness_present: bool,
+    driver_present: bool,
+    publication_present: bool,
+    cleanup_deadline: Option<u64>,
+) -> Result<ProductionWaitPlan, ConnectorModelError> {
+    let cleanup_pending = matches!(
+        slot,
+        ConnectorSlot::AwaitingDriverRelease { .. }
+            | ConnectorSlot::AwaitingClientRelease { .. }
+            | ConnectorSlot::RetiringActive { .. }
+    );
+    if cleanup_pending != cleanup_deadline.is_some()
+        || cleanup_deadline.is_some_and(|deadline| deadline == u64::MAX)
+    {
+        return Err(ConnectorModelError::InternalFailure);
+    }
+    let mut sources = [None; 3];
+    let mut len = 0;
+    if witness_present {
+        sources[len] = Some(ProductionWaitSource::Witness);
+        len += 1;
+    }
+    if driver_present {
+        sources[len] = Some(ProductionWaitSource::Driver);
+        len += 1;
+    }
+    if publication_present && !cleanup_pending {
+        sources[len] = Some(ProductionWaitSource::Publication);
+        len += 1;
+    }
+    Ok(ProductionWaitPlan {
+        sources,
+        len,
+        deadline: cleanup_deadline,
+    })
+}
+
 impl ConnectorBroker {
     pub const fn new(
         current: Option<PublishedDriver>,
@@ -798,6 +904,88 @@ mod tests {
         broker.client_release_observed(active).unwrap();
         broker.replace_published_driver(driver(11, 2)).unwrap();
         assert_eq!(broker.current(), Some(driver(11, 2)));
+    }
+
+    #[test]
+    fn production_release_witness_accepts_only_pure_peer_close_and_finite_deadline() {
+        assert_eq!(
+            classify_direct_client_release(false, true),
+            DirectClientReleaseEvent::Released
+        );
+        for (readable, peer_closed) in [(false, false), (true, false), (true, true)] {
+            assert_eq!(
+                classify_direct_client_release(readable, peer_closed),
+                DirectClientReleaseEvent::Malformed
+            );
+        }
+        let deadline = production_cleanup_deadline(7).unwrap();
+        assert!(cleanup_deadline_live(deadline - 1, deadline));
+        assert!(!cleanup_deadline_live(deadline, deadline));
+        assert_eq!(
+            production_cleanup_deadline(u64::MAX - PRODUCTION_CLEANUP_TIMEOUT_NS),
+            Err(ConnectorModelError::InternalFailure)
+        );
+    }
+
+    #[test]
+    fn production_retirement_joins_client_and_driver_release_in_either_order() {
+        let published = driver(10, 1);
+        for client_first in [false, true] {
+            let mut broker = ConnectorBroker::new(Some(published), 100, 200).unwrap();
+            let attach = attach_once(&mut broker, 10, 7);
+            assert_eq!(broker.retire_current(), None);
+            assert!(matches!(
+                broker.slot(),
+                ConnectorSlot::RetiringActive { .. }
+            ));
+            let deadline = production_cleanup_deadline(50).unwrap();
+            let plan =
+                production_wait_plan(broker.slot(), true, true, true, Some(deadline)).unwrap();
+            assert_eq!(
+                &plan.sources()[..plan.len()],
+                &[
+                    Some(ProductionWaitSource::Witness),
+                    Some(ProductionWaitSource::Driver),
+                ]
+            );
+            assert_eq!(plan.deadline(), Some(deadline));
+            assert!(!cleanup_deadline_live(deadline, deadline));
+            assert_eq!(
+                broker.replace_published_driver(driver(11, 2)),
+                Err(ConnectorModelError::Stale)
+            );
+            if client_first {
+                broker.client_release_observed(attach).unwrap();
+                assert!(matches!(
+                    broker.slot(),
+                    ConnectorSlot::RetiringActive { .. }
+                ));
+                broker.driver_detached(attach.detached_message()).unwrap();
+            } else {
+                broker.driver_detached(attach.detached_message()).unwrap();
+                assert!(matches!(
+                    broker.slot(),
+                    ConnectorSlot::RetiringActive { .. }
+                ));
+                broker.client_release_observed(attach).unwrap();
+            }
+            assert_eq!(broker.slot(), ConnectorSlot::Empty);
+            let fresh_plan = production_wait_plan(broker.slot(), false, true, true, None).unwrap();
+            assert_eq!(
+                &fresh_plan.sources()[..fresh_plan.len()],
+                &[
+                    Some(ProductionWaitSource::Driver),
+                    Some(ProductionWaitSource::Publication),
+                ]
+            );
+            broker.replace_published_driver(driver(11, 2)).unwrap();
+            let fresh = attach_once(&mut broker, 11, 8);
+            assert_eq!(
+                fresh.attach_transaction_id,
+                attach.attach_transaction_id + 1
+            );
+            assert_eq!(fresh.stream_generation, attach.stream_generation + 1);
+        }
     }
 
     #[test]
