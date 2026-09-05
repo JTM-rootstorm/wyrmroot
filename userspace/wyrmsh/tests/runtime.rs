@@ -6,15 +6,17 @@ use std::vec::Vec;
 use deepwyrm_syscall::{
     DW_OBJECT_TYPE_CHANNEL, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DW_SIGNAL_WRITABLE,
     DW_STATUS_PEER_CLOSED, DW_STATUS_TIMED_OUT, DW_STATUS_WOULD_BLOCK, DwDeadline, DwHandle,
-    DwObjectType, DwReceivedHandleInfoV1, DwRights, DwSignals, DwWaitItemV1, DwWaitResultV1,
+    DwHandleTransferV1, DwObjectType, DwReceivedHandleInfoV1, DwRights, DwSignals, DwWaitItemV1,
+    DwWaitResultV1,
 };
 use wyrmroot_console_proto::{
     ErrorCode as StatusErrorCode, Header as StatusHeader, LastFailure, Snapshot,
     State as StatusState, encode_error as encode_status_error, encode_snapshot,
 };
 use wyrmroot_launch_proto::{
-    ErrorCode as LaunchErrorCode, Message as LaunchMessage, Reservation,
-    encode_error as encode_launch_error, encode_job_list, parse_message as parse_launch_message,
+    ErrorCode as LaunchErrorCode, Message as LaunchMessage, MessageType as LaunchMessageType,
+    Reservation, TerminationClassification, TerminationResult, encode_error as encode_launch_error,
+    encode_job_list, encode_job_message, encode_job_result, parse_message as parse_launch_message,
 };
 use wyrmroot_loader::launch::{
     CHILD_CHANNEL_RIGHTS, LaunchProfile, WYRMSH_BYTES, encode_wyrmsh_init, parse_ready_for_profile,
@@ -49,6 +51,8 @@ enum Trace {
     ReleaseWait,
     StreamSend(DwHandle),
     ControlWait,
+    JobSend(LaunchMessageType),
+    Close(DwHandle),
 }
 
 #[derive(Clone)]
@@ -85,6 +89,20 @@ struct Fixture {
     timeout_control: Option<DwHandle>,
     control_loss_on_transaction_wait: Option<usize>,
     waited_deadlines: Vec<DwDeadline>,
+    next_handle: u64,
+    created: Vec<(DwHandle, DwRights)>,
+    moved: Vec<Vec<DwHandleTransferV1>>,
+    child_incoming: VecDeque<(DwHandle, Option<Vec<u8>>)>,
+    child_receive_trace: Vec<(DwHandle, bool)>,
+    fail_move_send: bool,
+    job_receive_blocks: VecDeque<bool>,
+    block_payload_once: Option<Vec<u8>>,
+    fail_job_send_kind: Option<LaunchMessageType>,
+    timeout_job_kind: Option<LaunchMessageType>,
+    peer_loss_job_kind: Option<LaunchMessageType>,
+    last_job_kind: Option<LaunchMessageType>,
+    fail_close_once: Option<DwHandle>,
+    close_attempts: Vec<DwHandle>,
 }
 
 impl Fixture {
@@ -134,6 +152,20 @@ impl Fixture {
             timeout_control: None,
             control_loss_on_transaction_wait: None,
             waited_deadlines: vec![],
+            next_handle: 1000,
+            created: vec![],
+            moved: vec![],
+            child_incoming: VecDeque::new(),
+            child_receive_trace: vec![],
+            fail_move_send: false,
+            job_receive_blocks: VecDeque::new(),
+            block_payload_once: None,
+            fail_job_send_kind: None,
+            timeout_job_kind: None,
+            peer_loss_job_kind: None,
+            last_job_kind: None,
+            fail_close_once: None,
+            close_attempts: vec![],
         }
     }
 
@@ -142,6 +174,12 @@ impl Fixture {
             return CapabilityInfo {
                 object_type: BOOTSTRAP_CHANNEL_EXPECTATION.object_type,
                 rights: BOOTSTRAP_CHANNEL_EXPECTATION.rights,
+            };
+        }
+        if let Some((_, rights)) = self.created.iter().find(|(actual, _)| *actual == handle) {
+            return CapabilityInfo {
+                object_type: DW_OBJECT_TYPE_CHANNEL,
+                rights: *rights,
             };
         }
         let index = self
@@ -248,8 +286,16 @@ impl WyrmshSystem for Fixture {
             handles.copy_from_slice(&self.handles);
             return Ok(self.receive_counts);
         }
-        let message = self.control_incoming.pop_front().expect("control reply");
-        assert_eq!(message.channel, channel);
+        if channel == SHELL_JOBS && self.job_receive_blocks.pop_front() == Some(true) {
+            return Err(NativeError::Status(DW_STATUS_WOULD_BLOCK));
+        }
+        let Some(message) = self.control_incoming.front() else {
+            return Err(NativeError::Status(DW_STATUS_WOULD_BLOCK));
+        };
+        if message.channel != channel {
+            return Err(NativeError::Status(DW_STATUS_WOULD_BLOCK));
+        }
+        let message = self.control_incoming.pop_front().unwrap();
         bytes[..message.bytes.len()].copy_from_slice(&message.bytes);
         for (target, source) in handles.iter_mut().zip(&message.handles) {
             *target = *source;
@@ -266,9 +312,18 @@ impl WyrmshSystem for Fixture {
             self.ready.extend_from_slice(bytes);
             return Ok(());
         }
+        let kind = (channel == SHELL_JOBS).then(|| request_kind(bytes, 0));
+        self.last_job_kind = kind;
+        if kind.is_some() && self.fail_job_send_kind == kind {
+            self.fail_job_send_kind = None;
+            return Err(NativeError::Status(DW_STATUS_PEER_CLOSED));
+        }
         if self.control_send_would_block.front() == Some(&channel) {
             self.control_send_would_block.pop_front();
             return Err(NativeError::Status(DW_STATUS_WOULD_BLOCK));
+        }
+        if let Some(kind) = kind {
+            self.trace.push(Trace::JobSend(kind));
         }
         self.control_requests.push((channel, bytes.to_vec()));
         if !self.scripted_controls {
@@ -277,7 +332,57 @@ impl WyrmshSystem for Fixture {
         Ok(())
     }
 
+    fn send_channel_with_handles(
+        &mut self,
+        channel: DwHandle,
+        bytes: &[u8],
+        transfers: &[DwHandleTransferV1],
+    ) -> Result<(), NativeError> {
+        if self.fail_move_send && !transfers.is_empty() {
+            self.fail_move_send = false;
+            return Err(NativeError::Status(DW_STATUS_PEER_CLOSED));
+        }
+        if channel == SHELL_JOBS && !transfers.is_empty() {
+            let kind = request_kind(bytes, transfers.len());
+            self.last_job_kind = Some(kind);
+            self.trace.push(Trace::JobSend(kind));
+        }
+        self.moved.push(transfers.to_vec());
+        if transfers.is_empty() {
+            self.send_channel(channel, bytes)
+        } else {
+            self.control_requests.push((channel, bytes.to_vec()));
+            assert!(
+                self.scripted_controls,
+                "handle-bearing launch must be scripted"
+            );
+            Ok(())
+        }
+    }
+
+    fn create_channel(&mut self, rights: DwRights) -> Result<(DwHandle, DwHandle), NativeError> {
+        let first = DwHandle(self.next_handle);
+        let second = DwHandle(self.next_handle + 1);
+        self.next_handle += 2;
+        self.created.push((first, rights));
+        self.created.push((second, rights));
+        Ok((first, second))
+    }
+
+    fn duplicate_handle(&mut self, _: DwHandle, rights: DwRights) -> Result<DwHandle, NativeError> {
+        let duplicate = DwHandle(self.next_handle);
+        self.next_handle += 1;
+        self.created.push((duplicate, rights));
+        Ok(duplicate)
+    }
+
     fn close_handle(&mut self, handle: DwHandle) -> Result<(), NativeError> {
+        self.close_attempts.push(handle);
+        if self.fail_close_once == Some(handle) {
+            self.fail_close_once = None;
+            return Err(NativeError::Status(DW_STATUS_PEER_CLOSED));
+        }
+        self.trace.push(Trace::Close(handle));
         self.closed.push(handle);
         Ok(())
     }
@@ -305,9 +410,24 @@ impl WyrmshSystem for Fixture {
         if let Some(index) = self.control_loss_on_transaction_wait {
             return Ok(wait_result(index, DW_SIGNAL_PEER_CLOSED));
         }
+        if self.peer_loss_job_kind == self.last_job_kind
+            && self.peer_loss_job_kind.is_some()
+            && let Some(index) = items.iter().position(|item| item.handle == SHELL_JOBS)
+        {
+            return Ok(wait_result(index, DW_SIGNAL_PEER_CLOSED));
+        }
         if let Some(handle) = self.timeout_control
             && items.iter().any(|item| {
                 item.handle == handle
+                    && item.signals.0 & (DW_SIGNAL_READABLE.0 | DW_SIGNAL_WRITABLE.0) != 0
+            })
+        {
+            return Err(NativeError::Status(DW_STATUS_TIMED_OUT));
+        }
+        if self.timeout_job_kind == self.last_job_kind
+            && self.timeout_job_kind.is_some()
+            && items.iter().any(|item| {
+                item.handle == SHELL_JOBS
                     && item.signals.0 & (DW_SIGNAL_READABLE.0 | DW_SIGNAL_WRITABLE.0) != 0
             })
         {
@@ -319,6 +439,18 @@ impl WyrmshSystem for Fixture {
             })
         {
             return Ok(wait_result(index, DW_SIGNAL_READABLE));
+        }
+        if let Some((handle, record)) = self.child_incoming.front()
+            && let Some(index) = items.iter().position(|item| item.handle == *handle)
+        {
+            return Ok(wait_result(
+                index,
+                if record.is_some() {
+                    DW_SIGNAL_READABLE
+                } else {
+                    DW_SIGNAL_PEER_CLOSED
+                },
+            ));
         }
         if let Some(index) = items.iter().position(|item| {
             (item.handle == STATUS || item.handle == REGISTRY || item.handle == SHELL_JOBS)
@@ -369,7 +501,25 @@ impl StreamSystem for Fixture {
         bytes: &mut [u8],
         _: &mut [DwReceivedHandleInfoV1],
     ) -> Result<ReceiveCounts, NativeError> {
-        assert_eq!(channel, STDIN);
+        if channel != STDIN {
+            let Some(index) = self
+                .child_incoming
+                .iter()
+                .position(|(actual, _)| *actual == channel)
+            else {
+                return Err(NativeError::Status(DW_STATUS_WOULD_BLOCK));
+            };
+            let (_, record) = self.child_incoming.remove(index).unwrap();
+            self.child_receive_trace.push((channel, record.is_none()));
+            let Some(record) = record else {
+                return Err(NativeError::Status(DW_STATUS_PEER_CLOSED));
+            };
+            bytes[..record.len()].copy_from_slice(&record);
+            return Ok(ReceiveCounts {
+                bytes: record.len(),
+                handles: 0,
+            });
+        }
         self.receive_calls += 1;
         let Some(record) = self.incoming.pop_front() else {
             return Err(NativeError::Status(if self.physical_eof {
@@ -389,6 +539,10 @@ impl StreamSystem for Fixture {
         assert!(channel == STDOUT || channel == STDERR);
         self.trace.push(Trace::StreamSend(channel));
         let payload = decode_data(bytes).unwrap().payload();
+        if self.block_payload_once.as_deref() == Some(payload) {
+            self.block_payload_once = None;
+            return Err(NativeError::Status(DW_STATUS_WOULD_BLOCK));
+        }
         if channel == STDOUT
             && payload.len() == MAX_PAYLOAD_BYTES
             && payload.iter().all(|byte| *byte == b'x')
@@ -423,6 +577,18 @@ fn wait_result(index: usize, observed: DwSignals) -> DwWaitResultV1 {
         index: index as u32,
         observed,
         ..DwWaitResultV1::default()
+    }
+}
+
+fn request_kind(bytes: &[u8], handles: usize) -> LaunchMessageType {
+    match parse_launch_message(bytes, handles).unwrap().message {
+        LaunchMessage::Launch(_) => LaunchMessageType::Launch,
+        LaunchMessage::Wait { .. } => LaunchMessageType::Wait,
+        LaunchMessage::Terminate { .. } => LaunchMessageType::Terminate,
+        LaunchMessage::Cancel { .. } => LaunchMessageType::Cancel,
+        LaunchMessage::CloseJob { .. } => LaunchMessageType::CloseJob,
+        LaunchMessage::ListJobs => LaunchMessageType::ListJobs,
+        _ => panic!("request kind"),
     }
 }
 
@@ -559,6 +725,56 @@ fn launch_error(transaction: u64, code: LaunchErrorCode) -> Vec<u8> {
     .unwrap();
     bytes[..size].to_vec()
 }
+
+fn job_reply(transaction: u64, kind: LaunchMessageType, job_id: u64) -> Vec<u8> {
+    let mut bytes = [0_u8; 88];
+    let size = encode_job_message(
+        Reservation {
+            connection_id: 5,
+            generation: 6,
+            transaction_id: transaction,
+        },
+        kind,
+        job_id,
+        &mut bytes,
+    )
+    .unwrap();
+    bytes[..size].to_vec()
+}
+
+fn terminal_reply(transaction: u64, job_id: u64, result: TerminationResult) -> Vec<u8> {
+    let mut bytes = [0_u8; 88];
+    let size = encode_job_result(
+        Reservation {
+            connection_id: 5,
+            generation: 6,
+            transaction_id: transaction,
+        },
+        job_id,
+        result,
+        &mut bytes,
+    )
+    .unwrap();
+    bytes[..size].to_vec()
+}
+
+fn normal_result(code: u32) -> TerminationResult {
+    TerminationResult {
+        classification: TerminationClassification::NormalExit,
+        application_code: code,
+        exception_class: 0,
+        exception_detail: 0,
+        exception_address: 0,
+        cleanup_result: 0,
+    }
+}
+
+const CHILD_STDIN_RETAINED: DwHandle = DwHandle(1002);
+const CHILD_STDOUT_RETAINED: DwHandle = DwHandle(1005);
+const CHILD_STDERR_RETAINED: DwHandle = DwHandle(1008);
+const MOVED_STDIN: DwHandle = DwHandle(1001);
+const MOVED_STDOUT: DwHandle = DwHandle(1004);
+const MOVED_STDERR: DwHandle = DwHandle(1007);
 
 fn status_error(transaction: u64, code: StatusErrorCode) -> Vec<u8> {
     let mut bytes = [0_u8; wyrmroot_console_proto::ERROR_BYTES];
@@ -1487,4 +1703,801 @@ fn response_validation_must_complete_before_the_absolute_deadline() {
         assert!(fixture.clock_values.is_empty());
         assert!(fixture.control_incoming.is_empty());
     }
+}
+
+#[test]
+fn spawn_wait_and_close_use_one_shared_transaction_namespace() {
+    let mut fixture = Fixture::new(&[b"spawn bin/cpu-hog\nwait 91\nexit\n"]);
+    fixture.queue_control(
+        SHELL_JOBS,
+        &job_reply(1, LaunchMessageType::LaunchAccepted, 91),
+    );
+    fixture.queue_control(SHELL_JOBS, &terminal_reply(2, 91, normal_result(7)));
+    fixture.queue_control(SHELL_JOBS, &job_reply(3, LaunchMessageType::Closed, 91));
+    assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+
+    let requests: Vec<_> = fixture
+        .control_requests
+        .iter()
+        .filter(|(handle, _)| *handle == SHELL_JOBS)
+        .map(|(_, bytes)| parse_launch_message(bytes, 0).unwrap())
+        .collect();
+    assert!(
+        matches!(requests[0].message, LaunchMessage::Launch(request) if request.stream_count == 0 && request.path == "bin/cpu-hog")
+    );
+    assert!(matches!(
+        requests[1].message,
+        LaunchMessage::Wait { job_id: 91 }
+    ));
+    assert!(matches!(
+        requests[2].message,
+        LaunchMessage::CloseJob { job_id: 91 }
+    ));
+    assert_eq!(requests[0].reservation.transaction_id, 1);
+    assert_eq!(requests[1].reservation.transaction_id, 2);
+    assert_eq!(requests[2].reservation.transaction_id, 3);
+    let output = fixture.output(STDOUT);
+    assert!(
+        output
+            .windows(b"spawn job=91\n".len())
+            .any(|bytes| bytes == b"spawn job=91\n")
+    );
+    assert!(
+        output
+            .windows(b"job result job=91 classification=normal application=7".len())
+            .any(|bytes| bytes == b"job result job=91 classification=normal application=7")
+    );
+}
+
+#[test]
+fn terminate_reports_acceptance_without_implicit_wait_or_close() {
+    let mut fixture = Fixture::new(&[b"spawn bin/cpu-hog\nterminate 91\nexit\n"]);
+    fixture.queue_control(
+        SHELL_JOBS,
+        &job_reply(1, LaunchMessageType::LaunchAccepted, 91),
+    );
+    fixture.queue_control(
+        SHELL_JOBS,
+        &job_reply(2, LaunchMessageType::TerminationAccepted, 91),
+    );
+    assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+    let requests: Vec<_> = fixture
+        .control_requests
+        .iter()
+        .filter(|(handle, _)| *handle == SHELL_JOBS)
+        .map(|(_, bytes)| parse_launch_message(bytes, 0).unwrap())
+        .collect();
+    assert!(matches!(
+        requests.as_slice(),
+        [
+            wyrmroot_launch_proto::ParsedMessage {
+                message: LaunchMessage::Launch(_),
+                ..
+            },
+            wyrmroot_launch_proto::ParsedMessage {
+                message: LaunchMessage::Terminate { job_id: 91 },
+                ..
+            }
+        ]
+    ));
+    assert!(
+        fixture
+            .output(STDOUT)
+            .windows(b"terminate job=91 status=accepted\n".len())
+            .any(|bytes| bytes == b"terminate job=91 status=accepted\n")
+    );
+}
+
+#[test]
+fn foreground_run_moves_staging_rights_drains_both_outputs_then_closes() {
+    let mut fixture = Fixture::new(&[b"run bin/hello\nexit\n"]);
+    fixture.queue_control(
+        SHELL_JOBS,
+        &job_reply(1, LaunchMessageType::LaunchAccepted, 41),
+    );
+    fixture.queue_control(SHELL_JOBS, &terminal_reply(2, 41, normal_result(0)));
+    fixture.queue_control(SHELL_JOBS, &job_reply(3, LaunchMessageType::Closed, 41));
+    fixture.child_incoming.extend([
+        (CHILD_STDOUT_RETAINED, Some(wire(b"hello-out\n"))),
+        (CHILD_STDOUT_RETAINED, None),
+        (CHILD_STDERR_RETAINED, Some(wire(b"hello-err\n"))),
+        (CHILD_STDERR_RETAINED, None),
+    ]);
+    assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+
+    assert_eq!(fixture.moved[0].len(), 3);
+    for (transfer, expected) in
+        fixture.moved[0]
+            .iter()
+            .zip([MOVED_STDIN, MOVED_STDOUT, MOVED_STDERR])
+    {
+        assert_eq!(transfer.handle, expected);
+        assert_eq!(
+            transfer.operation,
+            deepwyrm_syscall::DW_HANDLE_TRANSFER_MOVE
+        );
+        assert_eq!(
+            transfer.requested_rights,
+            wyrmroot_loader::launch::CHILD_CHANNEL_TRANSFER_RIGHTS
+        );
+        assert_eq!(
+            transfer.requested_rights.0 & deepwyrm_syscall::DW_RIGHT_DUPLICATE.0,
+            0
+        );
+    }
+    for retained in [
+        CHILD_STDIN_RETAINED,
+        CHILD_STDOUT_RETAINED,
+        CHILD_STDERR_RETAINED,
+    ] {
+        assert_eq!(
+            fixture
+                .closed
+                .iter()
+                .filter(|actual| **actual == retained)
+                .count(),
+            1
+        );
+    }
+    for moved in [MOVED_STDIN, MOVED_STDOUT, MOVED_STDERR] {
+        assert!(!fixture.closed.contains(&moved));
+    }
+    assert!(
+        fixture
+            .output(STDOUT)
+            .windows(10)
+            .any(|bytes| bytes == b"hello-out\n")
+    );
+    assert!(
+        fixture
+            .output(STDERR)
+            .windows(10)
+            .any(|bytes| bytes == b"hello-err\n")
+    );
+}
+
+#[test]
+fn foreground_accepts_stderr_peer_close_before_stdout_without_spinning() {
+    let mut fixture = Fixture::new(&[b"run bin/hello\nexit\n"]);
+    let full_stdout = [b'x'; 256];
+    fixture.queue_control(
+        SHELL_JOBS,
+        &job_reply(1, LaunchMessageType::LaunchAccepted, 41),
+    );
+    fixture.queue_control(SHELL_JOBS, &terminal_reply(2, 41, normal_result(0)));
+    fixture.queue_control(SHELL_JOBS, &job_reply(3, LaunchMessageType::Closed, 41));
+    fixture.child_incoming.extend([
+        (CHILD_STDOUT_RETAINED, Some(wire(&full_stdout))),
+        (CHILD_STDERR_RETAINED, None),
+        (CHILD_STDOUT_RETAINED, None),
+    ]);
+
+    assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+    let peer_closes: Vec<_> = fixture
+        .child_receive_trace
+        .iter()
+        .filter_map(|(handle, closed)| closed.then_some(*handle))
+        .collect();
+    assert_eq!(peer_closes, [CHILD_STDERR_RETAINED, CHILD_STDOUT_RETAINED]);
+    assert!(fixture.waited_deadlines.len() < 10);
+    assert!(
+        fixture
+            .output(STDOUT)
+            .windows(256)
+            .any(|bytes| bytes == full_stdout)
+    );
+}
+
+#[test]
+fn foreground_drains_buffered_output_before_presenting_exception_and_closing() {
+    let mut fixture = Fixture::new(&[b"run bin/hello\nexit\n"]);
+    fixture.queue_control(
+        SHELL_JOBS,
+        &job_reply(1, LaunchMessageType::LaunchAccepted, 41),
+    );
+    fixture.queue_control(
+        SHELL_JOBS,
+        &terminal_reply(
+            2,
+            41,
+            TerminationResult {
+                classification: TerminationClassification::UnhandledException,
+                application_code: 0,
+                exception_class: 7,
+                exception_detail: 9,
+                exception_address: 0xfeed_beef,
+                cleanup_result: 0,
+            },
+        ),
+    );
+    fixture.queue_control(SHELL_JOBS, &job_reply(3, LaunchMessageType::Closed, 41));
+    fixture.child_incoming.extend([
+        (CHILD_STDOUT_RETAINED, Some(wire(b"buffered stdout\n"))),
+        (CHILD_STDOUT_RETAINED, None),
+        (CHILD_STDERR_RETAINED, Some(wire(b"buffered stderr\n"))),
+        (CHILD_STDERR_RETAINED, None),
+    ]);
+
+    assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+    let stdout = fixture.output(STDOUT);
+    let buffered = stdout
+        .windows(b"buffered stdout\n".len())
+        .position(|bytes| bytes == b"buffered stdout\n")
+        .unwrap();
+    let result = stdout
+        .windows(b"job result job=41 classification=exception".len())
+        .position(|bytes| bytes == b"job result job=41 classification=exception")
+        .unwrap();
+    assert!(buffered < result);
+    let stderr_send = fixture
+        .trace
+        .iter()
+        .position(|event| *event == Trace::StreamSend(STDERR))
+        .unwrap();
+    let close_job = fixture
+        .trace
+        .iter()
+        .position(|event| *event == Trace::JobSend(LaunchMessageType::CloseJob))
+        .unwrap();
+    assert!(stderr_send < close_job);
+}
+
+#[test]
+fn failed_move_retains_and_closes_every_local_stream_handle() {
+    let mut fixture = Fixture::new(&[b"run bin/hello\n"]);
+    fixture.scripted_controls = true;
+    fixture.fail_move_send = true;
+    assert!(matches!(
+        run_v2(&mut fixture, "system/wyrmsh", &[]),
+        Err(ShellError::Native {
+            operation: wyrmroot_wyrmsh::NativeOperation::ControlSend,
+            ..
+        })
+    ));
+    for handle in [
+        CHILD_STDIN_RETAINED,
+        CHILD_STDOUT_RETAINED,
+        CHILD_STDERR_RETAINED,
+        MOVED_STDIN,
+        MOVED_STDOUT,
+        MOVED_STDERR,
+    ] {
+        assert_eq!(
+            fixture
+                .closed
+                .iter()
+                .filter(|actual| **actual == handle)
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn committed_policy_rejection_closes_only_retained_stream_sides() {
+    let mut fixture = Fixture::new(&[b"run bin/hello\nexit\n"]);
+    fixture.queue_control(
+        SHELL_JOBS,
+        &launch_error(1, LaunchErrorCode::PolicyRejected),
+    );
+    assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+    for retained in [
+        CHILD_STDIN_RETAINED,
+        CHILD_STDOUT_RETAINED,
+        CHILD_STDERR_RETAINED,
+    ] {
+        assert_eq!(
+            fixture
+                .closed
+                .iter()
+                .filter(|actual| **actual == retained)
+                .count(),
+            1
+        );
+    }
+    for moved in [MOVED_STDIN, MOVED_STDOUT, MOVED_STDERR] {
+        assert!(!fixture.closed.contains(&moved));
+    }
+    assert!(
+        fixture
+            .output(STDERR)
+            .windows(b"run status=policy-rejected\n".len())
+            .any(|bytes| bytes == b"run status=policy-rejected\n")
+    );
+}
+
+#[test]
+fn closed_child_streams_leave_wait_set_and_do_not_spin_before_result() {
+    let mut fixture = Fixture::new(&[b"run bin/hello\nexit\n"]);
+    fixture.job_receive_blocks.extend([false, true]);
+    fixture.queue_control(
+        SHELL_JOBS,
+        &job_reply(1, LaunchMessageType::LaunchAccepted, 41),
+    );
+    fixture.queue_control(SHELL_JOBS, &terminal_reply(2, 41, normal_result(0)));
+    fixture.queue_control(SHELL_JOBS, &job_reply(3, LaunchMessageType::Closed, 41));
+    fixture
+        .child_incoming
+        .extend([(CHILD_STDOUT_RETAINED, None), (CHILD_STDERR_RETAINED, None)]);
+    assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+    assert!(fixture.waited_deadlines.len() < 10);
+}
+
+#[test]
+fn blocked_foreground_stdout_does_not_starve_stderr_or_job_result() {
+    let mut fixture = Fixture::new(&[b"run bin/hello\nexit\n"]);
+    fixture.block_payload_once = Some(b"child-out".to_vec());
+    fixture.queue_control(
+        SHELL_JOBS,
+        &job_reply(1, LaunchMessageType::LaunchAccepted, 41),
+    );
+    fixture.queue_control(SHELL_JOBS, &terminal_reply(2, 41, normal_result(0)));
+    fixture.queue_control(SHELL_JOBS, &job_reply(3, LaunchMessageType::Closed, 41));
+    fixture.child_incoming.extend([
+        (CHILD_STDOUT_RETAINED, Some(wire(b"child-out"))),
+        (CHILD_STDOUT_RETAINED, None),
+        (CHILD_STDERR_RETAINED, Some(wire(b"child-err"))),
+        (CHILD_STDERR_RETAINED, None),
+    ]);
+    assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+    assert_eq!(
+        fixture
+            .output(STDOUT)
+            .windows(9)
+            .filter(|bytes| *bytes == b"child-out")
+            .count(),
+        1
+    );
+    assert_eq!(
+        fixture
+            .output(STDERR)
+            .windows(9)
+            .filter(|bytes| *bytes == b"child-err")
+            .count(),
+        1
+    );
+}
+
+fn stream_failure_fixture(cancel_replies: &[Vec<u8>]) -> Fixture {
+    let mut fixture = Fixture::new(&[b"run bin/hello\nexit\n"]);
+    fixture.queue_control(
+        SHELL_JOBS,
+        &job_reply(1, LaunchMessageType::LaunchAccepted, 41),
+    );
+    for reply in cancel_replies {
+        fixture.queue_control(SHELL_JOBS, reply);
+    }
+    fixture.queue_control(SHELL_JOBS, &job_reply(4, LaunchMessageType::Closed, 41));
+    fixture
+        .child_incoming
+        .push_back((CHILD_STDOUT_RETAINED, Some(vec![0])));
+    fixture
+}
+
+#[test]
+fn stream_failure_closes_endpoints_before_cancel_and_cancelled_closes_visibility() {
+    let mut fixture = stream_failure_fixture(&[job_reply(3, LaunchMessageType::Cancelled, 2)]);
+    assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+    let cancel = fixture
+        .trace
+        .iter()
+        .position(|event| *event == Trace::JobSend(LaunchMessageType::Cancel))
+        .unwrap();
+    for handle in [CHILD_STDOUT_RETAINED, CHILD_STDERR_RETAINED] {
+        let closed = fixture
+            .trace
+            .iter()
+            .position(|event| *event == Trace::Close(handle))
+            .unwrap();
+        assert!(closed < cancel);
+    }
+    let close_job = fixture
+        .trace
+        .iter()
+        .position(|event| *event == Trace::JobSend(LaunchMessageType::CloseJob))
+        .unwrap();
+    let diagnostic = fixture
+        .trace
+        .iter()
+        .rposition(|event| *event == Trace::StreamSend(STDERR))
+        .unwrap();
+    assert!(close_job < diagnostic);
+    assert!(
+        fixture
+            .output(STDERR)
+            .windows(b"run stream=failed\n".len())
+            .any(|bytes| bytes == b"run stream=failed\n")
+    );
+}
+
+#[test]
+fn cancel_completion_race_drains_both_correlations_in_either_order() {
+    for replies in [
+        vec![
+            terminal_reply(2, 41, normal_result(0)),
+            launch_error(3, LaunchErrorCode::CancellationUnavailable),
+        ],
+        vec![
+            launch_error(3, LaunchErrorCode::CancellationUnavailable),
+            terminal_reply(2, 41, normal_result(0)),
+        ],
+    ] {
+        let mut fixture = stream_failure_fixture(&replies);
+        assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+        assert!(fixture.control_incoming.is_empty());
+    }
+}
+
+#[test]
+fn duplicate_cancel_race_reply_is_protocol_fatal() {
+    let replies = vec![
+        terminal_reply(2, 41, normal_result(0)),
+        terminal_reply(2, 41, normal_result(0)),
+        launch_error(3, LaunchErrorCode::CancellationUnavailable),
+    ];
+    let mut fixture = stream_failure_fixture(&replies);
+    assert_eq!(
+        run_v2(&mut fixture, "system/wyrmsh", &[]),
+        Err(ShellError::InspectionProtocol)
+    );
+}
+
+#[test]
+fn cancellation_unavailable_then_cancelled_is_contradictory_and_fatal() {
+    let replies = vec![
+        launch_error(3, LaunchErrorCode::CancellationUnavailable),
+        job_reply(3, LaunchMessageType::Cancelled, 2),
+    ];
+    let mut fixture = stream_failure_fixture(&replies);
+    assert_eq!(
+        run_v2(&mut fixture, "system/wyrmsh", &[]),
+        Err(ShellError::InspectionProtocol)
+    );
+}
+
+#[test]
+fn accepted_run_cleans_outputs_when_stdin_close_or_wait_send_fails() {
+    let mut stdin_close = Fixture::new(&[b"run bin/hello\n"]);
+    stdin_close.queue_control(
+        SHELL_JOBS,
+        &job_reply(1, LaunchMessageType::LaunchAccepted, 41),
+    );
+    stdin_close.fail_close_once = Some(CHILD_STDIN_RETAINED);
+    assert!(matches!(
+        run_v2(&mut stdin_close, "system/wyrmsh", &[]),
+        Err(ShellError::Native {
+            operation: wyrmroot_wyrmsh::NativeOperation::Cleanup,
+            ..
+        })
+    ));
+    for retained in [
+        CHILD_STDIN_RETAINED,
+        CHILD_STDOUT_RETAINED,
+        CHILD_STDERR_RETAINED,
+    ] {
+        assert!(stdin_close.closed.contains(&retained));
+    }
+    assert_eq!(
+        stdin_close
+            .close_attempts
+            .iter()
+            .filter(|handle| **handle == CHILD_STDIN_RETAINED)
+            .count(),
+        2
+    );
+
+    let mut wait_send = Fixture::new(&[b"run bin/hello\n"]);
+    wait_send.queue_control(
+        SHELL_JOBS,
+        &job_reply(1, LaunchMessageType::LaunchAccepted, 41),
+    );
+    wait_send.fail_job_send_kind = Some(LaunchMessageType::Wait);
+    assert!(matches!(
+        run_v2(&mut wait_send, "system/wyrmsh", &[]),
+        Err(ShellError::Native {
+            operation: wyrmroot_wyrmsh::NativeOperation::ControlSend,
+            ..
+        })
+    ));
+    for retained in [
+        CHILD_STDIN_RETAINED,
+        CHILD_STDOUT_RETAINED,
+        CHILD_STDERR_RETAINED,
+    ] {
+        assert!(wait_send.closed.contains(&retained));
+    }
+}
+
+#[test]
+fn close_and_terminate_acknowledgements_have_one_finite_deadline_and_no_resend() {
+    let mut close = Fixture::new(&[b"spawn bin/cpu-hog\nwait 91\n"]);
+    close.queue_control(
+        SHELL_JOBS,
+        &job_reply(1, LaunchMessageType::LaunchAccepted, 91),
+    );
+    close.queue_control(SHELL_JOBS, &terminal_reply(2, 91, normal_result(0)));
+    close.timeout_job_kind = Some(LaunchMessageType::CloseJob);
+    assert_eq!(
+        run_v2(&mut close, "system/wyrmsh", &[]),
+        Err(ShellError::InspectionTimeout)
+    );
+    assert_eq!(
+        close
+            .trace
+            .iter()
+            .filter(|event| **event == Trace::JobSend(LaunchMessageType::CloseJob))
+            .count(),
+        1
+    );
+
+    let mut terminate = Fixture::new(&[b"spawn bin/cpu-hog\nterminate 91\n"]);
+    terminate.queue_control(
+        SHELL_JOBS,
+        &job_reply(1, LaunchMessageType::LaunchAccepted, 91),
+    );
+    terminate.timeout_job_kind = Some(LaunchMessageType::Terminate);
+    assert_eq!(
+        run_v2(&mut terminate, "system/wyrmsh", &[]),
+        Err(ShellError::InspectionTimeout)
+    );
+    assert_eq!(
+        terminate
+            .trace
+            .iter()
+            .filter(|event| **event == Trace::JobSend(LaunchMessageType::Terminate))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn job_request_is_not_committed_when_initial_send_reaches_its_deadline() {
+    let mut fixture = Fixture::new(&[b"spawn bin/cpu-hog\nexit\n"]);
+    fixture.queue_control(
+        SHELL_JOBS,
+        &job_reply(1, LaunchMessageType::LaunchAccepted, 91),
+    );
+    fixture.clock_values = VecDeque::from([5_000_000_000, 6_000_000_000]);
+
+    assert_eq!(
+        run_v2(&mut fixture, "system/wyrmsh", &[]),
+        Err(ShellError::InspectionTimeout)
+    );
+    assert!(fixture.clock_values.is_empty());
+    assert!(fixture.control_requests.is_empty());
+    assert_eq!(fixture.control_incoming.len(), 1);
+    assert!(
+        !fixture
+            .trace
+            .contains(&Trace::JobSend(LaunchMessageType::Launch))
+    );
+}
+
+#[test]
+fn cancel_cleanup_timeout_is_finite_and_never_resends_or_guesses_close() {
+    let mut fixture = stream_failure_fixture(&[]);
+    fixture.timeout_job_kind = Some(LaunchMessageType::Cancel);
+    assert_eq!(
+        run_v2(&mut fixture, "system/wyrmsh", &[]),
+        Err(ShellError::InspectionTimeout)
+    );
+    assert_eq!(
+        fixture
+            .trace
+            .iter()
+            .filter(|event| **event == Trace::JobSend(LaunchMessageType::Cancel))
+            .count(),
+        1
+    );
+    assert!(
+        !fixture
+            .trace
+            .contains(&Trace::JobSend(LaunchMessageType::CloseJob))
+    );
+}
+
+#[test]
+fn authoritative_foreign_wait_removes_only_that_local_id() {
+    let mut fixture =
+        Fixture::new(&[b"spawn bin/cpu-hog\nwait 91\nterminate 91\nspawn bin/cpu-hog\nexit\n"]);
+    fixture.queue_control(
+        SHELL_JOBS,
+        &job_reply(1, LaunchMessageType::LaunchAccepted, 91),
+    );
+    fixture.queue_control(
+        SHELL_JOBS,
+        &launch_error(2, LaunchErrorCode::ForeignOrUnknownJob),
+    );
+    fixture.queue_control(
+        SHELL_JOBS,
+        &job_reply(3, LaunchMessageType::LaunchAccepted, 92),
+    );
+    assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+    let requests: Vec<_> = fixture
+        .control_requests
+        .iter()
+        .filter(|(handle, _)| *handle == SHELL_JOBS)
+        .map(|(_, bytes)| request_kind(bytes, 0))
+        .collect();
+    assert_eq!(
+        requests,
+        [
+            LaunchMessageType::Launch,
+            LaunchMessageType::Wait,
+            LaunchMessageType::Launch,
+        ]
+    );
+    let error = fixture.output(STDERR);
+    assert!(
+        error
+            .windows(b"wait job=91 status=foreign\n".len())
+            .any(|bytes| bytes == b"wait job=91 status=foreign\n")
+    );
+    assert!(
+        error
+            .windows(b"terminate job=91 status=invalid-state\n".len())
+            .any(|bytes| bytes == b"terminate job=91 status=invalid-state\n")
+    );
+}
+
+#[test]
+fn empty_child_record_flood_yields_to_other_output_and_job_result() {
+    let mut fixture = Fixture::new(&[b"run bin/hello\nexit\n"]);
+    fixture.queue_control(
+        SHELL_JOBS,
+        &job_reply(1, LaunchMessageType::LaunchAccepted, 41),
+    );
+    fixture.queue_control(SHELL_JOBS, &terminal_reply(2, 41, normal_result(0)));
+    fixture.queue_control(SHELL_JOBS, &job_reply(3, LaunchMessageType::Closed, 41));
+    for _ in 0..16 {
+        fixture
+            .child_incoming
+            .push_back((CHILD_STDOUT_RETAINED, Some(wire(b""))));
+    }
+    fixture
+        .child_incoming
+        .push_back((CHILD_STDOUT_RETAINED, Some(wire(b"out"))));
+    fixture
+        .child_incoming
+        .push_back((CHILD_STDOUT_RETAINED, None));
+    fixture
+        .child_incoming
+        .push_back((CHILD_STDERR_RETAINED, Some(wire(b"err"))));
+    fixture
+        .child_incoming
+        .push_back((CHILD_STDERR_RETAINED, None));
+    assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+    assert!(
+        fixture
+            .output(STDOUT)
+            .windows(3)
+            .any(|bytes| bytes == b"out")
+    );
+    assert!(
+        fixture
+            .output(STDERR)
+            .windows(3)
+            .any(|bytes| bytes == b"err")
+    );
+}
+
+#[test]
+fn all_structured_termination_classes_and_fields_are_rendered_from_wire_data() {
+    for (classification, spelling) in [
+        (TerminationClassification::NormalExit, b"normal".as_slice()),
+        (
+            TerminationClassification::Authorized,
+            b"authorized".as_slice(),
+        ),
+        (
+            TerminationClassification::UnhandledException,
+            b"exception".as_slice(),
+        ),
+        (
+            TerminationClassification::ResourcePolicy,
+            b"resource-policy".as_slice(),
+        ),
+        (
+            TerminationClassification::TaskGroupTeardown,
+            b"task-group-teardown".as_slice(),
+        ),
+    ] {
+        let mut fixture = Fixture::new(&[b"spawn bin/cpu-hog\nwait 91\nexit\n"]);
+        fixture.queue_control(
+            SHELL_JOBS,
+            &job_reply(1, LaunchMessageType::LaunchAccepted, 91),
+        );
+        fixture.queue_control(
+            SHELL_JOBS,
+            &terminal_reply(
+                2,
+                91,
+                TerminationResult {
+                    classification,
+                    application_code: 10,
+                    exception_class: 11,
+                    exception_detail: 12,
+                    exception_address: 13,
+                    cleanup_result: 3,
+                },
+            ),
+        );
+        fixture.queue_control(SHELL_JOBS, &job_reply(3, LaunchMessageType::Closed, 91));
+        assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+        let output = fixture.output(STDOUT);
+        assert!(
+            output
+                .windows(spelling.len())
+                .any(|bytes| bytes == spelling)
+        );
+        assert!(output
+            .windows(b"application=10 exception-class=11 exception-detail=12 exception-address=13 cleanup=3".len())
+            .any(|bytes| bytes == b"application=10 exception-class=11 exception-detail=12 exception-address=13 cleanup=3"));
+    }
+}
+
+#[test]
+fn stale_or_handle_bearing_job_results_fail_without_close_or_guessed_output() {
+    let mut stale = Fixture::new(&[b"spawn bin/cpu-hog\nwait 91\n"]);
+    stale.queue_control(
+        SHELL_JOBS,
+        &job_reply(1, LaunchMessageType::LaunchAccepted, 91),
+    );
+    stale.queue_control(SHELL_JOBS, &terminal_reply(99, 91, normal_result(0)));
+    assert_eq!(
+        run_v2(&mut stale, "system/wyrmsh", &[]),
+        Err(ShellError::InspectionProtocol)
+    );
+    assert!(
+        !stale
+            .trace
+            .contains(&Trace::JobSend(LaunchMessageType::CloseJob))
+    );
+
+    let mut handled = Fixture::new(&[b"spawn bin/cpu-hog\nwait 91\n"]);
+    handled.queue_control(
+        SHELL_JOBS,
+        &job_reply(1, LaunchMessageType::LaunchAccepted, 91),
+    );
+    handled.queue_control_with_handle(
+        SHELL_JOBS,
+        &terminal_reply(2, 91, normal_result(0)),
+        DwHandle(700),
+    );
+    assert_eq!(
+        run_v2(&mut handled, "system/wyrmsh", &[]),
+        Err(ShellError::InspectionProtocol)
+    );
+    assert_eq!(
+        handled
+            .closed
+            .iter()
+            .filter(|handle| **handle == DwHandle(700))
+            .count(),
+        1
+    );
+    assert!(
+        !handled
+            .trace
+            .contains(&Trace::JobSend(LaunchMessageType::CloseJob))
+    );
+}
+
+#[test]
+fn shell_jobs_peer_loss_with_active_job_is_generation_fatal() {
+    let mut fixture = Fixture::new(&[b"spawn bin/cpu-hog\nwait 91\n"]);
+    fixture.queue_control(
+        SHELL_JOBS,
+        &job_reply(1, LaunchMessageType::LaunchAccepted, 91),
+    );
+    fixture.peer_loss_job_kind = Some(LaunchMessageType::Wait);
+    assert_eq!(
+        run_v2(&mut fixture, "system/wyrmsh", &[]),
+        Err(ShellError::RequiredEndpointLost(EndpointRole::ShellJobs))
+    );
+    assert!(
+        !fixture
+            .trace
+            .contains(&Trace::JobSend(LaunchMessageType::CloseJob))
+    );
 }

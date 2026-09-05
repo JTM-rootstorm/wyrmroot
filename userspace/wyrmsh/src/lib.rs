@@ -5,12 +5,13 @@
 //! Allocation-free WYR1-E shell startup and local-command runtime.
 
 mod inspection;
+mod jobs;
 
 use deepwyrm_syscall::{
     DW_DEADLINE_INFINITE, DW_DEADLINE_NOW, DW_OBJECT_TYPE_CHANNEL, DW_SIGNAL_PEER_CLOSED,
     DW_SIGNAL_READABLE, DW_SIGNAL_WRITABLE, DW_STATUS_TIMED_OUT, DW_STATUS_WOULD_BLOCK, DwDeadline,
-    DwHandle, DwObjectType, DwReceivedHandleInfoV1, DwRights, DwSignals, DwWaitItemV1,
-    DwWaitResultV1,
+    DwHandle, DwHandleTransferV1, DwObjectType, DwReceivedHandleInfoV1, DwRights, DwSignals,
+    DwWaitItemV1, DwWaitResultV1,
 };
 use inspection::{InspectionError, RegistrySequence, TransactionIds};
 use wyrmroot_loader::launch::{
@@ -26,8 +27,7 @@ use wyrmroot_runtime::{
 #[cfg(test)]
 use wyrmroot_stream_proto as _;
 use wyrmroot_wyrmsh_core::{
-    COMMANDS, Command, CommandName, EditError, EditOutcome, Editor, InputDecoder, ParseError,
-    Parser, UsageError,
+    COMMANDS, Command, EditError, EditOutcome, Editor, InputDecoder, ParseError, Parser, UsageError,
 };
 
 const HANDLE_COUNT: usize = 6;
@@ -54,6 +54,8 @@ pub enum NativeOperation {
     ControlSend = 9,
     ControlReceive = 10,
     MonotonicClock = 11,
+    CreateChannel = 12,
+    DuplicateHandle = 13,
 }
 
 /// The endpoint whose loss makes the shell generation unusable.
@@ -152,6 +154,18 @@ pub trait WyrmshSystem: StreamSystem {
         handles: &mut [DwReceivedHandleInfoV1],
     ) -> Result<ReceiveCounts, NativeError>;
     fn send_channel(&mut self, channel: DwHandle, bytes: &[u8]) -> Result<(), NativeError>;
+    fn send_channel_with_handles(
+        &mut self,
+        channel: DwHandle,
+        bytes: &[u8],
+        transfers: &[DwHandleTransferV1],
+    ) -> Result<(), NativeError>;
+    fn create_channel(&mut self, rights: DwRights) -> Result<(DwHandle, DwHandle), NativeError>;
+    fn duplicate_handle(
+        &mut self,
+        handle: DwHandle,
+        rights: DwRights,
+    ) -> Result<DwHandle, NativeError>;
     fn close_handle(&mut self, handle: DwHandle) -> Result<(), NativeError>;
     fn wait_many(
         &mut self,
@@ -330,6 +344,7 @@ struct Shell {
     stderr: NativeOutput,
     controls: Controls,
     transactions: TransactionIds,
+    jobs: jobs::JobTable,
 }
 
 impl Shell {
@@ -348,6 +363,7 @@ impl Shell {
             stderr: NativeOutput::new(endpoints[2]),
             controls,
             transactions: TransactionIds::new(),
+            jobs: jobs::JobTable::new(),
         }
     }
 
@@ -448,6 +464,7 @@ impl Shell {
                 self.identity,
                 self.controls,
                 &mut self.transactions,
+                &mut self.jobs,
                 command,
             )?,
             Err(error) => {
@@ -505,6 +522,7 @@ fn dispatch_local<System: WyrmshSystem>(
     identity: ShellIdentity,
     controls: Controls,
     transactions: &mut TransactionIds,
+    jobs: &mut jobs::JobTable,
     command: Command<'_>,
 ) -> Result<bool, ShellError> {
     match command {
@@ -541,12 +559,48 @@ fn dispatch_local<System: WyrmshSystem>(
         Command::Status => {
             inspect_status(system, stdout, stderr, identity, controls, transactions)?
         }
-        Command::Run { .. } | Command::Spawn { .. } | Command::Wait(_) | Command::Terminate(_) => {
-            let name = command_name(command);
-            write_stdout(system, stdout, stderr_handle, controls, b"unavailable: ")?;
-            write_stdout(system, stdout, stderr_handle, controls, name.as_bytes())?;
-            write_stdout(system, stdout, stderr_handle, controls, b"\n")?;
-        }
+        Command::Run { path, argv } => jobs::run(
+            system,
+            stdout,
+            stderr,
+            identity,
+            controls,
+            transactions,
+            jobs,
+            path,
+            argv,
+        )?,
+        Command::Spawn { path, argv } => jobs::spawn(
+            system,
+            stdout,
+            stderr,
+            identity,
+            controls,
+            transactions,
+            jobs,
+            path,
+            argv,
+        )?,
+        Command::Wait(job) => jobs::wait(
+            system,
+            stdout,
+            stderr,
+            identity,
+            controls,
+            transactions,
+            jobs,
+            job.get(),
+        )?,
+        Command::Terminate(job) => jobs::terminate(
+            system,
+            stdout,
+            stderr,
+            identity,
+            controls,
+            transactions,
+            jobs,
+            job.get(),
+        )?,
     }
     Ok(false)
 }
@@ -1288,23 +1342,6 @@ fn wait_for_control<System: WyrmshSystem>(
         return Err(ShellError::InspectionProtocol);
     }
     ensure_before_control_deadline(system, deadline)
-}
-
-fn command_name(command: Command<'_>) -> &'static str {
-    let name = match command {
-        Command::Services => CommandName::Services,
-        Command::Tasks => CommandName::Tasks,
-        Command::Status => CommandName::Status,
-        Command::Run { .. } => CommandName::Run,
-        Command::Spawn { .. } => CommandName::Spawn,
-        Command::Wait(_) => CommandName::Wait,
-        Command::Terminate(_) => CommandName::Terminate,
-        _ => return "command",
-    };
-    COMMANDS
-        .iter()
-        .find(|spec| spec.name == name)
-        .map_or("command", |spec| spec.spelling)
 }
 
 fn present_edit_error<System: WyrmshSystem>(
