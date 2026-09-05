@@ -565,6 +565,35 @@ pub(crate) fn fixed_builder_for_profiles(
     registry_profile: StartupProfile,
     devmgr_profile: StartupProfile,
 ) -> Result<Builder<'static>, Failure> {
+    fixed_builder_for_all_profiles(
+        boot_generation,
+        role_hashes,
+        registry_profile,
+        devmgr_profile,
+        StartupProfile::Retained,
+    )
+}
+
+pub(crate) fn fixed_builder_for_wyrmsh(
+    boot_generation: &[u8; 32],
+    role_hashes: [[u8; 32]; 5],
+) -> Result<Builder<'static>, Failure> {
+    fixed_builder_for_all_profiles(
+        boot_generation,
+        role_hashes,
+        StartupProfile::BootstrapRegistry,
+        StartupProfile::DeviceCoordinator,
+        StartupProfile::Wyrmsh,
+    )
+}
+
+fn fixed_builder_for_all_profiles(
+    boot_generation: &[u8; 32],
+    role_hashes: [[u8; 32]; 5],
+    registry_profile: StartupProfile,
+    devmgr_profile: StartupProfile,
+    wyrmsh_profile: StartupProfile,
+) -> Result<Builder<'static>, Failure> {
     let mut builder = Builder::new(*boot_generation);
     let roles = [
         (
@@ -600,7 +629,7 @@ pub(crate) fn fixed_builder_for_profiles(
             "system/wyrmsh",
             ROLE_JUSTIFICATIONS[4],
             Activation::ConsoleBound,
-            StartupProfile::Retained,
+            wyrmsh_profile,
         ),
     ];
     for (index, (id, path, justification, activation, startup_profile)) in

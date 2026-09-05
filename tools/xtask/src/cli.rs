@@ -43,6 +43,8 @@ Usage:
     tools/pinned-cargo xtask wyr1b run --request <wyr1-b-request.toml>
     tools/pinned-cargo xtask wyr1b evidence --request <wyr1-b-request.toml>
     tools/pinned-cargo xtask wyr1c1 product --output <fresh-directory>
+    tools/pinned-cargo xtask wyr1e6 product --output <fresh-directory>
+    tools/pinned-cargo xtask wyr1e6 inspect --product <directory>
     tools/pinned-cargo xtask wyr1c2 freeze --output <fresh-directory>
     tools/pinned-cargo xtask wyr1c2 image --request <wyr1-c2-request.toml>
     tools/pinned-cargo xtask wyr1c2 inspect --request <wyr1-c2-request.toml>
@@ -168,6 +170,8 @@ pub(crate) enum Action {
     Wyr1BRun(String),
     Wyr1BEvidence(String),
     Wyr1C1Product(String),
+    Wyr1E6Product(String),
+    Wyr1E6Inspect(String),
     Wyr1C2Freeze(String),
     Wyr1C2Image(String),
     Wyr1C2Inspect(String),
@@ -288,6 +292,7 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
         "wyr1" => dispatch_wyr1(&arguments[1..]),
         "wyr1b" => dispatch_wyr1b(&arguments[1..]),
         "wyr1c1" => dispatch_wyr1c1(&arguments[1..]),
+        "wyr1e6" => dispatch_wyr1e6(&arguments[1..]),
         "wyr1c2" => dispatch_wyr1c2(&arguments[1..]),
         "wyr1c6" => dispatch_wyr1c6(&arguments[1..]),
         "dw1b" => dispatch_dw1b(&arguments[1..]),
@@ -476,6 +481,20 @@ fn dispatch_wyr1c1(arguments: &[String]) -> Result<Action, Failure> {
         }
         _ => Err(Failure::usage(
             "wyr1c1 requires product --output <fresh-directory>; it has no selector, run, or evidence command",
+        )),
+    }
+}
+
+fn dispatch_wyr1e6(arguments: &[String]) -> Result<Action, Failure> {
+    match arguments {
+        [command, flag, output] if command == "product" && flag == "--output" => {
+            Ok(Action::Wyr1E6Product(output.clone()))
+        }
+        [command, flag, output] if command == "inspect" && flag == "--product" => {
+            Ok(Action::Wyr1E6Inspect(output.clone()))
+        }
+        _ => Err(Failure::usage(
+            "wyr1e6 requires product --output <fresh-directory> or inspect --product <directory>; it has no selector, image, run, or evidence command",
         )),
     }
 }
@@ -1188,6 +1207,22 @@ mod tests {
         assert!(USAGE.contains("tools/pinned-cargo xtask wyr1c1 product --output"));
         assert!(!USAGE.contains("wyr1c1 run"));
         assert!(!USAGE.contains("wyr1c1 evidence"));
+    }
+
+    #[test]
+    fn wyr1e6_dispatch_is_selector_free_product_only() {
+        assert_eq!(
+            dispatch(&arguments(&["wyr1e6", "product", "--output", "product"])),
+            Ok(Action::Wyr1E6Product("product".into()))
+        );
+        assert_eq!(
+            dispatch(&arguments(&["wyr1e6", "inspect", "--product", "product"])),
+            Ok(Action::Wyr1E6Inspect("product".into()))
+        );
+        assert!(dispatch(&arguments(&["wyr1e6", "run", "--product", "product"])).is_err());
+        assert!(dispatch(&arguments(&["wyr1e6", "image", "--product", "product"])).is_err());
+        assert!(USAGE.contains("tools/pinned-cargo xtask wyr1e6 product --output"));
+        assert!(USAGE.contains("tools/pinned-cargo xtask wyr1e6 inspect --product"));
     }
 
     #[test]
