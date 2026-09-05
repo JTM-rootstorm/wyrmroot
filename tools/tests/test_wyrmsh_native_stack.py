@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 
@@ -135,6 +136,52 @@ class StackProofTests(unittest.TestCase):
         with self.assertRaises(stack.ProofFailure) as caught:
             stack._prove(functions, 0x1000)
         self.assertEqual(caught.exception.code, "inconsistent_stack_merge")
+
+    def test_tool_output_is_killed_at_active_cap(self):
+        original = stack.MAX_TOOL_OUTPUT_BYTES
+        stack.MAX_TOOL_OUTPUT_BYTES = 1024
+        try:
+            with self.assertRaisesRegex(RuntimeError, "exceeded bounded size"):
+                stack._run([
+                    sys.executable, "-c", "import os; os.write(1, b'x' * 4096)"
+                ], cwd=REPO)
+        finally:
+            stack.MAX_TOOL_OUTPUT_BYTES = original
+
+    def test_tool_timeout_kills_parent_and_descendant_group(self):
+        original = stack.TOOL_TIMEOUT_SECONDS
+        stack.TOOL_TIMEOUT_SECONDS = 0.5
+        temporary_root = REPO / ".tmp"
+        temporary_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=temporary_root) as directory:
+            pid_file = Path(directory) / "pids"
+            program = (
+                "import os, pathlib, subprocess, sys, time; "
+                "child=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+                "pathlib.Path(sys.argv[1]).write_text(f'{os.getpid()} {child.pid}'); "
+                "time.sleep(30)"
+            )
+            try:
+                with self.assertRaisesRegex(RuntimeError, "exceeded 0.5s"):
+                    stack._run([sys.executable, "-c", program, str(pid_file)], cwd=REPO)
+                parent, child = (int(value) for value in pid_file.read_text().split())
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline and any(
+                    self._process_running(pid) for pid in (parent, child)
+                ):
+                    time.sleep(0.01)
+                self.assertFalse(self._process_running(parent))
+                self.assertFalse(self._process_running(child))
+            finally:
+                stack.TOOL_TIMEOUT_SECONDS = original
+
+    @staticmethod
+    def _process_running(pid):
+        try:
+            state = Path(f"/proc/{pid}/stat").read_text().split()[2]
+        except FileNotFoundError:
+            return False
+        return state not in {"Z", "X"}
 
     def test_accepts_exact_fixed_llvm_stack_probe(self):
         functions = {0x1000: function(0x1000, 40, "_start", 0x3020, [
