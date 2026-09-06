@@ -31,8 +31,6 @@ const SOURCE_RECEIPT: &str = "e7-source-build.toml";
 const MACHINE: &str = "pc-q35-10.2";
 const TIMEOUT_SECONDS: &str = "300";
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
-const NATIVE_TARGET: &str = "x86_64-unknown-wyrmroot";
-const CURRENT_DEVMGR_PACKAGE: &str = "wyrmroot-devmgr";
 const CURRENT_DEVMGR_BINARY: &str = "devmgr";
 const CURRENT_DEVMGR_FEATURES: &str = "wyr1e-production";
 const CURRENT_DEVMGR_COMMAND: &str = "cargo build --offline --locked --release --target x86_64-unknown-wyrmroot --package wyrmroot-devmgr --bin devmgr --no-default-features --features wyr1e-production";
@@ -394,30 +392,7 @@ fn build_produced_artifacts(
         build_directory.with_inheritable_anchor("WYR1-E7 build directory", |anchor| {
             crate::dw1e3a::build_bootstrap(repository, &toolchain, &layout, &cargo_home, anchor)
         })?;
-    let mut snapshot = crate::wyr1c::build_e7_snapshot(nonce, &e6.product)?;
-    let devmgr = build_directory.with_inheritable_anchor("WYR1-E7 build directory", |anchor| {
-        build_current_devmgr(repository, &cargo_home, toolchain.accepted(), anchor)
-    })?;
-    let devmgr_sha256 = sha256::bytes_digest(&devmgr);
-    let devmgr_inspection =
-        wyr1c::inspect_native_bytes(repository, &devmgr, &devmgr_sha256, CURRENT_DEVMGR_BINARY)?;
-    snapshot
-        .artifacts
-        .insert(CURRENT_DEVMGR_BINARY.to_owned(), devmgr);
-    snapshot.inspections.insert(
-        CURRENT_DEVMGR_BINARY.to_owned(),
-        devmgr_inspection.into_bytes(),
-    );
-    let product = wyr1c::reassemble_e7_snapshot(
-        wyrmroot_revision,
-        &snapshot.artifacts,
-        &snapshot.malformed_elf,
-    )?;
-    snapshot.generation = product.generation;
-    snapshot.rrc_manifest = product.rrc_manifest;
-    snapshot.device_manifest = product.device_manifest;
-    snapshot.launch_policy = product.launch_policy;
-    snapshot.bootfs = product.bootfs;
+    let snapshot = crate::wyr1c::build_e7_snapshot(nonce, &e6.product)?;
     let kernel = build_kernel(deep_repository, nonce)?;
     let boot_device_table = wyr1c6::boot_device_table();
     let ovmf_code = wyr1c6::pinned_firmware(
@@ -506,129 +481,6 @@ fn build_produced_artifacts(
         e6_source_receipt_sha256: sha256::bytes_digest(&e6.source_receipt),
         e6_freeze_receipt_sha256: sha256::bytes_digest(&e6.freeze_receipt),
     })
-}
-
-fn build_current_devmgr(
-    repository: &Path,
-    cargo_home: &Path,
-    toolchain: &crate::toolchain_artifact::AcceptedToolchain,
-    build_directory: &crate::secure_fs::InheritableDirectory,
-) -> Result<Vec<u8>, Failure> {
-    let target = build_directory.path().join("devmgr-current");
-    fs::create_dir(&target)
-        .map_err(|error| Failure::task(format!("could not create E7 devmgr target: {error}")))?;
-    let temporary = target.join(".tmp");
-    fs::create_dir(&temporary).map_err(|error| {
-        Failure::task(format!(
-            "could not create E7 devmgr temporary directory: {error}"
-        ))
-    })?;
-    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o700)).map_err(|error| {
-        Failure::task(format!(
-            "could not seal E7 devmgr temporary directory: {error}"
-        ))
-    })?;
-    let flags = current_devmgr_remap_flags(repository, cargo_home, &target)?;
-    build_directory.verify_unchanged("WYR1-E7 build directory")?;
-    let status = current_devmgr_build_command(
-        &toolchain.cargo,
-        &toolchain.rustc,
-        cargo_home,
-        repository,
-        &target,
-        &temporary,
-        &flags,
-    )?
-    .status()
-    .map_err(|error| Failure::task(format!("could not build current E7 devmgr: {error}")))?;
-    build_directory.verify_unchanged("WYR1-E7 build directory")?;
-    if !status.success() {
-        return Err(Failure::task("WYR1-E7 canonical devmgr build failed"));
-    }
-    build_directory.read_producer(
-        &PathBuf::from("devmgr-current")
-            .join(NATIVE_TARGET)
-            .join("release")
-            .join(CURRENT_DEVMGR_BINARY),
-        wyr1c6::MAX_ARTIFACT_BYTES,
-        "current E7 devmgr",
-    )
-}
-
-fn current_devmgr_remap_flags(
-    repository: &Path,
-    cargo_home: &Path,
-    target: &Path,
-) -> Result<String, Failure> {
-    let repository = fs::canonicalize(repository)
-        .map_err(|error| Failure::task(format!("could not resolve source root: {error}")))?;
-    let cargo_home = fs::canonicalize(cargo_home)
-        .map_err(|error| Failure::task(format!("could not resolve Cargo home: {error}")))?;
-    let target = fs::canonicalize(target)
-        .map_err(|error| Failure::task(format!("could not resolve E7 devmgr target: {error}")))?;
-    Ok([
-        format!(
-            "--remap-path-prefix={}=/source/wyrmroot",
-            repository.display()
-        ),
-        format!("--remap-path-prefix={}=/cargo-home", cargo_home.display()),
-        format!("--remap-path-prefix={}=/cargo-target", target.display()),
-    ]
-    .join("\u{1f}"))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn current_devmgr_build_command(
-    cargo: &Path,
-    rustc: &Path,
-    cargo_home: &Path,
-    repository: &Path,
-    target: &Path,
-    temporary: &Path,
-    flags: &str,
-) -> Result<Command, Failure> {
-    let mut command = Command::new(cargo);
-    let cargo_bin = cargo
-        .parent()
-        .ok_or_else(|| Failure::task("accepted Cargo has no parent directory"))?;
-    let path = env::join_paths([
-        cargo_bin,
-        Path::new("/usr/lib/llvm/22/bin"),
-        Path::new("/usr/bin"),
-        Path::new("/bin"),
-    ])
-    .map_err(|_| Failure::task("accepted Cargo path cannot be encoded for subprocess use"))?;
-    command
-        .env_clear()
-        .env("PATH", path)
-        .env("LC_ALL", "C")
-        .env("TMPDIR", temporary)
-        .args([
-            "build",
-            "--offline",
-            "--locked",
-            "--release",
-            "--target",
-            NATIVE_TARGET,
-            "--package",
-            CURRENT_DEVMGR_PACKAGE,
-            "--bin",
-            CURRENT_DEVMGR_BINARY,
-            "--no-default-features",
-            "--features",
-            CURRENT_DEVMGR_FEATURES,
-        ])
-        .arg("--target-dir")
-        .arg(target)
-        .env("RUSTC", rustc)
-        .env("CARGO_HOME", cargo_home)
-        .env("CARGO_ENCODED_RUSTFLAGS", flags)
-        .env("CARGO_INCREMENTAL", "0")
-        .env("CARGO_NET_OFFLINE", "true")
-        .env("SOURCE_DATE_EPOCH", "0")
-        .current_dir(repository)
-        .stdin(Stdio::null());
-    Ok(command)
 }
 
 fn build_kernel(repository: &Path, nonce: &str) -> Result<Vec<u8>, Failure> {
@@ -2708,68 +2560,6 @@ module._strict_c6_toml(sys.stdin.buffer.read(), keys, "Rust-rendered E7 fixture"
             local_deep_repository(&project)?,
             fs::canonicalize(project.join("deepwyrm")).unwrap()
         );
-        Ok(())
-    }
-
-    #[test]
-    fn current_devmgr_command_matches_the_source_receipt_and_exact_environment()
-    -> Result<(), Failure> {
-        let cargo = Path::new("/accepted/bin/cargo");
-        let rustc = Path::new("/accepted/bin/rustc");
-        let cargo_home = Path::new("/project/.cargo-home");
-        let repository = Path::new("/project/wyrmroot");
-        let target = Path::new("/project/build/devmgr-current");
-        let temporary = target.join(".tmp");
-        let flags = "--remap-path-prefix=/project/wyrmroot=/source/wyrmroot\u{1f}--remap-path-prefix=/project/.cargo-home=/cargo-home\u{1f}--remap-path-prefix=/project/build/devmgr-current=/cargo-target";
-        let command = current_devmgr_build_command(
-            cargo, rustc, cargo_home, repository, target, &temporary, flags,
-        )?;
-        assert_eq!(command.get_program(), cargo);
-        assert_eq!(command.get_current_dir(), Some(repository));
-        let arguments = command
-            .get_args()
-            .map(|argument| argument.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            arguments[..arguments.len() - 2].join(" "),
-            CURRENT_DEVMGR_COMMAND.strip_prefix("cargo ").unwrap()
-        );
-        assert_eq!(arguments[arguments.len() - 2], "--target-dir");
-        assert_eq!(arguments[arguments.len() - 1], target.to_string_lossy());
-        let environment = command
-            .get_envs()
-            .map(|(key, value)| {
-                (
-                    key.to_string_lossy().into_owned(),
-                    value
-                        .expect("exact devmgr environment does not remove variables")
-                        .to_string_lossy()
-                        .into_owned(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        assert_eq!(
-            environment.keys().map(String::as_str).collect::<Vec<_>>(),
-            [
-                "CARGO_ENCODED_RUSTFLAGS",
-                "CARGO_HOME",
-                "CARGO_INCREMENTAL",
-                "CARGO_NET_OFFLINE",
-                "LC_ALL",
-                "PATH",
-                "RUSTC",
-                "SOURCE_DATE_EPOCH",
-                "TMPDIR",
-            ]
-        );
-        assert_eq!(environment["CARGO_ENCODED_RUSTFLAGS"], flags);
-        assert_eq!(environment["CARGO_HOME"], cargo_home.to_string_lossy());
-        assert_eq!(environment["CARGO_INCREMENTAL"], "0");
-        assert_eq!(environment["CARGO_NET_OFFLINE"], "true");
-        assert_eq!(environment["LC_ALL"], "C");
-        assert_eq!(environment["RUSTC"], rustc.to_string_lossy());
-        assert_eq!(environment["SOURCE_DATE_EPOCH"], "0");
-        assert_eq!(environment["TMPDIR"], temporary.to_string_lossy());
         Ok(())
     }
 

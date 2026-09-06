@@ -398,13 +398,20 @@ const WYR1E6_PRODUCT_NATIVE_SPECS: [NativeSpec; 7] = [
     },
 ];
 
-const WYR1E7_SELECTED_NATIVE_SPECS: [NativeSpec; 4] = [
+const WYR1E7_SELECTED_NATIVE_SPECS: [NativeSpec; 5] = [
     NativeSpec {
         label: "system-init",
         package: "wyrmroot-system-init",
         binary: "system-init",
         features: "wyr1e-selector33",
         artifact: "system-init",
+    },
+    NativeSpec {
+        label: "devmgr",
+        package: "wyrmroot-devmgr",
+        binary: "devmgr",
+        features: "wyr1e-production",
+        artifact: "devmgr",
     },
     NativeSpec {
         label: "cpu-hog",
@@ -1432,7 +1439,7 @@ pub(crate) fn build_e6_snapshot() -> Result<E6Snapshot, Failure> {
     Ok(snapshot)
 }
 
-/// Builds the selector-private E7 artifacts while reusing the immutable E6
+/// Builds the selected E7 artifacts while reusing the remaining immutable E6
 /// production payloads and exact shell stack proof supplied by the caller.
 pub(crate) fn build_e7_snapshot(
     evidence_nonce: &str,
@@ -4080,7 +4087,7 @@ mod tests {
     }
 
     #[test]
-    fn wyr1e7_native_gate_selects_only_the_observer_and_three_fixture_actors() {
+    fn wyr1e7_native_gate_selects_current_init_devmgr_and_three_fixture_actors() {
         let specs = WYR1E7_SELECTED_NATIVE_SPECS
             .iter()
             .map(|spec| (spec.label, spec.package, spec.binary, spec.features))
@@ -4094,6 +4101,7 @@ mod tests {
                     "system-init",
                     "wyr1e-selector33",
                 ),
+                ("devmgr", "wyrmroot-devmgr", "devmgr", "wyr1e-production",),
                 (
                     "cpu-hog",
                     "wyrmroot-dw1b-preemption",
@@ -4119,7 +4127,7 @@ mod tests {
                 .unwrap()
                 .contains("WYRMROOT_WYR1E7_EVIDENCE_NONCE")
         );
-        for label in ["cpu-hog", "exit-nonzero", "fault"] {
+        for label in ["devmgr", "cpu-hog", "exit-nonzero", "fault"] {
             assert!(
                 !e7_native_command(label)
                     .unwrap()
