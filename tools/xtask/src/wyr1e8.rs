@@ -159,7 +159,7 @@ pub(crate) fn inspect(product: &Path) -> Result<String, Failure> {
         .map_err(|_| Failure::task("WYR1-E8 request is not UTF-8"))?;
     let request = parse(request_text)?;
     validate_request(&request)?;
-    if render(&request, &request_keys(), "WYR1-E8 request")? != request_text {
+    if render(&request, &request_keys(), ScalarSchema::Request)? != request_text {
         return Err(Failure::task("WYR1-E8 request is not canonical"));
     }
     let revision = wyr1c6::clean_revision(&repository, "Wyrmroot")?;
@@ -552,7 +552,7 @@ fn freeze(output: &Path, produced: &Produced, nonce: &str) -> Result<String, Fai
     ] {
         fields.insert(k.into(), v.into());
     }
-    let request = render(&fields, &request_keys(), "WYR1-E8 request")?;
+    let request = render(&fields, &request_keys(), ScalarSchema::Request)?;
     wyr1c6::write_new(
         &output.join("request.toml"),
         request.as_bytes(),
@@ -570,13 +570,13 @@ fn freeze(output: &Path, produced: &Produced, nonce: &str) -> Result<String, Fai
     let pair = pair_fields(output, &request_hash)?;
     wyr1c6::write_new(
         &output.join("profile-pair.toml"),
-        render_sorted(&pair)?.as_bytes(),
+        render_sorted(&pair, ScalarSchema::Pair)?.as_bytes(),
         "profile pair",
     )?;
     let receipt = receipt_fields(&request_hash, &fields);
     wyr1c6::write_new(
         &output.join("freeze-receipt.toml"),
-        render_sorted(&receipt)?.as_bytes(),
+        render_sorted(&receipt, ScalarSchema::FreezeReceipt)?.as_bytes(),
         "freeze receipt",
     )?;
     validate_request(&fields)?;
@@ -711,7 +711,7 @@ fn source_receipt(
             )?),
         );
     }
-    render(&f, &source_receipt_keys(), "WYR1-E8 source receipt")
+    render(&f, &source_receipt_keys(), ScalarSchema::SourceReceipt)
 }
 
 fn source_receipt_keys() -> Vec<String> {
@@ -834,7 +834,7 @@ fn stage_profile(
     let h = profile_fields(profile, vcpus, count, request_hash, r, &xml, &vars)?;
     wyr1c6::write_new(
         &d.join("handoff.toml"),
-        render_sorted(&h)?.as_bytes(),
+        render_sorted(&h, ScalarSchema::Handoff)?.as_bytes(),
         "handoff",
     )
 }
@@ -1040,7 +1040,7 @@ fn result_schema() -> Result<String, Failure> {
             },
         );
     }
-    render(&f, &keys, "WYR1-E8 result schema")
+    render(&f, &keys, ScalarSchema::ResultTemplate)
 }
 
 fn result_keys() -> Vec<String> {
@@ -1323,7 +1323,7 @@ fn validate_frozen_metadata(
         let handoff_path = output.join(profile).join("handoff.toml");
         require_mode(&handoff_path, 0o444, "WYR1-E8 handoff")?;
         if wyr1c6::read_regular_bounded(&handoff_path, 64 * 1024, "WYR1-E8 handoff")?
-            != render_sorted(&handoff)?.as_bytes()
+            != render_sorted(&handoff, ScalarSchema::Handoff)?.as_bytes()
         {
             return Err(Failure::task(format!("WYR1-E8 {profile} handoff drifted")));
         }
@@ -1333,7 +1333,7 @@ fn validate_frozen_metadata(
         &output.join(field(request, "profile_pair")?),
         64 * 1024,
         "WYR1-E8 profile pair",
-    )? != render_sorted(&pair)?.as_bytes()
+    )? != render_sorted(&pair, ScalarSchema::Pair)?.as_bytes()
     {
         return Err(Failure::task("WYR1-E8 profile pair drifted"));
     }
@@ -1342,7 +1342,7 @@ fn validate_frozen_metadata(
         &output.join(field(request, "receipt")?),
         64 * 1024,
         "WYR1-E8 freeze receipt",
-    )? != render_sorted(&receipt)?.as_bytes()
+    )? != render_sorted(&receipt, ScalarSchema::FreezeReceipt)?.as_bytes()
     {
         return Err(Failure::task("WYR1-E8 freeze receipt drifted"));
     }
@@ -1408,27 +1408,104 @@ fn artifact_maximum(k: &str) -> u64 {
         _ => wyr1c6::MAX_ARTIFACT_BYTES,
     }
 }
-fn numeric(k: &str) -> bool {
-    k == "schema_version"
-        || k == "test_id"
-        || k == "com2_prelude_length"
-        || k.ends_with("_capacity")
-        || k.ends_with("_seconds")
-        || k.ends_with("_bytes")
-        || k.ends_with("_records")
-        || matches!(
-            k,
-            "evidence_version_major"
-                | "evidence_version_minor"
-                | "send_limit"
-                | "pressure_pause_milliseconds"
-                | "pressure_min_would_blocks"
-                | "pressure_max_would_blocks"
-                | "vcpus"
-                | "memory_mib"
-        )
+const SEMANTIC_INTEGER_KEYS: &[&str] = &[
+    "evidence_version_major",
+    "evidence_version_minor",
+    "evidence_record_bytes",
+    "evidence_record_capacity",
+    "default_evidence_records",
+    "smp_evidence_records",
+    "com2_prelude_length",
+    "process_capacity",
+    "thread_capacity",
+    "root_address_space_capacity",
+    "task_group_capacity",
+    "channel_pair_capacity",
+    "wait_capacity",
+    "overall_timeout_seconds",
+    "ordinary_timeout_seconds",
+    "transition_timeout_seconds",
+    "com2_capture_bytes",
+    "send_limit",
+    "input_limit_bytes",
+    "audit_limit_bytes",
+    "pressure_pause_milliseconds",
+    "pressure_bytes",
+    "pressure_min_would_blocks",
+    "pressure_max_would_blocks",
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScalarSchema {
+    Request,
+    SourceReceipt,
+    Handoff,
+    FreezeReceipt,
+    Pair,
+    ResultTemplate,
 }
-fn render(f: &BTreeMap<String, String>, keys: &[String], label: &str) -> Result<String, Failure> {
+
+impl ScalarSchema {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Request => "WYR1-E8 request",
+            Self::SourceReceipt => "WYR1-E8 source receipt",
+            Self::Handoff => "WYR1-E8 handoff",
+            Self::FreezeReceipt => "WYR1-E8 freeze receipt",
+            Self::Pair => "WYR1-E8 profile pair",
+            Self::ResultTemplate => "WYR1-E8 result schema",
+        }
+    }
+
+    fn is_integer(self, key: &str) -> bool {
+        match self {
+            Self::Request | Self::SourceReceipt => {
+                matches!(key, "schema_version" | "test_id") || SEMANTIC_INTEGER_KEYS.contains(&key)
+            }
+            Self::Handoff => {
+                matches!(
+                    key,
+                    "schema_version"
+                        | "test_id"
+                        | "expected_evidence_records"
+                        | "vcpus"
+                        | "memory_mib"
+                        | "timeout_seconds"
+                ) || SEMANTIC_INTEGER_KEYS.contains(&key)
+            }
+            Self::FreezeReceipt => matches!(
+                key,
+                "schema_version"
+                    | "test_id"
+                    | "evidence_version_major"
+                    | "evidence_version_minor"
+                    | "default_evidence_records"
+                    | "smp_evidence_records"
+            ),
+            Self::Pair => matches!(
+                key,
+                "schema_version"
+                    | "test_id"
+                    | "evidence_version_major"
+                    | "evidence_version_minor"
+                    | "default_evidence_records"
+                    | "smp_evidence_records"
+                    | "default_vcpus"
+                    | "smp_vcpus"
+                    | "memory_mib"
+                    | "timeout_seconds"
+            ),
+            Self::ResultTemplate => false,
+        }
+    }
+}
+
+fn render(
+    f: &BTreeMap<String, String>,
+    keys: &[String],
+    schema: ScalarSchema,
+) -> Result<String, Failure> {
+    let label = schema.label();
     let expected = keys.iter().cloned().collect::<BTreeSet<_>>();
     if f.keys().cloned().collect::<BTreeSet<_>>() != expected {
         return Err(Failure::task(format!("{label} fields drifted")));
@@ -1436,20 +1513,29 @@ fn render(f: &BTreeMap<String, String>, keys: &[String], label: &str) -> Result<
     let mut out = String::new();
     for k in keys {
         let v = field(f, k)?;
-        if v.contains(['\n', '\r', '"']) {
+        if v.contains(['\n', '\r']) {
             return Err(Failure::task(format!("{label} unsafe value")));
         }
-        if numeric(k) {
+        if schema.is_integer(k) {
+            if v.is_empty()
+                || !v.bytes().all(|byte| byte.is_ascii_digit())
+                || (v.len() > 1 && v.starts_with('0'))
+            {
+                return Err(Failure::task(format!(
+                    "{label} {k} is not a canonical integer"
+                )));
+            }
             out.push_str(&format!("{k} = {v}\n"));
         } else {
-            out.push_str(&format!("{k} = \"{v}\"\n"));
+            let escaped = v.replace('\\', "\\\\").replace('"', "\\\"");
+            out.push_str(&format!("{k} = \"{escaped}\"\n"));
         }
     }
     Ok(out)
 }
-fn render_sorted(f: &BTreeMap<String, String>) -> Result<String, Failure> {
+fn render_sorted(f: &BTreeMap<String, String>, schema: ScalarSchema) -> Result<String, Failure> {
     let keys = f.keys().cloned().collect::<Vec<_>>();
-    render(f, &keys, "WYR1-E8 schema")
+    render(f, &keys, schema)
 }
 fn parse(text: &str) -> Result<BTreeMap<String, String>, Failure> {
     if !text.ends_with('\n') || text.contains('\r') {
@@ -1468,25 +1554,44 @@ fn parse(text: &str) -> Result<BTreeMap<String, String>, Failure> {
             return Err(Failure::task("invalid WYR1-E8 key"));
         }
         let value = if let Some(q) = v.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
-            q
+            decode_scalar_string(q)?
         } else if v.bytes().all(|b| b.is_ascii_digit()) {
-            v
+            v.to_owned()
         } else {
             return Err(Failure::task("invalid WYR1-E8 value"));
         };
-        if out.insert(k.into(), value.into()).is_some() {
+        if out.insert(k.into(), value).is_some() {
             return Err(Failure::task("duplicate WYR1-E8 key"));
         }
     }
     Ok(out)
 }
 
+fn decode_scalar_string(inner: &str) -> Result<String, Failure> {
+    let mut value = String::new();
+    let mut characters = inner.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            '\\' => match characters.next() {
+                Some('\\') => value.push('\\'),
+                Some('"') => value.push('"'),
+                _ => return Err(Failure::task("unsupported WYR1-E8 scalar escape")),
+            },
+            '"' => return Err(Failure::task("unescaped WYR1-E8 scalar quote")),
+            other => value.push(other),
+        }
+    }
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::{
+        fs,
         io::Write as _,
         process::{Command, Stdio},
+        time::{SystemTime, UNIX_EPOCH},
     };
 
     fn root_verifier_accepts_request(text: &str) -> Result<(), Failure> {
@@ -1588,6 +1693,191 @@ module._strict_c6_toml(
         request
     }
 
+    fn normalized_source_receipt() -> BTreeMap<String, String> {
+        let mut source = fixed_fields()
+            .into_iter()
+            .chain(extra_fields())
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect::<BTreeMap<_, _>>();
+        source.insert("kind".into(), SOURCE_KIND.into());
+        for (key, value) in [
+            (
+                "deepwyrm_revision",
+                "89cac01882d83a8cd76b4dd30639573839b2b8cd",
+            ),
+            (
+                "generated_abi_revision",
+                "085b184c32ae1fa3d5ec322c86957dd5d036595c",
+            ),
+            (
+                "generated_abi_tree",
+                "a9b067107ec38e2be44630f4dce428dab0f48de8",
+            ),
+            (
+                "wyrmroot_revision",
+                "f262c60226cf038a575c6bf0da150083ea9bd07d",
+            ),
+            ("rust_revision", "a92dc7f7464ad6ddfece4402bd7b86dbfa86166d"),
+            ("e6_wyrmroot_revision", ACCEPTED_E6_REVISION),
+            (
+                "e6_source_receipt_sha256",
+                ACCEPTED_E6_SOURCE_RECEIPT_SHA256,
+            ),
+            (
+                "e6_freeze_receipt_sha256",
+                ACCEPTED_E6_FREEZE_RECEIPT_SHA256,
+            ),
+            ("evidence_nonce", "E800000000000101"),
+            ("boot_generation", "01"),
+            ("rust_toolchain_name", "wyrmroot-test-toolchain"),
+            ("rustc_sha256", "01"),
+            ("cargo_sha256", "02"),
+            ("rust_lld_sha256", "03"),
+            ("toolchain_manifest_sha256", "04"),
+            ("toolchain_tree_sha256", "05"),
+            (
+                "loader_command",
+                "canonical deterministic release UEFI loader pair",
+            ),
+            (
+                "kernel_command",
+                "tools/pinned-cargo target build --locked --offline --release --target x86_64-unknown-none --package deepwyrm-kernel --bin deepwyrm-kernel --features test-support [selector=interactive-wyrmsh DEEPWYRM_WYR1E8_EVIDENCE=1 nonce=validated]",
+            ),
+            (
+                "bootstrap_command",
+                "canonical DW1-E3A native bootstrap build",
+            ),
+            ("bootstrap_features", "wyr1c5-production"),
+            (
+                "bootfs_command",
+                "in-process wyrmroot-bootfs build_e8 exact 18-entry archive",
+            ),
+            (
+                "esp_command",
+                "canonical g3_image build_d6 selector33 E8 ESP with explicit boot device table",
+            ),
+            ("malformed_elf_literal", "WYR1-E7 malformed ELF\\n"),
+            (
+                "malformed_elf_command",
+                "inherited exact E7 literal ASCII followed by LF",
+            ),
+        ] {
+            source.insert(key.into(), value.into());
+        }
+        for label in wyr1c::E8_ARTIFACT_LABELS {
+            let key = label.replace('-', "_");
+            source.insert(
+                format!("{key}_features"),
+                wyr1c::e8_native_features(label).unwrap().into(),
+            );
+            let command = wyr1c::e8_native_command(label).unwrap();
+            source.insert(
+                format!("{key}_command"),
+                if matches!(label, "registryd" | "wyrmsh") {
+                    format!("inherited E6 revision {ACCEPTED_E6_REVISION}: {command}")
+                } else {
+                    command
+                },
+            );
+            source.insert(format!("{key}_inspection_sha256"), "06".repeat(32));
+        }
+        for (key, _) in ARTIFACTS {
+            source.insert(format!("{key}_sha256"), "07".repeat(32));
+        }
+        for (key, digest) in ACCEPTED_E6_REUSED_SHA256 {
+            source.insert(format!("{key}_sha256"), (*digest).into());
+        }
+        assert_eq!(source.len(), 124);
+        source
+    }
+
+    fn root_accepts_all_scalar_records(records: &[String; 7]) -> Result<(), Failure> {
+        let repository = tasks::repository_root()?;
+        let project = tasks::canonical_project_root(&repository)?;
+        let verifier = project.join("tools/verify-vm-request.py");
+        let runner = project.join("tools/run-verified-vm-request.py");
+        let program = r#"import importlib.util, sys
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+verify = load("verify_vm_request", sys.argv[1])
+runner = load("run_verified_vm_request", sys.argv[2])
+records = sys.stdin.buffer.read().split(b"\0")
+if len(records) != 7:
+    raise RuntimeError("expected seven Rust-rendered E8 scalar records")
+request, source, freeze, pair, default_handoff, smp_handoff, result = records
+semantic = verify.E8_SEMANTIC_INTEGER_KEYS
+profiles = (
+    (request, verify.E8_REQUEST_KEYS, frozenset({"schema_version", "test_id"}) | semantic, "request"),
+    (source, verify.E8_SOURCE_RECEIPT_KEYS, frozenset({"schema_version", "test_id"}) | semantic, "source"),
+    (freeze, verify.E8_RECEIPT_KEYS, frozenset({"schema_version", "test_id", "evidence_version_major", "evidence_version_minor", "default_evidence_records", "smp_evidence_records"}), "freeze"),
+    (pair, verify.E8_PAIR_KEYS, frozenset({"schema_version", "test_id", "evidence_version_major", "evidence_version_minor", "default_evidence_records", "smp_evidence_records", "default_vcpus", "smp_vcpus", "memory_mib", "timeout_seconds"}), "pair"),
+    (default_handoff, verify.E8_HANDOFF_KEYS, frozenset({"schema_version", "test_id", "vcpus", "memory_mib", "timeout_seconds", "expected_evidence_records"}) | semantic, "default handoff"),
+    (smp_handoff, verify.E8_HANDOFF_KEYS, frozenset({"schema_version", "test_id", "vcpus", "memory_mib", "timeout_seconds", "expected_evidence_records"}) | semantic, "SMP handoff"),
+)
+def replace_value(contents, key, replacement):
+    prefix = key + " = "
+    lines = contents.decode("utf-8").splitlines()
+    matches = [index for index, line in enumerate(lines) if line.startswith(prefix)]
+    if len(matches) != 1:
+        raise RuntimeError(f"missing unique {key}")
+    lines[matches[0]] = prefix + replacement
+    return ("\n".join(lines) + "\n").encode()
+for contents, keys, integers, label in profiles:
+    parsed = verify._strict_c6_toml(contents, keys, f"Rust-rendered E8 {label}", integers)
+    for key in keys:
+        replacement = f'"{parsed[key]}"' if key in integers else "1"
+        try:
+            verify._strict_c6_toml(replace_value(contents, key, replacement), keys, f"mistyped E8 {label}", integers)
+        except verify.VerificationError:
+            pass
+        else:
+            raise RuntimeError(f"root accepted mistyped E8 {label} field {key}")
+source_fields = verify.parse_e8_source_receipt(source)
+verify.validate_e8_source_receipt_lineage(source_fields)
+if source_fields["malformed_elf_literal"] != r"WYR1-E7 malformed ELF\n":
+    raise RuntimeError("source literal did not preserve backslash+n")
+values = {key: f"value-{key}" for key in verify.E8_RESULT_KEYS}
+runner._render_e8_result_toml(values, result)
+for key in verify.E8_RESULT_KEYS:
+    try:
+        runner._render_e8_result_toml(values, replace_value(result, key, "1"))
+    except runner.RunnerError:
+        pass
+    else:
+        raise RuntimeError(f"runner accepted mistyped E8 result field {key}")
+"#;
+        let mut child = Command::new("/usr/bin/python3")
+            .args(["-c", program])
+            .arg(verifier)
+            .arg(runner)
+            .current_dir(project)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| Failure::task(format!("could not start root E8 parsers: {error}")))?;
+        let input = records.join("\0");
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| Failure::task("root E8 parser stdin was unavailable"))?
+            .write_all(input.as_bytes())
+            .map_err(|error| Failure::task(format!("could not feed root E8 parsers: {error}")))?;
+        let output = child.wait_with_output().map_err(|error| {
+            Failure::task(format!("could not wait for root E8 parsers: {error}"))
+        })?;
+        if !output.status.success() {
+            return Err(Failure::task(format!(
+                "root rejected Rust-rendered E8 scalar records: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(())
+    }
+
     #[test]
     fn request_contract_has_one_exact_additive_key_set() {
         let keys = request_keys();
@@ -1648,6 +1938,90 @@ module._strict_c6_toml(
             "backpressure_audit_sha256 = \"<runner:backpressure_audit_sha256>\"\nacceptance = \"pass\"\n"
         ));
         assert!(rendered.contains("evidence_nonce = \"<runner:evidence_nonce>\"\n"));
+        assert!(rendered.contains("schema_version = \"1\"\n"));
+        assert!(
+            rendered
+                .contains("expected_evidence_records = \"<runner:expected_evidence_records>\"\n")
+        );
+    }
+
+    #[test]
+    fn all_e8_scalar_records_match_root_type_and_escape_contracts() {
+        let request = normalized_a1_request();
+        let request_text = render(&request, &request_keys(), ScalarSchema::Request).unwrap();
+        let request_hash = sha256::bytes_digest(request_text.as_bytes());
+        let source_text = render(
+            &normalized_source_receipt(),
+            &source_receipt_keys(),
+            ScalarSchema::SourceReceipt,
+        )
+        .unwrap();
+        assert!(source_text.contains("malformed_elf_literal = \"WYR1-E7 malformed ELF\\\\n\"\n"));
+        assert_eq!(
+            parse(&source_text).unwrap()["malformed_elf_literal"],
+            "WYR1-E7 malformed ELF\\n"
+        );
+
+        let default = profile_fields(
+            "default",
+            1,
+            "33",
+            &request_hash,
+            &request,
+            "<domain profile=\"default\"/>",
+            b"default vars",
+        )
+        .unwrap();
+        let smp = profile_fields(
+            "smp",
+            4,
+            "69",
+            &request_hash,
+            &request,
+            "<domain profile=\"smp\"/>",
+            b"smp vars",
+        )
+        .unwrap();
+        let default_text = render_sorted(&default, ScalarSchema::Handoff).unwrap();
+        let smp_text = render_sorted(&smp, ScalarSchema::Handoff).unwrap();
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let repository = tasks::repository_root().unwrap();
+        let scratch = repository
+            .join(".tmp/wyr1e8-schema-tests")
+            .join(format!("{}-{unique}", std::process::id()));
+        fs::create_dir_all(scratch.join("default")).unwrap();
+        fs::create_dir_all(scratch.join("smp")).unwrap();
+        fs::write(scratch.join("default/handoff.toml"), &default_text).unwrap();
+        fs::write(scratch.join("smp/handoff.toml"), &smp_text).unwrap();
+        let pair = pair_fields(&scratch, &request_hash).unwrap();
+        let pair_text = render_sorted(&pair, ScalarSchema::Pair).unwrap();
+        fs::remove_dir_all(&scratch).unwrap();
+        assert!(pair_text.contains("default_vcpus = 1\n"));
+        assert!(pair_text.contains("smp_vcpus = 4\n"));
+
+        let freeze_text = render_sorted(
+            &receipt_fields(&request_hash, &request),
+            ScalarSchema::FreezeReceipt,
+        )
+        .unwrap();
+        let records = [
+            request_text,
+            source_text,
+            freeze_text,
+            pair_text,
+            default_text,
+            smp_text,
+            result_schema().unwrap(),
+        ];
+        root_accepts_all_scalar_records(&records).unwrap();
+
+        let mut noncanonical_pair = pair;
+        noncanonical_pair.insert("default_vcpus".into(), "01".into());
+        assert!(render_sorted(&noncanonical_pair, ScalarSchema::Pair).is_err());
     }
 
     #[test]
@@ -1716,7 +2090,7 @@ module._strict_c6_toml(
         );
         validate_request(&request).unwrap();
 
-        let corrected = render(&request, &request_keys(), "WYR1-E8 request").unwrap();
+        let corrected = render(&request, &request_keys(), ScalarSchema::Request).unwrap();
         assert!(corrected.contains("com2_prelude_length = 354\n"));
         assert!(!corrected.contains("com2_prelude_length = \"354\"\n"));
         root_verifier_accepts_request(&corrected).unwrap();
