@@ -47,13 +47,33 @@ fn e6_manifest_admission_is_additive_and_historical_profiles_stay_retained() {
 
 #[test]
 fn console_launcher_is_installed_before_consoled_can_send_shell_v1() {
-    let launch = &E6[E6.find("fn launch_console").unwrap()..E6.find("pub(super) fn poll").unwrap()];
+    let launch = &E6
+        [E6.find("fn launch_console").unwrap()..E6.find("fn clear_publication_observer").unwrap()];
     let install = launch.find("LaunchSessionScope::ConsoleLauncher").unwrap();
     let load = launch.find("load_consoled_process(").unwrap();
     let owner = launch.find("attach_session_owner(").unwrap();
     assert!(install < load && load < owner);
     assert!(launch.contains("ConsoledLoadRequest"));
     assert!(!launch.contains("selector"));
+}
+
+#[test]
+fn selector33_observes_only_the_validated_current_serial_publication() {
+    let observer = &E6[E6.find("fn poll_publication_observer_state").unwrap()
+        ..E6.find("fn poll_publication_observer<S, W>").unwrap()];
+    let datagram = observer.find("validate_publication_datagram(").unwrap();
+    let current = observer
+        .find("current.request != observer.expected_driver")
+        .unwrap();
+    let hook = observer.find("e6.shell.observe_serial_for_e7(").unwrap();
+    let cleanup = observer.rfind("clear_publication_observer(").unwrap();
+    assert!(datagram < current && current < hook && hook < cleanup);
+    assert!(
+        observer.contains(
+            "#[cfg(feature = \"wyr1e-selector33\")]\n    e6.shell.observe_serial_for_e7("
+        )
+    );
+    assert_eq!(E6.matches("observe_serial_for_e7(").count(), 1);
 }
 
 #[test]
