@@ -3739,6 +3739,10 @@ pub(crate) fn e7_native_command(label: &str) -> Result<String, Failure> {
     Ok(command)
 }
 
+pub(crate) fn e7_native_features(label: &str) -> Result<&'static str, Failure> {
+    Ok(e7_native_spec(label)?.features)
+}
+
 pub(crate) fn validate_e7_nonce(nonce: &str) -> Result<(), Failure> {
     if nonce.len() != 16
         || !nonce

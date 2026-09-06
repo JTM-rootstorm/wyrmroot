@@ -32,6 +32,8 @@ const TIMEOUT_SECONDS: &str = "300";
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
 const COM1_FD_GROUP: &str = "wyr1-e7-com1-evidence-v1";
 const COM2_FD_GROUP: &str = "wyr1-e7-com2-interactive-v1";
+const ESP_FD_GROUP: &str = "dw-f13-esp-v1";
+const VARS_FD_GROUP: &str = "dw-f13-ovmf-vars-v1";
 const COM2_PRELUDE_KIND: &str = "ovmf-bds-session-banner";
 const COM2_PRELUDE_LENGTH: &str = "354";
 const COM2_PRELUDE_SHA256: &str =
@@ -63,7 +65,7 @@ pub(crate) const ARTIFACTS: &[(&str, &str)] = &[
     ("launch_policy", "launch-policy-e7-v1.bin"),
     ("boot_device_table", "boot-device-table.bin"),
     ("bootfs", "bootfs.img"),
-    ("stack_report", "wyrmsh-stack.json"),
+    ("stack_report", "stack-report.json"),
     ("ovmf_code", "OVMF_CODE.fd"),
     ("ovmf_vars", "OVMF_VARS.fd"),
 ];
@@ -264,7 +266,7 @@ pub(crate) fn inspect(output: &Path) -> Result<String, Failure> {
     if source_text != expected_source {
         return Err(Failure::task("WYR1-E7 source receipt is not canonical"));
     }
-    let expected_receipt = render_freeze_receipt(&request_hash)?;
+    let expected_receipt = render_freeze_receipt(&request_hash, &request)?;
     let receipt = wyr1c6::read_regular_bounded(
         &output.join("freeze-receipt.toml"),
         64 * 1024,
@@ -328,7 +330,7 @@ fn build_produced_artifacts(
             crate::dw1e3a::build_bootstrap(repository, &toolchain, &layout, &cargo_home, anchor)
         })?;
     let snapshot = crate::wyr1c::build_e7_snapshot(nonce, &e6.product)?;
-    let kernel = build_kernel(deep_repository, nonce, &build.join("deep-target"))?;
+    let kernel = build_kernel(deep_repository, nonce)?;
     let boot_device_table = wyr1c6::boot_device_table();
     let ovmf_code = wyr1c6::pinned_firmware(
         wyr1c6::OVMF_CODE_PATH,
@@ -370,7 +372,7 @@ fn build_produced_artifacts(
         ("launch-policy-e7-v1.bin", &snapshot.launch_policy),
         ("boot-device-table.bin", &boot_device_table),
         ("bootfs.img", &snapshot.bootfs),
-        ("wyrmsh-stack.json", &snapshot.stack_report),
+        ("stack-report.json", &snapshot.stack_report),
         ("OVMF_CODE.fd", &ovmf_code),
         ("OVMF_VARS.fd", &ovmf_vars),
     ] {
@@ -418,13 +420,58 @@ fn build_produced_artifacts(
     })
 }
 
-fn build_kernel(repository: &Path, nonce: &str, target: &Path) -> Result<Vec<u8>, Failure> {
+fn build_kernel(repository: &Path, nonce: &str) -> Result<Vec<u8>, Failure> {
     let repository = Directory::open_exact(repository, "Deepwyrm source root")?;
-    fs::create_dir(target).map_err(|error| {
-        Failure::task(format!("could not create WYR1-E7 kernel target: {error}"))
-    })?;
-    let target = Directory::open_exact(target, "WYR1-E7 Deepwyrm target")?;
-    let status = Command::new(repository.path().join("tools/pinned-cargo"))
+    let target = fresh_kernel_target(&repository)?;
+    let stdout = target.create_file("cargo.stdout.log", 0o600, "WYR1-E7 kernel stdout")?;
+    let stderr = target.create_file("cargo.stderr.log", 0o600, "WYR1-E7 kernel stderr")?;
+    let status = kernel_build_command(
+        &repository.path().join("tools/pinned-cargo"),
+        repository.path(),
+        target.path(),
+        nonce,
+    )
+    .stdout(Stdio::from(stdout))
+    .stderr(Stdio::from(stderr))
+    .status()
+    .map_err(|error| Failure::task(format!("could not build WYR1-E7 kernel: {error}")))?;
+    if !status.success() {
+        return Err(Failure::task(format!(
+            "WYR1-E7 selector-33 Deepwyrm kernel build failed; logs preserved in {}",
+            target.path().display()
+        )));
+    }
+    target.read_producer(
+        &PathBuf::from(KERNEL_TARGET).join("release/deepwyrm-kernel"),
+        wyr1c6::MAX_ARTIFACT_BYTES,
+        "selector-33 kernel",
+    )
+}
+
+fn fresh_kernel_target(repository: &Directory) -> Result<Directory, Failure> {
+    let temporary = match repository.open_child(".tmp", "Deepwyrm temporary root") {
+        Ok(directory) => directory,
+        Err(_) => repository.create_child(".tmp", 0o700, "Deepwyrm temporary root")?,
+    };
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Failure::task("system clock is before the Unix epoch"))?
+        .as_nanos();
+    temporary.create_child(
+        &format!("wyr1e7-kernel-{}-{unique}", std::process::id()),
+        0o700,
+        "WYR1-E7 kernel target",
+    )
+}
+
+fn kernel_build_command(
+    pinned_cargo: &Path,
+    repository: &Path,
+    target: &Path,
+    nonce: &str,
+) -> Command {
+    let mut command = Command::new(pinned_cargo);
+    command
         .arg("target")
         .args([
             "build",
@@ -440,7 +487,7 @@ fn build_kernel(repository: &Path, nonce: &str, target: &Path) -> Result<Vec<u8>
             "--features",
             "test-support",
         ])
-        .env("DEEPWYRM_PINNED_TARGET_DIR", target.path())
+        .env("DEEPWYRM_PINNED_TARGET_DIR", target)
         .env("DEEPWYRM_GUEST_TEST_SELECTOR", SELECTOR)
         .env("DEEPWYRM_WYR1E7_EVIDENCE_NONCE", nonce)
         .env_remove("DEEPWYRM_WYR1D_EVIDENCE_NONCE")
@@ -452,20 +499,9 @@ fn build_kernel(repository: &Path, nonce: &str, target: &Path) -> Result<Vec<u8>
         .env_remove("LD_AUDIT")
         .env_remove("LD_LIBRARY_PATH")
         .env_remove("LD_PRELOAD")
-        .current_dir(repository.path())
-        .stdin(Stdio::null())
-        .status()
-        .map_err(|error| Failure::task(format!("could not build WYR1-E7 kernel: {error}")))?;
-    if !status.success() {
-        return Err(Failure::task(
-            "WYR1-E7 selector-33 Deepwyrm kernel build failed",
-        ));
-    }
-    target.read_producer(
-        &PathBuf::from(KERNEL_TARGET).join("release/deepwyrm-kernel"),
-        wyr1c6::MAX_ARTIFACT_BYTES,
-        "selector-33 kernel",
-    )
+        .current_dir(repository)
+        .stdin(Stdio::null());
+    command
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -517,6 +553,10 @@ fn render_source_receipt(
             "toolchain_tree_sha256",
             toolchain.toolchain_tree_sha256.clone(),
         ),
+        (
+            "rust_toolchain_name",
+            manifest.rust_toolchain_name()?.to_owned(),
+        ),
         ("evidence_nonce", nonce.to_owned()),
         ("boot_generation", hex_digest(generation)),
         (
@@ -531,6 +571,20 @@ fn render_source_receipt(
             "bootstrap_command",
             "canonical DW1-E3A native bootstrap build".to_owned(),
         ),
+        ("bootstrap_features", "wyr1c5-production".to_owned()),
+        (
+            "bootfs_command",
+            "in-process wyrmroot-bootfs build_e7 exact 16-entry archive".to_owned(),
+        ),
+        (
+            "esp_command",
+            "canonical g3_image build_d6 selector33 ESP with explicit boot device table"
+                .to_owned(),
+        ),
+        (
+            "malformed_elf_literal",
+            "WYR1-E7 malformed ELF\\n".to_owned(),
+        ),
         (
             "malformed_elf_command",
             "literal ASCII WYR1-E7 malformed ELF followed by LF".to_owned(),
@@ -540,6 +594,10 @@ fn render_source_receipt(
     }
     for label in crate::wyr1c::E7_ARTIFACT_LABELS {
         let command = crate::wyr1c::e7_native_command(label)?;
+        values.insert(
+            format!("{}_features", label.replace('-', "_")),
+            crate::wyr1c::e7_native_features(label)?.to_owned(),
+        );
         values.insert(
             format!("{}_command", label.replace('-', "_")),
             if matches!(label, "system-init" | "cpu-hog" | "exit-nonzero" | "fault") {
@@ -559,6 +617,11 @@ fn render_source_receipt(
             )?),
         );
     }
+    let keys = source_receipt_keys();
+    render_dynamic(&values, &keys, &[], "WYR1-E7 source receipt")
+}
+
+fn source_receipt_keys() -> Vec<String> {
     let mut keys = vec![
         "kind",
         "schema_version",
@@ -575,6 +638,7 @@ fn render_source_receipt(
         "rust_revision",
         "evidence_nonce",
         "boot_generation",
+        "rust_toolchain_name",
         "rustc_sha256",
         "cargo_sha256",
         "rust_lld_sha256",
@@ -583,16 +647,30 @@ fn render_source_receipt(
         "loader_command",
         "kernel_command",
         "bootstrap_command",
+        "bootstrap_features",
         "system_init_command",
+        "system_init_features",
         "registryd_command",
+        "registryd_features",
         "devmgr_command",
+        "devmgr_features",
         "uart16550d_command",
+        "uart16550d_features",
         "consoled_command",
+        "consoled_features",
         "wyrmsh_command",
+        "wyrmsh_features",
         "hello_command",
+        "hello_features",
         "cpu_hog_command",
+        "cpu_hog_features",
         "exit_nonzero_command",
+        "exit_nonzero_features",
         "fault_command",
+        "fault_features",
+        "bootfs_command",
+        "esp_command",
+        "malformed_elf_literal",
         "malformed_elf_command",
     ]
     .into_iter()
@@ -601,12 +679,7 @@ fn render_source_receipt(
     for (key, _) in ARTIFACTS {
         keys.push(format!("{key}_sha256"));
     }
-    render_dynamic(
-        &values,
-        &keys,
-        &["schema_version", "test_id"],
-        "WYR1-E7 source receipt",
-    )
+    keys
 }
 
 fn freeze_produced(
@@ -730,7 +803,7 @@ fn freeze_produced(
     write_pair(output, &request_hash)?;
     wyr1c6::write_new(
         &output.join("freeze-receipt.toml"),
-        render_freeze_receipt(&request_hash)?.as_bytes(),
+        render_freeze_receipt(&request_hash, &fields)?.as_bytes(),
         "WYR1-E7 freeze receipt",
     )?;
     validate_frozen_output(output, &fields, &request_hash)?;
@@ -824,7 +897,10 @@ fn stage_profile(
         ("timeout_seconds", TIMEOUT_SECONDS),
         ("scenario", "interactive-wyrmsh"),
         ("physical_io", "real-com2-irq3-required"),
-        ("terminal_authority", "permanent-system-init-selector33"),
+        (
+            "terminal_authority",
+            "system-init-selector33-wre1-controller",
+        ),
         ("com1_role", "trusted-wre1-evidence-and-terminal"),
         ("com2_role", "interactive-wyrmsh-byte-stream"),
         ("com2_transport", "unix-socket-byte-stream"),
@@ -832,6 +908,8 @@ fn stage_profile(
         ("com2_socket_owner", "runner"),
         ("com1_fd_group", COM1_FD_GROUP),
         ("com2_fd_group", COM2_FD_GROUP),
+        ("esp_fd_group", ESP_FD_GROUP),
+        ("vars_fd_group", VARS_FD_GROUP),
         ("domain_xml", &format!("{profile}/domain.xml")),
         ("domain_xml_sha256", &sha256::bytes_digest(xml.as_bytes())),
         (
@@ -866,20 +944,23 @@ fn stage_profile(
     let keys = handoff_keys();
     wyr1c6::write_new(
         &directory.join("handoff.toml"),
-        render_dynamic(
-            &fields,
-            &keys,
-            &[
-                "schema_version",
-                "test_id",
-                "vcpus",
-                "memory_mib",
-                "timeout_seconds",
-                "com2_prelude_length",
-            ],
-            "WYR1-E7 handoff",
-        )?
-        .as_bytes(),
+        render_handoff(&fields, &keys)?.as_bytes(),
+        "WYR1-E7 handoff",
+    )
+}
+
+fn render_handoff(fields: &BTreeMap<String, String>, keys: &[String]) -> Result<String, Failure> {
+    render_dynamic(
+        fields,
+        keys,
+        &[
+            "schema_version",
+            "test_id",
+            "vcpus",
+            "memory_mib",
+            "timeout_seconds",
+            "com2_prelude_length",
+        ],
         "WYR1-E7 handoff",
     )
 }
@@ -894,7 +975,6 @@ fn write_pair(output: &Path, request_hash: &str) -> Result<(), Failure> {
         ("evidence_protocol", EVIDENCE_PROTOCOL),
         ("full_evidence", "true"),
         ("acceptance_claim", "full-selector33-interactive-wyrmsh"),
-        ("terminal_line", "DWTEST1 33 0"),
         ("request", "request.toml"),
         ("request_sha256", request_hash),
         ("profiles", "default,smp"),
@@ -926,34 +1006,17 @@ fn write_pair(output: &Path, request_hash: &str) -> Result<(), Failure> {
             )?),
         );
     }
-    render_and_write(
-        output,
-        "profile-pair.toml",
-        &fields,
-        &[
-            "kind",
-            "schema_version",
-            "selector",
-            "test_id",
-            "evidence_protocol",
-            "full_evidence",
-            "acceptance_claim",
-            "terminal_line",
-            "request",
-            "request_sha256",
-            "profiles",
-            "default_handoff",
-            "default_handoff_sha256",
-            "default_vcpus",
-            "smp_handoff",
-            "smp_handoff_sha256",
-            "smp_vcpus",
-            "memory_mib",
-            "machine",
-            "firmware",
-            "timeout_seconds",
-            "result_schema",
-        ],
+    wyr1c6::write_new(
+        &output.join("profile-pair.toml"),
+        render_pair(&fields)?.as_bytes(),
+        "WYR1-E7 profile pair",
+    )
+}
+
+fn render_pair(fields: &BTreeMap<String, String>) -> Result<String, Failure> {
+    render(
+        fields,
+        &pair_keys(),
         &[
             "schema_version",
             "test_id",
@@ -964,6 +1027,32 @@ fn write_pair(output: &Path, request_hash: &str) -> Result<(), Failure> {
         ],
         "WYR1-E7 profile pair",
     )
+}
+
+fn pair_keys() -> [&'static str; 21] {
+    [
+        "kind",
+        "schema_version",
+        "selector",
+        "test_id",
+        "evidence_protocol",
+        "full_evidence",
+        "acceptance_claim",
+        "request",
+        "request_sha256",
+        "profiles",
+        "default_handoff",
+        "default_handoff_sha256",
+        "default_vcpus",
+        "smp_handoff",
+        "smp_handoff_sha256",
+        "smp_vcpus",
+        "memory_mib",
+        "machine",
+        "firmware",
+        "timeout_seconds",
+        "result_schema",
+    ]
 }
 
 fn render_request(values: &BTreeMap<String, String>) -> Result<String, Failure> {
@@ -992,7 +1081,10 @@ fn render_request(values: &BTreeMap<String, String>) -> Result<String, Failure> 
     )
 }
 
-fn render_freeze_receipt(request_hash: &str) -> Result<String, Failure> {
+fn render_freeze_receipt(
+    request_hash: &str,
+    request: &BTreeMap<String, String>,
+) -> Result<String, Failure> {
     let mut receipt = BTreeMap::new();
     for (key, value) in [
         ("kind", RECEIPT_KIND),
@@ -1008,26 +1100,46 @@ fn render_freeze_receipt(request_hash: &str) -> Result<String, Failure> {
         ("com2_prelude_kind", COM2_PRELUDE_KIND),
         ("com2_prelude_length", COM2_PRELUDE_LENGTH),
         ("com2_prelude_sha256", COM2_PRELUDE_SHA256),
+        (
+            "source_receipt_sha256",
+            value(request, "source_receipt_sha256")?,
+        ),
+        ("esp_sha256", value(request, "esp_sha256")?),
     ] {
         receipt.insert(key.to_owned(), value.to_owned());
     }
-    render(
+    for (label, _) in ARTIFACTS {
+        receipt.insert(
+            format!("{label}_sha256"),
+            value(request, &format!("{label}_sha256"))?.to_owned(),
+        );
+    }
+    let mut keys = [
+        "kind",
+        "schema_version",
+        "request_sha256",
+        "selector",
+        "test_id",
+        "evidence_protocol",
+        "scenario",
+        "full_evidence",
+        "acceptance_claim",
+        "terminal_line",
+        "com2_prelude_kind",
+        "com2_prelude_length",
+        "com2_prelude_sha256",
+        "source_receipt_sha256",
+        "esp_sha256",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    for (label, _) in ARTIFACTS {
+        keys.push(format!("{label}_sha256"));
+    }
+    render_dynamic(
         &receipt,
-        &[
-            "kind",
-            "schema_version",
-            "request_sha256",
-            "selector",
-            "test_id",
-            "evidence_protocol",
-            "scenario",
-            "full_evidence",
-            "acceptance_claim",
-            "terminal_line",
-            "com2_prelude_kind",
-            "com2_prelude_length",
-            "com2_prelude_sha256",
-        ],
+        &keys,
         &["schema_version", "test_id", "com2_prelude_length"],
         "WYR1-E7 freeze receipt",
     )
@@ -1167,6 +1279,8 @@ fn handoff_keys() -> Vec<String> {
         "com2_socket_owner",
         "com1_fd_group",
         "com2_fd_group",
+        "esp_fd_group",
+        "vars_fd_group",
         "domain_xml",
         "domain_xml_sha256",
         "mutable_ovmf_vars",
@@ -1278,18 +1392,6 @@ fn artifact_maximum(key: &str) -> u64 {
     }
 }
 
-fn render_and_write(
-    output: &Path,
-    name: &str,
-    values: &BTreeMap<String, String>,
-    keys: &[&str],
-    integers: &[&str],
-    label: &str,
-) -> Result<(), Failure> {
-    let text = render(values, keys, integers, label)?;
-    wyr1c6::write_new(&output.join(name), text.as_bytes(), label)
-}
-
 fn render_dynamic(
     values: &BTreeMap<String, String>,
     keys: &[String],
@@ -1367,12 +1469,7 @@ fn parse_scalar_receipt(text: &str, label: &str) -> Result<BTreeMap<String, Stri
             .strip_prefix('"')
             .and_then(|value| value.strip_suffix('"'))
         {
-            if inner.contains(['\\', '"']) {
-                return Err(Failure::task(format!(
-                    "{label} contains an unsupported escape"
-                )));
-            }
-            inner.to_owned()
+            decode_scalar_string(inner, label)?
         } else if !encoded.is_empty() && encoded.bytes().all(|byte| byte.is_ascii_digit()) {
             encoded.to_owned()
         } else {
@@ -1383,6 +1480,31 @@ fn parse_scalar_receipt(text: &str, label: &str) -> Result<BTreeMap<String, Stri
         values.insert(key.to_owned(), value);
     }
     Ok(values)
+}
+
+fn decode_scalar_string(inner: &str, label: &str) -> Result<String, Failure> {
+    let mut value = String::new();
+    let mut characters = inner.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            '\\' => match characters.next() {
+                Some('\\') => value.push('\\'),
+                Some('"') => value.push('"'),
+                _ => {
+                    return Err(Failure::task(format!(
+                        "{label} contains an unsupported escape"
+                    )));
+                }
+            },
+            '"' => {
+                return Err(Failure::task(format!(
+                    "{label} contains an unescaped quote"
+                )));
+            }
+            other => value.push(other),
+        }
+    }
+    Ok(value)
 }
 
 fn canonical_existing_output(
@@ -1416,6 +1538,84 @@ fn hex_digest(value: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn fixture_fields(keys: &[String], integers: &[&str]) -> BTreeMap<String, String> {
+        keys.iter()
+            .map(|key| {
+                let value = if integers.contains(&key.as_str()) {
+                    "1".to_owned()
+                } else if key.ends_with("_sha256") {
+                    "ab".repeat(32)
+                } else if key.ends_with("_revision") || key.ends_with("_tree") {
+                    "cd".repeat(20)
+                } else if key == "evidence_nonce" {
+                    "0123456789ABCDEF".to_owned()
+                } else if key == "boot_generation" {
+                    "ef".repeat(32)
+                } else {
+                    "fixture".to_owned()
+                };
+                (key.clone(), value)
+            })
+            .collect()
+    }
+
+    fn set_fields<const N: usize>(
+        fields: &mut BTreeMap<String, String>,
+        values: [(&str, &str); N],
+    ) {
+        for (key, value) in values {
+            fields.insert(key.to_owned(), value.to_owned());
+        }
+    }
+
+    fn root_verifier_accepts_schema(schema: &str, text: &str) -> Result<(), Failure> {
+        let repository = tasks::repository_root()?;
+        let project = tasks::canonical_project_root(&repository)?;
+        let verifier = project.join("tools/verify-vm-request.py");
+        let program = r#"import importlib.util, sys
+spec = importlib.util.spec_from_file_location("verify_vm_request", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+schemas = {
+    "request": (module.E7_REQUEST_KEYS, frozenset({"schema_version", "test_id", "com2_prelude_length"})),
+    "handoff": (module.E7_HANDOFF_KEYS, frozenset({"schema_version", "test_id", "vcpus", "memory_mib", "timeout_seconds", "com2_prelude_length"})),
+    "pair": (module.E7_PAIR_KEYS, frozenset({"schema_version", "test_id", "default_vcpus", "smp_vcpus", "memory_mib", "timeout_seconds"})),
+    "receipt": (module.E7_RECEIPT_KEYS, frozenset({"schema_version", "test_id", "com2_prelude_length"})),
+    "source": (module.E7_SOURCE_RECEIPT_KEYS, frozenset()),
+}
+keys, integers = schemas[sys.argv[2]]
+module._strict_c6_toml(sys.stdin.buffer.read(), keys, "Rust-rendered E7 fixture", integers)
+"#;
+        let mut child = Command::new("/usr/bin/python3")
+            .args(["-c", program])
+            .arg(&verifier)
+            .arg(schema)
+            .current_dir(project)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| Failure::task(format!("could not start root verifier: {error}")))?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| Failure::task("root verifier stdin was unavailable"))?
+            .write_all(text.as_bytes())
+            .map_err(|error| Failure::task(format!("could not feed root verifier: {error}")))?;
+        let output = child
+            .wait_with_output()
+            .map_err(|error| Failure::task(format!("could not wait for root verifier: {error}")))?;
+        if !output.status.success() {
+            return Err(Failure::task(format!(
+                "root verifier rejected Rust-rendered {schema}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(())
+    }
 
     #[test]
     fn e7_profile_selects_test33_without_changing_the_q35_transport() {
@@ -1501,6 +1701,216 @@ mod tests {
         assert_eq!(TEST_ID, "33");
         assert_eq!(TIMEOUT_SECONDS, "300");
         assert_eq!(ARTIFACTS.len(), 23);
+        assert_eq!(
+            ARTIFACTS
+                .iter()
+                .find(|(label, _)| *label == "stack_report")
+                .map(|(_, name)| *name),
+            Some("stack-report.json")
+        );
         assert_eq!(COM2_PRELUDE_LENGTH, "354");
+    }
+
+    #[test]
+    fn canonical_root_parser_accepts_rust_rendered_e7_schemas() -> Result<(), Failure> {
+        let request_keys = request_keys();
+        let mut request = fixture_fields(
+            &request_keys,
+            &["schema_version", "test_id", "com2_prelude_length"],
+        );
+        set_fields(
+            &mut request,
+            [
+                ("kind", REQUEST_KIND),
+                ("schema_version", "1"),
+                ("selector", SELECTOR),
+                ("test_id", TEST_ID),
+                ("profile", "wyr1e7-selector33"),
+                ("scenario", "interactive-wyrmsh"),
+                ("evidence_protocol", EVIDENCE_PROTOCOL),
+                ("full_evidence", "true"),
+                ("acceptance_claim", "full-selector33-interactive-wyrmsh"),
+                ("terminal_line", "DWTEST1 33 0"),
+                ("com2_prelude_kind", COM2_PRELUDE_KIND),
+                ("com2_prelude_length", COM2_PRELUDE_LENGTH),
+                ("com2_prelude_sha256", COM2_PRELUDE_SHA256),
+            ],
+        );
+        let request_text = render_request(&request)?;
+
+        let handoff_keys = handoff_keys();
+        let mut handoff = fixture_fields(
+            &handoff_keys,
+            &[
+                "schema_version",
+                "test_id",
+                "vcpus",
+                "memory_mib",
+                "timeout_seconds",
+                "com2_prelude_length",
+            ],
+        );
+        set_fields(
+            &mut handoff,
+            [
+                ("kind", HANDOFF_KIND),
+                ("schema_version", "1"),
+                ("selector", SELECTOR),
+                ("test_id", TEST_ID),
+                ("evidence_protocol", EVIDENCE_PROTOCOL),
+                (
+                    "terminal_authority",
+                    "system-init-selector33-wre1-controller",
+                ),
+                ("esp_fd_group", ESP_FD_GROUP),
+                ("vars_fd_group", VARS_FD_GROUP),
+                ("com2_prelude_kind", COM2_PRELUDE_KIND),
+                ("com2_prelude_length", COM2_PRELUDE_LENGTH),
+                ("com2_prelude_sha256", COM2_PRELUDE_SHA256),
+            ],
+        );
+        let handoff_text = render_handoff(&handoff, &handoff_keys)?;
+
+        let pair_keys = pair_keys();
+        let pair_key_strings = pair_keys
+            .iter()
+            .map(|key| (*key).to_owned())
+            .collect::<Vec<_>>();
+        let mut pair = fixture_fields(
+            &pair_key_strings,
+            &[
+                "schema_version",
+                "test_id",
+                "default_vcpus",
+                "smp_vcpus",
+                "memory_mib",
+                "timeout_seconds",
+            ],
+        );
+        set_fields(
+            &mut pair,
+            [
+                ("kind", PAIR_KIND),
+                ("schema_version", "1"),
+                ("selector", SELECTOR),
+                ("test_id", TEST_ID),
+                ("evidence_protocol", EVIDENCE_PROTOCOL),
+            ],
+        );
+        let pair_text = render_pair(&pair)?;
+
+        let receipt_text = render_freeze_receipt(&"12".repeat(32), &request)?;
+        let source_keys = source_receipt_keys();
+        let mut source = fixture_fields(&source_keys, &[]);
+        set_fields(
+            &mut source,
+            [
+                ("kind", SOURCE_RECEIPT_KIND),
+                ("schema_version", "1"),
+                ("selector", SELECTOR),
+                ("test_id", TEST_ID),
+                ("evidence_protocol", EVIDENCE_PROTOCOL),
+                ("malformed_elf_literal", "WYR1-E7 malformed ELF\\n"),
+            ],
+        );
+        let source_text = render_dynamic(&source, &source_keys, &[], "WYR1-E7 source fixture")?;
+        assert_eq!(
+            value(
+                &parse_scalar_receipt(&source_text, "WYR1-E7 source fixture")?,
+                "malformed_elf_literal",
+            )?,
+            "WYR1-E7 malformed ELF\\n"
+        );
+
+        for (schema, text) in [
+            ("request", request_text),
+            ("handoff", handoff_text),
+            ("pair", pair_text),
+            ("receipt", receipt_text),
+            ("source", source_text),
+        ] {
+            root_verifier_accepts_schema(schema, &text)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn kernel_command_uses_one_build_verb_and_an_admitted_deep_target() -> Result<(), Failure> {
+        let repository = tasks::repository_root()?;
+        let repository = Directory::open_exact(&repository, "Wyrmroot test source")?;
+        let temporary = match repository.open_child(".tmp", "WYR1-E7 test temporary root") {
+            Ok(directory) => directory,
+            Err(_) => repository.create_child(".tmp", 0o700, "WYR1-E7 test temporary root")?,
+        };
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| Failure::task("system clock is before the Unix epoch"))?
+            .as_nanos();
+        let scratch = temporary.create_scratch(
+            &format!("wyr1e7-kernel-command-test-{}-{unique}", std::process::id()),
+            "WYR1-E7 kernel command test scratch",
+        )?;
+        let result = (|| {
+            let fake_deep = scratch.path().join("deepwyrm");
+            let fake_tmp = fake_deep.join(".tmp");
+            let target = fake_tmp.join("target");
+            fs::create_dir(&fake_deep)
+                .and_then(|()| fs::create_dir(&fake_tmp))
+                .and_then(|()| fs::create_dir(&target))
+                .map_err(|error| {
+                    Failure::task(format!("could not create fake Deep tree: {error}"))
+                })?;
+            let wrapper = fake_deep.join("pinned-cargo");
+            fs::write(
+                &wrapper,
+                b"#!/bin/sh\nset -eu\ncase \"$DEEPWYRM_PINNED_TARGET_DIR\" in \"$PWD\"/.tmp/*) ;; *) exit 4 ;; esac\nfor argument in \"$@\"; do printf 'ARG=%s\\n' \"$argument\"; done\nprintf 'TARGET=%s\\n' \"$DEEPWYRM_PINNED_TARGET_DIR\"\nprintf 'SELECTOR=%s\\n' \"$DEEPWYRM_GUEST_TEST_SELECTOR\"\nprintf 'NONCE=%s\\n' \"$DEEPWYRM_WYR1E7_EVIDENCE_NONCE\"\nprintf 'CARGO_HOME=%s\\n' \"${CARGO_HOME-unset}\"\n",
+            )
+            .map_err(|error| Failure::task(format!("could not write fake wrapper: {error}")))?;
+            fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700))
+                .map_err(|error| Failure::task(format!("could not seal fake wrapper: {error}")))?;
+            let output = kernel_build_command(&wrapper, &fake_deep, &target, "0123456789ABCDEF")
+                .output()
+                .map_err(|error| Failure::task(format!("could not run fake wrapper: {error}")))?;
+            if !output.status.success() {
+                return Err(Failure::task("fake Deep wrapper failed"));
+            }
+            let observed = String::from_utf8(output.stdout)
+                .map_err(|_| Failure::task("fake wrapper output is not UTF-8"))?;
+            let arguments = observed
+                .lines()
+                .filter_map(|line| line.strip_prefix("ARG="))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                arguments,
+                [
+                    "target",
+                    "build",
+                    "--locked",
+                    "--offline",
+                    "--release",
+                    "--target",
+                    KERNEL_TARGET,
+                    "--package",
+                    "deepwyrm-kernel",
+                    "--bin",
+                    "deepwyrm-kernel",
+                    "--features",
+                    "test-support",
+                ]
+            );
+            assert_eq!(
+                arguments
+                    .iter()
+                    .filter(|argument| **argument == "build")
+                    .count(),
+                1
+            );
+            assert!(observed.contains(&format!("TARGET={}\n", target.display())));
+            assert!(observed.contains("SELECTOR=interactive-wyrmsh\n"));
+            assert!(observed.contains("NONCE=0123456789ABCDEF\n"));
+            assert!(observed.contains("CARGO_HOME=unset\n"));
+            Ok(())
+        })();
+        scratch.finish(result)
     }
 }
