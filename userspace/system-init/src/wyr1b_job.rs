@@ -4,8 +4,12 @@ use deepwyrm_syscall::DwHandle;
 
 use crate::wyr1b::{EndpointGrant, EndpointKind, JobController, JobError};
 use wyrmroot_launch_proto::Reservation;
+#[cfg(feature = "wyr1e-selector33")]
+use wyrmroot_launch_proto::{Message, parse_message};
 
 pub(crate) const MAX_SESSIONS: usize = 16;
+#[cfg(feature = "wyr1e-selector33")]
+const WAIT_REQUEST_BYTES: usize = 56;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Session {
@@ -77,6 +81,15 @@ pub(crate) struct PendingWait {
     pub(crate) grant: EndpointGrant,
     pub(crate) reservation: Reservation,
     pub(crate) job_id: u64,
+    #[cfg(feature = "wyr1e-selector33")]
+    request: [u8; WAIT_REQUEST_BYTES],
+}
+
+#[cfg(feature = "wyr1e-selector33")]
+impl PendingWait {
+    pub(crate) fn request_bytes(&self) -> &[u8; WAIT_REQUEST_BYTES] {
+        &self.request
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -281,6 +294,7 @@ impl JobDispatcher {
         grant: EndpointGrant,
         reservation: Reservation,
         job_id: u64,
+        request_bytes: &[u8],
     ) -> Result<(), JobError> {
         if reservation.connection_id != grant.endpoint_id
             || reservation.generation != grant.endpoint_generation
@@ -289,6 +303,20 @@ impl JobDispatcher {
         {
             return Err(JobError::ResourceIdentity);
         }
+        #[cfg(feature = "wyr1e-selector33")]
+        let request: [u8; WAIT_REQUEST_BYTES] = {
+            let parsed = parse_message(request_bytes, 0).map_err(|_| JobError::ResourceIdentity)?;
+            if parsed.reservation != reservation
+                || !matches!(parsed.message, Message::Wait { job_id: parsed_job } if parsed_job == job_id)
+            {
+                return Err(JobError::ResourceIdentity);
+            }
+            request_bytes
+                .try_into()
+                .map_err(|_| JobError::ResourceIdentity)?
+        };
+        #[cfg(not(feature = "wyr1e-selector33"))]
+        let _ = request_bytes;
         if self.pending_waits.iter().flatten().any(|pending| {
             pending.grant == grant
                 && pending.reservation.transaction_id == reservation.transaction_id
@@ -304,6 +332,8 @@ impl JobDispatcher {
             grant,
             reservation,
             job_id,
+            #[cfg(feature = "wyr1e-selector33")]
+            request,
         });
         Ok(())
     }
@@ -398,6 +428,19 @@ mod tests {
             role_generation: 1,
             kind: EndpointKind::LaunchSession,
         }
+    }
+
+    fn wait_request(reservation: Reservation, job_id: u64) -> [u8; 56] {
+        let mut request = [0u8; 56];
+        let size = encode_job_message(
+            reservation,
+            wyrmroot_launch_proto::MessageType::Wait,
+            job_id,
+            &mut request,
+        )
+        .unwrap();
+        assert_eq!(size, request.len());
+        request
     }
 
     #[test]
@@ -635,39 +678,35 @@ mod tests {
         let owner = grant(1);
         dispatcher.install_session(owner, DwHandle(101)).unwrap();
         for transaction_id in 1..=MAX_SESSIONS as u64 {
+            let reservation = Reservation {
+                connection_id: 1,
+                generation: 1,
+                transaction_id,
+            };
             dispatcher
-                .install_pending_wait(
-                    owner,
-                    Reservation {
-                        connection_id: 1,
-                        generation: 1,
-                        transaction_id,
-                    },
-                    9,
-                )
+                .install_pending_wait(owner, reservation, 9, &wait_request(reservation, 9))
                 .unwrap();
         }
+        let replay = Reservation {
+            connection_id: 1,
+            generation: 1,
+            transaction_id: 1,
+        };
         assert_eq!(
-            dispatcher.install_pending_wait(
-                owner,
-                Reservation {
-                    connection_id: 1,
-                    generation: 1,
-                    transaction_id: 1,
-                },
-                9,
-            ),
+            dispatcher.install_pending_wait(owner, replay, 9, &wait_request(replay, 9),),
             Err(JobError::TransactionReplay)
         );
+        let over_capacity = Reservation {
+            connection_id: 1,
+            generation: 1,
+            transaction_id: 17,
+        };
         assert_eq!(
             dispatcher.install_pending_wait(
                 owner,
-                Reservation {
-                    connection_id: 1,
-                    generation: 1,
-                    transaction_id: 17,
-                },
+                over_capacity,
                 9,
+                &wait_request(over_capacity, 9),
             ),
             Err(JobError::Capacity)
         );
@@ -676,5 +715,7 @@ mod tests {
         assert_eq!(cancelled.grant, owner);
         assert_eq!(cancelled.reservation.transaction_id, 1);
         assert_eq!(cancelled.job_id, 9);
+        #[cfg(feature = "wyr1e-selector33")]
+        assert_eq!(cancelled.request_bytes(), &wait_request(replay, 9));
     }
 }

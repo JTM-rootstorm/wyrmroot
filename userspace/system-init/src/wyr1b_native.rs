@@ -2166,7 +2166,7 @@ fn publish_launch_accepted<S, W>(
     reservation: LaunchReservation,
     loaded: crate::wyr1b::LoadedJob,
     release: LaunchChannelRelease,
-) -> Result<LaunchChannelRelease, InitError>
+) -> Result<(LaunchChannelRelease, SentLaunchAccepted), InitError>
 where
     S: Wyr1BPlatform,
     W: SupervisionPlatform<Error = NativeError>,
@@ -2188,7 +2188,35 @@ where
             InitError::Native(error)
         });
     }
-    Ok(release)
+    Ok((
+        release,
+        SentLaunchAccepted {
+            #[cfg(feature = "wyr1e-selector33")]
+            bytes: response,
+            #[cfg(feature = "wyr1e-selector33")]
+            len: size,
+        },
+    ))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SentLaunchAccepted {
+    #[cfg(feature = "wyr1e-selector33")]
+    bytes: [u8; 88],
+    #[cfg(feature = "wyr1e-selector33")]
+    len: usize,
+}
+
+impl SentLaunchAccepted {
+    #[cfg(feature = "wyr1e-selector33")]
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+
+    #[cfg(not(feature = "wyr1e-selector33"))]
+    fn as_bytes(&self) -> &[u8] {
+        &[]
+    }
 }
 
 fn force_cleanup_job<S, W>(
@@ -2265,7 +2293,7 @@ fn accept_reserved_launch<S, L, W>(
     request: wyrmroot_launch_proto::LaunchRequest<'_>,
     received: &[DwReceivedHandleInfoV1],
     handle_count: usize,
-) -> Result<crate::wyr1b::LoadedJob, InitError>
+) -> Result<(crate::wyr1b::LoadedJob, SentLaunchAccepted), InitError>
 where
     S: Wyr1BPlatform,
     L: LoaderPlatform<Error = NativeError>,
@@ -2379,7 +2407,7 @@ where
         .jobs
         .release_launch_channel(loaded.job_id, loaded.loaded.launch_channel.0)
         .map_err(InitError::Wyr1BModel)?;
-    let release =
+    let (release, sent_response) =
         publish_launch_accepted(system, waits, jobs, session, reservation, loaded, release)?;
     if system.close_handle(loaded.loaded.launch_channel).is_err() {
         jobs.jobs.restore_launch_channel(release);
@@ -2403,17 +2431,20 @@ where
                 .commit_forced_termination(loaded.job_id, resources)
                 .map_err(InitError::Wyr1BModel)?;
         }
-        return jobs
+        let loaded = jobs
             .jobs
             .loaded_job(loaded.job_id)
-            .map_err(InitError::Wyr1BModel);
+            .map_err(InitError::Wyr1BModel)?;
+        return Ok((loaded, sent_response));
     }
     // The accepted job's retained resources are now owned by the model, which
     // recorded the released launch Channel. Returning the pre-release snapshot
     // would hand callers a closed launch-Channel handle to close again.
-    jobs.jobs
+    let loaded = jobs
+        .jobs
         .loaded_job(loaded.job_id)
-        .map_err(InitError::Wyr1BModel)
+        .map_err(InitError::Wyr1BModel)?;
+    Ok((loaded, sent_response))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2748,6 +2779,14 @@ where
     S: Wyr1BPlatform,
     W: SupervisionPlatform<Error = NativeError>,
 {
+    let mut request = [0u8; 56];
+    let request_size = match &message {
+        LaunchMessage::Wait { job_id } => {
+            encode_job_message(reservation, LaunchMessageType::Wait, *job_id, &mut request)
+                .map_err(|_| InitError::Accounting)?
+        }
+        _ => 0,
+    };
     dispatch_reserved_operation_observed(
         system,
         waits,
@@ -2757,7 +2796,7 @@ where
         reservation,
         ticket,
         message,
-        &[],
+        &request[..request_size],
         LaunchSessionScope::Historical,
         None,
     )
@@ -2810,7 +2849,7 @@ where
                 }
                 Err(JobError::UnknownJob) => {
                     jobs.jobs.query_reserved(ticket, job_id)?;
-                    jobs.install_pending_wait(grant, reservation, job_id)?;
+                    jobs.install_pending_wait(grant, reservation, job_id, request_bytes)?;
                     Ok(None)
                 }
                 Err(error) => Err(error),
@@ -3642,21 +3681,13 @@ where
                 &received[..legacy_handle_limit],
                 counts.handles,
             ) {
-                Ok(loaded) => {
-                    let mut response = [0_u8; 56];
-                    let response_size = encode_job_message(
-                        reservation,
-                        LaunchMessageType::LaunchAccepted,
-                        loaded.job_id,
-                        &mut response,
-                    )
-                    .map_err(|_| InitError::Accounting)?;
+                Ok((loaded, response)) => {
                     observe_e7_response(
                         system,
                         scope,
                         shell.as_deref_mut().map(|context| &mut *context.state),
                         &bytes[..counts.bytes],
-                        &response[..response_size],
+                        response.as_bytes(),
                         &received[..counts.handles],
                     )?;
                     Ok(JobDispatchOutcome::Launched(loaded))
@@ -3957,22 +3988,11 @@ where
             InitError::Native(error)
         });
     }
-    let mut request = [0u8; 56];
-    let request_size = encode_job_message(
-        pending.reservation,
-        LaunchMessageType::Wait,
-        pending.job_id,
-        &mut request,
-    )
-    .map_err(|_| InitError::Accounting)?;
-    observe_e7_response(
-        system,
-        scope,
-        evidence,
-        &request[..request_size],
-        &response[..size],
-        &[],
-    )?;
+    #[cfg(feature = "wyr1e-selector33")]
+    let request = pending.request_bytes();
+    #[cfg(not(feature = "wyr1e-selector33"))]
+    let request = &[];
+    observe_e7_response(system, scope, evidence, request, &response[..size], &[])?;
     jobs.finish_pending_wait(pending)
         .map_err(InitError::Wyr1BModel)
 }
@@ -6004,6 +6024,34 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "wyr1e-selector33")]
+    fn selector33_ready_state(
+        platform: &mut ShellPlatform,
+        shell_jobs: EndpointGrant,
+        outer_job_id: u64,
+    ) -> ShellControllerState {
+        let mut state = ShellControllerState::new(6).unwrap();
+        state.observe_serial_for_e7(11, 12, 13).unwrap();
+        state
+            .record_e7_shell_ready(
+                platform,
+                crate::wyr1e7_evidence::ShellTuple {
+                    console_generation: 1,
+                    status_generation: 2,
+                    shell_generation: 3,
+                    outer_launch_transaction: 4,
+                    outer_job_id,
+                    registry_generation: 6,
+                    registry_endpoint_id: 7,
+                    registry_endpoint_generation: 8,
+                    shell_jobs_connection_id: shell_jobs.endpoint_id,
+                    shell_jobs_generation: shell_jobs.endpoint_generation,
+                },
+            )
+            .unwrap();
+        state
+    }
+
     fn evidence_through_job_accepted(
         gate: GateConfig,
         owner: EndpointGrant,
@@ -6887,7 +6935,109 @@ mod tests {
 
     #[cfg(feature = "wyr1e-selector33")]
     #[test]
-    fn selector33_terminal_requires_actual_outer_result_then_committed_close() {
+    fn selector33_launch_observer_uses_the_successfully_sent_reply_buffer() {
+        let grant = grant(EndpointKind::LaunchSession, 9, 3);
+        let session = DwHandle(90);
+        let reservation = LaunchReservation {
+            connection_id: grant.endpoint_id,
+            generation: grant.endpoint_generation,
+            transaction_id: 20,
+        };
+        let mut request = [0u8; 128];
+        let request_size = wyrmroot_launch_proto::encode_launch(
+            reservation,
+            "bin/hello",
+            &["bin/hello"],
+            &[],
+            false,
+            &mut request,
+        )
+        .unwrap();
+        let mut platform = ShellPlatform::new();
+        let mut waits = TerminalWaits;
+        let mut jobs = JobDispatcher::new();
+        jobs.install_scoped_session(grant, session, LaunchSessionScope::ShellJobs)
+            .unwrap();
+        let launch = jobs.jobs.begin_launch(reservation).unwrap();
+        jobs.jobs.commit_launch(launch, 101, 102, 103).unwrap();
+        let loaded = jobs.jobs.loaded_job(launch.job_id).unwrap();
+        let release = jobs
+            .jobs
+            .release_launch_channel(launch.job_id, 103)
+            .unwrap();
+        let (_, sent) = publish_launch_accepted(
+            &mut platform,
+            &mut waits,
+            &mut jobs,
+            session,
+            reservation,
+            loaded,
+            release,
+        )
+        .unwrap();
+        assert_eq!(sent.as_bytes(), platform.sent[0].1.as_slice());
+
+        let mut state = ShellControllerState::new(6).unwrap();
+        state.observe_serial_for_e7(11, 12, 13).unwrap();
+        state
+            .record_e7_shell_ready(
+                &mut platform,
+                crate::wyr1e7_evidence::ShellTuple {
+                    console_generation: 1,
+                    status_generation: 2,
+                    shell_generation: 3,
+                    outer_launch_transaction: 4,
+                    outer_job_id: 5,
+                    registry_generation: 6,
+                    registry_endpoint_id: 7,
+                    registry_endpoint_generation: 8,
+                    shell_jobs_connection_id: grant.endpoint_id,
+                    shell_jobs_generation: grant.endpoint_generation,
+                },
+            )
+            .unwrap();
+        observe_e7_response(
+            &mut platform,
+            LaunchSessionScope::ShellJobs,
+            Some(&mut state),
+            &request[..request_size],
+            sent.as_bytes(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(platform.evidence.len(), 2);
+
+        let failed_reservation = LaunchReservation {
+            transaction_id: 21,
+            ..reservation
+        };
+        let failed = jobs.jobs.begin_launch(failed_reservation).unwrap();
+        jobs.jobs.commit_launch(failed, 201, 202, 203).unwrap();
+        let failed_loaded = jobs.jobs.loaded_job(failed.job_id).unwrap();
+        let failed_release = jobs
+            .jobs
+            .release_launch_channel(failed.job_id, 203)
+            .unwrap();
+        platform.fail_send_on = Some(session);
+        assert!(
+            publish_launch_accepted(
+                &mut platform,
+                &mut waits,
+                &mut jobs,
+                session,
+                failed_reservation,
+                failed_loaded,
+                failed_release,
+            )
+            .is_err()
+        );
+        assert_eq!(platform.sent.len(), 1);
+        assert_eq!(platform.evidence.len(), 2);
+    }
+
+    #[cfg(feature = "wyr1e-selector33")]
+    #[test]
+    fn selector33_terminal_follows_pending_wait_reap_and_committed_close() {
         let mut platform = ShellPlatform::new();
         let mut loader = InitSendLoader::new();
         let mut waits = TerminalWaits;
@@ -6905,22 +7055,6 @@ mod tests {
             })
             .unwrap();
         jobs.jobs.commit_launch(launched, 101, 102, 103).unwrap();
-        jobs.jobs
-            .complete(
-                launched.job_id,
-                101,
-                102,
-                103,
-                ControllerJobResult {
-                    classification: TerminationClassification::NormalExit.as_u32(),
-                    application_code: 0,
-                    exception_class: 0,
-                    exception_detail: 0,
-                    exception_address: 0,
-                    cleanup_result: 0,
-                },
-            )
-            .unwrap();
         let mut topology = RegistryTopology::new(6).unwrap();
         let mut state = ShellControllerState::new(6).unwrap();
         state.observe_serial_for_e7(11, 12, 13).unwrap();
@@ -6946,36 +7080,82 @@ mod tests {
             topology: &mut topology,
             state: &mut state,
         };
-        for (transaction_id, kind) in [
-            (40, LaunchMessageType::Wait),
-            (41, LaunchMessageType::CloseJob),
-        ] {
-            let reservation = LaunchReservation {
-                connection_id: grant.endpoint_id,
-                generation: grant.endpoint_generation,
-                transaction_id,
-            };
-            let mut request = [0u8; 56];
-            let size =
-                encode_job_message(reservation, kind, launched.job_id, &mut request).unwrap();
-            platform.push(session, request[..size].to_vec(), &[]);
-            dispatch_one_job_request_with_shell(
-                &mut platform,
-                &mut loader,
-                &mut waits,
-                LoadAuthority {
-                    parent_root: DwHandle(1),
-                    bootfs: DwHandle(2),
-                    task_group: DwHandle(3),
-                },
-                None,
-                &mut jobs,
-                session,
-                grant,
-                &mut context,
-            )
-            .unwrap();
-        }
+        let wait_reservation = LaunchReservation {
+            connection_id: grant.endpoint_id,
+            generation: grant.endpoint_generation,
+            transaction_id: 40,
+        };
+        let mut wait_request = [0u8; 56];
+        let wait_size = encode_job_message(
+            wait_reservation,
+            LaunchMessageType::Wait,
+            launched.job_id,
+            &mut wait_request,
+        )
+        .unwrap();
+        platform.push(session, wait_request[..wait_size].to_vec(), &[]);
+        dispatch_one_job_request_with_shell(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            LoadAuthority {
+                parent_root: DwHandle(1),
+                bootfs: DwHandle(2),
+                task_group: DwHandle(3),
+            },
+            None,
+            &mut jobs,
+            session,
+            grant,
+            &mut context,
+        )
+        .unwrap();
+        assert_eq!(platform.evidence.len(), 1);
+        assert!(platform.sent.is_empty());
+
+        let loaded = jobs.jobs.loaded_job(launched.job_id).unwrap();
+        reap_job(&mut platform, &mut waits, &mut jobs, loaded).unwrap();
+        service_pending_wait_inner(
+            &mut platform,
+            &mut waits,
+            &mut jobs,
+            Some(&mut *context.state),
+        )
+        .unwrap();
+        assert!(matches!(
+            parse_launch_message(&platform.sent[0].1, 0).unwrap().message,
+            LaunchMessage::JobResult { job_id, .. } if job_id == launched.job_id
+        ));
+
+        let close_reservation = LaunchReservation {
+            transaction_id: 41,
+            ..wait_reservation
+        };
+        let mut close_request = [0u8; 56];
+        let close_size = encode_job_message(
+            close_reservation,
+            LaunchMessageType::CloseJob,
+            launched.job_id,
+            &mut close_request,
+        )
+        .unwrap();
+        platform.push(session, close_request[..close_size].to_vec(), &[]);
+        dispatch_one_job_request_with_shell(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            LoadAuthority {
+                parent_root: DwHandle(1),
+                bootfs: DwHandle(2),
+                task_group: DwHandle(3),
+            },
+            None,
+            &mut jobs,
+            session,
+            grant,
+            &mut context,
+        )
+        .unwrap();
         assert_eq!(platform.evidence.len(), 3);
         assert_eq!(
             u32::from_le_bytes(platform.evidence[1][8..12].try_into().unwrap()),
@@ -7000,6 +7180,153 @@ mod tests {
             ),
             Err(JobError::UnknownJob)
         );
+    }
+
+    #[cfg(feature = "wyr1e-selector33")]
+    #[test]
+    fn selector33_failed_pending_result_and_close_reply_emit_no_terminal() {
+        let authority = LoadAuthority {
+            parent_root: DwHandle(1),
+            bootfs: DwHandle(2),
+            task_group: DwHandle(3),
+        };
+        let shell_jobs = grant(EndpointKind::LaunchSession, 9, 3);
+
+        {
+            let mut platform = ShellPlatform::new();
+            let mut loader = InitSendLoader::new();
+            let mut waits = TerminalWaits;
+            let mut jobs = JobDispatcher::new();
+            let grant = grant(EndpointKind::LaunchSession, 30, 31);
+            let session = DwHandle(90);
+            jobs.install_scoped_session(grant, session, LaunchSessionScope::ConsoleLauncher)
+                .unwrap();
+            let launch = jobs
+                .jobs
+                .begin_launch(LaunchReservation {
+                    connection_id: grant.endpoint_id,
+                    generation: grant.endpoint_generation,
+                    transaction_id: 1,
+                })
+                .unwrap();
+            jobs.jobs.commit_launch(launch, 101, 102, 103).unwrap();
+            let mut topology = RegistryTopology::new(6).unwrap();
+            let mut state = selector33_ready_state(&mut platform, shell_jobs, launch.job_id);
+            let mut context = ShellLaunchContext {
+                registry_control: DwHandle(70),
+                topology: &mut topology,
+                state: &mut state,
+            };
+            let reservation = LaunchReservation {
+                connection_id: grant.endpoint_id,
+                generation: grant.endpoint_generation,
+                transaction_id: 40,
+            };
+            let mut request = [0u8; 56];
+            let size = encode_job_message(
+                reservation,
+                LaunchMessageType::Wait,
+                launch.job_id,
+                &mut request,
+            )
+            .unwrap();
+            platform.push(session, request[..size].to_vec(), &[]);
+            dispatch_one_job_request_with_shell(
+                &mut platform,
+                &mut loader,
+                &mut waits,
+                authority,
+                None,
+                &mut jobs,
+                session,
+                grant,
+                &mut context,
+            )
+            .unwrap();
+            let loaded = jobs.jobs.loaded_job(launch.job_id).unwrap();
+            reap_job(&mut platform, &mut waits, &mut jobs, loaded).unwrap();
+            platform.fail_send_on = Some(session);
+            assert!(
+                service_pending_wait_inner(
+                    &mut platform,
+                    &mut waits,
+                    &mut jobs,
+                    Some(&mut *context.state),
+                )
+                .is_err()
+            );
+            assert!(platform.sent.is_empty());
+            assert_eq!(platform.evidence.len(), 1);
+        }
+
+        {
+            let mut platform = ShellPlatform::new();
+            let mut loader = InitSendLoader::new();
+            let mut waits = TerminalWaits;
+            let mut jobs = JobDispatcher::new();
+            let grant = grant(EndpointKind::LaunchSession, 30, 31);
+            let session = DwHandle(90);
+            jobs.install_scoped_session(grant, session, LaunchSessionScope::ConsoleLauncher)
+                .unwrap();
+            let launch = jobs
+                .jobs
+                .begin_launch(LaunchReservation {
+                    connection_id: grant.endpoint_id,
+                    generation: grant.endpoint_generation,
+                    transaction_id: 1,
+                })
+                .unwrap();
+            jobs.jobs.commit_launch(launch, 201, 202, 203).unwrap();
+            let loaded = jobs.jobs.loaded_job(launch.job_id).unwrap();
+            reap_job(&mut platform, &mut waits, &mut jobs, loaded).unwrap();
+            let mut topology = RegistryTopology::new(6).unwrap();
+            let mut state = selector33_ready_state(&mut platform, shell_jobs, launch.job_id);
+            let mut context = ShellLaunchContext {
+                registry_control: DwHandle(70),
+                topology: &mut topology,
+                state: &mut state,
+            };
+
+            for (transaction_id, kind) in [
+                (40, LaunchMessageType::Wait),
+                (41, LaunchMessageType::CloseJob),
+            ] {
+                let reservation = LaunchReservation {
+                    connection_id: grant.endpoint_id,
+                    generation: grant.endpoint_generation,
+                    transaction_id,
+                };
+                let mut request = [0u8; 56];
+                let size =
+                    encode_job_message(reservation, kind, launch.job_id, &mut request).unwrap();
+                platform.push(session, request[..size].to_vec(), &[]);
+                if kind == LaunchMessageType::CloseJob {
+                    platform.fail_send_on = Some(session);
+                }
+                let result = dispatch_one_job_request_with_shell(
+                    &mut platform,
+                    &mut loader,
+                    &mut waits,
+                    authority,
+                    None,
+                    &mut jobs,
+                    session,
+                    grant,
+                    &mut context,
+                );
+                if kind == LaunchMessageType::Wait {
+                    result.unwrap();
+                } else {
+                    assert!(result.is_err());
+                }
+            }
+            assert_eq!(platform.sent.len(), 1);
+            assert!(matches!(
+                parse_launch_message(&platform.sent[0].1, 0).unwrap().message,
+                LaunchMessage::JobResult { job_id, .. } if job_id == launch.job_id
+            ));
+            assert_eq!(platform.evidence.len(), 1);
+        }
     }
 
     #[test]
