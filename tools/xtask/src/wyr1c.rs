@@ -28,9 +28,11 @@ use wyrmroot_bootfs::{
         encode as encode_launch_policy, encode_wyrmsh,
     },
     wyr1::{
-        CONSOLE_ECHO_PATH, DW1_E3A_COM2_PROBE_PATH, DW1_E3A_GATE_PATH, LAUNCH_POLICY_PATH, Product,
-        ProductC1, ProductC6, ProductD5, ProductE3A, ProductE6, WYR1_C1_MARKER, WYR1_D5_GATE_PATH,
-        build_c1, build_c6, build_d5, build_e3a, build_e6,
+        CONSOLE_ECHO_PATH, CPU_HOG_PATH, DW1_E3A_COM2_PROBE_PATH, DW1_E3A_GATE_PATH,
+        E7_EXIT_NONZERO_PATH, E7_FAULT_PATH, E7_MALFORMED_ELF, E7_MALFORMED_ELF_PATH,
+        LAUNCH_POLICY_PATH, Product, ProductC1, ProductC6, ProductD5, ProductE3A, ProductE6,
+        ProductE7, WYR1_C1_MARKER, WYR1_D5_GATE_PATH, build_c1, build_c6, build_d5, build_e3a,
+        build_e6, build_e7,
     },
 };
 use wyrmroot_device_proto::manifest::{
@@ -396,6 +398,37 @@ const WYR1E6_PRODUCT_NATIVE_SPECS: [NativeSpec; 7] = [
     },
 ];
 
+const WYR1E7_SELECTED_NATIVE_SPECS: [NativeSpec; 4] = [
+    NativeSpec {
+        label: "system-init",
+        package: "wyrmroot-system-init",
+        binary: "system-init",
+        features: "wyr1e-selector33",
+        artifact: "system-init",
+    },
+    NativeSpec {
+        label: "cpu-hog",
+        package: "wyrmroot-dw1b-preemption",
+        binary: "wyrmroot-job-cpu-hog",
+        features: "native-job-cpu-hog",
+        artifact: "wyrmroot-job-cpu-hog",
+    },
+    NativeSpec {
+        label: "exit-nonzero",
+        package: "wyrmroot-wyr1e-test-actors",
+        binary: "wyrmroot-wyr1e-exit-nonzero",
+        features: "native-exit-nonzero",
+        artifact: "wyrmroot-wyr1e-exit-nonzero",
+    },
+    NativeSpec {
+        label: "fault",
+        package: "wyrmroot-wyr1e-test-actors",
+        binary: "wyrmroot-wyr1e-fault",
+        features: "native-fault",
+        artifact: "wyrmroot-wyr1e-fault",
+    },
+];
+
 const E3B_NATIVE_CHECK_ENVIRONMENT: [(&str, &str); 3] = [
     ("DEEPWYRM_DW1E_EVIDENCE_NONCE", "E300000000000001"),
     ("WYRMROOT_DW1E3_CHALLENGE_1_NONCE", "E300000000000002"),
@@ -608,6 +641,21 @@ pub(crate) struct E6Snapshot {
     pub(crate) stack_report: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct E7Snapshot {
+    pub(crate) wyrmroot_revision: String,
+    pub(crate) evidence_nonce: String,
+    pub(crate) generation: [u8; 32],
+    pub(crate) rrc_manifest: Vec<u8>,
+    pub(crate) device_manifest: Vec<u8>,
+    pub(crate) launch_policy: Vec<u8>,
+    pub(crate) bootfs: Vec<u8>,
+    pub(crate) artifacts: BTreeMap<String, Vec<u8>>,
+    pub(crate) inspections: BTreeMap<String, Vec<u8>>,
+    pub(crate) malformed_elf: Vec<u8>,
+    pub(crate) stack_report: Vec<u8>,
+}
+
 pub(crate) const E6_ARTIFACT_LABELS: [&str; 7] = [
     "system-init",
     "registryd",
@@ -616,6 +664,19 @@ pub(crate) const E6_ARTIFACT_LABELS: [&str; 7] = [
     "consoled",
     "wyrmsh",
     "hello",
+];
+
+pub(crate) const E7_ARTIFACT_LABELS: [&str; 10] = [
+    "system-init",
+    "registryd",
+    "devmgr",
+    "uart16550d",
+    "consoled",
+    "wyrmsh",
+    "hello",
+    "cpu-hog",
+    "exit-nonzero",
+    "fault",
 ];
 
 pub(crate) struct ValidatedFrozenProduct {
@@ -629,15 +690,36 @@ pub(crate) struct BuiltFrozenProduct {
 }
 
 pub(crate) fn run_c4_native_checks(repository: &Path) -> Result<(), Failure> {
-    run_native_checks(repository, "WYR1-C4", "wyr1c4", &C4_NATIVE_CHECK_SPECS, &[])
+    run_native_checks(
+        repository,
+        "WYR1-C4",
+        "wyr1c4",
+        &C4_NATIVE_CHECK_SPECS,
+        &[],
+        None,
+    )
 }
 
 pub(crate) fn run_c5_native_checks(repository: &Path) -> Result<(), Failure> {
-    run_native_checks(repository, "WYR1-C5", "wyr1c5", &C5_NATIVE_CHECK_SPECS, &[])
+    run_native_checks(
+        repository,
+        "WYR1-C5",
+        "wyr1c5",
+        &C5_NATIVE_CHECK_SPECS,
+        &[],
+        None,
+    )
 }
 
 pub(crate) fn run_c6_native_checks(repository: &Path) -> Result<(), Failure> {
-    run_native_checks(repository, "WYR1-C6", "wyr1c6", &C6_NATIVE_CHECK_SPECS, &[])
+    run_native_checks(
+        repository,
+        "WYR1-C6",
+        "wyr1c6",
+        &C6_NATIVE_CHECK_SPECS,
+        &[],
+        None,
+    )
 }
 
 pub(crate) fn run_e3b_native_checks(repository: &Path) -> Result<(), Failure> {
@@ -647,6 +729,7 @@ pub(crate) fn run_e3b_native_checks(repository: &Path) -> Result<(), Failure> {
         "dw1e3b",
         &E3B_NATIVE_CHECK_SPECS,
         &E3B_NATIVE_CHECK_ENVIRONMENT,
+        None,
     )
 }
 
@@ -659,7 +742,7 @@ pub(crate) fn run_wyr1e3_native_checks(repository: &Path, filter: &str) -> Resul
         "wyr1e3-registry-native" => &WYR1E3_NATIVE_CHECK_SPECS[1..2],
         _ => return Err(Failure::usage("unknown WYR1-E3 native check selection")),
     };
-    run_native_checks(repository, "WYR1-E3", filter, specs, &[])
+    run_native_checks(repository, "WYR1-E3", filter, specs, &[], None)
 }
 
 pub(crate) fn run_wyrmsh_native_checks(repository: &Path, filter: &str) -> Result<(), Failure> {
@@ -668,7 +751,14 @@ pub(crate) fn run_wyrmsh_native_checks(repository: &Path, filter: &str) -> Resul
         "wyr1e5-native" => ("WYR1-E5", "wyr1e5"),
         _ => return Err(Failure::usage("unknown Wyrmsh native check selection")),
     };
-    run_native_checks(repository, phase, slug, &WYRMSH_NATIVE_CHECK_SPECS, &[])
+    run_native_checks(
+        repository,
+        phase,
+        slug,
+        &WYRMSH_NATIVE_CHECK_SPECS,
+        &[],
+        None,
+    )
 }
 
 pub(crate) fn run_wyr1e6_native_checks(repository: &Path) -> Result<(), Failure> {
@@ -678,6 +768,18 @@ pub(crate) fn run_wyr1e6_native_checks(repository: &Path) -> Result<(), Failure>
         "wyr1e6",
         &WYR1E6_NATIVE_CHECK_SPECS,
         &[],
+        None,
+    )
+}
+
+pub(crate) fn run_wyr1e7_native_checks(repository: &Path) -> Result<(), Failure> {
+    run_native_checks(
+        repository,
+        "WYR1-E7",
+        "wyr1e7",
+        &WYR1E7_SELECTED_NATIVE_SPECS,
+        &[("WYRMROOT_WYR1E7_EVIDENCE_NONCE", "0123456789ABCDEF")],
+        Some("system-init"),
     )
 }
 
@@ -687,6 +789,7 @@ fn run_native_checks(
     slug: &str,
     specs: &[NativeSpec],
     environment: &[(&str, &str)],
+    environment_label: Option<&str>,
 ) -> Result<(), Failure> {
     reject_ambient_build_environment(env::vars_os())?;
     let manifest = BuildManifest::load(repository)?;
@@ -743,8 +846,14 @@ fn run_native_checks(
                 .env_remove("LD_PRELOAD")
                 .current_dir(repository)
                 .stdin(Stdio::null());
-            for (name, value) in environment {
-                command.env(name, value);
+            if environment_label.is_none_or(|label| label == spec.label) {
+                for (name, value) in environment {
+                    command.env(name, value);
+                }
+            } else {
+                for (name, _) in environment {
+                    command.env_remove(name);
+                }
             }
             let status = command.status().map_err(|error| {
                 Failure::task(format!("could not check {}: {error}", spec.label))
@@ -1323,6 +1432,106 @@ pub(crate) fn build_e6_snapshot() -> Result<E6Snapshot, Failure> {
     Ok(snapshot)
 }
 
+/// Builds the selector-private E7 artifacts while reusing the immutable E6
+/// production payloads and exact shell stack proof supplied by the caller.
+pub(crate) fn build_e7_snapshot(
+    evidence_nonce: &str,
+    e6: &E6Snapshot,
+) -> Result<E7Snapshot, Failure> {
+    validate_e7_nonce(evidence_nonce)?;
+    reject_e6_ambient_build_environment(env::vars_os())?;
+    let repository = crate::tasks::repository_root()?;
+    let revision = clean_repository_revision(&repository)?;
+    let manifest = BuildManifest::load(&repository)?;
+    if manifest.rust_revision()? != ACCEPTED_RUST_REVISION
+        || manifest.rust_toolchain_name()? != ACCEPTED_TOOLCHAIN_NAME
+    {
+        return Err(Failure::task(
+            "WYR1-E7 product metadata does not name the accepted a92dc7f Rust toolchain",
+        ));
+    }
+    let profile = manifest.validate_loader_build_readiness(&repository)?;
+    let toolchain = crate::tasks::prepare_loader_toolchain(&repository, &profile, &manifest)?;
+    let cargo_home = crate::tasks::project_cargo_home(&repository, &manifest)?;
+    if env::var_os("CARGO_HOME").as_deref() != Some(cargo_home.as_os_str()) {
+        return Err(Failure::task(
+            "WYR1-E7 product requires the pinned launcher's exact CARGO_HOME",
+        ));
+    }
+    toolchain.accepted().verify_unchanged()?;
+    let deep_source =
+        inspect_e6_dependency_source(&repository, &manifest, toolchain.accepted(), &cargo_home)?;
+    let repository_directory =
+        crate::secure_fs::Directory::open_exact(&repository, "Wyrmroot source")?;
+    let tmp = match repository_directory.open_child(".tmp", "WYR1-E7 temporary root") {
+        Ok(directory) => directory,
+        Err(_) => repository_directory.create_child(".tmp", 0o700, "WYR1-E7 temporary root")?,
+    };
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Failure::task("system clock is before the Unix epoch"))?
+        .as_nanos();
+    let scratch = tmp.create_scratch(
+        &format!("wyr1e7-build-{}-{unique}", std::process::id()),
+        "WYR1-E7 build scratch",
+    )?;
+    let result = (|| {
+        let mut artifacts = e6.artifacts.clone();
+        let mut inspections = e6.inspections.clone();
+        artifacts.remove("system-init");
+        inspections.remove("system-init");
+        for spec in WYR1E7_SELECTED_NATIVE_SPECS {
+            toolchain.accepted().verify_unchanged()?;
+            deep_source.verify_unchanged()?;
+            let artifact = scratch.with_inheritable_anchor("WYR1-E7 build scratch", |anchor| {
+                let options = if spec.label == "system-init" {
+                    NativeBuildOptions::exact_wyr1e7()
+                } else {
+                    NativeBuildOptions::exact(&[])
+                };
+                let mut artifact = build_native_with_flags(
+                    &repository,
+                    &cargo_home,
+                    toolchain.accepted(),
+                    anchor,
+                    spec,
+                    (spec.label == "system-init").then_some(evidence_nonce),
+                    options,
+                )?;
+                artifact.inspection = inspect_native(
+                    &repository,
+                    &artifact.bytes,
+                    &artifact.sha256,
+                    spec.label,
+                    anchor,
+                )?;
+                Ok(artifact)
+            })?;
+            artifacts.insert(spec.label.to_owned(), artifact.bytes);
+            inspections.insert(spec.label.to_owned(), artifact.inspection.into_bytes());
+        }
+        let product = reassemble_e7_snapshot(&revision, &artifacts, E7_MALFORMED_ELF)?;
+        Ok(E7Snapshot {
+            wyrmroot_revision: revision.clone(),
+            evidence_nonce: evidence_nonce.to_owned(),
+            generation: product.generation,
+            rrc_manifest: product.rrc_manifest,
+            device_manifest: product.device_manifest,
+            launch_policy: product.launch_policy,
+            bootfs: product.bootfs,
+            artifacts,
+            inspections,
+            malformed_elf: E7_MALFORMED_ELF.to_vec(),
+            stack_report: e6.stack_report.clone(),
+        })
+    })();
+    let snapshot = scratch.finish(result)?;
+    toolchain.accepted().verify_unchanged()?;
+    deep_source.verify_unchanged()?;
+    verify_repository_revision(&repository, &revision)?;
+    Ok(snapshot)
+}
+
 fn publish_snapshot(
     output: &crate::secure_fs::Directory,
     snapshot: &FrozenSnapshot,
@@ -1611,6 +1820,14 @@ pub(crate) struct E6ProductBytes {
     pub(crate) bootfs: Vec<u8>,
 }
 
+pub(crate) struct E7ProductBytes {
+    pub(crate) generation: [u8; 32],
+    pub(crate) rrc_manifest: Vec<u8>,
+    pub(crate) device_manifest: Vec<u8>,
+    pub(crate) launch_policy: Vec<u8>,
+    pub(crate) bootfs: Vec<u8>,
+}
+
 fn assemble_product(revision: &str, artifacts: &[NativeArtifact]) -> Result<ProductBytes, Failure> {
     let [init, registryd, devmgr, uart, consoled, wyrmsh]: [&NativeArtifact; 6] = artifacts
         .iter()
@@ -1809,6 +2026,210 @@ pub(crate) fn reassemble_e6_snapshot(
         });
     }
     assemble_e6_product(revision, &artifacts)
+}
+
+pub(crate) fn reassemble_e7_snapshot(
+    revision: &str,
+    artifact_bytes: &BTreeMap<String, Vec<u8>>,
+    malformed_elf: &[u8],
+) -> Result<E7ProductBytes, Failure> {
+    let mut artifacts = Vec::with_capacity(E7_ARTIFACT_LABELS.len());
+    for label in E7_ARTIFACT_LABELS {
+        let spec = e7_native_spec(label)?;
+        let bytes = artifact_bytes
+            .get(label)
+            .ok_or_else(|| Failure::task(format!("WYR1-E7 snapshot lacks {label}")))?
+            .clone();
+        artifacts.push(NativeArtifact {
+            spec,
+            sha256: sha256::bytes_digest(&bytes),
+            bytes,
+            inspection: String::new(),
+        });
+    }
+    assemble_e7_product(revision, &artifacts, malformed_elf)
+}
+
+fn assemble_e7_product(
+    revision: &str,
+    artifacts: &[NativeArtifact],
+    malformed_elf: &[u8],
+) -> Result<E7ProductBytes, Failure> {
+    let [
+        init,
+        registryd,
+        devmgr,
+        uart,
+        consoled,
+        wyrmsh,
+        hello,
+        cpu_hog,
+        exit_nonzero,
+        fault,
+    ]: [&NativeArtifact; 10] = artifacts
+        .iter()
+        .collect::<Vec<_>>()
+        .try_into()
+        .map_err(|_| Failure::task("WYR1-E7 requires ten explicit native artifacts"))?;
+    if malformed_elf != E7_MALFORMED_ELF {
+        return Err(Failure::task(
+            "WYR1-E7 malformed ELF bytes differ from the frozen fixture",
+        ));
+    }
+    let role_hashes = [
+        digest_array(&registryd.sha256)?,
+        digest_array(&devmgr.sha256)?,
+        digest_array(&uart.sha256)?,
+        digest_array(&consoled.sha256)?,
+        digest_array(&wyrmsh.sha256)?,
+    ];
+    let generation = e7_product_generation(revision, artifacts, malformed_elf);
+    let builder = crate::wyr1::fixed_builder_for_wyrmsh(&generation, role_hashes)?;
+    let structural_rrc = builder
+        .build_structural()
+        .map_err(|error| Failure::task(format!("WYR1-E7 WRRM build failed: {error:?}")))?;
+    let mut wrdm = [0u8; WRDM_HEADER_BYTES + WRDM_RECORD_BYTES];
+    let wrdm_size = encode_com2_manifest(ContentIdentity(role_hashes[2]), &mut wrdm)
+        .map_err(|error| Failure::task(format!("WYR1-E7 WRDM build failed: {error:?}")))?;
+    let device_manifest = wrdm[..wrdm_size].to_vec();
+    let hello_identity = digest_array(&hello.sha256)?;
+    let cpu_hog_identity = digest_array(&cpu_hog.sha256)?;
+    let exit_nonzero_identity = digest_array(&exit_nonzero.sha256)?;
+    let fault_identity = digest_array(&fault.sha256)?;
+    let malformed_identity = sha256::bytes_digest_array(malformed_elf);
+    let mut policy = [0u8; 1024];
+    let policy_size = encode_wyrmsh(
+        generation,
+        &[
+            LaunchPolicyEntry {
+                path: CPU_HOG_PATH,
+                content_sha256: cpu_hog_identity,
+                startup_abi: 2,
+                profile_id: JOB_V2_PROFILE_ID,
+                allow_no_streams: true,
+                allow_three_streams: false,
+            },
+            LaunchPolicyEntry {
+                path: "bin/hello",
+                content_sha256: hello_identity,
+                startup_abi: 2,
+                profile_id: JOB_V2_PROFILE_ID,
+                allow_no_streams: false,
+                allow_three_streams: true,
+            },
+            LaunchPolicyEntry {
+                path: WYRMSH_PATH,
+                content_sha256: role_hashes[4],
+                startup_abi: 2,
+                profile_id: WYRMSH_PROFILE_ID,
+                allow_no_streams: false,
+                allow_three_streams: true,
+            },
+            LaunchPolicyEntry {
+                path: E7_EXIT_NONZERO_PATH,
+                content_sha256: exit_nonzero_identity,
+                startup_abi: 2,
+                profile_id: JOB_V2_PROFILE_ID,
+                allow_no_streams: false,
+                allow_three_streams: true,
+            },
+            LaunchPolicyEntry {
+                path: E7_FAULT_PATH,
+                content_sha256: fault_identity,
+                startup_abi: 2,
+                profile_id: JOB_V2_PROFILE_ID,
+                allow_no_streams: false,
+                allow_three_streams: true,
+            },
+            LaunchPolicyEntry {
+                path: E7_MALFORMED_ELF_PATH,
+                content_sha256: malformed_identity,
+                startup_abi: 2,
+                profile_id: JOB_V2_PROFILE_ID,
+                allow_no_streams: false,
+                allow_three_streams: true,
+            },
+        ],
+        &mut policy,
+    )
+    .map_err(|error| Failure::task(format!("WYR1-E7 launch policy failed: {error:?}")))?;
+    let launch_policy = policy[..policy_size].to_vec();
+    let bootfs = build_e7(ProductE7 {
+        base: ProductC1 {
+            base: Product {
+                init: &init.bytes,
+                registryd: &registryd.bytes,
+                devmgr: &devmgr.bytes,
+                uart16550d: &uart.bytes,
+                consoled: &consoled.bytes,
+                wyrmsh: &wyrmsh.bytes,
+                rrc_manifest: &structural_rrc,
+                gate_config: GATE_CONFIG,
+            },
+            marker: WYR1_C1_MARKER,
+            device_manifest: &device_manifest,
+            expected_uart16550d_identity: role_hashes[2],
+        },
+        launch_policy: &launch_policy,
+        hello: &hello.bytes,
+        cpu_hog: &cpu_hog.bytes,
+        exit_nonzero: &exit_nonzero.bytes,
+        fault: &fault.bytes,
+        malformed_elf,
+        expected_wyrmsh_identity: role_hashes[4],
+        expected_hello_identity: hello_identity,
+        expected_cpu_hog_identity: cpu_hog_identity,
+        expected_exit_nonzero_identity: exit_nonzero_identity,
+        expected_fault_identity: fault_identity,
+        expected_malformed_elf_identity: malformed_identity,
+    })
+    .map_err(|error| Failure::task(format!("WYR1-E7 bootfs build failed: {error:?}")))?;
+    if bootfs.len() > MAX_BOOTFS_BYTES {
+        return Err(Failure::task("WYR1-E7 bootfs exceeds the image bound"));
+    }
+    let expected_closure = crate::wyr1::expected_closure_for_request(
+        digest_array(&init.sha256)?,
+        role_hashes,
+        sha256::bytes_digest_array(GATE_CONFIG),
+    );
+    let observed = crate::wyr1::observe_closure_from_archive(&bootfs)?;
+    let profile = Wyr1eProductProfile {
+        base: crate::wyr1::product_profile_for_request(
+            sha256::bytes_digest_array(&structural_rrc),
+            sha256::bytes_digest_array(&structural_rrc),
+            sha256::bytes_digest_array(&bootfs),
+            sha256::bytes_digest_array(&bootfs),
+            &expected_closure,
+            &observed,
+        ),
+        production_wyrmsh_identity: role_hashes[4],
+    };
+    let admitted_rrc = builder
+        .build_wyr1e_product(profile)
+        .map_err(|error| Failure::task(format!("WYR1-E7 WRRM admission failed: {error:?}")))?;
+    if admitted_rrc != structural_rrc {
+        return Err(Failure::task(
+            "WYR1-E7 admitted WRRM differs from its structural bytes",
+        ));
+    }
+    Manifest::parse_wyr1e_product(&admitted_rrc, &generation, profile)
+        .and_then(|manifest| manifest.validate_wyr1e_product(profile))
+        .map_err(|error| Failure::task(format!("WYR1-E7 WRRM inspection failed: {error:?}")))?;
+    inspect_e7_archive(
+        &bootfs,
+        artifacts,
+        malformed_elf,
+        &admitted_rrc,
+        &device_manifest,
+        &launch_policy,
+    )?;
+    Ok(E7ProductBytes {
+        generation,
+        rrc_manifest: admitted_rrc,
+        device_manifest,
+        launch_policy,
+        bootfs,
+    })
 }
 
 #[allow(dead_code)]
@@ -2103,6 +2524,7 @@ fn build_native(
 struct NativeBuildOptions<'a> {
     extra_flags: &'a [&'a str],
     exact_environment: bool,
+    evidence_variable: &'static str,
 }
 
 impl NativeBuildOptions<'_> {
@@ -2110,6 +2532,7 @@ impl NativeBuildOptions<'_> {
         Self {
             extra_flags: &[],
             exact_environment: false,
+            evidence_variable: "DEEPWYRM_DW1E_EVIDENCE_NONCE",
         }
     }
 
@@ -2117,6 +2540,15 @@ impl NativeBuildOptions<'_> {
         Self {
             extra_flags,
             exact_environment: true,
+            evidence_variable: "DEEPWYRM_DW1E_EVIDENCE_NONCE",
+        }
+    }
+
+    const fn exact_wyr1e7() -> Self {
+        Self {
+            extra_flags: &[],
+            exact_environment: true,
+            evidence_variable: "WYRMROOT_WYR1E7_EVIDENCE_NONCE",
         }
     }
 }
@@ -2199,9 +2631,17 @@ fn build_native_with_flags(
         .current_dir(repository)
         .stdin(Stdio::null());
     if let Some(nonce) = evidence_nonce {
-        command.env("DEEPWYRM_DW1E_EVIDENCE_NONCE", nonce);
+        command.env(options.evidence_variable, nonce);
     } else {
-        command.env_remove("DEEPWYRM_DW1E_EVIDENCE_NONCE");
+        command.env_remove(options.evidence_variable);
+    }
+    for variable in [
+        "DEEPWYRM_DW1E_EVIDENCE_NONCE",
+        "WYRMROOT_WYR1E7_EVIDENCE_NONCE",
+    ] {
+        if variable != options.evidence_variable {
+            command.env_remove(variable);
+        }
     }
     let status = command.status();
     build_directory.verify_unchanged("WYR1-C1 build scratch")?;
@@ -2352,6 +2792,58 @@ pub(crate) fn validate_e6_artifact_reports(
         return Err(Failure::task(
             "WYR1-E6 stack proof was not reproduced byte-for-byte",
         ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_e7_artifact_reports(
+    repository: &Path,
+    artifacts: &BTreeMap<String, Vec<u8>>,
+    inspections: &BTreeMap<String, Vec<u8>>,
+    malformed_elf: &[u8],
+    expected_stack_report: &[u8],
+) -> Result<(), Failure> {
+    if artifacts.len() != E7_ARTIFACT_LABELS.len()
+        || inspections.len() != E7_ARTIFACT_LABELS.len()
+        || malformed_elf != E7_MALFORMED_ELF
+    {
+        return Err(Failure::task("WYR1-E7 artifact set drifted"));
+    }
+    let mut e6_artifacts = BTreeMap::new();
+    let mut e6_inspections = BTreeMap::new();
+    for label in E6_ARTIFACT_LABELS {
+        e6_artifacts.insert(
+            label.to_owned(),
+            artifacts
+                .get(label)
+                .ok_or_else(|| Failure::task(format!("WYR1-E7 lacks {label}")))?
+                .clone(),
+        );
+        e6_inspections.insert(
+            label.to_owned(),
+            inspections
+                .get(label)
+                .ok_or_else(|| Failure::task(format!("WYR1-E7 lacks {label} inspection")))?
+                .clone(),
+        );
+    }
+    validate_e6_artifact_reports(
+        repository,
+        &e6_artifacts,
+        &e6_inspections,
+        expected_stack_report,
+    )?;
+    for label in ["cpu-hog", "exit-nonzero", "fault"] {
+        let bytes = artifacts
+            .get(label)
+            .ok_or_else(|| Failure::task(format!("WYR1-E7 lacks {label}")))?;
+        let digest = sha256::bytes_digest(bytes);
+        let expected = inspect_native_bytes(repository, bytes, &digest, label)?;
+        if inspections.get(label).map(Vec::as_slice) != Some(expected.as_bytes()) {
+            return Err(Failure::task(format!(
+                "WYR1-E7 {label} inspection was not recomputed exactly"
+            )));
+        }
     }
     Ok(())
 }
@@ -2668,6 +3160,56 @@ fn inspect_e6_archive(
         if entry.data() != expected_bytes || entry.is_executable() != executable {
             return Err(Failure::task(format!("WYR1-E6 bootfs changed {path}")));
         }
+    }
+    Ok(())
+}
+
+fn inspect_e7_archive(
+    bytes: &[u8],
+    artifacts: &[NativeArtifact],
+    malformed_elf: &[u8],
+    rrc: &[u8],
+    wrdm: &[u8],
+    launch_policy: &[u8],
+) -> Result<(), Failure> {
+    let archive = Archive::new(bytes)
+        .map_err(|error| Failure::task(format!("WYR1-E7 bootfs inspection failed: {error:?}")))?;
+    let expected = [
+        ("system/init", artifacts[0].bytes.as_slice(), true),
+        ("system/registryd", artifacts[1].bytes.as_slice(), true),
+        ("system/devmgr", artifacts[2].bytes.as_slice(), true),
+        ("system/uart16550d", artifacts[3].bytes.as_slice(), true),
+        ("system/consoled", artifacts[4].bytes.as_slice(), true),
+        ("system/wyrmsh", artifacts[5].bytes.as_slice(), true),
+        ("system/bootstrap/rrc-a-v1", rrc, false),
+        ("system/bootstrap/wyr1-a-gate-v1", GATE_CONFIG, false),
+        ("system/bootstrap/wyr1-c-gate-v1", WYR1_C1_MARKER, false),
+        ("system/bootstrap/wyr1-c-device-manifest-v1", wrdm, false),
+        (LAUNCH_POLICY_PATH, launch_policy, false),
+        ("bin/hello", artifacts[6].bytes.as_slice(), true),
+        (CPU_HOG_PATH, artifacts[7].bytes.as_slice(), true),
+        (E7_EXIT_NONZERO_PATH, artifacts[8].bytes.as_slice(), true),
+        (E7_FAULT_PATH, artifacts[9].bytes.as_slice(), true),
+        (E7_MALFORMED_ELF_PATH, malformed_elf, true),
+    ];
+    if archive.entries().count() != expected.len() {
+        return Err(Failure::task("WYR1-E7 bootfs entry set drifted"));
+    }
+    for (path, expected_bytes, executable) in expected {
+        let entry = archive
+            .lookup(path.as_bytes())
+            .map_err(|_| Failure::task(format!("WYR1-E7 bootfs lacks {path}")))?;
+        if entry.data() != expected_bytes || entry.is_executable() != executable {
+            return Err(Failure::task(format!("WYR1-E7 bootfs changed {path}")));
+        }
+    }
+    if archive.lookup(b"system/bootstrap/wyr1-e7-gate-v1").is_ok()
+        || archive.lookup(CONSOLE_ECHO_PATH.as_bytes()).is_ok()
+        || archive.lookup(WYR1_D5_GATE_PATH.as_bytes()).is_ok()
+    {
+        return Err(Failure::task(
+            "WYR1-E7 bootfs inherited an unfrozen selector entry",
+        ));
     }
     Ok(())
 }
@@ -3140,6 +3682,31 @@ fn e6_product_generation(revision: &str, artifacts: &[NativeArtifact]) -> [u8; 3
     sha256::bytes_digest_array(&material)
 }
 
+fn e7_product_generation(
+    revision: &str,
+    artifacts: &[NativeArtifact],
+    malformed_elf: &[u8],
+) -> [u8; 32] {
+    let mut material = Vec::from(b"wyrmroot-wyr1-e7-selector33-product-v1\0".as_slice());
+    material.extend_from_slice(revision.as_bytes());
+    for artifact in artifacts {
+        material.extend_from_slice(artifact.spec.label.as_bytes());
+        material.extend_from_slice(artifact.sha256.as_bytes());
+    }
+    material.extend_from_slice(E7_MALFORMED_ELF_PATH.as_bytes());
+    material.extend_from_slice(sha256::bytes_digest(malformed_elf).as_bytes());
+    sha256::bytes_digest_array(&material)
+}
+
+fn e7_native_spec(label: &str) -> Result<NativeSpec, Failure> {
+    WYR1E7_SELECTED_NATIVE_SPECS
+        .iter()
+        .chain(WYR1E6_PRODUCT_NATIVE_SPECS.iter())
+        .copied()
+        .find(|spec| spec.label == label)
+        .ok_or_else(|| Failure::task("unknown WYR1-E7 native artifact label"))
+}
+
 fn native_command(spec: NativeSpec) -> String {
     format!(
         "cargo build --offline --locked --release --target {NATIVE_TARGET} --package {} --bin {} --no-default-features --features {}",
@@ -3158,6 +3725,32 @@ pub(crate) fn e6_native_command(label: &str) -> Result<String, Failure> {
         command.push_str(" [rustflags: -Cjump-tables=no -Zemit-stack-sizes]");
     }
     Ok(command)
+}
+
+pub(crate) fn e7_native_command(label: &str) -> Result<String, Failure> {
+    let spec = e7_native_spec(label)?;
+    let mut command = native_command(spec);
+    if label == "wyrmsh" {
+        command.push_str(" [rustflags: -Cjump-tables=no -Zemit-stack-sizes]");
+    }
+    if label == "system-init" {
+        command.push_str(" [env: WYRMROOT_WYR1E7_EVIDENCE_NONCE=<validated-16-hex>]");
+    }
+    Ok(command)
+}
+
+pub(crate) fn validate_e7_nonce(nonce: &str) -> Result<(), Failure> {
+    if nonce.len() != 16
+        || !nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'A'..=b'F'))
+        || nonce.bytes().all(|byte| byte == b'0')
+    {
+        return Err(Failure::task(
+            "WYR1-E7 evidence nonce must be 16 nonzero uppercase hexadecimal characters",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_fresh_output(
@@ -3222,6 +3815,7 @@ pub(crate) fn reject_ambient_build_environment(
         "WYRMROOT_RUSTC",
         "DEEPWYRM_GUEST_TEST_SELECTOR",
         "DEEPWYRM_GUEST_TEST_ID",
+        "WYRMROOT_WYR1E7_EVIDENCE_NONCE",
     ] {
         if variables.contains_key(OsStr::new(variable)) {
             return Err(Failure::task(format!(
@@ -3479,6 +4073,106 @@ mod tests {
             manifest.role(RoleId::Wyrmsh).unwrap().startup_profile(),
             StartupProfile::Wyrmsh
         );
+    }
+
+    #[test]
+    fn wyr1e7_native_gate_selects_only_the_observer_and_three_fixture_actors() {
+        let specs = WYR1E7_SELECTED_NATIVE_SPECS
+            .iter()
+            .map(|spec| (spec.label, spec.package, spec.binary, spec.features))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            specs,
+            vec![
+                (
+                    "system-init",
+                    "wyrmroot-system-init",
+                    "system-init",
+                    "wyr1e-selector33",
+                ),
+                (
+                    "cpu-hog",
+                    "wyrmroot-dw1b-preemption",
+                    "wyrmroot-job-cpu-hog",
+                    "native-job-cpu-hog",
+                ),
+                (
+                    "exit-nonzero",
+                    "wyrmroot-wyr1e-test-actors",
+                    "wyrmroot-wyr1e-exit-nonzero",
+                    "native-exit-nonzero",
+                ),
+                (
+                    "fault",
+                    "wyrmroot-wyr1e-test-actors",
+                    "wyrmroot-wyr1e-fault",
+                    "native-fault",
+                ),
+            ]
+        );
+        assert!(
+            e7_native_command("system-init")
+                .unwrap()
+                .contains("WYRMROOT_WYR1E7_EVIDENCE_NONCE")
+        );
+        for label in ["cpu-hog", "exit-nonzero", "fault"] {
+            assert!(
+                !e7_native_command(label)
+                    .unwrap()
+                    .contains("WYRMROOT_WYR1E7_EVIDENCE_NONCE")
+            );
+        }
+    }
+
+    #[test]
+    fn wyr1e7_product_is_exact_augmented_sixteen_entry_archive() {
+        let artifacts = E7_ARTIFACT_LABELS
+            .iter()
+            .enumerate()
+            .map(|(index, label)| {
+                let bytes = vec![index as u8 + 1; index + 3];
+                NativeArtifact {
+                    spec: e7_native_spec(label).unwrap(),
+                    sha256: sha256::bytes_digest(&bytes),
+                    bytes,
+                    inspection: format!("{{\"verified\":true,\"artifact\":\"{label}\"}}\n"),
+                }
+            })
+            .collect::<Vec<_>>();
+        let product = assemble_e7_product(&"3".repeat(40), &artifacts, E7_MALFORMED_ELF).unwrap();
+        let archive = Archive::new(&product.bootfs).unwrap();
+        assert_eq!(archive.entries().count(), 16);
+        for path in [
+            CPU_HOG_PATH,
+            E7_EXIT_NONZERO_PATH,
+            E7_FAULT_PATH,
+            E7_MALFORMED_ELF_PATH,
+        ] {
+            assert!(archive.lookup(path.as_bytes()).unwrap().is_executable());
+        }
+        assert_eq!(
+            archive
+                .lookup(E7_MALFORMED_ELF_PATH.as_bytes())
+                .unwrap()
+                .data(),
+            E7_MALFORMED_ELF
+        );
+        let policy = LaunchPolicy::parse(&product.launch_policy).unwrap();
+        assert_eq!(policy.version_minor(), 1);
+        assert_eq!(policy.len(), 6);
+    }
+
+    #[test]
+    fn wyr1e7_nonce_is_fixed_uppercase_nonzero_hex() {
+        assert!(validate_e7_nonce("0123456789ABCDEF").is_ok());
+        for invalid in [
+            "0000000000000000",
+            "0123456789abcdef",
+            "0123456789ABCDE",
+            "0123456789ABCDEG",
+        ] {
+            assert!(validate_e7_nonce(invalid).is_err());
+        }
     }
 
     #[test]

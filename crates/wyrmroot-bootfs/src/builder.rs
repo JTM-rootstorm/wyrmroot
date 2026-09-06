@@ -134,6 +134,14 @@ pub enum BuildError {
     /// The WYR1-E hello policy identity was zero or did not match the selected
     /// hello identity supplied by the product producer.
     E6HelloIdentityMismatch,
+    /// The selector-33 WRJP policy was malformed or did not contain exactly
+    /// the six frozen interactive-shell records.
+    InvalidE7LaunchPolicy,
+    /// A selector-33 fixture identity was zero or did not match its WRJP
+    /// record.
+    E7ArtifactIdentityMismatch,
+    /// The selector-33 malformed-ELF fixture was not the frozen byte string.
+    InvalidE7MalformedElf,
 }
 
 /// The only regular-file metadata forms permitted in a WYR0 bootfs archive.

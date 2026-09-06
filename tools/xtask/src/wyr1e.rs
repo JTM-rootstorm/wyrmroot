@@ -24,6 +24,12 @@ struct FrozenSnapshot {
     freeze_receipt: Vec<u8>,
 }
 
+pub(crate) struct ImmutableE6Input {
+    pub(crate) product: wyr1c::E6Snapshot,
+    pub(crate) source_receipt: Vec<u8>,
+    pub(crate) freeze_receipt: Vec<u8>,
+}
+
 struct Publication {
     artifacts_dir: Directory,
     inspections_dir: Directory,
@@ -110,6 +116,70 @@ pub(crate) fn inspect(output: &Path) -> Result<String, Failure> {
         snapshot.product.wyrmroot_revision,
         sha256::bytes_digest(&snapshot.product.bootfs),
     ))
+}
+
+/// Loads the exact historical E6 freeze admitted by the E7 contract without
+/// weakening the public E6 inspector's same-revision requirement.
+pub(crate) fn immutable_input_for_e7(
+    output: &Path,
+    expected_revision: &str,
+    expected_source_receipt_sha256: &str,
+    expected_freeze_receipt_sha256: &str,
+) -> Result<ImmutableE6Input, Failure> {
+    let repository = crate::tasks::repository_root()?;
+    let project = crate::tasks::canonical_project_root(&repository)?;
+    let output = validate_existing_output(&repository, &project, output)?;
+    let output_dir = Directory::open_exact(&output, "WYR1-E6 immutable input")?;
+    let parent_path = output
+        .parent()
+        .ok_or_else(|| Failure::task("WYR1-E6 immutable input has no parent"))?;
+    let name = output
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| Failure::task("WYR1-E6 immutable input name is not UTF-8"))?;
+    let parent = Directory::open_exact(parent_path, "WYR1-E6 immutable input parent")?;
+    let parent_mode = parent.owned_container_mode("WYR1-E6 immutable input parent")?;
+    let mut publication = open_publication(&output_dir)?;
+    verify_publication(&parent, parent_mode, name, &output_dir, &publication)?;
+    let snapshot = snapshot_from_publication(&mut publication)?;
+    if snapshot.product.wyrmroot_revision != expected_revision
+        || sha256::bytes_digest(&snapshot.source_receipt) != expected_source_receipt_sha256
+        || sha256::bytes_digest(&snapshot.freeze_receipt) != expected_freeze_receipt_sha256
+    {
+        return Err(Failure::task(
+            "WYR1-E7 immutable E6 source/freeze identity is not the accepted tuple",
+        ));
+    }
+    wyr1c::validate_e6_artifact_reports(
+        &repository,
+        &snapshot.product.artifacts,
+        &snapshot.product.inspections,
+        &snapshot.product.stack_report,
+    )?;
+    let assembled = wyr1c::reassemble_e6_snapshot(expected_revision, &snapshot.product.artifacts)?;
+    if assembled.rrc_manifest != snapshot.product.rrc_manifest
+        || assembled.device_manifest != snapshot.product.device_manifest
+        || assembled.launch_policy != snapshot.product.launch_policy
+        || assembled.bootfs != snapshot.product.bootfs
+    {
+        return Err(Failure::task(
+            "WYR1-E7 immutable E6 input failed deterministic reconstruction",
+        ));
+    }
+    let source = std::str::from_utf8(&snapshot.source_receipt)
+        .map_err(|_| Failure::task("WYR1-E6 immutable source receipt is not UTF-8"))?;
+    let expected_freeze = render_freeze_receipt(&snapshot.product, source);
+    if snapshot.freeze_receipt != expected_freeze.as_bytes() {
+        return Err(Failure::task(
+            "WYR1-E7 immutable E6 freeze receipt is not canonical",
+        ));
+    }
+    verify_publication(&parent, parent_mode, name, &output_dir, &publication)?;
+    Ok(ImmutableE6Input {
+        product: snapshot.product,
+        source_receipt: snapshot.source_receipt,
+        freeze_receipt: snapshot.freeze_receipt,
+    })
 }
 
 fn render_source_receipt(

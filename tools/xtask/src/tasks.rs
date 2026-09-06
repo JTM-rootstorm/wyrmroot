@@ -1354,6 +1354,9 @@ pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<
     if matches!(filter, Some("wyr1e6-native")) {
         return crate::wyr1c::run_wyr1e6_native_checks(repository);
     }
+    if matches!(filter, Some("wyr1e7-native")) {
+        return crate::wyr1c::run_wyr1e7_native_checks(repository);
+    }
     if matches!(filter, Some("dw1e3b-native")) {
         return crate::wyr1c::run_e3b_native_checks(repository);
     }
@@ -1365,6 +1368,37 @@ pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<
 }
 
 fn host_test_commands(filter: Option<&str>) -> Result<Vec<Vec<String>>, Failure> {
+    if matches!(filter, Some("wyr1e7-model" | "wyr1e7-clippy")) {
+        let lint = filter.is_some_and(|value| value.ends_with("clippy"));
+        return Ok([
+            ("wyrmroot-system-init", Some("wyr1e-selector33"), true),
+            ("wyrmroot-dw1b-preemption", None, true),
+            ("wyrmroot-wyr1e-test-actors", None, true),
+            ("wyrmroot-bootfs", Some("builder"), true),
+            ("xtask", None, false),
+        ]
+        .into_iter()
+        .map(|(package, feature, library)| {
+            let mut arguments = vec![
+                if lint { "clippy" } else { "test" }.to_owned(),
+                "--locked".to_owned(),
+                "--offline".to_owned(),
+                "--package".to_owned(),
+                package.to_owned(),
+            ];
+            if let Some(feature) = feature {
+                arguments.extend(["--features".to_owned(), feature.to_owned()]);
+            }
+            if library {
+                arguments.push("--lib".to_owned());
+            }
+            if lint {
+                arguments.extend(["--".to_owned(), "-D".to_owned(), "warnings".to_owned()]);
+            }
+            arguments
+        })
+        .collect());
+    }
     if matches!(
         filter,
         Some("wyr1e6-controller-model" | "wyr1e6-controller-clippy")
@@ -1781,6 +1815,54 @@ mod tests {
                 assert!(!command.iter().any(|argument| argument == "--tests"));
                 assert!(!command.iter().any(|argument| argument == "--bin"));
             }
+        }
+    }
+
+    #[test]
+    fn wyr1e7_host_filters_cover_selected_observer_actors_and_product_builder() {
+        for filter in ["wyr1e7-model", "wyr1e7-clippy"] {
+            let commands = host_test_commands(Some(filter)).unwrap();
+            assert_eq!(commands.len(), 5);
+            for package in [
+                "wyrmroot-system-init",
+                "wyrmroot-dw1b-preemption",
+                "wyrmroot-wyr1e-test-actors",
+                "wyrmroot-bootfs",
+                "xtask",
+            ] {
+                assert!(
+                    commands
+                        .iter()
+                        .any(|command| command.iter().any(|argument| argument == package))
+                );
+            }
+            for command in &commands[..4] {
+                assert!(command.iter().any(|argument| argument == "--lib"));
+                assert!(!command.iter().any(|argument| argument == "--tests"));
+                assert!(!command.iter().any(|argument| argument == "--bin"));
+                assert!(!command.iter().any(|argument| argument == "--all-targets"));
+            }
+            let init = &commands[0];
+            assert!(
+                init.windows(2)
+                    .any(|arguments| arguments == ["--features", "wyr1e-selector33"])
+            );
+            let bootfs = &commands[3];
+            assert!(
+                bootfs
+                    .windows(2)
+                    .any(|arguments| arguments == ["--features", "builder"])
+            );
+            let xtask = &commands[4];
+            assert!(!xtask.iter().any(|argument| argument == "--lib"));
+            assert_eq!(
+                commands[0][0],
+                if filter.ends_with("clippy") {
+                    "clippy"
+                } else {
+                    "test"
+                }
+            );
         }
     }
 
