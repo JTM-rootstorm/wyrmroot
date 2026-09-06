@@ -284,8 +284,7 @@ pub(crate) fn inspect(output: &Path) -> Result<String, Failure> {
             "WYR1-E7 request does not match current source metadata",
         ));
     }
-    let deep_repository =
-        wyr1c6::canonical_deep_repository(Path::new(manifest.deepwyrm_repository()?), &project)?;
+    let deep_repository = local_deep_repository(&project)?;
     let abi_tree = wyr1c6::matching_abi_tree(
         &deep_repository,
         value(&request, "deepwyrm_revision")?,
@@ -685,8 +684,21 @@ fn render_source_receipt(
             )?),
         );
     }
-    let keys = source_receipt_keys();
-    render_dynamic(&values, &keys, &[], "WYR1-E7 source receipt")
+    render_source_fields(&values)
+}
+
+fn local_deep_repository(project: &Path) -> Result<PathBuf, Failure> {
+    // Build metadata names the upstream Git URL, not a filesystem checkout.
+    wyr1c6::canonical_deep_repository(&project.join("deepwyrm"), project)
+}
+
+fn render_source_fields(values: &BTreeMap<String, String>) -> Result<String, Failure> {
+    render_dynamic(
+        values,
+        &source_receipt_keys(),
+        &["schema_version", "test_id"],
+        "WYR1-E7 source receipt",
+    )
 }
 
 fn source_receipt_keys() -> Vec<String> {
@@ -2107,8 +2119,10 @@ schemas = {
     "handoff": (module.E7_HANDOFF_KEYS, frozenset({"schema_version", "test_id", "vcpus", "memory_mib", "timeout_seconds", "com2_prelude_length"})),
     "pair": (module.E7_PAIR_KEYS, frozenset({"schema_version", "test_id", "default_vcpus", "smp_vcpus", "memory_mib", "timeout_seconds"})),
     "receipt": (module.E7_RECEIPT_KEYS, frozenset({"schema_version", "test_id", "com2_prelude_length"})),
-    "source": (module.E7_SOURCE_RECEIPT_KEYS, frozenset()),
 }
+if sys.argv[2] == "source":
+    module.parse_e7_source_receipt(sys.stdin.buffer.read())
+    sys.exit(0)
 keys, integers = schemas[sys.argv[2]]
 module._strict_c6_toml(sys.stdin.buffer.read(), keys, "Rust-rendered E7 fixture", integers)
 "#;
@@ -2336,7 +2350,7 @@ module._strict_c6_toml(sys.stdin.buffer.read(), keys, "Rust-rendered E7 fixture"
                 ("malformed_elf_literal", "WYR1-E7 malformed ELF\\n"),
             ],
         );
-        let source_text = render_dynamic(&source, &source_keys, &[], "WYR1-E7 source fixture")?;
+        let source_text = render_source_fields(&source)?;
         assert_eq!(
             value(
                 &parse_scalar_receipt(&source_text, "WYR1-E7 source fixture")?,
@@ -2501,6 +2515,19 @@ module._strict_c6_toml(sys.stdin.buffer.read(), keys, "Rust-rendered E7 fixture"
         let request_hash = rewrite_control_graph(&fixture.root, &request)?;
         validate_frozen_output(&fixture.root, &request, &request_hash)?;
         assert!(validate_esp_contents(&fixture.root, &request).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn inspector_uses_the_local_checkout_with_upstream_url_metadata() -> Result<(), Failure> {
+        let repository = tasks::repository_root()?;
+        let project = tasks::canonical_project_root(&repository)?;
+        let manifest = crate::metadata::BuildManifest::load(&repository)?;
+        assert!(manifest.deepwyrm_repository()?.starts_with("https://"));
+        assert_eq!(
+            local_deep_repository(&project)?,
+            fs::canonicalize(project.join("deepwyrm")).unwrap()
+        );
         Ok(())
     }
 
