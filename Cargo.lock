@@ -456,6 +456,15 @@ name = "wyrmroot-wyrmsh-core"
 version = "0.0.0"
 
 [[package]]
+name = "wyrmroot-wyr1e-test-actors"
+version = "0.0.0"
+dependencies = [
+ "deepwyrm-syscall",
+ "wyrmroot-loader",
+ "wyrmroot-runtime",
+]
+
+[[package]]
 name = "xtask"
 version = "0.0.0"
 dependencies = [

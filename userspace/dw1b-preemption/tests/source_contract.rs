@@ -16,11 +16,15 @@ fn repository() -> PathBuf {
 }
 
 #[test]
-fn both_native_payloads_use_the_canonical_linker_contract() {
+fn all_native_payloads_use_the_canonical_linker_contract() {
     let build =
         fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("build.rs")).unwrap();
     assert!(build.contains("../../toolchain/native-user.ld"));
-    for binary in ["wyrmroot-dw1b-cpu-hog", "wyrmroot-dw1b-progress"] {
+    for binary in [
+        "wyrmroot-dw1b-cpu-hog",
+        "wyrmroot-dw1b-progress",
+        "wyrmroot-job-cpu-hog",
+    ] {
         assert!(build.contains(binary), "build script omitted {binary}");
         assert!(build.contains("--build-id=none"));
     }
@@ -30,7 +34,7 @@ fn both_native_payloads_use_the_canonical_linker_contract() {
 fn executed_hog_loop_is_syscall_yield_and_block_free() {
     let source =
         fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs")).unwrap();
-    let start = source.find("pub fn run_cpu_hog").unwrap();
+    let start = source.find("pub fn run_cpu_hog_body").unwrap();
     let end = source[start..].find("pub fn run_progress").unwrap() + start;
     let function = &source[start..end];
     let loop_start = function.find("loop {").unwrap();
@@ -39,6 +43,22 @@ fn executed_hog_loop_is_syscall_yield_and_block_free() {
     for forbidden in ["syscall", "yield", "wait_", "receive_", "send_", "close_"] {
         assert!(!executed_loop.contains(forbidden), "found {forbidden}");
     }
+}
+
+#[test]
+fn historical_and_job_v2_entries_share_the_only_hog_body() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let source = fs::read_to_string(manifest.join("src/lib.rs")).unwrap();
+    let job = fs::read_to_string(manifest.join("src/bin/job_cpu_hog.rs")).unwrap();
+    assert_eq!(source.matches("core::hint::spin_loop()").count(), 1);
+    assert!(source.contains("pub fn run_cpu_hog(channel: DwHandle)"));
+    assert!(source.contains("receive_hog_startup_and_ready(channel)?;"));
+    assert!(source.contains("run_cpu_hog_body()"));
+    assert!(job.contains("prepare_job_cpu_hog"));
+    assert!(job.contains("run_cpu_hog_body()"));
+    assert!(job.contains("startup.version()"));
+    assert!(job.contains("startup.arg(0)"));
+    assert!(job.contains("startup.envc()"));
 }
 
 #[test]

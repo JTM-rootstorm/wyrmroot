@@ -1,0 +1,38 @@
+[package]
+name = "wyrmroot-wyr1e-test-actors"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Bounded WYR1-E JobV2 test actors"
+license = "GPL-3.0-or-later"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "wyrmroot-wyr1e-exit-nonzero"
+path = "src/bin/exit_nonzero.rs"
+test = false
+bench = false
+required-features = ["native-exit-nonzero"]
+
+[[bin]]
+name = "wyrmroot-wyr1e-fault"
+path = "src/bin/fault.rs"
+test = false
+bench = false
+required-features = ["native-fault"]
+
+[features]
+default = []
+native-exit-nonzero = []
+native-fault = []
+
+[dependencies]
+deepwyrm-syscall.workspace = true
+wyrmroot-loader = { path = "../../crates/wyrmroot-loader" }
+wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }
+
+[lints.rust]
+unsafe_code = "deny"
+unused_crate_dependencies = "deny"

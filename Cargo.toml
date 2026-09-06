@@ -32,6 +32,7 @@ members = [
     "userspace/consoled",
     "userspace/wyrmsh",
     "userspace/dw1b-preemption",
+    "userspace/wyr1e-test-actors",
     "userspace/dw1c-preemption",
     "userspace/dw1d6-device-test",
     "userspace/dw1e3-com2-test",

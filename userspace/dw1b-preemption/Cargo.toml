@@ -23,9 +23,17 @@ test = false
 bench = false
 required-features = ["native-payloads"]
 
+[[bin]]
+name = "wyrmroot-job-cpu-hog"
+path = "src/bin/job_cpu_hog.rs"
+test = false
+bench = false
+required-features = ["native-job-cpu-hog"]
+
 [features]
 default = []
 native-payloads = ["wyrmroot-runtime/dw1b-test-evidence"]
+native-job-cpu-hog = []
 
 [dependencies]
 deepwyrm-syscall.workspace = true
