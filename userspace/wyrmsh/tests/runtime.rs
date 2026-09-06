@@ -64,6 +64,18 @@ struct ControlDatagram {
     handles: Vec<DwReceivedHandleInfoV1>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CommittedEffects {
+    ready: Vec<u8>,
+    outputs: Vec<(DwHandle, Vec<u8>)>,
+    control_requests: Vec<(DwHandle, Vec<u8>)>,
+    next_handle: u64,
+    created: Vec<(DwHandle, DwRights)>,
+    moved: Vec<Vec<DwHandleTransferV1>>,
+    handle_send_attempts: Vec<Vec<DwHandleTransferV1>>,
+    child_receive_trace: Vec<(DwHandle, bool)>,
+}
+
 struct Fixture {
     init: [u8; WYRMSH_BYTES],
     handles: [DwReceivedHandleInfoV1; 6],
@@ -84,6 +96,7 @@ struct Fixture {
     receive_calls: usize,
     control_incoming: VecDeque<ControlDatagram>,
     control_requests: Vec<(DwHandle, Vec<u8>)>,
+    control_delivery_effects: Vec<CommittedEffects>,
     scripted_controls: bool,
     control_send_would_block: VecDeque<DwHandle>,
     now: u64,
@@ -148,6 +161,7 @@ impl Fixture {
             receive_calls: 0,
             control_incoming: VecDeque::new(),
             control_requests: vec![],
+            control_delivery_effects: vec![],
             scripted_controls: false,
             control_send_would_block: VecDeque::new(),
             now: 5_000_000_000,
@@ -209,6 +223,19 @@ impl Fixture {
             }
         }
         result
+    }
+
+    fn committed_effects(&self) -> CommittedEffects {
+        CommittedEffects {
+            ready: self.ready.clone(),
+            outputs: self.outputs.clone(),
+            control_requests: self.control_requests.clone(),
+            next_handle: self.next_handle,
+            created: self.created.clone(),
+            moved: self.moved.clone(),
+            handle_send_attempts: self.handle_send_attempts.clone(),
+            child_receive_trace: self.child_receive_trace.clone(),
+        }
     }
 
     fn queue_control(&mut self, channel: DwHandle, bytes: &[u8]) {
@@ -300,6 +327,7 @@ impl WyrmshSystem for Fixture {
             return Err(NativeError::Status(DW_STATUS_WOULD_BLOCK));
         }
         let message = self.control_incoming.pop_front().unwrap();
+        self.control_delivery_effects.push(self.committed_effects());
         bytes[..message.bytes.len()].copy_from_slice(&message.bytes);
         for (target, source) in handles.iter_mut().zip(&message.handles) {
             *target = *source;
