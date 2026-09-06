@@ -7,6 +7,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{SystemTime, UNIX_EPOCH},
@@ -43,6 +44,36 @@ const ACCEPTED_E6_SOURCE_RECEIPT_SHA256: &str =
     "7df2550df8b16a316ac9d30246f4a59f7e7f88db6977da8090a5b4c83717a819";
 const ACCEPTED_E6_FREEZE_RECEIPT_SHA256: &str =
     "0507062b98e26ef62f1d65dcff73ffd3b0418935c1f08ad42b128579115c10bc";
+const ACCEPTED_E6_REUSED_SHA256: &[(&str, &str)] = &[
+    (
+        "registryd",
+        "3c75e3edaf27dd5457e433fdc1a5368c985a25469d6c70cdd954cb1646f3973b",
+    ),
+    (
+        "devmgr",
+        "0b4599c277038582879cab7d96ec2cd553155f815e750128148093788928b00b",
+    ),
+    (
+        "uart16550d",
+        "a6518f0293f7c88d816201d53661432345a8aa722409a25a9720c17972359a27",
+    ),
+    (
+        "consoled",
+        "16f9874dd2c09a484c9019bc3b4a3cab0a2deae533e113ca08920a78f627fd09",
+    ),
+    (
+        "wyrmsh",
+        "9d7f3ab7462488dd3f4db6226ef119516de7a2933c4441eeb331fc4f07f72101",
+    ),
+    (
+        "hello",
+        "5acb3922032f522de84d6378af837260d8fbcb63fff22bd26299a8642bcd5ba6",
+    ),
+    (
+        "stack_report",
+        "7eab648da90518331e95650becba6013158cb2edc3c5f5126beaabb6eb83ea7f",
+    ),
+];
 
 pub(crate) const ARTIFACTS: &[(&str, &str)] = &[
     ("loader", "loader.efi"),
@@ -148,6 +179,9 @@ pub(crate) fn prepare(
     result
 }
 
+/// Inspect the freshly prepared, unconsumed product graph. Once a verified
+/// runner has captured a profile or changed its mutable vars, the root
+/// post-run recheck owns validation of that runtime state.
 pub(crate) fn inspect(output: &Path) -> Result<String, Failure> {
     reject_selector_environment()?;
     wyr1c::reject_e6_ambient_build_environment(env::vars_os())?;
@@ -162,21 +196,7 @@ pub(crate) fn inspect(output: &Path) -> Result<String, Failure> {
     if render_request(&request)? != request_text {
         return Err(Failure::task("WYR1-E7 request is not canonical"));
     }
-    for (key, expected) in [
-        ("e6_wyrmroot_revision", ACCEPTED_E6_REVISION),
-        (
-            "e6_source_receipt_sha256",
-            ACCEPTED_E6_SOURCE_RECEIPT_SHA256,
-        ),
-        (
-            "e6_freeze_receipt_sha256",
-            ACCEPTED_E6_FREEZE_RECEIPT_SHA256,
-        ),
-    ] {
-        if value(&request, key)? != expected {
-            return Err(Failure::task(format!("WYR1-E7 request changed {key}")));
-        }
-    }
+    validate_request_contract(&request)?;
     let revision = wyr1c6::clean_revision(&repository, "Wyrmroot")?;
     if revision != value(&request, "wyrmroot_revision")? {
         return Err(Failure::task("WYR1-E7 source revision changed"));
@@ -241,6 +261,8 @@ pub(crate) fn inspect(output: &Path) -> Result<String, Failure> {
         &stack_report,
     )?;
 
+    validate_esp_contents(&output, &request)?;
+
     let source_bytes = wyr1c6::read_regular_bounded(
         &output.join(value(&request, "source_receipt")?),
         64 * 1024,
@@ -248,16 +270,38 @@ pub(crate) fn inspect(output: &Path) -> Result<String, Failure> {
     )?;
     let source_text = std::str::from_utf8(&source_bytes)
         .map_err(|_| Failure::task("WYR1-E7 source receipt is not UTF-8"))?;
-    let source = parse_scalar_receipt(source_text, "WYR1-E7 source receipt")?;
+    parse_scalar_receipt(source_text, "WYR1-E7 source receipt")?;
+    if sha256::bytes_digest(&source_bytes) != value(&request, "source_receipt_sha256")? {
+        return Err(Failure::task(
+            "WYR1-E7 source receipt does not match the request",
+        ));
+    }
     let manifest = crate::metadata::BuildManifest::load(&repository)?;
+    if value(&request, "rust_revision")? != manifest.rust_revision()?
+        || value(&request, "generated_abi_revision")? != manifest.deepwyrm_revision()?
+    {
+        return Err(Failure::task(
+            "WYR1-E7 request does not match current source metadata",
+        ));
+    }
+    let deep_repository =
+        wyr1c6::canonical_deep_repository(Path::new(manifest.deepwyrm_repository()?), &project)?;
+    let abi_tree = wyr1c6::matching_abi_tree(
+        &deep_repository,
+        value(&request, "deepwyrm_revision")?,
+        value(&request, "generated_abi_revision")?,
+    )?;
+    if abi_tree != value(&request, "generated_abi_tree")? {
+        return Err(Failure::task("WYR1-E7 generated ABI tree changed"));
+    }
     let profile = manifest.validate_loader_build_readiness(&repository)?;
     let toolchain = tasks::prepare_loader_toolchain(&repository, &profile, &manifest)?;
     let expected_source = render_source_receipt(
         &manifest,
         toolchain.accepted(),
-        value(&source, "deepwyrm_revision")?,
-        value(&source, "generated_abi_revision")?,
-        value(&source, "generated_abi_tree")?,
+        value(&request, "deepwyrm_revision")?,
+        value(&request, "generated_abi_revision")?,
+        value(&request, "generated_abi_tree")?,
         &revision,
         value(&request, "evidence_nonce")?,
         &artifacts_directory,
@@ -279,6 +323,27 @@ pub(crate) fn inspect(output: &Path) -> Result<String, Failure> {
         "WYR1_E7_INSPECT_PASS selector={SELECTOR} test_id={TEST_ID} evidence={EVIDENCE_PROTOCOL} wyrmroot_revision={revision} bootfs_sha256={}\n",
         sha256::bytes_digest(&assembled.bootfs),
     ))
+}
+
+fn validate_esp_contents(output: &Path, request: &BTreeMap<String, String>) -> Result<(), Failure> {
+    let esp_arguments = G3ImageArguments {
+        image: output.join(value(request, "esp")?).display().to_string(),
+        loader: output.join(value(request, "loader")?).display().to_string(),
+        kernel: output.join(value(request, "kernel")?).display().to_string(),
+        bootstrap: output
+            .join(value(request, "bootstrap")?)
+            .display()
+            .to_string(),
+        bootfs: output.join(value(request, "bootfs")?).display().to_string(),
+    };
+    g3_image::inspect_d6(
+        &esp_arguments,
+        &output
+            .join(value(request, "boot_device_table")?)
+            .display()
+            .to_string(),
+    )?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -806,6 +871,7 @@ fn freeze_produced(
         render_freeze_receipt(&request_hash, &fields)?.as_bytes(),
         "WYR1-E7 freeze receipt",
     )?;
+    validate_request_contract(&fields)?;
     validate_frozen_output(output, &fields, &request_hash)?;
     Ok(format!(
         "WYR1_E7_PREPARE_PASS selector={SELECTOR} test_id={TEST_ID} evidence={EVIDENCE_PROTOCOL} request={} default_handoff={} smp_handoff={} profile_pair={} terminal=DWTEST1-33-0\n",
@@ -857,21 +923,48 @@ fn stage_profile(
     )?;
     let vars_path = directory.join("OVMF_VARS.mutable.fd");
     wyr1c6::write_new_mode(&vars_path, &vars, 0o600, "WYR1-E7 mutable OVMF vars")?;
+    let xml = expected_profile_xml(output, profile, vcpus, request)?;
+    wyr1c6::write_new(
+        &directory.join("domain.xml"),
+        xml.as_bytes(),
+        "WYR1-E7 domain XML",
+    )?;
+    let fields = expected_handoff_fields(profile, vcpus, request_hash, request, &xml, &vars)?;
+    let keys = handoff_keys();
+    wyr1c6::write_new(
+        &directory.join("handoff.toml"),
+        render_handoff(&fields, &keys)?.as_bytes(),
+        "WYR1-E7 handoff",
+    )
+}
+
+fn expected_profile_xml(
+    output: &Path,
+    profile: &str,
+    vcpus: u8,
+    request: &BTreeMap<String, String>,
+) -> Result<String, Failure> {
     let absolute = fs::canonicalize(output)
         .map_err(|error| Failure::task(format!("could not resolve WYR1-E7 output: {error}")))?;
-    let xml = crate::dw1e3a::selected_domain_xml(
+    Ok(crate::dw1e3a::selected_domain_xml(
         vcpus,
         &absolute.join(value(request, "ovmf_code")?),
         &absolute.join(value(request, "esp")?),
         &absolute.join(profile).join("OVMF_VARS.mutable.fd"),
         &absolute.join(profile).join("com2.sock"),
         (SELECTOR, TEST_ID),
-    );
-    wyr1c6::write_new(
-        &directory.join("domain.xml"),
-        xml.as_bytes(),
-        "WYR1-E7 domain XML",
-    )?;
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expected_handoff_fields(
+    profile: &str,
+    vcpus: u8,
+    request_hash: &str,
+    request: &BTreeMap<String, String>,
+    xml: &str,
+    vars: &[u8],
+) -> Result<BTreeMap<String, String>, Failure> {
     let mut fields = BTreeMap::new();
     for (key, field) in [
         ("kind", HANDOFF_KIND),
@@ -918,7 +1011,7 @@ fn stage_profile(
         ),
         (
             "mutable_ovmf_vars_initial_sha256",
-            &sha256::bytes_digest(&vars),
+            &sha256::bytes_digest(vars),
         ),
         ("com2_socket", &format!("{profile}/com2.sock")),
         ("com1_serial_log", &format!("{profile}/com1.log")),
@@ -941,12 +1034,7 @@ fn stage_profile(
             value(request, &format!("{key}_sha256"))?.to_owned(),
         );
     }
-    let keys = handoff_keys();
-    wyr1c6::write_new(
-        &directory.join("handoff.toml"),
-        render_handoff(&fields, &keys)?.as_bytes(),
-        "WYR1-E7 handoff",
-    )
+    Ok(fields)
 }
 
 fn render_handoff(fields: &BTreeMap<String, String>, keys: &[String]) -> Result<String, Failure> {
@@ -966,6 +1054,18 @@ fn render_handoff(fields: &BTreeMap<String, String>, keys: &[String]) -> Result<
 }
 
 fn write_pair(output: &Path, request_hash: &str) -> Result<(), Failure> {
+    let fields = expected_pair_fields(output, request_hash)?;
+    wyr1c6::write_new(
+        &output.join("profile-pair.toml"),
+        render_pair(&fields)?.as_bytes(),
+        "WYR1-E7 profile pair",
+    )
+}
+
+fn expected_pair_fields(
+    output: &Path,
+    request_hash: &str,
+) -> Result<BTreeMap<String, String>, Failure> {
     let mut fields = BTreeMap::new();
     for (key, value) in [
         ("kind", PAIR_KIND),
@@ -1006,11 +1106,7 @@ fn write_pair(output: &Path, request_hash: &str) -> Result<(), Failure> {
             )?),
         );
     }
-    wyr1c6::write_new(
-        &output.join("profile-pair.toml"),
-        render_pair(&fields)?.as_bytes(),
-        "WYR1-E7 profile pair",
-    )
+    Ok(fields)
 }
 
 fn render_pair(fields: &BTreeMap<String, String>) -> Result<String, Failure> {
@@ -1309,10 +1405,13 @@ fn validate_frozen_output(
     request: &BTreeMap<String, String>,
     request_hash: &str,
 ) -> Result<(), Failure> {
+    validate_prepared_layout(output)?;
+    require_mode(&output.join("request.toml"), 0o444, "WYR1-E7 request")?;
     for (key, name) in ARTIFACTS {
         let path = output.join(value(request, key)?);
+        require_mode(&path, 0o444, key)?;
         let bytes = wyr1c6::read_regular_bounded(&path, artifact_maximum(key), key)?;
-        if path.file_name().and_then(|name| name.to_str()) != Some(name)
+        if value(request, key)? != format!("artifacts/{name}")
             || sha256::bytes_digest(&bytes) != value(request, &format!("{key}_sha256"))?
         {
             return Err(Failure::task(format!(
@@ -1324,28 +1423,170 @@ fn validate_frozen_output(
         ("e6-source-build.toml", "e6_source_receipt_sha256"),
         ("e6-freeze-receipt.toml", "e6_freeze_receipt_sha256"),
     ] {
-        let bytes = wyr1c6::read_regular_bounded(
-            &output.join("artifacts").join(name),
-            64 * 1024,
-            "WYR1-E7 inherited E6 receipt",
-        )?;
+        let path = output.join("artifacts").join(name);
+        require_mode(&path, 0o444, "WYR1-E7 inherited E6 receipt")?;
+        let bytes = wyr1c6::read_regular_bounded(&path, 64 * 1024, "WYR1-E7 inherited E6 receipt")?;
         if sha256::bytes_digest(&bytes) != value(request, key)? {
             return Err(Failure::task(
                 "WYR1-E7 inherited E6 receipt identity drifted",
             ));
         }
     }
-    for profile in ["default", "smp"] {
-        let handoff = String::from_utf8(wyr1c6::read_regular_bounded(
-            &output.join(profile).join("handoff.toml"),
-            64 * 1024,
-            "WYR1-E7 handoff",
-        )?)
-        .map_err(|_| Failure::task("WYR1-E7 handoff is not UTF-8"))?;
-        if !handoff.contains(&format!("request_sha256 = \"{request_hash}\"")) {
-            return Err(Failure::task("WYR1-E7 handoff request join drifted"));
+
+    let source_path = output.join(value(request, "source_receipt")?);
+    require_mode(&source_path, 0o444, "WYR1-E7 source receipt")?;
+    let source = wyr1c6::read_regular_bounded(&source_path, 64 * 1024, "WYR1-E7 source receipt")?;
+    if sha256::bytes_digest(&source) != value(request, "source_receipt_sha256")? {
+        return Err(Failure::task("WYR1-E7 source receipt identity drifted"));
+    }
+    let esp_path = output.join(value(request, "esp")?);
+    require_mode(&esp_path, 0o444, "WYR1-E7 ESP")?;
+    let esp = wyr1c6::read_regular_bounded(&esp_path, g3_image::IMAGE_BYTES, "WYR1-E7 ESP")?;
+    if sha256::bytes_digest(&esp) != value(request, "esp_sha256")? {
+        return Err(Failure::task("WYR1-E7 ESP identity drifted"));
+    }
+
+    let result_schema_path = output.join(value(request, "result_schema")?);
+    require_mode(&result_schema_path, 0o444, "WYR1-E7 result schema")?;
+    let result_schema =
+        wyr1c6::read_regular_bounded(&result_schema_path, 64 * 1024, "WYR1-E7 result schema")?;
+    if result_schema != render_result_schema()?.as_bytes() {
+        return Err(Failure::task("WYR1-E7 result schema drifted"));
+    }
+
+    let vars = wyr1c6::read_regular_bounded(
+        &output.join(value(request, "ovmf_vars")?),
+        wyr1c6::MAX_FIRMWARE_BYTES,
+        "WYR1-E7 OVMF vars",
+    )?;
+    for (profile, vcpus) in [("default", 1_u8), ("smp", 4_u8)] {
+        let profile_directory = output.join(profile);
+        let mutable_vars = profile_directory.join("OVMF_VARS.mutable.fd");
+        require_mode(&mutable_vars, 0o600, "WYR1-E7 mutable OVMF vars")?;
+        if wyr1c6::read_regular_bounded(
+            &mutable_vars,
+            wyr1c6::MAX_FIRMWARE_BYTES,
+            "WYR1-E7 mutable OVMF vars",
+        )? != vars
+        {
+            return Err(Failure::task(
+                "WYR1-E7 output is consumed/runtime state because prepared OVMF variables changed; use the canonical post-run recheck",
+            ));
         }
-        for absent in [
+        let xml = expected_profile_xml(output, profile, vcpus, request)?;
+        let xml_path = profile_directory.join("domain.xml");
+        require_mode(&xml_path, 0o444, "WYR1-E7 domain XML")?;
+        if wyr1c6::read_regular_bounded(&xml_path, 64 * 1024, "WYR1-E7 domain XML")?
+            != xml.as_bytes()
+        {
+            return Err(Failure::task(format!(
+                "WYR1-E7 {profile} domain XML drifted"
+            )));
+        }
+        let fields = expected_handoff_fields(profile, vcpus, request_hash, request, &xml, &vars)?;
+        let expected = render_handoff(&fields, &handoff_keys())?;
+        let handoff_path = profile_directory.join("handoff.toml");
+        require_mode(&handoff_path, 0o444, "WYR1-E7 handoff")?;
+        if wyr1c6::read_regular_bounded(&handoff_path, 64 * 1024, "WYR1-E7 handoff")?
+            != expected.as_bytes()
+        {
+            return Err(Failure::task(format!("WYR1-E7 {profile} handoff drifted")));
+        }
+    }
+
+    let pair_path = output.join(value(request, "profile_pair")?);
+    require_mode(&pair_path, 0o444, "WYR1-E7 profile pair")?;
+    let expected_pair = render_pair(&expected_pair_fields(output, request_hash)?)?;
+    if wyr1c6::read_regular_bounded(&pair_path, 64 * 1024, "WYR1-E7 profile pair")?
+        != expected_pair.as_bytes()
+    {
+        return Err(Failure::task("WYR1-E7 profile pair drifted"));
+    }
+
+    let receipt_path = output.join(value(request, "receipt")?);
+    require_mode(&receipt_path, 0o444, "WYR1-E7 freeze receipt")?;
+    if wyr1c6::read_regular_bounded(&receipt_path, 64 * 1024, "WYR1-E7 freeze receipt")?
+        != render_freeze_receipt(request_hash, request)?.as_bytes()
+    {
+        return Err(Failure::task("WYR1-E7 freeze receipt drifted"));
+    }
+    Ok(())
+}
+
+fn validate_request_contract(request: &BTreeMap<String, String>) -> Result<(), Failure> {
+    for (key, expected) in [
+        ("schema_version", "1"),
+        ("profile", "wyr1e7-selector33"),
+        ("scenario", "interactive-wyrmsh"),
+        ("default_handoff", "default/handoff.toml"),
+        ("smp_handoff", "smp/handoff.toml"),
+        ("profile_pair", "profile-pair.toml"),
+        ("receipt", "freeze-receipt.toml"),
+        ("source_receipt", "artifacts/e7-source-build.toml"),
+        ("esp", "artifacts/selector33-esp.img"),
+        ("result_schema", "result-schema.toml"),
+        ("e6_wyrmroot_revision", ACCEPTED_E6_REVISION),
+        (
+            "e6_source_receipt_sha256",
+            ACCEPTED_E6_SOURCE_RECEIPT_SHA256,
+        ),
+        (
+            "e6_freeze_receipt_sha256",
+            ACCEPTED_E6_FREEZE_RECEIPT_SHA256,
+        ),
+    ] {
+        if value(request, key)? != expected {
+            return Err(Failure::task(format!("WYR1-E7 request changed {key}")));
+        }
+    }
+    for (key, name) in ARTIFACTS {
+        if value(request, key)? != format!("artifacts/{name}") {
+            return Err(Failure::task(format!(
+                "WYR1-E7 request {key} locality drifted"
+            )));
+        }
+    }
+    for (key, expected) in ACCEPTED_E6_REUSED_SHA256 {
+        if value(request, &format!("{key}_sha256"))? != *expected {
+            return Err(Failure::task(format!(
+                "WYR1-E7 reused {key} is not from the accepted E6 product"
+            )));
+        }
+    }
+    for key in [
+        "deepwyrm_revision",
+        "generated_abi_revision",
+        "generated_abi_tree",
+        "wyrmroot_revision",
+        "rust_revision",
+        "e6_wyrmroot_revision",
+    ] {
+        wyr1c6::validate_revision(value(request, key)?, key)?;
+    }
+    wyr1c6::validate_upper_hex_nonzero(
+        value(request, "evidence_nonce")?,
+        16,
+        "WYR1-E7 evidence nonce",
+    )?;
+    for key in [
+        "esp_sha256",
+        "source_receipt_sha256",
+        "e6_source_receipt_sha256",
+        "e6_freeze_receipt_sha256",
+    ] {
+        validate_lower_hex(value(request, key)?, 64, key)?;
+    }
+    for (key, _) in ARTIFACTS {
+        let hash_key = format!("{key}_sha256");
+        validate_lower_hex(value(request, &hash_key)?, 64, &hash_key)?;
+    }
+    Ok(())
+}
+
+fn validate_prepared_layout(output: &Path) -> Result<(), Failure> {
+    for profile in ["default", "smp"] {
+        for runtime in [
+            "verification-manifest.json",
             "com2.sock",
             "com1.log",
             "com2.bin",
@@ -1353,12 +1594,94 @@ fn validate_frozen_output(
             "result.toml",
             "acceptance-receipt.toml",
         ] {
-            if output.join(profile).join(absent).exists() {
+            if output.join(profile).join(runtime).exists() {
                 return Err(Failure::task(
-                    "WYR1-E7 runtime output exists before runner execution",
+                    "WYR1-E7 output is consumed/runtime state; use the canonical post-run recheck",
                 ));
             }
         }
+    }
+    require_exact_directory(
+        output,
+        &[
+            "artifacts",
+            "default",
+            "smp",
+            "request.toml",
+            "result-schema.toml",
+            "profile-pair.toml",
+            "freeze-receipt.toml",
+        ],
+        "WYR1-E7 output",
+    )?;
+    let mut artifact_names = ARTIFACTS.iter().map(|(_, name)| *name).collect::<Vec<_>>();
+    artifact_names.extend([
+        "e6-source-build.toml",
+        "e6-freeze-receipt.toml",
+        SOURCE_RECEIPT,
+        "selector33-esp.img",
+    ]);
+    require_exact_directory(
+        &output.join("artifacts"),
+        &artifact_names,
+        "WYR1-E7 artifacts",
+    )?;
+    for profile in ["default", "smp"] {
+        require_exact_directory(
+            &output.join(profile),
+            &["handoff.toml", "domain.xml", "OVMF_VARS.mutable.fd"],
+            "WYR1-E7 prepared profile",
+        )?;
+    }
+    Ok(())
+}
+
+fn require_exact_directory(path: &Path, expected: &[&str], label: &str) -> Result<(), Failure> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| Failure::task(format!("could not stat {label}: {error}")))?;
+    if !metadata.file_type().is_dir() {
+        return Err(Failure::task(format!("{label} is not a directory")));
+    }
+    let mut actual = BTreeSet::new();
+    for entry in fs::read_dir(path)
+        .map_err(|error| Failure::task(format!("could not read {label}: {error}")))?
+    {
+        let entry =
+            entry.map_err(|error| Failure::task(format!("could not read {label}: {error}")))?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| Failure::task(format!("{label} contains a non-UTF-8 name")))?;
+        actual.insert(name);
+    }
+    let expected = expected.iter().map(|name| (*name).to_owned()).collect();
+    if actual != expected {
+        return Err(Failure::task(format!("{label} entry set drifted")));
+    }
+    Ok(())
+}
+
+fn require_mode(path: &Path, expected: u32, label: &str) -> Result<(), Failure> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| Failure::task(format!("could not stat {label}: {error}")))?;
+    if !metadata.file_type().is_file()
+        || metadata.nlink() != 1
+        || metadata.permissions().mode() & 0o777 != expected
+    {
+        return Err(Failure::task(format!("{label} mode drifted")));
+    }
+    Ok(())
+}
+
+fn validate_lower_hex(value: &str, length: usize, label: &str) -> Result<(), Failure> {
+    if value.len() != length
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(Failure::task(format!(
+            "{label} is not lowercase hexadecimal"
+        )));
     }
     Ok(())
 }
@@ -1518,9 +1841,17 @@ fn canonical_existing_output(
         .map_err(|error| Failure::task(format!("could not resolve OS-Project root: {error}")))?;
     let repository = fs::canonicalize(repository)
         .map_err(|error| Failure::task(format!("could not resolve Wyrmroot source: {error}")))?;
-    if !output.starts_with(project) || output.starts_with(repository) {
+    let deep_repository = fs::canonicalize(project.join("deepwyrm")).map_err(|error| {
+        Failure::task(format!(
+            "could not resolve canonical Deepwyrm source: {error}"
+        ))
+    })?;
+    if !output.starts_with(project)
+        || output.starts_with(repository)
+        || output.starts_with(deep_repository)
+    {
         return Err(Failure::task(
-            "WYR1-E7 output must remain inside OS-Project and outside Wyrmroot source",
+            "WYR1-E7 output must remain inside OS-Project and outside source repositories",
         ));
     }
     Ok(output)
@@ -1540,6 +1871,195 @@ mod tests {
     use super::*;
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt;
+
+    struct PreparedFixture {
+        root: PathBuf,
+        request: BTreeMap<String, String>,
+        request_hash: String,
+    }
+
+    impl Drop for PreparedFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn prepared_fixture(label: &str) -> Result<PreparedFixture, Failure> {
+        let repository = tasks::repository_root()?;
+        let temporary = repository.join(".tmp");
+        fs::create_dir_all(&temporary).map_err(|error| {
+            Failure::task(format!("could not create WYR1-E7 test root: {error}"))
+        })?;
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| Failure::task("system clock is before the Unix epoch"))?
+            .as_nanos();
+        let root = temporary.join(format!(
+            "wyr1e7-inspector-{label}-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&root)
+            .and_then(|()| fs::create_dir(root.join("artifacts")))
+            .map_err(|error| Failure::task(format!("could not create E7 fixture: {error}")))?;
+
+        let mut request = fixture_fields(
+            &request_keys(),
+            &["schema_version", "test_id", "com2_prelude_length"],
+        );
+        set_fields(
+            &mut request,
+            [
+                ("kind", REQUEST_KIND),
+                ("schema_version", "1"),
+                ("selector", SELECTOR),
+                ("test_id", TEST_ID),
+                ("profile", "wyr1e7-selector33"),
+                ("scenario", "interactive-wyrmsh"),
+                ("evidence_protocol", EVIDENCE_PROTOCOL),
+                ("full_evidence", "true"),
+                ("acceptance_claim", "full-selector33-interactive-wyrmsh"),
+                ("terminal_line", "DWTEST1 33 0"),
+                ("com2_prelude_kind", COM2_PRELUDE_KIND),
+                ("com2_prelude_length", COM2_PRELUDE_LENGTH),
+                ("com2_prelude_sha256", COM2_PRELUDE_SHA256),
+                ("deepwyrm_revision", "11"),
+                ("generated_abi_revision", "22"),
+                ("generated_abi_tree", "33"),
+                ("wyrmroot_revision", "44"),
+                ("rust_revision", "55"),
+                ("e6_wyrmroot_revision", ACCEPTED_E6_REVISION),
+                (
+                    "e6_source_receipt_sha256",
+                    ACCEPTED_E6_SOURCE_RECEIPT_SHA256,
+                ),
+                (
+                    "e6_freeze_receipt_sha256",
+                    ACCEPTED_E6_FREEZE_RECEIPT_SHA256,
+                ),
+                ("evidence_nonce", "0123456789ABCDEF"),
+                ("default_handoff", "default/handoff.toml"),
+                ("smp_handoff", "smp/handoff.toml"),
+                ("profile_pair", "profile-pair.toml"),
+                ("receipt", "freeze-receipt.toml"),
+                ("source_receipt", "artifacts/e7-source-build.toml"),
+                ("esp", "artifacts/selector33-esp.img"),
+                ("result_schema", "result-schema.toml"),
+            ],
+        );
+        for (key, name) in ARTIFACTS {
+            let bytes = if *key == "malformed_elf" {
+                b"WYR1-E7 malformed ELF\n".to_vec()
+            } else {
+                format!("fixture {name}\n").into_bytes()
+            };
+            wyr1c6::write_new(&root.join("artifacts").join(name), &bytes, key)?;
+            request.insert((*key).to_owned(), format!("artifacts/{name}"));
+            request.insert(format!("{key}_sha256"), sha256::bytes_digest(&bytes));
+        }
+        for (name, key, bytes) in [
+            (
+                "e6-source-build.toml",
+                "e6_source_receipt_sha256",
+                b"fixture E6 source\n".as_slice(),
+            ),
+            (
+                "e6-freeze-receipt.toml",
+                "e6_freeze_receipt_sha256",
+                b"fixture E6 freeze\n".as_slice(),
+            ),
+            (
+                SOURCE_RECEIPT,
+                "source_receipt_sha256",
+                b"fixture E7 source\n".as_slice(),
+            ),
+            (
+                "selector33-esp.img",
+                "esp_sha256",
+                b"fixture ESP\n".as_slice(),
+            ),
+        ] {
+            wyr1c6::write_new(
+                &root.join("artifacts").join(name),
+                bytes,
+                "WYR1-E7 fixture input",
+            )?;
+            request.insert(key.to_owned(), sha256::bytes_digest(bytes));
+        }
+        let request_text = render_request(&request)?;
+        wyr1c6::write_new(
+            &root.join("request.toml"),
+            request_text.as_bytes(),
+            "WYR1-E7 fixture request",
+        )?;
+        let request_hash = sha256::bytes_digest(request_text.as_bytes());
+        wyr1c6::write_new(
+            &root.join("result-schema.toml"),
+            render_result_schema()?.as_bytes(),
+            "WYR1-E7 fixture result schema",
+        )?;
+        for (profile, vcpus) in [("default", 1_u8), ("smp", 4_u8)] {
+            stage_profile(&root, profile, vcpus, &request_hash, &request)?;
+        }
+        write_pair(&root, &request_hash)?;
+        wyr1c6::write_new(
+            &root.join("freeze-receipt.toml"),
+            render_freeze_receipt(&request_hash, &request)?.as_bytes(),
+            "WYR1-E7 fixture freeze receipt",
+        )?;
+        Ok(PreparedFixture {
+            root,
+            request,
+            request_hash,
+        })
+    }
+
+    fn rewrite_frozen(path: &Path, bytes: &[u8], mode: u32) -> Result<(), Failure> {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .and_then(|()| fs::write(path, bytes))
+            .and_then(|()| fs::set_permissions(path, fs::Permissions::from_mode(mode)))
+            .map_err(|error| Failure::task(format!("could not mutate E7 fixture: {error}")))
+    }
+
+    fn rewrite_control_graph(
+        root: &Path,
+        request: &BTreeMap<String, String>,
+    ) -> Result<String, Failure> {
+        let request_text = render_request(request)?;
+        rewrite_frozen(&root.join("request.toml"), request_text.as_bytes(), 0o444)?;
+        let request_hash = sha256::bytes_digest(request_text.as_bytes());
+        let vars = wyr1c6::read_regular_bounded(
+            &root.join(value(request, "ovmf_vars")?),
+            wyr1c6::MAX_FIRMWARE_BYTES,
+            "WYR1-E7 fixture OVMF vars",
+        )?;
+        for (profile, vcpus) in [("default", 1_u8), ("smp", 4_u8)] {
+            let xml = expected_profile_xml(root, profile, vcpus, request)?;
+            let fields =
+                expected_handoff_fields(profile, vcpus, &request_hash, request, &xml, &vars)?;
+            rewrite_frozen(
+                &root.join(profile).join("handoff.toml"),
+                render_handoff(&fields, &handoff_keys())?.as_bytes(),
+                0o444,
+            )?;
+        }
+        rewrite_frozen(
+            &root.join("profile-pair.toml"),
+            render_pair(&expected_pair_fields(root, &request_hash)?)?.as_bytes(),
+            0o444,
+        )?;
+        rewrite_frozen(
+            &root.join("freeze-receipt.toml"),
+            render_freeze_receipt(&request_hash, request)?.as_bytes(),
+            0o444,
+        )?;
+        Ok(request_hash)
+    }
+
+    fn assert_metadata_rejected(fixture: &PreparedFixture, expected: &str) {
+        let error = validate_frozen_output(&fixture.root, &fixture.request, &fixture.request_hash)
+            .expect_err("mutated prepared output must be rejected");
+        assert!(error.message.contains(expected), "{:?}", error);
+    }
 
     fn fixture_fields(keys: &[String], integers: &[&str]) -> BTreeMap<String, String> {
         keys.iter()
@@ -1831,6 +2351,153 @@ module._strict_c6_toml(sys.stdin.buffer.read(), keys, "Rust-rendered E7 fixture"
         ] {
             root_verifier_accepts_schema(schema, &text)?;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_inspector_rejoins_every_rendered_metadata_edge() -> Result<(), Failure> {
+        let fixture = prepared_fixture("metadata")?;
+        validate_frozen_output(&fixture.root, &fixture.request, &fixture.request_hash)?;
+        for (relative, expected) in [
+            ("artifacts/e7-source-build.toml", "source receipt identity"),
+            ("default/handoff.toml", "default handoff drifted"),
+            ("profile-pair.toml", "profile pair drifted"),
+            ("result-schema.toml", "result schema drifted"),
+            ("freeze-receipt.toml", "freeze receipt drifted"),
+        ] {
+            let path = fixture.root.join(relative);
+            let original = fs::read(&path).map_err(|error| {
+                Failure::task(format!("could not read E7 fixture metadata: {error}"))
+            })?;
+            let mut mutated = original.clone();
+            mutated.push(b'x');
+            rewrite_frozen(&path, &mutated, 0o444)?;
+            assert_metadata_rejected(&fixture, expected);
+            rewrite_frozen(&path, &original, 0o444)?;
+            validate_frozen_output(&fixture.root, &fixture.request, &fixture.request_hash)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn correlated_source_hash_rewrite_cannot_replace_actual_source_bytes() -> Result<(), Failure> {
+        let fixture = prepared_fixture("source-join")?;
+        let mut request = fixture.request.clone();
+        request.insert("source_receipt_sha256".to_owned(), "ab".repeat(32));
+        let request_hash = rewrite_control_graph(&fixture.root, &request)?;
+        let error = validate_frozen_output(&fixture.root, &request, &request_hash)
+            .expect_err("correlated source-hash rewrite must be rejected");
+        assert!(
+            error.message.contains("source receipt identity"),
+            "{:?}",
+            error
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_inspector_checks_esp_bytes_modes_and_exact_layout() -> Result<(), Failure> {
+        let fixture = prepared_fixture("layout")?;
+        let esp = fixture.root.join("artifacts/selector33-esp.img");
+        rewrite_frozen(&esp, b"changed ESP\n", 0o444)?;
+        assert_metadata_rejected(&fixture, "ESP identity drifted");
+
+        rewrite_frozen(&esp, b"fixture ESP\n", 0o444)?;
+        fs::set_permissions(
+            fixture.root.join("request.toml"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .map_err(|error| Failure::task(format!("could not change fixture mode: {error}")))?;
+        assert_metadata_rejected(&fixture, "request mode drifted");
+        fs::set_permissions(
+            fixture.root.join("request.toml"),
+            fs::Permissions::from_mode(0o444),
+        )
+        .map_err(|error| Failure::task(format!("could not restore fixture mode: {error}")))?;
+
+        fs::write(fixture.root.join("unexpected"), b"unexpected")
+            .map_err(|error| Failure::task(format!("could not add fixture entry: {error}")))?;
+        assert_metadata_rejected(&fixture, "entry set drifted");
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_inspector_distinguishes_consumed_runtime_state() -> Result<(), Failure> {
+        let fixture = prepared_fixture("consumed")?;
+        let vars = fixture.root.join("default/OVMF_VARS.mutable.fd");
+        let original = fs::read(&vars)
+            .map_err(|error| Failure::task(format!("could not read fixture vars: {error}")))?;
+        rewrite_frozen(&vars, b"consumed vars\n", 0o600)?;
+        assert_metadata_rejected(&fixture, "consumed/runtime state");
+        rewrite_frozen(&vars, &original, 0o600)?;
+        validate_frozen_output(&fixture.root, &fixture.request, &fixture.request_hash)?;
+
+        fs::write(
+            fixture.root.join("default/verification-manifest.json"),
+            b"{}\n",
+        )
+        .map_err(|error| Failure::task(format!("could not mark fixture consumed: {error}")))?;
+        assert_metadata_rejected(&fixture, "consumed/runtime state");
+        Ok(())
+    }
+
+    #[test]
+    fn request_contract_freezes_localities_and_reused_e6_identities() -> Result<(), Failure> {
+        let fixture = prepared_fixture("request")?;
+        let mut request = fixture.request.clone();
+        for key in [
+            "deepwyrm_revision",
+            "generated_abi_revision",
+            "generated_abi_tree",
+            "wyrmroot_revision",
+            "rust_revision",
+        ] {
+            request.insert(key.to_owned(), "12".repeat(20));
+        }
+        for (key, digest) in ACCEPTED_E6_REUSED_SHA256 {
+            request.insert(format!("{key}_sha256"), (*digest).to_owned());
+        }
+        request.insert(
+            "e6_source_receipt_sha256".to_owned(),
+            ACCEPTED_E6_SOURCE_RECEIPT_SHA256.to_owned(),
+        );
+        request.insert(
+            "e6_freeze_receipt_sha256".to_owned(),
+            ACCEPTED_E6_FREEZE_RECEIPT_SHA256.to_owned(),
+        );
+        validate_request_contract(&request)?;
+
+        request.insert("esp".to_owned(), "default/selector33-esp.img".to_owned());
+        assert!(
+            validate_request_contract(&request)
+                .expect_err("moved ESP must be rejected")
+                .message
+                .contains("changed esp")
+        );
+        request.insert("esp".to_owned(), "artifacts/selector33-esp.img".to_owned());
+        request.insert("wyrmsh_sha256".to_owned(), "ab".repeat(32));
+        assert!(
+            validate_request_contract(&request)
+                .expect_err("changed inherited shell must be rejected")
+                .message
+                .contains("accepted E6 product")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn actual_esp_parser_rejects_a_hash_consistent_non_image() -> Result<(), Failure> {
+        let fixture = prepared_fixture("esp-parser")?;
+        let mut request = fixture.request.clone();
+        let esp = fixture.root.join("artifacts/selector33-esp.img");
+        rewrite_frozen(&esp, b"replacement ESP\n", 0o444)?;
+        request.insert(
+            "esp_sha256".to_owned(),
+            sha256::bytes_digest(b"replacement ESP\n"),
+        );
+        let request_hash = rewrite_control_graph(&fixture.root, &request)?;
+        validate_frozen_output(&fixture.root, &request, &request_hash)?;
+        assert!(validate_esp_contents(&fixture.root, &request).is_err());
         Ok(())
     }
 
