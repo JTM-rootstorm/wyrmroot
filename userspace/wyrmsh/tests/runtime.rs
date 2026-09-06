@@ -35,6 +35,8 @@ use wyrmroot_stream_proto::{MAX_PAYLOAD_BYTES, MAX_RECORD_BYTES, decode_data, en
 use wyrmroot_wyrmsh::{EndpointRole, ShellError, WyrmshSystem, run_wyrmsh};
 use wyrmroot_wyrmsh_core::COMMANDS;
 
+mod e8_adversarial;
+
 const BASE: u64 = 0x40_0000;
 const BOOTSTRAP: DwHandle = DwHandle(11);
 const STDIN: DwHandle = DwHandle(80);
