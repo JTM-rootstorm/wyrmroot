@@ -57,10 +57,14 @@ const WYR1C6_TEST_EVIDENCE_SYSCALL: DwSyscallId = DwSyscallId(0xffff_ff1e);
 const WYR1D_TEST_EVIDENCE_SYSCALL: DwSyscallId = DwSyscallId(0xffff_ff20);
 #[cfg(feature = "wyr1e7-test-evidence")]
 const WYR1E7_TEST_EVIDENCE_SYSCALL: DwSyscallId = DwSyscallId(0xffff_ff21);
+#[cfg(feature = "wyr1e8-test-evidence")]
+const WYR1E8_TEST_EVIDENCE_SYSCALL: DwSyscallId = DwSyscallId(0xffff_ff21);
 #[cfg(feature = "wyr1c6-test-evidence")]
 pub const WYR1C6_EVIDENCE_RECORD_BYTES: usize = 113;
 #[cfg(feature = "wyr1e7-test-evidence")]
 pub const WYR1E7_EVIDENCE_RECORD_BYTES: usize = 192;
+#[cfg(feature = "wyr1e8-test-evidence")]
+pub const WYR1E8_EVIDENCE_RECORD_BYTES: usize = 192;
 
 /// Submit one selector-33 WRE1 record from permanent system-init.
 #[cfg(feature = "wyr1e7-test-evidence")]
@@ -72,6 +76,24 @@ pub fn submit_wyr1e7_evidence(
         [
             record.as_ptr() as u64,
             WYR1E7_EVIDENCE_RECORD_BYTES as u64,
+            0,
+            0,
+            0,
+            0,
+        ],
+    ))
+}
+
+/// Submit one additive selector-33 WRE1 v1.1 record from permanent system-init.
+#[cfg(feature = "wyr1e8-test-evidence")]
+pub fn submit_wyr1e8_evidence(
+    record: &[u8; WYR1E8_EVIDENCE_RECORD_BYTES],
+) -> Result<(), NativeError> {
+    require_success(raw::call(
+        WYR1E8_TEST_EVIDENCE_SYSCALL,
+        [
+            record.as_ptr() as u64,
+            WYR1E8_EVIDENCE_RECORD_BYTES as u64,
             0,
             0,
             0,

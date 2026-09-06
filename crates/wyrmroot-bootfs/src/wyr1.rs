@@ -31,6 +31,8 @@ pub const CPU_HOG_PATH: &str = "bin/cpu-hog";
 pub const E7_EXIT_NONZERO_PATH: &str = "test/wyr1-e/exit-nonzero";
 pub const E7_FAULT_PATH: &str = "test/wyr1-e/fault";
 pub const E7_MALFORMED_ELF_PATH: &str = "test/wyr1-e/malformed-elf";
+pub const E8_RECOVERY_TRIGGER_PATH: &str = "test/wyr1-e/recovery-trigger";
+pub const E8_STDOUT_PRESSURE_PATH: &str = "test/wyr1-e/stdout-pressure";
 pub const E7_MALFORMED_ELF: &[u8] = b"WYR1-E7 malformed ELF\n";
 pub const RRC_MANIFEST_PATH: &str = "system/bootstrap/rrc-a-v1";
 pub const GATE_CONFIG_PATH: &str = "system/bootstrap/wyr1-a-gate-v1";
@@ -646,6 +648,184 @@ fn validate_e7_product(product: ProductE7<'_>) -> Result<(), BuildError> {
     Ok(())
 }
 
+/// Additive selector-33 WYR1-E8 product. The E7 grammar and product type stay
+/// frozen; E8 carries its own eight-entry policy and two additional actors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProductE8<'a> {
+    pub base: ProductC1<'a>,
+    pub launch_policy: &'a [u8],
+    pub hello: &'a [u8],
+    pub cpu_hog: &'a [u8],
+    pub exit_nonzero: &'a [u8],
+    pub fault: &'a [u8],
+    pub malformed_elf: &'a [u8],
+    pub recovery_trigger: &'a [u8],
+    pub stdout_pressure: &'a [u8],
+    pub expected_wyrmsh_identity: [u8; 32],
+    pub expected_hello_identity: [u8; 32],
+    pub expected_cpu_hog_identity: [u8; 32],
+    pub expected_exit_nonzero_identity: [u8; 32],
+    pub expected_fault_identity: [u8; 32],
+    pub expected_malformed_elf_identity: [u8; 32],
+    pub expected_recovery_trigger_identity: [u8; 32],
+    pub expected_stdout_pressure_identity: [u8; 32],
+}
+
+impl<'a> ProductE8<'a> {
+    /// The exact E7 archive shape plus the recovery trigger and stdout-pressure
+    /// executables admitted only by the additive E8 policy.
+    pub fn artifacts(self) -> [Artifact<'a>; 18] {
+        let base = self.base.artifacts();
+        [
+            base[0],
+            base[1],
+            base[2],
+            base[3],
+            base[4],
+            base[5],
+            base[6],
+            base[7],
+            base[8],
+            base[9],
+            Artifact::read_only(LAUNCH_POLICY_PATH, self.launch_policy),
+            Artifact::executable(HELLO_PATH, self.hello),
+            Artifact::executable(CPU_HOG_PATH, self.cpu_hog),
+            Artifact::executable(E7_EXIT_NONZERO_PATH, self.exit_nonzero),
+            Artifact::executable(E7_FAULT_PATH, self.fault),
+            Artifact::executable(E7_MALFORMED_ELF_PATH, self.malformed_elf),
+            Artifact::executable(E8_RECOVERY_TRIGGER_PATH, self.recovery_trigger),
+            Artifact::executable(E8_STDOUT_PRESSURE_PATH, self.stdout_pressure),
+        ]
+    }
+}
+
+/// Builds the deterministic E8 archive after validating its exact eight-entry
+/// WRJP 1.1 policy and all inherited and current fixture identities.
+pub fn build_e8(product: ProductE8<'_>) -> Result<Vec<u8>, BuildError> {
+    validate_e8_product(product)?;
+    let mut builder = Builder::new();
+    for artifact in product.artifacts() {
+        if artifact.bytes.is_empty() {
+            return Err(BuildError::EmptyArtifact);
+        }
+        builder.add(
+            artifact.path.as_bytes(),
+            artifact.bytes,
+            if artifact.executable {
+                FileMode::Executable
+            } else {
+                FileMode::ReadOnly
+            },
+        )?;
+    }
+    builder.build()
+}
+
+fn validate_e8_product(product: ProductE8<'_>) -> Result<(), BuildError> {
+    validate_c1_product(product.base)?;
+    if product.launch_policy.is_empty()
+        || product.hello.is_empty()
+        || product.cpu_hog.is_empty()
+        || product.exit_nonzero.is_empty()
+        || product.fault.is_empty()
+        || product.recovery_trigger.is_empty()
+        || product.stdout_pressure.is_empty()
+    {
+        return Err(BuildError::EmptyArtifact);
+    }
+    if product.malformed_elf != E7_MALFORMED_ELF {
+        return Err(BuildError::InvalidE8MalformedElf);
+    }
+    let expected = [
+        product.expected_wyrmsh_identity,
+        product.expected_hello_identity,
+        product.expected_cpu_hog_identity,
+        product.expected_exit_nonzero_identity,
+        product.expected_fault_identity,
+        product.expected_malformed_elf_identity,
+        product.expected_recovery_trigger_identity,
+        product.expected_stdout_pressure_identity,
+    ];
+    if expected.contains(&[0; 32]) {
+        return Err(BuildError::E8ArtifactIdentityMismatch);
+    }
+    let policy = LaunchPolicy::parse(product.launch_policy)
+        .map_err(|_| BuildError::InvalidE8LaunchPolicy)?;
+    if policy.version_minor() != 1 || policy.len() != 8 {
+        return Err(BuildError::InvalidE8LaunchPolicy);
+    }
+    let entries = [
+        (
+            POLICY_WYRMSH_PATH,
+            product.expected_wyrmsh_identity,
+            WYRMSH_PROFILE_ID,
+            false,
+            true,
+        ),
+        (
+            HELLO_PATH,
+            product.expected_hello_identity,
+            JOB_V2_PROFILE_ID,
+            false,
+            true,
+        ),
+        (
+            CPU_HOG_PATH,
+            product.expected_cpu_hog_identity,
+            JOB_V2_PROFILE_ID,
+            true,
+            false,
+        ),
+        (
+            E7_EXIT_NONZERO_PATH,
+            product.expected_exit_nonzero_identity,
+            JOB_V2_PROFILE_ID,
+            false,
+            true,
+        ),
+        (
+            E7_FAULT_PATH,
+            product.expected_fault_identity,
+            JOB_V2_PROFILE_ID,
+            false,
+            true,
+        ),
+        (
+            E7_MALFORMED_ELF_PATH,
+            product.expected_malformed_elf_identity,
+            JOB_V2_PROFILE_ID,
+            false,
+            true,
+        ),
+        (
+            E8_RECOVERY_TRIGGER_PATH,
+            product.expected_recovery_trigger_identity,
+            JOB_V2_PROFILE_ID,
+            false,
+            true,
+        ),
+        (
+            E8_STDOUT_PRESSURE_PATH,
+            product.expected_stdout_pressure_identity,
+            JOB_V2_PROFILE_ID,
+            false,
+            true,
+        ),
+    ];
+    for (path, identity, profile, no_streams, three_streams) in entries {
+        let entry = policy.find(path).ok_or(BuildError::InvalidE8LaunchPolicy)?;
+        if entry.startup_abi != 2
+            || entry.profile_id != profile
+            || entry.allow_no_streams != no_streams
+            || entry.allow_three_streams != three_streams
+            || entry.content_sha256 != identity
+        {
+            return Err(BuildError::E8ArtifactIdentityMismatch);
+        }
+    }
+    Ok(())
+}
+
 fn validate_c1_product(product: ProductC1<'_>) -> Result<(), BuildError> {
     if product.marker != WYR1_C1_MARKER {
         return Err(BuildError::WrongC1Marker);
@@ -811,6 +991,79 @@ mod tests {
         ];
         let mut output = vec![0; 1024];
         let used = encode_wyrmsh([0x73; 32], &entries, &mut output).unwrap();
+        output.truncate(used);
+        output
+    }
+
+    fn e8_policy(identities: [[u8; 32]; 8]) -> Vec<u8> {
+        let entries = [
+            LaunchPolicyEntry {
+                path: CPU_HOG_PATH,
+                content_sha256: identities[2],
+                startup_abi: 2,
+                profile_id: JOB_V2_PROFILE_ID,
+                allow_no_streams: true,
+                allow_three_streams: false,
+            },
+            LaunchPolicyEntry {
+                path: HELLO_PATH,
+                content_sha256: identities[1],
+                startup_abi: 2,
+                profile_id: JOB_V2_PROFILE_ID,
+                allow_no_streams: false,
+                allow_three_streams: true,
+            },
+            LaunchPolicyEntry {
+                path: WYRMSH_PATH,
+                content_sha256: identities[0],
+                startup_abi: 2,
+                profile_id: WYRMSH_PROFILE_ID,
+                allow_no_streams: false,
+                allow_three_streams: true,
+            },
+            LaunchPolicyEntry {
+                path: E7_EXIT_NONZERO_PATH,
+                content_sha256: identities[3],
+                startup_abi: 2,
+                profile_id: JOB_V2_PROFILE_ID,
+                allow_no_streams: false,
+                allow_three_streams: true,
+            },
+            LaunchPolicyEntry {
+                path: E7_FAULT_PATH,
+                content_sha256: identities[4],
+                startup_abi: 2,
+                profile_id: JOB_V2_PROFILE_ID,
+                allow_no_streams: false,
+                allow_three_streams: true,
+            },
+            LaunchPolicyEntry {
+                path: E7_MALFORMED_ELF_PATH,
+                content_sha256: identities[5],
+                startup_abi: 2,
+                profile_id: JOB_V2_PROFILE_ID,
+                allow_no_streams: false,
+                allow_three_streams: true,
+            },
+            LaunchPolicyEntry {
+                path: E8_RECOVERY_TRIGGER_PATH,
+                content_sha256: identities[6],
+                startup_abi: 2,
+                profile_id: JOB_V2_PROFILE_ID,
+                allow_no_streams: false,
+                allow_three_streams: true,
+            },
+            LaunchPolicyEntry {
+                path: E8_STDOUT_PRESSURE_PATH,
+                content_sha256: identities[7],
+                startup_abi: 2,
+                profile_id: JOB_V2_PROFILE_ID,
+                allow_no_streams: false,
+                allow_three_streams: true,
+            },
+        ];
+        let mut output = vec![0; 1536];
+        let used = encode_wyrmsh([0x84; 32], &entries, &mut output).unwrap();
         output.truncate(used);
         output
     }
@@ -1232,6 +1485,120 @@ mod tests {
                 ..product
             }),
             Err(BuildError::InvalidE7LaunchPolicy)
+        );
+    }
+
+    #[test]
+    fn wyr1_e8_is_additive_and_keeps_the_e7_product_exact() {
+        let identities = [
+            [0x81; 32], [0x82; 32], [0x83; 32], [0x84; 32], [0x85; 32], [0x86; 32], [0x87; 32],
+            [0x88; 32],
+        ];
+        let device_manifest = canonical_wrdm(UART_IDENTITY);
+        let policy = e8_policy(identities);
+        let product = ProductE8 {
+            base: c1_product(WYR1_C1_MARKER, &device_manifest, UART_IDENTITY),
+            launch_policy: &policy,
+            hello: b"hello-elf",
+            cpu_hog: b"cpu-hog-elf",
+            exit_nonzero: b"exit-nonzero-elf",
+            fault: b"fault-elf",
+            malformed_elf: E7_MALFORMED_ELF,
+            recovery_trigger: b"recovery-trigger-elf",
+            stdout_pressure: b"stdout-pressure-elf",
+            expected_wyrmsh_identity: identities[0],
+            expected_hello_identity: identities[1],
+            expected_cpu_hog_identity: identities[2],
+            expected_exit_nonzero_identity: identities[3],
+            expected_fault_identity: identities[4],
+            expected_malformed_elf_identity: identities[5],
+            expected_recovery_trigger_identity: identities[6],
+            expected_stdout_pressure_identity: identities[7],
+        };
+        let first = build_e8(product).unwrap();
+        assert_eq!(first, build_e8(product).unwrap());
+        let archive = Archive::new(&first).unwrap();
+        assert_eq!(archive.entries().count(), 18);
+        for path in [E8_RECOVERY_TRIGGER_PATH, E8_STDOUT_PRESSURE_PATH] {
+            assert!(archive.lookup(path.as_bytes()).unwrap().is_executable());
+        }
+        assert_eq!(LaunchPolicy::parse(&policy).unwrap().len(), 8);
+
+        let e7_identities: [[u8; 32]; 6] = identities[..6].try_into().unwrap();
+        let e7_policy = e7_policy(e7_identities);
+        let e7 = build_e7(ProductE7 {
+            base: c1_product(WYR1_C1_MARKER, &device_manifest, UART_IDENTITY),
+            launch_policy: &e7_policy,
+            hello: b"hello-elf",
+            cpu_hog: b"cpu-hog-elf",
+            exit_nonzero: b"exit-nonzero-elf",
+            fault: b"fault-elf",
+            malformed_elf: E7_MALFORMED_ELF,
+            expected_wyrmsh_identity: identities[0],
+            expected_hello_identity: identities[1],
+            expected_cpu_hog_identity: identities[2],
+            expected_exit_nonzero_identity: identities[3],
+            expected_fault_identity: identities[4],
+            expected_malformed_elf_identity: identities[5],
+        })
+        .unwrap();
+        assert_eq!(Archive::new(&e7).unwrap().entries().count(), 16);
+        assert!(
+            Archive::new(&e7)
+                .unwrap()
+                .lookup(E8_RECOVERY_TRIGGER_PATH.as_bytes())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn wyr1_e8_rejects_policy_identity_and_fixture_substitution() {
+        let identities = [
+            [0x81; 32], [0x82; 32], [0x83; 32], [0x84; 32], [0x85; 32], [0x86; 32], [0x87; 32],
+            [0x88; 32],
+        ];
+        let device_manifest = canonical_wrdm(UART_IDENTITY);
+        let policy = e8_policy(identities);
+        let product = ProductE8 {
+            base: c1_product(WYR1_C1_MARKER, &device_manifest, UART_IDENTITY),
+            launch_policy: &policy,
+            hello: b"hello-elf",
+            cpu_hog: b"cpu-hog-elf",
+            exit_nonzero: b"exit-nonzero-elf",
+            fault: b"fault-elf",
+            malformed_elf: E7_MALFORMED_ELF,
+            recovery_trigger: b"recovery-trigger-elf",
+            stdout_pressure: b"stdout-pressure-elf",
+            expected_wyrmsh_identity: identities[0],
+            expected_hello_identity: identities[1],
+            expected_cpu_hog_identity: identities[2],
+            expected_exit_nonzero_identity: identities[3],
+            expected_fault_identity: identities[4],
+            expected_malformed_elf_identity: identities[5],
+            expected_recovery_trigger_identity: identities[6],
+            expected_stdout_pressure_identity: identities[7],
+        };
+        assert_eq!(
+            build_e8(ProductE8 {
+                malformed_elf: b"WYR1-E7 malformed ELF",
+                ..product
+            }),
+            Err(BuildError::InvalidE8MalformedElf)
+        );
+        assert_eq!(
+            build_e8(ProductE8 {
+                expected_recovery_trigger_identity: [0; 32],
+                ..product
+            }),
+            Err(BuildError::E8ArtifactIdentityMismatch)
+        );
+        let wrong_policy = e7_policy(identities[..6].try_into().unwrap());
+        assert_eq!(
+            build_e8(ProductE8 {
+                launch_policy: &wrong_policy,
+                ..product
+            }),
+            Err(BuildError::InvalidE8LaunchPolicy)
         );
     }
 }

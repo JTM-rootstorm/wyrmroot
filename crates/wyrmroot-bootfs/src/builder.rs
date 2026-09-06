@@ -142,6 +142,14 @@ pub enum BuildError {
     E7ArtifactIdentityMismatch,
     /// The selector-33 malformed-ELF fixture was not the frozen byte string.
     InvalidE7MalformedElf,
+    /// The additive E8 launch policy was malformed or did not contain exactly
+    /// the eight admitted production and selector records.
+    InvalidE8LaunchPolicy,
+    /// An E8 inherited or current artifact identity did not match its policy
+    /// entry.
+    E8ArtifactIdentityMismatch,
+    /// The inherited malformed-ELF fixture changed in the additive E8 product.
+    InvalidE8MalformedElf,
 }
 
 /// The only regular-file metadata forms permitted in a WYR0 bootfs archive.

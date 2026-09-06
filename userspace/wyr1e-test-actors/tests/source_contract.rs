@@ -13,9 +13,13 @@ fn binaries_use_canonical_linker_and_exact_paths() {
     assert!(build.contains("../../toolchain/native-user.ld"));
     assert!(build.contains("wyrmroot-wyr1e-exit-nonzero"));
     assert!(build.contains("wyrmroot-wyr1e-fault"));
+    assert!(build.contains("wyrmroot-recovery-trigger"));
+    assert!(build.contains("wyrmroot-stdout-pressure"));
     let library = fs::read_to_string(root.join("src/lib.rs")).unwrap();
     assert!(library.contains("test/wyr1-e/exit-nonzero"));
     assert!(library.contains("test/wyr1-e/fault"));
+    assert!(library.contains("test/wyr1-e/recovery-trigger"));
+    assert!(library.contains("test/wyr1-e/stdout-pressure"));
     assert!(library.contains("LaunchProfile::JobV2Streams"));
 }
 
@@ -35,7 +39,13 @@ fn fault_instruction_is_narrow_and_other_actor_sources_forbid_unsafe() {
 #[test]
 fn actors_have_no_privileged_or_test_evidence_calls() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    for path in ["src/lib.rs", "src/bin/exit_nonzero.rs", "src/bin/fault.rs"] {
+    for path in [
+        "src/lib.rs",
+        "src/bin/exit_nonzero.rs",
+        "src/bin/fault.rs",
+        "src/bin/recovery_trigger.rs",
+        "src/bin/stdout_pressure.rs",
+    ] {
         let source = fs::read_to_string(root.join(path)).unwrap();
         for forbidden in [
             "submit_",

@@ -34,6 +34,12 @@ Usage:
     tools/pinned-cargo xtask test host wyr1e7-model
     tools/pinned-cargo xtask test host wyr1e7-clippy
     tools/pinned-cargo xtask test host wyr1e7-native
+    tools/pinned-cargo xtask test host wyr1e8-model
+    tools/pinned-cargo xtask test host wyr1e8-clippy
+    tools/pinned-cargo xtask test host wyr1e8-native
+    tools/pinned-cargo xtask test host wyr1e8-actors-native
+    tools/pinned-cargo xtask test host wyr1e8-product-model
+    tools/pinned-cargo xtask test host wyr1e8-product-clippy
     cargo xtask test guest [filter]
     cargo xtask test integration wyr0 [default|smp] --request <wyr0-h-request.toml>
     tools/pinned-cargo xtask wyr1 image --request <wyr1-a-request.toml>
@@ -50,6 +56,8 @@ Usage:
     tools/pinned-cargo xtask wyr1e6 inspect --product <directory>
     tools/pinned-cargo xtask wyr1e7 prepare --output <fresh-directory> --e6-product <directory> --deep-repository <path> --deep-revision <40-hex> --evidence-nonce <16-hex>
     tools/pinned-cargo xtask wyr1e7 inspect --product <directory>
+    tools/pinned-cargo xtask wyr1e8 prepare --output <fresh-directory> --e6-product <directory> --deep-repository <path> --deep-revision <40-hex> --evidence-nonce <16-hex>
+    tools/pinned-cargo xtask wyr1e8 inspect --product <directory>
     tools/pinned-cargo xtask wyr1c2 freeze --output <fresh-directory>
     tools/pinned-cargo xtask wyr1c2 image --request <wyr1-c2-request.toml>
     tools/pinned-cargo xtask wyr1c2 inspect --request <wyr1-c2-request.toml>
@@ -88,6 +96,10 @@ wyr1e6-controller-model/clippy runs the selected resident init/devmgr features;
 wyr1e6-native compiles the exact normal product matrix plus selector-32 regressions.
 WYR1-E7 model/clippy covers the selected observer, current devmgr, fixtures, and product builder;
 wyr1e7-native compiles exactly the selected init, current devmgr, current stream hello, and three fixture actors.
+WYR1-E8 model/clippy covers the current recovery services, two additive actors, typed bootfs, and product builder;
+wyr1e8-native compiles that exact selected E8 native artifact set.
+wyr1e8-actors-native compiles and inspects only the two product-owned E8 actors.
+wyr1e8-product-model and wyr1e8-product-clippy validate product-owned E8 host code.
 These E3-E7 filters do not create a product or run a guest.
 
 The WYR0-H request path builds and inspects the exact init0/hello bootfs and
@@ -187,6 +199,14 @@ pub(crate) enum Action {
         evidence_nonce: String,
     },
     Wyr1E7Inspect(String),
+    Wyr1E8Prepare {
+        output: String,
+        e6_product: String,
+        deep_repository: String,
+        deep_revision: String,
+        evidence_nonce: String,
+    },
+    Wyr1E8Inspect(String),
     Wyr1C2Freeze(String),
     Wyr1C2Image(String),
     Wyr1C2Inspect(String),
@@ -309,6 +329,7 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
         "wyr1c1" => dispatch_wyr1c1(&arguments[1..]),
         "wyr1e6" => dispatch_wyr1e6(&arguments[1..]),
         "wyr1e7" => dispatch_wyr1e7(&arguments[1..]),
+        "wyr1e8" => dispatch_wyr1e8(&arguments[1..]),
         "wyr1c2" => dispatch_wyr1c2(&arguments[1..]),
         "wyr1c6" => dispatch_wyr1c6(&arguments[1..]),
         "dw1b" => dispatch_dw1b(&arguments[1..]),
@@ -549,6 +570,44 @@ fn dispatch_wyr1e7(arguments: &[String]) -> Result<Action, Failure> {
         }
         _ => Err(Failure::usage(
             "wyr1e7 requires prepare --output <fresh-directory> --e6-product <directory> --deep-repository <path> --deep-revision <40-hex> --evidence-nonce <16-hex> or inspect --product <directory>",
+        )),
+    }
+}
+
+fn dispatch_wyr1e8(arguments: &[String]) -> Result<Action, Failure> {
+    match arguments {
+        [
+            command,
+            output_flag,
+            output,
+            e6_flag,
+            e6_product,
+            deep_flag,
+            deep_repository,
+            revision_flag,
+            deep_revision,
+            nonce_flag,
+            evidence_nonce,
+        ] if command == "prepare"
+            && output_flag == "--output"
+            && e6_flag == "--e6-product"
+            && deep_flag == "--deep-repository"
+            && revision_flag == "--deep-revision"
+            && nonce_flag == "--evidence-nonce" =>
+        {
+            Ok(Action::Wyr1E8Prepare {
+                output: output.clone(),
+                e6_product: e6_product.clone(),
+                deep_repository: deep_repository.clone(),
+                deep_revision: deep_revision.clone(),
+                evidence_nonce: evidence_nonce.clone(),
+            })
+        }
+        [command, flag, product] if command == "inspect" && flag == "--product" => {
+            Ok(Action::Wyr1E8Inspect(product.clone()))
+        }
+        _ => Err(Failure::usage(
+            "wyr1e8 requires prepare --output <fresh-directory> --e6-product <directory> --deep-repository <path> --deep-revision <40-hex> --evidence-nonce <16-hex> or inspect --product <directory>",
         )),
     }
 }
@@ -1309,6 +1368,38 @@ mod tests {
             Ok(Action::Wyr1E7Inspect("e7".into()))
         );
         assert!(dispatch(&arguments(&["wyr1e7", "run", "--product", "e7"])).is_err());
+    }
+
+    #[test]
+    fn wyr1e8_dispatch_is_additive_and_keeps_execution_in_the_root_runner() {
+        assert_eq!(
+            dispatch(&arguments(&[
+                "wyr1e8",
+                "prepare",
+                "--output",
+                "e8",
+                "--e6-product",
+                "e6",
+                "--deep-repository",
+                "deep",
+                "--deep-revision",
+                "1",
+                "--evidence-nonce",
+                "A",
+            ])),
+            Ok(Action::Wyr1E8Prepare {
+                output: "e8".into(),
+                e6_product: "e6".into(),
+                deep_repository: "deep".into(),
+                deep_revision: "1".into(),
+                evidence_nonce: "A".into(),
+            })
+        );
+        assert_eq!(
+            dispatch(&arguments(&["wyr1e8", "inspect", "--product", "e8"])),
+            Ok(Action::Wyr1E8Inspect("e8".into()))
+        );
+        assert!(dispatch(&arguments(&["wyr1e8", "run", "--product", "e8"])).is_err());
     }
 
     #[test]

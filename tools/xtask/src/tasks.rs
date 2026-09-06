@@ -1357,6 +1357,12 @@ pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<
     if matches!(filter, Some("wyr1e7-native")) {
         return crate::wyr1c::run_wyr1e7_native_checks(repository);
     }
+    if matches!(filter, Some("wyr1e8-native")) {
+        return crate::wyr1c::run_wyr1e8_native_checks(repository);
+    }
+    if matches!(filter, Some("wyr1e8-actors-native")) {
+        return crate::wyr1c::run_wyr1e8_actor_native_checks(repository);
+    }
     if matches!(filter, Some("dw1e3b-native")) {
         return crate::wyr1c::run_e3b_native_checks(repository);
     }
@@ -1368,11 +1374,79 @@ pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<
 }
 
 fn host_test_commands(filter: Option<&str>) -> Result<Vec<Vec<String>>, Failure> {
+    if matches!(
+        filter,
+        Some("wyr1e8-product-model" | "wyr1e8-product-clippy")
+    ) {
+        let lint = filter.is_some_and(|value| value.ends_with("clippy"));
+        return Ok([
+            ("wyrmroot-wyr1e-test-actors", None, true),
+            ("wyrmroot-bootfs", Some("builder"), true),
+            ("xtask", None, false),
+        ]
+        .into_iter()
+        .map(|(package, feature, library)| {
+            let mut arguments = vec![
+                if lint { "clippy" } else { "test" }.to_owned(),
+                "--locked".to_owned(),
+                "--offline".to_owned(),
+                "--package".to_owned(),
+                package.to_owned(),
+            ];
+            if let Some(feature) = feature {
+                arguments.extend(["--features".to_owned(), feature.to_owned()]);
+            }
+            if library {
+                arguments.push("--lib".to_owned());
+            }
+            if lint {
+                arguments.extend(["--".to_owned(), "-D".to_owned(), "warnings".to_owned()]);
+            }
+            arguments
+        })
+        .collect());
+    }
     if matches!(filter, Some("wyr1e7-model" | "wyr1e7-clippy")) {
         let lint = filter.is_some_and(|value| value.ends_with("clippy"));
         return Ok([
             ("wyrmroot-system-init", Some("wyr1e-selector33"), true),
             ("wyrmroot-dw1b-preemption", None, true),
+            ("wyrmroot-wyr1e-test-actors", None, true),
+            ("wyrmroot-bootfs", Some("builder"), true),
+            ("xtask", None, false),
+        ]
+        .into_iter()
+        .map(|(package, feature, library)| {
+            let mut arguments = vec![
+                if lint { "clippy" } else { "test" }.to_owned(),
+                "--locked".to_owned(),
+                "--offline".to_owned(),
+                "--package".to_owned(),
+                package.to_owned(),
+            ];
+            if let Some(feature) = feature {
+                arguments.extend(["--features".to_owned(), feature.to_owned()]);
+            }
+            if library {
+                arguments.push("--lib".to_owned());
+            }
+            if lint {
+                arguments.extend(["--".to_owned(), "-D".to_owned(), "warnings".to_owned()]);
+            }
+            arguments
+        })
+        .collect());
+    }
+    if matches!(filter, Some("wyr1e8-model" | "wyr1e8-clippy")) {
+        let lint = filter.is_some_and(|value| value.ends_with("clippy"));
+        return Ok([
+            ("wyrmroot-system-init", Some("wyr1e8-selector33"), true),
+            ("wyrmroot-devmgr", Some("wyr1e8-production"), true),
+            (
+                "wyrmroot-consoled",
+                Some("native-consoled,wyr1e-wyrmsh,wyr1e8-recovery"),
+                true,
+            ),
             ("wyrmroot-wyr1e-test-actors", None, true),
             ("wyrmroot-bootfs", Some("builder"), true),
             ("xtask", None, false),
@@ -1855,6 +1929,69 @@ mod tests {
             );
             let xtask = &commands[4];
             assert!(!xtask.iter().any(|argument| argument == "--lib"));
+            assert_eq!(
+                commands[0][0],
+                if filter.ends_with("clippy") {
+                    "clippy"
+                } else {
+                    "test"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn wyr1e8_host_filters_cover_current_recovery_product_and_additive_builder() {
+        for filter in ["wyr1e8-model", "wyr1e8-clippy"] {
+            let commands = host_test_commands(Some(filter)).unwrap();
+            assert_eq!(commands.len(), 6);
+            for package in [
+                "wyrmroot-system-init",
+                "wyrmroot-devmgr",
+                "wyrmroot-consoled",
+                "wyrmroot-wyr1e-test-actors",
+                "wyrmroot-bootfs",
+                "xtask",
+            ] {
+                assert!(
+                    commands
+                        .iter()
+                        .any(|command| command.iter().any(|argument| argument == package))
+                );
+            }
+            assert!(
+                commands[0]
+                    .windows(2)
+                    .any(|arguments| { arguments == ["--features", "wyr1e8-selector33"] })
+            );
+            assert!(
+                commands[1]
+                    .windows(2)
+                    .any(|arguments| { arguments == ["--features", "wyr1e8-production"] })
+            );
+            assert!(commands[2].windows(2).any(|arguments| {
+                arguments == ["--features", "native-consoled,wyr1e-wyrmsh,wyr1e8-recovery"]
+            }));
+        }
+    }
+
+    #[test]
+    fn wyr1e8_product_filters_cover_only_product_owned_host_code() {
+        for filter in ["wyr1e8-product-model", "wyr1e8-product-clippy"] {
+            let commands = host_test_commands(Some(filter)).unwrap();
+            assert_eq!(commands.len(), 3);
+            assert!(
+                commands[0]
+                    .iter()
+                    .any(|arg| arg == "wyrmroot-wyr1e-test-actors")
+            );
+            assert!(commands[1].iter().any(|arg| arg == "wyrmroot-bootfs"));
+            assert!(
+                commands[1]
+                    .windows(2)
+                    .any(|args| args == ["--features", "builder"])
+            );
+            assert!(commands[2].iter().any(|arg| arg == "xtask"));
             assert_eq!(
                 commands[0][0],
                 if filter.ends_with("clippy") {

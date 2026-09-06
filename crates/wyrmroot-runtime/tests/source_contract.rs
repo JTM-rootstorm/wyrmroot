@@ -307,6 +307,26 @@ fn wyr1b_evidence_raw_call_is_exact_and_feature_isolated() {
 }
 
 #[test]
+fn wyr1e8_evidence_alias_is_additive_and_keeps_e7_feature_exact() {
+    assert!(MANIFEST.contains("wyr1e7-test-evidence = []"));
+    assert!(MANIFEST.contains("wyr1e8-test-evidence = []"));
+    for required in [
+        "#[cfg(feature = \"wyr1e8-test-evidence\")]",
+        "const WYR1E8_TEST_EVIDENCE_SYSCALL: DwSyscallId = DwSyscallId(0xffff_ff21)",
+        "pub const WYR1E8_EVIDENCE_RECORD_BYTES: usize = 192",
+        "pub fn submit_wyr1e8_evidence",
+        "WYR1E8_EVIDENCE_RECORD_BYTES as u64",
+    ] {
+        assert!(
+            CAPABILITY_NATIVE_SOURCE.contains(required),
+            "missing WYR1-E8 evidence boundary marker {required}"
+        );
+    }
+    assert!(SOURCE.contains("submit_wyr1e7_evidence"));
+    assert!(SOURCE.contains("submit_wyr1e8_evidence"));
+}
+
+#[test]
 fn dw1c_private_veneer_has_only_the_four_frozen_operation_shapes() {
     assert!(MANIFEST.contains("dw1c-test-evidence = []"));
     for required in [

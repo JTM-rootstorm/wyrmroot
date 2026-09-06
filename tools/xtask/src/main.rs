@@ -26,6 +26,7 @@ mod wyr1c6;
 mod wyr1d5;
 mod wyr1e;
 mod wyr1e7;
+mod wyr1e8;
 
 use std::env;
 use std::process::ExitCode;
@@ -149,6 +150,21 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
         )
         .map(Some),
         Action::Wyr1E7Inspect(product) => wyr1e7::inspect(std::path::Path::new(&product)).map(Some),
+        Action::Wyr1E8Prepare {
+            output,
+            e6_product,
+            deep_repository,
+            deep_revision,
+            evidence_nonce,
+        } => wyr1e8::prepare(
+            std::path::Path::new(&output),
+            std::path::Path::new(&e6_product),
+            std::path::Path::new(&deep_repository),
+            &deep_revision,
+            &evidence_nonce,
+        )
+        .map(Some),
+        Action::Wyr1E8Inspect(product) => wyr1e8::inspect(std::path::Path::new(&product)).map(Some),
         Action::Wyr1C2Freeze(output) => wyr1c2::freeze(std::path::Path::new(&output)).map(Some),
         Action::Wyr1C2Image(request) => wyr1c2::image(std::path::Path::new(&request)).map(Some),
         Action::Wyr1C2Inspect(request) => wyr1c2::inspect(std::path::Path::new(&request)).map(Some),

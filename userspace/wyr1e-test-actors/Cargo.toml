@@ -23,10 +23,26 @@ test = false
 bench = false
 required-features = ["native-fault"]
 
+[[bin]]
+name = "wyrmroot-recovery-trigger"
+path = "src/bin/recovery_trigger.rs"
+test = false
+bench = false
+required-features = ["native-recovery-trigger"]
+
+[[bin]]
+name = "wyrmroot-stdout-pressure"
+path = "src/bin/stdout_pressure.rs"
+test = false
+bench = false
+required-features = ["native-stdout-pressure"]
+
 [features]
 default = []
 native-exit-nonzero = []
 native-fault = []
+native-recovery-trigger = []
+native-stdout-pressure = []
 
 [dependencies]
 deepwyrm-syscall.workspace = true
