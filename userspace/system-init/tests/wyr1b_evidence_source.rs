@@ -109,7 +109,8 @@ fn selector_27_dispatcher_keeps_one_protocol_sized_payload_and_stream_set() {
 
 #[test]
 fn selector_27_ordinary_mapping_diagnostic_names_each_remaining_site() {
-    let production_lib = LIB.split("#[cfg(test)]").next().unwrap();
+    // Exclude the test module, not a test-only branch inside production code.
+    let production_lib = LIB.split("\n#[cfg(test)]\nmod ").next().unwrap();
     assert!(LIB.contains("low five bits carry the claim-bearing ordinal"));
     assert!(LIB.contains("mapping_failure_ordinal(0, diagnostic.error"));
     assert!(LIB.contains("ordinary_mapping_error(MappingDiagnosticSite::RoleRemap, error, size)"));
