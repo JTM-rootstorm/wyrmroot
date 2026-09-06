@@ -114,6 +114,11 @@ pub(crate) fn prepare(
     let manifest = crate::metadata::BuildManifest::load(&repository)?;
     let abi_revision = manifest.deepwyrm_revision()?.to_owned();
     let abi_tree = wyr1c6::matching_abi_tree(&deep_repository, deep_revision, &abi_revision)?;
+    let layout = crate::deep_layout::prepare_current_kernel_source(
+        &repository,
+        &deep_repository,
+        deep_revision,
+    )?;
     let output = wyr1c::validate_fresh_output(&repository, &project, output)?;
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -135,6 +140,7 @@ pub(crate) fn prepare(
             &abi_tree,
             nonce,
             &e6,
+            &layout,
         )?;
         freeze(&output, &produced, nonce)
     })();
@@ -297,14 +303,10 @@ fn build_produced(
     abi_tree: &str,
     nonce: &str,
     e6: &crate::wyr1e::ImmutableE6Input,
+    layout: &crate::deep_layout::DeepLayoutBuild,
 ) -> Result<Produced, Failure> {
     let manifest = crate::metadata::BuildManifest::load(repository)?;
     let profile = manifest.validate_loader_build_readiness(repository)?;
-    let layout = crate::deep_layout::prepare(
-        repository,
-        manifest.deepwyrm_repository()?,
-        manifest.deepwyrm_revision()?,
-    )?;
     let toolchain = tasks::prepare_loader_toolchain(repository, &profile, &manifest)?;
     let cargo_home = tasks::project_cargo_home(repository, &manifest)?;
     if env::var_os("CARGO_HOME").as_deref() != Some(cargo_home.as_os_str()) {
@@ -319,7 +321,7 @@ fn build_produced(
         repository,
         &toolchain,
         &profile,
-        &layout,
+        layout,
         &tasks::IsolatedUefiBuild {
             cargo_home: &cargo_home,
             production_target: &build.join("uefi-production"),
@@ -330,7 +332,7 @@ fn build_produced(
     let build_directory = Directory::open_exact(&build, "WYR1-E8 build directory")?;
     let bootstrap =
         build_directory.with_inheritable_anchor("WYR1-E8 build directory", |anchor| {
-            crate::dw1e3a::build_bootstrap(repository, &toolchain, &layout, &cargo_home, anchor)
+            crate::dw1e3a::build_bootstrap(repository, &toolchain, layout, &cargo_home, anchor)
         })?;
     let snapshot = wyr1c::build_e8_snapshot(nonce, &e6.product)?;
     let kernel = wyr1e7::build_e8_kernel(deep_repository, nonce)?;
@@ -2066,6 +2068,29 @@ for key in verify.E8_RESULT_KEYS:
                 .collect::<Vec<_>>(),
             ["registryd", "wyrmsh", "stack_report"]
         );
+    }
+
+    #[test]
+    fn current_kernel_layout_is_preflighted_before_e8_output_and_build_effects() {
+        let source = include_str!("wyr1e8.rs");
+        let prepare = &source[source.find("pub(crate) fn prepare(").unwrap()
+            ..source.find("pub(crate) fn inspect(").unwrap()];
+        let abi_join = prepare.find("matching_abi_tree(").unwrap();
+        let current_layout = prepare
+            .find("deep_layout::prepare_current_kernel_source(")
+            .unwrap();
+        let output = prepare.find("validate_fresh_output(").unwrap();
+        let staging = prepare.find("fs::create_dir(&staging)").unwrap();
+        let native_build = prepare.find("build_produced(").unwrap();
+        assert!(abi_join < current_layout);
+        assert!(current_layout < output);
+        assert!(output < staging);
+        assert!(staging < native_build);
+
+        let build = &source
+            [source.find("fn build_produced(").unwrap()..source.find("fn fixed_fields(").unwrap()];
+        assert!(!build.contains("deep_layout::prepare("));
+        assert!(build.contains("layout: &crate::deep_layout::DeepLayoutBuild"));
     }
 
     #[test]

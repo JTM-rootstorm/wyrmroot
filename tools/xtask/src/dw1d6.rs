@@ -93,6 +93,11 @@ pub fn freeze(
     let generated_abi_revision = manifest.deepwyrm_revision()?.to_owned();
     let deepwyrm_abi_tree =
         require_matching_abi_tree(&deep_repository, deep_revision, &generated_abi_revision)?;
+    let layout = crate::deep_layout::prepare_current_kernel_source(
+        &wyrmroot,
+        &deep_repository,
+        deep_revision,
+    )?;
 
     let parent = fs::canonicalize(
         output
@@ -118,6 +123,7 @@ pub fn freeze(
         &deepwyrm_abi_tree,
         evidence_nonce,
         evidence_challenge,
+        &layout,
     );
     if result.is_err() {
         fs::remove_dir_all(&output).map_err(io)?;
@@ -136,6 +142,7 @@ fn build_product(
     deepwyrm_abi_tree: &str,
     nonce: &str,
     challenge: &str,
+    layout: &crate::deep_layout::DeepLayoutBuild,
 ) -> Result<String, Failure> {
     let manifest = BuildManifest::load(wyrmroot)?;
     if manifest.deepwyrm_revision()? != generated_abi_revision {
@@ -145,11 +152,6 @@ fn build_product(
     }
     let rust_revision = manifest.rust_revision()?.to_owned();
     let loader_profile = manifest.validate_loader_build_readiness(wyrmroot)?;
-    let layout = crate::deep_layout::prepare(
-        wyrmroot,
-        manifest.deepwyrm_repository()?,
-        manifest.deepwyrm_revision()?,
-    )?;
     let toolchain = crate::tasks::prepare_loader_toolchain(wyrmroot, &loader_profile, &manifest)?;
     let cargo_home = crate::tasks::project_cargo_home(wyrmroot, &manifest)?;
     let build = output.join("build");
@@ -158,7 +160,7 @@ fn build_product(
         wyrmroot,
         &toolchain,
         &loader_profile,
-        &layout,
+        layout,
         &crate::tasks::IsolatedUefiBuild {
             cargo_home: &cargo_home,
             production_target: &build.join("uefi-production"),
@@ -170,7 +172,7 @@ fn build_product(
     let bootstrap = native_build(
         wyrmroot,
         &toolchain,
-        &layout,
+        layout,
         &cargo_home,
         &build,
         "bootstrap",
@@ -183,7 +185,7 @@ fn build_product(
     let owner = native_build(
         wyrmroot,
         &toolchain,
-        &layout,
+        layout,
         &cargo_home,
         &build,
         "resource-owner",
@@ -196,7 +198,7 @@ fn build_product(
     let trigger = native_build(
         wyrmroot,
         &toolchain,
-        &layout,
+        layout,
         &cargo_home,
         &build,
         "trigger",
@@ -209,7 +211,7 @@ fn build_product(
     let replacement = native_build(
         wyrmroot,
         &toolchain,
-        &layout,
+        layout,
         &cargo_home,
         &build,
         "replacement-owner",

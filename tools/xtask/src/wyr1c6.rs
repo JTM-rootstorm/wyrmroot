@@ -210,6 +210,11 @@ pub(crate) fn prepare(
     // private evidence code.
     let abi_revision = manifest.deepwyrm_revision()?.to_owned();
     let abi_tree = matching_abi_tree(&deep_repository, deep_revision, &abi_revision)?;
+    let layout = crate::deep_layout::prepare_current_kernel_source(
+        &repository,
+        &deep_repository,
+        deep_revision,
+    )?;
     let output = canonical_new_output(output, &project, &repository, &deep_repository)?;
     let tmp = project.join(".tmp");
     fs::create_dir_all(&tmp).map_err(|error| {
@@ -233,6 +238,7 @@ pub(crate) fn prepare(
             &abi_revision,
             &abi_tree,
             nonce,
+            &layout,
         )?;
         freeze_produced(&output, &produced, nonce, challenge)
     })();
@@ -254,14 +260,10 @@ fn build_produced_artifacts(
     abi_revision: &str,
     abi_tree: &str,
     nonce: &str,
+    layout: &crate::deep_layout::DeepLayoutBuild,
 ) -> Result<ProducedArtifacts, Failure> {
     let manifest = crate::metadata::BuildManifest::load(repository)?;
     let profile = manifest.validate_loader_build_readiness(repository)?;
-    let layout = crate::deep_layout::prepare(
-        repository,
-        manifest.deepwyrm_repository()?,
-        manifest.deepwyrm_revision()?,
-    )?;
     let toolchain = tasks::prepare_loader_toolchain(repository, &profile, &manifest)?;
     let cargo_home = tasks::project_cargo_home(repository, &manifest)?;
     if env::var_os("CARGO_HOME").as_deref() != Some(cargo_home.as_os_str()) {
@@ -278,7 +280,7 @@ fn build_produced_artifacts(
         repository,
         &toolchain,
         &profile,
-        &layout,
+        layout,
         &tasks::IsolatedUefiBuild {
             cargo_home: &cargo_home,
             production_target: &build.join("uefi-production"),
@@ -290,13 +292,7 @@ fn build_produced_artifacts(
     let build_directory = Directory::open_exact(&build, "WYR1-C6 build directory")?;
     let bootstrap =
         build_directory.with_inheritable_anchor("WYR1-C6 build directory", |build_directory| {
-            build_c6_bootstrap(
-                repository,
-                &toolchain,
-                &layout,
-                &cargo_home,
-                build_directory,
-            )
+            build_c6_bootstrap(repository, &toolchain, layout, &cargo_home, build_directory)
         })?;
     let snapshot = crate::wyr1c::build_c6_snapshot(nonce)?;
     let kernel = build_selector29_kernel(deep_repository, nonce)?;

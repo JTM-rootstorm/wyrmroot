@@ -279,10 +279,10 @@ fn build_produced_artifacts_with_snapshot(
     reject_e3b_payload_environment()?;
     let manifest = crate::metadata::BuildManifest::load(repository)?;
     let profile = manifest.validate_loader_build_readiness(repository)?;
-    let layout = crate::deep_layout::prepare(
+    let layout = crate::deep_layout::prepare_current_kernel_source(
         repository,
-        manifest.deepwyrm_repository()?,
-        manifest.deepwyrm_revision()?,
+        deep_repository,
+        deep_revision,
     )?;
     let toolchain = tasks::prepare_loader_toolchain(repository, &profile, &manifest)?;
     let cargo_home = tasks::project_cargo_home(repository, &manifest)?;

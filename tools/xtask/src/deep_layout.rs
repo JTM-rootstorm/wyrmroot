@@ -254,6 +254,53 @@ pub(crate) fn prepare(
     let metadata = cargo_metadata(repository)?;
     let package = locate_package(&metadata, expected_repository, expected_revision)?;
     let source_root = validate_git_source(&package.manifest_path, expected_revision)?;
+    prepare_from_source_root(repository, source_root, expected_revision)
+}
+
+/// Prepares the loader policy from the exact Deepwyrm checkout that supplies
+/// the kernel artifact. This is intentionally separate from [`prepare`],
+/// whose callers bind layout to Cargo's historical generated-ABI source.
+pub(crate) fn prepare_current_kernel_source(
+    repository: &Path,
+    source_root: &Path,
+    expected_revision: &str,
+) -> Result<DeepLayoutBuild, Failure> {
+    if !source_root.is_absolute() {
+        return Err(Failure::task(
+            "current Deepwyrm kernel source root is not absolute",
+        ));
+    }
+    validate_directory(source_root, "current Deepwyrm kernel source root")?;
+    let canonical_root = fs::canonicalize(source_root).map_err(|error| {
+        Failure::task(format!(
+            "could not canonicalize current Deepwyrm kernel source root: {error}"
+        ))
+    })?;
+    if canonical_root != source_root {
+        return Err(Failure::task(
+            "current Deepwyrm kernel source root is not canonical or contains a symlink",
+        ));
+    }
+    let git_root = git_output_bounded(
+        source_root,
+        ["rev-parse", "--show-toplevel"],
+        MAX_GIT_ROOT_STDOUT_BYTES,
+        "current Deepwyrm kernel source root inspection",
+    )?;
+    if Path::new(git_root.trim()) != source_root {
+        return Err(Failure::task(
+            "current Deepwyrm kernel source root is not the Git worktree root",
+        ));
+    }
+    verify_git_source_identity(source_root, expected_revision)?;
+    prepare_from_source_root(repository, source_root.to_path_buf(), expected_revision)
+}
+
+fn prepare_from_source_root(
+    repository: &Path,
+    source_root: PathBuf,
+    expected_revision: &str,
+) -> Result<DeepLayoutBuild, Failure> {
     let layout_path = source_root.join(LAYOUT_PATH);
     validate_regular_path(&source_root, &layout_path, "Deepwyrm x86_64 layout")?;
     let layout_bytes = read_bounded(&layout_path, MAX_LAYOUT_BYTES, "Deepwyrm x86_64 layout")?;
@@ -2814,10 +2861,11 @@ mod tests {
     use super::{
         DeepLayoutBuild, JsonParser, KERNEL_BOOT_STACK_BYTES, LayoutPolicy,
         MAX_METADATA_CONTAINER_ENTRIES, MAX_METADATA_JSON_DEPTH, MAX_METADATA_STRING_BYTES,
-        bounded_command_output, locate_package, open_stable_regular_file, read_pipe_bounded,
-        validate_git_status, validate_metadata_manifest_path, validate_regular_path,
-        verify_cargo_configuration, verify_exact_cargo_git_source, verify_open_file_identity,
-        verify_tracked_bytes, write_generated_policy, x86_64_page_table_indices,
+        bounded_command_output, locate_package, open_stable_regular_file,
+        prepare_current_kernel_source, read_pipe_bounded, validate_git_status,
+        validate_metadata_manifest_path, validate_regular_path, verify_cargo_configuration,
+        verify_exact_cargo_git_source, verify_open_file_identity, verify_tracked_bytes,
+        write_generated_policy, x86_64_page_table_indices,
     };
     use crate::sha256::bytes_digest;
     use std::path::Path;
@@ -3167,6 +3215,177 @@ mod tests {
                 "kernel_boot_stack_size' is {bytes}, expected {KERNEL_BOOT_STACK_BYTES}"
             )));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_kernel_source_selects_exact_layout_and_rejects_historical_source() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        fn commit_layout(root: &Path, contents: &str) -> String {
+            let layout_path = root.join(super::LAYOUT_PATH);
+            fs::create_dir_all(layout_path.parent().expect("layout parent"))
+                .expect("create layout fixture");
+            fs::write(&layout_path, contents).expect("write layout fixture");
+            for arguments in [
+                vec!["init", "-q"],
+                vec!["add", super::LAYOUT_PATH],
+                vec![
+                    "-c",
+                    "user.name=Wyrmroot test",
+                    "-c",
+                    "user.email=wyrmroot-test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "fixture",
+                ],
+            ] {
+                assert!(
+                    Command::new(super::FIXED_GIT)
+                        .arg("-C")
+                        .arg(root)
+                        .args(arguments)
+                        .status()
+                        .expect("run layout fixture Git command")
+                        .success()
+                );
+            }
+            super::git_output_bounded(
+                root,
+                ["rev-parse", "HEAD"],
+                super::MAX_GIT_REVISION_STDOUT_BYTES,
+                "layout fixture revision",
+            )
+            .expect("read layout fixture revision")
+            .trim()
+            .to_owned()
+        }
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock precedes Unix epoch")
+            .as_nanos();
+        let fixture = std::env::temp_dir().join(format!(
+            "wyrmroot-current-layout-source-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let repository = fixture.join("wyrmroot");
+        let current = fixture.join("current-deepwyrm");
+        let historical = fixture.join("historical-abi-deepwyrm");
+        fs::create_dir_all(&repository).expect("create Wyrmroot fixture root");
+
+        let current_layout = layout("0xffff800000200000");
+        let current_revision = commit_layout(&current, &current_layout);
+        let historical_layout = current_layout.replace(
+            "kernel_boot_stack_size = 4194304",
+            "kernel_boot_stack_size = 1048576",
+        );
+        assert_ne!(historical_layout, current_layout);
+        let historical_revision = commit_layout(&historical, &historical_layout);
+
+        let build = prepare_current_kernel_source(&repository, &current, &current_revision)
+            .expect("exact current kernel layout rejected");
+        assert_eq!(build.layout_sha256, bytes_digest(current_layout.as_bytes()));
+        let generated = fs::read_to_string(&build.policy_path).expect("read generated policy");
+        assert!(generated.contains("DEEPWYRM_KERNEL_BOOT_STACK_SIZE: u64 = 4194304"));
+        build
+            .verify_unchanged()
+            .expect("current kernel layout identity changed");
+
+        let historical_failure =
+            match prepare_current_kernel_source(&repository, &historical, &historical_revision) {
+                Ok(_) => panic!("historical 1 MiB layout unexpectedly accepted"),
+                Err(failure) => failure,
+            };
+        assert!(
+            historical_failure
+                .message
+                .contains("kernel_boot_stack_size' is 1048576, expected 4194304")
+        );
+        assert!(
+            prepare_current_kernel_source(&repository, &current, &"0".repeat(40)).is_err(),
+            "wrong current kernel revision unexpectedly accepted"
+        );
+
+        let nested = current.join("nested");
+        fs::create_dir(&nested).expect("create nested current source path");
+        assert!(
+            prepare_current_kernel_source(&repository, &nested, &current_revision).is_err(),
+            "nested path unexpectedly accepted as the current kernel source root"
+        );
+        fs::remove_dir(&nested).expect("remove nested current source path");
+
+        fs::write(current.join(super::LAYOUT_PATH), "dirty layout\n")
+            .expect("dirty current layout fixture");
+        assert!(
+            prepare_current_kernel_source(&repository, &current, &current_revision).is_err(),
+            "dirty current kernel source unexpectedly accepted"
+        );
+
+        let alias = fixture.join("current-deepwyrm-alias");
+        symlink(&current, &alias).expect("create current source alias");
+        assert!(
+            prepare_current_kernel_source(&repository, &alias, &current_revision).is_err(),
+            "symlinked current kernel source unexpectedly accepted"
+        );
+
+        fs::remove_dir_all(&fixture).expect("remove current layout source fixture");
+    }
+
+    #[test]
+    fn current_product_builders_do_not_reselect_layout_from_the_abi_dependency() {
+        for (name, source) in [
+            ("selector27", include_str!("wyr1b.rs")),
+            ("selector28", include_str!("dw1c.rs")),
+            ("selector29", include_str!("wyr1c6.rs")),
+            ("selector30", include_str!("dw1d6.rs")),
+            ("selector31", include_str!("dw1e3a.rs")),
+            ("selector32", include_str!("wyr1d5.rs")),
+            ("selector33-e8", include_str!("wyr1e8.rs")),
+        ] {
+            assert!(
+                source.contains("deep_layout::prepare_current_kernel_source("),
+                "{name} does not select layout from its current kernel source"
+            );
+            assert!(
+                !source.contains("crate::deep_layout::prepare("),
+                "{name} still selects layout from the historical ABI dependency"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the canonical sibling Deepwyrm checkout"]
+    fn actual_current_kernel_layout_preflight_uses_the_sibling_source() {
+        let repository = crate::tasks::repository_root().expect("resolve Wyrmroot source");
+        let project =
+            crate::tasks::canonical_project_root(&repository).expect("resolve OS-Project source");
+        let deep = std::fs::canonicalize(project.join("deepwyrm"))
+            .expect("resolve canonical Deepwyrm sibling");
+        let revision = super::git_output_bounded(
+            &deep,
+            ["rev-parse", "HEAD"],
+            super::MAX_GIT_REVISION_STDOUT_BYTES,
+            "current Deepwyrm revision",
+        )
+        .expect("read current Deepwyrm revision");
+        let build = prepare_current_kernel_source(&repository, &deep, revision.trim())
+            .expect("current Deepwyrm layout preflight failed");
+        let layout =
+            std::fs::read(deep.join(super::LAYOUT_PATH)).expect("read current Deepwyrm layout");
+        assert_eq!(build.layout_sha256, bytes_digest(&layout));
+        let generated = std::fs::read_to_string(&build.policy_path)
+            .expect("read generated current layout policy");
+        assert!(generated.contains("DEEPWYRM_KERNEL_BOOT_STACK_SIZE: u64 = 4194304"));
+        build
+            .verify_unchanged()
+            .expect("current Deepwyrm layout changed during preflight");
     }
 
     #[cfg(unix)]

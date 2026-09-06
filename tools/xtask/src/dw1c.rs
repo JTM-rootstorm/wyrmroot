@@ -287,6 +287,7 @@ pub(crate) fn build_wyr_artifact_set(
     build_root: &Path,
     source_revision: &str,
     progress_digest: &str,
+    layout: &crate::deep_layout::DeepLayoutBuild,
 ) -> Result<WyrArtifactSet, Failure> {
     validate_upper_hex(progress_digest, 16, "progress_digest")?;
     fs::create_dir(build_root).map_err(|error| {
@@ -295,18 +296,13 @@ pub(crate) fn build_wyr_artifact_set(
     let repository = crate::tasks::repository_root()?;
     let manifest = BuildManifest::load(&repository)?;
     let profile = manifest.validate_loader_build_readiness(&repository)?;
-    let layout = crate::deep_layout::prepare(
-        &repository,
-        manifest.deepwyrm_repository()?,
-        manifest.deepwyrm_revision()?,
-    )?;
     let toolchain = crate::tasks::prepare_loader_toolchain(&repository, &profile, &manifest)?;
     let cargo_home = crate::tasks::project_cargo_home(&repository, &manifest)?;
     let uefi = crate::tasks::build_deterministic_uefi_pair(
         &repository,
         &toolchain,
         &profile,
-        &layout,
+        layout,
         &crate::tasks::IsolatedUefiBuild {
             cargo_home: &cargo_home,
             production_target: &build_root.join("uefi-production"),
@@ -328,7 +324,7 @@ pub(crate) fn build_wyr_artifact_set(
         artifacts.push(build_wyr_native_artifact(
             &repository,
             &toolchain,
-            &layout,
+            layout,
             &cargo_home,
             build_root,
             spec,
@@ -362,7 +358,7 @@ pub(crate) fn build_wyr_artifact_set(
         source_revision,
         progress_digest,
         toolchain.accepted(),
-        &layout,
+        layout,
         &uefi,
         WyrReceiptArtifacts {
             loader: &loader,
@@ -765,6 +761,15 @@ pub fn preflight(output: &Path, progress_digest: &str) -> Result<String, Failure
     let repository = crate::tasks::repository_root()?;
     let revision = current_revision(&repository)?;
     verify_clean_repository(&repository, "Wyrmroot", &revision)?;
+    let project = repository
+        .ancestors()
+        .find(|ancestor| ancestor.ends_with("OS-Project"))
+        .ok_or_else(|| Failure::task("DW1-C could not locate OS-Project root"))?;
+    let deep_repository = fs::canonicalize(project.join("deepwyrm")).map_err(io)?;
+    let deep_repository = canonical_repository_path(&deep_repository, "Deepwyrm")?;
+    let deep_revision = current_revision(&deep_repository)?;
+    verify_clean_repository(&deep_repository, "Deepwyrm", &deep_revision)?;
+    let layout = prepare_current_layout(&repository, &deep_repository, &deep_revision)?;
     let parent = output
         .parent()
         .ok_or_else(|| Failure::task("DW1-C preflight output has no parent"))?;
@@ -777,11 +782,6 @@ pub fn preflight(output: &Path, progress_digest: &str) -> Result<String, Failure
     let result = (|| {
         let manifest = BuildManifest::load(&repository)?;
         let profile = manifest.validate_loader_build_readiness(&repository)?;
-        let layout = crate::deep_layout::prepare(
-            &repository,
-            manifest.deepwyrm_repository()?,
-            manifest.deepwyrm_revision()?,
-        )?;
         let toolchain = crate::tasks::prepare_loader_toolchain(&repository, &profile, &manifest)?;
         let cargo_home = crate::tasks::project_cargo_home(&repository, &manifest)?;
         let build_root = output.join("build");
@@ -853,22 +853,14 @@ pub fn freeze(
         "Wyrmroot",
         &current_revision(&crate::tasks::repository_root()?)?,
     )?;
-    // The generated ABI/layout identity belongs to the accepted Wyrmroot
-    // consumer.  It need not equal the later product-kernel revision, but the
-    // candidate must expose the identical ABI tree before any build starts.
-    let abi_tree = git_output(
+    // The generated ABI identity belongs to the accepted Wyrmroot consumer.
+    // It need not equal the product-kernel revision, but the candidate must
+    // expose the identical ABI tree before its current layout is selected.
+    let layout = prepare_current_layout(
+        &crate::tasks::repository_root()?,
         &deep_repository,
-        &["rev-parse", &format!("{deep_revision}:abi")],
+        deep_revision,
     )?;
-    let generated_tree = git_output(
-        &deep_repository,
-        &["rev-parse", &format!("{GENERATED_ABI_REVISION}:abi")],
-    )?;
-    if abi_tree != DEEPWYRM_ABI_TREE || generated_tree != DEEPWYRM_ABI_TREE {
-        return Err(Failure::task(
-            "DW1-C product Deep candidate does not match the accepted generated ABI tree",
-        ));
-    }
     for (label, value) in [
         ("deep_revision", deep_revision),
         ("evidence_nonce", evidence_nonce),
@@ -908,6 +900,7 @@ pub fn freeze(
         deep_revision,
         evidence_nonce,
         progress_digest,
+        &layout,
     );
     if result.is_err() {
         // This directory was just created with `create_dir`; never retain a
@@ -923,6 +916,7 @@ fn freeze_product(
     deep_revision: &str,
     evidence_nonce: &str,
     progress_digest: &str,
+    layout: &crate::deep_layout::DeepLayoutBuild,
 ) -> Result<String, Failure> {
     let repository = crate::tasks::repository_root()?;
     let wyrmroot_revision = current_revision(&repository)?;
@@ -934,6 +928,7 @@ fn freeze_product(
         &build_root.join("wyrmroot"),
         &wyrmroot_revision,
         progress_digest,
+        layout,
     )?;
     let bootfs = build_bootfs(&artifacts.init0, &artifacts.hello, &artifacts.actors)?;
     let pages = bootfs.len().div_ceil(4096);
@@ -1309,6 +1304,27 @@ fn render_freeze_request(
 
 fn current_revision(repository: &Path) -> Result<String, Failure> {
     git_output(repository, &["rev-parse", "HEAD"])
+}
+
+fn prepare_current_layout(
+    repository: &Path,
+    deep_repository: &Path,
+    deep_revision: &str,
+) -> Result<crate::deep_layout::DeepLayoutBuild, Failure> {
+    let abi_tree = git_output(
+        deep_repository,
+        &["rev-parse", &format!("{deep_revision}:abi")],
+    )?;
+    let generated_tree = git_output(
+        deep_repository,
+        &["rev-parse", &format!("{GENERATED_ABI_REVISION}:abi")],
+    )?;
+    if abi_tree != DEEPWYRM_ABI_TREE || generated_tree != DEEPWYRM_ABI_TREE {
+        return Err(Failure::task(
+            "DW1-C product Deep candidate does not match the accepted generated ABI tree",
+        ));
+    }
+    crate::deep_layout::prepare_current_kernel_source(repository, deep_repository, deep_revision)
 }
 
 fn canonical_repository_path(path: &Path, label: &str) -> Result<PathBuf, Failure> {

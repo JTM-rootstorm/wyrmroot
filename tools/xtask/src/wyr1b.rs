@@ -413,6 +413,11 @@ pub fn freeze(output: &Path) -> Result<String, Failure> {
     let deepwyrm = deepwyrm_repository()?;
     let wyrmroot_revision = repository_revision(&repository, "Wyrmroot")?;
     let deepwyrm_revision = repository_revision(&deepwyrm, "Deepwyrm")?;
+    let layout = crate::deep_layout::prepare_current_kernel_source(
+        &repository,
+        &deepwyrm,
+        &deepwyrm_revision,
+    )?;
     if fs::symlink_metadata(output).is_ok() {
         return Err(Failure::task(
             "WYR1-B freeze refuses a pre-existing output path",
@@ -437,7 +442,7 @@ pub fn freeze(output: &Path) -> Result<String, Failure> {
     let build_root = output.join("build");
     fs::create_dir(&build_root)
         .map_err(|error| Failure::task(format!("could not create WYR1-B build root: {error}")))?;
-    let mut artifacts = build_frozen_artifacts(&build_root, &wyrmroot_revision)?;
+    let mut artifacts = build_frozen_artifacts(&build_root, &wyrmroot_revision, &layout)?;
     let nonce = 0xB001_B027_0000_0001;
     let generation_text = sha256::bytes_digest(
         format!(
@@ -657,7 +662,11 @@ fn validate_ambient_build_environment(
     Ok(())
 }
 
-fn build_frozen_artifacts(build_root: &Path, revision: &str) -> Result<FrozenArtifacts, Failure> {
+fn build_frozen_artifacts(
+    build_root: &Path,
+    revision: &str,
+    layout: &crate::deep_layout::DeepLayoutBuild,
+) -> Result<FrozenArtifacts, Failure> {
     let repository = crate::tasks::repository_root()?;
     let manifest = crate::metadata::BuildManifest::load(&repository)?;
     if manifest.rust_revision()? != ACCEPTED_RUST_REVISION
@@ -668,18 +677,13 @@ fn build_frozen_artifacts(build_root: &Path, revision: &str) -> Result<FrozenArt
         ));
     }
     let profile = manifest.validate_loader_build_readiness(&repository)?;
-    let layout = crate::deep_layout::prepare(
-        &repository,
-        manifest.deepwyrm_repository()?,
-        manifest.deepwyrm_revision()?,
-    )?;
     let toolchain = crate::tasks::prepare_loader_toolchain(&repository, &profile, &manifest)?;
     let cargo_home = crate::tasks::project_cargo_home(&repository, &manifest)?;
     let uefi = crate::tasks::build_deterministic_uefi_pair(
         &repository,
         &toolchain,
         &profile,
-        &layout,
+        layout,
         &crate::tasks::IsolatedUefiBuild {
             cargo_home: &cargo_home,
             production_target: &build_root.join("uefi-production"),
