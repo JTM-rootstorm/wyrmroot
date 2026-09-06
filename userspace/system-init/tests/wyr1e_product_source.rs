@@ -46,6 +46,38 @@ fn e6_manifest_admission_is_additive_and_historical_profiles_stay_retained() {
 }
 
 #[test]
+fn production_publication_sender_uses_v1_1_without_selecting_d5_control() {
+    let imports = &NATIVE[..NATIVE.find("pub(crate) const MARKER_BYTES").unwrap()];
+    assert!(imports.contains(
+        "#[cfg(any(\n    test,\n    not(any(feature = \"wyr1d-selector32\", feature = \"wyr1e-production\"))\n))]\nuse wyrmroot_device_proto::controller::encode as encode_controller;"
+    ));
+
+    let selected = "#[cfg(any(feature = \"wyr1d-selector32\", feature = \"wyr1e-production\"))]";
+    let legacy = "#[cfg(not(any(feature = \"wyr1d-selector32\", feature = \"wyr1e-production\")))]";
+    let encode_start = NATIVE
+        .find(&format!("{selected}\nconst PUBLICATION_REQUEST_BYTES"))
+        .unwrap();
+    let encode = &NATIVE[encode_start..NATIVE.find("fn install_publication").unwrap()];
+    assert!(encode.contains(&format!(
+        "{selected}\nconst PUBLICATION_REQUEST_BYTES: usize = wyrmroot_device_proto::controller_v1_1::RECORD_BYTES;"
+    )));
+    assert!(encode.contains(&format!(
+        "{legacy}\nconst PUBLICATION_REQUEST_BYTES: usize = wyrmroot_device_proto::controller::INSTALL_BYTES;"
+    )));
+    assert!(encode.contains(&format!(
+        "{selected}\n    wyrmroot_device_proto::controller_v1_1::encode(\n        wyrmroot_device_proto::controller_v1_1::PublicationMessage {{\n            controller,\n            service_generation,"
+    )));
+    assert!(encode.contains(&format!(
+        "{legacy}\n    {{\n        let _ = service_generation;\n        encode_controller(controller, &mut bytes)"
+    )));
+    assert!(!encode.contains("d5_controller"));
+
+    assert!(
+        NATIVE.contains("#[cfg(feature = \"wyr1d-selector32\")]\n#[path = \"wyr1d_native.rs\"]")
+    );
+}
+
+#[test]
 fn console_launcher_is_installed_before_consoled_can_send_shell_v1() {
     let launch = &E6
         [E6.find("fn launch_console").unwrap()..E6.find("fn clear_publication_observer").unwrap()];

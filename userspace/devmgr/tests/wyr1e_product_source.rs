@@ -37,6 +37,79 @@ fn connector_broker_activation_is_shared_but_wdr5_remains_selector_only() {
 }
 
 #[test]
+fn production_publication_receiver_uses_the_exact_v1_1_service_generation() {
+    let imports = &NATIVE[..NATIVE.find("const FAILURE_BASE").unwrap()];
+    assert!(imports.contains(
+        "#[cfg(not(any(\n    feature = \"dw1e3-selector31\",\n    feature = \"wyr1d-selector32\",\n    feature = \"wyr1e-production\"\n)))]\nuse wyrmroot_device_proto::controller::INSTALL_BYTES;"
+    ));
+    assert!(imports.contains(
+        "#[cfg(not(any(feature = \"wyr1d-selector32\", feature = \"wyr1e-production\")))]\nuse wyrmroot_device_proto::controller::parse as parse_controller;"
+    ));
+    assert!(imports.contains(
+        "#[cfg(feature = \"wyr1d-selector32\")]\nuse wyrmroot_device_proto::d5_controller::{"
+    ));
+
+    let receive = &NATIVE[NATIVE.find("fn receive_controller(").unwrap()
+        ..NATIVE.find("fn published_driver(").unwrap()];
+    let selected = "#[cfg(any(feature = \"wyr1d-selector32\", feature = \"wyr1e-production\"))]";
+    let legacy = "#[cfg(not(any(feature = \"wyr1d-selector32\", feature = \"wyr1e-production\")))]";
+    let e7_buffer = receive
+        .find(
+            "#[cfg(all(\n        not(feature = \"dw1e3-selector31\"),\n        not(feature = \"wyr1d-selector32\"),\n        feature = \"wyr1e-production\"\n    ))]\n    let mut bytes = [0u8; wyrmroot_device_proto::controller_v1_1::RECORD_BYTES];",
+        )
+        .unwrap();
+    let legacy_buffer = receive
+        .find(
+            "#[cfg(not(any(\n        feature = \"dw1e3-selector31\",\n        feature = \"wyr1d-selector32\",\n        feature = \"wyr1e-production\"\n    )))]\n    let mut bytes = [0u8; INSTALL_BYTES];",
+        )
+        .unwrap();
+    assert!(receive.contains(
+        "#[cfg(feature = \"dw1e3-selector31\")]\n    let mut bytes = [0u8; D3_DEVICE_STAGE_BYTES];"
+    ));
+    assert!(receive.contains(
+        "#[cfg(all(not(feature = \"dw1e3-selector31\"), feature = \"wyr1d-selector32\"))]\n    let mut bytes = [0u8; D5_CONTROLLER_BYTES];"
+    ));
+    let parse = receive
+        .find(&format!(
+            "{selected}\n    let publication = match wyrmroot_device_proto::controller_v1_1::parse(&bytes[..counts.bytes])"
+        ))
+        .unwrap();
+    assert!(e7_buffer < parse && legacy_buffer < parse);
+    let message = receive
+        .find(&format!(
+            "{selected}\n    let message = publication.controller;"
+        ))
+        .unwrap();
+    let accept = receive
+        .find(&format!(
+            "{selected}\n    let accepted = resident.accept_publication(publication, counts.handles as u32);"
+        ))
+        .unwrap();
+    assert!(parse < message && message < accept);
+    assert!(receive.contains(&format!(
+        "{legacy}\n    let message = match parse_controller(&bytes[..counts.bytes])"
+    )));
+    assert!(receive.contains(&format!(
+        "{legacy}\n    let accepted = resident.accept(message, counts.handles as u32);"
+    )));
+
+    let d5_gate = receive
+        .find("#[cfg(feature = \"wyr1d-selector32\")]\n    if counts.bytes == D5_CONTROLLER_BYTES")
+        .unwrap();
+    let d5_parse = receive
+        .find("parse_d5_controller(&bytes[..counts.bytes])")
+        .unwrap();
+    assert!(d5_gate < d5_parse && d5_parse < parse);
+
+    let published = &NATIVE[NATIVE.find("fn published_driver(").unwrap()
+        ..NATIVE.find("fn selector32_driver_ready(").unwrap()];
+    assert!(published.contains("publication_service_generation()"));
+    assert!(published.contains(".ok_or(failure(243))?"));
+    assert!(!published.contains("active_binding"));
+    assert!(!published.contains("endpoint.generation"));
+}
+
+#[test]
 fn production_connector_services_offer_and_generic_detach_without_test_evidence() {
     assert!(NATIVE.contains("feature = \"wyr1e-production\""));
     let service = &NATIVE[NATIVE.find("fn service_production_driver_control").unwrap()

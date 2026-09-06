@@ -31,7 +31,10 @@ use wyrmroot_device_proto::SERIAL_CONSOLE_CONNECTOR_PUBLICATION_POLICY;
     feature = "wyr1e-production"
 )))]
 use wyrmroot_device_proto::SERIAL_CONSOLE_PUBLICATION_POLICY;
-#[cfg(any(test, not(feature = "wyr1d-selector32")))]
+#[cfg(any(
+    test,
+    not(any(feature = "wyr1d-selector32", feature = "wyr1e-production"))
+))]
 use wyrmroot_device_proto::controller::encode as encode_controller;
 use wyrmroot_device_proto::coordinator::{
     RegistryEndpoint, RegistryEndpointGeneration, RegistryEndpointId, RegistryGeneration,
@@ -1011,9 +1014,9 @@ where
     })
 }
 
-#[cfg(feature = "wyr1d-selector32")]
+#[cfg(any(feature = "wyr1d-selector32", feature = "wyr1e-production"))]
 const PUBLICATION_REQUEST_BYTES: usize = wyrmroot_device_proto::controller_v1_1::RECORD_BYTES;
-#[cfg(not(feature = "wyr1d-selector32"))]
+#[cfg(not(any(feature = "wyr1d-selector32", feature = "wyr1e-production")))]
 const PUBLICATION_REQUEST_BYTES: usize = wyrmroot_device_proto::controller::INSTALL_BYTES;
 
 fn encode_publication_request(
@@ -1021,7 +1024,7 @@ fn encode_publication_request(
     service_generation: u64,
 ) -> Result<[u8; PUBLICATION_REQUEST_BYTES], ()> {
     let mut bytes = [0u8; PUBLICATION_REQUEST_BYTES];
-    #[cfg(feature = "wyr1d-selector32")]
+    #[cfg(any(feature = "wyr1d-selector32", feature = "wyr1e-production"))]
     wyrmroot_device_proto::controller_v1_1::encode(
         wyrmroot_device_proto::controller_v1_1::PublicationMessage {
             controller,
@@ -1030,7 +1033,7 @@ fn encode_publication_request(
         &mut bytes,
     )
     .map_err(|_| ())?;
-    #[cfg(not(feature = "wyr1d-selector32"))]
+    #[cfg(not(any(feature = "wyr1d-selector32", feature = "wyr1e-production")))]
     {
         let _ = service_generation;
         encode_controller(controller, &mut bytes).map_err(|_| ())?;
@@ -4208,7 +4211,7 @@ mod tests {
                 assert_eq!(self.send_count, 2);
                 assert_eq!(channel, devmgr().loaded.launch_channel);
                 assert_eq!(transfers[0].handle, DwHandle(51));
-                #[cfg(feature = "wyr1d-selector32")]
+                #[cfg(any(feature = "wyr1d-selector32", feature = "wyr1e-production"))]
                 {
                     let parsed = wyrmroot_device_proto::controller_v1_1::parse(bytes).unwrap();
                     self.controller_request = Some(parsed.controller);
@@ -4218,7 +4221,7 @@ mod tests {
                         self.registry_service_generation
                     );
                 }
-                #[cfg(not(feature = "wyr1d-selector32"))]
+                #[cfg(not(any(feature = "wyr1d-selector32", feature = "wyr1e-production")))]
                 {
                     self.controller_request = Some(parse_controller(bytes).unwrap());
                 }
@@ -4372,9 +4375,9 @@ mod tests {
                 transaction_id: result.2,
             })
         );
-        #[cfg(feature = "wyr1d-selector32")]
+        #[cfg(any(feature = "wyr1d-selector32", feature = "wyr1e-production"))]
         assert_eq!(platform.controller_service_generation, Some(result.1));
-        #[cfg(not(feature = "wyr1d-selector32"))]
+        #[cfg(not(any(feature = "wyr1d-selector32", feature = "wyr1e-production")))]
         assert_eq!(platform.controller_service_generation, None);
     }
 
@@ -4386,7 +4389,7 @@ mod tests {
             transaction_id: 9,
         };
         let bytes = encode_publication_request(request, 0xC1_0801).unwrap();
-        #[cfg(feature = "wyr1d-selector32")]
+        #[cfg(any(feature = "wyr1d-selector32", feature = "wyr1e-production"))]
         {
             let parsed = wyrmroot_device_proto::controller_v1_1::parse(&bytes).unwrap();
             assert_eq!(parsed.controller, request);
@@ -4394,7 +4397,7 @@ mod tests {
             assert_ne!(parsed.service_generation, binding().generation.0);
             assert!(parse_controller(&bytes).is_err());
         }
-        #[cfg(not(feature = "wyr1d-selector32"))]
+        #[cfg(not(any(feature = "wyr1d-selector32", feature = "wyr1e-production")))]
         assert_eq!(parse_controller(&bytes), Ok(request));
     }
 

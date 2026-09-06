@@ -66,9 +66,13 @@ use wyrmroot_device_proto::control_v1_1::{
     DEVICE_STAGE_BYTES as D3_DEVICE_STAGE_BYTES, INTERRUPT_STAGE_BYTES as D3_INTERRUPT_STAGE_BYTES,
     READY_BYTES as D3_READY_BYTES, encode as encode_control_v1_1, parse as parse_control_v1_1,
 };
-#[cfg(not(any(feature = "dw1e3-selector31", feature = "wyr1d-selector32")))]
+#[cfg(not(any(
+    feature = "dw1e3-selector31",
+    feature = "wyr1d-selector32",
+    feature = "wyr1e-production"
+)))]
 use wyrmroot_device_proto::controller::INSTALL_BYTES;
-#[cfg(not(feature = "wyr1d-selector32"))]
+#[cfg(not(any(feature = "wyr1d-selector32", feature = "wyr1e-production")))]
 use wyrmroot_device_proto::controller::parse as parse_controller;
 #[cfg(feature = "wyr1d-selector32")]
 use wyrmroot_device_proto::d5_controller::{
@@ -1288,7 +1292,17 @@ fn receive_controller(
     let mut bytes = [0u8; D3_DEVICE_STAGE_BYTES];
     #[cfg(all(not(feature = "dw1e3-selector31"), feature = "wyr1d-selector32"))]
     let mut bytes = [0u8; D5_CONTROLLER_BYTES];
-    #[cfg(not(any(feature = "dw1e3-selector31", feature = "wyr1d-selector32")))]
+    #[cfg(all(
+        not(feature = "dw1e3-selector31"),
+        not(feature = "wyr1d-selector32"),
+        feature = "wyr1e-production"
+    ))]
+    let mut bytes = [0u8; wyrmroot_device_proto::controller_v1_1::RECORD_BYTES];
+    #[cfg(not(any(
+        feature = "dw1e3-selector31",
+        feature = "wyr1d-selector32",
+        feature = "wyr1e-production"
+    )))]
     let mut bytes = [0u8; INSTALL_BYTES];
     let mut handles = [DwReceivedHandleInfoV1::default(); 1];
     let counts = receive_channel(bootstrap, &mut bytes, &mut handles).map_err(|_| failure(27))?;
@@ -1340,7 +1354,7 @@ fn receive_controller(
             .map(ControllerInput::D5)
             .map_err(|_| failure(233));
     }
-    #[cfg(feature = "wyr1d-selector32")]
+    #[cfg(any(feature = "wyr1d-selector32", feature = "wyr1e-production"))]
     let publication = match wyrmroot_device_proto::controller_v1_1::parse(&bytes[..counts.bytes]) {
         Ok(publication) => publication,
         Err(_) => {
@@ -1348,9 +1362,9 @@ fn receive_controller(
             return Err(failure(29));
         }
     };
-    #[cfg(feature = "wyr1d-selector32")]
+    #[cfg(any(feature = "wyr1d-selector32", feature = "wyr1e-production"))]
     let message = publication.controller;
-    #[cfg(not(feature = "wyr1d-selector32"))]
+    #[cfg(not(any(feature = "wyr1d-selector32", feature = "wyr1e-production")))]
     let message = match parse_controller(&bytes[..counts.bytes]) {
         Ok(message) => message,
         Err(_) => {
@@ -1389,9 +1403,9 @@ fn receive_controller(
             return Err(failure(33));
         }
     };
-    #[cfg(feature = "wyr1d-selector32")]
+    #[cfg(any(feature = "wyr1d-selector32", feature = "wyr1e-production"))]
     let accepted = resident.accept_publication(publication, counts.handles as u32);
-    #[cfg(not(feature = "wyr1d-selector32"))]
+    #[cfg(not(any(feature = "wyr1d-selector32", feature = "wyr1e-production")))]
     let accepted = resident.accept(message, counts.handles as u32);
     let action = match accepted {
         Ok(action) => action,
