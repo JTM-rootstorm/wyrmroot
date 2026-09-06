@@ -196,8 +196,11 @@ fn hello_rejects_bootstrap_channel_excess_rights() {
 struct StreamFixture {
     init: [u8; 64],
     handles: [DwReceivedHandleInfoV1; 3],
+    wait_signals: DwSignals,
+    wait_count: usize,
     sent: Vec<Vec<u8>>,
     closed: Vec<DwHandle>,
+    events: Vec<&'static str>,
 }
 impl StreamFixture {
     fn new() -> Self {
@@ -212,8 +215,11 @@ impl StreamFixture {
         Self {
             init,
             handles: [handle(21), handle(22), handle(23)],
+            wait_signals: DW_SIGNAL_PEER_CLOSED,
+            wait_count: 0,
             sent: vec![],
             closed: vec![],
+            events: vec![],
         }
     }
 }
@@ -241,17 +247,34 @@ impl HelloSystem for StreamFixture {
         })
     }
     fn send_channel(&mut self, _: DwHandle, bytes: &[u8]) -> Result<(), NativeError> {
+        self.events.push("ready");
         self.sent.push(bytes.to_vec());
         Ok(())
     }
     fn close_handle(&mut self, handle: DwHandle) -> Result<(), NativeError> {
+        self.events.push(match handle {
+            CHANNEL => "close-bootstrap",
+            DwHandle(21..=23) => "close-stream",
+            _ => "close-other",
+        });
         self.closed.push(handle);
         Ok(())
     }
 }
 impl JobHelloSystem for StreamFixture {
-    fn wait_channel(&mut self, _: DwHandle, _: DwSignals) -> Result<DwSignals, NativeError> {
-        Ok(DW_SIGNAL_PEER_CLOSED)
+    fn wait_channel(
+        &mut self,
+        channel: DwHandle,
+        signals: DwSignals,
+    ) -> Result<DwSignals, NativeError> {
+        assert_eq!(channel, CHANNEL);
+        assert_eq!(
+            signals,
+            DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0)
+        );
+        self.wait_count += 1;
+        self.events.push("wait-release");
+        Ok(self.wait_signals)
     }
 }
 impl StreamSystem for StreamFixture {
@@ -264,6 +287,7 @@ impl StreamSystem for StreamFixture {
         unreachable!()
     }
     fn send(&mut self, _: DwHandle, bytes: &[u8]) -> Result<(), NativeError> {
+        self.events.push("stdout-data");
         self.sent.push(bytes.to_vec());
         Ok(())
     }
@@ -290,4 +314,30 @@ fn stream_hello_uses_only_a_validated_native_stdout_record() {
         fixture.closed,
         [DwHandle(21), DwHandle(22), DwHandle(23), CHANNEL]
     );
+    assert_eq!(fixture.wait_count, 1);
+    assert_eq!(
+        fixture.events,
+        [
+            "stdout-data",
+            "close-stream",
+            "close-stream",
+            "close-stream",
+            "ready",
+            "wait-release",
+            "close-bootstrap",
+        ]
+    );
+}
+
+#[test]
+fn stream_hello_rejects_readable_post_ready_data() {
+    let mut fixture = StreamFixture::new();
+    fixture.wait_signals = DW_SIGNAL_READABLE;
+    assert_eq!(
+        run_stream_hello(&mut fixture, CHANNEL),
+        Err(HelloError::PostReadySignals(DW_SIGNAL_READABLE))
+    );
+    assert_eq!(fixture.wait_count, 1);
+    assert_eq!(fixture.closed, [DwHandle(21), DwHandle(22), DwHandle(23)]);
+    assert_eq!(fixture.events.last(), Some(&"wait-release"));
 }

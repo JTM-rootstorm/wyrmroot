@@ -134,6 +134,14 @@ pub fn run_job_hello<System: JobHelloSystem>(
     bootstrap_channel: DwHandle,
 ) -> Result<(), HelloError> {
     run_profile_ready(system, bootstrap_channel, LaunchProfile::JobV2)?;
+    wait_for_release(system, bootstrap_channel)?;
+    close_bootstrap(system, bootstrap_channel)
+}
+
+fn wait_for_release<System: JobHelloSystem>(
+    system: &mut System,
+    bootstrap_channel: DwHandle,
+) -> Result<(), HelloError> {
     let requested = DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0);
     let observed = system
         .wait_channel(bootstrap_channel, requested)
@@ -147,7 +155,7 @@ pub fn run_job_hello<System: JobHelloSystem>(
     {
         return Err(HelloError::PostReadySignals(observed));
     }
-    close_bootstrap(system, bootstrap_channel)
+    Ok(())
 }
 
 /// Completes the D1 stream-profile hello exchange and writes a binary-safe
@@ -223,6 +231,7 @@ pub fn run_stream_hello<System: StreamHelloSystem>(
             operation: HelloNativeOperation::SendReady,
             cause,
         })?;
+    wait_for_release(system, bootstrap_channel)?;
     close_bootstrap(system, bootstrap_channel)
 }
 

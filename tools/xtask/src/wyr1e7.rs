@@ -34,6 +34,9 @@ const KERNEL_TARGET: &str = "x86_64-unknown-none";
 const CURRENT_DEVMGR_BINARY: &str = "devmgr";
 const CURRENT_DEVMGR_FEATURES: &str = "wyr1e-production";
 const CURRENT_DEVMGR_COMMAND: &str = "cargo build --offline --locked --release --target x86_64-unknown-wyrmroot --package wyrmroot-devmgr --bin devmgr --no-default-features --features wyr1e-production";
+const CURRENT_HELLO_BINARY: &str = "hello";
+const CURRENT_HELLO_FEATURES: &str = "native-stream-hello";
+const CURRENT_HELLO_COMMAND: &str = "cargo build --offline --locked --release --target x86_64-unknown-wyrmroot --package wyrmroot-hello --bin wyrmroot-stream-hello --no-default-features --features native-stream-hello";
 const COM1_FD_GROUP: &str = "wyr1-e7-com1-evidence-v1";
 const COM2_FD_GROUP: &str = "wyr1-e7-com2-interactive-v1";
 const ESP_FD_GROUP: &str = "dw-f13-esp-v1";
@@ -63,10 +66,6 @@ const ACCEPTED_E6_REUSED_SHA256: &[(&str, &str)] = &[
     (
         "wyrmsh",
         "9d7f3ab7462488dd3f4db6226ef119516de7a2933c4441eeb331fc4f07f72101",
-    ),
-    (
-        "hello",
-        "5acb3922032f522de84d6378af837260d8fbcb63fff22bd26299a8642bcd5ba6",
     ),
     (
         "stack_report",
@@ -667,6 +666,13 @@ fn render_source_receipt(
                 return Err(Failure::task("WYR1-E7 devmgr build specification drifted"));
             }
             (CURRENT_DEVMGR_COMMAND.to_owned(), CURRENT_DEVMGR_FEATURES)
+        } else if label == CURRENT_HELLO_BINARY {
+            if command != CURRENT_HELLO_COMMAND
+                || crate::wyr1c::e7_native_features(label)? != CURRENT_HELLO_FEATURES
+            {
+                return Err(Failure::task("WYR1-E7 hello build specification drifted"));
+            }
+            (CURRENT_HELLO_COMMAND.to_owned(), CURRENT_HELLO_FEATURES)
         } else {
             (command, crate::wyr1c::e7_native_features(label)?)
         };
@@ -678,7 +684,7 @@ fn render_source_receipt(
             format!("{}_command", label.replace('-', "_")),
             if matches!(
                 label,
-                "system-init" | "devmgr" | "cpu-hog" | "exit-nonzero" | "fault"
+                "system-init" | "devmgr" | "hello" | "cpu-hog" | "exit-nonzero" | "fault"
             ) {
                 command
             } else {
@@ -2362,6 +2368,8 @@ module._strict_c6_toml(sys.stdin.buffer.read(), keys, "Rust-rendered E7 fixture"
                 ("evidence_protocol", EVIDENCE_PROTOCOL),
                 ("devmgr_command", CURRENT_DEVMGR_COMMAND),
                 ("devmgr_features", CURRENT_DEVMGR_FEATURES),
+                ("hello_command", CURRENT_HELLO_COMMAND),
+                ("hello_features", CURRENT_HELLO_FEATURES),
                 ("malformed_elf_literal", "WYR1-E7 malformed ELF\\n"),
             ],
         );
@@ -2391,6 +2399,21 @@ module._strict_c6_toml(sys.stdin.buffer.read(), keys, "Rust-rendered E7 fixture"
         assert!(
             root_verifier_accepts_schema("source", &inherited)
                 .expect_err("root verifier must reject inherited E6 devmgr lineage")
+                .message
+                .contains("root verifier rejected")
+        );
+        source.insert(
+            "devmgr_command".to_owned(),
+            CURRENT_DEVMGR_COMMAND.to_owned(),
+        );
+        source.insert(
+            "hello_command".to_owned(),
+            format!("inherited E6 revision {ACCEPTED_E6_REVISION}: {CURRENT_HELLO_COMMAND}"),
+        );
+        let inherited = render_source_fields(&source)?;
+        assert!(
+            root_verifier_accepts_schema("source", &inherited)
+                .expect_err("root verifier must reject inherited E6 hello lineage")
                 .message
                 .contains("root verifier rejected")
         );
@@ -2504,6 +2527,11 @@ module._strict_c6_toml(sys.stdin.buffer.read(), keys, "Rust-rendered E7 fixture"
             !ACCEPTED_E6_REUSED_SHA256
                 .iter()
                 .any(|(key, _)| *key == CURRENT_DEVMGR_BINARY)
+        );
+        assert!(
+            !ACCEPTED_E6_REUSED_SHA256
+                .iter()
+                .any(|(key, _)| *key == CURRENT_HELLO_BINARY)
         );
         request.insert("devmgr_sha256".to_owned(), "34".repeat(32));
         request.insert(

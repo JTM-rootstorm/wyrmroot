@@ -398,7 +398,7 @@ const WYR1E6_PRODUCT_NATIVE_SPECS: [NativeSpec; 7] = [
     },
 ];
 
-const WYR1E7_SELECTED_NATIVE_SPECS: [NativeSpec; 5] = [
+const WYR1E7_SELECTED_NATIVE_SPECS: [NativeSpec; 6] = [
     NativeSpec {
         label: "system-init",
         package: "wyrmroot-system-init",
@@ -412,6 +412,13 @@ const WYR1E7_SELECTED_NATIVE_SPECS: [NativeSpec; 5] = [
         binary: "devmgr",
         features: "wyr1e-production",
         artifact: "devmgr",
+    },
+    NativeSpec {
+        label: "hello",
+        package: "wyrmroot-hello",
+        binary: "wyrmroot-stream-hello",
+        features: "native-stream-hello",
+        artifact: "wyrmroot-stream-hello",
     },
     NativeSpec {
         label: "cpu-hog",
@@ -4087,7 +4094,7 @@ mod tests {
     }
 
     #[test]
-    fn wyr1e7_native_gate_selects_current_init_devmgr_and_three_fixture_actors() {
+    fn wyr1e7_native_gate_selects_current_init_devmgr_hello_and_three_fixture_actors() {
         let specs = WYR1E7_SELECTED_NATIVE_SPECS
             .iter()
             .map(|spec| (spec.label, spec.package, spec.binary, spec.features))
@@ -4102,6 +4109,12 @@ mod tests {
                     "wyr1e-selector33",
                 ),
                 ("devmgr", "wyrmroot-devmgr", "devmgr", "wyr1e-production",),
+                (
+                    "hello",
+                    "wyrmroot-hello",
+                    "wyrmroot-stream-hello",
+                    "native-stream-hello",
+                ),
                 (
                     "cpu-hog",
                     "wyrmroot-dw1b-preemption",
@@ -4127,7 +4140,7 @@ mod tests {
                 .unwrap()
                 .contains("WYRMROOT_WYR1E7_EVIDENCE_NONCE")
         );
-        for label in ["devmgr", "cpu-hog", "exit-nonzero", "fault"] {
+        for label in ["devmgr", "hello", "cpu-hog", "exit-nonzero", "fault"] {
             assert!(
                 !e7_native_command(label)
                     .unwrap()
