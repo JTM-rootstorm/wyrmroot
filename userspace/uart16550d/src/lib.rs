@@ -46,6 +46,12 @@ pub const RAW_STREAM_RIGHTS: DwRights =
     DwRights(DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_WAIT.0 | DW_RIGHT_INSPECT.0);
 pub const INTERRUPT_RIGHTS: DwRights =
     DwRights(DW_RIGHT_WAIT.0 | DW_RIGHT_MODIFY.0 | DW_RIGHT_INSPECT.0);
+/// One absolute production-retirement budget. At 115200 baud this leaves
+/// substantial headroom over the bounded raw Channel, software ring, and
+/// hardware FIFO contents without permitting an indefinite device wait.
+pub const GRACEFUL_RETIRE_TIMEOUT_NS: u64 = 2_000_000_000;
+/// TEMT is sampled at most once per millisecond while retirement is pending.
+pub const GRACEFUL_RETIRE_TEMT_POLL_NS: u64 = 1_000_000;
 
 /// Both startup handoff waits are fail-closed: once the control peer has
 /// closed, queued readability cannot authorize further hardware activation.
@@ -513,6 +519,103 @@ impl ReadySet {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GracefulRetireError {
+    DeadlineOverflow,
+    TimedOut,
+    ProbeOutOfOrder,
+}
+
+/// Local facts required before an exact production `Retire` may release the
+/// UART generation. The controller owns producer quiescence; this state owns
+/// only the driver's fresh receive, software-ring, and paced TEMT proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GracefulRetireDrain {
+    deadline: u64,
+    next_temt_poll: u64,
+    channel_empty: bool,
+}
+
+impl GracefulRetireDrain {
+    pub fn new(now: u64, no_stream: bool) -> Result<Self, GracefulRetireError> {
+        let deadline = now
+            .checked_add(GRACEFUL_RETIRE_TIMEOUT_NS)
+            .filter(|deadline| *deadline != u64::MAX)
+            .ok_or(GracefulRetireError::DeadlineOverflow)?;
+        Ok(Self {
+            deadline,
+            next_temt_poll: now,
+            channel_empty: no_stream,
+        })
+    }
+
+    pub const fn deadline(self) -> u64 {
+        self.deadline
+    }
+
+    pub const fn channel_empty(self) -> bool {
+        self.channel_empty
+    }
+
+    /// Any admitted datagram invalidates a prior empty observation. The
+    /// driver must receive again and obtain a fresh WOULD_BLOCK result.
+    pub fn observe_stream_record(&mut self) {
+        self.channel_empty = false;
+    }
+
+    pub fn observe_stream_empty(&mut self) {
+        self.channel_empty = true;
+    }
+
+    pub fn wait_deadline(
+        self,
+        now: u64,
+        software_tx_empty: bool,
+    ) -> Result<u64, GracefulRetireError> {
+        if now >= self.deadline {
+            return Err(GracefulRetireError::TimedOut);
+        }
+        Ok(if self.channel_empty && software_tx_empty {
+            core::cmp::min(self.next_temt_poll, self.deadline)
+        } else {
+            self.deadline
+        })
+    }
+
+    pub fn temt_probe_due(
+        self,
+        now: u64,
+        software_tx_empty: bool,
+    ) -> Result<bool, GracefulRetireError> {
+        if now >= self.deadline {
+            return Err(GracefulRetireError::TimedOut);
+        }
+        Ok(self.channel_empty && software_tx_empty && now >= self.next_temt_poll)
+    }
+
+    /// Returns true only for the first in-budget TEMT=1 sample after both
+    /// receive-side and software-ring facts hold. A false sample advances only
+    /// the paced poll point; the absolute deadline never moves.
+    pub fn observe_temt(
+        &mut self,
+        now: u64,
+        software_tx_empty: bool,
+        transport_empty: bool,
+    ) -> Result<bool, GracefulRetireError> {
+        if !self.temt_probe_due(now, software_tx_empty)? {
+            return Err(GracefulRetireError::ProbeOutOfOrder);
+        }
+        if transport_empty {
+            return Ok(true);
+        }
+        self.next_temt_poll = now
+            .checked_add(GRACEFUL_RETIRE_TEMT_POLL_NS)
+            .unwrap_or(self.deadline)
+            .min(self.deadline);
+        Ok(false)
+    }
+}
+
 /// The joined D3B/D3D state after exact Interrupt intake but before
 /// production READY.  Handle closure remains an explicit caller operation so
 /// native code and host models can prove the same order.
@@ -671,13 +774,23 @@ impl<I: ByteRegisterIo> ProductionDriver<I> {
     /// stream endpoint is detached. The caller deliberately retains the
     /// Interrupt/resource/control handles for controller-authorized stage 2.
     pub fn begin_selector_retire(&mut self) {
-        self.uart.disable_interrupts();
+        self.begin_graceful_retire();
     }
 
     /// Exact stage-1 IER readback. The caller must fail closed rather than
     /// advertise retirement readiness if the hardware still exposes any
     /// enabled source.
     pub fn selector_interrupts_disabled(&mut self) -> bool {
+        self.graceful_retire_interrupts_disabled()
+    }
+
+    /// Final production-retirement quiesce after receive, software TX, and
+    /// TEMT completion. The caller checks sticky PIO health around readback.
+    pub fn begin_graceful_retire(&mut self) {
+        self.uart.disable_interrupts();
+    }
+
+    pub fn graceful_retire_interrupts_disabled(&mut self) -> bool {
         self.uart.interrupts_disabled()
     }
 
@@ -1163,6 +1276,70 @@ mod tests {
             )))
         ));
         assert!(matches!(driver.uart().state(), CoreState::Failed(_)));
+    }
+
+    #[test]
+    fn graceful_retire_requires_fresh_channel_empty_software_empty_and_paced_temt() {
+        let start = 10_000_000;
+        let mut drain = GracefulRetireDrain::new(start, false).unwrap();
+        assert_eq!(drain.deadline(), start + GRACEFUL_RETIRE_TIMEOUT_NS);
+        assert!(!drain.channel_empty());
+        assert!(!drain.temt_probe_due(start, true).unwrap());
+
+        drain.observe_stream_empty();
+        assert!(drain.channel_empty());
+        assert!(!drain.temt_probe_due(start, false).unwrap());
+        assert!(drain.temt_probe_due(start, true).unwrap());
+        assert!(!drain.observe_temt(start, true, false).unwrap());
+        assert_eq!(
+            drain.wait_deadline(start, true).unwrap(),
+            start + GRACEFUL_RETIRE_TEMT_POLL_NS
+        );
+        assert!(
+            !drain
+                .temt_probe_due(start + GRACEFUL_RETIRE_TEMT_POLL_NS - 1, true)
+                .unwrap()
+        );
+
+        drain.observe_stream_record();
+        assert!(!drain.channel_empty());
+        assert!(
+            !drain
+                .temt_probe_due(start + GRACEFUL_RETIRE_TEMT_POLL_NS, true)
+                .unwrap()
+        );
+        drain.observe_stream_empty();
+        assert!(
+            drain
+                .temt_probe_due(start + GRACEFUL_RETIRE_TEMT_POLL_NS, true)
+                .unwrap()
+        );
+        assert!(
+            drain
+                .observe_temt(start + GRACEFUL_RETIRE_TEMT_POLL_NS, true, true)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn graceful_retire_uses_one_absolute_deadline_and_rejects_early_probe() {
+        let start = u64::MAX - GRACEFUL_RETIRE_TIMEOUT_NS - 1;
+        let mut drain = GracefulRetireDrain::new(start, true).unwrap();
+        assert_eq!(drain.deadline(), u64::MAX - 1);
+        assert_eq!(
+            drain.observe_temt(start, false, true),
+            Err(GracefulRetireError::ProbeOutOfOrder)
+        );
+        assert!(!drain.observe_temt(start, true, false).unwrap());
+        assert_eq!(drain.deadline(), u64::MAX - 1);
+        assert_eq!(
+            drain.wait_deadline(u64::MAX - 1, true),
+            Err(GracefulRetireError::TimedOut)
+        );
+        assert_eq!(
+            GracefulRetireDrain::new(start + 1, true),
+            Err(GracefulRetireError::DeadlineOverflow)
+        );
     }
 
     #[cfg(feature = "wyr1d-selector32")]

@@ -106,7 +106,9 @@ fn selector31_rechecks_stream_input_after_final_ack_before_temt() {
     assert!(post_ack < temt);
     let proof = &DRIVER[input_proof..];
     assert!(proof.contains("loop {"));
-    assert!(proof.contains("Ok(StreamReadOutcome::WouldBlock) => return Ok(())"));
+    assert!(proof.contains(
+        "Ok(StreamReadOutcome::WouldBlock | StreamReadOutcome::PeerClosed) => return Ok(())"
+    ));
     assert!(proof.contains("Ok(StreamReadOutcome::EmptyData) => continue"));
     assert!(proof.contains("StreamReadOutcome::Accepted | StreamReadOutcome::Detached"));
 }
@@ -132,7 +134,7 @@ fn selector31_queue_proof_drains_one_or_many_empty_records_but_rejects_nonempty_
         .find("Ok(StreamReadOutcome::EmptyData) => continue")
         .unwrap();
     let clear = body
-        .find("Ok(StreamReadOutcome::WouldBlock) => return Ok(())")
+        .find("Ok(StreamReadOutcome::WouldBlock | StreamReadOutcome::PeerClosed) => return Ok(())")
         .unwrap();
     let reject = body
         .find("StreamReadOutcome::Accepted | StreamReadOutcome::Detached")
@@ -229,9 +231,8 @@ fn send_side_peer_close_enters_receive_drain_before_detach() {
     assert!(pending_result < resolution);
 
     let dispatch = DRIVER.find("service_stream_write(driver, control").unwrap();
-    let suppression = DRIVER
-        .find("!peer_close_drain.is_pending() && driver.wants_stream_writable()")
-        .unwrap();
+    let suppression = DRIVER.find("!peer_close_drain.is_pending()").unwrap();
+    assert!(DRIVER[..dispatch].contains("graceful_retire.is_none()"));
     assert!(suppression < dispatch && dispatch < writer_start);
 }
 
@@ -264,6 +265,86 @@ fn native_stream_and_teardown_paths_preserve_commit_and_close_order() {
         .unwrap();
     let control = DRIVER.rfind("close_handle(control)").unwrap();
     assert!(disable < stream && stream < interrupt && interrupt < resource && resource < control);
+}
+
+#[test]
+fn ordinary_retire_drains_raw_tx_and_temt_before_ier_zero_release() {
+    let retire = DRIVER
+        .find("Ok(ControlOutcome::Retire) => {")
+        .expect("ordinary Retire branch");
+    let start = DRIVER[retire..]
+        .find("GracefulRetireDrain::new")
+        .expect("bounded production drain")
+        + retire;
+    let service = DRIVER
+        .find("fn service_graceful_retire_drain")
+        .expect("production drain service");
+    let receive = DRIVER[service..]
+        .find("service_stream_read(")
+        .expect("raw receive")
+        + service;
+    let fresh_empty = DRIVER[service..]
+        .find("drain.observe_stream_empty()")
+        .expect("fresh receive-side empty")
+        + service;
+    let software_empty = DRIVER[service..]
+        .find("driver.tx_free() == wyrmroot_uart16550_core::RING_CAPACITY")
+        .expect("software TX empty")
+        + service;
+    let temt = DRIVER[service..]
+        .find("driver.uart_mut().transport_empty()")
+        .expect("hardware transport empty")
+        + service;
+    let complete = DRIVER
+        .find("fn complete_graceful_retire")
+        .expect("drained retirement completion");
+    let disable = DRIVER[complete..]
+        .find("driver.begin_graceful_retire()")
+        .expect("IER zero transition")
+        + complete;
+    let readback = DRIVER[complete..]
+        .find("driver.graceful_retire_interrupts_disabled()")
+        .expect("IER zero readback")
+        + complete;
+    let release = DRIVER[complete..]
+        .find("release_driver(driver, control, 0)")
+        .expect("release after readback")
+        + complete;
+    assert!(retire < start && start < service);
+    assert!(service < receive && receive < fresh_empty);
+    assert!(fresh_empty < software_empty && software_empty < temt);
+    assert!(temt < complete && complete < disable && disable < readback && readback < release);
+
+    let drain_body = &DRIVER[service..complete];
+    assert!(drain_body.contains("temt_probe_due"));
+    assert!(drain_body.contains("StreamReadOutcome::PeerClosed"));
+    assert!(!drain_body.contains("isolate_stream(driver, control)"));
+    assert!(!drain_body.contains("peer_close_drain"));
+
+    let receive = DRIVER
+        .split("fn service_stream_read")
+        .nth(1)
+        .expect("stream receive helper");
+    assert!(receive.contains(
+        "status_is(error, DW_STATUS_WOULD_BLOCK) => {\n            return Ok(StreamReadOutcome::WouldBlock)"
+    ));
+    assert!(receive.contains(
+        "status_is(error, DW_STATUS_PEER_CLOSED) => {\n            return Ok(StreamReadOutcome::PeerClosed)"
+    ));
+
+    let dispatch = &DRIVER[..service];
+    let pending = dispatch
+        .rfind("if let Some(drain) = graceful_retire.as_mut()")
+        .expect("pending Retire dispatch");
+    let probe = dispatch[pending..]
+        .find("probe_control(control)")
+        .expect("control probe before drain")
+        + pending;
+    let queued = dispatch[pending..]
+        .find("DW_SIGNAL_READABLE.0 != 0")
+        .expect("queued control rejection")
+        + pending;
+    assert!(pending < probe && probe < queued && queued < service);
 }
 
 #[test]

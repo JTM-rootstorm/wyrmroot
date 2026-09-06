@@ -443,7 +443,7 @@ const WYR1E7_SELECTED_NATIVE_SPECS: [NativeSpec; 6] = [
     },
 ];
 
-const WYR1E8_SELECTED_NATIVE_SPECS: [NativeSpec; 9] = [
+const WYR1E8_SELECTED_NATIVE_SPECS: [NativeSpec; 10] = [
     NativeSpec {
         label: "system-init",
         package: "wyrmroot-system-init",
@@ -457,6 +457,13 @@ const WYR1E8_SELECTED_NATIVE_SPECS: [NativeSpec; 9] = [
         binary: "devmgr",
         features: "wyr1e8-production",
         artifact: "devmgr",
+    },
+    NativeSpec {
+        label: "uart16550d",
+        package: "wyrmroot-uart16550d",
+        binary: "uart16550d",
+        features: "native-uart16550d",
+        artifact: "uart16550d",
     },
     NativeSpec {
         label: "consoled",
@@ -909,7 +916,7 @@ pub(crate) fn run_wyr1e8_actor_native_checks(repository: &Path) -> Result<(), Fa
         repository,
         "WYR1-E8 actors",
         "wyr1e8-actors",
-        &WYR1E8_SELECTED_NATIVE_SPECS[7..],
+        &WYR1E8_SELECTED_NATIVE_SPECS[8..],
         &[],
         None,
     )
@@ -4353,6 +4360,30 @@ pub(crate) fn validate_e8_nonce(nonce: &str) -> Result<(), Failure> {
             "WYR1-E8 evidence nonce must be 16 nonzero uppercase hexadecimal characters",
         ));
     }
+    const SELECTED_TOKEN_INDICES: [&str; 17] = [
+        "0000000000000001",
+        "0000000000000002",
+        "0000000000000003",
+        "0000000000000004",
+        "0000000000000005",
+        "0000000000000006",
+        "0000000000000101",
+        "0000000000000102",
+        "0000000000000201",
+        "0000000000000202",
+        "0000000000000301",
+        "0000000000000310",
+        "0000000000000311",
+        "0000000000000312",
+        "0000000000000320",
+        "0000000000000321",
+        "0000000000000322",
+    ];
+    if SELECTED_TOKEN_INDICES.contains(&nonce) {
+        return Err(Failure::task(
+            "WYR1-E8 evidence nonce must not equal a selected token index",
+        ));
+    }
     Ok(())
 }
 
@@ -4778,7 +4809,7 @@ mod tests {
             .iter()
             .map(|spec| (spec.label, spec.package, spec.binary, spec.features))
             .collect::<Vec<_>>();
-        assert_eq!(specs.len(), 9);
+        assert_eq!(specs.len(), 10);
         assert_eq!(
             specs[0],
             (
@@ -4789,6 +4820,12 @@ mod tests {
             )
         );
         assert!(specs.contains(&("devmgr", "wyrmroot-devmgr", "devmgr", "wyr1e8-production",)));
+        assert!(specs.contains(&(
+            "uart16550d",
+            "wyrmroot-uart16550d",
+            "uart16550d",
+            "native-uart16550d",
+        )));
         assert!(specs.contains(&(
             "consoled",
             "wyrmroot-consoled",
@@ -4894,6 +4931,42 @@ mod tests {
             "E80000000000000G",
         ] {
             assert!(validate_e8_nonce(invalid).is_err());
+        }
+        for selected_index in [
+            "0000000000000001",
+            "0000000000000002",
+            "0000000000000003",
+            "0000000000000004",
+            "0000000000000005",
+            "0000000000000006",
+            "0000000000000101",
+            "0000000000000102",
+            "0000000000000201",
+            "0000000000000202",
+            "0000000000000301",
+            "0000000000000310",
+            "0000000000000311",
+            "0000000000000312",
+            "0000000000000320",
+            "0000000000000321",
+            "0000000000000322",
+        ] {
+            assert!(validate_e8_nonce(selected_index).is_err());
+        }
+        for adjacent_allowed in [
+            "0000000000000007",
+            "0000000000000100",
+            "0000000000000103",
+            "0000000000000200",
+            "0000000000000203",
+            "0000000000000300",
+            "0000000000000302",
+            "000000000000030F",
+            "0000000000000313",
+            "000000000000031F",
+            "0000000000000323",
+        ] {
+            assert!(validate_e8_nonce(adjacent_allowed).is_ok());
         }
     }
 

@@ -37,10 +37,6 @@ const ACCEPTED_E6_REUSED_SHA256: &[(&str, &str)] = &[
         "3c75e3edaf27dd5457e433fdc1a5368c985a25469d6c70cdd954cb1646f3973b",
     ),
     (
-        "uart16550d",
-        "a6518f0293f7c88d816201d53661432345a8aa722409a25a9720c17972359a27",
-    ),
-    (
         "wyrmsh",
         "9d7f3ab7462488dd3f4db6226ef119516de7a2933c4441eeb331fc4f07f72101",
     ),
@@ -690,7 +686,7 @@ fn source_receipt(
         let command = wyr1c::e8_native_command(label)?;
         f.insert(
             format!("{key}_command"),
-            if matches!(label, "registryd" | "uart16550d" | "wyrmsh") {
+            if matches!(label, "registryd" | "wyrmsh") {
                 format!("inherited E6 revision {ACCEPTED_E6_REVISION}: {command}")
             } else {
                 command
@@ -1565,6 +1561,14 @@ mod tests {
             "native-consoled,wyr1e-wyrmsh,wyr1e8-recovery"
         );
         assert_eq!(
+            wyr1c::e8_native_features("uart16550d").unwrap(),
+            "native-uart16550d"
+        );
+        assert_eq!(
+            wyr1c::e8_native_command("uart16550d").unwrap(),
+            "cargo build --offline --locked --release --target x86_64-unknown-wyrmroot --package wyrmroot-uart16550d --bin uart16550d --no-default-features --features native-uart16550d"
+        );
+        assert_eq!(
             wyr1c::e8_native_features("recovery-trigger").unwrap(),
             "native-recovery-trigger"
         );
@@ -1582,7 +1586,7 @@ mod tests {
                 .iter()
                 .map(|(label, _)| *label)
                 .collect::<Vec<_>>(),
-            ["registryd", "uart16550d", "wyrmsh", "stack_report"]
+            ["registryd", "wyrmsh", "stack_report"]
         );
     }
 

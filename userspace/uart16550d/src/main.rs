@@ -35,17 +35,16 @@ use wyrmroot_dw1e3_com2_test::{
 use wyrmroot_loader::launch::{
     CHILD_CHANNEL_RIGHTS, DEVICE_DRIVER_BYTES, SELF_ROOT_RIGHTS, parse_device_driver_init,
 };
-#[cfg(feature = "wyr1d-selector32")]
-use wyrmroot_runtime::monotonic_active_now;
 use wyrmroot_runtime::{
     BOOTSTRAP_CHANNEL_EXPECTATION, NativeError, StartupBlock, close_handle, device_pio_read,
-    device_pio_write, device_resource_info, interrupt_ack, interrupt_info, panic_abort,
-    query_capability_info, receive_channel, send_channel, validate_bootstrap_channel, wait_many,
+    device_pio_write, device_resource_info, interrupt_ack, interrupt_info, monotonic_active_now,
+    panic_abort, query_capability_info, receive_channel, send_channel, validate_bootstrap_channel,
+    wait_many,
 };
 #[cfg(feature = "dw1e3-selector31")]
 use wyrmroot_runtime::{
     Dw1e3ReportEvent, create_timer, dw1e3_bind_driver, dw1e3_build_nonce, dw1e3_challenge_nonce,
-    dw1e3_report, monotonic_active_now, set_timer, wait_one,
+    dw1e3_report, set_timer, wait_one,
 };
 use wyrmroot_stream_proto::MAX_RECORD_BYTES;
 #[cfg(feature = "dw1e3-selector31")]
@@ -54,8 +53,9 @@ use wyrmroot_uart16550_core::ByteRegisterIo;
 #[cfg(feature = "wyr1d-selector32")]
 use wyrmroot_uart16550d::d5_drain::DrainFence;
 use wyrmroot_uart16550d::{
-    DeviceStage, PeerCloseDrain, ProductionDriver, ReceivedDeviceResource, ReceivedInterrupt,
-    ReceivedStreamEndpoint, StreamSendAction, StreamSendResult, startup_control_is_readable,
+    DeviceStage, GracefulRetireDrain, PeerCloseDrain, ProductionDriver, ReceivedDeviceResource,
+    ReceivedInterrupt, ReceivedStreamEndpoint, StreamSendAction, StreamSendResult,
+    startup_control_is_readable,
 };
 
 const FAILURE_BASE: u32 = 0xD3A0_0000;
@@ -338,7 +338,39 @@ fn run_event_loop<I: ByteRegisterIo>(
     let mut selector_retiring = false;
     #[cfg(feature = "dw1e3-selector31")]
     let mut selector_retirement_binding = None;
+    let mut graceful_retire = None;
     loop {
+        if let Some(drain) = graceful_retire.as_mut() {
+            // Once an exact Retire is admitted, no later control request may
+            // overtake a fast transport-empty observation.  Peer loss keeps
+            // the established best-effort shutdown behavior; any queued
+            // message is a conflicting post-Retire request.
+            let control_signals = match probe_control(control) {
+                Ok(signals) => signals,
+                Err(_) => return fail_driver(driver, control, 36),
+            };
+            if control_signals.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 {
+                return graceful_shutdown(driver, control, 0);
+            }
+            if control_signals.0 & DW_SIGNAL_READABLE.0 != 0 {
+                return fail_driver(driver, control, 114);
+            }
+            let completed = service_graceful_retire_drain(
+                driver,
+                control,
+                pio_failed,
+                drain,
+                #[cfg(feature = "dw1e3-selector31")]
+                &mut evidence,
+                #[cfg(feature = "wyr1d-selector32")]
+                &mut d5,
+            );
+            match completed {
+                Ok(true) => return complete_graceful_retire(driver, control, pio_failed),
+                Ok(false) => {}
+                Err(code) => return fail_driver(driver, control, code),
+            }
+        }
         #[cfg(feature = "wyr1d-selector32")]
         if d5.pending().is_some() {
             if let Err(code) = service_d5_drain(driver, control, pio_failed, &mut d5) {
@@ -375,7 +407,10 @@ fn run_event_loop<I: ByteRegisterIo>(
                 if receive_capacity {
                     signals |= DW_SIGNAL_READABLE.0;
                 }
-                if !peer_close_drain.is_pending() && driver.wants_stream_writable() {
+                if graceful_retire.is_none()
+                    && !peer_close_drain.is_pending()
+                    && driver.wants_stream_writable()
+                {
                     signals |= DW_SIGNAL_WRITABLE.0;
                 }
                 items[2] = DwWaitItemV1 {
@@ -385,9 +420,22 @@ fn run_event_loop<I: ByteRegisterIo>(
                 count = 3;
             }
         }
-        let deadline = DW_DEADLINE_INFINITE;
+        let deadline = if let Some(drain) = graceful_retire {
+            let now = match monotonic_active_now() {
+                Ok(now) => now,
+                Err(_) => return fail_driver(driver, control, 112),
+            };
+            let software_empty = driver.tx_free() == wyrmroot_uart16550_core::RING_CAPACITY;
+            let deadline = match drain.wait_deadline(now, software_empty) {
+                Ok(deadline) => deadline,
+                Err(_) => return fail_driver(driver, control, 113),
+            };
+            DwDeadline(deadline)
+        } else {
+            DW_DEADLINE_INFINITE
+        };
         #[cfg(feature = "wyr1d-selector32")]
-        let deadline = if d5.pending().is_some() {
+        let deadline = if graceful_retire.is_none() && d5.pending().is_some() {
             DwDeadline(
                 monotonic_active_now()
                     .map_err(|_| 100u32)?
@@ -399,6 +447,9 @@ fn run_event_loop<I: ByteRegisterIo>(
         };
         let observed = match wait_many(&items[..count], deadline) {
             Ok(observed) => observed,
+            Err(error) if graceful_retire.is_some() && status_is(error, DW_STATUS_TIMED_OUT) => {
+                continue;
+            }
             #[cfg(feature = "wyr1d-selector32")]
             Err(error) if d5.pending().is_some() && status_is(error, DW_STATUS_TIMED_OUT) => {
                 d5_polls += 1;
@@ -425,10 +476,26 @@ fn run_event_loop<I: ByteRegisterIo>(
             if signals.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 {
                 return graceful_shutdown(driver, control, 0);
             }
+            if graceful_retire.is_some() {
+                return fail_driver(driver, control, 114);
+            }
             if signals.0 & DW_SIGNAL_READABLE.0 != 0 {
                 match service_control(driver, control) {
                     Ok(ControlOutcome::Continue) => continue,
-                    Ok(ControlOutcome::Retire) => return graceful_shutdown(driver, control, 0),
+                    Ok(ControlOutcome::Retire) => {
+                        let now = match monotonic_active_now() {
+                            Ok(now) => now,
+                            Err(_) => return fail_driver(driver, control, 112),
+                        };
+                        graceful_retire =
+                            match GracefulRetireDrain::new(now, driver.stream_endpoint().is_none())
+                            {
+                                Ok(drain) => Some(drain),
+                                Err(_) => return fail_driver(driver, control, 113),
+                            };
+                        peer_close_drain.clear();
+                        continue;
+                    }
                     #[cfg(feature = "wyr1d-selector32")]
                     Ok(ControlOutcome::Drain(identity)) => {
                         if d5
@@ -589,6 +656,13 @@ fn run_event_loop<I: ByteRegisterIo>(
             continue;
         }
 
+        if graceful_retire.is_some() && observed.index == 2 {
+            // The retirement helper drains every immediately available raw
+            // record and owns the fresh empty observation. Keep the normal
+            // stream path from detaching or emitting RX data mid-retirement.
+            continue;
+        }
+
         if observed.index == 2 {
             let peer_closed = observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0;
             let readable = observed.observed.0 & DW_SIGNAL_READABLE.0 != 0;
@@ -618,7 +692,7 @@ fn run_event_loop<I: ByteRegisterIo>(
                         Ok(StreamReadOutcome::Accepted) => {}
                         #[cfg(feature = "dw1e3-selector31")]
                         Ok(StreamReadOutcome::EmptyData) => {}
-                        Ok(StreamReadOutcome::WouldBlock) => {
+                        Ok(StreamReadOutcome::WouldBlock | StreamReadOutcome::PeerClosed) => {
                             if isolate_stream(driver, control).is_err() {
                                 return fail_driver(driver, control, 41);
                             }
@@ -656,7 +730,10 @@ fn run_event_loop<I: ByteRegisterIo>(
                     Ok(StreamReadOutcome::Accepted | StreamReadOutcome::WouldBlock) => {}
                     #[cfg(feature = "dw1e3-selector31")]
                     Ok(StreamReadOutcome::EmptyData) => {}
-                    Ok(StreamReadOutcome::Detached) => {
+                    Ok(StreamReadOutcome::PeerClosed | StreamReadOutcome::Detached) => {
+                        if isolate_stream(driver, control).is_err() {
+                            return fail_driver(driver, control, 41);
+                        }
                         peer_close_drain.clear();
                         continue;
                     }
@@ -678,6 +755,78 @@ fn run_event_loop<I: ByteRegisterIo>(
         }
         return fail_driver(driver, control, 44);
     }
+}
+
+fn service_graceful_retire_drain<I: ByteRegisterIo>(
+    driver: &mut ProductionDriver<I>,
+    control: DwHandle,
+    pio_failed: &Cell<bool>,
+    drain: &mut GracefulRetireDrain,
+    #[cfg(feature = "dw1e3-selector31")] evidence: &mut Option<EvidenceDrain>,
+    #[cfg(feature = "wyr1d-selector32")] d5: &mut DrainFence,
+) -> Result<bool, u32> {
+    while driver.wants_stream_readable() {
+        #[cfg(feature = "dw1e3-selector31")]
+        let result = service_stream_read(
+            driver,
+            control,
+            pio_failed,
+            evidence,
+            #[cfg(feature = "wyr1d-selector32")]
+            d5,
+        );
+        #[cfg(not(feature = "dw1e3-selector31"))]
+        let result = service_stream_read(
+            driver,
+            control,
+            pio_failed,
+            #[cfg(feature = "wyr1d-selector32")]
+            d5,
+        );
+        match result {
+            Ok(StreamReadOutcome::Accepted) => drain.observe_stream_record(),
+            #[cfg(feature = "dw1e3-selector31")]
+            Ok(StreamReadOutcome::EmptyData) => drain.observe_stream_record(),
+            Ok(StreamReadOutcome::WouldBlock) => {
+                drain.observe_stream_empty();
+                break;
+            }
+            Ok(StreamReadOutcome::PeerClosed | StreamReadOutcome::Detached) | Err(()) => {
+                return Err(115);
+            }
+        }
+    }
+
+    let now = monotonic_active_now().map_err(|_| 112u32)?;
+    let software_empty = driver.tx_free() == wyrmroot_uart16550_core::RING_CAPACITY;
+    if !drain
+        .temt_probe_due(now, software_empty)
+        .map_err(|_| 113u32)?
+    {
+        return Ok(false);
+    }
+    if pio_failed.get() {
+        return Err(116);
+    }
+    let transport_empty = driver.uart_mut().transport_empty();
+    if pio_failed.get() {
+        return Err(116);
+    }
+    drain
+        .observe_temt(now, software_empty, transport_empty)
+        .map_err(|_| 113u32)
+}
+
+fn complete_graceful_retire<I: ByteRegisterIo>(
+    driver: &mut ProductionDriver<I>,
+    control: DwHandle,
+    pio_failed: &Cell<bool>,
+) -> Result<u32, u32> {
+    driver.begin_graceful_retire();
+    if pio_failed.get() || !driver.graceful_retire_interrupts_disabled() || pio_failed.get() {
+        return fail_driver(driver, control, 117);
+    }
+    release_driver(driver, control, 0)
 }
 
 #[cfg(feature = "wyr1d-selector32")]
@@ -705,7 +854,9 @@ fn service_d5_drain<I: ByteRegisterIo>(
                 channel_empty = true;
                 break;
             }
-            Ok(StreamReadOutcome::Detached) | Err(()) => return Err(107),
+            Ok(StreamReadOutcome::PeerClosed | StreamReadOutcome::Detached) | Err(()) => {
+                return Err(107);
+            }
         }
     }
     let software_empty = driver.tx_free() == wyrmroot_uart16550_core::RING_CAPACITY;
@@ -738,7 +889,7 @@ fn selector_response_input_drained<I: ByteRegisterIo>(
             // positive proof. Legal empty DATA records are no-ops and must be
             // drained first; any nonempty/handle-bearing/malformed record
             // after the exact response fails before TEMT is emitted.
-            Ok(StreamReadOutcome::WouldBlock) => return Ok(()),
+            Ok(StreamReadOutcome::WouldBlock | StreamReadOutcome::PeerClosed) => return Ok(()),
             Ok(StreamReadOutcome::EmptyData) => continue,
             Ok(StreamReadOutcome::Accepted | StreamReadOutcome::Detached) | Err(()) => {
                 return Err(());
@@ -1055,11 +1206,11 @@ fn service_stream_read<I: ByteRegisterIo>(
     let mut handles = [DwReceivedHandleInfoV1::default(); 16];
     let counts = match receive_channel(endpoint.handle, &mut bytes, &mut handles) {
         Ok(counts) => counts,
-        Err(error)
-            if status_is(error, DW_STATUS_WOULD_BLOCK)
-                || status_is(error, DW_STATUS_PEER_CLOSED) =>
-        {
+        Err(error) if status_is(error, DW_STATUS_WOULD_BLOCK) => {
             return Ok(StreamReadOutcome::WouldBlock);
+        }
+        Err(error) if status_is(error, DW_STATUS_PEER_CLOSED) => {
+            return Ok(StreamReadOutcome::PeerClosed);
         }
         Err(_) => {
             isolate_stream(driver, control)?;
@@ -1108,6 +1259,7 @@ enum StreamReadOutcome {
     #[cfg(feature = "dw1e3-selector31")]
     EmptyData,
     WouldBlock,
+    PeerClosed,
     Detached,
 }
 
@@ -1180,6 +1332,14 @@ fn graceful_shutdown<I: ByteRegisterIo>(
     result: u32,
 ) -> Result<u32, u32> {
     let _ = device_pio_write(driver.resource().handle, 1, 1, 0);
+    release_driver(driver, control, result)
+}
+
+fn release_driver<I: ByteRegisterIo>(
+    driver: &mut ProductionDriver<I>,
+    control: DwHandle,
+    result: u32,
+) -> Result<u32, u32> {
     if let Some((_, endpoint)) = driver.detach_stream() {
         let _ = close_handle(endpoint.handle);
     }
