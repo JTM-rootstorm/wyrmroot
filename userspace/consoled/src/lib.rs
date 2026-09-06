@@ -13,7 +13,10 @@ compile_error!("selector-32 console-echo and WYR1-E wyrmsh policies are mutually
 #[cfg(test)]
 extern crate std;
 
-#[cfg(feature = "native-consoled")]
+#[cfg(any(test, feature = "wyr1e8-recovery"))]
+pub mod e8_control;
+
+#[cfg(all(feature = "native-consoled", target_os = "wyrmroot"))]
 use {
     deepwyrm_syscall as _, wyrmroot_device_proto as _, wyrmroot_launch_proto as _,
     wyrmroot_loader as _, wyrmroot_registry_proto as _, wyrmroot_runtime as _,
@@ -2049,6 +2052,28 @@ mod tests {
         let r = model.reserve_serial_tx(&mut output).unwrap().unwrap();
         assert_eq!(&output[..r.length()], b"e\r\n");
     }
+
+    #[test]
+    fn clean_terminal_drains_committed_output_before_volatile_retirement() {
+        let (mut model, event) = live();
+        model
+            .stage_child_output(event, OutputSource::Stdout, b"\n")
+            .unwrap();
+        let mut bytes = [0u8; 8];
+        let committed = model.reserve_serial_tx(&mut bytes).unwrap().unwrap();
+        assert_eq!(&bytes[..committed.length()], b"\r\n");
+        model.commit_serial_tx(committed).unwrap();
+        assert_eq!(model.snapshot().stdout_queued, 0);
+        assert!(matches!(
+            model.child_terminal(event, 1),
+            Ok(RecoveryAction::ReapChild(job)) if job == event.child_job
+        ));
+        model.child_streams_closed(event, 1).unwrap();
+        assert_eq!(
+            model.child_reaped(event, 1),
+            Ok(RecoveryAction::ReplaceChild)
+        );
+    }
     #[test]
     fn launch_binds_caller_supplied_transaction_and_accepted_job() {
         let mut model = ConsoleModel::new();
@@ -2710,6 +2735,42 @@ mod tests {
                 .observe_ready(3 + STABLE_RUN_MILLIS, new_token)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn three_retired_shell_epochs_cannot_mutate_the_current_ready_or_stream_state() {
+        let (mut model, mut current) = live();
+        let mut now = 1;
+        for _ in 0..3 {
+            let retired = current;
+            model.child_terminal(retired, now).unwrap();
+            model.child_streams_closed(retired, now).unwrap();
+            assert_eq!(
+                model.child_reaped(retired, now),
+                Ok(RecoveryAction::ReplaceChild)
+            );
+            current = launch(&mut model);
+            let current_token = model.observe_child_ready(current, now + 1).unwrap();
+            let before = model.snapshot();
+
+            assert_eq!(
+                model.observe_child_ready(retired, now + 2),
+                Err(ModelError::StaleCorrelation)
+            );
+            assert_eq!(
+                model.stage_child_output(retired, OutputSource::Stdout, b"old"),
+                Err(ModelError::StaleCorrelation)
+            );
+            assert_eq!(
+                model.child_peer_closed(retired, StreamKind::Stdout, now + 2),
+                Err(ModelError::StaleCorrelation)
+            );
+            let mut expected = before;
+            expected.last_failure = Some(ModelError::StaleCorrelation);
+            assert_eq!(model.snapshot(), expected);
+            assert_eq!(model.ready_token(), Some(current_token));
+            now += 3;
+        }
     }
 
     #[test]

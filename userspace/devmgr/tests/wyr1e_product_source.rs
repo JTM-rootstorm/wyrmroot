@@ -46,7 +46,7 @@ fn production_publication_receiver_uses_the_exact_v1_1_service_generation() {
         "#[cfg(not(any(feature = \"wyr1d-selector32\", feature = \"wyr1e-production\")))]\nuse wyrmroot_device_proto::controller::parse as parse_controller;"
     ));
     assert!(imports.contains(
-        "#[cfg(feature = \"wyr1d-selector32\")]\nuse wyrmroot_device_proto::d5_controller::{"
+        "#[cfg(any(feature = \"wyr1d-selector32\", feature = \"wyr1e8-production\"))]\nuse wyrmroot_device_proto::d5_controller::{"
     ));
 
     let receive = &NATIVE[NATIVE.find("fn receive_controller(").unwrap()
@@ -55,7 +55,7 @@ fn production_publication_receiver_uses_the_exact_v1_1_service_generation() {
     let legacy = "#[cfg(not(any(feature = \"wyr1d-selector32\", feature = \"wyr1e-production\")))]";
     let e7_buffer = receive
         .find(
-            "#[cfg(all(\n        not(feature = \"dw1e3-selector31\"),\n        not(feature = \"wyr1d-selector32\"),\n        feature = \"wyr1e-production\"\n    ))]\n    let mut bytes = [0u8; wyrmroot_device_proto::controller_v1_1::RECORD_BYTES];",
+            "#[cfg(all(\n        not(feature = \"dw1e3-selector31\"),\n        not(feature = \"wyr1d-selector32\"),\n        not(feature = \"wyr1e8-production\"),\n        feature = \"wyr1e-production\"\n    ))]\n    let mut bytes = [0u8; wyrmroot_device_proto::controller_v1_1::RECORD_BYTES];",
         )
         .unwrap();
     let legacy_buffer = receive
@@ -67,7 +67,7 @@ fn production_publication_receiver_uses_the_exact_v1_1_service_generation() {
         "#[cfg(feature = \"dw1e3-selector31\")]\n    let mut bytes = [0u8; D3_DEVICE_STAGE_BYTES];"
     ));
     assert!(receive.contains(
-        "#[cfg(all(not(feature = \"dw1e3-selector31\"), feature = \"wyr1d-selector32\"))]\n    let mut bytes = [0u8; D5_CONTROLLER_BYTES];"
+        "#[cfg(all(\n        not(feature = \"dw1e3-selector31\"),\n        any(feature = \"wyr1d-selector32\", feature = \"wyr1e8-production\")\n    ))]\n    let mut bytes = [0u8; D5_CONTROLLER_BYTES];"
     ));
     let parse = receive
         .find(&format!(
@@ -94,7 +94,7 @@ fn production_publication_receiver_uses_the_exact_v1_1_service_generation() {
     )));
 
     let d5_gate = receive
-        .find("#[cfg(feature = \"wyr1d-selector32\")]\n    if counts.bytes == D5_CONTROLLER_BYTES")
+        .find("#[cfg(any(feature = \"wyr1d-selector32\", feature = \"wyr1e8-production\"))]\n    if counts.bytes == D5_CONTROLLER_BYTES")
         .unwrap();
     let d5_parse = receive
         .find("parse_d5_controller(&bytes[..counts.bytes])")
@@ -107,6 +107,35 @@ fn production_publication_receiver_uses_the_exact_v1_1_service_generation() {
     assert!(published.contains(".ok_or(failure(243))?"));
     assert!(!published.contains("active_binding"));
     assert!(!published.contains("endpoint.generation"));
+}
+
+#[test]
+fn e8_accepts_only_the_exact_current_driver_retire_request() {
+    assert!(MANIFEST.contains("wyr1e8-production = [\"wyr1e-production\"]"));
+    let controller = &NATIVE[NATIVE
+        .find("let (replacement, action) = match input")
+        .unwrap()..NATIVE.find("fn receive_controller(").unwrap()];
+    let e8 = &controller[controller
+        .find("#[cfg(feature = \"wyr1e8-production\")]\n                ControllerInput::D5(D5ControllerMessage::RequestRetire(identity))")
+        .unwrap()..];
+    let validate = e8.find("identity != current.d5_identity()").unwrap();
+    let broker = e8.find("broker.current() != Some(current)").unwrap();
+    let attach = e8
+        .find("ConnectorSlot::Active { attach, .. } if attach.driver == current")
+        .unwrap();
+    let duplicate = e8.find("e8_retire_requested").unwrap();
+    let retire = e8
+        .find("send_driver_retire(control, &mut resident)?")
+        .unwrap();
+    let one_shot = e8.find("e8_retire_requested = true").unwrap();
+    assert!(validate < broker && broker < attach && attach < duplicate);
+    assert!(duplicate < retire && retire < one_shot);
+    assert!(e8.contains(
+        "#[cfg(feature = \"wyr1e8-production\")]\n                ControllerInput::D5(_) => return Err(failure(313))"
+    ));
+    assert!(NATIVE.contains(
+        "#[cfg(feature = \"wyr1d-selector32\")]\n                ControllerInput::D5(D5ControllerMessage::RequestRetire(identity))"
+    ));
 }
 
 #[test]

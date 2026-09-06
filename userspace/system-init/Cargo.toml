@@ -30,6 +30,12 @@ wyr1d-selector32 = ["wyr1c5-production", "dep:wyrmroot-consoled", "wyrmroot-cons
 wyr1e-shell-controller = []
 wyr1e-production = ["wyr1c6-production", "wyr1e-shell-controller", "dep:wyrmroot-consoled", "wyrmroot-consoled/wyr1e-wyrmsh"]
 wyr1e-selector33 = ["wyr1e-production", "wyrmroot-runtime/wyr1e7-test-evidence"]
+wyr1e8-selector33 = [
+    "wyr1e-production",
+    "dep:wyrmroot-wyr1e-test-actors",
+    "wyrmroot-consoled/wyr1e8-recovery",
+    "wyrmroot-runtime/wyr1e8-test-evidence",
+]
 dw1e3-selector31 = [
     "wyr1c5-production",
     "dep:wyrmroot-dw1e3-com2-test",
@@ -48,6 +54,7 @@ wyrmroot-registry-proto = { path = "../../crates/wyrmroot-registry-proto" }
 wyrmroot-rrc-manifest = { path = "../../crates/wyrmroot-rrc-manifest" }
 wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }
 wyrmroot-wyr1b-gate-proto = { path = "../../crates/wyrmroot-wyr1b-gate-proto" }
+wyrmroot-wyr1e-test-actors = { path = "../wyr1e-test-actors", optional = true }
 
 [dev-dependencies]
 wyrmroot-bootfs = { path = "../../crates/wyrmroot-bootfs", features = ["builder"] }

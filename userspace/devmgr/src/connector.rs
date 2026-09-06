@@ -3,11 +3,13 @@
 //! Native code owns actual Channel handles. This module names every ownership
 //! transition so the native adapter never infers cleanup from event order.
 
+#[cfg(any(feature = "wyr1d-selector32", feature = "wyr1e8-production"))]
+use wyrmroot_device_proto::D5DriverIdentity;
+#[cfg(feature = "wyr1d-selector32")]
+use wyrmroot_device_proto::D5StreamIdentity;
 use wyrmroot_device_proto::connector::{ConnectorErrorCode, ConnectorIdentity, ConnectorMessage};
 use wyrmroot_device_proto::control::FailureCode;
 use wyrmroot_device_proto::control_v1_1::{ControlIdentityV1_1, ControlMessageV1_1};
-#[cfg(feature = "wyr1d-selector32")]
-use wyrmroot_device_proto::{D5DriverIdentity, D5StreamIdentity};
 use wyrmroot_device_proto::{PublicationPolicy, SERIAL_CONSOLE_CONNECTOR_PUBLICATION_POLICY};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -84,7 +86,7 @@ impl AttachCorrelation {
     }
 }
 
-#[cfg(feature = "wyr1d-selector32")]
+#[cfg(any(feature = "wyr1d-selector32", feature = "wyr1e8-production"))]
 impl PublishedDriver {
     pub const fn d5_identity(self) -> D5DriverIdentity {
         D5DriverIdentity {

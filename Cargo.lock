@@ -382,6 +382,7 @@ dependencies = [
  "wyrmroot-rrc-manifest",
  "wyrmroot-runtime",
  "wyrmroot-wyr1b-gate-proto",
+ "wyrmroot-wyr1e-test-actors",
 ]
 
 [[package]]

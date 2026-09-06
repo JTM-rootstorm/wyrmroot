@@ -52,6 +52,8 @@ use wyrmroot_runtime::{
 const FAILURE_BASE: u32 = 0xD400_0000;
 const EVENT_TICK_NS: u64 = 1_000_000_000;
 const STATUS_SEND_TIMEOUT_NS: u64 = 1_000_000_000;
+#[cfg(feature = "wyr1e-wyrmsh")]
+const TERMINAL_DRAIN_TIMEOUT_NS: u64 = 4_000_000_000;
 const NANOS_PER_MILLI: u64 = 1_000_000;
 const FATAL_ATTACH_BASE: u32 = 0x0000_0100;
 
@@ -69,6 +71,8 @@ struct StartupAuthorities {
     selector_control: DwHandle,
     #[cfg(feature = "wyr1d-selector32")]
     selector_nonce: u64,
+    #[cfg(feature = "wyr1e8-recovery")]
+    recovery_control: DwHandle,
     registry: DwHandle,
     launch: DwHandle,
     registry_generation: u64,
@@ -332,6 +336,8 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
         selector_control: bootstrap,
         #[cfg(feature = "wyr1d-selector32")]
         selector_nonce: selector_configure(bootstrap)?,
+        #[cfg(feature = "wyr1e8-recovery")]
+        recovery_control: bootstrap,
         registry: init_handles[1].handle,
         launch: init_handles[2].handle,
         registry_generation: init.registry_generation,
@@ -397,7 +403,7 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
         let _ = close_handle(bootstrap);
         return Err(11);
     }
-    #[cfg(not(feature = "wyr1d-selector32"))]
+    #[cfg(not(any(feature = "wyr1d-selector32", feature = "wyr1e8-recovery")))]
     if close_handle(bootstrap).is_err() {
         let _ = close_serial_session(&mut serial);
         let _ = cleanup_child_for_exit(authorities, &mut transactions, &mut child);
@@ -953,6 +959,27 @@ fn launch_child_once(
             };
     }
 
+    #[cfg(feature = "wyr1e8-recovery")]
+    if policy == ChildPolicy::Wyrmsh {
+        let facts = wyrmroot_consoled::e8_control::ReadyFacts {
+            console_generation: model_launch.console_generation(),
+            status_generation,
+            shell_generation: model_launch.child_generation(),
+            attach_transaction: serial.identity.attach_transaction_id,
+            stream_generation: serial.identity.stream_generation,
+            bundle_generation: serial.identity.bundle_generation,
+        };
+        let bytes = wyrmroot_consoled::e8_control::encode(
+            wyrmroot_consoled::e8_control::Message::ReadyFacts(facts),
+        )
+        .map_err(|_| 43u32)?;
+        if send_channel(authorities.recovery_control, &bytes, &[]).is_err() {
+            close_status_pair(status_retained, status_child)?;
+            finish_launch_abort(model, model_launch, &retained, &child, false)?;
+            return Err(43);
+        }
+    }
+
     let reservation = LaunchReservation {
         connection_id: authorities.launch_connection_id,
         generation: authorities.launch_connection_generation,
@@ -1264,6 +1291,10 @@ fn event_loop(
     let mut input_pending = Pending::new();
     let mut output_pending = Pending::new();
     let mut next_data = DataClass::Raw;
+    #[cfg(feature = "wyr1e8-recovery")]
+    let mut recovery_request = None;
+    #[cfg(feature = "wyr1e8-recovery")]
+    let mut recovery_acknowledged = false;
     loop {
         #[cfg(feature = "wyr1d-selector32")]
         if let Some(status) = capture
@@ -1282,6 +1313,27 @@ fn event_loop(
         reserve_input(model, &mut input_pending)?;
         reserve_output(model, &mut output_pending)?;
 
+        #[cfg(feature = "wyr1e8-recovery")]
+        if let Some(identity) = recovery_request
+            && !recovery_acknowledged
+            && input_pending.is_empty()
+            && output_pending.is_empty()
+        {
+            let snapshot = model.snapshot();
+            if snapshot.input_queued == 0
+                && snapshot.stdout_queued == 0
+                && snapshot.stderr_queued == 0
+                && streams_freshly_quiet(&mut streams, child)?
+            {
+                let ack = wyrmroot_consoled::e8_control::encode(
+                    wyrmroot_consoled::e8_control::Message::Quiesced(identity),
+                )
+                .map_err(|_| 128u32)?;
+                send_channel(authorities.recovery_control, &ack, &[]).map_err(|_| 128u32)?;
+                recovery_acknowledged = true;
+            }
+        }
+
         let now = monotonic_active_now().map_err(|_| 53u32)?;
         // Stability is time-based, not idleness-based. Continuous serial or
         // child traffic must not prevent the exact READY tuple from clearing
@@ -1289,7 +1341,7 @@ fn event_loop(
         observe_exact_ready(model, &serial, &child, 55)?;
         let deadline = now.checked_add(EVENT_TICK_NS).ok_or(54u32)?;
         let snapshot = model.snapshot();
-        let mut items = [DwWaitItemV1::default(); 12];
+        let mut items = [DwWaitItemV1::default(); 13];
         let mut data_classes = [DataClass::Raw; 4];
         // Control and every retirement signal precede rotating data work.
         items[0] = wait_item(
@@ -1332,14 +1384,30 @@ fn event_loop(
         };
         #[cfg(not(feature = "wyr1e-wyrmsh"))]
         let witness_index: Option<usize> = None;
+        #[cfg(feature = "wyr1e8-recovery")]
+        let recovery_index = {
+            let index = data_base;
+            items[index] = wait_item(
+                authorities.recovery_control,
+                DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+            );
+            data_base += 1;
+            Some(index)
+        };
+        #[cfg(not(feature = "wyr1e8-recovery"))]
+        let recovery_index: Option<usize> = None;
 
         let raw_writable = if output_pending.is_empty() {
             0
         } else {
             DW_SIGNAL_WRITABLE.0
         };
-        let raw_readable = if snapshot.input_queued
-            <= STAGING_CAPACITY.saturating_sub(FAIR_SOURCE_BYTES_PER_TURN)
+        #[cfg(feature = "wyr1e8-recovery")]
+        let accepting_raw_input = recovery_request.is_none();
+        #[cfg(not(feature = "wyr1e8-recovery"))]
+        let accepting_raw_input = true;
+        let raw_readable = if accepting_raw_input
+            && snapshot.input_queued <= STAGING_CAPACITY.saturating_sub(FAIR_SOURCE_BYTES_PER_TURN)
         {
             DW_SIGNAL_READABLE.0
         } else {
@@ -1410,6 +1478,21 @@ fn event_loop(
             continue;
         }
 
+        if recovery_index == Some(observed_index) {
+            #[cfg(feature = "wyr1e8-recovery")]
+            {
+                if signals & DW_SIGNAL_PEER_CLOSED.0 != 0 || recovery_request.is_some() {
+                    return Err(127);
+                }
+                if signals & DW_SIGNAL_READABLE.0 == 0 {
+                    return Err(127);
+                }
+                recovery_request = Some(receive_recovery_request(authorities, child)?);
+                next_data = DataClass::Stdout;
+                continue;
+            }
+        }
+
         match observed.index {
             // Registry retirement and raw close invalidate the serial tuple
             // before a co-ready launch response may use it.
@@ -1447,6 +1530,15 @@ fn event_loop(
                 if signals & DW_SIGNAL_READABLE.0 == 0 {
                     return Err(57);
                 }
+                #[cfg(feature = "wyr1e-wyrmsh")]
+                drain_clean_terminal_output(
+                    authorities,
+                    model,
+                    &mut streams,
+                    &mut serial,
+                    &mut child,
+                    &mut output_pending,
+                )?;
                 recover_terminal_child(
                     authorities,
                     transactions,
@@ -1713,6 +1805,161 @@ fn event_loop(
     }
 }
 
+#[cfg(feature = "wyr1e-wyrmsh")]
+fn drain_clean_terminal_output(
+    authorities: StartupAuthorities,
+    model: &mut ConsoleModel,
+    streams: &mut NativeStreams,
+    serial: &mut SerialSession,
+    child: &mut ChildSession,
+    output_pending: &mut Pending,
+) -> Result<(), u32> {
+    let wait = child.wait.take().ok_or(61u32)?;
+    if receive_launch(authorities.launch, wait)? != LaunchReply::JobResult(child.job_id) {
+        return Err(61);
+    }
+    let deadline = monotonic_active_now()
+        .map_err(|_| 53u32)?
+        .checked_add(TERMINAL_DRAIN_TIMEOUT_NS)
+        .ok_or(54u32)?;
+    let mut stdout_eof = false;
+    let mut stderr_eof = false;
+    loop {
+        reserve_output(model, output_pending)?;
+        let snapshot = model.snapshot();
+        if stdout_eof
+            && stderr_eof
+            && output_pending.is_empty()
+            && snapshot.stdout_queued == 0
+            && snapshot.stderr_queued == 0
+        {
+            break;
+        }
+        let mut items = [DwWaitItemV1::default(); 3];
+        let mut count = 0;
+        let output_index = if output_pending.is_empty() {
+            None
+        } else {
+            let index = count;
+            items[count] = wait_item(
+                serial.endpoint(),
+                DwSignals(DW_SIGNAL_WRITABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+            );
+            count += 1;
+            Some(index)
+        };
+        let stdout_index = if stdout_eof {
+            None
+        } else {
+            let index = count;
+            items[count] = wait_item(
+                child.stdout.endpoint().handle(),
+                DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+            );
+            count += 1;
+            Some(index)
+        };
+        let stderr_index = if stderr_eof {
+            None
+        } else {
+            let index = count;
+            items[count] = wait_item(
+                child.stderr.endpoint().handle(),
+                DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+            );
+            count += 1;
+            Some(index)
+        };
+        let observed = wait_many(&items[..count], DwDeadline(deadline)).map_err(|_| 64u32)?;
+        let index = usize::try_from(observed.index).map_err(|_| 64u32)?;
+        if output_index == Some(index) {
+            if observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0
+                || observed.observed.0 & DW_SIGNAL_WRITABLE.0 == 0
+            {
+                return Err(64);
+            }
+            match serial
+                .output
+                .write(streams, &output_pending.bytes[..output_pending.used])
+            {
+                Ok(written) if written == output_pending.used => {
+                    commit_output(model, output_pending)?;
+                    output_pending.clear();
+                }
+                Ok(_) => return Err(59),
+                Err(StreamError::WouldBlock) => {
+                    release_output(model, output_pending)?;
+                    output_pending.clear();
+                }
+                Err(_) => return Err(64),
+            }
+            continue;
+        }
+        let (input, source, eof) = if stdout_index == Some(index) {
+            (&mut child.stdout, OutputSource::Stdout, &mut stdout_eof)
+        } else if stderr_index == Some(index) {
+            (&mut child.stderr, OutputSource::Stderr, &mut stderr_eof)
+        } else {
+            return Err(64);
+        };
+        input.observe_wait(observed.observed).map_err(|_| 64u32)?;
+        let mut payload = [0u8; FAIR_SOURCE_BYTES_PER_TURN];
+        match input.read(streams, &mut payload) {
+            Ok(count) => model
+                .stage_child_output(child.event, source, &payload[..count])
+                .map_err(|_| 60u32)?,
+            Err(StreamError::WouldBlock) => {}
+            Err(StreamError::Eof) => *eof = true,
+            Err(_) => return Err(64),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "wyr1e8-recovery")]
+fn receive_recovery_request(
+    authorities: StartupAuthorities,
+    child: &ChildSession,
+) -> Result<wyrmroot_consoled::e8_control::Identity, u32> {
+    let mut bytes = [0_u8; wyrmroot_consoled::e8_control::FRAME_BYTES];
+    let mut handles = [DwReceivedHandleInfoV1::default(); 1];
+    let counts = receive_channel(authorities.recovery_control, &mut bytes, &mut handles)
+        .map_err(|_| 127u32)?;
+    if counts.bytes != bytes.len() || counts.handles != 0 {
+        close_received(&handles, counts.handles);
+        return Err(127);
+    }
+    let wyrmroot_consoled::e8_control::Message::Quiesce(identity) =
+        wyrmroot_consoled::e8_control::parse(&bytes).map_err(|_| 127u32)?
+    else {
+        return Err(127);
+    };
+    let relationship = child.status.as_ref().ok_or(127u32)?.session.relationship();
+    if identity.console_generation != child.event.console_generation
+        || identity.status_generation != relationship.status_generation
+        || identity.shell_generation != child.event.child_generation
+        || identity.outer_shell_job != child.job_id
+    {
+        return Err(127);
+    }
+    Ok(identity)
+}
+
+#[cfg(feature = "wyr1e8-recovery")]
+fn streams_freshly_quiet(
+    streams: &mut NativeStreams,
+    child: &mut ChildSession,
+) -> Result<bool, u32> {
+    let mut scratch = [0u8; 1];
+    for input in [&mut child.stdout, &mut child.stderr] {
+        match input.read(streams, &mut scratch) {
+            Err(StreamError::WouldBlock) => {}
+            Ok(_) | Err(_) => return Err(128),
+        }
+    }
+    Ok(true)
+}
+
 #[cfg(feature = "wyr1d-selector32")]
 fn selector_configure(channel: DwHandle) -> Result<u64, u32> {
     use wyrmroot_consoled::selector32::{CONFIGURE, STATUS_BYTES, Status};
@@ -1764,9 +2011,12 @@ fn recover_terminal_child(
     input_pending: &mut Pending,
     output_pending: &mut Pending,
 ) -> Result<(), u32> {
-    let wait = child.wait.take().ok_or(61u32)?;
-    if receive_launch(authorities.launch, wait)? != LaunchReply::JobResult(child.job_id) {
-        return Err(61);
+    #[cfg(not(feature = "wyr1e-wyrmsh"))]
+    {
+        let wait = child.wait.take().ok_or(61u32)?;
+        if receive_launch(authorities.launch, wait)? != LaunchReply::JobResult(child.job_id) {
+            return Err(61);
+        }
     }
     if !matches!(model.child_terminal(child.event, now_millis()?), Ok(RecoveryAction::ReapChild(job)) if job == child.job_id)
     {

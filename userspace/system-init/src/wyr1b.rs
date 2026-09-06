@@ -987,6 +987,56 @@ impl JobController {
         self.completed_len
     }
 
+    /// Removes the one E8 barrier result after its owning ShellJobs session is
+    /// closed. Ordinary completed results remain retained in FIFO order.
+    #[cfg(feature = "wyr1e8-selector33")]
+    pub(crate) fn remove_invisible_completed(
+        &mut self,
+        connection_id: u64,
+        generation: u64,
+        job_id: u64,
+        expected: JobResult,
+    ) -> Result<(), JobError> {
+        let owner = identity(connection_id, generation)?;
+        if job_id == 0
+            || self
+                .jobs
+                .iter()
+                .flatten()
+                .any(|job| job.id == job_id || job.owner == owner && !job.orphaned)
+        {
+            return Err(JobError::WrongState);
+        }
+        let mut found = None;
+        for offset in 0..self.completed_len {
+            let index = (self.completed_start + offset) % MAX_COMPLETED_JOBS;
+            if self.completed[index].is_some_and(|record| {
+                record.id == job_id
+                    && record.owner == owner
+                    && record.result == expected
+                    && !record.visible
+            }) {
+                if found.is_some() {
+                    return Err(JobError::ResourceIdentity);
+                }
+                found = Some(offset);
+            }
+        }
+        let removed = found.ok_or(JobError::UnknownJob)?;
+        for offset in removed..self.completed_len - 1 {
+            let current = (self.completed_start + offset) % MAX_COMPLETED_JOBS;
+            let next = (self.completed_start + offset + 1) % MAX_COMPLETED_JOBS;
+            self.completed[current] = self.completed[next];
+        }
+        let last = (self.completed_start + self.completed_len - 1) % MAX_COMPLETED_JOBS;
+        self.completed[last] = None;
+        self.completed_len -= 1;
+        if self.completed_len == 0 {
+            self.completed_start = 0;
+        }
+        Ok(())
+    }
+
     pub(crate) fn loaded_job(&self, job_id: u64) -> Result<LoadedJob, JobError> {
         let job = self
             .jobs
@@ -2051,6 +2101,46 @@ mod tests {
             jobs.query(reservation(1, 2, 1), second.job_id),
             Err(JobError::ForeignJob)
         );
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    #[test]
+    fn e8_removes_only_the_exact_invisible_completed_barrier() {
+        let mut jobs = JobController::new();
+        jobs.open_connection(1, 7).unwrap();
+        jobs.open_connection(2, 9).unwrap();
+
+        let retained = jobs.begin_launch(reservation(2, 9, 1)).unwrap();
+        jobs.commit_launch(retained, 20, 21, 22).unwrap();
+        jobs.close_job(reservation(2, 9, 2), retained.job_id)
+            .unwrap();
+        jobs.complete(retained.job_id, 20, 21, 22, normal_with_code(8))
+            .unwrap();
+
+        let barrier = jobs.begin_launch(reservation(1, 7, 1)).unwrap();
+        jobs.commit_launch(barrier, 10, 11, 12).unwrap();
+        jobs.close_job(reservation(1, 7, 2), barrier.job_id)
+            .unwrap();
+        jobs.complete(barrier.job_id, 10, 11, 12, normal()).unwrap();
+        assert_eq!(jobs.completed_results(), 2);
+
+        assert_eq!(
+            jobs.remove_invisible_completed(1, 7, barrier.job_id, normal_with_code(1)),
+            Err(JobError::UnknownJob)
+        );
+        assert_eq!(jobs.completed_results(), 2);
+        jobs.remove_invisible_completed(1, 7, barrier.job_id, normal())
+            .unwrap();
+        assert_eq!(jobs.completed_results(), 1);
+        assert_eq!(
+            jobs.remove_invisible_completed(1, 7, barrier.job_id, normal()),
+            Err(JobError::UnknownJob)
+        );
+        assert_eq!(
+            jobs.remove_invisible_completed(2, 9, retained.job_id, normal_with_code(8)),
+            Ok(())
+        );
+        assert_eq!(jobs.completed_results(), 0);
     }
 
     #[test]

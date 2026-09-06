@@ -7,6 +7,8 @@ use crate::wyr1b::{
     correlation_environment, observe_prepared_ready, prepare_reserved_job,
 };
 use crate::wyr1b_gate::{EvidenceLog, GATE_PATH, GateConfig, GateEvent, parse_config};
+#[cfg(feature = "wyr1e8-selector33")]
+use crate::wyr1b_job::PendingWait;
 use crate::wyr1b_job::{JobDispatcher, LaunchSessionScope, SessionOwner};
 use deepwyrm_syscall::{
     DW_HANDLE_TRANSFER_MOVE, DW_OBJECT_TYPE_CHANNEL, DW_RIGHT_INSPECT, DW_RIGHT_READ,
@@ -15,6 +17,8 @@ use deepwyrm_syscall::{
     DW_TERMINATION_RESOURCE_POLICY, DW_TERMINATION_TASK_GROUP_TEARDOWN,
     DW_TERMINATION_UNHANDLED_EXCEPTION, DwHandleTransferV1, DwRights,
 };
+#[cfg(feature = "wyr1e8-selector33")]
+use wyrmroot_device_proto::DriverLaunchRequest;
 use wyrmroot_launch_proto::{
     ErrorCode as LaunchErrorCode, Message as LaunchMessage, MessageType as LaunchMessageType,
     Reservation as LaunchReservation, TerminationClassification, TerminationResult,
@@ -57,6 +61,10 @@ const WYRMSH_REGISTRY_DEADLINE_NS: u64 = 1_000_000_000;
     reason = "used by the E3C controller feature and host matrix"
 )]
 const WYRMSH_FIRST_INSTALL_TRANSACTION: u64 = 0xE300_0001;
+#[cfg(feature = "wyr1e8-selector33")]
+const E8_DRIVER_TRIGGER_TOKEN_INDEX: u64 = 0x0102;
+#[cfg(feature = "wyr1e8-selector33")]
+const E8_REGISTRY_TRIGGER_TOKEN_INDEX: u64 = 0x0202;
 
 #[allow(
     dead_code,
@@ -69,6 +77,41 @@ pub(crate) enum ShellRegistryHealth {
     Exhausted,
 }
 
+#[cfg(feature = "wyr1e8-selector33")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum E8RecoveryAction {
+    Driver,
+    Registry,
+}
+
+#[cfg(feature = "wyr1e8-selector33")]
+impl E8RecoveryAction {
+    fn control(self) -> wyrmroot_consoled::e8_control::Action {
+        match self {
+            Self::Driver => wyrmroot_consoled::e8_control::Action::Driver,
+            Self::Registry => wyrmroot_consoled::e8_control::Action::Registry,
+        }
+    }
+}
+
+#[cfg(feature = "wyr1e8-selector33")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct E8Trigger {
+    launch_transaction: u64,
+    job_id: u64,
+    action: E8RecoveryAction,
+}
+
+#[cfg(feature = "wyr1e8-selector33")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct E8HeldWait {
+    pub(crate) pending: PendingWait,
+    pub(crate) identity: wyrmroot_consoled::e8_control::Identity,
+    pub(crate) result: ControllerJobResult,
+    pub(crate) deadline: u64,
+    acknowledged: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ShellControllerState {
     health: ShellRegistryHealth,
@@ -79,6 +122,14 @@ pub(crate) struct ShellControllerState {
     last_child_generation: u64,
     #[cfg(feature = "wyr1e-selector33")]
     evidence: crate::wyr1e7_evidence::Observer,
+    #[cfg(feature = "wyr1e8-selector33")]
+    e8_evidence: crate::wyr1e8_evidence::Observer,
+    #[cfg(feature = "wyr1e8-selector33")]
+    e8_console_control: Option<DwHandle>,
+    #[cfg(feature = "wyr1e8-selector33")]
+    e8_trigger: Option<E8Trigger>,
+    #[cfg(feature = "wyr1e8-selector33")]
+    e8_held: Option<E8HeldWait>,
 }
 
 #[allow(
@@ -101,6 +152,14 @@ impl ShellControllerState {
             last_child_generation: 0,
             #[cfg(feature = "wyr1e-selector33")]
             evidence: crate::wyr1e7_evidence::Observer::new()?,
+            #[cfg(feature = "wyr1e8-selector33")]
+            e8_evidence: crate::wyr1e8_evidence::Observer::new()?,
+            #[cfg(feature = "wyr1e8-selector33")]
+            e8_console_control: None,
+            #[cfg(feature = "wyr1e8-selector33")]
+            e8_trigger: None,
+            #[cfg(feature = "wyr1e8-selector33")]
+            e8_held: None,
         })
     }
 
@@ -173,6 +232,331 @@ impl ShellControllerState {
         }
         self.evidence
             .observe_outer_response(request, response, |record| Self::submit_e7(system, record))
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    pub(crate) fn observe_serial_for_e8(
+        &mut self,
+        publication_generation: u64,
+        request: DriverLaunchRequest,
+    ) -> Result<(), InitError> {
+        self.e8_evidence
+            .observe_serial(crate::wyr1e8_evidence::SerialFacts {
+                publication_generation,
+                device_role_id: request.role_id.0,
+                driver_attempt_generation: request.attempt_generation.0,
+                driver_control_endpoint_id: request.endpoint.id.0,
+                driver_control_endpoint_generation: request.endpoint.generation.0,
+                driver_launch_transaction: request.transaction_id,
+                supervisor_generation: request.supervisor_generation.0,
+            })
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    fn submit_e8<S: Wyr1BPlatform>(
+        system: &mut S,
+        record: &[u8; crate::wyr1e8_evidence::RECORD_BYTES],
+    ) -> Result<(), InitError> {
+        system
+            .submit_wyr1e8_evidence(record)
+            .map_err(InitError::Native)
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    fn stage_e8_shell_ready<S: Wyr1BPlatform>(
+        &mut self,
+        system: &mut S,
+        tuple: crate::wyr1e8_evidence::ShellTuple,
+    ) -> Result<(), InitError> {
+        #[cfg(test)]
+        if !self.e8_evidence.armed() {
+            return Ok(());
+        }
+        self.e8_evidence
+            .stage_shell_tuple(tuple, |record| Self::submit_e8(system, record))
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    pub(crate) fn observe_e8_serial_ready<S: Wyr1BPlatform>(
+        &mut self,
+        system: &mut S,
+        ready: crate::wyr1e8_evidence::SerialReady,
+    ) -> Result<(), InitError> {
+        self.e8_evidence
+            .observe_serial_ready(ready, |record| Self::submit_e8(system, record))
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    pub(crate) const fn e8_shell_ready(&self) -> bool {
+        self.e8_evidence.ready()
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    pub(crate) const fn e8_tuple_waiting_for_serial(&self) -> bool {
+        self.e8_evidence.tuple_waiting_for_serial()
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    pub(crate) const fn e8_stage(&self) -> u32 {
+        self.e8_evidence.stage()
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    fn record_e8_shell_jobs<S: Wyr1BPlatform>(
+        &mut self,
+        system: &mut S,
+        request: &[u8],
+        response: &[u8],
+        handles: &[DwReceivedHandleInfoV1],
+    ) -> Result<(), InitError> {
+        #[cfg(test)]
+        if !self.e8_evidence.ready() {
+            return Ok(());
+        }
+        let trigger = e8_trigger_from_transaction(
+            self.e8_evidence.stage(),
+            self.e8_evidence.nonce(),
+            request,
+            response,
+            handles.len(),
+        )?;
+        if trigger.is_some() && self.e8_trigger.is_some() {
+            return Err(InitError::Accounting);
+        }
+        self.e8_evidence
+            .shell_jobs_transaction(request, response, handles, |record| {
+                Self::submit_e8(system, record)
+            })?;
+        if let Some(trigger) = trigger {
+            self.e8_trigger = Some(trigger);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    fn record_e8_outer_response<S: Wyr1BPlatform>(
+        &mut self,
+        system: &mut S,
+        request: &[u8],
+        response: &[u8],
+    ) -> Result<(), InitError> {
+        #[cfg(test)]
+        if !self.e8_evidence.ready() {
+            return Ok(());
+        }
+        self.e8_evidence
+            .observe_outer_response(request, response, |record| Self::submit_e8(system, record))
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    pub(crate) fn set_e8_console_control(&mut self, control: DwHandle) -> Result<(), InitError> {
+        if control.0 == 0 || self.e8_console_control.is_some() {
+            return Err(InitError::WrongActivationOrder);
+        }
+        self.e8_console_control = Some(control);
+        self.last_console_generation = 0;
+        self.last_status_generation = 0;
+        self.last_child_generation = 0;
+        Ok(())
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    pub(crate) fn clear_e8_console_control(&mut self, control: DwHandle) -> Result<(), InitError> {
+        if self.e8_console_control != Some(control) {
+            return Err(InitError::WrongActivationOrder);
+        }
+        self.e8_console_control = None;
+        Ok(())
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    fn hold_e8_wait<S: Wyr1BPlatform>(
+        &mut self,
+        system: &mut S,
+        pending: PendingWait,
+        result: ControllerJobResult,
+    ) -> Result<bool, InitError> {
+        let Some(trigger) = self.e8_trigger else {
+            return Ok(false);
+        };
+        if pending.job_id != trigger.job_id {
+            return Ok(false);
+        }
+        let expected_wait_transaction = trigger
+            .launch_transaction
+            .checked_add(1)
+            .ok_or(InitError::Accounting)?;
+        if self.e8_held.is_some()
+            || pending.reservation.transaction_id != expected_wait_transaction
+            || result
+                != (ControllerJobResult {
+                    classification: TerminationClassification::NormalExit.as_u32(),
+                    application_code: 0,
+                    exception_class: 0,
+                    exception_detail: 0,
+                    exception_address: 0,
+                    cleanup_result: 0,
+                })
+        {
+            return Err(InitError::Supervision);
+        }
+        let parsed =
+            parse_launch_message(pending.request_bytes(), 0).map_err(|_| InitError::Accounting)?;
+        if parsed.reservation != pending.reservation
+            || !matches!(parsed.message, LaunchMessage::Wait { job_id } if job_id == trigger.job_id)
+        {
+            return Err(InitError::Accounting);
+        }
+        let tuple = self
+            .e8_evidence
+            .current_tuple()
+            .ok_or(InitError::WrongActivationOrder)?;
+        let identity = wyrmroot_consoled::e8_control::Identity {
+            console_generation: tuple.console_generation,
+            status_generation: tuple.status_generation,
+            shell_generation: tuple.shell_generation,
+            outer_shell_job: tuple.outer_job_id,
+            trigger_job: trigger.job_id,
+            trigger_wait_transaction: pending.reservation.transaction_id,
+            action: trigger.action.control(),
+            stage_nonce: self.e8_evidence.nonce(),
+        };
+        let bytes = wyrmroot_consoled::e8_control::encode(
+            wyrmroot_consoled::e8_control::Message::Quiesce(identity),
+        )
+        .map_err(|_| InitError::Accounting)?;
+        let control = self
+            .e8_console_control
+            .ok_or(InitError::WrongActivationOrder)?;
+        system
+            .send_channel(control, &bytes)
+            .map_err(InitError::Native)?;
+        let deadline = system
+            .now()
+            .map_err(InitError::Native)?
+            .checked_add(WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns)
+            .ok_or(InitError::Accounting)?;
+        self.e8_held = Some(E8HeldWait {
+            pending,
+            identity,
+            result,
+            deadline,
+            acknowledged: false,
+        });
+        Ok(true)
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    fn e8_wait_is_held(&self, pending: PendingWait) -> Result<bool, InitError> {
+        let Some(held) = self.e8_held else {
+            return Ok(false);
+        };
+        if held.pending != pending {
+            return Err(InitError::WrongActivationOrder);
+        }
+        Ok(true)
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    pub(crate) fn e8_quiescence_expired(&self, now: u64) -> bool {
+        self.e8_held.is_some_and(|held| now >= held.deadline)
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    pub(crate) fn accept_e8_quiesced(
+        &mut self,
+        identity: wyrmroot_consoled::e8_control::Identity,
+        now: u64,
+    ) -> Result<E8RecoveryAction, InitError> {
+        let held = self
+            .e8_held
+            .as_mut()
+            .ok_or(InitError::WrongActivationOrder)?;
+        if identity != held.identity || held.acknowledged || now >= held.deadline {
+            return Err(InitError::Supervision);
+        }
+        held.acknowledged = true;
+        Ok(match identity.action {
+            wyrmroot_consoled::e8_control::Action::Driver => E8RecoveryAction::Driver,
+            wyrmroot_consoled::e8_control::Action::Registry => E8RecoveryAction::Registry,
+        })
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    pub(crate) fn take_e8_held(
+        &mut self,
+        action: E8RecoveryAction,
+    ) -> Result<E8HeldWait, InitError> {
+        let held = self.e8_held.take().ok_or(InitError::WrongActivationOrder)?;
+        let actual = match held.identity.action {
+            wyrmroot_consoled::e8_control::Action::Driver => E8RecoveryAction::Driver,
+            wyrmroot_consoled::e8_control::Action::Registry => E8RecoveryAction::Registry,
+        };
+        if actual != action || !held.acknowledged {
+            self.e8_held = Some(held);
+            return Err(InitError::WrongActivationOrder);
+        }
+        self.e8_trigger = None;
+        Ok(held)
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    pub(crate) fn e8_pending_action(&self) -> Option<E8RecoveryAction> {
+        self.e8_held.map(|held| match held.identity.action {
+            wyrmroot_consoled::e8_control::Action::Driver => E8RecoveryAction::Driver,
+            wyrmroot_consoled::e8_control::Action::Registry => E8RecoveryAction::Registry,
+        })
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    pub(crate) fn e8_driver_identity(
+        &self,
+        request: DriverLaunchRequest,
+    ) -> Result<wyrmroot_device_proto::d5_controller::D5DriverIdentity, InitError> {
+        let [
+            role,
+            bundle,
+            attempt,
+            endpoint,
+            endpoint_generation,
+            transaction,
+            supervisor,
+        ] = self
+            .e8_evidence
+            .current_serial_identity()
+            .ok_or(InitError::WrongActivationOrder)?;
+        if role != request.role_id.0
+            || attempt != request.attempt_generation.0
+            || endpoint != request.endpoint.id.0
+            || endpoint_generation != request.endpoint.generation.0
+            || transaction != request.transaction_id
+            || supervisor != request.supervisor_generation.0
+        {
+            return Err(InitError::Accounting);
+        }
+        Ok(wyrmroot_device_proto::d5_controller::D5DriverIdentity {
+            device_role_id: role,
+            bundle_generation: bundle,
+            driver_attempt_generation: attempt,
+            driver_control_endpoint_id: endpoint,
+            driver_control_endpoint_generation: endpoint_generation,
+            launch_transaction_id: transaction,
+        })
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    pub(crate) fn record_e8_forced_retired<S: Wyr1BPlatform>(
+        &mut self,
+        system: &mut S,
+        held: E8HeldWait,
+        result: TerminationResult,
+    ) -> Result<(), InitError> {
+        self.e8_evidence.forced_retired(
+            held.identity.trigger_wait_transaction,
+            held.identity.trigger_job,
+            result,
+            |record| Self::submit_e8(system, record),
+        )
     }
 
     pub(crate) const fn health(&self) -> ShellRegistryHealth {
@@ -264,6 +648,68 @@ impl ShellControllerState {
         self.next_install_transaction = WYRMSH_FIRST_INSTALL_TRANSACTION;
         Ok(())
     }
+}
+
+#[cfg(feature = "wyr1e8-selector33")]
+fn e8_trigger_from_transaction(
+    stage: u32,
+    nonce: u64,
+    request: &[u8],
+    response: &[u8],
+    handles: usize,
+) -> Result<Option<E8Trigger>, InitError> {
+    let request = parse_launch_message(request, handles).map_err(|_| InitError::Accounting)?;
+    let response = parse_launch_message(response, 0).map_err(|_| InitError::Accounting)?;
+    let LaunchMessage::Launch(launch) = request.message else {
+        return Ok(None);
+    };
+    if launch.path != wyrmroot_wyr1e_test_actors::RECOVERY_TRIGGER_PATH {
+        return Ok(None);
+    }
+    let LaunchMessage::LaunchAccepted { job_id } = response.message else {
+        return Err(InitError::Accounting);
+    };
+    if request.reservation != response.reservation
+        || job_id == 0
+        || launch.stream_count != 3
+        || launch.argc() != 3
+        || launch.environment_count() != 0
+        || launch.arg(0) != Some(wyrmroot_wyr1e_test_actors::RECOVERY_TRIGGER_PATH)
+    {
+        return Err(InitError::Accounting);
+    }
+    let (action, token_index) = match (stage, launch.arg(1)) {
+        (2, Some(wyrmroot_wyr1e_test_actors::RECOVERY_DRIVER_ACTION)) => {
+            (E8RecoveryAction::Driver, E8_DRIVER_TRIGGER_TOKEN_INDEX)
+        }
+        (3, Some(wyrmroot_wyr1e_test_actors::RECOVERY_REGISTRY_ACTION)) => {
+            (E8RecoveryAction::Registry, E8_REGISTRY_TRIGGER_TOKEN_INDEX)
+        }
+        _ => return Err(InitError::Accounting),
+    };
+    let expected_token = nonce ^ token_index;
+    if expected_token == 0 || launch.arg(2).and_then(parse_e8_nonce) != Some(expected_token) {
+        return Err(InitError::Accounting);
+    }
+    Ok(Some(E8Trigger {
+        launch_transaction: request.reservation.transaction_id,
+        job_id,
+        action,
+    }))
+}
+
+#[cfg(feature = "wyr1e8-selector33")]
+fn parse_e8_nonce(text: &str) -> Option<u64> {
+    if text.len() != 16
+        || !text
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'A'..=b'F').contains(byte))
+    {
+        return None;
+    }
+    let value = u64::from_str_radix(text, 16).ok()?;
+    (value != 0).then_some(value)
 }
 
 pub(crate) struct ShellLaunchContext<'a> {
@@ -2191,9 +2637,9 @@ where
     Ok((
         release,
         SentLaunchAccepted {
-            #[cfg(feature = "wyr1e-selector33")]
+            #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
             bytes: response,
-            #[cfg(feature = "wyr1e-selector33")]
+            #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
             len: size,
         },
     ))
@@ -2201,19 +2647,19 @@ where
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SentLaunchAccepted {
-    #[cfg(feature = "wyr1e-selector33")]
+    #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
     bytes: [u8; 88],
-    #[cfg(feature = "wyr1e-selector33")]
+    #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
     len: usize,
 }
 
 impl SentLaunchAccepted {
-    #[cfg(feature = "wyr1e-selector33")]
+    #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
     fn as_bytes(&self) -> &[u8] {
         &self.bytes[..self.len]
     }
 
-    #[cfg(not(feature = "wyr1e-selector33"))]
+    #[cfg(not(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33")))]
     fn as_bytes(&self) -> &[u8] {
         &[]
     }
@@ -2703,7 +3149,28 @@ fn observe_e7_response<S: Wyr1BPlatform>(
             LaunchSessionScope::Historical => Ok(()),
         }
     }
-    #[cfg(not(feature = "wyr1e-selector33"))]
+    #[cfg(feature = "wyr1e8-selector33")]
+    {
+        let Some(state) = state else {
+            #[cfg(test)]
+            return Ok(());
+            #[cfg(not(test))]
+            return Err(InitError::WrongActivationOrder);
+        };
+        match scope {
+            LaunchSessionScope::ShellJobs => {
+                state.record_e8_shell_jobs(system, request, response, handles)
+            }
+            LaunchSessionScope::ConsoleLauncher => {
+                if !handles.is_empty() {
+                    return Err(InitError::Accounting);
+                }
+                state.record_e8_outer_response(system, request, response)
+            }
+            LaunchSessionScope::Historical => Ok(()),
+        }
+    }
+    #[cfg(not(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33")))]
     {
         let _ = (system, scope, state, request, response, handles);
         Ok(())
@@ -3017,17 +3484,16 @@ fn cleanup_shell_before_publication<S, W>(
     waits: &mut W,
     jobs: &mut JobDispatcher,
     loaded: crate::wyr1b::LoadedJob,
-) -> Result<(), InitError>
+) -> Result<TerminationResult, InitError>
 where
     S: Wyr1BPlatform,
     W: SupervisionPlatform<Error = NativeError>,
 {
     let cleanup = force_cleanup_job(system, waits, jobs, loaded);
     let session_cleanup = close_shell_session_for_job(system, jobs, loaded.job_id);
-    if cleanup.is_err() || session_cleanup.is_err() {
-        Err(InitError::Cleanup)
-    } else {
-        Ok(())
+    match (cleanup, session_cleanup) {
+        (Ok(result), Ok(())) => Ok(result),
+        _ => Err(InitError::Cleanup),
     }
 }
 
@@ -3611,6 +4077,22 @@ where
                 shell_jobs_generation: accepted.shell_grant.endpoint_generation,
             },
         )?;
+        #[cfg(feature = "wyr1e8-selector33")]
+        shell.state.stage_e8_shell_ready(
+            system,
+            crate::wyr1e8_evidence::ShellTuple {
+                console_generation: accepted.request.console_generation,
+                status_generation: accepted.request.status_generation,
+                shell_generation: accepted.request.requested_child_generation,
+                outer_launch_transaction: reservation.transaction_id,
+                outer_job_id: loaded.job_id,
+                registry_generation: accepted.registry_grant.registry_generation,
+                registry_endpoint_id: accepted.registry_grant.endpoint_id,
+                registry_endpoint_generation: accepted.registry_grant.endpoint_generation,
+                shell_jobs_connection_id: accepted.shell_grant.endpoint_id,
+                shell_jobs_generation: accepted.shell_grant.endpoint_generation,
+            },
+        )?;
         return Ok(JobDispatchOutcome::Launched(
             jobs.jobs
                 .loaded_job(loaded.job_id)
@@ -3942,11 +4424,12 @@ where
     service_pending_wait_inner(system, waits, jobs, None)
 }
 
+#[allow(unused_mut)]
 fn service_pending_wait_inner<S, W>(
     system: &mut S,
     waits: &mut W,
     jobs: &mut JobDispatcher,
-    evidence: Option<&mut ShellControllerState>,
+    mut evidence: Option<&mut ShellControllerState>,
 ) -> Result<(), InitError>
 where
     S: Wyr1BPlatform,
@@ -3970,6 +4453,15 @@ where
     let session = jobs
         .session_handle(pending.grant)
         .map_err(InitError::Wyr1BModel)?;
+    #[cfg(feature = "wyr1e8-selector33")]
+    if scope == LaunchSessionScope::ShellJobs {
+        let state = evidence
+            .as_deref_mut()
+            .ok_or(InitError::WrongActivationOrder)?;
+        if state.e8_wait_is_held(pending)? || state.hold_e8_wait(system, pending, result)? {
+            return Ok(());
+        }
+    }
     let terminal = controller_result_to_wire(result)?;
     let mut response = [0_u8; 88];
     let size = encode_job_result(pending.reservation, pending.job_id, terminal, &mut response)
@@ -3988,9 +4480,9 @@ where
             InitError::Native(error)
         });
     }
-    #[cfg(feature = "wyr1e-selector33")]
+    #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
     let request = pending.request_bytes();
-    #[cfg(not(feature = "wyr1e-selector33"))]
+    #[cfg(not(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33")))]
     let request = &[];
     observe_e7_response(system, scope, evidence, request, &response[..size], &[])?;
     jobs.finish_pending_wait(pending)
@@ -4037,6 +4529,36 @@ where
     S: Wyr1BPlatform,
     W: SupervisionPlatform<Error = NativeError>,
 {
+    retire_console_product_with_result(system, waits, jobs, peer, terminate).map(|_| ())
+}
+
+#[cfg(feature = "wyr1e8-selector33")]
+pub(crate) fn retire_console_product_with_result<S, W>(
+    system: &mut S,
+    waits: &mut W,
+    jobs: &mut JobDispatcher,
+    peer: InstalledPeer,
+    terminate: bool,
+) -> Result<Option<TerminationResult>, InitError>
+where
+    S: Wyr1BPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    retire_console_product_inner(system, waits, jobs, peer, terminate)
+}
+
+#[cfg(feature = "wyr1e-production")]
+fn retire_console_product_inner<S, W>(
+    system: &mut S,
+    waits: &mut W,
+    jobs: &mut JobDispatcher,
+    peer: InstalledPeer,
+    terminate: bool,
+) -> Result<Option<TerminationResult>, InitError>
+where
+    S: Wyr1BPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
     let outer = jobs
         .jobs
         .loaded_job_for_owner(peer.grant.endpoint_id, peer.grant.endpoint_generation)
@@ -4057,13 +4579,20 @@ where
     let channel_close_failed = system.close_handle(disconnected.channel).is_err();
     let owner_cleanup_failed = cleanup_session_owner(system, waits, disconnected.owner, terminate);
     let mut failed = owner_mismatch | outer_mismatch | channel_close_failed | owner_cleanup_failed;
-    if let Some(outer) = outer {
-        failed |= cleanup_shell_before_publication(system, waits, jobs, outer).is_err();
-    }
+    let outer_result = match outer {
+        Some(outer) => match cleanup_shell_before_publication(system, waits, jobs, outer) {
+            Ok(result) => Some(result),
+            Err(_) => {
+                failed = true;
+                None
+            }
+        },
+        None => None,
+    };
     if failed {
         Err(InitError::Cleanup)
     } else {
-        Ok(())
+        Ok(outer_result)
     }
 }
 
@@ -8351,6 +8880,177 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(feature = "wyr1e8-selector33")]
+    #[test]
+    fn e8_generation_restart_requires_a_fresh_authenticated_console_owner() {
+        let mut state = ShellControllerState::new(1).unwrap();
+        let local_first = wyrmroot_launch_proto::ShellV1Request {
+            console_generation: 1,
+            status_generation: 2,
+            requested_child_generation: 3,
+        };
+        state.set_e8_console_control(DwHandle(10)).unwrap();
+        state.reserve_shell_generation(local_first).unwrap();
+        assert_eq!(
+            state.reserve_shell_generation(local_first),
+            Err(InitError::Wyr1BModel(JobError::StaleGeneration))
+        );
+
+        let before_stale_owner = state;
+        assert_eq!(
+            state.set_e8_console_control(DwHandle(11)),
+            Err(InitError::WrongActivationOrder)
+        );
+        assert_eq!(state, before_stale_owner);
+        assert_eq!(
+            state.clear_e8_console_control(DwHandle(11)),
+            Err(InitError::WrongActivationOrder)
+        );
+        assert_eq!(state, before_stale_owner);
+
+        state.clear_e8_console_control(DwHandle(10)).unwrap();
+        state.set_e8_console_control(DwHandle(20)).unwrap();
+        state.reserve_shell_generation(local_first).unwrap();
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    fn e8_state_for_held_wait(launch_transaction: u64) -> ShellControllerState {
+        let mut state = ShellControllerState::new(7).unwrap();
+        let tuple = crate::wyr1e8_evidence::ShellTuple {
+            console_generation: 1,
+            status_generation: 2,
+            shell_generation: 3,
+            outer_launch_transaction: 4,
+            outer_job_id: 5,
+            registry_generation: 7,
+            registry_endpoint_id: 8,
+            registry_endpoint_generation: 9,
+            shell_jobs_connection_id: 1,
+            shell_jobs_generation: 3,
+        };
+        state
+            .e8_evidence
+            .observe_serial(crate::wyr1e8_evidence::SerialFacts {
+                publication_generation: 10,
+                device_role_id: 11,
+                driver_attempt_generation: 12,
+                driver_control_endpoint_id: 13,
+                driver_control_endpoint_generation: 14,
+                driver_launch_transaction: 15,
+                supervisor_generation: 16,
+            })
+            .unwrap();
+        state
+            .e8_evidence
+            .stage_shell_tuple(tuple, |_| Ok(()))
+            .unwrap();
+        state
+            .e8_evidence
+            .observe_serial_ready(
+                crate::wyr1e8_evidence::SerialReady {
+                    console_generation: tuple.console_generation,
+                    status_generation: tuple.status_generation,
+                    shell_generation: tuple.shell_generation,
+                    attach_transaction: 17,
+                    stream_generation: 18,
+                    bundle_generation: 19,
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        state.set_e8_console_control(DwHandle(20)).unwrap();
+        state.e8_trigger = Some(E8Trigger {
+            launch_transaction,
+            job_id: 12,
+            action: E8RecoveryAction::Driver,
+        });
+        state
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    fn e8_pending_wait(transaction_id: u64) -> PendingWait {
+        let reservation = reservation(transaction_id);
+        let mut request = [0_u8; 56];
+        let request_len =
+            encode_job_message(reservation, LaunchMessageType::Wait, 12, &mut request).unwrap();
+        let mut jobs = JobDispatcher::new();
+        jobs.install_pending_wait(
+            grant(EndpointKind::LaunchSession, 1, 1),
+            reservation,
+            12,
+            &request[..request_len],
+        )
+        .unwrap();
+        jobs.next_pending_wait().unwrap()
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    const fn e8_normal_result() -> ControllerJobResult {
+        ControllerJobResult {
+            classification: TerminationClassification::NormalExit.as_u32(),
+            application_code: 0,
+            exception_class: 0,
+            exception_detail: 0,
+            exception_address: 0,
+            cleanup_result: 0,
+        }
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    #[test]
+    fn e8_held_wait_requires_the_exact_launch_successor() {
+        let mut adjacent = e8_state_for_held_wait(40);
+        let mut adjacent_platform = MockPlatform::new();
+        adjacent_platform.fail_send = false;
+        adjacent_platform.now = Some(100);
+        assert_eq!(
+            adjacent.hold_e8_wait(
+                &mut adjacent_platform,
+                e8_pending_wait(41),
+                e8_normal_result(),
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            wyrmroot_consoled::e8_control::parse(
+                &adjacent_platform.sent[..adjacent_platform.sent_len]
+            ),
+            Ok(wyrmroot_consoled::e8_control::Message::Quiesce(
+                adjacent.e8_held.unwrap().identity
+            ))
+        );
+        assert_eq!(
+            adjacent.e8_held.unwrap().identity.trigger_wait_transaction,
+            41
+        );
+
+        let mut gap = e8_state_for_held_wait(40);
+        let mut gap_platform = MockPlatform::new();
+        gap_platform.fail_send = false;
+        gap_platform.now = Some(100);
+        assert_eq!(
+            gap.hold_e8_wait(&mut gap_platform, e8_pending_wait(42), e8_normal_result()),
+            Err(InitError::Supervision)
+        );
+        assert_eq!(gap.e8_held, None);
+        assert_eq!(gap_platform.sent_len, 0);
+
+        let mut overflow = e8_state_for_held_wait(u64::MAX);
+        let mut overflow_platform = MockPlatform::new();
+        overflow_platform.fail_send = false;
+        overflow_platform.now = Some(100);
+        assert_eq!(
+            overflow.hold_e8_wait(
+                &mut overflow_platform,
+                e8_pending_wait(u64::MAX),
+                e8_normal_result(),
+            ),
+            Err(InitError::Accounting)
+        );
+        assert_eq!(overflow.e8_held, None);
+        assert_eq!(overflow_platform.sent_len, 0);
+    }
+
     #[test]
     fn e3c_shelljobs_peer_loss_forces_its_correlated_outer_shell() {
         let console = grant(EndpointKind::LaunchSession, 1, 1);
@@ -8561,6 +9261,187 @@ mod tests {
         );
         assert_eq!(platform.close_count, 8);
         assert_eq!(platform.query_count, 0);
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    #[test]
+    fn coherent_old_shell_v1_epoch_cannot_mutate_current_controller_or_observer() {
+        let mut platform = MockPlatform::new();
+        platform.fail_send = false;
+        let mut waits = TerminalWaits;
+        let mut loader = InitSendLoader::new();
+        let mut jobs = JobDispatcher::new();
+        let current = grant(EndpointKind::LaunchSession, 2, 2);
+        jobs.install_scoped_session(current, DwHandle(90), LaunchSessionScope::ConsoleLauncher)
+            .unwrap();
+        let old_reservation = reservation(41);
+        platform.inbound_len = wyrmroot_launch_proto::encode_shell_v1_request(
+            old_reservation,
+            wyrmroot_launch_proto::ShellV1Request {
+                console_generation: 11,
+                status_generation: 12,
+                requested_child_generation: 13,
+            },
+            &mut platform.inbound,
+        )
+        .unwrap();
+        platform.inbound_handle_count = 4;
+        for (index, info) in platform.inbound_handles[..4].iter_mut().enumerate() {
+            info.handle = DwHandle(51 + index as u64);
+        }
+        let mut topology = RegistryTopology::new(7).unwrap();
+        let mut state = ShellControllerState::new(7).unwrap();
+        let state_before = state;
+        let topology_before = topology;
+        let mut shell = ShellLaunchContext {
+            registry_control: DwHandle(80),
+            topology: &mut topology,
+            state: &mut state,
+        };
+
+        assert_eq!(
+            dispatch_one_job_request_with_shell(
+                &mut platform,
+                &mut loader,
+                &mut waits,
+                LoadAuthority {
+                    parent_root: DwHandle(1),
+                    bootfs: DwHandle(2),
+                    task_group: DwHandle(3),
+                },
+                None,
+                &mut jobs,
+                DwHandle(90),
+                current,
+                &mut shell,
+            ),
+            Ok(JobDispatchOutcome::Responded)
+        );
+        assert_eq!(*shell.state, state_before);
+        assert_eq!(*shell.topology, topology_before);
+        assert_eq!(jobs.session_count(), 1);
+        assert_eq!(jobs.jobs.live_jobs(), 0);
+        assert_eq!(jobs.jobs.completed_results(), 0);
+        assert_eq!(platform.query_count, 0);
+        assert_eq!(platform.close_count, 4);
+        assert_eq!(
+            platform.closed[..4],
+            [DwHandle(54), DwHandle(53), DwHandle(52), DwHandle(51)]
+        );
+        assert_eq!(
+            wyrmroot_launch_proto::parse_shell_v1_reply(&platform.sent[..platform.sent_len], 0,)
+                .unwrap()
+                .reply,
+            wyrmroot_launch_proto::ShellV1Reply::Error {
+                code: LaunchErrorCode::StaleOrUnknownSession,
+            }
+        );
+        assert!(
+            jobs.jobs
+                .reserve_request(LaunchReservation {
+                    connection_id: current.endpoint_id,
+                    generation: current.endpoint_generation,
+                    transaction_id: old_reservation.transaction_id,
+                })
+                .is_ok()
+        );
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    fn classify_e8_trigger_for_test(
+        stage: u32,
+        action: &str,
+        token: &str,
+    ) -> Result<Option<E8Trigger>, InitError> {
+        let reservation = LaunchReservation {
+            connection_id: 9,
+            generation: 10,
+            transaction_id: 11,
+        };
+        let mut request = [0u8; wyrmroot_launch_proto::MAX_LAUNCH_MESSAGE_BYTES];
+        let request_len = wyrmroot_launch_proto::encode_launch(
+            reservation,
+            wyrmroot_wyr1e_test_actors::RECOVERY_TRIGGER_PATH,
+            &[
+                wyrmroot_wyr1e_test_actors::RECOVERY_TRIGGER_PATH,
+                action,
+                token,
+            ],
+            &[],
+            true,
+            &mut request,
+        )
+        .unwrap();
+        let mut response = [0u8; 56];
+        let response_len = encode_job_message(
+            reservation,
+            LaunchMessageType::LaunchAccepted,
+            12,
+            &mut response,
+        )
+        .unwrap();
+        e8_trigger_from_transaction(
+            stage,
+            0x1122_3344_5566_7788,
+            &request[..request_len],
+            &response[..response_len],
+            3,
+        )
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    #[test]
+    fn e8_recovery_trigger_requires_exact_stage_derived_token() {
+        for (stage, action, token, expected) in [
+            (
+                2,
+                wyrmroot_wyr1e_test_actors::RECOVERY_DRIVER_ACTION,
+                "112233445566768A",
+                E8RecoveryAction::Driver,
+            ),
+            (
+                3,
+                wyrmroot_wyr1e_test_actors::RECOVERY_REGISTRY_ACTION,
+                "112233445566758A",
+                E8RecoveryAction::Registry,
+            ),
+        ] {
+            assert_eq!(
+                classify_e8_trigger_for_test(stage, action, token),
+                Ok(Some(E8Trigger {
+                    launch_transaction: 11,
+                    job_id: 12,
+                    action: expected,
+                }))
+            );
+            for rejected in [
+                "1122334455667788",
+                "112233445566768B",
+                "112233445566758B",
+                "112233445566768a",
+            ] {
+                assert_eq!(
+                    classify_e8_trigger_for_test(stage, action, rejected),
+                    Err(InitError::Accounting)
+                );
+            }
+        }
+        assert_eq!(
+            classify_e8_trigger_for_test(
+                2,
+                wyrmroot_wyr1e_test_actors::RECOVERY_REGISTRY_ACTION,
+                "112233445566758A",
+            ),
+            Err(InitError::Accounting)
+        );
+        assert_eq!(
+            classify_e8_trigger_for_test(
+                3,
+                wyrmroot_wyr1e_test_actors::RECOVERY_DRIVER_ACTION,
+                "112233445566768A",
+            ),
+            Err(InitError::Accounting)
+        );
     }
 
     #[test]

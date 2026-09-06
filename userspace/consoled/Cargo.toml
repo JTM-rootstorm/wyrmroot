@@ -20,6 +20,7 @@ required-features = ["native-consoled"]
 default = []
 wyr1d-selector32 = []
 wyr1e-wyrmsh = []
+wyr1e8-recovery = ["wyr1e-wyrmsh"]
 native-consoled = [
     "dep:deepwyrm-syscall",
     "dep:wyrmroot-device-proto",
@@ -45,3 +46,4 @@ wyrmroot-stream-proto = { path = "../../crates/wyrmroot-stream-proto", optional 
 [lints.rust]
 unsafe_code = "deny"
 unused_crate_dependencies = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("wyrmroot"))'] }

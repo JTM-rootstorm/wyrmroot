@@ -86,7 +86,7 @@ fn console_launcher_is_installed_before_consoled_can_send_shell_v1() {
     let owner = launch.find("attach_session_owner(").unwrap();
     assert!(install < load && load < owner);
     assert!(launch.contains("ConsoledLoadRequest"));
-    assert!(!launch.contains("selector"));
+    assert!(!launch.contains("wyr1d-selector32"));
 }
 
 #[test]

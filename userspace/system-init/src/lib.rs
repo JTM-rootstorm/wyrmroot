@@ -13,6 +13,9 @@
 ))]
 compile_error!("WYR1-E production and selector-only init policies are mutually exclusive");
 
+#[cfg(all(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
+compile_error!("WYR1-E7 and E8 selector profiles are mutually exclusive");
+
 use core::mem::MaybeUninit;
 
 #[cfg(feature = "wyr1e-production")]
@@ -31,6 +34,8 @@ pub mod wyr1c_native;
 pub mod wyr1d_gate;
 #[cfg(any(test, feature = "wyr1e-selector33"))]
 mod wyr1e7_evidence;
+#[cfg(any(test, feature = "wyr1e8-selector33"))]
+mod wyr1e8_evidence;
 
 use crate::evidence::{EvidenceError, EvidenceEvent, EvidenceLog};
 use crate::gate::{GATE_CONFIG_PATH, GateConfig, GateConfigError, parse_gate_config};
@@ -1590,6 +1595,17 @@ pub trait Wyr1BPlatform: InitPlatform {
     /// Sends one observer-only WRE1 record to the selector-33 kernel relay.
     #[cfg(feature = "wyr1e-selector33")]
     fn submit_wyr1e7_evidence(&mut self, _record: &[u8; 192]) -> Result<(), NativeError> {
+        #[cfg(test)]
+        return Ok(());
+        #[cfg(not(test))]
+        Err(NativeError::Output(
+            wyrmroot_runtime::NativeOutputError::InvalidWaitResult,
+        ))
+    }
+
+    /// Sends one observer-only WRE1 v1.1 record to the selector-33 relay.
+    #[cfg(feature = "wyr1e8-selector33")]
+    fn submit_wyr1e8_evidence(&mut self, _record: &[u8; 192]) -> Result<(), NativeError> {
         #[cfg(test)]
         return Ok(());
         #[cfg(not(test))]

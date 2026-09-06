@@ -51,6 +51,8 @@ use wyrmroot_system_init::{InitPlatform, ResidentSystemInit, Wyr1BPlatform};
 #[cfg(feature = "wyr1c6-selector29")]
 use wyrmroot_system_init::{wyr1c_native, wyr1c6_gate, wyr1c6_test_failure_application_status};
 use wyrmroot_wyr1b_gate_proto as _;
+#[cfg(feature = "wyr1e8-selector33")]
+use wyrmroot_wyr1e_test_actors as _;
 
 struct NativeSystem;
 
@@ -171,6 +173,11 @@ impl Wyr1BPlatform for NativeSystem {
     #[cfg(feature = "wyr1e-selector33")]
     fn submit_wyr1e7_evidence(&mut self, record: &[u8; 192]) -> Result<(), NativeError> {
         wyrmroot_runtime::submit_wyr1e7_evidence(record)
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    fn submit_wyr1e8_evidence(&mut self, record: &[u8; 192]) -> Result<(), NativeError> {
+        wyrmroot_runtime::submit_wyr1e8_evidence(record)
     }
 }
 

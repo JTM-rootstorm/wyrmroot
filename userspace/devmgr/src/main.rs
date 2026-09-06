@@ -75,9 +75,10 @@ use wyrmroot_device_proto::controller::INSTALL_BYTES;
 #[cfg(not(any(feature = "wyr1d-selector32", feature = "wyr1e-production")))]
 use wyrmroot_device_proto::controller::parse as parse_controller;
 #[cfg(feature = "wyr1d-selector32")]
+use wyrmroot_device_proto::d5_controller::encode as encode_d5_controller;
+#[cfg(any(feature = "wyr1d-selector32", feature = "wyr1e8-production"))]
 use wyrmroot_device_proto::d5_controller::{
-    D5ControllerMessage, RECORD_BYTES as D5_CONTROLLER_BYTES, encode as encode_d5_controller,
-    parse as parse_d5_controller,
+    D5ControllerMessage, RECORD_BYTES as D5_CONTROLLER_BYTES, parse as parse_d5_controller,
 };
 #[cfg(feature = "wyr1c6-selector29")]
 use wyrmroot_device_proto::driver_launch::{C6_FACT_BYTES, C6Fact, encode_c6_fact};
@@ -353,6 +354,8 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
     let mut selector32_retire_requested = None;
     #[cfg(feature = "wyr1d-selector32")]
     let mut selector32_drain = wyrmroot_devmgr::d5_drain::DrainRelay::default();
+    #[cfg(feature = "wyr1e8-production")]
+    let mut e8_retire_requested = false;
     #[cfg(feature = "wyr1c4-production")]
     let mut _device_resource = None;
     #[cfg(feature = "wyr1c5-production")]
@@ -480,8 +483,34 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                     return Err(code);
                 }
             };
-            #[cfg(any(feature = "dw1e3-selector31", feature = "wyr1d-selector32"))]
+            #[cfg(any(
+                feature = "dw1e3-selector31",
+                feature = "wyr1d-selector32",
+                feature = "wyr1e8-production"
+            ))]
             let (replacement, action) = match input {
+                #[cfg(feature = "wyr1e8-production")]
+                ControllerInput::D5(D5ControllerMessage::RequestRetire(identity)) => {
+                    let request = resident.active_driver_request().ok_or(failure(309))?;
+                    let control = driver_control.ok_or(failure(310))?;
+                    let broker = connector_broker.as_ref().ok_or(failure(311))?;
+                    let current = published_driver(&resident, request)?;
+                    if identity != current.d5_identity()
+                        || broker.current() != Some(current)
+                        || !matches!(
+                            broker.slot(),
+                            ConnectorSlot::Active { attach, .. } if attach.driver == current
+                        )
+                        || e8_retire_requested
+                    {
+                        return Err(failure(312));
+                    }
+                    send_driver_retire(control, &mut resident)?;
+                    e8_retire_requested = true;
+                    continue;
+                }
+                #[cfg(feature = "wyr1e8-production")]
+                ControllerInput::D5(_) => return Err(failure(313)),
                 #[cfg(feature = "wyr1d-selector32")]
                 ControllerInput::D5(D5ControllerMessage::RequestRetire(identity)) => {
                     let request = resident.active_driver_request().ok_or(failure(226))?;
@@ -623,7 +652,11 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                 }
                 ControllerInput::Controller(received) => received,
             };
-            #[cfg(not(any(feature = "dw1e3-selector31", feature = "wyr1d-selector32")))]
+            #[cfg(not(any(
+                feature = "dw1e3-selector31",
+                feature = "wyr1d-selector32",
+                feature = "wyr1e8-production"
+            )))]
             let (replacement, action) = input;
             if let Some(replacement) = replacement {
                 if let Some(old) = publication.replace(replacement) {
@@ -1045,9 +1078,15 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                         .map_err(|_| failure(45))?;
                 wait_readable(bootstrap, rebind_deadline, 46)?;
                 let received = receive_controller(bootstrap, &mut resident)?;
-                #[cfg(any(feature = "dw1e3-selector31", feature = "wyr1d-selector32"))]
+                #[cfg(any(
+                    feature = "dw1e3-selector31",
+                    feature = "wyr1d-selector32",
+                    feature = "wyr1e8-production"
+                ))]
                 let (replacement, action) = match received {
                     ControllerInput::Controller(received) => received,
+                    #[cfg(feature = "wyr1e8-production")]
+                    ControllerInput::D5(_) => return Err(failure(314)),
                     #[cfg(feature = "wyr1d-selector32")]
                     ControllerInput::D5(_) => return Err(failure(241)),
                     #[cfg(feature = "dw1e3-selector31")]
@@ -1057,7 +1096,11 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                     #[cfg(feature = "dw1e3-selector31")]
                     ControllerInput::Dw1e3DriverCommand(_, _) => return Err(failure(223)),
                 };
-                #[cfg(not(any(feature = "dw1e3-selector31", feature = "wyr1d-selector32")))]
+                #[cfg(not(any(
+                    feature = "dw1e3-selector31",
+                    feature = "wyr1d-selector32",
+                    feature = "wyr1e8-production"
+                )))]
                 let (replacement, action) = received;
                 if action != ControllerAction::PublicationRebound {
                     return Err(failure(47));
@@ -1268,10 +1311,14 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
     }
 }
 
-#[cfg(any(feature = "dw1e3-selector31", feature = "wyr1d-selector32"))]
+#[cfg(any(
+    feature = "dw1e3-selector31",
+    feature = "wyr1d-selector32",
+    feature = "wyr1e8-production"
+))]
 enum ControllerInput {
     Controller((Option<DwHandle>, ControllerAction)),
-    #[cfg(feature = "wyr1d-selector32")]
+    #[cfg(any(feature = "wyr1d-selector32", feature = "wyr1e8-production"))]
     D5(D5ControllerMessage),
     #[cfg(feature = "dw1e3-selector31")]
     Dw1e3(DevmgrConfig),
@@ -1281,7 +1328,11 @@ enum ControllerInput {
     Dw1e3DriverCommand(ChallengeBinding, u16),
 }
 
-#[cfg(not(any(feature = "dw1e3-selector31", feature = "wyr1d-selector32")))]
+#[cfg(not(any(
+    feature = "dw1e3-selector31",
+    feature = "wyr1d-selector32",
+    feature = "wyr1e8-production"
+)))]
 type ControllerInput = (Option<DwHandle>, ControllerAction);
 
 fn receive_controller(
@@ -1290,11 +1341,15 @@ fn receive_controller(
 ) -> Result<ControllerInput, u32> {
     #[cfg(feature = "dw1e3-selector31")]
     let mut bytes = [0u8; D3_DEVICE_STAGE_BYTES];
-    #[cfg(all(not(feature = "dw1e3-selector31"), feature = "wyr1d-selector32"))]
+    #[cfg(all(
+        not(feature = "dw1e3-selector31"),
+        any(feature = "wyr1d-selector32", feature = "wyr1e8-production")
+    ))]
     let mut bytes = [0u8; D5_CONTROLLER_BYTES];
     #[cfg(all(
         not(feature = "dw1e3-selector31"),
         not(feature = "wyr1d-selector32"),
+        not(feature = "wyr1e8-production"),
         feature = "wyr1e-production"
     ))]
     let mut bytes = [0u8; wyrmroot_device_proto::controller_v1_1::RECORD_BYTES];
@@ -1342,7 +1397,7 @@ fn receive_controller(
             _ => Err(failure(216)),
         };
     }
-    #[cfg(feature = "wyr1d-selector32")]
+    #[cfg(any(feature = "wyr1d-selector32", feature = "wyr1e8-production"))]
     if counts.bytes == D5_CONTROLLER_BYTES
         && bytes[..4] == wyrmroot_device_proto::d5_controller::MAGIC
     {
@@ -1418,9 +1473,17 @@ fn receive_controller(
             return Err(failure(34));
         }
     };
-    #[cfg(any(feature = "dw1e3-selector31", feature = "wyr1d-selector32"))]
+    #[cfg(any(
+        feature = "dw1e3-selector31",
+        feature = "wyr1d-selector32",
+        feature = "wyr1e8-production"
+    ))]
     return Ok(ControllerInput::Controller((replacement, action)));
-    #[cfg(not(any(feature = "dw1e3-selector31", feature = "wyr1d-selector32")))]
+    #[cfg(not(any(
+        feature = "dw1e3-selector31",
+        feature = "wyr1d-selector32",
+        feature = "wyr1e8-production"
+    )))]
     Ok((replacement, action))
 }
 
