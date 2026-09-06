@@ -167,6 +167,11 @@ impl Wyr1BPlatform for NativeSystem {
     ) -> Result<DwHandle, NativeError> {
         wyrmroot_runtime::materialize_read_only_memory(root, bytes, rights)
     }
+
+    #[cfg(feature = "wyr1e-selector33")]
+    fn submit_wyr1e7_evidence(&mut self, record: &[u8; 192]) -> Result<(), NativeError> {
+        wyrmroot_runtime::submit_wyr1e7_evidence(record)
+    }
 }
 
 fn main(startup: StartupBlock<'_>) -> u32 {

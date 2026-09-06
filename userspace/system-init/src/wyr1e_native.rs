@@ -571,6 +571,12 @@ where
         clear_publication_observer(e6, system, registry_generation, false)?;
         return Ok(Some(PollOutcome::RecoverDevmgr));
     }
+    #[cfg(feature = "wyr1e-selector33")]
+    e6.shell.observe_serial_for_e7(
+        observer.expected_service_generation,
+        observer.expected_driver.attempt_generation.0,
+        observer.expected_driver.supervisor_generation.0,
+    )?;
     clear_publication_observer(e6, system, registry_generation, false)?;
     Ok(Some(PollOutcome::LaunchConsole))
 }

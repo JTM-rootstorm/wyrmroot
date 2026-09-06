@@ -29,6 +29,8 @@ pub mod wyr1c6_gate;
 pub mod wyr1c_native;
 #[cfg(feature = "wyr1d-selector32")]
 pub mod wyr1d_gate;
+#[cfg(any(test, feature = "wyr1e-selector33"))]
+mod wyr1e7_evidence;
 
 use crate::evidence::{EvidenceError, EvidenceEvent, EvidenceLog};
 use crate::gate::{GATE_CONFIG_PATH, GateConfig, GateConfigError, parse_gate_config};
@@ -1584,6 +1586,17 @@ pub trait Wyr1BPlatform: InitPlatform {
         bytes: &[u8],
         rights: DwRights,
     ) -> Result<DwHandle, NativeError>;
+
+    /// Sends one observer-only WRE1 record to the selector-33 kernel relay.
+    #[cfg(feature = "wyr1e-selector33")]
+    fn submit_wyr1e7_evidence(&mut self, _record: &[u8; 192]) -> Result<(), NativeError> {
+        #[cfg(test)]
+        return Ok(());
+        #[cfg(not(test))]
+        Err(NativeError::Output(
+            wyrmroot_runtime::NativeOutputError::InvalidWaitResult,
+        ))
+    }
 }
 
 /// Runs the native selected-generation activation through NORMAL or DEGRADED.

@@ -33,7 +33,23 @@ impl LaunchSessionScope {
         match self {
             Self::Historical => true,
             Self::ConsoleLauncher => false,
-            Self::ShellJobs => matches!(path, "bin/hello" | "bin/cpu-hog"),
+            Self::ShellJobs => {
+                let production = matches!(path, "bin/hello" | "bin/cpu-hog");
+                #[cfg(feature = "wyr1e-selector33")]
+                {
+                    production
+                        || matches!(
+                            path,
+                            "test/wyr1-e/exit-nonzero"
+                                | "test/wyr1-e/fault"
+                                | "test/wyr1-e/malformed-elf"
+                        )
+                }
+                #[cfg(not(feature = "wyr1e-selector33"))]
+                {
+                    production
+                }
+            }
         }
     }
 
@@ -431,6 +447,17 @@ mod tests {
         assert!(LaunchSessionScope::ShellJobs.admits_legacy_launch("bin/hello"));
         assert!(LaunchSessionScope::ShellJobs.admits_legacy_launch("bin/cpu-hog"));
         assert!(!LaunchSessionScope::ShellJobs.admits_legacy_launch("bin/hello-extra"));
+        #[cfg(feature = "wyr1e-selector33")]
+        for path in [
+            "test/wyr1-e/exit-nonzero",
+            "test/wyr1-e/fault",
+            "test/wyr1-e/malformed-elf",
+        ] {
+            assert!(LaunchSessionScope::ShellJobs.admits_legacy_launch(path));
+        }
+        #[cfg(not(feature = "wyr1e-selector33"))]
+        assert!(!LaunchSessionScope::ShellJobs.admits_legacy_launch("test/wyr1-e/fault"));
+        assert!(!LaunchSessionScope::ShellJobs.admits_legacy_launch("test/wyr1-e/fault-extra"));
         assert!(LaunchSessionScope::ConsoleLauncher.admits_shell_v1());
         assert!(!LaunchSessionScope::Historical.admits_shell_v1());
         assert!(!LaunchSessionScope::ShellJobs.admits_shell_v1());

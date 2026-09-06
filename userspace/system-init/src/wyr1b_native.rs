@@ -7,7 +7,7 @@ use crate::wyr1b::{
     correlation_environment, observe_prepared_ready, prepare_reserved_job,
 };
 use crate::wyr1b_gate::{EvidenceLog, GATE_PATH, GateConfig, GateEvent, parse_config};
-use crate::wyr1b_job::{JobDispatcher, SessionOwner};
+use crate::wyr1b_job::{JobDispatcher, LaunchSessionScope, SessionOwner};
 use deepwyrm_syscall::{
     DW_HANDLE_TRANSFER_MOVE, DW_OBJECT_TYPE_CHANNEL, DW_RIGHT_INSPECT, DW_RIGHT_READ,
     DW_RIGHT_TRANSFER, DW_RIGHT_WAIT, DW_RIGHT_WRITE, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE,
@@ -77,6 +77,8 @@ pub(crate) struct ShellControllerState {
     last_console_generation: u64,
     last_status_generation: u64,
     last_child_generation: u64,
+    #[cfg(feature = "wyr1e-selector33")]
+    evidence: crate::wyr1e7_evidence::Observer,
 }
 
 #[allow(
@@ -97,7 +99,80 @@ impl ShellControllerState {
             last_console_generation: 0,
             last_status_generation: 0,
             last_child_generation: 0,
+            #[cfg(feature = "wyr1e-selector33")]
+            evidence: crate::wyr1e7_evidence::Observer::new()?,
         })
+    }
+
+    #[cfg(feature = "wyr1e-selector33")]
+    pub(crate) fn observe_serial_for_e7(
+        &mut self,
+        publication_generation: u64,
+        driver_attempt_generation: u64,
+        supervisor_generation: u64,
+    ) -> Result<(), InitError> {
+        self.evidence.observe_serial(
+            publication_generation,
+            driver_attempt_generation,
+            supervisor_generation,
+        )
+    }
+
+    #[cfg(feature = "wyr1e-selector33")]
+    fn submit_e7<S: Wyr1BPlatform>(
+        system: &mut S,
+        record: &[u8; crate::wyr1e7_evidence::RECORD_BYTES],
+    ) -> Result<(), InitError> {
+        system
+            .submit_wyr1e7_evidence(record)
+            .map_err(InitError::Native)
+    }
+
+    #[cfg(feature = "wyr1e-selector33")]
+    fn record_e7_shell_ready<S: Wyr1BPlatform>(
+        &mut self,
+        system: &mut S,
+        tuple: crate::wyr1e7_evidence::ShellTuple,
+    ) -> Result<(), InitError> {
+        #[cfg(test)]
+        if !self.evidence.armed() {
+            return Ok(());
+        }
+        self.evidence
+            .shell_ready(tuple, |record| Self::submit_e7(system, record))
+    }
+
+    #[cfg(feature = "wyr1e-selector33")]
+    fn record_e7_shell_jobs<S: Wyr1BPlatform>(
+        &mut self,
+        system: &mut S,
+        request: &[u8],
+        response: &[u8],
+        handles: &[DwReceivedHandleInfoV1],
+    ) -> Result<(), InitError> {
+        #[cfg(test)]
+        if !self.evidence.ready() {
+            return Ok(());
+        }
+        self.evidence
+            .shell_jobs_transaction(request, response, handles, |record| {
+                Self::submit_e7(system, record)
+            })
+    }
+
+    #[cfg(feature = "wyr1e-selector33")]
+    fn record_e7_outer_response<S: Wyr1BPlatform>(
+        &mut self,
+        system: &mut S,
+        request: &[u8],
+        response: &[u8],
+    ) -> Result<(), InitError> {
+        #[cfg(test)]
+        if !self.evidence.ready() {
+            return Ok(());
+        }
+        self.evidence
+            .observe_outer_response(request, response, |record| Self::submit_e7(system, record))
     }
 
     pub(crate) const fn health(&self) -> ShellRegistryHealth {
@@ -2567,6 +2642,63 @@ fn send_job_error<S: InitPlatform>(
         .map_err(InitError::Native)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn observe_e7_response<S: Wyr1BPlatform>(
+    system: &mut S,
+    scope: LaunchSessionScope,
+    state: Option<&mut ShellControllerState>,
+    request: &[u8],
+    response: &[u8],
+    handles: &[DwReceivedHandleInfoV1],
+) -> Result<(), InitError> {
+    #[cfg(feature = "wyr1e-selector33")]
+    {
+        let Some(state) = state else {
+            #[cfg(test)]
+            return Ok(());
+            #[cfg(not(test))]
+            return Err(InitError::WrongActivationOrder);
+        };
+        match scope {
+            LaunchSessionScope::ShellJobs => {
+                state.record_e7_shell_jobs(system, request, response, handles)
+            }
+            LaunchSessionScope::ConsoleLauncher => {
+                if !handles.is_empty() {
+                    return Err(InitError::Accounting);
+                }
+                state.record_e7_outer_response(system, request, response)
+            }
+            LaunchSessionScope::Historical => Ok(()),
+        }
+    }
+    #[cfg(not(feature = "wyr1e-selector33"))]
+    {
+        let _ = (system, scope, state, request, response, handles);
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_observed_job_error<S: Wyr1BPlatform>(
+    system: &mut S,
+    session: DwHandle,
+    reservation: LaunchReservation,
+    code: LaunchErrorCode,
+    scope: LaunchSessionScope,
+    state: Option<&mut ShellControllerState>,
+    request: &[u8],
+    handles: &[DwReceivedHandleInfoV1],
+) -> Result<(), InitError> {
+    let mut response = [0_u8; 88];
+    let size =
+        encode_launch_error(reservation, code, &mut response).map_err(|_| InitError::Accounting)?;
+    system
+        .send_channel(session, &response[..size])
+        .map_err(InitError::Native)?;
+    observe_e7_response(system, scope, state, request, &response[..size], handles)
+}
+
 fn send_shell_v1_error<S: InitPlatform>(
     system: &mut S,
     session: DwHandle,
@@ -2600,8 +2732,39 @@ fn controller_result_to_wire(result: ControllerJobResult) -> Result<TerminationR
     })
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn dispatch_reserved_operation<S, W>(
+    system: &mut S,
+    waits: &mut W,
+    jobs: &mut JobDispatcher,
+    session: DwHandle,
+    grant: EndpointGrant,
+    reservation: LaunchReservation,
+    ticket: RequestTicket,
+    message: LaunchMessage<'_>,
+) -> Result<(), InitError>
+where
+    S: Wyr1BPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    dispatch_reserved_operation_observed(
+        system,
+        waits,
+        jobs,
+        session,
+        grant,
+        reservation,
+        ticket,
+        message,
+        &[],
+        LaunchSessionScope::Historical,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::needless_option_as_deref)]
+fn dispatch_reserved_operation_observed<S, W>(
     system: &mut S,
     _waits: &mut W,
     jobs: &mut JobDispatcher,
@@ -2610,6 +2773,9 @@ fn dispatch_reserved_operation<S, W>(
     reservation: LaunchReservation,
     ticket: RequestTicket,
     message: LaunchMessage<'_>,
+    request_bytes: &[u8],
+    scope: LaunchSessionScope,
+    mut evidence: Option<&mut ShellControllerState>,
 ) -> Result<(), InitError>
 where
     S: Wyr1BPlatform,
@@ -2654,7 +2820,16 @@ where
             let resources = match jobs.jobs.authorize_terminate_reserved(ticket, job_id) {
                 Ok(resources) => resources,
                 Err(error) => {
-                    return send_job_error(system, session, reservation, job_error_code(error));
+                    return send_observed_job_error(
+                        system,
+                        session,
+                        reservation,
+                        job_error_code(error),
+                        scope,
+                        evidence.as_deref_mut(),
+                        request_bytes,
+                        &[],
+                    );
                 }
             };
             if system
@@ -2664,11 +2839,15 @@ where
                 jobs.jobs
                     .record_cleanup_bits(job_id, 1 << 0)
                     .map_err(InitError::Wyr1BModel)?;
-                return send_job_error(
+                return send_observed_job_error(
                     system,
                     session,
                     reservation,
                     LaunchErrorCode::CleanupFailure,
+                    scope,
+                    evidence.as_deref_mut(),
+                    request_bytes,
+                    &[],
                 );
             }
             jobs.jobs
@@ -2712,11 +2891,15 @@ where
                 .cancel_pending_wait(grant, target_transaction_id)
                 .is_none()
             {
-                return send_job_error(
+                return send_observed_job_error(
                     system,
                     session,
                     reservation,
                     LaunchErrorCode::CancellationUnavailable,
+                    scope,
+                    evidence.as_deref_mut(),
+                    request_bytes,
+                    &[],
                 );
             }
             encode_job_message(
@@ -2731,11 +2914,30 @@ where
         _ => Err(JobError::WrongState),
     };
     match result {
-        Ok(Some(size)) => system
-            .send_channel(session, &response[..size])
-            .map_err(InitError::Native),
+        Ok(Some(size)) => {
+            system
+                .send_channel(session, &response[..size])
+                .map_err(InitError::Native)?;
+            observe_e7_response(
+                system,
+                scope,
+                evidence.as_deref_mut(),
+                request_bytes,
+                &response[..size],
+                &[],
+            )
+        }
         Ok(None) => Ok(()),
-        Err(error) => send_job_error(system, session, reservation, job_error_code(error)),
+        Err(error) => send_observed_job_error(
+            system,
+            session,
+            reservation,
+            job_error_code(error),
+            scope,
+            evidence,
+            request_bytes,
+            &[],
+        ),
     }
 }
 
@@ -2790,6 +2992,14 @@ where
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AcceptedShell {
+    loaded: crate::wyr1b::LoadedJob,
+    request: wyrmroot_launch_proto::ShellV1Request,
+    registry_grant: EndpointGrant,
+    shell_grant: EndpointGrant,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn accept_reserved_shell<S, L, W>(
     system: &mut S,
@@ -2803,7 +3013,7 @@ fn accept_reserved_shell<S, L, W>(
     request: wyrmroot_launch_proto::ShellV1Request,
     received: &[DwReceivedHandleInfoV1],
     context: &mut ShellLaunchContext<'_>,
-) -> Result<crate::wyr1b::LoadedJob, InitError>
+) -> Result<AcceptedShell, InitError>
 where
     S: Wyr1BPlatform,
     L: LoaderPlatform<Error = NativeError>,
@@ -3084,7 +3294,12 @@ where
             InitError::Wyr1BModel(error)
         });
     }
-    Ok(loaded_job)
+    Ok(AcceptedShell {
+        loaded: loaded_job,
+        request,
+        registry_grant,
+        shell_grant,
+    })
 }
 
 fn send_versioned_job_error<S: InitPlatform>(
@@ -3165,7 +3380,7 @@ fn dispatch_one_job_request_inner<S, L, W>(
     jobs: &mut JobDispatcher,
     session: DwHandle,
     grant: EndpointGrant,
-    shell: Option<&mut ShellLaunchContext<'_>>,
+    mut shell: Option<&mut ShellLaunchContext<'_>>,
 ) -> Result<JobDispatchOutcome, InitError>
 where
     S: Wyr1BPlatform,
@@ -3277,14 +3492,14 @@ where
                 return Ok(JobDispatchOutcome::Responded);
             }
         }
-        let (Some(policy), Some(shell)) = (policy, shell) else {
+        let (Some(policy), Some(shell)) = (policy, shell.as_deref_mut()) else {
             if close_received_reverse(system, &received, counts.handles) {
                 return Err(InitError::Cleanup);
             }
             send_shell_v1_error(system, session, reservation, LaunchErrorCode::LoaderFailure)?;
             return Ok(JobDispatchOutcome::Responded);
         };
-        let loaded = match accept_reserved_shell(
+        let accepted = match accept_reserved_shell(
             system,
             loader,
             waits,
@@ -3297,7 +3512,7 @@ where
             &received[..counts.handles],
             shell,
         ) {
-            Ok(loaded) => loaded,
+            Ok(accepted) => accepted,
             Err(error) => {
                 let response = send_shell_v1_error(
                     system,
@@ -3313,6 +3528,7 @@ where
                 };
             }
         };
+        let loaded = accepted.loaded;
         let release = jobs
             .jobs
             .release_launch_channel(loaded.job_id, loaded.loaded.launch_channel.0)
@@ -3340,6 +3556,22 @@ where
             let _ = cleanup_shell_before_publication(system, waits, jobs, loaded);
             return Err(InitError::Cleanup);
         }
+        #[cfg(feature = "wyr1e-selector33")]
+        shell.state.record_e7_shell_ready(
+            system,
+            crate::wyr1e7_evidence::ShellTuple {
+                console_generation: accepted.request.console_generation,
+                status_generation: accepted.request.status_generation,
+                shell_generation: accepted.request.requested_child_generation,
+                outer_launch_transaction: reservation.transaction_id,
+                outer_job_id: loaded.job_id,
+                registry_generation: accepted.registry_grant.registry_generation,
+                registry_endpoint_id: accepted.registry_grant.endpoint_id,
+                registry_endpoint_generation: accepted.registry_grant.endpoint_generation,
+                shell_jobs_connection_id: accepted.shell_grant.endpoint_id,
+                shell_jobs_generation: accepted.shell_grant.endpoint_generation,
+            },
+        )?;
         return Ok(JobDispatchOutcome::Launched(
             jobs.jobs
                 .loaded_job(loaded.job_id)
@@ -3368,11 +3600,15 @@ where
                 if close_received_reverse(system, &received, counts.handles) {
                     return Err(InitError::Cleanup);
                 }
-                send_job_error(
+                send_observed_job_error(
                     system,
                     session,
                     reservation,
                     LaunchErrorCode::PolicyRejected,
+                    scope,
+                    shell.as_deref_mut().map(|context| &mut *context.state),
+                    &bytes[..counts.bytes],
+                    &received[..counts.handles],
                 )?;
                 return Ok(JobDispatchOutcome::Responded);
             }
@@ -3380,11 +3616,15 @@ where
                 if close_received_reverse(system, &received, counts.handles) {
                     return Err(InitError::Cleanup);
                 }
-                send_job_error(
+                send_observed_job_error(
                     system,
                     session,
                     reservation,
                     LaunchErrorCode::PolicyRejected,
+                    scope,
+                    shell.as_deref_mut().map(|context| &mut *context.state),
+                    &bytes[..counts.bytes],
+                    &received[..counts.handles],
                 )?;
                 return Ok(JobDispatchOutcome::Responded);
             };
@@ -3402,9 +3642,36 @@ where
                 &received[..legacy_handle_limit],
                 counts.handles,
             ) {
-                Ok(loaded) => Ok(JobDispatchOutcome::Launched(loaded)),
+                Ok(loaded) => {
+                    let mut response = [0_u8; 56];
+                    let response_size = encode_job_message(
+                        reservation,
+                        LaunchMessageType::LaunchAccepted,
+                        loaded.job_id,
+                        &mut response,
+                    )
+                    .map_err(|_| InitError::Accounting)?;
+                    observe_e7_response(
+                        system,
+                        scope,
+                        shell.as_deref_mut().map(|context| &mut *context.state),
+                        &bytes[..counts.bytes],
+                        &response[..response_size],
+                        &received[..counts.handles],
+                    )?;
+                    Ok(JobDispatchOutcome::Launched(loaded))
+                }
                 Err(error) => {
-                    send_job_error(system, session, reservation, launch_error_code(&error))?;
+                    send_observed_job_error(
+                        system,
+                        session,
+                        reservation,
+                        launch_error_code(&error),
+                        scope,
+                        shell.as_deref_mut().map(|context| &mut *context.state),
+                        &bytes[..counts.bytes],
+                        &received[..counts.handles],
+                    )?;
                     if error == InitError::Cleanup {
                         Err(error)
                     } else {
@@ -3417,7 +3684,7 @@ where
             if close_received_reverse(system, &received, counts.handles) {
                 return Err(InitError::Cleanup);
             }
-            dispatch_reserved_operation(
+            dispatch_reserved_operation_observed(
                 system,
                 waits,
                 jobs,
@@ -3426,6 +3693,9 @@ where
                 reservation,
                 request_ticket,
                 message,
+                &bytes[..counts.bytes],
+                scope,
+                shell.map(|context| &mut *context.state),
             )?;
             Ok(JobDispatchOutcome::Responded)
         }
@@ -3483,7 +3753,7 @@ fn poll_job_dispatcher_inner<S, L, W>(
     authority: LoadAuthority,
     jobs: &mut JobDispatcher,
     now_ns: u64,
-    shell: Option<&mut ShellLaunchContext<'_>>,
+    mut shell: Option<&mut ShellLaunchContext<'_>>,
 ) -> Result<(), InitError>
 where
     S: Wyr1BPlatform,
@@ -3523,7 +3793,7 @@ where
                                 .map_err(|_| InitError::Accounting)?;
                             let policy = PolicyView::from_bootfs(archive, boot_generation)
                                 .map_err(InitError::Wyr1BModel)?;
-                            if let Some(shell) = shell {
+                            if let Some(shell) = shell.as_deref_mut() {
                                 dispatch_one_job_request_with_shell(
                                     system,
                                     loader,
@@ -3621,7 +3891,11 @@ where
             }
         }
     }
-    service_pending_wait(system, waits, jobs)?;
+    if let Some(shell) = shell {
+        service_pending_wait_inner(system, waits, jobs, Some(&mut *shell.state))?;
+    } else {
+        service_pending_wait(system, waits, jobs)?;
+    }
     Ok(())
 }
 
@@ -3634,9 +3908,25 @@ where
     S: Wyr1BPlatform,
     W: SupervisionPlatform<Error = NativeError>,
 {
+    service_pending_wait_inner(system, waits, jobs, None)
+}
+
+fn service_pending_wait_inner<S, W>(
+    system: &mut S,
+    waits: &mut W,
+    jobs: &mut JobDispatcher,
+    evidence: Option<&mut ShellControllerState>,
+) -> Result<(), InitError>
+where
+    S: Wyr1BPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
     let Some(pending) = jobs.next_pending_wait() else {
         return Ok(());
     };
+    let scope = jobs
+        .session_scope(pending.grant)
+        .map_err(InitError::Wyr1BModel)?;
     let result = match jobs.jobs.result_for_owner(
         pending.reservation.connection_id,
         pending.reservation.generation,
@@ -3667,6 +3957,22 @@ where
             InitError::Native(error)
         });
     }
+    let mut request = [0u8; 56];
+    let request_size = encode_job_message(
+        pending.reservation,
+        LaunchMessageType::Wait,
+        pending.job_id,
+        &mut request,
+    )
+    .map_err(|_| InitError::Accounting)?;
+    observe_e7_response(
+        system,
+        scope,
+        evidence,
+        &request[..request_size],
+        &response[..size],
+        &[],
+    )?;
     jobs.finish_pending_wait(pending)
         .map_err(InitError::Wyr1BModel)
 }
@@ -4739,6 +5045,10 @@ mod tests {
         fail_move: bool,
         fail_send_on: Option<DwHandle>,
         bootfs: Option<Vec<u8>>,
+        #[cfg(feature = "wyr1e-selector33")]
+        evidence: Vec<[u8; crate::wyr1e7_evidence::RECORD_BYTES]>,
+        #[cfg(feature = "wyr1e-selector33")]
+        fail_evidence: bool,
     }
 
     impl ShellPlatform {
@@ -4909,6 +5219,18 @@ mod tests {
             _rights: DwRights,
         ) -> Result<DwHandle, NativeError> {
             Err(FAILURE)
+        }
+
+        #[cfg(feature = "wyr1e-selector33")]
+        fn submit_wyr1e7_evidence(
+            &mut self,
+            record: &[u8; crate::wyr1e7_evidence::RECORD_BYTES],
+        ) -> Result<(), NativeError> {
+            if self.fail_evidence {
+                return Err(FAILURE);
+            }
+            self.evidence.push(*record);
+            Ok(())
         }
     }
 
@@ -6429,6 +6751,255 @@ mod tests {
         ));
         assert_eq!(jobs.jobs.live_jobs(), 0);
         assert_eq!(jobs.session_count(), 1);
+    }
+
+    #[cfg(feature = "wyr1e-selector33")]
+    #[test]
+    fn selector33_records_only_successfully_sent_actual_shelljobs_replies() {
+        let mut platform = ShellPlatform::new();
+        let mut loader = InitSendLoader::new();
+        let mut waits = TerminalWaits;
+        let mut jobs = JobDispatcher::new();
+        let grant = grant(EndpointKind::LaunchSession, 9, 3);
+        let session = DwHandle(90);
+        jobs.install_scoped_session(grant, session, LaunchSessionScope::ShellJobs)
+            .unwrap();
+        let mut topology = RegistryTopology::new(6).unwrap();
+        let mut state = ShellControllerState::new(6).unwrap();
+        state.observe_serial_for_e7(11, 12, 13).unwrap();
+        state
+            .record_e7_shell_ready(
+                &mut platform,
+                crate::wyr1e7_evidence::ShellTuple {
+                    console_generation: 1,
+                    status_generation: 2,
+                    shell_generation: 3,
+                    outer_launch_transaction: 4,
+                    outer_job_id: 5,
+                    registry_generation: 6,
+                    registry_endpoint_id: 7,
+                    registry_endpoint_generation: 8,
+                    shell_jobs_connection_id: grant.endpoint_id,
+                    shell_jobs_generation: grant.endpoint_generation,
+                },
+            )
+            .unwrap();
+        let reservation = LaunchReservation {
+            connection_id: grant.endpoint_id,
+            generation: grant.endpoint_generation,
+            transaction_id: 20,
+        };
+        let mut request = [0u8; wyrmroot_launch_proto::HEADER_BYTES];
+        let size = wyrmroot_launch_proto::encode_list_jobs(reservation, &mut request).unwrap();
+        platform.push(session, request[..size].to_vec(), &[]);
+        let mut context = ShellLaunchContext {
+            registry_control: DwHandle(70),
+            topology: &mut topology,
+            state: &mut state,
+        };
+        dispatch_one_job_request_with_shell(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            LoadAuthority {
+                parent_root: DwHandle(1),
+                bootfs: DwHandle(2),
+                task_group: DwHandle(3),
+            },
+            None,
+            &mut jobs,
+            session,
+            grant,
+            &mut context,
+        )
+        .unwrap();
+        assert_eq!(platform.evidence.len(), 2);
+        assert_eq!(
+            u32::from_le_bytes(platform.evidence[1][8..12].try_into().unwrap()),
+            2
+        );
+        assert_eq!(
+            u32::from_le_bytes(platform.evidence[1][128..132].try_into().unwrap()),
+            9
+        );
+        assert_eq!(
+            u32::from_le_bytes(platform.evidence[1][132..136].try_into().unwrap()),
+            10
+        );
+
+        let failed_reservation = LaunchReservation {
+            transaction_id: 21,
+            ..reservation
+        };
+        let failed_size =
+            wyrmroot_launch_proto::encode_list_jobs(failed_reservation, &mut request).unwrap();
+        platform.push(session, request[..failed_size].to_vec(), &[]);
+        platform.fail_send_on = Some(session);
+        assert!(
+            dispatch_one_job_request_with_shell(
+                &mut platform,
+                &mut loader,
+                &mut waits,
+                LoadAuthority {
+                    parent_root: DwHandle(1),
+                    bootfs: DwHandle(2),
+                    task_group: DwHandle(3),
+                },
+                None,
+                &mut jobs,
+                session,
+                grant,
+                &mut context,
+            )
+            .is_err()
+        );
+        assert_eq!(platform.evidence.len(), 2);
+
+        platform.fail_send_on = None;
+        platform.fail_evidence = true;
+        let relay_failure = LaunchReservation {
+            transaction_id: 22,
+            ..reservation
+        };
+        let relay_failure_size =
+            wyrmroot_launch_proto::encode_list_jobs(relay_failure, &mut request).unwrap();
+        platform.push(session, request[..relay_failure_size].to_vec(), &[]);
+        assert!(
+            dispatch_one_job_request_with_shell(
+                &mut platform,
+                &mut loader,
+                &mut waits,
+                LoadAuthority {
+                    parent_root: DwHandle(1),
+                    bootfs: DwHandle(2),
+                    task_group: DwHandle(3),
+                },
+                None,
+                &mut jobs,
+                session,
+                grant,
+                &mut context,
+            )
+            .is_err()
+        );
+        assert_eq!(platform.evidence.len(), 2);
+    }
+
+    #[cfg(feature = "wyr1e-selector33")]
+    #[test]
+    fn selector33_terminal_requires_actual_outer_result_then_committed_close() {
+        let mut platform = ShellPlatform::new();
+        let mut loader = InitSendLoader::new();
+        let mut waits = TerminalWaits;
+        let mut jobs = JobDispatcher::new();
+        let grant = grant(EndpointKind::LaunchSession, 30, 31);
+        let session = DwHandle(90);
+        jobs.install_scoped_session(grant, session, LaunchSessionScope::ConsoleLauncher)
+            .unwrap();
+        let launched = jobs
+            .jobs
+            .begin_launch(LaunchReservation {
+                connection_id: grant.endpoint_id,
+                generation: grant.endpoint_generation,
+                transaction_id: 1,
+            })
+            .unwrap();
+        jobs.jobs.commit_launch(launched, 101, 102, 103).unwrap();
+        jobs.jobs
+            .complete(
+                launched.job_id,
+                101,
+                102,
+                103,
+                ControllerJobResult {
+                    classification: TerminationClassification::NormalExit.as_u32(),
+                    application_code: 0,
+                    exception_class: 0,
+                    exception_detail: 0,
+                    exception_address: 0,
+                    cleanup_result: 0,
+                },
+            )
+            .unwrap();
+        let mut topology = RegistryTopology::new(6).unwrap();
+        let mut state = ShellControllerState::new(6).unwrap();
+        state.observe_serial_for_e7(11, 12, 13).unwrap();
+        state
+            .record_e7_shell_ready(
+                &mut platform,
+                crate::wyr1e7_evidence::ShellTuple {
+                    console_generation: 1,
+                    status_generation: 2,
+                    shell_generation: 3,
+                    outer_launch_transaction: 4,
+                    outer_job_id: launched.job_id,
+                    registry_generation: 6,
+                    registry_endpoint_id: 7,
+                    registry_endpoint_generation: 8,
+                    shell_jobs_connection_id: 9,
+                    shell_jobs_generation: 10,
+                },
+            )
+            .unwrap();
+        let mut context = ShellLaunchContext {
+            registry_control: DwHandle(70),
+            topology: &mut topology,
+            state: &mut state,
+        };
+        for (transaction_id, kind) in [
+            (40, LaunchMessageType::Wait),
+            (41, LaunchMessageType::CloseJob),
+        ] {
+            let reservation = LaunchReservation {
+                connection_id: grant.endpoint_id,
+                generation: grant.endpoint_generation,
+                transaction_id,
+            };
+            let mut request = [0u8; 56];
+            let size =
+                encode_job_message(reservation, kind, launched.job_id, &mut request).unwrap();
+            platform.push(session, request[..size].to_vec(), &[]);
+            dispatch_one_job_request_with_shell(
+                &mut platform,
+                &mut loader,
+                &mut waits,
+                LoadAuthority {
+                    parent_root: DwHandle(1),
+                    bootfs: DwHandle(2),
+                    task_group: DwHandle(3),
+                },
+                None,
+                &mut jobs,
+                session,
+                grant,
+                &mut context,
+            )
+            .unwrap();
+        }
+        assert_eq!(platform.evidence.len(), 3);
+        assert_eq!(
+            u32::from_le_bytes(platform.evidence[1][8..12].try_into().unwrap()),
+            3
+        );
+        assert_eq!(
+            u64::from_le_bytes(platform.evidence[1][112..120].try_into().unwrap()),
+            41
+        );
+        assert_eq!(
+            u32::from_le_bytes(platform.evidence[2][8..12].try_into().unwrap()),
+            255
+        );
+        assert_eq!(
+            jobs.jobs.result(
+                LaunchReservation {
+                    connection_id: grant.endpoint_id,
+                    generation: grant.endpoint_generation,
+                    transaction_id: 42,
+                },
+                launched.job_id,
+            ),
+            Err(JobError::UnknownJob)
+        );
     }
 
     #[test]
