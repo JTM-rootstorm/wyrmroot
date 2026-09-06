@@ -1179,6 +1179,7 @@ fn validate_request(f: &BTreeMap<String, String>) -> Result<(), Failure> {
     for k in [
         "deepwyrm_revision",
         "generated_abi_revision",
+        "generated_abi_tree",
         "wyrmroot_revision",
         "rust_revision",
     ] {
@@ -1186,7 +1187,6 @@ fn validate_request(f: &BTreeMap<String, String>) -> Result<(), Failure> {
     }
     wyr1c::validate_e8_nonce(field(f, "evidence_nonce")?)?;
     for k in [
-        "generated_abi_tree",
         "esp_sha256",
         "source_receipt_sha256",
         "e6_source_receipt_sha256",
@@ -1411,6 +1411,7 @@ fn artifact_maximum(k: &str) -> u64 {
 fn numeric(k: &str) -> bool {
     k == "schema_version"
         || k == "test_id"
+        || k == "com2_prelude_length"
         || k.ends_with("_capacity")
         || k.ends_with("_seconds")
         || k.ends_with("_bytes")
@@ -1483,6 +1484,109 @@ fn parse(text: &str) -> Result<BTreeMap<String, String>, Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        io::Write as _,
+        process::{Command, Stdio},
+    };
+
+    fn root_verifier_accepts_request(text: &str) -> Result<(), Failure> {
+        let repository = tasks::repository_root()?;
+        let project = tasks::canonical_project_root(&repository)?;
+        let verifier = project.join("tools/verify-vm-request.py");
+        let program = r#"import importlib.util, sys
+spec = importlib.util.spec_from_file_location("verify_vm_request", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+integers = frozenset({"schema_version", "test_id"}) | module.E8_SEMANTIC_INTEGER_KEYS
+module._strict_c6_toml(
+    sys.stdin.buffer.read(),
+    module.E8_REQUEST_KEYS,
+    "Rust-rendered E8 request fixture",
+    integers,
+)
+"#;
+        let mut child = Command::new("/usr/bin/python3")
+            .args(["-c", program])
+            .arg(verifier)
+            .current_dir(project)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| Failure::task(format!("could not start root verifier: {error}")))?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| Failure::task("root verifier stdin was unavailable"))?
+            .write_all(text.as_bytes())
+            .map_err(|error| Failure::task(format!("could not feed root verifier: {error}")))?;
+        let output = child
+            .wait_with_output()
+            .map_err(|error| Failure::task(format!("could not wait for root verifier: {error}")))?;
+        if !output.status.success() {
+            return Err(Failure::task(format!(
+                "root verifier rejected Rust-rendered E8 request: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(())
+    }
+
+    fn normalized_a1_request() -> BTreeMap<String, String> {
+        let mut request = fixed_fields()
+            .into_iter()
+            .chain(extra_fields())
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect::<BTreeMap<_, _>>();
+        for (key, value) in [
+            (
+                "deepwyrm_revision",
+                "89cac01882d83a8cd76b4dd30639573839b2b8cd",
+            ),
+            (
+                "generated_abi_revision",
+                "085b184c32ae1fa3d5ec322c86957dd5d036595c",
+            ),
+            (
+                "generated_abi_tree",
+                "a9b067107ec38e2be44630f4dce428dab0f48de8",
+            ),
+            (
+                "wyrmroot_revision",
+                "f262c60226cf038a575c6bf0da150083ea9bd07d",
+            ),
+            ("e6_wyrmroot_revision", ACCEPTED_E6_REVISION),
+            (
+                "e6_source_receipt_sha256",
+                ACCEPTED_E6_SOURCE_RECEIPT_SHA256,
+            ),
+            (
+                "e6_freeze_receipt_sha256",
+                ACCEPTED_E6_FREEZE_RECEIPT_SHA256,
+            ),
+            ("rust_revision", "a92dc7f7464ad6ddfece4402bd7b86dbfa86166d"),
+            ("evidence_nonce", "E800000000000101"),
+            ("esp", "artifacts/selector33-e8-esp.img"),
+            ("default_handoff", "default/handoff.toml"),
+            ("smp_handoff", "smp/handoff.toml"),
+            ("profile_pair", "profile-pair.toml"),
+            ("receipt", "freeze-receipt.toml"),
+            ("source_receipt", "artifacts/e8-source-build.toml"),
+            ("result_schema", "result-schema.toml"),
+        ] {
+            request.insert(key.to_owned(), value.to_owned());
+        }
+        request.insert("esp_sha256".into(), "ab".repeat(32));
+        request.insert("source_receipt_sha256".into(), "cd".repeat(32));
+        for (key, name) in ARTIFACTS {
+            request.insert((*key).to_owned(), format!("artifacts/{name}"));
+            request.insert(format!("{key}_sha256"), "ef".repeat(32));
+        }
+        for (key, digest) in ACCEPTED_E6_REUSED_SHA256 {
+            request.insert(format!("{key}_sha256"), (*digest).to_owned());
+        }
+        request
+    }
 
     #[test]
     fn request_contract_has_one_exact_additive_key_set() {
@@ -1597,5 +1701,40 @@ mod tests {
         assert!(parse("kind = bare\n").is_err());
         assert!(parse("kind = \"one\"\r\n").is_err());
         assert!(parse("kind = \"one\"").is_err());
+    }
+
+    #[test]
+    fn actual_a1_request_reaches_git_tree_and_root_scalar_domains() {
+        // Byte-exact source evidence SHA-256:
+        // bb30ae7a6edb4d883c18e6da3af78391d0f23921d4b6e654051b7e8f0e138163.
+        // Artifact digests are normalized here; lineage and failing field values are retained.
+        let request = normalized_a1_request();
+        assert_eq!(request.len(), 107);
+        assert_eq!(
+            field(&request, "generated_abi_tree").unwrap(),
+            "a9b067107ec38e2be44630f4dce428dab0f48de8"
+        );
+        validate_request(&request).unwrap();
+
+        let corrected = render(&request, &request_keys(), "WYR1-E8 request").unwrap();
+        assert!(corrected.contains("com2_prelude_length = 354\n"));
+        assert!(!corrected.contains("com2_prelude_length = \"354\"\n"));
+        root_verifier_accepts_request(&corrected).unwrap();
+
+        let failed_a1_scalar = corrected.replacen(
+            "com2_prelude_length = 354\n",
+            "com2_prelude_length = \"354\"\n",
+            1,
+        );
+        assert_ne!(failed_a1_scalar, corrected);
+        assert!(root_verifier_accepts_request(&failed_a1_scalar).is_err());
+
+        let mut sha_sized_tree = request.clone();
+        sha_sized_tree.insert("generated_abi_tree".into(), "ab".repeat(32));
+        assert!(validate_request(&sha_sized_tree).is_err());
+
+        let mut tree_sized_sha = request;
+        tree_sized_sha.insert("esp_sha256".into(), "ab".repeat(20));
+        assert!(validate_request(&tree_sized_sha).is_err());
     }
 }
