@@ -487,9 +487,12 @@ fn build_produced_artifacts(
 
 fn build_kernel(repository: &Path, nonce: &str) -> Result<Vec<u8>, Failure> {
     let repository = Directory::open_exact(repository, "Deepwyrm source root")?;
-    let target = fresh_kernel_target(&repository)?;
-    let stdout = target.create_file("cargo.stdout.log", 0o600, "WYR1-E7 kernel stdout")?;
-    let stderr = target.create_file("cargo.stderr.log", 0o600, "WYR1-E7 kernel stderr")?;
+    let build = fresh_kernel_target(&repository)?;
+    // The pinned launcher initializes only an empty Cargo target directory.
+    // Keep diagnostics alongside it so failures retain their original output.
+    let target = build.create_child("target", 0o700, "WYR1-E7 Cargo target")?;
+    let stdout = build.create_file("cargo.stdout.log", 0o600, "WYR1-E7 kernel stdout")?;
+    let stderr = build.create_file("cargo.stderr.log", 0o600, "WYR1-E7 kernel stderr")?;
     let status = kernel_build_command(
         &repository.path().join("tools/pinned-cargo"),
         repository.path(),
@@ -503,7 +506,7 @@ fn build_kernel(repository: &Path, nonce: &str) -> Result<Vec<u8>, Failure> {
     if !status.success() {
         return Err(Failure::task(format!(
             "WYR1-E7 selector-33 Deepwyrm kernel build failed; logs preserved in {}",
-            target.path().display()
+            build.path().display()
         )));
     }
     target.read_producer(
@@ -2499,6 +2502,58 @@ module._strict_c6_toml(sys.stdin.buffer.read(), keys, "Rust-rendered E7 fixture"
         validate_frozen_output(&fixture.root, &request, &request_hash)?;
         assert!(validate_esp_contents(&fixture.root, &request).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn kernel_build_keeps_logs_outside_the_fresh_cargo_target() -> Result<(), Failure> {
+        let repository = tasks::repository_root()?;
+        let temporary = Directory::open_exact(&repository.join(".tmp"), "test temporary root")?;
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| Failure::task("system clock is before the Unix epoch"))?
+            .as_nanos();
+        let scratch = temporary.create_scratch(
+            &format!("wyr1e7-kernel-log-test-{}-{unique}", std::process::id()),
+            "kernel log test scratch",
+        )?;
+        let result = (|| {
+            let repository = scratch.path().join("deepwyrm");
+            fs::create_dir_all(repository.join("tools"))
+                .map_err(|error| Failure::task(format!("create fake repository: {error}")))?;
+            let wrapper = repository.join("tools/pinned-cargo");
+            fs::write(&wrapper, concat!(
+                "#!/bin/sh\nset -eu\n",
+                "test -z \"$(ls -A -- \"$DEEPWYRM_PINNED_TARGET_DIR\")\"\n",
+                "test -f \"$DEEPWYRM_PINNED_TARGET_DIR/../cargo.stdout.log\"\n",
+                "test -f \"$DEEPWYRM_PINNED_TARGET_DIR/../cargo.stderr.log\"\n",
+                "mkdir -p -- \"$DEEPWYRM_PINNED_TARGET_DIR/x86_64-unknown-none/release\"\n",
+                "printf 'kernel fixture' >\"$DEEPWYRM_PINNED_TARGET_DIR/x86_64-unknown-none/release/deepwyrm-kernel\"\n",
+                "printf 'build stdout\\n'\nprintf 'build stderr\\n' >&2\n",
+            ))
+            .map_err(|error| Failure::task(format!("write fake launcher: {error}")))?;
+            fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700))
+                .map_err(|error| Failure::task(format!("set fake launcher mode: {error}")))?;
+            assert_eq!(
+                build_kernel(&repository, "0123456789ABCDEF")?,
+                b"kernel fixture"
+            );
+            let build = fs::read_dir(repository.join(".tmp"))
+                .map_err(|error| Failure::task(format!("read build directory: {error}")))?
+                .next()
+                .expect("one build directory")
+                .map_err(|error| Failure::task(format!("read build entry: {error}")))?
+                .path();
+            assert_eq!(
+                fs::read(build.join("cargo.stdout.log")).unwrap(),
+                b"build stdout\n"
+            );
+            assert_eq!(
+                fs::read(build.join("cargo.stderr.log")).unwrap(),
+                b"build stderr\n"
+            );
+            Ok(())
+        })();
+        scratch.finish(result)
     }
 
     #[test]
