@@ -48,6 +48,7 @@ pub(crate) const GENERATED_POLICY_VALIDATION_SCOPE: &str =
     "exact-layout-schema-fields-and-semantic-constraints";
 pub(crate) const GENERATED_ABI_ASSERTION_SCOPE: &str =
     "base-page-and-paging-handoff-numeric-constants";
+const KERNEL_BOOT_STACK_BYTES: u64 = 4 * 1024 * 1024;
 
 pub(crate) struct DeepLayoutBuild {
     pub(crate) policy_path: PathBuf,
@@ -1918,7 +1919,11 @@ impl LayoutPolicy {
             ));
         }
         expect_bool(&mut values, "red_zone", false)?;
-        expect_integer(&mut values, "kernel_boot_stack_size", 1_048_576)?;
+        expect_integer(
+            &mut values,
+            "kernel_boot_stack_size",
+            KERNEL_BOOT_STACK_BYTES,
+        )?;
         expect_integer(&mut values, "kernel_boot_stack_alignment", 4096)?;
         expect_integer(&mut values, "loader_transition_stack_size", 16384)?;
         expect_integer(&mut values, "loader_transition_stack_alignment", 4096)?;
@@ -2807,12 +2812,12 @@ fn hex_digit(byte: u8) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DeepLayoutBuild, JsonParser, LayoutPolicy, MAX_METADATA_CONTAINER_ENTRIES,
-        MAX_METADATA_JSON_DEPTH, MAX_METADATA_STRING_BYTES, bounded_command_output, locate_package,
-        open_stable_regular_file, read_pipe_bounded, validate_git_status,
-        validate_metadata_manifest_path, validate_regular_path, verify_cargo_configuration,
-        verify_exact_cargo_git_source, verify_open_file_identity, verify_tracked_bytes,
-        write_generated_policy, x86_64_page_table_indices,
+        DeepLayoutBuild, JsonParser, KERNEL_BOOT_STACK_BYTES, LayoutPolicy,
+        MAX_METADATA_CONTAINER_ENTRIES, MAX_METADATA_JSON_DEPTH, MAX_METADATA_STRING_BYTES,
+        bounded_command_output, locate_package, open_stable_regular_file, read_pipe_bounded,
+        validate_git_status, validate_metadata_manifest_path, validate_regular_path,
+        verify_cargo_configuration, verify_exact_cargo_git_source, verify_open_file_identity,
+        verify_tracked_bytes, write_generated_policy, x86_64_page_table_indices,
     };
     use crate::sha256::bytes_digest;
     use std::path::Path;
@@ -3008,6 +3013,7 @@ mod tests {
         let policy = LayoutPolicy::parse(&valid).expect("locked layout fixture rejected");
         let generated = policy.render_rust();
         assert!(generated.contains("DEEPWYRM_LINK_BASE: u64 = 0xffff800000200000"));
+        assert!(generated.contains("DEEPWYRM_KERNEL_BOOT_STACK_SIZE: u64 = 4194304"));
         assert!(generated.contains("DEEPWYRM_ELF_WINDOW_START: u64 = DEEPWYRM_LINK_BASE"));
         assert!(generated.contains("DEEPWYRM_ELF_WINDOW_END_EXCLUSIVE: u64 = u64::MAX"));
         assert!(
@@ -3140,27 +3146,27 @@ mod tests {
     }
 
     #[test]
-    fn kernel_boot_stack_contract_requires_one_mib() {
+    fn kernel_boot_stack_contract_requires_four_mib() {
         let valid = layout("0xffff800000200000");
-        LayoutPolicy::parse(&valid).expect("1 MiB kernel boot stack rejected");
+        LayoutPolicy::parse(&valid).expect("4 MiB kernel boot stack rejected");
 
-        let stale = valid.replace(
-            "kernel_boot_stack_size = 1048576",
-            "kernel_boot_stack_size = 262144",
-        );
-        assert_ne!(
-            stale, valid,
-            "stack-size fixture substitution did not apply"
-        );
-        let failure = match LayoutPolicy::parse(&stale) {
-            Ok(_) => panic!("stale 256 KiB kernel boot stack unexpectedly accepted"),
-            Err(failure) => failure,
-        };
-        assert!(
-            failure
-                .message
-                .contains("kernel_boot_stack_size' is 262144, expected 1048576")
-        );
+        for (bytes, label) in [(1_048_576, "stale 1 MiB"), (8_388_608, "unbound 8 MiB")] {
+            let candidate = valid.replace(
+                "kernel_boot_stack_size = 4194304",
+                &format!("kernel_boot_stack_size = {bytes}"),
+            );
+            assert_ne!(
+                candidate, valid,
+                "stack-size fixture substitution did not apply"
+            );
+            let failure = match LayoutPolicy::parse(&candidate) {
+                Ok(_) => panic!("{label} kernel boot stack unexpectedly accepted"),
+                Err(failure) => failure,
+            };
+            assert!(failure.message.contains(&format!(
+                "kernel_boot_stack_size' is {bytes}, expected {KERNEL_BOOT_STACK_BYTES}"
+            )));
+        }
     }
 
     #[cfg(unix)]
@@ -3825,7 +3831,7 @@ entry_symbol = "_dw_kernel_entry"
 link_base = "{link_base}"
 base_page_size = 4096
 red_zone = false
-kernel_boot_stack_size = 1048576
+kernel_boot_stack_size = 4194304
 kernel_boot_stack_alignment = 4096
 loader_transition_stack_size = 16384
 loader_transition_stack_alignment = 4096
