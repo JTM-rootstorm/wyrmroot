@@ -944,16 +944,18 @@ const DW1C_POST_ARM_ORDER: [u8; wyrmroot_runtime::DW1C_ACTOR_COUNT] =
 mod dw1c_protocol_tests {
     use deepwyrm_syscall::{
         DW_STATUS_BAD_STATE, DW_STATUS_TIMED_OUT, DW_STATUS_WOULD_BLOCK, DW_TASK_STATE_EXITED,
-        DW_TASK_TERMINATION_INFO_V1_SIZE, DW_TERMINATION_AUTHORIZED, DwDeadline,
+        DW_TASK_TERMINATION_INFO_V1_SIZE, DW_TERMINATION_AUTHORIZED, DwDeadline, DwHandle,
         DwTaskTerminationInfoV1,
     };
 
     use super::{
         DW1C_ACTOR_ACK_PREFIX, DW1C_GO, DW1C_POST_ARM_ORDER, DW1C_TOKEN2_RELAY_SETUP,
         DW1C_TOKEN7_FULL, DW1C_TOKEN7_RELAY_START, DW1C_TOKEN7_SETUP, DW1C_TOKEN7_SETUP_ACK,
-        DW1C_TOKEN7_WOKE, LOADER_ABORT_CODE, terminate_dw1c_token8_bounded,
+        DW1C_TOKEN7_WOKE, Dw1cActorCleanup, Init0Error, LOADER_ABORT_CODE, LoadedProcess,
+        cleanup_dw1c_actors_with, terminate_dw1c_process_bounded,
         valid_dw1c_authorized_termination,
     };
+    use std::vec::Vec;
 
     #[test]
     fn post_arm_protocol_has_one_go_per_actor_and_orders_reaps() {
@@ -991,18 +993,19 @@ mod dw1c_protocol_tests {
     }
 
     #[test]
-    fn actor8_termination_retries_would_block_across_syscall_boundaries() {
+    fn process_termination_retries_would_block_across_syscall_boundaries() {
         let mut attempts = 0;
         let mut clock_reads = 0;
-        let result = terminate_dw1c_token8_bounded(
+        let result = terminate_dw1c_process_bounded(
             DwDeadline(100),
             || {
                 attempts += 1;
-                if attempts < 3 {
+                let result = if attempts < 3 {
                     Err(wyrmroot_runtime::NativeError::Status(DW_STATUS_WOULD_BLOCK))
                 } else {
                     Ok(())
-                }
+                };
+                (result, false)
             },
             || {
                 clock_reads += 1;
@@ -1015,10 +1018,35 @@ mod dw1c_protocol_tests {
     }
 
     #[test]
-    fn actor8_termination_timeout_and_nonretry_errors_are_bounded() {
-        let timed_out = terminate_dw1c_token8_bounded(
+    fn process_termination_accepts_an_exact_already_exited_race() {
+        let mut clock_called = false;
+        let result = terminate_dw1c_process_bounded(
             DwDeadline(10),
-            || Err(wyrmroot_runtime::NativeError::Status(DW_STATUS_WOULD_BLOCK)),
+            || {
+                (
+                    Err(wyrmroot_runtime::NativeError::Status(DW_STATUS_WOULD_BLOCK)),
+                    true,
+                )
+            },
+            || {
+                clock_called = true;
+                Ok(0)
+            },
+        );
+        assert_eq!(result, Ok(()));
+        assert!(!clock_called);
+    }
+
+    #[test]
+    fn process_termination_timeout_and_nonretry_errors_are_bounded() {
+        let timed_out = terminate_dw1c_process_bounded(
+            DwDeadline(10),
+            || {
+                (
+                    Err(wyrmroot_runtime::NativeError::Status(DW_STATUS_WOULD_BLOCK)),
+                    false,
+                )
+            },
             || Ok(10),
         );
         assert_eq!(
@@ -1027,9 +1055,14 @@ mod dw1c_protocol_tests {
         );
 
         let mut clock_called = false;
-        let rejected = terminate_dw1c_token8_bounded(
+        let rejected = terminate_dw1c_process_bounded(
             DwDeadline(10),
-            || Err(wyrmroot_runtime::NativeError::Status(DW_STATUS_BAD_STATE)),
+            || {
+                (
+                    Err(wyrmroot_runtime::NativeError::Status(DW_STATUS_BAD_STATE)),
+                    false,
+                )
+            },
             || {
                 clock_called = true;
                 Ok(0)
@@ -1040,6 +1073,86 @@ mod dw1c_protocol_tests {
             Err(wyrmroot_runtime::NativeError::Status(DW_STATUS_BAD_STATE))
         );
         assert!(!clock_called);
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum CleanupCall {
+        Terminate(u64),
+        Wait(u64),
+        Close(u64),
+    }
+
+    struct CleanupFixture {
+        calls: Vec<CleanupCall>,
+        fail_terminate: Option<DwHandle>,
+    }
+
+    impl Dw1cActorCleanup for CleanupFixture {
+        fn terminate_bounded(
+            &mut self,
+            process: DwHandle,
+            deadline: DwDeadline,
+        ) -> Result<(), wyrmroot_runtime::NativeError> {
+            assert_eq!(deadline, DwDeadline(100));
+            self.calls.push(CleanupCall::Terminate(process.0));
+            if self.fail_terminate == Some(process) {
+                Err(wyrmroot_runtime::NativeError::Status(DW_STATUS_BAD_STATE))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn wait_exited(
+            &mut self,
+            process: DwHandle,
+            deadline: DwDeadline,
+        ) -> Result<(), wyrmroot_runtime::NativeError> {
+            assert_eq!(deadline, DwDeadline(100));
+            self.calls.push(CleanupCall::Wait(process.0));
+            Ok(())
+        }
+
+        fn close(&mut self, handle: DwHandle) -> Result<(), wyrmroot_runtime::NativeError> {
+            self.calls.push(CleanupCall::Close(handle.0));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cleanup_retains_the_first_hard_error_and_closes_every_actor_in_order() {
+        let actors = [
+            Some(LoadedProcess {
+                process: DwHandle(11),
+                launch_channel: DwHandle(12),
+            }),
+            Some(LoadedProcess {
+                process: DwHandle(21),
+                launch_channel: DwHandle(22),
+            }),
+        ];
+        let mut fixture = CleanupFixture {
+            calls: Vec::new(),
+            fail_terminate: Some(DwHandle(11)),
+        };
+        assert_eq!(
+            cleanup_dw1c_actors_with(&mut fixture, actors, DwDeadline(100)),
+            Err(Init0Error::Cleanup(wyrmroot_runtime::NativeError::Status(
+                DW_STATUS_BAD_STATE
+            )))
+        );
+        assert_eq!(
+            fixture.calls,
+            [
+                CleanupCall::Terminate(11),
+                CleanupCall::Wait(11),
+                CleanupCall::Close(12),
+                CleanupCall::Close(11),
+                CleanupCall::Terminate(21),
+                CleanupCall::Wait(21),
+                CleanupCall::Close(22),
+                CleanupCall::Close(21),
+            ]
+        );
     }
 
     #[test]
@@ -1320,9 +1433,9 @@ fn drive_dw1c_workload<
     system
         .send_channel(actor8.launch_channel, &go)
         .map_err(Init0Error::Native)?;
-    terminate_dw1c_token8_bounded(
+    terminate_dw1c_process_bounded(
         deadline,
-        || loader.process_terminate(actor8.process),
+        || (loader.process_terminate(actor8.process), false),
         wyrmroot_runtime::monotonic_active_now,
     )
     .map_err(Init0Error::Cleanup)?;
@@ -1348,22 +1461,104 @@ fn drive_dw1c_workload<
 }
 
 #[cfg(feature = "dw1c-preemption-integration")]
-fn terminate_dw1c_token8_bounded(
+fn terminate_dw1c_process_bounded(
     deadline: DwDeadline,
-    mut terminate: impl FnMut() -> Result<(), NativeError>,
+    mut terminate: impl FnMut() -> (Result<(), NativeError>, bool),
     mut monotonic_now: impl FnMut() -> Result<u64, NativeError>,
 ) -> Result<(), NativeError> {
     loop {
         match terminate() {
-            Ok(()) => return Ok(()),
-            Err(NativeError::Status(status)) if status == DW_STATUS_WOULD_BLOCK => {}
-            Err(error) => return Err(error),
+            (Ok(()), _) => return Ok(()),
+            (Err(_), true) => return Ok(()),
+            (Err(NativeError::Status(status)), false) if status == DW_STATUS_WOULD_BLOCK => {}
+            (Err(error), false) => return Err(error),
         }
         if monotonic_now()? >= deadline.0 {
             return Err(NativeError::Status(DW_STATUS_TIMED_OUT));
         }
         core::hint::spin_loop();
     }
+}
+
+#[cfg(feature = "dw1c-preemption-integration")]
+trait Dw1cActorCleanup {
+    fn terminate_bounded(
+        &mut self,
+        process: DwHandle,
+        deadline: DwDeadline,
+    ) -> Result<(), NativeError>;
+    fn wait_exited(&mut self, process: DwHandle, deadline: DwDeadline) -> Result<(), NativeError>;
+    fn close(&mut self, handle: DwHandle) -> Result<(), NativeError>;
+}
+
+#[cfg(feature = "dw1c-preemption-integration")]
+struct NativeDw1cActorCleanup<'a, Loader, Supervisor> {
+    loader: &'a mut Loader,
+    supervisor: &'a mut Supervisor,
+}
+
+#[cfg(feature = "dw1c-preemption-integration")]
+impl<Loader, Supervisor> Dw1cActorCleanup for NativeDw1cActorCleanup<'_, Loader, Supervisor>
+where
+    Loader: LoaderPlatform<Error = NativeError>,
+    Supervisor: SupervisionPlatform<Error = NativeError>,
+{
+    fn terminate_bounded(
+        &mut self,
+        process: DwHandle,
+        deadline: DwDeadline,
+    ) -> Result<(), NativeError> {
+        terminate_dw1c_process_bounded(
+            deadline,
+            || {
+                let result = self.loader.process_terminate(process);
+                let already_exited = result.is_err()
+                    && self
+                        .supervisor
+                        .query_task_termination(process)
+                        .is_ok_and(|info| info.state == DW_TASK_STATE_EXITED);
+                (result, already_exited)
+            },
+            wyrmroot_runtime::monotonic_active_now,
+        )
+    }
+
+    fn wait_exited(&mut self, process: DwHandle, deadline: DwDeadline) -> Result<(), NativeError> {
+        let item = DwWaitItemV1 {
+            handle: process,
+            signals: DW_SIGNAL_EXITED,
+        };
+        self.supervisor
+            .wait_many(core::slice::from_ref(&item), deadline)
+            .map(|_| ())
+    }
+
+    fn close(&mut self, handle: DwHandle) -> Result<(), NativeError> {
+        self.loader.close(handle)
+    }
+}
+
+#[cfg(feature = "dw1c-preemption-integration")]
+fn cleanup_dw1c_actors_with<const ACTORS: usize>(
+    cleanup: &mut impl Dw1cActorCleanup,
+    actors: [Option<LoadedProcess>; ACTORS],
+    deadline: DwDeadline,
+) -> Result<(), Init0Error> {
+    let mut first = None;
+    for actor in actors.into_iter().flatten() {
+        if let Err(error) = cleanup.terminate_bounded(actor.process, deadline) {
+            first.get_or_insert(Init0Error::Cleanup(error));
+        }
+        if cleanup.wait_exited(actor.process, deadline).is_err() {
+            first.get_or_insert(Init0Error::CapabilityEvidence);
+        }
+        for handle in [actor.launch_channel, actor.process] {
+            if let Err(error) = cleanup.close(handle) {
+                first.get_or_insert(Init0Error::Cleanup(error));
+            }
+        }
+    }
+    first.map_or(Ok(()), Err)
 }
 
 #[cfg(feature = "dw1c-preemption-integration")]
@@ -1558,33 +1753,11 @@ fn cleanup_dw1c_actors<
     actors: [Option<LoadedProcess>; wyrmroot_runtime::DW1C_ACTOR_COUNT],
     deadline: DwDeadline,
 ) -> Result<(), Init0Error> {
-    let mut first = None;
-    for actor in actors.into_iter().flatten() {
-        if let Err(error) = loader.process_terminate(actor.process) {
-            let already_exited = supervisor
-                .query_task_termination(actor.process)
-                .is_ok_and(|info| info.state == DW_TASK_STATE_EXITED);
-            if !already_exited {
-                first.get_or_insert(Init0Error::Cleanup(error));
-            }
-        }
-        let item = DwWaitItemV1 {
-            handle: actor.process,
-            signals: DW_SIGNAL_EXITED,
-        };
-        if supervisor
-            .wait_many(core::slice::from_ref(&item), deadline)
-            .is_err()
-        {
-            first.get_or_insert(Init0Error::CapabilityEvidence);
-        }
-        for handle in [actor.launch_channel, actor.process] {
-            if let Err(error) = loader.close(handle) {
-                first.get_or_insert(Init0Error::Cleanup(error));
-            }
-        }
-    }
-    first.map_or(Ok(()), Err)
+    cleanup_dw1c_actors_with(
+        &mut NativeDw1cActorCleanup { loader, supervisor },
+        actors,
+        deadline,
+    )
 }
 
 #[cfg(feature = "dw1c-preemption-integration")]
