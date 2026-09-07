@@ -72,6 +72,13 @@ where
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
+    #[cfg(feature = "wyr1e8-selector33")]
+    let deadline_cap = super::wyr1e::e8_action_deadline(resident)?;
+    #[cfg(not(feature = "wyr1e8-selector33"))]
+    let deadline_cap = None;
+    if deadline_cap.is_some_and(|deadline| system.now().map_or(true, |now| now >= deadline)) {
+        return Err(InitError::Supervision);
+    }
     let state = resident
         .wyr1c
         .as_mut()
@@ -86,6 +93,7 @@ where
         return Err(InitError::WrongManifestProfile);
     }
     let d5 = state.d5.as_mut().ok_or(InitError::WrongActivationOrder)?;
+    let first_driver = d5.driver.is_none();
     if let Some(old) = d5.driver {
         if d5.gate.record_count() != 8
             || !d5.released
@@ -104,10 +112,7 @@ where
         {
             return Err(InitError::WrongManifestProfile);
         }
-    } else {
-        d5.first_driver = Some(identity);
     }
-    d5.driver = Some(identity);
     if d5.console.is_none() {
         let registry = state.registry.ok_or(InitError::WrongActivationOrder)?;
         launch_console(
@@ -119,8 +124,16 @@ where
             bootfs,
             registry.control_channel,
             &mut state.topology,
+            deadline_cap,
         )?;
     }
+    if deadline_cap.is_some_and(|deadline| system.now().map_or(true, |now| now >= deadline)) {
+        return Err(InitError::Supervision);
+    }
+    if first_driver {
+        d5.first_driver = Some(identity);
+    }
+    d5.driver = Some(identity);
     Ok(())
 }
 
@@ -134,12 +147,16 @@ fn launch_console<S, L, W>(
     bootfs: &[u8],
     registry_control: DwHandle,
     topology: &mut RegistryTopology,
+    deadline_cap: Option<u64>,
 ) -> Result<(), InitError>
 where
     S: Wyr1BPlatform,
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
+    if deadline_cap.is_some_and(|deadline| system.now().map_or(true, |now| now >= deadline)) {
+        return Err(InitError::Supervision);
+    }
     let archive = Archive::new(bootfs).map_err(InitError::Bootfs)?;
     let image = archive
         .lookup(CONSOLE_PATH.as_bytes())
@@ -174,6 +191,15 @@ where
             | system.close_handle(child_registry).is_err()
             | system.close_handle(group).is_err();
         return Err(if failed { InitError::Cleanup } else { error });
+    }
+    if deadline_cap.is_some_and(|deadline| system.now().map_or(true, |now| now >= deadline)) {
+        let failed =
+            system.close_handle(child_registry).is_err() | system.close_handle(group).is_err();
+        return Err(if failed {
+            InitError::Cleanup
+        } else {
+            InitError::Supervision
+        });
     }
     let (launch_endpoint, child_launch) = match create_controller_channel_pair(system) {
         Ok(pair) => pair,
@@ -236,6 +262,18 @@ where
             });
         }
     };
+    if deadline_cap.is_some_and(|deadline| system.now().map_or(true, |now| now >= deadline)) {
+        let failed = cleanup_loaded_before(system, waits, loaded, group, true, deadline_cap)
+            .is_err()
+            | d5.jobs
+                .disconnect_session(launch_grant)
+                .map_or(true, |handle| system.close_handle(handle).is_err());
+        return Err(if failed {
+            InitError::Cleanup
+        } else {
+            InitError::Supervision
+        });
+    }
     let configured = (|| {
         let bytes = Status::configure(d5.gate.nonce())
             .encode()
@@ -243,15 +281,20 @@ where
         system
             .send_channel(loaded.launch_channel, &bytes)
             .map_err(InitError::Native)?;
-        d5.ready_deadline = system
-            .now()
-            .map_err(InitError::Native)?
+        let now = system.now().map_err(InitError::Native)?;
+        if deadline_cap.is_some_and(|deadline| now >= deadline) {
+            return Err(InitError::Supervision);
+        }
+        d5.ready_deadline = now
             .checked_add(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
+            .map(|deadline| deadline_cap.map_or(deadline, |cap| deadline.min(cap)))
+            .or(deadline_cap)
             .ok_or(InitError::Accounting)?;
         Ok(())
     })();
     if let Err(error) = configured {
-        let failed = cleanup_loaded(system, waits, loaded, group, true).is_err()
+        let failed = cleanup_loaded_before(system, waits, loaded, group, true, deadline_cap)
+            .is_err()
             | d5.jobs
                 .disconnect_session(launch_grant)
                 .map_or(true, |handle| system.close_handle(handle).is_err());
@@ -265,7 +308,8 @@ where
             task_group: group,
         },
     ) {
-        let failed = cleanup_loaded(system, waits, loaded, group, true).is_err()
+        let failed = cleanup_loaded_before(system, waits, loaded, group, true, deadline_cap)
+            .is_err()
             | d5.jobs
                 .disconnect_session(launch_grant)
                 .map_or(true, |handle| system.close_handle(handle).is_err());
@@ -305,6 +349,11 @@ where
         devmgr: state.devmgr,
         publication: state.publication_service_generation,
         last_reaped_driver: state.last_reaped_driver,
+        #[cfg(feature = "wyr1e8-selector33")]
+        e8_deadline: state
+            .e6
+            .as_ref()
+            .and_then(|e6| e6.shell.e8_action_deadline()),
     };
     let d5 = state.d5.as_mut().ok_or(InitError::WrongActivationOrder)?;
     poll_inner(d5, context, system, loader, waits, now)
@@ -316,6 +365,8 @@ struct PollContext {
     devmgr: Option<ActiveNativeRole>,
     publication: u64,
     last_reaped_driver: Option<DriverLaunchRequest>,
+    #[cfg(feature = "wyr1e8-selector33")]
+    e8_deadline: Option<u64>,
 }
 
 fn poll_inner<S, L, W>(
@@ -331,6 +382,10 @@ where
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
+    #[cfg(feature = "wyr1e8-selector33")]
+    if context.e8_deadline.is_some_and(|deadline| now >= deadline) {
+        return Err(InitError::Supervision);
+    }
     let Some(console) = d5.console else {
         return Ok(());
     };
@@ -343,6 +398,13 @@ where
     // acknowledgement on the same devmgr Channel; WDR5 then follows it in FIFO
     // order even when the console cleans its child before the driver exits.
     flush_release(d5, context, system)?;
+    #[cfg(feature = "wyr1e8-selector33")]
+    if context
+        .e8_deadline
+        .is_some_and(|deadline| system.now().map_or(true, |now| now >= deadline))
+    {
+        return Err(InitError::Supervision);
+    }
     let observed = system.wait_many(
         &[
             DwWaitItemV1 {
@@ -376,6 +438,14 @@ where
     let counts = system
         .receive_channel(console.loaded.launch_channel, &mut bytes, &mut handles)
         .map_err(InitError::Native)?;
+    #[cfg(feature = "wyr1e8-selector33")]
+    if context
+        .e8_deadline
+        .is_some_and(|deadline| system.now().map_or(true, |now| now >= deadline))
+    {
+        close_received_native(system, &handles, counts.handles)?;
+        return Err(InitError::Supervision);
+    }
     if counts.handles != 0 {
         close_received_native(system, &handles, counts.handles)?;
         return Err(InitError::WrongManifestProfile);
@@ -445,10 +515,30 @@ where
         d5.last_ready = Some(status);
     }
     if matches!(status.leg, 2 | 4) {
-        hold_for_drain(d5, system, devmgr, driver, status, batch, now)?;
+        hold_for_drain(
+            d5,
+            system,
+            devmgr,
+            driver,
+            status,
+            batch,
+            now,
+            #[cfg(feature = "wyr1e8-selector33")]
+            context.e8_deadline,
+            #[cfg(not(feature = "wyr1e8-selector33"))]
+            None,
+        )?;
         return Ok(());
     }
-    publish_batch(system, devmgr, driver, &batch)
+    publish_batch(system, devmgr, driver, &batch)?;
+    #[cfg(feature = "wyr1e8-selector33")]
+    if context
+        .e8_deadline
+        .is_some_and(|deadline| system.now().map_or(true, |now| now >= deadline))
+    {
+        return Err(InitError::Supervision);
+    }
+    Ok(())
 }
 
 fn validate_status_job(
@@ -536,17 +626,27 @@ fn hold_for_drain<S: InitPlatform>(
     status: Status,
     batch: Batch,
     now: u64,
+    deadline_cap: Option<u64>,
 ) -> Result<(), InitError> {
     if d5.pending_fence.is_some() {
         return Err(InitError::WrongManifestProfile);
     }
+    if deadline_cap.is_some_and(|deadline| now >= deadline) {
+        return Err(InitError::Supervision);
+    }
     let deadline = now
         .checked_add(WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns)
+        .map(|deadline| deadline_cap.map_or(deadline, |cap| deadline.min(cap)))
+        .or(deadline_cap)
         .ok_or(InitError::Accounting)?;
     d5.pending_fence =
         Some(DrainFence::new(driver, status, batch).map_err(|_| InitError::WrongManifestProfile)?);
     d5.fence_deadline = deadline;
-    send_pending_drain(d5, system, devmgr)
+    send_pending_drain(d5, system, devmgr)?;
+    if deadline_cap.is_some_and(|deadline| system.now().map_or(true, |now| now >= deadline)) {
+        return Err(InitError::Supervision);
+    }
+    Ok(())
 }
 
 fn send_pending_drain<S: InitPlatform>(
@@ -575,13 +675,21 @@ pub(super) fn tx_drained<S: InitPlatform>(
     system: &mut S,
     identity: D5DrainIdentity,
 ) -> Result<(), InitError> {
+    #[cfg(feature = "wyr1e8-selector33")]
+    let deadline_cap = super::wyr1e::e8_action_deadline(resident)?;
+    #[cfg(not(feature = "wyr1e8-selector33"))]
+    let deadline_cap = None;
+    let observed_now = system.now().map_err(InitError::Native)?;
+    if deadline_cap.is_some_and(|deadline| observed_now >= deadline) {
+        return Err(InitError::Supervision);
+    }
     let state = resident
         .wyr1c
         .as_mut()
         .ok_or(InitError::WrongActivationOrder)?;
     let devmgr = state.devmgr.ok_or(InitError::WrongActivationOrder)?;
     let d5 = state.d5.as_mut().ok_or(InitError::WrongActivationOrder)?;
-    let fence = take_completed_fence(d5, identity, system.now().map_err(InitError::Native)?)?;
+    let fence = take_completed_fence(d5, identity, observed_now)?;
     let batch = fence
         .completed(identity)
         .map_err(|_| InitError::WrongManifestProfile)?;
@@ -592,8 +700,12 @@ pub(super) fn tx_drained<S: InitPlatform>(
         Some(
             RetirementJoin::new(
                 identity.driver,
-                system.now().map_err(InitError::Native)?,
-                WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns,
+                observed_now,
+                deadline_cap.map_or(WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns, |deadline| {
+                    deadline
+                        .saturating_sub(observed_now)
+                        .min(WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns)
+                }),
             )
             .map_err(|_| InitError::Accounting)?,
         )
@@ -601,6 +713,9 @@ pub(super) fn tx_drained<S: InitPlatform>(
         None
     };
     publish_batch(system, devmgr, identity.driver, batch)?;
+    if deadline_cap.is_some_and(|deadline| system.now().map_or(true, |now| now >= deadline)) {
+        return Err(InitError::Supervision);
+    }
     if retirement.is_some() {
         d5.retirement = retirement;
     }
@@ -1017,7 +1132,8 @@ mod tests {
                 driver,
                 final_status,
                 batch,
-                1
+                1,
+                None,
             )
             .is_err()
         );
@@ -1032,7 +1148,8 @@ mod tests {
                 driver,
                 final_status,
                 batch,
-                2
+                2,
+                None,
             )
             .is_err()
         );

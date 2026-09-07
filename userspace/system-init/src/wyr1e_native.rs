@@ -4,7 +4,9 @@ use super::*;
 use crate::wyr1b::EndpointGrant;
 use crate::wyr1b_job::{JobDispatcher, LaunchSessionScope, SessionOwner};
 #[cfg(feature = "wyr1e8-selector33")]
-use crate::wyr1b_native::{E8RecoveryAction, retire_console_product_with_result};
+use crate::wyr1b_native::{
+    E8RecoveryAction, retire_console_product_with_result, retire_console_product_with_result_before,
+};
 use crate::wyr1b_native::{
     InstalledPeer, ShellControllerState, ShellLaunchContext, create_controller_channel_pair,
     install_client, poll_job_dispatcher_with_shell, retire_console_product,
@@ -56,7 +58,7 @@ struct PublicationObserver {
 pub(super) struct State {
     jobs: JobDispatcher,
     console: Option<InstalledPeer>,
-    shell: ShellControllerState,
+    pub(super) shell: ShellControllerState,
     publication_observer: Option<PublicationObserver>,
     awaiting_ready: bool,
     bootstrap_released: bool,
@@ -73,6 +75,8 @@ pub(super) enum PollOutcome {
     LaunchConsole,
     RecoverDevmgr,
     RecoverRegistry,
+    #[cfg(feature = "wyr1e8-selector33")]
+    RecoverRegistryForE8,
 }
 
 impl State {
@@ -138,12 +142,15 @@ where
     if e6.console.is_some() || e6.publication_observer.is_some() {
         return Err(InitError::WrongActivationOrder);
     }
+    let started_at = system.now().map_err(InitError::Native)?;
+    #[cfg(feature = "wyr1e8-selector33")]
+    e6.shell.require_e8_action_live_at(started_at)?;
     let operation = e6.take_publication_observer()?;
-    let deadline = system
-        .now()
-        .map_err(InitError::Native)?
+    let deadline = started_at
         .checked_add(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
         .ok_or(InitError::Accounting)?;
+    #[cfg(feature = "wyr1e8-selector33")]
+    let deadline = e6.shell.cap_e8_deadline(deadline);
     if deadline == u64::MAX {
         return Err(InitError::Accounting);
     }
@@ -152,6 +159,15 @@ where
         .issue(operation, EndpointKind::RegistryClient)
         .map_err(InitError::Wyr1BModel)?;
     let (registry_endpoint, client) = create_controller_channel_pair(system)?;
+    #[cfg(feature = "wyr1e8-selector33")]
+    if let Err(error) = e6
+        .shell
+        .require_e8_action_live_at(system.now().map_err(InitError::Native)?)
+    {
+        let failed =
+            system.close_handle(registry_endpoint).is_err() | system.close_handle(client).is_err();
+        return Err(if failed { InitError::Cleanup } else { error });
+    }
     if let Err(error) = install_client(
         system,
         registry.control_channel,
@@ -162,6 +178,18 @@ where
         let cleanup_failed =
             system.close_handle(registry_endpoint).is_err() | system.close_handle(client).is_err();
         return Err(if cleanup_failed {
+            InitError::Cleanup
+        } else {
+            error
+        });
+    }
+    #[cfg(feature = "wyr1e8-selector33")]
+    if let Err(error) = e6
+        .shell
+        .require_e8_action_live_at(system.now().map_err(InitError::Native)?)
+    {
+        e6.shell.poison(grant.registry_generation);
+        return Err(if system.close_handle(client).is_err() {
             InitError::Cleanup
         } else {
             error
@@ -185,6 +213,18 @@ where
             InitError::Cleanup
         } else {
             InitError::Native(error)
+        });
+    }
+    #[cfg(feature = "wyr1e8-selector33")]
+    if let Err(error) = e6
+        .shell
+        .require_e8_action_live_at(system.now().map_err(InitError::Native)?)
+    {
+        e6.shell.poison(grant.registry_generation);
+        return Err(if system.close_handle(client).is_err() {
+            InitError::Cleanup
+        } else {
+            error
         });
     }
     e6.publication_observer = Some(PublicationObserver {
@@ -263,6 +303,9 @@ where
     if e6.console.is_some() {
         return Err(InitError::WrongActivationOrder);
     }
+    #[cfg(feature = "wyr1e8-selector33")]
+    e6.shell
+        .require_e8_action_live_at(system.now().map_err(InitError::Native)?)?;
     let image = Archive::new(bootfs)
         .map_err(InitError::Bootfs)?
         .lookup(CONSOLE_PATH.as_bytes())
@@ -287,6 +330,16 @@ where
             return Err(error);
         }
     };
+    #[cfg(feature = "wyr1e8-selector33")]
+    if let Err(error) = e6
+        .shell
+        .require_e8_action_live_at(system.now().map_err(InitError::Native)?)
+    {
+        let failed = system.close_handle(registry_endpoint).is_err()
+            | system.close_handle(child_registry).is_err()
+            | system.close_handle(group).is_err();
+        return Err(if failed { InitError::Cleanup } else { error });
+    }
     if let Err(error) = install_client(
         system,
         registry_control,
@@ -297,6 +350,16 @@ where
         let failed = system.close_handle(registry_endpoint).is_err()
             | system.close_handle(child_registry).is_err()
             | system.close_handle(group).is_err();
+        return Err(if failed { InitError::Cleanup } else { error });
+    }
+    #[cfg(feature = "wyr1e8-selector33")]
+    if let Err(error) = e6
+        .shell
+        .require_e8_action_live_at(system.now().map_err(InitError::Native)?)
+    {
+        e6.shell.poison(topology.generation());
+        let failed =
+            system.close_handle(child_registry).is_err() | system.close_handle(group).is_err();
         return Err(if failed { InitError::Cleanup } else { error });
     }
     let (launch_endpoint, child_launch) = match create_controller_channel_pair(system) {
@@ -323,6 +386,21 @@ where
         } else {
             InitError::Wyr1BModel(error)
         });
+    }
+    #[cfg(feature = "wyr1e8-selector33")]
+    if let Err(error) = e6
+        .shell
+        .require_e8_action_live_at(system.now().map_err(InitError::Native)?)
+    {
+        e6.shell.poison(topology.generation());
+        let failed = e6
+            .jobs
+            .disconnect_session(launch_grant)
+            .map_or(true, |handle| system.close_handle(handle).is_err())
+            | system.close_handle(child_launch).is_err()
+            | system.close_handle(child_registry).is_err()
+            | system.close_handle(group).is_err();
+        return Err(if failed { InitError::Cleanup } else { error });
     }
     let loaded = match load_consoled_process(
         loader,
@@ -366,10 +444,16 @@ where
         }
     };
     let ready_deadline = match system.now().map_err(InitError::Native).and_then(|now| {
+        #[cfg(feature = "wyr1e8-selector33")]
+        e6.shell.require_e8_action_live_at(now)?;
         now.checked_add(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
             .ok_or(InitError::Accounting)
     }) {
-        Ok(deadline) => deadline,
+        Ok(deadline) => {
+            #[cfg(feature = "wyr1e8-selector33")]
+            let deadline = e6.shell.cap_e8_deadline(deadline);
+            deadline
+        }
         Err(error) => {
             e6.shell.poison(topology.generation());
             let failed = cleanup_loaded(system, waits, loaded, group, true).is_err()
@@ -549,6 +633,18 @@ where
             });
         }
     };
+    #[cfg(feature = "wyr1e8-selector33")]
+    if e6.shell.e8_action_expired(validated_at) {
+        let cleanup = clear_publication_observer(e6, system, registry_generation, false);
+        return if cleanup.is_err() {
+            Err(InitError::Cleanup)
+        } else {
+            e8_operation(
+                E8FailureOperation::RebindPublication,
+                Err(InitError::Supervision),
+            )
+        };
+    }
     if let Err(outcome) =
         validate_publication_datagram(observer, &bytes[..counts.bytes], validated_at)
     {
@@ -629,6 +725,8 @@ where
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
+    #[cfg(feature = "wyr1e8-selector33")]
+    ensure_e8_action_live(resident, now)?;
     if let Some(outcome) = poll_publication_observer(resident, system, waits, now)? {
         return Ok(outcome);
     }
@@ -639,10 +737,6 @@ where
         .ok_or(InitError::WrongActivationOrder)?;
     let registry = state.registry.ok_or(InitError::WrongActivationOrder)?;
     let e6 = state.e6.as_mut().ok_or(InitError::WrongActivationOrder)?;
-    #[cfg(feature = "wyr1e8-selector33")]
-    if e6.shell.e8_quiescence_expired(now) {
-        return e8_operation(E8FailureOperation::Quiesced, Err(InitError::Supervision));
-    }
     let mut shell = ShellLaunchContext {
         registry_control: registry.control_channel,
         topology: &mut state.topology,
@@ -778,13 +872,22 @@ where
                     return Ok(PollOutcome::Stable);
                 }
                 wyrmroot_consoled::e8_control::Message::Quiesced(identity) => {
+                    let quiesced_at = system.now().map_err(InitError::Native)?;
+                    e8_operation(
+                        E8FailureOperation::Quiesced,
+                        e6.shell.require_e8_action_live_at(quiesced_at),
+                    )?;
                     let action = e8_operation(
                         E8FailureOperation::Quiesced,
-                        e6.shell.accept_e8_quiesced(identity, now),
+                        e6.shell.accept_e8_quiesced(identity, quiesced_at),
                     )?;
                     if action == E8RecoveryAction::Registry {
-                        return Ok(PollOutcome::RecoverRegistry);
+                        return Ok(PollOutcome::RecoverRegistryForE8);
                     }
+                    e8_operation(
+                        E8FailureOperation::RequestRetire,
+                        e6.shell.require_e8_action_live(system),
+                    )?;
                     e8_operation(
                         E8FailureOperation::RequestRetire,
                         (|| {
@@ -805,6 +908,10 @@ where
                                 .send_channel(devmgr.loaded.launch_channel, &request_bytes)
                                 .map_err(InitError::Native)
                         })(),
+                    )?;
+                    e8_operation(
+                        E8FailureOperation::RequestRetire,
+                        e6.shell.require_e8_action_live(system),
                     )?;
                     return Ok(PollOutcome::Stable);
                 }
@@ -840,6 +947,10 @@ where
         };
         if validated_at >= e6.ready_deadline {
             retire_current_console(e6, system, waits, state.topology.generation(), true)?;
+            #[cfg(feature = "wyr1e8-selector33")]
+            if e6.shell.e8_action_expired(validated_at) {
+                return e8_operation(E8FailureOperation::Quiesced, Err(InitError::Supervision));
+            }
             return Ok(PollOutcome::RecoverRegistry);
         }
         e6.awaiting_ready = false;
@@ -851,6 +962,33 @@ where
     }
     retire_current_console(e6, system, waits, state.topology.generation(), true)?;
     Ok(PollOutcome::RecoverRegistry)
+}
+
+#[cfg(feature = "wyr1e8-selector33")]
+pub(super) fn e8_action_deadline(resident: &ResidentSystemInit) -> Result<Option<u64>, InitError> {
+    Ok(resident
+        .wyr1c
+        .as_ref()
+        .and_then(|state| state.e6.as_ref())
+        .ok_or(InitError::WrongActivationOrder)?
+        .shell
+        .e8_action_deadline())
+}
+
+#[cfg(feature = "wyr1e8-selector33")]
+pub(super) fn ensure_e8_action_live(
+    resident: &ResidentSystemInit,
+    now: u64,
+) -> Result<(), InitError> {
+    let state = resident
+        .wyr1c
+        .as_ref()
+        .and_then(|state| state.e6.as_ref())
+        .ok_or(InitError::WrongActivationOrder)?;
+    e8_operation(
+        E8FailureOperation::Quiesced,
+        state.shell.require_e8_action_live_at(now),
+    )
 }
 
 fn retire_current_console<S, W>(
@@ -902,13 +1040,6 @@ where
         .ok_or(InitError::WrongActivationOrder)?;
     let generation = state.topology.generation();
     let e6 = state.e6.as_mut().ok_or(InitError::WrongActivationOrder)?;
-    if poison_registry {
-        e6.shell.poison(generation);
-    }
-    let observer_failed = e6
-        .publication_observer
-        .take()
-        .is_some_and(|observer| system.close_handle(observer.client).is_err());
     #[cfg(feature = "wyr1e8-selector33")]
     let pending_action = e6.shell.e8_pending_action();
     #[cfg(feature = "wyr1e8-selector33")]
@@ -921,6 +1052,26 @@ where
     if pending_action.is_some_and(|action| action != expected_action) {
         return Err(InitError::WrongActivationOrder);
     }
+    #[cfg(feature = "wyr1e8-selector33")]
+    let held = match pending_action {
+        Some(_) => Some(e6.shell.e8_held_for_action(expected_action)?),
+        None => None,
+    };
+    #[cfg(feature = "wyr1e8-selector33")]
+    if let Some(held) = held {
+        e6.shell
+            .require_e8_action_live_at(system.now().map_err(InitError::Native)?)?;
+        if held.deadline != e6.shell.e8_action_deadline().ok_or(InitError::Accounting)? {
+            return Err(InitError::Accounting);
+        }
+    }
+    if poison_registry {
+        e6.shell.poison(generation);
+    }
+    let observer_failed = e6
+        .publication_observer
+        .take()
+        .is_some_and(|observer| system.close_handle(observer.client).is_err());
     let Some(peer) = e6.console.take() else {
         return if observer_failed || {
             #[cfg(feature = "wyr1e8-selector33")]
@@ -946,8 +1097,17 @@ where
         .clear_e8_console_control(peer.loaded.launch_channel)
         .is_err();
     #[cfg(feature = "wyr1e8-selector33")]
-    let console_result =
-        retire_console_product_with_result(system, waits, &mut e6.jobs, peer, true);
+    let console_result = match held {
+        Some(held) => retire_console_product_with_result_before(
+            system,
+            waits,
+            &mut e6.jobs,
+            peer,
+            true,
+            held.deadline,
+        ),
+        None => retire_console_product_with_result(system, waits, &mut e6.jobs, peer, true),
+    };
     #[cfg(not(feature = "wyr1e8-selector33"))]
     let console_result =
         retire_console_product(system, waits, &mut e6.jobs, peer, true).map(|_| None);
@@ -964,13 +1124,17 @@ where
         Err(InitError::Cleanup)
     } else {
         #[cfg(feature = "wyr1e8-selector33")]
-        if pending_action.is_some() {
-            let held = e6.shell.take_e8_held(expected_action)?;
+        if let Some(held) = held {
+            e6.shell
+                .require_e8_action_live_at(system.now().map_err(InitError::Native)?)?;
             e6.jobs
                 .remove_barrier_result(held.pending, held.result)
                 .map_err(InitError::Wyr1BModel)?;
+            e6.shell
+                .require_e8_action_live_at(system.now().map_err(InitError::Native)?)?;
             let result = console_result?.ok_or(InitError::WrongActivationOrder)?;
             e6.shell.record_e8_forced_retired(system, held, result)?;
+            e6.shell.consume_e8_held(held);
         }
         Ok(())
     }

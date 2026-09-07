@@ -2666,11 +2666,30 @@ pub(crate) fn cleanup_loaded<S: InitPlatform, W: SupervisionPlatform<Error = Nat
     task_group: DwHandle,
     terminate: bool,
 ) -> Result<(), InitError> {
+    cleanup_loaded_before(system, waits, loaded, task_group, terminate, None)
+}
+
+pub(crate) fn cleanup_loaded_before<
+    S: InitPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+>(
+    system: &mut S,
+    waits: &mut W,
+    loaded: LoadedProcess,
+    task_group: DwHandle,
+    terminate: bool,
+    deadline_cap: Option<u64>,
+) -> Result<(), InitError> {
     let mut failed = false;
-    let cleanup_deadline = system
-        .now()
-        .ok()
-        .and_then(|now| now.checked_add(WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns));
+    let observed_now = system.now();
+    let cleanup_deadline = observed_now.ok().and_then(|now| {
+        now.checked_add(WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns)
+            .map(|deadline| deadline_cap.map_or(deadline, |cap| deadline.min(cap)))
+            .or(deadline_cap)
+    });
+    if deadline_cap.is_some() && observed_now.is_err() {
+        failed = true;
+    }
     if terminate && system.terminate_task_group(task_group).is_err() {
         // A termination request may race the child's own terminal transition.
         failed |= !matches!(
@@ -2682,7 +2701,15 @@ pub(crate) fn cleanup_loaded<S: InitPlatform, W: SupervisionPlatform<Error = Nat
         waits.query_task_termination(loaded.process),
         Ok(info) if info.state == DW_TASK_STATE_EXITED
     );
-    if !terminal && let Some(deadline) = cleanup_deadline {
+    let may_wait = match (observed_now, deadline_cap) {
+        (Ok(now), Some(cap)) => now < cap,
+        (Ok(_), None) => true,
+        (Err(_), _) => false,
+    };
+    if !terminal
+        && may_wait
+        && let Some(deadline) = cleanup_deadline
+    {
         let item = DwWaitItemV1 {
             handle: loaded.process,
             signals: DW_SIGNAL_EXITED,
@@ -3197,6 +3224,52 @@ mod native_cleanup_tests {
         wait_exited: bool,
     }
 
+    struct DeadlineWaits {
+        query_count: u8,
+        wait_deadline: Option<DwDeadline>,
+    }
+
+    impl SupervisionPlatform for DeadlineWaits {
+        type Error = NativeError;
+
+        fn wait_many(
+            &mut self,
+            _items: &[DwWaitItemV1],
+            deadline: DwDeadline,
+        ) -> Result<DwWaitResultV1, Self::Error> {
+            self.wait_deadline = Some(deadline);
+            Ok(DwWaitResultV1 {
+                index: 0,
+                observed: DW_SIGNAL_EXITED,
+                ..DwWaitResultV1::default()
+            })
+        }
+
+        fn receive_channel(
+            &mut self,
+            _channel: DwHandle,
+            _bytes: &mut [u8],
+            _handles: &mut [DwReceivedHandleInfoV1],
+        ) -> Result<ReceiveCounts, Self::Error> {
+            Err(FAILURE)
+        }
+
+        fn query_task_termination(
+            &mut self,
+            _process: DwHandle,
+        ) -> Result<DwTaskTerminationInfoV1, Self::Error> {
+            self.query_count += 1;
+            Ok(DwTaskTerminationInfoV1 {
+                state: if self.query_count >= 2 {
+                    DW_TASK_STATE_EXITED
+                } else {
+                    DwTaskState(0)
+                },
+                ..DwTaskTerminationInfoV1::default()
+            })
+        }
+    }
+
     struct ResidentWaits {
         wait_count: u8,
     }
@@ -3562,6 +3635,48 @@ mod native_cleanup_tests {
             &native.closed[..3],
             &[DwHandle(30), DwHandle(20), DwHandle(10)]
         );
+    }
+
+    #[test]
+    fn cleanup_action_cap_uses_exact_deadline_and_starts_no_wait_at_expiry() {
+        let mut before = MockNative::new();
+        before.now = 199;
+        let mut before_waits = DeadlineWaits {
+            query_count: 0,
+            wait_deadline: None,
+        };
+        assert_eq!(
+            cleanup_loaded_before(
+                &mut before,
+                &mut before_waits,
+                LOADED,
+                DwHandle(10),
+                true,
+                Some(200),
+            ),
+            Ok(())
+        );
+        assert_eq!(before_waits.wait_deadline, Some(DwDeadline(200)));
+
+        let mut expired = MockNative::new();
+        expired.now = 200;
+        let mut expired_waits = DeadlineWaits {
+            query_count: 0,
+            wait_deadline: None,
+        };
+        assert_eq!(
+            cleanup_loaded_before(
+                &mut expired,
+                &mut expired_waits,
+                LOADED,
+                DwHandle(10),
+                true,
+                Some(200),
+            ),
+            Err(InitError::Cleanup)
+        );
+        assert_eq!(expired_waits.wait_deadline, None);
+        assert_eq!(expired.close_count, 3);
     }
 
     #[test]

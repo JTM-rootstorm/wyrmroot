@@ -12,11 +12,14 @@ mod selector32;
 #[path = "wyr1e_native.rs"]
 mod wyr1e;
 use crate::wyr1b::{EndpointKind, RegistryTopology};
+#[cfg(feature = "wyr1e8-selector33")]
+use crate::wyr1b_native::launch_registry_until_ready_before;
 #[cfg(feature = "dw1e3-selector31")]
 use crate::wyr1b_native::{InstalledPeer, launch_registry_client_actor};
 use crate::wyr1b_native::{
     RegistryNativeAttempt, create_controller_channel_pair, establish_registry_topology,
-    launch_registry_until_ready, poison_registry_generation, restart_topology_or_poison,
+    launch_registry_until_ready, poison_registry_generation, poison_registry_generation_before,
+    restart_topology_or_poison_before,
 };
 use deepwyrm_syscall::{DW_HANDLE_TRANSFER_MOVE, DW_OBJECT_TYPE_CHANNEL, DwHandleTransferV1};
 #[cfg(any(
@@ -1140,16 +1143,20 @@ fn await_waiting_for_registry<S, W>(
     devmgr: ActiveNativeRole,
     supervisor_generation: u64,
     last_controller_transaction: u64,
+    deadline_cap: Option<u64>,
 ) -> Result<(), InitError>
 where
     S: InitPlatform,
     W: SupervisionPlatform<Error = NativeError>,
 {
-    let deadline = system
-        .now()
-        .map_err(InitError::Native)?
+    let now = system.now().map_err(InitError::Native)?;
+    if deadline_cap.is_some_and(|deadline| now >= deadline) {
+        return Err(InitError::Supervision);
+    }
+    let deadline = now
         .checked_add(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
         .ok_or(InitError::Accounting)?;
+    let deadline = deadline_cap.map_or(deadline, |cap| deadline.min(cap));
     let observed = waits
         .wait_many(
             core::slice::from_ref(&DwWaitItemV1 {
@@ -1167,7 +1174,14 @@ where
         devmgr,
         supervisor_generation,
         last_controller_transaction,
-    )
+    )?;
+    if let Some(deadline) = deadline_cap {
+        let validated_at = system.now().map_err(InitError::Native)?;
+        if validated_at >= deadline {
+            return Err(InitError::Supervision);
+        }
+    }
+    Ok(())
 }
 
 fn receive_waiting_for_registry<S: InitPlatform>(
@@ -1829,6 +1843,16 @@ where
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
+    #[cfg(feature = "wyr1e8-selector33")]
+    let action_deadline = wyr1e::e8_action_deadline(resident)?;
+    #[cfg(not(feature = "wyr1e8-selector33"))]
+    let action_deadline = None;
+    if action_deadline.is_some_and(|deadline| system.now().map_or(true, |now| now >= deadline)) {
+        system
+            .close_handle(child_endpoint)
+            .map_err(|_| InitError::Cleanup)?;
+        return Err(InitError::Supervision);
+    }
     let state = resident
         .wyr1c
         .as_ref()
@@ -1902,6 +1926,20 @@ where
         }
     };
 
+    #[cfg(feature = "wyr1e8-selector33")]
+    if let Err(error) =
+        wyr1e::ensure_e8_action_live(resident, system.now().map_err(InitError::Native)?)
+    {
+        let cleanup_failed =
+            cleanup_loaded_before(system, waits, loaded, task_group, true, action_deadline)
+                .is_err();
+        return Err(if cleanup_failed {
+            InitError::Cleanup
+        } else {
+            error
+        });
+    }
+
     {
         let state = resident
             .wyr1c
@@ -1922,16 +1960,33 @@ where
     if let Err(error) = system.send_channel(devmgr.loaded.launch_channel, &ack) {
         let attempt = resident
             .wyr1c
-            .as_mut()
-            .and_then(|state| state.driver.take())
+            .as_ref()
+            .and_then(|state| state.driver)
             .ok_or(InitError::WrongActivationOrder)?;
-        let cleanup_failed =
-            cleanup_loaded(system, waits, attempt.loaded, attempt.task_group, true).is_err();
+        let cleanup_failed = cleanup_loaded_before(
+            system,
+            waits,
+            attempt.loaded,
+            attempt.task_group,
+            true,
+            action_deadline,
+        )
+        .is_err();
+        if !cleanup_failed {
+            resident
+                .wyr1c
+                .as_mut()
+                .ok_or(InitError::WrongActivationOrder)?
+                .driver = None;
+        }
         return Err(if cleanup_failed {
             InitError::Cleanup
         } else {
             InitError::Native(error)
         });
+    }
+    if action_deadline.is_some_and(|deadline| system.now().map_or(true, |now| now >= deadline)) {
+        return Err(InitError::Supervision);
     }
     Ok(())
 }
@@ -2240,14 +2295,42 @@ where
     S: InitPlatform,
     W: SupervisionPlatform<Error = NativeError>,
 {
+    reap_driver_before(resident, system, waits, terminate, None)
+}
+
+fn reap_driver_before<S, W>(
+    resident: &mut ResidentSystemInit,
+    system: &mut S,
+    waits: &mut W,
+    terminate: bool,
+    deadline_cap: Option<u64>,
+) -> Result<DriverLaunchRequest, InitError>
+where
+    S: InitPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
     let attempt = resident
         .wyr1c
-        .as_mut()
-        .and_then(|state| state.driver.take())
+        .as_ref()
+        .and_then(|state| state.driver)
         .ok_or(InitError::WrongActivationOrder)?;
     let request = attempt.request;
-    cleanup_loaded(system, waits, attempt.loaded, attempt.task_group, terminate)?;
+    cleanup_loaded_before(
+        system,
+        waits,
+        attempt.loaded,
+        attempt.task_group,
+        terminate,
+        deadline_cap,
+    )?;
     if let Some(state) = resident.wyr1c.as_mut() {
+        if state.driver != Some(attempt) {
+            return Err(InitError::WrongActivationOrder);
+        }
+        state.driver = None;
+        if deadline_cap.is_some_and(|deadline| system.now().map_or(true, |now| now >= deadline)) {
+            return Err(InitError::Supervision);
+        }
         state.last_reaped_driver = Some(request);
     }
     Ok(request)
@@ -2892,16 +2975,20 @@ fn expect_device_status<S, W>(
     binding: wyrmroot_device_proto::RegistryBinding,
     transaction_id: u64,
     expected_status: StatusCode,
+    deadline_cap: Option<u64>,
 ) -> Result<(), InitError>
 where
     S: InitPlatform,
     W: SupervisionPlatform<Error = NativeError>,
 {
-    let deadline = system
-        .now()
-        .map_err(InitError::Native)?
+    let now = system.now().map_err(InitError::Native)?;
+    if deadline_cap.is_some_and(|deadline| now >= deadline) {
+        return Err(InitError::Supervision);
+    }
+    let deadline = now
         .checked_add(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
         .ok_or(InitError::Accounting)?;
+    let deadline = deadline_cap.map_or(deadline, |cap| deadline.min(cap));
     let observed = waits
         .wait_many(
             core::slice::from_ref(&DwWaitItemV1 {
@@ -2924,6 +3011,12 @@ where
     if receive_controller_status(system, devmgr.loaded.launch_channel)? != expected {
         return Err(InitError::WrongManifestProfile);
     }
+    if let Some(deadline) = deadline_cap {
+        let validated_at = system.now().map_err(InitError::Native)?;
+        if validated_at >= deadline {
+            return Err(InitError::Supervision);
+        }
+    }
     Ok(())
 }
 
@@ -2945,6 +3038,8 @@ where
         return Err(InitError::WrongActivationOrder);
     }
     resident.last_tick_ns = now_ns;
+    #[cfg(feature = "wyr1e8-selector33")]
+    wyr1e::ensure_e8_action_live(resident, now_ns)?;
     let state = resident
         .wyr1c
         .as_ref()
@@ -3117,7 +3212,7 @@ where
                                     }
                                     if state.registry.is_some() {
                                         recover_registry(
-                                            resident, system, loader, waits, bootfs, true,
+                                            resident, system, loader, waits, bootfs, true, false,
                                         )
                                     } else {
                                         resident
@@ -3216,7 +3311,7 @@ where
                             }
                         }
                         ResidentPollEvent::RegistryLost => {
-                            recover_registry(resident, system, loader, waits, bootfs, false)
+                            recover_registry(resident, system, loader, waits, bootfs, false, false)
                         }
                         ResidentPollEvent::DriverExited => {
                             #[cfg(feature = "dw1e3-selector31")]
@@ -3242,6 +3337,12 @@ where
                             );
                             #[cfg(feature = "wyr1e-production")]
                             dependent_retirement?;
+                            #[cfg(feature = "wyr1e8-selector33")]
+                            let _request = {
+                                let deadline = wyr1e::e8_action_deadline(resident)?;
+                                reap_driver_before(resident, system, waits, false, deadline)
+                            };
+                            #[cfg(not(feature = "wyr1e8-selector33"))]
                             let _request = reap_driver(resident, system, waits, false);
                             #[cfg(feature = "wyr1e8-selector33")]
                             let _request = e8_operation(E8FailureOperation::ReapDriver, _request)?;
@@ -3249,6 +3350,11 @@ where
                             let _request = _request?;
                             #[cfg(feature = "wyr1e-production")]
                             {
+                                #[cfg(feature = "wyr1e8-selector33")]
+                                wyr1e::ensure_e8_action_live(
+                                    resident,
+                                    system.now().map_err(InitError::Native)?,
+                                )?;
                                 let acknowledged = (|| {
                                     let state = resident
                                         .wyr1c
@@ -3263,7 +3369,13 @@ where
                                     E8FailureOperation::AcknowledgeReaped,
                                     acknowledged,
                                 );
-                                acknowledged
+                                acknowledged?;
+                                #[cfg(feature = "wyr1e8-selector33")]
+                                wyr1e::ensure_e8_action_live(
+                                    resident,
+                                    system.now().map_err(InitError::Native)?,
+                                )?;
+                                Ok(())
                             }
                             #[cfg(not(feature = "wyr1e-production"))]
                             {
@@ -3401,6 +3513,14 @@ where
     {
         let outcome = wyr1e::poll(resident, system, loader, waits, now_ns)?;
         if outcome != wyr1e::PollOutcome::Stable {
+            #[cfg(feature = "wyr1e8-selector33")]
+            if matches!(
+                outcome,
+                wyr1e::PollOutcome::RecoverDevmgr | wyr1e::PollOutcome::RecoverRegistry
+            ) && wyr1e::e8_action_deadline(resident)?.is_some()
+            {
+                return e8_operation(E8FailureOperation::Quiesced, Err(InitError::Supervision));
+            }
             let size = system
                 .query_memory_object_size(resident.authority.bootfs)
                 .map_err(InitError::Native)?;
@@ -3423,9 +3543,13 @@ where
                             wyr1e::PollOutcome::RecoverDevmgr => {
                                 recover_devmgr(resident, system, loader, waits, bootfs)
                             }
-                            wyr1e::PollOutcome::RecoverRegistry => {
-                                recover_registry(resident, system, loader, waits, bootfs, false)
-                            }
+                            wyr1e::PollOutcome::RecoverRegistry => recover_registry(
+                                resident, system, loader, waits, bootfs, false, false,
+                            ),
+                            #[cfg(feature = "wyr1e8-selector33")]
+                            wyr1e::PollOutcome::RecoverRegistryForE8 => recover_registry(
+                                resident, system, loader, waits, bootfs, false, true,
+                            ),
                         }?;
                         Ok(resident.controller.mode())
                     },
@@ -3443,19 +3567,36 @@ fn recover_registry<S, L, W>(
     waits: &mut W,
     bootfs: &[u8],
     status_already_consumed: bool,
+    _e8_quiesced: bool,
 ) -> Result<(), InitError>
 where
     S: Wyr1BPlatform,
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
+    #[cfg(feature = "wyr1e8-selector33")]
+    let action_deadline = wyr1e::e8_action_deadline(resident)?;
+    #[cfg(not(feature = "wyr1e8-selector33"))]
+    let action_deadline = None;
+    #[cfg(feature = "wyr1e8-selector33")]
+    if action_deadline.is_some() && !_e8_quiesced {
+        return Err(InitError::Supervision);
+    }
+    #[cfg(feature = "wyr1e8-selector33")]
+    if action_deadline.is_some() {
+        wyr1e::ensure_e8_action_live(resident, system.now().map_err(InitError::Native)?)?;
+    }
     #[cfg(feature = "dw1e3-selector31")]
     if let Some(child_cleanup_failed) = fail_closed_e3a_recovery(resident, system, waits) {
         return finish_e3a_fatal_recovery(resident, system, waits, child_cleanup_failed);
     }
-    #[cfg(feature = "wyr1e-production")]
+    #[cfg(all(feature = "wyr1e-production", feature = "wyr1e8-selector33"))]
+    let dependent_cleanup_error = wyr1e::retire_dependents(resident, system, waits, true).err();
+    #[cfg(all(not(feature = "wyr1e-production"), feature = "wyr1e8-selector33"))]
+    let dependent_cleanup_error: Option<InitError> = None;
+    #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1e8-selector33")))]
     let dependent_cleanup_failed = wyr1e::retire_dependents(resident, system, waits, true).is_err();
-    #[cfg(not(feature = "wyr1e-production"))]
+    #[cfg(all(not(feature = "wyr1e-production"), not(feature = "wyr1e8-selector33")))]
     let dependent_cleanup_failed = false;
     let registry = resident
         .wyr1c
@@ -3470,21 +3611,64 @@ where
         .as_mut()
         .ok_or(InitError::WrongActivationOrder)?
         .binding = None;
-    let exhausted = poison_registry_generation(
+    let exhausted = poison_registry_generation_before(
         system,
         waits,
         &mut resident.controller,
         registry,
+        #[cfg(feature = "wyr1e8-selector33")]
+        dependent_cleanup_error.is_some(),
+        #[cfg(not(feature = "wyr1e8-selector33"))]
         dependent_cleanup_failed,
-    )?;
+        action_deadline,
+    );
+    #[cfg(feature = "wyr1e8-selector33")]
+    if let Some(error) = dependent_cleanup_error {
+        return Err(if exhausted.is_err() {
+            InitError::Cleanup
+        } else {
+            error
+        });
+    }
+    let exhausted = exhausted?;
     let step = registry_recovery_step(exhausted, status_already_consumed);
     match step {
         RegistryRecoveryStep::Degraded => {
             resident.result = RecoveryResult::Degraded;
+            #[cfg(feature = "wyr1e8-selector33")]
+            if action_deadline.is_some() {
+                return Err(InitError::Cleanup);
+            }
             return Ok(());
         }
         RegistryRecoveryStep::Restart | RegistryRecoveryStep::AwaitStatus => {}
     }
+    #[cfg(feature = "wyr1e8-selector33")]
+    if action_deadline.is_some() {
+        wyr1e::ensure_e8_action_live(resident, system.now().map_err(InitError::Native)?)?;
+    }
+    #[cfg(feature = "wyr1e8-selector33")]
+    let replacement = if let Some(deadline) = action_deadline {
+        launch_registry_until_ready_before(
+            system,
+            loader,
+            waits,
+            &mut resident.controller,
+            resident.authority,
+            bootfs,
+            deadline,
+        )?
+    } else {
+        launch_registry_until_ready(
+            system,
+            loader,
+            waits,
+            &mut resident.controller,
+            resident.authority,
+            bootfs,
+        )?
+    };
+    #[cfg(not(feature = "wyr1e8-selector33"))]
     let replacement = launch_registry_until_ready(
         system,
         loader,
@@ -3495,11 +3679,34 @@ where
     )?;
     let Some(replacement) = replacement else {
         resident.result = RecoveryResult::Degraded;
+        #[cfg(feature = "wyr1e8-selector33")]
+        if action_deadline.is_some() {
+            return Err(InitError::Supervision);
+        }
         return Ok(());
     };
+    #[cfg(feature = "wyr1e8-selector33")]
+    if action_deadline.is_some()
+        && let Err(error) =
+            wyr1e::ensure_e8_action_live(resident, system.now().map_err(InitError::Native)?)
+    {
+        let cleanup = poison_registry_generation_before(
+            system,
+            waits,
+            &mut resident.controller,
+            replacement,
+            false,
+            action_deadline,
+        );
+        return Err(if cleanup.is_err() {
+            InitError::Cleanup
+        } else {
+            error
+        });
+    }
     #[cfg(feature = "wyr1e-production")]
     wyr1e::reserve_registry_replacement(resident, replacement.active.generation)?;
-    let replacement = restart_topology_or_poison(
+    let replacement = restart_topology_or_poison_before(
         system,
         waits,
         &mut resident.controller,
@@ -3509,6 +3716,7 @@ where
             .ok_or(InitError::WrongActivationOrder)?
             .topology,
         replacement,
+        action_deadline,
     )?;
     #[cfg(feature = "wyr1e-production")]
     wyr1e::commit_registry_replacement(resident, replacement.active.generation)?;
@@ -3530,6 +3738,7 @@ where
             devmgr,
             devmgr.generation,
             state.last_controller_transaction,
+            action_deadline,
         ) {
             return recover_devmgr_after_error(resident, system, loader, waits, bootfs, error);
         }
@@ -3566,10 +3775,15 @@ where
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
-    match wyr1e::start_after_driver_constructed(resident, system) {
+    let result = wyr1e::start_after_driver_constructed(resident, system);
+    #[cfg(feature = "wyr1e8-selector33")]
+    if result.is_err() && wyr1e::e8_action_deadline(resident)?.is_some() {
+        return result;
+    }
+    match result {
         Ok(()) => Ok(()),
         Err(_) if wyr1e::registry_recovery_required(resident) => {
-            recover_registry(resident, system, loader, waits, bootfs, false)
+            recover_registry(resident, system, loader, waits, bootfs, false, false)
         }
         Err(error) => Err(error),
     }
@@ -3581,13 +3795,19 @@ fn recover_devmgr_after_error<S, L, W>(
     loader: &mut L,
     waits: &mut W,
     bootfs: &[u8],
-    _error: InitError,
+    error: InitError,
 ) -> Result<(), InitError>
 where
     S: Wyr1BPlatform,
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
+    #[cfg(feature = "wyr1e8-selector33")]
+    if wyr1e::e8_action_deadline(resident)?.is_some() {
+        return Err(error);
+    }
+    #[cfg(not(feature = "wyr1e8-selector33"))]
+    let _ = error;
     recover_devmgr(resident, system, loader, waits, bootfs)
 }
 
@@ -3662,6 +3882,10 @@ where
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
+    #[cfg(feature = "wyr1e8-selector33")]
+    if wyr1e::e8_action_deadline(resident)?.is_some() {
+        return Err(InitError::Supervision);
+    }
     #[cfg(feature = "dw1e3-selector31")]
     if let Some(child_cleanup_failed) = fail_closed_e3a_recovery(resident, system, waits) {
         return finish_e3a_fatal_recovery(resident, system, waits, child_cleanup_failed);
@@ -3984,13 +4208,17 @@ where
     S: Wyr1BPlatform,
     W: SupervisionPlatform<Error = NativeError>,
 {
+    #[cfg(feature = "wyr1e8-selector33")]
+    let deadline_cap = wyr1e::e8_action_deadline(resident)?;
+    #[cfg(not(feature = "wyr1e8-selector33"))]
+    let deadline_cap = None;
     let state = resident
         .wyr1c
         .as_mut()
         .ok_or(InitError::WrongActivationOrder)?;
     let registry = state.registry.ok_or(InitError::WrongActivationOrder)?;
     let devmgr = state.devmgr.ok_or(InitError::WrongActivationOrder)?;
-    let (binding, publication_service_generation, transaction_id) = perform_rebind(
+    let rebound = perform_rebind(
         system,
         waits,
         &mut state.topology,
@@ -3998,7 +4226,23 @@ where
         registry.control_channel,
         devmgr,
         state.next_controller_transaction,
-    )?;
+        deadline_cap,
+    );
+    let (binding, publication_service_generation, transaction_id) = match rebound {
+        Ok(rebound) => rebound,
+        Err(error) => {
+            #[cfg(feature = "wyr1e8-selector33")]
+            if deadline_cap.is_some() {
+                state
+                    .e6
+                    .as_mut()
+                    .ok_or(InitError::WrongActivationOrder)?
+                    .shell
+                    .poison(registry.active.generation);
+            }
+            return Err(error);
+        }
+    };
     state.binding = Some(binding);
     state.publication_service_generation = publication_service_generation;
     state.waiting_registry_observed = false;
@@ -4008,6 +4252,7 @@ where
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn perform_rebind<S, W>(
     system: &mut S,
     waits: &mut W,
@@ -4016,11 +4261,18 @@ fn perform_rebind<S, W>(
     registry_control: DwHandle,
     devmgr: ActiveNativeRole,
     transaction_id: u64,
+    deadline_cap: Option<u64>,
 ) -> Result<(wyrmroot_device_proto::RegistryBinding, u64, u64), InitError>
 where
     S: Wyr1BPlatform,
     W: SupervisionPlatform<Error = NativeError>,
 {
+    if let Some(deadline) = deadline_cap {
+        let now = system.now().map_err(InitError::Native)?;
+        if now >= deadline {
+            return Err(InitError::Supervision);
+        }
+    }
     let grant = topology
         .issue(devmgr.generation, EndpointKind::Publication)
         .map_err(InitError::Wyr1BModel)?;
@@ -4033,6 +4285,18 @@ where
         },
     };
     let (registry_endpoint, devmgr_endpoint) = create_controller_channel_pair(system)?;
+    if let Some(deadline) = deadline_cap {
+        let now = system.now().map_err(InitError::Native)?;
+        if now >= deadline {
+            let failed = system.close_handle(registry_endpoint).is_err()
+                | system.close_handle(devmgr_endpoint).is_err();
+            return Err(if failed {
+                InitError::Cleanup
+            } else {
+                InitError::Supervision
+            });
+        }
+    }
     if let Err(error) = install_publication(
         system,
         registry_control,
@@ -4047,6 +4311,16 @@ where
         } else {
             error
         });
+    }
+    if let Some(deadline) = deadline_cap {
+        let now = system.now().map_err(InitError::Native)?;
+        if now >= deadline {
+            return Err(if system.close_handle(devmgr_endpoint).is_err() {
+                InitError::Cleanup
+            } else {
+                InitError::Supervision
+            });
+        }
     }
     let request = ControllerMessage::RebindPublication {
         supervisor_generation: SupervisorGeneration(devmgr.generation),
@@ -4085,6 +4359,9 @@ where
             error
         });
     }
+    if deadline_cap.is_some_and(|deadline| system.now().map_or(true, |now| now >= deadline)) {
+        return Err(InitError::Supervision);
+    }
     expect_device_status(
         system,
         waits,
@@ -4092,6 +4369,7 @@ where
         binding,
         transaction_id,
         StatusCode::OperationalWaitingForDeviceBundle,
+        deadline_cap,
     )?;
     Ok((binding, publication.service_generation, transaction_id))
 }
@@ -4399,6 +4677,7 @@ mod tests {
             DwHandle(40),
             devmgr(),
             9,
+            None,
         )
         .unwrap();
         assert_eq!(result.0, rebound_binding());
@@ -4420,6 +4699,40 @@ mod tests {
         assert_eq!(platform.controller_service_generation, Some(result.1));
         #[cfg(not(any(feature = "wyr1d-selector32", feature = "wyr1e-production")))]
         assert_eq!(platform.controller_service_generation, None);
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    #[test]
+    fn e8_rebind_expiry_precedes_namespace_and_endpoint_effects() {
+        let mut platform = RebindPlatform::with_status(waiting_device_status());
+        let mut waits = StatusWaits { fail: false };
+        let mut topology = RegistryTopology::new(2).unwrap();
+        let mut publications = PublicationAllocator::new();
+
+        assert_eq!(
+            perform_rebind(
+                &mut platform,
+                &mut waits,
+                &mut topology,
+                &mut publications,
+                DwHandle(40),
+                devmgr(),
+                9,
+                Some(100),
+            ),
+            Err(InitError::Supervision)
+        );
+        assert_eq!(platform.send_count, 0);
+        assert_eq!(platform.close_count, 0);
+        assert_eq!(
+            topology
+                .issue(7, EndpointKind::Publication)
+                .unwrap()
+                .endpoint_id,
+            1
+        );
+        let mut untouched = PublicationAllocator::new();
+        assert_eq!(publications.issue().unwrap(), untouched.issue().unwrap());
     }
 
     #[test]
@@ -4454,6 +4767,7 @@ mod tests {
             DwHandle(40),
             devmgr(),
             9,
+            None,
         )
         .unwrap_err();
         assert_eq!(error, InitError::Native(FAILURE));
@@ -4471,6 +4785,7 @@ mod tests {
             DwHandle(40),
             devmgr(),
             9,
+            None,
         )
         .unwrap_err();
         assert_eq!(error, InitError::Native(FAILURE));

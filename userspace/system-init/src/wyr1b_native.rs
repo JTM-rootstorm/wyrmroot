@@ -96,10 +96,17 @@ impl E8RecoveryAction {
 
 #[cfg(feature = "wyr1e8-selector33")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct E8Trigger {
+struct E8TriggerIdentity {
     launch_transaction: u64,
     job_id: u64,
     action: E8RecoveryAction,
+}
+
+#[cfg(feature = "wyr1e8-selector33")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct E8Trigger {
+    identity: E8TriggerIdentity,
+    deadline: u64,
 }
 
 #[cfg(feature = "wyr1e8-selector33")]
@@ -272,8 +279,12 @@ impl ShellControllerState {
         if !self.e8_evidence.armed() {
             return Ok(());
         }
-        self.e8_evidence
-            .stage_shell_tuple(tuple, |record| Self::submit_e8(system, record))
+        self.require_e8_action_live(system)?;
+        let mut candidate = self.e8_evidence;
+        candidate.stage_shell_tuple(tuple, |record| Self::submit_e8(system, record))?;
+        self.require_e8_action_live(system)?;
+        self.e8_evidence = candidate;
+        self.finish_e8_action_if_ready(system)
     }
 
     #[cfg(feature = "wyr1e8-selector33")]
@@ -282,8 +293,12 @@ impl ShellControllerState {
         system: &mut S,
         ready: crate::wyr1e8_evidence::SerialReady,
     ) -> Result<(), InitError> {
-        self.e8_evidence
-            .observe_serial_ready(ready, |record| Self::submit_e8(system, record))
+        self.require_e8_action_live(system)?;
+        let mut candidate = self.e8_evidence;
+        candidate.observe_serial_ready(ready, |record| Self::submit_e8(system, record))?;
+        self.require_e8_action_live(system)?;
+        self.e8_evidence = candidate;
+        self.finish_e8_action_if_ready(system)
     }
 
     #[cfg(feature = "wyr1e8-selector33")]
@@ -308,6 +323,7 @@ impl ShellControllerState {
         request: &[u8],
         response: &[u8],
         handles: &[DwReceivedHandleInfoV1],
+        accepted_deadline: Option<u64>,
     ) -> Result<(), InitError> {
         #[cfg(test)]
         if !self.e8_evidence.ready() {
@@ -320,17 +336,60 @@ impl ShellControllerState {
             response,
             handles.len(),
         )?;
-        if trigger.is_some() && self.e8_trigger.is_some() {
+        match (trigger, accepted_deadline) {
+            (Some(identity), Some(deadline))
+                if deadline != 0
+                    && self.e8_trigger == Some(E8Trigger { identity, deadline })
+                    && self.e8_held.is_none() => {}
+            (None, None) => {}
+            _ => return Err(InitError::Accounting),
+        }
+        let mut candidate = self.e8_evidence;
+        candidate.shell_jobs_transaction(request, response, handles, |record| {
+            Self::submit_e8(system, record)
+        })?;
+        self.require_e8_action_live(system)?;
+        self.e8_evidence = candidate;
+        Ok(())
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    fn install_e8_trigger_before_accept(
+        &mut self,
+        request: E8TriggerRequest,
+        job_id: u64,
+        deadline: u64,
+    ) -> Result<(), InitError> {
+        if deadline == 0 || self.e8_trigger.is_some() || self.e8_held.is_some() {
             return Err(InitError::Accounting);
         }
-        self.e8_evidence
-            .shell_jobs_transaction(request, response, handles, |record| {
-                Self::submit_e8(system, record)
-            })?;
-        if let Some(trigger) = trigger {
-            self.e8_trigger = Some(trigger);
-        }
+        self.e8_trigger = Some(E8Trigger {
+            identity: E8TriggerIdentity {
+                launch_transaction: request.reservation.transaction_id,
+                job_id,
+                action: request.action,
+            },
+            deadline,
+        });
         Ok(())
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    fn classify_e8_trigger_request(
+        &self,
+        request: &[u8],
+        handles: usize,
+    ) -> Result<Option<E8TriggerRequest>, InitError> {
+        let trigger = e8_trigger_from_request(
+            self.e8_evidence.stage(),
+            self.e8_evidence.nonce(),
+            request,
+            handles,
+        )?;
+        if trigger.is_some() && (self.e8_trigger.is_some() || self.e8_held.is_some()) {
+            return Err(InitError::Accounting);
+        }
+        Ok(trigger)
     }
 
     #[cfg(feature = "wyr1e8-selector33")]
@@ -379,10 +438,11 @@ impl ShellControllerState {
         let Some(trigger) = self.e8_trigger else {
             return Ok(false);
         };
-        if pending.job_id != trigger.job_id {
+        if pending.job_id != trigger.identity.job_id {
             return Ok(false);
         }
         let expected_wait_transaction = trigger
+            .identity
             .launch_transaction
             .checked_add(1)
             .ok_or(InitError::Accounting)?;
@@ -403,7 +463,7 @@ impl ShellControllerState {
         let parsed =
             parse_launch_message(pending.request_bytes(), 0).map_err(|_| InitError::Accounting)?;
         if parsed.reservation != pending.reservation
-            || !matches!(parsed.message, LaunchMessage::Wait { job_id } if job_id == trigger.job_id)
+            || !matches!(parsed.message, LaunchMessage::Wait { job_id } if job_id == trigger.identity.job_id)
         {
             return Err(InitError::Accounting);
         }
@@ -416,11 +476,15 @@ impl ShellControllerState {
             status_generation: tuple.status_generation,
             shell_generation: tuple.shell_generation,
             outer_shell_job: tuple.outer_job_id,
-            trigger_job: trigger.job_id,
+            trigger_job: trigger.identity.job_id,
             trigger_wait_transaction: pending.reservation.transaction_id,
-            action: trigger.action.control(),
+            action: trigger.identity.action.control(),
             stage_nonce: self.e8_evidence.nonce(),
         };
+        let now = system.now().map_err(InitError::Native)?;
+        if now >= trigger.deadline {
+            return Err(InitError::Supervision);
+        }
         let bytes = wyrmroot_consoled::e8_control::encode(
             wyrmroot_consoled::e8_control::Message::Quiesce(identity),
         )
@@ -428,21 +492,17 @@ impl ShellControllerState {
         let control = self
             .e8_console_control
             .ok_or(InitError::WrongActivationOrder)?;
-        system
-            .send_channel(control, &bytes)
-            .map_err(InitError::Native)?;
-        let deadline = system
-            .now()
-            .map_err(InitError::Native)?
-            .checked_add(WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns)
-            .ok_or(InitError::Accounting)?;
         self.e8_held = Some(E8HeldWait {
             pending,
             identity,
             result,
-            deadline,
+            deadline: trigger.deadline,
             acknowledged: false,
         });
+        system
+            .send_channel(control, &bytes)
+            .map_err(InitError::Native)?;
+        self.require_e8_action_live(system)?;
         Ok(true)
     }
 
@@ -458,8 +518,9 @@ impl ShellControllerState {
     }
 
     #[cfg(feature = "wyr1e8-selector33")]
-    pub(crate) fn e8_quiescence_expired(&self, now: u64) -> bool {
-        self.e8_held.is_some_and(|held| now >= held.deadline)
+    pub(crate) fn e8_action_expired(&self, now: u64) -> bool {
+        self.e8_trigger
+            .is_some_and(|trigger| now >= trigger.deadline)
     }
 
     #[cfg(feature = "wyr1e8-selector33")]
@@ -483,29 +544,85 @@ impl ShellControllerState {
     }
 
     #[cfg(feature = "wyr1e8-selector33")]
-    pub(crate) fn take_e8_held(
-        &mut self,
+    pub(crate) fn e8_held_for_action(
+        &self,
         action: E8RecoveryAction,
     ) -> Result<E8HeldWait, InitError> {
-        let held = self.e8_held.take().ok_or(InitError::WrongActivationOrder)?;
+        let held = self.e8_held.ok_or(InitError::WrongActivationOrder)?;
         let actual = match held.identity.action {
             wyrmroot_consoled::e8_control::Action::Driver => E8RecoveryAction::Driver,
             wyrmroot_consoled::e8_control::Action::Registry => E8RecoveryAction::Registry,
         };
         if actual != action || !held.acknowledged {
-            self.e8_held = Some(held);
             return Err(InitError::WrongActivationOrder);
         }
-        self.e8_trigger = None;
         Ok(held)
     }
 
     #[cfg(feature = "wyr1e8-selector33")]
+    pub(crate) fn consume_e8_held(&mut self, held: E8HeldWait) {
+        debug_assert_eq!(self.e8_held, Some(held));
+        self.e8_held = None;
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
     pub(crate) fn e8_pending_action(&self) -> Option<E8RecoveryAction> {
-        self.e8_held.map(|held| match held.identity.action {
-            wyrmroot_consoled::e8_control::Action::Driver => E8RecoveryAction::Driver,
-            wyrmroot_consoled::e8_control::Action::Registry => E8RecoveryAction::Registry,
-        })
+        self.e8_trigger.map(|trigger| trigger.identity.action)
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    pub(crate) fn e8_action_deadline(&self) -> Option<u64> {
+        self.e8_trigger.map(|trigger| trigger.deadline)
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    pub(crate) fn cap_e8_deadline(&self, deadline: u64) -> u64 {
+        self.e8_action_deadline()
+            .map_or(deadline, |action_deadline| deadline.min(action_deadline))
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    pub(crate) fn require_e8_action_live_at(&self, now: u64) -> Result<(), InitError> {
+        if self.e8_action_expired(now) {
+            Err(InitError::Supervision)
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    pub(crate) fn require_e8_action_live<S: Wyr1BPlatform>(
+        &self,
+        system: &mut S,
+    ) -> Result<(), InitError> {
+        if self.e8_trigger.is_none() {
+            return Ok(());
+        }
+        self.require_e8_action_live_at(system.now().map_err(InitError::Native)?)
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    fn finish_e8_action_if_ready<S: Wyr1BPlatform>(
+        &mut self,
+        system: &mut S,
+    ) -> Result<(), InitError> {
+        let Some(trigger) = self.e8_trigger else {
+            return Ok(());
+        };
+        self.require_e8_action_live(system)?;
+        if !self.e8_evidence.ready() {
+            return Ok(());
+        }
+        let expected_stage = match trigger.identity.action {
+            E8RecoveryAction::Driver => 3,
+            E8RecoveryAction::Registry => 4,
+        };
+        if self.e8_evidence.stage() != expected_stage || self.e8_held.is_some() {
+            return Err(InitError::WrongActivationOrder);
+        }
+        self.require_e8_action_live(system)?;
+        self.e8_trigger = None;
+        Ok(())
     }
 
     #[cfg(feature = "wyr1e8-selector33")]
@@ -551,12 +668,17 @@ impl ShellControllerState {
         held: E8HeldWait,
         result: TerminationResult,
     ) -> Result<(), InitError> {
-        self.e8_evidence.forced_retired(
+        self.require_e8_action_live(system)?;
+        let mut candidate = self.e8_evidence;
+        candidate.forced_retired(
             held.identity.trigger_wait_transaction,
             held.identity.trigger_job,
             result,
             |record| Self::submit_e8(system, record),
-        )
+        )?;
+        self.require_e8_action_live(system)?;
+        self.e8_evidence = candidate;
+        Ok(())
     }
 
     pub(crate) const fn health(&self) -> ShellRegistryHealth {
@@ -651,27 +773,27 @@ impl ShellControllerState {
 }
 
 #[cfg(feature = "wyr1e8-selector33")]
-fn e8_trigger_from_transaction(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct E8TriggerRequest {
+    reservation: LaunchReservation,
+    action: E8RecoveryAction,
+}
+
+#[cfg(feature = "wyr1e8-selector33")]
+fn e8_trigger_from_request(
     stage: u32,
     nonce: u64,
     request: &[u8],
-    response: &[u8],
     handles: usize,
-) -> Result<Option<E8Trigger>, InitError> {
+) -> Result<Option<E8TriggerRequest>, InitError> {
     let request = parse_launch_message(request, handles).map_err(|_| InitError::Accounting)?;
-    let response = parse_launch_message(response, 0).map_err(|_| InitError::Accounting)?;
     let LaunchMessage::Launch(launch) = request.message else {
         return Ok(None);
     };
     if launch.path != wyrmroot_wyr1e_test_actors::RECOVERY_TRIGGER_PATH {
         return Ok(None);
     }
-    let LaunchMessage::LaunchAccepted { job_id } = response.message else {
-        return Err(InitError::Accounting);
-    };
-    if request.reservation != response.reservation
-        || job_id == 0
-        || launch.stream_count != 3
+    if launch.stream_count != 3
         || launch.argc() != 3
         || launch.environment_count() != 0
         || launch.arg(0) != Some(wyrmroot_wyr1e_test_actors::RECOVERY_TRIGGER_PATH)
@@ -691,10 +813,34 @@ fn e8_trigger_from_transaction(
     if expected_token == 0 || launch.arg(2).and_then(parse_e8_nonce) != Some(expected_token) {
         return Err(InitError::Accounting);
     }
-    Ok(Some(E8Trigger {
-        launch_transaction: request.reservation.transaction_id,
-        job_id,
+    Ok(Some(E8TriggerRequest {
+        reservation: request.reservation,
         action,
+    }))
+}
+
+#[cfg(feature = "wyr1e8-selector33")]
+fn e8_trigger_from_transaction(
+    stage: u32,
+    nonce: u64,
+    request: &[u8],
+    response: &[u8],
+    handles: usize,
+) -> Result<Option<E8TriggerIdentity>, InitError> {
+    let Some(trigger) = e8_trigger_from_request(stage, nonce, request, handles)? else {
+        return Ok(None);
+    };
+    let response = parse_launch_message(response, 0).map_err(|_| InitError::Accounting)?;
+    let LaunchMessage::LaunchAccepted { job_id } = response.message else {
+        return Err(InitError::Accounting);
+    };
+    if response.reservation != trigger.reservation || job_id == 0 {
+        return Err(InitError::Accounting);
+    }
+    Ok(Some(E8TriggerIdentity {
+        launch_transaction: trigger.reservation.transaction_id,
+        job_id,
+        action: trigger.action,
     }))
 }
 
@@ -1333,7 +1479,12 @@ fn preflight_wyrmsh_registry<S: Wyr1BPlatform>(
     system: &mut S,
     client: DwHandle,
     grant: EndpointGrant,
+    deadline_cap: Option<u64>,
 ) -> Result<(), InitError> {
+    let now = system.now().map_err(InitError::Native)?;
+    if deadline_cap.is_some_and(|deadline| now >= deadline) {
+        return Err(InitError::Supervision);
+    }
     let header = RegistryHeader {
         message_type: RegistryMessageType::Enumerate,
         registry_generation: grant.registry_generation,
@@ -1348,10 +1499,9 @@ fn preflight_wyrmsh_registry<S: Wyr1BPlatform>(
         .send_channel(client, &request[..request_size])
         .map_err(InitError::Native)?;
     let deadline = DwDeadline(
-        system
-            .now()
-            .map_err(InitError::Native)?
-            .checked_add(WYRMSH_REGISTRY_DEADLINE_NS)
+        now.checked_add(WYRMSH_REGISTRY_DEADLINE_NS)
+            .map(|deadline| deadline_cap.map_or(deadline, |cap| deadline.min(cap)))
+            .or(deadline_cap)
             .ok_or(InitError::Accounting)?,
     );
     let mut expected_page = 0_u16;
@@ -1372,6 +1522,9 @@ fn preflight_wyrmsh_registry<S: Wyr1BPlatform>(
                 deadline,
             )
             .map_err(InitError::Native)?;
+        if deadline_cap.is_some_and(|deadline| system.now().map_or(true, |now| now >= deadline)) {
+            return Err(InitError::Supervision);
+        }
         if observed.index != 0
             || observed.observed.0 & DW_SIGNAL_READABLE.0 == 0
             || observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0
@@ -1487,12 +1640,19 @@ fn launch_registry<S, L, W>(
     controller: &mut SystemInit,
     authority: LoadAuthority,
     bootfs: &[u8],
+    deadline_cap: Option<u64>,
 ) -> Result<RegistryNativeAttempt, InitError>
 where
     S: Wyr1BPlatform,
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
+    if let Some(deadline) = deadline_cap {
+        let now = system.now().map_err(InitError::Native)?;
+        if now >= deadline {
+            return Err(InitError::Supervision);
+        }
+    }
     let RestartState::Starting {
         generation,
         transaction_id,
@@ -1512,6 +1672,12 @@ where
         || wyrmroot_runtime::sha256::digest(image.data()) != executable_identity
     {
         return Err(InitError::ArtifactIdentityMismatch(RoleId::Registryd));
+    }
+    if let Some(deadline) = deadline_cap {
+        let now = system.now().map_err(InitError::Native)?;
+        if now >= deadline {
+            return Err(InitError::Supervision);
+        }
     }
     let task_group = system
         .create_attempt_task_group(authority.task_group)
@@ -1580,16 +1746,31 @@ where
     let started_at = match system.now().map_err(InitError::Native) {
         Ok(now) => now,
         Err(error) => {
-            let mut failed = cleanup_loaded(system, waits, loaded, task_group, true).is_err();
+            let mut failed =
+                cleanup_loaded_before(system, waits, loaded, task_group, true, deadline_cap)
+                    .is_err();
             failed |= !channels.cleanup(system);
             failed |= controller.abort_reservation(reservation).is_err();
             return Err(if failed { InitError::Cleanup } else { error });
         }
     };
+    if deadline_cap.is_some_and(|deadline| started_at >= deadline) {
+        let mut failed =
+            cleanup_loaded_before(system, waits, loaded, task_group, true, deadline_cap).is_err();
+        failed |= !channels.cleanup(system);
+        failed |= controller.abort_reservation(reservation).is_err();
+        return Err(if failed {
+            InitError::Cleanup
+        } else {
+            InitError::Supervision
+        });
+    }
     let deadline = match started_at.checked_add(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns) {
-        Some(deadline) => deadline,
+        Some(deadline) => deadline_cap.map_or(deadline, |cap| deadline.min(cap)),
         None => {
-            let mut failed = cleanup_loaded(system, waits, loaded, task_group, true).is_err();
+            let mut failed =
+                cleanup_loaded_before(system, waits, loaded, task_group, true, deadline_cap)
+                    .is_err();
             failed |= !channels.cleanup(system);
             failed |= controller.abort_reservation(reservation).is_err();
             return Err(if failed {
@@ -1612,7 +1793,7 @@ where
         reservation,
     };
     if let Err(error) = controller.install_attempt(resources) {
-        let cleanup = cleanup_loaded(system, waits, loaded, task_group, true);
+        let cleanup = cleanup_loaded_before(system, waits, loaded, task_group, true, deadline_cap);
         let control_failed = !channels.cleanup(system);
         return Err(if cleanup.is_err() || control_failed {
             InitError::Cleanup
@@ -1636,6 +1817,7 @@ where
             started_at,
             AttemptFailure::CreationFailed,
             error,
+            deadline_cap,
         ));
     }
     if let Err(_error) = await_child_ready_profile_observed(
@@ -1658,6 +1840,7 @@ where
             started_at,
             AttemptFailure::WaitFailed,
             InitError::Supervision,
+            deadline_cap,
         ));
     }
     let ready_at = match system.now().map_err(InitError::Native) {
@@ -1675,9 +1858,26 @@ where
                 started_at,
                 AttemptFailure::WaitFailed,
                 error,
+                deadline_cap,
             ));
         }
     };
+    if deadline_cap.is_some_and(|deadline| ready_at >= deadline) {
+        return Err(reconcile_failed_registry_launch(
+            system,
+            waits,
+            controller,
+            loaded,
+            task_group,
+            control_channel,
+            generation,
+            transaction_id,
+            ready_at,
+            AttemptFailure::WaitFailed,
+            InitError::Supervision,
+            deadline_cap,
+        ));
+    }
     if let Err(error) = controller.ready(RoleId::Registryd, generation, transaction_id, ready_at) {
         return Err(reconcile_failed_registry_launch(
             system,
@@ -1691,6 +1891,7 @@ where
             ready_at,
             AttemptFailure::WaitFailed,
             error,
+            deadline_cap,
         ));
     }
     let installed_generation = match controller
@@ -1711,6 +1912,7 @@ where
                 ready_at,
                 AttemptFailure::WaitFailed,
                 InitError::MissingAttemptResources,
+                deadline_cap,
             ));
         }
     };
@@ -1727,6 +1929,7 @@ where
             ready_at,
             AttemptFailure::WaitFailed,
             InitError::ResourceIdentityMismatch,
+            deadline_cap,
         ));
     }
     Ok(RegistryNativeAttempt {
@@ -1766,6 +1969,7 @@ where
             registry.ready_at,
             AttemptFailure::WaitFailed,
             error,
+            None,
         )),
     }
 }
@@ -1786,6 +1990,7 @@ fn reconcile_failed_registry_launch<
     classified_at: u64,
     failure: AttemptFailure,
     original: InitError,
+    deadline_cap: Option<u64>,
 ) -> InitError {
     let transition = match controller.role_state(RoleId::Registryd) {
         Some(RestartState::Starting { .. }) | Some(RestartState::Ready { .. }) => controller.fail(
@@ -1805,15 +2010,23 @@ fn reconcile_failed_registry_launch<
         _ => Err(InitError::WrongActivationOrder),
     };
     if transition.is_err() {
-        let _ = cleanup_loaded(system, waits, loaded, task_group, true);
+        let _ = cleanup_loaded_before(system, waits, loaded, task_group, true, deadline_cap);
         let _ = system.close_handle(control_channel);
         controller.fatal();
         return InitError::Cleanup;
     }
-    let cleanup_failed = cleanup_loaded(system, waits, loaded, task_group, true).is_err()
-        | system.close_handle(control_channel).is_err();
+    let cleanup_failed =
+        cleanup_loaded_before(system, waits, loaded, task_group, true, deadline_cap).is_err()
+            | system.close_handle(control_channel).is_err();
+    let completed_at = match system.now() {
+        Ok(value) => value,
+        Err(_) => {
+            controller.fatal();
+            return InitError::Cleanup;
+        }
+    };
     let retired_at = match classified_at.checked_add(1) {
-        Some(value) => value,
+        Some(value) => value.max(completed_at),
         None => {
             controller.fatal();
             return InitError::Accounting;
@@ -1846,6 +2059,50 @@ where
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
+    launch_registry_until_ready_inner(system, loader, waits, controller, authority, bootfs, None)
+}
+
+#[cfg(feature = "wyr1e8-selector33")]
+pub(crate) fn launch_registry_until_ready_before<S, L, W>(
+    system: &mut S,
+    loader: &mut L,
+    waits: &mut W,
+    controller: &mut SystemInit,
+    authority: LoadAuthority,
+    bootfs: &[u8],
+    action_deadline: u64,
+) -> Result<Option<RegistryNativeAttempt>, InitError>
+where
+    S: Wyr1BPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    launch_registry_until_ready_inner(
+        system,
+        loader,
+        waits,
+        controller,
+        authority,
+        bootfs,
+        Some(action_deadline),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_registry_until_ready_inner<S, L, W>(
+    system: &mut S,
+    loader: &mut L,
+    waits: &mut W,
+    controller: &mut SystemInit,
+    authority: LoadAuthority,
+    bootfs: &[u8],
+    deadline_cap: Option<u64>,
+) -> Result<Option<RegistryNativeAttempt>, InitError>
+where
+    S: Wyr1BPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+{
     loop {
         let attempt_transaction = match controller
             .role_state(RoleId::Registryd)
@@ -1855,7 +2112,18 @@ where
             _ => return Err(InitError::WrongActivationOrder),
         };
         let attempt_time = system.now().map_err(InitError::Native)?;
-        match launch_registry(system, loader, waits, controller, authority, bootfs) {
+        if deadline_cap.is_some_and(|deadline| attempt_time >= deadline) {
+            return Err(InitError::Supervision);
+        }
+        match launch_registry(
+            system,
+            loader,
+            waits,
+            controller,
+            authority,
+            bootfs,
+            deadline_cap,
+        ) {
             Ok(value) => return Ok(Some(value)),
             Err(error) => {
                 let now = attempt_time;
@@ -1869,7 +2137,12 @@ where
                         ..
                     } => (generation, transaction_id),
                     RestartState::Backoff { .. } => {
-                        if advance_registry_or_exhausted(system, controller, attempt_transaction)? {
+                        if advance_registry_or_exhausted_with_cap(
+                            system,
+                            controller,
+                            attempt_transaction,
+                            deadline_cap,
+                        )? {
                             return Ok(None);
                         }
                         continue;
@@ -1900,7 +2173,12 @@ where
                     transaction_id,
                     retired_at,
                 )?;
-                if advance_registry_or_exhausted(system, controller, transaction_id)? {
+                if advance_registry_or_exhausted_with_cap(
+                    system,
+                    controller,
+                    transaction_id,
+                    deadline_cap,
+                )? {
                     return Ok(None);
                 }
             }
@@ -1914,6 +2192,28 @@ pub(crate) fn poison_registry_generation<S, W>(
     controller: &mut SystemInit,
     registry: RegistryNativeAttempt,
     dependent_cleanup_failed: bool,
+) -> Result<bool, InitError>
+where
+    S: InitPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    poison_registry_generation_before(
+        system,
+        waits,
+        controller,
+        registry,
+        dependent_cleanup_failed,
+        None,
+    )
+}
+
+pub(crate) fn poison_registry_generation_before<S, W>(
+    system: &mut S,
+    waits: &mut W,
+    controller: &mut SystemInit,
+    registry: RegistryNativeAttempt,
+    dependent_cleanup_failed: bool,
+    deadline_cap: Option<u64>,
 ) -> Result<bool, InitError>
 where
     S: InitPlatform,
@@ -1933,12 +2233,13 @@ where
         ),
         Err(error) => (None, Err(error)),
     };
-    let native_cleanup_failed = cleanup_loaded(
+    let native_cleanup_failed = cleanup_loaded_before(
         system,
         waits,
         registry.active.loaded,
         registry.active.task_group,
         true,
+        deadline_cap,
     )
     .is_err()
         | system.close_handle(registry.control_channel).is_err()
@@ -1981,7 +2282,11 @@ where
             });
         }
     };
-    let retired_at = now.checked_add(1).unwrap_or(now);
+    let completed_at = system.now().map_err(InitError::Native)?;
+    let retired_at = now
+        .checked_add(1)
+        .map_or(completed_at, |minimum| minimum.max(completed_at));
+    let deadline_expired = deadline_cap.is_some_and(|deadline| completed_at >= deadline);
     let cleanup_must_fail = native_cleanup_failed || retired_at == now;
     if cleanup_must_fail {
         if controller
@@ -2011,7 +2316,15 @@ where
         let _ = controller.retire_attempt_after_fatal(RoleId::Registryd);
         return Err(error);
     }
-    advance_registry_or_exhausted(system, controller, registry.active.transaction_id)
+    if deadline_expired {
+        return Err(InitError::Supervision);
+    }
+    advance_registry_or_exhausted_with_cap(
+        system,
+        controller,
+        registry.active.transaction_id,
+        deadline_cap,
+    )
 }
 
 pub(crate) fn restart_topology_or_poison<S, W>(
@@ -2025,12 +2338,60 @@ where
     S: InitPlatform,
     W: SupervisionPlatform<Error = NativeError>,
 {
+    restart_topology_or_poison_before(system, waits, controller, topology, registry, None)
+}
+
+pub(crate) fn restart_topology_or_poison_before<S, W>(
+    system: &mut S,
+    waits: &mut W,
+    controller: &mut SystemInit,
+    topology: &mut RegistryTopology,
+    registry: RegistryNativeAttempt,
+    deadline_cap: Option<u64>,
+) -> Result<RegistryNativeAttempt, InitError>
+where
+    S: InitPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    if deadline_cap.is_some_and(|deadline| system.now().map_or(true, |now| now >= deadline)) {
+        let cleanup = poison_registry_generation_before(
+            system,
+            waits,
+            controller,
+            registry,
+            false,
+            deadline_cap,
+        );
+        return match cleanup {
+            Err(InitError::Cleanup) => Err(InitError::Cleanup),
+            Err(error) => Err(error),
+            Ok(_) => Err(InitError::Supervision),
+        };
+    }
     if let Err(error) = topology
         .restart(registry.active.generation)
         .map_err(InitError::Wyr1BModel)
     {
-        let _ = poison_registry_generation(system, waits, controller, registry, false)?;
+        let _ = poison_registry_generation_before(
+            system,
+            waits,
+            controller,
+            registry,
+            false,
+            deadline_cap,
+        )?;
         return Err(error);
+    }
+    if deadline_cap.is_some_and(|deadline| system.now().map_or(true, |now| now >= deadline)) {
+        let _ = poison_registry_generation_before(
+            system,
+            waits,
+            controller,
+            registry,
+            false,
+            deadline_cap,
+        )?;
+        return Err(InitError::Supervision);
     }
     Ok(registry)
 }
@@ -2047,6 +2408,48 @@ fn advance_registry_or_exhausted<S: InitPlatform>(
             .ok_or(InitError::WrongActivationOrder)?,
         RestartState::PermanentFailure { .. }
     ))
+}
+
+fn advance_registry_or_exhausted_with_cap<S: InitPlatform>(
+    system: &mut S,
+    controller: &mut SystemInit,
+    transaction_id: u64,
+    deadline_cap: Option<u64>,
+) -> Result<bool, InitError> {
+    let Some(action_deadline) = deadline_cap else {
+        return advance_registry_or_exhausted(system, controller, transaction_id);
+    };
+    match controller
+        .role_state(RoleId::Registryd)
+        .ok_or(InitError::WrongActivationOrder)?
+    {
+        RestartState::PermanentFailure { .. } => Ok(true),
+        RestartState::Backoff {
+            next_generation,
+            deadline_ns,
+            ..
+        } => {
+            let wait_deadline = deadline_ns.min(action_deadline);
+            system
+                .wait_until(wait_deadline)
+                .map_err(InitError::Native)?;
+            let observed_now = system.now().map_err(InitError::Native)?;
+            if observed_now < wait_deadline {
+                return Err(InitError::WrongActivationOrder);
+            }
+            if observed_now >= action_deadline {
+                return Err(InitError::Supervision);
+            }
+            controller.start_replacement(
+                RoleId::Registryd,
+                observed_now,
+                next_generation,
+                next_transaction(transaction_id)?,
+            )?;
+            Ok(matches!(controller.mode(), SystemMode::Degraded))
+        }
+        _ => Err(InitError::WrongActivationOrder),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2604,6 +3007,7 @@ fn launch_engine_error(error: LaunchEngineError<NativeError>) -> InitError {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn publish_launch_accepted<S, W>(
     system: &mut S,
     waits: &mut W,
@@ -2612,6 +3016,10 @@ fn publish_launch_accepted<S, W>(
     reservation: LaunchReservation,
     loaded: crate::wyr1b::LoadedJob,
     release: LaunchChannelRelease,
+    #[cfg(feature = "wyr1e8-selector33")] e8_acceptance: Option<(
+        &mut ShellControllerState,
+        E8TriggerRequest,
+    )>,
 ) -> Result<(LaunchChannelRelease, SentLaunchAccepted), InitError>
 where
     S: Wyr1BPlatform,
@@ -2625,9 +3033,62 @@ where
         &mut response,
     )
     .map_err(|_| InitError::Accounting)?;
+    #[cfg(feature = "wyr1e8-selector33")]
+    let e8_deadline = if e8_acceptance.is_some() {
+        let deadline = system.now().map_err(InitError::Native).and_then(|now| {
+            now.checked_add(WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns)
+                .ok_or(InitError::Accounting)
+        });
+        match deadline {
+            Ok(deadline) if deadline != u64::MAX => Some(deadline),
+            Ok(_) => {
+                jobs.jobs.restore_launch_channel(release);
+                let cleanup_failed =
+                    force_cleanup_job_before(system, waits, jobs, loaded, None).is_err();
+                return Err(if cleanup_failed {
+                    InitError::Cleanup
+                } else {
+                    InitError::Accounting
+                });
+            }
+            Err(error) => {
+                jobs.jobs.restore_launch_channel(release);
+                let cleanup_failed =
+                    force_cleanup_job_before(system, waits, jobs, loaded, None).is_err();
+                return Err(if cleanup_failed {
+                    InitError::Cleanup
+                } else {
+                    error
+                });
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(feature = "wyr1e8-selector33")]
+    let mut e8_owner = None;
+    #[cfg(feature = "wyr1e8-selector33")]
+    if let (Some((state, trigger)), Some(deadline)) = (e8_acceptance, e8_deadline) {
+        state.install_e8_trigger_before_accept(trigger, loaded.job_id, deadline)?;
+        e8_owner = Some(state);
+    }
     if let Err(error) = system.send_channel(session, &response[..size]) {
+        #[cfg(feature = "wyr1e8-selector33")]
+        if let Some(state) = e8_owner {
+            state.e8_trigger = None;
+        }
         jobs.jobs.restore_launch_channel(release);
-        let cleanup_failed = force_cleanup_job(system, waits, jobs, loaded).is_err();
+        let cleanup_failed = force_cleanup_job_before(
+            system,
+            waits,
+            jobs,
+            loaded,
+            #[cfg(feature = "wyr1e8-selector33")]
+            e8_deadline,
+            #[cfg(not(feature = "wyr1e8-selector33"))]
+            None,
+        )
+        .is_err();
         return Err(if cleanup_failed {
             InitError::Cleanup
         } else {
@@ -2641,6 +3102,8 @@ where
             bytes: response,
             #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
             len: size,
+            #[cfg(feature = "wyr1e8-selector33")]
+            e8_deadline,
         },
     ))
 }
@@ -2651,6 +3114,8 @@ struct SentLaunchAccepted {
     bytes: [u8; 88],
     #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
     len: usize,
+    #[cfg(feature = "wyr1e8-selector33")]
+    e8_deadline: Option<u64>,
 }
 
 impl SentLaunchAccepted {
@@ -2675,6 +3140,20 @@ where
     S: Wyr1BPlatform,
     W: SupervisionPlatform<Error = NativeError>,
 {
+    force_cleanup_job_before(system, waits, jobs, loaded, None)
+}
+
+fn force_cleanup_job_before<S, W>(
+    system: &mut S,
+    waits: &mut W,
+    jobs: &mut JobDispatcher,
+    loaded: crate::wyr1b::LoadedJob,
+    deadline_cap: Option<u64>,
+) -> Result<TerminationResult, InitError>
+where
+    S: Wyr1BPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
     if let Some(resources) = jobs
         .jobs
         .forced_termination_resources(loaded.job_id)
@@ -2693,7 +3172,7 @@ where
                 .map_err(InitError::Wyr1BModel)?;
         }
     }
-    let result = reap_job(system, waits, jobs, loaded)?;
+    let result = reap_job_before(system, waits, jobs, loaded, deadline_cap)?;
     if result.cleanup_result != 0 {
         Err(InitError::Cleanup)
     } else {
@@ -2739,6 +3218,10 @@ fn accept_reserved_launch<S, L, W>(
     request: wyrmroot_launch_proto::LaunchRequest<'_>,
     received: &[DwReceivedHandleInfoV1],
     handle_count: usize,
+    #[cfg(feature = "wyr1e8-selector33")] e8_acceptance: Option<(
+        &mut ShellControllerState,
+        E8TriggerRequest,
+    )>,
 ) -> Result<(crate::wyr1b::LoadedJob, SentLaunchAccepted), InitError>
 where
     S: Wyr1BPlatform,
@@ -2853,8 +3336,17 @@ where
         .jobs
         .release_launch_channel(loaded.job_id, loaded.loaded.launch_channel.0)
         .map_err(InitError::Wyr1BModel)?;
-    let (release, sent_response) =
-        publish_launch_accepted(system, waits, jobs, session, reservation, loaded, release)?;
+    let (release, sent_response) = publish_launch_accepted(
+        system,
+        waits,
+        jobs,
+        session,
+        reservation,
+        loaded,
+        release,
+        #[cfg(feature = "wyr1e8-selector33")]
+        e8_acceptance,
+    )?;
     if system.close_handle(loaded.loaded.launch_channel).is_err() {
         jobs.jobs.restore_launch_channel(release);
         jobs.jobs
@@ -2959,6 +3451,7 @@ fn await_job_exit<S, W>(
     system: &mut S,
     waits: &mut W,
     process: DwHandle,
+    deadline_cap: Option<u64>,
 ) -> Result<DwTaskTerminationInfoV1, ()>
 where
     S: Wyr1BPlatform,
@@ -2971,7 +3464,16 @@ where
             return Err(());
         }
         round += 1;
-        let deadline = report_deadline(system).map_err(|_| ())?;
+        let now = system.now().map_err(|_| ())?;
+        if deadline_cap.is_some_and(|cap| now >= cap) {
+            return Err(());
+        }
+        let deadline = now
+            .checked_add(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
+            .map(|deadline| deadline_cap.map_or(deadline, |cap| deadline.min(cap)))
+            .or(deadline_cap)
+            .map(DwDeadline)
+            .ok_or(())?;
         match waits.wait_many(
             core::slice::from_ref(&DwWaitItemV1 {
                 handle: process,
@@ -2987,6 +3489,12 @@ where
             Err(_) => return Err(()),
         }
         info = waits.query_task_termination(process).map_err(|_| ())?;
+        if deadline_cap.is_some() {
+            let now = system.now().map_err(|_| ())?;
+            if now >= deadline_cap.ok_or(())? {
+                return Err(());
+            }
+        }
     }
     Ok(info)
 }
@@ -2996,6 +3504,20 @@ fn reap_job<S, W>(
     waits: &mut W,
     jobs: &mut JobDispatcher,
     loaded: crate::wyr1b::LoadedJob,
+) -> Result<TerminationResult, InitError>
+where
+    S: Wyr1BPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    reap_job_before(system, waits, jobs, loaded, None)
+}
+
+fn reap_job_before<S, W>(
+    system: &mut S,
+    waits: &mut W,
+    jobs: &mut JobDispatcher,
+    loaded: crate::wyr1b::LoadedJob,
+    deadline_cap: Option<u64>,
 ) -> Result<TerminationResult, InitError>
 where
     S: Wyr1BPlatform,
@@ -3011,7 +3533,7 @@ where
             if loaded.loaded.process.0 == 0 {
                 return Err(InitError::Accounting);
             }
-            let info = match await_job_exit(system, waits, loaded.loaded.process) {
+            let info = match await_job_exit(system, waits, loaded.loaded.process, deadline_cap) {
                 Ok(info) => info,
                 Err(()) => {
                     jobs.jobs
@@ -3127,6 +3649,7 @@ fn observe_e7_response<S: Wyr1BPlatform>(
     request: &[u8],
     response: &[u8],
     handles: &[DwReceivedHandleInfoV1],
+    #[cfg(feature = "wyr1e8-selector33")] accepted_deadline: Option<u64>,
 ) -> Result<(), InitError> {
     #[cfg(feature = "wyr1e-selector33")]
     {
@@ -3159,7 +3682,7 @@ fn observe_e7_response<S: Wyr1BPlatform>(
         };
         match scope {
             LaunchSessionScope::ShellJobs => {
-                state.record_e8_shell_jobs(system, request, response, handles)
+                state.record_e8_shell_jobs(system, request, response, handles, accepted_deadline)
             }
             LaunchSessionScope::ConsoleLauncher => {
                 if !handles.is_empty() {
@@ -3194,7 +3717,16 @@ fn send_observed_job_error<S: Wyr1BPlatform>(
     system
         .send_channel(session, &response[..size])
         .map_err(InitError::Native)?;
-    observe_e7_response(system, scope, state, request, &response[..size], handles)
+    observe_e7_response(
+        system,
+        scope,
+        state,
+        request,
+        &response[..size],
+        handles,
+        #[cfg(feature = "wyr1e8-selector33")]
+        None,
+    )
 }
 
 fn send_shell_v1_error<S: InitPlatform>(
@@ -3431,6 +3963,8 @@ where
                 request_bytes,
                 &response[..size],
                 &[],
+                #[cfg(feature = "wyr1e8-selector33")]
+                None,
             )
         }
         Ok(None) => Ok(()),
@@ -3489,7 +4023,21 @@ where
     S: Wyr1BPlatform,
     W: SupervisionPlatform<Error = NativeError>,
 {
-    let cleanup = force_cleanup_job(system, waits, jobs, loaded);
+    cleanup_shell_before_publication_before(system, waits, jobs, loaded, None)
+}
+
+fn cleanup_shell_before_publication_before<S, W>(
+    system: &mut S,
+    waits: &mut W,
+    jobs: &mut JobDispatcher,
+    loaded: crate::wyr1b::LoadedJob,
+    deadline_cap: Option<u64>,
+) -> Result<TerminationResult, InitError>
+where
+    S: Wyr1BPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let cleanup = force_cleanup_job_before(system, waits, jobs, loaded, deadline_cap);
     let session_cleanup = close_shell_session_for_job(system, jobs, loaded.job_id);
     match (cleanup, session_cleanup) {
         (Ok(result), Ok(())) => Ok(result),
@@ -3524,6 +4072,8 @@ where
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
+    #[cfg(feature = "wyr1e8-selector33")]
+    context.state.require_e8_action_live(system)?;
     if jobs.has_shell_session() {
         let failed = close_received_reverse(system, received, received.len());
         return Err(if failed {
@@ -3636,7 +4186,15 @@ where
             | jobs.jobs.abort_launch(ticket).is_err();
         if failed { InitError::Cleanup } else { original }
     };
-    if let Err(error) = preflight_wyrmsh_registry(system, registry_client, registry_grant) {
+    if let Err(error) = preflight_wyrmsh_registry(
+        system,
+        registry_client,
+        registry_grant,
+        #[cfg(feature = "wyr1e8-selector33")]
+        context.state.e8_action_deadline(),
+        #[cfg(not(feature = "wyr1e8-selector33"))]
+        None,
+    ) {
         return Err(fail_after_install(system, jobs, context, error, true));
     }
     let shell_grant = match context.topology.issue(
@@ -3759,7 +4317,11 @@ where
         });
     }
     let ready_deadline = match report_deadline(system) {
-        Ok(deadline) => deadline,
+        Ok(deadline) => {
+            #[cfg(feature = "wyr1e8-selector33")]
+            let deadline = DwDeadline(context.state.cap_e8_deadline(deadline.0));
+            deadline
+        }
         Err(error) => {
             let failed = cleanup_shell_before_publication(system, waits, jobs, loaded_job).is_err();
             context.state.poison(registry_grant.registry_generation);
@@ -3786,6 +4348,12 @@ where
         } else {
             InitError::Supervision
         });
+    }
+    #[cfg(feature = "wyr1e8-selector33")]
+    if let Err(error) = context.state.require_e8_action_live(system) {
+        let failed = cleanup_shell_before_publication(system, waits, jobs, loaded_job).is_err();
+        context.state.poison(registry_grant.registry_generation);
+        return Err(if failed { InitError::Cleanup } else { error });
     }
     if let Err(error) =
         jobs.jobs
@@ -4033,6 +4601,17 @@ where
                 };
             }
         };
+        #[cfg(feature = "wyr1e8-selector33")]
+        if let Err(error) = shell.state.require_e8_action_live(system) {
+            shell.state.poison(shell.topology.generation());
+            return Err(
+                if cleanup_shell_before_publication(system, waits, jobs, accepted.loaded).is_err() {
+                    InitError::Cleanup
+                } else {
+                    error
+                },
+            );
+        }
         let loaded = accepted.loaded;
         let release = jobs
             .jobs
@@ -4049,6 +4628,18 @@ where
                     InitError::Cleanup
                 } else {
                     InitError::Native(error)
+                },
+            );
+        }
+        #[cfg(feature = "wyr1e8-selector33")]
+        if let Err(error) = shell.state.require_e8_action_live(system) {
+            jobs.jobs.restore_launch_channel(release);
+            shell.state.poison(shell.topology.generation());
+            return Err(
+                if cleanup_shell_before_publication(system, waits, jobs, loaded).is_err() {
+                    InitError::Cleanup
+                } else {
+                    error
                 },
             );
         }
@@ -4149,6 +4740,22 @@ where
                 )?;
                 return Ok(JobDispatchOutcome::Responded);
             };
+            #[cfg(feature = "wyr1e8-selector33")]
+            let e8_trigger = if scope == LaunchSessionScope::ShellJobs {
+                let state = shell
+                    .as_deref()
+                    .map(|context| &*context.state)
+                    .ok_or(InitError::WrongActivationOrder)?;
+                match state.classify_e8_trigger_request(&bytes[..counts.bytes], counts.handles) {
+                    Ok(trigger) => trigger,
+                    Err(error) => {
+                        let failed = close_received_reverse(system, &received, counts.handles);
+                        return Err(if failed { InitError::Cleanup } else { error });
+                    }
+                }
+            } else {
+                None
+            };
             match accept_reserved_launch(
                 system,
                 loader,
@@ -4162,6 +4769,17 @@ where
                 request,
                 &received[..legacy_handle_limit],
                 counts.handles,
+                #[cfg(feature = "wyr1e8-selector33")]
+                match e8_trigger {
+                    Some(trigger) => Some((
+                        shell
+                            .as_deref_mut()
+                            .map(|context| &mut *context.state)
+                            .ok_or(InitError::WrongActivationOrder)?,
+                        trigger,
+                    )),
+                    None => None,
+                },
             ) {
                 Ok((loaded, response)) => {
                     observe_e7_response(
@@ -4171,6 +4789,8 @@ where
                         &bytes[..counts.bytes],
                         response.as_bytes(),
                         &received[..counts.handles],
+                        #[cfg(feature = "wyr1e8-selector33")]
+                        response.e8_deadline,
                     )?;
                     Ok(JobDispatchOutcome::Launched(loaded))
                 }
@@ -4490,7 +5110,16 @@ where
     let request = pending.request_bytes();
     #[cfg(not(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33")))]
     let request = &[];
-    observe_e7_response(system, scope, evidence, request, &response[..size], &[])?;
+    observe_e7_response(
+        system,
+        scope,
+        evidence,
+        request,
+        &response[..size],
+        &[],
+        #[cfg(feature = "wyr1e8-selector33")]
+        None,
+    )?;
     jobs.finish_pending_wait(pending)
         .map_err(InitError::Wyr1BModel)
 }
@@ -4505,8 +5134,22 @@ where
     S: InitPlatform,
     W: SupervisionPlatform<Error = NativeError>,
 {
+    cleanup_session_owner_before(system, waits, owner, terminate, None)
+}
+
+fn cleanup_session_owner_before<S, W>(
+    system: &mut S,
+    waits: &mut W,
+    owner: Option<SessionOwner>,
+    terminate: bool,
+    deadline_cap: Option<u64>,
+) -> bool
+where
+    S: InitPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
     owner.is_some_and(|owner| {
-        cleanup_loaded(
+        cleanup_loaded_before(
             system,
             waits,
             LoadedProcess {
@@ -4515,6 +5158,7 @@ where
             },
             owner.task_group,
             terminate,
+            deadline_cap,
         )
         .is_err()
     })
@@ -4550,7 +5194,23 @@ where
     S: Wyr1BPlatform,
     W: SupervisionPlatform<Error = NativeError>,
 {
-    retire_console_product_inner(system, waits, jobs, peer, terminate)
+    retire_console_product_inner(system, waits, jobs, peer, terminate, None)
+}
+
+#[cfg(feature = "wyr1e8-selector33")]
+pub(crate) fn retire_console_product_with_result_before<S, W>(
+    system: &mut S,
+    waits: &mut W,
+    jobs: &mut JobDispatcher,
+    peer: InstalledPeer,
+    terminate: bool,
+    deadline_cap: u64,
+) -> Result<Option<TerminationResult>, InitError>
+where
+    S: Wyr1BPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    retire_console_product_inner(system, waits, jobs, peer, terminate, Some(deadline_cap))
 }
 
 #[cfg(feature = "wyr1e-production")]
@@ -4560,6 +5220,7 @@ fn retire_console_product_inner<S, W>(
     jobs: &mut JobDispatcher,
     peer: InstalledPeer,
     terminate: bool,
+    deadline_cap: Option<u64>,
 ) -> Result<Option<TerminationResult>, InitError>
 where
     S: Wyr1BPlatform,
@@ -4583,16 +5244,20 @@ where
     let owner_mismatch = disconnected.owner != Some(expected_owner);
     let outer_mismatch = disconnected.outer_job.is_some();
     let channel_close_failed = system.close_handle(disconnected.channel).is_err();
-    let owner_cleanup_failed = cleanup_session_owner(system, waits, disconnected.owner, terminate);
+    let owner_cleanup_failed =
+        cleanup_session_owner_before(system, waits, disconnected.owner, terminate, deadline_cap);
     let mut failed = owner_mismatch | outer_mismatch | channel_close_failed | owner_cleanup_failed;
     let outer_result = match outer {
-        Some(outer) => match cleanup_shell_before_publication(system, waits, jobs, outer) {
-            Ok(result) => Some(result),
-            Err(_) => {
-                failed = true;
-                None
+        Some(outer) => {
+            match cleanup_shell_before_publication_before(system, waits, jobs, outer, deadline_cap)
+            {
+                Ok(result) => Some(result),
+                Err(_) => {
+                    failed = true;
+                    None
+                }
             }
-        },
+        }
         None => None,
     };
     if failed {
@@ -5599,6 +6264,8 @@ mod tests {
         session_peer_closed: bool,
         fail_move: bool,
         fail_send_on: Option<DwHandle>,
+        now: u64,
+        fail_now: bool,
         bootfs: Option<Vec<u8>>,
         #[cfg(feature = "wyr1e-selector33")]
         evidence: Vec<[u8; crate::wyr1e7_evidence::RECORD_BYTES]>,
@@ -5606,6 +6273,10 @@ mod tests {
         fail_evidence: bool,
         #[cfg(feature = "wyr1e8-selector33")]
         e8_evidence: Vec<[u8; crate::wyr1e8_evidence::RECORD_BYTES]>,
+        #[cfg(feature = "wyr1e8-selector33")]
+        now_after_e8_evidence: Option<u64>,
+        #[cfg(feature = "wyr1e8-selector33")]
+        now_after_send_on: Option<(DwHandle, u64)>,
     }
 
     impl ShellPlatform {
@@ -5613,6 +6284,7 @@ mod tests {
             Self {
                 next_channel: 100,
                 session_readable: true,
+                now: 10,
                 ..Self::default()
             }
         }
@@ -5691,6 +6363,12 @@ mod tests {
                 return Err(FAILURE);
             }
             self.sent.push((channel, bytes.to_vec()));
+            #[cfg(feature = "wyr1e8-selector33")]
+            if let Some((target, now)) = self.now_after_send_on
+                && target == channel
+            {
+                self.now = now;
+            }
             Ok(())
         }
 
@@ -5711,7 +6389,11 @@ mod tests {
         }
 
         fn now(&mut self) -> Result<u64, NativeError> {
-            Ok(10)
+            if self.fail_now {
+                Err(FAILURE)
+            } else {
+                Ok(self.now)
+            }
         }
 
         fn wait_until(&mut self, _deadline_ns: u64) -> Result<(), NativeError> {
@@ -5796,6 +6478,9 @@ mod tests {
             record: &[u8; crate::wyr1e8_evidence::RECORD_BYTES],
         ) -> Result<(), NativeError> {
             self.e8_evidence.push(*record);
+            if let Some(now) = self.now_after_e8_evidence {
+                self.now = now;
+            }
             Ok(())
         }
     }
@@ -7520,6 +8205,8 @@ mod tests {
             reservation,
             loaded,
             release,
+            #[cfg(feature = "wyr1e8-selector33")]
+            false,
         )
         .unwrap();
         assert_eq!(sent.as_bytes(), platform.sent[0].1.as_slice());
@@ -7550,6 +8237,8 @@ mod tests {
             &request[..request_size],
             sent.as_bytes(),
             &[],
+            #[cfg(feature = "wyr1e8-selector33")]
+            None,
         )
         .unwrap();
         assert_eq!(platform.evidence.len(), 2);
@@ -7575,11 +8264,107 @@ mod tests {
                 failed_reservation,
                 failed_loaded,
                 failed_release,
+                #[cfg(feature = "wyr1e8-selector33")]
+                false,
             )
             .is_err()
         );
         assert_eq!(platform.sent.len(), 1);
         assert_eq!(platform.evidence.len(), 2);
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    #[test]
+    fn e8_trigger_acceptance_establishes_one_checked_deadline_before_reply() {
+        let grant = grant(EndpointKind::LaunchSession, 9, 3);
+        let session = DwHandle(90);
+        let reservation = LaunchReservation {
+            connection_id: grant.endpoint_id,
+            generation: grant.endpoint_generation,
+            transaction_id: 20,
+        };
+        let mut platform = ShellPlatform::new();
+        platform.now = 25;
+        let mut waits = TerminalWaits;
+        let mut jobs = JobDispatcher::new();
+        jobs.install_scoped_session(grant, session, LaunchSessionScope::ShellJobs)
+            .unwrap();
+        let launch = jobs.jobs.begin_launch(reservation).unwrap();
+        jobs.jobs.commit_launch(launch, 101, 102, 103).unwrap();
+        let loaded = jobs.jobs.loaded_job(launch.job_id).unwrap();
+        let release = jobs
+            .jobs
+            .release_launch_channel(launch.job_id, 103)
+            .unwrap();
+        let mut state = ShellControllerState::new(1).unwrap();
+        let trigger = E8TriggerRequest {
+            reservation,
+            action: E8RecoveryAction::Driver,
+        };
+
+        let (_, sent) = publish_launch_accepted(
+            &mut platform,
+            &mut waits,
+            &mut jobs,
+            session,
+            reservation,
+            loaded,
+            release,
+            Some((&mut state, trigger)),
+        )
+        .unwrap();
+        assert_eq!(
+            sent.e8_deadline,
+            Some(25 + WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns)
+        );
+        assert_eq!(platform.sent.len(), 1);
+        assert_eq!(state.e8_action_deadline(), sent.e8_deadline);
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    #[test]
+    fn e8_trigger_deadline_overflow_fails_before_accepted_reply() {
+        let grant = grant(EndpointKind::LaunchSession, 9, 3);
+        let session = DwHandle(90);
+        let reservation = LaunchReservation {
+            connection_id: grant.endpoint_id,
+            generation: grant.endpoint_generation,
+            transaction_id: 20,
+        };
+        let mut platform = ShellPlatform::new();
+        platform.now = u64::MAX - WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns + 1;
+        let mut waits = TerminalWaits;
+        let mut jobs = JobDispatcher::new();
+        jobs.install_scoped_session(grant, session, LaunchSessionScope::ShellJobs)
+            .unwrap();
+        let launch = jobs.jobs.begin_launch(reservation).unwrap();
+        jobs.jobs.commit_launch(launch, 101, 102, 103).unwrap();
+        let loaded = jobs.jobs.loaded_job(launch.job_id).unwrap();
+        let release = jobs
+            .jobs
+            .release_launch_channel(launch.job_id, 103)
+            .unwrap();
+        let mut state = ShellControllerState::new(1).unwrap();
+        let trigger = E8TriggerRequest {
+            reservation,
+            action: E8RecoveryAction::Driver,
+        };
+
+        assert_eq!(
+            publish_launch_accepted(
+                &mut platform,
+                &mut waits,
+                &mut jobs,
+                session,
+                reservation,
+                loaded,
+                release,
+                Some((&mut state, trigger)),
+            ),
+            Err(InitError::Accounting)
+        );
+        assert!(platform.sent.is_empty());
+        assert_eq!(jobs.jobs.live_jobs(), 0);
     }
 
     #[cfg(feature = "wyr1e-selector33")]
@@ -8978,9 +9763,12 @@ mod tests {
             .unwrap();
         state.set_e8_console_control(DwHandle(20)).unwrap();
         state.e8_trigger = Some(E8Trigger {
-            launch_transaction,
-            job_id: 12,
-            action: E8RecoveryAction::Driver,
+            identity: E8TriggerIdentity {
+                launch_transaction,
+                job_id: 12,
+                action: E8RecoveryAction::Driver,
+            },
+            deadline: 200,
         });
         state
     }
@@ -9067,6 +9855,281 @@ mod tests {
         );
         assert_eq!(overflow.e8_held, None);
         assert_eq!(overflow_platform.sent_len, 0);
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    #[test]
+    fn e8_quiesce_send_crossing_deadline_keeps_the_held_owner() {
+        let mut state = e8_state_for_held_wait(40);
+        let mut platform = ShellPlatform::new();
+        platform.now = 199;
+        platform.now_after_send_on = Some((DwHandle(20), 200));
+
+        assert_eq!(
+            state.hold_e8_wait(&mut platform, e8_pending_wait(41), e8_normal_result()),
+            Err(InitError::Supervision)
+        );
+        assert!(state.e8_held.is_some());
+        assert_eq!(state.e8_action_deadline(), Some(200));
+        assert_eq!(platform.sent.len(), 1);
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    #[test]
+    fn e8_action_keeps_its_deadline_across_preheld_held_and_recovery_states() {
+        let mut state = e8_state_for_held_wait(40);
+        assert_eq!(state.e8_action_deadline(), Some(200));
+        assert!(!state.e8_action_expired(199));
+        assert!(state.e8_action_expired(200));
+        assert_eq!(
+            state.require_e8_action_live_at(200),
+            Err(InitError::Supervision)
+        );
+        assert_eq!(state.cap_e8_deadline(250), 200);
+
+        let mut platform = MockPlatform::new();
+        platform.fail_send = false;
+        platform.now = Some(199);
+        assert_eq!(
+            state.hold_e8_wait(&mut platform, e8_pending_wait(41), e8_normal_result()),
+            Ok(true)
+        );
+        let held = state.e8_held.unwrap();
+        assert_eq!(held.deadline, 200);
+        assert_eq!(
+            state.e8_held_for_action(E8RecoveryAction::Registry),
+            Err(InitError::WrongActivationOrder)
+        );
+        assert_eq!(state.e8_held, Some(held));
+        assert_eq!(
+            state.accept_e8_quiesced(held.identity, 199),
+            Ok(E8RecoveryAction::Driver)
+        );
+        let taken = state.e8_held_for_action(E8RecoveryAction::Driver).unwrap();
+        assert_eq!(taken.deadline, 200);
+        state.consume_e8_held(taken);
+        assert_eq!(state.e8_action_deadline(), Some(200));
+        assert_eq!(state.e8_pending_action(), Some(E8RecoveryAction::Driver));
+
+        let mut delayed = e8_state_for_held_wait(40);
+        let mut delayed_platform = MockPlatform::new();
+        delayed_platform.fail_send = false;
+        delayed_platform.now = Some(200);
+        assert_eq!(
+            delayed.hold_e8_wait(
+                &mut delayed_platform,
+                e8_pending_wait(41),
+                e8_normal_result(),
+            ),
+            Err(InitError::Supervision)
+        );
+        assert_eq!(delayed.e8_action_deadline(), Some(200));
+        assert_eq!(delayed.e8_held, None);
+        assert_eq!(delayed_platform.sent_len, 0);
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    #[test]
+    fn e8_ready_evidence_crossing_deadline_retains_the_pending_action() {
+        let mut state = e8_state_for_held_wait(40);
+        state.e8_trigger = None;
+        let mut platform = ShellPlatform::new();
+
+        let wait = reservation(30);
+        let mut wait_request = [0u8; 56];
+        let wait_request_len =
+            encode_job_message(wait, LaunchMessageType::Wait, 5, &mut wait_request).unwrap();
+        let mut wait_response = [0u8; 88];
+        let wait_response_len = encode_job_result(
+            wait,
+            5,
+            TerminationResult {
+                classification: TerminationClassification::NormalExit,
+                application_code: 0,
+                exception_class: 0,
+                exception_detail: 0,
+                exception_address: 0,
+                cleanup_result: 0,
+            },
+            &mut wait_response,
+        )
+        .unwrap();
+        state
+            .record_e8_outer_response(
+                &mut platform,
+                &wait_request[..wait_request_len],
+                &wait_response[..wait_response_len],
+            )
+            .unwrap();
+
+        let close = reservation(31);
+        let mut close_request = [0u8; 56];
+        let close_request_len =
+            encode_job_message(close, LaunchMessageType::CloseJob, 5, &mut close_request).unwrap();
+        let mut close_response = [0u8; 56];
+        let close_response_len =
+            encode_job_message(close, LaunchMessageType::Closed, 5, &mut close_response).unwrap();
+        state
+            .record_e8_outer_response(
+                &mut platform,
+                &close_request[..close_request_len],
+                &close_response[..close_response_len],
+            )
+            .unwrap();
+        assert_eq!(state.e8_stage(), 2);
+
+        let stage_two_tuple = crate::wyr1e8_evidence::ShellTuple {
+            console_generation: 1,
+            status_generation: 3,
+            shell_generation: 4,
+            outer_launch_transaction: 6,
+            outer_job_id: 7,
+            registry_generation: 7,
+            registry_endpoint_id: 10,
+            registry_endpoint_generation: 11,
+            shell_jobs_connection_id: 12,
+            shell_jobs_generation: 13,
+        };
+        state
+            .stage_e8_shell_ready(&mut platform, stage_two_tuple)
+            .unwrap();
+        state
+            .observe_e8_serial_ready(
+                &mut platform,
+                crate::wyr1e8_evidence::SerialReady {
+                    console_generation: stage_two_tuple.console_generation,
+                    status_generation: stage_two_tuple.status_generation,
+                    shell_generation: stage_two_tuple.shell_generation,
+                    attach_transaction: 17,
+                    stream_generation: 18,
+                    bundle_generation: 19,
+                },
+            )
+            .unwrap();
+        state.e8_trigger = Some(E8Trigger {
+            identity: E8TriggerIdentity {
+                launch_transaction: 40,
+                job_id: 12,
+                action: E8RecoveryAction::Driver,
+            },
+            deadline: 200,
+        });
+        platform.now = 199;
+        state
+            .hold_e8_wait(&mut platform, e8_pending_wait(41), e8_normal_result())
+            .unwrap();
+        let held = state.e8_held.unwrap();
+        state.accept_e8_quiesced(held.identity, 199).unwrap();
+        let held = state.e8_held_for_action(E8RecoveryAction::Driver).unwrap();
+
+        state
+            .record_e8_forced_retired(
+                &mut platform,
+                held,
+                TerminationResult {
+                    classification: TerminationClassification::TaskGroupTeardown,
+                    application_code: 0,
+                    exception_class: 0,
+                    exception_detail: 0,
+                    exception_address: 0,
+                    cleanup_result: 0,
+                },
+            )
+            .unwrap();
+        state.consume_e8_held(held);
+
+        let tuple = crate::wyr1e8_evidence::ShellTuple {
+            console_generation: 2,
+            status_generation: 4,
+            shell_generation: 5,
+            outer_launch_transaction: 8,
+            outer_job_id: 9,
+            registry_generation: 7,
+            registry_endpoint_id: 14,
+            registry_endpoint_generation: 15,
+            shell_jobs_connection_id: 16,
+            shell_jobs_generation: 17,
+        };
+        state
+            .e8_evidence
+            .observe_serial(crate::wyr1e8_evidence::SerialFacts {
+                publication_generation: 20,
+                device_role_id: 11,
+                driver_attempt_generation: 21,
+                driver_control_endpoint_id: 22,
+                driver_control_endpoint_generation: 23,
+                driver_launch_transaction: 24,
+                supervisor_generation: 16,
+            })
+            .unwrap();
+        state.stage_e8_shell_ready(&mut platform, tuple).unwrap();
+        platform.now_after_e8_evidence = Some(200);
+        assert_eq!(
+            state.observe_e8_serial_ready(
+                &mut platform,
+                crate::wyr1e8_evidence::SerialReady {
+                    console_generation: tuple.console_generation,
+                    status_generation: tuple.status_generation,
+                    shell_generation: tuple.shell_generation,
+                    attach_transaction: 25,
+                    stream_generation: 26,
+                    bundle_generation: 19,
+                },
+            ),
+            Err(InitError::Supervision)
+        );
+        assert_eq!(state.e8_action_deadline(), Some(200));
+        assert_eq!(state.e8_pending_action(), Some(E8RecoveryAction::Driver));
+        assert_eq!(state.e8_stage(), 3);
+        assert!(state.e8_tuple_waiting_for_serial());
+        assert!(!state.e8_shell_ready());
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    #[test]
+    fn e8_registry_backoff_stops_at_the_action_deadline_without_replacement() {
+        let (mut controller, registry) = ready_registry();
+        controller
+            .fail(
+                RoleId::Registryd,
+                registry.active.generation,
+                registry.active.transaction_id,
+                10,
+                AttemptFailure::WaitFailed,
+            )
+            .unwrap();
+        controller
+            .cleanup_complete(
+                RoleId::Registryd,
+                registry.active.generation,
+                registry.active.transaction_id,
+                11,
+            )
+            .unwrap();
+        let RestartState::Backoff { deadline_ns, .. } =
+            controller.role_state(RoleId::Registryd).unwrap()
+        else {
+            panic!("registry failure must enter backoff")
+        };
+        let action_deadline = deadline_ns.checked_sub(1).unwrap();
+        let mut platform = MockPlatform::new();
+        platform.now = Some(action_deadline - 1);
+        platform.allow_wait = true;
+
+        assert_eq!(
+            advance_registry_or_exhausted_with_cap(
+                &mut platform,
+                &mut controller,
+                registry.active.transaction_id,
+                Some(action_deadline),
+            ),
+            Err(InitError::Supervision)
+        );
+        assert_eq!(platform.now, Some(action_deadline));
+        assert!(matches!(
+            controller.role_state(RoleId::Registryd),
+            Some(RestartState::Backoff { .. })
+        ));
     }
 
     #[test]
@@ -9183,14 +10246,14 @@ mod tests {
         let mut platform = ShellPlatform::new();
         platform.push(DwHandle(101), page(grant, 0, &[b"alpha", b"beta"]), &[]);
         platform.push(DwHandle(101), page(grant, 1, &[b"gamma"]), &[]);
-        preflight_wyrmsh_registry(&mut platform, DwHandle(101), grant).unwrap();
+        preflight_wyrmsh_registry(&mut platform, DwHandle(101), grant, None).unwrap();
         assert_eq!(platform.inbound_cursor, 2);
 
         let mut noncanonical = ShellPlatform::new();
         noncanonical.push(DwHandle(101), page(grant, 0, &[b"alpha", b"beta"]), &[]);
         noncanonical.push(DwHandle(101), page(grant, 1, &[b"aardvark"]), &[]);
         assert_eq!(
-            preflight_wyrmsh_registry(&mut noncanonical, DwHandle(101), grant),
+            preflight_wyrmsh_registry(&mut noncanonical, DwHandle(101), grant, None),
             Err(InitError::WrongManifestProfile)
         );
     }
@@ -9370,7 +10433,7 @@ mod tests {
         stage: u32,
         action: &str,
         token: &str,
-    ) -> Result<Option<E8Trigger>, InitError> {
+    ) -> Result<Option<E8TriggerIdentity>, InitError> {
         let reservation = LaunchReservation {
             connection_id: 9,
             generation: 10,
@@ -9426,7 +10489,7 @@ mod tests {
         ] {
             assert_eq!(
                 classify_e8_trigger_for_test(stage, action, token),
-                Ok(Some(E8Trigger {
+                Ok(Some(E8TriggerIdentity {
                     launch_transaction: 11,
                     job_id: 12,
                     action: expected,
@@ -9781,6 +10844,8 @@ mod tests {
                 reservation(1),
                 loaded,
                 release,
+                #[cfg(feature = "wyr1e8-selector33")]
+                None,
             ),
             Err(InitError::Native(FAILURE))
         );
@@ -10444,6 +11509,7 @@ mod tests {
                 &mut controller,
                 authority,
                 &bootfs,
+                None,
             ),
             Err(InitError::Loader(LoadError::Platform {
                 stage: wyrmroot_loader::process::LoadStage::InitSend,
@@ -10699,6 +11765,39 @@ mod tests {
             [DwHandle(32), DwHandle(31), DwHandle(30), DwHandle(33)]
         );
         assert!(controller.resources(RoleId::Registryd).is_none());
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    #[test]
+    fn expired_topology_handoff_cleans_owned_registry_without_restart() {
+        let (mut controller, registry) = ready_registry();
+        let mut topology = RegistryTopology::new(1).unwrap();
+        let mut platform = MockPlatform::new();
+        platform.now = Some(200);
+        let mut waits = TerminalWaits;
+
+        assert_eq!(
+            restart_topology_or_poison_before(
+                &mut platform,
+                &mut waits,
+                &mut controller,
+                &mut topology,
+                registry,
+                Some(200),
+            ),
+            Err(InitError::Supervision)
+        );
+        assert_eq!(topology.generation(), 1);
+        assert_eq!(platform.terminate_count, 1);
+        assert_eq!(
+            &platform.closed[..platform.close_count],
+            &[DwHandle(32), DwHandle(31), DwHandle(30), DwHandle(33)]
+        );
+        assert!(controller.resources(RoleId::Registryd).is_none());
+        assert!(matches!(
+            controller.role_state(RoleId::Registryd),
+            Some(RestartState::Backoff { .. })
+        ));
     }
 
     #[test]

@@ -31,7 +31,7 @@ fn record(
     handles: &[DwReceivedHandleInfoV1],
 ) {
     state
-        .record_e8_shell_jobs(platform, request, response, handles)
+        .record_e8_shell_jobs(platform, request, response, handles, None)
         .unwrap();
 }
 
@@ -556,11 +556,59 @@ fn actual_dispatcher_emits_s2_driver_trigger_record_after_accepted_prefix() {
     assert_eq!(
         context.state.e8_trigger,
         Some(E8Trigger {
-            launch_transaction: reservation.transaction_id,
-            job_id: loaded.job_id,
-            action: E8RecoveryAction::Driver,
+            identity: E8TriggerIdentity {
+                launch_transaction: reservation.transaction_id,
+                job_id: loaded.job_id,
+                action: E8RecoveryAction::Driver,
+            },
+            deadline: 10 + WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns,
         })
     );
+
+    let accepted_request = request[..request_len].to_vec();
+    let accepted_reply_count = platform.sent.len();
+    let accepted_evidence_count = platform.e8_evidence.len();
+    let duplicate = transaction(s2_grant, 2);
+    let duplicate_len = wyrmroot_launch_proto::encode_launch(
+        duplicate,
+        path,
+        &[
+            path,
+            wyrmroot_wyr1e_test_actors::RECOVERY_DRIVER_ACTION,
+            token.as_str(),
+        ],
+        &[],
+        true,
+        &mut request,
+    )
+    .unwrap();
+    platform.push(
+        session,
+        request[..duplicate_len].to_vec(),
+        &handles.map(|info| info.handle),
+    );
+    let closed_before_duplicate = platform.closed.len();
+    assert_eq!(
+        dispatch_one_job_request_with_shell(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            LoadAuthority {
+                parent_root: DwHandle(1),
+                bootfs: DwHandle(2),
+                task_group: DwHandle(3),
+            },
+            Some(&policy),
+            &mut jobs,
+            session,
+            s2_grant,
+            &mut context,
+        ),
+        Err(InitError::Accounting)
+    );
+    assert_eq!(platform.sent.len(), accepted_reply_count);
+    assert_eq!(platform.e8_evidence.len(), accepted_evidence_count);
+    assert_eq!(platform.closed.len(), closed_before_duplicate + 3);
 
     let response = platform.sent.last().unwrap().1.as_slice();
     assert!(matches!(
@@ -597,7 +645,7 @@ fn actual_dispatcher_emits_s2_driver_trigger_record_after_accepted_prefix() {
     }
     std::println!(
         "E8FIXTURE_REQUEST={}",
-        lowercase_hex(&request[..request_len])
+        lowercase_hex(&accepted_request)
     );
     std::println!("E8FIXTURE_RESPONSE={}", lowercase_hex(response));
     let mut handle_shape = String::new();
