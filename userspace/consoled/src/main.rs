@@ -1552,6 +1552,21 @@ fn event_loop(
                 continue;
             }
             3 => {
+                #[cfg(feature = "wyr1e-wyrmsh")]
+                if signals & DW_SIGNAL_PEER_CLOSED.0 != 0 && child.wait.is_some() {
+                    recover_terminal_precursor(
+                        authorities,
+                        transactions,
+                        model,
+                        &mut streams,
+                        &mut serial,
+                        &mut child,
+                        &mut input_pending,
+                        &mut output_pending,
+                    )?;
+                    next_data = DataClass::Raw;
+                    continue;
+                }
                 let fault = if signals & DW_SIGNAL_PEER_CLOSED.0 != 0 {
                     ChildFault::Peer(StreamKind::Stdin)
                 } else {
@@ -1572,6 +1587,21 @@ fn event_loop(
                 continue;
             }
             4 | 5 => {
+                #[cfg(feature = "wyr1e-wyrmsh")]
+                if child.wait.is_some() {
+                    recover_terminal_precursor(
+                        authorities,
+                        transactions,
+                        model,
+                        &mut streams,
+                        &mut serial,
+                        &mut child,
+                        &mut input_pending,
+                        &mut output_pending,
+                    )?;
+                    next_data = DataClass::Raw;
+                    continue;
+                }
                 let kind = if observed.index == 4 {
                     StreamKind::Stdout
                 } else {
@@ -1591,6 +1621,21 @@ fn event_loop(
                 continue;
             }
             6 if child.status.is_some() => {
+                #[cfg(feature = "wyr1e-wyrmsh")]
+                if signals & DW_SIGNAL_PEER_CLOSED.0 != 0 && child.wait.is_some() {
+                    recover_terminal_precursor(
+                        authorities,
+                        transactions,
+                        model,
+                        &mut streams,
+                        &mut serial,
+                        &mut child,
+                        &mut input_pending,
+                        &mut output_pending,
+                    )?;
+                    next_data = DataClass::Raw;
+                    continue;
+                }
                 let failed = if signals & DW_SIGNAL_PEER_CLOSED.0 != 0 {
                     true
                 } else if signals & DW_SIGNAL_READABLE.0 != 0 {
@@ -1814,14 +1859,16 @@ fn drain_clean_terminal_output(
     child: &mut ChildSession,
     output_pending: &mut Pending,
 ) -> Result<(), u32> {
-    let wait = child.wait.take().ok_or(61u32)?;
-    if receive_launch(authorities.launch, wait)? != LaunchReply::JobResult(child.job_id) {
-        return Err(61);
-    }
     let deadline = monotonic_active_now()
         .map_err(|_| 53u32)?
         .checked_add(TERMINAL_DRAIN_TIMEOUT_NS)
         .ok_or(54u32)?;
+    let wait = child.wait.take().ok_or(61u32)?;
+    if receive_launch_before(authorities.launch, wait, deadline)?
+        != LaunchReply::JobResult(child.job_id)
+    {
+        return Err(61);
+    }
     let mut stdout_eof = false;
     let mut stderr_eof = false;
     loop {
@@ -1914,6 +1961,36 @@ fn drain_clean_terminal_output(
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "wyr1e-wyrmsh")]
+#[allow(clippy::too_many_arguments)]
+fn recover_terminal_precursor(
+    authorities: StartupAuthorities,
+    transactions: &mut TransactionIds,
+    model: &mut ConsoleModel,
+    streams: &mut NativeStreams,
+    serial: &mut SerialSession,
+    child: &mut ChildSession,
+    input_pending: &mut Pending,
+    output_pending: &mut Pending,
+) -> Result<(), u32> {
+    if !matches!(
+        model.child_terminal_precursor(child.event, now_millis()?),
+        Ok(RecoveryAction::None)
+    ) {
+        return Err(62);
+    }
+    drain_clean_terminal_output(authorities, model, streams, serial, child, output_pending)?;
+    recover_terminal_child(
+        authorities,
+        transactions,
+        model,
+        serial,
+        child,
+        input_pending,
+        output_pending,
+    )
 }
 
 #[cfg(feature = "wyr1e8-recovery")]
@@ -2390,6 +2467,29 @@ fn receive_launch(channel: DwHandle, expected: LaunchReservation) -> Result<Laun
     Ok(reply)
 }
 
+fn receive_launch_before(
+    channel: DwHandle,
+    expected: LaunchReservation,
+    deadline: u64,
+) -> Result<LaunchReply, u32> {
+    let observed = wait_one(
+        channel,
+        DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+        DwDeadline(deadline),
+    )
+    .map_err(|_| 64u32)?;
+    if observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0
+        || observed.observed.0 & DW_SIGNAL_READABLE.0 == 0
+    {
+        return Err(64);
+    }
+    let (reservation, reply) = receive_launch_ready(channel)?;
+    if reservation != expected {
+        return Err(79);
+    }
+    Ok(reply)
+}
+
 fn receive_initial_launch(
     channel: DwHandle,
     expected: LaunchReservation,
@@ -2519,6 +2619,10 @@ fn send_status_bounded(
 
 fn receive_launch_any(channel: DwHandle) -> Result<(LaunchReservation, LaunchReply), u32> {
     wait_readable(channel).map_err(|_| 75u32)?;
+    receive_launch_ready(channel)
+}
+
+fn receive_launch_ready(channel: DwHandle) -> Result<(LaunchReservation, LaunchReply), u32> {
     let mut bytes = [0u8; 128];
     let mut handles = [DwReceivedHandleInfoV1::default(); 1];
     let counts = receive_channel(channel, &mut bytes, &mut handles).map_err(|_| 76u32)?;

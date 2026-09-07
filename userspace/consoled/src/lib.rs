@@ -1062,6 +1062,18 @@ impl ConsoleModel {
         self.state = ConnectionState::AwaitingReap;
         Ok(RecoveryAction::ReapChild(event.child_job))
     }
+    /// Records that a child role closed while its authoritative terminal WAIT
+    /// is still pending. The native controller must consume that exact result
+    /// and drain committed output before publishing retirement.
+    pub fn child_terminal_precursor(
+        &mut self,
+        event: EventGeneration,
+        now: u64,
+    ) -> Result<RecoveryAction, ModelError> {
+        self.time(now)?;
+        self.require_current(event)?;
+        Ok(RecoveryAction::None)
+    }
     pub fn child_peer_closed(
         &mut self,
         event: EventGeneration,
@@ -2054,25 +2066,51 @@ mod tests {
     }
 
     #[test]
-    fn clean_terminal_drains_committed_output_before_volatile_retirement() {
+    fn terminal_precursor_preserves_lf_until_commit_before_replacement_prompt() {
         let (mut model, event) = live();
         model
             .stage_child_output(event, OutputSource::Stdout, b"\n")
             .unwrap();
+        let staged = model.snapshot();
+        assert_eq!(
+            model.child_terminal_precursor(event, 1),
+            Ok(RecoveryAction::None)
+        );
+        assert_eq!(model.snapshot(), staged);
+
+        let mut serial = std::vec::Vec::new();
         let mut bytes = [0u8; 8];
         let committed = model.reserve_serial_tx(&mut bytes).unwrap().unwrap();
         assert_eq!(&bytes[..committed.length()], b"\r\n");
+        serial.extend_from_slice(&bytes[..committed.length()]);
         model.commit_serial_tx(committed).unwrap();
         assert_eq!(model.snapshot().stdout_queued, 0);
         assert!(matches!(
-            model.child_terminal(event, 1),
+            model.child_terminal(event, 2),
             Ok(RecoveryAction::ReapChild(job)) if job == event.child_job
         ));
-        model.child_streams_closed(event, 1).unwrap();
+        model.child_streams_closed(event, 2).unwrap();
         assert_eq!(
-            model.child_reaped(event, 1),
+            model.child_reaped(event, 2),
             Ok(RecoveryAction::ReplaceChild)
         );
+
+        let mut launch = model.begin_child_launch(200).unwrap();
+        for kind in [StreamKind::Stdin, StreamKind::Stdout, StreamKind::Stderr] {
+            launch.move_child_peer(kind).unwrap();
+        }
+        let replacement = model.commit_child_launch(&mut launch, 201).unwrap();
+        model
+            .stage_child_output(
+                EventGeneration::from(replacement.ids),
+                OutputSource::Stdout,
+                b"\r\x1b[2K",
+            )
+            .unwrap();
+        let prompt = model.reserve_serial_tx(&mut bytes).unwrap().unwrap();
+        serial.extend_from_slice(&bytes[..prompt.length()]);
+        assert_eq!(&serial[..2], b"\r\n");
+        assert_eq!(&serial[2..], b"\r\x1b[2K");
     }
     #[test]
     fn launch_binds_caller_supplied_transaction_and_accepted_job() {

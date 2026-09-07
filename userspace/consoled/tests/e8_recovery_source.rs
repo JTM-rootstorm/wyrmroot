@@ -76,7 +76,14 @@ fn clean_terminal_result_drains_child_output_before_reap_and_relaunch() {
     let commit = drain_body
         .find("commit_output(model, output_pending)?")
         .unwrap();
-    assert!(job_result < deadline && deadline < stdout && stdout < stderr && stderr < commit);
+    assert!(deadline < job_result && job_result < stdout && stdout < stderr && stderr < commit);
+
+    let bounded_receive = &NATIVE[NATIVE.find("fn receive_launch_before(").unwrap()
+        ..NATIVE.find("fn receive_initial_launch(").unwrap()];
+    assert!(bounded_receive.contains("DwDeadline(deadline)"));
+    assert!(bounded_receive.contains("DW_SIGNAL_READABLE"));
+    assert!(bounded_receive.contains("DW_SIGNAL_PEER_CLOSED"));
+    assert!(bounded_receive.contains("receive_launch_ready(channel)?"));
 
     let recover_body = &NATIVE[NATIVE.find("fn recover_terminal_child(").unwrap()
         ..NATIVE.find("fn recover_child(").unwrap()];
@@ -84,4 +91,23 @@ fn clean_terminal_result_drains_child_output_before_reap_and_relaunch() {
     assert!(recover_body.contains("model.child_terminal"));
     assert!(recover_body.contains("close_reaped_job"));
     assert!(recover_body.contains("*child = launch_child"));
+}
+
+#[test]
+fn role_peer_close_with_pending_wait_uses_terminal_precursor_before_fault_retirement() {
+    let loop_body = &NATIVE[NATIVE.find("fn event_loop(").unwrap()
+        ..NATIVE.find("fn drain_clean_terminal_output(").unwrap()];
+    assert_eq!(loop_body.matches("recover_terminal_precursor(").count(), 3);
+    assert!(loop_body.contains("signals & DW_SIGNAL_PEER_CLOSED.0 != 0 && child.wait.is_some()"));
+    assert!(loop_body.contains("4 | 5 => {"));
+    assert!(loop_body.contains("6 if child.status.is_some() => {"));
+
+    let precursor = &NATIVE[NATIVE.find("fn recover_terminal_precursor(").unwrap()
+        ..NATIVE.find("fn receive_recovery_request(").unwrap()];
+    let observe = precursor.find("model.child_terminal_precursor").unwrap();
+    let drain = precursor.find("drain_clean_terminal_output(").unwrap();
+    let recover = precursor.find("recover_terminal_child(").unwrap();
+    assert!(observe < drain && drain < recover);
+    assert!(!precursor.contains("recover_child("));
+    assert!(!precursor.contains("clear_volatile"));
 }
