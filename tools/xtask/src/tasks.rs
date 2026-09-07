@@ -1325,6 +1325,11 @@ fn stderr_suffix(output: &Output) -> String {
 }
 
 pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<(), Failure> {
+    if matches!(filter, Some("wyr1e8-producer-fixture")) {
+        let arguments = wyr1e8_producer_fixture_command();
+        let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+        return run_cargo(repository, &arguments);
+    }
     if matches!(filter, Some("wyr1c4" | "wyr1c4-native")) {
         // WYR1-C4 is a guest-target compilation gate. The pinned host compiler
         // intentionally does not know the x86_64-unknown-wyrmroot built-in
@@ -1371,6 +1376,25 @@ pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<
         run_cargo(repository, &arguments)?;
     }
     Ok(())
+}
+
+fn wyr1e8_producer_fixture_command() -> Vec<String> {
+    [
+        "test",
+        "--locked",
+        "--offline",
+        "--package",
+        "wyrmroot-system-init",
+        "--features",
+        "wyr1e8-selector33",
+        "--lib",
+        "wyr1b_native::tests::e8_producer_fixture::actual_dispatcher_emits_s2_driver_trigger_record_after_accepted_prefix",
+        "--",
+        "--exact",
+        "--nocapture",
+    ]
+    .map(str::to_owned)
+    .into()
 }
 
 fn host_test_commands(filter: Option<&str>) -> Result<Vec<Vec<String>>, Failure> {
@@ -1773,6 +1797,7 @@ mod tests {
         encoded_uefi_rustflags_for_target, explicit_test_filter, host_test_arguments,
         host_test_commands, prepare_uefi_target_roots, render_uefi_inspection_report,
         run_verified_report, validate_regular_artifact, validate_uefi_inspection_report,
+        wyr1e8_producer_fixture_command,
     };
     use crate::error::Failure;
     use crate::sha256::bytes_digest;
@@ -1973,6 +1998,28 @@ mod tests {
                 arguments == ["--features", "native-consoled,wyr1e-wyrmsh,wyr1e8-recovery"]
             }));
         }
+    }
+
+    #[test]
+    fn wyr1e8_producer_fixture_filter_is_exact_and_preserves_output() {
+        assert_eq!(
+            wyr1e8_producer_fixture_command(),
+            [
+                "test",
+                "--locked",
+                "--offline",
+                "--package",
+                "wyrmroot-system-init",
+                "--features",
+                "wyr1e8-selector33",
+                "--lib",
+                "wyr1b_native::tests::e8_producer_fixture::actual_dispatcher_emits_s2_driver_trigger_record_after_accepted_prefix",
+                "--",
+                "--exact",
+                "--nocapture",
+            ]
+            .map(str::to_owned)
+        );
     }
 
     #[test]

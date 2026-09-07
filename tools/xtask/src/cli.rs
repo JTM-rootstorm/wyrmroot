@@ -40,6 +40,7 @@ Usage:
     tools/pinned-cargo xtask test host wyr1e8-actors-native
     tools/pinned-cargo xtask test host wyr1e8-product-model
     tools/pinned-cargo xtask test host wyr1e8-product-clippy
+    tools/pinned-cargo xtask test host wyr1e8-producer-fixture
     cargo xtask test guest [filter]
     cargo xtask test integration wyr0 [default|smp] --request <wyr0-h-request.toml>
     tools/pinned-cargo xtask wyr1 image --request <wyr1-a-request.toml>
@@ -100,6 +101,7 @@ WYR1-E8 model/clippy covers the current recovery services, two additive actors, 
 wyr1e8-native compiles that exact selected E8 native artifact set.
 wyr1e8-actors-native compiles and inspects only the two product-owned E8 actors.
 wyr1e8-product-model and wyr1e8-product-clippy validate product-owned E8 host code.
+wyr1e8-producer-fixture emits the bounded actual-dispatcher S2 trigger record and its modeled accepted prefix.
 These E3-E7 filters do not create a product or run a guest.
 
 The WYR0-H request path builds and inspects the exact init0/hello bootfs and

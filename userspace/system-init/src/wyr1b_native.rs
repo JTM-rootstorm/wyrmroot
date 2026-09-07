@@ -5604,6 +5604,8 @@ mod tests {
         evidence: Vec<[u8; crate::wyr1e7_evidence::RECORD_BYTES]>,
         #[cfg(feature = "wyr1e-selector33")]
         fail_evidence: bool,
+        #[cfg(feature = "wyr1e8-selector33")]
+        e8_evidence: Vec<[u8; crate::wyr1e8_evidence::RECORD_BYTES]>,
     }
 
     impl ShellPlatform {
@@ -5785,6 +5787,15 @@ mod tests {
                 return Err(FAILURE);
             }
             self.evidence.push(*record);
+            Ok(())
+        }
+
+        #[cfg(feature = "wyr1e8-selector33")]
+        fn submit_wyr1e8_evidence(
+            &mut self,
+            record: &[u8; crate::wyr1e8_evidence::RECORD_BYTES],
+        ) -> Result<(), NativeError> {
+            self.e8_evidence.push(*record);
             Ok(())
         }
     }
@@ -6354,6 +6365,7 @@ mod tests {
     /// exited, exactly like the live post-READY release wait.
     struct AcceptedJobV2Waits {
         transaction_id: u64,
+        profile: LaunchProfile,
         exited: bool,
     }
 
@@ -6379,7 +6391,7 @@ mod tests {
             _handles: &mut [DwReceivedHandleInfoV1],
         ) -> Result<ReceiveCounts, Self::Error> {
             let size = wyrmroot_loader::launch::encode_ready_for_profile(
-                LaunchProfile::JobV2,
+                self.profile,
                 self.transaction_id,
                 bytes,
             )
@@ -10167,6 +10179,7 @@ mod tests {
         platform.task_group = Some(DwHandle(77));
         let mut waits = AcceptedJobV2Waits {
             transaction_id: reservation(1).transaction_id,
+            profile: LaunchProfile::JobV2,
             exited: false,
         };
         let mut loader = InitSendLoader::new();
@@ -10953,6 +10966,11 @@ mod tests {
             expect_gate(stale, expected),
             Err(InitError::Wyr1BGateMismatch)
         );
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    mod e8_producer_fixture {
+        include!("wyr1e8_producer_fixture.rs");
     }
 
     #[test]
