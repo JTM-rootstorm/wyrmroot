@@ -4458,7 +4458,13 @@ where
         let state = evidence
             .as_deref_mut()
             .ok_or(InitError::WrongActivationOrder)?;
-        if state.e8_wait_is_held(pending)? || state.hold_e8_wait(system, pending, result)? {
+        if e8_operation(
+            E8FailureOperation::TriggerWait,
+            state.e8_wait_is_held(pending),
+        )? || e8_operation(
+            E8FailureOperation::TriggerWait,
+            state.hold_e8_wait(system, pending, result),
+        )? {
             return Ok(());
         }
     }

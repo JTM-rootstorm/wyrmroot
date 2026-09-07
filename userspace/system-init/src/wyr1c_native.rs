@@ -3167,21 +3167,38 @@ where
                                         feature = "wyr1d-selector32"
                                     ))]
                                     {
-                                        let state = resident
-                                            .wyr1c
-                                            .as_ref()
-                                            .ok_or(InitError::WrongActivationOrder)?;
-                                        let request = state
-                                            .last_reaped_driver
-                                            .ok_or(InitError::WrongActivationOrder)?;
-                                        parse_driver_retired(&bytes, request)
-                                            .map_err(|_| InitError::WrongManifestProfile)?;
-                                        #[cfg(feature = "wyr1d-selector32")]
-                                        return selector32::observe_driver_retired(
-                                            resident, request,
+                                        let retired = (|| {
+                                            let state = resident
+                                                .wyr1c
+                                                .as_ref()
+                                                .ok_or(InitError::WrongActivationOrder)?;
+                                            let request = state
+                                                .last_reaped_driver
+                                                .ok_or(InitError::WrongActivationOrder)?;
+                                            parse_driver_retired(&bytes, request)
+                                                .map_err(|_| InitError::WrongManifestProfile)?;
+                                            #[cfg(feature = "wyr1d-selector32")]
+                                            return selector32::observe_driver_retired(
+                                                resident, request,
+                                            );
+                                            #[cfg(not(feature = "wyr1d-selector32"))]
+                                            {
+                                                let rebound =
+                                                    rebind_publication(resident, system, waits);
+                                                #[cfg(feature = "wyr1e8-selector33")]
+                                                let rebound = e8_operation(
+                                                    E8FailureOperation::RebindPublication,
+                                                    rebound,
+                                                );
+                                                rebound
+                                            }
+                                        })();
+                                        #[cfg(feature = "wyr1e8-selector33")]
+                                        let retired = e8_operation(
+                                            E8FailureOperation::DriverRetired,
+                                            retired,
                                         );
-                                        #[cfg(not(feature = "wyr1d-selector32"))]
-                                        rebind_publication(resident, system, waits)
+                                        retired
                                     }
                                     #[cfg(not(any(
                                         feature = "wyr1c6-production",
@@ -3213,16 +3230,40 @@ where
                                 });
                             }
                             #[cfg(feature = "wyr1e-production")]
-                            wyr1e::retire_dependents(resident, system, waits, false)?;
-                            let _request = reap_driver(resident, system, waits, false)?;
+                            let dependent_retirement =
+                                wyr1e::retire_dependents(resident, system, waits, false);
+                            #[cfg(all(
+                                feature = "wyr1e-production",
+                                feature = "wyr1e8-selector33"
+                            ))]
+                            let dependent_retirement = e8_operation(
+                                E8FailureOperation::RetireDependents,
+                                dependent_retirement,
+                            );
+                            #[cfg(feature = "wyr1e-production")]
+                            dependent_retirement?;
+                            let _request = reap_driver(resident, system, waits, false);
+                            #[cfg(feature = "wyr1e8-selector33")]
+                            let _request = e8_operation(E8FailureOperation::ReapDriver, _request)?;
+                            #[cfg(not(feature = "wyr1e8-selector33"))]
+                            let _request = _request?;
                             #[cfg(feature = "wyr1e-production")]
                             {
-                                let state = resident
-                                    .wyr1c
-                                    .as_ref()
-                                    .ok_or(InitError::WrongActivationOrder)?;
-                                let devmgr = state.devmgr.ok_or(InitError::WrongActivationOrder)?;
-                                acknowledge_driver_reaped(system, devmgr, _request)
+                                let acknowledged = (|| {
+                                    let state = resident
+                                        .wyr1c
+                                        .as_ref()
+                                        .ok_or(InitError::WrongActivationOrder)?;
+                                    let devmgr =
+                                        state.devmgr.ok_or(InitError::WrongActivationOrder)?;
+                                    acknowledge_driver_reaped(system, devmgr, _request)
+                                })();
+                                #[cfg(feature = "wyr1e8-selector33")]
+                                let acknowledged = e8_operation(
+                                    E8FailureOperation::AcknowledgeReaped,
+                                    acknowledged,
+                                );
+                                acknowledged
                             }
                             #[cfg(not(feature = "wyr1e-production"))]
                             {

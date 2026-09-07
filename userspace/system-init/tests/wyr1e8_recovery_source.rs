@@ -55,7 +55,7 @@ fn e8_holds_the_real_terminal_wait_until_exact_quiescence_and_cleanup() {
         ..JOBS.find("fn cleanup_session_owner").unwrap()];
     let terminal = service.find("result_for_owner").unwrap();
     let held = service
-        .find("state.hold_e8_wait(system, pending, result)?")
+        .find("state.hold_e8_wait(system, pending, result)")
         .unwrap();
     let send = service
         .find("system.send_channel(session, &response[..size])")
@@ -132,4 +132,66 @@ fn forced_retirement_disconnects_then_removes_only_the_held_barrier_result() {
     assert!(remove_body.contains("pending.grant.endpoint_id"));
     assert!(remove_body.contains("pending.grant.endpoint_generation"));
     assert!(remove_body.contains("pending.job_id"));
+}
+
+#[test]
+fn e8_failure_detail_is_bound_to_each_actual_transition_join() {
+    let main = include_str!("../src/main.rs");
+    let lib = include_str!("../src/lib.rs");
+    let jobs = include_str!("../src/wyr1b_native.rs");
+    let console = include_str!("../src/wyr1e_native.rs");
+    let driver = include_str!("../src/wyr1c_native.rs");
+
+    assert!(main.contains("resident_tick_failure_application_status(&error)"));
+    assert!(lib.contains("0xAF18_0000 | (operation as u32) << 8 | kind as u32"));
+    let held_wait_start = jobs
+        .find("if scope == LaunchSessionScope::ShellJobs")
+        .unwrap();
+    let held_wait_end = held_wait_start
+        + jobs[held_wait_start..]
+            .find("let terminal = controller_result_to_wire(result)")
+            .unwrap();
+    let held_wait = &jobs[held_wait_start..held_wait_end];
+    assert_eq!(
+        held_wait.matches("E8FailureOperation::TriggerWait").count(),
+        2
+    );
+
+    let quiesced = &console[console.find("Message::Quiesced(identity)").unwrap()
+        ..console.find("Message::Quiesce(_)").unwrap()];
+    for operation in [
+        "E8FailureOperation::Quiesced",
+        "E8FailureOperation::RequestRetire",
+    ] {
+        assert!(quiesced.contains(operation));
+    }
+
+    let driver_retired_start = driver
+        .find("Ok(DevmgrControlInput::DriverRetired { bytes })")
+        .unwrap();
+    let driver_retired_end = driver_retired_start
+        + driver[driver_retired_start..]
+            .find("ResidentPollEvent::RegistryLost")
+            .unwrap();
+    let driver_retired = &driver[driver_retired_start..driver_retired_end];
+    for operation in [
+        "E8FailureOperation::DriverRetired",
+        "E8FailureOperation::RebindPublication",
+    ] {
+        assert!(driver_retired.contains(operation));
+    }
+
+    let driver_exited_start = driver.find("ResidentPollEvent::DriverExited =>").unwrap();
+    let driver_exited_end = driver_exited_start
+        + driver[driver_exited_start..]
+            .find("ResidentPollEvent::ProbeControlReadable")
+            .unwrap();
+    let driver_exited = &driver[driver_exited_start..driver_exited_end];
+    for operation in [
+        "E8FailureOperation::RetireDependents",
+        "E8FailureOperation::ReapDriver",
+        "E8FailureOperation::AcknowledgeReaped",
+    ] {
+        assert!(driver_exited.contains(operation));
+    }
 }

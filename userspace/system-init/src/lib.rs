@@ -113,6 +113,105 @@ pub const fn fatal_application_status(_error: &InitError) -> InitApplicationStat
     InitApplicationStatus::FatalRebootRequired
 }
 
+/// E8-only operation that most narrowly returned an error during the bounded
+/// driver-recovery transition. These values are private diagnostic evidence,
+/// not protocol or application-status ABI.
+#[cfg(feature = "wyr1e8-selector33")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum E8FailureOperation {
+    TriggerWait = 0x01,
+    Quiesced = 0x02,
+    RequestRetire = 0x03,
+    RetireDependents = 0x04,
+    ReapDriver = 0x05,
+    AcknowledgeReaped = 0x06,
+    DriverRetired = 0x07,
+    RebindPublication = 0x08,
+}
+
+#[cfg(feature = "wyr1e8-selector33")]
+const fn e8_failure_kind(error: &InitError) -> u8 {
+    match error {
+        InitError::WrongActivationOrder => 0x01,
+        InitError::Accounting | InitError::Wyr1BModel(_) => 0x02,
+        InitError::Supervision => 0x03,
+        InitError::Cleanup => 0x04,
+        InitError::Native(_) => 0x05,
+        InitError::WrongManifestProfile
+        | InitError::ResourceIdentityMismatch
+        | InitError::InvalidResourceHandle
+        | InitError::Capability(_)
+        | InitError::RegistryProtocol(_)
+        | InitError::Wyr1BGateProtocol(_)
+        | InitError::Wyr1BGateMismatch => 0x06,
+        InitError::UnlaunchableRole
+        | InitError::Bootfs(_)
+        | InitError::MissingRetainedMaterial
+        | InitError::NonExecutableRole
+        | InitError::Manifest(_)
+        | InitError::ArtifactIdentityMismatch(_)
+        | InitError::Mapping(_)
+        | InitError::Launch(_)
+        | InitError::Loader(_) => 0x07,
+        InitError::GateConfig(_)
+        | InitError::Evidence(_)
+        | InitError::Wyr1BGateConfig(_)
+        | InitError::Wyr1BEvidence(_) => 0x08,
+        #[cfg(feature = "wyr1b-test-evidence")]
+        InitError::StartupMapping(_) | InitError::OrdinaryMapping(_) => 0x07,
+        #[cfg(feature = "wyr1c6-selector29")]
+        InitError::Wyr1C6GateConfig(_) => 0x08,
+        InitError::E8Transition { kind, .. } => *kind,
+        InitError::MissingAttemptResources
+        | InitError::ResourcesAlreadyInstalled
+        | InitError::Restart(_)
+        | InitError::ZeroBootGeneration => 0x0f,
+    }
+}
+
+#[cfg(feature = "wyr1e8-selector33")]
+pub(crate) fn e8_operation<T>(
+    operation: E8FailureOperation,
+    result: Result<T, InitError>,
+) -> Result<T, InitError> {
+    result.map_err(|error| match error {
+        InitError::E8Transition { .. } => error,
+        _ => InitError::E8Transition {
+            operation: operation as u8,
+            kind: e8_failure_kind(&error),
+        },
+    })
+}
+
+/// Application detail for a fatal resident tick. E8 records the narrow
+/// operation that returned `Err`; every other build preserves the established
+/// coarse resident failure code.
+#[must_use]
+pub const fn resident_tick_failure_application_status(error: &InitError) -> u32 {
+    #[cfg(feature = "wyr1e8-selector33")]
+    {
+        let (operation, kind) = match error {
+            InitError::E8Transition { operation, kind } => (*operation, *kind),
+            _ => (0x0f, e8_failure_kind(error)),
+        };
+        let operation = match operation {
+            0x01..=0x08 | 0x0f => operation,
+            _ => 0x0f,
+        };
+        let kind = match kind {
+            0x01..=0x08 | 0x0f => kind,
+            _ => 0x0f,
+        };
+        0xAF18_0000 | (operation as u32) << 8 | kind as u32
+    }
+    #[cfg(not(feature = "wyr1e8-selector33"))]
+    {
+        let _ = error;
+        0xAF01_0006
+    }
+}
+
 /// Test-only application status that preserves the top-level init failure
 /// category across the selector's process-exit boundary. These values are
 /// diagnostic evidence, not part of the production application-status ABI.
@@ -159,6 +258,8 @@ const fn test_failure_category(error: &InitError) -> u32 {
         InitError::Wyr1BEvidence(_) => 0x1e,
         #[cfg(feature = "wyr1c6-selector29")]
         InitError::Wyr1C6GateConfig(_) => 0x1f,
+        #[cfg(feature = "wyr1e8-selector33")]
+        InitError::E8Transition { .. } => 0x20,
     }
 }
 
@@ -800,6 +901,11 @@ pub enum InitError {
     Wyr1BEvidence(wyr1b_gate::GateError),
     #[cfg(feature = "wyr1c6-selector29")]
     Wyr1C6GateConfig(wyr1c6_gate::GateError),
+    #[cfg(feature = "wyr1e8-selector33")]
+    E8Transition {
+        operation: u8,
+        kind: u8,
+    },
 }
 
 impl From<RestartTransitionError> for InitError {
@@ -3704,6 +3810,91 @@ mod native_cleanup_tests {
             InitApplicationStatus::FatalRebootRequired
         );
         assert_eq!(fatal_application_status(&error) as u32, 0xAF01_0002);
+    }
+
+    #[test]
+    fn resident_tick_failure_detail_preserves_the_selected_profile() {
+        #[cfg(not(feature = "wyr1e8-selector33"))]
+        assert_eq!(
+            resident_tick_failure_application_status(&InitError::Accounting),
+            0xAF01_0006
+        );
+
+        #[cfg(feature = "wyr1e8-selector33")]
+        assert_eq!(
+            resident_tick_failure_application_status(&InitError::Accounting),
+            0xAF18_0F02
+        );
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    #[test]
+    fn e8_failure_detail_is_finite_unique_and_keeps_the_narrowest_operation() {
+        for operation in [
+            E8FailureOperation::TriggerWait,
+            E8FailureOperation::Quiesced,
+            E8FailureOperation::RequestRetire,
+            E8FailureOperation::RetireDependents,
+            E8FailureOperation::ReapDriver,
+            E8FailureOperation::AcknowledgeReaped,
+            E8FailureOperation::DriverRetired,
+            E8FailureOperation::RebindPublication,
+        ] {
+            let error = e8_operation::<()>(operation, Err(InitError::Cleanup)).unwrap_err();
+            assert_eq!(
+                resident_tick_failure_application_status(&error),
+                0xAF18_0004 | (operation as u32) << 8
+            );
+        }
+
+        for (error, expected_kind) in [
+            (InitError::WrongActivationOrder, 0x01),
+            (InitError::Accounting, 0x02),
+            (InitError::Supervision, 0x03),
+            (InitError::Cleanup, 0x04),
+            (
+                InitError::Native(NativeError::Status(deepwyrm_syscall::DwStatus(-11))),
+                0x05,
+            ),
+            (InitError::WrongManifestProfile, 0x06),
+            (InitError::UnlaunchableRole, 0x07),
+            (
+                InitError::Evidence(evidence::EvidenceError::AlreadyTerminal),
+                0x08,
+            ),
+            (InitError::ZeroBootGeneration, 0x0f),
+        ] {
+            let error =
+                e8_operation::<()>(E8FailureOperation::TriggerWait, Err(error)).unwrap_err();
+            assert_eq!(
+                resident_tick_failure_application_status(&error),
+                0xAF18_0100 | expected_kind
+            );
+        }
+
+        let nested = e8_operation(
+            E8FailureOperation::DriverRetired,
+            e8_operation::<()>(
+                E8FailureOperation::RebindPublication,
+                Err(InitError::Cleanup),
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(
+            resident_tick_failure_application_status(&nested),
+            0xAF18_0804
+        );
+        assert_eq!(
+            resident_tick_failure_application_status(&InitError::E8Transition {
+                operation: 0,
+                kind: 0,
+            }),
+            0xAF18_0F0F
+        );
+        assert_eq!(
+            e8_operation(E8FailureOperation::RequestRetire, Ok::<_, InitError>(7)),
+            Ok(7)
+        );
     }
 
     #[cfg(feature = "wyr1c6-selector29")]

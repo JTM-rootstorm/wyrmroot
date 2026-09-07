@@ -641,7 +641,7 @@ where
     let e6 = state.e6.as_mut().ok_or(InitError::WrongActivationOrder)?;
     #[cfg(feature = "wyr1e8-selector33")]
     if e6.shell.e8_quiescence_expired(now) {
-        return Err(InitError::Supervision);
+        return e8_operation(E8FailureOperation::Quiesced, Err(InitError::Supervision));
     }
     let mut shell = ShellLaunchContext {
         registry_control: registry.control_channel,
@@ -757,9 +757,12 @@ where
         }
         #[cfg(feature = "wyr1e8-selector33")]
         if bytes[..counts.bytes].starts_with(b"WRC8") {
-            match wyrmroot_consoled::e8_control::parse(&bytes[..counts.bytes])
-                .map_err(|_| InitError::Accounting)?
-            {
+            let message = e8_operation(
+                E8FailureOperation::Quiesced,
+                wyrmroot_consoled::e8_control::parse(&bytes[..counts.bytes])
+                    .map_err(|_| InitError::Accounting),
+            )?;
+            match message {
                 wyrmroot_consoled::e8_control::Message::ReadyFacts(facts) => {
                     e6.shell.observe_e8_serial_ready(
                         system,
@@ -775,29 +778,41 @@ where
                     return Ok(PollOutcome::Stable);
                 }
                 wyrmroot_consoled::e8_control::Message::Quiesced(identity) => {
-                    let action = e6.shell.accept_e8_quiesced(identity, now)?;
+                    let action = e8_operation(
+                        E8FailureOperation::Quiesced,
+                        e6.shell.accept_e8_quiesced(identity, now),
+                    )?;
                     if action == E8RecoveryAction::Registry {
                         return Ok(PollOutcome::RecoverRegistry);
                     }
-                    let request = state.driver.ok_or(InitError::WrongActivationOrder)?.request;
-                    let devmgr = state.devmgr.ok_or(InitError::WrongActivationOrder)?;
-                    let identity = e6.shell.e8_driver_identity(request)?;
-                    let mut request_bytes =
-                        [0u8; wyrmroot_device_proto::d5_controller::RECORD_BYTES];
-                    wyrmroot_device_proto::d5_controller::encode(
-                        wyrmroot_device_proto::d5_controller::D5ControllerMessage::RequestRetire(
-                            identity,
-                        ),
-                        &mut request_bytes,
-                    )
-                    .map_err(|_| InitError::Accounting)?;
-                    system
-                        .send_channel(devmgr.loaded.launch_channel, &request_bytes)
-                        .map_err(InitError::Native)?;
+                    e8_operation(
+                        E8FailureOperation::RequestRetire,
+                        (|| {
+                            let request =
+                                state.driver.ok_or(InitError::WrongActivationOrder)?.request;
+                            let devmgr = state.devmgr.ok_or(InitError::WrongActivationOrder)?;
+                            let identity = e6.shell.e8_driver_identity(request)?;
+                            let mut request_bytes =
+                                [0u8; wyrmroot_device_proto::d5_controller::RECORD_BYTES];
+                            wyrmroot_device_proto::d5_controller::encode(
+                            wyrmroot_device_proto::d5_controller::D5ControllerMessage::RequestRetire(
+                                identity,
+                            ),
+                            &mut request_bytes,
+                        )
+                        .map_err(|_| InitError::Accounting)?;
+                            system
+                                .send_channel(devmgr.loaded.launch_channel, &request_bytes)
+                                .map_err(InitError::Native)
+                        })(),
+                    )?;
                     return Ok(PollOutcome::Stable);
                 }
                 wyrmroot_consoled::e8_control::Message::Quiesce(_) => {
-                    return Err(InitError::WrongActivationOrder);
+                    return e8_operation(
+                        E8FailureOperation::Quiesced,
+                        Err(InitError::WrongActivationOrder),
+                    );
                 }
             }
         }

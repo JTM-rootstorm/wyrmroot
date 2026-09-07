@@ -42,12 +42,14 @@ use wyrmroot_system_init::continue_system_init_resource_product;
     feature = "wyr1c6-selector29"
 )))]
 use wyrmroot_system_init::fatal_application_status;
-use wyrmroot_system_init::validate_wait_until_completion;
 #[cfg(feature = "wyr1-test-evidence")]
 use wyrmroot_system_init::wyr1_test_failure_application_status;
 #[cfg(feature = "wyr1b-test-evidence")]
 use wyrmroot_system_init::wyr1b_test_failure_application_status;
 use wyrmroot_system_init::{InitPlatform, ResidentSystemInit, Wyr1BPlatform};
+use wyrmroot_system_init::{
+    resident_tick_failure_application_status, validate_wait_until_completion,
+};
 #[cfg(feature = "wyr1c6-selector29")]
 use wyrmroot_system_init::{wyr1c_native, wyr1c6_gate, wyr1c6_test_failure_application_status};
 use wyrmroot_wyr1b_gate_proto as _;
@@ -261,11 +263,8 @@ fn continue_resident(
         let Some(deadline) = now.checked_add(tick_ns) else {
             return 0xAF01_0004;
         };
-        if resident
-            .control_tick_product(system, loader, waits, now)
-            .is_err()
-        {
-            return 0xAF01_0006;
+        if let Err(error) = resident.control_tick_product(system, loader, waits, now) {
+            return resident_tick_failure_application_status(&error);
         }
         #[cfg(feature = "wyr1c6-selector29")]
         if !c6_evidence_submitted {
