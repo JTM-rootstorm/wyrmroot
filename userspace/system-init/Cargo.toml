@@ -58,7 +58,9 @@ wyrmroot-wyr1e-test-actors = { path = "../wyr1e-test-actors", optional = true }
 
 [dev-dependencies]
 wyrmroot-bootfs = { path = "../../crates/wyrmroot-bootfs", features = ["builder"] }
+wyrmroot-devmgr = { path = "../devmgr", features = ["wyr1e8-production"] }
 wyrmroot-rrc-manifest = { path = "../../crates/wyrmroot-rrc-manifest", features = ["builder"] }
+wyrmroot-uart16550d = { path = "../uart16550d" }
 
 [lints.rust]
 unsafe_code = "deny"

@@ -131,6 +131,8 @@ impl Observer {
             || serial.driver_control_endpoint_generation == 0
             || serial.driver_launch_transaction == 0
             || serial.supervisor_generation == 0
+            || self.serial.is_some()
+            || self.current.is_some()
             || self.terminal
         {
             return Err(InitError::Accounting);
@@ -208,6 +210,7 @@ impl Observer {
             if let Err(error) = validate_transition(self.stage, previous, next) {
                 self.pending_tuple = None;
                 self.pending_ready = None;
+                self.serial = None;
                 return Err(error);
             }
         } else if self.stage != 1 {
@@ -246,6 +249,12 @@ impl Observer {
 
     pub(crate) const fn tuple_waiting_for_serial(&self) -> bool {
         self.pending_tuple.is_some()
+    }
+
+    pub(crate) fn abort_staged_ready(&mut self) {
+        self.serial = None;
+        self.pending_tuple = None;
+        self.pending_ready = None;
     }
 
     pub(crate) const fn stage(&self) -> u32 {
@@ -395,6 +404,7 @@ impl Observer {
         self.advance()?;
         self.current = None;
         self.previous = Some(current);
+        self.serial = None;
         self.outer_result = None;
         Ok(())
     }
@@ -465,8 +475,20 @@ const fn kind_record_type() -> u32 {
 fn validate_transition(stage: u32, old: ReadyState, new: ReadyState) -> Result<(), InitError> {
     let fresh_shell = old.tuple.outer_launch_transaction != new.tuple.outer_launch_transaction
         && old.tuple.outer_job_id != new.tuple.outer_job_id
-        && old.tuple.shell_jobs_connection_id != new.tuple.shell_jobs_connection_id
-        && old.tuple.registry_endpoint_id != new.tuple.registry_endpoint_id;
+        && (
+            old.tuple.shell_jobs_connection_id,
+            old.tuple.shell_jobs_generation,
+        ) != (
+            new.tuple.shell_jobs_connection_id,
+            new.tuple.shell_jobs_generation,
+        )
+        && (
+            old.tuple.registry_endpoint_id,
+            old.tuple.registry_endpoint_generation,
+        ) != (
+            new.tuple.registry_endpoint_id,
+            new.tuple.registry_endpoint_generation,
+        );
     let valid = match stage {
         2 => {
             fresh_shell
@@ -480,13 +502,26 @@ fn validate_transition(stage: u32, old: ReadyState, new: ReadyState) -> Result<(
                 && old.ready.bundle_generation == new.ready.bundle_generation
         }
         3 => {
+            // System-init and the healthy devmgr persist across this leg, so
+            // their publication, attempt, launch, attach, and stream allocators
+            // are monotonic. Consoled-owned counters are intentionally absent.
             fresh_shell
                 && old.tuple.registry_generation == new.tuple.registry_generation
-                && old.serial.publication_generation != new.serial.publication_generation
-                && old.serial.driver_attempt_generation != new.serial.driver_attempt_generation
-                && old.ready.attach_transaction != new.ready.attach_transaction
-                && old.ready.stream_generation != new.ready.stream_generation
-                && new.ready.bundle_generation >= old.ready.bundle_generation
+                && new.serial.publication_generation > old.serial.publication_generation
+                && new.serial.device_role_id == old.serial.device_role_id
+                && new.serial.driver_attempt_generation > old.serial.driver_attempt_generation
+                && (
+                    new.serial.driver_control_endpoint_id,
+                    new.serial.driver_control_endpoint_generation,
+                ) != (
+                    old.serial.driver_control_endpoint_id,
+                    old.serial.driver_control_endpoint_generation,
+                )
+                && new.serial.driver_launch_transaction > old.serial.driver_launch_transaction
+                && new.serial.supervisor_generation == old.serial.supervisor_generation
+                && new.ready.attach_transaction > old.ready.attach_transaction
+                && new.ready.stream_generation > old.ready.stream_generation
+                && new.ready.bundle_generation == old.ready.bundle_generation
         }
         4 => {
             fresh_shell
@@ -838,6 +873,70 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn driver_replacement_checks_every_persistent_owner_relation() {
+        let old_tuple = tuple(100);
+        let old = ReadyState {
+            tuple: old_tuple,
+            serial: SerialFacts {
+                publication_generation: 300,
+                device_role_id: 301,
+                driver_attempt_generation: 302,
+                driver_control_endpoint_id: 303,
+                driver_control_endpoint_generation: 304,
+                driver_launch_transaction: 305,
+                supervisor_generation: 306,
+            },
+            ready: ready(old_tuple, 400, 401, 402),
+        };
+        let new_tuple = ShellTuple {
+            console_generation: 1,
+            status_generation: 1,
+            shell_generation: 1,
+            outer_launch_transaction: 203,
+            outer_job_id: 204,
+            registry_generation: old_tuple.registry_generation,
+            registry_endpoint_id: 206,
+            registry_endpoint_generation: 207,
+            shell_jobs_connection_id: 208,
+            shell_jobs_generation: 209,
+        };
+        let next = ReadyState {
+            tuple: new_tuple,
+            serial: SerialFacts {
+                publication_generation: 500,
+                device_role_id: old.serial.device_role_id,
+                driver_attempt_generation: 502,
+                driver_control_endpoint_id: 503,
+                driver_control_endpoint_generation: 504,
+                driver_launch_transaction: 505,
+                supervisor_generation: old.serial.supervisor_generation,
+            },
+            ready: ready(new_tuple, 600, 601, old.ready.bundle_generation),
+        };
+        assert_eq!(validate_transition(3, old, next), Ok(()));
+
+        let mut invalid = [next; 10];
+        invalid[0].tuple.registry_generation = old.tuple.registry_generation + 1;
+        invalid[1].serial.publication_generation = old.serial.publication_generation;
+        invalid[2].serial.device_role_id = old.serial.device_role_id + 1;
+        invalid[3].serial.driver_attempt_generation = old.serial.driver_attempt_generation;
+        invalid[4].serial.driver_control_endpoint_id = old.serial.driver_control_endpoint_id;
+        invalid[4].serial.driver_control_endpoint_generation =
+            old.serial.driver_control_endpoint_generation;
+        invalid[5].serial.driver_launch_transaction = old.serial.driver_launch_transaction;
+        invalid[6].serial.supervisor_generation = old.serial.supervisor_generation + 1;
+        invalid[7].ready.attach_transaction = old.ready.attach_transaction;
+        invalid[8].ready.stream_generation = old.ready.stream_generation;
+        invalid[9].ready.bundle_generation = old.ready.bundle_generation + 1;
+        for candidate in invalid {
+            assert_eq!(
+                validate_transition(3, old, candidate),
+                Err(InitError::Accounting)
+            );
+        }
+    }
+
     fn forced_zero() -> TerminationResult {
         TerminationResult {
             classification: TerminationClassification::TaskGroupTeardown,
@@ -881,6 +980,7 @@ mod tests {
         let consistently_wrong = tuple(1_000);
         let consistently_wrong_ready = ready(consistently_wrong, 1_200, 1_201, 1_202);
         let before = observer;
+        observe_serial(&mut observer, serial(1_100));
         observer
             .stage_shell_tuple(consistently_wrong, |_| Ok(()))
             .unwrap();
@@ -889,6 +989,7 @@ mod tests {
             Err(InitError::Accounting)
         );
         assert_eq!(observer, before);
+        observe_serial(&mut observer, serial(1_100));
         observer
             .observe_serial_ready(consistently_wrong_ready, |_| Ok(()))
             .unwrap();
@@ -931,8 +1032,8 @@ mod tests {
             shell_jobs_connection_id: 36,
             shell_jobs_generation: 37,
         };
-        let s3_ready = ready(s3, 500, 501, 502);
-        observe_serial(&mut observer, serial(400));
+        let s3_ready = ready(s3, 500, 501, 202);
+        observe_serial(&mut observer, [400, 101, 402, 403, 404, 405, 106]);
         observer.stage_shell_tuple(s3, |_| Ok(())).unwrap();
         observer.observe_serial_ready(s3_ready, |_| Ok(())).unwrap();
         observer
@@ -1057,10 +1158,11 @@ mod tests {
             shell_jobs_connection_id: 36,
             shell_jobs_generation: 37,
         };
-        observe_serial(&mut observer, serial(400));
+        let s3_serial = [400, 101, 402, 403, 404, 405, 106];
+        observe_serial(&mut observer, s3_serial);
         observer.stage_shell_tuple(s3, |_| Ok(())).unwrap();
         observer
-            .observe_serial_ready(ready(s3, 500, 501, 502), |record| {
+            .observe_serial_ready(ready(s3, 500, 501, 202), |record| {
                 records[count] = *record;
                 count += 1;
                 Ok(())
@@ -1098,12 +1200,12 @@ mod tests {
             shell_jobs_connection_id: 47,
             shell_jobs_generation: 48,
         };
-        let mut s4_serial = serial(400);
+        let mut s4_serial = s3_serial;
         s4_serial[0] = 600;
         observe_serial(&mut observer, s4_serial);
         observer.stage_shell_tuple(s4, |_| Ok(())).unwrap();
         observer
-            .observe_serial_ready(ready(s4, 700, 701, 502), |record| {
+            .observe_serial_ready(ready(s4, 700, 701, 202), |record| {
                 records[count] = *record;
                 count += 1;
                 Ok(())

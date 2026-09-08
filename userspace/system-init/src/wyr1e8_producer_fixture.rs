@@ -3,6 +3,17 @@ extern crate std;
 use alloc::{format, string::String};
 use core::fmt::Write;
 use wyrmroot_bootfs::launch_policy::JOB_V2_PROFILE_ID;
+use wyrmroot_device_proto::connector::{ConnectorMessage, ConnectorIdentity};
+use wyrmroot_device_proto::control::ControlEndpoint;
+use wyrmroot_device_proto::control_v1_1::{ControlIdentityV1_1, ControlMessageV1_1};
+use wyrmroot_device_proto::coordinator::{
+    AttemptGeneration, BundleGeneration, EndpointGeneration, EndpointId,
+};
+use wyrmroot_device_proto::manifest::RoleId;
+use wyrmroot_devmgr::connector::{
+    AttachCorrelation, ConnectorAction, ConnectorBroker, ConnectorSlot, PublishedDriver,
+};
+use wyrmroot_uart16550d::GracefulRetireDrain;
 
 const NONCE: u64 = 0x1122_3344_5566_7788;
 
@@ -414,8 +425,72 @@ fn lowercase_hex(bytes: &[u8]) -> String {
     encoded
 }
 
+fn published_driver(
+    serial: crate::wyr1e8_evidence::SerialFacts,
+    bundle_generation: u64,
+) -> PublishedDriver {
+    PublishedDriver {
+        publication_generation: serial.publication_generation,
+        control: ControlIdentityV1_1 {
+            role_id: RoleId(serial.device_role_id),
+            bundle_generation: BundleGeneration(bundle_generation),
+            attempt_generation: AttemptGeneration(serial.driver_attempt_generation),
+            endpoint: ControlEndpoint {
+                id: EndpointId(serial.driver_control_endpoint_id),
+                generation: EndpointGeneration(serial.driver_control_endpoint_generation),
+            },
+            transaction_id: serial.driver_launch_transaction,
+        },
+    }
+}
+
+fn attach_serial(
+    broker: &mut ConnectorBroker,
+    publication_generation: u64,
+    client_transaction_id: u64,
+) -> AttachCorrelation {
+    let ConnectorAction::AllocatePair { attach, .. } = broker
+        .begin_connect(ConnectorMessage::ConnectStream {
+            publication_generation,
+            client_transaction_id,
+        })
+        .unwrap()
+    else {
+        panic!("connector must allocate the fresh raw pair")
+    };
+    broker.driver_endpoint_moved(attach).unwrap();
+    broker
+        .accept_stream_ready(ControlMessageV1_1::StreamReady {
+            identity: ControlIdentityV1_1 {
+                transaction_id: attach.attach_transaction_id,
+                ..attach.driver.control
+            },
+            stream_generation: attach.stream_generation,
+            publication_generation: attach.driver.publication_generation,
+        })
+        .unwrap();
+    assert_eq!(
+        broker.connected_response(),
+        Ok(ConnectorMessage::Connected {
+            identity: ConnectorIdentity {
+                publication_generation: attach.driver.publication_generation,
+                client_transaction_id,
+                device_role_id: attach.driver.control.role_id.0,
+                bundle_generation: attach.driver.control.bundle_generation.0,
+                driver_attempt_generation: attach.driver.control.attempt_generation.0,
+                driver_control_endpoint_id: attach.driver.control.endpoint.id.0,
+                driver_control_endpoint_generation: attach.driver.control.endpoint.generation.0,
+                attach_transaction_id: attach.attach_transaction_id,
+                stream_generation: attach.stream_generation,
+            },
+        })
+    );
+    broker.client_endpoint_moved().unwrap();
+    attach
+}
+
 #[test]
-fn actual_dispatcher_emits_s2_driver_trigger_record_after_accepted_prefix() {
+fn actual_driver_recovery_composes_dispatcher_barrier_drain_broker_and_s3_ready() {
     let serial = crate::wyr1e8_evidence::SerialFacts {
         publication_generation: 20,
         device_role_id: 21,
@@ -463,12 +538,58 @@ fn actual_dispatcher_emits_s2_driver_trigger_record_after_accepted_prefix() {
         role_generation: 112,
         kind: EndpointKind::LaunchSession,
     };
+    let console_grant = EndpointGrant {
+        registry_generation: s1.registry_generation,
+        endpoint_id: 180,
+        endpoint_generation: 2,
+        role_generation: 110,
+        kind: EndpointKind::LaunchSession,
+    };
+    let console_session = DwHandle(89);
+    let session = DwHandle(90);
+    let console_owner = SessionOwner {
+        process: DwHandle(801),
+        launch_channel: DwHandle(802),
+        task_group: DwHandle(803),
+    };
+    let mut jobs = JobDispatcher::new();
+    jobs
+        .install_scoped_session(
+            console_grant,
+            console_session,
+            LaunchSessionScope::ConsoleLauncher,
+        )
+        .unwrap();
+    jobs.attach_session_owner(console_grant, console_owner).unwrap();
+    let outer_reservation = transaction(console_grant, 113);
+    let outer = jobs.jobs.begin_launch(outer_reservation).unwrap();
+    jobs
+        .jobs
+        .commit_launch(
+            outer,
+            console_owner.process.0,
+            console_owner.task_group.0,
+            console_owner.launch_channel.0,
+        )
+        .unwrap();
+    jobs
+        .install_scoped_session(s2_grant, session, LaunchSessionScope::ShellJobs)
+        .unwrap();
+    jobs.attach_outer_job(s2_grant, outer.job_id).unwrap();
+    let console_peer = InstalledPeer {
+        grant: console_grant,
+        loaded: LoadedProcess {
+            process: console_owner.process,
+            launch_channel: console_owner.launch_channel,
+        },
+        task_group: console_owner.task_group,
+    };
     let s2 = crate::wyr1e8_evidence::ShellTuple {
         console_generation: s1.console_generation,
         status_generation: 111,
         shell_generation: 112,
-        outer_launch_transaction: 113,
-        outer_job_id: 114,
+        outer_launch_transaction: outer_reservation.transaction_id,
+        outer_job_id: outer.job_id,
         registry_generation: s1.registry_generation,
         registry_endpoint_id: 116,
         registry_endpoint_generation: 117,
@@ -487,12 +608,23 @@ fn actual_dispatcher_emits_s2_driver_trigger_record_after_accepted_prefix() {
         .observe_e8_serial_ready(&mut platform, s2_ready)
         .unwrap();
     assert_eq!(platform.e8_evidence.len(), 21);
+    state.set_e8_console_control(DwHandle(91)).unwrap();
+
+    let old_driver = published_driver(serial, s2_ready.bundle_generation);
+    let mut broker = ConnectorBroker::new(
+        Some(old_driver),
+        s2_ready.attach_transaction,
+        s2_ready.stream_generation,
+    )
+    .unwrap();
+    let old_attach = attach_serial(&mut broker, serial.publication_generation, 40);
+    assert_eq!(old_attach.attach_transaction_id, s2_ready.attach_transaction);
+    assert_eq!(old_attach.stream_generation, s2_ready.stream_generation);
 
     let image = executable();
     let (bootfs, generation) = recovery_policy_bootfs(&image);
     let archive = Archive::new(&bootfs).unwrap();
     let policy = PolicyView::from_bootfs(archive, generation).unwrap();
-    let session = DwHandle(90);
     let reservation = transaction(s2_grant, 1);
     let token = format!("{:016X}", NONCE ^ E8_DRIVER_TRIGGER_TOKEN_INDEX);
     let path = wyrmroot_wyr1e_test_actors::RECOVERY_TRIGGER_PATH;
@@ -517,15 +649,13 @@ fn actual_dispatcher_emits_s2_driver_trigger_record_after_accepted_prefix() {
         &handles.map(|info| info.handle),
     );
     let captured_handles = platform.inbound[0].2.clone();
-    let mut jobs = JobDispatcher::new();
-    jobs.install_scoped_session(s2_grant, session, LaunchSessionScope::ShellJobs)
-        .unwrap();
     let mut loader = InitSendLoader::new();
     loader.fail_init = false;
     let mut waits = AcceptedJobV2Waits {
         transaction_id: reservation.transaction_id,
         profile: LaunchProfile::JobV2Streams,
         exited: false,
+        teardown_process: Some(console_owner.process),
     };
     let mut topology = RegistryTopology::new(s2.registry_generation).unwrap();
     let mut context = ShellLaunchContext {
@@ -566,51 +696,8 @@ fn actual_dispatcher_emits_s2_driver_trigger_record_after_accepted_prefix() {
     );
 
     let accepted_request = request[..request_len].to_vec();
-    let accepted_reply_count = platform.sent.len();
-    let accepted_evidence_count = platform.e8_evidence.len();
-    let duplicate = transaction(s2_grant, 2);
-    let duplicate_len = wyrmroot_launch_proto::encode_launch(
-        duplicate,
-        path,
-        &[
-            path,
-            wyrmroot_wyr1e_test_actors::RECOVERY_DRIVER_ACTION,
-            token.as_str(),
-        ],
-        &[],
-        true,
-        &mut request,
-    )
-    .unwrap();
-    platform.push(
-        session,
-        request[..duplicate_len].to_vec(),
-        &handles.map(|info| info.handle),
-    );
-    let closed_before_duplicate = platform.closed.len();
-    assert_eq!(
-        dispatch_one_job_request_with_shell(
-            &mut platform,
-            &mut loader,
-            &mut waits,
-            LoadAuthority {
-                parent_root: DwHandle(1),
-                bootfs: DwHandle(2),
-                task_group: DwHandle(3),
-            },
-            Some(&policy),
-            &mut jobs,
-            session,
-            s2_grant,
-            &mut context,
-        ),
-        Err(InitError::Accounting)
-    );
-    assert_eq!(platform.sent.len(), accepted_reply_count);
-    assert_eq!(platform.e8_evidence.len(), accepted_evidence_count);
-    assert_eq!(platform.closed.len(), closed_before_duplicate + 3);
-
-    let response = platform.sent.last().unwrap().1.as_slice();
+    let accepted_response = platform.sent.last().unwrap().1.clone();
+    let response = accepted_response.as_slice();
     assert!(matches!(
         parse_launch_message(response, 0).unwrap().message,
         LaunchMessage::LaunchAccepted { job_id } if job_id == loaded.job_id
@@ -639,6 +726,168 @@ fn actual_dispatcher_emits_s2_driver_trigger_record_after_accepted_prefix() {
     );
     assert!(actual[160..].iter().any(|byte| *byte != 0));
 
+    // The exact LAUNCH-successor WAIT is installed while the actor is still
+    // running. Only the later real terminal/reap observation may hold it.
+    let wait = transaction(s2_grant, 2);
+    let mut wait_request = [0u8; 56];
+    let wait_request_len = encode_job_message(
+        wait,
+        LaunchMessageType::Wait,
+        loaded.job_id,
+        &mut wait_request,
+    )
+    .unwrap();
+    platform.push(session, wait_request[..wait_request_len].to_vec(), &[]);
+    assert_eq!(
+        dispatch_one_job_request_with_shell(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            LoadAuthority {
+                parent_root: DwHandle(1),
+                bootfs: DwHandle(2),
+                task_group: DwHandle(3),
+            },
+            Some(&policy),
+            &mut jobs,
+            session,
+            s2_grant,
+            &mut context,
+        ),
+        Ok(JobDispatchOutcome::Responded)
+    );
+    let sent_before_terminal = platform.sent.len();
+    waits.exited = true;
+    let released_actor = jobs.jobs.loaded_job(loaded.job_id).unwrap();
+    assert_eq!(released_actor.loaded.launch_channel, DwHandle(0));
+    let actor_result = reap_job(&mut platform, &mut waits, &mut jobs, released_actor).unwrap();
+    assert_eq!(actor_result, result(TerminationClassification::NormalExit, 0, 0, 0));
+    service_pending_wait_inner(
+        &mut platform,
+        &mut waits,
+        &mut jobs,
+        Some(&mut *context.state),
+    )
+    .unwrap();
+    assert_eq!(platform.sent.len(), sent_before_terminal + 1);
+    let quiesce = wyrmroot_consoled::e8_control::parse(&platform.sent.last().unwrap().1).unwrap();
+    let wyrmroot_consoled::e8_control::Message::Quiesce(quiesce_identity) = quiesce else {
+        panic!("the held WAIT must emit the exact WRC8 quiescence request")
+    };
+    let held = context.state.e8_held.unwrap();
+    assert_eq!(held.identity, quiesce_identity);
+    assert_eq!(held.identity.trigger_wait_transaction, 2);
+    assert_eq!(context.state.accept_e8_quiesced(quiesce_identity, platform.now), Ok(E8RecoveryAction::Driver));
+
+    // The reached UART drain needs a fresh empty receive, empty software ring,
+    // and a paced TEMT observation before the old driver may be released.
+    let mut drain = GracefulRetireDrain::new(platform.now, false).unwrap();
+    assert!(!drain.temt_probe_due(platform.now, true).unwrap());
+    drain.observe_stream_empty();
+    assert!(drain.temt_probe_due(platform.now, true).unwrap());
+    assert!(drain.observe_temt(platform.now, true, true).unwrap());
+
+    // Ordinary UART retirement invalidates the raw/publication path first.
+    // Replacement must remain impossible while the dependent console product
+    // and its exact held result are still owned.
+    assert_eq!(broker.retire_current(), None);
+    assert!(matches!(broker.slot(), ConnectorSlot::RetiringActive { .. }));
+
+    let new_serial = crate::wyr1e8_evidence::SerialFacts {
+        publication_generation: 36,
+        device_role_id: serial.device_role_id,
+        driver_attempt_generation: 37,
+        driver_control_endpoint_id: 38,
+        driver_control_endpoint_generation: 39,
+        driver_launch_transaction: 40,
+        supervisor_generation: serial.supervisor_generation,
+    };
+    let new_driver = published_driver(new_serial, s2_ready.bundle_generation);
+    assert!(broker.replace_published_driver(new_driver).is_err());
+
+    // Use the same product-retirement and held-result finalizer as the reached
+    // production DriverExited path. The console/shell owners must be gone and
+    // cause-2 retirement emitted before exact driver reap acknowledgement.
+    let held = context
+        .state
+        .e8_held_for_action(E8RecoveryAction::Driver)
+        .unwrap();
+    context.state.clear_e8_console_control(DwHandle(91)).unwrap();
+    let retired = retire_console_product_with_result_before(
+        &mut platform,
+        &mut waits,
+        &mut jobs,
+        console_peer,
+        true,
+        held.deadline,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        retired,
+        result(TerminationClassification::TaskGroupTeardown, 0, 0, 0)
+    );
+    crate::wyr1b_native::finish_e8_dependent_retirement(
+        &mut platform,
+        &mut jobs,
+        context.state,
+        held,
+        retired,
+    )
+        .unwrap();
+    assert_eq!(jobs.session_count(), 0);
+    assert_eq!(jobs.jobs.live_jobs(), 0);
+    assert_eq!(platform.e8_evidence.len(), 23);
+
+    // STREAM_DETACHED is not used as reap evidence. Exact supervisor/reaper
+    // proof moves the broker toward Empty, but client-witness release remains
+    // independently required before the fresh publication can be installed.
+    assert_eq!(broker.driver_attempt_reaped(old_driver), Ok(None));
+    assert!(matches!(
+        broker.slot(),
+        ConnectorSlot::RetiringActive { .. }
+    ));
+    assert!(broker.replace_published_driver(new_driver).is_err());
+    broker.client_release_observed(old_attach).unwrap();
+    assert_eq!(broker.slot(), ConnectorSlot::Empty);
+    broker.replace_published_driver(new_driver).unwrap();
+    // Connector transactions are local to the replacement consoled process;
+    // numeric reuse is valid only because the authenticated client owner is new.
+    let new_attach = attach_serial(&mut broker, new_serial.publication_generation, 40);
+    assert!(new_attach.attach_transaction_id > old_attach.attach_transaction_id);
+    assert!(new_attach.stream_generation > old_attach.stream_generation);
+
+    let s3 = crate::wyr1e8_evidence::ShellTuple {
+        console_generation: 1,
+        status_generation: 1,
+        shell_generation: 1,
+        outer_launch_transaction: 213,
+        outer_job_id: 214,
+        registry_generation: s2.registry_generation,
+        registry_endpoint_id: 216,
+        registry_endpoint_generation: 217,
+        shell_jobs_connection_id: 220,
+        shell_jobs_generation: 1,
+    };
+    let s3_ready = crate::wyr1e8_evidence::SerialReady {
+        console_generation: s3.console_generation,
+        status_generation: s3.status_generation,
+        shell_generation: s3.shell_generation,
+        attach_transaction: new_attach.attach_transaction_id,
+        stream_generation: new_attach.stream_generation,
+        bundle_generation: new_attach.driver.control.bundle_generation.0,
+    };
+    context.state.e8_evidence.observe_serial(new_serial).unwrap();
+    context.state.stage_e8_shell_ready(&mut platform, s3).unwrap();
+    context
+        .state
+        .observe_e8_serial_ready(&mut platform, s3_ready)
+        .unwrap();
+    assert_eq!(context.state.e8_stage(), 3);
+    assert!(context.state.e8_shell_ready());
+    assert_eq!(context.state.e8_trigger, None);
+    assert_eq!(platform.e8_evidence.len(), 24);
+
     std::println!();
     for record in &platform.e8_evidence {
         std::println!("E8FIXTURE_RECORD={}", lowercase_hex(record));
@@ -647,7 +896,7 @@ fn actual_dispatcher_emits_s2_driver_trigger_record_after_accepted_prefix() {
         "E8FIXTURE_REQUEST={}",
         lowercase_hex(&accepted_request)
     );
-    std::println!("E8FIXTURE_RESPONSE={}", lowercase_hex(response));
+    std::println!("E8FIXTURE_RESPONSE={}", lowercase_hex(&accepted_response));
     let mut handle_shape = String::new();
     for (index, info) in captured_handles.iter().enumerate() {
         if index != 0 {

@@ -101,7 +101,7 @@ WYR1-E8 model/clippy covers the current recovery services, two additive actors, 
 wyr1e8-native compiles that exact selected E8 native artifact set.
 wyr1e8-actors-native compiles and inspects only the two product-owned E8 actors.
 wyr1e8-product-model and wyr1e8-product-clippy validate product-owned E8 host code.
-wyr1e8-producer-fixture emits the bounded actual-dispatcher S2 trigger record and its modeled accepted prefix.
+wyr1e8-producer-fixture emits the bounded S1/S2 prefix plus the actual dispatcher, held-WAIT, driver-retirement, and S3-ready composition.
 These E3-E7 filters do not create a product or run a guest.
 
 The WYR0-H request path builds and inspects the exact init0/hello bootfs and

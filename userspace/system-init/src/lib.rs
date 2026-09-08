@@ -20,6 +20,8 @@ use core::mem::MaybeUninit;
 
 #[cfg(feature = "wyr1e-production")]
 use wyrmroot_consoled as _;
+#[cfg(test)]
+use {wyrmroot_devmgr as _, wyrmroot_uart16550d as _};
 
 pub mod evidence;
 pub mod gate;

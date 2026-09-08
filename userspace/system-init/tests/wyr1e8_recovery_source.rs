@@ -1,13 +1,17 @@
 use {
-    deepwyrm_syscall as _, wyrmroot_bootfs as _, wyrmroot_device_proto as _,
-    wyrmroot_launch_proto as _, wyrmroot_loader as _, wyrmroot_registry_proto as _,
-    wyrmroot_rrc_manifest as _, wyrmroot_runtime as _, wyrmroot_system_init as _,
-    wyrmroot_wyr1b_gate_proto as _,
+    deepwyrm_syscall as _, wyrmroot_bootfs as _, wyrmroot_consoled as _,
+    wyrmroot_device_proto as _, wyrmroot_devmgr as _, wyrmroot_launch_proto as _,
+    wyrmroot_loader as _, wyrmroot_registry_proto as _, wyrmroot_rrc_manifest as _,
+    wyrmroot_runtime as _, wyrmroot_system_init as _, wyrmroot_uart16550d as _,
+    wyrmroot_wyr1b_gate_proto as _, wyrmroot_wyr1e_test_actors as _,
 };
 
 const MANIFEST: &str = include_str!("../Cargo.toml");
 const CONSOLED: &str = include_str!("../../consoled/src/main.rs");
+const DEVMGR: &str = include_str!("../../devmgr/src/main.rs");
+const UART: &str = include_str!("../../uart16550d/src/main.rs");
 const NATIVE: &str = include_str!("../src/wyr1e_native.rs");
+const RESIDENT: &str = include_str!("../src/wyr1c_native.rs");
 const JOBS: &str = include_str!("../src/wyr1b_native.rs");
 const DISPATCH: &str = include_str!("../src/wyr1b_job.rs");
 
@@ -47,6 +51,16 @@ fn e8_shell_ready_requires_matching_tuple_and_authenticated_serial_facts() {
     assert!(launch.contains("stage_e8_shell_ready"));
     assert!(launch.contains("ShellTuple"));
     assert!(CONSOLED.contains("Message::ReadyFacts(facts)"));
+    let attach = &CONSOLED[CONSOLED.find("fn attach_serial(").unwrap()
+        ..CONSOLED.find("fn finish_connect_abort(").unwrap()];
+    assert!(attach.contains("connector_client_transaction: connector_transaction"));
+    assert!(attach.contains(
+        "valid_connector_identity(identity, publication_generation, connector_transaction)"
+    ));
+    assert!(attach.contains("let correlation = serial_correlation(authorities, identity);"));
+    let correlation = &CONSOLED[CONSOLED.find("fn serial_correlation(").unwrap()
+        ..CONSOLED.find("fn valid_serial_event(").unwrap()];
+    assert!(correlation.contains("connector_client_transaction: identity.client_transaction_id"));
 }
 
 #[test]
@@ -115,15 +129,26 @@ fn forced_retirement_disconnects_then_removes_only_the_held_barrier_result() {
         ..NATIVE
             .find("pub(super) fn reserve_registry_replacement")
             .unwrap()];
-    let disconnect = retire.find("retire_console_product_with_result(").unwrap();
-    let held = retire.find("take_e8_held(expected_action)?").unwrap();
-    let remove = retire
+    let held = retire.find("e8_held_for_action(expected_action)?").unwrap();
+    let disconnect = retire
+        .find("retire_console_product_with_result_before(")
+        .unwrap();
+    let finalize = retire
+        .find("finish_e8_dependent_retirement(system")
+        .unwrap();
+    assert!(held < disconnect && disconnect < finalize);
+
+    let finalizer = &JOBS[JOBS
+        .find("pub(crate) fn finish_e8_dependent_retirement")
+        .unwrap()..JOBS.find("fn retire_console_product_inner").unwrap()];
+    let remove = finalizer
         .find("remove_barrier_result(held.pending, held.result)")
         .unwrap();
-    let evidence = retire
+    let evidence = finalizer
         .find("record_e8_forced_retired(system, held, result)")
         .unwrap();
-    assert!(disconnect < held && held < remove && remove < evidence);
+    let consume = finalizer.find("consume_e8_held(held)").unwrap();
+    assert!(remove < evidence && evidence < consume);
 
     let remove_body = &DISPATCH[DISPATCH
         .find("pub(crate) fn remove_barrier_result")
@@ -132,6 +157,34 @@ fn forced_retirement_disconnects_then_removes_only_the_held_barrier_result() {
     assert!(remove_body.contains("pending.grant.endpoint_id"));
     assert!(remove_body.contains("pending.grant.endpoint_generation"));
     assert!(remove_body.contains("pending.job_id"));
+}
+
+#[test]
+fn driver_exit_uses_the_reached_production_owner_order() {
+    let driver_exit = &RESIDENT[RESIDENT.find("ResidentPollEvent::DriverExited =>").unwrap()..];
+    let driver_exit = &driver_exit[..driver_exit
+        .find("ResidentPollEvent::ProbeControlReadable =>")
+        .unwrap()];
+    let dependents = driver_exit.find("wyr1e::retire_dependents(").unwrap();
+    let reap = driver_exit.find("reap_driver_before(").unwrap();
+    let acknowledge = driver_exit.find("acknowledge_driver_reaped(").unwrap();
+    assert!(dependents < reap && reap < acknowledge);
+
+    for reached_uart_step in [
+        "GracefulRetireDrain::new",
+        "observe_stream_empty",
+        "temt_probe_due",
+        "observe_temt",
+    ] {
+        assert!(UART.contains(reached_uart_step));
+    }
+    for reached_broker_step in [
+        ".retire_current()",
+        ".driver_attempt_reaped(",
+        ".replace_published_driver(",
+    ] {
+        assert!(DEVMGR.contains(reached_broker_step));
+    }
 }
 
 #[test]

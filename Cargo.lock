@@ -374,6 +374,7 @@ dependencies = [
  "deepwyrm-syscall",
  "wyrmroot-bootfs",
  "wyrmroot-consoled",
+ "wyrmroot-devmgr",
  "wyrmroot-device-proto",
  "wyrmroot-dw1e3-com2-test",
  "wyrmroot-launch-proto",
@@ -381,6 +382,7 @@ dependencies = [
  "wyrmroot-registry-proto",
  "wyrmroot-rrc-manifest",
  "wyrmroot-runtime",
+ "wyrmroot-uart16550d",
  "wyrmroot-wyr1b-gate-proto",
  "wyrmroot-wyr1e-test-actors",
 ]

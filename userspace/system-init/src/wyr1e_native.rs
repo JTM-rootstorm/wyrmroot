@@ -5,7 +5,8 @@ use crate::wyr1b::EndpointGrant;
 use crate::wyr1b_job::{JobDispatcher, LaunchSessionScope, SessionOwner};
 #[cfg(feature = "wyr1e8-selector33")]
 use crate::wyr1b_native::{
-    E8RecoveryAction, retire_console_product_with_result, retire_console_product_with_result_before,
+    E8RecoveryAction, finish_e8_dependent_retirement, retire_console_product_with_result,
+    retire_console_product_with_result_before,
 };
 use crate::wyr1b_native::{
     InstalledPeer, ShellControllerState, ShellLaunchContext, create_controller_channel_pair,
@@ -1125,16 +1126,8 @@ where
     } else {
         #[cfg(feature = "wyr1e8-selector33")]
         if let Some(held) = held {
-            e6.shell
-                .require_e8_action_live_at(system.now().map_err(InitError::Native)?)?;
-            e6.jobs
-                .remove_barrier_result(held.pending, held.result)
-                .map_err(InitError::Wyr1BModel)?;
-            e6.shell
-                .require_e8_action_live_at(system.now().map_err(InitError::Native)?)?;
             let result = console_result?.ok_or(InitError::WrongActivationOrder)?;
-            e6.shell.record_e8_forced_retired(system, held, result)?;
-            e6.shell.consume_e8_held(held);
+            finish_e8_dependent_retirement(system, &mut e6.jobs, &mut e6.shell, held, result)?;
         }
         Ok(())
     }

@@ -280,8 +280,17 @@ impl ShellControllerState {
             return Ok(());
         }
         self.require_e8_action_live(system)?;
+        let ready_allowed = self.e8_ready_submission_allowed();
         let mut candidate = self.e8_evidence;
-        candidate.stage_shell_tuple(tuple, |record| Self::submit_e8(system, record))?;
+        if let Err(error) = candidate.stage_shell_tuple(tuple, |record| {
+            if !ready_allowed {
+                return Err(InitError::WrongActivationOrder);
+            }
+            Self::submit_e8(system, record)
+        }) {
+            self.e8_evidence.abort_staged_ready();
+            return Err(error);
+        }
         self.require_e8_action_live(system)?;
         self.e8_evidence = candidate;
         self.finish_e8_action_if_ready(system)
@@ -294,11 +303,32 @@ impl ShellControllerState {
         ready: crate::wyr1e8_evidence::SerialReady,
     ) -> Result<(), InitError> {
         self.require_e8_action_live(system)?;
+        let ready_allowed = self.e8_ready_submission_allowed();
         let mut candidate = self.e8_evidence;
-        candidate.observe_serial_ready(ready, |record| Self::submit_e8(system, record))?;
+        if let Err(error) = candidate.observe_serial_ready(ready, |record| {
+            if !ready_allowed {
+                return Err(InitError::WrongActivationOrder);
+            }
+            Self::submit_e8(system, record)
+        }) {
+            self.e8_evidence.abort_staged_ready();
+            return Err(error);
+        }
         self.require_e8_action_live(system)?;
         self.e8_evidence = candidate;
         self.finish_e8_action_if_ready(system)
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    fn e8_ready_submission_allowed(&self) -> bool {
+        let Some(trigger) = self.e8_trigger else {
+            return true;
+        };
+        let expected_stage = match trigger.identity.action {
+            E8RecoveryAction::Driver => 3,
+            E8RecoveryAction::Registry => 4,
+        };
+        self.e8_evidence.stage() == expected_stage && self.e8_held.is_none()
     }
 
     #[cfg(feature = "wyr1e8-selector33")]
@@ -5233,6 +5263,23 @@ where
     retire_console_product_inner(system, waits, jobs, peer, terminate, Some(deadline_cap))
 }
 
+#[cfg(feature = "wyr1e8-selector33")]
+pub(crate) fn finish_e8_dependent_retirement<S: Wyr1BPlatform>(
+    system: &mut S,
+    jobs: &mut JobDispatcher,
+    shell: &mut ShellControllerState,
+    held: E8HeldWait,
+    result: TerminationResult,
+) -> Result<(), InitError> {
+    shell.require_e8_action_live_at(system.now().map_err(InitError::Native)?)?;
+    jobs.remove_barrier_result(held.pending, held.result)
+        .map_err(InitError::Wyr1BModel)?;
+    shell.require_e8_action_live_at(system.now().map_err(InitError::Native)?)?;
+    shell.record_e8_forced_retired(system, held, result)?;
+    shell.consume_e8_held(held);
+    Ok(())
+}
+
 #[cfg(feature = "wyr1e-production")]
 fn retire_console_product_inner<S, W>(
     system: &mut S,
@@ -7072,6 +7119,7 @@ mod tests {
         transaction_id: u64,
         profile: LaunchProfile,
         exited: bool,
+        teardown_process: Option<DwHandle>,
     }
 
     impl SupervisionPlatform for AcceptedJobV2Waits {
@@ -7109,15 +7157,20 @@ mod tests {
 
         fn query_task_termination(
             &mut self,
-            _process: DwHandle,
+            process: DwHandle,
         ) -> Result<DwTaskTerminationInfoV1, Self::Error> {
+            let teardown = self.teardown_process == Some(process);
             Ok(DwTaskTerminationInfoV1 {
-                state: if self.exited {
+                state: if self.exited || teardown {
                     DW_TASK_STATE_EXITED
                 } else {
                     deepwyrm_syscall::DW_TASK_STATE_RUNNING
                 },
-                reason: DW_TERMINATION_NORMAL_EXIT,
+                reason: if teardown {
+                    DW_TERMINATION_TASK_GROUP_TEARDOWN
+                } else {
+                    DW_TERMINATION_NORMAL_EXIT
+                },
                 ..DwTaskTerminationInfoV1::default()
             })
         }
@@ -10185,6 +10238,18 @@ mod tests {
             shell_jobs_generation: 13,
         };
         state
+            .e8_evidence
+            .observe_serial(crate::wyr1e8_evidence::SerialFacts {
+                publication_generation: 10,
+                device_role_id: 11,
+                driver_attempt_generation: 12,
+                driver_control_endpoint_id: 13,
+                driver_control_endpoint_generation: 14,
+                driver_launch_transaction: 15,
+                supervisor_generation: 16,
+            })
+            .unwrap();
+        state
             .stage_e8_shell_ready(&mut platform, stage_two_tuple)
             .unwrap();
         state
@@ -10230,7 +10295,6 @@ mod tests {
                 },
             )
             .unwrap();
-        state.consume_e8_held(held);
 
         let tuple = crate::wyr1e8_evidence::ShellTuple {
             console_generation: 2,
@@ -10244,32 +10308,44 @@ mod tests {
             shell_jobs_connection_id: 16,
             shell_jobs_generation: 17,
         };
-        state
-            .e8_evidence
-            .observe_serial(crate::wyr1e8_evidence::SerialFacts {
-                publication_generation: 20,
-                device_role_id: 11,
-                driver_attempt_generation: 21,
-                driver_control_endpoint_id: 22,
-                driver_control_endpoint_generation: 23,
-                driver_launch_transaction: 24,
-                supervisor_generation: 16,
-            })
-            .unwrap();
+        let fresh_serial = crate::wyr1e8_evidence::SerialFacts {
+            publication_generation: 20,
+            device_role_id: 11,
+            driver_attempt_generation: 21,
+            driver_control_endpoint_id: 22,
+            driver_control_endpoint_generation: 23,
+            driver_launch_transaction: 24,
+            supervisor_generation: 16,
+        };
+        let ready = crate::wyr1e8_evidence::SerialReady {
+            console_generation: tuple.console_generation,
+            status_generation: tuple.status_generation,
+            shell_generation: tuple.shell_generation,
+            attach_transaction: 25,
+            stream_generation: 26,
+            bundle_generation: 19,
+        };
+
+        // Even a relation-valid replacement cannot publish READY while the
+        // exact held barrier still owns the transition. Rejection also clears
+        // the controller's staged tuple and serial facts.
+        let evidence_count = platform.e8_evidence.len();
+        state.e8_evidence.observe_serial(fresh_serial).unwrap();
+        state.stage_e8_shell_ready(&mut platform, tuple).unwrap();
+        assert_eq!(
+            state.observe_e8_serial_ready(&mut platform, ready),
+            Err(InitError::WrongActivationOrder)
+        );
+        assert_eq!(platform.e8_evidence.len(), evidence_count);
+        assert!(!state.e8_tuple_waiting_for_serial());
+        assert!(!state.e8_shell_ready());
+
+        state.consume_e8_held(held);
+        state.e8_evidence.observe_serial(fresh_serial).unwrap();
         state.stage_e8_shell_ready(&mut platform, tuple).unwrap();
         platform.now_after_e8_evidence = Some(200);
         assert_eq!(
-            state.observe_e8_serial_ready(
-                &mut platform,
-                crate::wyr1e8_evidence::SerialReady {
-                    console_generation: tuple.console_generation,
-                    status_generation: tuple.status_generation,
-                    shell_generation: tuple.shell_generation,
-                    attach_transaction: 25,
-                    stream_generation: 26,
-                    bundle_generation: 19,
-                },
-            ),
+            state.observe_e8_serial_ready(&mut platform, ready),
             Err(InitError::Supervision)
         );
         assert_eq!(state.e8_action_deadline(), Some(200));
@@ -11440,6 +11516,7 @@ mod tests {
             transaction_id: reservation(1).transaction_id,
             profile: LaunchProfile::JobV2,
             exited: false,
+            teardown_process: None,
         };
         let mut loader = InitSendLoader::new();
         loader.fail_init = false;
