@@ -616,7 +616,6 @@ fn actual_driver_and_registry_recovery_compose_through_s4_ready() {
         shell_generation: s2.shell_generation,
         ..s1_ready
     };
-    state.e8_evidence.observe_serial(serial).unwrap();
     state.stage_e8_shell_ready(&mut platform, s2).unwrap();
     state
         .observe_e8_serial_ready(&mut platform, s2_ready)

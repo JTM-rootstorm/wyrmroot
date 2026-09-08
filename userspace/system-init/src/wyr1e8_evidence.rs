@@ -404,7 +404,7 @@ impl Observer {
         self.advance()?;
         self.current = None;
         self.previous = Some(current);
-        self.serial = None;
+        self.serial = (cause == 1).then_some(current.serial);
         self.outer_result = None;
         Ok(())
     }
@@ -1049,7 +1049,6 @@ mod tests {
         let consistently_wrong = tuple(1_000);
         let consistently_wrong_ready = ready(consistently_wrong, 1_200, 1_201, 1_202);
         let before = observer;
-        observe_serial(&mut observer, serial(1_100));
         observer
             .stage_shell_tuple(consistently_wrong, |_| Ok(()))
             .unwrap();
@@ -1057,7 +1056,9 @@ mod tests {
             observer.observe_serial_ready(consistently_wrong_ready, |_| Ok(())),
             Err(InitError::Accounting)
         );
-        assert_eq!(observer, before);
+        let mut after_reject = before;
+        after_reject.serial = None;
+        assert_eq!(observer, after_reject);
         observe_serial(&mut observer, serial(1_100));
         observer
             .observe_serial_ready(consistently_wrong_ready, |_| Ok(()))
@@ -1066,7 +1067,7 @@ mod tests {
             observer.stage_shell_tuple(consistently_wrong, |_| Ok(())),
             Err(InitError::Accounting)
         );
-        assert_eq!(observer, before);
+        assert_eq!(observer, after_reject);
 
         let s2 = ShellTuple {
             console_generation: s1.console_generation,
@@ -1141,7 +1142,6 @@ mod tests {
                 invalid.shell_generation = s1.shell_generation;
             }
             let invalid_ready = ready(invalid, 200, 201, 202);
-            observe_serial(&mut observer, serial(100));
             observer.stage_shell_tuple(invalid, |_| Ok(())).unwrap();
             assert_eq!(
                 observer.observe_serial_ready(invalid_ready, |_| Ok(())),
@@ -1150,6 +1150,66 @@ mod tests {
             assert!(!observer.ready());
             assert!(!observer.tuple_waiting_for_serial());
         }
+    }
+
+    #[test]
+    fn clean_s1_to_s2_reuses_exact_serial_without_reobservation() {
+        let mut observer = Observer::new().unwrap();
+        let s1 = tuple(1);
+        let retained_serial = serial(100);
+        observe_serial(&mut observer, retained_serial);
+        observer.stage_shell_tuple(s1, |_| Ok(())).unwrap();
+        observer
+            .observe_serial_ready(ready(s1, 200, 201, 202), |_| Ok(()))
+            .unwrap();
+        finish_clean(&mut observer, s1, 300, |_| Ok(()));
+
+        let s2 = ShellTuple {
+            console_generation: s1.console_generation,
+            status_generation: 20,
+            shell_generation: 21,
+            outer_launch_transaction: 22,
+            outer_job_id: 23,
+            registry_generation: s1.registry_generation,
+            registry_endpoint_id: 24,
+            registry_endpoint_generation: 25,
+            shell_jobs_connection_id: 26,
+            shell_jobs_generation: 27,
+        };
+        let mut ready_records = 0usize;
+        observer.stage_shell_tuple(s2, |_| Ok(())).unwrap();
+        observer
+            .observe_serial_ready(ready(s2, 200, 201, 202), |record| {
+                assert_eq!(
+                    u32::from_le_bytes(record[8..12].try_into().unwrap()),
+                    TYPE_SHELL_READY
+                );
+                assert_eq!(u32::from_le_bytes(record[128..132].try_into().unwrap()), 2);
+                ready_records += 1;
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(
+            observer.ready(),
+            "S2 must publish READY from retained serial facts"
+        );
+        assert!(!observer.tuple_waiting_for_serial());
+        assert_eq!(ready_records, 1);
+        let before_redundant_observation = observer;
+        assert_eq!(
+            observer.observe_serial(SerialFacts {
+                publication_generation: retained_serial[0],
+                device_role_id: retained_serial[1],
+                driver_attempt_generation: retained_serial[2],
+                driver_control_endpoint_id: retained_serial[3],
+                driver_control_endpoint_generation: retained_serial[4],
+                driver_launch_transaction: retained_serial[5],
+                supervisor_generation: retained_serial[6],
+            }),
+            Err(InitError::Accounting)
+        );
+        assert_eq!(observer, before_redundant_observation);
     }
 
     #[test]
@@ -1186,7 +1246,6 @@ mod tests {
             shell_jobs_connection_id: 26,
             shell_jobs_generation: 27,
         };
-        observe_serial(&mut observer, serial(100));
         observer.stage_shell_tuple(s2, |_| Ok(())).unwrap();
         observer
             .observe_serial_ready(ready(s2, 200, 201, 202), |record| {
@@ -1214,6 +1273,7 @@ mod tests {
                 },
             )
             .unwrap();
+        assert!(!observer.armed());
 
         let s3 = ShellTuple {
             console_generation: 1,
@@ -1256,6 +1316,7 @@ mod tests {
                 },
             )
             .unwrap();
+        assert!(!observer.armed());
 
         let s4 = ShellTuple {
             console_generation: 1,
@@ -1316,5 +1377,6 @@ mod tests {
             4
         );
         assert!(observer.terminal);
+        assert!(!observer.armed());
     }
 }

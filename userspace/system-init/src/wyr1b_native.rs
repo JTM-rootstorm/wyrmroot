@@ -10261,18 +10261,6 @@ mod tests {
             shell_jobs_generation: 13,
         };
         state
-            .e8_evidence
-            .observe_serial(crate::wyr1e8_evidence::SerialFacts {
-                publication_generation: 10,
-                device_role_id: 11,
-                driver_attempt_generation: 12,
-                driver_control_endpoint_id: 13,
-                driver_control_endpoint_generation: 14,
-                driver_launch_transaction: 15,
-                supervisor_generation: 16,
-            })
-            .unwrap();
-        state
             .stage_e8_shell_ready(&mut platform, stage_two_tuple)
             .unwrap();
         state
