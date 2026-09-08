@@ -4955,14 +4955,34 @@ where
                     .map_err(InitError::Native)?;
                 if let Err(dispatch_error) = dispatched {
                     let disconnected = jobs.disconnect_owned_session(grant);
-                    let close_failed = disconnected.map_or(true, |session| {
-                        system.close_handle(session.channel).is_err()
-                            | cleanup_session_owner(system, waits, session.owner, true)
-                    });
-                    if close_failed {
-                        return Err(InitError::Cleanup);
+                    #[cfg(feature = "wyr1e8-selector33")]
+                    {
+                        let emergency_cleanup = match disconnected {
+                            Ok(session) => {
+                                let channel_close_failed =
+                                    system.close_handle(session.channel).is_err();
+                                let owner_cleanup_failed =
+                                    cleanup_session_owner(system, waits, session.owner, true);
+                                E8EmergencyCleanup::Attempted {
+                                    channel_close_failed,
+                                    owner_cleanup_failed,
+                                }
+                            }
+                            Err(_) => E8EmergencyCleanup::DisconnectFailed,
+                        };
+                        return Err(e8_dispatch_failure(dispatch_error, emergency_cleanup));
                     }
-                    return Err(dispatch_error);
+                    #[cfg(not(feature = "wyr1e8-selector33"))]
+                    {
+                        let close_failed = disconnected.map_or(true, |session| {
+                            system.close_handle(session.channel).is_err()
+                                | cleanup_session_owner(system, waits, session.owner, true)
+                        });
+                        if close_failed {
+                            return Err(InitError::Cleanup);
+                        }
+                        return Err(dispatch_error);
+                    }
                 }
             }
             Ok(observed) if observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 => {
@@ -7736,6 +7756,169 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "wyr1e8-selector33")]
+    fn poll_malformed_dispatch_with_emergency_cleanup(
+        fail_channel_close: bool,
+        attach_owner: bool,
+    ) -> (InitError, MockPlatform) {
+        let image = executable();
+        let (bootfs, _) = job_policy_bootfs(&image);
+        let mut platform = MockPlatform::new();
+        platform.bootfs = Some(bootfs);
+        platform.session_poll_readable = true;
+        platform.inbound[0] = 0;
+        platform.inbound_len = 1;
+        platform.now = Some(1);
+        if fail_channel_close {
+            platform.fail_close = Some(DwHandle(90));
+        }
+        let mut loader = InitSendLoader::new();
+        let mut jobs = JobDispatcher::new();
+        let owner = grant(EndpointKind::LaunchSession, 1, 1);
+        jobs.install_session(owner, DwHandle(90)).unwrap();
+        if attach_owner {
+            jobs.attach_session_owner(
+                owner,
+                SessionOwner {
+                    process: DwHandle(101),
+                    launch_channel: DwHandle(102),
+                    task_group: DwHandle(103),
+                },
+            )
+            .unwrap();
+        }
+        let authority = LoadAuthority {
+            parent_root: DwHandle(1),
+            bootfs: DwHandle(2),
+            task_group: DwHandle(3),
+        };
+        let result = if attach_owner {
+            let mut waits = ScheduledExitWaits {
+                waits: 0,
+                exit_after_waits: usize::MAX,
+            };
+            poll_job_dispatcher(
+                &mut platform,
+                &mut loader,
+                &mut waits,
+                authority,
+                &mut jobs,
+                10,
+            )
+        } else {
+            let mut waits = TerminalWaits;
+            poll_job_dispatcher(
+                &mut platform,
+                &mut loader,
+                &mut waits,
+                authority,
+                &mut jobs,
+                10,
+            )
+        };
+        assert_eq!(jobs.session_count(), 0);
+        assert_eq!(jobs.jobs.live_jobs(), 0);
+        (result.unwrap_err(), platform)
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    #[test]
+    fn e8_dispatch_failure_with_completed_cleanup_reports_the_initiating_error() {
+        let (error, platform) = poll_malformed_dispatch_with_emergency_cleanup(false, false);
+        assert_eq!(
+            error,
+            InitError::E8Transition {
+                operation: 0x0f,
+                initiating_kind: 0x02,
+                emergency_cleanup: E8EmergencyCleanup::Attempted {
+                    channel_close_failed: false,
+                    owner_cleanup_failed: false,
+                },
+            }
+        );
+        assert_eq!(
+            resident_tick_failure_application_status(&error),
+            0xAF18_0F02
+        );
+        assert_eq!(&platform.closed[..platform.close_count], &[DwHandle(90)]);
+        assert_eq!(platform.terminate_count, 0);
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    #[test]
+    fn e8_dispatch_failure_records_channel_cleanup_failure_separately() {
+        let (error, platform) = poll_malformed_dispatch_with_emergency_cleanup(true, false);
+        assert_eq!(
+            error,
+            InitError::E8Transition {
+                operation: 0x0f,
+                initiating_kind: 0x02,
+                emergency_cleanup: E8EmergencyCleanup::Attempted {
+                    channel_close_failed: true,
+                    owner_cleanup_failed: false,
+                },
+            }
+        );
+        assert_eq!(
+            resident_tick_failure_application_status(&error),
+            0xAF18_0F04
+        );
+        assert_eq!(&platform.closed[..platform.close_count], &[DwHandle(90)]);
+        assert_eq!(platform.terminate_count, 0);
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    #[test]
+    fn e8_dispatch_failure_records_owner_cleanup_failure_separately() {
+        let (error, platform) = poll_malformed_dispatch_with_emergency_cleanup(false, true);
+        assert_eq!(
+            error,
+            InitError::E8Transition {
+                operation: 0x0f,
+                initiating_kind: 0x02,
+                emergency_cleanup: E8EmergencyCleanup::Attempted {
+                    channel_close_failed: false,
+                    owner_cleanup_failed: true,
+                },
+            }
+        );
+        assert_eq!(
+            resident_tick_failure_application_status(&error),
+            0xAF18_0F04
+        );
+        assert_eq!(
+            &platform.closed[..platform.close_count],
+            &[DwHandle(90), DwHandle(102), DwHandle(101), DwHandle(103)]
+        );
+        assert_eq!(platform.terminate_count, 1);
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    #[test]
+    fn e8_dispatch_failure_records_both_cleanup_legs_without_a_second_error() {
+        let (error, platform) = poll_malformed_dispatch_with_emergency_cleanup(true, true);
+        assert_eq!(
+            error,
+            InitError::E8Transition {
+                operation: 0x0f,
+                initiating_kind: 0x02,
+                emergency_cleanup: E8EmergencyCleanup::Attempted {
+                    channel_close_failed: true,
+                    owner_cleanup_failed: true,
+                },
+            }
+        );
+        assert_eq!(
+            resident_tick_failure_application_status(&error),
+            0xAF18_0F04
+        );
+        assert_eq!(
+            &platform.closed[..platform.close_count],
+            &[DwHandle(90), DwHandle(102), DwHandle(101), DwHandle(103)]
+        );
+        assert_eq!(platform.terminate_count, 1);
+    }
+
     #[test]
     fn resident_poll_disconnects_but_preserves_received_move_cleanup_failure() {
         let image = executable();
@@ -7762,21 +7945,32 @@ mod tests {
         let owner = grant(EndpointKind::LaunchSession, 1, 1);
         jobs.install_session(owner, DwHandle(90)).unwrap();
 
-        assert_eq!(
-            poll_job_dispatcher(
-                &mut platform,
-                &mut loader,
-                &mut waits,
-                LoadAuthority {
-                    parent_root: DwHandle(1),
-                    bootfs: DwHandle(2),
-                    task_group: DwHandle(3),
-                },
-                &mut jobs,
-                10,
-            ),
-            Err(InitError::Cleanup)
+        let result = poll_job_dispatcher(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            LoadAuthority {
+                parent_root: DwHandle(1),
+                bootfs: DwHandle(2),
+                task_group: DwHandle(3),
+            },
+            &mut jobs,
+            10,
         );
+        #[cfg(feature = "wyr1e8-selector33")]
+        assert_eq!(
+            result,
+            Err(InitError::E8Transition {
+                operation: 0x0f,
+                initiating_kind: 0x04,
+                emergency_cleanup: E8EmergencyCleanup::Attempted {
+                    channel_close_failed: false,
+                    owner_cleanup_failed: false,
+                },
+            })
+        );
+        #[cfg(not(feature = "wyr1e8-selector33"))]
+        assert_eq!(result, Err(InitError::Cleanup));
         assert_eq!(jobs.session_count(), 0);
         assert_eq!(
             &platform.closed[..platform.close_count],

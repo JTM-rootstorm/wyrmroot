@@ -113,6 +113,35 @@ pub const fn fatal_application_status(_error: &InitError) -> InitApplicationStat
     InitApplicationStatus::FatalRebootRequired
 }
 
+/// E8-only record of the emergency dispatcher cleanup that followed an
+/// initiating error. This is private diagnostic state, not protocol or
+/// application-status ABI.
+#[cfg(feature = "wyr1e8-selector33")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum E8EmergencyCleanup {
+    NotRun,
+    DisconnectFailed,
+    Attempted {
+        channel_close_failed: bool,
+        owner_cleanup_failed: bool,
+    },
+}
+
+#[cfg(feature = "wyr1e8-selector33")]
+impl E8EmergencyCleanup {
+    const fn failed(self) -> bool {
+        match self {
+            Self::NotRun => false,
+            Self::DisconnectFailed => true,
+            Self::Attempted {
+                channel_close_failed,
+                owner_cleanup_failed,
+            } => channel_close_failed || owner_cleanup_failed,
+        }
+    }
+}
+
 /// E8-only operation that most narrowly returned an error during the bounded
 /// driver-recovery transition. These values are private diagnostic evidence,
 /// not protocol or application-status ABI.
@@ -162,7 +191,17 @@ const fn e8_failure_kind(error: &InitError) -> u8 {
         InitError::StartupMapping(_) | InitError::OrdinaryMapping(_) => 0x07,
         #[cfg(feature = "wyr1c6-selector29")]
         InitError::Wyr1C6GateConfig(_) => 0x08,
-        InitError::E8Transition { kind, .. } => *kind,
+        InitError::E8Transition {
+            initiating_kind,
+            emergency_cleanup,
+            ..
+        } => {
+            if emergency_cleanup.failed() {
+                0x04
+            } else {
+                *initiating_kind
+            }
+        }
         InitError::MissingAttemptResources
         | InitError::ResourcesAlreadyInstalled
         | InitError::Restart(_)
@@ -179,20 +218,57 @@ pub(crate) fn e8_operation<T>(
         InitError::E8Transition { .. } => error,
         _ => InitError::E8Transition {
             operation: operation as u8,
-            kind: e8_failure_kind(&error),
+            initiating_kind: e8_failure_kind(&error),
+            emergency_cleanup: E8EmergencyCleanup::NotRun,
         },
     })
 }
 
+#[cfg(feature = "wyr1e8-selector33")]
+pub(crate) fn e8_dispatch_failure(
+    error: InitError,
+    emergency_cleanup: E8EmergencyCleanup,
+) -> InitError {
+    match error {
+        InitError::E8Transition {
+            operation,
+            initiating_kind,
+            ..
+        } => InitError::E8Transition {
+            operation,
+            initiating_kind,
+            emergency_cleanup,
+        },
+        error => InitError::E8Transition {
+            operation: 0x0f,
+            initiating_kind: e8_failure_kind(&error),
+            emergency_cleanup,
+        },
+    }
+}
+
 /// Application detail for a fatal resident tick. E8 records the narrow
-/// operation that returned `Err`; every other build preserves the established
-/// coarse resident failure code.
+/// operation that returned `Err` and its initiating kind. If the dispatcher's
+/// emergency cleanup fails, the same operation is reported with existing kind
+/// `04` while the initiating kind remains in the private carrier. Every other
+/// build preserves the established coarse resident failure code.
 #[must_use]
 pub const fn resident_tick_failure_application_status(error: &InitError) -> u32 {
     #[cfg(feature = "wyr1e8-selector33")]
     {
         let (operation, kind) = match error {
-            InitError::E8Transition { operation, kind } => (*operation, *kind),
+            InitError::E8Transition {
+                operation,
+                initiating_kind,
+                emergency_cleanup,
+            } => (
+                *operation,
+                if emergency_cleanup.failed() {
+                    0x04
+                } else {
+                    *initiating_kind
+                },
+            ),
             _ => (0x0f, e8_failure_kind(error)),
         };
         let operation = match operation {
@@ -904,7 +980,8 @@ pub enum InitError {
     #[cfg(feature = "wyr1e8-selector33")]
     E8Transition {
         operation: u8,
-        kind: u8,
+        initiating_kind: u8,
+        emergency_cleanup: E8EmergencyCleanup,
     },
 }
 
@@ -4002,13 +4079,69 @@ mod native_cleanup_tests {
         assert_eq!(
             resident_tick_failure_application_status(&InitError::E8Transition {
                 operation: 0,
-                kind: 0,
+                initiating_kind: 0,
+                emergency_cleanup: E8EmergencyCleanup::NotRun,
             }),
             0xAF18_0F0F
         );
         assert_eq!(
             e8_operation(E8FailureOperation::RequestRetire, Ok::<_, InitError>(7)),
             Ok(7)
+        );
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    #[test]
+    fn e8_dispatch_failure_keeps_initiating_detail_and_cleanup_outcome_separate() {
+        let initiating = e8_operation::<()>(
+            E8FailureOperation::Quiesced,
+            Err(InitError::Native(NativeError::Status(
+                deepwyrm_syscall::DwStatus(-11),
+            ))),
+        )
+        .unwrap_err();
+        let cleanup = E8EmergencyCleanup::Attempted {
+            channel_close_failed: true,
+            owner_cleanup_failed: false,
+        };
+        let joined = e8_dispatch_failure(initiating, cleanup);
+        assert_eq!(
+            joined,
+            InitError::E8Transition {
+                operation: E8FailureOperation::Quiesced as u8,
+                initiating_kind: 0x05,
+                emergency_cleanup: cleanup,
+            }
+        );
+        assert_eq!(
+            resident_tick_failure_application_status(&joined),
+            0xAF18_0204
+        );
+
+        let completed = e8_dispatch_failure(
+            InitError::Accounting,
+            E8EmergencyCleanup::Attempted {
+                channel_close_failed: false,
+                owner_cleanup_failed: false,
+            },
+        );
+        assert_eq!(
+            resident_tick_failure_application_status(&completed),
+            0xAF18_0F02
+        );
+        assert_eq!(
+            e8_dispatch_failure(InitError::Accounting, E8EmergencyCleanup::DisconnectFailed),
+            InitError::E8Transition {
+                operation: 0x0f,
+                initiating_kind: 0x02,
+                emergency_cleanup: E8EmergencyCleanup::DisconnectFailed,
+            }
+        );
+        let disconnect_failed =
+            e8_dispatch_failure(InitError::Accounting, E8EmergencyCleanup::DisconnectFailed);
+        assert_eq!(
+            resident_tick_failure_application_status(&disconnect_failed),
+            0xAF18_0F04
         );
     }
 
