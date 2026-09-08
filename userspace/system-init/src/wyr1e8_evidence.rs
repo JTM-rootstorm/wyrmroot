@@ -524,11 +524,21 @@ fn validate_transition(stage: u32, old: ReadyState, new: ReadyState) -> Result<(
                 && new.ready.bundle_generation == old.ready.bundle_generation
         }
         4 => {
+            // Registry replacement retains the healthy driver and supervisor,
+            // but reissues every registry/publication/raw/shell authority from
+            // the strictly newer topology. Consoled-local counters may restart.
             fresh_shell
-                && old.tuple.registry_generation != new.tuple.registry_generation
-                && old.serial.publication_generation != new.serial.publication_generation
-                && old.ready.attach_transaction != new.ready.attach_transaction
-                && old.ready.stream_generation != new.ready.stream_generation
+                && new.tuple.registry_generation > old.tuple.registry_generation
+                && new.serial.publication_generation > old.serial.publication_generation
+                && new.serial.device_role_id == old.serial.device_role_id
+                && new.serial.driver_attempt_generation == old.serial.driver_attempt_generation
+                && new.serial.driver_control_endpoint_id == old.serial.driver_control_endpoint_id
+                && new.serial.driver_control_endpoint_generation
+                    == old.serial.driver_control_endpoint_generation
+                && new.serial.driver_launch_transaction == old.serial.driver_launch_transaction
+                && new.serial.supervisor_generation == old.serial.supervisor_generation
+                && new.ready.attach_transaction > old.ready.attach_transaction
+                && new.ready.stream_generation > old.ready.stream_generation
                 && old.ready.bundle_generation == new.ready.bundle_generation
         }
         _ => false,
@@ -937,6 +947,65 @@ mod tests {
         }
     }
 
+    #[test]
+    fn registry_replacement_retains_driver_and_refreshes_every_reissued_owner() {
+        let old_tuple = tuple(100);
+        let old = ReadyState {
+            tuple: old_tuple,
+            serial: SerialFacts {
+                publication_generation: 300,
+                device_role_id: 301,
+                driver_attempt_generation: 302,
+                driver_control_endpoint_id: 303,
+                driver_control_endpoint_generation: 304,
+                driver_launch_transaction: 305,
+                supervisor_generation: 306,
+            },
+            ready: ready(old_tuple, 400, 401, 402),
+        };
+        let new_tuple = ShellTuple {
+            console_generation: 1,
+            status_generation: 1,
+            shell_generation: 1,
+            outer_launch_transaction: 203,
+            outer_job_id: 204,
+            registry_generation: old_tuple.registry_generation + 1,
+            registry_endpoint_id: 206,
+            registry_endpoint_generation: 207,
+            shell_jobs_connection_id: 208,
+            shell_jobs_generation: 209,
+        };
+        let next = ReadyState {
+            tuple: new_tuple,
+            serial: SerialFacts {
+                publication_generation: 500,
+                ..old.serial
+            },
+            ready: ready(new_tuple, 600, 601, old.ready.bundle_generation),
+        };
+        assert_eq!(validate_transition(4, old, next), Ok(()));
+
+        let mut invalid = [next; 11];
+        invalid[0].tuple.registry_generation = old.tuple.registry_generation;
+        invalid[1].serial.publication_generation = old.serial.publication_generation;
+        invalid[2].serial.device_role_id = old.serial.device_role_id + 1;
+        invalid[3].serial.driver_attempt_generation = old.serial.driver_attempt_generation + 1;
+        invalid[4].serial.driver_control_endpoint_id = old.serial.driver_control_endpoint_id + 1;
+        invalid[5].serial.driver_control_endpoint_generation =
+            old.serial.driver_control_endpoint_generation + 1;
+        invalid[6].serial.driver_launch_transaction = old.serial.driver_launch_transaction + 1;
+        invalid[7].serial.supervisor_generation = old.serial.supervisor_generation + 1;
+        invalid[8].ready.attach_transaction = old.ready.attach_transaction;
+        invalid[9].ready.stream_generation = old.ready.stream_generation;
+        invalid[10].ready.bundle_generation = old.ready.bundle_generation + 1;
+        for candidate in invalid {
+            assert_eq!(
+                validate_transition(4, old, candidate),
+                Err(InitError::Accounting)
+            );
+        }
+    }
+
     fn forced_zero() -> TerminationResult {
         TerminationResult {
             classification: TerminationClassification::TaskGroupTeardown,
@@ -1194,7 +1263,7 @@ mod tests {
             shell_generation: 3,
             outer_launch_transaction: 42,
             outer_job_id: 43,
-            registry_generation: 44,
+            registry_generation: 1_000,
             registry_endpoint_id: 45,
             registry_endpoint_generation: 46,
             shell_jobs_connection_id: 47,

@@ -908,6 +908,19 @@ pub(crate) struct RegistryNativeAttempt {
     ready_at: u64,
 }
 
+#[cfg(all(test, feature = "wyr1e8-selector33"))]
+pub(crate) const fn registry_native_attempt_for_e8_fixture(
+    active: ActiveNativeRole,
+    control_channel: DwHandle,
+    ready_at: u64,
+) -> RegistryNativeAttempt {
+    RegistryNativeAttempt {
+        active,
+        control_channel,
+        ready_at,
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum PeerLaunchError {
     PreInstall(InitError),
@@ -6333,6 +6346,7 @@ mod tests {
         fail_send_on: Option<DwHandle>,
         now: u64,
         fail_now: bool,
+        allow_wait_until: bool,
         bootfs: Option<Vec<u8>>,
         #[cfg(feature = "wyr1e-selector33")]
         evidence: Vec<[u8; crate::wyr1e7_evidence::RECORD_BYTES]>,
@@ -6463,8 +6477,13 @@ mod tests {
             }
         }
 
-        fn wait_until(&mut self, _deadline_ns: u64) -> Result<(), NativeError> {
-            Err(FAILURE)
+        fn wait_until(&mut self, deadline_ns: u64) -> Result<(), NativeError> {
+            if self.allow_wait_until {
+                self.now = deadline_ns;
+                Ok(())
+            } else {
+                Err(FAILURE)
+            }
         }
     }
 
@@ -7120,6 +7139,7 @@ mod tests {
         profile: LaunchProfile,
         exited: bool,
         teardown_process: Option<DwHandle>,
+        running_process: Option<DwHandle>,
     }
 
     impl SupervisionPlatform for AcceptedJobV2Waits {
@@ -7160,8 +7180,11 @@ mod tests {
             process: DwHandle,
         ) -> Result<DwTaskTerminationInfoV1, Self::Error> {
             let teardown = self.teardown_process == Some(process);
+            let running = self.running_process == Some(process);
             Ok(DwTaskTerminationInfoV1 {
-                state: if self.exited || teardown {
+                state: if running {
+                    deepwyrm_syscall::DW_TASK_STATE_RUNNING
+                } else if self.exited || teardown {
                     DW_TASK_STATE_EXITED
                 } else {
                     deepwyrm_syscall::DW_TASK_STATE_RUNNING
@@ -11517,6 +11540,7 @@ mod tests {
             profile: LaunchProfile::JobV2,
             exited: false,
             teardown_process: None,
+            running_process: None,
         };
         let mut loader = InitSendLoader::new();
         loader.fail_init = false;

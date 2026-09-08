@@ -97,6 +97,45 @@ impl State {
         })
     }
 
+    #[cfg(all(test, feature = "wyr1e8-selector33"))]
+    pub(super) fn from_e8_registry_fixture(
+        shell: ShellControllerState,
+        jobs: JobDispatcher,
+        console: InstalledPeer,
+    ) -> Self {
+        Self {
+            jobs,
+            console: Some(console),
+            shell,
+            publication_observer: None,
+            awaiting_ready: false,
+            bootstrap_released: false,
+            ready_deadline: 0,
+            console_transaction: 0,
+            next_console_transaction: FIRST_CONSOLE_TRANSACTION,
+            next_publication_observer: FIRST_PUBLICATION_OBSERVER,
+            console_launch_attempts: 0,
+        }
+    }
+
+    #[cfg(all(test, feature = "wyr1e8-selector33"))]
+    pub(super) fn e8_fixture_publication_observer(&self) -> Option<(DwHandle, EndpointGrant, u64)> {
+        self.publication_observer.map(|observer| {
+            (
+                observer.client,
+                observer.grant,
+                observer.expected_service_generation,
+            )
+        })
+    }
+
+    #[cfg(all(test, feature = "wyr1e8-selector33"))]
+    pub(super) fn into_e8_registry_fixture_parts(
+        self,
+    ) -> (ShellControllerState, JobDispatcher, Option<InstalledPeer>) {
+        (self.shell, self.jobs, self.console)
+    }
+
     fn take_console_transaction(&mut self) -> Result<u64, InitError> {
         if self.console_launch_attempts >= WYR0_I_SUPERVISION_POLICY.max_attempts {
             return Err(InitError::Cleanup);

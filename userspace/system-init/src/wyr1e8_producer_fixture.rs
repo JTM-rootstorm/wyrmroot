@@ -405,6 +405,9 @@ fn recovery_policy_bootfs(image: &[u8]) -> (Vec<u8>, [u8; 32]) {
         .add(path.as_bytes(), image, FileMode::Executable)
         .unwrap();
     builder
+        .add(b"system/registryd", image, FileMode::Executable)
+        .unwrap();
+    builder
         .add(
             LAUNCH_POLICY_PATH.as_bytes(),
             &policy[..policy_len],
@@ -489,8 +492,19 @@ fn attach_serial(
     attach
 }
 
+fn detach_serial(attach: AttachCorrelation) -> ControlMessageV1_1 {
+    ControlMessageV1_1::StreamDetached {
+        identity: ControlIdentityV1_1 {
+            transaction_id: attach.attach_transaction_id,
+            ..attach.driver.control
+        },
+        stream_generation: attach.stream_generation,
+        publication_generation: attach.driver.publication_generation,
+    }
+}
+
 #[test]
-fn actual_driver_recovery_composes_dispatcher_barrier_drain_broker_and_s3_ready() {
+fn actual_driver_and_registry_recovery_compose_through_s4_ready() {
     let serial = crate::wyr1e8_evidence::SerialFacts {
         publication_generation: 20,
         device_role_id: 21,
@@ -608,7 +622,9 @@ fn actual_driver_recovery_composes_dispatcher_barrier_drain_broker_and_s3_ready(
         .observe_e8_serial_ready(&mut platform, s2_ready)
         .unwrap();
     assert_eq!(platform.e8_evidence.len(), 21);
-    state.set_e8_console_control(DwHandle(91)).unwrap();
+    state
+        .set_e8_console_control(console_owner.launch_channel)
+        .unwrap();
 
     let old_driver = published_driver(serial, s2_ready.bundle_generation);
     let mut broker = ConnectorBroker::new(
@@ -656,6 +672,7 @@ fn actual_driver_recovery_composes_dispatcher_barrier_drain_broker_and_s3_ready(
         profile: LaunchProfile::JobV2Streams,
         exited: false,
         teardown_process: Some(console_owner.process),
+        running_process: None,
     };
     let mut topology = RegistryTopology::new(s2.registry_generation).unwrap();
     let mut context = ShellLaunchContext {
@@ -812,7 +829,10 @@ fn actual_driver_recovery_composes_dispatcher_barrier_drain_broker_and_s3_ready(
         .state
         .e8_held_for_action(E8RecoveryAction::Driver)
         .unwrap();
-    context.state.clear_e8_console_control(DwHandle(91)).unwrap();
+    context
+        .state
+        .clear_e8_console_control(console_owner.launch_channel)
+        .unwrap();
     let retired = retire_console_product_with_result_before(
         &mut platform,
         &mut waits,
@@ -857,17 +877,72 @@ fn actual_driver_recovery_composes_dispatcher_barrier_drain_broker_and_s3_ready(
     assert!(new_attach.attach_transaction_id > old_attach.attach_transaction_id);
     assert!(new_attach.stream_generation > old_attach.stream_generation);
 
+    // Reissue the S3 console, registry-client, and ShellJobs authorities. The
+    // local generation counters may restart only because all owning endpoints
+    // and processes are new.
+    let s3_console_grant = context
+        .topology
+        .issue(310, EndpointKind::LaunchSession)
+        .unwrap();
+    let s3_grant = context
+        .topology
+        .issue(312, EndpointKind::LaunchSession)
+        .unwrap();
+    let s3_registry_client = context
+        .topology
+        .issue(312, EndpointKind::RegistryClient)
+        .unwrap();
+    let s3_console_session = DwHandle(189);
+    let s3_session = DwHandle(190);
+    let s3_console_owner = SessionOwner {
+        process: DwHandle(901),
+        launch_channel: DwHandle(902),
+        task_group: DwHandle(903),
+    };
+    jobs
+        .install_scoped_session(
+            s3_console_grant,
+            s3_console_session,
+            LaunchSessionScope::ConsoleLauncher,
+        )
+        .unwrap();
+    jobs
+        .attach_session_owner(s3_console_grant, s3_console_owner)
+        .unwrap();
+    let s3_outer_reservation = transaction(s3_console_grant, 313);
+    let s3_outer = jobs.jobs.begin_launch(s3_outer_reservation).unwrap();
+    jobs
+        .jobs
+        .commit_launch(
+            s3_outer,
+            s3_console_owner.process.0,
+            s3_console_owner.task_group.0,
+            s3_console_owner.launch_channel.0,
+        )
+        .unwrap();
+    jobs
+        .install_scoped_session(s3_grant, s3_session, LaunchSessionScope::ShellJobs)
+        .unwrap();
+    jobs.attach_outer_job(s3_grant, s3_outer.job_id).unwrap();
+    let s3_console_peer = InstalledPeer {
+        grant: s3_console_grant,
+        loaded: LoadedProcess {
+            process: s3_console_owner.process,
+            launch_channel: s3_console_owner.launch_channel,
+        },
+        task_group: s3_console_owner.task_group,
+    };
     let s3 = crate::wyr1e8_evidence::ShellTuple {
         console_generation: 1,
         status_generation: 1,
         shell_generation: 1,
-        outer_launch_transaction: 213,
-        outer_job_id: 214,
+        outer_launch_transaction: s3_outer_reservation.transaction_id,
+        outer_job_id: s3_outer.job_id,
         registry_generation: s2.registry_generation,
-        registry_endpoint_id: 216,
-        registry_endpoint_generation: 217,
-        shell_jobs_connection_id: 220,
-        shell_jobs_generation: 1,
+        registry_endpoint_id: s3_registry_client.endpoint_id,
+        registry_endpoint_generation: s3_registry_client.endpoint_generation,
+        shell_jobs_connection_id: s3_grant.endpoint_id,
+        shell_jobs_generation: s3_grant.endpoint_generation,
     };
     let s3_ready = crate::wyr1e8_evidence::SerialReady {
         console_generation: s3.console_generation,
@@ -887,6 +962,370 @@ fn actual_driver_recovery_composes_dispatcher_barrier_drain_broker_and_s3_ready(
     assert!(context.state.e8_shell_ready());
     assert_eq!(context.state.e8_trigger, None);
     assert_eq!(platform.e8_evidence.len(), 24);
+    context
+        .state
+        .set_e8_console_control(s3_console_owner.launch_channel)
+        .unwrap();
+
+    // Drive the S3 registry trigger through the same production dispatcher and
+    // held-WAIT barrier used by the driver leg.
+    let registry_reservation = transaction(s3_grant, 1);
+    let registry_token = format!("{:016X}", NONCE ^ E8_REGISTRY_TRIGGER_TOKEN_INDEX);
+    let mut registry_request = [0u8; wyrmroot_launch_proto::MAX_LAUNCH_MESSAGE_BYTES];
+    let registry_request_len = wyrmroot_launch_proto::encode_launch(
+        registry_reservation,
+        path,
+        &[
+            path,
+            wyrmroot_wyr1e_test_actors::RECOVERY_REGISTRY_ACTION,
+            registry_token.as_str(),
+        ],
+        &[],
+        true,
+        &mut registry_request,
+    )
+    .unwrap();
+    platform.push(
+        s3_session,
+        registry_request[..registry_request_len].to_vec(),
+        &handles.map(|info| info.handle),
+    );
+    waits.transaction_id = registry_reservation.transaction_id;
+    waits.exited = false;
+    waits.teardown_process = Some(s3_console_owner.process);
+    let registry_outcome = dispatch_one_job_request_with_shell(
+        &mut platform,
+        &mut loader,
+        &mut waits,
+        LoadAuthority {
+            parent_root: DwHandle(1),
+            bootfs: DwHandle(2),
+            task_group: DwHandle(3),
+        },
+        Some(&policy),
+        &mut jobs,
+        s3_session,
+        s3_grant,
+        &mut context,
+    )
+    .unwrap();
+    let JobDispatchOutcome::Launched(registry_actor) = registry_outcome else {
+        panic!("the real dispatcher must accept the S3 registry trigger")
+    };
+    assert_eq!(platform.e8_evidence.len(), 25);
+    assert!(matches!(
+        context.state.e8_trigger,
+        Some(E8Trigger {
+            identity: E8TriggerIdentity {
+                launch_transaction: 1,
+                job_id,
+                action: E8RecoveryAction::Registry,
+            },
+            ..
+        }) if job_id == registry_actor.job_id
+    ));
+
+    let registry_wait = transaction(s3_grant, 2);
+    let mut registry_wait_request = [0u8; 56];
+    let registry_wait_len = encode_job_message(
+        registry_wait,
+        LaunchMessageType::Wait,
+        registry_actor.job_id,
+        &mut registry_wait_request,
+    )
+    .unwrap();
+    platform.push(
+        s3_session,
+        registry_wait_request[..registry_wait_len].to_vec(),
+        &[],
+    );
+    assert_eq!(
+        dispatch_one_job_request_with_shell(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            LoadAuthority {
+                parent_root: DwHandle(1),
+                bootfs: DwHandle(2),
+                task_group: DwHandle(3),
+            },
+            Some(&policy),
+            &mut jobs,
+            s3_session,
+            s3_grant,
+            &mut context,
+        ),
+        Ok(JobDispatchOutcome::Responded)
+    );
+    waits.exited = true;
+    let released_registry_actor = jobs.jobs.loaded_job(registry_actor.job_id).unwrap();
+    assert_eq!(released_registry_actor.loaded.launch_channel, DwHandle(0));
+    assert_eq!(
+        reap_job(&mut platform, &mut waits, &mut jobs, released_registry_actor),
+        Ok(result(TerminationClassification::NormalExit, 0, 0, 0))
+    );
+    service_pending_wait_inner(
+        &mut platform,
+        &mut waits,
+        &mut jobs,
+        Some(&mut *context.state),
+    )
+    .unwrap();
+    let registry_quiesce =
+        wyrmroot_consoled::e8_control::parse(&platform.sent.last().unwrap().1).unwrap();
+    let wyrmroot_consoled::e8_control::Message::Quiesce(registry_identity) = registry_quiesce
+    else {
+        panic!("the registry held WAIT must emit its exact WRC8 request")
+    };
+    assert_eq!(registry_identity.trigger_wait_transaction, 2);
+    assert_eq!(
+        context
+            .state
+            .accept_e8_quiesced(registry_identity, platform.now),
+        Ok(E8RecoveryAction::Registry)
+    );
+
+    // The old consoled-side connector must become empty before its replacement
+    // can publish. This independent broker model preserves the nonempty and
+    // stale-correlation negatives while production init owns root recovery.
+    assert_eq!(broker.retire_current(), None);
+    assert!(matches!(broker.slot(), ConnectorSlot::RetiringActive { .. }));
+    let proposed_rebound_serial = crate::wyr1e8_evidence::SerialFacts {
+        publication_generation: 46,
+        ..new_serial
+    };
+    let proposed_rebound_driver =
+        published_driver(proposed_rebound_serial, s3_ready.bundle_generation);
+    assert!(broker
+        .replace_published_driver(proposed_rebound_driver)
+        .is_err());
+    broker.client_release_observed(new_attach).unwrap();
+    assert!(matches!(broker.slot(), ConnectorSlot::RetiringActive { .. }));
+    broker.driver_detached(detach_serial(new_attach)).unwrap();
+    assert_eq!(broker.slot(), ConnectorSlot::Empty);
+
+    // Cross the actual system-init recovery wrapper. It consumes the held WAIT,
+    // retires the old consoled and registry owners, launches the replacement
+    // registry, observes devmgr's exact WAIT, rebinds its publication, installs
+    // the current-driver watch, and consumes the matching generation event.
+    drop(context);
+    let driver_request = DriverLaunchRequest {
+        supervisor_generation: wyrmroot_device_proto::coordinator::SupervisorGeneration(
+            new_serial.supervisor_generation,
+        ),
+        role_id: RoleId(new_serial.device_role_id),
+        attempt_generation: AttemptGeneration(new_serial.driver_attempt_generation),
+        launch_session: wyrmroot_device_proto::coordinator::LaunchSessionGeneration(39),
+        endpoint: ControlEndpoint {
+            id: EndpointId(new_serial.driver_control_endpoint_id),
+            generation: EndpointGeneration(new_serial.driver_control_endpoint_generation),
+        },
+        transaction_id: new_serial.driver_launch_transaction,
+        driver_path: wyrmroot_device_proto::DEVICE_DRIVER_PATH,
+        actor_identity: wyrmroot_device_proto::manifest::ContentIdentity([0x5a; 32]),
+        child_is_channel: true,
+        child_rights: wyrmroot_device_proto::DirectControlRights::ExactReduced,
+    };
+    let devmgr_control = crate::wyr1c_native::E8_REGISTRY_FIXTURE_DEVMGR_CONTROL;
+    let mut waiting_status = [0u8; wyrmroot_device_proto::controller::STATUS_BYTES];
+    wyrmroot_device_proto::controller::encode(
+        wyrmroot_device_proto::controller::ControllerMessage::Status {
+            supervisor_generation: wyrmroot_device_proto::coordinator::SupervisorGeneration(
+                s3.registry_generation,
+            ),
+            binding: None,
+            transaction_id: 9,
+            status: wyrmroot_device_proto::controller::StatusCode::OperationalWaitingForRegistry,
+            attempt_generation: None,
+        },
+        &mut waiting_status,
+    )
+    .unwrap();
+    platform.push(devmgr_control, waiting_status.to_vec(), &[]);
+    let expected_rebound_binding = wyrmroot_device_proto::RegistryBinding {
+        generation: wyrmroot_device_proto::coordinator::RegistryGeneration(
+            s3.registry_generation + 1,
+        ),
+        endpoint: wyrmroot_device_proto::coordinator::RegistryEndpoint {
+            id: wyrmroot_device_proto::coordinator::RegistryEndpointId(4),
+            generation: wyrmroot_device_proto::coordinator::RegistryEndpointGeneration(1),
+        },
+    };
+    let mut rebound_status = [0u8; wyrmroot_device_proto::controller::STATUS_BYTES];
+    wyrmroot_device_proto::controller::encode(
+        wyrmroot_device_proto::controller::ControllerMessage::Status {
+            supervisor_generation: wyrmroot_device_proto::coordinator::SupervisorGeneration(
+                s3.registry_generation,
+            ),
+            binding: Some(expected_rebound_binding),
+            transaction_id: 10,
+            status:
+                wyrmroot_device_proto::controller::StatusCode::OperationalWaitingForDeviceBundle,
+            attempt_generation: None,
+        },
+        &mut rebound_status,
+    )
+    .unwrap();
+    platform.push(devmgr_control, rebound_status.to_vec(), &[]);
+    platform.allow_wait_until = true;
+    waits.transaction_id = 0xE8B5_0002;
+    waits.profile = LaunchProfile::BootstrapRegistry;
+    waits.exited = true;
+    waits.teardown_process = Some(s3_console_owner.process);
+    waits.running_process = Some(crate::wyr1c_native::E8_REGISTRY_FIXTURE_DRIVER_PROCESS);
+    let recovered = crate::wyr1c_native::exercise_e8_registry_recovery_orchestrator(
+        &mut platform,
+        &mut loader,
+        &mut waits,
+        &bootfs,
+        wyrmroot_runtime::sha256::digest(&image),
+        s3.registry_generation,
+        state,
+        jobs,
+        s3_console_peer,
+        topology,
+        driver_request,
+        |platform, channel, bytes| {
+            platform.push(channel, bytes.to_vec(), &[]);
+            Ok(())
+        },
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "production registry recovery failed: {error:?}; evidence={}, inbound={}/{}, moved={}, sent={}, closed={}, now={}",
+            platform.e8_evidence.len(),
+            platform.inbound_cursor,
+            platform.inbound.len(),
+            platform.moved.len(),
+            platform.sent.len(),
+            platform.closed.len(),
+            platform.now,
+        )
+    });
+    let replacement_registry_generation = recovered.registry_generation;
+    assert!(replacement_registry_generation > s3.registry_generation);
+    let rebound_serial = crate::wyr1e8_evidence::SerialFacts {
+        publication_generation: recovered.publication_generation,
+        ..new_serial
+    };
+    let rebound_driver = published_driver(rebound_serial, s3_ready.bundle_generation);
+    broker.replace_published_driver(rebound_driver).unwrap();
+    let rebound_attach = attach_serial(&mut broker, rebound_serial.publication_generation, 40);
+    assert!(rebound_attach.attach_transaction_id > new_attach.attach_transaction_id);
+    assert!(rebound_attach.stream_generation > new_attach.stream_generation);
+
+    let mut state = recovered.shell;
+    let mut jobs = recovered.jobs;
+    let mut topology = recovered.topology;
+    let context = ShellLaunchContext {
+        registry_control: DwHandle(0xE8B5_0010),
+        topology: &mut topology,
+        state: &mut state,
+    };
+    assert_eq!(platform.e8_evidence.len(), 26);
+    assert_eq!(jobs.session_count(), 0);
+    assert_eq!(jobs.jobs.live_jobs(), 0);
+
+    let s4_console_grant = context
+        .topology
+        .issue(410, EndpointKind::LaunchSession)
+        .unwrap();
+    let s4_registry_client = context
+        .topology
+        .issue(412, EndpointKind::RegistryClient)
+        .unwrap();
+    let s4_shell_jobs = context
+        .topology
+        .issue(412, EndpointKind::LaunchSession)
+        .unwrap();
+    let s4_console_session = DwHandle(192);
+    let s4_session = DwHandle(193);
+    let s4_console_owner = SessionOwner {
+        process: DwHandle(904),
+        launch_channel: DwHandle(905),
+        task_group: DwHandle(906),
+    };
+    jobs
+        .install_scoped_session(
+            s4_console_grant,
+            s4_console_session,
+            LaunchSessionScope::ConsoleLauncher,
+        )
+        .unwrap();
+    jobs
+        .attach_session_owner(s4_console_grant, s4_console_owner)
+        .unwrap();
+    let s4_outer_reservation = transaction(s4_console_grant, 413);
+    let s4_outer = jobs.jobs.begin_launch(s4_outer_reservation).unwrap();
+    jobs
+        .jobs
+        .commit_launch(
+            s4_outer,
+            s4_console_owner.process.0,
+            s4_console_owner.task_group.0,
+            s4_console_owner.launch_channel.0,
+        )
+        .unwrap();
+    jobs
+        .install_scoped_session(s4_shell_jobs, s4_session, LaunchSessionScope::ShellJobs)
+        .unwrap();
+    jobs
+        .attach_outer_job(s4_shell_jobs, s4_outer.job_id)
+        .unwrap();
+    let s4 = crate::wyr1e8_evidence::ShellTuple {
+        console_generation: 1,
+        status_generation: 1,
+        shell_generation: 1,
+        outer_launch_transaction: s4_outer_reservation.transaction_id,
+        outer_job_id: s4_outer.job_id,
+        registry_generation: replacement_registry_generation,
+        registry_endpoint_id: s4_registry_client.endpoint_id,
+        registry_endpoint_generation: s4_registry_client.endpoint_generation,
+        shell_jobs_connection_id: s4_shell_jobs.endpoint_id,
+        shell_jobs_generation: s4_shell_jobs.endpoint_generation,
+    };
+    let s4_ready = crate::wyr1e8_evidence::SerialReady {
+        console_generation: s4.console_generation,
+        status_generation: s4.status_generation,
+        shell_generation: s4.shell_generation,
+        attach_transaction: rebound_attach.attach_transaction_id,
+        stream_generation: rebound_attach.stream_generation,
+        bundle_generation: rebound_attach.driver.control.bundle_generation.0,
+    };
+    assert_ne!(s4_console_grant, s3_console_grant);
+
+    // Stale publication ownership and a duplicate old READY are terminal
+    // relation failures; neither may mutate the accepted observer.
+    let mut stale_publication_observer = context.state.e8_evidence;
+    let stale_before = stale_publication_observer;
+    assert_eq!(
+        stale_publication_observer.observe_serial(new_serial),
+        Err(InitError::Accounting)
+    );
+    assert_eq!(stale_publication_observer, stale_before);
+
+    context.state.stage_e8_shell_ready(&mut platform, s4).unwrap();
+    context
+        .state
+        .observe_e8_serial_ready(&mut platform, s4_ready)
+        .unwrap();
+    assert_eq!(context.state.e8_stage(), 4);
+    assert!(context.state.e8_shell_ready());
+    assert_eq!(context.state.e8_trigger, None);
+    assert_eq!(jobs.session_count(), 2);
+    assert_eq!(jobs.jobs.live_jobs(), 1);
+    assert_eq!(platform.e8_evidence.len(), 27);
+    assert_eq!(
+        context.state.stage_e8_shell_ready(&mut platform, s4),
+        Err(InitError::Accounting)
+    );
+    assert_eq!(
+        context
+            .state
+            .observe_e8_serial_ready(&mut platform, s4_ready),
+        Err(InitError::Accounting)
+    );
+    assert_eq!(platform.e8_evidence.len(), 27);
 
     std::println!();
     for record in &platform.e8_evidence {
