@@ -9,8 +9,9 @@ use crate::wyr1b_native::{
     retire_console_product_with_result_before,
 };
 use crate::wyr1b_native::{
-    InstalledPeer, ShellControllerState, ShellLaunchContext, create_controller_channel_pair,
-    install_client, poll_job_dispatcher_with_shell, retire_console_product,
+    InstalledPeer, JobDispatcherPollOutcome, ShellControllerState, ShellLaunchContext,
+    create_controller_channel_pair, install_client, poll_job_dispatcher_with_shell,
+    retire_console_product,
 };
 use deepwyrm_syscall::DW_TASK_STATE_RUNNING;
 use wyrmroot_loader::process::{ConsoledLoadRequest, load_consoled_process};
@@ -78,6 +79,33 @@ pub(super) enum PollOutcome {
     RecoverRegistry,
     #[cfg(feature = "wyr1e8-selector33")]
     RecoverRegistryForE8,
+}
+
+fn reconcile_job_dispatcher_outcome(
+    state: &mut State,
+    outcome: JobDispatcherPollOutcome,
+) -> Result<Option<PollOutcome>, InitError> {
+    let JobDispatcherPollOutcome::SessionClosed {
+        grant,
+        scope: LaunchSessionScope::ConsoleLauncher,
+    } = outcome
+    else {
+        return Ok(None);
+    };
+    let peer = state.console.ok_or(InitError::WrongActivationOrder)?;
+    if peer.grant != grant {
+        return Err(InitError::Accounting);
+    }
+    state.console = None;
+    state.awaiting_ready = false;
+    state.bootstrap_released = false;
+    state.console_transaction = 0;
+    #[cfg(feature = "wyr1e8-selector33")]
+    state
+        .shell
+        .clear_e8_console_control(peer.loaded.launch_channel)
+        .map_err(|_| InitError::Cleanup)?;
+    Ok(Some(PollOutcome::LaunchConsole))
 }
 
 impl State {
@@ -777,34 +805,43 @@ where
         .ok_or(InitError::WrongActivationOrder)?;
     let registry = state.registry.ok_or(InitError::WrongActivationOrder)?;
     let e6 = state.e6.as_mut().ok_or(InitError::WrongActivationOrder)?;
-    let mut shell = ShellLaunchContext {
-        registry_control: registry.control_channel,
-        topology: &mut state.topology,
-        state: &mut e6.shell,
-    };
     #[cfg(feature = "wyr1e8-selector33")]
-    let poll_shell_jobs = !shell.state.e8_tuple_waiting_for_serial();
+    let poll_shell_jobs = !e6.shell.e8_tuple_waiting_for_serial();
     #[cfg(not(feature = "wyr1e8-selector33"))]
     let poll_shell_jobs = true;
-    if poll_shell_jobs
-        && let Err(error) = poll_job_dispatcher_with_shell(
-            system,
-            loader,
-            waits,
-            authority,
-            &mut e6.jobs,
-            now,
-            &mut shell,
-        )
-    {
-        return if matches!(
-            e6.shell.health(),
-            crate::wyr1b_native::ShellRegistryHealth::Poisoned { .. }
-        ) {
-            Ok(PollOutcome::RecoverRegistry)
-        } else {
-            Err(error)
+    if poll_shell_jobs {
+        let dispatcher_result = {
+            let mut shell = ShellLaunchContext {
+                registry_control: registry.control_channel,
+                topology: &mut state.topology,
+                state: &mut e6.shell,
+            };
+            poll_job_dispatcher_with_shell(
+                system,
+                loader,
+                waits,
+                authority,
+                &mut e6.jobs,
+                now,
+                &mut shell,
+            )
         };
+        let dispatcher_outcome = match dispatcher_result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return if matches!(
+                    e6.shell.health(),
+                    crate::wyr1b_native::ShellRegistryHealth::Poisoned { .. }
+                ) {
+                    Ok(PollOutcome::RecoverRegistry)
+                } else {
+                    Err(error)
+                };
+            }
+        };
+        if let Some(outcome) = reconcile_job_dispatcher_outcome(e6, dispatcher_outcome)? {
+            return Ok(outcome);
+        }
     }
     if e6.awaiting_ready && now >= e6.ready_deadline {
         retire_current_console(e6, system, waits, state.topology.generation(), true)?;
@@ -1435,6 +1472,23 @@ mod tests {
         }
     }
 
+    fn console_peer() -> InstalledPeer {
+        InstalledPeer {
+            grant: EndpointGrant {
+                registry_generation: 7,
+                endpoint_id: 12,
+                endpoint_generation: 13,
+                role_generation: 14,
+                kind: EndpointKind::LaunchSession,
+            },
+            loaded: LoadedProcess {
+                process: DwHandle(94),
+                launch_channel: DwHandle(95),
+            },
+            task_group: DwHandle(96),
+        }
+    }
+
     fn generation_changed(observed: PublicationObserver) -> ([u8; 72], usize) {
         let mut bytes = [0u8; 72];
         let size = wyrmroot_registry_proto::encode_generation_changed(
@@ -1470,6 +1524,57 @@ mod tests {
             crate::wyr1b_native::ShellRegistryHealth::Healthy { generation: 8 }
         );
         assert!(state.take_console_transaction().is_ok());
+    }
+
+    #[test]
+    fn closed_console_session_discards_stale_owner_and_requests_fresh_launch() {
+        let peer = console_peer();
+        let mut state = State::new(7).unwrap();
+        state.console = Some(peer);
+        state.awaiting_ready = true;
+        state.bootstrap_released = true;
+        state.console_transaction = 23;
+        #[cfg(feature = "wyr1e8-selector33")]
+        state
+            .shell
+            .set_e8_console_control(peer.loaded.launch_channel)
+            .unwrap();
+
+        assert_eq!(
+            reconcile_job_dispatcher_outcome(
+                &mut state,
+                JobDispatcherPollOutcome::SessionClosed {
+                    grant: peer.grant,
+                    scope: LaunchSessionScope::ConsoleLauncher,
+                },
+            ),
+            Ok(Some(PollOutcome::LaunchConsole))
+        );
+        assert_eq!(state.console, None);
+        assert!(!state.awaiting_ready);
+        assert!(!state.bootstrap_released);
+        assert_eq!(state.console_transaction, 0);
+    }
+
+    #[test]
+    fn closed_console_session_with_wrong_grant_fails_without_discarding_owner() {
+        let peer = console_peer();
+        let mut state = State::new(7).unwrap();
+        state.console = Some(peer);
+        let mut wrong_grant = peer.grant;
+        wrong_grant.endpoint_generation += 1;
+
+        assert_eq!(
+            reconcile_job_dispatcher_outcome(
+                &mut state,
+                JobDispatcherPollOutcome::SessionClosed {
+                    grant: wrong_grant,
+                    scope: LaunchSessionScope::ConsoleLauncher,
+                },
+            ),
+            Err(InitError::Accounting)
+        );
+        assert_eq!(state.console, Some(peer));
     }
 
     #[test]

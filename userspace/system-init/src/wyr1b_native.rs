@@ -902,6 +902,15 @@ pub(crate) struct InstalledPeer {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum JobDispatcherPollOutcome {
+    Stable,
+    SessionClosed {
+        grant: EndpointGrant,
+        scope: LaunchSessionScope,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RegistryNativeAttempt {
     pub active: ActiveNativeRole,
     pub control_channel: DwHandle,
@@ -4892,7 +4901,7 @@ where
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
-    poll_job_dispatcher_inner(system, loader, waits, authority, jobs, now_ns, None)
+    poll_job_dispatcher_inner(system, loader, waits, authority, jobs, now_ns, None).map(|_| ())
 }
 
 /// E3C adapter for the selected console controller. The caller supplies the
@@ -4912,7 +4921,7 @@ pub(crate) fn poll_job_dispatcher_with_shell<S, L, W>(
     jobs: &mut JobDispatcher,
     now_ns: u64,
     shell: &mut ShellLaunchContext<'_>,
-) -> Result<(), InitError>
+) -> Result<JobDispatcherPollOutcome, InitError>
 where
     S: Wyr1BPlatform,
     L: LoaderPlatform<Error = NativeError>,
@@ -4930,12 +4939,13 @@ fn poll_job_dispatcher_inner<S, L, W>(
     jobs: &mut JobDispatcher,
     now_ns: u64,
     mut shell: Option<&mut ShellLaunchContext<'_>>,
-) -> Result<(), InitError>
+) -> Result<JobDispatcherPollOutcome, InitError>
 where
     S: Wyr1BPlatform,
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
+    let mut outcome = JobDispatcherPollOutcome::Stable;
     if let Some((grant, session)) = jobs.next_session() {
         let item = DwWaitItemV1 {
             handle: session,
@@ -5054,6 +5064,7 @@ where
                 if failed {
                     return Err(InitError::Cleanup);
                 }
+                outcome = JobDispatcherPollOutcome::SessionClosed { grant, scope };
             }
             Ok(_) => return Err(InitError::Supervision),
         }
@@ -5092,7 +5103,7 @@ where
     } else {
         service_pending_wait(system, waits, jobs)?;
     }
-    Ok(())
+    Ok(outcome)
 }
 
 fn service_pending_wait<S, W>(
@@ -10474,6 +10485,76 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[cfg(feature = "wyr1e-shell-controller")]
+    #[test]
+    fn e3c_console_peer_loss_reports_exact_closed_session_after_owner_cleanup() {
+        let console = grant(EndpointKind::LaunchSession, 1, 1);
+        let mut jobs = JobDispatcher::new();
+        jobs.install_scoped_session(console, DwHandle(90), LaunchSessionScope::ConsoleLauncher)
+            .unwrap();
+        jobs.attach_session_owner(
+            console,
+            SessionOwner {
+                process: DwHandle(91),
+                launch_channel: DwHandle(92),
+                task_group: DwHandle(93),
+            },
+        )
+        .unwrap();
+
+        let mut platform = ShellPlatform::new();
+        platform.session_readable = false;
+        platform.session_peer_closed = true;
+        let mut loader = InitSendLoader::new();
+        let mut waits = ShellWaits {
+            transaction: 1,
+            exited: true,
+            exit_after_running_check: false,
+            query_count: 0,
+        };
+        let mut topology = RegistryTopology::new(7).unwrap();
+        let mut shell_state = ShellControllerState::new(7).unwrap();
+        let mut context = ShellLaunchContext {
+            registry_control: DwHandle(70),
+            topology: &mut topology,
+            state: &mut shell_state,
+        };
+
+        let outcome = poll_job_dispatcher_with_shell(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            LoadAuthority {
+                parent_root: DwHandle(1),
+                bootfs: DwHandle(2),
+                task_group: DwHandle(3),
+            },
+            &mut jobs,
+            10,
+            &mut context,
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            JobDispatcherPollOutcome::SessionClosed {
+                grant: console,
+                scope: LaunchSessionScope::ConsoleLauncher,
+            }
+        );
+        assert_eq!(jobs.session_count(), 0);
+        for handle in [DwHandle(90), DwHandle(91), DwHandle(92)] {
+            assert_eq!(
+                platform
+                    .closed
+                    .iter()
+                    .filter(|closed| **closed == handle)
+                    .count(),
+                1
+            );
+        }
     }
 
     #[test]
