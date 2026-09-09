@@ -1463,7 +1463,7 @@ fn host_test_commands(filter: Option<&str>) -> Result<Vec<Vec<String>>, Failure>
     }
     if matches!(filter, Some("wyr1e8-model" | "wyr1e8-clippy")) {
         let lint = filter.is_some_and(|value| value.ends_with("clippy"));
-        return Ok([
+        let mut commands: Vec<Vec<String>> = [
             ("wyrmroot-system-init", Some("wyr1e8-selector33"), true),
             ("wyrmroot-devmgr", Some("wyr1e8-production"), true),
             (
@@ -1490,12 +1490,34 @@ fn host_test_commands(filter: Option<&str>) -> Result<Vec<Vec<String>>, Failure>
             if library {
                 arguments.push("--lib".to_owned());
             }
+            if lint && package == "wyrmroot-system-init" {
+                arguments.extend(["--test".to_owned(), "wyr1e8_recovery_source".to_owned()]);
+            }
             if lint {
                 arguments.extend(["--".to_owned(), "-D".to_owned(), "warnings".to_owned()]);
             }
             arguments
         })
-        .collect());
+        .collect();
+        // Running an integration target with native-init enabled also links
+        // the freestanding binary on the host. Execute source assertions with
+        // default features; Clippy additionally compiles the selected target.
+        let mut source = [
+            if lint { "clippy" } else { "test" },
+            "--locked",
+            "--offline",
+            "--package",
+            "wyrmroot-system-init",
+            "--test",
+            "wyr1e8_recovery_source",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        if lint {
+            source.extend(["--".to_owned(), "-D".to_owned(), "warnings".to_owned()]);
+        }
+        commands.push(source);
+        return Ok(commands);
     }
     if matches!(
         filter,
@@ -1969,7 +1991,7 @@ mod tests {
     fn wyr1e8_host_filters_cover_current_recovery_product_and_additive_builder() {
         for filter in ["wyr1e8-model", "wyr1e8-clippy"] {
             let commands = host_test_commands(Some(filter)).unwrap();
-            assert_eq!(commands.len(), 6);
+            assert_eq!(commands.len(), 7);
             for package in [
                 "wyrmroot-system-init",
                 "wyrmroot-devmgr",
@@ -1989,6 +2011,36 @@ mod tests {
                     .windows(2)
                     .any(|arguments| { arguments == ["--features", "wyr1e8-selector33"] })
             );
+            assert!(commands[0].iter().any(|argument| argument == "--lib"));
+            let source_target = commands[0]
+                .windows(2)
+                .position(|arguments| arguments == ["--test", "wyr1e8_recovery_source"]);
+            assert_eq!(source_target.is_some(), filter.ends_with("clippy"));
+            if let Some(lint_arguments) = commands[0].iter().position(|argument| argument == "--") {
+                assert!(source_target.unwrap() < lint_arguments);
+            }
+            assert!(commands[1..6].iter().all(|command| {
+                !command
+                    .iter()
+                    .any(|argument| argument == "wyr1e8_recovery_source")
+            }));
+            let mut expected_source = vec![
+                if filter.ends_with("clippy") {
+                    "clippy"
+                } else {
+                    "test"
+                },
+                "--locked",
+                "--offline",
+                "--package",
+                "wyrmroot-system-init",
+                "--test",
+                "wyr1e8_recovery_source",
+            ];
+            if filter.ends_with("clippy") {
+                expected_source.extend(["--", "-D", "warnings"]);
+            }
+            assert_eq!(commands[6], expected_source);
             assert!(
                 commands[1]
                     .windows(2)

@@ -152,6 +152,7 @@ impl E8EmergencyCleanup {
 #[repr(u8)]
 pub(crate) enum E8FailureOperation {
     TriggerWait = 0x01,
+    /// Explicit WRC8 response parsing, identity or post-receive lateness.
     Quiesced = 0x02,
     RequestRetire = 0x03,
     RetireDependents = 0x04,
@@ -159,6 +160,10 @@ pub(crate) enum E8FailureOperation {
     AcknowledgeReaped = 0x06,
     DriverRetired = 0x07,
     RebindPublication = 0x08,
+    /// The action-live guard, including expiry after ordinary READY receipt.
+    ActionDeadline = 0x09,
+    /// Ordinary registry/devmgr recovery requested while an action is active.
+    RecoveryFallback = 0x0a,
 }
 
 #[cfg(feature = "wyr1e8-selector33")]
@@ -274,7 +279,7 @@ pub const fn resident_tick_failure_application_status(error: &InitError) -> u32 
             _ => (0x0f, e8_failure_kind(error)),
         };
         let operation = match operation {
-            0x01..=0x08 | 0x0f => operation,
+            0x01..=0x0a | 0x0f => operation,
             _ => 0x0f,
         };
         let kind = match kind {
@@ -4009,10 +4014,17 @@ mod native_cleanup_tests {
     #[test]
     fn resident_tick_failure_detail_preserves_the_selected_profile() {
         #[cfg(not(feature = "wyr1e8-selector33"))]
-        assert_eq!(
-            resident_tick_failure_application_status(&InitError::Accounting),
-            0xAF01_0006
-        );
+        for error in [
+            InitError::Accounting,
+            InitError::Supervision,
+            InitError::Cleanup,
+            InitError::WrongActivationOrder,
+        ] {
+            assert_eq!(
+                resident_tick_failure_application_status(&error),
+                0xAF01_0006
+            );
+        }
 
         #[cfg(feature = "wyr1e8-selector33")]
         assert_eq!(
@@ -4033,6 +4045,8 @@ mod native_cleanup_tests {
             E8FailureOperation::AcknowledgeReaped,
             E8FailureOperation::DriverRetired,
             E8FailureOperation::RebindPublication,
+            E8FailureOperation::ActionDeadline,
+            E8FailureOperation::RecoveryFallback,
         ] {
             let error = e8_operation::<()>(operation, Err(InitError::Cleanup)).unwrap_err();
             assert_eq!(
@@ -4090,6 +4104,33 @@ mod native_cleanup_tests {
             e8_operation(E8FailureOperation::RequestRetire, Ok::<_, InitError>(7)),
             Ok(7)
         );
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    #[test]
+    fn recovery_supervision_failures_keep_their_source_family() {
+        for (operation, expected) in [
+            (E8FailureOperation::Quiesced, 0xAF18_0203),
+            (E8FailureOperation::ActionDeadline, 0xAF18_0903),
+            (E8FailureOperation::RecoveryFallback, 0xAF18_0A03),
+        ] {
+            let initiating =
+                e8_operation::<()>(operation, Err(InitError::Supervision)).unwrap_err();
+            let nested = e8_operation::<()>(E8FailureOperation::RebindPublication, Err(initiating))
+                .unwrap_err();
+            let dispatched = e8_dispatch_failure(
+                nested,
+                E8EmergencyCleanup::Attempted {
+                    channel_close_failed: false,
+                    owner_cleanup_failed: false,
+                },
+            );
+            assert_eq!(
+                resident_tick_failure_application_status(&dispatched),
+                expected
+            );
+            assert_eq!(e8_operation(operation, Ok::<_, InitError>(7)), Ok(7));
+        }
     }
 
     #[cfg(feature = "wyr1e8-selector33")]

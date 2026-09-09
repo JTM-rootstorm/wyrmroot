@@ -3525,7 +3525,10 @@ where
                 wyr1e::PollOutcome::RecoverDevmgr | wyr1e::PollOutcome::RecoverRegistry
             ) && wyr1e::e8_action_deadline(resident)?.is_some()
             {
-                return e8_operation(E8FailureOperation::Quiesced, Err(InitError::Supervision));
+                return e8_operation(
+                    E8FailureOperation::RecoveryFallback,
+                    Err(InitError::Supervision),
+                );
             }
             let size = system
                 .query_memory_object_size(resident.authority.bootfs)

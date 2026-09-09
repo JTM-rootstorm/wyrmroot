@@ -1082,7 +1082,10 @@ where
             retire_current_console(e6, system, waits, state.topology.generation(), true)?;
             #[cfg(feature = "wyr1e8-selector33")]
             if e6.shell.e8_action_expired(validated_at) {
-                return e8_operation(E8FailureOperation::Quiesced, Err(InitError::Supervision));
+                return e8_operation(
+                    E8FailureOperation::ActionDeadline,
+                    Err(InitError::Supervision),
+                );
             }
             return Ok(PollOutcome::RecoverRegistry);
         }
@@ -1119,7 +1122,7 @@ pub(super) fn ensure_e8_action_live(
         .and_then(|state| state.e6.as_ref())
         .ok_or(InitError::WrongActivationOrder)?;
     e8_operation(
-        E8FailureOperation::Quiesced,
+        E8FailureOperation::ActionDeadline,
         state.shell.require_e8_action_live_at(now),
     )
 }

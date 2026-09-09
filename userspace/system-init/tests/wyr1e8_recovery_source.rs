@@ -1,9 +1,12 @@
+#[cfg(any(feature = "wyr1d-selector32", feature = "wyr1e-production"))]
+use wyrmroot_consoled as _;
+#[cfg(feature = "wyr1e8-selector33")]
+use wyrmroot_wyr1e_test_actors as _;
 use {
-    deepwyrm_syscall as _, wyrmroot_bootfs as _, wyrmroot_consoled as _,
-    wyrmroot_device_proto as _, wyrmroot_devmgr as _, wyrmroot_launch_proto as _,
-    wyrmroot_loader as _, wyrmroot_registry_proto as _, wyrmroot_rrc_manifest as _,
-    wyrmroot_runtime as _, wyrmroot_system_init as _, wyrmroot_uart16550d as _,
-    wyrmroot_wyr1b_gate_proto as _, wyrmroot_wyr1e_test_actors as _,
+    deepwyrm_syscall as _, wyrmroot_bootfs as _, wyrmroot_device_proto as _, wyrmroot_devmgr as _,
+    wyrmroot_launch_proto as _, wyrmroot_loader as _, wyrmroot_registry_proto as _,
+    wyrmroot_rrc_manifest as _, wyrmroot_runtime as _, wyrmroot_system_init as _,
+    wyrmroot_uart16550d as _, wyrmroot_wyr1b_gate_proto as _,
 };
 
 const MANIFEST: &str = include_str!("../Cargo.toml");
@@ -44,7 +47,17 @@ fn e8_shell_ready_requires_matching_tuple_and_authenticated_serial_facts() {
     let observe = poll.find("observe_e8_serial_ready(").unwrap();
     assert!(facts < observe);
     assert!(poll.contains("bundle_generation: facts.bundle_generation"));
-    assert!(poll.contains("e8_tuple_waiting_for_serial()"));
+    assert!(poll.contains("e6.shell.job_dispatcher_poll_allowed()"));
+    let admission = &JOBS[JOBS
+        .find("pub(crate) const fn job_dispatcher_poll_allowed")
+        .unwrap()
+        ..JOBS
+            .find("pub(crate) const fn routine_console_relaunch_allowed")
+            .unwrap()];
+    assert!(
+        admission
+            .contains("self.e8_held.is_none() && !self.e8_evidence.tuple_waiting_for_serial()")
+    );
 
     let launch = &JOBS[JOBS.find("fn dispatch_one_job_request_inner").unwrap()
         ..JOBS.find("pub(crate) fn poll_job_dispatcher").unwrap()];
@@ -59,7 +72,7 @@ fn e8_shell_ready_requires_matching_tuple_and_authenticated_serial_facts() {
     ));
     assert!(attach.contains("let correlation = serial_correlation(authorities, identity);"));
     let correlation = &CONSOLED[CONSOLED.find("fn serial_correlation(").unwrap()
-        ..CONSOLED.find("fn valid_serial_event(").unwrap()];
+        ..CONSOLED.find("fn serial_correlates(").unwrap()];
     assert!(correlation.contains("connector_client_transaction: identity.client_transaction_id"));
 }
 
@@ -185,6 +198,47 @@ fn driver_exit_uses_the_reached_production_owner_order() {
     ] {
         assert!(DEVMGR.contains(reached_broker_step));
     }
+}
+
+#[test]
+fn supervision_discriminator_stays_at_the_three_existing_failure_sources() {
+    let guard = &NATIVE[NATIVE.find("pub(super) fn ensure_e8_action_live(").unwrap()
+        ..NATIVE.find("fn retire_current_console<").unwrap()];
+    assert!(guard.contains("E8FailureOperation::ActionDeadline"));
+    assert!(guard.contains("state.shell.require_e8_action_live_at(now)"));
+    assert!(!guard.contains("E8FailureOperation::Quiesced"));
+
+    let late_ready_start = NATIVE.find("if validated_at >= e6.ready_deadline").unwrap();
+    let late_ready = &NATIVE[late_ready_start..];
+    let late_ready = &late_ready[..late_ready.find("e6.awaiting_ready = false;").unwrap()];
+    assert!(late_ready.contains("e6.shell.e8_action_expired(validated_at)"));
+    assert!(late_ready.contains("E8FailureOperation::ActionDeadline"));
+    assert!(!late_ready.contains("E8FailureOperation::Quiesced"));
+
+    let response = &NATIVE[NATIVE
+        .find("if bytes[..counts.bytes].starts_with(b\"WRC8\")")
+        .unwrap()
+        ..NATIVE
+            .find("if wyrmroot_loader::launch::parse_ready_for_profile")
+            .unwrap()];
+    assert_eq!(response.matches("E8FailureOperation::Quiesced").count(), 4);
+    assert!(response.contains("e6.shell.require_e8_action_live_at(quiesced_at)"));
+    assert!(response.contains("e6.shell.accept_e8_quiesced(identity, quiesced_at)"));
+    assert!(!response.contains("E8FailureOperation::ActionDeadline"));
+    assert!(!response.contains("E8FailureOperation::RecoveryFallback"));
+
+    let fallback_start = RESIDENT.find("let outcome = wyr1e::poll(").unwrap();
+    let fallback = &RESIDENT[fallback_start..];
+    let fallback = &fallback[..fallback.find("let size = system").unwrap()];
+    assert!(fallback.contains("#[cfg(feature = \"wyr1e8-selector33\")]"));
+    assert!(
+        fallback
+            .contains("wyr1e::PollOutcome::RecoverDevmgr | wyr1e::PollOutcome::RecoverRegistry")
+    );
+    assert!(fallback.contains("wyr1e::e8_action_deadline(resident)?.is_some()"));
+    assert!(fallback.contains("E8FailureOperation::RecoveryFallback"));
+    assert!(fallback.contains("Err(InitError::Supervision)"));
+    assert!(!fallback.contains("E8FailureOperation::Quiesced"));
 }
 
 #[test]
