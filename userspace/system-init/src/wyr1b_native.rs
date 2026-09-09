@@ -342,6 +342,18 @@ impl ShellControllerState {
     }
 
     #[cfg(feature = "wyr1e8-selector33")]
+    pub(crate) const fn job_dispatcher_poll_allowed(&self) -> bool {
+        self.e8_held.is_none() && !self.e8_evidence.tuple_waiting_for_serial()
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    pub(crate) const fn routine_console_relaunch_allowed(&self) -> bool {
+        self.e8_trigger.is_none()
+            && self.e8_held.is_none()
+            && !self.e8_evidence.tuple_waiting_for_serial()
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
     pub(crate) const fn e8_stage(&self) -> u32 {
         self.e8_evidence.stage()
     }
@@ -10160,6 +10172,8 @@ mod tests {
     fn e8_action_keeps_its_deadline_across_preheld_held_and_recovery_states() {
         let mut state = e8_state_for_held_wait(40);
         assert_eq!(state.e8_action_deadline(), Some(200));
+        assert!(state.job_dispatcher_poll_allowed());
+        assert!(!state.routine_console_relaunch_allowed());
         assert!(!state.e8_action_expired(199));
         assert!(state.e8_action_expired(200));
         assert_eq!(
@@ -10176,6 +10190,8 @@ mod tests {
             Ok(true)
         );
         let held = state.e8_held.unwrap();
+        assert!(!state.job_dispatcher_poll_allowed());
+        assert!(!state.routine_console_relaunch_allowed());
         assert_eq!(held.deadline, 200);
         assert_eq!(
             state.e8_held_for_action(E8RecoveryAction::Registry),
@@ -10186,9 +10202,13 @@ mod tests {
             state.accept_e8_quiesced(held.identity, 199),
             Ok(E8RecoveryAction::Driver)
         );
+        assert!(!state.job_dispatcher_poll_allowed());
+        assert!(!state.routine_console_relaunch_allowed());
         let taken = state.e8_held_for_action(E8RecoveryAction::Driver).unwrap();
         assert_eq!(taken.deadline, 200);
         state.consume_e8_held(taken);
+        assert!(state.job_dispatcher_poll_allowed());
+        assert!(!state.routine_console_relaunch_allowed());
         assert_eq!(state.e8_action_deadline(), Some(200));
         assert_eq!(state.e8_pending_action(), Some(E8RecoveryAction::Driver));
 

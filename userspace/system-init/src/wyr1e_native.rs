@@ -96,6 +96,10 @@ fn reconcile_job_dispatcher_outcome(
     if peer.grant != grant {
         return Err(InitError::Accounting);
     }
+    #[cfg(feature = "wyr1e8-selector33")]
+    if !state.shell.routine_console_relaunch_allowed() {
+        return Err(InitError::Supervision);
+    }
     state.console = None;
     state.awaiting_ready = false;
     state.bootstrap_released = false;
@@ -806,7 +810,7 @@ where
     let registry = state.registry.ok_or(InitError::WrongActivationOrder)?;
     let e6 = state.e6.as_mut().ok_or(InitError::WrongActivationOrder)?;
     #[cfg(feature = "wyr1e8-selector33")]
-    let poll_shell_jobs = !e6.shell.e8_tuple_waiting_for_serial();
+    let poll_shell_jobs = e6.shell.job_dispatcher_poll_allowed();
     #[cfg(not(feature = "wyr1e8-selector33"))]
     let poll_shell_jobs = true;
     if poll_shell_jobs {
@@ -876,6 +880,8 @@ where
         Ok(observed) => observed,
     };
     if observed.index == 0 && observed.observed.0 & DW_SIGNAL_EXITED.0 != 0 {
+        #[cfg(feature = "wyr1e8-selector33")]
+        let relaunch_allowed = e6.shell.routine_console_relaunch_allowed();
         let peer = e6.console.take().ok_or(InitError::WrongActivationOrder)?;
         e6.awaiting_ready = false;
         e6.bootstrap_released = false;
@@ -891,6 +897,10 @@ where
             return Err(InitError::Cleanup);
         }
         cleanup?;
+        #[cfg(feature = "wyr1e8-selector33")]
+        if !relaunch_allowed {
+            return Err(InitError::Supervision);
+        }
         return Ok(PollOutcome::LaunchConsole);
     }
     if observed.index != 1 {
