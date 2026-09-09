@@ -356,6 +356,11 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
     let mut selector32_drain = wyrmroot_devmgr::d5_drain::DrainRelay::default();
     #[cfg(feature = "wyr1e8-production")]
     let mut e8_retire_requested = false;
+    #[cfg(all(
+        not(feature = "wyr1e8-production"),
+        any(feature = "wyr1c6-production", feature = "dw1e3-selector31")
+    ))]
+    let e8_retire_requested = false;
     #[cfg(feature = "wyr1c4-production")]
     let mut _device_resource = None;
     #[cfg(feature = "wyr1c5-production")]
@@ -924,6 +929,7 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                     &mut resident,
                     observed.observed.0 & DW_SIGNAL_READABLE.0 != 0,
                     observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0,
+                    e8_retire_requested,
                 )?;
                 #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
                 {
@@ -1052,6 +1058,13 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                     },
                 )?;
                 send_driver_retired(bootstrap, request)?;
+                #[cfg(feature = "wyr1e8-production")]
+                {
+                    // The exact retired attempt is now terminal and fully
+                    // reaped.  A later replacement failure is ordinary unless
+                    // init issues another exact RequestRetire.
+                    e8_retire_requested = false;
+                }
                 #[cfg(feature = "wyr1d-selector32")]
                 {
                     let release_deadline =
@@ -1996,11 +2009,10 @@ fn observe_driver_failure(
     resident: &mut wyrmroot_devmgr::ResidentController,
     readable: bool,
     peer_closed: bool,
+    intentional_retirement: bool,
 ) -> Result<(), u32> {
     if !readable {
-        return resident
-            .driver_failed(request.endpoint)
-            .map_err(|_| failure(105));
+        return record_driver_terminal(resident, request, intentional_retirement);
     }
     let mut bytes = [0u8; wyrmroot_device_proto::control::FAILURE_BYTES];
     let mut handles = [DwReceivedHandleInfoV1::default(); 1];
@@ -2008,9 +2020,7 @@ fn observe_driver_failure(
     if counts.bytes != bytes.len() || counts.handles != 0 {
         close_received(&handles, counts.handles);
         if peer_closed && counts.bytes == 0 && counts.handles == 0 {
-            return resident
-                .driver_failed(request.endpoint)
-                .map_err(|_| failure(105));
+            return record_driver_terminal(resident, request, intentional_retirement);
         }
         return Err(failure(101));
     }
@@ -2033,6 +2043,20 @@ fn observe_driver_failure(
     #[cfg(feature = "wyr1c6-selector29")]
     if !selector29_should_fail(request.supervisor_generation, request.attempt_generation) {
         return Err(failure(104));
+    }
+    record_driver_terminal(resident, request, intentional_retirement)
+}
+
+#[cfg(any(feature = "wyr1c6-production", feature = "dw1e3-selector31"))]
+fn record_driver_terminal(
+    resident: &mut wyrmroot_devmgr::ResidentController,
+    request: wyrmroot_device_proto::DriverLaunchRequest,
+    intentional_retirement: bool,
+) -> Result<(), u32> {
+    if intentional_retirement {
+        return resident
+            .accept_intentional_driver_terminal(request)
+            .map_err(|_| failure(105));
     }
     resident
         .driver_failed(request.endpoint)

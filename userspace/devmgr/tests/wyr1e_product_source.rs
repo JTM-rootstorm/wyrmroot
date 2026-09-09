@@ -139,6 +139,41 @@ fn e8_accepts_only_the_exact_current_driver_retire_request() {
 }
 
 #[test]
+fn e8_intentional_terminal_preserves_failure_validation_and_cleanup_state() {
+    let driver_branch = &NATIVE[NATIVE.find("if Some(index) == driver_index").unwrap()
+        ..NATIVE.find("if Some(index) != publication_index").unwrap()];
+    let observe_call = driver_branch.find("observe_driver_failure(").unwrap();
+    let observe_call = &driver_branch[observe_call..];
+    let observe_call = &observe_call[..observe_call.find(")?;").unwrap()];
+    assert!(observe_call.contains("e8_retire_requested"));
+
+    let observe = &NATIVE[NATIVE.find("fn observe_driver_failure(").unwrap()
+        ..NATIVE.find("fn retire_driver_publication(").unwrap()];
+    let counts = observe.find("counts.bytes != bytes.len()").unwrap();
+    let parse = observe.find("control::parse(&bytes)").unwrap();
+    let exact_message = observe.find("if message != expected").unwrap();
+    let terminal = observe.rfind("record_driver_terminal(").unwrap();
+    assert!(counts < parse && parse < exact_message && exact_message < terminal);
+    assert!(observe.contains("if peer_closed && counts.bytes == 0 && counts.handles == 0"));
+
+    let terminal_helper = &observe[observe.find("fn record_driver_terminal(").unwrap()..];
+    let intentional = terminal_helper
+        .find("accept_intentional_driver_terminal(request)")
+        .unwrap();
+    let unexpected = terminal_helper
+        .find("driver_failed(request.endpoint)")
+        .unwrap();
+    assert!(intentional < unexpected);
+
+    let retired = driver_branch
+        .find("send_driver_retired(bootstrap, request)?")
+        .unwrap();
+    let clear = driver_branch.find("e8_retire_requested = false").unwrap();
+    let rebind = driver_branch.find("let rebind_deadline =").unwrap();
+    assert!(retired < clear && clear < rebind);
+}
+
+#[test]
 fn production_connector_services_offer_and_generic_detach_without_test_evidence() {
     assert!(NATIVE.contains("feature = \"wyr1e-production\""));
     let service = &NATIVE[NATIVE.find("fn service_production_driver_control").unwrap()

@@ -586,6 +586,25 @@ impl ResidentController {
         Ok(())
     }
 
+    /// Accepts the exact terminal observation for a driver whose intentional
+    /// retirement already opened cleanup. This is distinct from
+    /// `driver_failed`: `retire_message` has already invalidated publication
+    /// and performed the one-way transition to `CleaningUp`.
+    pub fn accept_intentional_driver_terminal(
+        &mut self,
+        request: DriverLaunchRequest,
+    ) -> Result<(), DevmgrError> {
+        if self.status.state != CoordinatorState::CleaningUp
+            || !self.driver_ready
+            || self.publication_current
+            || self.active_driver_request() != Some(request)
+        {
+            return Err(DevmgrError::ControllerLifecycle);
+        }
+        self.driver_ready = false;
+        Ok(())
+    }
+
     /// Allocates the endpoint-local registry transaction used to retire the
     /// failed driver's publication. Publish has already completed with the
     /// launch transaction, so replay protection requires a distinct identity.
@@ -1271,6 +1290,61 @@ mod tests {
             resident.retire_message(),
             Err(DevmgrError::ControllerLifecycle)
         );
+    }
+
+    #[test]
+    fn e8_intentional_driver_terminal_is_exact_once_after_retire() {
+        let mut resident =
+            ResidentController::new(prepare_operational(&manifest(), 7).unwrap(), 41).unwrap();
+        resident.accept(install(binding(1, 7), 41), 0).unwrap();
+        resident.admit_device_resource(exact_resource(19)).unwrap();
+        let request = resident
+            .issue_driver_launch_with_bundle(true, DirectControlRights::ExactReduced)
+            .unwrap();
+        resident.driver_constructed().unwrap();
+        resident.resource_bundle_message().unwrap();
+        resident.bundle_transferred().unwrap();
+        resident
+            .accept_driver_ready(wyrmroot_device_proto::ControlMessage::Ready {
+                role_id: request.role_id,
+                bundle_generation: BundleGeneration(19),
+                attempt_generation: request.attempt_generation,
+                endpoint: request.endpoint,
+                transaction_id: request.transaction_id,
+            })
+            .unwrap();
+        resident.publication_committed().unwrap();
+
+        let published = resident;
+        assert_eq!(
+            resident.accept_intentional_driver_terminal(request),
+            Err(DevmgrError::ControllerLifecycle)
+        );
+        assert_eq!(resident, published);
+
+        resident.retire_message().unwrap();
+        assert_eq!(resident.status().state, CoordinatorState::CleaningUp);
+        let retiring = resident;
+        let mut stale = request;
+        stale.endpoint.id = EndpointId(request.endpoint.id.0 + 1);
+        assert_eq!(
+            resident.accept_intentional_driver_terminal(stale),
+            Err(DevmgrError::ControllerLifecycle)
+        );
+        assert_eq!(resident, retiring);
+
+        resident
+            .accept_intentional_driver_terminal(request)
+            .unwrap();
+        assert_eq!(resident.status().state, CoordinatorState::CleaningUp);
+        assert!(!resident.driver_ready());
+        assert_eq!(resident.active_driver_request(), Some(request));
+        let accepted = resident;
+        assert_eq!(
+            resident.accept_intentional_driver_terminal(request),
+            Err(DevmgrError::ControllerLifecycle)
+        );
+        assert_eq!(resident, accepted);
     }
 
     #[test]
