@@ -1190,7 +1190,12 @@ where
             waits,
             &mut e6.jobs,
             peer,
-            true,
+            // Closing the ConsoleLauncher session is consoled's graceful
+            // retirement signal. Let it close the child status endpoint before
+            // stdout, then force-clean only the outer shell below. Immediate
+            // consoled task-group teardown races that ordering and can expose
+            // stdout loss instead of the required status-loss result.
+            false,
             held.deadline,
         ),
         None => retire_console_product_with_result(system, waits, &mut e6.jobs, peer, true),

@@ -6328,6 +6328,7 @@ mod tests {
     };
 
     const FAILURE: NativeError = NativeError::Status(DwStatus(-1));
+    const WYRMSH_CONSOLE_STATUS_LOST: u32 = 0x5745_0104;
 
     struct MockPlatform {
         sent: [u8; 256],
@@ -6362,6 +6363,7 @@ mod tests {
         sent: Vec<(DwHandle, Vec<u8>)>,
         moved: Vec<(DwHandle, Vec<u8>, DwHandleTransferV1)>,
         closed: Vec<DwHandle>,
+        terminated_task_groups: Vec<DwHandle>,
         next_channel: u64,
         session_readable: bool,
         session_peer_closed: bool,
@@ -6488,7 +6490,8 @@ mod tests {
             Ok(DwHandle(300))
         }
 
-        fn terminate_task_group(&mut self, _task_group: DwHandle) -> Result<(), NativeError> {
+        fn terminate_task_group(&mut self, task_group: DwHandle) -> Result<(), NativeError> {
+            self.terminated_task_groups.push(task_group);
             Ok(())
         }
 
@@ -7161,7 +7164,7 @@ mod tests {
         transaction_id: u64,
         profile: LaunchProfile,
         exited: bool,
-        teardown_process: Option<DwHandle>,
+        console_status_lost_process: Option<DwHandle>,
         running_process: Option<DwHandle>,
     }
 
@@ -7202,20 +7205,21 @@ mod tests {
             &mut self,
             process: DwHandle,
         ) -> Result<DwTaskTerminationInfoV1, Self::Error> {
-            let teardown = self.teardown_process == Some(process);
+            let status_lost = self.console_status_lost_process == Some(process);
             let running = self.running_process == Some(process);
             Ok(DwTaskTerminationInfoV1 {
                 state: if running {
                     deepwyrm_syscall::DW_TASK_STATE_RUNNING
-                } else if self.exited || teardown {
+                } else if self.exited || status_lost {
                     DW_TASK_STATE_EXITED
                 } else {
                     deepwyrm_syscall::DW_TASK_STATE_RUNNING
                 },
-                reason: if teardown {
-                    DW_TERMINATION_TASK_GROUP_TEARDOWN
+                reason: DW_TERMINATION_NORMAL_EXIT,
+                application_code: if status_lost {
+                    WYRMSH_CONSOLE_STATUS_LOST
                 } else {
-                    DW_TERMINATION_NORMAL_EXIT
+                    0
                 },
                 ..DwTaskTerminationInfoV1::default()
             })
@@ -11628,7 +11632,7 @@ mod tests {
             transaction_id: reservation(1).transaction_id,
             profile: LaunchProfile::JobV2,
             exited: false,
-            teardown_process: None,
+            console_status_lost_process: None,
             running_process: None,
         };
         let mut loader = InitSendLoader::new();

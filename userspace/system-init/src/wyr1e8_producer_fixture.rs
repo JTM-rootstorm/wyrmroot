@@ -577,13 +577,16 @@ fn actual_driver_and_registry_recovery_compose_through_s4_ready() {
     jobs.attach_session_owner(console_grant, console_owner).unwrap();
     let outer_reservation = transaction(console_grant, 113);
     let outer = jobs.jobs.begin_launch(outer_reservation).unwrap();
+    let outer_process = DwHandle(811);
+    let outer_task_group = DwHandle(812);
+    let outer_launch_channel = DwHandle(813);
     jobs
         .jobs
         .commit_launch(
             outer,
-            console_owner.process.0,
-            console_owner.task_group.0,
-            console_owner.launch_channel.0,
+            outer_process.0,
+            outer_task_group.0,
+            outer_launch_channel.0,
         )
         .unwrap();
     jobs
@@ -670,7 +673,7 @@ fn actual_driver_and_registry_recovery_compose_through_s4_ready() {
         transaction_id: reservation.transaction_id,
         profile: LaunchProfile::JobV2Streams,
         exited: false,
-        teardown_process: Some(console_owner.process),
+        console_status_lost_process: Some(outer_process),
         running_process: None,
     };
     let mut topology = RegistryTopology::new(s2.registry_generation).unwrap();
@@ -837,15 +840,24 @@ fn actual_driver_and_registry_recovery_compose_through_s4_ready() {
         &mut waits,
         &mut jobs,
         console_peer,
-        true,
+        false,
         held.deadline,
     )
     .unwrap()
     .unwrap();
     assert_eq!(
         retired,
-        result(TerminationClassification::TaskGroupTeardown, 0, 0, 0)
+        result(
+            TerminationClassification::NormalExit,
+            WYRMSH_CONSOLE_STATUS_LOST,
+            0,
+            0,
+        )
     );
+    assert!(!platform
+        .terminated_task_groups
+        .contains(&console_owner.task_group));
+    assert!(platform.terminated_task_groups.contains(&outer_task_group));
     crate::wyr1b_native::finish_e8_dependent_retirement(
         &mut platform,
         &mut jobs,
@@ -910,13 +922,16 @@ fn actual_driver_and_registry_recovery_compose_through_s4_ready() {
         .unwrap();
     let s3_outer_reservation = transaction(s3_console_grant, 313);
     let s3_outer = jobs.jobs.begin_launch(s3_outer_reservation).unwrap();
+    let s3_outer_process = DwHandle(911);
+    let s3_outer_task_group = DwHandle(912);
+    let s3_outer_launch_channel = DwHandle(913);
     jobs
         .jobs
         .commit_launch(
             s3_outer,
-            s3_console_owner.process.0,
-            s3_console_owner.task_group.0,
-            s3_console_owner.launch_channel.0,
+            s3_outer_process.0,
+            s3_outer_task_group.0,
+            s3_outer_launch_channel.0,
         )
         .unwrap();
     jobs
@@ -991,7 +1006,7 @@ fn actual_driver_and_registry_recovery_compose_through_s4_ready() {
     );
     waits.transaction_id = registry_reservation.transaction_id;
     waits.exited = false;
-    waits.teardown_process = Some(s3_console_owner.process);
+    waits.console_status_lost_process = Some(s3_outer_process);
     let registry_outcome = dispatch_one_job_request_with_shell(
         &mut platform,
         &mut loader,
@@ -1170,7 +1185,7 @@ fn actual_driver_and_registry_recovery_compose_through_s4_ready() {
     waits.transaction_id = 0xE8B5_0002;
     waits.profile = LaunchProfile::BootstrapRegistry;
     waits.exited = true;
-    waits.teardown_process = Some(s3_console_owner.process);
+    waits.console_status_lost_process = Some(s3_outer_process);
     waits.running_process = Some(crate::wyr1c_native::E8_REGISTRY_FIXTURE_DRIVER_PROCESS);
     let recovered = crate::wyr1c_native::exercise_e8_registry_recovery_orchestrator(
         &mut platform,
