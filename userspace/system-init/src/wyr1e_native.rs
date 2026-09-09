@@ -819,6 +819,43 @@ where
     Ok(PollOutcome::LaunchConsole)
 }
 
+fn poll_console_event<S: Wyr1BPlatform>(
+    system: &mut S,
+    console: LoadedProcess,
+    bootstrap_released: bool,
+    defer_to_coordinated_retirement: bool,
+    now: u64,
+) -> Result<Option<DwWaitResultV1>, NativeError> {
+    let items = [
+        DwWaitItemV1 {
+            handle: console.process,
+            signals: DW_SIGNAL_EXITED,
+        },
+        DwWaitItemV1 {
+            handle: console.launch_channel,
+            signals: deepwyrm_syscall::DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+        },
+    ];
+    // A retained process exit is level-triggered. Once recovery owns its
+    // retirement, waiting on it would repeatedly select the first item and
+    // starve a committed control reply needed by that same recovery action.
+    let first = usize::from(defer_to_coordinated_retirement);
+    let end = if bootstrap_released { 1 } else { 2 };
+    if first == end {
+        return Ok(None);
+    }
+    match system.wait_many(&items[first..end], DwDeadline(now)) {
+        Err(NativeError::Status(status)) if status == DW_STATUS_TIMED_OUT => Ok(None),
+        Err(error) => Err(error),
+        Ok(mut observed) => {
+            // Keep the caller's process/control indices independent of which
+            // owner is currently responsible for process retirement.
+            observed.index += first as u32;
+            Ok(Some(observed))
+        }
+    }
+}
+
 pub(super) fn poll<S, L, W>(
     resident: &mut ResidentSystemInit,
     system: &mut S,
@@ -888,22 +925,18 @@ where
     let Some(console) = e6.console else {
         return Ok(PollOutcome::Stable);
     };
-    let mut items = [DwWaitItemV1::default(); 2];
-    items[0] = DwWaitItemV1 {
-        handle: console.loaded.process,
-        signals: DW_SIGNAL_EXITED,
-    };
-    let used = if e6.bootstrap_released {
-        1
-    } else {
-        items[1] = DwWaitItemV1 {
-            handle: console.loaded.launch_channel,
-            signals: deepwyrm_syscall::DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
-        };
-        2
-    };
-    let observed = match system.wait_many(&items[..used], DwDeadline(now)) {
-        Err(NativeError::Status(status)) if status == DW_STATUS_TIMED_OUT => {
+    #[cfg(feature = "wyr1e8-selector33")]
+    let defer_to_coordinated_retirement = e6.shell.recovery_owns_console_retirement();
+    #[cfg(not(feature = "wyr1e8-selector33"))]
+    let defer_to_coordinated_retirement = false;
+    let observed = match poll_console_event(
+        system,
+        console.loaded,
+        e6.bootstrap_released,
+        defer_to_coordinated_retirement,
+        now,
+    ) {
+        Ok(None) => {
             if e6.awaiting_ready && now >= e6.ready_deadline {
                 retire_current_console(e6, system, waits, state.topology.generation(), true)?;
                 return Ok(PollOutcome::RecoverRegistry);
@@ -911,13 +944,9 @@ where
             return Ok(PollOutcome::Stable);
         }
         Err(error) => return Err(InitError::Native(error)),
-        Ok(observed) => observed,
+        Ok(Some(observed)) => observed,
     };
     if observed.index == 0 && observed.observed.0 & DW_SIGNAL_EXITED.0 != 0 {
-        #[cfg(feature = "wyr1e8-selector33")]
-        let defer_to_coordinated_retirement = e6.shell.recovery_owns_console_retirement();
-        #[cfg(not(feature = "wyr1e8-selector33"))]
-        let defer_to_coordinated_retirement = false;
         return handle_console_process_exit(e6, system, waits, defer_to_coordinated_retirement);
     }
     if observed.index != 1 {
@@ -1218,8 +1247,7 @@ where
         None => retire_console_product_with_result(system, waits, &mut e6.jobs, peer, true),
     };
     #[cfg(not(feature = "wyr1e8-selector33"))]
-    let console_result =
-        retire_console_product(system, waits, &mut e6.jobs, peer, true).map(|_| None);
+    let console_result = retire_console_product(system, waits, &mut e6.jobs, peer, true);
     if observer_failed || console_result.is_err() || {
         #[cfg(feature = "wyr1e8-selector33")]
         {
@@ -1284,6 +1312,7 @@ mod tests {
         receive_count: usize,
         closed: [DwHandle; 2],
         close_count: usize,
+        console_signals: Option<(deepwyrm_syscall::DwSignals, deepwyrm_syscall::DwSignals)>,
     }
 
     impl ObserverPlatform {
@@ -1309,6 +1338,7 @@ mod tests {
                 receive_count: 0,
                 closed: [DwHandle(0); 2],
                 close_count: 0,
+                console_signals: None,
             }
         }
     }
@@ -1402,6 +1432,25 @@ mod tests {
             _deadline: DwDeadline,
         ) -> Result<DwWaitResultV1, NativeError> {
             self.wait_count += 1;
+            if let Some((process, control)) = self.console_signals {
+                for (index, item) in items.iter().enumerate() {
+                    let signals = if item.handle == console_peer().loaded.process {
+                        process
+                    } else {
+                        assert_eq!(item.handle, console_peer().loaded.launch_channel);
+                        control
+                    };
+                    let observed = deepwyrm_syscall::DwSignals(signals.0 & item.signals.0);
+                    if observed.0 != 0 {
+                        return Ok(DwWaitResultV1 {
+                            index: index as u32,
+                            observed,
+                            ..DwWaitResultV1::default()
+                        });
+                    }
+                }
+                return Err(NativeError::Status(DW_STATUS_TIMED_OUT));
+            }
             assert_eq!(items.len(), 1);
             Ok(DwWaitResultV1 {
                 index: 0,
@@ -1634,6 +1683,49 @@ mod tests {
         assert_eq!(state.console_transaction, 23);
         assert_eq!(platform.close_count, 0);
         assert_eq!(waits.query_count, 0);
+    }
+
+    #[test]
+    fn coordinated_retirement_services_control_despite_a_retained_console_exit() {
+        let peer = console_peer();
+        let observed = observer();
+        let mut platform = ObserverPlatform::generation(observed, 50);
+        platform.console_signals = Some((DW_SIGNAL_EXITED, DW_SIGNAL_READABLE));
+
+        // The ordinary owner still observes process death first.
+        let ordinary = poll_console_event(&mut platform, peer.loaded, false, false, 50)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ordinary.index, 0);
+        assert_eq!(ordinary.observed, DW_SIGNAL_EXITED);
+
+        // The recovery owner must instead reach the already-committed reply.
+        let recovering = poll_console_event(&mut platform, peer.loaded, false, true, 50)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovering.index, 1);
+        assert_eq!(recovering.observed, DW_SIGNAL_READABLE);
+
+        // With the reply consumed, process death must not produce false work.
+        platform.console_signals = Some((DW_SIGNAL_EXITED, deepwyrm_syscall::DwSignals(0)));
+        assert_eq!(
+            poll_console_event(&mut platform, peer.loaded, false, true, 50),
+            Ok(None)
+        );
+        // Later peer closure still reaches the control owner exactly once.
+        platform.console_signals = Some((DW_SIGNAL_EXITED, DW_SIGNAL_PEER_CLOSED));
+        let closed = poll_console_event(&mut platform, peer.loaded, false, true, 50)
+            .unwrap()
+            .unwrap();
+        assert_eq!(closed.index, 1);
+        assert_eq!(closed.observed, DW_SIGNAL_PEER_CLOSED);
+        let wait_count = platform.wait_count;
+        assert_eq!(
+            poll_console_event(&mut platform, peer.loaded, true, true, 50),
+            Ok(None)
+        );
+        assert_eq!(platform.wait_count, wait_count);
+        assert_eq!(platform.close_count, 0);
     }
 
     #[test]

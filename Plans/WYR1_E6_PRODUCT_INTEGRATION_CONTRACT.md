@@ -71,6 +71,14 @@ must not be claimed from whole-subsystem reconstruction. Ambiguous cleanup or
 exhausted local recovery enters the existing finite supervisor reconstruction
 and degraded-recovery policy rather than guessing release or resetting budgets.
 
+When coordinated recovery owns console retirement, the resident console poll
+omits the retained console Process's EXITED signal from its wait admission.
+Its authenticated control Channel remains serviceable until peer closure is
+consumed. A level-triggered process exit must not starve an already committed
+quiescence reply. The recovery owner retains the process/session for the exact
+retirement join and keeps the original action deadline; ordinary console
+supervision continues to give process exit precedence outside that ownership.
+
 ## Exact publication gate before consoled construction
 
 Driver construction acknowledgement precedes staging, driver READY and serial

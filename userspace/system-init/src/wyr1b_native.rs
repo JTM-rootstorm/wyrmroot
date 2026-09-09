@@ -5283,7 +5283,7 @@ where
     S: Wyr1BPlatform,
     W: SupervisionPlatform<Error = NativeError>,
 {
-    retire_console_product_with_result(system, waits, jobs, peer, terminate).map(|_| ())
+    retire_console_product_inner(system, waits, jobs, peer, terminate, None).map(|_| ())
 }
 
 #[cfg(feature = "wyr1e8-selector33")]
