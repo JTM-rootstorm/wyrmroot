@@ -1323,8 +1323,12 @@ fn event_loop(
             if snapshot.input_queued == 0
                 && snapshot.stdout_queued == 0
                 && snapshot.stderr_queued == 0
-                && streams_freshly_quiet(&mut streams, child)?
             {
+                if !streams_freshly_quiet(&mut streams, child, model)? {
+                    // The quiet poll staged more native output. Reserve it
+                    // before waiting so it can immediately reach serial TX.
+                    continue;
+                }
                 let ack = wyrmroot_consoled::e8_control::encode(
                     wyrmroot_consoled::e8_control::Message::Quiesced(identity),
                 )
@@ -2026,15 +2030,21 @@ fn receive_recovery_request(
 fn streams_freshly_quiet(
     streams: &mut NativeStreams,
     child: &mut ChildSession,
+    model: &mut ConsoleModel,
 ) -> Result<bool, u32> {
-    let mut scratch = [0u8; 1];
-    for input in [&mut child.stdout, &mut child.stderr] {
-        match input.read(streams, &mut scratch) {
-            Err(StreamError::WouldBlock) => {}
-            Ok(_) | Err(_) => return Err(128),
-        }
-    }
-    Ok(true)
+    model
+        .poll_output_quiescence(child.event, |source, payload| {
+            let input = match source {
+                OutputSource::Stdout => &mut child.stdout,
+                OutputSource::Stderr => &mut child.stderr,
+            };
+            match input.read(streams, payload) {
+                Ok(count) => Ok(Some(count)),
+                Err(StreamError::WouldBlock) => Ok(None),
+                Err(_) => Err(wyrmroot_consoled::ModelError::ChildDisconnected),
+            }
+        })
+        .map_err(|_| 128u32)
 }
 
 #[cfg(feature = "wyr1d-selector32")]

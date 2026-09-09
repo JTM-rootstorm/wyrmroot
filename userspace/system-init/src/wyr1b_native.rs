@@ -3909,6 +3909,19 @@ where
         LaunchMessage::Wait { job_id } => (|| -> Result<Option<usize>, JobError> {
             match jobs.jobs.result_reserved(ticket, job_id) {
                 Ok(controller) => {
+                    #[cfg(feature = "wyr1e8-selector33")]
+                    if scope == LaunchSessionScope::ShellJobs
+                        && evidence.as_deref().is_some_and(|state| {
+                            state
+                                .e8_trigger
+                                .is_some_and(|trigger| trigger.identity.job_id == job_id)
+                        })
+                    {
+                        // Completion before WAIT admission must use the same
+                        // retained barrier as completion after admission.
+                        jobs.install_pending_wait(grant, reservation, job_id, request_bytes)?;
+                        return Ok(None);
+                    }
                     let terminal =
                         controller_result_to_wire(controller).map_err(|_| JobError::WrongState)?;
                     encode_job_result(reservation, job_id, terminal, &mut response)
@@ -10114,6 +10127,76 @@ mod tests {
             exception_detail: 0,
             exception_address: 0,
             cleanup_result: 0,
+        }
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    #[test]
+    fn completed_trigger_wait_still_enters_the_quiescence_barrier() {
+        for action in [E8RecoveryAction::Driver, E8RecoveryAction::Registry] {
+            let mut platform = ShellPlatform::new();
+            let mut waits = TerminalWaits;
+            let mut jobs = JobDispatcher::new();
+            let owner = grant(EndpointKind::LaunchSession, 1, 1);
+            let session = DwHandle(90);
+            jobs.install_scoped_session(owner, session, LaunchSessionScope::ShellJobs)
+                .unwrap();
+            let launched = jobs.jobs.begin_launch(reservation(40)).unwrap();
+            jobs.jobs.commit_launch(launched, 101, 102, 103).unwrap();
+            let loaded = jobs.jobs.loaded_job(launched.job_id).unwrap();
+            reap_job(&mut platform, &mut waits, &mut jobs, loaded).unwrap();
+            let mut state = e8_state_for_held_wait(40);
+            let trigger = state.e8_trigger.as_mut().unwrap();
+            trigger.identity.job_id = launched.job_id;
+            trigger.identity.action = action;
+            let deadline = trigger.deadline;
+            let wait = reservation(41);
+            let ticket = jobs.jobs.reserve_request(wait).unwrap();
+            let mut request = [0u8; 56];
+            let size =
+                encode_job_message(wait, LaunchMessageType::Wait, launched.job_id, &mut request)
+                    .unwrap();
+            dispatch_reserved_operation_observed(
+                &mut platform,
+                &mut waits,
+                &mut jobs,
+                session,
+                owner,
+                wait,
+                ticket,
+                LaunchMessage::Wait {
+                    job_id: launched.job_id,
+                },
+                &request[..size],
+                LaunchSessionScope::ShellJobs,
+                Some(&mut state),
+            )
+            .unwrap();
+            assert!(
+                platform.sent.is_empty(),
+                "completed trigger result stays held"
+            );
+            service_pending_wait_inner(&mut platform, &mut waits, &mut jobs, Some(&mut state))
+                .unwrap();
+            let held = state.e8_held.unwrap();
+            assert_eq!(held.pending.reservation, wait);
+            assert_eq!(held.deadline, deadline);
+            assert_eq!(held.result, e8_normal_result());
+            assert_eq!(platform.sent.len(), 1);
+            assert_eq!(platform.sent[0].0, DwHandle(20));
+            assert_eq!(
+                wyrmroot_consoled::e8_control::parse(&platform.sent[0].1),
+                Ok(wyrmroot_consoled::e8_control::Message::Quiesce(
+                    held.identity
+                ))
+            );
+            service_pending_wait_inner(&mut platform, &mut waits, &mut jobs, Some(&mut state))
+                .unwrap();
+            assert_eq!(
+                platform.sent.len(),
+                1,
+                "held WAIT sends neither reply nor duplicate request"
+            );
         }
     }
 

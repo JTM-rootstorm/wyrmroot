@@ -1035,6 +1035,39 @@ impl ConsoleModel {
         }
     }
 
+    /// Polls each live child output once after staged output has drained.
+    /// The adapter returns `None` only for a real WOULD_BLOCK observation;
+    /// peer closure and every other read failure remain errors. Data found
+    /// during this check enters the ordinary staging/serial commit path.
+    #[cfg(any(test, feature = "wyr1e8-recovery"))]
+    pub fn poll_output_quiescence(
+        &mut self,
+        event: EventGeneration,
+        mut read: impl FnMut(OutputSource, &mut [u8]) -> Result<Option<usize>, ModelError>,
+    ) -> Result<bool, ModelError> {
+        self.require_current(event)?;
+        if !self.input.is_empty()
+            || !self.stdout.is_empty()
+            || !self.stderr.is_empty()
+            || self.pending_stdin.is_some()
+            || self.pending_tx.is_some()
+        {
+            return Ok(false);
+        }
+        let mut quiet = true;
+        let mut payload = [0u8; FAIR_SOURCE_BYTES_PER_TURN];
+        for source in [OutputSource::Stdout, OutputSource::Stderr] {
+            if let Some(count) = read(source, &mut payload)? {
+                if count == 0 || count > payload.len() {
+                    return Err(ModelError::TooLarge);
+                }
+                self.stage_child_output(event, source, &payload[..count])?;
+                quiet = false;
+            }
+        }
+        Ok(quiet)
+    }
+
     pub fn wrong_direction_data(
         &mut self,
         event: EventGeneration,
@@ -1893,6 +1926,65 @@ mod tests {
         connect(&mut model, 1, 0);
         let event = launch(&mut model);
         (model, event)
+    }
+
+    #[test]
+    fn quiescence_stages_native_output_and_waits_for_serial_commit() {
+        let (mut model, event) = live();
+        let mut polls = 0;
+        assert_eq!(
+            model.poll_output_quiescence(event, |source, output| {
+                polls += 1;
+                let bytes: &[u8] = match source {
+                    OutputSource::Stdout => b"redraw\n",
+                    OutputSource::Stderr => b"diagnostic\n",
+                };
+                output[..bytes.len()].copy_from_slice(bytes);
+                Ok(Some(bytes.len()))
+            }),
+            Ok(false)
+        );
+        assert_eq!(polls, 2);
+        assert_eq!(
+            model.poll_output_quiescence(event, |_, _| panic!("queued output must drain first")),
+            Ok(false)
+        );
+        let mut bytes = [0u8; FAIR_SOURCE_BYTES_PER_TURN];
+        let mut committed = std::vec::Vec::new();
+        while let Some(reservation) = model.reserve_serial_tx(&mut bytes).unwrap() {
+            let original = bytes[..reservation.length].to_vec();
+            model.release_serial_tx(reservation).unwrap();
+            let retry = model.reserve_serial_tx(&mut bytes).unwrap().unwrap();
+            assert_eq!(&bytes[..retry.length], original.as_slice());
+            committed.extend_from_slice(&bytes[..retry.length]);
+            model.commit_serial_tx(retry).unwrap();
+        }
+        assert_eq!(committed, b"redraw\r\ndiagnostic\r\n");
+        assert_eq!(
+            model.poll_output_quiescence(event, |_, _| {
+                polls += 1;
+                Ok(None)
+            }),
+            Ok(true)
+        );
+        assert_eq!(
+            polls, 4,
+            "both live streams must freshly report WOULD_BLOCK"
+        );
+    }
+
+    #[test]
+    fn quiescence_rejects_peer_loss_and_invalid_read_counts() {
+        for bad in [
+            Ok(Some(0)),
+            Ok(Some(FAIR_SOURCE_BYTES_PER_TURN + 1)),
+            Err(ModelError::ChildDisconnected),
+        ] {
+            let (mut model, event) = live();
+            assert!(model.poll_output_quiescence(event, |_, _| bad).is_err());
+            assert_eq!(model.snapshot().stdout_queued, 0);
+            assert_eq!(model.snapshot().stderr_queued, 0);
+        }
     }
 
     #[test]

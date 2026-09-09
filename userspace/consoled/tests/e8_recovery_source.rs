@@ -39,7 +39,12 @@ fn e8_quiescence_stops_input_and_waits_for_every_owned_output_queue() {
     assert!(loop_body.contains("snapshot.input_queued == 0"));
     assert!(loop_body.contains("snapshot.stdout_queued == 0"));
     assert!(loop_body.contains("snapshot.stderr_queued == 0"));
-    assert!(loop_body.contains("streams_freshly_quiet(&mut streams, child)?"));
+    let quiet_poll = loop_body
+        .find("if !streams_freshly_quiet(&mut streams, child, model)?")
+        .unwrap();
+    let acknowledge = loop_body.find("Message::Quiesced(identity)").unwrap();
+    assert!(quiet_poll < acknowledge);
+    assert!(loop_body[quiet_poll..acknowledge].contains("continue;"));
     assert!(loop_body.contains("if let Some(identity) = recovery_request"));
     assert!(
         loop_body
@@ -52,8 +57,11 @@ fn e8_quiescence_stops_input_and_waits_for_every_owned_output_queue() {
         ..NATIVE.find("fn selector_configure(").unwrap()];
     assert!(quiet.contains("&mut child.stdout"));
     assert!(quiet.contains("&mut child.stderr"));
-    assert!(quiet.contains("input.read(streams, &mut scratch)"));
-    assert!(quiet.contains("Err(StreamError::WouldBlock) => {}"));
+    assert!(quiet.contains(".poll_output_quiescence(child.event, |source, payload|"));
+    assert!(quiet.contains("input.read(streams, payload)"));
+    assert!(quiet.contains("Ok(count) => Ok(Some(count))"));
+    assert!(quiet.contains("Err(StreamError::WouldBlock) => Ok(None)"));
+    assert!(quiet.contains("Err(_) => Err(wyrmroot_consoled::ModelError::ChildDisconnected)"));
     assert!(!quiet.contains("wait_many"));
     assert!(!quiet.contains("DW_STATUS_TIMED_OUT"));
 }

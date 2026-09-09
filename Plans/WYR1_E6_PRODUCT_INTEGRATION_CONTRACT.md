@@ -79,6 +79,20 @@ quiescence reply. The recovery owner retains the process/session for the exact
 retirement join and keeps the original action deadline; ordinary console
 supervision continues to give process exit precedence outside that ownership.
 
+The recovery trigger's exact WAIT enters the same retained barrier whether the
+actor completes before or after WAIT admission. An already available terminal
+result must not bypass the controller's quiescence request or reach the retiring
+shell. The existing result, successor-transaction and deadline checks apply to
+both completion orders.
+
+Consoled's final quiescence poll may discover output still queued in a native
+child Channel even when its local staging queues are empty. Such bytes pass
+through ordinary output staging, serial reservation, retry and commit before
+acknowledgement. Only fresh WOULD_BLOCK reads from both still-live child outputs
+after those queues and reservations drain establish quiescence; peer closure
+remains a failure. Discovering more output immediately resumes reservation work
+without waiting for another native readability event.
+
 ## Exact publication gate before consoled construction
 
 Driver construction acknowledgement precedes staging, driver READY and serial
@@ -114,3 +128,8 @@ compile selected E6 init/devmgr/consoled and all directly affected selector32
 variants. Source-string assertions support feature isolation but do not prove
 these state transitions. The exact normal artifact/RRC/policy freeze and shell
 stack report remain E6 gates; live recovery and interactive evidence remain E7/E8.
+
+Run consoled's model and native-source checks together with
+`tools/pinned-cargo test --locked --offline --package wyrmroot-consoled --tests`.
+Its native-source targets are `e3d_native_source` and `e8_recovery_source`;
+the package has no target named `source_contract`.
