@@ -145,7 +145,7 @@ impl E8EmergencyCleanup {
 }
 
 /// E8-only operation that most narrowly returned an error during the bounded
-/// driver-recovery transition. These values are private diagnostic evidence,
+/// recovery transition. These values are private diagnostic evidence,
 /// not protocol or application-status ABI.
 #[cfg(feature = "wyr1e8-selector33")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -164,6 +164,10 @@ pub(crate) enum E8FailureOperation {
     ActionDeadline = 0x09,
     /// Ordinary registry/devmgr recovery requested while an action is active.
     RecoveryFallback = 0x0a,
+    RetireRegistry = 0x0b,
+    LaunchRegistry = 0x0c,
+    CommitRegistry = 0x0d,
+    StartConsole = 0x0e,
 }
 
 #[cfg(feature = "wyr1e8-selector33")]
@@ -279,7 +283,7 @@ pub const fn resident_tick_failure_application_status(error: &InitError) -> u32 
             _ => (0x0f, e8_failure_kind(error)),
         };
         let operation = match operation {
-            0x01..=0x0a | 0x0f => operation,
+            0x01..=0x0f => operation,
             _ => 0x0f,
         };
         let kind = match kind {
@@ -4047,6 +4051,10 @@ mod native_cleanup_tests {
             E8FailureOperation::RebindPublication,
             E8FailureOperation::ActionDeadline,
             E8FailureOperation::RecoveryFallback,
+            E8FailureOperation::RetireRegistry,
+            E8FailureOperation::LaunchRegistry,
+            E8FailureOperation::CommitRegistry,
+            E8FailureOperation::StartConsole,
         ] {
             let error = e8_operation::<()>(operation, Err(InitError::Cleanup)).unwrap_err();
             assert_eq!(
@@ -4131,6 +4139,66 @@ mod native_cleanup_tests {
             );
             assert_eq!(e8_operation(operation, Ok::<_, InitError>(7)), Ok(7));
         }
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    #[test]
+    fn registry_recovery_failures_keep_phase_and_nested_operations() {
+        for (operation, expected) in [
+            (E8FailureOperation::RetireDependents, 0xAF18_0404),
+            (E8FailureOperation::RebindPublication, 0xAF18_0804),
+            (E8FailureOperation::ActionDeadline, 0xAF18_0904),
+            (E8FailureOperation::RetireRegistry, 0xAF18_0B04),
+            (E8FailureOperation::LaunchRegistry, 0xAF18_0C04),
+            (E8FailureOperation::CommitRegistry, 0xAF18_0D04),
+            (E8FailureOperation::StartConsole, 0xAF18_0E04),
+        ] {
+            let error = e8_operation::<()>(operation, Err(InitError::Cleanup)).unwrap_err();
+            assert_eq!(resident_tick_failure_application_status(&error), expected);
+            let nested =
+                e8_operation::<()>(E8FailureOperation::StartConsole, Err(error)).unwrap_err();
+            assert_eq!(
+                nested,
+                InitError::E8Transition {
+                    operation: operation as u8,
+                    initiating_kind: 4,
+                    emergency_cleanup: E8EmergencyCleanup::NotRun,
+                }
+            );
+            let deadline = e8_operation::<()>(
+                E8FailureOperation::ActionDeadline,
+                Err(InitError::Supervision),
+            )
+            .unwrap_err();
+            let nested_deadline = e8_operation::<()>(operation, Err(deadline)).unwrap_err();
+            assert_eq!(
+                resident_tick_failure_application_status(&nested_deadline),
+                0xAF18_0903
+            );
+            assert_eq!(
+                e8_operation(operation, Ok::<_, InitError>(Some(7))),
+                Ok(Some(7))
+            );
+            assert_eq!(
+                e8_operation(operation, Ok::<Option<u64>, InitError>(None)),
+                Ok(None)
+            );
+        }
+        for operation in [0, 0x10, u8::MAX] {
+            let error = InitError::E8Transition {
+                operation,
+                initiating_kind: 4,
+                emergency_cleanup: E8EmergencyCleanup::NotRun,
+            };
+            assert_eq!(
+                resident_tick_failure_application_status(&error),
+                0xAF18_0F04
+            );
+        }
+        assert_eq!(
+            resident_tick_failure_application_status(&InitError::Cleanup),
+            0xAF18_0F04
+        );
     }
 
     #[cfg(feature = "wyr1e8-selector33")]

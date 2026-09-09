@@ -242,6 +242,50 @@ fn supervision_discriminator_stays_at_the_three_existing_failure_sources() {
 }
 
 #[test]
+fn registry_recovery_phase_failures_are_wrapped_at_existing_boundaries() {
+    let recovery = &RESIDENT[RESIDENT.find("fn recover_registry<").unwrap()
+        ..RESIDENT
+            .find("pub(crate) const E8_REGISTRY_FIXTURE_DEVMGR_CONTROL")
+            .unwrap()];
+    let dependents = &recovery[recovery.find("let dependent_cleanup_error =").unwrap()
+        ..recovery.find("let registry = resident").unwrap()];
+    assert!(dependents.contains("E8FailureOperation::RetireDependents"));
+    assert!(dependents.contains("wyr1e::retire_dependents(resident, system, waits, true)"));
+    for (binding, operation) in [
+        ("exhausted", "RetireRegistry"),
+        ("replacement", "LaunchRegistry"),
+        ("reserved", "CommitRegistry"),
+        ("replacement", "CommitRegistry"),
+        ("committed", "CommitRegistry"),
+        ("waiting", "RebindPublication"),
+        ("rebound", "RebindPublication"),
+        ("started", "StartConsole"),
+    ] {
+        assert!(recovery.contains(&format!(
+            "e8_operation(E8FailureOperation::{operation}, {binding})"
+        )));
+    }
+    assert_eq!(recovery.matches("wyr1e::ensure_e8_action_live(").count(), 3);
+    let console_start = &RESIDENT[RESIDENT
+        .find("wyr1e::PollOutcome::LaunchConsole =>")
+        .unwrap()
+        ..RESIDENT
+            .find("wyr1e::PollOutcome::RecoverDevmgr =>")
+            .unwrap()];
+    assert!(console_start.contains("wyr1e::launch_after_publication_observed("));
+    assert!(console_start.contains("e8_operation(E8FailureOperation::StartConsole, launched)"));
+    let publication = &NATIVE[NATIVE.find("pub(super) fn poll<").unwrap()
+        ..NATIVE.find("fn retire_current_console<").unwrap()];
+    assert!(
+        publication
+            .contains("let publication = poll_publication_observer(resident, system, waits, now)")
+    );
+    assert!(
+        publication.contains("e8_operation(E8FailureOperation::RebindPublication, publication)")
+    );
+}
+
+#[test]
 fn e8_failure_detail_is_bound_to_each_actual_transition_join() {
     let main = include_str!("../src/main.rs");
     let lib = include_str!("../src/lib.rs");

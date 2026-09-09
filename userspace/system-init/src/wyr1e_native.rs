@@ -870,7 +870,10 @@ where
 {
     #[cfg(feature = "wyr1e8-selector33")]
     ensure_e8_action_live(resident, now)?;
-    if let Some(outcome) = poll_publication_observer(resident, system, waits, now)? {
+    let publication = poll_publication_observer(resident, system, waits, now);
+    #[cfg(feature = "wyr1e8-selector33")]
+    let publication = e8_operation(E8FailureOperation::RebindPublication, publication);
+    if let Some(outcome) = publication? {
         return Ok(outcome);
     }
     let authority = resident.authority;

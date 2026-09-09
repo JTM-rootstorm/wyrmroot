@@ -3545,9 +3545,13 @@ where
                         match outcome {
                             wyr1e::PollOutcome::Stable => Ok(()),
                             wyr1e::PollOutcome::LaunchConsole => {
-                                wyr1e::launch_after_publication_observed(
+                                let launched = wyr1e::launch_after_publication_observed(
                                     resident, system, loader, waits, bootfs,
-                                )
+                                );
+                                #[cfg(feature = "wyr1e8-selector33")]
+                                let launched =
+                                    e8_operation(E8FailureOperation::StartConsole, launched);
+                                launched
                             }
                             wyr1e::PollOutcome::RecoverDevmgr => {
                                 recover_devmgr(resident, system, loader, waits, bootfs)
@@ -3600,7 +3604,11 @@ where
         return finish_e3a_fatal_recovery(resident, system, waits, child_cleanup_failed);
     }
     #[cfg(all(feature = "wyr1e-production", feature = "wyr1e8-selector33"))]
-    let dependent_cleanup_error = wyr1e::retire_dependents(resident, system, waits, true).err();
+    let dependent_cleanup_error = e8_operation(
+        E8FailureOperation::RetireDependents,
+        wyr1e::retire_dependents(resident, system, waits, true),
+    )
+    .err();
     #[cfg(all(not(feature = "wyr1e-production"), feature = "wyr1e8-selector33"))]
     let dependent_cleanup_error: Option<InitError> = None;
     #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1e8-selector33")))]
@@ -3632,12 +3640,14 @@ where
         action_deadline,
     );
     #[cfg(feature = "wyr1e8-selector33")]
+    let exhausted = e8_operation(E8FailureOperation::RetireRegistry, exhausted);
+    #[cfg(feature = "wyr1e8-selector33")]
     if let Some(error) = dependent_cleanup_error {
-        return Err(if exhausted.is_err() {
-            InitError::Cleanup
+        return if exhausted.is_err() {
+            e8_operation(E8FailureOperation::RetireRegistry, Err(InitError::Cleanup))
         } else {
-            error
-        });
+            Err(error)
+        };
     }
     let exhausted = exhausted?;
     let step = registry_recovery_step(exhausted, status_already_consumed);
@@ -3646,7 +3656,7 @@ where
             resident.result = RecoveryResult::Degraded;
             #[cfg(feature = "wyr1e8-selector33")]
             if action_deadline.is_some() {
-                return Err(InitError::Cleanup);
+                return e8_operation(E8FailureOperation::RetireRegistry, Err(InitError::Cleanup));
             }
             return Ok(());
         }
@@ -3666,7 +3676,7 @@ where
             resident.authority,
             bootfs,
             deadline,
-        )?
+        )
     } else {
         launch_registry_until_ready(
             system,
@@ -3675,8 +3685,10 @@ where
             &mut resident.controller,
             resident.authority,
             bootfs,
-        )?
+        )
     };
+    #[cfg(feature = "wyr1e8-selector33")]
+    let replacement = e8_operation(E8FailureOperation::LaunchRegistry, replacement)?;
     #[cfg(not(feature = "wyr1e8-selector33"))]
     let replacement = launch_registry_until_ready(
         system,
@@ -3690,7 +3702,10 @@ where
         resident.result = RecoveryResult::Degraded;
         #[cfg(feature = "wyr1e8-selector33")]
         if action_deadline.is_some() {
-            return Err(InitError::Supervision);
+            return e8_operation(
+                E8FailureOperation::LaunchRegistry,
+                Err(InitError::Supervision),
+            );
         }
         return Ok(());
     };
@@ -3707,14 +3722,19 @@ where
             false,
             action_deadline,
         );
-        return Err(if cleanup.is_err() {
-            InitError::Cleanup
+        return if cleanup.is_err() {
+            e8_operation(E8FailureOperation::LaunchRegistry, Err(InitError::Cleanup))
         } else {
-            error
-        });
+            Err(error)
+        };
     }
     #[cfg(feature = "wyr1e-production")]
-    wyr1e::reserve_registry_replacement(resident, replacement.active.generation)?;
+    {
+        let reserved = wyr1e::reserve_registry_replacement(resident, replacement.active.generation);
+        #[cfg(feature = "wyr1e8-selector33")]
+        let reserved = e8_operation(E8FailureOperation::CommitRegistry, reserved);
+        reserved?;
+    }
     let replacement = restart_topology_or_poison_before(
         system,
         waits,
@@ -3726,9 +3746,17 @@ where
             .topology,
         replacement,
         action_deadline,
-    )?;
+    );
+    #[cfg(feature = "wyr1e8-selector33")]
+    let replacement = e8_operation(E8FailureOperation::CommitRegistry, replacement);
+    let replacement = replacement?;
     #[cfg(feature = "wyr1e-production")]
-    wyr1e::commit_registry_replacement(resident, replacement.active.generation)?;
+    {
+        let committed = wyr1e::commit_registry_replacement(resident, replacement.active.generation);
+        #[cfg(feature = "wyr1e8-selector33")]
+        let committed = e8_operation(E8FailureOperation::CommitRegistry, committed);
+        committed?;
+    }
     resident
         .wyr1c
         .as_mut()
@@ -3741,14 +3769,17 @@ where
             .as_ref()
             .ok_or(InitError::WrongActivationOrder)?;
         let devmgr = state.devmgr.ok_or(InitError::WrongActivationOrder)?;
-        if let Err(error) = await_waiting_for_registry(
+        let waiting = await_waiting_for_registry(
             system,
             waits,
             devmgr,
             devmgr.generation,
             state.last_controller_transaction,
             action_deadline,
-        ) {
+        );
+        #[cfg(feature = "wyr1e8-selector33")]
+        let waiting = e8_operation(E8FailureOperation::RebindPublication, waiting);
+        if let Err(error) = waiting {
             return recover_devmgr_after_error(resident, system, loader, waits, bootfs, error);
         }
     }
@@ -3757,7 +3788,10 @@ where
         .as_mut()
         .ok_or(InitError::WrongActivationOrder)?
         .waiting_registry_observed = true;
-    if let Err(error) = rebind_publication(resident, system, waits) {
+    let rebound = rebind_publication(resident, system, waits);
+    #[cfg(feature = "wyr1e8-selector33")]
+    let rebound = e8_operation(E8FailureOperation::RebindPublication, rebound);
+    if let Err(error) = rebound {
         return recover_devmgr_after_error(resident, system, loader, waits, bootfs, error);
     }
     #[cfg(feature = "wyr1e-production")]
@@ -3766,7 +3800,10 @@ where
         .as_ref()
         .is_some_and(|state| state.driver.is_some())
     {
-        start_wyr1e_or_recover_registry(resident, system, loader, waits, bootfs)?;
+        let started = start_wyr1e_or_recover_registry(resident, system, loader, waits, bootfs);
+        #[cfg(feature = "wyr1e8-selector33")]
+        let started = e8_operation(E8FailureOperation::StartConsole, started);
+        started?;
     }
     Ok(())
 }
