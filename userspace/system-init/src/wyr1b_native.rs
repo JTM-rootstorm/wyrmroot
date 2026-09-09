@@ -354,6 +354,11 @@ impl ShellControllerState {
     }
 
     #[cfg(feature = "wyr1e8-selector33")]
+    pub(crate) const fn recovery_owns_console_retirement(&self) -> bool {
+        !self.routine_console_relaunch_allowed()
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
     pub(crate) const fn e8_stage(&self) -> u32 {
         self.e8_evidence.stage()
     }
@@ -5052,31 +5057,44 @@ where
             }
             Ok(observed) if observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 => {
                 let scope = jobs.session_scope(grant).map_err(InitError::Wyr1BModel)?;
-                let outer = if scope == crate::wyr1b_job::LaunchSessionScope::ConsoleLauncher {
-                    jobs.jobs
-                        .loaded_job_for_owner(grant.endpoint_id, grant.endpoint_generation)
-                        .map_err(InitError::Wyr1BModel)?
-                } else {
-                    None
-                };
-                let disconnected = jobs
-                    .disconnect_owned_session(grant)
-                    .map_err(InitError::Wyr1BModel)?;
-                let mut failed = system.close_handle(disconnected.channel).is_err()
-                    | cleanup_session_owner(system, waits, disconnected.owner, true)
-                    | disconnected.outer_job.is_some_and(|job_id| {
-                        let loaded = jobs.jobs.loaded_job(job_id);
-                        loaded.map_or(true, |loaded| {
-                            force_cleanup_job(system, waits, jobs, loaded).is_err()
-                        })
-                    });
-                if let Some(outer) = outer {
-                    failed |= cleanup_shell_before_publication(system, waits, jobs, outer).is_err();
+                #[cfg(feature = "wyr1e8-selector33")]
+                let defer_console_retirement = scope == LaunchSessionScope::ConsoleLauncher
+                    && shell
+                        .as_deref()
+                        .is_some_and(|context| context.state.recovery_owns_console_retirement());
+                #[cfg(not(feature = "wyr1e8-selector33"))]
+                let defer_console_retirement = false;
+                // When recovery owns this session and its process as one
+                // coordinated retirement, observe peer close without consuming
+                // either owner ahead of that join.
+                if !defer_console_retirement {
+                    let outer = if scope == crate::wyr1b_job::LaunchSessionScope::ConsoleLauncher {
+                        jobs.jobs
+                            .loaded_job_for_owner(grant.endpoint_id, grant.endpoint_generation)
+                            .map_err(InitError::Wyr1BModel)?
+                    } else {
+                        None
+                    };
+                    let disconnected = jobs
+                        .disconnect_owned_session(grant)
+                        .map_err(InitError::Wyr1BModel)?;
+                    let mut failed = system.close_handle(disconnected.channel).is_err()
+                        | cleanup_session_owner(system, waits, disconnected.owner, true)
+                        | disconnected.outer_job.is_some_and(|job_id| {
+                            let loaded = jobs.jobs.loaded_job(job_id);
+                            loaded.map_or(true, |loaded| {
+                                force_cleanup_job(system, waits, jobs, loaded).is_err()
+                            })
+                        });
+                    if let Some(outer) = outer {
+                        failed |=
+                            cleanup_shell_before_publication(system, waits, jobs, outer).is_err();
+                    }
+                    if failed {
+                        return Err(InitError::Cleanup);
+                    }
+                    outcome = JobDispatcherPollOutcome::SessionClosed { grant, scope };
                 }
-                if failed {
-                    return Err(InitError::Cleanup);
-                }
-                outcome = JobDispatcherPollOutcome::SessionClosed { grant, scope };
             }
             Ok(_) => return Err(InitError::Supervision),
         }
@@ -10579,6 +10597,63 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    #[test]
+    fn active_recovery_defers_console_peer_loss_to_coordinated_retirement() {
+        let console = grant(EndpointKind::LaunchSession, 1, 1);
+        let owner = SessionOwner {
+            process: DwHandle(91),
+            launch_channel: DwHandle(92),
+            task_group: DwHandle(93),
+        };
+        let mut jobs = JobDispatcher::new();
+        jobs.install_scoped_session(console, DwHandle(90), LaunchSessionScope::ConsoleLauncher)
+            .unwrap();
+        jobs.attach_session_owner(console, owner).unwrap();
+
+        let mut platform = ShellPlatform::new();
+        platform.session_readable = false;
+        platform.session_peer_closed = true;
+        let mut loader = InitSendLoader::new();
+        let mut waits = ShellWaits {
+            transaction: 1,
+            exited: true,
+            exit_after_running_check: false,
+            query_count: 0,
+        };
+        let mut topology = RegistryTopology::new(7).unwrap();
+        let mut shell_state = e8_state_for_held_wait(40);
+        let mut context = ShellLaunchContext {
+            registry_control: DwHandle(70),
+            topology: &mut topology,
+            state: &mut shell_state,
+        };
+
+        let outcome = poll_job_dispatcher_with_shell(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            LoadAuthority {
+                parent_root: DwHandle(1),
+                bootfs: DwHandle(2),
+                task_group: DwHandle(3),
+            },
+            &mut jobs,
+            10,
+            &mut context,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, JobDispatcherPollOutcome::Stable);
+        assert_eq!(jobs.session_count(), 1);
+        assert!(platform.closed.is_empty());
+        assert!(platform.terminated_task_groups.is_empty());
+        let disconnected = jobs.disconnect_owned_session(console).unwrap();
+        assert_eq!(disconnected.channel, DwHandle(90));
+        assert_eq!(disconnected.owner, Some(owner));
+        assert_eq!(disconnected.outer_job, None);
     }
 
     #[test]
