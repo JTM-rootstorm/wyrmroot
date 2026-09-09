@@ -785,6 +785,40 @@ where
     poll_publication_observer_state(e6, current_driver, registry_generation, system, waits, now)
 }
 
+fn handle_console_process_exit<S, W>(
+    e6: &mut State,
+    system: &mut S,
+    waits: &mut W,
+    defer_to_coordinated_retirement: bool,
+) -> Result<PollOutcome, InitError>
+where
+    S: Wyr1BPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    // Recovery retires the console session, process, and task group as one
+    // ownership unit. An independently observed process exit must not consume
+    // that unit before the resident recovery path reaches its join.
+    if defer_to_coordinated_retirement {
+        return Ok(PollOutcome::Stable);
+    }
+    let peer = e6.console.take().ok_or(InitError::WrongActivationOrder)?;
+    e6.awaiting_ready = false;
+    e6.bootstrap_released = false;
+    e6.console_transaction = 0;
+    #[cfg(feature = "wyr1e8-selector33")]
+    let control_failed = e6
+        .shell
+        .clear_e8_console_control(peer.loaded.launch_channel)
+        .is_err();
+    let cleanup = retire_console_product(system, waits, &mut e6.jobs, peer, false);
+    #[cfg(feature = "wyr1e8-selector33")]
+    if control_failed || cleanup.is_err() {
+        return Err(InitError::Cleanup);
+    }
+    cleanup?;
+    Ok(PollOutcome::LaunchConsole)
+}
+
 pub(super) fn poll<S, L, W>(
     resident: &mut ResidentSystemInit,
     system: &mut S,
@@ -881,27 +915,10 @@ where
     };
     if observed.index == 0 && observed.observed.0 & DW_SIGNAL_EXITED.0 != 0 {
         #[cfg(feature = "wyr1e8-selector33")]
-        let relaunch_allowed = e6.shell.routine_console_relaunch_allowed();
-        let peer = e6.console.take().ok_or(InitError::WrongActivationOrder)?;
-        e6.awaiting_ready = false;
-        e6.bootstrap_released = false;
-        e6.console_transaction = 0;
-        #[cfg(feature = "wyr1e8-selector33")]
-        let control_failed = e6
-            .shell
-            .clear_e8_console_control(peer.loaded.launch_channel)
-            .is_err();
-        let cleanup = retire_console_product(system, waits, &mut e6.jobs, peer, false);
-        #[cfg(feature = "wyr1e8-selector33")]
-        if control_failed || cleanup.is_err() {
-            return Err(InitError::Cleanup);
-        }
-        cleanup?;
-        #[cfg(feature = "wyr1e8-selector33")]
-        if !relaunch_allowed {
-            return Err(InitError::Supervision);
-        }
-        return Ok(PollOutcome::LaunchConsole);
+        let defer_to_coordinated_retirement = e6.shell.recovery_owns_console_retirement();
+        #[cfg(not(feature = "wyr1e8-selector33"))]
+        let defer_to_coordinated_retirement = false;
+        return handle_console_process_exit(e6, system, waits, defer_to_coordinated_retirement);
     }
     if observed.index != 1 {
         retire_current_console(e6, system, waits, state.topology.generation(), true)?;
@@ -1590,6 +1607,33 @@ mod tests {
             Err(InitError::Accounting)
         );
         assert_eq!(state.console, Some(peer));
+    }
+
+    #[test]
+    fn coordinated_retirement_keeps_an_exited_console_owned_for_the_recovery_join() {
+        let peer = console_peer();
+        let mut state = State::new(7).unwrap();
+        state.console = Some(peer);
+        state.awaiting_ready = true;
+        state.bootstrap_released = true;
+        state.console_transaction = 23;
+        let observed = observer();
+        let mut platform = ObserverPlatform::generation(observed, observed.deadline);
+        let mut waits = ObserverWaits {
+            state: DW_TASK_STATE_RUNNING,
+            query_count: 0,
+        };
+
+        assert_eq!(
+            handle_console_process_exit(&mut state, &mut platform, &mut waits, true),
+            Ok(PollOutcome::Stable)
+        );
+        assert_eq!(state.console, Some(peer));
+        assert!(state.awaiting_ready);
+        assert!(state.bootstrap_released);
+        assert_eq!(state.console_transaction, 23);
+        assert_eq!(platform.close_count, 0);
+        assert_eq!(waits.query_count, 0);
     }
 
     #[test]
