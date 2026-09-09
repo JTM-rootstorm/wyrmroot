@@ -982,7 +982,9 @@ fn actual_driver_and_registry_recovery_compose_through_s4_ready() {
         .unwrap();
 
     // Drive the S3 registry trigger through the same production dispatcher and
-    // held-WAIT barrier used by the driver leg.
+    // held-WAIT barrier used by the driver leg, after the healthy registry has
+    // outlived the boot-anchored startup retry window.
+    platform.now = 3_000_000_000;
     let registry_reservation = transaction(s3_grant, 1);
     let registry_token = format!("{:016X}", NONCE ^ E8_REGISTRY_TRIGGER_TOKEN_INDEX);
     let mut registry_request = [0u8; wyrmroot_launch_proto::MAX_LAUNCH_MESSAGE_BYTES];

@@ -15,7 +15,7 @@ pub struct SupervisionPolicy {
     pub max_attempts: u8,
     /// Fixed delay before a replacement may be started.
     pub backoff_ns: u64,
-    /// Maximum duration from the initial attempt to a replacement start.
+    /// Maximum duration from episode admission to a replacement start.
     pub restart_window_ns: u64,
     /// Maximum duration from a successful start to exact READY.
     pub ready_timeout_ns: u64,
@@ -487,6 +487,50 @@ impl RestartSupervisor {
             action
         };
         self.enter_cleanup(now_ns, failure, action, true)
+    }
+
+    /// Admits a controller-authorized recovery episode for an exact Ready owner
+    /// and atomically moves that owner into cleanup as the first attempt.
+    ///
+    /// The caller owns post-stability admission; READY and ordinary failures
+    /// never renew the startup episode. The policy and identity high-water mark
+    /// remain unchanged. The new episode history retains the retiring owner's
+    /// original attempt start time: admission did not launch a new process, so
+    /// that healthy generation is the truthful first attempt of this episode.
+    /// Every rejection leaves the entire supervisor unchanged.
+    pub fn admit_recovery(
+        &mut self,
+        generation: u64,
+        transaction_id: u64,
+        now_ns: u64,
+        failure: AttemptFailure,
+    ) -> Result<(), RestartTransitionError> {
+        let RestartState::Ready {
+            generation: current_generation,
+            transaction_id: current_transaction,
+            ..
+        } = self.state
+        else {
+            return Err(RestartTransitionError::InvalidState);
+        };
+        validate_event_identity(
+            generation,
+            transaction_id,
+            current_generation,
+            current_transaction,
+        )?;
+        checked_deadline(now_ns, self.policy.restart_window_ns)?;
+        let mut candidate = *self;
+        candidate.history = RestartHistory::new();
+        candidate.episode_started_at_ns = now_ns;
+        candidate.state = RestartState::Ready {
+            attempt: 1,
+            generation,
+            transaction_id,
+        };
+        candidate.fail_attempt(generation, transaction_id, now_ns, failure)?;
+        *self = candidate;
+        Ok(())
     }
 
     /// Retires an exact active identity when its ordinary failure transition
@@ -1097,6 +1141,245 @@ mod tests {
         assert!(matches!(
             supervisor.state(),
             RestartState::Ready { generation: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn ordinary_failure_of_aged_ready_role_keeps_boot_anchored_window() {
+        let mut supervisor = supervisor();
+        begin_started(&mut supervisor, 0);
+        supervisor.ready(1, 11, 1).unwrap();
+        supervisor
+            .fail_attempt(1, 11, 3_000_000_000, AttemptFailure::WaitFailed)
+            .unwrap();
+        supervisor.cleanup_complete(1, 11, 3_000_000_001).unwrap();
+        assert_eq!(
+            supervisor.state(),
+            RestartState::PermanentFailure {
+                final_failure: AttemptFailure::WaitFailed,
+                cleanup: CleanupDisposition::Complete,
+            }
+        );
+        assert_eq!(supervisor.history().len(), 1);
+        assert_eq!(supervisor.episode_started_at_ns, 0);
+    }
+
+    #[test]
+    fn admitted_recovery_retires_original_owner_as_first_bounded_attempt() {
+        let mut supervisor = supervisor();
+        begin_started(&mut supervisor, 0);
+        let owner_started_at = fail_and_restart(&mut supervisor, 1, 11, 1);
+        supervisor.ready(2, 12, owner_started_at + 1).unwrap();
+        assert_eq!(supervisor.history().len(), 1);
+
+        supervisor
+            .admit_recovery(2, 12, 3_000_000_000, AttemptFailure::WaitFailed)
+            .unwrap();
+        assert_eq!(supervisor.policy, WYR0_I_SUPERVISION_POLICY);
+        assert_eq!(supervisor.history().len(), 0);
+        assert_eq!(supervisor.episode_started_at_ns, 3_000_000_000);
+        assert_eq!(supervisor.last_generation, 2);
+        assert_eq!(
+            supervisor.state(),
+            RestartState::CleaningUp {
+                attempt: 1,
+                generation: 2,
+                transaction_id: 12,
+                failure: AttemptFailure::WaitFailed,
+                action: CleanupAction::TerminateTaskGroup,
+                classified_at_ns: 3_000_000_000,
+                deadline_ns: 4_000_000_000,
+                retry: true,
+            }
+        );
+        supervisor.cleanup_complete(2, 12, 3_000_000_001).unwrap();
+        assert_eq!(
+            supervisor.history().as_slice(),
+            &[Some(AttemptRecord {
+                attempt: 1,
+                generation: 2,
+                transaction_id: 12,
+                started_at_ns: owner_started_at,
+                terminal_at_ns: 3_000_000_000,
+                failure: AttemptFailure::WaitFailed,
+                cleanup: CleanupDisposition::Complete,
+            })]
+        );
+        assert_eq!(
+            supervisor.state(),
+            RestartState::Backoff {
+                next_attempt: 2,
+                next_generation: 3,
+                deadline_ns: 3_025_000_001,
+            }
+        );
+        for generation in 3..=5 {
+            let RestartState::Backoff { deadline_ns, .. } = supervisor.state() else {
+                panic!("replacement not bounded by backoff");
+            };
+            supervisor
+                .start_replacement(deadline_ns, generation, generation + 10)
+                .unwrap();
+            supervisor
+                .fail_attempt(
+                    generation,
+                    generation + 10,
+                    deadline_ns,
+                    AttemptFailure::StartFailed,
+                )
+                .unwrap();
+            supervisor
+                .cleanup_complete(generation, generation + 10, deadline_ns + 1)
+                .unwrap();
+        }
+        assert_eq!(supervisor.history().len(), 4);
+        assert_eq!(
+            supervisor.state(),
+            RestartState::PermanentFailure {
+                final_failure: AttemptFailure::StartFailed,
+                cleanup: CleanupDisposition::Complete,
+            }
+        );
+    }
+
+    #[test]
+    fn recovery_admission_rejections_preserve_every_field() {
+        let mut supervisor = supervisor();
+        begin_started(&mut supervisor, 0);
+        let started_at = fail_and_restart(&mut supervisor, 1, 11, 1);
+        supervisor.ready(2, 12, started_at + 1).unwrap();
+        for (generation, transaction, now, failure, error) in [
+            (
+                0,
+                12,
+                3_000_000_000,
+                AttemptFailure::WaitFailed,
+                RestartTransitionError::ZeroIdentity,
+            ),
+            (
+                2,
+                0,
+                3_000_000_000,
+                AttemptFailure::WaitFailed,
+                RestartTransitionError::ZeroIdentity,
+            ),
+            (
+                1,
+                12,
+                3_000_000_000,
+                AttemptFailure::WaitFailed,
+                RestartTransitionError::StaleGeneration,
+            ),
+            (
+                2,
+                11,
+                3_000_000_000,
+                AttemptFailure::WaitFailed,
+                RestartTransitionError::TransactionMismatch,
+            ),
+            (
+                2,
+                12,
+                started_at,
+                AttemptFailure::WaitFailed,
+                RestartTransitionError::TimeRegression,
+            ),
+            (
+                2,
+                12,
+                3_000_000_000,
+                AttemptFailure::CreationFailed,
+                RestartTransitionError::InvalidState,
+            ),
+            (
+                2,
+                12,
+                u64::MAX - 1_000_000_000,
+                AttemptFailure::WaitFailed,
+                RestartTransitionError::ArithmeticOverflow,
+            ),
+        ] {
+            let before = supervisor;
+            assert_eq!(
+                supervisor.admit_recovery(generation, transaction, now, failure),
+                Err(error)
+            );
+            assert_eq!(supervisor, before);
+        }
+        // Exercise overflow after the candidate's time/history changes, not
+        // only overflow rejected before the candidate is constructed.
+        supervisor.policy.restart_window_ns = 1;
+        let before = supervisor;
+        assert_eq!(
+            supervisor.admit_recovery(2, 12, u64::MAX - 1, AttemptFailure::WaitFailed),
+            Err(RestartTransitionError::ArithmeticOverflow)
+        );
+        assert_eq!(supervisor, before);
+    }
+
+    #[test]
+    fn recovery_admission_rejects_non_ready_states_and_duplicate() {
+        fn reject(supervisor: &mut RestartSupervisor, now: u64) {
+            let before = *supervisor;
+            assert_eq!(
+                supervisor.admit_recovery(1, 11, now, AttemptFailure::WaitFailed),
+                Err(RestartTransitionError::InvalidState)
+            );
+            assert_eq!(*supervisor, before);
+        }
+        let mut supervisor = supervisor();
+        reject(&mut supervisor, 0);
+        supervisor.begin(0, 1, 11).unwrap();
+        reject(&mut supervisor, 0);
+        supervisor.child_started(1, 11, 1).unwrap();
+        reject(&mut supervisor, 1);
+        supervisor.ready(1, 11, 2).unwrap();
+        supervisor
+            .admit_recovery(1, 11, 3_000_000_000, AttemptFailure::WaitFailed)
+            .unwrap();
+        reject(&mut supervisor, 3_000_000_001);
+        let mut failed = supervisor;
+        failed.cleanup_failed(1, 11, 3_000_000_001).unwrap();
+        reject(&mut failed, 3_000_000_002);
+        supervisor.cleanup_complete(1, 11, 3_000_000_001).unwrap();
+        reject(&mut supervisor, 3_000_000_002);
+    }
+
+    #[test]
+    fn admitted_recovery_preserves_absolute_window_and_cleanup_edges() {
+        let mut supervisor = supervisor();
+        begin_started(&mut supervisor, 0);
+        supervisor.ready(1, 11, 1).unwrap();
+        supervisor
+            .admit_recovery(1, 11, 3_000_000_000, AttemptFailure::WaitFailed)
+            .unwrap();
+        let mut late_cleanup = supervisor;
+        late_cleanup.cleanup_complete(1, 11, 4_000_000_000).unwrap();
+        assert_eq!(
+            late_cleanup.state(),
+            RestartState::PermanentFailure {
+                final_failure: AttemptFailure::WaitFailed,
+                cleanup: CleanupDisposition::Failed,
+            }
+        );
+        supervisor.cleanup_complete(1, 11, 3_000_000_001).unwrap();
+        let mut late_start = supervisor;
+        late_start.start_replacement(5_000_000_001, 2, 12).unwrap();
+        assert_eq!(
+            late_start.state(),
+            RestartState::PermanentFailure {
+                final_failure: AttemptFailure::WaitFailed,
+                cleanup: CleanupDisposition::Complete,
+            }
+        );
+        supervisor.start_replacement(5_000_000_000, 2, 12).unwrap();
+        assert!(matches!(
+            supervisor.state(),
+            RestartState::Starting {
+                attempt: 2,
+                deadline_ns: 6_000_000_000,
+                ..
+            }
         ));
     }
 

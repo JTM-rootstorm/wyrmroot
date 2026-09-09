@@ -2290,17 +2290,85 @@ where
     S: InitPlatform,
     W: SupervisionPlatform<Error = NativeError>,
 {
+    retire_registry_generation(
+        system,
+        waits,
+        controller,
+        registry,
+        dependent_cleanup_failed,
+        deadline_cap,
+        RegistryRetirement::Failure,
+    )
+}
+
+#[cfg(feature = "wyr1e8-selector33")]
+pub(crate) fn retire_registry_for_recovery_before<S, W>(
+    system: &mut S,
+    waits: &mut W,
+    controller: &mut SystemInit,
+    registry: RegistryNativeAttempt,
+    deadline_cap: u64,
+) -> Result<bool, InitError>
+where
+    S: InitPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    retire_registry_generation(
+        system,
+        waits,
+        controller,
+        registry,
+        false,
+        Some(deadline_cap),
+        RegistryRetirement::CoordinatedRecovery,
+    )
+}
+
+enum RegistryRetirement {
+    Failure,
+    #[cfg(feature = "wyr1e8-selector33")]
+    CoordinatedRecovery,
+}
+
+fn retire_registry_generation<S, W>(
+    system: &mut S,
+    waits: &mut W,
+    controller: &mut SystemInit,
+    registry: RegistryNativeAttempt,
+    dependent_cleanup_failed: bool,
+    deadline_cap: Option<u64>,
+    retirement: RegistryRetirement,
+) -> Result<bool, InitError>
+where
+    S: InitPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
     let observed_now = system.now().map_err(InitError::Native);
     let (transition_now, transition) = match observed_now {
         Ok(now) => (
             Some(now),
-            controller.fail(
-                RoleId::Registryd,
-                registry.active.generation,
-                registry.active.transaction_id,
-                now,
-                AttemptFailure::WaitFailed,
-            ),
+            match retirement {
+                RegistryRetirement::Failure => controller.fail(
+                    RoleId::Registryd,
+                    registry.active.generation,
+                    registry.active.transaction_id,
+                    now,
+                    AttemptFailure::WaitFailed,
+                ),
+                #[cfg(feature = "wyr1e8-selector33")]
+                RegistryRetirement::CoordinatedRecovery
+                    if deadline_cap.is_some_and(|deadline| now < deadline) =>
+                {
+                    controller.admit_recovery(
+                        RoleId::Registryd,
+                        registry.active.generation,
+                        registry.active.transaction_id,
+                        now,
+                    )
+                }
+                #[cfg(feature = "wyr1e8-selector33")]
+                RegistryRetirement::CoordinatedRecovery => Err(InitError::Supervision),
+            },
         ),
         Err(error) => (None, Err(error)),
     };
@@ -12395,6 +12463,133 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn ordinary_aged_registry_cleanup_remains_permanent_after_startup_window() {
+        let (mut controller, registry) = ready_registry();
+        let mut platform = MockPlatform::new();
+        platform.now = Some(3_000_000_000);
+        platform.allow_wait = true;
+        let mut waits = TerminalWaits;
+        assert_eq!(
+            poison_registry_generation_before(
+                &mut platform,
+                &mut waits,
+                &mut controller,
+                registry,
+                false,
+                Some(4_000_000_000),
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            controller.role_state(RoleId::Registryd),
+            Some(RestartState::PermanentFailure {
+                final_failure: AttemptFailure::WaitFailed,
+                cleanup: CleanupDisposition::Complete,
+            })
+        );
+        assert_eq!(controller.outstanding_reservations(), 0);
+        assert_eq!(controller.mode(), SystemMode::Degraded);
+        assert_eq!(platform.now, Some(3_000_000_000));
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    #[test]
+    fn admitted_aged_registry_cleanup_advances_only_after_exact_retirement_and_backoff() {
+        let (mut controller, registry) = ready_registry();
+        let mut platform = MockPlatform::new();
+        platform.now = Some(3_000_000_000);
+        platform.allow_wait = true;
+        let mut waits = TerminalWaits;
+        assert_eq!(
+            retire_registry_for_recovery_before(
+                &mut platform,
+                &mut waits,
+                &mut controller,
+                registry,
+                4_000_000_000,
+            ),
+            Ok(false)
+        );
+        assert_eq!(platform.terminate_count, 1);
+        assert_eq!(
+            platform.closed[..platform.close_count],
+            [DwHandle(32), DwHandle(31), DwHandle(30), DwHandle(33)]
+        );
+        assert_eq!(controller.outstanding_reservations(), 0);
+        assert!(controller.resources(RoleId::Registryd).is_none());
+        assert_eq!(platform.now, Some(3_025_000_001));
+        assert_eq!(
+            controller.role_state(RoleId::Registryd),
+            Some(RestartState::Starting {
+                attempt: 2,
+                generation: 2,
+                transaction_id: 0x1002,
+                deadline_ns: 4_025_000_001,
+            })
+        );
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    #[test]
+    fn admitted_registry_cleanup_failure_keeps_accounting_and_forbids_replacement() {
+        let (mut controller, registry) = ready_registry();
+        let mut platform = MockPlatform::new();
+        platform.now = Some(3_000_000_000);
+        platform.fail_close = Some(registry.control_channel);
+        let mut waits = TerminalWaits;
+        assert_eq!(
+            retire_registry_for_recovery_before(
+                &mut platform,
+                &mut waits,
+                &mut controller,
+                registry,
+                4_000_000_000,
+            ),
+            Ok(true)
+        );
+        assert_eq!(controller.outstanding_reservations(), 1);
+        assert!(controller.resources(RoleId::Registryd).is_some());
+        assert_eq!(
+            controller.role_state(RoleId::Registryd),
+            Some(RestartState::PermanentFailure {
+                final_failure: AttemptFailure::WaitFailed,
+                cleanup: CleanupDisposition::Failed,
+            })
+        );
+        assert_eq!(platform.close_count, 4);
+        assert_eq!(platform.now, Some(3_000_000_000));
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    #[test]
+    fn recovery_episode_does_not_extend_the_existing_action_cap() {
+        for deadline in [3_000_000_000, 3_025_000_001] {
+            let (mut controller, registry) = ready_registry();
+            let mut platform = MockPlatform::new();
+            platform.now = Some(3_000_000_000);
+            platform.allow_wait = true;
+            let mut waits = TerminalWaits;
+            assert_eq!(
+                retire_registry_for_recovery_before(
+                    &mut platform,
+                    &mut waits,
+                    &mut controller,
+                    registry,
+                    deadline,
+                ),
+                Err(InitError::Supervision)
+            );
+            assert!(!matches!(
+                controller.role_state(RoleId::Registryd),
+                Some(RestartState::Starting { .. })
+            ));
+            assert_eq!(controller.outstanding_reservations(), 0);
+            assert_eq!(platform.close_count, 4);
+            assert_eq!(platform.now, Some(deadline));
+        }
     }
 
     #[test]

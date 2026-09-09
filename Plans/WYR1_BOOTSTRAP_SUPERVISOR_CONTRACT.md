@@ -359,6 +359,34 @@ Bounded oldest-to-newest history records generation, transaction,
 start/classification time, terminal/failure disposition, requested cleanup, and
 cleanup outcome. It is current-boot state.
 
+### Explicit post-stability recovery admission
+
+The startup episode remains anchored to its initial attempt: accepting READY or
+observing an ordinary failure never replenishes its budget or window. An aged
+Ready registry can therefore exhaust that episode despite successful cleanup.
+
+The authenticated, exactly quiesced coordinated registry recovery action may
+explicitly admit one new finite episode after dependent retirement succeeds and
+before its existing absolute action deadline. `SystemInit` validates the exact
+Ready role/generation/transaction and its published resource reservation, then
+`RestartSupervisor::admit_recovery` atomically moves that owner into CleaningUp.
+Invalid identity, state, accounting, time, or checked deadline arithmetic leaves
+admission state unchanged; an immediate duplicate cannot renew the episode
+because the owner is no longer Ready. No ordinary failure path uses this API.
+
+The admission time anchors the new two-second window and clears only the
+episode-local terminal history. The retiring generation counts as attempt one
+of the same four-attempt policy, with its actual original attempt start time
+retained: admission did not launch a process, and recording a new start would
+misrepresent the healthy owner's lifetime. Generation and transaction identities,
+the generation high-water mark, native resources, and accounting ownership are
+not reset. Only successful exact cleanup releases the reservation and admits
+the fixed 25 ms backoff toward a fresh generation; failed cleanup remains visible
+PermanentFailure. The one-second READY and cleanup limits and the coordinated
+action's earlier absolute cap remain unchanged. This is explicit controller
+policy for the admitted action, not a general long-lived service restart policy
+or a change to the locked WYR0-I startup semantics.
+
 ## 8. Launch, READY, exit, and reaping
 
 Init reuses `wyrmroot-loader` ELF validation, mapping, construction, startup

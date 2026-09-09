@@ -1019,6 +1019,41 @@ impl RoleController {
             resources: None,
         })
     }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    fn admit_recovery(
+        &mut self,
+        accounting: &AttemptLedger,
+        generation: u64,
+        transaction: u64,
+        now: u64,
+    ) -> Result<(), InitError> {
+        let resources = self
+            .resources
+            .as_ref()
+            .ok_or(InitError::MissingAttemptResources)?;
+        if resources.generation != generation {
+            return Err(RestartTransitionError::StaleGeneration.into());
+        }
+        if resources.transaction_id != transaction {
+            return Err(RestartTransitionError::TransactionMismatch.into());
+        }
+        let reservation = &resources.reservation;
+        let slot = &accounting.slots[role_index(self.role)?];
+        validate_reservation(slot, reservation)?;
+        if resources.role != self.role
+            || reservation.role != self.role
+            || reservation.generation != generation
+            || reservation.transaction_id != transaction
+            || !reservation.published
+            || !slot.published
+        {
+            return Err(InitError::Accounting);
+        }
+        self.restart
+            .admit_recovery(generation, transaction, now, AttemptFailure::WaitFailed)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1382,6 +1417,20 @@ impl SystemInit {
             .restart
             .fail_attempt(generation, transaction, now, failure)?;
         Ok(())
+    }
+
+    /// Starts one explicitly admitted post-stability recovery episode without
+    /// releasing the exact published owner's resources or accounting token.
+    #[cfg(feature = "wyr1e8-selector33")]
+    pub(crate) fn admit_recovery(
+        &mut self,
+        role: RoleId,
+        generation: u64,
+        transaction: u64,
+        now: u64,
+    ) -> Result<(), InitError> {
+        let index = self.index(role).ok_or(InitError::UnlaunchableRole)?;
+        self.roles[index].admit_recovery(&self.accounting, generation, transaction, now)
     }
 
     pub fn ready_wait_failed(
@@ -3539,6 +3588,151 @@ mod native_cleanup_tests {
             1,
         );
         controller
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    #[test]
+    fn admitted_recovery_keeps_owner_reserved_until_exact_cleanup() {
+        let mut controller = ready_registry_controller();
+        controller
+            .admit_recovery(RoleId::Registryd, 1, 0x1001, 3_000_000_000)
+            .unwrap();
+        assert_eq!(controller.outstanding_reservations(), 1);
+        assert!(controller.resources(RoleId::Registryd).is_some());
+        let restart = controller.roles[0].restart;
+        let accounting = controller.accounting;
+        assert_eq!(
+            controller.admit_recovery(RoleId::Registryd, 1, 0x1001, 3_000_000_001),
+            Err(InitError::Restart(RestartTransitionError::InvalidState))
+        );
+        assert_eq!(controller.roles[0].restart, restart);
+        assert_eq!(controller.accounting, accounting);
+        assert_eq!(
+            controller.cleanup_complete(RoleId::Registryd, 2, 0x1001, 3_000_000_001),
+            Err(InitError::Restart(RestartTransitionError::StaleGeneration))
+        );
+        assert_eq!(controller.outstanding_reservations(), 1);
+        controller
+            .cleanup_complete(RoleId::Registryd, 1, 0x1001, 3_000_000_001)
+            .unwrap();
+        assert_eq!(controller.outstanding_reservations(), 0);
+        assert!(controller.resources(RoleId::Registryd).is_none());
+        assert_ne!(controller.mode(), SystemMode::Degraded);
+        assert_eq!(
+            controller.role_state(RoleId::Registryd),
+            Some(RestartState::Backoff {
+                next_attempt: 2,
+                next_generation: 2,
+                deadline_ns: 3_025_000_001,
+            })
+        );
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    #[test]
+    fn recovery_admission_rejects_wrong_owner_and_invalid_clock_without_mutation() {
+        for (role, generation, transaction, now, error) in [
+            (
+                RoleId::Consoled,
+                1,
+                0x1001,
+                3_000_000_000,
+                InitError::UnlaunchableRole,
+            ),
+            (
+                RoleId::Registryd,
+                2,
+                0x1001,
+                3_000_000_000,
+                InitError::Restart(RestartTransitionError::StaleGeneration),
+            ),
+            (
+                RoleId::Registryd,
+                1,
+                0x1002,
+                3_000_000_000,
+                InitError::Restart(RestartTransitionError::TransactionMismatch),
+            ),
+            (
+                RoleId::Registryd,
+                1,
+                0x1001,
+                0,
+                InitError::Restart(RestartTransitionError::TimeRegression),
+            ),
+            (
+                RoleId::Registryd,
+                1,
+                0x1001,
+                u64::MAX,
+                InitError::Restart(RestartTransitionError::ArithmeticOverflow),
+            ),
+        ] {
+            let mut controller = ready_registry_controller();
+            let unchanged = ready_registry_controller();
+            assert_eq!(
+                controller.admit_recovery(role, generation, transaction, now),
+                Err(error)
+            );
+            assert_eq!(controller, unchanged);
+        }
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    #[test]
+    fn recovery_admission_requires_exact_published_resources_without_mutation() {
+        let mutations: [fn(&mut SystemInit); 6] = [
+            |controller| controller.roles[0].resources.as_mut().unwrap().role = RoleId::Devmgr,
+            |controller| {
+                controller.roles[0]
+                    .resources
+                    .as_mut()
+                    .unwrap()
+                    .reservation
+                    .role = RoleId::Devmgr
+            },
+            |controller| {
+                controller.roles[0]
+                    .resources
+                    .as_mut()
+                    .unwrap()
+                    .reservation
+                    .published = false
+            },
+            |controller| {
+                controller.roles[0]
+                    .resources
+                    .as_mut()
+                    .unwrap()
+                    .reservation
+                    .released = true
+            },
+            |controller| controller.accounting.slots[0].published = false,
+            |controller| controller.accounting.slots[0].nonce += 1,
+        ];
+        for mutate in mutations {
+            let mut controller = ready_registry_controller();
+            let mut unchanged = ready_registry_controller();
+            mutate(&mut controller);
+            mutate(&mut unchanged);
+            assert_eq!(
+                controller.admit_recovery(RoleId::Registryd, 1, 0x1001, 3_000_000_000),
+                Err(InitError::Accounting)
+            );
+            assert_eq!(controller, unchanged);
+        }
+        let mut controller = ready_registry_controller();
+        let retained = controller.roles[0].resources.take().unwrap();
+        let restart = controller.roles[0].restart;
+        let accounting = controller.accounting;
+        assert_eq!(
+            controller.admit_recovery(RoleId::Registryd, 1, 0x1001, 3_000_000_000),
+            Err(InitError::MissingAttemptResources)
+        );
+        assert_eq!(controller.roles[0].restart, restart);
+        assert_eq!(controller.accounting, accounting);
+        controller.roles[0].resources = Some(retained);
+        assert_eq!(controller, ready_registry_controller());
     }
 
     #[test]

@@ -14,8 +14,6 @@ mod wyr1e;
 use crate::wyr1b::{EndpointKind, RegistryTopology};
 #[cfg(all(test, feature = "wyr1e8-selector33"))]
 use crate::wyr1b_job::JobDispatcher;
-#[cfg(feature = "wyr1e8-selector33")]
-use crate::wyr1b_native::launch_registry_until_ready_before;
 #[cfg(all(test, feature = "wyr1e8-selector33"))]
 use crate::wyr1b_native::{
     InstalledPeer, ShellControllerState, registry_native_attempt_for_e8_fixture,
@@ -26,6 +24,10 @@ use crate::wyr1b_native::{
     RegistryNativeAttempt, create_controller_channel_pair, establish_registry_topology,
     launch_registry_until_ready, poison_registry_generation, poison_registry_generation_before,
     restart_topology_or_poison_before,
+};
+#[cfg(feature = "wyr1e8-selector33")]
+use crate::wyr1b_native::{
+    launch_registry_until_ready_before, retire_registry_for_recovery_before,
 };
 use deepwyrm_syscall::{DW_HANDLE_TRANSFER_MOVE, DW_OBJECT_TYPE_CHANNEL, DwHandleTransferV1};
 #[cfg(any(
@@ -3628,14 +3630,36 @@ where
         .as_mut()
         .ok_or(InitError::WrongActivationOrder)?
         .binding = None;
+    #[cfg(feature = "wyr1e8-selector33")]
+    let exhausted = if let Some(deadline) = action_deadline
+        && dependent_cleanup_error.is_none()
+    {
+        // The authenticated, exactly quiesced action admits a fresh finite
+        // episode only after dependent retirement succeeds. Ordinary failures
+        // keep the boot-anchored episode, even after a long healthy lifetime.
+        retire_registry_for_recovery_before(
+            system,
+            waits,
+            &mut resident.controller,
+            registry,
+            deadline,
+        )
+    } else {
+        poison_registry_generation_before(
+            system,
+            waits,
+            &mut resident.controller,
+            registry,
+            dependent_cleanup_error.is_some(),
+            action_deadline,
+        )
+    };
+    #[cfg(not(feature = "wyr1e8-selector33"))]
     let exhausted = poison_registry_generation_before(
         system,
         waits,
         &mut resident.controller,
         registry,
-        #[cfg(feature = "wyr1e8-selector33")]
-        dependent_cleanup_error.is_some(),
-        #[cfg(not(feature = "wyr1e8-selector33"))]
         dependent_cleanup_failed,
         action_deadline,
     );

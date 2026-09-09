@@ -286,6 +286,38 @@ fn registry_recovery_phase_failures_are_wrapped_at_existing_boundaries() {
 }
 
 #[test]
+fn registry_episode_admission_is_only_for_live_quiesced_coordinated_recovery() {
+    let recovery = &RESIDENT[RESIDENT.find("fn recover_registry<").unwrap()
+        ..RESIDENT
+            .find("pub(crate) const E8_REGISTRY_FIXTURE_DEVMGR_CONTROL")
+            .unwrap()];
+    let quiesced = recovery
+        .find("action_deadline.is_some() && !_e8_quiesced")
+        .unwrap();
+    let live = recovery.find("wyr1e::ensure_e8_action_live(").unwrap();
+    let dependents = recovery.find("wyr1e::retire_dependents(").unwrap();
+    let admission = recovery
+        .find("retire_registry_for_recovery_before(")
+        .unwrap();
+    assert!(quiesced < live && live < dependents && dependents < admission);
+    assert!(recovery.contains("let exhausted = if let Some(deadline) = action_deadline"));
+    assert!(recovery.contains("&& dependent_cleanup_error.is_none()"));
+    assert_eq!(
+        RESIDENT
+            .matches("retire_registry_for_recovery_before(")
+            .count(),
+        1
+    );
+    assert!(JOBS.contains("RegistryRetirement::Failure => controller.fail("));
+    assert!(JOBS.contains("if deadline_cap.is_some_and(|deadline| now < deadline)"));
+    let retirement = &JOBS[JOBS.find("fn retire_registry_generation<").unwrap()
+        ..JOBS
+            .find("pub(crate) fn restart_topology_or_poison<")
+            .unwrap()];
+    assert_eq!(retirement.matches("controller.admit_recovery(").count(), 1);
+}
+
+#[test]
 fn e8_failure_detail_is_bound_to_each_actual_transition_join() {
     let main = include_str!("../src/main.rs");
     let lib = include_str!("../src/lib.rs");
