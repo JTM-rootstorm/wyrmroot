@@ -3286,8 +3286,12 @@ where
                                             );
                                             #[cfg(not(feature = "wyr1d-selector32"))]
                                             {
-                                                let rebound =
-                                                    rebind_publication(resident, system, waits);
+                                                let rebound = rebind_publication(
+                                                    resident,
+                                                    system,
+                                                    waits,
+                                                    PublicationRebindContext::DriverRetirement,
+                                                );
                                                 #[cfg(feature = "wyr1e8-selector33")]
                                                 let rebound = e8_operation(
                                                     E8FailureOperation::RebindPublication,
@@ -3514,7 +3518,12 @@ where
         selector32::poll(resident, system, loader, waits, now_ns)?;
         if selector32::claim_publication_rebind(resident, system.now().map_err(InitError::Native)?)?
         {
-            rebind_publication(resident, system, waits)?;
+            rebind_publication(
+                resident,
+                system,
+                waits,
+                PublicationRebindContext::DriverRetirement,
+            )?;
         }
     }
     #[cfg(feature = "wyr1e-production")]
@@ -3812,7 +3821,12 @@ where
         .as_mut()
         .ok_or(InitError::WrongActivationOrder)?
         .waiting_registry_observed = true;
-    let rebound = rebind_publication(resident, system, waits);
+    let rebound = rebind_publication(
+        resident,
+        system,
+        waits,
+        PublicationRebindContext::RegistryRecovery,
+    );
     #[cfg(feature = "wyr1e8-selector33")]
     let rebound = e8_operation(E8FailureOperation::RebindPublication, rebound);
     if let Err(error) = rebound {
@@ -3992,7 +4006,7 @@ where
         wyr1b_evidence: None,
         wyr1c: Some(ResidentState {
             e6: Some(e6),
-            resource_domain: None,
+            resource_domain: Some(ResourceDomainCustody::new(DwHandle(0xE8B5_0043))),
             registry: Some(registry),
             topology,
             devmgr: Some(devmgr),
@@ -4512,10 +4526,53 @@ where
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublicationRebindContext {
+    RegistryRecovery,
+    #[cfg(any(
+        test,
+        feature = "wyr1c6-production",
+        feature = "dw1e3-selector31",
+        feature = "wyr1d-selector32"
+    ))]
+    DriverRetirement,
+}
+
+impl PublicationRebindContext {
+    fn expected_status(
+        self,
+        resource_domain: Option<ResourceDomainCustody>,
+        _driver: Option<DriverNativeAttempt>,
+        _reaped: Option<DriverLaunchRequest>,
+        _supervisor: SupervisorGeneration,
+    ) -> Result<StatusCode, InitError> {
+        match self {
+            Self::RegistryRecovery if resource_domain.is_some() => {
+                Ok(StatusCode::OperationalResourceOwned)
+            }
+            Self::RegistryRecovery => Ok(StatusCode::OperationalWaitingForDeviceBundle),
+            #[cfg(any(
+                test,
+                feature = "wyr1c6-production",
+                feature = "dw1e3-selector31",
+                feature = "wyr1d-selector32"
+            ))]
+            Self::DriverRetirement => {
+                let reaped = _reaped.ok_or(InitError::WrongActivationOrder)?;
+                if _driver.is_some() || reaped.supervisor_generation != _supervisor {
+                    return Err(InitError::WrongActivationOrder);
+                }
+                Ok(StatusCode::OperationalWaitingForDeviceBundle)
+            }
+        }
+    }
+}
+
 fn rebind_publication<S, W>(
     resident: &mut ResidentSystemInit,
     system: &mut S,
     waits: &mut W,
+    context: PublicationRebindContext,
 ) -> Result<(), InitError>
 where
     S: Wyr1BPlatform,
@@ -4531,6 +4588,12 @@ where
         .ok_or(InitError::WrongActivationOrder)?;
     let registry = state.registry.ok_or(InitError::WrongActivationOrder)?;
     let devmgr = state.devmgr.ok_or(InitError::WrongActivationOrder)?;
+    let expected_status = context.expected_status(
+        state.resource_domain,
+        state.driver,
+        state.last_reaped_driver,
+        SupervisorGeneration(devmgr.generation),
+    )?;
     let rebound = perform_rebind(
         system,
         waits,
@@ -4539,6 +4602,7 @@ where
         registry.control_channel,
         devmgr,
         state.next_controller_transaction,
+        expected_status,
         deadline_cap,
     );
     let (binding, publication_service_generation, transaction_id) = match rebound {
@@ -4574,6 +4638,7 @@ fn perform_rebind<S, W>(
     registry_control: DwHandle,
     devmgr: ActiveNativeRole,
     transaction_id: u64,
+    expected_status: StatusCode,
     deadline_cap: Option<u64>,
 ) -> Result<(wyrmroot_device_proto::RegistryBinding, u64, u64), InitError>
 where
@@ -4681,7 +4746,7 @@ where
         devmgr,
         binding,
         transaction_id,
-        StatusCode::OperationalWaitingForDeviceBundle,
+        expected_status,
         deadline_cap,
     )?;
     Ok((binding, publication.service_generation, transaction_id))
@@ -4719,12 +4784,18 @@ mod tests {
         registry_service_generation: Option<u64>,
         controller_service_generation: Option<u64>,
         controller_request: Option<ControllerMessage>,
+        now: u64,
+        receive_at: Option<u64>,
     }
 
     impl RebindPlatform {
         fn with_status(message: ControllerMessage) -> Self {
             let mut inbound = [0; wyrmroot_device_proto::controller::STATUS_BYTES];
             encode_controller(message, &mut inbound).unwrap();
+            Self::with_reply(inbound)
+        }
+
+        fn with_reply(inbound: [u8; wyrmroot_device_proto::controller::STATUS_BYTES]) -> Self {
             Self {
                 inbound,
                 inbound_len: wyrmroot_device_proto::controller::STATUS_BYTES,
@@ -4735,6 +4806,8 @@ mod tests {
                 registry_service_generation: None,
                 controller_service_generation: None,
                 controller_request: None,
+                now: 100,
+                receive_at: None,
             }
         }
     }
@@ -4762,6 +4835,9 @@ mod tests {
                 handles: 0,
             };
             self.inbound_len = 0;
+            if let Some(now) = self.receive_at {
+                self.now = now;
+            }
             Ok(counts)
         }
 
@@ -4801,7 +4877,7 @@ mod tests {
         }
 
         fn now(&mut self) -> Result<u64, NativeError> {
-            Ok(100)
+            Ok(self.now)
         }
 
         fn wait_until(&mut self, _deadline_ns: u64) -> Result<(), NativeError> {
@@ -4966,6 +5042,244 @@ mod tests {
         }
     }
 
+    fn real_rebind_producer(retired: bool) -> wyrmroot_devmgr::ResidentController {
+        use wyrmroot_device_proto::coordinator::BundleGeneration;
+        let mut producer = wyrmroot_devmgr::ResidentController::new(
+            wyrmroot_devmgr::prepare_operational(&wrdm([0x5a; 32]), 7).unwrap(),
+            8,
+        )
+        .unwrap();
+        let mut initial = binding();
+        if !retired {
+            initial.generation = RegistryGeneration(1);
+        }
+        producer
+            .accept(
+                ControllerMessage::InstallPublication {
+                    supervisor_generation: SupervisorGeneration(7),
+                    binding: initial,
+                    transaction_id: 8,
+                },
+                0,
+            )
+            .unwrap();
+        producer
+            .admit_device_resource(deepwyrm_syscall::DwDeviceResourceInfoV1 {
+                size: deepwyrm_syscall::DW_DEVICE_RESOURCE_INFO_V1_SIZE,
+                version: deepwyrm_syscall::DW_DEVICE_RESOURCE_INFO_V1_VERSION,
+                kind: deepwyrm_syscall::DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT,
+                flags: 0,
+                resource_id: 1,
+                lease_generation: 19,
+                pio_base: 0x2f8,
+                pio_length: 8,
+                interrupt_source: 3,
+                reserved: 0,
+            })
+            .unwrap();
+        let driver = producer
+            .issue_driver_launch_with_bundle(
+                true,
+                wyrmroot_device_proto::DirectControlRights::ExactReduced,
+            )
+            .unwrap();
+        producer.driver_constructed().unwrap();
+        producer.resource_bundle_message().unwrap();
+        producer.bundle_transferred().unwrap();
+        producer
+            .accept_driver_ready(wyrmroot_device_proto::ControlMessage::Ready {
+                role_id: driver.role_id,
+                bundle_generation: BundleGeneration(19),
+                attempt_generation: driver.attempt_generation,
+                endpoint: driver.endpoint,
+                transaction_id: driver.transaction_id,
+            })
+            .unwrap();
+        producer.publication_committed().unwrap();
+        if retired {
+            producer.retire_message().unwrap();
+            producer.accept_intentional_driver_terminal(driver).unwrap();
+            producer.publication_retired().unwrap();
+            producer.reap_driver().unwrap();
+        } else {
+            producer.publication_peer_closed().unwrap();
+        }
+        producer
+            .accept(
+                ControllerMessage::RebindPublication {
+                    supervisor_generation: SupervisorGeneration(7),
+                    binding: rebound_binding(),
+                    transaction_id: 9,
+                },
+                1,
+            )
+            .unwrap();
+        assert_eq!(producer.driver_ready(), !retired);
+        assert_eq!(
+            producer.active_driver_request(),
+            if retired { None } else { Some(driver) }
+        );
+        producer
+    }
+
+    #[test]
+    fn real_rebind_acknowledgements_are_lifecycle_exact_and_reject_swapped_or_stale_replies() {
+        for retired in [false, true] {
+            let producer = real_rebind_producer(retired);
+            let reply = producer.publication_acknowledgement().unwrap();
+            let context = if retired {
+                PublicationRebindContext::DriverRetirement
+            } else {
+                PublicationRebindContext::RegistryRecovery
+            };
+            let expected_status = context
+                .expected_status(
+                    Some(ResourceDomainCustody::new(DwHandle(60))),
+                    None,
+                    retired.then(driver_request),
+                    SupervisorGeneration(7),
+                )
+                .unwrap();
+            assert_eq!(
+                parse_controller(&reply).unwrap(),
+                ControllerMessage::Status {
+                    supervisor_generation: SupervisorGeneration(7),
+                    binding: Some(rebound_binding()),
+                    transaction_id: 9,
+                    status: expected_status,
+                    attempt_generation: None,
+                }
+            );
+            let swapped = if retired {
+                StatusCode::OperationalResourceOwned
+            } else {
+                StatusCode::OperationalWaitingForDeviceBundle
+            };
+            for mutation in [
+                None,
+                Some((72, swapped as u64)),
+                Some((24, 8)),
+                Some((32, 3)),
+                Some((40, 3)),
+                Some((48, 2)),
+                Some((56, 10)),
+                Some((80, 1)),
+            ] {
+                let mut bytes = reply;
+                if let Some((offset, value)) = mutation {
+                    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+                }
+                let mut platform = RebindPlatform::with_reply(bytes);
+                let mut topology = RegistryTopology::new(2).unwrap();
+                topology.issue(7, EndpointKind::Publication).unwrap();
+                let result = perform_rebind(
+                    &mut platform,
+                    &mut StatusWaits { fail: false },
+                    &mut topology,
+                    &mut PublicationAllocator::new(),
+                    DwHandle(40),
+                    devmgr(),
+                    9,
+                    expected_status,
+                    Some(1_000_000_000),
+                );
+                if mutation.is_none() {
+                    assert!(result.is_ok(), "retired={retired}: {result:?}");
+                } else {
+                    assert_eq!(
+                        result,
+                        Err(InitError::WrongManifestProfile),
+                        "retired={retired}, mutation={mutation:?}"
+                    );
+                }
+                assert_eq!(platform.inbound_len, 0);
+                assert_eq!(platform.send_count, 2);
+                assert_eq!(platform.close_count, 0);
+                assert_eq!(
+                    platform.controller_request,
+                    Some(ControllerMessage::RebindPublication {
+                        supervisor_generation: SupervisorGeneration(7),
+                        binding: rebound_binding(),
+                        transaction_id: 9,
+                    })
+                );
+            }
+            let mut platform = RebindPlatform::with_reply(reply);
+            platform.receive_at = Some(101);
+            let mut topology = RegistryTopology::new(2).unwrap();
+            topology.issue(7, EndpointKind::Publication).unwrap();
+            assert_eq!(
+                perform_rebind(
+                    &mut platform,
+                    &mut StatusWaits { fail: false },
+                    &mut topology,
+                    &mut PublicationAllocator::new(),
+                    DwHandle(40),
+                    devmgr(),
+                    9,
+                    expected_status,
+                    Some(101),
+                ),
+                Err(InitError::Supervision)
+            );
+            assert_eq!(platform.inbound_len, 0);
+        }
+    }
+
+    #[test]
+    fn rebind_postconditions_require_the_reached_resource_and_reaped_owner_context() {
+        let custody = Some(ResourceDomainCustody::new(DwHandle(60)));
+        let request = driver_request();
+        let driver = Some(DriverNativeAttempt {
+            loaded: devmgr().loaded,
+            task_group: DwHandle(61),
+            request,
+        });
+        let supervisor = SupervisorGeneration(7);
+        assert_eq!(
+            PublicationRebindContext::RegistryRecovery
+                .expected_status(None, None, None, supervisor),
+            Ok(StatusCode::OperationalWaitingForDeviceBundle)
+        );
+        assert_eq!(
+            PublicationRebindContext::RegistryRecovery
+                .expected_status(custody, driver, None, supervisor),
+            Ok(StatusCode::OperationalResourceOwned)
+        );
+        assert_eq!(
+            PublicationRebindContext::DriverRetirement.expected_status(
+                custody,
+                None,
+                Some(request),
+                supervisor
+            ),
+            Ok(StatusCode::OperationalWaitingForDeviceBundle)
+        );
+        assert_eq!(
+            PublicationRebindContext::DriverRetirement.expected_status(
+                custody,
+                driver,
+                Some(request),
+                supervisor
+            ),
+            Err(InitError::WrongActivationOrder)
+        );
+        assert_eq!(
+            PublicationRebindContext::DriverRetirement
+                .expected_status(custody, None, None, supervisor),
+            Err(InitError::WrongActivationOrder)
+        );
+        assert_eq!(
+            PublicationRebindContext::DriverRetirement.expected_status(
+                custody,
+                None,
+                Some(request),
+                SupervisorGeneration(8)
+            ),
+            Err(InitError::WrongActivationOrder)
+        );
+    }
+
     #[test]
     fn successful_rebind_preserves_devmgr_generation_and_commits_correlation() {
         let status = ControllerMessage::Status {
@@ -4990,6 +5304,7 @@ mod tests {
             DwHandle(40),
             devmgr(),
             9,
+            StatusCode::OperationalWaitingForDeviceBundle,
             None,
         )
         .unwrap();
@@ -5031,6 +5346,7 @@ mod tests {
                 DwHandle(40),
                 devmgr(),
                 9,
+                StatusCode::OperationalWaitingForDeviceBundle,
                 Some(100),
             ),
             Err(InitError::Supervision)
@@ -5080,6 +5396,7 @@ mod tests {
             DwHandle(40),
             devmgr(),
             9,
+            StatusCode::OperationalWaitingForDeviceBundle,
             None,
         )
         .unwrap_err();
@@ -5098,6 +5415,7 @@ mod tests {
             DwHandle(40),
             devmgr(),
             9,
+            StatusCode::OperationalWaitingForDeviceBundle,
             None,
         )
         .unwrap_err();

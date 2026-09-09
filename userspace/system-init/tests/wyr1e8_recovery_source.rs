@@ -378,3 +378,29 @@ fn e8_failure_detail_is_bound_to_each_actual_transition_join() {
         assert!(driver_exited.contains(operation));
     }
 }
+
+#[test]
+fn publication_rebind_joins_use_exact_lifecycle_postconditions_and_a_real_producer() {
+    let production = &RESIDENT[..RESIDENT.find("#[cfg(test)]\nmod tests {").unwrap()];
+    assert_eq!(
+        production
+            .matches("PublicationRebindContext::DriverRetirement")
+            .count(),
+        2
+    );
+    assert_eq!(
+        production
+            .matches("PublicationRebindContext::RegistryRecovery")
+            .count(),
+        1
+    );
+    let rebind = &production[production.find("fn rebind_publication<").unwrap()..];
+    assert!(rebind.contains("context.expected_status("));
+    assert!(rebind.contains("state.resource_domain"));
+    assert!(rebind.contains("state.last_reaped_driver"));
+    assert!(rebind.contains("expected_status,"));
+    assert!(rebind.contains("deadline_cap,"));
+    let fixture = include_str!("../src/wyr1e8_producer_fixture.rs");
+    assert!(fixture.contains("producer.publication_acknowledgement().unwrap()"));
+    assert!(!fixture.contains("OperationalWaitingForDeviceBundle"));
+}

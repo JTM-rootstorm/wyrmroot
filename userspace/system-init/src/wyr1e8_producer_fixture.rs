@@ -1167,21 +1167,9 @@ fn actual_driver_and_registry_recovery_compose_through_s4_ready() {
             generation: wyrmroot_device_proto::coordinator::RegistryEndpointGeneration(1),
         },
     };
-    let mut rebound_status = [0u8; wyrmroot_device_proto::controller::STATUS_BYTES];
-    wyrmroot_device_proto::controller::encode(
-        wyrmroot_device_proto::controller::ControllerMessage::Status {
-            supervisor_generation: wyrmroot_device_proto::coordinator::SupervisorGeneration(
-                s3.registry_generation,
-            ),
-            binding: Some(expected_rebound_binding),
-            transaction_id: 10,
-            status:
-                wyrmroot_device_proto::controller::StatusCode::OperationalWaitingForDeviceBundle,
-            attempt_generation: None,
-        },
-        &mut rebound_status,
-    )
-    .unwrap();
+    let rebound_status = retained_driver_rebind_acknowledgement(
+        s3.registry_generation, expected_rebound_binding, s3_ready.bundle_generation,
+    );
     platform.push(devmgr_control, rebound_status.to_vec(), &[]);
     platform.allow_wait_until = true;
     waits.transaction_id = 0xE8B5_0002;
@@ -1367,4 +1355,48 @@ fn actual_driver_and_registry_recovery_compose_through_s4_ready() {
         .unwrap();
     }
     std::println!("E8FIXTURE_HANDLES={handle_shape}");
+}
+
+fn retained_driver_rebind_acknowledgement(
+    supervisor_generation: u64,
+    replacement: wyrmroot_device_proto::RegistryBinding,
+    lease_generation: u64,
+) -> [u8; wyrmroot_device_proto::controller::STATUS_BYTES] {
+    use wyrmroot_device_proto::controller::ControllerMessage;
+    use wyrmroot_device_proto::coordinator::{RegistryGeneration, RegistryEndpointId, RegistryEndpointGeneration, SupervisorGeneration};
+    let mut manifest = [0; wyrmroot_device_proto::manifest::HEADER_BYTES + wyrmroot_device_proto::manifest::RECORD_BYTES];
+    wyrmroot_device_proto::encode_com2_manifest(wyrmroot_device_proto::manifest::ContentIdentity([0x5a; 32]), &mut manifest).unwrap();
+    let mut producer = wyrmroot_devmgr::ResidentController::new(
+        wyrmroot_devmgr::prepare_operational(&manifest, supervisor_generation).unwrap(), 9,
+    ).unwrap();
+    producer.accept(ControllerMessage::InstallPublication {
+        supervisor_generation: SupervisorGeneration(supervisor_generation),
+        binding: wyrmroot_device_proto::RegistryBinding {
+            generation: RegistryGeneration(replacement.generation.0 - 1),
+            endpoint: wyrmroot_device_proto::RegistryEndpoint { id: RegistryEndpointId(1), generation: RegistryEndpointGeneration(1) },
+        },
+        transaction_id: 9,
+    }, 0).unwrap();
+    producer.admit_device_resource(deepwyrm_syscall::DwDeviceResourceInfoV1 {
+        size: deepwyrm_syscall::DW_DEVICE_RESOURCE_INFO_V1_SIZE,
+        version: deepwyrm_syscall::DW_DEVICE_RESOURCE_INFO_V1_VERSION,
+        kind: deepwyrm_syscall::DW_DEVICE_RESOURCE_KIND_X86_PIO_WITH_PLATFORM_INTERRUPT,
+        flags: 0, resource_id: 1, lease_generation, pio_base: 0x2f8, pio_length: 8, interrupt_source: 3, reserved: 0,
+    }).unwrap();
+    let driver = producer.issue_driver_launch_with_bundle(true, wyrmroot_device_proto::DirectControlRights::ExactReduced).unwrap();
+    producer.driver_constructed().unwrap();
+    producer.resource_bundle_message().unwrap();
+    producer.bundle_transferred().unwrap();
+    producer.accept_driver_ready(wyrmroot_device_proto::ControlMessage::Ready {
+        role_id: driver.role_id, bundle_generation: BundleGeneration(lease_generation), attempt_generation: driver.attempt_generation,
+        endpoint: driver.endpoint, transaction_id: driver.transaction_id,
+    }).unwrap();
+    producer.publication_committed().unwrap();
+    producer.publication_peer_closed().unwrap();
+    producer.accept(ControllerMessage::RebindPublication {
+        supervisor_generation: SupervisorGeneration(supervisor_generation), binding: replacement, transaction_id: 10,
+    }, 1).unwrap();
+    assert_eq!(producer.active_driver_request(), Some(driver));
+    assert!(producer.driver_ready());
+    producer.publication_acknowledgement().unwrap()
 }

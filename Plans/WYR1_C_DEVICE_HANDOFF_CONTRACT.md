@@ -199,6 +199,22 @@ finalizes the old Interrupt, then creates a new object/binding generation while
 retaining the same devmgr lease/bundle generation. A devmgr replacement cannot
 retain that generation; it claims a fresh lease after cleanup.
 
+Publication-binding acknowledgement is lifecycle-exact. Registry replacement
+that retains the current resource-owning devmgr, including a healthy driver,
+acknowledges the fresh binding with `OperationalResourceOwned`. This confirms
+retained broad custody, not completion of the new publication. A driver-retirement
+rebind after exact terminal/reap instead acknowledges
+`OperationalWaitingForDeviceBundle` before the bounded replacement backoff;
+the broad parent lease may still be retained while no driver owns a bundle.
+Historical pre-resource binding continues to use the waiting status.
+
+Init chooses the exact expected acknowledgement from the recovery context and
+retained resource-domain ownership, not merely a compiled feature. Driver
+retirement requires the matching reaped owner and no live driver. Swapping the
+two statuses fails even when every supervisor, registry, endpoint, and transaction
+field matches. Acknowledgement does not replace the later driver-ready or
+registry publication observation, renew any action deadline, or relax cleanup.
+
 ## 6. Exact WRDC bundle and MOVE transaction
 
 The already-reserved `WRDC RESOURCE_BUNDLE` becomes inhabitable with exactly

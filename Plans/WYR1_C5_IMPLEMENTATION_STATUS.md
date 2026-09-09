@@ -33,9 +33,16 @@ change the actor startup profile or the C3 historical path.
    sending registry `Publish` and requiring `Published`.
 
 The earlier `OperationalResourceOwned` controller status remains a C4 custody
-acknowledgement to init. It is emitted before driver construction and is not a
+acknowledgement to init. Its initial emission precedes driver construction and is not a
 driver-readiness or publication claim. C5 publication truth is maintained by
 the distinct WRDC `DRIVER_READY` and WRRG `Published` transitions.
+
+The same custody acknowledgement also applies when registry replacement retains
+a healthy driver and rebinds its publication endpoint. It does not imply that
+the driver is absent. The distinct synchronous driver-retirement rebind reports
+`OperationalWaitingForDeviceBundle` only after the old driver is reaped; init
+requires that lifecycle-specific status before admitting replacement. See the
+device handoff contract for the exact rebind postconditions.
 
 ## 2. Driver actor and cleanup
 

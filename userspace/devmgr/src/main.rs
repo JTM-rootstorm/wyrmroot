@@ -750,11 +750,7 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                     return Err(failure(52));
                 }
             }
-            #[cfg(not(any(feature = "wyr1c4-production", feature = "wyr1c5-production")))]
-            let status = StatusCode::OperationalWaitingForDeviceBundle;
-            #[cfg(any(feature = "wyr1c4-production", feature = "wyr1c5-production"))]
-            let status = StatusCode::OperationalResourceOwned;
-            if let Err(code) = send_resident_status(bootstrap, &resident, status) {
+            if let Err(code) = send_publication_acknowledgement(bootstrap, &resident) {
                 close_optional(publication);
                 close_optional(driver_control);
                 #[cfg(feature = "wyr1c4-production")]
@@ -1126,11 +1122,7 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
                 // of returning to the outer controller loop.  Acknowledge the
                 // committed binding here so init can finish the same WRCS
                 // transaction before the bounded driver backoff begins.
-                let acknowledged = send_resident_status(
-                    bootstrap,
-                    &resident,
-                    StatusCode::OperationalWaitingForDeviceBundle,
-                );
+                let acknowledged = send_publication_acknowledgement(bootstrap, &resident);
                 if let Err(code) = acknowledged {
                     close_optional(device_resource.take());
                     close_optional(publication.take());
@@ -2978,6 +2970,19 @@ fn wait_readable(
         return Err(failure(stage));
     }
     Ok(())
+}
+
+fn send_publication_acknowledgement(
+    bootstrap: DwHandle,
+    resident: &wyrmroot_devmgr::ResidentController,
+) -> Result<(), u32> {
+    let bytes = resident
+        .publication_acknowledgement()
+        .map_err(|error| match error {
+            wyrmroot_devmgr::PublicationAcknowledgementError::Lifecycle(_) => failure(35),
+            wyrmroot_devmgr::PublicationAcknowledgementError::Encoding(_) => failure(36),
+        })?;
+    send_bootstrap_channel(bootstrap, &bytes, &[], 37)
 }
 
 fn send_resident_status(

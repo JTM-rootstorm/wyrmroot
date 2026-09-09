@@ -46,7 +46,7 @@ fn c4_claim_path_is_feature_gated_exact_and_stops_before_interrupt_creation() {
     assert!(NATIVE.contains("DEVICE_RESOURCE_CUSTODY_RIGHTS"));
     assert!(NATIVE.contains("device_resource_info(resource)"));
     assert!(NATIVE.contains("admit_device_resource(info)"));
-    assert!(NATIVE.contains("StatusCode::OperationalResourceOwned"));
+    assert!(NATIVE.contains("send_publication_acknowledgement(bootstrap, &resident)"));
     let c4 = &NATIVE[NATIVE
         .find("if action == ControllerAction::InitialPublicationBound")
         .expect("C4 initial binding")..];
@@ -64,7 +64,7 @@ fn c4_claim_path_is_feature_gated_exact_and_stops_before_interrupt_creation() {
         .find("if close_handle(domain).is_err()")
         .expect("domain retirement");
     let status = c4
-        .find("send_resident_status(bootstrap, &resident, status)")
+        .find("send_publication_acknowledgement(bootstrap, &resident)")
         .expect("resource-owned status");
     assert!(feature < claim && claim < owned && owned < metadata);
     assert!(metadata < retire_domain && retire_domain < status);
@@ -192,7 +192,7 @@ fn c6_inline_publication_rebind_is_acknowledged_before_driver_backoff() {
         .find("publication.replace(replacement)")
         .expect("replacement publication install");
     let acknowledge = cleanup
-        .find("StatusCode::OperationalWaitingForDeviceBundle")
+        .find("send_publication_acknowledgement(bootstrap, &resident)")
         .expect("rebind acknowledgement status");
     let acknowledge_failure = cleanup
         .find("if let Err(code) = acknowledged")
@@ -221,6 +221,22 @@ fn c6_inline_publication_rebind_is_acknowledged_before_driver_backoff() {
     assert!(close_bootstrap < cleanup_complete);
     assert!(acknowledge < cleanup_complete);
     assert!(cleanup_complete < retry);
+}
+
+#[test]
+fn publication_acknowledgements_use_the_shared_lifecycle_producer_and_failure_stages() {
+    let sender = &NATIVE[NATIVE.find("fn send_publication_acknowledgement(").unwrap()
+        ..NATIVE.find("fn send_resident_status(").unwrap()];
+    assert!(sender.contains(".publication_acknowledgement()"));
+    assert!(sender.contains("PublicationAcknowledgementError::Lifecycle(_) => failure(35)"));
+    assert!(sender.contains("PublicationAcknowledgementError::Encoding(_) => failure(36)"));
+    assert!(sender.contains("send_bootstrap_channel(bootstrap, &bytes, &[], 37)"));
+    assert_eq!(
+        NATIVE
+            .matches("send_publication_acknowledgement(bootstrap, &resident)")
+            .count(),
+        2
+    );
 }
 
 #[test]

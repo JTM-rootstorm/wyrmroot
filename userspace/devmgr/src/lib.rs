@@ -95,6 +95,12 @@ pub enum DevmgrError {
     ResourceIdentity,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PublicationAcknowledgementError {
+    Lifecycle(DevmgrError),
+    Encoding(ControllerParseError),
+}
+
 impl From<ControllerParseError> for DevmgrError {
     fn from(error: ControllerParseError) -> Self {
         Self::Controller(error)
@@ -839,6 +845,42 @@ impl ResidentController {
         Ok(())
     }
 
+    /// Acknowledges an installed publication binding without claiming that
+    /// the driver has published through it. Retained custody and a reaped
+    /// driver awaiting a replacement bundle are distinct postconditions.
+    pub fn publication_acknowledgement(
+        &self,
+    ) -> Result<
+        [u8; wyrmroot_device_proto::controller::STATUS_BYTES],
+        PublicationAcknowledgementError,
+    > {
+        let invalid = PublicationAcknowledgementError::Lifecycle(DevmgrError::ControllerLifecycle);
+        if self.active_binding.is_none() || self.publication_current {
+            return Err(invalid);
+        }
+        let status = match self.status.state {
+            CoordinatorState::CleaningUp if self.active_driver.is_none() && !self.driver_ready => {
+                StatusCode::OperationalWaitingForDeviceBundle
+            }
+            CoordinatorState::Matched | CoordinatorState::AwaitingPublication
+                if self.bundle_generation.is_some() =>
+            {
+                StatusCode::OperationalResourceOwned
+            }
+            CoordinatorState::WaitingForDeviceBundle if self.bundle_generation.is_none() => {
+                StatusCode::OperationalWaitingForDeviceBundle
+            }
+            _ => return Err(invalid),
+        };
+        let message = self
+            .report(status)
+            .map_err(PublicationAcknowledgementError::Lifecycle)?;
+        let mut bytes = [0; wyrmroot_device_proto::controller::STATUS_BYTES];
+        wyrmroot_device_proto::controller::encode(message, &mut bytes)
+            .map_err(PublicationAcknowledgementError::Encoding)?;
+        Ok(bytes)
+    }
+
     pub fn report(&self, status: StatusCode) -> Result<ControllerMessage, DevmgrError> {
         if status.is_device_bound() {
             return Err(DevmgrError::Controller(
@@ -1145,6 +1187,79 @@ mod tests {
             resident.admit_device_resource(exact_resource(20)),
             Err(DevmgrError::ResourceIdentity)
         );
+    }
+
+    #[test]
+    fn publication_acknowledgement_preserves_pre_resource_and_retained_custody_statuses() {
+        use wyrmroot_device_proto::controller::parse;
+        let mut resident =
+            ResidentController::new(prepare_operational(&manifest(), 7).unwrap(), 41).unwrap();
+        let invalid = Err(PublicationAcknowledgementError::Lifecycle(
+            DevmgrError::ControllerLifecycle,
+        ));
+        assert_eq!(resident.publication_acknowledgement(), invalid);
+        resident.accept(install(binding(1, 7), 41), 0).unwrap();
+        assert_eq!(
+            parse(&resident.publication_acknowledgement().unwrap()).unwrap(),
+            resident
+                .report(StatusCode::OperationalWaitingForDeviceBundle)
+                .unwrap()
+        );
+        resident.admit_device_resource(exact_resource(19)).unwrap();
+        assert_eq!(
+            parse(&resident.publication_acknowledgement().unwrap()).unwrap(),
+            resident
+                .report(StatusCode::OperationalResourceOwned)
+                .unwrap()
+        );
+        let request = resident
+            .issue_driver_launch_with_bundle(true, DirectControlRights::ExactReduced)
+            .unwrap();
+        resident.driver_constructed().unwrap();
+        resident.resource_bundle_message().unwrap();
+        resident.bundle_transferred().unwrap();
+        assert_eq!(resident.publication_acknowledgement(), invalid);
+        resident
+            .accept_driver_ready(wyrmroot_device_proto::ControlMessage::Ready {
+                role_id: request.role_id,
+                bundle_generation: BundleGeneration(19),
+                attempt_generation: request.attempt_generation,
+                endpoint: request.endpoint,
+                transaction_id: request.transaction_id,
+            })
+            .unwrap();
+        resident.publication_committed().unwrap();
+        assert_eq!(resident.publication_acknowledgement(), invalid);
+        resident.publication_peer_closed().unwrap();
+        assert_eq!(resident.publication_acknowledgement(), invalid);
+        resident.accept(rebind(binding(1, 8), 42), 1).unwrap();
+        assert_eq!(
+            parse(&resident.publication_acknowledgement().unwrap()).unwrap(),
+            resident
+                .report(StatusCode::OperationalResourceOwned)
+                .unwrap()
+        );
+        assert_eq!(resident.active_driver_request(), Some(request));
+        assert!(resident.driver_ready());
+        resident.publication_committed().unwrap();
+        resident.retire_message().unwrap();
+        assert_eq!(resident.publication_acknowledgement(), invalid);
+        resident
+            .accept_intentional_driver_terminal(request)
+            .unwrap();
+        assert_eq!(resident.publication_acknowledgement(), invalid);
+        resident.publication_retired().unwrap();
+        resident.reap_driver().unwrap();
+        assert_eq!(resident.publication_acknowledgement(), invalid);
+        resident.accept(rebind(binding(1, 9), 43), 1).unwrap();
+        assert_eq!(
+            parse(&resident.publication_acknowledgement().unwrap()).unwrap(),
+            resident
+                .report(StatusCode::OperationalWaitingForDeviceBundle)
+                .unwrap()
+        );
+        assert_eq!(resident.bundle_generation(), Some(BundleGeneration(19)));
+        assert_eq!(resident.active_driver_request(), None);
     }
 
     #[test]

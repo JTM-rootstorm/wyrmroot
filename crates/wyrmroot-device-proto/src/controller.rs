@@ -51,8 +51,9 @@ pub enum StatusCode {
     CleaningUp = 3,
     Backoff = 4,
     PermanentFailure = 5,
-    /// C4-only coordinator status: the exact current devmgr owns and has
-    /// validated its broad DeviceResource lease, but no driver has received it.
+    /// The exact current devmgr retains its validated broad DeviceResource
+    /// lease. This custody acknowledgement makes no driver-readiness or
+    /// publication claim and also applies across a healthy-driver rebind.
     OperationalResourceOwned = 6,
 }
 
