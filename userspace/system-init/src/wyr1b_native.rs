@@ -1519,7 +1519,6 @@ fn install_wyrmsh_registry_client<S: Wyr1BPlatform>(
     control: DwHandle,
     grant: EndpointGrant,
     registry_endpoint: DwHandle,
-    client_id: u64,
     transaction_id: u64,
 ) -> Result<(), InitError> {
     let mut bytes = [0_u8; 104];
@@ -1534,7 +1533,10 @@ fn install_wyrmsh_registry_client<S: Wyr1BPlatform>(
         InstallClient {
             endpoint_id: grant.endpoint_id,
             endpoint_generation: grant.endpoint_generation,
-            client_id,
+            // Registry client IDs cannot repeat within a registry generation,
+            // even when a replacement consoled restarts its local counters.
+            // The reserved init transaction survives that console replacement.
+            client_id: transaction_id,
             client_generation: grant.role_generation,
             scope: EnumerationScope::BootstrapMetadata,
         },
@@ -4245,7 +4247,6 @@ where
         context.registry_control,
         registry_grant,
         registry_server,
-        request.requested_child_generation,
         install_transaction,
     ) {
         let failed = close_received_reverse(system, received, received.len())
@@ -9180,7 +9181,7 @@ mod tests {
             RegistryMessage::InstallClient(InstallClient {
                 endpoint_id: 1,
                 endpoint_generation: 1,
-                client_id: 4,
+                client_id: WYRMSH_FIRST_INSTALL_TRANSACTION,
                 client_generation: 4,
                 scope: EnumerationScope::BootstrapMetadata,
             })
@@ -9344,6 +9345,17 @@ mod tests {
             replacement_init.transaction_id,
             WYRMSH_FIRST_INSTALL_TRANSACTION + 1
         );
+        let replacement_install = parse(&platform.moved[1].1, 1).unwrap();
+        assert!(matches!(
+            replacement_install.message,
+            RegistryMessage::InstallClient(InstallClient {
+                endpoint_id: 3,
+                endpoint_generation: 1,
+                client_id,
+                client_generation: 5,
+                scope: EnumerationScope::BootstrapMetadata,
+            }) if client_id == WYRMSH_FIRST_INSTALL_TRANSACTION + 1
+        ));
     }
 
     #[cfg(feature = "wyr1e-shell-controller")]
@@ -10042,6 +10054,107 @@ mod tests {
         state.clear_e8_console_control(DwHandle(10)).unwrap();
         state.set_e8_console_control(DwHandle(20)).unwrap();
         state.reserve_shell_generation(local_first).unwrap();
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    #[test]
+    fn shell_registry_clients_stay_fresh_when_console_generations_restart() {
+        let mut state = ShellControllerState::new(7).unwrap();
+        let mut topology = RegistryTopology::new(7).unwrap();
+        let mut platform = ShellPlatform::new();
+        let local_first = wyrmroot_launch_proto::ShellV1Request {
+            console_generation: 1,
+            status_generation: 3,
+            requested_child_generation: 2,
+        };
+        let mut installed = Vec::new();
+        for control in [DwHandle(10), DwHandle(20)] {
+            state.set_e8_console_control(control).unwrap();
+            state.reserve_shell_generation(local_first).unwrap();
+            let transaction = state.reserve_install_transaction(7).unwrap();
+            let grant = topology
+                .issue(
+                    local_first.requested_child_generation,
+                    EndpointKind::RegistryClient,
+                )
+                .unwrap();
+            let (server, client) = create_controller_channel_pair(&mut platform).unwrap();
+            install_wyrmsh_registry_client(&mut platform, DwHandle(70), grant, server, transaction)
+                .unwrap();
+            let message = parse(&platform.moved.last().unwrap().1, 1).unwrap();
+            let RegistryMessage::InstallClient(install) = message.message else {
+                panic!("shell must install a registry client")
+            };
+            assert_eq!(message.header.registry_generation, 7);
+            assert_eq!(
+                install.client_generation,
+                local_first.requested_child_generation
+            );
+            assert_eq!(install.scope, EnumerationScope::BootstrapMetadata);
+            installed.push((message.header.transaction_id, install));
+            assert_eq!(
+                state.reserve_shell_generation(local_first),
+                Err(InitError::Wyr1BModel(JobError::StaleGeneration))
+            );
+            platform.close_handle(client).unwrap();
+            state.clear_e8_console_control(control).unwrap();
+        }
+        assert_ne!(installed[0].1.endpoint_id, installed[1].1.endpoint_id);
+        assert_ne!(installed[0].1.client_id, installed[1].1.client_id);
+        for (index, (transaction, install)) in installed.iter().enumerate() {
+            assert_eq!(
+                *transaction,
+                WYRMSH_FIRST_INSTALL_TRANSACTION + index as u64
+            );
+            assert_eq!(install.client_id, *transaction);
+        }
+        assert_eq!(
+            state.health(),
+            ShellRegistryHealth::Healthy { generation: 7 }
+        );
+    }
+
+    #[test]
+    fn shell_registry_install_identity_resets_only_with_a_new_registry() {
+        let mut state = ShellControllerState::new(7).unwrap();
+        let mut topology = RegistryTopology::new(7).unwrap();
+        assert_eq!(
+            state.reserve_install_transaction(7),
+            Ok(WYRMSH_FIRST_INSTALL_TRANSACTION)
+        );
+        assert_eq!(
+            state.reserve_install_transaction(8),
+            Err(InitError::Cleanup)
+        );
+        assert_eq!(
+            state.reserve_install_transaction(7),
+            Ok(WYRMSH_FIRST_INSTALL_TRANSACTION + 1)
+        );
+        state.next_install_transaction = u64::MAX;
+        assert_eq!(
+            state.reserve_install_transaction(7),
+            Err(InitError::Accounting)
+        );
+        assert_eq!(state.next_install_transaction, u64::MAX);
+        state.poison(7);
+        assert_eq!(
+            state.reserve_install_transaction(7),
+            Err(InitError::Cleanup)
+        );
+        assert_eq!(
+            state.install_replacement(&mut topology, 7),
+            Err(InitError::Accounting)
+        );
+        assert_eq!(state.next_install_transaction, u64::MAX);
+        state.install_replacement(&mut topology, 8).unwrap();
+        assert_eq!(
+            state.reserve_install_transaction(7),
+            Err(InitError::Cleanup)
+        );
+        assert_eq!(
+            state.reserve_install_transaction(8),
+            Ok(WYRMSH_FIRST_INSTALL_TRANSACTION)
+        );
     }
 
     #[cfg(feature = "wyr1e8-selector33")]
