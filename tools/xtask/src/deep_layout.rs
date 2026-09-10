@@ -18,8 +18,12 @@ const PACKAGE_MANIFEST: &str = "crates/deepwyrm-abi/Cargo.toml";
 const SYSCALL_PACKAGE_NAME: &str = "deepwyrm-syscall";
 const SYSCALL_PACKAGE_MANIFEST: &str = "crates/deepwyrm-syscall/Cargo.toml";
 const LAYOUT_PATH: &str = "kernel/arch/x86_64/layout.toml";
+const WYR1E8_CAPACITY_PATH: &str =
+    "kernel/src/arch/x86_64/mm/activation/wyr1e8_resource_geometry.rs";
+const WYR1E8_CAPACITY_MARKER: &str = "// WYR1E8_SELECTED_CAPACITIES";
 const GENERATED_POLICY_PATH: &str = "target/wyr0-b/generated/deepwyrm_layout_policy.rs";
 const MAX_LAYOUT_BYTES: u64 = 1024 * 1024;
+const MAX_WYR1E8_CAPACITY_BYTES: u64 = 64 * 1024;
 const MAX_METADATA_STDOUT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_METADATA_STDERR_BYTES: u64 = 1024 * 1024;
 const METADATA_COMMAND_DEADLINE: Duration = Duration::from_secs(60);
@@ -56,6 +60,17 @@ pub(crate) struct DeepLayoutBuild {
     pub(crate) policy_sha256: String,
     source_root: PathBuf,
     expected_revision: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Wyr1E8CapacityContract {
+    pub(crate) per_process_handle_capacity: u64,
+    pub(crate) memory_object_capacity: u64,
+    pub(crate) mapping_lease_capacity: u64,
+    pub(crate) registry_object_capacity: u64,
+    source_root: PathBuf,
+    expected_revision: String,
+    source_sha256: String,
 }
 
 pub(crate) struct CargoGitSourceIdentity {
@@ -244,6 +259,177 @@ impl DeepLayoutBuild {
         }
         Ok(())
     }
+}
+
+impl Wyr1E8CapacityContract {
+    pub(crate) fn verify_unchanged(&self) -> Result<(), Failure> {
+        verify_git_source_identity(&self.source_root, &self.expected_revision)?;
+        let source_path = self.source_root.join(WYR1E8_CAPACITY_PATH);
+        validate_regular_path(
+            &self.source_root,
+            &source_path,
+            "Deepwyrm WYR1-E8 capacity contract",
+        )?;
+        let source = read_bounded(
+            &source_path,
+            MAX_WYR1E8_CAPACITY_BYTES,
+            "Deepwyrm WYR1-E8 capacity contract",
+        )?;
+        verify_tracked_source_bytes(
+            &self.source_root,
+            WYR1E8_CAPACITY_PATH,
+            &source,
+            "Deepwyrm WYR1-E8 capacity contract",
+        )?;
+        let actual_sha256 = bytes_digest(&source);
+        if actual_sha256 != self.source_sha256 {
+            return Err(Failure::task(format!(
+                "Deepwyrm WYR1-E8 capacity contract hash changed: {actual_sha256}, expected {}",
+                self.source_sha256
+            )));
+        }
+        let parsed = parse_wyr1e8_capacity_contract(&source)?;
+        if parsed != self.receipt_values() {
+            return Err(Failure::task(
+                "Deepwyrm WYR1-E8 capacity contract values changed",
+            ));
+        }
+        verify_git_source_identity(&self.source_root, &self.expected_revision)
+    }
+
+    pub(crate) fn receipt_values(&self) -> [u64; 4] {
+        [
+            self.per_process_handle_capacity,
+            self.memory_object_capacity,
+            self.mapping_lease_capacity,
+            self.registry_object_capacity,
+        ]
+    }
+}
+
+/// Reads the selector-33 resource geometry from the exact tracked Deepwyrm
+/// source that supplies the kernel artifact. The marker is deliberately narrow:
+/// it exposes only the four capacities that E8 receipts must bind.
+pub(crate) fn read_wyr1e8_capacity_contract(
+    source_root: &Path,
+    expected_revision: &str,
+) -> Result<Wyr1E8CapacityContract, Failure> {
+    if !source_root.is_absolute() {
+        return Err(Failure::task(
+            "current Deepwyrm kernel source root is not absolute",
+        ));
+    }
+    validate_directory(source_root, "current Deepwyrm kernel source root")?;
+    let canonical_root = fs::canonicalize(source_root).map_err(|error| {
+        Failure::task(format!(
+            "could not canonicalize current Deepwyrm kernel source root: {error}"
+        ))
+    })?;
+    if canonical_root != source_root {
+        return Err(Failure::task(
+            "current Deepwyrm kernel source root is not canonical or contains a symlink",
+        ));
+    }
+    let git_root = git_output_bounded(
+        source_root,
+        ["rev-parse", "--show-toplevel"],
+        MAX_GIT_ROOT_STDOUT_BYTES,
+        "current Deepwyrm kernel source root inspection",
+    )?;
+    if Path::new(git_root.trim()) != source_root {
+        return Err(Failure::task(
+            "current Deepwyrm kernel source root is not the Git worktree root",
+        ));
+    }
+    verify_git_source_identity(source_root, expected_revision)?;
+    let source_path = source_root.join(WYR1E8_CAPACITY_PATH);
+    validate_regular_path(
+        source_root,
+        &source_path,
+        "Deepwyrm WYR1-E8 capacity contract",
+    )?;
+    let source = read_bounded(
+        &source_path,
+        MAX_WYR1E8_CAPACITY_BYTES,
+        "Deepwyrm WYR1-E8 capacity contract",
+    )?;
+    verify_tracked_source_bytes(
+        source_root,
+        WYR1E8_CAPACITY_PATH,
+        &source,
+        "Deepwyrm WYR1-E8 capacity contract",
+    )?;
+    let values = parse_wyr1e8_capacity_contract(&source)?;
+    verify_git_source_identity(source_root, expected_revision)?;
+    let contract = Wyr1E8CapacityContract {
+        per_process_handle_capacity: values[0],
+        memory_object_capacity: values[1],
+        mapping_lease_capacity: values[2],
+        registry_object_capacity: values[3],
+        source_root: source_root.to_path_buf(),
+        expected_revision: expected_revision.to_owned(),
+        source_sha256: bytes_digest(&source),
+    };
+    contract.verify_unchanged()?;
+    Ok(contract)
+}
+
+fn parse_wyr1e8_capacity_contract(source: &[u8]) -> Result<[u64; 4], Failure> {
+    let source = std::str::from_utf8(source)
+        .map_err(|_| Failure::task("Deepwyrm WYR1-E8 capacity contract is not UTF-8"))?;
+    let markers = source
+        .lines()
+        .filter(|line| line.starts_with(WYR1E8_CAPACITY_MARKER))
+        .collect::<Vec<_>>();
+    if markers.len() != 1 {
+        return Err(Failure::task(
+            "Deepwyrm WYR1-E8 capacity contract must contain exactly one canonical marker",
+        ));
+    }
+    let expected_keys = [
+        "per_process_handle_capacity",
+        "memory_object_capacity",
+        "mapping_lease_capacity",
+        "registry_object_capacity",
+    ];
+    let fields = markers[0]
+        .strip_prefix(WYR1E8_CAPACITY_MARKER)
+        .expect("filtered marker prefix")
+        .strip_prefix(' ')
+        .ok_or_else(|| Failure::task("Deepwyrm WYR1-E8 capacity marker spacing drifted"))?
+        .split(' ')
+        .collect::<Vec<_>>();
+    if fields.len() != expected_keys.len() {
+        return Err(Failure::task(
+            "Deepwyrm WYR1-E8 capacity marker field count drifted",
+        ));
+    }
+    let mut values = [0_u64; 4];
+    for (index, (field, expected_key)) in fields.iter().zip(expected_keys).enumerate() {
+        let (key, value) = field
+            .split_once('=')
+            .ok_or_else(|| Failure::task("Deepwyrm WYR1-E8 capacity marker field is malformed"))?;
+        if key != expected_key
+            || value.is_empty()
+            || !value.bytes().all(|byte| byte.is_ascii_digit())
+            || (value.len() > 1 && value.starts_with('0'))
+        {
+            return Err(Failure::task(format!(
+                "Deepwyrm WYR1-E8 capacity marker field {expected_key} drifted"
+            )));
+        }
+        values[index] = value.parse().map_err(|_| {
+            Failure::task(format!(
+                "Deepwyrm WYR1-E8 capacity marker field {expected_key} overflows u64"
+            ))
+        })?;
+        if values[index] == 0 {
+            return Err(Failure::task(format!(
+                "Deepwyrm WYR1-E8 capacity marker field {expected_key} is zero"
+            )));
+        }
+    }
+    Ok(values)
 }
 
 pub(crate) fn prepare(
@@ -1671,23 +1857,32 @@ fn validate_directory(path: &Path, label: &str) -> Result<(), Failure> {
 }
 
 fn verify_tracked_bytes(root: &Path, relative: &str, bytes: &[u8]) -> Result<(), Failure> {
+    verify_tracked_source_bytes(root, relative, bytes, "Deepwyrm x86_64 layout")
+}
+
+fn verify_tracked_source_bytes(
+    root: &Path,
+    relative: &str,
+    bytes: &[u8],
+    label: &str,
+) -> Result<(), Failure> {
     git_output_bounded(
         root,
         ["ls-files", "--error-unmatch", relative],
         MAX_GIT_PATH_STDOUT_BYTES,
-        "Deepwyrm tracked layout path inspection",
+        &format!("{label} tracked path inspection"),
     )?;
     let expected = git_output_bounded(
         root,
         ["rev-parse", &format!("HEAD:{relative}")],
         MAX_GIT_REVISION_STDOUT_BYTES,
-        "Deepwyrm tracked layout revision inspection",
+        &format!("{label} tracked revision inspection"),
     )?;
     let actual = git_hash_bytes(root, bytes)?;
     if expected.trim() != actual.trim() {
-        return Err(Failure::task(
-            "Deepwyrm x86_64 layout content does not match the pinned Git revision",
-        ));
+        return Err(Failure::task(format!(
+            "{label} content does not match the pinned Git revision"
+        )));
     }
     Ok(())
 }
@@ -2862,10 +3057,11 @@ mod tests {
         DeepLayoutBuild, JsonParser, KERNEL_BOOT_STACK_BYTES, LayoutPolicy,
         MAX_METADATA_CONTAINER_ENTRIES, MAX_METADATA_JSON_DEPTH, MAX_METADATA_STRING_BYTES,
         bounded_command_output, locate_package, open_stable_regular_file,
-        prepare_current_kernel_source, read_pipe_bounded, validate_git_status,
-        validate_metadata_manifest_path, validate_regular_path, verify_cargo_configuration,
-        verify_exact_cargo_git_source, verify_open_file_identity, verify_tracked_bytes,
-        write_generated_policy, x86_64_page_table_indices,
+        parse_wyr1e8_capacity_contract, prepare_current_kernel_source, read_pipe_bounded,
+        read_wyr1e8_capacity_contract, validate_git_status, validate_metadata_manifest_path,
+        validate_regular_path, verify_cargo_configuration, verify_exact_cargo_git_source,
+        verify_open_file_identity, verify_tracked_bytes, write_generated_policy,
+        x86_64_page_table_indices,
     };
     use crate::sha256::bytes_digest;
     use std::path::Path;
@@ -3388,6 +3584,31 @@ mod tests {
             .expect("current Deepwyrm layout changed during preflight");
     }
 
+    #[test]
+    #[ignore = "requires the canonical sibling Deepwyrm checkout at the selected E8 revision"]
+    fn actual_current_kernel_capacity_contract_uses_the_sibling_source() {
+        let repository = crate::tasks::repository_root().expect("resolve Wyrmroot source");
+        let project =
+            crate::tasks::canonical_project_root(&repository).expect("resolve OS-Project source");
+        let deep_source = std::env::var_os("WYRMROOT_TEST_DEEPWYRM_E8_CAPACITY_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| project.join("deepwyrm"));
+        let deep = std::fs::canonicalize(deep_source).expect("resolve selected Deepwyrm source");
+        let revision = super::git_output_bounded(
+            &deep,
+            ["rev-parse", "HEAD"],
+            super::MAX_GIT_REVISION_STDOUT_BYTES,
+            "current Deepwyrm revision",
+        )
+        .expect("read current Deepwyrm revision");
+        let contract = read_wyr1e8_capacity_contract(&deep, revision.trim())
+            .expect("current Deepwyrm E8 capacity preflight failed");
+        assert_eq!(contract.receipt_values(), [64, 64, 64, 160]);
+        contract
+            .verify_unchanged()
+            .expect("current Deepwyrm E8 capacity contract changed during preflight");
+    }
+
     #[cfg(unix)]
     #[test]
     fn source_tree_validation_rejects_symlinks() {
@@ -3635,6 +3856,103 @@ mod tests {
             verify_tracked_bytes(&root, super::LAYOUT_PATH, b"swapped layout bytes\n").is_err()
         );
         fs::remove_dir_all(root).expect("remove isolated Git fixture");
+    }
+
+    #[test]
+    fn wyr1e8_capacity_marker_is_exact_and_unambiguous() {
+        let marker = b"// WYR1E8_SELECTED_CAPACITIES per_process_handle_capacity=64 memory_object_capacity=64 mapping_lease_capacity=64 registry_object_capacity=160\n";
+        assert_eq!(
+            parse_wyr1e8_capacity_contract(marker).expect("canonical capacity marker rejected"),
+            [64, 64, 64, 160]
+        );
+        for malformed in [
+            b"// no marker\n".as_slice(),
+            b" // WYR1E8_SELECTED_CAPACITIES per_process_handle_capacity=64 memory_object_capacity=64 mapping_lease_capacity=64 registry_object_capacity=160\n",
+            b"// WYR1E8_SELECTED_CAPACITIES memory_object_capacity=64 per_process_handle_capacity=64 mapping_lease_capacity=64 registry_object_capacity=160\n",
+            b"// WYR1E8_SELECTED_CAPACITIES per_process_handle_capacity=064 memory_object_capacity=64 mapping_lease_capacity=64 registry_object_capacity=160\n",
+            b"// WYR1E8_SELECTED_CAPACITIES per_process_handle_capacity=64 memory_object_capacity=64 mapping_lease_capacity=64 registry_object_capacity=0\n",
+            b"// WYR1E8_SELECTED_CAPACITIES per_process_handle_capacity=64 memory_object_capacity=64 mapping_lease_capacity=64 registry_object_capacity=160 extra=1\n",
+            b"// WYR1E8_SELECTED_CAPACITIES per_process_handle_capacity=64 memory_object_capacity=64 mapping_lease_capacity=64 registry_object_capacity=160\n// WYR1E8_SELECTED_CAPACITIES per_process_handle_capacity=64 memory_object_capacity=64 mapping_lease_capacity=64 registry_object_capacity=160\n",
+        ] {
+            assert!(parse_wyr1e8_capacity_contract(malformed).is_err());
+        }
+    }
+
+    #[test]
+    fn wyr1e8_capacity_reader_binds_clean_tracked_source_and_revision() {
+        use std::fs;
+        use std::process::Command;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock precedes Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "wyrmroot-e8-capacity-source-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let source_path = root.join(super::WYR1E8_CAPACITY_PATH);
+        fs::create_dir_all(source_path.parent().expect("capacity source parent"))
+            .expect("create capacity source fixture tree");
+        let source = "selector model\n// WYR1E8_SELECTED_CAPACITIES per_process_handle_capacity=64 memory_object_capacity=64 mapping_lease_capacity=64 registry_object_capacity=160\n";
+        fs::write(&source_path, source.as_bytes()).expect("write capacity source fixture");
+        for arguments in [
+            vec!["init", "-q"],
+            vec!["add", super::WYR1E8_CAPACITY_PATH],
+            vec![
+                "-c",
+                "user.name=Wyrmroot test",
+                "-c",
+                "user.email=wyrmroot-test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "fixture",
+            ],
+        ] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&root)
+                    .args(arguments)
+                    .status()
+                    .expect("run capacity fixture Git command")
+                    .success()
+            );
+        }
+        let revision = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("read capacity fixture revision");
+        let revision = std::str::from_utf8(&revision.stdout)
+            .expect("capacity fixture revision UTF-8")
+            .trim();
+        let contract = read_wyr1e8_capacity_contract(&root, revision)
+            .expect("clean tracked capacity contract rejected");
+        assert_eq!(contract.per_process_handle_capacity, 64);
+        assert_eq!(contract.memory_object_capacity, 64);
+        assert_eq!(contract.mapping_lease_capacity, 64);
+        assert_eq!(contract.registry_object_capacity, 160);
+        contract
+            .verify_unchanged()
+            .expect("stable contract changed");
+
+        fs::write(
+            &source_path,
+            source.replace(
+                "registry_object_capacity=160",
+                "registry_object_capacity=159",
+            ),
+        )
+        .expect("mutate capacity source fixture");
+        assert!(contract.verify_unchanged().is_err());
+        assert!(read_wyr1e8_capacity_contract(&root, revision).is_err());
+        fs::remove_dir_all(root).expect("remove capacity source fixture");
     }
 
     #[test]

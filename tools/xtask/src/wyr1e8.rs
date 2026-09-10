@@ -50,6 +50,13 @@ const COM2_PRELUDE_LENGTH: &str = "354";
 const COM2_PRELUDE_SHA256: &str =
     "8cf1a7eba89309b5ee101cbe77935604572151fb79f4e009a327125c5da8cb47";
 const TOKEN_INDEX_SCHEDULE: &str = "s1=0001..0006,s2_echo=0101,driver=0102,s3_echo=0201,registry=0202,s4_echo=0301,smp_echo=0310..0312,smp_hello=0320..0322";
+const CAPACITY_KEYS: [&str; 4] = [
+    "per_process_handle_capacity",
+    "memory_object_capacity",
+    "mapping_lease_capacity",
+    "registry_object_capacity",
+];
+const LOCKED_CAPACITIES: [u64; 4] = [64, 64, 64, 160];
 
 pub(crate) const ARTIFACTS: &[(&str, &str)] = &[
     ("loader", "loader.efi"),
@@ -88,6 +95,7 @@ struct Produced {
     rust_revision: String,
     e6_source_receipt_sha256: String,
     e6_freeze_receipt_sha256: String,
+    capacities: [u64; 4],
 }
 
 pub(crate) fn prepare(
@@ -119,6 +127,9 @@ pub(crate) fn prepare(
         &deep_repository,
         deep_revision,
     )?;
+    let capacity_contract =
+        crate::deep_layout::read_wyr1e8_capacity_contract(&deep_repository, deep_revision)?;
+    validate_locked_capacities(capacity_contract.receipt_values())?;
     let output = wyr1c::validate_fresh_output(&repository, &project, output)?;
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -141,7 +152,9 @@ pub(crate) fn prepare(
             nonce,
             &e6,
             &layout,
+            &capacity_contract,
         )?;
+        capacity_contract.verify_unchanged()?;
         freeze(&output, &produced, nonce)
     })();
     if result.is_ok() {
@@ -164,7 +177,15 @@ pub(crate) fn inspect(product: &Path) -> Result<String, Failure> {
     let request_text = std::str::from_utf8(&request_bytes)
         .map_err(|_| Failure::task("WYR1-E8 request is not UTF-8"))?;
     let request = parse(request_text)?;
-    validate_request(&request)?;
+    wyr1c6::validate_revision(field(&request, "deepwyrm_revision")?, "deepwyrm_revision")?;
+    let deep_repository = wyr1c6::canonical_deep_repository(&project.join("deepwyrm"), &project)?;
+    let capacity_contract = crate::deep_layout::read_wyr1e8_capacity_contract(
+        &deep_repository,
+        field(&request, "deepwyrm_revision")?,
+    )?;
+    let capacities = capacity_contract.receipt_values();
+    validate_locked_capacities(capacities)?;
+    validate_request(&request, capacities)?;
     if render(&request, &request_keys(), ScalarSchema::Request)? != request_text {
         return Err(Failure::task("WYR1-E8 request is not canonical"));
     }
@@ -260,7 +281,6 @@ pub(crate) fn inspect(product: &Path) -> Result<String, Failure> {
             "WYR1-E8 request does not match current source metadata",
         ));
     }
-    let deep_repository = wyr1c6::canonical_deep_repository(&project.join("deepwyrm"), &project)?;
     let abi_tree = wyr1c6::matching_abi_tree(
         &deep_repository,
         field(&request, "deepwyrm_revision")?,
@@ -282,6 +302,7 @@ pub(crate) fn inspect(product: &Path) -> Result<String, Failure> {
         &product.join("artifacts"),
         &assembled.generation,
         &inspections,
+        capacities,
     )?;
     if source_text != expected_source {
         return Err(Failure::task("WYR1-E8 source receipt is not canonical"));
@@ -304,6 +325,7 @@ fn build_produced(
     nonce: &str,
     e6: &crate::wyr1e::ImmutableE6Input,
     layout: &crate::deep_layout::DeepLayoutBuild,
+    capacity_contract: &crate::deep_layout::Wyr1E8CapacityContract,
 ) -> Result<Produced, Failure> {
     let manifest = crate::metadata::BuildManifest::load(repository)?;
     let profile = manifest.validate_loader_build_readiness(repository)?;
@@ -412,6 +434,7 @@ fn build_produced(
         &artifacts,
         &snapshot.generation,
         &snapshot.inspections,
+        capacity_contract.receipt_values(),
     )?;
     wyr1c6::write_new(
         &artifacts.join(SOURCE_RECEIPT),
@@ -420,6 +443,7 @@ fn build_produced(
     )?;
     toolchain.accepted().verify_unchanged()?;
     layout.verify_unchanged()?;
+    capacity_contract.verify_unchanged()?;
     wyr1c6::verify_clean_revision(repository, "Wyrmroot", wyrmroot_revision)?;
     wyr1c6::verify_clean_revision(deep_repository, "Deepwyrm", deep_revision)?;
     Ok(Produced {
@@ -431,6 +455,7 @@ fn build_produced(
         rust_revision: manifest.rust_revision()?.into(),
         e6_source_receipt_sha256: sha256::bytes_digest(&e6.source_receipt),
         e6_freeze_receipt_sha256: sha256::bytes_digest(&e6.freeze_receipt),
+        capacities: capacity_contract.receipt_values(),
     })
 }
 
@@ -468,6 +493,21 @@ fn fixed_fields() -> [(&'static str, &'static str); 31] {
         ("send_limit", "1024"),
         ("input_limit_bytes", "131072"),
     ]
+}
+
+fn insert_capacity_fields(fields: &mut BTreeMap<String, String>, capacities: [u64; 4]) {
+    for (key, value) in CAPACITY_KEYS.into_iter().zip(capacities) {
+        fields.insert(key.into(), value.to_string());
+    }
+}
+
+fn validate_locked_capacities(capacities: [u64; 4]) -> Result<(), Failure> {
+    if capacities != LOCKED_CAPACITIES {
+        return Err(Failure::task(format!(
+            "Deepwyrm WYR1-E8 selected capacities drifted: observed {capacities:?}, expected {LOCKED_CAPACITIES:?}"
+        )));
+    }
+    Ok(())
 }
 
 fn extra_fields() -> [(&'static str, &'static str); 8] {
@@ -530,6 +570,7 @@ fn freeze(output: &Path, produced: &Produced, nonce: &str) -> Result<String, Fai
     for (k, v) in fixed_fields().into_iter().chain(extra_fields()) {
         fields.insert(k.into(), v.into());
     }
+    insert_capacity_fields(&mut fields, produced.capacities);
     for (k, v) in [
         ("deepwyrm_revision", produced.deep_revision.as_str()),
         ("generated_abi_revision", produced.abi_revision.as_str()),
@@ -581,7 +622,7 @@ fn freeze(output: &Path, produced: &Produced, nonce: &str) -> Result<String, Fai
         render_sorted(&receipt, ScalarSchema::FreezeReceipt)?.as_bytes(),
         "freeze receipt",
     )?;
-    validate_request(&fields)?;
+    validate_request(&fields, produced.capacities)?;
     Ok(format!(
         "WYR1_E8_PREPARE_PASS selector={SELECTOR} test_id={TEST_ID} request={} default_handoff={} smp_handoff={}\n",
         output.join("request.toml").display(),
@@ -602,6 +643,7 @@ fn source_receipt(
     artifacts: &Path,
     generation: &[u8; 32],
     inspections: &BTreeMap<String, Vec<u8>>,
+    capacities: [u64; 4],
 ) -> Result<String, Failure> {
     let mut f = BTreeMap::new();
     for (k, v) in fixed_fields().into_iter().chain(extra_fields()) {
@@ -609,6 +651,7 @@ fn source_receipt(
             f.insert(k.into(), v.into());
         }
     }
+    insert_capacity_fields(&mut f, capacities);
     for (k, v) in [
         ("kind", SOURCE_KIND),
         ("deepwyrm_revision", deep),
@@ -722,6 +765,7 @@ fn source_receipt_keys() -> Vec<String> {
         .chain(extra_fields().iter())
         .map(|(key, _)| (*key).to_owned())
         .collect::<BTreeSet<_>>();
+    keys.extend(CAPACITY_KEYS.into_iter().map(str::to_owned));
     keys.extend(
         [
             "deepwyrm_revision",
@@ -853,6 +897,9 @@ fn profile_fields(
     let mut h = BTreeMap::new();
     for (k, v) in fixed_fields().into_iter().chain(extra_fields()) {
         h.insert(k.into(), v.into());
+    }
+    for key in CAPACITY_KEYS {
+        h.insert(key.into(), field(r, key)?.into());
     }
     h.insert("kind".into(), HANDOFF_KIND.into());
     h.insert("profile".into(), profile.into());
@@ -988,10 +1035,13 @@ fn receipt_fields(hash: &str, r: &BTreeMap<String, String>) -> BTreeMap<String, 
 }
 
 fn request_keys() -> Vec<String> {
-    let mut k = fixed_fields()
-        .iter()
-        .map(|(k, _)| (*k).into())
-        .collect::<Vec<_>>();
+    let mut k = Vec::new();
+    for (key, _) in fixed_fields() {
+        k.push(key.into());
+        if key == "task_group_capacity" {
+            k.extend(CAPACITY_KEYS.into_iter().map(str::to_owned));
+        }
+    }
     k.extend(extra_fields().iter().map(|(k, _)| (*k).into()));
     for x in [
         "deepwyrm_revision",
@@ -1134,10 +1184,18 @@ fn result_keys() -> Vec<String> {
     .map(str::to_owned)
     .collect()
 }
-fn validate_request(f: &BTreeMap<String, String>) -> Result<(), Failure> {
+fn validate_request(f: &BTreeMap<String, String>, capacities: [u64; 4]) -> Result<(), Failure> {
     for (k, v) in fixed_fields().into_iter().chain(extra_fields()) {
         if field(f, k)? != v {
             return Err(Failure::task(format!("WYR1-E8 {k} drifted")));
+        }
+    }
+    validate_locked_capacities(capacities)?;
+    for (key, value) in CAPACITY_KEYS.into_iter().zip(capacities) {
+        if field(f, key)? != value.to_string() {
+            return Err(Failure::task(format!(
+                "WYR1-E8 {key} does not match the selected Deepwyrm source"
+            )));
         }
     }
     for (k, v) in [
@@ -1422,6 +1480,10 @@ const SEMANTIC_INTEGER_KEYS: &[&str] = &[
     "thread_capacity",
     "root_address_space_capacity",
     "task_group_capacity",
+    "per_process_handle_capacity",
+    "memory_object_capacity",
+    "mapping_lease_capacity",
+    "registry_object_capacity",
     "channel_pair_capacity",
     "wait_capacity",
     "overall_timeout_seconds",
@@ -1645,6 +1707,7 @@ module._strict_c6_toml(
             .chain(extra_fields())
             .map(|(key, value)| (key.to_owned(), value.to_owned()))
             .collect::<BTreeMap<_, _>>();
+        insert_capacity_fields(&mut request, LOCKED_CAPACITIES);
         for (key, value) in [
             (
                 "deepwyrm_revision",
@@ -1701,6 +1764,7 @@ module._strict_c6_toml(
             .chain(extra_fields())
             .map(|(key, value)| (key.to_owned(), value.to_owned()))
             .collect::<BTreeMap<_, _>>();
+        insert_capacity_fields(&mut source, LOCKED_CAPACITIES);
         source.insert("kind".into(), SOURCE_KIND.into());
         for (key, value) in [
             (
@@ -1789,7 +1853,7 @@ module._strict_c6_toml(
         for (key, digest) in ACCEPTED_E6_REUSED_SHA256 {
             source.insert(format!("{key}_sha256"), (*digest).into());
         }
-        assert_eq!(source.len(), 124);
+        assert_eq!(source.len(), 128);
         source
     }
 
@@ -1883,7 +1947,7 @@ for key in verify.E8_RESULT_KEYS:
     #[test]
     fn request_contract_has_one_exact_additive_key_set() {
         let keys = request_keys();
-        assert_eq!(keys.len(), 107);
+        assert_eq!(keys.len(), 111);
         assert_eq!(
             keys.iter().cloned().collect::<BTreeSet<_>>().len(),
             keys.len()
@@ -1905,7 +1969,7 @@ for key in verify.E8_RESULT_KEYS:
         assert_eq!(ARTIFACTS[0], ("loader", "loader.efi"));
         assert_eq!(ARTIFACTS[24], ("ovmf_vars", "OVMF_VARS.fd"));
         let source_keys = source_receipt_keys();
-        assert_eq!(source_keys.len(), 124);
+        assert_eq!(source_keys.len(), 128);
         assert!(source_keys.contains(&"profile".to_owned()));
         assert!(source_keys.contains(&"scenario".to_owned()));
         for label in wyr1c::E8_ARTIFACT_LABELS {
@@ -1923,6 +1987,30 @@ for key in verify.E8_RESULT_KEYS:
                 ("wait_capacity", "64"),
             ]
         );
+        assert_eq!(
+            CAPACITY_KEYS,
+            [
+                "per_process_handle_capacity",
+                "memory_object_capacity",
+                "mapping_lease_capacity",
+                "registry_object_capacity",
+            ]
+        );
+        assert_eq!(LOCKED_CAPACITIES, [64, 64, 64, 160]);
+    }
+
+    #[test]
+    fn request_rejects_each_capacity_mismatch_from_selected_source() {
+        for (key, capacity) in CAPACITY_KEYS.into_iter().zip(LOCKED_CAPACITIES) {
+            let mut request = normalized_a1_request();
+            request.insert(key.into(), (capacity - 1).to_string());
+            assert!(validate_request(&request, LOCKED_CAPACITIES).is_err());
+        }
+        for index in 0..LOCKED_CAPACITIES.len() {
+            let mut source_capacities = LOCKED_CAPACITIES;
+            source_capacities[index] -= 1;
+            assert!(validate_request(&normalized_a1_request(), source_capacities).is_err());
+        }
     }
 
     #[test]
@@ -1984,6 +2072,8 @@ for key in verify.E8_RESULT_KEYS:
             b"smp vars",
         )
         .unwrap();
+        assert_eq!(default.len(), 126);
+        assert_eq!(smp.len(), 126);
         let default_text = render_sorted(&default, ScalarSchema::Handoff).unwrap();
         let smp_text = render_sorted(&smp, ScalarSchema::Handoff).unwrap();
 
@@ -2000,16 +2090,27 @@ for key in verify.E8_RESULT_KEYS:
         fs::write(scratch.join("default/handoff.toml"), &default_text).unwrap();
         fs::write(scratch.join("smp/handoff.toml"), &smp_text).unwrap();
         let pair = pair_fields(&scratch, &request_hash).unwrap();
+        assert_eq!(pair.len(), 23);
         let pair_text = render_sorted(&pair, ScalarSchema::Pair).unwrap();
         fs::remove_dir_all(&scratch).unwrap();
         assert!(pair_text.contains("default_vcpus = 1\n"));
         assert!(pair_text.contains("smp_vcpus = 4\n"));
 
-        let freeze_text = render_sorted(
-            &receipt_fields(&request_hash, &request),
-            ScalarSchema::FreezeReceipt,
-        )
-        .unwrap();
+        let freeze = receipt_fields(&request_hash, &request);
+        assert_eq!(freeze.len(), 38);
+        let freeze_text = render_sorted(&freeze, ScalarSchema::FreezeReceipt).unwrap();
+        assert_eq!(result_keys().len(), 82);
+        let result_text = result_schema().unwrap();
+        for (key, value) in CAPACITY_KEYS.into_iter().zip(LOCKED_CAPACITIES) {
+            let field = format!("{key} = {value}\n");
+            assert!(request_text.contains(&field));
+            assert!(source_text.contains(&field));
+            assert!(default_text.contains(&field));
+            assert!(smp_text.contains(&field));
+            assert!(!freeze_text.contains(&format!("{key} = ")));
+            assert!(!pair_text.contains(&format!("{key} = ")));
+            assert!(!result_text.contains(&format!("{key} = ")));
+        }
         let records = [
             request_text,
             source_text,
@@ -2017,7 +2118,7 @@ for key in verify.E8_RESULT_KEYS:
             pair_text,
             default_text,
             smp_text,
-            result_schema().unwrap(),
+            result_text,
         ];
         root_accepts_all_scalar_records(&records).unwrap();
 
@@ -2079,11 +2180,15 @@ for key in verify.E8_RESULT_KEYS:
         let current_layout = prepare
             .find("deep_layout::prepare_current_kernel_source(")
             .unwrap();
+        let current_capacities = prepare
+            .find("deep_layout::read_wyr1e8_capacity_contract(")
+            .unwrap();
         let output = prepare.find("validate_fresh_output(").unwrap();
         let staging = prepare.find("fs::create_dir(&staging)").unwrap();
         let native_build = prepare.find("build_produced(").unwrap();
         assert!(abi_join < current_layout);
-        assert!(current_layout < output);
+        assert!(current_layout < current_capacities);
+        assert!(current_capacities < output);
         assert!(output < staging);
         assert!(staging < native_build);
 
@@ -2091,6 +2196,24 @@ for key in verify.E8_RESULT_KEYS:
             [source.find("fn build_produced(").unwrap()..source.find("fn fixed_fields(").unwrap()];
         assert!(!build.contains("deep_layout::prepare("));
         assert!(build.contains("layout: &crate::deep_layout::DeepLayoutBuild"));
+        assert!(build.contains("capacity_contract: &crate::deep_layout::Wyr1E8CapacityContract"));
+        assert!(build.contains("capacity_contract.verify_unchanged()?"));
+
+        let inspect = &source[source.find("pub(crate) fn inspect(").unwrap()
+            ..source.find("fn build_produced(").unwrap()];
+        let read_capacities = inspect
+            .find("deep_layout::read_wyr1e8_capacity_contract(")
+            .unwrap();
+        let validate_request = inspect
+            .find("validate_request(&request, capacities)?")
+            .unwrap();
+        let frozen_metadata = inspect.find("validate_frozen_metadata(").unwrap();
+        let source_receipt = inspect
+            .find("let expected_source = source_receipt(")
+            .unwrap();
+        assert!(read_capacities < validate_request);
+        assert!(validate_request < frozen_metadata);
+        assert!(frozen_metadata < source_receipt);
     }
 
     #[test]
@@ -2108,12 +2231,12 @@ for key in verify.E8_RESULT_KEYS:
         // bb30ae7a6edb4d883c18e6da3af78391d0f23921d4b6e654051b7e8f0e138163.
         // Artifact digests are normalized here; lineage and failing field values are retained.
         let request = normalized_a1_request();
-        assert_eq!(request.len(), 107);
+        assert_eq!(request.len(), 111);
         assert_eq!(
             field(&request, "generated_abi_tree").unwrap(),
             "a9b067107ec38e2be44630f4dce428dab0f48de8"
         );
-        validate_request(&request).unwrap();
+        validate_request(&request, LOCKED_CAPACITIES).unwrap();
 
         let corrected = render(&request, &request_keys(), ScalarSchema::Request).unwrap();
         assert!(corrected.contains("com2_prelude_length = 354\n"));
@@ -2130,10 +2253,10 @@ for key in verify.E8_RESULT_KEYS:
 
         let mut sha_sized_tree = request.clone();
         sha_sized_tree.insert("generated_abi_tree".into(), "ab".repeat(32));
-        assert!(validate_request(&sha_sized_tree).is_err());
+        assert!(validate_request(&sha_sized_tree, LOCKED_CAPACITIES).is_err());
 
         let mut tree_sized_sha = request;
         tree_sized_sha.insert("esp_sha256".into(), "ab".repeat(20));
-        assert!(validate_request(&tree_sized_sha).is_err());
+        assert!(validate_request(&tree_sized_sha, LOCKED_CAPACITIES).is_err());
     }
 }
