@@ -223,3 +223,171 @@ fn a_terminal_outcome_is_sticky() {
     probe.observe_progress_result_timeout(0);
     assert_eq!(probe.outcome(), first, "the first failure is the diagnosis");
 }
+
+mod record_contract {
+    use super::super::record::*;
+    use super::super::*;
+
+    extern crate std;
+
+    fn header(bytes: &[u8; BYTES], kind: u32, sequence: u64, nonce: u64) {
+        assert_eq!(&bytes[0..4], b"R1SP", "magic");
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 1, "major");
+        assert_eq!(u16::from_le_bytes([bytes[6], bytes[7]]), 0, "minor");
+        assert_eq!(
+            u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            kind,
+            "kind"
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+            BYTES as u32,
+            "byte length"
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+            sequence,
+            "sequence"
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
+            nonce,
+            "build nonce"
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[60..64].try_into().unwrap()),
+            0,
+            "trailing reserved word must be zero; the kernel rejects otherwise"
+        );
+    }
+
+    #[test]
+    fn a_step_record_pins_every_offset_the_kernel_validates() {
+        let bytes = encode_step(
+            7,
+            0x5A70_0001,
+            ProbePlan::SMP,
+            ProbeStep::AwaitHogAccepted { index: 3 },
+            0x1234,
+        );
+        header(&bytes, KIND_STEP, 7, 0x5A70_0001);
+        assert_eq!(u32::from_le_bytes(bytes[32..36].try_into().unwrap()), 4);
+        assert_eq!(u32::from_le_bytes(bytes[36..40].try_into().unwrap()), 6);
+        assert_eq!(
+            u32::from_le_bytes(bytes[40..44].try_into().unwrap()),
+            STEP_AWAIT_HOG_ACCEPTED
+        );
+        assert_eq!(u32::from_le_bytes(bytes[44..48].try_into().unwrap()), 3);
+        assert_eq!(
+            u64::from_le_bytes(bytes[48..56].try_into().unwrap()),
+            0x1234
+        );
+    }
+
+    #[test]
+    fn a_failure_record_carries_its_ordinal_index_and_detail() {
+        let bytes = encode_failure(
+            2,
+            0x5A70_0001,
+            ProbePlan::SMP,
+            ProbeFailure::HogAcceptTimeout { index: 1 },
+        );
+        header(&bytes, KIND_FAILED, 2, 0x5A70_0001);
+        assert_eq!(
+            u32::from_le_bytes(bytes[40..44].try_into().unwrap()),
+            FAIL_HOG_ACCEPT_TIMEOUT
+        );
+        assert_eq!(u32::from_le_bytes(bytes[44..48].try_into().unwrap()), 1);
+        assert_eq!(u64::from_le_bytes(bytes[48..56].try_into().unwrap()), 0);
+
+        let uncorrelated = encode_failure(
+            3,
+            0x5A70_0001,
+            ProbePlan::SMP,
+            ProbeFailure::Uncorrelated {
+                expected: 13,
+                observed: 999,
+            },
+        );
+        assert_eq!(
+            u32::from_le_bytes(uncorrelated[44..48].try_into().unwrap()),
+            13
+        );
+        assert_eq!(
+            u64::from_le_bytes(uncorrelated[48..56].try_into().unwrap()),
+            999
+        );
+    }
+
+    #[test]
+    fn the_terminal_record_states_pass_or_the_failure_ordinal() {
+        let passed = encode_terminal(9, 1, ProbePlan::CONTROL, ProbeOutcome::Passed, 18);
+        header(&passed, KIND_TERMINAL, 9, 1);
+        assert_eq!(u32::from_le_bytes(passed[40..44].try_into().unwrap()), 18);
+        assert_eq!(u32::from_le_bytes(passed[56..60].try_into().unwrap()), 0);
+
+        let failed = encode_terminal(
+            9,
+            1,
+            ProbePlan::CONTROL,
+            ProbeOutcome::Failed(ProbeFailure::CleanupIncomplete { index: 2 }),
+            5,
+        );
+        assert_eq!(
+            u32::from_le_bytes(failed[56..60].try_into().unwrap()),
+            FAIL_CLEANUP_INCOMPLETE
+        );
+    }
+
+    #[test]
+    fn every_step_and_failure_variant_has_a_distinct_nonzero_ordinal() {
+        let steps = [
+            ProbeStep::LaunchHog { index: 0 },
+            ProbeStep::AwaitHogAccepted { index: 0 },
+            ProbeStep::LaunchProgress { after_hog: 0 },
+            ProbeStep::AwaitProgressResult { after_hog: 0 },
+            ProbeStep::TerminateHog { index: 0 },
+            ProbeStep::AwaitHogResult { index: 0 },
+            ProbeStep::Complete,
+        ];
+        let mut seen = std::vec::Vec::new();
+        for step in steps {
+            let ordinal = step_ordinal(step);
+            assert_ne!(ordinal, 0);
+            assert!(!seen.contains(&ordinal), "duplicate step ordinal {ordinal}");
+            seen.push(ordinal);
+        }
+
+        let failures = [
+            ProbeFailure::HogAcceptTimeout { index: 0 },
+            ProbeFailure::HogRejected {
+                index: 0,
+                status: 0,
+            },
+            ProbeFailure::ProgressResultTimeout { after_hog: 0 },
+            ProbeFailure::ProgressRejected {
+                after_hog: 0,
+                status: 0,
+            },
+            ProbeFailure::ProgressNotNormalZero {
+                after_hog: 0,
+                code: 0,
+            },
+            ProbeFailure::CleanupIncomplete { index: 0 },
+            ProbeFailure::Uncorrelated {
+                expected: 0,
+                observed: 0,
+            },
+        ];
+        let mut seen = std::vec::Vec::new();
+        for failure in failures {
+            let (ordinal, _, _) = failure_fields(failure);
+            assert_ne!(ordinal, 0);
+            assert!(
+                !seen.contains(&ordinal),
+                "duplicate failure ordinal {ordinal}"
+            );
+            seen.push(ordinal);
+        }
+    }
+}

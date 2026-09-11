@@ -22,6 +22,7 @@ wyr1c6-test-evidence = []
 wyr1d-test-evidence = []
 wyr1e7-test-evidence = []
 wyr1e8-test-evidence = []
+r1-test-evidence = []
 
 [dependencies]
 deepwyrm-syscall.workspace = true

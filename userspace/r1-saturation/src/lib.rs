@@ -324,3 +324,169 @@ impl SaturationProbe {
 
 #[cfg(test)]
 mod tests;
+
+/// `R1SP` record encoding. The kernel collector validates only bounded
+/// transport, the build nonce, a consecutive sequence and reporter custody; the
+/// step meanings below stay this crate's and the host decoder's concern.
+pub mod record {
+    use super::{ProbeFailure, ProbeOutcome, ProbeStep};
+
+    pub const BYTES: usize = 64;
+    const MAGIC: [u8; 4] = *b"R1SP";
+    const MAJOR: u16 = 1;
+    const MINOR: u16 = 0;
+
+    pub const KIND_STEP: u32 = 1;
+    pub const KIND_FAILED: u32 = 2;
+    pub const KIND_TERMINAL: u32 = 255;
+
+    /// Step ordinals. Stable: the host decoder and the kernel's retained bytes
+    /// both read them.
+    pub const STEP_LAUNCH_HOG: u32 = 1;
+    pub const STEP_AWAIT_HOG_ACCEPTED: u32 = 2;
+    pub const STEP_LAUNCH_PROGRESS: u32 = 3;
+    pub const STEP_AWAIT_PROGRESS_RESULT: u32 = 4;
+    pub const STEP_TERMINATE_HOG: u32 = 5;
+    pub const STEP_AWAIT_HOG_RESULT: u32 = 6;
+    pub const STEP_COMPLETE: u32 = 7;
+
+    /// Failure ordinals, one per [`ProbeFailure`] variant.
+    pub const FAIL_HOG_ACCEPT_TIMEOUT: u32 = 1;
+    pub const FAIL_HOG_REJECTED: u32 = 2;
+    pub const FAIL_PROGRESS_RESULT_TIMEOUT: u32 = 3;
+    pub const FAIL_PROGRESS_REJECTED: u32 = 4;
+    pub const FAIL_PROGRESS_NOT_NORMAL_ZERO: u32 = 5;
+    pub const FAIL_CLEANUP_INCOMPLETE: u32 = 6;
+    pub const FAIL_UNCORRELATED: u32 = 7;
+
+    pub const fn step_ordinal(step: ProbeStep) -> u32 {
+        match step {
+            ProbeStep::LaunchHog { .. } => STEP_LAUNCH_HOG,
+            ProbeStep::AwaitHogAccepted { .. } => STEP_AWAIT_HOG_ACCEPTED,
+            ProbeStep::LaunchProgress { .. } => STEP_LAUNCH_PROGRESS,
+            ProbeStep::AwaitProgressResult { .. } => STEP_AWAIT_PROGRESS_RESULT,
+            ProbeStep::TerminateHog { .. } => STEP_TERMINATE_HOG,
+            ProbeStep::AwaitHogResult { .. } => STEP_AWAIT_HOG_RESULT,
+            ProbeStep::Complete => STEP_COMPLETE,
+        }
+    }
+
+    pub const fn step_index(step: ProbeStep) -> u32 {
+        match step {
+            ProbeStep::LaunchHog { index }
+            | ProbeStep::AwaitHogAccepted { index }
+            | ProbeStep::TerminateHog { index }
+            | ProbeStep::AwaitHogResult { index } => index as u32,
+            ProbeStep::LaunchProgress { after_hog }
+            | ProbeStep::AwaitProgressResult { after_hog } => after_hog as u32,
+            ProbeStep::Complete => 0,
+        }
+    }
+
+    /// Returns the failure ordinal and its two detail words.
+    pub const fn failure_fields(failure: ProbeFailure) -> (u32, u32, u64) {
+        match failure {
+            ProbeFailure::HogAcceptTimeout { index } => (FAIL_HOG_ACCEPT_TIMEOUT, index as u32, 0),
+            ProbeFailure::HogRejected { index, status } => {
+                (FAIL_HOG_REJECTED, index as u32, status as u64)
+            }
+            ProbeFailure::ProgressResultTimeout { after_hog } => {
+                (FAIL_PROGRESS_RESULT_TIMEOUT, after_hog as u32, 0)
+            }
+            ProbeFailure::ProgressRejected { after_hog, status } => {
+                (FAIL_PROGRESS_REJECTED, after_hog as u32, status as u64)
+            }
+            ProbeFailure::ProgressNotNormalZero { after_hog, code } => {
+                (FAIL_PROGRESS_NOT_NORMAL_ZERO, after_hog as u32, code as u64)
+            }
+            ProbeFailure::CleanupIncomplete { index } => (FAIL_CLEANUP_INCOMPLETE, index as u32, 0),
+            ProbeFailure::Uncorrelated { expected, observed } => {
+                (FAIL_UNCORRELATED, expected as u32, observed)
+            }
+        }
+    }
+
+    struct Writer {
+        bytes: [u8; BYTES],
+    }
+
+    impl Writer {
+        fn new(kind: u32, sequence: u64, nonce: u64) -> Self {
+            let mut bytes = [0_u8; BYTES];
+            bytes[0..4].copy_from_slice(&MAGIC);
+            bytes[4..6].copy_from_slice(&MAJOR.to_le_bytes());
+            bytes[6..8].copy_from_slice(&MINOR.to_le_bytes());
+            bytes[8..12].copy_from_slice(&kind.to_le_bytes());
+            bytes[12..16].copy_from_slice(&(BYTES as u32).to_le_bytes());
+            bytes[16..24].copy_from_slice(&sequence.to_le_bytes());
+            bytes[24..32].copy_from_slice(&nonce.to_le_bytes());
+            Self { bytes }
+        }
+
+        fn u32_at(&mut self, offset: usize, value: u32) {
+            self.bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+
+        fn u64_at(&mut self, offset: usize, value: u64) {
+            self.bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    /// Encodes one observed step. Offsets 32/36 carry the topology so a report
+    /// can never be misread as a different profile.
+    pub fn encode_step(
+        sequence: u64,
+        nonce: u64,
+        plan: super::ProbePlan,
+        step: ProbeStep,
+        job_id: u64,
+    ) -> [u8; BYTES] {
+        let mut writer = Writer::new(KIND_STEP, sequence, nonce);
+        writer.u32_at(32, plan.online_cpus as u32);
+        writer.u32_at(36, plan.hog_count as u32);
+        writer.u32_at(40, step_ordinal(step));
+        writer.u32_at(44, step_index(step));
+        writer.u64_at(48, job_id);
+        writer.bytes
+    }
+
+    /// Encodes the first failure classification.
+    pub fn encode_failure(
+        sequence: u64,
+        nonce: u64,
+        plan: super::ProbePlan,
+        failure: ProbeFailure,
+    ) -> [u8; BYTES] {
+        let (ordinal, index, detail) = failure_fields(failure);
+        let mut writer = Writer::new(KIND_FAILED, sequence, nonce);
+        writer.u32_at(32, plan.online_cpus as u32);
+        writer.u32_at(36, plan.hog_count as u32);
+        writer.u32_at(40, ordinal);
+        writer.u32_at(44, index);
+        writer.u64_at(48, detail);
+        writer.bytes
+    }
+
+    /// Encodes the single terminal record. Offset 56 carries zero for a pass and
+    /// the failure ordinal otherwise, so a truncated capture still says which.
+    pub fn encode_terminal(
+        sequence: u64,
+        nonce: u64,
+        plan: super::ProbePlan,
+        outcome: ProbeOutcome,
+        steps_observed: usize,
+    ) -> [u8; BYTES] {
+        let mut writer = Writer::new(KIND_TERMINAL, sequence, nonce);
+        writer.u32_at(32, plan.online_cpus as u32);
+        writer.u32_at(36, plan.hog_count as u32);
+        writer.u32_at(40, steps_observed as u32);
+        writer.u32_at(
+            56,
+            match outcome {
+                ProbeOutcome::Passed => 0,
+                ProbeOutcome::Failed(failure) => failure_fields(failure).0,
+            },
+        );
+        writer.bytes
+    }
+}

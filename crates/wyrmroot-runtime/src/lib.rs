@@ -74,6 +74,8 @@ pub use capability_native::{
     materialize_read_only_memory, set_timer, signal_event, terminate_process, terminate_task_group,
     unmap_memory, wait_one,
 };
+#[cfg(feature = "r1-test-evidence")]
+pub use capability_native::{R1_EVIDENCE_RECORD_BYTES, submit_r1_evidence};
 #[cfg(feature = "wyr1-test-evidence")]
 pub use capability_native::{WYR1_EVIDENCE_RECORD_BYTES, submit_wyr1_evidence};
 #[cfg(feature = "wyr1b-test-evidence")]

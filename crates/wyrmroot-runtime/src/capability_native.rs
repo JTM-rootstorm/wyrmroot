@@ -59,12 +59,16 @@ const WYR1D_TEST_EVIDENCE_SYSCALL: DwSyscallId = DwSyscallId(0xffff_ff20);
 const WYR1E7_TEST_EVIDENCE_SYSCALL: DwSyscallId = DwSyscallId(0xffff_ff21);
 #[cfg(feature = "wyr1e8-test-evidence")]
 const WYR1E8_TEST_EVIDENCE_SYSCALL: DwSyscallId = DwSyscallId(0xffff_ff21);
+#[cfg(feature = "r1-test-evidence")]
+const R1_TEST_EVIDENCE_SYSCALL: DwSyscallId = DwSyscallId(0xffff_ff22);
 #[cfg(feature = "wyr1c6-test-evidence")]
 pub const WYR1C6_EVIDENCE_RECORD_BYTES: usize = 113;
 #[cfg(feature = "wyr1e7-test-evidence")]
 pub const WYR1E7_EVIDENCE_RECORD_BYTES: usize = 192;
 #[cfg(feature = "wyr1e8-test-evidence")]
 pub const WYR1E8_EVIDENCE_RECORD_BYTES: usize = 192;
+#[cfg(feature = "r1-test-evidence")]
+pub const R1_EVIDENCE_RECORD_BYTES: usize = 64;
 
 /// Submit one selector-33 WRE1 record from permanent system-init.
 #[cfg(feature = "wyr1e7-test-evidence")]
@@ -94,6 +98,27 @@ pub fn submit_wyr1e8_evidence(
         [
             record.as_ptr() as u64,
             WYR1E8_EVIDENCE_RECORD_BYTES as u64,
+            0,
+            0,
+            0,
+            0,
+        ],
+    ))
+}
+
+/// Submit one reset-card-R1 `R1SP` saturation-probe record.
+///
+/// Reporter custody is permanent system-init, matching every other selector.
+/// The probe is a dynamically launched client: it reports to its parent over its
+/// ordinary bootstrap channel and permanent init relays through this seam, so no
+/// launched child holds a private kernel operation.
+#[cfg(feature = "r1-test-evidence")]
+pub fn submit_r1_evidence(record: &[u8; R1_EVIDENCE_RECORD_BYTES]) -> Result<(), NativeError> {
+    require_success(raw::call(
+        R1_TEST_EVIDENCE_SYSCALL,
+        [
+            record.as_ptr() as u64,
+            R1_EVIDENCE_RECORD_BYTES as u64,
             0,
             0,
             0,
