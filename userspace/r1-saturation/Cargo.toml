@@ -1,0 +1,17 @@
+[package]
+name = "wyrmroot-r1-saturation"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Reset card R1A dynamic-launch saturation probe scenario"
+license = "GPL-3.0-or-later"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+
+[lints.rust]
+unsafe_code = "deny"
+unused_crate_dependencies = "deny"

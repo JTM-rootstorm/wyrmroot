@@ -334,6 +334,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrmroot-r1-saturation"
+version = "0.0.0"
+
+[[package]]
 name = "wyrmroot-registry-proto"
 version = "0.0.0"
 
@@ -374,8 +378,8 @@ dependencies = [
  "deepwyrm-syscall",
  "wyrmroot-bootfs",
  "wyrmroot-consoled",
- "wyrmroot-devmgr",
  "wyrmroot-device-proto",
+ "wyrmroot-devmgr",
  "wyrmroot-dw1e3-com2-test",
  "wyrmroot-launch-proto",
  "wyrmroot-loader",

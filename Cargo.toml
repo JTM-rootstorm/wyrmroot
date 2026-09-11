@@ -30,6 +30,7 @@ members = [
     "userspace/uart16550d",
     "userspace/console-echo",
     "userspace/consoled",
+    "userspace/r1-saturation",
     "userspace/wyrmsh",
     "userspace/dw1b-preemption",
     "userspace/wyr1e-test-actors",
