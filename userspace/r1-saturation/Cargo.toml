@@ -5,12 +5,37 @@ edition = "2024"
 publish = false
 description = "Reset card R1A dynamic-launch saturation probe scenario"
 license = "GPL-3.0-or-later"
+autobins = false
 
 [lib]
 path = "src/lib.rs"
 
 [features]
 default = []
+# The two payloads need syscalls, so they are built only for a product. The
+# scenario itself stays host testable with no features enabled.
+native-payloads = []
+
+[dependencies]
+deepwyrm-syscall.workspace = true
+wyrmroot-launch-proto = { path = "../../crates/wyrmroot-launch-proto" }
+wyrmroot-loader = { path = "../../crates/wyrmroot-loader" }
+wyrmroot-registry-proto = { path = "../../crates/wyrmroot-registry-proto" }
+wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }
+
+[[bin]]
+name = "wyrmroot-r1-probe"
+path = "src/bin/probe.rs"
+test = false
+bench = false
+required-features = ["native-payloads"]
+
+[[bin]]
+name = "wyrmroot-r1-hog"
+path = "src/bin/hog.rs"
+test = false
+bench = false
+required-features = ["native-payloads"]
 
 [lints.rust]
 unsafe_code = "deny"

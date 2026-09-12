@@ -378,6 +378,7 @@ mod record_contract {
                 expected: 0,
                 observed: 0,
             },
+            ProbeFailure::ProgressAcceptTimeout { after_hog: 0 },
         ];
         let mut seen = std::vec::Vec::new();
         for failure in failures {
@@ -390,4 +391,162 @@ mod record_contract {
             seen.push(ordinal);
         }
     }
+}
+
+mod launch_parameters {
+    use crate::launch_parameters::{ACCEPTED_PLANS, ParameterError, parse_nonce, parse_plan};
+    use crate::{ProbePlan, SaturationProbe};
+
+    #[test]
+    fn both_accepted_plans_round_trip_and_construct_a_probe() {
+        for plan in ACCEPTED_PLANS {
+            let hogs = [b'0' + plan.hog_count as u8];
+            let cpus = [b'0' + plan.online_cpus as u8];
+            let hogs = core::str::from_utf8(&hogs).unwrap();
+            let cpus = core::str::from_utf8(&cpus).unwrap();
+            assert_eq!(parse_plan(&[hogs, cpus]), Ok(plan));
+            assert!(SaturationProbe::new(plan).is_some());
+        }
+    }
+
+    #[test]
+    fn a_plausible_but_unaccepted_topology_is_refused() {
+        // Valid by ProbePlan::is_valid and inside MAX_HOGS, so only the
+        // accepted-plan check can reject it. A probe that ran this would
+        // publish topology fields no profile handoff matches.
+        let unaccepted = ProbePlan {
+            hog_count: 5,
+            online_cpus: 4,
+        };
+        assert!(unaccepted.is_valid());
+        assert_eq!(parse_plan(&["5", "4"]), Err(ParameterError::UnacceptedPlan));
+        // The control plan's hog count against the SMP CPU count, and vice
+        // versa: each half is accepted, the pairing is not.
+        assert_eq!(parse_plan(&["3", "4"]), Err(ParameterError::UnacceptedPlan));
+        assert_eq!(parse_plan(&["6", "1"]), Err(ParameterError::UnacceptedPlan));
+    }
+
+    #[test]
+    fn argument_shape_is_exact() {
+        assert_eq!(parse_plan(&[]), Err(ParameterError::WrongArgumentCount));
+        assert_eq!(parse_plan(&["6"]), Err(ParameterError::WrongArgumentCount));
+        assert_eq!(
+            parse_plan(&["6", "4", "4"]),
+            Err(ParameterError::WrongArgumentCount)
+        );
+        for malformed in [
+            ("", "4"),
+            ("6", ""),
+            ("06", "4"),
+            ("6", "04"),
+            ("+6", "4"),
+            ("-6", "4"),
+            ("6 ", "4"),
+            ("six", "4"),
+            ("9", "4"),
+            ("100", "4"),
+        ] {
+            assert_eq!(
+                parse_plan(&[malformed.0, malformed.1]),
+                Err(ParameterError::Malformed),
+                "{malformed:?} must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn the_build_nonce_parses_exactly_as_the_kernel_spells_it() {
+        // The value the stack gate supplies for this selector.
+        assert_eq!(parse_nonce("8100000000000001"), Ok(0x8100_0000_0000_0001));
+        assert_eq!(parse_nonce("FFFFFFFFFFFFFFFF"), Ok(u64::MAX));
+        assert_eq!(
+            parse_nonce("0000000000000000"),
+            Err(ParameterError::ZeroNonce)
+        );
+        for malformed in [
+            "",
+            "81",
+            "810000000000000",
+            "81000000000000001",
+            "8100000000000O01",
+            "8100000000000001 ",
+            // Lowercase is the kernel's own rejection, mirrored here so a
+            // product cannot be built with a nonce the collector refuses.
+            "8100000000000abc",
+        ] {
+            assert_eq!(
+                parse_nonce(malformed),
+                Err(ParameterError::MalformedNonce),
+                "{malformed:?} must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn the_nonce_parse_is_usable_in_const_context() {
+        const NONCE: u64 = match parse_nonce("8100000000000001") {
+            Ok(value) => value,
+            Err(_) => panic!("canonical nonce must parse at compile time"),
+        };
+        assert_eq!(NONCE, 0x8100_0000_0000_0001);
+    }
+}
+
+#[test]
+fn job_identity_is_readable_only_while_the_job_is_live() {
+    let mut probe = SaturationProbe::new(ProbePlan::CONTROL).unwrap();
+    assert_eq!(probe.hog_job(0), None);
+    assert_eq!(probe.progress_job(), None);
+    assert_eq!(probe.hog_job(MAX_HOGS), None);
+
+    assert!(probe.observe_hog_submitted(0));
+    assert!(probe.observe_hog_accepted(0, 41));
+    assert_eq!(probe.hog_job(0), Some(41));
+    assert_eq!(probe.hog_job(1), None);
+
+    assert!(probe.observe_progress_accepted(0, 42));
+    assert_eq!(probe.progress_job(), Some(42));
+    // Proving progress retires the child, so the binary cannot wait on it twice.
+    assert!(probe.observe_progress_result(0, 42, 0));
+    assert_eq!(probe.progress_job(), None);
+    // The hog stays addressable until it is reaped, which is what cleanup needs.
+    assert_eq!(probe.hog_job(0), Some(41));
+}
+
+#[test]
+fn a_silent_progress_launch_is_not_reported_as_a_refusal() {
+    // Both stop the run after the same step, and the record must still say
+    // which happened: a refusal is an answer from the launch service, a
+    // silence is the failure family A27 belongs to.
+    let mut refused = SaturationProbe::new(ProbePlan::SMP).unwrap();
+    assert!(refused.observe_hog_submitted(0));
+    assert!(refused.observe_hog_accepted(0, 7));
+    refused.observe_progress_rejected(0, 0x1234);
+
+    let mut silent = SaturationProbe::new(ProbePlan::SMP).unwrap();
+    assert!(silent.observe_hog_submitted(0));
+    assert!(silent.observe_hog_accepted(0, 7));
+    silent.observe_progress_accept_timeout(0);
+
+    let refused_outcome = refused.outcome().unwrap();
+    let silent_outcome = silent.outcome().unwrap();
+    assert_ne!(refused_outcome, silent_outcome);
+    assert_eq!(
+        silent_outcome,
+        ProbeOutcome::Failed(ProbeFailure::ProgressAcceptTimeout { after_hog: 0 })
+    );
+    let refused_ordinal = record::failure_fields(ProbeFailure::ProgressRejected {
+        after_hog: 0,
+        status: 0x1234,
+    })
+    .0;
+    let silent_ordinal =
+        record::failure_fields(ProbeFailure::ProgressAcceptTimeout { after_hog: 0 }).0;
+    assert_ne!(refused_ordinal, silent_ordinal);
+    // The silent case carries no status to report, so its detail stays zero
+    // rather than borrowing a status code that was never received.
+    assert_eq!(
+        record::failure_fields(ProbeFailure::ProgressAcceptTimeout { after_hog: 3 }),
+        (record::FAIL_PROGRESS_ACCEPT_TIMEOUT, 3, 0)
+    );
 }

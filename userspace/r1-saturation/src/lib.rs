@@ -21,6 +21,15 @@
 
 #![no_std]
 
+// The scenario itself needs no syscalls; its two payload binaries do. Naming
+// their dependencies here keeps `unused_crate_dependencies` on for the whole
+// crate rather than dropping the lint to accommodate a lib/bin split.
+use deepwyrm_syscall as _;
+use wyrmroot_launch_proto as _;
+use wyrmroot_loader as _;
+use wyrmroot_registry_proto as _;
+use wyrmroot_runtime as _;
+
 /// Progress is proved by launching a short-lived child and requiring its
 /// terminal result, not by sampling a queue. An instantaneous sample would pass
 /// while nothing actually ran, which is the mistake the plan's section 4 barrier
@@ -98,6 +107,11 @@ pub enum ProbeFailure {
     ProgressResultTimeout { after_hog: usize },
     /// The progress child was refused admission while hogs hold the CPUs.
     ProgressRejected { after_hog: usize, status: u32 },
+    /// The progress child's launch drew no reply at all inside the bound. Kept
+    /// distinct from `ProgressRejected`: a refusal is an answer and a silence is
+    /// not, and collapsing them is exactly the "a spawn timed out" vagueness the
+    /// R1 gate exists to eliminate.
+    ProgressAcceptTimeout { after_hog: usize },
     /// The progress child ran but did not exit normal-zero.
     ProgressNotNormalZero { after_hog: usize, code: u32 },
     /// Cleanup did not complete, so the run cannot be treated as bounded.
@@ -166,6 +180,23 @@ impl SaturationProbe {
 
     pub const fn outcome(&self) -> Option<ProbeOutcome> {
         self.outcome
+    }
+
+    /// The accepted job id for hog `index`, while it is still live.
+    ///
+    /// The native binary must not keep its own copy: a second record of which
+    /// job belongs to which hog is a second thing that can be wrong, and the
+    /// scenario already rejects an uncorrelated reply.
+    pub const fn hog_job(&self, index: usize) -> Option<u64> {
+        if index >= MAX_HOGS {
+            return None;
+        }
+        self.hog_jobs[index]
+    }
+
+    /// The job id of the progress child currently being proved.
+    pub const fn progress_job(&self) -> Option<u64> {
+        self.progress_job
     }
 
     /// Hogs whose launch was accepted, in launch order. A stalled run reports
@@ -247,6 +278,11 @@ impl SaturationProbe {
 
     pub fn observe_progress_rejected(&mut self, after_hog: usize, status: u32) {
         self.fail(ProbeFailure::ProgressRejected { after_hog, status });
+    }
+
+    /// Records that the progress launch drew no reply inside the bound.
+    pub fn observe_progress_accept_timeout(&mut self, after_hog: usize) {
+        self.fail(ProbeFailure::ProgressAcceptTimeout { after_hog });
     }
 
     /// Records the progress child's terminal result. `code` must be zero for a
@@ -358,6 +394,7 @@ pub mod record {
     pub const FAIL_PROGRESS_NOT_NORMAL_ZERO: u32 = 5;
     pub const FAIL_CLEANUP_INCOMPLETE: u32 = 6;
     pub const FAIL_UNCORRELATED: u32 = 7;
+    pub const FAIL_PROGRESS_ACCEPT_TIMEOUT: u32 = 8;
 
     pub const fn step_ordinal(step: ProbeStep) -> u32 {
         match step {
@@ -402,6 +439,9 @@ pub mod record {
             ProbeFailure::CleanupIncomplete { index } => (FAIL_CLEANUP_INCOMPLETE, index as u32, 0),
             ProbeFailure::Uncorrelated { expected, observed } => {
                 (FAIL_UNCORRELATED, expected as u32, observed)
+            }
+            ProbeFailure::ProgressAcceptTimeout { after_hog } => {
+                (FAIL_PROGRESS_ACCEPT_TIMEOUT, after_hog as u32, 0)
             }
         }
     }
@@ -488,5 +528,124 @@ pub mod record {
             },
         );
         writer.bytes
+    }
+}
+
+/// Bootfs paths the probe launches. Declared here so the probe binary, the
+/// launch policy and the product builder cannot drift apart: a path typo would
+/// surface as `HogRejected` and read like a scheduler result.
+pub const HOG_PATH: &str = "bin/r1-hog";
+
+/// The progress child. Section 8.1 wants an *independent* process proving
+/// progress, and the existing smoke payload is the smallest thing that exits
+/// normal-zero without any authority of its own.
+pub const PROGRESS_PATH: &str = "bin/hello";
+
+/// Launch parameters the native probe binary must not invent.
+///
+/// The plan reaches the probe as launch arguments and the build nonce as a
+/// build-time constant, so both are parsed here rather than in the binary:
+/// a `no_main` payload cannot be host tested, and these two parses are exactly
+/// where a product could silently run a different topology than its report
+/// claims, or emit records the kernel collector will refuse.
+pub mod launch_parameters {
+    use super::{MAX_HOGS, ProbePlan};
+
+    /// The only plans a product may run. Section 8.1 fixes both, and refusing
+    /// anything else is what keeps a report's topology fields trustworthy.
+    pub const ACCEPTED_PLANS: [ProbePlan; 2] = [ProbePlan::SMP, ProbePlan::CONTROL];
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum ParameterError {
+        /// Not exactly the two decimal arguments the plan needs.
+        WrongArgumentCount,
+        /// An argument was empty, over-long, or not canonical decimal.
+        Malformed,
+        /// A parsed plan is not one of the two accepted ones.
+        UnacceptedPlan,
+        /// The build nonce was not exactly sixteen uppercase hex digits.
+        MalformedNonce,
+        /// The build nonce was zero, which the kernel collector refuses.
+        ZeroNonce,
+    }
+
+    /// Parses canonical decimal with no sign, no leading zero, and a bound.
+    /// Rejecting `007` matters: two spellings of one topology would let two
+    /// products claim the same identity.
+    const fn parse_decimal(text: &str, limit: usize) -> Result<usize, ParameterError> {
+        let bytes = text.as_bytes();
+        if bytes.is_empty() || bytes.len() > 2 {
+            return Err(ParameterError::Malformed);
+        }
+        if bytes.len() > 1 && bytes[0] == b'0' {
+            return Err(ParameterError::Malformed);
+        }
+        let mut value = 0_usize;
+        let mut index = 0;
+        while index < bytes.len() {
+            let digit = bytes[index];
+            if digit < b'0' || digit > b'9' {
+                return Err(ParameterError::Malformed);
+            }
+            value = value * 10 + (digit - b'0') as usize;
+            index += 1;
+        }
+        if value > limit {
+            return Err(ParameterError::Malformed);
+        }
+        Ok(value)
+    }
+
+    /// `arguments` is the probe's argv tail: hog count, then online CPUs.
+    pub const fn parse_plan(arguments: &[&str]) -> Result<ProbePlan, ParameterError> {
+        if arguments.len() != 2 {
+            return Err(ParameterError::WrongArgumentCount);
+        }
+        let hog_count = match parse_decimal(arguments[0], MAX_HOGS) {
+            Ok(value) => value,
+            Err(error) => return Err(error),
+        };
+        let online_cpus = match parse_decimal(arguments[1], 64) {
+            Ok(value) => value,
+            Err(error) => return Err(error),
+        };
+        let plan = ProbePlan {
+            hog_count,
+            online_cpus,
+        };
+        let mut index = 0;
+        while index < ACCEPTED_PLANS.len() {
+            let accepted = ACCEPTED_PLANS[index];
+            if accepted.hog_count == plan.hog_count && accepted.online_cpus == plan.online_cpus {
+                return Ok(plan);
+            }
+            index += 1;
+        }
+        Err(ParameterError::UnacceptedPlan)
+    }
+
+    /// Parses the sixteen-uppercase-hex-digit build nonce the kernel collector
+    /// was compiled with. Usable in `const` context so a malformed nonce stops
+    /// the build rather than producing a probe whose every record is refused.
+    pub const fn parse_nonce(text: &str) -> Result<u64, ParameterError> {
+        let bytes = text.as_bytes();
+        if bytes.len() != 16 {
+            return Err(ParameterError::MalformedNonce);
+        }
+        let mut value = 0_u64;
+        let mut index = 0;
+        while index < 16 {
+            let digit = match bytes[index] {
+                byte @ b'0'..=b'9' => (byte - b'0') as u64,
+                byte @ b'A'..=b'F' => (byte - b'A' + 10) as u64,
+                _ => return Err(ParameterError::MalformedNonce),
+            };
+            value = (value << 4) | digit;
+            index += 1;
+        }
+        if value == 0 {
+            return Err(ParameterError::ZeroNonce);
+        }
+        Ok(value)
     }
 }
