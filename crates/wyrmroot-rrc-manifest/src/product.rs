@@ -105,6 +105,22 @@ pub type Wyr1bProductProfile<'a> = Wyr1aProductProfile<'a>;
 /// devmgr its distinct resident device-coordinator startup profile.
 pub type Wyr1cProductProfile<'a> = Wyr1aProductProfile<'a>;
 
+/// Reset card R1 reuses WYR1-C1's role graph without change.
+///
+/// Its product early-activates registryd as the resident `BootstrapRegistry`
+/// and devmgr as the resident `DeviceCoordinator`, and leaves uart16550d,
+/// consoled and wyrmsh `Retained` — which is exactly C1's graph. Reset plan
+/// §8.1 excludes UART recovery, console pressure and shell parsing from this
+/// card, so those three staying non-launchable is the requirement rather than
+/// an omission, and reusing C1's validator is what enforces it: a manifest that
+/// granted wyrmsh its production profile would be refused here rather than
+/// merely unused.
+///
+/// This is an alias, not a second copy of the rules. The card gets a named
+/// entry point so its intent is recorded and a future divergence has somewhere
+/// to live, while the graph it validates stays literally the same code.
+pub type R1ProductProfile<'a> = Wyr1cProductProfile<'a>;
+
 /// WYR1-E selected-product inputs. The production shell identity is supplied
 /// independently of WRRM so admission cannot accept a consistently substituted
 /// retained-stub identity in the manifest and closure inventory.
@@ -200,6 +216,24 @@ impl<'a> Manifest<'a> {
         self.validate_product_role_edges()?;
         self.validate_expected_closure(profile.expected_closure)?;
         validate_observed_materials(profile.expected_closure, profile.observed_materials)
+    }
+
+    /// Parses structural WRRM v1 and then applies reset card R1's product role
+    /// graph, which is WYR1-C1's.
+    pub fn parse_r1_product(
+        bytes: &'a [u8],
+        expected_boot_generation: &[u8; 32],
+        profile: R1ProductProfile<'_>,
+    ) -> Result<Self, ProductError> {
+        Self::parse_wyr1c_product(bytes, expected_boot_generation, profile)
+    }
+
+    /// Validates reset card R1's product graph. Delegates to the C1 validator
+    /// deliberately: R1 requires the same resident registry and device
+    /// coordinator and the same three non-launchable roles, and a divergence
+    /// should be a deliberate edit here rather than a drift between two copies.
+    pub fn validate_r1_product(self, profile: R1ProductProfile<'_>) -> Result<(), ProductError> {
+        self.validate_wyr1c_product(profile)
     }
 
     /// Parses structural WRRM v1 and applies the exact WYR1-E selected-product

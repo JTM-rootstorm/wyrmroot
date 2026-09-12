@@ -14,6 +14,7 @@ pub mod content;
 pub mod launch_policy;
 mod limits;
 pub mod path;
+pub mod r1;
 #[cfg(feature = "builder")]
 pub mod wyr1;
 

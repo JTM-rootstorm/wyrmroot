@@ -16,6 +16,11 @@ default = []
 # scenario itself stays host testable with no features enabled.
 native-payloads = []
 
+[dev-dependencies]
+# Only to assert that this crate's hog path is the one the existing payload
+# validates; nothing here links it.
+wyrmroot-dw1b-preemption = { path = "../dw1b-preemption" }
+
 [dependencies]
 deepwyrm-syscall.workspace = true
 wyrmroot-launch-proto = { path = "../../crates/wyrmroot-launch-proto" }
@@ -26,13 +31,6 @@ wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }
 [[bin]]
 name = "wyrmroot-r1-probe"
 path = "src/bin/probe.rs"
-test = false
-bench = false
-required-features = ["native-payloads"]
-
-[[bin]]
-name = "wyrmroot-r1-hog"
-path = "src/bin/hog.rs"
 test = false
 bench = false
 required-features = ["native-payloads"]

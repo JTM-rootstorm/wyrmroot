@@ -20,5 +20,6 @@ pub use format::{
 pub use product::{
     ExpectedClosureEntry, ExpectedClosureUse, ExpectedObservedIdentity, ImmutableDependencyKind,
     MaterialResidence, ObservedRetainedMaterial, ProductError, ProductReceiptIdentities,
-    Wyr1aProductProfile, Wyr1bProductProfile, Wyr1cProductProfile, Wyr1eProductProfile,
+    R1ProductProfile, Wyr1aProductProfile, Wyr1bProductProfile, Wyr1cProductProfile,
+    Wyr1eProductProfile,
 };

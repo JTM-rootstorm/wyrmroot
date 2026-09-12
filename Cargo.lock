@@ -338,6 +338,7 @@ name = "wyrmroot-r1-saturation"
 version = "0.0.0"
 dependencies = [
  "deepwyrm-syscall",
+ "wyrmroot-dw1b-preemption",
  "wyrmroot-launch-proto",
  "wyrmroot-loader",
  "wyrmroot-registry-proto",

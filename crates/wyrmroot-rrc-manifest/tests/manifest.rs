@@ -1211,3 +1211,72 @@ fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
 fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
+
+#[test]
+fn r1_accepts_the_c1_graph_and_nothing_wider() {
+    let expected = expected_product_closure();
+    let observed = observed_product_materials();
+    let profile = product_profile(&expected, &observed);
+    let c1 = wyr1c_product_builder()
+        .build_wyr1c_product(profile)
+        .unwrap();
+
+    // Reset card R1 needs a resident registry and a resident device
+    // coordinator, and needs uart16550d, consoled and wyrmsh to stay
+    // non-launchable. That is C1's graph exactly, so R1 validates C1's product.
+    let parsed = Manifest::parse_r1_product(&c1, &BOOT_IDENTITY, profile).unwrap();
+    assert_eq!(
+        parsed.role(RoleId::Registryd).unwrap().startup_profile(),
+        StartupProfile::BootstrapRegistry
+    );
+    assert_eq!(
+        parsed.role(RoleId::Devmgr).unwrap().startup_profile(),
+        StartupProfile::DeviceCoordinator
+    );
+    for excluded in [RoleId::Uart16550d, RoleId::Consoled, RoleId::Wyrmsh] {
+        assert_eq!(
+            parsed.role(excluded).unwrap().startup_profile(),
+            StartupProfile::Retained,
+            "reset plan §8.1 excludes {excluded:?} from card R1"
+        );
+    }
+}
+
+#[test]
+fn r1_refuses_a_product_that_grants_the_shell_its_production_profile() {
+    let expected = expected_product_closure();
+    let observed = observed_product_materials();
+    let profile = product_profile(&expected, &observed);
+
+    // The exclusion is enforced rather than conventional: an E-shaped product,
+    // which differs from C1 only by giving wyrmsh its launchable profile, is
+    // refused for R1. Card R1 forbids shell parsing, and a product that shipped
+    // a launchable shell would satisfy no R1 requirement while widening the
+    // authority present in the image.
+    let e = wyr1e_product_builder([0x55; 32])
+        .build_wyr1e_product(wyr1e_product_profile(&expected, &observed, [0x55; 32]))
+        .unwrap();
+    assert_eq!(
+        Manifest::parse_structural(&e, &BOOT_IDENTITY)
+            .unwrap()
+            .validate_r1_product(profile),
+        Err(ProductError::WrongRoleActivationProfile)
+    );
+
+    // And the narrower historical graphs are refused too, so R1 cannot be
+    // satisfied by a product whose registry or device coordinator never became
+    // resident: the probe's launch-session grant depends on both.
+    for narrower in [
+        wyr1b_product_builder()
+            .build_wyr1b_product(profile)
+            .unwrap(),
+        product_builder(false).build_wyr1a_product(profile).unwrap(),
+    ] {
+        assert_eq!(
+            Manifest::parse_structural(&narrower, &BOOT_IDENTITY)
+                .unwrap()
+                .validate_r1_product(profile),
+            Err(ProductError::WrongRoleActivationProfile)
+        );
+    }
+}

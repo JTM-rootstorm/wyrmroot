@@ -640,7 +640,15 @@ pub mod record {
 /// Bootfs paths the probe launches. Declared here so the probe binary, the
 /// launch policy and the product builder cannot drift apart: a path typo would
 /// surface as `HogRejected` and read like a scheduler result.
-pub const HOG_PATH: &str = "bin/r1-hog";
+///
+/// The hog is the **existing** `bin/cpu-hog` payload
+/// (`wyrmroot-job-cpu-hog`), not a new actor. It is already a JobV2-launchable
+/// no-yield spinner that validates its bootstrap channel, answers `INIT` with
+/// `READY`, and then never makes another syscall — exactly what section 8.1
+/// specifies — and `§3`'s artifact list names `cpu-hog.elf` for that reason. It
+/// also validates its own entry shape as `argc == 1`, `argv[0] == "bin/cpu-hog"`
+/// and `envc == 0`, which is what this probe's launch encodes.
+pub const HOG_PATH: &str = "bin/cpu-hog";
 
 /// The progress child. Section 8.1 wants an *independent* process proving
 /// progress, and the existing smoke payload is the smallest thing that exits

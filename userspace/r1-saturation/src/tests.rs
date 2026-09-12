@@ -638,3 +638,15 @@ mod header_round_trip {
         assert_eq!(parse_header(&nonce), Err(HeaderError::ZeroNonce));
     }
 }
+
+#[test]
+fn the_probe_launches_the_existing_cpu_hog_payload() {
+    // Reusing it rather than minting an R1-specific hog keeps one payload
+    // identity in the policy and one artifact in §3's list. The path is the
+    // contract between them, and the existing payload refuses to start if its
+    // argv[0] is anything else, so a drift here would surface as the hog
+    // exiting immediately — indistinguishable from a scheduler result.
+    assert_eq!(HOG_PATH, wyrmroot_dw1b_preemption::JOB_CPU_HOG_PATH);
+    // The progress child is the ordinary smoke payload, launched the same way.
+    assert_eq!(PROGRESS_PATH, "bin/hello");
+}
