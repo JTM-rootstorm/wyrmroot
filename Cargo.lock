@@ -390,6 +390,7 @@ dependencies = [
  "wyrmroot-dw1e3-com2-test",
  "wyrmroot-launch-proto",
  "wyrmroot-loader",
+ "wyrmroot-r1-saturation",
  "wyrmroot-registry-proto",
  "wyrmroot-rrc-manifest",
  "wyrmroot-runtime",

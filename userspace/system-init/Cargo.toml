@@ -36,6 +36,14 @@ wyr1e8-selector33 = [
     "wyrmroot-consoled/wyr1e8-recovery",
     "wyrmroot-runtime/wyr1e8-test-evidence",
 ]
+# Reset card R1. Deliberately minimal, like wyr1b-test-evidence: the product
+# early-activates only Registryd and Devmgr, so it needs no console, shell or
+# recovery feature, and adding one would contradict section 8.1's exclusions.
+r1-selector34 = [
+    "native-init",
+    "dep:wyrmroot-r1-saturation",
+    "wyrmroot-runtime/r1-test-evidence",
+]
 dw1e3-selector31 = [
     "wyr1c5-production",
     "dep:wyrmroot-dw1e3-com2-test",
@@ -50,6 +58,7 @@ wyrmroot-consoled = { path = "../consoled", optional = true }
 wyrmroot-dw1e3-com2-test = { path = "../dw1e3-com2-test", optional = true }
 wyrmroot-loader = { path = "../../crates/wyrmroot-loader" }
 wyrmroot-launch-proto = { path = "../../crates/wyrmroot-launch-proto" }
+wyrmroot-r1-saturation = { path = "../r1-saturation", optional = true }
 wyrmroot-registry-proto = { path = "../../crates/wyrmroot-registry-proto" }
 wyrmroot-rrc-manifest = { path = "../../crates/wyrmroot-rrc-manifest" }
 wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime" }

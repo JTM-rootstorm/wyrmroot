@@ -550,3 +550,91 @@ fn a_silent_progress_launch_is_not_reported_as_a_refusal() {
         (record::FAIL_PROGRESS_ACCEPT_TIMEOUT, 3, 0)
     );
 }
+
+mod header_round_trip {
+    use crate::record::{
+        BYTES, Header, HeaderError, KIND_FAILED, KIND_STEP, KIND_TERMINAL, encode_failure,
+        encode_step, encode_terminal, parse_header,
+    };
+    use crate::{ProbeFailure, ProbeOutcome, ProbePlan, ProbeStep};
+
+    const NONCE: u64 = 0x8100_0000_0000_0001;
+
+    #[test]
+    fn every_encoder_produces_a_parseable_header() {
+        let step = encode_step(
+            1,
+            NONCE,
+            ProbePlan::SMP,
+            ProbeStep::LaunchHog { index: 2 },
+            77,
+        );
+        assert_eq!(
+            parse_header(&step),
+            Ok(Header {
+                kind: KIND_STEP,
+                sequence: 1,
+                nonce: NONCE,
+                online_cpus: 4,
+                hog_count: 6,
+            })
+        );
+        let failure = encode_failure(
+            2,
+            NONCE,
+            ProbePlan::CONTROL,
+            ProbeFailure::HogAcceptTimeout { index: 0 },
+        );
+        assert_eq!(
+            parse_header(&failure),
+            Ok(Header {
+                kind: KIND_FAILED,
+                sequence: 2,
+                nonce: NONCE,
+                online_cpus: 1,
+                hog_count: 3,
+            })
+        );
+        let terminal = encode_terminal(3, NONCE, ProbePlan::SMP, ProbeOutcome::Passed, 36);
+        assert_eq!(
+            parse_header(&terminal).map(|header| header.kind),
+            Ok(KIND_TERMINAL)
+        );
+    }
+
+    #[test]
+    fn the_parser_refuses_what_the_collector_would_refuse() {
+        let good = encode_step(1, NONCE, ProbePlan::SMP, ProbeStep::Complete, 0);
+        assert_eq!(
+            parse_header(&good[..BYTES - 1]),
+            Err(HeaderError::WrongLength)
+        );
+        assert_eq!(parse_header(&[]), Err(HeaderError::WrongLength));
+
+        let mut magic = good;
+        magic[2] = b'X';
+        assert_eq!(parse_header(&magic), Err(HeaderError::WrongMagic));
+
+        let mut version = good;
+        version[4] = 2;
+        assert_eq!(parse_header(&version), Err(HeaderError::UnsupportedVersion));
+
+        let mut kind = good;
+        kind[8] = 9;
+        assert_eq!(parse_header(&kind), Err(HeaderError::UnknownKind));
+
+        // A record that lies about its own size would let a relay forward a
+        // frame the collector measures differently.
+        let mut size = good;
+        size[12] = 32;
+        assert_eq!(parse_header(&size), Err(HeaderError::SizeMismatch));
+
+        let mut sequence = good;
+        sequence[16..24].copy_from_slice(&0_u64.to_le_bytes());
+        assert_eq!(parse_header(&sequence), Err(HeaderError::ZeroSequence));
+
+        let mut nonce = good;
+        nonce[24..32].copy_from_slice(&0_u64.to_le_bytes());
+        assert_eq!(parse_header(&nonce), Err(HeaderError::ZeroNonce));
+    }
+}

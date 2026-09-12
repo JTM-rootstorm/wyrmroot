@@ -472,6 +472,112 @@ pub mod record {
         }
     }
 
+    /// The fixed header every record carries, as read back by a relay.
+    ///
+    /// Decoding lives beside the encoder on purpose: system-init must check the
+    /// topology fields against the plan it actually launched, and a second
+    /// hand-written copy of these offsets in the supervisor would be a second
+    /// thing that can drift from the wire format.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct Header {
+        pub kind: u32,
+        pub sequence: u64,
+        pub nonce: u64,
+        pub online_cpus: u32,
+        pub hog_count: u32,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum HeaderError {
+        /// Not exactly `BYTES` long.
+        WrongLength,
+        /// Missing the `R1SP` magic.
+        WrongMagic,
+        /// Not major 1 minor 0.
+        UnsupportedVersion,
+        /// The self-declared size disagreed with the record length.
+        SizeMismatch,
+        /// Not one of the three defined kinds.
+        UnknownKind,
+        /// A record claimed sequence zero; the collector counts from one.
+        ZeroSequence,
+        /// A record carried the zero nonce the collector refuses.
+        ZeroNonce,
+    }
+
+    const fn u16_at(bytes: &[u8; BYTES], offset: usize) -> u16 {
+        u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
+    }
+
+    const fn u32_from(bytes: &[u8; BYTES], offset: usize) -> u32 {
+        u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ])
+    }
+
+    const fn u64_from(bytes: &[u8; BYTES], offset: usize) -> u64 {
+        u64::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
+        ])
+    }
+
+    /// Validates the fixed header of one record and returns what a relay needs.
+    /// This does **not** authenticate the record: the nonce check that matters
+    /// is the kernel collector's, against the nonce it was compiled with.
+    pub const fn parse_header(bytes: &[u8]) -> Result<Header, HeaderError> {
+        if bytes.len() != BYTES {
+            return Err(HeaderError::WrongLength);
+        }
+        let mut fixed = [0_u8; BYTES];
+        let mut index = 0;
+        while index < BYTES {
+            fixed[index] = bytes[index];
+            index += 1;
+        }
+        let mut magic = 0;
+        while magic < MAGIC.len() {
+            if fixed[magic] != MAGIC[magic] {
+                return Err(HeaderError::WrongMagic);
+            }
+            magic += 1;
+        }
+        if u16_at(&fixed, 4) != MAJOR || u16_at(&fixed, 6) != MINOR {
+            return Err(HeaderError::UnsupportedVersion);
+        }
+        let kind = u32_from(&fixed, 8);
+        if kind != KIND_STEP && kind != KIND_FAILED && kind != KIND_TERMINAL {
+            return Err(HeaderError::UnknownKind);
+        }
+        if u32_from(&fixed, 12) as usize != BYTES {
+            return Err(HeaderError::SizeMismatch);
+        }
+        let sequence = u64_from(&fixed, 16);
+        if sequence == 0 {
+            return Err(HeaderError::ZeroSequence);
+        }
+        let nonce = u64_from(&fixed, 24);
+        if nonce == 0 {
+            return Err(HeaderError::ZeroNonce);
+        }
+        Ok(Header {
+            kind,
+            sequence,
+            nonce,
+            online_cpus: u32_from(&fixed, 32),
+            hog_count: u32_from(&fixed, 36),
+        })
+    }
+
     /// Encodes one observed step. Offsets 32/36 carry the topology so a report
     /// can never be misread as a different profile.
     pub fn encode_step(

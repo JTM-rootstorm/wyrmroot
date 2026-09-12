@@ -25,6 +25,8 @@ use {wyrmroot_devmgr as _, wyrmroot_uart16550d as _};
 
 pub mod evidence;
 pub mod gate;
+#[cfg(feature = "r1-selector34")]
+pub mod r1_relay;
 pub mod wyr1b;
 pub mod wyr1b_gate;
 mod wyr1b_job;

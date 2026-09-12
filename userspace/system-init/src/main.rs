@@ -16,6 +16,8 @@ use wyrmroot_device_proto as _;
 use wyrmroot_dw1e3_com2_test as _;
 use wyrmroot_launch_proto as _;
 use wyrmroot_loader as _;
+#[cfg(feature = "r1-selector34")]
+use wyrmroot_r1_saturation as _;
 use wyrmroot_registry_proto as _;
 use wyrmroot_rrc_manifest as _;
 #[cfg(any(
@@ -180,6 +182,19 @@ impl Wyr1BPlatform for NativeSystem {
     #[cfg(feature = "wyr1e8-selector33")]
     fn submit_wyr1e8_evidence(&mut self, record: &[u8; 192]) -> Result<(), NativeError> {
         wyrmroot_runtime::submit_wyr1e8_evidence(record)
+    }
+}
+
+/// Reset card R1's evidence seam. The whole native side of the relay is this
+/// one call: the decision to forward, and every refusal, lives in
+/// `r1_relay` where it is host tested against a capturing double.
+#[cfg(feature = "r1-selector34")]
+impl wyrmroot_system_init::r1_relay::R1EvidenceSink for NativeSystem {
+    fn submit_r1_evidence(
+        &mut self,
+        record: &[u8; wyrmroot_runtime::R1_EVIDENCE_RECORD_BYTES],
+    ) -> Result<(), NativeError> {
+        wyrmroot_runtime::submit_r1_evidence(record)
     }
 }
 
