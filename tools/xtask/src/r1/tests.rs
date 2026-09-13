@@ -143,3 +143,110 @@ fn the_boot_generation_separates_this_card_from_c1_and_from_another_nonce() {
     assert_ne!(r1, c1);
     assert_ne!(r1, other_nonce);
 }
+
+mod domain {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn render(vcpus: u8, port: u16) -> (String, PathBuf) {
+        let root = PathBuf::from("/home/mike/Documents/Programming/OS-Project");
+        let product = root.join("artifacts/r1-260912");
+        let output = product.join(if vcpus == 1 { "control" } else { "smp" });
+        let xml = domain_xml(
+            vcpus,
+            port,
+            &product.join("artifacts/OVMF_CODE.fd"),
+            &product.join("artifacts/r1-esp.img"),
+            &output.join("OVMF_VARS.fd"),
+        );
+        (xml, output)
+    }
+
+    /// Every check `tools/run-active-gdb-vm.sh` performs on the XML it is handed,
+    /// asserted here so the harness cannot refuse a generated domain at run time —
+    /// which under the lease would waste an accepted request.
+    #[test]
+    fn the_domain_satisfies_every_check_the_gdb_harness_makes() {
+        let (xml, output) = render(4, 1240);
+        assert!(xml.contains("<name>OS-Project</name>"));
+        assert!(xml.contains(&format!("<uuid>{DOMAIN_UUID}</uuid>")));
+        assert!(xml.contains("<qemu:arg value=\"-S\"/>"));
+        assert!(xml.contains("<qemu:arg value=\"tcp:127.0.0.1:1240\"/>"));
+        assert!(xml.contains(&format!(
+            "<source file=\"{}\"",
+            output.join("OVMF_VARS.fd").display()
+        )));
+        // The harness rejects any file containing one. C6's domain carries them
+        // on nvram and disk because its runner owns those descriptors.
+        assert!(
+            !xml.contains(" fdgroup="),
+            "the GDB harness refuses runner-owned fdgroup annotations"
+        );
+    }
+
+    #[test]
+    fn the_gdbstub_port_is_the_one_the_operator_passes() {
+        // The port is baked into the XML and also passed to the harness
+        // separately. If they disagreed, the attach would hang until the timeout
+        // and the run would look like a guest stall.
+        for port in [1240_u16, 1236, 65535] {
+            let (xml, _) = render(4, port);
+            assert!(xml.contains(&format!("<qemu:arg value=\"tcp:127.0.0.1:{port}\"/>")));
+            assert_eq!(
+                xml.matches("tcp:127.0.0.1:").count(),
+                1,
+                "exactly one gdbstub endpoint"
+            );
+        }
+    }
+
+    #[test]
+    fn each_profile_declares_its_own_exact_width() {
+        // §4 rejects a run at a different width outright: A27's diagnosis depends
+        // on the exact topology, so the domain must state it rather than inherit
+        // whatever the domain was last defined with.
+        let (smp, _) = render(4, 1240);
+        let (control, _) = render(1, 1240);
+        assert!(smp.contains("<vcpu placement=\"static\">4</vcpu>"));
+        assert!(control.contains("<vcpu placement=\"static\">1</vcpu>"));
+        assert_ne!(smp, control);
+    }
+
+    #[test]
+    fn the_selector_and_test_id_reach_the_guest_by_firmware_config() {
+        let (xml, _) = render(4, 1240);
+        assert!(xml.contains(
+            "<entry name=\"opt/org.deepwyrm.test.selector\">dynamic-launch-saturation</entry>"
+        ));
+        assert!(xml.contains("<entry name=\"opt/org.deepwyrm.test.test_id\">34</entry>"));
+        assert_eq!(TEST_ID, 34);
+        assert_eq!(SELECTOR, "dynamic-launch-saturation");
+    }
+
+    #[test]
+    fn com2_is_null_and_the_transcript_leaves_over_com1() {
+        let (xml, _) = render(4, 1240);
+        // §8.1 excludes COM2 conversation from this card. A socket here would
+        // create a second channel the card has no protocol for.
+        assert!(xml.contains("<serial type=\"null\"><target type=\"isa-serial\" port=\"1\"/>"));
+        assert!(!xml.contains("com2"));
+        assert!(!xml.contains("type=\"unix\""));
+        assert!(xml.contains("<serial type=\"pty\"><target type=\"isa-serial\" port=\"0\"/>"));
+        // isa-debug-exit is how the kernel completes a run.
+        assert!(xml.contains("isa-debug-exit,iobase=0xf4,iosize=0x04"));
+    }
+
+    #[test]
+    fn the_nvram_path_is_the_per_run_copy_the_harness_makes() {
+        // The harness refuses to start if <output>/OVMF_VARS.fd already exists,
+        // and makes the copy itself. So prepare must reference that path and must
+        // not create the file. Both profiles must point at their own copy, or one
+        // run would inherit the other's variables.
+        let (smp, smp_output) = render(4, 1240);
+        let (control, control_output) = render(1, 1240);
+        assert!(smp.contains(&smp_output.join("OVMF_VARS.fd").display().to_string()));
+        assert!(control.contains(&control_output.join("OVMF_VARS.fd").display().to_string()));
+        assert!(!smp.contains(&control_output.join("OVMF_VARS.fd").display().to_string()));
+        assert_ne!(smp_output, control_output);
+    }
+}

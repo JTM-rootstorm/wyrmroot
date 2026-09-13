@@ -641,3 +641,98 @@ fn validate_nonce(nonce: &str) -> Result<(), Failure> {
 
 #[cfg(test)]
 mod tests;
+
+// The domain seam below has no caller until `r1 prepare` lands; it is written
+// and tested first because its contract is the GDB harness's, and a domain the
+// harness refuses would waste an accepted request under the lease. The same
+// pattern as `wyr1c::build_c6_snapshot`, which is a seam for `wyr1c6::prepare`.
+/// The designated domain's fixed identity. Card R1 runs under the same domain as
+/// every other card; the lease and the baseline XML are what make that safe.
+#[allow(
+    dead_code,
+    reason = "domain seam consumed by the follow-on r1 prepare command"
+)]
+pub(crate) const DOMAIN_UUID: &str = "33005e22-d7c2-4b13-b1ac-b82eda95e584";
+#[allow(
+    dead_code,
+    reason = "domain seam consumed by the follow-on r1 prepare command"
+)]
+pub(crate) const MACHINE: &str = "pc-q35-10.2";
+#[allow(
+    dead_code,
+    reason = "domain seam consumed by the follow-on r1 prepare command"
+)]
+pub(crate) const SELECTOR: &str = "dynamic-launch-saturation";
+#[allow(
+    dead_code,
+    reason = "domain seam consumed by the follow-on r1 prepare command"
+)]
+pub(crate) const TEST_ID: u32 = 34;
+/// Two GiB, matching every other card's guest.
+#[allow(
+    dead_code,
+    reason = "domain seam consumed by the follow-on r1 prepare command"
+)]
+const MEMORY_KIB: u32 = 2_097_152;
+
+/// Renders one profile's libvirt domain for a **GDB-attached** run.
+///
+/// This is not C6's domain XML with a different vCPU count, and the differences
+/// are the whole point. `tools/run-active-gdb-vm.sh` greps the file it is handed
+/// and refuses it unless every one of these holds, so they are encoded here and
+/// asserted in `tests`:
+///
+/// * `<name>OS-Project</name>` and the fixed UUID, so the harness can only ever
+///   define the designated domain;
+/// * `<qemu:arg value="-S"/>` and `tcp:127.0.0.1:<port>`, because the guest must
+///   start stopped with the gdbstub listening — §5.2's three carrier facts are
+///   unreadable any other way;
+/// * the nvram source is `<output>/OVMF_VARS.fd`, the per-run copy the harness
+///   makes itself. Prepare must **not** create that file: the harness refuses to
+///   run if it already exists, so a pre-staged copy would fail every run;
+/// * **no `fdgroup=` annotations.** C6's domain carries them on nvram and disk
+///   because its runner owns those descriptors; the GDB harness rejects any file
+///   containing one.
+///
+/// COM2 is `null` rather than a socket. §8.1 excludes COM2 conversation from this
+/// card entirely, and the evidence transcript leaves over COM1.
+#[allow(
+    dead_code,
+    reason = "domain seam consumed by the follow-on r1 prepare command"
+)]
+pub(crate) fn domain_xml(vcpus: u8, port: u16, code: &Path, esp: &Path, vars: &Path) -> String {
+    format!(
+        "<domain xmlns:qemu=\"http://libvirt.org/schemas/domain/qemu/1.0\" type=\"qemu\">\n  \
+         <name>OS-Project</name>\n  <uuid>{DOMAIN_UUID}</uuid>\n  \
+         <memory unit=\"KiB\">{MEMORY_KIB}</memory>\
+         <currentMemory unit=\"KiB\">{MEMORY_KIB}</currentMemory>\
+         <vcpu placement=\"static\">{vcpus}</vcpu>\n  \
+         <sysinfo type=\"fwcfg\">\
+         <entry name=\"opt/org.deepwyrm.test.selector\">{SELECTOR}</entry>\
+         <entry name=\"opt/org.deepwyrm.test.test_id\">{TEST_ID}</entry></sysinfo>\n  \
+         <os><type arch=\"x86_64\" machine=\"{MACHINE}\">hvm</type>\
+         <loader readonly=\"yes\" secure=\"no\" type=\"pflash\" format=\"raw\">{}</loader>\
+         <nvram type=\"file\" format=\"raw\"><source file=\"{}\"/></nvram>\
+         <boot dev=\"hd\"/></os>\n  \
+         <features><acpi/><apic/></features>\
+         <clock offset=\"utc\"><timer name=\"rtc\" tickpolicy=\"catchup\"/>\
+         <timer name=\"pit\" tickpolicy=\"delay\"/><timer name=\"hpet\" present=\"no\"/></clock>\
+         <on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot>\
+         <on_crash>destroy</on_crash>\
+         <pm><suspend-to-mem enabled=\"no\"/><suspend-to-disk enabled=\"no\"/></pm>\
+         <devices><emulator>/usr/bin/qemu-system-x86_64</emulator>\
+         <disk type=\"file\" device=\"disk\"><driver name=\"qemu\" type=\"raw\"/>\
+         <source file=\"{}\"/><target dev=\"vda\" bus=\"virtio\"/><readonly/></disk>\
+         <controller type=\"pci\" index=\"0\" model=\"pcie-root\"/>\
+         <serial type=\"pty\"><target type=\"isa-serial\" port=\"0\"/></serial>\
+         <serial type=\"null\"><target type=\"isa-serial\" port=\"1\"/></serial>\
+         <console type=\"pty\"><target type=\"serial\" port=\"0\"/></console></devices>\n  \
+         <qemu:commandline><qemu:arg value=\"-device\"/>\
+         <qemu:arg value=\"isa-debug-exit,iobase=0xf4,iosize=0x04\"/>\
+         <qemu:arg value=\"-S\"/><qemu:arg value=\"-gdb\"/>\
+         <qemu:arg value=\"tcp:127.0.0.1:{port}\"/></qemu:commandline>\n</domain>\n",
+        code.display(),
+        vars.display(),
+        esp.display(),
+    )
+}
