@@ -359,6 +359,8 @@ const fn test_failure_category(error: &InitError) -> u32 {
         InitError::Wyr1C6GateConfig(_) => 0x1f,
         #[cfg(feature = "wyr1e8-selector33")]
         InitError::E8Transition { .. } => 0x20,
+        #[cfg(feature = "r1-selector34")]
+        InitError::R1Probe(failure) => failure.category(),
     }
 }
 
@@ -379,6 +381,52 @@ pub const fn wyr1_test_failure_application_status(error: &InitError) -> u32 {
     0xAF11_0000 | test_failure_category(error)
 }
 
+/// Why card R1's probe never produced its terminal record, as precisely as the
+/// driver could establish it.
+///
+/// Run 5 reported `Supervision` from two unrelated sites -- the READY handshake
+/// and the report drain -- and both discarded the probe's own normal-exit code,
+/// which is `PROBE_ERROR_BASE | ordinal` and names the exact startup check that
+/// refused. That left the run proving the probe did not report and nothing about
+/// why, which is the same cause-erasing shape the `0xAF34` bases were introduced
+/// to remove, one layer further in. Each variant here is a distinct terminal
+/// status, so a later run says which site failed and, when the kernel recorded
+/// one, with which probe code.
+#[cfg(feature = "r1-selector34")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum R1ProbeFailure {
+    /// The probe exited with its own nonzero application code, kept verbatim.
+    ExitCode(u32),
+    /// The READY handshake failed with no exact terminal record to attribute it
+    /// to: a timeout, or a liveness failure the kernel could not resolve to an
+    /// exit. The probe may still have been running.
+    ReadyUnattributed,
+    /// The probe stopped reporting before its terminal record and its task-state
+    /// record carried no application code -- it had not exited normally, or had
+    /// not exited at all and only closed its channel.
+    DrainUnattributed,
+    /// The probe stopped reporting and the task-state query itself refused, so
+    /// no exit code could be read.
+    DrainQueryFailed,
+}
+
+#[cfg(feature = "r1-selector34")]
+impl R1ProbeFailure {
+    /// Category byte for this failure, continuing `test_failure_category`'s
+    /// sequence so each site is separable in the terminal status.
+    const fn category(self) -> u32 {
+        match self {
+            // `ExitCode` never reaches a category: the status encoder gives it
+            // its own base so the probe's full code survives. It is mapped here
+            // only because `test_failure_category` is total over `InitError`.
+            Self::ExitCode(_) => 0x21,
+            Self::ReadyUnattributed => 0x22,
+            Self::DrainUnattributed => 0x23,
+            Self::DrainQueryFailed => 0x24,
+        }
+    }
+}
+
 /// Selector-34-only status preserving the pre-READY system-init failure category
 /// across the primordial Process-exit boundary.
 ///
@@ -396,6 +444,10 @@ pub const fn wyr1_test_failure_application_status(error: &InitError) -> u32 {
 pub const fn r1_test_failure_application_status(error: &InitError) -> u32 {
     match error {
         InitError::Native(error) => 0xAF35_0000 | wyrmroot_runtime::native_error_code(*error),
+        // The probe's own code, not a category: `PROBE_ERROR_BASE` occupies the
+        // high half, so the low sixteen bits carry the ordinal that identifies
+        // which of its startup checks refused.
+        InitError::R1Probe(R1ProbeFailure::ExitCode(code)) => 0xAF37_0000 | (*code & 0xffff),
         _ => 0xAF34_0000 | test_failure_category(error),
     }
 }
@@ -1027,6 +1079,8 @@ pub enum InitError {
         initiating_kind: u8,
         emergency_cleanup: E8EmergencyCleanup,
     },
+    #[cfg(feature = "r1-selector34")]
+    R1Probe(R1ProbeFailure),
 }
 
 impl From<RestartTransitionError> for InitError {

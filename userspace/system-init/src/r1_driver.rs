@@ -31,6 +31,7 @@ use wyrmroot_loader::process::{LaunchClientLoadRequest, load_launch_client_proce
 use wyrmroot_r1_saturation::record::BYTES as RECORD_BYTES;
 use wyrmroot_r1_saturation::{ProbePlan, launch_parameters};
 use wyrmroot_registry_proto::{Correlation, CorrelationEnvironment};
+use wyrmroot_runtime::{ExitValidationError, ObservedSupervisionError};
 
 /// The probe's launch transaction. One launch, one generation, so this is a
 /// constant rather than an allocator.
@@ -354,7 +355,7 @@ where
             TRANSACTION,
             DwDeadline(deadline),
         )
-        .map_err(|_| InitError::Supervision)
+        .map_err(|error| InitError::R1Probe(probe_failure_before_ready(&error)))
     })();
     if let Err(error) = ready {
         let failed = cleanup_loaded(system, waits, loaded, group, true).is_err()
@@ -381,6 +382,34 @@ where
     })
 }
 
+/// Classifies a failed READY handshake by the probe's own terminal record.
+///
+/// Four of the five variants carry an exact `DwTaskTerminationInfoV1`, and a
+/// normal exit's `application_code` is the probe's `PROBE_ERROR_BASE | ordinal`.
+/// Keeping it is the difference between a run that says the probe never reported
+/// and one that says which of its startup checks refused. A zero code means the
+/// record was not a normal exit -- a fault, or still running -- and there is no
+/// application code to keep, so the site is reported instead.
+fn probe_failure_before_ready(error: &ObservedSupervisionError<NativeError>) -> R1ProbeFailure {
+    let info = match error {
+        // The validator already extracted the code; it is the same field, read
+        // through a variant that proves the exit was structurally normal.
+        ObservedSupervisionError::Exit(ExitValidationError::NonzeroApplicationCode(code), _) => {
+            return R1ProbeFailure::ExitCode(*code);
+        }
+        ObservedSupervisionError::ExitedBeforeReady(info)
+        | ObservedSupervisionError::PeerClosedBeforeReady(info)
+        | ObservedSupervisionError::Exit(_, info)
+        | ObservedSupervisionError::ExitObservedReadiness(_, info) => info,
+        ObservedSupervisionError::Supervision(_) => return R1ProbeFailure::ReadyUnattributed,
+    };
+    if info.application_code == 0 {
+        R1ProbeFailure::ReadyUnattributed
+    } else {
+        R1ProbeFailure::ExitCode(info.application_code)
+    }
+}
+
 /// One tick: service the probe's launches, then drain its report channel.
 fn pump<S, L, W>(
     state: &mut State,
@@ -396,7 +425,7 @@ where
     W: SupervisionPlatform<Error = NativeError>,
 {
     poll_job_dispatcher(system, loader, waits, authority, &mut state.jobs, now_ns)?;
-    drain(state, system, now_ns)?;
+    drain(state, system, waits, now_ns)?;
     if state.relay.complete() {
         return finish(state, system, waits);
     }
@@ -407,9 +436,15 @@ where
 ///
 /// The loop is bounded by the relay's own capacity: a probe that talked past it
 /// is refused by the relay rather than allowed to hold this tick open.
-pub(crate) fn drain<S>(state: &mut State, system: &mut S, now_ns: u64) -> Result<(), InitError>
+pub(crate) fn drain<S, W>(
+    state: &mut State,
+    system: &mut S,
+    waits: &mut W,
+    now_ns: u64,
+) -> Result<(), InitError>
 where
     S: Wyr1BPlatform + R1EvidenceSink,
+    W: SupervisionPlatform<Error = NativeError>,
 {
     for _ in 0..=RELAY_CAPACITY {
         if state.relay.complete() {
@@ -442,8 +477,20 @@ where
         if observed.index != 0 || observed.observed.0 & DW_SIGNAL_READABLE.0 == 0 {
             // The probe exited or closed its channel without its terminal
             // record. A run that stopped reporting is not a run that passed,
-            // and saying so here is the whole point of the card.
-            return Err(InitError::Supervision);
+            // and saying so here is the whole point of the card -- but saying
+            // only that much erases the one datum that explains it, so the
+            // probe's own exit code is read here rather than inferred later.
+            // A live probe that merely closed its channel has no exit code and
+            // is reported as the unattributed drain it is.
+            return Err(InitError::R1Probe(
+                match waits.query_task_termination(state.probe.process) {
+                    Ok(info) if info.application_code != 0 => {
+                        R1ProbeFailure::ExitCode(info.application_code)
+                    }
+                    Ok(_) => R1ProbeFailure::DrainUnattributed,
+                    Err(_) => R1ProbeFailure::DrainQueryFailed,
+                },
+            ));
         }
         let mut bytes = [0_u8; RECORD_BYTES];
         let mut handles = [DwReceivedHandleInfoV1::default(); 1];

@@ -12,6 +12,7 @@ use deepwyrm_syscall::{
     DW_HANDLE_TRANSFER_MOVE, DW_STATUS_TIMED_OUT, DwObjectType, DwRights, DwStatus, DwWaitResultV1,
 };
 use wyrmroot_r1_saturation::record::{encode_step, encode_terminal};
+use wyrmroot_runtime::{ExitObservedReadinessError, SupervisionError};
 use wyrmroot_r1_saturation::{ProbeOutcome, ProbeStep};
 
 const NONCE: u64 = 0x3400_0000_0000_0001;
@@ -242,8 +243,11 @@ impl R1EvidenceSink for Probe {
     }
 }
 
+#[derive(Default)]
 struct Waits {
     exited: bool,
+    application_code: u32,
+    query_fails: bool,
 }
 
 impl SupervisionPlatform for Waits {
@@ -274,12 +278,16 @@ impl SupervisionPlatform for Waits {
         &mut self,
         _process: DwHandle,
     ) -> Result<DwTaskTerminationInfoV1, Self::Error> {
+        if self.query_fails {
+            return Err(FAILURE);
+        }
         Ok(DwTaskTerminationInfoV1 {
             state: if self.exited {
                 DW_TASK_STATE_EXITED
             } else {
                 deepwyrm_syscall::DwTaskState(0)
             },
+            application_code: self.application_code,
             ..DwTaskTerminationInfoV1::default()
         })
     }
@@ -350,7 +358,7 @@ fn a_whole_transcript_reaches_the_collector_in_order_and_ends_once() {
     let terminal = encode_terminal(4, NONCE, plan, ProbeOutcome::Passed, 3);
     system.queue(terminal, 0);
 
-    drain(&mut state, &mut system, 500).expect("a well-formed transcript was refused");
+    drain(&mut state, &mut system, &mut Waits::default(), 500).expect("a well-formed transcript was refused");
     assert_eq!(system.submitted_count, 4);
     for sequence in 1..=3 {
         assert_eq!(
@@ -365,7 +373,7 @@ fn a_whole_transcript_reaches_the_collector_in_order_and_ends_once() {
     // The terminal record is the end of the run: a later tick submits nothing
     // more even with the probe still queueing.
     system.queue(step(5, plan), 0);
-    drain(&mut state, &mut system, 600).expect("a completed run was re-drained as a failure");
+    drain(&mut state, &mut system, &mut Waits::default(), 600).expect("a completed run was re-drained as a failure");
     assert_eq!(system.submitted_count, 4);
 }
 
@@ -373,7 +381,7 @@ fn a_whole_transcript_reaches_the_collector_in_order_and_ends_once() {
 fn an_idle_probe_leaves_the_tick_immediately() {
     let mut state = state(ProbePlan::SMP);
     let mut system = Probe::new();
-    drain(&mut state, &mut system, 500).expect("an idle probe was reported as a failure");
+    drain(&mut state, &mut system, &mut Waits::default(), 500).expect("an idle probe was reported as a failure");
     assert_eq!(system.submitted_count, 0);
     assert_eq!(state.submitted(), 0);
 }
@@ -386,12 +394,92 @@ fn a_probe_that_stops_reporting_before_its_terminal_record_is_a_failure() {
     let mut system = Probe::new();
     system.queue(step(1, plan), 0);
     system.exited = true;
+    // The probe's own exit code is the whole diagnostic value of this branch, so
+    // it is asserted to reach the error verbatim rather than as a category. Run
+    // 5 reported only `Supervision` here and the code was lost.
     assert_eq!(
-        drain(&mut state, &mut system, 500),
-        Err(InitError::Supervision)
+        drain(
+            &mut state,
+            &mut system,
+            &mut Waits {
+                exited: true,
+                application_code: 0x8100_0007,
+                query_fails: false,
+            },
+            500,
+        ),
+        Err(InitError::R1Probe(R1ProbeFailure::ExitCode(0x8100_0007)))
     );
     assert_eq!(system.submitted_count, 1);
     assert!(!state.relay.complete());
+}
+
+/// A probe that stopped reporting without an exit code to attribute it to, and
+/// one whose task-state query refused, must stay distinguishable from each other
+/// and from the attributed case: the three are different findings for a later
+/// run, and collapsing them is what made run 5 undiagnosable.
+#[test]
+fn an_unattributable_stop_is_reported_as_its_own_site_rather_than_as_an_exit_code() {
+    let plan = ProbePlan::SMP;
+    for (waits, expected) in [
+        (
+            Waits {
+                exited: true,
+                application_code: 0,
+                query_fails: false,
+            },
+            R1ProbeFailure::DrainUnattributed,
+        ),
+        (
+            Waits {
+                exited: false,
+                application_code: 0,
+                query_fails: false,
+            },
+            R1ProbeFailure::DrainUnattributed,
+        ),
+        (
+            Waits {
+                exited: true,
+                // A refused query is not the same finding as a zero code, and a
+                // run that cannot read the code should say so rather than imply
+                // the probe reported one.
+                application_code: 0x8100_0007,
+                query_fails: true,
+            },
+            R1ProbeFailure::DrainQueryFailed,
+        ),
+    ] {
+        let mut state = state(plan);
+        let mut system = Probe::new();
+        system.queue(step(1, plan), 0);
+        system.exited = true;
+        let mut waits = waits;
+        assert_eq!(
+            drain(&mut state, &mut system, &mut waits, 500),
+            Err(InitError::R1Probe(expected))
+        );
+    }
+    // Every one of the four failures is a distinct terminal status, and the
+    // attributed one keeps the probe's ordinal in the low half of its own base.
+    assert_eq!(
+        r1_test_failure_application_status(&InitError::R1Probe(R1ProbeFailure::ExitCode(
+            0x8100_0007
+        ))),
+        0xAF37_0007
+    );
+    let statuses = [
+        R1ProbeFailure::ExitCode(0x8100_0007),
+        R1ProbeFailure::ReadyUnattributed,
+        R1ProbeFailure::DrainUnattributed,
+        R1ProbeFailure::DrainQueryFailed,
+    ]
+    .map(|failure| r1_test_failure_application_status(&InitError::R1Probe(failure)));
+    for (index, status) in statuses.iter().enumerate() {
+        for other in &statuses[index + 1..] {
+            assert_ne!(status, other, "two probe failures share a terminal status");
+        }
+    }
 }
 
 #[test]
@@ -401,7 +489,7 @@ fn a_record_arriving_with_a_handle_is_refused_and_the_handle_is_closed() {
     let mut system = Probe::new();
     system.queue(step(1, plan), 1);
     assert_eq!(
-        drain(&mut state, &mut system, 500),
+        drain(&mut state, &mut system, &mut Waits::default(), 500),
         Err(InitError::WrongManifestProfile)
     );
     assert_eq!(system.submitted_count, 0);
@@ -415,7 +503,7 @@ fn an_out_of_order_record_is_refused_rather_than_relayed() {
     let mut system = Probe::new();
     system.queue(step(2, plan), 0);
     assert_eq!(
-        drain(&mut state, &mut system, 500),
+        drain(&mut state, &mut system, &mut Waits::default(), 500),
         Err(InitError::WrongManifestProfile)
     );
     assert_eq!(system.submitted_count, 0);
@@ -427,7 +515,7 @@ fn a_report_describing_another_topology_never_reaches_the_collector() {
     let mut system = Probe::new();
     system.queue(step(1, ProbePlan::CONTROL), 0);
     assert_eq!(
-        drain(&mut state, &mut system, 500),
+        drain(&mut state, &mut system, &mut Waits::default(), 500),
         Err(InitError::WrongManifestProfile)
     );
     assert_eq!(system.submitted_count, 0);
@@ -441,14 +529,14 @@ fn a_kernel_refusal_leaves_the_transcript_retryable() {
     system.queue(step(1, plan), 0);
     system.reject_submission = true;
     assert_eq!(
-        drain(&mut state, &mut system, 500),
+        drain(&mut state, &mut system, &mut Waits::default(), 500),
         Err(InitError::Native(FAILURE))
     );
     // The refused record consumed no sequence, so the same record still fits.
     assert_eq!(state.submitted(), 0);
     system.reject_submission = false;
     system.queue(step(1, plan), 0);
-    drain(&mut state, &mut system, 600).expect("a retried record was refused");
+    drain(&mut state, &mut system, &mut Waits::default(), 600).expect("a retried record was refused");
     assert_eq!(system.submitted_count, 1);
     assert_eq!(state.submitted(), 1);
 }
@@ -458,7 +546,10 @@ fn teardown_retires_the_probe_and_stops_the_driver() {
     let plan = ProbePlan::SMP;
     let mut state = state(plan);
     let mut system = Probe::new();
-    let mut waits = Waits { exited: true };
+    let mut waits = Waits {
+        exited: true,
+        ..Waits::default()
+    };
     // The session was installed at launch, so teardown must retire it exactly
     // once and close its channel along with the probe's own handles.
     state
@@ -480,7 +571,10 @@ fn teardown_tolerates_a_session_the_dispatcher_already_retired() {
     // the session first is normal and must not be reported as a model error.
     let mut state = state(ProbePlan::SMP);
     let mut system = Probe::new();
-    let mut waits = Waits { exited: true };
+    let mut waits = Waits {
+        exited: true,
+        ..Waits::default()
+    };
     finish(&mut state, &mut system, &mut waits).expect("an already-retired session failed");
     assert_eq!(
         system.closed[..system.closed_count],
@@ -498,9 +592,66 @@ fn a_datagram_that_is_not_exactly_one_record_is_refused_rather_than_truncated() 
     system.oversized = true;
     system.queue(step(1, plan), 0);
     assert_eq!(
-        drain(&mut state, &mut system, 500),
+        drain(&mut state, &mut system, &mut Waits::default(), 500),
         Err(InitError::WrongManifestProfile)
     );
     assert_eq!(system.submitted_count, 0);
     assert_eq!(state.submitted(), 0);
+}
+
+/// The READY handshake is the other site that reported a bare `Supervision` in
+/// run 5. Four of the five observed-error variants carry an exact terminal
+/// record, so a probe that exited with its own code must be reported with that
+/// code no matter which of them delivered it; only a failure with no terminal
+/// record at all may fall back to the site.
+#[test]
+fn a_failed_ready_handshake_keeps_the_probe_code_from_every_variant_that_carries_one() {
+    fn info(application_code: u32) -> DwTaskTerminationInfoV1 {
+        DwTaskTerminationInfoV1 {
+            state: DW_TASK_STATE_EXITED,
+            application_code,
+            ..DwTaskTerminationInfoV1::default()
+        }
+    }
+    const CODE: u32 = 0x8100_0007;
+    let carrying: [ObservedSupervisionError<NativeError>; 5] = [
+        ObservedSupervisionError::ExitedBeforeReady(info(CODE)),
+        ObservedSupervisionError::PeerClosedBeforeReady(info(CODE)),
+        ObservedSupervisionError::Exit(ExitValidationError::NotNormalExit, info(CODE)),
+        ObservedSupervisionError::ExitObservedReadiness(
+            ExitObservedReadinessError::DuplicateReady,
+            info(CODE),
+        ),
+        // The validator extracted the code itself; it must be honoured even
+        // though this variant's record is reached by a different field.
+        ObservedSupervisionError::Exit(
+            ExitValidationError::NonzeroApplicationCode(CODE),
+            info(0),
+        ),
+    ];
+    for error in &carrying {
+        assert_eq!(
+            probe_failure_before_ready(error),
+            R1ProbeFailure::ExitCode(CODE),
+            "a carried probe code was discarded"
+        );
+    }
+    // A timeout, and an exit whose record holds no application code, are the two
+    // shapes with nothing to attribute; they report the site and say so.
+    for error in [
+        ObservedSupervisionError::Supervision(SupervisionError::UnboundedDeadline),
+        ObservedSupervisionError::Supervision(SupervisionError::Platform(FAILURE)),
+        ObservedSupervisionError::ExitedBeforeReady(info(0)),
+    ] {
+        assert_eq!(
+            probe_failure_before_ready(&error),
+            R1ProbeFailure::ReadyUnattributed
+        );
+    }
+    // The ready site and the drain sites must not collapse onto one status, which
+    // is exactly what made run 5's `AF340014` impossible to localise.
+    assert_ne!(
+        r1_test_failure_application_status(&InitError::R1Probe(R1ProbeFailure::ReadyUnattributed)),
+        r1_test_failure_application_status(&InitError::R1Probe(R1ProbeFailure::DrainUnattributed)),
+    );
 }
