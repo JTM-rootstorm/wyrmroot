@@ -179,7 +179,10 @@ const fn e8_failure_kind(error: &InitError) -> u8 {
     match error {
         InitError::WrongActivationOrder => 0x01,
         InitError::Accounting | InitError::Wyr1BModel(_) => 0x02,
-        InitError::Supervision => 0x03,
+        // The retirement wait kept `Supervision`'s meaning when it gained a
+        // payload, so selector 33's kind is unchanged by that split. E8 must stay
+        // byte-identical to the A27 baseline, and this is what keeps it so.
+        InitError::Supervision | InitError::BootstrapRetirement(_) => 0x03,
         InitError::Cleanup => 0x04,
         InitError::Native(_) => 0x05,
         InitError::WrongManifestProfile
@@ -363,6 +366,7 @@ const fn test_failure_category(error: &InitError) -> u32 {
         InitError::R1Probe(failure) => failure.category(),
         #[cfg(feature = "r1-selector34")]
         InitError::R1Relay(_) => 0x25,
+        InitError::BootstrapRetirement(_) => 0x26,
     }
 }
 
@@ -508,6 +512,16 @@ pub const fn r1_test_failure_application_status(error: &InitError) -> u32 {
         // A refused record's own reason, for the same purpose: run 6 proved a
         // record had been refused and nothing about which check refused it.
         InitError::R1Relay(error) => 0xAF38_0000 | r1_relay_detail(error),
+        // The retirement wait, whose bare `Supervision` was indistinguishable
+        // from every other supervision failure in the crate -- including the two
+        // driver sites run 5 was attributed to.
+        InitError::BootstrapRetirement(BootstrapRetirementFailure::Wait(error)) => {
+            0xAF39_0000 | wyrmroot_runtime::native_error_code(*error)
+        }
+        InitError::BootstrapRetirement(BootstrapRetirementFailure::WrongResult {
+            index,
+            observed,
+        }) => 0xAF3A_0000 | ((*index & 0xff) << 8) | ((*observed & 0xff) as u32),
         _ => 0xAF34_0000 | test_failure_category(error),
     }
 }
@@ -1143,6 +1157,27 @@ pub enum InitError {
     R1Probe(R1ProbeFailure),
     #[cfg(feature = "r1-selector34")]
     R1Relay(r1_relay::RelayError),
+    BootstrapRetirement(BootstrapRetirementFailure),
+}
+
+/// Why permanent init could not retire its bootstrap launch channel.
+///
+/// The retirement wait is reached by every selector through `run_system_init`,
+/// and both of its failures reported a bare `InitError::Supervision` -- one value
+/// shared with a hundred and five other sites across this crate. Card R1's run 5
+/// reported exactly that (`0xAF340014`) and the site was not even among the two I
+/// had identified; the cause-preservation gate found it. Each case here carries
+/// what it knows, so the failure names itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BootstrapRetirementFailure {
+    /// The wait for the bootstrap peer's close failed or timed out. The native
+    /// status distinguishes those, and every neighbouring call in this function
+    /// already preserves it.
+    Wait(NativeError),
+    /// The wait succeeded but selected the wrong input or lacked `PEER_CLOSED`,
+    /// which is a different failure from the wait refusing: the kernel answered,
+    /// and answered unexpectedly.
+    WrongResult { index: u32, observed: u64 },
 }
 
 impl From<RestartTransitionError> for InitError {
@@ -2625,9 +2660,16 @@ where
             core::slice::from_ref(&retire_item),
             DwDeadline(retire_deadline),
         )
-        .map_err(|_| InitError::Supervision)?;
+        .map_err(|error| {
+            InitError::BootstrapRetirement(BootstrapRetirementFailure::Wait(error))
+        })?;
     if retired.index != 0 || retired.observed.0 & DW_SIGNAL_PEER_CLOSED.0 == 0 {
-        return Err(InitError::Supervision);
+        return Err(InitError::BootstrapRetirement(
+            BootstrapRetirementFailure::WrongResult {
+                index: retired.index,
+                observed: retired.observed.0,
+            },
+        ));
     }
     let now = system.now().map_err(InitError::Native)?;
     controller.begin_registry(now, 1, 0x1001)?;
@@ -5362,16 +5404,7 @@ mod r1_cause_preservation {
     ///
     /// Every entry is a live defect, not an exemption. Each would erase the cause
     /// of a future run exactly as runs 2, 5 and 6 did.
-    const KNOWN_DISCARDS: [(&str, &str); 5] = [
-        (
-            ".map_err(|_| InitError::Supervision)?;",
-            "lib.rs `activate_retained_bootfs_state`: the bootstrap-retirement \
-             wait loses the native status of a refused or timed-out wait, and \
-             reports selector 34's `0xAF340014` -- run 5's exact status -- from a \
-             site earlier than the driver. Shared by every selector, so carrying \
-             the cause changes other products' statuses and needs a \
-             cross-selector pass rather than a local edit.",
-        ),
+    const KNOWN_DISCARDS: [(&str, &str); 4] = [
         (
             ".map_err(|_| InitError::WrongManifestProfile)?;",
             "gate lookup: the bootfs error naming which entry is missing is lost",
