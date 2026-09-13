@@ -1330,6 +1330,15 @@ pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<
         let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
         return run_cargo(repository, &arguments);
     }
+    if matches!(filter, Some("r1-clippy")) {
+        // The ordinary clippy gates lint the default feature set, under which
+        // r1_driver does not exist at all: it is compiled only by r1-status,
+        // which runs rustc and not clippy. Without this entry the driver is the
+        // largest unlinted module in the crate.
+        let arguments = r1_clippy_command();
+        let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+        return run_cargo(repository, &arguments);
+    }
     if matches!(filter, Some("r1-status")) {
         // Selector 34's failure statuses and its scenario driver only exist
         // under its own feature, and the launcher rightly refuses
@@ -1387,6 +1396,24 @@ pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<
         run_cargo(repository, &arguments)?;
     }
     Ok(())
+}
+
+fn r1_clippy_command() -> Vec<String> {
+    [
+        "clippy",
+        "--locked",
+        "--offline",
+        "--package",
+        "wyrmroot-system-init",
+        "--features",
+        "r1-selector34",
+        "--lib",
+        "--",
+        "-D",
+        "warnings",
+    ]
+    .map(str::to_owned)
+    .into()
 }
 
 fn r1_status_command() -> Vec<String> {

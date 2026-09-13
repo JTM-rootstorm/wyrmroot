@@ -301,7 +301,7 @@ pub const fn resident_tick_failure_application_status(error: &InitError) -> u32 
     // cannot be told apart from any other fatal tick.
     #[cfg(feature = "r1-selector34")]
     {
-        return 0xAF36_0000 | test_failure_category(error);
+        0xAF36_0000 | test_failure_category(error)
     }
     #[cfg(not(any(feature = "wyr1e8-selector33", feature = "r1-selector34")))]
     {
