@@ -520,8 +520,10 @@ where
             Ok(_) => {}
             // An inadmissible record is a malformed or out-of-order transcript,
             // which the host must see as a classified init failure rather than
-            // as a short transcript that looks like a stall.
-            Err(RelayFailure::Refused(_)) => return Err(InitError::WrongManifestProfile),
+            // as a short transcript that looks like a stall -- and the relay's
+            // own reason says which, so it travels with the failure. Answering
+            // this with a bare category is what made run 6 undiagnosable.
+            Err(RelayFailure::Refused(error)) => return Err(InitError::R1Relay(error)),
             Err(RelayFailure::Rejected(error)) => return Err(InitError::Native(error)),
         }
     }

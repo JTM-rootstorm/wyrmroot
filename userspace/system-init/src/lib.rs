@@ -361,6 +361,8 @@ const fn test_failure_category(error: &InitError) -> u32 {
         InitError::E8Transition { .. } => 0x20,
         #[cfg(feature = "r1-selector34")]
         InitError::R1Probe(failure) => failure.category(),
+        #[cfg(feature = "r1-selector34")]
+        InitError::R1Relay(_) => 0x25,
     }
 }
 
@@ -427,6 +429,61 @@ impl R1ProbeFailure {
     }
 }
 
+/// Packs a relay refusal into sixteen bits, keeping the numbers that identify it.
+///
+/// Run 6 reported `0xAF340001` because the driver answered a refused record with
+/// `InitError::WrongManifestProfile`, one of fourteen sites returning that value.
+/// The refusal itself knows exactly what was wrong -- `OutOfOrder` carries the
+/// expected and observed sequence numbers, `WrongTopology` the two counts that
+/// disagreed -- and all of it was discarded at the boundary.
+///
+/// Layout: kind in the high nibble, its own numbers in the low twelve bits. Both
+/// sequence numbers fit because the relay refuses anything past
+/// `RELAY_CAPACITY` (64), and both topology counts fit because the gate's own
+/// fields are bounded well below 64; each is saturated rather than truncated so a
+/// wild value reads as at-the-limit instead of as a small one.
+#[cfg(feature = "r1-selector34")]
+const fn r1_relay_detail(error: &r1_relay::RelayError) -> u32 {
+    use r1_relay::RelayError;
+
+    const fn six(value: u64) -> u32 {
+        if value > 0x3f { 0x3f } else { value as u32 }
+    }
+
+    match error {
+        RelayError::Malformed(header) => 0x1000 | r1_relay_header_detail(header),
+        RelayError::UnexpectedHandles => 0x2000,
+        RelayError::WrongTopology {
+            online_cpus,
+            hog_count,
+        } => 0x3000 | (six(*online_cpus as u64) << 6) | six(*hog_count as u64),
+        RelayError::OutOfOrder { expected, observed } => {
+            0x4000 | (six(*expected) << 6) | six(*observed)
+        }
+        RelayError::AfterTerminal => 0x5000,
+        RelayError::Full => 0x6000,
+    }
+}
+
+/// Ordinal of the header rejection behind a `Malformed` refusal.
+///
+/// Enumerated rather than cast so adding a `HeaderError` variant is a compile
+/// error here instead of silently joining whichever ordinal it lands on.
+#[cfg(feature = "r1-selector34")]
+const fn r1_relay_header_detail(error: &wyrmroot_r1_saturation::record::HeaderError) -> u32 {
+    use wyrmroot_r1_saturation::record::HeaderError;
+
+    match error {
+        HeaderError::WrongLength => 0x01,
+        HeaderError::WrongMagic => 0x02,
+        HeaderError::UnsupportedVersion => 0x03,
+        HeaderError::SizeMismatch => 0x04,
+        HeaderError::UnknownKind => 0x05,
+        HeaderError::ZeroSequence => 0x06,
+        HeaderError::ZeroNonce => 0x07,
+    }
+}
+
 /// Selector-34-only status preserving the pre-READY system-init failure category
 /// across the primordial Process-exit boundary.
 ///
@@ -448,6 +505,9 @@ pub const fn r1_test_failure_application_status(error: &InitError) -> u32 {
         // high half, so the low sixteen bits carry the ordinal that identifies
         // which of its startup checks refused.
         InitError::R1Probe(R1ProbeFailure::ExitCode(code)) => 0xAF37_0000 | (*code & 0xffff),
+        // A refused record's own reason, for the same purpose: run 6 proved a
+        // record had been refused and nothing about which check refused it.
+        InitError::R1Relay(error) => 0xAF38_0000 | r1_relay_detail(error),
         _ => 0xAF34_0000 | test_failure_category(error),
     }
 }
@@ -1081,6 +1141,8 @@ pub enum InitError {
     },
     #[cfg(feature = "r1-selector34")]
     R1Probe(R1ProbeFailure),
+    #[cfg(feature = "r1-selector34")]
+    R1Relay(r1_relay::RelayError),
 }
 
 impl From<RestartTransitionError> for InitError {
@@ -4983,6 +5045,81 @@ return wyr1_test_failure_application_status(&error);\n";
 mod r1_failure_status_tests {
     use super::*;
 
+    /// A refused record must reach the host as which refusal, with its numbers.
+    ///
+    /// Run 6's `0xAF340001` could have been any of six refusals at any of
+    /// fourteen sites. These assertions are the difference between that and a
+    /// status that names the check and the values that failed it.
+    #[test]
+    fn every_relay_refusal_keeps_its_own_numbers_and_stays_distinct() {
+        use crate::r1_relay::RelayError;
+        use wyrmroot_r1_saturation::record::HeaderError;
+
+        let status = |error| r1_test_failure_application_status(&InitError::R1Relay(error));
+
+        // The two refusals that carry numbers must carry them intact.
+        assert_eq!(
+            status(RelayError::OutOfOrder {
+                expected: 3,
+                observed: 7,
+            }),
+            0xAF38_40c7
+        );
+        assert_eq!(
+            status(RelayError::WrongTopology {
+                online_cpus: 1,
+                hog_count: 3,
+            }),
+            0xAF38_3043
+        );
+        // Saturation, not truncation: a wild count must not read as a small one.
+        assert_eq!(
+            status(RelayError::OutOfOrder {
+                expected: u64::MAX,
+                observed: 64,
+            }),
+            0xAF38_4fff
+        );
+
+        let cases = [
+            RelayError::Malformed(HeaderError::WrongLength),
+            RelayError::Malformed(HeaderError::WrongMagic),
+            RelayError::Malformed(HeaderError::UnsupportedVersion),
+            RelayError::Malformed(HeaderError::SizeMismatch),
+            RelayError::Malformed(HeaderError::UnknownKind),
+            RelayError::Malformed(HeaderError::ZeroSequence),
+            RelayError::Malformed(HeaderError::ZeroNonce),
+            RelayError::UnexpectedHandles,
+            RelayError::WrongTopology {
+                online_cpus: 1,
+                hog_count: 3,
+            },
+            RelayError::OutOfOrder {
+                expected: 1,
+                observed: 2,
+            },
+            RelayError::AfterTerminal,
+            RelayError::Full,
+        ];
+        for (index, error) in cases.iter().enumerate() {
+            let mine = status(*error);
+            // No refusal may collide with another, nor with the category space
+            // every other pre-READY failure reports through.
+            assert_ne!(
+                mine & 0xffff_0000,
+                0xAF34_0000,
+                "a relay refusal fell back into the collapsed category space"
+            );
+            for other in &cases[index + 1..] {
+                assert_ne!(
+                    mine,
+                    status(*other),
+                    "two relay refusals share one terminal status"
+                );
+            }
+        }
+    }
+
     #[test]
     fn every_category_survives_the_pre_ready_boundary_distinctly() {
         // The point of the status is that different failures read differently.
@@ -5225,7 +5362,7 @@ mod r1_cause_preservation {
     ///
     /// Every entry is a live defect, not an exemption. Each would erase the cause
     /// of a future run exactly as runs 2, 5 and 6 did.
-    const KNOWN_DISCARDS: [(&str, &str); 6] = [
+    const KNOWN_DISCARDS: [(&str, &str); 5] = [
         (
             ".map_err(|_| InitError::Supervision)?;",
             "lib.rs `activate_retained_bootfs_state`: the bootstrap-retirement \
@@ -5251,11 +5388,6 @@ mod r1_cause_preservation {
             "system.close_handle(group).map_err(|_| InitError::Cleanup)?;",
             "teardown: loses the native status of the refused close",
         ),
-        (
-            "Err(RelayFailure::Refused(_)) => return Err(InitError::WrongManifestProfile),",
-            "run 6's most probable site: loses RelayError, including OutOfOrder's \
-             expected and observed sequence numbers",
-        ),
     ];
 
     /// Payload-free `InitError` variants returned from more than one site in the
@@ -5268,7 +5400,7 @@ mod r1_cause_preservation {
         (
             "WrongManifestProfile",
             "InitError::WrongManifestProfile",
-            14,
+            13,
         ),
         ("Cleanup", "InitError::Cleanup", 7),
     ];
@@ -5528,7 +5660,11 @@ mod r1_cause_preservation {
         // `Native` and `R1Probe` are the two the encoder does surface. If either
         // stopped being special-cased, every cause on this path would collapse
         // again and this list would be describing the wrong problem.
-        for surfaced in ["InitError::Native(error) => 0xAF35_0000", "R1ProbeFailure::ExitCode(code)) => 0xAF37_0000"] {
+        for surfaced in [
+            "InitError::Native(error) => 0xAF35_0000",
+            "R1ProbeFailure::ExitCode(code)) => 0xAF37_0000",
+            "InitError::R1Relay(error) => 0xAF38_0000",
+        ] {
             assert!(
                 lib.contains(surfaced),
                 "the selector-34 encoder no longer surfaces a cause it used to: \

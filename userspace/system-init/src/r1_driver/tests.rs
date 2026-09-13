@@ -13,6 +13,7 @@ use deepwyrm_syscall::{
 };
 use wyrmroot_r1_saturation::record::{encode_step, encode_terminal};
 use wyrmroot_runtime::{ExitObservedReadinessError, SupervisionError};
+use crate::r1_relay::RelayError;
 use wyrmroot_r1_saturation::{ProbeOutcome, ProbeStep};
 
 const NONCE: u64 = 0x3400_0000_0000_0001;
@@ -502,9 +503,14 @@ fn an_out_of_order_record_is_refused_rather_than_relayed() {
     let mut state = state(plan);
     let mut system = Probe::new();
     system.queue(step(2, plan), 0);
+    // The refusal travels with its numbers: a gap says a record was lost, and
+    // which one. Run 6 reported this shape as a bare category.
     assert_eq!(
         drain(&mut state, &mut system, &mut Waits::default(), 500),
-        Err(InitError::WrongManifestProfile)
+        Err(InitError::R1Relay(RelayError::OutOfOrder {
+            expected: 1,
+            observed: 2,
+        }))
     );
     assert_eq!(system.submitted_count, 0);
 }
@@ -516,7 +522,10 @@ fn a_report_describing_another_topology_never_reaches_the_collector() {
     system.queue(step(1, ProbePlan::CONTROL), 0);
     assert_eq!(
         drain(&mut state, &mut system, &mut Waits::default(), 500),
-        Err(InitError::WrongManifestProfile)
+        Err(InitError::R1Relay(RelayError::WrongTopology {
+            online_cpus: ProbePlan::CONTROL.online_cpus as u32,
+            hog_count: ProbePlan::CONTROL.hog_count as u32,
+        }))
     );
     assert_eq!(system.submitted_count, 0);
 }
