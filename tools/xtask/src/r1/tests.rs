@@ -250,3 +250,67 @@ mod domain {
         assert_ne!(smp_output, control_output);
     }
 }
+
+mod media {
+    use super::*;
+
+    #[test]
+    fn the_kernel_environment_is_exactly_the_selector_and_the_nonce() {
+        let environment = kernel_environment("8100000000000001");
+        assert_eq!(
+            environment,
+            [
+                (
+                    "DEEPWYRM_GUEST_TEST_SELECTOR",
+                    "dynamic-launch-saturation".to_owned()
+                ),
+                ("DEEPWYRM_R1_EVIDENCE_NONCE", "8100000000000001".to_owned()),
+            ]
+        );
+        // The nonce must be the same value the probe was compiled against. If it
+        // were not, the collector would refuse every record and a working run
+        // would report nothing at all — the failure mode hardest to tell from a
+        // scheduler stall, which is what this card exists to distinguish.
+        assert_eq!(environment[1].0, R1_EVIDENCE_VARIABLE);
+        assert!(NONCE_BOUND_LABELS.contains(&"r1-probe"));
+    }
+
+    #[test]
+    fn the_media_set_names_no_per_profile_artifact() {
+        // bootfs.img and the ESP are per-profile, because the two handoffs differ
+        // precisely in the WRR1 configuration their archive carries. Staging
+        // either as shared media would silently give both profiles one topology.
+        assert_eq!(MEDIA_ARTIFACTS.len(), 13);
+        for shared in ["loader.efi", "deepwyrm.elf", "OVMF_CODE.fd", "OVMF_VARS.fd"] {
+            assert!(MEDIA_ARTIFACTS.contains(&shared), "{shared} is missing");
+        }
+        for per_profile in ["bootfs.img", "r1-esp.img", "r1-gate-v1.bin", "domain.xml"] {
+            assert!(
+                !MEDIA_ARTIFACTS.contains(&per_profile),
+                "{per_profile} is per-profile and must not be shared media"
+            );
+        }
+    }
+
+    #[test]
+    fn the_symbols_and_kernel_are_the_same_image() {
+        // The release profile keeps full DWARF, which is what lets the GDB harness
+        // read §8.2's carrier facts. Stripping one of the two would silently
+        // remove the only way this card obtains its evidence.
+        assert!(MEDIA_ARTIFACTS.contains(&"deepwyrm.elf"));
+        assert!(MEDIA_ARTIFACTS.contains(&"deepwyrm.symbols.elf"));
+    }
+
+    #[test]
+    fn the_excluded_roles_are_staged_as_images_but_launch_nothing() {
+        // Their presence is the RRC graph, which requires all five roles to exist;
+        // their exclusion is the launch policy, which admits neither.
+        for retained in ["uart16550d.elf", "consoled.elf", "wyrmsh.elf"] {
+            assert!(MEDIA_ARTIFACTS.contains(&retained));
+        }
+        let entries = wyrmroot_bootfs::r1::launch_policy_entries([0x11; 32], [0x22; 32]);
+        for path in ["system/wyrmsh", "system/consoled", "system/uart16550d"] {
+            assert!(!entries.iter().any(|entry| entry.path == path));
+        }
+    }
+}

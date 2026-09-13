@@ -50,7 +50,7 @@ const DOMAIN_UUID: &str = "33005e22-d7c2-4b13-b1ac-b82eda95e584";
 const ESP_FD_GROUP: &str = "dw-f13-esp-v1";
 const VARS_FD_GROUP: &str = "dw-f13-ovmf-vars-v1";
 const NATIVE_TARGET: &str = "x86_64-unknown-wyrmroot";
-const KERNEL_TARGET: &str = "x86_64-unknown-none";
+pub(crate) const KERNEL_TARGET: &str = "x86_64-unknown-none";
 pub(crate) const OVMF_CODE_PATH: &str = "/usr/share/edk2/OvmfX64/OVMF_CODE.fd";
 pub(crate) const OVMF_CODE_SHA256: &str =
     "f3ff7e73448ed2845ee15356f394882f5618eb5dab92c9a30ec6ee0e1468553a";
@@ -60,7 +60,7 @@ pub(crate) const OVMF_VARS_SHA256: &str =
 pub(crate) const ACCEPTED_RUST_REVISION: &str = "a92dc7f7464ad6ddfece4402bd7b86dbfa86166d";
 pub(crate) const ACCEPTED_TOOLCHAIN_NAME: &str = "wyrmroot-1.97.1-a92dc7f7";
 
-const ARTIFACTS: &[(&str, &str, u64)] = &[
+pub(crate) const ARTIFACTS: &[(&str, &str, u64)] = &[
     ("loader", "loader.efi", MAX_ARTIFACT_BYTES),
     ("kernel", "deepwyrm.elf", MAX_ARTIFACT_BYTES),
     ("symbols", "deepwyrm.symbols.elf", MAX_ARTIFACT_BYTES),
@@ -905,7 +905,7 @@ fn parse_evidence(bytes: &[u8], nonce: &str) -> Result<ParsedEvidence, Failure> 
     })
 }
 
-fn build_c6_bootstrap(
+pub(crate) fn build_c6_bootstrap(
     repository: &Path,
     toolchain: &tasks::LoaderToolchain,
     layout: &crate::deep_layout::DeepLayoutBuild,

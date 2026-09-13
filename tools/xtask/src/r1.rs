@@ -736,3 +736,170 @@ pub(crate) fn domain_xml(vcpus: u8, port: u16, code: &Path, esp: &Path, vars: &P
         esp.display(),
     )
 }
+
+/// Card R1's media inputs. Every byte here is either built from a pinned clean
+/// revision or read from a digest-pinned path; nothing is copied from a
+/// developer tree.
+#[allow(
+    dead_code,
+    reason = "media seam consumed by the follow-on r1 prepare command"
+)]
+pub(crate) struct R1Media {
+    pub(crate) loader: Vec<u8>,
+    /// The selector-34 kernel. `deepwyrm.elf` and `deepwyrm.symbols.elf` are the
+    /// same bytes: the release profile keeps full DWARF, which is what lets the
+    /// GDB harness read §8.2's carrier facts at all.
+    pub(crate) kernel: Vec<u8>,
+    pub(crate) bootstrap: Vec<u8>,
+    pub(crate) boot_device_table: Vec<u8>,
+    pub(crate) ovmf_code: Vec<u8>,
+    pub(crate) ovmf_vars: Vec<u8>,
+}
+
+/// The environment the selector-34 kernel must be built under.
+///
+/// Exactly two variables, and both matter. The selector chooses the guest test;
+/// the nonce is baked into the kernel's evidence collector and must be the same
+/// value the probe was compiled against, or the collector refuses every record
+/// and a working run reports nothing.
+#[allow(
+    dead_code,
+    reason = "media seam consumed by the follow-on r1 prepare command"
+)]
+pub(crate) fn kernel_environment(nonce: &str) -> [(&'static str, String); 2] {
+    [
+        ("DEEPWYRM_GUEST_TEST_SELECTOR", SELECTOR.to_owned()),
+        (R1_EVIDENCE_VARIABLE, nonce.to_owned()),
+    ]
+}
+
+/// Builds the selector-34 Deepwyrm kernel from a pinned clean Deepwyrm checkout.
+///
+/// This mirrors `wyr1c6::build_selector29_kernel` rather than generalising it.
+/// That function is part of an accepted producer path, and parameterising it
+/// would put a card-R1 change inside selector 29's build; the duplication is
+/// deliberate and bounded to the environment above.
+#[allow(
+    dead_code,
+    reason = "media seam consumed by the follow-on r1 prepare command"
+)]
+pub(crate) fn build_kernel(deep_repository: &Path, nonce: &str) -> Result<Vec<u8>, Failure> {
+    use std::process::{Command, Stdio};
+
+    let repository =
+        crate::secure_fs::Directory::open_exact(deep_repository, "Deepwyrm source root")?;
+    let temporary = match repository.open_child(".tmp", "Deepwyrm temporary root") {
+        Ok(directory) => directory,
+        Err(_) => repository.create_child(".tmp", 0o700, "Deepwyrm temporary root")?,
+    };
+    temporary.verify_owned_container_path("Deepwyrm temporary root")?;
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Failure::task("system clock is before the Unix epoch"))?
+        .as_nanos();
+    let scratch = temporary.create_scratch(
+        &format!("r1-kernel-{}-{unique}", std::process::id()),
+        "card R1 Deepwyrm target",
+    )?;
+    let result = (|| {
+        let mut command = Command::new(repository.path().join("tools/pinned-cargo"));
+        command
+            .arg("target")
+            .args([
+                "build",
+                "--locked",
+                "--offline",
+                "--release",
+                "--target",
+                crate::wyr1c6::KERNEL_TARGET,
+                "--package",
+                "deepwyrm-kernel",
+                "--bin",
+                "deepwyrm-kernel",
+                "--features",
+                "test-support",
+            ])
+            .env("DEEPWYRM_PINNED_TARGET_DIR", scratch.path())
+            .env_remove("CARGO_HOME")
+            .env_remove("LD_AUDIT")
+            .env_remove("LD_LIBRARY_PATH")
+            .env_remove("LD_PRELOAD")
+            .current_dir(repository.path())
+            .stdin(Stdio::null());
+        for (key, value) in kernel_environment(nonce) {
+            command.env(key, value);
+        }
+        let status = command
+            .status()
+            .map_err(|error| Failure::task(format!("could not build card R1 kernel: {error}")))?;
+        if !status.success() {
+            return Err(Failure::task(
+                "card R1 selector-34 Deepwyrm kernel build failed",
+            ));
+        }
+        scratch.read_producer(
+            &std::path::PathBuf::from(crate::wyr1c6::KERNEL_TARGET).join("release/deepwyrm-kernel"),
+            crate::wyr1c6::MAX_ARTIFACT_BYTES,
+            "selector-34 kernel",
+        )
+    })();
+    scratch.finish(result)
+}
+
+/// The artifact files card R1 stages, in the order they are written.
+///
+/// `bootfs.img` is absent on purpose: it is per-profile and lives in each
+/// profile's own directory, because the two handoffs differ precisely in the
+/// `WRR1` configuration their archive carries.
+#[allow(
+    dead_code,
+    reason = "media seam consumed by the follow-on r1 prepare command"
+)]
+pub(crate) const MEDIA_ARTIFACTS: [&str; 13] = [
+    "loader.efi",
+    "deepwyrm.elf",
+    "deepwyrm.symbols.elf",
+    "bootstrap.elf",
+    "system-init.elf",
+    "registryd.elf",
+    "devmgr.elf",
+    "uart16550d.elf",
+    "consoled.elf",
+    "wyrmsh.elf",
+    "boot-device-table.bin",
+    "OVMF_CODE.fd",
+    "OVMF_VARS.fd",
+];
+
+/// Composes one profile's ESP from the shared media and that profile's archive.
+///
+/// The ESP is per-profile for the same reason the archive is: it embeds the
+/// bootfs, so two profiles cannot share one image. §3's single `r1-esp.img` entry
+/// therefore names two files, one under each profile directory, and the request
+/// must record both digests.
+#[allow(
+    dead_code,
+    reason = "media seam consumed by the follow-on r1 prepare command"
+)]
+pub(crate) fn compose_profile_esp(
+    artifacts: &Path,
+    profile_directory: &Path,
+) -> Result<std::path::PathBuf, Failure> {
+    let esp = profile_directory.join("r1-esp.img");
+    let arguments = crate::cli::G3ImageArguments {
+        image: esp.display().to_string(),
+        loader: artifacts.join("loader.efi").display().to_string(),
+        kernel: artifacts.join("deepwyrm.elf").display().to_string(),
+        bootstrap: artifacts.join("bootstrap.elf").display().to_string(),
+        bootfs: profile_directory.join("bootfs.img").display().to_string(),
+    };
+    crate::g3_image::build_d6(
+        &arguments,
+        &artifacts
+            .join("boot-device-table.bin")
+            .display()
+            .to_string(),
+    )?;
+    crate::wyr1c6::seal_mode(&esp, 0o444, "card R1 ESP")?;
+    Ok(esp)
+}
