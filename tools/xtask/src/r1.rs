@@ -73,11 +73,20 @@ const NATIVE_SPECS: [NativeSpec; 9] = [
         features: "native-registryd",
         artifact: "registryd",
     },
+    // `wyr1c5-production`, not bare `native-devmgr`. The RRC graph assigns
+    // devmgr the resident DeviceCoordinator profile, and this is the feature that
+    // gives it the resource-domain init path and the registry publication the
+    // geometry ledger accounts for in its three resident handles. Bare
+    // `native-devmgr` selects the older non-resource coordinator and, as of this
+    // revision, does not build at all: `wyrmroot-registry-proto` is attached to
+    // the feature but used only from `wyr1c5-production` upward, so the crate's
+    // own `unused_crate_dependencies = "deny"` rejects it. See the commit
+    // message for the pre-existing breakage that exposes in `wyr1c1 product`.
     NativeSpec {
         label: "devmgr",
         package: "wyrmroot-devmgr",
         binary: "devmgr",
-        features: "native-devmgr",
+        features: "wyr1c5-production",
         artifact: "devmgr",
     },
     NativeSpec {

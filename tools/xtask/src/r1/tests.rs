@@ -58,6 +58,23 @@ fn the_payload_set_is_exactly_the_cards_nine_and_names_no_excluded_actor() {
         .find(|spec| spec.label == "system-init")
         .unwrap();
     assert_eq!(init.features, "r1-selector34");
+    // devmgr must be the resource-domain coordinator the RRC graph assigns it.
+    // Bare native-devmgr selects the older non-resource path and does not build.
+    let devmgr = NATIVE_SPECS
+        .iter()
+        .find(|spec| spec.label == "devmgr")
+        .unwrap();
+    assert_eq!(devmgr.features, "wyr1c5-production");
+    // The three excluded roles are the retained stubs, not the real drivers:
+    // their images exist because the graph says the roles do.
+    for retained in ["uart16550d", "consoled", "wyrmsh"] {
+        let spec = NATIVE_SPECS
+            .iter()
+            .find(|spec| spec.label == retained)
+            .unwrap();
+        assert_eq!(spec.package, "wyrmroot-wyr1-retained-stubs");
+        assert_eq!(spec.features, "native-retained");
+    }
 }
 
 #[test]
