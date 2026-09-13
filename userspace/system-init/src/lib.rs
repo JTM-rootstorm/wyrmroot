@@ -5211,6 +5211,17 @@ mod r1_failure_status_tests {
         assert_eq!(r1_test_failure_application_status(&output), 0xAF35_8003);
     }
 
+    /// Every base `r1_test_failure_application_status` can produce.
+    const R1_BASES: [u32; 7] = [
+        0xAF34_0000,
+        0xAF35_0000,
+        0xAF36_0000,
+        0xAF37_0000,
+        0xAF38_0000,
+        0xAF39_0000,
+        0xAF3A_0000,
+    ];
+
     #[test]
     fn the_r1_bases_cannot_be_confused_with_another_selectors() {
         // Deepwyrm reports selector 34's code unsummarized, so a base shared
@@ -5223,9 +5234,56 @@ mod r1_failure_status_tests {
             0xAF1C_0000,
             0xAF1D_0000,
         ] {
-            for mine in [0xAF34_0000_u32, 0xAF35_0000, 0xAF36_0000] {
+            for mine in R1_BASES {
                 assert_ne!(existing, mine);
             }
+        }
+        // Every base selector 34 can report, not the three it had when this test
+        // was written: each cause-preserving fix added one, and a base that joined
+        // the encoder without joining this list would be unguarded.
+        for (index, mine) in R1_BASES.iter().enumerate() {
+            for other in &R1_BASES[index + 1..] {
+                assert_ne!(mine, other, "two selector-34 bases collide");
+            }
+        }
+        // The guarded list must match the encoders exactly, in both directions.
+        // A lower bound was tried first and was useless: dropping a base from
+        // R1_BASES still satisfied it, so the list could silently shrink away from
+        // the code it claims to describe. Every `0xAF3X` an encoder arm can
+        // produce is enumerated here, so an added base that is not guarded fails,
+        // and a guarded base no longer produced fails too.
+        // Scanned with this module excised. The table below quotes the patterns
+        // it searches for, so scanning the whole file made the test find its own
+        // literals -- the same self-reference that bit `r1_cause_preservation`.
+        // A renamed module makes this panic, which is the loud failure we want.
+        let lib = include_str!("lib.rs");
+        let encoder = &lib[..lib
+            .find("\nmod r1_failure_status_tests {")
+            .expect("this module's own marker no longer matches")];
+        for (pattern, base) in [
+            ("0xAF30_0000 |", 0xAF30_0000_u32),
+            ("0xAF31_0000 |", 0xAF31_0000),
+            ("0xAF32_0000 |", 0xAF32_0000),
+            ("0xAF33_0000 |", 0xAF33_0000),
+            ("0xAF34_0000 |", 0xAF34_0000),
+            ("0xAF35_0000 |", 0xAF35_0000),
+            ("0xAF36_0000 |", 0xAF36_0000),
+            ("0xAF37_0000 |", 0xAF37_0000),
+            ("0xAF38_0000 |", 0xAF38_0000),
+            ("0xAF39_0000 |", 0xAF39_0000),
+            ("0xAF3A_0000 |", 0xAF3A_0000),
+            ("0xAF3B_0000 |", 0xAF3B_0000),
+            ("0xAF3C_0000 |", 0xAF3C_0000),
+            ("0xAF3D_0000 |", 0xAF3D_0000),
+            ("0xAF3E_0000 |", 0xAF3E_0000),
+            ("0xAF3F_0000 |", 0xAF3F_0000),
+        ] {
+            assert_eq!(
+                encoder.contains(pattern),
+                R1_BASES.contains(&base),
+                "{pattern} is produced by an encoder but not guarded, or guarded \
+                 but no longer produced"
+            );
         }
         // And the coarse production value must no longer be reachable here.
         assert_ne!(
