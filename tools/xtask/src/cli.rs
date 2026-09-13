@@ -52,6 +52,7 @@ Usage:
     tools/pinned-cargo xtask wyr1b inspect --request <wyr1-b-request.toml>
     tools/pinned-cargo xtask wyr1b run --request <wyr1-b-request.toml>
     tools/pinned-cargo xtask wyr1b evidence --request <wyr1-b-request.toml>
+    tools/pinned-cargo xtask r1 product --output <fresh-directory> --evidence-nonce <16-hex>
     tools/pinned-cargo xtask wyr1c1 product --output <fresh-directory>
     tools/pinned-cargo xtask wyr1e6 product --output <fresh-directory>
     tools/pinned-cargo xtask wyr1e6 inspect --product <directory>
@@ -190,6 +191,10 @@ pub(crate) enum Action {
     Wyr1BInspect(String),
     Wyr1BRun(String),
     Wyr1BEvidence(String),
+    R1Product {
+        output: String,
+        evidence_nonce: String,
+    },
     Wyr1C1Product(String),
     Wyr1E6Product(String),
     Wyr1E6Inspect(String),
@@ -328,6 +333,7 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
         "test" => dispatch_test(&arguments[1..]),
         "wyr1" => dispatch_wyr1(&arguments[1..]),
         "wyr1b" => dispatch_wyr1b(&arguments[1..]),
+        "r1" => dispatch_r1(&arguments[1..]),
         "wyr1c1" => dispatch_wyr1c1(&arguments[1..]),
         "wyr1e6" => dispatch_wyr1e6(&arguments[1..]),
         "wyr1e7" => dispatch_wyr1e7(&arguments[1..]),
@@ -509,6 +515,24 @@ fn dispatch_wyr1c6(arguments: &[String]) -> Result<Action, Failure> {
         }
         _ => Err(Failure::usage(
             "wyr1c6 requires prepare --output <fresh-directory> --deep-repository <path> --deep-revision <40-hex> --evidence-nonce <16-hex> --evidence-challenge <16-hex>, inspect|run --request <path>, or evidence --request <path> --default <log> --smp <log> --output <fresh-receipt>",
+        )),
+    }
+}
+
+fn dispatch_r1(arguments: &[String]) -> Result<Action, Failure> {
+    match arguments {
+        [command, output_flag, output, nonce_flag, evidence_nonce]
+            if command == "product"
+                && output_flag == "--output"
+                && nonce_flag == "--evidence-nonce" =>
+        {
+            Ok(Action::R1Product {
+                output: output.clone(),
+                evidence_nonce: evidence_nonce.clone(),
+            })
+        }
+        _ => Err(Failure::usage(
+            "r1 requires product --output <fresh-directory> --evidence-nonce <16-hex>; media, domain XML and the VM request are produced by a follow-on prepare",
         )),
     }
 }

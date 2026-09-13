@@ -13,6 +13,7 @@ mod h_request;
 mod i_b_closure;
 mod metadata;
 mod provenance;
+mod r1;
 mod secure_fs;
 mod sha256;
 mod tasks;
@@ -132,6 +133,10 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
         Action::Wyr1BInspect(request) => wyr1b::inspect(std::path::Path::new(&request)).map(Some),
         Action::Wyr1BRun(request) => wyr1b::run(std::path::Path::new(&request)).map(Some),
         Action::Wyr1BEvidence(request) => wyr1b::evidence(std::path::Path::new(&request)).map(Some),
+        Action::R1Product {
+            output,
+            evidence_nonce,
+        } => r1::product(std::path::Path::new(&output), &evidence_nonce).map(Some),
         Action::Wyr1C1Product(output) => wyr1c::product(std::path::Path::new(&output)).map(Some),
         Action::Wyr1E6Product(output) => wyr1e::product(std::path::Path::new(&output)).map(Some),
         Action::Wyr1E6Inspect(output) => wyr1e::inspect(std::path::Path::new(&output)).map(Some),

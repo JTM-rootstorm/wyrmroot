@@ -54,12 +54,12 @@ pub(crate) const GATE_CONFIG: &[u8] =
     b"schema = 1\nproduct = \"wyr1-c1-host-only\"\nselector = \"none\"\nevidence = \"not-produced\"\n";
 
 #[derive(Clone, Copy)]
-struct NativeSpec {
-    label: &'static str,
-    package: &'static str,
-    binary: &'static str,
-    features: &'static str,
-    artifact: &'static str,
+pub(crate) struct NativeSpec {
+    pub(crate) label: &'static str,
+    pub(crate) package: &'static str,
+    pub(crate) binary: &'static str,
+    pub(crate) features: &'static str,
+    pub(crate) artifact: &'static str,
 }
 
 const NATIVE_SPECS: [NativeSpec; 6] = [
@@ -664,11 +664,11 @@ const C6_NATIVE_CHECK_SPECS: [NativeSpec; 4] = [
     },
 ];
 
-struct NativeArtifact {
-    spec: NativeSpec,
-    bytes: Vec<u8>,
-    sha256: String,
-    inspection: String,
+pub(crate) struct NativeArtifact {
+    pub(crate) spec: NativeSpec,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) sha256: String,
+    pub(crate) inspection: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1738,7 +1738,7 @@ fn build_selected_e_artifacts(
     Ok(snapshot)
 }
 
-fn publish_snapshot(
+pub(crate) fn publish_snapshot(
     output: &crate::secure_fs::Directory,
     snapshot: &FrozenSnapshot,
 ) -> Result<FrozenPublication, Failure> {
@@ -2945,7 +2945,7 @@ fn assemble_d5_product(
     ))
 }
 
-fn build_native(
+pub(crate) fn build_native(
     repository: &Path,
     cargo_home: &Path,
     toolchain: &crate::toolchain_artifact::AcceptedToolchain,
@@ -2965,10 +2965,10 @@ fn build_native(
 }
 
 #[derive(Clone, Copy)]
-struct NativeBuildOptions<'a> {
-    extra_flags: &'a [&'a str],
-    exact_environment: bool,
-    evidence_variable: &'static str,
+pub(crate) struct NativeBuildOptions<'a> {
+    pub(crate) extra_flags: &'a [&'a str],
+    pub(crate) exact_environment: bool,
+    pub(crate) evidence_variable: &'static str,
 }
 
 impl NativeBuildOptions<'_> {
@@ -2996,7 +2996,7 @@ impl NativeBuildOptions<'_> {
         Self::exact_with_evidence("WYRMROOT_WYR1E8_EVIDENCE_NONCE")
     }
 
-    const fn exact_with_evidence(evidence_variable: &'static str) -> Self {
+    pub(crate) const fn exact_with_evidence(evidence_variable: &'static str) -> Self {
         Self {
             extra_flags: &[],
             exact_environment: true,
@@ -3005,7 +3005,7 @@ impl NativeBuildOptions<'_> {
     }
 }
 
-fn build_native_with_flags(
+pub(crate) fn build_native_with_flags(
     repository: &Path,
     cargo_home: &Path,
     toolchain: &crate::toolchain_artifact::AcceptedToolchain,
@@ -3360,7 +3360,7 @@ fn native_remap_flags(
     .join("\u{1f}"))
 }
 
-fn inspect_native(
+pub(crate) fn inspect_native(
     repository: &Path,
     bytes: &[u8],
     expected_sha256: &str,

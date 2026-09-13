@@ -35,16 +35,21 @@ fn the_policy_admits_exactly_the_two_payloads_the_card_launches() {
 
 #[cfg(feature = "builder")]
 #[test]
-fn the_hog_is_admitted_zero_stream_and_the_progress_child_is_not() {
+fn both_payloads_are_admitted_zero_stream_only() {
     let entries = launch_policy_entries(HOG, HELLO);
-    // The hog must never hold stdio: it is a no-yield spinner, the geometry
-    // ledger sizes its handles as Process and TaskGroup only, and a saturation
-    // payload with output would change what the run measures.
-    assert!(entries[0].allow_no_streams);
-    assert!(!entries[0].allow_three_streams);
-    // The progress child keeps the shape every other product gives it.
-    assert!(!entries[1].allow_no_streams);
-    assert!(entries[1].allow_three_streams);
+    // The probe encodes every launch with streams: false, so three-stream
+    // admission would be authority this product never exercises — and card R1
+    // ships no console or UART driver to carry it. WYR1-B admits bin/hello with
+    // both shapes because its client may launch it either way; copying that
+    // here would have widened R1 for no use.
+    for entry in entries {
+        assert!(entry.allow_no_streams);
+        assert!(
+            !entry.allow_three_streams,
+            "{} must not be admitted with stdio under card R1",
+            entry.path
+        );
+    }
     assert_eq!(entries[0].content_sha256, HOG);
     assert_eq!(entries[1].content_sha256, HELLO);
 }
@@ -312,10 +317,10 @@ mod archive {
         let wrdm = canonical_wrdm(UART_IDENTITY);
         let gate = gate_bytes(6, 4, PROBE);
 
-        // Giving the hog stdio is structurally valid and semantically wrong: a
-        // saturation payload with output changes what the run measures.
+        // Giving either payload stdio is structurally valid and semantically
+        // wrong: the probe launches with streams: false, and a saturation
+        // payload with output changes what the run measures.
         let mut entries = launch_policy_entries(HOG, HELLO);
-        entries[0].allow_no_streams = false;
         entries[0].allow_three_streams = true;
         let mut bytes = [0_u8; 1024];
         let size = encode_policy(GENERATION, &entries, &mut bytes).unwrap();

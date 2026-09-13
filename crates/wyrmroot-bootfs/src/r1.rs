@@ -42,12 +42,17 @@ pub const R1_POLICY_ENTRY_COUNT: usize = 2;
 
 /// Builds the card's complete JobV2 policy entry set.
 ///
-/// The stream shapes are not cosmetic. The hog is admitted zero-stream because
-/// it is a no-yield spinner with no output — the geometry ledger sizes its
-/// handles as Process and TaskGroup only — and admitting it with three streams
-/// would hand a saturation payload stdio it must never use. The progress child
-/// is the ordinary smoke payload and keeps the three-stream shape every other
-/// product gives it.
+/// Both payloads are admitted **zero-stream only**, and that is deliberate
+/// rather than inherited. The probe encodes every launch with `streams: false`,
+/// so three-stream admission would be authority the product never exercises,
+/// and card R1 has no console at all: §8.1 excludes output pressure, and §3
+/// ships no `consoled` or UART driver. The hog additionally must never hold
+/// stdio because it is a no-yield spinner whose handles the geometry ledger
+/// sizes as Process and TaskGroup only — a saturation payload with output
+/// changes what the run measures.
+///
+/// WYR1-B admits `bin/hello` with both shapes because its client may launch it
+/// either way. Copying that here would have widened R1 for no use.
 #[cfg(feature = "builder")]
 #[must_use]
 pub fn launch_policy_entries(
@@ -68,8 +73,8 @@ pub fn launch_policy_entries(
             content_sha256: hello_identity,
             startup_abi: R1_STARTUP_ABI,
             profile_id: JOB_V2_PROFILE_ID,
-            allow_no_streams: false,
-            allow_three_streams: true,
+            allow_no_streams: true,
+            allow_three_streams: false,
         },
     ]
 }
