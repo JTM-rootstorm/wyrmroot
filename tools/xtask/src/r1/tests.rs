@@ -314,3 +314,109 @@ mod media {
         }
     }
 }
+
+mod request {
+    use super::*;
+
+    #[test]
+    fn the_host_timeout_exceeds_every_bound_the_probe_can_legitimately_use() {
+        // This ordering is the card's whole premise. A27 produced no evidence
+        // because the host's 30 s bound expired before anything in the guest
+        // reported; the probe now bounds its own waits so it reports a
+        // classification first, and the host bound exists only to stop a wedged
+        // guest holding the lease.
+        const {
+            assert!(REQUEST_TIMEOUT_SECONDS > PROBE_WORST_CASE_SECONDS);
+            // A27's own bound, which this must not regress to.
+            assert!(REQUEST_TIMEOUT_SECONDS > 30);
+        }
+        // Derived from the probe's own constants rather than guessed: per hog an
+        // accept, a progress accept and a progress result, then bounded cleanup.
+        let per_hog = 3 + 3 + 8;
+        let per_cleanup = 8 + 8;
+        let smp_hogs = u32::from(PROFILES[0].1);
+        assert_eq!(smp_hogs * (per_hog + per_cleanup), PROBE_WORST_CASE_SECONDS);
+        assert_eq!(REQUEST_TIMEOUT_SECONDS, 300);
+    }
+
+    #[test]
+    fn the_request_states_every_element_section_10_requires() {
+        let mut digests = BTreeMap::new();
+        digests.insert("smp/r1-esp.img".to_owned(), "aa".repeat(32));
+        let request = render_request(
+            Path::new("/home/mike/Documents/Programming/OS-Project/artifacts/r1-260912"),
+            "a7ce03706f85b186b2810c3ac38377f0ccac7238",
+            "12d75ae405e5aa66960246ad459ec5e9f18127de",
+            "085b184c32ae1fa3d5ec322c86957dd5d036595c",
+            "a9b067107ec38e2be44630f4dce428dab0f48de8",
+            "8100000000000001",
+            1240,
+            &digests,
+        )
+        .unwrap();
+
+        // §10: project/gate, revisions with dirty qualification, artifact and
+        // media identity, effective profile, selector/commands/expected signals,
+        // timeout/logs, and destructive storage/configuration/cleanup needs.
+        for required in [
+            "[gate]",
+            "card = \"R1C\"",
+            "deepwyrm_dirty = \"clean\"",
+            "wyrmroot_dirty = \"clean\"",
+            "generated_abi_tree =",
+            "[digest]",
+            "[profile.smp]",
+            "[profile.control]",
+            "selector = \"dynamic-launch-saturation\"",
+            "[expected_signals]",
+            "timeout_seconds = 300",
+            "logs =",
+            "destructive_needs = \"none\"",
+            "primary_qcow2_host_side_mutation = \"not-requested\"",
+            "cleanup =",
+            "configuration_delta =",
+            "baseline_xml_sha256 =",
+            "lease = \"/tmp/os-project-vm.lock\"",
+            "connection = \"qemu:///system\"",
+        ] {
+            assert!(request.contains(required), "request omits {required}");
+        }
+        // It must not claim anything it cannot establish.
+        assert!(request.contains("acceptance_identity = \"none-minted\""));
+        assert!(request.contains("advances_e8 = false"));
+        assert!(request.contains("physical_io = \"not-performed\""));
+        // And it must say plainly that the verifier does not consume it, so no
+        // operator goes looking for a schema that does not exist.
+        assert!(request.contains("not"));
+        assert!(request.contains("verify-vm-request.py"));
+    }
+
+    #[test]
+    fn each_profile_carries_the_exact_command_for_its_own_leg() {
+        let output = Path::new("/home/mike/Documents/Programming/OS-Project/artifacts/r1-260912");
+        let request = render_request(
+            output,
+            "a7ce037",
+            "12d75ae",
+            "085b184",
+            "a9b0671",
+            "8100000000000001",
+            1240,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        // Each command must name its own domain and output directory. Passing one
+        // profile's domain with the other's output directory would put the nvram
+        // copy where the domain does not expect it and fail at start.
+        for (profile, _, _) in PROFILES {
+            let directory = output.join(profile);
+            assert!(request.contains(&format!("{} ", directory.join("domain.xml").display())));
+            assert!(request.contains(&format!("{} 1240 300", directory.display())));
+        }
+        assert!(request.contains("run-active-gdb-vm.sh"));
+        assert!(request.contains("ACTIVE_GDB_EXTRA_HOOKS=tools/gdb/r1-liveness.gdb"));
+        assert!(request.contains("diagnostic-only"));
+        assert!(request.contains("vcpus = 4"));
+        assert!(request.contains("vcpus = 1"));
+    }
+}

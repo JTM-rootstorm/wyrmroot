@@ -1143,6 +1143,26 @@ pub(crate) fn prepare(
         )
     })?;
 
+    let request = render_request(
+        &output,
+        &wyrmroot_revision,
+        deep_revision,
+        &abi_revision,
+        &abi_tree,
+        nonce,
+        gdb_port,
+        &digests,
+    )?;
+    write_new(
+        &output.join("request.toml"),
+        request.as_bytes(),
+        "card R1 request",
+    )?;
+    digests.insert(
+        "request.toml".to_owned(),
+        sha256::bytes_digest(request.as_bytes()),
+    );
+
     let receipt = render_source_receipt(
         &wyrmroot_revision,
         deep_revision,
@@ -1165,7 +1185,7 @@ pub(crate) fn prepare(
     verify_repository_revision(&repository, &wyrmroot_revision)?;
     Ok(format!(
         "WYR1_R1_PREPARE_PASS product_kind={PRODUCT_KIND} selector={SELECTOR} test_id={TEST_ID} \
-         request=not-produced physical_io=not-performed deepwyrm_revision={deep_revision} \
+         request=request.toml physical_io=not-performed deepwyrm_revision={deep_revision} \
          wyrmroot_revision={wyrmroot_revision} gdb_port={gdb_port} \
          source_receipt={}\n",
         output.join("source-receipt.toml").display(),
@@ -1201,7 +1221,7 @@ fn render_source_receipt(
         ("machine", MACHINE.to_owned()),
         ("firmware", "uefi-ovmf-x64".to_owned()),
         ("memory_kib", MEMORY_KIB.to_string()),
-        ("request", "not-produced".to_owned()),
+        ("request", "request.toml".to_owned()),
         ("physical_io", "not-performed".to_owned()),
         ("baseline_domain_sha256", BASELINE_DOMAIN_SHA256.to_owned()),
         ("domain_uuid", DOMAIN_UUID.to_owned()),
@@ -1225,3 +1245,186 @@ fn render_source_receipt(
 /// reading the harness.
 pub(crate) const BASELINE_DOMAIN_SHA256: &str =
     "a823095e2182f848be0c15fe1a88728fce9f126fbc55e7d9aab30d84a6c5d3c3";
+
+/// Host timeout for one profile leg, in seconds.
+///
+/// This must **exceed the probe's own bounds**, and that is the whole point.
+/// A27 failed because the host's 30 s bound expired before anything in the guest
+/// reported, so the only evidence was "a spawn timed out". The probe now bounds
+/// every wait itself — 3 s for an accept, 8 s for a terminal result — so the host
+/// timeout exists only to stop a genuinely wedged guest, and must be larger than
+/// any sequence the probe can legitimately take.
+///
+/// Worst case for the six-hog leg: per hog, a hog accept (3) plus a progress
+/// accept (3) plus a progress result (8) is 14 s, and bounded cleanup is a
+/// termination accept (8) plus a hog result (8), 16 s. Six hogs is 180 s, plus
+/// firmware and boot. 300 s leaves margin without letting a wedged guest hold the
+/// lease indefinitely.
+pub(crate) const REQUEST_TIMEOUT_SECONDS: u32 = 300;
+
+/// Seconds the probe itself can legitimately consume on the SMP leg, from its own
+/// bounds. Kept beside the host timeout so the ordering between them is a test
+/// rather than a comment.
+pub(crate) const PROBE_WORST_CASE_SECONDS: u32 = 180;
+
+/// Renders the request AGENTS.md §10 requires before a run.
+///
+/// §10 names eight things an acceptable request must carry: project and gate,
+/// exact Deepwyrm and Wyrmroot revisions with dirty qualification, artifact and
+/// media identity, the effective profile, selector, commands and expected
+/// signals, timeout and logs, and destructive storage, configuration and cleanup
+/// needs. Each has a section below, and the emitted file is what Mike accepts —
+/// it is not consumed by `tools/verify-vm-request.py`, which serves the
+/// `run-verified-vm-request.py` capture/recheck flow that a GDB-attached
+/// diagnostic run does not use.
+#[allow(clippy::too_many_arguments)]
+fn render_request(
+    output: &Path,
+    wyrmroot_revision: &str,
+    deep_revision: &str,
+    abi_revision: &str,
+    abi_tree: &str,
+    nonce: &str,
+    gdb_port: u16,
+    digests: &BTreeMap<String, String>,
+) -> Result<String, Failure> {
+    use std::fmt::Write as _;
+    let mut request = String::new();
+    let mut line = |text: String| {
+        let _ = writeln!(&mut request, "{text}");
+    };
+
+    line("schema = \"wyrmroot-r1-vm-request-v1\"".into());
+    line(format!("kind = \"{REQUEST_KIND}\""));
+    line("# Accepted by Mike before a run, per AGENTS.md §10. This file is not".into());
+    line("# consumed by tools/verify-vm-request.py: that tool serves the".into());
+    line("# run-verified-vm-request.py capture/recheck flow, and a GDB-attached".into());
+    line("# diagnostic run goes through tools/run-active-gdb-vm.sh instead.".into());
+    line(String::new());
+
+    line("[gate]".into());
+    line("project = \"DW1/WYR1 runtime reset\"".into());
+    line("card = \"R1C\"".into());
+    line("plan = \"DW1_WYR1_RUNTIME_RESET_IMPLEMENTATION_PLAN.md\"".into());
+    line("question = \"reproduce the present failure family, or establish that A27 depends on additional E8 state\"".into());
+    line("acceptance_identity = \"none-minted\"".into());
+    line("advances_e8 = false".into());
+    line("security_conclusion = \"none\"".into());
+    line("# A failing run is a valid result if it identifies internal scheduler,".into());
+    line("# wait or teardown state. A run that stalls and captures no structured".into());
+    line("# state fails the card even though the VM behaved.".into());
+    line("failing_run_is_valid = true".into());
+    line(String::new());
+
+    line("[revisions]".into());
+    line(format!("deepwyrm = \"{deep_revision}\""));
+    line("deepwyrm_dirty = \"clean\"".into());
+    line(format!("wyrmroot = \"{wyrmroot_revision}\""));
+    line("wyrmroot_dirty = \"clean\"".into());
+    line(format!("rust = \"{ACCEPTED_RUST_REVISION}\""));
+    line(format!("rust_toolchain = \"{ACCEPTED_TOOLCHAIN_NAME}\""));
+    line(format!("generated_abi_revision = \"{abi_revision}\""));
+    line(format!("generated_abi_tree = \"{abi_tree}\""));
+    line("# Both checkouts were verified clean at preparation and the revisions".into());
+    line("# above were re-verified after every build step.".into());
+    line(String::new());
+
+    line("[domain]".into());
+    line("connection = \"qemu:///system\"".into());
+    line("name = \"OS-Project\"".into());
+    line(format!("uuid = \"{DOMAIN_UUID}\""));
+    line(format!(
+        "baseline_xml_sha256 = \"{BASELINE_DOMAIN_SHA256}\""
+    ));
+    line("lease = \"/tmp/os-project-vm.lock\"".into());
+    line(format!("machine = \"{MACHINE}\""));
+    line("firmware = \"uefi-ovmf-x64\"".into());
+    line(format!("memory_kib = {MEMORY_KIB}"));
+    line(String::new());
+
+    line("[storage]".into());
+    line("# §10 requires destructive needs to be stated. This card has none.".into());
+    line("destructive_needs = \"none\"".into());
+    line("primary_qcow2_host_side_mutation = \"not-requested\"".into());
+    line("overlays = \"none\"".into());
+    line("snapshots = \"none\"".into());
+    line("guest_io = \"none; the guest writes no storage\"".into());
+    line("media = \"project-owned, read-only ESP per profile\"".into());
+    line("nvram = \"per-profile copy created by the harness inside the product\"".into());
+    line(
+        "configuration_delta = \"domain XML redefined per profile; harness restores the baseline\""
+            .into(),
+    );
+    line("cleanup = \"harness destroys the domain if running, redefines the baseline, and records the inactive digest\"".into());
+    line(String::new());
+
+    line("[run]".into());
+    line(format!("selector = \"{SELECTOR}\""));
+    line(format!("test_id = {TEST_ID}"));
+    line(format!("evidence_nonce = \"{nonce}\""));
+    line(
+        "evidence_protocol = \"R1SP over the selector-private evidence syscall 0xffffff22\"".into(),
+    );
+    line("transcript = \"COM1 serial; no COM2 conversation\"".into());
+    line(format!("gdb_port = {gdb_port}"));
+    line("gdb_required = true".into());
+    line("# §8.2's three carrier facts sit behind the monolithic runtime authority".into());
+    line("# on a boot-stack-pinned carrier, so reading a stopped guest over the".into());
+    line("# gdbstub is the only way to obtain them without entering the authority".into());
+    line("# under investigation.".into());
+    line("hook_profile = \"diagnostic-only\"".into());
+    line(format!("timeout_seconds = {REQUEST_TIMEOUT_SECONDS}"));
+    line(format!(
+        "probe_worst_case_seconds = {PROBE_WORST_CASE_SECONDS}"
+    ));
+    line("# The host bound exceeds the probe's own, so the probe reports a".into());
+    line("# classification rather than the host timing out first, which is exactly".into());
+    line("# what left A27 with no evidence.".into());
+    line("logs = \"serial.log, active.gdb.log, and the snapshot log on a timeout re-attach, per profile directory\"".into());
+    line("physical_io = \"not-performed\"".into());
+    line(String::new());
+
+    for (profile, hog_count, online_cpus) in PROFILES {
+        let directory = output.join(profile);
+        line(format!("[profile.{profile}]"));
+        line(format!("vcpus = {online_cpus}"));
+        line(format!("hog_count = {hog_count}"));
+        line(format!("domain_xml = \"{profile}/domain.xml\""));
+        line(format!("esp = \"{profile}/r1-esp.img\""));
+        line(format!("bootfs = \"{profile}/bootfs.img\""));
+        line(format!("gate = \"{profile}/r1-gate-v1.bin\""));
+        line("# §4: if the domain cannot present exactly this width, reject the".into());
+        line("# request rather than run at another. A27's diagnosis depends on it.".into());
+        line(format!(
+            "command = \"ACTIVE_GDB_EXTRA_HOOKS=tools/gdb/r1-liveness.gdb \
+             tools/run-active-gdb-vm.sh {} {} {} {} {gdb_port} {REQUEST_TIMEOUT_SECONDS} \
+             diagnostic-only\"",
+            directory.join("domain.xml").display(),
+            output.join("artifacts/deepwyrm.symbols.elf").display(),
+            output.join("artifacts/OVMF_VARS.fd").display(),
+            directory.display(),
+        ));
+        line(String::new());
+    }
+
+    line("[expected_signals]".into());
+    line(
+        "pass = \"one R1SP terminal record with outcome zero, after the full step sequence\""
+            .into(),
+    );
+    line("classified_failure = \"an R1SP failure record naming one of the seven ProbeFailure ordinals, then the terminal record\"".into());
+    line(
+        "card_failure = \"no structured record at all; the run stalled and proved nothing\"".into(),
+    );
+    line("# The third outcome is the only one that fails card R1 rather than".into());
+    line("# answering it.".into());
+    line(String::new());
+
+    line("[digest]".into());
+    for (name, digest) in digests {
+        line(format!("\"{name}\" = \"{digest}\""));
+    }
+    Ok(request)
+}
+
+pub(crate) const REQUEST_KIND: &str = "wyrmroot-r1-saturation-request";
