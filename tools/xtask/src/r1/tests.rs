@@ -254,9 +254,51 @@ mod domain {
 mod media {
     use super::*;
 
+    fn archives(sizes: &[(&str, usize)]) -> BTreeMap<String, Vec<u8>> {
+        sizes
+            .iter()
+            .map(|(name, bytes)| ((*name).to_owned(), vec![0_u8; *bytes]))
+            .collect()
+    }
+
     #[test]
-    fn the_kernel_environment_is_exactly_the_selector_and_the_nonce() {
-        let environment = kernel_environment("8100000000000001");
+    fn the_page_bound_is_measured_from_the_largest_archive_that_will_be_mapped() {
+        // One kernel serves both profiles, so the smaller archive must not set
+        // the bound: the journal has to fit whichever archive is mapped.
+        assert_eq!(
+            bootfs_page_ceiling(&archives(&[("smp", 593_328), ("control", 4_096)])).unwrap(),
+            145
+        );
+        assert_eq!(
+            bootfs_page_ceiling(&archives(&[("smp", 4_096), ("control", 593_328)])).unwrap(),
+            145
+        );
+        // A partial trailing page still needs a whole mapped page.
+        assert_eq!(
+            bootfs_page_ceiling(&archives(&[("smp", 4_097)])).unwrap(),
+            2
+        );
+        assert_eq!(
+            bootfs_page_ceiling(&archives(&[("smp", 4_096)])).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_page_bound_refuses_what_deepwyrm_cannot_compile() {
+        // Deepwyrm's parser asserts 1..=8192, so an out-of-range count must fail
+        // here rather than at kernel build time with a const-eval panic.
+        assert!(bootfs_page_ceiling(&archives(&[("smp", 8_192 * 4_096)])).is_ok());
+        assert!(bootfs_page_ceiling(&archives(&[("smp", 8_192 * 4_096 + 1)])).is_err());
+        // An empty archive would compile a zero ceiling, which the kernel rejects.
+        assert!(bootfs_page_ceiling(&archives(&[("smp", 0)])).is_err());
+        // No profile at all is a producer defect, not a zero bound.
+        assert!(bootfs_page_ceiling(&BTreeMap::new()).is_err());
+    }
+
+    #[test]
+    fn the_kernel_environment_is_exactly_the_selector_the_nonce_and_the_page_bound() {
+        let environment = kernel_environment("8100000000000001", 145);
         assert_eq!(
             environment,
             [
@@ -265,8 +307,13 @@ mod media {
                     "dynamic-launch-saturation".to_owned()
                 ),
                 ("DEEPWYRM_R1_EVIDENCE_NONCE", "8100000000000001".to_owned()),
+                ("DEEPWYRM_R1_BOOTFS_MAX_PAGES", "145".to_owned()),
             ]
         );
+        // The page bound is not decoration: Deepwyrm sizes its primordial
+        // mapping journal from it, and selector 34 inherited a 17-page default
+        // before this variable existed, which made the bootstrap's bootfs
+        // mapping fail with NO_RESOURCES on a 145-page archive.
         // The nonce must be the same value the probe was compiled against. If it
         // were not, the collector would refuse every record and a working run
         // would report nothing at all — the failure mode hardest to tell from a
@@ -351,6 +398,7 @@ mod request {
             "a9b067107ec38e2be44630f4dce428dab0f48de8",
             "8100000000000001",
             1240,
+            145,
             &digests,
         )
         .unwrap();
@@ -402,6 +450,7 @@ mod request {
             "a9b0671",
             "8100000000000001",
             1240,
+            145,
             &BTreeMap::new(),
         )
         .unwrap();

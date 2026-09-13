@@ -46,6 +46,9 @@ const PRODUCT_KIND: &str = "wyr1-r1-saturation";
 const ACCEPTED_RUST_REVISION: &str = "a92dc7f7464ad6ddfece4402bd7b86dbfa86166d";
 const ACCEPTED_TOOLCHAIN_NAME: &str = "wyrmroot-1.97.1-a92dc7f7";
 const R1_EVIDENCE_VARIABLE: &str = "DEEPWYRM_R1_EVIDENCE_NONCE";
+/// Selector 34's measured bootfs page ceiling, validated by `pinned-cargo` and
+/// compiled into Deepwyrm's primordial mapping journal.
+const R1_BOOTFS_PAGES_VARIABLE: &str = "DEEPWYRM_R1_BOOTFS_MAX_PAGES";
 const MAX_BOOTFS_BYTES: usize = 32 * 1024 * 1024;
 const MAX_RECEIPT_BYTES: usize = 64 * 1024;
 /// Card R1's WYR1-A gate slot. The card has no A-era gate behaviour; the byte is
@@ -767,10 +770,35 @@ pub(crate) struct R1Media {
     dead_code,
     reason = "media seam consumed by the follow-on r1 prepare command"
 )]
-pub(crate) fn kernel_environment(nonce: &str) -> [(&'static str, String); 2] {
+/// The exact mapped page count selector 34's kernel must admit.
+///
+/// One kernel serves both profiles, so the ceiling is the larger archive's page
+/// count. Deepwyrm sizes its primordial mapping journal from this value, so it
+/// has to be measured from the archives that will actually be mapped rather
+/// than guessed: an archive past the compiled ceiling does not fail admission,
+/// it fails the bootstrap's bootfs mapping with an opaque NO_RESOURCES.
+pub(crate) fn bootfs_page_ceiling(bootfs: &BTreeMap<String, Vec<u8>>) -> Result<usize, Failure> {
+    const PAGE_BYTES: usize = 4096;
+    const CEILING_PAGES: usize = 8192;
+
+    let pages = bootfs
+        .values()
+        .map(|archive| archive.len().div_ceil(PAGE_BYTES))
+        .max()
+        .ok_or_else(|| Failure::task("card R1 has no profile archive to measure"))?;
+    if pages == 0 || pages > CEILING_PAGES {
+        return Err(Failure::task(format!(
+            "card R1 bootfs page ceiling {pages} is outside Deepwyrm's 1..={CEILING_PAGES} bound"
+        )));
+    }
+    Ok(pages)
+}
+
+pub(crate) fn kernel_environment(nonce: &str, bootfs_pages: usize) -> [(&'static str, String); 3] {
     [
         ("DEEPWYRM_GUEST_TEST_SELECTOR", SELECTOR.to_owned()),
         (R1_EVIDENCE_VARIABLE, nonce.to_owned()),
+        (R1_BOOTFS_PAGES_VARIABLE, bootfs_pages.to_string()),
     ]
 }
 
@@ -784,7 +812,11 @@ pub(crate) fn kernel_environment(nonce: &str) -> [(&'static str, String); 2] {
     dead_code,
     reason = "media seam consumed by the follow-on r1 prepare command"
 )]
-pub(crate) fn build_kernel(deep_repository: &Path, nonce: &str) -> Result<Vec<u8>, Failure> {
+pub(crate) fn build_kernel(
+    deep_repository: &Path,
+    nonce: &str,
+    bootfs_pages: usize,
+) -> Result<Vec<u8>, Failure> {
     use std::process::{Command, Stdio};
 
     let repository =
@@ -827,7 +859,7 @@ pub(crate) fn build_kernel(deep_repository: &Path, nonce: &str) -> Result<Vec<u8
             .env_remove("LD_PRELOAD")
             .current_dir(repository.path())
             .stdin(Stdio::null());
-        for (key, value) in kernel_environment(nonce) {
+        for (key, value) in kernel_environment(nonce, bootfs_pages) {
             command.env(key, value);
         }
         let status = command
@@ -1005,7 +1037,13 @@ pub(crate) fn prepare(
         build_directory.with_inheritable_anchor("card R1 build directory", |anchor| {
             crate::wyr1c6::build_c6_bootstrap(&repository, &toolchain, &layout, &cargo_home, anchor)
         })?;
-    let kernel = build_kernel(&deep_repository, nonce)?;
+    // The snapshot is assembled before the kernel on purpose: the kernel's
+    // mapping journal is sized from the archives' measured page count, so they
+    // must exist first. Nothing in the snapshot consumes the kernel — the ESP
+    // composition that needs both still runs after this.
+    let snapshot = build_snapshot(&repository, &project, nonce)?;
+    let bootfs_pages = bootfs_page_ceiling(&snapshot.bootfs)?;
+    let kernel = build_kernel(&deep_repository, nonce, bootfs_pages)?;
     let media = R1Media {
         loader: uefi.loader_bytes,
         kernel,
@@ -1023,7 +1061,6 @@ pub(crate) fn prepare(
         )?,
     };
 
-    let snapshot = build_snapshot(&repository, &project, nonce)?;
     toolchain.accepted().verify_unchanged()?;
     layout.verify_unchanged()?;
     verify_repository_revision(&repository, &wyrmroot_revision)?;
@@ -1151,6 +1188,7 @@ pub(crate) fn prepare(
         &abi_tree,
         nonce,
         gdb_port,
+        bootfs_pages,
         &digests,
     )?;
     write_new(
@@ -1170,6 +1208,7 @@ pub(crate) fn prepare(
         &abi_tree,
         nonce,
         gdb_port,
+        bootfs_pages,
         &digests,
     )?;
     write_new(
@@ -1200,6 +1239,7 @@ fn render_source_receipt(
     abi_tree: &str,
     nonce: &str,
     gdb_port: u16,
+    bootfs_pages: usize,
     digests: &BTreeMap<String, String>,
 ) -> Result<String, Failure> {
     use std::fmt::Write as _;
@@ -1225,6 +1265,13 @@ fn render_source_receipt(
         ("physical_io", "not-performed".to_owned()),
         ("baseline_domain_sha256", BASELINE_DOMAIN_SHA256.to_owned()),
         ("domain_uuid", DOMAIN_UUID.to_owned()),
+        // The exact bound compiled into the kernel's primordial mapping
+        // journal, so a later reader can check it against the archives below.
+        ("bootfs_pages", bootfs_pages.to_string()),
+        (
+            "kernel_bootfs_env",
+            format!("{R1_BOOTFS_PAGES_VARIABLE}={bootfs_pages}"),
+        ),
     ] {
         writeln!(&mut receipt, "{key} = \"{value}\"").ok();
     }
@@ -1286,6 +1333,7 @@ fn render_request(
     abi_tree: &str,
     nonce: &str,
     gdb_port: u16,
+    bootfs_pages: usize,
     digests: &BTreeMap<String, String>,
 ) -> Result<String, Failure> {
     use std::fmt::Write as _;
@@ -1367,6 +1415,14 @@ fn render_request(
     );
     line("transcript = \"COM1 serial; no COM2 conversation\"".into());
     line(format!("gdb_port = {gdb_port}"));
+    // Stated because it is otherwise invisible at acceptance: Deepwyrm sizes
+    // its primordial mapping journal from this measured count, and an archive
+    // past the compiled bound fails the bootstrap's mapping rather than any
+    // admission check.
+    line(format!("bootfs_pages = {bootfs_pages}"));
+    line(format!(
+        "kernel_bootfs_env = \"{R1_BOOTFS_PAGES_VARIABLE}={bootfs_pages}\""
+    ));
     line("gdb_required = true".into());
     line("# §8.2's three carrier facts sit behind the monolithic runtime authority".into());
     line("# on a boot-stack-pinned carrier, so reading a stopped guest over the".into());
