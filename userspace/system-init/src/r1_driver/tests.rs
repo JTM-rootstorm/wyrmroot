@@ -196,6 +196,14 @@ impl Wyr1BPlatform for Probe {
         _deadline: DwDeadline,
     ) -> Result<DwWaitResultV1, NativeError> {
         assert_eq!(items.len(), 2);
+        // Pins the ordering `drain` depends on: the kernel resolves a tie to the
+        // lowest input index, so the Channel must be asked about first or a
+        // terminal record queued just before the probe's exit is discarded.
+        assert_eq!(
+            items[0].signals.0,
+            DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0
+        );
+        assert_eq!(items[1].signals, DW_SIGNAL_EXITED);
         if self.pending() {
             return Ok(DwWaitResultV1 {
                 index: 0,

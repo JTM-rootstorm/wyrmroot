@@ -250,6 +250,13 @@ where
     let configuration = parse_gate(gate.data()).map_err(|_| InitError::WrongManifestProfile)?;
     let arguments = PlanArguments::new(configuration)?;
     let plan = arguments.plan;
+    // Borrowed before any handle exists, deliberately. Taken at the load call
+    // instead, the two `?` would return from this function after the task group,
+    // the Channel pair and the installed session had been acquired, leaking all
+    // three and contradicting this function's cleanup invariant. `PlanArguments`
+    // has already proved both entries succeed, so this is unreachable today --
+    // which is exactly why it would survive review as written.
+    let argv = [arguments.entry(0)?, arguments.entry(1)?];
     let image = archive
         .lookup(R1_PROBE_PATH.as_bytes())
         .map_err(map_lookup)?;
@@ -312,7 +319,7 @@ where
             image: image.data(),
             display_path: R1_PROBE_PATH,
             launch_session: child_launch,
-            arguments: &[arguments.entry(0)?, arguments.entry(1)?],
+            arguments: &argv,
             correlation: &correlation,
             transaction_id: TRANSACTION,
         },
@@ -408,6 +415,13 @@ where
         if state.relay.complete() {
             return Ok(());
         }
+        // The order of these two items is load-bearing. The probe sends its
+        // terminal record and then exits, so both can be ready at once, and the
+        // kernel resolves a tie to the lowest input index (its wait engine scans
+        // requests in order and a test pins that). With the Channel first, a
+        // queued terminal record is read; with the Process first, the branch
+        // below would read that same run as one that stopped reporting and throw
+        // the transcript away. The double asserts this shape on every call.
         let items = [
             DwWaitItemV1 {
                 handle: state.probe.launch_channel,
@@ -467,8 +481,15 @@ where
     Ok(())
 }
 
-/// Terminal teardown. The kernel's handling of the terminal record has already
-/// flushed the transcript, so nothing follows it and the probe is retired.
+/// Terminal teardown.
+///
+/// In the product this does not run. Deepwyrm's terminal branch for the evidence
+/// syscall is `complete_r1_evidence`, which is `-> !`: it flushes the transcript,
+/// writes the completion record and exits the guest, so the relay's submit of the
+/// terminal record never returns and nothing after it executes. This path exists
+/// for the host double, which does return, and it is written as real teardown so
+/// the double exercises the same ownership the launch established rather than a
+/// weaker stub.
 ///
 /// Every job the probe launched was terminated and awaited by the plan itself
 /// before its terminal record, so the dispatcher has no live job left to reap
