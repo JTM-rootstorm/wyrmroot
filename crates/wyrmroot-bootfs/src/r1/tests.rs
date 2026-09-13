@@ -182,3 +182,241 @@ fn the_gate_parser_refuses_every_malformed_shape() {
     identity[16..48].fill(0);
     assert_eq!(parse_gate(&identity), Err(GateError::ZeroIdentity));
 }
+
+#[cfg(feature = "builder")]
+mod archive {
+    use super::*;
+    use crate::archive::Archive;
+    use crate::builder::BuildError;
+    use crate::launch_policy::encode as encode_policy;
+    use crate::wyr1::{
+        CONSOLED_PATH, DEVMGR_PATH, INIT_PATH, LAUNCH_POLICY_PATH, REGISTRYD_PATH, UART16550D_PATH,
+        WYR1_C1_MARKER, WYRMSH_PATH,
+        tests::{UART_IDENTITY, c1_product, canonical_wrdm},
+    };
+
+    const GENERATION: [u8; 32] = [0x77; 32];
+
+    fn policy_bytes(hog: [u8; 32], hello: [u8; 32]) -> alloc::vec::Vec<u8> {
+        let mut bytes = [0_u8; 1024];
+        let size = encode_policy(GENERATION, &launch_policy_entries(hog, hello), &mut bytes)
+            .expect("policy encodes");
+        bytes[..size].to_vec()
+    }
+
+    fn gate_bytes(hog_count: u16, online_cpus: u16, probe: [u8; 32]) -> [u8; R1_GATE_BYTES] {
+        let mut bytes = [0_u8; R1_GATE_BYTES];
+        encode_gate(
+            ProbeConfiguration {
+                hog_count,
+                online_cpus,
+                probe_identity: probe,
+            },
+            &mut bytes,
+        )
+        .expect("gate encodes");
+        bytes
+    }
+
+    fn product<'a>(
+        device_manifest: &'a [u8],
+        launch_policy: &'a [u8],
+        gate_config: &'a [u8],
+    ) -> ProductR1<'a> {
+        ProductR1 {
+            c1: c1_product(WYR1_C1_MARKER, device_manifest, UART_IDENTITY),
+            launch_policy,
+            gate_config,
+            probe: b"probe",
+            cpu_hog: b"hog",
+            hello: b"hello",
+            expected_probe_identity: PROBE,
+            expected_cpu_hog_identity: HOG,
+            expected_hello_identity: HELLO,
+        }
+    }
+
+    #[test]
+    fn the_archive_is_deterministic_and_carries_the_exact_entry_set() {
+        let wrdm = canonical_wrdm(UART_IDENTITY);
+        let policy = policy_bytes(HOG, HELLO);
+        let gate = gate_bytes(6, 4, PROBE);
+        let bytes = build_r1(product(&wrdm, &policy, &gate)).unwrap();
+        assert_eq!(bytes, build_r1(product(&wrdm, &policy, &gate)).unwrap());
+
+        let archive = Archive::new(&bytes).unwrap();
+        for path in [
+            INIT_PATH,
+            REGISTRYD_PATH,
+            DEVMGR_PATH,
+            LAUNCH_POLICY_PATH,
+            R1_GATE_PATH,
+            R1_PROBE_PATH,
+            "bin/cpu-hog",
+            "bin/hello",
+        ] {
+            assert!(archive.lookup(path.as_bytes()).is_ok(), "{path} is missing");
+        }
+        // The three excluded roles are present as images because the RRC graph
+        // says the roles exist, and non-launchable because the policy admits
+        // neither. Their presence is the graph; their exclusion is the policy.
+        for retained in [UART16550D_PATH, CONSOLED_PATH, WYRMSH_PATH] {
+            assert!(archive.lookup(retained.as_bytes()).is_ok());
+            assert!(
+                !launch_policy_entries(HOG, HELLO)
+                    .iter()
+                    .any(|entry| entry.path == retained)
+            );
+        }
+        assert!(
+            archive
+                .lookup(R1_PROBE_PATH.as_bytes())
+                .unwrap()
+                .is_executable()
+        );
+        assert!(
+            !archive
+                .lookup(R1_GATE_PATH.as_bytes())
+                .unwrap()
+                .is_executable()
+        );
+        assert!(
+            !archive
+                .lookup(LAUNCH_POLICY_PATH.as_bytes())
+                .unwrap()
+                .is_executable()
+        );
+    }
+
+    #[test]
+    fn a_policy_naming_different_bytes_than_the_payloads_is_refused() {
+        // The failure this prevents: an image whose policy admits a digest the
+        // archive does not contain would boot and then refuse every launch,
+        // which reads as the probe failing rather than as a build defect.
+        let wrdm = canonical_wrdm(UART_IDENTITY);
+        let gate = gate_bytes(6, 4, PROBE);
+        let substituted = policy_bytes([0x99; 32], HELLO);
+        assert_eq!(
+            build_r1(product(&wrdm, &substituted, &gate)),
+            Err(BuildError::R1PolicyIdentityMismatch)
+        );
+        let substituted_hello = policy_bytes(HOG, [0x98; 32]);
+        assert_eq!(
+            build_r1(product(&wrdm, &substituted_hello, &gate)),
+            Err(BuildError::R1PolicyIdentityMismatch)
+        );
+    }
+
+    #[test]
+    fn a_policy_with_the_wrong_stream_shape_or_extra_entry_is_refused() {
+        let wrdm = canonical_wrdm(UART_IDENTITY);
+        let gate = gate_bytes(6, 4, PROBE);
+
+        // Giving the hog stdio is structurally valid and semantically wrong: a
+        // saturation payload with output changes what the run measures.
+        let mut entries = launch_policy_entries(HOG, HELLO);
+        entries[0].allow_no_streams = false;
+        entries[0].allow_three_streams = true;
+        let mut bytes = [0_u8; 1024];
+        let size = encode_policy(GENERATION, &entries, &mut bytes).unwrap();
+        assert_eq!(
+            build_r1(product(&wrdm, &bytes[..size], &gate)),
+            Err(BuildError::InvalidR1LaunchPolicy)
+        );
+
+        // One admitted payload too many is refused even when both expected
+        // entries are present and correct.
+        let widened = [
+            entries[0],
+            entries[1],
+            crate::launch_policy::LaunchPolicyEntry {
+                path: crate::launch_policy::WYRMSH_PATH,
+                content_sha256: [0x33; 32],
+                startup_abi: R1_STARTUP_ABI,
+                profile_id: JOB_V2_PROFILE_ID,
+                allow_no_streams: false,
+                allow_three_streams: true,
+            },
+        ];
+        let mut wide = [0_u8; 1024];
+        let size = encode_policy(GENERATION, &widened, &mut wide).unwrap();
+        assert_eq!(
+            build_r1(product(&wrdm, &wide[..size], &gate)),
+            Err(BuildError::InvalidR1LaunchPolicy)
+        );
+    }
+
+    #[test]
+    fn a_gate_naming_another_probe_or_topology_is_refused() {
+        let wrdm = canonical_wrdm(UART_IDENTITY);
+        let policy = policy_bytes(HOG, HELLO);
+
+        let foreign = gate_bytes(6, 4, [0x5B; 32]);
+        assert_eq!(
+            build_r1(product(&wrdm, &policy, &foreign)),
+            Err(BuildError::R1ProbeIdentityMismatch)
+        );
+
+        // A topology no profile handoff provides. Both halves are individually
+        // plausible, which is why the pairing is what gets checked.
+        let unaccepted = gate_bytes(6, 1, PROBE);
+        assert_eq!(
+            build_r1(product(&wrdm, &policy, &unaccepted)),
+            Err(BuildError::R1UnacceptedTopology)
+        );
+        let malformed = [0_u8; R1_GATE_BYTES];
+        assert_eq!(
+            build_r1(product(&wrdm, &policy, &malformed)),
+            Err(BuildError::InvalidR1GateConfiguration)
+        );
+    }
+
+    #[test]
+    fn both_profile_handoffs_build_and_differ_only_in_the_gate() {
+        let wrdm = canonical_wrdm(UART_IDENTITY);
+        let policy = policy_bytes(HOG, HELLO);
+        let smp = build_r1(product(&wrdm, &policy, &gate_bytes(6, 4, PROBE))).unwrap();
+        let control = build_r1(product(&wrdm, &policy, &gate_bytes(3, 1, PROBE))).unwrap();
+        assert_ne!(smp, control);
+        // Same entry set, same payload bytes: the two runs are one product with
+        // two configurations, which is what lets their results be compared.
+        assert_eq!(smp.len(), control.len());
+        let smp_archive = Archive::new(&smp).unwrap();
+        let control_archive = Archive::new(&control).unwrap();
+        for path in [
+            R1_PROBE_PATH,
+            "bin/cpu-hog",
+            "bin/hello",
+            LAUNCH_POLICY_PATH,
+        ] {
+            assert_eq!(
+                smp_archive.lookup(path.as_bytes()).unwrap().data(),
+                control_archive.lookup(path.as_bytes()).unwrap().data()
+            );
+        }
+        assert_ne!(
+            smp_archive.lookup(R1_GATE_PATH.as_bytes()).unwrap().data(),
+            control_archive
+                .lookup(R1_GATE_PATH.as_bytes())
+                .unwrap()
+                .data()
+        );
+    }
+
+    #[test]
+    fn c1s_own_validation_still_applies() {
+        // R1 does not get a weaker base: a malformed device manifest or a wrong
+        // marker is refused here exactly as build_c1 refuses it.
+        let policy = policy_bytes(HOG, HELLO);
+        let gate = gate_bytes(6, 4, PROBE);
+        let wrong_driver = canonical_wrdm([0xa2; 32]);
+        assert_eq!(
+            build_r1(product(&wrong_driver, &policy, &gate)),
+            Err(BuildError::C1DriverIdentityMismatch)
+        );
+        let wrdm = canonical_wrdm(UART_IDENTITY);
+        let mut wrong_marker = product(&wrdm, &policy, &gate);
+        wrong_marker.c1.marker = b"WYR1-B";
+        assert_eq!(build_r1(wrong_marker), Err(BuildError::WrongC1Marker));
+    }
+}

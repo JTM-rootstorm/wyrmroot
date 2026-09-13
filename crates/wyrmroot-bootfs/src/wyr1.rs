@@ -826,7 +826,7 @@ fn validate_e8_product(product: ProductE8<'_>) -> Result<(), BuildError> {
     Ok(())
 }
 
-fn validate_c1_product(product: ProductC1<'_>) -> Result<(), BuildError> {
+pub(crate) fn validate_c1_product(product: ProductC1<'_>) -> Result<(), BuildError> {
     if product.marker != WYR1_C1_MARKER {
         return Err(BuildError::WrongC1Marker);
     }
@@ -851,15 +851,15 @@ fn validate_c1_product(product: ProductC1<'_>) -> Result<(), BuildError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::archive::Archive;
     use crate::launch_policy::{LaunchPolicyEntry, encode_wyrmsh};
     use alloc::vec;
 
-    const UART_IDENTITY: [u8; 32] = [0xa1; 32];
+    pub(crate) const UART_IDENTITY: [u8; 32] = [0xa1; 32];
 
-    fn c1_base() -> Product<'static> {
+    pub(crate) fn c1_base() -> Product<'static> {
         Product {
             init: b"init",
             registryd: b"registry",
@@ -872,7 +872,7 @@ mod tests {
         }
     }
 
-    fn canonical_wrdm(identity: [u8; 32]) -> [u8; 176] {
+    pub(crate) fn canonical_wrdm(identity: [u8; 32]) -> [u8; 176] {
         let mut bytes = [0u8; 176];
         bytes[..4].copy_from_slice(b"WRDM");
         bytes[4..6].copy_from_slice(&1u16.to_le_bytes());
@@ -896,7 +896,7 @@ mod tests {
         bytes
     }
 
-    fn c1_product<'a>(
+    pub(crate) fn c1_product<'a>(
         marker: &'a [u8],
         device_manifest: &'a [u8],
         expected_uart16550d_identity: [u8; 32],

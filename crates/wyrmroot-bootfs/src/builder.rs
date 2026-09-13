@@ -134,6 +134,19 @@ pub enum BuildError {
     /// The WYR1-E hello policy identity was zero or did not match the selected
     /// hello identity supplied by the product producer.
     E6HelloIdentityMismatch,
+    /// Reset card R1's launch policy was malformed, or did not admit exactly the
+    /// hog and progress payloads on exactly their expected stream shapes.
+    InvalidR1LaunchPolicy,
+    /// A card-R1 policy identity was zero or disagreed with the artifact
+    /// identity the product producer supplied for that payload.
+    R1PolicyIdentityMismatch,
+    /// The card-R1 WRR1 probe configuration was malformed.
+    InvalidR1GateConfiguration,
+    /// The WRR1 probe identity was zero or disagreed with the supplied probe
+    /// artifact identity.
+    R1ProbeIdentityMismatch,
+    /// The WRR1 topology was not one of the two plans reset plan §8.1 fixes.
+    R1UnacceptedTopology,
     /// The selector-33 WRJP policy was malformed or did not contain exactly
     /// the six frozen interactive-shell records.
     InvalidE7LaunchPolicy,
