@@ -648,6 +648,61 @@ pub mod record {
 /// specifies — and `§3`'s artifact list names `cpu-hog.elf` for that reason. It
 /// also validates its own entry shape as `argc == 1`, `argv[0] == "bin/cpu-hog"`
 /// and `envc == 0`, which is what this probe's launch encodes.
+/// How the probe reports a failure to the parent that launched it.
+///
+/// The probe's exit code is its only channel to the host once its record send
+/// has failed, and card R1's run 7 proved why that matters: the probe exited
+/// `0x81000030`, which named `Reporter::emit` exactly -- and said nothing about
+/// *why* the send refused, because the site discarded the native status. A
+/// missing right, a closed peer and a full buffer are different defects and all
+/// three arrived as one number.
+///
+/// Only sixteen bits survive to the host: selector 34's encoder reports the
+/// probe's code as `0xAF37_0000 | (code & 0xffff)`. So a site that carries a
+/// status sets [`NATIVE_FLAG`], names itself in the next three bits, and spends
+/// the remaining twelve on the compressed status. Every plain ordinal stays below
+/// `NATIVE_FLAG`, so none of them collide with this scheme.
+pub mod probe_status {
+    use wyrmroot_runtime::{NativeError, native_error_code};
+
+    /// Base of every probe exit code.
+    pub const ERROR_BASE: u32 = 0x8100_0000;
+
+    /// Set when the low twelve bits carry a native status, not just a site.
+    pub const NATIVE_FLAG: u32 = 0x8000;
+
+    /// Site class for the reporter's record send to permanent init.
+    pub const SITE_REPORT_SEND: u32 = 0x1000;
+
+    /// Marks a compressed status that came from `NativeError::Output`.
+    pub const OUTPUT_FLAG: u32 = 0x800;
+
+    /// Squeezes a native status into twelve bits without losing which it was.
+    ///
+    /// `native_error_code` needs sixteen; the four spent on the flag and site
+    /// class have to come from somewhere. `Output` variants are a closed set of
+    /// eight, so they keep their ordinal under [`OUTPUT_FLAG`]; a `Status` keeps
+    /// its magnitude and saturates at `0x7ff`, so an implausible value reads as
+    /// at-the-limit rather than wrapping into a small, plausible-looking one.
+    #[must_use]
+    pub const fn native_detail(error: NativeError) -> u32 {
+        let full = native_error_code(error);
+        if full & 0x8000 != 0 {
+            OUTPUT_FLAG | (full & 0x000f)
+        } else if full > 0x7ff {
+            0x7ff
+        } else {
+            full
+        }
+    }
+
+    /// The exit code for a failed record send, carrying why it failed.
+    #[must_use]
+    pub const fn report_send_failure(error: NativeError) -> u32 {
+        ERROR_BASE | NATIVE_FLAG | SITE_REPORT_SEND | native_detail(error)
+    }
+}
+
 pub const HOG_PATH: &str = "bin/cpu-hog";
 
 /// The progress child. Section 8.1 wants an *independent* process proving

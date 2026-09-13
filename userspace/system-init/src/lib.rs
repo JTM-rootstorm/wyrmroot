@@ -5481,6 +5481,102 @@ mod r1_cause_preservation {
         ),
     ];
 
+    /// The probe binary, on the other side of the channel this module's driver
+    /// reads. It is a different crate, which is exactly why run 7 escaped the
+    /// rules above: the gate was scoped to selector 34's terminal-status path
+    /// *inside system-init*, and the probe's own reporting was not in it.
+    ///
+    /// Run 7 exited `0x81000030`, which named `Reporter::emit` precisely and said
+    /// nothing about why its send refused. So the probe's discards are a milder
+    /// form of the same class than system-init's were: every site here already
+    /// carries a distinct ordinal, so the *site* survives and only the native
+    /// status is lost. That is still the difference between "the send refused"
+    /// and "the handle lacked a right".
+    const PROBE_SOURCE: (&str, &str) = (
+        "r1-saturation/src/bin/probe.rs",
+        include_str!("../../r1-saturation/src/bin/probe.rs"),
+    );
+
+    /// Probe sites that keep their ordinal but discard the native status.
+    ///
+    /// Shrinks and never grows, like `KNOWN_DISCARDS`. `Reporter::emit` is absent
+    /// because it is fixed: it was the one that actually fired, and it is the only
+    /// path every record takes.
+    const PROBE_DISCARDS: [(&str, &str); 15] = [
+        ("query_capability_info(parent).map_err(|_| PROBE_ERROR_BASE + 0x0001)?,", "parent handle query"),
+        (".map_err(|_| PROBE_ERROR_BASE + 0x0002)?;", "bootstrap channel validation"),
+        ("receive_channel(parent, &mut init, &mut handles).map_err(|_| PROBE_ERROR_BASE + 0x0004)?;", "startup INIT receive"),
+        (".map_err(|_| PROBE_ERROR_BASE + 0x000E)", "READY send to the parent"),
+        ("parse_correlation_environment(&entries).map_err(|_| PROBE_ERROR_BASE + 0x000F)?;", "correlation environment parse"),
+        (".map_err(|_| PROBE_ERROR_BASE + 0x0017)?;", "hog launch encode"),
+        (".map_err(|_| PROBE_ERROR_BASE + 0x0018)?;", "hog launch send"),
+        (".map_err(|_| PROBE_ERROR_BASE + 0x0020)?;", "progress launch encode"),
+        ("send_channel(session.channel, &bytes[..size], &[]).map_err(|_| PROBE_ERROR_BASE + 0x0021)?;", "progress launch send"),
+        (".map_err(|_| PROBE_ERROR_BASE + 0x0023)?;", "job message encode"),
+        ("send_channel(session.channel, &bytes[..size], &[]).map_err(|_| PROBE_ERROR_BASE + 0x0024)?;", "job message send"),
+        (".map_err(|_| PROBE_ERROR_BASE + 0x0026)?;", "session reply receive"),
+        ("let parsed = parse_message(&bytes[..counts.bytes], 0).map_err(|_| PROBE_ERROR_BASE + 0x0028)?;", "session reply parse"),
+        ("let deadline = monotonic_deadline_after(timeout).map_err(|_| code)?;", "deadline arithmetic; keeps the caller's site, loses the status"),
+        ("let observed = query_capability_info(info.handle).map_err(|_| ())?;", "received-handle check; discards into unit, keeping nothing"),
+    ];
+
+    fn probe_offending_lines() -> impl Iterator<Item = &'static str> {
+        PROBE_SOURCE
+            .1
+            .lines()
+            .map(str::trim)
+            .filter(|line| discards_a_cause(line))
+    }
+
+    #[test]
+    fn no_new_probe_site_discards_its_native_status() {
+        let seen = probe_offending_lines().count();
+        assert_eq!(
+            seen,
+            PROBE_DISCARDS.len(),
+            "the probe has {seen} status-discarding lines and {} are declared. \
+             More means a new one; fewer means one was fixed without shrinking \
+             PROBE_DISCARDS, or the include no longer reaches the probe",
+            PROBE_DISCARDS.len()
+        );
+        for line in probe_offending_lines() {
+            assert!(
+                PROBE_DISCARDS.iter().any(|(known, _)| *known == line),
+                "{} discards a native status at a site this gate does not know:\n  \
+                 {line}\nThe probe's exit code is the only thing the host sees \
+                 once its record send has failed; carry the status into it.",
+                PROBE_SOURCE.0
+            );
+        }
+    }
+
+    #[test]
+    fn the_probe_discard_list_shrinks_rather_than_rots() {
+        for (known, reason) in PROBE_DISCARDS {
+            assert!(
+                probe_offending_lines().any(|line| line == known),
+                "PROBE_DISCARDS lists a site that no longer exists: {known} ({reason})"
+            );
+            assert!(!reason.is_empty(), "every declared probe discard names its site");
+        }
+    }
+
+    #[test]
+    fn the_probes_only_record_send_carries_why_it_refused() {
+        // This is run 7's site. Every record the probe emits goes through it, so
+        // a discard here loses the cause of every possible transcript at once --
+        // which is why it is fixed rather than declared.
+        assert!(
+            PROBE_SOURCE.1.contains("send_channel(self.parent, &record, &[]).map_err(report_send_failure)"),
+            "the probe's record send no longer carries its native status, so a \
+             refused send is once again indistinguishable from any other"
+        );
+        assert!(
+            !PROBE_SOURCE.1.contains("map_err(|_| PROBE_ERROR_BASE + 0x0030)"),
+            "run 7's discarding form is back at the probe's record send"
+        );
+    }
+
     /// Payload-free `InitError` variants returned from more than one site in the
     /// driver, with the count at the time this gate was written.
     ///

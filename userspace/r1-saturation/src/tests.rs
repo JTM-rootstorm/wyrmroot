@@ -650,3 +650,79 @@ fn the_probe_launches_the_existing_cpu_hog_payload() {
     // The progress child is the ordinary smoke payload, launched the same way.
     assert_eq!(PROGRESS_PATH, "bin/hello");
 }
+
+/// The probe's exit code is the only thing the host sees once its record send
+/// has failed, so what fits in it is the whole diagnostic budget.
+mod probe_status_tests {
+    use crate::probe_status::{
+        ERROR_BASE, NATIVE_FLAG, OUTPUT_FLAG, SITE_REPORT_SEND, native_detail, report_send_failure,
+    };
+    use deepwyrm_syscall::DwStatus;
+    use wyrmroot_runtime::{NativeError, NativeOutputError};
+
+    /// The sixteen bits selector 34's encoder forwards to the host.
+    fn host_detail(code: u32) -> u32 {
+        code & 0xffff
+    }
+
+    #[test]
+    fn a_refused_send_says_which_status_refused_it() {
+        // Run 7 exited 0x81000030 -- the site and nothing else. These are the
+        // three answers that ordinal could have been hiding, now distinguishable.
+        let no_rights = report_send_failure(NativeError::Status(DwStatus(-13)));
+        let peer_closed = report_send_failure(NativeError::Status(DwStatus(-23)));
+        let queue_full = report_send_failure(NativeError::Status(DwStatus(-27)));
+        assert_ne!(no_rights, peer_closed);
+        assert_ne!(peer_closed, queue_full);
+        assert_ne!(no_rights, queue_full);
+        // And each keeps the status magnitude verbatim in its low bits.
+        assert_eq!(host_detail(no_rights) & 0xfff, 13);
+        assert_eq!(host_detail(peer_closed) & 0xfff, 23);
+        assert_eq!(host_detail(queue_full) & 0xfff, 27);
+    }
+
+    #[test]
+    fn a_status_carrying_code_cannot_be_read_as_a_plain_ordinal() {
+        // Every existing site is a bare ordinal well below NATIVE_FLAG, so the
+        // flag is what tells a reader which scheme a code follows. If an ordinal
+        // ever reached the flag the two would be ambiguous in a transcript.
+        for ordinal in [0x0001_u32, 0x0004, 0x0017, 0x0028, 0x0030] {
+            assert_eq!(ordinal & NATIVE_FLAG, 0);
+        }
+        let carried = report_send_failure(NativeError::Status(DwStatus(-13)));
+        assert_ne!(carried & NATIVE_FLAG, 0);
+        assert_eq!(carried & SITE_REPORT_SEND, SITE_REPORT_SEND);
+        assert_eq!(carried & 0xffff_0000, ERROR_BASE);
+    }
+
+    #[test]
+    fn output_errors_keep_their_own_identity_rather_than_joining_a_status() {
+        // `native_error_code` puts Output variants above 0x8000, which does not
+        // fit the twelve bits left here; they must not be truncated onto a
+        // Status magnitude that means something else entirely.
+        let output = native_detail(NativeError::Output(NativeOutputError::InvalidChannelReceive));
+        assert_eq!(output, OUTPUT_FLAG | 3);
+        assert_ne!(output, native_detail(NativeError::Status(DwStatus(-3))));
+        for (variant, ordinal) in [
+            (NativeOutputError::InvalidObjectInfo, 1),
+            (NativeOutputError::InvalidMemoryObjectInfo, 2),
+            (NativeOutputError::InvalidChannelReceive, 3),
+            (NativeOutputError::InvalidMappedRange, 4),
+            (NativeOutputError::InvalidLoaderOutput, 5),
+            (NativeOutputError::InvalidWaitResult, 6),
+            (NativeOutputError::InvalidTaskTerminationInfo, 7),
+            (NativeOutputError::DeadlineOverflow, 8),
+        ] {
+            assert_eq!(native_detail(NativeError::Output(variant)), OUTPUT_FLAG | ordinal);
+        }
+    }
+
+    #[test]
+    fn an_implausible_status_saturates_rather_than_wrapping() {
+        // A wrapped value would read as a small, plausible status and send a
+        // later reader after the wrong defect.
+        let huge = native_detail(NativeError::Status(DwStatus(-0x7fff_ffff)));
+        assert_eq!(huge, 0x7ff);
+        assert!(huge < OUTPUT_FLAG, "saturation must not collide with an Output");
+    }
+}

@@ -32,6 +32,7 @@ use wyrmroot_loader::launch::{
     encode_ready_for_profile, parse_init,
 };
 use wyrmroot_r1_saturation::launch_parameters::parse_nonce;
+use wyrmroot_r1_saturation::probe_status::{self, report_send_failure};
 use wyrmroot_r1_saturation::record::{self, BYTES as RECORD_BYTES};
 use wyrmroot_r1_saturation::{
     HOG_PATH, PROGRESS_PATH, ProbeFailure, ProbeOutcome, ProbePlan, ProbeStep, SaturationProbe,
@@ -52,7 +53,9 @@ const NONCE: u64 = match parse_nonce(env!("DEEPWYRM_R1_EVIDENCE_NONCE")) {
     Err(_) => panic!("DEEPWYRM_R1_EVIDENCE_NONCE must be sixteen uppercase hex digits, nonzero"),
 };
 
-const PROBE_ERROR_BASE: u32 = 0x8100_0000;
+/// One definition, shared with the library that encodes the status-carrying
+/// codes, so the two cannot drift apart.
+const PROBE_ERROR_BASE: u32 = probe_status::ERROR_BASE;
 
 /// How long the probe waits for a launch to be accepted.
 ///
@@ -94,8 +97,16 @@ impl Reporter {
         self.sequence
     }
 
+    /// Sends one record, keeping the reason a send refused.
+    ///
+    /// This is the probe's only send path -- `step`, `failure` and `terminal` all
+    /// route through it -- so when it fails the probe reports nothing at all, and
+    /// its exit code is the only thing the host will see. Run 7 exited here with
+    /// `0x81000030` and the native status was discarded, which left the run
+    /// proving the send refused and not whether the handle lacked a right, the
+    /// peer had closed, or the queue was full.
     fn emit(&self, record: [u8; RECORD_BYTES]) -> Result<(), u32> {
-        send_channel(self.parent, &record, &[]).map_err(|_| PROBE_ERROR_BASE + 0x0030)
+        send_channel(self.parent, &record, &[]).map_err(report_send_failure)
     }
 
     fn step(&mut self, step: ProbeStep, job_id: u64) -> Result<(), u32> {
