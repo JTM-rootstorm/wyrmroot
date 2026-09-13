@@ -12,12 +12,13 @@ use wyrmroot_loader::{
         ConsoledLoadError, ConsoledLoadRequest, D6ResourceOwnerLoadRequest,
         DeviceCoordinatorLoadError, DeviceCoordinatorLoadRequest,
         DeviceCoordinatorResourceLoadRequest, DeviceDriverLoadError, DeviceDriverLoadRequest,
-        JobLoadError, JobLoadRequest, LoadAuthority, LoadError, LoadFault, LoadRequest, LoadStage,
-        LoaderPlatform, ParentMapping, ProcessCreateRequest, ProcessCreateResult,
-        ResourceDomainLoadRequest, ServiceLoadError, ServiceLoadRequest, WyrmshLoadError,
-        WyrmshLoadRequest, load_consoled_process, load_d6_resource_owner_process,
-        load_device_coordinator_process, load_device_coordinator_resource_process,
-        load_device_driver_process, load_job_process, load_process, load_process_with_fault,
+        JobLoadError, JobLoadRequest, LaunchClientLoadError, LaunchClientLoadRequest,
+        LoadAuthority, LoadError, LoadFault, LoadRequest, LoadStage, LoaderPlatform, ParentMapping,
+        ProcessCreateRequest, ProcessCreateResult, ResourceDomainLoadRequest, ServiceLoadError,
+        ServiceLoadRequest, WyrmshLoadError, WyrmshLoadRequest, load_consoled_process,
+        load_d6_resource_owner_process, load_device_coordinator_process,
+        load_device_coordinator_resource_process, load_device_driver_process, load_job_process,
+        load_launch_client_process, load_process, load_process_with_fault,
         load_resource_domain_process, load_service_process, load_wyrmsh_process,
     },
 };
@@ -511,6 +512,109 @@ fn owned_service_load_reports_the_exact_atomic_init_boundary() {
         }
     );
     assert!(!post_send.events.contains(&Event::Close(service_channel.0)));
+}
+
+#[test]
+fn a_launch_client_receives_its_self_root_session_arguments_and_correlation() {
+    let image = executable();
+    let session = DwHandle(0x3401);
+    let correlation = CorrelationEnvironment::new(Correlation {
+        registry_generation: 2,
+        endpoint_id: 5,
+        endpoint_generation: 1,
+    })
+    .unwrap();
+    let request = || LaunchClientLoadRequest {
+        image: &image,
+        display_path: "system/r1-saturation-probe",
+        launch_session: session,
+        arguments: &["6", "4"],
+        correlation: &correlation,
+        transaction_id: 0x3400_0001,
+    };
+
+    let mut platform = Mock::new(None);
+    load_launch_client_process(&mut platform, authority(), request()).unwrap();
+    // WRLP 1.3, two capabilities: the child self root then its launch session.
+    assert_eq!(&platform.sent_init[6..8], &3_u16.to_le_bytes());
+    assert_eq!(&platform.sent_init[20..24], &2_u32.to_le_bytes());
+    assert_eq!(platform.sent_transfers.len(), 2);
+    assert_eq!(platform.sent_transfers[1].handle, session);
+    assert_eq!(
+        platform.sent_transfers[1].requested_rights,
+        wyrmroot_loader::launch::CHILD_CHANNEL_RIGHTS
+    );
+    assert!(
+        platform
+            .sent_transfers
+            .iter()
+            .all(|transfer| transfer.operation == DW_HANDLE_TRANSFER_MOVE)
+    );
+    // Startup ABI v2 with argv[0] plus the plan pair, and exactly the three
+    // correlation entries the child parses its session identity out of.
+    assert_eq!(platform.started_abi, Some(2));
+    let mut expected = vec![0; wyrmroot_loader::image::STARTUP_V2_BLOCK_BYTES];
+    wyrmroot_loader::image::write_startup_block_v2(
+        &mut expected,
+        wyrmroot_loader::image::STARTUP_V2_BLOCK_ADDRESS,
+        "system/r1-saturation-probe",
+        &["system/r1-saturation-probe", "6", "4"],
+        &[
+            "WYR_REGISTRY_GENERATION=2",
+            "WYR_REGISTRY_ENDPOINT_ID=5",
+            "WYR_REGISTRY_ENDPOINT_GENERATION=1",
+        ],
+    )
+    .unwrap();
+    assert_eq!(platform.materialized.last(), Some(&expected));
+
+    // The endpoint crosses one atomic MOVE: a failed send leaves it entirely
+    // with the caller, and a post-INIT failure reports it consumed.
+    let mut failed_send = Mock::new(Some("send"));
+    let send = load_launch_client_process(&mut failed_send, authority(), request())
+        .expect_err("failed atomic INIT accepted");
+    assert_eq!(
+        send,
+        LaunchClientLoadError {
+            error: LoadError::Platform {
+                stage: LoadStage::InitSend,
+                cause: "send",
+                rollback_failed: false,
+            },
+            launch_session_consumed: false,
+        }
+    );
+    assert!(!failed_send.events.contains(&Event::Close(session.0)));
+
+    let mut post_send = Mock::new(None);
+    post_send.post_start_thread_close_failures = 1;
+    let post = load_launch_client_process(&mut post_send, authority(), request())
+        .expect_err("post-INIT SuccessCleanup failure accepted");
+    assert!(post.launch_session_consumed);
+    assert!(!post_send.events.contains(&Event::Close(session.0)));
+
+    // A zero endpoint and an over-long argument tail are refused before any
+    // platform operation, so the caller still owns everything it supplied.
+    let mut rejected = Mock::new(None);
+    let mut zero = request();
+    zero.launch_session = DwHandle(0);
+    assert!(matches!(
+        load_launch_client_process(&mut rejected, authority(), zero),
+        Err(LaunchClientLoadError {
+            error: LoadError::Launch(wyrmroot_loader::launch::LaunchError::HandleCount),
+            launch_session_consumed: false,
+        })
+    ));
+    let mut wide = request();
+    wide.arguments = &["6", "4", "1"];
+    assert!(matches!(
+        load_launch_client_process(&mut rejected, authority(), wide),
+        Err(LaunchClientLoadError {
+            error: LoadError::Startup(wyrmroot_loader::image::StartupBlockError::TooManyArguments),
+            launch_session_consumed: false,
+        })
+    ));
+    assert!(rejected.events.is_empty());
 }
 
 #[test]

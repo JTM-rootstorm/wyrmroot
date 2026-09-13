@@ -26,6 +26,8 @@ use {wyrmroot_devmgr as _, wyrmroot_uart16550d as _};
 pub mod evidence;
 pub mod gate;
 #[cfg(feature = "r1-selector34")]
+pub mod r1_driver;
+#[cfg(feature = "r1-selector34")]
 pub mod r1_relay;
 pub mod wyr1b;
 pub mod wyr1b_gate;
@@ -4242,7 +4244,10 @@ mod native_cleanup_tests {
 
     #[test]
     fn resident_tick_failure_detail_preserves_the_selected_profile() {
-        #[cfg(not(feature = "wyr1e8-selector33"))]
+        // Selector 34 keeps its category at this boundary too, so it is excluded
+        // from the collapsing case rather than asserted to collapse: this test
+        // predates that selector and only ran under features where it does.
+        #[cfg(not(any(feature = "wyr1e8-selector33", feature = "r1-selector34")))]
         for error in [
             InitError::Accounting,
             InitError::Supervision,
@@ -4260,6 +4265,19 @@ mod native_cleanup_tests {
             resident_tick_failure_application_status(&InitError::Accounting),
             0xAF18_0F02
         );
+
+        #[cfg(feature = "r1-selector34")]
+        for error in [
+            InitError::Accounting,
+            InitError::Supervision,
+            InitError::Cleanup,
+            InitError::WrongActivationOrder,
+        ] {
+            assert_eq!(
+                resident_tick_failure_application_status(&error),
+                0xAF36_0000 | test_failure_category(&error)
+            );
+        }
     }
 
     #[cfg(feature = "wyr1e8-selector33")]
@@ -5007,36 +5025,50 @@ mod r1_failure_status_tests {
 /// stall this card exists to investigate, which is what makes it worth a gate.
 #[cfg(test)]
 mod r1_composition_coverage {
-    /// Paths R1 stages whose consumer is not written yet. Emptying this list is
+    /// Paths R1 stages whose consumer is not written yet. Emptying this list was
     /// the definition of done for the selector-34 scenario driver: it must look
     /// the gate up, launch the probe, and relay the probe's records.
-    const KNOWN_UNWIRED: [&str; 2] = [
-        wyrmroot_bootfs::r1::R1_PROBE_PATH,
-        wyrmroot_bootfs::r1::R1_GATE_PATH,
-    ];
+    ///
+    /// It is now empty, and `r1_driver` is the consumer of both paths.
+    const KNOWN_UNWIRED: [&str; 0] = [];
 
     /// Everything permanent init could plausibly look a path up from.
-    const SOURCES: [&str; 3] = [
+    /// `r1_driver.rs` joined this list with the driver it gates.
+    const SOURCES: [&str; 4] = [
         include_str!("lib.rs"),
         include_str!("main.rs"),
+        include_str!("r1_driver.rs"),
         include_str!("r1_relay.rs"),
     ];
 
-    fn any_source_mentions(path: &str) -> bool {
-        SOURCES.iter().any(|source| source.contains(path))
+    /// A path is consumed when some source names the bootfs constant that
+    /// carries it, not only when a copy of the literal appears.
+    ///
+    /// The literal spelling stays accepted because that is what a wrong local
+    /// copy would look like, and this gate should keep finding one; but a driver
+    /// that correctly looks the path up through `wyrmroot_bootfs::r1` never
+    /// contains the literal at all, so requiring it would have forced exactly
+    /// the duplicated constant the archive builder exists to prevent.
+    fn any_source_mentions(path: &str, constant: &str) -> bool {
+        SOURCES
+            .iter()
+            .any(|source| source.contains(path) || source.contains(constant))
     }
+
+    /// Each staged path with the constant permanent init must reach it through.
+    const STAGED: [(&str, &str); 2] = [
+        (wyrmroot_bootfs::r1::R1_PROBE_PATH, "R1_PROBE_PATH"),
+        (wyrmroot_bootfs::r1::R1_GATE_PATH, "R1_GATE_PATH"),
+    ];
 
     #[test]
     fn every_path_r1_stages_is_either_consumed_or_recorded_as_unwired() {
-        for path in [
-            wyrmroot_bootfs::r1::R1_PROBE_PATH,
-            wyrmroot_bootfs::r1::R1_GATE_PATH,
-        ] {
+        for (path, constant) in STAGED {
             if KNOWN_UNWIRED.contains(&path) {
                 continue;
             }
             assert!(
-                any_source_mentions(path),
+                any_source_mentions(path, constant),
                 "{path} is staged in card R1's bootfs but permanent init never \
                  looks it up, so the product would boot and produce no evidence. \
                  Consume it, or record it in KNOWN_UNWIRED with the reason."
@@ -5047,23 +5079,36 @@ mod r1_composition_coverage {
     #[test]
     fn the_unwired_list_is_real_and_shrinks_rather_than_rots() {
         for path in KNOWN_UNWIRED {
+            let constant = STAGED
+                .iter()
+                .find_map(|(staged, constant)| (*staged == path).then_some(*constant))
+                .unwrap_or_default();
             assert!(
-                !any_source_mentions(path),
+                !any_source_mentions(path, constant),
                 "{path} now has a consumer in permanent init; remove it from \
                  KNOWN_UNWIRED so the gate starts protecting it"
             );
         }
-        // The relay is the other half of the same gap: it exists, it is host
-        // tested, and in the product nothing calls it. When the driver lands
-        // this assertion is what forces this module to be revisited.
+        // The relay was the other half of the same gap: it existed, it was host
+        // tested, and in the product nothing called it. The driver has now
+        // landed, so the bound rises from "declaration only" to "declaration
+        // plus exactly the driver's one call site": `r1_driver::drain` relays
+        // each datagram, and a second caller would mean two places decide
+        // custody of the same transcript, which is what this bound still
+        // forbids. KNOWN_UNWIRED is empty, re-checked with this change.
         let called = SOURCES
             .iter()
             .filter(|source| source.contains("relay_one("))
             .count();
         assert!(
-            called <= 1,
-            "relay_one now has a caller outside its own module; the scenario \
-             driver has landed, so re-check KNOWN_UNWIRED and this assertion"
+            called <= 2,
+            "relay_one has more callers than its own module and the scenario \
+             driver; two places now decide custody of one transcript"
+        );
+        assert!(
+            SOURCES[2].contains("relay_one("),
+            "the scenario driver no longer relays the probe's records, so a \
+             running probe's transcript cannot reach the kernel collector"
         );
     }
 }

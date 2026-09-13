@@ -97,6 +97,29 @@ pub struct ServiceLoadRequest<'a> {
     pub transaction_id: u64,
 }
 
+/// WRLP 1.3 launch-client request: one self root, one launch-session endpoint,
+/// and startup ABI v2 so the child receives its plan arguments.
+///
+/// `ServiceLoadRequest` cannot express this launch. It builds the correlation
+/// environment only for `BootstrapService` and `RegistryClient`, and otherwise
+/// selects the legacy startup block, which carries no argv tail at all. A
+/// launch client is correlated to its *launch session* rather than to a
+/// registry endpoint, and its arguments are part of what it is launched to do,
+/// so both belong in a request of its own instead of widening that one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LaunchClientLoadRequest<'a> {
+    pub image: &'a [u8],
+    pub display_path: &'a str,
+    pub launch_session: DwHandle,
+    /// Arguments after `argv[0]`, which is always the display path.
+    pub arguments: &'a [&'a str],
+    /// The launch session's own correlation. The capability record and the
+    /// received handle metadata remain authoritative; these three entries only
+    /// let the child name the session it was given.
+    pub correlation: &'a CorrelationEnvironment,
+    pub transaction_id: u64,
+}
+
 /// WYR1-D4 console-broker launch request. The two endpoints are distinct,
 /// caller-owned staging capabilities until the atomic INIT MOVE commits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -304,6 +327,23 @@ impl<E> ServiceLoadError<E> {
         Self {
             error,
             service_channel_consumed: false,
+        }
+    }
+}
+
+/// Launch-client failure with explicit ownership of the caller-supplied
+/// launch-session endpoint at the atomic INIT boundary.
+#[derive(Debug, Eq, PartialEq)]
+pub struct LaunchClientLoadError<PlatformError> {
+    pub error: LoadError<PlatformError>,
+    pub launch_session_consumed: bool,
+}
+
+impl<E> LaunchClientLoadError<E> {
+    const fn caller_retains(error: LoadError<E>) -> Self {
+        Self {
+            error,
+            launch_session_consumed: false,
         }
     }
 }
@@ -824,6 +864,77 @@ pub fn load_service_process<P: LoaderPlatform>(
     .map_err(|error| ServiceLoadError {
         error,
         service_channel_consumed,
+    })
+}
+
+/// Arguments a launch client may receive after `argv[0]`.
+///
+/// Two is exactly the launch-client plan pair. The bound exists so this entry
+/// point allocates a fixed argv on the stack, like every other `load_*` here.
+pub const MAX_LAUNCH_CLIENT_ARGUMENTS: usize = 2;
+
+/// Launches one WRLP 1.3 launch client with its self root, exactly one
+/// launch-session endpoint, and the startup ABI v2 argv/environment tail.
+///
+/// The endpoint crosses the single atomic INIT MOVE, so a failure leaves it
+/// with the caller and a success consumes it; the returned error says which.
+pub fn load_launch_client_process<P: LoaderPlatform>(
+    platform: &mut P,
+    authority: LoadAuthority,
+    request: LaunchClientLoadRequest<'_>,
+) -> Result<LoadedProcess, LaunchClientLoadError<P::Error>> {
+    if request.launch_session.0 == 0 {
+        return Err(LaunchClientLoadError::caller_retains(LoadError::Launch(
+            LaunchError::HandleCount,
+        )));
+    }
+    if request.arguments.len() > MAX_LAUNCH_CLIENT_ARGUMENTS {
+        return Err(LaunchClientLoadError::caller_retains(LoadError::Startup(
+            StartupBlockError::TooManyArguments,
+        )));
+    }
+    let mut argv = [""; MAX_LAUNCH_CLIENT_ARGUMENTS + 1];
+    argv[0] = request.display_path;
+    for (slot, argument) in argv[1..].iter_mut().zip(request.arguments) {
+        *slot = argument;
+    }
+    let argc = 1 + request.arguments.len();
+    let mut environment = [""; wyrmroot_registry_proto::CORRELATION_ENVIRONMENT_COUNT];
+    for (index, slot) in environment.iter_mut().enumerate() {
+        *slot = request.correlation.entry(index).ok_or_else(|| {
+            LaunchClientLoadError::caller_retains(LoadError::Startup(
+                StartupBlockError::InvalidEnvironment,
+            ))
+        })?;
+    }
+    let channels = [request.launch_session];
+    let mut launch_session_consumed = false;
+    load_process_internal(
+        platform,
+        authority,
+        InternalLoadRequest {
+            image: request.image,
+            profile: LaunchProfile::LaunchClient,
+            transaction_id: request.transaction_id,
+            startup: StartupSpec::JobV2 {
+                path: request.display_path,
+                argv: &argv[..argc],
+                environment: &environment,
+            },
+            channels: &channels,
+            device_manifest: None,
+            supervisor_generation: None,
+            driver_correlation: None,
+            consoled_correlation: None,
+            wyrmsh_correlation: None,
+            resource_domain: None,
+        },
+        LoadFault::None,
+        &mut launch_session_consumed,
+    )
+    .map_err(|error| LaunchClientLoadError {
+        error,
+        launch_session_consumed,
     })
 }
 

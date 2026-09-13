@@ -1331,10 +1331,12 @@ pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<
         return run_cargo(repository, &arguments);
     }
     if matches!(filter, Some("r1-status")) {
-        // Selector 34's failure statuses only exist under its own feature, and
-        // the launcher rightly refuses caller-selected features, so the gate
-        // that proves a category survives the Process-exit boundary has to be
-        // named here.
+        // Selector 34's failure statuses and its scenario driver only exist
+        // under its own feature, and the launcher rightly refuses
+        // caller-selected features, so the gate has to be named here. It runs
+        // the whole library suite under that feature rather than one test
+        // module: the driver's own tests are gated the same way, and naming
+        // them individually is how a later one would be added and never run.
         let arguments = r1_status_command();
         let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
         return run_cargo(repository, &arguments);
@@ -1397,7 +1399,6 @@ fn r1_status_command() -> Vec<String> {
         "--features",
         "r1-selector34",
         "--lib",
-        "r1_failure_status_tests",
         "--",
         "--nocapture",
     ]

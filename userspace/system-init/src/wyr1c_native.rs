@@ -184,6 +184,23 @@ struct DriverNativeAttempt {
     request: DriverLaunchRequest,
 }
 
+/// The resident endpoint allocator, for card R1's scenario driver.
+///
+/// The driver issues its probe's launch-session grant from the same allocator
+/// every other resident endpoint comes from, so a launch session cannot collide
+/// with a registry endpoint id. It is exposed rather than duplicated because a
+/// second private allocator would be exactly that collision waiting to happen.
+#[cfg(feature = "r1-selector34")]
+pub(crate) fn resident_topology(
+    resident: &mut ResidentSystemInit,
+) -> Result<&mut RegistryTopology, InitError> {
+    Ok(&mut resident
+        .wyr1c
+        .as_mut()
+        .ok_or(InitError::WrongActivationOrder)?
+        .topology)
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ResidentState {
     #[cfg(feature = "wyr1d-selector32")]
