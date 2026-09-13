@@ -40,6 +40,13 @@ wyr1e8-selector33 = [
 # early-activates only Registryd and Devmgr, so it needs no console, shell or
 # recovery feature, and adding one would contradict section 8.1's exclusions.
 r1-selector34 = [
+    # The product's bootstrap is built with wyr1c6-production, which launches
+    # permanent init as SupervisorResourceDomain: four handles and
+    # SUPERVISOR_BYTES + 8. Without this feature init receives as Supervisor --
+    # three handles, SUPERVISOR_BYTES -- and the kernel refuses the handoff with
+    # BUFFER_TOO_SMALL, which is what card R1's third run hit. It also matches
+    # the RRC manifest, which is C1's graph by construction.
+    "wyr1c5-production",
     "native-init",
     "dep:wyrmroot-r1-saturation",
     "wyrmroot-runtime/r1-test-evidence",

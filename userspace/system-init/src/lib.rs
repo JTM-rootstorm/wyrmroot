@@ -4995,3 +4995,75 @@ mod r1_failure_status_tests {
         );
     }
 }
+
+/// Guards what card R1's audit found after three runs: an artifact the product
+/// stages but nothing consumes.
+///
+/// R1's bootfs carries the saturation probe and a `WRR1` gate describing it, and
+/// neither had a reader anywhere in permanent init. Nothing failed a test,
+/// because no test related what the product stages to what init looks up — so
+/// the product booted, activated its role graph, and would have idled until the
+/// host timeout with no evidence. That failure is indistinguishable from the A27
+/// stall this card exists to investigate, which is what makes it worth a gate.
+#[cfg(test)]
+mod r1_composition_coverage {
+    /// Paths R1 stages whose consumer is not written yet. Emptying this list is
+    /// the definition of done for the selector-34 scenario driver: it must look
+    /// the gate up, launch the probe, and relay the probe's records.
+    const KNOWN_UNWIRED: [&str; 2] = [
+        wyrmroot_bootfs::r1::R1_PROBE_PATH,
+        wyrmroot_bootfs::r1::R1_GATE_PATH,
+    ];
+
+    /// Everything permanent init could plausibly look a path up from.
+    const SOURCES: [&str; 3] = [
+        include_str!("lib.rs"),
+        include_str!("main.rs"),
+        include_str!("r1_relay.rs"),
+    ];
+
+    fn any_source_mentions(path: &str) -> bool {
+        SOURCES.iter().any(|source| source.contains(path))
+    }
+
+    #[test]
+    fn every_path_r1_stages_is_either_consumed_or_recorded_as_unwired() {
+        for path in [
+            wyrmroot_bootfs::r1::R1_PROBE_PATH,
+            wyrmroot_bootfs::r1::R1_GATE_PATH,
+        ] {
+            if KNOWN_UNWIRED.contains(&path) {
+                continue;
+            }
+            assert!(
+                any_source_mentions(path),
+                "{path} is staged in card R1's bootfs but permanent init never \
+                 looks it up, so the product would boot and produce no evidence. \
+                 Consume it, or record it in KNOWN_UNWIRED with the reason."
+            );
+        }
+    }
+
+    #[test]
+    fn the_unwired_list_is_real_and_shrinks_rather_than_rots() {
+        for path in KNOWN_UNWIRED {
+            assert!(
+                !any_source_mentions(path),
+                "{path} now has a consumer in permanent init; remove it from \
+                 KNOWN_UNWIRED so the gate starts protecting it"
+            );
+        }
+        // The relay is the other half of the same gap: it exists, it is host
+        // tested, and in the product nothing calls it. When the driver lands
+        // this assertion is what forces this module to be revisited.
+        let called = SOURCES
+            .iter()
+            .filter(|source| source.contains("relay_one("))
+            .count();
+        assert!(
+            called <= 1,
+            "relay_one now has a caller outside its own module; the scenario \
+             driver has landed, so re-check KNOWN_UNWIRED and this assertion"
+        );
+    }
+}

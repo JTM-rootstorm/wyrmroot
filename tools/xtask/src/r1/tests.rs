@@ -254,6 +254,49 @@ mod domain {
 mod media {
     use super::*;
 
+    /// The handoff card R1's third run failed on, asserted where the two halves
+    /// are chosen rather than discovered by booting.
+    ///
+    /// The bootstrap decides how it launches permanent init; the init spec
+    /// decides how init receives. Those are picked in two different files, and
+    /// nothing related them: a bootstrap built with a `wyr1c*-production`
+    /// feature launches `SupervisorResourceDomain` (four handles,
+    /// `SUPERVISOR_BYTES + 8`), while an init without one receives as
+    /// `Supervisor` (three handles, `SUPERVISOR_BYTES`). The kernel refuses that
+    /// with `BUFFER_TOO_SMALL`.
+    #[test]
+    fn the_init_features_match_the_bootstrap_that_launches_it() {
+        const C6: &str = include_str!("../wyr1c6.rs");
+        let bootstrap_is_resource_product = C6.contains("\"wyr1c6-production\"")
+            || C6.contains("\"wyr1c5-production\"")
+            || C6.contains("\"wyr1c4-production\"");
+        assert!(
+            bootstrap_is_resource_product,
+            "card R1 builds its bootstrap through wyr1c6; if that stopped being \
+             a production bootstrap, re-derive the handoff shape below"
+        );
+        let init = NATIVE_SPECS
+            .iter()
+            .find(|spec| spec.label == "system-init")
+            .expect("card R1 stages permanent init");
+        // The spec names one feature and Cargo resolves the rest, so the receive
+        // shape is decided in the manifest. Read it there rather than in the
+        // spec string, which is what an earlier version of this check got wrong.
+        const INIT_MANIFEST: &str = include_str!("../../../../userspace/system-init/Cargo.toml");
+        let selected = INIT_MANIFEST
+            .split(&format!("\n{} = [", init.features))
+            .nth(1)
+            .and_then(|rest| rest.split(']').next())
+            .unwrap_or_else(|| panic!("system-init declares no {} feature list", init.features));
+        assert!(
+            selected.contains("wyr1c5-production") || selected.contains("wyr1c4-production"),
+            "the bootstrap launches init as SupervisorResourceDomain but {} \
+             selects the plain Supervisor receive shape, so the handoff fails \
+             with BUFFER_TOO_SMALL: the feature list was {selected:?}",
+            init.features
+        );
+    }
+
     fn archives(sizes: &[(&str, usize)]) -> BTreeMap<String, Vec<u8>> {
         sizes
             .iter()
