@@ -2138,7 +2138,7 @@ pub(crate) fn clean_revision(repository: &Path, label: &str) -> Result<String, F
     validate_revision(&revision, label)?;
     Ok(revision)
 }
-fn reject_selector_environment() -> Result<(), Failure> {
+pub(crate) fn reject_selector_environment() -> Result<(), Failure> {
     for key in [
         "DEEPWYRM_GUEST_TEST_SELECTOR",
         "DEEPWYRM_GUEST_TEST_ID",

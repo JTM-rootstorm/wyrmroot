@@ -17,6 +17,7 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsStr;
+use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -903,3 +904,324 @@ pub(crate) fn compose_profile_esp(
     crate::wyr1c6::seal_mode(&esp, 0o444, "card R1 ESP")?;
     Ok(esp)
 }
+
+/// Stages card R1's complete run inputs: shared media, both profile handoffs,
+/// and a source receipt binding every digest to the revisions it came from.
+///
+/// Deliberately produces **no `request.toml`**. The root verifier
+/// (`tools/verify-vm-request.py`) enumerates a schema per request kind, and
+/// adding card R1's is a change to the script that decides whether a request may
+/// reach the designated VM. That belongs in its own reviewed change, so this
+/// command stops at the point where every digest such a request would need is
+/// recorded in the receipt and nothing yet claims to be runnable.
+///
+/// Output is written directly into the validated fresh directory rather than
+/// staged and moved. The directory must not already exist, so there is nothing to
+/// clobber; a failure part-way leaves a partial tree the operator deletes, which
+/// is the same recovery as a rejected staging.
+pub(crate) fn prepare(
+    output: &Path,
+    deep_repository: &Path,
+    deep_revision: &str,
+    nonce: &str,
+    gdb_port: u16,
+) -> Result<String, Failure> {
+    use crate::wyr1c6::{
+        MAX_ARTIFACT_BYTES, canonical_deep_repository, canonical_new_output, clean_revision,
+        matching_abi_tree, pinned_firmware, reject_selector_environment, validate_revision,
+        verify_clean_revision, write_new,
+    };
+
+    reject_selector_environment()?;
+    validate_nonce(nonce)?;
+    validate_revision(deep_revision, "Deepwyrm revision")?;
+    // The port is baked into both domains and passed to the harness separately.
+    // Refusing the privileged range here keeps the generated domain runnable by
+    // the unprivileged operator the harness assumes.
+    if gdb_port < 1024 {
+        return Err(Failure::usage(
+            "card R1 requires --gdb-port above the privileged range",
+        ));
+    }
+
+    let repository = crate::tasks::repository_root()?;
+    let project = crate::tasks::canonical_project_root(&repository)?;
+    let deep_repository = canonical_deep_repository(deep_repository, &project)?;
+    let wyrmroot_revision = clean_revision(&repository, "Wyrmroot")?;
+    verify_clean_revision(&deep_repository, "Deepwyrm", deep_revision)?;
+    let manifest = BuildManifest::load(&repository)?;
+    if manifest.rust_revision()? != ACCEPTED_RUST_REVISION
+        || manifest.rust_toolchain_name()? != ACCEPTED_TOOLCHAIN_NAME
+    {
+        return Err(Failure::task(
+            "card R1 prepare does not name the accepted a92dc7f Rust toolchain",
+        ));
+    }
+    // The semantic join with Deepwyrm is the immutable `abi` tree, not the commit:
+    // selector-34 code may sit at a newer clean revision than the generated ABI
+    // pin without changing the ABI either side compiled against.
+    let abi_revision = manifest.deepwyrm_revision()?.to_owned();
+    let abi_tree = matching_abi_tree(&deep_repository, deep_revision, &abi_revision)?;
+    let layout = crate::deep_layout::prepare_current_kernel_source(
+        &repository,
+        &deep_repository,
+        deep_revision,
+    )?;
+    let output = canonical_new_output(output, &project, &repository, &deep_repository)?;
+
+    let loader_profile = manifest.validate_loader_build_readiness(&repository)?;
+    let toolchain =
+        crate::tasks::prepare_loader_toolchain(&repository, &loader_profile, &manifest)?;
+    let cargo_home = crate::tasks::project_cargo_home(&repository, &manifest)?;
+    if env::var_os("CARGO_HOME").as_deref() != Some(cargo_home.as_os_str()) {
+        return Err(Failure::task(
+            "card R1 prepare requires the pinned launcher's exact CARGO_HOME",
+        ));
+    }
+    toolchain.accepted().verify_unchanged()?;
+    layout.verify_unchanged()?;
+
+    fs::create_dir(&output)
+        .map_err(|error| Failure::task(format!("could not create card R1 output: {error}")))?;
+    let build = output.join(".build");
+    fs::create_dir(&build).map_err(|error| {
+        Failure::task(format!("could not create card R1 build directory: {error}"))
+    })?;
+    let uefi = crate::tasks::build_deterministic_uefi_pair(
+        &repository,
+        &toolchain,
+        &loader_profile,
+        &layout,
+        &crate::tasks::IsolatedUefiBuild {
+            cargo_home: &cargo_home,
+            production_target: &build.join("uefi-production"),
+            retained_debug_target: &build.join("uefi-retained-debug"),
+            cargo_profile: crate::tasks::UefiCargoProfile::Release,
+        },
+    )?;
+    let build_directory =
+        crate::secure_fs::Directory::open_exact(&build, "card R1 build directory")?;
+    let bootstrap =
+        build_directory.with_inheritable_anchor("card R1 build directory", |anchor| {
+            crate::wyr1c6::build_c6_bootstrap(&repository, &toolchain, &layout, &cargo_home, anchor)
+        })?;
+    let kernel = build_kernel(&deep_repository, nonce)?;
+    let media = R1Media {
+        loader: uefi.loader_bytes,
+        kernel,
+        bootstrap,
+        boot_device_table: crate::wyr1c6::boot_device_table(),
+        ovmf_code: pinned_firmware(
+            crate::wyr1c6::OVMF_CODE_PATH,
+            crate::wyr1c6::OVMF_CODE_SHA256,
+            "OVMF code",
+        )?,
+        ovmf_vars: pinned_firmware(
+            crate::wyr1c6::OVMF_VARS_PATH,
+            crate::wyr1c6::OVMF_VARS_SHA256,
+            "OVMF vars",
+        )?,
+    };
+
+    let snapshot = build_snapshot(&repository, &project, nonce)?;
+    toolchain.accepted().verify_unchanged()?;
+    layout.verify_unchanged()?;
+    verify_repository_revision(&repository, &wyrmroot_revision)?;
+
+    let artifacts = output.join("artifacts");
+    fs::create_dir(&artifacts)
+        .map_err(|error| Failure::task(format!("could not create card R1 artifacts: {error}")))?;
+    let payload = |label: &str| -> Result<&Vec<u8>, Failure> {
+        snapshot
+            .artifacts
+            .get(label)
+            .ok_or_else(|| Failure::task(format!("card R1 snapshot omitted {label}")))
+    };
+    let mut digests: BTreeMap<String, String> = BTreeMap::new();
+    for (name, bytes) in [
+        ("loader.efi", &media.loader),
+        ("deepwyrm.elf", &media.kernel),
+        ("deepwyrm.symbols.elf", &media.kernel),
+        ("bootstrap.elf", &media.bootstrap),
+        ("system-init.elf", payload("system-init")?),
+        ("registryd.elf", payload("registryd")?),
+        ("devmgr.elf", payload("devmgr")?),
+        ("uart16550d.elf", payload("uart16550d")?),
+        ("consoled.elf", payload("consoled")?),
+        ("wyrmsh.elf", payload("wyrmsh")?),
+        ("r1-probe.elf", payload("r1-probe")?),
+        ("cpu-hog.elf", payload("cpu-hog")?),
+        ("hello.elf", payload("hello")?),
+        ("boot-device-table.bin", &media.boot_device_table),
+        ("OVMF_CODE.fd", &media.ovmf_code),
+        ("OVMF_VARS.fd", &media.ovmf_vars),
+        ("rrc-r1-v1.bin", &snapshot.rrc_manifest),
+        ("wrdm-r1-v1.bin", &snapshot.device_manifest),
+        ("launch-policy-v1.bin", &snapshot.launch_policy),
+    ] {
+        write_new(&artifacts.join(name), bytes, name)?;
+        digests.insert(name.to_owned(), sha256::bytes_digest(bytes));
+    }
+
+    for (profile, _, _) in PROFILES {
+        let directory = output.join(profile);
+        fs::create_dir(&directory).map_err(|error| {
+            Failure::task(format!(
+                "could not create card R1 {profile} handoff: {error}"
+            ))
+        })?;
+        let archive = snapshot
+            .bootfs
+            .get(profile)
+            .ok_or_else(|| Failure::task("card R1 snapshot lacks a profile archive"))?;
+        let gate = snapshot
+            .gates
+            .get(profile)
+            .ok_or_else(|| Failure::task("card R1 snapshot lacks a profile gate"))?;
+        write_new(&directory.join("bootfs.img"), archive, "profile bootfs")?;
+        write_new(&directory.join("r1-gate-v1.bin"), gate, "profile gate")?;
+        let esp = compose_profile_esp(&artifacts, &directory)?;
+        let esp_bytes =
+            crate::wyr1c6::read_regular_bounded(&esp, crate::g3_image::IMAGE_BYTES, "card R1 ESP")?;
+        let vcpus = PROFILES
+            .iter()
+            .find(|(name, _, _)| *name == profile)
+            .map(|(_, _, cpus)| u8::try_from(*cpus).unwrap_or(u8::MAX))
+            .ok_or_else(|| Failure::task("card R1 profile width is unknown"))?;
+        // The nvram path is the copy `run-active-gdb-vm.sh` makes for itself at
+        // run time. Staging it here would make the harness refuse to start.
+        let xml = domain_xml(
+            vcpus,
+            gdb_port,
+            &artifacts.join("OVMF_CODE.fd"),
+            &esp,
+            &directory.join("OVMF_VARS.fd"),
+        );
+        write_new(
+            &directory.join("domain.xml"),
+            xml.as_bytes(),
+            "profile domain",
+        )?;
+        if directory.join("OVMF_VARS.fd").exists() {
+            return Err(Failure::task(
+                "card R1 must not stage OVMF_VARS.fd; the GDB harness refuses to run when it exists",
+            ));
+        }
+        digests.insert(
+            format!("{profile}/bootfs.img"),
+            sha256::bytes_digest(archive),
+        );
+        digests.insert(
+            format!("{profile}/r1-gate-v1.bin"),
+            sha256::bytes_digest(gate),
+        );
+        digests.insert(
+            format!("{profile}/r1-esp.img"),
+            sha256::bytes_digest(&esp_bytes),
+        );
+        digests.insert(
+            format!("{profile}/domain.xml"),
+            sha256::bytes_digest(xml.as_bytes()),
+        );
+    }
+
+    write_new(
+        &output.join("product/build-receipt.toml"),
+        &snapshot.receipt,
+        "card R1 product receipt",
+    )
+    .or_else(|_| {
+        fs::create_dir(output.join("product")).map_err(|error| {
+            Failure::task(format!(
+                "could not create card R1 product directory: {error}"
+            ))
+        })?;
+        write_new(
+            &output.join("product/build-receipt.toml"),
+            &snapshot.receipt,
+            "card R1 product receipt",
+        )
+    })?;
+
+    let receipt = render_source_receipt(
+        &wyrmroot_revision,
+        deep_revision,
+        &abi_revision,
+        &abi_tree,
+        nonce,
+        gdb_port,
+        &digests,
+    )?;
+    write_new(
+        &output.join("source-receipt.toml"),
+        receipt.as_bytes(),
+        "card R1 source receipt",
+    )?;
+    fs::remove_dir_all(&build).map_err(|error| {
+        Failure::task(format!("could not remove card R1 build directory: {error}"))
+    })?;
+    let _ = MAX_ARTIFACT_BYTES;
+    toolchain.accepted().verify_unchanged()?;
+    verify_repository_revision(&repository, &wyrmroot_revision)?;
+    Ok(format!(
+        "WYR1_R1_PREPARE_PASS product_kind={PRODUCT_KIND} selector={SELECTOR} test_id={TEST_ID} \
+         request=not-produced physical_io=not-performed deepwyrm_revision={deep_revision} \
+         wyrmroot_revision={wyrmroot_revision} gdb_port={gdb_port} \
+         source_receipt={}\n",
+        output.join("source-receipt.toml").display(),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_source_receipt(
+    wyrmroot_revision: &str,
+    deep_revision: &str,
+    abi_revision: &str,
+    abi_tree: &str,
+    nonce: &str,
+    gdb_port: u16,
+    digests: &BTreeMap<String, String>,
+) -> Result<String, Failure> {
+    use std::fmt::Write as _;
+    let mut receipt = String::new();
+    writeln!(&mut receipt, "schema = \"wyrmroot-r1-source-receipt-v1\"")
+        .map_err(|_| Failure::task("card R1 receipt write failed"))?;
+    for (key, value) in [
+        ("product_kind", PRODUCT_KIND.to_owned()),
+        ("selector", SELECTOR.to_owned()),
+        ("test_id", TEST_ID.to_string()),
+        ("wyrmroot_revision", wyrmroot_revision.to_owned()),
+        ("deepwyrm_revision", deep_revision.to_owned()),
+        ("generated_abi_revision", abi_revision.to_owned()),
+        ("generated_abi_tree", abi_tree.to_owned()),
+        ("rust_revision", ACCEPTED_RUST_REVISION.to_owned()),
+        ("rust_toolchain", ACCEPTED_TOOLCHAIN_NAME.to_owned()),
+        ("evidence_nonce", nonce.to_owned()),
+        ("gdb_port", gdb_port.to_string()),
+        ("machine", MACHINE.to_owned()),
+        ("firmware", "uefi-ovmf-x64".to_owned()),
+        ("memory_kib", MEMORY_KIB.to_string()),
+        ("request", "not-produced".to_owned()),
+        ("physical_io", "not-performed".to_owned()),
+        ("baseline_domain_sha256", BASELINE_DOMAIN_SHA256.to_owned()),
+        ("domain_uuid", DOMAIN_UUID.to_owned()),
+    ] {
+        writeln!(&mut receipt, "{key} = \"{value}\"").ok();
+    }
+    for (profile, hog_count, online_cpus) in PROFILES {
+        writeln!(&mut receipt, "\n[profile.{profile}]").ok();
+        writeln!(&mut receipt, "hog_count = {hog_count}").ok();
+        writeln!(&mut receipt, "online_cpus = {online_cpus}").ok();
+    }
+    writeln!(&mut receipt, "\n[digest]").ok();
+    for (name, digest) in digests {
+        writeln!(&mut receipt, "\"{name}\" = \"{digest}\"").ok();
+    }
+    Ok(receipt)
+}
+
+/// The approved inactive baseline the GDB harness restores the domain to. Quoted
+/// into the receipt so an operator can check it against `AGENTS.md` §10 without
+/// reading the harness.
+pub(crate) const BASELINE_DOMAIN_SHA256: &str =
+    "a823095e2182f848be0c15fe1a88728fce9f126fbc55e7d9aab30d84a6c5d3c3";

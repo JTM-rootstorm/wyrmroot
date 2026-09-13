@@ -53,6 +53,7 @@ Usage:
     tools/pinned-cargo xtask wyr1b run --request <wyr1-b-request.toml>
     tools/pinned-cargo xtask wyr1b evidence --request <wyr1-b-request.toml>
     tools/pinned-cargo xtask r1 product --output <fresh-directory> --evidence-nonce <16-hex>
+    tools/pinned-cargo xtask r1 prepare --output <fresh-directory> --deep-repository <path> --deep-revision <40-hex> --evidence-nonce <16-hex> --gdb-port <port>
     tools/pinned-cargo xtask wyr1c1 product --output <fresh-directory>
     tools/pinned-cargo xtask wyr1e6 product --output <fresh-directory>
     tools/pinned-cargo xtask wyr1e6 inspect --product <directory>
@@ -194,6 +195,13 @@ pub(crate) enum Action {
     R1Product {
         output: String,
         evidence_nonce: String,
+    },
+    R1Prepare {
+        output: String,
+        deep_repository: String,
+        deep_revision: String,
+        evidence_nonce: String,
+        gdb_port: String,
     },
     Wyr1C1Product(String),
     Wyr1E6Product(String),
@@ -531,8 +539,35 @@ fn dispatch_r1(arguments: &[String]) -> Result<Action, Failure> {
                 evidence_nonce: evidence_nonce.clone(),
             })
         }
+        [
+            command,
+            output_flag,
+            output,
+            deep_flag,
+            deep_repository,
+            revision_flag,
+            deep_revision,
+            nonce_flag,
+            evidence_nonce,
+            port_flag,
+            gdb_port,
+        ] if command == "prepare"
+            && output_flag == "--output"
+            && deep_flag == "--deep-repository"
+            && revision_flag == "--deep-revision"
+            && nonce_flag == "--evidence-nonce"
+            && port_flag == "--gdb-port" =>
+        {
+            Ok(Action::R1Prepare {
+                output: output.clone(),
+                deep_repository: deep_repository.clone(),
+                deep_revision: deep_revision.clone(),
+                evidence_nonce: evidence_nonce.clone(),
+                gdb_port: gdb_port.clone(),
+            })
+        }
         _ => Err(Failure::usage(
-            "r1 requires product --output <fresh-directory> --evidence-nonce <16-hex>; media, domain XML and the VM request are produced by a follow-on prepare",
+            "r1 requires product --output <fresh-directory> --evidence-nonce <16-hex>, or prepare --output <fresh-directory> --deep-repository <path> --deep-revision <40-hex> --evidence-nonce <16-hex> --gdb-port <port>; the VM request itself is not produced",
         )),
     }
 }
@@ -1333,6 +1368,73 @@ mod tests {
             assert!(USAGE.contains(&format!("tools/pinned-cargo xtask wyr1b {command}")));
         }
         assert!(!USAGE.contains("\n    cargo xtask wyr1b"));
+    }
+
+    #[test]
+    fn r1_dispatch_accepts_product_and_prepare_and_nothing_looser() {
+        assert_eq!(
+            dispatch(&arguments(&[
+                "r1",
+                "product",
+                "--output",
+                "product",
+                "--evidence-nonce",
+                "8100000000000001",
+            ])),
+            Ok(Action::R1Product {
+                output: "product".into(),
+                evidence_nonce: "8100000000000001".into(),
+            })
+        );
+        assert_eq!(
+            dispatch(&arguments(&[
+                "r1",
+                "prepare",
+                "--output",
+                "run",
+                "--deep-repository",
+                "../deepwyrm",
+                "--deep-revision",
+                "0123456789abcdef0123456789abcdef01234567",
+                "--evidence-nonce",
+                "8100000000000001",
+                "--gdb-port",
+                "1240",
+            ])),
+            Ok(Action::R1Prepare {
+                output: "run".into(),
+                deep_repository: "../deepwyrm".into(),
+                deep_revision: "0123456789abcdef0123456789abcdef01234567".into(),
+                evidence_nonce: "8100000000000001".into(),
+                gdb_port: "1240".into(),
+            })
+        );
+        // Every flag is required and positional order is exact: a prepare missing
+        // its revision or port must not fall back to a default, because both are
+        // part of what the produced domains and receipt claim.
+        for looser in [
+            vec!["r1"],
+            vec!["r1", "product", "--output", "product"],
+            vec!["r1", "prepare", "--output", "run"],
+            vec![
+                "r1",
+                "prepare",
+                "--output",
+                "run",
+                "--deep-repository",
+                "../deepwyrm",
+                "--deep-revision",
+                "0123456789abcdef0123456789abcdef01234567",
+                "--evidence-nonce",
+                "8100000000000001",
+            ],
+            vec!["r1", "run", "--request", "request.toml"],
+        ] {
+            assert!(dispatch(&arguments(&looser)).is_err(), "{looser:?}");
+        }
+        for command in ["product --output", "prepare --output"] {
+            assert!(USAGE.contains(&format!("tools/pinned-cargo xtask r1 {command}")));
+        }
     }
 
     #[test]
