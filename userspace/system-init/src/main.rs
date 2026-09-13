@@ -41,9 +41,12 @@ use wyrmroot_system_init::continue_system_init_resource_product;
 #[cfg(not(any(
     feature = "wyr1-test-evidence",
     feature = "wyr1b-test-evidence",
-    feature = "wyr1c6-selector29"
+    feature = "wyr1c6-selector29",
+    feature = "r1-selector34"
 )))]
 use wyrmroot_system_init::fatal_application_status;
+#[cfg(feature = "r1-selector34")]
+use wyrmroot_system_init::r1_test_failure_application_status;
 #[cfg(feature = "wyr1-test-evidence")]
 use wyrmroot_system_init::wyr1_test_failure_application_status;
 #[cfg(feature = "wyr1b-test-evidence")]
@@ -227,10 +230,13 @@ fn main(startup: StartupBlock<'_>) -> u32 {
             return wyr1b_test_failure_application_status(&error);
             #[cfg(all(feature = "wyr1-test-evidence", not(feature = "wyr1b-test-evidence")))]
             return wyr1_test_failure_application_status(&error);
+            #[cfg(feature = "r1-selector34")]
+            return r1_test_failure_application_status(&error);
             #[cfg(not(any(
                 feature = "wyr1-test-evidence",
                 feature = "wyr1b-test-evidence",
-                feature = "wyr1c6-selector29"
+                feature = "wyr1c6-selector29",
+                feature = "r1-selector34"
             )))]
             return fatal_application_status(&error) as u32;
         }

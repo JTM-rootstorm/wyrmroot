@@ -294,7 +294,14 @@ pub const fn resident_tick_failure_application_status(error: &InitError) -> u32 
         };
         0xAF18_0000 | (operation as u32) << 8 | kind as u32
     }
-    #[cfg(not(feature = "wyr1e8-selector33"))]
+    // Selector 34 keeps the category here for the same reason it keeps it at the
+    // pre-READY boundary: a resident-tick failure that reports only 0xAF01_0006
+    // cannot be told apart from any other fatal tick.
+    #[cfg(feature = "r1-selector34")]
+    {
+        return 0xAF36_0000 | test_failure_category(error);
+    }
+    #[cfg(not(any(feature = "wyr1e8-selector33", feature = "r1-selector34")))]
     {
         let _ = error;
         0xAF01_0006
@@ -307,7 +314,8 @@ pub const fn resident_tick_failure_application_status(error: &InitError) -> u32 
 #[cfg(any(
     feature = "wyr1-test-evidence",
     feature = "wyr1b-test-evidence",
-    feature = "wyr1c6-selector29"
+    feature = "wyr1c6-selector29",
+    feature = "r1-selector34"
 ))]
 const fn test_failure_category(error: &InitError) -> u32 {
     match error {
@@ -367,6 +375,27 @@ pub const fn wyr1c6_test_failure_application_status(error: &InitError) -> u32 {
 #[must_use]
 pub const fn wyr1_test_failure_application_status(error: &InitError) -> u32 {
     0xAF11_0000 | test_failure_category(error)
+}
+
+/// Selector-34-only status preserving the pre-READY system-init failure category
+/// across the primordial Process-exit boundary.
+///
+/// Card R1's first two runs each died before the probe ran, and the second
+/// reported only `FatalRebootRequired` -- one value standing for all thirty-two
+/// `InitError` categories -- so the run proved the product had failed and
+/// nothing about where. Deepwyrm reports selector 34's terminal application code
+/// unsummarized, so every bit kept here reaches the host transcript intact.
+///
+/// `Native` keeps its own base because `native_error_code` needs a full sixteen
+/// bits: collapsing it into the category byte would discard exactly the status
+/// that identifies which syscall refused.
+#[cfg(feature = "r1-selector34")]
+#[must_use]
+pub const fn r1_test_failure_application_status(error: &InitError) -> u32 {
+    match error {
+        InitError::Native(error) => 0xAF35_0000 | wyrmroot_runtime::native_error_code(*error),
+        _ => 0xAF34_0000 | test_failure_category(error),
+    }
 }
 
 /// Coarse, bounded classification of the queried startup bootfs size.
@@ -4632,6 +4661,337 @@ mod native_cleanup_tests {
         assert_eq!(
             wyrmroot_loader::elf::STACK_BYTES as usize - wyrmroot_runtime::STARTUP_BLOCK_V2_SIZE,
             108 * 1024
+        );
+    }
+}
+
+/// Guards the one property card R1's second run proved was missing: that a
+/// selector-private evidence build reports *which* init failure it hit.
+///
+/// The status dispatch in `main.rs` selects on features, and its production arm
+/// is a negated default. A new selector that does not name a status therefore
+/// inherits `FatalRebootRequired` silently -- one value standing for all
+/// thirty-two `InitError` categories -- and the defect stays invisible until a
+/// run fails and proves nothing. This reads the crate's own manifest rather than
+/// a hand-kept list, so the check cannot drift from the features that exist.
+#[cfg(test)]
+mod selector_status_coverage {
+    /// Selectors that predate this rule and still collapse to
+    /// `FatalRebootRequired` at the pre-READY boundary. They are accepted or
+    /// frozen products: giving them a cause-preserving status changes their
+    /// binaries and therefore their product identity, which is not card R1's to
+    /// do. Recorded as debt so the check still fails closed for new work.
+    const KNOWN_COLLAPSING: [&str; 4] = [
+        "dw1e3-selector31",
+        "wyr1d-selector32",
+        "wyr1e-selector33",
+        "wyr1e8-selector33",
+    ];
+
+    /// Features that switch on a runtime evidence surface but are never built
+    /// as a selector on their own: they are composed into one that is. Selector
+    /// 29 is `wyr1c6-production` plus `wyr1c6-test-evidence`, and the status is
+    /// gated on the composed name, so the component must not be required to
+    /// carry one itself.
+    const COMPONENT_FEATURES: [&str; 1] = ["wyr1c6-test-evidence"];
+
+    /// Selector features whose names predate the `*-selector<N>` convention.
+    /// These are selectors 25 and 27, and both do name a status.
+    const LEGACY_SELECTORS: [&str; 2] = ["wyr1-test-evidence", "wyr1b-test-evidence"];
+
+    const MANIFEST: &str = include_str!("../Cargo.toml");
+    const MAIN: &str = include_str!("main.rs");
+
+    /// Just the pre-READY status dispatch, not all of `main.rs`.
+    ///
+    /// Scoping matters: every selector also appears in `main.rs` as a
+    /// `#[cfg(feature = ...)] use ... as _;` line, so searching the whole file
+    /// would let an import stand in for a status arm and this check would pass
+    /// for a selector that still collapses.
+    fn dispatch(main: &str) -> &str {
+        let start = main
+            .find("match result {")
+            .expect("main dispatches on the init result");
+        let rest = &main[start..];
+        let end = rest
+            .find("fn continue_resident")
+            .expect("the dispatch ends before the resident hook");
+        let region = &rest[..end];
+        // If the dispatch moves, fail loudly rather than searching an empty
+        // region and silently passing.
+        assert!(
+            region.contains("fatal_application_status"),
+            "the status dispatch no longer looks like itself; re-anchor this check"
+        );
+        region
+    }
+
+    /// True when `dispatch` gates on exactly this feature name. Compares the
+    /// whole name so `wyr1e-selector33` cannot be satisfied by
+    /// `wyr1e8-selector33`.
+    fn names_feature(dispatch: &str, selector: &str) -> bool {
+        const NEEDLE: &str = "feature = \"";
+        let mut rest = dispatch;
+        while let Some(index) = rest.find(NEEDLE) {
+            let after = &rest[index + NEEDLE.len()..];
+            if let Some(end) = after.find('"')
+                && &after[..end] == selector
+            {
+                return true;
+            }
+            rest = after;
+        }
+        false
+    }
+
+    /// True when the selector appears as a *positive* condition of this one-line
+    /// `cfg`, rather than inside a `not(...)`.
+    fn positively_gated(attribute: &str, selector: &str) -> bool {
+        attribute
+            .split("not(")
+            .next()
+            .is_some_and(|positive| names_feature(positive, selector))
+    }
+
+    /// True when the dispatch answers this selector by returning a status other
+    /// than the coarse production one.
+    ///
+    /// Merely naming the selector is not enough, and this is the distinction the
+    /// check turns on: the negated production arm lists every selector that must
+    /// *not* reach `fatal_application_status`, so a selector can be named all
+    /// over the dispatch and still collapse. What matters is that some arm
+    /// positively gated on it returns something else.
+    fn preserves_category(dispatch: &str, selector: &str) -> bool {
+        let mut lines = dispatch.lines();
+        while let Some(line) = lines.next() {
+            let line = line.trim();
+            if !line.starts_with("#[cfg(") || !positively_gated(line, selector) {
+                continue;
+            }
+            for next in lines.by_ref() {
+                let next = next.trim();
+                if next.is_empty() || next.starts_with('#') || next.starts_with("//") {
+                    continue;
+                }
+                return next.contains("return") && !next.contains("fatal_application_status");
+            }
+        }
+        false
+    }
+
+    /// Visits every feature whose definition turns on a selector-private
+    /// evidence surface in the runtime. That dependency feature is what makes a
+    /// build selector-private, so it is the honest definition of "must preserve
+    /// its failure category".
+    fn for_each_evidence_selector(manifest: &str, mut visit: impl FnMut(&str)) {
+        let features = manifest
+            .split("[features]")
+            .nth(1)
+            .expect("system-init declares features");
+        let features = features
+            .split("\n[")
+            .next()
+            .expect("the features section ends");
+        let mut name: Option<&str> = None;
+        let mut evidence = false;
+        for line in features.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((left, right)) = line.split_once('=') {
+                if let Some(previous) = name
+                    && evidence
+                {
+                    visit(previous);
+                }
+                name = Some(left.trim());
+                evidence = right.contains("-test-evidence");
+            } else if line.contains("-test-evidence") {
+                evidence = true;
+            }
+        }
+        if let Some(previous) = name
+            && evidence
+        {
+            visit(previous);
+        }
+    }
+
+    #[test]
+    fn every_evidence_selector_either_preserves_its_category_or_is_recorded_debt() {
+        let mut saw_selector_34 = false;
+        for_each_evidence_selector(MANIFEST, |selector| {
+            if selector == "r1-selector34" {
+                saw_selector_34 = true;
+            }
+            if COMPONENT_FEATURES.contains(&selector) {
+                return;
+            }
+            // Fail closed on a name that is neither a recognised selector
+            // spelling nor a declared component, so a future feature cannot slip
+            // past this check by being named something new.
+            assert!(
+                selector.contains("selector") || LEGACY_SELECTORS.contains(&selector),
+                "{selector} enables a runtime evidence surface but is neither a \
+                 *-selector<N> feature nor a declared component; classify it in \
+                 COMPONENT_FEATURES or LEGACY_SELECTORS so this check keeps \
+                 meaning something."
+            );
+            if KNOWN_COLLAPSING.contains(&selector) {
+                return;
+            }
+            assert!(
+                preserves_category(dispatch(MAIN), selector),
+                "{selector} is a selector-private evidence build but names no \
+                 failure status in main.rs, so every InitError would collapse to \
+                 FatalRebootRequired. Add a status that preserves the category, \
+                 or record it in KNOWN_COLLAPSING with the reason."
+            );
+        });
+        // If this trips, the manifest parse stopped matching the manifest and
+        // the check above proved nothing.
+        assert!(
+            saw_selector_34,
+            "selector 34 was not seen as an evidence build"
+        );
+    }
+
+    #[test]
+    fn the_recorded_debt_is_real_and_not_stale() {
+        for selector in KNOWN_COLLAPSING {
+            assert!(
+                MANIFEST.contains(selector),
+                "{selector} is recorded as collapsing but no longer exists"
+            );
+            assert!(
+                !preserves_category(dispatch(MAIN), selector),
+                "{selector} now names a status in main.rs; remove it from \
+                 KNOWN_COLLAPSING rather than leaving the debt recorded"
+            );
+        }
+    }
+
+    #[test]
+    fn the_needle_match_is_exact_and_not_a_prefix() {
+        let sample = "#[cfg(feature = \"wyr1e8-selector33\")]";
+        assert!(names_feature(sample, "wyr1e8-selector33"));
+        assert!(!names_feature(sample, "wyr1e-selector33"));
+        assert!(!names_feature(sample, "wyr1e8"));
+    }
+
+    #[test]
+    fn being_named_in_the_negated_production_arm_does_not_count() {
+        // This is the shape that made an earlier version of this check pass for
+        // a selector whose status arm had been deleted.
+        let fallback = "\
+#[cfg(not(any(\n\
+    feature = \"wyr1-test-evidence\",\n\
+    feature = \"r1-selector34\"\n\
+)))]\n\
+return fatal_application_status(&error) as u32;\n";
+        assert!(!preserves_category(fallback, "r1-selector34"));
+
+        let arm = "\
+#[cfg(feature = \"r1-selector34\")]\n\
+return r1_test_failure_application_status(&error);\n";
+        assert!(preserves_category(arm, "r1-selector34"));
+
+        // A selector excluded by a sibling arm's not(...) must not be credited
+        // to that arm, but must still be credited to its own.
+        let composed = "\
+#[cfg(all(feature = \"wyr1-test-evidence\", not(feature = \"wyr1b-test-evidence\")))]\n\
+return wyr1_test_failure_application_status(&error);\n";
+        assert!(preserves_category(composed, "wyr1-test-evidence"));
+        assert!(!preserves_category(composed, "wyr1b-test-evidence"));
+    }
+}
+
+#[cfg(all(test, feature = "r1-selector34"))]
+mod r1_failure_status_tests {
+    use super::*;
+
+    #[test]
+    fn every_category_survives_the_pre_ready_boundary_distinctly() {
+        // The point of the status is that different failures read differently.
+        // Two categories mapping to one value would put us back where run 2 was.
+        let cases = [
+            (InitError::WrongManifestProfile, 0xAF34_0001),
+            (InitError::UnlaunchableRole, 0xAF34_0002),
+            (InitError::WrongActivationOrder, 0xAF34_0003),
+            (InitError::NonExecutableRole, 0xAF34_000b),
+            (InitError::ZeroBootGeneration, 0xAF34_000d),
+            (InitError::Supervision, 0xAF34_0014),
+            (InitError::Cleanup, 0xAF34_0015),
+            (InitError::Accounting, 0xAF34_0016),
+        ];
+        for (error, expected) in &cases {
+            assert_eq!(
+                r1_test_failure_application_status(error),
+                *expected,
+                "{error:?} lost its category"
+            );
+        }
+        // Pairwise, so the check needs no allocation in this no_std crate.
+        let mut outer = 0;
+        while outer < cases.len() {
+            let mut inner = outer + 1;
+            while inner < cases.len() {
+                assert_ne!(
+                    r1_test_failure_application_status(&cases[outer].0),
+                    r1_test_failure_application_status(&cases[inner].0),
+                    "two categories collided"
+                );
+                inner += 1;
+            }
+            outer += 1;
+        }
+    }
+
+    #[test]
+    fn a_native_failure_keeps_the_status_that_says_which_syscall_refused() {
+        // DW_STATUS_NO_RESOURCES is what run 1 turned on, so it is the case
+        // worth pinning: the code must survive, not become a bare "native".
+        let error = InitError::Native(NativeError::Status(deepwyrm_syscall::DwStatus(-13)));
+        assert_eq!(r1_test_failure_application_status(&error), 0xAF35_000d);
+        let output = InitError::Native(NativeError::Output(
+            wyrmroot_runtime::NativeOutputError::InvalidChannelReceive,
+        ));
+        assert_eq!(r1_test_failure_application_status(&output), 0xAF35_8003);
+    }
+
+    #[test]
+    fn the_r1_bases_cannot_be_confused_with_another_selectors() {
+        // Deepwyrm reports selector 34's code unsummarized, so a base shared
+        // with another selector would be genuinely ambiguous in a transcript.
+        for existing in [
+            0xAF01_0000_u32,
+            0xAF11_0000,
+            0xAF18_0000,
+            0xAF1B_0000,
+            0xAF1C_0000,
+            0xAF1D_0000,
+        ] {
+            for mine in [0xAF34_0000_u32, 0xAF35_0000, 0xAF36_0000] {
+                assert_ne!(existing, mine);
+            }
+        }
+        // And the coarse production value must no longer be reachable here.
+        assert_ne!(
+            r1_test_failure_application_status(&InitError::Supervision),
+            InitApplicationStatus::FatalRebootRequired as u32
+        );
+    }
+
+    #[test]
+    fn a_fatal_resident_tick_also_keeps_its_category() {
+        assert_eq!(
+            resident_tick_failure_application_status(&InitError::Supervision),
+            0xAF36_0014
+        );
+        assert_ne!(
+            resident_tick_failure_application_status(&InitError::Cleanup),
+            0xAF01_0006
         );
     }
 }

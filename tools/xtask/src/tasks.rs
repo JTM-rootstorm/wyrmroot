@@ -1330,6 +1330,15 @@ pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<
         let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
         return run_cargo(repository, &arguments);
     }
+    if matches!(filter, Some("r1-status")) {
+        // Selector 34's failure statuses only exist under its own feature, and
+        // the launcher rightly refuses caller-selected features, so the gate
+        // that proves a category survives the Process-exit boundary has to be
+        // named here.
+        let arguments = r1_status_command();
+        let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+        return run_cargo(repository, &arguments);
+    }
     if matches!(filter, Some("wyr1c4" | "wyr1c4-native")) {
         // WYR1-C4 is a guest-target compilation gate. The pinned host compiler
         // intentionally does not know the x86_64-unknown-wyrmroot built-in
@@ -1376,6 +1385,24 @@ pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<
         run_cargo(repository, &arguments)?;
     }
     Ok(())
+}
+
+fn r1_status_command() -> Vec<String> {
+    [
+        "test",
+        "--locked",
+        "--offline",
+        "--package",
+        "wyrmroot-system-init",
+        "--features",
+        "r1-selector34",
+        "--lib",
+        "r1_failure_status_tests",
+        "--",
+        "--nocapture",
+    ]
+    .map(str::to_owned)
+    .into()
 }
 
 fn wyr1e8_producer_fixture_command() -> Vec<String> {
