@@ -5166,3 +5166,374 @@ mod r1_composition_coverage {
         );
     }
 }
+
+/// Card R1's third repetition of one defect, gated instead of patched again.
+///
+/// Three runs of this card failed with a status that proved something had gone
+/// wrong and nothing about where:
+///
+/// - run 2 (`0xAF010002`): `fatal_application_status(_error)` discarded its
+///   argument, collapsing every `InitError` category into one value;
+/// - run 5 (`0xAF340014`): two unrelated driver sites returned
+///   `InitError::Supervision`, both discarding the probe's own exit code;
+/// - run 6 (`0xAF340001`): `InitError::WrongManifestProfile`, returned from
+///   fourteen sites in `r1_driver.rs` alone, one of which
+///   (`Err(RelayFailure::Refused(_))`) threw away a `RelayError` carrying the
+///   exact expected and observed sequence numbers.
+///
+/// Each of the first two was fixed correctly at its own site, and the next run
+/// was undiagnosable anyway. `AGENTS.md` §1 requires that the third occurrence of
+/// one failure class be classified rather than patched a third time, so this
+/// module states the class as an invariant over the source of the terminal-status
+/// path: **a cause that was carried to a boundary must not be dropped at it.**
+///
+/// The rules read source text for the same reason
+/// `selector_class_membership.rs` does: the defect is an *absence* — a payload
+/// that is never read — so nothing about a correct build fails, and no type can
+/// express "this discard was not deliberate".
+#[cfg(all(test, feature = "r1-selector34"))]
+mod r1_cause_preservation {
+    /// The files a selector-34 terminal status can be produced from. `lib.rs`
+    /// carries the encoders, the other two the driver and its relay.
+    const SOURCES: [(&str, &str); 3] = [
+        ("r1_driver.rs", include_str!("r1_driver.rs")),
+        ("r1_relay.rs", include_str!("r1_relay.rs")),
+        ("lib.rs", include_str!("lib.rs")),
+    ];
+
+    /// Error types on this path whose variants carry a cause worth keeping.
+    ///
+    /// Curated rather than derived: the rule needs to know that discarding a
+    /// `RelayFailure` loses `OutOfOrder { expected, observed }` while discarding
+    /// a unit-like marker loses nothing. `the_curated_types_still_exist` fails if
+    /// one is renamed out from under the list.
+    const PAYLOAD_BEARING: [&str; 6] = [
+        "RelayFailure",
+        "RelayError",
+        "ObservedSupervisionError",
+        "SupervisionError",
+        "LoadError",
+        "ExitValidationError",
+    ];
+
+    /// Sites that drop a carried cause and are not yet fixed.
+    ///
+    /// Keyed on the exact trimmed source line so the entry rots visibly when the
+    /// line changes, rather than drifting with line numbers. This list may
+    /// **shrink and never grow**: a new discard is the fourth occurrence of the
+    /// class, which is precisely what this module exists to refuse.
+    ///
+    /// Every entry is a live defect, not an exemption. Each would erase the cause
+    /// of a future run exactly as runs 2, 5 and 6 did.
+    const KNOWN_DISCARDS: [(&str, &str); 6] = [
+        (
+            ".map_err(|_| InitError::Supervision)?;",
+            "lib.rs `activate_retained_bootfs_state`: the bootstrap-retirement \
+             wait loses the native status of a refused or timed-out wait, and \
+             reports selector 34's `0xAF340014` -- run 5's exact status -- from a \
+             site earlier than the driver. Shared by every selector, so carrying \
+             the cause changes other products' statuses and needs a \
+             cross-selector pass rather than a local edit.",
+        ),
+        (
+            ".map_err(|_| InitError::WrongManifestProfile)?;",
+            "gate lookup: the bootfs error naming which entry is missing is lost",
+        ),
+        (
+            ".map_err(|_| InitError::WrongManifestProfile)",
+            "argv encoding: loses which field would not fit",
+        ),
+        (
+            "let configuration = parse_gate(gate.data()).map_err(|_| InitError::WrongManifestProfile)?;",
+            "gate parse: loses the WRR1 field that failed validation",
+        ),
+        (
+            "system.close_handle(group).map_err(|_| InitError::Cleanup)?;",
+            "teardown: loses the native status of the refused close",
+        ),
+        (
+            "Err(RelayFailure::Refused(_)) => return Err(InitError::WrongManifestProfile),",
+            "run 6's most probable site: loses RelayError, including OutOfOrder's \
+             expected and observed sequence numbers",
+        ),
+    ];
+
+    /// Payload-free `InitError` variants returned from more than one site in the
+    /// driver, with the count at the time this gate was written.
+    ///
+    /// A payload-free variant returned from many sites is the run-6 defect
+    /// directly: fourteen distinct causes arriving as `0xAF340001`. The counts
+    /// may only fall.
+    const KNOWN_COLLAPSING: [(&str, &str, usize); 2] = [
+        (
+            "WrongManifestProfile",
+            "InitError::WrongManifestProfile",
+            14,
+        ),
+        ("Cleanup", "InitError::Cleanup", 7),
+    ];
+
+    /// Variants that carry a cause the selector-34 encoder does not surface.
+    ///
+    /// `r1_test_failure_application_status` gives `Native` and `R1Probe` their
+    /// own bases; every other payload-bearing variant reaches the host as a bare
+    /// category, so the payload is carried the whole way and dropped at the last
+    /// step. The counts may only fall.
+    const KNOWN_UNSURFACED: [&str; 5] = [
+        "InitError::Bootfs",
+        "InitError::Mapping",
+        "InitError::Loader",
+        "InitError::RegistryProtocol",
+        "InitError::Wyr1BModel",
+    ];
+
+    /// Lines that convert one error into another while discarding the original.
+    ///
+    /// Two forms, both taken from real defects on this card:
+    /// `map_err(|_| …)` (runs 2 and 5) and a match arm that discards a
+    /// payload-bearing variant and produces an `InitError` (run 6).
+    fn discards_a_cause(line: &str) -> bool {
+        let trimmed = line.trim();
+        // Comments, and string literals -- which is what this module's own
+        // fixtures and its KNOWN_DISCARDS entries are. Without the literal skip
+        // the gate reports its own test data as defects, and a finding could be
+        // silenced by editing a fixture rather than by fixing the code.
+        if trimmed.starts_with("//") || trimmed.starts_with('"') {
+            return false;
+        }
+        if trimmed.contains("map_err(|_|") {
+            return true;
+        }
+        discards_a_binding(trimmed)
+            && trimmed.contains("InitError::")
+            && PAYLOAD_BEARING.iter().any(|name| trimmed.contains(name))
+    }
+
+    /// Whether a line binds a payload only to throw it away.
+    ///
+    /// Both spellings count. `(_)` is run 6's form; `(_error)` is run 2's -- the
+    /// `fatal_application_status(_error)` that started this class, and which an
+    /// earlier draft of this rule missed because it looked only for `(_)`. A
+    /// leading underscore on a bound payload means the compiler was told to stop
+    /// asking, which is the whole defect.
+    fn discards_a_binding(line: &str) -> bool {
+        let bytes = line.as_bytes();
+        for (at, window) in bytes.windows(2).enumerate() {
+            if window != b"(_" {
+                continue;
+            }
+            match bytes.get(at + 2) {
+                Some(b')') => return true,
+                Some(next) if next.is_ascii_alphanumeric() || *next == b'_' => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Source with its test modules removed.
+    ///
+    /// Tests legitimately construct and match errors they do not care about, and
+    /// counting those would make the collapse budget meaningless. This module's
+    /// own fixtures are the sharper reason: they quote real defect lines
+    /// verbatim, so scanning them would report the gate's own test data as
+    /// defects -- and would let someone silence a finding by editing a fixture.
+    fn without_tests(source: &str) -> &str {
+        // Only a trailing `mod tests` block is cut. Truncating at the first
+        // `#[cfg(test)]` was tried and was wrong: `lib.rs` carries inline test
+        // modules throughout, so it hid every real site below the first one --
+        // including the `activate_retained_bootfs_state` discard this gate found.
+        match source.find("\nmod tests {") {
+            Some(at) => &source[..at],
+            None => source,
+        }
+    }
+
+    /// Every discarding line across the scanned sources, as an iterator: this
+    /// crate is `no_std` with no allocator, so the scan cannot collect.
+    /// This module's own marker in `lib.rs`. Everything from here down is the
+    /// gate itself, whose detector literals and declared defect lines are not
+    /// code under test.
+    const SELF_MARKER: &str = "\nmod r1_cause_preservation {";
+
+    /// `lib.rs` with this module removed.
+    ///
+    /// Skipping comments and quoted fixtures was not enough: the detector's own
+    /// `contains("map_err(|_|")` sits mid-line in ordinary code and matched
+    /// itself. A gate that reads the file it lives in has to excise itself, and
+    /// `the_self_exclusion_is_real` fails if the marker stops matching.
+    fn without_self(source: &str) -> &str {
+        match source.find(SELF_MARKER) {
+            Some(at) => &source[..at],
+            None => source,
+        }
+    }
+
+    fn offending_lines() -> impl Iterator<Item = (&'static str, &'static str)> {
+        SOURCES.into_iter().flat_map(|(name, source)| {
+            without_tests(without_self(source))
+                .lines()
+                .map(str::trim)
+                .filter(|line| discards_a_cause(line))
+                .map(move |line| (name, line))
+        })
+    }
+
+    /// The rule itself, proven against the real defect rather than only against
+    /// the current tree: if this ever stops firing on run 6's own line, the gate
+    /// has been disabled whatever else it reports.
+    #[test]
+    fn the_rule_fires_on_the_defects_it_was_written_for() {
+        for line in [
+            "            Err(RelayFailure::Refused(_)) => return Err(InitError::WrongManifestProfile),",
+            "        .map_err(|_| InitError::Supervision)",
+            "            .map_err(|_| InitError::WrongManifestProfile)?;",
+            "        ObservedSupervisionError::Supervision(_) => return Err(InitError::Supervision),",
+            // Run 2's spelling: a bound payload silenced with a leading
+            // underscore. An earlier draft of this rule missed it.
+            "            Err(RelayFailure::Refused(_error)) => Err(InitError::WrongManifestProfile),",
+            "        Err(LoadError::Native(_e)) => Err(InitError::WrongManifestProfile),",
+        ] {
+            assert!(
+                discards_a_cause(line),
+                "the cause-preservation rule does not fire on a known defect: {line}"
+            );
+        }
+        // And it must not fire on the shapes that keep the cause, or the gate
+        // would be unusable and would be switched off rather than obeyed.
+        for line in [
+            "        .map_err(InitError::Native)?;",
+            "            .map_err(|error| InitError::R1Probe(probe_failure_before_ready(&error)))",
+            "                    Ok(_) => R1ProbeFailure::DrainUnattributed,",
+            "            // map_err(|_| InitError::Cleanup) is what this forbids",
+        ] {
+            assert!(
+                !discards_a_cause(line),
+                "the rule fires on a shape that preserves its cause: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_new_site_drops_a_carried_cause() {
+        // Self-check: the scan must actually be reading source. A rename or an
+        // emptied include would otherwise make this pass by finding nothing.
+        // Exact, not a lower bound. Keying the allowlist on line text means a
+        // second copy of an allowed line would otherwise be admitted for free --
+        // which is how a fourteen-site collapse grows one paste at a time. Too
+        // few, and the scan has stopped reading the sources it names.
+        let seen = offending_lines().count();
+        assert_eq!(
+            seen,
+            KNOWN_DISCARDS.len(),
+            "the scan found {seen} cause-discarding lines and {} are declared. \
+             More means a new discard, or a second copy of a declared one; fewer \
+             means the scan is no longer reading these sources, or a site was \
+             fixed without shrinking KNOWN_DISCARDS",
+            KNOWN_DISCARDS.len()
+        );
+        for (file, line) in offending_lines() {
+            assert!(
+                KNOWN_DISCARDS.iter().any(|(known, _)| *known == line),
+                "{file} drops a carried cause at a site this gate does not know:\n  \
+                 {line}\nThis is the fourth occurrence of card R1's recurring \
+                 defect class. Carry the cause into the status instead of \
+                 declaring it here."
+            );
+        }
+    }
+
+    #[test]
+    fn the_discard_list_shrinks_rather_than_rots() {
+        for (known, reason) in KNOWN_DISCARDS {
+            assert!(
+                offending_lines().any(|(_, line)| line == known),
+                "KNOWN_DISCARDS still lists a site that no longer exists, so the \
+                 list describes a tree that is gone: {known} ({reason})"
+            );
+            assert!(
+                !reason.is_empty(),
+                "every declared discard states what cause it loses"
+            );
+        }
+    }
+
+    #[test]
+    fn the_self_exclusion_is_real() {
+        let lib = include_str!("lib.rs");
+        assert!(
+            lib.contains(SELF_MARKER),
+            "this module's own marker no longer matches, so the gate is either \
+             scanning itself or excising the wrong region"
+        );
+        // The excision must remove this module and nothing above it: the
+        // `activate_retained_bootfs_state` discard lives far earlier in the file
+        // and must still be scanned. Losing it is how the first attempt at this
+        // exclusion silently hid every real site in `lib.rs`.
+        let scanned = without_self(lib);
+        assert!(
+            scanned.contains("fn activate_retained_bootfs_state"),
+            "the self-exclusion cut away real code above this module"
+        );
+        assert!(
+            !scanned.contains("fn discards_a_cause"),
+            "the self-exclusion did not remove this module's own detector"
+        );
+    }
+
+    #[test]
+    fn the_curated_types_still_exist() {
+        // The payload-bearing list is the rule's whole notion of "a cause worth
+        // keeping". If a type is renamed and the list is not, the rule silently
+        // narrows, which is how a gate stops gating without failing.
+        for name in PAYLOAD_BEARING {
+            assert!(
+                SOURCES.iter().any(|(_, source)| source.contains(name)),
+                "{name} is named in PAYLOAD_BEARING but appears in none of the \
+                 sources, so the rule no longer recognises it"
+            );
+        }
+    }
+
+    #[test]
+    fn the_collapse_budget_only_falls() {
+        let driver = without_tests(include_str!("r1_driver.rs"));
+        for (variant, pattern, recorded) in KNOWN_COLLAPSING {
+            let count = driver.matches(pattern).count();
+            assert!(
+                count > 0,
+                "{variant} is recorded as collapsing but is never returned; \
+                 remove it from KNOWN_COLLAPSING"
+            );
+            assert!(
+                count <= recorded,
+                "{variant} is now returned from {count} driver sites, up from \
+                 {recorded}. A payload-free variant returned from many sites is \
+                 run 6's defect: fourteen causes arriving as one status. Give it \
+                 a payload or reuse an existing site."
+            );
+        }
+    }
+
+    #[test]
+    fn the_unsurfaced_list_names_real_variants() {
+        let lib = include_str!("lib.rs");
+        for variant in KNOWN_UNSURFACED {
+            assert!(
+                lib.contains(variant),
+                "{variant} is recorded as carrying an unsurfaced cause but is not \
+                 an InitError variant any more"
+            );
+        }
+        // `Native` and `R1Probe` are the two the encoder does surface. If either
+        // stopped being special-cased, every cause on this path would collapse
+        // again and this list would be describing the wrong problem.
+        for surfaced in ["InitError::Native(error) => 0xAF35_0000", "R1ProbeFailure::ExitCode(code)) => 0xAF37_0000"] {
+            assert!(
+                lib.contains(surfaced),
+                "the selector-34 encoder no longer surfaces a cause it used to: \
+                 {surfaced}"
+            );
+        }
+    }
+}
