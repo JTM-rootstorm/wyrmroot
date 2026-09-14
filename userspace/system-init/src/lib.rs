@@ -4867,11 +4867,22 @@ mod native_cleanup_tests {
         // Selector 32 retains a JobV2 dispatcher alongside the device resident.
         // Reserve 40 KiB of the existing 108 KiB execution stack for residency;
         // this partition is a userspace budget, not a startup ABI limit.
+        //
+        // Selector 29 gets its own tier rather than either of those. It carries
+        // twenty-two selector-private evidence fields in
+        // `wyr1c_native::ResidentState`, which grow that resident from 512 bytes
+        // to 1,864 and put the total 360 bytes over the 20 KiB partition. That
+        // state exists only under `wyr1c6-selector29`, so the growth is real and
+        // intended -- but 40 KiB would be twice what it needs and would stop this
+        // gate biting for a long time. 22 KiB sits just above the current 20,840
+        // and still fails on the next unexamined field.
         let resident_budget = if cfg!(any(
             feature = "wyr1d-selector32",
             feature = "wyr1e-production"
         )) {
             40
+        } else if cfg!(feature = "wyr1c6-selector29") {
+            22
         } else {
             20
         };
