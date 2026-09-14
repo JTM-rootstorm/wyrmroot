@@ -5942,6 +5942,57 @@ mod r1_cause_preservation {
         }
     }
 
+    /// The body of the probe's sole send path, comments removed.
+    fn send_with_room_body() -> &'static str {
+        PROBE_SOURCE
+            .1
+            .split("fn send_with_room(")
+            .nth(1)
+            .expect("the probe still routes every record through one send path")
+            .split("\n    }")
+            .next()
+            .expect("the send path is still a bounded function body")
+    }
+
+    #[test]
+    fn the_probes_only_record_send_waits_for_room() {
+        // Run 13's site. `send_channel` is non-blocking by contract -- WouldBlock
+        // means "no room at this instant", not "something is wrong" -- and this
+        // path had no back-pressure at all, so the first time the probe outran
+        // permanent init's drain it reported the refusal as a fatal RunStopped.
+        // Runs 12 and 13 stopped at different hogs for that reason alone, with
+        // every launch and accept in them succeeding.
+        assert!(
+            probe_code_lines().any(|line| line.contains("self.send_with_room(&record)")),
+            "the probe's record send no longer routes through the waiting path, \
+             so a momentarily full channel is fatal again"
+        );
+        let body = send_with_room_body();
+        assert!(
+            body.contains("DW_SIGNAL_WRITABLE"),
+            "the send path no longer waits for room before retrying"
+        );
+        assert!(
+            body.contains("is_would_block(error)"),
+            "the send path no longer separates \"no room right now\" from a real \
+             refusal, so either it retries errors it must not or it fails on the \
+             one it must not"
+        );
+        // Bounded. An unbounded wait would turn a stopped init into a hang, and
+        // the harness only snapshots on timeout -- trading a named failure for
+        // the least informative outcome this card has.
+        assert!(
+            body.contains("monotonic_deadline_after(REPORT_ROOM_TIMEOUT_NANOSECONDS)"),
+            "the wait for room is no longer bounded by a deadline"
+        );
+        // And the give-up must still be the channel's own refusal, not a probe
+        // -invented ordinal: the host needs to see WOULD_BLOCK at this site.
+        assert!(
+            body.contains("return Err(report_send_failure(error));"),
+            "running out of room must be reported as the refusal it was"
+        );
+    }
+
     /// The probe crate's *library*, which none of the rules above reach.
     ///
     /// `PROBE_SOURCE` is the binary. `encode_terminal` lives in the library

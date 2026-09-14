@@ -20,8 +20,9 @@
 use core::panic::PanicInfo;
 
 use deepwyrm_syscall::{
-    DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL, DW_SIGNAL_READABLE, DW_STATUS_TIMED_OUT,
-    DwHandle, DwReceivedHandleInfoV1, DwRights, DwSignals,
+    DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL, DW_SIGNAL_READABLE,
+    DW_SIGNAL_WRITABLE, DW_STATUS_TIMED_OUT, DW_STATUS_WOULD_BLOCK, DwHandle,
+    DwReceivedHandleInfoV1, DwRights, DwSignals,
 };
 use wyrmroot_launch_proto::{
     Message as LaunchMessage, MessageType as LaunchType, Reservation, TerminationClassification,
@@ -71,6 +72,17 @@ const ACCEPT_TIMEOUT_NANOSECONDS: u64 = 3_000_000_000;
 /// hogs hold the CPUs, which is the condition under test.
 const RESULT_TIMEOUT_NANOSECONDS: u64 = 8_000_000_000;
 
+/// How long the probe waits for room on its report channel before giving up.
+///
+/// The channel is depth 2 and the kernel's send is non-blocking by contract: it
+/// refuses with `WouldBlock` rather than dropping or blocking, so a sender that
+/// outruns permanent init's drain *must* wait. Generous on purpose -- a report
+/// that is merely queued behind init is not a failure of anything under test,
+/// and reporting it as one is what stopped runs 12 and 13 at different depths of
+/// the same scenario. Still bounded, because an init that has actually stopped
+/// draining must end the run rather than hang it.
+const REPORT_ROOM_TIMEOUT_NANOSECONDS: u64 = 5_000_000_000;
+
 /// Largest launch/job datagram this probe sends or accepts, matching the
 /// wyr1b-gate client's fixed frame so no path here allocates.
 const FRAME_BYTES: usize = 416;
@@ -106,7 +118,7 @@ impl Reporter {
     /// proving the send refused and not whether the handle lacked a right, the
     /// peer had closed, or the queue was full.
     fn emit(&mut self, record: [u8; RECORD_BYTES]) -> Result<(), u32> {
-        match send_channel(self.parent, &record, &[]) {
+        match self.send_with_room(&record) {
             Ok(()) => Ok(()),
             Err(error) => {
                 // The send is atomic: on refusal nothing was transmitted, so the
@@ -116,7 +128,47 @@ impl Reporter {
                 // and which sent this investigation after a lost datagram that
                 // never existed.
                 self.sequence -= 1;
-                Err(report_send_failure(error))
+                Err(error)
+            }
+        }
+    }
+
+    /// Sends one record, waiting for room rather than treating a full channel
+    /// as a failure.
+    ///
+    /// `send_channel` is non-blocking by contract: `WouldBlock` means the peer's
+    /// depth-2 queue or the shared payload pool had no room *at that instant*,
+    /// not that anything is wrong. This path had no back-pressure at all, so the
+    /// probe reported `WOULD_BLOCK` as a fatal `RunStopped` the first time it
+    /// outran permanent init's drain -- run 13's `0x81009008`, and run 12's
+    /// discarded code before it. How far the scenario got was decided by drain
+    /// timing, which is why the two runs stopped at different hogs while every
+    /// launch and accept in them succeeded.
+    ///
+    /// Waiting on `DW_SIGNAL_WRITABLE` alone is not enough to make the retry
+    /// unnecessary: that signal asserts per-queue descriptor room and says
+    /// nothing about the globally shared payload pool, so a send can still be
+    /// refused immediately after the wait reports writable. The loop is written
+    /// to survive that rather than to assume it away.
+    fn send_with_room(&self, record: &[u8; RECORD_BYTES]) -> Result<(), u32> {
+        let deadline = monotonic_deadline_after(REPORT_ROOM_TIMEOUT_NANOSECONDS)
+            .map_err(report_send_failure)?;
+        loop {
+            match send_channel(self.parent, record, &[]) {
+                Ok(()) => return Ok(()),
+                Err(error) if !is_would_block(error) => return Err(report_send_failure(error)),
+                Err(error) => {
+                    // Out of time is reported as the refusal it actually was, so
+                    // the host sees `WOULD_BLOCK` at the report-send site rather
+                    // than a probe-invented timeout ordinal.
+                    match wait_one(self.parent, DwSignals(DW_SIGNAL_WRITABLE.0), deadline) {
+                        Ok(_) => {}
+                        Err(NativeError::Status(status)) if status == DW_STATUS_TIMED_OUT => {
+                            return Err(report_send_failure(error));
+                        }
+                        Err(waited) => return Err(report_send_failure(waited)),
+                    }
+                }
             }
         }
     }
@@ -555,6 +607,15 @@ fn await_reply_for(
 /// failure. Reporting a generic error as a timeout is exactly the vagueness the
 /// R1 gate exists to eliminate.
 const TIMED_OUT_SENTINEL: u32 = PROBE_ERROR_BASE + 0x0FFF;
+
+/// Whether a native error is the channel saying "no room right now".
+///
+/// The kernel maps both a full peer queue and an exhausted payload pool to this
+/// one status, so userspace cannot tell which refused -- and does not need to:
+/// waiting and retrying is correct for both.
+fn is_would_block(error: NativeError) -> bool {
+    matches!(error, NativeError::Status(status) if status == DW_STATUS_WOULD_BLOCK)
+}
 
 fn wait_readable(channel: DwHandle, timeout: u64, code: u32) -> Result<(), u32> {
     let deadline = monotonic_deadline_after(timeout).map_err(|_| code)?;
