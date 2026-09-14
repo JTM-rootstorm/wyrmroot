@@ -81,6 +81,7 @@ This file defines the minimum architecture reading set for Wyrmroot implementati
 - A milestone plan may add stricter requirements but may not silently weaken a platform convention.
 - If implementation reveals a conflict, stop local invention and route the change through the coordinator/architecture documents.
 - For compatibility-motivated native growth, the cross-personality doctrine is a hard admission overlay: an older statement that compatibility may influence or generalize a native abstraction cannot authorize personality-aware Wyrmroot policy or a broader Deepwyrm primitive. Prefer personality adapters and shared restartable userspace helpers; any kernel change must independently satisfy the stricter privileged-mechanism admission test.
+- Any new payload-bearing error variant, exit-code encoder, or evidence field is subject to the workspace [`../../DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md`](../../DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md): a status may collapse causes whose recovery action is identical, a collapse owes the instance to the reader's channel in the same change, and a `match` converting an error type into an exit code or status must be exhaustive over it.
 
 ## Phase-0 freeze policy
 

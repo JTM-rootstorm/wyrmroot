@@ -364,7 +364,20 @@ impl Init0Error {
                 cause,
                 rollback_failed,
             }) => loader_platform_exit_code(*stage, *cause, *rollback_failed),
-            Self::Loader(_) => PREFIX | 0x01FF,
+            // `Loader(_) => PREFIX | 0x01FF` collapsed three distinct loader
+            // failures into one code: an ELF rejection, a startup-block
+            // rejection and a launch rejection arrived identical. Named per
+            // variant so the match is exhaustive over `LoadError`, per
+            // `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §3.4.
+            //
+            // The inner `ElfError`, `StartupBlockError` and `LaunchError`
+            // ordinals are not yet surfaced. The boot path has no snapshot to
+            // fall back on, so contract §4 puts them here rather than in §4.2 --
+            // this encoder is the reader's only channel that early. Adding them
+            // is the next step, not a decision deferred to a wildcard.
+            Self::Loader(LoadError::Elf(_)) => PREFIX | 0x0101,
+            Self::Loader(LoadError::Startup(_)) => PREFIX | 0x0102,
+            Self::Loader(LoadError::Launch(_)) => PREFIX | 0x0103,
             Self::Supervision(SupervisionError::Exit(
                 wyrmroot_runtime::ExitValidationError::NonzeroApplicationCode(code),
             )) => *code,

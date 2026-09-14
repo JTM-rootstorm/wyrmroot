@@ -523,6 +523,16 @@ pub const fn r1_test_failure_application_status(error: &InitError) -> u32 {
         // high half, so the low sixteen bits carry the ordinal that identifies
         // which of its startup checks refused.
         InitError::R1Probe(R1ProbeFailure::ExitCode(code)) => 0xAF37_0000 | (*code & 0xffff),
+        // The wildcard this match used to end with was absorbing these three.
+        // They are payload-free, so their category byte is the whole cause and
+        // naming them loses nothing -- but a payload-bearing `R1ProbeFailure`
+        // added later now fails to compile here rather than arriving as a
+        // category, which is what §3.4 is for.
+        InitError::R1Probe(
+            R1ProbeFailure::ReadyUnattributed
+            | R1ProbeFailure::DrainUnattributed
+            | R1ProbeFailure::DrainQueryFailed,
+        ) => 0xAF34_0000 | test_failure_category(error),
         // A refused record's own reason, for the same purpose: run 6 proved a
         // record had been refused and nothing about which check refused it.
         InitError::R1Relay(error) => 0xAF38_0000 | r1_relay_detail(error),
@@ -547,7 +557,56 @@ pub const fn r1_test_failure_application_status(error: &InitError) -> u32 {
             index,
             observed,
         }) => 0xAF3A_0000 | ((*index & 0xff) << 8) | ((*observed & 0xff) as u32),
-        _ => 0xAF34_0000 | test_failure_category(error),
+        // Every remaining variant reaches the host as its category byte and
+        // nothing more. They are named rather than swallowed by a wildcard:
+        // `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §3.4 forbids a `_` arm at a
+        // status boundary, so a variant added to `InitError` later fails to
+        // compile here instead of silently joining this list.
+        //
+        // Naming them is not the same as surfacing them. The payloads of
+        // `Bootfs`, `Mapping`, `Loader`, `RegistryProtocol` and `Wyr1BModel`
+        // are on paths selector 34 does not exercise, and this encoder's low
+        // sixteen bits are scarce. Per contract §4.2 their instance belongs in
+        // the liveness snapshot when a card needs it, not spent here. Adding a
+        // base above is the right move only for a payload selector 34 can
+        // actually reach.
+        InitError::WrongManifestProfile
+        | InitError::UnlaunchableRole
+        | InitError::WrongActivationOrder
+        | InitError::MissingAttemptResources
+        | InitError::ResourcesAlreadyInstalled
+        | InitError::ResourceIdentityMismatch
+        | InitError::InvalidResourceHandle
+        | InitError::Restart(_)
+        | InitError::Bootfs(_)
+        | InitError::MissingRetainedMaterial
+        | InitError::NonExecutableRole
+        | InitError::Manifest(_)
+        | InitError::ZeroBootGeneration
+        | InitError::ArtifactIdentityMismatch(_)
+        | InitError::Capability(_)
+        | InitError::Mapping(_)
+        | InitError::Launch(_)
+        | InitError::Loader(_)
+        | InitError::Supervision
+        | InitError::Cleanup
+        | InitError::Accounting
+        | InitError::GateConfig(_)
+        | InitError::Evidence(_)
+        | InitError::Wyr1BGateConfig(_)
+        | InitError::RegistryProtocol(_)
+        | InitError::Wyr1BGateProtocol(_)
+        | InitError::Wyr1BGateMismatch
+        | InitError::Wyr1BModel(_)
+        | InitError::Wyr1BEvidence(_) => 0xAF34_0000 | test_failure_category(error),
+        #[cfg(feature = "wyr1b-test-evidence")]
+        InitError::StartupMapping(_) | InitError::OrdinaryMapping(_) => {
+            0xAF34_0000 | test_failure_category(error)
+        }
+        #[cfg(feature = "wyr1c6-selector29")]
+        InitError::Wyr1C6GateConfig(_) => 0xAF34_0000 | test_failure_category(error),
+        #[cfg(feature = "wyr1e8-selector33")]
+        InitError::E8Transition { .. } => 0xAF34_0000 | test_failure_category(error),
     }
 }
 
@@ -609,13 +668,25 @@ const fn mapping_failure_ordinal(
     error: MappingPlanError,
     size_class: StartupBootfsSizeClass,
 ) -> u32 {
-    let outcome = match (error, size_class) {
-        (MappingPlanError::EmptyArchive, StartupBootfsSizeClass::Zero) => 0,
-        (MappingPlanError::ArchiveTooLarge, StartupBootfsSizeClass::OverMaximum) => 1,
-        (MappingPlanError::ArchiveTooLarge, StartupBootfsSizeClass::GarbageHigh) => 2,
-        _ => 0x1f,
+    // Exhaustive on the error axis per `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md`
+    // §3.4: a fourth `MappingPlanError` variant must fail to compile here rather
+    // than silently become the implausible-combination sentinel. The size-class
+    // axis keeps its sentinel, because most of the product genuinely cannot
+    // occur and `0x1f` is the right answer when it appears to.
+    const IMPLAUSIBLE: u32 = 0x1f;
+    let outcome = match error {
+        MappingPlanError::EmptyArchive => match size_class {
+            StartupBootfsSizeClass::Zero => 0,
+            _ => IMPLAUSIBLE,
+        },
+        MappingPlanError::ArchiveTooLarge => match size_class {
+            StartupBootfsSizeClass::OverMaximum => 1,
+            StartupBootfsSizeClass::GarbageHigh => 2,
+            _ => IMPLAUSIBLE,
+        },
+        MappingPlanError::RoundingOverflow => IMPLAUSIBLE,
     };
-    if outcome == 0x1f {
+    if outcome == IMPLAUSIBLE {
         outcome
     } else {
         site * 3 + outcome + 1
@@ -5487,6 +5558,30 @@ mod r1_composition_coverage {
 /// `selector_class_membership.rs` does: the defect is an *absence* — a payload
 /// that is never read — so nothing about a correct build fails, and no type can
 /// express "this discard was not deliberate".
+///
+/// # What this module is, and is not
+///
+/// The §12 architecture review in `DW1_WYR1_RESET_CAUSE_ERASURE_REVIEW.md`
+/// examined this module after the class reached five occurrences, and found that
+/// it does not guard the class. It reads four files. `system-init` alone has
+/// around 142 discarding sites, most in files not listed here, and `devmgr`
+/// carries run 6's own shape at twenty-seven sites in a crate this module has
+/// never opened. Its checks also run on trimmed single lines, so splitting a
+/// call across two defeats them.
+///
+/// So read it as what it is: **a bounded ratchet over four files on selector
+/// 34's terminal-status path**, which is useful where its scope matches the code
+/// — the probe especially — and is not evidence about the class anywhere else. It
+/// was widened twice after escapes; the review's conclusion is that it should not
+/// be widened a third time, because a source-text check cannot tell a legitimate
+/// collapse from a defect and ends up parking instances as "known" instead.
+///
+/// The class's actual rule now lives in `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md`,
+/// and its enforceable core is §3.4: no wildcard arm over an error type at a
+/// status boundary, so the compiler refuses a new variant that would silently
+/// join a category. `the_selector34_encoder_has_no_wildcard_arm` holds that one
+/// property here and replaced a list of five instances that described nothing
+/// about variants added later.
 #[cfg(all(test, feature = "r1-selector34"))]
 mod r1_cause_preservation {
     /// The files a selector-34 terminal status can be produced from. `lib.rs`
@@ -5685,19 +5780,6 @@ mod r1_cause_preservation {
         ("Cleanup", "InitError::Cleanup", 7),
     ];
 
-    /// Variants that carry a cause the selector-34 encoder does not surface.
-    ///
-    /// `r1_test_failure_application_status` gives `Native` and `R1Probe` their
-    /// own bases; every other payload-bearing variant reaches the host as a bare
-    /// category, so the payload is carried the whole way and dropped at the last
-    /// step. The counts may only fall.
-    const KNOWN_UNSURFACED: [&str; 5] = [
-        "InitError::Bootfs",
-        "InitError::Mapping",
-        "InitError::Loader",
-        "InitError::RegistryProtocol",
-        "InitError::Wyr1BModel",
-    ];
 
     /// Lines that convert one error into another while discarding the original.
     ///
@@ -5927,19 +6009,44 @@ mod r1_cause_preservation {
         }
     }
 
+    /// The encoder's code lines, comments dropped. Allocation-free, like the
+    /// rest of this module.
+    fn selector34_encoder_lines() -> impl Iterator<Item = &'static str> {
+        include_str!("lib.rs")
+            .split("pub const fn r1_test_failure_application_status(")
+            .nth(1)
+            .expect("selector 34 still has one terminal status encoder")
+            .split("\n}\n")
+            .next()
+            .expect("the encoder is still a bounded function body")
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//"))
+    }
+
     #[test]
-    fn the_unsurfaced_list_names_real_variants() {
-        let lib = include_str!("lib.rs");
-        for variant in KNOWN_UNSURFACED {
+    fn the_selector34_encoder_has_no_wildcard_arm() {
+        // This replaced a list of five variants whose payload the encoder did
+        // not surface. The list described instances; this describes the
+        // property, and covers every variant added after it was written.
+        //
+        // `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §3.4: a match converting an
+        // error type into a status must be exhaustive over it. The compiler
+        // enforces that as long as no wildcard is reintroduced, and a wildcard
+        // is one token rather than a spelling a grep can miss -- which is the
+        // one shape a source check can hold reliably.
+        for forbidden in ["_ =>", "_ if"] {
             assert!(
-                lib.contains(variant),
-                "{variant} is recorded as carrying an unsurfaced cause but is not \
-                 an InitError variant any more"
+                !selector34_encoder_lines().any(|line| line.contains(forbidden)),
+                "the selector-34 encoder has a `{forbidden}` arm again. A variant \
+                 added to InitError now reaches the host as a bare category \
+                 instead of failing to compile here."
             );
         }
-        // `Native` and `R1Probe` are the two the encoder does surface. If either
-        // stopped being special-cased, every cause on this path would collapse
-        // again and this list would be describing the wrong problem.
+
+        let lib = include_str!("lib.rs");
+        // The bases the encoder does surface. If one stopped being special-cased,
+        // a cause that used to survive would collapse into its category.
         for surfaced in [
             "InitError::Native(error) => 0xAF35_0000",
             "R1ProbeFailure::ExitCode(code)) => 0xAF37_0000",
