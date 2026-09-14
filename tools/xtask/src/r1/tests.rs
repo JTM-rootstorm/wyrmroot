@@ -430,11 +430,50 @@ mod request {
     }
 
     #[test]
+    fn a_prepared_request_carries_its_own_card_and_not_another_cards_question() {
+        let mut digests = BTreeMap::new();
+        digests.insert("smp/r1-esp.img".to_owned(), "aa".repeat(32));
+        let render = |card| {
+            render_request(
+                Path::new("/home/mike/Documents/Programming/OS-Project/artifacts/r1-260912"),
+                card,
+                "a7ce03706f85b186b2810c3ac38377f0ccac7238",
+                "12d75ae405e5aa66960246ad459ec5e9f18127de",
+                "085b184c32ae1fa3d5ec322c86957dd5d036595c",
+                "a9b067107ec38e2be44630f4dce428dab0f48de8",
+                "8100000000000001",
+                1240,
+                145,
+                &digests,
+            )
+            .unwrap()
+        };
+
+        let r1c = render(RequestCard::R1C);
+        assert!(r1c.contains("card = \"R1C\""));
+        assert!(r1c.contains("reproduce the present failure family"));
+
+        let r4e = render(RequestCard::R4E);
+        assert!(r4e.contains("card = \"R4E\""));
+        assert!(r4e.contains("more hogs than CPUs are launched on exactly four vCPUs"));
+        // The point of the flag: R4E must not inherit the question or the
+        // wants-a-failure framing of the card that ran before it.
+        assert!(!r4e.contains("reproduce the present failure family"));
+        assert!(!r4e.contains("A failing run is a valid result if it identifies"));
+        assert!(r4e.contains("cannot discriminate R4B/R4C from their absence"));
+        // Both still require the gdbstub, for opposite reasons.
+        assert!(r1c.contains("gdb_required = true"));
+        assert!(r4e.contains("gdb_required = true"));
+        assert!(r4e.contains("The hook reads nothing on a passing run."));
+    }
+
+    #[test]
     fn the_request_states_every_element_section_10_requires() {
         let mut digests = BTreeMap::new();
         digests.insert("smp/r1-esp.img".to_owned(), "aa".repeat(32));
         let request = render_request(
             Path::new("/home/mike/Documents/Programming/OS-Project/artifacts/r1-260912"),
+            RequestCard::R1C,
             "a7ce03706f85b186b2810c3ac38377f0ccac7238",
             "12d75ae405e5aa66960246ad459ec5e9f18127de",
             "085b184c32ae1fa3d5ec322c86957dd5d036595c",
@@ -487,6 +526,7 @@ mod request {
         let output = Path::new("/home/mike/Documents/Programming/OS-Project/artifacts/r1-260912");
         let request = render_request(
             output,
+            RequestCard::R1C,
             "a7ce037",
             "12d75ae",
             "085b184",

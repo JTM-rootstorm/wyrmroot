@@ -953,6 +953,7 @@ pub(crate) fn compose_profile_esp(
 /// is the same recovery as a rejected staging.
 pub(crate) fn prepare(
     output: &Path,
+    card: RequestCard,
     deep_repository: &Path,
     deep_revision: &str,
     nonce: &str,
@@ -1182,6 +1183,7 @@ pub(crate) fn prepare(
 
     let request = render_request(
         &output,
+        card,
         &wyrmroot_revision,
         deep_revision,
         &abi_revision,
@@ -1325,8 +1327,90 @@ pub(crate) const PROBE_WORST_CASE_SECONDS: u32 = 180;
 /// `run-verified-vm-request.py` capture/recheck flow that a GDB-attached
 /// diagnostic run does not use.
 #[allow(clippy::too_many_arguments)]
+/// Which reset card a prepared request is for.
+///
+/// The gate block is not decoration: it is what a reader checks a run against
+/// before accepting it, so a request prepared for one card must not carry
+/// another card's question. R1C wanted a classified failure and R4E does not,
+/// and that difference belongs in the file rather than in whoever remembers it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RequestCard {
+    R1C,
+    R4E,
+}
+
+impl RequestCard {
+    pub(crate) fn parse(name: &str) -> Option<Self> {
+        match name {
+            "R1C" => Some(Self::R1C),
+            "R4E" => Some(Self::R4E),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::R1C => "R1C",
+            Self::R4E => "R4E",
+        }
+    }
+
+    fn question(self) -> &'static str {
+        match self {
+            Self::R1C => {
+                "reproduce the present failure family, or establish that A27 depends on additional E8 state"
+            }
+            Self::R4E => {
+                "does every continuously runnable unpinned thread execute, and does the independent progress child stay responsive, while more hogs than CPUs are launched on exactly four vCPUs"
+            }
+        }
+    }
+
+    fn gate_notes(self) -> &'static [&'static str] {
+        match self {
+            Self::R1C => &[
+                "# A failing run is a valid result if it identifies internal scheduler,",
+                "# wait or teardown state. A run that stalls and captures no structured",
+                "# state fails the card even though the VM behaved.",
+            ],
+            Self::R4E => &[
+                "# A classified failure is a valid result and is not what this card",
+                "# wants: it reports that R4's repair is incomplete, which is an answer.",
+                "# R1C wanted such a failure; R4E does not. A run that stalls and",
+                "# captures no structured state fails the card even though the VM",
+                "# behaved, exactly as it did for R1C.",
+                "#",
+                "# This probe cannot discriminate R4B/R4C from their absence: it passed",
+                "# four times before either existed, and it observes completion within a",
+                "# latency bound rather than placement or share. Read a pass as evidence",
+                "# that the live path is not regressed, not as vindication of the repair.",
+                "# DW1_WYR1_RESET_R4E_VM_REQUEST.md section 4 states this at length.",
+            ],
+        }
+    }
+
+    fn gdb_notes(self) -> &'static [&'static str] {
+        match self {
+            Self::R1C => &[
+                "# \u{a7}8.2's three carrier facts sit behind the monolithic runtime authority",
+                "# on a boot-stack-pinned carrier, so reading a stopped guest over the",
+                "# gdbstub is the only way to obtain them without entering the authority",
+                "# under investigation.",
+            ],
+            Self::R4E => &[
+                "# R1C required the gdbstub to read carrier facts from a stopped guest.",
+                "# R4E expects passing runs and requires it for the opposite reason: if a",
+                "# run does stall, the \u{a7}9 gate still demands internal scheduler, wait or",
+                "# teardown state rather than \"a spawn timed out\", and the snapshot is the",
+                "# only thing that supplies it. The hook reads nothing on a passing run.",
+            ],
+        }
+    }
+}
+
 fn render_request(
     output: &Path,
+    card: RequestCard,
     wyrmroot_revision: &str,
     deep_revision: &str,
     abi_revision: &str,
@@ -1352,15 +1436,15 @@ fn render_request(
 
     line("[gate]".into());
     line("project = \"DW1/WYR1 runtime reset\"".into());
-    line("card = \"R1C\"".into());
+    line(format!("card = \"{}\"", card.name()));
     line("plan = \"DW1_WYR1_RUNTIME_RESET_IMPLEMENTATION_PLAN.md\"".into());
-    line("question = \"reproduce the present failure family, or establish that A27 depends on additional E8 state\"".into());
+    line(format!("question = \"{}\"", card.question()));
     line("acceptance_identity = \"none-minted\"".into());
     line("advances_e8 = false".into());
     line("security_conclusion = \"none\"".into());
-    line("# A failing run is a valid result if it identifies internal scheduler,".into());
-    line("# wait or teardown state. A run that stalls and captures no structured".into());
-    line("# state fails the card even though the VM behaved.".into());
+    for note in card.gate_notes() {
+        line((*note).into());
+    }
     line("failing_run_is_valid = true".into());
     line(String::new());
 
@@ -1424,10 +1508,9 @@ fn render_request(
         "kernel_bootfs_env = \"{R1_BOOTFS_PAGES_VARIABLE}={bootfs_pages}\""
     ));
     line("gdb_required = true".into());
-    line("# §8.2's three carrier facts sit behind the monolithic runtime authority".into());
-    line("# on a boot-stack-pinned carrier, so reading a stopped guest over the".into());
-    line("# gdbstub is the only way to obtain them without entering the authority".into());
-    line("# under investigation.".into());
+    for note in card.gdb_notes() {
+        line((*note).into());
+    }
     line("hook_profile = \"diagnostic-only\"".into());
     line(format!("timeout_seconds = {REQUEST_TIMEOUT_SECONDS}"));
     line(format!(

@@ -139,6 +139,7 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
         } => r1::product(std::path::Path::new(&output), &evidence_nonce).map(Some),
         Action::R1Prepare {
             output,
+            card,
             deep_repository,
             deep_revision,
             evidence_nonce,
@@ -147,8 +148,12 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
             let port = gdb_port.parse::<u16>().map_err(|_| {
                 error::Failure::usage("card R1 requires --gdb-port as a decimal TCP port")
             })?;
+            let card = r1::RequestCard::parse(&card).ok_or_else(|| {
+                error::Failure::usage("card R1 prepare requires --card R1C or --card R4E")
+            })?;
             r1::prepare(
                 std::path::Path::new(&output),
+                card,
                 std::path::Path::new(&deep_repository),
                 &deep_revision,
                 &evidence_nonce,

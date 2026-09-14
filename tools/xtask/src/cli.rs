@@ -198,6 +198,7 @@ pub(crate) enum Action {
     },
     R1Prepare {
         output: String,
+        card: String,
         deep_repository: String,
         deep_revision: String,
         evidence_nonce: String,
@@ -551,6 +552,7 @@ fn dispatch_r1(arguments: &[String]) -> Result<Action, Failure> {
             evidence_nonce,
             port_flag,
             gdb_port,
+            rest @ ..,
         ] if command == "prepare"
             && output_flag == "--output"
             && deep_flag == "--deep-repository"
@@ -558,8 +560,21 @@ fn dispatch_r1(arguments: &[String]) -> Result<Action, Failure> {
             && nonce_flag == "--evidence-nonce"
             && port_flag == "--gdb-port" =>
         {
+            // The gate block a request carries is what a reader checks a run
+            // against, so the card is selectable. It defaults to R1C, which is
+            // the only card that ran before the flag existed.
+            let card = match rest {
+                [] => "R1C".to_string(),
+                [card_flag, card] if card_flag == "--card" => card.clone(),
+                _ => {
+                    return Err(Failure::usage(
+                        "r1 prepare accepts only --card <R1C|R4E> after --gdb-port",
+                    ));
+                }
+            };
             Ok(Action::R1Prepare {
                 output: output.clone(),
+                card,
                 deep_repository: deep_repository.clone(),
                 deep_revision: deep_revision.clone(),
                 evidence_nonce: evidence_nonce.clone(),
@@ -567,7 +582,7 @@ fn dispatch_r1(arguments: &[String]) -> Result<Action, Failure> {
             })
         }
         _ => Err(Failure::usage(
-            "r1 requires product --output <fresh-directory> --evidence-nonce <16-hex>, or prepare --output <fresh-directory> --deep-repository <path> --deep-revision <40-hex> --evidence-nonce <16-hex> --gdb-port <port>; the VM request itself is not produced",
+            "r1 requires product --output <fresh-directory> --evidence-nonce <16-hex>, or prepare --output <fresh-directory> --deep-repository <path> --deep-revision <40-hex> --evidence-nonce <16-hex> --gdb-port <port> [--card <R1C|R4E>]; the VM request itself is not produced",
         )),
     }
 }
@@ -1403,12 +1418,40 @@ mod tests {
             ])),
             Ok(Action::R1Prepare {
                 output: "run".into(),
+                card: "R1C".into(),
                 deep_repository: "../deepwyrm".into(),
                 deep_revision: "0123456789abcdef0123456789abcdef01234567".into(),
                 evidence_nonce: "8100000000000001".into(),
                 gdb_port: "1240".into(),
             })
         );
+        fn prepare_with(extra: &[&str]) -> Vec<&'static str> {
+            let mut line: Vec<&'static str> = vec![
+                "r1",
+                "prepare",
+                "--output",
+                "run",
+                "--deep-repository",
+                "../deepwyrm",
+                "--deep-revision",
+                "0123456789abcdef0123456789abcdef01234567",
+                "--evidence-nonce",
+                "8100000000000001",
+                "--gdb-port",
+                "1240",
+            ];
+            for argument in extra {
+                line.push(match *argument {
+                    "--card" => "--card",
+                    "--profile" => "--profile",
+                    "R1C" => "R1C",
+                    "R4E" => "R4E",
+                    "smp" => "smp",
+                    other => panic!("unexpected fixture argument {other}"),
+                });
+            }
+            line
+        }
         // Every flag is required and positional order is exact: a prepare missing
         // its revision or port must not fall back to a default, because both are
         // part of what the produced domains and receipt claim.
@@ -1429,9 +1472,21 @@ mod tests {
                 "8100000000000001",
             ],
             vec!["r1", "run", "--request", "request.toml"],
+            // A trailing flag that is not --card, and a --card with no value,
+            // are refused rather than ignored: silently preparing a request
+            // under the wrong card is the failure this flag exists to prevent.
+            prepare_with(&["--profile", "smp"]),
+            prepare_with(&["--card"]),
+            prepare_with(&["--card", "R4E", "--card", "R1C"]),
         ] {
             assert!(dispatch(&arguments(&looser)).is_err(), "{looser:?}");
         }
+        let Ok(Action::R1Prepare { card, .. }) =
+            dispatch(&arguments(&prepare_with(&["--card", "R4E"])))
+        else {
+            panic!("an explicit card is accepted after --gdb-port");
+        };
+        assert_eq!(card, "R4E");
         for command in ["product --output", "prepare --output"] {
             assert!(USAGE.contains(&format!("tools/pinned-cargo xtask r1 {command}")));
         }
