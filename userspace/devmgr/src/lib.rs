@@ -90,9 +90,57 @@ pub enum DevmgrError {
     Controller(ControllerParseError),
     StartupCorrelation,
     StaleControllerTransaction,
-    ControllerLifecycle,
+    /// A coordinator lifecycle lookup or counter refused, naming which.
+    ///
+    /// This carried nothing across twenty-seven sites: a counter at its limit,
+    /// an absent active driver and an absent bundle generation all arrived as
+    /// one value. Run 6 of card R1 was fourteen causes arriving as one status
+    /// and produced a whole gate; this was twice that, in a crate the gate
+    /// never read. `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §3.3.
+    ControllerLifecycle(ControllerLifecycleFault),
+    /// A coordinator state-machine precondition did not hold.
+    ///
+    /// Split from `ControllerLifecycle` so a refused *lookup* is at least
+    /// distinguishable from a step reached in the wrong state. The individual
+    /// preconditions are not yet named; they are the remaining half of this
+    /// repair, and each is an explicit `return` rather than a wildcard.
+    ControllerPrecondition,
     DriverLaunch(DriverLaunchError),
     ResourceIdentity,
+}
+
+/// Which coordinator lifecycle fact refused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControllerLifecycleFault {
+    /// A monotonic counter or deadline reached its limit.
+    Exhausted(ControllerCounter),
+    /// Coordinator state a step required was absent.
+    Absent(ControllerDatum),
+}
+
+/// The counters and deadlines a coordinator step can exhaust.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControllerCounter {
+    DriverAttempt,
+    DriverSession,
+    DriverEndpoint,
+    DriverTransaction,
+    InterruptTransaction,
+    ReadyTransaction,
+    NextTransaction,
+    StageGeneration,
+    RequestTransaction,
+    DriverFailures,
+    RetryDeadline,
+}
+
+/// The coordinator state a step can find absent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControllerDatum {
+    ActiveDriver,
+    ActiveDriverRequest,
+    BundleGeneration,
+    RetryDeadline,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -193,7 +241,7 @@ impl ResidentController {
             return Err(DevmgrError::StartupCorrelation);
         }
         if status.state != CoordinatorState::WaitingForRegistry {
-            return Err(DevmgrError::ControllerLifecycle);
+            return Err(DevmgrError::ControllerPrecondition);
         }
         let driver_namespace = status
             .supervisor_generation
@@ -350,7 +398,7 @@ impl ResidentController {
         child_rights: DirectControlRights,
     ) -> Result<DriverLaunchRequest, DevmgrError> {
         if self.active_binding.is_none() || self.active_driver.is_some() {
-            return Err(DevmgrError::ControllerLifecycle);
+            return Err(DevmgrError::ControllerPrecondition);
         }
         let request = DriverLaunchRequest {
             supervisor_generation: self.status.supervisor_generation,
@@ -369,22 +417,30 @@ impl ResidentController {
         };
         let launch = DriverLaunch::new(request)?;
         self.active_driver = Some(launch);
-        self.next_driver_attempt = self
-            .next_driver_attempt
-            .checked_add(1)
-            .ok_or(DevmgrError::ControllerLifecycle)?;
-        self.next_driver_session = self
-            .next_driver_session
-            .checked_add(1)
-            .ok_or(DevmgrError::ControllerLifecycle)?;
-        self.next_driver_endpoint = self
-            .next_driver_endpoint
-            .checked_add(1)
-            .ok_or(DevmgrError::ControllerLifecycle)?;
-        self.next_driver_transaction = self
-            .next_driver_transaction
-            .checked_add(1)
-            .ok_or(DevmgrError::ControllerLifecycle)?;
+        self.next_driver_attempt =
+            self.next_driver_attempt
+                .checked_add(1)
+                .ok_or(DevmgrError::ControllerLifecycle(
+                    ControllerLifecycleFault::Exhausted(ControllerCounter::DriverAttempt),
+                ))?;
+        self.next_driver_session =
+            self.next_driver_session
+                .checked_add(1)
+                .ok_or(DevmgrError::ControllerLifecycle(
+                    ControllerLifecycleFault::Exhausted(ControllerCounter::DriverSession),
+                ))?;
+        self.next_driver_endpoint =
+            self.next_driver_endpoint
+                .checked_add(1)
+                .ok_or(DevmgrError::ControllerLifecycle(
+                    ControllerLifecycleFault::Exhausted(ControllerCounter::DriverEndpoint),
+                ))?;
+        self.next_driver_transaction =
+            self.next_driver_transaction
+                .checked_add(1)
+                .ok_or(DevmgrError::ControllerLifecycle(
+                    ControllerLifecycleFault::Exhausted(ControllerCounter::DriverTransaction),
+                ))?;
         Ok(request)
     }
 
@@ -396,7 +452,7 @@ impl ResidentController {
         child_rights: DirectControlRights,
     ) -> Result<DriverLaunchRequest, DevmgrError> {
         if self.bundle_generation.is_none() || self.status.state != CoordinatorState::Matched {
-            return Err(DevmgrError::ControllerLifecycle);
+            return Err(DevmgrError::ControllerPrecondition);
         }
         self.issue_driver_launch(child_is_channel, child_rights)
     }
@@ -409,22 +465,34 @@ impl ResidentController {
         request: DriverLaunchRequest,
     ) -> Result<staging::D3StageCorrelations, DevmgrError> {
         if self.active_driver_request() != Some(request) {
-            return Err(DevmgrError::ControllerLifecycle);
+            return Err(DevmgrError::ControllerPrecondition);
         }
         let stage_generation = self.next_driver_stage_generation;
         let device_transaction_id = self.next_driver_transaction;
-        let interrupt_transaction_id = device_transaction_id
-            .checked_add(1)
-            .ok_or(DevmgrError::ControllerLifecycle)?;
-        let ready_transaction_id = interrupt_transaction_id
-            .checked_add(1)
-            .ok_or(DevmgrError::ControllerLifecycle)?;
-        let next_transaction = ready_transaction_id
-            .checked_add(1)
-            .ok_or(DevmgrError::ControllerLifecycle)?;
-        let next_stage_generation = stage_generation
-            .checked_add(1)
-            .ok_or(DevmgrError::ControllerLifecycle)?;
+        let interrupt_transaction_id =
+            device_transaction_id
+                .checked_add(1)
+                .ok_or(DevmgrError::ControllerLifecycle(
+                    ControllerLifecycleFault::Exhausted(ControllerCounter::InterruptTransaction),
+                ))?;
+        let ready_transaction_id =
+            interrupt_transaction_id
+                .checked_add(1)
+                .ok_or(DevmgrError::ControllerLifecycle(
+                    ControllerLifecycleFault::Exhausted(ControllerCounter::ReadyTransaction),
+                ))?;
+        let next_transaction =
+            ready_transaction_id
+                .checked_add(1)
+                .ok_or(DevmgrError::ControllerLifecycle(
+                    ControllerLifecycleFault::Exhausted(ControllerCounter::NextTransaction),
+                ))?;
+        let next_stage_generation =
+            stage_generation
+                .checked_add(1)
+                .ok_or(DevmgrError::ControllerLifecycle(
+                    ControllerLifecycleFault::Exhausted(ControllerCounter::StageGeneration),
+                ))?;
         self.next_driver_transaction = next_transaction;
         self.next_driver_stage_generation = next_stage_generation;
         Ok(staging::D3StageCorrelations {
@@ -443,23 +511,31 @@ impl ResidentController {
         request: DriverLaunchRequest,
     ) -> Result<(u64, u64), DevmgrError> {
         if self.active_driver_request() != Some(request) || !self.publication_current {
-            return Err(DevmgrError::ControllerLifecycle);
+            return Err(DevmgrError::ControllerPrecondition);
         }
         let attach_transaction = self.next_driver_transaction;
         let stream_generation = self.next_driver_stage_generation;
-        self.next_driver_transaction = attach_transaction
-            .checked_add(1)
-            .ok_or(DevmgrError::ControllerLifecycle)?;
-        self.next_driver_stage_generation = stream_generation
-            .checked_add(1)
-            .ok_or(DevmgrError::ControllerLifecycle)?;
+        self.next_driver_transaction =
+            attach_transaction
+                .checked_add(1)
+                .ok_or(DevmgrError::ControllerLifecycle(
+                    ControllerLifecycleFault::Exhausted(ControllerCounter::DriverTransaction),
+                ))?;
+        self.next_driver_stage_generation =
+            stream_generation
+                .checked_add(1)
+                .ok_or(DevmgrError::ControllerLifecycle(
+                    ControllerLifecycleFault::Exhausted(ControllerCounter::StageGeneration),
+                ))?;
         Ok((attach_transaction, stream_generation))
     }
 
     pub fn driver_constructed(&mut self) -> Result<(), DevmgrError> {
         self.active_driver
             .as_mut()
-            .ok_or(DevmgrError::ControllerLifecycle)?
+            .ok_or(DevmgrError::ControllerLifecycle(
+                ControllerLifecycleFault::Absent(ControllerDatum::ActiveDriver),
+            ))?
             .constructed()?;
         Ok(())
     }
@@ -471,16 +547,20 @@ impl ResidentController {
         &mut self,
     ) -> Result<wyrmroot_device_proto::ControlMessage, DevmgrError> {
         if self.status.state != CoordinatorState::Matched || self.driver_ready {
-            return Err(DevmgrError::ControllerLifecycle);
+            return Err(DevmgrError::ControllerPrecondition);
         }
-        let launch = self.active_driver.ok_or(DevmgrError::ControllerLifecycle)?;
+        let launch = self.active_driver.ok_or(DevmgrError::ControllerLifecycle(
+            ControllerLifecycleFault::Absent(ControllerDatum::ActiveDriver),
+        ))?;
         if launch.state() != DriverLaunchState::AwaitingControlReady {
-            return Err(DevmgrError::ControllerLifecycle);
+            return Err(DevmgrError::ControllerPrecondition);
         }
         let request = launch.request();
         let bundle_generation = self
             .bundle_generation
-            .ok_or(DevmgrError::ControllerLifecycle)?;
+            .ok_or(DevmgrError::ControllerLifecycle(
+                ControllerLifecycleFault::Absent(ControllerDatum::BundleGeneration),
+            ))?;
         Ok(wyrmroot_device_proto::ControlMessage::ResourceBundle {
             role_id: request.role_id,
             bundle_generation,
@@ -492,11 +572,13 @@ impl ResidentController {
 
     pub fn bundle_transferred(&mut self) -> Result<(), DevmgrError> {
         if self.status.state != CoordinatorState::Matched || self.driver_ready {
-            return Err(DevmgrError::ControllerLifecycle);
+            return Err(DevmgrError::ControllerPrecondition);
         }
         self.active_driver
             .as_mut()
-            .ok_or(DevmgrError::ControllerLifecycle)?
+            .ok_or(DevmgrError::ControllerLifecycle(
+                ControllerLifecycleFault::Absent(ControllerDatum::ActiveDriver),
+            ))?
             .bundle_transferred()?;
         self.status.state = CoordinatorState::AwaitingDriverReady;
         Ok(())
@@ -509,7 +591,9 @@ impl ResidentController {
     ) -> Result<(), DevmgrError> {
         let request = self
             .active_driver_request()
-            .ok_or(DevmgrError::ControllerLifecycle)?;
+            .ok_or(DevmgrError::ControllerLifecycle(
+                ControllerLifecycleFault::Absent(ControllerDatum::ActiveDriverRequest),
+            ))?;
         self.accept_driver_ready_for_transaction(message, request.transaction_id)
     }
 
@@ -522,29 +606,35 @@ impl ResidentController {
         ready_transaction_id: u64,
     ) -> Result<(), DevmgrError> {
         if self.status.state != CoordinatorState::AwaitingDriverReady || self.driver_ready {
-            return Err(DevmgrError::ControllerLifecycle);
+            return Err(DevmgrError::ControllerPrecondition);
         }
         if ready_transaction_id == 0 {
-            return Err(DevmgrError::ControllerLifecycle);
+            return Err(DevmgrError::ControllerPrecondition);
         }
         let request = self
             .active_driver_request()
-            .ok_or(DevmgrError::ControllerLifecycle)?;
+            .ok_or(DevmgrError::ControllerLifecycle(
+                ControllerLifecycleFault::Absent(ControllerDatum::ActiveDriverRequest),
+            ))?;
         let expected = wyrmroot_device_proto::ControlMessage::Ready {
             role_id: request.role_id,
             bundle_generation: self
                 .bundle_generation
-                .ok_or(DevmgrError::ControllerLifecycle)?,
+                .ok_or(DevmgrError::ControllerLifecycle(
+                    ControllerLifecycleFault::Absent(ControllerDatum::BundleGeneration),
+                ))?,
             attempt_generation: request.attempt_generation,
             endpoint: request.endpoint,
             transaction_id: ready_transaction_id,
         };
         if message != expected {
-            return Err(DevmgrError::ControllerLifecycle);
+            return Err(DevmgrError::ControllerPrecondition);
         }
         self.active_driver
             .as_mut()
-            .ok_or(DevmgrError::ControllerLifecycle)?
+            .ok_or(DevmgrError::ControllerLifecycle(
+                ControllerLifecycleFault::Absent(ControllerDatum::ActiveDriver),
+            ))?
             .driver_ready()?;
         self.driver_ready = true;
         self.publication_current = false;
@@ -558,7 +648,7 @@ impl ResidentController {
             || self.active_binding.is_none()
             || self.publication_current
         {
-            return Err(DevmgrError::ControllerLifecycle);
+            return Err(DevmgrError::ControllerPrecondition);
         }
         self.publication_current = true;
         self.status.state = CoordinatorState::Published;
@@ -578,13 +668,15 @@ impl ResidentController {
                 | CoordinatorState::AwaitingPublication
                 | CoordinatorState::Published
         ) {
-            return Err(DevmgrError::ControllerLifecycle);
+            return Err(DevmgrError::ControllerPrecondition);
         }
         let request = self
             .active_driver_request()
-            .ok_or(DevmgrError::ControllerLifecycle)?;
+            .ok_or(DevmgrError::ControllerLifecycle(
+                ControllerLifecycleFault::Absent(ControllerDatum::ActiveDriverRequest),
+            ))?;
         if request.endpoint != endpoint {
-            return Err(DevmgrError::ControllerLifecycle);
+            return Err(DevmgrError::ControllerPrecondition);
         }
         self.driver_ready = false;
         self.publication_current = false;
@@ -605,7 +697,7 @@ impl ResidentController {
             || self.publication_current
             || self.active_driver_request() != Some(request)
         {
-            return Err(DevmgrError::ControllerLifecycle);
+            return Err(DevmgrError::ControllerPrecondition);
         }
         self.driver_ready = false;
         Ok(())
@@ -621,19 +713,21 @@ impl ResidentController {
         if self.status.state != CoordinatorState::CleaningUp
             || self.active_driver_request() != Some(request)
         {
-            return Err(DevmgrError::ControllerLifecycle);
+            return Err(DevmgrError::ControllerPrecondition);
         }
         request
             .transaction_id
             .checked_add(1)
-            .ok_or(DevmgrError::ControllerLifecycle)
+            .ok_or(DevmgrError::ControllerLifecycle(
+                ControllerLifecycleFault::Exhausted(ControllerCounter::RequestTransaction),
+            ))
     }
 
     /// Drops only the retired registry endpoint. The D1 resource lease and
     /// failed attempt identity remain until init confirms reaping.
     pub fn publication_retired(&mut self) -> Result<(), DevmgrError> {
         if self.status.state != CoordinatorState::CleaningUp || self.active_binding.is_none() {
-            return Err(DevmgrError::ControllerLifecycle);
+            return Err(DevmgrError::ControllerPrecondition);
         }
         self.retired_binding = self.active_binding;
         self.retired_driver_attempt = self
@@ -645,16 +739,20 @@ impl ResidentController {
 
     pub fn retire_message(&mut self) -> Result<wyrmroot_device_proto::ControlMessage, DevmgrError> {
         if !self.driver_ready {
-            return Err(DevmgrError::ControllerLifecycle);
+            return Err(DevmgrError::ControllerPrecondition);
         }
         let request = self
             .active_driver_request()
-            .ok_or(DevmgrError::ControllerLifecycle)?;
+            .ok_or(DevmgrError::ControllerLifecycle(
+                ControllerLifecycleFault::Absent(ControllerDatum::ActiveDriverRequest),
+            ))?;
         let message = wyrmroot_device_proto::ControlMessage::Retire {
             role_id: request.role_id,
             bundle_generation: self
                 .bundle_generation
-                .ok_or(DevmgrError::ControllerLifecycle)?,
+                .ok_or(DevmgrError::ControllerLifecycle(
+                    ControllerLifecycleFault::Absent(ControllerDatum::BundleGeneration),
+                ))?,
             attempt_generation: request.attempt_generation,
             endpoint: request.endpoint,
             transaction_id: request.transaction_id,
@@ -670,7 +768,9 @@ impl ResidentController {
     ) -> Result<(), DevmgrError> {
         self.active_driver
             .as_mut()
-            .ok_or(DevmgrError::ControllerLifecycle)?
+            .ok_or(DevmgrError::ControllerLifecycle(
+                ControllerLifecycleFault::Absent(ControllerDatum::ActiveDriver),
+            ))?
             .accept_control_ready(message)?;
         Ok(())
     }
@@ -679,7 +779,9 @@ impl ResidentController {
         let mut launch = self
             .active_driver
             .take()
-            .ok_or(DevmgrError::ControllerLifecycle)?;
+            .ok_or(DevmgrError::ControllerLifecycle(
+                ControllerLifecycleFault::Absent(ControllerDatum::ActiveDriver),
+            ))?;
         launch.reap()?;
         self.driver_ready = false;
         self.publication_current = false;
@@ -691,12 +793,14 @@ impl ResidentController {
     /// cleanup or reuse an old driver identity.
     pub fn complete_driver_failure_cleanup(&mut self, now_ns: u64) -> Result<(), DevmgrError> {
         if self.status.state != CoordinatorState::CleaningUp {
-            return Err(DevmgrError::ControllerLifecycle);
+            return Err(DevmgrError::ControllerPrecondition);
         }
-        self.driver_failures = self
-            .driver_failures
-            .checked_add(1)
-            .ok_or(DevmgrError::ControllerLifecycle)?;
+        self.driver_failures =
+            self.driver_failures
+                .checked_add(1)
+                .ok_or(DevmgrError::ControllerLifecycle(
+                    ControllerLifecycleFault::Exhausted(ControllerCounter::DriverFailures),
+                ))?;
         if self.driver_failures >= wyrmroot_device_proto::coordinator::MAX_ATTEMPTS {
             self.retry_until_ns = None;
             self.status.state = CoordinatorState::PermanentFailure;
@@ -705,7 +809,9 @@ impl ResidentController {
         self.retry_until_ns = Some(
             now_ns
                 .checked_add(wyrmroot_device_proto::coordinator::RETRY_BACKOFF_NS)
-                .ok_or(DevmgrError::ControllerLifecycle)?,
+                .ok_or(DevmgrError::ControllerLifecycle(
+                    ControllerLifecycleFault::Exhausted(ControllerCounter::RetryDeadline),
+                ))?,
         );
         self.status.state = CoordinatorState::Backoff {
             attempt: AttemptGeneration(self.next_driver_attempt),
@@ -715,11 +821,11 @@ impl ResidentController {
     }
 
     pub fn driver_retry_ready(&mut self, now_ns: u64) -> Result<(), DevmgrError> {
-        let until = self
-            .retry_until_ns
-            .ok_or(DevmgrError::ControllerLifecycle)?;
+        let until = self.retry_until_ns.ok_or(DevmgrError::ControllerLifecycle(
+            ControllerLifecycleFault::Absent(ControllerDatum::RetryDeadline),
+        ))?;
         if now_ns < until || !matches!(self.status.state, CoordinatorState::Backoff { .. }) {
-            return Err(DevmgrError::ControllerLifecycle);
+            return Err(DevmgrError::ControllerPrecondition);
         }
         self.retry_until_ns = None;
         self.status.state = CoordinatorState::Matched;
@@ -828,7 +934,7 @@ impl ResidentController {
                 };
                 Ok(ControllerAction::PublicationRebound)
             }
-            ControllerMessage::Status { .. } => Err(DevmgrError::ControllerLifecycle),
+            ControllerMessage::Status { .. } => Err(DevmgrError::ControllerPrecondition),
         }
     }
 
@@ -837,7 +943,7 @@ impl ResidentController {
     /// replacement later; it is no longer an active publication binding.
     pub fn publication_peer_closed(&mut self) -> Result<(), DevmgrError> {
         if self.active_binding.is_none() {
-            return Err(DevmgrError::ControllerLifecycle);
+            return Err(DevmgrError::ControllerPrecondition);
         }
         self.active_binding = None;
         self.publication_current = false;
@@ -854,7 +960,10 @@ impl ResidentController {
         [u8; wyrmroot_device_proto::controller::STATUS_BYTES],
         PublicationAcknowledgementError,
     > {
-        let invalid = PublicationAcknowledgementError::Lifecycle(DevmgrError::ControllerLifecycle);
+        // A precondition, not a refused lookup: no active binding, or the
+        // publication is already current.
+        let invalid =
+            PublicationAcknowledgementError::Lifecycle(DevmgrError::ControllerPrecondition);
         if self.active_binding.is_none() || self.publication_current {
             return Err(invalid);
         }
@@ -892,16 +1001,16 @@ impl ResidentController {
             StatusCode::OperationalWaitingForDeviceBundle => self.active_binding,
             StatusCode::OperationalResourceOwned => {
                 if self.bundle_generation.is_none() {
-                    return Err(DevmgrError::ControllerLifecycle);
+                    return Err(DevmgrError::ControllerPrecondition);
                 }
                 self.active_binding
             }
             StatusCode::CleaningUp | StatusCode::Backoff | StatusCode::PermanentFailure => {
-                return Err(DevmgrError::ControllerLifecycle);
+                return Err(DevmgrError::ControllerPrecondition);
             }
         };
         if self.last_transaction_id == 0 {
-            return Err(DevmgrError::ControllerLifecycle);
+            return Err(DevmgrError::ControllerPrecondition);
         }
         Ok(ControllerMessage::Status {
             supervisor_generation: self.status.supervisor_generation,
@@ -1195,7 +1304,7 @@ mod tests {
         let mut resident =
             ResidentController::new(prepare_operational(&manifest(), 7).unwrap(), 41).unwrap();
         let invalid = Err(PublicationAcknowledgementError::Lifecycle(
-            DevmgrError::ControllerLifecycle,
+            DevmgrError::ControllerPrecondition,
         ));
         assert_eq!(resident.publication_acknowledgement(), invalid);
         resident.accept(install(binding(1, 7), 41), 0).unwrap();
@@ -1308,7 +1417,7 @@ mod tests {
         resident.accept(install(binding(1, 7), 41), 0).unwrap();
         assert_eq!(
             resident.issue_driver_launch_with_bundle(true, DirectControlRights::ExactReduced),
-            Err(DevmgrError::ControllerLifecycle)
+            Err(DevmgrError::ControllerPrecondition)
         );
         resident.admit_device_resource(exact_resource(19)).unwrap();
         let request = resident
@@ -1316,7 +1425,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             resident.resource_bundle_message(),
-            Err(DevmgrError::ControllerLifecycle)
+            Err(DevmgrError::ControllerPrecondition)
         );
         resident.driver_constructed().unwrap();
         let bundle = resident.resource_bundle_message().unwrap();
@@ -1344,7 +1453,7 @@ mod tests {
                 endpoint: request.endpoint,
                 transaction_id: request.transaction_id,
             }),
-            Err(DevmgrError::ControllerLifecycle)
+            Err(DevmgrError::ControllerPrecondition)
         );
         resident
             .accept_driver_ready(wyrmroot_device_proto::ControlMessage::Ready {
@@ -1363,7 +1472,7 @@ mod tests {
         assert_eq!(resident.status().state, CoordinatorState::Published);
         assert_eq!(
             resident.publication_committed(),
-            Err(DevmgrError::ControllerLifecycle)
+            Err(DevmgrError::ControllerPrecondition)
         );
     }
 
@@ -1403,7 +1512,7 @@ mod tests {
         assert!(!resident.driver_ready());
         assert_eq!(
             resident.retire_message(),
-            Err(DevmgrError::ControllerLifecycle)
+            Err(DevmgrError::ControllerPrecondition)
         );
     }
 
@@ -1433,7 +1542,7 @@ mod tests {
         let published = resident;
         assert_eq!(
             resident.accept_intentional_driver_terminal(request),
-            Err(DevmgrError::ControllerLifecycle)
+            Err(DevmgrError::ControllerPrecondition)
         );
         assert_eq!(resident, published);
 
@@ -1444,7 +1553,7 @@ mod tests {
         stale.endpoint.id = EndpointId(request.endpoint.id.0 + 1);
         assert_eq!(
             resident.accept_intentional_driver_terminal(stale),
-            Err(DevmgrError::ControllerLifecycle)
+            Err(DevmgrError::ControllerPrecondition)
         );
         assert_eq!(resident, retiring);
 
@@ -1457,12 +1566,61 @@ mod tests {
         let accepted = resident;
         assert_eq!(
             resident.accept_intentional_driver_terminal(request),
-            Err(DevmgrError::ControllerLifecycle)
+            Err(DevmgrError::ControllerPrecondition)
         );
         assert_eq!(resident, accepted);
     }
 
     #[test]
+    /// The twenty-seven lookups and counters this crate folded into one
+    /// `ControllerLifecycle` value had no test between them, which is part of
+    /// why the collapse survived. This covers one of them end to end so the
+    /// named fault is read rather than merely declared.
+    #[test]
+    fn an_exhausted_retry_deadline_names_itself_and_not_the_whole_lifecycle() {
+        let mut resident =
+            ResidentController::new(prepare_operational(&manifest(), 7).unwrap(), 41).unwrap();
+        resident.accept(install(binding(1, 7), 41), 0).unwrap();
+        resident.admit_device_resource(exact_resource(19)).unwrap();
+        let request = resident
+            .issue_driver_launch_with_bundle(true, DirectControlRights::ExactReduced)
+            .unwrap();
+        resident.driver_constructed().unwrap();
+        resident.resource_bundle_message().unwrap();
+        resident.bundle_transferred().unwrap();
+        resident
+            .accept_driver_ready(wyrmroot_device_proto::ControlMessage::Ready {
+                role_id: request.role_id,
+                bundle_generation: BundleGeneration(19),
+                attempt_generation: request.attempt_generation,
+                endpoint: request.endpoint,
+                transaction_id: request.transaction_id,
+            })
+            .unwrap();
+        resident.publication_committed().unwrap();
+        resident.driver_failed(request.endpoint).unwrap();
+        resident.publication_retire_transaction(request).unwrap();
+        resident.publication_retired().unwrap();
+        resident.reap_driver().unwrap();
+        assert_eq!(resident.status().state, CoordinatorState::CleaningUp);
+
+        // A backoff deadline that cannot be computed used to arrive as the same
+        // value as an absent active driver.
+        assert_eq!(
+            resident.complete_driver_failure_cleanup(u64::MAX),
+            Err(DevmgrError::ControllerLifecycle(
+                ControllerLifecycleFault::Exhausted(ControllerCounter::RetryDeadline)
+            )),
+            "the exhausted counter must name itself"
+        );
+        // And it is not the precondition failure, which is the other half of
+        // what the single variant used to mean.
+        assert_ne!(
+            resident.complete_driver_failure_cleanup(u64::MAX),
+            Err(DevmgrError::ControllerPrecondition)
+        );
+    }
+
     fn c6_failure_rebind_preserves_cleanup_gate_before_retry() {
         let mut resident =
             ResidentController::new(prepare_operational(&manifest(), 7).unwrap(), 41).unwrap();
@@ -1646,7 +1804,7 @@ mod tests {
                 },
                 0,
             ),
-            Err(DevmgrError::ControllerLifecycle)
+            Err(DevmgrError::ControllerPrecondition)
         );
     }
 
