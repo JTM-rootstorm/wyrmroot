@@ -726,3 +726,53 @@ mod probe_status_tests {
         assert!(huge < OUTPUT_FLAG, "saturation must not collide with an Output");
     }
 }
+
+/// The failure classification and its ordinal, which card R1's runs 9 and 11
+/// needed and did not have.
+mod run_stopped_tests {
+    use crate::record::{self, FAIL_RUN_STOPPED, failure_fields};
+    use crate::{ProbeFailure, ProbeOutcome, ProbePlan};
+
+    #[test]
+    fn a_stopped_run_carries_its_own_exit_code_rather_than_a_borrowed_outcome() {
+        // Runs 9 and 11 classified a refused report send as `CleanupIncomplete`
+        // -- a cleanup the run never reached. The code is what names the site.
+        let code = 0x8100_9013;
+        let (ordinal, index, detail) = failure_fields(ProbeFailure::RunStopped { code });
+        assert_eq!(ordinal, FAIL_RUN_STOPPED);
+        assert_eq!(index, 0);
+        assert_eq!(detail, u64::from(code));
+        // And it must not be confusable with any other failure's ordinal.
+        for other in [
+            ProbeFailure::HogAcceptTimeout { index: 1 },
+            ProbeFailure::HogRejected { index: 1, status: 3 },
+            ProbeFailure::ProgressResultTimeout { after_hog: 1 },
+            ProbeFailure::ProgressRejected { after_hog: 1, status: 3 },
+            ProbeFailure::ProgressAcceptTimeout { after_hog: 1 },
+            ProbeFailure::ProgressNotNormalZero { after_hog: 1, code: 3 },
+            ProbeFailure::CleanupIncomplete { index: 1 },
+            ProbeFailure::Uncorrelated { expected: 1, observed: 2 },
+        ] {
+            assert_ne!(failure_fields(other).0, FAIL_RUN_STOPPED);
+        }
+    }
+
+    #[test]
+    fn a_stopped_run_is_encodable_as_a_terminal_record() {
+        // The kernel flushes the transcript on the terminal record and on nothing
+        // else, so this classification has to survive encoding or a stopped run
+        // takes every already-relayed record down with it.
+        let plan = ProbePlan::SMP;
+        let record = record::encode_terminal(
+            6,
+            0x3400_0000_0000_0001,
+            plan,
+            ProbeOutcome::Failed(ProbeFailure::RunStopped { code: 0x8100_9013 }),
+            5,
+        );
+        let header = record::parse_header(&record).expect("terminal record is malformed");
+        assert_eq!(header.sequence, 6);
+        assert_eq!(header.online_cpus as usize, plan.online_cpus);
+        assert_eq!(header.hog_count as usize, plan.hog_count);
+    }
+}

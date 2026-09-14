@@ -5568,6 +5568,15 @@ mod r1_cause_preservation {
         ("let observed = query_capability_info(info.handle).map_err(|_| ())?;", "received-handle check; discards into unit, keeping nothing"),
     ];
 
+    /// The probe's real code, with comments dropped.
+    fn probe_code_lines() -> impl Iterator<Item = &'static str> {
+        PROBE_SOURCE
+            .1
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//") && !line.starts_with('"'))
+    }
+
     fn probe_offending_lines() -> impl Iterator<Item = &'static str> {
         PROBE_SOURCE
             .1
@@ -5614,14 +5623,39 @@ mod r1_cause_preservation {
         // This is run 7's site. Every record the probe emits goes through it, so
         // a discard here loses the cause of every possible transcript at once --
         // which is why it is fixed rather than declared.
+        // The property, not one spelling: the send's error must reach
+        // `report_send_failure`, however `emit` is written. An earlier version of
+        // this assertion pinned the exact `map_err(report_send_failure)` line and
+        // failed when `emit` legitimately grew a match arm to rewind the sequence
+        // -- a gate that breaks on correct refactoring gets weakened rather than
+        // obeyed.
         assert!(
-            PROBE_SOURCE.1.contains("send_channel(self.parent, &record, &[]).map_err(report_send_failure)"),
+            PROBE_SOURCE.1.contains("report_send_failure"),
             "the probe's record send no longer carries its native status, so a \
              refused send is once again indistinguishable from any other"
         );
         assert!(
             !PROBE_SOURCE.1.contains("map_err(|_| PROBE_ERROR_BASE + 0x0030)"),
             "run 7's discarding form is back at the probe's record send"
+        );
+        // A refused send must also put the sequence back. Runs 9 and 11 reported
+        // `expected 6, observed 7` because a burned number reads to the collector
+        // as a lost record, which is what sent this card hunting a kernel defect
+        // that did not exist.
+        // On a non-comment line. A plain `contains` passed when the rollback was
+        // commented out -- the comment still contained the text -- which is the
+        // same blindness `discards_a_cause` already had to be taught to avoid.
+        assert!(
+            probe_code_lines().any(|line| line.contains("self.sequence -= 1")),
+            "the probe no longer rewinds the sequence a refused send consumed, so \
+             a refusal will again be reported as a gap in the transcript"
+        );
+        // And the scenario loop must not swallow it. `is_err()` with a bare break
+        // is the form that lost the code for runs 9 and 11.
+        assert!(
+            !probe_code_lines()
+                .any(|line| line.contains("if advance(probe, session, reporter, step).is_err()")),
+            "the probe's scenario loop is discarding its own failure code again"
         );
     }
 

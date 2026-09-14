@@ -118,6 +118,16 @@ pub enum ProbeFailure {
     CleanupIncomplete { index: usize },
     /// A reply arrived for a job the scenario was not waiting on.
     Uncorrelated { expected: u64, observed: u64 },
+    /// The run stopped on the probe's own internal failure rather than on
+    /// anything it observed about the scheduler, and `code` is the probe exit
+    /// code naming the site.
+    ///
+    /// Card R1's runs 9 and 11 needed this. A refused report send was swallowed
+    /// by the scenario loop, and the terminal record then classified the run as
+    /// `CleanupIncomplete` -- a cleanup that was never attempted. A transcript
+    /// that says the wrong thing is worse than one that stops, so the terminal
+    /// record now carries the real reason and the exit code carries it too.
+    RunStopped { code: u32 },
 }
 
 /// Terminal state of a probe run.
@@ -395,6 +405,10 @@ pub mod record {
     pub const FAIL_CLEANUP_INCOMPLETE: u32 = 6;
     pub const FAIL_UNCORRELATED: u32 = 7;
     pub const FAIL_PROGRESS_ACCEPT_TIMEOUT: u32 = 8;
+    /// The probe stopped itself; `detail` carries its exit code. The kernel
+    /// collector validates only transport, so a new ordinal needs no kernel
+    /// change and no record-format change.
+    pub const FAIL_RUN_STOPPED: u32 = 9;
 
     pub const fn step_ordinal(step: ProbeStep) -> u32 {
         match step {
@@ -443,6 +457,7 @@ pub mod record {
             ProbeFailure::ProgressAcceptTimeout { after_hog } => {
                 (FAIL_PROGRESS_ACCEPT_TIMEOUT, after_hog as u32, 0)
             }
+            ProbeFailure::RunStopped { code } => (FAIL_RUN_STOPPED, 0, code as u64),
         }
     }
 

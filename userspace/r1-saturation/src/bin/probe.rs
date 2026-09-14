@@ -105,8 +105,20 @@ impl Reporter {
     /// `0x81000030` and the native status was discarded, which left the run
     /// proving the send refused and not whether the handle lacked a right, the
     /// peer had closed, or the queue was full.
-    fn emit(&self, record: [u8; RECORD_BYTES]) -> Result<(), u32> {
-        send_channel(self.parent, &record, &[]).map_err(report_send_failure)
+    fn emit(&mut self, record: [u8; RECORD_BYTES]) -> Result<(), u32> {
+        match send_channel(self.parent, &record, &[]) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // The send is atomic: on refusal nothing was transmitted, so the
+                // sequence it consumed must go back. Runs 9 and 11 both reported
+                // `expected 6, observed 7` for exactly this -- a number burned by
+                // a refused send, which the collector correctly read as a gap
+                // and which sent this investigation after a lost datagram that
+                // never existed.
+                self.sequence -= 1;
+                Err(report_send_failure(error))
+            }
+        }
     }
 
     fn step(&mut self, step: ProbeStep, job_id: u64) -> Result<(), u32> {
@@ -259,12 +271,28 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
     let mut reporter = Reporter::new(parent, plan);
     let mut probe = SaturationProbe::new(plan).ok_or(PROBE_ERROR_BASE + 0x000B)?;
 
-    let outcome = drive(&mut probe, &mut session, &mut reporter);
-    // The terminal record is emitted whatever happened, including after a
-    // transport error, so the host always learns which classification applied.
+    // The terminal record is emitted whatever happened, because the kernel
+    // collector flushes the transcript on it and nothing else: without one, every
+    // record already relayed stays collected and unprinted. A probe failure is
+    // classified as what it is rather than as whatever `probe.outcome()` happened
+    // to hold, and its code is still reported afterwards, so the host learns both
+    // the transcript and the reason the run stopped.
+    let (outcome, stopped) = match drive(&mut probe, &mut session, &mut reporter) {
+        Ok(outcome) => (outcome, None),
+        Err(code) => (
+            ProbeOutcome::Failed(ProbeFailure::RunStopped { code }),
+            Some(code),
+        ),
+    };
     let terminal = reporter.terminal(outcome, probe.steps_observed());
     let _ = close_handle(session.channel);
     let _ = close_handle(parent);
+    // The failure that stopped the run outranks a later terminal-send failure:
+    // it is the cause, and the terminal send is a consequence of the same
+    // refusing channel.
+    if let Some(code) = stopped {
+        return Err(code);
+    }
     terminal?;
     match outcome {
         ProbeOutcome::Passed => Ok(0),
@@ -272,29 +300,32 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
     }
 }
 
-/// Runs the scenario to its terminal outcome. A transport failure is turned
-/// into a classified probe outcome rather than an early return, so the caller
-/// can still emit a terminal record.
+/// Runs the scenario, returning either its observed outcome or the probe's own
+/// failure code.
+///
+/// A failure here is the probe's, not the scheduler's: a refused report send or
+/// a violated internal precondition. It used to be swallowed by a bare `break`,
+/// which lost the code entirely and left the terminal record claiming whatever
+/// `probe.outcome()` happened to hold -- `CleanupIncomplete` for a run that never
+/// reached cleanup. The caller now classifies it honestly and reports the code.
 fn drive(
     probe: &mut SaturationProbe,
     session: &mut Session,
     reporter: &mut Reporter,
-) -> ProbeOutcome {
+) -> Result<ProbeOutcome, u32> {
     let budget = probe.plan().step_budget() + 1;
     for _ in 0..budget {
         let Some(step) = probe.next_step() else { break };
-        if advance(probe, session, reporter, step).is_err() {
-            break;
-        }
+        advance(probe, session, reporter, step)?;
     }
-    probe
+    Ok(probe
         .outcome()
         // A run that exhausted its bounded budget without a terminal outcome is
         // itself a cleanup failure: the plan forbids treating an unbounded run
         // as a pass.
         .unwrap_or(ProbeOutcome::Failed(ProbeFailure::CleanupIncomplete {
             index: probe.admitted_hogs(),
-        }))
+        })))
 }
 
 fn advance(
