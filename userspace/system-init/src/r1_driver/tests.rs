@@ -197,15 +197,24 @@ impl Wyr1BPlatform for Probe {
         items: &[DwWaitItemV1],
         _deadline: DwDeadline,
     ) -> Result<DwWaitResultV1, NativeError> {
-        assert_eq!(items.len(), 2);
-        // Pins the ordering `drain` depends on: the kernel resolves a tie to the
-        // lowest input index, so the Channel must be asked about first or a
-        // terminal record queued just before the probe's exit is discarded.
-        assert_eq!(
-            items[0].signals.0,
-            DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0
-        );
-        assert_eq!(items[1].signals, DW_SIGNAL_EXITED);
+        // Two shapes reach this double and each is checked, rather than the
+        // two-item one being assumed: `drain` asks about the channel and the
+        // process together, and the post-gap census asks about the channel alone.
+        match items.len() {
+            2 => {
+                // Pins the ordering `drain` depends on: the kernel resolves a tie
+                // to the lowest input index, so the Channel must be asked about
+                // first or a terminal record queued just before the probe's exit
+                // is discarded.
+                assert_eq!(
+                    items[0].signals.0,
+                    DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0
+                );
+                assert_eq!(items[1].signals, DW_SIGNAL_EXITED);
+            }
+            1 => assert_eq!(items[0].signals, DW_SIGNAL_READABLE),
+            other => panic!("unexpected wait shape with {other} items"),
+        }
         if self.pending() {
             return Ok(DwWaitResultV1 {
                 index: 0,
@@ -503,15 +512,69 @@ fn an_out_of_order_record_is_refused_rather_than_relayed() {
     let mut state = state(plan);
     let mut system = Probe::new();
     system.queue(step(2, plan), 0);
-    // The refusal travels with its numbers: a gap says a record was lost, and
-    // which one. Run 6 reported this shape as a bare category.
+    // The refusal travels with its numbers, and with a census of what was still
+    // queued behind it. Run 6 reported this shape as a bare category; run 9
+    // reported the numbers but could not say whether one datagram was lost or
+    // many. Nothing follows this record, so the census is empty.
     assert_eq!(
         drain(&mut state, &mut system, &mut Waits::default(), 500),
-        Err(InitError::R1Relay(RelayError::OutOfOrder {
+        Err(InitError::R1RelayGap(RelayGapCensus {
             expected: 1,
             observed: 2,
+            further: 0,
+            further_gaps: 0,
         }))
     );
+    assert_eq!(system.submitted_count, 0);
+}
+
+/// The census is the difference between run 9's finding and a diagnosis: one lost
+/// datagram is a different defect from a channel dropping them repeatedly.
+#[test]
+fn a_gap_counts_what_was_still_queued_behind_it() {
+    let plan = ProbePlan::SMP;
+    // One gap, then a consecutive run behind it: the loss was isolated.
+    let mut isolated_state = state(plan);
+    let mut system = Probe::new();
+    for sequence in [2, 3, 4] {
+        system.queue(step(sequence, plan), 0);
+    }
+    assert_eq!(
+        drain(&mut isolated_state, &mut system, &mut Waits::default(), 500),
+        Err(InitError::R1RelayGap(RelayGapCensus {
+            expected: 1,
+            observed: 2,
+            further: 2,
+            further_gaps: 0,
+        }))
+    );
+
+    // A second gap behind the first: the loss recurred, which is the finding.
+    let mut recurring_state = state(plan);
+    let mut system = Probe::new();
+    for sequence in [2, 3, 7] {
+        system.queue(step(sequence, plan), 0);
+    }
+    let failure = drain(&mut recurring_state, &mut system, &mut Waits::default(), 500);
+    assert_eq!(
+        failure,
+        Err(InitError::R1RelayGap(RelayGapCensus {
+            expected: 1,
+            observed: 2,
+            further: 2,
+            further_gaps: 1,
+        }))
+    );
+    // And the two read differently at the host, which is the whole point.
+    let recurring = r1_test_failure_application_status(&failure.unwrap_err());
+    let isolated = r1_test_failure_application_status(&InitError::R1RelayGap(RelayGapCensus {
+        expected: 1,
+        observed: 2,
+        further: 2,
+        further_gaps: 0,
+    }));
+    assert_ne!(recurring, isolated);
+    // Nothing is relayed after a gap, census or not.
     assert_eq!(system.submitted_count, 0);
 }
 

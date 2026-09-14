@@ -22,7 +22,9 @@
 
 use super::*;
 
-use crate::r1_relay::{R1EvidenceSink, R1Relay, RELAY_CAPACITY, RelayFailure, relay_one};
+use crate::r1_relay::{
+    R1EvidenceSink, R1Relay, RELAY_CAPACITY, RelayError, RelayFailure, relay_one,
+};
 use crate::wyr1b::{EndpointGrant, EndpointKind, JobError, RegistryTopology};
 use crate::wyr1b_job::JobDispatcher;
 use crate::wyr1b_native::{create_controller_channel_pair, poll_job_dispatcher};
@@ -432,6 +434,74 @@ where
     Ok(())
 }
 
+/// Counts what was still queued behind a refused out-of-order record.
+///
+/// Reached only on a run that has already failed, so these datagrams are drained
+/// and discarded rather than relayed: the relay refuses everything after a gap by
+/// design, and submitting them would put an out-of-order transcript in front of
+/// the collector. What they are worth is their *count*, and whether any of them
+/// is itself out of sequence -- one lost datagram is a different defect from a
+/// channel dropping them repeatedly, and run 9 could not distinguish the two.
+///
+/// Bounded by the relay's capacity, and a refusal to read further is not an error
+/// here: the census is diagnostic, and losing it must not replace the gap that
+/// prompted it with some later failure.
+fn census_after_gap<S>(
+    state: &State,
+    system: &mut S,
+    expected: u64,
+    observed: u64,
+    now_ns: u64,
+) -> RelayGapCensus
+where
+    S: Wyr1BPlatform,
+{
+    let mut census = RelayGapCensus {
+        expected,
+        observed,
+        further: 0,
+        further_gaps: 0,
+    };
+    let mut next = observed;
+    for _ in 0..RELAY_CAPACITY {
+        let items = [DwWaitItemV1 {
+            handle: state.probe.launch_channel,
+            signals: DW_SIGNAL_READABLE,
+        }];
+        match system.wait_many(&items, DwDeadline(now_ns)) {
+            Ok(result) if result.observed.0 & DW_SIGNAL_READABLE.0 != 0 => {}
+            _ => break,
+        }
+        let mut bytes = [0_u8; RECORD_BYTES];
+        let mut handles = [DwReceivedHandleInfoV1::default(); 1];
+        let counts = match system.receive_channel(state.probe.launch_channel, &mut bytes, &mut handles)
+        {
+            Ok(counts) => counts,
+            Err(_) => break,
+        };
+        for info in handles.iter().take(counts.handles) {
+            let _ = system.close_handle(info.handle);
+        }
+        census.further += 1;
+        if counts.bytes != RECORD_BYTES {
+            census.further_gaps += 1;
+            continue;
+        }
+        // A record whose sequence is not one past the previous one is a second
+        // loss, which is the finding this census exists to surface.
+        match wyrmroot_r1_saturation::record::parse_header(&bytes) {
+            Ok(header) => {
+                if header.sequence != next + 1 {
+                    census.further_gaps += 1;
+                }
+                next = header.sequence;
+            }
+            Err(_) => census.further_gaps += 1,
+        }
+    }
+    census
+}
+
 /// Relays whatever the probe has queued, without blocking the resident tick.
 ///
 /// The loop is bounded by the relay's own capacity: a probe that talked past it
@@ -523,6 +593,16 @@ where
             // as a short transcript that looks like a stall -- and the relay's
             // own reason says which, so it travels with the failure. Answering
             // this with a bare category is what made run 6 undiagnosable.
+            //
+            // A sequence gap gets one further question asked before the run ends.
+            // The run is still a failure and nothing more is relayed; the census
+            // only counts what was already queued, which is the difference
+            // between one lost datagram and a stream of them.
+            Err(RelayFailure::Refused(RelayError::OutOfOrder { expected, observed })) => {
+                return Err(InitError::R1RelayGap(census_after_gap(
+                    state, system, expected, observed, now_ns,
+                )));
+            }
             Err(RelayFailure::Refused(error)) => return Err(InitError::R1Relay(error)),
             Err(RelayFailure::Rejected(error)) => return Err(InitError::Native(error)),
         }

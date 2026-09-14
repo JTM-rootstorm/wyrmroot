@@ -366,6 +366,8 @@ const fn test_failure_category(error: &InitError) -> u32 {
         InitError::R1Probe(failure) => failure.category(),
         #[cfg(feature = "r1-selector34")]
         InitError::R1Relay(_) => 0x25,
+        #[cfg(feature = "r1-selector34")]
+        InitError::R1RelayGap(_) => 0x27,
         InitError::BootstrapRetirement(_) => 0x26,
     }
 }
@@ -446,6 +448,18 @@ impl R1ProbeFailure {
 /// `RELAY_CAPACITY` (64), and both topology counts fit because the gate's own
 /// fields are bounded well below 64; each is saturated rather than truncated so a
 /// wild value reads as at-the-limit instead of as a small one.
+/// Six bits, saturating, so a wild value reads as at-the-limit.
+#[cfg(feature = "r1-selector34")]
+const fn saturating_six(value: u64) -> u32 {
+    if value > 0x3f { 0x3f } else { value as u32 }
+}
+
+/// Three bits, saturating, for a gap that should be one.
+#[cfg(feature = "r1-selector34")]
+const fn saturating_three(value: u64) -> u32 {
+    if value > 0x7 { 0x7 } else { value as u32 }
+}
+
 #[cfg(feature = "r1-selector34")]
 const fn r1_relay_detail(error: &r1_relay::RelayError) -> u32 {
     use r1_relay::RelayError;
@@ -512,6 +526,17 @@ pub const fn r1_test_failure_application_status(error: &InitError) -> u32 {
         // A refused record's own reason, for the same purpose: run 6 proved a
         // record had been refused and nothing about which check refused it.
         InitError::R1Relay(error) => 0xAF38_0000 | r1_relay_detail(error),
+        // The gap census: which record was expected, how much was still queued
+        // behind the refused one, and whether the loss recurred. `expected` and
+        // `further` saturate at 63 and the gap at 15, so an implausible value
+        // reads as at-the-limit rather than wrapping.
+        InitError::R1RelayGap(census) => {
+            0xAF3B_0000
+                | (saturating_six(census.expected) << 10)
+                | (saturating_six(census.further as u64) << 4)
+                | if census.further_gaps > 0 { 0x8 } else { 0 }
+                | saturating_three(census.observed.saturating_sub(census.expected))
+        }
         // The retirement wait, whose bare `Supervision` was indistinguishable
         // from every other supervision failure in the crate -- including the two
         // driver sites run 5 was attributed to.
@@ -1157,6 +1182,8 @@ pub enum InitError {
     R1Probe(R1ProbeFailure),
     #[cfg(feature = "r1-selector34")]
     R1Relay(r1_relay::RelayError),
+    #[cfg(feature = "r1-selector34")]
+    R1RelayGap(RelayGapCensus),
     BootstrapRetirement(BootstrapRetirementFailure),
 }
 
@@ -1178,6 +1205,27 @@ pub enum BootstrapRetirementFailure {
     /// which is a different failure from the wait refusing: the kernel answered,
     /// and answered unexpectedly.
     WrongResult { index: u32, observed: u64 },
+}
+
+/// What init found on the probe's channel after a record went missing.
+///
+/// Run 9 refused sequence 7 while expecting 6, and the probe provably sent 6:
+/// record 7 carries sequence 7, so `next_sequence` ran seven times, and it is
+/// only ever consumed inside an emitter that immediately sends and propagates
+/// failure. So the datagram was lost between a successful `send_channel` and
+/// init's `receive_channel`, and the next question is not *whether* one was lost
+/// but whether exactly one was.
+///
+/// `further` is how many more datagrams were queued behind the refused one, and
+/// `highest_gap` whether any of those was itself out of sequence. One isolated
+/// loss and a stream of losses are different defects, and the status has to tell
+/// them apart or the next run repeats this one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RelayGapCensus {
+    pub expected: u64,
+    pub observed: u64,
+    pub further: u32,
+    pub further_gaps: u32,
 }
 
 impl From<RestartTransitionError> for InitError {
