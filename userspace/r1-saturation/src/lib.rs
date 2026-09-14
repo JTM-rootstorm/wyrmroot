@@ -630,6 +630,12 @@ pub mod record {
 
     /// Encodes the single terminal record. Offset 56 carries zero for a pass and
     /// the failure ordinal otherwise, so a truncated capture still says which.
+    ///
+    /// Offsets 44 and 48 carry that failure's own two words, at the same places a
+    /// `KIND_FAILED` record puts them. They were previously written as zeros,
+    /// which threw away the only thing that distinguishes one instance of a
+    /// failure from another: run 12 reported `FAIL_RUN_STOPPED` and the probe's
+    /// exit code -- the entire reason it stopped -- was in the discarded word.
     pub fn encode_terminal(
         sequence: u64,
         nonce: u64,
@@ -638,16 +644,16 @@ pub mod record {
         steps_observed: usize,
     ) -> [u8; BYTES] {
         let mut writer = Writer::new(KIND_TERMINAL, sequence, nonce);
+        let (ordinal, index, detail) = match outcome {
+            ProbeOutcome::Passed => (0, 0, 0),
+            ProbeOutcome::Failed(failure) => failure_fields(failure),
+        };
         writer.u32_at(32, plan.online_cpus as u32);
         writer.u32_at(36, plan.hog_count as u32);
         writer.u32_at(40, steps_observed as u32);
-        writer.u32_at(
-            56,
-            match outcome {
-                ProbeOutcome::Passed => 0,
-                ProbeOutcome::Failed(failure) => failure_fields(failure).0,
-            },
-        );
+        writer.u32_at(44, index);
+        writer.u64_at(48, detail);
+        writer.u32_at(56, ordinal);
         writer.bytes
     }
 }
