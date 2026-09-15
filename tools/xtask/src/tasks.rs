@@ -1823,6 +1823,27 @@ fn component_package(filter: &str) -> Option<&'static str> {
         "init0" | "wyrmroot-init0" | "package:wyrmroot-init0" => Some("wyrmroot-init0"),
         "hello" | "wyrmroot-hello" | "package:wyrmroot-hello" => Some("wyrmroot-hello"),
         "xtask" | "package:xtask" => Some("xtask"),
+        // Reset card R7E. Section 9 asks for the driver, registry, shell and
+        // console areas to be runnable as smaller independent tests, and each
+        // of these had only the whole-workspace run or a product feature gate.
+        // Naming them here costs nothing and makes one area's failure legible
+        // without the rest of the suite around it.
+        "registry" | "registryd" | "wyrmroot-registryd" | "package:wyrmroot-registryd" => {
+            Some("wyrmroot-registryd")
+        }
+        "console" | "consoled" | "wyrmroot-consoled" | "package:wyrmroot-consoled" => {
+            Some("wyrmroot-consoled")
+        }
+        "driver" | "uart16550d" | "wyrmroot-uart16550d" | "package:wyrmroot-uart16550d" => {
+            Some("wyrmroot-uart16550d")
+        }
+        "devmgr" | "wyrmroot-devmgr" | "package:wyrmroot-devmgr" => Some("wyrmroot-devmgr"),
+        "shell" | "wyrmsh" | "wyrmroot-wyrmsh" | "package:wyrmroot-wyrmsh" => {
+            Some("wyrmroot-wyrmsh")
+        }
+        "shell-core" | "wyrmsh-core" | "wyrmroot-wyrmsh-core" | "package:wyrmroot-wyrmsh-core" => {
+            Some("wyrmroot-wyrmsh-core")
+        }
         _ => None,
     }
 }

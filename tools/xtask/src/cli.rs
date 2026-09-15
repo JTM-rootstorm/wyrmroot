@@ -87,8 +87,11 @@ Usage:
     tools/pinned-cargo xtask wyr1-d5-prepare <fresh-directory> <deepwyrm-repository> <deepwyrm-revision> <16-hex-evidence-nonce>
 
 Host filters may name a component (bootfs, protocol, elf, runtime, bootstrap,
-efi, init0, hello, xtask, dw1c-init0, or dw1d6), package:<workspace-package>,
-or test:<substring>. The dw1c-init0 and dw1d6 filters are explicit
+efi, init0, hello, xtask, dw1c-init0, or dw1d6), one product area (registry,
+console, driver, devmgr, shell, or shell-core), package:<workspace-package>,
+or test:<substring>. The area filters are reset card R7E's smaller independent
+runs: each names one workspace package so a single area's failure is legible
+without the rest of the suite around it. The dw1c-init0 and dw1d6 filters are explicit
 feature-specific controller gates. WYR1-E3 model/clippy filters select the shell
 controller and console model features; wyr1e3-native checks the unselected
 new adapters and historical selector32 with the accepted native compiler.
