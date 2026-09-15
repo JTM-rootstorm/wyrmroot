@@ -3,8 +3,8 @@
 use super::*;
 use crate::wyr1b::{
     EndpointGrant, EndpointKind, JobError, JobResult as ControllerJobResult, LaunchChannelRelease,
-    LaunchEngineError, PolicyView, RegistryTopology, RequestTicket, commit_prepared_job,
-    correlation_environment, observe_prepared_ready, prepare_reserved_job,
+    LaunchEngineError, PolicyView, PreparedJob, RegistryTopology, RequestTicket,
+    commit_prepared_job, correlation_environment, observe_prepared_ready, prepare_reserved_job,
 };
 use crate::wyr1b_gate::{EvidenceLog, GATE_PATH, GateConfig, GateEvent, parse_config};
 #[cfg(feature = "wyr1e8-selector33")]
@@ -3342,6 +3342,18 @@ where
     .map(|_| ())
 }
 
+/// Runs a launch end to end in one frame.
+///
+/// Retained by reset card R6B for the callers that genuinely need the launch
+/// complete when the call returns -- `receive_and_accept_job`, and through it
+/// `run_job_gate`'s owner and orphan launches, which use the returned
+/// `LoadedJob`'s handles on the next line. Those are one-shot bring-up paths
+/// with no event loop to return to.
+///
+/// The resident dispatcher does not use this. It calls
+/// `construct_reserved_launch` and lets the poll finish the launch later,
+/// which is the whole point of the card: §3's invariant 6 requires that one
+/// child failing to reach READY not block unrelated control traffic.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn accept_reserved_launch<S, L, W>(
@@ -3362,6 +3374,56 @@ fn accept_reserved_launch<S, L, W>(
         E8TriggerRequest,
     )>,
 ) -> Result<(crate::wyr1b::LoadedJob, SentLaunchAccepted), InitError>
+where
+    S: Wyr1BPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let constructed = construct_reserved_launch(
+        system,
+        loader,
+        waits,
+        authority,
+        policy,
+        jobs,
+        session,
+        reservation,
+        request_ticket,
+        request,
+        received,
+        handle_count,
+    )?;
+    finish_constructed_launch(
+        system,
+        waits,
+        jobs,
+        constructed,
+        #[cfg(feature = "wyr1e8-selector33")]
+        e8_acceptance,
+    )
+}
+
+/// Validates, reserves, loads and arms the READY deadline, and stops there.
+///
+/// Everything up to and including `report_deadline` is work the request's own
+/// frame has to do: it consumes the moved stream handles and the borrowed
+/// request, neither of which outlives the dispatch. What it returns is the
+/// small record the observation needs afterwards.
+#[allow(clippy::too_many_arguments)]
+fn construct_reserved_launch<S, L, W>(
+    system: &mut S,
+    loader: &mut L,
+    waits: &mut W,
+    authority: LoadAuthority,
+    policy: &PolicyView<'_>,
+    jobs: &mut JobDispatcher,
+    session: DwHandle,
+    reservation: LaunchReservation,
+    request_ticket: RequestTicket,
+    request: wyrmroot_launch_proto::LaunchRequest<'_>,
+    received: &[DwReceivedHandleInfoV1],
+    handle_count: usize,
+) -> Result<ConstructedLaunch, InitError>
 where
     S: Wyr1BPlatform,
     L: LoaderPlatform<Error = NativeError>,
@@ -3448,6 +3510,56 @@ where
             );
         }
     };
+    Ok(ConstructedLaunch {
+        prepared,
+        deadline,
+        session,
+        reservation,
+    })
+}
+
+/// A launch whose child exists and whose READY has not been observed yet.
+///
+/// Reset plan §7: this is the boundary between `Constructed` and
+/// `AwaitingReady`. Everything in it is a fact the observation and the
+/// publication still need, and every one of them used to be a local of
+/// `accept_reserved_launch`'s frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ConstructedLaunch {
+    prepared: PreparedJob,
+    deadline: DwDeadline,
+    session: DwHandle,
+    reservation: LaunchReservation,
+}
+
+/// Observes the exact READY and publishes, or rolls the launch back.
+///
+/// Split out of `accept_reserved_launch` by reset card R6B. It is the half
+/// that may not run in the frame that read the request: `observe_prepared_ready`
+/// blocks until the child answers or `deadline` expires, and §3's invariant 6
+/// says that wait must not hold the resident dispatcher. R6B moves the call
+/// site; the sequence inside is unchanged.
+#[allow(clippy::too_many_arguments)]
+fn finish_constructed_launch<S, W>(
+    system: &mut S,
+    waits: &mut W,
+    jobs: &mut JobDispatcher,
+    constructed: ConstructedLaunch,
+    #[cfg(feature = "wyr1e8-selector33")] e8_acceptance: Option<(
+        &mut ShellControllerState,
+        E8TriggerRequest,
+    )>,
+) -> Result<(crate::wyr1b::LoadedJob, SentLaunchAccepted), InitError>
+where
+    S: Wyr1BPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let ConstructedLaunch {
+        prepared,
+        deadline,
+        session,
+        reservation,
+    } = constructed;
     let observation = observe_prepared_ready(waits, &prepared, deadline);
     if observation.is_err() {
         return Err(

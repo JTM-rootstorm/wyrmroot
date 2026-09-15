@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::wyr1b::{EndpointKind, RegistryTopology};
+use crate::wyr1b_job::LaunchSessionScope;
 
 fn grant(role_generation: u64) -> EndpointGrant {
     RegistryTopology::new(7)
@@ -62,7 +63,12 @@ fn drive_to_published(
 fn an_accepted_launch_runs_reserved_to_complete_and_frees_its_slot() {
     let mut arena = LaunchTransactions::new();
     let token = arena
-        .open(grant(1), DwHandle(0x10), reservation(0x99))
+        .open(
+            grant(1),
+            DwHandle(0x10),
+            LaunchSessionScope::Historical,
+            reservation(0x99),
+        )
         .expect("first transaction");
     assert_eq!(arena.stage(token), Ok(LaunchStage::Reserved));
     assert_eq!(arena.open_count(), 1);
@@ -85,7 +91,12 @@ fn an_accepted_launch_runs_reserved_to_complete_and_frees_its_slot() {
 fn a_slot_holding_the_childs_handles_refuses_to_close() {
     let mut arena = LaunchTransactions::new();
     let token = arena
-        .open(grant(1), DwHandle(0x10), reservation(0x99))
+        .open(
+            grant(1),
+            DwHandle(0x10),
+            LaunchSessionScope::Historical,
+            reservation(0x99),
+        )
         .expect("transaction");
     drive_to_published(&mut arena, token).expect("accepted path");
     arena.advance(token, LaunchStage::Cleanup).expect("cleanup");
@@ -105,7 +116,12 @@ fn a_slot_holding_the_childs_handles_refuses_to_close() {
 fn a_transaction_that_has_not_completed_refuses_to_close() {
     let mut arena = LaunchTransactions::new();
     let token = arena
-        .open(grant(1), DwHandle(0x10), reservation(0x99))
+        .open(
+            grant(1),
+            DwHandle(0x10),
+            LaunchSessionScope::Historical,
+            reservation(0x99),
+        )
         .expect("transaction");
     assert_eq!(arena.close(token), Err(LaunchTransactionError::Incomplete));
     arena.advance(token, LaunchStage::Failing).expect("failing");
@@ -120,7 +136,12 @@ fn a_transaction_that_has_not_completed_refuses_to_close() {
 fn construction_cannot_skip_the_ready_observation() {
     let mut arena = LaunchTransactions::new();
     let token = arena
-        .open(grant(1), DwHandle(0x10), reservation(0x99))
+        .open(
+            grant(1),
+            DwHandle(0x10),
+            LaunchSessionScope::Historical,
+            reservation(0x99),
+        )
         .expect("transaction");
     arena
         .advance(token, LaunchStage::Constructed)
@@ -136,7 +157,12 @@ fn construction_cannot_skip_the_ready_observation() {
 fn a_stage_cannot_go_backwards_or_leave_a_terminal_stage() {
     let mut arena = LaunchTransactions::new();
     let token = arena
-        .open(grant(1), DwHandle(0x10), reservation(0x99))
+        .open(
+            grant(1),
+            DwHandle(0x10),
+            LaunchSessionScope::Historical,
+            reservation(0x99),
+        )
         .expect("transaction");
     arena
         .advance(token, LaunchStage::Constructed)
@@ -198,16 +224,31 @@ fn one_session_cannot_hold_two_launches_in_flight() {
     let (first, second) = two_grants();
     let mut arena = LaunchTransactions::new();
     let token = arena
-        .open(first, DwHandle(0x10), reservation(0x99))
+        .open(
+            first,
+            DwHandle(0x10),
+            LaunchSessionScope::Historical,
+            reservation(0x99),
+        )
         .expect("first transaction");
     assert_eq!(
-        arena.open(first, DwHandle(0x10), reservation(0x9a)),
+        arena.open(
+            first,
+            DwHandle(0x10),
+            LaunchSessionScope::Historical,
+            reservation(0x9a)
+        ),
         Err(LaunchTransactionError::SessionBusy)
     );
     // A different session is admitted, and the busy one is admitted again once
     // its transaction closes.
     arena
-        .open(second, DwHandle(0x11), reservation(0x9b))
+        .open(
+            second,
+            DwHandle(0x11),
+            LaunchSessionScope::Historical,
+            reservation(0x9b),
+        )
         .expect("second session");
     arena.advance(token, LaunchStage::Failing).expect("failing");
     arena.advance(token, LaunchStage::Cleanup).expect("cleanup");
@@ -216,7 +257,12 @@ fn one_session_cannot_hold_two_launches_in_flight() {
         .expect("complete");
     arena.close(token).expect("close");
     arena
-        .open(first, DwHandle(0x10), reservation(0x9c))
+        .open(
+            first,
+            DwHandle(0x10),
+            LaunchSessionScope::Historical,
+            reservation(0x9c),
+        )
         .expect("first session again");
 }
 
@@ -229,7 +275,12 @@ fn the_arena_refuses_a_transaction_beyond_its_bound() {
             .issue(1, EndpointKind::LaunchSession)
             .expect("session grant");
         arena
-            .open(grant, DwHandle(0x10 + index as u64), reservation(0x99))
+            .open(
+                grant,
+                DwHandle(0x10 + index as u64),
+                LaunchSessionScope::Historical,
+                reservation(0x99),
+            )
             .expect("slot within the bound");
     }
     assert_eq!(arena.open_count(), LAUNCH_TRANSACTION_SLOTS);
@@ -237,7 +288,12 @@ fn the_arena_refuses_a_transaction_beyond_its_bound() {
         .issue(1, EndpointKind::LaunchSession)
         .expect("session grant");
     assert_eq!(
-        arena.open(overflow, DwHandle(0xff), reservation(0x99)),
+        arena.open(
+            overflow,
+            DwHandle(0xff),
+            LaunchSessionScope::Historical,
+            reservation(0x99)
+        ),
         Err(LaunchTransactionError::Capacity)
     );
 }
@@ -249,7 +305,9 @@ fn the_response_envelope_survives_the_whole_transaction() {
     let mut arena = LaunchTransactions::new();
     let session = DwHandle(0x10);
     let request = reservation(0x4321);
-    let token = arena.open(grant(1), session, request).expect("transaction");
+    let token = arena
+        .open(grant(1), session, LaunchSessionScope::Historical, request)
+        .expect("transaction");
     drive_to_published(&mut arena, token).expect("accepted path");
     assert_eq!(arena.response_envelope(token), Ok((session, request)));
     arena.advance(token, LaunchStage::Cleanup).expect("cleanup");
@@ -264,7 +322,12 @@ fn the_response_envelope_survives_the_whole_transaction() {
 fn the_first_failure_fixes_the_reported_code() {
     let mut arena = LaunchTransactions::new();
     let token = arena
-        .open(grant(1), DwHandle(0x10), reservation(0x99))
+        .open(
+            grant(1),
+            DwHandle(0x10),
+            LaunchSessionScope::Historical,
+            reservation(0x99),
+        )
         .expect("transaction");
     let loader = LaunchFailure {
         code: 8,
@@ -296,7 +359,12 @@ fn the_first_failure_fixes_the_reported_code() {
 fn a_disposition_outside_the_contracts_error_codes_is_refused() {
     let mut arena = LaunchTransactions::new();
     let token = arena
-        .open(grant(1), DwHandle(0x10), reservation(0x99))
+        .open(
+            grant(1),
+            DwHandle(0x10),
+            LaunchSessionScope::Historical,
+            reservation(0x99),
+        )
         .expect("transaction");
     for code in [0, 11, u32::MAX] {
         assert_eq!(
@@ -317,7 +385,12 @@ fn a_disposition_outside_the_contracts_error_codes_is_refused() {
 fn attaching_resources_twice_is_refused_rather_than_overwriting() {
     let mut arena = LaunchTransactions::new();
     let token = arena
-        .open(grant(1), DwHandle(0x10), reservation(0x99))
+        .open(
+            grant(1),
+            DwHandle(0x10),
+            LaunchSessionScope::Historical,
+            reservation(0x99),
+        )
         .expect("transaction");
     arena
         .attach_resources(token, LaunchProfile::ProbeChild, resources())
@@ -338,7 +411,12 @@ fn attaching_resources_twice_is_refused_rather_than_overwriting() {
 fn zero_identities_are_refused_everywhere_they_can_appear() {
     let mut arena = LaunchTransactions::new();
     assert_eq!(
-        arena.open(grant(1), DwHandle(0), reservation(0x99)),
+        arena.open(
+            grant(1),
+            DwHandle(0),
+            LaunchSessionScope::Historical,
+            reservation(0x99)
+        ),
         Err(LaunchTransactionError::ResourceIdentity)
     );
     for zeroed in [
@@ -359,12 +437,22 @@ fn zero_identities_are_refused_everywhere_they_can_appear() {
         },
     ] {
         assert_eq!(
-            arena.open(grant(1), DwHandle(0x10), zeroed),
+            arena.open(
+                grant(1),
+                DwHandle(0x10),
+                LaunchSessionScope::Historical,
+                zeroed
+            ),
             Err(LaunchTransactionError::ResourceIdentity)
         );
     }
     let token = arena
-        .open(grant(1), DwHandle(0x10), reservation(0x99))
+        .open(
+            grant(1),
+            DwHandle(0x10),
+            LaunchSessionScope::Historical,
+            reservation(0x99),
+        )
         .expect("transaction");
     assert_eq!(
         arena.attach_job(token, 0),
@@ -401,7 +489,12 @@ fn a_token_kept_across_a_close_cannot_address_the_reused_slot() {
     let (first, second) = two_grants();
     let mut arena = LaunchTransactions::new();
     let stale = arena
-        .open(first, DwHandle(0x10), reservation(0x99))
+        .open(
+            first,
+            DwHandle(0x10),
+            LaunchSessionScope::Historical,
+            reservation(0x99),
+        )
         .expect("first transaction");
     arena.advance(stale, LaunchStage::Failing).expect("failing");
     arena.advance(stale, LaunchStage::Cleanup).expect("cleanup");
@@ -410,7 +503,12 @@ fn a_token_kept_across_a_close_cannot_address_the_reused_slot() {
         .expect("complete");
     arena.close(stale).expect("close");
     let fresh = arena
-        .open(second, DwHandle(0x11), reservation(0x9a))
+        .open(
+            second,
+            DwHandle(0x11),
+            LaunchSessionScope::Historical,
+            reservation(0x9a),
+        )
         .expect("second transaction");
     assert_eq!(fresh.slot(), stale.slot());
     assert_ne!(fresh.generation(), stale.generation());
@@ -430,7 +528,12 @@ fn an_exhausted_slot_retires_rather_than_reusing_its_generation() {
     let mut arena = LaunchTransactions::new();
     arena.generations[0] = u64::MAX - 1;
     let token = arena
-        .open(first, DwHandle(0x10), reservation(0x99))
+        .open(
+            first,
+            DwHandle(0x10),
+            LaunchSessionScope::Historical,
+            reservation(0x99),
+        )
         .expect("last generation");
     assert_eq!(token.generation(), u64::MAX);
     arena.advance(token, LaunchStage::Failing).expect("failing");
@@ -441,7 +544,12 @@ fn an_exhausted_slot_retires_rather_than_reusing_its_generation() {
     arena.close(token).expect("close");
     assert!(arena.retired[0]);
     let fresh = arena
-        .open(second, DwHandle(0x11), reservation(0x9a))
+        .open(
+            second,
+            DwHandle(0x11),
+            LaunchSessionScope::Historical,
+            reservation(0x9a),
+        )
         .expect("a different slot");
     assert_ne!(fresh.slot(), 0);
 }
@@ -451,10 +559,20 @@ fn a_session_and_a_job_each_find_their_own_open_transaction() {
     let (first, second) = two_grants();
     let mut arena = LaunchTransactions::new();
     let left = arena
-        .open(first, DwHandle(0x10), reservation(0x99))
+        .open(
+            first,
+            DwHandle(0x10),
+            LaunchSessionScope::Historical,
+            reservation(0x99),
+        )
         .expect("first transaction");
     let right = arena
-        .open(second, DwHandle(0x11), reservation(0x9a))
+        .open(
+            second,
+            DwHandle(0x11),
+            LaunchSessionScope::Historical,
+            reservation(0x9a),
+        )
         .expect("second transaction");
     arena.attach_job(left, 5).expect("left job");
     arena.attach_job(right, 6).expect("right job");

@@ -95,7 +95,7 @@ use wyrmroot_launch_proto::{MAX_LIVE_JOBS, Reservation};
 use wyrmroot_loader::launch::LaunchProfile;
 
 use crate::wyr1b::EndpointGrant;
-use crate::wyr1b_job::MAX_SESSIONS;
+use crate::wyr1b_job::{LaunchSessionScope, MAX_SESSIONS};
 
 /// Concurrent launch transactions the arena can hold.
 pub(crate) const LAUNCH_TRANSACTION_SLOTS: usize = MAX_SESSIONS;
@@ -210,6 +210,7 @@ struct LaunchSlot {
     open: bool,
     grant: EndpointGrant,
     session: DwHandle,
+    scope: LaunchSessionScope,
     reservation: Reservation,
     stage: LaunchStage,
     job_id: u64,
@@ -217,9 +218,12 @@ struct LaunchSlot {
     resources: Option<LaunchResources>,
     ready_deadline: Option<DwDeadline>,
     failure: Option<LaunchFailure>,
+    /// Moved-handle count from the request, which the evidence join needs
+    /// alongside the request bytes and cannot recover from the slot otherwise.
+    handle_count: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct LaunchTransactions {
     slots: [Option<LaunchSlot>; LAUNCH_TRANSACTION_SLOTS],
     retired: [bool; LAUNCH_TRANSACTION_SLOTS],
@@ -240,6 +244,7 @@ impl LaunchTransactions {
         &mut self,
         grant: EndpointGrant,
         session: DwHandle,
+        scope: LaunchSessionScope,
         reservation: Reservation,
     ) -> Result<LaunchToken, LaunchTransactionError> {
         if session.0 == 0
@@ -272,6 +277,7 @@ impl LaunchTransactions {
             open: true,
             grant,
             session,
+            scope,
             reservation,
             stage: LaunchStage::Reserved,
             job_id: 0,
@@ -279,6 +285,7 @@ impl LaunchTransactions {
             resources: None,
             ready_deadline: None,
             failure: None,
+            handle_count: 0,
         });
         Ok(LaunchToken {
             slot: index,
@@ -312,6 +319,17 @@ impl LaunchTransactions {
 
     pub(crate) fn stage(&self, token: LaunchToken) -> Result<LaunchStage, LaunchTransactionError> {
         self.slot(token).map(|slot| slot.stage)
+    }
+
+    pub(crate) fn scope(
+        &self,
+        token: LaunchToken,
+    ) -> Result<LaunchSessionScope, LaunchTransactionError> {
+        self.slot(token).map(|slot| slot.scope)
+    }
+
+    pub(crate) fn handle_count(&self, token: LaunchToken) -> Result<usize, LaunchTransactionError> {
+        self.slot(token).map(|slot| slot.handle_count)
     }
 
     /// The envelope a deferred response must echo: the session Channel to send
@@ -470,6 +488,27 @@ impl LaunchTransactions {
                 }),
                 _ => None,
             })
+    }
+
+    /// The first transaction at [`LaunchStage::AwaitingReady`] at or after
+    /// `start`, wrapping once. Callers advance `start` past the slot they were
+    /// handed so a child that never answers cannot starve its neighbours.
+    pub(crate) fn awaiting_ready_from(&self, start: usize) -> Option<LaunchToken> {
+        let start = start.checked_rem(LAUNCH_TRANSACTION_SLOTS).unwrap_or(0);
+        (0..LAUNCH_TRANSACTION_SLOTS).find_map(|offset| {
+            let index = start
+                .wrapping_add(offset)
+                .checked_rem(LAUNCH_TRANSACTION_SLOTS)?;
+            match self.slots.get(index)?.as_ref() {
+                Some(slot) if slot.open && slot.stage == LaunchStage::AwaitingReady => {
+                    Some(LaunchToken {
+                        slot: index,
+                        generation: slot.generation,
+                    })
+                }
+                _ => None,
+            }
+        })
     }
 
     /// The open transaction that owns one job, if any still does.
