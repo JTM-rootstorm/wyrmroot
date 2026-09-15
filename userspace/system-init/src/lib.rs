@@ -1335,7 +1335,6 @@ impl RoleController {
         })
     }
 
-    #[cfg(feature = "wyr1e8-selector33")]
     fn admit_recovery(
         &mut self,
         accounting: &AttemptLedger,
@@ -1736,7 +1735,10 @@ impl SystemInit {
 
     /// Starts one explicitly admitted post-stability recovery episode without
     /// releasing the exact published owner's resources or accounting token.
-    #[cfg(feature = "wyr1e8-selector33")]
+    ///
+    /// `RestartSupervisor::admit_recovery` in `wyrmroot-runtime` has always
+    /// been ordinary, documented supervision. Only these two wrappers named a
+    /// selector, so only they were removed at R7B-4.
     pub(crate) fn admit_recovery(
         &mut self,
         role: RoleId,

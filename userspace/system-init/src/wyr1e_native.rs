@@ -1243,7 +1243,7 @@ where
             // consoled task-group teardown races that ordering and can expose
             // stdout loss instead of the required status-loss result.
             false,
-            held.deadline,
+            Some(held.deadline),
         ),
         None => retire_console_product_with_result(system, waits, &mut e6.jobs, peer, true),
     };

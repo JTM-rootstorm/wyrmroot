@@ -317,8 +317,13 @@ fn registry_episode_admission_is_only_for_live_quiesced_coordinated_recovery() {
         .find("retire_registry_for_recovery_before(")
         .unwrap();
     assert!(quiesced < live && live < dependents && dependents < admission);
-    assert!(recovery.contains("let exhausted = if let Some(deadline) = action_deadline"));
-    assert!(recovery.contains("&& dependent_cleanup_error.is_none()"));
+    // R7B-4 made the episode-capped retirement take `Option<u64>` like the
+    // rest of the `_before` family, so the condition reads as a test on the
+    // episode rather than a destructuring of it. The property is unchanged:
+    // admission needs a live episode and a clean dependent retirement.
+    assert!(recovery.contains(
+        "let exhausted = if action_deadline.is_some() && dependent_cleanup_error.is_none()"
+    ));
     assert_eq!(
         RESIDENT
             .matches("retire_registry_for_recovery_before(")

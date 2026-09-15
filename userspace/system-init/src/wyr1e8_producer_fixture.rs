@@ -844,7 +844,7 @@ fn actual_driver_and_registry_recovery_compose_through_s4_ready() {
         &mut jobs,
         console_peer,
         false,
-        held.deadline,
+        Some(held.deadline),
     )
     .unwrap()
     .unwrap();

@@ -22,12 +22,9 @@ use crate::wyr1b_native::{
 use crate::wyr1b_native::{InstalledPeer, launch_registry_client_actor};
 use crate::wyr1b_native::{
     RegistryNativeAttempt, create_controller_channel_pair, establish_registry_topology,
-    launch_registry_until_ready, poison_registry_generation, poison_registry_generation_before,
-    restart_topology_or_poison_before,
-};
-#[cfg(feature = "wyr1e8-selector33")]
-use crate::wyr1b_native::{
-    launch_registry_until_ready_before, retire_registry_for_recovery_before,
+    launch_registry_until_ready, launch_registry_until_ready_before, poison_registry_generation,
+    poison_registry_generation_before, restart_topology_or_poison_before,
+    retire_registry_for_recovery_before,
 };
 use deepwyrm_syscall::{DW_HANDLE_TRANSFER_MOVE, DW_OBJECT_TYPE_CHANNEL, DwHandleTransferV1};
 #[cfg(any(
@@ -3621,18 +3618,18 @@ where
     if let Some(child_cleanup_failed) = fail_closed_e3a_recovery(resident, system, waits) {
         return finish_e3a_fatal_recovery(resident, system, waits, child_cleanup_failed);
     }
-    #[cfg(all(feature = "wyr1e-production", feature = "wyr1e8-selector33"))]
+    // Four arms for one fact, and two of them threw the cause away: outside
+    // the selector this was a bare `bool`, so a dependent retirement that
+    // failed said so without saying why. One `Option<InitError>` now, under
+    // the product gate that actually has dependents.
+    #[cfg(feature = "wyr1e-production")]
     let dependent_cleanup_error = attribute_failure(
         RecoveryOperation::RetireDependents,
         wyr1e::retire_dependents(resident, system, waits, true),
     )
     .err();
-    #[cfg(all(not(feature = "wyr1e-production"), feature = "wyr1e8-selector33"))]
+    #[cfg(not(feature = "wyr1e-production"))]
     let dependent_cleanup_error: Option<InitError> = None;
-    #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1e8-selector33")))]
-    let dependent_cleanup_failed = wyr1e::retire_dependents(resident, system, waits, true).is_err();
-    #[cfg(all(not(feature = "wyr1e-production"), not(feature = "wyr1e8-selector33")))]
-    let dependent_cleanup_failed = false;
     let registry = resident
         .wyr1c
         .as_mut()
@@ -3646,10 +3643,7 @@ where
         .as_mut()
         .ok_or(InitError::WrongActivationOrder)?
         .binding = None;
-    #[cfg(feature = "wyr1e8-selector33")]
-    let exhausted = if let Some(deadline) = action_deadline
-        && dependent_cleanup_error.is_none()
-    {
+    let exhausted = if action_deadline.is_some() && dependent_cleanup_error.is_none() {
         // The authenticated, exactly quiesced action admits a fresh finite
         // episode only after dependent retirement succeeds. Ordinary failures
         // keep the boot-anchored episode, even after a long healthy lifetime.
@@ -3658,7 +3652,7 @@ where
             waits,
             &mut resident.controller,
             registry,
-            deadline,
+            action_deadline,
         )
     } else {
         poison_registry_generation_before(
@@ -3670,19 +3664,7 @@ where
             action_deadline,
         )
     };
-    #[cfg(not(feature = "wyr1e8-selector33"))]
-    let exhausted = poison_registry_generation_before(
-        system,
-        waits,
-        &mut resident.controller,
-        registry,
-        dependent_cleanup_failed,
-        action_deadline,
-    );
     let exhausted = attribute_failure(RecoveryOperation::RetireRegistry, exhausted);
-    // `dependent_cleanup_error` is the E8 dependent-retirement leg (R7A class
-    // D1), so this stays gated on the selector that has one.
-    #[cfg(feature = "wyr1e8-selector33")]
     if let Some(error) = dependent_cleanup_error {
         return if exhausted.is_err() {
             attribute_failure(RecoveryOperation::RetireRegistry, Err(InitError::Cleanup))
@@ -3709,38 +3691,16 @@ where
     if action_deadline.is_some() {
         wyr1e::ensure_recovery_live(resident, system.now().map_err(InitError::Native)?)?;
     }
-    #[cfg(feature = "wyr1e8-selector33")]
-    let replacement = if let Some(deadline) = action_deadline {
-        launch_registry_until_ready_before(
-            system,
-            loader,
-            waits,
-            &mut resident.controller,
-            resident.authority,
-            bootfs,
-            deadline,
-        )
-    } else {
-        launch_registry_until_ready(
-            system,
-            loader,
-            waits,
-            &mut resident.controller,
-            resident.authority,
-            bootfs,
-        )
-    };
-    #[cfg(feature = "wyr1e8-selector33")]
-    let replacement = attribute_failure(RecoveryOperation::LaunchRegistry, replacement)?;
-    #[cfg(not(feature = "wyr1e8-selector33"))]
-    let replacement = launch_registry_until_ready(
+    let replacement = launch_registry_until_ready_before(
         system,
         loader,
         waits,
         &mut resident.controller,
         resident.authority,
         bootfs,
-    )?;
+        action_deadline,
+    );
+    let replacement = attribute_failure(RecoveryOperation::LaunchRegistry, replacement)?;
     let Some(replacement) = replacement else {
         resident.result = RecoveryResult::Degraded;
         if action_deadline.is_some() {

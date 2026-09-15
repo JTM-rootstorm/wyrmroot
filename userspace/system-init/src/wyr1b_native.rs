@@ -2148,7 +2148,11 @@ where
     launch_registry_until_ready_inner(system, loader, waits, controller, authority, bootfs, None)
 }
 
-#[cfg(feature = "wyr1e8-selector33")]
+/// The deadline-capped launch, matching the eight other `_before` helpers that
+/// were already ordinary. R7B-4 took the selector gate off and the argument to
+/// `Option<u64>`: with no episode open the cap is `None` and this is the plain
+/// launch, which is what the `not(selector)` call site used to spell by hand.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn launch_registry_until_ready_before<S, L, W>(
     system: &mut S,
     loader: &mut L,
@@ -2156,7 +2160,7 @@ pub(crate) fn launch_registry_until_ready_before<S, L, W>(
     controller: &mut SystemInit,
     authority: LoadAuthority,
     bootfs: &[u8],
-    action_deadline: u64,
+    deadline_cap: Option<u64>,
 ) -> Result<Option<RegistryNativeAttempt>, InitError>
 where
     S: Wyr1BPlatform,
@@ -2170,7 +2174,7 @@ where
         controller,
         authority,
         bootfs,
-        Some(action_deadline),
+        deadline_cap,
     )
 }
 
@@ -2316,13 +2320,12 @@ where
     )
 }
 
-#[cfg(feature = "wyr1e8-selector33")]
 pub(crate) fn retire_registry_for_recovery_before<S, W>(
     system: &mut S,
     waits: &mut W,
     controller: &mut SystemInit,
     registry: RegistryNativeAttempt,
-    deadline_cap: u64,
+    deadline_cap: Option<u64>,
 ) -> Result<bool, InitError>
 where
     S: InitPlatform,
@@ -2334,14 +2337,16 @@ where
         controller,
         registry,
         false,
-        Some(deadline_cap),
+        deadline_cap,
         RegistryRetirement::CoordinatedRecovery,
     )
 }
 
 enum RegistryRetirement {
     Failure,
-    #[cfg(feature = "wyr1e8-selector33")]
+    /// Retire a published, healthy owner as part of an admitted recovery
+    /// episode, keeping its accounting token. Only reachable while an episode
+    /// is open, so a build that opens none never selects it.
     CoordinatedRecovery,
 }
 
@@ -2370,7 +2375,6 @@ where
                     now,
                     AttemptFailure::WaitFailed,
                 ),
-                #[cfg(feature = "wyr1e8-selector33")]
                 RegistryRetirement::CoordinatedRecovery
                     if deadline_cap.is_some_and(|deadline| now < deadline) =>
                 {
@@ -2381,7 +2385,6 @@ where
                         now,
                     )
                 }
-                #[cfg(feature = "wyr1e8-selector33")]
                 RegistryRetirement::CoordinatedRecovery => Err(InitError::Supervision),
             },
         ),
@@ -5489,6 +5492,8 @@ where
     retire_console_product_inner(system, waits, jobs, peer, terminate, None).map(|_| ())
 }
 
+// Called only from the held-wait retirement branch, which is class D1c and
+// still the selector's. Signature matches the `_before` family regardless.
 #[cfg(feature = "wyr1e8-selector33")]
 pub(crate) fn retire_console_product_with_result<S, W>(
     system: &mut S,
@@ -5511,13 +5516,13 @@ pub(crate) fn retire_console_product_with_result_before<S, W>(
     jobs: &mut JobDispatcher,
     peer: InstalledPeer,
     terminate: bool,
-    deadline_cap: u64,
+    deadline_cap: Option<u64>,
 ) -> Result<Option<TerminationResult>, InitError>
 where
     S: Wyr1BPlatform,
     W: SupervisionPlatform<Error = NativeError>,
 {
-    retire_console_product_inner(system, waits, jobs, peer, terminate, Some(deadline_cap))
+    retire_console_product_inner(system, waits, jobs, peer, terminate, deadline_cap)
 }
 
 #[cfg(feature = "wyr1e8-selector33")]
@@ -12622,7 +12627,7 @@ mod tests {
                 &mut waits,
                 &mut controller,
                 registry,
-                4_000_000_000,
+                Some(4_000_000_000),
             ),
             Ok(false)
         );
@@ -12659,7 +12664,7 @@ mod tests {
                 &mut waits,
                 &mut controller,
                 registry,
-                4_000_000_000,
+                Some(4_000_000_000),
             ),
             Ok(true)
         );
@@ -12691,7 +12696,7 @@ mod tests {
                     &mut waits,
                     &mut controller,
                     registry,
-                    deadline,
+                    Some(deadline),
                 ),
                 Err(InitError::Supervision)
             );
