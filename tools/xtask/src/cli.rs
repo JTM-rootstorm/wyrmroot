@@ -91,7 +91,8 @@ efi, init0, hello, xtask, dw1c-init0, or dw1d6), one product area (registry,
 console, driver, devmgr, shell, or shell-core), package:<workspace-package>,
 or test:<substring>. The area filters are reset card R7E's smaller independent
 runs: each names one workspace package so a single area's failure is legible
-without the rest of the suite around it. The dw1c-init0 and dw1d6 filters are explicit
+without the rest of the suite around it. wyr1d5-clippy lints the two
+selector-32 libraries that only the d5 product path used to build. The dw1c-init0 and dw1d6 filters are explicit
 feature-specific controller gates. WYR1-E3 model/clippy filters select the shell
 controller and console model features; wyr1e3-native checks the unselected
 new adapters and historical selector32 with the accepted native compiler.

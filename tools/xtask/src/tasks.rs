@@ -1330,6 +1330,19 @@ pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<
         let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
         return run_cargo(repository, &arguments);
     }
+    if matches!(filter, Some("wyr1d5-clippy")) {
+        // Reset card E8D.4-32. Selector 32's `system-init` was compiled only by
+        // the d5 product path, never by a host gate, so R7B-1 could replace its
+        // episode deadline with a `super::wyr1e::` call -- a module gated on a
+        // feature selector 32 does not select -- and leave the selector
+        // unbuildable for a week without any gate noticing. Building the two
+        // selector-32 libraries here is what makes that class of break loud.
+        for arguments in selector32_library_commands() {
+            let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+            run_cargo(repository, &arguments)?;
+        }
+        return Ok(());
+    }
     if matches!(filter, Some("r1-clippy")) {
         // The ordinary clippy gates lint the default feature set, under which
         // r1_driver does not exist at all: it is compiled only by r1-status,
@@ -1396,6 +1409,34 @@ pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<
         run_cargo(repository, &arguments)?;
     }
     Ok(())
+}
+
+/// The two libraries the selector-32 product builds and no other host gate does.
+fn selector32_library_commands() -> Vec<Vec<String>> {
+    [
+        ("wyrmroot-system-init", "wyr1d-selector32"),
+        ("wyrmroot-consoled", "native-consoled,wyr1d-selector32"),
+    ]
+    .into_iter()
+    .map(|(package, features)| {
+        [
+            "clippy",
+            "--locked",
+            "--offline",
+            "--package",
+            package,
+            "--no-default-features",
+            "--features",
+            features,
+            "--lib",
+            "--",
+            "-D",
+            "warnings",
+        ]
+        .map(str::to_owned)
+        .into()
+    })
+    .collect()
 }
 
 fn r1_clippy_command() -> Vec<String> {

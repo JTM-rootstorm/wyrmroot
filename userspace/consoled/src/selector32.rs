@@ -362,10 +362,10 @@ impl Capture {
             // in this same raw record; dispatch the current phase each time.
             if self.awaiting_ready && self.leg == 4 {
                 compare(b"exit\r\n", &mut self.exit, bytes)?;
-                if let Some(status) = self.try_pending_ready()? {
-                    if observed.replace(status).is_some() {
-                        return Err(Error);
-                    }
+                if let Some(status) = self.try_pending_ready()?
+                    && observed.replace(status).is_some()
+                {
+                    return Err(Error);
                 }
                 break;
             }

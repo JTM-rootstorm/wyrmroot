@@ -72,7 +72,15 @@ where
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
+    // R7B-1 made the recovery episode's budget ordinary supervision rather
+    // than E8's, and gave every caller this line. `mod wyr1e` is gated on
+    // `wyr1e-production`, which selector 32 does not select, so here the
+    // episode does not exist and the cap is `None` -- the same shape
+    // `wyr1c_native` already uses at each of its own call sites.
+    #[cfg(feature = "wyr1e-production")]
     let deadline_cap = super::wyr1e::recovery_deadline(resident)?;
+    #[cfg(not(feature = "wyr1e-production"))]
+    let deadline_cap: Option<u64> = None;
     if deadline_cap.is_some_and(|deadline| system.now().map_or(true, |now| now >= deadline)) {
         return Err(InitError::Supervision);
     }
@@ -91,8 +99,8 @@ where
     }
     let d5 = state.d5.as_mut().ok_or(InitError::WrongActivationOrder)?;
     let first_driver = d5.driver.is_none();
-    if let Some(old) = d5.driver {
-        if d5.gate.record_count() != 8
+    if let Some(old) = d5.driver
+        && (d5.gate.record_count() != 8
             || !d5.released
             || identity.bundle_generation != old.bundle_generation
             || identity.driver_attempt_generation <= old.driver_attempt_generation
@@ -105,10 +113,9 @@ where
             )
             || state
                 .last_reaped_driver
-                .is_none_or(|r| r.attempt_generation.0 != old.driver_attempt_generation)
-        {
-            return Err(InitError::WrongManifestProfile);
-        }
+                .is_none_or(|r| r.attempt_generation.0 != old.driver_attempt_generation))
+    {
+        return Err(InitError::WrongManifestProfile);
     }
     if d5.console.is_none() {
         let registry = state.registry.ok_or(InitError::WrongActivationOrder)?;
@@ -672,7 +679,15 @@ pub(super) fn tx_drained<S: InitPlatform>(
     system: &mut S,
     identity: D5DrainIdentity,
 ) -> Result<(), InitError> {
+    // R7B-1 made the recovery episode's budget ordinary supervision rather
+    // than E8's, and gave every caller this line. `mod wyr1e` is gated on
+    // `wyr1e-production`, which selector 32 does not select, so here the
+    // episode does not exist and the cap is `None` -- the same shape
+    // `wyr1c_native` already uses at each of its own call sites.
+    #[cfg(feature = "wyr1e-production")]
     let deadline_cap = super::wyr1e::recovery_deadline(resident)?;
+    #[cfg(not(feature = "wyr1e-production"))]
+    let deadline_cap: Option<u64> = None;
     let observed_now = system.now().map_err(InitError::Native)?;
     if deadline_cap.is_some_and(|deadline| observed_now >= deadline) {
         return Err(InitError::Supervision);
