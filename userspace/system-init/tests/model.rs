@@ -1,6 +1,7 @@
 use deepwyrm_syscall::DwHandle;
 use wyrmroot_bootfs::builder::{Builder as BootfsBuilder, FileMode};
 use wyrmroot_device_proto as _;
+use wyrmroot_devmgr as _;
 use wyrmroot_launch_proto as _;
 use wyrmroot_loader::launch::{self, HEADER_BYTES, LaunchProfile};
 use wyrmroot_registry_proto as _;
@@ -14,6 +15,7 @@ use wyrmroot_system_init::{
     REAP_CLASS_TASK_GROUP_TEARDOWN, REAP_CLASS_UNHANDLED_EXCEPTION, RecoveryResult, SystemInit,
     SystemMode, observe_ready, reap_evidence_value,
 };
+use wyrmroot_uart16550d as _;
 use wyrmroot_wyr1b_gate_proto as _;
 
 const BOOT: [u8; 32] = [0x42; 32];

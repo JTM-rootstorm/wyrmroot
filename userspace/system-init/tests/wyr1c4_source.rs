@@ -1,12 +1,14 @@
 use deepwyrm_syscall as _;
 use wyrmroot_bootfs as _;
 use wyrmroot_device_proto as _;
+use wyrmroot_devmgr as _;
 use wyrmroot_launch_proto as _;
 use wyrmroot_loader as _;
 use wyrmroot_registry_proto as _;
 use wyrmroot_rrc_manifest as _;
 use wyrmroot_runtime as _;
 use wyrmroot_system_init as _;
+use wyrmroot_uart16550d as _;
 use wyrmroot_wyr1b_gate_proto as _;
 
 const MANIFEST: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
