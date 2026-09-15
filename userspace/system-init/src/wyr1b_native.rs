@@ -991,8 +991,8 @@ pub(crate) struct RegistryNativeAttempt {
     ready_at: u64,
 }
 
-#[cfg(all(test, feature = "wyr1e8-selector33"))]
-pub(crate) const fn registry_native_attempt_for_e8_fixture(
+#[cfg(all(test, feature = "wyr1e-production"))]
+pub(crate) const fn registry_native_attempt_for_fixture(
     active: ActiveNativeRole,
     control_channel: DwHandle,
     ready_at: u64,
@@ -14696,6 +14696,140 @@ mod tests {
             expect_gate(stale, expected),
             Err(InitError::Wyr1BGateMismatch)
         );
+    }
+
+    /// The product's own registry recovery, with nothing E8 about it.
+    ///
+    /// Reset card R7E. Before this test the only host test that reached
+    /// `recover_registry` was the E8 producer fixture, and it could only reach
+    /// it by launching an actor at a magic path with a matching nonce through a
+    /// live ShellJobs session. The ordinary path -- no episode open, so
+    /// `recovery_deadline` answers `None` and none of the selector's episode
+    /// arithmetic runs -- had no coverage in the tree. That is what blocked
+    /// R7B-4's D1b: the sniff could not be removed while it was the only way
+    /// any test reached recovery at all.
+    #[cfg(feature = "wyr1e-production")]
+    #[test]
+    fn ordinary_registry_recovery_needs_no_shell_no_trigger_and_no_barrier() {
+        let image = executable();
+        // The retained closure the relaunch looks up: the registry executable
+        // and the manifest that names its generation.
+        let generation = [0x47; 32];
+        let mut manifest = [0u8; 80];
+        manifest[48..80].copy_from_slice(&generation);
+        let entry = LaunchPolicyEntry {
+            path: "bin/hello",
+            content_sha256: wyrmroot_runtime::sha256::digest(&image),
+            startup_abi: 2,
+            profile_id: 1,
+            allow_no_streams: true,
+            allow_three_streams: true,
+        };
+        let mut policy = [0u8; 512];
+        let policy_len = encode_launch_policy(generation, &[entry], &mut policy).unwrap();
+        let mut builder = BootfsBuilder::new();
+        builder
+            .add(b"bin/hello", &image, FileMode::Executable)
+            .unwrap();
+        builder
+            .add(
+                LAUNCH_POLICY_PATH.as_bytes(),
+                &policy[..policy_len],
+                FileMode::ReadOnly,
+            )
+            .unwrap();
+        builder
+            .add(MANIFEST_PATH.as_bytes(), &manifest, FileMode::ReadOnly)
+            .unwrap();
+        builder
+            .add(b"system/registryd", &image, FileMode::Executable)
+            .unwrap();
+        let bootfs = builder.build().unwrap();
+        let mut platform = ShellPlatform::new();
+        platform.allow_wait_until = true;
+        platform.bootfs = Some(bootfs.clone());
+        let mut loader = InitSendLoader::new();
+        loader.fail_init = false;
+        // The replacement's launch transaction is the successor of the one the
+        // fixture's live registry holds, so the child's exact READY is for it.
+        let mut waits = AcceptedJobV2Waits {
+            transaction_id: 0xE8B5_0002,
+            profile: LaunchProfile::BootstrapRegistry,
+            exited: true,
+            console_status_lost_process: None,
+            running_process: None,
+        };
+        // Devmgr's two answers: it reports waiting for a registry, then
+        // acknowledges the fresh binding. Both are ordinary controller frames;
+        // nothing about them is E8.
+        let devmgr_control = crate::wyr1c_native::E8_REGISTRY_FIXTURE_DEVMGR_CONTROL;
+        let mut waiting = [0u8; wyrmroot_device_proto::controller::STATUS_BYTES];
+        wyrmroot_device_proto::controller::encode(
+            wyrmroot_device_proto::controller::ControllerMessage::Status {
+                supervisor_generation: wyrmroot_device_proto::coordinator::SupervisorGeneration(1),
+                binding: None,
+                transaction_id: 9,
+                status:
+                    wyrmroot_device_proto::controller::StatusCode::OperationalWaitingForRegistry,
+                attempt_generation: None,
+            },
+            &mut waiting,
+        )
+        .unwrap();
+        platform.push(devmgr_control, waiting.to_vec(), &[]);
+        let mut rebound = [0u8; wyrmroot_device_proto::controller::STATUS_BYTES];
+        wyrmroot_device_proto::controller::encode(
+            wyrmroot_device_proto::controller::ControllerMessage::Status {
+                supervisor_generation: wyrmroot_device_proto::coordinator::SupervisorGeneration(1),
+                binding: Some(wyrmroot_device_proto::RegistryBinding {
+                    generation: wyrmroot_device_proto::coordinator::RegistryGeneration(2),
+                    endpoint: wyrmroot_device_proto::coordinator::RegistryEndpoint {
+                        id: wyrmroot_device_proto::coordinator::RegistryEndpointId(1),
+                        generation: wyrmroot_device_proto::coordinator::RegistryEndpointGeneration(
+                            1,
+                        ),
+                    },
+                }),
+                transaction_id: 10,
+                status: wyrmroot_device_proto::controller::StatusCode::OperationalResourceOwned,
+                attempt_generation: None,
+            },
+            &mut rebound,
+        )
+        .unwrap();
+        platform.push(devmgr_control, rebound.to_vec(), &[]);
+        let (result, generation, role) = crate::wyr1c_native::exercise_ordinary_registry_recovery(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            &bootfs,
+            wyrmroot_runtime::sha256::digest(&image),
+            1,
+        )
+        .expect("the product's ordinary registry recovery must complete");
+        assert_eq!(result, crate::RecoveryResult::Recovered);
+        assert!(
+            generation > 1,
+            "recovery must restart the topology on a fresh registry generation"
+        );
+        // The replacement is the role's second attempt at its second
+        // generation, which is what distinguishes a real relaunch from a
+        // recovery that merely reported success.
+        assert!(
+            matches!(
+                role,
+                Some(RestartState::Ready {
+                    attempt: 2,
+                    generation: 2,
+                    ..
+                })
+            ),
+            "the replacement registry must be live: {role:?}"
+        );
+        // The bootfs deliberately omits `system/devmgr`: if the publication
+        // rebind ever fails, the fall into `recover_devmgr_after_error` is
+        // loud instead of letting devmgr recovery quietly stand in for the
+        // registry recovery under test.
     }
 
     #[cfg(feature = "wyr1e8-selector33")]

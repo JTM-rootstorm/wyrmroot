@@ -14,10 +14,10 @@ mod wyr1e;
 use crate::wyr1b::{EndpointKind, RegistryTopology};
 #[cfg(all(test, feature = "wyr1e8-selector33"))]
 use crate::wyr1b_job::JobDispatcher;
+#[cfg(all(test, feature = "wyr1e-production"))]
+use crate::wyr1b_native::registry_native_attempt_for_fixture;
 #[cfg(all(test, feature = "wyr1e8-selector33"))]
-use crate::wyr1b_native::{
-    InstalledPeer, ShellControllerState, registry_native_attempt_for_e8_fixture,
-};
+use crate::wyr1b_native::{InstalledPeer, ShellControllerState};
 #[cfg(feature = "dw1e3-selector31")]
 use crate::wyr1b_native::{InstalledPeer, launch_registry_client_actor};
 use crate::wyr1b_native::{
@@ -3812,9 +3812,9 @@ where
     Ok(())
 }
 
-#[cfg(all(test, feature = "wyr1e8-selector33"))]
+#[cfg(all(test, feature = "wyr1e-production"))]
 pub(crate) const E8_REGISTRY_FIXTURE_DEVMGR_CONTROL: DwHandle = DwHandle(0xE8B5_0021);
-#[cfg(all(test, feature = "wyr1e8-selector33"))]
+#[cfg(all(test, feature = "wyr1e-production"))]
 pub(crate) const E8_REGISTRY_FIXTURE_DRIVER_PROCESS: DwHandle = DwHandle(0xE8B5_0030);
 
 #[cfg(all(test, feature = "wyr1e8-selector33"))]
@@ -3826,7 +3826,7 @@ pub(crate) struct E8RegistryRecoveryFixtureResult {
     pub(crate) publication_generation: u64,
 }
 
-#[cfg(all(test, feature = "wyr1e8-selector33"))]
+#[cfg(all(test, feature = "wyr1e-production"))]
 fn install_e8_registry_fixture_role(
     controller: &mut SystemInit,
     role: RoleId,
@@ -3862,34 +3862,30 @@ fn install_e8_registry_fixture_role(
     })
 }
 
-/// Test-only bridge from the reached S3 held-WAIT state into the production
-/// registry-recovery orchestrator. The caller supplies real dispatcher-owned
-/// shell/job state; this function performs the actual dependent retirement,
-/// registry process retirement/relaunch, topology restart, devmgr WAIT/rebind,
-/// and current-driver publication observation before returning the surviving
-/// owners for the S4 evidence continuation.
-#[cfg(all(test, feature = "wyr1e8-selector33"))]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn exercise_e8_registry_recovery_orchestrator<S, L, W, E>(
-    system: &mut S,
-    loader: &mut L,
-    waits: &mut W,
-    bootfs: &[u8],
+/// The resident a recovery fixture starts from: an operational controller with
+/// a live registry, devmgr and driver, and one registry binding.
+///
+/// Reset card R7E. This was the opening half of the E8 orchestrator bridge,
+/// and that made the E8 mega-fixture the only host test in the tree that
+/// reached `recover_registry`, `recover_devmgr` or `recover_devmgr_after_error`
+/// at all -- measured by probe, not assumed. The resident is ordinary; only
+/// the `e6` state its caller supplies decides whether an episode is open, so
+/// the product path can be driven without a shell, a trigger or a barrier.
+#[cfg(all(test, feature = "wyr1e-production"))]
+fn recovery_fixture_resident(
     registry_identity: [u8; 32],
     registry_generation: u64,
-    shell: ShellControllerState,
-    jobs: JobDispatcher,
-    console: InstalledPeer,
+    e6: wyr1e::State,
     topology: RegistryTopology,
-    driver_request: DriverLaunchRequest,
-    enqueue_publication: E,
-) -> Result<E8RegistryRecoveryFixtureResult, InitError>
-where
-    S: Wyr1BPlatform,
-    L: LoaderPlatform<Error = NativeError>,
-    W: SupervisionPlatform<Error = NativeError>,
-    E: FnOnce(&mut S, DwHandle, &[u8]) -> Result<(), NativeError>,
-{
+    driver_request: Option<DriverLaunchRequest>,
+) -> Result<
+    (
+        ResidentSystemInit,
+        ActiveNativeRole,
+        Option<DriverNativeAttempt>,
+    ),
+    InitError,
+> {
     const REGISTRY_TRANSACTION: u64 = 0xE8B5_0001;
     const LAST_CONTROLLER_TRANSACTION: u64 = 9;
     const NEXT_CONTROLLER_TRANSACTION: u64 = 10;
@@ -3939,17 +3935,15 @@ where
         DwHandle(0xE8B5_0022),
         4,
     )?;
-    let registry =
-        registry_native_attempt_for_e8_fixture(registry_active, DwHandle(0xE8B5_0010), 3);
-    let driver = DriverNativeAttempt {
+    let registry = registry_native_attempt_for_fixture(registry_active, DwHandle(0xE8B5_0010), 3);
+    let driver = driver_request.map(|request| DriverNativeAttempt {
         loaded: LoadedProcess {
             process: E8_REGISTRY_FIXTURE_DRIVER_PROCESS,
             launch_channel: DwHandle(0xE8B5_0031),
         },
         task_group: DwHandle(0xE8B5_0032),
-        request: driver_request,
-    };
-    let e6 = wyr1e::State::from_e8_registry_fixture(shell, jobs, console);
+        request,
+    });
     let initial_binding = wyrmroot_device_proto::RegistryBinding {
         generation: RegistryGeneration(registry_generation),
         endpoint: RegistryEndpoint {
@@ -3957,7 +3951,7 @@ where
             generation: RegistryEndpointGeneration(1),
         },
     };
-    let mut resident = ResidentSystemInit {
+    let resident = ResidentSystemInit {
         controller,
         authority: LoadAuthority {
             parent_root: DwHandle(0xE8B5_0040),
@@ -3977,20 +3971,103 @@ where
             topology,
             devmgr: Some(devmgr),
             binding: Some(initial_binding),
-            publication_service_generation: driver_request.attempt_generation.0,
+            publication_service_generation: driver_request
+                .map_or(1, |request| request.attempt_generation.0),
             waiting_registry_observed: false,
             publication_allocator: PublicationAllocator::new(),
             last_controller_transaction: LAST_CONTROLLER_TRANSACTION,
             next_controller_transaction: NEXT_CONTROLLER_TRANSACTION,
-            driver: Some(driver),
+            driver,
             last_reaped_driver: None,
-            last_driver_attempt: driver_request.attempt_generation.0,
-            last_driver_session: driver_request.launch_session.0,
-            last_driver_endpoint: driver_request.endpoint.id.0,
-            last_driver_transaction: driver_request.transaction_id,
+            last_driver_attempt: driver_request.map_or(0, |request| request.attempt_generation.0),
+            last_driver_session: driver_request.map_or(0, |request| request.launch_session.0),
+            last_driver_endpoint: driver_request.map_or(0, |request| request.endpoint.id.0),
+            last_driver_transaction: driver_request.map_or(0, |request| request.transaction_id),
         }),
     };
 
+    Ok((resident, devmgr, driver))
+}
+
+/// Drives the product's ordinary registry recovery with no episode open.
+///
+/// Reset card R7E. A probe over the whole host suite found that
+/// `recover_registry`, `recover_devmgr` and `recover_devmgr_after_error` were
+/// reached by exactly one test -- the E8 producer fixture -- and only through a
+/// ShellJobs launch carrying a magic path and nonce. The *product's* recovery,
+/// the one R7B-1 made ordinary by giving the episode a budget instead of a
+/// selector, had no coverage at all.
+///
+/// This is that path: no trigger, no held WAIT, no shell. `recovery_deadline`
+/// answers `None`, so the episode arithmetic the selector opens is simply not
+/// entered, and what runs is registry retirement, relaunch, topology restart
+/// and publication rebinding.
+#[cfg(all(test, feature = "wyr1e-production"))]
+pub(crate) fn exercise_ordinary_registry_recovery<S, L, W>(
+    system: &mut S,
+    loader: &mut L,
+    waits: &mut W,
+    bootfs: &[u8],
+    registry_identity: [u8; 32],
+    registry_generation: u64,
+) -> Result<(RecoveryResult, u64, Option<RestartState>), InitError>
+where
+    S: Wyr1BPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let (mut resident, _devmgr, _driver) = recovery_fixture_resident(
+        registry_identity,
+        registry_generation,
+        wyr1e::State::new(registry_generation)?,
+        RegistryTopology::new(registry_generation).map_err(InitError::Wyr1BModel)?,
+        None,
+    )?;
+    recover_registry(&mut resident, system, loader, waits, bootfs, false, false)?;
+    let role = resident.controller.role_state(RoleId::Registryd);
+    let state = resident
+        .wyr1c
+        .as_ref()
+        .ok_or(InitError::WrongActivationOrder)?;
+    Ok((resident.result, state.topology.generation(), role))
+}
+
+/// Test-only bridge from the reached S3 held-WAIT state into the production
+/// registry-recovery orchestrator. The caller supplies real dispatcher-owned
+/// shell/job state; this function performs the actual dependent retirement,
+/// registry process retirement/relaunch, topology restart, devmgr WAIT/rebind,
+/// and current-driver publication observation before returning the surviving
+/// owners for the S4 evidence continuation.
+#[cfg(all(test, feature = "wyr1e8-selector33"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn exercise_e8_registry_recovery_orchestrator<S, L, W, E>(
+    system: &mut S,
+    loader: &mut L,
+    waits: &mut W,
+    bootfs: &[u8],
+    registry_identity: [u8; 32],
+    registry_generation: u64,
+    shell: ShellControllerState,
+    jobs: JobDispatcher,
+    console: InstalledPeer,
+    topology: RegistryTopology,
+    driver_request: DriverLaunchRequest,
+    enqueue_publication: E,
+) -> Result<E8RegistryRecoveryFixtureResult, InitError>
+where
+    S: Wyr1BPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+    E: FnOnce(&mut S, DwHandle, &[u8]) -> Result<(), NativeError>,
+{
+    let e6 = wyr1e::State::from_e8_registry_fixture(shell, jobs, console);
+    let (mut resident, devmgr, driver) = recovery_fixture_resident(
+        registry_identity,
+        registry_generation,
+        e6,
+        topology,
+        Some(driver_request),
+    )?;
     recover_registry(&mut resident, system, loader, waits, bootfs, false, true)?;
 
     let (client, grant, publication_generation) = resident
@@ -4038,7 +4115,7 @@ where
     );
     assert!(state.registry.is_some(), "replacement registry owner");
     assert_eq!(state.devmgr, Some(devmgr), "retained devmgr owner");
-    assert_eq!(state.driver, Some(driver), "retained driver owner");
+    assert_eq!(state.driver, driver, "retained driver owner");
     let e6 = state.e6.take().ok_or(InitError::WrongActivationOrder)?;
     assert!(
         e6.e8_fixture_publication_observer().is_none(),
