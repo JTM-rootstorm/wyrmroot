@@ -104,13 +104,6 @@ struct E8TriggerIdentity {
 
 #[cfg(feature = "wyr1e8-selector33")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct E8Trigger {
-    identity: E8TriggerIdentity,
-    deadline: u64,
-}
-
-#[cfg(feature = "wyr1e8-selector33")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct E8HeldWait {
     pub(crate) pending: PendingWait,
     pub(crate) identity: wyrmroot_consoled::e8_control::Identity,
@@ -127,6 +120,16 @@ pub(crate) struct ShellControllerState {
     last_console_generation: u64,
     last_status_generation: u64,
     last_child_generation: u64,
+    /// The deadline of the recovery episode in flight, if one is.
+    ///
+    /// R7B-1. Every recovery leg's own deadline is capped by this one and
+    /// every step refuses to proceed past it, so an episode cannot outlive its
+    /// budget by accumulating individually-legal legs. Nothing in the product
+    /// opens an episode yet, so product builds hold `None` here and behave
+    /// exactly as the removed `not(wyr1e8-selector33)` arms did: no cap, no
+    /// expiry. What was selector-specific was never the property, only the one
+    /// caller that asks for it.
+    recovery_deadline: Option<u64>,
     #[cfg(feature = "wyr1e-selector33")]
     evidence: crate::wyr1e7_evidence::Observer,
     #[cfg(feature = "wyr1e8-selector33")]
@@ -134,7 +137,7 @@ pub(crate) struct ShellControllerState {
     #[cfg(feature = "wyr1e8-selector33")]
     e8_console_control: Option<DwHandle>,
     #[cfg(feature = "wyr1e8-selector33")]
-    e8_trigger: Option<E8Trigger>,
+    e8_trigger: Option<E8TriggerIdentity>,
     #[cfg(feature = "wyr1e8-selector33")]
     e8_held: Option<E8HeldWait>,
 }
@@ -157,6 +160,7 @@ impl ShellControllerState {
             last_console_generation: 0,
             last_status_generation: 0,
             last_child_generation: 0,
+            recovery_deadline: None,
             #[cfg(feature = "wyr1e-selector33")]
             evidence: crate::wyr1e7_evidence::Observer::new()?,
             #[cfg(feature = "wyr1e8-selector33")]
@@ -279,7 +283,7 @@ impl ShellControllerState {
         if !self.e8_evidence.armed() {
             return Ok(());
         }
-        self.require_e8_action_live(system)?;
+        self.require_recovery_live(system)?;
         let ready_allowed = self.e8_ready_submission_allowed();
         let mut candidate = self.e8_evidence;
         if let Err(error) = candidate.stage_shell_tuple(tuple, |record| {
@@ -291,7 +295,7 @@ impl ShellControllerState {
             self.e8_evidence.abort_staged_ready();
             return Err(error);
         }
-        self.require_e8_action_live(system)?;
+        self.require_recovery_live(system)?;
         self.e8_evidence = candidate;
         self.finish_e8_action_if_ready(system)
     }
@@ -302,7 +306,7 @@ impl ShellControllerState {
         system: &mut S,
         ready: crate::wyr1e8_evidence::SerialReady,
     ) -> Result<(), InitError> {
-        self.require_e8_action_live(system)?;
+        self.require_recovery_live(system)?;
         let ready_allowed = self.e8_ready_submission_allowed();
         let mut candidate = self.e8_evidence;
         if let Err(error) = candidate.observe_serial_ready(ready, |record| {
@@ -314,7 +318,7 @@ impl ShellControllerState {
             self.e8_evidence.abort_staged_ready();
             return Err(error);
         }
-        self.require_e8_action_live(system)?;
+        self.require_recovery_live(system)?;
         self.e8_evidence = candidate;
         self.finish_e8_action_if_ready(system)
     }
@@ -324,7 +328,7 @@ impl ShellControllerState {
         let Some(trigger) = self.e8_trigger else {
             return true;
         };
-        let expected_stage = match trigger.identity.action {
+        let expected_stage = match trigger.action {
             E8RecoveryAction::Driver => 3,
             E8RecoveryAction::Registry => 4,
         };
@@ -386,7 +390,8 @@ impl ShellControllerState {
         match (trigger, accepted_deadline) {
             (Some(identity), Some(deadline))
                 if deadline != 0
-                    && self.e8_trigger == Some(E8Trigger { identity, deadline })
+                    && self.e8_trigger == Some(identity)
+                    && self.recovery_deadline == Some(deadline)
                     && self.e8_held.is_none() => {}
             (None, None) => {}
             _ => return Err(InitError::Accounting),
@@ -395,7 +400,7 @@ impl ShellControllerState {
         candidate.shell_jobs_transaction(request, response, handles, |record| {
             Self::submit_e8(system, record)
         })?;
-        self.require_e8_action_live(system)?;
+        self.require_recovery_live(system)?;
         self.e8_evidence = candidate;
         Ok(())
     }
@@ -410,14 +415,14 @@ impl ShellControllerState {
         if deadline == 0 || self.e8_trigger.is_some() || self.e8_held.is_some() {
             return Err(InitError::Accounting);
         }
-        self.e8_trigger = Some(E8Trigger {
-            identity: E8TriggerIdentity {
-                launch_transaction: request.reservation.transaction_id,
-                job_id,
-                action: request.action,
-            },
-            deadline,
+        self.e8_trigger = Some(E8TriggerIdentity {
+            launch_transaction: request.reservation.transaction_id,
+            job_id,
+            action: request.action,
         });
+        // The episode's budget and the trigger that opened it are set together
+        // and cleared together, so no caller can observe one without the other.
+        self.recovery_deadline = Some(deadline);
         Ok(())
     }
 
@@ -485,11 +490,10 @@ impl ShellControllerState {
         let Some(trigger) = self.e8_trigger else {
             return Ok(false);
         };
-        if pending.job_id != trigger.identity.job_id {
+        if pending.job_id != trigger.job_id {
             return Ok(false);
         }
         let expected_wait_transaction = trigger
-            .identity
             .launch_transaction
             .checked_add(1)
             .ok_or(InitError::Accounting)?;
@@ -510,7 +514,7 @@ impl ShellControllerState {
         let parsed =
             parse_launch_message(pending.request_bytes(), 0).map_err(|_| InitError::Accounting)?;
         if parsed.reservation != pending.reservation
-            || !matches!(parsed.message, LaunchMessage::Wait { job_id } if job_id == trigger.identity.job_id)
+            || !matches!(parsed.message, LaunchMessage::Wait { job_id } if job_id == trigger.job_id)
         {
             return Err(InitError::Accounting);
         }
@@ -523,13 +527,16 @@ impl ShellControllerState {
             status_generation: tuple.status_generation,
             shell_generation: tuple.shell_generation,
             outer_shell_job: tuple.outer_job_id,
-            trigger_job: trigger.identity.job_id,
+            trigger_job: trigger.job_id,
             trigger_wait_transaction: pending.reservation.transaction_id,
-            action: trigger.identity.action.control(),
+            action: trigger.action.control(),
             stage_nonce: self.e8_evidence.nonce(),
         };
         let now = system.now().map_err(InitError::Native)?;
-        if now >= trigger.deadline {
+        let deadline = self
+            .recovery_deadline
+            .ok_or(InitError::WrongActivationOrder)?;
+        if now >= deadline {
             return Err(InitError::Supervision);
         }
         let bytes = wyrmroot_consoled::e8_control::encode(
@@ -543,13 +550,13 @@ impl ShellControllerState {
             pending,
             identity,
             result,
-            deadline: trigger.deadline,
+            deadline,
             acknowledged: false,
         });
         system
             .send_channel(control, &bytes)
             .map_err(InitError::Native)?;
-        self.require_e8_action_live(system)?;
+        self.require_recovery_live(system)?;
         Ok(true)
     }
 
@@ -564,10 +571,9 @@ impl ShellControllerState {
         Ok(true)
     }
 
-    #[cfg(feature = "wyr1e8-selector33")]
-    pub(crate) fn e8_action_expired(&self, now: u64) -> bool {
-        self.e8_trigger
-            .is_some_and(|trigger| now >= trigger.deadline)
+    pub(crate) fn recovery_deadline_expired(&self, now: u64) -> bool {
+        self.recovery_deadline
+            .is_some_and(|deadline| now >= deadline)
     }
 
     #[cfg(feature = "wyr1e8-selector33")]
@@ -612,40 +618,49 @@ impl ShellControllerState {
         self.e8_held = None;
     }
 
+    /// Ends the episode: the trigger that opened it and the budget it was
+    /// given are cleared together. Every site that abandons an episode goes
+    /// through here, because clearing only one of the two would leave a
+    /// deadline that no trigger owns -- and `recovery_deadline_expired` would
+    /// then start failing legs for an episode that is over.
+    #[cfg(feature = "wyr1e8-selector33")]
+    fn close_recovery_episode(&mut self) {
+        self.e8_trigger = None;
+        self.recovery_deadline = None;
+    }
+
     #[cfg(feature = "wyr1e8-selector33")]
     pub(crate) fn e8_pending_action(&self) -> Option<E8RecoveryAction> {
-        self.e8_trigger.map(|trigger| trigger.identity.action)
+        self.e8_trigger.map(|trigger| trigger.action)
     }
 
-    #[cfg(feature = "wyr1e8-selector33")]
-    pub(crate) fn e8_action_deadline(&self) -> Option<u64> {
-        self.e8_trigger.map(|trigger| trigger.deadline)
+    pub(crate) fn recovery_deadline(&self) -> Option<u64> {
+        self.recovery_deadline
     }
 
-    #[cfg(feature = "wyr1e8-selector33")]
-    pub(crate) fn cap_e8_deadline(&self, deadline: u64) -> u64 {
-        self.e8_action_deadline()
-            .map_or(deadline, |action_deadline| deadline.min(action_deadline))
+    pub(crate) fn cap_recovery_deadline(&self, deadline: u64) -> u64 {
+        self.recovery_deadline
+            .map_or(deadline, |episode| deadline.min(episode))
     }
 
-    #[cfg(feature = "wyr1e8-selector33")]
-    pub(crate) fn require_e8_action_live_at(&self, now: u64) -> Result<(), InitError> {
-        if self.e8_action_expired(now) {
+    pub(crate) fn require_recovery_live_at(&self, now: u64) -> Result<(), InitError> {
+        if self.recovery_deadline_expired(now) {
             Err(InitError::Supervision)
         } else {
             Ok(())
         }
     }
 
-    #[cfg(feature = "wyr1e8-selector33")]
-    pub(crate) fn require_e8_action_live<S: Wyr1BPlatform>(
+    /// Reads the clock only when an episode is open, so a build with no
+    /// episode pays no syscall for the check.
+    pub(crate) fn require_recovery_live<S: Wyr1BPlatform>(
         &self,
         system: &mut S,
     ) -> Result<(), InitError> {
-        if self.e8_trigger.is_none() {
+        if self.recovery_deadline.is_none() {
             return Ok(());
         }
-        self.require_e8_action_live_at(system.now().map_err(InitError::Native)?)
+        self.require_recovery_live_at(system.now().map_err(InitError::Native)?)
     }
 
     #[cfg(feature = "wyr1e8-selector33")]
@@ -656,19 +671,19 @@ impl ShellControllerState {
         let Some(trigger) = self.e8_trigger else {
             return Ok(());
         };
-        self.require_e8_action_live(system)?;
+        self.require_recovery_live(system)?;
         if !self.e8_evidence.ready() {
             return Ok(());
         }
-        let expected_stage = match trigger.identity.action {
+        let expected_stage = match trigger.action {
             E8RecoveryAction::Driver => 3,
             E8RecoveryAction::Registry => 4,
         };
         if self.e8_evidence.stage() != expected_stage || self.e8_held.is_some() {
             return Err(InitError::WrongActivationOrder);
         }
-        self.require_e8_action_live(system)?;
-        self.e8_trigger = None;
+        self.require_recovery_live(system)?;
+        self.close_recovery_episode();
         Ok(())
     }
 
@@ -715,7 +730,7 @@ impl ShellControllerState {
         held: E8HeldWait,
         result: TerminationResult,
     ) -> Result<(), InitError> {
-        self.require_e8_action_live(system)?;
+        self.require_recovery_live(system)?;
         let mut candidate = self.e8_evidence;
         candidate.forced_retired(
             held.identity.trigger_wait_transaction,
@@ -723,7 +738,7 @@ impl ShellControllerState {
             result,
             |record| Self::submit_e8(system, record),
         )?;
-        self.require_e8_action_live(system)?;
+        self.require_recovery_live(system)?;
         self.e8_evidence = candidate;
         Ok(())
     }
@@ -3214,7 +3229,7 @@ where
     if let Err(error) = system.send_channel(session, &response[..size]) {
         #[cfg(feature = "wyr1e8-selector33")]
         if let Some(state) = e8_owner {
-            state.e8_trigger = None;
+            state.close_recovery_episode();
         }
         jobs.jobs.restore_launch_channel(release);
         let cleanup_failed = force_cleanup_job_before(
@@ -4096,7 +4111,7 @@ where
                         && evidence.as_deref().is_some_and(|state| {
                             state
                                 .e8_trigger
-                                .is_some_and(|trigger| trigger.identity.job_id == job_id)
+                                .is_some_and(|trigger| trigger.job_id == job_id)
                         })
                     {
                         // Completion before WAIT admission must use the same
@@ -4337,7 +4352,7 @@ where
     W: SupervisionPlatform<Error = NativeError>,
 {
     #[cfg(feature = "wyr1e8-selector33")]
-    context.state.require_e8_action_live(system)?;
+    context.state.require_recovery_live(system)?;
     if jobs.has_shell_session() {
         let failed = close_received_reverse(system, received, received.len());
         return Err(if failed {
@@ -4454,7 +4469,7 @@ where
         registry_client,
         registry_grant,
         #[cfg(feature = "wyr1e8-selector33")]
-        context.state.e8_action_deadline(),
+        context.state.recovery_deadline(),
         #[cfg(not(feature = "wyr1e8-selector33"))]
         None,
     ) {
@@ -4582,7 +4597,7 @@ where
     let ready_deadline = match report_deadline(system) {
         Ok(deadline) => {
             #[cfg(feature = "wyr1e8-selector33")]
-            let deadline = DwDeadline(context.state.cap_e8_deadline(deadline.0));
+            let deadline = DwDeadline(context.state.cap_recovery_deadline(deadline.0));
             deadline
         }
         Err(error) => {
@@ -4613,7 +4628,7 @@ where
         });
     }
     #[cfg(feature = "wyr1e8-selector33")]
-    if let Err(error) = context.state.require_e8_action_live(system) {
+    if let Err(error) = context.state.require_recovery_live(system) {
         let failed = cleanup_shell_before_publication(system, waits, jobs, loaded_job).is_err();
         context.state.poison(registry_grant.registry_generation);
         return Err(if failed { InitError::Cleanup } else { error });
@@ -4865,7 +4880,7 @@ where
             }
         };
         #[cfg(feature = "wyr1e8-selector33")]
-        if let Err(error) = shell.state.require_e8_action_live(system) {
+        if let Err(error) = shell.state.require_recovery_live(system) {
             shell.state.poison(shell.topology.generation());
             return Err(
                 if cleanup_shell_before_publication(system, waits, jobs, accepted.loaded).is_err() {
@@ -4895,7 +4910,7 @@ where
             );
         }
         #[cfg(feature = "wyr1e8-selector33")]
-        if let Err(error) = shell.state.require_e8_action_live(system) {
+        if let Err(error) = shell.state.require_recovery_live(system) {
             jobs.jobs.restore_launch_channel(release);
             shell.state.poison(shell.topology.generation());
             return Err(
@@ -5519,10 +5534,10 @@ pub(crate) fn finish_e8_dependent_retirement<S: Wyr1BPlatform>(
     held: E8HeldWait,
     result: TerminationResult,
 ) -> Result<(), InitError> {
-    shell.require_e8_action_live_at(system.now().map_err(InitError::Native)?)?;
+    shell.require_recovery_live_at(system.now().map_err(InitError::Native)?)?;
     jobs.remove_barrier_result(held.pending, held.result)
         .map_err(InitError::Wyr1BModel)?;
-    shell.require_e8_action_live_at(system.now().map_err(InitError::Native)?)?;
+    shell.require_recovery_live_at(system.now().map_err(InitError::Native)?)?;
     shell.record_e8_forced_retired(system, held, result)?;
     shell.consume_e8_held(held);
     Ok(())
@@ -8827,7 +8842,7 @@ mod tests {
             Some(25 + WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns)
         );
         assert_eq!(platform.sent.len(), 1);
-        assert_eq!(state.e8_action_deadline(), sent.e8_deadline);
+        assert_eq!(state.recovery_deadline(), sent.e8_deadline);
     }
 
     #[cfg(feature = "wyr1e8-selector33")]
@@ -10383,14 +10398,12 @@ mod tests {
             )
             .unwrap();
         state.set_e8_console_control(DwHandle(20)).unwrap();
-        state.e8_trigger = Some(E8Trigger {
-            identity: E8TriggerIdentity {
-                launch_transaction,
-                job_id: 12,
-                action: E8RecoveryAction::Driver,
-            },
-            deadline: 200,
+        state.e8_trigger = Some(E8TriggerIdentity {
+            launch_transaction,
+            job_id: 12,
+            action: E8RecoveryAction::Driver,
         });
+        state.recovery_deadline = Some(200);
         state
     }
 
@@ -10440,9 +10453,9 @@ mod tests {
             reap_job(&mut platform, &mut waits, &mut jobs, loaded).unwrap();
             let mut state = e8_state_for_held_wait(40);
             let trigger = state.e8_trigger.as_mut().unwrap();
-            trigger.identity.job_id = launched.job_id;
-            trigger.identity.action = action;
-            let deadline = trigger.deadline;
+            trigger.job_id = launched.job_id;
+            trigger.action = action;
+            let deadline = state.recovery_deadline.unwrap();
             let wait = reservation(41);
             let ticket = jobs.jobs.reserve_request(wait).unwrap();
             let mut request = [0u8; 56];
@@ -10561,7 +10574,7 @@ mod tests {
             Err(InitError::Supervision)
         );
         assert!(state.e8_held.is_some());
-        assert_eq!(state.e8_action_deadline(), Some(200));
+        assert_eq!(state.recovery_deadline(), Some(200));
         assert_eq!(platform.sent.len(), 1);
     }
 
@@ -10569,16 +10582,16 @@ mod tests {
     #[test]
     fn e8_action_keeps_its_deadline_across_preheld_held_and_recovery_states() {
         let mut state = e8_state_for_held_wait(40);
-        assert_eq!(state.e8_action_deadline(), Some(200));
+        assert_eq!(state.recovery_deadline(), Some(200));
         assert!(state.job_dispatcher_poll_allowed());
         assert!(!state.routine_console_relaunch_allowed());
-        assert!(!state.e8_action_expired(199));
-        assert!(state.e8_action_expired(200));
+        assert!(!state.recovery_deadline_expired(199));
+        assert!(state.recovery_deadline_expired(200));
         assert_eq!(
-            state.require_e8_action_live_at(200),
+            state.require_recovery_live_at(200),
             Err(InitError::Supervision)
         );
-        assert_eq!(state.cap_e8_deadline(250), 200);
+        assert_eq!(state.cap_recovery_deadline(250), 200);
 
         let mut platform = MockPlatform::new();
         platform.fail_send = false;
@@ -10607,7 +10620,7 @@ mod tests {
         state.consume_e8_held(taken);
         assert!(state.job_dispatcher_poll_allowed());
         assert!(!state.routine_console_relaunch_allowed());
-        assert_eq!(state.e8_action_deadline(), Some(200));
+        assert_eq!(state.recovery_deadline(), Some(200));
         assert_eq!(state.e8_pending_action(), Some(E8RecoveryAction::Driver));
 
         let mut delayed = e8_state_for_held_wait(40);
@@ -10622,7 +10635,7 @@ mod tests {
             ),
             Err(InitError::Supervision)
         );
-        assert_eq!(delayed.e8_action_deadline(), Some(200));
+        assert_eq!(delayed.recovery_deadline(), Some(200));
         assert_eq!(delayed.e8_held, None);
         assert_eq!(delayed_platform.sent_len, 0);
     }
@@ -10631,7 +10644,7 @@ mod tests {
     #[test]
     fn e8_ready_evidence_crossing_deadline_retains_the_pending_action() {
         let mut state = e8_state_for_held_wait(40);
-        state.e8_trigger = None;
+        state.close_recovery_episode();
         let mut platform = ShellPlatform::new();
 
         let wait = reservation(30);
@@ -10705,14 +10718,12 @@ mod tests {
                 },
             )
             .unwrap();
-        state.e8_trigger = Some(E8Trigger {
-            identity: E8TriggerIdentity {
-                launch_transaction: 40,
-                job_id: 12,
-                action: E8RecoveryAction::Driver,
-            },
-            deadline: 200,
+        state.e8_trigger = Some(E8TriggerIdentity {
+            launch_transaction: 40,
+            job_id: 12,
+            action: E8RecoveryAction::Driver,
         });
+        state.recovery_deadline = Some(200);
         platform.now = 199;
         state
             .hold_e8_wait(&mut platform, e8_pending_wait(41), e8_normal_result())
@@ -10788,7 +10799,7 @@ mod tests {
             state.observe_e8_serial_ready(&mut platform, ready),
             Err(InitError::Supervision)
         );
-        assert_eq!(state.e8_action_deadline(), Some(200));
+        assert_eq!(state.recovery_deadline(), Some(200));
         assert_eq!(state.e8_pending_action(), Some(E8RecoveryAction::Driver));
         assert_eq!(state.e8_stage(), 3);
         assert!(state.e8_tuple_waiting_for_serial());

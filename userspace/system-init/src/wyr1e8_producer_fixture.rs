@@ -704,14 +704,17 @@ fn actual_driver_and_registry_recovery_compose_through_s4_ready() {
     assert_eq!(platform.e8_evidence.len(), 22);
     assert_eq!(
         context.state.e8_trigger,
-        Some(E8Trigger {
-            identity: E8TriggerIdentity {
-                launch_transaction: reservation.transaction_id,
-                job_id: loaded.job_id,
-                action: E8RecoveryAction::Driver,
-            },
-            deadline: 10 + WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns,
+        Some(E8TriggerIdentity {
+            launch_transaction: reservation.transaction_id,
+            job_id: loaded.job_id,
+            action: E8RecoveryAction::Driver,
         })
+    );
+    // The episode's budget is now ordinary supervision state, so assert it
+    // where it lives rather than inside the trigger.
+    assert_eq!(
+        context.state.recovery_deadline(),
+        Some(10 + WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns)
     );
 
     let accepted_request = request[..request_len].to_vec();
@@ -1031,15 +1034,13 @@ fn actual_driver_and_registry_recovery_compose_through_s4_ready() {
     assert_eq!(platform.e8_evidence.len(), 25);
     assert!(matches!(
         context.state.e8_trigger,
-        Some(E8Trigger {
-            identity: E8TriggerIdentity {
-                launch_transaction: 1,
-                job_id,
-                action: E8RecoveryAction::Registry,
-            },
-            ..
+        Some(E8TriggerIdentity {
+            launch_transaction: 1,
+            job_id,
+            action: E8RecoveryAction::Registry,
         }) if job_id == registry_actor.job_id
     ));
+    assert!(context.state.recovery_deadline().is_some());
 
     let registry_wait = transaction(s3_grant, 2);
     let mut registry_wait_request = [0u8; 56];

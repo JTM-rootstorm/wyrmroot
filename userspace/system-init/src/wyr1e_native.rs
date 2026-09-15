@@ -215,14 +215,12 @@ where
         return Err(InitError::WrongActivationOrder);
     }
     let started_at = system.now().map_err(InitError::Native)?;
-    #[cfg(feature = "wyr1e8-selector33")]
-    e6.shell.require_e8_action_live_at(started_at)?;
+    e6.shell.require_recovery_live_at(started_at)?;
     let operation = e6.take_publication_observer()?;
     let deadline = started_at
         .checked_add(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
         .ok_or(InitError::Accounting)?;
-    #[cfg(feature = "wyr1e8-selector33")]
-    let deadline = e6.shell.cap_e8_deadline(deadline);
+    let deadline = e6.shell.cap_recovery_deadline(deadline);
     if deadline == u64::MAX {
         return Err(InitError::Accounting);
     }
@@ -234,7 +232,7 @@ where
     #[cfg(feature = "wyr1e8-selector33")]
     if let Err(error) = e6
         .shell
-        .require_e8_action_live_at(system.now().map_err(InitError::Native)?)
+        .require_recovery_live_at(system.now().map_err(InitError::Native)?)
     {
         let failed =
             system.close_handle(registry_endpoint).is_err() | system.close_handle(client).is_err();
@@ -258,7 +256,7 @@ where
     #[cfg(feature = "wyr1e8-selector33")]
     if let Err(error) = e6
         .shell
-        .require_e8_action_live_at(system.now().map_err(InitError::Native)?)
+        .require_recovery_live_at(system.now().map_err(InitError::Native)?)
     {
         e6.shell.poison(grant.registry_generation);
         return Err(if system.close_handle(client).is_err() {
@@ -290,7 +288,7 @@ where
     #[cfg(feature = "wyr1e8-selector33")]
     if let Err(error) = e6
         .shell
-        .require_e8_action_live_at(system.now().map_err(InitError::Native)?)
+        .require_recovery_live_at(system.now().map_err(InitError::Native)?)
     {
         e6.shell.poison(grant.registry_generation);
         return Err(if system.close_handle(client).is_err() {
@@ -377,7 +375,7 @@ where
     }
     #[cfg(feature = "wyr1e8-selector33")]
     e6.shell
-        .require_e8_action_live_at(system.now().map_err(InitError::Native)?)?;
+        .require_recovery_live_at(system.now().map_err(InitError::Native)?)?;
     let image = Archive::new(bootfs)
         .map_err(InitError::Bootfs)?
         .lookup(CONSOLE_PATH.as_bytes())
@@ -405,7 +403,7 @@ where
     #[cfg(feature = "wyr1e8-selector33")]
     if let Err(error) = e6
         .shell
-        .require_e8_action_live_at(system.now().map_err(InitError::Native)?)
+        .require_recovery_live_at(system.now().map_err(InitError::Native)?)
     {
         let failed = system.close_handle(registry_endpoint).is_err()
             | system.close_handle(child_registry).is_err()
@@ -427,7 +425,7 @@ where
     #[cfg(feature = "wyr1e8-selector33")]
     if let Err(error) = e6
         .shell
-        .require_e8_action_live_at(system.now().map_err(InitError::Native)?)
+        .require_recovery_live_at(system.now().map_err(InitError::Native)?)
     {
         e6.shell.poison(topology.generation());
         let failed =
@@ -462,7 +460,7 @@ where
     #[cfg(feature = "wyr1e8-selector33")]
     if let Err(error) = e6
         .shell
-        .require_e8_action_live_at(system.now().map_err(InitError::Native)?)
+        .require_recovery_live_at(system.now().map_err(InitError::Native)?)
     {
         e6.shell.poison(topology.generation());
         let failed = e6
@@ -516,16 +514,11 @@ where
         }
     };
     let ready_deadline = match system.now().map_err(InitError::Native).and_then(|now| {
-        #[cfg(feature = "wyr1e8-selector33")]
-        e6.shell.require_e8_action_live_at(now)?;
+        e6.shell.require_recovery_live_at(now)?;
         now.checked_add(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
             .ok_or(InitError::Accounting)
     }) {
-        Ok(deadline) => {
-            #[cfg(feature = "wyr1e8-selector33")]
-            let deadline = e6.shell.cap_e8_deadline(deadline);
-            deadline
-        }
+        Ok(deadline) => e6.shell.cap_recovery_deadline(deadline),
         Err(error) => {
             e6.shell.poison(topology.generation());
             let failed = cleanup_loaded(system, waits, loaded, group, true).is_err()
@@ -705,16 +698,15 @@ where
             });
         }
     };
-    #[cfg(feature = "wyr1e8-selector33")]
-    if e6.shell.e8_action_expired(validated_at) {
+    if e6.shell.recovery_deadline_expired(validated_at) {
         let cleanup = clear_publication_observer(e6, system, registry_generation, false);
         return if cleanup.is_err() {
             Err(InitError::Cleanup)
         } else {
-            e8_operation(
-                E8FailureOperation::RebindPublication,
-                Err(InitError::Supervision),
-            )
+            let expired = Err(InitError::Supervision);
+            #[cfg(feature = "wyr1e8-selector33")]
+            let expired = e8_operation(E8FailureOperation::RebindPublication, expired);
+            expired
         };
     }
     if let Err(outcome) =
@@ -869,7 +861,7 @@ where
     W: SupervisionPlatform<Error = NativeError>,
 {
     #[cfg(feature = "wyr1e8-selector33")]
-    ensure_e8_action_live(resident, now)?;
+    ensure_recovery_live(resident, now)?;
     let publication = poll_publication_observer(resident, system, waits, now);
     #[cfg(feature = "wyr1e8-selector33")]
     let publication = e8_operation(E8FailureOperation::RebindPublication, publication);
@@ -1011,7 +1003,7 @@ where
                     let quiesced_at = system.now().map_err(InitError::Native)?;
                     e8_operation(
                         E8FailureOperation::Quiesced,
-                        e6.shell.require_e8_action_live_at(quiesced_at),
+                        e6.shell.require_recovery_live_at(quiesced_at),
                     )?;
                     let action = e8_operation(
                         E8FailureOperation::Quiesced,
@@ -1022,7 +1014,7 @@ where
                     }
                     e8_operation(
                         E8FailureOperation::RequestRetire,
-                        e6.shell.require_e8_action_live(system),
+                        e6.shell.require_recovery_live(system),
                     )?;
                     e8_operation(
                         E8FailureOperation::RequestRetire,
@@ -1047,7 +1039,7 @@ where
                     )?;
                     e8_operation(
                         E8FailureOperation::RequestRetire,
-                        e6.shell.require_e8_action_live(system),
+                        e6.shell.require_recovery_live(system),
                     )?;
                     return Ok(PollOutcome::Stable);
                 }
@@ -1083,12 +1075,11 @@ where
         };
         if validated_at >= e6.ready_deadline {
             retire_current_console(e6, system, waits, state.topology.generation(), true)?;
-            #[cfg(feature = "wyr1e8-selector33")]
-            if e6.shell.e8_action_expired(validated_at) {
-                return e8_operation(
-                    E8FailureOperation::ActionDeadline,
-                    Err(InitError::Supervision),
-                );
+            if e6.shell.recovery_deadline_expired(validated_at) {
+                let expired = Err(InitError::Supervision);
+                #[cfg(feature = "wyr1e8-selector33")]
+                let expired = e8_operation(E8FailureOperation::ActionDeadline, expired);
+                return expired;
             }
             return Ok(PollOutcome::RecoverRegistry);
         }
@@ -1103,19 +1094,25 @@ where
     Ok(PollOutcome::RecoverRegistry)
 }
 
-#[cfg(feature = "wyr1e8-selector33")]
-pub(super) fn e8_action_deadline(resident: &ResidentSystemInit) -> Result<Option<u64>, InitError> {
+/// The deadline of the recovery episode in flight, if one is open.
+///
+/// Ordinary supervision state since R7B-1. A build that never opens an episode
+/// reads `None` here, which is what the removed `not(wyr1e8-selector33)` arms
+/// wrote by hand at every call site.
+pub(super) fn recovery_deadline(resident: &ResidentSystemInit) -> Result<Option<u64>, InitError> {
     Ok(resident
         .wyr1c
         .as_ref()
         .and_then(|state| state.e6.as_ref())
         .ok_or(InitError::WrongActivationOrder)?
         .shell
-        .e8_action_deadline())
+        .recovery_deadline())
 }
 
-#[cfg(feature = "wyr1e8-selector33")]
-pub(super) fn ensure_e8_action_live(
+/// Refuses to continue a recovery leg once its episode's budget has passed.
+///
+/// With no episode open this is `Ok(())` without reading the clock.
+pub(super) fn ensure_recovery_live(
     resident: &ResidentSystemInit,
     now: u64,
 ) -> Result<(), InitError> {
@@ -1124,10 +1121,12 @@ pub(super) fn ensure_e8_action_live(
         .as_ref()
         .and_then(|state| state.e6.as_ref())
         .ok_or(InitError::WrongActivationOrder)?;
-    e8_operation(
-        E8FailureOperation::ActionDeadline,
-        state.shell.require_e8_action_live_at(now),
-    )
+    let live = state.shell.require_recovery_live_at(now);
+    // The cause tag stays selector-gated: carrying which leg failed is class C
+    // of the R7A inventory and is R7B's next increment, not this one.
+    #[cfg(feature = "wyr1e8-selector33")]
+    let live = e8_operation(E8FailureOperation::ActionDeadline, live);
+    live
 }
 
 fn retire_current_console<S, W>(
@@ -1199,8 +1198,8 @@ where
     #[cfg(feature = "wyr1e8-selector33")]
     if let Some(held) = held {
         e6.shell
-            .require_e8_action_live_at(system.now().map_err(InitError::Native)?)?;
-        if held.deadline != e6.shell.e8_action_deadline().ok_or(InitError::Accounting)? {
+            .require_recovery_live_at(system.now().map_err(InitError::Native)?)?;
+        if held.deadline != e6.shell.recovery_deadline().ok_or(InitError::Accounting)? {
             return Err(InitError::Accounting);
         }
     }

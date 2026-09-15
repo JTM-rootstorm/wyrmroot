@@ -72,10 +72,7 @@ where
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
-    #[cfg(feature = "wyr1e8-selector33")]
-    let deadline_cap = super::wyr1e::e8_action_deadline(resident)?;
-    #[cfg(not(feature = "wyr1e8-selector33"))]
-    let deadline_cap = None;
+    let deadline_cap = super::wyr1e::recovery_deadline(resident)?;
     if deadline_cap.is_some_and(|deadline| system.now().map_or(true, |now| now >= deadline)) {
         return Err(InitError::Supervision);
     }
@@ -353,7 +350,7 @@ where
         e8_deadline: state
             .e6
             .as_ref()
-            .and_then(|e6| e6.shell.e8_action_deadline()),
+            .and_then(|e6| e6.shell.recovery_deadline()),
     };
     let d5 = state.d5.as_mut().ok_or(InitError::WrongActivationOrder)?;
     poll_inner(d5, context, system, loader, waits, now)
@@ -675,10 +672,7 @@ pub(super) fn tx_drained<S: InitPlatform>(
     system: &mut S,
     identity: D5DrainIdentity,
 ) -> Result<(), InitError> {
-    #[cfg(feature = "wyr1e8-selector33")]
-    let deadline_cap = super::wyr1e::e8_action_deadline(resident)?;
-    #[cfg(not(feature = "wyr1e8-selector33"))]
-    let deadline_cap = None;
+    let deadline_cap = super::wyr1e::recovery_deadline(resident)?;
     let observed_now = system.now().map_err(InitError::Native)?;
     if deadline_cap.is_some_and(|deadline| observed_now >= deadline) {
         return Err(InitError::Supervision);

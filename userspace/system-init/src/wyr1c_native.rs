@@ -1868,9 +1868,12 @@ where
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
-    #[cfg(feature = "wyr1e8-selector33")]
-    let action_deadline = wyr1e::e8_action_deadline(resident)?;
-    #[cfg(not(feature = "wyr1e8-selector33"))]
+    // The recovery episode lives on the wyr1e console/shell supervisor, so
+    // a build without that product has no episode rather than no concept of
+    // one. The gate is the product, not a selector.
+    #[cfg(feature = "wyr1e-production")]
+    let action_deadline = wyr1e::recovery_deadline(resident)?;
+    #[cfg(not(feature = "wyr1e-production"))]
     let action_deadline = None;
     if action_deadline.is_some_and(|deadline| system.now().map_or(true, |now| now >= deadline)) {
         system
@@ -1951,9 +1954,9 @@ where
         }
     };
 
-    #[cfg(feature = "wyr1e8-selector33")]
+    #[cfg(feature = "wyr1e-production")]
     if let Err(error) =
-        wyr1e::ensure_e8_action_live(resident, system.now().map_err(InitError::Native)?)
+        wyr1e::ensure_recovery_live(resident, system.now().map_err(InitError::Native)?)
     {
         let cleanup_failed =
             cleanup_loaded_before(system, waits, loaded, task_group, true, action_deadline)
@@ -3063,8 +3066,8 @@ where
         return Err(InitError::WrongActivationOrder);
     }
     resident.last_tick_ns = now_ns;
-    #[cfg(feature = "wyr1e8-selector33")]
-    wyr1e::ensure_e8_action_live(resident, now_ns)?;
+    #[cfg(feature = "wyr1e-production")]
+    wyr1e::ensure_recovery_live(resident, now_ns)?;
     let state = resident
         .wyr1c
         .as_ref()
@@ -3368,7 +3371,7 @@ where
                             dependent_retirement?;
                             #[cfg(feature = "wyr1e8-selector33")]
                             let _request = {
-                                let deadline = wyr1e::e8_action_deadline(resident)?;
+                                let deadline = wyr1e::recovery_deadline(resident)?;
                                 reap_driver_before(resident, system, waits, false, deadline)
                             };
                             #[cfg(not(feature = "wyr1e8-selector33"))]
@@ -3379,8 +3382,7 @@ where
                             let _request = _request?;
                             #[cfg(feature = "wyr1e-production")]
                             {
-                                #[cfg(feature = "wyr1e8-selector33")]
-                                wyr1e::ensure_e8_action_live(
+                                wyr1e::ensure_recovery_live(
                                     resident,
                                     system.now().map_err(InitError::Native)?,
                                 )?;
@@ -3399,8 +3401,7 @@ where
                                     acknowledged,
                                 );
                                 acknowledged?;
-                                #[cfg(feature = "wyr1e8-selector33")]
-                                wyr1e::ensure_e8_action_live(
+                                wyr1e::ensure_recovery_live(
                                     resident,
                                     system.now().map_err(InitError::Native)?,
                                 )?;
@@ -3551,7 +3552,7 @@ where
             if matches!(
                 outcome,
                 wyr1e::PollOutcome::RecoverDevmgr | wyr1e::PollOutcome::RecoverRegistry
-            ) && wyr1e::e8_action_deadline(resident)?.is_some()
+            ) && wyr1e::recovery_deadline(resident)?.is_some()
             {
                 return e8_operation(
                     E8FailureOperation::RecoveryFallback,
@@ -3615,17 +3616,20 @@ where
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
-    #[cfg(feature = "wyr1e8-selector33")]
-    let action_deadline = wyr1e::e8_action_deadline(resident)?;
-    #[cfg(not(feature = "wyr1e8-selector33"))]
+    // The recovery episode lives on the wyr1e console/shell supervisor, so
+    // a build without that product has no episode rather than no concept of
+    // one. The gate is the product, not a selector.
+    #[cfg(feature = "wyr1e-production")]
+    let action_deadline = wyr1e::recovery_deadline(resident)?;
+    #[cfg(not(feature = "wyr1e-production"))]
     let action_deadline = None;
     #[cfg(feature = "wyr1e8-selector33")]
     if action_deadline.is_some() && !_e8_quiesced {
         return Err(InitError::Supervision);
     }
-    #[cfg(feature = "wyr1e8-selector33")]
+    #[cfg(feature = "wyr1e-production")]
     if action_deadline.is_some() {
-        wyr1e::ensure_e8_action_live(resident, system.now().map_err(InitError::Native)?)?;
+        wyr1e::ensure_recovery_live(resident, system.now().map_err(InitError::Native)?)?;
     }
     #[cfg(feature = "dw1e3-selector31")]
     if let Some(child_cleanup_failed) = fail_closed_e3a_recovery(resident, system, waits) {
@@ -3712,9 +3716,9 @@ where
         }
         RegistryRecoveryStep::Restart | RegistryRecoveryStep::AwaitStatus => {}
     }
-    #[cfg(feature = "wyr1e8-selector33")]
+    #[cfg(feature = "wyr1e-production")]
     if action_deadline.is_some() {
-        wyr1e::ensure_e8_action_live(resident, system.now().map_err(InitError::Native)?)?;
+        wyr1e::ensure_recovery_live(resident, system.now().map_err(InitError::Native)?)?;
     }
     #[cfg(feature = "wyr1e8-selector33")]
     let replacement = if let Some(deadline) = action_deadline {
@@ -3759,10 +3763,10 @@ where
         }
         return Ok(());
     };
-    #[cfg(feature = "wyr1e8-selector33")]
+    #[cfg(feature = "wyr1e-production")]
     if action_deadline.is_some()
         && let Err(error) =
-            wyr1e::ensure_e8_action_live(resident, system.now().map_err(InitError::Native)?)
+            wyr1e::ensure_recovery_live(resident, system.now().map_err(InitError::Native)?)
     {
         let cleanup = poison_registry_generation_before(
             system,
@@ -3773,7 +3777,12 @@ where
             action_deadline,
         );
         return if cleanup.is_err() {
-            e8_operation(E8FailureOperation::LaunchRegistry, Err(InitError::Cleanup))
+            let failed: Result<(), InitError> = Err(InitError::Cleanup);
+            // Which leg failed is class C of the R7A inventory, so the tag
+            // stays selector-gated while the deadline check above does not.
+            #[cfg(feature = "wyr1e8-selector33")]
+            let failed = e8_operation(E8FailureOperation::LaunchRegistry, failed);
+            failed
         } else {
             Err(error)
         };
@@ -4121,7 +4130,7 @@ where
 {
     let result = wyr1e::start_after_driver_constructed(resident, system);
     #[cfg(feature = "wyr1e8-selector33")]
-    if result.is_err() && wyr1e::e8_action_deadline(resident)?.is_some() {
+    if result.is_err() && wyr1e::recovery_deadline(resident)?.is_some() {
         return result;
     }
     match result {
@@ -4147,7 +4156,7 @@ where
     W: SupervisionPlatform<Error = NativeError>,
 {
     #[cfg(feature = "wyr1e8-selector33")]
-    if wyr1e::e8_action_deadline(resident)?.is_some() {
+    if wyr1e::recovery_deadline(resident)?.is_some() {
         return Err(error);
     }
     #[cfg(not(feature = "wyr1e8-selector33"))]
@@ -4227,7 +4236,7 @@ where
     W: SupervisionPlatform<Error = NativeError>,
 {
     #[cfg(feature = "wyr1e8-selector33")]
-    if wyr1e::e8_action_deadline(resident)?.is_some() {
+    if wyr1e::recovery_deadline(resident)?.is_some() {
         return Err(InitError::Supervision);
     }
     #[cfg(feature = "dw1e3-selector31")]
@@ -4595,9 +4604,12 @@ where
     S: Wyr1BPlatform,
     W: SupervisionPlatform<Error = NativeError>,
 {
-    #[cfg(feature = "wyr1e8-selector33")]
-    let deadline_cap = wyr1e::e8_action_deadline(resident)?;
-    #[cfg(not(feature = "wyr1e8-selector33"))]
+    // The recovery episode lives on the wyr1e console/shell supervisor, so
+    // a build without that product has no episode rather than no concept of
+    // one. The gate is the product, not a selector.
+    #[cfg(feature = "wyr1e-production")]
+    let deadline_cap = wyr1e::recovery_deadline(resident)?;
+    #[cfg(not(feature = "wyr1e-production"))]
     let deadline_cap = None;
     let state = resident
         .wyr1c

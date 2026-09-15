@@ -214,16 +214,16 @@ fn driver_exit_uses_the_reached_production_owner_order() {
 
 #[test]
 fn supervision_discriminator_stays_at_the_three_existing_failure_sources() {
-    let guard = &NATIVE[NATIVE.find("pub(super) fn ensure_e8_action_live(").unwrap()
+    let guard = &NATIVE[NATIVE.find("pub(super) fn ensure_recovery_live(").unwrap()
         ..NATIVE.find("fn retire_current_console<").unwrap()];
     assert!(guard.contains("E8FailureOperation::ActionDeadline"));
-    assert!(guard.contains("state.shell.require_e8_action_live_at(now)"));
+    assert!(guard.contains("state.shell.require_recovery_live_at(now)"));
     assert!(!guard.contains("E8FailureOperation::Quiesced"));
 
     let late_ready_start = NATIVE.find("if validated_at >= e6.ready_deadline").unwrap();
     let late_ready = &NATIVE[late_ready_start..];
     let late_ready = &late_ready[..late_ready.find("e6.awaiting_ready = false;").unwrap()];
-    assert!(late_ready.contains("e6.shell.e8_action_expired(validated_at)"));
+    assert!(late_ready.contains("e6.shell.recovery_deadline_expired(validated_at)"));
     assert!(late_ready.contains("E8FailureOperation::ActionDeadline"));
     assert!(!late_ready.contains("E8FailureOperation::Quiesced"));
 
@@ -234,7 +234,7 @@ fn supervision_discriminator_stays_at_the_three_existing_failure_sources() {
             .find("if wyrmroot_loader::launch::parse_ready_for_profile")
             .unwrap()];
     assert_eq!(response.matches("E8FailureOperation::Quiesced").count(), 4);
-    assert!(response.contains("e6.shell.require_e8_action_live_at(quiesced_at)"));
+    assert!(response.contains("e6.shell.require_recovery_live_at(quiesced_at)"));
     assert!(response.contains("e6.shell.accept_e8_quiesced(identity, quiesced_at)"));
     assert!(!response.contains("E8FailureOperation::ActionDeadline"));
     assert!(!response.contains("E8FailureOperation::RecoveryFallback"));
@@ -247,7 +247,7 @@ fn supervision_discriminator_stays_at_the_three_existing_failure_sources() {
         fallback
             .contains("wyr1e::PollOutcome::RecoverDevmgr | wyr1e::PollOutcome::RecoverRegistry")
     );
-    assert!(fallback.contains("wyr1e::e8_action_deadline(resident)?.is_some()"));
+    assert!(fallback.contains("wyr1e::recovery_deadline(resident)?.is_some()"));
     assert!(fallback.contains("E8FailureOperation::RecoveryFallback"));
     assert!(fallback.contains("Err(InitError::Supervision)"));
     assert!(!fallback.contains("E8FailureOperation::Quiesced"));
@@ -277,7 +277,7 @@ fn registry_recovery_phase_failures_are_wrapped_at_existing_boundaries() {
             "e8_operation(E8FailureOperation::{operation}, {binding})"
         )));
     }
-    assert_eq!(recovery.matches("wyr1e::ensure_e8_action_live(").count(), 3);
+    assert_eq!(recovery.matches("wyr1e::ensure_recovery_live(").count(), 3);
     let console_start = &RESIDENT[RESIDENT
         .find("wyr1e::PollOutcome::LaunchConsole =>")
         .unwrap()
@@ -306,7 +306,7 @@ fn registry_episode_admission_is_only_for_live_quiesced_coordinated_recovery() {
     let quiesced = recovery
         .find("action_deadline.is_some() && !_e8_quiesced")
         .unwrap();
-    let live = recovery.find("wyr1e::ensure_e8_action_live(").unwrap();
+    let live = recovery.find("wyr1e::ensure_recovery_live(").unwrap();
     let dependents = recovery.find("wyr1e::retire_dependents(").unwrap();
     let admission = recovery
         .find("retire_registry_for_recovery_before(")
@@ -415,4 +415,36 @@ fn publication_rebind_joins_use_exact_lifecycle_postconditions_and_a_real_produc
     let fixture = include_str!("../src/wyr1e8_producer_fixture.rs");
     assert!(fixture.contains("producer.publication_acknowledgement().unwrap()"));
     assert!(!fixture.contains("OperationalWaitingForDeviceBundle"));
+}
+
+/// R7B-1's invariant: a recovery episode's budget never outlives the trigger
+/// that opened it.
+///
+/// The deadline became ordinary supervision state while the trigger stayed
+/// selector-gated, which put the two in separate fields. Clearing only the
+/// trigger would leave a deadline nothing owns, and `recovery_deadline_expired`
+/// would then start failing ordinary legs against a window that had already
+/// closed. During the split one abandon site -- the rollback taken when the
+/// ACCEPTED reply cannot be sent -- did exactly that, and no test caught it.
+/// So pin the shape instead of the symptom: both fields are written in exactly
+/// one place each outside construction, and that place is the helper.
+#[test]
+fn a_recovery_episodes_budget_is_cleared_with_the_trigger_that_opened_it() {
+    assert_eq!(JOBS.matches("self.e8_trigger = None;").count(), 1);
+    assert_eq!(JOBS.matches("self.recovery_deadline = None;").count(), 1);
+    let close = JOBS
+        .find("fn close_recovery_episode(&mut self) {")
+        .expect("the episode still ends in one helper");
+    let body = &JOBS[close..close + JOBS[close..].find("\n    }\n").unwrap()];
+    assert!(body.contains("self.e8_trigger = None;"));
+    assert!(body.contains("self.recovery_deadline = None;"));
+
+    // No other site may clear either half on its own.
+    for stray in [".e8_trigger = None", ".recovery_deadline = None"] {
+        assert_eq!(
+            JOBS.matches(stray).count(),
+            1,
+            "an abandon site clears {stray} outside close_recovery_episode"
+        );
+    }
 }
