@@ -5503,8 +5503,8 @@ where
 /// This is the gate. It polls the same two handles the observation will wait
 /// on, with an already-passed deadline, so it cannot block:
 ///
-/// - something signalled -- READY, peer close, or exit -- so the observation
-///   will find it immediately, and the launch is finished now;
+/// - something signalled that the observation can act on without waiting again
+///   -- a READY message, or the child's exit -- so the launch is finished now;
 /// - nothing signalled and the budget is spent, so the launch is failed here
 ///   without observing at all. Handing the spent deadline back to
 ///   `observe_prepared_ready` and letting its own `wait_many` time out would
@@ -5544,10 +5544,29 @@ fn parked_launch_disposition<S: Wyr1BPlatform>(
         .ready_deadline(token)
         .map_err(launch_transaction_error)?
         .ok_or(InitError::Accounting)?;
+    // R6D. `PEER_CLOSED` is deliberately not asked for, and this is the whole
+    // reason the gate is a signal set rather than "did anything happen".
+    //
+    // `await_child_ready_profile_observed` branches on what its own wait
+    // selects. `READABLE` is the READY message, which it receives and parses;
+    // `EXITED` is the early-exit record, which it queries and returns. Both
+    // finish without waiting again. But a launch Channel that is `PEER_CLOSED`
+    // and *not* `READABLE` sends it into a second `wait_many` for the Process's
+    // `EXITED`, and that one is bounded only by the launch's own deadline. A
+    // child that dropped its end of the Channel and then declined to die would
+    // hold the tick for the whole budget -- one failing child blocking every
+    // other launch client, which is exactly what R6D has to refute.
+    //
+    // So a peer-closed-but-silent child is left parked. Its Channel stays
+    // closed, so the condition is level-triggered and every later tick sees it
+    // again; it leaves through `Expired` when the budget runs out, by the same
+    // door as a child that said nothing at all. What is lost is the terminal
+    // record `PeerClosedBeforeReady` would have carried, and only when the
+    // Process outlives its Channel by the whole budget.
     let items = [
         DwWaitItemV1 {
             handle: resources.launch_channel,
-            signals: deepwyrm_syscall::DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+            signals: deepwyrm_syscall::DwSignals(DW_SIGNAL_READABLE.0),
         },
         DwWaitItemV1 {
             handle: resources.process,
@@ -7383,6 +7402,11 @@ mod tests {
         /// has no opinion and the child poll answers the same way the session
         /// poll does, which is what every test written before R6C expects.
         child_poll_readable: Option<bool>,
+        /// The signals the last parked-child poll asked about, for R6D.
+        child_poll_signals: Vec<u64>,
+        /// Which session Channel the last reply went to, so a test with two
+        /// launch clients can say which one was answered.
+        last_sent_channel: Option<DwHandle>,
     }
 
     #[derive(Default)]
@@ -7716,6 +7740,8 @@ mod tests {
                 session_poll_readable: false,
                 session_poll_peer_closed: false,
                 child_poll_readable: None,
+                child_poll_signals: Vec::new(),
+                last_sent_channel: None,
             }
         }
     }
@@ -8110,12 +8136,13 @@ mod tests {
             self.bootfs = Some(bootfs);
             Ok(result)
         }
-        fn send_channel(&mut self, _channel: DwHandle, bytes: &[u8]) -> Result<(), NativeError> {
+        fn send_channel(&mut self, channel: DwHandle, bytes: &[u8]) -> Result<(), NativeError> {
             if self.fail_send {
                 return Err(FAILURE);
             }
             self.sent[..bytes.len()].copy_from_slice(bytes);
             self.sent_len = bytes.len();
+            self.last_sent_channel = Some(channel);
             Ok(())
         }
         fn close_handle(&mut self, handle: DwHandle) -> Result<(), NativeError> {
@@ -8372,6 +8399,9 @@ mod tests {
             let child_poll = items
                 .iter()
                 .any(|item| item.signals.0 & DW_SIGNAL_EXITED.0 != 0);
+            if child_poll {
+                self.child_poll_signals = items.iter().map(|item| item.signals.0).collect();
+            }
             if let (true, Some(readable)) = (child_poll, self.child_poll_readable) {
                 return if readable {
                     Ok(DwWaitResultV1 {
@@ -13150,6 +13180,166 @@ mod tests {
                 .unwrap()
                 .reservation,
             reservation(2)
+        );
+    }
+
+    /// Reset card R6D, the part that needed a second launch client to say
+    /// anything at all.
+    ///
+    /// R6C proved a silent child does not cost *its own* session its turn. That
+    /// is the weaker reading: the same session could be serviced because the
+    /// dispatcher happened to come back to it. R6D's claim is about other
+    /// clients, so this has two installed sessions and asserts that the one
+    /// without a parked launch is the one answered, while the other's child is
+    /// still in flight.
+    #[test]
+    fn a_parked_child_does_not_cost_a_different_launch_client_its_turn() {
+        let image = executable();
+        let (bootfs, _) = job_policy_bootfs(&image);
+        let mut platform = MockPlatform::new();
+        platform.bootfs = Some(bootfs);
+        platform.fail_send = false;
+        platform.now = Some(1);
+        platform.task_group = Some(DwHandle(77));
+        platform.session_poll_readable = true;
+        let mut waits = AcceptedJobV2Waits {
+            transaction_id: reservation(1).transaction_id,
+            profile: LaunchProfile::JobV2,
+            exited: false,
+            console_status_lost_process: None,
+            running_process: None,
+        };
+        let mut loader = InitSendLoader::new();
+        loader.fail_init = false;
+        let mut jobs = JobDispatcher::new();
+        let first = grant(EndpointKind::LaunchSession, 1, 1);
+        let second = grant(EndpointKind::LaunchSession, 2, 1);
+        jobs.install_session(first, DwHandle(90)).unwrap();
+        jobs.install_session(second, DwHandle(91)).unwrap();
+        let authority = LoadAuthority {
+            parent_root: DwHandle(1),
+            bootfs: DwHandle(2),
+            task_group: DwHandle(3),
+        };
+        park_one_launch(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            &mut jobs,
+            first,
+            authority,
+        );
+        assert_eq!(
+            jobs.launches.open_count(),
+            1,
+            "the first client's launch is in flight"
+        );
+
+        // The first client's child says nothing. The second client asks an
+        // unrelated question, on its own session.
+        platform.child_poll_readable = Some(false);
+        platform.inbound_len = encode_job_message(
+            LaunchReservation {
+                connection_id: second.endpoint_id,
+                generation: second.endpoint_generation,
+                transaction_id: 1,
+            },
+            LaunchMessageType::Query,
+            1,
+            &mut platform.inbound,
+        )
+        .unwrap();
+
+        poll_job_dispatcher(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            authority,
+            &mut jobs,
+            11,
+        )
+        .unwrap();
+
+        assert_eq!(
+            jobs.launches.open_count(),
+            1,
+            "the first client's child is still in flight"
+        );
+        assert_eq!(
+            platform.last_sent_channel,
+            Some(DwHandle(91)),
+            "the second client's session is the one that was answered"
+        );
+    }
+
+    /// Reset card R6D, and the reason the parked-child poll asks for the
+    /// signals it does rather than for anything at all.
+    ///
+    /// `await_child_ready_profile_observed` finishes without waiting again on
+    /// exactly two of its branches: `READABLE`, where it receives and parses the
+    /// READY message, and `EXITED`, where it queries the terminal record. A
+    /// launch Channel that is `PEER_CLOSED` and not `READABLE` takes the third
+    /// branch, which waits for the Process's `EXITED` under the launch's own
+    /// deadline -- so a child that dropped its Channel and then declined to die
+    /// would hold the tick for the whole budget.
+    ///
+    /// Asking for `PEER_CLOSED` here would therefore hand the observation
+    /// exactly the case it cannot answer promptly. This pins the omission,
+    /// because nothing else about the code would look wrong if it came back.
+    #[test]
+    fn the_parked_child_poll_asks_only_for_signals_it_can_act_on_at_once() {
+        let image = executable();
+        let (bootfs, _) = job_policy_bootfs(&image);
+        let mut platform = MockPlatform::new();
+        platform.bootfs = Some(bootfs);
+        platform.fail_send = false;
+        platform.now = Some(1);
+        platform.task_group = Some(DwHandle(77));
+        platform.session_poll_readable = true;
+        let mut waits = AcceptedJobV2Waits {
+            transaction_id: reservation(1).transaction_id,
+            profile: LaunchProfile::JobV2,
+            exited: false,
+            console_status_lost_process: None,
+            running_process: None,
+        };
+        let mut loader = InitSendLoader::new();
+        loader.fail_init = false;
+        let mut jobs = JobDispatcher::new();
+        let owner = grant(EndpointKind::LaunchSession, 1, 1);
+        jobs.install_session(owner, DwHandle(90)).unwrap();
+        let authority = LoadAuthority {
+            parent_root: DwHandle(1),
+            bootfs: DwHandle(2),
+            task_group: DwHandle(3),
+        };
+        park_one_launch(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            &mut jobs,
+            owner,
+            authority,
+        );
+
+        platform.child_poll_readable = Some(false);
+        platform.session_poll_readable = false;
+        platform.session_poll_timeout = true;
+        poll_job_dispatcher(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            authority,
+            &mut jobs,
+            11,
+        )
+        .unwrap();
+
+        assert_eq!(
+            platform.child_poll_signals,
+            vec![DW_SIGNAL_READABLE.0, DW_SIGNAL_EXITED.0],
+            "the Channel is polled for READY and the Process for exit, and \
+             PEER_CLOSED is not asked for on either"
         );
     }
 

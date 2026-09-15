@@ -196,3 +196,61 @@ fn controller_records_all_relational_joins_in_contract_order() {
     assert!(NATIVE.contains("jobs.jobs.live_jobs() != 0"));
     assert!(NATIVE.contains("jobs.jobs.orphan_jobs() != 0"));
 }
+
+/// Reset card R6D, for the two clients a model test cannot reach: registry
+/// supervision and service control.
+///
+/// Those live in `control_tick`, which supervises the active roles and then
+/// polls the launch dispatcher. Nothing in a unit test can show that a parked
+/// child did not *delay* them, because the harness never actually blocks -- the
+/// claim is about wall time, and what decides it is the deadline every wait in
+/// the tick is given.
+///
+/// So this reads them. Every `wait_many` on the resident tick path -- the role
+/// supervision poll, the session poll, and R6C's parked-child poll -- is called
+/// with `DwDeadline(now_ns)`, the tick's own instant, which is already in the
+/// past by the time the syscall runs and therefore cannot wait. A tick composed
+/// only of such calls terminates whatever its children are doing, so one child
+/// that never reaches READY cannot delay the next tick's role supervision or
+/// the mode `control_tick` returns.
+///
+/// The one wait on this path that is *not* a poll is inside
+/// `observe_prepared_ready`, which is reached only through
+/// `finish_deferred_launch`. R6C's gate is what keeps it bounded: it is entered
+/// only when the child's own handles already carry a signal the observation can
+/// act on without waiting again. That is asserted separately, by
+/// `the_parked_child_poll_asks_only_for_signals_it_can_act_on_at_once`; here the
+/// point is that nothing else on the path waits at all.
+#[test]
+fn every_wait_on_the_resident_tick_path_is_a_poll_of_the_ticks_own_instant() {
+    fn body<'a>(source: &'a str, name: &str) -> &'a str {
+        let start = source
+            .find(name)
+            .unwrap_or_else(|| panic!("{name} missing"));
+        let rest = &source[start..];
+        let end = rest[1..]
+            .find("\nfn ")
+            .or_else(|| rest[1..].find("\npub(crate) fn "))
+            .map(|offset| offset + 1)
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    for name in [
+        "fn control_tick<S, L, W>(",
+        "fn poll_job_dispatcher_inner<S, L, W>(",
+        "fn parked_launch_disposition<S: Wyr1BPlatform>(",
+    ] {
+        let source = body(NATIVE, name);
+        let calls = source.matches(".wait_many(").count();
+        assert!(
+            calls > 0,
+            "{name} no longer waits at all; re-read this test"
+        );
+        assert_eq!(
+            calls,
+            source.matches("DwDeadline(now_ns)").count(),
+            "{name} has a wait whose deadline is not the tick's own instant"
+        );
+    }
+}
