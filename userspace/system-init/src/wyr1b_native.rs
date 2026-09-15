@@ -5419,6 +5419,81 @@ where
     }
 }
 
+/// Whether a parked launch has anything to say yet.
+///
+/// Reset card R6C. `finish_deferred_launch` ends in `observe_prepared_ready`,
+/// which waits on the child's launch Channel and Process until one of them
+/// signals or the READY deadline expires. R6B-2 moved that wait to a tick of
+/// its own; it did not stop it being a wait, so a child that never answers
+/// still held the tick that went to finish it.
+///
+/// This is the gate. It polls the same two handles the observation will wait
+/// on, with an already-passed deadline, so it cannot block:
+///
+/// - something signalled -- READY, peer close, or exit -- so the observation
+///   will find it immediately, and the launch is finished now;
+/// - nothing signalled and the budget is spent, so the launch is failed here
+///   without observing at all. Handing the spent deadline back to
+///   `observe_prepared_ready` and letting its own `wait_many` time out would
+///   reach the same disposition in production, but by way of a second clock --
+///   the one the wait sees rather than the one the loop measured against. One
+///   clock decides, and it is this one;
+/// - nothing signalled and there is budget left, so the launch stays parked and
+///   the tick goes on to the sessions.
+///
+/// READY is checked before expiry deliberately. A child that signalled in the
+/// same instant its deadline passed is published, exactly as the one-frame
+/// `wait_many` would have published it -- the deadline bounds how long the
+/// supervisor waits, not how late an answer may be.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ParkedLaunch {
+    /// Silent, with budget left. Stays parked.
+    Waiting,
+    /// Its Channel or its Process said something. Finish it.
+    Signalled,
+    /// Silent, and out of budget. Fail it.
+    Expired,
+}
+
+fn parked_launch_disposition<S: Wyr1BPlatform>(
+    system: &mut S,
+    jobs: &JobDispatcher,
+    token: LaunchToken,
+    now_ns: u64,
+) -> Result<ParkedLaunch, InitError> {
+    let resources = jobs
+        .launches
+        .resources(token)
+        .map_err(launch_transaction_error)?
+        .ok_or(InitError::Accounting)?;
+    let deadline = jobs
+        .launches
+        .ready_deadline(token)
+        .map_err(launch_transaction_error)?
+        .ok_or(InitError::Accounting)?;
+    let items = [
+        DwWaitItemV1 {
+            handle: resources.launch_channel,
+            signals: deepwyrm_syscall::DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+        },
+        DwWaitItemV1 {
+            handle: resources.process,
+            signals: deepwyrm_syscall::DwSignals(DW_SIGNAL_EXITED.0),
+        },
+    ];
+    match system.wait_many(&items, DwDeadline(now_ns)) {
+        Ok(_) => Ok(ParkedLaunch::Signalled),
+        Err(NativeError::Status(status)) if status == DW_STATUS_TIMED_OUT => {
+            if now_ns >= deadline.0 {
+                Ok(ParkedLaunch::Expired)
+            } else {
+                Ok(ParkedLaunch::Waiting)
+            }
+        }
+        Err(error) => Err(InitError::Native(error)),
+    }
+}
+
 /// Runs the half of a launch that was left parked, on a tick of its own.
 ///
 /// Reset card R6B-2. This is `finish_constructed_launch` with its inputs read
@@ -5439,6 +5514,7 @@ fn finish_deferred_launch<S, W>(
     jobs: &mut JobDispatcher,
     token: LaunchToken,
     mut shell: Option<&mut ShellLaunchContext<'_>>,
+    disposition: ParkedLaunch,
 ) -> Result<(), InitError>
 where
     S: Wyr1BPlatform,
@@ -5528,14 +5604,32 @@ where
         (Some(_), None) => return Err(InitError::WrongActivationOrder),
         (None, _) => None,
     };
-    let outcome = finish_constructed_launch(
-        system,
-        waits,
-        jobs,
-        constructed,
-        #[cfg(feature = "wyr1e8-selector33")]
-        acceptance,
-    );
+    let outcome = match disposition {
+        ParkedLaunch::Signalled => finish_constructed_launch(
+            system,
+            waits,
+            jobs,
+            constructed,
+            #[cfg(feature = "wyr1e8-selector33")]
+            acceptance,
+        ),
+        // Out of budget, and nothing to observe. This is the disposition the
+        // one-frame path reached when its `wait_many` hit the deadline, and the
+        // rollback is the same one: the child is not published, and whether the
+        // teardown itself failed is what decides between `Cleanup` and
+        // `Supervision`.
+        ParkedLaunch::Waiting | ParkedLaunch::Expired => {
+            #[cfg(feature = "wyr1e8-selector33")]
+            let _ = acceptance;
+            Err(
+                if rollback_prepared_job(system, waits, jobs, constructed.prepared).is_err() {
+                    InitError::Cleanup
+                } else {
+                    InitError::Supervision
+                },
+            )
+        }
+    };
     let published = match outcome {
         Ok((_, response)) => {
             #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
@@ -5571,7 +5665,18 @@ where
         }
     };
     close_deferred_launch(jobs, token, published.is_ok())?;
-    published
+    // One launch failing is not the tick failing. The one-frame path answered a
+    // failed launch with an `ERROR` reply and returned `Responded`, and only a
+    // failed *cleanup* escalated -- because a cleanup that did not happen means
+    // resources nobody can name, while a child that missed READY has already
+    // been rolled back by the time we get here. R6C keeps that split: a launch
+    // that never answers must not take down the supervisor, which is most of
+    // what R6D has to prove.
+    match published {
+        Ok(()) => Ok(()),
+        Err(InitError::Cleanup) => Err(InitError::Cleanup),
+        Err(_) => Ok(()),
+    }
 }
 
 /// Walks the parked transaction out of the arena by the same door every
@@ -5711,17 +5816,33 @@ where
     W: SupervisionPlatform<Error = NativeError>,
 {
     let mut outcome = JobDispatcherPollOutcome::Stable;
-    // Reset card R6B-2. A launch parked by a previous tick is resolved before
-    // any new request is read, for two reasons. The child is already alive and
-    // its READY deadline is already running, so it has the older claim; and a
-    // session cannot be disconnected out from under a transaction that still
-    // owns its child, because the transaction is always resolved first. The
-    // cursor moves past the slot it hands back, so a child that never answers
-    // cannot starve the one behind it.
+    // Reset cards R6B-2 and R6C. A launch parked by a previous tick is looked at
+    // before any new request is read -- the child is already alive and its READY
+    // deadline is already running, so it has the older claim -- but it is only
+    // *finished* if its own handles say something has happened, or if its budget
+    // has run out. R6B-2 moved the blocking observation off the frame that read
+    // the request; R6C is what stops it blocking the tick as well.
+    //
+    // The tick does not end here either way. A parked child that is still
+    // silent costs one non-blocking poll of two handles, and the session poll
+    // below runs regardless, which is the property R6D has to prove: a child
+    // that never answers cannot take a session's turn.
+    //
+    // The cursor moves past the slot it looked at, so a silent child cannot
+    // starve the one behind it.
     if let Some(token) = jobs.launches.awaiting_ready_from(jobs.launch_cursor) {
         jobs.launch_cursor = token.slot().wrapping_add(1);
-        finish_deferred_launch(system, waits, jobs, token, shell.as_deref_mut())?;
-        return Ok(outcome);
+        match parked_launch_disposition(system, jobs, token, now_ns)? {
+            ParkedLaunch::Waiting => {}
+            disposition => finish_deferred_launch(
+                system,
+                waits,
+                jobs,
+                token,
+                shell.as_deref_mut(),
+                disposition,
+            )?,
+        }
     }
     if let Some((grant, session)) = jobs.next_session() {
         let item = DwWaitItemV1 {
@@ -7139,6 +7260,15 @@ mod tests {
         inbound_handle_count: usize,
         bootfs: Option<Vec<u8>>,
         session_poll_readable: bool,
+        /// What R6C's parked-launch poll should see, when a test has a parked
+        /// launch at all.
+        ///
+        /// A poll of a parked child is the only wait on this platform that asks
+        /// for `EXITED`, so it is distinguishable from the session poll without
+        /// the mock having to know which handle is which. `None` means the test
+        /// has no opinion and the child poll answers the same way the session
+        /// poll does, which is what every test written before R6C expects.
+        child_poll_readable: Option<bool>,
     }
 
     #[derive(Default)]
@@ -7470,6 +7600,7 @@ mod tests {
                 inbound_handle_count: 0,
                 bootfs: None,
                 session_poll_readable: false,
+                child_poll_readable: None,
             }
         }
     }
@@ -8120,9 +8251,23 @@ mod tests {
         }
         fn wait_many(
             &mut self,
-            _items: &[DwWaitItemV1],
+            items: &[DwWaitItemV1],
             _deadline: DwDeadline,
         ) -> Result<DwWaitResultV1, NativeError> {
+            let child_poll = items
+                .iter()
+                .any(|item| item.signals.0 & DW_SIGNAL_EXITED.0 != 0);
+            if let (true, Some(readable)) = (child_poll, self.child_poll_readable) {
+                return if readable {
+                    Ok(DwWaitResultV1 {
+                        index: 0,
+                        observed: DW_SIGNAL_READABLE,
+                        ..DwWaitResultV1::default()
+                    })
+                } else {
+                    Err(NativeError::Status(DW_STATUS_TIMED_OUT))
+                };
+            }
             if self.session_poll_readable {
                 Ok(DwWaitResultV1 {
                     index: 0,
@@ -12745,6 +12890,13 @@ mod tests {
         // answer for when R6C drives cleanup and cancel from ordinary dispatch.
         assert!(jobs.launches.job_transaction(1).is_some());
 
+        // The session has nothing more to say; the child does. R6C makes those
+        // two separate questions, so the next tick finishes the launch without
+        // reading anything from the session.
+        platform.session_poll_readable = false;
+        platform.session_poll_timeout = true;
+        platform.child_poll_readable = Some(true);
+
         poll_job_dispatcher(
             &mut platform,
             &mut loader,
@@ -12766,6 +12918,197 @@ mod tests {
                 .unwrap()
                 .message,
             LaunchMessage::LaunchAccepted { job_id } if job_id != 0
+        ));
+    }
+
+    /// Builds the state the two R6C tests below start from: one launch read,
+    /// constructed and parked, with nothing published.
+    fn park_one_launch(
+        platform: &mut MockPlatform,
+        loader: &mut InitSendLoader,
+        waits: &mut AcceptedJobV2Waits,
+        jobs: &mut JobDispatcher,
+        owner: EndpointGrant,
+        authority: LoadAuthority,
+    ) {
+        platform.inbound_len = wyrmroot_launch_proto::encode_launch(
+            reservation(1),
+            "bin/hello",
+            &["bin/hello"],
+            &[],
+            false,
+            &mut platform.inbound,
+        )
+        .unwrap();
+        poll_job_dispatcher(platform, loader, waits, authority, jobs, 10).unwrap();
+        assert_eq!(jobs.launches.open_count(), 1);
+        assert_eq!(platform.sent_len, 0);
+        let _ = owner;
+    }
+
+    /// Reset card R6C, and the half of R6D that can be proved without a guest:
+    /// a child that never answers does not take the session's turn.
+    ///
+    /// Before R6C the tick that went to finish a parked launch waited inside
+    /// `observe_prepared_ready` until the child answered or its deadline
+    /// expired, and every session on the dispatcher waited with it. Now a
+    /// silent child costs one non-blocking poll of two handles and the session
+    /// is serviced in the same tick. The assertion is that the session's
+    /// request was answered while the launch was still parked -- which is only
+    /// possible if finishing the launch did not block.
+    #[test]
+    fn a_child_that_never_answers_does_not_take_the_sessions_turn() {
+        let image = executable();
+        let (bootfs, _) = job_policy_bootfs(&image);
+        let mut platform = MockPlatform::new();
+        platform.bootfs = Some(bootfs);
+        platform.fail_send = false;
+        platform.now = Some(1);
+        platform.task_group = Some(DwHandle(77));
+        platform.session_poll_readable = true;
+        let mut waits = AcceptedJobV2Waits {
+            transaction_id: reservation(1).transaction_id,
+            profile: LaunchProfile::JobV2,
+            exited: false,
+            console_status_lost_process: None,
+            running_process: None,
+        };
+        let mut loader = InitSendLoader::new();
+        loader.fail_init = false;
+        let mut jobs = JobDispatcher::new();
+        let owner = grant(EndpointKind::LaunchSession, 1, 1);
+        jobs.install_session(owner, DwHandle(90)).unwrap();
+        let authority = LoadAuthority {
+            parent_root: DwHandle(1),
+            bootfs: DwHandle(2),
+            task_group: DwHandle(3),
+        };
+        park_one_launch(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            &mut jobs,
+            owner,
+            authority,
+        );
+
+        // The child stays silent. The session asks an unrelated question.
+        platform.child_poll_readable = Some(false);
+        platform.inbound_len = encode_job_message(
+            reservation(2),
+            LaunchMessageType::Query,
+            1,
+            &mut platform.inbound,
+        )
+        .unwrap();
+
+        poll_job_dispatcher(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            authority,
+            &mut jobs,
+            11,
+        )
+        .unwrap();
+
+        assert_eq!(
+            jobs.launches.open_count(),
+            1,
+            "a silent child stays parked rather than being failed early"
+        );
+        assert!(
+            platform.sent_len > 0,
+            "the session must be answered in the same tick the silent child was polled"
+        );
+        // §9 requires every reply to echo its request's envelope, so the
+        // reservation is what says *which* request was answered. It is the
+        // session's second one, not the parked launch's first.
+        assert_eq!(
+            parse_launch_message(&platform.sent[..platform.sent_len], 0)
+                .unwrap()
+                .reservation,
+            reservation(2)
+        );
+    }
+
+    /// The other half: a child that never answers is failed when its budget
+    /// runs out, and failing it does not fail the tick.
+    ///
+    /// The one-frame path answered a failed launch with an `ERROR` reply and
+    /// carried on; only a failed cleanup escalated. A deferred launch that
+    /// misses READY has to behave the same way, or one child that never starts
+    /// would take down the supervisor -- which is the failure R6 exists to
+    /// remove, reintroduced one card later.
+    #[test]
+    fn a_parked_launch_past_its_budget_fails_itself_and_not_the_tick() {
+        let image = executable();
+        let (bootfs, _) = job_policy_bootfs(&image);
+        let mut platform = MockPlatform::new();
+        platform.bootfs = Some(bootfs);
+        platform.fail_send = false;
+        platform.now = Some(1);
+        platform.task_group = Some(DwHandle(77));
+        platform.session_poll_readable = true;
+        let mut waits = AcceptedJobV2Waits {
+            transaction_id: reservation(1).transaction_id,
+            profile: LaunchProfile::JobV2,
+            exited: false,
+            console_status_lost_process: None,
+            running_process: None,
+        };
+        let mut loader = InitSendLoader::new();
+        loader.fail_init = false;
+        let mut jobs = JobDispatcher::new();
+        let owner = grant(EndpointKind::LaunchSession, 1, 1);
+        jobs.install_session(owner, DwHandle(90)).unwrap();
+        let authority = LoadAuthority {
+            parent_root: DwHandle(1),
+            bootfs: DwHandle(2),
+            task_group: DwHandle(3),
+        };
+        park_one_launch(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            &mut jobs,
+            owner,
+            authority,
+        );
+        let deadline = jobs
+            .launches
+            .ready_deadline(jobs.launches.job_transaction(1).unwrap())
+            .unwrap()
+            .unwrap();
+
+        platform.child_poll_readable = Some(false);
+        platform.session_poll_readable = false;
+        platform.session_poll_timeout = true;
+        // The rollback terminates the child and reaps it; a torn-down child has
+        // exited by the time its terminal record is read.
+        waits.exited = true;
+
+        poll_job_dispatcher(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            authority,
+            &mut jobs,
+            deadline.0,
+        )
+        .expect("a launch that misses its budget must not fail the tick");
+
+        assert_eq!(
+            jobs.launches.open_count(),
+            0,
+            "an expired transaction leaves the arena"
+        );
+        assert_eq!(jobs.jobs.live_jobs(), 0, "its child is rolled back");
+        assert!(matches!(
+            parse_launch_message(&platform.sent[..platform.sent_len], 0)
+                .unwrap()
+                .message,
+            LaunchMessage::Error { .. }
         ));
     }
 
