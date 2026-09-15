@@ -961,7 +961,7 @@ fn launch_child_once(
 
     #[cfg(feature = "wyr1e8-recovery")]
     if policy == ChildPolicy::Wyrmsh {
-        let facts = wyrmroot_consoled::e8_control::ReadyFacts {
+        let facts = wyrmroot_consoled::quiesce_control::ReadyFacts {
             console_generation: model_launch.console_generation(),
             status_generation,
             shell_generation: model_launch.child_generation(),
@@ -969,8 +969,8 @@ fn launch_child_once(
             stream_generation: serial.identity.stream_generation,
             bundle_generation: serial.identity.bundle_generation,
         };
-        let bytes = wyrmroot_consoled::e8_control::encode(
-            wyrmroot_consoled::e8_control::Message::ReadyFacts(facts),
+        let bytes = wyrmroot_consoled::quiesce_control::encode(
+            wyrmroot_consoled::quiesce_control::Message::ReadyFacts(facts),
         )
         .map_err(|_| 43u32)?;
         if send_channel(authorities.recovery_control, &bytes, &[]).is_err() {
@@ -1329,8 +1329,8 @@ fn event_loop(
                     // before waiting so it can immediately reach serial TX.
                     continue;
                 }
-                let ack = wyrmroot_consoled::e8_control::encode(
-                    wyrmroot_consoled::e8_control::Message::Quiesced(identity),
+                let ack = wyrmroot_consoled::quiesce_control::encode(
+                    wyrmroot_consoled::quiesce_control::Message::Quiesced(identity),
                 )
                 .map_err(|_| 128u32)?;
                 send_channel(authorities.recovery_control, &ack, &[]).map_err(|_| 128u32)?;
@@ -1406,6 +1406,21 @@ fn event_loop(
         } else {
             DW_SIGNAL_WRITABLE.0
         };
+        // R7B-3 read this as the one place a build's console behaves
+        // differently, and it is -- but it is not a choice. An outstanding
+        // quiesce request is acknowledged only once the input, stdout and
+        // stderr queues are all empty and one further poll finds nothing. Keep
+        // admitting raw serial input across that window and fresh bytes can
+        // refill the queue faster than it drains, so the acknowledgement need
+        // never be reached. Suppressing raw input is what makes the handshake
+        // terminate; it is entailed by having the handshake, not a policy
+        // chosen alongside it.
+        //
+        // So the open question is not whether to unify these two arms. It is
+        // whether the product has the handshake at all, and that is the far
+        // end of init's held-wait barrier: nothing sends `Quiesce` except the
+        // machinery R7A filed as class D1. Deciding it from this side would be
+        // settling a supervision protocol from one end. It waits for R7B-4.
         #[cfg(feature = "wyr1e8-recovery")]
         let accepting_raw_input = recovery_request.is_none();
         #[cfg(not(feature = "wyr1e8-recovery"))]
@@ -2001,8 +2016,8 @@ fn recover_terminal_precursor(
 fn receive_recovery_request(
     authorities: StartupAuthorities,
     child: &ChildSession,
-) -> Result<wyrmroot_consoled::e8_control::Identity, u32> {
-    let mut bytes = [0_u8; wyrmroot_consoled::e8_control::FRAME_BYTES];
+) -> Result<wyrmroot_consoled::quiesce_control::Identity, u32> {
+    let mut bytes = [0_u8; wyrmroot_consoled::quiesce_control::FRAME_BYTES];
     let mut handles = [DwReceivedHandleInfoV1::default(); 1];
     let counts = receive_channel(authorities.recovery_control, &mut bytes, &mut handles)
         .map_err(|_| 127u32)?;
@@ -2010,8 +2025,8 @@ fn receive_recovery_request(
         close_received(&handles, counts.handles);
         return Err(127);
     }
-    let wyrmroot_consoled::e8_control::Message::Quiesce(identity) =
-        wyrmroot_consoled::e8_control::parse(&bytes).map_err(|_| 127u32)?
+    let wyrmroot_consoled::quiesce_control::Message::Quiesce(identity) =
+        wyrmroot_consoled::quiesce_control::parse(&bytes).map_err(|_| 127u32)?
     else {
         return Err(127);
     };

@@ -176,7 +176,7 @@ fn registry_and_devmgr_recovery_retire_dependents_before_replacement() {
     let relaunch = registry.find("start_wyr1e_or_recover_registry(").unwrap();
     assert!(retire < poison && poison < reserve && reserve < restart);
     assert!(restart < commit && commit < relaunch);
-    // The E8 coordinated-recovery branch retires the same generation from the
+    // The E8 wyr1e8-recovery branch retires the same generation from the
     // same position, after dependent retirement and before any replacement.
     let e8_retire = registry
         .find("retire_registry_for_recovery_before(")

@@ -20,7 +20,7 @@ fn e8_ready_facts_precede_each_shell_v1_request_and_use_live_serial_identity() {
     let launch = item(NATIVE, "fn launch_child_once(");
     let reserve = launch.find("model.begin_child_launch(").unwrap();
     let facts = launch
-        .find("wyrmroot_consoled::e8_control::ReadyFacts {")
+        .find("wyrmroot_consoled::quiesce_control::ReadyFacts {")
         .unwrap();
     let live_attach = launch
         .find("serial.identity.attach_transaction_id")

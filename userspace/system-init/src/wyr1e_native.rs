@@ -952,7 +952,7 @@ where
             return Ok(PollOutcome::RecoverRegistry);
         }
         #[cfg(feature = "wyr1e8-selector33")]
-        let mut bytes = [0u8; wyrmroot_consoled::e8_control::FRAME_BYTES];
+        let mut bytes = [0u8; wyrmroot_consoled::quiesce_control::FRAME_BYTES];
         #[cfg(not(feature = "wyr1e8-selector33"))]
         let mut bytes = [0u8; 64];
         let mut handles = [DwReceivedHandleInfoV1::default(); 1];
@@ -980,11 +980,11 @@ where
         if bytes[..counts.bytes].starts_with(b"WRC8") {
             let message = attribute_failure(
                 RecoveryOperation::Quiesced,
-                wyrmroot_consoled::e8_control::parse(&bytes[..counts.bytes])
+                wyrmroot_consoled::quiesce_control::parse(&bytes[..counts.bytes])
                     .map_err(|_| InitError::Accounting),
             )?;
             match message {
-                wyrmroot_consoled::e8_control::Message::ReadyFacts(facts) => {
+                wyrmroot_consoled::quiesce_control::Message::ReadyFacts(facts) => {
                     e6.shell.observe_e8_serial_ready(
                         system,
                         crate::wyr1e8_evidence::SerialReady {
@@ -998,7 +998,7 @@ where
                     )?;
                     return Ok(PollOutcome::Stable);
                 }
-                wyrmroot_consoled::e8_control::Message::Quiesced(identity) => {
+                wyrmroot_consoled::quiesce_control::Message::Quiesced(identity) => {
                     let quiesced_at = system.now().map_err(InitError::Native)?;
                     attribute_failure(
                         RecoveryOperation::Quiesced,
@@ -1042,7 +1042,7 @@ where
                     )?;
                     return Ok(PollOutcome::Stable);
                 }
-                wyrmroot_consoled::e8_control::Message::Quiesce(_) => {
+                wyrmroot_consoled::quiesce_control::Message::Quiesce(_) => {
                     return attribute_failure(
                         RecoveryOperation::Quiesced,
                         Err(InitError::WrongActivationOrder),

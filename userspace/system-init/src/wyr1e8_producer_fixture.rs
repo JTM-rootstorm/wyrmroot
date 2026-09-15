@@ -792,8 +792,8 @@ fn actual_driver_and_registry_recovery_compose_through_s4_ready() {
     )
     .unwrap();
     assert_eq!(platform.sent.len(), sent_before_terminal + 1);
-    let quiesce = wyrmroot_consoled::e8_control::parse(&platform.sent.last().unwrap().1).unwrap();
-    let wyrmroot_consoled::e8_control::Message::Quiesce(quiesce_identity) = quiesce else {
+    let quiesce = wyrmroot_consoled::quiesce_control::parse(&platform.sent.last().unwrap().1).unwrap();
+    let wyrmroot_consoled::quiesce_control::Message::Quiesce(quiesce_identity) = quiesce else {
         panic!("the held WAIT must emit the exact WRC8 quiescence request")
     };
     let held = context.state.e8_held.unwrap();
@@ -1089,8 +1089,8 @@ fn actual_driver_and_registry_recovery_compose_through_s4_ready() {
     )
     .unwrap();
     let registry_quiesce =
-        wyrmroot_consoled::e8_control::parse(&platform.sent.last().unwrap().1).unwrap();
-    let wyrmroot_consoled::e8_control::Message::Quiesce(registry_identity) = registry_quiesce
+        wyrmroot_consoled::quiesce_control::parse(&platform.sent.last().unwrap().1).unwrap();
+    let wyrmroot_consoled::quiesce_control::Message::Quiesce(registry_identity) = registry_quiesce
     else {
         panic!("the registry held WAIT must emit its exact WRC8 request")
     };

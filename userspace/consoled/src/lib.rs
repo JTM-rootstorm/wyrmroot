@@ -13,8 +13,15 @@ compile_error!("selector-32 console-echo and WYR1-E wyrmsh policies are mutually
 #[cfg(test)]
 extern crate std;
 
+/// The WRC8 quiesce handshake. Frames keep their `WRC8` wire tag, which is
+/// protocol; the module name is not, and no longer names a selector.
+///
+/// The *feature* still does. Renaming it changes `E8_NATIVE_SPECS` in the root
+/// `tools/verify-vm-request.py`, which is a declared cross-repository lineage
+/// contract, and R7B-4 decides whether this leg survives at all. One rename
+/// there, not two.
 #[cfg(any(test, feature = "wyr1e8-recovery"))]
-pub mod e8_control;
+pub mod quiesce_control;
 
 #[cfg(all(feature = "native-consoled", target_os = "wyrmroot"))]
 use {
@@ -1039,7 +1046,11 @@ impl ConsoleModel {
     /// The adapter returns `None` only for a real WOULD_BLOCK observation;
     /// peer closure and every other read failure remain errors. Data found
     /// during this check enters the ordinary staging/serial commit path.
-    #[cfg(any(test, feature = "wyr1e8-recovery"))]
+    ///
+    /// R7B-2 note, kept at R7B-3: nothing here is selector-specific. "Have the
+    /// queues drained, and does one more read find nothing?" is an ordinary
+    /// question about this model, so it is no longer gated on the one caller
+    /// that asks it.
     pub fn poll_output_quiescence(
         &mut self,
         event: EventGeneration,

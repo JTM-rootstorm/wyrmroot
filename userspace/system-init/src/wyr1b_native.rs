@@ -86,10 +86,10 @@ pub(crate) enum E8RecoveryAction {
 
 #[cfg(feature = "wyr1e8-selector33")]
 impl E8RecoveryAction {
-    fn control(self) -> wyrmroot_consoled::e8_control::Action {
+    fn control(self) -> wyrmroot_consoled::quiesce_control::Action {
         match self {
-            Self::Driver => wyrmroot_consoled::e8_control::Action::Driver,
-            Self::Registry => wyrmroot_consoled::e8_control::Action::Registry,
+            Self::Driver => wyrmroot_consoled::quiesce_control::Action::Driver,
+            Self::Registry => wyrmroot_consoled::quiesce_control::Action::Registry,
         }
     }
 }
@@ -106,7 +106,7 @@ struct E8TriggerIdentity {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct E8HeldWait {
     pub(crate) pending: PendingWait,
-    pub(crate) identity: wyrmroot_consoled::e8_control::Identity,
+    pub(crate) identity: wyrmroot_consoled::quiesce_control::Identity,
     pub(crate) result: ControllerJobResult,
     pub(crate) deadline: u64,
     acknowledged: bool,
@@ -522,7 +522,7 @@ impl ShellControllerState {
             .e8_evidence
             .current_tuple()
             .ok_or(InitError::WrongActivationOrder)?;
-        let identity = wyrmroot_consoled::e8_control::Identity {
+        let identity = wyrmroot_consoled::quiesce_control::Identity {
             console_generation: tuple.console_generation,
             status_generation: tuple.status_generation,
             shell_generation: tuple.shell_generation,
@@ -539,8 +539,8 @@ impl ShellControllerState {
         if now >= deadline {
             return Err(InitError::Supervision);
         }
-        let bytes = wyrmroot_consoled::e8_control::encode(
-            wyrmroot_consoled::e8_control::Message::Quiesce(identity),
+        let bytes = wyrmroot_consoled::quiesce_control::encode(
+            wyrmroot_consoled::quiesce_control::Message::Quiesce(identity),
         )
         .map_err(|_| InitError::Accounting)?;
         let control = self
@@ -579,7 +579,7 @@ impl ShellControllerState {
     #[cfg(feature = "wyr1e8-selector33")]
     pub(crate) fn accept_e8_quiesced(
         &mut self,
-        identity: wyrmroot_consoled::e8_control::Identity,
+        identity: wyrmroot_consoled::quiesce_control::Identity,
         now: u64,
     ) -> Result<E8RecoveryAction, InitError> {
         let held = self
@@ -591,8 +591,8 @@ impl ShellControllerState {
         }
         held.acknowledged = true;
         Ok(match identity.action {
-            wyrmroot_consoled::e8_control::Action::Driver => E8RecoveryAction::Driver,
-            wyrmroot_consoled::e8_control::Action::Registry => E8RecoveryAction::Registry,
+            wyrmroot_consoled::quiesce_control::Action::Driver => E8RecoveryAction::Driver,
+            wyrmroot_consoled::quiesce_control::Action::Registry => E8RecoveryAction::Registry,
         })
     }
 
@@ -603,8 +603,8 @@ impl ShellControllerState {
     ) -> Result<E8HeldWait, InitError> {
         let held = self.e8_held.ok_or(InitError::WrongActivationOrder)?;
         let actual = match held.identity.action {
-            wyrmroot_consoled::e8_control::Action::Driver => E8RecoveryAction::Driver,
-            wyrmroot_consoled::e8_control::Action::Registry => E8RecoveryAction::Registry,
+            wyrmroot_consoled::quiesce_control::Action::Driver => E8RecoveryAction::Driver,
+            wyrmroot_consoled::quiesce_control::Action::Registry => E8RecoveryAction::Registry,
         };
         if actual != action || !held.acknowledged {
             return Err(InitError::WrongActivationOrder);
@@ -10481,8 +10481,8 @@ mod tests {
             assert_eq!(platform.sent.len(), 1);
             assert_eq!(platform.sent[0].0, DwHandle(20));
             assert_eq!(
-                wyrmroot_consoled::e8_control::parse(&platform.sent[0].1),
-                Ok(wyrmroot_consoled::e8_control::Message::Quiesce(
+                wyrmroot_consoled::quiesce_control::parse(&platform.sent[0].1),
+                Ok(wyrmroot_consoled::quiesce_control::Message::Quiesce(
                     held.identity
                 ))
             );
@@ -10512,10 +10512,10 @@ mod tests {
             Ok(true)
         );
         assert_eq!(
-            wyrmroot_consoled::e8_control::parse(
+            wyrmroot_consoled::quiesce_control::parse(
                 &adjacent_platform.sent[..adjacent_platform.sent_len]
             ),
-            Ok(wyrmroot_consoled::e8_control::Message::Quiesce(
+            Ok(wyrmroot_consoled::quiesce_control::Message::Quiesce(
                 adjacent.e8_held.unwrap().identity
             ))
         );
