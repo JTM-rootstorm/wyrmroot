@@ -7363,6 +7363,11 @@ mod tests {
         Message, ProtocolVersion as RegistryProtocolVersion, ServiceListRecord,
         encode_service_list, parse,
     };
+    use wyrmroot_registryd::service::{
+        ChannelRights as RegistryChannelRights, ProbeSignals as RegistryProbeSignals,
+        ReceiveCounts as RegistryReceiveCounts, ReceivedHandle as RegistryReceivedHandle,
+        Transport as RegistryTransport, WaitEvent as RegistryWaitEvent,
+    };
 
     const FAILURE: NativeError = NativeError::Status(DwStatus(-1));
     const WYRMSH_CONSOLE_STATUS_LOST: u32 = 0x5745_0104;
@@ -11916,8 +11921,225 @@ mod tests {
         assert_eq!(disconnected.outer_job, None);
     }
 
+    /// A host transport for the real registry service.
+    ///
+    /// Reset card R7C. `preflight_wyrmsh_registry` consumes `ServiceList` pages
+    /// that only Registryd produces, and the test below used to author them:
+    /// two pages the fixture paged, counted and ordered itself, which is
+    /// section 12's "hand-authoring a cross-component producer reply so a
+    /// fixture matches the consumer". The pages the consumer now drains come
+    /// out of `wyrmroot_registryd::service::RegistryService::step`, driven over
+    /// the wire the same way the resident drives it.
+    #[derive(Default)]
+    struct RegistryHost {
+        /// Frames waiting for the service, oldest first.
+        inbound: Vec<(u64, Vec<u8>, Vec<u64>)>,
+        /// Frames the service wrote, in order.
+        sent: Vec<(u64, Vec<u8>)>,
+    }
+
+    impl RegistryHost {
+        fn push(&mut self, channel: u64, bytes: Vec<u8>, handles: Vec<u64>) {
+            self.inbound.push((channel, bytes, handles));
+        }
+    }
+
+    impl RegistryTransport for RegistryHost {
+        type Error = ();
+
+        fn wait(
+            &mut self,
+            control: u64,
+            endpoints: &[wyrmroot_registryd::InstalledEndpoint],
+        ) -> Result<RegistryWaitEvent, Self::Error> {
+            let channel = self.inbound.first().ok_or(())?.0;
+            Ok(RegistryWaitEvent {
+                endpoint_index: if channel == control {
+                    None
+                } else {
+                    Some(
+                        endpoints
+                            .iter()
+                            .position(|endpoint| endpoint.handle == channel)
+                            .ok_or(())?,
+                    )
+                },
+                readable: true,
+                peer_closed: false,
+            })
+        }
+
+        fn probe(
+            &mut self,
+            _endpoint: wyrmroot_registryd::InstalledEndpoint,
+        ) -> Result<RegistryProbeSignals, Self::Error> {
+            Ok(RegistryProbeSignals::default())
+        }
+
+        fn receive(
+            &mut self,
+            channel: u64,
+            bytes: &mut [u8],
+            handles: &mut [RegistryReceivedHandle],
+        ) -> Result<RegistryReceiveCounts, Self::Error> {
+            let index = self
+                .inbound
+                .iter()
+                .position(|(queued, _, _)| *queued == channel)
+                .ok_or(())?;
+            let (_, frame, moved) = self.inbound.remove(index);
+            bytes
+                .get_mut(..frame.len())
+                .ok_or(())?
+                .copy_from_slice(&frame);
+            for (slot, handle) in handles.iter_mut().zip(moved.iter()) {
+                *slot = RegistryReceivedHandle {
+                    handle: *handle,
+                    metadata_is_channel: true,
+                    metadata_rights: 0,
+                };
+            }
+            Ok(RegistryReceiveCounts {
+                bytes: frame.len(),
+                handles: moved.len(),
+            })
+        }
+
+        fn validate_channel(
+            &mut self,
+            _handle: RegistryReceivedHandle,
+            _rights: RegistryChannelRights,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn send(&mut self, channel: u64, bytes: &[u8]) -> Result<(), Self::Error> {
+            self.sent.push((channel, bytes.to_vec()));
+            Ok(())
+        }
+
+        fn send_move(
+            &mut self,
+            channel: u64,
+            bytes: &[u8],
+            _moved_handle: u64,
+            _reduced_rights: RegistryChannelRights,
+        ) -> Result<(), Self::Error> {
+            self.sent.push((channel, bytes.to_vec()));
+            Ok(())
+        }
+
+        fn close(&mut self, _handle: u64) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    /// Publishes `names` through the real registry service and returns the
+    /// `ServiceList` pages it writes for one bootstrap-metadata enumeration.
+    fn actual_service_list_pages(grant: EndpointGrant, names: &[&[u8]]) -> Vec<Vec<u8>> {
+        const CONTROL: u64 = 1;
+        const CLIENT_CHANNEL: u64 = 900;
+        let versions = [wyrmroot_registry_proto::ProtocolVersion { major: 1, minor: 0 }];
+        let mut host = RegistryHost::default();
+        let mut service = wyrmroot_registryd::service::RegistryService::new(CONTROL);
+        for (index, name) in names.iter().enumerate() {
+            let endpoint_id = 20 + index as u64;
+            let channel = 200 + index as u64;
+            // Control-channel installs are supervisor-scoped: the header
+            // carries no endpoint, the payload names the one being installed.
+            let header = RegistryHeader {
+                message_type: RegistryMessageType::InstallPublication,
+                registry_generation: grant.registry_generation,
+                endpoint_id: 0,
+                endpoint_generation: 0,
+                transaction_id: 1,
+            };
+            let mut bytes = [0_u8; 416];
+            let size = encode_install_publication(
+                header,
+                endpoint_id,
+                1,
+                RoleId::Registryd as u32,
+                30 + index as u64,
+                1,
+                10 + index as u64,
+                &versions,
+                name,
+                &mut bytes,
+            )
+            .unwrap();
+            host.push(CONTROL, bytes[..size].to_vec(), vec![channel]);
+            service.step(&mut host).unwrap();
+            let mut publish = [0_u8; REGISTRY_HEADER_BYTES];
+            let publish_size = encode_registry_empty(
+                RegistryHeader {
+                    message_type: RegistryMessageType::Publish,
+                    endpoint_id,
+                    endpoint_generation: 1,
+                    transaction_id: 2,
+                    ..header
+                },
+                &mut publish,
+            )
+            .unwrap();
+            host.push(channel, publish[..publish_size].to_vec(), Vec::new());
+            service.step(&mut host).unwrap();
+        }
+        let mut install = [0_u8; 416];
+        let install_size = encode_install_client(
+            RegistryHeader {
+                message_type: RegistryMessageType::InstallClient,
+                registry_generation: grant.registry_generation,
+                endpoint_id: 0,
+                endpoint_generation: 0,
+                transaction_id: 1,
+            },
+            wyrmroot_registry_proto::InstallClient {
+                endpoint_id: grant.endpoint_id,
+                endpoint_generation: grant.endpoint_generation,
+                client_id: 50,
+                client_generation: 1,
+                scope: wyrmroot_registry_proto::EnumerationScope::BootstrapMetadata,
+            },
+            &mut install,
+        )
+        .unwrap();
+        host.push(
+            CONTROL,
+            install[..install_size].to_vec(),
+            vec![CLIENT_CHANNEL],
+        );
+        service.step(&mut host).unwrap();
+        let mut enumerate = [0_u8; REGISTRY_HEADER_BYTES];
+        let enumerate_size = encode_registry_empty(
+            RegistryHeader {
+                message_type: RegistryMessageType::Enumerate,
+                registry_generation: grant.registry_generation,
+                endpoint_id: grant.endpoint_id,
+                endpoint_generation: grant.endpoint_generation,
+                transaction_id: 1,
+            },
+            &mut enumerate,
+        )
+        .unwrap();
+        host.push(
+            CLIENT_CHANNEL,
+            enumerate[..enumerate_size].to_vec(),
+            Vec::new(),
+        );
+        service.step(&mut host).unwrap();
+        host.sent
+            .iter()
+            .filter(|(channel, _)| *channel == CLIENT_CHANNEL)
+            .map(|(_, bytes)| bytes.clone())
+            .collect()
+    }
+
     #[test]
     fn e3c_registry_preflight_drains_every_canonical_page() {
+        /// Only the refusal leg still authors a page: the real registry cannot
+        /// emit a noncanonical one, and refusing one is exactly what this
+        /// consumer owes.
         fn page(grant: EndpointGrant, page_index: u16, names: &[&[u8]]) -> Vec<u8> {
             let versions = [
                 RegistryProtocolVersion { major: 1, minor: 0 },
@@ -11964,9 +12186,16 @@ mod tests {
             role_generation: 9,
             kind: EndpointKind::RegistryClient,
         };
+        let pages = actual_service_list_pages(grant, &[b"alpha", b"beta", b"gamma"]);
+        assert_eq!(
+            pages.len(),
+            2,
+            "the real registry pages three services in two"
+        );
         let mut platform = ShellPlatform::new();
-        platform.push(DwHandle(101), page(grant, 0, &[b"alpha", b"beta"]), &[]);
-        platform.push(DwHandle(101), page(grant, 1, &[b"gamma"]), &[]);
+        for page in pages {
+            platform.push(DwHandle(101), page, &[]);
+        }
         preflight_wyrmsh_registry(&mut platform, DwHandle(101), grant, None).unwrap();
         assert_eq!(platform.inbound_cursor, 2);
 

@@ -5,6 +5,7 @@ use wyrmroot_devmgr as _;
 use wyrmroot_launch_proto as _;
 use wyrmroot_loader as _;
 use wyrmroot_registry_proto as _;
+use wyrmroot_registryd as _;
 use wyrmroot_rrc_manifest as _;
 use wyrmroot_runtime as _;
 use wyrmroot_system_init as _;

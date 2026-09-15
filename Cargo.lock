@@ -393,6 +393,7 @@ dependencies = [
  "wyrmroot-loader",
  "wyrmroot-r1-saturation",
  "wyrmroot-registry-proto",
+ "wyrmroot-registryd",
  "wyrmroot-rrc-manifest",
  "wyrmroot-runtime",
  "wyrmroot-uart16550d",
