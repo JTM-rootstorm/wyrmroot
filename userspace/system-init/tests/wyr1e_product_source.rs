@@ -181,17 +181,39 @@ fn registry_and_devmgr_recovery_retire_dependents_before_replacement() {
 
     let devmgr = &NATIVE[NATIVE.find("fn recover_devmgr<S").unwrap()
         ..NATIVE.find("fn launch_devmgr_replacement").unwrap()];
-    assert!(devmgr.find("wyr1e::retire_dependents").unwrap() < devmgr.find("reap_driver").unwrap());
+    // `reap_driver` is a prefix of `reap_driver_before`; anchor on the call.
+    assert!(
+        devmgr.find("wyr1e::retire_dependents").unwrap() < devmgr.find("reap_driver(").unwrap()
+    );
 }
 
 #[test]
 fn targeted_console_retirement_preserves_the_dispatcher_for_orphan_reaping() {
-    let retire = &JOBS[JOBS.find("pub(crate) fn retire_console_product").unwrap()
+    // `retire_console_product` only delegates now. Assert the entry point and
+    // the body that does the work against their own spans, so neither is
+    // proven by a slice that runs past the function it names.
+    let entry = &JOBS[JOBS
+        .find("pub(crate) fn retire_console_product<S, W>")
+        .unwrap()
+        ..JOBS
+            .find("pub(crate) fn retire_console_product_with_result<S, W>")
+            .unwrap()];
+    assert!(entry.contains("retire_console_product_inner("));
+
+    let inner = &JOBS[JOBS.find("fn retire_console_product_inner<S, W>").unwrap()
         ..JOBS.find("fn drain_job_dispatcher").unwrap()];
-    assert!(retire.contains("loaded_job_for_owner"));
-    assert!(retire.contains("disconnect_owned_session"));
-    assert!(retire.contains("cleanup_shell_before_publication"));
-    assert!(!retire.contains("drain_job_dispatcher("));
+    assert!(inner.contains("loaded_job_for_owner"));
+    assert!(inner.contains("disconnect_owned_session"));
+    // `cleanup_shell_before_publication` is a prefix of the deadline-capped
+    // variant this path actually calls.
+    assert!(inner.contains("cleanup_shell_before_publication_before("));
+
+    // The shared drain reaps orphans owned by other sessions, so no entry point
+    // in the retirement family may reach it.
+    let family = &JOBS[JOBS
+        .find("pub(crate) fn retire_console_product<S, W>")
+        .unwrap()..JOBS.find("fn drain_job_dispatcher").unwrap()];
+    assert!(!family.contains("drain_job_dispatcher("));
 }
 
 #[test]

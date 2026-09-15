@@ -35,8 +35,11 @@ fn e8_profile_is_additive_and_keeps_e7_feature_separate() {
 fn e8_actor_admission_uses_the_product_owned_paths() {
     assert!(DISPATCH.contains("wyrmroot_wyr1e_test_actors::RECOVERY_TRIGGER_PATH"));
     assert!(DISPATCH.contains("wyrmroot_wyr1e_test_actors::STDOUT_PRESSURE_PATH"));
-    assert!(!DISPATCH.contains("| \"test/wyr1-e/recovery-trigger\""));
-    assert!(!DISPATCH.contains("| \"test/wyr1-e/stdout-pressure\""));
+    // Match the path in any position: as the first alternative of an
+    // or-pattern it carries no leading `|`, so requiring one let a hard-coded
+    // literal through.
+    assert!(!DISPATCH.contains("\"test/wyr1-e/recovery-trigger\""));
+    assert!(!DISPATCH.contains("\"test/wyr1-e/stdout-pressure\""));
 }
 
 #[test]
