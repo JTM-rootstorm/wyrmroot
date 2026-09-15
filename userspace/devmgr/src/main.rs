@@ -1,5 +1,5 @@
-#![no_std]
-#![no_main]
+#![cfg_attr(target_os = "wyrmroot", no_std)]
+#![cfg_attr(target_os = "wyrmroot", no_main)]
 #![deny(unsafe_code)]
 
 #[cfg(any(
@@ -9,6 +9,7 @@
 ))]
 compile_error!("WYR1-E production and selector-only devmgr policies are mutually exclusive");
 
+#[cfg(target_os = "wyrmroot")]
 use core::panic::PanicInfo;
 #[cfg(feature = "wyr1d-production")]
 use deepwyrm_syscall::DW_HANDLE_INVALID;
@@ -165,10 +166,12 @@ use wyrmroot_runtime::NativeError;
 use wyrmroot_runtime::dw1e3_build_nonce;
 #[cfg(any(feature = "wyr1c6-production", feature = "dw1e3-selector31"))]
 use wyrmroot_runtime::monotonic_active_now;
+#[cfg(target_os = "wyrmroot")]
+use wyrmroot_runtime::panic_abort;
 use wyrmroot_runtime::{
     BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, MappingPlan, StartupBlock, close_handle,
-    map_bootfs_read_only, panic_abort, query_capability_info, query_memory_object_size,
-    receive_channel, send_channel, unmap_bootfs, validate_bootstrap_channel, wait_many,
+    map_bootfs_read_only, query_capability_info, query_memory_object_size, receive_channel,
+    send_channel, unmap_bootfs, validate_bootstrap_channel, wait_many,
 };
 #[cfg(any(
     not(any(feature = "wyr1c4-production", feature = "wyr1c5-production")),
@@ -232,7 +235,7 @@ const STREAM_BROAD_RIGHTS: DwRights = DwRights(
     DW_RIGHT_READ.0 | DW_RIGHT_WRITE.0 | DW_RIGHT_WAIT.0 | DW_RIGHT_INSPECT.0 | DW_RIGHT_TRANSFER.0,
 );
 
-fn main(startup: StartupBlock<'_>) -> u32 {
+fn native_main(startup: StartupBlock<'_>) -> u32 {
     run(startup).unwrap_or_else(|code| code)
 }
 
@@ -3074,9 +3077,21 @@ const fn failure(stage: u32) -> u32 {
     FAILURE_BASE | stage
 }
 
-wyrmroot_runtime::native_entry!(crate::main);
+#[cfg(target_os = "wyrmroot")]
+wyrmroot_runtime::native_entry!(crate::native_main);
 
+#[cfg(target_os = "wyrmroot")]
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
     panic_abort()
+}
+
+// This is a guest binary for `x86_64-unknown-wyrmroot`. A host build exists
+// only so a workspace-wide `cargo test` can build the target at all: `_start`
+// and a `#[panic_handler]` would each collide with the std that the host test
+// profile links. Naming the freestanding entry keeps it, and everything it
+// reaches, live for host type-checking; nothing here ever runs on the host.
+#[cfg(not(target_os = "wyrmroot"))]
+fn main() {
+    let _: fn(StartupBlock<'_>) -> u32 = native_main;
 }
