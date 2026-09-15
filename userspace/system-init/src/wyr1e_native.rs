@@ -704,9 +704,7 @@ where
             Err(InitError::Cleanup)
         } else {
             let expired = Err(InitError::Supervision);
-            #[cfg(feature = "wyr1e8-selector33")]
-            let expired = e8_operation(E8FailureOperation::RebindPublication, expired);
-            expired
+            attribute_failure(RecoveryOperation::RebindPublication, expired)
         };
     }
     if let Err(outcome) =
@@ -863,8 +861,7 @@ where
     #[cfg(feature = "wyr1e8-selector33")]
     ensure_recovery_live(resident, now)?;
     let publication = poll_publication_observer(resident, system, waits, now);
-    #[cfg(feature = "wyr1e8-selector33")]
-    let publication = e8_operation(E8FailureOperation::RebindPublication, publication);
+    let publication = attribute_failure(RecoveryOperation::RebindPublication, publication);
     if let Some(outcome) = publication? {
         return Ok(outcome);
     }
@@ -977,10 +974,12 @@ where
                 Ok(PollOutcome::RecoverRegistry)
             };
         }
+        // The WRC8 quiesce exchange is R7A class D1/D3 and stays the selector's;
+        // R7B-2 only made the attribution around it ordinary.
         #[cfg(feature = "wyr1e8-selector33")]
         if bytes[..counts.bytes].starts_with(b"WRC8") {
-            let message = e8_operation(
-                E8FailureOperation::Quiesced,
+            let message = attribute_failure(
+                RecoveryOperation::Quiesced,
                 wyrmroot_consoled::e8_control::parse(&bytes[..counts.bytes])
                     .map_err(|_| InitError::Accounting),
             )?;
@@ -1001,23 +1000,23 @@ where
                 }
                 wyrmroot_consoled::e8_control::Message::Quiesced(identity) => {
                     let quiesced_at = system.now().map_err(InitError::Native)?;
-                    e8_operation(
-                        E8FailureOperation::Quiesced,
+                    attribute_failure(
+                        RecoveryOperation::Quiesced,
                         e6.shell.require_recovery_live_at(quiesced_at),
                     )?;
-                    let action = e8_operation(
-                        E8FailureOperation::Quiesced,
+                    let action = attribute_failure(
+                        RecoveryOperation::Quiesced,
                         e6.shell.accept_e8_quiesced(identity, quiesced_at),
                     )?;
                     if action == E8RecoveryAction::Registry {
                         return Ok(PollOutcome::RecoverRegistryForE8);
                     }
-                    e8_operation(
-                        E8FailureOperation::RequestRetire,
+                    attribute_failure(
+                        RecoveryOperation::RequestRetire,
                         e6.shell.require_recovery_live(system),
                     )?;
-                    e8_operation(
-                        E8FailureOperation::RequestRetire,
+                    attribute_failure(
+                        RecoveryOperation::RequestRetire,
                         (|| {
                             let request =
                                 state.driver.ok_or(InitError::WrongActivationOrder)?.request;
@@ -1037,15 +1036,15 @@ where
                                 .map_err(InitError::Native)
                         })(),
                     )?;
-                    e8_operation(
-                        E8FailureOperation::RequestRetire,
+                    attribute_failure(
+                        RecoveryOperation::RequestRetire,
                         e6.shell.require_recovery_live(system),
                     )?;
                     return Ok(PollOutcome::Stable);
                 }
                 wyrmroot_consoled::e8_control::Message::Quiesce(_) => {
-                    return e8_operation(
-                        E8FailureOperation::Quiesced,
+                    return attribute_failure(
+                        RecoveryOperation::Quiesced,
                         Err(InitError::WrongActivationOrder),
                     );
                 }
@@ -1077,8 +1076,7 @@ where
             retire_current_console(e6, system, waits, state.topology.generation(), true)?;
             if e6.shell.recovery_deadline_expired(validated_at) {
                 let expired = Err(InitError::Supervision);
-                #[cfg(feature = "wyr1e8-selector33")]
-                let expired = e8_operation(E8FailureOperation::ActionDeadline, expired);
+                let expired = attribute_failure(RecoveryOperation::ActionDeadline, expired);
                 return expired;
             }
             return Ok(PollOutcome::RecoverRegistry);
@@ -1124,9 +1122,7 @@ pub(super) fn ensure_recovery_live(
     let live = state.shell.require_recovery_live_at(now);
     // The cause tag stays selector-gated: carrying which leg failed is class C
     // of the R7A inventory and is R7B's next increment, not this one.
-    #[cfg(feature = "wyr1e8-selector33")]
-    let live = e8_operation(E8FailureOperation::ActionDeadline, live);
-    live
+    attribute_failure(RecoveryOperation::ActionDeadline, live)
 }
 
 fn retire_current_console<S, W>(

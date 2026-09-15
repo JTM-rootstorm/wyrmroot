@@ -5233,35 +5233,27 @@ where
                     )
                     .map_err(InitError::Native)?;
                 if let Err(dispatch_error) = dispatched {
+                    // Both arms ran the same emergency cleanup; only one said
+                    // which half of it failed. The other collapsed to a bare
+                    // `Cleanup`, losing the initiating error entirely -- the
+                    // collapse `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` 3.2 says
+                    // owes an instance. One arm now, and the reported kind is
+                    // unchanged: a failed cleanup still reports kind 04.
                     let disconnected = jobs.disconnect_owned_session(grant);
-                    #[cfg(feature = "wyr1e8-selector33")]
-                    {
-                        let emergency_cleanup = match disconnected {
-                            Ok(session) => {
-                                let channel_close_failed =
-                                    system.close_handle(session.channel).is_err();
-                                let owner_cleanup_failed =
-                                    cleanup_session_owner(system, waits, session.owner, true);
-                                E8EmergencyCleanup::Attempted {
-                                    channel_close_failed,
-                                    owner_cleanup_failed,
-                                }
+                    let emergency_cleanup = match disconnected {
+                        Ok(session) => {
+                            let channel_close_failed =
+                                system.close_handle(session.channel).is_err();
+                            let owner_cleanup_failed =
+                                cleanup_session_owner(system, waits, session.owner, true);
+                            EmergencyCleanup::Attempted {
+                                channel_close_failed,
+                                owner_cleanup_failed,
                             }
-                            Err(_) => E8EmergencyCleanup::DisconnectFailed,
-                        };
-                        return Err(e8_dispatch_failure(dispatch_error, emergency_cleanup));
-                    }
-                    #[cfg(not(feature = "wyr1e8-selector33"))]
-                    {
-                        let close_failed = disconnected.map_or(true, |session| {
-                            system.close_handle(session.channel).is_err()
-                                | cleanup_session_owner(system, waits, session.owner, true)
-                        });
-                        if close_failed {
-                            return Err(InitError::Cleanup);
                         }
-                        return Err(dispatch_error);
-                    }
+                        Err(_) => EmergencyCleanup::DisconnectFailed,
+                    };
+                    return Err(dispatch_failure(dispatch_error, emergency_cleanup));
                 }
             }
             Ok(observed) if observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 => {
@@ -5386,16 +5378,18 @@ where
     let session = jobs
         .session_handle(pending.grant)
         .map_err(InitError::Wyr1BModel)?;
+    // The held-wait barrier itself is R7A class D1 and still selector-only;
+    // only the attribution around it became ordinary.
     #[cfg(feature = "wyr1e8-selector33")]
     if scope == LaunchSessionScope::ShellJobs {
         let state = evidence
             .as_deref_mut()
             .ok_or(InitError::WrongActivationOrder)?;
-        if e8_operation(
-            E8FailureOperation::TriggerWait,
+        if attribute_failure(
+            RecoveryOperation::TriggerWait,
             state.e8_wait_is_held(pending),
-        )? || e8_operation(
-            E8FailureOperation::TriggerWait,
+        )? || attribute_failure(
+            RecoveryOperation::TriggerWait,
             state.hold_e8_wait(system, pending, result),
         )? {
             return Ok(());
@@ -8086,7 +8080,6 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "wyr1e8-selector33")]
     fn poll_malformed_dispatch_with_emergency_cleanup(
         fail_channel_close: bool,
         attach_owner: bool,
@@ -8151,16 +8144,15 @@ mod tests {
         (result.unwrap_err(), platform)
     }
 
-    #[cfg(feature = "wyr1e8-selector33")]
     #[test]
-    fn e8_dispatch_failure_with_completed_cleanup_reports_the_initiating_error() {
+    fn dispatch_failure_with_completed_cleanup_reports_the_initiating_error() {
         let (error, platform) = poll_malformed_dispatch_with_emergency_cleanup(false, false);
         assert_eq!(
             error,
-            InitError::E8Transition {
+            InitError::RecoveryTransition {
                 operation: 0x0f,
                 initiating_kind: 0x02,
-                emergency_cleanup: E8EmergencyCleanup::Attempted {
+                emergency_cleanup: EmergencyCleanup::Attempted {
                     channel_close_failed: false,
                     owner_cleanup_failed: false,
                 },
@@ -8174,16 +8166,15 @@ mod tests {
         assert_eq!(platform.terminate_count, 0);
     }
 
-    #[cfg(feature = "wyr1e8-selector33")]
     #[test]
-    fn e8_dispatch_failure_records_channel_cleanup_failure_separately() {
+    fn dispatch_failure_records_channel_cleanup_failure_separately() {
         let (error, platform) = poll_malformed_dispatch_with_emergency_cleanup(true, false);
         assert_eq!(
             error,
-            InitError::E8Transition {
+            InitError::RecoveryTransition {
                 operation: 0x0f,
                 initiating_kind: 0x02,
-                emergency_cleanup: E8EmergencyCleanup::Attempted {
+                emergency_cleanup: EmergencyCleanup::Attempted {
                     channel_close_failed: true,
                     owner_cleanup_failed: false,
                 },
@@ -8197,16 +8188,15 @@ mod tests {
         assert_eq!(platform.terminate_count, 0);
     }
 
-    #[cfg(feature = "wyr1e8-selector33")]
     #[test]
-    fn e8_dispatch_failure_records_owner_cleanup_failure_separately() {
+    fn dispatch_failure_records_owner_cleanup_failure_separately() {
         let (error, platform) = poll_malformed_dispatch_with_emergency_cleanup(false, true);
         assert_eq!(
             error,
-            InitError::E8Transition {
+            InitError::RecoveryTransition {
                 operation: 0x0f,
                 initiating_kind: 0x02,
-                emergency_cleanup: E8EmergencyCleanup::Attempted {
+                emergency_cleanup: EmergencyCleanup::Attempted {
                     channel_close_failed: false,
                     owner_cleanup_failed: true,
                 },
@@ -8223,16 +8213,15 @@ mod tests {
         assert_eq!(platform.terminate_count, 1);
     }
 
-    #[cfg(feature = "wyr1e8-selector33")]
     #[test]
-    fn e8_dispatch_failure_records_both_cleanup_legs_without_a_second_error() {
+    fn dispatch_failure_records_both_cleanup_legs_without_a_second_error() {
         let (error, platform) = poll_malformed_dispatch_with_emergency_cleanup(true, true);
         assert_eq!(
             error,
-            InitError::E8Transition {
+            InitError::RecoveryTransition {
                 operation: 0x0f,
                 initiating_kind: 0x02,
-                emergency_cleanup: E8EmergencyCleanup::Attempted {
+                emergency_cleanup: EmergencyCleanup::Attempted {
                     channel_close_failed: true,
                     owner_cleanup_failed: true,
                 },
@@ -8287,20 +8276,21 @@ mod tests {
             &mut jobs,
             10,
         );
-        #[cfg(feature = "wyr1e8-selector33")]
+        // R7B-2: every build reports which half of the emergency cleanup ran
+        // and what it did. This used to collapse to a bare `Cleanup` outside
+        // the selector, which said a cleanup happened and nothing about what
+        // provoked it.
         assert_eq!(
             result,
-            Err(InitError::E8Transition {
+            Err(InitError::RecoveryTransition {
                 operation: 0x0f,
                 initiating_kind: 0x04,
-                emergency_cleanup: E8EmergencyCleanup::Attempted {
+                emergency_cleanup: EmergencyCleanup::Attempted {
                     channel_close_failed: false,
                     owner_cleanup_failed: false,
                 },
             })
         );
-        #[cfg(not(feature = "wyr1e8-selector33"))]
-        assert_eq!(result, Err(InitError::Cleanup));
         assert_eq!(jobs.session_count(), 0);
         assert_eq!(
             &platform.closed[..platform.close_count],

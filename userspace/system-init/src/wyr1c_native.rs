@@ -3312,20 +3312,13 @@ where
                                                     waits,
                                                     PublicationRebindContext::DriverRetirement,
                                                 );
-                                                #[cfg(feature = "wyr1e8-selector33")]
-                                                let rebound = e8_operation(
-                                                    E8FailureOperation::RebindPublication,
+                                                attribute_failure(
+                                                    RecoveryOperation::RebindPublication,
                                                     rebound,
-                                                );
-                                                rebound
+                                                )
                                             }
                                         })();
-                                        #[cfg(feature = "wyr1e8-selector33")]
-                                        let retired = e8_operation(
-                                            E8FailureOperation::DriverRetired,
-                                            retired,
-                                        );
-                                        retired
+                                        attribute_failure(RecoveryOperation::DriverRetired, retired)
                                     }
                                     #[cfg(not(any(
                                         feature = "wyr1c6-production",
@@ -3363,8 +3356,8 @@ where
                                 feature = "wyr1e-production",
                                 feature = "wyr1e8-selector33"
                             ))]
-                            let dependent_retirement = e8_operation(
-                                E8FailureOperation::RetireDependents,
+                            let dependent_retirement = attribute_failure(
+                                RecoveryOperation::RetireDependents,
                                 dependent_retirement,
                             );
                             #[cfg(feature = "wyr1e-production")]
@@ -3376,10 +3369,8 @@ where
                             };
                             #[cfg(not(feature = "wyr1e8-selector33"))]
                             let _request = reap_driver(resident, system, waits, false);
-                            #[cfg(feature = "wyr1e8-selector33")]
-                            let _request = e8_operation(E8FailureOperation::ReapDriver, _request)?;
-                            #[cfg(not(feature = "wyr1e8-selector33"))]
-                            let _request = _request?;
+                            let _request =
+                                attribute_failure(RecoveryOperation::ReapDriver, _request)?;
                             #[cfg(feature = "wyr1e-production")]
                             {
                                 wyr1e::ensure_recovery_live(
@@ -3395,9 +3386,8 @@ where
                                         state.devmgr.ok_or(InitError::WrongActivationOrder)?;
                                     acknowledge_driver_reaped(system, devmgr, _request)
                                 })();
-                                #[cfg(feature = "wyr1e8-selector33")]
-                                let acknowledged = e8_operation(
-                                    E8FailureOperation::AcknowledgeReaped,
+                                let acknowledged = attribute_failure(
+                                    RecoveryOperation::AcknowledgeReaped,
                                     acknowledged,
                                 );
                                 acknowledged?;
@@ -3548,14 +3538,13 @@ where
     {
         let outcome = wyr1e::poll(resident, system, loader, waits, now_ns)?;
         if outcome != wyr1e::PollOutcome::Stable {
-            #[cfg(feature = "wyr1e8-selector33")]
             if matches!(
                 outcome,
                 wyr1e::PollOutcome::RecoverDevmgr | wyr1e::PollOutcome::RecoverRegistry
             ) && wyr1e::recovery_deadline(resident)?.is_some()
             {
-                return e8_operation(
-                    E8FailureOperation::RecoveryFallback,
+                return attribute_failure(
+                    RecoveryOperation::RecoveryFallback,
                     Err(InitError::Supervision),
                 );
             }
@@ -3577,10 +3566,7 @@ where
                                 let launched = wyr1e::launch_after_publication_observed(
                                     resident, system, loader, waits, bootfs,
                                 );
-                                #[cfg(feature = "wyr1e8-selector33")]
-                                let launched =
-                                    e8_operation(E8FailureOperation::StartConsole, launched);
-                                launched
+                                attribute_failure(RecoveryOperation::StartConsole, launched)
                             }
                             wyr1e::PollOutcome::RecoverDevmgr => {
                                 recover_devmgr(resident, system, loader, waits, bootfs)
@@ -3636,8 +3622,8 @@ where
         return finish_e3a_fatal_recovery(resident, system, waits, child_cleanup_failed);
     }
     #[cfg(all(feature = "wyr1e-production", feature = "wyr1e8-selector33"))]
-    let dependent_cleanup_error = e8_operation(
-        E8FailureOperation::RetireDependents,
+    let dependent_cleanup_error = attribute_failure(
+        RecoveryOperation::RetireDependents,
         wyr1e::retire_dependents(resident, system, waits, true),
     )
     .err();
@@ -3693,12 +3679,13 @@ where
         dependent_cleanup_failed,
         action_deadline,
     );
-    #[cfg(feature = "wyr1e8-selector33")]
-    let exhausted = e8_operation(E8FailureOperation::RetireRegistry, exhausted);
+    let exhausted = attribute_failure(RecoveryOperation::RetireRegistry, exhausted);
+    // `dependent_cleanup_error` is the E8 dependent-retirement leg (R7A class
+    // D1), so this stays gated on the selector that has one.
     #[cfg(feature = "wyr1e8-selector33")]
     if let Some(error) = dependent_cleanup_error {
         return if exhausted.is_err() {
-            e8_operation(E8FailureOperation::RetireRegistry, Err(InitError::Cleanup))
+            attribute_failure(RecoveryOperation::RetireRegistry, Err(InitError::Cleanup))
         } else {
             Err(error)
         };
@@ -3708,9 +3695,11 @@ where
     match step {
         RegistryRecoveryStep::Degraded => {
             resident.result = RecoveryResult::Degraded;
-            #[cfg(feature = "wyr1e8-selector33")]
             if action_deadline.is_some() {
-                return e8_operation(E8FailureOperation::RetireRegistry, Err(InitError::Cleanup));
+                return attribute_failure(
+                    RecoveryOperation::RetireRegistry,
+                    Err(InitError::Cleanup),
+                );
             }
             return Ok(());
         }
@@ -3742,7 +3731,7 @@ where
         )
     };
     #[cfg(feature = "wyr1e8-selector33")]
-    let replacement = e8_operation(E8FailureOperation::LaunchRegistry, replacement)?;
+    let replacement = attribute_failure(RecoveryOperation::LaunchRegistry, replacement)?;
     #[cfg(not(feature = "wyr1e8-selector33"))]
     let replacement = launch_registry_until_ready(
         system,
@@ -3754,10 +3743,9 @@ where
     )?;
     let Some(replacement) = replacement else {
         resident.result = RecoveryResult::Degraded;
-        #[cfg(feature = "wyr1e8-selector33")]
         if action_deadline.is_some() {
-            return e8_operation(
-                E8FailureOperation::LaunchRegistry,
+            return attribute_failure(
+                RecoveryOperation::LaunchRegistry,
                 Err(InitError::Supervision),
             );
         }
@@ -3780,9 +3768,7 @@ where
             let failed: Result<(), InitError> = Err(InitError::Cleanup);
             // Which leg failed is class C of the R7A inventory, so the tag
             // stays selector-gated while the deadline check above does not.
-            #[cfg(feature = "wyr1e8-selector33")]
-            let failed = e8_operation(E8FailureOperation::LaunchRegistry, failed);
-            failed
+            attribute_failure(RecoveryOperation::LaunchRegistry, failed)
         } else {
             Err(error)
         };
@@ -3790,8 +3776,7 @@ where
     #[cfg(feature = "wyr1e-production")]
     {
         let reserved = wyr1e::reserve_registry_replacement(resident, replacement.active.generation);
-        #[cfg(feature = "wyr1e8-selector33")]
-        let reserved = e8_operation(E8FailureOperation::CommitRegistry, reserved);
+        let reserved = attribute_failure(RecoveryOperation::CommitRegistry, reserved);
         reserved?;
     }
     let replacement = restart_topology_or_poison_before(
@@ -3806,14 +3791,12 @@ where
         replacement,
         action_deadline,
     );
-    #[cfg(feature = "wyr1e8-selector33")]
-    let replacement = e8_operation(E8FailureOperation::CommitRegistry, replacement);
+    let replacement = attribute_failure(RecoveryOperation::CommitRegistry, replacement);
     let replacement = replacement?;
     #[cfg(feature = "wyr1e-production")]
     {
         let committed = wyr1e::commit_registry_replacement(resident, replacement.active.generation);
-        #[cfg(feature = "wyr1e8-selector33")]
-        let committed = e8_operation(E8FailureOperation::CommitRegistry, committed);
+        let committed = attribute_failure(RecoveryOperation::CommitRegistry, committed);
         committed?;
     }
     resident
@@ -3836,8 +3819,7 @@ where
             state.last_controller_transaction,
             action_deadline,
         );
-        #[cfg(feature = "wyr1e8-selector33")]
-        let waiting = e8_operation(E8FailureOperation::RebindPublication, waiting);
+        let waiting = attribute_failure(RecoveryOperation::RebindPublication, waiting);
         if let Err(error) = waiting {
             return recover_devmgr_after_error(resident, system, loader, waits, bootfs, error);
         }
@@ -3853,8 +3835,7 @@ where
         waits,
         PublicationRebindContext::RegistryRecovery,
     );
-    #[cfg(feature = "wyr1e8-selector33")]
-    let rebound = e8_operation(E8FailureOperation::RebindPublication, rebound);
+    let rebound = attribute_failure(RecoveryOperation::RebindPublication, rebound);
     if let Err(error) = rebound {
         return recover_devmgr_after_error(resident, system, loader, waits, bootfs, error);
     }
@@ -3865,8 +3846,7 @@ where
         .is_some_and(|state| state.driver.is_some())
     {
         let started = start_wyr1e_or_recover_registry(resident, system, loader, waits, bootfs);
-        #[cfg(feature = "wyr1e8-selector33")]
-        let started = e8_operation(E8FailureOperation::StartConsole, started);
+        let started = attribute_failure(RecoveryOperation::StartConsole, started);
         started?;
     }
     Ok(())
@@ -4155,12 +4135,16 @@ where
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
-    #[cfg(feature = "wyr1e8-selector33")]
-    if wyr1e::recovery_deadline(resident)?.is_some() {
+    // `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` 3.5: the parameter was taken and
+    // then discarded outside the selector, which told every reader this
+    // function carried a cause it did not. It is read in every build now.
+    #[cfg(feature = "wyr1e-production")]
+    let episode_open = wyr1e::recovery_deadline(resident)?.is_some();
+    #[cfg(not(feature = "wyr1e-production"))]
+    let episode_open = false;
+    if episode_open {
         return Err(error);
     }
-    #[cfg(not(feature = "wyr1e8-selector33"))]
-    let _ = error;
     recover_devmgr(resident, system, loader, waits, bootfs)
 }
 

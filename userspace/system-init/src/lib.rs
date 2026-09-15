@@ -120,13 +120,14 @@ pub const fn fatal_application_status(_error: &InitError) -> InitApplicationStat
     InitApplicationStatus::FatalRebootRequired
 }
 
-/// E8-only record of the emergency dispatcher cleanup that followed an
-/// initiating error. This is private diagnostic state, not protocol or
-/// application-status ABI.
-#[cfg(feature = "wyr1e8-selector33")]
+/// What the dispatcher's emergency cleanup did after an initiating error.
+///
+/// Private diagnostic state, not protocol or application-status ABI. Ordinary
+/// supervision state since R7B-2: the selector was never what made a failed
+/// cleanup worth reporting, it was only the one build that reported it.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum E8EmergencyCleanup {
+pub enum EmergencyCleanup {
     NotRun,
     DisconnectFailed,
     Attempted {
@@ -135,8 +136,7 @@ pub enum E8EmergencyCleanup {
     },
 }
 
-#[cfg(feature = "wyr1e8-selector33")]
-impl E8EmergencyCleanup {
+impl EmergencyCleanup {
     const fn failed(self) -> bool {
         match self {
             Self::NotRun => false,
@@ -149,13 +149,16 @@ impl E8EmergencyCleanup {
     }
 }
 
-/// E8-only operation that most narrowly returned an error during the bounded
-/// recovery transition. These values are private diagnostic evidence,
-/// not protocol or application-status ABI.
-#[cfg(feature = "wyr1e8-selector33")]
+/// The operation that most narrowly returned an error during a bounded
+/// recovery transition. Private diagnostic evidence, not protocol or
+/// application-status ABI.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
-pub(crate) enum E8FailureOperation {
+#[allow(
+    dead_code,
+    reason = "the numbering is a reader's vocabulary, shared across products:               a build with no dependent-retirement or held-wait leg never               reports those operations, and gating the variants per feature               would put back the selector-shaped code R7B-2 removes"
+)]
+pub(crate) enum RecoveryOperation {
     TriggerWait = 0x01,
     /// Explicit WRC8 response parsing, identity or post-receive lateness.
     Quiesced = 0x02,
@@ -175,8 +178,11 @@ pub(crate) enum E8FailureOperation {
     StartConsole = 0x0e,
 }
 
-#[cfg(feature = "wyr1e8-selector33")]
-const fn e8_failure_kind(error: &InitError) -> u8 {
+/// Reported when no operation claimed the failure: the error reached the tick
+/// boundary without passing through `attribute_failure`.
+const UNATTRIBUTED_OPERATION: u8 = 0x0f;
+
+const fn failure_kind(error: &InitError) -> u8 {
     match error {
         InitError::WrongActivationOrder => 0x01,
         InitError::Accounting | InitError::Wyr1BModel(_) => 0x02,
@@ -210,7 +216,7 @@ const fn e8_failure_kind(error: &InitError) -> u8 {
         InitError::StartupMapping(_) | InitError::OrdinaryMapping(_) => 0x07,
         #[cfg(feature = "wyr1c6-selector29")]
         InitError::Wyr1C6GateConfig(_) => 0x08,
-        InitError::E8Transition {
+        InitError::RecoveryTransition {
             initiating_kind,
             emergency_cleanup,
             ..
@@ -228,55 +234,74 @@ const fn e8_failure_kind(error: &InitError) -> u8 {
     }
 }
 
-#[cfg(feature = "wyr1e8-selector33")]
-pub(crate) fn e8_operation<T>(
-    operation: E8FailureOperation,
+/// Names the operation a failure came from, innermost wins.
+///
+/// An error that already carries an attribution keeps it, so wrapping an outer
+/// step does not overwrite the narrow one that actually failed.
+pub(crate) fn attribute_failure<T>(
+    operation: RecoveryOperation,
     result: Result<T, InitError>,
 ) -> Result<T, InitError> {
     result.map_err(|error| match error {
-        InitError::E8Transition { .. } => error,
-        _ => InitError::E8Transition {
+        InitError::RecoveryTransition { .. } => error,
+        _ => InitError::RecoveryTransition {
             operation: operation as u8,
-            initiating_kind: e8_failure_kind(&error),
-            emergency_cleanup: E8EmergencyCleanup::NotRun,
+            initiating_kind: failure_kind(&error),
+            emergency_cleanup: EmergencyCleanup::NotRun,
         },
     })
 }
 
-#[cfg(feature = "wyr1e8-selector33")]
-pub(crate) fn e8_dispatch_failure(
-    error: InitError,
-    emergency_cleanup: E8EmergencyCleanup,
-) -> InitError {
+pub(crate) fn dispatch_failure(error: InitError, emergency_cleanup: EmergencyCleanup) -> InitError {
     match error {
-        InitError::E8Transition {
+        InitError::RecoveryTransition {
             operation,
             initiating_kind,
             ..
-        } => InitError::E8Transition {
+        } => InitError::RecoveryTransition {
             operation,
             initiating_kind,
             emergency_cleanup,
         },
-        error => InitError::E8Transition {
+        error => InitError::RecoveryTransition {
             operation: 0x0f,
-            initiating_kind: e8_failure_kind(&error),
+            initiating_kind: failure_kind(&error),
             emergency_cleanup,
         },
     }
 }
 
-/// Application detail for a fatal resident tick. E8 records the narrow
-/// operation that returned `Err` and its initiating kind. If the dispatcher's
-/// emergency cleanup fails, the same operation is reported with existing kind
-/// `04` while the initiating kind remains in the private carrier. Every other
-/// build preserves the established coarse resident failure code.
+/// Application detail for a fatal resident tick: `AF18SSKK`, where `SS` is the
+/// narrow operation that returned `Err` and `KK` its initiating kind. If the
+/// dispatcher's emergency cleanup fails, the same operation is reported with
+/// kind `04` while the initiating kind stays in the private carrier.
+///
+/// R7B-2 made this every build's encoding. It used to be E8's alone, and every
+/// other build returned the single constant `0xAF01_0006` -- which is the exact
+/// reading that stalled A8: the transcript showed a fatal tick and the frozen
+/// evidence could not say which operation produced it. That is the collapse
+/// `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §3.2 says owes an instance to the
+/// reader's channel, and the process exit status is that channel here. E8's own
+/// values are unchanged, so its transcripts stay byte-identical to the A27
+/// baseline; `0xAF01_0006` is now unreachable, because operation `0x00` cannot
+/// be produced, and so still reads unambiguously as a pre-R7B-2 build.
+///
+/// Selector 34 keeps its own category encoding: `test_failure_category` is a
+/// 32-value space that R1's evidence is written against, not this 8-kind one.
 #[must_use]
 pub const fn resident_tick_failure_application_status(error: &InitError) -> u32 {
-    #[cfg(feature = "wyr1e8-selector33")]
+    #[cfg(feature = "r1-selector34")]
     {
+        0xAF36_0000 | test_failure_category(error)
+    }
+    #[cfg(not(feature = "r1-selector34"))]
+    {
+        // Not a wildcard over `InitError` in the sense §3.4 forbids: every
+        // variant but this one is named by `failure_kind`, whose match is
+        // exhaustive, so a new variant still fails to compile rather than
+        // inheriting an arm here.
         let (operation, kind) = match error {
-            InitError::E8Transition {
+            InitError::RecoveryTransition {
                 operation,
                 initiating_kind,
                 emergency_cleanup,
@@ -288,29 +313,17 @@ pub const fn resident_tick_failure_application_status(error: &InitError) -> u32 
                     *initiating_kind
                 },
             ),
-            _ => (0x0f, e8_failure_kind(error)),
+            unattributed => (UNATTRIBUTED_OPERATION, failure_kind(unattributed)),
         };
         let operation = match operation {
             0x01..=0x0f => operation,
-            _ => 0x0f,
+            _ => UNATTRIBUTED_OPERATION,
         };
         let kind = match kind {
             0x01..=0x08 | 0x0f => kind,
             _ => 0x0f,
         };
         0xAF18_0000 | (operation as u32) << 8 | kind as u32
-    }
-    // Selector 34 keeps the category here for the same reason it keeps it at the
-    // pre-READY boundary: a resident-tick failure that reports only 0xAF01_0006
-    // cannot be told apart from any other fatal tick.
-    #[cfg(feature = "r1-selector34")]
-    {
-        0xAF36_0000 | test_failure_category(error)
-    }
-    #[cfg(not(any(feature = "wyr1e8-selector33", feature = "r1-selector34")))]
-    {
-        let _ = error;
-        0xAF01_0006
     }
 }
 
@@ -361,8 +374,7 @@ const fn test_failure_category(error: &InitError) -> u32 {
         InitError::Wyr1BEvidence(_) => 0x1e,
         #[cfg(feature = "wyr1c6-selector29")]
         InitError::Wyr1C6GateConfig(_) => 0x1f,
-        #[cfg(feature = "wyr1e8-selector33")]
-        InitError::E8Transition { .. } => 0x20,
+        InitError::RecoveryTransition { .. } => 0x20,
         #[cfg(feature = "r1-selector34")]
         InitError::R1Probe(failure) => failure.category(),
         #[cfg(feature = "r1-selector34")]
@@ -606,8 +618,7 @@ pub const fn r1_test_failure_application_status(error: &InitError) -> u32 {
         }
         #[cfg(feature = "wyr1c6-selector29")]
         InitError::Wyr1C6GateConfig(_) => 0xAF34_0000 | test_failure_category(error),
-        #[cfg(feature = "wyr1e8-selector33")]
-        InitError::E8Transition { .. } => 0xAF34_0000 | test_failure_category(error),
+        InitError::RecoveryTransition { .. } => 0xAF34_0000 | test_failure_category(error),
     }
 }
 
@@ -1244,11 +1255,11 @@ pub enum InitError {
     Wyr1BEvidence(wyr1b_gate::GateError),
     #[cfg(feature = "wyr1c6-selector29")]
     Wyr1C6GateConfig(wyr1c6_gate::GateError),
-    #[cfg(feature = "wyr1e8-selector33")]
-    E8Transition {
+    /// A bounded recovery transition failed, naming the operation it failed in.
+    RecoveryTransition {
         operation: u8,
         initiating_kind: u8,
-        emergency_cleanup: E8EmergencyCleanup,
+        emergency_cleanup: EmergencyCleanup,
     },
     #[cfg(feature = "r1-selector34")]
     R1Probe(R1ProbeFailure),
@@ -2780,9 +2791,7 @@ where
             core::slice::from_ref(&retire_item),
             DwDeadline(retire_deadline),
         )
-        .map_err(|error| {
-            InitError::BootstrapRetirement(BootstrapRetirementFailure::Wait(error))
-        })?;
+        .map_err(|error| InitError::BootstrapRetirement(BootstrapRetirementFailure::Wait(error)))?;
     if retired.index != 0 || retired.observed.0 & DW_SIGNAL_PEER_CLOSED.0 == 0 {
         return Err(InitError::BootstrapRetirement(
             BootstrapRetirementFailure::WrongResult {
@@ -4522,28 +4531,8 @@ mod native_cleanup_tests {
 
     #[test]
     fn resident_tick_failure_detail_preserves_the_selected_profile() {
-        // Selector 34 keeps its category at this boundary too, so it is excluded
-        // from the collapsing case rather than asserted to collapse: this test
-        // predates that selector and only ran under features where it does.
-        #[cfg(not(any(feature = "wyr1e8-selector33", feature = "r1-selector34")))]
-        for error in [
-            InitError::Accounting,
-            InitError::Supervision,
-            InitError::Cleanup,
-            InitError::WrongActivationOrder,
-        ] {
-            assert_eq!(
-                resident_tick_failure_application_status(&error),
-                0xAF01_0006
-            );
-        }
-
-        #[cfg(feature = "wyr1e8-selector33")]
-        assert_eq!(
-            resident_tick_failure_application_status(&InitError::Accounting),
-            0xAF18_0F02
-        );
-
+        // Selector 34 keeps its own category encoding at this boundary: it is a
+        // 32-value space R1's evidence is written against, not this 8-kind one.
         #[cfg(feature = "r1-selector34")]
         for error in [
             InitError::Accounting,
@@ -4556,28 +4545,80 @@ mod native_cleanup_tests {
                 0xAF36_0000 | test_failure_category(&error)
             );
         }
+
+        // Every other build reports the operation and the kind. Before R7B-2
+        // only E8 did, and the rest returned 0xAF01_0006 for all four of these
+        // -- one value standing for every fatal tick, which is the reading that
+        // stalled A8.
+        #[cfg(not(feature = "r1-selector34"))]
+        for (error, expected) in [
+            (InitError::Accounting, 0xAF18_0F02),
+            (InitError::Supervision, 0xAF18_0F03),
+            (InitError::Cleanup, 0xAF18_0F04),
+            (InitError::WrongActivationOrder, 0xAF18_0F01),
+        ] {
+            assert_eq!(resident_tick_failure_application_status(&error), expected);
+        }
+
+        // An attributed failure reports its operation in place of 0x0f, and a
+        // failed emergency cleanup reports kind 04 while the initiating kind
+        // stays in the private carrier rather than being lost.
+        #[cfg(not(feature = "r1-selector34"))]
+        {
+            assert_eq!(
+                resident_tick_failure_application_status(&InitError::RecoveryTransition {
+                    operation: RecoveryOperation::StartConsole as u8,
+                    initiating_kind: 0x02,
+                    emergency_cleanup: EmergencyCleanup::NotRun,
+                }),
+                0xAF18_0E02
+            );
+            assert_eq!(
+                resident_tick_failure_application_status(&InitError::RecoveryTransition {
+                    operation: RecoveryOperation::StartConsole as u8,
+                    initiating_kind: 0x02,
+                    emergency_cleanup: EmergencyCleanup::DisconnectFailed,
+                }),
+                0xAF18_0E04
+            );
+        }
+
+        // 0xAF01_0006 is now unreachable: operation 0x00 cannot be produced, so
+        // the old collapsed value still reads as a pre-R7B-2 build.
+        #[cfg(not(feature = "r1-selector34"))]
+        for error in [
+            InitError::Accounting,
+            InitError::Supervision,
+            InitError::Cleanup,
+            InitError::WrongActivationOrder,
+        ] {
+            assert_ne!(
+                resident_tick_failure_application_status(&error),
+                0xAF01_0006
+            );
+        }
     }
 
     #[cfg(feature = "wyr1e8-selector33")]
     #[test]
     fn e8_failure_detail_is_finite_unique_and_keeps_the_narrowest_operation() {
         for operation in [
-            E8FailureOperation::TriggerWait,
-            E8FailureOperation::Quiesced,
-            E8FailureOperation::RequestRetire,
-            E8FailureOperation::RetireDependents,
-            E8FailureOperation::ReapDriver,
-            E8FailureOperation::AcknowledgeReaped,
-            E8FailureOperation::DriverRetired,
-            E8FailureOperation::RebindPublication,
-            E8FailureOperation::ActionDeadline,
-            E8FailureOperation::RecoveryFallback,
-            E8FailureOperation::RetireRegistry,
-            E8FailureOperation::LaunchRegistry,
-            E8FailureOperation::CommitRegistry,
-            E8FailureOperation::StartConsole,
+            RecoveryOperation::TriggerWait,
+            RecoveryOperation::Quiesced,
+            RecoveryOperation::RequestRetire,
+            RecoveryOperation::RetireDependents,
+            RecoveryOperation::ReapDriver,
+            RecoveryOperation::AcknowledgeReaped,
+            RecoveryOperation::DriverRetired,
+            RecoveryOperation::RebindPublication,
+            RecoveryOperation::ActionDeadline,
+            RecoveryOperation::RecoveryFallback,
+            RecoveryOperation::RetireRegistry,
+            RecoveryOperation::LaunchRegistry,
+            RecoveryOperation::CommitRegistry,
+            RecoveryOperation::StartConsole,
         ] {
-            let error = e8_operation::<()>(operation, Err(InitError::Cleanup)).unwrap_err();
+            let error = attribute_failure::<()>(operation, Err(InitError::Cleanup)).unwrap_err();
             assert_eq!(
                 resident_tick_failure_application_status(&error),
                 0xAF18_0004 | (operation as u32) << 8
@@ -4602,17 +4643,17 @@ mod native_cleanup_tests {
             (InitError::ZeroBootGeneration, 0x0f),
         ] {
             let error =
-                e8_operation::<()>(E8FailureOperation::TriggerWait, Err(error)).unwrap_err();
+                attribute_failure::<()>(RecoveryOperation::TriggerWait, Err(error)).unwrap_err();
             assert_eq!(
                 resident_tick_failure_application_status(&error),
                 0xAF18_0100 | expected_kind
             );
         }
 
-        let nested = e8_operation(
-            E8FailureOperation::DriverRetired,
-            e8_operation::<()>(
-                E8FailureOperation::RebindPublication,
+        let nested = attribute_failure(
+            RecoveryOperation::DriverRetired,
+            attribute_failure::<()>(
+                RecoveryOperation::RebindPublication,
                 Err(InitError::Cleanup),
             ),
         )
@@ -4622,15 +4663,15 @@ mod native_cleanup_tests {
             0xAF18_0804
         );
         assert_eq!(
-            resident_tick_failure_application_status(&InitError::E8Transition {
+            resident_tick_failure_application_status(&InitError::RecoveryTransition {
                 operation: 0,
                 initiating_kind: 0,
-                emergency_cleanup: E8EmergencyCleanup::NotRun,
+                emergency_cleanup: EmergencyCleanup::NotRun,
             }),
             0xAF18_0F0F
         );
         assert_eq!(
-            e8_operation(E8FailureOperation::RequestRetire, Ok::<_, InitError>(7)),
+            attribute_failure(RecoveryOperation::RequestRetire, Ok::<_, InitError>(7)),
             Ok(7)
         );
     }
@@ -4639,17 +4680,18 @@ mod native_cleanup_tests {
     #[test]
     fn recovery_supervision_failures_keep_their_source_family() {
         for (operation, expected) in [
-            (E8FailureOperation::Quiesced, 0xAF18_0203),
-            (E8FailureOperation::ActionDeadline, 0xAF18_0903),
-            (E8FailureOperation::RecoveryFallback, 0xAF18_0A03),
+            (RecoveryOperation::Quiesced, 0xAF18_0203),
+            (RecoveryOperation::ActionDeadline, 0xAF18_0903),
+            (RecoveryOperation::RecoveryFallback, 0xAF18_0A03),
         ] {
             let initiating =
-                e8_operation::<()>(operation, Err(InitError::Supervision)).unwrap_err();
-            let nested = e8_operation::<()>(E8FailureOperation::RebindPublication, Err(initiating))
-                .unwrap_err();
-            let dispatched = e8_dispatch_failure(
+                attribute_failure::<()>(operation, Err(InitError::Supervision)).unwrap_err();
+            let nested =
+                attribute_failure::<()>(RecoveryOperation::RebindPublication, Err(initiating))
+                    .unwrap_err();
+            let dispatched = dispatch_failure(
                 nested,
-                E8EmergencyCleanup::Attempted {
+                EmergencyCleanup::Attempted {
                     channel_close_failed: false,
                     owner_cleanup_failed: false,
                 },
@@ -4658,7 +4700,7 @@ mod native_cleanup_tests {
                 resident_tick_failure_application_status(&dispatched),
                 expected
             );
-            assert_eq!(e8_operation(operation, Ok::<_, InitError>(7)), Ok(7));
+            assert_eq!(attribute_failure(operation, Ok::<_, InitError>(7)), Ok(7));
         }
     }
 
@@ -4666,50 +4708,50 @@ mod native_cleanup_tests {
     #[test]
     fn registry_recovery_failures_keep_phase_and_nested_operations() {
         for (operation, expected) in [
-            (E8FailureOperation::RetireDependents, 0xAF18_0404),
-            (E8FailureOperation::RebindPublication, 0xAF18_0804),
-            (E8FailureOperation::ActionDeadline, 0xAF18_0904),
-            (E8FailureOperation::RetireRegistry, 0xAF18_0B04),
-            (E8FailureOperation::LaunchRegistry, 0xAF18_0C04),
-            (E8FailureOperation::CommitRegistry, 0xAF18_0D04),
-            (E8FailureOperation::StartConsole, 0xAF18_0E04),
+            (RecoveryOperation::RetireDependents, 0xAF18_0404),
+            (RecoveryOperation::RebindPublication, 0xAF18_0804),
+            (RecoveryOperation::ActionDeadline, 0xAF18_0904),
+            (RecoveryOperation::RetireRegistry, 0xAF18_0B04),
+            (RecoveryOperation::LaunchRegistry, 0xAF18_0C04),
+            (RecoveryOperation::CommitRegistry, 0xAF18_0D04),
+            (RecoveryOperation::StartConsole, 0xAF18_0E04),
         ] {
-            let error = e8_operation::<()>(operation, Err(InitError::Cleanup)).unwrap_err();
+            let error = attribute_failure::<()>(operation, Err(InitError::Cleanup)).unwrap_err();
             assert_eq!(resident_tick_failure_application_status(&error), expected);
             let nested =
-                e8_operation::<()>(E8FailureOperation::StartConsole, Err(error)).unwrap_err();
+                attribute_failure::<()>(RecoveryOperation::StartConsole, Err(error)).unwrap_err();
             assert_eq!(
                 nested,
-                InitError::E8Transition {
+                InitError::RecoveryTransition {
                     operation: operation as u8,
                     initiating_kind: 4,
-                    emergency_cleanup: E8EmergencyCleanup::NotRun,
+                    emergency_cleanup: EmergencyCleanup::NotRun,
                 }
             );
-            let deadline = e8_operation::<()>(
-                E8FailureOperation::ActionDeadline,
+            let deadline = attribute_failure::<()>(
+                RecoveryOperation::ActionDeadline,
                 Err(InitError::Supervision),
             )
             .unwrap_err();
-            let nested_deadline = e8_operation::<()>(operation, Err(deadline)).unwrap_err();
+            let nested_deadline = attribute_failure::<()>(operation, Err(deadline)).unwrap_err();
             assert_eq!(
                 resident_tick_failure_application_status(&nested_deadline),
                 0xAF18_0903
             );
             assert_eq!(
-                e8_operation(operation, Ok::<_, InitError>(Some(7))),
+                attribute_failure(operation, Ok::<_, InitError>(Some(7))),
                 Ok(Some(7))
             );
             assert_eq!(
-                e8_operation(operation, Ok::<Option<u64>, InitError>(None)),
+                attribute_failure(operation, Ok::<Option<u64>, InitError>(None)),
                 Ok(None)
             );
         }
         for operation in [0, 0x10, u8::MAX] {
-            let error = InitError::E8Transition {
+            let error = InitError::RecoveryTransition {
                 operation,
                 initiating_kind: 4,
-                emergency_cleanup: E8EmergencyCleanup::NotRun,
+                emergency_cleanup: EmergencyCleanup::NotRun,
             };
             assert_eq!(
                 resident_tick_failure_application_status(&error),
@@ -4724,23 +4766,23 @@ mod native_cleanup_tests {
 
     #[cfg(feature = "wyr1e8-selector33")]
     #[test]
-    fn e8_dispatch_failure_keeps_initiating_detail_and_cleanup_outcome_separate() {
-        let initiating = e8_operation::<()>(
-            E8FailureOperation::Quiesced,
+    fn dispatch_failure_keeps_initiating_detail_and_cleanup_outcome_separate() {
+        let initiating = attribute_failure::<()>(
+            RecoveryOperation::Quiesced,
             Err(InitError::Native(NativeError::Status(
                 deepwyrm_syscall::DwStatus(-11),
             ))),
         )
         .unwrap_err();
-        let cleanup = E8EmergencyCleanup::Attempted {
+        let cleanup = EmergencyCleanup::Attempted {
             channel_close_failed: true,
             owner_cleanup_failed: false,
         };
-        let joined = e8_dispatch_failure(initiating, cleanup);
+        let joined = dispatch_failure(initiating, cleanup);
         assert_eq!(
             joined,
-            InitError::E8Transition {
-                operation: E8FailureOperation::Quiesced as u8,
+            InitError::RecoveryTransition {
+                operation: RecoveryOperation::Quiesced as u8,
                 initiating_kind: 0x05,
                 emergency_cleanup: cleanup,
             }
@@ -4750,9 +4792,9 @@ mod native_cleanup_tests {
             0xAF18_0204
         );
 
-        let completed = e8_dispatch_failure(
+        let completed = dispatch_failure(
             InitError::Accounting,
-            E8EmergencyCleanup::Attempted {
+            EmergencyCleanup::Attempted {
                 channel_close_failed: false,
                 owner_cleanup_failed: false,
             },
@@ -4762,15 +4804,15 @@ mod native_cleanup_tests {
             0xAF18_0F02
         );
         assert_eq!(
-            e8_dispatch_failure(InitError::Accounting, E8EmergencyCleanup::DisconnectFailed),
-            InitError::E8Transition {
+            dispatch_failure(InitError::Accounting, EmergencyCleanup::DisconnectFailed),
+            InitError::RecoveryTransition {
                 operation: 0x0f,
                 initiating_kind: 0x02,
-                emergency_cleanup: E8EmergencyCleanup::DisconnectFailed,
+                emergency_cleanup: EmergencyCleanup::DisconnectFailed,
             }
         );
         let disconnect_failed =
-            e8_dispatch_failure(InitError::Accounting, E8EmergencyCleanup::DisconnectFailed);
+            dispatch_failure(InitError::Accounting, EmergencyCleanup::DisconnectFailed);
         assert_eq!(
             resident_tick_failure_application_status(&disconnect_failed),
             0xAF18_0F04
@@ -5658,21 +5700,66 @@ mod r1_cause_preservation {
     /// because it is fixed: it was the one that actually fired, and it is the only
     /// path every record takes.
     const PROBE_DISCARDS: [(&str, &str); 15] = [
-        ("query_capability_info(parent).map_err(|_| PROBE_ERROR_BASE + 0x0001)?,", "parent handle query"),
-        (".map_err(|_| PROBE_ERROR_BASE + 0x0002)?;", "bootstrap channel validation"),
-        ("receive_channel(parent, &mut init, &mut handles).map_err(|_| PROBE_ERROR_BASE + 0x0004)?;", "startup INIT receive"),
-        (".map_err(|_| PROBE_ERROR_BASE + 0x000E)", "READY send to the parent"),
-        ("parse_correlation_environment(&entries).map_err(|_| PROBE_ERROR_BASE + 0x000F)?;", "correlation environment parse"),
-        (".map_err(|_| PROBE_ERROR_BASE + 0x0017)?;", "hog launch encode"),
-        (".map_err(|_| PROBE_ERROR_BASE + 0x0018)?;", "hog launch send"),
-        (".map_err(|_| PROBE_ERROR_BASE + 0x0020)?;", "progress launch encode"),
-        ("send_channel(session.channel, &bytes[..size], &[]).map_err(|_| PROBE_ERROR_BASE + 0x0021)?;", "progress launch send"),
-        (".map_err(|_| PROBE_ERROR_BASE + 0x0023)?;", "job message encode"),
-        ("send_channel(session.channel, &bytes[..size], &[]).map_err(|_| PROBE_ERROR_BASE + 0x0024)?;", "job message send"),
-        (".map_err(|_| PROBE_ERROR_BASE + 0x0026)?;", "session reply receive"),
-        ("let parsed = parse_message(&bytes[..counts.bytes], 0).map_err(|_| PROBE_ERROR_BASE + 0x0028)?;", "session reply parse"),
-        ("let deadline = monotonic_deadline_after(timeout).map_err(|_| code)?;", "deadline arithmetic; keeps the caller's site, loses the status"),
-        ("let observed = query_capability_info(info.handle).map_err(|_| ())?;", "received-handle check; discards into unit, keeping nothing"),
+        (
+            "query_capability_info(parent).map_err(|_| PROBE_ERROR_BASE + 0x0001)?,",
+            "parent handle query",
+        ),
+        (
+            ".map_err(|_| PROBE_ERROR_BASE + 0x0002)?;",
+            "bootstrap channel validation",
+        ),
+        (
+            "receive_channel(parent, &mut init, &mut handles).map_err(|_| PROBE_ERROR_BASE + 0x0004)?;",
+            "startup INIT receive",
+        ),
+        (
+            ".map_err(|_| PROBE_ERROR_BASE + 0x000E)",
+            "READY send to the parent",
+        ),
+        (
+            "parse_correlation_environment(&entries).map_err(|_| PROBE_ERROR_BASE + 0x000F)?;",
+            "correlation environment parse",
+        ),
+        (
+            ".map_err(|_| PROBE_ERROR_BASE + 0x0017)?;",
+            "hog launch encode",
+        ),
+        (
+            ".map_err(|_| PROBE_ERROR_BASE + 0x0018)?;",
+            "hog launch send",
+        ),
+        (
+            ".map_err(|_| PROBE_ERROR_BASE + 0x0020)?;",
+            "progress launch encode",
+        ),
+        (
+            "send_channel(session.channel, &bytes[..size], &[]).map_err(|_| PROBE_ERROR_BASE + 0x0021)?;",
+            "progress launch send",
+        ),
+        (
+            ".map_err(|_| PROBE_ERROR_BASE + 0x0023)?;",
+            "job message encode",
+        ),
+        (
+            "send_channel(session.channel, &bytes[..size], &[]).map_err(|_| PROBE_ERROR_BASE + 0x0024)?;",
+            "job message send",
+        ),
+        (
+            ".map_err(|_| PROBE_ERROR_BASE + 0x0026)?;",
+            "session reply receive",
+        ),
+        (
+            "let parsed = parse_message(&bytes[..counts.bytes], 0).map_err(|_| PROBE_ERROR_BASE + 0x0028)?;",
+            "session reply parse",
+        ),
+        (
+            "let deadline = monotonic_deadline_after(timeout).map_err(|_| code)?;",
+            "deadline arithmetic; keeps the caller's site, loses the status",
+        ),
+        (
+            "let observed = query_capability_info(info.handle).map_err(|_| ())?;",
+            "received-handle check; discards into unit, keeping nothing",
+        ),
     ];
 
     /// The probe's real code, with comments dropped.
@@ -5721,7 +5808,10 @@ mod r1_cause_preservation {
                 probe_offending_lines().any(|line| line == known),
                 "PROBE_DISCARDS lists a site that no longer exists: {known} ({reason})"
             );
-            assert!(!reason.is_empty(), "every declared probe discard names its site");
+            assert!(
+                !reason.is_empty(),
+                "every declared probe discard names its site"
+            );
         }
     }
 
@@ -5742,7 +5832,9 @@ mod r1_cause_preservation {
              refused send is once again indistinguishable from any other"
         );
         assert!(
-            !PROBE_SOURCE.1.contains("map_err(|_| PROBE_ERROR_BASE + 0x0030)"),
+            !PROBE_SOURCE
+                .1
+                .contains("map_err(|_| PROBE_ERROR_BASE + 0x0030)"),
             "run 7's discarding form is back at the probe's record send"
         );
         // A refused send must also put the sequence back. Runs 9 and 11 reported
@@ -5780,7 +5872,6 @@ mod r1_cause_preservation {
         ),
         ("Cleanup", "InitError::Cleanup", 7),
     ];
-
 
     /// Lines that convert one error into another while discarding the original.
     ///

@@ -216,16 +216,16 @@ fn driver_exit_uses_the_reached_production_owner_order() {
 fn supervision_discriminator_stays_at_the_three_existing_failure_sources() {
     let guard = &NATIVE[NATIVE.find("pub(super) fn ensure_recovery_live(").unwrap()
         ..NATIVE.find("fn retire_current_console<").unwrap()];
-    assert!(guard.contains("E8FailureOperation::ActionDeadline"));
+    assert!(guard.contains("RecoveryOperation::ActionDeadline"));
     assert!(guard.contains("state.shell.require_recovery_live_at(now)"));
-    assert!(!guard.contains("E8FailureOperation::Quiesced"));
+    assert!(!guard.contains("RecoveryOperation::Quiesced"));
 
     let late_ready_start = NATIVE.find("if validated_at >= e6.ready_deadline").unwrap();
     let late_ready = &NATIVE[late_ready_start..];
     let late_ready = &late_ready[..late_ready.find("e6.awaiting_ready = false;").unwrap()];
     assert!(late_ready.contains("e6.shell.recovery_deadline_expired(validated_at)"));
-    assert!(late_ready.contains("E8FailureOperation::ActionDeadline"));
-    assert!(!late_ready.contains("E8FailureOperation::Quiesced"));
+    assert!(late_ready.contains("RecoveryOperation::ActionDeadline"));
+    assert!(!late_ready.contains("RecoveryOperation::Quiesced"));
 
     let response = &NATIVE[NATIVE
         .find("if bytes[..counts.bytes].starts_with(b\"WRC8\")")
@@ -233,24 +233,28 @@ fn supervision_discriminator_stays_at_the_three_existing_failure_sources() {
         ..NATIVE
             .find("if wyrmroot_loader::launch::parse_ready_for_profile")
             .unwrap()];
-    assert_eq!(response.matches("E8FailureOperation::Quiesced").count(), 4);
+    assert_eq!(response.matches("RecoveryOperation::Quiesced").count(), 4);
     assert!(response.contains("e6.shell.require_recovery_live_at(quiesced_at)"));
     assert!(response.contains("e6.shell.accept_e8_quiesced(identity, quiesced_at)"));
-    assert!(!response.contains("E8FailureOperation::ActionDeadline"));
-    assert!(!response.contains("E8FailureOperation::RecoveryFallback"));
+    assert!(!response.contains("RecoveryOperation::ActionDeadline"));
+    assert!(!response.contains("RecoveryOperation::RecoveryFallback"));
 
     let fallback_start = RESIDENT.find("let outcome = wyr1e::poll(").unwrap();
     let fallback = &RESIDENT[fallback_start..];
     let fallback = &fallback[..fallback.find("let size = system").unwrap()];
-    assert!(fallback.contains("#[cfg(feature = \"wyr1e8-selector33\")]"));
+    // R7B-2: the fallback is no longer the selector's. It is reached only when
+    // an episode is open, and a product build opens none, so removing the gate
+    // changed which builds compile it and not which builds take it. Pin that
+    // the gate is gone, so putting it back has to argue with this line.
+    assert!(!fallback.contains("#[cfg(feature = \"wyr1e8-selector33\")]"));
     assert!(
         fallback
             .contains("wyr1e::PollOutcome::RecoverDevmgr | wyr1e::PollOutcome::RecoverRegistry")
     );
     assert!(fallback.contains("wyr1e::recovery_deadline(resident)?.is_some()"));
-    assert!(fallback.contains("E8FailureOperation::RecoveryFallback"));
+    assert!(fallback.contains("RecoveryOperation::RecoveryFallback"));
     assert!(fallback.contains("Err(InitError::Supervision)"));
-    assert!(!fallback.contains("E8FailureOperation::Quiesced"));
+    assert!(!fallback.contains("RecoveryOperation::Quiesced"));
 }
 
 #[test]
@@ -261,7 +265,7 @@ fn registry_recovery_phase_failures_are_wrapped_at_existing_boundaries() {
             .unwrap()];
     let dependents = &recovery[recovery.find("let dependent_cleanup_error =").unwrap()
         ..recovery.find("let registry = resident").unwrap()];
-    assert!(dependents.contains("E8FailureOperation::RetireDependents"));
+    assert!(dependents.contains("RecoveryOperation::RetireDependents"));
     assert!(dependents.contains("wyr1e::retire_dependents(resident, system, waits, true)"));
     for (binding, operation) in [
         ("exhausted", "RetireRegistry"),
@@ -274,7 +278,7 @@ fn registry_recovery_phase_failures_are_wrapped_at_existing_boundaries() {
         ("started", "StartConsole"),
     ] {
         assert!(recovery.contains(&format!(
-            "e8_operation(E8FailureOperation::{operation}, {binding})"
+            "attribute_failure(RecoveryOperation::{operation}, {binding})"
         )));
     }
     assert_eq!(recovery.matches("wyr1e::ensure_recovery_live(").count(), 3);
@@ -285,7 +289,7 @@ fn registry_recovery_phase_failures_are_wrapped_at_existing_boundaries() {
             .find("wyr1e::PollOutcome::RecoverDevmgr =>")
             .unwrap()];
     assert!(console_start.contains("wyr1e::launch_after_publication_observed("));
-    assert!(console_start.contains("e8_operation(E8FailureOperation::StartConsole, launched)"));
+    assert!(console_start.contains("attribute_failure(RecoveryOperation::StartConsole, launched)"));
     let publication = &NATIVE[NATIVE.find("pub(super) fn poll<").unwrap()
         ..NATIVE.find("fn retire_current_console<").unwrap()];
     assert!(
@@ -293,7 +297,8 @@ fn registry_recovery_phase_failures_are_wrapped_at_existing_boundaries() {
             .contains("let publication = poll_publication_observer(resident, system, waits, now)")
     );
     assert!(
-        publication.contains("e8_operation(E8FailureOperation::RebindPublication, publication)")
+        publication
+            .contains("attribute_failure(RecoveryOperation::RebindPublication, publication)")
     );
 }
 
@@ -348,15 +353,15 @@ fn e8_failure_detail_is_bound_to_each_actual_transition_join() {
             .unwrap();
     let held_wait = &jobs[held_wait_start..held_wait_end];
     assert_eq!(
-        held_wait.matches("E8FailureOperation::TriggerWait").count(),
+        held_wait.matches("RecoveryOperation::TriggerWait").count(),
         2
     );
 
     let quiesced = &console[console.find("Message::Quiesced(identity)").unwrap()
         ..console.find("Message::Quiesce(_)").unwrap()];
     for operation in [
-        "E8FailureOperation::Quiesced",
-        "E8FailureOperation::RequestRetire",
+        "RecoveryOperation::Quiesced",
+        "RecoveryOperation::RequestRetire",
     ] {
         assert!(quiesced.contains(operation));
     }
@@ -370,8 +375,8 @@ fn e8_failure_detail_is_bound_to_each_actual_transition_join() {
             .unwrap();
     let driver_retired = &driver[driver_retired_start..driver_retired_end];
     for operation in [
-        "E8FailureOperation::DriverRetired",
-        "E8FailureOperation::RebindPublication",
+        "RecoveryOperation::DriverRetired",
+        "RecoveryOperation::RebindPublication",
     ] {
         assert!(driver_retired.contains(operation));
     }
@@ -383,9 +388,9 @@ fn e8_failure_detail_is_bound_to_each_actual_transition_join() {
             .unwrap();
     let driver_exited = &driver[driver_exited_start..driver_exited_end];
     for operation in [
-        "E8FailureOperation::RetireDependents",
-        "E8FailureOperation::ReapDriver",
-        "E8FailureOperation::AcknowledgeReaped",
+        "RecoveryOperation::RetireDependents",
+        "RecoveryOperation::ReapDriver",
+        "RecoveryOperation::AcknowledgeReaped",
     ] {
         assert!(driver_exited.contains(operation));
     }
