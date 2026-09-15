@@ -12,10 +12,10 @@ use deepwyrm_syscall::{
 use deepwyrm_syscall::{
     DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL, DwReceivedHandleInfoV1,
 };
+#[cfg(feature = "wyr1c6-selector29")]
+use wyrmroot_device_proto::control::{FAILURE_BYTES, TRIGGER_FAILURE_BYTES};
 #[cfg(feature = "wyr1c5-production")]
-use wyrmroot_device_proto::control::{
-    FAILURE_BYTES, READY_BYTES, RESOURCE_BUNDLE_BYTES, RETIRE_BYTES, TRIGGER_FAILURE_BYTES, parse,
-};
+use wyrmroot_device_proto::control::{READY_BYTES, RESOURCE_BUNDLE_BYTES, RETIRE_BYTES, parse};
 #[cfg(feature = "wyr1c6-selector29")]
 use wyrmroot_device_proto::selector29_should_fail;
 #[cfg(not(feature = "wyr1c5-production"))]

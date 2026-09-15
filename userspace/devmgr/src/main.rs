@@ -19,13 +19,13 @@ use deepwyrm_syscall::{
     DW_DEADLINE_INFINITE, DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL,
     DW_OBJECT_TYPE_MEMORY_OBJECT, DW_RIGHT_DUPLICATE, DW_RIGHT_INSPECT, DW_RIGHT_READ,
     DW_RIGHT_TRANSFER, DW_RIGHT_WRITE, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE, DwHandle,
-    DwObjectType, DwReceivedHandleInfoV1, DwRights, DwWaitItemV1,
+    DwHandleTransferV1, DwObjectType, DwReceivedHandleInfoV1, DwRights, DwWaitItemV1,
 };
 #[cfg(any(
     not(any(feature = "wyr1c4-production", feature = "wyr1c5-production")),
     feature = "wyr1c5-production"
 ))]
-use deepwyrm_syscall::{DW_HANDLE_TRANSFER_MOVE, DW_RIGHT_WAIT, DwHandleTransferV1};
+use deepwyrm_syscall::{DW_HANDLE_TRANSFER_MOVE, DW_RIGHT_WAIT};
 #[cfg(feature = "wyr1c5-production")]
 use deepwyrm_syscall::{
     DW_INTERRUPT_INFO_V1_SIZE, DW_INTERRUPT_INFO_V1_VERSION, DW_INTERRUPT_STATE_ARMED,

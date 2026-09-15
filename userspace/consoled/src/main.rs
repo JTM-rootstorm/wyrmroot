@@ -2477,6 +2477,8 @@ fn receive_launch(channel: DwHandle, expected: LaunchReservation) -> Result<Laun
     Ok(reply)
 }
 
+// Only the Wyrmsh terminal drain waits for a launch result under a deadline.
+#[cfg(feature = "wyr1e-wyrmsh")]
 fn receive_launch_before(
     channel: DwHandle,
     expected: LaunchReservation,
