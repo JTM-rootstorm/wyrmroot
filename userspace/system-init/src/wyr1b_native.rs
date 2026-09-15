@@ -5419,6 +5419,79 @@ where
     }
 }
 
+/// Rolls back the launch a departing session left parked, if it left one.
+///
+/// Reset card R6C's cancel edge. A session that peer-closes, or that is
+/// disconnected by the tick's emergency cleanup, may have a transaction still
+/// sitting at `AwaitingReady`: its child is constructed and unpublished, and the
+/// only names for that child's Process, launch Channel and TaskGroup are in the
+/// arena slot. Disconnecting the session without this would close the Channel
+/// the slot recorded and leave the child to be collected at its deadline --
+/// bounded, but by then the reply would be attempted on a closed handle and the
+/// resources would have sat for the whole budget.
+///
+/// Nothing is sent. The peer that would have received `LAUNCH_ACCEPTED` or
+/// `ERROR` is exactly the peer that has gone.
+fn cancel_parked_launch<S, W>(
+    system: &mut S,
+    waits: &mut W,
+    jobs: &mut JobDispatcher,
+    grant: EndpointGrant,
+) -> Result<(), InitError>
+where
+    S: Wyr1BPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let Some(token) = jobs.launches.session_transaction(grant) else {
+        return Ok(());
+    };
+    if jobs
+        .launches
+        .stage(token)
+        .map_err(launch_transaction_error)?
+        != LaunchStage::AwaitingReady
+    {
+        // Every other open stage is reached and left inside one call. A
+        // transaction found in one here would mean a launch was parked at a
+        // stage nothing polls, which is an accounting fault rather than a
+        // cancel.
+        return Err(InitError::Accounting);
+    }
+    let reservation = jobs
+        .launches
+        .response_envelope(token)
+        .map_err(launch_transaction_error)?
+        .1;
+    let job_id = jobs
+        .launches
+        .job_id(token)
+        .map_err(launch_transaction_error)?;
+    let profile = jobs
+        .launches
+        .profile(token)
+        .map_err(launch_transaction_error)?
+        .ok_or(InitError::Accounting)?;
+    let prepared = jobs
+        .jobs
+        .staged_job(
+            grant.endpoint_id,
+            grant.endpoint_generation,
+            job_id,
+            reservation.transaction_id,
+            profile,
+        )
+        .map_err(InitError::Wyr1BModel)?;
+    jobs.launches
+        .take_resources(token)
+        .map_err(launch_transaction_error)?;
+    let cleanup_failed = rollback_prepared_job(system, waits, jobs, prepared).is_err();
+    close_deferred_launch(jobs, token, false)?;
+    if cleanup_failed {
+        return Err(InitError::Cleanup);
+    }
+    Ok(())
+}
+
 /// Whether a parked launch has anything to say yet.
 ///
 /// Reset card R6C. `finish_deferred_launch` ends in `observe_prepared_ready`,
@@ -5630,38 +5703,57 @@ where
             )
         }
     };
+    #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
+    let scope = jobs
+        .launches
+        .scope(token)
+        .map_err(launch_transaction_error)?;
     let published = match outcome {
         Ok((_, response)) => {
             #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
-            observe_deferred_launch_response(
+            let recorded = observe_deferred_launch_response(
                 system,
-                jobs.launches
-                    .scope(token)
-                    .map_err(launch_transaction_error)?,
+                scope,
                 shell.as_deref_mut().map(|context| &mut *context.state),
                 facts,
                 response.as_bytes(),
-            )?;
+            );
             #[cfg(not(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33")))]
-            let _ = &response;
-            Ok(())
+            let recorded = {
+                let _ = &response;
+                Ok(())
+            };
+            recorded
         }
         Err(error) => {
-            send_deferred_launch_error(
+            // Best-effort, and deliberately not `?`. The reply is owed to a
+            // session that may already be gone -- peer close, or an emergency
+            // disconnect elsewhere in the tick, closes the Channel this slot
+            // recorded, and sending on a closed handle fails. What is *not*
+            // best-effort is emptying the slot below: a transaction left open
+            // here would be handed back by `awaiting_ready_from` on every
+            // subsequent tick, for ever, holding a child nothing else can name.
+            let reply = send_deferred_launch_error(
                 system,
                 session,
                 reservation,
                 launch_error_code(&error),
                 #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
-                jobs.launches
-                    .scope(token)
-                    .map_err(launch_transaction_error)?,
+                scope,
                 #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
                 shell.map(|context| &mut *context.state),
                 #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
                 facts,
-            )?;
-            Err(error)
+            );
+            Err(match reply {
+                Ok(()) => error,
+                // A failed reply does not relabel the launch's own failure, for
+                // the same reason `LaunchTransactions::fail` keeps the first
+                // disposition: the caller asked why the launch failed, not what
+                // went wrong telling it.
+                Err(InitError::Cleanup) => InitError::Cleanup,
+                Err(_) => error,
+            })
         }
     };
     close_deferred_launch(jobs, token, published.is_ok())?;
@@ -5907,6 +5999,8 @@ where
                     )
                     .map_err(InitError::Native)?;
                 if let Err(dispatch_error) = dispatched {
+                    // R6C. Whatever this session had in flight goes with it.
+                    let cancel_failed = cancel_parked_launch(system, waits, jobs, grant).is_err();
                     // Both arms ran the same emergency cleanup; only one said
                     // which half of it failed. The other collapsed to a bare
                     // `Cleanup`, losing the initiating error entirely -- the
@@ -5927,6 +6021,16 @@ where
                         }
                         Err(_) => EmergencyCleanup::DisconnectFailed,
                     };
+                    let emergency_cleanup = match emergency_cleanup {
+                        EmergencyCleanup::Attempted {
+                            channel_close_failed,
+                            owner_cleanup_failed,
+                        } => EmergencyCleanup::Attempted {
+                            channel_close_failed,
+                            owner_cleanup_failed: owner_cleanup_failed | cancel_failed,
+                        },
+                        other => other,
+                    };
                     return Err(dispatch_failure(dispatch_error, emergency_cleanup));
                 }
             }
@@ -5943,6 +6047,14 @@ where
                 // coordinated retirement, observe peer close without consuming
                 // either owner ahead of that join.
                 if !defer_console_retirement {
+                    // R6C's cancel. The peer that asked for this launch is gone
+                    // before it was told the child exists, so nothing owns the
+                    // child and nothing is owed a reply. Rolling it back here
+                    // rather than leaving it to its deadline means the session's
+                    // resources and its child's go in one step -- and means the
+                    // slot is not still holding a Channel this branch is about
+                    // to close.
+                    cancel_parked_launch(system, waits, jobs, grant)?;
                     let outer = if scope == crate::wyr1b_job::LaunchSessionScope::ConsoleLauncher {
                         jobs.jobs
                             .loaded_job_for_owner(grant.endpoint_id, grant.endpoint_generation)
@@ -7260,6 +7372,8 @@ mod tests {
         inbound_handle_count: usize,
         bootfs: Option<Vec<u8>>,
         session_poll_readable: bool,
+        /// Reports the session's peer as gone, for R6C's cancel edge.
+        session_poll_peer_closed: bool,
         /// What R6C's parked-launch poll should see, when a test has a parked
         /// launch at all.
         ///
@@ -7600,6 +7714,7 @@ mod tests {
                 inbound_handle_count: 0,
                 bootfs: None,
                 session_poll_readable: false,
+                session_poll_peer_closed: false,
                 child_poll_readable: None,
             }
         }
@@ -8268,7 +8383,13 @@ mod tests {
                     Err(NativeError::Status(DW_STATUS_TIMED_OUT))
                 };
             }
-            if self.session_poll_readable {
+            if self.session_poll_peer_closed {
+                Ok(DwWaitResultV1 {
+                    index: 0,
+                    observed: DW_SIGNAL_PEER_CLOSED,
+                    ..DwWaitResultV1::default()
+                })
+            } else if self.session_poll_readable {
                 Ok(DwWaitResultV1 {
                     index: 0,
                     observed: DW_SIGNAL_READABLE,
@@ -13029,6 +13150,87 @@ mod tests {
                 .unwrap()
                 .reservation,
             reservation(2)
+        );
+    }
+
+    /// Reset card R6C's cancel edge, and the hole that made it necessary.
+    ///
+    /// R6B-2 was safe here by accident: the poll returned as soon as it had
+    /// finished a parked launch, so a session could never be disconnected while
+    /// one of its launches was in flight. R6C stops the launch branch ending
+    /// the tick -- which is the whole point, a silent child must not cost the
+    /// session its turn -- and that made the case reachable. The session's peer
+    /// closes, the branch closes the Channel the slot recorded, and the slot is
+    /// left holding a child whose only names are in it.
+    ///
+    /// So the peer close cancels it. Nothing is sent: the peer that would have
+    /// been told is the one that left.
+    #[test]
+    fn a_session_that_leaves_takes_its_parked_launch_with_it() {
+        let image = executable();
+        let (bootfs, _) = job_policy_bootfs(&image);
+        let mut platform = MockPlatform::new();
+        platform.bootfs = Some(bootfs);
+        platform.fail_send = false;
+        platform.now = Some(1);
+        platform.task_group = Some(DwHandle(77));
+        platform.session_poll_readable = true;
+        let mut waits = AcceptedJobV2Waits {
+            transaction_id: reservation(1).transaction_id,
+            profile: LaunchProfile::JobV2,
+            exited: false,
+            console_status_lost_process: None,
+            running_process: None,
+        };
+        let mut loader = InitSendLoader::new();
+        loader.fail_init = false;
+        let mut jobs = JobDispatcher::new();
+        let owner = grant(EndpointKind::LaunchSession, 1, 1);
+        jobs.install_session(owner, DwHandle(90)).unwrap();
+        let authority = LoadAuthority {
+            parent_root: DwHandle(1),
+            bootfs: DwHandle(2),
+            task_group: DwHandle(3),
+        };
+        park_one_launch(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            &mut jobs,
+            owner,
+            authority,
+        );
+
+        platform.child_poll_readable = Some(false);
+        platform.session_poll_readable = false;
+        platform.session_poll_peer_closed = true;
+        waits.exited = true;
+        let sent_before = platform.sent_len;
+
+        poll_job_dispatcher(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            authority,
+            &mut jobs,
+            11,
+        )
+        .unwrap();
+
+        assert_eq!(
+            jobs.launches.open_count(),
+            0,
+            "the departing session's transaction must not outlive it"
+        );
+        assert_eq!(
+            jobs.jobs.live_jobs(),
+            0,
+            "its unpublished child must be rolled back, not left to its deadline"
+        );
+        assert_eq!(jobs.session_count(), 0);
+        assert_eq!(
+            platform.sent_len, sent_before,
+            "nothing is owed to a peer that has gone"
         );
     }
 
