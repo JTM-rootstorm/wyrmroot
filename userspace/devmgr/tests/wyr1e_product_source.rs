@@ -1,3 +1,6 @@
+#[cfg(feature = "native-devmgr")]
+use {wyrmroot_loader as _, wyrmroot_registry_proto as _, wyrmroot_runtime as _};
+
 use {deepwyrm_syscall as _, wyrmroot_device_proto as _, wyrmroot_devmgr as _};
 
 const MANIFEST: &str = include_str!("../Cargo.toml");
