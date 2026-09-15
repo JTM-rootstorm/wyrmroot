@@ -593,18 +593,34 @@ fn a_session_and_a_job_each_find_their_own_open_transaction() {
     assert_eq!(arena.job_transaction(6), Some(right));
 }
 
-/// The arena lives in `ResidentSystemInit`, which
-/// `resident_fits_locked_native_stack_partition` locks to a 20,480-byte
-/// partition of init's 108 KiB execution stack. R6B found that out by putting
-/// a 16-slot arena in `JobDispatcher` and watching the resident go from 19,496
-/// to 22,200. This keeps the arithmetic checkable without waiting for the
-/// wiring to fail it again.
+/// The arena's cost, named where it is paid.
+///
+/// R6A asserted this against a single constant, `LAUNCH_ARENA_BUDGET_BYTES`,
+/// because the arena was not yet a field of anything and arithmetic was the
+/// only check available. R6B-2 wires it into `JobDispatcher`, so
+/// `resident_fits_locked_native_stack_partition` now measures the real total
+/// and is the gate that binds.
+///
+/// The constant could not survive that wiring anyway: it is the *default*
+/// tier's headroom, and the resident gate it was derived from selects three
+/// budgets, not one -- 40 KiB under `wyr1d-selector32` or `wyr1e-production`,
+/// 22 KiB under `wyr1c6-selector29`, 20 KiB otherwise. Charging every build
+/// against the smallest is the same wrong-tier arithmetic reset plan §7.1 and
+/// §7.2 were corrected for at R6E. So this checks what is true in every tier:
+/// the arena's ungated part fits the tightest headroom, and whatever the
+/// evidence features add on top is gated out of that tier entirely.
 #[test]
-fn the_arena_fits_the_resident_partitions_headroom() {
+fn the_arenas_ungated_cost_fits_the_tightest_resident_tier() {
     use core::mem::size_of;
-    assert!(
-        size_of::<LaunchTransactions>() <= LAUNCH_ARENA_BUDGET_BYTES,
-        "arena is {} bytes against {LAUNCH_ARENA_BUDGET_BYTES} of resident headroom",
-        size_of::<LaunchTransactions>()
-    );
+    let ungated = cfg!(not(any(
+        feature = "wyr1e-selector33",
+        feature = "wyr1e8-selector33"
+    )));
+    if ungated {
+        assert!(
+            size_of::<LaunchTransactions>() <= LAUNCH_ARENA_BUDGET_BYTES,
+            "arena is {} bytes against {LAUNCH_ARENA_BUDGET_BYTES} of default-tier headroom",
+            size_of::<LaunchTransactions>()
+        );
+    }
 }

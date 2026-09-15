@@ -696,6 +696,7 @@ fn actual_driver_and_registry_recovery_compose_through_s4_ready() {
         session,
         s2_grant,
         &mut context,
+        LaunchPublication::Immediate,
     )
     .unwrap();
     let JobDispatchOutcome::Launched(loaded) = outcome else {
@@ -775,6 +776,7 @@ fn actual_driver_and_registry_recovery_compose_through_s4_ready() {
             session,
             s2_grant,
             &mut context,
+            LaunchPublication::Immediate,
         ),
         Ok(JobDispatchOutcome::Responded)
     );
@@ -1026,6 +1028,7 @@ fn actual_driver_and_registry_recovery_compose_through_s4_ready() {
         s3_session,
         s3_grant,
         &mut context,
+        LaunchPublication::Immediate,
     )
     .unwrap();
     let JobDispatchOutcome::Launched(registry_actor) = registry_outcome else {
@@ -1071,6 +1074,7 @@ fn actual_driver_and_registry_recovery_compose_through_s4_ready() {
             s3_session,
             s3_grant,
             &mut context,
+            LaunchPublication::Immediate,
         ),
         Ok(JobDispatchOutcome::Responded)
     );

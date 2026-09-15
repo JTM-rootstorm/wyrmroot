@@ -5,7 +5,7 @@
 
 use deepwyrm_syscall::DwReceivedHandleInfoV1;
 use wyrmroot_launch_proto::{
-    Message, MessageType, TerminationClassification, TerminationResult, parse_message,
+    Message, MessageType, Reservation, TerminationClassification, TerminationResult, parse_message,
 };
 
 use crate::InitError;
@@ -20,8 +20,6 @@ const TYPE_SHELL_EXITED: u32 = 3;
 const TYPE_TERMINAL: u32 = 255;
 const ERROR_OUTCOME_BIT: u32 = 0x8000_0000;
 const MAX_RECORDS: u64 = 128;
-const TX_DIGEST_DOMAIN: &[u8; 11] = b"WRE1-TX-V1\0";
-const HANDLE_DIGEST_DOMAIN: &[u8; 16] = b"WRE1-HANDLES-V1\0";
 const EXIT_DIGEST_DOMAIN: &[u8; 13] = b"WRE1-EXIT-V1\0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -137,6 +135,39 @@ impl Observer {
                 serial.supervisor_generation,
             ],
             [0; 32],
+        )?;
+        submit(&record)?;
+        self.advance()
+    }
+
+    /// Records a launch transaction whose reply was written on a later tick.
+    ///
+    /// Reset card R6B-2. The one-frame path is [`Self::shell_jobs_transaction`]
+    /// and this records the same thing about the same launch; what differs is
+    /// only that the request bytes are gone by now, replaced by the
+    /// [`LaunchRequestFacts`] taken while they were in hand. The reservation the
+    /// response has to echo is checked against the request's exactly as
+    /// `classify` checks it, and the digest is finished from the same preimage.
+    ///
+    /// A launch answers `LAUNCH_ACCEPTED` or `ERROR`; nothing else can reach
+    /// here, because a deferred reply is written by the publication half and
+    /// those are the only two things it sends.
+    pub(crate) fn shell_jobs_launch_response(
+        &mut self,
+        facts: crate::launch_request_facts::LaunchRequestFacts,
+        response: &[u8],
+        submit: impl FnOnce(&[u8; RECORD_BYTES]) -> Result<(), InitError>,
+    ) -> Result<(), InitError> {
+        let (transaction, job, kind, outcome, values) =
+            classify_launch_response(facts.reservation(), response)?;
+        let record = self.record(
+            TYPE_SHELLJOBS_TRANSACTION,
+            transaction,
+            job,
+            kind,
+            outcome,
+            values,
+            facts.combine(response),
         )?;
         submit(&record)?;
         self.advance()
@@ -291,6 +322,35 @@ impl Observer {
     }
 }
 
+/// The response half of [`classify`], for a launch whose request is gone.
+///
+/// Reset card R6B-2. Every request-derived value `classify` would compute is
+/// either carried in the facts or constant for a launch: the kind is `Launch`,
+/// and the requested job id -- which an `ERROR` reply reports back -- is zero.
+fn classify_launch_response(
+    reservation: Reservation,
+    response: &[u8],
+) -> Result<(u64, u64, u32, u32, [u64; 3]), InitError> {
+    let response = parse_message(response, 0).map_err(|_| InitError::Accounting)?;
+    if response.reservation != reservation {
+        return Err(InitError::Accounting);
+    }
+    let (job, outcome) = match response.message {
+        Message::LaunchAccepted { job_id } if job_id != 0 => {
+            (job_id, MessageType::LaunchAccepted as u32)
+        }
+        Message::Error { code } => (0, ERROR_OUTCOME_BIT | code.as_u32()),
+        _ => return Err(InitError::Accounting),
+    };
+    Ok((
+        reservation.transaction_id,
+        job,
+        MessageType::Launch as u32,
+        outcome,
+        [0; 3],
+    ))
+}
+
 fn classify(
     request: &[u8],
     response: &[u8],
@@ -362,27 +422,7 @@ fn transaction_digest(
     response: &[u8],
     handles: &[DwReceivedHandleInfoV1],
 ) -> Result<[u8; 32], InitError> {
-    if handles.len() > 3 {
-        return Err(InitError::Accounting);
-    }
-    let request_digest = wyrmroot_runtime::sha256::digest(request);
-    let response_digest = wyrmroot_runtime::sha256::digest(response);
-    let mut shape = [0u8; 72];
-    shape[..HANDLE_DIGEST_DOMAIN.len()].copy_from_slice(HANDLE_DIGEST_DOMAIN);
-    put_u32(&mut shape, 16, handles.len() as u32);
-    for (index, handle) in handles.iter().enumerate() {
-        let offset = 20 + index * 16;
-        put_u32(&mut shape, offset, handle.object_type.0);
-        put_u64(&mut shape, offset + 4, handle.rights.0);
-        put_u32(&mut shape, offset + 12, index as u32 + 1);
-    }
-    let shape_digest = wyrmroot_runtime::sha256::digest(&shape[..20 + handles.len() * 16]);
-    let mut preimage = [0u8; 107];
-    preimage[..TX_DIGEST_DOMAIN.len()].copy_from_slice(TX_DIGEST_DOMAIN);
-    preimage[11..43].copy_from_slice(&request_digest);
-    preimage[43..75].copy_from_slice(&response_digest);
-    preimage[75..107].copy_from_slice(&shape_digest);
-    Ok(wyrmroot_runtime::sha256::digest(&preimage))
+    crate::launch_request_facts::transaction_digest(request, response, handles)
 }
 
 fn exit_digest(tuple: ShellTuple, close_transaction: u64, result: TerminationResult) -> [u8; 32] {

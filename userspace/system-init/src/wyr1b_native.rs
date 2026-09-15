@@ -1,6 +1,9 @@
 //! Native selector-27 registry and dependent-peer controller.
 
 use super::*;
+use crate::launch_transaction::{
+    LaunchResources, LaunchStage, LaunchToken, LaunchTransactionError,
+};
 use crate::wyr1b::{
     EndpointGrant, EndpointKind, JobError, JobResult as ControllerJobResult, LaunchChannelRelease,
     LaunchEngineError, PolicyView, PreparedJob, RegistryTopology, RequestTicket,
@@ -228,6 +231,45 @@ impl ShellControllerState {
             .shell_jobs_transaction(request, response, handles, |record| {
                 Self::submit_e7(system, record)
             })
+    }
+
+    /// Records a shell-jobs launch whose reply was written on a later tick.
+    ///
+    /// R6B-2's counterpart to `record_e7_shell_jobs`. What it records is the
+    /// same transaction; what it has instead of the request bytes is the
+    /// `LaunchRequestFacts` taken while they existed.
+    #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
+    fn record_deferred_shell_jobs_launch<S: Wyr1BPlatform>(
+        &mut self,
+        system: &mut S,
+        facts: crate::launch_request_facts::LaunchRequestFacts,
+        response: &[u8],
+    ) -> Result<(), InitError> {
+        #[cfg(feature = "wyr1e-selector33")]
+        {
+            #[cfg(test)]
+            if !self.evidence.ready() {
+                return Ok(());
+            }
+            self.evidence
+                .shell_jobs_launch_response(facts, response, |record| {
+                    Self::submit_e7(system, record)
+                })
+        }
+        #[cfg(feature = "wyr1e8-selector33")]
+        {
+            #[cfg(test)]
+            if !self.e8_evidence.ready() {
+                return Ok(());
+            }
+            let mut candidate = self.e8_evidence;
+            candidate.shell_jobs_launch_response(facts, response, |record| {
+                Self::submit_e8(system, record)
+            })?;
+            self.require_recovery_live(system)?;
+            self.e8_evidence = candidate;
+            Ok(())
+        }
     }
 
     #[cfg(feature = "wyr1e-selector33")]
@@ -3680,9 +3722,17 @@ where
         jobs,
         session,
         grant,
+        LaunchPublication::Immediate,
     )? {
         JobDispatchOutcome::Launched(loaded) => Ok(loaded),
         JobDispatchOutcome::Responded => Err(InitError::Wyr1BModel(JobError::WrongState)),
+        // Unreachable by construction: this caller asked for
+        // `LaunchPublication::Immediate` precisely because it uses the job's
+        // handles on the next line and has no event loop to be handed a token
+        // instead. Refused rather than unwrapped, so a future caller that
+        // changes the mode without changing the use gets an error instead of a
+        // panic.
+        JobDispatchOutcome::Constructed => Err(InitError::Wyr1BModel(JobError::WrongState)),
     }
 }
 
@@ -3908,6 +3958,200 @@ fn send_job_error<S: InitPlatform>(
     system
         .send_channel(session, &response[..size])
         .map_err(InitError::Native)
+}
+
+/// Constructs the child, parks the transaction, and returns to the event loop.
+///
+/// Reset card R6B-2, and the whole of what it changes. The one-frame path is
+/// `accept_reserved_launch`, which runs `construct_reserved_launch` and
+/// `finish_constructed_launch` back to back; this runs only the first and
+/// leaves the second to `finish_deferred_launch` on a later tick. Everything
+/// the second half will need is written into the arena before this returns,
+/// because the request buffer, the moved handles and the bootfs mapping all die
+/// with this frame.
+///
+/// Failures before the child exists are answered here, exactly as they were:
+/// the request bytes are still in hand, so the error reply and its evidence
+/// record are unchanged. The one new failure is parking itself, and it is the
+/// dangerous one -- a constructed child whose transaction never reached the
+/// arena is a child nothing owns. It is rolled back before the reply, by the
+/// same `rollback_prepared_job` the synchronous path uses.
+#[allow(clippy::too_many_arguments)]
+fn defer_reserved_launch<S, L, W>(
+    system: &mut S,
+    loader: &mut L,
+    waits: &mut W,
+    authority: LoadAuthority,
+    policy: &PolicyView<'_>,
+    jobs: &mut JobDispatcher,
+    session: DwHandle,
+    grant: EndpointGrant,
+    scope: LaunchSessionScope,
+    reservation: LaunchReservation,
+    request_ticket: RequestTicket,
+    request: wyrmroot_launch_proto::LaunchRequest<'_>,
+    moved: &[DwReceivedHandleInfoV1],
+    observed: &[DwReceivedHandleInfoV1],
+    handle_count: usize,
+    request_bytes: &[u8],
+    mut state: Option<&mut ShellControllerState>,
+    #[cfg(feature = "wyr1e8-selector33")] e8_trigger: Option<E8TriggerRequest>,
+) -> Result<JobDispatchOutcome, InitError>
+where
+    S: Wyr1BPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    // Taken before anything is constructed. If the request cannot yield the
+    // facts the join will want, that is a property of the bytes, and finding it
+    // out after a child exists would mean tearing one down to report it.
+    #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
+    let facts = match crate::launch_request_facts::LaunchRequestFacts::of(request_bytes, observed) {
+        Ok(facts) => facts,
+        Err(error) => {
+            if close_received_reverse(system, moved, handle_count) {
+                return Err(InitError::Cleanup);
+            }
+            send_observed_job_error(
+                system,
+                session,
+                reservation,
+                launch_error_code(&error),
+                scope,
+                state.as_deref_mut(),
+                request_bytes,
+                observed,
+            )?;
+            return Ok(JobDispatchOutcome::Responded);
+        }
+    };
+    let constructed = match construct_reserved_launch(
+        system,
+        loader,
+        waits,
+        authority,
+        policy,
+        jobs,
+        session,
+        reservation,
+        request_ticket,
+        request,
+        moved,
+        handle_count,
+    ) {
+        Ok(constructed) => constructed,
+        Err(error) => {
+            send_observed_job_error(
+                system,
+                session,
+                reservation,
+                launch_error_code(&error),
+                scope,
+                state.as_deref_mut(),
+                request_bytes,
+                observed,
+            )?;
+            return if error == InitError::Cleanup {
+                Err(error)
+            } else {
+                Ok(JobDispatchOutcome::Responded)
+            };
+        }
+    };
+    if let Err(error) = park_constructed_launch(
+        jobs,
+        grant,
+        scope,
+        constructed,
+        #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
+        facts,
+        #[cfg(feature = "wyr1e8-selector33")]
+        e8_trigger.map(|trigger| trigger.action),
+    ) {
+        let cleanup_failed =
+            rollback_prepared_job(system, waits, jobs, constructed.prepared).is_err();
+        send_observed_job_error(
+            system,
+            session,
+            reservation,
+            launch_error_code(&error),
+            scope,
+            state,
+            request_bytes,
+            observed,
+        )?;
+        return Err(if cleanup_failed {
+            InitError::Cleanup
+        } else {
+            error
+        });
+    }
+    Ok(JobDispatchOutcome::Constructed)
+}
+
+/// Writes one constructed launch into the arena and leaves it `AwaitingReady`.
+///
+/// Every stage edge is taken explicitly rather than assigned, so the arena's
+/// own graph gets to refuse a sequence the dispatcher should not be producing.
+fn park_constructed_launch(
+    jobs: &mut JobDispatcher,
+    grant: EndpointGrant,
+    scope: LaunchSessionScope,
+    constructed: ConstructedLaunch,
+    #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
+    facts: crate::launch_request_facts::LaunchRequestFacts,
+    #[cfg(feature = "wyr1e8-selector33")] trigger_action: Option<E8RecoveryAction>,
+) -> Result<(), InitError> {
+    let token = jobs
+        .launches
+        .open(grant, constructed.session, scope, constructed.reservation)
+        .map_err(launch_transaction_error)?;
+    let record = || -> Result<(), LaunchTransactionError> {
+        jobs.launches
+            .attach_job(token, constructed.prepared.job_id())?;
+        jobs.launches.advance(token, LaunchStage::Constructed)?;
+        jobs.launches.attach_resources(
+            token,
+            constructed.prepared.profile(),
+            LaunchResources {
+                process: constructed.prepared.loaded.process,
+                launch_channel: constructed.prepared.loaded.launch_channel,
+                task_group: DwHandle(constructed.prepared.task_group),
+            },
+        )?;
+        jobs.launches
+            .arm_ready_deadline(token, constructed.deadline)?;
+        #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
+        jobs.launches.attach_request_facts(token, facts)?;
+        #[cfg(feature = "wyr1e8-selector33")]
+        if let Some(action) = trigger_action {
+            jobs.launches.attach_trigger_action(token, action)?;
+        }
+        jobs.launches.advance(token, LaunchStage::AwaitingReady)
+    }();
+    if let Err(error) = record {
+        // The slot exists but does not describe the child. Empty it so it
+        // cannot be mistaken for one that owns handles, and let the caller
+        // roll the child back.
+        let _ = jobs.launches.take_resources(token);
+        let _ = jobs.launches.advance(token, LaunchStage::Failing);
+        let _ = jobs.launches.advance(token, LaunchStage::Cleanup);
+        let _ = jobs.launches.advance(token, LaunchStage::Complete);
+        let _ = jobs.launches.close(token);
+        return Err(launch_transaction_error(error));
+    }
+    Ok(())
+}
+
+/// The arena's refusals are accounting errors: every one of them means the
+/// dispatcher asked for a transition its own sequence should have made
+/// impossible.
+fn launch_transaction_error(error: LaunchTransactionError) -> InitError {
+    match error {
+        LaunchTransactionError::Capacity => InitError::Wyr1BModel(JobError::Capacity),
+        LaunchTransactionError::SessionBusy => InitError::Wyr1BModel(JobError::WrongState),
+        _ => InitError::Accounting,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4267,6 +4511,29 @@ where
 enum JobDispatchOutcome {
     Responded,
     Launched(crate::wyr1b::LoadedJob),
+    /// The child exists and its READY deadline is armed, but nothing has been
+    /// published yet. Reset card R6B-2: the transaction is in the arena and the
+    /// dispatcher has gone back to the event loop.
+    Constructed,
+}
+
+/// Whether a launch's reply is written in the frame that read the request.
+///
+/// Reset card R6B-2. §3's invariant 6 says one child failing to reach READY
+/// must not block the supervisor from servicing unrelated traffic, and a stack
+/// frame was the reason it did: `observe_prepared_ready` blocks in the middle
+/// of the dispatch. `Deferred` parks the constructed launch in the arena and
+/// returns, so the wait happens on a later tick with the request buffer and the
+/// bootfs mapping already released.
+///
+/// `Immediate` is not a transitional shim. `receive_and_accept_job` and the
+/// launch gates use the returned job's handles on the next line and have no
+/// event loop to return to; for them the frame *is* the lifetime. Only the
+/// resident dispatcher defers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LaunchPublication {
+    Immediate,
+    Deferred,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4679,6 +4946,7 @@ fn dispatch_one_job_request<S, L, W>(
     jobs: &mut JobDispatcher,
     session: DwHandle,
     grant: EndpointGrant,
+    publication: LaunchPublication,
 ) -> Result<JobDispatchOutcome, InitError>
 where
     S: Wyr1BPlatform,
@@ -4686,7 +4954,16 @@ where
     W: SupervisionPlatform<Error = NativeError>,
 {
     dispatch_one_job_request_inner(
-        system, loader, waits, authority, policy, jobs, session, grant, None,
+        system,
+        loader,
+        waits,
+        authority,
+        policy,
+        jobs,
+        session,
+        grant,
+        None,
+        publication,
     )
 }
 
@@ -4705,6 +4982,7 @@ fn dispatch_one_job_request_with_shell<S, L, W>(
     session: DwHandle,
     grant: EndpointGrant,
     shell: &mut ShellLaunchContext<'_>,
+    publication: LaunchPublication,
 ) -> Result<JobDispatchOutcome, InitError>
 where
     S: Wyr1BPlatform,
@@ -4721,6 +4999,7 @@ where
         session,
         grant,
         Some(shell),
+        publication,
     )
 }
 
@@ -4735,6 +5014,7 @@ fn dispatch_one_job_request_inner<S, L, W>(
     session: DwHandle,
     grant: EndpointGrant,
     mut shell: Option<&mut ShellLaunchContext<'_>>,
+    publication: LaunchPublication,
 ) -> Result<JobDispatchOutcome, InitError>
 where
     S: Wyr1BPlatform,
@@ -5037,6 +5317,29 @@ where
             } else {
                 None
             };
+            if publication == LaunchPublication::Deferred {
+                return defer_reserved_launch(
+                    system,
+                    loader,
+                    waits,
+                    authority,
+                    policy,
+                    jobs,
+                    session,
+                    grant,
+                    scope,
+                    reservation,
+                    request_ticket,
+                    request,
+                    &received[..legacy_handle_limit],
+                    &received[..counts.handles],
+                    counts.handles,
+                    &bytes[..counts.bytes],
+                    shell.as_deref_mut().map(|context| &mut *context.state),
+                    #[cfg(feature = "wyr1e8-selector33")]
+                    e8_trigger,
+                );
+            }
             match accept_reserved_launch(
                 system,
                 loader,
@@ -5116,6 +5419,239 @@ where
     }
 }
 
+/// Runs the half of a launch that was left parked, on a tick of its own.
+///
+/// Reset card R6B-2. This is `finish_constructed_launch` with its inputs read
+/// back out of the arena instead of off the frame that constructed them, and
+/// with the evidence record finished from the digests taken then. The sequence
+/// inside `finish_constructed_launch` is untouched, including every rollback.
+///
+/// The prepared job is not stored; it is asked for. `JobController::staged_job`
+/// rebuilds it from the model's own record of the job, which is why a slot can
+/// be resolved a tick later without the arena holding a `LaunchTicket` that
+/// names a job-table position the model may have reused. The handles the model
+/// hands back are checked against the ones the arena recorded, because two
+/// records of the same child disagreeing is exactly the state neither of them
+/// could detect alone.
+fn finish_deferred_launch<S, W>(
+    system: &mut S,
+    waits: &mut W,
+    jobs: &mut JobDispatcher,
+    token: LaunchToken,
+    mut shell: Option<&mut ShellLaunchContext<'_>>,
+) -> Result<(), InitError>
+where
+    S: Wyr1BPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    // A build with no evidence surface and no recovery trigger has nothing to
+    // ask the shell context for; it still takes one, because the caller is the
+    // same poll loop in every build.
+    #[cfg(not(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33")))]
+    let _ = &mut shell;
+    let (session, reservation) = jobs
+        .launches
+        .response_envelope(token)
+        .map_err(launch_transaction_error)?;
+    let grant = jobs
+        .launches
+        .grant(token)
+        .map_err(launch_transaction_error)?;
+    let job_id = jobs
+        .launches
+        .job_id(token)
+        .map_err(launch_transaction_error)?;
+    let deadline = jobs
+        .launches
+        .ready_deadline(token)
+        .map_err(launch_transaction_error)?
+        .ok_or(InitError::Accounting)?;
+    let profile = jobs
+        .launches
+        .profile(token)
+        .map_err(launch_transaction_error)?
+        .ok_or(InitError::Accounting)?;
+    let recorded = jobs
+        .launches
+        .resources(token)
+        .map_err(launch_transaction_error)?
+        .ok_or(InitError::Accounting)?;
+    #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
+    let facts = jobs
+        .launches
+        .request_facts(token)
+        .map_err(launch_transaction_error)?
+        .ok_or(InitError::Accounting)?;
+    #[cfg(feature = "wyr1e8-selector33")]
+    let trigger_action = jobs
+        .launches
+        .trigger_action(token)
+        .map_err(launch_transaction_error)?;
+    let prepared = jobs
+        .jobs
+        .staged_job(
+            grant.endpoint_id,
+            grant.endpoint_generation,
+            job_id,
+            reservation.transaction_id,
+            profile,
+        )
+        .map_err(InitError::Wyr1BModel)?;
+    if prepared.loaded.process != recorded.process
+        || prepared.loaded.launch_channel != recorded.launch_channel
+        || prepared.task_group != recorded.task_group.0
+    {
+        return Err(InitError::Accounting);
+    }
+    // The transaction stops owning the handles here. Whichever way the rest of
+    // this goes -- published, or rolled back -- they are accounted for by the
+    // model or closed by the rollback, and a slot that still claimed them could
+    // not be closed at all.
+    jobs.launches
+        .take_resources(token)
+        .map_err(launch_transaction_error)?;
+    let constructed = ConstructedLaunch {
+        prepared,
+        deadline,
+        session,
+        reservation,
+    };
+    #[cfg(feature = "wyr1e8-selector33")]
+    let acceptance = match (trigger_action, shell.as_deref_mut()) {
+        (Some(action), Some(context)) => Some((
+            &mut *context.state,
+            E8TriggerRequest {
+                reservation,
+                action,
+            },
+        )),
+        (Some(_), None) => return Err(InitError::WrongActivationOrder),
+        (None, _) => None,
+    };
+    let outcome = finish_constructed_launch(
+        system,
+        waits,
+        jobs,
+        constructed,
+        #[cfg(feature = "wyr1e8-selector33")]
+        acceptance,
+    );
+    let published = match outcome {
+        Ok((_, response)) => {
+            #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
+            observe_deferred_launch_response(
+                system,
+                jobs.launches
+                    .scope(token)
+                    .map_err(launch_transaction_error)?,
+                shell.as_deref_mut().map(|context| &mut *context.state),
+                facts,
+                response.as_bytes(),
+            )?;
+            #[cfg(not(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33")))]
+            let _ = &response;
+            Ok(())
+        }
+        Err(error) => {
+            send_deferred_launch_error(
+                system,
+                session,
+                reservation,
+                launch_error_code(&error),
+                #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
+                jobs.launches
+                    .scope(token)
+                    .map_err(launch_transaction_error)?,
+                #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
+                shell.map(|context| &mut *context.state),
+                #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
+                facts,
+            )?;
+            Err(error)
+        }
+    };
+    close_deferred_launch(jobs, token, published.is_ok())?;
+    published
+}
+
+/// Walks the parked transaction out of the arena by the same door every
+/// transaction leaves by: a disposition, then `Cleanup`, then `Complete`.
+fn close_deferred_launch(
+    jobs: &mut JobDispatcher,
+    token: LaunchToken,
+    published: bool,
+) -> Result<(), InitError> {
+    let disposition = if published {
+        LaunchStage::Published
+    } else {
+        LaunchStage::Failing
+    };
+    jobs.launches
+        .advance(token, disposition)
+        .map_err(launch_transaction_error)?;
+    jobs.launches
+        .advance(token, LaunchStage::Cleanup)
+        .map_err(launch_transaction_error)?;
+    jobs.launches
+        .advance(token, LaunchStage::Complete)
+        .map_err(launch_transaction_error)?;
+    jobs.launches
+        .close(token)
+        .map(|_| ())
+        .map_err(launch_transaction_error)
+}
+
+/// Records the transaction whose request bytes are gone.
+///
+/// The counterpart of `observe_e7_response` for a deferred reply. Only
+/// `ShellJobs` carries a launch transaction record; a console-launcher reply is
+/// an outer response, which is recorded against the request and is never
+/// deferred.
+#[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
+fn observe_deferred_launch_response<S: Wyr1BPlatform>(
+    system: &mut S,
+    scope: LaunchSessionScope,
+    state: Option<&mut ShellControllerState>,
+    facts: crate::launch_request_facts::LaunchRequestFacts,
+    response: &[u8],
+) -> Result<(), InitError> {
+    if scope != LaunchSessionScope::ShellJobs {
+        return Ok(());
+    }
+    let Some(state) = state else {
+        #[cfg(test)]
+        return Ok(());
+        #[cfg(not(test))]
+        return Err(InitError::WrongActivationOrder);
+    };
+    state.record_deferred_shell_jobs_launch(system, facts, response)
+}
+
+/// Sends the error reply a deferred launch owes its session, and records it.
+fn send_deferred_launch_error<S: Wyr1BPlatform>(
+    system: &mut S,
+    session: DwHandle,
+    reservation: LaunchReservation,
+    code: LaunchErrorCode,
+    #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
+    scope: LaunchSessionScope,
+    #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))] state: Option<
+        &mut ShellControllerState,
+    >,
+    #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
+    facts: crate::launch_request_facts::LaunchRequestFacts,
+) -> Result<(), InitError> {
+    let mut response = [0_u8; 88];
+    let size =
+        encode_launch_error(reservation, code, &mut response).map_err(|_| InitError::Accounting)?;
+    system
+        .send_channel(session, &response[..size])
+        .map_err(InitError::Native)?;
+    #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
+    observe_deferred_launch_response(system, scope, state, facts, &response[..size])?;
+    Ok(())
+}
+
 #[inline(always)]
 pub(crate) fn poll_job_dispatcher<S, L, W>(
     system: &mut S,
@@ -5175,6 +5711,18 @@ where
     W: SupervisionPlatform<Error = NativeError>,
 {
     let mut outcome = JobDispatcherPollOutcome::Stable;
+    // Reset card R6B-2. A launch parked by a previous tick is resolved before
+    // any new request is read, for two reasons. The child is already alive and
+    // its READY deadline is already running, so it has the older claim; and a
+    // session cannot be disconnected out from under a transaction that still
+    // owns its child, because the transaction is always resolved first. The
+    // cursor moves past the slot it hands back, so a child that never answers
+    // cannot starve the one behind it.
+    if let Some(token) = jobs.launches.awaiting_ready_from(jobs.launch_cursor) {
+        jobs.launch_cursor = token.slot().wrapping_add(1);
+        finish_deferred_launch(system, waits, jobs, token, shell.as_deref_mut())?;
+        return Ok(outcome);
+    }
     if let Some((grant, session)) = jobs.next_session() {
         let item = DwWaitItemV1 {
             handle: session,
@@ -5219,6 +5767,7 @@ where
                                     session,
                                     grant,
                                     shell,
+                                    LaunchPublication::Deferred,
                                 )
                             } else {
                                 dispatch_one_job_request(
@@ -5230,6 +5779,7 @@ where
                                     jobs,
                                     session,
                                     grant,
+                                    LaunchPublication::Deferred,
                                 )
                             }
                         },
@@ -5742,7 +6292,15 @@ where
     W: SupervisionPlatform<Error = NativeError>,
 {
     if dispatch_one_job_request(
-        system, loader, waits, authority, policy, jobs, session, grant,
+        system,
+        loader,
+        waits,
+        authority,
+        policy,
+        jobs,
+        session,
+        grant,
+        LaunchPublication::Immediate,
     )? != JobDispatchOutcome::Responded
     {
         return Err(InitError::Wyr1BModel(JobError::WrongState));
@@ -5913,6 +6471,7 @@ where
         jobs,
         foreign_session,
         foreign.grant,
+        LaunchPublication::Immediate,
     )? != JobDispatchOutcome::Responded
     {
         return Err(InitError::Wyr1BModel(JobError::WrongState));
@@ -8338,6 +8897,7 @@ mod tests {
                 &mut jobs,
                 DwHandle(90),
                 owner,
+                LaunchPublication::Immediate,
             ),
             Ok(JobDispatchOutcome::Responded)
         );
@@ -8365,6 +8925,7 @@ mod tests {
             &mut jobs,
             DwHandle(90),
             owner,
+            LaunchPublication::Immediate,
         )
         .unwrap();
         assert!(matches!(
@@ -8393,6 +8954,7 @@ mod tests {
             &mut jobs,
             DwHandle(90),
             owner,
+            LaunchPublication::Immediate,
         )
         .unwrap();
         assert!(matches!(
@@ -8448,6 +9010,7 @@ mod tests {
                 &mut jobs,
                 DwHandle(90),
                 owner,
+                LaunchPublication::Immediate,
             ),
             Ok(JobDispatchOutcome::Responded)
         );
@@ -8480,6 +9043,7 @@ mod tests {
             &mut jobs,
             DwHandle(90),
             owner,
+            LaunchPublication::Immediate,
         )
         .unwrap();
         assert!(matches!(
@@ -8510,6 +9074,7 @@ mod tests {
             &mut jobs,
             DwHandle(90),
             owner,
+            LaunchPublication::Immediate,
         )
         .unwrap();
         assert!(matches!(
@@ -8538,6 +9103,7 @@ mod tests {
             &mut jobs,
             DwHandle(90),
             owner,
+            LaunchPublication::Immediate,
         )
         .unwrap();
         assert!(matches!(
@@ -8610,6 +9176,7 @@ mod tests {
             session,
             grant,
             &mut context,
+            LaunchPublication::Immediate,
         )
         .unwrap();
         assert_eq!(platform.evidence.len(), 2);
@@ -8649,6 +9216,7 @@ mod tests {
                 session,
                 grant,
                 &mut context,
+                LaunchPublication::Immediate,
             )
             .is_err()
         );
@@ -8678,6 +9246,7 @@ mod tests {
                 session,
                 grant,
                 &mut context,
+                LaunchPublication::Immediate,
             )
             .is_err()
         );
@@ -8959,6 +9528,7 @@ mod tests {
             session,
             grant,
             &mut context,
+            LaunchPublication::Immediate,
         )
         .unwrap();
         assert_eq!(platform.evidence.len(), 1);
@@ -9005,6 +9575,7 @@ mod tests {
             session,
             grant,
             &mut context,
+            LaunchPublication::Immediate,
         )
         .unwrap();
         assert_eq!(platform.evidence.len(), 3);
@@ -9092,6 +9663,7 @@ mod tests {
                 session,
                 grant,
                 &mut context,
+                LaunchPublication::Immediate,
             )
             .unwrap();
             let loaded = jobs.jobs.loaded_job(launch.job_id).unwrap();
@@ -9164,6 +9736,7 @@ mod tests {
                     session,
                     grant,
                     &mut context,
+                    LaunchPublication::Immediate,
                 );
                 if kind == LaunchMessageType::Wait {
                     result.unwrap();
@@ -9221,6 +9794,7 @@ mod tests {
                 &mut jobs,
                 DwHandle(90),
                 owner,
+                LaunchPublication::Immediate,
             ),
             Ok(JobDispatchOutcome::Responded)
         );
@@ -9266,6 +9840,7 @@ mod tests {
             &mut jobs,
             DwHandle(90),
             owner,
+            LaunchPublication::Immediate,
         )
         .unwrap();
         assert_eq!(
@@ -9344,6 +9919,7 @@ mod tests {
             DwHandle(90),
             owner,
             &mut context,
+            LaunchPublication::Immediate,
         )
         .unwrap();
         let JobDispatchOutcome::Launched(loaded) = outcome else {
@@ -9507,6 +10083,7 @@ mod tests {
             DwHandle(90),
             owner,
             &mut replacement_context,
+            LaunchPublication::Immediate,
         )
         .unwrap();
         assert!(matches!(replacement, JobDispatchOutcome::Launched(_)));
@@ -9673,6 +10250,7 @@ mod tests {
                 DwHandle(90),
                 owner,
                 &mut context,
+                LaunchPublication::Immediate,
             ),
             Ok(JobDispatchOutcome::Responded)
         );
@@ -9761,6 +10339,7 @@ mod tests {
                 DwHandle(90),
                 owner,
                 &mut context,
+                LaunchPublication::Immediate,
             ),
             Ok(JobDispatchOutcome::Responded)
         );
@@ -9860,6 +10439,7 @@ mod tests {
                 DwHandle(90),
                 owner,
                 &mut context,
+                LaunchPublication::Immediate,
             ),
             Ok(JobDispatchOutcome::Responded)
         );
@@ -9941,6 +10521,7 @@ mod tests {
                 DwHandle(90),
                 owner,
                 &mut context,
+                LaunchPublication::Immediate,
             ),
             Ok(JobDispatchOutcome::Responded)
         );
@@ -10023,6 +10604,7 @@ mod tests {
                 DwHandle(90),
                 owner,
                 &mut context,
+                LaunchPublication::Immediate,
             ),
             Err(InitError::Native(_))
         ));
@@ -11141,6 +11723,7 @@ mod tests {
             &mut jobs,
             DwHandle(90),
             owner,
+            LaunchPublication::Immediate,
         )
         .unwrap();
         assert_eq!(
@@ -11173,6 +11756,7 @@ mod tests {
             &mut jobs,
             DwHandle(90),
             owner,
+            LaunchPublication::Immediate,
         )
         .unwrap();
         assert_eq!(
@@ -11238,6 +11822,7 @@ mod tests {
                 DwHandle(90),
                 current,
                 &mut shell,
+                LaunchPublication::Immediate,
             ),
             Ok(JobDispatchOutcome::Responded)
         );
@@ -11408,6 +11993,7 @@ mod tests {
                 &mut jobs,
                 DwHandle(90),
                 owner,
+                LaunchPublication::Immediate,
             ),
             Err(InitError::Native(FAILURE))
         );
@@ -11455,6 +12041,7 @@ mod tests {
             &mut jobs,
             DwHandle(90),
             owner,
+            LaunchPublication::Immediate,
         )
         .unwrap();
         assert_eq!(platform.query_count, 1);
@@ -11508,6 +12095,7 @@ mod tests {
                 &mut jobs,
                 DwHandle(90),
                 owner,
+                LaunchPublication::Immediate,
             )
             .unwrap();
             assert_eq!(
@@ -11546,6 +12134,7 @@ mod tests {
             &mut jobs,
             DwHandle(90),
             owner,
+            LaunchPublication::Immediate,
         )
         .unwrap();
         assert!(matches!(
@@ -11591,6 +12180,7 @@ mod tests {
                 &mut jobs,
                 DwHandle(90),
                 owner,
+                LaunchPublication::Immediate,
             )
             .unwrap();
             assert!(matches!(
@@ -11642,6 +12232,7 @@ mod tests {
                 &mut jobs,
                 DwHandle(90),
                 owner,
+                LaunchPublication::Immediate,
             ),
             Ok(JobDispatchOutcome::Responded)
         );
@@ -12075,6 +12666,109 @@ mod tests {
         assert_eq!(jobs.jobs.live_jobs(), 0);
     }
 
+    /// Reset card R6B-2's property, stated as a sequence rather than a
+    /// signature: the poll that reads a launch does not publish it.
+    ///
+    /// This is the test the card exists for. Before it, the whole launch --
+    /// construction, the blocking READY observation, and the reply -- ran in
+    /// the frame that read the request, which is what §3's invariant 6 forbids.
+    /// After it, the first poll returns with the child alive, the transaction
+    /// parked in the arena and nothing on the wire; a later poll finds the
+    /// parked transaction and finishes it. Both halves are asserted, because
+    /// only publishing late is the property, and a version that never published
+    /// at all would satisfy the first half alone.
+    #[test]
+    fn a_deferred_launch_publishes_on_a_later_poll_than_the_one_that_read_it() {
+        let image = executable();
+        let (bootfs, _) = job_policy_bootfs(&image);
+        let mut platform = MockPlatform::new();
+        platform.bootfs = Some(bootfs);
+        platform.fail_send = false;
+        platform.now = Some(1);
+        platform.task_group = Some(DwHandle(77));
+        platform.session_poll_readable = true;
+        let mut waits = AcceptedJobV2Waits {
+            transaction_id: reservation(1).transaction_id,
+            profile: LaunchProfile::JobV2,
+            exited: false,
+            console_status_lost_process: None,
+            running_process: None,
+        };
+        let mut loader = InitSendLoader::new();
+        loader.fail_init = false;
+        let mut jobs = JobDispatcher::new();
+        let owner = grant(EndpointKind::LaunchSession, 1, 1);
+        jobs.install_session(owner, DwHandle(90)).unwrap();
+        let authority = LoadAuthority {
+            parent_root: DwHandle(1),
+            bootfs: DwHandle(2),
+            task_group: DwHandle(3),
+        };
+        platform.inbound_len = wyrmroot_launch_proto::encode_launch(
+            reservation(1),
+            "bin/hello",
+            &["bin/hello"],
+            &[],
+            false,
+            &mut platform.inbound,
+        )
+        .unwrap();
+
+        poll_job_dispatcher(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            authority,
+            &mut jobs,
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(
+            jobs.launches.open_count(),
+            1,
+            "the launch must be parked in the arena, not on the frame that read it"
+        );
+        assert_eq!(
+            platform.sent_len, 0,
+            "nothing may be published before the READY observation"
+        );
+        // The child is real -- construction ran -- and the model counts it.
+        // What has not happened is publication: the owner has been told
+        // nothing, which is the whole of what the deferral moves.
+        assert_eq!(jobs.jobs.live_jobs(), 1);
+        // Recorded rather than asserted: `loaded_job` answers for a job that
+        // is staged but not committed, so a parked transaction's child is
+        // reachable by id. That was true inside the one frame too and had no
+        // window to be observed in; deferring gives it one. Nothing on the
+        // resident path reaps by id today, and `job_transaction` is the arena's
+        // answer for when R6C drives cleanup and cancel from ordinary dispatch.
+        assert!(jobs.launches.job_transaction(1).is_some());
+
+        poll_job_dispatcher(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            authority,
+            &mut jobs,
+            11,
+        )
+        .unwrap();
+
+        assert_eq!(
+            jobs.launches.open_count(),
+            0,
+            "a published transaction leaves the arena"
+        );
+        assert_eq!(jobs.jobs.live_jobs(), 1);
+        assert!(matches!(
+            parse_launch_message(&platform.sent[..platform.sent_len], 0)
+                .unwrap()
+                .message,
+            LaunchMessage::LaunchAccepted { job_id } if job_id != 0
+        ));
+    }
+
     #[test]
     fn accepted_launch_hands_back_released_state_so_a_scripted_orphan_reap_closes_once() {
         let image = executable();
@@ -12121,6 +12815,7 @@ mod tests {
             &mut jobs,
             DwHandle(90),
             owner,
+            LaunchPublication::Immediate,
         )
         .unwrap() else {
             panic!("an accepted launch must report its loaded job");

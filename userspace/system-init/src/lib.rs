@@ -25,6 +25,8 @@ use {wyrmroot_devmgr as _, wyrmroot_uart16550d as _};
 
 pub mod evidence;
 pub mod gate;
+#[cfg(any(test, feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
+mod launch_request_facts;
 mod launch_transaction;
 #[cfg(feature = "r1-selector34")]
 pub mod r1_driver;

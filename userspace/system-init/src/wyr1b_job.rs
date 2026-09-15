@@ -2,6 +2,7 @@
 
 use deepwyrm_syscall::DwHandle;
 
+use crate::launch_transaction::LaunchTransactions;
 use crate::wyr1b::{EndpointGrant, EndpointKind, JobController, JobError};
 use wyrmroot_launch_proto::Reservation;
 #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
@@ -107,6 +108,13 @@ impl PendingWait {
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct JobDispatcher {
     pub(crate) jobs: JobController,
+    /// R6A's storage, wired in by R6B-2. A launch that returns to the event
+    /// loop between construction and READY keeps its envelope, its handles and
+    /// its stage here instead of on the dispatch frame.
+    pub(crate) launches: LaunchTransactions,
+    /// Where the next deferred-launch sweep starts, so a child that never
+    /// answers cannot starve the slot behind it.
+    pub(crate) launch_cursor: usize,
     sessions: [Option<Session>; MAX_SESSIONS],
     poll_cursor: usize,
     job_cursor: usize,
@@ -118,6 +126,8 @@ impl JobDispatcher {
     pub(crate) const fn new() -> Self {
         Self {
             jobs: JobController::new(),
+            launches: LaunchTransactions::new(),
+            launch_cursor: 0,
             sessions: [None; MAX_SESSIONS],
             poll_cursor: 0,
             job_cursor: 0,

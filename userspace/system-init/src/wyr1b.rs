@@ -356,6 +356,12 @@ pub(crate) struct PreparedJob {
 }
 
 impl PreparedJob {
+    /// The profile the arena has to record, so a deferred finish can ask the
+    /// model to rebuild this job. See [`JobController::staged_job`].
+    pub(crate) const fn profile(self) -> LaunchProfile {
+        self.profile
+    }
+
     pub(crate) const fn job_id(self) -> u64 {
         self.ticket.job_id
     }
@@ -592,6 +598,73 @@ impl JobController {
         job.task_group = task_group;
         job.launch_channel = launch_channel;
         Ok(())
+    }
+
+    /// Rebuilds the prepared job a deferred launch left staged in the model.
+    ///
+    /// Reset card R6B-2. `PreparedJob` used to be a local of the one frame that
+    /// both constructed and published, so its [`LaunchTicket`] never had to
+    /// outlive the dispatch. A launch that returns to the event loop between
+    /// those two halves has to name that job again on a later tick.
+    ///
+    /// The launch arena is the wrong place to keep the ticket. `slot` is this
+    /// controller's own index into its job table, and a copy of it held outside
+    /// the controller is a name for a position, not for a job -- if the job
+    /// were freed and the position reused, the stale ticket would still parse.
+    /// So the ticket is not stored anywhere; it is re-derived here.
+    ///
+    /// The caller supplies only what the wire gave it and the arena recorded at
+    /// construction: the owning connection, the job id, the request's
+    /// transaction id and the profile. This finds the job by identity and
+    /// refuses unless it is still exactly what construction left behind --
+    /// owned by that connection, still `Reserved`, and staged with all three
+    /// handles. The returned `PreparedJob` carries the model's own record of
+    /// those handles, not the caller's, so a caller whose copy has drifted
+    /// fails the identity checks in [`commit_prepared_job`] rather than
+    /// committing the model's job against its own stale handles.
+    pub(crate) fn staged_job(
+        &self,
+        owner_id: u64,
+        owner_generation: u64,
+        job_id: u64,
+        transaction_id: u64,
+        profile: LaunchProfile,
+    ) -> Result<PreparedJob, JobError> {
+        let owner = identity(owner_id, owner_generation)?;
+        let (slot, job) = self
+            .jobs
+            .iter()
+            .enumerate()
+            .find_map(|(slot, job)| {
+                job.as_ref()
+                    .filter(|job| job.id == job_id)
+                    .map(|job| (slot, job))
+            })
+            .ok_or(JobError::UnknownJob)?;
+        if job.owner != owner {
+            return Err(JobError::ForeignJob);
+        }
+        if job.phase != JobPhase::Reserved || job.published {
+            return Err(JobError::WrongState);
+        }
+        if job.process == 0 || job.task_group == 0 || job.launch_channel == 0 {
+            return Err(JobError::WrongState);
+        }
+        Ok(PreparedJob {
+            ticket: LaunchTicket {
+                slot,
+                job_id,
+                owner,
+                transaction_id,
+            },
+            profile,
+            transaction_id,
+            loaded: LoadedProcess {
+                process: deepwyrm_syscall::DwHandle(job.process),
+                launch_channel: deepwyrm_syscall::DwHandle(job.launch_channel),
+            },
+            task_group: job.task_group,
+        })
     }
 
     pub fn abort_launch(&mut self, ticket: LaunchTicket) -> Result<(), JobError> {

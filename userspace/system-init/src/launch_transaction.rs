@@ -20,9 +20,16 @@
 //!
 //! Returning to the event loop mid-launch means those facts have to live
 //! somewhere that outlives the dispatch. This module is that somewhere. R6A
-//! adds it and changes no behaviour; R6B splits construction from the READY
-//! observation onto it, and R6C drives the remaining events from ordinary
-//! dispatch.
+//! added it and changed no behaviour; R6B-1 split construction from the READY
+//! observation; R6B-2 wired the arena into `JobDispatcher` and moved the
+//! resident dispatcher onto it, so a launch really does return to the event
+//! loop between the two halves. R6C drives the remaining events -- EXITED,
+//! deadline, cancel, cleanup -- from ordinary dispatch, and they are still the
+//! reason a `Failing` slot can be reached from three stages.
+//!
+//! What R6B-2 does *not* move is the console launcher's ShellV1 wire, which has
+//! its own `accept_reserved_shell` and was never split by R6B-1. Its launch
+//! still publishes in the frame that read it.
 //!
 //! # Why these fields
 //!
@@ -87,7 +94,9 @@
 
 #![allow(
     dead_code,
-    reason = "R6A adds the storage; R6B and R6C migrate the dispatcher onto it"
+    reason = "R6B-2 uses most of this; `fail`, `failure` and `job_transaction` \
+              are the disposition and cancel surface R6C drives from ordinary \
+              dispatch, and are kept rather than removed and rewritten"
 )]
 
 use deepwyrm_syscall::{DwDeadline, DwHandle};
@@ -131,12 +140,29 @@ use crate::wyr1b_job::{LaunchSessionScope, MAX_SESSIONS};
 /// three simultaneous in-flight launches. This is an interim figure. §10's
 /// generated resource-budget record is what should own it, and that record
 /// still does not exist.
+///
+/// **Corrected at R6E, 2026-09-15.** The table above is one tier's, and the
+/// arithmetic it supports was generalised to builds that do not share it.
+/// `resident_fits_locked_native_stack_partition` selects three budgets: 40 KiB
+/// under `wyr1d-selector32` or `wyr1e-production`, 22 KiB under
+/// `wyr1c6-selector29`, 20 KiB otherwise. 20,480 and 984 are the last of those.
+/// Measured with this arena wired in, the spare left after it is 144 bytes on
+/// the default tier, 840 on selector 29, and 4,832 to 7,552 on the 40 KiB
+/// builds -- so five slots fit everywhere, and the tier that binds is the one
+/// with no evidence surface, which is also the one that pays least for a slot.
+/// R6B-2 relies on that: the per-slot request facts are gated with the evidence
+/// features, so the tier with 144 bytes of headroom carries none of them.
 pub(crate) const LAUNCH_TRANSACTION_SLOTS: usize = 5;
 
-/// What the arena may cost inside the locked resident partition.
+/// What the arena's ungated part may cost on the tightest resident tier.
 ///
 /// Measured, not assumed: `resident_fits_locked_native_stack_partition` locks
-/// 20,480 bytes and the resident measured 19,496 without the arena.
+/// the default tier to 20,480 bytes and the resident measured 19,496 without
+/// the arena. This is that tier's headroom and no other's -- see
+/// [`LAUNCH_TRANSACTION_SLOTS`] for why the distinction matters. Since R6B-2
+/// wired the arena into `JobDispatcher`, the resident gate measures the real
+/// total in every tier and is the one that binds; this stays as the named cost
+/// of the storage itself.
 pub(crate) const LAUNCH_ARENA_BUDGET_BYTES: usize = 20_480 - 19_496;
 
 const _: () = assert!(
@@ -262,9 +288,23 @@ struct LaunchSlot {
     resources: Option<LaunchResources>,
     ready_deadline: Option<DwDeadline>,
     failure: Option<LaunchFailure>,
-    /// Moved-handle count from the request, which the evidence join needs
-    /// alongside the request bytes and cannot recover from the slot otherwise.
-    handle_count: usize,
+    /// The request's contribution to the evidence record, taken while the
+    /// request bytes were still in hand.
+    ///
+    /// R6B-2. A deferred reply cannot re-read the request, and cannot keep it:
+    /// `MAX_LAUNCH_MESSAGE_BYTES` is 17,760 and §7.1 of the reset plan measured
+    /// that out. Two digests and a reservation are the whole of what the join
+    /// needs from it. Gated with the evidence, because a build with no evidence
+    /// surface has nothing to record and should not pay 88 bytes a slot to
+    /// carry it -- the default resident tier has 144 bytes of headroom in
+    /// total.
+    #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
+    request_facts: Option<crate::launch_request_facts::LaunchRequestFacts>,
+    /// Which recovery leg this launch was classified as, if it was one.
+    ///
+    /// Its reservation is the slot's, so only the action has to be carried.
+    #[cfg(feature = "wyr1e8-selector33")]
+    trigger_action: Option<crate::wyr1b_native::E8RecoveryAction>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -329,7 +369,10 @@ impl LaunchTransactions {
             resources: None,
             ready_deadline: None,
             failure: None,
-            handle_count: 0,
+            #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
+            request_facts: None,
+            #[cfg(feature = "wyr1e8-selector33")]
+            trigger_action: None,
         });
         Ok(LaunchToken {
             slot: index,
@@ -370,10 +413,6 @@ impl LaunchTransactions {
         token: LaunchToken,
     ) -> Result<LaunchSessionScope, LaunchTransactionError> {
         self.slot(token).map(|slot| slot.scope)
-    }
-
-    pub(crate) fn handle_count(&self, token: LaunchToken) -> Result<usize, LaunchTransactionError> {
-        self.slot(token).map(|slot| slot.handle_count)
     }
 
     /// The envelope a deferred response must echo: the session Channel to send
@@ -471,6 +510,60 @@ impl LaunchTransactions {
     ) -> Result<Option<LaunchResources>, LaunchTransactionError> {
         let slot = self.slot_mut(token)?;
         Ok(slot.resources.take())
+    }
+
+    /// Records the request-derived half of the evidence record.
+    ///
+    /// R6B-2. Refuses a second attach rather than overwriting: two different
+    /// requests cannot both be the one this transaction answers, and silently
+    /// keeping the later one would put a digest in the record that no reader
+    /// could reproduce.
+    #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
+    pub(crate) fn attach_request_facts(
+        &mut self,
+        token: LaunchToken,
+        facts: crate::launch_request_facts::LaunchRequestFacts,
+    ) -> Result<(), LaunchTransactionError> {
+        if facts.reservation() != self.slot(token)?.reservation {
+            return Err(LaunchTransactionError::ResourceIdentity);
+        }
+        let slot = self.slot_mut(token)?;
+        if slot.request_facts.is_some() {
+            return Err(LaunchTransactionError::ResourceIdentity);
+        }
+        slot.request_facts = Some(facts);
+        Ok(())
+    }
+
+    #[cfg(any(feature = "wyr1e-selector33", feature = "wyr1e8-selector33"))]
+    pub(crate) fn request_facts(
+        &self,
+        token: LaunchToken,
+    ) -> Result<Option<crate::launch_request_facts::LaunchRequestFacts>, LaunchTransactionError>
+    {
+        self.slot(token).map(|slot| slot.request_facts)
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    pub(crate) fn attach_trigger_action(
+        &mut self,
+        token: LaunchToken,
+        action: crate::wyr1b_native::E8RecoveryAction,
+    ) -> Result<(), LaunchTransactionError> {
+        let slot = self.slot_mut(token)?;
+        if slot.trigger_action.is_some() {
+            return Err(LaunchTransactionError::ResourceIdentity);
+        }
+        slot.trigger_action = Some(action);
+        Ok(())
+    }
+
+    #[cfg(feature = "wyr1e8-selector33")]
+    pub(crate) fn trigger_action(
+        &self,
+        token: LaunchToken,
+    ) -> Result<Option<crate::wyr1b_native::E8RecoveryAction>, LaunchTransactionError> {
+        self.slot(token).map(|slot| slot.trigger_action)
     }
 
     pub(crate) fn arm_ready_deadline(
