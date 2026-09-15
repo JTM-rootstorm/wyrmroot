@@ -13,6 +13,15 @@ const E6: &str = include_str!("../src/wyr1e_native.rs");
 const SELECTOR32: &str = include_str!("../src/wyr1d_native.rs");
 const JOBS: &str = include_str!("../src/wyr1b_native.rs");
 
+/// Source assertions on call shape must survive rustfmt wrapping an argument
+/// list, so compare calls with their layout removed.
+fn without_whitespace(source: &str) -> String {
+    source
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect()
+}
+
 #[test]
 fn e6_feature_selects_the_shell_controller_without_selecting_selector32() {
     assert!(MANIFEST.contains(
@@ -110,11 +119,31 @@ fn selector33_observes_only_the_validated_current_serial_publication() {
 
 #[test]
 fn resident_services_shell_v1_before_waiting_for_consoled_ready() {
-    let poll = &E6[E6.find("pub(super) fn poll").unwrap()
+    // The console readiness/exit wait admission now lives in
+    // `poll_console_event`. The property is that the resident services the
+    // shell-v1 dispatcher before it admits that wait, not that the wait is
+    // written inline in `poll`.
+    let console_event =
+        &E6[E6.find("fn poll_console_event").unwrap()..E6.find("pub(super) fn poll<").unwrap()];
+    assert!(console_event.contains("system.wait_many("));
+
+    let poll = &E6[E6.find("pub(super) fn poll<").unwrap()
         ..E6.find("pub(super) fn retire_dependents").unwrap()];
+    // A re-inlined console wait could sit ahead of the dispatcher without
+    // disturbing the ordering below, so `poll` must keep delegating it.
+    assert!(!poll.contains("system.wait_many("));
     let dispatch = poll.find("poll_job_dispatcher_with_shell(").unwrap();
-    let wait = poll.find("system.wait_many(").unwrap();
+    let wait = poll.find("poll_console_event(").unwrap();
     assert!(dispatch < wait);
+
+    // The publication gate is the only step `poll` runs before the dispatcher.
+    // Its wait carries a zero deadline, so it cannot stall a queued shell-v1
+    // request either.
+    let gate = &E6[E6.find("fn poll_publication_observer_state").unwrap()
+        ..E6.find("fn poll_publication_observer<S, W>").unwrap()];
+    assert!(poll.find("poll_publication_observer(").unwrap() < dispatch);
+    assert!(gate.contains("system.wait_many(core::slice::from_ref(&item), DwDeadline(now))"));
+
     assert!(poll.contains("ShellLaunchContext"));
     assert!(poll.contains("LaunchProfile::Consoled"));
     assert!(poll.contains("bootstrap_released = true"));
@@ -127,17 +156,28 @@ fn registry_and_devmgr_recovery_retire_dependents_before_replacement() {
     let registry = &NATIVE[NATIVE.find("fn recover_registry").unwrap()
         ..NATIVE.find("fn recover_devmgr_after_error").unwrap()];
     let retire = registry.find("wyr1e::retire_dependents").unwrap();
-    let poison = registry.find("poison_registry_generation(").unwrap();
+    // The `_before` variants are the same retirement and the same topology
+    // restart, carrying the E8 action deadline as a cap.
+    let poison = registry.find("poison_registry_generation_before(").unwrap();
     let reserve = registry
         .find("wyr1e::reserve_registry_replacement")
         .unwrap();
-    let restart = registry.find("restart_topology_or_poison(").unwrap();
+    let restart = registry.find("restart_topology_or_poison_before(").unwrap();
     let commit = registry.find("wyr1e::commit_registry_replacement").unwrap();
-    let relaunch = registry
-        .rfind("wyr1e::start_after_driver_constructed")
-        .unwrap();
+    let relaunch = registry.find("start_wyr1e_or_recover_registry(").unwrap();
     assert!(retire < poison && poison < reserve && reserve < restart);
     assert!(restart < commit && commit < relaunch);
+    // The E8 coordinated-recovery branch retires the same generation from the
+    // same position, after dependent retirement and before any replacement.
+    let e8_retire = registry
+        .find("retire_registry_for_recovery_before(")
+        .unwrap();
+    assert!(retire < e8_retire && e8_retire < reserve);
+    // Relaunch is one hop away: the helper starts the console and re-enters
+    // registry recovery only when that start fails.
+    let relaunch_helper = &NATIVE[NATIVE.find("fn start_wyr1e_or_recover_registry<S").unwrap()
+        ..NATIVE.find("fn recover_devmgr_after_error").unwrap()];
+    assert!(relaunch_helper.contains("wyr1e::start_after_driver_constructed"));
 
     let devmgr = &NATIVE[NATIVE.find("fn recover_devmgr<S").unwrap()
         ..NATIVE.find("fn launch_devmgr_replacement").unwrap()];
@@ -168,7 +208,17 @@ fn console_relaunch_is_finite_and_registry_replacement_is_the_only_budget_reset(
 
     assert!(NATIVE.contains("let outcome = wyr1e::poll(resident"));
     assert!(NATIVE.contains("wyr1e::PollOutcome::RecoverRegistry =>"));
-    assert!(NATIVE.contains("recover_registry(resident, system, loader, waits, bootfs, false)"));
+    // `recover_registry` gained an E8-quiescence argument and the call is now
+    // wrapped, so compare the call shape instead of one formatted line.
+    // Ordinary recovery passes `status_already_consumed = false`, so the
+    // replacement still awaits WRCS status, and `_e8_quiesced = false`.
+    let native = without_whitespace(NATIVE);
+    assert!(native.contains(
+        "wyr1e::PollOutcome::RecoverRegistry=>recover_registry(resident,system,loader,waits,bootfs,false,false"
+    ));
+    assert!(native.contains(
+        "wyr1e::PollOutcome::RecoverRegistryForE8=>recover_registry(resident,system,loader,waits,bootfs,false,true"
+    ));
 }
 
 #[test]
