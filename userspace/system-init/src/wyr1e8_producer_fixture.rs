@@ -34,123 +34,6 @@ fn stream_handles() -> [DwReceivedHandleInfoV1; 3] {
     })
 }
 
-fn record(
-    state: &mut ShellControllerState,
-    platform: &mut ShellPlatform,
-    request: &[u8],
-    response: &[u8],
-    handles: &[DwReceivedHandleInfoV1],
-) {
-    state
-        .record_e8_shell_jobs(platform, request, response, handles, None)
-        .unwrap();
-}
-
-fn record_list(
-    state: &mut ShellControllerState,
-    platform: &mut ShellPlatform,
-    grant: EndpointGrant,
-    transaction_id: u64,
-    jobs: &[u64],
-) {
-    let reservation = transaction(grant, transaction_id);
-    let mut request = [0u8; wyrmroot_launch_proto::HEADER_BYTES];
-    let request_len = wyrmroot_launch_proto::encode_list_jobs(reservation, &mut request).unwrap();
-    let mut response = [0u8; 96];
-    let response_len = encode_job_list(reservation, jobs, &mut response).unwrap();
-    record(
-        state,
-        platform,
-        &request[..request_len],
-        &response[..response_len],
-        &[],
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn record_launch(
-    state: &mut ShellControllerState,
-    platform: &mut ShellPlatform,
-    grant: EndpointGrant,
-    transaction_id: u64,
-    path: &str,
-    argv: &[&str],
-    streams: bool,
-    result: Result<u64, LaunchErrorCode>,
-) {
-    let reservation = transaction(grant, transaction_id);
-    let mut request = [0u8; wyrmroot_launch_proto::MAX_LAUNCH_MESSAGE_BYTES];
-    let request_len =
-        wyrmroot_launch_proto::encode_launch(reservation, path, argv, &[], streams, &mut request)
-            .unwrap();
-    let mut response = [0u8; 88];
-    let response_len = match result {
-        Ok(job_id) => encode_job_message(
-            reservation,
-            LaunchMessageType::LaunchAccepted,
-            job_id,
-            &mut response,
-        )
-        .unwrap(),
-        Err(error) => encode_launch_error(reservation, error, &mut response).unwrap(),
-    };
-    let handles = stream_handles();
-    record(
-        state,
-        platform,
-        &request[..request_len],
-        &response[..response_len],
-        if streams { &handles } else { &[] },
-    );
-}
-
-fn record_job_message(
-    state: &mut ShellControllerState,
-    platform: &mut ShellPlatform,
-    grant: EndpointGrant,
-    transaction_id: u64,
-    request_kind: LaunchMessageType,
-    response_kind: LaunchMessageType,
-    job_id: u64,
-) {
-    let reservation = transaction(grant, transaction_id);
-    let mut request = [0u8; 56];
-    let request_len = encode_job_message(reservation, request_kind, job_id, &mut request).unwrap();
-    let mut response = [0u8; 56];
-    let response_len =
-        encode_job_message(reservation, response_kind, job_id, &mut response).unwrap();
-    record(
-        state,
-        platform,
-        &request[..request_len],
-        &response[..response_len],
-        &[],
-    );
-}
-
-fn record_wait(
-    state: &mut ShellControllerState,
-    platform: &mut ShellPlatform,
-    grant: EndpointGrant,
-    transaction_id: u64,
-    job_id: u64,
-    result: TerminationResult,
-) {
-    let reservation = transaction(grant, transaction_id);
-    let mut request = [0u8; 56];
-    let request_len =
-        encode_job_message(reservation, LaunchMessageType::Wait, job_id, &mut request).unwrap();
-    let mut response = [0u8; 88];
-    let response_len = encode_job_result(reservation, job_id, result, &mut response).unwrap();
-    record(
-        state,
-        platform,
-        &request[..request_len],
-        &response[..response_len],
-        &[],
-    );
-}
-
 const fn result(
     classification: TerminationClassification,
     application_code: u32,
@@ -167,224 +50,434 @@ const fn result(
     }
 }
 
-fn record_modeled_s1(
-    state: &mut ShellControllerState,
-    platform: &mut ShellPlatform,
-    tuple: crate::wyr1e8_evidence::ShellTuple,
-) {
-    let grant = EndpointGrant {
-        registry_generation: tuple.registry_generation,
-        endpoint_id: tuple.shell_jobs_connection_id,
-        endpoint_generation: tuple.shell_jobs_generation,
-        role_generation: 1,
-        kind: EndpointKind::LaunchSession,
-    };
-    let token = format!("{:016X}", NONCE ^ 5);
-    let hello = 1_001;
-    let nonzero = 1_002;
-    let fault = 1_003;
-    let hog = 1_004;
+/// What the kernel reports about one S1 child.
+///
+/// Reset card R7C. Before this card the S1 leg hand-authored all eighteen
+/// replies and handed them to the evidence recorder, so the leg's
+/// `transaction_digest` chain was a function of the fixture rather than of the
+/// resident -- section 12's named anti-pattern, and the reason a passing S1 leg
+/// said nothing about the product. What the fixture still authors is only what
+/// the kernel owns: each child's READY frame and its terminal record. Every
+/// response byte the evidence digests below is now written by
+/// `dispatch_one_job_request_with_shell`, and every job identity is allocated
+/// by the real controller.
+struct S1Waits {
+    /// The launch transaction and profile the next child publishes exact READY
+    /// for. `None` refuses the observation, which is what a child that never
+    /// answers looks like.
+    ready: Option<(u64, LaunchProfile)>,
+    /// Terminal records by Process handle, installed before the job is reaped.
+    /// A Process with no entry is still running, which is what the shell sees
+    /// when it asks to WAIT on a live child.
+    terminal: Vec<(u64, DwTaskTerminationInfoV1)>,
+}
 
-    record_list(state, platform, grant, 1, &[]);
-    record_launch(
-        state,
+impl SupervisionPlatform for S1Waits {
+    type Error = NativeError;
+
+    fn wait_many(
+        &mut self,
+        _items: &[DwWaitItemV1],
+        _deadline: DwDeadline,
+    ) -> Result<DwWaitResultV1, Self::Error> {
+        Ok(DwWaitResultV1 {
+            index: 0,
+            observed: DW_SIGNAL_READABLE,
+            ..DwWaitResultV1::default()
+        })
+    }
+
+    fn receive_channel(
+        &mut self,
+        _channel: DwHandle,
+        bytes: &mut [u8],
+        _handles: &mut [DwReceivedHandleInfoV1],
+    ) -> Result<ReceiveCounts, Self::Error> {
+        let (transaction_id, profile) = self.ready.ok_or(FAILURE)?;
+        let size = wyrmroot_loader::launch::encode_ready_for_profile(profile, transaction_id, bytes)
+            .map_err(|_| FAILURE)?;
+        Ok(ReceiveCounts {
+            bytes: size,
+            handles: 0,
+        })
+    }
+
+    fn query_task_termination(
+        &mut self,
+        process: DwHandle,
+    ) -> Result<DwTaskTerminationInfoV1, Self::Error> {
+        Ok(self
+            .terminal
+            .iter()
+            .find(|(handle, _)| *handle == process.0)
+            .map_or(
+                DwTaskTerminationInfoV1 {
+                    state: deepwyrm_syscall::DW_TASK_STATE_RUNNING,
+                    ..DwTaskTerminationInfoV1::default()
+                },
+                |(_, info)| *info,
+            ))
+    }
+}
+
+/// One exited child's kernel record.
+fn s1_exited(
+    reason: deepwyrm_syscall::DwTerminationReason,
+    application_code: u32,
+    exception_class: u32,
+    detail: u32,
+) -> DwTaskTerminationInfoV1 {
+    DwTaskTerminationInfoV1 {
+        state: DW_TASK_STATE_EXITED,
+        reason,
+        application_code,
+        exception_type: deepwyrm_syscall::DwExceptionType(exception_class),
+        detail,
+        ..DwTaskTerminationInfoV1::default()
+    }
+}
+
+/// The S1 bootfs, admitting exactly the paths the scenario's shell asks for.
+///
+/// `test/wyr1-e/not-admitted` is present in the image and absent from the
+/// policy, and `test/wyr1-e/malformed-elf` is admitted by content digest but is
+/// not an ELF. Those are the two failures the leg needs, and neither is
+/// injected: the production admission check and the production loader each
+/// reach their own ordinary refusal.
+fn s1_policy_bootfs(image: &[u8], malformed: &[u8]) -> (Vec<u8>, [u8; 32]) {
+    let generation = [0x47; 32];
+    let mut manifest = [0u8; 80];
+    manifest[48..80].copy_from_slice(&generation);
+    // Canonical path order, which is what the bootfs builder and the policy
+    // both require.
+    let admitted: [(&str, &[u8], bool, bool); 5] = [
+        ("bin/cpu-hog", image, true, false),
+        ("bin/hello", image, false, true),
+        ("test/wyr1-e/exit-nonzero", image, false, true),
+        ("test/wyr1-e/fault", image, false, true),
+        ("test/wyr1-e/malformed-elf", malformed, false, true),
+    ];
+    let entries: Vec<LaunchPolicyEntry<'_>> = admitted
+        .iter()
+        .map(|(path, bytes, allow_no_streams, allow_three_streams)| LaunchPolicyEntry {
+            path,
+            content_sha256: wyrmroot_runtime::sha256::digest(bytes),
+            startup_abi: 2,
+            profile_id: JOB_V2_PROFILE_ID,
+            allow_no_streams: *allow_no_streams,
+            allow_three_streams: *allow_three_streams,
+        })
+        .collect();
+    let mut policy = [0u8; 2048];
+    let policy_len = encode_launch_policy(generation, &entries, &mut policy).unwrap();
+    let mut files: Vec<(&[u8], &[u8], FileMode)> = admitted
+        .iter()
+        .map(|(path, bytes, _, _)| (path.as_bytes(), *bytes, FileMode::Executable))
+        .collect();
+    files.push((b"test/wyr1-e/not-admitted", image, FileMode::Executable));
+    files.push((
+        LAUNCH_POLICY_PATH.as_bytes(),
+        &policy[..policy_len],
+        FileMode::ReadOnly,
+    ));
+    files.push((MANIFEST_PATH.as_bytes(), &manifest, FileMode::ReadOnly));
+    files.sort_by(|left, right| left.0.cmp(right.0));
+    let mut builder = BootfsBuilder::new();
+    for (path, bytes, mode) in files {
+        builder.add(path, bytes, mode).unwrap();
+    }
+    (builder.build().unwrap(), generation)
+}
+
+/// Everything one S1 transaction needs, so the leg below reads as the sequence
+/// of shell requests it is rather than as ten-argument call after call.
+struct S1Driver<'a, 'b> {
+    platform: &'a mut ShellPlatform,
+    loader: &'a mut InitSendLoader,
+    waits: &'a mut S1Waits,
+    jobs: &'a mut JobDispatcher,
+    context: ShellLaunchContext<'b>,
+    policy: &'a PolicyView<'a>,
+}
+
+impl S1Driver<'_, '_> {
+    fn dispatch(
+        &mut self,
+        grant: EndpointGrant,
+        session: DwHandle,
+        request: &[u8],
+        handles: &[DwHandle],
+    ) -> JobDispatchOutcome {
+        self.platform.push(session, request.to_vec(), handles);
+        dispatch_one_job_request_with_shell(
+            self.platform,
+            self.loader,
+            self.waits,
+            LoadAuthority {
+                parent_root: DwHandle(1),
+                bootfs: DwHandle(2),
+                task_group: DwHandle(3),
+            },
+            Some(self.policy),
+            self.jobs,
+            session,
+            grant,
+            &mut self.context,
+            LaunchPublication::Immediate,
+        )
+        .unwrap()
+    }
+
+    /// Returns the request bytes, so a caller can check the record against the
+    /// exact pair that crossed the Channel.
+    fn list(&mut self, grant: EndpointGrant, session: DwHandle, transaction_id: u64) -> Vec<u8> {
+        let reservation = transaction(grant, transaction_id);
+        let mut request = [0u8; wyrmroot_launch_proto::HEADER_BYTES];
+        let len = wyrmroot_launch_proto::encode_list_jobs(reservation, &mut request).unwrap();
+        self.dispatch(grant, session, &request[..len], &[]);
+        request[..len].to_vec()
+    }
+
+    /// Returns the job the controller allocated, or `None` when the production
+    /// admission check or the production loader refused the path.
+    fn launch(
+        &mut self,
+        grant: EndpointGrant,
+        session: DwHandle,
+        transaction_id: u64,
+        path: &str,
+        streams: bool,
+    ) -> Option<crate::wyr1b::LoadedJob> {
+        let reservation = transaction(grant, transaction_id);
+        let mut request = [0u8; wyrmroot_launch_proto::MAX_LAUNCH_MESSAGE_BYTES];
+        let len = wyrmroot_launch_proto::encode_launch(
+            reservation,
+            path,
+            &[path],
+            &[],
+            streams,
+            &mut request,
+        )
+        .unwrap();
+        self.waits.ready = Some((
+            transaction_id,
+            if streams {
+                LaunchProfile::JobV2Streams
+            } else {
+                LaunchProfile::JobV2
+            },
+        ));
+        let handles: Vec<DwHandle> = if streams {
+            stream_handles().iter().map(|info| info.handle).collect()
+        } else {
+            Vec::new()
+        };
+        match self.dispatch(grant, session, &request[..len], &handles) {
+            JobDispatchOutcome::Launched(loaded) => Some(loaded),
+            JobDispatchOutcome::Responded => None,
+            JobDispatchOutcome::Constructed => panic!("S1 publishes in the frame that read it"),
+        }
+    }
+
+    fn message(
+        &mut self,
+        grant: EndpointGrant,
+        session: DwHandle,
+        transaction_id: u64,
+        kind: LaunchMessageType,
+        job_id: u64,
+    ) {
+        let reservation = transaction(grant, transaction_id);
+        let mut request = [0u8; 56];
+        let len = encode_job_message(reservation, kind, job_id, &mut request).unwrap();
+        self.dispatch(grant, session, &request[..len], &[]);
+    }
+
+    /// The shell asks to WAIT on a live child, the child then exits, and the
+    /// resident answers from its own terminal observation. The reply is
+    /// produced by `service_pending_wait_inner`, not by this fixture.
+    fn wait(
+        &mut self,
+        grant: EndpointGrant,
+        session: DwHandle,
+        transaction_id: u64,
+        job_id: u64,
+        process: DwHandle,
+        info: DwTaskTerminationInfoV1,
+    ) {
+        self.message(grant, session, transaction_id, LaunchMessageType::Wait, job_id);
+        self.waits.terminal.push((process.0, info));
+        let loaded = self.jobs.jobs.loaded_job(job_id).unwrap();
+        reap_job(self.platform, self.waits, self.jobs, loaded).unwrap();
+        service_pending_wait_inner(
+            self.platform,
+            self.waits,
+            self.jobs,
+            Some(&mut *self.context.state),
+        )
+        .unwrap();
+    }
+}
+
+/// S1, composed rather than modeled: eighteen shell-jobs transactions and the
+/// console launcher's two, every reply written by the production dispatcher.
+#[allow(clippy::too_many_arguments)]
+fn drive_actual_s1(
+    platform: &mut ShellPlatform,
+    jobs: &mut JobDispatcher,
+    topology: &mut RegistryTopology,
+    state: &mut ShellControllerState,
+    grant: EndpointGrant,
+    session: DwHandle,
+    console_grant: EndpointGrant,
+    console_session: DwHandle,
+    outer_job_id: u64,
+    outer_process: DwHandle,
+) {
+    let image = executable();
+    let mut malformed = image.clone();
+    malformed[..4].copy_from_slice(b"NOPE");
+    let (bootfs, generation) = s1_policy_bootfs(&image, &malformed);
+    let archive = Archive::new(&bootfs).unwrap();
+    let policy = PolicyView::from_bootfs(archive, generation).unwrap();
+    let mut loader = InitSendLoader::new();
+    loader.fail_init = false;
+    let mut waits = S1Waits {
+        ready: None,
+        terminal: Vec::new(),
+    };
+    let mut driver = S1Driver {
         platform,
+        loader: &mut loader,
+        waits: &mut waits,
+        jobs,
+        context: ShellLaunchContext {
+            registry_control: DwHandle(80),
+            topology,
+            state,
+        },
+        policy: &policy,
+    };
+
+    let _ = driver.list(grant, session, 1);
+    let hello = driver
+        .launch(grant, session, 2, "bin/hello", true)
+        .expect("the production policy admits bin/hello with three streams");
+    driver.wait(
         grant,
-        2,
-        "bin/hello",
-        &["bin/hello", token.as_str()],
-        true,
-        Ok(hello),
-    );
-    record_wait(
-        state,
-        platform,
-        grant,
+        session,
         3,
-        hello,
-        result(TerminationClassification::NormalExit, 0, 0, 0),
+        hello.job_id,
+        hello.loaded.process,
+        s1_exited(DW_TERMINATION_NORMAL_EXIT, 0, 0, 0),
     );
-    record_job_message(
-        state,
-        platform,
+    driver.message(
         grant,
+        session,
         4,
         LaunchMessageType::CloseJob,
-        LaunchMessageType::Closed,
-        hello,
+        hello.job_id,
     );
-    record_launch(
-        state,
-        platform,
-        grant,
-        5,
-        "test/wyr1-e/not-admitted",
-        &["test/wyr1-e/not-admitted"],
-        true,
-        Err(LaunchErrorCode::PolicyRejected),
+    assert!(
+        driver
+            .launch(grant, session, 5, "test/wyr1-e/not-admitted", true)
+            .is_none(),
+        "an unadmitted path must be refused by the production admission check"
     );
-    record_launch(
-        state,
-        platform,
-        grant,
-        6,
-        "test/wyr1-e/malformed-elf",
-        &["test/wyr1-e/malformed-elf"],
-        true,
-        Err(LaunchErrorCode::LoaderFailure),
+    assert!(
+        driver
+            .launch(grant, session, 6, "test/wyr1-e/malformed-elf", true)
+            .is_none(),
+        "a non-ELF image must be refused by the production loader"
     );
-    record_launch(
-        state,
-        platform,
+    let nonzero = driver
+        .launch(grant, session, 7, "test/wyr1-e/exit-nonzero", true)
+        .expect("the production policy admits the nonzero-exit actor");
+    driver.wait(
         grant,
-        7,
-        "test/wyr1-e/exit-nonzero",
-        &["test/wyr1-e/exit-nonzero"],
-        true,
-        Ok(nonzero),
-    );
-    record_wait(
-        state,
-        platform,
-        grant,
+        session,
         8,
-        nonzero,
-        result(TerminationClassification::NormalExit, 37, 0, 0),
+        nonzero.job_id,
+        nonzero.loaded.process,
+        s1_exited(DW_TERMINATION_NORMAL_EXIT, 37, 0, 0),
     );
-    record_job_message(
-        state,
-        platform,
+    driver.message(
         grant,
+        session,
         9,
         LaunchMessageType::CloseJob,
-        LaunchMessageType::Closed,
-        nonzero,
+        nonzero.job_id,
     );
-    record_launch(
-        state,
-        platform,
+    let fault = driver
+        .launch(grant, session, 10, "test/wyr1-e/fault", true)
+        .expect("the production policy admits the faulting actor");
+    driver.wait(
         grant,
-        10,
-        "test/wyr1-e/fault",
-        &["test/wyr1-e/fault"],
-        true,
-        Ok(fault),
-    );
-    record_wait(
-        state,
-        platform,
-        grant,
+        session,
         11,
-        fault,
-        result(TerminationClassification::UnhandledException, 0, 2, 6),
+        fault.job_id,
+        fault.loaded.process,
+        s1_exited(DW_TERMINATION_UNHANDLED_EXCEPTION, 0, 2, 6),
     );
-    record_job_message(
-        state,
-        platform,
+    driver.message(
         grant,
+        session,
         12,
         LaunchMessageType::CloseJob,
-        LaunchMessageType::Closed,
-        fault,
+        fault.job_id,
     );
-    record_launch(
-        state,
-        platform,
+    let hog = driver
+        .launch(grant, session, 13, "bin/cpu-hog", false)
+        .expect("the production policy admits the hog without streams");
+    let _ = driver.list(grant, session, 14);
+    driver.message(
         grant,
-        13,
-        "bin/cpu-hog",
-        &["bin/cpu-hog"],
-        false,
-        Ok(hog),
-    );
-    record_list(state, platform, grant, 14, &[hog]);
-    record_job_message(
-        state,
-        platform,
-        grant,
+        session,
         15,
         LaunchMessageType::Terminate,
-        LaunchMessageType::TerminationAccepted,
-        hog,
+        hog.job_id,
     );
-    record_wait(
-        state,
-        platform,
+    driver.wait(
         grant,
+        session,
         16,
-        hog,
-        result(TerminationClassification::TaskGroupTeardown, 0, 0, 0),
+        hog.job_id,
+        hog.loaded.process,
+        s1_exited(DW_TERMINATION_TASK_GROUP_TEARDOWN, 0, 0, 0),
     );
-    record_job_message(
-        state,
-        platform,
-        grant,
-        17,
-        LaunchMessageType::CloseJob,
-        LaunchMessageType::Closed,
-        hog,
+    driver.message(grant, session, 17, LaunchMessageType::CloseJob, hog.job_id);
+    let last_request = driver.list(grant, session, 18);
+
+    // The claim this leg exists to support. The record's digest is over the
+    // exact bytes the resident put on the session Channel, so a dispatcher that
+    // answered differently would change the evidence rather than agree with a
+    // reply the fixture had composed to match it.
+    let last_response = driver.platform.sent.last().unwrap().1.clone();
+    assert_eq!(
+        &driver.platform.e8_evidence.last().unwrap()[160..192],
+        &crate::launch_request_facts::transaction_digest(&last_request, &last_response, &[])
+            .unwrap()
     );
-    record_list(state, platform, grant, 18, &[]);
-}
 
-fn finish_modeled_s1(
-    state: &mut ShellControllerState,
-    platform: &mut ShellPlatform,
-    outer_job: u64,
-) {
-    let outer_grant = EndpointGrant {
-        registry_generation: 15,
-        endpoint_id: 300,
-        endpoint_generation: 4,
-        role_generation: 1,
-        kind: EndpointKind::LaunchSession,
-    };
-    let wait = transaction(outer_grant, 501);
-    let mut wait_request = [0u8; 56];
-    let wait_request_len =
-        encode_job_message(wait, LaunchMessageType::Wait, outer_job, &mut wait_request).unwrap();
-    let mut wait_response = [0u8; 88];
-    let wait_response_len = encode_job_result(
-        wait,
-        outer_job,
-        result(TerminationClassification::NormalExit, 0, 0, 0),
-        &mut wait_response,
-    )
-    .unwrap();
-    state
-        .record_e8_outer_response(
-            platform,
-            &wait_request[..wait_request_len],
-            &wait_response[..wait_response_len],
-        )
-        .unwrap();
-
-    let close = transaction(outer_grant, 502);
-    let mut close_request = [0u8; 56];
-    let close_request_len = encode_job_message(
-        close,
+    // The console launcher's own two transactions, which retire the shell
+    // generation. Only the CLOSE emits a record; the WAIT is the result the
+    // record carries.
+    driver.wait(
+        console_grant,
+        console_session,
+        501,
+        outer_job_id,
+        outer_process,
+        s1_exited(DW_TERMINATION_NORMAL_EXIT, 0, 0, 0),
+    );
+    driver.message(
+        console_grant,
+        console_session,
+        502,
         LaunchMessageType::CloseJob,
-        outer_job,
-        &mut close_request,
-    )
-    .unwrap();
-    let mut close_response = [0u8; 56];
-    let close_response_len = encode_job_message(
-        close,
-        LaunchMessageType::Closed,
-        outer_job,
-        &mut close_response,
-    )
-    .unwrap();
-    state
-        .record_e8_outer_response(
-            platform,
-            &close_request[..close_request_len],
-            &close_response[..close_response_len],
-        )
-        .unwrap();
+        outer_job_id,
+    );
 }
-
 fn recovery_policy_bootfs(image: &[u8]) -> (Vec<u8>, [u8; 32]) {
     let generation = [0x46; 32];
     let mut manifest = [0u8; 80];
@@ -514,17 +607,61 @@ fn actual_driver_and_registry_recovery_compose_through_s4_ready() {
         driver_launch_transaction: 25,
         supervisor_generation: 26,
     };
+    // S1's sessions and its wyrmsh generation, installed on the real job
+    // dispatcher before the tuple that names them is built, so the outer job
+    // identity below is the one the controller allocated rather than a number
+    // the fixture picked.
+    let mut platform = ShellPlatform::new();
+    let mut jobs = JobDispatcher::new();
+    let s1_console_grant = EndpointGrant {
+        registry_generation: 15,
+        endpoint_id: 170,
+        endpoint_generation: 1,
+        role_generation: 9,
+        kind: EndpointKind::LaunchSession,
+    };
+    let s1_grant = EndpointGrant {
+        registry_generation: 15,
+        endpoint_id: 100,
+        endpoint_generation: 1,
+        role_generation: 10,
+        kind: EndpointKind::LaunchSession,
+    };
+    let s1_console_session = DwHandle(87);
+    let s1_session = DwHandle(88);
+    let s1_console_owner = SessionOwner {
+        process: DwHandle(821),
+        launch_channel: DwHandle(822),
+        task_group: DwHandle(823),
+    };
+    jobs.install_scoped_session(
+        s1_console_grant,
+        s1_console_session,
+        LaunchSessionScope::ConsoleLauncher,
+    )
+    .unwrap();
+    jobs.attach_session_owner(s1_console_grant, s1_console_owner)
+        .unwrap();
+    let s1_outer_reservation = transaction(s1_console_grant, 13);
+    let s1_outer = jobs.jobs.begin_launch(s1_outer_reservation).unwrap();
+    let s1_outer_process = DwHandle(831);
+    jobs.jobs
+        .commit_launch(s1_outer, s1_outer_process.0, 832, 833)
+        .unwrap();
+    jobs.install_scoped_session(s1_grant, s1_session, LaunchSessionScope::ShellJobs)
+        .unwrap();
+    jobs.attach_outer_job(s1_grant, s1_outer.job_id).unwrap();
     let s1 = crate::wyr1e8_evidence::ShellTuple {
         console_generation: 10,
         status_generation: 11,
         shell_generation: 12,
-        outer_launch_transaction: 13,
-        outer_job_id: 14,
+        outer_launch_transaction: s1_outer_reservation.transaction_id,
+        outer_job_id: s1_outer.job_id,
         registry_generation: 15,
         registry_endpoint_id: 16,
         registry_endpoint_generation: 17,
-        shell_jobs_connection_id: 100,
-        shell_jobs_generation: 1,
+        shell_jobs_connection_id: s1_grant.endpoint_id,
+        shell_jobs_generation: s1_grant.endpoint_generation,
     };
     let s1_ready = crate::wyr1e8_evidence::SerialReady {
         console_generation: s1.console_generation,
@@ -534,16 +671,33 @@ fn actual_driver_and_registry_recovery_compose_through_s4_ready() {
         stream_generation: 31,
         bundle_generation: 32,
     };
-    let mut platform = ShellPlatform::new();
     let mut state = ShellControllerState::new(s1.registry_generation).unwrap();
+    let mut topology = RegistryTopology::new(s1.registry_generation).unwrap();
     state.e8_evidence.observe_serial(serial).unwrap();
     state.stage_e8_shell_ready(&mut platform, s1).unwrap();
     state
         .observe_e8_serial_ready(&mut platform, s1_ready)
         .unwrap();
-    record_modeled_s1(&mut state, &mut platform, s1);
-    finish_modeled_s1(&mut state, &mut platform, s1.outer_job_id);
+    drive_actual_s1(
+        &mut platform,
+        &mut jobs,
+        &mut topology,
+        &mut state,
+        s1_grant,
+        s1_session,
+        s1_console_grant,
+        s1_console_session,
+        s1_outer.job_id,
+        s1_outer_process,
+    );
     assert_eq!(platform.e8_evidence.len(), 20);
+    // S1's shell generation is gone once its outer job closes, so its two
+    // sessions leave with it. S2 installs against an empty dispatcher, exactly
+    // as the resident's relaunch does.
+    jobs.disconnect_owned_session(s1_grant).unwrap();
+    jobs.disconnect_owned_session(s1_console_grant).unwrap();
+    assert_eq!(jobs.session_count(), 0);
+    assert_eq!(jobs.jobs.live_jobs(), 0);
 
     let s2_grant = EndpointGrant {
         registry_generation: s1.registry_generation,
@@ -566,7 +720,6 @@ fn actual_driver_and_registry_recovery_compose_through_s4_ready() {
         launch_channel: DwHandle(802),
         task_group: DwHandle(803),
     };
-    let mut jobs = JobDispatcher::new();
     jobs
         .install_scoped_session(
             console_grant,
@@ -666,7 +819,7 @@ fn actual_driver_and_registry_recovery_compose_through_s4_ready() {
         request[..request_len].to_vec(),
         &handles.map(|info| info.handle),
     );
-    let captured_handles = platform.inbound[0].2.clone();
+    let captured_handles = platform.inbound.last().unwrap().2.clone();
     let mut loader = InitSendLoader::new();
     loader.fail_init = false;
     let mut waits = AcceptedJobV2Waits {
@@ -676,7 +829,6 @@ fn actual_driver_and_registry_recovery_compose_through_s4_ready() {
         console_status_lost_process: Some(outer_process),
         running_process: None,
     };
-    let mut topology = RegistryTopology::new(s2.registry_generation).unwrap();
     let mut context = ShellLaunchContext {
         registry_control: DwHandle(80),
         topology: &mut topology,
