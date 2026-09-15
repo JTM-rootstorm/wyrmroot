@@ -3,11 +3,21 @@ use {wyrmroot_console_proto as _, wyrmroot_consoled as _};
 const MANIFEST: &str = include_str!("../Cargo.toml");
 const NATIVE: &str = include_str!("../src/main.rs");
 
+/// The source span of the one top-level item beginning at `anchor`. rustfmt
+/// closes a top-level item with `}` in column zero, so ending the span there
+/// rather than at a named later function keeps an anchor that has left the
+/// item from quietly matching somewhere further down the file. Top-level items
+/// only: a method inside an `impl` does not close in column zero.
+fn item<'a>(source: &'a str, anchor: &str) -> &'a str {
+    let start = source.find(anchor).unwrap();
+    let end = start + source[start..].find("\n}\n").unwrap() + 3;
+    &source[start..end]
+}
+
 #[test]
 fn e8_ready_facts_precede_each_shell_v1_request_and_use_live_serial_identity() {
     assert!(MANIFEST.contains("wyr1e8-recovery = [\"wyr1e-wyrmsh\"]"));
-    let launch = &NATIVE[NATIVE.find("fn launch_child_once(").unwrap()
-        ..NATIVE.find("fn finish_launch_abort(").unwrap()];
+    let launch = item(NATIVE, "fn launch_child_once(");
     let reserve = launch.find("model.begin_child_launch(").unwrap();
     let facts = launch
         .find("wyrmroot_consoled::e8_control::ReadyFacts {")
@@ -73,8 +83,7 @@ fn clean_terminal_result_drains_child_output_before_reap_and_relaunch() {
     let recover = branch.find("recover_terminal_child(").unwrap();
     assert!(drain < recover);
 
-    let drain_body = &NATIVE[NATIVE.find("fn drain_clean_terminal_output(").unwrap()
-        ..NATIVE.find("fn receive_recovery_request(").unwrap()];
+    let drain_body = item(NATIVE, "fn drain_clean_terminal_output(");
     let job_result = drain_body
         .find("LaunchReply::JobResult(child.job_id)")
         .unwrap();

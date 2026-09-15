@@ -18,6 +18,17 @@ const RESIDENT: &str = include_str!("../src/wyr1c_native.rs");
 const JOBS: &str = include_str!("../src/wyr1b_native.rs");
 const DISPATCH: &str = include_str!("../src/wyr1b_job.rs");
 
+/// The source span of the one top-level item beginning at `anchor`. rustfmt
+/// closes a top-level item with `}` in column zero, so ending the span there
+/// rather than at a named later function keeps an anchor that has left the
+/// item from quietly matching somewhere further down the file. Top-level items
+/// only: a method inside an `impl` does not close in column zero.
+fn item<'a>(source: &'a str, anchor: &str) -> &'a str {
+    let start = source.find(anchor).unwrap();
+    let end = start + source[start..].find("\n}\n").unwrap() + 3;
+    &source[start..end]
+}
+
 #[test]
 fn e8_profile_is_additive_and_keeps_e7_feature_separate() {
     assert!(MANIFEST.contains("wyr1e8-selector33 = ["));
@@ -44,8 +55,7 @@ fn e8_actor_admission_uses_the_product_owned_paths() {
 
 #[test]
 fn e8_shell_ready_requires_matching_tuple_and_authenticated_serial_facts() {
-    let poll = &NATIVE[NATIVE.find("pub(super) fn poll").unwrap()
-        ..NATIVE.find("pub(super) fn retire_dependents").unwrap()];
+    let poll = item(NATIVE, "pub(super) fn poll<");
     let facts = poll.find("Message::ReadyFacts(facts)").unwrap();
     let observe = poll.find("observe_e8_serial_ready(").unwrap();
     assert!(facts < observe);
@@ -67,8 +77,7 @@ fn e8_shell_ready_requires_matching_tuple_and_authenticated_serial_facts() {
     assert!(launch.contains("stage_e8_shell_ready"));
     assert!(launch.contains("ShellTuple"));
     assert!(CONSOLED.contains("Message::ReadyFacts(facts)"));
-    let attach = &CONSOLED[CONSOLED.find("fn attach_serial(").unwrap()
-        ..CONSOLED.find("fn finish_connect_abort(").unwrap()];
+    let attach = item(CONSOLED, "fn attach_serial(");
     assert!(attach.contains("connector_client_transaction: connector_transaction"));
     assert!(attach.contains(
         "valid_connector_identity(identity, publication_generation, connector_transaction)"

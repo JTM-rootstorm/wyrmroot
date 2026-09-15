@@ -22,6 +22,17 @@ fn without_whitespace(source: &str) -> String {
         .collect()
 }
 
+/// The source span of the one top-level item beginning at `anchor`. rustfmt
+/// closes a top-level item with `}` in column zero, so ending the span there
+/// rather than at a named later function keeps an anchor that has left the
+/// item from quietly matching somewhere further down the file. Top-level items
+/// only: a method inside an `impl` does not close in column zero.
+fn item<'a>(source: &'a str, anchor: &str) -> &'a str {
+    let start = source.find(anchor).unwrap();
+    let end = start + source[start..].find("\n}\n").unwrap() + 3;
+    &source[start..end]
+}
+
 #[test]
 fn e6_feature_selects_the_shell_controller_without_selecting_selector32() {
     assert!(MANIFEST.contains(
@@ -127,8 +138,7 @@ fn resident_services_shell_v1_before_waiting_for_consoled_ready() {
         &E6[E6.find("fn poll_console_event").unwrap()..E6.find("pub(super) fn poll<").unwrap()];
     assert!(console_event.contains("system.wait_many("));
 
-    let poll = &E6[E6.find("pub(super) fn poll<").unwrap()
-        ..E6.find("pub(super) fn retire_dependents").unwrap()];
+    let poll = item(E6, "pub(super) fn poll<");
     // A re-inlined console wait could sit ahead of the dispatcher without
     // disturbing the ordering below, so `poll` must keep delegating it.
     assert!(!poll.contains("system.wait_many("));
@@ -153,8 +163,7 @@ fn resident_services_shell_v1_before_waiting_for_consoled_ready() {
 
 #[test]
 fn registry_and_devmgr_recovery_retire_dependents_before_replacement() {
-    let registry = &NATIVE[NATIVE.find("fn recover_registry").unwrap()
-        ..NATIVE.find("fn recover_devmgr_after_error").unwrap()];
+    let registry = item(NATIVE, "fn recover_registry");
     let retire = registry.find("wyr1e::retire_dependents").unwrap();
     // The `_before` variants are the same retirement and the same topology
     // restart, carrying the E8 action deadline as a cap.
@@ -175,8 +184,7 @@ fn registry_and_devmgr_recovery_retire_dependents_before_replacement() {
     assert!(retire < e8_retire && e8_retire < reserve);
     // Relaunch is one hop away: the helper starts the console and re-enters
     // registry recovery only when that start fails.
-    let relaunch_helper = &NATIVE[NATIVE.find("fn start_wyr1e_or_recover_registry<S").unwrap()
-        ..NATIVE.find("fn recover_devmgr_after_error").unwrap()];
+    let relaunch_helper = item(NATIVE, "fn start_wyr1e_or_recover_registry<S");
     assert!(relaunch_helper.contains("wyr1e::start_after_driver_constructed"));
 
     let devmgr = &NATIVE[NATIVE.find("fn recover_devmgr<S").unwrap()
