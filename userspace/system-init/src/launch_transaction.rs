@@ -98,7 +98,51 @@ use crate::wyr1b::EndpointGrant;
 use crate::wyr1b_job::{LaunchSessionScope, MAX_SESSIONS};
 
 /// Concurrent launch transactions the arena can hold.
-pub(crate) const LAUNCH_TRANSACTION_SLOTS: usize = MAX_SESSIONS;
+///
+/// R6A sized this at `MAX_SESSIONS`, one per launch session, on the reasoning
+/// that WRLJ is request/response over a session so a session cannot have two
+/// launches in flight. That bound is still correct and [`LaunchTransactions::open`]
+/// still enforces it. It is not the binding one.
+///
+/// R6B measured the arena inside the resident. `JobDispatcher` lives in
+/// `ResidentSystemInit`, which `resident_fits_locked_native_stack_partition`
+/// locks to a 20,480-byte partition of init's 108 KiB execution stack, and
+/// which measured 19,496 bytes without this arena. Sixteen slots cost 2,704
+/// bytes against 984 of headroom, so the session bound cannot be the slot
+/// count.
+///
+/// Five is the concurrency this buys, and the arithmetic is:
+///
+/// | | Bytes |
+/// | --- | ---: |
+/// | Resident partition | 20,480 |
+/// | Resident without the arena | 19,496 |
+/// | Headroom | 984 |
+/// | Per slot | 169 |
+/// | Five slots plus the arena's own cursors | see [`LAUNCH_ARENA_BUDGET_BYTES`] |
+///
+/// A sixth concurrent launch is not silently dropped. It fails to reserve and
+/// the session receives `ERROR` code 6, capacity, which §9.5 of
+/// `Plans/WYR1_B_REGISTRY_LAUNCH_CONTRACT.md` already defines -- so the cap is
+/// a stated wire outcome rather than an invisible limit.
+///
+/// Five also sits above every topology the reset has exercised: the console
+/// launcher, the shell-jobs session and the R1 probe's session give a peak of
+/// three simultaneous in-flight launches. This is an interim figure. §10's
+/// generated resource-budget record is what should own it, and that record
+/// still does not exist.
+pub(crate) const LAUNCH_TRANSACTION_SLOTS: usize = 5;
+
+/// What the arena may cost inside the locked resident partition.
+///
+/// Measured, not assumed: `resident_fits_locked_native_stack_partition` locks
+/// 20,480 bytes and the resident measured 19,496 without the arena.
+pub(crate) const LAUNCH_ARENA_BUDGET_BYTES: usize = 20_480 - 19_496;
+
+const _: () = assert!(
+    LAUNCH_TRANSACTION_SLOTS <= MAX_SESSIONS,
+    "a session may hold one launch in flight, so more slots than sessions cannot all be used"
+);
 
 const _: () = assert!(
     LAUNCH_TRANSACTION_SLOTS <= MAX_LIVE_JOBS,

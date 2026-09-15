@@ -592,3 +592,19 @@ fn a_session_and_a_job_each_find_their_own_open_transaction() {
     assert_eq!(arena.job_transaction(5), None);
     assert_eq!(arena.job_transaction(6), Some(right));
 }
+
+/// The arena lives in `ResidentSystemInit`, which
+/// `resident_fits_locked_native_stack_partition` locks to a 20,480-byte
+/// partition of init's 108 KiB execution stack. R6B found that out by putting
+/// a 16-slot arena in `JobDispatcher` and watching the resident go from 19,496
+/// to 22,200. This keeps the arithmetic checkable without waiting for the
+/// wiring to fail it again.
+#[test]
+fn the_arena_fits_the_resident_partitions_headroom() {
+    use core::mem::size_of;
+    assert!(
+        size_of::<LaunchTransactions>() <= LAUNCH_ARENA_BUDGET_BYTES,
+        "arena is {} bytes against {LAUNCH_ARENA_BUDGET_BYTES} of resident headroom",
+        size_of::<LaunchTransactions>()
+    );
+}
