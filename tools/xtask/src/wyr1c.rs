@@ -57,7 +57,7 @@ const MAX_REPORT_BYTES: usize = 64 * 1024;
 pub(crate) const GATE_CONFIG: &[u8] =
     b"schema = 1\nproduct = \"wyr1-c1-host-only\"\nselector = \"none\"\nevidence = \"not-produced\"\n";
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct NativeSpec {
     pub(crate) label: &'static str,
     pub(crate) package: &'static str,
@@ -5734,6 +5734,193 @@ mod tests {
     }
 
     const WYR1F_TEST_REVISION: &str = "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1";
+    /// The matched pair's shared evidence nonce. It is shared rather than
+    /// per-sibling because it reaches the kernel ELF through the WRE1
+    /// transport, and contract §5.4 declares the kernel identical across the
+    /// siblings.
+    const WYR1F_PAIR_NONCE: &str = "F1B0000000000001";
+
+    fn wyr1f_artifacts_for(product_kind: Wyr1fProduct) -> Vec<NativeArtifact> {
+        product_kind
+            .native_specs()
+            .iter()
+            .enumerate()
+            .map(|(index, spec)| {
+                let bytes = vec![index as u8 + 0x41; index + 9];
+                NativeArtifact {
+                    spec: *spec,
+                    sha256: sha256::bytes_digest(&bytes),
+                    bytes,
+                    inspection: String::new(),
+                }
+            })
+            .collect()
+    }
+
+    fn wyr1f_sibling(product_kind: Wyr1fProduct) -> (Wyr1fProductBytes, Vec<u8>) {
+        let gate = product_kind
+            .gate_config(Some(WYR1F_PAIR_NONCE))
+            .expect("instrumented gate configuration");
+        let artifacts = wyr1f_artifacts_for(product_kind);
+        let product = assemble_wyr1f_product(WYR1F_TEST_REVISION, &artifacts, product_kind, &gate)
+            .expect("assemble an instrumented sibling");
+        (product, gate)
+    }
+
+    /// F1B.4: "required RRC binary/hash/profile changed without declaration".
+    ///
+    /// The matched siblings share every role build, so the *only* thing that
+    /// may differ between their products is the gate configuration -- and
+    /// everything downstream that binds its content identity. Contract §5.4's
+    /// difference set, checked against the actual builder rather than restated.
+    #[test]
+    fn the_matched_siblings_differ_only_in_the_gate_configuration_and_what_binds_it() {
+        let (normal, normal_gate) = wyr1f_sibling(Wyr1fProduct::InstrumentedNormal);
+        let (degraded, degraded_gate) = wyr1f_sibling(Wyr1fProduct::Degraded);
+
+        // The declared difference, and it really is the whole file.
+        assert_ne!(normal_gate, degraded_gate);
+        assert_eq!(
+            core::str::from_utf8(&normal_gate)
+                .unwrap()
+                .lines()
+                .zip(core::str::from_utf8(&degraded_gate).unwrap().lines())
+                .filter(|(left, right)| left != right)
+                .count(),
+            1,
+            "the siblings' configurations differ in exactly the scenario line"
+        );
+        assert!(normal_gate.ends_with(format!("nonce = \"{WYR1F_PAIR_NONCE}\"\n").as_bytes()));
+        assert!(degraded_gate.ends_with(format!("nonce = \"{WYR1F_PAIR_NONCE}\"\n").as_bytes()));
+
+        // Everything that does not contain the configuration is equal --
+        // including the WRRM manifest. Contract §5.4 says the difference is
+        // "the whole gate-config file and therefore its `config_hash`", which
+        // reads as though WRRM carried that hash. It does not: the format has
+        // no such field, and `expected_closure_for_request` is the only place
+        // the configuration's identity is bound, at inspection time, against
+        // `observe_closure_from_archive`. So the manifests are byte-identical
+        // and only the archive that holds the file differs.
+        assert!(normal.generation == degraded.generation);
+        assert!(normal.device_manifest == degraded.device_manifest);
+        assert!(normal.launch_policy == degraded.launch_policy);
+        assert!(
+            normal.rrc_manifest == degraded.rrc_manifest,
+            "WRRM binds no config hash; if it gained one, §5.4 and this test \
+             both need revisiting"
+        );
+        assert_ne!(normal.bootfs, degraded.bootfs);
+
+        // And the six other closure entries are byte-identical, which is
+        // §5.4's dependency-preservation rule at the product level.
+        let left = crate::wyr1::observe_closure_from_archive(&normal.bootfs).unwrap();
+        let right = crate::wyr1::observe_closure_from_archive(&degraded.bootfs).unwrap();
+        assert_eq!(left.len(), right.len());
+        let differing: Vec<&str> = left
+            .iter()
+            .zip(right.iter())
+            .filter(|(l, r)| l.identity != r.identity)
+            .map(|(l, _)| l.path)
+            .collect();
+        assert_eq!(differing, vec!["system/bootstrap/wyr1-a-gate-v1"]);
+    }
+
+    /// F1B.4: "degraded input sent to ordinary production" and "unknown
+    /// scenario or unbound episode metadata".
+    ///
+    /// The re-reader rebuilds the configuration from the declared product kind
+    /// instead of trusting the bytes it was handed, so no sibling's
+    /// configuration can be presented as another's, and the production product
+    /// admits no scenario at all.
+    #[test]
+    fn no_product_accepts_another_s_gate_configuration() {
+        let instrumented_normal = Wyr1fProduct::InstrumentedNormal
+            .gate_config(Some(WYR1F_PAIR_NONCE))
+            .unwrap();
+        let degraded = Wyr1fProduct::Degraded
+            .gate_config(Some(WYR1F_PAIR_NONCE))
+            .unwrap();
+        let cases = [
+            (Wyr1fProduct::Normal, degraded.clone()),
+            (Wyr1fProduct::Normal, instrumented_normal.clone()),
+            (Wyr1fProduct::InstrumentedNormal, degraded.clone()),
+            (Wyr1fProduct::Degraded, instrumented_normal.clone()),
+            (
+                Wyr1fProduct::InstrumentedNormal,
+                WYR1F_NORMAL_GATE_CONFIG.to_vec(),
+            ),
+            (Wyr1fProduct::Degraded, WYR1F_NORMAL_GATE_CONFIG.to_vec()),
+        ];
+        for (product_kind, gate) in cases {
+            let artifacts = wyr1f_artifacts_for(product_kind);
+            let Err(failure) =
+                assemble_wyr1f_product(WYR1F_TEST_REVISION, &artifacts, product_kind, &gate)
+            else {
+                panic!("a foreign gate configuration must be refused");
+            };
+            assert!(
+                failure.message.contains("gate configuration is not")
+                    || failure.message.contains("carries no readable nonce"),
+                "{}: {}",
+                product_kind.cli_value(),
+                failure.message
+            );
+        }
+        // A different nonce is a different configuration, and the re-reader
+        // rebuilds from the nonce it read, so a same-shape file still has to be
+        // the one the product froze.
+        let other_nonce = Wyr1fProduct::Degraded
+            .gate_config(Some("F1B000000000000F"))
+            .unwrap();
+        assert_ne!(other_nonce, degraded);
+    }
+
+    /// F1B.4: "test actor promoted into RRC-A", at the artifact level.
+    ///
+    /// The production and instrumented role builds differ in exactly one
+    /// feature on exactly one role. Anything else would put instrumentation
+    /// into a role the production product also ships.
+    #[test]
+    fn instrumentation_is_one_feature_on_one_role() {
+        let production = Wyr1fProduct::Normal.native_specs();
+        for instrumented in [
+            Wyr1fProduct::InstrumentedNormal.native_specs(),
+            Wyr1fProduct::Degraded.native_specs(),
+        ] {
+            let differing: Vec<&str> = production
+                .iter()
+                .zip(instrumented.iter())
+                .filter(|(left, right)| left != right)
+                .map(|(left, _)| left.label)
+                .collect();
+            assert_eq!(differing, vec!["system-init"]);
+            assert_eq!(production[0].features, "wyr1e-production");
+            assert_eq!(instrumented[0].features, "wyr1e-production,wyr1f-closure");
+            // Only the feature moves: same package, same binary, same artifact.
+            assert_eq!(production[0].package, instrumented[0].package);
+            assert_eq!(production[0].binary, instrumented[0].binary);
+            assert_eq!(production[0].artifact, instrumented[0].artifact);
+        }
+        // The two instrumented siblings build identically. The kernel and the
+        // roles are not part of the declared normal/degraded difference.
+        assert_eq!(
+            Wyr1fProduct::InstrumentedNormal.native_specs(),
+            Wyr1fProduct::Degraded.native_specs()
+        );
+        // And the production product has no nonce to give a kernel.
+        assert_eq!(
+            wyr1f_kernel_evidence_nonce(Wyr1fProduct::Normal, WYR1F_NORMAL_GATE_CONFIG).unwrap(),
+            None
+        );
+        for product_kind in [Wyr1fProduct::InstrumentedNormal, Wyr1fProduct::Degraded] {
+            let gate = product_kind.gate_config(Some(WYR1F_PAIR_NONCE)).unwrap();
+            assert_eq!(
+                wyr1f_kernel_evidence_nonce(product_kind, &gate).unwrap(),
+                Some(WYR1F_PAIR_NONCE.to_owned())
+            );
+        }
+    }
+
 
     fn wyr1f_product() -> (Wyr1fProductBytes, Vec<NativeArtifact>) {
         let artifacts = wyr1f_artifacts();
