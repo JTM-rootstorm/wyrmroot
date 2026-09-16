@@ -24,8 +24,9 @@ use crate::{
 use wyrmroot_bootfs::{
     archive::Archive,
     launch_policy::{
-        JOB_V2_PROFILE_ID, LaunchPolicy, LaunchPolicyEntry, WYRMSH_PATH, WYRMSH_PROFILE_ID,
-        encode as encode_launch_policy, encode_wyrmsh,
+        JOB_V2_PROFILE_ID, LaunchPolicy, LaunchPolicyEntry, RECOVERY_TRIGGER_PROFILE_ID,
+        WYRMSH_PATH, WYRMSH_PROFILE_ID, encode as encode_launch_policy, encode_recovery_trigger,
+        encode_wyrmsh,
     },
     wyr1::{
         CONSOLE_ECHO_PATH, CPU_HOG_PATH, DW1_E3A_COM2_PROBE_PATH, DW1_E3A_GATE_PATH,
@@ -2522,7 +2523,7 @@ fn assemble_e8_product(
         digest_array(&stdout_pressure.sha256)?,
     ];
     let mut policy = [0u8; 1536];
-    let policy_size = encode_wyrmsh(
+    let policy_size = encode_recovery_trigger(
         generation,
         &[
             LaunchPolicyEntry {
@@ -2577,7 +2578,10 @@ fn assemble_e8_product(
                 path: E8_RECOVERY_TRIGGER_PATH,
                 content_sha256: identities[5],
                 startup_abi: 2,
-                profile_id: JOB_V2_PROFILE_ID,
+                // R7B-4 class D1b. The one place that still knows which path
+                // opens a recovery episode is the builder that writes the
+                // policy saying so. The dispatcher reads the profile.
+                profile_id: RECOVERY_TRIGGER_PROFILE_ID,
                 allow_no_streams: false,
                 allow_three_streams: true,
             },
@@ -4886,7 +4890,21 @@ mod tests {
             assert!(archive.lookup(path.as_bytes()).unwrap().is_executable());
         }
         let policy = LaunchPolicy::parse(&product.launch_policy).unwrap();
-        assert_eq!(policy.version_minor(), 1);
+        // R7B-4 class D1b. The E8 policy is the minor that admits the recovery
+        // trigger profile, and the trigger entry is the only one carrying it.
+        // This is where the magic path now lives, so this is where it is pinned.
+        assert_eq!(policy.version_minor(), 2);
+        assert_eq!(
+            policy.find(E8_RECOVERY_TRIGGER_PATH).unwrap().profile_id,
+            RECOVERY_TRIGGER_PROFILE_ID
+        );
+        assert_eq!(
+            (0..policy.len())
+                .filter_map(|index| policy.entry(index).and_then(Result::ok))
+                .filter(|entry| entry.profile_id == RECOVERY_TRIGGER_PROFILE_ID)
+                .count(),
+            1
+        );
         assert_eq!(policy.len(), 8);
 
         let e7_artifacts = artifacts[..10]

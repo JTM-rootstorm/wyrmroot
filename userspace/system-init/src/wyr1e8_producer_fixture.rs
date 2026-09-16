@@ -487,12 +487,18 @@ fn recovery_policy_bootfs(image: &[u8]) -> (Vec<u8>, [u8; 32]) {
         path,
         content_sha256: wyrmroot_runtime::sha256::digest(image),
         startup_abi: 2,
-        profile_id: JOB_V2_PROFILE_ID,
+        // R7B-4 class D1b. The fixture builds the policy the product builds,
+        // including the profile that permits this path to open an episode --
+        // the dispatcher reads that and nothing else, so a fixture that tagged
+        // it JobV2 would exercise a path the product cannot reach.
+        profile_id: wyrmroot_bootfs::launch_policy::RECOVERY_TRIGGER_PROFILE_ID,
         allow_no_streams: false,
         allow_three_streams: true,
     };
     let mut policy = [0u8; 512];
-    let policy_len = encode_launch_policy(generation, &[entry], &mut policy).unwrap();
+    let policy_len =
+        wyrmroot_bootfs::launch_policy::encode_recovery_trigger(generation, &[entry], &mut policy)
+            .unwrap();
     let mut builder = BootfsBuilder::new();
     builder
         .add(path.as_bytes(), image, FileMode::Executable)

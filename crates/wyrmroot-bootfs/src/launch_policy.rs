@@ -12,8 +12,22 @@ const MAGIC: [u8; 4] = *b"WRJP";
 const VERSION_MAJOR: u16 = 1;
 const VERSION_MINOR_HISTORICAL: u16 = 0;
 const VERSION_MINOR_WYRMSH: u16 = 1;
+/// Admits [`RECOVERY_TRIGGER_PROFILE_ID`]. Reset card R7B-4 class D1b.
+const VERSION_MINOR_RECOVERY_TRIGGER: u16 = 2;
 pub const JOB_V2_PROFILE_ID: u16 = 1;
 pub const WYRMSH_PROFILE_ID: u16 = 2;
+/// A launch this policy permits to open a recovery episode.
+///
+/// R7B-4 class D1b. The E8 recovery trigger used to be an ordinary
+/// `JOB_V2_PROFILE_ID` entry indistinguishable from every other test actor, so
+/// the only way the dispatcher could recognise it was to compare each ShellJobs
+/// launch against a magic path -- a sniff on the production dispatch path,
+/// which is what D1b names.
+///
+/// A profile id is the policy's existing way to say what a path is for, so the
+/// fact moves here. Deliberately not constrained to any path: the point is that
+/// nothing outside the builder that writes this policy knows which path it is.
+pub const RECOVERY_TRIGGER_PROFILE_ID: u16 = 3;
 pub const WYRMSH_PATH: &str = "system/wyrmsh";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,7 +77,10 @@ impl<'a> LaunchPolicy<'a> {
         }
         let minor = get_u16(bytes, 6)?;
         if get_u16(bytes, 4)? != VERSION_MAJOR
-            || !matches!(minor, VERSION_MINOR_HISTORICAL | VERSION_MINOR_WYRMSH)
+            || !matches!(
+                minor,
+                VERSION_MINOR_HISTORICAL | VERSION_MINOR_WYRMSH | VERSION_MINOR_RECOVERY_TRIGGER
+            )
         {
             return Err(PolicyError::UnsupportedVersion);
         }
@@ -189,8 +206,13 @@ impl<'a> LaunchPolicy<'a> {
         if startup_abi != 2
             || match (self.minor, profile_id) {
                 (VERSION_MINOR_HISTORICAL, JOB_V2_PROFILE_ID) => false,
-                (VERSION_MINOR_WYRMSH, JOB_V2_PROFILE_ID) => path == WYRMSH_PATH,
-                (VERSION_MINOR_WYRMSH, WYRMSH_PROFILE_ID) => path != WYRMSH_PATH,
+                (VERSION_MINOR_WYRMSH | VERSION_MINOR_RECOVERY_TRIGGER, JOB_V2_PROFILE_ID) => {
+                    path == WYRMSH_PATH
+                }
+                (VERSION_MINOR_WYRMSH | VERSION_MINOR_RECOVERY_TRIGGER, WYRMSH_PROFILE_ID) => {
+                    path != WYRMSH_PATH
+                }
+                (VERSION_MINOR_RECOVERY_TRIGGER, RECOVERY_TRIGGER_PROFILE_ID) => false,
                 _ => true,
             }
         {
@@ -199,7 +221,8 @@ impl<'a> LaunchPolicy<'a> {
         let stream_modes = get_u16(record, 10)?;
         if stream_modes == 0
             || stream_modes & !0b11 != 0
-            || (profile_id == WYRMSH_PROFILE_ID && stream_modes != 0b10)
+            || (matches!(profile_id, WYRMSH_PROFILE_ID | RECOVERY_TRIGGER_PROFILE_ID)
+                && stream_modes != 0b10)
         {
             return Err(PolicyError::InvalidStreamModes);
         }
@@ -242,6 +265,25 @@ pub fn encode(
 ) -> Result<usize, PolicyError> {
     encode_version(
         VERSION_MINOR_HISTORICAL,
+        boot_generation_sha256,
+        entries,
+        output,
+    )
+}
+
+/// Encodes the additive WRJP 1.2 policy, which may also carry
+/// [`RECOVERY_TRIGGER_PROFILE_ID`].
+///
+/// R7B-4 class D1b. Only a build that actually has a recovery trigger emits
+/// this minor; every other selector keeps the minor it already emits, so the
+/// profile exists exactly where it is used.
+pub fn encode_recovery_trigger(
+    boot_generation_sha256: [u8; 32],
+    entries: &[LaunchPolicyEntry<'_>],
+    output: &mut [u8],
+) -> Result<usize, PolicyError> {
+    encode_version(
+        VERSION_MINOR_RECOVERY_TRIGGER,
         boot_generation_sha256,
         entries,
         output,
@@ -310,8 +352,13 @@ fn encode_version(
         if entry.startup_abi != 2
             || match (minor, entry.profile_id) {
                 (VERSION_MINOR_HISTORICAL, JOB_V2_PROFILE_ID) => false,
-                (VERSION_MINOR_WYRMSH, JOB_V2_PROFILE_ID) => entry.path == WYRMSH_PATH,
-                (VERSION_MINOR_WYRMSH, WYRMSH_PROFILE_ID) => entry.path != WYRMSH_PATH,
+                (VERSION_MINOR_RECOVERY_TRIGGER, RECOVERY_TRIGGER_PROFILE_ID) => false,
+                (VERSION_MINOR_WYRMSH | VERSION_MINOR_RECOVERY_TRIGGER, JOB_V2_PROFILE_ID) => {
+                    entry.path == WYRMSH_PATH
+                }
+                (VERSION_MINOR_WYRMSH | VERSION_MINOR_RECOVERY_TRIGGER, WYRMSH_PROFILE_ID) => {
+                    entry.path != WYRMSH_PATH
+                }
                 _ => true,
             }
         {
@@ -319,7 +366,12 @@ fn encode_version(
         }
         let stream_modes =
             u16::from(entry.allow_no_streams) | (u16::from(entry.allow_three_streams) << 1);
-        if stream_modes == 0 || (entry.profile_id == WYRMSH_PROFILE_ID && stream_modes != 0b10) {
+        if stream_modes == 0
+            || (matches!(
+                entry.profile_id,
+                WYRMSH_PROFILE_ID | RECOVERY_TRIGGER_PROFILE_ID
+            ) && stream_modes != 0b10)
+        {
             return Err(PolicyError::InvalidStreamModes);
         }
         let record = HEADER_BYTES + index * RECORD_BYTES;
@@ -485,10 +537,56 @@ mod tests {
             LaunchPolicy::parse(&bytes[..size]),
             Err(PolicyError::InvalidStartupProfile)
         );
-        bytes[6..8].copy_from_slice(&2_u16.to_le_bytes());
+        // R7B-4 class D1b made minor 2 real, so this mutation now parses. What
+        // the test is for still holds and is asserted directly: a minor the
+        // attacker flips cannot promote an entry to the recovery-trigger
+        // profile, because the profile is a separate field the mutation does
+        // not touch, and the entry parses identically under both minors.
+        bytes[6..8].copy_from_slice(&VERSION_MINOR_RECOVERY_TRIGGER.to_le_bytes());
+        let promoted = LaunchPolicy::parse(&bytes[..size]).unwrap();
+        let entry = promoted.find(WYRMSH_PATH).unwrap();
+        assert_eq!(entry.profile_id, WYRMSH_PROFILE_ID);
+        assert_ne!(entry.profile_id, RECOVERY_TRIGGER_PROFILE_ID);
+        assert_eq!(entry, wyrmsh);
+
+        bytes[6..8].copy_from_slice(&3_u16.to_le_bytes());
         assert_eq!(
             LaunchPolicy::parse(&bytes[..size]),
             Err(PolicyError::UnsupportedVersion)
+        );
+    }
+
+    #[test]
+    fn the_recovery_trigger_profile_needs_its_own_minor_and_three_streams() {
+        let trigger = LaunchPolicyEntry {
+            path: "test/wyr1-e/recovery-trigger",
+            content_sha256: [0x44; 32],
+            startup_abi: 2,
+            profile_id: RECOVERY_TRIGGER_PROFILE_ID,
+            allow_no_streams: false,
+            allow_three_streams: true,
+        };
+        let mut bytes = [0_u8; 512];
+        // The minor that does not admit it refuses to encode it at all.
+        assert_eq!(
+            encode_wyrmsh([0x11; 32], &[trigger], &mut bytes),
+            Err(PolicyError::InvalidStartupProfile)
+        );
+        let size = encode_recovery_trigger([0x11; 32], &[trigger], &mut bytes).unwrap();
+        let parsed = LaunchPolicy::parse(&bytes[..size]).unwrap();
+        assert_eq!(parsed.version_minor(), VERSION_MINOR_RECOVERY_TRIGGER);
+        assert_eq!(parsed.find(trigger.path).unwrap(), trigger);
+
+        // A no-stream trigger is not a trigger: the actor takes three streams,
+        // and the profile pins that the way the Wyrmsh profile pins its own.
+        let starved = LaunchPolicyEntry {
+            allow_no_streams: true,
+            allow_three_streams: false,
+            ..trigger
+        };
+        assert_eq!(
+            encode_recovery_trigger([0x11; 32], &[starved], &mut bytes),
+            Err(PolicyError::InvalidStreamModes)
         );
     }
 }

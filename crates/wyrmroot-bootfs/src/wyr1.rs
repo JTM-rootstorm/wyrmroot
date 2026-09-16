@@ -14,7 +14,8 @@ use alloc::vec::Vec;
 use crate::{
     builder::{BuildError, Builder, FileMode},
     launch_policy::{
-        JOB_V2_PROFILE_ID, LaunchPolicy, WYRMSH_PATH as POLICY_WYRMSH_PATH, WYRMSH_PROFILE_ID,
+        JOB_V2_PROFILE_ID, LaunchPolicy, RECOVERY_TRIGGER_PROFILE_ID,
+        WYRMSH_PATH as POLICY_WYRMSH_PATH, WYRMSH_PROFILE_ID,
     },
 };
 use wyrmroot_device_proto::{Manifest as DeviceManifest, manifest::ContentIdentity};
@@ -751,7 +752,9 @@ fn validate_e8_product(product: ProductE8<'_>) -> Result<(), BuildError> {
     }
     let policy = LaunchPolicy::parse(product.launch_policy)
         .map_err(|_| BuildError::InvalidE8LaunchPolicy)?;
-    if policy.version_minor() != 1 || policy.len() != 8 {
+    // R7B-4 class D1b. The E8 policy is the minor that admits the recovery
+    // trigger profile, because this product is the one that has a trigger.
+    if policy.version_minor() != 2 || policy.len() != 8 {
         return Err(BuildError::InvalidE8LaunchPolicy);
     }
     let entries = [
@@ -800,7 +803,7 @@ fn validate_e8_product(product: ProductE8<'_>) -> Result<(), BuildError> {
         (
             E8_RECOVERY_TRIGGER_PATH,
             product.expected_recovery_trigger_identity,
-            JOB_V2_PROFILE_ID,
+            RECOVERY_TRIGGER_PROFILE_ID,
             false,
             true,
         ),
@@ -854,7 +857,7 @@ pub(crate) fn validate_c1_product(product: ProductC1<'_>) -> Result<(), BuildErr
 pub(crate) mod tests {
     use super::*;
     use crate::archive::Archive;
-    use crate::launch_policy::{LaunchPolicyEntry, encode_wyrmsh};
+    use crate::launch_policy::{LaunchPolicyEntry, encode_recovery_trigger, encode_wyrmsh};
     use alloc::vec;
 
     pub(crate) const UART_IDENTITY: [u8; 32] = [0xa1; 32];
@@ -1049,7 +1052,7 @@ pub(crate) mod tests {
                 path: E8_RECOVERY_TRIGGER_PATH,
                 content_sha256: identities[6],
                 startup_abi: 2,
-                profile_id: JOB_V2_PROFILE_ID,
+                profile_id: RECOVERY_TRIGGER_PROFILE_ID,
                 allow_no_streams: false,
                 allow_three_streams: true,
             },
@@ -1063,7 +1066,7 @@ pub(crate) mod tests {
             },
         ];
         let mut output = vec![0; 1536];
-        let used = encode_wyrmsh([0x84; 32], &entries, &mut output).unwrap();
+        let used = encode_recovery_trigger([0x84; 32], &entries, &mut output).unwrap();
         output.truncate(used);
         output
     }

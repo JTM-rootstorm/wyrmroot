@@ -61,6 +61,15 @@ fn e8_shell_ready_requires_matching_tuple_and_authenticated_serial_facts() {
     assert!(facts < observe);
     assert!(poll.contains("bundle_generation: facts.bundle_generation"));
     assert!(poll.contains("!e6.shell.e8_tuple_waiting_for_serial()"));
+    // R7B-4 class D1b. The dispatcher asks the policy which launch may open an
+    // episode; it does not know the path. Assert the negative too, since
+    // reintroducing the comparison would not change how the call site reads.
+    assert!(JOBS.contains("policy.opens_recovery_episode(request.path)"));
+    let classify = &JOBS[JOBS.find("fn e8_trigger_from_launch").unwrap()
+        ..JOBS.find("fn e8_trigger_from_request").unwrap()];
+    assert!(classify.contains("if !opens_episode {"));
+    assert!(!classify.contains("RECOVERY_TRIGGER_PATH"));
+    assert!(classify.contains("launch.arg(0) != Some(launch.path)"));
     // R7B-4 class D1e. The dispatcher admission carries one reason, evidence
     // adjacency, and the held WAIT is no longer one of them. Assert the
     // negative too: re-adding `e8_held` here would restore the bundling

@@ -514,12 +514,14 @@ impl ShellControllerState {
         &self,
         reservation: LaunchReservation,
         launch: &wyrmroot_launch_proto::LaunchRequest<'_>,
+        opens_episode: bool,
     ) -> Result<Option<E8TriggerRequest>, InitError> {
         let trigger = e8_trigger_from_launch(
             self.e8_evidence.stage(),
             self.e8_evidence.nonce(),
             reservation,
             launch,
+            opens_episode,
         )?;
         if trigger.is_some() && (self.e8_trigger.is_some() || self.e8_held.is_some()) {
             return Err(InitError::Accounting);
@@ -936,14 +938,18 @@ fn e8_trigger_from_launch(
     nonce: u64,
     reservation: LaunchReservation,
     launch: &wyrmroot_launch_proto::LaunchRequest<'_>,
+    opens_episode: bool,
 ) -> Result<Option<E8TriggerRequest>, InitError> {
-    if launch.path != wyrmroot_wyr1e_test_actors::RECOVERY_TRIGGER_PATH {
+    if !opens_episode {
         return Ok(None);
     }
     if launch.stream_count != 3
         || launch.argc() != 3
         || launch.environment_count() != 0
-        || launch.arg(0) != Some(wyrmroot_wyr1e_test_actors::RECOVERY_TRIGGER_PATH)
+        // argv0 naming the launched path is the general contract, not a fact
+        // about this actor. Comparing it to `launch.path` says the same thing
+        // without the dispatcher knowing which path that is.
+        || launch.arg(0) != Some(launch.path)
     {
         return Err(InitError::Accounting);
     }
@@ -982,7 +988,13 @@ fn e8_trigger_from_request(
     let LaunchMessage::Launch(launch) = request.message else {
         return Ok(None);
     };
-    e8_trigger_from_launch(stage, nonce, request.reservation, &launch)
+    e8_trigger_from_launch(
+        stage,
+        nonce,
+        request.reservation,
+        &launch,
+        launch.path == wyrmroot_wyr1e_test_actors::RECOVERY_TRIGGER_PATH,
+    )
 }
 
 #[cfg(feature = "wyr1e8-selector33")]
@@ -5369,7 +5381,11 @@ where
                     .as_deref()
                     .map(|context| &*context.state)
                     .ok_or(InitError::WrongActivationOrder)?;
-                match state.classify_e8_trigger_launch(reservation, &request) {
+                // R7B-4 class D1b. The dispatcher no longer knows which path
+                // opens a recovery episode; the policy that admitted the launch
+                // says so, by the profile it gave that path.
+                let opens_episode = policy.opens_recovery_episode(request.path);
+                match state.classify_e8_trigger_launch(reservation, &request, opens_episode) {
                     Ok(trigger) => trigger,
                     Err(error) => {
                         let failed = close_received_reverse(system, &received, counts.handles);
