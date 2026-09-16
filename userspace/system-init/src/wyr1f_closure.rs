@@ -206,6 +206,118 @@ mod tests {
         }
     }
 
+    /// The named item's source span, for the two structural checks below.
+    fn item<'a>(source: &'a str, signature: &'a str) -> &'a str {
+        let start = source.find(signature).expect(signature);
+        let body = &source[start..];
+        let open = body.find('{').expect("body");
+        let mut depth = 0_usize;
+        for (index, byte) in body.as_bytes().iter().enumerate().skip(open) {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &body[..=index];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced body for {signature}");
+    }
+
+
+    /// F1B.4: "old READY or endpoint tuple used as full-console trigger".
+    ///
+    /// The closure episode's READY join is read from the two owners' live state,
+    /// not from a recorded tuple. There is nothing for a stale generation, a stale
+    /// endpoint or a replayed READY message to be presented as, because the join
+    /// carries no identity at all -- only "consoled is installed and validated"
+    /// and "a wyrmsh generation has reached READY".
+    ///
+    /// The shell half is deliberately never cleared: it means "the first
+    /// generation was READY", not "a generation is READY now", so a shell that
+    /// exits and is replaced after DEGRADED cannot re-arm an episode.
+    #[test]
+    fn the_closure_ready_join_reads_live_owner_state_and_no_tuple() {
+        let join = item(
+            include_str!("wyr1e_native.rs"),
+            "pub(super) fn wyr1f_ready_join",
+        );
+        assert!(join.contains("e6.console.is_some() && !e6.awaiting_ready"));
+        assert!(join.contains("e6.shell.wyr1f_shell_ready()"));
+        for forbidden in [
+            "generation",
+            "endpoint",
+            "transaction",
+            "identity",
+            "nonce",
+            "tuple",
+        ] {
+            assert!(
+                !join.contains(forbidden),
+                "the join must carry no {forbidden}: an identity here is \
+                 something a stale one could be presented as"
+            );
+        }
+        // The shell half is set and never cleared: it means "the first
+        // generation was READY", not "a generation is READY now", so a shell
+        // replaced after DEGRADED cannot re-arm an episode.
+        let shell = include_str!("wyr1b_native.rs");
+        assert!(shell.contains("self.wyr1f_shell_ready = true;"));
+        assert!(!shell.contains("self.wyr1f_shell_ready = false;"));
+    }
+
+    /// F1B.4: "extra method/right/handle added to shell or job".
+    ///
+    /// The episode adds no shell or job surface at all. It is confined to init:
+    /// one observation recorded by the dispatcher at a join it already computed,
+    /// and one state machine on the resident. Nothing reaches `wyr1b_job`, and the
+    /// shell and job profiles are whatever they were -- which is why the matched
+    /// siblings' launch policies are byte-identical.
+    /// F1B.4: "extra method/right/handle added to shell or job".
+    ///
+    /// The episode adds no shell or job surface at all. It is confined to
+    /// init: one boolean recorded by the dispatcher at a join it already
+    /// computes, and one state machine on the resident. Nothing reaches
+    /// `wyr1b_job`, and the shell and job profiles are whatever they were --
+    /// which is why the matched siblings' launch policies are byte-identical.
+    #[test]
+    fn the_closure_episode_adds_no_shell_or_job_authority() {
+        let jobs = include_str!("wyr1b_job.rs");
+        assert!(!jobs.contains("wyr1f"));
+        let shell = include_str!("wyr1b_native.rs");
+        // The field, its initializer, one setter, one reader, and one call at
+        // the join the dispatcher already computes. A shell surface would need
+        // more than a boolean.
+        assert_eq!(shell.matches("wyr1f_shell_ready").count(), 7);
+        assert_eq!(shell.matches("observe_wyr1f_shell_ready").count(), 2);
+        // The episode type appears in `wyr1b_native` only where a
+        // `ResidentSystemInit` is constructed, which is init's own field. The
+        // shell controller neither holds it nor can reach it.
+        assert_eq!(shell.matches("ClosureEpisode").count(), 2);
+        assert_eq!(shell.matches("ClosureEpisode::new(").count(), 2);
+        for span in [
+            item(shell, "pub(crate) struct ShellControllerState"),
+            item(shell, "impl ShellControllerState"),
+        ] {
+            assert!(!span.contains("ClosureEpisode"));
+            assert!(!span.contains("wyr1f_closure"));
+        }
+        // The episode itself never names a launch profile, a right or a
+        // handle, and contains no `unsafe`. Scanned above `#[cfg(test)]`,
+        // because this test names those very words a few lines down.
+        let whole = include_str!("wyr1f_closure.rs");
+        let episode = &whole[..whole.find("#[cfg(test)]").expect("test module")];
+        for forbidden in ["LaunchProfile", "DwRights", "DwHandle", "Channel", "unsafe"] {
+            assert!(
+                !episode.contains(forbidden),
+                "episode must not name {forbidden}"
+            );
+        }
+    }
+
     /// A terminal observation that arrives before the episode is in flight is
     /// some other role's, and must not consume the declared episode.
     #[test]
