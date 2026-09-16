@@ -414,7 +414,7 @@ fn a_lost_control_peer_orphans_the_driver_instead_of_shutting_it_down() {
 
     // Dropping control shifts the wait set down by one; `slot` undoes that so
     // the Interrupt and stream branches stay positional.
-    assert!(loop_body.contains("let slot = observed.index + usize::from(orphaned);"));
+    assert!(loop_body.contains("let slot = observed.index + u32::from(orphaned);"));
 
     // An orphan with neither an Interrupt nor a stream has no service to keep.
     assert!(loop_body.contains("if count == 0 {"));

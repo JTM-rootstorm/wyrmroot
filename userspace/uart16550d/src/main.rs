@@ -486,7 +486,7 @@ fn run_event_loop<I: ByteRegisterIo>(
 
         // Slot 0 is control, 1 the Interrupt, 2 the stream, whether or not
         // control is actually in the wait set this round.
-        let slot = observed.index + usize::from(orphaned);
+        let slot = observed.index + u32::from(orphaned);
         // Control retirement/revocation wins even when the wait selected an
         // Interrupt or stream item whose readiness coexists with control.
         let control_signals = if orphaned {

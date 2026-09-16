@@ -1398,6 +1398,9 @@ pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<
     if matches!(filter, Some("wyr1e8-native")) {
         return crate::wyr1c::run_wyr1e8_native_checks(repository);
     }
+    if matches!(filter, Some("wyr1f-native")) {
+        return crate::wyr1c::run_wyr1f_native_checks(repository);
+    }
     if matches!(filter, Some("wyr1e8-actors-native")) {
         return crate::wyr1c::run_wyr1e8_actor_native_checks(repository);
     }

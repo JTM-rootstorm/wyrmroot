@@ -991,6 +991,28 @@ pub(crate) fn run_wyr1e8_native_checks(repository: &Path) -> Result<(), Failure>
     )
 }
 
+/// Compiles both WYR1-F role sets for the native target.
+///
+/// This gate exists because F1B.2's uart16550d change shipped a compile error
+/// into a product build: the driver binary is compiled only for
+/// `x86_64-unknown-wyrmroot`, so every host test that covers it reads its
+/// source as text rather than building it, and `observed.index` being `u32`
+/// there and not `usize` was invisible until `wyr1f prepare` ran. No host gate
+/// compiled the F artifact set at all.
+pub(crate) fn run_wyr1f_native_checks(repository: &Path) -> Result<(), Failure> {
+    for product_kind in [Wyr1fProduct::Normal, Wyr1fProduct::InstrumentedNormal] {
+        run_native_checks(
+            repository,
+            "WYR1-F",
+            "wyr1f",
+            &product_kind.native_specs(),
+            &[],
+            None,
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn run_wyr1e8_actor_native_checks(repository: &Path) -> Result<(), Failure> {
     run_native_checks(
         repository,
