@@ -1408,7 +1408,10 @@ impl RequestCard {
     }
 }
 
-#[allow(clippy::too_many_arguments, reason = "ten parameters are distinct fields of one rendered request")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "ten parameters are distinct fields of one rendered request"
+)]
 fn render_request(
     output: &Path,
     card: RequestCard,

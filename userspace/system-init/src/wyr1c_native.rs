@@ -14,12 +14,12 @@ mod wyr1e;
 use crate::wyr1b::{EndpointKind, RegistryTopology};
 #[cfg(all(test, feature = "wyr1e8-selector33"))]
 use crate::wyr1b_job::JobDispatcher;
-#[cfg(all(test, feature = "wyr1e-production"))]
-use crate::wyr1b_native::registry_native_attempt_for_fixture;
-#[cfg(all(test, feature = "wyr1e8-selector33"))]
-use crate::wyr1b_native::ShellControllerState;
 #[cfg(all(test, any(feature = "wyr1e8-selector33", feature = "wyr1f-closure")))]
 use crate::wyr1b_native::InstalledPeer;
+#[cfg(all(test, feature = "wyr1e8-selector33"))]
+use crate::wyr1b_native::ShellControllerState;
+#[cfg(all(test, feature = "wyr1e-production"))]
+use crate::wyr1b_native::registry_native_attempt_for_fixture;
 #[cfg(feature = "dw1e3-selector31")]
 use crate::wyr1b_native::{InstalledPeer, launch_registry_client_actor};
 use crate::wyr1b_native::{
@@ -3628,7 +3628,9 @@ fn wyr1f_closure_trigger(
         return outcome;
     }
     let (console_ready, shell_ready) = wyr1e::wyr1f_ready_join(resident);
-    resident.wyr1f.observe_ready_join(console_ready, shell_ready);
+    resident
+        .wyr1f
+        .observe_ready_join(console_ready, shell_ready);
     if resident.wyr1f.take_trigger() {
         return wyr1e::PollOutcome::RecoverDevmgr;
     }
@@ -4173,7 +4175,11 @@ where
     assert_eq!(fired, 1, "exactly one episode per boot");
     // One more poll, as the idle product makes it, to close the episode.
     let idle = wyr1f_closure_trigger(&mut resident, wyr1e::PollOutcome::Stable);
-    assert_eq!(idle, wyr1e::PollOutcome::Stable, "an idle poll re-triggered");
+    assert_eq!(
+        idle,
+        wyr1e::PollOutcome::Stable,
+        "an idle poll re-triggered"
+    );
 
     let permanent_failure_records = (0..)
         .map_while(|index| resident.controller.evidence_line(index))

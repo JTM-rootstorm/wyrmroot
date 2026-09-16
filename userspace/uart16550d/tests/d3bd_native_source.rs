@@ -394,7 +394,9 @@ fn a_lost_control_peer_orphans_the_driver_instead_of_shutting_it_down() {
 
     // The peer-close branch inside the control arm orphans, and shuts down
     // only when a `Retire` was already admitted.
-    let arm = loop_body.find("if slot == 0 || control_signals.0 != 0 {").unwrap();
+    let arm = loop_body
+        .find("if slot == 0 || control_signals.0 != 0 {")
+        .unwrap();
     let peer_closed = loop_body[arm..]
         .find("if signals.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 {")
         .unwrap()
@@ -410,7 +412,9 @@ fn a_lost_control_peer_orphans_the_driver_instead_of_shutting_it_down() {
     // peer keeps `PEER_CLOSED` asserted, and any reply `service_control` owes
     // would fail the driver.
     assert!(loop_body.contains("if !orphaned {\n            items[count] = DwWaitItemV1 {\n                handle: control,"));
-    assert!(loop_body.contains("let control_signals = if orphaned {\n            DwSignals(0)\n        } else {"));
+    assert!(loop_body.contains(
+        "let control_signals = if orphaned {\n            DwSignals(0)\n        } else {"
+    ));
 
     // Dropping control shifts the wait set down by one; `slot` undoes that so
     // the Interrupt and stream branches stay positional.
@@ -428,6 +432,8 @@ fn a_lost_control_peer_orphans_the_driver_instead_of_shutting_it_down() {
         DRIVER[admitted..]
             .find("return graceful_shutdown(driver, control, 0);")
             .unwrap()
-            < DRIVER[admitted..].find("service_graceful_retire_drain(").unwrap()
+            < DRIVER[admitted..]
+                .find("service_graceful_retire_drain(")
+                .unwrap()
     );
 }

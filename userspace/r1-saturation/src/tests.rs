@@ -700,7 +700,9 @@ mod probe_status_tests {
         // `native_error_code` puts Output variants above 0x8000, which does not
         // fit the twelve bits left here; they must not be truncated onto a
         // Status magnitude that means something else entirely.
-        let output = native_detail(NativeError::Output(NativeOutputError::InvalidChannelReceive));
+        let output = native_detail(NativeError::Output(
+            NativeOutputError::InvalidChannelReceive,
+        ));
         assert_eq!(output, OUTPUT_FLAG | 3);
         assert_ne!(output, native_detail(NativeError::Status(DwStatus(-3))));
         for (variant, ordinal) in [
@@ -713,7 +715,10 @@ mod probe_status_tests {
             (NativeOutputError::InvalidTaskTerminationInfo, 7),
             (NativeOutputError::DeadlineOverflow, 8),
         ] {
-            assert_eq!(native_detail(NativeError::Output(variant)), OUTPUT_FLAG | ordinal);
+            assert_eq!(
+                native_detail(NativeError::Output(variant)),
+                OUTPUT_FLAG | ordinal
+            );
         }
     }
 
@@ -723,7 +728,10 @@ mod probe_status_tests {
         // later reader after the wrong defect.
         let huge = native_detail(NativeError::Status(DwStatus(-0x7fff_ffff)));
         assert_eq!(huge, 0x7ff);
-        assert!(huge < OUTPUT_FLAG, "saturation must not collide with an Output");
+        assert!(
+            huge < OUTPUT_FLAG,
+            "saturation must not collide with an Output"
+        );
     }
 }
 
@@ -745,13 +753,25 @@ mod run_stopped_tests {
         // And it must not be confusable with any other failure's ordinal.
         for other in [
             ProbeFailure::HogAcceptTimeout { index: 1 },
-            ProbeFailure::HogRejected { index: 1, status: 3 },
+            ProbeFailure::HogRejected {
+                index: 1,
+                status: 3,
+            },
             ProbeFailure::ProgressResultTimeout { after_hog: 1 },
-            ProbeFailure::ProgressRejected { after_hog: 1, status: 3 },
+            ProbeFailure::ProgressRejected {
+                after_hog: 1,
+                status: 3,
+            },
             ProbeFailure::ProgressAcceptTimeout { after_hog: 1 },
-            ProbeFailure::ProgressNotNormalZero { after_hog: 1, code: 3 },
+            ProbeFailure::ProgressNotNormalZero {
+                after_hog: 1,
+                code: 3,
+            },
             ProbeFailure::CleanupIncomplete { index: 1 },
-            ProbeFailure::Uncorrelated { expected: 1, observed: 2 },
+            ProbeFailure::Uncorrelated {
+                expected: 1,
+                observed: 2,
+            },
         ] {
             assert_ne!(failure_fields(other).0, FAIL_RUN_STOPPED);
         }

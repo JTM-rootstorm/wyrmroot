@@ -201,10 +201,14 @@ fn registry_and_devmgr_recovery_retire_dependents_before_replacement() {
     let reap = devmgr.find("reap_driver(").unwrap();
     assert!(retained < retire && retire < reap);
     // Neither half may run unconditionally any more.
-    assert!(devmgr[..retire].ends_with("if !retained_device_topology
-        && "));
-    assert!(devmgr[..reap].contains("if !retained_device_topology
-        && resident"));
+    assert!(devmgr[..retire].ends_with(
+        "if !retained_device_topology
+        && "
+    ));
+    assert!(devmgr[..reap].contains(
+        "if !retained_device_topology
+        && resident"
+    ));
 
     // What was retained is torn down when a replacement generation is READY,
     // not skipped: ordinary devmgr recovery ends where it always did.
@@ -216,7 +220,9 @@ fn registry_and_devmgr_recovery_retire_dependents_before_replacement() {
     let teardown = replacement
         .find("retire_retained_device_topology(resident, system, waits)?;")
         .unwrap();
-    let install = replacement.find("state.devmgr = Some(attempt.active);").unwrap();
+    let install = replacement
+        .find("state.devmgr = Some(attempt.active);")
+        .unwrap();
     assert!(teardown < install);
 }
 

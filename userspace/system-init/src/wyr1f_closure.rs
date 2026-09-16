@@ -55,10 +55,9 @@ impl ClosureEpisode {
     pub(crate) const fn new(gate: Option<crate::gate::GateConfig>) -> Self {
         let phase = match gate {
             Some(config) => match (config.contract, config.scenario) {
-                (
-                    GateContract::Dw1Wyr1InteractiveClosure,
-                    GateScenario::DegradedRecovery,
-                ) => Phase::Waiting,
+                (GateContract::Dw1Wyr1InteractiveClosure, GateScenario::DegradedRecovery) => {
+                    Phase::Waiting
+                }
                 _ => Phase::Inert,
             },
             None => Phase::Inert,
@@ -226,7 +225,6 @@ mod tests {
         }
         panic!("unbalanced body for {signature}");
     }
-
 
     /// F1B.4: "old READY or endpoint tuple used as full-console trigger".
     ///

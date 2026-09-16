@@ -474,11 +474,11 @@ where
         }
         let mut bytes = [0_u8; RECORD_BYTES];
         let mut handles = [DwReceivedHandleInfoV1::default(); 1];
-        let counts = match system.receive_channel(state.probe.launch_channel, &mut bytes, &mut handles)
-        {
-            Ok(counts) => counts,
-            Err(_) => break,
-        };
+        let counts =
+            match system.receive_channel(state.probe.launch_channel, &mut bytes, &mut handles) {
+                Ok(counts) => counts,
+                Err(_) => break,
+            };
         for info in handles.iter().take(counts.handles) {
             let _ = system.close_handle(info.handle);
         }

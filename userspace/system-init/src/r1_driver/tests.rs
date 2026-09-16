@@ -8,13 +8,13 @@
 
 use super::*;
 
+use crate::r1_relay::RelayError;
 use deepwyrm_syscall::{
     DW_HANDLE_TRANSFER_MOVE, DW_STATUS_TIMED_OUT, DwObjectType, DwRights, DwStatus, DwWaitResultV1,
 };
 use wyrmroot_r1_saturation::record::{encode_step, encode_terminal};
-use wyrmroot_runtime::{ExitObservedReadinessError, SupervisionError};
-use crate::r1_relay::RelayError;
 use wyrmroot_r1_saturation::{ProbeOutcome, ProbeStep};
+use wyrmroot_runtime::{ExitObservedReadinessError, SupervisionError};
 
 const NONCE: u64 = 0x3400_0000_0000_0001;
 const PROBE_IDENTITY: [u8; 32] = [7; 32];
@@ -368,7 +368,8 @@ fn a_whole_transcript_reaches_the_collector_in_order_and_ends_once() {
     let terminal = encode_terminal(4, NONCE, plan, ProbeOutcome::Passed, 3);
     system.queue(terminal, 0);
 
-    drain(&mut state, &mut system, &mut Waits::default(), 500).expect("a well-formed transcript was refused");
+    drain(&mut state, &mut system, &mut Waits::default(), 500)
+        .expect("a well-formed transcript was refused");
     assert_eq!(system.submitted_count, 4);
     for sequence in 1..=3 {
         assert_eq!(
@@ -383,7 +384,8 @@ fn a_whole_transcript_reaches_the_collector_in_order_and_ends_once() {
     // The terminal record is the end of the run: a later tick submits nothing
     // more even with the probe still queueing.
     system.queue(step(5, plan), 0);
-    drain(&mut state, &mut system, &mut Waits::default(), 600).expect("a completed run was re-drained as a failure");
+    drain(&mut state, &mut system, &mut Waits::default(), 600)
+        .expect("a completed run was re-drained as a failure");
     assert_eq!(system.submitted_count, 4);
 }
 
@@ -391,7 +393,8 @@ fn a_whole_transcript_reaches_the_collector_in_order_and_ends_once() {
 fn an_idle_probe_leaves_the_tick_immediately() {
     let mut state = state(ProbePlan::SMP);
     let mut system = Probe::new();
-    drain(&mut state, &mut system, &mut Waits::default(), 500).expect("an idle probe was reported as a failure");
+    drain(&mut state, &mut system, &mut Waits::default(), 500)
+        .expect("an idle probe was reported as a failure");
     assert_eq!(system.submitted_count, 0);
     assert_eq!(state.submitted(), 0);
 }
@@ -555,7 +558,12 @@ fn a_gap_counts_what_was_still_queued_behind_it() {
     for sequence in [2, 3, 7] {
         system.queue(step(sequence, plan), 0);
     }
-    let failure = drain(&mut recurring_state, &mut system, &mut Waits::default(), 500);
+    let failure = drain(
+        &mut recurring_state,
+        &mut system,
+        &mut Waits::default(),
+        500,
+    );
     assert_eq!(
         failure,
         Err(InitError::R1RelayGap(RelayGapCensus {
@@ -608,7 +616,8 @@ fn a_kernel_refusal_leaves_the_transcript_retryable() {
     assert_eq!(state.submitted(), 0);
     system.reject_submission = false;
     system.queue(step(1, plan), 0);
-    drain(&mut state, &mut system, &mut Waits::default(), 600).expect("a retried record was refused");
+    drain(&mut state, &mut system, &mut Waits::default(), 600)
+        .expect("a retried record was refused");
     assert_eq!(system.submitted_count, 1);
     assert_eq!(state.submitted(), 1);
 }
@@ -696,10 +705,7 @@ fn a_failed_ready_handshake_keeps_the_probe_code_from_every_variant_that_carries
         ),
         // The validator extracted the code itself; it must be honoured even
         // though this variant's record is reached by a different field.
-        ObservedSupervisionError::Exit(
-            ExitValidationError::NonzeroApplicationCode(CODE),
-            info(0),
-        ),
+        ObservedSupervisionError::Exit(ExitValidationError::NonzeroApplicationCode(CODE), info(0)),
     ];
     for error in &carrying {
         assert_eq!(

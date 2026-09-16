@@ -20,9 +20,9 @@
 use core::panic::PanicInfo;
 
 use deepwyrm_syscall::{
-    DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL, DW_SIGNAL_READABLE,
-    DW_SIGNAL_WRITABLE, DW_STATUS_TIMED_OUT, DW_STATUS_WOULD_BLOCK, DwHandle,
-    DwReceivedHandleInfoV1, DwRights, DwSignals,
+    DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL, DW_SIGNAL_READABLE, DW_SIGNAL_WRITABLE,
+    DW_STATUS_TIMED_OUT, DW_STATUS_WOULD_BLOCK, DwHandle, DwReceivedHandleInfoV1, DwRights,
+    DwSignals,
 };
 use wyrmroot_launch_proto::{
     Message as LaunchMessage, MessageType as LaunchType, Reservation, TerminationClassification,
