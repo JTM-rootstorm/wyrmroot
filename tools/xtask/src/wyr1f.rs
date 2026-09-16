@@ -1390,11 +1390,12 @@ fn handoff_fields(
     ] {
         h.insert(key.into(), field(request, key)?.into());
     }
-    // `profile` in the request is the product's name for itself; here it is the
-    // run profile, which is the value the runner matches on.
-    h.insert("vm_profile".into(), profile.into());
-    h.insert("product_profile".into(), field(request, "profile")?.into());
+    // `profile` in the request is the product's name for itself. Here it is the
+    // run profile, because that is the value the runner matches on, and the
+    // product's own name moves to `product_profile` rather than being dropped:
+    // a handoff has to say which product it launches as well as how.
     h.insert("profile".into(), profile.into());
+    h.insert("product_profile".into(), field(request, "profile")?.into());
     h.insert("vcpus".into(), vcpus.to_string());
     h.insert(
         "timeout_seconds".into(),
