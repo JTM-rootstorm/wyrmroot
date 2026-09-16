@@ -37,6 +37,8 @@ Usage:
     tools/pinned-cargo xtask test host wyr1e8-model
     tools/pinned-cargo xtask test host wyr1e8-clippy
     tools/pinned-cargo xtask test host wyr1e8-native
+    tools/pinned-cargo xtask test host wyr1f-model
+    tools/pinned-cargo xtask test host wyr1f-clippy
     tools/pinned-cargo xtask test host wyr1e8-actors-native
     tools/pinned-cargo xtask test host wyr1e8-product-model
     tools/pinned-cargo xtask test host wyr1e8-product-clippy
@@ -107,6 +109,8 @@ WYR1-E7 model/clippy covers the selected observer, current devmgr, fixtures, and
 wyr1e7-native compiles exactly the selected init, current devmgr, current stream hello, and three fixture actors.
 WYR1-E8 model/clippy covers the current recovery services, two additive actors, typed bootfs, and product builder;
 wyr1e8-native compiles that exact selected E8 native artifact set.
+wyr1f-model and wyr1f-clippy build the DW1-F/WYR1-F instrumented artifact set,
+the only shape that compiles the declared post-console failure episode.
 wyr1e8-actors-native compiles and inspects only the two product-owned E8 actors.
 wyr1e8-product-model and wyr1e8-product-clippy validate product-owned E8 host code.
 wyr1e8-producer-fixture emits the bounded S1 prefix plus actual dispatcher-held driver/registry WAITs, the production registry-recovery orchestrator and publication observer, and real scoped S4 shell ownership.

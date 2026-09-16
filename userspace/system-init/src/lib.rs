@@ -45,6 +45,8 @@ pub mod wyr1d_gate;
 mod wyr1e7_evidence;
 #[cfg(any(test, feature = "wyr1e8-selector33"))]
 mod wyr1e8_evidence;
+#[cfg(feature = "wyr1f-closure")]
+mod wyr1f_closure;
 
 use crate::evidence::{EvidenceError, EvidenceEvent, EvidenceLog};
 use crate::gate::{GATE_CONFIG_PATH, GateConfig, GateConfigError, parse_gate_config};
@@ -784,6 +786,10 @@ pub struct ResidentSystemInit {
     wyr1b: Option<wyr1b_native::ResidentState>,
     wyr1b_evidence: Option<wyr1b_gate::EvidenceLog>,
     wyr1c: Option<wyr1c_native::ResidentState>,
+    /// The declared final-closure episode. Present only in the instrumented
+    /// artifact; `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` §5.4.
+    #[cfg(feature = "wyr1f-closure")]
+    wyr1f: wyr1f_closure::ClosureEpisode,
 }
 
 /// Broad primordial resource-domain custody. It is intentionally not a field
@@ -2229,6 +2235,8 @@ where
             )
         },
     )?;
+    #[cfg(feature = "wyr1f-closure")]
+    let wyr1f = wyr1f_closure::ClosureEpisode::new(activation.controller.gate_config());
     Ok(ResidentSystemInit {
         controller: activation.controller,
         authority,
@@ -2239,6 +2247,8 @@ where
         wyr1b: None,
         wyr1b_evidence: None,
         wyr1c: None,
+        #[cfg(feature = "wyr1f-closure")]
+        wyr1f,
     })
 }
 
@@ -2754,6 +2764,8 @@ where
     W: SupervisionPlatform<Error = NativeError>,
 {
     let controller = validate_retained_bootfs(bootfs)?;
+    #[cfg(feature = "wyr1f-closure")]
+    let wyr1f = wyr1f_closure::ClosureEpisode::new(controller.gate_config());
     let resident = slot.write(ResidentSystemInit {
         controller,
         authority,
@@ -2764,6 +2776,8 @@ where
         wyr1b: None,
         wyr1b_evidence: None,
         wyr1c: None,
+        #[cfg(feature = "wyr1f-closure")]
+        wyr1f,
     });
     resident.result = activate_retained_bootfs_state(
         system,
@@ -3938,6 +3952,119 @@ mod native_cleanup_tests {
         controller
     }
 
+    /// The final closure episode, driven through the real transition owner.
+    ///
+    /// `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` §5.4. The episode itself never
+    /// fails a role, counts an attempt, moves a deadline or sets a mode, so
+    /// this test asserts the property on `SystemInit`: one episode drives the
+    /// reached `NORMAL -> ActivatingEarlyRoles -> ... -> PermanentFailure ->
+    /// DEGRADED` path exactly once, `degraded_transitions` is exactly 1, and
+    /// exactly one `PermanentFailure` evidence record is emitted -- no matter
+    /// how many times the trigger is delivered.
+    #[cfg(feature = "wyr1f-closure")]
+    #[test]
+    fn the_declared_episode_exhausts_the_real_supervisor_exactly_once() {
+        use crate::gate::{GateConfig, GateContract, GateScenario};
+        use crate::wyr1f_closure::ClosureEpisode;
+
+        let gate = GateConfig {
+            contract: GateContract::Dw1Wyr1InteractiveClosure,
+            scenario: GateScenario::DegradedRecovery,
+            nonce: 0x00ff,
+        };
+        let mut controller = ready_registry_controller();
+        controller.evidence = Some(EvidenceLog::new(gate.nonce, gate.scenario).unwrap());
+        let devmgr =
+            install_ready_attempt(&mut controller, RoleId::Devmgr, 1, 0x1002, (11, 21, 31), 3);
+        assert_eq!(controller.mode(), SystemMode::Normal);
+
+        let mut episode = ClosureEpisode::new(Some(gate));
+        // Deliver the trigger before the join, repeatedly. Nothing arms.
+        for _ in 0..4 {
+            episode.observe_ready_join(true, false);
+            assert!(!episode.take_trigger());
+        }
+        assert_eq!(controller.mode(), SystemMode::Normal);
+        assert_eq!(controller.degraded_transitions(), 0);
+
+        episode.observe_ready_join(true, true);
+        assert!(episode.take_trigger());
+        // Everything from here is the supervisor's, exactly as `recover_devmgr`
+        // and `launch_devmgr_replacement` drive it: `fail`, `cleanup_complete`,
+        // then `advance_or_degrade`'s `start_replacement` or its terminal
+        // report. The episode contributes nothing but the refusal.
+        let mut now = 10;
+        let mut generation = devmgr.generation;
+        let mut transaction = devmgr.transaction_id;
+        let mut attempts = 0_u32;
+        while episode.refuses_activation() {
+            attempts += 1;
+            assert!(attempts < 16, "the episode must exhaust deterministically");
+            // The running owner is lost as `recover_devmgr` loses it; each
+            // replacement fails as `launch_devmgr_replacement`'s refusal arm
+            // fails it. The supervisor admits exactly one failure kind per
+            // state, which is itself the check that this is the reached path.
+            let failure = match controller.role_state(RoleId::Devmgr).unwrap() {
+                RestartState::Ready { .. } => AttemptFailure::WaitFailed,
+                _ => AttemptFailure::CreationFailed,
+            };
+            controller
+                .fail(RoleId::Devmgr, generation, transaction, now, failure)
+                .unwrap();
+            controller
+                .cleanup_complete(RoleId::Devmgr, generation, transaction, now + 1)
+                .unwrap();
+            match controller.role_state(RoleId::Devmgr).unwrap() {
+                RestartState::PermanentFailure { .. } => {
+                    // `advance_or_degrade` reports the terminal result here.
+                    episode.observe_terminal();
+                }
+                RestartState::Backoff {
+                    next_generation,
+                    deadline_ns,
+                    ..
+                } => {
+                    now = deadline_ns;
+                    transaction = next_transaction(transaction).unwrap();
+                    generation = next_generation;
+                    controller
+                        .start_replacement(RoleId::Devmgr, now, generation, transaction)
+                        .unwrap();
+                    // The mode does not leave NORMAL during the retries.
+                    // Contract §5.4 names `terminal()` and an intermediate
+                    // ActivatingEarlyRoles hop, but `terminal()` belongs to
+                    // `wyr1b_native::control_tick`, and a product with a
+                    // `wyr1c` resident dispatches to `wyr1c_native::control_tick`
+                    // instead, where `recover_devmgr` uses `fail`. See the
+                    // §5.4 amendment.
+                    assert_eq!(controller.mode(), SystemMode::Normal);
+                }
+                other => panic!("unexpected state {other:?}"),
+            }
+        }
+
+        // The WYR0-I budget is four attempts including the initial launch: the
+        // running owner plus three replacements, and no more.
+        assert_eq!(attempts, 4);
+        assert_eq!(controller.mode(), SystemMode::Degraded);
+        assert_eq!(controller.degraded_transitions(), 1);
+        assert!(episode.is_complete());
+
+        // Exactly one PermanentFailure record, and re-delivering the trigger
+        // after the terminal result adds neither a transition nor a record.
+        let permanent = (0..)
+            .map_while(|index| controller.evidence_line(index))
+            .filter(|line| &line[39..41] == b"04")
+            .count();
+        assert_eq!(permanent, 1);
+        for _ in 0..4 {
+            episode.observe_ready_join(true, true);
+            assert!(!episode.take_trigger());
+            assert!(!episode.refuses_activation());
+        }
+        assert_eq!(controller.degraded_transitions(), 1);
+    }
+
     #[cfg(feature = "wyr1e8-selector33")]
     #[test]
     fn admitted_recovery_keeps_owner_reserved_until_exact_cleanup() {
@@ -4196,6 +4323,8 @@ mod native_cleanup_tests {
             wyr1b: None,
             wyr1b_evidence: None,
             wyr1c: None,
+            #[cfg(feature = "wyr1f-closure")]
+            wyr1f: wyr1f_closure::ClosureEpisode::new(None),
         };
         let mut native = MockNative::new();
         let mut loader = wyrmroot_runtime::NativeLoaderPlatform;

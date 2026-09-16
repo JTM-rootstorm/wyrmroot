@@ -1653,6 +1653,45 @@ fn host_test_commands(filter: Option<&str>) -> Result<Vec<Vec<String>>, Failure>
         })
         .collect());
     }
+    // The DW1-F/WYR1-F instrumented artifact set. `wyr1f-closure` is the only
+    // feature that compiles the declared post-console failure episode, so it
+    // needs a gate of its own: every other row builds the production shape,
+    // which is exactly the shape that must not contain it.
+    if matches!(filter, Some("wyr1f-model" | "wyr1f-clippy")) {
+        let lint = filter.is_some_and(|value| value.ends_with("clippy"));
+        return Ok([
+            ("wyrmroot-system-init", Some("wyr1f-closure"), true),
+            ("wyrmroot-devmgr", Some("wyr1e8-production"), true),
+            (
+                "wyrmroot-consoled",
+                Some("native-consoled,wyr1e-wyrmsh,wyr1e8-recovery"),
+                true,
+            ),
+            ("wyrmroot-uart16550d", None, true),
+            ("wyrmroot-bootfs", Some("builder"), true),
+        ]
+        .into_iter()
+        .map(|(package, feature, library)| {
+            let mut arguments = vec![
+                if lint { "clippy" } else { "test" }.to_owned(),
+                "--locked".to_owned(),
+                "--offline".to_owned(),
+                "--package".to_owned(),
+                package.to_owned(),
+            ];
+            if let Some(feature) = feature {
+                arguments.extend(["--features".to_owned(), feature.to_owned()]);
+            }
+            if library {
+                arguments.push("--lib".to_owned());
+            }
+            if lint {
+                arguments.extend(["--".to_owned(), "-D".to_owned(), "warnings".to_owned()]);
+            }
+            arguments
+        })
+        .collect());
+    }
     if matches!(filter, Some("wyr1e8-model" | "wyr1e8-clippy")) {
         let lint = filter.is_some_and(|value| value.ends_with("clippy"));
         let mut commands: Vec<Vec<String>> = [

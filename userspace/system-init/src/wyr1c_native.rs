@@ -454,6 +454,8 @@ where
         (config, evidence)
     };
     validate_device_identity(device_manifest, uart_identity)?;
+    #[cfg(feature = "wyr1f-closure")]
+    let wyr1f = crate::wyr1f_closure::ClosureEpisode::new(manifest.gate_config());
     let resident = slot.write(ResidentSystemInit {
         controller: manifest,
         authority,
@@ -464,6 +466,8 @@ where
         wyr1b: None,
         wyr1b_evidence: None,
         wyr1c: None,
+        #[cfg(feature = "wyr1f-closure")]
+        wyr1f,
     });
     resident.controller.become_operational()?;
     let mut ready = [0u8; HEADER_BYTES];
@@ -3550,6 +3554,8 @@ where
     #[cfg(feature = "wyr1e-production")]
     {
         let outcome = wyr1e::poll(resident, system, loader, waits, now_ns)?;
+        #[cfg(feature = "wyr1f-closure")]
+        let outcome = wyr1f_closure_trigger(resident, outcome);
         if outcome != wyr1e::PollOutcome::Stable {
             if matches!(
                 outcome,
@@ -3599,6 +3605,32 @@ where
         }
     }
     Ok(resident.controller.mode())
+}
+
+/// Delivers the one declared final-closure trigger, and closes the episode
+/// when the supervisor reaches its own terminal result.
+///
+/// It substitutes exactly the `RecoverDevmgr` outcome that a real
+/// publication-observer failure produces, and only on an otherwise `Stable`
+/// poll, so it never overrides a recovery the supervisor already wants. Every
+/// transition, retry, deadline and mode change after that is `SystemInit`'s.
+#[cfg(feature = "wyr1f-closure")]
+fn wyr1f_closure_trigger(
+    resident: &mut ResidentSystemInit,
+    outcome: wyr1e::PollOutcome,
+) -> wyr1e::PollOutcome {
+    if resident.controller.mode() == SystemMode::Degraded {
+        resident.wyr1f.observe_terminal();
+    }
+    if outcome != wyr1e::PollOutcome::Stable {
+        return outcome;
+    }
+    let (console_ready, shell_ready) = wyr1e::wyr1f_ready_join(resident);
+    resident.wyr1f.observe_ready_join(console_ready, shell_ready);
+    if resident.wyr1f.take_trigger() {
+        return wyr1e::PollOutcome::RecoverDevmgr;
+    }
+    outcome
 }
 
 fn recover_registry<S, L, W>(
@@ -3980,6 +4012,8 @@ fn recovery_fixture_resident(
         last_tick_ns: 0,
         wyr1b: None,
         wyr1b_evidence: None,
+        #[cfg(feature = "wyr1f-closure")]
+        wyr1f: crate::wyr1f_closure::ClosureEpisode::new(None),
         wyr1c: Some(ResidentState {
             e6: Some(e6),
             resource_domain: Some(ResourceDomainCustody::new(DwHandle(0xE8B5_0043))),
@@ -4547,7 +4581,18 @@ where
             resident.result = RecoveryResult::Degraded;
             return Ok(());
         };
-        let attempt = {
+        // The declared episode refuses each replacement activation, before any
+        // topology grant or publication is issued, so nothing is reserved that
+        // the refusal would then have to unwind. The refusal is an ordinary
+        // attempt failure and takes the ordinary arm below: the episode never
+        // counts an attempt, moves a deadline or sets a mode itself.
+        #[cfg(feature = "wyr1f-closure")]
+        let refused = resident.wyr1f.refuses_activation();
+        #[cfg(not(feature = "wyr1f-closure"))]
+        let refused = false;
+        let attempt = if refused {
+            Err(InitError::Supervision)
+        } else {
             let state = resident
                 .wyr1c
                 .as_mut()

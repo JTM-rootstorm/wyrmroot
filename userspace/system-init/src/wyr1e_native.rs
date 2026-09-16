@@ -1277,6 +1277,25 @@ where
     }
 }
 
+/// The two halves of the final closure episode's READY join, each read from
+/// the owner that actually establishes it.
+///
+/// The console half is consoled's own validated READY -- `awaiting_ready`
+/// cleared with a console installed -- not a printed string and not a
+/// selector-local boolean. The shell half is the first `system/wyrmsh`
+/// generation reaching `JobDispatchOutcome::Launched`, recorded by the
+/// dispatcher that owns it. `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` §5.4.
+#[cfg(feature = "wyr1f-closure")]
+pub(super) fn wyr1f_ready_join(resident: &ResidentSystemInit) -> (bool, bool) {
+    let Some(e6) = resident.wyr1c.as_ref().and_then(|state| state.e6.as_ref()) else {
+        return (false, false);
+    };
+    (
+        e6.console.is_some() && !e6.awaiting_ready,
+        e6.shell.wyr1f_shell_ready(),
+    )
+}
+
 /// Whether a console product is installed on the stream the current device
 /// topology established.
 ///

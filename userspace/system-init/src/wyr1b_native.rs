@@ -172,6 +172,13 @@ pub(crate) struct ShellControllerState {
     e8_trigger: Option<E8TriggerIdentity>,
     #[cfg(feature = "wyr1e8-selector33")]
     e8_held: Option<E8HeldWait>,
+    /// Half of the final closure episode's READY join: the first
+    /// `system/wyrmsh` generation having reached
+    /// `JobDispatchOutcome::Launched`. It is set once by the dispatcher that
+    /// owns that join and is never cleared, so a later shell replacement
+    /// cannot re-arm an episode. `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` §5.4.
+    #[cfg(feature = "wyr1f-closure")]
+    wyr1f_shell_ready: bool,
 }
 
 #[allow(
@@ -203,7 +210,26 @@ impl ShellControllerState {
             e8_trigger: None,
             #[cfg(feature = "wyr1e8-selector33")]
             e8_held: None,
+            #[cfg(feature = "wyr1f-closure")]
+            wyr1f_shell_ready: false,
         })
+    }
+
+    /// Records that a `system/wyrmsh` generation reached READY.
+    ///
+    /// Idempotent by construction, and never cleared: the join this feeds is
+    /// "the first generation was READY", not "a generation is READY now", so
+    /// a shell that exits and is replaced after DEGRADED cannot re-arm the
+    /// episode.
+    #[cfg(feature = "wyr1f-closure")]
+    pub(crate) const fn observe_wyr1f_shell_ready(&mut self) {
+        self.wyr1f_shell_ready = true;
+    }
+
+    #[cfg(feature = "wyr1f-closure")]
+    #[must_use]
+    pub(crate) const fn wyr1f_shell_ready(&self) -> bool {
+        self.wyr1f_shell_ready
     }
 
     #[cfg(feature = "wyr1e-selector33")]
@@ -1347,6 +1373,8 @@ fn initialize_resident_in_place<'a>(
     bootfs: &[u8],
 ) -> Result<&'a mut ResidentSystemInit, InitError> {
     let (controller, gate) = validate_retained_bootfs(bootfs)?;
+    #[cfg(feature = "wyr1f-closure")]
+    let wyr1f = crate::wyr1f_closure::ClosureEpisode::new(controller.gate_config());
     Ok(slot.write(ResidentSystemInit {
         controller,
         authority,
@@ -1362,6 +1390,8 @@ fn initialize_resident_in_place<'a>(
         }),
         wyr1b_evidence: None,
         wyr1c: None,
+        #[cfg(feature = "wyr1f-closure")]
+        wyr1f,
     }))
 }
 
@@ -5303,6 +5333,8 @@ where
                 shell_jobs_generation: accepted.shell_grant.endpoint_generation,
             },
         )?;
+        #[cfg(feature = "wyr1f-closure")]
+        shell.state.observe_wyr1f_shell_ready();
         #[cfg(feature = "wyr1e8-selector33")]
         shell.state.stage_e8_shell_ready(
             system,
@@ -8652,6 +8684,8 @@ mod tests {
             wyr1b: None,
             wyr1b_evidence: Some(evidence),
             wyr1c: None,
+            #[cfg(feature = "wyr1f-closure")]
+            wyr1f: crate::wyr1f_closure::ClosureEpisode::new(None),
         }
     }
 
