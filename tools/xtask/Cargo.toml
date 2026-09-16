@@ -15,3 +15,6 @@ wyrmroot-rrc-manifest = { path = "../../crates/wyrmroot-rrc-manifest", features 
 
 [dev-dependencies]
 wyrmroot-i-capability = { path = "../../userspace/i-capability" }
+# Host-only, and only so the gate-config encoder can be round-tripped through
+# the actual `parse_gate_config` rather than a re-spelling of it.
+wyrmroot-system-init = { path = "../../userspace/system-init" }

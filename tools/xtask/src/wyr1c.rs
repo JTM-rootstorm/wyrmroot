@@ -41,7 +41,8 @@ use wyrmroot_device_proto::manifest::{
     encode_com2_manifest,
 };
 use wyrmroot_rrc_manifest::{
-    Activation, DependencyKind, Manifest, RoleId, StartupProfile, Wyr1eProductProfile,
+    Activation, DependencyKind, Manifest, MaterialResidence, RoleId, StartupProfile,
+    Wyr1eProductProfile,
 };
 
 const PRODUCT_KIND: &str = "wyrmroot-wyr1-c1-host-product";
@@ -2352,6 +2353,97 @@ pub(crate) fn reassemble_e6_snapshot(
 pub(crate) const WYR1F_NORMAL_GATE_CONFIG: &[u8] =
     b"schema = 1\nproduct = \"wyr1-f-normal\"\nselector = \"none\"\nevidence = \"not-produced\"\n";
 
+/// The scenario a final closure gate configuration selects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Wyr1fScenario {
+    Normal,
+    DegradedRecovery,
+}
+
+impl Wyr1fScenario {
+    pub(crate) fn parse(value: &str) -> Result<Self, Failure> {
+        match value {
+            "normal" => Ok(Self::Normal),
+            "degraded" | "degraded_recovery" => Ok(Self::DegradedRecovery),
+            other => Err(Failure::task(format!(
+                "unknown WYR1-F scenario `{other}`; expected normal or degraded"
+            ))),
+        }
+    }
+
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the instrumented gate configuration's only consumer is F1B's degraded product"
+        )
+    )]
+    pub(crate) const fn as_config_value(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::DegradedRecovery => "degraded_recovery",
+        }
+    }
+
+    /// The scenario's WYR1EVID1 discriminant, per contract §5.4.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the instrumented gate configuration's only consumer is F1B's degraded product"
+        )
+    )]
+    pub(crate) const fn evidence_code(self) -> u8 {
+        match self {
+            Self::Normal => 1,
+            Self::DegradedRecovery => 2,
+        }
+    }
+}
+
+/// The final closure selector and its frozen test id, from
+/// `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` §4.
+pub(crate) const WYR1F_SELECTOR: &str = "dw1-wyr1-interactive-closure";
+pub(crate) const WYR1F_TEST_ID: &str = "35";
+
+/// Encodes the *instrumented* final gate configuration (change W6).
+///
+/// This is not the normal production product's config. `WYR1F_NORMAL_GATE_CONFIG`
+/// is a different file entirely — no selector, no scenario, no nonce — and the
+/// difference between the two products is the whole file, which is what makes
+/// the RRC-A `config_hash` differ. Only a product carrying an instrumented init
+/// has anything that reads this shape.
+///
+/// The nonce must be sixteen uppercase hex digits and nonzero, matching what
+/// `gate::parse_gate_config` demands; a caller-supplied value is rejected here
+/// rather than producing a file that only fails at boot.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the instrumented gate configuration's only consumer is F1B's degraded product"
+    )
+)]
+pub(crate) fn wyr1f_gate_config(scenario: Wyr1fScenario, nonce: &str) -> Result<Vec<u8>, Failure> {
+    if nonce.len() != 16
+        || !nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'A'..=b'F'))
+    {
+        return Err(Failure::task(
+            "WYR1-F gate nonce must be exactly sixteen uppercase hex digits",
+        ));
+    }
+    if nonce.bytes().all(|byte| byte == b'0') {
+        return Err(Failure::task("WYR1-F gate nonce must be nonzero"));
+    }
+    Ok(format!(
+        "schema = 1\nselector = \"{WYR1F_SELECTOR}\"\ntest_id = {WYR1F_TEST_ID}\nscenario = \"{}\"\nevidence_protocol = \"wyr1evid1\"\nnonce = \"{nonce}\"\n",
+        scenario.as_config_value()
+    )
+    .into_bytes())
+}
+
 /// Every path the final normal bootfs is allowed to contain, and whether the
 /// entry is executable. Independently written here rather than derived from the
 /// builder, so the re-reader compares against a second source.
@@ -2698,6 +2790,19 @@ fn verify_wyr1f_product(
     if manifest.roles().count() != expected_roles.len() {
         return Err(Failure::task("WYR1-F WRRM role count is not five"));
     }
+    // Locality, checked over what the manifest actually declares rather than
+    // over the fixed closure path list. RRC-A may reach only immutable retained
+    // material under `system/`: never a mutable, host, network or root-owned
+    // path, and never a `test/` actor. Checked before the per-role joins so a
+    // manifest that escaped the tree is reported as an escape.
+    for role in manifest.roles() {
+        if !role.path().starts_with("system/") {
+            return Err(Failure::task(format!(
+                "WYR1-F WRRM role path {} is outside the retained system tree",
+                role.path()
+            )));
+        }
+    }
     for (id, path, label, profile, activation) in expected_roles {
         let role = manifest
             .role(id)
@@ -2855,9 +2960,9 @@ fn verify_wyr1f_product(
                 expected.path
             )));
         }
-        if !expected.path.starts_with("system/") {
+        if observed.residence != MaterialResidence::RetainedBootfs {
             return Err(Failure::task(format!(
-                "WYR1-F closure reaches {}, which is outside the retained system tree",
+                "WYR1-F closure entry {} is not retained material",
                 expected.path
             )));
         }
@@ -3651,8 +3756,24 @@ impl NativeBuildOptions<'_> {
     }
 
     pub(crate) const fn exact_with_evidence(evidence_variable: &'static str) -> Self {
+        Self::exact_with_evidence_and_flags(evidence_variable, &[])
+    }
+
+    /// The exact environment, a chosen evidence variable, and explicit
+    /// rustflags.
+    ///
+    /// `exact_with_evidence` alone cannot express the production shell build:
+    /// `system/wyrmsh` is built with `-Cjump-tables=no -Zemit-stack-sizes` in
+    /// every accepted product, which `WYR1_E6_VALIDATION.md` records as the
+    /// *production* shell setting rather than test instrumentation. A product
+    /// that omits them ships a different shell binary and loses the stack-size
+    /// sections the native stack proof reads.
+    pub(crate) const fn exact_with_evidence_and_flags(
+        evidence_variable: &'static str,
+        extra_flags: &'static [&'static str],
+    ) -> Self {
         Self {
-            extra_flags: &[],
+            extra_flags,
             exact_environment: true,
             evidence_variable,
         }
@@ -3878,6 +3999,21 @@ fn validate_wyrmsh_stack_report(
     let shell = artifacts
         .get("wyrmsh")
         .ok_or_else(|| Failure::task(format!("{phase} lacks wyrmsh")))?;
+    if wyrmsh_stack_report(repository, shell)? != expected_stack_report {
+        return Err(Failure::task(format!(
+            "{phase} stack proof was not reproduced byte-for-byte"
+        )));
+    }
+    Ok(())
+}
+
+/// Runs the native stack proof over one shell ELF and returns its report.
+///
+/// Extracted from `validate_wyrmsh_stack_report` so a producer can obtain the
+/// report and an inspector can reproduce and compare it, without two copies of
+/// the scratch/analyzer choreography. `validate_wyrmsh_stack_report`'s
+/// behaviour is unchanged.
+pub(crate) fn wyrmsh_stack_report(repository: &Path, shell: &[u8]) -> Result<Vec<u8>, Failure> {
     let repository_directory =
         crate::secure_fs::Directory::open_exact(repository, "Wyrmroot source")?;
     let tmp = match repository_directory.open_child(".tmp", "WYR1-E6 temporary root") {
@@ -3903,13 +4039,7 @@ fn validate_wyrmsh_stack_report(
         0o400,
         "WYR1-E6 stack input",
     )?;
-    let actual_stack_report = scratch.finish(result)?;
-    if actual_stack_report != expected_stack_report {
-        return Err(Failure::task(format!(
-            "{phase} stack proof was not reproduced byte-for-byte"
-        )));
-    }
-    Ok(())
+    scratch.finish(result)
 }
 
 pub(crate) fn validate_e7_artifact_reports(
@@ -4950,13 +5080,40 @@ fn e8_native_spec(label: &str) -> Result<NativeSpec, Failure> {
         reason = "F1A.2 fixes the final artifact set; its caller is the F1A.3 assembler"
     )
 )]
-fn wyr1f_native_spec(label: &str) -> Result<NativeSpec, Failure> {
+pub(crate) fn wyr1f_native_spec(label: &str) -> Result<NativeSpec, Failure> {
     WYR1F_PRODUCT_NATIVE_SPECS
         .iter()
         .copied()
         .find(|spec| spec.label == label)
         .ok_or_else(|| Failure::task("unknown WYR1-F native artifact label"))
 }
+
+/// The exact build command for one final production role.
+///
+/// Unlike `e6_native_command`/`e8_native_command` this appends no evidence-nonce
+/// environment suffix: the final normal product builds every role with the
+/// evidence variables removed, so a suffix here would describe a build that does
+/// not happen. The shell's rustflags are *not* in that category — they are the
+/// production shell setting and are applied and recorded exactly as the
+/// accepted products do.
+pub(crate) fn wyr1f_native_command(label: &str) -> Result<String, Failure> {
+    let mut command = native_command(wyr1f_native_spec(label)?);
+    if label == "wyrmsh" {
+        command.push_str(&format!(
+            " [rustflags: {}]",
+            WYRMSH_PRODUCTION_FLAGS.join(" ")
+        ));
+    }
+    Ok(command)
+}
+
+/// The frozen feature set for one final production role.
+pub(crate) fn wyr1f_native_features(label: &str) -> Result<&'static str, Failure> {
+    Ok(wyr1f_native_spec(label)?.features)
+}
+
+/// The production shell's rustflags, applied by every accepted product.
+pub(crate) const WYRMSH_PRODUCTION_FLAGS: [&str; 2] = ["-Cjump-tables=no", "-Zemit-stack-sizes"];
 
 fn native_command(spec: NativeSpec) -> String {
     format!(
@@ -5377,6 +5534,45 @@ mod tests {
 
     /// The lookup must not silently accept a test actor's label. E8's own
     /// lookups chain the E6 set as a fallback; the final one must not.
+    /// The shell's production rustflags are applied and recorded.
+    ///
+    /// The first cut of the F producer built every role with no extra flags,
+    /// which would have shipped a `system/wyrmsh` differing from every accepted
+    /// product's and missing the stack-size sections the native stack proof
+    /// reads. `Plans/WYR1_E6_VALIDATION.md` calls this the *production* shell
+    /// setting, so it is not something the final product may drop.
+    #[test]
+    fn wyr1f_builds_and_records_the_shell_with_the_production_rustflags() {
+        let recorded = format!(" [rustflags: {}]", WYRMSH_PRODUCTION_FLAGS.join(" "));
+        assert!(wyr1f_native_command("wyrmsh").unwrap().ends_with(&recorded));
+        for label in ["system-init", "registryd", "devmgr", "uart16550d", "consoled", "hello"] {
+            let command = wyr1f_native_command(label).unwrap();
+            assert!(!command.contains("rustflags"), "{label}: {command}");
+        }
+        // The same flags the accepted products record, not a second spelling.
+        assert!(e6_native_command("wyrmsh").unwrap().ends_with(&recorded));
+        assert!(e8_native_command("wyrmsh").unwrap().ends_with(&recorded));
+        // No role's command carries an evidence-nonce environment suffix; that
+        // is the part the final product genuinely does drop.
+        for label in WYR1F_PRODUCT_NATIVE_SPECS.map(|spec| spec.label) {
+            assert!(!wyr1f_native_command(label).unwrap().contains("[env:"), "{label}");
+        }
+        // And the options constructor actually carries them through.
+        assert_eq!(
+            NativeBuildOptions::exact_with_evidence_and_flags(
+                "WYRMROOT_WYR1E8_EVIDENCE_NONCE",
+                &WYRMSH_PRODUCTION_FLAGS,
+            )
+            .extra_flags,
+            WYRMSH_PRODUCTION_FLAGS,
+        );
+        assert!(
+            NativeBuildOptions::exact_with_evidence("WYRMROOT_WYR1E8_EVIDENCE_NONCE")
+                .extra_flags
+                .is_empty()
+        );
+    }
+
     #[test]
     fn wyr1f_native_spec_rejects_an_unknown_label() {
         assert!(wyr1f_native_spec("recovery-trigger").is_err());
@@ -5546,6 +5742,80 @@ mod tests {
                 .data(),
             WYR1F_NORMAL_GATE_CONFIG
         );
+    }
+
+    /// The encoder's output is fed to the real `parse_gate_config`, not to a
+    /// re-spelling of it, so a producer that drifts from the parser fails here
+    /// rather than at boot.
+    #[test]
+    fn wyr1f_gate_config_round_trips_through_the_actual_init_parser() {
+        use wyrmroot_system_init::gate::{
+            GateConfig, GateContract, GateScenario, parse_gate_config,
+        };
+
+        let normal = wyr1f_gate_config(Wyr1fScenario::Normal, "0123456789ABCDEF").unwrap();
+        assert_eq!(
+            parse_gate_config(&normal),
+            Ok(GateConfig {
+                contract: GateContract::Dw1Wyr1InteractiveClosure,
+                scenario: GateScenario::Normal,
+                nonce: 0x0123_4567_89ab_cdef,
+            })
+        );
+        // The same nonce for both, so the scenario line is the only thing that
+        // can differ in the comparison below.
+        let degraded =
+            wyr1f_gate_config(Wyr1fScenario::DegradedRecovery, "0123456789ABCDEF").unwrap();
+        assert_eq!(
+            parse_gate_config(&degraded),
+            Ok(GateConfig {
+                contract: GateContract::Dw1Wyr1InteractiveClosure,
+                scenario: GateScenario::DegradedRecovery,
+                nonce: 0x0123_4567_89ab_cdef,
+            })
+        );
+
+        // Contract §5.4: the declared difference between the two instrumented
+        // products is the scenario field and nothing else.
+        let normal_text = core::str::from_utf8(&normal).unwrap();
+        let degraded_text = core::str::from_utf8(&degraded).unwrap();
+        let differing = normal_text
+            .lines()
+            .zip(degraded_text.lines())
+            .filter(|(left, right)| left != right)
+            .count();
+        assert_eq!(differing, 1);
+        assert_eq!(Wyr1fScenario::Normal.evidence_code(), 1);
+        assert_eq!(Wyr1fScenario::DegradedRecovery.evidence_code(), 2);
+
+        // And the production config is a different file, not this one with a
+        // line removed.
+        assert!(parse_gate_config(WYR1F_NORMAL_GATE_CONFIG).is_err());
+        assert_ne!(normal.as_slice(), WYR1F_NORMAL_GATE_CONFIG);
+    }
+
+    #[test]
+    fn wyr1f_gate_config_rejects_a_nonce_the_parser_would_reject() {
+        for bad in [
+            "",
+            "FF",
+            "0000000000000000",
+            "0123456789abcdef",
+            "0123456789ABCDE",
+            "G123456789ABCDEF",
+            "0123456789ABCDEF0",
+        ] {
+            assert!(
+                wyr1f_gate_config(Wyr1fScenario::Normal, bad).is_err(),
+                "{bad} was accepted"
+            );
+        }
+        assert!(Wyr1fScenario::parse("normal").is_ok());
+        assert!(Wyr1fScenario::parse("degraded").is_ok());
+        assert!(Wyr1fScenario::parse("degraded_recovery").is_ok());
+        for unknown in ["NORMAL", "degraded-recovery", "reboot", ""] {
+            assert!(Wyr1fScenario::parse(unknown).is_err(), "{unknown}");
+        }
     }
 
     #[test]
@@ -5944,6 +6214,167 @@ mod tests {
         verify_wyr1f_product(product, artifacts)
             .expect_err("the product should not verify")
             .message
+    }
+
+    /// A hand-built WRRM, so the negatives that `fixed_builder_for_wyrmsh`
+    /// structurally cannot produce — a dropped prerequisite, a self-edge, and a
+    /// role reaching outside the retained tree — are actually exercised rather
+    /// than assumed unreachable.
+    #[test]
+    fn wyr1f_rejects_a_hand_built_manifest_with_a_broken_cyclic_or_escaped_graph() {
+        use wyrmroot_rrc_manifest::builder::{Builder as RrcBuilder, DependencySpec, RoleSpec};
+
+        let (product, artifacts) = wyr1f_product();
+        let identity = |index: usize| sha256::bytes_digest_array(&artifacts[index].bytes);
+        let roles: [(RoleId, &str, usize, Activation, StartupProfile); 5] = [
+            (
+                RoleId::Registryd,
+                "system/registryd",
+                1,
+                Activation::Early,
+                StartupProfile::BootstrapRegistry,
+            ),
+            (
+                RoleId::Devmgr,
+                "system/devmgr",
+                2,
+                Activation::Early,
+                StartupProfile::DeviceCoordinator,
+            ),
+            (
+                RoleId::Uart16550d,
+                "system/uart16550d",
+                3,
+                Activation::DeviceBound,
+                StartupProfile::Retained,
+            ),
+            (
+                RoleId::Consoled,
+                "system/consoled",
+                4,
+                Activation::ConsoleBound,
+                StartupProfile::Retained,
+            ),
+            (
+                RoleId::Wyrmsh,
+                "system/wyrmsh",
+                5,
+                Activation::ConsoleBound,
+                StartupProfile::Wyrmsh,
+            ),
+        ];
+        let spine: [(RoleId, RoleId); 4] = [
+            (RoleId::Devmgr, RoleId::Registryd),
+            (RoleId::Uart16550d, RoleId::Devmgr),
+            (RoleId::Consoled, RoleId::Uart16550d),
+            (RoleId::Wyrmsh, RoleId::Consoled),
+        ];
+        let justification = "hand-built WYR1-F negative fixture";
+
+        let encode = |role_paths: [&str; 5], edges: &[(RoleId, RoleId)]| -> Option<Vec<u8>> {
+            let mut builder = RrcBuilder::new(product.generation);
+            for (index, (id, _, artifact, activation, startup_profile)) in
+                roles.into_iter().enumerate()
+            {
+                builder
+                    .add_role(RoleSpec {
+                        id,
+                        required: true,
+                        requires_ready: true,
+                        activation,
+                        startup_profile,
+                        path: role_paths[index],
+                        justification,
+                        executable_identity: identity(artifact),
+                    })
+                    .expect("add a fixture role");
+            }
+            for (owner, target) in edges {
+                builder
+                    .add_dependency(DependencySpec {
+                        owner: *owner,
+                        kind: DependencyKind::RoleReady,
+                        target_role: Some(*target),
+                        target_path: None,
+                    })
+                    .expect("add a fixture edge");
+            }
+            // `None` means the WRRM builder refused to serialize it. It owns
+            // acyclicity, so a cyclic graph never becomes bytes at all.
+            builder.build_structural().ok()
+        };
+        let paths = roles.map(|(_, path, ..)| path);
+
+        // The control: the same graph, hand-encoded, still verifies. It is not
+        // byte-identical to the product's manifest, because the fixture carries
+        // its own justification strings — which the re-reader does not check,
+        // and should not: justification text is documentation, not identity.
+        // So this proves the mutations below are what get rejected, not the
+        // hand encoding.
+        let baseline = encode(paths, &spine).expect("the frozen spine encodes");
+        assert_ne!(baseline, product.rrc_manifest);
+        let control = Wyr1fProductBytes {
+            bootfs: respin_wyr1f_bootfs(
+                &product,
+                &[(
+                    "system/bootstrap/rrc-a-v1",
+                    Some((baseline.clone(), false)),
+                )],
+            ),
+            rrc_manifest: baseline,
+            ..clone_wyr1f(&product)
+        };
+        verify_wyr1f_product(&control, &artifacts).expect("the hand-built control verifies");
+
+        let mut broken = spine.to_vec();
+        broken.remove(2); // consoled no longer waits for the UART.
+        let self_edge = [
+            spine[0],
+            spine[1],
+            (RoleId::Consoled, RoleId::Consoled),
+            spine[3],
+        ];
+        // Edge *directions* reversed, not the list order: the builder discards
+        // insertion order, so reordering the list would encode to the same
+        // bytes and prove nothing. This graph is still acyclic, so it encodes,
+        // and the re-reader has to be the thing that rejects it.
+        let reversed = [
+            (RoleId::Registryd, RoleId::Devmgr),
+            (RoleId::Devmgr, RoleId::Uart16550d),
+            (RoleId::Uart16550d, RoleId::Consoled),
+            (RoleId::Consoled, RoleId::Wyrmsh),
+        ];
+        let escaped = ["system/registryd", "system/devmgr", "system/uart16550d",
+            "system/consoled", "bin/wyrmsh"];
+
+        // Cycles are the builder's to refuse, and it does. Asserting that
+        // explicitly is stronger than letting the case silently skip the
+        // re-reader.
+        assert!(encode(paths, &self_edge).is_none(), "a self-edge encoded");
+
+        for (name, manifest) in [
+            ("dropped prerequisite", encode(paths, &broken)),
+            ("reversed spine", encode(paths, &reversed)),
+            ("escaped role path", encode(escaped, &spine)),
+        ] {
+            let manifest = manifest.unwrap_or_else(|| panic!("{name} should still encode"));
+            let mutated = Wyr1fProductBytes {
+                bootfs: respin_wyr1f_bootfs(
+                    &product,
+                    &[(
+                        "system/bootstrap/rrc-a-v1",
+                        Some((manifest.clone(), false)),
+                    )],
+                ),
+                rrc_manifest: manifest,
+                ..clone_wyr1f(&product)
+            };
+            let message = wyr1f_rejection(&mutated, &artifacts);
+            assert!(
+                message.contains("WRRM") || message.contains("bootfs"),
+                "{name} was rejected for an unrelated reason: {message}"
+            );
+        }
     }
 
     fn clone_wyr1f(product: &Wyr1fProductBytes) -> Wyr1fProductBytes {

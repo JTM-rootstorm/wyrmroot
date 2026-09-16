@@ -491,4 +491,5 @@ dependencies = [
  "wyrmroot-i-capability",
  "wyrmroot-loader",
  "wyrmroot-rrc-manifest",
+ "wyrmroot-system-init",
 ]

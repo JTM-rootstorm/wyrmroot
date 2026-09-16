@@ -61,6 +61,8 @@ Usage:
     tools/pinned-cargo xtask wyr1e7 inspect --product <directory>
     tools/pinned-cargo xtask wyr1e8 prepare --output <fresh-directory> --e6-product <directory> --deep-repository <path> --deep-revision <40-hex> --evidence-nonce <16-hex>
     tools/pinned-cargo xtask wyr1e8 inspect --product <directory>
+    tools/pinned-cargo xtask wyr1f prepare --scenario <normal|degraded> --output <fresh-directory> --deep-repository <path> --deep-revision <40-hex>
+    tools/pinned-cargo xtask wyr1f inspect --product <directory>
     tools/pinned-cargo xtask wyr1c2 freeze --output <fresh-directory>
     tools/pinned-cargo xtask wyr1c2 image --request <wyr1-c2-request.toml>
     tools/pinned-cargo xtask wyr1c2 inspect --request <wyr1-c2-request.toml>
@@ -109,6 +111,15 @@ wyr1e8-actors-native compiles and inspects only the two product-owned E8 actors.
 wyr1e8-product-model and wyr1e8-product-clippy validate product-owned E8 host code.
 wyr1e8-producer-fixture emits the bounded S1 prefix plus actual dispatcher-held driver/registry WAITs, the production registry-recovery orchestrator and publication observer, and real scoped S4 shell ownership.
 These E3-E7 filters do not create a product or run a guest.
+
+The WYR1-F commands own the final DW1-F/WYR1-F normal production product.
+`wyr1f prepare --scenario normal` rebuilds all seven production roles from the
+exact pair, inherits nothing, selects no guest test and produces no evidence:
+its kernel is the uninstrumented production kernel and its gate configuration
+carries no selector, scenario or nonce. `--scenario degraded` is refused until
+slice F1B supplies the instrumented init artifact. `wyr1f inspect --product`
+reconstructs the product from the frozen artifacts and re-renders the request
+canonically; it inspects prepared products only, never consumed ones.
 
 The WYR0-H request path builds and inspects the exact init0/hello bootfs and
 paired ESP, records revision/hash provenance, and uses one q35/OVMF path for
@@ -227,6 +238,13 @@ pub(crate) enum Action {
         evidence_nonce: String,
     },
     Wyr1E8Inspect(String),
+    Wyr1FPrepare {
+        scenario: String,
+        output: String,
+        deep_repository: String,
+        deep_revision: String,
+    },
+    Wyr1FInspect(String),
     Wyr1C2Freeze(String),
     Wyr1C2Image(String),
     Wyr1C2Inspect(String),
@@ -351,6 +369,7 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
         "wyr1e6" => dispatch_wyr1e6(&arguments[1..]),
         "wyr1e7" => dispatch_wyr1e7(&arguments[1..]),
         "wyr1e8" => dispatch_wyr1e8(&arguments[1..]),
+        "wyr1f" => dispatch_wyr1f(&arguments[1..]),
         "wyr1c2" => dispatch_wyr1c2(&arguments[1..]),
         "wyr1c6" => dispatch_wyr1c6(&arguments[1..]),
         "dw1b" => dispatch_dw1b(&arguments[1..]),
@@ -688,6 +707,43 @@ fn dispatch_wyr1e8(arguments: &[String]) -> Result<Action, Failure> {
         }
         _ => Err(Failure::usage(
             "wyr1e8 requires prepare --output <fresh-directory> --e6-product <directory> --deep-repository <path> --deep-revision <40-hex> --evidence-nonce <16-hex> or inspect --product <directory>",
+        )),
+    }
+}
+
+/// The final closure interface named by `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md`
+/// §4. It takes no `--e6-product` (the final product inherits nothing) and no
+/// `--evidence-nonce` (it produces no evidence).
+fn dispatch_wyr1f(arguments: &[String]) -> Result<Action, Failure> {
+    match arguments {
+        [
+            command,
+            scenario_flag,
+            scenario,
+            output_flag,
+            output,
+            deep_flag,
+            deep_repository,
+            revision_flag,
+            deep_revision,
+        ] if command == "prepare"
+            && scenario_flag == "--scenario"
+            && output_flag == "--output"
+            && deep_flag == "--deep-repository"
+            && revision_flag == "--deep-revision" =>
+        {
+            Ok(Action::Wyr1FPrepare {
+                scenario: scenario.clone(),
+                output: output.clone(),
+                deep_repository: deep_repository.clone(),
+                deep_revision: deep_revision.clone(),
+            })
+        }
+        [command, flag, product] if command == "inspect" && flag == "--product" => {
+            Ok(Action::Wyr1FInspect(product.clone()))
+        }
+        _ => Err(Failure::usage(
+            "wyr1f requires prepare --scenario <normal|degraded> --output <fresh-directory> --deep-repository <path> --deep-revision <40-hex> or inspect --product <directory>",
         )),
     }
 }
@@ -1587,6 +1643,99 @@ mod tests {
             Ok(Action::Wyr1E8Inspect("e8".into()))
         );
         assert!(dispatch(&arguments(&["wyr1e8", "run", "--product", "e8"])).is_err());
+    }
+
+    #[test]
+    fn wyr1f_dispatch_names_the_final_interface_without_inheritance_or_evidence() {
+        assert_eq!(
+            dispatch(&arguments(&[
+                "wyr1f",
+                "prepare",
+                "--scenario",
+                "normal",
+                "--output",
+                "f",
+                "--deep-repository",
+                "deep",
+                "--deep-revision",
+                "1",
+            ])),
+            Ok(Action::Wyr1FPrepare {
+                scenario: "normal".into(),
+                output: "f".into(),
+                deep_repository: "deep".into(),
+                deep_revision: "1".into(),
+            })
+        );
+        // The scenario reaches the producer unparsed; `wyr1f` itself refuses it.
+        assert_eq!(
+            dispatch(&arguments(&[
+                "wyr1f",
+                "prepare",
+                "--scenario",
+                "degraded",
+                "--output",
+                "f",
+                "--deep-repository",
+                "deep",
+                "--deep-revision",
+                "1",
+            ])),
+            Ok(Action::Wyr1FPrepare {
+                scenario: "degraded".into(),
+                output: "f".into(),
+                deep_repository: "deep".into(),
+                deep_revision: "1".into(),
+            })
+        );
+        assert_eq!(
+            dispatch(&arguments(&["wyr1f", "inspect", "--product", "f"])),
+            Ok(Action::Wyr1FInspect("f".into()))
+        );
+        // No execution, no inherited product, no nonce, no missing scenario.
+        for invalid in [
+            &["wyr1f", "run", "--product", "f"][..],
+            &["wyr1f", "image", "--product", "f"],
+            &["wyr1f", "evidence", "--product", "f"],
+            &["wyr1f", "inspect", "--product"],
+            &["wyr1f", "prepare", "--output", "f"],
+            &[
+                "wyr1f",
+                "prepare",
+                "--scenario",
+                "normal",
+                "--output",
+                "f",
+                "--e6-product",
+                "e6",
+                "--deep-repository",
+                "deep",
+                "--deep-revision",
+                "1",
+            ],
+            &[
+                "wyr1f",
+                "prepare",
+                "--scenario",
+                "normal",
+                "--output",
+                "f",
+                "--deep-repository",
+                "deep",
+                "--deep-revision",
+                "1",
+                "--evidence-nonce",
+                "A",
+            ],
+        ] {
+            assert!(dispatch(&arguments(invalid)).is_err(), "{invalid:?}");
+        }
+        assert!(USAGE.contains(
+            "tools/pinned-cargo xtask wyr1f prepare --scenario <normal|degraded> --output <fresh-directory> --deep-repository <path> --deep-revision <40-hex>"
+        ));
+        assert!(USAGE.contains("tools/pinned-cargo xtask wyr1f inspect --product <directory>"));
+        assert!(!USAGE.contains("wyr1f prepare --e6-product"));
+        assert!(!USAGE.contains("wyr1f run"));
     }
 
     #[test]
