@@ -71,6 +71,12 @@ const REQUEST_KIND: &str = "wyrmroot-wyr1-f-request";
 const RECEIPT_KIND: &str = "wyrmroot-wyr1-f-freeze-receipt";
 const SOURCE_KIND: &str = "wyrmroot-wyr1-f-source-build";
 const RESULT_KIND: &str = "wyrmroot-wyr1-f-result";
+const HANDOFF_KIND: &str = "wyrmroot-wyr1-f-vm-handoff";
+const PAIR_KIND: &str = "wyrmroot-wyr1-f-vm-profile-pair";
+/// The two profiles the plan's F3A row requires of every final product: one
+/// vCPU and four. The fairness obligation is only meaningful at the second, and
+/// the first is what shows a UP regression the second would mask.
+const PROFILES: [(&str, u8); 2] = [("default", 1), ("smp", 4)];
 const SOURCE_RECEIPT: &str = "f-source-build.toml";
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
 
@@ -970,6 +976,21 @@ fn freeze(
         result_schema(product_kind)?.as_bytes(),
         "result schema",
     )?;
+    // F3A.3. Every launching runner mode consumes a staged per-profile handoff;
+    // before this the final products staged none, which is closure contract
+    // item 15 and why the runner had only a preflight mode.
+    for (profile, vcpus) in PROFILES {
+        stage_profile(product_kind, output, profile, vcpus, &request_hash, &fields)?;
+    }
+    wyr1c6::write_new(
+        &output.join("profile-pair.toml"),
+        render_sorted(
+            &pair_fields(product_kind, output, &request_hash, &fields)?,
+            ScalarSchema::Pair,
+        )?
+        .as_bytes(),
+        "profile pair",
+    )?;
     let receipt = receipt_fields(&request_hash, &fields);
     wyr1c6::write_new(
         &output.join("freeze-receipt.toml"),
@@ -1244,6 +1265,234 @@ fn request_keys(product_kind: wyr1c::Wyr1fProduct) -> Vec<String> {
     keys
 }
 
+/// Stages one profile's launch inputs beside the frozen product.
+///
+/// DW1-F/WYR1-F F3A.3. The shape follows `wyr1e8::stage_profile`, because the
+/// runner already knows how to consume it: a profile directory holding the
+/// mutable OVMF variables a run is allowed to change, the domain XML, and a
+/// `handoff.toml` naming both. What differs is the domain itself -- see
+/// [`profile_domain_xml`].
+fn stage_profile(
+    product_kind: wyr1c::Wyr1fProduct,
+    output: &Path,
+    profile: &str,
+    vcpus: u8,
+    request_hash: &str,
+    request: &BTreeMap<String, String>,
+) -> Result<(), Failure> {
+    let directory = output.join(profile);
+    fs::create_dir(&directory)
+        .map_err(|error| Failure::task(format!("WYR1-F profile directory: {error}")))?;
+    let vars = wyr1c6::read_regular_bounded(
+        &output.join(field(request, "ovmf_vars")?),
+        wyr1c6::MAX_FIRMWARE_BYTES,
+        "OVMF vars",
+    )?;
+    // The one file a run may rewrite. Sealed read-only everywhere else in this
+    // product; here it is the run's own copy, and the frozen template it was
+    // taken from stays untouched under `artifacts/`.
+    wyr1c6::write_new_mode(
+        &directory.join("OVMF_VARS.mutable.fd"),
+        &vars,
+        0o600,
+        "mutable OVMF vars",
+    )?;
+    let absolute = fs::canonicalize(output)
+        .map_err(|error| Failure::task(format!("WYR1-F output resolve: {error}")))?;
+    let xml = profile_domain_xml(
+        product_kind,
+        vcpus,
+        &absolute.join(field(request, "ovmf_code")?),
+        &absolute.join(field(request, "esp")?),
+        &absolute.join(profile).join("OVMF_VARS.mutable.fd"),
+        &absolute.join(profile).join("com2.sock"),
+    );
+    wyr1c6::write_new(&directory.join("domain.xml"), xml.as_bytes(), "domain XML")?;
+    let handoff = handoff_fields(
+        product_kind,
+        profile,
+        vcpus,
+        request_hash,
+        request,
+        &xml,
+        &vars,
+    )?;
+    wyr1c6::write_new(
+        &directory.join("handoff.toml"),
+        render_sorted(&handoff, ScalarSchema::Handoff)?.as_bytes(),
+        "handoff",
+    )
+}
+
+/// The domain XML for one profile of one product.
+///
+/// The production product gets the selectorless variant. Every other launching
+/// card passes its selector to the guest through the fwcfg entries
+/// `opt/org.deepwyrm.test.selector` and `…test_id`; `wyr1-f-normal` selects no
+/// guest test, so a domain that named one would advertise something the product
+/// does not contain. The two instrumented siblings do select one -- the same
+/// one -- and get it.
+fn profile_domain_xml(
+    product_kind: wyr1c::Wyr1fProduct,
+    vcpus: u8,
+    code: &Path,
+    esp: &Path,
+    vars: &Path,
+    com2: &Path,
+) -> String {
+    if product_kind.is_instrumented() {
+        crate::dw1e3a::selected_domain_xml(
+            vcpus,
+            code,
+            esp,
+            vars,
+            com2,
+            (wyr1c::WYR1F_SELECTOR, wyr1c::WYR1F_TEST_ID),
+        )
+    } else {
+        crate::dw1e3a::unselected_domain_xml(vcpus, code, esp, vars, com2)
+    }
+}
+
+/// What one profile's handoff declares to the runner.
+fn handoff_fields(
+    product_kind: wyr1c::Wyr1fProduct,
+    profile: &str,
+    vcpus: u8,
+    request_hash: &str,
+    request: &BTreeMap<String, String>,
+    xml: &str,
+    vars: &[u8],
+) -> Result<BTreeMap<String, String>, Failure> {
+    let mut h = BTreeMap::new();
+    h.insert("kind".into(), HANDOFF_KIND.into());
+    h.insert("schema_version".into(), "1".into());
+    // Product identity travels with the handoff, so a runner cannot be handed
+    // the degraded profile and validate it as the normal one.
+    for key in [
+        "product",
+        "profile",
+        "scenario",
+        "selector",
+        "guest_test",
+        "evidence",
+        "evidence_protocol",
+        "acceptance_claim",
+        "com1_role",
+        "com2_role",
+        "com2_transport",
+        "com2_socket_mode",
+        "com1_capture_bytes",
+        "com2_capture_bytes",
+        "memory_mib",
+        "machine",
+        "firmware",
+    ] {
+        h.insert(key.into(), field(request, key)?.into());
+    }
+    // `profile` in the request is the product's name for itself; here it is the
+    // run profile, which is the value the runner matches on.
+    h.insert("vm_profile".into(), profile.into());
+    h.insert("product_profile".into(), field(request, "profile")?.into());
+    h.insert("profile".into(), profile.into());
+    h.insert("vcpus".into(), vcpus.to_string());
+    h.insert(
+        "timeout_seconds".into(),
+        field(request, "overall_timeout_seconds")?.into(),
+    );
+    h.insert("request".into(), "request.toml".into());
+    h.insert("request_sha256".into(), request_hash.into());
+    h.insert("result_schema".into(), "result-schema.toml".into());
+    h.insert("esp".into(), field(request, "esp")?.into());
+    h.insert("esp_sha256".into(), field(request, "esp_sha256")?.into());
+    h.insert("ovmf_code".into(), field(request, "ovmf_code")?.into());
+    h.insert(
+        "ovmf_code_sha256".into(),
+        field(request, "ovmf_code_sha256")?.into(),
+    );
+    h.insert("com1_fd_group".into(), "com1".into());
+    h.insert("com2_fd_group".into(), "com2".into());
+    h.insert("esp_fd_group".into(), "esp".into());
+    h.insert("vars_fd_group".into(), "vars".into());
+    h.insert("com2_socket".into(), format!("{profile}/com2.sock"));
+    h.insert("domain_xml".into(), format!("{profile}/domain.xml"));
+    h.insert(
+        "domain_xml_sha256".into(),
+        sha256::bytes_digest(xml.as_bytes()),
+    );
+    // Whether this profile's domain names a guest test at all. A reviewer reads
+    // one field rather than grepping the XML, and the production product's
+    // `false` is the assertion that F3A.3 exists to make.
+    h.insert(
+        "domain_declares_selector".into(),
+        if product_kind.is_instrumented() {
+            "true"
+        } else {
+            "false"
+        }
+        .into(),
+    );
+    h.insert(
+        "mutable_ovmf_vars".into(),
+        format!("{profile}/OVMF_VARS.mutable.fd"),
+    );
+    h.insert(
+        "mutable_ovmf_vars_initial_sha256".into(),
+        sha256::bytes_digest(vars),
+    );
+    Ok(h)
+}
+
+/// The pair manifest naming both staged profiles.
+fn pair_fields(
+    product_kind: wyr1c::Wyr1fProduct,
+    output: &Path,
+    request_hash: &str,
+    request: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, Failure> {
+    let mut f = BTreeMap::new();
+    f.insert("kind".into(), PAIR_KIND.into());
+    f.insert("schema_version".into(), "1".into());
+    for key in ["product", "scenario", "selector", "evidence"] {
+        f.insert(key.into(), field(request, key)?.into());
+    }
+    f.insert("request".into(), "request.toml".into());
+    f.insert("request_sha256".into(), request_hash.into());
+    f.insert("result_schema".into(), "result-schema.toml".into());
+    f.insert("profiles".into(), "default,smp".into());
+    f.insert("memory_mib".into(), field(request, "memory_mib")?.into());
+    f.insert(
+        "timeout_seconds".into(),
+        field(request, "overall_timeout_seconds")?.into(),
+    );
+    f.insert(
+        "domain_declares_selector".into(),
+        if product_kind.is_instrumented() {
+            "true"
+        } else {
+            "false"
+        }
+        .into(),
+    );
+    for (profile, vcpus) in PROFILES {
+        f.insert(
+            format!("{profile}_handoff"),
+            format!("{profile}/handoff.toml"),
+        );
+        f.insert(format!("{profile}_vcpus"), vcpus.to_string());
+        let handoff = wyr1c6::read_regular_bounded(
+            &output.join(profile).join("handoff.toml"),
+            64 * 1024,
+            "WYR1-F handoff",
+        )?;
+        f.insert(
+            format!("{profile}_handoff_sha256"),
+            sha256::bytes_digest(&handoff),
+        );
+    }
+    Ok(f)
+}
+
 /// The live-run result grammar, per product.
 ///
 /// DW1-F/WYR1-F F3A.2. This used to take no argument and hardcode the
@@ -1461,6 +1710,9 @@ fn validate_frozen_metadata(
         output,
         &[
             "artifacts",
+            "default",
+            "smp",
+            "profile-pair.toml",
             "request.toml",
             "result-schema.toml",
             "freeze-receipt.toml",
@@ -1490,6 +1742,56 @@ fn validate_frozen_metadata(
     if result_schema_bytes != result_schema(product_kind)?.as_bytes() {
         return Err(Failure::task("WYR1-F result schema drifted"));
     }
+    // F3A.3's staged launch inputs, re-derived rather than trusted. The domain
+    // XML is rebuilt from this product's own frozen paths and compared, so a
+    // hand-edited domain -- one that added a selector to the production
+    // product, say -- is refused here rather than at the point it boots.
+    require_mode(
+        &output.join("profile-pair.toml"),
+        0o444,
+        "WYR1-F profile pair",
+    )?;
+    let absolute = fs::canonicalize(output)
+        .map_err(|error| Failure::task(format!("WYR1-F output resolve: {error}")))?;
+    for (profile, vcpus) in PROFILES {
+        let directory = output.join(profile);
+        require_exact_directory(&directory, &PROFILE_ENTRIES, "WYR1-F profile")?;
+        require_mode(&directory.join("domain.xml"), 0o444, "WYR1-F domain XML")?;
+        require_mode(&directory.join("handoff.toml"), 0o444, "WYR1-F handoff")?;
+        require_mode(
+            &directory.join("OVMF_VARS.mutable.fd"),
+            0o600,
+            "WYR1-F mutable OVMF vars",
+        )?;
+        let expected = profile_domain_xml(
+            product_kind,
+            vcpus,
+            &absolute.join(field(request, "ovmf_code")?),
+            &absolute.join(field(request, "esp")?),
+            &absolute.join(profile).join("OVMF_VARS.mutable.fd"),
+            &absolute.join(profile).join("com2.sock"),
+        );
+        let observed = wyr1c6::read_regular_bounded(
+            &directory.join("domain.xml"),
+            64 * 1024,
+            "WYR1-F domain XML",
+        )?;
+        if observed != expected.as_bytes() {
+            return Err(Failure::task(format!(
+                "WYR1-F {profile} domain XML is not this product's"
+            )));
+        }
+        // The production product must not advertise a guest test it does not
+        // contain, and the two siblings must advertise exactly the one they do.
+        let names_selector = observed
+            .windows(wyr1c::WYR1F_SELECTOR.len())
+            .any(|window| window == wyr1c::WYR1F_SELECTOR.as_bytes());
+        if names_selector != product_kind.is_instrumented() {
+            return Err(Failure::task(format!(
+                "WYR1-F {profile} domain XML selector declaration disagrees with the product"
+            )));
+        }
+    }
     let request_hash = sha256::bytes_digest(&wyr1c6::read_regular_bounded(
         &output.join("request.toml"),
         64 * 1024,
@@ -1510,9 +1812,15 @@ fn validate_frozen_metadata(
 /// Names that only exist once a product has been *run*. Their presence means
 /// this is consumed state, which is verified by the runner's own grammar and
 /// never by prepared-product inspection.
-const RUNTIME_STATE_NAMES: [&str; 10] = [
-    "default",
-    "smp",
+/// What only a *run* leaves behind. Finding any of it means the directory is a
+/// consumed product, and a consumed product is never re-inspected as prepared.
+///
+/// DW1-F/WYR1-F F3A.3 removed `default` and `smp` from this list. They used to
+/// be here because the final products staged no launch inputs at all -- closure
+/// contract item 15 -- so a profile directory could only have come from a run.
+/// They are now prepared content, and what distinguishes prepared from consumed
+/// moved *inside* them: see [`PROFILE_RUNTIME_STATE_NAMES`].
+const RUNTIME_STATE_NAMES: [&str; 8] = [
     "com1.log",
     "com2.bin",
     "com2.sock",
@@ -1523,12 +1831,39 @@ const RUNTIME_STATE_NAMES: [&str; 10] = [
     "OVMF_VARS.mutable.fd",
 ];
 
+/// The same, one level down. A staged profile holds exactly its domain XML, its
+/// handoff and the mutable firmware variables a run is allowed to change; a run
+/// adds the socket, the transcripts and its result beside them.
+const PROFILE_RUNTIME_STATE_NAMES: [&str; 7] = [
+    "com1.log",
+    "com2.bin",
+    "com2.sock",
+    "evidence.bin",
+    "result.toml",
+    "acceptance-receipt.toml",
+    "verification-manifest.json",
+];
+
+/// A staged profile directory's exact prepared entry set.
+const PROFILE_ENTRIES: [&str; 3] = ["domain.xml", "handoff.toml", "OVMF_VARS.mutable.fd"];
+
 fn reject_consumed_runtime_state(output: &Path) -> Result<(), Failure> {
     for name in RUNTIME_STATE_NAMES {
         if fs::symlink_metadata(output.join(name)).is_ok() {
             return Err(Failure::task(
                 "WYR1-F output is consumed/runtime state; inspect a preserved prepared copy instead",
             ));
+        }
+    }
+    for (profile, _) in PROFILES {
+        let directory = output.join(profile);
+        for name in PROFILE_RUNTIME_STATE_NAMES {
+            if fs::symlink_metadata(directory.join(name)).is_ok() {
+                return Err(Failure::task(format!(
+                    "WYR1-F {profile} profile is consumed/runtime state; inspect a \
+                     preserved prepared copy instead"
+                )));
+            }
         }
     }
     Ok(())
@@ -1616,6 +1951,8 @@ enum ScalarSchema {
     SourceReceipt,
     FreezeReceipt,
     ResultTemplate,
+    Handoff,
+    Pair,
 }
 
 impl ScalarSchema {
@@ -1625,6 +1962,8 @@ impl ScalarSchema {
             Self::SourceReceipt => "WYR1-F source receipt",
             Self::FreezeReceipt => "WYR1-F freeze receipt",
             Self::ResultTemplate => "WYR1-F result schema",
+            Self::Handoff => "WYR1-F handoff",
+            Self::Pair => "WYR1-F profile pair",
         }
     }
 
@@ -1635,6 +1974,20 @@ impl ScalarSchema {
             }
             Self::FreezeReceipt => matches!(key, "schema_version" | "closure_test_id"),
             Self::ResultTemplate => false,
+            Self::Handoff => matches!(
+                key,
+                "schema_version"
+                    | "closure_test_id"
+                    | "vcpus"
+                    | "memory_mib"
+                    | "timeout_seconds"
+                    | "com1_capture_bytes"
+                    | "com2_capture_bytes"
+            ),
+            Self::Pair => matches!(
+                key,
+                "schema_version" | "default_vcpus" | "smp_vcpus" | "memory_mib" | "timeout_seconds"
+            ),
         }
     }
 }
@@ -2284,10 +2637,83 @@ mod tests {
             );
             fs::remove_file(&path).unwrap();
         }
-        // Directory-shaped runtime state is caught too.
-        fs::create_dir(root.join("default")).unwrap();
-        assert!(reject_consumed_runtime_state(&root).is_err());
+        // F3A.3: a bare profile directory is now *prepared* content, not
+        // evidence of a run. What makes it consumed is what a run leaves inside
+        // it, so the same refusal has to hold one level down.
+        for (profile, _) in PROFILES {
+            let directory = root.join(profile);
+            fs::create_dir(&directory).unwrap();
+            reject_consumed_runtime_state(&root)
+                .expect("a staged profile directory is not consumed state");
+            for name in PROFILE_RUNTIME_STATE_NAMES {
+                let path = directory.join(name);
+                fs::write(&path, b"x").unwrap();
+                let failure = reject_consumed_runtime_state(&root)
+                    .expect_err("profile runtime state must be refused");
+                assert!(
+                    failure.message.contains("consumed/runtime state"),
+                    "{profile}/{name}: {}",
+                    failure.message
+                );
+                fs::remove_file(&path).unwrap();
+            }
+        }
+        // The staged trio is what a prepared profile holds, and none of it
+        // reads as a run.
+        for (profile, _) in PROFILES {
+            for name in PROFILE_ENTRIES {
+                fs::write(root.join(profile).join(name), b"x").unwrap();
+            }
+        }
+        reject_consumed_runtime_state(&root).expect("staged profile entries are not consumed");
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// DW1-F/WYR1-F F3A.3. Every other launching card hands its selector to the
+    /// guest through fwcfg entries. The production final product selects no
+    /// guest test, so its domain must name none -- and passing empty strings to
+    /// the selected generator would still emit the entry, which is why there is
+    /// a second generator rather than an empty argument.
+    #[test]
+    fn only_an_instrumented_product_gets_a_domain_that_names_a_guest_test() {
+        use std::path::Path;
+        use wyr1c::Wyr1fProduct;
+        let render = |product_kind, vcpus| {
+            profile_domain_xml(
+                product_kind,
+                vcpus,
+                Path::new("/p/OVMF_CODE.fd"),
+                Path::new("/p/esp.img"),
+                Path::new("/p/default/OVMF_VARS.mutable.fd"),
+                Path::new("/p/default/com2.sock"),
+            )
+        };
+        let production = render(Wyr1fProduct::Normal, 1);
+        assert!(
+            !production.contains("org.deepwyrm.test.selector"),
+            "{production}"
+        );
+        assert!(!production.contains("<sysinfo"), "{production}");
+        assert!(!production.contains(wyr1c::WYR1F_SELECTOR), "{production}");
+
+        for product_kind in [Wyr1fProduct::InstrumentedNormal, Wyr1fProduct::Degraded] {
+            let instrumented = render(product_kind, 4);
+            assert!(instrumented.contains("org.deepwyrm.test.selector"));
+            assert!(instrumented.contains(wyr1c::WYR1F_SELECTOR));
+            assert!(instrumented.contains(wyr1c::WYR1F_TEST_ID));
+        }
+
+        // Both profiles differ only in the vCPU count, and the production and
+        // instrumented domains differ only by the selection: everything a run
+        // depends on -- machine, firmware, COM1 pty, COM2 unix socket,
+        // isa-debug-exit -- is shared.
+        assert!(production.contains("<vcpu placement=\"static\">1</vcpu>"));
+        assert!(render(Wyr1fProduct::Normal, 4).contains("<vcpu placement=\"static\">4</vcpu>"));
+        for xml in [&production, &render(Wyr1fProduct::InstrumentedNormal, 1)] {
+            assert!(xml.contains("isa-debug-exit,iobase=0xf4,iosize=0x04"));
+            assert!(xml.contains("<serial type=\"pty\">"));
+            assert!(xml.contains("<source mode=\"connect\" path=\"/p/default/com2.sock\"/>"));
+        }
     }
 
     #[test]
@@ -2297,41 +2723,31 @@ mod tests {
         fs::create_dir(&product).unwrap();
         for name in [
             "artifacts",
+            "default",
+            "smp",
+            "profile-pair.toml",
             "request.toml",
             "result-schema.toml",
             "freeze-receipt.toml",
         ] {
-            if name == "artifacts" {
+            if matches!(name, "artifacts" | "default" | "smp") {
                 fs::create_dir(product.join(name)).unwrap();
             } else {
                 fs::write(product.join(name), b"x").unwrap();
             }
         }
-        require_exact_directory(
-            &product,
-            &[
-                "artifacts",
-                "request.toml",
-                "result-schema.toml",
-                "freeze-receipt.toml",
-            ],
-            "WYR1-F output",
-        )
-        .unwrap();
+        const PREPARED: [&str; 7] = [
+            "artifacts",
+            "default",
+            "smp",
+            "profile-pair.toml",
+            "request.toml",
+            "result-schema.toml",
+            "freeze-receipt.toml",
+        ];
+        require_exact_directory(&product, &PREPARED, "WYR1-F output").unwrap();
         fs::write(product.join("extra.toml"), b"x").unwrap();
-        assert!(
-            require_exact_directory(
-                &product,
-                &[
-                    "artifacts",
-                    "request.toml",
-                    "result-schema.toml",
-                    "freeze-receipt.toml",
-                ],
-                "WYR1-F output",
-            )
-            .is_err()
-        );
+        assert!(require_exact_directory(&product, &PREPARED, "WYR1-F output").is_err());
         fs::remove_file(product.join("extra.toml")).unwrap();
         // Modes: 0644 is not a sealed product file, and a symlink is never one.
         assert!(require_mode(&product.join("request.toml"), 0o444, "request").is_err());

@@ -1243,6 +1243,7 @@ pub(crate) fn domain_xml(vcpus: u8, code: &Path, esp: &Path, vars: &Path, com2: 
     selected_domain_xml(vcpus, code, esp, vars, com2, (SELECTOR, TEST_ID))
 }
 
+/// The domain a selector-driven product runs in.
 pub(crate) fn selected_domain_xml(
     vcpus: u8,
     code: &Path,
@@ -1251,9 +1252,43 @@ pub(crate) fn selected_domain_xml(
     com2: &Path,
     selection: (&str, &str),
 ) -> String {
-    let (selector, test_id) = selection;
+    domain_xml_for(vcpus, code, esp, vars, com2, Some(selection))
+}
+
+/// The same domain with no guest-test selection at all.
+///
+/// DW1-F/WYR1-F F3A.3. The production final product selects no guest test, so
+/// it must not be handed the fwcfg entries that name one. Passing empty strings
+/// to [`selected_domain_xml`] would still emit
+/// `opt/org.deepwyrm.test.selector`, and a domain that advertises a selector
+/// the product does not have is exactly the sort of thing a later reviewer
+/// would have to disprove.
+pub(crate) fn unselected_domain_xml(
+    vcpus: u8,
+    code: &Path,
+    esp: &Path,
+    vars: &Path,
+    com2: &Path,
+) -> String {
+    domain_xml_for(vcpus, code, esp, vars, com2, None)
+}
+
+fn domain_xml_for(
+    vcpus: u8,
+    code: &Path,
+    esp: &Path,
+    vars: &Path,
+    com2: &Path,
+    selection: Option<(&str, &str)>,
+) -> String {
+    let sysinfo = match selection {
+        Some((selector, test_id)) => format!(
+            "  <sysinfo type=\"fwcfg\"><entry name=\"opt/org.deepwyrm.test.selector\">{selector}</entry><entry name=\"opt/org.deepwyrm.test.test_id\">{test_id}</entry></sysinfo>\n"
+        ),
+        None => String::new(),
+    };
     format!(
-        "<domain xmlns:qemu=\"http://libvirt.org/schemas/domain/qemu/1.0\" type=\"qemu\">\n  <name>OS-Project</name>\n  <uuid>{DOMAIN_UUID}</uuid>\n  <memory unit=\"KiB\">2097152</memory><currentMemory unit=\"KiB\">2097152</currentMemory><vcpu placement=\"static\">{vcpus}</vcpu>\n  <sysinfo type=\"fwcfg\"><entry name=\"opt/org.deepwyrm.test.selector\">{selector}</entry><entry name=\"opt/org.deepwyrm.test.test_id\">{test_id}</entry></sysinfo>\n  <os><type arch=\"x86_64\" machine=\"{MACHINE}\">hvm</type><loader readonly=\"yes\" secure=\"no\" type=\"pflash\" format=\"raw\">{}</loader><nvram type=\"file\" format=\"raw\"><source file=\"{}\" fdgroup=\"{VARS_FD_GROUP}\"/></nvram><boot dev=\"hd\"/></os>\n  <features><acpi/><apic/></features><clock offset=\"utc\"><timer name=\"rtc\" tickpolicy=\"catchup\"/><timer name=\"pit\" tickpolicy=\"delay\"/><timer name=\"hpet\" present=\"no\"/></clock><on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>destroy</on_crash><pm><suspend-to-mem enabled=\"no\"/><suspend-to-disk enabled=\"no\"/></pm><devices><emulator>/usr/bin/qemu-system-x86_64</emulator><disk type=\"file\" device=\"disk\"><driver name=\"qemu\" type=\"raw\"/><source file=\"{}\" fdgroup=\"{ESP_FD_GROUP}\"/><target dev=\"vda\" bus=\"virtio\"/><readonly/></disk><controller type=\"pci\" index=\"0\" model=\"pcie-root\"/><serial type=\"pty\"><target type=\"isa-serial\" port=\"0\"/></serial><serial type=\"unix\"><source mode=\"connect\" path=\"{}\"/><target type=\"isa-serial\" port=\"1\"/></serial><console type=\"pty\"><target type=\"serial\" port=\"0\"/></console></devices>\n  <qemu:commandline><qemu:arg value=\"-device\"/><qemu:arg value=\"isa-debug-exit,iobase=0xf4,iosize=0x04\"/></qemu:commandline>\n</domain>\n",
+        "<domain xmlns:qemu=\"http://libvirt.org/schemas/domain/qemu/1.0\" type=\"qemu\">\n  <name>OS-Project</name>\n  <uuid>{DOMAIN_UUID}</uuid>\n  <memory unit=\"KiB\">2097152</memory><currentMemory unit=\"KiB\">2097152</currentMemory><vcpu placement=\"static\">{vcpus}</vcpu>\n{sysinfo}  <os><type arch=\"x86_64\" machine=\"{MACHINE}\">hvm</type><loader readonly=\"yes\" secure=\"no\" type=\"pflash\" format=\"raw\">{}</loader><nvram type=\"file\" format=\"raw\"><source file=\"{}\" fdgroup=\"{VARS_FD_GROUP}\"/></nvram><boot dev=\"hd\"/></os>\n  <features><acpi/><apic/></features><clock offset=\"utc\"><timer name=\"rtc\" tickpolicy=\"catchup\"/><timer name=\"pit\" tickpolicy=\"delay\"/><timer name=\"hpet\" present=\"no\"/></clock><on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>destroy</on_crash><pm><suspend-to-mem enabled=\"no\"/><suspend-to-disk enabled=\"no\"/></pm><devices><emulator>/usr/bin/qemu-system-x86_64</emulator><disk type=\"file\" device=\"disk\"><driver name=\"qemu\" type=\"raw\"/><source file=\"{}\" fdgroup=\"{ESP_FD_GROUP}\"/><target dev=\"vda\" bus=\"virtio\"/><readonly/></disk><controller type=\"pci\" index=\"0\" model=\"pcie-root\"/><serial type=\"pty\"><target type=\"isa-serial\" port=\"0\"/></serial><serial type=\"unix\"><source mode=\"connect\" path=\"{}\"/><target type=\"isa-serial\" port=\"1\"/></serial><console type=\"pty\"><target type=\"serial\" port=\"0\"/></console></devices>\n  <qemu:commandline><qemu:arg value=\"-device\"/><qemu:arg value=\"isa-debug-exit,iobase=0xf4,iosize=0x04\"/></qemu:commandline>\n</domain>\n",
         xml_escape(code),
         xml_escape(vars),
         xml_escape(esp),
