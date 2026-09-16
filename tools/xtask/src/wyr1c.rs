@@ -2394,6 +2394,21 @@ fn wyr1f_nonce_from_config(gate_config: &[u8]) -> Result<String, Failure> {
         })
 }
 
+/// The evidence nonce an instrumented kernel build must carry, read back from
+/// the product's own frozen gate configuration rather than passed alongside it.
+///
+/// The production product has none: its kernel selects no guest test.
+pub(crate) fn wyr1f_kernel_evidence_nonce(
+    product_kind: Wyr1fProduct,
+    gate_config: &[u8],
+) -> Result<Option<String>, Failure> {
+    if product_kind.is_instrumented() {
+        wyr1f_nonce_from_config(gate_config).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
 /// Which of the three final products is being built.
 ///
 /// `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` §5.4 permits exactly one artifact

@@ -475,7 +475,7 @@ fn build_produced(
 
     let product =
         wyr1c::reassemble_wyr1f_snapshot(wyrmroot_revision, &artifact_bytes, product_kind, gate_config)?;
-    let kernel = build_kernel(deep_repository, product_kind)?;
+    let kernel = build_kernel(deep_repository, product_kind, gate_config)?;
     let boot_device_table = wyr1c6::boot_device_table();
     let ovmf_code = wyr1c6::pinned_firmware(
         wyr1c6::OVMF_CODE_PATH,
@@ -563,7 +563,12 @@ fn build_produced(
 /// The production build removes the selector variable and passes no features,
 /// which is the shape of `PRODUCTION_KERNEL_ROW`
 /// (`deepwyrm/tools/xtask/src/lib.rs:535`).
-fn build_kernel(repository: &Path, product_kind: wyr1c::Wyr1fProduct) -> Result<Vec<u8>, Failure> {
+fn build_kernel(
+    repository: &Path,
+    product_kind: wyr1c::Wyr1fProduct,
+    gate_config: &[u8],
+) -> Result<Vec<u8>, Failure> {
+    let nonce = wyr1c::wyr1f_kernel_evidence_nonce(product_kind, gate_config)?;
     let repository = Directory::open_exact(repository, "Deepwyrm source root")?;
     let temporary = match repository.open_child(".tmp", "Deepwyrm temporary root") {
         Ok(directory) => directory,
@@ -585,7 +590,7 @@ fn build_kernel(repository: &Path, product_kind: wyr1c::Wyr1fProduct) -> Result<
         &repository.path().join("tools/pinned-cargo"),
         repository.path(),
         target.path(),
-        product_kind,
+        nonce.as_deref(),
     )
     .stdout(Stdio::from(stdout))
     .stderr(Stdio::from(stderr))
@@ -608,7 +613,11 @@ fn kernel_build_command(
     pinned_cargo: &Path,
     repository: &Path,
     target: &Path,
-    product_kind: wyr1c::Wyr1fProduct,
+    // The instrumentation is exactly "does this product have an evidence
+    // nonce", and `wyr1c::wyr1f_kernel_evidence_nonce` is the one place that
+    // decides it from the product kind. Taking the answer rather than the
+    // product keeps a second, divergent decision from existing here.
+    evidence_nonce: Option<&str>,
 ) -> Command {
     let mut command = Command::new(pinned_cargo);
     command
@@ -646,10 +655,17 @@ fn kernel_build_command(
         .env_remove("LD_PRELOAD")
         .current_dir(repository)
         .stdin(Stdio::null());
-    if product_kind.is_instrumented() {
+    if let Some(nonce) = evidence_nonce {
+        // The closure selector reuses `interactive-wyrmsh`'s WRE1 transport, so
+        // the kernel build requires that transport's evidence nonce. It is the
+        // *pair's* nonce, not a per-sibling one: contract §5.4 declares the
+        // kernel identical across the matched siblings, and this variable
+        // reaches the kernel ELF, so two different nonces would make the
+        // kernels differ and fail inspection.
         command
             .env("DEEPWYRM_GUEST_TEST_SELECTOR", wyr1c::WYR1F_SELECTOR)
-            .env("DEEPWYRM_GUEST_TEST_ID", wyr1c::WYR1F_TEST_ID);
+            .env("DEEPWYRM_GUEST_TEST_ID", wyr1c::WYR1F_TEST_ID)
+            .env("DEEPWYRM_WYR1E7_EVIDENCE_NONCE", nonce);
     }
     command
 }
@@ -2039,12 +2055,20 @@ mod tests {
 
     #[test]
     fn the_kernel_command_declares_exactly_its_product_s_instrumentation() {
+        const NONCE: &str = "0123456789ABCDEF";
         let arguments_and_env = |product_kind| {
             let command = kernel_build_command(
                 Path::new("/deep/tools/pinned-cargo"),
                 Path::new("/deep"),
                 Path::new("/deep/.tmp/target"),
-                product_kind,
+                wyr1c::wyr1f_kernel_evidence_nonce(
+                    product_kind,
+                    &product_kind
+                        .gate_config(product_kind.gate_scenario().map(|_| NONCE))
+                        .unwrap(),
+                )
+                .unwrap()
+                .as_deref(),
             );
             let arguments = command
                 .get_args()
@@ -2116,7 +2140,13 @@ mod tests {
                 set.get("DEEPWYRM_GUEST_TEST_ID").map(String::as_str),
                 Some(wyr1c::WYR1F_TEST_ID)
             );
-            assert_eq!(set.len(), 3, "no fourth variable is set");
+            // The selector pair, its WRE1 evidence nonce, and the target
+            // directory. Nothing else.
+            assert_eq!(
+                set.get("DEEPWYRM_WYR1E7_EVIDENCE_NONCE").map(String::as_str),
+                Some(NONCE)
+            );
+            assert_eq!(set.len(), 4, "no fifth variable is set");
             instrumented.push(set);
         }
         assert_eq!(instrumented[0], instrumented[1]);
