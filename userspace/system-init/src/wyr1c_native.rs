@@ -1905,10 +1905,26 @@ where
             return Err(error);
         }
     };
-    #[cfg(feature = "wyr1c5-production")]
-    let driver_parent = devmgr.task_group;
-    #[cfg(not(feature = "wyr1c5-production"))]
-    let driver_parent = resident.authority.task_group;
+    // `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` §5.3 item 2: the driver's attempt
+    // TaskGroup is no longer a child of the devmgr generation that asked for
+    // it, so tearing that generation down does not take the driver with it.
+    // Deliberate driver retirement stays explicit -- `reap_driver` terminates
+    // this group by handle -- which is the only path that ever needed to be
+    // deliberate.
+    //
+    // It moves *up one level*, to the resource domain itself, not out to
+    // init's bootstrap group. The domain is the fail-closed boundary:
+    // `WYR1_C_DEVICE_HANDOFF_CONTRACT.md` §4 makes its teardown terminal
+    // recovery for the boot, and a driver holding a DeviceResource and an
+    // Interrupt outside it would survive that teardown. Init's own group sits
+    // outside the domain, which is exactly why init cannot claim; a driver
+    // parented there would inherit that escape. Builds with no resource domain
+    // keep init's group, as they always did.
+    let driver_parent = resident
+        .wyr1c
+        .as_ref()
+        .and_then(|state| state.resource_domain)
+        .map_or(resident.authority.task_group, ResourceDomainCustody::handle);
     let task_group = match system.create_attempt_task_group(driver_parent) {
         Ok(handle) => handle,
         Err(error) => {
@@ -4264,8 +4280,25 @@ where
     if let Some(child_cleanup_failed) = fail_closed_e3a_recovery(resident, system, waits) {
         return finish_e3a_fatal_recovery(resident, system, waits, child_cleanup_failed);
     }
+    // `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` §5.3.1 item 4. A coordinator change
+    // does not by itself invalidate the device topology beneath it, so the
+    // console stack is retained *through* the recovery episode and torn down
+    // only once a replacement generation is actually READY and about to build
+    // a driver of its own -- see `retire_retained_device_topology`. An episode
+    // that exhausts instead therefore reaches DEGRADED with the console and
+    // the live shell generation still serving, which is what [B] §5.4 promises
+    // and what §5.4's dependency-preservation rule requires.
+    //
+    // With no console product installed there is no consumer, the retention is
+    // false, and everything below runs exactly as it always has.
     #[cfg(feature = "wyr1e-production")]
-    if wyr1e::retire_dependents(resident, system, waits, false).is_err() {
+    let retained_device_topology = wyr1e::console_depends_on_driver(resident);
+    #[cfg(not(feature = "wyr1e-production"))]
+    let retained_device_topology = false;
+    #[cfg(feature = "wyr1e-production")]
+    if !retained_device_topology
+        && wyr1e::retire_dependents(resident, system, waits, false).is_err()
+    {
         resident.result = RecoveryResult::Degraded;
         return Err(InitError::Cleanup);
     }
@@ -4297,10 +4330,11 @@ where
         // P2 retirement and U2 reap evidence.
         drain_selector29_d1_terminal_facts(resident, system, devmgr)?;
     }
-    if resident
-        .wyr1c
-        .as_ref()
-        .is_some_and(|state| state.driver.is_some())
+    if !retained_device_topology
+        && resident
+            .wyr1c
+            .as_ref()
+            .is_some_and(|state| state.driver.is_some())
         && reap_driver(resident, system, waits, true).is_err()
     {
         resident.result = RecoveryResult::Degraded;
@@ -4448,6 +4482,37 @@ where
     launch_devmgr_replacement(resident, system, loader, waits, bootfs)
 }
 
+/// Tears down a device topology that `recover_devmgr` retained through the
+/// episode, once a replacement coordinator generation is actually READY.
+///
+/// This is the second half of §5.3.1 item 4. Deferring the teardown to here,
+/// rather than skipping it, keeps ordinary devmgr recovery's end state exactly
+/// what it was -- fresh driver, fresh console, fresh foreground shell -- while
+/// an episode that never produces a replacement generation leaves the console
+/// stack untouched. It runs before the new generation is installed, so the
+/// replacement's first driver-launch request cannot race a live old driver.
+#[cfg(feature = "wyr1e-production")]
+fn retire_retained_device_topology<S, W>(
+    resident: &mut ResidentSystemInit,
+    system: &mut S,
+    waits: &mut W,
+) -> Result<(), InitError>
+where
+    S: Wyr1BPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    if !wyr1e::console_depends_on_driver(resident) {
+        return Ok(());
+    }
+    let retired = wyr1e::retire_dependents(resident, system, waits, false)
+        .and_then(|()| reap_driver(resident, system, waits, true).map(|_| ()));
+    if retired.is_err() {
+        resident.result = RecoveryResult::Degraded;
+        return Err(InitError::Cleanup);
+    }
+    Ok(())
+}
+
 fn launch_devmgr_replacement<S, L, W>(
     resident: &mut ResidentSystemInit,
     system: &mut S,
@@ -4503,6 +4568,8 @@ where
         };
         match attempt {
             Ok(attempt) => {
+                #[cfg(feature = "wyr1e-production")]
+                retire_retained_device_topology(resident, system, waits)?;
                 let state = resident
                     .wyr1c
                     .as_mut()

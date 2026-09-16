@@ -1277,6 +1277,19 @@ where
     }
 }
 
+/// Whether a console product is installed on the stream the current device
+/// topology established.
+///
+/// `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` §5.3.1 item 4 makes this the condition
+/// under which a devmgr generation change leaves the device topology beneath
+/// it alone. It is a dependency fact, not a product or selector gate: a build
+/// with no console product has no consumer, and reaps exactly as before.
+pub(super) fn console_depends_on_driver(resident: &ResidentSystemInit) -> bool {
+    resident.wyr1c.as_ref().is_some_and(|state| {
+        state.driver.is_some() && state.e6.as_ref().is_some_and(|e6| e6.console.is_some())
+    })
+}
+
 pub(super) fn reserve_registry_replacement(
     resident: &mut ResidentSystemInit,
     generation: u64,

@@ -113,6 +113,41 @@ bootstrap TaskGroup
             └── driver
 ```
 
+### 4.1 Amendment (DW1-F/WYR1-F F1B, 2026-09-16): the driver attempt is a domain sibling, not a generation descendant
+
+`DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` §5.3 item 2 moves the driver-attempt
+TaskGroup up one level, so that reaping a devmgr generation does not
+implicitly reap a driver that is still serving a console:
+
+```text
+bootstrap TaskGroup
+├── /system/init
+└── resource-domain TaskGroup         long-lived for this boot
+    ├── devmgr-generation TaskGroup   fresh per devmgr generation
+    │   └── /system/devmgr
+    └── driver-attempt TaskGroup      fresh per driver attempt
+        └── driver
+```
+
+It moves **up one level, not out**. The resource domain is the fail-closed
+boundary this section already establishes: its teardown is terminal recovery
+for the boot, and it recursively terminates what it contains. A driver holding
+a DeviceResource and an Interrupt parented under init's bootstrap group would
+survive that teardown — init's own group is outside the domain, which is
+precisely why init's `device_resource_claim` returns `ACCESS_DENIED`. Keeping
+the driver inside the domain preserves both properties at once.
+
+Builds with no resource domain keep init's bootstrap group as the parent, as
+they always did.
+
+Replacement cleanup's step 7 below is narrowed accordingly: a devmgr restart
+terminates and reaps the devmgr-generation TaskGroup, which no longer contains
+the driver. Step 3's explicit driver retirement — requesting retirement or
+terminating the exact driver-attempt TaskGroup by handle — is unchanged and is
+now the only thing that stops a driver. Whether step 3 runs during a
+coordinator change, or is deferred until a replacement generation is READY, is
+governed by `WYR1_C_DEVICE_COORDINATOR_CONTRACT.md` §7.1 item 3.
+
 Init receives four ordered bootstrap capabilities in the D5-selected product:
 
 1. existing root AddressRegion with its existing rights;

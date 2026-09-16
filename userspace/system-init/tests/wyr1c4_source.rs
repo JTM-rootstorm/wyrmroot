@@ -97,19 +97,29 @@ fn c4_manifest_move_stages_transfer_without_delegating_it() {
     assert!(process.contains("transfers[2] = transfer(manifest, launch::DEVICE_MANIFEST_RIGHTS);"));
 }
 
+/// Reversed by `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` §5.3 item 2. The driver's
+/// attempt TaskGroup used to be a child of the devmgr generation that
+/// requested it, so tearing that generation down took the driver with it --
+/// which contradicts [B] §5.4's promise that the recovery console stays usable
+/// exactly when automatic reconstruction has failed. It is now parented under
+/// init's own authority, and only `reap_driver`'s explicit termination by
+/// handle stops it. It moves up one level, to the resource domain itself, not
+/// out to init's bootstrap group: `WYR1_C_DEVICE_HANDOFF_CONTRACT.md` §4 makes
+/// domain teardown terminal recovery for the boot, and a driver holding a
+/// DeviceResource outside the domain would survive it.
 #[test]
-fn c5_driver_attempt_is_parented_under_the_current_devmgr_generation() {
+fn c5_driver_attempt_is_parented_under_init_not_the_devmgr_generation() {
     assert!(MANIFEST.contains("wyr1c5-production = [\"native-init\"]"));
     let construct = &NATIVE_SOURCE[NATIVE_SOURCE.find("fn construct_driver").unwrap()..];
     let parent = construct
-        .find("let driver_parent = devmgr.task_group")
+        .find(".and_then(|state| state.resource_domain)")
         .unwrap();
     let create = construct
         .find("create_attempt_task_group(driver_parent)")
         .unwrap();
     let load = construct.find("load_device_driver_process(").unwrap();
     assert!(parent < create && create < load);
-    assert!(construct.contains("#[cfg(feature = \"wyr1c5-production\")]"));
+    assert!(!construct[..create].contains("driver_parent = devmgr.task_group"));
 }
 
 #[test]

@@ -339,6 +339,16 @@ fn run_event_loop<I: ByteRegisterIo>(
     #[cfg(feature = "dw1e3-selector31")]
     let mut selector_retirement_binding = None;
     let mut graceful_retire = None;
+    // `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` §5.3 item 1: losing the control
+    // peer orphans the driver, it does not stop it. The established stream,
+    // the DeviceResource and the Interrupt are all retained, and the exact
+    // `Retire` handshake stays the only deliberate way to stop serving.
+    //
+    // A `Retire` still queued when the peer closes was never admitted, so it
+    // does not win over orphaning -- and could not complete anyway, since
+    // `complete_graceful_retire` has no peer left to answer. Only a peer close
+    // *after* an admitted `Retire` keeps the old best-effort shutdown.
+    let mut orphaned = false;
     loop {
         if let Some(drain) = graceful_retire.as_mut() {
             // Once an exact Retire is admitted, no later control request may
@@ -378,27 +388,34 @@ fn run_event_loop<I: ByteRegisterIo>(
             }
         }
         let mut items = [DwWaitItemV1::default(); 3];
-        items[0] = DwWaitItemV1 {
-            handle: control,
-            signals: DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
-        };
-        #[cfg(not(feature = "dw1e3-selector31"))]
-        let mut count = 2;
+        // An orphaned driver never waits on, probes, serves or answers its
+        // control endpoint again: the peer is gone, so `PEER_CLOSED` would
+        // spin the wait and any reply `service_control` owes would fail the
+        // driver. Dropping it shifts every later slot down by one, which
+        // `slot` below undoes so the branch conditions stay positional.
+        let mut count = 0;
+        if !orphaned {
+            items[count] = DwWaitItemV1 {
+                handle: control,
+                signals: DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
+            };
+            count += 1;
+        }
         #[cfg(not(feature = "dw1e3-selector31"))]
         {
-            items[1] = DwWaitItemV1 {
+            items[count] = DwWaitItemV1 {
                 handle: driver.interrupt().handle,
                 signals: DW_SIGNAL_SIGNALED,
             };
+            count += 1;
         }
         #[cfg(feature = "dw1e3-selector31")]
-        let mut count = if selector_retiring { 1 } else { 2 };
-        #[cfg(feature = "dw1e3-selector31")]
         if !selector_retiring {
-            items[1] = DwWaitItemV1 {
+            items[count] = DwWaitItemV1 {
                 handle: driver.interrupt().handle,
                 signals: DW_SIGNAL_SIGNALED,
             };
+            count += 1;
         }
         if let Some(stream) = driver.stream_endpoint() {
             let receive_capacity = driver.wants_stream_readable();
@@ -413,11 +430,11 @@ fn run_event_loop<I: ByteRegisterIo>(
                 {
                     signals |= DW_SIGNAL_WRITABLE.0;
                 }
-                items[2] = DwWaitItemV1 {
+                items[count] = DwWaitItemV1 {
                     handle: stream.handle,
                     signals: DwSignals(signals),
                 };
-                count = 3;
+                count += 1;
             }
         }
         let deadline = if let Some(drain) = graceful_retire {
@@ -445,6 +462,12 @@ fn run_event_loop<I: ByteRegisterIo>(
         } else {
             deadline
         };
+        if count == 0 {
+            // Orphaned with neither an interrupt nor a stream left: there is
+            // no established service to keep, so the retained-driver rule has
+            // nothing to protect.
+            return graceful_shutdown(driver, control, 0);
+        }
         let observed = match wait_many(&items[..count], deadline) {
             Ok(observed) => observed,
             Err(error) if graceful_retire.is_some() && status_is(error, DW_STATUS_TIMED_OUT) => {
@@ -461,20 +484,31 @@ fn run_event_loop<I: ByteRegisterIo>(
             Err(_) => return fail_driver(driver, control, 35),
         };
 
+        // Slot 0 is control, 1 the Interrupt, 2 the stream, whether or not
+        // control is actually in the wait set this round.
+        let slot = observed.index + usize::from(orphaned);
         // Control retirement/revocation wins even when the wait selected an
         // Interrupt or stream item whose readiness coexists with control.
-        let control_signals = match probe_control(control) {
-            Ok(signals) => signals,
-            Err(_) => return fail_driver(driver, control, 36),
+        let control_signals = if orphaned {
+            DwSignals(0)
+        } else {
+            match probe_control(control) {
+                Ok(signals) => signals,
+                Err(_) => return fail_driver(driver, control, 36),
+            }
         };
-        if observed.index == 0 || control_signals.0 != 0 {
-            let signals = if observed.index == 0 {
+        if slot == 0 || control_signals.0 != 0 {
+            let signals = if slot == 0 {
                 observed.observed
             } else {
                 control_signals
             };
             if signals.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 {
-                return graceful_shutdown(driver, control, 0);
+                if graceful_retire.is_some() {
+                    return graceful_shutdown(driver, control, 0);
+                }
+                orphaned = true;
+                continue;
             }
             if graceful_retire.is_some() {
                 return fail_driver(driver, control, 114);
@@ -596,7 +630,7 @@ fn run_event_loop<I: ByteRegisterIo>(
             return fail_driver(driver, control, 37);
         }
 
-        if observed.index == 1 {
+        if slot == 1 {
             if observed.observed.0 & DW_SIGNAL_SIGNALED.0 == 0 {
                 return fail_driver(driver, control, 38);
             }
@@ -656,14 +690,14 @@ fn run_event_loop<I: ByteRegisterIo>(
             continue;
         }
 
-        if graceful_retire.is_some() && observed.index == 2 {
+        if graceful_retire.is_some() && slot == 2 {
             // The retirement helper drains every immediately available raw
             // record and owns the fresh empty observation. Keep the normal
             // stream path from detaching or emitting RX data mid-retirement.
             continue;
         }
 
-        if observed.index == 2 {
+        if slot == 2 {
             let peer_closed = observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0;
             let readable = observed.observed.0 & DW_SIGNAL_READABLE.0 != 0;
             if peer_closed {

@@ -13,10 +13,10 @@ const RETAINED_MANIFEST: &str = include_str!("../../wyr1-retained-stubs/Cargo.to
 
 #[test]
 fn native_loop_checks_control_and_pio_before_interrupt_ack() {
-    let probe = DRIVER
-        .find("let control_signals = match probe_control(control)")
-        .unwrap();
-    let interrupt = DRIVER.find("if observed.index == 1").unwrap();
+    // The probe is skipped once the driver is orphaned, so anchor on the call
+    // rather than on the binding that used to wrap it.
+    let probe = DRIVER.find("probe_control(control)").unwrap();
+    let interrupt = DRIVER.find("if slot == 1").unwrap();
     assert!(probe < interrupt);
 
     let peer_closed = DRIVER
@@ -63,10 +63,10 @@ fn selector31_stage1_blocks_stale_finalize_and_post_ier_interrupt_drains() {
     assert!(begin < retired && retired < finalize && finalize < exact);
 
     let wait_gate = DRIVER
-        .find("let mut count = if selector_retiring { 1 } else { 2 };")
+        .find("let mut items = [DwWaitItemV1::default(); 3];")
         .unwrap();
-    let interrupt_gate = DRIVER[wait_gate..].find("if !selector_retiring").unwrap() + wait_gate;
-    let interrupt_drain = DRIVER.find("if observed.index == 1").unwrap();
+    let interrupt_gate = DRIVER[wait_gate..].find("if !selector_retiring {").unwrap() + wait_gate;
+    let interrupt_drain = DRIVER.find("if slot == 1").unwrap();
     assert!(wait_gate < interrupt_gate && interrupt_gate < interrupt_drain);
 
     let ier_readback = DRIVER[begin..]
@@ -378,4 +378,56 @@ fn d3_product_gate_cannot_select_the_historical_selector29_actor() {
         "#[cfg(all(feature = \"wyr1c5-production\", not(feature = \"wyr1d-production\")))]\nfn launch_driver_with_historical_bundle"
     ));
     assert!(!RETAINED_MANIFEST.contains("wyr1d-production"));
+}
+
+/// `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` §5.3 item 1. Losing the control peer
+/// orphans the driver; it does not stop it. The DeviceResource, the Interrupt
+/// and the established stream are all retained, and the exact `Retire`
+/// handshake stays the only deliberate way to stop serving.
+///
+/// This is a source-contract test because the branch lives in the binary's
+/// syscall loop, not in the testable policy library. It pins the structure the
+/// behaviour depends on; the behaviour itself is a live obligation.
+#[test]
+fn a_lost_control_peer_orphans_the_driver_instead_of_shutting_it_down() {
+    let loop_body = &DRIVER[DRIVER.find("let mut orphaned = false;").unwrap()..];
+
+    // The peer-close branch inside the control arm orphans, and shuts down
+    // only when a `Retire` was already admitted.
+    let arm = loop_body.find("if slot == 0 || control_signals.0 != 0 {").unwrap();
+    let peer_closed = loop_body[arm..]
+        .find("if signals.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 {")
+        .unwrap()
+        + arm;
+    let post_retire = loop_body[peer_closed..]
+        .find("if graceful_retire.is_some() {\n                    return graceful_shutdown(driver, control, 0);")
+        .unwrap()
+        + peer_closed;
+    let orphan = loop_body[peer_closed..].find("orphaned = true;").unwrap() + peer_closed;
+    assert!(peer_closed < post_retire && post_retire < orphan);
+
+    // An orphaned driver neither waits on nor probes control again: a closed
+    // peer keeps `PEER_CLOSED` asserted, and any reply `service_control` owes
+    // would fail the driver.
+    assert!(loop_body.contains("if !orphaned {\n            items[count] = DwWaitItemV1 {\n                handle: control,"));
+    assert!(loop_body.contains("let control_signals = if orphaned {\n            DwSignals(0)\n        } else {"));
+
+    // Dropping control shifts the wait set down by one; `slot` undoes that so
+    // the Interrupt and stream branches stay positional.
+    assert!(loop_body.contains("let slot = observed.index + usize::from(orphaned);"));
+
+    // An orphan with neither an Interrupt nor a stream has no service to keep.
+    assert!(loop_body.contains("if count == 0 {"));
+
+    // The pre-existing post-`Retire` peer-close shutdown at the top of the
+    // loop is untouched.
+    let admitted = DRIVER
+        .find("if let Some(drain) = graceful_retire.as_mut() {")
+        .unwrap();
+    assert!(
+        DRIVER[admitted..]
+            .find("return graceful_shutdown(driver, control, 0);")
+            .unwrap()
+            < DRIVER[admitted..].find("service_graceful_retire_drain(").unwrap()
+    );
 }

@@ -188,6 +188,46 @@ attempt through `CleaningUp`. A clean retriable failure enters `Backoff`; an
 exhausted budget or unprovable cleanup enters `PermanentFailure` and is reported
 to supervisor recovery policy.
 
+### 7.1 Amendment (DW1-F/WYR1-F F1B, 2026-09-16): driver lifetime is not the coordinator's lifetime
+
+Recorded by `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` §5.3 and its §5.3.1
+amendment. §7 above is unchanged for driver attempts. What changes is what a
+*coordinator* generation change does to a driver that is already serving.
+
+1. **A closed direct control peer orphans the driver; it does not stop it.**
+   `uart16550d` retains its DeviceResource, its Interrupt and the established
+   stream, and keeps serving. It stops waiting on, probing, serving and
+   answering the control endpoint, because the peer is gone. The exact `RETIRE`
+   handshake of §8 remains the only deliberate way to stop a driver. A peer
+   close *after* an admitted `RETIRE` keeps the previous best-effort shutdown;
+   a `RETIRE` still queued when the peer closes was never admitted, does not
+   win over orphaning, and could not be answered anyway.
+
+2. **The driver-attempt TaskGroup is no longer a child of the requesting devmgr
+   generation.** It is created directly beneath the resource domain — see
+   `WYR1_C_DEVICE_HANDOFF_CONTRACT.md` §4.1. Reaping a devmgr generation
+   therefore no longer implicitly reaps its driver; `reap_driver`'s explicit
+   termination by handle does, and always did.
+
+3. **A coordinator change retires the device topology beneath it only when
+   nothing still consumes the stream that topology established.** When a
+   console product is installed on the driver's stream, init retains the
+   driver, the console and the foreground shell *through* the recovery episode,
+   and tears them down only once a replacement generation is actually READY and
+   about to construct a driver of its own. Ordinary recovery therefore ends
+   exactly where §7 always put it — fresh driver, fresh console, fresh shell.
+   An episode that exhausts instead reaches `PermanentFailure` with the console
+   stack still serving, which is what `BOOTSTRAP_AND_RECOVERY_ARCHITECTURE.md`
+   §5.4 requires of a recovery console. A build with no console product has no
+   consumer and behaves exactly as before.
+
+**Deferred, with a stated cost.** Re-adoption of a surviving driver by a later
+coordinator generation does not exist. Item 3 confines the consequence: the
+only generation that meets a live driver is one that is about to replace it, so
+init reaps first and hands the new coordinator a clean device. Nothing here
+gives a coordinator a way to adopt a driver it did not construct. That remains
+open, and is carried as item 16 of the final closure contract's §11.
+
 ## 8. Direct driver-control protocol
 
 `wyrmroot-device-proto` owns allocation-free `WRDC` version 1 framing for:

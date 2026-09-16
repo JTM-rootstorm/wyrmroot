@@ -187,12 +187,37 @@ fn registry_and_devmgr_recovery_retire_dependents_before_replacement() {
     let relaunch_helper = item(NATIVE, "fn start_wyr1e_or_recover_registry<S");
     assert!(relaunch_helper.contains("wyr1e::start_after_driver_constructed"));
 
+    // The devmgr path keeps that ordering, but both halves are now conditional
+    // on the retention introduced by `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md`
+    // §5.3.1 item 4: a coordinator change leaves the device topology beneath it
+    // alone while anything still consumes the stream it established.
     let devmgr = &NATIVE[NATIVE.find("fn recover_devmgr<S").unwrap()
-        ..NATIVE.find("fn launch_devmgr_replacement").unwrap()];
+        ..NATIVE.find("fn retire_retained_device_topology").unwrap()];
+    let retained = devmgr
+        .find("let retained_device_topology = wyr1e::console_depends_on_driver(resident);")
+        .unwrap();
+    let retire = devmgr.find("wyr1e::retire_dependents").unwrap();
     // `reap_driver` is a prefix of `reap_driver_before`; anchor on the call.
-    assert!(
-        devmgr.find("wyr1e::retire_dependents").unwrap() < devmgr.find("reap_driver(").unwrap()
-    );
+    let reap = devmgr.find("reap_driver(").unwrap();
+    assert!(retained < retire && retire < reap);
+    // Neither half may run unconditionally any more.
+    assert!(devmgr[..retire].ends_with("if !retained_device_topology
+        && "));
+    assert!(devmgr[..reap].contains("if !retained_device_topology
+        && resident"));
+
+    // What was retained is torn down when a replacement generation is READY,
+    // not skipped: ordinary devmgr recovery ends where it always did.
+    let deferred = item(NATIVE, "fn retire_retained_device_topology<S, W>");
+    assert!(deferred.contains("if !wyr1e::console_depends_on_driver(resident)"));
+    assert!(deferred.contains("wyr1e::retire_dependents(resident, system, waits, false)"));
+    assert!(deferred.contains("reap_driver(resident, system, waits, true)"));
+    let replacement = item(NATIVE, "fn launch_devmgr_replacement<S, L, W>");
+    let teardown = replacement
+        .find("retire_retained_device_topology(resident, system, waits)?;")
+        .unwrap();
+    let install = replacement.find("state.devmgr = Some(attempt.active);").unwrap();
+    assert!(teardown < install);
 }
 
 #[test]
