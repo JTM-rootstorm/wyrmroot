@@ -1416,6 +1416,29 @@ fn handoff_fields(
     h.insert("esp_fd_group".into(), "esp".into());
     h.insert("vars_fd_group".into(), "vars".into());
     h.insert("com2_socket".into(), format!("{profile}/com2.sock"));
+    // Where the run writes. Declared by the handoff rather than chosen by the
+    // runner, so the verifier binds the same paths the producer reserved and a
+    // run cannot quietly write its transcript somewhere unexamined. Every one
+    // of these is in `PROFILE_RUNTIME_STATE_NAMES`, which is what makes their
+    // presence the mark of a consumed profile.
+    h.insert("com1_serial_log".into(), format!("{profile}/com1.log"));
+    h.insert("com2_log".into(), format!("{profile}/com2.bin"));
+    h.insert("result_path".into(), format!("{profile}/result.toml"));
+    h.insert(
+        "acceptance_receipt".into(),
+        format!("{profile}/acceptance-receipt.toml"),
+    );
+    // Only a product that produces evidence reserves a place to put it. The
+    // production product declares `none`, which is the same statement its
+    // request and its result grammar make.
+    h.insert(
+        "evidence_log".into(),
+        if product_kind.is_instrumented() {
+            format!("{profile}/evidence.bin")
+        } else {
+            "none".into()
+        },
+    );
     h.insert("domain_xml".into(), format!("{profile}/domain.xml"));
     h.insert(
         "domain_xml_sha256".into(),
