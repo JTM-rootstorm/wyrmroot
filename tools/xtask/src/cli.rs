@@ -63,7 +63,7 @@ Usage:
     tools/pinned-cargo xtask wyr1e7 inspect --product <directory>
     tools/pinned-cargo xtask wyr1e8 prepare --output <fresh-directory> --e6-product <directory> --deep-repository <path> --deep-revision <40-hex> --evidence-nonce <16-hex>
     tools/pinned-cargo xtask wyr1e8 inspect --product <directory>
-    tools/pinned-cargo xtask wyr1f prepare --scenario <normal|degraded> --output <fresh-directory> --deep-repository <path> --deep-revision <40-hex>
+    tools/pinned-cargo xtask wyr1f prepare --scenario <normal|normal-instrumented|degraded> --output <fresh-directory> --deep-repository <path> --deep-revision <40-hex> [--evidence-nonce <16-uppercase-hex>]
     tools/pinned-cargo xtask wyr1f inspect --product <directory>
     tools/pinned-cargo xtask wyr1c2 freeze --output <fresh-directory>
     tools/pinned-cargo xtask wyr1c2 image --request <wyr1-c2-request.toml>
@@ -247,6 +247,7 @@ pub(crate) enum Action {
         output: String,
         deep_repository: String,
         deep_revision: String,
+        evidence_nonce: Option<String>,
     },
     Wyr1FInspect(String),
     Wyr1C2Freeze(String),
@@ -716,8 +717,14 @@ fn dispatch_wyr1e8(arguments: &[String]) -> Result<Action, Failure> {
 }
 
 /// The final closure interface named by `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md`
-/// §4. It takes no `--e6-product` (the final product inherits nothing) and no
-/// `--evidence-nonce` (it produces no evidence).
+/// §4. It takes no `--e6-product`: the final product inherits nothing.
+///
+/// §4 froze the scenario values as `normal|degraded`. F1B adds a third,
+/// `normal-instrumented`, and `--evidence-nonce`, because contract §5.4's
+/// difference set permits exactly one artifact difference between the matched
+/// siblings and therefore forces both to carry the same instrumented
+/// `system/init` -- see `DW1F_WYR1F_F1B1_FAULT_RECIPE_MAP.md` §7. The
+/// production product still takes no nonce and is refused if given one.
 fn dispatch_wyr1f(arguments: &[String]) -> Result<Action, Failure> {
     match arguments {
         [
@@ -730,24 +737,36 @@ fn dispatch_wyr1f(arguments: &[String]) -> Result<Action, Failure> {
             deep_repository,
             revision_flag,
             deep_revision,
+            nonce_tail @ ..,
         ] if command == "prepare"
             && scenario_flag == "--scenario"
             && output_flag == "--output"
             && deep_flag == "--deep-repository"
-            && revision_flag == "--deep-revision" =>
+            && revision_flag == "--deep-revision"
+            && matches!(nonce_tail, [] | [_, _]) =>
         {
+            let evidence_nonce = match nonce_tail {
+                [] => None,
+                [flag, nonce] if flag == "--evidence-nonce" => Some(nonce.clone()),
+                _ => {
+                    return Err(Failure::usage(
+                        "wyr1f prepare accepts only --evidence-nonce after --deep-revision",
+                    ));
+                }
+            };
             Ok(Action::Wyr1FPrepare {
                 scenario: scenario.clone(),
                 output: output.clone(),
                 deep_repository: deep_repository.clone(),
                 deep_revision: deep_revision.clone(),
+                evidence_nonce,
             })
         }
         [command, flag, product] if command == "inspect" && flag == "--product" => {
             Ok(Action::Wyr1FInspect(product.clone()))
         }
         _ => Err(Failure::usage(
-            "wyr1f requires prepare --scenario <normal|degraded> --output <fresh-directory> --deep-repository <path> --deep-revision <40-hex> or inspect --product <directory>",
+            "wyr1f requires prepare --scenario <normal|normal-instrumented|degraded> --output <fresh-directory> --deep-repository <path> --deep-revision <40-hex> [--evidence-nonce <16-uppercase-hex>] or inspect --product <directory>",
         )),
     }
 }
@@ -1669,6 +1688,7 @@ mod tests {
                 output: "f".into(),
                 deep_repository: "deep".into(),
                 deep_revision: "1".into(),
+                evidence_nonce: None,
             })
         );
         // The scenario reaches the producer unparsed; `wyr1f` itself refuses it.
@@ -1690,13 +1710,40 @@ mod tests {
                 output: "f".into(),
                 deep_repository: "deep".into(),
                 deep_revision: "1".into(),
+                evidence_nonce: None,
             })
         );
         assert_eq!(
             dispatch(&arguments(&["wyr1f", "inspect", "--product", "f"])),
             Ok(Action::Wyr1FInspect("f".into()))
         );
-        // No execution, no inherited product, no nonce, no missing scenario.
+        // `--evidence-nonce` is now accepted; the producer, not the parser,
+        // decides which products require one and which refuse one. The parser
+        // still admits no execution, no inherited product and no missing
+        // scenario.
+        assert_eq!(
+            dispatch(&arguments(&[
+                "wyr1f",
+                "prepare",
+                "--scenario",
+                "degraded",
+                "--output",
+                "f",
+                "--deep-repository",
+                "deep",
+                "--deep-revision",
+                "1",
+                "--evidence-nonce",
+                "0123456789ABCDEF",
+            ])),
+            Ok(Action::Wyr1FPrepare {
+                scenario: "degraded".into(),
+                output: "f".into(),
+                deep_repository: "deep".into(),
+                deep_revision: "1".into(),
+                evidence_nonce: Some("0123456789ABCDEF".into()),
+            })
+        );
         for invalid in [
             &["wyr1f", "run", "--product", "f"][..],
             &["wyr1f", "image", "--product", "f"],
@@ -1728,14 +1775,14 @@ mod tests {
                 "deep",
                 "--deep-revision",
                 "1",
-                "--evidence-nonce",
+                "--unknown-flag",
                 "A",
             ],
         ] {
             assert!(dispatch(&arguments(invalid)).is_err(), "{invalid:?}");
         }
         assert!(USAGE.contains(
-            "tools/pinned-cargo xtask wyr1f prepare --scenario <normal|degraded> --output <fresh-directory> --deep-repository <path> --deep-revision <40-hex>"
+            "tools/pinned-cargo xtask wyr1f prepare --scenario <normal|normal-instrumented|degraded> --output <fresh-directory> --deep-repository <path> --deep-revision <40-hex> [--evidence-nonce <16-uppercase-hex>]"
         ));
         assert!(USAGE.contains("tools/pinned-cargo xtask wyr1f inspect --product <directory>"));
         assert!(!USAGE.contains("wyr1f prepare --e6-product"));

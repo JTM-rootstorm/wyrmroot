@@ -2361,23 +2361,6 @@ pub(crate) enum Wyr1fScenario {
 }
 
 impl Wyr1fScenario {
-    pub(crate) fn parse(value: &str) -> Result<Self, Failure> {
-        match value {
-            "normal" => Ok(Self::Normal),
-            "degraded" | "degraded_recovery" => Ok(Self::DegradedRecovery),
-            other => Err(Failure::task(format!(
-                "unknown WYR1-F scenario `{other}`; expected normal or degraded"
-            ))),
-        }
-    }
-
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "the instrumented gate configuration's only consumer is F1B's degraded product"
-        )
-    )]
     pub(crate) const fn as_config_value(self) -> &'static str {
         match self {
             Self::Normal => "normal",
@@ -2385,18 +2368,115 @@ impl Wyr1fScenario {
         }
     }
 
-    /// The scenario's WYR1EVID1 discriminant, per contract §5.4.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "the instrumented gate configuration's only consumer is F1B's degraded product"
-        )
-    )]
-    pub(crate) const fn evidence_code(self) -> u8 {
+    /// The scenario's WYR1EVID1 discriminant, spelled as the request's
+    /// `evidence_scenario_code` field spells it so the two cannot drift.
+    pub(crate) const fn evidence_code_text(self) -> &'static str {
         match self {
-            Self::Normal => 1,
-            Self::DegradedRecovery => 2,
+            Self::Normal => "1",
+            Self::DegradedRecovery => "2",
+        }
+    }
+}
+
+/// Recovers the evidence nonce from an already-encoded instrumented gate
+/// configuration, so the re-reader can rebuild the file rather than trust it.
+fn wyr1f_nonce_from_config(gate_config: &[u8]) -> Result<String, Failure> {
+    core::str::from_utf8(gate_config)
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find_map(|line| line.strip_prefix("nonce = \""))
+                .and_then(|line| line.strip_suffix('"'))
+        })
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            Failure::task("WYR1-F instrumented gate configuration carries no readable nonce")
+        })
+}
+
+/// Which of the three final products is being built.
+///
+/// `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` §5.4 permits exactly one artifact
+/// difference between the matched siblings -- the gate configuration file --
+/// so both siblings must carry the same `system/init`, and therefore both must
+/// be the instrumented build. The production product is a third thing, related
+/// to them by §3.1's named construction rather than by §5.4's difference set.
+/// `DW1F_WYR1F_F1B1_FAULT_RECIPE_MAP.md` §7 records why this follows from the
+/// difference set rather than being chosen.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Wyr1fProduct {
+    /// The production artifact. No selector, no scenario, no nonce, and a gate
+    /// configuration `parse_gate_config` deliberately rejects.
+    Normal,
+    /// The instrumented normal sibling of the acceptance pair.
+    InstrumentedNormal,
+    /// The instrumented degraded sibling of the acceptance pair.
+    Degraded,
+}
+
+impl Wyr1fProduct {
+    pub(crate) fn parse(value: &str) -> Result<Self, Failure> {
+        match value {
+            "normal" => Ok(Self::Normal),
+            "normal-instrumented" | "instrumented-normal" => Ok(Self::InstrumentedNormal),
+            "degraded" | "degraded_recovery" => Ok(Self::Degraded),
+            other => Err(Failure::task(format!(
+                "unknown WYR1-F scenario `{other}`; expected normal, \
+                 normal-instrumented or degraded"
+            ))),
+        }
+    }
+
+    pub(crate) const fn cli_value(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::InstrumentedNormal => "normal-instrumented",
+            Self::Degraded => "degraded",
+        }
+    }
+
+    /// Whether the product carries the declared episode's machinery at all.
+    pub(crate) const fn is_instrumented(self) -> bool {
+        !matches!(self, Self::Normal)
+    }
+
+    /// The gate scenario an instrumented product declares.
+    pub(crate) const fn gate_scenario(self) -> Option<Wyr1fScenario> {
+        match self {
+            Self::Normal => None,
+            Self::InstrumentedNormal => Some(Wyr1fScenario::Normal),
+            Self::Degraded => Some(Wyr1fScenario::DegradedRecovery),
+        }
+    }
+
+    /// The seven production role builds. Only `system/init` differs, and only
+    /// by the one feature that compiles the episode -- which is what makes the
+    /// instrumented/production relationship a named construction rather than
+    /// "the same source revision".
+    pub(crate) fn native_specs(self) -> [NativeSpec; 7] {
+        let mut specs = WYR1F_PRODUCT_NATIVE_SPECS;
+        if self.is_instrumented() {
+            specs[0].features = "wyr1e-production,wyr1f-closure";
+        }
+        specs
+    }
+
+    /// The retained gate configuration. The production product's is
+    /// deliberately unparseable; an instrumented product's carries the frozen
+    /// selector/test-id pair, its scenario and a nonzero nonce.
+    pub(crate) fn gate_config(self, nonce: Option<&str>) -> Result<Vec<u8>, Failure> {
+        match (self.gate_scenario(), nonce) {
+            (None, None) => Ok(WYR1F_NORMAL_GATE_CONFIG.to_vec()),
+            (None, Some(_)) => Err(Failure::task(
+                "the WYR1-F production product takes no evidence nonce: its gate \
+                 configuration declares no scenario and no evidence",
+            )),
+            (Some(scenario), Some(nonce)) => wyr1f_gate_config(scenario, nonce),
+            (Some(_), None) => Err(Failure::task(format!(
+                "the WYR1-F {} product requires --evidence-nonce: its declared \
+                 episode identity is bound to it",
+                self.cli_value()
+            ))),
         }
     }
 }
@@ -2522,13 +2602,16 @@ fn wyr1f_product_generation(revision: &str, artifacts: &[NativeArtifact]) -> [u8
 fn assemble_wyr1f_product(
     revision: &str,
     artifacts: &[NativeArtifact],
+    product_kind: Wyr1fProduct,
+    gate_config: &[u8],
 ) -> Result<Wyr1fProductBytes, Failure> {
-    if artifacts.len() != WYR1F_PRODUCT_NATIVE_SPECS.len() {
+    let specs = product_kind.native_specs();
+    if artifacts.len() != specs.len() {
         return Err(Failure::task(
             "WYR1-F requires exactly seven production artifacts",
         ));
     }
-    for (artifact, expected) in artifacts.iter().zip(WYR1F_PRODUCT_NATIVE_SPECS) {
+    for (artifact, expected) in artifacts.iter().zip(specs) {
         if artifact.spec != expected {
             return Err(Failure::task(format!(
                 "WYR1-F artifact {} is not the frozen final production build",
@@ -2608,7 +2691,7 @@ fn assemble_wyr1f_product(
                 consoled: &consoled.bytes,
                 wyrmsh: &wyrmsh.bytes,
                 rrc_manifest: &structural_rrc,
-                gate_config: WYR1F_NORMAL_GATE_CONFIG,
+                gate_config,
             },
             marker: WYR1_C1_MARKER,
             device_manifest: &device_manifest,
@@ -2627,7 +2710,7 @@ fn assemble_wyr1f_product(
     let expected_closure = crate::wyr1::expected_closure_for_request(
         digest_array(&init.sha256)?,
         role_hashes,
-        sha256::bytes_digest_array(WYR1F_NORMAL_GATE_CONFIG),
+        sha256::bytes_digest_array(gate_config),
     );
     let observed = crate::wyr1::observe_closure_from_archive(&bootfs)?;
     let profile = Wyr1eProductProfile {
@@ -2660,7 +2743,7 @@ fn assemble_wyr1f_product(
         launch_policy,
         bootfs,
     };
-    verify_wyr1f_product(&product, artifacts)?;
+    verify_wyr1f_product(&product, artifacts, product_kind, gate_config)?;
     Ok(product)
 }
 
@@ -2681,7 +2764,23 @@ fn assemble_wyr1f_product(
 fn verify_wyr1f_product(
     product: &Wyr1fProductBytes,
     artifacts: &[NativeArtifact],
+    product_kind: Wyr1fProduct,
+    gate_config: &[u8],
 ) -> Result<(), Failure> {
+    // The gate configuration is the one permitted artifact difference, so it
+    // is re-derived here from the declared product kind rather than taken on
+    // trust from the caller: a builder that wrote the wrong sibling's
+    // configuration cannot also satisfy this.
+    let declared_gate = product_kind.gate_config(match product_kind.gate_scenario() {
+        None => None,
+        Some(_) => Some(wyr1f_nonce_from_config(gate_config)?),
+    }.as_deref())?;
+    if declared_gate != gate_config {
+        return Err(Failure::task(format!(
+            "WYR1-F gate configuration is not the {} product's",
+            product_kind.cli_value()
+        )));
+    }
     let archive = Archive::new(&product.bootfs)
         .map_err(|error| Failure::task(format!("WYR1-F bootfs is unreadable: {error:?}")))?;
     // The allowlist is scanned first, so an unadmitted entry is named rather
@@ -2720,7 +2819,7 @@ fn verify_wyr1f_product(
             "system/wyrmsh" => artifact_bytes("wyrmsh")?.to_vec(),
             "bin/hello" => artifact_bytes("hello")?.to_vec(),
             "system/bootstrap/rrc-a-v1" => product.rrc_manifest.clone(),
-            "system/bootstrap/wyr1-a-gate-v1" => WYR1F_NORMAL_GATE_CONFIG.to_vec(),
+            "system/bootstrap/wyr1-a-gate-v1" => gate_config.to_vec(),
             "system/bootstrap/wyr1-c-gate-v1" => WYR1_C1_MARKER.to_vec(),
             "system/bootstrap/wyr1-c-device-manifest-v1" => product.device_manifest.clone(),
             _ if path == LAUNCH_POLICY_PATH => product.launch_policy.clone(),
@@ -2950,7 +3049,7 @@ fn verify_wyr1f_product(
             sha256::bytes_digest_array(artifact_bytes("consoled")?),
             sha256::bytes_digest_array(artifact_bytes("wyrmsh")?),
         ],
-        sha256::bytes_digest_array(WYR1F_NORMAL_GATE_CONFIG),
+        sha256::bytes_digest_array(gate_config),
     );
     let observed = crate::wyr1::observe_closure_from_archive(&product.bootfs)?;
     for (expected, observed) in expected_closure.iter().zip(observed.iter()) {
@@ -2981,9 +3080,12 @@ fn verify_wyr1f_product(
 pub(crate) fn reassemble_wyr1f_snapshot(
     revision: &str,
     artifact_bytes: &BTreeMap<String, Vec<u8>>,
+    product_kind: Wyr1fProduct,
+    gate_config: &[u8],
 ) -> Result<Wyr1fProductBytes, Failure> {
-    let mut artifacts = Vec::with_capacity(WYR1F_PRODUCT_NATIVE_SPECS.len());
-    for spec in WYR1F_PRODUCT_NATIVE_SPECS {
+    let specs = product_kind.native_specs();
+    let mut artifacts = Vec::with_capacity(specs.len());
+    for spec in specs {
         let bytes = artifact_bytes
             .get(spec.label)
             .ok_or_else(|| Failure::task(format!("WYR1-F snapshot lacks {}", spec.label)))?
@@ -2995,7 +3097,7 @@ pub(crate) fn reassemble_wyr1f_snapshot(
             inspection: String::new(),
         });
     }
-    assemble_wyr1f_product(revision, &artifacts)
+    assemble_wyr1f_product(revision, &artifacts, product_kind, gate_config)
 }
 
 pub(crate) fn reassemble_e7_snapshot(
@@ -5080,8 +5182,12 @@ fn e8_native_spec(label: &str) -> Result<NativeSpec, Failure> {
         reason = "F1A.2 fixes the final artifact set; its caller is the F1A.3 assembler"
     )
 )]
-pub(crate) fn wyr1f_native_spec(label: &str) -> Result<NativeSpec, Failure> {
-    WYR1F_PRODUCT_NATIVE_SPECS
+pub(crate) fn wyr1f_native_spec(
+    label: &str,
+    product_kind: Wyr1fProduct,
+) -> Result<NativeSpec, Failure> {
+    product_kind
+        .native_specs()
         .iter()
         .copied()
         .find(|spec| spec.label == label)
@@ -5096,8 +5202,11 @@ pub(crate) fn wyr1f_native_spec(label: &str) -> Result<NativeSpec, Failure> {
 /// not happen. The shell's rustflags are *not* in that category — they are the
 /// production shell setting and are applied and recorded exactly as the
 /// accepted products do.
-pub(crate) fn wyr1f_native_command(label: &str) -> Result<String, Failure> {
-    let mut command = native_command(wyr1f_native_spec(label)?);
+pub(crate) fn wyr1f_native_command(
+    label: &str,
+    product_kind: Wyr1fProduct,
+) -> Result<String, Failure> {
+    let mut command = native_command(wyr1f_native_spec(label, product_kind)?);
     if label == "wyrmsh" {
         command.push_str(&format!(
             " [rustflags: {}]",
@@ -5108,8 +5217,11 @@ pub(crate) fn wyr1f_native_command(label: &str) -> Result<String, Failure> {
 }
 
 /// The frozen feature set for one final production role.
-pub(crate) fn wyr1f_native_features(label: &str) -> Result<&'static str, Failure> {
-    Ok(wyr1f_native_spec(label)?.features)
+pub(crate) fn wyr1f_native_features(
+    label: &str,
+    product_kind: Wyr1fProduct,
+) -> Result<&'static str, Failure> {
+    Ok(wyr1f_native_spec(label, product_kind)?.features)
 }
 
 /// The production shell's rustflags, applied by every accepted product.
@@ -5527,7 +5639,7 @@ mod tests {
     /// compile the test-actor crate into the permanent supervisor.
     #[test]
     fn wyr1f_system_init_is_not_the_selector_build() {
-        let init = wyr1f_native_spec("system-init").expect("system-init is in the final set");
+        let init = wyr1f_native_spec("system-init", Wyr1fProduct::Normal).expect("system-init is in the final set");
         assert_eq!(init.features, "wyr1e-production");
         assert!(!init.features.contains("wyr1e8-selector33"));
     }
@@ -5544,9 +5656,9 @@ mod tests {
     #[test]
     fn wyr1f_builds_and_records_the_shell_with_the_production_rustflags() {
         let recorded = format!(" [rustflags: {}]", WYRMSH_PRODUCTION_FLAGS.join(" "));
-        assert!(wyr1f_native_command("wyrmsh").unwrap().ends_with(&recorded));
+        assert!(wyr1f_native_command("wyrmsh", Wyr1fProduct::Normal).unwrap().ends_with(&recorded));
         for label in ["system-init", "registryd", "devmgr", "uart16550d", "consoled", "hello"] {
-            let command = wyr1f_native_command(label).unwrap();
+            let command = wyr1f_native_command(label, Wyr1fProduct::Normal).unwrap();
             assert!(!command.contains("rustflags"), "{label}: {command}");
         }
         // The same flags the accepted products record, not a second spelling.
@@ -5555,7 +5667,7 @@ mod tests {
         // No role's command carries an evidence-nonce environment suffix; that
         // is the part the final product genuinely does drop.
         for label in WYR1F_PRODUCT_NATIVE_SPECS.map(|spec| spec.label) {
-            assert!(!wyr1f_native_command(label).unwrap().contains("[env:"), "{label}");
+            assert!(!wyr1f_native_command(label, Wyr1fProduct::Normal).unwrap().contains("[env:"), "{label}");
         }
         // And the options constructor actually carries them through.
         assert_eq!(
@@ -5575,10 +5687,10 @@ mod tests {
 
     #[test]
     fn wyr1f_native_spec_rejects_an_unknown_label() {
-        assert!(wyr1f_native_spec("recovery-trigger").is_err());
-        assert!(wyr1f_native_spec("stdout-pressure").is_err());
-        assert!(wyr1f_native_spec("cpu-hog").is_err());
-        assert!(wyr1f_native_spec("consoled").is_ok());
+        assert!(wyr1f_native_spec("recovery-trigger", Wyr1fProduct::Normal).is_err());
+        assert!(wyr1f_native_spec("stdout-pressure", Wyr1fProduct::Normal).is_err());
+        assert!(wyr1f_native_spec("cpu-hog", Wyr1fProduct::Normal).is_err());
+        assert!(wyr1f_native_spec("consoled", Wyr1fProduct::Normal).is_ok());
     }
 
     // -----------------------------------------------------------------------
@@ -5610,7 +5722,7 @@ mod tests {
 
     fn wyr1f_product() -> (Wyr1fProductBytes, Vec<NativeArtifact>) {
         let artifacts = wyr1f_artifacts();
-        let product = assemble_wyr1f_product(WYR1F_TEST_REVISION, &artifacts)
+        let product = assemble_wyr1f_product(WYR1F_TEST_REVISION, &artifacts, Wyr1fProduct::Normal, WYR1F_NORMAL_GATE_CONFIG)
             .expect("assemble the final normal product");
         (product, artifacts)
     }
@@ -5692,21 +5804,27 @@ mod tests {
         );
         assert_eq!(manifest.roles().count(), 5);
         assert_eq!(manifest.edges().count(), 4);
-        verify_wyr1f_product(&product, &artifacts).expect("the product verifies");
+        verify_wyr1f_product(&product, &artifacts, Wyr1fProduct::Normal, WYR1F_NORMAL_GATE_CONFIG).expect("the product verifies");
     }
 
     #[test]
     fn wyr1f_product_serializes_deterministically() {
         let artifacts = wyr1f_artifacts();
-        let first = assemble_wyr1f_product(WYR1F_TEST_REVISION, &artifacts).unwrap();
-        let second = assemble_wyr1f_product(WYR1F_TEST_REVISION, &artifacts).unwrap();
+        let first = assemble_wyr1f_product(WYR1F_TEST_REVISION, &artifacts, Wyr1fProduct::Normal, WYR1F_NORMAL_GATE_CONFIG).unwrap();
+        let second = assemble_wyr1f_product(WYR1F_TEST_REVISION, &artifacts, Wyr1fProduct::Normal, WYR1F_NORMAL_GATE_CONFIG).unwrap();
         assert_eq!(first.generation, second.generation);
         assert_eq!(first.bootfs, second.bootfs);
         assert_eq!(first.rrc_manifest, second.rrc_manifest);
         assert_eq!(first.launch_policy, second.launch_policy);
         assert_eq!(first.device_manifest, second.device_manifest);
         // A different source revision is a different product generation.
-        let moved = assemble_wyr1f_product(&"a".repeat(40), &artifacts).unwrap();
+        let moved = assemble_wyr1f_product(
+            &"a".repeat(40),
+            &artifacts,
+            Wyr1fProduct::Normal,
+            WYR1F_NORMAL_GATE_CONFIG,
+        )
+        .unwrap();
         assert_ne!(first.generation, moved.generation);
         assert_ne!(first.bootfs, moved.bootfs);
     }
@@ -5785,8 +5903,8 @@ mod tests {
             .filter(|(left, right)| left != right)
             .count();
         assert_eq!(differing, 1);
-        assert_eq!(Wyr1fScenario::Normal.evidence_code(), 1);
-        assert_eq!(Wyr1fScenario::DegradedRecovery.evidence_code(), 2);
+        assert_eq!(Wyr1fScenario::Normal.evidence_code_text(), "1");
+        assert_eq!(Wyr1fScenario::DegradedRecovery.evidence_code_text(), "2");
 
         // And the production config is a different file, not this one with a
         // line removed.
@@ -5810,12 +5928,30 @@ mod tests {
                 "{bad} was accepted"
             );
         }
-        assert!(Wyr1fScenario::parse("normal").is_ok());
-        assert!(Wyr1fScenario::parse("degraded").is_ok());
-        assert!(Wyr1fScenario::parse("degraded_recovery").is_ok());
-        for unknown in ["NORMAL", "degraded-recovery", "reboot", ""] {
-            assert!(Wyr1fScenario::parse(unknown).is_err(), "{unknown}");
+        // The three products, their spellings, and what each declares.
+        assert_eq!(
+            Wyr1fProduct::parse("normal").unwrap().gate_scenario(),
+            None
+        );
+        for spelling in ["normal-instrumented", "instrumented-normal"] {
+            assert_eq!(
+                Wyr1fProduct::parse(spelling).unwrap().gate_scenario(),
+                Some(Wyr1fScenario::Normal)
+            );
         }
+        for spelling in ["degraded", "degraded_recovery"] {
+            assert_eq!(
+                Wyr1fProduct::parse(spelling).unwrap().gate_scenario(),
+                Some(Wyr1fScenario::DegradedRecovery)
+            );
+        }
+        for unknown in ["NORMAL", "degraded-recovery", "reboot", "", "35"] {
+            assert!(Wyr1fProduct::parse(unknown).is_err(), "{unknown}");
+        }
+        // The evidence discriminants are §5.4's, and they are what makes the
+        // two siblings' evidence identity differ.
+        assert_eq!(Wyr1fScenario::Normal.evidence_code_text(), "1");
+        assert_eq!(Wyr1fScenario::DegradedRecovery.evidence_code_text(), "2");
     }
 
     #[test]
@@ -5823,28 +5959,28 @@ mod tests {
         let artifacts = wyr1f_artifacts();
         let mut short = artifacts.clone();
         short.remove(3);
-        assert!(assemble_wyr1f_product(WYR1F_TEST_REVISION, &short).is_err());
+        assert!(assemble_wyr1f_product(WYR1F_TEST_REVISION, &short, Wyr1fProduct::Normal, WYR1F_NORMAL_GATE_CONFIG).is_err());
 
         let mut duplicated = artifacts.clone();
         duplicated[4] = duplicated[3].clone();
-        assert!(assemble_wyr1f_product(WYR1F_TEST_REVISION, &duplicated).is_err());
+        assert!(assemble_wyr1f_product(WYR1F_TEST_REVISION, &duplicated, Wyr1fProduct::Normal, WYR1F_NORMAL_GATE_CONFIG).is_err());
 
         let mut reordered = artifacts.clone();
         reordered.swap(1, 2);
-        assert!(assemble_wyr1f_product(WYR1F_TEST_REVISION, &reordered).is_err());
+        assert!(assemble_wyr1f_product(WYR1F_TEST_REVISION, &reordered, Wyr1fProduct::Normal, WYR1F_NORMAL_GATE_CONFIG).is_err());
 
         let mut empty = artifacts.clone();
         empty[0].bytes.clear();
         empty[0].sha256 = sha256::bytes_digest(&empty[0].bytes);
-        assert!(assemble_wyr1f_product(WYR1F_TEST_REVISION, &empty).is_err());
+        assert!(assemble_wyr1f_product(WYR1F_TEST_REVISION, &empty, Wyr1fProduct::Normal, WYR1F_NORMAL_GATE_CONFIG).is_err());
 
         let mut snapshot: BTreeMap<String, Vec<u8>> = artifacts
             .iter()
             .map(|artifact| (artifact.spec.label.to_owned(), artifact.bytes.clone()))
             .collect();
-        assert!(reassemble_wyr1f_snapshot(WYR1F_TEST_REVISION, &snapshot).is_ok());
+        assert!(reassemble_wyr1f_snapshot(WYR1F_TEST_REVISION, &snapshot, Wyr1fProduct::Normal, WYR1F_NORMAL_GATE_CONFIG).is_ok());
         snapshot.remove("consoled");
-        assert!(reassemble_wyr1f_snapshot(WYR1F_TEST_REVISION, &snapshot).is_err());
+        assert!(reassemble_wyr1f_snapshot(WYR1F_TEST_REVISION, &snapshot, Wyr1fProduct::Normal, WYR1F_NORMAL_GATE_CONFIG).is_err());
     }
 
     /// "Stub artifact in a required role." The retained-stub UART, consoled and
@@ -5897,7 +6033,7 @@ mod tests {
             let mut artifacts = wyr1f_artifacts();
             artifacts[index].spec = substitute;
             assert!(
-                assemble_wyr1f_product(WYR1F_TEST_REVISION, &artifacts).is_err(),
+                assemble_wyr1f_product(WYR1F_TEST_REVISION, &artifacts, Wyr1fProduct::Normal, WYR1F_NORMAL_GATE_CONFIG).is_err(),
                 "{} accepted {}/{}",
                 substitute.label,
                 substitute.package,
@@ -6211,7 +6347,7 @@ mod tests {
     /// Returns the message of the check that rejected a product, so a negative
     /// proves *which* invariant fired rather than only that something failed.
     fn wyr1f_rejection(product: &Wyr1fProductBytes, artifacts: &[NativeArtifact]) -> String {
-        verify_wyr1f_product(product, artifacts)
+        verify_wyr1f_product(product, artifacts, Wyr1fProduct::Normal, WYR1F_NORMAL_GATE_CONFIG)
             .expect_err("the product should not verify")
             .message
     }
@@ -6324,7 +6460,7 @@ mod tests {
             rrc_manifest: baseline,
             ..clone_wyr1f(&product)
         };
-        verify_wyr1f_product(&control, &artifacts).expect("the hand-built control verifies");
+        verify_wyr1f_product(&control, &artifacts, Wyr1fProduct::Normal, WYR1F_NORMAL_GATE_CONFIG).expect("the hand-built control verifies");
 
         let mut broken = spine.to_vec();
         broken.remove(2); // consoled no longer waits for the UART.

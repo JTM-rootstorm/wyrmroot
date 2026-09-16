@@ -62,18 +62,23 @@ use crate::{
     wyr1c6,
 };
 
-const REQUEST_KIND: &str = "wyrmroot-wyr1-f-normal-request";
-const RECEIPT_KIND: &str = "wyrmroot-wyr1-f-normal-freeze-receipt";
-const SOURCE_KIND: &str = "wyrmroot-wyr1-f-normal-source-build";
-const RESULT_KIND: &str = "wyrmroot-wyr1-f-normal-result";
+// The kinds no longer name a scenario. F1B makes this producer build all
+// three final products -- the production normal, and the instrumented normal
+// and degraded siblings of the acceptance pair -- and one schema that carries
+// the product as a field is what lets a reviewer compare two siblings field by
+// field instead of reconciling two schemas.
+const REQUEST_KIND: &str = "wyrmroot-wyr1-f-request";
+const RECEIPT_KIND: &str = "wyrmroot-wyr1-f-freeze-receipt";
+const SOURCE_KIND: &str = "wyrmroot-wyr1-f-source-build";
+const RESULT_KIND: &str = "wyrmroot-wyr1-f-result";
 const SOURCE_RECEIPT: &str = "f-source-build.toml";
-const ESP_NAME: &str = "wyr1f-normal-esp.img";
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
 
-/// The message `prepare --scenario degraded` fails with. F1B owns the
-/// instrumented init artifact that a degraded product requires; no degraded
-/// product exists, and this producer will not fabricate one.
-const DEGRADED_IS_F1B: &str = "WYR1-F prepare refuses --scenario degraded: the degraded product requires the instrumented init artifact, which is slice F1B's, and no degraded product exists yet";
+/// The ESP basename, which names its product so two siblings cannot be
+/// confused for one another on disk.
+fn esp_name(product: wyr1c::Wyr1fProduct) -> String {
+    format!("wyr1f-{}-esp.img", product.cli_value())
+}
 
 /// The seven production roles, in the frozen order of
 /// `wyr1c::WYR1F_PRODUCT_NATIVE_SPECS`.
@@ -131,13 +136,12 @@ pub(crate) fn prepare(
     scenario: &str,
     deep_repository: &Path,
     deep_revision: &str,
+    evidence_nonce: Option<&str>,
 ) -> Result<String, Failure> {
-    // Scenario first, before any environment probe or filesystem effect, so a
-    // degraded request cannot leave a half-made root behind.
-    match wyr1c::Wyr1fScenario::parse(scenario)? {
-        wyr1c::Wyr1fScenario::Normal => {}
-        wyr1c::Wyr1fScenario::DegradedRecovery => return Err(Failure::task(DEGRADED_IS_F1B)),
-    }
+    // Scenario and nonce first, before any environment probe or filesystem
+    // effect, so a malformed request cannot leave a half-made root behind.
+    let product_kind = wyr1c::Wyr1fProduct::parse(scenario)?;
+    let gate_config = product_kind.gate_config(evidence_nonce)?;
     wyr1c::reject_e6_ambient_build_environment(env::vars_os())?;
     reject_selector_environment()?;
     wyr1c6::validate_revision(deep_revision, "Deepwyrm revision")?;
@@ -174,8 +178,10 @@ pub(crate) fn prepare(
             &abi_revision,
             &abi_tree,
             &layout,
+            product_kind,
+            &gate_config,
         )?;
-        freeze(&output, &produced)
+        freeze(&output, &produced, product_kind)
     })();
     if result.is_ok() {
         fs::remove_dir_all(&staging)
@@ -197,15 +203,16 @@ pub(crate) fn inspect(product: &Path) -> Result<String, Failure> {
     let request_text =
         std::str::from_utf8(&request_bytes).map_err(|_| Failure::task("WYR1-F request is not UTF-8"))?;
     let request = parse(request_text)?;
+    let product_kind = product_kind_of(&request)?;
     validate_request(&request)?;
-    if render(&request, &request_keys(), ScalarSchema::Request)? != request_text {
+    if render(&request, &request_keys(product_kind), ScalarSchema::Request)? != request_text {
         return Err(Failure::task("WYR1-F request is not canonical"));
     }
     let revision = wyr1c6::clean_revision(&repository, "Wyrmroot")?;
     if field(&request, "wyrmroot_revision")? != revision {
         return Err(Failure::task("WYR1-F source revision changed"));
     }
-    validate_frozen_metadata(&product, &request)?;
+    validate_frozen_metadata(product_kind, &product, &request)?;
 
     // Byte-for-byte reconstruction from the frozen native ELFs.
     let mut artifacts = BTreeMap::new();
@@ -220,7 +227,13 @@ pub(crate) fn inspect(product: &Path) -> Result<String, Failure> {
             )?,
         );
     }
-    let assembled = wyr1c::reassemble_wyr1f_snapshot(&revision, &artifacts)?;
+    let gate_config = wyr1c6::read_regular_bounded(
+        &product.join(field(&request, "gate_config")?),
+        64 * 1024,
+        "WYR1-F gate configuration",
+    )?;
+    let assembled =
+        wyr1c::reassemble_wyr1f_snapshot(&revision, &artifacts, product_kind, &gate_config)?;
     for (key, actual) in [
         ("rrc_manifest", assembled.rrc_manifest.as_slice()),
         ("device_manifest", assembled.device_manifest.as_slice()),
@@ -325,6 +338,7 @@ pub(crate) fn inspect(product: &Path) -> Result<String, Failure> {
         &product.join("artifacts"),
         &assembled.generation,
         &inspections,
+        product_kind,
     )?;
     if source_text != expected_source {
         return Err(Failure::task("WYR1-F source receipt is not canonical"));
@@ -370,6 +384,8 @@ fn build_produced(
     abi_revision: &str,
     abi_tree: &str,
     layout: &crate::deep_layout::DeepLayoutBuild,
+    product_kind: wyr1c::Wyr1fProduct,
+    gate_config: &[u8],
 ) -> Result<Produced, Failure> {
     let manifest = crate::metadata::BuildManifest::load(repository)?;
     let profile = manifest.validate_loader_build_readiness(repository)?;
@@ -414,7 +430,7 @@ fn build_produced(
     let mut inspections = BTreeMap::new();
     let mut stack_report = None;
     for label in NATIVE_LABELS {
-        let spec = wyr1c::wyr1f_native_spec(label)?;
+        let spec = wyr1c::wyr1f_native_spec(label, product_kind)?;
         toolchain.accepted().verify_unchanged()?;
         deep_source.verify_unchanged()?;
         let artifact =
@@ -457,8 +473,9 @@ fn build_produced(
     let stack_report =
         stack_report.ok_or_else(|| Failure::task("WYR1-F build omitted the shell stack proof"))?;
 
-    let product = wyr1c::reassemble_wyr1f_snapshot(wyrmroot_revision, &artifact_bytes)?;
-    let kernel = build_normal_kernel(deep_repository)?;
+    let product =
+        wyr1c::reassemble_wyr1f_snapshot(wyrmroot_revision, &artifact_bytes, product_kind, gate_config)?;
+    let kernel = build_kernel(deep_repository, product_kind)?;
     let boot_device_table = wyr1c6::boot_device_table();
     let ovmf_code = wyr1c6::pinned_firmware(
         wyr1c6::OVMF_CODE_PATH,
@@ -516,6 +533,7 @@ fn build_produced(
         &artifacts,
         &product.generation,
         &inspections,
+        product_kind,
     )?;
     wyr1c6::write_new(
         &artifacts.join(SOURCE_RECEIPT),
@@ -545,7 +563,7 @@ fn build_produced(
 /// The production build removes the selector variable and passes no features,
 /// which is the shape of `PRODUCTION_KERNEL_ROW`
 /// (`deepwyrm/tools/xtask/src/lib.rs:535`).
-fn build_normal_kernel(repository: &Path) -> Result<Vec<u8>, Failure> {
+fn build_kernel(repository: &Path, product_kind: wyr1c::Wyr1fProduct) -> Result<Vec<u8>, Failure> {
     let repository = Directory::open_exact(repository, "Deepwyrm source root")?;
     let temporary = match repository.open_child(".tmp", "Deepwyrm temporary root") {
         Ok(directory) => directory,
@@ -563,10 +581,11 @@ fn build_normal_kernel(repository: &Path) -> Result<Vec<u8>, Failure> {
     let target = build.create_child("target", 0o700, "WYR1-F Cargo target")?;
     let stdout = build.create_file("cargo.stdout.log", 0o600, "WYR1-F kernel stdout")?;
     let stderr = build.create_file("cargo.stderr.log", 0o600, "WYR1-F kernel stderr")?;
-    let status = normal_kernel_build_command(
+    let status = kernel_build_command(
         &repository.path().join("tools/pinned-cargo"),
         repository.path(),
         target.path(),
+        product_kind,
     )
     .stdout(Stdio::from(stdout))
     .stderr(Stdio::from(stderr))
@@ -585,7 +604,12 @@ fn build_normal_kernel(repository: &Path) -> Result<Vec<u8>, Failure> {
     )
 }
 
-fn normal_kernel_build_command(pinned_cargo: &Path, repository: &Path, target: &Path) -> Command {
+fn kernel_build_command(
+    pinned_cargo: &Path,
+    repository: &Path,
+    target: &Path,
+    product_kind: wyr1c::Wyr1fProduct,
+) -> Command {
     let mut command = Command::new(pinned_cargo);
     command
         .arg("target")
@@ -602,7 +626,10 @@ fn normal_kernel_build_command(pinned_cargo: &Path, repository: &Path, target: &
             "deepwyrm-kernel",
         ])
         .env("DEEPWYRM_PINNED_TARGET_DIR", target)
-        // Removed, never set: this is the production kernel.
+        // Removed, never inherited. An instrumented product sets exactly the
+        // two frozen selector variables below and nothing else; the production
+        // product sets none, which is what makes its kernel contain no
+        // guest-test selector string at all.
         .env_remove("DEEPWYRM_GUEST_TEST_SELECTOR")
         .env_remove("DEEPWYRM_GUEST_TEST_ID")
         .env_remove("DEEPWYRM_WYR1E8_EVIDENCE")
@@ -619,30 +646,138 @@ fn normal_kernel_build_command(pinned_cargo: &Path, repository: &Path, target: &
         .env_remove("LD_PRELOAD")
         .current_dir(repository)
         .stdin(Stdio::null());
+    if product_kind.is_instrumented() {
+        command
+            .env("DEEPWYRM_GUEST_TEST_SELECTOR", wyr1c::WYR1F_SELECTOR)
+            .env("DEEPWYRM_GUEST_TEST_ID", wyr1c::WYR1F_TEST_ID);
+    }
     command
 }
 
-/// Identity, authority and limit fields that never vary for the normal product.
-fn fixed_fields() -> [(&'static str, &'static str); 34] {
+/// Identity, authority and limit fields that never vary for a given product.
+///
+/// Thirteen of them do vary by product, and those thirteen are the whole
+/// declared production-versus-instrumented and normal-versus-degraded
+/// difference as the request records it.
+fn fixed_fields(product_kind: wyr1c::Wyr1fProduct) -> [(&'static str, &'static str); 35] {
+    use wyr1c::Wyr1fProduct;
+    let instrumented = product_kind.is_instrumented();
     [
         ("kind", REQUEST_KIND),
         ("schema_version", "1"),
-        ("product", "wyr1-f-normal"),
-        ("profile", "wyr1f-normal"),
-        ("scenario", "normal"),
-        ("selector", "none"),
-        ("guest_test", "none"),
+        (
+            "product",
+            match product_kind {
+                Wyr1fProduct::Normal => "wyr1-f-normal",
+                Wyr1fProduct::InstrumentedNormal => "wyr1-f-normal-instrumented",
+                Wyr1fProduct::Degraded => "wyr1-f-degraded",
+            },
+        ),
+        (
+            "profile",
+            match product_kind {
+                Wyr1fProduct::Normal => "wyr1f-normal",
+                Wyr1fProduct::InstrumentedNormal => "wyr1f-normal-instrumented",
+                Wyr1fProduct::Degraded => "wyr1f-degraded",
+            },
+        ),
+        (
+            "scenario",
+            match product_kind {
+                Wyr1fProduct::Normal | Wyr1fProduct::InstrumentedNormal => "normal",
+                Wyr1fProduct::Degraded => "degraded_recovery",
+            },
+        ),
+        (
+            "selector",
+            if instrumented {
+                wyr1c::WYR1F_SELECTOR
+            } else {
+                "none"
+            },
+        ),
+        (
+            "guest_test",
+            if instrumented {
+                wyr1c::WYR1F_TEST_ID
+            } else {
+                "none"
+            },
+        ),
         ("closure_selector", wyr1c::WYR1F_SELECTOR),
         ("closure_test_id", wyr1c::WYR1F_TEST_ID),
-        ("closure_selector_state", "reserved"),
-        ("kernel_instrumentation", "none"),
+        (
+            "closure_selector_state",
+            if instrumented {
+                "implemented"
+            } else {
+                "reserved"
+            },
+        ),
+        (
+            "kernel_instrumentation",
+            if instrumented {
+                "dw1-wyr1-interactive-closure"
+            } else {
+                "none"
+            },
+        ),
         ("kernel_cargo_features", "none"),
-        ("evidence", "not-produced"),
-        ("evidence_protocol", "none"),
-        ("gate_config_selector", "none"),
-        ("gate_config_scenario", "none"),
-        ("gate_config_nonce", "none"),
-        ("acceptance_claim", "prepared-normal-product-only"),
+        (
+            "evidence",
+            if instrumented {
+                "produced"
+            } else {
+                "not-produced"
+            },
+        ),
+        (
+            "evidence_protocol",
+            if instrumented { "wyr1evid1" } else { "none" },
+        ),
+        (
+            "gate_config_selector",
+            if instrumented {
+                wyr1c::WYR1F_SELECTOR
+            } else {
+                "none"
+            },
+        ),
+        (
+            "gate_config_scenario",
+            match product_kind.gate_scenario() {
+                None => "none",
+                Some(scenario) => scenario.as_config_value(),
+            },
+        ),
+        // The nonce itself is not a fixed field: it is written from the gate
+        // configuration the producer actually froze. This entry only records
+        // whether one exists, so a reviewer comparing two siblings sees the
+        // difference declared before reading the value.
+        (
+            "gate_config_nonce",
+            if instrumented { "declared" } else { "none" },
+        ),
+        // Contract §5.4's declared difference (b), scenario-bound evidence
+        // identity, as the request records it: the WYR1EVID1 discriminant the
+        // instrumented init encodes into every record it emits.
+        (
+            "evidence_scenario_code",
+            match product_kind.gate_scenario() {
+                None => "none",
+                Some(scenario) => scenario.evidence_code_text(),
+            },
+        ),
+        (
+            "acceptance_claim",
+            match product_kind {
+                Wyr1fProduct::Normal => "prepared-normal-product-only",
+                Wyr1fProduct::InstrumentedNormal => {
+                    "prepared-instrumented-normal-sibling-only"
+                }
+                Wyr1fProduct::Degraded => "prepared-degraded-sibling-only",
+            },
+        ),
         ("com1_role", "trusted-serial-diagnostics"),
         ("com2_role", "native-shell-byte-stream"),
         ("com2_transport", "unix-socket-byte-stream"),
@@ -684,7 +819,12 @@ fn obligation_fields() -> [(&'static str, &'static str); 4] {
     ]
 }
 
-fn freeze(output: &Path, produced: &Produced) -> Result<String, Failure> {
+fn freeze(
+    output: &Path,
+    produced: &Produced,
+    product_kind: wyr1c::Wyr1fProduct,
+) -> Result<String, Failure> {
+    let esp_name = esp_name(product_kind);
     fs::create_dir(output)
         .map_err(|e| Failure::task(format!("could not create WYR1-F output: {e}")))?;
     let frozen = output.join("artifacts");
@@ -712,10 +852,10 @@ fn freeze(output: &Path, produced: &Produced) -> Result<String, Failure> {
         "source_receipt_sha256".into(),
         sha256::bytes_digest(&source_bytes),
     );
-    build_esp(output, &fields)?;
-    let esp = frozen.join(ESP_NAME);
+    build_esp(output, &fields, &esp_name)?;
+    let esp = frozen.join(&esp_name);
     wyr1c6::seal_mode(&esp, 0o444, "WYR1-F ESP")?;
-    fields.insert("esp".into(), format!("artifacts/{ESP_NAME}"));
+    fields.insert("esp".into(), format!("artifacts/{esp_name}"));
     fields.insert(
         "esp_sha256".into(),
         sha256::bytes_digest(&wyr1c6::read_regular_bounded(
@@ -724,7 +864,10 @@ fn freeze(output: &Path, produced: &Produced) -> Result<String, Failure> {
             "ESP",
         )?),
     );
-    for (k, v) in fixed_fields().into_iter().chain(obligation_fields()) {
+    for (k, v) in fixed_fields(product_kind)
+        .into_iter()
+        .chain(obligation_fields())
+    {
         fields.insert(k.into(), v.into());
     }
     for (k, v) in [
@@ -739,7 +882,7 @@ fn freeze(output: &Path, produced: &Produced) -> Result<String, Failure> {
         fields.insert(k.into(), v.into());
     }
     validate_request(&fields)?;
-    let request = render(&fields, &request_keys(), ScalarSchema::Request)?;
+    let request = render(&fields, &request_keys(product_kind), ScalarSchema::Request)?;
     wyr1c6::write_new(
         &output.join("request.toml"),
         request.as_bytes(),
@@ -757,8 +900,17 @@ fn freeze(output: &Path, produced: &Produced) -> Result<String, Failure> {
         render_sorted(&receipt, ScalarSchema::FreezeReceipt)?.as_bytes(),
         "freeze receipt",
     )?;
+    let fixed = |key: &str| {
+        fixed_fields(product_kind)
+            .into_iter()
+            .find(|(k, _)| *k == key)
+            .map_or("?", |(_, v)| v)
+    };
     Ok(format!(
-        "WYR1_F_PREPARE_PASS product=wyr1-f-normal scenario=normal selector=none request={} receipt={}\n",
+        "WYR1_F_PREPARE_PASS product={} scenario={} selector={} request={} receipt={}\n",
+        fixed("product"),
+        fixed("scenario"),
+        fixed("selector"),
         output.join("request.toml").display(),
         output.join("freeze-receipt.toml").display()
     ))
@@ -775,9 +927,13 @@ fn source_receipt(
     artifacts: &Path,
     generation: &[u8; 32],
     inspections: &BTreeMap<String, Vec<u8>>,
+    product_kind: wyr1c::Wyr1fProduct,
 ) -> Result<String, Failure> {
     let mut f = BTreeMap::new();
-    for (k, v) in fixed_fields().into_iter().chain(obligation_fields()) {
+    for (k, v) in fixed_fields(product_kind)
+        .into_iter()
+        .chain(obligation_fields())
+    {
         if k != "kind" {
             f.insert(k.into(), v.into());
         }
@@ -845,11 +1001,11 @@ fn source_receipt(
         let key = label.replace('-', "_");
         f.insert(
             format!("{key}_features"),
-            wyr1c::wyr1f_native_features(label)?.into(),
+            wyr1c::wyr1f_native_features(label, product_kind)?.into(),
         );
         f.insert(
             format!("{key}_command"),
-            wyr1c::wyr1f_native_command(label)?,
+            wyr1c::wyr1f_native_command(label, product_kind)?,
         );
         f.insert(
             format!("{key}_inspection_sha256"),
@@ -870,11 +1026,11 @@ fn source_receipt(
             )?),
         );
     }
-    render(&f, &source_receipt_keys(), ScalarSchema::SourceReceipt)
+    render(&f, &source_receipt_keys(product_kind), ScalarSchema::SourceReceipt)
 }
 
-fn source_receipt_keys() -> Vec<String> {
-    let mut keys = fixed_fields()
+fn source_receipt_keys(product_kind: wyr1c::Wyr1fProduct) -> Vec<String> {
+    let mut keys = fixed_fields(product_kind)
         .iter()
         .chain(obligation_fields().iter())
         .map(|(key, _)| (*key).to_owned())
@@ -916,10 +1072,14 @@ fn source_receipt_keys() -> Vec<String> {
     keys.into_iter().collect()
 }
 
-fn build_esp(output: &Path, f: &BTreeMap<String, String>) -> Result<(), Failure> {
+fn build_esp(
+    output: &Path,
+    f: &BTreeMap<String, String>,
+    esp_name: &str,
+) -> Result<(), Failure> {
     let arguments = G3ImageArguments {
         image: output
-            .join(format!("artifacts/{ESP_NAME}"))
+            .join(format!("artifacts/{esp_name}"))
             .display()
             .to_string(),
         loader: output.join(field(f, "loader")?).display().to_string(),
@@ -980,9 +1140,9 @@ fn receipt_fields(hash: &str, r: &BTreeMap<String, String>) -> BTreeMap<String, 
     f
 }
 
-fn request_keys() -> Vec<String> {
+fn request_keys(product_kind: wyr1c::Wyr1fProduct) -> Vec<String> {
     let mut keys = Vec::new();
-    for (key, _) in fixed_fields() {
+    for (key, _) in fixed_fields(product_kind) {
         keys.push(key.into());
     }
     keys.extend(obligation_fields().iter().map(|(k, _)| (*k).into()));
@@ -1072,8 +1232,25 @@ fn result_keys() -> Vec<String> {
     .collect()
 }
 
+/// Which product a request declares itself to be.
+///
+/// Read before anything else is checked, because every other fixed field is
+/// conditioned on it. An unknown value is rejected here rather than silently
+/// validated against the production shape.
+fn product_kind_of(f: &BTreeMap<String, String>) -> Result<wyr1c::Wyr1fProduct, Failure> {
+    match field(f, "product")? {
+        "wyr1-f-normal" => Ok(wyr1c::Wyr1fProduct::Normal),
+        "wyr1-f-normal-instrumented" => Ok(wyr1c::Wyr1fProduct::InstrumentedNormal),
+        "wyr1-f-degraded" => Ok(wyr1c::Wyr1fProduct::Degraded),
+        other => Err(Failure::task(format!(
+            "WYR1-F request declares the unknown product `{other}`"
+        ))),
+    }
+}
+
 fn validate_request(f: &BTreeMap<String, String>) -> Result<(), Failure> {
-    for (k, v) in fixed_fields().into_iter().chain(obligation_fields()) {
+    let product_kind = product_kind_of(f)?;
+    for (k, v) in fixed_fields(product_kind).into_iter().chain(obligation_fields()) {
         if field(f, k)? != v {
             return Err(Failure::task(format!("WYR1-F {k} drifted")));
         }
@@ -1115,6 +1292,7 @@ fn validate_request(f: &BTreeMap<String, String>) -> Result<(), Failure> {
 /// Prepared-only inspection: the product must still be exactly what `prepare`
 /// wrote, with no consumed/runtime state anywhere in it.
 fn validate_frozen_metadata(
+    product_kind: wyr1c::Wyr1fProduct,
     output: &Path,
     request: &BTreeMap<String, String>,
 ) -> Result<(), Failure> {
@@ -1129,8 +1307,9 @@ fn validate_frozen_metadata(
         ],
         "WYR1-F output",
     )?;
+    let esp = esp_name(product_kind);
     let mut artifact_names = ARTIFACTS.iter().map(|(_, name)| *name).collect::<Vec<_>>();
-    artifact_names.extend([SOURCE_RECEIPT, ESP_NAME]);
+    artifact_names.extend([SOURCE_RECEIPT, esp.as_str()]);
     require_exact_directory(&output.join("artifacts"), &artifact_names, "WYR1-F artifacts")?;
     require_mode(&output.join("request.toml"), 0o444, "WYR1-F request")?;
     for (key, _) in ARTIFACTS {
@@ -1390,7 +1569,7 @@ mod tests {
     const RUST: &str = "a92dc7f7464ad6ddfece4402bd7b86dbfa86166d";
 
     fn normalized_request() -> BTreeMap<String, String> {
-        let mut request = fixed_fields()
+        let mut request = fixed_fields(wyr1c::Wyr1fProduct::Normal)
             .into_iter()
             .chain(obligation_fields())
             .map(|(key, value)| (key.to_owned(), value.to_owned()))
@@ -1445,7 +1624,7 @@ mod tests {
             ]
         );
         for label in NATIVE_LABELS {
-            wyr1c::wyr1f_native_spec(label).expect("every production role is in the final set");
+            wyr1c::wyr1f_native_spec(label, wyr1c::Wyr1fProduct::Normal).expect("every production role is in the final set");
         }
         // Acceptance content the E7/E8 products carry and this one must not.
         for label in [
@@ -1455,7 +1634,7 @@ mod tests {
             "recovery-trigger",
             "stdout-pressure",
         ] {
-            assert!(wyr1c::wyr1f_native_spec(label).is_err(), "{label} is not production");
+            assert!(wyr1c::wyr1f_native_spec(label, wyr1c::Wyr1fProduct::Normal).is_err(), "{label} is not production");
             assert!(!NATIVE_LABELS.contains(&label));
         }
         let keys = ARTIFACTS.iter().map(|(key, _)| *key).collect::<Vec<_>>();
@@ -1482,8 +1661,8 @@ mod tests {
 
     #[test]
     fn no_request_or_receipt_field_inherits_e6_or_carries_an_evidence_nonce() {
-        let request = request_keys();
-        let source = source_receipt_keys();
+        let request = request_keys(wyr1c::Wyr1fProduct::Normal);
+        let source = source_receipt_keys(wyr1c::Wyr1fProduct::Normal);
         for key in request.iter().chain(source.iter()) {
             assert!(!key.starts_with("e6_"), "{key} inherits an E6 artifact");
             assert!(!key.contains("nonce") || key == "gate_config_nonce", "{key}");
@@ -1500,7 +1679,7 @@ mod tests {
 
     #[test]
     fn the_request_key_set_is_exact_and_renders_canonically() {
-        let keys = request_keys();
+        let keys = request_keys(wyr1c::Wyr1fProduct::Normal);
         assert_eq!(
             keys.iter().cloned().collect::<BTreeSet<_>>().len(),
             keys.len()
@@ -1523,7 +1702,7 @@ mod tests {
 
     #[test]
     fn malformed_field_types_and_versions_are_rejected() {
-        let keys = request_keys();
+        let keys = request_keys(wyr1c::Wyr1fProduct::Normal);
         for (key, bad) in [
             ("schema_version", "2"),
             ("selector", "interactive-wyrmsh"),
@@ -1591,18 +1770,18 @@ mod tests {
         // A foreign key set never renders as an F request, in either direction.
         let mut extra = normalized_request();
         extra.insert("evidence_nonce".into(), "E800000000000001".into());
-        assert!(render(&extra, &request_keys(), ScalarSchema::Request).is_err());
+        assert!(render(&extra, &request_keys(wyr1c::Wyr1fProduct::Normal), ScalarSchema::Request).is_err());
         assert!(validate_request(&extra).is_ok(), "extra keys are a render error, not a field error");
 
         let mut missing = normalized_request();
         missing.remove("bootfs_sha256");
-        assert!(render(&missing, &request_keys(), ScalarSchema::Request).is_err());
+        assert!(render(&missing, &request_keys(wyr1c::Wyr1fProduct::Normal), ScalarSchema::Request).is_err());
         assert!(validate_request(&missing).is_err());
     }
 
     #[test]
     fn the_source_receipt_binds_only_frozen_production_features() {
-        let keys = source_receipt_keys();
+        let keys = source_receipt_keys(wyr1c::Wyr1fProduct::Normal);
         assert_eq!(
             keys.iter().cloned().collect::<BTreeSet<_>>().len(),
             keys.len()
@@ -1612,25 +1791,25 @@ mod tests {
             assert!(keys.contains(&format!("{key}_features")));
             assert!(keys.contains(&format!("{key}_command")));
             assert!(keys.contains(&format!("{key}_inspection_sha256")));
-            let features = wyr1c::wyr1f_native_features(label).unwrap();
+            let features = wyr1c::wyr1f_native_features(label, wyr1c::Wyr1fProduct::Normal).unwrap();
             assert!(
                 !features.contains("selector") && !features.contains("evidence"),
                 "{label} carries {features}"
             );
-            let command = wyr1c::wyr1f_native_command(label).unwrap();
+            let command = wyr1c::wyr1f_native_command(label, wyr1c::Wyr1fProduct::Normal).unwrap();
             assert!(command.contains(&format!("--features {features}")));
             assert!(!command.contains("NONCE"), "{label}: {command}");
         }
         assert_eq!(
-            wyr1c::wyr1f_native_features("system-init").unwrap(),
+            wyr1c::wyr1f_native_features("system-init", wyr1c::Wyr1fProduct::Normal).unwrap(),
             "wyr1e-production"
         );
         assert_eq!(
-            wyr1c::wyr1f_native_features("devmgr").unwrap(),
+            wyr1c::wyr1f_native_features("devmgr", wyr1c::Wyr1fProduct::Normal).unwrap(),
             "wyr1e8-production"
         );
         assert_eq!(
-            wyr1c::wyr1f_native_features("consoled").unwrap(),
+            wyr1c::wyr1f_native_features("consoled", wyr1c::Wyr1fProduct::Normal).unwrap(),
             "native-consoled,wyr1e-wyrmsh,wyr1e8-recovery"
         );
     }
@@ -1659,7 +1838,7 @@ mod tests {
     #[test]
     fn the_freeze_receipt_carries_every_artifact_identity() {
         let request = normalized_request();
-        let text = render(&request, &request_keys(), ScalarSchema::Request).unwrap();
+        let text = render(&request, &request_keys(wyr1c::Wyr1fProduct::Normal), ScalarSchema::Request).unwrap();
         let receipt = receipt_fields(&sha256::bytes_digest(text.as_bytes()), &request);
         for (key, _) in ARTIFACTS {
             assert!(receipt.contains_key(&format!("{key}_sha256")), "{key}");
@@ -1683,35 +1862,59 @@ mod tests {
         assert!(parse("kind = \n").is_err());
     }
 
+    /// F1A refused `--scenario degraded` because the instrumented init
+    /// artifact did not exist. F1B supplies it, so the refusal is gone and the
+    /// nonce requirement takes its place: an instrumented product's episode
+    /// identity is bound to its evidence nonce, and a production product has
+    /// no scenario to bind one to.
     #[test]
-    fn prepare_refuses_the_degraded_scenario_before_any_effect() {
-        let root = scratch("degraded");
+    fn prepare_requires_a_nonce_for_an_instrumented_product_and_refuses_one_otherwise() {
+        let root = scratch("nonce");
         let output = root.join("product");
+        for scenario in ["degraded", "degraded_recovery", "normal-instrumented"] {
+            let failure = prepare(
+                &output,
+                scenario,
+                Path::new("/nonexistent-deepwyrm"),
+                DEEP,
+                None,
+            )
+            .expect_err("an instrumented product without a nonce is refused");
+            assert!(
+                failure.message.contains("requires --evidence-nonce"),
+                "{scenario}: {}",
+                failure.message
+            );
+            assert!(!output.exists(), "a refused prepare must create nothing");
+        }
         let failure = prepare(
             &output,
-            "degraded",
+            "normal",
             Path::new("/nonexistent-deepwyrm"),
             DEEP,
+            Some("0123456789ABCDEF"),
         )
-        .expect_err("degraded must be refused");
-        assert!(failure.message.contains("F1B"), "{}", failure.message);
+        .expect_err("the production product takes no nonce");
         assert!(
-            failure.message.contains("instrumented init artifact"),
+            failure.message.contains("takes no evidence nonce"),
             "{}",
             failure.message
         );
-        assert!(failure.message.contains("no degraded product exists yet"));
-        assert!(!output.exists(), "a refused prepare must create nothing");
-
-        let same = prepare(
-            &output,
-            "degraded_recovery",
-            Path::new("/nonexistent-deepwyrm"),
-            DEEP,
-        )
-        .expect_err("the long spelling is refused identically");
-        assert_eq!(same.message, failure.message);
         assert!(!output.exists());
+        // A nonce the real init parser would reject is refused before any
+        // filesystem effect too.
+        for bad in ["0123456789abcdef", "FF", "0000000000000000", ""] {
+            let failure = prepare(
+                &output,
+                "degraded",
+                Path::new("/nonexistent-deepwyrm"),
+                DEEP,
+                Some(bad),
+            )
+            .expect_err("a malformed nonce is refused");
+            assert!(!failure.message.is_empty(), "{bad}");
+            assert!(!output.exists(), "{bad}");
+        }
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -1720,8 +1923,14 @@ mod tests {
         let root = scratch("unknown-scenario");
         let output = root.join("product");
         for scenario in ["", "normal-recovery", "NORMAL", "interactive-wyrmsh", "35"] {
-            let failure = prepare(&output, scenario, Path::new("/nonexistent-deepwyrm"), DEEP)
-                .expect_err("an unknown scenario is refused");
+            let failure = prepare(
+                &output,
+                scenario,
+                Path::new("/nonexistent-deepwyrm"),
+                DEEP,
+                None,
+            )
+            .expect_err("an unknown scenario is refused");
             assert!(
                 failure.message.contains("unknown WYR1-F scenario"),
                 "{scenario}: {}",
@@ -1829,34 +2038,87 @@ mod tests {
     }
 
     #[test]
-    fn the_kernel_command_is_the_uninstrumented_production_build() {
-        let command = normal_kernel_build_command(
-            Path::new("/deep/tools/pinned-cargo"),
-            Path::new("/deep"),
-            Path::new("/deep/.tmp/target"),
-        );
-        let arguments = command
-            .get_args()
-            .map(|argument| argument.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        assert!(!arguments.iter().any(|argument| argument == "--features"));
-        assert!(!arguments.iter().any(|argument| argument == "test-support"));
-        assert!(arguments.contains(&"--locked".to_owned()));
-        assert!(arguments.contains(&"--offline".to_owned()));
-        assert!(arguments.contains(&KERNEL_TARGET.to_owned()));
-        let removed = command
-            .get_envs()
-            .filter(|(_, value)| value.is_none())
-            .map(|(key, _)| key.to_string_lossy().into_owned())
-            .collect::<BTreeSet<_>>();
-        // The selector is removed, never set.
+    fn the_kernel_command_declares_exactly_its_product_s_instrumentation() {
+        let arguments_and_env = |product_kind| {
+            let command = kernel_build_command(
+                Path::new("/deep/tools/pinned-cargo"),
+                Path::new("/deep"),
+                Path::new("/deep/.tmp/target"),
+                product_kind,
+            );
+            let arguments = command
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            let removed = command
+                .get_envs()
+                .filter(|(_, value)| value.is_none())
+                .map(|(key, _)| key.to_string_lossy().into_owned())
+                .collect::<BTreeSet<_>>();
+            let set = command
+                .get_envs()
+                .filter_map(|(key, value)| {
+                    value.map(|value| {
+                        (
+                            key.to_string_lossy().into_owned(),
+                            value.to_string_lossy().into_owned(),
+                        )
+                    })
+                })
+                .collect::<BTreeMap<_, _>>();
+            (arguments, removed, set)
+        };
+
+        // No product passes cargo features, ever.
+        for product_kind in [
+            wyr1c::Wyr1fProduct::Normal,
+            wyr1c::Wyr1fProduct::InstrumentedNormal,
+            wyr1c::Wyr1fProduct::Degraded,
+        ] {
+            let (arguments, removed, _) = arguments_and_env(product_kind);
+            assert!(!arguments.iter().any(|argument| argument == "--features"));
+            assert!(!arguments.iter().any(|argument| argument == "test-support"));
+            assert!(arguments.contains(&"--locked".to_owned()));
+            assert!(arguments.contains(&"--offline".to_owned()));
+            assert!(arguments.contains(&KERNEL_TARGET.to_owned()));
+            // Every evidence variable is removed for every product: an
+            // instrumented kernel selects a guest test, it does not inherit an
+            // evidence nonce from the operator's shell.
+            assert!(removed.contains("DEEPWYRM_WYR1E8_EVIDENCE"));
+            assert!(removed.contains("DEEPWYRM_WYR1E8_EVIDENCE_NONCE"));
+            assert!(removed.contains("DEEPWYRM_DW1E_EVIDENCE_NONCE"));
+        }
+
+        // The production kernel sets nothing but its target directory, which is
+        // what makes it carry no guest-test selector string at all.
+        let (_, removed, set) = arguments_and_env(wyr1c::Wyr1fProduct::Normal);
         assert!(removed.contains("DEEPWYRM_GUEST_TEST_SELECTOR"));
-        assert!(removed.contains("DEEPWYRM_WYR1E8_EVIDENCE"));
-        assert!(removed.contains("DEEPWYRM_WYR1E8_EVIDENCE_NONCE"));
-        let set = command
-            .get_envs()
-            .filter_map(|(key, value)| value.map(|_| key.to_string_lossy().into_owned()))
-            .collect::<BTreeSet<_>>();
-        assert_eq!(set, BTreeSet::from(["DEEPWYRM_PINNED_TARGET_DIR".to_owned()]));
+        assert!(removed.contains("DEEPWYRM_GUEST_TEST_ID"));
+        assert_eq!(
+            set.keys().cloned().collect::<Vec<_>>(),
+            vec!["DEEPWYRM_PINNED_TARGET_DIR".to_owned()]
+        );
+
+        // Both instrumented siblings set exactly the frozen selector pair, and
+        // the same pair: the kernel is not part of the declared normal/degraded
+        // difference.
+        let mut instrumented = Vec::new();
+        for product_kind in [
+            wyr1c::Wyr1fProduct::InstrumentedNormal,
+            wyr1c::Wyr1fProduct::Degraded,
+        ] {
+            let (_, _, set) = arguments_and_env(product_kind);
+            assert_eq!(
+                set.get("DEEPWYRM_GUEST_TEST_SELECTOR").map(String::as_str),
+                Some(wyr1c::WYR1F_SELECTOR)
+            );
+            assert_eq!(
+                set.get("DEEPWYRM_GUEST_TEST_ID").map(String::as_str),
+                Some(wyr1c::WYR1F_TEST_ID)
+            );
+            assert_eq!(set.len(), 3, "no fourth variable is set");
+            instrumented.push(set);
+        }
+        assert_eq!(instrumented[0], instrumented[1]);
     }
 }

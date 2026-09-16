@@ -200,11 +200,13 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
             output,
             deep_repository,
             deep_revision,
+            evidence_nonce,
         } => wyr1f::prepare(
             std::path::Path::new(&output),
             &scenario,
             std::path::Path::new(&deep_repository),
             &deep_revision,
+            evidence_nonce.as_deref(),
         )
         .map(Some),
         Action::Wyr1FInspect(product) => wyr1f::inspect(std::path::Path::new(&product)).map(Some),
