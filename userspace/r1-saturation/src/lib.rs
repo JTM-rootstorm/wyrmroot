@@ -680,7 +680,7 @@ pub mod record {
 ///
 /// Only sixteen bits survive to the host: selector 34's encoder reports the
 /// probe's code as `0xAF37_0000 | (code & 0xffff)`. So a site that carries a
-/// status sets [`NATIVE_FLAG`], names itself in the next three bits, and spends
+/// status sets `NATIVE_FLAG`, names itself in the next three bits, and spends
 /// the remaining twelve on the compressed status. Every plain ordinal stays below
 /// `NATIVE_FLAG`, so none of them collide with this scheme.
 pub mod probe_status {

@@ -48,3 +48,4 @@ wyrmroot-dw1e3-com2-test = { path = "../dw1e3-com2-test", optional = true }
 [lints.rust]
 unsafe_code = "deny"
 unused_crate_dependencies = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("wyrmroot"))'] }

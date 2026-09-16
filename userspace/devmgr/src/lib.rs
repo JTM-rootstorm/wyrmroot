@@ -1571,7 +1571,6 @@ mod tests {
         assert_eq!(resident, accepted);
     }
 
-    #[test]
     /// The twenty-seven lookups and counters this crate folded into one
     /// `ControllerLifecycle` value had no test between them, which is part of
     /// why the collapse survived. This covers one of them end to end so the
@@ -1621,6 +1620,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn c6_failure_rebind_preserves_cleanup_gate_before_retry() {
         let mut resident =
             ResidentController::new(prepare_operational(&manifest(), 7).unwrap(), 41).unwrap();

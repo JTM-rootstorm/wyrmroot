@@ -152,6 +152,14 @@ impl Observer {
     /// A launch answers `LAUNCH_ACCEPTED` or `ERROR`; nothing else can reach
     /// here, because a deferred reply is written by the publication half and
     /// those are the only two things it sends.
+    // Its only caller is the `wyr1e-selector33` deferred-reply path, but the
+    // module is also compiled under plain `test` for its own units, and no
+    // unit reaches this recorder. F2B leaves that gap named rather than
+    // covered by a test written to the implementation.
+    #[allow(
+        dead_code,
+        reason = "recorded only by the selector-33 deferred-reply path"
+    )]
     pub(crate) fn shell_jobs_launch_response(
         &mut self,
         facts: crate::launch_request_facts::LaunchRequestFacts,
@@ -327,6 +335,10 @@ impl Observer {
 /// Reset card R6B-2. Every request-derived value `classify` would compute is
 /// either carried in the facts or constant for a launch: the kind is `Launch`,
 /// and the requested job id -- which an `ERROR` reply reports back -- is zero.
+#[allow(
+    dead_code,
+    reason = "the response half of `classify`, reached only through `shell_jobs_launch_response`"
+)]
 fn classify_launch_response(
     reservation: Reservation,
     response: &[u8],

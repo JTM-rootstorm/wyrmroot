@@ -2038,6 +2038,63 @@ fn explicit_test_filter(filter: &str) -> Result<String, Failure> {
     Ok(filter.to_owned())
 }
 
+/// `cargo fmt --all --check` on the accepted host rustfmt.
+///
+/// DW1-F/WYR1-F F2B. Closure contract item 9: Wyrmroot had no formatting gate
+/// at all, so eleven files had drifted out of rustfmt shape without anything
+/// saying so, three of them in a role the production product builds.
+pub(crate) fn run_format_gate(repository: &Path) -> Result<(), Failure> {
+    run_cargo(repository, &["fmt", "--all", "--", "--check"])
+}
+
+/// Warnings-denied Clippy over every workspace target in its default shape.
+///
+/// DW1-F/WYR1-F F2B. The per-card `*-clippy` host filters each select one
+/// product's feature combination, which is what they are for; between them no
+/// gate ever linted the default shape of the whole workspace. That is the row
+/// that found a `#[test]` attribute duplicated onto the function above a WYR1-C6
+/// test -- which had therefore not run since -- and two unreached evidence
+/// recorders.
+pub(crate) fn run_clippy_gate(repository: &Path) -> Result<(), Failure> {
+    run_cargo(
+        repository,
+        &[
+            "clippy",
+            "--locked",
+            "--workspace",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
+    )
+}
+
+/// Workspace rustdoc with rustdoc warnings denied.
+///
+/// DW1-F/WYR1-F F2B, closure contract item 9's other half. `RUSTDOCFLAGS` is
+/// set on the child rather than passed to `tools/pinned-cargo`, which rightly
+/// refuses a caller-supplied one: the launcher owns the environment, and this
+/// is the launcher's own xtask setting it for one invocation.
+pub(crate) fn run_rustdoc_gate(repository: &Path) -> Result<(), Failure> {
+    let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let status = Command::new(cargo)
+        .args(["doc", "--locked", "--workspace", "--no-deps"])
+        .env("RUSTDOCFLAGS", "-D warnings")
+        .current_dir(repository)
+        .stdin(Stdio::null())
+        .status()
+        .map_err(|error| Failure::task(format!("could not run Cargo: {error}")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(Failure::task(format!(
+            "rustdoc gate failed with {}",
+            child_status(status.code())
+        )))
+    }
+}
+
 /// `run_cargo` plus the one compile-time variable a selector library needs.
 ///
 /// Only selector 31 reads it, but setting it for the whole set keeps the table

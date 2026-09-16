@@ -12,6 +12,9 @@ Usage:
     cargo xtask audit-i-b <first-request.toml> <second-request.toml>
     cargo xtask gdb <default|smp> --request <wyr0-h-request.toml>
     cargo xtask test host [filter]
+    tools/pinned-cargo xtask format
+    tools/pinned-cargo xtask clippy
+    tools/pinned-cargo xtask doc
     tools/pinned-cargo xtask test host wyr1e3-model
     tools/pinned-cargo xtask test host wyr1e3-clippy
     tools/pinned-cargo xtask test host wyr1e3-native
@@ -120,6 +123,14 @@ wyr1e8-product-model and wyr1e8-product-clippy validate product-owned E8 host co
 wyr1e8-producer-fixture emits the bounded S1 prefix plus actual dispatcher-held driver/registry WAITs, the production registry-recovery orchestrator and publication observer, and real scoped S4 shell ownership.
 These E3-E7 filters do not create a product or run a guest.
 
+`format`, `clippy` and `doc` are the three whole-workspace quality gates.
+`format` is `cargo fmt --all --check` on the accepted host rustfmt, `clippy`
+lints every workspace target with warnings denied, and `doc` builds the
+workspace documentation with rustdoc warnings denied. They take no arguments
+and select no feature: the per-card `*-clippy` host filters cover the feature
+combinations a product selects, and these cover the default shape of
+everything, which no per-card filter does.
+
 The WYR1-F commands own the final DW1-F/WYR1-F normal production product.
 `wyr1f prepare --scenario normal` rebuilds all seven production roles from the
 exact pair, inherits nothing, selects no guest test and produces no evidence:
@@ -182,6 +193,9 @@ pub(crate) enum Action {
     Help,
     Build(BuildScope),
     HostTests(Option<String>),
+    Format,
+    Clippy,
+    Rustdoc,
     BuildG3Image(G3ImageArguments),
     InspectG3Image(G3ImageArguments),
     BuildHImage(String),
@@ -371,6 +385,18 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
         "audit-i-b" => dispatch_i_b_audit(&arguments[1..]),
         "gdb" => dispatch_profile_request(&arguments[1..], true),
         "test" => dispatch_test(&arguments[1..]),
+        "format" => {
+            expect_arity(arguments, 1, "format does not accept arguments")?;
+            Ok(Action::Format)
+        }
+        "clippy" => {
+            expect_arity(arguments, 1, "clippy does not accept arguments")?;
+            Ok(Action::Clippy)
+        }
+        "doc" => {
+            expect_arity(arguments, 1, "doc does not accept arguments")?;
+            Ok(Action::Rustdoc)
+        }
         "wyr1" => dispatch_wyr1(&arguments[1..]),
         "wyr1b" => dispatch_wyr1b(&arguments[1..]),
         "r1" => dispatch_r1(&arguments[1..]),
@@ -1791,6 +1817,33 @@ mod tests {
         assert!(USAGE.contains("tools/pinned-cargo xtask wyr1f inspect --product <directory>"));
         assert!(!USAGE.contains("wyr1f prepare --e6-product"));
         assert!(!USAGE.contains("wyr1f run"));
+    }
+
+    /// DW1-F/WYR1-F F2B. Closure contract item 9: Wyrmroot had no formatting,
+    /// workspace-Clippy or rustdoc gate. Each takes no arguments, because a
+    /// caller-selected feature or target is exactly what the per-card filters
+    /// are for, and a whole-workspace quality gate that could be narrowed by an
+    /// argument is one that can be reported green while narrow.
+    #[test]
+    fn the_three_quality_gates_are_whole_workspace_and_take_no_arguments() {
+        assert_eq!(dispatch(&arguments(&["format"])), Ok(Action::Format));
+        assert_eq!(dispatch(&arguments(&["clippy"])), Ok(Action::Clippy));
+        assert_eq!(dispatch(&arguments(&["doc"])), Ok(Action::Rustdoc));
+        for command in ["format", "clippy", "doc"] {
+            assert!(
+                dispatch(&arguments(&[command, "extra"])).is_err(),
+                "{command}"
+            );
+            assert!(
+                USAGE.contains(&format!("tools/pinned-cargo xtask {command}\n")),
+                "{command}"
+            );
+        }
+        assert!(
+            USAGE.contains(
+                "`format`, `clippy` and `doc` are the three whole-workspace quality gates."
+            )
+        );
     }
 
     #[test]

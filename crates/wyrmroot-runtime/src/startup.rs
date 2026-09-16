@@ -144,7 +144,7 @@ pub const fn startup_error_exit_code(error: StartupError) -> u32 {
 /// # Safety
 ///
 /// `address` must identify the initial, immutable, readable block whose size is selected by
-/// [`startup_block_size`] for the complete call. It must be the initial stack address supplied by
+/// `startup_block_size` for the complete call. It must be the initial stack address supplied by
 /// Deepwyrm rather than an arbitrary userspace pointer.
 #[allow(
     unsafe_code,

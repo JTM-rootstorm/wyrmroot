@@ -14,6 +14,7 @@ mod i_b_closure;
 mod metadata;
 mod provenance;
 mod r1;
+mod rrc_audit;
 mod secure_fs;
 mod sha256;
 mod tasks;
@@ -106,6 +107,21 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
             let repository = tasks::repository_root()?;
             BuildManifest::load(&repository)?;
             tasks::run_host_tests(&repository, filter.as_deref())?;
+            Ok(None)
+        }
+        Action::Format => {
+            let repository = tasks::repository_root()?;
+            tasks::run_format_gate(&repository)?;
+            Ok(None)
+        }
+        Action::Clippy => {
+            let repository = tasks::repository_root()?;
+            tasks::run_clippy_gate(&repository)?;
+            Ok(None)
+        }
+        Action::Rustdoc => {
+            let repository = tasks::repository_root()?;
+            tasks::run_rustdoc_gate(&repository)?;
             Ok(None)
         }
         Action::BuildG3Image(arguments) => g3_image::build(&arguments).map(Some),

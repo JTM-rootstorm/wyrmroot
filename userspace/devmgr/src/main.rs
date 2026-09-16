@@ -1473,10 +1473,10 @@ fn receive_controller(
     let action = match accepted {
         Ok(action) => action,
         Err(_) => {
-            if counts.handles == 1 {
-                if let Some(replacement) = replacement {
-                    let _ = close_handle(replacement);
-                }
+            if counts.handles == 1
+                && let Some(replacement) = replacement
+            {
+                let _ = close_handle(replacement);
             }
             return Err(failure(34));
         }
@@ -2505,9 +2505,7 @@ fn launch_driver_staged(
             correlations.ready_transaction_id,
         )
         .map_err(|_| failure(96))?;
-    if let Err(code) = publish_driver(publication, request, resident) {
-        return Err(code);
-    }
+    publish_driver(publication, request, resident)?;
     Ok(retained.into_raw())
 }
 

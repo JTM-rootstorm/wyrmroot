@@ -132,7 +132,7 @@ pub enum Command<'a> {
     Services,
     Tasks,
     Status,
-    /// `argv` includes the path as child argv[0], without the shell command name.
+    /// `argv` includes the path as child `argv[0]`, without the shell command name.
     Run {
         path: &'a str,
         argv: Arguments<'a>,
