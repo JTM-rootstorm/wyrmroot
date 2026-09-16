@@ -872,8 +872,13 @@ where
         .ok_or(InitError::WrongActivationOrder)?;
     let registry = state.registry.ok_or(InitError::WrongActivationOrder)?;
     let e6 = state.e6.as_mut().ok_or(InitError::WrongActivationOrder)?;
+    // R7B-4 class D1e. This gate used to carry a second reason -- a parked WAIT
+    // reply -- which R6C's argument retires: the reply sits in ordinary
+    // `pending_waits` storage and `e8_wait_is_held` refuses to answer it twice,
+    // so nothing needs the dispatcher stopped for it. What remains is evidence
+    // adjacency, which is a real obligation and keeps its own name.
     #[cfg(feature = "wyr1e8-selector33")]
-    let poll_shell_jobs = e6.shell.job_dispatcher_poll_allowed();
+    let poll_shell_jobs = !e6.shell.e8_tuple_waiting_for_serial();
     #[cfg(not(feature = "wyr1e8-selector33"))]
     let poll_shell_jobs = true;
     if poll_shell_jobs {

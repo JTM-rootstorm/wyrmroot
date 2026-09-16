@@ -60,17 +60,19 @@ fn e8_shell_ready_requires_matching_tuple_and_authenticated_serial_facts() {
     let observe = poll.find("observe_e8_serial_ready(").unwrap();
     assert!(facts < observe);
     assert!(poll.contains("bundle_generation: facts.bundle_generation"));
-    assert!(poll.contains("e6.shell.job_dispatcher_poll_allowed()"));
+    assert!(poll.contains("!e6.shell.e8_tuple_waiting_for_serial()"));
+    // R7B-4 class D1e. The dispatcher admission carries one reason, evidence
+    // adjacency, and the held WAIT is no longer one of them. Assert the
+    // negative too: re-adding `e8_held` here would restore the bundling
+    // without changing how the call site reads.
     let admission = &JOBS[JOBS
-        .find("pub(crate) const fn job_dispatcher_poll_allowed")
+        .find("pub(crate) const fn e8_tuple_waiting_for_serial")
         .unwrap()
         ..JOBS
             .find("pub(crate) const fn routine_console_relaunch_allowed")
             .unwrap()];
-    assert!(
-        admission
-            .contains("self.e8_held.is_none() && !self.e8_evidence.tuple_waiting_for_serial()")
-    );
+    assert!(admission.contains("self.e8_evidence.tuple_waiting_for_serial()"));
+    assert!(!admission.contains("self.e8_held"));
 
     let launch = &JOBS[JOBS.find("fn dispatch_one_job_request_inner").unwrap()
         ..JOBS.find("pub(crate) fn poll_job_dispatcher").unwrap()];

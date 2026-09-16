@@ -382,14 +382,26 @@ impl ShellControllerState {
         self.e8_evidence.ready()
     }
 
+    /// Whether an evidence tuple is written but not yet closed by its serial
+    /// line.
+    ///
+    /// The shell-jobs dispatcher must not run while this holds: a tuple is two
+    /// records that the protocol requires adjacent, and dispatching between
+    /// them would interleave a third. This is an evidence-ordering obligation
+    /// and nothing else.
+    ///
+    /// R7B-4 class D1e. Until now this reason shared a predicate,
+    /// `job_dispatcher_poll_allowed`, with `e8_held.is_none()` -- a parked
+    /// WAIT reply. Those are unrelated: one protects record adjacency, the
+    /// other suppressed polling while a reply waited. R6C's argument is that a
+    /// parked reply needs no such suppression, because the reply is parked in
+    /// ordinary `pending_waits` storage and `e8_wait_is_held` already refuses
+    /// to answer it twice. So that half is retired and this half is named for
+    /// what it is. D1e's other two predicates were not retired with it: they
+    /// are console-lifecycle ownership, which R6C's argument does not reach.
     #[cfg(feature = "wyr1e8-selector33")]
     pub(crate) const fn e8_tuple_waiting_for_serial(&self) -> bool {
         self.e8_evidence.tuple_waiting_for_serial()
-    }
-
-    #[cfg(feature = "wyr1e8-selector33")]
-    pub(crate) const fn job_dispatcher_poll_allowed(&self) -> bool {
-        self.e8_held.is_none() && !self.e8_evidence.tuple_waiting_for_serial()
     }
 
     #[cfg(feature = "wyr1e8-selector33")]
@@ -11464,7 +11476,12 @@ mod tests {
     fn e8_action_keeps_its_deadline_across_preheld_held_and_recovery_states() {
         let mut state = e8_state_for_held_wait(40);
         assert_eq!(state.recovery_deadline(), Some(200));
-        assert!(state.job_dispatcher_poll_allowed());
+        // The dispatcher admission is asserted at each step below and never
+        // changes: R7B-4's D1e retired the held-wait suppression, so parking a
+        // WAIT no longer stops the shell-jobs dispatcher. Console relaunch
+        // stays suppressed throughout, because that predicate is episode
+        // ownership and was deliberately left alone.
+        assert!(!state.e8_tuple_waiting_for_serial());
         assert!(!state.routine_console_relaunch_allowed());
         assert!(!state.recovery_deadline_expired(199));
         assert!(state.recovery_deadline_expired(200));
@@ -11482,7 +11499,7 @@ mod tests {
             Ok(true)
         );
         let held = state.e8_held.unwrap();
-        assert!(!state.job_dispatcher_poll_allowed());
+        assert!(!state.e8_tuple_waiting_for_serial());
         assert!(!state.routine_console_relaunch_allowed());
         assert_eq!(held.deadline, 200);
         assert_eq!(
@@ -11494,12 +11511,12 @@ mod tests {
             state.accept_e8_quiesced(held.identity, 199),
             Ok(E8RecoveryAction::Driver)
         );
-        assert!(!state.job_dispatcher_poll_allowed());
+        assert!(!state.e8_tuple_waiting_for_serial());
         assert!(!state.routine_console_relaunch_allowed());
         let taken = state.e8_held_for_action(E8RecoveryAction::Driver).unwrap();
         assert_eq!(taken.deadline, 200);
         state.consume_e8_held(taken);
-        assert!(state.job_dispatcher_poll_allowed());
+        assert!(!state.e8_tuple_waiting_for_serial());
         assert!(!state.routine_console_relaunch_allowed());
         assert_eq!(state.recovery_deadline(), Some(200));
         assert_eq!(state.e8_pending_action(), Some(E8RecoveryAction::Driver));
