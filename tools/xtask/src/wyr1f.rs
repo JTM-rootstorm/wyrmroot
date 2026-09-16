@@ -1287,11 +1287,14 @@ fn validate_request(f: &BTreeMap<String, String>) -> Result<(), Failure> {
             return Err(Failure::task(format!("WYR1-F {k} path drifted")));
         }
     }
+    let esp = format!("artifacts/{}", esp_name(product_kind));
     for (k, v) in [
         ("receipt", "freeze-receipt.toml"),
         ("result_schema", "result-schema.toml"),
         ("source_receipt", "artifacts/f-source-build.toml"),
-        ("esp", "artifacts/wyr1f-normal-esp.img"),
+        // The ESP names its product, so a sibling's image cannot be presented
+        // under this request.
+        ("esp", esp.as_str()),
     ] {
         if field(f, k)? != v {
             return Err(Failure::task(format!("WYR1-F {k} path drifted")));
