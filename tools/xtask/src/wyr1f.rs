@@ -249,15 +249,19 @@ pub(crate) fn inspect(product: &Path) -> Result<String, Failure> {
             return Err(Failure::task(format!("WYR1-F {key} reconstruction failed")));
         }
     }
-    let gate = wyr1c6::read_regular_bounded(
-        &product.join(field(&request, "gate_config")?),
-        64 * 1024,
-        "WYR1-F gate configuration",
+    // Rebuilt from the declared product, not compared with one literal. The
+    // production configuration is deliberately unparseable; an instrumented
+    // one carries the frozen selector/test-id pair, its scenario and a nonzero
+    // nonce. F1B.5 found this reading the production literal for every
+    // product, which is also how the degraded product came to freeze it.
+    let declared = product_kind.gate_config(
+        wyr1c::wyr1f_kernel_evidence_nonce(product_kind, &gate_config)?.as_deref(),
     )?;
-    if gate != wyr1c::WYR1F_NORMAL_GATE_CONFIG {
-        return Err(Failure::task(
-            "WYR1-F gate configuration is not the frozen normal production configuration",
-        ));
+    if gate_config != declared {
+        return Err(Failure::task(format!(
+            "WYR1-F gate configuration is not the frozen {} configuration",
+            product_kind.cli_value()
+        )));
     }
     for (key, _) in ARTIFACTS {
         let bytes = wyr1c6::read_regular_bounded(
@@ -511,7 +515,7 @@ fn build_produced(
         ("consoled.elf", native("consoled")?),
         ("wyrmsh.elf", native("wyrmsh")?),
         ("hello.elf", native("hello")?),
-        ("wyr1-a-gate-v1.bin", wyr1c::WYR1F_NORMAL_GATE_CONFIG),
+        ("wyr1-a-gate-v1.bin", gate_config),
         ("rrc-f-v1.bin", product.rrc_manifest.as_slice()),
         ("wrdm-f-v1.bin", product.device_manifest.as_slice()),
         ("launch-policy-f-v1.bin", product.launch_policy.as_slice()),
