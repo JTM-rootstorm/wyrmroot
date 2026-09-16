@@ -348,7 +348,10 @@ pub(crate) fn inspect(product: &Path) -> Result<String, Failure> {
         return Err(Failure::task("WYR1-F source receipt is not canonical"));
     }
     Ok(format!(
-        "WYR1_F_INSPECT_PASS product=wyr1-f-normal scenario=normal selector=none wyrmroot_revision={revision} bootfs_sha256={}\n",
+        "WYR1_F_INSPECT_PASS product={} scenario={} selector={} wyrmroot_revision={revision} bootfs_sha256={}\n",
+        field(&request, "product")?,
+        field(&request, "scenario")?,
+        field(&request, "selector")?,
         sha256::bytes_digest(&assembled.bootfs)
     ))
 }
