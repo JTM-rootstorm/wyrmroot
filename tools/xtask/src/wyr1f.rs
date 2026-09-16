@@ -662,9 +662,11 @@ fn kernel_build_command(
         // kernel identical across the matched siblings, and this variable
         // reaches the kernel ELF, so two different nonces would make the
         // kernels differ and fail inspection.
+        // Only the selector name. `DEEPWYRM_GUEST_TEST_ID` is build-owned --
+        // the pinned launcher refuses it outright -- and the id is derived
+        // from the harness manifest, which is where 35 is registered.
         command
             .env("DEEPWYRM_GUEST_TEST_SELECTOR", wyr1c::WYR1F_SELECTOR)
-            .env("DEEPWYRM_GUEST_TEST_ID", wyr1c::WYR1F_TEST_ID)
             .env("DEEPWYRM_WYR1E7_EVIDENCE_NONCE", nonce);
     }
     command
@@ -2136,17 +2138,16 @@ mod tests {
                 set.get("DEEPWYRM_GUEST_TEST_SELECTOR").map(String::as_str),
                 Some(wyr1c::WYR1F_SELECTOR)
             );
-            assert_eq!(
-                set.get("DEEPWYRM_GUEST_TEST_ID").map(String::as_str),
-                Some(wyr1c::WYR1F_TEST_ID)
-            );
-            // The selector pair, its WRE1 evidence nonce, and the target
+            // The id is never set: it is build-owned, derived from the
+            // manifest entry the selector name selects.
+            assert!(!set.contains_key("DEEPWYRM_GUEST_TEST_ID"));
+            // The selector, its WRE1 evidence nonce, and the target
             // directory. Nothing else.
             assert_eq!(
                 set.get("DEEPWYRM_WYR1E7_EVIDENCE_NONCE").map(String::as_str),
                 Some(NONCE)
             );
-            assert_eq!(set.len(), 4, "no fifth variable is set");
+            assert_eq!(set.len(), 3, "no fourth variable is set");
             instrumented.push(set);
         }
         assert_eq!(instrumented[0], instrumented[1]);
