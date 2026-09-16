@@ -967,7 +967,7 @@ fn freeze(
     let request_hash = sha256::bytes_digest(request.as_bytes());
     wyr1c6::write_new(
         &output.join("result-schema.toml"),
-        result_schema()?.as_bytes(),
+        result_schema(product_kind)?.as_bytes(),
         "result schema",
     )?;
     let receipt = receipt_fields(&request_hash, &fields);
@@ -1244,36 +1244,64 @@ fn request_keys(product_kind: wyr1c::Wyr1fProduct) -> Vec<String> {
     keys
 }
 
-fn result_schema() -> Result<String, Failure> {
-    let keys = result_keys();
+/// The live-run result grammar, per product.
+///
+/// DW1-F/WYR1-F F3A.2. This used to take no argument and hardcode the
+/// production product's `product`, `scenario`, `selector` and `evidence`, so
+/// all three prepared products carried the byte-identical file -- and `inspect`
+/// re-renders it and refuses a product whose copy differs, which made the
+/// production shape *required* of the other two. The degraded product was
+/// obliged to declare `scenario = "normal"`, and the instrumented sibling, the
+/// only product that produces evidence, was obliged to declare
+/// `evidence = "not-produced"` and had nowhere to record any.
+///
+/// The four identity values are read out of [`fixed_fields`] rather than spelled
+/// again here. A result that disagrees with its own request about which product
+/// it is would otherwise be expressible, and that is precisely the mistake this
+/// function used to institutionalise.
+fn result_schema(product_kind: wyr1c::Wyr1fProduct) -> Result<String, Failure> {
+    let keys = result_keys(product_kind);
+    let fixed = fixed_fields(product_kind);
+    let from_request = |name: &str| -> Result<String, Failure> {
+        fixed
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| (*value).to_owned())
+            .ok_or_else(|| Failure::task(format!("WYR1-F result schema cannot source `{name}`")))
+    };
     let mut f = BTreeMap::new();
     for key in &keys {
         let key = key.as_str();
-        f.insert(
-            key.into(),
-            match key {
-                "kind" => RESULT_KIND.into(),
-                "schema_version" => "1".into(),
-                "product" => "wyr1-f-normal".into(),
-                "scenario" => "normal".into(),
-                "selector" => "none".into(),
-                "evidence" => "not-produced".into(),
-                "shutdown_byte_hex" => "04".into(),
-                "acceptance" => "pass".into(),
-                _ => format!("<runner:{key}>"),
-            },
-        );
+        let value = match key {
+            "kind" => RESULT_KIND.into(),
+            "schema_version" => "1".into(),
+            "product" | "scenario" | "selector" | "evidence" | "evidence_protocol" => {
+                from_request(key)?
+            }
+            "shutdown_byte_hex" => "04".into(),
+            "acceptance" => "pass".into(),
+            _ => format!("<runner:{key}>"),
+        };
+        f.insert(key.into(), value);
     }
     render(&f, &keys, ScalarSchema::ResultTemplate)
 }
 
 /// The live-run result grammar this product's runner must fill in.
 ///
-/// Deliberately much smaller than `wyr1e8::result_keys`: every WRE1 evidence,
-/// scenario-episode and backpressure field there belongs to selector 33's
-/// acceptance surface, and this product emits no evidence at all.
-fn result_keys() -> Vec<String> {
-    [
+/// DW1-F/WYR1-F F3A.2. The previous list had 28 keys, and four of the plan's
+/// thirteen F3A proof obligations had a field to land in: `prompt_reached`,
+/// `status_output_sha256`, `services_output_sha256` and the shell-exit pair.
+/// Roles reaching READY in dependency order, COM1 and COM2 staying distinct,
+/// the nonce `echo`, `tasks`, `run bin/hello`, CPU-hog fairness and every one
+/// of the five DEGRADED obligations had nowhere to go, so a runner could report
+/// `acceptance = "pass"` having proven a third of the card.
+///
+/// Every key here is fillable from what a run actually produces: the COM1 and
+/// COM2 transcripts, and for an instrumented sibling the WRE1 evidence stream.
+/// Nothing is listed that the runner would have to invent.
+fn result_keys(product_kind: wyr1c::Wyr1fProduct) -> Vec<String> {
+    let mut keys: Vec<&'static str> = vec![
         "kind",
         "schema_version",
         "product",
@@ -1293,19 +1321,69 @@ fn result_keys() -> Vec<String> {
         "com2_full_length",
         "com2_full_sha256",
         "shutdown_byte_hex",
+        // The production bring-up proof. `roles_ready_order` is the observed
+        // READY sequence as one comma-separated list rather than five booleans:
+        // the obligation is dependency *order*, and five independent flags
+        // cannot express a wrong one.
+        "roles_ready_order",
+        "roles_ready_count",
+        // COM1 is the trusted diagnostic serial line and COM2 the shell byte
+        // stream. That they stay distinct is an obligation, not an assumption:
+        // a console that leaked onto COM1 would still produce a prompt.
+        "com1_com2_distinct",
         "prompt_reached",
-        "status_output_sha256",
+        "nonce_echo_nonce",
+        "nonce_echo_status",
         "services_output_sha256",
+        "status_output_sha256",
+        "tasks_output_sha256",
+        "hello_stdout_sha256",
+        "hello_exit_status",
+        "prompt_after_hello",
         "shell_exit_status",
         "shell_restart_generation",
         "qemu_exit",
         "post_run_inspect_result",
         "domain_restored",
-        "acceptance",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect()
+    ];
+    match product_kind {
+        // The normal scenario owes the fairness proof. It is meaningful only at
+        // `smp`, but the key exists in both profiles' grammar so that a UP
+        // result has to say what it observed rather than omit the question.
+        wyr1c::Wyr1fProduct::Normal | wyr1c::Wyr1fProduct::InstrumentedNormal => {
+            keys.extend([
+                "cpu_hog_jobs",
+                "shell_responses_under_hogs",
+                "shell_progress_bounded",
+            ]);
+        }
+        // Contract §5.4's declared episode. `degraded_transitions` must be one
+        // -- entering DEGRADED twice is a different failure from never entering
+        // it -- and `degraded_retry_attempts` is what makes "no infinite retry"
+        // a number rather than an impression.
+        wyr1c::Wyr1fProduct::Degraded => {
+            keys.extend([
+                "degraded_transitions",
+                "degraded_retry_attempts",
+                "shell_usable_in_degraded",
+                "degraded_admin_nonce",
+                "degraded_admin_status",
+                "degraded_exit_restart_generation",
+                "degraded_exit_restart_bounded",
+            ]);
+        }
+    }
+    if product_kind.is_instrumented() {
+        keys.extend([
+            "evidence_protocol",
+            "evidence_nonce",
+            "expected_evidence_records",
+            "evidence_records",
+            "evidence_sha256",
+        ]);
+    }
+    keys.push("acceptance");
+    keys.into_iter().map(str::to_owned).collect()
 }
 
 /// Which product a request declares itself to be.
@@ -1409,7 +1487,7 @@ fn validate_frozen_metadata(
         64 * 1024,
         "WYR1-F result schema",
     )?;
-    if result_schema_bytes != result_schema()?.as_bytes() {
+    if result_schema_bytes != result_schema(product_kind)?.as_bytes() {
         return Err(Failure::task("WYR1-F result schema drifted"));
     }
     let request_hash = sha256::bytes_digest(&wyr1c6::read_regular_bounded(
@@ -1932,27 +2010,133 @@ mod tests {
         );
     }
 
+    /// DW1-F/WYR1-F F3A.2. The predecessor of this test asserted that the
+    /// grammar was "evidence free" and nonce free for *every* product, which is
+    /// how the production shape came to be required of the two siblings that
+    /// are neither. What is actually true is per product, so this checks each
+    /// one against its own request rather than all three against one shape.
     #[test]
-    fn the_result_schema_is_ordered_and_evidence_free() {
-        let keys = result_keys();
-        assert_eq!(
-            keys.iter().cloned().collect::<BTreeSet<_>>().len(),
-            keys.len()
-        );
-        assert_eq!(keys.last().map(String::as_str), Some("acceptance"));
-        for key in &keys {
-            assert!(!key.contains("evidence_record"), "{key}");
-            assert!(!key.contains("nonce"), "{key}");
+    fn each_product_gets_the_result_grammar_its_own_request_implies() {
+        use wyr1c::Wyr1fProduct;
+        for product_kind in [
+            Wyr1fProduct::Normal,
+            Wyr1fProduct::InstrumentedNormal,
+            Wyr1fProduct::Degraded,
+        ] {
+            let keys = result_keys(product_kind);
+            assert_eq!(
+                keys.iter().cloned().collect::<BTreeSet<_>>().len(),
+                keys.len(),
+                "{product_kind:?} repeats a key"
+            );
+            assert_eq!(keys.last().map(String::as_str), Some("acceptance"));
+            let rendered = result_schema(product_kind).unwrap();
+            assert!(rendered.contains("schema_version = \"1\"\n"));
+            assert!(rendered.ends_with("acceptance = \"pass\"\n"));
+            // Every identity value agrees with the request's, because it is
+            // read from the same table rather than spelled twice.
+            let fixed = fixed_fields(product_kind);
+            for name in ["product", "scenario", "selector", "evidence"] {
+                let expected = fixed
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| *value)
+                    .unwrap();
+                assert!(
+                    rendered.contains(&format!("{name} = \"{expected}\"\n")),
+                    "{product_kind:?} {name}: {rendered}"
+                );
+            }
+            // The plan's thirteen F3A obligations, each with somewhere to land.
+            for key in [
+                "roles_ready_order",
+                "com1_com2_distinct",
+                "prompt_reached",
+                "nonce_echo_status",
+                "services_output_sha256",
+                "status_output_sha256",
+                "tasks_output_sha256",
+                "hello_stdout_sha256",
+                "hello_exit_status",
+                "shell_exit_status",
+                "shell_restart_generation",
+            ] {
+                assert!(
+                    keys.iter().any(|k| k == key),
+                    "{product_kind:?} lacks {key}"
+                );
+            }
         }
-        let rendered = result_schema().unwrap();
-        assert!(rendered.contains("evidence = \"not-produced\"\n"));
-        assert!(rendered.contains("selector = \"none\"\n"));
+    }
+
+    /// The scenario-specific halves, and the one property that made the old
+    /// grammar wrong: an evidence-producing product must have somewhere to
+    /// record evidence, and a product that produces none must not.
+    #[test]
+    fn the_scenario_and_evidence_halves_are_where_they_belong() {
+        use wyr1c::Wyr1fProduct;
+        let normal = result_keys(Wyr1fProduct::Normal);
+        let instrumented = result_keys(Wyr1fProduct::InstrumentedNormal);
+        let degraded = result_keys(Wyr1fProduct::Degraded);
+
+        for keys in [&normal, &instrumented] {
+            assert!(keys.iter().any(|k| k == "cpu_hog_jobs"));
+            assert!(!keys.iter().any(|k| k.starts_with("degraded_")));
+        }
+        for key in [
+            "degraded_transitions",
+            "degraded_retry_attempts",
+            "shell_usable_in_degraded",
+            "degraded_admin_status",
+            "degraded_exit_restart_bounded",
+        ] {
+            assert!(degraded.iter().any(|k| k == key), "{key}");
+        }
+        assert!(!degraded.iter().any(|k| k == "cpu_hog_jobs"));
+
+        // The production product produces no evidence and gets no field for
+        // any; both instrumented siblings produce it and get five.
+        assert!(!normal.iter().any(|k| k.starts_with("evidence_")));
+        for keys in [&instrumented, &degraded] {
+            for key in [
+                "evidence_protocol",
+                "evidence_nonce",
+                "expected_evidence_records",
+                "evidence_records",
+                "evidence_sha256",
+            ] {
+                assert!(keys.iter().any(|k| k == key), "{key}");
+            }
+        }
         assert!(
-            rendered.contains("post_run_inspect_result = \"<runner:post_run_inspect_result>\"\n")
+            result_schema(Wyr1fProduct::Normal)
+                .unwrap()
+                .contains("evidence = \"not-produced\"\n")
         );
-        assert!(rendered.ends_with("acceptance = \"pass\"\n"));
-        // The result template is untyped text; nothing is silently coerced.
-        assert!(rendered.contains("schema_version = \"1\"\n"));
+        assert!(
+            result_schema(Wyr1fProduct::Degraded)
+                .unwrap()
+                .contains("evidence = \"produced\"\n")
+        );
+        assert!(
+            result_schema(Wyr1fProduct::Degraded)
+                .unwrap()
+                .contains("scenario = \"degraded_recovery\"\n")
+        );
+    }
+
+    /// The three grammars must differ. The defect F3A.2 corrects was that they
+    /// did not: all three prepared products carried the byte-identical file,
+    /// and `inspect` re-rendered the production shape and refused anything else.
+    #[test]
+    fn the_three_products_do_not_share_one_result_schema() {
+        use wyr1c::Wyr1fProduct;
+        let normal = result_schema(Wyr1fProduct::Normal).unwrap();
+        let instrumented = result_schema(Wyr1fProduct::InstrumentedNormal).unwrap();
+        let degraded = result_schema(Wyr1fProduct::Degraded).unwrap();
+        assert_ne!(normal, instrumented);
+        assert_ne!(normal, degraded);
+        assert_ne!(instrumented, degraded);
     }
 
     #[test]
