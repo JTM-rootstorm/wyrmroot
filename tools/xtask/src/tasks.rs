@@ -1660,6 +1660,30 @@ fn host_test_commands(filter: Option<&str>) -> Result<Vec<Vec<String>>, Failure>
     // feature that compiles the declared post-console failure episode, so it
     // needs a gate of its own: every other row builds the production shape,
     // which is exactly the shape that must not contain it.
+    // The one production role binary a host lint can reach, in the exact
+    // feature shape it ships in.
+    //
+    // DW1-F/WYR1-F F2B. `wyr1f-clippy` lints `--lib`, and devmgr's role logic
+    // is mostly not in the library: 3095 lines of `main.rs` against 1956 of
+    // `lib.rs`. F2B.2's `--all-targets` workspace row does build that binary --
+    // it is where two of F2B's findings came from -- but in the crate's
+    // *default* feature shape, which is `default = []`, not the
+    // `wyr1e8-production` shape that reaches a product.
+    //
+    // It is one row rather than seven because devmgr is the only role binary
+    // whose `main.rs` is `#![cfg_attr(target_os = "wyrmroot", no_std)]`. The
+    // other six are unconditionally `#![no_std]` with their own
+    // `#[panic_handler]`, so no host build of them exists to lint -- they are
+    // out of reach for the same reason as closure contract item 20, by a
+    // different mechanism. `wyr1f-native` compiles them for the guest target
+    // with `rustc`, which is type checking and no lint at all.
+    if matches!(filter, Some("wyr1f-role-clippy")) {
+        return Ok(vec![role_binary_lint_command(
+            "wyrmroot-devmgr",
+            "devmgr",
+            "wyr1e8-production",
+        )]);
+    }
     if matches!(filter, Some("wyr1f-model" | "wyr1f-clippy")) {
         let lint = filter.is_some_and(|value| value.ends_with("clippy"));
         return Ok([
@@ -2036,6 +2060,27 @@ fn explicit_test_filter(filter: &str) -> Result<String, Failure> {
     let filter = filter.strip_prefix("test:").unwrap_or(filter);
     validate_filter(filter)?;
     Ok(filter.to_owned())
+}
+
+/// One warnings-denied Clippy row for a production role binary.
+fn role_binary_lint_command(package: &str, binary: &str, features: &str) -> Vec<String> {
+    [
+        "clippy",
+        "--locked",
+        "--offline",
+        "--package",
+        package,
+        "--bin",
+        binary,
+        "--features",
+        features,
+        "--",
+        "-D",
+        "warnings",
+    ]
+    .iter()
+    .map(|argument| (*argument).to_owned())
+    .collect()
 }
 
 /// `cargo fmt --all --check` on the accepted host rustfmt.

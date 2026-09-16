@@ -43,6 +43,7 @@ Usage:
     tools/pinned-cargo xtask test host wyr1f-model
     tools/pinned-cargo xtask test host wyr1f-native
     tools/pinned-cargo xtask test host wyr1f-clippy
+    tools/pinned-cargo xtask test host wyr1f-role-clippy
     tools/pinned-cargo xtask test host wyr1e8-actors-native
     tools/pinned-cargo xtask test host wyr1e8-product-model
     tools/pinned-cargo xtask test host wyr1e8-product-clippy
@@ -115,6 +116,10 @@ WYR1-E8 model/clippy covers the current recovery services, two additive actors, 
 wyr1e8-native compiles that exact selected E8 native artifact set.
 wyr1f-model and wyr1f-clippy build the DW1-F/WYR1-F instrumented artifact set,
 the only shape that compiles the declared post-console failure episode.
+wyr1f-role-clippy lints devmgr's role binary in the `wyr1e8-production` shape it
+ships in. `wyr1f-clippy` lints `--lib`, which for devmgr is the smaller half,
+and devmgr is the only role binary a host build can reach: the other six are
+unconditionally `#![no_std]` with their own panic handler.
 wyr1f-native compiles both F role sets for the native target. The role binaries
 are built for x86_64-unknown-wyrmroot only, so every other gate reads their
 source as text; without this one a native-only type error reaches a product.
@@ -1844,6 +1849,21 @@ mod tests {
                 "`format`, `clippy` and `doc` are the three whole-workspace quality gates."
             )
         );
+    }
+
+    /// DW1-F/WYR1-F F2B. The production role binary row exists because
+    /// `wyr1f-clippy` lints `--lib` and devmgr's role logic is mostly not
+    /// there. Pinned as a named filter so it cannot be dropped silently.
+    #[test]
+    fn the_production_role_binary_has_its_own_lint_filter() {
+        assert_eq!(
+            dispatch(&arguments(&["test", "host", "wyr1f-role-clippy"])),
+            Ok(Action::HostTests(Some("wyr1f-role-clippy".to_owned())))
+        );
+        assert!(USAGE.contains("tools/pinned-cargo xtask test host wyr1f-role-clippy\n"));
+        assert!(USAGE.contains(
+            "the other six are\nunconditionally `#![no_std]` with their own panic handler."
+        ));
     }
 
     #[test]
