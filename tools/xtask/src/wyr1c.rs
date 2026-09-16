@@ -517,6 +517,81 @@ const WYR1E8_SELECTED_NATIVE_SPECS: [NativeSpec; 10] = [
     },
 ];
 
+/// The DW1-F/WYR1-F final production artifact set.
+///
+/// This is deliberately not `WYR1E6_PRODUCT_NATIVE_SPECS`. That set is the E6
+/// production baseline and predates E8's *production* recovery work, so reusing
+/// it would ship a final product missing behaviour the reached implementation
+/// already has. Two artifacts differ, and neither difference is
+/// instrumentation:
+///
+/// - `devmgr` takes `wyr1e8-production`, which is `["wyr1e-production"]` plus
+///   the D5 controller message set and `RequestRetire` handling.
+/// - `consoled` takes `wyr1e8-recovery`, which is `["wyr1e-wyrmsh"]` plus the
+///   console-side recovery path.
+///
+/// Neither pulls a `*-test-evidence` feature, unlike `dw1e3-selector31`.
+///
+/// `system-init` stays on `wyr1e-production`. Its E8 recovery machinery is
+/// reachable only through `wyr1e8-selector33`, which drags in the test-actor
+/// crate and the evidence path, and the episode it drives has no ordinary-boot
+/// entry point: `e8_trigger_from_launch` opens one only from a ShellJobs launch
+/// of a test actor carrying a nonce-derived token. That machinery is acceptance
+/// content and stays out of the production artifact.
+///
+/// Recorded in `DW1F_WYR1F_F1A1_IMPLEMENTATION_MAP.md` §§1.1, 1.2 and 2.
+const WYR1F_PRODUCT_NATIVE_SPECS: [NativeSpec; 7] = [
+    NativeSpec {
+        label: "system-init",
+        package: "wyrmroot-system-init",
+        binary: "system-init",
+        features: "wyr1e-production",
+        artifact: "system-init",
+    },
+    NativeSpec {
+        label: "registryd",
+        package: "wyrmroot-registryd",
+        binary: "registryd",
+        features: "native-registryd",
+        artifact: "registryd",
+    },
+    NativeSpec {
+        label: "devmgr",
+        package: "wyrmroot-devmgr",
+        binary: "devmgr",
+        features: "wyr1e8-production",
+        artifact: "devmgr",
+    },
+    NativeSpec {
+        label: "uart16550d",
+        package: "wyrmroot-uart16550d",
+        binary: "uart16550d",
+        features: "native-uart16550d",
+        artifact: "uart16550d",
+    },
+    NativeSpec {
+        label: "consoled",
+        package: "wyrmroot-consoled",
+        binary: "consoled",
+        features: "native-consoled,wyr1e-wyrmsh,wyr1e8-recovery",
+        artifact: "consoled",
+    },
+    NativeSpec {
+        label: "wyrmsh",
+        package: "wyrmroot-wyrmsh",
+        binary: "wyrmsh",
+        features: "native-wyrmsh",
+        artifact: "wyrmsh",
+    },
+    NativeSpec {
+        label: "hello",
+        package: "wyrmroot-hello",
+        binary: "wyrmroot-stream-hello",
+        features: "native-stream-hello",
+        artifact: "wyrmroot-stream-hello",
+    },
+];
+
 const E3B_NATIVE_CHECK_ENVIRONMENT: [(&str, &str); 3] = [
     ("DEEPWYRM_DW1E_EVIDENCE_NONCE", "E300000000000001"),
     ("WYRMROOT_DW1E3_CHALLENGE_1_NONCE", "E300000000000002"),
@@ -4287,6 +4362,27 @@ fn e8_native_spec(label: &str) -> Result<NativeSpec, Failure> {
         .ok_or_else(|| Failure::task("unknown WYR1-E8 native artifact label"))
 }
 
+/// Looks one artifact up in the final production set.
+///
+/// Unlike `e7_native_spec`/`e8_native_spec` this deliberately does **not**
+/// chain `WYR1E6_PRODUCT_NATIVE_SPECS` as a fallback: the final product has no
+/// second set to fall back to, and a label that is not in the final set is a
+/// mistake rather than an inherited artifact.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "F1A.2 fixes the final artifact set; its caller is the F1A.3 assembler"
+    )
+)]
+fn wyr1f_native_spec(label: &str) -> Result<NativeSpec, Failure> {
+    WYR1F_PRODUCT_NATIVE_SPECS
+        .iter()
+        .copied()
+        .find(|spec| spec.label == label)
+        .ok_or_else(|| Failure::task("unknown WYR1-F native artifact label"))
+}
+
 fn native_command(spec: NativeSpec) -> String {
     format!(
         "cargo build --offline --locked --release --target {NATIVE_TARGET} --package {} --bin {} --no-default-features --features {}",
@@ -4598,6 +4694,121 @@ fn hex_digest(value: &[u8; 32]) -> String {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// F1A.2. The final product is the seven production roles and nothing else.
+    ///
+    /// A test actor reaching this set is the failure the F0A contract's §2
+    /// forbids, so assert the membership by package name rather than by count
+    /// alone -- a count check would pass if an actor replaced `hello`.
+    #[test]
+    fn wyr1f_product_set_is_exactly_the_production_roles() {
+        let labels: Vec<&str> = WYR1F_PRODUCT_NATIVE_SPECS
+            .iter()
+            .map(|spec| spec.label)
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "system-init",
+                "registryd",
+                "devmgr",
+                "uart16550d",
+                "consoled",
+                "wyrmsh",
+                "hello"
+            ]
+        );
+        for spec in WYR1F_PRODUCT_NATIVE_SPECS {
+            assert_ne!(
+                spec.package, "wyrmroot-wyr1e-test-actors",
+                "{} is a test actor and cannot be production content",
+                spec.label
+            );
+            assert_ne!(
+                spec.package, "wyrmroot-wyr1-retained-stubs",
+                "{} would ship a retained stub as a production role",
+                spec.label
+            );
+        }
+    }
+
+    /// F1A.2. No production artifact may carry an evidence or selector feature.
+    ///
+    /// This is the contract's §3.2 rule expressed where it can actually fail:
+    /// the feature strings the final product compiles with.
+    #[test]
+    fn wyr1f_product_set_carries_no_selector_or_evidence_feature() {
+        for spec in WYR1F_PRODUCT_NATIVE_SPECS {
+            for feature in spec.features.split(',') {
+                assert!(
+                    !feature.contains("selector"),
+                    "{} carries selector feature {feature}",
+                    spec.label
+                );
+                assert!(
+                    !feature.contains("test-evidence"),
+                    "{} carries evidence feature {feature}",
+                    spec.label
+                );
+            }
+        }
+    }
+
+    /// F1A.2. The two places the final set must diverge from the E6 baseline.
+    ///
+    /// E6 predates E8's production recovery work. If someone later "simplifies"
+    /// the final set back onto `WYR1E6_PRODUCT_NATIVE_SPECS`, the product
+    /// silently loses devmgr's D5 retire path and consoled's recovery path.
+    /// Assert both the difference and the sameness of everything else, so this
+    /// test also fails if an unintended third divergence appears.
+    #[test]
+    fn wyr1f_diverges_from_e6_only_where_e8_added_production_behaviour() {
+        for spec in WYR1F_PRODUCT_NATIVE_SPECS {
+            let e6 = WYR1E6_PRODUCT_NATIVE_SPECS
+                .iter()
+                .find(|candidate| candidate.label == spec.label)
+                .unwrap_or_else(|| panic!("E6 has no {} artifact", spec.label));
+            assert_eq!(spec.package, e6.package, "{} package drifted", spec.label);
+            assert_eq!(spec.binary, e6.binary, "{} binary drifted", spec.label);
+            match spec.label {
+                "devmgr" => {
+                    assert_eq!(e6.features, "wyr1e-production");
+                    assert_eq!(spec.features, "wyr1e8-production");
+                }
+                "consoled" => {
+                    assert_eq!(e6.features, "native-consoled,wyr1e-wyrmsh");
+                    assert_eq!(spec.features, "native-consoled,wyr1e-wyrmsh,wyr1e8-recovery");
+                }
+                _ => assert_eq!(
+                    spec.features, e6.features,
+                    "{} features diverged from E6 without a recorded reason",
+                    spec.label
+                ),
+            }
+        }
+    }
+
+    /// F1A.2. `system-init` stays on the production feature.
+    ///
+    /// `wyr1e8-selector33` pulls `dep:wyrmroot-wyr1e-test-actors` and
+    /// `wyrmroot-runtime/wyr1e8-test-evidence`, so selecting it here would
+    /// compile the test-actor crate into the permanent supervisor.
+    #[test]
+    fn wyr1f_system_init_is_not_the_selector_build() {
+        let init = wyr1f_native_spec("system-init").expect("system-init is in the final set");
+        assert_eq!(init.features, "wyr1e-production");
+        assert!(!init.features.contains("wyr1e8-selector33"));
+    }
+
+    /// The lookup must not silently accept a test actor's label. E8's own
+    /// lookups chain the E6 set as a fallback; the final one must not.
+    #[test]
+    fn wyr1f_native_spec_rejects_an_unknown_label() {
+        assert!(wyr1f_native_spec("recovery-trigger").is_err());
+        assert!(wyr1f_native_spec("stdout-pressure").is_err());
+        assert!(wyr1f_native_spec("cpu-hog").is_err());
+        assert!(wyr1f_native_spec("consoled").is_ok());
+    }
 
     #[test]
     fn e6_actual_dependency_source_preflight() {
