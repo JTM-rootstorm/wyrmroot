@@ -665,7 +665,13 @@ fn kernel_build_command(
         // Only the selector name. `DEEPWYRM_GUEST_TEST_ID` is build-owned --
         // the pinned launcher refuses it outright -- and the id is derived
         // from the harness manifest, which is where 35 is registered.
+        //
+        // `--features test-support` is not optional either: the launcher
+        // refuses a selector without it. It is therefore a declared
+        // production-versus-instrumented difference, recorded by the request's
+        // `kernel_cargo_features`, and not something this build chose.
         command
+            .args(["--features", "test-support"])
             .env("DEEPWYRM_GUEST_TEST_SELECTOR", wyr1c::WYR1F_SELECTOR)
             .env("DEEPWYRM_WYR1E7_EVIDENCE_NONCE", nonce);
     }
@@ -740,7 +746,10 @@ fn fixed_fields(product_kind: wyr1c::Wyr1fProduct) -> [(&'static str, &'static s
                 "none"
             },
         ),
-        ("kernel_cargo_features", "none"),
+        (
+            "kernel_cargo_features",
+            if instrumented { "test-support" } else { "none" },
+        ),
         (
             "evidence",
             if instrumented {
@@ -2102,8 +2111,12 @@ mod tests {
             wyr1c::Wyr1fProduct::Degraded,
         ] {
             let (arguments, removed, _) = arguments_and_env(product_kind);
-            assert!(!arguments.iter().any(|argument| argument == "--features"));
-            assert!(!arguments.iter().any(|argument| argument == "test-support"));
+            let features = arguments.iter().any(|argument| argument == "--features");
+            assert_eq!(features, product_kind.is_instrumented());
+            assert_eq!(
+                arguments.iter().any(|argument| argument == "test-support"),
+                product_kind.is_instrumented()
+            );
             assert!(arguments.contains(&"--locked".to_owned()));
             assert!(arguments.contains(&"--offline".to_owned()));
             assert!(arguments.contains(&KERNEL_TARGET.to_owned()));
