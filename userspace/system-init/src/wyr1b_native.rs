@@ -105,13 +105,42 @@ struct E8TriggerIdentity {
     action: E8RecoveryAction,
 }
 
+/// The only result a held WAIT may carry.
+///
+/// `hold_e8_wait` refuses anything else, so this is not a default: it is the
+/// value the admission guard has already established by the time a barrier
+/// exists. R7B-4 class D1c -- `E8HeldWait` used to store a copy, which could
+/// only ever equal this.
+#[cfg(feature = "wyr1e8-selector33")]
+const E8_HELD_WAIT_RESULT: ControllerJobResult = ControllerJobResult {
+    classification: TerminationClassification::NormalExit.as_u32(),
+    application_code: 0,
+    exception_class: 0,
+    exception_detail: 0,
+    exception_address: 0,
+    cleanup_result: 0,
+};
+
+/// One shell WAIT held across a recovery episode, and the quiesce handshake
+/// that holds it.
+///
+/// R7B-4 class D1c shrank this. It carried two fields that duplicated state
+/// the product already owns: a `deadline`, which R7B-1 made ordinary episode
+/// state on `ShellControllerState` and which every reader cross-checked
+/// against `recovery_deadline()` because the copy could disagree; and a
+/// `result`, which the admission guard pins to [`E8_HELD_WAIT_RESULT`] before
+/// the barrier can exist at all. Both are read from their owners now, and the
+/// consistency check that policed the deadline copy went with it.
+///
+/// What is left is not specialization to be removed. `pending` names the
+/// parked reply -- parked in ordinary `pending_waits` storage, not here -- and
+/// `identity` and `acknowledged` are the WRC8 quiesce handshake with consoled,
+/// which is the scenario itself rather than machinery around it.
 #[cfg(feature = "wyr1e8-selector33")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct E8HeldWait {
     pub(crate) pending: PendingWait,
     pub(crate) identity: wyrmroot_consoled::quiesce_control::Identity,
-    pub(crate) result: ControllerJobResult,
-    pub(crate) deadline: u64,
     acknowledged: bool,
 }
 
@@ -553,15 +582,7 @@ impl ShellControllerState {
             .ok_or(InitError::Accounting)?;
         if self.e8_held.is_some()
             || pending.reservation.transaction_id != expected_wait_transaction
-            || result
-                != (ControllerJobResult {
-                    classification: TerminationClassification::NormalExit.as_u32(),
-                    application_code: 0,
-                    exception_class: 0,
-                    exception_detail: 0,
-                    exception_address: 0,
-                    cleanup_result: 0,
-                })
+            || result != E8_HELD_WAIT_RESULT
         {
             return Err(InitError::Supervision);
         }
@@ -603,8 +624,6 @@ impl ShellControllerState {
         self.e8_held = Some(E8HeldWait {
             pending,
             identity,
-            result,
-            deadline,
             acknowledged: false,
         });
         system
@@ -636,11 +655,14 @@ impl ShellControllerState {
         identity: wyrmroot_consoled::quiesce_control::Identity,
         now: u64,
     ) -> Result<E8RecoveryAction, InitError> {
+        let deadline = self
+            .recovery_deadline
+            .ok_or(InitError::WrongActivationOrder)?;
         let held = self
             .e8_held
             .as_mut()
             .ok_or(InitError::WrongActivationOrder)?;
-        if identity != held.identity || held.acknowledged || now >= held.deadline {
+        if identity != held.identity || held.acknowledged || now >= deadline {
             return Err(InitError::Supervision);
         }
         held.acknowledged = true;
@@ -6348,7 +6370,7 @@ pub(crate) fn finish_e8_dependent_retirement<S: Wyr1BPlatform>(
     result: TerminationResult,
 ) -> Result<(), InitError> {
     shell.require_recovery_live_at(system.now().map_err(InitError::Native)?)?;
-    jobs.remove_barrier_result(held.pending, held.result)
+    jobs.remove_barrier_result(held.pending, E8_HELD_WAIT_RESULT)
         .map_err(InitError::Wyr1BModel)?;
     shell.require_recovery_live_at(system.now().map_err(InitError::Native)?)?;
     shell.record_e8_forced_retired(system, held, result)?;
@@ -11379,8 +11401,12 @@ mod tests {
                 .unwrap();
             let held = state.e8_held.unwrap();
             assert_eq!(held.pending.reservation, wait);
-            assert_eq!(held.deadline, deadline);
-            assert_eq!(held.result, e8_normal_result());
+            // D1c: the barrier no longer copies these. The deadline is read
+            // from the episode that owns it, and the result is the one the
+            // admission guard admits -- asserting the copies matched was only
+            // ever asserting that copying worked.
+            assert_eq!(state.recovery_deadline(), Some(deadline));
+            assert_eq!(E8_HELD_WAIT_RESULT, e8_normal_result());
             assert_eq!(platform.sent.len(), 1);
             assert_eq!(platform.sent[0].0, DwHandle(20));
             assert_eq!(
@@ -11501,7 +11527,7 @@ mod tests {
         let held = state.e8_held.unwrap();
         assert!(!state.e8_tuple_waiting_for_serial());
         assert!(!state.routine_console_relaunch_allowed());
-        assert_eq!(held.deadline, 200);
+        assert_eq!(state.recovery_deadline(), Some(200));
         assert_eq!(
             state.e8_held_for_action(E8RecoveryAction::Registry),
             Err(InitError::WrongActivationOrder)
@@ -11514,7 +11540,7 @@ mod tests {
         assert!(!state.e8_tuple_waiting_for_serial());
         assert!(!state.routine_console_relaunch_allowed());
         let taken = state.e8_held_for_action(E8RecoveryAction::Driver).unwrap();
-        assert_eq!(taken.deadline, 200);
+        assert_eq!(state.recovery_deadline(), Some(200));
         state.consume_e8_held(taken);
         assert!(!state.e8_tuple_waiting_for_serial());
         assert!(!state.routine_console_relaunch_allowed());

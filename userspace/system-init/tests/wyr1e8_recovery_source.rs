@@ -105,11 +105,19 @@ fn e8_holds_the_real_terminal_wait_until_exact_quiescence_and_cleanup() {
 
     let state = &JOBS
         [JOBS.find("fn hold_e8_wait").unwrap()..JOBS.find("pub(crate) const fn health").unwrap()];
-    assert!(state.contains("TerminationClassification::NormalExit.as_u32()"));
+    // R7B-4 class D1c. The admitted result is named once and compared by name;
+    // both halves are asserted, because a constant nothing compares against
+    // would pass a `contains` on either alone.
+    assert!(JOBS.contains("const E8_HELD_WAIT_RESULT: ControllerJobResult"));
+    assert!(JOBS.contains("classification: TerminationClassification::NormalExit.as_u32()"));
+    assert!(state.contains("result != E8_HELD_WAIT_RESULT"));
     assert!(state.contains(".launch_transaction\n            .checked_add(1)"));
     assert!(state.contains("pending.reservation.transaction_id != expected_wait_transaction"));
     assert!(state.contains("Message::Quiesce(identity)"));
-    assert!(state.contains("now >= held.deadline"));
+    // The barrier stopped carrying its own deadline copy; quiesce acceptance
+    // reads the episode's. The check itself is unchanged and still asserted.
+    assert!(state.contains("now >= deadline"));
+    assert!(state.contains("let deadline = self\n            .recovery_deadline"));
     assert!(state.contains("identity != held.identity || held.acknowledged"));
 }
 
@@ -169,7 +177,7 @@ fn forced_retirement_disconnects_then_removes_only_the_held_barrier_result() {
         .find("pub(crate) fn finish_e8_dependent_retirement")
         .unwrap()..JOBS.find("fn retire_console_product_inner").unwrap()];
     let remove = finalizer
-        .find("remove_barrier_result(held.pending, held.result)")
+        .find("remove_barrier_result(held.pending, E8_HELD_WAIT_RESULT)")
         .unwrap();
     let evidence = finalizer
         .find("record_e8_forced_retired(system, held, result)")

@@ -1196,13 +1196,15 @@ where
         Some(_) => Some(e6.shell.e8_held_for_action(expected_action)?),
         None => None,
     };
+    // R7B-4 class D1c. This used to also check the barrier's own `deadline`
+    // copy against the episode's, and fail `Accounting` when they disagreed.
+    // The copy is gone -- the episode deadline has been ordinary state since
+    // R7B-1 -- so there is nothing left to disagree, and the liveness check is
+    // the whole of what was ever being asked here.
     #[cfg(feature = "wyr1e8-selector33")]
-    if let Some(held) = held {
+    if held.is_some() {
         e6.shell
             .require_recovery_live_at(system.now().map_err(InitError::Native)?)?;
-        if held.deadline != e6.shell.recovery_deadline().ok_or(InitError::Accounting)? {
-            return Err(InitError::Accounting);
-        }
     }
     if poison_registry {
         e6.shell.poison(generation);
@@ -1237,7 +1239,7 @@ where
         .is_err();
     #[cfg(feature = "wyr1e8-selector33")]
     let console_result = match held {
-        Some(held) => retire_console_product_with_result_before(
+        Some(_) => retire_console_product_with_result_before(
             system,
             waits,
             &mut e6.jobs,
@@ -1248,7 +1250,7 @@ where
             // consoled task-group teardown races that ordering and can expose
             // stdout loss instead of the required status-loss result.
             false,
-            Some(held.deadline),
+            e6.shell.recovery_deadline(),
         ),
         None => retire_console_product_with_result(system, waits, &mut e6.jobs, peer, true),
     };
