@@ -44,7 +44,7 @@ prepare rather than producing a differently-descended product.
 
 ## 3. E8 pairs
 
-Four accepted pairs, each its own frozen product, each UP+SMP:
+Five accepted pairs, each its own frozen product, each UP+SMP:
 
 | Pair | Nonce | Wyrmroot | UP | SMP | Terminal |
 | --- | --- | --- | --- | --- | --- |
@@ -52,14 +52,16 @@ Four accepted pairs, each its own frozen product, each UP+SMP:
 | D1e | `E80000000000011D` | `3e8880e` | 33 | 69 | `DWTEST1 33 0`, exit 33 |
 | D1c | `E80000000000011E` | `b0cd8f9` | 33 | 69 | `DWTEST1 33 0`, exit 33 |
 | D1b (part) | `E80000000000011F` | `00253df` | 33 | 69 | `DWTEST1 33 0`, exit 33 |
+| D1b (complete) | `E800000000000120` | `f5c2ffb` | 33 | 69 | `DWTEST1 33 0`, exit 33 |
 
 Artifacts: `artifacts/e8-r7f-260915`, `artifacts/e8-d1e-260915`,
-`artifacts/e8-d1c-260915`, `artifacts/e8-d1b-260915`.
+`artifacts/e8-d1c-260915`, `artifacts/e8-d1b-260915`,
+`artifacts/e8-d1b-full-260916`.
 
-The record counts, terminal line and exit status are identical across all four.
-That is the point of running a pair per card: each of D1e, D1c and D1b-part
-touched the held-wait barrier or the trigger path, and the pinned values in the
-root verifier's `E8_FIXED_SEMANTICS` did not move.
+The record counts, terminal line and exit status are identical across all five.
+That is the point of running a pair per card: each of D1e, D1c and D1b touched
+the held-wait barrier or the trigger path, and the pinned values in the root
+verifier's `E8_FIXED_SEMANTICS` did not move.
 
 ### Record and transcript results (accepted pair, E8D.5)
 
@@ -124,7 +126,7 @@ Five, all found by this validation rather than reported into it.
    failure as `InterruptsEnabled` — so a privilege violation was reported as the
    one thing that was not wrong. Split and reported separately in Deepwyrm
    `b598302`.
-5. **R7B-4 classes D1e, D1c and D1b (part).** Recorded in §6.
+5. **R7B-4 classes D1e, D1c and D1b.** Recorded in §6.
 
 ### The class, not the instances
 
@@ -152,7 +154,7 @@ gate fail, naming the selector.
 | --- | --- | --- |
 | D1e | Done, **narrowed** | `E80000000000011D` |
 | D1c | Done | `E80000000000011E` |
-| D1b | **Partly done** | `E80000000000011F` |
+| D1b | Done | `E80000000000011F`, `E800000000000120` |
 
 **D1e** retired one of its three predicates, not three.
 `job_dispatcher_poll_allowed` bundled a parked WAIT reply with an evidence
@@ -170,7 +172,16 @@ policed the deadline copy. The card's premise that parking should move onto
 `pending_waits` storage. What remains is the WRC8 quiesce handshake, which is
 the scenario rather than machinery around it.
 
-**D1b** is the one card not finished, and §8 carries it as a qualification.
+**D1b** is finished, in two steps, and the plan's stated obstacle was wrong.
+The first step stopped the trigger check re-parsing bytes the dispatcher had
+already parsed. The second removed the sniff itself: the launch policy carries
+a per-entry `profile_id`, the recovery trigger was written as an ordinary
+`JOB_V2_PROFILE_ID` entry indistinguishable from any other test actor, and it
+now has `RECOVERY_TRIGGER_PROFILE_ID` under a new WRJP minor. The dispatcher
+asks `policy.opens_recovery_episode(path)` and does not know which path that
+is; only the E8 builder does. The plan held that every way of moving the
+episode off a magic-path comparison "changes the E8 request wire, the evidence
+sequence, or both". Pair `E800000000000120` changes neither.
 
 ## 7. Required-source disposition
 
@@ -182,26 +193,18 @@ proof of prior execution, per E8D.4.
 
 ## 8. Qualifications — what this record does not claim
 
-1. **D1b is not finished.** The trigger check no longer re-parses bytes the
-   dispatch path already parsed, but the episode still opens from a ShellJobs
-   launch. Moving it off one requires the episode to be installed before the
-   launch is accepted while carrying that launch's transaction, and every other
-   source changes the E8 request wire or the evidence sequence — both pinned in
-   `E8_FIXED_SEMANTICS` and both attested by the pairs above. That is a contract
-   decision. **Completing D1b invalidates the baseline this record publishes**
-   and requires a fresh pair and new pins.
-2. **No physical-hardware validation.** Every result here is QEMU. §9 forbids
+1. **No physical-hardware validation.** Every result here is QEMU. §9 forbids
    inferring hardware acceptance from it.
-3. **One pair is one pair.** A25–A27 failed differently each time before R7F
+2. **One pair is one pair.** A25–A27 failed differently each time before R7F
    passed, which is the profile of an intermittent fault. Four passing pairs
    close the gate; they are not a flake-rate claim.
-4. **Not claimed:** final DW1/WYR1 completion, final security review, a
+3. **Not claimed:** final DW1/WYR1 completion, final security review, a
    two-clean-build proof, a selector-34 run result, persistent-root recovery,
    or any hard real-time guarantee. Selector 34 is now *buildable* and gated;
    it has not been run.
-5. **Deepwyrm's `#[ignore]`d target-artifact tests still gate link, disassembly
+4. **Deepwyrm's `#[ignore]`d target-artifact tests still gate link, disassembly
    and boot.** The new aggregate gate proves compilation only.
-6. **The bundled-predicate sweep was not exhaustive.** Two further candidates
+5. **The bundled-predicate sweep was not exhaustive.** Two further candidates
    in `carrier_admission.rs` and `primordial.rs` are suspected and untraced; one
    confirmed candidate, `current_native_usercopy_is_quiescent`, is unfixed.
 
