@@ -9009,6 +9009,21 @@ mod tests {
         (result.unwrap_err(), platform)
     }
 
+    /// Asserts the resident tick status in the builds that encode it this way.
+    ///
+    /// `resident_tick_failure_application_status` forks on selector 34, which
+    /// encodes a tick failure with `test_failure_category`'s 32-value space
+    /// instead of the operation/kind pair these constants are written in. The
+    /// `InitError` each caller asserts immediately above is selector-
+    /// independent and is checked in every build; only the encoding of it is
+    /// not, so only the encoding is gated.
+    fn assert_tick_status(error: &InitError, expected: u32) {
+        #[cfg(not(feature = "r1-selector34"))]
+        assert_eq!(resident_tick_failure_application_status(error), expected);
+        #[cfg(feature = "r1-selector34")]
+        let _ = (error, expected);
+    }
+
     #[test]
     fn dispatch_failure_with_completed_cleanup_reports_the_initiating_error() {
         let (error, platform) = poll_malformed_dispatch_with_emergency_cleanup(false, false);
@@ -9023,10 +9038,7 @@ mod tests {
                 },
             }
         );
-        assert_eq!(
-            resident_tick_failure_application_status(&error),
-            0xAF18_0F02
-        );
+        assert_tick_status(&error, 0xAF18_0F02);
         assert_eq!(&platform.closed[..platform.close_count], &[DwHandle(90)]);
         assert_eq!(platform.terminate_count, 0);
     }
@@ -9045,10 +9057,7 @@ mod tests {
                 },
             }
         );
-        assert_eq!(
-            resident_tick_failure_application_status(&error),
-            0xAF18_0F04
-        );
+        assert_tick_status(&error, 0xAF18_0F04);
         assert_eq!(&platform.closed[..platform.close_count], &[DwHandle(90)]);
         assert_eq!(platform.terminate_count, 0);
     }
@@ -9067,10 +9076,7 @@ mod tests {
                 },
             }
         );
-        assert_eq!(
-            resident_tick_failure_application_status(&error),
-            0xAF18_0F04
-        );
+        assert_tick_status(&error, 0xAF18_0F04);
         assert_eq!(
             &platform.closed[..platform.close_count],
             &[DwHandle(90), DwHandle(102), DwHandle(101), DwHandle(103)]
@@ -9092,10 +9098,7 @@ mod tests {
                 },
             }
         );
-        assert_eq!(
-            resident_tick_failure_application_status(&error),
-            0xAF18_0F04
-        );
+        assert_tick_status(&error, 0xAF18_0F04);
         assert_eq!(
             &platform.closed[..platform.close_count],
             &[DwHandle(90), DwHandle(102), DwHandle(101), DwHandle(103)]

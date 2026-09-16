@@ -1404,11 +1404,107 @@ pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<
     if matches!(filter, Some("dw1e3b-native")) {
         return crate::wyr1c::run_e3b_native_checks(repository);
     }
+    // Unfiltered, so a broken selector cannot wait for someone to type its
+    // gate's name. `selectors` runs the same set alone when that is all the
+    // reader wants.
+    if filter.is_none() || matches!(filter, Some("selectors")) {
+        for arguments in selector_library_commands() {
+            let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+            run_selector_cargo(repository, &arguments)?;
+        }
+        if matches!(filter, Some("selectors")) {
+            return Ok(());
+        }
+    }
     for arguments in host_test_commands(filter)? {
         let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
         run_cargo(repository, &arguments)?;
     }
     Ok(())
+}
+
+/// Every library configuration a product path builds, as one compile gate.
+///
+/// Follow-up to reset card E8D.4. Two selectors broke on 2026-09-15 and neither
+/// was noticed for a week, for one structural reason: a selector's libraries
+/// are compiled only by the product path that mints its VM image, and every
+/// feature-specific gate in this file is an opt-in named filter that an
+/// unfiltered `xtask test host` never runs. R7B-1 left selector 32 calling a
+/// module its feature does not enable. R7B-2 removed a `match` wildcard and
+/// left selector 34 non-exhaustive. Both compiled clean under the default
+/// feature set, which is all the default suite ever built -- and selector 34
+/// even had two gates written for it, both red, both unrun.
+///
+/// So this one runs unfiltered. It checks rather than lints, because the class
+/// is "does not compile" and `cargo check` is the cheapest thing that answers
+/// it; the per-selector clippy gates below still lint more deeply when named.
+/// The point is that no selector's compilability depends on anyone remembering
+/// a filter name.
+const SELECTOR_LIBRARIES: [(&str, &str); 26] = [
+    ("wyrmroot-system-init", "wyr1-test-evidence"),
+    ("wyrmroot-system-init", "wyr1b-test-evidence"),
+    ("wyrmroot-system-init", "wyr1c4-production"),
+    ("wyrmroot-system-init", "wyr1c5-production"),
+    ("wyrmroot-system-init", "wyr1c6-production"),
+    (
+        "wyrmroot-system-init",
+        "wyr1c6-production,wyr1c6-selector29",
+    ),
+    ("wyrmroot-system-init", "wyr1c6-test-evidence"),
+    ("wyrmroot-system-init", "wyr1d-selector32"),
+    ("wyrmroot-system-init", "wyr1e-shell-controller"),
+    ("wyrmroot-system-init", "wyr1e-production"),
+    ("wyrmroot-system-init", "wyr1e-selector33"),
+    ("wyrmroot-system-init", "wyr1e8-selector33"),
+    ("wyrmroot-system-init", "r1-selector34"),
+    ("wyrmroot-system-init", "dw1e3-selector31"),
+    ("wyrmroot-consoled", "native-consoled,wyr1d-selector32"),
+    ("wyrmroot-consoled", "native-consoled,wyr1e-wyrmsh"),
+    (
+        "wyrmroot-consoled",
+        "native-consoled,wyr1e-wyrmsh,wyr1e8-recovery",
+    ),
+    ("wyrmroot-devmgr", "wyr1c4-production"),
+    ("wyrmroot-devmgr", "wyr1c5-production"),
+    ("wyrmroot-devmgr", "wyr1c6-production,wyr1c6-selector29"),
+    ("wyrmroot-devmgr", "wyr1d-production"),
+    ("wyrmroot-devmgr", "wyr1d-selector32"),
+    ("wyrmroot-devmgr", "wyr1e-production"),
+    ("wyrmroot-devmgr", "wyr1e8-production"),
+    ("wyrmroot-devmgr", "dw1e3-selector31"),
+    ("wyrmroot-uart16550d", "wyr1d-selector32"),
+];
+
+/// A placeholder for the evidence nonce selector 31's runtime stamps in at
+/// compile time.
+///
+/// `wyrmroot-runtime`'s `dw1e3` module reads `DEEPWYRM_DW1E_EVIDENCE_NONCE`
+/// through `env!`, so the selector does not compile without one and was
+/// therefore reachable only from the product path that supplies the real
+/// value. This gate compiles the library and never runs it, so any parseable
+/// nonce answers the only question being asked -- does the code still build --
+/// and no artifact is produced that could carry this value anywhere.
+const SELECTOR_PLACEHOLDER_NONCE: &str = "0000000000000001";
+
+fn selector_library_commands() -> Vec<Vec<String>> {
+    SELECTOR_LIBRARIES
+        .into_iter()
+        .map(|(package, features)| {
+            [
+                "check",
+                "--locked",
+                "--offline",
+                "--package",
+                package,
+                "--no-default-features",
+                "--features",
+                features,
+                "--lib",
+            ]
+            .map(str::to_owned)
+            .into()
+        })
+        .collect()
 }
 
 /// The two libraries the selector-32 product builds and no other host gate does.
@@ -1898,6 +1994,29 @@ fn explicit_test_filter(filter: &str) -> Result<String, Failure> {
     let filter = filter.strip_prefix("test:").unwrap_or(filter);
     validate_filter(filter)?;
     Ok(filter.to_owned())
+}
+
+/// `run_cargo` plus the one compile-time variable a selector library needs.
+///
+/// Only selector 31 reads it, but setting it for the whole set keeps the table
+/// a plain list of configurations rather than a list with an exception in it.
+fn run_selector_cargo(repository: &Path, arguments: &[&str]) -> Result<(), Failure> {
+    let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let status = Command::new(cargo)
+        .args(arguments)
+        .env("DEEPWYRM_DW1E_EVIDENCE_NONCE", SELECTOR_PLACEHOLDER_NONCE)
+        .current_dir(repository)
+        .stdin(Stdio::null())
+        .status()
+        .map_err(|error| Failure::task(format!("could not run Cargo: {error}")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(Failure::task(format!(
+            "selector library gate failed with {}",
+            child_status(status.code())
+        )))
+    }
 }
 
 fn run_cargo(repository: &Path, arguments: &[&str]) -> Result<(), Failure> {

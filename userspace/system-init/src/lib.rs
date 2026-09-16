@@ -182,6 +182,13 @@ pub(crate) enum RecoveryOperation {
 
 /// Reported when no operation claimed the failure: the error reached the tick
 /// boundary without passing through `attribute_failure`.
+///
+/// Selector 34 encodes tick failures with `test_failure_category`'s 32-value
+/// space instead, so the whole 8-kind fallback -- and this constant with it --
+/// is compiled out there. Gated rather than `allow`ed: an unused constant under
+/// one selector is a fact about which encoding that selector uses, and saying
+/// so keeps `-D dead-code` meaningful instead of silencing it.
+#[cfg(not(feature = "r1-selector34"))]
 const UNATTRIBUTED_OPERATION: u8 = 0x0f;
 
 const fn failure_kind(error: &InitError) -> u8 {
@@ -233,6 +240,23 @@ const fn failure_kind(error: &InitError) -> u8 {
         | InitError::ResourcesAlreadyInstalled
         | InitError::Restart(_)
         | InitError::ZeroBootGeneration => 0x0f,
+        // Selector 34's three causes, grouped by what they are and not by the
+        // feature that adds them. R7B-2 removed this match's wildcard so a new
+        // variant has to be placed deliberately; it did not place these, and
+        // no gate that runs by default compiles them, so the selector stopped
+        // building on 2026-09-15 and stayed broken.
+        //
+        // A probe that exits nonzero, times out on READY or stops draining is
+        // a supervised child failing, which is what 0x03 already names.
+        #[cfg(feature = "r1-selector34")]
+        InitError::R1Probe(_) => 0x03,
+        // A refused relay record is a protocol refusal, like the registry and
+        // gate protocols at 0x06.
+        #[cfg(feature = "r1-selector34")]
+        InitError::R1Relay(_) => 0x06,
+        // A gap census is lost evidence, which is 0x08's group.
+        #[cfg(feature = "r1-selector34")]
+        InitError::R1RelayGap(_) => 0x08,
     }
 }
 
