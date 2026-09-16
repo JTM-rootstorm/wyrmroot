@@ -40,7 +40,9 @@ use wyrmroot_device_proto::manifest::{
     ContentIdentity, HEADER_BYTES as WRDM_HEADER_BYTES, RECORD_BYTES as WRDM_RECORD_BYTES,
     encode_com2_manifest,
 };
-use wyrmroot_rrc_manifest::{Manifest, RoleId, StartupProfile, Wyr1eProductProfile};
+use wyrmroot_rrc_manifest::{
+    Activation, DependencyKind, Manifest, RoleId, StartupProfile, Wyr1eProductProfile,
+};
 
 const PRODUCT_KIND: &str = "wyrmroot-wyr1-c1-host-product";
 const RECEIPT_KIND: &str = "wyrmroot-wyr1-c1-host-product-receipt";
@@ -54,7 +56,7 @@ const MAX_REPORT_BYTES: usize = 64 * 1024;
 pub(crate) const GATE_CONFIG: &[u8] =
     b"schema = 1\nproduct = \"wyr1-c1-host-only\"\nselector = \"none\"\nevidence = \"not-produced\"\n";
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) struct NativeSpec {
     pub(crate) label: &'static str,
     pub(crate) package: &'static str,
@@ -740,6 +742,7 @@ const C6_NATIVE_CHECK_SPECS: [NativeSpec; 4] = [
     },
 ];
 
+#[derive(Clone)]
 pub(crate) struct NativeArtifact {
     pub(crate) spec: NativeSpec,
     pub(crate) bytes: Vec<u8>,
@@ -2316,6 +2319,578 @@ pub(crate) fn reassemble_e6_snapshot(
         });
     }
     assemble_e6_product(revision, &artifacts)
+}
+
+// ---------------------------------------------------------------------------
+// DW1-F/WYR1-F final normal product assembly (F1A.3)
+// ---------------------------------------------------------------------------
+
+/// The final normal product's `system/bootstrap/wyr1-a-gate-v1` bytes.
+///
+/// F1A.3 change W3. `GATE_CONFIG` still says `product = "wyr1-c1-host-only"`,
+/// which was already stale by C6 and is simply untrue of the final product.
+/// The frozen C1/E6/E7/E8 products keep those exact bytes — their receipts and
+/// RRC closures are pinned to them — so this is a new sibling constant rather
+/// than an edit.
+///
+/// The production boot path does not parse this file. The native entry point
+/// uses `validate_retained_bootfs_c1`
+/// (`userspace/system-init/src/wyr1b_native.rs:1265`), which never looks the
+/// path up; `gate::parse_gate_config` is reached only from the selector-25
+/// model path at `userspace/system-init/src/lib.rs:2075`. Its *bytes* still
+/// matter, because RRC-A binds the config's content identity as init's
+/// immutable `Config` dependency — see `expected_closure_for_request`. That is
+/// why `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` §5.4's normal/degraded difference
+/// is the whole file and not a `scenario` line inside a shared shape.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "F1A.3 fixes the final product; its caller is the F1A.4 CLI"
+    )
+)]
+pub(crate) const WYR1F_NORMAL_GATE_CONFIG: &[u8] =
+    b"schema = 1\nproduct = \"wyr1-f-normal\"\nselector = \"none\"\nevidence = \"not-produced\"\n";
+
+/// Every path the final normal bootfs is allowed to contain, and whether the
+/// entry is executable. Independently written here rather than derived from the
+/// builder, so the re-reader compares against a second source.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "F1A.3 fixes the final product; its caller is the F1A.4 CLI"
+    )
+)]
+const WYR1F_EXPECTED_PATHS: [(&str, bool); 12] = [
+    ("system/init", true),
+    ("system/registryd", true),
+    ("system/devmgr", true),
+    ("system/uart16550d", true),
+    ("system/consoled", true),
+    ("system/wyrmsh", true),
+    ("bin/hello", true),
+    ("system/bootstrap/rrc-a-v1", false),
+    ("system/bootstrap/wyr1-a-gate-v1", false),
+    ("system/bootstrap/wyr1-c-gate-v1", false),
+    ("system/bootstrap/wyr1-c-device-manifest-v1", false),
+    (LAUNCH_POLICY_PATH, false),
+];
+
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "F1A.3 fixes the final product; its caller is the F1A.4 CLI"
+    )
+)]
+pub(crate) struct Wyr1fProductBytes {
+    pub(crate) generation: [u8; 32],
+    pub(crate) rrc_manifest: Vec<u8>,
+    pub(crate) device_manifest: Vec<u8>,
+    pub(crate) launch_policy: Vec<u8>,
+    pub(crate) bootfs: Vec<u8>,
+}
+
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "F1A.3 fixes the final product; its caller is the F1A.4 CLI"
+    )
+)]
+fn wyr1f_product_generation(revision: &str, artifacts: &[NativeArtifact]) -> [u8; 32] {
+    let mut material = Vec::from(b"wyrmroot-wyr1-f-normal-product-v1\0".as_slice());
+    material.extend_from_slice(revision.as_bytes());
+    for artifact in artifacts {
+        material.extend_from_slice(artifact.spec.label.as_bytes());
+        material.extend_from_slice(artifact.sha256.as_bytes());
+    }
+    sha256::bytes_digest_array(&material)
+}
+
+/// Assembles the final normal WYR1-F product.
+///
+/// The bootfs *shape* is E6's — twelve entries, a minor-1 two-entry WRJP — so
+/// `build_e6` and its `validate_e6_product` admission are reused deliberately
+/// rather than copied. What is not reused is `assemble_e6_product`, which
+/// positionally unpacks seven artifacts without checking which artifacts they
+/// are and embeds the stale `GATE_CONFIG`. This assembler checks the whole
+/// spec, not just the count: an artifact carrying the wrong package, binary or
+/// feature set is rejected before anything is built, which is what makes
+/// "stub artifact in a required role" a build failure rather than a review
+/// question.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "F1A.3 fixes the final product; its caller is the F1A.4 CLI"
+    )
+)]
+fn assemble_wyr1f_product(
+    revision: &str,
+    artifacts: &[NativeArtifact],
+) -> Result<Wyr1fProductBytes, Failure> {
+    if artifacts.len() != WYR1F_PRODUCT_NATIVE_SPECS.len() {
+        return Err(Failure::task(
+            "WYR1-F requires exactly seven production artifacts",
+        ));
+    }
+    for (artifact, expected) in artifacts.iter().zip(WYR1F_PRODUCT_NATIVE_SPECS) {
+        if artifact.spec != expected {
+            return Err(Failure::task(format!(
+                "WYR1-F artifact {} is not the frozen final production build",
+                artifact.spec.label
+            )));
+        }
+        if artifact.bytes.is_empty() {
+            return Err(Failure::task(format!(
+                "WYR1-F artifact {} is empty",
+                artifact.spec.label
+            )));
+        }
+        if sha256::bytes_digest(&artifact.bytes) != artifact.sha256 {
+            return Err(Failure::task(format!(
+                "WYR1-F artifact {} carries a hash its bytes do not produce",
+                artifact.spec.label
+            )));
+        }
+    }
+    let [init, registryd, devmgr, uart, consoled, wyrmsh, hello]: [&NativeArtifact; 7] = artifacts
+        .iter()
+        .collect::<Vec<_>>()
+        .try_into()
+        .map_err(|_| Failure::task("WYR1-F requires exactly seven production artifacts"))?;
+    let role_hashes = [
+        digest_array(&registryd.sha256)?,
+        digest_array(&devmgr.sha256)?,
+        digest_array(&uart.sha256)?,
+        digest_array(&consoled.sha256)?,
+        digest_array(&wyrmsh.sha256)?,
+    ];
+    let generation = wyr1f_product_generation(revision, artifacts);
+    let builder = crate::wyr1::fixed_builder_for_wyrmsh(&generation, role_hashes)?;
+    let structural_rrc = builder
+        .build_structural()
+        .map_err(|error| Failure::task(format!("WYR1-F WRRM build failed: {error:?}")))?;
+
+    let mut wrdm = [0u8; WRDM_HEADER_BYTES + WRDM_RECORD_BYTES];
+    let wrdm_size = encode_com2_manifest(ContentIdentity(role_hashes[2]), &mut wrdm)
+        .map_err(|error| Failure::task(format!("WYR1-F WRDM build failed: {error:?}")))?;
+    let device_manifest = wrdm[..wrdm_size].to_vec();
+
+    let hello_identity = digest_array(&hello.sha256)?;
+    let mut policy = [0u8; 512];
+    let policy_size = encode_wyrmsh(
+        generation,
+        &[
+            LaunchPolicyEntry {
+                path: "bin/hello",
+                content_sha256: hello_identity,
+                startup_abi: 2,
+                profile_id: JOB_V2_PROFILE_ID,
+                allow_no_streams: false,
+                allow_three_streams: true,
+            },
+            LaunchPolicyEntry {
+                path: WYRMSH_PATH,
+                content_sha256: role_hashes[4],
+                startup_abi: 2,
+                profile_id: WYRMSH_PROFILE_ID,
+                allow_no_streams: false,
+                allow_three_streams: true,
+            },
+        ],
+        &mut policy,
+    )
+    .map_err(|error| Failure::task(format!("WYR1-F launch policy failed: {error:?}")))?;
+    let launch_policy = policy[..policy_size].to_vec();
+
+    let bootfs = build_e6(ProductE6 {
+        base: ProductC1 {
+            base: Product {
+                init: &init.bytes,
+                registryd: &registryd.bytes,
+                devmgr: &devmgr.bytes,
+                uart16550d: &uart.bytes,
+                consoled: &consoled.bytes,
+                wyrmsh: &wyrmsh.bytes,
+                rrc_manifest: &structural_rrc,
+                gate_config: WYR1F_NORMAL_GATE_CONFIG,
+            },
+            marker: WYR1_C1_MARKER,
+            device_manifest: &device_manifest,
+            expected_uart16550d_identity: role_hashes[2],
+        },
+        launch_policy: &launch_policy,
+        hello: &hello.bytes,
+        expected_wyrmsh_identity: role_hashes[4],
+        expected_hello_identity: hello_identity,
+    })
+    .map_err(|error| Failure::task(format!("WYR1-F bootfs build failed: {error:?}")))?;
+    if bootfs.len() > MAX_BOOTFS_BYTES {
+        return Err(Failure::task("WYR1-F bootfs exceeds the image bound"));
+    }
+
+    let expected_closure = crate::wyr1::expected_closure_for_request(
+        digest_array(&init.sha256)?,
+        role_hashes,
+        sha256::bytes_digest_array(WYR1F_NORMAL_GATE_CONFIG),
+    );
+    let observed = crate::wyr1::observe_closure_from_archive(&bootfs)?;
+    let profile = Wyr1eProductProfile {
+        base: crate::wyr1::product_profile_for_request(
+            sha256::bytes_digest_array(&structural_rrc),
+            sha256::bytes_digest_array(&structural_rrc),
+            sha256::bytes_digest_array(&bootfs),
+            sha256::bytes_digest_array(&bootfs),
+            &expected_closure,
+            &observed,
+        ),
+        production_wyrmsh_identity: role_hashes[4],
+    };
+    let admitted_rrc = builder
+        .build_wyr1e_product(profile)
+        .map_err(|error| Failure::task(format!("WYR1-F WRRM admission failed: {error:?}")))?;
+    if admitted_rrc != structural_rrc {
+        return Err(Failure::task(
+            "WYR1-F admitted WRRM differs from its structural bytes",
+        ));
+    }
+    Manifest::parse_wyr1e_product(&admitted_rrc, &generation, profile)
+        .and_then(|manifest| manifest.validate_wyr1e_product(profile))
+        .map_err(|error| Failure::task(format!("WYR1-F WRRM inspection failed: {error:?}")))?;
+
+    let product = Wyr1fProductBytes {
+        generation,
+        rrc_manifest: admitted_rrc,
+        device_manifest,
+        launch_policy,
+        bootfs,
+    };
+    verify_wyr1f_product(&product, artifacts)?;
+    Ok(product)
+}
+
+/// Rereads a serialized final product and joins it against independently
+/// constructed expected inputs.
+///
+/// This deliberately does not consult the values `assemble_wyr1f_product`
+/// computed along the way. Everything it compares is either parsed back out of
+/// the serialized bytes or rebuilt from the artifact byte slices, so a builder
+/// that silently wrote the wrong thing cannot also satisfy the check.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "F1A.3 fixes the final product; its caller is the F1A.4 CLI"
+    )
+)]
+fn verify_wyr1f_product(
+    product: &Wyr1fProductBytes,
+    artifacts: &[NativeArtifact],
+) -> Result<(), Failure> {
+    let archive = Archive::new(&product.bootfs)
+        .map_err(|error| Failure::task(format!("WYR1-F bootfs is unreadable: {error:?}")))?;
+    // The allowlist is scanned first, so an unadmitted entry is named rather
+    // than reported as a bare arity mismatch.
+    for entry in archive.entries() {
+        let path = entry
+            .name_utf8()
+            .map_err(|_| Failure::task("WYR1-F bootfs holds a non-UTF-8 path"))?;
+        if !WYR1F_EXPECTED_PATHS
+            .iter()
+            .any(|(expected, _)| *expected == path)
+        {
+            return Err(Failure::task(format!(
+                "WYR1-F bootfs holds the unadmitted entry {path}"
+            )));
+        }
+    }
+    if archive.entries().count() != WYR1F_EXPECTED_PATHS.len() {
+        return Err(Failure::task("WYR1-F bootfs entry set drifted"));
+    }
+
+    let artifact_bytes = |label: &str| -> Result<&[u8], Failure> {
+        artifacts
+            .iter()
+            .find(|artifact| artifact.spec.label == label)
+            .map(|artifact| artifact.bytes.as_slice())
+            .ok_or_else(|| Failure::task(format!("WYR1-F product lacks the {label} artifact")))
+    };
+    let expected_bytes = |path: &str| -> Result<Vec<u8>, Failure> {
+        Ok(match path {
+            "system/init" => artifact_bytes("system-init")?.to_vec(),
+            "system/registryd" => artifact_bytes("registryd")?.to_vec(),
+            "system/devmgr" => artifact_bytes("devmgr")?.to_vec(),
+            "system/uart16550d" => artifact_bytes("uart16550d")?.to_vec(),
+            "system/consoled" => artifact_bytes("consoled")?.to_vec(),
+            "system/wyrmsh" => artifact_bytes("wyrmsh")?.to_vec(),
+            "bin/hello" => artifact_bytes("hello")?.to_vec(),
+            "system/bootstrap/rrc-a-v1" => product.rrc_manifest.clone(),
+            "system/bootstrap/wyr1-a-gate-v1" => WYR1F_NORMAL_GATE_CONFIG.to_vec(),
+            "system/bootstrap/wyr1-c-gate-v1" => WYR1_C1_MARKER.to_vec(),
+            "system/bootstrap/wyr1-c-device-manifest-v1" => product.device_manifest.clone(),
+            _ if path == LAUNCH_POLICY_PATH => product.launch_policy.clone(),
+            _ => return Err(Failure::task(format!("WYR1-F has no expectation for {path}"))),
+        })
+    };
+    for (path, executable) in WYR1F_EXPECTED_PATHS {
+        let entry = archive
+            .lookup(path.as_bytes())
+            .map_err(|_| Failure::task(format!("WYR1-F bootfs lacks {path}")))?;
+        if entry.data() != expected_bytes(path)?.as_slice() {
+            return Err(Failure::task(format!("WYR1-F bootfs content differs at {path}")));
+        }
+        if entry.is_executable() != executable {
+            return Err(Failure::task(format!("WYR1-F bootfs rights differ at {path}")));
+        }
+    }
+
+    // WRRM, reparsed from the archive rather than from the builder's return.
+    let manifest_entry = archive
+        .lookup(b"system/bootstrap/rrc-a-v1")
+        .map_err(|_| Failure::task("WYR1-F bootfs lacks its WRRM"))?;
+    let manifest = Manifest::parse_structural(manifest_entry.data(), &product.generation)
+        .map_err(|error| Failure::task(format!("WYR1-F WRRM reparse failed: {error:?}")))?;
+    // Startup profiles are WRRM's, not WRLP's. `uart16550d` and `consoled`
+    // carry `Retained` here and take their actual startup capabilities from
+    // the launch profile the loader applies; only the shell has a WRRM profile
+    // of its own, and it must be `Wyrmsh` rather than the historical
+    // `Retained` stub value.
+    let expected_roles: [(RoleId, &str, &str, StartupProfile, Activation); 5] = [
+        (
+            RoleId::Registryd,
+            "system/registryd",
+            "registryd",
+            StartupProfile::BootstrapRegistry,
+            Activation::Early,
+        ),
+        (
+            RoleId::Devmgr,
+            "system/devmgr",
+            "devmgr",
+            StartupProfile::DeviceCoordinator,
+            Activation::Early,
+        ),
+        (
+            RoleId::Uart16550d,
+            "system/uart16550d",
+            "uart16550d",
+            StartupProfile::Retained,
+            Activation::DeviceBound,
+        ),
+        (
+            RoleId::Consoled,
+            "system/consoled",
+            "consoled",
+            StartupProfile::Retained,
+            Activation::ConsoleBound,
+        ),
+        (
+            RoleId::Wyrmsh,
+            "system/wyrmsh",
+            "wyrmsh",
+            StartupProfile::Wyrmsh,
+            Activation::ConsoleBound,
+        ),
+    ];
+    if manifest.roles().count() != expected_roles.len() {
+        return Err(Failure::task("WYR1-F WRRM role count is not five"));
+    }
+    for (id, path, label, profile, activation) in expected_roles {
+        let role = manifest
+            .role(id)
+            .ok_or_else(|| Failure::task(format!("WYR1-F WRRM lacks the {label} role")))?;
+        if role.path() != path {
+            return Err(Failure::task(format!("WYR1-F WRRM moved {label}")));
+        }
+        if *role.executable_identity() != sha256::bytes_digest_array(artifact_bytes(label)?) {
+            return Err(Failure::task(format!(
+                "WYR1-F WRRM {label} identity does not match its artifact"
+            )));
+        }
+        if role.startup_profile() != profile {
+            return Err(Failure::task(format!(
+                "WYR1-F WRRM {label} carries the wrong startup profile"
+            )));
+        }
+        if role.activation() != activation {
+            return Err(Failure::task(format!(
+                "WYR1-F WRRM {label} carries the wrong activation class"
+            )));
+        }
+    }
+
+    // The production spine, as WRRM records it: a four-edge chain, each edge a
+    // `RoleReady` prerequisite on the previous role. A missing edge breaks the
+    // ordering the supervisor relies on; an extra edge or a self-edge would be
+    // a cycle. Checking the set exactly rejects both.
+    let expected_edges: [(RoleId, RoleId); 4] = [
+        (RoleId::Devmgr, RoleId::Registryd),
+        (RoleId::Uart16550d, RoleId::Devmgr),
+        (RoleId::Consoled, RoleId::Uart16550d),
+        (RoleId::Wyrmsh, RoleId::Consoled),
+    ];
+    let observed_edges = manifest
+        .edges()
+        .map(|edge| (edge.owner(), edge.kind(), edge.target_role(), edge.target_path()))
+        .collect::<Vec<_>>();
+    if observed_edges.len() != expected_edges.len() {
+        return Err(Failure::task("WYR1-F WRRM edge count drifted"));
+    }
+    for ((owner, target), observed) in expected_edges.iter().zip(observed_edges.iter()) {
+        if observed.0 != *owner
+            || observed.1 != DependencyKind::RoleReady
+            || observed.2 != Some(*target)
+            || observed.3.is_some()
+        {
+            return Err(Failure::task(format!(
+                "WYR1-F WRRM edge {owner:?} -> {target:?} is not the frozen role-ready prerequisite"
+            )));
+        }
+    }
+    for (_, _, target_role, target_path) in &observed_edges {
+        if let Some(path) = target_path {
+            if !WYR1F_EXPECTED_PATHS
+                .iter()
+                .any(|(expected, _)| expected == path)
+            {
+                return Err(Failure::task(format!(
+                    "WYR1-F WRRM depends on {path}, which the retained bootfs does not hold"
+                )));
+            }
+        }
+        if let Some(role) = target_role {
+            if manifest.role(*role).is_none() {
+                return Err(Failure::task(
+                    "WYR1-F WRRM depends on a role it does not declare",
+                ));
+            }
+        }
+    }
+
+    // WRJP, reparsed. Exactly the two admitted launch paths, at minor 1.
+    let policy_entry = archive
+        .lookup(LAUNCH_POLICY_PATH.as_bytes())
+        .map_err(|_| Failure::task("WYR1-F bootfs lacks its launch policy"))?;
+    let policy = LaunchPolicy::parse(policy_entry.data())
+        .map_err(|error| Failure::task(format!("WYR1-F WRJP reparse failed: {error:?}")))?;
+    if policy.version_minor() != 1 {
+        return Err(Failure::task(
+            "WYR1-F launch policy is not the minor-1 production version",
+        ));
+    }
+    if policy.len() != 2 {
+        return Err(Failure::task("WYR1-F launch policy admits the wrong count"));
+    }
+    let expected_policy: [(&str, &str, u16); 2] = [
+        ("bin/hello", "hello", JOB_V2_PROFILE_ID),
+        (WYRMSH_PATH, "wyrmsh", WYRMSH_PROFILE_ID),
+    ];
+    for (path, label, profile_id) in expected_policy {
+        let entry = policy
+            .find(path)
+            .ok_or_else(|| Failure::task(format!("WYR1-F launch policy lacks {path}")))?;
+        if entry.profile_id != profile_id
+            || entry.startup_abi != 2
+            || entry.allow_no_streams
+            || !entry.allow_three_streams
+        {
+            return Err(Failure::task(format!(
+                "WYR1-F launch policy grants {path} the wrong profile or stream rights"
+            )));
+        }
+        if entry.content_sha256 != sha256::bytes_digest_array(artifact_bytes(label)?) {
+            return Err(Failure::task(format!(
+                "WYR1-F launch policy binds {path} to different content than the archive holds"
+            )));
+        }
+    }
+    // Every executable in the archive is either a supervised RRC role, init
+    // itself, or an explicitly admitted launch path. Nothing else is runnable.
+    for (path, executable) in WYR1F_EXPECTED_PATHS {
+        if !executable || path == "system/init" {
+            continue;
+        }
+        let supervised = expected_roles.iter().any(|(_, role, ..)| *role == path);
+        let launchable = expected_policy.iter().any(|(policy, _, _)| *policy == path);
+        if !supervised && !launchable {
+            return Err(Failure::task(format!(
+                "WYR1-F bootfs holds the unreachable executable {path}"
+            )));
+        }
+    }
+
+    // WRDM, rebuilt from the observed UART identity rather than trusted.
+    let mut wrdm = [0u8; WRDM_HEADER_BYTES + WRDM_RECORD_BYTES];
+    let size = encode_com2_manifest(
+        ContentIdentity(sha256::bytes_digest_array(artifact_bytes("uart16550d")?)),
+        &mut wrdm,
+    )
+    .map_err(|error| Failure::task(format!("WYR1-F WRDM rebuild failed: {error:?}")))?;
+    if product.device_manifest != wrdm[..size] {
+        return Err(Failure::task(
+            "WYR1-F WRDM does not name the UART artifact the archive holds",
+        ));
+    }
+
+    // RRC-A closure: the frozen seven, all retained, all under system/.
+    let expected_closure = crate::wyr1::expected_closure_for_request(
+        sha256::bytes_digest_array(artifact_bytes("system-init")?),
+        [
+            sha256::bytes_digest_array(artifact_bytes("registryd")?),
+            sha256::bytes_digest_array(artifact_bytes("devmgr")?),
+            sha256::bytes_digest_array(artifact_bytes("uart16550d")?),
+            sha256::bytes_digest_array(artifact_bytes("consoled")?),
+            sha256::bytes_digest_array(artifact_bytes("wyrmsh")?),
+        ],
+        sha256::bytes_digest_array(WYR1F_NORMAL_GATE_CONFIG),
+    );
+    let observed = crate::wyr1::observe_closure_from_archive(&product.bootfs)?;
+    for (expected, observed) in expected_closure.iter().zip(observed.iter()) {
+        if expected.path != observed.path || expected.identity != observed.identity {
+            return Err(Failure::task(format!(
+                "WYR1-F closure entry {} does not match the retained archive",
+                expected.path
+            )));
+        }
+        if !expected.path.starts_with("system/") {
+            return Err(Failure::task(format!(
+                "WYR1-F closure reaches {}, which is outside the retained system tree",
+                expected.path
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Reassembles the final normal product from frozen artifact bytes.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "F1A.3 fixes the final product; its caller is the F1A.4 CLI"
+    )
+)]
+pub(crate) fn reassemble_wyr1f_snapshot(
+    revision: &str,
+    artifact_bytes: &BTreeMap<String, Vec<u8>>,
+) -> Result<Wyr1fProductBytes, Failure> {
+    let mut artifacts = Vec::with_capacity(WYR1F_PRODUCT_NATIVE_SPECS.len());
+    for spec in WYR1F_PRODUCT_NATIVE_SPECS {
+        let bytes = artifact_bytes
+            .get(spec.label)
+            .ok_or_else(|| Failure::task(format!("WYR1-F snapshot lacks {}", spec.label)))?
+            .clone();
+        artifacts.push(NativeArtifact {
+            spec,
+            sha256: sha256::bytes_digest(&bytes),
+            bytes,
+            inspection: String::new(),
+        });
+    }
+    assemble_wyr1f_product(revision, &artifacts)
 }
 
 pub(crate) fn reassemble_e7_snapshot(
@@ -4808,6 +5383,577 @@ mod tests {
         assert!(wyr1f_native_spec("stdout-pressure").is_err());
         assert!(wyr1f_native_spec("cpu-hog").is_err());
         assert!(wyr1f_native_spec("consoled").is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // F1A.3: final normal product construction and its required negatives.
+    //
+    // The positives prove the builder writes the frozen twelve-entry archive
+    // deterministically. The negatives all run through `verify_wyr1f_product`,
+    // the independent re-reader, rather than through the builder's own return
+    // values, so a builder that wrote the wrong thing cannot also pass.
+    // -----------------------------------------------------------------------
+
+    fn wyr1f_artifacts() -> Vec<NativeArtifact> {
+        WYR1F_PRODUCT_NATIVE_SPECS
+            .iter()
+            .enumerate()
+            .map(|(index, spec)| {
+                let bytes = vec![index as u8 + 0x41; index + 9];
+                NativeArtifact {
+                    spec: *spec,
+                    sha256: sha256::bytes_digest(&bytes),
+                    bytes,
+                    inspection: String::new(),
+                }
+            })
+            .collect()
+    }
+
+    const WYR1F_TEST_REVISION: &str = "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1";
+
+    fn wyr1f_product() -> (Wyr1fProductBytes, Vec<NativeArtifact>) {
+        let artifacts = wyr1f_artifacts();
+        let product = assemble_wyr1f_product(WYR1F_TEST_REVISION, &artifacts)
+            .expect("assemble the final normal product");
+        (product, artifacts)
+    }
+
+    /// Rebuilds a product's bootfs after applying explicit entry edits, so a
+    /// negative can plant material the builder itself would never emit.
+    ///
+    /// `None` removes the entry; `Some((bytes, executable))` replaces or adds.
+    fn respin_wyr1f_bootfs(
+        product: &Wyr1fProductBytes,
+        edits: &[(&str, Option<(Vec<u8>, bool)>)],
+    ) -> Vec<u8> {
+        use wyrmroot_bootfs::builder::{Builder, FileMode};
+
+        let archive = Archive::new(&product.bootfs).expect("reread the product bootfs");
+        let mut entries: Vec<(String, Vec<u8>, bool)> = archive
+            .entries()
+            .map(|entry| {
+                (
+                    entry.name_utf8().expect("UTF-8 path").to_owned(),
+                    entry.data().to_vec(),
+                    entry.is_executable(),
+                )
+            })
+            .collect();
+        for (path, edit) in edits {
+            entries.retain(|(existing, _, _)| existing != path);
+            if let Some((bytes, executable)) = edit {
+                entries.push(((*path).to_owned(), bytes.clone(), *executable));
+            }
+        }
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut builder = Builder::new();
+        for (path, bytes, executable) in &entries {
+            builder
+                .add(
+                    path.as_bytes(),
+                    bytes,
+                    if *executable {
+                        FileMode::Executable
+                    } else {
+                        FileMode::ReadOnly
+                    },
+                )
+                .expect("add a respun entry");
+        }
+        builder.build().expect("respin the product bootfs")
+    }
+
+    #[test]
+    fn wyr1f_normal_product_is_the_exact_twelve_entry_production_archive() {
+        let (product, artifacts) = wyr1f_product();
+        let archive = Archive::new(&product.bootfs).unwrap();
+        assert_eq!(archive.entries().count(), 12);
+        for (path, executable) in WYR1F_EXPECTED_PATHS {
+            let entry = archive.lookup(path.as_bytes()).expect("frozen entry");
+            assert_eq!(entry.is_executable(), executable, "{path}");
+        }
+        // No historical or acceptance material rode along.
+        for absent in [
+            "test/wyr1-e/recovery-trigger",
+            "test/wyr1-e/stdout-pressure",
+            "test/wyr1-e/fault",
+            "bin/cpu-hog",
+            "bin/console-echo",
+            "system/bootstrap/wyr1-d5-gate-v1",
+            "system/bootstrap/wyr1-c6-gate-v1",
+        ] {
+            assert!(archive.lookup(absent.as_bytes()).is_err(), "{absent}");
+        }
+        let policy = LaunchPolicy::parse(&product.launch_policy).unwrap();
+        assert_eq!(policy.version_minor(), 1, "minor 2 admits recovery-trigger");
+        assert_eq!(policy.len(), 2);
+        let manifest =
+            Manifest::parse_structural(&product.rrc_manifest, &product.generation).unwrap();
+        assert_eq!(
+            manifest.role(RoleId::Wyrmsh).unwrap().startup_profile(),
+            StartupProfile::Wyrmsh
+        );
+        assert_eq!(manifest.roles().count(), 5);
+        assert_eq!(manifest.edges().count(), 4);
+        verify_wyr1f_product(&product, &artifacts).expect("the product verifies");
+    }
+
+    #[test]
+    fn wyr1f_product_serializes_deterministically() {
+        let artifacts = wyr1f_artifacts();
+        let first = assemble_wyr1f_product(WYR1F_TEST_REVISION, &artifacts).unwrap();
+        let second = assemble_wyr1f_product(WYR1F_TEST_REVISION, &artifacts).unwrap();
+        assert_eq!(first.generation, second.generation);
+        assert_eq!(first.bootfs, second.bootfs);
+        assert_eq!(first.rrc_manifest, second.rrc_manifest);
+        assert_eq!(first.launch_policy, second.launch_policy);
+        assert_eq!(first.device_manifest, second.device_manifest);
+        // A different source revision is a different product generation.
+        let moved = assemble_wyr1f_product(&"a".repeat(40), &artifacts).unwrap();
+        assert_ne!(first.generation, moved.generation);
+        assert_ne!(first.bootfs, moved.bootfs);
+    }
+
+    /// F1A.3 change W3, and contract §5.4's normal/degraded difference.
+    #[test]
+    fn wyr1f_gate_config_drops_the_stale_c1_host_only_label() {
+        assert!(!WYR1F_NORMAL_GATE_CONFIG
+            .windows(GATE_CONFIG.len())
+            .any(|window| window == GATE_CONFIG));
+        let text = core::str::from_utf8(WYR1F_NORMAL_GATE_CONFIG).unwrap();
+        assert!(!text.contains("wyr1-c1-host-only"));
+        assert!(text.contains("product = \"wyr1-f-normal\""));
+        // Ordinary boot needs no selector, scenario, nonce or evidence channel.
+        assert!(text.contains("selector = \"none\""));
+        assert!(!text.contains("scenario"));
+        assert!(!text.contains("nonce"));
+        assert!(!text.contains("test_id"));
+        // The whole file differs from the instrumented shape rather than one
+        // line inside a shared one. `gate::parse_gate_config`
+        // (`userspace/system-init/src/gate.rs:24`) requires
+        // `selector = "permanent-supervisor-rrc"` on its second line, so these
+        // bytes are not a gate contract at all — which is safe only because the
+        // native boot path never looks this file up. That crate is not an xtask
+        // dependency, so the assertion here is on the shape the parser demands.
+        assert_ne!(text.lines().nth(1), Some("selector = \"permanent-supervisor-rrc\""));
+        let (product, _) = wyr1f_product();
+        let archive = Archive::new(&product.bootfs).unwrap();
+        assert_eq!(
+            archive
+                .lookup(b"system/bootstrap/wyr1-a-gate-v1")
+                .unwrap()
+                .data(),
+            WYR1F_NORMAL_GATE_CONFIG
+        );
+    }
+
+    #[test]
+    fn wyr1f_rejects_an_absent_or_duplicated_role() {
+        let artifacts = wyr1f_artifacts();
+        let mut short = artifacts.clone();
+        short.remove(3);
+        assert!(assemble_wyr1f_product(WYR1F_TEST_REVISION, &short).is_err());
+
+        let mut duplicated = artifacts.clone();
+        duplicated[4] = duplicated[3].clone();
+        assert!(assemble_wyr1f_product(WYR1F_TEST_REVISION, &duplicated).is_err());
+
+        let mut reordered = artifacts.clone();
+        reordered.swap(1, 2);
+        assert!(assemble_wyr1f_product(WYR1F_TEST_REVISION, &reordered).is_err());
+
+        let mut empty = artifacts.clone();
+        empty[0].bytes.clear();
+        empty[0].sha256 = sha256::bytes_digest(&empty[0].bytes);
+        assert!(assemble_wyr1f_product(WYR1F_TEST_REVISION, &empty).is_err());
+
+        let mut snapshot: BTreeMap<String, Vec<u8>> = artifacts
+            .iter()
+            .map(|artifact| (artifact.spec.label.to_owned(), artifact.bytes.clone()))
+            .collect();
+        assert!(reassemble_wyr1f_snapshot(WYR1F_TEST_REVISION, &snapshot).is_ok());
+        snapshot.remove("consoled");
+        assert!(reassemble_wyr1f_snapshot(WYR1F_TEST_REVISION, &snapshot).is_err());
+    }
+
+    /// "Stub artifact in a required role." The retained-stub UART, consoled and
+    /// shell are exactly what C1 shipped; the final product must refuse them
+    /// even though their bytes are a structurally valid ELF.
+    #[test]
+    fn wyr1f_rejects_a_stub_or_selector_build_in_a_required_role() {
+        for (index, substitute) in [
+            (
+                3,
+                NativeSpec {
+                    label: "uart16550d",
+                    package: "wyrmroot-wyr1-retained-stubs",
+                    binary: "uart16550d",
+                    features: "native-retained",
+                    artifact: "uart16550d",
+                },
+            ),
+            (
+                5,
+                NativeSpec {
+                    label: "wyrmsh",
+                    package: "wyrmroot-wyr1-retained-stubs",
+                    binary: "wyrmsh",
+                    features: "native-retained",
+                    artifact: "wyrmsh",
+                },
+            ),
+            (
+                0,
+                NativeSpec {
+                    label: "system-init",
+                    package: "wyrmroot-system-init",
+                    binary: "system-init",
+                    features: "wyr1e8-selector33",
+                    artifact: "system-init",
+                },
+            ),
+            (
+                2,
+                NativeSpec {
+                    label: "devmgr",
+                    package: "wyrmroot-devmgr",
+                    binary: "devmgr",
+                    features: "wyr1e-production",
+                    artifact: "devmgr",
+                },
+            ),
+        ] {
+            let mut artifacts = wyr1f_artifacts();
+            artifacts[index].spec = substitute;
+            assert!(
+                assemble_wyr1f_product(WYR1F_TEST_REVISION, &artifacts).is_err(),
+                "{} accepted {}/{}",
+                substitute.label,
+                substitute.package,
+                substitute.features
+            );
+        }
+    }
+
+    #[test]
+    fn wyr1f_rejects_a_path_or_content_mismatch() {
+        let (product, artifacts) = wyr1f_product();
+
+        // The declared artifact no longer matches the archived bytes.
+        let mut drifted = artifacts.clone();
+        drifted[4].bytes.push(0xff);
+        drifted[4].sha256 = sha256::bytes_digest(&drifted[4].bytes);
+        assert!(
+            wyr1f_rejection(&product, &drifted).contains("content differs at system/consoled"),
+            "{}",
+            wyr1f_rejection(&product, &drifted)
+        );
+
+        // A role executable moved to a path nothing supervises.
+        let moved = Wyr1fProductBytes {
+            bootfs: respin_wyr1f_bootfs(
+                &product,
+                &[
+                    ("system/consoled", None),
+                    (
+                        "system/consoled-v2",
+                        Some((artifacts[4].bytes.clone(), true)),
+                    ),
+                ],
+            ),
+            ..clone_wyr1f(&product)
+        };
+        assert!(
+            wyr1f_rejection(&moved, &artifacts)
+                .contains("unadmitted entry system/consoled-v2"),
+            "{}",
+            wyr1f_rejection(&moved, &artifacts)
+        );
+
+        // Immutable policy material demoted to executable.
+        let rewritable = Wyr1fProductBytes {
+            bootfs: respin_wyr1f_bootfs(
+                &product,
+                &[(
+                    "system/bootstrap/rrc-a-v1",
+                    Some((product.rrc_manifest.clone(), true)),
+                )],
+            ),
+            ..clone_wyr1f(&product)
+        };
+        assert!(
+            wyr1f_rejection(&rewritable, &artifacts)
+                .contains("rights differ at system/bootstrap/rrc-a-v1"),
+            "{}",
+            wyr1f_rejection(&rewritable, &artifacts)
+        );
+    }
+
+    #[test]
+    fn wyr1f_rejects_a_test_actor_or_extra_executable_in_the_product() {
+        let (product, artifacts) = wyr1f_product();
+        for planted in [
+            "test/wyr1-e/recovery-trigger",
+            "test/wyr1-e/fault",
+            "bin/cpu-hog",
+            "system/wyrmsh-recovery",
+        ] {
+            let polluted = Wyr1fProductBytes {
+                bootfs: respin_wyr1f_bootfs(&product, &[(planted, Some((vec![0x7f; 16], true)))]),
+                ..clone_wyr1f(&product)
+            };
+            let message = wyr1f_rejection(&polluted, &artifacts);
+            assert!(
+                message.contains(&format!("unadmitted entry {planted}")),
+                "{planted} was admitted or misreported: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn wyr1f_rejects_a_conflicting_shell_or_non_admitted_launch_path() {
+        let (product, artifacts) = wyr1f_product();
+        let generation = product.generation;
+        let hello_identity = sha256::bytes_digest_array(&artifacts[6].bytes);
+        let wyrmsh_identity = sha256::bytes_digest_array(&artifacts[5].bytes);
+
+        // Some of these shapes the WRJP encoder refuses outright — it owns the
+        // path-to-profile pairing — and the rest it will happily write, leaving
+        // the product re-reader as the thing that has to catch them. Both
+        // outcomes are a rejection; what would not be acceptable is a shape
+        // that encodes *and* verifies.
+        let encode = |entries: &[LaunchPolicyEntry]| -> Option<Vec<u8>> {
+            let mut buffer = [0u8; 1024];
+            encode_wyrmsh(generation, entries, &mut buffer)
+                .ok()
+                .map(|size| buffer[..size].to_vec())
+        };
+        let hello_entry = LaunchPolicyEntry {
+            path: "bin/hello",
+            content_sha256: hello_identity,
+            startup_abi: 2,
+            profile_id: JOB_V2_PROFILE_ID,
+            allow_no_streams: false,
+            allow_three_streams: true,
+        };
+        let wyrmsh_entry = LaunchPolicyEntry {
+            path: WYRMSH_PATH,
+            content_sha256: wyrmsh_identity,
+            startup_abi: 2,
+            profile_id: WYRMSH_PROFILE_ID,
+            allow_no_streams: false,
+            allow_three_streams: true,
+        };
+
+        let variants: Vec<(&str, Option<Vec<u8>>)> = vec![
+            // The shell entry binds content the archive does not hold at
+            // system/wyrmsh: a conflicting shell artifact.
+            (
+                "shell bound to foreign content",
+                encode(&[
+                    hello_entry,
+                    LaunchPolicyEntry {
+                        content_sha256: hello_identity,
+                        ..wyrmsh_entry
+                    },
+                ]),
+            ),
+            // The shell runs under the plain job profile instead of its own.
+            (
+                "shell demoted to JobV2",
+                encode(&[
+                    hello_entry,
+                    LaunchPolicyEntry {
+                        profile_id: JOB_V2_PROFILE_ID,
+                        ..wyrmsh_entry
+                    },
+                ]),
+            ),
+            // Stream rights widened beyond the frozen three-stream shape.
+            (
+                "streamless launch admitted",
+                encode(&[
+                    LaunchPolicyEntry {
+                        allow_no_streams: true,
+                        ..hello_entry
+                    },
+                    wyrmsh_entry,
+                ]),
+            ),
+            // A launch path the production product never admits.
+            (
+                "third launch path",
+                encode(&[
+                    hello_entry,
+                    wyrmsh_entry,
+                    LaunchPolicyEntry {
+                        path: "test/wyr1-e/recovery-trigger",
+                        content_sha256: [0x5a; 32],
+                        startup_abi: 2,
+                        profile_id: JOB_V2_PROFILE_ID,
+                        allow_no_streams: false,
+                        allow_three_streams: true,
+                    },
+                ]),
+            ),
+            // The shell dropped out of the policy entirely.
+            ("shell unlaunchable", encode(&[hello_entry])),
+        ];
+
+        let mut encodable = 0;
+        let mut refused_by_encoder = 0;
+        for (name, policy) in variants {
+            let Some(policy) = policy else {
+                refused_by_encoder += 1;
+                continue;
+            };
+            encodable += 1;
+            let mutated = Wyr1fProductBytes {
+                bootfs: respin_wyr1f_bootfs(
+                    &product,
+                    &[(LAUNCH_POLICY_PATH, Some((policy.clone(), false)))],
+                ),
+                launch_policy: policy,
+                ..clone_wyr1f(&product)
+            };
+            let message = wyr1f_rejection(&mutated, &artifacts);
+            assert!(
+                message.contains("launch policy") || message.contains("unreachable executable"),
+                "{name} was rejected for an unrelated reason: {message}"
+            );
+        }
+        // Guard against the whole set quietly collapsing into encoder refusals,
+        // which would leave the re-reader's policy checks unexercised.
+        assert!(
+            encodable >= 3,
+            "only {encodable} policy negatives reached the re-reader ({refused_by_encoder} refused by the encoder)"
+        );
+    }
+
+    #[test]
+    fn wyr1f_rejects_a_broken_dependency_chain_or_a_foreign_rrc_edge() {
+        let (product, artifacts) = wyr1f_product();
+        let role_hashes = [
+            sha256::bytes_digest_array(&artifacts[1].bytes),
+            sha256::bytes_digest_array(&artifacts[2].bytes),
+            sha256::bytes_digest_array(&artifacts[3].bytes),
+            sha256::bytes_digest_array(&artifacts[4].bytes),
+            sha256::bytes_digest_array(&artifacts[5].bytes),
+        ];
+
+        // A manifest built without the shell's own startup profile is the
+        // historical retained-stub shape, not the final product's.
+        let historical = crate::wyr1::fixed_builder_for_profiles(
+            &product.generation,
+            role_hashes,
+            StartupProfile::BootstrapRegistry,
+            StartupProfile::DeviceCoordinator,
+        )
+        .unwrap()
+        .build_structural()
+        .unwrap();
+        let swapped = Wyr1fProductBytes {
+            bootfs: respin_wyr1f_bootfs(
+                &product,
+                &[(
+                    "system/bootstrap/rrc-a-v1",
+                    Some((historical.clone(), false)),
+                )],
+            ),
+            rrc_manifest: historical,
+            ..clone_wyr1f(&product)
+        };
+        assert!(
+            wyr1f_rejection(&swapped, &artifacts).contains("wyrmsh carries the wrong startup profile"),
+            "{}",
+            wyr1f_rejection(&swapped, &artifacts)
+        );
+
+        // A manifest whose role identities name artifacts the archive does not
+        // hold: the RRC reaches material outside the retained bootfs.
+        let foreign = crate::wyr1::fixed_builder_for_wyrmsh(
+            &product.generation,
+            [role_hashes[0], role_hashes[1], role_hashes[2], role_hashes[3], [0x11; 32]],
+        )
+        .unwrap()
+        .build_structural()
+        .unwrap();
+        let detached = Wyr1fProductBytes {
+            bootfs: respin_wyr1f_bootfs(
+                &product,
+                &[("system/bootstrap/rrc-a-v1", Some((foreign.clone(), false)))],
+            ),
+            rrc_manifest: foreign,
+            ..clone_wyr1f(&product)
+        };
+        assert!(
+            wyr1f_rejection(&detached, &artifacts)
+                .contains("wyrmsh identity does not match its artifact"),
+            "{}",
+            wyr1f_rejection(&detached, &artifacts)
+        );
+
+        // The gate config is init's immutable RRC-A dependency. Reverting it to
+        // the stale C1 bytes is caught by the content join before the closure
+        // comparison runs — which is the point of checking both: the closure
+        // would also have moved, since `expected_closure_for_request` binds the
+        // config's content identity.
+        let regated = Wyr1fProductBytes {
+            bootfs: respin_wyr1f_bootfs(
+                &product,
+                &[(
+                    "system/bootstrap/wyr1-a-gate-v1",
+                    Some((GATE_CONFIG.to_vec(), false)),
+                )],
+            ),
+            ..clone_wyr1f(&product)
+        };
+        assert!(
+            wyr1f_rejection(&regated, &artifacts)
+                .contains("content differs at system/bootstrap/wyr1-a-gate-v1"),
+            "{}",
+            wyr1f_rejection(&regated, &artifacts)
+        );
+
+        // A WRDM naming a driver the archive does not hold.
+        let mut wrdm = [0u8; WRDM_HEADER_BYTES + WRDM_RECORD_BYTES];
+        let size = encode_com2_manifest(ContentIdentity([0x22; 32]), &mut wrdm).unwrap();
+        let misdriven = Wyr1fProductBytes {
+            bootfs: respin_wyr1f_bootfs(
+                &product,
+                &[(
+                    "system/bootstrap/wyr1-c-device-manifest-v1",
+                    Some((wrdm[..size].to_vec(), false)),
+                )],
+            ),
+            device_manifest: wrdm[..size].to_vec(),
+            ..clone_wyr1f(&product)
+        };
+        assert!(
+            wyr1f_rejection(&misdriven, &artifacts)
+                .contains("does not name the UART artifact"),
+            "{}",
+            wyr1f_rejection(&misdriven, &artifacts)
+        );
+    }
+
+    /// Returns the message of the check that rejected a product, so a negative
+    /// proves *which* invariant fired rather than only that something failed.
+    fn wyr1f_rejection(product: &Wyr1fProductBytes, artifacts: &[NativeArtifact]) -> String {
+        verify_wyr1f_product(product, artifacts)
+            .expect_err("the product should not verify")
+            .message
+    }
+
+    fn clone_wyr1f(product: &Wyr1fProductBytes) -> Wyr1fProductBytes {
+        Wyr1fProductBytes {
+            generation: product.generation,
+            rrc_manifest: product.rrc_manifest.clone(),
+            device_manifest: product.device_manifest.clone(),
+            launch_policy: product.launch_policy.clone(),
+            bootfs: product.bootfs.clone(),
+        }
     }
 
     #[test]
