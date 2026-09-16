@@ -690,7 +690,7 @@ fn kernel_build_command(
 /// Thirteen of them do vary by product, and those thirteen are the whole
 /// declared production-versus-instrumented and normal-versus-degraded
 /// difference as the request records it.
-fn fixed_fields(product_kind: wyr1c::Wyr1fProduct) -> [(&'static str, &'static str); 35] {
+fn fixed_fields(product_kind: wyr1c::Wyr1fProduct) -> [(&'static str, &'static str); 40] {
     use wyr1c::Wyr1fProduct;
     let instrumented = product_kind.is_instrumented();
     [
@@ -812,6 +812,38 @@ fn fixed_fields(product_kind: wyr1c::Wyr1fProduct) -> [(&'static str, &'static s
                 Wyr1fProduct::Degraded => "prepared-degraded-sibling-only",
             },
         ),
+        // Contract §11 item 14, closed at F2A: the receipt bound no kernel
+        // resource-geometry scalar, and F2A.1 found there was no production
+        // resource policy for one to name -- the freestanding kernel fell
+        // through to the bootstrap-era arm. These five say which ledger the
+        // kernel inside this product was built against and what it selected.
+        //
+        // Deepwyrm owns the reconciliation. `production_resource_geometry.rs`
+        // and `kernel/tests/x86_64_syscall_contract.rs` assert these same
+        // numbers against the constants the kernel links, so a capacity change
+        // there fails Deepwyrm's own suite before it can reach a product whose
+        // receipt still claims the old figure.
+        (
+            "kernel_resource_geometry",
+            if instrumented {
+                "wyr1e-interactive"
+            } else {
+                "production"
+            },
+        ),
+        // Sixteen in both, for different reasons: production selects its
+        // ledger's `identities`, the instrumented arm its literal. They agree
+        // today, and are recorded so that stays visible if one moves.
+        ("kernel_identity_capacity", "16"),
+        ("kernel_handle_capacity", if instrumented { "32" } else { "48" }),
+        ("kernel_registry_capacity", "160"),
+        // The linked per-thread kernel-stack arena. `identities` becomes
+        // `THREADS` and every Thread needs one of these carriers, so a product
+        // whose identity capacity exceeds this number boots nothing at all --
+        // silently, because the release build folds the unsatisfiable
+        // continuation away. Bound here so the relation is legible in the
+        // receipt rather than only in a const assert.
+        ("kernel_thread_stack_count", "16"),
         ("com1_role", "trusted-serial-diagnostics"),
         ("com2_role", "native-shell-byte-stream"),
         ("com2_transport", "unix-socket-byte-stream"),
