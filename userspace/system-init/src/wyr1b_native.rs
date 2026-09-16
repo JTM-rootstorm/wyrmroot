@@ -510,16 +510,16 @@ impl ShellControllerState {
     }
 
     #[cfg(feature = "wyr1e8-selector33")]
-    fn classify_e8_trigger_request(
+    fn classify_e8_trigger_launch(
         &self,
-        request: &[u8],
-        handles: usize,
+        reservation: LaunchReservation,
+        launch: &wyrmroot_launch_proto::LaunchRequest<'_>,
     ) -> Result<Option<E8TriggerRequest>, InitError> {
-        let trigger = e8_trigger_from_request(
+        let trigger = e8_trigger_from_launch(
             self.e8_evidence.stage(),
             self.e8_evidence.nonce(),
-            request,
-            handles,
+            reservation,
+            launch,
         )?;
         if trigger.is_some() && (self.e8_trigger.is_some() || self.e8_held.is_some()) {
             return Err(InitError::Accounting);
@@ -917,17 +917,26 @@ struct E8TriggerRequest {
     action: E8RecoveryAction,
 }
 
+/// Classifies a launch the dispatcher has already parsed.
+///
+/// R7B-4 class D1b. The trigger check used to take raw request bytes and run
+/// `parse_launch_message` over them a second time, on the ShellJobs dispatch
+/// path, after the dispatcher had already parsed exactly those bytes. That
+/// second parse is what made the check a sniff over every launch rather than a
+/// comparison against a value already in hand. It takes the parsed launch now.
+///
+/// The episode still opens from a ShellJobs launch. Moving it off one entirely
+/// is the rest of D1b and cannot be done here: the episode must be installed
+/// before the launch is accepted, so whatever opens it has to carry the
+/// launch's transaction, and every other source changes the E8 request wire or
+/// the evidence sequence. That part owes a design decision, not a refactor.
 #[cfg(feature = "wyr1e8-selector33")]
-fn e8_trigger_from_request(
+fn e8_trigger_from_launch(
     stage: u32,
     nonce: u64,
-    request: &[u8],
-    handles: usize,
+    reservation: LaunchReservation,
+    launch: &wyrmroot_launch_proto::LaunchRequest<'_>,
 ) -> Result<Option<E8TriggerRequest>, InitError> {
-    let request = parse_launch_message(request, handles).map_err(|_| InitError::Accounting)?;
-    let LaunchMessage::Launch(launch) = request.message else {
-        return Ok(None);
-    };
     if launch.path != wyrmroot_wyr1e_test_actors::RECOVERY_TRIGGER_PATH {
         return Ok(None);
     }
@@ -952,9 +961,28 @@ fn e8_trigger_from_request(
         return Err(InitError::Accounting);
     }
     Ok(Some(E8TriggerRequest {
-        reservation: request.reservation,
+        reservation,
         action,
     }))
+}
+
+/// Byte-level entry point, for the evidence join that only ever has bytes.
+///
+/// `e8_trigger_from_transaction` reconstructs a trigger from a recorded
+/// request/response pair, where no parsed launch survives. That is not the
+/// dispatch path and parsing there costs nothing anyone is paying for.
+#[cfg(feature = "wyr1e8-selector33")]
+fn e8_trigger_from_request(
+    stage: u32,
+    nonce: u64,
+    request: &[u8],
+    handles: usize,
+) -> Result<Option<E8TriggerRequest>, InitError> {
+    let request = parse_launch_message(request, handles).map_err(|_| InitError::Accounting)?;
+    let LaunchMessage::Launch(launch) = request.message else {
+        return Ok(None);
+    };
+    e8_trigger_from_launch(stage, nonce, request.reservation, &launch)
 }
 
 #[cfg(feature = "wyr1e8-selector33")]
@@ -5341,7 +5369,7 @@ where
                     .as_deref()
                     .map(|context| &*context.state)
                     .ok_or(InitError::WrongActivationOrder)?;
-                match state.classify_e8_trigger_request(&bytes[..counts.bytes], counts.handles) {
+                match state.classify_e8_trigger_launch(reservation, &request) {
                     Ok(trigger) => trigger,
                     Err(error) => {
                         let failed = close_received_reverse(system, &received, counts.handles);
