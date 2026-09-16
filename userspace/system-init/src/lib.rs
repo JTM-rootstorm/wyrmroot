@@ -1605,6 +1605,20 @@ impl SystemInit {
         self.accounting.outstanding()
     }
 
+    /// Installs the declared gate configuration and its evidence log on an
+    /// already-built controller, for the closure fixture only. The product
+    /// reads both from retained bootfs in `validate_retained_bootfs`.
+    #[cfg(all(test, feature = "wyr1f-closure"))]
+    pub(crate) fn install_wyr1f_gate_for_fixture(
+        &mut self,
+        gate: GateConfig,
+    ) -> Result<(), InitError> {
+        self.gate = Some(gate);
+        self.evidence =
+            Some(EvidenceLog::new(gate.nonce, gate.scenario).map_err(InitError::Evidence)?);
+        Ok(())
+    }
+
     #[must_use]
     pub const fn gate_config(&self) -> Option<GateConfig> {
         self.gate

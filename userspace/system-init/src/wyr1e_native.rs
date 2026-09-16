@@ -150,6 +150,35 @@ impl State {
         }
     }
 
+    /// A console product already installed and serving, with the shell half of
+    /// the closure READY join already recorded.
+    #[cfg(all(test, feature = "wyr1f-closure"))]
+    pub(super) fn wyr1f_degraded_fixture(
+        registry_generation: u64,
+        console: InstalledPeer,
+    ) -> Result<Self, InitError> {
+        let mut shell = ShellControllerState::new(registry_generation)?;
+        shell.observe_wyr1f_shell_ready();
+        Ok(Self {
+            jobs: JobDispatcher::new(),
+            console: Some(console),
+            shell,
+            publication_observer: None,
+            awaiting_ready: false,
+            bootstrap_released: false,
+            ready_deadline: 0,
+            console_transaction: 0,
+            next_console_transaction: FIRST_CONSOLE_TRANSACTION,
+            next_publication_observer: FIRST_PUBLICATION_OBSERVER,
+            console_launch_attempts: 0,
+        })
+    }
+
+    #[cfg(all(test, feature = "wyr1f-closure"))]
+    pub(super) const fn wyr1f_console(&self) -> Option<InstalledPeer> {
+        self.console
+    }
+
     #[cfg(all(test, feature = "wyr1e8-selector33"))]
     pub(super) fn e8_fixture_publication_observer(&self) -> Option<(DwHandle, EndpointGrant, u64)> {
         self.publication_observer.map(|observer| {

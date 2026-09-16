@@ -14822,6 +14822,99 @@ mod tests {
         );
     }
 
+    /// The declared closure episode, on the production recovery path.
+    ///
+    /// `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` §5.4 and §11 item 4. This is the
+    /// slice's central claim: the episode reaches `DEGRADED_RECOVERY` with the
+    /// driver and the console still owned, which is what makes `status`,
+    /// `services` and controlled shell exit/restart possible afterwards.
+    /// Before the §5.3.1 narrowing this test could not pass -- `recover_devmgr`
+    /// retired both before it knew devmgr would not come back.
+    #[cfg(feature = "wyr1f-closure")]
+    #[test]
+    fn the_declared_episode_degrades_with_the_console_and_driver_retained() {
+        let image = executable();
+        let generation = [0x47; 32];
+        let mut manifest = [0u8; 80];
+        manifest[48..80].copy_from_slice(&generation);
+        let mut builder = BootfsBuilder::new();
+        builder
+            .add(MANIFEST_PATH.as_bytes(), &manifest, FileMode::ReadOnly)
+            .unwrap();
+        builder
+            .add(b"system/devmgr", &image, FileMode::Executable)
+            .unwrap();
+        // The replacement loop reads the device manifest before its first
+        // attempt, whether or not the episode then refuses that attempt.
+        builder
+            .add(
+                crate::wyr1c_native::DEVICE_MANIFEST_PATH.as_bytes(),
+                &[0u8; 16],
+                FileMode::ReadOnly,
+            )
+            .unwrap();
+        let bootfs = builder.build().unwrap();
+        let mut platform = ShellPlatform::new();
+        platform.allow_wait_until = true;
+        platform.bootfs = Some(bootfs.clone());
+        let mut loader = InitSendLoader::new();
+        loader.fail_init = false;
+        let mut waits = AcceptedJobV2Waits {
+            transaction_id: 0xE8B5_0002,
+            profile: LaunchProfile::EarlyBootStub,
+            exited: true,
+            console_status_lost_process: None,
+            running_process: None,
+        };
+        let console = InstalledPeer {
+            grant: EndpointGrant {
+                registry_generation: 1,
+                endpoint_id: 21,
+                endpoint_generation: 1,
+                role_generation: 1,
+                kind: EndpointKind::LaunchSession,
+            },
+            loaded: LoadedProcess {
+                process: DwHandle(0xF1B0_0001),
+                launch_channel: DwHandle(0xF1B0_0002),
+            },
+            task_group: DwHandle(0xF1B0_0003),
+        };
+        let driver_request = crate::wyr1c_native::wyr1f_fixture_driver_request();
+        // Deliver the trigger eight times. A second episode, a re-armed one, or
+        // a reset retry budget would all show up as a different outcome.
+        let outcome = crate::wyr1c_native::exercise_wyr1f_degraded_episode(
+            &mut platform,
+            &mut loader,
+            &mut waits,
+            &bootfs,
+            wyrmroot_runtime::sha256::digest(&image),
+            1,
+            console,
+            driver_request,
+            8,
+        )
+        .expect("the declared episode must reach a terminal supervisor result");
+
+        assert_eq!(outcome.mode, crate::SystemMode::Degraded);
+        assert_eq!(outcome.result, crate::RecoveryResult::Degraded);
+        // Exactly one transition and one authoritative record, not eight.
+        assert_eq!(outcome.degraded_transitions, 1);
+        assert_eq!(outcome.permanent_failure_records, 1);
+        assert!(matches!(
+            outcome.devmgr_state,
+            Some(RestartState::PermanentFailure { .. })
+        ));
+        // The dependency-preservation rule: both survive the episode.
+        assert_eq!(outcome.console, Some(console), "console retained");
+        assert!(outcome.driver_retained, "driver retained");
+        // DEGRADED is a trustworthy substrate, not FATAL.
+        assert_ne!(outcome.mode, crate::SystemMode::Fatal);
+        // The episode is closed: ordinary activation is no longer refused, so
+        // nothing the shell does afterwards re-enters it.
+        assert!(!outcome.refuses_activation);
+    }
+
     /// The product's own registry recovery, with nothing E8 about it.
     ///
     /// Reset card R7E. Before this test the only host test that reached

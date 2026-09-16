@@ -17,7 +17,9 @@ use crate::wyr1b_job::JobDispatcher;
 #[cfg(all(test, feature = "wyr1e-production"))]
 use crate::wyr1b_native::registry_native_attempt_for_fixture;
 #[cfg(all(test, feature = "wyr1e8-selector33"))]
-use crate::wyr1b_native::{InstalledPeer, ShellControllerState};
+use crate::wyr1b_native::ShellControllerState;
+#[cfg(all(test, any(feature = "wyr1e8-selector33", feature = "wyr1f-closure")))]
+use crate::wyr1b_native::InstalledPeer;
 #[cfg(feature = "dw1e3-selector31")]
 use crate::wyr1b_native::{InstalledPeer, launch_registry_client_actor};
 use crate::wyr1b_native::{
@@ -4080,6 +4082,117 @@ where
         .as_ref()
         .ok_or(InitError::WrongActivationOrder)?;
     Ok((resident.result, state.topology.generation(), role))
+}
+
+/// The driver request the closure fixture's retained driver was launched from.
+#[cfg(all(test, feature = "wyr1f-closure"))]
+pub(crate) fn wyr1f_fixture_driver_request() -> DriverLaunchRequest {
+    DriverLaunchRequest {
+        supervisor_generation: SupervisorGeneration(1),
+        role_id: wyrmroot_device_proto::COM2_ROLE_ID,
+        attempt_generation: wyrmroot_device_proto::coordinator::AttemptGeneration(1),
+        launch_session: wyrmroot_device_proto::coordinator::LaunchSessionGeneration(2),
+        endpoint: wyrmroot_device_proto::ControlEndpoint {
+            id: wyrmroot_device_proto::coordinator::EndpointId(3),
+            generation: wyrmroot_device_proto::coordinator::EndpointGeneration(1),
+        },
+        transaction_id: 9,
+        driver_path: wyrmroot_device_proto::DEVICE_DRIVER_PATH,
+        actor_identity: wyrmroot_device_proto::manifest::ContentIdentity([0x5a; 32]),
+        child_is_channel: true,
+        child_rights: wyrmroot_device_proto::DirectControlRights::ExactReduced,
+    }
+}
+
+/// What one declared closure episode leaves behind.
+#[cfg(all(test, feature = "wyr1f-closure"))]
+#[derive(Debug)]
+pub(crate) struct Wyr1fDegradedOutcome {
+    pub(crate) result: RecoveryResult,
+    pub(crate) mode: SystemMode,
+    pub(crate) degraded_transitions: u8,
+    pub(crate) console: Option<InstalledPeer>,
+    pub(crate) driver_retained: bool,
+    pub(crate) devmgr_state: Option<RestartState>,
+    pub(crate) permanent_failure_records: usize,
+    pub(crate) refuses_activation: bool,
+}
+
+/// Drives one declared closure episode through the production recovery path.
+///
+/// Nothing here is synthetic except the resident the episode starts from: the
+/// trigger is taken through `wyr1f_closure_trigger`, and the consequence is
+/// `recover_devmgr` and `launch_devmgr_replacement` exactly as the product
+/// runs them. `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` §5.4 and §11 item 4.
+#[cfg(all(test, feature = "wyr1f-closure"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn exercise_wyr1f_degraded_episode<S, L, W>(
+    system: &mut S,
+    loader: &mut L,
+    waits: &mut W,
+    bootfs: &[u8],
+    registry_identity: [u8; 32],
+    registry_generation: u64,
+    console: InstalledPeer,
+    driver_request: DriverLaunchRequest,
+    deliveries: u32,
+) -> Result<Wyr1fDegradedOutcome, InitError>
+where
+    S: Wyr1BPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    use crate::gate::{GateConfig, GateContract, GateScenario};
+    let e6 = wyr1e::State::wyr1f_degraded_fixture(registry_generation, console)?;
+    let (mut resident, _devmgr, _driver) = recovery_fixture_resident(
+        registry_identity,
+        registry_generation,
+        e6,
+        RegistryTopology::new(registry_generation).map_err(InitError::Wyr1BModel)?,
+        Some(driver_request),
+    )?;
+    let gate = GateConfig {
+        contract: GateContract::Dw1Wyr1InteractiveClosure,
+        scenario: GateScenario::DegradedRecovery,
+        nonce: 0x00ff,
+    };
+    resident.controller.install_wyr1f_gate_for_fixture(gate)?;
+    resident.wyr1f = crate::wyr1f_closure::ClosureEpisode::new(Some(gate));
+
+    // Deliver the trigger `deliveries` times. A second episode, a re-armed
+    // one, or a reset retry budget would all show up in the outcome.
+    let mut fired = 0_u32;
+    for _ in 0..deliveries {
+        if wyr1f_closure_trigger(&mut resident, wyr1e::PollOutcome::Stable)
+            == wyr1e::PollOutcome::RecoverDevmgr
+        {
+            fired += 1;
+            recover_devmgr(&mut resident, system, loader, waits, bootfs)?;
+        }
+    }
+    assert_eq!(fired, 1, "exactly one episode per boot");
+    // One more poll, as the idle product makes it, to close the episode.
+    let idle = wyr1f_closure_trigger(&mut resident, wyr1e::PollOutcome::Stable);
+    assert_eq!(idle, wyr1e::PollOutcome::Stable, "an idle poll re-triggered");
+
+    let permanent_failure_records = (0..)
+        .map_while(|index| resident.controller.evidence_line(index))
+        .filter(|line| &line[39..41] == b"04")
+        .count();
+    let state = resident
+        .wyr1c
+        .as_ref()
+        .ok_or(InitError::WrongActivationOrder)?;
+    Ok(Wyr1fDegradedOutcome {
+        result: resident.result,
+        mode: resident.controller.mode(),
+        degraded_transitions: resident.controller.degraded_transitions(),
+        console: state.e6.as_ref().and_then(wyr1e::State::wyr1f_console),
+        driver_retained: state.driver.is_some(),
+        devmgr_state: resident.controller.role_state(RoleId::Devmgr),
+        permanent_failure_records,
+        refuses_activation: resident.wyr1f.refuses_activation(),
+    })
 }
 
 /// Test-only bridge from the reached S3 held-WAIT state into the production
