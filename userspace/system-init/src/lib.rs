@@ -3966,6 +3966,59 @@ mod native_cleanup_tests {
         controller
     }
 
+    /// Contract §11 item 4: shell exit and restart under DEGRADED.
+    ///
+    /// The half of that obligation that lives in the supervisor. §5.4 argues a
+    /// replacement shell cannot silently restore NORMAL because wyrmsh READY
+    /// "hits the `_ => {}` arm" of `ready()`. That arm is real but is not what
+    /// protects this: `ready()` rejects wyrmsh before reaching any arm, because
+    /// `index()` maps only Registryd and Devmgr. The protection is stronger
+    /// than the argument given for it -- no wyrmsh generation can enter the
+    /// supervisor's mode machinery at all -- and the same holds for the three
+    /// other non-early roles, so a replacement consoled cannot restore NORMAL
+    /// either.
+    #[cfg(feature = "wyr1f-closure")]
+    #[test]
+    fn no_console_or_shell_generation_can_restore_normal_after_degraded() {
+        let mut controller = ready_registry_controller();
+        install_ready_attempt(&mut controller, RoleId::Devmgr, 1, 0x1002, (11, 21, 31), 3);
+        controller
+            .retire_active_fail_closed(
+                RoleId::Devmgr,
+                1,
+                0x1002,
+                9,
+                AttemptFailure::WaitFailed,
+                CleanupDisposition::Complete,
+            )
+            .unwrap();
+        assert_eq!(controller.mode(), SystemMode::Degraded);
+        assert_eq!(controller.degraded_transitions(), 1);
+
+        // Every role outside the two early slots is refused outright, at any
+        // generation or transaction, and leaves the mode alone.
+        for role in [RoleId::Uart16550d, RoleId::Consoled, RoleId::Wyrmsh] {
+            for (generation, transaction) in [(1, 0x1002), (2, 0x2002), (9, 0x9009)] {
+                assert_eq!(
+                    controller.ready(role, generation, transaction, 20),
+                    Err(InitError::UnlaunchableRole)
+                );
+                assert_eq!(
+                    controller.child_started(role, generation, transaction, 20),
+                    Err(InitError::UnlaunchableRole)
+                );
+            }
+        }
+        assert_eq!(controller.mode(), SystemMode::Degraded);
+        assert_eq!(controller.degraded_transitions(), 1);
+
+        // DEGRADED is a trustworthy substrate. It is not FATAL, and reaching
+        // it did not consume the distinction.
+        assert_ne!(controller.mode(), SystemMode::Fatal);
+        controller.fatal();
+        assert_eq!(controller.mode(), SystemMode::Fatal);
+    }
+
     /// The final closure episode, driven through the real transition owner.
     ///
     /// `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` §5.4. The episode itself never

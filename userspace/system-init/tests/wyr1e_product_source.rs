@@ -284,3 +284,37 @@ fn selector32_resident_remains_on_historical_launch_and_gate_paths() {
     assert!(!SELECTOR32.contains("poll_job_dispatcher_with_shell"));
     assert!(!SELECTOR32.contains("LaunchSessionScope::ConsoleLauncher"));
 }
+
+/// Contract §11 item 4, the dispatcher half: ordinary `exit` and fresh-shell
+/// construction keep working under DEGRADED.
+///
+/// The console/shell supervisor consults the supervisor's mode nowhere. That
+/// is the whole reason shell continuity survives a degraded episode, and it is
+/// exactly the kind of property that regresses silently when someone adds a
+/// well-meaning mode gate -- so it is pinned by absence, deliberately.
+/// `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` §5.4 also forbids the converse: a
+/// replacement shell must not restore NORMAL, which no code here could do
+/// because none of it can reach the mode.
+#[test]
+fn the_console_and_shell_supervisor_never_reads_or_writes_the_supervisor_mode() {
+    for (name, source) in [
+        ("wyr1e_native.rs", E6),
+        ("wyr1b_job.rs", include_str!("../src/wyr1b_job.rs")),
+    ] {
+        assert!(
+            !source.contains("SystemMode"),
+            "{name} must not reach the supervisor mode: shell continuity under \
+             DEGRADED depends on the job dispatcher and the shell launch path \
+             being mode-blind, and a replacement shell must not be able to \
+             restore NORMAL"
+        );
+    }
+
+    // The dispatcher leg of `poll` is unconditional apart from the E8
+    // evidence-adjacency gate, which is a selector's and is not the mode.
+    let poll = item(E6, "pub(super) fn poll<S, L, W>");
+    assert!(poll.contains("let poll_shell_jobs = true;"));
+    let gate = poll.find("if poll_shell_jobs {").unwrap();
+    let dispatch = poll.find("poll_job_dispatcher_with_shell(").unwrap();
+    assert!(gate < dispatch);
+}
