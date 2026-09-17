@@ -1072,11 +1072,43 @@ where
         let counts =
             match system.receive_channel(console.loaded.launch_channel, &mut bytes, &mut handles) {
                 Ok(counts) => counts,
-                Err(_) => {
-                    retire_current_console(e6, system, waits, state.topology.generation(), true)?;
-                    return Ok(PollOutcome::RecoverRegistry(
-                        crate::wyr1c_native::abandoned::phase::CONSOLE_RECEIVE_FAILED,
-                    ));
+                // F3A.6j. This arm is why the F bring-up took six boots to
+                // locate: it discarded the kernel status that says why the
+                // console's own message could not be received, retired the
+                // console, and reported a *registry* recovery. The failure
+                // then spent the registry's restart budget and surfaced as an
+                // abandoned registry, four ticks and two indirections from
+                // the actual refusal.
+                //
+                // The console wait twenty lines above already preserves its
+                // native error; this one did not, and this one is the one
+                // that fires. `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §3.2:
+                // the instance is owed to the reader's channel, and the
+                // process exit status is that channel.
+                //
+                // Attributed here rather than left to the tick, because
+                // `attribute_failure` keeps the innermost operation: the
+                // reader gets `ActivateConsole` and the status, not
+                // `ResidentTick` and the status.
+                Err(error) => {
+                    // A cleanup failure supersedes, per the same shape the
+                    // READY-validation arm below already uses. The receive's
+                    // own status survives whenever cleanup completes. Written
+                    // as a returned `Result` rather than an unwrapped error so
+                    // the product carries no panic path for it.
+                    let cleanup = retire_current_console(
+                        e6,
+                        system,
+                        waits,
+                        state.topology.generation(),
+                        true,
+                    );
+                    let failed: Result<PollOutcome, InitError> = Err(InitError::Native(error));
+                    return if cleanup.is_err() {
+                        Err(InitError::Cleanup)
+                    } else {
+                        attribute_failure(RecoveryOperation::ActivateConsole, failed)
+                    };
                 }
             };
         if counts.handles != 0 {

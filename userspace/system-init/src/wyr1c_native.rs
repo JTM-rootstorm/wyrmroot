@@ -483,8 +483,11 @@ pub(crate) mod abandoned {
         pub(crate) const CONSOLE_WAIT_INDEX: u8 = 0x06;
         /// The console wrote when no READY was outstanding.
         pub(crate) const CONSOLE_UNSOLICITED: u8 = 0x07;
-        /// Receiving the console's message failed.
-        pub(crate) const CONSOLE_RECEIVE_FAILED: u8 = 0x08;
+        /// Retired. `0x08` was "receiving the console's message failed",
+        /// which is where F3A.6j found the F bring-up dying. That site now
+        /// returns the kernel status instead of laundering it into a registry
+        /// recovery, so the phase can no longer be produced. The number stays
+        /// spent so an older transcript still reads correctly.
         /// The console's message carried handles, which READY never does.
         pub(crate) const CONSOLE_UNEXPECTED_HANDLES: u8 = 0x09;
         /// The console's READY message failed validation.

@@ -502,6 +502,32 @@ fn every_registry_recovery_caller_names_a_distinct_trigger() {
         );
     }
 
+    // F3A.6j. The console receive must carry its kernel status, not report a
+    // registry recovery. This is the arm the whole sequence turned on, and
+    // the shape that hides it -- a bare `Err(_)` returning `Ok` -- is exactly
+    // what Appendix A's `map_err` census could not see.
+    let receive = poll
+        .find("system.receive_channel(console.loaded.launch_channel,&mutbytes,&muthandles)")
+        .expect("the console receive");
+    // Bounded by the next statement rather than a character count: the arm
+    // carries a long comment, and `without_whitespace` keeps comments.
+    let arm_end = poll[receive..]
+        .find("ifcounts.handles!=0")
+        .expect("the arm's end");
+    let arm = &poll[receive..receive + arm_end];
+    assert!(
+        !arm.contains("Err(_)=>"),
+        "the console receive discards its status again"
+    );
+    assert!(
+        arm.contains("Err(InitError::Native(error))"),
+        "the console receive no longer carries its status"
+    );
+    assert!(
+        arm.contains("attribute_failure(RecoveryOperation::ActivateConsole,failed)"),
+        "the console receive no longer names the console"
+    );
+
     // No trigger code is spent twice. The reason byte packs the trigger into
     // one nibble, so a duplicate would make two callers indistinguishable
     // without the compiler noticing. The two namespaces are counted apart:
