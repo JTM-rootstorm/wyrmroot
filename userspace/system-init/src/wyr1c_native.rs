@@ -481,17 +481,26 @@ where
     resident
         .controller
         .begin_registry(system.now().map_err(InitError::Native)?, 1, 0xC1_0000)?;
-    let registry = launch_registry_until_ready(
-        system,
-        loader,
-        waits,
-        &mut resident.controller,
-        authority,
-        bootfs,
+    // Startup phases name themselves, so a bring-up failure says which role
+    // was being brought up. Before F3A.6e these reached the host as
+    // `operation = 0x0f`, and F3A.6d could locate a site without being able to
+    // say whether the site ran during startup or during an ordinary tick.
+    let registry = attribute_failure(
+        RecoveryOperation::ActivateRegistry,
+        launch_registry_until_ready(
+            system,
+            loader,
+            waits,
+            &mut resident.controller,
+            authority,
+            bootfs,
+        ),
     )?
     .ok_or(InitError::AbsentState(0x11))?;
-    let (registry, mut topology) =
-        establish_registry_topology(system, waits, &mut resident.controller, registry)?;
+    let (registry, mut topology) = attribute_failure(
+        RecoveryOperation::ActivateRegistry,
+        establish_registry_topology(system, waits, &mut resident.controller, registry),
+    )?;
     let mut publication_allocator = PublicationAllocator::new();
     let devmgr = match launch_devmgr(
         system,
@@ -508,6 +517,8 @@ where
     ) {
         Ok(devmgr) => devmgr,
         Err(error) => {
+            let error =
+                attribute_failure::<()>(RecoveryOperation::ActivateDevmgr, Err(error)).unwrap_err();
             let poison = poison_registry_generation(
                 system,
                 waits,

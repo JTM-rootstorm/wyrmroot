@@ -180,6 +180,26 @@ pub(crate) enum RecoveryOperation {
     LaunchRegistry = 0x0c,
     CommitRegistry = 0x0d,
     StartConsole = 0x0e,
+    // 0x0f is `UNATTRIBUTED_OPERATION`. Everything below it is a recovery
+    // transition and everything above it is a startup step: F3A.6d could
+    // locate its failure's site and its status but not the step it happened
+    // in, because there was no value left to name one with.
+    /// Receiving and validating the retained product before any role runs.
+    ReceiveProduct = 0x10,
+    /// Mapping the retained bootfs for in-place activation.
+    MapRetainedBootfs = 0x11,
+    /// The registry role's first launch, before any READY exists.
+    ActivateRegistry = 0x12,
+    /// The device manager's first launch.
+    ActivateDevmgr = 0x13,
+    /// The serial driver's first launch.
+    ActivateUart = 0x14,
+    /// The console role's first launch.
+    ActivateConsole = 0x15,
+    /// The shell's first launch.
+    ActivateShell = 0x16,
+    /// An ordinary resident tick after startup completed.
+    ResidentTick = 0x17,
 }
 
 /// Reported when no operation claimed the failure: the error reached the tick
@@ -381,8 +401,14 @@ pub const fn resident_tick_failure_application_status(error: &InitError) -> u32 
             ),
             unattributed => (UNATTRIBUTED_OPERATION, failure_kind(unattributed)),
         };
+        // The operation field is eight bits wide at bits 15..8 and always was;
+        // until F3A.6e the clamp admitted only four bits of values, which is
+        // why the bring-up steps could not be named -- 0x01..=0x0e were all
+        // allocated to recovery transitions and 0x0f is the sentinel. Values
+        // above the sentinel are the bring-up operations, so every existing
+        // status is unchanged and `0x0f` still means "nothing claimed this".
         let operation = match operation {
-            0x01..=0x0f => operation,
+            0x01..=0xfe => operation,
             _ => UNATTRIBUTED_OPERATION,
         };
         let kind = match kind {
@@ -400,27 +426,32 @@ pub const fn resident_tick_failure_application_status(error: &InitError) -> u32 
         // Every other error keeps `0xAF18_<operation><kind>` byte for byte,
         // which is what holds E8's statuses identical to the A27 baseline.
         let instance = failure_instance(error) as u32;
+        // Every instance-bearing tag uses one layout -- `operation` at bits
+        // 15..8, the cause's own byte at 7..0 -- so a reader needs one rule
+        // rather than one per tag. Eight bits is enough for all three causes:
+        // `deepwyrm/abi/schema/status.toml` tops out at magnitude 16 and there
+        // are eight `NativeOutputError` variants, so the native byte is
+        // lossless across the whole ABI rather than merely usually.
         match kind {
-            // A kernel status or a malformed-output classification. Bit 11
-            // keeps the two families apart after saturation; the magnitude
-            // saturates at 0x7ff rather than aliasing a smaller status.
+            // Bit 7 keeps a malformed-output classification distinguishable
+            // from a kernel status; the magnitude saturates at 0x7f, which no
+            // status in the schema reaches.
             0x05 => {
                 let magnitude = instance & 0x7fff;
-                let saturated = if magnitude > 0x7ff { 0x7ff } else { magnitude };
+                let saturated = if magnitude > 0x7f { 0x7f } else { magnitude };
                 0xAF1E_0000
-                    | (operation as u32) << 12
-                    | if instance & 0x8000 != 0 { 0x800 } else { 0 }
+                    | (operation as u32) << 8
+                    | if instance & 0x8000 != 0 { 0x80 } else { 0 }
                     | saturated
             }
-            // An absent state slot, at the site that found it. Eight bits, so
-            // no saturation is possible.
-            0x09 => 0xAF1F_0000 | (operation as u32) << 12 | (instance & 0xff),
+            // An absent state slot, at the site that found it.
+            0x09 => 0xAF1F_0000 | (operation as u32) << 8 | (instance & 0xff),
             // Kind 0x06 is shared by three protocols, so the tag says which
             // one and the low byte carries the refusal. Only the launch
             // protocol carries an instance here; the other two reach the
             // reader as 0xAF18 and their class, unchanged.
             0x06 if matches!(error, InitError::LaunchProtocol(_)) => {
-                0xAF20_0000 | (operation as u32) << 12 | (instance & 0xff)
+                0xAF20_0000 | (operation as u32) << 8 | (instance & 0xff)
             }
             _ => 0xAF18_0000 | (operation as u32) << 8 | kind as u32,
         }
@@ -439,26 +470,26 @@ pub const fn resident_tick_failure_application_status(error: &InitError) -> u32 
 pub const fn decode_tick_failure(status: u32) -> Option<TickFailure> {
     match status >> 16 {
         0xAF18 => Some(TickFailure {
-            operation: ((status >> 8) & 0x0f) as u8,
+            operation: ((status >> 8) & 0xff) as u8,
             kind: (status & 0x0f) as u8,
             instance: 0,
             saturated: false,
         }),
         0xAF1E => Some(TickFailure {
-            operation: ((status >> 12) & 0x0f) as u8,
+            operation: ((status >> 8) & 0xff) as u8,
             kind: 0x05,
-            instance: (status & 0x7ff) as u16 | if status & 0x800 != 0 { 0x8000 } else { 0 },
-            saturated: status & 0x7ff == 0x7ff,
+            instance: (status & 0x7f) as u16 | if status & 0x80 != 0 { 0x8000 } else { 0 },
+            saturated: status & 0x7f == 0x7f,
         }),
-        0xAF20 => Some(TickFailure {
-            operation: ((status >> 12) & 0x0f) as u8,
-            kind: 0x06,
+        0xAF1F => Some(TickFailure {
+            operation: ((status >> 8) & 0xff) as u8,
+            kind: 0x09,
             instance: (status & 0xff) as u16,
             saturated: false,
         }),
-        0xAF1F => Some(TickFailure {
-            operation: ((status >> 12) & 0x0f) as u8,
-            kind: 0x09,
+        0xAF20 => Some(TickFailure {
+            operation: ((status >> 8) & 0xff) as u8,
+            kind: 0x06,
             instance: (status & 0xff) as u16,
             saturated: false,
         }),
@@ -1230,13 +1261,18 @@ impl ResidentSystemInit {
         L: LoaderPlatform<Error = NativeError>,
         W: SupervisionPlatform<Error = NativeError>,
     {
-        if self.wyr1c.is_some() {
+        // Attributed as an ordinary resident tick, so a failure here is
+        // distinguishable from one during startup. `attribute_failure` keeps
+        // an inner attribution, so a recovery transition that already named
+        // itself is not overwritten by this outer one.
+        let observed = if self.wyr1c.is_some() {
             wyr1c_native::control_tick(self, system, loader, waits, now_ns)
         } else if self.wyr1b.is_none() {
             self.control_tick(system, loader, waits, now_ns)
         } else {
             wyr1b_native::control_tick(self, system, loader, waits, now_ns)
-        }
+        };
+        attribute_failure(RecoveryOperation::ResidentTick, observed)
     }
 }
 
@@ -4978,12 +5014,59 @@ mod native_cleanup_tests {
         assert_eq!(decoded.instance, 0x8006);
 
         // A magnitude beyond the field saturates and says so, rather than
-        // aliasing a different small status: contract §5.
+        // aliasing a different small status: contract §5. Nothing in
+        // `status.toml` reaches 0x7f -- it tops out at 16 -- so this is a
+        // guard against a future status, not a live loss.
         let big = InitError::Native(NativeError::Status(DwStatus(-4096)));
         let decoded = decode_tick_failure(resident_tick_failure_application_status(&big))
             .expect("a large native status decodes");
         assert!(decoded.saturated);
-        assert_eq!(decoded.instance, 0x7ff);
+        assert_eq!(decoded.instance, 0x7f);
+    }
+
+    /// F3A.6e: a startup step must be nameable, and every old value must not move.
+    ///
+    /// F3A.6d located its failure's site and its status and could not say
+    /// which step it happened in, because `0x01..=0x0e` were all recovery
+    /// transitions and `0x0f` is the sentinel. The field was always eight bits
+    /// wide; only the clamp was four.
+    #[cfg(not(feature = "r1-selector34"))]
+    #[test]
+    fn a_startup_operation_is_nameable_without_moving_any_recovery_value() {
+        // Every startup operation round-trips above the sentinel.
+        for operation in [
+            RecoveryOperation::ReceiveProduct,
+            RecoveryOperation::MapRetainedBootfs,
+            RecoveryOperation::ActivateRegistry,
+            RecoveryOperation::ActivateDevmgr,
+            RecoveryOperation::ActivateUart,
+            RecoveryOperation::ActivateConsole,
+            RecoveryOperation::ActivateShell,
+            RecoveryOperation::ResidentTick,
+        ] {
+            assert!(operation as u8 > UNATTRIBUTED_OPERATION);
+            let attributed: Result<(), InitError> =
+                attribute_failure(operation, Err(InitError::AbsentState(0x8d)));
+            let decoded = decode_tick_failure(resident_tick_failure_application_status(
+                &attributed.unwrap_err(),
+            ))
+            .expect("a startup-attributed failure decodes");
+            assert_eq!(decoded.operation, operation as u8);
+            assert_eq!(decoded.instance, 0x8d);
+        }
+
+        // A recovery operation still encodes where it always did, and the
+        // sentinel still means unattributed.
+        let recovery: Result<(), InitError> =
+            attribute_failure(RecoveryOperation::StartConsole, Err(InitError::Cleanup));
+        assert_eq!(
+            resident_tick_failure_application_status(&recovery.unwrap_err()),
+            0xAF18_0E04
+        );
+        assert_eq!(
+            resident_tick_failure_application_status(&InitError::Cleanup),
+            0xAF18_0F04
+        );
     }
 
     /// F3A.6c: a refused launch message must say why it was refused.
