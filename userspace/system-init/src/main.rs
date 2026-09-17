@@ -290,6 +290,31 @@ fn continue_resident(
             return 0xAF01_0004;
         };
         if let Err(error) = resident.control_tick_product(system, loader, waits, now) {
+            // A fatally failed bring-up would otherwise discard its own
+            // account of itself. The ordinary drain below is gated on
+            // `evidence_finalized()`, and a tick that fails never finalizes,
+            // so every record produced before the failure was thrown away and
+            // the only thing reaching COM1 was the application status -- one
+            // error class, with no indication of how far activation got.
+            //
+            // Nothing is added or rewritten here: the records already encoded
+            // are submitted before the failure is reported. The transcript
+            // will carry no terminal record, which is correct, because the run
+            // did not reach one; a consumer that requires a terminal must
+            // still refuse it. Submission errors are ignored deliberately --
+            // this path is already failing, and the status that explains why
+            // must not be replaced by a complaint about reporting it.
+            #[cfg(feature = "wyr1-test-evidence")]
+            if !evidence_submitted {
+                let mut index = 0;
+                while let Some(line) = resident.controller().evidence_line(index) {
+                    if let Ok(record) = <&[u8; 114]>::try_from(line) {
+                        let _ = wyrmroot_runtime::submit_wyr1_evidence(record);
+                    }
+                    index += 1;
+                }
+                evidence_submitted = true;
+            }
             return resident_tick_failure_application_status(&error);
         }
         // The probe named by the staged `WRR1` gate is launched on the first tick
