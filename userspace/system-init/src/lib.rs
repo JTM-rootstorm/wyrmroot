@@ -1491,6 +1491,11 @@ pub enum InitError {
     /// | `0x10..=0x7f` | `wyr1c_native.rs` |
     /// | `0x80..=0xbf` | `wyr1e_native.rs` |
     ///
+    /// Within a file a site may also be a base or'd with a bounded mask, where
+    /// one slot's absence is not the whole fact worth carrying.
+    /// `wyr1e_native.rs` does this for `0xa0..=0xbf`; see
+    /// `absent_owner_site`.
+    ///
     /// `wyr1b_native.rs`, `wyr1d_native.rs` and the two evidence modules keep
     /// `WrongActivationOrder` deliberately: their sites belong to selectors
     /// whose failure statuses are pinned, and

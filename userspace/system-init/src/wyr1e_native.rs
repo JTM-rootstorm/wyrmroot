@@ -875,6 +875,47 @@ fn poll_console_event<S: Wyr1BPlatform>(
     }
 }
 
+/// The lowest site number in `wyr1e_native.rs`'s absent-owner block.
+///
+/// Sites `0xa0..=0xbf` are this block: the base or'd with a five-bit mask of
+/// which owner slots of `ResidentState` were empty. The base is aligned to the
+/// mask width so the two cannot overlap; `0x98..=0x9f` stay free for ordinary
+/// single sites.
+const ABSENT_OWNER_SITE_BASE: u8 = 0xa0;
+
+/// Which of the resident state's owner slots are empty, as one site number.
+///
+/// F3A.6e left a contradiction this exists to settle. `poll` reported site
+/// `0x8d` -- `registry` absent -- while that field is assigned `Some` at every
+/// non-test site and its only `take()` sits behind `dw1e3-selector31`, which
+/// an F product does not compile. A bare "the registry is missing" cannot
+/// distinguish a state whose registry alone was cleared from one that was
+/// rebuilt or zeroed wholesale, and the two have different causes. Reporting
+/// the siblings separates them in a single boot.
+///
+/// Per `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §5 the encoding is bounded and
+/// total: all thirty-two combinations are representable, so no value has to be
+/// read as at-the-limit.
+fn absent_owner_site(state: &ResidentState) -> u8 {
+    let mut absent = 0u8;
+    if state.registry.is_none() {
+        absent |= 0x01;
+    }
+    if state.e6.is_none() {
+        absent |= 0x02;
+    }
+    if state.devmgr.is_none() {
+        absent |= 0x04;
+    }
+    if state.binding.is_none() {
+        absent |= 0x08;
+    }
+    if state.driver.is_none() {
+        absent |= 0x10;
+    }
+    ABSENT_OWNER_SITE_BASE | absent
+}
+
 pub(super) fn poll<S, L, W>(
     resident: &mut ResidentSystemInit,
     system: &mut S,
@@ -899,7 +940,13 @@ where
         .wyr1c
         .as_mut()
         .ok_or(InitError::AbsentState(0x8c))?;
-    let registry = state.registry.ok_or(InitError::AbsentState(0x8d))?;
+    let registry = match state.registry {
+        Some(registry) => registry,
+        // Not `ok_or(AbsentState(0x8d))`. F3A.6e reported that bare site from
+        // here on a path where the slot cannot be empty, so the site now says
+        // which of the state's siblings are empty too.
+        None => return Err(InitError::AbsentState(absent_owner_site(state))),
+    };
     let e6 = state.e6.as_mut().ok_or(InitError::AbsentState(0x8e))?;
     // R7B-4 class D1e. This gate used to carry a second reason -- a parked WAIT
     // reply -- which R6C's argument retires: the reply sits in ordinary
@@ -1371,6 +1418,30 @@ mod tests {
     };
 
     const FAILURE: NativeError = NativeError::Status(DwStatus(-1));
+
+    #[test]
+    fn every_absent_owner_combination_stays_inside_its_own_site_block() {
+        // The five bits `absent_owner_site` sets are the whole mask, so the
+        // block it can produce is exactly `0xa0..=0xbf`. The base has to be
+        // aligned to the mask width, or the two overlap and a transcript can
+        // no longer say which slots a site named.
+        for absent in 0u8..0x20 {
+            let site = ABSENT_OWNER_SITE_BASE | absent;
+            assert!(
+                (0xa0..=0xbf).contains(&site),
+                "absent-owner site {site:#04x} left its block"
+            );
+            assert_eq!(
+                site & !0x1f,
+                ABSENT_OWNER_SITE_BASE,
+                "mask {absent:#04x} disturbed the base"
+            );
+            assert_eq!(site & 0x1f, absent, "mask {absent:#04x} did not survive");
+        }
+        // The base itself is not a reachable site: the read only reports when
+        // the registry slot is absent, so bit 0 is always set.
+        assert_eq!(ABSENT_OWNER_SITE_BASE & 0x1f, 0);
+    }
 
     struct ObserverPlatform {
         inbound: [u8; 256],
