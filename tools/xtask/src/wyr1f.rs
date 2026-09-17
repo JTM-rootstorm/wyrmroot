@@ -505,7 +505,14 @@ fn build_produced(
         product_kind,
         gate_config,
     )?;
-    let kernel = build_kernel(deep_repository, product_kind, gate_config)?;
+    // F3A.6y. The production kernel's bootfs page ceiling is measured from the
+    // archive that will actually be mapped, rather than the Wave 4 literal
+    // Deepwyrm held: a 203-page archive against a 17-page ceiling is what made
+    // the F production product fail bootstrap with an opaque NO_RESOURCES.
+    // Measured here because this is the point where the archive exists and the
+    // kernel has not been built yet.
+    let bootfs_pages = product.bootfs.len().div_ceil(4096);
+    let kernel = build_kernel(deep_repository, product_kind, gate_config, bootfs_pages)?;
     let boot_device_table = wyr1c6::boot_device_table();
     let ovmf_code = wyr1c6::pinned_firmware(
         wyr1c6::OVMF_CODE_PATH,
@@ -598,6 +605,7 @@ fn build_kernel(
     repository: &Path,
     product_kind: wyr1c::Wyr1fProduct,
     gate_config: &[u8],
+    bootfs_pages: usize,
 ) -> Result<Vec<u8>, Failure> {
     let nonce = wyr1c::wyr1f_kernel_evidence_nonce(product_kind, gate_config)?;
     let repository = Directory::open_exact(repository, "Deepwyrm source root")?;
@@ -622,6 +630,7 @@ fn build_kernel(
         repository.path(),
         target.path(),
         nonce.as_deref(),
+        bootfs_pages,
     )
     .stdout(Stdio::from(stdout))
     .stderr(Stdio::from(stderr))
@@ -649,6 +658,12 @@ fn kernel_build_command(
     // decides it from the product kind. Taking the answer rather than the
     // product keeps a second, divergent decision from existing here.
     evidence_nonce: Option<&str>,
+    // Measured page count of the archive this product will map. Only the
+    // production kernel consults it: the instrumented siblings' selector
+    // reaches a different `PRIMORDIAL_BOOTFS_MAX_PAGES` arm, so passing it to
+    // them would be an inert variable in a build whose kernel contract §5.4
+    // requires to be identical across the pair.
+    bootfs_pages: usize,
 ) -> Command {
     let mut command = Command::new(pinned_cargo);
     command
@@ -686,6 +701,18 @@ fn kernel_build_command(
         .env_remove("LD_PRELOAD")
         .current_dir(repository)
         .stdin(Stdio::null());
+    if evidence_nonce.is_none() {
+        // Production: the measured ceiling, which is the whole point of the
+        // change. Set explicitly rather than inherited, so an operator's
+        // ambient value cannot decide what the production kernel admits.
+        command.env("DEEPWYRM_BOOTFS_MAX_PAGES", bootfs_pages.to_string());
+    } else {
+        // Instrumented: removed, not set. Its selector reaches the 256-page
+        // arm, so a value here would be inert -- and an inert variable that
+        // differed between the two siblings would still be a difference in a
+        // kernel §5.4 requires to be identical across the pair.
+        command.env_remove("DEEPWYRM_BOOTFS_MAX_PAGES");
+    }
     if let Some(nonce) = evidence_nonce {
         // The closure selector reuses `interactive-wyrmsh`'s WRE1 transport, so
         // the kernel build requires that transport's evidence nonce. It is the
@@ -2857,6 +2884,9 @@ mod tests {
                 )
                 .unwrap()
                 .as_deref(),
+                // The measured WYR1-F archive (828,200 bytes) that exposed the
+                // 17-page ceiling.
+                203,
             );
             let arguments = command
                 .get_args()
@@ -2910,9 +2940,20 @@ mod tests {
         let (_, removed, set) = arguments_and_env(wyr1c::Wyr1fProduct::Normal);
         assert!(removed.contains("DEEPWYRM_GUEST_TEST_SELECTOR"));
         assert!(removed.contains("DEEPWYRM_GUEST_TEST_ID"));
+        // F3A.6y adds the measured bootfs ceiling. It is not a selector and
+        // does not instrument the kernel -- it decides how large an archive the
+        // production kernel admits, which used to be a Wave 4 literal of 17
+        // against a 203-page archive.
         assert_eq!(
             set.keys().cloned().collect::<Vec<_>>(),
-            vec!["DEEPWYRM_PINNED_TARGET_DIR".to_owned()]
+            vec![
+                "DEEPWYRM_BOOTFS_MAX_PAGES".to_owned(),
+                "DEEPWYRM_PINNED_TARGET_DIR".to_owned(),
+            ]
+        );
+        assert_eq!(
+            set.get("DEEPWYRM_BOOTFS_MAX_PAGES").map(String::as_str),
+            Some("203")
         );
 
         // Both instrumented siblings set exactly the frozen selector pair, and
@@ -2939,6 +2980,10 @@ mod tests {
                 Some(NONCE)
             );
             assert_eq!(set.len(), 3, "no fourth variable is set");
+            // The measured ceiling is removed, not set: contract §5.4 makes
+            // the instrumented kernel identical across the pair, so nothing
+            // derived from a per-product archive may reach it.
+            assert!(!set.contains_key("DEEPWYRM_BOOTFS_MAX_PAGES"));
             instrumented.push(set);
         }
         assert_eq!(instrumented[0], instrumented[1]);
