@@ -340,8 +340,8 @@ impl Observer {
         response: &[u8],
         mut submit: impl FnMut(&[u8; RECORD_BYTES]) -> Result<(), InitError>,
     ) -> Result<(), InitError> {
-        let parsed_request = parse_message(request, 0).map_err(|_| InitError::Accounting)?;
-        let parsed_response = parse_message(response, 0).map_err(|_| InitError::Accounting)?;
+        let parsed_request = parse_message(request, 0).map_err(InitError::LaunchProtocol)?;
+        let parsed_response = parse_message(response, 0).map_err(InitError::LaunchProtocol)?;
         let tuple = self.current.ok_or(InitError::WrongActivationOrder)?.tuple;
         if parsed_request.reservation != parsed_response.reservation {
             return Err(InitError::Accounting);
@@ -608,7 +608,7 @@ fn classify_launch_response(
     reservation: Reservation,
     response: &[u8],
 ) -> Result<(u64, u64, u32, u32, [u64; 3]), InitError> {
-    let response = parse_message(response, 0).map_err(|_| InitError::Accounting)?;
+    let response = parse_message(response, 0).map_err(InitError::LaunchProtocol)?;
     if response.reservation != reservation {
         return Err(InitError::Accounting);
     }
@@ -633,8 +633,8 @@ fn classify(
     response: &[u8],
     request_handles: usize,
 ) -> Result<(u64, u64, u32, u32, [u64; 3]), InitError> {
-    let request = parse_message(request, request_handles).map_err(|_| InitError::Accounting)?;
-    let response = parse_message(response, 0).map_err(|_| InitError::Accounting)?;
+    let request = parse_message(request, request_handles).map_err(InitError::LaunchProtocol)?;
+    let response = parse_message(response, 0).map_err(InitError::LaunchProtocol)?;
     if request.reservation != response.reservation {
         return Err(InitError::Accounting);
     }

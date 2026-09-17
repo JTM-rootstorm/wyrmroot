@@ -196,7 +196,7 @@ pub(crate) fn resident_topology(
     Ok(&mut resident
         .wyr1c
         .as_mut()
-        .ok_or(InitError::WrongActivationOrder)?
+        .ok_or(InitError::AbsentState(0x10))?
         .topology)
 }
 
@@ -489,7 +489,7 @@ where
         authority,
         bootfs,
     )?
-    .ok_or(InitError::WrongActivationOrder)?;
+    .ok_or(InitError::AbsentState(0x11))?;
     let (registry, mut topology) =
         establish_registry_topology(system, waits, &mut resident.controller, registry)?;
     let mut publication_allocator = PublicationAllocator::new();
@@ -649,7 +649,7 @@ where
         ..
     } = controller
         .role_state(RoleId::Devmgr)
-        .ok_or(InitError::WrongActivationOrder)?
+        .ok_or(InitError::AbsentState(0x12))?
     else {
         return Err(InitError::WrongActivationOrder);
     };
@@ -1437,8 +1437,8 @@ fn accept_c6_fact(resident: &mut ResidentSystemInit, fact: C6Fact) -> Result<(),
             .wyr1c
             .as_ref()
             .map(|state| (state.c6_d1_lease, state.c6_d1_cleanup_complete))
-            .ok_or(InitError::WrongActivationOrder)?;
-        let d1_lease = d1_lease.ok_or(InitError::WrongActivationOrder)?;
+            .ok_or(InitError::AbsentState(0x13))?;
+        let d1_lease = d1_lease.ok_or(InitError::AbsentState(0x14))?;
         if !cleanup_complete
             || fact.lease <= d1_lease
             || fact.binding != 1
@@ -1450,11 +1450,11 @@ fn accept_c6_fact(resident: &mut ResidentSystemInit, fact: C6Fact) -> Result<(),
         let state = resident
             .wyr1c
             .as_mut()
-            .ok_or(InitError::WrongActivationOrder)?;
+            .ok_or(InitError::AbsentState(0x15))?;
         state
             .c6_evidence
             .as_mut()
-            .ok_or(InitError::WrongActivationOrder)?
+            .ok_or(InitError::AbsentState(0x16))?
             .record(
                 crate::wyr1c6_gate::GateEvent::D1GrantAvailable,
                 d1_lease,
@@ -1467,7 +1467,7 @@ fn accept_c6_fact(resident: &mut ResidentSystemInit, fact: C6Fact) -> Result<(),
     let state = resident
         .wyr1c
         .as_mut()
-        .ok_or(InitError::WrongActivationOrder)?;
+        .ok_or(InitError::AbsentState(0x17))?;
     let valid = match fact.event {
         1 => fact.lease != 0 && fact.binding == 1 && fact.value != 0 && fact.aux == COM2_ROLE_ID.0,
         2 => Some(fact.lease) == state.c6_d1_lease && fact.binding == 1,
@@ -1666,7 +1666,7 @@ fn accept_c6_fact(resident: &mut ResidentSystemInit, fact: C6Fact) -> Result<(),
     let log = state
         .c6_evidence
         .as_mut()
-        .ok_or(InitError::WrongActivationOrder)?;
+        .ok_or(InitError::AbsentState(0x18))?;
     log.record(event, fact.lease, evidence_binding, fact.value, fact.aux)
         .map_err(|_| InitError::WrongManifestProfile)?;
     match fact.event {
@@ -1736,8 +1736,8 @@ fn emit_c6_terminal_facts(resident: &mut ResidentSystemInit) -> Result<(), InitE
         let state = resident
             .wyr1c
             .as_ref()
-            .ok_or(InitError::WrongActivationOrder)?;
-        let devmgr = state.devmgr.ok_or(InitError::WrongActivationOrder)?;
+            .ok_or(InitError::AbsentState(0x19))?;
+        let devmgr = state.devmgr.ok_or(InitError::AbsentState(0x1a))?;
         if devmgr.role != RoleId::Devmgr
             || state.driver.is_some()
             || state.c6_d2_lease.is_none()
@@ -1755,7 +1755,7 @@ fn emit_c6_terminal_facts(resident: &mut ResidentSystemInit) -> Result<(), InitE
         {
             return Err(InitError::WrongManifestProfile);
         }
-        let lease = state.c6_d2_lease.ok_or(InitError::WrongActivationOrder)?;
+        let lease = state.c6_d2_lease.ok_or(InitError::AbsentState(0x1b))?;
         let driver_failures = state.c6_d1_driver_failures;
         let devmgr_failures = resident
             .controller
@@ -1797,11 +1797,11 @@ pub fn finish_c6_evidence(resident: &mut ResidentSystemInit) -> Result<bool, Ini
     let state = resident
         .wyr1c
         .as_mut()
-        .ok_or(InitError::WrongActivationOrder)?;
+        .ok_or(InitError::AbsentState(0x1c))?;
     let log = state
         .c6_evidence
         .as_mut()
-        .ok_or(InitError::WrongActivationOrder)?;
+        .ok_or(InitError::AbsentState(0x1d))?;
     if !log.ready_for_terminal() {
         return Ok(false);
     }
@@ -1887,7 +1887,7 @@ where
     let state = resident
         .wyr1c
         .as_ref()
-        .ok_or(InitError::WrongActivationOrder)?;
+        .ok_or(InitError::AbsentState(0x1e))?;
     let correlation_valid = driver_correlation_is_fresh(
         devmgr.generation,
         state.last_driver_attempt,
@@ -1991,7 +1991,7 @@ where
         let state = resident
             .wyr1c
             .as_mut()
-            .ok_or(InitError::WrongActivationOrder)?;
+            .ok_or(InitError::AbsentState(0x1f))?;
         state.driver = Some(DriverNativeAttempt {
             loaded,
             task_group,
@@ -2009,7 +2009,7 @@ where
             .wyr1c
             .as_ref()
             .and_then(|state| state.driver)
-            .ok_or(InitError::WrongActivationOrder)?;
+            .ok_or(InitError::AbsentState(0x20))?;
         let cleanup_failed = cleanup_loaded_before(
             system,
             waits,
@@ -2023,7 +2023,7 @@ where
             resident
                 .wyr1c
                 .as_mut()
-                .ok_or(InitError::WrongActivationOrder)?
+                .ok_or(InitError::AbsentState(0x21))?
                 .driver = None;
         }
         return Err(if cleanup_failed {
@@ -2062,17 +2062,17 @@ where
         let state = resident
             .wyr1c
             .as_ref()
-            .ok_or(InitError::WrongActivationOrder)?;
+            .ok_or(InitError::AbsentState(0x22))?;
         (
-            state.devmgr.ok_or(InitError::WrongActivationOrder)?,
+            state.devmgr.ok_or(InitError::AbsentState(0x23))?,
             state
                 .registry
-                .ok_or(InitError::WrongActivationOrder)?
+                .ok_or(InitError::AbsentState(0x24))?
                 .control_channel,
             state.publication_service_generation,
             state
                 .driver
-                .ok_or(InitError::WrongActivationOrder)?
+                .ok_or(InitError::AbsentState(0x25))?
                 .request
                 .attempt_generation
                 .0,
@@ -2159,7 +2159,7 @@ where
         let state = resident
             .wyr1c
             .as_mut()
-            .ok_or(InitError::WrongActivationOrder)?;
+            .ok_or(InitError::AbsentState(0x26))?;
         launch_registry_client_actor(
             system,
             loader,
@@ -2307,7 +2307,7 @@ where
             let state = resident
                 .wyr1c
                 .as_mut()
-                .ok_or(InitError::WrongActivationOrder)?;
+                .ok_or(InitError::AbsentState(0x27))?;
             state.e3a_probe = Some(probe);
             state.e3a_stream_generation = Some(stream_generation);
             state.e3a_binding = Some(binding);
@@ -2360,7 +2360,7 @@ where
         .wyr1c
         .as_ref()
         .and_then(|state| state.driver)
-        .ok_or(InitError::WrongActivationOrder)?;
+        .ok_or(InitError::AbsentState(0x28))?;
     let request = attempt.request;
     cleanup_loaded_before(
         system,
@@ -2433,10 +2433,10 @@ fn maybe_begin_e3a_retire<S: InitPlatform>(
         let state = resident
             .wyr1c
             .as_ref()
-            .ok_or(InitError::WrongActivationOrder)?;
+            .ok_or(InitError::AbsentState(0x29))?;
         (
-            state.devmgr.ok_or(InitError::WrongActivationOrder)?,
-            state.e3a_binding.ok_or(InitError::WrongActivationOrder)?,
+            state.devmgr.ok_or(InitError::AbsentState(0x2a))?,
+            state.e3a_binding.ok_or(InitError::AbsentState(0x2b))?,
             state.e3a_response_committed,
             state.e3a_transport_empty,
             state.e3a_begin_retire_sent,
@@ -2456,14 +2456,14 @@ fn maybe_begin_e3a_retire<S: InitPlatform>(
         let terminal_claimed = resident
             .wyr1c
             .as_ref()
-            .ok_or(InitError::WrongActivationOrder)?
+            .ok_or(InitError::AbsentState(0x2c))?
             .e3a_terminal_claimed;
         if terminal_claimed {
             return Err(InitError::WrongManifestProfile);
         }
         exact_transport_empty(
             binding,
-            transport_empty.ok_or(InitError::WrongActivationOrder)?,
+            transport_empty.ok_or(InitError::AbsentState(0x2d))?,
         )?;
         // The probe cannot make this claim: both its committed response and
         // the current driver's post-ack TEMT fact have been rejoined here.
@@ -2471,7 +2471,7 @@ fn maybe_begin_e3a_retire<S: InitPlatform>(
         resident
             .wyr1c
             .as_mut()
-            .ok_or(InitError::WrongActivationOrder)?
+            .ok_or(InitError::AbsentState(0x2e))?
             .e3a_terminal_claimed = true;
         return Ok(());
     }
@@ -2483,7 +2483,7 @@ fn maybe_begin_e3a_retire<S: InitPlatform>(
     }
     exact_transport_empty(
         binding,
-        transport_empty.ok_or(InitError::WrongActivationOrder)?,
+        transport_empty.ok_or(InitError::AbsentState(0x2f))?,
     )?;
     let mut bytes = [0u8; TRANSPORT_EMPTY_FACT_BYTES];
     encode_begin_retire(binding, &mut bytes).map_err(|_| InitError::WrongManifestProfile)?;
@@ -2493,7 +2493,7 @@ fn maybe_begin_e3a_retire<S: InitPlatform>(
     resident
         .wyr1c
         .as_mut()
-        .ok_or(InitError::WrongActivationOrder)?
+        .ok_or(InitError::AbsentState(0x30))?
         .e3a_begin_retire_sent = true;
     Ok(())
 }
@@ -2507,10 +2507,10 @@ fn send_e3a_finalize_retire<S: InitPlatform>(
         let state = resident
             .wyr1c
             .as_ref()
-            .ok_or(InitError::WrongActivationOrder)?;
+            .ok_or(InitError::AbsentState(0x31))?;
         (
-            state.devmgr.ok_or(InitError::WrongActivationOrder)?,
-            state.e3a_binding.ok_or(InitError::WrongActivationOrder)?,
+            state.devmgr.ok_or(InitError::AbsentState(0x32))?,
+            state.e3a_binding.ok_or(InitError::AbsentState(0x33))?,
             state.e3a_stage1_ready,
             state.e3a_peer_closed,
             state.e3a_finalize_retire_sent,
@@ -2530,7 +2530,7 @@ fn send_e3a_finalize_retire<S: InitPlatform>(
     resident
         .wyr1c
         .as_mut()
-        .ok_or(InitError::WrongActivationOrder)?
+        .ok_or(InitError::AbsentState(0x34))?
         .e3a_finalize_retire_sent = true;
     Ok(())
 }
@@ -2544,7 +2544,7 @@ fn receive_e3a_probe_message<S: InitPlatform>(
         .wyr1c
         .as_ref()
         .and_then(|state| state.e3a_probe)
-        .ok_or(InitError::WrongActivationOrder)?;
+        .ok_or(InitError::AbsentState(0x35))?;
     let mut bytes = [0u8; E3A_CONTROL_BYTES];
     let mut handles = [DwReceivedHandleInfoV1::default(); 1];
     let counts = system
@@ -2568,7 +2568,7 @@ where
     let state = resident
         .wyr1c
         .as_ref()
-        .ok_or(InitError::WrongActivationOrder)?;
+        .ok_or(InitError::AbsentState(0x36))?;
     let binding = state.e3a_binding.ok_or(InitError::WrongManifestProfile)?;
     let driver = state.driver.ok_or(InitError::WrongManifestProfile)?;
     if binding.challenge_generation != 1
@@ -2706,7 +2706,7 @@ where
         let state = resident
             .wyr1c
             .as_mut()
-            .ok_or(InitError::WrongActivationOrder)?;
+            .ok_or(InitError::AbsentState(0x37))?;
         let binding = state.e3a_binding.ok_or(InitError::WrongManifestProfile)?;
         if binding.challenge_generation != 2
             || !state.e3a_response_committed
@@ -2775,7 +2775,7 @@ where
             resident
                 .wyr1c
                 .as_mut()
-                .ok_or(InitError::WrongActivationOrder)?
+                .ok_or(InitError::AbsentState(0x38))?
                 .e3a_probe = Some(probe);
             return Err(InitError::Cleanup);
         }
@@ -2791,7 +2791,7 @@ where
     resident
         .wyr1c
         .as_mut()
-        .ok_or(InitError::WrongActivationOrder)?
+        .ok_or(InitError::AbsentState(0x39))?
         .e3a_u2_probe_reaped_successfully = true;
     // TEMT may already be present when the exit is observed. Re-run the
     // controller join only after this exact normal-zero reap has committed.
@@ -2915,7 +2915,7 @@ where
         let state = resident
             .wyr1c
             .as_mut()
-            .ok_or(InitError::WrongActivationOrder)?;
+            .ok_or(InitError::AbsentState(0x3a))?;
         let registry = state.registry.take();
         let devmgr = state.devmgr.take();
         state.binding = None;
@@ -2979,7 +2979,7 @@ where
             .wyr1c
             .as_ref()
             .and_then(|state| state.e3a_probe)
-            .ok_or(InitError::WrongActivationOrder)?;
+            .ok_or(InitError::AbsentState(0x3b))?;
         match waits.query_task_termination(probe.loaded.process) {
             Ok(exit) => wyrmroot_runtime::validate_successful_exit(&exit)
                 .map_err(|_| InitError::WrongManifestProfile)
@@ -3090,7 +3090,7 @@ where
     let state = resident
         .wyr1c
         .as_ref()
-        .ok_or(InitError::WrongActivationOrder)?;
+        .ok_or(InitError::AbsentState(0x3c))?;
     let Some(devmgr) = state.devmgr else {
         resident.result = RecoveryResult::Degraded;
         return Ok(resident.controller.mode());
@@ -3170,8 +3170,8 @@ where
                             let state = resident
                                 .wyr1c
                                 .as_ref()
-                                .ok_or(InitError::WrongActivationOrder)?;
-                            let devmgr = state.devmgr.ok_or(InitError::WrongActivationOrder)?;
+                                .ok_or(InitError::AbsentState(0x3d))?;
+                            let devmgr = state.devmgr.ok_or(InitError::AbsentState(0x3e))?;
                             match receive_devmgr_control(system, devmgr.loaded.launch_channel) {
                                 #[cfg(feature = "wyr1d-selector32")]
                                 Ok(DevmgrControlInput::D5Ready(identity)) => {
@@ -3189,11 +3189,11 @@ where
                                         .wyr1c
                                         .as_ref()
                                         .and_then(|state| state.e3a_binding)
-                                        .ok_or(InitError::WrongActivationOrder)?;
+                                        .ok_or(InitError::AbsentState(0x3f))?;
                                     let duplicate = resident
                                         .wyr1c
                                         .as_ref()
-                                        .ok_or(InitError::WrongActivationOrder)?
+                                        .ok_or(InitError::AbsentState(0x40))?
                                         .e3a_transport_empty
                                         .is_some();
                                     if duplicate {
@@ -3203,7 +3203,7 @@ where
                                     resident
                                         .wyr1c
                                         .as_mut()
-                                        .ok_or(InitError::WrongActivationOrder)?
+                                        .ok_or(InitError::AbsentState(0x41))?
                                         .e3a_transport_empty = Some(fact);
                                     maybe_begin_e3a_retire(resident, system)
                                 }
@@ -3216,7 +3216,7 @@ where
                                     let state = resident
                                         .wyr1c
                                         .as_mut()
-                                        .ok_or(InitError::WrongActivationOrder)?;
+                                        .ok_or(InitError::AbsentState(0x42))?;
                                     if !state.e3a_begin_retire_sent
                                         || state.e3a_stage1_ready
                                         || state.e3a_binding != Some(binding)
@@ -3265,7 +3265,7 @@ where
                                         resident
                                             .wyr1c
                                             .as_mut()
-                                            .ok_or(InitError::WrongActivationOrder)?
+                                            .ok_or(InitError::AbsentState(0x43))?
                                             .waiting_registry_observed = true;
                                         Ok(())
                                     }
@@ -3313,10 +3313,10 @@ where
                                             let state = resident
                                                 .wyr1c
                                                 .as_ref()
-                                                .ok_or(InitError::WrongActivationOrder)?;
+                                                .ok_or(InitError::AbsentState(0x44))?;
                                             let request = state
                                                 .last_reaped_driver
-                                                .ok_or(InitError::WrongActivationOrder)?;
+                                                .ok_or(InitError::AbsentState(0x45))?;
                                             parse_driver_retired(&bytes, request)
                                                 .map_err(|_| InitError::WrongManifestProfile)?;
                                             #[cfg(feature = "wyr1d-selector32")]
@@ -3400,9 +3400,9 @@ where
                                     let state = resident
                                         .wyr1c
                                         .as_ref()
-                                        .ok_or(InitError::WrongActivationOrder)?;
+                                        .ok_or(InitError::AbsentState(0x46))?;
                                     let devmgr =
-                                        state.devmgr.ok_or(InitError::WrongActivationOrder)?;
+                                        state.devmgr.ok_or(InitError::AbsentState(0x47))?;
                                     acknowledge_driver_reaped(system, devmgr, _request)
                                 })();
                                 let acknowledged = attribute_failure(
@@ -3429,9 +3429,9 @@ where
                                     let state = resident
                                         .wyr1c
                                         .as_ref()
-                                        .ok_or(InitError::WrongActivationOrder)?;
+                                        .ok_or(InitError::AbsentState(0x48))?;
                                     let devmgr =
-                                        state.devmgr.ok_or(InitError::WrongActivationOrder)?;
+                                        state.devmgr.ok_or(InitError::AbsentState(0x49))?;
                                     acknowledge_driver_reaped(system, devmgr, _request)?;
                                 }
                                 Ok(())
@@ -3444,7 +3444,7 @@ where
                                 .wyr1c
                                 .as_ref()
                                 .and_then(|state| state.e3a_binding)
-                                .ok_or(InitError::WrongActivationOrder)?;
+                                .ok_or(InitError::AbsentState(0x4a))?;
                             match message {
                                 E3AControllerMessage::ResponseCommitted {
                                     nonce,
@@ -3459,7 +3459,7 @@ where
                                     let state = resident
                                         .wyr1c
                                         .as_mut()
-                                        .ok_or(InitError::WrongActivationOrder)?;
+                                        .ok_or(InitError::AbsentState(0x4b))?;
                                     if state.e3a_response_committed
                                         || nonce != binding.nonce
                                         || publication_generation != binding.publication_generation
@@ -3482,7 +3482,7 @@ where
                                     let state = resident
                                         .wyr1c
                                         .as_ref()
-                                        .ok_or(InitError::WrongActivationOrder)?;
+                                        .ok_or(InitError::AbsentState(0x4c))?;
                                     if !state.e3a_response_committed
                                         || state.e3a_peer_closed
                                         || nonce != binding.nonce
@@ -3502,7 +3502,7 @@ where
                                     resident
                                         .wyr1c
                                         .as_mut()
-                                        .ok_or(InitError::WrongActivationOrder)?
+                                        .ok_or(InitError::AbsentState(0x4d))?
                                         .e3a_peer_closed = true;
                                     send_e3a_finalize_retire(resident, system)
                                 }
@@ -3685,15 +3685,15 @@ where
     let registry = resident
         .wyr1c
         .as_mut()
-        .ok_or(InitError::WrongActivationOrder)?
+        .ok_or(InitError::AbsentState(0x4e))?
         .registry
         .take()
-        .ok_or(InitError::WrongActivationOrder)?;
+        .ok_or(InitError::AbsentState(0x4f))?;
     resident.active[0] = None;
     resident
         .wyr1c
         .as_mut()
-        .ok_or(InitError::WrongActivationOrder)?
+        .ok_or(InitError::AbsentState(0x50))?
         .binding = None;
     let exhausted = if action_deadline.is_some() && dependent_cleanup_error.is_none() {
         // The authenticated, exactly quiesced action admits a fresh finite
@@ -3798,7 +3798,7 @@ where
         &mut resident
             .wyr1c
             .as_mut()
-            .ok_or(InitError::WrongActivationOrder)?
+            .ok_or(InitError::AbsentState(0x51))?
             .topology,
         replacement,
         action_deadline,
@@ -3814,15 +3814,15 @@ where
     resident
         .wyr1c
         .as_mut()
-        .ok_or(InitError::WrongActivationOrder)?
+        .ok_or(InitError::AbsentState(0x52))?
         .registry = Some(replacement);
     resident.active[0] = Some(replacement.active);
     if step == RegistryRecoveryStep::AwaitStatus {
         let state = resident
             .wyr1c
             .as_ref()
-            .ok_or(InitError::WrongActivationOrder)?;
-        let devmgr = state.devmgr.ok_or(InitError::WrongActivationOrder)?;
+            .ok_or(InitError::AbsentState(0x53))?;
+        let devmgr = state.devmgr.ok_or(InitError::AbsentState(0x54))?;
         let waiting = await_waiting_for_registry(
             system,
             waits,
@@ -3839,7 +3839,7 @@ where
     resident
         .wyr1c
         .as_mut()
-        .ok_or(InitError::WrongActivationOrder)?
+        .ok_or(InitError::AbsentState(0x55))?
         .waiting_registry_observed = true;
     let rebound = rebind_publication(
         resident,
@@ -4082,7 +4082,7 @@ where
     let state = resident
         .wyr1c
         .as_ref()
-        .ok_or(InitError::WrongActivationOrder)?;
+        .ok_or(InitError::AbsentState(0x56))?;
     Ok((resident.result, state.topology.generation(), role))
 }
 
@@ -4188,7 +4188,7 @@ where
     let state = resident
         .wyr1c
         .as_ref()
-        .ok_or(InitError::WrongActivationOrder)?;
+        .ok_or(InitError::AbsentState(0x57))?;
     Ok(Wyr1fDegradedOutcome {
         result: resident.result,
         mode: resident.controller.mode(),
@@ -4244,7 +4244,7 @@ where
         .as_ref()
         .and_then(|state| state.e6.as_ref())
         .and_then(wyr1e::State::e8_fixture_publication_observer)
-        .ok_or(InitError::WrongActivationOrder)?;
+        .ok_or(InitError::AbsentState(0x58))?;
     let mut publication = [0u8; 72];
     let publication_len = wyrmroot_registry_proto::encode_generation_changed(
         RegistryHeader {
@@ -4269,10 +4269,7 @@ where
         "production publication outcome"
     );
 
-    let mut state = resident
-        .wyr1c
-        .take()
-        .ok_or(InitError::WrongActivationOrder)?;
+    let mut state = resident.wyr1c.take().ok_or(InitError::AbsentState(0x59))?;
     let replacement_generation = state.topology.generation();
     assert!(
         replacement_generation > registry_generation,
@@ -4285,7 +4282,7 @@ where
     assert!(state.registry.is_some(), "replacement registry owner");
     assert_eq!(state.devmgr, Some(devmgr), "retained devmgr owner");
     assert_eq!(state.driver, driver, "retained driver owner");
-    let e6 = state.e6.take().ok_or(InitError::WrongActivationOrder)?;
+    let e6 = state.e6.take().ok_or(InitError::AbsentState(0x5a))?;
     assert!(
         e6.e8_fixture_publication_observer().is_none(),
         "publication observation consumed"
@@ -4392,7 +4389,7 @@ fn selector29_next_d1_terminal_fact(
         .as_ref()
         .and_then(|state| state.c6_evidence.as_ref())
         .and_then(crate::wyr1c6_gate::EvidenceLog::next_expected_event)
-        .ok_or(InitError::WrongActivationOrder)?;
+        .ok_or(InitError::AbsentState(0x5b))?;
     selector29_terminal_fact_for_event(next)
 }
 
@@ -4460,7 +4457,7 @@ where
         let state = resident
             .wyr1c
             .as_ref()
-            .ok_or(InitError::WrongActivationOrder)?;
+            .ok_or(InitError::AbsentState(0x5c))?;
         selector29_restarting_d1(
             state
                 .devmgr
@@ -4476,7 +4473,7 @@ where
             .wyr1c
             .as_ref()
             .and_then(|state| state.devmgr)
-            .ok_or(InitError::WrongActivationOrder)?;
+            .ok_or(InitError::AbsentState(0x5d))?;
         // D1 sends the final stale-rejection and failure facts immediately
         // before exiting. A process-exit wait may win over the readable launch
         // channel, so drain those already-buffered facts before synthesizing
@@ -4499,25 +4496,23 @@ where
             let state = resident
                 .wyr1c
                 .as_ref()
-                .ok_or(InitError::WrongActivationOrder)?;
+                .ok_or(InitError::AbsentState(0x5e))?;
             (
-                state.c6_d1_lease.ok_or(InitError::WrongActivationOrder)?,
+                state.c6_d1_lease.ok_or(InitError::AbsentState(0x5f))?,
                 if state.c6_p2_service_generation == 0 {
                     return Err(InitError::WrongActivationOrder);
                 } else {
                     state.c6_p2_service_generation
                 },
-                state.c6_u2_attempt.ok_or(InitError::WrongActivationOrder)?,
+                state.c6_u2_attempt.ok_or(InitError::AbsentState(0x60))?,
                 if state.c6_p2_endpoint_generation == 0 {
                     return Err(InitError::WrongActivationOrder);
                 } else {
                     state.c6_p2_endpoint_generation
                 },
-                state.c6_u2_irq.ok_or(InitError::WrongActivationOrder)?,
-                state.c6_u2_attempt.ok_or(InitError::WrongActivationOrder)?,
-                state
-                    .c6_u2_endpoint
-                    .ok_or(InitError::WrongActivationOrder)?,
+                state.c6_u2_irq.ok_or(InitError::AbsentState(0x61))?,
+                state.c6_u2_attempt.ok_or(InitError::AbsentState(0x62))?,
+                state.c6_u2_endpoint.ok_or(InitError::AbsentState(0x63))?,
             )
         };
         accept_c6_fact(
@@ -4544,16 +4539,16 @@ where
     let active = resident
         .wyr1c
         .as_mut()
-        .ok_or(InitError::WrongActivationOrder)?
+        .ok_or(InitError::AbsentState(0x64))?
         .devmgr
         .take()
-        .ok_or(InitError::WrongActivationOrder)?;
+        .ok_or(InitError::AbsentState(0x65))?;
     resident.active[1] = None;
     {
         let state = resident
             .wyr1c
             .as_mut()
-            .ok_or(InitError::WrongActivationOrder)?;
+            .ok_or(InitError::AbsentState(0x66))?;
         state.binding = None;
         state.waiting_registry_observed = false;
     }
@@ -4611,7 +4606,7 @@ where
             .wyr1c
             .as_ref()
             .and_then(|state| state.c6_d1_lease)
-            .ok_or(InitError::WrongActivationOrder)?;
+            .ok_or(InitError::AbsentState(0x67))?;
         accept_c6_fact(
             resident,
             C6Fact {
@@ -4686,7 +4681,7 @@ where
         let attempt_transaction = match resident
             .controller
             .role_state(RoleId::Devmgr)
-            .ok_or(InitError::WrongActivationOrder)?
+            .ok_or(InitError::AbsentState(0x68))?
         {
             RestartState::Starting { transaction_id, .. } => transaction_id,
             _ => return Err(InitError::WrongActivationOrder),
@@ -4715,7 +4710,7 @@ where
             let state = resident
                 .wyr1c
                 .as_mut()
-                .ok_or(InitError::WrongActivationOrder)?;
+                .ok_or(InitError::AbsentState(0x69))?;
             launch_devmgr(
                 system,
                 loader,
@@ -4737,7 +4732,7 @@ where
                 let state = resident
                     .wyr1c
                     .as_mut()
-                    .ok_or(InitError::WrongActivationOrder)?;
+                    .ok_or(InitError::AbsentState(0x6a))?;
                 state.devmgr = Some(attempt.active);
                 state.binding = Some(attempt.binding);
                 state.publication_service_generation = attempt.publication_service_generation;
@@ -4751,7 +4746,7 @@ where
                 let (generation, transaction_id) = match resident
                     .controller
                     .role_state(RoleId::Devmgr)
-                    .ok_or(InitError::WrongActivationOrder)?
+                    .ok_or(InitError::AbsentState(0x6b))?
                 {
                     RestartState::Starting {
                         generation,
@@ -4836,7 +4831,7 @@ impl PublicationRebindContext {
                 feature = "wyr1d-selector32"
             ))]
             Self::DriverRetirement => {
-                let reaped = _reaped.ok_or(InitError::WrongActivationOrder)?;
+                let reaped = _reaped.ok_or(InitError::AbsentState(0x6c))?;
                 if _driver.is_some() || reaped.supervisor_generation != _supervisor {
                     return Err(InitError::WrongActivationOrder);
                 }
@@ -4866,9 +4861,9 @@ where
     let state = resident
         .wyr1c
         .as_mut()
-        .ok_or(InitError::WrongActivationOrder)?;
-    let registry = state.registry.ok_or(InitError::WrongActivationOrder)?;
-    let devmgr = state.devmgr.ok_or(InitError::WrongActivationOrder)?;
+        .ok_or(InitError::AbsentState(0x6d))?;
+    let registry = state.registry.ok_or(InitError::AbsentState(0x6e))?;
+    let devmgr = state.devmgr.ok_or(InitError::AbsentState(0x6f))?;
     let expected_status = context.expected_status(
         state.resource_domain,
         state.driver,
@@ -4894,7 +4889,7 @@ where
                 state
                     .e6
                     .as_mut()
-                    .ok_or(InitError::WrongActivationOrder)?
+                    .ok_or(InitError::AbsentState(0x70))?
                     .shell
                     .poison(registry.active.generation);
             }
@@ -5543,12 +5538,14 @@ mod tests {
                 Some(request),
                 supervisor
             ),
+            // Still an ordering violation, not an absent slot: this reaches
+            // the explicit guard rather than a state `Option`.
             Err(InitError::WrongActivationOrder)
         );
         assert_eq!(
             PublicationRebindContext::DriverRetirement
                 .expected_status(custody, None, None, supervisor),
-            Err(InitError::WrongActivationOrder)
+            Err(InitError::AbsentState(0x6c))
         );
         assert_eq!(
             PublicationRebindContext::DriverRetirement.expected_status(
@@ -5557,6 +5554,8 @@ mod tests {
                 Some(request),
                 SupervisorGeneration(8)
             ),
+            // A stale supervisor generation is an ordering violation, and the
+            // guard that says so runs before any slot is read.
             Err(InitError::WrongActivationOrder)
         );
     }

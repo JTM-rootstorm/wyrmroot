@@ -9144,6 +9144,7 @@ mod tests {
             InitError::RecoveryTransition {
                 operation: 0x0f,
                 initiating_kind: 0x02,
+                payload: 0,
                 emergency_cleanup: EmergencyCleanup::Attempted {
                     channel_close_failed: false,
                     owner_cleanup_failed: false,
@@ -9163,6 +9164,7 @@ mod tests {
             InitError::RecoveryTransition {
                 operation: 0x0f,
                 initiating_kind: 0x02,
+                payload: 0,
                 emergency_cleanup: EmergencyCleanup::Attempted {
                     channel_close_failed: true,
                     owner_cleanup_failed: false,
@@ -9182,6 +9184,7 @@ mod tests {
             InitError::RecoveryTransition {
                 operation: 0x0f,
                 initiating_kind: 0x02,
+                payload: 0,
                 emergency_cleanup: EmergencyCleanup::Attempted {
                     channel_close_failed: false,
                     owner_cleanup_failed: true,
@@ -9204,6 +9207,7 @@ mod tests {
             InitError::RecoveryTransition {
                 operation: 0x0f,
                 initiating_kind: 0x02,
+                payload: 0,
                 emergency_cleanup: EmergencyCleanup::Attempted {
                     channel_close_failed: true,
                     owner_cleanup_failed: true,
@@ -9265,6 +9269,7 @@ mod tests {
             Err(InitError::RecoveryTransition {
                 operation: 0x0f,
                 initiating_kind: 0x04,
+                payload: 0,
                 emergency_cleanup: EmergencyCleanup::Attempted {
                     channel_close_failed: false,
                     owner_cleanup_failed: false,

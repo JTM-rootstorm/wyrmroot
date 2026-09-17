@@ -92,7 +92,7 @@ fn reconcile_job_dispatcher_outcome(
     else {
         return Ok(None);
     };
-    let peer = state.console.ok_or(InitError::WrongActivationOrder)?;
+    let peer = state.console.ok_or(InitError::AbsentState(0x80))?;
     if peer.grant != grant {
         return Err(InitError::Accounting);
     }
@@ -235,11 +235,11 @@ where
     let state = resident
         .wyr1c
         .as_mut()
-        .ok_or(InitError::WrongActivationOrder)?;
-    let registry = state.registry.ok_or(InitError::WrongActivationOrder)?;
-    let expected_driver = state.driver.ok_or(InitError::WrongActivationOrder)?.request;
+        .ok_or(InitError::AbsentState(0x81))?;
+    let registry = state.registry.ok_or(InitError::AbsentState(0x82))?;
+    let expected_driver = state.driver.ok_or(InitError::AbsentState(0x83))?.request;
     let expected_service_generation = state.publication_service_generation;
-    let e6 = state.e6.as_mut().ok_or(InitError::WrongActivationOrder)?;
+    let e6 = state.e6.as_mut().ok_or(InitError::AbsentState(0x84))?;
     if e6.console.is_some() || e6.publication_observer.is_some() {
         return Err(InitError::WrongActivationOrder);
     }
@@ -352,9 +352,9 @@ where
     let state = resident
         .wyr1c
         .as_mut()
-        .ok_or(InitError::WrongActivationOrder)?;
-    let registry = state.registry.ok_or(InitError::WrongActivationOrder)?;
-    let e6 = state.e6.as_mut().ok_or(InitError::WrongActivationOrder)?;
+        .ok_or(InitError::AbsentState(0x85))?;
+    let registry = state.registry.ok_or(InitError::AbsentState(0x86))?;
+    let e6 = state.e6.as_mut().ok_or(InitError::AbsentState(0x87))?;
     if e6.publication_observer.is_some() {
         return Err(InitError::WrongActivationOrder);
     }
@@ -609,7 +609,7 @@ fn clear_publication_observer<S: Wyr1BPlatform>(
     let observer = e6
         .publication_observer
         .take()
-        .ok_or(InitError::WrongActivationOrder)?;
+        .ok_or(InitError::AbsentState(0x88))?;
     system
         .close_handle(observer.client)
         .map_err(|_| InitError::Cleanup)
@@ -797,10 +797,10 @@ where
     let state = resident
         .wyr1c
         .as_mut()
-        .ok_or(InitError::WrongActivationOrder)?;
+        .ok_or(InitError::AbsentState(0x89))?;
     let registry_generation = state.topology.generation();
     let current_driver = state.driver;
-    let e6 = state.e6.as_mut().ok_or(InitError::WrongActivationOrder)?;
+    let e6 = state.e6.as_mut().ok_or(InitError::AbsentState(0x8a))?;
     poll_publication_observer_state(e6, current_driver, registry_generation, system, waits, now)
 }
 
@@ -820,7 +820,7 @@ where
     if defer_to_coordinated_retirement {
         return Ok(PollOutcome::Stable);
     }
-    let peer = e6.console.take().ok_or(InitError::WrongActivationOrder)?;
+    let peer = e6.console.take().ok_or(InitError::AbsentState(0x8b))?;
     e6.awaiting_ready = false;
     e6.bootstrap_released = false;
     e6.console_transaction = 0;
@@ -898,9 +898,9 @@ where
     let state = resident
         .wyr1c
         .as_mut()
-        .ok_or(InitError::WrongActivationOrder)?;
-    let registry = state.registry.ok_or(InitError::WrongActivationOrder)?;
-    let e6 = state.e6.as_mut().ok_or(InitError::WrongActivationOrder)?;
+        .ok_or(InitError::AbsentState(0x8c))?;
+    let registry = state.registry.ok_or(InitError::AbsentState(0x8d))?;
+    let e6 = state.e6.as_mut().ok_or(InitError::AbsentState(0x8e))?;
     // R7B-4 class D1e. This gate used to carry a second reason -- a parked WAIT
     // reply -- which R6C's argument retires: the reply sits in ordinary
     // `pending_waits` storage and `e8_wait_is_held` refuses to answer it twice,
@@ -1052,9 +1052,8 @@ where
                     attribute_failure(
                         RecoveryOperation::RequestRetire,
                         (|| {
-                            let request =
-                                state.driver.ok_or(InitError::WrongActivationOrder)?.request;
-                            let devmgr = state.devmgr.ok_or(InitError::WrongActivationOrder)?;
+                            let request = state.driver.ok_or(InitError::AbsentState(0x8f))?.request;
+                            let devmgr = state.devmgr.ok_or(InitError::AbsentState(0x90))?;
                             let identity = e6.shell.e8_driver_identity(request)?;
                             let mut request_bytes =
                                 [0u8; wyrmroot_device_proto::d5_controller::RECORD_BYTES];
@@ -1136,7 +1135,7 @@ pub(super) fn recovery_deadline(resident: &ResidentSystemInit) -> Result<Option<
         .wyr1c
         .as_ref()
         .and_then(|state| state.e6.as_ref())
-        .ok_or(InitError::WrongActivationOrder)?
+        .ok_or(InitError::AbsentState(0x91))?
         .shell
         .recovery_deadline())
 }
@@ -1152,7 +1151,7 @@ pub(super) fn ensure_recovery_live(
         .wyr1c
         .as_ref()
         .and_then(|state| state.e6.as_ref())
-        .ok_or(InitError::WrongActivationOrder)?;
+        .ok_or(InitError::AbsentState(0x92))?;
     let live = state.shell.require_recovery_live_at(now);
     // The cause tag stays selector-gated: carrying which leg failed is class C
     // of the R7A inventory and is R7B's next increment, not this one.
@@ -1205,9 +1204,9 @@ where
     let state = resident
         .wyr1c
         .as_mut()
-        .ok_or(InitError::WrongActivationOrder)?;
+        .ok_or(InitError::AbsentState(0x93))?;
     let generation = state.topology.generation();
-    let e6 = state.e6.as_mut().ok_or(InitError::WrongActivationOrder)?;
+    let e6 = state.e6.as_mut().ok_or(InitError::AbsentState(0x94))?;
     #[cfg(feature = "wyr1e8-selector33")]
     let pending_action = e6.shell.e8_pending_action();
     #[cfg(feature = "wyr1e8-selector33")]
@@ -1299,7 +1298,7 @@ where
     } else {
         #[cfg(feature = "wyr1e8-selector33")]
         if let Some(held) = held {
-            let result = console_result?.ok_or(InitError::WrongActivationOrder)?;
+            let result = console_result?.ok_or(InitError::AbsentState(0x95))?;
             finish_e8_dependent_retirement(system, &mut e6.jobs, &mut e6.shell, held, result)?;
         }
         Ok(())
@@ -1346,7 +1345,7 @@ pub(super) fn reserve_registry_replacement(
         .wyr1c
         .as_mut()
         .and_then(|state| state.e6.as_mut())
-        .ok_or(InitError::WrongActivationOrder)?
+        .ok_or(InitError::AbsentState(0x96))?
         .shell
         .reserve_replacement_generation(generation)
 }
@@ -1359,7 +1358,7 @@ pub(super) fn commit_registry_replacement(
         .wyr1c
         .as_mut()
         .and_then(|state| state.e6.as_mut())
-        .ok_or(InitError::WrongActivationOrder)?
+        .ok_or(InitError::AbsentState(0x97))?
         .commit_registry_replacement(generation)
 }
 

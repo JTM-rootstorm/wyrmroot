@@ -193,9 +193,39 @@ pub(crate) enum RecoveryOperation {
 #[cfg(not(feature = "r1-selector34"))]
 const UNATTRIBUTED_OPERATION: u8 = 0x0f;
 
+/// One error's own diagnostic instance, or zero where it has nothing to add.
+///
+/// `failure_kind` answers "what class of thing went wrong" in four bits, which
+/// is the caller's question under `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §2.
+/// This answers "which one", which is the reader's, and §3.3 requires it to
+/// survive a diagnostic boundary -- a test-completion status is named there as
+/// exactly such a boundary. Zero means the error carries no instance.
+///
+/// Kept across attribution in `RecoveryTransition::payload`, because
+/// `attribute_failure` replaces the error it wraps: before F3A.6c the
+/// innermost cause was reduced to four bits there, which is the collapse
+/// contract §3.2 calls a debt to the reader.
+const fn failure_instance(error: &InitError) -> u16 {
+    match error {
+        // `native_error_code` is the project's own canonical 16-bit encoding:
+        // bit 15 distinguishes an output-contract failure from a kernel status
+        // and the magnitude saturates below it.
+        InitError::Native(error) => wyrmroot_runtime::native_error_code(*error) as u16,
+        InitError::AbsentState(site) => *site as u16,
+        InitError::LaunchProtocol(error) => *error as u16,
+        // An attributed failure already carries the innermost instance.
+        InitError::RecoveryTransition { payload, .. } => *payload,
+        _ => 0,
+    }
+}
+
 const fn failure_kind(error: &InitError) -> u8 {
     match error {
         InitError::WrongActivationOrder => 0x01,
+        // A new kind rather than 0x01's: the payload namespaces are per-kind,
+        // and sharing 0x01 would make a site number indistinguishable from a
+        // native status magnitude. 0x09..=0x0e were unallocated.
+        InitError::AbsentState(_) => 0x09,
         InitError::Accounting | InitError::Wyr1BModel(_) => 0x02,
         // The retirement wait kept `Supervision`'s meaning when it gained a
         // payload, so selector 33's kind is unchanged by that split. E8 must stay
@@ -219,6 +249,9 @@ const fn failure_kind(error: &InitError) -> u8 {
         | InitError::Mapping(_)
         | InitError::Launch(_)
         | InitError::Loader(_) => 0x07,
+        // A refused launch message is a protocol refusal, which is what 0x06
+        // already names for the registry and gate protocols.
+        InitError::LaunchProtocol(_) => 0x06,
         InitError::GateConfig(_)
         | InitError::Evidence(_)
         | InitError::Wyr1BGateConfig(_)
@@ -275,6 +308,7 @@ pub(crate) fn attribute_failure<T>(
         _ => InitError::RecoveryTransition {
             operation: operation as u8,
             initiating_kind: failure_kind(&error),
+            payload: failure_instance(&error),
             emergency_cleanup: EmergencyCleanup::NotRun,
         },
     })
@@ -285,15 +319,18 @@ pub(crate) fn dispatch_failure(error: InitError, emergency_cleanup: EmergencyCle
         InitError::RecoveryTransition {
             operation,
             initiating_kind,
+            payload,
             ..
         } => InitError::RecoveryTransition {
             operation,
             initiating_kind,
+            payload,
             emergency_cleanup,
         },
         error => InitError::RecoveryTransition {
             operation: 0x0f,
             initiating_kind: failure_kind(&error),
+            payload: failure_instance(&error),
             emergency_cleanup,
         },
     }
@@ -333,6 +370,7 @@ pub const fn resident_tick_failure_application_status(error: &InitError) -> u32 
                 operation,
                 initiating_kind,
                 emergency_cleanup,
+                ..
             } => (
                 *operation,
                 if emergency_cleanup.failed() {
@@ -348,11 +386,98 @@ pub const fn resident_tick_failure_application_status(error: &InitError) -> u32 
             _ => UNATTRIBUTED_OPERATION,
         };
         let kind = match kind {
-            0x01..=0x08 | 0x0f => kind,
+            0x01..=0x09 | 0x0f => kind,
             _ => 0x0f,
         };
-        0xAF18_0000 | (operation as u32) << 8 | kind as u32
+        // Two kinds carry an instance, and a sixteen-bit word cannot hold the
+        // operation nibble plus a sixteen-bit cause. Per
+        // `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §5 the encoding saturates
+        // rather than wraps, and per §3.3 the instance survives: each gets its
+        // own tag carrying the operation *and* its cause, in the same shape
+        // `wyr1c6_test_failure_application_status` and selector 34's encoder
+        // already use for a native status.
+        //
+        // Every other error keeps `0xAF18_<operation><kind>` byte for byte,
+        // which is what holds E8's statuses identical to the A27 baseline.
+        let instance = failure_instance(error) as u32;
+        match kind {
+            // A kernel status or a malformed-output classification. Bit 11
+            // keeps the two families apart after saturation; the magnitude
+            // saturates at 0x7ff rather than aliasing a smaller status.
+            0x05 => {
+                let magnitude = instance & 0x7fff;
+                let saturated = if magnitude > 0x7ff { 0x7ff } else { magnitude };
+                0xAF1E_0000
+                    | (operation as u32) << 12
+                    | if instance & 0x8000 != 0 { 0x800 } else { 0 }
+                    | saturated
+            }
+            // An absent state slot, at the site that found it. Eight bits, so
+            // no saturation is possible.
+            0x09 => 0xAF1F_0000 | (operation as u32) << 12 | (instance & 0xff),
+            // Kind 0x06 is shared by three protocols, so the tag says which
+            // one and the low byte carries the refusal. Only the launch
+            // protocol carries an instance here; the other two reach the
+            // reader as 0xAF18 and their class, unchanged.
+            0x06 if matches!(error, InitError::LaunchProtocol(_)) => {
+                0xAF20_0000 | (operation as u32) << 12 | (instance & 0xff)
+            }
+            _ => 0xAF18_0000 | (operation as u32) << 8 | kind as u32,
+        }
     }
+}
+
+/// Decodes a tick-failure status back into operation, kind and instance.
+///
+/// In source and under test because the layout is a contract, not a comment:
+/// three tags share one function and a reader holding a transcript needs to
+/// know which one they are looking at.
+///
+/// Returns `None` for a word this encoder never produces.
+#[cfg(not(feature = "r1-selector34"))]
+#[must_use]
+pub const fn decode_tick_failure(status: u32) -> Option<TickFailure> {
+    match status >> 16 {
+        0xAF18 => Some(TickFailure {
+            operation: ((status >> 8) & 0x0f) as u8,
+            kind: (status & 0x0f) as u8,
+            instance: 0,
+            saturated: false,
+        }),
+        0xAF1E => Some(TickFailure {
+            operation: ((status >> 12) & 0x0f) as u8,
+            kind: 0x05,
+            instance: (status & 0x7ff) as u16 | if status & 0x800 != 0 { 0x8000 } else { 0 },
+            saturated: status & 0x7ff == 0x7ff,
+        }),
+        0xAF20 => Some(TickFailure {
+            operation: ((status >> 12) & 0x0f) as u8,
+            kind: 0x06,
+            instance: (status & 0xff) as u16,
+            saturated: false,
+        }),
+        0xAF1F => Some(TickFailure {
+            operation: ((status >> 12) & 0x0f) as u8,
+            kind: 0x09,
+            instance: (status & 0xff) as u16,
+            saturated: false,
+        }),
+        _ => None,
+    }
+}
+
+/// One decoded tick-failure status.
+#[cfg(not(feature = "r1-selector34"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TickFailure {
+    /// `RecoveryOperation`, or `0x0f` when nothing claimed the failure.
+    pub operation: u8,
+    /// `failure_kind`'s four-bit class.
+    pub kind: u8,
+    /// The cause's own value, or zero where the kind carries none.
+    pub instance: u16,
+    /// Whether `instance` reached its encoding's limit and may be larger.
+    pub saturated: bool,
 }
 
 /// Test-only application status that preserves the top-level init failure
@@ -369,6 +494,12 @@ const fn test_failure_category(error: &InitError) -> u32 {
         InitError::WrongManifestProfile => 0x01,
         InitError::UnlaunchableRole => 0x02,
         InitError::WrongActivationOrder => 0x03,
+        // Its own category rather than 0x03's: this space has room, and the
+        // point of splitting the variant was that "an expected slot was
+        // absent" and "the activation order was violated" are different
+        // findings. 0x21..=0x24 were unallocated.
+        InitError::AbsentState(_) => 0x21,
+        InitError::LaunchProtocol(_) => 0x22,
         InitError::MissingAttemptResources => 0x04,
         InitError::ResourcesAlreadyInstalled => 0x05,
         InitError::ResourceIdentityMismatch => 0x06,
@@ -611,7 +742,15 @@ pub const fn r1_test_failure_application_status(error: &InitError) -> u32 {
         // the liveness snapshot when a card needs it, not spent here. Adding a
         // base above is the right move only for a payload selector 34 can
         // actually reach.
-        InitError::WrongManifestProfile
+        // F3A.6c's `AbsentState` site number is named here rather than given a
+        // base of its own, for the reason the paragraph above gives: its sites
+        // are all in `wyr1c_native.rs` and `wyr1e_native.rs`, which selector
+        // 34 does not exercise, and this encoder's low sixteen bits are
+        // scarce. If a card ever reaches one from selector 34, a base is the
+        // right move then.
+        InitError::AbsentState(_)
+        | InitError::LaunchProtocol(_)
+        | InitError::WrongManifestProfile
         | InitError::UnlaunchableRole
         | InitError::WrongActivationOrder
         | InitError::MissingAttemptResources
@@ -1273,6 +1412,15 @@ pub enum InitError {
     #[cfg(feature = "wyr1b-test-evidence")]
     OrdinaryMapping(OrdinaryMappingDiagnostic),
     Launch(wyrmroot_loader::launch::LaunchError),
+    /// A launch-protocol message refused parsing, with the reason it refused.
+    ///
+    /// Both sites that parse one used to report `InitError::Accounting`, which
+    /// was not merely a collapse under
+    /// `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §3.1 but the wrong class: a
+    /// malformed request is a protocol refusal, and kind 0x02 sent a reader
+    /// looking at resource accounting. Twenty-three distinct reasons reached
+    /// that one value.
+    LaunchProtocol(wyrmroot_launch_proto::Error),
     Loader(LoadError<NativeError>),
     Supervision,
     Cleanup,
@@ -1288,9 +1436,42 @@ pub enum InitError {
     #[cfg(feature = "wyr1c6-selector29")]
     Wyr1C6GateConfig(wyr1c6_gate::GateError),
     /// A bounded recovery transition failed, naming the operation it failed in.
+    /// An expected state slot was absent, at the numbered site that found it.
+    ///
+    /// Every one of these used to be `WrongActivationOrder`, which is raised
+    /// at roughly two hundred sites across six files and carries four bits.
+    /// Two different meanings were sharing it: `return Err(..)` guards, which
+    /// are genuine ordering violations, and `.ok_or(..)` on a state `Option`,
+    /// which says some slot the caller expected to be populated was not. The
+    /// second is now this, with a site number, so a transcript can say which
+    /// slot.
+    ///
+    /// Sites are allocated in stable per-file ranges rather than one global
+    /// sequence, so inserting one does not renumber the rest:
+    ///
+    /// | range | file |
+    /// | --- | --- |
+    /// | `0x01..=0x0f` | `lib.rs` |
+    /// | `0x10..=0x7f` | `wyr1c_native.rs` |
+    /// | `0x80..=0xbf` | `wyr1e_native.rs` |
+    ///
+    /// `wyr1b_native.rs`, `wyr1d_native.rs` and the two evidence modules keep
+    /// `WrongActivationOrder` deliberately: their sites belong to selectors
+    /// whose failure statuses are pinned, and
+    /// `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` requires E8's to stay identical to
+    /// the A27 baseline. Converting them would move those words.
+    AbsentState(u8),
     RecoveryTransition {
         operation: u8,
         initiating_kind: u8,
+        /// The innermost error's own diagnostic instance, kept across attribution.
+        ///
+        /// `attribute_failure` replaces the error it wraps with this variant,
+        /// which used to mean the payload of the error that actually failed --
+        /// a `DwStatus`, a parse error, a launcher code -- was discarded and
+        /// only its four-bit kind survived. F3A.6b's transcripts said
+        /// `InitError::Native(_)` and could not say which syscall.
+        payload: u16,
         emergency_cleanup: EmergencyCleanup,
     },
     #[cfg(feature = "r1-selector34")]
@@ -2922,7 +3103,7 @@ where
             ..
         } = controller
             .role_state(role)
-            .ok_or(InitError::WrongActivationOrder)?
+            .ok_or(InitError::AbsentState(0x01))?
         else {
             return Err(InitError::WrongActivationOrder);
         };
@@ -3374,7 +3555,7 @@ fn advance_or_degrade<S: InitPlatform>(
 ) -> Result<bool, InitError> {
     match controller
         .role_state(role)
-        .ok_or(InitError::WrongActivationOrder)?
+        .ok_or(InitError::AbsentState(0x02))?
     {
         RestartState::PermanentFailure { .. } => Ok(true),
         RestartState::Backoff {
@@ -4753,6 +4934,121 @@ mod native_cleanup_tests {
         assert_eq!(fatal_application_status(&error) as u32, 0xAF01_0002);
     }
 
+    /// F3A.6c: a native failure must say which native failure it was.
+    ///
+    /// The F3A campaign's transcripts reported `0xAF18_0F05` -- unattributed,
+    /// kind 5, `InitError::Native(_)` -- and could not say which syscall
+    /// returned what. `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §3.3 requires
+    /// the instance to survive a diagnostic boundary, so it now does: through
+    /// attribution, into its own tag, and back out of the decoder.
+    #[cfg(not(feature = "r1-selector34"))]
+    #[test]
+    fn a_native_tick_failure_carries_its_own_status_through_attribution() {
+        use deepwyrm_syscall::DwStatus;
+        use wyrmroot_runtime::{NativeError, NativeOutputError};
+
+        let native = InitError::Native(NativeError::Status(DwStatus(-7)));
+        let decoded = decode_tick_failure(resident_tick_failure_application_status(&native))
+            .expect("a native tick failure decodes");
+        assert_eq!(
+            (decoded.operation, decoded.kind, decoded.instance),
+            (0x0f, 0x05, 7)
+        );
+        assert!(!decoded.saturated);
+
+        // Attribution keeps the instance and replaces only the operation.
+        // This is the collapse F3A.6c closed: `attribute_failure` used to
+        // discard the error it wrapped and keep four bits of it.
+        let attributed: Result<(), InitError> =
+            attribute_failure(RecoveryOperation::StartConsole, Err(native));
+        let decoded = decode_tick_failure(resident_tick_failure_application_status(
+            &attributed.unwrap_err(),
+        ))
+        .expect("an attributed native tick failure decodes");
+        assert_eq!(
+            (decoded.operation, decoded.kind, decoded.instance),
+            (0x0e, 0x05, 7)
+        );
+
+        // An output-contract failure stays distinguishable from a kernel
+        // status, which is what the family bit is for.
+        let output = InitError::Native(NativeError::Output(NativeOutputError::InvalidWaitResult));
+        let decoded = decode_tick_failure(resident_tick_failure_application_status(&output))
+            .expect("an output-contract failure decodes");
+        assert_eq!(decoded.instance, 0x8006);
+
+        // A magnitude beyond the field saturates and says so, rather than
+        // aliasing a different small status: contract §5.
+        let big = InitError::Native(NativeError::Status(DwStatus(-4096)));
+        let decoded = decode_tick_failure(resident_tick_failure_application_status(&big))
+            .expect("a large native status decodes");
+        assert!(decoded.saturated);
+        assert_eq!(decoded.instance, 0x7ff);
+    }
+
+    /// F3A.6c: a refused launch message must say why it was refused.
+    ///
+    /// Both sites that parse one reported `InitError::Accounting`, which was
+    /// the wrong class as well as a collapse: twenty-three reasons arrived as
+    /// kind 0x02, pointing a reader at resource accounting.
+    #[cfg(not(feature = "r1-selector34"))]
+    #[test]
+    fn a_refused_launch_message_carries_its_reason_and_the_right_class() {
+        use wyrmroot_launch_proto::Error as LaunchProtocolError;
+
+        let refused = InitError::LaunchProtocol(LaunchProtocolError::WrongHandleCount);
+        let decoded = decode_tick_failure(resident_tick_failure_application_status(&refused))
+            .expect("a refused launch message decodes");
+        // 0x06 is the protocol-refusal class, not 0x02's accounting.
+        assert_eq!(decoded.kind, 0x06);
+        assert_eq!(
+            decoded.instance,
+            LaunchProtocolError::WrongHandleCount as u16
+        );
+
+        // Distinct reasons must not encode alike.
+        let other = InitError::LaunchProtocol(LaunchProtocolError::InvalidUtf8);
+        assert_ne!(
+            resident_tick_failure_application_status(&refused),
+            resident_tick_failure_application_status(&other)
+        );
+
+        // The other two protocols at kind 0x06 keep the unchanged encoding,
+        // because neither carries an instance this word has room for.
+        let registry = resident_tick_failure_application_status(&InitError::Wyr1BGateMismatch);
+        assert_eq!(registry, 0xAF18_0F06);
+    }
+
+    /// F3A.6c: an absent state slot must say which slot.
+    #[cfg(not(feature = "r1-selector34"))]
+    #[test]
+    fn an_absent_state_tick_failure_carries_its_site() {
+        let absent = InitError::AbsentState(0x42);
+        let decoded = decode_tick_failure(resident_tick_failure_application_status(&absent))
+            .expect("an absent-state tick failure decodes");
+        assert_eq!(
+            (decoded.operation, decoded.kind, decoded.instance),
+            (0x0f, 0x09, 0x42)
+        );
+
+        let attributed: Result<(), InitError> =
+            attribute_failure(RecoveryOperation::LaunchRegistry, Err(absent));
+        let decoded = decode_tick_failure(resident_tick_failure_application_status(
+            &attributed.unwrap_err(),
+        ))
+        .expect("an attributed absent-state failure decodes");
+        assert_eq!(
+            (decoded.operation, decoded.kind, decoded.instance),
+            (0x0c, 0x09, 0x42)
+        );
+
+        // Two different sites must not encode alike, which is the whole point.
+        assert_ne!(
+            resident_tick_failure_application_status(&InitError::AbsentState(0x10)),
+            resident_tick_failure_application_status(&InitError::AbsentState(0x11))
+        );
+    }
+
     #[test]
     fn resident_tick_failure_detail_preserves_the_selected_profile() {
         // Selector 34 keeps its own category encoding at this boundary: it is a
@@ -4793,6 +5089,7 @@ mod native_cleanup_tests {
                 resident_tick_failure_application_status(&InitError::RecoveryTransition {
                     operation: RecoveryOperation::StartConsole as u8,
                     initiating_kind: 0x02,
+                    payload: 0,
                     emergency_cleanup: EmergencyCleanup::NotRun,
                 }),
                 0xAF18_0E02
@@ -4801,6 +5098,7 @@ mod native_cleanup_tests {
                 resident_tick_failure_application_status(&InitError::RecoveryTransition {
                     operation: RecoveryOperation::StartConsole as u8,
                     initiating_kind: 0x02,
+                    payload: 0,
                     emergency_cleanup: EmergencyCleanup::DisconnectFailed,
                 }),
                 0xAF18_0E04
@@ -5008,6 +5306,7 @@ mod native_cleanup_tests {
             InitError::RecoveryTransition {
                 operation: RecoveryOperation::Quiesced as u8,
                 initiating_kind: 0x05,
+                payload: 0,
                 emergency_cleanup: cleanup,
             }
         );
@@ -5032,6 +5331,7 @@ mod native_cleanup_tests {
             InitError::RecoveryTransition {
                 operation: 0x0f,
                 initiating_kind: 0x02,
+                payload: 0,
                 emergency_cleanup: EmergencyCleanup::DisconnectFailed,
             }
         );

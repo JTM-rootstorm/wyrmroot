@@ -61,7 +61,7 @@ impl LaunchRequestFacts {
         if handles.len() > MAX_REQUEST_HANDLES {
             return Err(InitError::Accounting);
         }
-        let parsed = parse_message(request, handles.len()).map_err(|_| InitError::Accounting)?;
+        let parsed = parse_message(request, handles.len()).map_err(InitError::LaunchProtocol)?;
         if !matches!(parsed.message, Message::Launch(_)) {
             return Err(InitError::Accounting);
         }

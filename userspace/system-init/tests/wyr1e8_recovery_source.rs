@@ -367,7 +367,15 @@ fn e8_failure_detail_is_bound_to_each_actual_transition_join() {
     let driver = include_str!("../src/wyr1c_native.rs");
 
     assert!(main.contains("resident_tick_failure_application_status(&error)"));
-    assert!(lib.contains("0xAF18_0000 | (operation as u32) << 8 | kind as u32"));
+    // F3A.6c widened this word to carry the innermost error's own payload in
+    // the two nibbles `operation` and `kind` never used. The substring that
+    // used to stand here was a proxy for the property that actually matters --
+    // E8's statuses must not move -- so the property is asserted directly
+    // below, by value, and the expression is only checked for the tag and the
+    // two nibble positions it still has to keep.
+    assert!(lib.contains("0xAF18_0000"));
+    assert!(lib.contains("| (operation as u32) << 8"));
+    assert!(lib.contains("| kind as u32"));
     let held_wait_start = jobs
         .find("if scope == LaunchSessionScope::ShellJobs")
         .unwrap();
@@ -474,6 +482,37 @@ fn a_recovery_episodes_budget_is_cleared_with_the_trigger_that_opened_it() {
             JOBS.matches(stray).count(),
             1,
             "an abandon site clears {stray} outside close_recovery_episode"
+        );
+    }
+}
+
+/// F3A.6c: widening the tick-failure word must not move any existing status.
+///
+/// Every error that carries no payload has to encode exactly what it encoded
+/// before the payload nibbles existed, because
+/// `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` requires E8's failure statuses to stay
+/// identical to the A27 baseline. This asserts that by value rather than by
+/// reading the expression, which is what the substring check above could not
+/// do.
+#[test]
+fn a_payload_free_tick_failure_status_is_unchanged_by_the_widening() {
+    use wyrmroot_system_init::{
+        InitError, decode_tick_failure, resident_tick_failure_application_status as status,
+    };
+
+    // The four baseline kinds the A27/E8 table pins, unattributed.
+    for (error, expected) in [
+        (InitError::WrongActivationOrder, 0xAF18_0F01_u32),
+        (InitError::Accounting, 0xAF18_0F02),
+        (InitError::Supervision, 0xAF18_0F03),
+        (InitError::Cleanup, 0xAF18_0F04),
+    ] {
+        assert_eq!(status(&error), expected);
+        let decoded = decode_tick_failure(expected).expect("a baseline status decodes");
+        assert_eq!(decoded.instance, 0);
+        assert_eq!(
+            (decoded.operation, decoded.kind),
+            (0x0f, expected as u8 & 0x0f)
         );
     }
 }
