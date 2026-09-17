@@ -13,6 +13,16 @@ pub enum CommandName {
     Echo,
     Clear,
     Exit,
+    /// Ends the session rather than this shell.
+    ///
+    /// F3A.7d. `Exit` ends *this* shell and system-init relaunches it at the
+    /// next generation, which `DW1F_WYR1F_F3A_VM_REQUEST.md` §5 row 12 accepts
+    /// deliberately -- it is the closure behaviour under test. That left the
+    /// product with no way to end a session at all: F3A.7c searched the
+    /// console-facing surface and found none, so row 13 could never be
+    /// satisfied. This is that terminator, and it is a separate command
+    /// precisely so it does not disturb what `Exit` means.
+    Shutdown,
     Services,
     Tasks,
     Status,
@@ -38,7 +48,7 @@ pub struct CommandSpec {
 }
 
 /// The same fixed metadata supports classification and the future help builtin.
-pub const COMMANDS: [CommandSpec; 11] = [
+pub const COMMANDS: [CommandSpec; 12] = [
     CommandSpec {
         name: CommandName::Help,
         spelling: "help",
@@ -61,6 +71,12 @@ pub const COMMANDS: [CommandSpec; 11] = [
         name: CommandName::Exit,
         spelling: "exit",
         usage: "exit",
+        arity: Arity::Exact(0),
+    },
+    CommandSpec {
+        name: CommandName::Shutdown,
+        spelling: "shutdown",
+        usage: "shutdown",
         arity: Arity::Exact(0),
     },
     CommandSpec {
@@ -129,6 +145,8 @@ pub enum Command<'a> {
     Echo(Arguments<'a>),
     Clear,
     Exit,
+    /// Ends the session. See `CommandName::Shutdown`.
+    Shutdown,
     Services,
     Tasks,
     Status,
@@ -171,6 +189,7 @@ impl<'a> Arguments<'a> {
             CommandName::Echo => Command::Echo(operands),
             CommandName::Clear => Command::Clear,
             CommandName::Exit => Command::Exit,
+            CommandName::Shutdown => Command::Shutdown,
             CommandName::Services => Command::Services,
             CommandName::Tasks => Command::Tasks,
             CommandName::Status => Command::Status,

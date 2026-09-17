@@ -326,7 +326,7 @@ fn every_wrst_fragment_boundary_preserves_control_input_semantics() {
         let mut fixture = Fixture::new(&[&input[..split], &input[split..]]);
         assert_eq!(
             run_v2(&mut fixture, "system/wyrmsh", &[]),
-            Ok(()),
+            Ok(Termination::Shell),
             "split {split}"
         );
         let stdout = fixture.output(STDOUT);

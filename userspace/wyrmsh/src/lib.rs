@@ -193,7 +193,7 @@ pub fn validate_startup(startup: StartupBlock<'_>) -> Result<(), ShellError> {
 pub fn run_wyrmsh<System: WyrmshSystem>(
     system: &mut System,
     startup: StartupBlock<'_>,
-) -> Result<(), ShellError> {
+) -> Result<Termination, ShellError> {
     validate_startup(startup)?;
     let bootstrap = startup.bootstrap_channel().as_abi();
     let queried = system
@@ -367,7 +367,10 @@ impl Shell {
         }
     }
 
-    fn serve<System: WyrmshSystem>(&mut self, system: &mut System) -> Result<(), ShellError> {
+    fn serve<System: WyrmshSystem>(
+        &mut self,
+        system: &mut System,
+    ) -> Result<Termination, ShellError> {
         self.redraw(system)?;
         loop {
             poll_health(
@@ -380,8 +383,8 @@ impl Shell {
             let mut bounded = ReceiveBudget::new(system);
             match self.stdin.read(&mut bounded, &mut byte) {
                 Ok(1) => {
-                    if self.apply_byte(system, byte[0])? {
-                        return Ok(());
+                    if let Some(termination) = self.apply_byte(system, byte[0])? {
+                        return Ok(termination);
                     }
                 }
                 Ok(_) => return Err(ShellError::Stream(StreamError::Protocol)),
@@ -407,12 +410,12 @@ impl Shell {
         &mut self,
         system: &mut System,
         byte: u8,
-    ) -> Result<bool, ShellError> {
+    ) -> Result<Option<Termination>, ShellError> {
         match self.editor.apply(self.decoder.feed(byte)) {
-            EditOutcome::Unchanged | EditOutcome::Busy => Ok(false),
+            EditOutcome::Unchanged | EditOutcome::Busy => Ok(None),
             EditOutcome::Changed => {
                 self.redraw(system)?;
-                Ok(false)
+                Ok(None)
             }
             EditOutcome::Cancelled => {
                 write_stdout(
@@ -423,7 +426,7 @@ impl Shell {
                     SUBMISSION_NEWLINE,
                 )?;
                 self.redraw(system)?;
-                Ok(false)
+                Ok(None)
             }
             EditOutcome::Rejected(error) => {
                 present_edit_error(
@@ -434,14 +437,24 @@ impl Shell {
                     error,
                 )?;
                 self.redraw(system)?;
-                Ok(false)
+                Ok(None)
             }
-            EditOutcome::Eof => Ok(true),
+            // F3A.7d. End of input ends the *session*, not just this shell.
+            //
+            // It used to be `Ok(true)` -- identical to `exit` -- which is why
+            // a supervised product had no terminator: Ctrl-D ended a shell the
+            // supervisor then relaunched. `DW1F_WYR1F_F3A_VM_REQUEST.md` §5
+            // row 13 already says `\x04` means shutdown; this is the product
+            // agreeing with the row rather than the row being rewritten.
+            EditOutcome::Eof => Ok(Some(Termination::Session)),
             EditOutcome::Submitted => self.submit(system),
         }
     }
 
-    fn submit<System: WyrmshSystem>(&mut self, system: &mut System) -> Result<bool, ShellError> {
+    fn submit<System: WyrmshSystem>(
+        &mut self,
+        system: &mut System,
+    ) -> Result<Option<Termination>, ShellError> {
         write_stdout(
             system,
             &mut self.stdout,
@@ -475,11 +488,11 @@ impl Shell {
                     self.controls,
                     error,
                 )?;
-                false
+                None
             }
         };
         self.editor.accept_submission();
-        if !exit {
+        if exit.is_none() {
             self.redraw(system)?;
         }
         Ok(exit)
@@ -504,6 +517,21 @@ impl Shell {
     }
 }
 
+/// Why the shell's input loop stopped.
+///
+/// F3A.7d. This was a `bool`, which is exactly the collapse
+/// `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §3.4 is about: "stop" covered both
+/// ending this shell and ending the session, and the supervisor cannot tell
+/// them apart from a bool. Naming them is what lets `shutdown` exist without
+/// changing what `exit` means.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Termination {
+    /// The shell ended. The supervisor relaunches it at the next generation.
+    Shell,
+    /// The session ended. The supervisor retires the console.
+    Session,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CommandError {
     Parse(ParseError),
@@ -524,7 +552,7 @@ fn dispatch_local<System: WyrmshSystem>(
     transactions: &mut TransactionIds,
     jobs: &mut jobs::JobTable,
     command: Command<'_>,
-) -> Result<bool, ShellError> {
+) -> Result<Option<Termination>, ShellError> {
     match command {
         Command::Empty => {}
         Command::Help => {
@@ -551,7 +579,8 @@ fn dispatch_local<System: WyrmshSystem>(
         Command::Clear => {
             write_stdout(system, stdout, stderr_handle, controls, CLEAR_DISPLAY)?;
         }
-        Command::Exit => return Ok(true),
+        Command::Exit => return Ok(Some(Termination::Shell)),
+        Command::Shutdown => return Ok(Some(Termination::Session)),
         Command::Services => {
             inspect_services(system, stdout, stderr, identity, controls, transactions)?
         }
@@ -602,7 +631,7 @@ fn dispatch_local<System: WyrmshSystem>(
             job.get(),
         )?,
     }
-    Ok(false)
+    Ok(None)
 }
 
 fn inspect_services<System: WyrmshSystem>(

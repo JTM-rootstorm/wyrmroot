@@ -107,7 +107,19 @@ impl StreamSystem for NativeSystem {
 
 fn wyrmsh_main(startup: StartupBlock<'_>) -> u32 {
     let mut system = NativeSystem;
-    run_wyrmsh(&mut system, startup).map_or_else(|error| error.exit_code(), |_| 0)
+    // F3A.7d. The session terminator reaches the supervisor as an application
+    // status, because that is the one channel a supervised child already has
+    // and it needs no new capability. `Termination::Shell` stays 0 so `exit`
+    // is byte-for-byte what it was.
+    run_wyrmsh(&mut system, startup).map_or_else(
+        |error| error.exit_code(),
+        |termination| match termination {
+            wyrmroot_wyrmsh::Termination::Shell => 0,
+            wyrmroot_wyrmsh::Termination::Session => {
+                wyrmroot_launch_proto::SHELL_SESSION_SHUTDOWN_STATUS
+            }
+        },
+    )
 }
 
 wyrmroot_runtime::native_entry!(crate::wyrmsh_main);

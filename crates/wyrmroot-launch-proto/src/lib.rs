@@ -12,6 +12,24 @@ pub const HEADER_BYTES: usize = ENVELOPE_BYTES + PREFIX_BYTES;
 pub const MAX_LIVE_JOBS: usize = 32;
 pub const MAX_COMPLETED_JOBS: usize = 32;
 pub const MAX_ARGV: usize = 64;
+
+/// The application status a shell exits with when it was asked to end the
+/// session, rather than merely to end itself.
+///
+/// F3A.7d. `exit` ends one shell and the supervisor relaunches it at the next
+/// generation -- `DW1F_WYR1F_F3A_VM_REQUEST.md` §5 row 12 accepts that on
+/// purpose. A supervised shell therefore had no way to end a session at all,
+/// which F3A.7c established by searching the whole console-facing surface.
+///
+/// It lives here because it is the one fact the shell and its supervisor must
+/// agree on and neither owns: `wyrmsh` exits with it, `system-init` reads it
+/// off the terminal record and retires the console instead of relaunching.
+/// Both already depend on this protocol crate; neither depends on the other.
+///
+/// The value is outside `BootstrapError`'s `0xB0..` exit space and outside the
+/// `0xAF..` tick-failure encodings, so it cannot be confused with a failure by
+/// a reader that knows only those.
+pub const SHELL_SESSION_SHUTDOWN_STATUS: u32 = 0x5344_0001;
 pub const MAX_ENVIRONMENT: usize = 64;
 pub const MAX_STRING_BYTES: usize = 16 * 1024;
 pub const MAX_PATH_BYTES: usize = 256;

@@ -32,7 +32,7 @@ use wyrmroot_runtime::{
     StreamSystem,
 };
 use wyrmroot_stream_proto::{MAX_PAYLOAD_BYTES, MAX_RECORD_BYTES, decode_data, encode_data};
-use wyrmroot_wyrmsh::{EndpointRole, ShellError, WyrmshSystem, run_wyrmsh};
+use wyrmroot_wyrmsh::{EndpointRole, ShellError, Termination, WyrmshSystem, run_wyrmsh};
 use wyrmroot_wyrmsh_core::COMMANDS;
 
 mod e8_adversarial;
@@ -832,7 +832,11 @@ fn put_word(block: &mut [u8], offset: usize, value: u64) {
     block[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
-fn run_v2(fixture: &mut Fixture, path: &str, environment: &[&str]) -> Result<(), ShellError> {
+fn run_v2(
+    fixture: &mut Fixture,
+    path: &str,
+    environment: &[&str],
+) -> Result<Termination, ShellError> {
     let mut block = [0_u8; STARTUP_BLOCK_V2_SIZE];
     let argc = 1usize;
     put_word(&mut block, 0, argc as u64);
@@ -864,7 +868,7 @@ fn run_v2(fixture: &mut Fixture, path: &str, environment: &[&str]) -> Result<(),
     run_wyrmsh(fixture, startup)
 }
 
-fn run_v1(fixture: &mut Fixture) -> Result<(), ShellError> {
+fn run_v1(fixture: &mut Fixture) -> Result<Termination, ShellError> {
     let mut block = [0_u8; STARTUP_BLOCK_SIZE];
     put_word(&mut block, 0, 1);
     put_word(&mut block, 8, BASE + 40);
@@ -886,7 +890,10 @@ fn run_v1(fixture: &mut Fixture) -> Result<(), ShellError> {
 fn startup_ready_release_and_local_builtins_use_the_real_stream_runtime() {
     let mut fixture =
         Fixture::new(&[b"\nhelp\necho a \"\" \xf0\x9f\x90\x89\necho\nclear\nservices\nexit\n"]);
-    assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+    assert_eq!(
+        run_v2(&mut fixture, "system/wyrmsh", &[]),
+        Ok(Termination::Shell)
+    );
     assert_eq!(
         parse_ready_for_profile(LaunchProfile::Wyrmsh, &fixture.ready, TRANSACTION),
         Ok(())
@@ -941,7 +948,10 @@ fn utf8_csi_and_multiple_submissions_survive_record_fragmentation() {
     let bytes = b"echo ax\x1b[D\x7f\xf0\x9f\x90\x89\necho second\n\x04";
     let fragments: Vec<&[u8]> = bytes.chunks(1).collect();
     let mut fixture = Fixture::new(&fragments);
-    assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+    assert_eq!(
+        run_v2(&mut fixture, "system/wyrmsh", &[]),
+        Ok(Termination::Session)
+    );
     let stdout = fixture.output(STDOUT);
     assert!(
         stdout
@@ -958,12 +968,18 @@ fn utf8_csi_and_multiple_submissions_survive_record_fragmentation() {
 #[test]
 fn output_backpressure_retries_only_the_uncommitted_suffix() {
     let mut baseline = Fixture::new(&[b"echo one two\nexit\n"]);
-    assert_eq!(run_v2(&mut baseline, "system/wyrmsh", &[]), Ok(()));
+    assert_eq!(
+        run_v2(&mut baseline, "system/wyrmsh", &[]),
+        Ok(Termination::Shell)
+    );
     let expected = baseline.output(STDOUT);
 
     let mut blocked = Fixture::new(&[b"echo one two\nexit\n"]);
     blocked.block_send_once = true;
-    assert_eq!(run_v2(&mut blocked, "system/wyrmsh", &[]), Ok(()));
+    assert_eq!(
+        run_v2(&mut blocked, "system/wyrmsh", &[]),
+        Ok(Termination::Shell)
+    );
     assert_eq!(blocked.output(STDOUT), expected);
     assert!(blocked.trace.contains(&Trace::ControlWait));
 }
@@ -978,7 +994,10 @@ fn partial_long_echo_waits_then_retries_only_the_uncommitted_suffix() {
 
     let mut fixture = Fixture::new(&fragments);
     fixture.block_second_long_packet = true;
-    assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+    assert_eq!(
+        run_v2(&mut fixture, "system/wyrmsh", &[]),
+        Ok(Termination::Shell)
+    );
     let stdout = fixture.output(STDOUT);
     assert!(
         stdout
@@ -1010,7 +1029,10 @@ fn required_control_loss_wins_while_partial_output_is_blocked() {
 #[test]
 fn ctrl_d_is_clean_but_physical_stdin_eof_is_a_generation_failure() {
     let mut ctrl_d = Fixture::new(&[b"\x04"]);
-    assert_eq!(run_v2(&mut ctrl_d, "system/wyrmsh", &[]), Ok(()));
+    assert_eq!(
+        run_v2(&mut ctrl_d, "system/wyrmsh", &[]),
+        Ok(Termination::Session)
+    );
 
     let mut eof = Fixture::new(&[]);
     eof.physical_eof = true;
@@ -1131,7 +1153,10 @@ fn editing_parser_and_usage_errors_redraw_without_control_requests() {
     let mut fixture = Fixture::new(&[
         b"bad\xff\x03echo \"unterminated\nclear too many operands\nunknown\nexit\n",
     ]);
-    assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+    assert_eq!(
+        run_v2(&mut fixture, "system/wyrmsh", &[]),
+        Ok(Termination::Shell)
+    );
     let stderr = fixture.output(STDERR);
     for message in [
         &b"\nerror: invalid input\n"[..],
@@ -1155,7 +1180,10 @@ fn maximum_line_echo_streams_without_a_second_large_output_buffer() {
     input.extend_from_slice(b"\nexit\n");
     let fragments: Vec<&[u8]> = input.chunks(MAX_PAYLOAD_BYTES).collect();
     let mut fixture = Fixture::new(&fragments);
-    assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+    assert_eq!(
+        run_v2(&mut fixture, "system/wyrmsh", &[]),
+        Ok(Termination::Shell)
+    );
     let stdout = fixture.output(STDOUT);
     assert!(
         stdout
@@ -1185,7 +1213,10 @@ fn inspection_commands_use_exact_transactions_and_format_complete_results() {
     fixture.queue_control(SHELL_JOBS, &jobs_reply(1, &[91, 7, 44]));
     fixture.queue_control(STATUS, &status_reply(1, status_snapshot()));
 
-    assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+    assert_eq!(
+        run_v2(&mut fixture, "system/wyrmsh", &[]),
+        Ok(Termination::Shell)
+    );
     let stdout = fixture.output(STDOUT);
     for expected in [
         &b"service name=console protocol=30 versions=1.0 generation=101\n"[..],
@@ -1249,7 +1280,10 @@ fn maximum_services_and_tasks_remain_bounded_and_preserve_wire_order() {
     let ids: Vec<u64> = (0..32).map(|index| 1_000 - index).collect();
     fixture.queue_control(SHELL_JOBS, &jobs_reply(1, &ids));
 
-    assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+    assert_eq!(
+        run_v2(&mut fixture, "system/wyrmsh", &[]),
+        Ok(Termination::Shell)
+    );
     let stdout = fixture.output(STDOUT);
     assert_eq!(
         stdout
@@ -1321,7 +1355,10 @@ fn status_reports_every_state_and_valid_no_child_snapshots_without_authority_val
         };
         fixture.queue_control(STATUS, &status_reply(index as u64 + 1, snapshot));
     }
-    assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+    assert_eq!(
+        run_v2(&mut fixture, "system/wyrmsh", &[]),
+        Ok(Termination::Shell)
+    );
     let stdout = fixture.output(STDOUT);
     for state in [
         b"state=active".as_slice(),
@@ -1450,7 +1487,10 @@ fn typed_control_errors_are_reported_and_fail_closed() {
 fn control_backpressure_timeout_peer_loss_and_unexpected_handles_are_bounded() {
     let mut retried = Fixture::new(&[b"tasks\nexit\n"]);
     retried.control_send_would_block.push_back(SHELL_JOBS);
-    assert_eq!(run_v2(&mut retried, "system/wyrmsh", &[]), Ok(()));
+    assert_eq!(
+        run_v2(&mut retried, "system/wyrmsh", &[]),
+        Ok(Termination::Shell)
+    );
     assert_eq!(
         retried
             .control_requests
@@ -1557,7 +1597,10 @@ fn mixed_inspections_advance_only_their_independent_transaction_namespaces() {
     fixture.queue_control(REGISTRY, &registry_reply(3, 0, 1, 0, &[]));
     fixture.queue_control(SHELL_JOBS, &jobs_reply(2, &[]));
     fixture.queue_control(STATUS, &status_reply(2, status_snapshot()));
-    assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+    assert_eq!(
+        run_v2(&mut fixture, "system/wyrmsh", &[]),
+        Ok(Termination::Shell)
+    );
 
     let transactions: Vec<u64> = fixture
         .control_requests
@@ -1586,7 +1629,10 @@ fn mixed_inspections_advance_only_their_independent_transaction_namespaces() {
     assert_eq!(transactions, [2, 1, 1, 3, 2, 2]);
 
     let mut exit = Fixture::new(&[b"exit\n"]);
-    assert_eq!(run_v2(&mut exit, "system/wyrmsh", &[]), Ok(()));
+    assert_eq!(
+        run_v2(&mut exit, "system/wyrmsh", &[]),
+        Ok(Termination::Shell)
+    );
     assert!(exit.control_requests.is_empty());
 }
 
@@ -1751,7 +1797,10 @@ fn spawn_wait_and_close_use_one_shared_transaction_namespace() {
     );
     fixture.queue_control(SHELL_JOBS, &terminal_reply(2, 91, normal_result(7)));
     fixture.queue_control(SHELL_JOBS, &job_reply(3, LaunchMessageType::Closed, 91));
-    assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+    assert_eq!(
+        run_v2(&mut fixture, "system/wyrmsh", &[]),
+        Ok(Termination::Shell)
+    );
 
     let requests: Vec<_> = fixture
         .control_requests
@@ -1797,7 +1846,10 @@ fn terminate_reports_acceptance_without_implicit_wait_or_close() {
         SHELL_JOBS,
         &job_reply(2, LaunchMessageType::TerminationAccepted, 91),
     );
-    assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+    assert_eq!(
+        run_v2(&mut fixture, "system/wyrmsh", &[]),
+        Ok(Termination::Shell)
+    );
     let requests: Vec<_> = fixture
         .control_requests
         .iter()
@@ -1840,7 +1892,10 @@ fn foreground_run_moves_staging_rights_drains_both_outputs_then_closes() {
         (CHILD_STDERR_RETAINED, Some(wire(b"hello-err\n"))),
         (CHILD_STDERR_RETAINED, None),
     ]);
-    assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+    assert_eq!(
+        run_v2(&mut fixture, "system/wyrmsh", &[]),
+        Ok(Termination::Shell)
+    );
 
     assert_eq!(fixture.moved[0].len(), 3);
     for (transfer, expected) in
@@ -1907,7 +1962,10 @@ fn handle_bearing_launch_retries_the_same_moves_and_commits_once() {
         .child_incoming
         .extend([(CHILD_STDOUT_RETAINED, None), (CHILD_STDERR_RETAINED, None)]);
 
-    assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+    assert_eq!(
+        run_v2(&mut fixture, "system/wyrmsh", &[]),
+        Ok(Termination::Shell)
+    );
     assert_eq!(fixture.handle_send_attempts.len(), 2);
     assert_eq!(
         fixture.handle_send_attempts[0],
@@ -1975,7 +2033,10 @@ fn foreground_accepts_stderr_peer_close_before_stdout_without_spinning() {
         (CHILD_STDOUT_RETAINED, None),
     ]);
 
-    assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+    assert_eq!(
+        run_v2(&mut fixture, "system/wyrmsh", &[]),
+        Ok(Termination::Shell)
+    );
     let peer_closes: Vec<_> = fixture
         .child_receive_trace
         .iter()
@@ -2021,7 +2082,10 @@ fn foreground_drains_buffered_output_before_presenting_exception_and_closing() {
         (CHILD_STDERR_RETAINED, None),
     ]);
 
-    assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+    assert_eq!(
+        run_v2(&mut fixture, "system/wyrmsh", &[]),
+        Ok(Termination::Shell)
+    );
     let stdout = fixture.output(STDOUT);
     let buffered = stdout
         .windows(b"buffered stdout\n".len())
@@ -2083,7 +2147,10 @@ fn committed_policy_rejection_closes_only_retained_stream_sides() {
         SHELL_JOBS,
         &launch_error(1, LaunchErrorCode::PolicyRejected),
     );
-    assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+    assert_eq!(
+        run_v2(&mut fixture, "system/wyrmsh", &[]),
+        Ok(Termination::Shell)
+    );
     for retained in [
         CHILD_STDIN_RETAINED,
         CHILD_STDOUT_RETAINED,
@@ -2122,7 +2189,10 @@ fn closed_child_streams_leave_wait_set_and_do_not_spin_before_result() {
     fixture
         .child_incoming
         .extend([(CHILD_STDOUT_RETAINED, None), (CHILD_STDERR_RETAINED, None)]);
-    assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+    assert_eq!(
+        run_v2(&mut fixture, "system/wyrmsh", &[]),
+        Ok(Termination::Shell)
+    );
     assert!(fixture.waited_deadlines.len() < 10);
 }
 
@@ -2142,7 +2212,10 @@ fn blocked_foreground_stdout_does_not_starve_stderr_or_job_result() {
         (CHILD_STDERR_RETAINED, Some(wire(b"child-err"))),
         (CHILD_STDERR_RETAINED, None),
     ]);
-    assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+    assert_eq!(
+        run_v2(&mut fixture, "system/wyrmsh", &[]),
+        Ok(Termination::Shell)
+    );
     assert_eq!(
         fixture
             .output(STDOUT)
@@ -2180,7 +2253,10 @@ fn stream_failure_fixture(cancel_replies: &[Vec<u8>]) -> Fixture {
 #[test]
 fn stream_failure_closes_endpoints_before_cancel_and_cancelled_closes_visibility() {
     let mut fixture = stream_failure_fixture(&[job_reply(3, LaunchMessageType::Cancelled, 2)]);
-    assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+    assert_eq!(
+        run_v2(&mut fixture, "system/wyrmsh", &[]),
+        Ok(Termination::Shell)
+    );
     let cancel = fixture
         .trace
         .iter()
@@ -2229,7 +2305,10 @@ fn cancel_completion_race_drains_both_correlations_in_either_order() {
         ],
     ] {
         let mut fixture = stream_failure_fixture(&replies);
-        assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+        assert_eq!(
+            run_v2(&mut fixture, "system/wyrmsh", &[]),
+            Ok(Termination::Shell)
+        );
         assert!(fixture.control_incoming.is_empty());
     }
 }
@@ -2418,7 +2497,10 @@ fn authoritative_foreign_wait_removes_only_that_local_id() {
         SHELL_JOBS,
         &job_reply(3, LaunchMessageType::LaunchAccepted, 92),
     );
-    assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+    assert_eq!(
+        run_v2(&mut fixture, "system/wyrmsh", &[]),
+        Ok(Termination::Shell)
+    );
     let requests: Vec<_> = fixture
         .control_requests
         .iter()
@@ -2472,7 +2554,10 @@ fn empty_child_record_flood_yields_to_other_output_and_job_result() {
     fixture
         .child_incoming
         .push_back((CHILD_STDERR_RETAINED, None));
-    assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+    assert_eq!(
+        run_v2(&mut fixture, "system/wyrmsh", &[]),
+        Ok(Termination::Shell)
+    );
     assert!(
         fixture
             .output(STDOUT)
@@ -2529,7 +2614,10 @@ fn all_structured_termination_classes_and_fields_are_rendered_from_wire_data() {
             ),
         );
         fixture.queue_control(SHELL_JOBS, &job_reply(3, LaunchMessageType::Closed, 91));
-        assert_eq!(run_v2(&mut fixture, "system/wyrmsh", &[]), Ok(()));
+        assert_eq!(
+            run_v2(&mut fixture, "system/wyrmsh", &[]),
+            Ok(Termination::Shell)
+        );
         let output = fixture.output(STDOUT);
         assert!(
             output

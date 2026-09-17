@@ -158,6 +158,9 @@ fn fixed_commands_and_usage_are_exact() {
         ("help", Command::Help),
         ("clear", Command::Clear),
         ("exit", Command::Exit),
+        // F3A.7d. Parsed and arity-checked exactly like its neighbours, and
+        // distinct from `exit`: one ends this shell, the other the session.
+        ("shutdown", Command::Shutdown),
         ("services", Command::Services),
         ("tasks", Command::Tasks),
         ("status", Command::Status),
@@ -193,7 +196,18 @@ fn fixed_commands_and_usage_are_exact() {
             Err(UsageError::ArgumentCount { .. })
         ));
     }
-    assert_eq!(COMMANDS.len(), 11);
+    assert_eq!(COMMANDS.len(), 12);
+    // The two terminators are separate entries with separate spellings. A
+    // corpus that only counted them would pass if `shutdown` were an alias for
+    // `exit`, which is the one thing it must not be.
+    assert_ne!(Command::Shutdown, Command::Exit);
+    assert_eq!(
+        COMMANDS
+            .iter()
+            .filter(|spec| matches!(spec.name, CommandName::Exit | CommandName::Shutdown))
+            .count(),
+        2
+    );
     assert_eq!(COMMANDS[0].name, CommandName::Help);
     assert!(
         matches!(parser.parse(b"echo").unwrap().command(), Ok(Command::Echo(args)) if args.is_empty())

@@ -296,7 +296,7 @@ fn command_arity_is_bounded_at_every_public_shape() {
         );
     }
 
-    assert_eq!(COMMANDS.len(), 11);
+    assert_eq!(COMMANDS.len(), 12);
 }
 
 #[test]
