@@ -5114,24 +5114,41 @@ mod native_cleanup_tests {
 
         // F3A.6h. The same exit reached from two different triggers must not
         // read as one status, and a whole reason byte survives the encoder.
-        let control = InitError::RegistryAbandoned(crate::wyr1c_native::abandoned::reason(
-            crate::wyr1c_native::abandoned::trigger::CONTROL_LOST,
-            crate::wyr1c_native::abandoned::RESTART_BUDGET_EXHAUSTED,
+        use crate::wyr1c_native::abandoned;
+        let control = InitError::RegistryAbandoned(abandoned::reason(
+            abandoned::trigger::CONTROL_LOST,
+            abandoned::phase::NONE,
         ));
-        let exited = InitError::RegistryAbandoned(crate::wyr1c_native::abandoned::reason(
-            crate::wyr1c_native::abandoned::trigger::EXITED,
-            crate::wyr1c_native::abandoned::RESTART_BUDGET_EXHAUSTED,
+        let exited = InitError::RegistryAbandoned(abandoned::reason(
+            abandoned::trigger::EXITED,
+            abandoned::phase::NONE,
         ));
         let control = resident_tick_failure_application_status(&control);
         let exited = resident_tick_failure_application_status(&exited);
         assert_ne!(control, exited);
-        assert_eq!(control, 0xAF21_0F11);
-        assert_eq!(exited, 0xAF21_0F21);
+        assert_eq!(control, 0xAF21_0F10);
+        assert_eq!(exited, 0xAF21_0F20);
+
+        // F3A.6j. One trigger and two phases must not read as one status
+        // either: the phase is what distinguishes twenty poll sites.
+        let deadline = InitError::RegistryAbandoned(abandoned::reason(
+            abandoned::trigger::WYR1E_POLL,
+            abandoned::phase::READY_DEADLINE_BEFORE_WAIT,
+        ));
+        let unmatched = InitError::RegistryAbandoned(abandoned::reason(
+            abandoned::trigger::WYR1E_POLL,
+            abandoned::phase::CONSOLE_EVENT_UNMATCHED,
+        ));
+        let deadline = resident_tick_failure_application_status(&deadline);
+        let unmatched = resident_tick_failure_application_status(&unmatched);
+        assert_ne!(deadline, unmatched);
+        assert_eq!(deadline, 0xAF21_0F44);
+        assert_eq!(unmatched, 0xAF21_0F4C);
         assert_eq!(
-            decode_tick_failure(exited)
+            decode_tick_failure(unmatched)
                 .expect("an abandoned registry decodes")
                 .instance,
-            0x21
+            0x4c
         );
 
         // And the new kind does not disturb the tag every other error uses.

@@ -76,7 +76,11 @@ pub(super) enum PollOutcome {
     Stable,
     LaunchConsole,
     RecoverDevmgr,
-    RecoverRegistry,
+    /// The poll phase that asked, per `wyr1c_native::abandoned::phase`.
+    ///
+    /// F3A.6j: `RecoverRegistry` alone covered twenty product sites across
+    /// three functions, so a transcript that named it named most of this file.
+    RecoverRegistry(u8),
     #[cfg(feature = "wyr1e8-selector33")]
     RecoverRegistryForE8,
 }
@@ -627,12 +631,18 @@ fn validate_publication_datagram(
         endpoint_generation: observer.grant.endpoint_generation,
         transaction_id: PUBLICATION_WATCH_TRANSACTION,
     };
-    let parsed = parse_registry(bytes, 0).map_err(|_| PollOutcome::RecoverRegistry)?;
+    let parsed = parse_registry(bytes, 0).map_err(|_| {
+        PollOutcome::RecoverRegistry(crate::wyr1c_native::abandoned::phase::PUBLICATION_DATAGRAM)
+    })?;
     let RegistryMessage::GenerationChanged { service_generation } = parsed.message else {
-        return Err(PollOutcome::RecoverRegistry);
+        return Err(PollOutcome::RecoverRegistry(
+            crate::wyr1c_native::abandoned::phase::PUBLICATION_DATAGRAM,
+        ));
     };
     if parsed.header != expected_header {
-        return Err(PollOutcome::RecoverRegistry);
+        return Err(PollOutcome::RecoverRegistry(
+            crate::wyr1c_native::abandoned::phase::PUBLICATION_DATAGRAM,
+        ));
     }
     if service_generation != observer.expected_service_generation
         || validated_at >= observer.deadline
@@ -679,15 +689,21 @@ where
     };
     if observed.index != 0 {
         clear_publication_observer(e6, system, registry_generation, true)?;
-        return Ok(Some(PollOutcome::RecoverRegistry));
+        return Ok(Some(PollOutcome::RecoverRegistry(
+            crate::wyr1c_native::abandoned::phase::PUBLICATION_OBSERVER,
+        )));
     }
     if observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 {
         clear_publication_observer(e6, system, registry_generation, true)?;
-        return Ok(Some(PollOutcome::RecoverRegistry));
+        return Ok(Some(PollOutcome::RecoverRegistry(
+            crate::wyr1c_native::abandoned::phase::PUBLICATION_OBSERVER,
+        )));
     }
     if observed.observed.0 & DW_SIGNAL_READABLE.0 == 0 {
         clear_publication_observer(e6, system, registry_generation, true)?;
-        return Ok(Some(PollOutcome::RecoverRegistry));
+        return Ok(Some(PollOutcome::RecoverRegistry(
+            crate::wyr1c_native::abandoned::phase::PUBLICATION_OBSERVER,
+        )));
     }
     let mut bytes = [0u8; 256];
     let mut handles = [DwReceivedHandleInfoV1::default(); 1];
@@ -695,7 +711,9 @@ where
         Ok(counts) => counts,
         Err(_) => {
             clear_publication_observer(e6, system, registry_generation, true)?;
-            return Ok(Some(PollOutcome::RecoverRegistry));
+            return Ok(Some(PollOutcome::RecoverRegistry(
+                crate::wyr1c_native::abandoned::phase::PUBLICATION_OBSERVER,
+            )));
         }
     };
     if counts.bytes > bytes.len() || counts.handles > handles.len() {
@@ -704,7 +722,9 @@ where
         return if received_cleanup.is_err() || observer_cleanup.is_err() {
             Err(InitError::Cleanup)
         } else {
-            Ok(Some(PollOutcome::RecoverRegistry))
+            Ok(Some(PollOutcome::RecoverRegistry(
+                crate::wyr1c_native::abandoned::phase::PUBLICATION_OBSERVER,
+            )))
         };
     }
     if counts.handles != 0 {
@@ -713,7 +733,9 @@ where
         return if received_cleanup.is_err() || observer_cleanup.is_err() {
             Err(InitError::Cleanup)
         } else {
-            Ok(Some(PollOutcome::RecoverRegistry))
+            Ok(Some(PollOutcome::RecoverRegistry(
+                crate::wyr1c_native::abandoned::phase::PUBLICATION_OBSERVER,
+            )))
         };
     }
     let validated_at = match system.now() {
@@ -743,7 +765,7 @@ where
             e6,
             system,
             registry_generation,
-            outcome == PollOutcome::RecoverRegistry,
+            matches!(outcome, PollOutcome::RecoverRegistry(_)),
         )?;
         return Ok(Some(outcome));
     }
@@ -981,7 +1003,9 @@ where
                     e6.shell.health(),
                     crate::wyr1b_native::ShellRegistryHealth::Poisoned { .. }
                 ) {
-                    Ok(PollOutcome::RecoverRegistry)
+                    Ok(PollOutcome::RecoverRegistry(
+                        crate::wyr1c_native::abandoned::phase::DISPATCHER_POISONED,
+                    ))
                 } else {
                     Err(error)
                 };
@@ -993,7 +1017,9 @@ where
     }
     if e6.awaiting_ready && now >= e6.ready_deadline {
         retire_current_console(e6, system, waits, state.topology.generation(), true)?;
-        return Ok(PollOutcome::RecoverRegistry);
+        return Ok(PollOutcome::RecoverRegistry(
+            crate::wyr1c_native::abandoned::phase::READY_DEADLINE_BEFORE_WAIT,
+        ));
     }
     let Some(console) = e6.console else {
         return Ok(PollOutcome::Stable);
@@ -1012,7 +1038,9 @@ where
         Ok(None) => {
             if e6.awaiting_ready && now >= e6.ready_deadline {
                 retire_current_console(e6, system, waits, state.topology.generation(), true)?;
-                return Ok(PollOutcome::RecoverRegistry);
+                return Ok(PollOutcome::RecoverRegistry(
+                    crate::wyr1c_native::abandoned::phase::READY_DEADLINE_AFTER_WAIT,
+                ));
             }
             return Ok(PollOutcome::Stable);
         }
@@ -1024,13 +1052,17 @@ where
     }
     if observed.index != 1 {
         retire_current_console(e6, system, waits, state.topology.generation(), true)?;
-        return Ok(PollOutcome::RecoverRegistry);
+        return Ok(PollOutcome::RecoverRegistry(
+            crate::wyr1c_native::abandoned::phase::CONSOLE_WAIT_INDEX,
+        ));
     }
     if observed.observed.0 & DW_SIGNAL_READABLE.0 != 0 {
         #[cfg(not(feature = "wyr1e8-selector33"))]
         if !e6.awaiting_ready {
             retire_current_console(e6, system, waits, state.topology.generation(), true)?;
-            return Ok(PollOutcome::RecoverRegistry);
+            return Ok(PollOutcome::RecoverRegistry(
+                crate::wyr1c_native::abandoned::phase::CONSOLE_UNSOLICITED,
+            ));
         }
         #[cfg(feature = "wyr1e8-selector33")]
         let mut bytes = [0u8; wyrmroot_consoled::quiesce_control::FRAME_BYTES];
@@ -1042,7 +1074,9 @@ where
                 Ok(counts) => counts,
                 Err(_) => {
                     retire_current_console(e6, system, waits, state.topology.generation(), true)?;
-                    return Ok(PollOutcome::RecoverRegistry);
+                    return Ok(PollOutcome::RecoverRegistry(
+                        crate::wyr1c_native::abandoned::phase::CONSOLE_RECEIVE_FAILED,
+                    ));
                 }
             };
         if counts.handles != 0 {
@@ -1052,7 +1086,9 @@ where
             return if received_cleanup.is_err() || console_cleanup.is_err() {
                 Err(InitError::Cleanup)
             } else {
-                Ok(PollOutcome::RecoverRegistry)
+                Ok(PollOutcome::RecoverRegistry(
+                    crate::wyr1c_native::abandoned::phase::CONSOLE_UNEXPECTED_HANDLES,
+                ))
             };
         }
         // The WRC8 quiesce exchange is R7A class D1/D3 and stays the selector's;
@@ -1138,7 +1174,9 @@ where
         .is_err()
         {
             retire_current_console(e6, system, waits, state.topology.generation(), true)?;
-            return Ok(PollOutcome::RecoverRegistry);
+            return Ok(PollOutcome::RecoverRegistry(
+                crate::wyr1c_native::abandoned::phase::CONSOLE_READY_INVALID,
+            ));
         }
         let validated_at = match system.now() {
             Ok(validated_at) => validated_at,
@@ -1159,7 +1197,9 @@ where
                 let expired = attribute_failure(RecoveryOperation::ActionDeadline, expired);
                 return expired;
             }
-            return Ok(PollOutcome::RecoverRegistry);
+            return Ok(PollOutcome::RecoverRegistry(
+                crate::wyr1c_native::abandoned::phase::CONSOLE_RECOVERY_LIVE,
+            ));
         }
         e6.awaiting_ready = false;
         return Ok(PollOutcome::Stable);
@@ -1169,7 +1209,9 @@ where
         return Ok(PollOutcome::Stable);
     }
     retire_current_console(e6, system, waits, state.topology.generation(), true)?;
-    Ok(PollOutcome::RecoverRegistry)
+    Ok(PollOutcome::RecoverRegistry(
+        crate::wyr1c_native::abandoned::phase::CONSOLE_EVENT_UNMATCHED,
+    ))
 }
 
 /// The deadline of the recovery episode in flight, if one is open.
@@ -1908,14 +1950,19 @@ mod tests {
             Err(PollOutcome::RecoverDevmgr)
         );
 
+        // F3A.6j: both of these are the datagram's own phase, not the
+        // observer's -- a wrong message body and a truncated one.
+        let datagram = PollOutcome::RecoverRegistry(
+            crate::wyr1c_native::abandoned::phase::PUBLICATION_DATAGRAM,
+        );
         bytes[48] ^= 1;
         assert_eq!(
             validate_publication_datagram(observed, &bytes[..size], observed.deadline - 1),
-            Err(PollOutcome::RecoverRegistry)
+            Err(datagram)
         );
         assert_eq!(
             validate_publication_datagram(observed, &bytes[..size - 1], observed.deadline - 1),
-            Err(PollOutcome::RecoverRegistry)
+            Err(datagram)
         );
     }
 

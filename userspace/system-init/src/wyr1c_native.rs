@@ -412,12 +412,19 @@ enum RegistryRecoveryStep {
 // names its trigger regardless, so the names exist in every build.
 #[cfg_attr(not(feature = "wyr1e-production"), allow(dead_code))]
 pub(crate) mod abandoned {
-    /// `registry_recovery_step` chose `Degraded`: the controller's restart
-    /// budget for the registry was exhausted.
-    pub(crate) const RESTART_BUDGET_EXHAUSTED: u8 = 0x01;
-    /// The relaunch itself declined -- `launch_registry_until_ready_before`
-    /// returned `Ok(None)` rather than an owner.
-    pub(crate) const RELAUNCH_DECLINED: u8 = 0x02;
+    // Which exit gave up is not in the reason byte: it is the operation field
+    // of the same status. `registry_recovery_step`'s `Degraded` exit -- the
+    // controller's restart budget for the registry exhausted -- is attributed
+    // `RetireRegistry` (0x0b), and the exit where
+    // `launch_registry_until_ready_before` returned `Ok(None)` rather than an
+    // owner is attributed `LaunchRegistry` (0x0c). One for one.
+    //
+    // F3A.6j needed the whole low nibble for the poll phase and found the exit
+    // already encoded eight bits above it. Per
+    // `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §3.1 a collapse is permitted
+    // when the fact survives on the reader's channel, and here it survives in
+    // the same word; `wyr1e_product_source.rs` pins the correspondence so the
+    // redundancy cannot quietly stop being true.
 
     /// What asked for the recovery that gave up, in the reason's high nibble.
     ///
@@ -450,10 +457,50 @@ pub(crate) mod abandoned {
         pub(crate) const WYR1E_START_FALLBACK: u8 = 0x06;
     }
 
-    /// One reason byte: the trigger in the high nibble, the exit in the low.
+    /// Which part of `wyr1e::poll` asked, in the reason's low nibble.
+    ///
+    /// F3A.6j. `WYR1E_POLL` covers twenty product sites across three
+    /// functions, which is most of the poll, so on its own it named a file
+    /// rather than a cause. These name the site. `NONE` is every trigger that
+    /// is not the wyr1e poll.
+    #[allow(dead_code)]
+    pub(crate) mod phase {
+        /// Not a wyr1e-poll trigger.
+        pub(crate) const NONE: u8 = 0x00;
+        /// A publication datagram that did not parse, or was not the expected
+        /// message or generation.
+        pub(crate) const PUBLICATION_DATAGRAM: u8 = 0x01;
+        /// The publication observer's own lifecycle: a lost or unreadable
+        /// observer channel, or a refused rebind.
+        pub(crate) const PUBLICATION_OBSERVER: u8 = 0x02;
+        /// The job dispatcher failed and left the shell registry poisoned.
+        pub(crate) const DISPATCHER_POISONED: u8 = 0x03;
+        /// The console's READY deadline had already passed on entry.
+        pub(crate) const READY_DEADLINE_BEFORE_WAIT: u8 = 0x04;
+        /// The console wait timed out and the READY deadline had passed.
+        pub(crate) const READY_DEADLINE_AFTER_WAIT: u8 = 0x05;
+        /// The console wait reported an index that is not the launch channel.
+        pub(crate) const CONSOLE_WAIT_INDEX: u8 = 0x06;
+        /// The console wrote when no READY was outstanding.
+        pub(crate) const CONSOLE_UNSOLICITED: u8 = 0x07;
+        /// Receiving the console's message failed.
+        pub(crate) const CONSOLE_RECEIVE_FAILED: u8 = 0x08;
+        /// The console's message carried handles, which READY never does.
+        pub(crate) const CONSOLE_UNEXPECTED_HANDLES: u8 = 0x09;
+        /// The console's READY message failed validation.
+        pub(crate) const CONSOLE_READY_INVALID: u8 = 0x0a;
+        /// A recovery episode was still live when READY arrived.
+        pub(crate) const CONSOLE_RECOVERY_LIVE: u8 = 0x0b;
+        /// A console signal matched none of the handled cases.
+        pub(crate) const CONSOLE_EVENT_UNMATCHED: u8 = 0x0c;
+    }
+
+    /// One reason byte: the trigger in the high nibble, the poll phase in the
+    /// low. The exit is the operation field of the same status; see the note
+    /// above the phase module.
     #[must_use]
-    pub(crate) const fn reason(trigger: u8, exit: u8) -> u8 {
-        (trigger & 0x0f) << 4 | (exit & 0x0f)
+    pub(crate) const fn reason(trigger: u8, phase: u8) -> u8 {
+        (trigger & 0x0f) << 4 | (phase & 0x0f)
     }
 }
 
@@ -3341,7 +3388,10 @@ where
                                             bootfs,
                                             true,
                                             false,
-                                            abandoned::trigger::DEVMGR_WAITING,
+                                            abandoned::reason(
+                                                abandoned::trigger::DEVMGR_WAITING,
+                                                abandoned::phase::NONE,
+                                            ),
                                         )
                                     } else {
                                         resident
@@ -3444,7 +3494,10 @@ where
                             bootfs,
                             false,
                             false,
-                            abandoned::trigger::CONTROL_LOST,
+                            abandoned::reason(
+                                abandoned::trigger::CONTROL_LOST,
+                                abandoned::phase::NONE,
+                            ),
                         ),
                         ResidentPollEvent::RegistryExited => recover_registry(
                             resident,
@@ -3454,7 +3507,7 @@ where
                             bootfs,
                             false,
                             false,
-                            abandoned::trigger::EXITED,
+                            abandoned::reason(abandoned::trigger::EXITED, abandoned::phase::NONE),
                         ),
                         ResidentPollEvent::DriverExited => {
                             #[cfg(feature = "dw1e3-selector31")]
@@ -3660,7 +3713,7 @@ where
         if outcome != wyr1e::PollOutcome::Stable {
             if matches!(
                 outcome,
-                wyr1e::PollOutcome::RecoverDevmgr | wyr1e::PollOutcome::RecoverRegistry
+                wyr1e::PollOutcome::RecoverDevmgr | wyr1e::PollOutcome::RecoverRegistry(_)
             ) && wyr1e::recovery_deadline(resident)?.is_some()
             {
                 return attribute_failure(
@@ -3691,7 +3744,7 @@ where
                             wyr1e::PollOutcome::RecoverDevmgr => {
                                 recover_devmgr(resident, system, loader, waits, bootfs)
                             }
-                            wyr1e::PollOutcome::RecoverRegistry => recover_registry(
+                            wyr1e::PollOutcome::RecoverRegistry(phase) => recover_registry(
                                 resident,
                                 system,
                                 loader,
@@ -3699,7 +3752,7 @@ where
                                 bootfs,
                                 false,
                                 false,
-                                abandoned::trigger::WYR1E_POLL,
+                                abandoned::reason(abandoned::trigger::WYR1E_POLL, phase),
                             ),
                             #[cfg(feature = "wyr1e8-selector33")]
                             wyr1e::PollOutcome::RecoverRegistryForE8 => recover_registry(
@@ -3710,7 +3763,10 @@ where
                                 bootfs,
                                 false,
                                 true,
-                                abandoned::trigger::WYR1E_POLL_E8,
+                                abandoned::reason(
+                                    abandoned::trigger::WYR1E_POLL_E8,
+                                    abandoned::phase::NONE,
+                                ),
                             ),
                         }?;
                         Ok(resident.controller.mode())
@@ -3759,7 +3815,7 @@ fn recover_registry<S, L, W>(
     bootfs: &[u8],
     status_already_consumed: bool,
     _e8_quiesced: bool,
-    trigger: u8,
+    reason: u8,
 ) -> Result<(), InitError>
 where
     S: Wyr1BPlatform,
@@ -3769,7 +3825,7 @@ where
     // Only a build whose `poll` reads the registry slot reports the reason,
     // so only that build consumes the trigger. Every caller still names one.
     #[cfg(not(feature = "wyr1e-production"))]
-    let _ = trigger;
+    let _ = reason;
     // The recovery episode lives on the wyr1e console/shell supervisor, so
     // a build without that product has no episode rather than no concept of
     // one. The gate is the product, not a selector.
@@ -3860,10 +3916,7 @@ where
             #[cfg(feature = "wyr1e-production")]
             return attribute_failure(
                 RecoveryOperation::RetireRegistry,
-                Err(InitError::RegistryAbandoned(abandoned::reason(
-                    trigger,
-                    abandoned::RESTART_BUDGET_EXHAUSTED,
-                ))),
+                Err(InitError::RegistryAbandoned(reason)),
             );
             #[cfg(not(feature = "wyr1e-production"))]
             return Ok(());
@@ -3898,10 +3951,7 @@ where
         #[cfg(feature = "wyr1e-production")]
         return attribute_failure(
             RecoveryOperation::LaunchRegistry,
-            Err(InitError::RegistryAbandoned(abandoned::reason(
-                trigger,
-                abandoned::RELAUNCH_DECLINED,
-            ))),
+            Err(InitError::RegistryAbandoned(reason)),
         );
         #[cfg(not(feature = "wyr1e-production"))]
         return Ok(());
@@ -4228,7 +4278,7 @@ where
         bootfs,
         false,
         false,
-        abandoned::trigger::NONE,
+        abandoned::reason(abandoned::trigger::NONE, abandoned::phase::NONE),
     )?;
     let role = resident.controller.role_state(RoleId::Registryd);
     let state = resident
@@ -4397,7 +4447,7 @@ where
         bootfs,
         false,
         true,
-        abandoned::trigger::NONE,
+        abandoned::reason(abandoned::trigger::NONE, abandoned::phase::NONE),
     )?;
 
     let (client, grant, publication_generation) = resident
@@ -4487,7 +4537,10 @@ where
             bootfs,
             false,
             false,
-            abandoned::trigger::WYR1E_START_FALLBACK,
+            abandoned::reason(
+                abandoned::trigger::WYR1E_START_FALLBACK,
+                abandoned::phase::NONE,
+            ),
         ),
         Err(error) => Err(error),
     }

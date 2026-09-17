@@ -268,14 +268,15 @@ fn console_relaunch_is_finite_and_registry_replacement_is_the_only_budget_reset(
     assert!(replacement.contains("console_launch_attempts = 0"));
 
     assert!(NATIVE.contains("let outcome = wyr1e::poll(resident"));
-    assert!(NATIVE.contains("wyr1e::PollOutcome::RecoverRegistry =>"));
+    assert!(NATIVE.contains("wyr1e::PollOutcome::RecoverRegistry(phase) =>"));
     // `recover_registry` gained an E8-quiescence argument and the call is now
     // wrapped, so compare the call shape instead of one formatted line.
     // Ordinary recovery passes `status_already_consumed = false`, so the
     // replacement still awaits WRCS status, and `_e8_quiesced = false`.
     let native = without_whitespace(NATIVE);
     assert!(native.contains(
-        "wyr1e::PollOutcome::RecoverRegistry=>recover_registry(resident,system,loader,waits,bootfs,false,false"
+        "wyr1e::PollOutcome::RecoverRegistry(phase)=>recover_registry(resident,system,loader,waits,\
+         bootfs,false,false,abandoned::reason(abandoned::trigger::WYR1E_POLL,phase),)"
     ));
     assert!(native.contains(
         "wyr1e::PollOutcome::RecoverRegistryForE8=>recover_registry(resident,system,loader,waits,bootfs,false,true"
@@ -392,14 +393,18 @@ fn a_registry_recovery_that_installs_no_replacement_does_not_report_success() {
         "recover_registry no longer clears the binding"
     );
 
-    for (exit, reason) in [
+    // F3A.6j moved the exit out of the reason byte and into the operation
+    // field, so the pairing is what has to hold: the budget exit reports
+    // `RetireRegistry` and the declining exit `LaunchRegistry`. If these ever
+    // report the same operation the collapse stops being lossless.
+    for (exit, operation) in [
         (
             "RegistryRecoveryStep::Degraded => {",
-            "RESTART_BUDGET_EXHAUSTED",
+            "RecoveryOperation::RetireRegistry",
         ),
         (
             "let Some(replacement) = replacement else {",
-            "RELAUNCH_DECLINED",
+            "RecoveryOperation::LaunchRegistry",
         ),
     ] {
         let start = recovery.find(exit).expect("the give-up exit");
@@ -415,8 +420,12 @@ fn a_registry_recovery_that_installs_no_replacement_does_not_report_success() {
             "{exit}: the product gate is gone"
         );
         assert!(
-            block.contains(&format!("abandoned::{reason}")),
-            "{exit}: the reason code is gone, so the two exits collapse"
+            block.contains("InitError::RegistryAbandoned(reason)"),
+            "{exit}: the reason is gone"
+        );
+        assert!(
+            block.contains(operation),
+            "{exit}: the operation no longer distinguishes it from the other"
         );
         // The bare `Ok(())` survives only for builds with no `poll` reading
         // the slot, and only behind the negated gate.
@@ -475,6 +484,24 @@ fn every_registry_recovery_caller_names_a_distinct_trigger() {
         );
     }
 
+    // F3A.6j. The two console READY-deadline sites are the ones F3A.6i's
+    // hypothesis rests on, so their phases are pinned to the condition rather
+    // than left to a reader to trust. A swap here would point the next
+    // reading at the wrong site while every gate stayed green.
+    let poll = item(E6, "pub(super) fn poll<S, L, W>(");
+    let poll = without_whitespace(poll);
+    for phase in ["READY_DEADLINE_BEFORE_WAIT", "READY_DEADLINE_AFTER_WAIT"] {
+        assert!(
+            poll.contains(&format!(
+                "ife6.awaiting_ready&&now>=e6.ready_deadline{{\
+                 retire_current_console(e6,system,waits,state.topology.generation(),true)?;\
+                 returnOk(PollOutcome::RecoverRegistry(\
+                 crate::wyr1c_native::abandoned::phase::{phase}"
+            )),
+            "{phase} is no longer on a READY-deadline site"
+        );
+    }
+
     // No trigger code is spent twice. The reason byte packs the trigger into
     // one nibble, so a duplicate would make two callers indistinguishable
     // without the compiler noticing. The two namespaces are counted apart:
@@ -484,9 +511,13 @@ fn every_registry_recovery_caller_names_a_distinct_trigger() {
     let triggers_at = module
         .find("pub(crate) mod trigger {")
         .expect("the trigger module");
+    let phases_at = module
+        .find("pub(crate) mod phase {")
+        .expect("the phase module");
+    assert!(triggers_at < phases_at, "the modules changed order");
     for (label, span) in [
-        ("exit", &module[..triggers_at]),
-        ("trigger", &module[triggers_at..]),
+        ("trigger", &module[triggers_at..phases_at]),
+        ("phase", &module[phases_at..]),
     ] {
         let mut codes: Vec<&str> = span
             .lines()
