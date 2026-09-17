@@ -494,6 +494,134 @@ fn validate_e6_product(product: ProductE6<'_>) -> Result<(), BuildError> {
     Ok(())
 }
 
+/// Exact DW1-F/WYR1-F final product.
+///
+/// It is the E6 normal product plus one payload: the `bin/cpu-hog` job the
+/// final selector-35 normal proof needs to show that several no-yield jobs
+/// cannot starve the shell under SMP.
+///
+/// The hog is not a selector fixture and does not make this a test product.
+/// `LaunchSessionScope::ShellJobs` in the production `system-init` already
+/// admits `bin/hello | bin/cpu-hog` with no feature gate at all, so the
+/// production supervisor was always prepared to launch it; until F3A the
+/// product simply shipped no payload at that path. What keeps the distinction
+/// honest is where the hog is *not*: it is a bootfs member and a WRJP record,
+/// and it is neither an RRC-A role nor part of the retained recovery closure,
+/// so the degraded product's "shell remains usable from retained RRC-A
+/// material" proof is unchanged by its presence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProductF<'a> {
+    pub base: ProductC1<'a>,
+    pub launch_policy: &'a [u8],
+    pub hello: &'a [u8],
+    pub cpu_hog: &'a [u8],
+    /// Producer-computed identity of `base.base.wyrmsh`.
+    pub expected_wyrmsh_identity: [u8; 32],
+    /// Producer-computed identity of `hello`, bound to its WRJP JobV2 entry.
+    pub expected_hello_identity: [u8; 32],
+    /// Producer-computed identity of `cpu_hog`, bound to its WRJP JobV2 entry.
+    pub expected_cpu_hog_identity: [u8; 32],
+}
+
+impl<'a> ProductF<'a> {
+    /// The exact final archive: eight executables and five read-only
+    /// manifest/policy inputs.
+    pub fn artifacts(self) -> [Artifact<'a>; 13] {
+        let base = self.base.artifacts();
+        [
+            base[0],
+            base[1],
+            base[2],
+            base[3],
+            base[4],
+            base[5],
+            base[6],
+            base[7],
+            base[8],
+            base[9],
+            Artifact::read_only(LAUNCH_POLICY_PATH, self.launch_policy),
+            Artifact::executable(HELLO_PATH, self.hello),
+            Artifact::executable(CPU_HOG_PATH, self.cpu_hog),
+        ]
+    }
+}
+
+/// Builds the deterministic final WYR1-F archive after validating the retained
+/// C1 policy and the exact three-entry WRJP 1.1 admission set.
+pub fn build_f(product: ProductF<'_>) -> Result<Vec<u8>, BuildError> {
+    validate_f_product(product)?;
+    let mut builder = Builder::new();
+    for artifact in product.artifacts() {
+        if artifact.bytes.is_empty() {
+            return Err(BuildError::EmptyArtifact);
+        }
+        builder.add(
+            artifact.path.as_bytes(),
+            artifact.bytes,
+            if artifact.executable {
+                FileMode::Executable
+            } else {
+                FileMode::ReadOnly
+            },
+        )?;
+    }
+    builder.build()
+}
+
+fn validate_f_product(product: ProductF<'_>) -> Result<(), BuildError> {
+    validate_c1_product(product.base)?;
+    if product.launch_policy.is_empty() || product.hello.is_empty() || product.cpu_hog.is_empty() {
+        return Err(BuildError::EmptyArtifact);
+    }
+    if product.expected_wyrmsh_identity == [0; 32] {
+        return Err(BuildError::FWyrmshIdentityMismatch);
+    }
+    if product.expected_hello_identity == [0; 32] || product.expected_cpu_hog_identity == [0; 32] {
+        return Err(BuildError::FPayloadIdentityMismatch);
+    }
+    let policy =
+        LaunchPolicy::parse(product.launch_policy).map_err(|_| BuildError::InvalidFLaunchPolicy)?;
+    if policy.version_minor() != 1 || policy.len() != 3 {
+        return Err(BuildError::InvalidFLaunchPolicy);
+    }
+    let hello = policy
+        .find(HELLO_PATH)
+        .ok_or(BuildError::InvalidFLaunchPolicy)?;
+    let cpu_hog = policy
+        .find(CPU_HOG_PATH)
+        .ok_or(BuildError::InvalidFLaunchPolicy)?;
+    let wyrmsh = policy
+        .find(POLICY_WYRMSH_PATH)
+        .ok_or(BuildError::InvalidFLaunchPolicy)?;
+    // The hog is the one admitted payload with the opposite stream shape:
+    // `spawn` launches it with zero startup stream roles, so admitting it on
+    // three streams would grant a background job the foreground contract.
+    if hello.startup_abi != 2
+        || hello.profile_id != JOB_V2_PROFILE_ID
+        || hello.allow_no_streams
+        || !hello.allow_three_streams
+        || cpu_hog.startup_abi != 2
+        || cpu_hog.profile_id != JOB_V2_PROFILE_ID
+        || !cpu_hog.allow_no_streams
+        || cpu_hog.allow_three_streams
+        || wyrmsh.startup_abi != 2
+        || wyrmsh.profile_id != WYRMSH_PROFILE_ID
+        || wyrmsh.allow_no_streams
+        || !wyrmsh.allow_three_streams
+    {
+        return Err(BuildError::InvalidFLaunchPolicy);
+    }
+    if wyrmsh.content_sha256 != product.expected_wyrmsh_identity {
+        return Err(BuildError::FWyrmshIdentityMismatch);
+    }
+    if hello.content_sha256 != product.expected_hello_identity
+        || cpu_hog.content_sha256 != product.expected_cpu_hog_identity
+    {
+        return Err(BuildError::FPayloadIdentityMismatch);
+    }
+    Ok(())
+}
+
 /// Exact selector-33 WYR1-E product. It preserves the production recovery
 /// closure and adds only the four explicitly admitted interactive-test
 /// fixtures.
@@ -1280,6 +1408,160 @@ pub(crate) mod tests {
         for path in ROLE_PATHS {
             assert!(archive.lookup(path.as_bytes()).unwrap().is_executable());
         }
+    }
+
+    fn f_policy(
+        wyrmsh_identity: [u8; 32],
+        hello_identity: [u8; 32],
+        cpu_hog_identity: [u8; 32],
+        hog_three_streams: bool,
+    ) -> Vec<u8> {
+        let entries = [
+            LaunchPolicyEntry {
+                path: CPU_HOG_PATH,
+                content_sha256: cpu_hog_identity,
+                startup_abi: 2,
+                profile_id: JOB_V2_PROFILE_ID,
+                allow_no_streams: !hog_three_streams,
+                allow_three_streams: hog_three_streams,
+            },
+            LaunchPolicyEntry {
+                path: HELLO_PATH,
+                content_sha256: hello_identity,
+                startup_abi: 2,
+                profile_id: JOB_V2_PROFILE_ID,
+                allow_no_streams: false,
+                allow_three_streams: true,
+            },
+            LaunchPolicyEntry {
+                path: WYRMSH_PATH,
+                content_sha256: wyrmsh_identity,
+                startup_abi: 2,
+                profile_id: WYRMSH_PROFILE_ID,
+                allow_no_streams: false,
+                allow_three_streams: true,
+            },
+        ];
+        let mut output = vec![0; 512];
+        let used = encode_wyrmsh([0x42; 32], &entries, &mut output).unwrap();
+        output.truncate(used);
+        output
+    }
+
+    const F_WYRMSH_IDENTITY: [u8; 32] = [0xf1; 32];
+    const F_HELLO_IDENTITY: [u8; 32] = [0xf2; 32];
+    const F_CPU_HOG_IDENTITY: [u8; 32] = [0xf3; 32];
+
+    fn f_product<'a>(device_manifest: &'a [u8], policy: &'a [u8]) -> ProductF<'a> {
+        ProductF {
+            base: c1_product(WYR1_C1_MARKER, device_manifest, UART_IDENTITY),
+            launch_policy: policy,
+            hello: b"hello-elf",
+            cpu_hog: b"cpu-hog-elf",
+            expected_wyrmsh_identity: F_WYRMSH_IDENTITY,
+            expected_hello_identity: F_HELLO_IDENTITY,
+            expected_cpu_hog_identity: F_CPU_HOG_IDENTITY,
+        }
+    }
+
+    #[test]
+    fn wyr1_f_builds_the_thirteen_entry_final_product() {
+        let device_manifest = canonical_wrdm(UART_IDENTITY);
+        let policy = f_policy(
+            F_WYRMSH_IDENTITY,
+            F_HELLO_IDENTITY,
+            F_CPU_HOG_IDENTITY,
+            false,
+        );
+        let product = f_product(&device_manifest, &policy);
+
+        let first = build_f(product).unwrap();
+        assert_eq!(first, build_f(product).unwrap());
+        let archive = Archive::new(&first).unwrap();
+        assert_eq!(archive.entries().count(), 13);
+        // Eight executables: the six roles, hello, and the hog.
+        assert_eq!(
+            archive
+                .entries()
+                .filter(|entry| entry.is_executable())
+                .count(),
+            8
+        );
+        let hog = archive.lookup(CPU_HOG_PATH.as_bytes()).unwrap();
+        assert!(hog.is_executable());
+        assert_eq!(hog.data(), b"cpu-hog-elf");
+        assert!(
+            archive
+                .lookup(HELLO_PATH.as_bytes())
+                .unwrap()
+                .is_executable()
+        );
+        // The final product is still not a selector product: no test fixture
+        // rode in beside the hog.
+        for absent in [
+            E7_EXIT_NONZERO_PATH,
+            E7_FAULT_PATH,
+            E7_MALFORMED_ELF_PATH,
+            E8_RECOVERY_TRIGGER_PATH,
+            E8_STDOUT_PRESSURE_PATH,
+        ] {
+            assert!(archive.lookup(absent.as_bytes()).is_err(), "{absent}");
+        }
+    }
+
+    #[test]
+    fn the_final_product_refuses_a_hog_admitted_on_three_streams() {
+        let device_manifest = canonical_wrdm(UART_IDENTITY);
+        // `spawn` launches the hog with zero startup stream roles. A policy
+        // that grants it the foreground three-stream contract instead is the
+        // difference between a background job and a job that can claim the
+        // shell's own streams, so the builder refuses it.
+        let policy = f_policy(
+            F_WYRMSH_IDENTITY,
+            F_HELLO_IDENTITY,
+            F_CPU_HOG_IDENTITY,
+            true,
+        );
+        assert_eq!(
+            build_f(f_product(&device_manifest, &policy)),
+            Err(BuildError::InvalidFLaunchPolicy)
+        );
+    }
+
+    #[test]
+    fn the_final_product_refuses_a_two_entry_policy_that_omits_the_hog() {
+        let device_manifest = canonical_wrdm(UART_IDENTITY);
+        let policy = e6_policy(F_WYRMSH_IDENTITY, F_HELLO_IDENTITY, false);
+        assert_eq!(
+            build_f(f_product(&device_manifest, &policy)),
+            Err(BuildError::InvalidFLaunchPolicy)
+        );
+    }
+
+    #[test]
+    fn the_final_product_binds_every_admitted_payload_to_its_own_identity() {
+        let device_manifest = canonical_wrdm(UART_IDENTITY);
+        let policy = f_policy(
+            F_WYRMSH_IDENTITY,
+            F_HELLO_IDENTITY,
+            F_CPU_HOG_IDENTITY,
+            false,
+        );
+        let mut product = f_product(&device_manifest, &policy);
+        product.expected_cpu_hog_identity = [0x99; 32];
+        assert_eq!(build_f(product), Err(BuildError::FPayloadIdentityMismatch));
+
+        let mut product = f_product(&device_manifest, &policy);
+        product.expected_hello_identity = [0x99; 32];
+        assert_eq!(build_f(product), Err(BuildError::FPayloadIdentityMismatch));
+
+        let mut product = f_product(&device_manifest, &policy);
+        product.expected_wyrmsh_identity = [0x99; 32];
+        assert_eq!(build_f(product), Err(BuildError::FWyrmshIdentityMismatch));
+
+        let mut product = f_product(&device_manifest, &policy);
+        product.cpu_hog = b"";
+        assert_eq!(build_f(product), Err(BuildError::EmptyArtifact));
     }
 
     #[test]

@@ -32,8 +32,9 @@ use wyrmroot_bootfs::{
         CONSOLE_ECHO_PATH, CPU_HOG_PATH, DW1_E3A_COM2_PROBE_PATH, DW1_E3A_GATE_PATH,
         E7_EXIT_NONZERO_PATH, E7_FAULT_PATH, E7_MALFORMED_ELF, E7_MALFORMED_ELF_PATH,
         E8_RECOVERY_TRIGGER_PATH, E8_STDOUT_PRESSURE_PATH, LAUNCH_POLICY_PATH, Product, ProductC1,
-        ProductC6, ProductD5, ProductE3A, ProductE6, ProductE7, ProductE8, WYR1_C1_MARKER,
-        WYR1_D5_GATE_PATH, build_c1, build_c6, build_d5, build_e3a, build_e6, build_e7, build_e8,
+        ProductC6, ProductD5, ProductE3A, ProductE6, ProductE7, ProductE8, ProductF,
+        WYR1_C1_MARKER, WYR1_D5_GATE_PATH, build_c1, build_c6, build_d5, build_e3a, build_e6,
+        build_e7, build_e8, build_f,
     },
 };
 use wyrmroot_device_proto::manifest::{
@@ -543,7 +544,7 @@ const WYR1E8_SELECTED_NATIVE_SPECS: [NativeSpec; 10] = [
 /// content and stays out of the production artifact.
 ///
 /// Recorded in `DW1F_WYR1F_F1A1_IMPLEMENTATION_MAP.md` §§1.1, 1.2 and 2.
-const WYR1F_PRODUCT_NATIVE_SPECS: [NativeSpec; 7] = [
+const WYR1F_PRODUCT_NATIVE_SPECS: [NativeSpec; 8] = [
     NativeSpec {
         label: "system-init",
         package: "wyrmroot-system-init",
@@ -592,6 +593,17 @@ const WYR1F_PRODUCT_NATIVE_SPECS: [NativeSpec; 7] = [
         binary: "wyrmroot-stream-hello",
         features: "native-stream-hello",
         artifact: "wyrmroot-stream-hello",
+    },
+    // F3A.2b. The same build the E7 and E8 products use, because it is the
+    // same payload: the production supervisor's `ShellJobs` scope admits
+    // `bin/cpu-hog` with no feature gate at all, so a differently built hog
+    // here would be the anomaly rather than this row.
+    NativeSpec {
+        label: "cpu-hog",
+        package: "wyrmroot-dw1b-preemption",
+        binary: "wyrmroot-job-cpu-hog",
+        features: "native-job-cpu-hog",
+        artifact: "wyrmroot-job-cpu-hog",
     },
 ];
 
@@ -2486,11 +2498,11 @@ impl Wyr1fProduct {
         }
     }
 
-    /// The seven production role builds. Only `system/init` differs, and only
-    /// by the one feature that compiles the episode -- which is what makes the
-    /// instrumented/production relationship a named construction rather than
-    /// "the same source revision".
-    pub(crate) fn native_specs(self) -> [NativeSpec; 7] {
+    /// The six supervised role builds plus the two admitted payloads. Only
+    /// `system/init` differs, and only by the one feature that compiles the
+    /// episode -- which is what makes the instrumented/production relationship
+    /// a named construction rather than "the same source revision".
+    pub(crate) fn native_specs(self) -> [NativeSpec; 8] {
         let mut specs = WYR1F_PRODUCT_NATIVE_SPECS;
         if self.is_instrumented() {
             specs[0].features = "wyr1e-production,wyr1f-closure";
@@ -2571,7 +2583,7 @@ pub(crate) fn wyr1f_gate_config(scenario: Wyr1fScenario, nonce: &str) -> Result<
         reason = "F1A.3 fixes the final product; its caller is the F1A.4 CLI"
     )
 )]
-const WYR1F_EXPECTED_PATHS: [(&str, bool); 12] = [
+const WYR1F_EXPECTED_PATHS: [(&str, bool); 13] = [
     ("system/init", true),
     ("system/registryd", true),
     ("system/devmgr", true),
@@ -2579,6 +2591,13 @@ const WYR1F_EXPECTED_PATHS: [(&str, bool); 12] = [
     ("system/consoled", true),
     ("system/wyrmsh", true),
     ("bin/hello", true),
+    // F3A.2b. Not a selector fixture: `LaunchSessionScope::ShellJobs` in the
+    // production `system-init` already admits `bin/hello | bin/cpu-hog` with
+    // no feature gate, and the final selector-35 normal proof needs several
+    // no-yield jobs to show they cannot starve the shell. It is a bootfs
+    // member and a WRJP record and deliberately neither an RRC-A role nor
+    // part of the retained recovery closure.
+    ("bin/cpu-hog", true),
     ("system/bootstrap/rrc-a-v1", false),
     ("system/bootstrap/wyr1-a-gate-v1", false),
     ("system/bootstrap/wyr1-c-gate-v1", false),
@@ -2620,15 +2639,23 @@ fn wyr1f_product_generation(revision: &str, artifacts: &[NativeArtifact]) -> [u8
 
 /// Assembles the final normal WYR1-F product.
 ///
-/// The bootfs *shape* is E6's — twelve entries, a minor-1 two-entry WRJP — so
-/// `build_e6` and its `validate_e6_product` admission are reused deliberately
-/// rather than copied. What is not reused is `assemble_e6_product`, which
-/// positionally unpacks seven artifacts without checking which artifacts they
-/// are and embeds the stale `GATE_CONFIG`. This assembler checks the whole
-/// spec, not just the count: an artifact carrying the wrong package, binary or
-/// feature set is rejected before anything is built, which is what makes
-/// "stub artifact in a required role" a build failure rather than a review
-/// question.
+/// The bootfs shape was E6's until F3A.2b, which added `bin/cpu-hog`: thirteen
+/// entries and a minor-1 three-entry WRJP, so it now has its own `build_f` and
+/// `validate_f_product` admission rather than borrowing E6's two-entry one.
+/// The hog is not a selector fixture — the production supervisor's `ShellJobs`
+/// scope already admitted `bin/hello | bin/cpu-hog` with no feature gate, and
+/// the final selector-35 normal proof needs several no-yield jobs to show they
+/// cannot starve the shell. It is a bootfs member and a WRJP record and is
+/// deliberately neither an RRC-A role nor part of the retained recovery
+/// closure, so the degraded product still proves its shell usable from
+/// retained RRC-A material alone.
+///
+/// What is not reused is `assemble_e6_product`, which positionally unpacks
+/// seven artifacts without checking which artifacts they are and embeds the
+/// stale `GATE_CONFIG`. This assembler checks the whole spec, not just the
+/// count: an artifact carrying the wrong package, binary or feature set is
+/// rejected before anything is built, which is what makes "stub artifact in a
+/// required role" a build failure rather than a review question.
 #[cfg_attr(
     not(test),
     allow(
@@ -2645,7 +2672,7 @@ fn assemble_wyr1f_product(
     let specs = product_kind.native_specs();
     if artifacts.len() != specs.len() {
         return Err(Failure::task(
-            "WYR1-F requires exactly seven production artifacts",
+            "WYR1-F requires exactly eight production artifacts",
         ));
     }
     for (artifact, expected) in artifacts.iter().zip(specs) {
@@ -2668,11 +2695,20 @@ fn assemble_wyr1f_product(
             )));
         }
     }
-    let [init, registryd, devmgr, uart, consoled, wyrmsh, hello]: [&NativeArtifact; 7] = artifacts
+    let [
+        init,
+        registryd,
+        devmgr,
+        uart,
+        consoled,
+        wyrmsh,
+        hello,
+        cpu_hog,
+    ]: [&NativeArtifact; 8] = artifacts
         .iter()
         .collect::<Vec<_>>()
         .try_into()
-        .map_err(|_| Failure::task("WYR1-F requires exactly seven production artifacts"))?;
+        .map_err(|_| Failure::task("WYR1-F requires exactly eight production artifacts"))?;
     let role_hashes = [
         digest_array(&registryd.sha256)?,
         digest_array(&devmgr.sha256)?,
@@ -2692,10 +2728,23 @@ fn assemble_wyr1f_product(
     let device_manifest = wrdm[..wrdm_size].to_vec();
 
     let hello_identity = digest_array(&hello.sha256)?;
+    let cpu_hog_identity = digest_array(&cpu_hog.sha256)?;
     let mut policy = [0u8; 512];
     let policy_size = encode_wyrmsh(
         generation,
         &[
+            // Canonical path order, and the one admitted payload with the
+            // opposite stream shape: `spawn` gives a background job zero
+            // startup stream roles, so admitting the hog on three streams
+            // would hand it the shell's own foreground contract.
+            LaunchPolicyEntry {
+                path: "bin/cpu-hog",
+                content_sha256: cpu_hog_identity,
+                startup_abi: 2,
+                profile_id: JOB_V2_PROFILE_ID,
+                allow_no_streams: true,
+                allow_three_streams: false,
+            },
             LaunchPolicyEntry {
                 path: "bin/hello",
                 content_sha256: hello_identity,
@@ -2718,7 +2767,7 @@ fn assemble_wyr1f_product(
     .map_err(|error| Failure::task(format!("WYR1-F launch policy failed: {error:?}")))?;
     let launch_policy = policy[..policy_size].to_vec();
 
-    let bootfs = build_e6(ProductE6 {
+    let bootfs = build_f(ProductF {
         base: ProductC1 {
             base: Product {
                 init: &init.bytes,
@@ -2736,8 +2785,10 @@ fn assemble_wyr1f_product(
         },
         launch_policy: &launch_policy,
         hello: &hello.bytes,
+        cpu_hog: &cpu_hog.bytes,
         expected_wyrmsh_identity: role_hashes[4],
         expected_hello_identity: hello_identity,
+        expected_cpu_hog_identity: cpu_hog_identity,
     })
     .map_err(|error| Failure::task(format!("WYR1-F bootfs build failed: {error:?}")))?;
     if bootfs.len() > MAX_BOOTFS_BYTES {
@@ -2858,6 +2909,7 @@ fn verify_wyr1f_product(
             "system/consoled" => artifact_bytes("consoled")?.to_vec(),
             "system/wyrmsh" => artifact_bytes("wyrmsh")?.to_vec(),
             "bin/hello" => artifact_bytes("hello")?.to_vec(),
+            "bin/cpu-hog" => artifact_bytes("cpu-hog")?.to_vec(),
             "system/bootstrap/rrc-a-v1" => product.rrc_manifest.clone(),
             "system/bootstrap/wyr1-a-gate-v1" => gate_config.to_vec(),
             "system/bootstrap/wyr1-c-gate-v1" => WYR1_C1_MARKER.to_vec(),
@@ -3028,7 +3080,7 @@ fn verify_wyr1f_product(
         }
     }
 
-    // WRJP, reparsed. Exactly the two admitted launch paths, at minor 1.
+    // WRJP, reparsed. Exactly the three admitted launch paths, at minor 1.
     let policy_entry = archive
         .lookup(LAUNCH_POLICY_PATH.as_bytes())
         .map_err(|_| Failure::task("WYR1-F bootfs lacks its launch policy"))?;
@@ -3039,21 +3091,25 @@ fn verify_wyr1f_product(
             "WYR1-F launch policy is not the minor-1 production version",
         ));
     }
-    if policy.len() != 2 {
+    if policy.len() != 3 {
         return Err(Failure::task("WYR1-F launch policy admits the wrong count"));
     }
-    let expected_policy: [(&str, &str, u16); 2] = [
-        ("bin/hello", "hello", JOB_V2_PROFILE_ID),
-        (WYRMSH_PATH, "wyrmsh", WYRMSH_PROFILE_ID),
+    // The fourth column is `allow_no_streams`, which the background hog needs
+    // and the two foreground paths must not have. `allow_three_streams` is its
+    // exact complement here, so each row states one shape rather than two.
+    let expected_policy: [(&str, &str, u16, bool); 3] = [
+        ("bin/cpu-hog", "cpu-hog", JOB_V2_PROFILE_ID, true),
+        ("bin/hello", "hello", JOB_V2_PROFILE_ID, false),
+        (WYRMSH_PATH, "wyrmsh", WYRMSH_PROFILE_ID, false),
     ];
-    for (path, label, profile_id) in expected_policy {
+    for (path, label, profile_id, no_streams) in expected_policy {
         let entry = policy
             .find(path)
             .ok_or_else(|| Failure::task(format!("WYR1-F launch policy lacks {path}")))?;
         if entry.profile_id != profile_id
             || entry.startup_abi != 2
-            || entry.allow_no_streams
-            || !entry.allow_three_streams
+            || entry.allow_no_streams != no_streams
+            || entry.allow_three_streams == no_streams
         {
             return Err(Failure::task(format!(
                 "WYR1-F launch policy grants {path} the wrong profile or stream rights"
@@ -3072,7 +3128,7 @@ fn verify_wyr1f_product(
             continue;
         }
         let supervised = expected_roles.iter().any(|(_, role, ..)| *role == path);
-        let launchable = expected_policy.iter().any(|(policy, _, _)| *policy == path);
+        let launchable = expected_policy.iter().any(|(policy, ..)| *policy == path);
         if !supervised && !launchable {
             return Err(Failure::task(format!(
                 "WYR1-F bootfs holds the unreachable executable {path}"
@@ -5614,13 +5670,17 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    /// F1A.2. The final product is the seven production roles and nothing else.
+    /// F1A.2, widened at F3A.2b. The final product is the six supervised
+    /// roles, the `hello` payload and the `cpu-hog` job, and nothing else.
     ///
     /// A test actor reaching this set is the failure the F0A contract's §2
     /// forbids, so assert the membership by package name rather than by count
-    /// alone -- a count check would pass if an actor replaced `hello`.
+    /// alone -- a count check would pass if an actor replaced `hello`. The hog
+    /// is admitted by the production supervisor's own `ShellJobs` scope and
+    /// comes from `wyrmroot-dw1b-preemption`, not from the test-actor crate,
+    /// which is why the two package assertions below still hold for it.
     #[test]
-    fn wyr1f_product_set_is_exactly_the_production_roles() {
+    fn wyr1f_product_set_is_exactly_the_production_roles_and_payloads() {
         let labels: Vec<&str> = WYR1F_PRODUCT_NATIVE_SPECS
             .iter()
             .map(|spec| spec.label)
@@ -5634,7 +5694,8 @@ mod tests {
                 "uart16550d",
                 "consoled",
                 "wyrmsh",
-                "hello"
+                "hello",
+                "cpu-hog"
             ]
         );
         for spec in WYR1F_PRODUCT_NATIVE_SPECS {
@@ -5683,6 +5744,23 @@ mod tests {
     #[test]
     fn wyr1f_diverges_from_e6_only_where_e8_added_production_behaviour() {
         for spec in WYR1F_PRODUCT_NATIVE_SPECS {
+            // F3A.2b's addition has no E6 counterpart: E6 shipped no hog at
+            // all. It is compared against the E8 selected set instead, which
+            // is the row it was taken from, so "the same payload the accepted
+            // products ran" stays an assertion rather than a claim.
+            if spec.label == "cpu-hog" {
+                let e8 = WYR1E8_SELECTED_NATIVE_SPECS
+                    .iter()
+                    .find(|candidate| candidate.label == "cpu-hog")
+                    .expect("E8 admits the hog");
+                assert_eq!(spec, *e8);
+                assert!(
+                    !WYR1E6_PRODUCT_NATIVE_SPECS
+                        .iter()
+                        .any(|candidate| candidate.label == "cpu-hog")
+                );
+                continue;
+            }
             let e6 = WYR1E6_PRODUCT_NATIVE_SPECS
                 .iter()
                 .find(|candidate| candidate.label == spec.label)
@@ -5784,7 +5862,11 @@ mod tests {
     fn wyr1f_native_spec_rejects_an_unknown_label() {
         assert!(wyr1f_native_spec("recovery-trigger", Wyr1fProduct::Normal).is_err());
         assert!(wyr1f_native_spec("stdout-pressure", Wyr1fProduct::Normal).is_err());
-        assert!(wyr1f_native_spec("cpu-hog", Wyr1fProduct::Normal).is_err());
+        // The hog joined the set at F3A.2b; the four selector-only actors
+        // did not, and this is where that line is drawn.
+        assert!(wyr1f_native_spec("exit-nonzero", Wyr1fProduct::Normal).is_err());
+        assert!(wyr1f_native_spec("fault", Wyr1fProduct::Normal).is_err());
+        assert!(wyr1f_native_spec("cpu-hog", Wyr1fProduct::Normal).is_ok());
         assert!(wyr1f_native_spec("consoled", Wyr1fProduct::Normal).is_ok());
     }
 
@@ -6069,20 +6151,23 @@ mod tests {
     }
 
     #[test]
-    fn wyr1f_normal_product_is_the_exact_twelve_entry_production_archive() {
+    fn wyr1f_normal_product_is_the_exact_thirteen_entry_production_archive() {
         let (product, artifacts) = wyr1f_product();
         let archive = Archive::new(&product.bootfs).unwrap();
-        assert_eq!(archive.entries().count(), 12);
+        assert_eq!(archive.entries().count(), 13);
         for (path, executable) in WYR1F_EXPECTED_PATHS {
             let entry = archive.lookup(path.as_bytes()).expect("frozen entry");
             assert_eq!(entry.is_executable(), executable, "{path}");
         }
-        // No historical or acceptance material rode along.
+        // No historical or acceptance material rode along. `bin/cpu-hog`
+        // left this list at F3A.2b and is asserted present above, through
+        // WYR1F_EXPECTED_PATHS; every selector fixture stays out.
         for absent in [
             "test/wyr1-e/recovery-trigger",
             "test/wyr1-e/stdout-pressure",
             "test/wyr1-e/fault",
-            "bin/cpu-hog",
+            "test/wyr1-e/exit-nonzero",
+            "test/wyr1-e/malformed-elf",
             "bin/console-echo",
             "system/bootstrap/wyr1-d5-gate-v1",
             "system/bootstrap/wyr1-c6-gate-v1",
@@ -6091,7 +6176,13 @@ mod tests {
         }
         let policy = LaunchPolicy::parse(&product.launch_policy).unwrap();
         assert_eq!(policy.version_minor(), 1, "minor 2 admits recovery-trigger");
-        assert_eq!(policy.len(), 2);
+        assert_eq!(policy.len(), 3);
+        // The hog is admitted for `spawn` only: zero startup stream roles.
+        let hog = policy.find("bin/cpu-hog").expect("the hog is admitted");
+        assert!(hog.allow_no_streams && !hog.allow_three_streams);
+        assert_eq!(hog.profile_id, JOB_V2_PROFILE_ID);
+        // And it is not retained closure material: the manifest still declares
+        // exactly the five supervised roles and their four edges.
         let manifest =
             Manifest::parse_structural(&product.rrc_manifest, &product.generation).unwrap();
         assert_eq!(
@@ -6501,7 +6592,8 @@ mod tests {
         for planted in [
             "test/wyr1-e/recovery-trigger",
             "test/wyr1-e/fault",
-            "bin/cpu-hog",
+            "test/wyr1-e/exit-nonzero",
+            "bin/console-echo",
             "system/wyrmsh-recovery",
         ] {
             let polluted = Wyr1fProductBytes {

@@ -163,6 +163,16 @@ pub enum BuildError {
     E8ArtifactIdentityMismatch,
     /// The inherited malformed-ELF fixture changed in the additive E8 product.
     InvalidE8MalformedElf,
+    /// The final WYR1-F launch policy was malformed, or did not admit exactly
+    /// the production shell, the hello payload and the CPU-hog job on exactly
+    /// their expected stream shapes.
+    InvalidFLaunchPolicy,
+    /// The WYR1-F shell policy identity was zero or did not match the selected
+    /// production shell identity supplied by the product producer.
+    FWyrmshIdentityMismatch,
+    /// A WYR1-F admitted-payload identity was zero or did not match the
+    /// artifact identity the product producer supplied for that path.
+    FPayloadIdentityMismatch,
 }
 
 /// The only regular-file metadata forms permitted in a WYR0 bootfs archive.

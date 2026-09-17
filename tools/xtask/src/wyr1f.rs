@@ -9,11 +9,20 @@
 //!    `plans/specs/DW1F_WYR1F_F1A_NORMAL_PRODUCT_SPEC.md` §F1A.3 says an
 //!    inherited artifact cannot be relabelled as rebuilt. There is therefore no
 //!    `e6_*` request or receipt field at all.
-//! 2. **The artifact set is exactly the seven production roles** of
-//!    `wyr1c::WYR1F_PRODUCT_NATIVE_SPECS`. No malformed-ELF fixture, no
-//!    cpu-hog/exit-nonzero/fault/recovery-trigger/stdout-pressure actor, and no
-//!    stack report: those are final-*acceptance* content under
+//! 2. **The artifact set is the seven production roles plus two admitted
+//!    payloads** — `hello` and, since F3A.2b, `cpu-hog`. No malformed-ELF
+//!    fixture, no exit-nonzero/fault/recovery-trigger/stdout-pressure actor
+//!    and no stack report: those are final-*acceptance* content under
 //!    `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` §2 and are not in this product.
+//!
+//!    The hog is the one addition and it is not a selector fixture. The
+//!    production supervisor's `LaunchSessionScope::ShellJobs` already admitted
+//!    `bin/hello | bin/cpu-hog` with no feature gate at all, so the payload's
+//!    absence — not its presence — was the anomaly; the plan's final normal
+//!    proof requires showing that several no-yield jobs cannot starve the
+//!    shell under SMP, and no F product could run that. It enters the bootfs
+//!    and the WRJP and stays out of RRC-A, so the degraded product's "shell
+//!    remains usable from retained RRC-A material" proof is untouched.
 //! 3. **The kernel is the uninstrumented production kernel.**
 //!    `build_normal_kernel` removes `DEEPWYRM_GUEST_TEST_SELECTOR` rather than
 //!    setting it and passes no `--features test-support`, which is the shape of
@@ -86,9 +95,9 @@ fn esp_name(product: wyr1c::Wyr1fProduct) -> String {
     format!("wyr1f-{}-esp.img", product.cli_value())
 }
 
-/// The seven production roles, in the frozen order of
-/// `wyr1c::WYR1F_PRODUCT_NATIVE_SPECS`.
-const NATIVE_LABELS: [&str; 7] = [
+/// The six supervised roles and the two admitted payloads, in the frozen order
+/// of `wyr1c::WYR1F_PRODUCT_NATIVE_SPECS`.
+const NATIVE_LABELS: [&str; 8] = [
     "system-init",
     "registryd",
     "devmgr",
@@ -96,6 +105,7 @@ const NATIVE_LABELS: [&str; 7] = [
     "consoled",
     "wyrmsh",
     "hello",
+    "cpu-hog",
 ];
 
 /// Every frozen file, with the request key that names its path.
@@ -117,6 +127,7 @@ pub(crate) const ARTIFACTS: &[(&str, &str)] = &[
     ("consoled", "consoled.elf"),
     ("wyrmsh", "wyrmsh.elf"),
     ("hello", "hello.elf"),
+    ("cpu_hog", "cpu-hog.elf"),
     ("gate_config", "wyr1-a-gate-v1.bin"),
     ("rrc_manifest", "rrc-f-v1.bin"),
     ("device_manifest", "wrdm-f-v1.bin"),
@@ -1573,6 +1584,15 @@ fn result_schema(product_kind: wyr1c::Wyr1fProduct) -> Result<String, Failure> {
 /// Every key here is fillable from what a run actually produces: the COM1 and
 /// COM2 transcripts, and for an instrumented sibling the WRE1 evidence stream.
 /// Nothing is listed that the runner would have to invent.
+///
+/// F3A.2b corrected two keys that failed exactly that test. `roles_ready_order`
+/// and `roles_ready_count` were in every product's grammar, including the
+/// production product, whose kernel writes COM1 only from
+/// `emit_early_panic_record` and therefore emits no READY record at all; they
+/// moved to the two instrumented products, and production gained `com1_empty`,
+/// which is the assertion its silent COM1 can actually make. The three
+/// `cpu_hog_*` keys stayed where they were, and the payload that fills them was
+/// added to the product instead.
 fn result_keys(product_kind: wyr1c::Wyr1fProduct) -> Vec<String> {
     let mut keys: Vec<&'static str> = vec![
         "kind",
@@ -1594,15 +1614,11 @@ fn result_keys(product_kind: wyr1c::Wyr1fProduct) -> Vec<String> {
         "com2_full_length",
         "com2_full_sha256",
         "shutdown_byte_hex",
-        // The production bring-up proof. `roles_ready_order` is the observed
-        // READY sequence as one comma-separated list rather than five booleans:
-        // the obligation is dependency *order*, and five independent flags
-        // cannot express a wrong one.
-        "roles_ready_order",
-        "roles_ready_count",
         // COM1 is the trusted diagnostic serial line and COM2 the shell byte
         // stream. That they stay distinct is an obligation, not an assumption:
-        // a console that leaked onto COM1 would still produce a prompt.
+        // a console that leaked onto COM1 would still produce a prompt. On the
+        // production product it carries more than that -- see below, where the
+        // absence of a COM1 record is itself the assertion.
         "com1_com2_distinct",
         "prompt_reached",
         "nonce_echo_nonce",
@@ -1648,12 +1664,32 @@ fn result_keys(product_kind: wyr1c::Wyr1fProduct) -> Vec<String> {
     }
     if product_kind.is_instrumented() {
         keys.extend([
+            // The bring-up proof, and it lives here rather than in the base
+            // list because only an instrumented product can make it.
+            // `deepwyrm`'s COM1 writers other than `emit_early_panic_record`
+            // are all behind `feature = "test-support"`, which the production
+            // kernel is deliberately not built with, so a clean production
+            // boot emits no COM1 bytes at all and there is no READY record to
+            // read. The instrumented sibling emits one WYR1EVID1 `Ready` per
+            // role, which is what the sibling is for.
+            //
+            // `roles_ready_order` is the observed sequence as one
+            // comma-separated list rather than five booleans: the obligation
+            // is dependency *order*, and five independent flags cannot
+            // express a wrong one.
+            "roles_ready_order",
+            "roles_ready_count",
             "evidence_protocol",
             "evidence_nonce",
             "expected_evidence_records",
             "evidence_records",
             "evidence_sha256",
         ]);
+    } else {
+        // The production product's COM1 is silent on a clean boot, so its
+        // emptiness is the signal: any byte on that line is an early panic
+        // record, which is the only thing the production kernel writes there.
+        keys.push("com1_empty");
     }
     keys.push("acceptance");
     keys.into_iter().map(str::to_owned).collect()
@@ -2155,7 +2191,7 @@ mod tests {
     }
 
     #[test]
-    fn the_final_product_is_exactly_seven_production_roles_and_no_acceptance_content() {
+    fn the_final_product_is_the_production_roles_plus_its_two_admitted_payloads() {
         assert_eq!(
             NATIVE_LABELS,
             [
@@ -2166,6 +2202,7 @@ mod tests {
                 "consoled",
                 "wyrmsh",
                 "hello",
+                "cpu-hog",
             ]
         );
         for label in NATIVE_LABELS {
@@ -2173,8 +2210,10 @@ mod tests {
                 .expect("every production role is in the final set");
         }
         // Acceptance content the E7/E8 products carry and this one must not.
+        // The hog left this list at F3A.2b; the four selector fixtures did
+        // not, and the reason is the one the module doc gives: the production
+        // supervisor admits `bin/cpu-hog` and admits none of these.
         for label in [
-            "cpu-hog",
             "exit-nonzero",
             "fault",
             "recovery-trigger",
@@ -2187,14 +2226,14 @@ mod tests {
             assert!(!NATIVE_LABELS.contains(&label));
         }
         let keys = ARTIFACTS.iter().map(|(key, _)| *key).collect::<Vec<_>>();
-        assert_eq!(ARTIFACTS.len(), 20);
+        assert_eq!(ARTIFACTS.len(), 21);
         // `stack_report` is deliberately present: the shell's bounded stack
         // depth is a production property of `system/wyrmsh`, not selector-33
         // instrumentation, and every accepted product binds it.
         assert!(keys.contains(&"stack_report"));
+        assert!(keys.contains(&"cpu_hog"));
         for absent in [
             "malformed_elf",
-            "cpu_hog",
             "exit_nonzero",
             "fault",
             "recovery_trigger",
@@ -2424,9 +2463,10 @@ mod tests {
                     "{product_kind:?} {name}: {rendered}"
                 );
             }
-            // The plan's thirteen F3A obligations, each with somewhere to land.
+            // The plan's thirteen F3A obligations, each with somewhere to
+            // land. `roles_ready_order` is not here: it is asserted below,
+            // against the two products whose kernel can actually emit it.
             for key in [
-                "roles_ready_order",
                 "com1_com2_distinct",
                 "prompt_reached",
                 "nonce_echo_status",
@@ -2470,6 +2510,20 @@ mod tests {
             assert!(degraded.iter().any(|k| k == key), "{key}");
         }
         assert!(!degraded.iter().any(|k| k == "cpu_hog_jobs"));
+
+        // The bring-up proof follows the kernel that can witness it. The
+        // production kernel writes COM1 only from `emit_early_panic_record`,
+        // so a clean boot leaves that line empty and there is no READY record
+        // to order; the assertion the production product makes instead is
+        // that the line stayed empty.
+        for keys in [&instrumented, &degraded] {
+            assert!(keys.iter().any(|k| k == "roles_ready_order"));
+            assert!(keys.iter().any(|k| k == "roles_ready_count"));
+            assert!(!keys.iter().any(|k| k == "com1_empty"));
+        }
+        assert!(!normal.iter().any(|k| k == "roles_ready_order"));
+        assert!(!normal.iter().any(|k| k == "roles_ready_count"));
+        assert!(normal.iter().any(|k| k == "com1_empty"));
 
         // The production product produces no evidence and gets no field for
         // any; both instrumented siblings produce it and get five.
