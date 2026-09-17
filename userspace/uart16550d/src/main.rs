@@ -38,8 +38,8 @@ use wyrmroot_loader::launch::{
 use wyrmroot_runtime::{
     BOOTSTRAP_CHANNEL_EXPECTATION, NativeError, StartupBlock, close_handle, device_pio_read,
     device_pio_write, device_resource_info, interrupt_ack, interrupt_info, monotonic_active_now,
-    panic_abort, query_capability_info, receive_channel, send_channel, validate_bootstrap_channel,
-    wait_many,
+    native_error_code, panic_abort, query_capability_info, receive_channel, send_channel,
+    validate_bootstrap_channel, wait_many,
 };
 #[cfg(feature = "dw1e3-selector31")]
 use wyrmroot_runtime::{
@@ -53,9 +53,9 @@ use wyrmroot_uart16550_core::ByteRegisterIo;
 #[cfg(feature = "wyr1d-selector32")]
 use wyrmroot_uart16550d::d5_drain::DrainFence;
 use wyrmroot_uart16550d::{
-    DeviceStage, GracefulRetireDrain, PeerCloseDrain, ProductionDriver, ReceivedDeviceResource,
-    ReceivedInterrupt, ReceivedStreamEndpoint, StreamSendAction, StreamSendResult,
-    startup_control_is_readable,
+    DeviceStage, DriverError, GracefulRetireDrain, PeerCloseDrain, ProductionDriver,
+    ReceivedDeviceResource, ReceivedInterrupt, ReceivedStreamEndpoint, StreamSendAction,
+    StreamSendResult, startup_control_is_readable,
 };
 
 const FAILURE_BASE: u32 = 0xD3A0_0000;
@@ -733,7 +733,12 @@ fn run_event_loop<I: ByteRegisterIo>(
                             peer_close_drain.clear();
                             break;
                         }
-                        Ok(StreamReadOutcome::Detached) => {
+                        // F3A.6n: the cause is intentionally not inspected
+                        // here -- recovery is identical for every
+                        // `StreamDetachCause` (isolate already happened
+                        // inside `service_stream_read`; this arm only
+                        // clears local drain state).
+                        Ok(StreamReadOutcome::Detached(_)) => {
                             peer_close_drain.clear();
                             break;
                         }
@@ -764,7 +769,9 @@ fn run_event_loop<I: ByteRegisterIo>(
                     Ok(StreamReadOutcome::Accepted | StreamReadOutcome::WouldBlock) => {}
                     #[cfg(feature = "dw1e3-selector31")]
                     Ok(StreamReadOutcome::EmptyData) => {}
-                    Ok(StreamReadOutcome::PeerClosed | StreamReadOutcome::Detached) => {
+                    // F3A.6n: cause not inspected -- same reasoning as the
+                    // arm above.
+                    Ok(StreamReadOutcome::PeerClosed | StreamReadOutcome::Detached(_)) => {
                         if isolate_stream(driver, control).is_err() {
                             return fail_driver(driver, control, 41);
                         }
@@ -825,7 +832,12 @@ fn service_graceful_retire_drain<I: ByteRegisterIo>(
                 drain.observe_stream_empty();
                 break;
             }
-            Ok(StreamReadOutcome::PeerClosed | StreamReadOutcome::Detached) | Err(()) => {
+            // F3A.6n: cause not inspected -- this drain already treats any
+            // detach or hard error alike (fixed code 115), and moving that
+            // code space is a separate, deliberate change (it is pinned by
+            // an existing regression baseline), not part of preserving the
+            // cause.
+            Ok(StreamReadOutcome::PeerClosed | StreamReadOutcome::Detached(_)) | Err(()) => {
                 return Err(115);
             }
         }
@@ -888,7 +900,10 @@ fn service_d5_drain<I: ByteRegisterIo>(
                 channel_empty = true;
                 break;
             }
-            Ok(StreamReadOutcome::PeerClosed | StreamReadOutcome::Detached) | Err(()) => {
+            // F3A.6n: same reasoning as `service_graceful_retire_drain`
+            // above -- fixed code 107 is an existing baselined value, not
+            // touched here.
+            Ok(StreamReadOutcome::PeerClosed | StreamReadOutcome::Detached(_)) | Err(()) => {
                 return Err(107);
             }
         }
@@ -925,7 +940,9 @@ fn selector_response_input_drained<I: ByteRegisterIo>(
             // after the exact response fails before TEMT is emitted.
             Ok(StreamReadOutcome::WouldBlock | StreamReadOutcome::PeerClosed) => return Ok(()),
             Ok(StreamReadOutcome::EmptyData) => continue,
-            Ok(StreamReadOutcome::Accepted | StreamReadOutcome::Detached) | Err(()) => {
+            // F3A.6n: cause not inspected -- this evidence path already
+            // treats an unexpected `Accepted` and any detach alike.
+            Ok(StreamReadOutcome::Accepted | StreamReadOutcome::Detached(_)) | Err(()) => {
                 return Err(());
             }
         }
@@ -1234,7 +1251,7 @@ fn service_stream_read<I: ByteRegisterIo>(
     #[cfg(feature = "wyr1d-selector32")] d5: &mut DrainFence,
 ) -> Result<StreamReadOutcome, ()> {
     let Some(endpoint) = driver.stream_endpoint() else {
-        return Ok(StreamReadOutcome::Detached);
+        return Ok(StreamReadOutcome::Detached(StreamDetachCause::NoStream));
     };
     let mut bytes = [0; MAX_RECORD_BYTES];
     let mut handles = [DwReceivedHandleInfoV1::default(); 16];
@@ -1246,22 +1263,42 @@ fn service_stream_read<I: ByteRegisterIo>(
         Err(error) if status_is(error, DW_STATUS_PEER_CLOSED) => {
             return Ok(StreamReadOutcome::PeerClosed);
         }
-        Err(_) => {
+        // F3A.6n: this used to discard `error` and report the same
+        // `Detached` an ordinary teardown reports. `native_error_code` is
+        // the project's bounded, saturating 16-bit encoding for a native
+        // cause (see wyrmroot-runtime's `native.rs`); carrying it here keeps
+        // the recovery action identical (isolate and continue, per
+        // DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md §3.2) while letting a reader
+        // of the outcome tell this apart from a normal detach.
+        Err(error) => {
             isolate_stream(driver, control)?;
-            return Ok(StreamReadOutcome::Detached);
+            return Ok(StreamReadOutcome::Detached(StreamDetachCause::Native(
+                native_error_code(error),
+            )));
         }
     };
     if counts.bytes > bytes.len() || counts.handles > handles.len() {
         close_received(&handles, counts.handles);
         isolate_stream(driver, control)?;
-        return Ok(StreamReadOutcome::Detached);
+        // F3A.6n: no error value exists to preserve here, but the guard
+        // firing is itself a distinct cause from a native receive failure or
+        // a rejected record, so it gets its own `StreamDetachCause` variant
+        // rather than collapsing into one of those.
+        return Ok(StreamReadOutcome::Detached(StreamDetachCause::Overflow));
     }
     let accepted = match driver.accept_stream_record(&bytes[..counts.bytes], counts.handles) {
         Ok(accepted) => accepted,
-        Err(_) => {
+        // F3A.6n: `DriverError` is already `Copy` and is already the
+        // project's name for these three causes (`StreamHandles`,
+        // `StreamCapacity`, `StreamProtocol`); carrying the value itself
+        // avoids inventing a second encoding and avoids a wildcard over the
+        // error type at this boundary (contract §3.4).
+        Err(error) => {
             close_received(&handles, counts.handles);
             isolate_stream(driver, control)?;
-            return Ok(StreamReadOutcome::Detached);
+            return Ok(StreamReadOutcome::Detached(StreamDetachCause::Record(
+                error,
+            )));
         }
     };
     #[cfg(feature = "wyr1d-selector32")]
@@ -1294,7 +1331,59 @@ enum StreamReadOutcome {
     EmptyData,
     WouldBlock,
     PeerClosed,
-    Detached,
+    Detached(StreamDetachCause),
+}
+
+/// Which cause led `service_stream_read` to report
+/// `StreamReadOutcome::Detached` (F3A.6n).
+///
+/// Per `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §3.2, the recovery action for
+/// every one of these is identical -- `isolate_stream` and keep the driver
+/// running -- so collapsing them onto one caller-facing `StreamReadOutcome`
+/// variant is correct under §3.1. What is not correct is discarding the
+/// instance in the same motion: before this type existed, a reader holding
+/// only the serial transcript could not tell an ordinary "no stream
+/// attached yet" poll apart from a kernel-side receive fault or a rejected
+/// record, because all three routes -- plus a deliberate teardown --
+/// produced the exact same `Ok(StreamReadOutcome::Detached)`. This is the
+/// worst shape the contract names: an outcome that discards its cause and
+/// then reports success.
+///
+/// This rides in-band on `StreamReadOutcome` rather than crossing any ABI
+/// boundary (`DwStatus` is never widened for it, per contract §4.1), so it
+/// is free to name causes precisely. None of today's `StreamReadOutcome`
+/// consumers currently branch on the payload -- they still treat every
+/// detach alike, which is the correct, unchanged recovery behaviour -- but
+/// the cause no longer has to die at the point of collapse to keep that
+/// behaviour. Wiring it further into an out-of-band (§4.2) counter or into
+/// one of `fail_driver`'s numbered exit codes is left undone here: the
+/// former lives in `lib.rs`, which this change does not own, and the latter
+/// would move numbered codes that an existing regression baseline pins.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StreamDetachCause {
+    /// No stream was attached when `service_stream_read` was called. Not
+    /// itself a fault -- kept as its own variant so it is never confused
+    /// with a detach that a fault actually caused.
+    NoStream,
+    /// `receive_channel` failed with a status other than WOULD_BLOCK or
+    /// PEER_CLOSED (both handled before this arm and never reach here).
+    /// Encoded with `wyrmroot_runtime::native_error_code`, the same
+    /// bounded, saturating 16-bit encoding already used at other native
+    /// boundaries in this tree, so a reader who already knows that encoding
+    /// does not need a second one for this site.
+    Native(u32),
+    /// `receive_channel` reported more bytes or handles than the fixed
+    /// receive buffers can hold. There is no underlying error value to
+    /// carry -- the guard firing is itself the whole fact.
+    Overflow,
+    /// `accept_stream_record` rejected the record. Carries the exact
+    /// `DriverError` it returned (`StreamHandles`, `StreamCapacity`, or
+    /// `StreamProtocol`) rather than a re-encoded copy. `accept_stream_record`
+    /// already increments its own `malformed_streams` counter for two of
+    /// the three variants, but not for `StreamCapacity`; that counter is a
+    /// separate out-of-band channel this file does not own, so this variant
+    /// is the in-band copy available uniformly for all three causes.
+    Record(DriverError),
 }
 
 fn service_stream_write<I: ByteRegisterIo>(

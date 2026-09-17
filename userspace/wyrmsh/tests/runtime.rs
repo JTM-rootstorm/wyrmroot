@@ -2208,8 +2208,11 @@ fn stream_failure_closes_endpoints_before_cancel_and_cancelled_closes_visibility
     assert!(
         fixture
             .output(STDERR)
-            .windows(b"run stream=failed\n".len())
-            .any(|bytes| bytes == b"run stream=failed\n")
+            // F3A.6n: `run stream=failed` named no cause. This fixture
+            // injects a protocol violation, so the line must now say so --
+            // a stricter assertion than the old literal, not a looser one.
+            .windows(b"run stream=protocol\n".len())
+            .any(|bytes| bytes == b"run stream=protocol\n")
     );
 }
 

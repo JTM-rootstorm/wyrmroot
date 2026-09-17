@@ -16,8 +16,8 @@ use crate::wyr1b_job::{JobDispatcher, LaunchSessionScope, SessionOwner};
 use deepwyrm_syscall::{
     DW_HANDLE_TRANSFER_MOVE, DW_OBJECT_TYPE_CHANNEL, DW_RIGHT_INSPECT, DW_RIGHT_READ,
     DW_RIGHT_TRANSFER, DW_RIGHT_WAIT, DW_RIGHT_WRITE, DW_SIGNAL_PEER_CLOSED, DW_SIGNAL_READABLE,
-    DW_TASK_STATE_EXITED, DW_TERMINATION_AUTHORIZED, DW_TERMINATION_NORMAL_EXIT,
-    DW_TERMINATION_RESOURCE_POLICY, DW_TERMINATION_TASK_GROUP_TEARDOWN,
+    DW_STATUS_NO_MEMORY, DW_STATUS_NO_RESOURCES, DW_TASK_STATE_EXITED, DW_TERMINATION_AUTHORIZED,
+    DW_TERMINATION_NORMAL_EXIT, DW_TERMINATION_RESOURCE_POLICY, DW_TERMINATION_TASK_GROUP_TEARDOWN,
     DW_TERMINATION_UNHANDLED_EXCEPTION, DwHandleTransferV1, DwRights,
 };
 #[cfg(feature = "wyr1e8-selector33")]
@@ -4031,23 +4031,86 @@ const fn job_error_code(error: JobError) -> LaunchErrorCode {
     }
 }
 
+/// A native failure during a launch, as the launch protocol's own vocabulary.
+///
+/// F3A.6n. `ErrorCode::Capacity` exists and was unreachable from the case it
+/// describes. It is produced only by `job_error_code` from
+/// `JobError::Capacity`, which is the *shell's own job table* filling up; a
+/// **kernel** resource exhaustion arrived as `InitError::Native(status)` and
+/// was reported as `LoaderFailure`. So "the loader broke" and "the system is
+/// full" were the same word on the wire, and a reader could not tell a
+/// defective artifact from a full machine.
+///
+/// `NO_MEMORY` and `NO_RESOURCES` are the kernel's two exhaustion statuses
+/// (`deepwyrm/abi/schema/status.toml`, values -12 and -13). They are capacity
+/// by any reading. Everything else native -- including an output-contract
+/// fault, which is our own ABI handling and not the machine's limits -- keeps
+/// `LoaderFailure`.
+///
+/// This is a §3.1 collapse and it stays one: `ErrorCode` is a bare
+/// `#[repr(u32)]` enum with no payload, so the exact status cannot ride the
+/// reply. Its own doc comment says Deepwyrm statuses "remain available only in
+/// a terminal `JOB_RESULT`" -- an escape hatch a *refused* launch never has,
+/// because no job is created. Until an out-of-band channel carries it per
+/// §4.2, distinguishing the two classes is the whole improvement available
+/// here, and it is the one the reader needs first.
+const fn native_launch_error_code(error: NativeError) -> LaunchErrorCode {
+    match error {
+        NativeError::Status(status)
+            if status.0 == DW_STATUS_NO_MEMORY.0 || status.0 == DW_STATUS_NO_RESOURCES.0 =>
+        {
+            LaunchErrorCode::Capacity
+        }
+        NativeError::Status(_) | NativeError::Output(_) => LaunchErrorCode::LoaderFailure,
+    }
+}
+
 const fn launch_error_code(error: &InitError) -> LaunchErrorCode {
     match error {
         InitError::Wyr1BModel(error) => job_error_code(*error),
-        InitError::Loader(_) | InitError::Native(_) | InitError::Supervision => {
-            LaunchErrorCode::LoaderFailure
+        InitError::Native(error) => native_launch_error_code(*error),
+        // A load that failed *inside a platform stage* carries the kernel's
+        // own cause, and that is where a handle- or memory-table exhaustion
+        // during a launch actually surfaces -- not as a bare
+        // `InitError::Native`. Reading only the outer variant would have left
+        // the exhaustion case still answering `loader-failure`, which is the
+        // mistake this change exists to correct.
+        InitError::Loader(wyrmroot_loader::process::LoadError::Platform { cause, .. }) => {
+            native_launch_error_code(*cause)
         }
+        // The rest of `LoadError` genuinely names the loader or the artifact:
+        // a malformed ELF, a bad startup block, a refused launch message.
+        // `tools/e7_vm.py` pins `loader-failure` for a malformed ELF, and this
+        // is the arm that keeps that answer.
+        //
+        // `Supervision` keeps the code rather than moving to a more accurate
+        // one: nothing has been observed reaching it on this path, and moving
+        // a code nothing has seen fire is churn with a conformance risk
+        // attached.
+        InitError::Loader(_) | InitError::Supervision => LaunchErrorCode::LoaderFailure,
         InitError::Cleanup | InitError::Accounting => LaunchErrorCode::CleanupFailure,
         _ => LaunchErrorCode::PolicyRejected,
     }
 }
 
+/// The shell launch path's mapping.
+///
+/// F3A.6n. The default arm used to be `LoaderFailure`, which is why the F
+/// campaign's refused `spawn bin/cpu-hog` said `loader-failure` and meant
+/// nothing: every `InitError` that was not `Wyr1BModel`, `Cleanup` or
+/// `Accounting` claimed the loader had failed, including errors with no
+/// relation to it. `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §3.4 forbids a
+/// wildcard over an error type at a status boundary and the compiler enforces
+/// it -- but this is a *protocol reply* boundary, which that rule does not
+/// reach, so the shape survived here.
+///
+/// Defaulting to a *specific* claim is the defect, not the defaulting. The
+/// arms that can name their fault now do, by sharing `launch_error_code`'s
+/// vocabulary, and what remains unclassified defaults to `PolicyRejected` --
+/// "this request was refused" -- which claims nothing about where the fault
+/// was. That is the honest answer for an error this function cannot attribute.
 const fn shell_launch_error_code(error: &InitError) -> LaunchErrorCode {
-    match error {
-        InitError::Wyr1BModel(error) => job_error_code(*error),
-        InitError::Cleanup | InitError::Accounting => LaunchErrorCode::CleanupFailure,
-        _ => LaunchErrorCode::LoaderFailure,
-    }
+    launch_error_code(error)
 }
 
 fn send_job_error<S: InitPlatform>(
@@ -7457,6 +7520,73 @@ mod consoled_stream_transfer;
 
 #[cfg(test)]
 mod tests {
+
+    /// F3A.6n. `ErrorCode::Capacity` was unreachable from the case it names,
+    /// and `loader-failure` was the answer to a full machine.
+    #[test]
+    fn a_kernel_exhaustion_is_capacity_and_only_the_loader_is_a_loader_failure() {
+        use deepwyrm_syscall::DwStatus;
+
+        // The two kernel exhaustion statuses reach the code that describes
+        // them, on both launch paths.
+        for status in [DW_STATUS_NO_MEMORY, DW_STATUS_NO_RESOURCES] {
+            let error = InitError::Native(NativeError::Status(status));
+            assert_eq!(launch_error_code(&error), LaunchErrorCode::Capacity);
+            assert_eq!(shell_launch_error_code(&error), LaunchErrorCode::Capacity);
+        }
+
+        // Any other native failure is not capacity. An output-contract fault
+        // is our own ABI handling, not the machine's limits.
+        let other = InitError::Native(NativeError::Status(DwStatus(-5)));
+        assert_eq!(launch_error_code(&other), LaunchErrorCode::LoaderFailure);
+        let output = InitError::Native(NativeError::Output(
+            wyrmroot_runtime::NativeOutputError::InvalidChannelReceive,
+        ));
+        assert_eq!(launch_error_code(&output), LaunchErrorCode::LoaderFailure);
+
+        // A malformed ELF keeps `loader-failure`, because `tools/e7_vm.py`
+        // pins exactly that answer for `run test/wyr1-e/malformed-elf`.
+        assert_eq!(
+            launch_error_code(&InitError::Loader(
+                wyrmroot_loader::process::LoadError::Elf(wyrmroot_loader::elf::ElfError::BadMagic)
+            )),
+            LaunchErrorCode::LoaderFailure
+        );
+
+        // But an exhaustion inside a platform stage of the same load is
+        // capacity, which is where this actually bites: the kernel's cause is
+        // nested in `LoadError::Platform`, not in a bare `InitError::Native`.
+        assert_eq!(
+            launch_error_code(&InitError::Loader(
+                wyrmroot_loader::process::LoadError::Platform {
+                    stage: wyrmroot_loader::process::LoadStage::ChannelCreate,
+                    cause: NativeError::Status(DW_STATUS_NO_RESOURCES),
+                    rollback_failed: false,
+                }
+            )),
+            LaunchErrorCode::Capacity
+        );
+
+        // And the shell path no longer defaults to claiming the loader failed.
+        // An unclassified error says the request was refused, which claims
+        // nothing about where the fault was.
+        assert_eq!(
+            shell_launch_error_code(&InitError::WrongActivationOrder),
+            LaunchErrorCode::PolicyRejected
+        );
+        assert_ne!(
+            shell_launch_error_code(&InitError::WrongActivationOrder),
+            LaunchErrorCode::LoaderFailure
+        );
+
+        // The shell job table filling up is still its own code, unchanged:
+        // that is what `Capacity` already meant and it must not be confused
+        // with the kernel's exhaustion above.
+        assert_eq!(
+            shell_launch_error_code(&InitError::Wyr1BModel(JobError::Capacity)),
+            LaunchErrorCode::Capacity
+        );
+    }
     extern crate alloc;
 
     use super::*;

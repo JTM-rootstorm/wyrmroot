@@ -5777,6 +5777,19 @@ mod tests {
     /// contains "selector". `wyr1e8-recovery` does not, so it passed. This one
     /// checks the pairing instead of the spelling, over every product set, so
     /// a future recipe cannot enable one half alone in either direction.
+    ///
+    /// F3A.6n. The original check only walked four `NativeSpec` tables, and
+    /// only the one selector33/recovery pair. An audit of every table this
+    /// file declares (`grep -n "^const [A-Z0-9_]*NATIVE_\(SPECS\|CHECK_SPECS\)"`
+    /// -- fifteen of them) found three more cross-binary wire couplings with
+    /// the exact same hazard shape as F3A.6k: a protocol split across
+    /// binaries that are only ever compiled with both halves on today, with
+    /// nothing that would fail if a future recipe split them. `WIRE_COUPLINGS`
+    /// below names all four (the original plus the three the audit found);
+    /// `ALL_NATIVE_SPEC_TABLES` lists every table by hand so this list is a
+    /// diff target against that `grep`, not something a table addition can
+    /// silently bypass. `coupled_halves_are_paired` walks the full cross
+    /// product.
     #[test]
     fn selector33_halves_are_paired() {
         let sets: [(&str, &[NativeSpec]); 4] = [
@@ -5827,6 +5840,314 @@ mod tests {
             let init = has(&specs, "system-init", "wyr1e8-selector33");
             let console = has(&specs, "consoled", "wyr1e8-recovery");
             assert_eq!(init, console, "{product_kind:?} splits the protocol");
+        }
+    }
+
+    /// One binary's half of a [`WireCoupling`]: the binary field value (not
+    /// the decorated `label`, which several `*_CHECK_SPECS` tables reuse
+    /// with per-row suffixes like `-e6-regression` or `-selector32`) and the
+    /// feature name that binary must carry for its half to be "on".
+    struct CoupledHalf {
+        binary: &'static str,
+        feature: &'static str,
+    }
+
+    /// A cross-binary wire protocol that is only ever meant to be compiled
+    /// with every listed half on, or every listed half off. See F3A.6n.
+    struct WireCoupling {
+        name: &'static str,
+        halves: &'static [CoupledHalf],
+    }
+
+    // F3A.6n. The four known couplings with this hazard shape:
+    //
+    // - `wyr1e8-selector33` / `wyr1e8-recovery`: the F3A.6k pair documented
+    //   above `selector33_halves_are_paired` and on `WYR1F_PRODUCT_NATIVE_SPECS`.
+    // - `wyr1d-selector32`: the D5 controller protocol
+    //   (`wyrmroot-device-proto::d5_controller`), which system-init, devmgr,
+    //   uart16550d and consoled all speak.
+    // - `wyr1c6-selector29`: the C6 driver-launch fact
+    //   (`driver_launch::C6_FACT_BYTES`), shared by system-init and devmgr.
+    // - `dw1e3-selector31`: the COM2 challenge protocol, shared by
+    //   system-init, devmgr and uart16550d.
+    const WIRE_COUPLINGS: [WireCoupling; 4] = [
+        WireCoupling {
+            name: "wyr1e8-selector33/wyr1e8-recovery (F3A.6k)",
+            halves: &[
+                CoupledHalf {
+                    binary: "system-init",
+                    feature: "wyr1e8-selector33",
+                },
+                CoupledHalf {
+                    binary: "consoled",
+                    feature: "wyr1e8-recovery",
+                },
+            ],
+        },
+        WireCoupling {
+            name: "wyr1d-selector32 (D5 controller protocol)",
+            halves: &[
+                CoupledHalf {
+                    binary: "system-init",
+                    feature: "wyr1d-selector32",
+                },
+                CoupledHalf {
+                    binary: "devmgr",
+                    feature: "wyr1d-selector32",
+                },
+                CoupledHalf {
+                    binary: "uart16550d",
+                    feature: "wyr1d-selector32",
+                },
+                CoupledHalf {
+                    binary: "consoled",
+                    feature: "wyr1d-selector32",
+                },
+            ],
+        },
+        WireCoupling {
+            name: "wyr1c6-selector29 (C6 driver-launch fact)",
+            halves: &[
+                CoupledHalf {
+                    binary: "system-init",
+                    feature: "wyr1c6-selector29",
+                },
+                CoupledHalf {
+                    binary: "devmgr",
+                    feature: "wyr1c6-selector29",
+                },
+            ],
+        },
+        WireCoupling {
+            name: "dw1e3-selector31 (COM2 challenge protocol)",
+            halves: &[
+                CoupledHalf {
+                    binary: "system-init",
+                    feature: "dw1e3-selector31",
+                },
+                CoupledHalf {
+                    binary: "devmgr",
+                    feature: "dw1e3-selector31",
+                },
+                CoupledHalf {
+                    binary: "uart16550d",
+                    feature: "dw1e3-selector31",
+                },
+            ],
+        },
+    ];
+
+    // F3A.6n. Every `NativeSpec` table this file declares, named for the
+    // benefit of a reader diffing this list against
+    // `grep -n "^const [A-Z0-9_]*NATIVE_\(SPECS\|CHECK_SPECS\)" wyr1c.rs`.
+    // Deliberately not built by macro or reflection: the list itself, and
+    // the fact that adding a sixteenth table means editing this array, is
+    // what keeps a future table from going unchecked by accident. A table
+    // that builds none of the binaries any coupling names (there are none
+    // here, but there could be) still belongs in this list -- the pairing
+    // check is vacuously satisfied for it, and that vacuous pass is what
+    // makes the *next* table addition visible as a real check rather than
+    // a silent no-op.
+    /// Whether a table's rows describe binaries that will run *together* in
+    /// one guest, which is the property the pairing check is actually about.
+    ///
+    /// F3A.6n. A protocol coupling can only desync between two processes that
+    /// talk to each other. The `*_NATIVE_CHECK_SPECS` tables build nothing
+    /// that runs: per this file's own comment above
+    /// `WYR1E6_NATIVE_CHECK_SPECS`, they exist so "a product-selection change
+    /// cannot make the retained console path silently stop compiling" -- they
+    /// are compilation coverage, and several deliberately compile the *same*
+    /// binary twice under different feature sets to prove both paths still
+    /// build. Requiring a coupling to be whole in such a table would be
+    /// requiring a compile check to look like a product.
+    ///
+    /// The exemption is by this stated property, not by the table's name --
+    /// naming is exactly what let `wyr1e8-recovery` past the old guard, whose
+    /// test was whether a feature's name contained "selector". Every table
+    /// stays in the list either way, so a new table is a visible decision
+    /// rather than a silent omission.
+    ///
+    /// Concretely this exempts one real split: `WYR1E6_NATIVE_CHECK_SPECS`
+    /// carries `wyr1d-selector32` historical-regression rows for `consoled`,
+    /// `system-init` and `devmgr` but not `uart16550d`, and
+    /// `wyr1e6_native_gate_selects_one_normal_product_and_historical_regressions`
+    /// pins that three-of-four shape on purpose. Nothing launches there, so
+    /// nothing can desync.
+    #[derive(Clone, Copy)]
+    enum TableKind {
+        /// Binaries that run together in one guest. The coupling must be whole.
+        Product,
+        /// Compilation coverage only. No peer exists, so no pairing to hold.
+        CompileCheck,
+    }
+
+    const ALL_NATIVE_SPEC_TABLES: [(&str, &[NativeSpec], TableKind); 15] = [
+        ("NATIVE_SPECS", &NATIVE_SPECS, TableKind::Product),
+        (
+            "C6_PRODUCT_NATIVE_SPECS",
+            &C6_PRODUCT_NATIVE_SPECS,
+            TableKind::Product,
+        ),
+        (
+            "E3A_PRODUCT_NATIVE_SPECS",
+            &E3A_PRODUCT_NATIVE_SPECS,
+            TableKind::Product,
+        ),
+        (
+            "E3B_NATIVE_CHECK_SPECS",
+            &E3B_NATIVE_CHECK_SPECS,
+            TableKind::CompileCheck,
+        ),
+        (
+            "WYR1E3_NATIVE_CHECK_SPECS",
+            &WYR1E3_NATIVE_CHECK_SPECS,
+            TableKind::CompileCheck,
+        ),
+        (
+            "WYRMSH_NATIVE_CHECK_SPECS",
+            &WYRMSH_NATIVE_CHECK_SPECS,
+            TableKind::CompileCheck,
+        ),
+        (
+            "WYR1E6_NATIVE_CHECK_SPECS",
+            &WYR1E6_NATIVE_CHECK_SPECS,
+            TableKind::CompileCheck,
+        ),
+        (
+            "WYR1E6_PRODUCT_NATIVE_SPECS",
+            &WYR1E6_PRODUCT_NATIVE_SPECS,
+            TableKind::Product,
+        ),
+        (
+            "WYR1E7_SELECTED_NATIVE_SPECS",
+            &WYR1E7_SELECTED_NATIVE_SPECS,
+            TableKind::Product,
+        ),
+        (
+            "WYR1E8_SELECTED_NATIVE_SPECS",
+            &WYR1E8_SELECTED_NATIVE_SPECS,
+            TableKind::Product,
+        ),
+        (
+            "WYR1F_PRODUCT_NATIVE_SPECS",
+            &WYR1F_PRODUCT_NATIVE_SPECS,
+            TableKind::Product,
+        ),
+        (
+            "D5_PRODUCT_NATIVE_SPECS",
+            &D5_PRODUCT_NATIVE_SPECS,
+            TableKind::Product,
+        ),
+        (
+            "C4_NATIVE_CHECK_SPECS",
+            &C4_NATIVE_CHECK_SPECS,
+            TableKind::CompileCheck,
+        ),
+        (
+            "C5_NATIVE_CHECK_SPECS",
+            &C5_NATIVE_CHECK_SPECS,
+            TableKind::CompileCheck,
+        ),
+        (
+            "C6_NATIVE_CHECK_SPECS",
+            &C6_NATIVE_CHECK_SPECS,
+            TableKind::CompileCheck,
+        ),
+    ];
+
+    /// Whether `binary`'s *real* implementation is present in `specs`, and
+    /// if so, whether any row for it carries `feature`.
+    ///
+    /// Returns `None` when the binary has no real-implementation row in this
+    /// table at all, so the caller can drop it from the pairing check
+    /// instead of treating absence as "off". A table may legitimately build
+    /// only some of a coupling's binaries (e.g. `WYR1E7_SELECTED_NATIVE_SPECS`
+    /// has no `consoled` row at all); the pairing requirement only applies to
+    /// the binaries that are actually there.
+    ///
+    /// Several tables (`NATIVE_SPECS`, `C6_PRODUCT_NATIVE_SPECS`,
+    /// `C5_NATIVE_CHECK_SPECS`, `C6_NATIVE_CHECK_SPECS`) carry a row *labeled*
+    /// `uart16550d`, `consoled` or `wyrmsh` whose `package` is
+    /// `wyrmroot-wyr1-retained-stubs` rather than the real driver crate. A
+    /// retained stub does not contain the wire-protocol code these couplings
+    /// are about -- it cannot put a 96-byte frame on a channel it never
+    /// implements -- so it is excluded here rather than counted as a binary
+    /// that is "present but off". Treating it as a real absence (rather than
+    /// a false "off" data point) also matters for the all-or-none check: it
+    /// keeps a stub row from ever forcing a spurious split verdict against a
+    /// coupling it cannot possibly violate.
+    ///
+    /// A binary's state is "on" if *any* row for it carries the feature, not
+    /// only if *every* row does. Some tables (`WYR1E3_NATIVE_CHECK_SPECS`,
+    /// `WYR1E6_NATIVE_CHECK_SPECS`) list the same binary twice on purpose --
+    /// once on its normal feature set and once on a historical selector path
+    /// kept alive as a regression check -- and it is the regression row that
+    /// proves the coupling, not the baseline row next to it.
+    fn coupling_half_state(specs: &[NativeSpec], half: &CoupledHalf) -> Option<bool> {
+        const STUB_PACKAGE: &str = "wyrmroot-wyr1-retained-stubs";
+        let mut present = false;
+        let mut carries = false;
+        for spec in specs {
+            if spec.binary != half.binary || spec.package == STUB_PACKAGE {
+                continue;
+            }
+            present = true;
+            if spec.features.split(',').any(|value| value == half.feature) {
+                carries = true;
+            }
+        }
+        present.then_some(carries)
+    }
+
+    /// F3A.6n. The widened form of `selector33_halves_are_paired`'s pairing
+    /// check: every named [`WireCoupling`], over every declared `NativeSpec`
+    /// table, must have all of its present halves on or all of them off.
+    ///
+    /// This is a separate test from `selector33_halves_are_paired` rather
+    /// than a replacement for it, so a regression in the original F3A.6k
+    /// pair and a regression in one of the three couplings this audit added
+    /// are reported as distinct failures rather than one test name covering
+    /// both.
+    #[test]
+    fn coupled_halves_are_paired() {
+        for (table_name, specs, kind) in ALL_NATIVE_SPEC_TABLES {
+            if matches!(kind, TableKind::CompileCheck) {
+                continue;
+            }
+            for coupling in &WIRE_COUPLINGS {
+                let states: Vec<(&str, bool)> = coupling
+                    .halves
+                    .iter()
+                    .filter_map(|half| {
+                        coupling_half_state(specs, half).map(|state| (half.binary, state))
+                    })
+                    .collect();
+                if let Some((_, first)) = states.first() {
+                    assert!(
+                        states.iter().all(|(_, state)| state == first),
+                        "{table_name}: {} is split -- {states:?}",
+                        coupling.name
+                    );
+                }
+            }
+        }
+
+        // Non-vacuity: each coupling must actually be observed fully "on" in
+        // at least one table, or a future rename of one of these feature
+        // strings would make the loop above pass on every table for the
+        // wrong reason -- nobody ever mentioning either half again.
+        for coupling in &WIRE_COUPLINGS {
+            let observed_on = ALL_NATIVE_SPEC_TABLES.iter().any(|(_, specs, _)| {
+                coupling
+                    .halves
+                    .iter()
+                    .all(|half| coupling_half_state(specs, half) == Some(true))
+            });
+            assert!(
+                observed_on,
+                "{}: no table enables every half -- the coupling is unobservable",
+                coupling.name
+            );
         }
     }
 

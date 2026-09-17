@@ -380,7 +380,7 @@ pub(crate) fn run<System: WyrmshSystem>(
                 job_id,
             )
         }
-        Err(ForegroundError::Stream) => {
+        Err(ForegroundError::Stream(cause)) => {
             let resolution = cancel_wait(
                 system,
                 stdout,
@@ -406,13 +406,30 @@ pub(crate) fn run<System: WyrmshSystem>(
                 jobs,
                 job_id,
             )?;
+            // F3A.6n / DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md §3.2: this
+            // disposition already collapses many causes into one action
+            // (cancel + close the job, shell survives), which §3.1 permits
+            // because the action is identical for all of them. But the
+            // collapse owes the discarded instance to the reader's channel
+            // in the same change, so the literal used to read
+            // "run stream=failed\n" now names the cause instead of a bare
+            // class, following the "<command> status=<name>\n" shape
+            // `expected_text` already uses below.
             write_stderr(
                 system,
                 stderr,
                 stdout.endpoint().handle(),
                 controls,
-                b"run stream=failed\n",
-            )
+                b"run stream=",
+            )?;
+            write_stderr(
+                system,
+                stderr,
+                stdout.endpoint().handle(),
+                controls,
+                foreground_stream_cause_name(&cause),
+            )?;
+            write_stderr(system, stderr, stdout.endpoint().handle(), controls, b"\n")
         }
         Err(ForegroundError::Fatal(error)) => Err(error),
     }
@@ -919,8 +936,69 @@ fn receive_one<System: WyrmshSystem>(
 
 #[derive(Debug)]
 enum ForegroundError {
-    Stream,
+    /// A non-fatal foreground-stream disposition: this job's stdout/stderr
+    /// write side or stdin read side broke down, but the shell itself
+    /// survives — the caller cancels and closes just this job, then reports
+    /// `run stream=<cause>` to the reader's channel (see the
+    /// `Err(ForegroundError::Stream(cause))` arm below `drain_foreground`'s
+    /// call site). That is a different action from `Fatal`, which unwinds
+    /// `run` and tears the whole shell down, so F3A.6n keeps `Stream` as its
+    /// own disposition rather than rerouting it into
+    /// `Fatal(ShellError::Stream(_))` the way the write path's other
+    /// `StreamError`s already are (DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md
+    /// §3.1 only allows a collapse when the correct action is identical,
+    /// and here it is not). Per §3.2, the collapse this disposition already
+    /// makes (many causes, one action) still owes its discarded instance to
+    /// the reader, so it carries a payload instead of erasing it.
+    Stream(ForegroundStreamCause),
     Fatal(ShellError),
+}
+
+/// The cause carried by a non-fatal `ForegroundError::Stream`. `WriteExhausted`
+/// and `ReadExhausted` name the two `Ok(0)` sites in `drain_foreground`: a
+/// zero-length copy is a distinct cause from any `StreamError` and, before
+/// F3A.6n, was silently the same bare word as every other stream failure.
+/// `Read` carries the stdin `StreamError` itself, mirroring the write path's
+/// `Err(error) => ... ShellError::Stream(error)` arm twenty lines above in
+/// the same match ladder — the established pattern for "keep the value, do
+/// not collapse it" — rather than inventing a new one.
+#[derive(Debug)]
+enum ForegroundStreamCause {
+    WriteExhausted,
+    ReadExhausted,
+    Read(StreamError),
+}
+
+/// Names a `ForegroundStreamCause` for the reader's channel (the
+/// `run stream=<name>` line). Exhaustive over both this type and, through
+/// `stream_error_name`, over `StreamError` itself:
+/// DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md §3.4 forbids a wildcard arm at a
+/// diagnostic boundary because it would silently adopt every variant added
+/// later.
+fn foreground_stream_cause_name(cause: &ForegroundStreamCause) -> &'static [u8] {
+    match cause {
+        ForegroundStreamCause::WriteExhausted => b"write-exhausted",
+        ForegroundStreamCause::ReadExhausted => b"read-exhausted",
+        ForegroundStreamCause::Read(error) => stream_error_name(error),
+    }
+}
+
+/// Exhaustive name table for `StreamError`. `WouldBlock` and `Eof` are
+/// unreachable from the `ForegroundStreamCause::Read` site in practice (the
+/// drain loop peels both off before building this cause), but no_std guest
+/// code must not panic to assert that with `unreachable!()`, so they still
+/// get a real static name rather than being folded into a wildcard.
+fn stream_error_name(error: &StreamError) -> &'static [u8] {
+    match error {
+        StreamError::Native(_) => b"native",
+        StreamError::WouldBlock => b"would-block",
+        StreamError::Eof => b"eof",
+        StreamError::Broken => b"broken",
+        StreamError::Protocol => b"protocol",
+        StreamError::ReceivedHandles => b"received-handles",
+        StreamError::Failed => b"failed",
+        StreamError::Launch(_) => b"launch",
+    }
 }
 
 struct PendingOutput {
@@ -996,7 +1074,11 @@ fn drain_foreground<System: WyrmshSystem>(
             };
             if !pending.is_empty() {
                 match output.write(system, &pending.bytes[pending.offset..pending.used]) {
-                    Ok(0) => return Err(ForegroundError::Stream),
+                    Ok(0) => {
+                        return Err(ForegroundError::Stream(
+                            ForegroundStreamCause::WriteExhausted,
+                        ));
+                    }
                     Ok(written) => {
                         pending.offset += written;
                         if pending.is_empty() {
@@ -1019,7 +1101,11 @@ fn drain_foreground<System: WyrmshSystem>(
             }
             let mut bounded = ReceiveBudget::new(system);
             match input.read(&mut bounded, &mut pending.bytes) {
-                Ok(0) => return Err(ForegroundError::Stream),
+                Ok(0) => {
+                    return Err(ForegroundError::Stream(
+                        ForegroundStreamCause::ReadExhausted,
+                    ));
+                }
                 Ok(used) => {
                     pending.offset = 0;
                     pending.used = used;
@@ -1030,7 +1116,14 @@ fn drain_foreground<System: WyrmshSystem>(
                     *eof = true;
                     progress = true;
                 }
-                Err(_) => return Err(ForegroundError::Stream),
+                // F3A.6n: keep the cause instead of folding every remaining
+                // `StreamError` (Native, Broken, Protocol, ReceivedHandles,
+                // Failed, Launch) into the same bare disposition — see
+                // `ForegroundStreamCause::Read` and
+                // DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md §3.2/§3.4.
+                Err(error) => {
+                    return Err(ForegroundError::Stream(ForegroundStreamCause::Read(error)));
+                }
             }
         }
         first_stdout = !first_stdout;
@@ -1685,6 +1778,8 @@ fn write_decimal_stderr<System: WyrmshSystem>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deepwyrm_syscall::DwStatus;
+    use wyrmroot_loader::launch::LaunchError;
 
     #[test]
     fn local_job_table_reserves_before_publish_and_never_evicts() {
@@ -1715,5 +1810,77 @@ mod tests {
         assert!(!table.publish(second, 7));
         table.abort(second);
         assert_eq!(table.state(7), Some(JobState::Active));
+    }
+
+    // F3A.6n / DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md §3.2: before this
+    // amendment, `ForegroundError::Stream` was payload-less and every one of
+    // these causes reached the reader as the same literal
+    // "run stream=failed\n". These tests assert the instance now survives to
+    // `foreground_stream_cause_name`/`stream_error_name` distinctly, which is
+    // what `write_stderr`s the `run stream=<name>\n` line in `run`'s match on
+    // `ForegroundError`.
+
+    #[test]
+    fn write_and_read_exhaustion_are_distinct_causes() {
+        // Before F3A.6n both `Ok(0)` sites in `drain_foreground` (the
+        // pending-output write and the stdin read) produced the identical
+        // bare `ForegroundError::Stream`. A zero-length write and a
+        // zero-length read are different instances and must not collapse
+        // back onto one name.
+        assert_ne!(
+            foreground_stream_cause_name(&ForegroundStreamCause::WriteExhausted),
+            foreground_stream_cause_name(&ForegroundStreamCause::ReadExhausted),
+        );
+    }
+
+    #[test]
+    fn stream_error_name_is_exhaustive_and_distinct() {
+        // Every `StreamError` variant the stdin read side can produce
+        // (`Err(_)` used to erase all of these into one bare disposition)
+        // must now name a distinct static string. `stream_error_name` is
+        // matched exhaustively (no wildcard arm), so a new `StreamError`
+        // variant added later fails to compile here rather than silently
+        // inheriting a default name, per §3.4.
+        let samples: [(&str, StreamError); 8] = [
+            (
+                "native",
+                StreamError::Native(NativeError::Status(DwStatus(-1))),
+            ),
+            ("would_block", StreamError::WouldBlock),
+            ("eof", StreamError::Eof),
+            ("broken", StreamError::Broken),
+            ("protocol", StreamError::Protocol),
+            ("received_handles", StreamError::ReceivedHandles),
+            ("failed", StreamError::Failed),
+            ("launch", StreamError::Launch(LaunchError::BadMagic)),
+        ];
+        for (label_a, a) in &samples {
+            for (label_b, b) in &samples {
+                let name_a = stream_error_name(a);
+                let name_b = stream_error_name(b);
+                if label_a == label_b {
+                    assert_eq!(name_a, name_b, "{label_a} should name itself consistently");
+                } else {
+                    assert_ne!(
+                        name_a, name_b,
+                        "{label_a} and {label_b} must not collapse onto the same name"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn read_stream_cause_forwards_the_underlying_stream_error_name() {
+        // `ForegroundStreamCause::Read` must not re-collapse the
+        // `StreamError` it carries — its name has to match what
+        // `stream_error_name` would say directly, so the "run stream=<name>"
+        // line names the same cause a caller inspecting the `StreamError`
+        // itself would see.
+        let cause = ForegroundStreamCause::Read(StreamError::Broken);
+        assert_eq!(
+            foreground_stream_cause_name(&cause),
+            stream_error_name(&StreamError::Broken)
+        );
     }
 }
