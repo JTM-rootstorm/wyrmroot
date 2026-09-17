@@ -368,3 +368,64 @@ fn a_fatal_control_tick_submits_its_evidence_before_reporting_the_failure() {
     let ordinary = &MAIN[report_offset..];
     assert!(ordinary.contains("if resident.evidence_finalized() && !evidence_submitted {"));
 }
+
+/// F3A.6f. `recover_registry` empties `state.registry` and `state.binding`
+/// before it relaunches, and both of its give-up exits once returned
+/// `Ok(())`, leaving a state `wyr1e::poll` reads and cannot tolerate. No host
+/// test reached either exit -- they need an exhausted restart budget behind a
+/// full platform fixture -- so the guard is positional, on the one property
+/// that matters: under `wyr1e-production` neither exit may report success.
+#[test]
+fn a_registry_recovery_that_installs_no_replacement_does_not_report_success() {
+    let recovery = item(NATIVE, "fn recover_registry<S, L, W>(");
+
+    // The slot really is emptied before either exit, which is what makes an
+    // `Ok` return wrong rather than merely unhelpful. If this stops holding,
+    // the guard below is guarding nothing.
+    let empties = without_whitespace(recovery);
+    assert!(
+        empties.contains(".registry.take().ok_or(InitError::AbsentState(0x4f))?;"),
+        "recover_registry no longer takes the registry owner"
+    );
+    assert!(
+        empties.contains(".binding=None;"),
+        "recover_registry no longer clears the binding"
+    );
+
+    for (exit, reason) in [
+        (
+            "RegistryRecoveryStep::Degraded => {",
+            "RESTART_BUDGET_EXHAUSTED",
+        ),
+        (
+            "let Some(replacement) = replacement else {",
+            "RELAUNCH_DECLINED",
+        ),
+    ] {
+        let start = recovery.find(exit).expect("the give-up exit");
+        // The exit's own block, to the first line closing at its indentation.
+        let end = start
+            + recovery[start..]
+                .find("\n    };")
+                .or_else(|| recovery[start..].find("\n        }"))
+                .expect("the exit block's end");
+        let block = &recovery[start..end];
+        assert!(
+            block.contains("#[cfg(feature = \"wyr1e-production\")]"),
+            "{exit}: the product gate is gone"
+        );
+        assert!(
+            block.contains(&format!("abandoned::{reason}")),
+            "{exit}: the reason code is gone, so the two exits collapse"
+        );
+        // The bare `Ok(())` survives only for builds with no `poll` reading
+        // the slot, and only behind the negated gate.
+        assert!(
+            block.contains("#[cfg(not(feature = \"wyr1e-production\"))]\n        return Ok(());")
+                || block.contains(
+                    "#[cfg(not(feature = \"wyr1e-production\"))]\n            return Ok(());"
+                ),
+            "{exit}: an ungated Ok would report success with nothing installed"
+        );
+    }
+}

@@ -232,6 +232,7 @@ const fn failure_instance(error: &InitError) -> u16 {
         // and the magnitude saturates below it.
         InitError::Native(error) => wyrmroot_runtime::native_error_code(*error) as u16,
         InitError::AbsentState(site) => *site as u16,
+        InitError::RegistryAbandoned(reason) => *reason as u16,
         InitError::LaunchProtocol(error) => *error as u16,
         // An attributed failure already carries the innermost instance.
         InitError::RecoveryTransition { payload, .. } => *payload,
@@ -246,6 +247,10 @@ const fn failure_kind(error: &InitError) -> u8 {
         // and sharing 0x01 would make a site number indistinguishable from a
         // native status magnitude. 0x09..=0x0e were unallocated.
         InitError::AbsentState(_) => 0x09,
+        // Also its own kind, and for the same reason: the reason code shares
+        // no namespace with a site number or a status magnitude. 0x0a..=0x0e
+        // were unallocated.
+        InitError::RegistryAbandoned(_) => 0x0a,
         InitError::Accounting | InitError::Wyr1BModel(_) => 0x02,
         // The retirement wait kept `Supervision`'s meaning when it gained a
         // payload, so selector 33's kind is unchanged by that split. E8 must stay
@@ -412,10 +417,10 @@ pub const fn resident_tick_failure_application_status(error: &InitError) -> u32 
             _ => UNATTRIBUTED_OPERATION,
         };
         let kind = match kind {
-            0x01..=0x09 | 0x0f => kind,
+            0x01..=0x0a | 0x0f => kind,
             _ => 0x0f,
         };
-        // Two kinds carry an instance, and a sixteen-bit word cannot hold the
+        // Three kinds carry an instance, and a sixteen-bit word cannot hold the
         // operation nibble plus a sixteen-bit cause. Per
         // `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §5 the encoding saturates
         // rather than wraps, and per §3.3 the instance survives: each gets its
@@ -431,7 +436,8 @@ pub const fn resident_tick_failure_application_status(error: &InitError) -> u32 
         // rather than one per tag. Eight bits is enough for all three causes:
         // `deepwyrm/abi/schema/status.toml` tops out at magnitude 16 and there
         // are eight `NativeOutputError` variants, so the native byte is
-        // lossless across the whole ABI rather than merely usually.
+        // lossless across the whole ABI rather than merely usually. The
+        // abandoned-registry reason is a small enumeration and needs far less.
         match kind {
             // Bit 7 keeps a malformed-output classification distinguishable
             // from a kernel status; the magnitude saturates at 0x7f, which no
@@ -446,6 +452,8 @@ pub const fn resident_tick_failure_application_status(error: &InitError) -> u32 
             }
             // An absent state slot, at the site that found it.
             0x09 => 0xAF1F_0000 | (operation as u32) << 8 | (instance & 0xff),
+            // An abandoned registry, with the exit that abandoned it.
+            0x0a => 0xAF21_0000 | (operation as u32) << 8 | (instance & 0xff),
             // Kind 0x06 is shared by three protocols, so the tag says which
             // one and the low byte carries the refusal. Only the launch
             // protocol carries an instance here; the other two reach the
@@ -461,7 +469,7 @@ pub const fn resident_tick_failure_application_status(error: &InitError) -> u32 
 /// Decodes a tick-failure status back into operation, kind and instance.
 ///
 /// In source and under test because the layout is a contract, not a comment:
-/// three tags share one function and a reader holding a transcript needs to
+/// four tags share one function and a reader holding a transcript needs to
 /// know which one they are looking at.
 ///
 /// Returns `None` for a word this encoder never produces.
@@ -490,6 +498,12 @@ pub const fn decode_tick_failure(status: u32) -> Option<TickFailure> {
         0xAF20 => Some(TickFailure {
             operation: ((status >> 8) & 0xff) as u8,
             kind: 0x06,
+            instance: (status & 0xff) as u16,
+            saturated: false,
+        }),
+        0xAF21 => Some(TickFailure {
+            operation: ((status >> 8) & 0xff) as u8,
+            kind: 0x0a,
             instance: (status & 0xff) as u16,
             saturated: false,
         }),
@@ -565,6 +579,7 @@ const fn test_failure_category(error: &InitError) -> u32 {
         #[cfg(feature = "wyr1c6-selector29")]
         InitError::Wyr1C6GateConfig(_) => 0x1f,
         InitError::RecoveryTransition { .. } => 0x20,
+        InitError::RegistryAbandoned(_) => 0x23,
         #[cfg(feature = "r1-selector34")]
         InitError::R1Probe(failure) => failure.category(),
         #[cfg(feature = "r1-selector34")]
@@ -773,13 +788,15 @@ pub const fn r1_test_failure_application_status(error: &InitError) -> u32 {
         // the liveness snapshot when a card needs it, not spent here. Adding a
         // base above is the right move only for a payload selector 34 can
         // actually reach.
-        // F3A.6c's `AbsentState` site number is named here rather than given a
-        // base of its own, for the reason the paragraph above gives: its sites
-        // are all in `wyr1c_native.rs` and `wyr1e_native.rs`, which selector
-        // 34 does not exercise, and this encoder's low sixteen bits are
-        // scarce. If a card ever reaches one from selector 34, a base is the
-        // right move then.
+        // F3A.6c's `AbsentState` site number and F3A.6f's
+        // `RegistryAbandoned` reason are named here rather than given a base
+        // of their own, for the reason the paragraph above gives: they are
+        // raised in `wyr1c_native.rs` and `wyr1e_native.rs`, which selector 34
+        // does not exercise, and this encoder's low sixteen bits are scarce.
+        // If a card ever reaches one from selector 34, a base is the right
+        // move then.
         InitError::AbsentState(_)
+        | InitError::RegistryAbandoned(_)
         | InitError::LaunchProtocol(_)
         | InitError::WrongManifestProfile
         | InitError::UnlaunchableRole
@@ -1502,6 +1519,25 @@ pub enum InitError {
     /// `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` requires E8's to stay identical to
     /// the A27 baseline. Converting them would move those words.
     AbsentState(u8),
+    /// A registry recovery gave up without installing a replacement.
+    ///
+    /// F3A.6f: `recover_registry` empties `state.registry` and `state.binding`
+    /// before it relaunches, and two of its exits used to `return Ok(())`
+    /// having installed nothing -- leaving a state `wyr1e::poll` cannot
+    /// tolerate, and reporting success. The `RecoveryResult::Degraded` those
+    /// exits set is a running accumulator, not a verdict: the resident is
+    /// *constructed* `Degraded`, so no reader can treat it as a stop signal.
+    ///
+    /// Under `wyr1e-production` abandoning the registry is therefore terminal,
+    /// because almost everything `poll` does needs the registry's control
+    /// channel and a system without one has nothing left to poll. Builds
+    /// without that product keep the old `Ok`: nothing there reads the slot.
+    ///
+    /// The payload says which exit, per
+    /// `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §6 -- the two are
+    /// indistinguishable from a status otherwise, because both used to return
+    /// `Ok`, and F3A.6f could not say which one the smp profile took.
+    RegistryAbandoned(u8),
     RecoveryTransition {
         operation: u8,
         initiating_kind: u8,
@@ -5036,6 +5072,45 @@ mod native_cleanup_tests {
     /// transitions and `0x0f` is the sentinel. The field was always eight bits
     /// wide; only the clamp was four.
     #[cfg(not(feature = "r1-selector34"))]
+    #[test]
+    fn an_abandoned_registry_names_the_exit_that_abandoned_it() {
+        // F3A.6f's whole point: the two exits used to be indistinguishable
+        // because both returned `Ok`. They must not collapse to one status.
+        let budget: Result<(), InitError> = attribute_failure(
+            RecoveryOperation::RetireRegistry,
+            Err(InitError::RegistryAbandoned(0x01)),
+        );
+        let declined: Result<(), InitError> = attribute_failure(
+            RecoveryOperation::LaunchRegistry,
+            Err(InitError::RegistryAbandoned(0x02)),
+        );
+        let budget = resident_tick_failure_application_status(&budget.unwrap_err());
+        let declined = resident_tick_failure_application_status(&declined.unwrap_err());
+        assert_ne!(budget, declined);
+        assert_eq!(budget >> 16, 0xAF21);
+        assert_eq!(declined >> 16, 0xAF21);
+
+        let decoded = decode_tick_failure(budget).expect("an abandoned registry decodes");
+        assert_eq!(decoded.operation, RecoveryOperation::RetireRegistry as u8);
+        assert_eq!(decoded.kind, 0x0a);
+        assert_eq!(decoded.instance, 0x01);
+        assert!(!decoded.saturated);
+        let decoded = decode_tick_failure(declined).expect("an abandoned registry decodes");
+        assert_eq!(decoded.operation, RecoveryOperation::LaunchRegistry as u8);
+        assert_eq!(decoded.instance, 0x02);
+
+        // Unattributed, the reason still survives: the tag is what carries it,
+        // not the operation.
+        let bare = resident_tick_failure_application_status(&InitError::RegistryAbandoned(0x02));
+        assert_eq!(bare, 0xAF21_0F02);
+
+        // And the new kind does not disturb the tag every other error uses.
+        assert_eq!(
+            resident_tick_failure_application_status(&InitError::Cleanup) >> 16,
+            0xAF18
+        );
+    }
+
     #[test]
     fn a_startup_operation_is_nameable_without_moving_any_recovery_value() {
         // Every startup operation round-trips above the sentinel.

@@ -393,6 +393,22 @@ enum RegistryRecoveryStep {
     Restart,
 }
 
+/// Why a registry recovery gave up without installing a replacement.
+///
+/// Both exits used to `return Ok(())`, which made them indistinguishable from
+/// a status: F3A.6f could say the smp profile's registry slot had been emptied
+/// and not which exit emptied it. `InitError::RegistryAbandoned` carries one
+/// of these.
+#[cfg(feature = "wyr1e-production")]
+pub(crate) mod abandoned {
+    /// `registry_recovery_step` chose `Degraded`: the controller's restart
+    /// budget for the registry was exhausted.
+    pub(crate) const RESTART_BUDGET_EXHAUSTED: u8 = 0x01;
+    /// The relaunch itself declined -- `launch_registry_until_ready_before`
+    /// returned `Ok(None)` rather than an owner.
+    pub(crate) const RELAUNCH_DECLINED: u8 = 0x02;
+}
+
 const fn registry_recovery_step(
     exhausted: bool,
     status_already_consumed: bool,
@@ -3746,6 +3762,17 @@ where
                     Err(InitError::Cleanup),
                 );
             }
+            // F3A.6f. `state.registry` and `state.binding` were emptied above
+            // and nothing was installed, so a build whose `poll` reads that
+            // slot cannot continue; see `InitError::RegistryAbandoned`.
+            #[cfg(feature = "wyr1e-production")]
+            return attribute_failure(
+                RecoveryOperation::RetireRegistry,
+                Err(InitError::RegistryAbandoned(
+                    abandoned::RESTART_BUDGET_EXHAUSTED,
+                )),
+            );
+            #[cfg(not(feature = "wyr1e-production"))]
             return Ok(());
         }
         RegistryRecoveryStep::Restart | RegistryRecoveryStep::AwaitStatus => {}
@@ -3772,6 +3799,15 @@ where
                 Err(InitError::Supervision),
             );
         }
+        // F3A.6f, the second of the two exits. Same reasoning as the
+        // `Degraded` step above: emptied, nothing installed, terminal where a
+        // `poll` depends on it.
+        #[cfg(feature = "wyr1e-production")]
+        return attribute_failure(
+            RecoveryOperation::LaunchRegistry,
+            Err(InitError::RegistryAbandoned(abandoned::RELAUNCH_DECLINED)),
+        );
+        #[cfg(not(feature = "wyr1e-production"))]
         return Ok(());
     };
     #[cfg(feature = "wyr1e-production")]
