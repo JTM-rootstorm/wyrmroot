@@ -403,7 +403,9 @@ fn e8_failure_detail_is_bound_to_each_actual_transition_join() {
         .unwrap();
     let driver_retired_end = driver_retired_start
         + driver[driver_retired_start..]
-            .find("ResidentPollEvent::RegistryLost")
+            // F3A.6h split `RegistryLost` in two; this is a span delimiter,
+            // so it tracks whichever arm now comes first.
+            .find("ResidentPollEvent::RegistryControlLost")
             .unwrap();
     let driver_retired = &driver[driver_retired_start..driver_retired_end];
     for operation in [

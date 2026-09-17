@@ -304,7 +304,10 @@ enum ResidentPollEvent {
     DevmgrExited,
     DevmgrControlLost,
     DevmgrControlReadable,
-    RegistryLost,
+    /// The registry's control channel peer-closed.
+    RegistryControlLost,
+    /// The registry's process exited.
+    RegistryExited,
     DriverExited,
     #[cfg(feature = "dw1e3-selector31")]
     ProbeControlReadable,
@@ -341,11 +344,17 @@ fn classify_resident_poll(
         1 if result.observed.0 & DW_SIGNAL_READABLE.0 != 0 => {
             Ok(ResidentPollEvent::DevmgrControlReadable)
         }
+        // F3A.6h. These were one `RegistryLost` variant, which made a closed
+        // channel and a dead process the same word: the first points at the
+        // channel's other end or a handle lifetime, the second at registryd
+        // itself, and F3A.6g could say the registry was lost four times
+        // without saying how. Devmgr's two are named separately directly
+        // above, and always were.
         2 if registry_present && result.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 => {
-            Ok(ResidentPollEvent::RegistryLost)
+            Ok(ResidentPollEvent::RegistryControlLost)
         }
         3 if registry_present && result.observed.0 & DW_SIGNAL_EXITED.0 != 0 => {
-            Ok(ResidentPollEvent::RegistryLost)
+            Ok(ResidentPollEvent::RegistryExited)
         }
         index
             if driver_present
@@ -399,7 +408,9 @@ enum RegistryRecoveryStep {
 /// a status: F3A.6f could say the smp profile's registry slot had been emptied
 /// and not which exit emptied it. `InitError::RegistryAbandoned` carries one
 /// of these.
-#[cfg(feature = "wyr1e-production")]
+// The reason is only *reported* under `wyr1e-production`, but every caller
+// names its trigger regardless, so the names exist in every build.
+#[cfg_attr(not(feature = "wyr1e-production"), allow(dead_code))]
 pub(crate) mod abandoned {
     /// `registry_recovery_step` chose `Degraded`: the controller's restart
     /// budget for the registry was exhausted.
@@ -407,6 +418,43 @@ pub(crate) mod abandoned {
     /// The relaunch itself declined -- `launch_registry_until_ready_before`
     /// returned `Ok(None)` rather than an owner.
     pub(crate) const RELAUNCH_DECLINED: u8 = 0x02;
+
+    /// What asked for the recovery that gave up, in the reason's high nibble.
+    ///
+    /// F3A.6h. The exit alone says the budget ran out; it does not say what
+    /// kept spending it, and the callers are not interchangeable -- a
+    /// peer-closed channel, a dead process and a shell-side poisoning have
+    /// different causes. The final call's trigger is the one reported, which
+    /// is the loss that exhausted the budget.
+    // Each trigger belongs to a different caller, and the callers are behind
+    // different features: `WYR1E_POLL_E8` needs `wyr1e8-selector33` and
+    // `NONE` is only reached by host fixtures. Naming the whole set in one
+    // place is what makes the reason byte readable, so the set is allowed to
+    // be wider than any single build's callers rather than split across cfgs
+    // that would drift out of step with them.
+    #[allow(dead_code)]
+    pub(crate) mod trigger {
+        /// Not loss-driven: startup, a fallback, or a host fixture.
+        pub(crate) const NONE: u8 = 0x00;
+        /// `ResidentPollEvent::RegistryControlLost`.
+        pub(crate) const CONTROL_LOST: u8 = 0x01;
+        /// `ResidentPollEvent::RegistryExited`.
+        pub(crate) const EXITED: u8 = 0x02;
+        /// Devmgr reported waiting-for-registry while an owner still existed.
+        pub(crate) const DEVMGR_WAITING: u8 = 0x03;
+        /// `wyr1e::PollOutcome::RecoverRegistry`.
+        pub(crate) const WYR1E_POLL: u8 = 0x04;
+        /// `wyr1e::PollOutcome::RecoverRegistryForE8`.
+        pub(crate) const WYR1E_POLL_E8: u8 = 0x05;
+        /// `start_wyr1e_or_recover_registry`'s fallback after a failed start.
+        pub(crate) const WYR1E_START_FALLBACK: u8 = 0x06;
+    }
+
+    /// One reason byte: the trigger in the high nibble, the exit in the low.
+    #[must_use]
+    pub(crate) const fn reason(trigger: u8, exit: u8) -> u8 {
+        (trigger & 0x0f) << 4 | (exit & 0x0f)
+    }
 }
 
 const fn registry_recovery_step(
@@ -3286,7 +3334,14 @@ where
                                     }
                                     if state.registry.is_some() {
                                         recover_registry(
-                                            resident, system, loader, waits, bootfs, true, false,
+                                            resident,
+                                            system,
+                                            loader,
+                                            waits,
+                                            bootfs,
+                                            true,
+                                            false,
+                                            abandoned::trigger::DEVMGR_WAITING,
                                         )
                                     } else {
                                         resident
@@ -3381,9 +3436,26 @@ where
                                 ),
                             }
                         }
-                        ResidentPollEvent::RegistryLost => {
-                            recover_registry(resident, system, loader, waits, bootfs, false, false)
-                        }
+                        ResidentPollEvent::RegistryControlLost => recover_registry(
+                            resident,
+                            system,
+                            loader,
+                            waits,
+                            bootfs,
+                            false,
+                            false,
+                            abandoned::trigger::CONTROL_LOST,
+                        ),
+                        ResidentPollEvent::RegistryExited => recover_registry(
+                            resident,
+                            system,
+                            loader,
+                            waits,
+                            bootfs,
+                            false,
+                            false,
+                            abandoned::trigger::EXITED,
+                        ),
                         ResidentPollEvent::DriverExited => {
                             #[cfg(feature = "dw1e3-selector31")]
                             if let Err(error) = validate_e3a_u1_finalize_exit(resident, waits) {
@@ -3620,11 +3692,25 @@ where
                                 recover_devmgr(resident, system, loader, waits, bootfs)
                             }
                             wyr1e::PollOutcome::RecoverRegistry => recover_registry(
-                                resident, system, loader, waits, bootfs, false, false,
+                                resident,
+                                system,
+                                loader,
+                                waits,
+                                bootfs,
+                                false,
+                                false,
+                                abandoned::trigger::WYR1E_POLL,
                             ),
                             #[cfg(feature = "wyr1e8-selector33")]
                             wyr1e::PollOutcome::RecoverRegistryForE8 => recover_registry(
-                                resident, system, loader, waits, bootfs, false, true,
+                                resident,
+                                system,
+                                loader,
+                                waits,
+                                bootfs,
+                                false,
+                                true,
+                                abandoned::trigger::WYR1E_POLL_E8,
                             ),
                         }?;
                         Ok(resident.controller.mode())
@@ -3664,6 +3750,7 @@ fn wyr1f_closure_trigger(
     outcome
 }
 
+#[allow(clippy::too_many_arguments)]
 fn recover_registry<S, L, W>(
     resident: &mut ResidentSystemInit,
     system: &mut S,
@@ -3672,12 +3759,17 @@ fn recover_registry<S, L, W>(
     bootfs: &[u8],
     status_already_consumed: bool,
     _e8_quiesced: bool,
+    trigger: u8,
 ) -> Result<(), InitError>
 where
     S: Wyr1BPlatform,
     L: LoaderPlatform<Error = NativeError>,
     W: SupervisionPlatform<Error = NativeError>,
 {
+    // Only a build whose `poll` reads the registry slot reports the reason,
+    // so only that build consumes the trigger. Every caller still names one.
+    #[cfg(not(feature = "wyr1e-production"))]
+    let _ = trigger;
     // The recovery episode lives on the wyr1e console/shell supervisor, so
     // a build without that product has no episode rather than no concept of
     // one. The gate is the product, not a selector.
@@ -3768,9 +3860,10 @@ where
             #[cfg(feature = "wyr1e-production")]
             return attribute_failure(
                 RecoveryOperation::RetireRegistry,
-                Err(InitError::RegistryAbandoned(
+                Err(InitError::RegistryAbandoned(abandoned::reason(
+                    trigger,
                     abandoned::RESTART_BUDGET_EXHAUSTED,
-                )),
+                ))),
             );
             #[cfg(not(feature = "wyr1e-production"))]
             return Ok(());
@@ -3805,7 +3898,10 @@ where
         #[cfg(feature = "wyr1e-production")]
         return attribute_failure(
             RecoveryOperation::LaunchRegistry,
-            Err(InitError::RegistryAbandoned(abandoned::RELAUNCH_DECLINED)),
+            Err(InitError::RegistryAbandoned(abandoned::reason(
+                trigger,
+                abandoned::RELAUNCH_DECLINED,
+            ))),
         );
         #[cfg(not(feature = "wyr1e-production"))]
         return Ok(());
@@ -4124,7 +4220,16 @@ where
         RegistryTopology::new(registry_generation).map_err(InitError::Wyr1BModel)?,
         None,
     )?;
-    recover_registry(&mut resident, system, loader, waits, bootfs, false, false)?;
+    recover_registry(
+        &mut resident,
+        system,
+        loader,
+        waits,
+        bootfs,
+        false,
+        false,
+        abandoned::trigger::NONE,
+    )?;
     let role = resident.controller.role_state(RoleId::Registryd);
     let state = resident
         .wyr1c
@@ -4284,7 +4389,16 @@ where
         topology,
         Some(driver_request),
     )?;
-    recover_registry(&mut resident, system, loader, waits, bootfs, false, true)?;
+    recover_registry(
+        &mut resident,
+        system,
+        loader,
+        waits,
+        bootfs,
+        false,
+        true,
+        abandoned::trigger::NONE,
+    )?;
 
     let (client, grant, publication_generation) = resident
         .wyr1c
@@ -4365,9 +4479,16 @@ where
     }
     match result {
         Ok(()) => Ok(()),
-        Err(_) if wyr1e::registry_recovery_required(resident) => {
-            recover_registry(resident, system, loader, waits, bootfs, false, false)
-        }
+        Err(_) if wyr1e::registry_recovery_required(resident) => recover_registry(
+            resident,
+            system,
+            loader,
+            waits,
+            bootfs,
+            false,
+            false,
+            abandoned::trigger::WYR1E_START_FALLBACK,
+        ),
         Err(error) => Err(error),
     }
 }
@@ -5795,9 +5916,12 @@ mod tests {
         );
         assert_eq!(
             event(2, DW_SIGNAL_PEER_CLOSED),
-            ResidentPollEvent::RegistryLost
+            ResidentPollEvent::RegistryControlLost
         );
-        assert_eq!(event(3, DW_SIGNAL_EXITED), ResidentPollEvent::RegistryLost);
+        assert_eq!(
+            event(3, DW_SIGNAL_EXITED),
+            ResidentPollEvent::RegistryExited
+        );
     }
 
     #[test]

@@ -1533,10 +1533,18 @@ pub enum InitError {
     /// channel and a system without one has nothing left to poll. Builds
     /// without that product keep the old `Ok`: nothing there reads the slot.
     ///
-    /// The payload says which exit, per
-    /// `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §6 -- the two are
+    /// The payload says which exit and what asked for the recovery, per
+    /// `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §6 -- the exits are
     /// indistinguishable from a status otherwise, because both used to return
     /// `Ok`, and F3A.6f could not say which one the smp profile took.
+    ///
+    /// The trigger is the high nibble and the exit the low one; see
+    /// `wyr1c_native::abandoned`. F3A.6h added the trigger because the exit
+    /// alone says the restart budget ran out without saying what kept
+    /// spending it, and the callers are not interchangeable: a peer-closed
+    /// control channel, a dead registryd process and a shell-side poisoning
+    /// have different causes. The reported trigger is the final call's, which
+    /// is the loss that exhausted the budget.
     RegistryAbandoned(u8),
     RecoveryTransition {
         operation: u8,
@@ -5103,6 +5111,28 @@ mod native_cleanup_tests {
         // not the operation.
         let bare = resident_tick_failure_application_status(&InitError::RegistryAbandoned(0x02));
         assert_eq!(bare, 0xAF21_0F02);
+
+        // F3A.6h. The same exit reached from two different triggers must not
+        // read as one status, and a whole reason byte survives the encoder.
+        let control = InitError::RegistryAbandoned(crate::wyr1c_native::abandoned::reason(
+            crate::wyr1c_native::abandoned::trigger::CONTROL_LOST,
+            crate::wyr1c_native::abandoned::RESTART_BUDGET_EXHAUSTED,
+        ));
+        let exited = InitError::RegistryAbandoned(crate::wyr1c_native::abandoned::reason(
+            crate::wyr1c_native::abandoned::trigger::EXITED,
+            crate::wyr1c_native::abandoned::RESTART_BUDGET_EXHAUSTED,
+        ));
+        let control = resident_tick_failure_application_status(&control);
+        let exited = resident_tick_failure_application_status(&exited);
+        assert_ne!(control, exited);
+        assert_eq!(control, 0xAF21_0F11);
+        assert_eq!(exited, 0xAF21_0F21);
+        assert_eq!(
+            decode_tick_failure(exited)
+                .expect("an abandoned registry decodes")
+                .instance,
+            0x21
+        );
 
         // And the new kind does not disturb the tag every other error uses.
         assert_eq!(

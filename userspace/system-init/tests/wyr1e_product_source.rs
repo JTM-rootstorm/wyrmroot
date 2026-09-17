@@ -429,3 +429,74 @@ fn a_registry_recovery_that_installs_no_replacement_does_not_report_success() {
         );
     }
 }
+
+/// F3A.6h. A closed control channel and a dead registryd process were one
+/// `RegistryLost` word, so F3A.6g could report the restart budget exhausted
+/// without saying what kept spending it. Each poll arm must name its own
+/// trigger, and no two may share one -- a shared code collapses them again.
+#[test]
+fn every_registry_recovery_caller_names_a_distinct_trigger() {
+    let calls = without_whitespace(NATIVE);
+
+    // The split arms exist and dispatch on the two different signals.
+    let classify = item(NATIVE, "fn classify_resident_poll(");
+    let classify = without_whitespace(classify);
+    assert!(
+        classify.contains(
+            "2ifregistry_present&&result.observed.0&DW_SIGNAL_PEER_CLOSED.0!=0=>{\
+             Ok(ResidentPollEvent::RegistryControlLost)"
+        ),
+        "the peer-closed arm no longer names its own event"
+    );
+    assert!(
+        classify.contains(
+            "3ifregistry_present&&result.observed.0&DW_SIGNAL_EXITED.0!=0=>{\
+             Ok(ResidentPollEvent::RegistryExited)"
+        ),
+        "the exited arm no longer names its own event"
+    );
+
+    // Each arm carries its own trigger into the recovery.
+    for (arm, trigger) in [
+        (
+            "ResidentPollEvent::RegistryControlLost=>recover_registry(",
+            "CONTROL_LOST",
+        ),
+        (
+            "ResidentPollEvent::RegistryExited=>recover_registry(",
+            "EXITED",
+        ),
+    ] {
+        let start = calls.find(arm).expect("the split poll arm");
+        let end = start + calls[start..].find("),").expect("the call's end");
+        assert!(
+            calls[start..end].contains(&format!("abandoned::trigger::{trigger}")),
+            "{arm}: the trigger is gone, so the two losses collapse again"
+        );
+    }
+
+    // No trigger code is spent twice. The reason byte packs the trigger into
+    // one nibble, so a duplicate would make two callers indistinguishable
+    // without the compiler noticing. The two namespaces are counted apart:
+    // the exits share values with the triggers by design, because they
+    // occupy different nibbles.
+    let module = item(NATIVE, "pub(crate) mod abandoned {");
+    let triggers_at = module
+        .find("pub(crate) mod trigger {")
+        .expect("the trigger module");
+    for (label, span) in [
+        ("exit", &module[..triggers_at]),
+        ("trigger", &module[triggers_at..]),
+    ] {
+        let mut codes: Vec<&str> = span
+            .lines()
+            .filter_map(|line| line.split_once(": u8 = "))
+            .map(|(_, value)| value.trim_end_matches(';'))
+            .collect();
+        let total = codes.len();
+        assert!(total >= 2, "{label}: the codes are no longer declared here");
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), total, "two {label} codes share a value");
+    }
+}
