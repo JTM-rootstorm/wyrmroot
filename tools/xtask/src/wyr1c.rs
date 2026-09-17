@@ -529,12 +529,11 @@ const WYR1E8_SELECTED_NATIVE_SPECS: [NativeSpec; 10] = [
 /// already has. Two artifacts differ, and neither difference is
 /// instrumentation:
 ///
-/// - `devmgr` takes `wyr1e8-production`, which is `["wyr1e-production"]` plus
-///   the D5 controller message set and `RequestRetire` handling.
-/// - `consoled` takes `wyr1e8-recovery`, which is `["wyr1e-wyrmsh"]` plus the
-///   console-side recovery path.
+/// One artifact differs, and the difference is not instrumentation:
 ///
-/// Neither pulls a `*-test-evidence` feature, unlike `dw1e3-selector31`.
+/// - `devmgr` takes `wyr1e8-production`, which is `["wyr1e-production"]` plus
+///   the D5 controller message set and `RequestRetire` handling. It pulls no
+///   `*-test-evidence` feature, unlike `dw1e3-selector31`.
 ///
 /// `system-init` stays on `wyr1e-production`. Its E8 recovery machinery is
 /// reachable only through `wyr1e8-selector33`, which drags in the test-actor
@@ -543,7 +542,27 @@ const WYR1E8_SELECTED_NATIVE_SPECS: [NativeSpec; 10] = [
 /// of a test actor carrying a nonce-derived token. That machinery is acceptance
 /// content and stays out of the production artifact.
 ///
-/// Recorded in `DW1F_WYR1F_F1A1_IMPLEMENTATION_MAP.md` §§1.1, 1.2 and 2.
+/// F3A.6k: `consoled` used to take `wyr1e8-recovery` here as a second such
+/// difference, on the same reasoning -- console-side recovery, no evidence
+/// feature, behaviour the reached implementation already has. That reasoning
+/// was wrong, and the paragraph above is what defeats it. `wyr1e8-recovery`
+/// and `wyr1e8-selector33` are two halves of one wire protocol. With only
+/// consoled's half enabled, consoled sets `recovery_control` to the *bootstrap
+/// channel* and puts a 96-byte `quiesce_control` frame on it during the wyrmsh
+/// child launch -- before its own 40-byte READY -- and an init built without
+/// `wyr1e8-selector33` sizes that receive buffer at 64 bytes. The kernel
+/// refuses it `BUFFER_TOO_SMALL`, the console is retired, and the failure is
+/// reported as a registry recovery until the restart budget is spent.
+///
+/// So the feature did not add recovery the product could use. It stopped the
+/// product booting at all, and every F bring-up failure in the F3A campaign
+/// was downstream of it. If init's half is acceptance content that stays out,
+/// consoled's half has no peer and stays out with it. The invariant is now
+/// enforced by `selector33_halves_are_paired` rather than left to a reader of
+/// this comment.
+///
+/// Recorded in `DW1F_WYR1F_F1A1_IMPLEMENTATION_MAP.md` §§1.1, 1.2 and 2 and in
+/// `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md`'s F3A.6k amendment.
 const WYR1F_PRODUCT_NATIVE_SPECS: [NativeSpec; 8] = [
     NativeSpec {
         label: "system-init",
@@ -577,7 +596,7 @@ const WYR1F_PRODUCT_NATIVE_SPECS: [NativeSpec; 8] = [
         label: "consoled",
         package: "wyrmroot-consoled",
         binary: "consoled",
-        features: "native-consoled,wyr1e-wyrmsh,wyr1e8-recovery",
+        features: "native-consoled,wyr1e-wyrmsh",
         artifact: "consoled",
     },
     NativeSpec {
@@ -5741,6 +5760,76 @@ mod tests {
     /// silently loses devmgr's D5 retire path and consoled's recovery path.
     /// Assert both the difference and the sameness of everything else, so this
     /// test also fails if an unintended third divergence appears.
+    /// F3A.6k. `wyr1e8-selector33` on `system-init` and `wyr1e8-recovery` on
+    /// `consoled` are two halves of one wire protocol, and no compiler sees
+    /// both: they are chosen here, per product, in separate string literals.
+    ///
+    /// Enabling only consoled's half is what broke the whole F3A campaign.
+    /// Consoled sets `recovery_control` to the bootstrap channel and puts a
+    /// 96-byte `quiesce_control` frame on it during the wyrmsh child launch,
+    /// before its own 40-byte READY; an init without `wyr1e8-selector33` sizes
+    /// that buffer at 64 bytes and the kernel refuses the receive
+    /// `BUFFER_TOO_SMALL`. The console is retired, the failure is reported as
+    /// a registry recovery, the restart budget is spent, and the registry is
+    /// abandoned -- four layers away, with the status gone at each one.
+    ///
+    /// The guard that should have caught it checked whether a feature's *name*
+    /// contains "selector". `wyr1e8-recovery` does not, so it passed. This one
+    /// checks the pairing instead of the spelling, over every product set, so
+    /// a future recipe cannot enable one half alone in either direction.
+    #[test]
+    fn selector33_halves_are_paired() {
+        let sets: [(&str, &[NativeSpec]); 4] = [
+            ("E6 production", &WYR1E6_PRODUCT_NATIVE_SPECS),
+            ("E7 selected", &WYR1E7_SELECTED_NATIVE_SPECS),
+            ("E8 selected", &WYR1E8_SELECTED_NATIVE_SPECS),
+            ("F production", &WYR1F_PRODUCT_NATIVE_SPECS),
+        ];
+        let has = |specs: &[NativeSpec], label: &str, feature: &str| {
+            specs
+                .iter()
+                .filter(|spec| spec.label == label)
+                .any(|spec| spec.features.split(',').any(|value| value == feature))
+        };
+        for (name, specs) in sets {
+            let init = has(specs, "system-init", "wyr1e8-selector33");
+            let console = has(specs, "consoled", "wyr1e8-recovery");
+            assert_eq!(
+                init, console,
+                "{name}: system-init wyr1e8-selector33 = {init} but consoled \
+                 wyr1e8-recovery = {console}; the two are one protocol"
+            );
+        }
+
+        // Non-vacuity: the pairing must actually be observable in this data,
+        // or the loop above passes on four sets that mention neither feature.
+        assert!(
+            has(
+                &WYR1E8_SELECTED_NATIVE_SPECS,
+                "system-init",
+                "wyr1e8-selector33"
+            ) && has(&WYR1E8_SELECTED_NATIVE_SPECS, "consoled", "wyr1e8-recovery"),
+            "the E8 set no longer enables both halves"
+        );
+        assert!(
+            !has(&WYR1F_PRODUCT_NATIVE_SPECS, "consoled", "wyr1e8-recovery"),
+            "the F product enables consoled's half again"
+        );
+
+        // And the instrumented F product, whose system-init spec is rewritten
+        // at runtime, keeps the pairing too.
+        for product_kind in [
+            Wyr1fProduct::Normal,
+            Wyr1fProduct::InstrumentedNormal,
+            Wyr1fProduct::Degraded,
+        ] {
+            let specs = product_kind.native_specs();
+            let init = has(&specs, "system-init", "wyr1e8-selector33");
+            let console = has(&specs, "consoled", "wyr1e8-recovery");
+            assert_eq!(init, console, "{product_kind:?} splits the protocol");
+        }
+    }
+
     #[test]
     fn wyr1f_diverges_from_e6_only_where_e8_added_production_behaviour() {
         for spec in WYR1F_PRODUCT_NATIVE_SPECS {
@@ -5772,13 +5861,11 @@ mod tests {
                     assert_eq!(e6.features, "wyr1e-production");
                     assert_eq!(spec.features, "wyr1e8-production");
                 }
-                "consoled" => {
-                    assert_eq!(e6.features, "native-consoled,wyr1e-wyrmsh");
-                    assert_eq!(
-                        spec.features,
-                        "native-consoled,wyr1e-wyrmsh,wyr1e8-recovery"
-                    );
-                }
+                // F3A.6k: `consoled` used to have an arm here for its
+                // `wyr1e8-recovery` divergence. It has none now, so it falls
+                // through to the equality below -- which is the stronger
+                // statement, and the one that would have refused the
+                // divergence in the first place.
                 _ => assert_eq!(
                     spec.features, e6.features,
                     "{} features diverged from E6 without a recorded reason",

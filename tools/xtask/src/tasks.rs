@@ -1690,8 +1690,11 @@ fn host_test_commands(filter: Option<&str>) -> Result<Vec<Vec<String>>, Failure>
             ("wyrmroot-system-init", Some("wyr1f-closure"), true),
             ("wyrmroot-devmgr", Some("wyr1e8-production"), true),
             (
+                // F3A.6k. The F gate builds consoled in the shape the F
+                // product ships, and that shape no longer carries
+                // `wyr1e8-recovery`.
                 "wyrmroot-consoled",
-                Some("native-consoled,wyr1e-wyrmsh,wyr1e8-recovery"),
+                Some("native-consoled,wyr1e-wyrmsh"),
                 true,
             ),
             ("wyrmroot-uart16550d", None, true),

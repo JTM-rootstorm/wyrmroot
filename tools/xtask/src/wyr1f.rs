@@ -2423,7 +2423,7 @@ mod tests {
         );
         assert_eq!(
             wyr1c::wyr1f_native_features("consoled", wyr1c::Wyr1fProduct::Normal).unwrap(),
-            "native-consoled,wyr1e-wyrmsh,wyr1e8-recovery"
+            "native-consoled,wyr1e-wyrmsh"
         );
     }
 
