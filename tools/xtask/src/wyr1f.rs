@@ -541,6 +541,7 @@ fn build_produced(
         ("consoled.elf", native("consoled")?),
         ("wyrmsh.elf", native("wyrmsh")?),
         ("hello.elf", native("hello")?),
+        ("cpu-hog.elf", native("cpu-hog")?),
         ("wyr1-a-gate-v1.bin", gate_config),
         ("rrc-f-v1.bin", product.rrc_manifest.as_slice()),
         ("wrdm-f-v1.bin", product.device_manifest.as_slice()),
@@ -1092,7 +1093,7 @@ fn source_receipt(
         ("bootstrap_features", "wyr1c5-production"),
         (
             "bootfs_command",
-            "in-process wyrmroot-bootfs build_e6 exact 12-entry final normal archive",
+            "in-process wyrmroot-bootfs build_f exact 13-entry final archive",
         ),
         (
             "esp_command",
