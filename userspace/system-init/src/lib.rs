@@ -233,6 +233,7 @@ const fn failure_instance(error: &InitError) -> u16 {
         InitError::Native(error) => wyrmroot_runtime::native_error_code(*error) as u16,
         InitError::AbsentState(site) => *site as u16,
         InitError::RegistryAbandoned(reason) => *reason as u16,
+        InitError::SessionShutdown(steps) => *steps as u16,
         InitError::LaunchProtocol(error) => *error as u16,
         // An attributed failure already carries the innermost instance.
         InitError::RecoveryTransition { payload, .. } => *payload,
@@ -251,6 +252,10 @@ const fn failure_kind(error: &InitError) -> u8 {
         // no namespace with a site number or a status magnitude. 0x0a..=0x0e
         // were unallocated.
         InitError::RegistryAbandoned(_) => 0x0a,
+        // Its own kind for the same reason as the two above: the step mask
+        // shares no namespace with a site number, a status magnitude or an
+        // abandonment reason. 0x0b..=0x0e remain unallocated.
+        InitError::SessionShutdown(_) => 0x0b,
         InitError::Accounting | InitError::Wyr1BModel(_) => 0x02,
         // The retirement wait kept `Supervision`'s meaning when it gained a
         // payload, so selector 33's kind is unchanged by that split. E8 must stay
@@ -417,7 +422,7 @@ pub const fn resident_tick_failure_application_status(error: &InitError) -> u32 
             _ => UNATTRIBUTED_OPERATION,
         };
         let kind = match kind {
-            0x01..=0x0a | 0x0f => kind,
+            0x01..=0x0b | 0x0f => kind,
             _ => 0x0f,
         };
         // Three kinds carry an instance, and a sixteen-bit word cannot hold the
@@ -454,6 +459,8 @@ pub const fn resident_tick_failure_application_status(error: &InitError) -> u32 
             0x09 => 0xAF1F_0000 | (operation as u32) << 8 | (instance & 0xff),
             // An abandoned registry, with the exit that abandoned it.
             0x0a => 0xAF21_0000 | (operation as u32) << 8 | (instance & 0xff),
+            // A session shutdown, with the mask of steps that failed.
+            0x0b => 0xAF22_0000 | (operation as u32) << 8 | (instance & 0xff),
             // Kind 0x06 is shared by three protocols, so the tag says which
             // one and the low byte carries the refusal. Only the launch
             // protocol carries an instance here; the other two reach the
@@ -504,6 +511,12 @@ pub const fn decode_tick_failure(status: u32) -> Option<TickFailure> {
         0xAF21 => Some(TickFailure {
             operation: ((status >> 8) & 0xff) as u8,
             kind: 0x0a,
+            instance: (status & 0xff) as u16,
+            saturated: false,
+        }),
+        0xAF22 => Some(TickFailure {
+            operation: ((status >> 8) & 0xff) as u8,
+            kind: 0x0b,
             instance: (status & 0xff) as u16,
             saturated: false,
         }),
@@ -587,6 +600,11 @@ const fn test_failure_category(error: &InitError) -> u32 {
         #[cfg(feature = "r1-selector34")]
         InitError::R1RelayGap(_) => 0x27,
         InitError::BootstrapRetirement(_) => 0x26,
+        // F3A.7i. Its own category rather than `Cleanup`'s 0x15, for the
+        // reason the variant exists: a shutdown that could not release
+        // something and an ordinary cleanup failure are different findings.
+        // 0x28 was unallocated.
+        InitError::SessionShutdown(_) => 0x28,
     }
 }
 
@@ -795,7 +813,11 @@ pub const fn r1_test_failure_application_status(error: &InitError) -> u32 {
         // does not exercise, and this encoder's low sixteen bits are scarce.
         // If a card ever reaches one from selector 34, a base is the right
         // move then.
-        InitError::AbsentState(_)
+        // F3A.7i's step mask is named here for the same reason: a session
+        // shutdown is raised in `wyr1c_native.rs`, which selector 34 does not
+        // exercise, so its category byte is all this encoder owes it.
+        InitError::SessionShutdown(_)
+        | InitError::AbsentState(_)
         | InitError::RegistryAbandoned(_)
         | InitError::LaunchProtocol(_)
         | InitError::WrongManifestProfile
@@ -1565,6 +1587,23 @@ pub enum InitError {
     /// have different causes. The reported trigger is the final call's, which
     /// is the loss that exhausted the budget.
     RegistryAbandoned(u8),
+    /// A session shutdown could not release everything it owns, as a mask of
+    /// the steps that failed.
+    ///
+    /// F3A.7i. The first run of F3A.7g's teardown reported `0xAF18_1704` --
+    /// an ordinary resident tick returning `Cleanup` -- and that was the whole
+    /// of it. The teardown has five independent steps and deliberately runs
+    /// all of them, so "something failed" is four bits covering thirty-one
+    /// distinct outcomes, which is the collapse
+    /// `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` 3.2 calls a debt to the reader.
+    /// A mask is the honest shape here precisely *because* the steps are
+    /// independent: reporting only the first failure would hide the rest, and
+    /// the next run would be as blind as this one.
+    ///
+    /// Bit 0 the job dispatcher, 1 the driver, 2 devmgr, 3 the registry, 4 the
+    /// early-role table. Zero is never reported: a shutdown with no failed
+    /// step is a success.
+    SessionShutdown(u8),
     RecoveryTransition {
         operation: u8,
         initiating_kind: u8,
@@ -5275,6 +5314,47 @@ mod native_cleanup_tests {
             resident_tick_failure_application_status(&InitError::Cleanup) >> 16,
             0xAF18
         );
+    }
+
+    /// F3A.7i. The mask is the point: the shutdown runs all five steps, so a
+    /// status that said only "a cleanup failed" -- which is what the first
+    /// F3A.7g run reported, as `0xAF18_1704` -- covers thirty-one different
+    /// outcomes and names none of them.
+    #[test]
+    fn a_session_shutdown_reports_every_step_that_failed_and_not_merely_that_one_did() {
+        let status =
+            |steps| resident_tick_failure_application_status(&InitError::SessionShutdown(steps));
+
+        // Each step alone is its own status. Literals, not `1 << n`: the bit
+        // positions are what a transcript is read with, and a test written in
+        // terms of the shift would follow the shift if it moved.
+        assert_eq!(status(0x01), 0xAF22_0F01);
+        assert_eq!(status(0x02), 0xAF22_0F02);
+        assert_eq!(status(0x04), 0xAF22_0F04);
+        assert_eq!(status(0x08), 0xAF22_0F08);
+        assert_eq!(status(0x10), 0xAF22_0F10);
+
+        // And combinations stay distinguishable from their members, which is
+        // the property a first-failure-only report does not have.
+        assert_eq!(status(0x03), 0xAF22_0F03);
+        assert_eq!(status(0x1f), 0xAF22_0F1F);
+        assert_ne!(status(0x03), status(0x01));
+        assert_ne!(status(0x03), status(0x02));
+
+        // The tag is its own, so no other kind's reader can claim it.
+        for other in [
+            resident_tick_failure_application_status(&InitError::Cleanup),
+            resident_tick_failure_application_status(&InitError::AbsentState(0x01)),
+            resident_tick_failure_application_status(&InitError::RegistryAbandoned(0x01)),
+        ] {
+            assert_ne!(other >> 16, 0xAF22);
+        }
+
+        let decoded = decode_tick_failure(status(0x1f)).expect("a session shutdown decodes");
+        assert_eq!(decoded.kind, 0x0b);
+        assert_eq!(decoded.instance, 0x1f);
+        assert!(!decoded.saturated);
+        assert_eq!(decoded.operation, UNATTRIBUTED_OPERATION);
     }
 
     #[test]

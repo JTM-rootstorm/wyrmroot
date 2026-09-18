@@ -3828,27 +3828,42 @@ where
     S: Wyr1BPlatform,
     W: SupervisionPlatform<Error = NativeError>,
 {
-    let mut failed = wyr1e::drain_jobs_for_shutdown(resident, system, waits).is_err();
+    /// One bit per independent step, reported together because the shutdown
+    /// runs them all. F3A.7i; see `InitError::SessionShutdown`.
+    const JOBS: u8 = 1 << 0;
+    const DRIVER: u8 = 1 << 1;
+    const DEVMGR: u8 = 1 << 2;
+    const REGISTRY: u8 = 1 << 3;
+    const EARLY_ROLES: u8 = 1 << 4;
+
+    let mut failed = 0_u8;
+    if wyr1e::drain_jobs_for_shutdown(resident, system, waits).is_err() {
+        failed |= JOBS;
+    }
     if let Some(state) = resident.wyr1c.as_mut() {
-        if let Some(driver) = state.driver.take() {
-            failed |=
-                retire_role_for_shutdown(system, waits, driver.loaded, driver.task_group, None)
-                    .is_err();
+        if let Some(driver) = state.driver.take()
+            && retire_role_for_shutdown(system, waits, driver.loaded, driver.task_group, None)
+                .is_err()
+        {
+            failed |= DRIVER;
         }
-        if let Some(devmgr) = state.devmgr.take() {
-            failed |=
-                retire_role_for_shutdown(system, waits, devmgr.loaded, devmgr.task_group, None)
-                    .is_err();
+        if let Some(devmgr) = state.devmgr.take()
+            && retire_role_for_shutdown(system, waits, devmgr.loaded, devmgr.task_group, None)
+                .is_err()
+        {
+            failed |= DEVMGR;
         }
-        if let Some(registry) = state.registry.take() {
-            failed |= retire_role_for_shutdown(
+        if let Some(registry) = state.registry.take()
+            && retire_role_for_shutdown(
                 system,
                 waits,
                 registry.active.loaded,
                 registry.active.task_group,
                 Some(registry.control_channel),
             )
-            .is_err();
+            .is_err()
+        {
+            failed |= REGISTRY;
         }
         state.binding = None;
     }
@@ -3859,13 +3874,15 @@ where
         let Some(active) = resident.active[index].take() else {
             continue;
         };
-        failed |= retire_role_for_shutdown(system, waits, active.loaded, active.task_group, None)
-            .is_err();
+        if retire_role_for_shutdown(system, waits, active.loaded, active.task_group, None).is_err()
+        {
+            failed |= EARLY_ROLES;
+        }
     }
-    if failed {
-        Err(InitError::Cleanup)
-    } else {
+    if failed == 0 {
         Ok(())
+    } else {
+        Err(InitError::SessionShutdown(failed))
     }
 }
 
