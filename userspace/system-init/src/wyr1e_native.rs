@@ -75,6 +75,14 @@ pub(super) struct State {
 pub(super) enum PollOutcome {
     Stable,
     LaunchConsole,
+    /// The console child ended the interactive session and the console has
+    /// been retired. Nothing replaces it.
+    ///
+    /// F3A.7g. This is the one outcome that is not a recovery. Every other
+    /// non-`Stable` outcome names something to rebuild; this one says the
+    /// system finished what it was booted to do, and the supervisor's only
+    /// remaining obligation is to stop.
+    SessionComplete,
     RecoverDevmgr,
     /// The poll phase that asked, per `wyr1c_native::abandoned::phase`.
     ///
@@ -857,6 +865,13 @@ where
         return Err(InitError::Cleanup);
     }
     cleanup?;
+    // F3A.7g. The retirement above is the same either way -- a console that
+    // ended the session is released exactly as one that crashed -- and only
+    // what follows it differs. Asked after the cleanup, so a retirement that
+    // failed still reports its failure rather than a completed session.
+    if e6.shell.session_shutdown() {
+        return Ok(PollOutcome::SessionComplete);
+    }
     Ok(PollOutcome::LaunchConsole)
 }
 
@@ -1869,6 +1884,32 @@ mod tests {
             Err(InitError::Accounting)
         );
         assert_eq!(state.console, Some(peer));
+    }
+
+    /// F3A.7g. A completed session is the one outcome that stops the system,
+    /// so it must not be reported by a teardown that did not finish. The
+    /// latch is read after the retirement for exactly this reason, and moving
+    /// it above the `?` would turn a cleanup failure into a clean shutdown.
+    #[test]
+    fn a_failed_console_retirement_is_not_a_completed_session() {
+        let peer = console_peer();
+        let mut state = State::new(7).unwrap();
+        state.console = Some(peer);
+        state.shell.observe_session_shutdown();
+        assert!(state.shell.session_shutdown());
+        let observed = observer();
+        let mut platform = ObserverPlatform::generation(observed, observed.deadline);
+        let mut waits = ObserverWaits {
+            state: DW_TASK_STATE_RUNNING,
+            query_count: 0,
+        };
+
+        // The dispatcher holds no console session, so the retirement cannot
+        // complete. The latch is set and must not answer for it.
+        assert_ne!(
+            handle_console_process_exit(&mut state, &mut platform, &mut waits, false),
+            Ok(PollOutcome::SessionComplete)
+        );
     }
 
     #[test]

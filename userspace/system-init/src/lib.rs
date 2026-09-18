@@ -969,6 +969,14 @@ pub struct ResidentSystemInit {
     result: RecoveryResult,
     active: [Option<ActiveNativeRole>; EARLY_ROLE_COUNT],
     evidence_finalized: bool,
+    /// Whether the interactive session ended and nothing replaces it.
+    ///
+    /// F3A.7g. Permanent init's loop has no other way out: every exit from it
+    /// is a failure status, because a supervisor that stops supervising was
+    /// previously always a supervisor that broke. A console child that ends
+    /// the session is the one case where there is nothing left to supervise,
+    /// and this is how that reaches the loop.
+    session_complete: bool,
     last_tick_ns: u64,
     wyr1b: Option<wyr1b_native::ResidentState>,
     wyr1b_evidence: Option<wyr1b_gate::EvidenceLog>,
@@ -1088,6 +1096,17 @@ impl ResidentSystemInit {
     }
 
     #[must_use]
+    /// Whether the interactive session ended. Once true it stays true: there
+    /// is no console generation after the one that ended the session.
+    pub const fn session_complete(&self) -> bool {
+        self.session_complete
+    }
+
+    #[cfg(feature = "wyr1e-production")]
+    pub(crate) const fn observe_session_complete(&mut self) {
+        self.session_complete = true;
+    }
+
     pub const fn evidence_finalized(&self) -> bool {
         self.evidence_finalized
     }
@@ -2523,6 +2542,7 @@ where
         result: activation.result,
         active: activation.active,
         evidence_finalized: false,
+        session_complete: false,
         last_tick_ns: system.now().map_err(InitError::Native)?,
         wyr1b: None,
         wyr1b_evidence: None,
@@ -3052,6 +3072,7 @@ where
         result: RecoveryResult::Degraded,
         active: [None; EARLY_ROLE_COUNT],
         evidence_finalized: false,
+        session_complete: false,
         last_tick_ns: 0,
         wyr1b: None,
         wyr1b_evidence: None,
@@ -3756,6 +3777,83 @@ pub const fn cleanup_is_permanent(state: RestartState) -> bool {
 #[cfg(test)]
 mod native_cleanup_tests {
     use super::*;
+
+    /// The last step of F3A.7g, which no host test can reach.
+    ///
+    /// Permanent init's loop is in `main.rs`, which is unconditionally
+    /// `#![no_std]` with its own `#[panic_handler]`, so there is no host build
+    /// of it. What the loop does with `session_complete` is the whole point of
+    /// the flag -- a supervisor that latches the fact and keeps ticking has
+    /// changed nothing -- so it is read out of the source rather than left
+    /// unstated.
+    ///
+    /// Positions, not presence. A check that returns a failure status, or one
+    /// placed after the tick's own early returns so it is never reached on the
+    /// tick that set it, both fail here.
+    #[test]
+    fn permanent_init_leaves_its_loop_when_the_session_is_complete() {
+        const MAIN: &str = include_str!("main.rs");
+        const SIGNATURE: &str = "fn continue_resident(";
+
+        let start = MAIN.find(SIGNATURE).expect("continue_resident is gone");
+        let body = &MAIN[start + SIGNATURE.len()..];
+
+        let guard = body
+            .find("if resident.session_complete() {")
+            .expect("the loop no longer asks whether the session completed");
+        let tail = &body[guard..];
+        let returned = tail
+            .find("\n            return 0;\n        }\n")
+            .expect("a completed session must leave the loop with a success status");
+
+        // The wait is what makes this a loop rather than a sequence, so the
+        // check has to come before it or the tick that set the flag sleeps a
+        // full backoff first -- and, worse, a later failure could overtake it.
+        let waited = body
+            .find("InitPlatform::wait_until(system, deadline)")
+            .expect("the loop no longer waits");
+        assert!(
+            guard < waited,
+            "the completion check must precede the tick wait: guard {guard}, wait {waited}"
+        );
+        assert!(
+            returned < 64,
+            "the success return must be the body of the completion check, not something \
+             further down it: {returned} bytes after the guard"
+        );
+    }
+
+    /// The other half of the same wiring: what `SessionComplete` makes the
+    /// tick do. It is ordinary compiled code under `wyr1e-production`, but no
+    /// host fixture reaches `control_tick` with a retired console, so the
+    /// property is stated here rather than only compiled.
+    #[test]
+    fn a_complete_session_is_recorded_and_never_treated_as_a_recovery() {
+        const TICK: &str = include_str!("wyr1c_native.rs");
+
+        let handled = TICK
+            .find("if outcome == wyr1e::PollOutcome::SessionComplete {")
+            .expect("the tick no longer recognises a completed session");
+        let recorded = TICK[handled..]
+            .find("resident.observe_session_complete();")
+            .expect("a completed session is recognised but not recorded");
+        assert!(
+            recorded < 128,
+            "recording must be the body of the check: {recorded} bytes after it"
+        );
+
+        // The recovery dispatch maps every other outcome onto something to
+        // rebuild out of the bootfs archive. Reaching it with a completed
+        // session would relaunch the console the poll just retired.
+        let dispatch = TICK
+            .find("if outcome != wyr1e::PollOutcome::Stable {")
+            .expect("the tick no longer dispatches recoveries");
+        assert!(
+            handled < dispatch,
+            "a completed session must be answered before the recovery dispatch: \
+             handled {handled}, dispatch {dispatch}"
+        );
+    }
 
     #[cfg(feature = "wyr1e-production")]
     #[test]
@@ -4652,6 +4750,7 @@ mod native_cleanup_tests {
             result: RecoveryResult::Recovered,
             active: [Some(registry), Some(devmgr)],
             evidence_finalized: false,
+            session_complete: false,
             last_tick_ns: 9,
             wyr1b: None,
             wyr1b_evidence: None,

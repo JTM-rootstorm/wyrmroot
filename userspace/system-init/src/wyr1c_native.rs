@@ -578,6 +578,7 @@ where
         result: RecoveryResult::Degraded,
         active: [None; EARLY_ROLE_COUNT],
         evidence_finalized: false,
+        session_complete: false,
         last_tick_ns: 0,
         wyr1b: None,
         wyr1b_evidence: None,
@@ -3713,6 +3714,14 @@ where
         let outcome = wyr1e::poll(resident, system, loader, waits, now_ns)?;
         #[cfg(feature = "wyr1f-closure")]
         let outcome = wyr1f_closure_trigger(resident, outcome);
+        // F3A.7g. Handled before the recovery dispatch below, and outside the
+        // bootfs mapping it opens: every other non-`Stable` outcome rebuilds
+        // something out of the archive, and this one builds nothing. The
+        // console is already retired; all that is left is to say so.
+        if outcome == wyr1e::PollOutcome::SessionComplete {
+            resident.observe_session_complete();
+            return Ok(resident.controller.mode());
+        }
         if outcome != wyr1e::PollOutcome::Stable {
             if matches!(
                 outcome,
@@ -3737,7 +3746,14 @@ where
                     plan,
                     |system, bootfs| {
                         match outcome {
-                            wyr1e::PollOutcome::Stable => Ok(()),
+                            // Both are unreachable here: `Stable` does not
+                            // enter this block and `SessionComplete` returned
+                            // above. Neither is collapsed into the other, so a
+                            // future outcome cannot inherit a recovery arm by
+                            // accident.
+                            wyr1e::PollOutcome::Stable | wyr1e::PollOutcome::SessionComplete => {
+                                Ok(())
+                            }
                             wyr1e::PollOutcome::LaunchConsole => {
                                 let launched = wyr1e::launch_after_publication_observed(
                                     resident, system, loader, waits, bootfs,
@@ -4209,6 +4225,7 @@ fn recovery_fixture_resident(
         result: RecoveryResult::Recovered,
         active: [Some(registry_active), Some(devmgr)],
         evidence_finalized: false,
+        session_complete: false,
         last_tick_ns: 0,
         wyr1b: None,
         wyr1b_evidence: None,

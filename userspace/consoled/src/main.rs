@@ -28,8 +28,9 @@ use wyrmroot_device_proto::{
 };
 use wyrmroot_launch_proto::{
     ErrorCode as LaunchErrorCode, MAX_LAUNCH_MESSAGE_BYTES, Message as LaunchMessage,
-    MessageType as LaunchMessageType, Reservation as LaunchReservation, ShellV1Reply,
-    ShellV1Request, encode_job_message, encode_launch, encode_shell_v1_request,
+    MessageType as LaunchMessageType, Reservation as LaunchReservation,
+    SHELL_SESSION_SHUTDOWN_STATUS, ShellV1Reply, ShellV1Request, TerminationClassification,
+    encode_job_message, encode_launch, encode_shell_v1_request,
     parse_message as parse_launch_message, parse_shell_v1_reply,
 };
 use wyrmroot_loader::launch::{
@@ -56,6 +57,14 @@ const STATUS_SEND_TIMEOUT_NS: u64 = 1_000_000_000;
 const TERMINAL_DRAIN_TIMEOUT_NS: u64 = 4_000_000_000;
 const NANOS_PER_MILLI: u64 = 1_000_000;
 const FATAL_ATTACH_BASE: u32 = 0x0000_0100;
+/// The application status consoled exits with when its child ended the
+/// session.
+///
+/// F3A.7g. Zero, deliberately: consoled did what it was for and stopped
+/// because there was nothing left to supervise, which is a normal exit and
+/// not a supervision failure. `FAILURE_BASE` covers every other way out of
+/// `run`, so nothing else in this process can produce this status.
+const SESSION_ENDED: u32 = 0;
 
 /// DUPLICATE stays local. The retained endpoint has final child-Channel rights;
 /// the peer keeps TRANSFER through init until the loader's final child MOVE.
@@ -151,6 +160,14 @@ struct ChildSession {
     job_id: u64,
     event: EventGeneration,
     wait: Option<LaunchReservation>,
+    /// F3A.7g. Whether this child's terminal result carried
+    /// `SHELL_SESSION_SHUTDOWN_STATUS`. It is written exactly where the
+    /// result is received and read exactly once, by the terminal recovery
+    /// that would otherwise relaunch the shell at the next generation.
+    ///
+    /// A fresh `ChildSession` is always `false`, so the fact cannot outlive
+    /// the generation that reported it.
+    session_shutdown: bool,
     stdin: NativeOutput,
     stdout: NativeInput,
     stderr: NativeInput,
@@ -166,7 +183,18 @@ struct StatusChannel {
 enum LaunchReply {
     LaunchAccepted(u64),
     TerminationAccepted(u64),
-    JobResult(u64),
+    /// A terminal job result.
+    ///
+    /// `session_shutdown` is the only thing consoled reads out of the result
+    /// body: the child exited with `SHELL_SESSION_SHUTDOWN_STATUS`, which
+    /// says it was asked to end the *session* and not merely to end itself.
+    /// The classification, exception and cleanup fields belong to the shell's
+    /// own `job result` line, for jobs the shell launched; consoled supervises
+    /// one child and has no reader for them.
+    JobResult {
+        job_id: u64,
+        session_shutdown: bool,
+    },
     Cancelled(u64),
     Closed(u64),
     Error(LaunchErrorCode),
@@ -183,6 +211,23 @@ enum ChildFault {
 enum ChildWaitResolution {
     Cancelled,
     Terminal,
+}
+
+/// What a cleanly terminated child leaves behind.
+///
+/// F3A.7g. Terminal recovery used to have one outcome -- replace the child --
+/// because a shell that ended was always a shell to relaunch. Row 12 of
+/// `DW1F_WYR1F_F3A_VM_REQUEST.md` §5 still wants exactly that. Row 13 does
+/// not: `\x04` ends the session, and the difference reaches consoled as the
+/// child's own application status, so it is read where the status is read and
+/// named here rather than inferred from anything the child printed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalOutcome {
+    /// The next generation is running and holds the console.
+    Replaced,
+    /// The child asked for the session to end. Nothing replaced it, and the
+    /// child's streams, status channel and job are already released.
+    SessionEnded,
 }
 
 enum LaunchChildOutcome {
@@ -418,6 +463,22 @@ fn run(startup: StartupBlock<'_>) -> Result<u32, u32> {
         &mut serial,
         &mut child,
     );
+    // F3A.7g. A session that ended releases the same things a failed event
+    // loop does, in the same order, minus the child: terminal recovery
+    // already closed its streams, its status channel and its job before it
+    // declined to replace it, and closing a released handle would report a
+    // cleanup failure over a clean shutdown.
+    if result == Ok(SESSION_ENDED) {
+        let serial_closed = close_serial_session(&mut serial).is_ok();
+        let watch_retired =
+            retire_publication_watch(authorities, &mut transactions, &mut serial).is_ok();
+        close_authorities(authorities);
+        return if serial_closed && watch_retired {
+            Ok(SESSION_ENDED)
+        } else {
+            Err(FATAL_ATTACH_BASE | 105)
+        };
+    }
     if let Err(error) = result {
         // Event-loop failures still own the exact serial generation. Release
         // raw and witness first, then its watch and child stream custody.
@@ -1181,6 +1242,7 @@ fn launch_child_once(
         job_id,
         event,
         wait: Some(wait),
+        session_shutdown: false,
         stdin: NativeOutput::new(endpoints.0),
         stdout: NativeInput::new(endpoints.1),
         stderr: NativeInput::new(endpoints.2),
@@ -1558,7 +1620,7 @@ fn event_loop(
                     &mut child,
                     &mut output_pending,
                 )?;
-                recover_terminal_child(
+                if recover_terminal_child(
                     authorities,
                     transactions,
                     model,
@@ -1566,14 +1628,17 @@ fn event_loop(
                     &mut child,
                     &mut input_pending,
                     &mut output_pending,
-                )?;
+                )? == TerminalOutcome::SessionEnded
+                {
+                    return Ok(SESSION_ENDED);
+                }
                 next_data = DataClass::Raw;
                 continue;
             }
             3 => {
                 #[cfg(feature = "wyr1e-wyrmsh")]
                 if signals & DW_SIGNAL_PEER_CLOSED.0 != 0 && child.wait.is_some() {
-                    recover_terminal_precursor(
+                    if recover_terminal_precursor(
                         authorities,
                         transactions,
                         model,
@@ -1582,7 +1647,10 @@ fn event_loop(
                         &mut child,
                         &mut input_pending,
                         &mut output_pending,
-                    )?;
+                    )? == TerminalOutcome::SessionEnded
+                    {
+                        return Ok(SESSION_ENDED);
+                    }
                     next_data = DataClass::Raw;
                     continue;
                 }
@@ -1608,7 +1676,7 @@ fn event_loop(
             4 | 5 => {
                 #[cfg(feature = "wyr1e-wyrmsh")]
                 if child.wait.is_some() {
-                    recover_terminal_precursor(
+                    if recover_terminal_precursor(
                         authorities,
                         transactions,
                         model,
@@ -1617,7 +1685,10 @@ fn event_loop(
                         &mut child,
                         &mut input_pending,
                         &mut output_pending,
-                    )?;
+                    )? == TerminalOutcome::SessionEnded
+                    {
+                        return Ok(SESSION_ENDED);
+                    }
                     next_data = DataClass::Raw;
                     continue;
                 }
@@ -1642,7 +1713,7 @@ fn event_loop(
             6 if child.status.is_some() => {
                 #[cfg(feature = "wyr1e-wyrmsh")]
                 if signals & DW_SIGNAL_PEER_CLOSED.0 != 0 && child.wait.is_some() {
-                    recover_terminal_precursor(
+                    if recover_terminal_precursor(
                         authorities,
                         transactions,
                         model,
@@ -1651,7 +1722,10 @@ fn event_loop(
                         &mut child,
                         &mut input_pending,
                         &mut output_pending,
-                    )?;
+                    )? == TerminalOutcome::SessionEnded
+                    {
+                        return Ok(SESSION_ENDED);
+                    }
                     next_data = DataClass::Raw;
                     continue;
                 }
@@ -1883,10 +1957,12 @@ fn drain_clean_terminal_output(
         .checked_add(TERMINAL_DRAIN_TIMEOUT_NS)
         .ok_or(54u32)?;
     let wait = child.wait.take().ok_or(61u32)?;
-    if receive_launch_before(authorities.launch, wait, deadline)?
-        != LaunchReply::JobResult(child.job_id)
-    {
-        return Err(61);
+    match receive_launch_before(authorities.launch, wait, deadline)? {
+        LaunchReply::JobResult {
+            job_id,
+            session_shutdown,
+        } if job_id == child.job_id => child.session_shutdown = session_shutdown,
+        _ => return Err(61),
     }
     let mut stdout_eof = false;
     let mut stderr_eof = false;
@@ -1993,7 +2069,7 @@ fn recover_terminal_precursor(
     child: &mut ChildSession,
     input_pending: &mut Pending,
     output_pending: &mut Pending,
-) -> Result<(), u32> {
+) -> Result<TerminalOutcome, u32> {
     if !matches!(
         model.child_terminal_precursor(child.event, now_millis()?),
         Ok(RecoveryAction::None)
@@ -2112,12 +2188,16 @@ fn recover_terminal_child(
     child: &mut ChildSession,
     input_pending: &mut Pending,
     output_pending: &mut Pending,
-) -> Result<(), u32> {
+) -> Result<TerminalOutcome, u32> {
     #[cfg(not(feature = "wyr1e-wyrmsh"))]
     {
         let wait = child.wait.take().ok_or(61u32)?;
-        if receive_launch(authorities.launch, wait)? != LaunchReply::JobResult(child.job_id) {
-            return Err(61);
+        match receive_launch(authorities.launch, wait)? {
+            LaunchReply::JobResult {
+                job_id,
+                session_shutdown,
+            } if job_id == child.job_id => child.session_shutdown = session_shutdown,
+            _ => return Err(61),
         }
     }
     if !matches!(model.child_terminal(child.event, now_millis()?), Ok(RecoveryAction::ReapChild(job)) if job == child.job_id)
@@ -2135,8 +2215,17 @@ fn recover_terminal_child(
     }
     match close_reaped_job(authorities, transactions, model, child.event, child.job_id)? {
         RecoveryAction::ReplaceChild => {
+            // F3A.7g. The reap is identical either way -- the streams, the
+            // status channel and the job are released above before anything
+            // here looks at why the child stopped -- so a session that ends
+            // leaves no more behind than one that restarts. The only thing
+            // withheld is the replacement.
+            if child.session_shutdown {
+                return Ok(TerminalOutcome::SessionEnded);
+            }
             *child = launch_child(authorities, transactions, model, serial)?;
-            observe_exact_ready_without_serial(model, child, 65)
+            observe_exact_ready_without_serial(model, child, 65)?;
+            Ok(TerminalOutcome::Replaced)
         }
         RecoveryAction::Escalate => Err(66),
         _ => Err(67),
@@ -2286,7 +2375,7 @@ fn cleanup_job(
         _ => return Err(73),
     }
     let waited = job_request(authorities, transactions, LaunchMessageType::Wait, job_id)?;
-    if !matches!(waited, LaunchReply::JobResult(response) if response == job_id) {
+    if !matches!(waited, LaunchReply::JobResult { job_id: response, .. } if response == job_id) {
         return Err(75);
     }
     if !matches!(model.child_terminated(event, now_millis()?), Ok(RecoveryAction::ReapChild(job)) if job == job_id)
@@ -2357,7 +2446,7 @@ fn cleanup_unmodeled_job(
         return Err(78);
     }
     let waited = job_request(authorities, transactions, LaunchMessageType::Wait, job_id)?;
-    if !matches!(waited, LaunchReply::JobResult(response) if response == job_id) {
+    if !matches!(waited, LaunchReply::JobResult { job_id: response, .. } if response == job_id) {
         return Err(79);
     }
     let closed = job_request(
@@ -2414,7 +2503,9 @@ fn cancel_child_wait(
     let mut received = 0;
     while received < 2 {
         let (reservation, reply) = receive_launch_any(authorities.launch)?;
-        if reservation == target && reply == LaunchReply::JobResult(child.job_id) {
+        if reservation == target
+            && matches!(reply, LaunchReply::JobResult { job_id, .. } if job_id == child.job_id)
+        {
             terminal = true;
             received += 1;
             continue;
@@ -2661,7 +2752,11 @@ fn receive_launch_ready(channel: DwHandle) -> Result<(LaunchReservation, LaunchR
     let reply = match parsed.message {
         LaunchMessage::LaunchAccepted { job_id } => LaunchReply::LaunchAccepted(job_id),
         LaunchMessage::TerminationAccepted { job_id } => LaunchReply::TerminationAccepted(job_id),
-        LaunchMessage::JobResult { job_id, .. } => LaunchReply::JobResult(job_id),
+        LaunchMessage::JobResult { job_id, result } => LaunchReply::JobResult {
+            job_id,
+            session_shutdown: result.classification == TerminationClassification::NormalExit
+                && result.application_code == SHELL_SESSION_SHUTDOWN_STATUS,
+        },
         LaunchMessage::Cancelled {
             target_transaction_id,
         } => LaunchReply::Cancelled(target_transaction_id),

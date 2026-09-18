@@ -84,9 +84,12 @@ fn clean_terminal_result_drains_child_output_before_reap_and_relaunch() {
     assert!(drain < recover);
 
     let drain_body = item(NATIVE, "fn drain_clean_terminal_output(");
-    let job_result = drain_body
-        .find("LaunchReply::JobResult(child.job_id)")
-        .unwrap();
+    // F3A.7g. The reply is matched rather than compared, because the drain is
+    // also where the child's session-shutdown status is read off it. What this
+    // test is about is unchanged: the result is awaited before any output is
+    // drained.
+    let job_result = drain_body.find("LaunchReply::JobResult {").unwrap();
+    assert!(drain_body.contains("child.session_shutdown = session_shutdown"));
     let deadline = drain_body.find("TERMINAL_DRAIN_TIMEOUT_NS").unwrap();
     let stdout = drain_body.find("child.stdout.endpoint().handle()").unwrap();
     let stderr = drain_body.find("child.stderr.endpoint().handle()").unwrap();
@@ -108,6 +111,9 @@ fn clean_terminal_result_drains_child_output_before_reap_and_relaunch() {
     assert!(recover_body.contains("model.child_terminal"));
     assert!(recover_body.contains("close_reaped_job"));
     assert!(recover_body.contains("*child = launch_child"));
+    // F3A.7g. The relaunch is now conditional, and the condition is the whole
+    // difference between row 12 and row 13.
+    assert!(recover_body.contains("if child.session_shutdown {"));
 }
 
 #[test]

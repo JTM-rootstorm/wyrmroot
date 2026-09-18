@@ -162,6 +162,21 @@ pub(crate) struct ShellControllerState {
     /// expiry. What was selector-specific was never the property, only the one
     /// caller that asks for it.
     recovery_deadline: Option<u64>,
+    /// Whether a console child ended the interactive session.
+    ///
+    /// F3A.7g. `wyrmsh` exits with
+    /// `wyrmroot_launch_proto::SHELL_SESSION_SHUTDOWN_STATUS` when it was
+    /// asked to end the session rather than merely to end itself, and this is
+    /// where that status stops being a number on a wire. It is latched at the
+    /// WAIT reply -- the one place init has the child's terminal result in
+    /// hand -- and read at the console process exit that follows, which is
+    /// otherwise indistinguishable from a console that crashed and has to be
+    /// relaunched.
+    ///
+    /// Set once and never cleared. A session that ended cannot be un-ended by
+    /// a later generation, and there is no later generation: nothing replaces
+    /// the console after this.
+    session_shutdown: bool,
     #[cfg(feature = "wyr1e-selector33")]
     evidence: crate::wyr1e7_evidence::Observer,
     #[cfg(feature = "wyr1e8-selector33")]
@@ -200,6 +215,7 @@ impl ShellControllerState {
             last_status_generation: 0,
             last_child_generation: 0,
             recovery_deadline: None,
+            session_shutdown: false,
             #[cfg(feature = "wyr1e-selector33")]
             evidence: crate::wyr1e7_evidence::Observer::new()?,
             #[cfg(feature = "wyr1e8-selector33")]
@@ -213,6 +229,20 @@ impl ShellControllerState {
             #[cfg(feature = "wyr1f-closure")]
             wyr1f_shell_ready: false,
         })
+    }
+
+    /// Latches a console child's request to end the session.
+    ///
+    /// The caller has already established that the terminal result belongs to
+    /// a `ConsoleLauncher` session and carries the shutdown status; this only
+    /// remembers it.
+    pub(crate) const fn observe_session_shutdown(&mut self) {
+        self.session_shutdown = true;
+    }
+
+    #[must_use]
+    pub(crate) const fn session_shutdown(&self) -> bool {
+        self.session_shutdown
     }
 
     /// Records that a `system/wyrmsh` generation reached READY.
@@ -1381,6 +1411,7 @@ fn initialize_resident_in_place<'a>(
         result: RecoveryResult::Degraded,
         active: [None; EARLY_ROLE_COUNT],
         evidence_finalized: false,
+        session_complete: false,
         last_tick_ns: 0,
         wyr1b: Some(ResidentState {
             registry_control: DwHandle(0),
@@ -4535,6 +4566,7 @@ where
                     }
                     let terminal =
                         controller_result_to_wire(controller).map_err(|_| JobError::WrongState)?;
+                    observe_session_shutdown_result(scope, evidence.as_deref_mut(), terminal);
                     encode_job_result(reservation, job_id, terminal, &mut response)
                         .map(Some)
                         .map_err(|_| JobError::WrongState)
@@ -6315,6 +6347,34 @@ where
     Ok(outcome)
 }
 
+/// Latches a console child's session shutdown, at either WAIT reply.
+///
+/// F3A.7g. Both replies encode the same terminal result and both are reached
+/// for the same child, so the fact is read once, here, rather than at two
+/// sites that could drift apart.
+///
+/// The scope is what makes this specific. A `ConsoleLauncher` session belongs
+/// to `consoled`, which launches exactly one child -- its shell -- so any
+/// terminal result crossing it is that shell's. A `ShellJobs` session belongs
+/// to the shell itself, and the jobs *it* launches are ordinary user programs
+/// whose exit codes it prints; one of those happening to exit with the same
+/// value must not end the session.
+fn observe_session_shutdown_result(
+    scope: LaunchSessionScope,
+    state: Option<&mut ShellControllerState>,
+    terminal: wyrmroot_launch_proto::TerminationResult,
+) {
+    if scope != LaunchSessionScope::ConsoleLauncher
+        || terminal.classification != wyrmroot_launch_proto::TerminationClassification::NormalExit
+        || terminal.application_code != wyrmroot_launch_proto::SHELL_SESSION_SHUTDOWN_STATUS
+    {
+        return;
+    }
+    if let Some(state) = state {
+        state.observe_session_shutdown();
+    }
+}
+
 fn service_pending_wait<S, W>(
     system: &mut S,
     waits: &mut W,
@@ -6374,6 +6434,7 @@ where
         }
     }
     let terminal = controller_result_to_wire(result)?;
+    observe_session_shutdown_result(scope, evidence.as_deref_mut(), terminal);
     let mut response = [0_u8; 88];
     let size = encode_job_result(pending.reservation, pending.job_id, terminal, &mut response)
         .map_err(|_| InitError::Accounting)?;
@@ -7520,6 +7581,72 @@ mod consoled_stream_transfer;
 
 #[cfg(test)]
 mod tests {
+
+    /// F3A.7g. The latch is what turns a shell's exit status into the end of
+    /// a session, so each of the three things it insists on is checked
+    /// against the case it excludes, not merely against the case it admits.
+    #[test]
+    fn only_a_console_child_exiting_normally_with_the_shutdown_status_ends_the_session() {
+        use wyrmroot_launch_proto::{TerminationClassification, TerminationResult};
+
+        const SHUTDOWN: u32 = 0x5344_0001;
+
+        // The literal, not the constant under test: the shell writes this
+        // value from its own side of the wire, and a test written in terms of
+        // `SHELL_SESSION_SHUTDOWN_STATUS` would follow the constant if it
+        // moved and leave the two halves silently disagreeing.
+        assert_eq!(
+            wyrmroot_launch_proto::SHELL_SESSION_SHUTDOWN_STATUS,
+            SHUTDOWN
+        );
+
+        let result = |classification, application_code| TerminationResult {
+            classification,
+            application_code,
+            exception_class: 0,
+            exception_detail: 0,
+            exception_address: 0,
+            cleanup_result: 0,
+        };
+        let latched = |scope, terminal| {
+            let mut state = ShellControllerState::new(7).unwrap();
+            observe_session_shutdown_result(scope, Some(&mut state), terminal);
+            state.session_shutdown()
+        };
+
+        let shutdown = result(TerminationClassification::NormalExit, SHUTDOWN);
+        assert!(latched(LaunchSessionScope::ConsoleLauncher, shutdown));
+
+        // A shell's own job exiting with the same number is a user program's
+        // exit code, which the shell prints. It is not a request to end the
+        // session, and no session it could end is on that channel.
+        assert!(!latched(LaunchSessionScope::ShellJobs, shutdown));
+        assert!(!latched(LaunchSessionScope::Historical, shutdown));
+
+        // `application_code` is only the application's own word when the
+        // application exited normally. Every other classification carries
+        // whatever the kernel left in the field.
+        for classification in [
+            TerminationClassification::Authorized,
+            TerminationClassification::UnhandledException,
+            TerminationClassification::ResourcePolicy,
+            TerminationClassification::TaskGroupTeardown,
+        ] {
+            assert!(!latched(
+                LaunchSessionScope::ConsoleLauncher,
+                result(classification, SHUTDOWN)
+            ));
+        }
+
+        // Neighbouring codes, including the ordinary clean exit that row 12's
+        // `exit` produces, leave the session running.
+        for code in [0, 1, SHUTDOWN - 1, SHUTDOWN + 1, 0x5344_0000] {
+            assert!(!latched(
+                LaunchSessionScope::ConsoleLauncher,
+                result(TerminationClassification::NormalExit, code)
+            ));
+        }
+    }
 
     /// F3A.6n. `ErrorCode::Capacity` was unreachable from the case it names,
     /// and `loader-failure` was the answer to a full machine.
@@ -8810,6 +8937,7 @@ mod tests {
             result: RecoveryResult::Recovered,
             active: [None; EARLY_ROLE_COUNT],
             evidence_finalized: false,
+            session_complete: false,
             last_tick_ns: 0,
             wyr1b: None,
             wyr1b_evidence: Some(evidence),

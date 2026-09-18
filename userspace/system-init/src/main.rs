@@ -361,6 +361,20 @@ fn continue_resident(
             }
             evidence_submitted = true;
         }
+        // F3A.7g. The one way out of this loop that is not a failure.
+        //
+        // It is placed after every per-product drain above rather than beside
+        // the tick that sets it: an instrumented product still owes its
+        // evidence records, and a session that ended is not a reason to throw
+        // them away. Production compiles none of those blocks and reaches
+        // here directly.
+        //
+        // Returning ends permanent init's process, which is what leaves the
+        // system with nothing runnable -- the condition the kernel's
+        // primordial completion is waiting on.
+        if resident.session_complete() {
+            return 0;
+        }
         if InitPlatform::wait_until(system, deadline).is_err() {
             return 0xAF01_0005;
         }

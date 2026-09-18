@@ -1814,6 +1814,55 @@ const fn other(source: OutputSource) -> OutputSource {
 mod tests {
     use super::*;
 
+    /// The supervision half of F3A.7g, which no host test can reach.
+    ///
+    /// `consoled`'s event loop lives in `main.rs`, which is unconditionally
+    /// `#![no_std]` with its own `#[panic_handler]`, so there is no host
+    /// build of it to run -- `wyr1f-native` type-checks it for the guest
+    /// target and that is all. The property that matters is a decision inside
+    /// one function, so it is read out of the source here rather than left
+    /// unstated.
+    ///
+    /// Written against positions rather than presence: a guard that is
+    /// deleted, moved after the relaunch, or joined by a second relaunch all
+    /// fail. A substring test for `session_shutdown` alone would survive all
+    /// three.
+    #[test]
+    fn terminal_recovery_checks_for_a_session_shutdown_before_it_relaunches() {
+        const MAIN: &str = include_str!("main.rs");
+        const SIGNATURE: &str = "fn recover_terminal_child(";
+
+        let start = MAIN
+            .find(SIGNATURE)
+            .expect("recover_terminal_child is gone");
+        let body = &MAIN[start + SIGNATURE.len()..];
+        let end = body
+            .find("\nfn ")
+            .expect("recover_terminal_child never ends");
+        let body = &body[..end];
+
+        let guard = body
+            .find("if child.session_shutdown {")
+            .expect("terminal recovery no longer asks whether the session ended");
+        let ended = body
+            .find("return Ok(TerminalOutcome::SessionEnded);")
+            .expect("the shutdown guard no longer ends the session");
+        let relaunch = body
+            .find("*child = launch_child(")
+            .expect("terminal recovery no longer relaunches at all");
+
+        assert!(
+            guard < ended && ended < relaunch,
+            "the session-shutdown guard must decide before the relaunch: \
+             guard {guard}, end {ended}, relaunch {relaunch}"
+        );
+        assert_eq!(
+            body.matches("launch_child(").count(),
+            1,
+            "a second relaunch in this function would bypass the guard"
+        );
+    }
+
     #[test]
     fn direct_release_witness_is_message_free_and_raw_closes_first() {
         assert_eq!(
