@@ -3716,9 +3716,9 @@ where
         let outcome = wyr1f_closure_trigger(resident, outcome);
         // F3A.7g. Handled before the recovery dispatch below, and outside the
         // bootfs mapping it opens: every other non-`Stable` outcome rebuilds
-        // something out of the archive, and this one builds nothing. The
-        // console is already retired; all that is left is to say so.
+        // something out of the archive, and this one builds nothing.
         if outcome == wyr1e::PollOutcome::SessionComplete {
+            retire_for_session_shutdown(resident, system, waits)?;
             resident.observe_session_complete();
             return Ok(resident.controller.mode());
         }
@@ -3795,6 +3795,102 @@ where
         }
     }
     Ok(resident.controller.mode())
+}
+
+/// Retires every role this supervisor still owns, because the session ended.
+///
+/// F3A.7g. The first run of the supervisor half reached row 13, did not
+/// relaunch anything, and then sat there: the domain never powered off and
+/// the kernel emitted no completion record, because permanent init leaving
+/// its loop is not the same thing as the system being finished. registryd,
+/// devmgr and uart16550d were still running, and the kernel's terminal path
+/// is reached when nothing remains, not when the supervisor stops looking.
+///
+/// So this is a shutdown and not a recovery, and the difference matters in
+/// two places. It asks the controller for nothing -- no `terminal`, no
+/// `fail`, no attempt accounting -- because none of these roles failed and a
+/// supervision verdict about a role that is being switched off is a lie.
+/// And it does not stop at the first failure: a role that will not die is a
+/// reason to report, not a reason to leave the rest running.
+///
+/// Reverse dependency order, which is the order they were brought up in
+/// reversed: the driver answers to devmgr, devmgr answers to the registry,
+/// and the registry answers to nobody. A role outliving something it depends
+/// on is the state every recovery path here exists to avoid, and a shutdown
+/// has no more right to create it than a restart does.
+#[cfg(feature = "wyr1e-production")]
+fn retire_for_session_shutdown<S, W>(
+    resident: &mut ResidentSystemInit,
+    system: &mut S,
+    waits: &mut W,
+) -> Result<(), InitError>
+where
+    S: Wyr1BPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let mut failed = wyr1e::drain_jobs_for_shutdown(resident, system, waits).is_err();
+    if let Some(state) = resident.wyr1c.as_mut() {
+        if let Some(driver) = state.driver.take() {
+            failed |=
+                retire_role_for_shutdown(system, waits, driver.loaded, driver.task_group, None)
+                    .is_err();
+        }
+        if let Some(devmgr) = state.devmgr.take() {
+            failed |=
+                retire_role_for_shutdown(system, waits, devmgr.loaded, devmgr.task_group, None)
+                    .is_err();
+        }
+        if let Some(registry) = state.registry.take() {
+            failed |= retire_role_for_shutdown(
+                system,
+                waits,
+                registry.active.loaded,
+                registry.active.task_group,
+                Some(registry.control_channel),
+            )
+            .is_err();
+        }
+        state.binding = None;
+    }
+    // Anything still in the early-role table. A production boot moves its
+    // roles into the resident state above and leaves these empty, so this is
+    // the arm that must not be assumed away rather than the one that runs.
+    for index in 0..resident.active.len() {
+        let Some(active) = resident.active[index].take() else {
+            continue;
+        };
+        failed |= retire_role_for_shutdown(system, waits, active.loaded, active.task_group, None)
+            .is_err();
+    }
+    if failed {
+        Err(InitError::Cleanup)
+    } else {
+        Ok(())
+    }
+}
+
+/// One role, switched off. The channel is closed first so the role observes a
+/// peer close rather than only a termination, which is the ordinary way it
+/// learns its supervisor is gone.
+#[cfg(feature = "wyr1e-production")]
+fn retire_role_for_shutdown<S, W>(
+    system: &mut S,
+    waits: &mut W,
+    loaded: crate::LoadedProcess,
+    task_group: DwHandle,
+    control_channel: Option<DwHandle>,
+) -> Result<(), InitError>
+where
+    S: Wyr1BPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let channel_failed =
+        control_channel.is_some_and(|channel| system.close_handle(channel).is_err());
+    let cleanup = crate::cleanup_loaded_before(system, waits, loaded, task_group, true, None);
+    if channel_failed {
+        return Err(InitError::Cleanup);
+    }
+    cleanup
 }
 
 /// Delivers the one declared final-closure trigger, and closes the episode

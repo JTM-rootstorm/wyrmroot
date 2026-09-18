@@ -6632,7 +6632,7 @@ where
     }
 }
 
-fn drain_job_dispatcher<S, W>(
+pub(crate) fn drain_job_dispatcher<S, W>(
     system: &mut S,
     waits: &mut W,
     jobs: &mut JobDispatcher,

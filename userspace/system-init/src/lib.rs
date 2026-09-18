@@ -3831,15 +3831,35 @@ mod native_cleanup_tests {
     fn a_complete_session_is_recorded_and_never_treated_as_a_recovery() {
         const TICK: &str = include_str!("wyr1c_native.rs");
 
+        const CHECK: &str = "if outcome == wyr1e::PollOutcome::SessionComplete {";
+
         let handled = TICK
-            .find("if outcome == wyr1e::PollOutcome::SessionComplete {")
+            .find(CHECK)
             .expect("the tick no longer recognises a completed session");
-        let recorded = TICK[handled..]
+        let after = &TICK[handled + CHECK.len()..];
+        let close = after
+            .find("\n        }\n")
+            .expect("the completed-session check never closes");
+        let body = &after[..close];
+
+        let retired = body
+            .find("retire_for_session_shutdown(resident, system, waits)?;")
+            .expect("a completed session is recognised but nothing is retired");
+        let recorded = body
             .find("resident.observe_session_complete();")
             .expect("a completed session is recognised but not recorded");
+        // Retiring first is the whole point. Recording completion and then
+        // failing the teardown would report a finished system while its roles
+        // were still running, which is the state the first F3A.7g run left
+        // behind and could not explain.
         assert!(
-            recorded < 128,
-            "recording must be the body of the check: {recorded} bytes after it"
+            retired < recorded,
+            "the roles must be retired before completion is recorded: \
+             retire {retired}, record {recorded}"
+        );
+        assert!(
+            body[recorded..].contains("return Ok(resident.controller.mode());"),
+            "a recorded completion must leave the tick"
         );
 
         // The recovery dispatch maps every other outcome onto something to

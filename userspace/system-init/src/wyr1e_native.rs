@@ -1327,6 +1327,41 @@ where
     result
 }
 
+/// Releases what the job dispatcher still holds, for a session that ended.
+///
+/// F3A.7g. The console product is already retired by the time this runs --
+/// `handle_console_process_exit` did it, because a console that ended the
+/// session is released exactly like one that crashed -- so what is left here
+/// is whatever the dispatcher itself still owns: sessions nothing reconnects
+/// to, and jobs whose owner is gone. `drain_job_dispatcher` is the same drain
+/// a fatal tick uses; the difference is only that nothing follows it.
+#[cfg(feature = "wyr1e-production")]
+pub(super) fn drain_jobs_for_shutdown<S, W>(
+    resident: &mut ResidentSystemInit,
+    system: &mut S,
+    waits: &mut W,
+) -> Result<(), InitError>
+where
+    S: Wyr1BPlatform,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let Some(state) = resident.wyr1c.as_mut() else {
+        return Ok(());
+    };
+    let Some(e6) = state.e6.as_mut() else {
+        return Ok(());
+    };
+    let observer_failed = e6
+        .publication_observer
+        .take()
+        .is_some_and(|observer| system.close_handle(observer.client).is_err());
+    let drained = crate::wyr1b_native::drain_job_dispatcher(system, waits, &mut e6.jobs);
+    if observer_failed {
+        return Err(InitError::Cleanup);
+    }
+    drained
+}
+
 pub(super) fn retire_dependents<S, W>(
     resident: &mut ResidentSystemInit,
     system: &mut S,
