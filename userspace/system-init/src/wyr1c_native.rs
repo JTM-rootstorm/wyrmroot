@@ -570,6 +570,21 @@ where
         (config, evidence)
     };
     validate_device_identity(device_manifest, uart_identity)?;
+    // F3A.7k. The instrumented init's declared scenario and evidence nonce
+    // live in the retained gate config (closure contract §5.4). Read here,
+    // before the episode is built from it, and refused rather than skipped if
+    // it does not parse: an instrumented boot with no gate would run as the
+    // normal product while claiming to be the degraded one.
+    #[cfg(feature = "wyr1f-closure")]
+    let manifest = {
+        let mut manifest = manifest;
+        let entry = archive
+            .lookup(crate::gate::GATE_CONFIG_PATH.as_bytes())
+            .map_err(map_lookup)?;
+        let gate = crate::gate::parse_gate_config(entry.data()).map_err(InitError::GateConfig)?;
+        manifest.install_wyr1f_gate(gate)?;
+        manifest
+    };
     #[cfg(feature = "wyr1f-closure")]
     let wyr1f = crate::wyr1f_closure::ClosureEpisode::new(manifest.gate_config());
     let resident = slot.write(ResidentSystemInit {
@@ -4550,7 +4565,7 @@ where
         scenario: GateScenario::DegradedRecovery,
         nonce: 0x00ff,
     };
-    resident.controller.install_wyr1f_gate_for_fixture(gate)?;
+    resident.controller.install_wyr1f_gate(gate)?;
     resident.wyr1f = crate::wyr1f_closure::ClosureEpisode::new(Some(gate));
 
     // Deliver the trigger `deliveries` times. A second episode, a re-armed

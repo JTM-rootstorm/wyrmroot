@@ -463,6 +463,33 @@ mod tests {
         );
     }
 
+    /// F3A.7k. The product installs the retained gate before building the
+    /// episode from it. Before this, only the fixture did, so every real
+    /// instrumented boot ran an inert episode with no evidence log.
+    #[test]
+    fn the_product_installs_the_retained_gate_before_the_episode_reads_it() {
+        let squeeze = |text: &str| -> std::string::String {
+            text.chars().filter(|c| !c.is_whitespace()).collect()
+        };
+        let native = squeeze(include_str!("wyr1c_native.rs"));
+        let start = native
+            .find("pub(crate)fnactivate_in_place<")
+            .expect("the resident activation moved");
+        let body = &native[start..];
+        let lookup = body
+            .find(".lookup(crate::gate::GATE_CONFIG_PATH.as_bytes())")
+            .expect("the product no longer reads the retained gate");
+        let install = body
+            .find("manifest.install_wyr1f_gate(gate)?;")
+            .expect("the product no longer installs the retained gate");
+        let episode = body
+            .find("crate::wyr1f_closure::ClosureEpisode::new(manifest.gate_config())")
+            .expect("the episode is no longer built from the controller's gate");
+        assert!(lookup < install && install < episode);
+        let parse = &body[lookup..install];
+        assert!(parse.contains("parse_gate_config(entry.data()).map_err(InitError::GateConfig)?"));
+    }
+
     fn drain(evidence: &mut BringupEvidence) -> std::vec::Vec<(crate::RoleId, u64, u64)> {
         let mut out = std::vec::Vec::new();
         while let Some(due) = evidence.next_due() {

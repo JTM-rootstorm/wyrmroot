@@ -1938,13 +1938,17 @@ impl SystemInit {
     }
 
     /// Installs the declared gate configuration and its evidence log on an
-    /// already-built controller, for the closure fixture only. The product
-    /// reads both from retained bootfs in `validate_retained_bootfs`.
-    #[cfg(all(test, feature = "wyr1f-closure"))]
-    pub(crate) fn install_wyr1f_gate_for_fixture(
-        &mut self,
-        gate: GateConfig,
-    ) -> Result<(), InitError> {
+    /// already-built controller.
+    ///
+    /// F3A.7k: until now only the closure fixture called this. The resident
+    /// product builds its controller through `from_wyr1e_manifest`, which
+    /// leaves both empty, and nothing on that path read the retained gate
+    /// config: the declared degraded episode was inert in every real
+    /// instrumented boot, and the supervisor had no evidence log to emit.
+    /// `wyr1c_native::activate_in_place` now calls it for the instrumented
+    /// init; the production init compiles none of this.
+    #[cfg(feature = "wyr1f-closure")]
+    pub(crate) fn install_wyr1f_gate(&mut self, gate: GateConfig) -> Result<(), InitError> {
         self.gate = Some(gate);
         self.evidence =
             Some(EvidenceLog::new(gate.nonce, gate.scenario).map_err(InitError::Evidence)?);
