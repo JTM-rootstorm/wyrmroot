@@ -1617,8 +1617,8 @@ fn result_schema(product_kind: wyr1c::Wyr1fProduct) -> Result<String, Failure> {
 /// and `roles_ready_count` were in every product's grammar, including the
 /// production product, whose kernel writes COM1 only from
 /// `emit_early_panic_record` and therefore emits no READY record at all; they
-/// moved to the two instrumented products, and production gained `com1_empty`,
-/// which is the assertion its silent COM1 can actually make. The three
+/// moved to the two instrumented products, and production gained `com1_empty`.
+/// That premise was false too; F3A.7j replaced it with `com1_powered_off`. The three
 /// `cpu_hog_*` keys stayed where they were, and the payload that fills them was
 /// added to the product instead.
 fn result_keys(product_kind: wyr1c::Wyr1fProduct) -> Vec<String> {
@@ -1714,10 +1714,12 @@ fn result_keys(product_kind: wyr1c::Wyr1fProduct) -> Vec<String> {
             "evidence_sha256",
         ]);
     } else {
-        // The production product's COM1 is silent on a clean boot, so its
-        // emptiness is the signal: any byte on that line is an early panic
-        // record, which is the only thing the production kernel writes there.
-        keys.push("com1_empty");
+        // Production COM1 was never silent -- firmware, the loader and the
+        // kernel's `[DW0][INFO]` records all write it -- so `com1_empty` could
+        // not pass on any real boot. Closure contract item 28, re-derived in
+        // F3A.7j: the production product witnesses that its kernel powered off
+        // after a clean session, read without regard to how much was logged.
+        keys.push("com1_powered_off");
     }
     keys.push("acceptance");
     keys.into_iter().map(str::to_owned).collect()
@@ -2540,18 +2542,17 @@ mod tests {
         assert!(!degraded.iter().any(|k| k == "cpu_hog_jobs"));
 
         // The bring-up proof follows the kernel that can witness it. The
-        // production kernel writes COM1 only from `emit_early_panic_record`,
-        // so a clean boot leaves that line empty and there is no READY record
-        // to order; the assertion the production product makes instead is
-        // that the line stayed empty.
+        // production kernel emits no READY record to order; what its COM1 can
+        // witness instead is the kernel powering off after a clean session.
         for keys in [&instrumented, &degraded] {
             assert!(keys.iter().any(|k| k == "roles_ready_order"));
             assert!(keys.iter().any(|k| k == "roles_ready_count"));
-            assert!(!keys.iter().any(|k| k == "com1_empty"));
+            assert!(!keys.iter().any(|k| k == "com1_powered_off"));
         }
         assert!(!normal.iter().any(|k| k == "roles_ready_order"));
         assert!(!normal.iter().any(|k| k == "roles_ready_count"));
-        assert!(normal.iter().any(|k| k == "com1_empty"));
+        assert!(normal.iter().any(|k| k == "com1_powered_off"));
+        assert!(!normal.iter().any(|k| k == "com1_empty"));
 
         // The production product produces no evidence and gets no field for
         // any; both instrumented siblings produce it and get five.
