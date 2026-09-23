@@ -1324,106 +1324,230 @@ fn stderr_suffix(output: &Output) -> String {
     }
 }
 
-pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<(), Failure> {
-    if matches!(filter, Some("wyr1e8-producer-fixture")) {
-        let arguments = wyr1e8_producer_fixture_command();
-        let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
-        return run_cargo(repository, &arguments);
+/// A guest-target compile gate, run with the accepted native compiler.
+///
+/// Each is minutes of work in a fresh scratch target, which is why none of them
+/// runs in the unfiltered host suite.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeGate {
+    C4,
+    C5,
+    C6,
+    /// `wyr1e3-native` and its three sub-selections, which pass their name on.
+    Wyr1e3,
+    /// `wyr1e4-native` and `wyr1e5-native`, which pass their name on.
+    Wyrmsh,
+    Wyr1e6,
+    Wyr1e7,
+    Wyr1e8,
+    Wyr1e8Actors,
+    Wyr1f,
+    E3b,
+}
+
+impl NativeGate {
+    fn run(self, repository: &Path, filter: &str) -> Result<(), Failure> {
+        match self {
+            // WYR1-C4 is a guest-target compilation gate. The pinned host
+            // compiler intentionally does not know the x86_64-unknown-wyrmroot
+            // built-in target, so this must use the accepted immutable product
+            // compiler.
+            Self::C4 => crate::wyr1c::run_c4_native_checks(repository),
+            Self::C5 => crate::wyr1c::run_c5_native_checks(repository),
+            Self::C6 => crate::wyr1c::run_c6_native_checks(repository),
+            Self::Wyr1e3 => crate::wyr1c::run_wyr1e3_native_checks(repository, filter),
+            Self::Wyrmsh => crate::wyr1c::run_wyrmsh_native_checks(repository, filter),
+            Self::Wyr1e6 => crate::wyr1c::run_wyr1e6_native_checks(repository),
+            Self::Wyr1e7 => crate::wyr1c::run_wyr1e7_native_checks(repository),
+            Self::Wyr1e8 => crate::wyr1c::run_wyr1e8_native_checks(repository),
+            Self::Wyr1e8Actors => crate::wyr1c::run_wyr1e8_actor_native_checks(repository),
+            Self::Wyr1f => crate::wyr1c::run_wyr1f_native_checks(repository),
+            Self::E3b => crate::wyr1c::run_e3b_native_checks(repository),
+        }
     }
-    if matches!(filter, Some("wyr1d5-clippy")) {
+}
+
+/// What a named host filter runs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Route {
+    /// Host Cargo commands, from [`named_host_runs`].
+    Host,
+    /// A guest-target compile gate.
+    Native(NativeGate),
+}
+
+/// Every named `xtask test host` filter, and what it runs.
+///
+/// Structural refactor S1.1. The dispatcher used to be a chain of `matches!`
+/// arms spread over two functions, so the only list of gate names was the code
+/// itself; a name was reachable exactly when someone typed it. This is now the
+/// one place a named gate exists: `run_host_tests` looks every filter up here
+/// first, and anything not listed is a component, `package:` or `test:` filter
+/// over the workspace suite.
+const NAMED_HOST_FILTERS: &[(&str, Route)] = &[
+    ("selectors", Route::Host),
+    ("wyr1e8-producer-fixture", Route::Host),
+    ("wyr1d5-clippy", Route::Host),
+    ("r1-clippy", Route::Host),
+    ("r1-status", Route::Host),
+    ("wyr1e3-model", Route::Host),
+    ("wyr1e3-clippy", Route::Host),
+    ("wyr1e3-controller-model", Route::Host),
+    ("wyr1e3-controller-clippy", Route::Host),
+    ("wyr1e4-model", Route::Host),
+    ("wyr1e4-clippy", Route::Host),
+    ("wyr1e5-model", Route::Host),
+    ("wyr1e5-clippy", Route::Host),
+    ("wyr1e6-model", Route::Host),
+    ("wyr1e6-clippy", Route::Host),
+    ("wyr1e6-controller-model", Route::Host),
+    ("wyr1e6-controller-clippy", Route::Host),
+    ("wyr1e7-model", Route::Host),
+    ("wyr1e7-clippy", Route::Host),
+    ("wyr1e8-model", Route::Host),
+    ("wyr1e8-clippy", Route::Host),
+    ("wyr1e8-product-model", Route::Host),
+    ("wyr1e8-product-clippy", Route::Host),
+    ("wyr1f-model", Route::Host),
+    ("wyr1f-clippy", Route::Host),
+    ("wyr1f-role-clippy", Route::Host),
+    ("wyr1c6-model", Route::Host),
+    ("wyr1c6-clippy", Route::Host),
+    ("dw1c", Route::Host),
+    ("dw1c-init0", Route::Host),
+    ("dw1d6", Route::Host),
+    ("dw1d6-synthetic", Route::Host),
+    ("wyr1c4", Route::Native(NativeGate::C4)),
+    ("wyr1c4-native", Route::Native(NativeGate::C4)),
+    ("wyr1c5", Route::Native(NativeGate::C5)),
+    ("wyr1c5-native", Route::Native(NativeGate::C5)),
+    ("wyr1c6", Route::Native(NativeGate::C6)),
+    ("wyr1c6-native", Route::Native(NativeGate::C6)),
+    ("wyr1e3-native", Route::Native(NativeGate::Wyr1e3)),
+    ("wyr1e3-consoled-native", Route::Native(NativeGate::Wyr1e3)),
+    ("wyr1e3-registry-native", Route::Native(NativeGate::Wyr1e3)),
+    (
+        "wyr1e3-controller-native",
+        Route::Native(NativeGate::Wyr1e3),
+    ),
+    ("wyr1e4-native", Route::Native(NativeGate::Wyrmsh)),
+    ("wyr1e5-native", Route::Native(NativeGate::Wyrmsh)),
+    ("wyr1e6-native", Route::Native(NativeGate::Wyr1e6)),
+    ("wyr1e7-native", Route::Native(NativeGate::Wyr1e7)),
+    ("wyr1e8-native", Route::Native(NativeGate::Wyr1e8)),
+    (
+        "wyr1e8-actors-native",
+        Route::Native(NativeGate::Wyr1e8Actors),
+    ),
+    ("wyr1f-native", Route::Native(NativeGate::Wyr1f)),
+    ("dw1e3b-native", Route::Native(NativeGate::E3b)),
+];
+
+fn named_host_filter(filter: &str) -> Option<Route> {
+    NAMED_HOST_FILTERS
+        .iter()
+        .find(|(name, _)| *name == filter)
+        .map(|(_, route)| *route)
+}
+
+/// One Cargo invocation of a host gate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CargoRun {
+    arguments: Vec<String>,
+    /// Whether the child needs [`SELECTOR_PLACEHOLDER_NONCE`] to compile.
+    selector_nonce: bool,
+}
+
+impl CargoRun {
+    fn plain(arguments: Vec<String>) -> Self {
+        Self {
+            arguments,
+            selector_nonce: false,
+        }
+    }
+
+    fn execute(&self, repository: &Path) -> Result<(), Failure> {
+        let arguments = self
+            .arguments
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        if self.selector_nonce {
+            run_selector_cargo(repository, &arguments)
+        } else {
+            run_cargo(repository, &arguments)
+        }
+    }
+}
+
+/// The Cargo commands a named [`Route::Host`] filter runs, in order.
+fn named_host_runs(filter: &str) -> Result<Vec<CargoRun>, Failure> {
+    Ok(match filter {
+        "selectors" => selector_library_commands()
+            .into_iter()
+            .map(|arguments| CargoRun {
+                arguments,
+                selector_nonce: true,
+            })
+            .collect(),
+        "wyr1e8-producer-fixture" => vec![CargoRun::plain(wyr1e8_producer_fixture_command())],
         // Reset card E8D.4-32. Selector 32's `system-init` was compiled only by
         // the d5 product path, never by a host gate, so R7B-1 could replace its
         // episode deadline with a `super::wyr1e::` call -- a module gated on a
         // feature selector 32 does not select -- and leave the selector
         // unbuildable for a week without any gate noticing. Building the two
         // selector-32 libraries here is what makes that class of break loud.
-        for arguments in selector32_library_commands() {
-            let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
-            run_cargo(repository, &arguments)?;
-        }
-        return Ok(());
-    }
-    if matches!(filter, Some("r1-clippy")) {
+        "wyr1d5-clippy" => selector32_library_commands()
+            .into_iter()
+            .map(CargoRun::plain)
+            .collect(),
         // The ordinary clippy gates lint the default feature set, under which
         // r1_driver does not exist at all: it is compiled only by r1-status,
         // which runs rustc and not clippy. Without this entry the driver is the
         // largest unlinted module in the crate.
-        let arguments = r1_clippy_command();
-        let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
-        return run_cargo(repository, &arguments);
-    }
-    if matches!(filter, Some("r1-status")) {
+        "r1-clippy" => vec![CargoRun::plain(r1_clippy_command())],
         // Selector 34's failure statuses and its scenario driver only exist
         // under its own feature, and the launcher rightly refuses
         // caller-selected features, so the gate has to be named here. It runs
         // the whole library suite under that feature rather than one test
         // module: the driver's own tests are gated the same way, and naming
         // them individually is how a later one would be added and never run.
-        let arguments = r1_status_command();
-        let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
-        return run_cargo(repository, &arguments);
-    }
-    if matches!(filter, Some("wyr1c4" | "wyr1c4-native")) {
-        // WYR1-C4 is a guest-target compilation gate. The pinned host compiler
-        // intentionally does not know the x86_64-unknown-wyrmroot built-in
-        // target, so this must use the accepted immutable product compiler.
-        return crate::wyr1c::run_c4_native_checks(repository);
-    }
-    if matches!(filter, Some("wyr1c5" | "wyr1c5-native")) {
-        return crate::wyr1c::run_c5_native_checks(repository);
-    }
-    if matches!(filter, Some("wyr1c6" | "wyr1c6-native")) {
-        return crate::wyr1c::run_c6_native_checks(repository);
-    }
-    if matches!(
-        filter,
-        Some(
-            "wyr1e3-native"
-                | "wyr1e3-consoled-native"
-                | "wyr1e3-registry-native"
-                | "wyr1e3-controller-native"
-        )
-    ) {
-        return crate::wyr1c::run_wyr1e3_native_checks(repository, filter.unwrap());
-    }
-    if matches!(filter, Some("wyr1e4-native" | "wyr1e5-native")) {
-        return crate::wyr1c::run_wyrmsh_native_checks(repository, filter.unwrap());
-    }
-    if matches!(filter, Some("wyr1e6-native")) {
-        return crate::wyr1c::run_wyr1e6_native_checks(repository);
-    }
-    if matches!(filter, Some("wyr1e7-native")) {
-        return crate::wyr1c::run_wyr1e7_native_checks(repository);
-    }
-    if matches!(filter, Some("wyr1e8-native")) {
-        return crate::wyr1c::run_wyr1e8_native_checks(repository);
-    }
-    if matches!(filter, Some("wyr1f-native")) {
-        return crate::wyr1c::run_wyr1f_native_checks(repository);
-    }
-    if matches!(filter, Some("wyr1e8-actors-native")) {
-        return crate::wyr1c::run_wyr1e8_actor_native_checks(repository);
-    }
-    if matches!(filter, Some("dw1e3b-native")) {
-        return crate::wyr1c::run_e3b_native_checks(repository);
-    }
-    // Unfiltered, so a broken selector cannot wait for someone to type its
-    // gate's name. `selectors` runs the same set alone when that is all the
-    // reader wants.
-    if filter.is_none() || matches!(filter, Some("selectors")) {
-        for arguments in selector_library_commands() {
-            let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
-            run_selector_cargo(repository, &arguments)?;
+        "r1-status" => vec![CargoRun::plain(r1_status_command())],
+        _ => host_test_commands(Some(filter))?
+            .into_iter()
+            .map(CargoRun::plain)
+            .collect(),
+    })
+}
+
+pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<(), Failure> {
+    match filter.map(|name| (name, named_host_filter(name))) {
+        Some((name, Some(Route::Native(gate)))) => gate.run(repository, name),
+        Some((name, Some(Route::Host))) => {
+            for run in named_host_runs(name)? {
+                run.execute(repository)?;
+            }
+            Ok(())
         }
-        if matches!(filter, Some("selectors")) {
-            return Ok(());
+        Some((_, None)) => {
+            for arguments in host_test_commands(filter)? {
+                CargoRun::plain(arguments).execute(repository)?;
+            }
+            Ok(())
+        }
+        // Unfiltered, so a broken selector cannot wait for someone to type its
+        // gate's name. `selectors` runs the same set alone when that is all the
+        // reader wants.
+        None => {
+            for run in named_host_runs("selectors")? {
+                run.execute(repository)?;
+            }
+            for arguments in host_test_commands(None)? {
+                CargoRun::plain(arguments).execute(repository)?;
+            }
+            Ok(())
         }
     }
-    for arguments in host_test_commands(filter)? {
-        let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
-        run_cargo(repository, &arguments)?;
-    }
-    Ok(())
 }
 
 /// Every library configuration a product path builds, as one compile gate.
@@ -2194,14 +2318,16 @@ fn child_status(code: Option<i32>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BOOTFS_BUILD_ARGUMENTS, BOOTFS_PACKAGE, BOOTFS_TEST_ARGUMENTS, DW1C_INIT0_TEST_ARGUMENTS,
-        DW1D6_ACTOR_TEST_ARGUMENTS, DW1D6_BOOTSTRAP_TEST_ARGUMENTS,
+        BOOTFS_BUILD_ARGUMENTS, BOOTFS_PACKAGE, BOOTFS_TEST_ARGUMENTS, CargoRun,
+        DW1C_INIT0_TEST_ARGUMENTS, DW1D6_ACTOR_TEST_ARGUMENTS, DW1D6_BOOTSTRAP_TEST_ARGUMENTS,
         DW1D6_SOURCE_CONTRACT_TEST_ARGUMENTS, INSPECTION_PATH, INSPECTION_SHELL, IsolatedUefiBuild,
-        LoaderLinkMode, UefiCargoProfile, blocked_toolchain_failure, canonical_build_directory,
-        canonical_project_root, component_package, encoded_uefi_rustflags,
-        encoded_uefi_rustflags_for_target, explicit_test_filter, host_test_arguments,
-        host_test_commands, prepare_uefi_target_roots, render_uefi_inspection_report,
-        run_verified_report, validate_regular_artifact, validate_uefi_inspection_report,
+        LoaderLinkMode, NAMED_HOST_FILTERS, Route, SELECTOR_LIBRARIES, UefiCargoProfile,
+        blocked_toolchain_failure, canonical_build_directory, canonical_project_root,
+        component_package, encoded_uefi_rustflags, encoded_uefi_rustflags_for_target,
+        explicit_test_filter, host_test_arguments, host_test_commands, named_host_filter,
+        named_host_runs, prepare_uefi_target_roots, r1_clippy_command, r1_status_command,
+        render_uefi_inspection_report, run_verified_report, selector_library_commands,
+        selector32_library_commands, validate_regular_artifact, validate_uefi_inspection_report,
         wyr1e8_producer_fixture_command,
     };
     use crate::error::Failure;
@@ -2612,6 +2738,76 @@ mod tests {
                 DW1D6_SOURCE_CONTRACT_TEST_ARGUMENTS.to_vec(),
                 DW1D6_ACTOR_TEST_ARGUMENTS.to_vec(),
             ]
+        );
+    }
+
+    /// Every named gate is listed once, and every host-route name is one the
+    /// command builders actually special-case: a listed name that fell through
+    /// to the workspace `test:` substring filter would run nothing it names.
+    #[test]
+    fn every_named_host_filter_is_listed_once_and_routes_to_its_own_gate() {
+        let mut seen = std::collections::BTreeSet::new();
+        for (name, route) in NAMED_HOST_FILTERS {
+            assert!(seen.insert(*name), "{name} is listed twice");
+            assert_eq!(named_host_filter(name), Some(*route));
+            if *route == Route::Host {
+                let runs = named_host_runs(name).unwrap();
+                assert!(!runs.is_empty(), "{name} runs nothing");
+                assert!(
+                    runs.iter().all(|run| !run
+                        .arguments
+                        .iter()
+                        .any(|argument| argument == "--workspace")),
+                    "{name} fell through to the workspace substring filter"
+                );
+            }
+        }
+        for unlisted in ["bootfs", "test:traversal", "traversal", "native-ish"] {
+            assert_eq!(named_host_filter(unlisted), None);
+        }
+        let documented = crate::cli::USAGE
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix("tools/pinned-cargo xtask test host ")
+            })
+            .collect::<Vec<_>>();
+        assert!(!documented.is_empty());
+        for name in documented {
+            assert!(
+                named_host_filter(name).is_some(),
+                "usage documents {name}, which is not a named host filter"
+            );
+        }
+    }
+
+    /// The four gates that used to be matched inside `run_host_tests` keep the
+    /// exact commands they ran there.
+    #[test]
+    fn the_formerly_inline_gates_keep_their_exact_commands() {
+        let runs = |name| named_host_runs(name).unwrap();
+        assert_eq!(
+            runs("wyr1e8-producer-fixture"),
+            [CargoRun::plain(wyr1e8_producer_fixture_command())]
+        );
+        assert_eq!(runs("r1-clippy"), [CargoRun::plain(r1_clippy_command())]);
+        assert_eq!(runs("r1-status"), [CargoRun::plain(r1_status_command())]);
+        assert_eq!(
+            runs("wyr1d5-clippy"),
+            selector32_library_commands()
+                .into_iter()
+                .map(CargoRun::plain)
+                .collect::<Vec<_>>()
+        );
+        let selectors = runs("selectors");
+        assert_eq!(selectors.len(), SELECTOR_LIBRARIES.len());
+        assert!(selectors.iter().all(|run| run.selector_nonce));
+        assert_eq!(
+            selectors
+                .into_iter()
+                .map(|run| run.arguments)
+                .collect::<Vec<_>>(),
+            selector_library_commands()
         );
     }
 
