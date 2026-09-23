@@ -6169,6 +6169,8 @@ where
             Err(NativeError::Status(status)) if status == DW_STATUS_TIMED_OUT => {}
             Err(error) => return Err(InitError::Native(error)),
             Ok(observed) if observed.observed.0 & DW_SIGNAL_READABLE.0 != 0 => {
+                // Read before the dispatch, which may disconnect the session.
+                let scope = jobs.session_scope(grant).map_err(InitError::Wyr1BModel)?;
                 let size = system
                     .query_memory_object_size(authority.bootfs)
                     .map_err(InitError::Native)?;
@@ -6255,7 +6257,19 @@ where
                         },
                         other => other,
                     };
-                    return Err(dispatch_failure(dispatch_error, emergency_cleanup));
+                    // F3A.7j. Named by the session's scope, so a failed
+                    // request says whose it was; `attribute_failure` keeps
+                    // an operation the error already carries.
+                    let operation = match scope {
+                        LaunchSessionScope::Historical => RecoveryOperation::DispatchHistoricalJob,
+                        LaunchSessionScope::ConsoleLauncher => {
+                            RecoveryOperation::DispatchConsoleJob
+                        }
+                        LaunchSessionScope::ShellJobs => RecoveryOperation::DispatchShellJob,
+                    };
+                    let attributed =
+                        attribute_failure(operation, Err::<(), _>(dispatch_error)).unwrap_err();
+                    return Err(dispatch_failure(attributed, emergency_cleanup));
                 }
             }
             Ok(observed) if observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 => {
@@ -9400,7 +9414,7 @@ mod tests {
         assert_eq!(
             error,
             InitError::RecoveryTransition {
-                operation: 0x0f,
+                operation: RecoveryOperation::DispatchHistoricalJob as u8,
                 initiating_kind: 0x02,
                 payload: 0,
                 emergency_cleanup: EmergencyCleanup::Attempted {
@@ -9409,7 +9423,7 @@ mod tests {
                 },
             }
         );
-        assert_tick_status(&error, 0xAF18_0F02);
+        assert_tick_status(&error, 0xAF18_1802);
         assert_eq!(&platform.closed[..platform.close_count], &[DwHandle(90)]);
         assert_eq!(platform.terminate_count, 0);
     }
@@ -9420,7 +9434,7 @@ mod tests {
         assert_eq!(
             error,
             InitError::RecoveryTransition {
-                operation: 0x0f,
+                operation: RecoveryOperation::DispatchHistoricalJob as u8,
                 initiating_kind: 0x02,
                 payload: 0,
                 emergency_cleanup: EmergencyCleanup::Attempted {
@@ -9429,7 +9443,7 @@ mod tests {
                 },
             }
         );
-        assert_tick_status(&error, 0xAF18_0F04);
+        assert_tick_status(&error, 0xAF18_1804);
         assert_eq!(&platform.closed[..platform.close_count], &[DwHandle(90)]);
         assert_eq!(platform.terminate_count, 0);
     }
@@ -9440,7 +9454,7 @@ mod tests {
         assert_eq!(
             error,
             InitError::RecoveryTransition {
-                operation: 0x0f,
+                operation: RecoveryOperation::DispatchHistoricalJob as u8,
                 initiating_kind: 0x02,
                 payload: 0,
                 emergency_cleanup: EmergencyCleanup::Attempted {
@@ -9449,7 +9463,7 @@ mod tests {
                 },
             }
         );
-        assert_tick_status(&error, 0xAF18_0F04);
+        assert_tick_status(&error, 0xAF18_1804);
         assert_eq!(
             &platform.closed[..platform.close_count],
             &[DwHandle(90), DwHandle(102), DwHandle(101), DwHandle(103)]
@@ -9463,7 +9477,7 @@ mod tests {
         assert_eq!(
             error,
             InitError::RecoveryTransition {
-                operation: 0x0f,
+                operation: RecoveryOperation::DispatchHistoricalJob as u8,
                 initiating_kind: 0x02,
                 payload: 0,
                 emergency_cleanup: EmergencyCleanup::Attempted {
@@ -9472,7 +9486,7 @@ mod tests {
                 },
             }
         );
-        assert_tick_status(&error, 0xAF18_0F04);
+        assert_tick_status(&error, 0xAF18_1804);
         assert_eq!(
             &platform.closed[..platform.close_count],
             &[DwHandle(90), DwHandle(102), DwHandle(101), DwHandle(103)]
@@ -9525,7 +9539,7 @@ mod tests {
         assert_eq!(
             result,
             Err(InitError::RecoveryTransition {
-                operation: 0x0f,
+                operation: RecoveryOperation::DispatchHistoricalJob as u8,
                 initiating_kind: 0x04,
                 payload: 0,
                 emergency_cleanup: EmergencyCleanup::Attempted {

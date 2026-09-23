@@ -200,6 +200,14 @@ pub(crate) enum RecoveryOperation {
     ActivateShell = 0x16,
     /// An ordinary resident tick after startup completed.
     ResidentTick = 0x17,
+    /// A job request on a historical launch session. F3A.7j: the dispatcher's
+    /// failures reached COM1 as `0x0f`, so a request that killed permanent
+    /// init could not say whose session it came from.
+    DispatchHistoricalJob = 0x18,
+    /// A job request on the console's launch session.
+    DispatchConsoleJob = 0x19,
+    /// A job request on a shell's own job session.
+    DispatchShellJob = 0x1a,
 }
 
 /// Reported when no operation claimed the failure: the error reached the tick
@@ -5369,6 +5377,9 @@ mod native_cleanup_tests {
             RecoveryOperation::ActivateConsole,
             RecoveryOperation::ActivateShell,
             RecoveryOperation::ResidentTick,
+            RecoveryOperation::DispatchHistoricalJob,
+            RecoveryOperation::DispatchConsoleJob,
+            RecoveryOperation::DispatchShellJob,
         ] {
             assert!(operation as u8 > UNATTRIBUTED_OPERATION);
             let attributed: Result<(), InitError> =
