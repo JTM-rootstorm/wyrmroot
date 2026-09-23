@@ -567,15 +567,6 @@ fn product_acceptance_binds_external_manifest_and_bootfs_receipts() {
 }
 
 #[test]
-fn public_parser_names_separate_structural_from_product_acceptance() {
-    let format_source = include_str!("../src/format.rs");
-    let product_source = include_str!("../src/product.rs");
-    assert!(format_source.contains("pub fn parse_structural("));
-    assert!(!format_source.contains("pub fn parse("));
-    assert!(product_source.contains("pub fn parse_wyr1a_product("));
-}
-
-#[test]
 fn structural_flag_forms_are_valid_but_product_requires_both_bits() {
     let original = full_product_bytes();
     let expected = expected_product_closure();

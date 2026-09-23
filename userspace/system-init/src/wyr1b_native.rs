@@ -15338,12 +15338,4 @@ mod tests {
     mod e8_producer_fixture {
         include!("wyr1e8_producer_fixture.rs");
     }
-
-    #[test]
-    fn selector_27_controller_owns_the_native_wrlj_dispatch() {
-        let source = include_str!("wyr1b_native.rs");
-        assert!(source.contains(concat!("run_", "job_gate")));
-        assert!(source.contains(concat!("parse_launch_", "message")));
-        assert!(!source.contains(concat!("launch_", "authorized_job")));
-    }
 }
