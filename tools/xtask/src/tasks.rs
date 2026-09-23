@@ -1489,6 +1489,8 @@ struct CargoRun {
     arguments: Vec<String>,
     /// Whether the child needs [`SELECTOR_PLACEHOLDER_NONCE`] to compile.
     selector_nonce: bool,
+    /// Whether the run must execute at least one test to pass.
+    require_tests: bool,
 }
 
 impl CargoRun {
@@ -1496,7 +1498,18 @@ impl CargoRun {
         Self {
             arguments,
             selector_nonce: false,
+            require_tests: false,
         }
+    }
+
+    /// Structural refactor S1.2: a gate that names its test must run it.
+    ///
+    /// `cargo test <name>` exits 0 when `<name>` matches nothing, so a gate
+    /// whose test was renamed or gated away would pass without running
+    /// anything -- which is how a named gate goes silently green.
+    fn requiring_named_tests(mut self) -> Self {
+        self.require_tests = names_a_test(&self.arguments);
+        self
     }
 
     fn execute(&self, repository: &Path) -> Result<(), Failure> {
@@ -1507,10 +1520,50 @@ impl CargoRun {
             .collect::<Vec<_>>();
         if self.selector_nonce {
             run_selector_cargo(repository, &arguments)
+        } else if self.require_tests {
+            run_cargo_requiring_tests(repository, &arguments)
         } else {
             run_cargo(repository, &arguments)
         }
     }
+}
+
+/// Whether a `cargo test` command line narrows the run to named tests.
+fn names_a_test(arguments: &[String]) -> bool {
+    const VALUED: [&str; 8] = [
+        "--package",
+        "-p",
+        "--features",
+        "-F",
+        "--test",
+        "--bin",
+        "--example",
+        "--bench",
+    ];
+    if arguments.first().map(String::as_str) != Some("test") {
+        return false;
+    }
+    let mut arguments = arguments[1..]
+        .iter()
+        .take_while(|argument| *argument != "--");
+    while let Some(argument) = arguments.next() {
+        if VALUED.contains(&argument.as_str()) {
+            arguments.next();
+        } else if !argument.starts_with('-') {
+            return true;
+        }
+    }
+    false
+}
+
+/// How many tests a `cargo test` run passed, from libtest's summary lines.
+fn tests_passed(stdout: &str) -> u64 {
+    stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("test result: ok. "))
+        .filter_map(|rest| rest.split_once(" passed"))
+        .filter_map(|(count, _)| count.parse::<u64>().ok())
+        .sum()
 }
 
 /// The Cargo commands a named [`Route::Host`] filter runs, in order.
@@ -1521,9 +1574,12 @@ fn named_host_runs(filter: &str) -> Result<Vec<CargoRun>, Failure> {
             .map(|arguments| CargoRun {
                 arguments,
                 selector_nonce: true,
+                require_tests: false,
             })
             .collect(),
-        "wyr1e8-producer-fixture" => vec![CargoRun::plain(wyr1e8_producer_fixture_command())],
+        "wyr1e8-producer-fixture" => {
+            vec![CargoRun::plain(wyr1e8_producer_fixture_command()).requiring_named_tests()]
+        }
         // Reset card E8D.4-32. Selector 32's `system-init` was compiled only by
         // the d5 product path, never by a host gate, so R7B-1 could replace its
         // episode deadline with a `super::wyr1e::` call -- a module gated on a
@@ -1548,7 +1604,7 @@ fn named_host_runs(filter: &str) -> Result<Vec<CargoRun>, Failure> {
         "r1-status" => vec![CargoRun::plain(r1_status_command())],
         _ => host_test_commands(Some(filter))?
             .into_iter()
-            .map(CargoRun::plain)
+            .map(|arguments| CargoRun::plain(arguments).requiring_named_tests())
             .collect(),
     })
 }
@@ -2531,6 +2587,34 @@ fn run_selector_cargo(repository: &Path, arguments: &[&str]) -> Result<(), Failu
     }
 }
 
+/// `run_cargo` for a run that names its tests: it must also run at least one.
+fn run_cargo_requiring_tests(repository: &Path, arguments: &[&str]) -> Result<(), Failure> {
+    let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let output = Command::new(cargo)
+        .args(arguments)
+        .current_dir(repository)
+        .stdin(Stdio::null())
+        .stderr(Stdio::inherit())
+        .output()
+        .map_err(|error| Failure::task(format!("could not run Cargo: {error}")))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    print!("{stdout}");
+    if !output.status.success() {
+        return Err(Failure::task(format!(
+            "Cargo task failed with {}",
+            child_status(output.status.code())
+        )));
+    }
+    if tests_passed(&stdout) == 0 {
+        return Err(Failure::task(format!(
+            "cargo {} names tests but ran none: the named test was renamed, \
+             removed or compiled out",
+            arguments.join(" ")
+        )));
+    }
+    Ok(())
+}
+
 fn run_cargo(repository: &Path, arguments: &[&str]) -> Result<(), Failure> {
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let status = Command::new(cargo)
@@ -2567,10 +2651,11 @@ mod tests {
         canonical_build_directory, canonical_project_root, component_package, default_steps,
         encoded_uefi_rustflags, encoded_uefi_rustflags_for_target, explicit_test_filter,
         host_test_arguments, host_test_commands, is_listed_combination, lint_ratchet_shapes,
-        named_host_filter, named_host_runs, native_steps, prepare_uefi_target_roots,
+        named_host_filter, named_host_runs, names_a_test, native_steps, prepare_uefi_target_roots,
         r1_clippy_command, r1_status_command, render_uefi_inspection_report, run_verified_report,
-        selector_library_commands, selector32_library_commands, validate_regular_artifact,
-        validate_uefi_inspection_report, wyr1e8_producer_fixture_command,
+        selector_library_commands, selector32_library_commands, tests_passed,
+        validate_regular_artifact, validate_uefi_inspection_report,
+        wyr1e8_producer_fixture_command,
     };
     use crate::error::Failure;
     use crate::sha256::bytes_digest;
@@ -3030,7 +3115,7 @@ mod tests {
         let runs = |name| named_host_runs(name).unwrap();
         assert_eq!(
             runs("wyr1e8-producer-fixture"),
-            [CargoRun::plain(wyr1e8_producer_fixture_command())]
+            [CargoRun::plain(wyr1e8_producer_fixture_command()).requiring_named_tests()]
         );
         assert_eq!(runs("r1-clippy"), [CargoRun::plain(r1_clippy_command())]);
         assert_eq!(runs("r1-status"), [CargoRun::plain(r1_status_command())]);
@@ -3201,6 +3286,56 @@ mod tests {
             assert!(!shapes[..index].contains(shape));
         }
         assert_eq!(named_host_filter("lint-ratchet"), Some(Route::LintRatchet));
+    }
+
+    /// S1.2: the gates that name a test are exactly the ones that must see
+    /// it run, and libtest's summary is what says it did.
+    #[test]
+    fn a_gate_that_names_its_test_must_run_it() {
+        let owned = |arguments: &[&str]| {
+            arguments
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert!(names_a_test(&wyr1e8_producer_fixture_command()));
+        assert!(names_a_test(&owned(DW1C_INIT0_TEST_ARGUMENTS)));
+        assert!(!names_a_test(&r1_status_command()));
+        assert!(!names_a_test(&r1_clippy_command()));
+        assert!(!names_a_test(&owned(DW1D6_SOURCE_CONTRACT_TEST_ARGUMENTS)));
+        assert!(!names_a_test(&owned(&[
+            "test",
+            "--package",
+            "p",
+            "--features",
+            "f",
+            "--",
+            "--exact"
+        ])));
+        for name in ["wyr1e8-producer-fixture", "dw1c", "dw1c-init0"] {
+            let runs = named_host_runs(name).unwrap();
+            assert!(runs.iter().all(|run| run.require_tests), "{name}");
+        }
+        assert!(
+            named_host_runs("wyr1e8-model")
+                .unwrap()
+                .iter()
+                .all(|run| !run.require_tests)
+        );
+        assert_eq!(
+            tests_passed("running 1 test\ntest result: ok. 1 passed; 0 failed;\n"),
+            1
+        );
+        assert_eq!(
+            tests_passed(
+                "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 237 filtered out\n"
+            ),
+            0
+        );
+        assert_eq!(
+            tests_passed("test result: ok. 2 passed;\ntest result: ok. 3 passed;\n"),
+            5
+        );
     }
 
     #[test]
