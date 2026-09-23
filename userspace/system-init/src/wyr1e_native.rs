@@ -865,14 +865,32 @@ where
         return Err(InitError::Cleanup);
     }
     cleanup?;
-    // F3A.7g. The retirement above is the same either way -- a console that
-    // ended the session is released exactly as one that crashed -- and only
-    // what follows it differs. Asked after the cleanup, so a retirement that
-    // failed still reports its failure rather than a completed session.
-    if e6.shell.session_shutdown() {
-        return Ok(PollOutcome::SessionComplete);
-    }
+    // Whether this ends the session is `conclude_session`'s decision, not
+    // this route's: see there.
     Ok(PollOutcome::LaunchConsole)
+}
+
+/// F3A.7j. The one place a console departure is turned into a finished
+/// session.
+///
+/// Init sees consoled leave by two routes -- its launch session closing in
+/// the job dispatcher, and its process exiting -- and which one a tick reaches
+/// first is timing. F3A.7g put the session-ended check on the process-exit
+/// route alone, so a run whose session closed first relaunched the console
+/// it had just been told to stop (F3A.7 run 7, `0xAF18_0E04`). Deciding here,
+/// on whatever `poll` concluded, covers every route including any added
+/// later.
+///
+/// Both routes answer `LaunchConsole` only after the console is retired and
+/// return an error if the retirement failed, so a `SessionComplete` from here
+/// never stands for a teardown that did not finish. The latch is always set
+/// before either route can fire: consoled exits only after receiving the
+/// shell's terminal result, and the latch is set as that result is sent.
+const fn conclude_session(outcome: PollOutcome, session_shutdown: bool) -> PollOutcome {
+    match outcome {
+        PollOutcome::LaunchConsole if session_shutdown => PollOutcome::SessionComplete,
+        outcome => outcome,
+    }
 }
 
 fn poll_console_event<S: Wyr1BPlatform>(
@@ -954,6 +972,27 @@ fn absent_owner_site(state: &ResidentState) -> u8 {
 }
 
 pub(super) fn poll<S, L, W>(
+    resident: &mut ResidentSystemInit,
+    system: &mut S,
+    loader: &mut L,
+    waits: &mut W,
+    now: u64,
+) -> Result<PollOutcome, InitError>
+where
+    S: Wyr1BPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let outcome = poll_observations(resident, system, loader, waits, now)?;
+    let session_shutdown = resident
+        .wyr1c
+        .as_ref()
+        .and_then(|state| state.e6.as_ref())
+        .is_some_and(|e6| e6.shell.session_shutdown());
+    Ok(conclude_session(outcome, session_shutdown))
+}
+
+fn poll_observations<S, L, W>(
     resident: &mut ResidentSystemInit,
     system: &mut S,
     loader: &mut L,
@@ -1900,6 +1939,71 @@ mod tests {
         assert_eq!(state.console_transaction, 0);
     }
 
+    /// F3A.7j. Run 7 closed consoled's launch session before init saw its
+    /// process exit, and this route relaunched the console. Both routes must
+    /// conclude the same way once the shell has ended the session.
+    #[test]
+    fn a_closed_console_session_after_shutdown_completes_the_session() {
+        let peer = console_peer();
+        let mut state = State::new(7).unwrap();
+        state.console = Some(peer);
+        state.shell.observe_session_shutdown();
+
+        let outcome = reconcile_job_dispatcher_outcome(
+            &mut state,
+            JobDispatcherPollOutcome::SessionClosed {
+                grant: peer.grant,
+                scope: LaunchSessionScope::ConsoleLauncher,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            conclude_session(outcome, state.shell.session_shutdown()),
+            PollOutcome::SessionComplete
+        );
+        assert_eq!(state.console, None);
+    }
+
+    /// Every route's outcome must pass through `conclude_session`, or a new
+    /// route reopens run 7's relaunch.
+    #[test]
+    fn poll_concludes_every_outcome_through_one_decision() {
+        const SOURCE: &str = include_str!("wyr1e_native.rs");
+        let start = SOURCE.find("pub(super) fn poll<").unwrap();
+        let poll = &SOURCE[start..start + SOURCE[start..].find("\n}\n").unwrap()];
+        let observed = poll
+            .find("let outcome = poll_observations(resident, system, loader, waits, now)?;")
+            .expect("poll no longer delegates its observations");
+        let concluded = poll
+            .find("Ok(conclude_session(outcome, session_shutdown))")
+            .expect("poll no longer concludes through conclude_session");
+        assert!(observed < concluded);
+        assert_eq!(poll.matches("return").count(), 0, "poll must have one exit");
+    }
+
+    #[test]
+    fn only_a_console_departure_after_shutdown_completes_the_session() {
+        assert_eq!(
+            conclude_session(PollOutcome::LaunchConsole, true),
+            PollOutcome::SessionComplete
+        );
+        assert_eq!(
+            conclude_session(PollOutcome::LaunchConsole, false),
+            PollOutcome::LaunchConsole
+        );
+        // A recovery is still a recovery after the session ended: it names
+        // something that failed, and a clean shutdown must not hide it.
+        for outcome in [
+            PollOutcome::Stable,
+            PollOutcome::RecoverDevmgr,
+            PollOutcome::RecoverRegistry(3),
+        ] {
+            assert_eq!(conclude_session(outcome, true), outcome);
+            assert_eq!(conclude_session(outcome, false), outcome);
+        }
+    }
+
     #[test]
     fn closed_console_session_with_wrong_grant_fails_without_discarding_owner() {
         let peer = console_peer();
@@ -1922,9 +2026,10 @@ mod tests {
     }
 
     /// F3A.7g. A completed session is the one outcome that stops the system,
-    /// so it must not be reported by a teardown that did not finish. The
-    /// latch is read after the retirement for exactly this reason, and moving
-    /// it above the `?` would turn a cleanup failure into a clean shutdown.
+    /// so it must not be reported by a teardown that did not finish. A failed
+    /// retirement returns an error rather than `LaunchConsole`, so
+    /// `conclude_session` never sees it; answering `LaunchConsole` above the
+    /// `?` would turn a cleanup failure into a clean shutdown.
     #[test]
     fn a_failed_console_retirement_is_not_a_completed_session() {
         let peer = console_peer();

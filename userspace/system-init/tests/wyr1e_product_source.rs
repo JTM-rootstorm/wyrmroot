@@ -138,7 +138,7 @@ fn resident_services_shell_v1_before_waiting_for_consoled_ready() {
         &E6[E6.find("fn poll_console_event").unwrap()..E6.find("pub(super) fn poll<").unwrap()];
     assert!(console_event.contains("system.wait_many("));
 
-    let poll = item(E6, "pub(super) fn poll<");
+    let poll = item(E6, "fn poll_observations<");
     // A re-inlined console wait could sit ahead of the dispatcher without
     // disturbing the ordering below, so `poll` must keep delegating it.
     assert!(!poll.contains("system.wait_many("));
@@ -319,7 +319,7 @@ fn the_console_and_shell_supervisor_never_reads_or_writes_the_supervisor_mode() 
 
     // The dispatcher leg of `poll` is unconditional apart from the E8
     // evidence-adjacency gate, which is a selector's and is not the mode.
-    let poll = item(E6, "pub(super) fn poll<S, L, W>");
+    let poll = item(E6, "fn poll_observations<S, L, W>");
     assert!(poll.contains("let poll_shell_jobs = true;"));
     let gate = poll.find("if poll_shell_jobs {").unwrap();
     let dispatch = poll.find("poll_job_dispatcher_with_shell(").unwrap();
@@ -488,7 +488,7 @@ fn every_registry_recovery_caller_names_a_distinct_trigger() {
     // hypothesis rests on, so their phases are pinned to the condition rather
     // than left to a reader to trust. A swap here would point the next
     // reading at the wrong site while every gate stayed green.
-    let poll = item(E6, "pub(super) fn poll<S, L, W>(");
+    let poll = item(E6, "fn poll_observations<S, L, W>(");
     let poll = without_whitespace(poll);
     for phase in ["READY_DEADLINE_BEFORE_WAIT", "READY_DEADLINE_AFTER_WAIT"] {
         assert!(

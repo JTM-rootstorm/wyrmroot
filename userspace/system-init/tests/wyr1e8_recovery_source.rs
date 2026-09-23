@@ -55,7 +55,7 @@ fn e8_actor_admission_uses_the_product_owned_paths() {
 
 #[test]
 fn e8_shell_ready_requires_matching_tuple_and_authenticated_serial_facts() {
-    let poll = item(NATIVE, "pub(super) fn poll<");
+    let poll = item(NATIVE, "fn poll_observations<");
     let facts = poll.find("Message::ReadyFacts(facts)").unwrap();
     let observe = poll.find("observe_e8_serial_ready(").unwrap();
     assert!(facts < observe);
