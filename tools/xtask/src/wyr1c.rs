@@ -962,15 +962,21 @@ pub(crate) fn run_e3b_native_checks(repository: &Path) -> Result<(), Failure> {
 }
 
 pub(crate) fn run_wyr1e3_native_checks(repository: &Path, filter: &str) -> Result<(), Failure> {
-    let controller_specs = [WYR1E3_NATIVE_CHECK_SPECS[0], WYR1E3_NATIVE_CHECK_SPECS[4]];
-    let specs = match filter {
-        "wyr1e3-controller-native" => controller_specs.as_slice(),
-        "wyr1e3-native" => WYR1E3_NATIVE_CHECK_SPECS.as_slice(),
-        "wyr1e3-consoled-native" => &WYR1E3_NATIVE_CHECK_SPECS[2..4],
-        "wyr1e3-registry-native" => &WYR1E3_NATIVE_CHECK_SPECS[1..2],
+    let specs = wyr1e3_native_selection(filter)?;
+    run_native_checks(repository, "WYR1-E3", filter, &specs, &[], None)
+}
+
+/// The specs each WYR1-E3 native filter checks.
+fn wyr1e3_native_selection(filter: &str) -> Result<Vec<NativeSpec>, Failure> {
+    Ok(match filter {
+        "wyr1e3-controller-native" => {
+            vec![WYR1E3_NATIVE_CHECK_SPECS[0], WYR1E3_NATIVE_CHECK_SPECS[4]]
+        }
+        "wyr1e3-native" => WYR1E3_NATIVE_CHECK_SPECS.to_vec(),
+        "wyr1e3-consoled-native" => WYR1E3_NATIVE_CHECK_SPECS[2..4].to_vec(),
+        "wyr1e3-registry-native" => WYR1E3_NATIVE_CHECK_SPECS[1..2].to_vec(),
         _ => return Err(Failure::usage("unknown WYR1-E3 native check selection")),
-    };
-    run_native_checks(repository, "WYR1-E3", filter, specs, &[], None)
+    })
 }
 
 pub(crate) fn run_wyrmsh_native_checks(repository: &Path, filter: &str) -> Result<(), Failure> {
@@ -5688,6 +5694,25 @@ fn hex_digest(value: &[u8; 32]) -> String {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// The three narrower E3 filters check subsets of `wyr1e3-native` with the
+    /// same compiler, flags and environment, so running the full one covers
+    /// them.
+    #[test]
+    fn every_narrower_wyr1e3_native_selection_is_within_the_full_one() {
+        let full = wyr1e3_native_selection("wyr1e3-native").unwrap();
+        assert_eq!(full, WYR1E3_NATIVE_CHECK_SPECS);
+        for narrower in [
+            "wyr1e3-controller-native",
+            "wyr1e3-consoled-native",
+            "wyr1e3-registry-native",
+        ] {
+            let specs = wyr1e3_native_selection(narrower).unwrap();
+            assert!(!specs.is_empty());
+            assert!(specs.iter().all(|spec| full.contains(spec)), "{narrower}");
+        }
+        assert!(wyr1e3_native_selection("wyr1e3-unknown-native").is_err());
+    }
 
     /// F1A.2, widened at F3A.2b. The final product is the six supervised
     /// roles, the `hello` payload and the `cpu-hog` job, and nothing else.
