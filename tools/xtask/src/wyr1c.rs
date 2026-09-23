@@ -5695,6 +5695,26 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    /// S1.1: every combination these product and check tables build is in
+    /// the host gate table, so the unfiltered suite checks its library.
+    #[test]
+    fn every_native_spec_combination_is_in_the_host_gate_table() {
+        let instrumented = Wyr1fProduct::InstrumentedNormal.native_specs();
+        let tables = ALL_NATIVE_SPEC_TABLES
+            .iter()
+            .map(|(_, specs, _)| *specs)
+            .chain([instrumented.as_slice()]);
+        for spec in tables.flatten() {
+            assert!(
+                crate::tasks::is_listed_combination(spec.package, spec.features),
+                "{} builds {} with {}, which FEATURE_COMBINATIONS omits",
+                spec.label,
+                spec.package,
+                spec.features
+            );
+        }
+    }
+
     /// The three narrower E3 filters check subsets of `wyr1e3-native` with the
     /// same compiler, flags and environment, so running the full one covers
     /// them.

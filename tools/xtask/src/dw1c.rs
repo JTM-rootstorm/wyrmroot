@@ -1845,6 +1845,21 @@ fn validate_upper_hex(value: &str, expected_length: usize, label: &str) -> Resul
 mod tests {
     use super::*;
 
+    /// S1.1: every combination the DW1-C product builds is in the host gate
+    /// table.
+    #[test]
+    fn every_dw1c_build_spec_combination_is_in_the_host_gate_table() {
+        for spec in wyr_build_specs() {
+            assert!(
+                crate::tasks::is_listed_combination(spec.package, spec.features),
+                "{} builds {} with {}, which FEATURE_COMBINATIONS omits",
+                spec.label,
+                spec.package,
+                spec.features
+            );
+        }
+    }
+
     #[test]
     fn generated_abi_lineage_matches_the_current_workspace_dependency() {
         let manifest = include_str!("../../../Cargo.toml");

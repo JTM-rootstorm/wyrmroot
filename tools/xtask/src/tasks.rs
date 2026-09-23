@@ -1370,10 +1370,16 @@ impl NativeGate {
 /// What a named host filter runs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Route {
-    /// Host Cargo commands, from [`named_host_runs`].
+    /// Host Cargo commands, from [`named_host_runs`]. Every one of these also
+    /// runs in the unfiltered suite.
     Host,
-    /// A guest-target compile gate.
+    /// A guest-target compile gate. Every one of these runs in `native`, or is
+    /// covered there by the gate [`NATIVE_COVERED_BY`] names.
     Native(NativeGate),
+    /// `native`: every native gate.
+    AllNative,
+    /// `full`: the unfiltered suite, then every native gate.
+    Full,
 }
 
 /// Every named `xtask test host` filter, and what it runs.
@@ -1385,6 +1391,8 @@ enum Route {
 /// first, and anything not listed is a component, `package:` or `test:` filter
 /// over the workspace suite.
 const NAMED_HOST_FILTERS: &[(&str, Route)] = &[
+    ("native", Route::AllNative),
+    ("full", Route::Full),
     ("selectors", Route::Host),
     ("wyr1e8-producer-fixture", Route::Host),
     ("wyr1d5-clippy", Route::Host),
@@ -1441,6 +1449,28 @@ const NAMED_HOST_FILTERS: &[(&str, Route)] = &[
     ),
     ("wyr1f-native", Route::Native(NativeGate::Wyr1f)),
     ("dw1e3b-native", Route::Native(NativeGate::E3b)),
+];
+
+/// Native filters `native` does not run itself, each with the one that covers it.
+///
+/// The `wyr1cN` names are aliases of their `-native` gate. The narrower E3
+/// filters check subsets of `wyr1e3-native`'s specs
+/// (`every_narrower_wyr1e3_native_selection_is_within_the_full_one`), and
+/// `wyr1e5-native` checks the same `WYRMSH_NATIVE_CHECK_SPECS` as
+/// `wyr1e4-native` under another label. Each native gate is minutes of work in
+/// a fresh scratch target, so running a covered one again buys nothing.
+///
+/// `wyr1e8-actors-native` is not listed: its two specs are in `wyr1e8-native`
+/// too, but that gate compiles them with the E8 evidence nonce set and this one
+/// without, which is a different build.
+const NATIVE_COVERED_BY: &[(&str, &str)] = &[
+    ("wyr1c4", "wyr1c4-native"),
+    ("wyr1c5", "wyr1c5-native"),
+    ("wyr1c6", "wyr1c6-native"),
+    ("wyr1e3-consoled-native", "wyr1e3-native"),
+    ("wyr1e3-registry-native", "wyr1e3-native"),
+    ("wyr1e3-controller-native", "wyr1e3-native"),
+    ("wyr1e5-native", "wyr1e4-native"),
 ];
 
 fn named_host_filter(filter: &str) -> Option<Route> {
@@ -1529,28 +1559,120 @@ pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<
             }
             Ok(())
         }
+        Some((_, Some(Route::AllNative))) => run_every_step(repository, native_steps()),
+        Some((_, Some(Route::Full))) => {
+            let mut steps = default_steps()?;
+            steps.extend(native_steps());
+            run_every_step(repository, steps)
+        }
         Some((_, None)) => {
             for arguments in host_test_commands(filter)? {
                 CargoRun::plain(arguments).execute(repository)?;
             }
             Ok(())
         }
-        // Unfiltered, so a broken selector cannot wait for someone to type its
-        // gate's name. `selectors` runs the same set alone when that is all the
-        // reader wants.
-        None => {
-            for run in named_host_runs("selectors")? {
-                run.execute(repository)?;
-            }
-            for arguments in host_test_commands(None)? {
-                CargoRun::plain(arguments).execute(repository)?;
-            }
-            Ok(())
+        None => run_every_step(repository, default_steps()?),
+    }
+}
+
+/// One step of an aggregate host run.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Step {
+    Cargo(CargoRun),
+    Native(&'static str, NativeGate),
+}
+
+impl Step {
+    fn describe(&self) -> String {
+        match self {
+            Self::Cargo(run) => format!("cargo {}", run.arguments.join(" ")),
+            Self::Native(name, _) => format!("native gate {name}"),
+        }
+    }
+
+    fn execute(&self, repository: &Path) -> Result<(), Failure> {
+        match self {
+            Self::Cargo(run) => run.execute(repository),
+            Self::Native(name, gate) => gate.run(repository, name),
         }
     }
 }
 
-/// Every library configuration a product path builds, as one compile gate.
+/// The unfiltered suite, derived from the two tables above.
+///
+/// Structural refactor S1.1. It used to be the workspace tests plus the
+/// selector library checks; every clippy and feature-specific test gate was a
+/// named filter that ran only when typed, and S0 found three of them red with
+/// nobody the wiser. Now it is:
+/// - a library check of every row of [`FEATURE_COMBINATIONS`] (`selectors`);
+/// - the workspace suite and the bootfs builder suite, as before;
+/// - every [`Route::Host`] filter's own commands, each distinct command once.
+///
+/// So a gate that exists runs here, and only the native gates do not.
+fn default_steps() -> Result<Vec<Step>, Failure> {
+    let mut runs = named_host_runs("selectors")?;
+    runs.extend(host_test_commands(None)?.into_iter().map(CargoRun::plain));
+    for (name, route) in NAMED_HOST_FILTERS {
+        if *route == Route::Host {
+            for run in named_host_runs(name)? {
+                if !runs.contains(&run) {
+                    runs.push(run);
+                }
+            }
+        }
+    }
+    Ok(runs.into_iter().map(Step::Cargo).collect())
+}
+
+/// Every native gate, each once: `xtask test host native`.
+fn native_steps() -> Vec<Step> {
+    NAMED_HOST_FILTERS
+        .iter()
+        .filter_map(|(name, route)| match route {
+            Route::Native(gate)
+                if !NATIVE_COVERED_BY.iter().any(|(covered, _)| covered == name) =>
+            {
+                Some(Step::Native(name, *gate))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Runs every step even after one fails, then reports each failure.
+///
+/// An aggregate run exists to say everything that is wrong; stopping at the
+/// first failure would hide the rest until the next run.
+fn run_every_step(repository: &Path, steps: Vec<Step>) -> Result<(), Failure> {
+    let total = steps.len();
+    let mut failed = Vec::new();
+    for (index, step) in steps.iter().enumerate() {
+        let description = step.describe();
+        eprintln!("xtask: [{}/{total}] {description}", index + 1);
+        if let Err(failure) = step.execute(repository) {
+            eprintln!("xtask: [{}/{total}] failed: {}", index + 1, failure.message);
+            failed.push(format!(
+                "[{}/{total}] {description}: {}",
+                index + 1,
+                failure.message
+            ));
+        }
+    }
+    if failed.is_empty() {
+        eprintln!("xtask: all {total} host gate steps passed");
+        return Ok(());
+    }
+    eprintln!("xtask: {} of {total} host gate steps failed:", failed.len());
+    for line in &failed {
+        eprintln!("xtask:   {line}");
+    }
+    Err(Failure::task(format!(
+        "{} of {total} host gate steps failed",
+        failed.len()
+    )))
+}
+
+/// Every package/feature combination a product or a host gate builds, once.
 ///
 /// Follow-up to reset card E8D.4. Two selectors broke on 2026-09-15 and neither
 /// was noticed for a week, for one structural reason: a selector's libraries
@@ -1562,12 +1684,23 @@ pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<
 /// feature set, which is all the default suite ever built -- and selector 34
 /// even had two gates written for it, both red, both unrun.
 ///
-/// So this one runs unfiltered. It checks rather than lints, because the class
-/// is "does not compile" and `cargo check` is the cheapest thing that answers
-/// it; the per-selector clippy gates below still lint more deeply when named.
-/// The point is that no selector's compilability depends on anyone remembering
-/// a filter name.
-const SELECTOR_LIBRARIES: [(&str, &str); 26] = [
+/// Structural refactor S1.1 made this the one list. The unfiltered run checks
+/// every row's library (`cargo check` answers "does not compile" cheapest), and
+/// runs every named host gate besides, so the clippy and test commands those
+/// gates own run too. Tests hold the list complete: every `--features` any
+/// named host gate passes, and every native spec the `wyr1c`, `r1`, `wyr1b` and
+/// `dw1c` product tables build, must appear here. The inline builders of the
+/// older products (dw1b, dw1d6, dw1e3a, wyr1c2, wyr1c6) are listed by hand until
+/// S2T gives every product one spec table.
+///
+/// Feature sets are spelled as their builder spells them, so a combination two
+/// builders spell differently appears twice; Cargo resolves both to one build.
+const FEATURE_COMBINATIONS: &[(&str, &str)] = &[
+    // system-init: every selector and the product shapes.
+    ("wyrmroot-system-init", "native-init"),
+    ("wyrmroot-system-init", "native-init,wyr1-test-evidence"),
+    ("wyrmroot-system-init", "native-init,wyr1b-test-evidence"),
+    ("wyrmroot-system-init", "native-init,wyr1e-shell-controller"),
     ("wyrmroot-system-init", "wyr1-test-evidence"),
     ("wyrmroot-system-init", "wyr1b-test-evidence"),
     ("wyrmroot-system-init", "wyr1c4-production"),
@@ -1581,16 +1714,22 @@ const SELECTOR_LIBRARIES: [(&str, &str); 26] = [
     ("wyrmroot-system-init", "wyr1d-selector32"),
     ("wyrmroot-system-init", "wyr1e-shell-controller"),
     ("wyrmroot-system-init", "wyr1e-production"),
+    ("wyrmroot-system-init", "wyr1e-production,wyr1f-closure"),
     ("wyrmroot-system-init", "wyr1e-selector33"),
     ("wyrmroot-system-init", "wyr1e8-selector33"),
+    ("wyrmroot-system-init", "wyr1f-closure"),
     ("wyrmroot-system-init", "r1-selector34"),
     ("wyrmroot-system-init", "dw1e3-selector31"),
+    // consoled.
     ("wyrmroot-consoled", "native-consoled,wyr1d-selector32"),
     ("wyrmroot-consoled", "native-consoled,wyr1e-wyrmsh"),
     (
         "wyrmroot-consoled",
         "native-consoled,wyr1e-wyrmsh,wyr1e8-recovery",
     ),
+    ("wyrmroot-consoled", "wyr1e-wyrmsh"),
+    // devmgr.
+    ("wyrmroot-devmgr", "native-devmgr"),
     ("wyrmroot-devmgr", "wyr1c4-production"),
     ("wyrmroot-devmgr", "wyr1c5-production"),
     ("wyrmroot-devmgr", "wyr1c6-production,wyr1c6-selector29"),
@@ -1599,8 +1738,68 @@ const SELECTOR_LIBRARIES: [(&str, &str); 26] = [
     ("wyrmroot-devmgr", "wyr1e-production"),
     ("wyrmroot-devmgr", "wyr1e8-production"),
     ("wyrmroot-devmgr", "dw1e3-selector31"),
+    // uart16550d.
+    ("wyrmroot-uart16550d", "native-uart16550d"),
     ("wyrmroot-uart16550d", "wyr1d-selector32"),
+    ("wyrmroot-uart16550d", "dw1e3-selector31"),
+    // The other roles and payloads, in their product shapes.
+    ("wyrmroot-registryd", "native-registryd"),
+    ("wyrmroot-wyrmsh", "native-wyrmsh"),
+    ("wyrmroot-console-echo", "native-console-echo"),
+    ("wyrmroot-hello", "native-hello"),
+    ("wyrmroot-hello", "native-job-hello"),
+    ("wyrmroot-hello", "native-stream-hello"),
+    ("wyrmroot-dw1b-preemption", "native-job-cpu-hog"),
+    ("wyrmroot-dw1b-preemption", "native-payloads"),
+    ("wyrmroot-dw1c-preemption", "native-payloads"),
+    ("wyrmroot-dw1d6-device-test", "native-payloads"),
+    ("wyrmroot-dw1e3-com2-test", "native-probe"),
+    ("wyrmroot-r1-saturation", "native-payloads"),
+    ("wyrmroot-wyr1b-gate", "native-gate"),
+    ("wyrmroot-wyr1-bootstrap-stubs", "native-stubs"),
+    ("wyrmroot-wyr1-retained-stubs", "native-retained"),
+    ("wyrmroot-wyr1-retained-stubs", "wyr1c5-production"),
+    (
+        "wyrmroot-wyr1-retained-stubs",
+        "wyr1c6-production,wyr1c6-selector29",
+    ),
+    ("wyrmroot-wyr1e-test-actors", "native-exit-nonzero"),
+    ("wyrmroot-wyr1e-test-actors", "native-fault"),
+    ("wyrmroot-wyr1e-test-actors", "native-recovery-trigger"),
+    ("wyrmroot-wyr1e-test-actors", "native-stdout-pressure"),
+    // init0 and the bootstrap, for the DW1 and WYR1 products.
+    ("wyrmroot-init0", "dw1c-preemption-integration"),
+    ("wyrmroot-init0", "native-init0,dw1b-preemption-integration"),
+    ("wyrmroot-init0", "native-init0,dw1c-preemption-integration"),
+    ("wyrmroot-bootstrap", "dw1d6-synthetic"),
+    ("wyrmroot-bootstrap", "native-bootstrap"),
+    (
+        "wyrmroot-bootstrap",
+        "native-bootstrap,wyr0-init0-integration",
+    ),
+    (
+        "wyrmroot-bootstrap",
+        "native-bootstrap,wyr0-init0-integration,dw1c-bootstrap-supervision",
+    ),
+    ("wyrmroot-bootstrap", "native-bootstrap,dw1d6-synthetic"),
+    ("wyrmroot-bootstrap", "wyr1c4-production"),
+    ("wyrmroot-bootstrap", "wyr1c5-production"),
+    ("wyrmroot-bootstrap", "wyr1c6-production"),
+    // Host-only builder shapes.
+    ("wyrmroot-bootfs", "builder"),
+    ("wyrmroot-rrc-manifest", "builder"),
 ];
+
+/// Packages with no library target: only the native gates can compile them.
+const BINARY_ONLY_PACKAGES: &[&str] = &["wyrmroot-wyr1-retained-stubs"];
+
+/// Whether `FEATURE_COMBINATIONS` lists this package in this feature shape.
+#[cfg(test)]
+pub(crate) fn is_listed_combination(package: &str, features: &str) -> bool {
+    FEATURE_COMBINATIONS
+        .iter()
+        .any(|(listed, shape)| *listed == package && *shape == features)
+}
 
 /// A placeholder for the evidence nonce selector 31's runtime stamps in at
 /// compile time.
@@ -1614,9 +1813,10 @@ const SELECTOR_LIBRARIES: [(&str, &str); 26] = [
 const SELECTOR_PLACEHOLDER_NONCE: &str = "0000000000000001";
 
 fn selector_library_commands() -> Vec<Vec<String>> {
-    SELECTOR_LIBRARIES
-        .into_iter()
-        .map(|(package, features)| {
+    FEATURE_COMBINATIONS
+        .iter()
+        .filter(|(package, _)| !BINARY_ONLY_PACKAGES.contains(package))
+        .map(|&(package, features)| {
             [
                 "check",
                 "--locked",
@@ -2318,17 +2518,18 @@ fn child_status(code: Option<i32>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BOOTFS_BUILD_ARGUMENTS, BOOTFS_PACKAGE, BOOTFS_TEST_ARGUMENTS, CargoRun,
-        DW1C_INIT0_TEST_ARGUMENTS, DW1D6_ACTOR_TEST_ARGUMENTS, DW1D6_BOOTSTRAP_TEST_ARGUMENTS,
-        DW1D6_SOURCE_CONTRACT_TEST_ARGUMENTS, INSPECTION_PATH, INSPECTION_SHELL, IsolatedUefiBuild,
-        LoaderLinkMode, NAMED_HOST_FILTERS, Route, SELECTOR_LIBRARIES, UefiCargoProfile,
-        blocked_toolchain_failure, canonical_build_directory, canonical_project_root,
-        component_package, encoded_uefi_rustflags, encoded_uefi_rustflags_for_target,
-        explicit_test_filter, host_test_arguments, host_test_commands, named_host_filter,
-        named_host_runs, prepare_uefi_target_roots, r1_clippy_command, r1_status_command,
-        render_uefi_inspection_report, run_verified_report, selector_library_commands,
-        selector32_library_commands, validate_regular_artifact, validate_uefi_inspection_report,
-        wyr1e8_producer_fixture_command,
+        BINARY_ONLY_PACKAGES, BOOTFS_BUILD_ARGUMENTS, BOOTFS_PACKAGE, BOOTFS_TEST_ARGUMENTS,
+        CargoRun, DW1C_INIT0_TEST_ARGUMENTS, DW1D6_ACTOR_TEST_ARGUMENTS,
+        DW1D6_BOOTSTRAP_TEST_ARGUMENTS, DW1D6_SOURCE_CONTRACT_TEST_ARGUMENTS, FEATURE_COMBINATIONS,
+        INSPECTION_PATH, INSPECTION_SHELL, IsolatedUefiBuild, LoaderLinkMode, NAMED_HOST_FILTERS,
+        NATIVE_COVERED_BY, Route, Step, UefiCargoProfile, blocked_toolchain_failure,
+        canonical_build_directory, canonical_project_root, component_package, default_steps,
+        encoded_uefi_rustflags, encoded_uefi_rustflags_for_target, explicit_test_filter,
+        host_test_arguments, host_test_commands, is_listed_combination, named_host_filter,
+        named_host_runs, native_steps, prepare_uefi_target_roots, r1_clippy_command,
+        r1_status_command, render_uefi_inspection_report, run_verified_report,
+        selector_library_commands, selector32_library_commands, validate_regular_artifact,
+        validate_uefi_inspection_report, wyr1e8_producer_fixture_command,
     };
     use crate::error::Failure;
     use crate::sha256::bytes_digest;
@@ -2800,7 +3001,14 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         let selectors = runs("selectors");
-        assert_eq!(selectors.len(), SELECTOR_LIBRARIES.len());
+        assert_eq!(
+            selectors.len(),
+            FEATURE_COMBINATIONS.len()
+                - FEATURE_COMBINATIONS
+                    .iter()
+                    .filter(|(package, _)| BINARY_ONLY_PACKAGES.contains(package))
+                    .count()
+        );
         assert!(selectors.iter().all(|run| run.selector_nonce));
         assert_eq!(
             selectors
@@ -2809,6 +3017,111 @@ mod tests {
                 .collect::<Vec<_>>(),
             selector_library_commands()
         );
+    }
+
+    /// S1.1: a named host gate that exists runs in the unfiltered suite, so
+    /// none of them waits for someone to type its name.
+    #[test]
+    fn the_unfiltered_suite_runs_every_named_host_gate() {
+        let steps = default_steps().unwrap();
+        let runs = steps
+            .iter()
+            .map(|step| match step {
+                Step::Cargo(run) => run.clone(),
+                Step::Native(name, _) => panic!("the unfiltered suite runs native gate {name}"),
+            })
+            .collect::<Vec<_>>();
+        for (name, route) in NAMED_HOST_FILTERS {
+            if *route == Route::Host {
+                for run in named_host_runs(name).unwrap() {
+                    assert!(runs.contains(&run), "{name} is missing {:?}", run.arguments);
+                }
+            }
+        }
+        for arguments in host_test_commands(None).unwrap() {
+            assert!(runs.contains(&CargoRun::plain(arguments)));
+        }
+        for (index, run) in runs.iter().enumerate() {
+            assert!(
+                !runs[..index].contains(run),
+                "{:?} runs twice",
+                run.arguments
+            );
+        }
+        // The cheapest question first: does every combination compile at all.
+        let selectors = named_host_runs("selectors").unwrap();
+        assert_eq!(runs[..selectors.len()], selectors);
+    }
+
+    /// S1.1: every feature set a named host gate passes is in the one table,
+    /// so the table cannot fall behind the gates that read it.
+    #[test]
+    fn every_feature_set_a_host_gate_selects_is_a_listed_combination() {
+        let mut checked = 0;
+        for (name, route) in NAMED_HOST_FILTERS {
+            if *route != Route::Host {
+                continue;
+            }
+            for run in named_host_runs(name).unwrap() {
+                let value = |flag: &str| {
+                    run.arguments
+                        .windows(2)
+                        .find(|pair| pair[0] == flag)
+                        .map(|pair| pair[1].as_str())
+                };
+                if let Some(features) = value("--features") {
+                    let package = value("--package").expect("a feature gate names its package");
+                    assert!(
+                        is_listed_combination(package, features),
+                        "{name} builds {package} with {features}, which FEATURE_COMBINATIONS omits"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > FEATURE_COMBINATIONS.len());
+    }
+
+    /// S1.1: `native` runs every native gate once, and a gate it skips runs
+    /// the same check function as the gate that covers it.
+    #[test]
+    fn native_runs_every_native_gate_or_the_one_covering_it() {
+        let gates = native_steps()
+            .into_iter()
+            .map(|step| match step {
+                Step::Native(name, gate) => (name, gate),
+                Step::Cargo(run) => panic!("native runs a host command {:?}", run.arguments),
+            })
+            .collect::<Vec<_>>();
+        for (index, (name, gate)) in gates.iter().enumerate() {
+            assert!(
+                !gates[..index].iter().any(|(_, earlier)| earlier == gate),
+                "{name} repeats a gate native already runs"
+            );
+        }
+        for (name, route) in NAMED_HOST_FILTERS {
+            let Route::Native(gate) = route else {
+                continue;
+            };
+            if gates.iter().any(|(run, _)| run == name) {
+                continue;
+            }
+            let cover = NATIVE_COVERED_BY
+                .iter()
+                .find(|(covered, _)| covered == name)
+                .map(|(_, cover)| *cover)
+                .unwrap_or_else(|| panic!("native gate {name} is reachable only by its name"));
+            assert_eq!(
+                gates
+                    .iter()
+                    .find(|(run, _)| *run == cover)
+                    .map(|(_, gate)| gate),
+                Some(gate),
+                "{name} is covered by {cover}, which native does not run as the same gate"
+            );
+        }
+        assert_eq!(named_host_filter("native"), Some(Route::AllNative));
+        assert_eq!(named_host_filter("full"), Some(Route::Full));
     }
 
     #[test]

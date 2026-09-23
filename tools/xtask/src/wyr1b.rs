@@ -3280,6 +3280,21 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    /// S1.1: every combination the WYR1-B product builds is in the host gate
+    /// table.
+    #[test]
+    fn every_wyr1b_native_spec_combination_is_in_the_host_gate_table() {
+        for spec in NATIVE_SPECS {
+            assert!(
+                crate::tasks::is_listed_combination(spec.package, spec.features),
+                "{} builds {} with {}, which FEATURE_COMBINATIONS omits",
+                spec.label,
+                spec.package,
+                spec.features
+            );
+        }
+    }
+
     #[test]
     fn selector25_bootfs_capacity_matches_the_deepwyrm_selector_local_ceiling() {
         assert_eq!(enforce_selector25_bootfs_capacity(1).unwrap(), 1);

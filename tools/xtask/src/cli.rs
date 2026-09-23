@@ -12,6 +12,8 @@ Usage:
     cargo xtask audit-i-b <first-request.toml> <second-request.toml>
     cargo xtask gdb <default|smp> --request <wyr0-h-request.toml>
     cargo xtask test host [filter]
+    tools/pinned-cargo xtask test host native
+    tools/pinned-cargo xtask test host full
     tools/pinned-cargo xtask format
     tools/pinned-cargo xtask clippy
     tools/pinned-cargo xtask doc
@@ -94,6 +96,15 @@ Usage:
     tools/pinned-cargo xtask dw1-e3a-prepare <fresh-directory> <deepwyrm-repository> <deepwyrm-revision> <16-hex-nonce>
     tools/pinned-cargo xtask dw1-e3b-prepare <fresh-directory> <deepwyrm-repository> <deepwyrm-revision> <16-hex-evidence-nonce> <16-hex-challenge-1-nonce> <16-hex-challenge-2-nonce>
     tools/pinned-cargo xtask wyr1-d5-prepare <fresh-directory> <deepwyrm-repository> <deepwyrm-revision> <16-hex-evidence-nonce>
+
+Unfiltered, `test host` runs every host gate: a library check of every
+package/feature combination any product or gate builds, the workspace and bootfs
+builder suites, and the commands of every named model, clippy and
+feature-specific filter below, each distinct command once. It runs every step
+even after one fails and lists the failures at the end. `native` runs every
+guest-target *-native gate once (each takes minutes); a narrower native filter
+it skips is covered by the one it runs. `full` is the unfiltered run followed by
+`native`. Every named filter still runs alone, with its own commands.
 
 Host filters may name a component (bootfs, protocol, elf, runtime, bootstrap,
 efi, init0, hello, xtask, dw1c-init0, or dw1d6), one product area (registry,

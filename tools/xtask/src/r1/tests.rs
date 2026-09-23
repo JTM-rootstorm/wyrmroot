@@ -1,5 +1,19 @@
 use super::*;
 
+/// S1.1: every combination the R1 product builds is in the host gate table.
+#[test]
+fn every_r1_native_spec_combination_is_in_the_host_gate_table() {
+    for spec in NATIVE_SPECS {
+        assert!(
+            crate::tasks::is_listed_combination(spec.package, spec.features),
+            "{} builds {} with {}, which FEATURE_COMBINATIONS omits",
+            spec.label,
+            spec.package,
+            spec.features
+        );
+    }
+}
+
 #[test]
 fn the_nonce_shape_matches_what_the_kernel_and_probe_require() {
     // The stack gate supplies this value for the selector.
