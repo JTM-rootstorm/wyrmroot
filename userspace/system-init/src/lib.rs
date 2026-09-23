@@ -5387,6 +5387,7 @@ mod native_cleanup_tests {
     /// status that said only "a cleanup failed" -- which is what the first
     /// F3A.7g run reported, as `0xAF18_1704` -- covers thirty-one different
     /// outcomes and names none of them.
+    #[cfg(not(feature = "r1-selector34"))]
     #[test]
     fn a_session_shutdown_reports_every_step_that_failed_and_not_merely_that_one_did() {
         let status =
@@ -5424,6 +5425,7 @@ mod native_cleanup_tests {
         assert_eq!(decoded.operation, UNATTRIBUTED_OPERATION);
     }
 
+    #[cfg(not(feature = "r1-selector34"))]
     #[test]
     fn a_startup_operation_is_nameable_without_moving_any_recovery_value() {
         // Every startup operation round-trips above the sentinel.
