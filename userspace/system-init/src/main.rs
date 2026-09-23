@@ -313,7 +313,6 @@ fn continue_resident(
                     }
                     index += 1;
                 }
-                evidence_submitted = true;
             }
             return resident_tick_failure_application_status(&error);
         }

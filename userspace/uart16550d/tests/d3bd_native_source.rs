@@ -420,8 +420,28 @@ fn a_lost_control_peer_orphans_the_driver_instead_of_shutting_it_down() {
     // the Interrupt and stream branches stay positional.
     assert!(loop_body.contains("let slot = observed.index + u32::from(orphaned);"));
 
-    // An orphan with neither an Interrupt nor a stream has no service to keep.
-    assert!(loop_body.contains("if count == 0 {"));
+    // An orphan with no stream left has no service to keep: only devmgr can
+    // attach another, and devmgr is gone.
+    assert!(loop_body.contains(
+        "if count == 0 || (orphaned && driver.stream_endpoint().is_none()) {\n            // Orphaned with no stream left"
+    ));
+
+    // A detach report to a closed control peer is dropped, not a driver
+    // failure; any other send error still fails. Both detach paths use it.
+    let report = DRIVER.split("fn report_detached(").nth(1).unwrap();
+    let report = report.split("\n}\n").next().unwrap();
+    assert!(
+        report.contains("Err(Some(error)) if status_is(error, DW_STATUS_PEER_CLOSED) => Ok(()),")
+    );
+    assert!(report.contains("Err(_) => Err(()),"));
+    let isolate = DRIVER.split("fn isolate_stream<").nth(1).unwrap();
+    let isolate = isolate.split("\n}\n").next().unwrap();
+    assert!(isolate.contains("report_detached(control, detached)"));
+    assert!(!isolate.contains("send_control("));
+    let writer = DRIVER.split("fn service_stream_write<").nth(1).unwrap();
+    let writer = writer.split("\n}\n").next().unwrap();
+    assert!(writer.contains("report_detached(control, detached)?;"));
+    assert!(!writer.contains("send_control("));
 
     // The pre-existing post-`Retire` peer-close shutdown at the top of the
     // loop is untouched.
@@ -435,5 +455,40 @@ fn a_lost_control_peer_orphans_the_driver_instead_of_shutting_it_down() {
             < DRIVER[admitted..]
                 .find("service_graceful_retire_drain(")
                 .unwrap()
+    );
+}
+
+/// `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §3.2: the receive loop collapses
+/// every detach cause onto one outcome, so each producer records its cause
+/// before the collapse, and before isolation can fail and lose it.
+#[test]
+fn every_stream_detach_records_its_cause_before_isolating() {
+    let receive = DRIVER.split("fn service_stream_read<").nth(1).unwrap();
+    let receive = receive.split("\n}\n").next().unwrap();
+    assert_eq!(
+        receive
+            .matches("detached(driver, StreamDetachCause::")
+            .count(),
+        4
+    );
+    assert!(!receive.contains("StreamReadOutcome::Detached"));
+    // Each site's own block, from its opening brace to its return: the
+    // record comes first and the block's only isolation follows it.
+    for cause in ["Native(", "Overflow)", "Record(error)"] {
+        let site = receive
+            .find(&format!("detached(driver, StreamDetachCause::{cause}"))
+            .unwrap();
+        let open = receive[..site].rfind("{\n").unwrap();
+        let close = site + receive[site..].find("return Ok(outcome);").unwrap();
+        let block = &receive[open..close];
+        assert_eq!(
+            block.matches("isolate_stream(driver, control)?;").count(),
+            1
+        );
+        assert!(site - open < block.find("isolate_stream(driver, control)?;").unwrap());
+    }
+    let helper = DRIVER.split("fn detached<").nth(1).unwrap();
+    assert!(
+        helper.contains("driver.record_stream_detach(cause);\n    StreamReadOutcome::Detached")
     );
 }

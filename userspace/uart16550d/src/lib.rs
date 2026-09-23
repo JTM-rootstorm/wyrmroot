@@ -169,6 +169,47 @@ pub struct DriverCounters {
     pub stream_detaches: u32,
     pub rx_records: u32,
     pub tx_records: u32,
+    pub detach_causes: DetachCauseCounters,
+}
+
+/// Why a stream receive ended in a detach (F3A.6n, recorded since F3A.7l).
+///
+/// The recovery is the same for every cause -- isolate the stream and keep
+/// the driver running -- so the receive loop collapses them onto one outcome.
+/// `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §3.2 makes that collapse owe the
+/// instance to a reader, and [`ProductionDriver::record_stream_detach`] is
+/// where it is paid: each cause lands in [`DetachCauseCounters`], the
+/// out-of-band (§4.2) channel a person holding a stalled guest reads.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamDetachCause {
+    /// No stream was attached when the receive ran. Not a fault; counted on
+    /// its own so it is never mistaken for one.
+    NoStream,
+    /// `receive_channel` failed with a status other than WOULD_BLOCK or
+    /// PEER_CLOSED, encoded with `wyrmroot_runtime::native_error_code`.
+    Native(u32),
+    /// The receive reported more bytes or handles than its buffers hold.
+    Overflow,
+    /// [`ProductionDriver::accept_stream_record`] rejected the record.
+    Record(DriverError),
+}
+
+/// Per-cause detach counts. Saturating, like every other driver counter.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DetachCauseCounters {
+    pub no_stream: u32,
+    pub native: u32,
+    /// The most recent native cause, so the instance survives and not only
+    /// the count.
+    pub last_native: u32,
+    pub overflow: u32,
+    pub record_handles: u32,
+    pub record_protocol: u32,
+    pub record_capacity: u32,
+    /// A record rejection `accept_stream_record` does not produce today.
+    /// Named per variant below rather than caught by a wildcard (§3.4), so a
+    /// new rejection has to be placed deliberately.
+    pub record_other: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -655,6 +696,31 @@ impl<I: ByteRegisterIo> ProductionDriver<I> {
 
     pub const fn counters(&self) -> DriverCounters {
         self.counters
+    }
+
+    /// Records why a stream receive detached. Exhaustive over both the cause
+    /// and the record error, per `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §3.4.
+    pub fn record_stream_detach(&mut self, cause: StreamDetachCause) {
+        let causes = &mut self.counters.detach_causes;
+        let counter = match cause {
+            StreamDetachCause::NoStream => &mut causes.no_stream,
+            StreamDetachCause::Native(code) => {
+                causes.last_native = code;
+                &mut causes.native
+            }
+            StreamDetachCause::Overflow => &mut causes.overflow,
+            StreamDetachCause::Record(error) => match error {
+                DriverError::StreamHandles => &mut causes.record_handles,
+                DriverError::StreamProtocol => &mut causes.record_protocol,
+                DriverError::StreamCapacity => &mut causes.record_capacity,
+                DriverError::Stage(_)
+                | DriverError::NotActive
+                | DriverError::RegisterIo
+                | DriverError::Interrupt(_)
+                | DriverError::InterruptAck => &mut causes.record_other,
+            },
+        };
+        *counter = counter.saturating_add(1);
     }
 
     pub const fn stream_endpoint(&self) -> Option<ReceivedStreamEndpoint> {
@@ -1492,6 +1558,36 @@ mod tests {
             .acknowledge_interrupt(drained, true, |_| Ok(()))
             .unwrap();
         assert_eq!(driver.counters().interrupt_wakes, u32::MAX);
+    }
+
+    #[test]
+    fn every_stream_detach_cause_reaches_its_own_counter() {
+        let mut driver = production(FakeIo::new());
+        driver.record_stream_detach(StreamDetachCause::NoStream);
+        driver.record_stream_detach(StreamDetachCause::Native(0x1234));
+        driver.record_stream_detach(StreamDetachCause::Native(0x0042));
+        driver.record_stream_detach(StreamDetachCause::Overflow);
+        driver.record_stream_detach(StreamDetachCause::Record(DriverError::StreamHandles));
+        driver.record_stream_detach(StreamDetachCause::Record(DriverError::StreamProtocol));
+        driver.record_stream_detach(StreamDetachCause::Record(DriverError::StreamCapacity));
+        driver.record_stream_detach(StreamDetachCause::Record(DriverError::NotActive));
+        assert_eq!(
+            driver.counters().detach_causes,
+            DetachCauseCounters {
+                no_stream: 1,
+                native: 2,
+                last_native: 0x0042,
+                overflow: 1,
+                record_handles: 1,
+                record_protocol: 1,
+                record_capacity: 1,
+                record_other: 1,
+            }
+        );
+
+        driver.test_counters_mut().detach_causes.overflow = u32::MAX;
+        driver.record_stream_detach(StreamDetachCause::Overflow);
+        assert_eq!(driver.counters().detach_causes.overflow, u32::MAX);
     }
 
     #[test]

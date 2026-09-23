@@ -354,7 +354,9 @@ fn a_fatal_control_tick_submits_its_evidence_before_reporting_the_failure() {
     assert!(arm.contains("if !evidence_submitted {"));
     assert!(arm.contains("resident.controller().evidence_line(index)"));
     assert!(arm.contains("wyrmroot_runtime::submit_wyr1_evidence(record)"));
-    assert!(arm.contains("evidence_submitted = true;"));
+    // The arm returns right after the drain, so it does not set
+    // `evidence_submitted`: the write would never be read, and the guest
+    // build refuses it under `-D warnings`.
 
     // Nothing may return before the drain runs, or the arm is dead code.
     assert!(
