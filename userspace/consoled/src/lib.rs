@@ -1832,6 +1832,47 @@ mod tests {
     /// the live shell to keep serving. Both wait loops must drop the witness and
     /// carry on; neither may tear the shell down or report the serial lost.
     /// `main.rs` has no host build, so this reads it.
+    /// F3A.7k. devmgr's death also withdraws its publication, and registryd
+    /// completes consoled's watch with generation 0. Both registry arms must
+    /// keep serving on a withdrawal and rebuild only on a real republication.
+    #[test]
+    fn a_withdrawn_publication_keeps_the_session_serving() {
+        const MAIN: &str = include_str!("main.rs");
+        let main: std::string::String = MAIN.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(main.contains(
+            "#[cfg(feature=\"wyr1e-wyrmsh\")]constfnpublication_withdrawn(service_generation:u64)->bool{service_generation==0}"
+        ));
+        let guarded = "ifpublication_withdrawn(receive_publication_change(";
+        assert_eq!(
+            main.matches(guarded).count(),
+            2,
+            "both registry arms check for a withdrawal"
+        );
+        for (at, _) in main.match_indices(guarded) {
+            let arm = &main[at..at + 300];
+            let keep = arm
+                .find("continue;")
+                .expect("a withdrawal does not keep serving");
+            let rebuild = arm
+                .find("recover_serial(")
+                .or_else(|| arm.find("LaunchWaitOutcome::SerialLost"))
+                .expect("a republication no longer rebuilds the session");
+            assert!(keep < rebuild);
+        }
+        // Exactly the withdrawal test, and exactly `continue` when it holds.
+        for exact in [
+            "ifpublication_withdrawn(receive_publication_change(authorities,&mutserial)?){continue;}",
+            "ifpublication_withdrawn(receive_publication_change(authorities,serial)?){continue;}",
+        ] {
+            assert!(main.contains(exact), "missing exact guard {exact}");
+        }
+        // No registry arm may rebuild without asking first.
+        assert!(
+            !main.contains("receive_publication_change(authorities,&mutserial)?;recover_serial(")
+        );
+        assert!(!main.contains("receive_publication_change(authorities,serial)?;returnOk(LaunchWaitOutcome::SerialLost)"));
+    }
+
     #[test]
     fn an_orphaned_witness_is_dropped_and_the_session_keeps_serving() {
         const MAIN: &str = include_str!("main.rs");

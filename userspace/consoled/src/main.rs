@@ -172,6 +172,29 @@ fn drop_orphaned_witness(serial: &mut SerialSession) -> Result<(), u32> {
     close_handle(witness).map_err(|_| FATAL_ATTACH_BASE | 106)
 }
 
+/// Whether a publication change is devmgr's publication being withdrawn
+/// while consoled still serves the line, rather than a new publication.
+///
+/// F3A.7k, the second half of `drop_orphaned_witness`. The serial connector's
+/// publication endpoint lives only in devmgr, so when devmgr dies registryd
+/// withdraws `device.serial.console0` and completes consoled's watch with
+/// generation 0 (`registryd` `RegistryState::peer_closed`). That is the same
+/// fact the orphaned witness reports -- devmgr is gone -- seen through the
+/// registry, and it says nothing about the serial line the driver still
+/// serves. Treating it as serial loss closed the raw endpoint and silenced
+/// the console in every degraded boot whose episode fired. A new generation
+/// is a real republication and still rebuilds the session. The watch is
+/// one-shot, so nothing further arrives on it.
+#[cfg(feature = "wyr1e-wyrmsh")]
+const fn publication_withdrawn(service_generation: u64) -> bool {
+    service_generation == 0
+}
+
+#[cfg(not(feature = "wyr1e-wyrmsh"))]
+const fn publication_withdrawn(_service_generation: u64) -> bool {
+    false
+}
+
 #[derive(Clone, Copy)]
 struct ActiveWatch {
     transaction_id: u64,
@@ -1352,7 +1375,9 @@ fn wait_launch_with_serial(
         match index {
             0 if observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 => return Err(45),
             0 => {
-                receive_publication_change(authorities, serial)?;
+                if publication_withdrawn(receive_publication_change(authorities, serial)?) {
+                    continue;
+                }
                 return Ok(LaunchWaitOutcome::SerialLost);
             }
             1 => return Ok(LaunchWaitOutcome::SerialLost),
@@ -1615,7 +1640,9 @@ fn event_loop(
                 if signals & DW_SIGNAL_PEER_CLOSED.0 != 0 {
                     return Err(57);
                 }
-                receive_publication_change(authorities, &mut serial)?;
+                if publication_withdrawn(receive_publication_change(authorities, &mut serial)?) {
+                    continue;
+                }
                 recover_serial(
                     authorities,
                     transactions,

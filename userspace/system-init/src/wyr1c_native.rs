@@ -3234,6 +3234,15 @@ where
         .ok_or(InitError::AbsentState(0x3c))?;
     let Some(devmgr) = state.devmgr else {
         resident.result = RecoveryResult::Degraded;
+        // F3A.7k. DEGRADED has no devmgr, and this used to return here -- so
+        // once the WYR0-I budget exhausted, init stopped supervising the
+        // console and shell it had just kept alive: no job dispatch, no
+        // console exit, no session end and no terminal evidence. The console
+        // stack still needs all of that; only the devmgr-driven half of the
+        // tick has nothing to watch.
+        #[cfg(feature = "wyr1e-production")]
+        return wyr1e_resident_step(resident, system, loader, waits, now_ns, false);
+        #[cfg(not(feature = "wyr1e-production"))]
         return Ok(resident.controller.mode());
     };
     let mut items = [DwWaitItemV1::default(); 7];
@@ -3725,97 +3734,123 @@ where
         }
     }
     #[cfg(feature = "wyr1e-production")]
-    {
-        let outcome = wyr1e::poll(resident, system, loader, waits, now_ns)?;
+    return wyr1e_resident_step(resident, system, loader, waits, now_ns, true);
+    #[cfg(not(feature = "wyr1e-production"))]
+    Ok(resident.controller.mode())
+}
+
+/// The console/shell half of the resident tick.
+///
+/// Factored out in F3A.7k so DEGRADED, which has no devmgr to wait on, still
+/// runs it. With `devmgr_present` false only the outcomes that need no
+/// devmgr are served: `Stable` and a finished session. Anything else would
+/// rebuild devmgr, the registry or a console out of a publication that died
+/// with devmgr, and is refused at its own site rather than attempted on half
+/// a topology.
+#[cfg(feature = "wyr1e-production")]
+fn wyr1e_resident_step<S, L, W>(
+    resident: &mut ResidentSystemInit,
+    system: &mut S,
+    loader: &mut L,
+    waits: &mut W,
+    now_ns: u64,
+    devmgr_present: bool,
+) -> Result<SystemMode, InitError>
+where
+    S: Wyr1BPlatform,
+    L: LoaderPlatform<Error = NativeError>,
+    W: SupervisionPlatform<Error = NativeError>,
+{
+    let outcome = wyr1e::poll(resident, system, loader, waits, now_ns)?;
+    #[cfg(feature = "wyr1f-closure")]
+    let outcome = wyr1f_closure_trigger(resident, outcome);
+    #[cfg(feature = "wyr1f-closure")]
+    record_wyr1f_bringup(resident)?;
+    // F3A.7g. Handled before the recovery dispatch below, and outside the
+    // bootfs mapping it opens: every other non-`Stable` outcome rebuilds
+    // something out of the archive, and this one builds nothing.
+    if outcome == wyr1e::PollOutcome::SessionComplete {
+        retire_for_session_shutdown(resident, system, waits)?;
+        resident.observe_session_complete();
+        // F3A.7k. The end of the session is the end of the instrumented
+        // run, so it is where the supervisor's evidence gets its terminal
+        // record. `main` submits the finalized log, and the kernel answers
+        // the terminal record with DWTEST1 before init exits.
         #[cfg(feature = "wyr1f-closure")]
-        let outcome = wyr1f_closure_trigger(resident, outcome);
-        #[cfg(feature = "wyr1f-closure")]
-        record_wyr1f_bringup(resident)?;
-        // F3A.7g. Handled before the recovery dispatch below, and outside the
-        // bootfs mapping it opens: every other non-`Stable` outcome rebuilds
-        // something out of the archive, and this one builds nothing.
-        if outcome == wyr1e::PollOutcome::SessionComplete {
-            retire_for_session_shutdown(resident, system, waits)?;
-            resident.observe_session_complete();
-            // F3A.7k. The end of the session is the end of the instrumented
-            // run, so it is where the supervisor's evidence gets its terminal
-            // record. `main` submits the finalized log, and the kernel answers
-            // the terminal record with DWTEST1 before init exits.
-            #[cfg(feature = "wyr1f-closure")]
-            finalize_wyr1f_evidence(resident)?;
-            return Ok(resident.controller.mode());
+        finalize_wyr1f_evidence(resident)?;
+        return Ok(resident.controller.mode());
+    }
+    if outcome != wyr1e::PollOutcome::Stable {
+        if !devmgr_present {
+            return Err(InitError::AbsentState(0x98));
         }
-        if outcome != wyr1e::PollOutcome::Stable {
-            if matches!(
-                outcome,
-                wyr1e::PollOutcome::RecoverDevmgr | wyr1e::PollOutcome::RecoverRegistry(_)
-            ) && wyr1e::recovery_deadline(resident)?.is_some()
-            {
-                return attribute_failure(
-                    RecoveryOperation::RecoveryFallback,
-                    Err(InitError::Supervision),
-                );
-            }
-            let size = system
-                .query_memory_object_size(resident.authority.bootfs)
-                .map_err(InitError::Native)?;
-            let plan = MappingPlan::for_bootfs(size).map_err(|error| {
-                ordinary_mapping_error(MappingDiagnosticSite::RegistryReplacement, error, size)
-            })?;
-            return system
-                .with_bootfs_bytes(
-                    resident.authority.parent_root,
-                    resident.authority.bootfs,
-                    plan,
-                    |system, bootfs| {
-                        match outcome {
-                            // Both are unreachable here: `Stable` does not
-                            // enter this block and `SessionComplete` returned
-                            // above. Neither is collapsed into the other, so a
-                            // future outcome cannot inherit a recovery arm by
-                            // accident.
-                            wyr1e::PollOutcome::Stable | wyr1e::PollOutcome::SessionComplete => {
-                                Ok(())
-                            }
-                            wyr1e::PollOutcome::LaunchConsole => {
-                                let launched = wyr1e::launch_after_publication_observed(
-                                    resident, system, loader, waits, bootfs,
-                                );
-                                attribute_failure(RecoveryOperation::StartConsole, launched)
-                            }
-                            wyr1e::PollOutcome::RecoverDevmgr => {
-                                recover_devmgr(resident, system, loader, waits, bootfs)
-                            }
-                            wyr1e::PollOutcome::RecoverRegistry(phase) => recover_registry(
-                                resident,
-                                system,
-                                loader,
-                                waits,
-                                bootfs,
-                                false,
-                                false,
-                                abandoned::reason(abandoned::trigger::WYR1E_POLL, phase),
-                            ),
-                            #[cfg(feature = "wyr1e8-selector33")]
-                            wyr1e::PollOutcome::RecoverRegistryForE8 => recover_registry(
-                                resident,
-                                system,
-                                loader,
-                                waits,
-                                bootfs,
-                                false,
-                                true,
-                                abandoned::reason(
-                                    abandoned::trigger::WYR1E_POLL_E8,
-                                    abandoned::phase::NONE,
-                                ),
-                            ),
-                        }?;
-                        Ok(resident.controller.mode())
-                    },
-                )
-                .map_err(InitError::Native)?;
+        if matches!(
+            outcome,
+            wyr1e::PollOutcome::RecoverDevmgr | wyr1e::PollOutcome::RecoverRegistry(_)
+        ) && wyr1e::recovery_deadline(resident)?.is_some()
+        {
+            return attribute_failure(
+                RecoveryOperation::RecoveryFallback,
+                Err(InitError::Supervision),
+            );
         }
+        let size = system
+            .query_memory_object_size(resident.authority.bootfs)
+            .map_err(InitError::Native)?;
+        let plan = MappingPlan::for_bootfs(size).map_err(|error| {
+            ordinary_mapping_error(MappingDiagnosticSite::RegistryReplacement, error, size)
+        })?;
+        return system
+            .with_bootfs_bytes(
+                resident.authority.parent_root,
+                resident.authority.bootfs,
+                plan,
+                |system, bootfs| {
+                    match outcome {
+                        // Both are unreachable here: `Stable` does not
+                        // enter this block and `SessionComplete` returned
+                        // above. Neither is collapsed into the other, so a
+                        // future outcome cannot inherit a recovery arm by
+                        // accident.
+                        wyr1e::PollOutcome::Stable | wyr1e::PollOutcome::SessionComplete => Ok(()),
+                        wyr1e::PollOutcome::LaunchConsole => {
+                            let launched = wyr1e::launch_after_publication_observed(
+                                resident, system, loader, waits, bootfs,
+                            );
+                            attribute_failure(RecoveryOperation::StartConsole, launched)
+                        }
+                        wyr1e::PollOutcome::RecoverDevmgr => {
+                            recover_devmgr(resident, system, loader, waits, bootfs)
+                        }
+                        wyr1e::PollOutcome::RecoverRegistry(phase) => recover_registry(
+                            resident,
+                            system,
+                            loader,
+                            waits,
+                            bootfs,
+                            false,
+                            false,
+                            abandoned::reason(abandoned::trigger::WYR1E_POLL, phase),
+                        ),
+                        #[cfg(feature = "wyr1e8-selector33")]
+                        wyr1e::PollOutcome::RecoverRegistryForE8 => recover_registry(
+                            resident,
+                            system,
+                            loader,
+                            waits,
+                            bootfs,
+                            false,
+                            true,
+                            abandoned::reason(
+                                abandoned::trigger::WYR1E_POLL_E8,
+                                abandoned::phase::NONE,
+                            ),
+                        ),
+                    }?;
+                    Ok(resident.controller.mode())
+                },
+            )
+            .map_err(InitError::Native)?;
     }
     Ok(resident.controller.mode())
 }

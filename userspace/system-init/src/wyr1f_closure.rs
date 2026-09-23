@@ -490,6 +490,42 @@ mod tests {
         assert!(parse.contains("parse_gate_config(entry.data()).map_err(InitError::GateConfig)?"));
     }
 
+    /// F3A.7k. DEGRADED has no devmgr, and the tick used to return before the
+    /// console/shell step, so nothing after the episode -- `exit`, the
+    /// session end, the terminal evidence -- could ever happen.
+    #[test]
+    fn the_degraded_tick_still_supervises_the_console_and_shell() {
+        let native: std::string::String = include_str!("wyr1c_native.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let absent = native
+            .find("letSome(devmgr)=state.devmgrelse{")
+            .expect("the devmgr-absent branch moved");
+        let branch = &native[absent..absent + 900];
+        assert!(
+            branch
+                .contains("returnwyr1e_resident_step(resident,system,loader,waits,now_ns,false);")
+        );
+        assert!(
+            native.contains("returnwyr1e_resident_step(resident,system,loader,waits,now_ns,true);")
+        );
+        let step = native
+            .find("fnwyr1e_resident_step<")
+            .expect("the console/shell step is gone");
+        let step = &native[step..];
+        let refuse = step
+            .find("if!devmgr_present{returnErr(InitError::AbsentState(0x98));}")
+            .expect("without devmgr the step no longer refuses devmgr-dependent outcomes");
+        let complete = step
+            .find("ifoutcome==wyr1e::PollOutcome::SessionComplete{")
+            .expect("the step no longer handles a finished session");
+        let dispatch = step
+            .find("with_bootfs_bytes(")
+            .expect("the recovery dispatch moved");
+        assert!(complete < refuse && refuse < dispatch);
+    }
+
     fn drain(evidence: &mut BringupEvidence) -> std::vec::Vec<(crate::RoleId, u64, u64)> {
         let mut out = std::vec::Vec::new();
         while let Some(due) = evidence.next_due() {
