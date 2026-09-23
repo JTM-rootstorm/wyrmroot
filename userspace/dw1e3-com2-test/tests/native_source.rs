@@ -118,24 +118,18 @@ fn selector31_finalize_rejoins_stage1_and_peer_close_in_either_arrival_order() {
     assert!(peer_close.contains("send_e3a_finalize_retire(resident, system)"));
 }
 
+/// Source text because devmgr's `service_selector31_driver_control` calls the
+/// native syscalls directly and has no host seam to drive it through yet (S2U).
+/// The broker model's early/duplicate FinalizeRetire rejection is held by
+/// behaviour, by connector.rs's host tests
+/// `selector_finalize_rejects_early_duplicate_and_mismatched_attach_without_mutation`
+/// and `selector_reap_before_client_certificate_keeps_u2_blocked`.
 #[test]
-fn selector31_binding_ready_and_broker_model_reject_early_or_duplicate_finalize() {
+fn selector31_devmgr_forwards_one_binding_ready_for_the_current_binding() {
     let service = DEVMGR
         .split("fn service_selector31_driver_control")
         .nth(1)
         .unwrap();
     assert!(service.contains("binding != Some(ready) || *binding_ready"));
     assert!(service.contains("*binding_ready = true;"));
-
-    let model = include_str!("../../devmgr/src/connector.rs");
-    for required in [
-        "fn selector_finalize_client_release",
-        "let ConnectorSlot::Active { attach, .. } = self.slot",
-        "self.current != Some(observed_driver)",
-        "attach.stream_generation != observed_stream_generation",
-        "selector_finalize_rejects_early_duplicate_and_mismatched_attach_without_mutation",
-        "selector_reap_before_client_certificate_keeps_u2_blocked",
-    ] {
-        assert!(model.contains(required), "missing {required}");
-    }
 }
