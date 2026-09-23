@@ -344,18 +344,16 @@ mod tests {
 
     /// F1B.4: "extra method/right/handle added to shell or job".
     ///
-    /// The episode adds no shell or job surface at all. It is confined to init:
-    /// one observation recorded by the dispatcher at a join it already computed,
-    /// and one state machine on the resident. Nothing reaches `wyr1b_job`, and the
-    /// shell and job profiles are whatever they were -- which is why the matched
-    /// siblings' launch policies are byte-identical.
-    /// F1B.4: "extra method/right/handle added to shell or job".
-    ///
     /// The episode adds no shell or job surface at all. It is confined to
     /// init: one first-READY identity recorded by the dispatcher at a join it
     /// already computes, and one state machine on the resident. Nothing reaches
     /// `wyr1b_job`, and the shell and job profiles are whatever they were --
     /// which is why the matched siblings' launch policies are byte-identical.
+    ///
+    /// Source text because the property is an absence of names across modules
+    /// the episode could reach but does not; no host call can observe a surface
+    /// that was never added. `unsafe` is not scanned for: lib.rs's
+    /// `#![forbid(unsafe_code)]` already refuses it crate-wide.
     #[test]
     fn the_closure_episode_adds_no_shell_or_job_authority() {
         let jobs = include_str!("wyr1b_job.rs");
@@ -381,12 +379,12 @@ mod tests {
             assert!(!span.contains("ClosureEpisode"));
             assert!(!span.contains("wyr1f_closure"));
         }
-        // The episode itself never names a launch profile, a right or a
-        // handle, and contains no `unsafe`. Scanned above `#[cfg(test)]`,
-        // because this test names those very words a few lines down.
+        // The episode itself never names a launch profile, a right, a handle
+        // or a channel. Scanned above `#[cfg(test)]`, because this test names
+        // those very words a few lines down.
         let whole = include_str!("wyr1f_closure.rs");
         let episode = &whole[..whole.find("#[cfg(test)]").expect("test module")];
-        for forbidden in ["LaunchProfile", "DwRights", "DwHandle", "Channel", "unsafe"] {
+        for forbidden in ["LaunchProfile", "DwRights", "DwHandle", "Channel"] {
             assert!(
                 !episode.contains(forbidden),
                 "episode must not name {forbidden}"
