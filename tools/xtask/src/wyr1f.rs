@@ -872,30 +872,40 @@ fn fixed_fields(product_kind: wyr1c::Wyr1fProduct) -> [(&'static str, &'static s
         // numbers against the constants the kernel links, so a capacity change
         // there fails Deepwyrm's own suite before it can reach a product whose
         // receipt still claims the old figure.
+        // F3A.7k: the instrumented siblings select Deepwyrm's WYR1-F fairness
+        // ledger (`wyr1f_fairness_resource_geometry.rs`), because the
+        // interactive geometry's thirty-two handles refused the second
+        // concurrent hog. Every figure below follows that ledger's `SELECTED`.
         (
             "kernel_resource_geometry",
             if instrumented {
-                "wyr1e-interactive"
+                "wyr1f-fairness"
             } else {
                 "production"
             },
         ),
-        // Sixteen in both, for different reasons: production selects its
-        // ledger's `identities`, the instrumented arm its literal. They agree
-        // today, and are recorded so that stays visible if one moves.
-        ("kernel_identity_capacity", "16"),
+        (
+            "kernel_identity_capacity",
+            if instrumented { "64" } else { "16" },
+        ),
         (
             "kernel_handle_capacity",
-            if instrumented { "32" } else { "48" },
+            if instrumented { "64" } else { "48" },
         ),
-        ("kernel_registry_capacity", "160"),
+        (
+            "kernel_registry_capacity",
+            if instrumented { "192" } else { "160" },
+        ),
         // The linked per-thread kernel-stack arena. `identities` becomes
         // `THREADS` and every Thread needs one of these carriers, so a product
         // whose identity capacity exceeds this number boots nothing at all --
         // silently, because the release build folds the unsatisfiable
         // continuation away. Bound here so the relation is legible in the
         // receipt rather than only in a const assert.
-        ("kernel_thread_stack_count", "16"),
+        (
+            "kernel_thread_stack_count",
+            if instrumented { "64" } else { "16" },
+        ),
         ("com1_role", "trusted-serial-diagnostics"),
         ("com2_role", "native-shell-byte-stream"),
         ("com2_transport", "unix-socket-byte-stream"),
