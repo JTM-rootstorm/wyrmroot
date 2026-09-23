@@ -1827,6 +1827,54 @@ mod tests {
     /// deleted, moved after the relaunch, or joined by a second relaunch all
     /// fail. A substring test for `session_shutdown` alone would survive all
     /// three.
+    /// F3A.7k. A witness released while raw custody holds means devmgr is gone,
+    /// not the serial line, and closure contract §5.4 requires the console and
+    /// the live shell to keep serving. Both wait loops must drop the witness and
+    /// carry on; neither may tear the shell down or report the serial lost.
+    /// `main.rs` has no host build, so this reads it.
+    #[test]
+    fn an_orphaned_witness_is_dropped_and_the_session_keeps_serving() {
+        const MAIN: &str = include_str!("main.rs");
+        let squeeze = |text: &str| -> std::string::String {
+            text.chars().filter(|c| !c.is_whitespace()).collect()
+        };
+        let main = squeeze(MAIN);
+        let helper = main
+            .find("fndrop_orphaned_witness(serial:&mutSerialSession)")
+            .expect("the orphaned-witness helper is gone");
+        let helper = &main[helper..helper + 300];
+        assert!(helper.contains("serial.release_witness.take()"));
+        assert!(helper.contains("close_handle(witness)"));
+
+        let observed = "observe_release_witness(";
+        let mut sites = 0;
+        for (at, _) in main.match_indices("ifwitness_index==Some(") {
+            let branch = &main[at..at + 400];
+            let wyrmsh = branch
+                .find("#[cfg(feature=\"wyr1e-wyrmsh\")]{")
+                .expect("a witness branch has no wyrmsh arm");
+            let arm = &branch[wyrmsh..];
+            let arm = &arm[..arm.find("}").expect("the wyrmsh arm never closes")];
+            let observe = arm
+                .find(observed)
+                .expect("the release is not validated first");
+            let drop = arm
+                .find("drop_orphaned_witness(")
+                .expect("the witness is not dropped");
+            assert!(observe < drop);
+            assert!(arm[drop..].contains("continue;"));
+            assert!(!arm.contains("recover_serial("));
+            assert!(!arm.contains("SerialLost"));
+            sites += 1;
+        }
+        assert_eq!(sites, 2, "both wait loops watch the witness");
+        // A dropped witness must stop being waited on, not fail the next wait.
+        assert_eq!(
+            main.matches("serial.release_witness.map(|witness|").count(),
+            2
+        );
+    }
+
     #[test]
     fn terminal_recovery_checks_for_a_session_shutdown_before_it_relaunches() {
         const MAIN: &str = include_str!("main.rs");

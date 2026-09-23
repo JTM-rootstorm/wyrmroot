@@ -150,6 +150,28 @@ fn observe_release_witness(serial: &SerialSession, signals: DwSignals) -> Result
     Ok(())
 }
 
+/// Releases a witness whose other end is gone while raw custody still holds.
+///
+/// F3A.7k. devmgr retains the witness's other end as the lifetime certificate
+/// of this client generation, and never closes it while it lives: a driver
+/// retirement waits for *this* side to release first. So a pure release seen
+/// here, with the raw endpoint still open, means the certificate's observer
+/// is gone -- devmgr exited -- and says nothing about the serial line the
+/// driver serves. Closure contract §5.4 requires consoled and the live shell
+/// to keep serving across that loss, and they used to be torn down instead:
+/// `recover_serial` killed the shell and waited for a republication that a
+/// degraded devmgr never makes. A real serial loss still arrives on the raw
+/// endpoint, and a replacement devmgr retires the retained console stack
+/// explicitly (`wyr1c_native::retire_retained_device_topology`).
+#[cfg(feature = "wyr1e-wyrmsh")]
+fn drop_orphaned_witness(serial: &mut SerialSession) -> Result<(), u32> {
+    let witness = serial
+        .release_witness
+        .take()
+        .ok_or(FATAL_ATTACH_BASE | 102)?;
+    close_handle(witness).map_err(|_| FATAL_ATTACH_BASE | 106)
+}
+
 #[derive(Clone, Copy)]
 struct ActiveWatch {
     transaction_id: u64,
@@ -1279,15 +1301,15 @@ fn wait_launch_with_serial(
         );
         let mut used = 3;
         #[cfg(feature = "wyr1e-wyrmsh")]
-        let witness_index = {
+        let witness_index = serial.release_witness.map(|witness| {
             let index = used;
             items[index] = wait_item(
-                serial.release_witness.ok_or(45u32)?,
+                witness,
                 DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
             );
             used += 1;
-            Some(index)
-        };
+            index
+        });
         #[cfg(not(feature = "wyr1e-wyrmsh"))]
         let witness_index: Option<usize> = None;
         let status_index = if let Some(session) = status_session.as_deref() {
@@ -1308,7 +1330,12 @@ fn wait_launch_with_serial(
         let index = usize::try_from(observed.index).map_err(|_| 45u32)?;
         if witness_index == Some(index) {
             #[cfg(feature = "wyr1e-wyrmsh")]
-            observe_release_witness(serial, observed.observed)?;
+            {
+                observe_release_witness(serial, observed.observed)?;
+                drop_orphaned_witness(serial)?;
+                continue;
+            }
+            #[cfg(not(feature = "wyr1e-wyrmsh"))]
             return Ok(LaunchWaitOutcome::SerialLost);
         }
         if status_index == Some(index) {
@@ -1439,15 +1466,15 @@ fn event_loop(
         #[cfg(not(feature = "wyr1e-wyrmsh"))]
         let data_base = initial_data_base;
         #[cfg(feature = "wyr1e-wyrmsh")]
-        let witness_index = {
+        let witness_index = serial.release_witness.map(|witness| {
             let index = data_base;
             items[index] = wait_item(
-                serial.release_witness.ok_or(61u32)?,
+                witness,
                 DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
             );
             data_base += 1;
-            Some(index)
-        };
+            index
+        });
         #[cfg(not(feature = "wyr1e-wyrmsh"))]
         let witness_index: Option<usize> = None;
         #[cfg(feature = "wyr1e8-recovery")]
@@ -1545,18 +1572,25 @@ fn event_loop(
 
         if witness_index == Some(observed_index) {
             #[cfg(feature = "wyr1e-wyrmsh")]
-            observe_release_witness(&serial, observed.observed)?;
-            recover_serial(
-                authorities,
-                transactions,
-                model,
-                &mut serial,
-                &mut child,
-                &mut input_pending,
-                &mut output_pending,
-            )?;
-            next_data = DataClass::Raw;
-            continue;
+            {
+                observe_release_witness(&serial, observed.observed)?;
+                drop_orphaned_witness(&mut serial)?;
+                continue;
+            }
+            #[cfg(not(feature = "wyr1e-wyrmsh"))]
+            {
+                recover_serial(
+                    authorities,
+                    transactions,
+                    model,
+                    &mut serial,
+                    &mut child,
+                    &mut input_pending,
+                    &mut output_pending,
+                )?;
+                next_data = DataClass::Raw;
+                continue;
+            }
         }
 
         if recovery_index == Some(observed_index) {
