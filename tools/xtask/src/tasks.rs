@@ -150,6 +150,28 @@ pub(crate) struct DeterministicUefiArtifacts {
     _target_authority: Option<UefiTargetAuthority>,
 }
 
+impl DeterministicUefiArtifacts {
+    /// UEFI artifacts with fixed digests, for testing code that only renders
+    /// them. No file behind them exists.
+    #[cfg(test)]
+    pub(crate) fn test_identity(
+        effective_config_sha256: &str,
+        inspection_report_sha256: &str,
+    ) -> Self {
+        Self {
+            loader: PathBuf::new(),
+            loader_bytes: Vec::new(),
+            debug_loader: PathBuf::new(),
+            debug_symbols: PathBuf::new(),
+            effective_config: String::new(),
+            effective_config_sha256: effective_config_sha256.to_owned(),
+            inspection_report: String::new(),
+            inspection_report_sha256: inspection_report_sha256.to_owned(),
+            _target_authority: None,
+        }
+    }
+}
+
 struct UefiTargetAuthority {
     production: crate::secure_fs::InheritableDirectory,
     retained_debug: crate::secure_fs::InheritableDirectory,

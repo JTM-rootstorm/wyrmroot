@@ -49,6 +49,37 @@ pub(crate) struct AcceptedToolchain {
 }
 
 impl AcceptedToolchain {
+    /// A toolchain whose identity fields are fixed labels, for testing code
+    /// that only renders them. `rustc` must be a readable file: renderers hash
+    /// it. Nothing here was validated, so it must never reach a build.
+    #[cfg(test)]
+    pub(crate) fn test_identity(rustc: PathBuf) -> Self {
+        let label = |name: &str| format!("fixture-{name}");
+        Self {
+            rustc: rustc.clone(),
+            rustc_sha256: label("rustc"),
+            cargo: rustc.clone(),
+            rust_lld: rustc.clone(),
+            sysroot: rustc.clone(),
+            manifest_sha256: label("manifest"),
+            cargo_sha256: label("cargo"),
+            rust_lld_sha256: label("rust-lld"),
+            uefi_core_sha256: label("uefi-core"),
+            uefi_alloc_sha256: label("uefi-alloc"),
+            uefi_builtins_sha256: label("uefi-builtins"),
+            rustc_driver_sha256: label("rustc-driver"),
+            llvm_sha256: label("llvm"),
+            toolchain_tree_sha256: label("tree"),
+            root: rustc.clone(),
+            manifest: ArtifactComponent {
+                label: "fixture manifest",
+                path: rustc,
+                sha256: label("manifest"),
+            },
+            components: Vec::new(),
+        }
+    }
+
     pub(crate) fn verify_unchanged(&self) -> Result<(), Failure> {
         validate_component(&self.root, &self.manifest)?;
         for component in &self.components {

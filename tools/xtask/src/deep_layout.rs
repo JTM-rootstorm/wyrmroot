@@ -230,6 +230,19 @@ pub(crate) fn inspect_cargo_git_source(
 }
 
 impl DeepLayoutBuild {
+    /// A layout identity with fixed digests, for testing code that only
+    /// renders them. It names no source tree and must never reach a build.
+    #[cfg(test)]
+    pub(crate) fn test_identity(layout_sha256: &str, policy_sha256: &str) -> Self {
+        Self {
+            policy_path: PathBuf::new(),
+            layout_sha256: layout_sha256.to_owned(),
+            policy_sha256: policy_sha256.to_owned(),
+            source_root: PathBuf::new(),
+            expected_revision: String::new(),
+        }
+    }
+
     pub(crate) fn verify_unchanged(&self) -> Result<(), Failure> {
         verify_git_source_identity(&self.source_root, &self.expected_revision)?;
         let layout_path = self.source_root.join(LAYOUT_PATH);

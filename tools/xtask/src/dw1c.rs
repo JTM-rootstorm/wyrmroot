@@ -2044,18 +2044,56 @@ mod tests {
         assert!(canonical_repository_path(Path::new("/tmp"), "Deepwyrm").is_err());
     }
 
+    /// C0 §9.1 binds the evidence nonce to the Deep selector build only: the
+    /// Wyrmroot source receipt carries the progress digest native init0 and the
+    /// actors correlate on, and no nonce at all.
     #[test]
-    fn wyr_source_contract_binds_digest_but_not_deep_only_nonce() {
-        let source = include_str!("dw1c.rs");
-        let renderer = source
-            .split_once("fn render_wyr_source_receipt")
-            .expect("source receipt renderer")
-            .1
-            .split_once("fn native_build_command")
-            .expect("next item")
-            .0;
-        assert!(renderer.contains("progress_digest"));
-        assert!(renderer.contains("no evidence_nonce field"));
+    fn wyr_source_receipt_binds_the_progress_digest_and_no_evidence_nonce() {
+        let root = std::env::temp_dir().join(format!(
+            "dw1c-wyr-receipt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let rustc = root.join("rustc");
+        fs::write(&rustc, b"fixture rustc").unwrap();
+        let toolchain = crate::toolchain_artifact::AcceptedToolchain::test_identity(rustc);
+        let layout = crate::deep_layout::DeepLayoutBuild::test_identity(
+            &sha256::bytes_digest(b"layout"),
+            &sha256::bytes_digest(b"policy"),
+        );
+        let uefi = crate::tasks::DeterministicUefiArtifacts::test_identity(
+            &sha256::bytes_digest(b"config"),
+            &sha256::bytes_digest(b"report"),
+        );
+        let actors: [Vec<u8>; 10] = std::array::from_fn(|index| vec![index as u8]);
+        let receipt = render_wyr_source_receipt(
+            "0123456789abcdef0123456789abcdef01234567",
+            "fedcba9876543210",
+            &toolchain,
+            &layout,
+            &uefi,
+            WyrReceiptArtifacts {
+                loader: b"loader",
+                bootstrap: b"bootstrap",
+                init0: b"init0",
+                hello: b"hello",
+                actors: &actors,
+            },
+            "validation-report",
+        )
+        .unwrap();
+        fs::remove_dir_all(&root).unwrap();
+        let fields = scalars(&receipt).unwrap();
+        assert_eq!(fields["progress_digest"], "fedcba9876543210");
+        assert_eq!(fields["kind"], "wyrmroot-dw1-c-wyr-source-build");
+        assert!(
+            !receipt.contains("nonce"),
+            "the Wyrmroot source receipt carries a nonce:\n{receipt}"
+        );
     }
 
     #[test]
