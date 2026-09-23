@@ -14,6 +14,7 @@ Usage:
     cargo xtask test host [filter]
     tools/pinned-cargo xtask test host native
     tools/pinned-cargo xtask test host full
+    tools/pinned-cargo xtask test host lint-ratchet
     tools/pinned-cargo xtask format
     tools/pinned-cargo xtask clippy
     tools/pinned-cargo xtask doc
@@ -105,6 +106,10 @@ even after one fails and lists the failures at the end. `native` runs every
 guest-target *-native gate once (each takes minutes); a narrower native filter
 it skips is covered by the one it runs. `full` is the unfiltered run followed by
 `native`. Every named filter still runs alone, with its own commands.
+`lint-ratchet`, also part of the unfiltered run, lints every shape a clippy gate
+reaches with clippy::wildcard_enum_match_arm and
+clippy::undocumented_unsafe_blocks at warn level and fails if any per-package
+count rises above tools/xtask/lint-baseline.toml.
 
 Host filters may name a component (bootfs, protocol, elf, runtime, bootstrap,
 efi, init0, hello, xtask, dw1c-init0, or dw1d6), one product area (registry,

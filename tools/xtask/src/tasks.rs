@@ -1380,6 +1380,8 @@ enum Route {
     AllNative,
     /// `full`: the unfiltered suite, then every native gate.
     Full,
+    /// The warn-level lint ratchet, which also runs in the unfiltered suite.
+    LintRatchet,
 }
 
 /// Every named `xtask test host` filter, and what it runs.
@@ -1393,6 +1395,7 @@ enum Route {
 const NAMED_HOST_FILTERS: &[(&str, Route)] = &[
     ("native", Route::AllNative),
     ("full", Route::Full),
+    ("lint-ratchet", Route::LintRatchet),
     ("selectors", Route::Host),
     ("wyr1e8-producer-fixture", Route::Host),
     ("wyr1d5-clippy", Route::Host),
@@ -1560,6 +1563,7 @@ pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<
             Ok(())
         }
         Some((_, Some(Route::AllNative))) => run_every_step(repository, native_steps()),
+        Some((_, Some(Route::LintRatchet))) => Step::LintRatchet.execute(repository),
         Some((_, Some(Route::Full))) => {
             let mut steps = default_steps()?;
             steps.extend(native_steps());
@@ -1580,6 +1584,7 @@ pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<
 enum Step {
     Cargo(CargoRun),
     Native(&'static str, NativeGate),
+    LintRatchet,
 }
 
 impl Step {
@@ -1587,6 +1592,10 @@ impl Step {
         match self {
             Self::Cargo(run) => format!("cargo {}", run.arguments.join(" ")),
             Self::Native(name, _) => format!("native gate {name}"),
+            Self::LintRatchet => format!(
+                "lint ratchet against {}",
+                crate::lint_ratchet::BASELINE_PATH
+            ),
         }
     }
 
@@ -1594,6 +1603,7 @@ impl Step {
         match self {
             Self::Cargo(run) => run.execute(repository),
             Self::Native(name, gate) => gate.run(repository, name),
+            Self::LintRatchet => crate::lint_ratchet::run(repository, &lint_ratchet_shapes()?),
         }
     }
 }
@@ -1606,7 +1616,8 @@ impl Step {
 /// nobody the wiser. Now it is:
 /// - a library check of every row of [`FEATURE_COMBINATIONS`] (`selectors`);
 /// - the workspace suite and the bootfs builder suite, as before;
-/// - every [`Route::Host`] filter's own commands, each distinct command once.
+/// - every [`Route::Host`] filter's own commands, each distinct command once;
+/// - the warn-level lint ratchet (S1.3) over every shape those gates lint.
 ///
 /// So a gate that exists runs here, and only the native gates do not.
 fn default_steps() -> Result<Vec<Step>, Failure> {
@@ -1621,7 +1632,37 @@ fn default_steps() -> Result<Vec<Step>, Failure> {
             }
         }
     }
-    Ok(runs.into_iter().map(Step::Cargo).collect())
+    let mut steps = runs.into_iter().map(Step::Cargo).collect::<Vec<_>>();
+    steps.push(Step::LintRatchet);
+    Ok(steps)
+}
+
+/// What the lint ratchet lints: the workspace in the default shape `xtask
+/// clippy` lints, and every distinct clippy command a named host gate runs.
+fn lint_ratchet_shapes() -> Result<Vec<Vec<String>>, Failure> {
+    let mut shapes = vec![
+        [
+            "clippy",
+            "--locked",
+            "--offline",
+            "--workspace",
+            "--all-targets",
+        ]
+        .map(str::to_owned)
+        .to_vec(),
+    ];
+    for (name, route) in NAMED_HOST_FILTERS {
+        if *route == Route::Host {
+            for run in named_host_runs(name)? {
+                if run.arguments.first().map(String::as_str) == Some("clippy")
+                    && !shapes.contains(&run.arguments)
+                {
+                    shapes.push(run.arguments);
+                }
+            }
+        }
+    }
+    Ok(shapes)
 }
 
 /// Every native gate, each once: `xtask test host native`.
@@ -2525,9 +2566,9 @@ mod tests {
         NATIVE_COVERED_BY, Route, Step, UefiCargoProfile, blocked_toolchain_failure,
         canonical_build_directory, canonical_project_root, component_package, default_steps,
         encoded_uefi_rustflags, encoded_uefi_rustflags_for_target, explicit_test_filter,
-        host_test_arguments, host_test_commands, is_listed_combination, named_host_filter,
-        named_host_runs, native_steps, prepare_uefi_target_roots, r1_clippy_command,
-        r1_status_command, render_uefi_inspection_report, run_verified_report,
+        host_test_arguments, host_test_commands, is_listed_combination, lint_ratchet_shapes,
+        named_host_filter, named_host_runs, native_steps, prepare_uefi_target_roots,
+        r1_clippy_command, r1_status_command, render_uefi_inspection_report, run_verified_report,
         selector_library_commands, selector32_library_commands, validate_regular_artifact,
         validate_uefi_inspection_report, wyr1e8_producer_fixture_command,
     };
@@ -3026,11 +3067,13 @@ mod tests {
         let steps = default_steps().unwrap();
         let runs = steps
             .iter()
-            .map(|step| match step {
-                Step::Cargo(run) => run.clone(),
+            .filter_map(|step| match step {
+                Step::Cargo(run) => Some(run.clone()),
                 Step::Native(name, _) => panic!("the unfiltered suite runs native gate {name}"),
+                Step::LintRatchet => None,
             })
             .collect::<Vec<_>>();
+        assert_eq!(steps.last(), Some(&Step::LintRatchet));
         for (name, route) in NAMED_HOST_FILTERS {
             if *route == Route::Host {
                 for run in named_host_runs(name).unwrap() {
@@ -3091,6 +3134,7 @@ mod tests {
             .map(|step| match step {
                 Step::Native(name, gate) => (name, gate),
                 Step::Cargo(run) => panic!("native runs a host command {:?}", run.arguments),
+                Step::LintRatchet => panic!("native runs the lint ratchet"),
             })
             .collect::<Vec<_>>();
         for (index, (name, gate)) in gates.iter().enumerate() {
@@ -3122,6 +3166,41 @@ mod tests {
         }
         assert_eq!(named_host_filter("native"), Some(Route::AllNative));
         assert_eq!(named_host_filter("full"), Some(Route::Full));
+    }
+
+    /// S1.3: the ratchet lints every shape a named clippy gate lints, plus the
+    /// workspace's default shape, and each once.
+    #[test]
+    fn the_lint_ratchet_covers_every_clippy_shape_a_gate_lints() {
+        let shapes = lint_ratchet_shapes().unwrap();
+        assert_eq!(
+            shapes[0],
+            [
+                "clippy",
+                "--locked",
+                "--offline",
+                "--workspace",
+                "--all-targets"
+            ]
+        );
+        for (name, route) in NAMED_HOST_FILTERS {
+            if *route == Route::Host {
+                for run in named_host_runs(name).unwrap() {
+                    if run.arguments[0] == "clippy" {
+                        assert!(shapes.contains(&run.arguments), "{name}");
+                    }
+                }
+            }
+        }
+        assert!(
+            shapes
+                .iter()
+                .any(|shape| shape.contains(&"--bin".to_owned()))
+        );
+        for (index, shape) in shapes.iter().enumerate() {
+            assert!(!shapes[..index].contains(shape));
+        }
+        assert_eq!(named_host_filter("lint-ratchet"), Some(Route::LintRatchet));
     }
 
     #[test]

@@ -11,6 +11,7 @@ mod g3_image;
 mod h_integration;
 mod h_request;
 mod i_b_closure;
+mod lint_ratchet;
 mod metadata;
 mod provenance;
 mod r1;
