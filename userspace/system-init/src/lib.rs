@@ -5631,10 +5631,6 @@ mod native_cleanup_tests {
             (InitError::Accounting, 0x02),
             (InitError::Supervision, 0x03),
             (InitError::Cleanup, 0x04),
-            (
-                InitError::Native(NativeError::Status(deepwyrm_syscall::DwStatus(-11))),
-                0x05,
-            ),
             (InitError::WrongManifestProfile, 0x06),
             (InitError::UnlaunchableRole, 0x07),
             (
@@ -5650,6 +5646,19 @@ mod native_cleanup_tests {
                 0xAF18_0100 | expected_kind
             );
         }
+        // F3A.6c gave a native status its own tag carrying the magnitude, so
+        // kind 0x05 no longer reads as `0xAF18_<op>05`.
+        let native = attribute_failure::<()>(
+            RecoveryOperation::TriggerWait,
+            Err(InitError::Native(NativeError::Status(
+                deepwyrm_syscall::DwStatus(-11),
+            ))),
+        )
+        .unwrap_err();
+        assert_eq!(
+            resident_tick_failure_application_status(&native),
+            0xAF1E_010B
+        );
 
         let nested = attribute_failure(
             RecoveryOperation::DriverRetired,
@@ -5667,6 +5676,7 @@ mod native_cleanup_tests {
             resident_tick_failure_application_status(&InitError::RecoveryTransition {
                 operation: 0,
                 initiating_kind: 0,
+                payload: 0,
                 emergency_cleanup: EmergencyCleanup::NotRun,
             }),
             0xAF18_0F0F
@@ -5726,6 +5736,7 @@ mod native_cleanup_tests {
                 InitError::RecoveryTransition {
                     operation: operation as u8,
                     initiating_kind: 4,
+                    payload: 0,
                     emergency_cleanup: EmergencyCleanup::NotRun,
                 }
             );
@@ -5748,10 +5759,13 @@ mod native_cleanup_tests {
                 Ok(None)
             );
         }
-        for operation in [0, 0x10, u8::MAX] {
+        // F3A.6e gave 0x10..=0xfe to the bring-up operations, so only 0x00
+        // and 0xff still clamp to the sentinel.
+        for operation in [0, u8::MAX] {
             let error = InitError::RecoveryTransition {
                 operation,
                 initiating_kind: 4,
+                payload: 0,
                 emergency_cleanup: EmergencyCleanup::NotRun,
             };
             assert_eq!(
@@ -5759,6 +5773,15 @@ mod native_cleanup_tests {
                 0xAF18_0F04
             );
         }
+        assert_eq!(
+            resident_tick_failure_application_status(&InitError::RecoveryTransition {
+                operation: RecoveryOperation::ReceiveProduct as u8,
+                initiating_kind: 4,
+                payload: 0,
+                emergency_cleanup: EmergencyCleanup::NotRun,
+            }),
+            0xAF18_1004
+        );
         assert_eq!(
             resident_tick_failure_application_status(&InitError::Cleanup),
             0xAF18_0F04
@@ -5785,7 +5808,8 @@ mod native_cleanup_tests {
             InitError::RecoveryTransition {
                 operation: RecoveryOperation::Quiesced as u8,
                 initiating_kind: 0x05,
-                payload: 0,
+                // F3A.6c: the native status's magnitude survives attribution.
+                payload: 11,
                 emergency_cleanup: cleanup,
             }
         );

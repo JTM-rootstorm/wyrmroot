@@ -1969,6 +1969,13 @@ mod tests {
         let peer = console_peer();
         let mut state = State::new(7).unwrap();
         state.console = Some(peer);
+        // Under E8 a live console always holds its control: installing the
+        // console sets it before the peer is installed.
+        #[cfg(feature = "wyr1e8-selector33")]
+        state
+            .shell
+            .set_e8_console_control(peer.loaded.launch_channel)
+            .unwrap();
         state.shell.observe_session_shutdown();
 
         let outcome = reconcile_job_dispatcher_outcome(
