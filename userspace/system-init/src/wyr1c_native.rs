@@ -3847,14 +3847,22 @@ where
         {
             failed |= DRIVER;
         }
-        if let Some(devmgr) = state.devmgr.take()
-            && retire_role_for_shutdown(system, waits, devmgr.loaded, devmgr.task_group, None)
+        // `active[1]` and `active[0]` are copies of devmgr's and the
+        // registry's handles, not separate roles: every path that takes one
+        // clears the other with it. F3A.7j found this teardown retiring both
+        // twice -- here and again through the table below, on handles already
+        // closed -- which is the `EARLY_ROLES` failure run 6 reported.
+        if let Some(devmgr) = state.devmgr.take() {
+            resident.active[1] = None;
+            if retire_role_for_shutdown(system, waits, devmgr.loaded, devmgr.task_group, None)
                 .is_err()
-        {
-            failed |= DEVMGR;
+            {
+                failed |= DEVMGR;
+            }
         }
-        if let Some(registry) = state.registry.take()
-            && retire_role_for_shutdown(
+        if let Some(registry) = state.registry.take() {
+            resident.active[0] = None;
+            if retire_role_for_shutdown(
                 system,
                 waits,
                 registry.active.loaded,
@@ -3862,14 +3870,14 @@ where
                 Some(registry.control_channel),
             )
             .is_err()
-        {
-            failed |= REGISTRY;
+            {
+                failed |= REGISTRY;
+            }
         }
         state.binding = None;
     }
-    // Anything still in the early-role table. A production boot moves its
-    // roles into the resident state above and leaves these empty, so this is
-    // the arm that must not be assumed away rather than the one that runs.
+    // Anything still in the early-role table, which after the block above is
+    // only a role the resident state never held.
     for index in 0..resident.active.len() {
         let Some(active) = resident.active[index].take() else {
             continue;

@@ -3922,6 +3922,45 @@ mod native_cleanup_tests {
         );
     }
 
+    /// F3A.7j. Run 6 exited `0xAF22_1710`: only the early-role step failed,
+    /// because `active[0]` and `active[1]` hold copies of the registry's and
+    /// devmgr's handles and the teardown retired each role twice. Taking a
+    /// role must clear its mirror before the table is walked.
+    #[test]
+    fn a_shutdown_retires_each_mirrored_role_once() {
+        const TEARDOWN: &str = include_str!("wyr1c_native.rs");
+
+        let start = TEARDOWN
+            .find("fn retire_for_session_shutdown<")
+            .expect("the session teardown is gone");
+        let body = &TEARDOWN[start..];
+        let body = &body[..body.find("\n}\n").expect("the teardown never closes")];
+        let table = body
+            .find("for index in 0..resident.active.len()")
+            .expect("the teardown no longer walks the early-role table");
+
+        for (take, mirror) in [
+            (
+                "if let Some(devmgr) = state.devmgr.take() {",
+                "resident.active[1] = None;",
+            ),
+            (
+                "if let Some(registry) = state.registry.take() {",
+                "resident.active[0] = None;",
+            ),
+        ] {
+            let taken = body.find(take).unwrap_or_else(|| panic!("{take} is gone"));
+            // The mirror is cleared as the first statement of the take, so it
+            // happens whether or not the retirement that follows succeeds.
+            let first = body[taken + take.len()..].trim_start();
+            assert!(
+                first.starts_with(mirror),
+                "{take} must clear {mirror} before anything else"
+            );
+            assert!(taken < table, "{take} must come before the table walk");
+        }
+    }
+
     #[cfg(feature = "wyr1e-production")]
     #[test]
     fn e6_manifest_constructor_admits_only_the_production_shell_profile() {
