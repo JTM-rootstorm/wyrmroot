@@ -236,6 +236,22 @@ fn send_side_peer_close_enters_receive_drain_before_detach() {
     assert!(suppression < dispatch && dispatch < writer_start);
 }
 
+/// The body of the driver function `name`, up to its closing brace.
+fn driver_function(name: &str) -> &'static str {
+    let start = DRIVER
+        .find(&format!("\nfn {name}<"))
+        .unwrap_or_else(|| panic!("main.rs no longer defines {name}"));
+    let end = DRIVER[start..]
+        .find("\n}\n")
+        .unwrap_or_else(|| panic!("{name} has no closing brace"));
+    &DRIVER[start..start + end]
+}
+
+/// Source text because `main.rs` is unconditionally `#![no_std]` and built
+/// only for the guest target, so no host test can call its send or teardown
+/// path yet (S2U gives it a seam). That a sent record commits is held by the
+/// host test
+/// `send_peer_close_preserves_final_inbound_data_until_empty_queue_proof` in lib.rs.
 #[test]
 fn native_stream_and_teardown_paths_preserve_commit_and_close_order() {
     let prepare = DRIVER.find("driver.prepare_stream_send").unwrap();
@@ -247,24 +263,29 @@ fn native_stream_and_teardown_paths_preserve_commit_and_close_order() {
         .unwrap();
     assert!(prepare < send && send < resolve);
 
-    let sent = DRIVER_POLICY.find("StreamSendResult::Sent =>").unwrap();
-    let commit = DRIVER_POLICY[sent..]
-        .find("self.commit_stream_send()")
-        .unwrap();
-    assert!(commit != 0);
+    // Disable the device, then release in the one teardown order. Each
+    // position is read inside its own function: a whole-file `rfind` lands on
+    // the later failure paths' closes and cannot see this order change.
+    let shutdown = driver_function("graceful_shutdown");
+    let disable = shutdown
+        .find("device_pio_write(driver.resource().handle, 1, 1, 0)")
+        .expect("graceful shutdown no longer disables the device");
+    let release = shutdown
+        .find("release_driver(driver, control, result)")
+        .expect("graceful shutdown no longer releases the driver");
+    assert!(disable < release);
 
-    let disable = DRIVER
-        .rfind("device_pio_write(driver.resource().handle, 1, 1, 0)")
-        .unwrap();
-    let stream = DRIVER.rfind("driver.detach_stream()").unwrap();
-    let interrupt = DRIVER
-        .rfind("close_handle(driver.interrupt().handle)")
-        .unwrap();
-    let resource = DRIVER
-        .rfind("close_handle(driver.resource().handle)")
-        .unwrap();
-    let control = DRIVER.rfind("close_handle(control)").unwrap();
-    assert!(disable < stream && stream < interrupt && interrupt < resource && resource < control);
+    let release = driver_function("release_driver");
+    let position = |needle: &str| {
+        release
+            .find(needle)
+            .unwrap_or_else(|| panic!("release_driver no longer calls {needle}"))
+    };
+    let stream = position("driver.detach_stream()");
+    let interrupt = position("close_handle(driver.interrupt().handle)");
+    let resource = position("close_handle(driver.resource().handle)");
+    let control = position("close_handle(control)");
+    assert!(stream < interrupt && interrupt < resource && resource < control);
 }
 
 #[test]
