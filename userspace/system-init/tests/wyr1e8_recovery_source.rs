@@ -358,24 +358,20 @@ fn registry_episode_admission_is_only_for_live_quiesced_coordinated_recovery() {
     assert_eq!(retirement.matches("controller.admit_recovery(").count(), 1);
 }
 
+/// Source text until S3 converts it (triage HOST): the per-region
+/// `attribute_failure` spies over the resident fakes that would hold each
+/// join's operation by behaviour do not exist yet. The status word's layout is
+/// not checked here; it is pinned by value, in
+/// `a_payload_free_tick_failure_status_is_unchanged_by_the_widening` below and
+/// by the attributed-status tests in lib.rs.
 #[test]
 fn e8_failure_detail_is_bound_to_each_actual_transition_join() {
     let main = include_str!("../src/main.rs");
-    let lib = include_str!("../src/lib.rs");
     let jobs = include_str!("../src/wyr1b_native.rs");
     let console = include_str!("../src/wyr1e_native.rs");
     let driver = include_str!("../src/wyr1c_native.rs");
 
     assert!(main.contains("resident_tick_failure_application_status(&error)"));
-    // F3A.6c widened this word to carry the innermost error's own payload in
-    // the two nibbles `operation` and `kind` never used. The substring that
-    // used to stand here was a proxy for the property that actually matters --
-    // E8's statuses must not move -- so the property is asserted directly
-    // below, by value, and the expression is only checked for the tag and the
-    // two nibble positions it still has to keep.
-    assert!(lib.contains("0xAF18_0000"));
-    assert!(lib.contains("| (operation as u32) << 8"));
-    assert!(lib.contains("| kind as u32"));
     let held_wait_start = jobs
         .find("if scope == LaunchSessionScope::ShellJobs")
         .unwrap();
