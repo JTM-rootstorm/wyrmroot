@@ -2347,6 +2347,22 @@ impl SystemInit {
         Ok(())
     }
 
+    /// Records a production role's bring-up READY that this controller did
+    /// not observe through `ready`, because the role is not one it activates.
+    /// F3A.7k; see `wyr1f_closure::BringupEvidence`.
+    #[cfg(feature = "wyr1f-closure")]
+    pub(crate) fn record_bringup_ready(
+        &mut self,
+        role: RoleId,
+        generation: u64,
+        transaction: u64,
+    ) -> Result<(), InitError> {
+        if self.index(role).is_some() {
+            return Err(InitError::WrongActivationOrder);
+        }
+        self.record_evidence(EvidenceEvent::Ready, role, generation, transaction, 0)
+    }
+
     fn finalize_evidence(&mut self, result: RecoveryResult) -> Result<(), InitError> {
         if let Some(evidence) = &mut self.evidence {
             match result {
@@ -6031,6 +6047,15 @@ mod selector_status_coverage {
     /// These are selectors 25 and 27, and both do name a status.
     const LEGACY_SELECTORS: [&str; 2] = ["wyr1-test-evidence", "wyr1b-test-evidence"];
 
+    /// Selector features that carry their failure status through an evidence
+    /// feature they compose, rather than naming one of their own. F3A.7k:
+    /// selector 35's `wyr1f-closure` composes `wyr1-test-evidence` to submit
+    /// WYR1EVID1, and that feature's status arm is the one it reaches. The
+    /// check below requires the composition to be in the manifest and the
+    /// component's arm to preserve the category, so the entry cannot outlive
+    /// either fact.
+    const COMPOSED_SELECTORS: [(&str, &str); 1] = [("wyr1f-closure", "wyr1-test-evidence")];
+
     const MANIFEST: &str = include_str!("../Cargo.toml");
     const MAIN: &str = include_str!("main.rs");
 
@@ -6158,6 +6183,27 @@ mod selector_status_coverage {
                 saw_selector_34 = true;
             }
             if COMPONENT_FEATURES.contains(&selector) {
+                return;
+            }
+            if let Some((_, component)) = COMPOSED_SELECTORS
+                .iter()
+                .find(|(composed, _)| *composed == selector)
+            {
+                let line = MANIFEST
+                    .lines()
+                    .find(|line| {
+                        line.split_once(" = [")
+                            .is_some_and(|(name, _)| name.trim() == selector)
+                    })
+                    .expect("a composed selector is declared on one manifest line");
+                assert!(
+                    line.split('"').any(|part| part == *component),
+                    "{selector} no longer composes {component}"
+                );
+                assert!(
+                    preserves_category(dispatch(MAIN), component),
+                    "{component}, which {selector} relies on, names no failure status"
+                );
                 return;
             }
             // Fail closed on a name that is neither a recognised selector

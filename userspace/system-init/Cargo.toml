@@ -34,7 +34,7 @@ wyr1e-selector33 = ["wyr1e-production", "wyrmroot-runtime/wyr1e7-test-evidence"]
 # init artifact of the final acceptance pair, and the only build that contains
 # the declared post-console failure episode. `wyr1f prepare --scenario normal`
 # does not enable it; the production artifact contains none of it.
-wyr1f-closure = ["wyr1e-production"]
+wyr1f-closure = ["wyr1e-production", "wyr1-test-evidence"]
 wyr1e8-selector33 = [
     "wyr1e-production",
     "dep:wyrmroot-wyr1e-test-actors",

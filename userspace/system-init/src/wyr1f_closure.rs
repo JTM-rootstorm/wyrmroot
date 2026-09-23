@@ -129,8 +129,82 @@ impl ClosureEpisode {
     }
 }
 
+/// The three production roles whose READY `SystemInit`'s controller does not
+/// observe itself, in dependency order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BringupRole {
+    Uart,
+    Console,
+    Shell,
+}
+
+/// Bring-up READY evidence for the roles `SystemInit` does not activate.
+///
+/// F3A.7k. The instrumented product owes one WYR1EVID1 `Ready` per production
+/// role, in dependency order: registryd, devmgr, uart16550d, consoled,
+/// wyrmsh. The controller records the first two when it activates them. The
+/// other three become READY on the resident path, at sites that know nothing
+/// about the evidence log. Each site reports the first identity it sees here,
+/// and the resident tick records them in order.
+///
+/// Separate from `ClosureEpisode` because the episode never records evidence,
+/// and this does nothing else. Only the *first* READY per role counts: the
+/// obligation is bring-up, and a shell replaced after `exit` is not bring-up.
+/// A role is never handed out before the roles it depends on, so the log's
+/// order is the dependency order by construction, not by timing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BringupEvidence {
+    observed: [Option<(u64, u64)>; 3],
+    recorded: usize,
+}
+
+impl BringupEvidence {
+    pub(crate) const fn new() -> Self {
+        Self {
+            observed: [None; 3],
+            recorded: 0,
+        }
+    }
+
+    /// Remembers `role`'s READY identity unless one is already held.
+    ///
+    /// A zero generation or transaction is not an identity WYR1EVID1 can
+    /// carry, so it is not remembered. The role then never records, and the
+    /// transcript fails loudly for a missing READY instead of a malformed one.
+    pub(crate) const fn observe(&mut self, role: BringupRole, generation: u64, transaction: u64) {
+        let slot = role as usize;
+        if self.observed[slot].is_none() && generation != 0 && transaction != 0 {
+            self.observed[slot] = Some((generation, transaction));
+        }
+    }
+
+    /// The next role to record, if its READY has been observed.
+    #[must_use]
+    pub(crate) const fn next_due(&self) -> Option<(crate::RoleId, u64, u64)> {
+        let role = match self.recorded {
+            0 => crate::RoleId::Uart16550d,
+            1 => crate::RoleId::Consoled,
+            2 => crate::RoleId::Wyrmsh,
+            _ => return None,
+        };
+        match self.observed[self.recorded] {
+            Some((generation, transaction)) => Some((role, generation, transaction)),
+            None => None,
+        }
+    }
+
+    /// Marks the role `next_due` returned as recorded.
+    pub(crate) const fn mark_recorded(&mut self) {
+        if self.recorded < self.observed.len() {
+            self.recorded += 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
     use crate::gate::GateConfig;
 
@@ -263,8 +337,9 @@ mod tests {
         // generation was READY", not "a generation is READY now", so a shell
         // replaced after DEGRADED cannot re-arm an episode.
         let shell = include_str!("wyr1b_native.rs");
-        assert!(shell.contains("self.wyr1f_shell_ready = true;"));
-        assert!(!shell.contains("self.wyr1f_shell_ready = false;"));
+        assert!(shell.contains("if self.wyr1f_shell_ready.is_none() {"));
+        assert!(shell.contains("self.wyr1f_shell_ready = Some((generation, transaction));"));
+        assert!(!shell.contains("self.wyr1f_shell_ready = None;"));
     }
 
     /// F1B.4: "extra method/right/handle added to shell or job".
@@ -277,8 +352,8 @@ mod tests {
     /// F1B.4: "extra method/right/handle added to shell or job".
     ///
     /// The episode adds no shell or job surface at all. It is confined to
-    /// init: one boolean recorded by the dispatcher at a join it already
-    /// computes, and one state machine on the resident. Nothing reaches
+    /// init: one first-READY identity recorded by the dispatcher at a join it
+    /// already computes, and one state machine on the resident. Nothing reaches
     /// `wyr1b_job`, and the shell and job profiles are whatever they were --
     /// which is why the matched siblings' launch policies are byte-identical.
     #[test]
@@ -286,10 +361,13 @@ mod tests {
         let jobs = include_str!("wyr1b_job.rs");
         assert!(!jobs.contains("wyr1f"));
         let shell = include_str!("wyr1b_native.rs");
-        // The field, its initializer, one setter, one reader, and one call at
-        // the join the dispatcher already computes. A shell surface would need
-        // more than a boolean.
-        assert_eq!(shell.matches("wyr1f_shell_ready").count(), 7);
+        // The field, its initializer, one setter (which reads the field once
+        // to keep the first identity), one reader, and one call at the join
+        // the dispatcher already computes. Since F3A.7k the latch holds the
+        // first generation's (generation, transaction) instead of `true`, as
+        // bring-up READY evidence; it is still two integers and grants
+        // nothing. A shell surface would need more than that.
+        assert_eq!(shell.matches("wyr1f_shell_ready").count(), 8);
         assert_eq!(shell.matches("observe_wyr1f_shell_ready").count(), 2);
         // The episode type appears in `wyr1b_native` only where a
         // `ResidentSystemInit` is constructed, which is init's own field. The
@@ -326,5 +404,107 @@ mod tests {
         episode.observe_ready_join(true, true);
         assert!(episode.take_trigger());
         assert!(episode.refuses_activation());
+    }
+
+    /// F3A.7k. The wiring around `BringupEvidence` lives on the resident path,
+    /// which no host test drives, so it is pinned from source: every tick
+    /// records what has been observed, the session's end finalizes the log
+    /// only after the roles are retired, and each READY site reports before it
+    /// hands the outcome back.
+    #[test]
+    fn the_instrumented_tick_records_bringup_and_finalizes_at_session_end() {
+        let squeeze = |text: &str| -> std::string::String {
+            text.chars().filter(|c| !c.is_whitespace()).collect()
+        };
+        let tick = squeeze(include_str!("wyr1c_native.rs"));
+        let trigger = tick
+            .find("letoutcome=wyr1f_closure_trigger(resident,outcome);")
+            .expect("the closure trigger moved");
+        let record = tick
+            .find("record_wyr1f_bringup(resident)?;")
+            .expect("the tick no longer records bring-up evidence");
+        let complete = tick
+            .find("ifoutcome==wyr1e::PollOutcome::SessionComplete{")
+            .expect("the session-complete check moved");
+        assert!(trigger < record && record < complete);
+        let body = &tick[complete..];
+        let body = &body[..body
+            .find("}if")
+            .expect("the session-complete check never closes")];
+        let retire = body
+            .find("retire_for_session_shutdown(")
+            .expect("no teardown");
+        let finalize = body
+            .find("finalize_wyr1f_evidence(resident)?;")
+            .expect("no terminal");
+        let leave = body
+            .find("returnOk(resident.controller.mode());")
+            .expect("no return");
+        assert!(retire < finalize && finalize < leave);
+
+        let poll = squeeze(include_str!("wyr1e_native.rs"));
+        let uart = poll
+            .find("crate::wyr1f_closure::BringupRole::Uart,")
+            .expect("the UART READY is never observed");
+        assert!(
+            poll[uart..]
+                .find("Ok(Some(PollOutcome::LaunchConsole))")
+                .is_some()
+        );
+        let console = poll
+            .find("crate::wyr1f_closure::BringupRole::Console,")
+            .expect("consoled's READY is never observed");
+        let accepted = poll[console..]
+            .find("e6.awaiting_ready=false;returnOk(PollOutcome::Stable);")
+            .expect("the console observation is not at READY acceptance");
+        assert!(
+            accepted < 200,
+            "the console observation drifted from READY acceptance"
+        );
+    }
+
+    fn drain(evidence: &mut BringupEvidence) -> std::vec::Vec<(crate::RoleId, u64, u64)> {
+        let mut out = std::vec::Vec::new();
+        while let Some(due) = evidence.next_due() {
+            out.push(due);
+            evidence.mark_recorded();
+        }
+        out
+    }
+
+    #[test]
+    fn bringup_records_each_role_once_in_dependency_order() {
+        let mut evidence = BringupEvidence::new();
+        // The shell arriving first is held until the console and UART have.
+        evidence.observe(BringupRole::Shell, 1, 0x30);
+        assert_eq!(drain(&mut evidence), []);
+        evidence.observe(BringupRole::Console, 1, 0x20);
+        assert_eq!(drain(&mut evidence), []);
+        evidence.observe(BringupRole::Uart, 1, 0x10);
+        assert_eq!(
+            drain(&mut evidence),
+            [
+                (crate::RoleId::Uart16550d, 1, 0x10),
+                (crate::RoleId::Consoled, 1, 0x20),
+                (crate::RoleId::Wyrmsh, 1, 0x30),
+            ]
+        );
+        // A replacement shell after `exit` is not bring-up.
+        evidence.observe(BringupRole::Shell, 2, 0x31);
+        assert_eq!(drain(&mut evidence), []);
+    }
+
+    #[test]
+    fn bringup_keeps_the_first_identity_and_ignores_zero() {
+        let mut evidence = BringupEvidence::new();
+        evidence.observe(BringupRole::Uart, 0, 0x10);
+        evidence.observe(BringupRole::Uart, 1, 0);
+        assert_eq!(evidence.next_due(), None);
+        evidence.observe(BringupRole::Uart, 3, 0x13);
+        evidence.observe(BringupRole::Uart, 4, 0x14);
+        assert_eq!(
+            evidence.next_due(),
+            Some((crate::RoleId::Uart16550d, 3, 0x13))
+        );
     }
 }

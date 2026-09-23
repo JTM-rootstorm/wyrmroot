@@ -189,11 +189,13 @@ pub(crate) struct ShellControllerState {
     e8_held: Option<E8HeldWait>,
     /// Half of the final closure episode's READY join: the first
     /// `system/wyrmsh` generation having reached
-    /// `JobDispatchOutcome::Launched`. It is set once by the dispatcher that
-    /// owns that join and is never cleared, so a later shell replacement
-    /// cannot re-arm an episode. `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` §5.4.
+    /// `JobDispatchOutcome::Launched`, as its generation and outer launch
+    /// transaction. It is set once by the dispatcher that owns that join and
+    /// is never cleared, so a later shell replacement cannot re-arm an
+    /// episode. `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md` §5.4. The identity is
+    /// the shell's bring-up READY evidence (F3A.7k); it grants nothing.
     #[cfg(feature = "wyr1f-closure")]
-    wyr1f_shell_ready: bool,
+    wyr1f_shell_ready: Option<(u64, u64)>,
 }
 
 #[allow(
@@ -227,7 +229,7 @@ impl ShellControllerState {
             #[cfg(feature = "wyr1e8-selector33")]
             e8_held: None,
             #[cfg(feature = "wyr1f-closure")]
-            wyr1f_shell_ready: false,
+            wyr1f_shell_ready: None,
         })
     }
 
@@ -252,13 +254,16 @@ impl ShellControllerState {
     /// a shell that exits and is replaced after DEGRADED cannot re-arm the
     /// episode.
     #[cfg(feature = "wyr1f-closure")]
-    pub(crate) const fn observe_wyr1f_shell_ready(&mut self) {
-        self.wyr1f_shell_ready = true;
+    pub(crate) const fn observe_wyr1f_shell_ready(&mut self, generation: u64, transaction: u64) {
+        if self.wyr1f_shell_ready.is_none() {
+            self.wyr1f_shell_ready = Some((generation, transaction));
+        }
     }
 
+    /// The first READY generation's identity, once it exists.
     #[cfg(feature = "wyr1f-closure")]
     #[must_use]
-    pub(crate) const fn wyr1f_shell_ready(&self) -> bool {
+    pub(crate) const fn wyr1f_shell_ready(&self) -> Option<(u64, u64)> {
         self.wyr1f_shell_ready
     }
 
@@ -5429,7 +5434,10 @@ where
             },
         )?;
         #[cfg(feature = "wyr1f-closure")]
-        shell.state.observe_wyr1f_shell_ready();
+        shell.state.observe_wyr1f_shell_ready(
+            accepted.request.requested_child_generation,
+            reservation.transaction_id,
+        );
         #[cfg(feature = "wyr1e8-selector33")]
         shell.state.stage_e8_shell_ready(
             system,

@@ -69,6 +69,9 @@ pub(super) struct State {
     next_console_transaction: u64,
     next_publication_observer: u64,
     console_launch_attempts: u8,
+    /// F3A.7k. Bring-up READY evidence for UART, console and shell.
+    #[cfg(feature = "wyr1f-closure")]
+    pub(super) wyr1f_bringup: crate::wyr1f_closure::BringupEvidence,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -138,6 +141,8 @@ impl State {
             next_console_transaction: FIRST_CONSOLE_TRANSACTION,
             next_publication_observer: FIRST_PUBLICATION_OBSERVER,
             console_launch_attempts: 0,
+            #[cfg(feature = "wyr1f-closure")]
+            wyr1f_bringup: crate::wyr1f_closure::BringupEvidence::new(),
         })
     }
 
@@ -170,7 +175,7 @@ impl State {
         console: InstalledPeer,
     ) -> Result<Self, InitError> {
         let mut shell = ShellControllerState::new(registry_generation)?;
-        shell.observe_wyr1f_shell_ready();
+        shell.observe_wyr1f_shell_ready(1, 1);
         Ok(Self {
             jobs: JobDispatcher::new(),
             console: Some(console),
@@ -183,6 +188,8 @@ impl State {
             next_console_transaction: FIRST_CONSOLE_TRANSACTION,
             next_publication_observer: FIRST_PUBLICATION_OBSERVER,
             console_launch_attempts: 0,
+            #[cfg(feature = "wyr1f-closure")]
+            wyr1f_bringup: crate::wyr1f_closure::BringupEvidence::new(),
         })
     }
 
@@ -810,6 +817,14 @@ where
         observer.expected_service_generation,
         observer.expected_driver,
     )?;
+    // F3A.7k. The serial device published by exactly the driver attempt init
+    // expected, still running: the UART's READY, as far as init can see it.
+    #[cfg(feature = "wyr1f-closure")]
+    e6.wyr1f_bringup.observe(
+        crate::wyr1f_closure::BringupRole::Uart,
+        observer.expected_driver.attempt_generation.0,
+        current.request.transaction_id,
+    );
     clear_publication_observer(e6, system, registry_generation, false)?;
     Ok(Some(PollOutcome::LaunchConsole))
 }
@@ -1287,6 +1302,13 @@ where
                 crate::wyr1c_native::abandoned::phase::CONSOLE_RECOVERY_LIVE,
             ));
         }
+        // F3A.7k. consoled's READY, validated against its own transaction.
+        #[cfg(feature = "wyr1f-closure")]
+        e6.wyr1f_bringup.observe(
+            crate::wyr1f_closure::BringupRole::Console,
+            console.grant.role_generation,
+            e6.console_transaction,
+        );
         e6.awaiting_ready = false;
         return Ok(PollOutcome::Stable);
     }
@@ -1530,7 +1552,7 @@ pub(super) fn wyr1f_ready_join(resident: &ResidentSystemInit) -> (bool, bool) {
     };
     (
         e6.console.is_some() && !e6.awaiting_ready,
-        e6.shell.wyr1f_shell_ready(),
+        e6.shell.wyr1f_shell_ready().is_some(),
     )
 }
 

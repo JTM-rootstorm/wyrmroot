@@ -3714,12 +3714,20 @@ where
         let outcome = wyr1e::poll(resident, system, loader, waits, now_ns)?;
         #[cfg(feature = "wyr1f-closure")]
         let outcome = wyr1f_closure_trigger(resident, outcome);
+        #[cfg(feature = "wyr1f-closure")]
+        record_wyr1f_bringup(resident)?;
         // F3A.7g. Handled before the recovery dispatch below, and outside the
         // bootfs mapping it opens: every other non-`Stable` outcome rebuilds
         // something out of the archive, and this one builds nothing.
         if outcome == wyr1e::PollOutcome::SessionComplete {
             retire_for_session_shutdown(resident, system, waits)?;
             resident.observe_session_complete();
+            // F3A.7k. The end of the session is the end of the instrumented
+            // run, so it is where the supervisor's evidence gets its terminal
+            // record. `main` submits the finalized log, and the kernel answers
+            // the terminal record with DWTEST1 before init exits.
+            #[cfg(feature = "wyr1f-closure")]
+            finalize_wyr1f_evidence(resident)?;
             return Ok(resident.controller.mode());
         }
         if outcome != wyr1e::PollOutcome::Stable {
@@ -3944,6 +3952,47 @@ fn wyr1f_closure_trigger(
         return wyr1e::PollOutcome::RecoverDevmgr;
     }
     outcome
+}
+
+/// Moves each bring-up READY the resident path has observed into the
+/// controller's evidence log, in dependency order. The shell's comes from the
+/// dispatcher's READY-join latch, which already holds the first generation.
+#[cfg(feature = "wyr1f-closure")]
+fn record_wyr1f_bringup(resident: &mut ResidentSystemInit) -> Result<(), InitError> {
+    let Some(e6) = resident.wyr1c.as_mut().and_then(|state| state.e6.as_mut()) else {
+        return Ok(());
+    };
+    if let Some((generation, transaction)) = e6.shell.wyr1f_shell_ready() {
+        e6.wyr1f_bringup.observe(
+            crate::wyr1f_closure::BringupRole::Shell,
+            generation,
+            transaction,
+        );
+    }
+    while let Some((role, generation, transaction)) = e6.wyr1f_bringup.next_due() {
+        resident
+            .controller
+            .record_bringup_ready(role, generation, transaction)?;
+        e6.wyr1f_bringup.mark_recorded();
+    }
+    Ok(())
+}
+
+/// The supervisor's terminal evidence record, written once when the session
+/// ends. `DEGRADED` if the supervisor reached it, `NORMAL` otherwise.
+#[cfg(feature = "wyr1f-closure")]
+fn finalize_wyr1f_evidence(resident: &mut ResidentSystemInit) -> Result<(), InitError> {
+    if resident.evidence_finalized {
+        return Ok(());
+    }
+    let result = if resident.controller.mode() == SystemMode::Degraded {
+        crate::RecoveryResult::Degraded
+    } else {
+        crate::RecoveryResult::Recovered
+    };
+    resident.controller.finalize_evidence(result)?;
+    resident.evidence_finalized = true;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
