@@ -5,6 +5,10 @@
 # counts each site once per package, and fails if any count rises above this
 # file. When a count falls the gate prints the new counts; lower this file in
 # the change that fixed the sites. Measured 2026-09-23.
+#
+# 2026-09-27: consoled and uart16550d entered at 12 and 1. Their role binaries
+# gained a host build (S2U.2) and `wyr1f-role-clippy` now lints them, so these
+# are existing `main.rs` sites seen for the first time, not new ones.
 
 [undocumented_unsafe_blocks]
 xtask = 2
@@ -13,12 +17,14 @@ xtask = 2
 wyrmroot-bootfs = 1
 wyrmroot-bootstrap = 4
 wyrmroot-console-proto = 1
+wyrmroot-consoled = 12
 wyrmroot-device-proto = 9
 wyrmroot-devmgr = 5
 wyrmroot-loader = 3
 wyrmroot-registryd = 3
 wyrmroot-runtime = 12
 wyrmroot-system-init = 39
+wyrmroot-uart16550d = 1
 wyrmroot-wyr1b-gate = 2
 wyrmroot-wyr1b-gate-proto = 4
 wyrmroot-wyrmsh = 14

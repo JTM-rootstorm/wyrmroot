@@ -2124,29 +2124,22 @@ fn host_test_commands(filter: Option<&str>) -> Result<Vec<Vec<String>>, Failure>
     // feature that compiles the declared post-console failure episode, so it
     // needs a gate of its own: every other row builds the production shape,
     // which is exactly the shape that must not contain it.
-    // The one production role binary a host lint can reach, in the exact
-    // feature shape it ships in.
+    // Every production role binary, in the exact feature shape it ships in.
     //
-    // DW1-F/WYR1-F F2B. `wyr1f-clippy` lints `--lib`, and devmgr's role logic
-    // is mostly not in the library: 3095 lines of `main.rs` against 1956 of
-    // `lib.rs`. F2B.2's `--all-targets` workspace row does build that binary --
-    // it is where two of F2B's findings came from -- but in the crate's
-    // *default* feature shape, which is `default = []`, not the
-    // `wyr1e8-production` shape that reaches a product.
+    // DW1-F/WYR1-F F2B. `wyr1f-clippy` lints `--lib`, and most role logic is
+    // not in the library yet (devmgr: 3095 lines of `main.rs` against 1956 of
+    // `lib.rs`). F2B.2's `--all-targets` workspace row builds the binaries in
+    // their *default* feature shape, not the shape that reaches a product.
     //
-    // It is one row rather than seven because devmgr is the only role binary
-    // whose `main.rs` is `#![cfg_attr(target_os = "wyrmroot", no_std)]`. The
-    // other six are unconditionally `#![no_std]` with their own
-    // `#[panic_handler]`, so no host build of them exists to lint -- they are
-    // out of reach for the same reason as closure contract item 20, by a
-    // different mechanism. `wyr1f-native` compiles them for the guest target
-    // with `rustc`, which is type checking and no lint at all.
+    // Until S2U.2 this was devmgr alone, because the other role binaries were
+    // unconditionally `#![no_std]` and had no host build to lint. They now all
+    // use devmgr's `cfg_attr(target_os = "wyrmroot", no_std)` pattern, so the
+    // row set is read from the F product table.
     if matches!(filter, Some("wyr1f-role-clippy")) {
-        return Ok(vec![role_binary_lint_command(
-            "wyrmroot-devmgr",
-            "devmgr",
-            "wyr1e8-production",
-        )]);
+        return Ok(f_role_binary_shapes()
+            .into_iter()
+            .map(|(package, binary, features)| role_binary_lint_command(package, binary, features))
+            .collect());
     }
     if matches!(filter, Some("wyr1f-model" | "wyr1f-clippy")) {
         let lint = filter.is_some_and(|value| value.ends_with("clippy"));
@@ -2530,6 +2523,36 @@ fn explicit_test_filter(filter: &str) -> Result<String, Failure> {
 }
 
 /// One warnings-denied Clippy row for a production role binary.
+/// The role binaries the F products ship, in the feature shape each ships in.
+///
+/// Read from [`crate::wyr1c::WYR1F_PRODUCT_NATIVE_SPECS`], plus the
+/// instrumented product's system-init shape, so a role's shipped features are
+/// written once. Only the role packages have a host build (S2U.2); the other
+/// F payloads (`hello`, `cpu-hog`) are still guest-only binaries.
+fn f_role_binary_shapes() -> Vec<(&'static str, &'static str, &'static str)> {
+    let mut shapes = crate::wyr1c::WYR1F_PRODUCT_NATIVE_SPECS
+        .iter()
+        .filter(|spec| HOST_BUILDABLE_ROLE_PACKAGES.contains(&spec.package))
+        .map(|spec| (spec.package, spec.binary, spec.features))
+        .collect::<Vec<_>>();
+    shapes.push((
+        "wyrmroot-system-init",
+        "system-init",
+        "wyr1e-production,wyr1f-closure",
+    ));
+    shapes
+}
+
+/// Role packages whose `main.rs` builds for the host (S2U.2).
+const HOST_BUILDABLE_ROLE_PACKAGES: &[&str] = &[
+    "wyrmroot-system-init",
+    "wyrmroot-registryd",
+    "wyrmroot-devmgr",
+    "wyrmroot-uart16550d",
+    "wyrmroot-consoled",
+    "wyrmroot-wyrmsh",
+];
+
 fn role_binary_lint_command(package: &str, binary: &str, features: &str) -> Vec<String> {
     [
         "clippy",
@@ -2686,7 +2709,7 @@ fn child_status(code: Option<i32>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BINARY_ONLY_PACKAGES, BOOTFS_BUILD_ARGUMENTS, BOOTFS_PACKAGE, BOOTFS_TEST_ARGUMENTS,
+        BINARY_ONLY_PACKAGES, HOST_BUILDABLE_ROLE_PACKAGES, BOOTFS_BUILD_ARGUMENTS, BOOTFS_PACKAGE, BOOTFS_TEST_ARGUMENTS,
         CargoRun, DW1C_INIT0_TEST_ARGUMENTS, DW1D6_ACTOR_TEST_ARGUMENTS,
         DW1D6_BOOTSTRAP_TEST_ARGUMENTS, DW1D6_SOURCE_CONTRACT_TEST_ARGUMENTS,
         INSPECTION_PATH, INSPECTION_SHELL, IsolatedUefiBuild, LoaderLinkMode, NAMED_HOST_FILTERS,
@@ -2696,7 +2719,7 @@ mod tests {
         feature_combinations, host_test_arguments, host_test_commands, is_listed_combination,
         lint_ratchet_shapes,
         named_host_filter, named_host_runs, names_a_test, native_steps, prepare_uefi_target_roots,
-        r1_clippy_command, r1_status_command, render_uefi_inspection_report, run_verified_report,
+        r1_clippy_command, role_binary_lint_command, r1_status_command, render_uefi_inspection_report, run_verified_report,
         selector_library_commands, selector32_library_commands, tests_passed,
         validate_regular_artifact, validate_uefi_inspection_report,
         wyr1e8_producer_fixture_command,
@@ -3187,6 +3210,25 @@ mod tests {
                 .collect::<Vec<_>>(),
             selector_library_commands()
         );
+    }
+
+    /// S2U.2: every F role binary is linted in the feature shape the F
+    /// products ship it in, read from the product table rather than retyped.
+    #[test]
+    fn the_role_lint_covers_every_f_role_binary_in_its_shipped_shape() {
+        let commands = host_test_commands(Some("wyr1f-role-clippy")).unwrap();
+        let mut expected = crate::wyr1c::WYR1F_PRODUCT_NATIVE_SPECS
+            .iter()
+            .filter(|spec| HOST_BUILDABLE_ROLE_PACKAGES.contains(&spec.package))
+            .map(|spec| role_binary_lint_command(spec.package, spec.binary, spec.features))
+            .collect::<Vec<_>>();
+        assert_eq!(expected.len(), HOST_BUILDABLE_ROLE_PACKAGES.len());
+        expected.push(role_binary_lint_command(
+            "wyrmroot-system-init",
+            "system-init",
+            "wyr1e-production,wyr1f-closure",
+        ));
+        assert_eq!(commands, expected);
     }
 
     /// S1.1: a named host gate that exists runs in the unfiltered suite, so
