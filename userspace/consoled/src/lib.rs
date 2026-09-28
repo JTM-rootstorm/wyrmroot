@@ -1925,7 +1925,9 @@ mod tests {
     /// The property is a decision inside one role function, which no host
     /// test drives yet, so it is read out of the source rather than left
     /// unstated. `MAIN` is `main.rs` then `role.rs`, the binary's old text in
-    /// its old order; the slice below still ends at the next top-level `fn`.
+    /// its old order; the slice below still ends at the next top-level `fn`,
+    /// and starts at `fn recover_terminal_child<` since the function now opens
+    /// with its platform parameter list.
     ///
     /// Written against positions rather than presence: a guard that is
     /// deleted, moved after the relaunch, or joined by a second relaunch all
@@ -1934,7 +1936,7 @@ mod tests {
     #[test]
     fn terminal_recovery_checks_for_a_session_shutdown_before_it_relaunches() {
         const MAIN: &str = concat!(include_str!("main.rs"), include_str!("role.rs"));
-        const SIGNATURE: &str = "fn recover_terminal_child(";
+        const SIGNATURE: &str = "fn recover_terminal_child<";
 
         let start = MAIN
             .find(SIGNATURE)

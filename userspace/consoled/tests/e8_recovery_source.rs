@@ -21,10 +21,13 @@ fn item<'a>(source: &'a str, anchor: &str) -> &'a str {
     &source[start..end]
 }
 
+/// Source text: the READY-facts order is inside the role's child launch, which
+/// no host test drives yet. The item anchor ends in `<` because
+/// `launch_child_once` now opens with its platform parameter list.
 #[test]
 fn e8_ready_facts_precede_each_shell_v1_request_and_use_live_serial_identity() {
     assert!(MANIFEST.contains("wyr1e8-recovery = [\"wyr1e-wyrmsh\"]"));
-    let launch = item(NATIVE, "fn launch_child_once(");
+    let launch = item(NATIVE, "fn launch_child_once<");
     let reserve = launch.find("model.begin_child_launch(").unwrap();
     let facts = launch
         .find("wyrmroot_consoled::quiesce_control::ReadyFacts {")
@@ -110,15 +113,15 @@ fn clean_terminal_result_drains_child_output_before_reap_and_relaunch() {
         .unwrap();
     assert!(deadline < job_result && job_result < stdout && stdout < stderr && stderr < commit);
 
-    let bounded_receive = &NATIVE[NATIVE.find("fn receive_launch_before(").unwrap()
-        ..NATIVE.find("fn receive_initial_launch(").unwrap()];
+    let bounded_receive = &NATIVE[NATIVE.find("fn receive_launch_before<").unwrap()
+        ..NATIVE.find("fn receive_initial_launch<").unwrap()];
     assert!(bounded_receive.contains("DwDeadline(deadline)"));
     assert!(bounded_receive.contains("DW_SIGNAL_READABLE"));
     assert!(bounded_receive.contains("DW_SIGNAL_PEER_CLOSED"));
-    assert!(bounded_receive.contains("receive_launch_ready(channel)?"));
+    assert!(bounded_receive.contains("receive_launch_ready(platform, channel)?"));
 
-    let recover_body = &NATIVE[NATIVE.find("fn recover_terminal_child(").unwrap()
-        ..NATIVE.find("fn recover_child(").unwrap()];
+    let recover_body = &NATIVE[NATIVE.find("fn recover_terminal_child<").unwrap()
+        ..NATIVE.find("fn recover_child<").unwrap()];
     assert!(recover_body.contains("#[cfg(not(feature = \"wyr1e-wyrmsh\"))]"));
     assert!(recover_body.contains("model.child_terminal"));
     assert!(recover_body.contains("close_reaped_job"));
