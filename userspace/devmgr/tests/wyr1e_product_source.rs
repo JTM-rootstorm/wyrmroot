@@ -114,7 +114,7 @@ fn production_publication_receiver_uses_the_exact_v1_1_service_generation() {
     assert!(d5_gate < d5_parse && d5_parse < parse);
 
     let published = &NATIVE[NATIVE.find("fn published_driver(").unwrap()
-        ..NATIVE.find("fn selector32_driver_ready(").unwrap()];
+        ..NATIVE.find("fn selector32_driver_ready<").unwrap()];
     assert!(published.contains("publication_service_generation()"));
     assert!(published.contains(".ok_or(failure(243))?"));
     assert!(!published.contains("active_binding"));

@@ -508,11 +508,13 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
         #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
         if Some(index) == witness_index {
             observe_production_client_release(
+                platform,
                 &mut production_witness,
                 connector_broker.as_mut().ok_or(failure(279))?,
                 observed.observed,
             )?;
             update_production_cleanup(
+                platform,
                 connector_broker.as_ref().ok_or(failure(280))?,
                 &mut connector_cleanup_deadline,
             )?;
@@ -594,7 +596,7 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
                     {
                         return Err(failure(229));
                     }
-                    send_selector32_driver_retire(control, &resident)?;
+                    send_selector32_driver_retire(platform, control, &resident)?;
                     selector32_retire_requested = Some(current);
                     continue;
                 }
@@ -617,7 +619,11 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
                     selector32_drain
                         .request(identity, broker)
                         .map_err(|_| failure(266))?;
-                    send_d5_controller(control, D5ControllerMessage::RequestDrain(identity))?;
+                    send_d5_controller(
+                        platform,
+                        control,
+                        D5ControllerMessage::RequestDrain(identity),
+                    )?;
                     continue;
                 }
                 #[cfg(feature = "wyr1d-selector32")]
@@ -913,7 +919,7 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
                     }
                 };
                 #[cfg(feature = "wyr1d-selector32")]
-                selector32_driver_ready(bootstrap, &mut resident, &mut connector_broker)?;
+                selector32_driver_ready(platform, bootstrap, &mut resident, &mut connector_broker)?;
                 #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
                 activate_connector_broker(&mut resident, &mut connector_broker)?;
             } else if resident.driver_ready() {
@@ -943,6 +949,7 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
             #[cfg(feature = "dw1e3-selector31")]
             if observed.observed.0 & DW_SIGNAL_READABLE.0 != 0 && connector_broker.is_some() {
                 service_selector31_driver_control(
+                    platform,
                     control,
                     bootstrap,
                     connector_broker.as_mut().ok_or(failure(169))?,
@@ -955,6 +962,7 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
             #[cfg(feature = "wyr1d-selector32")]
             if observed.observed.0 & DW_SIGNAL_READABLE.0 != 0 && connector_broker.is_some() {
                 service_selector32_driver_control(
+                    platform,
                     control,
                     bootstrap,
                     connector_broker.as_mut().ok_or(failure(252))?,
@@ -966,10 +974,12 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
             #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
             if observed.observed.0 & DW_SIGNAL_READABLE.0 != 0 && connector_broker.is_some() {
                 service_production_driver_control(
+                    platform,
                     control,
                     connector_broker.as_mut().ok_or(failure(271))?,
                 )?;
                 update_production_cleanup(
+                    platform,
                     connector_broker.as_ref().ok_or(failure(288))?,
                     &mut connector_cleanup_deadline,
                 )?;
@@ -1007,7 +1017,7 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
                     {
                         return Err(failure(295));
                     }
-                    update_production_cleanup(broker, &mut connector_cleanup_deadline)?;
+                    update_production_cleanup(platform, broker, &mut connector_cleanup_deadline)?;
                 }
                 #[cfg(feature = "wyr1c6-selector29")]
                 let stale_control = control;
@@ -1062,8 +1072,9 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
                     {
                         return Err(failure(298));
                     }
-                    update_production_cleanup(broker, &mut connector_cleanup_deadline)?;
+                    update_production_cleanup(platform, broker, &mut connector_cleanup_deadline)?;
                     await_production_witness_release(
+                        platform,
                         &mut production_witness,
                         broker,
                         &mut connector_cleanup_deadline,
@@ -1236,7 +1247,7 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
                 )?;
                 driver_control = Some(launched);
                 #[cfg(feature = "wyr1d-selector32")]
-                selector32_driver_ready(bootstrap, &mut resident, &mut connector_broker)?;
+                selector32_driver_ready(platform, bootstrap, &mut resident, &mut connector_broker)?;
                 #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
                 activate_connector_broker(&mut resident, &mut connector_broker)?;
                 #[cfg(feature = "wyr1c6-selector29")]
@@ -1328,6 +1339,7 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
                 let broker = connector_broker.as_mut().ok_or(failure(170))?;
                 let control = driver_control.ok_or(failure(171))?;
                 service_connector_offer(
+                    platform,
                     publication.ok_or(failure(172))?,
                     control,
                     &resident,
@@ -1365,7 +1377,7 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
             if broker.retire_current().is_some() {
                 return Err(failure(291));
             }
-            update_production_cleanup(broker, &mut connector_cleanup_deadline)?;
+            update_production_cleanup(platform, broker, &mut connector_cleanup_deadline)?;
             waiting_registry_status_sent = false;
         }
         platform.close_handle(old).map_err(|_| failure(25))?;
@@ -1594,13 +1606,15 @@ fn published_driver(
 }
 
 #[cfg(feature = "wyr1d-selector32")]
-fn selector32_driver_ready(
+fn selector32_driver_ready<P: DevmgrPlatform>(
+    platform: &mut P,
     bootstrap: DwHandle,
     resident: &mut crate::ResidentController,
     broker: &mut Option<ConnectorBroker>,
 ) -> Result<(), u32> {
     let current = activate_connector_broker(resident, broker)?;
     send_d5_controller(
+        platform,
         bootstrap,
         D5ControllerMessage::DriverReady(current.d5_identity()),
     )
@@ -1633,14 +1647,21 @@ fn activate_connector_broker(
 }
 
 #[cfg(feature = "wyr1d-selector32")]
-fn send_d5_controller(bootstrap: DwHandle, message: D5ControllerMessage) -> Result<(), u32> {
+fn send_d5_controller<P: DevmgrPlatform>(
+    platform: &mut P,
+    bootstrap: DwHandle,
+    message: D5ControllerMessage,
+) -> Result<(), u32> {
     let mut bytes = [0u8; D5_CONTROLLER_BYTES];
     encode_d5_controller(message, &mut bytes).map_err(|_| failure(250))?;
-    send_channel(bootstrap, &bytes, &[]).map_err(|_| failure(251))
+    platform
+        .send_channel(bootstrap, &bytes, &[])
+        .map_err(|_| failure(251))
 }
 
 #[cfg(feature = "wyr1d-selector32")]
-fn send_selector32_driver_retire(
+fn send_selector32_driver_retire<P: DevmgrPlatform>(
+    platform: &mut P,
     control: DwHandle,
     resident: &crate::ResidentController,
 ) -> Result<(), u32> {
@@ -1661,7 +1682,9 @@ fn send_selector32_driver_retire(
     };
     let mut bytes = [0u8; wyrmroot_device_proto::control_v1_1::RETIRE_BYTES];
     encode_control_v1_1(message, &mut bytes).map_err(|_| failure(261))?;
-    send_channel(control, &bytes, &[]).map_err(|_| failure(262))
+    platform
+        .send_channel(control, &bytes, &[])
+        .map_err(|_| failure(262))
 }
 
 #[cfg(any(
@@ -1669,7 +1692,8 @@ fn send_selector32_driver_retire(
     feature = "wyr1d-selector32",
     feature = "wyr1e-production"
 ))]
-fn service_connector_offer(
+fn service_connector_offer<P: DevmgrPlatform>(
+    platform: &mut P,
     publication: DwHandle,
     driver_control: DwHandle,
     resident: &crate::ResidentController,
@@ -1679,7 +1703,8 @@ fn service_connector_offer(
 ) -> Result<(), u32> {
     let mut offer_bytes = [0u8; 256];
     let mut offer_handles = [DwReceivedHandleInfoV1::default(); 1];
-    let counts = receive_channel(publication, &mut offer_bytes, &mut offer_handles)
+    let counts = platform
+        .receive_channel(publication, &mut offer_bytes, &mut offer_handles)
         .map_err(|_| failure(174))?;
     if counts.bytes > offer_bytes.len() || counts.handles != 1 {
         close_received(&offer_handles, counts.handles);
@@ -1728,22 +1753,24 @@ fn service_connector_offer(
         return Err(failure(180));
     }
     let direct = offer_handles[0].handle;
-    let deadline = monotonic_deadline_after(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
+    let deadline = platform
+        .monotonic_deadline_after(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
         .map_err(|_| failure(181))?;
     wait_readable(direct, deadline, 182)?;
     let mut request_bytes = [0u8; CONNECTOR_BYTES];
     let mut request_handles = [DwReceivedHandleInfoV1::default(); 1];
-    let counts = receive_channel(direct, &mut request_bytes, &mut request_handles)
+    let counts = platform
+        .receive_channel(direct, &mut request_bytes, &mut request_handles)
         .map_err(|_| failure(183))?;
     if counts.bytes != request_bytes.len() || counts.handles != 0 {
         close_received(&request_handles, counts.handles);
-        let _ = close_handle(direct);
+        let _ = platform.close_handle(direct);
         return Err(failure(184));
     }
     let request = match parse_connector(&request_bytes) {
         Ok(request @ ConnectorMessage::ConnectStream { .. }) => request,
         _ => {
-            let _ = close_handle(direct);
+            let _ = platform.close_handle(direct);
             return Err(failure(185));
         }
     };
@@ -1756,9 +1783,9 @@ fn service_connector_offer(
             if encoded.is_ok() {
                 // A rejected request owns no raw pair. A disconnected client
                 // cannot turn a normal negative response into driver loss.
-                let _ = send_channel(direct, &bytes, &[]);
+                let _ = platform.send_channel(direct, &bytes, &[]);
             }
-            close_handle(direct).map_err(|_| failure(186))?;
+            platform.close_handle(direct).map_err(|_| failure(186))?;
             encoded.map_err(|_| failure(186))?;
             return Ok(());
         }
@@ -1768,17 +1795,18 @@ fn service_connector_offer(
         driver_message,
     } = action
     else {
-        let _ = close_handle(direct);
+        let _ = platform.close_handle(direct);
         return Err(failure(187));
     };
     #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
     if witness.is_some() {
         let _ = broker.attach_send_failed(attach);
-        let _ = close_handle(direct);
+        let _ = platform.close_handle(direct);
         return Err(failure(276));
     }
-    let (client_endpoint, driver_endpoint) =
-        create_channel(STREAM_BROAD_RIGHTS).map_err(|_| failure(188))?;
+    let (client_endpoint, driver_endpoint) = platform
+        .create_channel(STREAM_BROAD_RIGHTS)
+        .map_err(|_| failure(188))?;
     let mut driver_bytes = [0u8; D3_DEVICE_STAGE_BYTES];
     let size = driver_message.wire_size();
     encode_control_v1_1(driver_message, &mut driver_bytes[..size]).map_err(|_| failure(189))?;
@@ -1789,11 +1817,14 @@ fn service_connector_offer(
         reserved0: 0,
         reserved: [0; 2],
     };
-    if send_channel(driver_control, &driver_bytes[..size], &[transfer]).is_err() {
+    if platform
+        .send_channel(driver_control, &driver_bytes[..size], &[transfer])
+        .is_err()
+    {
         let _ = broker.attach_send_failed(attach);
-        let _ = close_handle(driver_endpoint);
-        let _ = close_handle(client_endpoint);
-        let _ = close_handle(direct);
+        let _ = platform.close_handle(driver_endpoint);
+        let _ = platform.close_handle(client_endpoint);
+        let _ = platform.close_handle(direct);
         return Err(failure(190));
     }
     broker
@@ -1802,12 +1833,13 @@ fn service_connector_offer(
     wait_readable(driver_control, deadline, 192)?;
     let mut ready_bytes = [0u8; D3_DEVICE_STAGE_BYTES];
     let mut ready_handles = [DwReceivedHandleInfoV1::default(); 1];
-    let counts = receive_channel(driver_control, &mut ready_bytes, &mut ready_handles)
+    let counts = platform
+        .receive_channel(driver_control, &mut ready_bytes, &mut ready_handles)
         .map_err(|_| failure(193))?;
     if counts.bytes > ready_bytes.len() || counts.handles != 0 {
         close_received(&ready_handles, counts.handles);
-        let _ = close_handle(client_endpoint);
-        let _ = close_handle(direct);
+        let _ = platform.close_handle(client_endpoint);
+        let _ = platform.close_handle(direct);
         return Err(failure(194));
     }
     let ready = parse_control_v1_1(&ready_bytes[..counts.bytes]).map_err(|_| failure(195))?;
@@ -1824,10 +1856,13 @@ fn service_connector_offer(
         reserved0: 0,
         reserved: [0; 2],
     };
-    if send_channel(direct, &response_bytes, &[transfer]).is_err() {
+    if platform
+        .send_channel(direct, &response_bytes, &[transfer])
+        .is_err()
+    {
         let _ = broker.connected_send_failed();
-        let _ = close_handle(client_endpoint);
-        let _ = close_handle(direct);
+        let _ = platform.close_handle(client_endpoint);
+        let _ = platform.close_handle(direct);
         return Err(failure(199));
     }
     broker.client_endpoint_moved().map_err(|_| failure(200))?;
@@ -1840,11 +1875,12 @@ fn service_connector_offer(
         Ok(())
     }
     #[cfg(not(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32"))))]
-    close_handle(direct).map_err(|_| failure(201))
+    platform.close_handle(direct).map_err(|_| failure(201))
 }
 
 #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
-fn observe_production_client_release(
+fn observe_production_client_release<P: DevmgrPlatform>(
+    platform: &mut P,
     witness: &mut Option<ProductionClientWitness>,
     broker: &mut ConnectorBroker,
     signals: deepwyrm_syscall::DwSignals,
@@ -1859,7 +1895,7 @@ fn observe_production_client_release(
         }
         let mut bytes = [0u8; 1];
         let mut handles = [DwReceivedHandleInfoV1::default(); 1];
-        if let Ok(counts) = receive_channel(observed.handle, &mut bytes, &mut handles) {
+        if let Ok(counts) = platform.receive_channel(observed.handle, &mut bytes, &mut handles) {
             close_received(&handles, counts.handles);
         }
         return Err(failure(280));
@@ -1878,13 +1914,16 @@ fn observe_production_client_release(
         }
         _ => return Err(failure(284)),
     }
-    close_handle(observed.handle).map_err(|_| failure(285))?;
+    platform
+        .close_handle(observed.handle)
+        .map_err(|_| failure(285))?;
     *witness = None;
     Ok(())
 }
 
 #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
-fn update_production_cleanup(
+fn update_production_cleanup<P: DevmgrPlatform>(
+    platform: &mut P,
     broker: &ConnectorBroker,
     deadline: &mut Option<u64>,
 ) -> Result<(), u32> {
@@ -1900,7 +1939,7 @@ fn update_production_cleanup(
     ) && deadline.is_none()
     {
         *deadline = Some(
-            production_cleanup_deadline(monotonic_active_now().map_err(|_| failure(286))?)
+            production_cleanup_deadline(platform.monotonic_active_now().map_err(|_| failure(286))?)
                 .map_err(|_| failure(287))?,
         );
     }
@@ -1927,7 +1966,8 @@ fn maybe_send_waiting_for_registry(
 }
 
 #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
-fn await_production_witness_release(
+fn await_production_witness_release<P: DevmgrPlatform>(
+    platform: &mut P,
     witness: &mut Option<ProductionClientWitness>,
     broker: &mut ConnectorBroker,
     deadline: &mut Option<u64>,
@@ -1940,34 +1980,43 @@ fn await_production_witness_release(
             Err(failure(300))
         };
     };
-    update_production_cleanup(broker, deadline)?;
+    update_production_cleanup(platform, broker, deadline)?;
     let absolute = (*deadline).ok_or(failure(301))?;
-    if !cleanup_deadline_live(monotonic_active_now().map_err(|_| failure(302))?, absolute) {
+    if !cleanup_deadline_live(
+        platform.monotonic_active_now().map_err(|_| failure(302))?,
+        absolute,
+    ) {
         return Err(failure(303));
     }
-    let result = wait_many(
-        core::slice::from_ref(&wait_item(observed.handle)),
-        deepwyrm_syscall::DwDeadline(absolute),
-    )
-    .map_err(|_| failure(304))?;
+    let result = platform
+        .wait_many(
+            core::slice::from_ref(&wait_item(observed.handle)),
+            deepwyrm_syscall::DwDeadline(absolute),
+        )
+        .map_err(|_| failure(304))?;
     if result.index != 0
-        || !cleanup_deadline_live(monotonic_active_now().map_err(|_| failure(305))?, absolute)
+        || !cleanup_deadline_live(
+            platform.monotonic_active_now().map_err(|_| failure(305))?,
+            absolute,
+        )
     {
         return Err(failure(306));
     }
-    observe_production_client_release(witness, broker, result.observed)?;
-    update_production_cleanup(broker, deadline)
+    observe_production_client_release(platform, witness, broker, result.observed)?;
+    update_production_cleanup(platform, broker, deadline)
 }
 
 #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
-fn service_production_driver_control(
+fn service_production_driver_control<P: DevmgrPlatform>(
+    platform: &mut P,
     driver_control: DwHandle,
     broker: &mut ConnectorBroker,
 ) -> Result<(), u32> {
     let mut bytes = [0u8; D3_DEVICE_STAGE_BYTES];
     let mut handles = [DwReceivedHandleInfoV1::default(); 1];
-    let counts =
-        receive_channel(driver_control, &mut bytes, &mut handles).map_err(|_| failure(272))?;
+    let counts = platform
+        .receive_channel(driver_control, &mut bytes, &mut handles)
+        .map_err(|_| failure(272))?;
     if counts.bytes > bytes.len() || counts.handles != 0 {
         close_received(&handles, counts.handles);
         return Err(failure(273));
@@ -1977,7 +2026,8 @@ fn service_production_driver_control(
 }
 
 #[cfg(feature = "dw1e3-selector31")]
-fn service_selector31_driver_control(
+fn service_selector31_driver_control<P: DevmgrPlatform>(
+    platform: &mut P,
     driver_control: DwHandle,
     bootstrap: DwHandle,
     broker: &mut ConnectorBroker,
@@ -1989,8 +2039,9 @@ fn service_selector31_driver_control(
     // would truncate STREAM_DETACHED and lose connector custody.
     let mut bytes = [0u8; D3_DEVICE_STAGE_BYTES];
     let mut handles = [DwReceivedHandleInfoV1::default(); 1];
-    let counts =
-        receive_channel(driver_control, &mut bytes, &mut handles).map_err(|_| failure(203))?;
+    let counts = platform
+        .receive_channel(driver_control, &mut bytes, &mut handles)
+        .map_err(|_| failure(203))?;
     if counts.bytes > bytes.len() || counts.handles != 0 {
         close_received(&handles, counts.handles);
         return Err(failure(204));
@@ -2003,7 +2054,9 @@ fn service_selector31_driver_control(
         // outer resident loop. Parse for framing only, then relay the same
         // bytes: devmgr does not construct or reinterpret a TEMT fact.
         parse_transport_empty_fact(&bytes[..counts.bytes]).map_err(|_| failure(205))?;
-        send_channel(bootstrap, &bytes[..counts.bytes], &[]).map_err(|_| failure(206))?;
+        platform
+            .send_channel(bootstrap, &bytes[..counts.bytes], &[])
+            .map_err(|_| failure(206))?;
         return Ok(());
     }
     if counts.bytes == TRANSPORT_EMPTY_FACT_BYTES
@@ -2011,7 +2064,9 @@ fn service_selector31_driver_control(
         && u16::from_le_bytes([bytes[6], bytes[7]]) == 8
     {
         parse_retire_stage1_ready(&bytes[..counts.bytes]).map_err(|_| failure(209))?;
-        send_channel(bootstrap, &bytes[..counts.bytes], &[]).map_err(|_| failure(210))?;
+        platform
+            .send_channel(bootstrap, &bytes[..counts.bytes], &[])
+            .map_err(|_| failure(210))?;
         return Ok(());
     }
     if counts.bytes == TRANSPORT_EMPTY_FACT_BYTES
@@ -2023,7 +2078,9 @@ fn service_selector31_driver_control(
             return Err(failure(207));
         }
         *binding_ready = true;
-        send_channel(bootstrap, &bytes[..counts.bytes], &[]).map_err(|_| failure(208))?;
+        platform
+            .send_channel(bootstrap, &bytes[..counts.bytes], &[])
+            .map_err(|_| failure(208))?;
         return Ok(());
     }
     let attach = match broker.slot() {
@@ -2042,7 +2099,8 @@ fn service_selector31_driver_control(
 }
 
 #[cfg(feature = "wyr1d-selector32")]
-fn service_selector32_driver_control(
+fn service_selector32_driver_control<P: DevmgrPlatform>(
+    platform: &mut P,
     driver_control: DwHandle,
     bootstrap: DwHandle,
     broker: &mut ConnectorBroker,
@@ -2050,8 +2108,9 @@ fn service_selector32_driver_control(
 ) -> Result<(), u32> {
     let mut bytes = [0u8; D3_DEVICE_STAGE_BYTES];
     let mut handles = [DwReceivedHandleInfoV1::default(); 1];
-    let counts =
-        receive_channel(driver_control, &mut bytes, &mut handles).map_err(|_| failure(253))?;
+    let counts = platform
+        .receive_channel(driver_control, &mut bytes, &mut handles)
+        .map_err(|_| failure(253))?;
     if counts.bytes > bytes.len() || counts.handles != 0 {
         close_received(&handles, counts.handles);
         return Err(failure(254));
@@ -2065,7 +2124,11 @@ fn service_selector32_driver_control(
         drain
             .validate_completion(identity, broker)
             .map_err(|_| failure(269))?;
-        send_d5_controller(bootstrap, D5ControllerMessage::TxDrained(identity))?;
+        send_d5_controller(
+            platform,
+            bootstrap,
+            D5ControllerMessage::TxDrained(identity),
+        )?;
         drain.forwarded(identity).map_err(|_| failure(270))?;
         return Ok(());
     }
