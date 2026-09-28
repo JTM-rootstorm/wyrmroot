@@ -1609,8 +1609,8 @@ fn event_loop(
                     authorities,
                     transactions,
                     model,
-                    &mut serial,
-                    &mut child,
+                    serial,
+                    child,
                     &mut input_pending,
                     &mut output_pending,
                 )?;
