@@ -41,6 +41,9 @@ wyrmroot-registry-proto = { path = "../../crates/wyrmroot-registry-proto", optio
 wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime", optional = true }
 wyrmroot-stream-proto = { path = "../../crates/wyrmroot-stream-proto", optional = true }
 
+[dev-dependencies]
+wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime", features = ["platform-recording"] }
+
 [lints.rust]
 unsafe_code = "deny"
 unused_crate_dependencies = "deny"

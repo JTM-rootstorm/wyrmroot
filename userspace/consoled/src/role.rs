@@ -3560,3 +3560,6 @@ fn now_millis<P: ConsoledPlatform>(platform: &mut P) -> Result<u64, u32> {
         .map(|now| now / NANOS_PER_MILLI)
         .map_err(|_| 94)
 }
+
+#[cfg(test)]
+mod tests;

@@ -12,6 +12,10 @@ compile_error!("selector-32 console-echo and WYR1-E wyrmsh policies are mutually
 
 #[cfg(test)]
 extern crate std;
+// The recording platform is a dev-dependency; only the native role's tests
+// name it.
+#[cfg(all(test, not(feature = "native-consoled")))]
+use wyrmroot_runtime as _;
 
 /// The WRC8 quiesce handshake. Frames keep their `WRC8` wire tag, which is
 /// protocol; the module name is not, and no longer names a selector.

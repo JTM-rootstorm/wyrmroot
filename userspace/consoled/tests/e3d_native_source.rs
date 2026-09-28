@@ -1,5 +1,6 @@
 use wyrmroot_console_proto as _;
 use wyrmroot_consoled as _;
+use wyrmroot_runtime as _;
 
 /// consoled's role, in its original order: the binary's entry file, then
 /// `role.rs`, which holds everything consoled's `main.rs` held before S2U step

@@ -1,3 +1,4 @@
+use wyrmroot_runtime as _;
 use {wyrmroot_console_proto as _, wyrmroot_consoled as _};
 
 const MANIFEST: &str = include_str!("../Cargo.toml");
