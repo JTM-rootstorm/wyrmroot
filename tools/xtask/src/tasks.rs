@@ -1910,6 +1910,22 @@ const FEATURE_COMBINATIONS_HAND_MAINTAINED: &[(&str, &str)] = &[
     ("wyrmroot-bootstrap", "wyr1c4-production"),
     ("wyrmroot-bootstrap", "wyr1c5-production"),
     ("wyrmroot-bootstrap", "wyr1c6-production"),
+    // S2 integration (S1 record §6). The bootstrap's guest-test variants:
+    // deepwyrm's primordial and I0 negative guest tests, the I capability
+    // relay and the loader smoke test. No current product or xtask path
+    // builds them, so nothing else would notice them stop compiling.
+    ("wyrmroot-bootstrap", "primordial-blocking-cleanup"),
+    ("wyrmroot-bootstrap", "primordial-user-exception"),
+    ("wyrmroot-bootstrap", "primordial-invalid-return"),
+    ("wyrmroot-bootstrap", "i0-negative-malformed-elf"),
+    ("wyrmroot-bootstrap", "i0-negative-malformed-startup"),
+    ("wyrmroot-bootstrap", "i0-negative-capability-count"),
+    ("wyrmroot-bootstrap", "i0-negative-capability-type"),
+    ("wyrmroot-bootstrap", "i0-negative-capability-rights"),
+    ("wyrmroot-bootstrap", "i-capability-integration"),
+    ("wyrmroot-bootstrap", "native-loader-smoke-integration"),
+    // S2U.1's recording fake of the platform trait family.
+    ("wyrmroot-runtime", "platform-recording"),
     // Host-only builder shapes.
     ("wyrmroot-bootfs", "builder"),
     ("wyrmroot-rrc-manifest", "builder"),
