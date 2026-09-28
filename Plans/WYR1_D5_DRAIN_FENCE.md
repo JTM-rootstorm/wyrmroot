@@ -13,7 +13,7 @@ likewise may exit QEMU before UART transmission. Therefore system-init must
 fence both U1 retirement after leg 2 and terminal submission after leg 4.
 
 Reuse the first-party selector-31 `EvidenceDrain`/`prove_transport_empty`
-ordering in `userspace/uart16550d/src/main.rs`: consume normal stream input,
+ordering in `userspace/uart16550d/src/role.rs` (in `main.rs` until S2U.3): consume normal stream input,
 service and acknowledge interrupts, then test software and hardware empty.
 No external source code is imported. Driver hardware ownership stays in
 uart16550d; system-init and Deepwyrm must not poll COM2 registers themselves.
