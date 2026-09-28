@@ -1002,6 +1002,7 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
                 #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
                 let production_retiring_driver = published_driver(&resident, request)?;
                 observe_driver_failure(
+                    platform,
                     control,
                     request,
                     &mut resident,
@@ -1034,7 +1035,7 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
                 )?;
                 platform.close_handle(control).map_err(|_| failure(41))?;
                 let old_publication = publication.take().ok_or(failure(42))?;
-                retire_driver_publication(old_publication, request, &resident)?;
+                retire_driver_publication(platform, old_publication, request, &resident)?;
                 #[cfg(feature = "wyr1c6-selector29")]
                 let stale_publication = old_publication;
                 #[cfg(not(feature = "wyr1c6-selector29"))]
@@ -1060,7 +1061,7 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
                     )?;
                 }
                 resident.publication_retired().map_err(|_| failure(43))?;
-                await_driver_reaped(bootstrap, request)?;
+                await_driver_reaped(platform, bootstrap, request)?;
                 resident.reap_driver().map_err(|_| failure(44))?;
                 #[cfg(all(feature = "wyr1e-production", not(feature = "wyr1d-selector32")))]
                 {
@@ -1257,8 +1258,8 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
                 }) {
                     let replacement = resident.active_driver_request().ok_or(failure(153))?;
                     probe_malformed_resource_mapping(launched, parent, replacement, &resident)?;
-                    probe_stale_driver_endpoint(stale_control, request, &resident)?;
-                    probe_stale_publication(stale_publication, request, &resident)?;
+                    probe_stale_driver_endpoint(platform, stale_control, request, &resident)?;
+                    probe_stale_publication(platform, stale_publication, request, &resident)?;
                     #[cfg(feature = "wyr1c6-selector29")]
                     {
                         let old_binding = resident.retired_binding().ok_or(failure(145))?;
@@ -2137,7 +2138,8 @@ fn service_selector32_driver_control<P: DevmgrPlatform>(
 }
 
 #[cfg(any(feature = "wyr1c6-production", feature = "dw1e3-selector31"))]
-fn observe_driver_failure(
+fn observe_driver_failure<P: DevmgrPlatform>(
+    platform: &mut P,
     control: DwHandle,
     request: wyrmroot_device_proto::DriverLaunchRequest,
     resident: &mut crate::ResidentController,
@@ -2150,7 +2152,9 @@ fn observe_driver_failure(
     }
     let mut bytes = [0u8; wyrmroot_device_proto::control::FAILURE_BYTES];
     let mut handles = [DwReceivedHandleInfoV1::default(); 1];
-    let counts = receive_channel(control, &mut bytes, &mut handles).map_err(|_| failure(100))?;
+    let counts = platform
+        .receive_channel(control, &mut bytes, &mut handles)
+        .map_err(|_| failure(100))?;
     if counts.bytes != bytes.len() || counts.handles != 0 {
         close_received(&handles, counts.handles);
         if peer_closed && counts.bytes == 0 && counts.handles == 0 {
@@ -2198,7 +2202,8 @@ fn record_driver_terminal(
 }
 
 #[cfg(any(feature = "wyr1c6-production", feature = "dw1e3-selector31"))]
-fn retire_driver_publication(
+fn retire_driver_publication<P: DevmgrPlatform>(
+    platform: &mut P,
     publication: DwHandle,
     request: wyrmroot_device_proto::DriverLaunchRequest,
     resident: &crate::ResidentController,
@@ -2216,14 +2221,18 @@ fn retire_driver_publication(
     };
     let mut bytes = [0u8; REGISTRY_HEADER_BYTES];
     let size = encode_registry_empty(header, &mut bytes).map_err(|_| failure(107))?;
-    send_channel(publication, &bytes[..size], &[]).map_err(|_| failure(108))?;
-    let deadline = monotonic_deadline_after(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
+    platform
+        .send_channel(publication, &bytes[..size], &[])
+        .map_err(|_| failure(108))?;
+    let deadline = platform
+        .monotonic_deadline_after(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
         .map_err(|_| failure(109))?;
     wait_readable(publication, deadline, 110)?;
     let mut response = [0u8; REGISTRY_HEADER_BYTES];
     let mut handles = [DwReceivedHandleInfoV1::default(); 1];
-    let counts =
-        receive_channel(publication, &mut response, &mut handles).map_err(|_| failure(111))?;
+    let counts = platform
+        .receive_channel(publication, &mut response, &mut handles)
+        .map_err(|_| failure(111))?;
     if counts.bytes != response.len() || counts.handles != 0 {
         close_received(&handles, counts.handles);
         return Err(failure(112));
@@ -2242,7 +2251,8 @@ fn retire_driver_publication(
 }
 
 #[cfg(feature = "wyr1c6-selector29")]
-fn probe_stale_driver_endpoint(
+fn probe_stale_driver_endpoint<P: DevmgrPlatform>(
+    platform: &mut P,
     control: DwHandle,
     request: wyrmroot_device_proto::DriverLaunchRequest,
     resident: &crate::ResidentController,
@@ -2256,14 +2266,15 @@ fn probe_stale_driver_endpoint(
     };
     let mut bytes = [0u8; wyrmroot_device_proto::control::RETIRE_BYTES];
     wyrmroot_device_proto::control::encode(message, &mut bytes).map_err(|_| failure(118))?;
-    if send_channel(control, &bytes, &[]).is_ok() {
+    if platform.send_channel(control, &bytes, &[]).is_ok() {
         return Err(failure(119));
     }
     Ok(())
 }
 
 #[cfg(feature = "wyr1c6-selector29")]
-fn probe_stale_publication(
+fn probe_stale_publication<P: DevmgrPlatform>(
+    platform: &mut P,
     publication: DwHandle,
     request: wyrmroot_device_proto::DriverLaunchRequest,
     resident: &crate::ResidentController,
@@ -2278,23 +2289,30 @@ fn probe_stale_publication(
     };
     let mut bytes = [0u8; REGISTRY_HEADER_BYTES];
     let size = encode_registry_empty(header, &mut bytes).map_err(|_| failure(150))?;
-    if send_channel(publication, &bytes[..size], &[]).is_ok() {
+    if platform
+        .send_channel(publication, &bytes[..size], &[])
+        .is_ok()
+    {
         return Err(failure(151));
     }
     Ok(())
 }
 
 #[cfg(any(feature = "wyr1c6-production", feature = "dw1e3-selector31"))]
-fn await_driver_reaped(
+fn await_driver_reaped<P: DevmgrPlatform>(
+    platform: &mut P,
     bootstrap: DwHandle,
     request: wyrmroot_device_proto::DriverLaunchRequest,
 ) -> Result<(), u32> {
-    let deadline = monotonic_deadline_after(WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns)
+    let deadline = platform
+        .monotonic_deadline_after(WYR0_I_SUPERVISION_POLICY.cleanup_timeout_ns)
         .map_err(|_| failure(115))?;
     wait_readable(bootstrap, deadline, 116)?;
     let mut bytes = [0u8; REAPED_RESPONSE_BYTES];
     let mut handles = [DwReceivedHandleInfoV1::default(); 1];
-    let counts = receive_channel(bootstrap, &mut bytes, &mut handles).map_err(|_| failure(117))?;
+    let counts = platform
+        .receive_channel(bootstrap, &mut bytes, &mut handles)
+        .map_err(|_| failure(117))?;
     if counts.bytes != bytes.len() || counts.handles != 0 {
         close_received(&handles, counts.handles);
         return Err(failure(118));

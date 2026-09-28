@@ -132,10 +132,10 @@ fn selector29_stale_probes_run_after_p2_publication_and_close_before_probe() {
         .find("probe_malformed_resource_mapping(launched")
         .expect("post-P2 malformed resource mapping probe");
     let stale_control = retry
-        .find("probe_stale_driver_endpoint(stale_control")
+        .find("probe_stale_driver_endpoint(platform, stale_control")
         .expect("post-P2 stale control probe");
     let stale_publication = retry
-        .find("probe_stale_publication(stale_publication")
+        .find("probe_stale_publication(platform, stale_publication")
         .expect("post-P2 stale publication probe");
     let close_control = NATIVE
         .find("close_handle(control).map_err(|_| failure(41))")
@@ -182,10 +182,12 @@ fn selector29_malformed_mapping_probe_moves_wrong_second_type_and_requires_typed
     assert!(!probe.contains("interrupt_ack"));
 }
 
+/// Source text until S3: the role runs over the platform seam, but no
+/// RecordingPlatform script drives this path yet.
 #[test]
 fn c6_retirement_uses_a_fresh_endpoint_local_registry_transaction() {
-    let retire = &NATIVE[NATIVE.find("fn retire_driver_publication(").unwrap()
-        ..NATIVE.find("fn probe_stale_driver_endpoint(").unwrap()];
+    let retire = &NATIVE[NATIVE.find("fn retire_driver_publication<").unwrap()
+        ..NATIVE.find("fn probe_stale_driver_endpoint<").unwrap()];
     let allocate = retire
         .find("publication_retire_transaction(request)")
         .expect("resident allocates the post-publish retirement transaction");

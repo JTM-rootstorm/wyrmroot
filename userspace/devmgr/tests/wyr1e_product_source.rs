@@ -152,6 +152,8 @@ fn e8_accepts_only_the_exact_current_driver_retire_request() {
     ));
 }
 
+/// Source text until S3: the role runs over the platform seam, but no
+/// RecordingPlatform script drives this path yet.
 #[test]
 fn e8_intentional_terminal_preserves_failure_validation_and_cleanup_state() {
     let driver_branch = &NATIVE[NATIVE.find("if Some(index) == driver_index").unwrap()
@@ -161,8 +163,8 @@ fn e8_intentional_terminal_preserves_failure_validation_and_cleanup_state() {
     let observe_call = &observe_call[..observe_call.find(")?;").unwrap()];
     assert!(observe_call.contains("e8_retire_requested"));
 
-    let observe = &NATIVE[NATIVE.find("fn observe_driver_failure(").unwrap()
-        ..NATIVE.find("fn retire_driver_publication(").unwrap()];
+    let observe = &NATIVE[NATIVE.find("fn observe_driver_failure<").unwrap()
+        ..NATIVE.find("fn retire_driver_publication<").unwrap()];
     let counts = observe.find("counts.bytes != bytes.len()").unwrap();
     let parse = observe.find("control::parse(&bytes)").unwrap();
     let exact_message = observe.find("if message != expected").unwrap();
