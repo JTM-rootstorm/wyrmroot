@@ -3,9 +3,14 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
-#[cfg(feature = "native-registryd")]
+// Also built for the library's own tests, which drive the role through the
+// runtime's recording platform (dev-dependencies below supply its crates).
+#[cfg(any(feature = "native-registryd", test))]
 pub mod role;
 pub mod service;
+
+#[cfg(test)]
+extern crate std;
 
 use wyrmroot_registry_proto::{
     EnumerationScope, InstallClient, InstallPublication, Lookup, MAX_CLIENT_REPLAY,

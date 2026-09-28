@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use {wyrmroot_registry_proto as _, wyrmroot_registryd as _};
+use {
+    deepwyrm_syscall as _, wyrmroot_loader as _, wyrmroot_registry_proto as _,
+    wyrmroot_registryd as _, wyrmroot_runtime as _,
+};
 
 const NATIVE: &str = concat!(include_str!("../src/main.rs"), include_str!("../src/role.rs"));
 const SERVICE: &str = include_str!("../src/service.rs");

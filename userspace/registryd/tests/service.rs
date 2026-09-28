@@ -10,6 +10,7 @@ use wyrmroot_registryd::service::{
     ChannelRights, ProbeSignals, ReceiveCounts, ReceivedHandle, RegistryService, ServiceError,
     Transport, WaitEvent,
 };
+use {deepwyrm_syscall as _, wyrmroot_loader as _, wyrmroot_runtime as _};
 
 #[derive(Default)]
 struct Mock {

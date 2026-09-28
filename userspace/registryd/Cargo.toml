@@ -26,6 +26,11 @@ wyrmroot-loader = { path = "../../crates/wyrmroot-loader", optional = true }
 wyrmroot-registry-proto = { path = "../../crates/wyrmroot-registry-proto" }
 wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime", optional = true }
 
+[dev-dependencies]
+deepwyrm-syscall.workspace = true
+wyrmroot-loader = { path = "../../crates/wyrmroot-loader" }
+wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime", features = ["platform-recording"] }
+
 [lints.rust]
 unsafe_code = "deny"
 unused_crate_dependencies = "deny"

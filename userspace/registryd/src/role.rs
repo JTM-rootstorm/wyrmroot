@@ -244,3 +244,6 @@ const fn wait_item(handle: DwHandle) -> DwWaitItemV1 {
         signals: DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
     }
 }
+
+#[cfg(test)]
+mod tests;
