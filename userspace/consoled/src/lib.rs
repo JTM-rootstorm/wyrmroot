@@ -23,12 +23,19 @@ extern crate std;
 #[cfg(any(test, feature = "wyr1e8-recovery"))]
 pub mod quiesce_control;
 
+/// The native role, which `src/main.rs` held until S2U step 3. It exists only
+/// with `native-consoled`, which every consoled binary shape requires.
 #[cfg(feature = "native-consoled")]
-use {
-    deepwyrm_syscall as _, wyrmroot_device_proto as _, wyrmroot_launch_proto as _,
-    wyrmroot_loader as _, wyrmroot_registry_proto as _, wyrmroot_runtime as _,
-    wyrmroot_stream_proto as _,
-};
+pub mod role;
+#[cfg(feature = "native-consoled")]
+mod stream_transfer;
+
+// The role was moved out of the binary verbatim, and the binary named this
+// library `wyrmroot_consoled`. Keeping that name resolvable here keeps the
+// moved code, and the source-text tests that read it, byte-for-byte as they
+// were.
+#[cfg(feature = "native-consoled")]
+extern crate self as wyrmroot_consoled;
 
 pub const STAGING_CAPACITY: usize = 4096;
 pub const FAIR_SOURCE_BYTES_PER_TURN: usize = 1024;
@@ -1814,32 +1821,17 @@ const fn other(source: OutputSource) -> OutputSource {
 mod tests {
     use super::*;
 
-    /// The supervision half of F3A.7g, which no host test can reach.
-    ///
-    /// `consoled`'s event loop lives in `main.rs`, whose host build only
-    /// type-checks the guest entry (S2U step 2) and has no platform seam to
-    /// drive it until step 3, so no host test can run the loop. The
-    /// property that matters is a decision inside
-    /// one function, so it is read out of the source here rather than left
-    /// unstated.
-    ///
-    /// Written against positions rather than presence: a guard that is
-    /// deleted, moved after the relaunch, or joined by a second relaunch all
-    /// fail. A substring test for `session_shutdown` alone would survive all
-    /// three.
-    /// F3A.7k. A witness released while raw custody holds means devmgr is gone,
-    /// not the serial line, and closure contract §5.4 requires the console and
-    /// the live shell to keep serving. Both wait loops must drop the witness and
-    /// carry on; neither may tear the shell down or report the serial lost.
-    /// `main.rs` has no host-runnable seam yet, so this reads it.
     /// F3A.7k. devmgr's death also withdraws its publication, and registryd
     /// completes consoled's watch with generation 0. Both registry arms must
     /// keep serving on a withdrawal and rebuild only on a real republication.
-    /// Still a text test: both arms live in `main.rs`'s event loop until S2U
-    /// step 3 moves consoled's decisions behind the platform seam.
+    ///
+    /// Still a text test: both arms are inside the role's event loop, which
+    /// moved to `role.rs` in S2U step 3 but which no host test drives yet.
+    /// `MAIN` is the binary's old text in its old order, `main.rs` then
+    /// `role.rs`, so every count and position below keeps its meaning.
     #[test]
     fn a_withdrawn_publication_keeps_the_session_serving() {
-        const MAIN: &str = include_str!("main.rs");
+        const MAIN: &str = concat!(include_str!("main.rs"), include_str!("role.rs"));
         let main: std::string::String = MAIN.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(main.contains(
             "#[cfg(feature=\"wyr1e-wyrmsh\")]constfnpublication_withdrawn(service_generation:u64)->bool{service_generation==0}"
@@ -1877,9 +1869,17 @@ mod tests {
         assert!(!main.contains("receive_publication_change(authorities,serial)?;returnOk(LaunchWaitOutcome::SerialLost)"));
     }
 
+    /// F3A.7k. A witness released while raw custody holds means devmgr is gone,
+    /// not the serial line, and closure contract §5.4 requires the console and
+    /// the live shell to keep serving. Both wait loops must drop the witness and
+    /// carry on; neither may tear the shell down or report the serial lost.
+    ///
+    /// Still a text test: both wait loops are in the role, which no host test
+    /// drives yet. `MAIN` is `main.rs` then `role.rs`, the binary's old text in
+    /// its old order.
     #[test]
     fn an_orphaned_witness_is_dropped_and_the_session_keeps_serving() {
-        const MAIN: &str = include_str!("main.rs");
+        const MAIN: &str = concat!(include_str!("main.rs"), include_str!("role.rs"));
         let squeeze = |text: &str| -> std::string::String {
             text.chars().filter(|c| !c.is_whitespace()).collect()
         };
@@ -1920,9 +1920,20 @@ mod tests {
         );
     }
 
+    /// The supervision half of F3A.7g.
+    ///
+    /// The property is a decision inside one role function, which no host
+    /// test drives yet, so it is read out of the source rather than left
+    /// unstated. `MAIN` is `main.rs` then `role.rs`, the binary's old text in
+    /// its old order; the slice below still ends at the next top-level `fn`.
+    ///
+    /// Written against positions rather than presence: a guard that is
+    /// deleted, moved after the relaunch, or joined by a second relaunch all
+    /// fail. A substring test for `session_shutdown` alone would survive all
+    /// three.
     #[test]
     fn terminal_recovery_checks_for_a_session_shutdown_before_it_relaunches() {
-        const MAIN: &str = include_str!("main.rs");
+        const MAIN: &str = concat!(include_str!("main.rs"), include_str!("role.rs"));
         const SIGNATURE: &str = "fn recover_terminal_child(";
 
         let start = MAIN

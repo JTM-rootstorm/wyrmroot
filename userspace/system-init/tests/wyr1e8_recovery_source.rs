@@ -10,7 +10,14 @@ use {
 };
 
 const MANIFEST: &str = include_str!("../Cargo.toml");
-const CONSOLED: &str = include_str!("../../consoled/src/main.rs");
+/// consoled's role, in its original order: the binary's entry file, then
+/// `role.rs`, which holds everything consoled's `main.rs` held before S2U step
+/// 3. Source text because no host test drives the role yet; each test below
+/// names the property it reads.
+const CONSOLED: &str = concat!(
+    include_str!("../../consoled/src/main.rs"),
+    include_str!("../../consoled/src/role.rs")
+);
 /// devmgr's role, in its original order: the binary's entry file, then
 /// `role.rs`, which holds everything devmgr's `main.rs` held before S2U step 3.
 /// Source text for the reason each test below gives.
