@@ -23,8 +23,7 @@ use wyrmroot_loader::launch::{
     encode_ready_for_profile, parse_init,
 };
 use wyrmroot_runtime::{
-    BOOTSTRAP_CHANNEL_EXPECTATION, ChannelPlatform, HandlePlatform, NativeError, NativePlatform,
-    WaitPlatform, close_handle, query_capability_info, receive_channel, send_channel,
+    BOOTSTRAP_CHANNEL_EXPECTATION, ChannelPlatform, HandlePlatform, NativeError, WaitPlatform,
     validate_bootstrap_channel,
 };
 
@@ -34,16 +33,24 @@ const BROAD_CHANNEL_RIGHTS: DwRights = DwRights(
 
 const _: () = assert!(MAX_RECEIVED_HANDLES == DW_CHANNEL_MAX_HANDLES as usize);
 
-/// Runs one registryd generation over its bootstrap Channel, returning the
-/// failure code the generation stopped with.
-pub fn run(bootstrap: DwHandle) -> Result<(), u32> {
-    let bootstrap_info = query_capability_info(bootstrap).map_err(|_| 0xB101_0001_u32)?;
+/// The platform traits the role uses.
+pub trait RegistryPlatform: HandlePlatform + ChannelPlatform + WaitPlatform {}
+
+impl<P> RegistryPlatform for P where P: HandlePlatform + ChannelPlatform + WaitPlatform + ?Sized {}
+
+/// Runs one registryd generation over its bootstrap Channel on `platform`,
+/// returning the failure code the generation stopped with.
+pub fn run<P: RegistryPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<(), u32> {
+    let bootstrap_info = platform
+        .query_capability_info(bootstrap)
+        .map_err(|_| 0xB101_0001_u32)?;
     validate_bootstrap_channel(bootstrap_info, BOOTSTRAP_CHANNEL_EXPECTATION)
         .map_err(|_| 0xB101_0002_u32)?;
     let mut init = [0u8; 64];
     let mut handles = [DwReceivedHandleInfoV1::default(); 2];
-    let counts =
-        receive_channel(bootstrap, &mut init, &mut handles).map_err(|_| 0xB101_0003_u32)?;
+    let counts = platform
+        .receive_channel(bootstrap, &mut init, &mut handles)
+        .map_err(|_| 0xB101_0003_u32)?;
     if counts.bytes > init.len() || counts.handles != 2 {
         return Err(0xB101_0004_u32);
     }
@@ -54,12 +61,13 @@ pub fn run(bootstrap: DwHandle) -> Result<(), u32> {
     )
     .map_err(|_| 0xB101_0005_u32)?;
     validate_received(
+        platform,
         handles[0],
         DW_OBJECT_TYPE_ADDRESS_REGION,
         wyrmroot_loader::launch::SELF_ROOT_RIGHTS,
     )
     .map_err(|_| 0xB101_0006_u32)?;
-    validate_received(handles[1], DW_OBJECT_TYPE_CHANNEL, CHILD_CHANNEL_RIGHTS)
+    validate_received(platform, handles[1], DW_OBJECT_TYPE_CHANNEL, CHILD_CHANNEL_RIGHTS)
         .map_err(|_| 0xB101_0007_u32)?;
     let self_root = handles[0].handle;
     let control = handles[1].handle;
@@ -70,26 +78,29 @@ pub fn run(bootstrap: DwHandle) -> Result<(), u32> {
         &mut ready,
     )
     .map_err(|_| 0xB101_0008_u32)?;
-    send_channel(bootstrap, &ready[..ready_len], &[]).map_err(|_| 0xB101_0009_u32)?;
-    close_handle(bootstrap).map_err(|_| 0xB101_000A_u32)?;
-    close_handle(self_root).map_err(|_| 0xB101_000B_u32)?;
+    platform
+        .send_channel(bootstrap, &ready[..ready_len], &[])
+        .map_err(|_| 0xB101_0009_u32)?;
+    platform.close_handle(bootstrap).map_err(|_| 0xB101_000A_u32)?;
+    platform
+        .close_handle(self_root)
+        .map_err(|_| 0xB101_000B_u32)?;
 
     let mut service = RegistryService::new(control.0);
-    let mut transport = NativeTransport {
-        platform: NativePlatform,
-    };
+    let mut transport = NativeTransport { platform };
     loop {
         service.step(&mut transport).map_err(|_| 0xB101_0010_u32)?;
     }
 }
 
-/// Registryd's transport over the platform family. The native binary uses
-/// [`NativePlatform`]; each operation keeps its own failure code.
-struct NativeTransport<P> {
-    platform: P,
+/// Registryd's transport over the platform family, sharing the caller's
+/// platform so the bootstrap sequence and the service loop are one
+/// continuous syscall sequence. Each operation keeps its own failure code.
+struct NativeTransport<'a, P> {
+    platform: &'a mut P,
 }
 
-impl<P: HandlePlatform + ChannelPlatform + WaitPlatform> Transport for NativeTransport<P> {
+impl<P: HandlePlatform + ChannelPlatform + WaitPlatform> Transport for NativeTransport<'_, P> {
     type Error = u32;
 
     fn wait(&mut self, control: u64, endpoints: &[InstalledEndpoint]) -> Result<WaitEvent, u32> {
@@ -211,7 +222,8 @@ impl<P: HandlePlatform + ChannelPlatform + WaitPlatform> Transport for NativeTra
     }
 }
 
-fn validate_received(
+fn validate_received<P: HandlePlatform + ?Sized>(
+    platform: &mut P,
     info: DwReceivedHandleInfoV1,
     object_type: deepwyrm_syscall::DwObjectType,
     rights: DwRights,
@@ -219,7 +231,7 @@ fn validate_received(
     if info.object_type != object_type || info.rights != rights {
         return Err(());
     }
-    let fresh = query_capability_info(info.handle).map_err(|_| ())?;
+    let fresh = platform.query_capability_info(info.handle).map_err(|_| ())?;
     if fresh.object_type != object_type || fresh.rights != rights {
         return Err(());
     }

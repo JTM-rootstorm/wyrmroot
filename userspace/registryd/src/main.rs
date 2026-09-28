@@ -2,11 +2,12 @@
 #![cfg_attr(target_os = "wyrmroot", no_main)]
 #![deny(unsafe_code)]
 
-use wyrmroot_runtime::StartupBlock;
+use wyrmroot_runtime::{NativePlatform, StartupBlock};
 use {deepwyrm_syscall as _, wyrmroot_loader as _, wyrmroot_registry_proto as _};
 
 fn native_main(startup: StartupBlock<'_>) -> u32 {
-    match wyrmroot_registryd::role::run(startup.bootstrap_channel().as_abi()) {
+    match wyrmroot_registryd::role::run(&mut NativePlatform, startup.bootstrap_channel().as_abi())
+    {
         Ok(()) => 0,
         Err(code) => code,
     }
