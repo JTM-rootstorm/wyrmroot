@@ -10,6 +10,12 @@
 //! side of that comparison by reading `wyr1f.rs` as text and regexing it.
 //! This command exists so that side can load a generated file instead.
 //!
+//! The generated file is committed as `tools/xtask/grammar/wyr1f-grammar-v1.json`
+//! and `tests::the_committed_snapshot_is_the_current_dump` keeps it current.
+//! The verifier keeps its own spelling of the grammar on purpose: a schema
+//! change made on one side alone must still fail a test, which it would not
+//! if the verifier loaded the producer's copy at run time.
+//!
 //! Every value this module emits comes from calling the exact functions and
 //! constants `wyr1f::prepare` itself calls to build a product -- `wyr1f::ARTIFACTS`,
 //! `wyr1f::fixed_fields`, `wyr1f::obligation_fields`, `wyr1f::request_keys`,
@@ -293,6 +299,20 @@ mod tests {
                 json_object_of_string_pairs(wyr1f::fixed_fields(product_kind).iter().copied());
             assert!(body.contains(&expected_fixed), "{}", product_kind.cli_value());
         }
+    }
+
+    /// The committed snapshot that `tests/test_verify_vm_request.py` compares
+    /// the verifier's own spelling against. Regenerate it with
+    /// `tools/pinned-cargo xtask grammar dump > tools/xtask/grammar/wyr1f-grammar-v1.json`.
+    #[test]
+    fn the_committed_snapshot_is_the_current_dump() {
+        const SNAPSHOT: &str = include_str!("../grammar/wyr1f-grammar-v1.json");
+        let current = dump().expect("grammar dump");
+        assert!(
+            current == SNAPSHOT,
+            "tools/xtask/grammar/wyr1f-grammar-v1.json is stale; regenerate it with \
+             `tools/pinned-cargo xtask grammar dump > tools/xtask/grammar/wyr1f-grammar-v1.json`"
+        );
     }
 
     /// The dump names all three final products by their request `product`
