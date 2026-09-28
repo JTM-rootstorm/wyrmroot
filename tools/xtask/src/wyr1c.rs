@@ -563,7 +563,7 @@ const WYR1E8_SELECTED_NATIVE_SPECS: [NativeSpec; 10] = [
 ///
 /// Recorded in `DW1F_WYR1F_F1A1_IMPLEMENTATION_MAP.md` §§1.1, 1.2 and 2 and in
 /// `DW1_WYR1_FINAL_CLOSURE_CONTRACT.md`'s F3A.6k amendment.
-const WYR1F_PRODUCT_NATIVE_SPECS: [NativeSpec; 8] = [
+pub(crate) const WYR1F_PRODUCT_NATIVE_SPECS: [NativeSpec; 8] = [
     NativeSpec {
         label: "system-init",
         package: "wyrmroot-system-init",

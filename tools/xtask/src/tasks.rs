@@ -1692,7 +1692,7 @@ impl Step {
 /// selector library checks; every clippy and feature-specific test gate was a
 /// named filter that ran only when typed, and S0 found three of them red with
 /// nobody the wiser. Now it is:
-/// - a library check of every row of [`FEATURE_COMBINATIONS`] (`selectors`);
+/// - a library check of every row of [`feature_combinations`] (`selectors`);
 /// - the workspace suite and the bootfs builder suite, as before;
 /// - every [`Route::Host`] filter's own commands, each distinct command once;
 /// - the warn-level lint ratchet (S1.3) over every shape those gates lint.
@@ -1809,13 +1809,20 @@ fn run_every_step(repository: &Path, steps: Vec<Step>) -> Result<(), Failure> {
 /// gates own run too. Tests hold the list complete: every `--features` any
 /// named host gate passes, and every native spec the `wyr1c`, `r1`, `wyr1b` and
 /// `dw1c` product tables build, must appear here. The inline builders of the
-/// older products (dw1b, dw1d6, dw1e3a, wyr1c2, wyr1c6) are listed by hand until
-/// S2T gives every product one spec table.
+/// older products (dw1b, dw1d6, dw1e3a, wyr1c2, wyr1c6) are listed by hand
+/// here still; S2T (`DW1_WYR1_STRUCTURAL_REFACTOR_PLAN.md` §4) started giving
+/// every product one spec table with the current final product,
+/// `wyr1c::WYR1F_PRODUCT_NATIVE_SPECS` -- see [`feature_combinations`], which
+/// reads that table's eight rows directly instead of restating them below. No
+/// disagreement existed between the two at the time of that change: every
+/// `WYR1F_PRODUCT_NATIVE_SPECS` pair was already, separately, one of these
+/// rows.
 ///
 /// Feature sets are spelled as their builder spells them, so a combination two
 /// builders spell differently appears twice; Cargo resolves both to one build.
-const FEATURE_COMBINATIONS: &[(&str, &str)] = &[
-    // system-init: every selector and the product shapes.
+const FEATURE_COMBINATIONS_HAND_MAINTAINED: &[(&str, &str)] = &[
+    // system-init: every selector and the product shapes. `wyr1e-production`
+    // is the WYR1-F production shape and comes from `feature_combinations`.
     ("wyrmroot-system-init", "native-init"),
     ("wyrmroot-system-init", "native-init,wyr1-test-evidence"),
     ("wyrmroot-system-init", "native-init,wyr1b-test-evidence"),
@@ -1832,22 +1839,22 @@ const FEATURE_COMBINATIONS: &[(&str, &str)] = &[
     ("wyrmroot-system-init", "wyr1c6-test-evidence"),
     ("wyrmroot-system-init", "wyr1d-selector32"),
     ("wyrmroot-system-init", "wyr1e-shell-controller"),
-    ("wyrmroot-system-init", "wyr1e-production"),
     ("wyrmroot-system-init", "wyr1e-production,wyr1f-closure"),
     ("wyrmroot-system-init", "wyr1e-selector33"),
     ("wyrmroot-system-init", "wyr1e8-selector33"),
     ("wyrmroot-system-init", "wyr1f-closure"),
     ("wyrmroot-system-init", "r1-selector34"),
     ("wyrmroot-system-init", "dw1e3-selector31"),
-    // consoled.
+    // consoled. `native-consoled,wyr1e-wyrmsh` is the WYR1-F production
+    // shape and comes from `feature_combinations`.
     ("wyrmroot-consoled", "native-consoled,wyr1d-selector32"),
-    ("wyrmroot-consoled", "native-consoled,wyr1e-wyrmsh"),
     (
         "wyrmroot-consoled",
         "native-consoled,wyr1e-wyrmsh,wyr1e8-recovery",
     ),
     ("wyrmroot-consoled", "wyr1e-wyrmsh"),
-    // devmgr.
+    // devmgr. `wyr1e8-production` is the WYR1-F production shape and comes
+    // from `feature_combinations`.
     ("wyrmroot-devmgr", "native-devmgr"),
     ("wyrmroot-devmgr", "wyr1c4-production"),
     ("wyrmroot-devmgr", "wyr1c5-production"),
@@ -1855,20 +1862,19 @@ const FEATURE_COMBINATIONS: &[(&str, &str)] = &[
     ("wyrmroot-devmgr", "wyr1d-production"),
     ("wyrmroot-devmgr", "wyr1d-selector32"),
     ("wyrmroot-devmgr", "wyr1e-production"),
-    ("wyrmroot-devmgr", "wyr1e8-production"),
     ("wyrmroot-devmgr", "dw1e3-selector31"),
-    // uart16550d.
-    ("wyrmroot-uart16550d", "native-uart16550d"),
+    // uart16550d. `native-uart16550d` is the WYR1-F production shape and
+    // comes from `feature_combinations`.
     ("wyrmroot-uart16550d", "wyr1d-selector32"),
     ("wyrmroot-uart16550d", "dw1e3-selector31"),
-    // The other roles and payloads, in their product shapes.
-    ("wyrmroot-registryd", "native-registryd"),
-    ("wyrmroot-wyrmsh", "native-wyrmsh"),
+    // The other roles and payloads, in their product shapes. `native-registryd`
+    // (registryd), `native-wyrmsh` (wyrmsh), `native-stream-hello` (hello) and
+    // `native-job-cpu-hog` (cpu-hog) are also the WYR1-F production shapes and
+    // come from `feature_combinations`; they are omitted here rather than
+    // listed twice.
     ("wyrmroot-console-echo", "native-console-echo"),
     ("wyrmroot-hello", "native-hello"),
     ("wyrmroot-hello", "native-job-hello"),
-    ("wyrmroot-hello", "native-stream-hello"),
-    ("wyrmroot-dw1b-preemption", "native-job-cpu-hog"),
     ("wyrmroot-dw1b-preemption", "native-payloads"),
     ("wyrmroot-dw1c-preemption", "native-payloads"),
     ("wyrmroot-dw1d6-device-test", "native-payloads"),
@@ -1909,13 +1915,28 @@ const FEATURE_COMBINATIONS: &[(&str, &str)] = &[
     ("wyrmroot-rrc-manifest", "builder"),
 ];
 
+/// Every package/feature combination a product or a host gate builds, once:
+/// `FEATURE_COMBINATIONS_HAND_MAINTAINED` plus the WYR1-F final production
+/// spec table, so that table's eight rows are written once and read by both
+/// the WYR1-F producer (`wyr1c::Wyr1fProduct::native_specs`) and this gate
+/// table (structural refactor S2T,
+/// `DW1_WYR1_STRUCTURAL_REFACTOR_PLAN.md` §4).
+fn feature_combinations() -> Vec<(&'static str, &'static str)> {
+    let mut rows: Vec<(&'static str, &'static str)> = crate::wyr1c::WYR1F_PRODUCT_NATIVE_SPECS
+        .iter()
+        .map(|spec| (spec.package, spec.features))
+        .collect();
+    rows.extend_from_slice(FEATURE_COMBINATIONS_HAND_MAINTAINED);
+    rows
+}
+
 /// Packages with no library target: only the native gates can compile them.
 const BINARY_ONLY_PACKAGES: &[&str] = &["wyrmroot-wyr1-retained-stubs"];
 
-/// Whether `FEATURE_COMBINATIONS` lists this package in this feature shape.
+/// Whether `feature_combinations` lists this package in this feature shape.
 #[cfg(test)]
 pub(crate) fn is_listed_combination(package: &str, features: &str) -> bool {
-    FEATURE_COMBINATIONS
+    feature_combinations()
         .iter()
         .any(|(listed, shape)| *listed == package && *shape == features)
 }
@@ -1932,7 +1953,7 @@ pub(crate) fn is_listed_combination(package: &str, features: &str) -> bool {
 const SELECTOR_PLACEHOLDER_NONCE: &str = "0000000000000001";
 
 fn selector_library_commands() -> Vec<Vec<String>> {
-    FEATURE_COMBINATIONS
+    feature_combinations()
         .iter()
         .filter(|(package, _)| !BINARY_ONLY_PACKAGES.contains(package))
         .map(|&(package, features)| {
@@ -2667,12 +2688,13 @@ mod tests {
     use super::{
         BINARY_ONLY_PACKAGES, BOOTFS_BUILD_ARGUMENTS, BOOTFS_PACKAGE, BOOTFS_TEST_ARGUMENTS,
         CargoRun, DW1C_INIT0_TEST_ARGUMENTS, DW1D6_ACTOR_TEST_ARGUMENTS,
-        DW1D6_BOOTSTRAP_TEST_ARGUMENTS, DW1D6_SOURCE_CONTRACT_TEST_ARGUMENTS, FEATURE_COMBINATIONS,
+        DW1D6_BOOTSTRAP_TEST_ARGUMENTS, DW1D6_SOURCE_CONTRACT_TEST_ARGUMENTS,
         INSPECTION_PATH, INSPECTION_SHELL, IsolatedUefiBuild, LoaderLinkMode, NAMED_HOST_FILTERS,
         NATIVE_COVERED_BY, Route, Step, UefiCargoProfile, blocked_toolchain_failure,
         canonical_build_directory, canonical_project_root, component_package, default_steps,
         encoded_uefi_rustflags, encoded_uefi_rustflags_for_target, explicit_test_filter,
-        host_test_arguments, host_test_commands, is_listed_combination, lint_ratchet_shapes,
+        feature_combinations, host_test_arguments, host_test_commands, is_listed_combination,
+        lint_ratchet_shapes,
         named_host_filter, named_host_runs, names_a_test, native_steps, prepare_uefi_target_roots,
         r1_clippy_command, r1_status_command, render_uefi_inspection_report, run_verified_report,
         selector_library_commands, selector32_library_commands, tests_passed,
@@ -3151,8 +3173,8 @@ mod tests {
         let selectors = runs("selectors");
         assert_eq!(
             selectors.len(),
-            FEATURE_COMBINATIONS.len()
-                - FEATURE_COMBINATIONS
+            feature_combinations().len()
+                - feature_combinations()
                     .iter()
                     .filter(|(package, _)| BINARY_ONLY_PACKAGES.contains(package))
                     .count()
@@ -3223,13 +3245,13 @@ mod tests {
                     let package = value("--package").expect("a feature gate names its package");
                     assert!(
                         is_listed_combination(package, features),
-                        "{name} builds {package} with {features}, which FEATURE_COMBINATIONS omits"
+                        "{name} builds {package} with {features}, which feature_combinations() omits"
                     );
                     checked += 1;
                 }
             }
         }
-        assert!(checked > FEATURE_COMBINATIONS.len());
+        assert!(checked > feature_combinations().len());
     }
 
     /// S1.1: `native` runs every native gate once, and a gate it skips runs
