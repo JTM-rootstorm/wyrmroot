@@ -11,6 +11,9 @@ path = "src/lib.rs"
 
 [features]
 default = []
+# Host test support: `platform::recording::RecordingPlatform`, the recording
+# fake of the platform trait family. Links std; refused on the guest target.
+platform-recording = []
 primordial-test-support = []
 wyr1-test-evidence = []
 wyr1b-test-evidence = []

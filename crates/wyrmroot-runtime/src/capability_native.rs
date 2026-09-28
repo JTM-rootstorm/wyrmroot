@@ -235,6 +235,14 @@ impl OwnedMemoryMapping {
     }
 }
 
+#[cfg(any(test, feature = "platform-recording"))]
+impl OwnedMemoryMapping {
+    /// The root region and byte extent, for the recording platform's call log.
+    pub(crate) const fn recorded_extent(&self) -> (DwHandle, u64) {
+        (self.root, self.bytes)
+    }
+}
+
 pub fn duplicate_handle(handle: DwHandle, rights: DwRights) -> Result<DwHandle, NativeError> {
     let mut duplicate = DwHandle(0);
     require_success(deepwyrm_syscall::handle_duplicate(

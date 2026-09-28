@@ -127,10 +127,34 @@ impl MappedBootfs {
             .expect("validated WYR0-C bootfs logical size fits the x86_64 native target");
         let pointer = self.address.0 as *const u8;
         // SAFETY: `map_bootfs_read_only` accepted a successful page-aligned Deepwyrm mapping
-        // whose mapped extent covers `logical_size`. The token is non-Copy and its raw address is
-        // not exposed. The higher-ranked callback prevents any borrow from escaping this call.
+        // whose mapped extent covers `logical_size`; the only other constructor,
+        // `MappedBootfs::recorded` (host test support), takes the address and length of one
+        // immutable `'static` slice. The token is non-Copy and its raw address is not exposed.
+        // The higher-ranked callback prevents any borrow from escaping this call.
         let bytes = unsafe { core::slice::from_raw_parts(pointer, byte_len) };
         use_bytes(bytes)
+    }
+}
+
+#[cfg(any(test, feature = "platform-recording"))]
+impl MappedBootfs {
+    /// A token over one immutable `'static` slice, for the recording platform only.
+    ///
+    /// The logical size is the slice's own length, so [`Self::with_logical_bytes`] views
+    /// exactly that slice. No kernel mapping exists; the recording `unmap_bootfs` never names
+    /// this address to the kernel.
+    pub(crate) fn recorded(root_region: DwHandle, bytes: &'static [u8], plan: MappingPlan) -> Self {
+        Self {
+            root_region,
+            address: DwUserAddress(bytes.as_ptr() as u64),
+            logical_size: bytes.len() as u64,
+            mapped_size: plan.mapped_size(),
+        }
+    }
+
+    /// The root region this token was mapped into, for the recording platform's call log.
+    pub(crate) const fn recorded_root_region(&self) -> DwHandle {
+        self.root_region
     }
 }
 

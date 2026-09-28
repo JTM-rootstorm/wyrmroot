@@ -8,6 +8,9 @@
 #![deny(unsafe_code)]
 #![deny(unused_crate_dependencies)]
 
+#[cfg(any(test, feature = "platform-recording"))]
+extern crate std;
+
 mod bootstrap;
 mod bounded_accounting;
 #[allow(
@@ -38,6 +41,7 @@ mod loader_native;
 #[cfg(target_os = "wyrmroot")]
 mod memory;
 mod native;
+pub mod platform;
 pub mod sha256;
 mod startup;
 mod stream;
@@ -108,6 +112,10 @@ pub use native::{
     monotonic_deadline_after, native_error_code, panic_abort, query_capability_info,
     query_memory_object_size, query_task_termination_info, receive_channel, send_channel,
     unmap_bootfs, wait_many,
+};
+pub use platform::{
+    ChannelPlatform, ClockPlatform, DevicePlatform, EvidencePlatform, HandlePlatform,
+    MemoryPlatform, NativePlatform, Platform, ProcessPlatform, WaitPlatform,
 };
 pub use startup::{
     AUXILIARY_VECTOR_TERMINATOR, BootstrapChannelHandle, STARTUP_ABI_V1, STARTUP_ABI_V2,
