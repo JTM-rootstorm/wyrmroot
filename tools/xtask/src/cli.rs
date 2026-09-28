@@ -97,6 +97,11 @@ Usage:
     tools/pinned-cargo xtask dw1-e3a-prepare <fresh-directory> <deepwyrm-repository> <deepwyrm-revision> <16-hex-nonce>
     tools/pinned-cargo xtask dw1-e3b-prepare <fresh-directory> <deepwyrm-repository> <deepwyrm-revision> <16-hex-evidence-nonce> <16-hex-challenge-1-nonce> <16-hex-challenge-2-nonce>
     tools/pinned-cargo xtask wyr1-d5-prepare <fresh-directory> <deepwyrm-repository> <deepwyrm-revision> <16-hex-evidence-nonce>
+    cargo xtask grammar dump
+
+`grammar dump` emits the DW1-F/WYR1-F request/receipt/handoff/pair/result
+grammar as one JSON document on stdout, generated from the same functions and
+constants `wyr1f prepare` uses to build a product.
 
 Unfiltered, `test host` runs every host gate: a library check of every
 package/feature combination any product or gate builds, the workspace and bootfs
@@ -361,6 +366,7 @@ pub(crate) enum Action {
         deep_revision: String,
         evidence_nonce: String,
     },
+    GrammarDump,
     Unavailable(&'static str),
 }
 
@@ -434,6 +440,7 @@ pub(crate) fn dispatch(arguments: &[String]) -> Result<Action, Failure> {
         "dw1-e3a-prepare" => dispatch_dw1e3a_prepare(&arguments[1..]),
         "dw1-e3b-prepare" => dispatch_dw1e3b_prepare(&arguments[1..]),
         "wyr1-d5-prepare" => dispatch_wyr1d5_prepare(&arguments[1..]),
+        "grammar" => dispatch_grammar(&arguments[1..]),
         unknown => Err(Failure::usage(format!(
             "unknown command '{unknown}'\n\n{USAGE}"
         ))),
@@ -663,6 +670,16 @@ fn dispatch_r1(arguments: &[String]) -> Result<Action, Failure> {
         _ => Err(Failure::usage(
             "r1 requires product --output <fresh-directory> --evidence-nonce <16-hex>, or prepare --output <fresh-directory> --deep-repository <path> --deep-revision <40-hex> --evidence-nonce <16-hex> --gdb-port <port> [--card <R1C|R4E>]; the VM request itself is not produced",
         )),
+    }
+}
+
+/// `xtask grammar dump`: the F request/receipt/handoff/pair/result grammar,
+/// as data (S2T). It takes no arguments; there is nothing to select, because
+/// it always emits the whole grammar.
+fn dispatch_grammar(arguments: &[String]) -> Result<Action, Failure> {
+    match arguments {
+        [command] if command == "dump" => Ok(Action::GrammarDump),
+        _ => Err(Failure::usage("grammar requires dump; it has no other command")),
     }
 }
 
@@ -1624,6 +1641,18 @@ mod tests {
         for command in ["product --output", "prepare --output"] {
             assert!(USAGE.contains(&format!("tools/pinned-cargo xtask r1 {command}")));
         }
+    }
+
+    #[test]
+    fn grammar_dump_dispatches_and_takes_no_arguments() {
+        assert_eq!(
+            dispatch(&arguments(&["grammar", "dump"])),
+            Ok(Action::GrammarDump)
+        );
+        assert!(dispatch(&arguments(&["grammar"])).is_err());
+        assert!(dispatch(&arguments(&["grammar", "dump", "extra"])).is_err());
+        assert!(dispatch(&arguments(&["grammar", "unknown"])).is_err());
+        assert!(USAGE.contains("cargo xtask grammar dump"));
     }
 
     #[test]

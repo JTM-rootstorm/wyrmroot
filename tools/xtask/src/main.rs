@@ -8,6 +8,7 @@ mod dw1e3b;
 mod elf_runtime;
 mod error;
 mod g3_image;
+mod grammar;
 mod h_integration;
 mod h_request;
 mod i_b_closure;
@@ -227,6 +228,7 @@ fn run(arguments: &[String]) -> Result<Option<String>, Failure> {
         )
         .map(Some),
         Action::Wyr1FInspect(product) => wyr1f::inspect(std::path::Path::new(&product)).map(Some),
+        Action::GrammarDump => grammar::dump().map(Some),
         Action::Wyr1C2Freeze(output) => wyr1c2::freeze(std::path::Path::new(&output)).map(Some),
         Action::Wyr1C2Image(request) => wyr1c2::image(std::path::Path::new(&request)).map(Some),
         Action::Wyr1C2Inspect(request) => wyr1c2::inspect(std::path::Path::new(&request)).map(Some),

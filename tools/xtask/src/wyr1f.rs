@@ -76,17 +76,17 @@ use crate::{
 // and degraded siblings of the acceptance pair -- and one schema that carries
 // the product as a field is what lets a reviewer compare two siblings field by
 // field instead of reconciling two schemas.
-const REQUEST_KIND: &str = "wyrmroot-wyr1-f-request";
-const RECEIPT_KIND: &str = "wyrmroot-wyr1-f-freeze-receipt";
-const SOURCE_KIND: &str = "wyrmroot-wyr1-f-source-build";
-const RESULT_KIND: &str = "wyrmroot-wyr1-f-result";
-const HANDOFF_KIND: &str = "wyrmroot-wyr1-f-vm-handoff";
-const PAIR_KIND: &str = "wyrmroot-wyr1-f-vm-profile-pair";
+pub(crate) const REQUEST_KIND: &str = "wyrmroot-wyr1-f-request";
+pub(crate) const RECEIPT_KIND: &str = "wyrmroot-wyr1-f-freeze-receipt";
+pub(crate) const SOURCE_KIND: &str = "wyrmroot-wyr1-f-source-build";
+pub(crate) const RESULT_KIND: &str = "wyrmroot-wyr1-f-result";
+pub(crate) const HANDOFF_KIND: &str = "wyrmroot-wyr1-f-vm-handoff";
+pub(crate) const PAIR_KIND: &str = "wyrmroot-wyr1-f-vm-profile-pair";
 /// The two profiles the plan's F3A row requires of every final product: one
 /// vCPU and four. The fairness obligation is only meaningful at the second, and
 /// the first is what shows a UP regression the second would mask.
-const PROFILES: [(&str, u8); 2] = [("default", 1), ("smp", 4)];
-const SOURCE_RECEIPT: &str = "f-source-build.toml";
+pub(crate) const PROFILES: [(&str, u8); 2] = [("default", 1), ("smp", 4)];
+pub(crate) const SOURCE_RECEIPT: &str = "f-source-build.toml";
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
 
 /// The ESP basename, which names its product so two siblings cannot be
@@ -741,7 +741,7 @@ fn kernel_build_command(
 /// Thirteen of them do vary by product, and those thirteen are the whole
 /// declared production-versus-instrumented and normal-versus-degraded
 /// difference as the request records it.
-fn fixed_fields(product_kind: wyr1c::Wyr1fProduct) -> [(&'static str, &'static str); 40] {
+pub(crate) fn fixed_fields(product_kind: wyr1c::Wyr1fProduct) -> [(&'static str, &'static str); 40] {
     use wyr1c::Wyr1fProduct;
     let instrumented = product_kind.is_instrumented();
     [
@@ -926,7 +926,7 @@ fn fixed_fields(product_kind: wyr1c::Wyr1fProduct) -> [(&'static str, &'static s
 }
 
 /// The post-run obligations a consumer of this product must satisfy.
-fn obligation_fields() -> [(&'static str, &'static str); 4] {
+pub(crate) fn obligation_fields() -> [(&'static str, &'static str); 4] {
     [
         (
             "post_run_recheck",
@@ -1261,7 +1261,7 @@ fn validate_esp(output: &Path, f: &BTreeMap<String, String>) -> Result<(), Failu
     .map(|_| ())
 }
 
-fn receipt_fields(hash: &str, r: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+pub(crate) fn receipt_fields(hash: &str, r: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     let mut f = BTreeMap::new();
     f.insert("kind".into(), RECEIPT_KIND.into());
     f.insert("request_sha256".into(), hash.into());
@@ -1286,7 +1286,7 @@ fn receipt_fields(hash: &str, r: &BTreeMap<String, String>) -> BTreeMap<String, 
     f
 }
 
-fn request_keys(product_kind: wyr1c::Wyr1fProduct) -> Vec<String> {
+pub(crate) fn request_keys(product_kind: wyr1c::Wyr1fProduct) -> Vec<String> {
     let mut keys = Vec::new();
     for (key, _) in fixed_fields(product_kind) {
         keys.push(key.into());
@@ -1404,7 +1404,7 @@ fn profile_domain_xml(
 }
 
 /// What one profile's handoff declares to the runner.
-fn handoff_fields(
+pub(crate) fn handoff_fields(
     product_kind: wyr1c::Wyr1fProduct,
     profile: &str,
     vcpus: u8,
@@ -1517,7 +1517,7 @@ fn handoff_fields(
 }
 
 /// The pair manifest naming both staged profiles.
-fn pair_fields(
+pub(crate) fn pair_fields(
     product_kind: wyr1c::Wyr1fProduct,
     output: &Path,
     request_hash: &str,
@@ -1631,105 +1631,121 @@ fn result_schema(product_kind: wyr1c::Wyr1fProduct) -> Result<String, Failure> {
 /// That premise was false too; F3A.7j replaced it with `com1_powered_off`. The three
 /// `cpu_hog_*` keys stayed where they were, and the payload that fills them was
 /// added to the product instead.
-fn result_keys(product_kind: wyr1c::Wyr1fProduct) -> Vec<String> {
-    let mut keys: Vec<&'static str> = vec![
-        "kind",
-        "schema_version",
-        "product",
-        "profile",
-        "scenario",
-        "selector",
-        "evidence",
-        "request_sha256",
-        "effective_vcpus",
-        "esp_sha256",
-        "bootfs_sha256",
-        "source_receipt_sha256",
-        "com1_length",
-        "com1_sha256",
-        "com2_accepted_length",
-        "com2_accepted_sha256",
-        "com2_full_length",
-        "com2_full_sha256",
-        "shutdown_byte_hex",
-        // COM1 is the trusted diagnostic serial line and COM2 the shell byte
-        // stream. That they stay distinct is an obligation, not an assumption:
-        // a console that leaked onto COM1 would still produce a prompt. On the
-        // production product it carries more than that -- see below, where the
-        // absence of a COM1 record is itself the assertion.
-        "com1_com2_distinct",
-        "prompt_reached",
-        "nonce_echo_nonce",
-        "nonce_echo_status",
-        "services_output_sha256",
-        "status_output_sha256",
-        "tasks_output_sha256",
-        "hello_stdout_sha256",
-        "hello_exit_status",
-        "prompt_after_hello",
-        "shell_exit_status",
-        "shell_restart_generation",
-        "qemu_exit",
-        "post_run_inspect_result",
-        "domain_restored",
-    ];
-    match product_kind {
-        // The normal scenario owes the fairness proof. It is meaningful only at
-        // `smp`, but the key exists in both profiles' grammar so that a UP
-        // result has to say what it observed rather than omit the question.
+/// The always-present result fields: identity/echo, the transcripts, and
+/// every key the plan's F3A proof obligations land in, whichever scenario or
+/// product this is.
+///
+/// Structural refactor S2T named this list so a caller can read it directly
+/// (`xtask grammar dump`) rather than recover it by parsing this function's
+/// source text, the way `tools/verify-vm-request.py` used to.
+pub(crate) const RESULT_BASE_KEYS: &[&str] = &[
+    "kind",
+    "schema_version",
+    "product",
+    "profile",
+    "scenario",
+    "selector",
+    "evidence",
+    "request_sha256",
+    "effective_vcpus",
+    "esp_sha256",
+    "bootfs_sha256",
+    "source_receipt_sha256",
+    "com1_length",
+    "com1_sha256",
+    "com2_accepted_length",
+    "com2_accepted_sha256",
+    "com2_full_length",
+    "com2_full_sha256",
+    "shutdown_byte_hex",
+    // COM1 is the trusted diagnostic serial line and COM2 the shell byte
+    // stream. That they stay distinct is an obligation, not an assumption:
+    // a console that leaked onto COM1 would still produce a prompt. On the
+    // production product it carries more than that -- see below, where the
+    // absence of a COM1 record is itself the assertion.
+    "com1_com2_distinct",
+    "prompt_reached",
+    "nonce_echo_nonce",
+    "nonce_echo_status",
+    "services_output_sha256",
+    "status_output_sha256",
+    "tasks_output_sha256",
+    "hello_stdout_sha256",
+    "hello_exit_status",
+    "prompt_after_hello",
+    "shell_exit_status",
+    "shell_restart_generation",
+    "qemu_exit",
+    "post_run_inspect_result",
+    "domain_restored",
+];
+
+/// Owed by the normal scenario: the CPU-hog fairness proof. It is meaningful
+/// only at `smp`, but the key exists in both profiles' grammar so that a UP
+/// result has to say what it observed rather than omit the question. Present
+/// in `wyr1-f-normal` and `wyr1-f-normal-instrumented`.
+pub(crate) const RESULT_NORMAL_HALF_KEYS: &[&str] = &[
+    "cpu_hog_jobs",
+    "shell_responses_under_hogs",
+    "shell_progress_bounded",
+];
+
+/// Owed by the degraded scenario: contract §5.4's declared episode.
+/// `degraded_transitions` must be one -- entering DEGRADED twice is a
+/// different failure from never entering it -- and `degraded_retry_attempts`
+/// is what makes "no infinite retry" a number rather than an impression.
+pub(crate) const RESULT_DEGRADED_HALF_KEYS: &[&str] = &[
+    "degraded_transitions",
+    "degraded_retry_attempts",
+    "shell_usable_in_degraded",
+    "degraded_admin_nonce",
+    "degraded_admin_status",
+    "degraded_exit_restart_generation",
+    "degraded_exit_restart_bounded",
+];
+
+/// Owed by an instrumented product: the bring-up proof, which lives here
+/// rather than in the base list because only an instrumented product can make
+/// it. `deepwyrm`'s COM1 writers other than `emit_early_panic_record` are all
+/// behind `feature = "test-support"`, which the production kernel is
+/// deliberately not built with, so a clean production boot emits no COM1
+/// bytes at all and there is no READY record to read. The instrumented
+/// sibling emits one WYR1EVID1 `Ready` per role, which is what the sibling is
+/// for.
+///
+/// `roles_ready_order` is the observed sequence as one comma-separated list
+/// rather than five booleans: the obligation is dependency *order*, and five
+/// independent flags cannot express a wrong one.
+pub(crate) const RESULT_INSTRUMENTED_TAIL_KEYS: &[&str] = &[
+    "roles_ready_order",
+    "roles_ready_count",
+    "evidence_protocol",
+    "evidence_nonce",
+    "expected_evidence_records",
+    "evidence_records",
+    "evidence_sha256",
+];
+
+/// Owed by the production product instead of the instrumented tail:
+/// production COM1 was never silent -- firmware, the loader and the kernel's
+/// `[DW0][INFO]` records all write it -- so `com1_empty` could not pass on
+/// any real boot. Closure contract item 28, re-derived in F3A.7j: the
+/// production product witnesses that its kernel powered off after a clean
+/// session, read without regard to how much was logged.
+pub(crate) const RESULT_PRODUCTION_TAIL_KEYS: &[&str] = &["com1_powered_off"];
+
+pub(crate) fn result_keys(product_kind: wyr1c::Wyr1fProduct) -> Vec<String> {
+    let mut keys: Vec<&'static str> = RESULT_BASE_KEYS.to_vec();
+    keys.extend_from_slice(match product_kind {
         wyr1c::Wyr1fProduct::Normal | wyr1c::Wyr1fProduct::InstrumentedNormal => {
-            keys.extend([
-                "cpu_hog_jobs",
-                "shell_responses_under_hogs",
-                "shell_progress_bounded",
-            ]);
+            RESULT_NORMAL_HALF_KEYS
         }
-        // Contract §5.4's declared episode. `degraded_transitions` must be one
-        // -- entering DEGRADED twice is a different failure from never entering
-        // it -- and `degraded_retry_attempts` is what makes "no infinite retry"
-        // a number rather than an impression.
-        wyr1c::Wyr1fProduct::Degraded => {
-            keys.extend([
-                "degraded_transitions",
-                "degraded_retry_attempts",
-                "shell_usable_in_degraded",
-                "degraded_admin_nonce",
-                "degraded_admin_status",
-                "degraded_exit_restart_generation",
-                "degraded_exit_restart_bounded",
-            ]);
-        }
-    }
+        wyr1c::Wyr1fProduct::Degraded => RESULT_DEGRADED_HALF_KEYS,
+    });
     if product_kind.is_instrumented() {
-        keys.extend([
-            // The bring-up proof, and it lives here rather than in the base
-            // list because only an instrumented product can make it.
-            // `deepwyrm`'s COM1 writers other than `emit_early_panic_record`
-            // are all behind `feature = "test-support"`, which the production
-            // kernel is deliberately not built with, so a clean production
-            // boot emits no COM1 bytes at all and there is no READY record to
-            // read. The instrumented sibling emits one WYR1EVID1 `Ready` per
-            // role, which is what the sibling is for.
-            //
-            // `roles_ready_order` is the observed sequence as one
-            // comma-separated list rather than five booleans: the obligation
-            // is dependency *order*, and five independent flags cannot
-            // express a wrong one.
-            "roles_ready_order",
-            "roles_ready_count",
-            "evidence_protocol",
-            "evidence_nonce",
-            "expected_evidence_records",
-            "evidence_records",
-            "evidence_sha256",
-        ]);
+        keys.extend_from_slice(RESULT_INSTRUMENTED_TAIL_KEYS);
     } else {
-        // Production COM1 was never silent -- firmware, the loader and the
-        // kernel's `[DW0][INFO]` records all write it -- so `com1_empty` could
-        // not pass on any real boot. Closure contract item 28, re-derived in
-        // F3A.7j: the production product witnesses that its kernel powered off
-        // after a clean session, read without regard to how much was logged.
-        keys.push("com1_powered_off");
+        keys.extend_from_slice(RESULT_PRODUCTION_TAIL_KEYS);
     }
     keys.push("acceptance");
     keys.into_iter().map(str::to_owned).collect()
