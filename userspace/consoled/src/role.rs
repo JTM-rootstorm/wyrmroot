@@ -46,9 +46,8 @@ use wyrmroot_registry_proto::{
 use wyrmroot_runtime::{
     BOOTSTRAP_CHANNEL_EXPECTATION, ChannelPlatform, ClockPlatform, HandlePlatform, NativeError,
     NativeInput, NativeOutput, ReceiveCounts, StreamEndpoint, StreamError, StreamSystem,
-    WYR0_I_SUPERVISION_POLICY, WaitPlatform, close_handle, create_channel, monotonic_active_now,
-    query_capability_info, receive_channel, send_channel, validate_bootstrap_channel, wait_many,
-    wait_one,
+    WYR0_I_SUPERVISION_POLICY, WaitPlatform, close_handle, monotonic_active_now,
+    query_capability_info, receive_channel, send_channel, validate_bootstrap_channel, wait_one,
 };
 
 /// The base every failure step of [`run`] is reported under, as the
@@ -111,7 +110,10 @@ impl SerialSession {
     }
 }
 
-fn close_serial_session(serial: &mut SerialSession) -> Result<(), u32> {
+fn close_serial_session<P: ConsoledPlatform>(
+    platform: &mut P,
+    serial: &mut SerialSession,
+) -> Result<(), u32> {
     // The raw endpoint is always released first. The retained registry
     // CONNECT peer is the devmgr-observed certificate for this exact client
     // generation and therefore cannot be closed before raw custody ends.
@@ -124,8 +126,10 @@ fn close_serial_session(serial: &mut SerialSession) -> Result<(), u32> {
     // attempt so outer fatal cleanup cannot retry a possibly released handle.
     serial.raw_owned = false;
     let closed = match raw {
-        Some(raw) => release_raw_then_witness(raw, witness, |handle| close_handle(handle).is_ok()),
-        None => witness.is_none_or(|handle| close_handle(handle).is_ok()),
+        Some(raw) => {
+            release_raw_then_witness(raw, witness, |handle| platform.close_handle(handle).is_ok())
+        }
+        None => witness.is_none_or(|handle| platform.close_handle(handle).is_ok()),
     };
     if !closed {
         Err(FATAL_ATTACH_BASE | 101)
@@ -135,7 +139,11 @@ fn close_serial_session(serial: &mut SerialSession) -> Result<(), u32> {
 }
 
 #[cfg(feature = "wyr1e-wyrmsh")]
-fn observe_release_witness(serial: &SerialSession, signals: DwSignals) -> Result<(), u32> {
+fn observe_release_witness<P: ConsoledPlatform>(
+    platform: &mut P,
+    serial: &SerialSession,
+    signals: DwSignals,
+) -> Result<(), u32> {
     let readable = signals.0 & DW_SIGNAL_READABLE.0 != 0;
     let peer_closed = signals.0 & DW_SIGNAL_PEER_CLOSED.0 != 0;
     if classify_release_witness(readable, peer_closed) == ReleaseWitnessEvent::Malformed {
@@ -145,7 +153,7 @@ fn observe_release_witness(serial: &SerialSession, signals: DwSignals) -> Result
         let witness = serial.release_witness.ok_or(FATAL_ATTACH_BASE | 102)?;
         let mut bytes = [0u8; 1];
         let mut handles = [DwReceivedHandleInfoV1::default(); 1];
-        if let Ok(counts) = receive_channel(witness, &mut bytes, &mut handles) {
+        if let Ok(counts) = platform.receive_channel(witness, &mut bytes, &mut handles) {
             close_received(&handles, counts.handles);
         }
         return Err(FATAL_ATTACH_BASE | 102);
@@ -167,12 +175,17 @@ fn observe_release_witness(serial: &SerialSession, signals: DwSignals) -> Result
 /// endpoint, and a replacement devmgr retires the retained console stack
 /// explicitly (`wyr1c_native::retire_retained_device_topology`).
 #[cfg(feature = "wyr1e-wyrmsh")]
-fn drop_orphaned_witness(serial: &mut SerialSession) -> Result<(), u32> {
+fn drop_orphaned_witness<P: ConsoledPlatform>(
+    platform: &mut P,
+    serial: &mut SerialSession,
+) -> Result<(), u32> {
     let witness = serial
         .release_witness
         .take()
         .ok_or(FATAL_ATTACH_BASE | 102)?;
-    close_handle(witness).map_err(|_| FATAL_ATTACH_BASE | 106)
+    platform
+        .close_handle(witness)
+        .map_err(|_| FATAL_ATTACH_BASE | 106)
 }
 
 /// Whether a publication change is devmgr's publication being withdrawn
@@ -485,14 +498,15 @@ pub fn run<P: ConsoledPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result
 
     let mut transactions = TransactionIds::after(authorities.startup_transaction)?;
     let mut model = ConsoleModel::new();
-    let mut serial = match attach_serial_bounded(authorities, &mut transactions, &mut model, None) {
-        Ok(serial) => serial,
-        Err(error) => {
-            close_authorities(authorities);
-            let _ = platform.close_handle(bootstrap);
-            return Err(error);
-        }
-    };
+    let mut serial =
+        match attach_serial_bounded(platform, authorities, &mut transactions, &mut model, None) {
+            Ok(serial) => serial,
+            Err(error) => {
+                close_authorities(authorities);
+                let _ = platform.close_handle(bootstrap);
+                return Err(error);
+            }
+        };
     let child = match launch_child(
         platform,
         authorities,
@@ -502,7 +516,7 @@ pub fn run<P: ConsoledPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result
     ) {
         Ok(child) => child,
         Err(error) => {
-            let _ = close_serial_session(&mut serial);
+            let _ = close_serial_session(platform, &mut serial);
             close_authorities(authorities);
             let _ = platform.close_handle(bootstrap);
             return Err(error);
@@ -510,7 +524,7 @@ pub fn run<P: ConsoledPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result
     };
     let mut child = child;
     if observe_exact_ready(&mut model, &serial, &child, 9).is_err() {
-        let _ = close_serial_session(&mut serial);
+        let _ = close_serial_session(platform, &mut serial);
         let _ = cleanup_child_for_exit(platform, authorities, &mut transactions, &mut child);
         close_authorities(authorities);
         let _ = platform.close_handle(bootstrap);
@@ -525,7 +539,7 @@ pub fn run<P: ConsoledPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result
     ) {
         Ok(size) => size,
         Err(_) => {
-            let _ = close_serial_session(&mut serial);
+            let _ = close_serial_session(platform, &mut serial);
             let _ = cleanup_child_for_exit(platform, authorities, &mut transactions, &mut child);
             close_authorities(authorities);
             let _ = platform.close_handle(bootstrap);
@@ -536,7 +550,7 @@ pub fn run<P: ConsoledPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result
         .send_channel(bootstrap, &ready[..ready_size], &[])
         .is_err()
     {
-        let _ = close_serial_session(&mut serial);
+        let _ = close_serial_session(platform, &mut serial);
         let _ = cleanup_child_for_exit(platform, authorities, &mut transactions, &mut child);
         close_authorities(authorities);
         let _ = platform.close_handle(bootstrap);
@@ -544,7 +558,7 @@ pub fn run<P: ConsoledPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result
     }
     #[cfg(not(any(feature = "wyr1d-selector32", feature = "wyr1e8-recovery")))]
     if platform.close_handle(bootstrap).is_err() {
-        let _ = close_serial_session(&mut serial);
+        let _ = close_serial_session(platform, &mut serial);
         let _ = cleanup_child_for_exit(platform, authorities, &mut transactions, &mut child);
         close_authorities(authorities);
         return Err(12);
@@ -564,9 +578,9 @@ pub fn run<P: ConsoledPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result
     // declined to replace it, and closing a released handle would report a
     // cleanup failure over a clean shutdown.
     if result == Ok(SESSION_ENDED) {
-        let serial_closed = close_serial_session(&mut serial).is_ok();
+        let serial_closed = close_serial_session(platform, &mut serial).is_ok();
         let watch_retired =
-            retire_publication_watch(authorities, &mut transactions, &mut serial).is_ok();
+            retire_publication_watch(platform, authorities, &mut transactions, &mut serial).is_ok();
         close_authorities(authorities);
         return if serial_closed && watch_retired {
             Ok(SESSION_ENDED)
@@ -578,11 +592,14 @@ pub fn run<P: ConsoledPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result
         // Event-loop failures still own the exact serial generation. Release
         // raw and witness first, then its watch and child stream custody.
         let cleaned = cleanup_after_event_loop_failure(
+            platform,
             &mut serial,
             &mut child,
-            |serial| close_serial_session(serial).is_ok(),
-            |serial| retire_publication_watch(authorities, &mut transactions, serial).is_ok(),
-            |child| close_child_streams(child).is_ok(),
+            |platform, serial| close_serial_session(platform, serial).is_ok(),
+            |platform, serial| {
+                retire_publication_watch(platform, authorities, &mut transactions, serial).is_ok()
+            },
+            |_, child| close_child_streams(child).is_ok(),
         );
         close_authorities(authorities);
         return if !cleaned {
@@ -594,16 +611,17 @@ pub fn run<P: ConsoledPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result
     result
 }
 
-fn attach_serial(
+fn attach_serial<P: ConsoledPlatform>(
+    platform: &mut P,
     authorities: StartupAuthorities,
     transactions: &mut TransactionIds,
     model: &mut ConsoleModel,
 ) -> Result<SerialSession, u32> {
-    let publication_generation = watch_publication(authorities, transactions)?;
+    let publication_generation = watch_publication(platform, authorities, transactions)?;
     if publication_generation == 0 {
         return Err(13);
     }
-    let direct = lookup_connector(authorities, transactions)?;
+    let direct = lookup_connector(platform, authorities, transactions)?;
     let connector_transaction = match transactions.take() {
         Ok(value) => value,
         Err(error) => {
@@ -631,7 +649,10 @@ fn attach_serial(
         finish_connect_abort(model, connect_request, core::slice::from_ref(&direct))?;
         return Err(14);
     }
-    if send_channel(direct, &connector_bytes, &[]).is_err() {
+    if platform
+        .send_channel(direct, &connector_bytes, &[])
+        .is_err()
+    {
         finish_connect_abort(model, connect_request, core::slice::from_ref(&direct))?;
         return Err(15);
     }
@@ -640,7 +661,7 @@ fn attach_serial(
         return Err(16);
     }
     let mut received = [DwReceivedHandleInfoV1::default(); 1];
-    let counts = match receive_channel(direct, &mut connector_bytes, &mut received) {
+    let counts = match platform.receive_channel(direct, &mut connector_bytes, &mut received) {
         Ok(counts) => counts,
         Err(_) => {
             finish_connect_abort(model, connect_request, core::slice::from_ref(&direct))?;
@@ -674,8 +695,8 @@ fn attach_serial(
         return Err(22);
     }
     #[cfg(not(feature = "wyr1e-wyrmsh"))]
-    if close_handle(direct).is_err() {
-        let _ = close_handle(received[0].handle);
+    if platform.close_handle(direct).is_err() {
+        let _ = platform.close_handle(received[0].handle);
         let _ = model.abort_connect(connect_request);
         return Err(FATAL_ATTACH_BASE | 23);
     }
@@ -690,21 +711,32 @@ fn attach_serial(
             return Err(error);
         }
     };
-    let active_watch =
-        match begin_publication_watch(authorities, transactions, publication_generation) {
-            Ok(watch) => watch,
-            Err(error) => {
-                #[cfg(feature = "wyr1e-wyrmsh")]
-                let cleanup = [direct, received[0].handle];
-                #[cfg(not(feature = "wyr1e-wyrmsh"))]
-                let cleanup = [received[0].handle, DwHandle(0)];
-                finish_connect_abort(model, connect_request, &cleanup)?;
-                return Err(error);
-            }
-        };
+    let active_watch = match begin_publication_watch(
+        platform,
+        authorities,
+        transactions,
+        publication_generation,
+    ) {
+        Ok(watch) => watch,
+        Err(error) => {
+            #[cfg(feature = "wyr1e-wyrmsh")]
+            let cleanup = [direct, received[0].handle];
+            #[cfg(not(feature = "wyr1e-wyrmsh"))]
+            let cleanup = [received[0].handle, DwHandle(0)];
+            finish_connect_abort(model, connect_request, &cleanup)?;
+            return Err(error);
+        }
+    };
     let correlation = serial_correlation(authorities, identity);
     if model.attach_connected(correlation, attached_at).is_err() {
-        if cancel_registry_watch(authorities, transactions, active_watch.transaction_id).is_err() {
+        if cancel_registry_watch(
+            platform,
+            authorities,
+            transactions,
+            active_watch.transaction_id,
+        )
+        .is_err()
+        {
             #[cfg(feature = "wyr1e-wyrmsh")]
             let cleanup = [direct, received[0].handle];
             #[cfg(not(feature = "wyr1e-wyrmsh"))]
@@ -732,7 +764,8 @@ fn attach_serial(
     })
 }
 
-fn begin_publication_watch(
+fn begin_publication_watch<P: ConsoledPlatform>(
+    platform: &mut P,
     authorities: StartupAuthorities,
     transactions: &mut TransactionIds,
     publication_generation: u64,
@@ -751,24 +784,27 @@ fn begin_publication_watch(
         &mut bytes,
     )
     .map_err(|_| 25u32)?;
-    send_channel(authorities.registry, &bytes[..size], &[]).map_err(|_| 26u32)?;
+    platform
+        .send_channel(authorities.registry, &bytes[..size], &[])
+        .map_err(|_| 26u32)?;
     Ok(ActiveWatch {
         transaction_id,
         publication_generation,
     })
 }
 
-fn attach_serial_bounded(
+fn attach_serial_bounded<P: ConsoledPlatform>(
+    platform: &mut P,
     authorities: StartupAuthorities,
     transactions: &mut TransactionIds,
     model: &mut ConsoleModel,
     first_deadline_ms: Option<u64>,
 ) -> Result<SerialSession, u32> {
     if let Some(deadline) = first_deadline_ms {
-        wait_backoff(authorities.registry, deadline)?;
+        wait_backoff(platform, authorities.registry, deadline)?;
     }
     loop {
-        match attach_serial(authorities, transactions, model) {
+        match attach_serial(platform, authorities, transactions, model) {
             Ok(serial) => return Ok(serial),
             Err(error) if error & FATAL_ATTACH_BASE != 0 => return Err(error),
             Err(_) => match model
@@ -776,7 +812,7 @@ fn attach_serial_bounded(
                 .map_err(|_| 25u32)?
             {
                 RecoveryAction::RetrySerialAt(deadline) => {
-                    wait_backoff(authorities.registry, deadline)?;
+                    wait_backoff(platform, authorities.registry, deadline)?;
                 }
                 RecoveryAction::Escalate => return Err(26),
                 _ => return Err(27),
@@ -785,7 +821,8 @@ fn attach_serial_bounded(
     }
 }
 
-fn watch_publication(
+fn watch_publication<P: ConsoledPlatform>(
+    platform: &mut P,
     authorities: StartupAuthorities,
     transactions: &mut TransactionIds,
 ) -> Result<u64, u32> {
@@ -805,16 +842,19 @@ fn watch_publication(
         &mut bytes,
     )
     .map_err(|_| 25u32)?;
-    send_channel(authorities.registry, &bytes[..size], &[]).map_err(|_| 26u32)?;
+    platform
+        .send_channel(authorities.registry, &bytes[..size], &[])
+        .map_err(|_| 26u32)?;
     if wait_readable(authorities.registry).is_err() {
-        return match cancel_registry_watch(authorities, transactions, transaction_id) {
+        return match cancel_registry_watch(platform, authorities, transactions, transaction_id) {
             Ok(Some(generation)) if generation != 0 => Ok(generation),
             Ok(_) => Err(27),
             Err(_) => Err(FATAL_ATTACH_BASE | 27),
         };
     }
     let mut received = [DwReceivedHandleInfoV1::default(); 1];
-    let counts = receive_channel(authorities.registry, &mut bytes, &mut received)
+    let counts = platform
+        .receive_channel(authorities.registry, &mut bytes, &mut received)
         .map_err(|_| FATAL_ATTACH_BASE | 28)?;
     if counts.handles != 0 {
         close_attempt_handles(core::slice::from_ref(&received[0].handle))?;
@@ -835,7 +875,8 @@ fn watch_publication(
     }
 }
 
-fn cancel_registry_watch(
+fn cancel_registry_watch<P: ConsoledPlatform>(
+    platform: &mut P,
     authorities: StartupAuthorities,
     transactions: &mut TransactionIds,
     target: u64,
@@ -844,13 +885,16 @@ fn cancel_registry_watch(
     let header = registry_header(authorities, RegistryMessageType::Cancel, transaction_id);
     let mut bytes = [0u8; 72];
     let size = encode_cancel(header, target, &mut bytes).map_err(|_| FATAL_ATTACH_BASE | 28)?;
-    send_channel(authorities.registry, &bytes[..size], &[]).map_err(|_| FATAL_ATTACH_BASE | 29)?;
+    platform
+        .send_channel(authorities.registry, &bytes[..size], &[])
+        .map_err(|_| FATAL_ATTACH_BASE | 29)?;
     let mut changed = None;
     let mut received_count = 0;
     while received_count < 2 {
         wait_readable(authorities.registry).map_err(|_| FATAL_ATTACH_BASE | 30)?;
         let mut handles = [DwReceivedHandleInfoV1::default(); 1];
-        let counts = receive_channel(authorities.registry, &mut bytes, &mut handles)
+        let counts = platform
+            .receive_channel(authorities.registry, &mut bytes, &mut handles)
             .map_err(|_| FATAL_ATTACH_BASE | 31)?;
         if counts.handles != 0 {
             close_attempt_handles(core::slice::from_ref(&handles[0].handle))?;
@@ -904,14 +948,16 @@ fn cancel_registry_watch(
     Err(FATAL_ATTACH_BASE | 34)
 }
 
-fn receive_publication_change(
+fn receive_publication_change<P: ConsoledPlatform>(
+    platform: &mut P,
     authorities: StartupAuthorities,
     serial: &mut SerialSession,
 ) -> Result<u64, u32> {
     let watch = serial.watch.ok_or(FATAL_ATTACH_BASE | 35)?;
     let mut bytes = [0u8; 256];
     let mut handles = [DwReceivedHandleInfoV1::default(); 1];
-    let counts = receive_channel(authorities.registry, &mut bytes, &mut handles)
+    let counts = platform
+        .receive_channel(authorities.registry, &mut bytes, &mut handles)
         .map_err(|_| FATAL_ATTACH_BASE | 35)?;
     if counts.handles != 0 {
         close_attempt_handles(core::slice::from_ref(&handles[0].handle))?;
@@ -935,7 +981,8 @@ fn receive_publication_change(
     Ok(service_generation)
 }
 
-fn retire_publication_watch(
+fn retire_publication_watch<P: ConsoledPlatform>(
+    platform: &mut P,
     authorities: StartupAuthorities,
     transactions: &mut TransactionIds,
     serial: &mut SerialSession,
@@ -943,16 +990,19 @@ fn retire_publication_watch(
     let Some(watch) = serial.watch else {
         return Ok(());
     };
-    cancel_registry_watch(authorities, transactions, watch.transaction_id)?;
+    cancel_registry_watch(platform, authorities, transactions, watch.transaction_id)?;
     serial.watch = None;
     Ok(())
 }
 
-fn lookup_connector(
+fn lookup_connector<P: ConsoledPlatform>(
+    platform: &mut P,
     authorities: StartupAuthorities,
     transactions: &mut TransactionIds,
 ) -> Result<DwHandle, u32> {
-    let (direct, service) = create_channel(CONNECTOR_PAIR_RIGHTS).map_err(|_| 33u32)?;
+    let (direct, service) = platform
+        .create_channel(CONNECTOR_PAIR_RIGHTS)
+        .map_err(|_| 33u32)?;
     let transaction_id = transactions.take()?;
     let policy = SERIAL_CONSOLE_CONNECTOR_PUBLICATION_POLICY;
     let header = registry_header(
@@ -989,7 +1039,10 @@ fn lookup_connector(
         reserved0: 0,
         reserved: [0; 2],
     };
-    if send_channel(authorities.registry, &bytes[..size], &[transfer]).is_err() {
+    if platform
+        .send_channel(authorities.registry, &bytes[..size], &[transfer])
+        .is_err()
+    {
         close_attempt_handles(&[direct, service])?;
         return Err(35);
     }
@@ -998,7 +1051,7 @@ fn lookup_connector(
         return Err(FATAL_ATTACH_BASE | 36);
     }
     let mut received = [DwReceivedHandleInfoV1::default(); 1];
-    let counts = match receive_channel(authorities.registry, &mut bytes, &mut received) {
+    let counts = match platform.receive_channel(authorities.registry, &mut bytes, &mut received) {
         Ok(counts) => counts,
         Err(_) => {
             close_attempt_handles(core::slice::from_ref(&direct))?;
@@ -1040,7 +1093,13 @@ fn launch_child<P: ConsoledPlatform>(
         match launch_child_once(platform, authorities, transactions, model, serial)? {
             LaunchChildOutcome::Child(child) => return Ok(child),
             LaunchChildOutcome::SerialLost(deadline) => {
-                *serial = attach_serial_bounded(authorities, transactions, model, Some(deadline))?;
+                *serial = attach_serial_bounded(
+                    platform,
+                    authorities,
+                    transactions,
+                    model,
+                    Some(deadline),
+                )?;
             }
         }
     }
@@ -1225,8 +1284,8 @@ fn launch_child_once<P: ConsoledPlatform>(
             {
                 return Err(45);
             }
-            close_serial_session(serial)?;
-            retire_publication_watch(authorities, transactions, serial)?;
+            close_serial_session(platform, serial)?;
+            retire_publication_watch(platform, authorities, transactions, serial)?;
             let resolved =
                 match receive_initial_launch(platform, authorities.launch, reservation, policy) {
                     Ok(reply) => reply,
@@ -1417,8 +1476,8 @@ fn wait_launch_with_serial<P: ConsoledPlatform>(
         if witness_index == Some(index) {
             #[cfg(feature = "wyr1e-wyrmsh")]
             {
-                observe_release_witness(serial, observed.observed)?;
-                drop_orphaned_witness(serial)?;
+                observe_release_witness(platform, serial, observed.observed)?;
+                drop_orphaned_witness(platform, serial)?;
                 continue;
             }
             #[cfg(not(feature = "wyr1e-wyrmsh"))]
@@ -1438,7 +1497,8 @@ fn wait_launch_with_serial<P: ConsoledPlatform>(
         match index {
             0 if observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 => return Err(45),
             0 => {
-                if publication_withdrawn(receive_publication_change(authorities, serial)?) {
+                if publication_withdrawn(receive_publication_change(platform, authorities, serial)?)
+                {
                     continue;
                 }
                 return Ok(LaunchWaitOutcome::SerialLost);
@@ -1663,8 +1723,8 @@ fn event_loop<P: ConsoledPlatform>(
         if witness_index == Some(observed_index) {
             #[cfg(feature = "wyr1e-wyrmsh")]
             {
-                observe_release_witness(serial, observed.observed)?;
-                drop_orphaned_witness(serial)?;
+                observe_release_witness(platform, serial, observed.observed)?;
+                drop_orphaned_witness(platform, serial)?;
                 continue;
             }
             #[cfg(not(feature = "wyr1e-wyrmsh"))]
@@ -1706,7 +1766,8 @@ fn event_loop<P: ConsoledPlatform>(
                 if signals & DW_SIGNAL_PEER_CLOSED.0 != 0 {
                     return Err(57);
                 }
-                if publication_withdrawn(receive_publication_change(authorities, serial)?) {
+                if publication_withdrawn(receive_publication_change(platform, authorities, serial)?)
+                {
                     continue;
                 }
                 recover_serial(
@@ -2478,8 +2539,9 @@ fn recover_serial<P: ConsoledPlatform>(
     if !matches!(action, RecoveryAction::TerminateChild(job) if job == child.job_id) {
         return Err(69);
     }
-    let raw_failed = close_serial_session(serial).is_err();
-    let watch_failed = retire_publication_watch(authorities, transactions, serial).is_err();
+    let raw_failed = close_serial_session(platform, serial).is_err();
+    let watch_failed =
+        retire_publication_watch(platform, authorities, transactions, serial).is_err();
     let wait_resolution = cancel_child_wait(platform, authorities, transactions, child)?;
     let streams_failed = close_child_streams(child).is_err();
     let observed_failed = model
@@ -2534,7 +2596,13 @@ fn recover_serial<P: ConsoledPlatform>(
         .map_err(|_| 72u32)?
     {
         RecoveryAction::RetrySerialAt(deadline_ms) => {
-            *serial = attach_serial_bounded(authorities, transactions, model, Some(deadline_ms))?;
+            *serial = attach_serial_bounded(
+                platform,
+                authorities,
+                transactions,
+                model,
+                Some(deadline_ms),
+            )?;
             *child = launch_child(platform, authorities, transactions, model, serial)?;
             observe_exact_ready(model, serial, child, 67)?;
             Ok(())
@@ -3326,10 +3394,14 @@ fn wait_readable(handle: DwHandle) -> Result<(), NativeError> {
     }
 }
 
-fn wait_backoff(registry: DwHandle, deadline_ms: u64) -> Result<(), u32> {
+fn wait_backoff<P: ConsoledPlatform>(
+    platform: &mut P,
+    registry: DwHandle,
+    deadline_ms: u64,
+) -> Result<(), u32> {
     let deadline_ns = deadline_ms.checked_mul(NANOS_PER_MILLI).ok_or(86u32)?;
     let item = wait_item(registry, DwSignals(DW_SIGNAL_PEER_CLOSED.0));
-    match wait_many(core::slice::from_ref(&item), DwDeadline(deadline_ns)) {
+    match platform.wait_many(core::slice::from_ref(&item), DwDeadline(deadline_ns)) {
         Err(NativeError::Status(status)) if status == DW_STATUS_TIMED_OUT => Ok(()),
         Ok(observed) if observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 => Err(87),
         _ => Err(88),

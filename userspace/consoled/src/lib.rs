@@ -76,16 +76,20 @@ pub fn release_raw_then_witness<H: Copy>(
 /// Runs fatal event-loop cleanup in the only safe ownership order. Callers
 /// supply their native effects so the sequencing remains executable in the
 /// allocation-free model and in host tests.
-pub fn cleanup_after_event_loop_failure<S, C>(
+///
+/// `effects` is lent to each step in turn: the three steps all act through
+/// the same native platform, which no two of them can hold at once.
+pub fn cleanup_after_event_loop_failure<X, S, C>(
+    effects: &mut X,
     serial: &mut S,
     child: &mut C,
-    close_serial: impl FnOnce(&mut S) -> bool,
-    retire_watch: impl FnOnce(&mut S) -> bool,
-    close_child: impl FnOnce(&mut C) -> bool,
+    close_serial: impl FnOnce(&mut X, &mut S) -> bool,
+    retire_watch: impl FnOnce(&mut X, &mut S) -> bool,
+    close_child: impl FnOnce(&mut X, &mut C) -> bool,
 ) -> bool {
-    let serial_closed = close_serial(serial);
-    let watch_retired = retire_watch(serial);
-    let child_closed = close_child(child);
+    let serial_closed = close_serial(effects, serial);
+    let watch_retired = retire_watch(effects, serial);
+    let child_closed = close_child(effects, child);
     serial_closed && watch_retired && child_closed
 }
 
@@ -1855,18 +1859,26 @@ mod tests {
         }
         // Exactly the withdrawal test, and exactly `continue` when it holds, in
         // both arms. (Both pass `serial` directly since the event loop's
-        // needless `&mut` reborrow went; see the S2 integration commit.)
+        // needless `&mut` reborrow went; see the S2 integration commit. Both
+        // pass the role's `platform` first since S2U step 3.) The two negative
+        // checks below name the same spelling, or they would pass vacuously.
         assert_eq!(
             main.matches(
-                "ifpublication_withdrawn(receive_publication_change(authorities,serial)?){continue;}"
+                "ifpublication_withdrawn(receive_publication_change(platform,authorities,serial)?){continue;}"
             )
             .count(),
             2,
             "a registry arm lost its exact withdrawal guard"
         );
         // No registry arm may rebuild without asking first.
-        assert!(!main.contains("receive_publication_change(authorities,serial)?;recover_serial("));
-        assert!(!main.contains("receive_publication_change(authorities,serial)?;returnOk(LaunchWaitOutcome::SerialLost)"));
+        assert!(
+            !main.contains(
+                "receive_publication_change(platform,authorities,serial)?;recover_serial("
+            )
+        );
+        assert!(!main.contains(
+            "receive_publication_change(platform,authorities,serial)?;returnOk(LaunchWaitOutcome::SerialLost)"
+        ));
     }
 
     /// F3A.7k. A witness released while raw custody holds means devmgr is gone,
@@ -1885,7 +1897,7 @@ mod tests {
         };
         let main = squeeze(MAIN);
         let helper = main
-            .find("fndrop_orphaned_witness(serial:&mutSerialSession)")
+            .find("fndrop_orphaned_witness<P:ConsoledPlatform>(platform:&mutP,serial:&mutSerialSession,)")
             .expect("the orphaned-witness helper is gone");
         let helper = &main[helper..helper + 300];
         assert!(helper.contains("serial.release_witness.take()"));
@@ -2015,17 +2027,18 @@ mod tests {
         let mut serial = ();
         let mut child = ();
         let cleaned = cleanup_after_event_loop_failure(
+            &mut (),
             &mut serial,
             &mut child,
-            |_| {
+            |_, _| {
                 log.set(log.get() * 10 + 1);
                 false
             },
-            |_| {
+            |_, _| {
                 log.set(log.get() * 10 + 2);
                 true
             },
-            |_| {
+            |_, _| {
                 log.set(log.get() * 10 + 3);
                 true
             },

@@ -107,7 +107,9 @@ fn e8_shell_ready_requires_matching_tuple_and_authenticated_serial_facts() {
     assert!(launch.contains("stage_e8_shell_ready"));
     assert!(launch.contains("ShellTuple"));
     assert!(CONSOLED.contains("Message::ReadyFacts(facts)"));
-    let attach = item(CONSOLED, "fn attach_serial(");
+    // Source text: no host test drives consoled's role yet. The anchor ends in
+    // `<` because attach_serial now opens with its platform parameter list.
+    let attach = item(CONSOLED, "fn attach_serial<");
     assert!(attach.contains("connector_client_transaction: connector_transaction"));
     assert!(attach.contains(
         "valid_connector_identity(identity, publication_generation, connector_transaction)"
