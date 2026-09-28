@@ -10,7 +10,9 @@
 
 #[cfg(feature = "wyr1d-selector32")]
 pub mod d5_drain;
-#[cfg(feature = "native-uart16550d")]
+// Also built for the library's own tests, which drive the role through the
+// runtime's recording platform (dev-dependencies below supply its crates).
+#[cfg(any(feature = "native-uart16550d", test))]
 pub mod role;
 
 #[cfg(feature = "dw1e3-selector31")]

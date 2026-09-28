@@ -12,6 +12,7 @@ use wyrmroot_devmgr::connector::{
 use wyrmroot_stream_proto as _;
 use wyrmroot_uart16550_core as _;
 use wyrmroot_uart16550d::{RAW_STREAM_RIGHTS, ReceivedStreamEndpoint, StreamAttachment};
+use {wyrmroot_loader as _, wyrmroot_runtime as _};
 
 fn driver() -> PublishedDriver {
     PublishedDriver {

@@ -1626,3 +1626,6 @@ fn fail_second_stage<P: UartPlatform>(
     let _ = platform.close_handle(control);
     Err(code)
 }
+
+#[cfg(test)]
+mod tests;
