@@ -4,14 +4,18 @@
 
 #[cfg(feature = "dw1e3-selector31")]
 use wyrmroot_dw1e3_com2_test as _;
-use wyrmroot_runtime::StartupBlock;
+use wyrmroot_runtime::{NativePlatform, StartupBlock};
 use {
     deepwyrm_syscall as _, wyrmroot_device_proto as _, wyrmroot_loader as _,
     wyrmroot_stream_proto as _, wyrmroot_uart16550_core as _,
 };
 
 fn uart_main(startup: StartupBlock<'_>) -> u32 {
-    wyrmroot_uart16550d::role::uart_main(startup.bootstrap_channel().as_abi())
+    wyrmroot_uart16550d::role::uart_main(
+        &mut NativePlatform,
+        &mut NativePlatform,
+        startup.bootstrap_channel().as_abi(),
+    )
 }
 
 #[cfg(target_os = "wyrmroot")]

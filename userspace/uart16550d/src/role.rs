@@ -47,14 +47,14 @@ use wyrmroot_loader::launch::{
     CHILD_CHANNEL_RIGHTS, DEVICE_DRIVER_BYTES, SELF_ROOT_RIGHTS, parse_device_driver_init,
 };
 use wyrmroot_runtime::{
-    BOOTSTRAP_CHANNEL_EXPECTATION, NativeError, close_handle, device_pio_read, device_pio_write,
-    device_resource_info, interrupt_ack, interrupt_info, monotonic_active_now, native_error_code,
-    query_capability_info, receive_channel, send_channel, validate_bootstrap_channel, wait_many,
+    BOOTSTRAP_CHANNEL_EXPECTATION, ChannelPlatform, ClockPlatform, DevicePlatform,
+    EvidencePlatform, HandlePlatform, NativeError, WaitPlatform, close_handle, device_pio_write,
+    interrupt_ack, monotonic_active_now, native_error_code, receive_channel, send_channel,
+    validate_bootstrap_channel, wait_many,
 };
 #[cfg(feature = "dw1e3-selector31")]
 use wyrmroot_runtime::{
-    Dw1e3ReportEvent, create_timer, dw1e3_bind_driver, dw1e3_build_nonce, dw1e3_challenge_nonce,
-    dw1e3_report, set_timer, wait_one,
+    Dw1e3ReportEvent, create_timer, dw1e3_challenge_nonce, dw1e3_report, set_timer, wait_one,
 };
 use wyrmroot_stream_proto::MAX_RECORD_BYTES;
 #[cfg(feature = "dw1e3-selector31")]
@@ -63,17 +63,42 @@ use wyrmroot_uart16550_core::ByteRegisterIo;
 
 const FAILURE_BASE: u32 = 0xD3A0_0000;
 
-struct NativeResourceIo<'a> {
+/// The platform traits the role uses.
+pub trait UartPlatform:
+    HandlePlatform + ChannelPlatform + WaitPlatform + ClockPlatform + DevicePlatform + EvidencePlatform
+{
+}
+
+impl<P> UartPlatform for P where
+    P: HandlePlatform
+        + ChannelPlatform
+        + WaitPlatform
+        + ClockPlatform
+        + DevicePlatform
+        + EvidencePlatform
+        + ?Sized
+{
+}
+
+/// The UART's register window, over the DeviceResource's port I/O.
+///
+/// It holds its own platform: the driver owns this for its whole life, while
+/// the role keeps making its own syscalls through the role platform.
+struct ResourceIo<'a, D> {
+    platform: &'a mut D,
     handle: DwHandle,
     failed: &'a Cell<bool>,
 }
 
-impl ByteRegisterIo for NativeResourceIo<'_> {
+impl<D: DevicePlatform> ByteRegisterIo for ResourceIo<'_, D> {
     fn read(&mut self, offset: u8) -> u8 {
         if self.failed.get() {
             return 0;
         }
-        match device_pio_read(self.handle, u32::from(offset), 1) {
+        match self
+            .platform
+            .device_pio_read(self.handle, u32::from(offset), 1)
+        {
             Ok(value) if value <= u32::from(u8::MAX) => value as u8,
             _ => {
                 self.failed.set(true);
@@ -84,27 +109,41 @@ impl ByteRegisterIo for NativeResourceIo<'_> {
 
     fn write(&mut self, offset: u8, value: u8) {
         if !self.failed.get()
-            && device_pio_write(self.handle, u32::from(offset), 1, u32::from(value)).is_err()
+            && self
+                .platform
+                .device_pio_write(self.handle, u32::from(offset), 1, u32::from(value))
+                .is_err()
         {
             self.failed.set(true);
         }
     }
 }
 
-pub fn uart_main(bootstrap: DwHandle) -> u32 {
-    run(bootstrap).unwrap_or_else(|step| FAILURE_BASE | step)
+pub fn uart_main<P: UartPlatform, D: DevicePlatform>(
+    platform: &mut P,
+    pio: &mut D,
+    bootstrap: DwHandle,
+) -> u32 {
+    run(platform, pio, bootstrap).unwrap_or_else(|step| FAILURE_BASE | step)
 }
 
-pub fn run(bootstrap: DwHandle) -> Result<u32, u32> {
+pub fn run<P: UartPlatform, D: DevicePlatform>(
+    platform: &mut P,
+    pio: &mut D,
+    bootstrap: DwHandle,
+) -> Result<u32, u32> {
     validate_bootstrap_channel(
-        query_capability_info(bootstrap).map_err(|_| 1u32)?,
+        platform
+            .query_capability_info(bootstrap)
+            .map_err(|_| 1u32)?,
         BOOTSTRAP_CHANNEL_EXPECTATION,
     )
     .map_err(|_| 2u32)?;
     let mut startup_bytes = [0; DEVICE_DRIVER_BYTES];
     let mut startup_handles = [DwReceivedHandleInfoV1::default(); 2];
-    let startup_counts =
-        receive_channel(bootstrap, &mut startup_bytes, &mut startup_handles).map_err(|_| 3u32)?;
+    let startup_counts = platform
+        .receive_channel(bootstrap, &mut startup_bytes, &mut startup_handles)
+        .map_err(|_| 3u32)?;
     if startup_counts.bytes != DEVICE_DRIVER_BYTES
         || startup_counts.handles != 2
         || !valid_received(
@@ -125,22 +164,22 @@ pub fn run(bootstrap: DwHandle) -> Result<u32, u32> {
         Ok(launch) => launch,
         Err(_) => {
             close_received(&startup_handles, 2);
-            let _ = close_handle(bootstrap);
+            let _ = platform.close_handle(bootstrap);
             return Err(5);
         }
     };
     let control = startup_handles[1].handle;
-    if close_handle(startup_handles[0].handle).is_err() {
-        let _ = close_handle(control);
-        let _ = close_handle(bootstrap);
+    if platform.close_handle(startup_handles[0].handle).is_err() {
+        let _ = platform.close_handle(control);
+        let _ = platform.close_handle(bootstrap);
         return Err(6);
     }
-    if close_handle(bootstrap).is_err() {
-        let _ = close_handle(control);
+    if platform.close_handle(bootstrap).is_err() {
+        let _ = platform.close_handle(control);
         return Err(7);
     }
 
-    let observed = match wait_many(
+    let observed = match platform.wait_many(
         core::slice::from_ref(&DwWaitItemV1 {
             handle: control,
             signals: deepwyrm_syscall::DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
@@ -149,34 +188,35 @@ pub fn run(bootstrap: DwHandle) -> Result<u32, u32> {
     ) {
         Ok(observed) => observed,
         Err(_) => {
-            let _ = close_handle(control);
+            let _ = platform.close_handle(control);
             return Err(8);
         }
     };
     if !startup_control_is_readable(observed.index, observed.observed) {
-        close_handle(control).map_err(|_| 9u32)?;
+        platform.close_handle(control).map_err(|_| 9u32)?;
         return Err(10);
     }
     let mut stage_bytes = [0; DEVICE_STAGE_BYTES];
     let mut stage_handles = [DwReceivedHandleInfoV1::default(); 1];
-    let stage_counts = match receive_channel(control, &mut stage_bytes, &mut stage_handles) {
+    let stage_counts = match platform.receive_channel(control, &mut stage_bytes, &mut stage_handles)
+    {
         Ok(counts) => counts,
         Err(_) => {
-            let _ = close_handle(control);
+            let _ = platform.close_handle(control);
             return Err(11);
         }
     };
     if stage_counts.bytes != DEVICE_STAGE_BYTES || stage_counts.handles != 1 {
         close_received(&stage_handles, stage_counts.handles);
-        close_handle(control).map_err(|_| 12u32)?;
+        platform.close_handle(control).map_err(|_| 12u32)?;
         return Err(13);
     }
     let message = match parse(&stage_bytes) {
         Ok(message) => message,
-        Err(_) => return fail_stage(control, &stage_handles, 1, 14),
+        Err(_) => return fail_stage(platform, control, &stage_handles, 1, 14),
     };
     let ControlMessageV1_1::DeviceStage { identity, .. } = message else {
-        return fail_stage(control, &stage_handles, 1, 16);
+        return fail_stage(platform, control, &stage_handles, 1, 16);
     };
     let startup_identity = ControlIdentityV1_1 {
         role_id: RoleId(launch.role_id),
@@ -188,9 +228,9 @@ pub fn run(bootstrap: DwHandle) -> Result<u32, u32> {
         },
         transaction_id: launch.transaction_id,
     };
-    let info = match device_resource_info(stage_handles[0].handle) {
+    let info = match platform.device_resource_info(stage_handles[0].handle) {
         Ok(info) => info,
-        Err(_) => return fail_stage(control, &stage_handles, 1, 17),
+        Err(_) => return fail_stage(platform, control, &stage_handles, 1, 17),
     };
     let received = ReceivedDeviceResource {
         handle: stage_handles[0].handle,
@@ -201,33 +241,37 @@ pub fn run(bootstrap: DwHandle) -> Result<u32, u32> {
         info,
     };
     let pio_failed = Cell::new(false);
-    let io = NativeResourceIo {
+    let io = ResourceIo {
+        platform: pio,
         handle: received.handle,
         failed: &pio_failed,
     };
     let mut stage = match DeviceStage::validate(startup_identity, message, received, io) {
         Ok(stage) => stage,
-        Err(_) => return fail_stage(control, &stage_handles, 1, 18),
+        Err(_) => return fail_stage(platform, control, &stage_handles, 1, 18),
     };
     let response = match stage.initialize_quiesced() {
         Ok(response) => response,
         Err(_) => {
             let (resource, _) = stage.into_parts();
-            return fail_owned_stage(control, resource.handle, 19);
+            return fail_owned_stage(platform, control, resource.handle, 19);
         }
     };
     if pio_failed.get() {
-        return fail_owned_stage(control, received.handle, 22);
+        return fail_owned_stage(platform, control, received.handle, 22);
     }
     let mut response_bytes = [0; DEVICE_QUIESCED_BYTES];
     if encode(response, &mut response_bytes).is_err() {
-        return fail_owned_stage(control, received.handle, 23);
+        return fail_owned_stage(platform, control, received.handle, 23);
     }
-    if send_channel(control, &response_bytes, &[]).is_err() {
-        return fail_owned_stage(control, received.handle, 24);
+    if platform
+        .send_channel(control, &response_bytes, &[])
+        .is_err()
+    {
+        return fail_owned_stage(platform, control, received.handle, 24);
     }
 
-    let observed = match wait_many(
+    let observed = match platform.wait_many(
         core::slice::from_ref(&DwWaitItemV1 {
             handle: control,
             signals: DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
@@ -235,39 +279,58 @@ pub fn run(bootstrap: DwHandle) -> Result<u32, u32> {
         DW_DEADLINE_INFINITE,
     ) {
         Ok(observed) => observed,
-        Err(_) => return fail_owned_stage(control, received.handle, 25),
+        Err(_) => return fail_owned_stage(platform, control, received.handle, 25),
     };
     if !startup_control_is_readable(observed.index, observed.observed) {
-        let _ = device_pio_write(received.handle, 1, 1, 0);
-        return fail_owned_stage(control, received.handle, 26);
+        let _ = platform.device_pio_write(received.handle, 1, 1, 0);
+        return fail_owned_stage(platform, control, received.handle, 26);
     }
     let mut interrupt_bytes = [0; INTERRUPT_STAGE_BYTES];
     let mut interrupt_handles = [DwReceivedHandleInfoV1::default(); 1];
-    let counts = match receive_channel(control, &mut interrupt_bytes, &mut interrupt_handles) {
-        Ok(counts) => counts,
-        Err(_) => return fail_owned_stage(control, received.handle, 27),
-    };
+    let counts =
+        match platform.receive_channel(control, &mut interrupt_bytes, &mut interrupt_handles) {
+            Ok(counts) => counts,
+            Err(_) => return fail_owned_stage(platform, control, received.handle, 27),
+        };
     if counts.bytes != INTERRUPT_STAGE_BYTES || counts.handles != 1 {
         close_received(&interrupt_handles, counts.handles);
-        let _ = device_pio_write(received.handle, 1, 1, 0);
-        return fail_owned_stage(control, received.handle, 28);
+        let _ = platform.device_pio_write(received.handle, 1, 1, 0);
+        return fail_owned_stage(platform, control, received.handle, 28);
     }
     let interrupt_message = match parse(&interrupt_bytes) {
         Ok(message) => message,
         Err(_) => {
-            return fail_second_stage(control, received.handle, interrupt_handles[0].handle, 29);
+            return fail_second_stage(
+                platform,
+                control,
+                received.handle,
+                interrupt_handles[0].handle,
+                29,
+            );
         }
     };
-    let basic = match query_capability_info(interrupt_handles[0].handle) {
+    let basic = match platform.query_capability_info(interrupt_handles[0].handle) {
         Ok(info) => info,
         Err(_) => {
-            return fail_second_stage(control, received.handle, interrupt_handles[0].handle, 30);
+            return fail_second_stage(
+                platform,
+                control,
+                received.handle,
+                interrupt_handles[0].handle,
+                30,
+            );
         }
     };
-    let irq_info = match interrupt_info(interrupt_handles[0].handle) {
+    let irq_info = match platform.interrupt_info(interrupt_handles[0].handle) {
         Ok(info) => info,
         Err(_) => {
-            return fail_second_stage(control, received.handle, interrupt_handles[0].handle, 31);
+            return fail_second_stage(
+                platform,
+                control,
+                received.handle,
+                interrupt_handles[0].handle,
+                31,
+            );
         }
     };
     let interrupt = ReceivedInterrupt {
@@ -281,21 +344,22 @@ pub fn run(bootstrap: DwHandle) -> Result<u32, u32> {
     let mut driver = match stage.validate_interrupt(interrupt_message, interrupt) {
         Ok(driver) => driver,
         Err(_) => {
-            return fail_second_stage(control, received.handle, interrupt.handle, 32);
+            return fail_second_stage(platform, control, received.handle, interrupt.handle, 32);
         }
     };
     #[cfg(feature = "dw1e3-selector31")]
-    let evidence_nonce = match dw1e3_build_nonce() {
+    let evidence_nonce = match platform.dw1e3_build_nonce() {
         Ok(nonce) => nonce,
         Err(_) => return fail_driver(&mut driver, control, 60),
     };
     #[cfg(feature = "dw1e3-selector31")]
-    dw1e3_bind_driver(
-        driver.interrupt().handle,
-        driver.identity().attempt_generation.0,
-        evidence_nonce,
-    )
-    .map_err(|_| 61u32)?;
+    platform
+        .dw1e3_bind_driver(
+            driver.interrupt().handle,
+            driver.identity().attempt_generation.0,
+            evidence_nonce,
+        )
+        .map_err(|_| 61u32)?;
     let ready = match driver.activate() {
         Ok(ready) if !pio_failed.get() => ready,
         _ => return fail_driver(&mut driver, control, 33),
@@ -1471,33 +1535,40 @@ fn close_received(handles: &[DwReceivedHandleInfoV1], count: usize) {
     }
 }
 
-fn fail_stage(
+fn fail_stage<P: UartPlatform>(
+    platform: &mut P,
     control: DwHandle,
     handles: &[DwReceivedHandleInfoV1],
     count: usize,
     code: u32,
 ) -> Result<u32, u32> {
     close_received(handles, count);
-    let _ = close_handle(control);
+    let _ = platform.close_handle(control);
     Err(code)
 }
 
-fn fail_owned_stage(control: DwHandle, resource: DwHandle, code: u32) -> Result<u32, u32> {
-    let _ = device_pio_write(resource, 1, 1, 0);
-    let _ = close_handle(resource);
-    let _ = close_handle(control);
+fn fail_owned_stage<P: UartPlatform>(
+    platform: &mut P,
+    control: DwHandle,
+    resource: DwHandle,
+    code: u32,
+) -> Result<u32, u32> {
+    let _ = platform.device_pio_write(resource, 1, 1, 0);
+    let _ = platform.close_handle(resource);
+    let _ = platform.close_handle(control);
     Err(code)
 }
 
-fn fail_second_stage(
+fn fail_second_stage<P: UartPlatform>(
+    platform: &mut P,
     control: DwHandle,
     resource: DwHandle,
     interrupt: DwHandle,
     code: u32,
 ) -> Result<u32, u32> {
-    let _ = device_pio_write(resource, 1, 1, 0);
-    let _ = close_handle(interrupt);
-    let _ = close_handle(resource);
-    let _ = close_handle(control);
+    let _ = platform.device_pio_write(resource, 1, 1, 0);
+    let _ = platform.close_handle(interrupt);
+    let _ = platform.close_handle(resource);
+    let _ = platform.close_handle(control);
     Err(code)
 }
