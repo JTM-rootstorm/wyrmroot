@@ -2,11 +2,13 @@
 
 use {wyrmroot_registry_proto as _, wyrmroot_registryd as _};
 
-const NATIVE: &str = include_str!("../src/main.rs");
+const NATIVE: &str = concat!(include_str!("../src/main.rs"), include_str!("../src/role.rs"));
 const SERVICE: &str = include_str!("../src/service.rs");
 
-/// Source text because `main.rs` is the guest binary and registryd's native
-/// transport has no host seam yet (S2U step 3 moves it into the library).
+/// Source text because `main.rs` plus `role.rs` is the guest binary's whole
+/// native role: registryd's transport has no host seam of its own yet, only
+/// the platform family's (S2U step 3 moved bootstrap and the transport into
+/// the library, in `main.rs`'s old text order).
 #[test]
 fn native_registry_is_resident_and_uses_only_channel_routing_primitives() {
     let compact: String = NATIVE.split_whitespace().collect();

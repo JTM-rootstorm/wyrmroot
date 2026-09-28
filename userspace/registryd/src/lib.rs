@@ -4,8 +4,7 @@
 #![forbid(unsafe_code)]
 
 #[cfg(feature = "native-registryd")]
-use {deepwyrm_syscall as _, wyrmroot_loader as _, wyrmroot_runtime as _};
-
+pub mod role;
 pub mod service;
 
 use wyrmroot_registry_proto::{
