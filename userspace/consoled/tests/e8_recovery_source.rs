@@ -45,10 +45,13 @@ fn e8_ready_facts_precede_each_shell_v1_request_and_use_live_serial_identity() {
     assert!(live_bundle < send_facts && send_facts < shell_request);
 }
 
+/// Source text: the quiesce handshake is inside the role's event loop, which no
+/// host test drives yet. Slice anchors end in `<` because each role function
+/// now opens with its platform parameter list.
 #[test]
 fn e8_quiescence_stops_input_and_waits_for_every_owned_output_queue() {
-    let loop_body = &NATIVE[NATIVE.find("fn event_loop(").unwrap()
-        ..NATIVE.find("fn drain_clean_terminal_output(").unwrap()];
+    let loop_body = &NATIVE[NATIVE.find("fn event_loop<").unwrap()
+        ..NATIVE.find("fn drain_clean_terminal_output<").unwrap()];
     assert!(loop_body.contains("let accepting_raw_input = recovery_request.is_none();"));
     assert!(
         loop_body.contains("input_pending.is_empty()\n            && output_pending.is_empty()")
@@ -57,21 +60,20 @@ fn e8_quiescence_stops_input_and_waits_for_every_owned_output_queue() {
     assert!(loop_body.contains("snapshot.stdout_queued == 0"));
     assert!(loop_body.contains("snapshot.stderr_queued == 0"));
     let quiet_poll = loop_body
-        .find("if !streams_freshly_quiet(&mut streams, child, model)?")
+        .find("if !streams_freshly_quiet(platform, child, model)?")
         .unwrap();
     let acknowledge = loop_body.find("Message::Quiesced(identity)").unwrap();
     assert!(quiet_poll < acknowledge);
     assert!(loop_body[quiet_poll..acknowledge].contains("continue;"));
     assert!(loop_body.contains("if let Some(identity) = recovery_request"));
-    assert!(
-        loop_body
-            .contains("recovery_request = Some(receive_recovery_request(authorities, child)?);")
-    );
+    assert!(loop_body.contains(
+        "recovery_request = Some(receive_recovery_request(platform, authorities, child)?);",
+    ));
     assert!(loop_body.contains("Message::Quiesced(identity)"));
     assert!(loop_body.contains("recovery_acknowledged = true"));
 
-    let quiet = &NATIVE[NATIVE.find("fn streams_freshly_quiet(").unwrap()
-        ..NATIVE.find("fn selector_configure(").unwrap()];
+    let quiet = &NATIVE[NATIVE.find("fn streams_freshly_quiet<").unwrap()
+        ..NATIVE.find("fn selector_configure<").unwrap()];
     assert!(quiet.contains("&mut child.stdout"));
     assert!(quiet.contains("&mut child.stderr"));
     assert!(quiet.contains(".poll_output_quiescence(child.event, |source, payload|"));
@@ -83,6 +85,9 @@ fn e8_quiescence_stops_input_and_waits_for_every_owned_output_queue() {
     assert!(!quiet.contains("DW_STATUS_TIMED_OUT"));
 }
 
+/// Source text: the drain-before-reap order is inside role functions that no
+/// host test drives yet. Slice anchors end in `<` where the function now
+/// opens with its platform parameter list.
 #[test]
 fn clean_terminal_result_drains_child_output_before_reap_and_relaunch() {
     let branch = &NATIVE[NATIVE.find("2 => {").unwrap()..NATIVE.find("3 => {").unwrap()];
@@ -90,7 +95,7 @@ fn clean_terminal_result_drains_child_output_before_reap_and_relaunch() {
     let recover = branch.find("recover_terminal_child(").unwrap();
     assert!(drain < recover);
 
-    let drain_body = item(NATIVE, "fn drain_clean_terminal_output(");
+    let drain_body = item(NATIVE, "fn drain_clean_terminal_output<");
     // F3A.7g. The reply is matched rather than compared, because the drain is
     // also where the child's session-shutdown status is read off it. What this
     // test is about is unchanged: the result is awaited before any output is
@@ -123,17 +128,20 @@ fn clean_terminal_result_drains_child_output_before_reap_and_relaunch() {
     assert!(recover_body.contains("if child.session_shutdown {"));
 }
 
+/// Source text: the precursor routing is inside the role's event loop, which no
+/// host test drives yet. Slice anchors end in `<` because each role function
+/// now opens with its platform parameter list.
 #[test]
 fn role_peer_close_with_pending_wait_uses_terminal_precursor_before_fault_retirement() {
-    let loop_body = &NATIVE[NATIVE.find("fn event_loop(").unwrap()
-        ..NATIVE.find("fn drain_clean_terminal_output(").unwrap()];
+    let loop_body = &NATIVE[NATIVE.find("fn event_loop<").unwrap()
+        ..NATIVE.find("fn drain_clean_terminal_output<").unwrap()];
     assert_eq!(loop_body.matches("recover_terminal_precursor(").count(), 3);
     assert!(loop_body.contains("signals & DW_SIGNAL_PEER_CLOSED.0 != 0 && child.wait.is_some()"));
     assert!(loop_body.contains("4 | 5 => {"));
     assert!(loop_body.contains("6 if child.status.is_some() => {"));
 
-    let precursor = &NATIVE[NATIVE.find("fn recover_terminal_precursor(").unwrap()
-        ..NATIVE.find("fn receive_recovery_request(").unwrap()];
+    let precursor = &NATIVE[NATIVE.find("fn recover_terminal_precursor<").unwrap()
+        ..NATIVE.find("fn receive_recovery_request<").unwrap()];
     let observe = precursor.find("model.child_terminal_precursor").unwrap();
     let drain = precursor.find("drain_clean_terminal_output(").unwrap();
     let recover = precursor.find("recover_terminal_child(").unwrap();

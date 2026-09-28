@@ -3,7 +3,7 @@
 #![deny(unsafe_code)]
 
 use wyrmroot_consoled::role::{FAILURE_BASE, run};
-use wyrmroot_runtime::StartupBlock;
+use wyrmroot_runtime::{NativePlatform, StartupBlock};
 use {
     deepwyrm_syscall as _, wyrmroot_console_proto as _, wyrmroot_device_proto as _,
     wyrmroot_launch_proto as _, wyrmroot_loader as _, wyrmroot_registry_proto as _,
@@ -11,7 +11,8 @@ use {
 };
 
 fn native_main(startup: StartupBlock<'_>) -> u32 {
-    run(startup.bootstrap_channel().as_abi()).unwrap_or_else(|step| FAILURE_BASE | step)
+    run(&mut NativePlatform, startup.bootstrap_channel().as_abi())
+        .unwrap_or_else(|step| FAILURE_BASE | step)
 }
 
 #[cfg(target_os = "wyrmroot")]

@@ -44,10 +44,11 @@ use wyrmroot_registry_proto::{
     encode_watch, parse as parse_registry,
 };
 use wyrmroot_runtime::{
-    BOOTSTRAP_CHANNEL_EXPECTATION, NativeError, NativeInput, NativeOutput, ReceiveCounts,
-    StreamEndpoint, StreamError, StreamSystem, WYR0_I_SUPERVISION_POLICY, close_handle,
-    create_channel, duplicate_handle, monotonic_active_now, query_capability_info, receive_channel,
-    send_channel, validate_bootstrap_channel, wait_many, wait_one,
+    BOOTSTRAP_CHANNEL_EXPECTATION, ChannelPlatform, ClockPlatform, HandlePlatform, NativeError,
+    NativeInput, NativeOutput, ReceiveCounts, StreamEndpoint, StreamError, StreamSystem,
+    WYR0_I_SUPERVISION_POLICY, WaitPlatform, close_handle, create_channel, duplicate_handle,
+    monotonic_active_now, query_capability_info, receive_channel, send_channel,
+    validate_bootstrap_channel, wait_many, wait_one,
 };
 
 /// The base every failure step of [`run`] is reported under, as the
@@ -368,59 +369,95 @@ impl TransactionIds {
     }
 }
 
-struct NativeStreams;
+/// The platform operations the consoled role uses.
+/// [`wyrmroot_runtime::NativePlatform`] is the production implementation; host
+/// tests use the runtime's recording platform.
+pub trait ConsoledPlatform:
+    HandlePlatform + ChannelPlatform + WaitPlatform + ClockPlatform
+{
+}
 
-impl StreamSystem for NativeStreams {
+impl<P> ConsoledPlatform for P where
+    P: HandlePlatform + ChannelPlatform + WaitPlatform + ClockPlatform
+{
+}
+
+/// consoled's native stream adapter, over its platform.
+///
+/// Deliberately not the runtime's blanket [`StreamSystem`] impl for a
+/// platform: that one waits on an endpoint forever, and consoled's stream wait
+/// has always been bounded, at `WYR0_I_SUPERVISION_POLICY.ready_timeout_ns`
+/// past the active clock. Pass `&mut ConsoledStreams::new(platform)`, never
+/// the platform itself, wherever a [`StreamSystem`] is wanted. It holds
+/// nothing but the borrow, so one built per call behaves exactly as the
+/// stateless `NativeStreams` unit it replaced.
+struct ConsoledStreams<'a, P>(&'a mut P);
+
+impl<'a, P: ConsoledPlatform> ConsoledStreams<'a, P> {
+    fn new(platform: &'a mut P) -> Self {
+        Self(platform)
+    }
+}
+
+impl<P: ConsoledPlatform> StreamSystem for ConsoledStreams<'_, P> {
     fn receive(
         &mut self,
         channel: DwHandle,
         bytes: &mut [u8],
         handles: &mut [DwReceivedHandleInfoV1],
     ) -> Result<ReceiveCounts, NativeError> {
-        receive_channel(channel, bytes, handles)
+        self.0.receive_channel(channel, bytes, handles)
     }
 
     fn send(&mut self, channel: DwHandle, bytes: &[u8]) -> Result<(), NativeError> {
-        send_channel(channel, bytes, &[])
+        self.0.send_channel(channel, bytes, &[])
     }
 
     fn close(&mut self, handle: DwHandle) -> Result<(), NativeError> {
-        close_handle(handle)
+        self.0.close_handle(handle)
     }
 
     fn wait(&mut self, channel: DwHandle, signals: DwSignals) -> Result<DwSignals, NativeError> {
-        let deadline = monotonic_active_now()?
+        let deadline = self
+            .0
+            .monotonic_active_now()?
             .checked_add(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
             .ok_or(NativeError::Output(
                 wyrmroot_runtime::NativeOutputError::DeadlineOverflow,
             ))?;
-        Ok(wait_one(channel, signals, DwDeadline(deadline))?.observed)
+        Ok(self
+            .0
+            .wait_one(channel, signals, DwDeadline(deadline))?
+            .observed)
     }
 }
 
 /// Runs one consoled generation over its bootstrap Channel, returning the
 /// session's exit status or the failure step it stopped with.
-pub fn run(bootstrap: DwHandle) -> Result<u32, u32> {
+pub fn run<P: ConsoledPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u32, u32> {
     validate_bootstrap_channel(
-        query_capability_info(bootstrap).map_err(|_| 3u32)?,
+        platform
+            .query_capability_info(bootstrap)
+            .map_err(|_| 3u32)?,
         BOOTSTRAP_CHANNEL_EXPECTATION,
     )
     .map_err(|_| 4u32)?;
 
     let mut init_bytes = [0u8; CONSOLED_BYTES];
     let mut init_handles = [DwReceivedHandleInfoV1::default(); 3];
-    let counts =
-        receive_channel(bootstrap, &mut init_bytes, &mut init_handles).map_err(|_| 5u32)?;
+    let counts = platform
+        .receive_channel(bootstrap, &mut init_bytes, &mut init_handles)
+        .map_err(|_| 5u32)?;
     if counts.bytes != CONSOLED_BYTES || counts.handles != 3 {
         close_received(&init_handles, counts.handles);
-        let _ = close_handle(bootstrap);
+        let _ = platform.close_handle(bootstrap);
         return Err(6);
     }
     let init = match parse_consoled_init(&init_bytes, &init_handles) {
         Ok(init) => init,
         Err(_) => {
             close_received(&init_handles, 3);
-            let _ = close_handle(bootstrap);
+            let _ = platform.close_handle(bootstrap);
             return Err(7);
         }
     };
@@ -428,7 +465,7 @@ pub fn run(bootstrap: DwHandle) -> Result<u32, u32> {
         #[cfg(feature = "wyr1d-selector32")]
         selector_control: bootstrap,
         #[cfg(feature = "wyr1d-selector32")]
-        selector_nonce: selector_configure(bootstrap)?,
+        selector_nonce: selector_configure(platform, bootstrap)?,
         #[cfg(feature = "wyr1e8-recovery")]
         recovery_control: bootstrap,
         registry: init_handles[1].handle,
@@ -440,9 +477,9 @@ pub fn run(bootstrap: DwHandle) -> Result<u32, u32> {
         launch_connection_generation: init.launch_connection_generation,
         startup_transaction: init.transaction_id,
     };
-    if close_handle(init_handles[0].handle).is_err() {
+    if platform.close_handle(init_handles[0].handle).is_err() {
         close_authorities(authorities);
-        let _ = close_handle(bootstrap);
+        let _ = platform.close_handle(bootstrap);
         return Err(8);
     }
 
@@ -452,7 +489,7 @@ pub fn run(bootstrap: DwHandle) -> Result<u32, u32> {
         Ok(serial) => serial,
         Err(error) => {
             close_authorities(authorities);
-            let _ = close_handle(bootstrap);
+            let _ = platform.close_handle(bootstrap);
             return Err(error);
         }
     };
@@ -461,7 +498,7 @@ pub fn run(bootstrap: DwHandle) -> Result<u32, u32> {
         Err(error) => {
             let _ = close_serial_session(&mut serial);
             close_authorities(authorities);
-            let _ = close_handle(bootstrap);
+            let _ = platform.close_handle(bootstrap);
             return Err(error);
         }
     };
@@ -470,7 +507,7 @@ pub fn run(bootstrap: DwHandle) -> Result<u32, u32> {
         let _ = close_serial_session(&mut serial);
         let _ = cleanup_child_for_exit(authorities, &mut transactions, &mut child);
         close_authorities(authorities);
-        let _ = close_handle(bootstrap);
+        let _ = platform.close_handle(bootstrap);
         return Err(9);
     }
 
@@ -485,19 +522,22 @@ pub fn run(bootstrap: DwHandle) -> Result<u32, u32> {
             let _ = close_serial_session(&mut serial);
             let _ = cleanup_child_for_exit(authorities, &mut transactions, &mut child);
             close_authorities(authorities);
-            let _ = close_handle(bootstrap);
+            let _ = platform.close_handle(bootstrap);
             return Err(10);
         }
     };
-    if send_channel(bootstrap, &ready[..ready_size], &[]).is_err() {
+    if platform
+        .send_channel(bootstrap, &ready[..ready_size], &[])
+        .is_err()
+    {
         let _ = close_serial_session(&mut serial);
         let _ = cleanup_child_for_exit(authorities, &mut transactions, &mut child);
         close_authorities(authorities);
-        let _ = close_handle(bootstrap);
+        let _ = platform.close_handle(bootstrap);
         return Err(11);
     }
     #[cfg(not(any(feature = "wyr1d-selector32", feature = "wyr1e8-recovery")))]
-    if close_handle(bootstrap).is_err() {
+    if platform.close_handle(bootstrap).is_err() {
         let _ = close_serial_session(&mut serial);
         let _ = cleanup_child_for_exit(authorities, &mut transactions, &mut child);
         close_authorities(authorities);
@@ -505,6 +545,7 @@ pub fn run(bootstrap: DwHandle) -> Result<u32, u32> {
     }
 
     let result = event_loop(
+        platform,
         authorities,
         &mut transactions,
         &mut model,
@@ -1394,7 +1435,8 @@ fn wait_launch_with_serial(
     }
 }
 
-fn event_loop(
+fn event_loop<P: ConsoledPlatform>(
+    platform: &mut P,
     authorities: StartupAuthorities,
     transactions: &mut TransactionIds,
     model: &mut ConsoleModel,
@@ -1404,7 +1446,6 @@ fn event_loop(
     #[cfg(feature = "wyr1d-selector32")]
     let mut capture = wyrmroot_consoled::selector32::Capture::new(authorities.selector_nonce)
         .map_err(|_| 120u32)?;
-    let mut streams = NativeStreams;
     let mut input_pending = Pending::new();
     let mut output_pending = Pending::new();
     let mut next_data = DataClass::Raw;
@@ -1441,7 +1482,7 @@ fn event_loop(
                 && snapshot.stdout_queued == 0
                 && snapshot.stderr_queued == 0
             {
-                if !streams_freshly_quiet(&mut streams, child, model)? {
+                if !streams_freshly_quiet(platform, child, model)? {
                     // The quiet poll staged more native output. Reserve it
                     // before waiting so it can immediately reach serial TX.
                     continue;
@@ -1450,12 +1491,14 @@ fn event_loop(
                     wyrmroot_consoled::quiesce_control::Message::Quiesced(identity),
                 )
                 .map_err(|_| 128u32)?;
-                send_channel(authorities.recovery_control, &ack, &[]).map_err(|_| 128u32)?;
+                platform
+                    .send_channel(authorities.recovery_control, &ack, &[])
+                    .map_err(|_| 128u32)?;
                 recovery_acknowledged = true;
             }
         }
 
-        let now = monotonic_active_now().map_err(|_| 53u32)?;
+        let now = platform.monotonic_active_now().map_err(|_| 53u32)?;
         // Stability is time-based, not idleness-based. Continuous serial or
         // child traffic must not prevent the exact READY tuple from clearing
         // an expired child-restart window.
@@ -1587,7 +1630,7 @@ fn event_loop(
             }
         }
 
-        let observed = match wait_many(&items[..used], DwDeadline(deadline)) {
+        let observed = match platform.wait_many(&items[..used], DwDeadline(deadline)) {
             Ok(observed) => observed,
             Err(NativeError::Status(status)) if status == DW_STATUS_TIMED_OUT => {
                 observe_exact_ready(model, serial, child, 55)?;
@@ -1630,7 +1673,7 @@ fn event_loop(
                 if signals & DW_SIGNAL_READABLE.0 == 0 {
                     return Err(127);
                 }
-                recovery_request = Some(receive_recovery_request(authorities, child)?);
+                recovery_request = Some(receive_recovery_request(platform, authorities, child)?);
                 next_data = DataClass::Stdout;
                 continue;
             }
@@ -1677,9 +1720,9 @@ fn event_loop(
                 }
                 #[cfg(feature = "wyr1e-wyrmsh")]
                 drain_clean_terminal_output(
+                    platform,
                     authorities,
                     model,
-                    &mut streams,
                     serial,
                     child,
                     &mut output_pending,
@@ -1703,10 +1746,10 @@ fn event_loop(
                 #[cfg(feature = "wyr1e-wyrmsh")]
                 if signals & DW_SIGNAL_PEER_CLOSED.0 != 0 && child.wait.is_some() {
                     if recover_terminal_precursor(
+                        platform,
                         authorities,
                         transactions,
                         model,
-                        &mut streams,
                         serial,
                         child,
                         &mut input_pending,
@@ -1741,10 +1784,10 @@ fn event_loop(
                 #[cfg(feature = "wyr1e-wyrmsh")]
                 if child.wait.is_some() {
                     if recover_terminal_precursor(
+                        platform,
                         authorities,
                         transactions,
                         model,
-                        &mut streams,
                         serial,
                         child,
                         &mut input_pending,
@@ -1778,10 +1821,10 @@ fn event_loop(
                 #[cfg(feature = "wyr1e-wyrmsh")]
                 if signals & DW_SIGNAL_PEER_CLOSED.0 != 0 && child.wait.is_some() {
                     if recover_terminal_precursor(
+                        platform,
                         authorities,
                         transactions,
                         model,
-                        &mut streams,
                         serial,
                         child,
                         &mut input_pending,
@@ -1847,7 +1890,10 @@ fn event_loop(
                         continue;
                     }
                     let mut payload = [0u8; FAIR_SOURCE_BYTES_PER_TURN];
-                    match serial.input.read(&mut streams, &mut payload) {
+                    match serial
+                        .input
+                        .read(&mut ConsoledStreams::new(platform), &mut payload)
+                    {
                         Ok(count) => {
                             #[cfg(feature = "wyr1d-selector32")]
                             if let Some(status) =
@@ -1876,10 +1922,10 @@ fn event_loop(
                     }
                 }
                 if signals & DW_SIGNAL_WRITABLE.0 != 0 && !output_pending.is_empty() {
-                    match serial
-                        .output
-                        .write(&mut streams, &output_pending.bytes[..output_pending.used])
-                    {
+                    match serial.output.write(
+                        &mut ConsoledStreams::new(platform),
+                        &output_pending.bytes[..output_pending.used],
+                    ) {
                         Ok(written) if written == output_pending.used => {
                             commit_output(model, &output_pending)?;
                             #[cfg(feature = "wyr1d-selector32")]
@@ -1913,10 +1959,10 @@ fn event_loop(
             }
             DataClass::Stdin => {
                 if signals & DW_SIGNAL_WRITABLE.0 != 0 && !input_pending.is_empty() {
-                    match child
-                        .stdin
-                        .write(&mut streams, &input_pending.bytes[..input_pending.used])
-                    {
+                    match child.stdin.write(
+                        &mut ConsoledStreams::new(platform),
+                        &input_pending.bytes[..input_pending.used],
+                    ) {
                         Ok(written) if written == input_pending.used => {
                             commit_input(model, &input_pending)?;
                             #[cfg(feature = "wyr1d-selector32")]
@@ -1974,7 +2020,7 @@ fn event_loop(
                     continue;
                 }
                 let mut payload = [0u8; FAIR_SOURCE_BYTES_PER_TURN];
-                match input.read(&mut streams, &mut payload) {
+                match input.read(&mut ConsoledStreams::new(platform), &mut payload) {
                     Ok(count) => {
                         #[cfg(feature = "wyr1d-selector32")]
                         if let Some(status) = capture
@@ -2008,15 +2054,16 @@ fn event_loop(
 }
 
 #[cfg(feature = "wyr1e-wyrmsh")]
-fn drain_clean_terminal_output(
+fn drain_clean_terminal_output<P: ConsoledPlatform>(
+    platform: &mut P,
     authorities: StartupAuthorities,
     model: &mut ConsoleModel,
-    streams: &mut NativeStreams,
     serial: &mut SerialSession,
     child: &mut ChildSession,
     output_pending: &mut Pending,
 ) -> Result<(), u32> {
-    let deadline = monotonic_active_now()
+    let deadline = platform
+        .monotonic_active_now()
         .map_err(|_| 53u32)?
         .checked_add(TERMINAL_DRAIN_TIMEOUT_NS)
         .ok_or(54u32)?;
@@ -2076,7 +2123,9 @@ fn drain_clean_terminal_output(
             count += 1;
             Some(index)
         };
-        let observed = wait_many(&items[..count], DwDeadline(deadline)).map_err(|_| 64u32)?;
+        let observed = platform
+            .wait_many(&items[..count], DwDeadline(deadline))
+            .map_err(|_| 64u32)?;
         let index = usize::try_from(observed.index).map_err(|_| 64u32)?;
         if output_index == Some(index) {
             if observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 != 0
@@ -2084,10 +2133,10 @@ fn drain_clean_terminal_output(
             {
                 return Err(64);
             }
-            match serial
-                .output
-                .write(streams, &output_pending.bytes[..output_pending.used])
-            {
+            match serial.output.write(
+                &mut ConsoledStreams::new(platform),
+                &output_pending.bytes[..output_pending.used],
+            ) {
                 Ok(written) if written == output_pending.used => {
                     commit_output(model, output_pending)?;
                     output_pending.clear();
@@ -2110,7 +2159,7 @@ fn drain_clean_terminal_output(
         };
         input.observe_wait(observed.observed).map_err(|_| 64u32)?;
         let mut payload = [0u8; FAIR_SOURCE_BYTES_PER_TURN];
-        match input.read(streams, &mut payload) {
+        match input.read(&mut ConsoledStreams::new(platform), &mut payload) {
             Ok(count) => model
                 .stage_child_output(child.event, source, &payload[..count])
                 .map_err(|_| 60u32)?,
@@ -2124,11 +2173,11 @@ fn drain_clean_terminal_output(
 
 #[cfg(feature = "wyr1e-wyrmsh")]
 #[allow(clippy::too_many_arguments)]
-fn recover_terminal_precursor(
+fn recover_terminal_precursor<P: ConsoledPlatform>(
+    platform: &mut P,
     authorities: StartupAuthorities,
     transactions: &mut TransactionIds,
     model: &mut ConsoleModel,
-    streams: &mut NativeStreams,
     serial: &mut SerialSession,
     child: &mut ChildSession,
     input_pending: &mut Pending,
@@ -2140,7 +2189,7 @@ fn recover_terminal_precursor(
     ) {
         return Err(62);
     }
-    drain_clean_terminal_output(authorities, model, streams, serial, child, output_pending)?;
+    drain_clean_terminal_output(platform, authorities, model, serial, child, output_pending)?;
     recover_terminal_child(
         authorities,
         transactions,
@@ -2153,13 +2202,15 @@ fn recover_terminal_precursor(
 }
 
 #[cfg(feature = "wyr1e8-recovery")]
-fn receive_recovery_request(
+fn receive_recovery_request<P: ConsoledPlatform>(
+    platform: &mut P,
     authorities: StartupAuthorities,
     child: &ChildSession,
 ) -> Result<wyrmroot_consoled::quiesce_control::Identity, u32> {
     let mut bytes = [0_u8; wyrmroot_consoled::quiesce_control::FRAME_BYTES];
     let mut handles = [DwReceivedHandleInfoV1::default(); 1];
-    let counts = receive_channel(authorities.recovery_control, &mut bytes, &mut handles)
+    let counts = platform
+        .receive_channel(authorities.recovery_control, &mut bytes, &mut handles)
         .map_err(|_| 127u32)?;
     if counts.bytes != bytes.len() || counts.handles != 0 {
         close_received(&handles, counts.handles);
@@ -2182,11 +2233,12 @@ fn receive_recovery_request(
 }
 
 #[cfg(feature = "wyr1e8-recovery")]
-fn streams_freshly_quiet(
-    streams: &mut NativeStreams,
+fn streams_freshly_quiet<P: ConsoledPlatform>(
+    platform: &mut P,
     child: &mut ChildSession,
     model: &mut ConsoleModel,
 ) -> Result<bool, u32> {
+    let streams = &mut ConsoledStreams::new(platform);
     model
         .poll_output_quiescence(child.event, |source, payload| {
             let input = match source {
@@ -2203,12 +2255,17 @@ fn streams_freshly_quiet(
 }
 
 #[cfg(feature = "wyr1d-selector32")]
-fn selector_configure(channel: DwHandle) -> Result<u64, u32> {
+fn selector_configure<P: ConsoledPlatform>(
+    platform: &mut P,
+    channel: DwHandle,
+) -> Result<u64, u32> {
     use wyrmroot_consoled::selector32::{CONFIGURE, STATUS_BYTES, Status};
     wait_readable(channel).map_err(|_| 120u32)?;
     let mut bytes = [0; STATUS_BYTES];
     let mut handles = [DwReceivedHandleInfoV1::default(); 1];
-    let counts = receive_channel(channel, &mut bytes, &mut handles).map_err(|_| 120u32)?;
+    let counts = platform
+        .receive_channel(channel, &mut bytes, &mut handles)
+        .map_err(|_| 120u32)?;
     if counts.bytes != STATUS_BYTES || counts.handles != 0 {
         close_received(&handles, counts.handles);
         return Err(120);
