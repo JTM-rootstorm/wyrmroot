@@ -49,13 +49,17 @@ fn historical_policy_remains_an_explicit_three_stream_launch() {
     }
 }
 
+/// Source text: no host test drives consoled's role yet. The status close
+/// names its `platform` argument since S2U step 3 threaded the platform.
 #[test]
 fn retained_status_endpoint_is_closed_before_streams_and_replacement() {
     let close_function = NATIVE
         .split_once("fn close_child_streams")
         .expect("close function")
         .1;
-    let status = close_function.find("close_child_status(child)").unwrap();
+    let status = close_function
+        .find("close_child_status(platform, child)")
+        .unwrap();
     let streams = close_function
         .find("child.stdin.endpoint().handle()")
         .unwrap();

@@ -46,8 +46,7 @@ use wyrmroot_registry_proto::{
 use wyrmroot_runtime::{
     BOOTSTRAP_CHANNEL_EXPECTATION, ChannelPlatform, ClockPlatform, HandlePlatform, NativeError,
     NativeInput, NativeOutput, ReceiveCounts, StreamEndpoint, StreamError, StreamSystem,
-    WYR0_I_SUPERVISION_POLICY, WaitPlatform, close_handle, monotonic_active_now,
-    query_capability_info, receive_channel, send_channel, validate_bootstrap_channel, wait_one,
+    WYR0_I_SUPERVISION_POLICY, WaitPlatform, validate_bootstrap_channel,
 };
 
 /// The base every failure step of [`run`] is reported under, as the
@@ -154,7 +153,7 @@ fn observe_release_witness<P: ConsoledPlatform>(
         let mut bytes = [0u8; 1];
         let mut handles = [DwReceivedHandleInfoV1::default(); 1];
         if let Ok(counts) = platform.receive_channel(witness, &mut bytes, &mut handles) {
-            close_received(&handles, counts.handles);
+            close_received(platform, &handles, counts.handles);
         }
         return Err(FATAL_ATTACH_BASE | 102);
     }
@@ -462,14 +461,14 @@ pub fn run<P: ConsoledPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result
         .receive_channel(bootstrap, &mut init_bytes, &mut init_handles)
         .map_err(|_| 5u32)?;
     if counts.bytes != CONSOLED_BYTES || counts.handles != 3 {
-        close_received(&init_handles, counts.handles);
+        close_received(platform, &init_handles, counts.handles);
         let _ = platform.close_handle(bootstrap);
         return Err(6);
     }
     let init = match parse_consoled_init(&init_bytes, &init_handles) {
         Ok(init) => init,
         Err(_) => {
-            close_received(&init_handles, 3);
+            close_received(platform, &init_handles, 3);
             let _ = platform.close_handle(bootstrap);
             return Err(7);
         }
@@ -491,7 +490,7 @@ pub fn run<P: ConsoledPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result
         startup_transaction: init.transaction_id,
     };
     if platform.close_handle(init_handles[0].handle).is_err() {
-        close_authorities(authorities);
+        close_authorities(platform, authorities);
         let _ = platform.close_handle(bootstrap);
         return Err(8);
     }
@@ -502,7 +501,7 @@ pub fn run<P: ConsoledPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result
         match attach_serial_bounded(platform, authorities, &mut transactions, &mut model, None) {
             Ok(serial) => serial,
             Err(error) => {
-                close_authorities(authorities);
+                close_authorities(platform, authorities);
                 let _ = platform.close_handle(bootstrap);
                 return Err(error);
             }
@@ -517,16 +516,16 @@ pub fn run<P: ConsoledPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result
         Ok(child) => child,
         Err(error) => {
             let _ = close_serial_session(platform, &mut serial);
-            close_authorities(authorities);
+            close_authorities(platform, authorities);
             let _ = platform.close_handle(bootstrap);
             return Err(error);
         }
     };
     let mut child = child;
-    if observe_exact_ready(&mut model, &serial, &child, 9).is_err() {
+    if observe_exact_ready(platform, &mut model, &serial, &child, 9).is_err() {
         let _ = close_serial_session(platform, &mut serial);
         let _ = cleanup_child_for_exit(platform, authorities, &mut transactions, &mut child);
-        close_authorities(authorities);
+        close_authorities(platform, authorities);
         let _ = platform.close_handle(bootstrap);
         return Err(9);
     }
@@ -541,7 +540,7 @@ pub fn run<P: ConsoledPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result
         Err(_) => {
             let _ = close_serial_session(platform, &mut serial);
             let _ = cleanup_child_for_exit(platform, authorities, &mut transactions, &mut child);
-            close_authorities(authorities);
+            close_authorities(platform, authorities);
             let _ = platform.close_handle(bootstrap);
             return Err(10);
         }
@@ -552,7 +551,7 @@ pub fn run<P: ConsoledPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result
     {
         let _ = close_serial_session(platform, &mut serial);
         let _ = cleanup_child_for_exit(platform, authorities, &mut transactions, &mut child);
-        close_authorities(authorities);
+        close_authorities(platform, authorities);
         let _ = platform.close_handle(bootstrap);
         return Err(11);
     }
@@ -560,7 +559,7 @@ pub fn run<P: ConsoledPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result
     if platform.close_handle(bootstrap).is_err() {
         let _ = close_serial_session(platform, &mut serial);
         let _ = cleanup_child_for_exit(platform, authorities, &mut transactions, &mut child);
-        close_authorities(authorities);
+        close_authorities(platform, authorities);
         return Err(12);
     }
 
@@ -581,7 +580,7 @@ pub fn run<P: ConsoledPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result
         let serial_closed = close_serial_session(platform, &mut serial).is_ok();
         let watch_retired =
             retire_publication_watch(platform, authorities, &mut transactions, &mut serial).is_ok();
-        close_authorities(authorities);
+        close_authorities(platform, authorities);
         return if serial_closed && watch_retired {
             Ok(SESSION_ENDED)
         } else {
@@ -599,9 +598,9 @@ pub fn run<P: ConsoledPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result
             |platform, serial| {
                 retire_publication_watch(platform, authorities, &mut transactions, serial).is_ok()
             },
-            |_, child| close_child_streams(child).is_ok(),
+            |platform, child| close_child_streams(platform, child).is_ok(),
         );
-        close_authorities(authorities);
+        close_authorities(platform, authorities);
         return if !cleaned {
             Err(FATAL_ATTACH_BASE | 104)
         } else {
@@ -625,7 +624,7 @@ fn attach_serial<P: ConsoledPlatform>(
     let connector_transaction = match transactions.take() {
         Ok(value) => value,
         Err(error) => {
-            close_attempt_handles(core::slice::from_ref(&direct))?;
+            close_attempt_handles(platform, core::slice::from_ref(&direct))?;
             return Err(error);
         }
     };
@@ -641,30 +640,50 @@ fn attach_serial<P: ConsoledPlatform>(
         connector_client_transaction: connector_transaction,
     };
     if model.begin_connect(connect_request).is_err() {
-        close_attempt_handles(core::slice::from_ref(&direct))?;
+        close_attempt_handles(platform, core::slice::from_ref(&direct))?;
         return Err(14);
     }
     let mut connector_bytes = [0u8; RECORD_BYTES];
     if encode_connector(request, &mut connector_bytes).is_err() {
-        finish_connect_abort(model, connect_request, core::slice::from_ref(&direct))?;
+        finish_connect_abort(
+            platform,
+            model,
+            connect_request,
+            core::slice::from_ref(&direct),
+        )?;
         return Err(14);
     }
     if platform
         .send_channel(direct, &connector_bytes, &[])
         .is_err()
     {
-        finish_connect_abort(model, connect_request, core::slice::from_ref(&direct))?;
+        finish_connect_abort(
+            platform,
+            model,
+            connect_request,
+            core::slice::from_ref(&direct),
+        )?;
         return Err(15);
     }
-    if wait_readable(direct).is_err() {
-        finish_connect_abort(model, connect_request, core::slice::from_ref(&direct))?;
+    if wait_readable(platform, direct).is_err() {
+        finish_connect_abort(
+            platform,
+            model,
+            connect_request,
+            core::slice::from_ref(&direct),
+        )?;
         return Err(16);
     }
     let mut received = [DwReceivedHandleInfoV1::default(); 1];
     let counts = match platform.receive_channel(direct, &mut connector_bytes, &mut received) {
         Ok(counts) => counts,
         Err(_) => {
-            finish_connect_abort(model, connect_request, core::slice::from_ref(&direct))?;
+            finish_connect_abort(
+                platform,
+                model,
+                connect_request,
+                core::slice::from_ref(&direct),
+            )?;
             return Err(17);
         }
     };
@@ -673,25 +692,25 @@ fn attach_serial<P: ConsoledPlatform>(
         || !valid_received_channel(received[0], CHILD_CHANNEL_RIGHTS)
     {
         let handles = [direct, received[0].handle];
-        finish_connect_abort(model, connect_request, &handles)?;
+        finish_connect_abort(platform, model, connect_request, &handles)?;
         return Err(18);
     }
     let identity = match parse_connector(&connector_bytes) {
         Ok(ConnectorMessage::Connected { identity }) => identity,
         _ => {
             let handles = [direct, received[0].handle];
-            finish_connect_abort(model, connect_request, &handles)?;
+            finish_connect_abort(platform, model, connect_request, &handles)?;
             return Err(20);
         }
     };
     if !valid_connector_identity(identity, publication_generation, connector_transaction) {
         let handles = [direct, received[0].handle];
-        finish_connect_abort(model, connect_request, &handles)?;
+        finish_connect_abort(platform, model, connect_request, &handles)?;
         return Err(21);
     }
-    if validate_exact_channel(received[0].handle, CHILD_CHANNEL_RIGHTS).is_err() {
+    if validate_exact_channel(platform, received[0].handle, CHILD_CHANNEL_RIGHTS).is_err() {
         let handles = [direct, received[0].handle];
-        finish_connect_abort(model, connect_request, &handles)?;
+        finish_connect_abort(platform, model, connect_request, &handles)?;
         return Err(22);
     }
     #[cfg(not(feature = "wyr1e-wyrmsh"))]
@@ -700,14 +719,14 @@ fn attach_serial<P: ConsoledPlatform>(
         let _ = model.abort_connect(connect_request);
         return Err(FATAL_ATTACH_BASE | 23);
     }
-    let attached_at = match now_millis() {
+    let attached_at = match now_millis(platform) {
         Ok(now) => now,
         Err(error) => {
             #[cfg(feature = "wyr1e-wyrmsh")]
             let cleanup = [direct, received[0].handle];
             #[cfg(not(feature = "wyr1e-wyrmsh"))]
             let cleanup = [received[0].handle, DwHandle(0)];
-            finish_connect_abort(model, connect_request, &cleanup)?;
+            finish_connect_abort(platform, model, connect_request, &cleanup)?;
             return Err(error);
         }
     };
@@ -723,7 +742,7 @@ fn attach_serial<P: ConsoledPlatform>(
             let cleanup = [direct, received[0].handle];
             #[cfg(not(feature = "wyr1e-wyrmsh"))]
             let cleanup = [received[0].handle, DwHandle(0)];
-            finish_connect_abort(model, connect_request, &cleanup)?;
+            finish_connect_abort(platform, model, connect_request, &cleanup)?;
             return Err(error);
         }
     };
@@ -741,14 +760,14 @@ fn attach_serial<P: ConsoledPlatform>(
             let cleanup = [direct, received[0].handle];
             #[cfg(not(feature = "wyr1e-wyrmsh"))]
             let cleanup = [received[0].handle, DwHandle(0)];
-            let _ = finish_connect_abort(model, connect_request, &cleanup);
+            let _ = finish_connect_abort(platform, model, connect_request, &cleanup);
             return Err(FATAL_ATTACH_BASE | 24);
         }
         #[cfg(feature = "wyr1e-wyrmsh")]
         let cleanup = [direct, received[0].handle];
         #[cfg(not(feature = "wyr1e-wyrmsh"))]
         let cleanup = [received[0].handle, DwHandle(0)];
-        finish_connect_abort(model, connect_request, &cleanup)?;
+        finish_connect_abort(platform, model, connect_request, &cleanup)?;
         return Err(24);
     }
     Ok(SerialSession {
@@ -808,7 +827,7 @@ fn attach_serial_bounded<P: ConsoledPlatform>(
             Ok(serial) => return Ok(serial),
             Err(error) if error & FATAL_ATTACH_BASE != 0 => return Err(error),
             Err(_) => match model
-                .serial_reconnect_failed(now_millis()?)
+                .serial_reconnect_failed(now_millis(platform)?)
                 .map_err(|_| 25u32)?
             {
                 RecoveryAction::RetrySerialAt(deadline) => {
@@ -845,7 +864,7 @@ fn watch_publication<P: ConsoledPlatform>(
     platform
         .send_channel(authorities.registry, &bytes[..size], &[])
         .map_err(|_| 26u32)?;
-    if wait_readable(authorities.registry).is_err() {
+    if wait_readable(platform, authorities.registry).is_err() {
         return match cancel_registry_watch(platform, authorities, transactions, transaction_id) {
             Ok(Some(generation)) if generation != 0 => Ok(generation),
             Ok(_) => Err(27),
@@ -857,7 +876,7 @@ fn watch_publication<P: ConsoledPlatform>(
         .receive_channel(authorities.registry, &mut bytes, &mut received)
         .map_err(|_| FATAL_ATTACH_BASE | 28)?;
     if counts.handles != 0 {
-        close_attempt_handles(core::slice::from_ref(&received[0].handle))?;
+        close_attempt_handles(platform, core::slice::from_ref(&received[0].handle))?;
         return Err(FATAL_ATTACH_BASE | 29);
     }
     let reply = parse_registry(&bytes[..counts.bytes], 0).map_err(|_| FATAL_ATTACH_BASE | 30)?;
@@ -891,13 +910,13 @@ fn cancel_registry_watch<P: ConsoledPlatform>(
     let mut changed = None;
     let mut received_count = 0;
     while received_count < 2 {
-        wait_readable(authorities.registry).map_err(|_| FATAL_ATTACH_BASE | 30)?;
+        wait_readable(platform, authorities.registry).map_err(|_| FATAL_ATTACH_BASE | 30)?;
         let mut handles = [DwReceivedHandleInfoV1::default(); 1];
         let counts = platform
             .receive_channel(authorities.registry, &mut bytes, &mut handles)
             .map_err(|_| FATAL_ATTACH_BASE | 31)?;
         if counts.handles != 0 {
-            close_attempt_handles(core::slice::from_ref(&handles[0].handle))?;
+            close_attempt_handles(platform, core::slice::from_ref(&handles[0].handle))?;
             return Err(FATAL_ATTACH_BASE | 32);
         }
         let reply =
@@ -960,7 +979,7 @@ fn receive_publication_change<P: ConsoledPlatform>(
         .receive_channel(authorities.registry, &mut bytes, &mut handles)
         .map_err(|_| FATAL_ATTACH_BASE | 35)?;
     if counts.handles != 0 {
-        close_attempt_handles(core::slice::from_ref(&handles[0].handle))?;
+        close_attempt_handles(platform, core::slice::from_ref(&handles[0].handle))?;
         return Err(FATAL_ATTACH_BASE | 35);
     }
     let reply = parse_registry(&bytes[..counts.bytes], 0).map_err(|_| FATAL_ATTACH_BASE | 35)?;
@@ -1025,7 +1044,7 @@ fn lookup_connector<P: ConsoledPlatform>(
     ) {
         Ok(size) => size,
         Err(_) => {
-            close_attempt_handles(&[direct, service])?;
+            close_attempt_handles(platform, &[direct, service])?;
             return Err(34);
         }
     };
@@ -1043,29 +1062,29 @@ fn lookup_connector<P: ConsoledPlatform>(
         .send_channel(authorities.registry, &bytes[..size], &[transfer])
         .is_err()
     {
-        close_attempt_handles(&[direct, service])?;
+        close_attempt_handles(platform, &[direct, service])?;
         return Err(35);
     }
-    if wait_readable(authorities.registry).is_err() {
-        close_attempt_handles(core::slice::from_ref(&direct))?;
+    if wait_readable(platform, authorities.registry).is_err() {
+        close_attempt_handles(platform, core::slice::from_ref(&direct))?;
         return Err(FATAL_ATTACH_BASE | 36);
     }
     let mut received = [DwReceivedHandleInfoV1::default(); 1];
     let counts = match platform.receive_channel(authorities.registry, &mut bytes, &mut received) {
         Ok(counts) => counts,
         Err(_) => {
-            close_attempt_handles(core::slice::from_ref(&direct))?;
+            close_attempt_handles(platform, core::slice::from_ref(&direct))?;
             return Err(FATAL_ATTACH_BASE | 37);
         }
     };
     if counts.handles != 0 {
-        close_attempt_handles(&[direct, received[0].handle])?;
+        close_attempt_handles(platform, &[direct, received[0].handle])?;
         return Err(38);
     }
     let reply = match parse_registry(&bytes[..counts.bytes], 0) {
         Ok(reply) => reply,
         Err(_) => {
-            close_attempt_handles(core::slice::from_ref(&direct))?;
+            close_attempt_handles(platform, core::slice::from_ref(&direct))?;
             return Err(39);
         }
     };
@@ -1076,7 +1095,7 @@ fn lookup_connector<P: ConsoledPlatform>(
         })
         || reply.message != RegistryMessage::Connected
     {
-        close_attempt_handles(core::slice::from_ref(&direct))?;
+        close_attempt_handles(platform, core::slice::from_ref(&direct))?;
         return Err(40);
     }
     Ok(direct)
@@ -1123,8 +1142,8 @@ fn launch_child_once<P: ConsoledPlatform>(
                 child[index] = peer;
             }
             Err(_) => {
-                close_handle_array_reverse(&retained);
-                close_handle_array_reverse(&child);
+                close_handle_array_reverse(platform, &retained);
+                close_handle_array_reverse(platform, &child);
                 return Err(42);
             }
         }
@@ -1132,8 +1151,8 @@ fn launch_child_once<P: ConsoledPlatform>(
     let mut model_launch = match model.begin_child_launch(transaction_id) {
         Ok(launch) => launch,
         Err(_) => {
-            close_handle_array_reverse(&retained);
-            close_handle_array_reverse(&child);
+            close_handle_array_reverse(platform, &retained);
+            close_handle_array_reverse(platform, &child);
             return Err(41);
         }
     };
@@ -1169,7 +1188,7 @@ fn launch_child_once<P: ConsoledPlatform>(
             }) {
                 Ok(session) => Some(session),
                 Err(_) => {
-                    close_status_pair(status_retained, status_child)?;
+                    close_status_pair(platform, status_retained, status_child)?;
                     finish_launch_abort(platform, model, model_launch, &retained, &child, false)?;
                     return Err(42);
                 }
@@ -1194,7 +1213,7 @@ fn launch_child_once<P: ConsoledPlatform>(
             .send_channel(authorities.recovery_control, &bytes, &[])
             .is_err()
         {
-            close_status_pair(status_retained, status_child)?;
+            close_status_pair(platform, status_retained, status_child)?;
             finish_launch_abort(platform, model, model_launch, &retained, &child, false)?;
             return Err(43);
         }
@@ -1228,7 +1247,7 @@ fn launch_child_once<P: ConsoledPlatform>(
     let size = match encoded {
         Ok(size) => size,
         Err(_) => {
-            close_status_pair(status_retained, status_child)?;
+            close_status_pair(platform, status_retained, status_child)?;
             finish_launch_abort(platform, model, model_launch, &retained, &child, false)?;
             return Err(43);
         }
@@ -1249,14 +1268,14 @@ fn launch_child_once<P: ConsoledPlatform>(
         .is_err()
     {
         // Channel MOVE is atomic: a failed send leaves every child peer local.
-        close_status_pair(status_retained, status_child)?;
+        close_status_pair(platform, status_retained, status_child)?;
         finish_launch_abort(platform, model, model_launch, &retained, &child, false)?;
         return Err(44);
     }
     for kind in [StreamKind::Stdin, StreamKind::Stdout, StreamKind::Stderr] {
         if model_launch.move_child_peer(kind).is_err() {
-            close_status_retained(status_retained, status_session.as_mut())?;
-            close_handle_array_reverse(&retained);
+            close_status_retained(platform, status_retained, status_session.as_mut())?;
+            close_handle_array_reverse(platform, &retained);
             // The native MOVE already committed, but no correlated launch
             // response proves revocation. Closing the launch session on fatal
             // process exit is the only truthful cleanup remaining.
@@ -1278,7 +1297,7 @@ fn launch_child_once<P: ConsoledPlatform>(
             let old_serial = serial_correlation(authorities, serial.identity);
             let old_console = model.snapshot().console_generation.ok_or(45u32)?;
             if model
-                .serial_peer_closed(old_serial, old_console, now_millis()?)
+                .serial_peer_closed(old_serial, old_console, now_millis(platform)?)
                 .map_err(|_| 45u32)?
                 != RecoveryAction::None
             {
@@ -1290,27 +1309,27 @@ fn launch_child_once<P: ConsoledPlatform>(
                 match receive_initial_launch(platform, authorities.launch, reservation, policy) {
                     Ok(reply) => reply,
                     Err(_) => {
-                        close_status_retained(status_retained, status_session.as_mut())?;
-                        close_handle_array_reverse(&retained);
+                        close_status_retained(platform, status_retained, status_session.as_mut())?;
+                        close_handle_array_reverse(platform, &retained);
                         return Err(45);
                     }
                 };
             match resolved {
                 LaunchReply::LaunchAccepted(job_id) => {
                     if cleanup_unmodeled_job(platform, authorities, transactions, job_id).is_err() {
-                        close_status_retained(status_retained, status_session.as_mut())?;
-                        close_handle_array_reverse(&retained);
+                        close_status_retained(platform, status_retained, status_session.as_mut())?;
+                        close_handle_array_reverse(platform, &retained);
                         return Err(45);
                     }
                 }
                 LaunchReply::Error(code) if code != LaunchErrorCode::CleanupFailure => {}
                 _ => {
-                    close_status_retained(status_retained, status_session.as_mut())?;
-                    close_handle_array_reverse(&retained);
+                    close_status_retained(platform, status_retained, status_session.as_mut())?;
+                    close_handle_array_reverse(platform, &retained);
                     return Err(45);
                 }
             }
-            close_status_retained(status_retained, status_session.as_mut())?;
+            close_status_retained(platform, status_retained, status_session.as_mut())?;
             finish_launch_abort(platform, model, model_launch, &retained, &child, true)?;
             return match model.take_recovery_action() {
                 Some(RecoveryAction::RetrySerialAt(deadline)) => {
@@ -1320,8 +1339,8 @@ fn launch_child_once<P: ConsoledPlatform>(
             };
         }
         Err(_) => {
-            close_status_retained(status_retained, status_session.as_mut())?;
-            close_handle_array_reverse(&retained);
+            close_status_retained(platform, status_retained, status_session.as_mut())?;
+            close_handle_array_reverse(platform, &retained);
             // Do not complete the model abort without proof that launchd
             // revoked the three moved peers.
             return Err(45);
@@ -1332,13 +1351,13 @@ fn launch_child_once<P: ConsoledPlatform>(
         LaunchReply::Error(code) if code != LaunchErrorCode::CleanupFailure => {
             // An exact correlated rejection is proof that launchd completed
             // cleanup for every moved child peer before replying.
-            close_status_retained(status_retained, status_session.as_mut())?;
+            close_status_retained(platform, status_retained, status_session.as_mut())?;
             finish_launch_abort(platform, model, model_launch, &retained, &child, true)?;
             return Err(47);
         }
         _ => {
-            close_status_retained(status_retained, status_session.as_mut())?;
-            close_handle_array_reverse(&retained);
+            close_status_retained(platform, status_retained, status_session.as_mut())?;
+            close_handle_array_reverse(platform, &retained);
             return Err(47);
         }
     };
@@ -1347,11 +1366,11 @@ fn launch_child_once<P: ConsoledPlatform>(
         Ok(modeled) => modeled,
         Err(_) => {
             if cleanup_unmodeled_job(platform, authorities, transactions, job_id).is_err() {
-                close_status_retained(status_retained, status_session.as_mut())?;
-                close_handle_array_reverse(&retained);
+                close_status_retained(platform, status_retained, status_session.as_mut())?;
+                close_handle_array_reverse(platform, &retained);
                 return Err(49);
             }
-            close_status_retained(status_retained, status_session.as_mut())?;
+            close_status_retained(platform, status_retained, status_session.as_mut())?;
             finish_launch_abort(platform, model, model_launch, &retained, &child, true)?;
             return Err(49);
         }
@@ -1364,9 +1383,9 @@ fn launch_child_once<P: ConsoledPlatform>(
     ) {
         (Ok(stdin), Ok(stdout), Ok(stderr)) => (stdin, stdout, stderr),
         _ => {
-            close_status_retained(status_retained, status_session.as_mut())?;
-            close_handle_array_reverse(&retained);
-            if let Ok(now) = now_millis() {
+            close_status_retained(platform, status_retained, status_session.as_mut())?;
+            close_handle_array_reverse(platform, &retained);
+            if let Ok(now) = now_millis(platform) {
                 let _ = model.wrong_direction_data(event, now);
                 let _ = model.child_streams_closed(event, now);
                 let _ = cleanup_job(platform, authorities, transactions, model, event, job_id);
@@ -1376,26 +1395,26 @@ fn launch_child_once<P: ConsoledPlatform>(
             return Err(50);
         }
     };
-    let ready = match model.observe_child_ready(event, now_millis()?) {
+    let ready = match model.observe_child_ready(event, now_millis(platform)?) {
         Ok(ready) => ready,
         Err(_) => {
-            close_status_retained(status_retained, status_session.as_mut())?;
-            close_handle_array_reverse(&retained);
+            close_status_retained(platform, status_retained, status_session.as_mut())?;
+            close_handle_array_reverse(platform, &retained);
             let _ = cleanup_unmodeled_job(platform, authorities, transactions, job_id);
             return Err(51);
         }
     };
     if EventGeneration::from(ready.ids) != event {
-        close_status_retained(status_retained, status_session.as_mut())?;
-        close_handle_array_reverse(&retained);
+        close_status_retained(platform, status_retained, status_session.as_mut())?;
+        close_handle_array_reverse(platform, &retained);
         let _ = cleanup_unmodeled_job(platform, authorities, transactions, job_id);
         return Err(52);
     }
     let wait = match start_job_wait(platform, authorities, transactions, job_id) {
         Ok(wait) => wait,
         Err(_) => {
-            close_status_retained(status_retained, status_session.as_mut())?;
-            close_handle_array_reverse(&retained);
+            close_status_retained(platform, status_retained, status_session.as_mut())?;
+            close_handle_array_reverse(platform, &retained);
             let _ = cleanup_unmodeled_job(platform, authorities, transactions, job_id);
             return Err(52);
         }
@@ -1488,6 +1507,7 @@ fn wait_launch_with_serial<P: ConsoledPlatform>(
                 return Err(45);
             }
             serve_status(
+                platform,
                 status_endpoint,
                 status_session.as_deref_mut().ok_or(45u32)?,
                 model,
@@ -1581,7 +1601,7 @@ fn event_loop<P: ConsoledPlatform>(
         // Stability is time-based, not idleness-based. Continuous serial or
         // child traffic must not prevent the exact READY tuple from clearing
         // an expired child-restart window.
-        observe_exact_ready(model, serial, child, 55)?;
+        observe_exact_ready(platform, model, serial, child, 55)?;
         let deadline = now.checked_add(EVENT_TICK_NS).ok_or(54u32)?;
         let snapshot = model.snapshot();
         let mut items = [DwWaitItemV1::default(); 13];
@@ -1712,7 +1732,7 @@ fn event_loop<P: ConsoledPlatform>(
         let observed = match platform.wait_many(&items[..used], DwDeadline(deadline)) {
             Ok(observed) => observed,
             Err(NativeError::Status(status)) if status == DW_STATUS_TIMED_OUT => {
-                observe_exact_ready(model, serial, child, 55)?;
+                observe_exact_ready(platform, model, serial, child, 55)?;
                 continue;
             }
             Err(_) => return Err(56),
@@ -1848,7 +1868,7 @@ fn event_loop<P: ConsoledPlatform>(
                 let fault = if signals & DW_SIGNAL_PEER_CLOSED.0 != 0 {
                     ChildFault::Peer(StreamKind::Stdin)
                 } else {
-                    discard_one_record(child.stdin.endpoint().handle());
+                    discard_one_record(platform, child.stdin.endpoint().handle());
                     ChildFault::WrongDirection
                 };
                 recover_child(
@@ -1926,7 +1946,7 @@ fn event_loop<P: ConsoledPlatform>(
                     true
                 } else if signals & DW_SIGNAL_READABLE.0 != 0 {
                     let status = child.status.as_mut().ok_or(61u32)?;
-                    serve_status(status.endpoint, &mut status.session, model).is_err()
+                    serve_status(platform, status.endpoint, &mut status.session, model).is_err()
                 } else {
                     true
                 };
@@ -2277,7 +2297,7 @@ fn recover_terminal_precursor<P: ConsoledPlatform>(
     output_pending: &mut Pending,
 ) -> Result<TerminalOutcome, u32> {
     if !matches!(
-        model.child_terminal_precursor(child.event, now_millis()?),
+        model.child_terminal_precursor(child.event, now_millis(platform)?),
         Ok(RecoveryAction::None)
     ) {
         return Err(62);
@@ -2307,7 +2327,7 @@ fn receive_recovery_request<P: ConsoledPlatform>(
         .receive_channel(authorities.recovery_control, &mut bytes, &mut handles)
         .map_err(|_| 127u32)?;
     if counts.bytes != bytes.len() || counts.handles != 0 {
-        close_received(&handles, counts.handles);
+        close_received(platform, &handles, counts.handles);
         return Err(127);
     }
     let wyrmroot_consoled::quiesce_control::Message::Quiesce(identity) =
@@ -2354,14 +2374,14 @@ fn selector_configure<P: ConsoledPlatform>(
     channel: DwHandle,
 ) -> Result<u64, u32> {
     use wyrmroot_consoled::selector32::{CONFIGURE, STATUS_BYTES, Status};
-    wait_readable(channel).map_err(|_| 120u32)?;
+    wait_readable(platform, channel).map_err(|_| 120u32)?;
     let mut bytes = [0; STATUS_BYTES];
     let mut handles = [DwReceivedHandleInfoV1::default(); 1];
     let counts = platform
         .receive_channel(channel, &mut bytes, &mut handles)
         .map_err(|_| 120u32)?;
     if counts.bytes != STATUS_BYTES || counts.handles != 0 {
-        close_received(&handles, counts.handles);
+        close_received(platform, &handles, counts.handles);
         return Err(120);
     }
     let config = Status::parse(&bytes).map_err(|_| 120u32)?;
@@ -2420,13 +2440,13 @@ fn recover_terminal_child<P: ConsoledPlatform>(
             _ => return Err(61),
         }
     }
-    if !matches!(model.child_terminal(child.event, now_millis()?), Ok(RecoveryAction::ReapChild(job)) if job == child.job_id)
+    if !matches!(model.child_terminal(child.event, now_millis(platform)?), Ok(RecoveryAction::ReapChild(job)) if job == child.job_id)
     {
         return Err(62);
     }
-    let stream_failed = close_child_streams(child).is_err();
+    let stream_failed = close_child_streams(platform, child).is_err();
     let observed_failed = model
-        .child_streams_closed(child.event, now_millis()?)
+        .child_streams_closed(child.event, now_millis(platform)?)
         .is_err();
     input_pending.clear();
     output_pending.clear();
@@ -2451,7 +2471,7 @@ fn recover_terminal_child<P: ConsoledPlatform>(
                 return Ok(TerminalOutcome::SessionEnded);
             }
             *child = launch_child(platform, authorities, transactions, model, serial)?;
-            observe_exact_ready_without_serial(model, child, 65)?;
+            observe_exact_ready_without_serial(platform, model, child, 65)?;
             Ok(TerminalOutcome::Replaced)
         }
         RecoveryAction::Escalate => Err(66),
@@ -2472,19 +2492,21 @@ fn recover_child<P: ConsoledPlatform>(
     fault: ChildFault,
 ) -> Result<(), u32> {
     let action = match fault {
-        ChildFault::Peer(kind) => model.child_peer_closed(child.event, kind, now_millis()?),
-        ChildFault::Status => model.status_peer_closed(child.event, now_millis()?),
-        ChildFault::WrongDirection => model.wrong_direction_data(child.event, now_millis()?),
+        ChildFault::Peer(kind) => model.child_peer_closed(child.event, kind, now_millis(platform)?),
+        ChildFault::Status => model.status_peer_closed(child.event, now_millis(platform)?),
+        ChildFault::WrongDirection => {
+            model.wrong_direction_data(child.event, now_millis(platform)?)
+        }
     }
     .map_err(|_| 62u32)?;
     if !matches!(action, RecoveryAction::TerminateChild(job) if job == child.job_id) {
         return Err(63);
     }
-    close_child_status(child)?;
+    close_child_status(platform, child)?;
     let wait_resolution = cancel_child_wait(platform, authorities, transactions, child)?;
-    let stream_failed = close_child_streams(child).is_err();
+    let stream_failed = close_child_streams(platform, child).is_err();
     let observed_failed = model
-        .child_streams_closed(child.event, now_millis()?)
+        .child_streams_closed(child.event, now_millis(platform)?)
         .is_err();
     if stream_failed || observed_failed {
         return Err(64);
@@ -2512,7 +2534,7 @@ fn recover_child<P: ConsoledPlatform>(
     match cleanup {
         RecoveryAction::ReplaceChild => {
             *child = launch_child(platform, authorities, transactions, model, serial)?;
-            observe_exact_ready_without_serial(model, child, 65)?;
+            observe_exact_ready_without_serial(platform, model, child, 65)?;
             Ok(())
         }
         RecoveryAction::Escalate => Err(66),
@@ -2534,7 +2556,7 @@ fn recover_serial<P: ConsoledPlatform>(
     let old_serial = child.event.serial;
     let old_console = child.event.console_generation;
     let action = model
-        .serial_peer_closed(old_serial, old_console, now_millis()?)
+        .serial_peer_closed(old_serial, old_console, now_millis(platform)?)
         .map_err(|_| 68u32)?;
     if !matches!(action, RecoveryAction::TerminateChild(job) if job == child.job_id) {
         return Err(69);
@@ -2543,9 +2565,9 @@ fn recover_serial<P: ConsoledPlatform>(
     let watch_failed =
         retire_publication_watch(platform, authorities, transactions, serial).is_err();
     let wait_resolution = cancel_child_wait(platform, authorities, transactions, child)?;
-    let streams_failed = close_child_streams(child).is_err();
+    let streams_failed = close_child_streams(platform, child).is_err();
     let observed_failed = model
-        .child_streams_closed(child.event, now_millis()?)
+        .child_streams_closed(child.event, now_millis(platform)?)
         .is_err();
     input_pending.clear();
     output_pending.clear();
@@ -2592,7 +2614,7 @@ fn recover_serial<P: ConsoledPlatform>(
         },
     )?;
     match model
-        .complete_serial_cleanup(old_serial, old_console, now_millis()?)
+        .complete_serial_cleanup(old_serial, old_console, now_millis(platform)?)
         .map_err(|_| 72u32)?
     {
         RecoveryAction::RetrySerialAt(deadline_ms) => {
@@ -2604,7 +2626,7 @@ fn recover_serial<P: ConsoledPlatform>(
                 Some(deadline_ms),
             )?;
             *child = launch_child(platform, authorities, transactions, model, serial)?;
-            observe_exact_ready(model, serial, child, 67)?;
+            observe_exact_ready(platform, model, serial, child, 67)?;
             Ok(())
         }
         RecoveryAction::Escalate => Err(71),
@@ -2644,7 +2666,7 @@ fn cleanup_job<P: ConsoledPlatform>(
     if !matches!(waited, LaunchReply::JobResult { job_id: response, .. } if response == job_id) {
         return Err(75);
     }
-    if !matches!(model.child_terminated(event, now_millis()?), Ok(RecoveryAction::ReapChild(job)) if job == job_id)
+    if !matches!(model.child_terminated(event, now_millis(platform)?), Ok(RecoveryAction::ReapChild(job)) if job == job_id)
     {
         return Err(74);
     }
@@ -2658,7 +2680,9 @@ fn cleanup_job<P: ConsoledPlatform>(
     if !matches!(closed, LaunchReply::Closed(response) if response == job_id) {
         return Err(76);
     }
-    model.child_reaped(event, now_millis()?).map_err(|_| 77)
+    model
+        .child_reaped(event, now_millis(platform)?)
+        .map_err(|_| 77)
 }
 
 fn complete_terminal_reap<P: ConsoledPlatform>(
@@ -2669,7 +2693,7 @@ fn complete_terminal_reap<P: ConsoledPlatform>(
     event: EventGeneration,
     job_id: u64,
 ) -> Result<RecoveryAction, u32> {
-    if !matches!(model.child_terminated(event, now_millis()?), Ok(RecoveryAction::ReapChild(job)) if job == job_id)
+    if !matches!(model.child_terminated(event, now_millis(platform)?), Ok(RecoveryAction::ReapChild(job)) if job == job_id)
     {
         return Err(74);
     }
@@ -2694,7 +2718,9 @@ fn close_reaped_job<P: ConsoledPlatform>(
     if !matches!(closed, LaunchReply::Closed(response) if response == job_id) {
         return Err(76);
     }
-    model.child_reaped(event, now_millis()?).map_err(|_| 77)
+    model
+        .child_reaped(event, now_millis(platform)?)
+        .map_err(|_| 77)
 }
 
 fn cleanup_unmodeled_job<P: ConsoledPlatform>(
@@ -2821,7 +2847,7 @@ fn cleanup_child_for_exit<P: ConsoledPlatform>(
     child: &mut ChildSession,
 ) -> Result<(), u32> {
     let resolution = cancel_child_wait(platform, authorities, transactions, child);
-    let streams_closed = close_child_streams(child);
+    let streams_closed = close_child_streams(platform, child);
     let result = match resolution? {
         ChildWaitResolution::Cancelled => {
             cleanup_unmodeled_job(platform, authorities, transactions, child.job_id)
@@ -2913,14 +2939,14 @@ fn receive_initial_launch<P: ConsoledPlatform>(
     if policy == ChildPolicy::ConsoleEcho {
         return receive_launch(platform, channel, expected);
     }
-    wait_readable(channel).map_err(|_| 75u32)?;
+    wait_readable(platform, channel).map_err(|_| 75u32)?;
     let mut bytes = [0u8; 128];
     let mut handles = [DwReceivedHandleInfoV1::default(); 1];
     let counts = platform
         .receive_channel(channel, &mut bytes, &mut handles)
         .map_err(|_| 76u32)?;
     if counts.handles != 0 {
-        close_received(&handles, counts.handles);
+        close_received(platform, &handles, counts.handles);
         return Err(77);
     }
     let parsed = parse_shell_v1_reply(&bytes[..counts.bytes], 0).map_err(|_| 78u32)?;
@@ -2933,16 +2959,19 @@ fn receive_initial_launch<P: ConsoledPlatform>(
     }
 }
 
-fn serve_status(
+fn serve_status<P: ConsoledPlatform>(
+    platform: &mut P,
     endpoint: DwHandle,
     session: &mut wyrmroot_console_proto::StatusSession,
     model: &ConsoleModel,
 ) -> Result<(), u32> {
     let mut bytes = [0u8; wyrmroot_console_proto::MAX_MESSAGE_BYTES];
     let mut handles = [DwReceivedHandleInfoV1::default(); 1];
-    let counts = receive_channel(endpoint, &mut bytes, &mut handles).map_err(|_| 101u32)?;
+    let counts = platform
+        .receive_channel(endpoint, &mut bytes, &mut handles)
+        .map_err(|_| 101u32)?;
     if counts.handles != 0 {
-        close_received(&handles, counts.handles);
+        close_received(platform, &handles, counts.handles);
         return Err(102);
     }
     let message = &bytes[..counts.bytes];
@@ -2953,7 +2982,7 @@ fn serve_status(
         Err(code) => {
             let size = wyrmroot_console_proto::encode_error(header, code, &mut bytes)
                 .map_err(|_| 104u32)?;
-            return send_status_bounded(endpoint, &bytes[..size], header);
+            return send_status_bounded(platform, endpoint, &bytes[..size], header);
         }
     };
     if decoded != Ok(wyrmroot_console_proto::Message::Query(header)) {
@@ -2963,7 +2992,7 @@ fn serve_status(
             &mut bytes,
         )
         .map_err(|_| 104u32)?;
-        send_status_bounded(endpoint, &bytes[..size], header)?;
+        send_status_bounded(platform, endpoint, &bytes[..size], header)?;
         session.complete(ticket).map_err(|_| 105u32)?;
         return Ok(());
     }
@@ -2976,7 +3005,7 @@ fn serve_status(
                 &mut bytes,
             )
             .map_err(|_| 106u32)?;
-            send_status_bounded(endpoint, &bytes[..size], header)?;
+            send_status_bounded(platform, endpoint, &bytes[..size], header)?;
             session.complete(ticket).map_err(|_| 106u32)?;
             return Ok(());
         }
@@ -2990,25 +3019,27 @@ fn serve_status(
     }
     let size = wyrmroot_console_proto::encode_snapshot(header, snapshot, &mut bytes)
         .map_err(|_| 108u32)?;
-    send_status_bounded(endpoint, &bytes[..size], header)?;
+    send_status_bounded(platform, endpoint, &bytes[..size], header)?;
     session.complete(ticket).map_err(|_| 109)
 }
 
-fn send_status_bounded(
+fn send_status_bounded<P: ConsoledPlatform>(
+    platform: &mut P,
     endpoint: DwHandle,
     bytes: &[u8],
     header: wyrmroot_console_proto::Header,
 ) -> Result<(), u32> {
-    match send_channel(endpoint, bytes, &[]) {
+    match platform.send_channel(endpoint, bytes, &[]) {
         Ok(()) => return Ok(()),
         Err(NativeError::Status(status)) if status == DW_STATUS_WOULD_BLOCK => {}
         Err(_) => return Err(110),
     }
-    let deadline = monotonic_active_now()
+    let deadline = platform
+        .monotonic_active_now()
         .map_err(|_| 110u32)?
         .checked_add(STATUS_SEND_TIMEOUT_NS)
         .ok_or(110u32)?;
-    match wait_one(
+    match platform.wait_one(
         endpoint,
         DwSignals(DW_SIGNAL_WRITABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
         DwDeadline(deadline),
@@ -3017,7 +3048,7 @@ fn send_status_bounded(
             if observed.observed.0 & DW_SIGNAL_WRITABLE.0 != 0
                 && observed.observed.0 & DW_SIGNAL_PEER_CLOSED.0 == 0 =>
         {
-            send_channel(endpoint, bytes, &[]).map_err(|_| 111)
+            platform.send_channel(endpoint, bytes, &[]).map_err(|_| 111)
         }
         Err(NativeError::Status(status)) if status == DW_STATUS_TIMED_OUT => {
             let mut unavailable = [0u8; wyrmroot_console_proto::ERROR_BYTES];
@@ -3026,7 +3057,7 @@ fn send_status_bounded(
                 wyrmroot_console_proto::ErrorCode::Unavailable,
                 &mut unavailable,
             ) {
-                let _ = send_channel(endpoint, &unavailable[..size], &[]);
+                let _ = platform.send_channel(endpoint, &unavailable[..size], &[]);
             }
             Err(112)
         }
@@ -3038,7 +3069,7 @@ fn receive_launch_any<P: ConsoledPlatform>(
     platform: &mut P,
     channel: DwHandle,
 ) -> Result<(LaunchReservation, LaunchReply), u32> {
-    wait_readable(channel).map_err(|_| 75u32)?;
+    wait_readable(platform, channel).map_err(|_| 75u32)?;
     receive_launch_ready(platform, channel)
 }
 
@@ -3052,7 +3083,7 @@ fn receive_launch_ready<P: ConsoledPlatform>(
         .receive_channel(channel, &mut bytes, &mut handles)
         .map_err(|_| 76u32)?;
     if counts.handles != 0 {
-        close_received(&handles, counts.handles);
+        close_received(platform, &handles, counts.handles);
         return Err(77);
     }
     let parsed = parse_launch_message(&bytes[..counts.bytes], 0).map_err(|_| 78u32)?;
@@ -3201,11 +3232,14 @@ fn finish_launch_abort<P: ConsoledPlatform>(
         .map_err(|_| 98)
 }
 
-fn close_attempt_handles(handles: &[DwHandle]) -> Result<(), u32> {
+fn close_attempt_handles<P: ConsoledPlatform>(
+    platform: &mut P,
+    handles: &[DwHandle],
+) -> Result<(), u32> {
     let mut failed = false;
     for handle in handles.iter().rev() {
         if handle.0 != 0 {
-            failed |= close_handle(*handle).is_err();
+            failed |= platform.close_handle(*handle).is_err();
         }
     }
     if failed {
@@ -3215,12 +3249,13 @@ fn close_attempt_handles(handles: &[DwHandle]) -> Result<(), u32> {
     }
 }
 
-fn finish_connect_abort(
+fn finish_connect_abort<P: ConsoledPlatform>(
+    platform: &mut P,
     model: &mut ConsoleModel,
     request: ConnectRequest,
     handles: &[DwHandle],
 ) -> Result<(), u32> {
-    let handles_closed = close_attempt_handles(handles).is_ok();
+    let handles_closed = close_attempt_handles(platform, handles).is_ok();
     let model_released = model.abort_connect(request).is_ok();
     if handles_closed && model_released {
         Ok(())
@@ -3248,7 +3283,7 @@ fn create_reduced_stream_pair<P: ConsoledPlatform>(
         let _ = platform.close_handle(child_broad);
         return Err(84);
     }
-    if validate_exact_channel(retained, CHILD_CHANNEL_RIGHTS).is_err() {
+    if validate_exact_channel(platform, retained, CHILD_CHANNEL_RIGHTS).is_err() {
         let _ = platform.close_handle(child_broad);
         let _ = platform.close_handle(retained);
         return Err(85);
@@ -3323,7 +3358,8 @@ fn serial_correlates(serial: &SerialSession, event: EventGeneration) -> bool {
         && serial.identity.stream_generation == event.serial.stream_generation
 }
 
-fn observe_exact_ready(
+fn observe_exact_ready<P: ConsoledPlatform>(
+    platform: &mut P,
     model: &mut ConsoleModel,
     serial: &SerialSession,
     child: &ChildSession,
@@ -3332,10 +3368,11 @@ fn observe_exact_ready(
     if !serial_correlates(serial, child.event) {
         return Err(error);
     }
-    observe_exact_ready_without_serial(model, child, error)
+    observe_exact_ready_without_serial(platform, model, child, error)
 }
 
-fn observe_exact_ready_without_serial(
+fn observe_exact_ready_without_serial<P: ConsoledPlatform>(
+    platform: &mut P,
     model: &mut ConsoleModel,
     child: &ChildSession,
     error: u32,
@@ -3352,7 +3389,7 @@ fn observe_exact_ready_without_serial(
         return Err(error);
     }
     model
-        .observe_ready(now_millis()?, token)
+        .observe_ready(now_millis(platform)?, token)
         .map(|_| ())
         .map_err(|_| error)
 }
@@ -3365,8 +3402,12 @@ fn valid_received_channel(info: DwReceivedHandleInfoV1, rights: DwRights) -> boo
         && info.reserved == [0; 2]
 }
 
-fn validate_exact_channel(handle: DwHandle, rights: DwRights) -> Result<(), NativeError> {
-    let info = query_capability_info(handle)?;
+fn validate_exact_channel<P: ConsoledPlatform>(
+    platform: &mut P,
+    handle: DwHandle,
+    rights: DwRights,
+) -> Result<(), NativeError> {
+    let info = platform.query_capability_info(handle)?;
     if info.object_type == DW_OBJECT_TYPE_CHANNEL && info.rights == rights {
         Ok(())
     } else {
@@ -3376,13 +3417,17 @@ fn validate_exact_channel(handle: DwHandle, rights: DwRights) -> Result<(), Nati
     }
 }
 
-fn wait_readable(handle: DwHandle) -> Result<(), NativeError> {
-    let deadline = monotonic_active_now()?
+fn wait_readable<P: ConsoledPlatform>(
+    platform: &mut P,
+    handle: DwHandle,
+) -> Result<(), NativeError> {
+    let deadline = platform
+        .monotonic_active_now()?
         .checked_add(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
         .ok_or(NativeError::Output(
             wyrmroot_runtime::NativeOutputError::DeadlineOverflow,
         ))?;
-    let observed = wait_one(
+    let observed = platform.wait_one(
         handle,
         DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
         DwDeadline(deadline),
@@ -3408,79 +3453,94 @@ fn wait_backoff<P: ConsoledPlatform>(
     }
 }
 
-fn discard_one_record(endpoint: DwHandle) {
+fn discard_one_record<P: ConsoledPlatform>(platform: &mut P, endpoint: DwHandle) {
     let mut bytes = [0u8; wyrmroot_stream_proto::MAX_RECORD_BYTES];
     let mut handles = [DwReceivedHandleInfoV1::default(); 1];
-    if let Ok(counts) = receive_channel(endpoint, &mut bytes, &mut handles) {
-        close_received(&handles, counts.handles);
+    if let Ok(counts) = platform.receive_channel(endpoint, &mut bytes, &mut handles) {
+        close_received(platform, &handles, counts.handles);
     }
 }
 
-fn close_child_streams(child: &mut ChildSession) -> Result<(), u32> {
-    let mut failed = close_child_status(child).is_err();
+fn close_child_streams<P: ConsoledPlatform>(
+    platform: &mut P,
+    child: &mut ChildSession,
+) -> Result<(), u32> {
+    let mut failed = close_child_status(platform, child).is_err();
     let handles = [
         child.stdin.endpoint().handle(),
         child.stdout.endpoint().handle(),
         child.stderr.endpoint().handle(),
     ];
     for handle in handles.into_iter().rev() {
-        failed |= close_handle(handle).is_err();
+        failed |= platform.close_handle(handle).is_err();
     }
     if failed { Err(93) } else { Ok(()) }
 }
 
-fn close_child_status(child: &mut ChildSession) -> Result<(), u32> {
+fn close_child_status<P: ConsoledPlatform>(
+    platform: &mut P,
+    child: &mut ChildSession,
+) -> Result<(), u32> {
     let Some(mut status) = child.status.take() else {
         return Ok(());
     };
     status.session.close();
-    close_handle(status.endpoint).map_err(|_| 93)
+    platform.close_handle(status.endpoint).map_err(|_| 93)
 }
 
-fn close_status_retained(
+fn close_status_retained<P: ConsoledPlatform>(
+    platform: &mut P,
     endpoint: DwHandle,
     session: Option<&mut wyrmroot_console_proto::StatusSession>,
 ) -> Result<(), u32> {
     if let Some(session) = session {
         session.close();
     }
-    if endpoint.0 != 0 && close_handle(endpoint).is_err() {
+    if endpoint.0 != 0 && platform.close_handle(endpoint).is_err() {
         Err(93)
     } else {
         Ok(())
     }
 }
 
-fn close_status_pair(retained: DwHandle, child: DwHandle) -> Result<(), u32> {
+fn close_status_pair<P: ConsoledPlatform>(
+    platform: &mut P,
+    retained: DwHandle,
+    child: DwHandle,
+) -> Result<(), u32> {
     let mut failed = false;
     if child.0 != 0 {
-        failed |= close_handle(child).is_err();
+        failed |= platform.close_handle(child).is_err();
     }
     if retained.0 != 0 {
-        failed |= close_handle(retained).is_err();
+        failed |= platform.close_handle(retained).is_err();
     }
     if failed { Err(93) } else { Ok(()) }
 }
 
-fn close_received(handles: &[DwReceivedHandleInfoV1], count: usize) {
+fn close_received<P: ConsoledPlatform>(
+    platform: &mut P,
+    handles: &[DwReceivedHandleInfoV1],
+    count: usize,
+) {
     for info in handles[..count.min(handles.len())].iter().rev() {
         if info.handle.0 != 0 {
-            let _ = close_handle(info.handle);
+            let _ = platform.close_handle(info.handle);
         }
     }
 }
 
-fn close_handle_array_reverse(handles: &[DwHandle]) {
+fn close_handle_array_reverse<P: ConsoledPlatform>(platform: &mut P, handles: &[DwHandle]) {
     for handle in handles.iter().rev() {
         if handle.0 != 0 {
-            let _ = close_handle(*handle);
+            let _ = platform.close_handle(*handle);
         }
     }
 }
 
-fn close_authorities(authorities: StartupAuthorities) {
-    let _ = close_handle(authorities.launch);
-    let _ = close_handle(authorities.registry);
+fn close_authorities<P: ConsoledPlatform>(platform: &mut P, authorities: StartupAuthorities) {
+    let _ = platform.close_handle(authorities.launch);
+    let _ = platform.close_handle(authorities.registry);
 }
 
 const fn wait_item(handle: DwHandle, signals: DwSignals) -> DwWaitItemV1 {
@@ -3494,8 +3554,9 @@ const fn output_kind(source: OutputSource) -> StreamKind {
     }
 }
 
-fn now_millis() -> Result<u64, u32> {
-    monotonic_active_now()
+fn now_millis<P: ConsoledPlatform>(platform: &mut P) -> Result<u64, u32> {
+    platform
+        .monotonic_active_now()
         .map(|now| now / NANOS_PER_MILLI)
         .map_err(|_| 94)
 }
