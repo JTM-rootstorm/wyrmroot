@@ -1593,6 +1593,7 @@ fn named_host_runs(filter: &str) -> Result<Vec<CargoRun>, Failure> {
     Ok(match filter {
         "selectors" => selector_library_commands()
             .into_iter()
+            .chain(role_binary_check_commands())
             .map(|arguments| CargoRun {
                 arguments,
                 selector_nonce: true,
@@ -1983,6 +1984,35 @@ fn selector_library_commands() -> Vec<Vec<String>> {
                 "--features",
                 features,
                 "--lib",
+            ]
+            .map(str::to_owned)
+            .into()
+        })
+        .collect()
+}
+
+/// Every role binary, checked on the host in every feature shape the table
+/// lists for its package (S2U.2 gave each one a host build).
+///
+/// `--bins` builds only the binaries whose `required-features` the shape
+/// enables, so a library-only shape checks nothing extra and needs no
+/// hand-kept exception list. Without these rows a break confined to one cfg
+/// arm of a role's `main.rs` was first seen by the native gates.
+fn role_binary_check_commands() -> Vec<Vec<String>> {
+    feature_combinations()
+        .iter()
+        .filter(|(package, _)| HOST_BUILDABLE_ROLE_PACKAGES.contains(package))
+        .map(|&(package, features)| {
+            [
+                "check",
+                "--locked",
+                "--offline",
+                "--package",
+                package,
+                "--no-default-features",
+                "--features",
+                features,
+                "--bins",
             ]
             .map(str::to_owned)
             .into()
@@ -2735,7 +2765,7 @@ mod tests {
         feature_combinations, host_test_arguments, host_test_commands, is_listed_combination,
         lint_ratchet_shapes,
         named_host_filter, named_host_runs, names_a_test, native_steps, prepare_uefi_target_roots,
-        r1_clippy_command, role_binary_lint_command, r1_status_command, render_uefi_inspection_report, run_verified_report,
+        r1_clippy_command, role_binary_check_commands, role_binary_lint_command, r1_status_command, render_uefi_inspection_report, run_verified_report,
         selector_library_commands, selector32_library_commands, tests_passed,
         validate_regular_artifact, validate_uefi_inspection_report,
         wyr1e8_producer_fixture_command,
@@ -3210,14 +3240,16 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         let selectors = runs("selectors");
-        assert_eq!(
-            selectors.len(),
-            feature_combinations().len()
-                - feature_combinations()
-                    .iter()
-                    .filter(|(package, _)| BINARY_ONLY_PACKAGES.contains(package))
-                    .count()
-        );
+        let libraries = feature_combinations().len()
+            - feature_combinations()
+                .iter()
+                .filter(|(package, _)| BINARY_ONLY_PACKAGES.contains(package))
+                .count();
+        let role_shapes = feature_combinations()
+            .iter()
+            .filter(|(package, _)| HOST_BUILDABLE_ROLE_PACKAGES.contains(package))
+            .count();
+        assert_eq!(selectors.len(), libraries + role_shapes);
         assert!(selectors.iter().all(|run| run.selector_nonce));
         assert_eq!(
             selectors
@@ -3225,6 +3257,9 @@ mod tests {
                 .map(|run| run.arguments)
                 .collect::<Vec<_>>(),
             selector_library_commands()
+                .into_iter()
+                .chain(role_binary_check_commands())
+                .collect::<Vec<_>>()
         );
     }
 
