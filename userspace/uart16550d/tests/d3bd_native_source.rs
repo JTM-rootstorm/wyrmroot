@@ -7,7 +7,13 @@ use wyrmroot_uart16550d as _;
 
 const DRIVER: &str = include_str!("../src/main.rs");
 const DRIVER_POLICY: &str = include_str!("../src/lib.rs");
-const DEVMGR: &str = include_str!("../../devmgr/src/main.rs");
+/// devmgr's role, in its original order: the binary's entry file, then
+/// `role.rs`, which holds everything devmgr's `main.rs` held before S2U step 3.
+/// Source text for the reason each test below gives.
+const DEVMGR: &str = concat!(
+    include_str!("../../devmgr/src/main.rs"),
+    include_str!("../../devmgr/src/role.rs")
+);
 const DEVMGR_MANIFEST: &str = include_str!("../../devmgr/Cargo.toml");
 const RETAINED_MANIFEST: &str = include_str!("../../wyr1-retained-stubs/Cargo.toml");
 

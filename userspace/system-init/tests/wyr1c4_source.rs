@@ -124,7 +124,11 @@ fn c5_driver_attempt_is_parented_under_init_not_the_devmgr_generation() {
 
 #[test]
 fn c6_terminal_facts_are_init_owned_and_bound_to_real_predicates() {
-    let devmgr = include_str!("../../devmgr/src/main.rs");
+    // devmgr's role moved from `main.rs` to `role.rs` in S2U step 3; read both.
+    let devmgr = concat!(
+        include_str!("../../devmgr/src/main.rs"),
+        include_str!("../../devmgr/src/role.rs")
+    );
     assert!(NATIVE_SOURCE.contains("emit_c6_terminal_facts(resident)"));
     assert!(!devmgr.contains("emit_selector29_final_facts"));
     assert!(NATIVE_SOURCE.contains("c6_startup_profiles_exclude_direct_device_authority"));

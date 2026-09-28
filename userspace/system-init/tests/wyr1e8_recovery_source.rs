@@ -11,7 +11,13 @@ use {
 
 const MANIFEST: &str = include_str!("../Cargo.toml");
 const CONSOLED: &str = include_str!("../../consoled/src/main.rs");
-const DEVMGR: &str = include_str!("../../devmgr/src/main.rs");
+/// devmgr's role, in its original order: the binary's entry file, then
+/// `role.rs`, which holds everything devmgr's `main.rs` held before S2U step 3.
+/// Source text for the reason each test below gives.
+const DEVMGR: &str = concat!(
+    include_str!("../../devmgr/src/main.rs"),
+    include_str!("../../devmgr/src/role.rs")
+);
 const UART: &str = include_str!("../../uart16550d/src/main.rs");
 const NATIVE: &str = include_str!("../src/wyr1e_native.rs");
 const RESIDENT: &str = include_str!("../src/wyr1c_native.rs");

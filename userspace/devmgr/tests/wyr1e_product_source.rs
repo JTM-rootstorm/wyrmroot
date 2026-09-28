@@ -4,7 +4,14 @@ use {wyrmroot_loader as _, wyrmroot_registry_proto as _, wyrmroot_runtime as _};
 use {deepwyrm_syscall as _, wyrmroot_device_proto as _, wyrmroot_devmgr as _};
 
 const MANIFEST: &str = include_str!("../Cargo.toml");
-const NATIVE: &str = include_str!("../src/main.rs");
+/// devmgr's role logic, in its original order: the binary's entry file, then
+/// `role.rs`, which holds everything `main.rs` held before S2U step 3. Source
+/// text because the role's decisions are not yet driven by host tests through
+/// the platform seam; S3 converts these rows.
+const NATIVE: &str = concat!(
+    include_str!("../src/main.rs"),
+    include_str!("../src/role.rs")
+);
 
 #[test]
 fn e6_feature_enables_the_neutral_staged_connector_without_selector32() {

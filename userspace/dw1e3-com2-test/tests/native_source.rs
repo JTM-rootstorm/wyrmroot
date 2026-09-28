@@ -1,7 +1,13 @@
 use wyrmroot_dw1e3_com2_test as _;
 
 const PROBE: &str = include_str!("../src/main.rs");
-const DEVMGR: &str = include_str!("../../devmgr/src/main.rs");
+/// devmgr's role, in its original order: the binary's entry file, then
+/// `role.rs`, which holds everything devmgr's `main.rs` held before S2U step 3.
+/// Source text for the reason each test below gives.
+const DEVMGR: &str = concat!(
+    include_str!("../../devmgr/src/main.rs"),
+    include_str!("../../devmgr/src/role.rs")
+);
 const SYSTEM_INIT: &str = include_str!("../../system-init/src/wyr1c_native.rs");
 
 #[test]

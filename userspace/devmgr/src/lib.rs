@@ -13,6 +13,8 @@ use wyrmroot_dw1e3_com2_test as _;
 pub mod connector;
 #[cfg(feature = "wyr1d-selector32")]
 pub mod d5_drain;
+#[cfg(feature = "native-devmgr")]
+pub mod role;
 pub mod staging;
 
 #[cfg(feature = "native-devmgr")]
