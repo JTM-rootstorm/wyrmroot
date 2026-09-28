@@ -282,9 +282,8 @@ fn driver_function(name: &str) -> &'static str {
     &DRIVER[start..start + end]
 }
 
-/// Source text because the role's send and teardown path still calls the
-/// runtime's free syscall wrappers, so no host test can drive it yet (S2U
-/// step 3 gives it a seam; S3 converts this test). That a sent record commits
+/// Source text until S3: the role runs over the platform seam, but no
+/// RecordingPlatform script drives this path yet. That a sent record commits
 /// is held by the host test
 /// `send_peer_close_preserves_final_inbound_data_until_empty_queue_proof` in lib.rs.
 #[test]
@@ -306,7 +305,7 @@ fn native_stream_and_teardown_paths_preserve_commit_and_close_order() {
         .find("device_pio_write(driver.resource().handle, 1, 1, 0)")
         .expect("graceful shutdown no longer disables the device");
     let release = shutdown
-        .find("release_driver(driver, control, result)")
+        .find("release_driver(platform, driver, control, result)")
         .expect("graceful shutdown no longer releases the driver");
     assert!(disable < release);
 
@@ -365,7 +364,7 @@ fn ordinary_retire_drains_raw_tx_and_temt_before_ier_zero_release() {
         .expect("IER zero readback")
         + complete;
     let release = DRIVER[complete..]
-        .find("release_driver(driver, control, 0)")
+        .find("release_driver(platform, driver, control, 0)")
         .expect("release after readback")
         + complete;
     assert!(retire < start && start < service);
@@ -461,7 +460,7 @@ fn a_lost_control_peer_orphans_the_driver_instead_of_shutting_it_down() {
         .unwrap()
         + arm;
     let post_retire = loop_body[peer_closed..]
-        .find("if graceful_retire.is_some() {\n                    return graceful_shutdown(driver, control, 0);")
+        .find("if graceful_retire.is_some() {\n                    return graceful_shutdown(platform, driver, control, 0);")
         .unwrap()
         + peer_closed;
     let orphan = loop_body[peer_closed..].find("orphaned = true;").unwrap() + peer_closed;
@@ -509,7 +508,7 @@ fn a_lost_control_peer_orphans_the_driver_instead_of_shutting_it_down() {
         .unwrap();
     assert!(
         DRIVER[admitted..]
-            .find("return graceful_shutdown(driver, control, 0);")
+            .find("return graceful_shutdown(platform, driver, control, 0);")
             .unwrap()
             < DRIVER[admitted..]
                 .find("service_graceful_retire_drain(")

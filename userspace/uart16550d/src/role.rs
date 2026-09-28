@@ -50,8 +50,8 @@ use wyrmroot_loader::launch::{
 use wyrmroot_runtime::Dw1e3ReportEvent;
 use wyrmroot_runtime::{
     BOOTSTRAP_CHANNEL_EXPECTATION, ChannelPlatform, ClockPlatform, DevicePlatform,
-    EvidencePlatform, HandlePlatform, NativeError, WaitPlatform, close_handle, device_pio_write,
-    native_error_code, validate_bootstrap_channel,
+    EvidencePlatform, HandlePlatform, NativeError, WaitPlatform, native_error_code,
+    validate_bootstrap_channel,
 };
 use wyrmroot_stream_proto::MAX_RECORD_BYTES;
 #[cfg(feature = "dw1e3-selector31")]
@@ -154,13 +154,13 @@ pub fn run<P: UartPlatform, D: DevicePlatform>(
             CHILD_CHANNEL_RIGHTS,
         )
     {
-        close_received(&startup_handles, startup_counts.handles);
+        close_received(platform, &startup_handles, startup_counts.handles);
         return Err(4);
     }
     let launch = match parse_device_driver_init(&startup_bytes, &startup_handles) {
         Ok(launch) => launch,
         Err(_) => {
-            close_received(&startup_handles, 2);
+            close_received(platform, &startup_handles, 2);
             let _ = platform.close_handle(bootstrap);
             return Err(5);
         }
@@ -204,7 +204,7 @@ pub fn run<P: UartPlatform, D: DevicePlatform>(
         }
     };
     if stage_counts.bytes != DEVICE_STAGE_BYTES || stage_counts.handles != 1 {
-        close_received(&stage_handles, stage_counts.handles);
+        close_received(platform, &stage_handles, stage_counts.handles);
         platform.close_handle(control).map_err(|_| 12u32)?;
         return Err(13);
     }
@@ -290,7 +290,7 @@ pub fn run<P: UartPlatform, D: DevicePlatform>(
             Err(_) => return fail_owned_stage(platform, control, received.handle, 27),
         };
     if counts.bytes != INTERRUPT_STAGE_BYTES || counts.handles != 1 {
-        close_received(&interrupt_handles, counts.handles);
+        close_received(platform, &interrupt_handles, counts.handles);
         let _ = platform.device_pio_write(received.handle, 1, 1, 0);
         return fail_owned_stage(platform, control, received.handle, 28);
     }
@@ -347,7 +347,7 @@ pub fn run<P: UartPlatform, D: DevicePlatform>(
     #[cfg(feature = "dw1e3-selector31")]
     let evidence_nonce = match platform.dw1e3_build_nonce() {
         Ok(nonce) => nonce,
-        Err(_) => return fail_driver(&mut driver, control, 60),
+        Err(_) => return fail_driver(platform, &mut driver, control, 60),
     };
     #[cfg(feature = "dw1e3-selector31")]
     platform
@@ -359,10 +359,10 @@ pub fn run<P: UartPlatform, D: DevicePlatform>(
         .map_err(|_| 61u32)?;
     let ready = match driver.activate() {
         Ok(ready) if !pio_failed.get() => ready,
-        _ => return fail_driver(&mut driver, control, 33),
+        _ => return fail_driver(platform, &mut driver, control, 33),
     };
     if send_control(platform, control, ready).is_err() {
-        return fail_driver(&mut driver, control, 34);
+        return fail_driver(platform, &mut driver, control, 34);
     }
     #[cfg(feature = "dw1e3-selector31")]
     return run_event_loop(platform, &mut driver, control, &pio_failed, evidence_nonce);
@@ -422,13 +422,13 @@ fn run_event_loop<P: UartPlatform, I: ByteRegisterIo>(
             // message is a conflicting post-Retire request.
             let control_signals = match probe_control(platform, control) {
                 Ok(signals) => signals,
-                Err(_) => return fail_driver(driver, control, 36),
+                Err(_) => return fail_driver(platform, driver, control, 36),
             };
             if control_signals.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 {
-                return graceful_shutdown(driver, control, 0);
+                return graceful_shutdown(platform, driver, control, 0);
             }
             if control_signals.0 & DW_SIGNAL_READABLE.0 != 0 {
-                return fail_driver(driver, control, 114);
+                return fail_driver(platform, driver, control, 114);
             }
             let completed = service_graceful_retire_drain(
                 platform,
@@ -442,15 +442,15 @@ fn run_event_loop<P: UartPlatform, I: ByteRegisterIo>(
                 &mut d5,
             );
             match completed {
-                Ok(true) => return complete_graceful_retire(driver, control, pio_failed),
+                Ok(true) => return complete_graceful_retire(platform, driver, control, pio_failed),
                 Ok(false) => {}
-                Err(code) => return fail_driver(driver, control, code),
+                Err(code) => return fail_driver(platform, driver, control, code),
             }
         }
         #[cfg(feature = "wyr1d-selector32")]
         if d5.pending().is_some() {
             if let Err(code) = service_d5_drain(platform, driver, control, pio_failed, &mut d5) {
-                return fail_driver(driver, control, code);
+                return fail_driver(platform, driver, control, code);
             }
         }
         let mut items = [DwWaitItemV1::default(); 3];
@@ -506,12 +506,12 @@ fn run_event_loop<P: UartPlatform, I: ByteRegisterIo>(
         let deadline = if let Some(drain) = graceful_retire {
             let now = match platform.monotonic_active_now() {
                 Ok(now) => now,
-                Err(_) => return fail_driver(driver, control, 112),
+                Err(_) => return fail_driver(platform, driver, control, 112),
             };
             let software_empty = driver.tx_free() == wyrmroot_uart16550_core::RING_CAPACITY;
             let deadline = match drain.wait_deadline(now, software_empty) {
                 Ok(deadline) => deadline,
-                Err(_) => return fail_driver(driver, control, 113),
+                Err(_) => return fail_driver(platform, driver, control, 113),
             };
             DwDeadline(deadline)
         } else {
@@ -534,7 +534,7 @@ fn run_event_loop<P: UartPlatform, I: ByteRegisterIo>(
             // to keep, so the retained-driver rule has nothing to protect.
             // Only devmgr can attach a new stream, and devmgr is gone, so an
             // Interrupt alone would feed a receive ring that no one reads.
-            return graceful_shutdown(driver, control, 0);
+            return graceful_shutdown(platform, driver, control, 0);
         }
         let observed = match platform.wait_many(&items[..count], deadline) {
             Ok(observed) => observed,
@@ -545,11 +545,11 @@ fn run_event_loop<P: UartPlatform, I: ByteRegisterIo>(
             Err(error) if d5.pending().is_some() && status_is(error, DW_STATUS_TIMED_OUT) => {
                 d5_polls += 1;
                 if d5_polls > 2000 {
-                    return fail_driver(driver, control, 102);
+                    return fail_driver(platform, driver, control, 102);
                 }
                 continue;
             }
-            Err(_) => return fail_driver(driver, control, 35),
+            Err(_) => return fail_driver(platform, driver, control, 35),
         };
 
         // Slot 0 is control, 1 the Interrupt, 2 the stream, whether or not
@@ -562,7 +562,7 @@ fn run_event_loop<P: UartPlatform, I: ByteRegisterIo>(
         } else {
             match probe_control(platform, control) {
                 Ok(signals) => signals,
-                Err(_) => return fail_driver(driver, control, 36),
+                Err(_) => return fail_driver(platform, driver, control, 36),
             }
         };
         if slot == 0 || control_signals.0 != 0 {
@@ -573,13 +573,13 @@ fn run_event_loop<P: UartPlatform, I: ByteRegisterIo>(
             };
             if signals.0 & DW_SIGNAL_PEER_CLOSED.0 != 0 {
                 if graceful_retire.is_some() {
-                    return graceful_shutdown(driver, control, 0);
+                    return graceful_shutdown(platform, driver, control, 0);
                 }
                 orphaned = true;
                 continue;
             }
             if graceful_retire.is_some() {
-                return fail_driver(driver, control, 114);
+                return fail_driver(platform, driver, control, 114);
             }
             if signals.0 & DW_SIGNAL_READABLE.0 != 0 {
                 match service_control(platform, driver, control) {
@@ -587,13 +587,13 @@ fn run_event_loop<P: UartPlatform, I: ByteRegisterIo>(
                     Ok(ControlOutcome::Retire) => {
                         let now = match platform.monotonic_active_now() {
                             Ok(now) => now,
-                            Err(_) => return fail_driver(driver, control, 112),
+                            Err(_) => return fail_driver(platform, driver, control, 112),
                         };
                         graceful_retire =
                             match GracefulRetireDrain::new(now, driver.stream_endpoint().is_none())
                             {
                                 Ok(drain) => Some(drain),
-                                Err(_) => return fail_driver(driver, control, 113),
+                                Err(_) => return fail_driver(platform, driver, control, 113),
                             };
                         peer_close_drain.clear();
                         continue;
@@ -604,14 +604,14 @@ fn run_event_loop<P: UartPlatform, I: ByteRegisterIo>(
                             .request(identity, driver.stream_attach_identity())
                             .is_err()
                         {
-                            return fail_driver(driver, control, 103);
+                            return fail_driver(platform, driver, control, 103);
                         }
                         continue;
                     }
                     #[cfg(feature = "dw1e3-selector31")]
                     Ok(ControlOutcome::ChallengeBinding(binding)) => {
                         if evidence.is_some() {
-                            return fail_driver(driver, control, 77);
+                            return fail_driver(platform, driver, control, 77);
                         }
                         let (stream_generation, publication_generation) =
                             driver.stream_generations().ok_or(78u32)?;
@@ -620,12 +620,12 @@ fn run_event_loop<P: UartPlatform, I: ByteRegisterIo>(
                             || binding.publication_generation != publication_generation
                             || binding.stream_generation != stream_generation
                         {
-                            return fail_driver(driver, control, 79);
+                            return fail_driver(platform, driver, control, 79);
                         }
                         let challenge_nonce =
                             match platform.dw1e3_challenge_nonce(binding.challenge_generation) {
                                 Ok(nonce) => nonce,
-                                Err(_) => return fail_driver(driver, control, 80),
+                                Err(_) => return fail_driver(platform, driver, control, 80),
                             };
                         let candidate = EvidenceDrain::new(
                             evidence_nonce,
@@ -635,32 +635,32 @@ fn run_event_loop<P: UartPlatform, I: ByteRegisterIo>(
                         if binding.expected_length != CHALLENGE_BYTES as u64
                             || binding.expected_hash != candidate.expected_hash
                         {
-                            return fail_driver(driver, control, 81);
+                            return fail_driver(platform, driver, control, 81);
                         }
                         evidence = Some(candidate);
                         let mut ready = [0u8; wyrmroot_dw1e3_com2_test::TRANSPORT_EMPTY_FACT_BYTES];
                         if encode_binding_ready(binding, &mut ready).is_err() {
-                            return fail_driver(driver, control, 83);
+                            return fail_driver(platform, driver, control, 83);
                         }
                         if platform.send_channel(control, &ready, &[]).is_err() {
-                            return fail_driver(driver, control, 84);
+                            return fail_driver(platform, driver, control, 84);
                         }
                         continue;
                     }
                     #[cfg(feature = "dw1e3-selector31")]
                     Ok(ControlOutcome::BeginRetire(binding)) => {
                         let Some(evidence) = evidence.as_ref() else {
-                            return fail_driver(driver, control, 85);
+                            return fail_driver(platform, driver, control, 85);
                         };
                         if !same_binding(driver, evidence_nonce, evidence, binding) {
-                            return fail_driver(driver, control, 86);
+                            return fail_driver(platform, driver, control, 86);
                         }
                         driver.begin_selector_retire();
                         if pio_failed.get()
                             || !driver.selector_interrupts_disabled()
                             || pio_failed.get()
                         {
-                            return fail_driver(driver, control, 87);
+                            return fail_driver(platform, driver, control, 87);
                         }
                         if let Some((detached, endpoint)) = driver.detach_stream() {
                             let mut ready =
@@ -670,55 +670,55 @@ fn run_event_loop<P: UartPlatform, I: ByteRegisterIo>(
                             )
                             .is_err()
                             {
-                                return fail_driver(driver, control, 88);
+                                return fail_driver(platform, driver, control, 88);
                             }
                             if platform.close_handle(endpoint.handle).is_err() {
-                                return fail_driver(driver, control, 89);
+                                return fail_driver(platform, driver, control, 89);
                             }
                             if platform.send_channel(control, &ready, &[]).is_err() {
-                                return fail_driver(driver, control, 90);
+                                return fail_driver(platform, driver, control, 90);
                             }
                             let _ = detached;
                             selector_retiring = true;
                             selector_retirement_binding = Some(binding);
                             continue;
                         }
-                        return fail_driver(driver, control, 91);
+                        return fail_driver(platform, driver, control, 91);
                     }
                     #[cfg(feature = "dw1e3-selector31")]
                     Ok(ControlOutcome::FinalizeRetire(binding)) => {
                         if !selector_retiring || selector_retirement_binding != Some(binding) {
-                            return fail_driver(driver, control, 92);
+                            return fail_driver(platform, driver, control, 92);
                         }
-                        return graceful_shutdown(driver, control, 0);
+                        return graceful_shutdown(platform, driver, control, 0);
                     }
-                    Err(code) => return fail_driver(driver, control, code),
+                    Err(code) => return fail_driver(platform, driver, control, code),
                 }
             }
-            return fail_driver(driver, control, 37);
+            return fail_driver(platform, driver, control, 37);
         }
 
         if slot == 1 {
             if observed.observed.0 & DW_SIGNAL_SIGNALED.0 == 0 {
-                return fail_driver(driver, control, 38);
+                return fail_driver(platform, driver, control, 38);
             }
             #[cfg(feature = "dw1e3-selector31")]
             let rx_before = driver.rx_len();
             let drained = match driver.drain_interrupt() {
                 Ok(drained) => drained,
-                Err(_) => return fail_driver(driver, control, 39),
+                Err(_) => return fail_driver(platform, driver, control, 39),
             };
             #[cfg(feature = "dw1e3-selector31")]
             {
                 let mut added = [0u8; CHALLENGE_BYTES];
                 let copied = driver.copy_rx_from(rx_before, &mut added);
                 let Some(evidence) = evidence.as_mut() else {
-                    return fail_driver(driver, control, 63);
+                    return fail_driver(platform, driver, control, 63);
                 };
                 if copied != usize::from(drained.work().received)
                     || evidence.record(platform, &added[..copied]).is_err()
                 {
-                    return fail_driver(driver, control, 63);
+                    return fail_driver(platform, driver, control, 63);
                 }
             }
             let acked = driver.acknowledge_interrupt(drained, !pio_failed.get(), |handle| {
@@ -726,7 +726,7 @@ fn run_event_loop<P: UartPlatform, I: ByteRegisterIo>(
             });
             let work = match acked {
                 Ok(work) => work,
-                Err(_) => return fail_driver(driver, control, 40),
+                Err(_) => return fail_driver(platform, driver, control, 40),
             };
             #[cfg(not(feature = "dw1e3-selector31"))]
             let _ = work;
@@ -752,15 +752,15 @@ fn run_event_loop<P: UartPlatform, I: ByteRegisterIo>(
                 )
                 .is_err()
                 {
-                    return fail_driver(driver, control, 82);
+                    return fail_driver(platform, driver, control, 82);
                 }
                 let Some(evidence) = evidence.as_mut() else {
-                    return fail_driver(driver, control, 83);
+                    return fail_driver(platform, driver, control, 83);
                 };
                 if let Err(code) =
                     prove_transport_empty(platform, driver, control, pio_failed, evidence)
                 {
-                    return fail_driver(driver, control, code);
+                    return fail_driver(platform, driver, control, code);
                 }
             }
             continue;
@@ -806,7 +806,7 @@ fn run_event_loop<P: UartPlatform, I: ByteRegisterIo>(
                         Ok(StreamReadOutcome::EmptyData) => {}
                         Ok(StreamReadOutcome::WouldBlock | StreamReadOutcome::PeerClosed) => {
                             if isolate_stream(platform, driver, control).is_err() {
-                                return fail_driver(driver, control, 41);
+                                return fail_driver(platform, driver, control, 41);
                             }
                             peer_close_drain.clear();
                             break;
@@ -818,7 +818,7 @@ fn run_event_loop<P: UartPlatform, I: ByteRegisterIo>(
                             peer_close_drain.clear();
                             break;
                         }
-                        Err(()) => return fail_driver(driver, control, 42),
+                        Err(()) => return fail_driver(platform, driver, control, 42),
                     }
                 }
                 continue;
@@ -849,12 +849,12 @@ fn run_event_loop<P: UartPlatform, I: ByteRegisterIo>(
                     Ok(StreamReadOutcome::EmptyData) => {}
                     Ok(StreamReadOutcome::PeerClosed | StreamReadOutcome::Detached) => {
                         if isolate_stream(platform, driver, control).is_err() {
-                            return fail_driver(driver, control, 41);
+                            return fail_driver(platform, driver, control, 41);
                         }
                         peer_close_drain.clear();
                         continue;
                     }
-                    Err(()) => return fail_driver(driver, control, 42),
+                    Err(()) => return fail_driver(platform, driver, control, 42),
                 }
             }
             if driver.stream_endpoint().is_some() && observed.observed.0 & DW_SIGNAL_WRITABLE.0 != 0
@@ -865,12 +865,12 @@ fn run_event_loop<P: UartPlatform, I: ByteRegisterIo>(
                         peer_close_drain.clear();
                         continue;
                     }
-                    Err(()) => return fail_driver(driver, control, 43),
+                    Err(()) => return fail_driver(platform, driver, control, 43),
                 }
             }
             continue;
         }
-        return fail_driver(driver, control, 44);
+        return fail_driver(platform, driver, control, 44);
     }
 }
 
@@ -942,16 +942,17 @@ fn service_graceful_retire_drain<P: UartPlatform, I: ByteRegisterIo>(
         .map_err(|_| 113u32)
 }
 
-fn complete_graceful_retire<I: ByteRegisterIo>(
+fn complete_graceful_retire<P: UartPlatform, I: ByteRegisterIo>(
+    platform: &mut P,
     driver: &mut ProductionDriver<I>,
     control: DwHandle,
     pio_failed: &Cell<bool>,
 ) -> Result<u32, u32> {
     driver.begin_graceful_retire();
     if pio_failed.get() || !driver.graceful_retire_interrupts_disabled() || pio_failed.get() {
-        return fail_driver(driver, control, 117);
+        return fail_driver(platform, driver, control, 117);
     }
-    release_driver(driver, control, 0)
+    release_driver(platform, driver, control, 0)
 }
 
 #[cfg(feature = "wyr1d-selector32")]
@@ -1263,13 +1264,13 @@ fn service_control<P: UartPlatform, I: ByteRegisterIo>(
         .receive_channel(control, &mut bytes, &mut handles)
         .map_err(|_| 45u32)?;
     if counts.bytes > bytes.len() || counts.handles > handles.len() {
-        close_received(&handles, counts.handles);
+        close_received(platform, &handles, counts.handles);
         return Err(46);
     }
     #[cfg(feature = "wyr1d-selector32")]
     if counts.bytes == D5_BYTES && bytes[..4] == *b"WDR5" {
         if counts.handles != 0 {
-            close_received(&handles, counts.handles);
+            close_received(platform, &handles, counts.handles);
             return Err(104);
         }
         return match parse_d5(&bytes[..counts.bytes]) {
@@ -1298,7 +1299,7 @@ fn service_control<P: UartPlatform, I: ByteRegisterIo>(
     let message = match parse(&bytes[..counts.bytes]) {
         Ok(message) => message,
         Err(_) => {
-            close_received(&handles, counts.handles);
+            close_received(platform, &handles, counts.handles);
             return Err(47);
         }
     };
@@ -1332,7 +1333,7 @@ fn service_control<P: UartPlatform, I: ByteRegisterIo>(
             Ok(ControlOutcome::Continue)
         }
         _ => {
-            close_received(&handles, counts.handles);
+            close_received(platform, &handles, counts.handles);
             Err(50)
         }
     }
@@ -1373,7 +1374,7 @@ fn service_stream_read<P: UartPlatform, I: ByteRegisterIo>(
         }
     };
     if counts.bytes > bytes.len() || counts.handles > handles.len() {
-        close_received(&handles, counts.handles);
+        close_received(platform, &handles, counts.handles);
         let outcome = detached(driver, StreamDetachCause::Overflow);
         isolate_stream(platform, driver, control)?;
         return Ok(outcome);
@@ -1381,7 +1382,7 @@ fn service_stream_read<P: UartPlatform, I: ByteRegisterIo>(
     let accepted = match driver.accept_stream_record(&bytes[..counts.bytes], counts.handles) {
         Ok(accepted) => accepted,
         Err(error) => {
-            close_received(&handles, counts.handles);
+            close_received(platform, &handles, counts.handles);
             let outcome = detached(driver, StreamDetachCause::Record(error));
             isolate_stream(platform, driver, control)?;
             return Ok(outcome);
@@ -1531,35 +1532,38 @@ fn send_control_status<P: UartPlatform>(
         .map_err(Some)
 }
 
-fn graceful_shutdown<I: ByteRegisterIo>(
+fn graceful_shutdown<P: UartPlatform, I: ByteRegisterIo>(
+    platform: &mut P,
     driver: &mut ProductionDriver<I>,
     control: DwHandle,
     result: u32,
 ) -> Result<u32, u32> {
-    let _ = device_pio_write(driver.resource().handle, 1, 1, 0);
-    release_driver(driver, control, result)
+    let _ = platform.device_pio_write(driver.resource().handle, 1, 1, 0);
+    release_driver(platform, driver, control, result)
 }
 
-fn release_driver<I: ByteRegisterIo>(
+fn release_driver<P: UartPlatform, I: ByteRegisterIo>(
+    platform: &mut P,
     driver: &mut ProductionDriver<I>,
     control: DwHandle,
     result: u32,
 ) -> Result<u32, u32> {
     if let Some((_, endpoint)) = driver.detach_stream() {
-        let _ = close_handle(endpoint.handle);
+        let _ = platform.close_handle(endpoint.handle);
     }
-    let _ = close_handle(driver.interrupt().handle);
-    let _ = close_handle(driver.resource().handle);
-    let _ = close_handle(control);
+    let _ = platform.close_handle(driver.interrupt().handle);
+    let _ = platform.close_handle(driver.resource().handle);
+    let _ = platform.close_handle(control);
     Ok(result)
 }
 
-fn fail_driver<I: ByteRegisterIo>(
+fn fail_driver<P: UartPlatform, I: ByteRegisterIo>(
+    platform: &mut P,
     driver: &mut ProductionDriver<I>,
     control: DwHandle,
     code: u32,
 ) -> Result<u32, u32> {
-    let _ = graceful_shutdown(driver, control, FAILURE_BASE | code);
+    let _ = graceful_shutdown(platform, driver, control, FAILURE_BASE | code);
     Err(code)
 }
 
@@ -1575,9 +1579,13 @@ fn valid_received(
         && info.reserved == [0; 2]
 }
 
-fn close_received(handles: &[DwReceivedHandleInfoV1], count: usize) {
+fn close_received<P: UartPlatform>(
+    platform: &mut P,
+    handles: &[DwReceivedHandleInfoV1],
+    count: usize,
+) {
     for info in handles.iter().take(count) {
-        let _ = close_handle(info.handle);
+        let _ = platform.close_handle(info.handle);
     }
 }
 
@@ -1588,7 +1596,7 @@ fn fail_stage<P: UartPlatform>(
     count: usize,
     code: u32,
 ) -> Result<u32, u32> {
-    close_received(handles, count);
+    close_received(platform, handles, count);
     let _ = platform.close_handle(control);
     Err(code)
 }
