@@ -5,7 +5,14 @@ use wyrmroot_stream_proto as _;
 use wyrmroot_uart16550_core as _;
 use wyrmroot_uart16550d as _;
 
-const DRIVER: &str = include_str!("../src/main.rs");
+/// The driver role, in its original order: the binary's entry file, then
+/// `role.rs`, which holds everything this `main.rs` held before S2U step 3, so
+/// every position and slice below keeps its meaning. Source text for the
+/// reason each test below gives.
+const DRIVER: &str = concat!(
+    include_str!("../src/main.rs"),
+    include_str!("../src/role.rs")
+);
 const DRIVER_POLICY: &str = include_str!("../src/lib.rs");
 /// devmgr's role, in its original order: the binary's entry file, then
 /// `role.rs`, which holds everything devmgr's `main.rs` held before S2U step 3.
@@ -246,17 +253,17 @@ fn send_side_peer_close_enters_receive_drain_before_detach() {
 fn driver_function(name: &str) -> &'static str {
     let start = DRIVER
         .find(&format!("\nfn {name}<"))
-        .unwrap_or_else(|| panic!("main.rs no longer defines {name}"));
+        .unwrap_or_else(|| panic!("the driver role no longer defines {name}"));
     let end = DRIVER[start..]
         .find("\n}\n")
         .unwrap_or_else(|| panic!("{name} has no closing brace"));
     &DRIVER[start..start + end]
 }
 
-/// Source text because `main.rs`'s host build only type-checks the guest
-/// entry (S2U step 2), so no host test can call its send or teardown
-/// path yet (S2U gives it a seam). That a sent record commits is held by the
-/// host test
+/// Source text because the role's send and teardown path still calls the
+/// runtime's free syscall wrappers, so no host test can drive it yet (S2U
+/// step 3 gives it a seam; S3 converts this test). That a sent record commits
+/// is held by the host test
 /// `send_peer_close_preserves_final_inbound_data_until_empty_queue_proof` in lib.rs.
 #[test]
 fn native_stream_and_teardown_paths_preserve_commit_and_close_order() {

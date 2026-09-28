@@ -10,6 +10,8 @@
 
 #[cfg(feature = "wyr1d-selector32")]
 pub mod d5_drain;
+#[cfg(feature = "native-uart16550d")]
+pub mod role;
 
 #[cfg(feature = "dw1e3-selector31")]
 use wyrmroot_dw1e3_com2_test as _;
