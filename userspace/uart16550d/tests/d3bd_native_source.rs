@@ -51,9 +51,13 @@ fn native_loop_checks_control_and_pio_before_interrupt_ack() {
     );
 }
 
+/// Source text until S3: the role runs over the platform seam, but no
+/// RecordingPlatform script drives this path yet.
 #[test]
 fn selector31_allows_an_empty_coalesced_ack_epoch_after_the_challenge_drain() {
-    let record = DRIVER.find("fn record(&mut self, bytes: &[u8])").unwrap();
+    let record = DRIVER
+        .find("fn record<P: UartPlatform>(&mut self, platform: &mut P, bytes: &[u8])")
+        .unwrap();
     let body = &DRIVER[record..];
     let empty = body.find("if bytes.is_empty()").unwrap();
     let reported = body.find("if self.reported").unwrap();
@@ -90,11 +94,15 @@ fn selector31_stage1_blocks_stale_finalize_and_post_ier_interrupt_drains() {
     assert!(begin < ier_readback && ier_readback < stage1_ready);
 }
 
+/// Source text until S3: the role runs over the platform seam, but no
+/// RecordingPlatform script drives this path yet.
 #[test]
 fn selector31_temt_wait_requires_the_timer_signal_and_checks_sticky_pio_after_lsr() {
     let prove = DRIVER.find("fn prove_transport_empty").unwrap();
     let body = &DRIVER[prove..];
-    let waited = body.find("let waited = wait_one(").unwrap();
+    let waited = body
+        .find("let waited = platform\n                .wait_one(")
+        .unwrap();
     let signaled = body[waited..]
         .find("waited.observed.0 & DW_SIGNAL_SIGNALED.0 == 0")
         .unwrap()
@@ -106,6 +114,8 @@ fn selector31_temt_wait_requires_the_timer_signal_and_checks_sticky_pio_after_ls
     assert!(waited < signaled && signaled < lsr && lsr < sticky);
 }
 
+/// Source text until S3: the role runs over the platform seam, but no
+/// RecordingPlatform script drives this path yet.
 #[test]
 fn selector31_rechecks_stream_input_after_final_ack_before_temt() {
     let input_proof = DRIVER.find("fn selector_response_input_drained").unwrap();
@@ -113,7 +123,7 @@ fn selector31_rechecks_stream_input_after_final_ack_before_temt() {
         .find("selector_response_input_drained(driver, control, pio_failed, &mut evidence)")
         .unwrap();
     let temt = DRIVER[post_ack..]
-        .find("prove_transport_empty(driver, control, pio_failed, evidence)")
+        .find("prove_transport_empty(platform, driver, control, pio_failed, evidence)")
         .unwrap()
         + post_ack;
     assert!(post_ack < temt);

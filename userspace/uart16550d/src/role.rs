@@ -46,15 +46,12 @@ use wyrmroot_dw1e3_com2_test::{
 use wyrmroot_loader::launch::{
     CHILD_CHANNEL_RIGHTS, DEVICE_DRIVER_BYTES, SELF_ROOT_RIGHTS, parse_device_driver_init,
 };
+#[cfg(feature = "dw1e3-selector31")]
+use wyrmroot_runtime::Dw1e3ReportEvent;
 use wyrmroot_runtime::{
     BOOTSTRAP_CHANNEL_EXPECTATION, ChannelPlatform, ClockPlatform, DevicePlatform,
     EvidencePlatform, HandlePlatform, NativeError, WaitPlatform, close_handle, device_pio_write,
-    interrupt_ack, monotonic_active_now, native_error_code, receive_channel, send_channel,
-    validate_bootstrap_channel, wait_many,
-};
-#[cfg(feature = "dw1e3-selector31")]
-use wyrmroot_runtime::{
-    Dw1e3ReportEvent, create_timer, dw1e3_challenge_nonce, dw1e3_report, set_timer, wait_one,
+    native_error_code, receive_channel, send_channel, validate_bootstrap_channel, wait_many,
 };
 use wyrmroot_stream_proto::MAX_RECORD_BYTES;
 #[cfg(feature = "dw1e3-selector31")]
@@ -368,9 +365,10 @@ pub fn run<P: UartPlatform, D: DevicePlatform>(
         return fail_driver(&mut driver, control, 34);
     }
     #[cfg(feature = "dw1e3-selector31")]
-    return run_event_loop(&mut driver, control, &pio_failed, evidence_nonce);
+    return run_event_loop(platform, &mut driver, control, &pio_failed, evidence_nonce);
     #[cfg(not(feature = "dw1e3-selector31"))]
     run_event_loop(
+        platform,
         &mut driver,
         control,
         &pio_failed,
@@ -379,7 +377,8 @@ pub fn run<P: UartPlatform, D: DevicePlatform>(
     )
 }
 
-fn run_event_loop<I: ByteRegisterIo>(
+fn run_event_loop<P: UartPlatform, I: ByteRegisterIo>(
+    platform: &mut P,
     driver: &mut ProductionDriver<I>,
     control: DwHandle,
     pio_failed: &Cell<bool>,
@@ -432,6 +431,7 @@ fn run_event_loop<I: ByteRegisterIo>(
                 return fail_driver(driver, control, 114);
             }
             let completed = service_graceful_retire_drain(
+                platform,
                 driver,
                 control,
                 pio_failed,
@@ -449,7 +449,7 @@ fn run_event_loop<I: ByteRegisterIo>(
         }
         #[cfg(feature = "wyr1d-selector32")]
         if d5.pending().is_some() {
-            if let Err(code) = service_d5_drain(driver, control, pio_failed, &mut d5) {
+            if let Err(code) = service_d5_drain(platform, driver, control, pio_failed, &mut d5) {
                 return fail_driver(driver, control, code);
             }
         }
@@ -504,7 +504,7 @@ fn run_event_loop<I: ByteRegisterIo>(
             }
         }
         let deadline = if let Some(drain) = graceful_retire {
-            let now = match monotonic_active_now() {
+            let now = match platform.monotonic_active_now() {
                 Ok(now) => now,
                 Err(_) => return fail_driver(driver, control, 112),
             };
@@ -520,7 +520,8 @@ fn run_event_loop<I: ByteRegisterIo>(
         #[cfg(feature = "wyr1d-selector32")]
         let deadline = if graceful_retire.is_none() && d5.pending().is_some() {
             DwDeadline(
-                monotonic_active_now()
+                platform
+                    .monotonic_active_now()
                     .map_err(|_| 100u32)?
                     .checked_add(1_000_000)
                     .ok_or(101u32)?,
@@ -535,7 +536,7 @@ fn run_event_loop<I: ByteRegisterIo>(
             // Interrupt alone would feed a receive ring that no one reads.
             return graceful_shutdown(driver, control, 0);
         }
-        let observed = match wait_many(&items[..count], deadline) {
+        let observed = match platform.wait_many(&items[..count], deadline) {
             Ok(observed) => observed,
             Err(error) if graceful_retire.is_some() && status_is(error, DW_STATUS_TIMED_OUT) => {
                 continue;
@@ -584,7 +585,7 @@ fn run_event_loop<I: ByteRegisterIo>(
                 match service_control(driver, control) {
                     Ok(ControlOutcome::Continue) => continue,
                     Ok(ControlOutcome::Retire) => {
-                        let now = match monotonic_active_now() {
+                        let now = match platform.monotonic_active_now() {
                             Ok(now) => now,
                             Err(_) => return fail_driver(driver, control, 112),
                         };
@@ -622,7 +623,7 @@ fn run_event_loop<I: ByteRegisterIo>(
                             return fail_driver(driver, control, 79);
                         }
                         let challenge_nonce =
-                            match dw1e3_challenge_nonce(binding.challenge_generation) {
+                            match platform.dw1e3_challenge_nonce(binding.challenge_generation) {
                                 Ok(nonce) => nonce,
                                 Err(_) => return fail_driver(driver, control, 80),
                             };
@@ -641,7 +642,7 @@ fn run_event_loop<I: ByteRegisterIo>(
                         if encode_binding_ready(binding, &mut ready).is_err() {
                             return fail_driver(driver, control, 83);
                         }
-                        if send_channel(control, &ready, &[]).is_err() {
+                        if platform.send_channel(control, &ready, &[]).is_err() {
                             return fail_driver(driver, control, 84);
                         }
                         continue;
@@ -671,10 +672,10 @@ fn run_event_loop<I: ByteRegisterIo>(
                             {
                                 return fail_driver(driver, control, 88);
                             }
-                            if close_handle(endpoint.handle).is_err() {
+                            if platform.close_handle(endpoint.handle).is_err() {
                                 return fail_driver(driver, control, 89);
                             }
-                            if send_channel(control, &ready, &[]).is_err() {
+                            if platform.send_channel(control, &ready, &[]).is_err() {
                                 return fail_driver(driver, control, 90);
                             }
                             let _ = detached;
@@ -715,13 +716,13 @@ fn run_event_loop<I: ByteRegisterIo>(
                     return fail_driver(driver, control, 63);
                 };
                 if copied != usize::from(drained.work().received)
-                    || evidence.record(&added[..copied]).is_err()
+                    || evidence.record(platform, &added[..copied]).is_err()
                 {
                     return fail_driver(driver, control, 63);
                 }
             }
             let acked = driver.acknowledge_interrupt(drained, !pio_failed.get(), |handle| {
-                interrupt_ack(handle).map_err(|_| ())
+                platform.interrupt_ack(handle).map_err(|_| ())
             });
             let work = match acked {
                 Ok(work) => work,
@@ -750,7 +751,9 @@ fn run_event_loop<I: ByteRegisterIo>(
                 let Some(evidence) = evidence.as_mut() else {
                     return fail_driver(driver, control, 83);
                 };
-                if let Err(code) = prove_transport_empty(driver, control, pio_failed, evidence) {
+                if let Err(code) =
+                    prove_transport_empty(platform, driver, control, pio_failed, evidence)
+                {
                     return fail_driver(driver, control, code);
                 }
             }
@@ -861,7 +864,8 @@ fn run_event_loop<I: ByteRegisterIo>(
     }
 }
 
-fn service_graceful_retire_drain<I: ByteRegisterIo>(
+fn service_graceful_retire_drain<P: UartPlatform, I: ByteRegisterIo>(
+    platform: &mut P,
     driver: &mut ProductionDriver<I>,
     control: DwHandle,
     pio_failed: &Cell<bool>,
@@ -906,7 +910,7 @@ fn service_graceful_retire_drain<I: ByteRegisterIo>(
         }
     }
 
-    let now = monotonic_active_now().map_err(|_| 112u32)?;
+    let now = platform.monotonic_active_now().map_err(|_| 112u32)?;
     let software_empty = driver.tx_free() == wyrmroot_uart16550_core::RING_CAPACITY;
     if !drain
         .temt_probe_due(now, software_empty)
@@ -939,7 +943,8 @@ fn complete_graceful_retire<I: ByteRegisterIo>(
 }
 
 #[cfg(feature = "wyr1d-selector32")]
-fn service_d5_drain<I: ByteRegisterIo>(
+fn service_d5_drain<P: UartPlatform, I: ByteRegisterIo>(
+    platform: &mut P,
     driver: &mut ProductionDriver<I>,
     control: DwHandle,
     pio_failed: &Cell<bool>,
@@ -982,7 +987,9 @@ fn service_d5_drain<I: ByteRegisterIo>(
     if let Some(identity) = fence.ready(channel_empty, software_empty, temt) {
         let mut bytes = [0; D5_BYTES];
         encode_d5(D5ControllerMessage::TxDrained(identity), &mut bytes).map_err(|_| 109u32)?;
-        send_channel(control, &bytes, &[]).map_err(|_| 110u32)?;
+        platform
+            .send_channel(control, &bytes, &[])
+            .map_err(|_| 110u32)?;
         fence.sent(identity).map_err(|_| 111u32)?;
     }
     Ok(())
@@ -1044,7 +1051,7 @@ impl EvidenceDrain {
         }
     }
 
-    fn record(&mut self, bytes: &[u8]) -> Result<(), ()> {
+    fn record<P: UartPlatform>(&mut self, platform: &mut P, bytes: &[u8]) -> Result<(), ()> {
         // One physical burst may coalesce while the first pending epoch is
         // being drained. The follow-up ack epoch can therefore contain no new
         // UART bytes; it must remain admissible so the driver can rearm the
@@ -1068,17 +1075,18 @@ impl EvidenceDrain {
             if self.hash != self.expected_hash {
                 return Err(());
             }
-            dw1e3_report(
-                if self.challenge_generation == CHALLENGE_GENERATION {
-                    Dw1e3ReportEvent::Challenge1UartDrain
-                } else {
-                    Dw1e3ReportEvent::Challenge2UartDrain
-                },
-                self.bytes as u64,
-                self.hash,
-                self.nonce,
-            )
-            .map_err(|_| ())?;
+            platform
+                .dw1e3_report(
+                    if self.challenge_generation == CHALLENGE_GENERATION {
+                        Dw1e3ReportEvent::Challenge1UartDrain
+                    } else {
+                        Dw1e3ReportEvent::Challenge2UartDrain
+                    },
+                    self.bytes as u64,
+                    self.hash,
+                    self.nonce,
+                )
+                .map_err(|_| ())?;
             self.reported = true;
         }
         Ok(())
@@ -1145,30 +1153,36 @@ fn same_binding<I: ByteRegisterIo>(
 }
 
 #[cfg(feature = "dw1e3-selector31")]
-fn prove_transport_empty<I: ByteRegisterIo>(
+fn prove_transport_empty<P: UartPlatform, I: ByteRegisterIo>(
+    platform: &mut P,
     driver: &mut ProductionDriver<I>,
     control: DwHandle,
     pio_failed: &Cell<bool>,
     evidence: &mut EvidenceDrain,
 ) -> Result<(), u32> {
     let (stream_generation, publication_generation) = driver.stream_generations().ok_or(64u32)?;
-    let timer = create_timer(DwRights(
-        DW_RIGHT_WAIT.0 | DW_RIGHT_MODIFY.0 | DW_RIGHT_INSPECT.0,
-    ))
-    .map_err(|_| 65u32)?;
+    let timer = platform
+        .create_timer(DwRights(
+            DW_RIGHT_WAIT.0 | DW_RIGHT_MODIFY.0 | DW_RIGHT_INSPECT.0,
+        ))
+        .map_err(|_| 65u32)?;
     let result = (|| {
         for _ in 0..TRANSPORT_EMPTY_TEMT_MAX_POLLS {
-            let deadline = monotonic_active_now()
+            let deadline = platform
+                .monotonic_active_now()
                 .map_err(|_| 66u32)?
                 .checked_add(1_000_000)
                 .ok_or(67u32)?;
-            set_timer(timer, DwDeadline(deadline)).map_err(|_| 68u32)?;
-            let waited = wait_one(
-                timer,
-                DW_SIGNAL_SIGNALED,
-                DwDeadline(deadline.checked_add(1_000_000).ok_or(69u32)?),
-            )
-            .map_err(|_| 70u32)?;
+            platform
+                .set_timer(timer, DwDeadline(deadline))
+                .map_err(|_| 68u32)?;
+            let waited = platform
+                .wait_one(
+                    timer,
+                    DW_SIGNAL_SIGNALED,
+                    DwDeadline(deadline.checked_add(1_000_000).ok_or(69u32)?),
+                )
+                .map_err(|_| 70u32)?;
             if waited.observed.0 & DW_SIGNAL_SIGNALED.0 == 0 {
                 return Err(70);
             }
@@ -1199,14 +1213,16 @@ fn prove_transport_empty<I: ByteRegisterIo>(
                     &mut bytes,
                 )
                 .map_err(|_| 74u32)?;
-                send_channel(control, &bytes, &[]).map_err(|_| 75u32)?;
+                platform
+                    .send_channel(control, &bytes, &[])
+                    .map_err(|_| 75u32)?;
                 evidence.mark_transport_empty();
                 return Ok(());
             }
         }
         Err(76)
     })();
-    let closed = close_handle(timer).map_err(|_| 77u32);
+    let closed = platform.close_handle(timer).map_err(|_| 77u32);
     result.and(closed)
 }
 
