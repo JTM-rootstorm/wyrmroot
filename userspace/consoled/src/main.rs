@@ -272,6 +272,10 @@ enum TerminalOutcome {
     SessionEnded,
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the guest role has no allocator to box into; the outcome is built and consumed once per launch"
+)]
 enum LaunchChildOutcome {
     Child(ChildSession),
     SerialLost(u64),
@@ -1392,8 +1396,8 @@ fn event_loop(
     authorities: StartupAuthorities,
     transactions: &mut TransactionIds,
     model: &mut ConsoleModel,
-    mut serial: &mut SerialSession,
-    mut child: &mut ChildSession,
+    serial: &mut SerialSession,
+    child: &mut ChildSession,
 ) -> Result<u32, u32> {
     #[cfg(feature = "wyr1d-selector32")]
     let mut capture = wyrmroot_consoled::selector32::Capture::new(authorities.selector_nonce)
@@ -1453,7 +1457,7 @@ fn event_loop(
         // Stability is time-based, not idleness-based. Continuous serial or
         // child traffic must not prevent the exact READY tuple from clearing
         // an expired child-restart window.
-        observe_exact_ready(model, &serial, &child, 55)?;
+        observe_exact_ready(model, serial, child, 55)?;
         let deadline = now.checked_add(EVENT_TICK_NS).ok_or(54u32)?;
         let snapshot = model.snapshot();
         let mut items = [DwWaitItemV1::default(); 13];
@@ -1584,7 +1588,7 @@ fn event_loop(
         let observed = match wait_many(&items[..used], DwDeadline(deadline)) {
             Ok(observed) => observed,
             Err(NativeError::Status(status)) if status == DW_STATUS_TIMED_OUT => {
-                observe_exact_ready(model, &serial, &child, 55)?;
+                observe_exact_ready(model, serial, child, 55)?;
                 continue;
             }
             Err(_) => return Err(56),
@@ -1595,8 +1599,8 @@ fn event_loop(
         if witness_index == Some(observed_index) {
             #[cfg(feature = "wyr1e-wyrmsh")]
             {
-                observe_release_witness(&serial, observed.observed)?;
-                drop_orphaned_witness(&mut serial)?;
+                observe_release_witness(serial, observed.observed)?;
+                drop_orphaned_witness(serial)?;
                 continue;
             }
             #[cfg(not(feature = "wyr1e-wyrmsh"))]
@@ -1637,15 +1641,15 @@ fn event_loop(
                 if signals & DW_SIGNAL_PEER_CLOSED.0 != 0 {
                     return Err(57);
                 }
-                if publication_withdrawn(receive_publication_change(authorities, &mut serial)?) {
+                if publication_withdrawn(receive_publication_change(authorities, serial)?) {
                     continue;
                 }
                 recover_serial(
                     authorities,
                     transactions,
                     model,
-                    &mut serial,
-                    &mut child,
+                    serial,
+                    child,
                     &mut input_pending,
                     &mut output_pending,
                 )?;
@@ -1657,8 +1661,8 @@ fn event_loop(
                     authorities,
                     transactions,
                     model,
-                    &mut serial,
-                    &mut child,
+                    serial,
+                    child,
                     &mut input_pending,
                     &mut output_pending,
                 )?;
@@ -1674,16 +1678,16 @@ fn event_loop(
                     authorities,
                     model,
                     &mut streams,
-                    &mut serial,
-                    &mut child,
+                    serial,
+                    child,
                     &mut output_pending,
                 )?;
                 if recover_terminal_child(
                     authorities,
                     transactions,
                     model,
-                    &mut serial,
-                    &mut child,
+                    serial,
+                    child,
                     &mut input_pending,
                     &mut output_pending,
                 )? == TerminalOutcome::SessionEnded
@@ -1701,8 +1705,8 @@ fn event_loop(
                         transactions,
                         model,
                         &mut streams,
-                        &mut serial,
-                        &mut child,
+                        serial,
+                        child,
                         &mut input_pending,
                         &mut output_pending,
                     )? == TerminalOutcome::SessionEnded
@@ -1722,8 +1726,8 @@ fn event_loop(
                     authorities,
                     transactions,
                     model,
-                    &mut serial,
-                    &mut child,
+                    serial,
+                    child,
                     &mut input_pending,
                     &mut output_pending,
                     fault,
@@ -1739,8 +1743,8 @@ fn event_loop(
                         transactions,
                         model,
                         &mut streams,
-                        &mut serial,
-                        &mut child,
+                        serial,
+                        child,
                         &mut input_pending,
                         &mut output_pending,
                     )? == TerminalOutcome::SessionEnded
@@ -1759,8 +1763,8 @@ fn event_loop(
                     authorities,
                     transactions,
                     model,
-                    &mut serial,
-                    &mut child,
+                    serial,
+                    child,
                     &mut input_pending,
                     &mut output_pending,
                     ChildFault::Peer(kind),
@@ -1776,8 +1780,8 @@ fn event_loop(
                         transactions,
                         model,
                         &mut streams,
-                        &mut serial,
-                        &mut child,
+                        serial,
+                        child,
                         &mut input_pending,
                         &mut output_pending,
                     )? == TerminalOutcome::SessionEnded
@@ -1800,8 +1804,8 @@ fn event_loop(
                         authorities,
                         transactions,
                         model,
-                        &mut serial,
-                        &mut child,
+                        serial,
+                        child,
                         &mut input_pending,
                         &mut output_pending,
                         ChildFault::Status,
@@ -1832,8 +1836,8 @@ fn event_loop(
                             authorities,
                             transactions,
                             model,
-                            &mut serial,
-                            &mut child,
+                            serial,
+                            child,
                             &mut input_pending,
                             &mut output_pending,
                         )?;
@@ -1859,8 +1863,8 @@ fn event_loop(
                                 authorities,
                                 transactions,
                                 model,
-                                &mut serial,
-                                &mut child,
+                                serial,
+                                child,
                                 &mut input_pending,
                                 &mut output_pending,
                             )?;
@@ -1895,8 +1899,8 @@ fn event_loop(
                                 authorities,
                                 transactions,
                                 model,
-                                &mut serial,
-                                &mut child,
+                                serial,
+                                child,
                                 &mut input_pending,
                                 &mut output_pending,
                             )?;
@@ -1932,8 +1936,8 @@ fn event_loop(
                                 authorities,
                                 transactions,
                                 model,
-                                &mut serial,
-                                &mut child,
+                                serial,
+                                child,
                                 &mut input_pending,
                                 &mut output_pending,
                                 ChildFault::Peer(StreamKind::Stdin),
@@ -1958,8 +1962,8 @@ fn event_loop(
                         authorities,
                         transactions,
                         model,
-                        &mut serial,
-                        &mut child,
+                        serial,
+                        child,
                         &mut input_pending,
                         &mut output_pending,
                         ChildFault::Peer(output_kind(source)),
@@ -1987,8 +1991,8 @@ fn event_loop(
                             authorities,
                             transactions,
                             model,
-                            &mut serial,
-                            &mut child,
+                            serial,
+                            child,
                             &mut input_pending,
                             &mut output_pending,
                             ChildFault::Peer(output_kind(source)),
@@ -2290,6 +2294,7 @@ fn recover_terminal_child(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn recover_child(
     authorities: StartupAuthorities,
     transactions: &mut TransactionIds,

@@ -1835,6 +1835,8 @@ mod tests {
     /// F3A.7k. devmgr's death also withdraws its publication, and registryd
     /// completes consoled's watch with generation 0. Both registry arms must
     /// keep serving on a withdrawal and rebuild only on a real republication.
+    /// Still a text test: both arms live in `main.rs`'s event loop until S2U
+    /// step 3 moves consoled's decisions behind the platform seam.
     #[test]
     fn a_withdrawn_publication_keeps_the_session_serving() {
         const MAIN: &str = include_str!("main.rs");
@@ -1859,17 +1861,19 @@ mod tests {
                 .expect("a republication no longer rebuilds the session");
             assert!(keep < rebuild);
         }
-        // Exactly the withdrawal test, and exactly `continue` when it holds.
-        for exact in [
-            "ifpublication_withdrawn(receive_publication_change(authorities,&mutserial)?){continue;}",
-            "ifpublication_withdrawn(receive_publication_change(authorities,serial)?){continue;}",
-        ] {
-            assert!(main.contains(exact), "missing exact guard {exact}");
-        }
-        // No registry arm may rebuild without asking first.
-        assert!(
-            !main.contains("receive_publication_change(authorities,&mutserial)?;recover_serial(")
+        // Exactly the withdrawal test, and exactly `continue` when it holds, in
+        // both arms. (Both pass `serial` directly since the event loop's
+        // needless `&mut` reborrow went; see the S2 integration commit.)
+        assert_eq!(
+            main.matches(
+                "ifpublication_withdrawn(receive_publication_change(authorities,serial)?){continue;}"
+            )
+            .count(),
+            2,
+            "a registry arm lost its exact withdrawal guard"
         );
+        // No registry arm may rebuild without asking first.
+        assert!(!main.contains("receive_publication_change(authorities,serial)?;recover_serial("));
         assert!(!main.contains("receive_publication_change(authorities,serial)?;returnOk(LaunchWaitOutcome::SerialLost)"));
     }
 
