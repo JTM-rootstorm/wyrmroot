@@ -14,6 +14,7 @@ mod h_request;
 mod i_b_closure;
 mod lint_ratchet;
 mod metadata;
+mod product_engine;
 mod provenance;
 mod r1;
 mod rrc_audit;
