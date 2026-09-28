@@ -182,7 +182,7 @@ fn e8_intentional_terminal_preserves_failure_validation_and_cleanup_state() {
     assert!(intentional < unexpected);
 
     let retired = driver_branch
-        .find("send_driver_retired(bootstrap, request)?")
+        .find("send_driver_retired(platform, bootstrap, request)?")
         .unwrap();
     let clear = driver_branch.find("e8_retire_requested = false").unwrap();
     let rebind = driver_branch.find("let rebind_deadline =").unwrap();

@@ -39,7 +39,10 @@ fn native_path_keeps_the_c3_launch_surface_hardware_free() {
     assert!(NATIVE.contains("LaunchProfile::DeviceCoordinator"));
     assert!(NATIVE.contains("DEVICE_MANIFEST_RIGHTS"));
     assert!(NATIVE.contains("DW_OBJECT_TYPE_MEMORY_OBJECT"));
-    assert!(NATIVE.contains("send_bootstrap_channel(bootstrap, &ready[..ready_len], &[], 15)"));
+    assert!(
+        NATIVE
+            .contains("send_bootstrap_channel(platform, bootstrap, &ready[..ready_len], &[], 15)")
+    );
     assert!(NATIVE.contains("issue_driver_launch"));
     assert!(NATIVE.contains("parse_constructed"));
     assert!(NATIVE.contains("accept_driver_control_ready"));
@@ -62,7 +65,7 @@ fn c4_claim_path_is_feature_gated_exact_and_stops_before_interrupt_creation() {
     assert!(NATIVE.contains("DEVICE_RESOURCE_CUSTODY_RIGHTS"));
     assert!(NATIVE.contains("device_resource_info(resource)"));
     assert!(NATIVE.contains("admit_device_resource(info)"));
-    assert!(NATIVE.contains("send_publication_acknowledgement(bootstrap, &resident)"));
+    assert!(NATIVE.contains("send_publication_acknowledgement(platform, bootstrap, &resident)"));
     let c4 = &NATIVE[NATIVE
         .find("if action == ControllerAction::InitialPublicationBound")
         .expect("C4 initial binding")..];
@@ -80,11 +83,11 @@ fn c4_claim_path_is_feature_gated_exact_and_stops_before_interrupt_creation() {
         .find("if platform.close_handle(domain).is_err()")
         .expect("domain retirement");
     let status = c4
-        .find("send_publication_acknowledgement(bootstrap, &resident)")
+        .find("send_publication_acknowledgement(platform, bootstrap, &resident)")
         .expect("resource-owned status");
     assert!(feature < claim && claim < owned && owned < metadata);
     assert!(metadata < retire_domain && retire_domain < status);
-    assert!(c4.contains("close_optional(_device_resource.take())"));
+    assert!(c4.contains("close_optional(platform, _device_resource.take())"));
     assert!(NATIVE.contains("#[cfg(not(any("));
     let c4_branch = &NATIVE[..NATIVE.find("fn launch_driver_with_bundle<").unwrap()];
     assert!(!c4_branch.contains("create_interrupt("));
@@ -209,7 +212,7 @@ fn c6_retirement_uses_a_fresh_endpoint_local_registry_transaction() {
 #[test]
 fn c6_inline_publication_rebind_is_acknowledged_before_driver_backoff() {
     let cleanup = &NATIVE[NATIVE
-        .find("send_driver_retired(bootstrap, request)?")
+        .find("send_driver_retired(platform, bootstrap, request)?")
         .expect("driver retirement notification")..];
     let receive = cleanup
         .find("let received = receive_controller")
@@ -218,16 +221,16 @@ fn c6_inline_publication_rebind_is_acknowledged_before_driver_backoff() {
         .find("publication.replace(replacement)")
         .expect("replacement publication install");
     let acknowledge = cleanup
-        .find("send_publication_acknowledgement(bootstrap, &resident)")
+        .find("send_publication_acknowledgement(platform, bootstrap, &resident)")
         .expect("rebind acknowledgement status");
     let acknowledge_failure = cleanup
         .find("if let Err(code) = acknowledged")
         .expect("failed acknowledgement cleanup");
     let close_resource = cleanup
-        .find("close_optional(device_resource.take())")
+        .find("close_optional(platform, device_resource.take())")
         .expect("failed acknowledgement closes the retained resource");
     let close_publication = cleanup
-        .find("close_optional(publication.take())")
+        .find("close_optional(platform, publication.take())")
         .expect("failed acknowledgement closes the replacement publication");
     let close_bootstrap = cleanup
         .find("let _ = platform.close_handle(bootstrap)")
@@ -249,17 +252,19 @@ fn c6_inline_publication_rebind_is_acknowledged_before_driver_backoff() {
     assert!(cleanup_complete < retry);
 }
 
+/// Source text until S3: the role runs over the platform seam, but no
+/// RecordingPlatform script drives this path yet.
 #[test]
 fn publication_acknowledgements_use_the_shared_lifecycle_producer_and_failure_stages() {
-    let sender = &NATIVE[NATIVE.find("fn send_publication_acknowledgement(").unwrap()
-        ..NATIVE.find("fn send_resident_status(").unwrap()];
+    let sender = &NATIVE[NATIVE.find("fn send_publication_acknowledgement<").unwrap()
+        ..NATIVE.find("fn send_resident_status<").unwrap()];
     assert!(sender.contains(".publication_acknowledgement()"));
     assert!(sender.contains("PublicationAcknowledgementError::Lifecycle(_) => failure(35)"));
     assert!(sender.contains("PublicationAcknowledgementError::Encoding(_) => failure(36)"));
-    assert!(sender.contains("send_bootstrap_channel(bootstrap, &bytes, &[], 37)"));
+    assert!(sender.contains("send_bootstrap_channel(platform, bootstrap, &bytes, &[], 37)"));
     assert_eq!(
         NATIVE
-            .matches("send_publication_acknowledgement(bootstrap, &resident)")
+            .matches("send_publication_acknowledgement(platform, bootstrap, &resident)")
             .count(),
         2
     );
@@ -272,16 +277,20 @@ fn selector29_native_path_has_no_physical_device_io_calls() {
     assert!(!NATIVE.contains("interrupt_ack"));
 }
 
+/// Source text until S3: the role runs over the platform seam, but no
+/// RecordingPlatform script drives this path yet.
 #[test]
 fn selector29_fact_delivery_handles_bounded_channel_backpressure() {
-    let send = &NATIVE[NATIVE.find("fn send_bootstrap_channel(").unwrap()..];
-    let send = &send[..send.find("fn send_c6_fact(").unwrap()];
+    let send = &NATIVE[NATIVE.find("fn send_bootstrap_channel<").unwrap()..];
+    let send = &send[..send.find("fn send_c6_fact<").unwrap()];
     assert!(send.contains("for _ in 0..4"));
     assert!(send.contains("DW_STATUS_WOULD_BLOCK"));
     assert!(send.contains("DW_SIGNAL_WRITABLE.0 | DW_SIGNAL_PEER_CLOSED.0"));
     assert!(send.contains("WYR0_I_SUPERVISION_POLICY.ready_timeout_ns"));
     assert!(!send.contains("DW_DEADLINE_INFINITE"));
-    assert!(NATIVE.contains("send_bootstrap_channel(\n        bootstrap,\n        &launch,"));
+    assert!(NATIVE.contains(
+        "send_bootstrap_channel(\n        platform,\n        bootstrap,\n        &launch,"
+    ));
 }
 
 /// Source text until S3: the role runs over the platform seam, but no
@@ -289,10 +298,14 @@ fn selector29_fact_delivery_handles_bounded_channel_backpressure() {
 #[test]
 fn c3_construction_and_control_ready_share_one_finite_deadline() {
     let launch = &NATIVE[NATIVE.find("fn launch_driver<").unwrap()..];
-    let launch = &launch[..launch.find("fn wait_readable(").unwrap()];
+    let launch = &launch[..launch.find("fn wait_readable<").unwrap()];
     let deadline = launch.find("monotonic_deadline_after").unwrap();
-    let ack_wait = launch.find("wait_readable(bootstrap, deadline").unwrap();
-    let direct_wait = launch.find("wait_readable(retained, deadline").unwrap();
+    let ack_wait = launch
+        .find("wait_readable(platform, bootstrap, deadline")
+        .unwrap();
+    let direct_wait = launch
+        .find("wait_readable(platform, retained, deadline")
+        .unwrap();
     assert!(deadline < ack_wait);
     assert!(ack_wait < direct_wait);
     assert!(launch.contains("WYR0_I_SUPERVISION_POLICY.ready_timeout_ns"));
@@ -314,8 +327,10 @@ fn registry_peer_close_preserves_generation_and_uses_explicit_rebind() {
     assert!(peer_closed < report);
     assert!(NATIVE.contains("parse_controller"));
     assert!(NATIVE.contains("RebindPublication"));
-    assert!(NATIVE.contains("validate_fresh(\n                    handles[0].handle,"));
     assert!(NATIVE.contains(
-        "close_optional(publication);\n                    close_optional(driver_control);\n                    let _ = platform.close_handle(bootstrap);"
+        "validate_fresh(\n                    platform,\n                    handles[0].handle,"
+    ));
+    assert!(NATIVE.contains(
+        "close_optional(platform, publication);\n                    close_optional(platform, driver_control);\n                    let _ = platform.close_handle(bootstrap);"
     ));
 }
