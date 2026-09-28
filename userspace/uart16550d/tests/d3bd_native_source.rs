@@ -24,11 +24,13 @@ const DEVMGR: &str = concat!(
 const DEVMGR_MANIFEST: &str = include_str!("../../devmgr/Cargo.toml");
 const RETAINED_MANIFEST: &str = include_str!("../../wyr1-retained-stubs/Cargo.toml");
 
+/// Source text until S3: the role runs over the platform seam, but no
+/// RecordingPlatform script drives this path yet.
 #[test]
 fn native_loop_checks_control_and_pio_before_interrupt_ack() {
     // The probe is skipped once the driver is orphaned, so anchor on the call
     // rather than on the binding that used to wrap it.
-    let probe = DRIVER.find("probe_control(control)").unwrap();
+    let probe = DRIVER.find("probe_control(platform, control)").unwrap();
     let interrupt = DRIVER.find("if slot == 1").unwrap();
     assert!(probe < interrupt);
 
@@ -120,7 +122,9 @@ fn selector31_temt_wait_requires_the_timer_signal_and_checks_sticky_pio_after_ls
 fn selector31_rechecks_stream_input_after_final_ack_before_temt() {
     let input_proof = DRIVER.find("fn selector_response_input_drained").unwrap();
     let post_ack = DRIVER
-        .find("selector_response_input_drained(driver, control, pio_failed, &mut evidence)")
+        .find(
+            "selector_response_input_drained(\n                    platform,\n                    driver,\n                    control,\n                    pio_failed,\n                    &mut evidence,\n                )",
+        )
         .unwrap();
     let temt = DRIVER[post_ack..]
         .find("prove_transport_empty(platform, driver, control, pio_failed, evidence)")
@@ -167,6 +171,8 @@ fn selector31_queue_proof_drains_one_or_many_empty_records_but_rejects_nonempty_
     assert!(clear < empty && empty < reject);
 }
 
+/// Source text until S3: the role runs over the platform seam, but no
+/// RecordingPlatform script drives this path yet.
 #[test]
 fn startup_and_stream_peer_close_precedence_is_explicit() {
     assert_eq!(DRIVER.matches("!startup_control_is_readable(").count(), 2);
@@ -183,7 +189,7 @@ fn startup_and_stream_peer_close_precedence_is_explicit() {
             .unwrap();
     let detach = blocked
         + DRIVER[blocked..]
-            .find("isolate_stream(driver, control)")
+            .find("isolate_stream(platform, driver, control)")
             .unwrap();
     assert!(pending < capacity && capacity < drain && drain < blocked && blocked < detach);
 
@@ -193,6 +199,8 @@ fn startup_and_stream_peer_close_precedence_is_explicit() {
     assert!(suppress < pending);
 }
 
+/// Source text until S3: the role runs over the platform seam, but no
+/// RecordingPlatform script drives this path yet.
 #[test]
 fn selector32_drain_is_post_ack_fresh_queue_and_hardware_proof() {
     let proof = DRIVER
@@ -203,7 +211,7 @@ fn selector32_drain_is_post_ack_fresh_queue_and_hardware_proof() {
         .next()
         .unwrap();
     let receive = proof
-        .find("service_stream_read(driver, control, pio_failed, fence)")
+        .find("service_stream_read(platform, driver, control, pio_failed, fence)")
         .unwrap();
     let empty = proof.find("channel_empty = true").unwrap();
     let software = proof.find("let software_empty").unwrap();
@@ -238,6 +246,8 @@ fn selector32_drain_is_post_ack_fresh_queue_and_hardware_proof() {
     );
 }
 
+/// Source text until S3: the role runs over the platform seam, but no
+/// RecordingPlatform script drives this path yet.
 #[test]
 fn send_side_peer_close_enters_receive_drain_before_detach() {
     let writer_start = DRIVER.find("fn service_stream_write").unwrap();
@@ -253,7 +263,9 @@ fn send_side_peer_close_enters_receive_drain_before_detach() {
         .unwrap();
     assert!(pending_result < resolution);
 
-    let dispatch = DRIVER.find("service_stream_write(driver, control").unwrap();
+    let dispatch = DRIVER
+        .find("service_stream_write(platform, driver, control")
+        .unwrap();
     let suppression = DRIVER.find("!peer_close_drain.is_pending()").unwrap();
     assert!(DRIVER[..dispatch].contains("graceful_retire.is_none()"));
     assert!(suppression < dispatch && dispatch < writer_start);
@@ -311,6 +323,8 @@ fn native_stream_and_teardown_paths_preserve_commit_and_close_order() {
     assert!(stream < interrupt && interrupt < resource && resource < control);
 }
 
+/// Source text until S3: the role runs over the platform seam, but no
+/// RecordingPlatform script drives this path yet.
 #[test]
 fn ordinary_retire_drains_raw_tx_and_temt_before_ier_zero_release() {
     let retire = DRIVER
@@ -362,7 +376,7 @@ fn ordinary_retire_drains_raw_tx_and_temt_before_ier_zero_release() {
     let drain_body = &DRIVER[service..complete];
     assert!(drain_body.contains("temt_probe_due"));
     assert!(drain_body.contains("StreamReadOutcome::PeerClosed"));
-    assert!(!drain_body.contains("isolate_stream(driver, control)"));
+    assert!(!drain_body.contains("isolate_stream(platform, driver, control)"));
     assert!(!drain_body.contains("peer_close_drain"));
 
     let receive = DRIVER
@@ -381,7 +395,7 @@ fn ordinary_retire_drains_raw_tx_and_temt_before_ier_zero_release() {
         .rfind("if let Some(drain) = graceful_retire.as_mut()")
         .expect("pending Retire dispatch");
     let probe = dispatch[pending..]
-        .find("probe_control(control)")
+        .find("probe_control(platform, control)")
         .expect("control probe before drain")
         + pending;
     let queued = dispatch[pending..]
@@ -429,9 +443,10 @@ fn d3_product_gate_cannot_select_the_historical_selector29_actor() {
 /// and the established stream are all retained, and the exact `Retire`
 /// handshake stays the only deliberate way to stop serving.
 ///
-/// This is a source-contract test because the branch lives in the binary's
-/// syscall loop, not in the testable policy library. It pins the structure the
-/// behaviour depends on; the behaviour itself is a live obligation.
+/// Source text until S3: the branch lives in the role's syscall loop, which
+/// now runs over the platform seam, but no RecordingPlatform script drives it
+/// yet. It pins the structure the behaviour depends on; the behaviour itself
+/// is a live obligation.
 #[test]
 fn a_lost_control_peer_orphans_the_driver_instead_of_shutting_it_down() {
     let loop_body = &DRIVER[DRIVER.find("let mut orphaned = false;").unwrap()..];
@@ -472,7 +487,7 @@ fn a_lost_control_peer_orphans_the_driver_instead_of_shutting_it_down() {
 
     // A detach report to a closed control peer is dropped, not a driver
     // failure; any other send error still fails. Both detach paths use it.
-    let report = DRIVER.split("fn report_detached(").nth(1).unwrap();
+    let report = DRIVER.split("fn report_detached<").nth(1).unwrap();
     let report = report.split("\n}\n").next().unwrap();
     assert!(
         report.contains("Err(Some(error)) if status_is(error, DW_STATUS_PEER_CLOSED) => Ok(()),")
@@ -480,11 +495,11 @@ fn a_lost_control_peer_orphans_the_driver_instead_of_shutting_it_down() {
     assert!(report.contains("Err(_) => Err(()),"));
     let isolate = DRIVER.split("fn isolate_stream<").nth(1).unwrap();
     let isolate = isolate.split("\n}\n").next().unwrap();
-    assert!(isolate.contains("report_detached(control, detached)"));
+    assert!(isolate.contains("report_detached(platform, control, detached)"));
     assert!(!isolate.contains("send_control("));
     let writer = DRIVER.split("fn service_stream_write<").nth(1).unwrap();
     let writer = writer.split("\n}\n").next().unwrap();
-    assert!(writer.contains("report_detached(control, detached)?;"));
+    assert!(writer.contains("report_detached(platform, control, detached)?;"));
     assert!(!writer.contains("send_control("));
 
     // The pre-existing post-`Retire` peer-close shutdown at the top of the
@@ -505,6 +520,9 @@ fn a_lost_control_peer_orphans_the_driver_instead_of_shutting_it_down() {
 /// `DIAGNOSTIC_CAUSE_CARRIAGE_CONTRACT.md` §3.2: the receive loop collapses
 /// every detach cause onto one outcome, so each producer records its cause
 /// before the collapse, and before isolation can fail and lose it.
+///
+/// Source text until S3: the role runs over the platform seam, but no
+/// RecordingPlatform script drives this path yet.
 #[test]
 fn every_stream_detach_records_its_cause_before_isolating() {
     let receive = DRIVER.split("fn service_stream_read<").nth(1).unwrap();
@@ -526,10 +544,17 @@ fn every_stream_detach_records_its_cause_before_isolating() {
         let close = site + receive[site..].find("return Ok(outcome);").unwrap();
         let block = &receive[open..close];
         assert_eq!(
-            block.matches("isolate_stream(driver, control)?;").count(),
+            block
+                .matches("isolate_stream(platform, driver, control)?;")
+                .count(),
             1
         );
-        assert!(site - open < block.find("isolate_stream(driver, control)?;").unwrap());
+        assert!(
+            site - open
+                < block
+                    .find("isolate_stream(platform, driver, control)?;")
+                    .unwrap()
+        );
     }
     let helper = DRIVER.split("fn detached<").nth(1).unwrap();
     assert!(

@@ -51,7 +51,7 @@ use wyrmroot_runtime::Dw1e3ReportEvent;
 use wyrmroot_runtime::{
     BOOTSTRAP_CHANNEL_EXPECTATION, ChannelPlatform, ClockPlatform, DevicePlatform,
     EvidencePlatform, HandlePlatform, NativeError, WaitPlatform, close_handle, device_pio_write,
-    native_error_code, receive_channel, send_channel, validate_bootstrap_channel, wait_many,
+    native_error_code, validate_bootstrap_channel,
 };
 use wyrmroot_stream_proto::MAX_RECORD_BYTES;
 #[cfg(feature = "dw1e3-selector31")]
@@ -361,7 +361,7 @@ pub fn run<P: UartPlatform, D: DevicePlatform>(
         Ok(ready) if !pio_failed.get() => ready,
         _ => return fail_driver(&mut driver, control, 33),
     };
-    if send_control(control, ready).is_err() {
+    if send_control(platform, control, ready).is_err() {
         return fail_driver(&mut driver, control, 34);
     }
     #[cfg(feature = "dw1e3-selector31")]
@@ -420,7 +420,7 @@ fn run_event_loop<P: UartPlatform, I: ByteRegisterIo>(
             // overtake a fast transport-empty observation.  Peer loss keeps
             // the established best-effort shutdown behavior; any queued
             // message is a conflicting post-Retire request.
-            let control_signals = match probe_control(control) {
+            let control_signals = match probe_control(platform, control) {
                 Ok(signals) => signals,
                 Err(_) => return fail_driver(driver, control, 36),
             };
@@ -560,7 +560,7 @@ fn run_event_loop<P: UartPlatform, I: ByteRegisterIo>(
         let control_signals = if orphaned {
             DwSignals(0)
         } else {
-            match probe_control(control) {
+            match probe_control(platform, control) {
                 Ok(signals) => signals,
                 Err(_) => return fail_driver(driver, control, 36),
             }
@@ -582,7 +582,7 @@ fn run_event_loop<P: UartPlatform, I: ByteRegisterIo>(
                 return fail_driver(driver, control, 114);
             }
             if signals.0 & DW_SIGNAL_READABLE.0 != 0 {
-                match service_control(driver, control) {
+                match service_control(platform, driver, control) {
                     Ok(ControlOutcome::Continue) => continue,
                     Ok(ControlOutcome::Retire) => {
                         let now = match platform.monotonic_active_now() {
@@ -743,8 +743,14 @@ fn run_event_loop<P: UartPlatform, I: ByteRegisterIo>(
                 // receive queue has no later WRST DATA.  Re-enter receive at
                 // the exact post-ack boundary: only WOULD_BLOCK/clean close
                 // proves no extra record can be hidden behind the response.
-                if selector_response_input_drained(driver, control, pio_failed, &mut evidence)
-                    .is_err()
+                if selector_response_input_drained(
+                    platform,
+                    driver,
+                    control,
+                    pio_failed,
+                    &mut evidence,
+                )
+                .is_err()
                 {
                     return fail_driver(driver, control, 82);
                 }
@@ -777,6 +783,7 @@ fn run_event_loop<P: UartPlatform, I: ByteRegisterIo>(
                 while driver.wants_stream_readable() {
                     #[cfg(feature = "dw1e3-selector31")]
                     let stream_result = service_stream_read(
+                        platform,
                         driver,
                         control,
                         pio_failed,
@@ -786,6 +793,7 @@ fn run_event_loop<P: UartPlatform, I: ByteRegisterIo>(
                     );
                     #[cfg(not(feature = "dw1e3-selector31"))]
                     let stream_result = service_stream_read(
+                        platform,
                         driver,
                         control,
                         pio_failed,
@@ -797,7 +805,7 @@ fn run_event_loop<P: UartPlatform, I: ByteRegisterIo>(
                         #[cfg(feature = "dw1e3-selector31")]
                         Ok(StreamReadOutcome::EmptyData) => {}
                         Ok(StreamReadOutcome::WouldBlock | StreamReadOutcome::PeerClosed) => {
-                            if isolate_stream(driver, control).is_err() {
+                            if isolate_stream(platform, driver, control).is_err() {
                                 return fail_driver(driver, control, 41);
                             }
                             peer_close_drain.clear();
@@ -818,6 +826,7 @@ fn run_event_loop<P: UartPlatform, I: ByteRegisterIo>(
             if readable {
                 #[cfg(feature = "dw1e3-selector31")]
                 let stream_result = service_stream_read(
+                    platform,
                     driver,
                     control,
                     pio_failed,
@@ -827,6 +836,7 @@ fn run_event_loop<P: UartPlatform, I: ByteRegisterIo>(
                 );
                 #[cfg(not(feature = "dw1e3-selector31"))]
                 let stream_result = service_stream_read(
+                    platform,
                     driver,
                     control,
                     pio_failed,
@@ -838,7 +848,7 @@ fn run_event_loop<P: UartPlatform, I: ByteRegisterIo>(
                     #[cfg(feature = "dw1e3-selector31")]
                     Ok(StreamReadOutcome::EmptyData) => {}
                     Ok(StreamReadOutcome::PeerClosed | StreamReadOutcome::Detached) => {
-                        if isolate_stream(driver, control).is_err() {
+                        if isolate_stream(platform, driver, control).is_err() {
                             return fail_driver(driver, control, 41);
                         }
                         peer_close_drain.clear();
@@ -849,7 +859,7 @@ fn run_event_loop<P: UartPlatform, I: ByteRegisterIo>(
             }
             if driver.stream_endpoint().is_some() && observed.observed.0 & DW_SIGNAL_WRITABLE.0 != 0
             {
-                match service_stream_write(driver, control, &mut peer_close_drain) {
+                match service_stream_write(platform, driver, control, &mut peer_close_drain) {
                     Ok(StreamSendAction::Continue) => {}
                     Ok(StreamSendAction::Detached(..)) => {
                         peer_close_drain.clear();
@@ -876,6 +886,7 @@ fn service_graceful_retire_drain<P: UartPlatform, I: ByteRegisterIo>(
     while driver.wants_stream_readable() {
         #[cfg(feature = "dw1e3-selector31")]
         let result = service_stream_read(
+            platform,
             driver,
             control,
             pio_failed,
@@ -885,6 +896,7 @@ fn service_graceful_retire_drain<P: UartPlatform, I: ByteRegisterIo>(
         );
         #[cfg(not(feature = "dw1e3-selector31"))]
         let result = service_stream_read(
+            platform,
             driver,
             control,
             pio_failed,
@@ -962,7 +974,7 @@ fn service_d5_drain<P: UartPlatform, I: ByteRegisterIo>(
     // considering retirement; fresh WOULD_BLOCK is required on every probe.
     let mut channel_empty = false;
     while driver.wants_stream_readable() {
-        match service_stream_read(driver, control, pio_failed, fence) {
+        match service_stream_read(platform, driver, control, pio_failed, fence) {
             Ok(StreamReadOutcome::Accepted) => {}
             Ok(StreamReadOutcome::WouldBlock) => {
                 channel_empty = true;
@@ -996,14 +1008,15 @@ fn service_d5_drain<P: UartPlatform, I: ByteRegisterIo>(
 }
 
 #[cfg(feature = "dw1e3-selector31")]
-fn selector_response_input_drained<I: ByteRegisterIo>(
+fn selector_response_input_drained<P: UartPlatform, I: ByteRegisterIo>(
+    platform: &mut P,
     driver: &mut ProductionDriver<I>,
     control: DwHandle,
     pio_failed: &Cell<bool>,
     evidence: &mut Option<EvidenceDrain>,
 ) -> Result<(), ()> {
     loop {
-        match service_stream_read(driver, control, pio_failed, evidence) {
+        match service_stream_read(platform, driver, control, pio_failed, evidence) {
             // A fresh receive-side empty/closed observation is the only
             // positive proof. Legal empty DATA records are no-ops and must be
             // drained first; any nonempty/handle-bearing/malformed record
@@ -1239,13 +1252,16 @@ enum ControlOutcome {
     FinalizeRetire(ChallengeBinding),
 }
 
-fn service_control<I: ByteRegisterIo>(
+fn service_control<P: UartPlatform, I: ByteRegisterIo>(
+    platform: &mut P,
     driver: &mut ProductionDriver<I>,
     control: DwHandle,
 ) -> Result<ControlOutcome, u32> {
     let mut bytes = [0; DEVICE_STAGE_BYTES];
     let mut handles = [DwReceivedHandleInfoV1::default(); 1];
-    let counts = receive_channel(control, &mut bytes, &mut handles).map_err(|_| 45u32)?;
+    let counts = platform
+        .receive_channel(control, &mut bytes, &mut handles)
+        .map_err(|_| 45u32)?;
     if counts.bytes > bytes.len() || counts.handles > handles.len() {
         close_received(&handles, counts.handles);
         return Err(46);
@@ -1303,13 +1319,13 @@ fn service_control<I: ByteRegisterIo>(
             let ready = match driver.attach_stream(message, endpoint) {
                 Ok(ready) => ready,
                 Err(_) => {
-                    let _ = close_handle(endpoint.handle);
+                    let _ = platform.close_handle(endpoint.handle);
                     return Err(48);
                 }
             };
-            if send_control(control, ready).is_err() {
+            if send_control(platform, control, ready).is_err() {
                 if let Some((_, endpoint)) = driver.detach_stream() {
-                    let _ = close_handle(endpoint.handle);
+                    let _ = platform.close_handle(endpoint.handle);
                 }
                 return Err(49);
             }
@@ -1322,7 +1338,8 @@ fn service_control<I: ByteRegisterIo>(
     }
 }
 
-fn service_stream_read<I: ByteRegisterIo>(
+fn service_stream_read<P: UartPlatform, I: ByteRegisterIo>(
+    platform: &mut P,
     driver: &mut ProductionDriver<I>,
     control: DwHandle,
     pio_failed: &Cell<bool>,
@@ -1334,7 +1351,7 @@ fn service_stream_read<I: ByteRegisterIo>(
     };
     let mut bytes = [0; MAX_RECORD_BYTES];
     let mut handles = [DwReceivedHandleInfoV1::default(); 16];
-    let counts = match receive_channel(endpoint.handle, &mut bytes, &mut handles) {
+    let counts = match platform.receive_channel(endpoint.handle, &mut bytes, &mut handles) {
         Ok(counts) => counts,
         Err(error) if status_is(error, DW_STATUS_WOULD_BLOCK) => {
             return Ok(StreamReadOutcome::WouldBlock);
@@ -1351,14 +1368,14 @@ fn service_stream_read<I: ByteRegisterIo>(
         // of the outcome tell this apart from a normal detach.
         Err(error) => {
             let outcome = detached(driver, StreamDetachCause::Native(native_error_code(error)));
-            isolate_stream(driver, control)?;
+            isolate_stream(platform, driver, control)?;
             return Ok(outcome);
         }
     };
     if counts.bytes > bytes.len() || counts.handles > handles.len() {
         close_received(&handles, counts.handles);
         let outcome = detached(driver, StreamDetachCause::Overflow);
-        isolate_stream(driver, control)?;
+        isolate_stream(platform, driver, control)?;
         return Ok(outcome);
     }
     let accepted = match driver.accept_stream_record(&bytes[..counts.bytes], counts.handles) {
@@ -1366,7 +1383,7 @@ fn service_stream_read<I: ByteRegisterIo>(
         Err(error) => {
             close_received(&handles, counts.handles);
             let outcome = detached(driver, StreamDetachCause::Record(error));
-            isolate_stream(driver, control)?;
+            isolate_stream(platform, driver, control)?;
             return Ok(outcome);
         }
     };
@@ -1416,7 +1433,8 @@ fn detached<I: ByteRegisterIo>(
     StreamReadOutcome::Detached
 }
 
-fn service_stream_write<I: ByteRegisterIo>(
+fn service_stream_write<P: UartPlatform, I: ByteRegisterIo>(
+    platform: &mut P,
     driver: &mut ProductionDriver<I>,
     control: DwHandle,
     peer_close_drain: &mut PeerCloseDrain,
@@ -1428,7 +1446,7 @@ fn service_stream_write<I: ByteRegisterIo>(
     let Some(size) = driver.prepare_stream_send(&mut bytes).map_err(|_| ())? else {
         return Ok(StreamSendAction::Continue);
     };
-    let result = match send_channel(endpoint.handle, &bytes[..size], &[]) {
+    let result = match platform.send_channel(endpoint.handle, &bytes[..size], &[]) {
         Ok(()) => StreamSendResult::Sent,
         Err(error) if status_is(error, DW_STATUS_WOULD_BLOCK) => StreamSendResult::WouldBlock,
         Err(error) if status_is(error, DW_STATUS_PEER_CLOSED) => StreamSendResult::PeerClosed,
@@ -1437,22 +1455,23 @@ fn service_stream_write<I: ByteRegisterIo>(
     match driver.resolve_stream_send(peer_close_drain, result) {
         StreamSendAction::Continue => Ok(StreamSendAction::Continue),
         StreamSendAction::Detached(detached, endpoint) => {
-            let _ = close_handle(endpoint.handle);
-            report_detached(control, detached)?;
+            let _ = platform.close_handle(endpoint.handle);
+            report_detached(platform, control, detached)?;
             Ok(StreamSendAction::Detached(detached, endpoint))
         }
     }
 }
 
-fn isolate_stream<I: ByteRegisterIo>(
+fn isolate_stream<P: UartPlatform, I: ByteRegisterIo>(
+    platform: &mut P,
     driver: &mut ProductionDriver<I>,
     control: DwHandle,
 ) -> Result<(), ()> {
     let Some((detached, endpoint)) = driver.detach_stream() else {
         return Ok(());
     };
-    let _ = close_handle(endpoint.handle);
-    report_detached(control, detached)
+    let _ = platform.close_handle(endpoint.handle);
+    report_detached(platform, control, detached)
 }
 
 /// Tells devmgr a stream detached. An orphaned driver's control peer is gone
@@ -1461,20 +1480,24 @@ fn isolate_stream<I: ByteRegisterIo>(
 /// driver that is otherwise healthy.
 /// A peer that closes between the loop's control probe and this send is the
 /// same case, and the next probe orphans the driver.
-fn report_detached(control: DwHandle, message: ControlMessageV1_1) -> Result<(), ()> {
-    match send_control_status(control, message) {
+fn report_detached<P: UartPlatform>(
+    platform: &mut P,
+    control: DwHandle,
+    message: ControlMessageV1_1,
+) -> Result<(), ()> {
+    match send_control_status(platform, control, message) {
         Ok(()) => Ok(()),
         Err(Some(error)) if status_is(error, DW_STATUS_PEER_CLOSED) => Ok(()),
         Err(_) => Err(()),
     }
 }
 
-fn probe_control(control: DwHandle) -> Result<DwSignals, ()> {
+fn probe_control<P: UartPlatform>(platform: &mut P, control: DwHandle) -> Result<DwSignals, ()> {
     let item = DwWaitItemV1 {
         handle: control,
         signals: DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
     };
-    match wait_many(core::slice::from_ref(&item), DwDeadline(0)) {
+    match platform.wait_many(core::slice::from_ref(&item), DwDeadline(0)) {
         Ok(result) if result.index == 0 => Ok(result.observed),
         Ok(_) => Err(()),
         Err(error) if status_is(error, DW_STATUS_TIMED_OUT) => Ok(DwSignals(0)),
@@ -1486,19 +1509,26 @@ fn status_is(error: NativeError, status: deepwyrm_syscall::DwStatus) -> bool {
     matches!(error, NativeError::Status(actual) if actual == status)
 }
 
-fn send_control(control: DwHandle, message: ControlMessageV1_1) -> Result<(), ()> {
-    send_control_status(control, message).map_err(|_| ())
+fn send_control<P: UartPlatform>(
+    platform: &mut P,
+    control: DwHandle,
+    message: ControlMessageV1_1,
+) -> Result<(), ()> {
+    send_control_status(platform, control, message).map_err(|_| ())
 }
 
 /// `send_control` keeping the native error; `None` is an encoding failure.
-fn send_control_status(
+fn send_control_status<P: UartPlatform>(
+    platform: &mut P,
     control: DwHandle,
     message: ControlMessageV1_1,
 ) -> Result<(), Option<NativeError>> {
     let mut bytes = [0; DEVICE_STAGE_BYTES];
     let size = message.wire_size();
     encode(message, &mut bytes[..size]).map_err(|_| None)?;
-    send_channel(control, &bytes[..size], &[]).map_err(Some)
+    platform
+        .send_channel(control, &bytes[..size], &[])
+        .map_err(Some)
 }
 
 fn graceful_shutdown<I: ByteRegisterIo>(
