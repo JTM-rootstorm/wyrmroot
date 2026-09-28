@@ -2420,6 +2420,74 @@ fn launch_driver_with_bundle(
     return launch_driver_with_historical_bundle(bootstrap, publication, parent_resource, resident);
 }
 
+/// One handle the staged launch owns until it moves or returns it.
+#[cfg(feature = "wyr1d-production")]
+struct OwnedHandle(DwHandle);
+
+#[cfg(feature = "wyr1d-production")]
+impl OwnedHandle {
+    const fn raw(&self) -> DwHandle {
+        self.0
+    }
+
+    fn moved(&mut self) {
+        self.0 = DW_HANDLE_INVALID;
+    }
+
+    fn take_raw(&mut self) -> DwHandle {
+        let raw = self.0;
+        self.moved();
+        raw
+    }
+
+    fn hold(&mut self, raw: DwHandle) -> &mut Self {
+        self.0 = raw;
+        self
+    }
+}
+
+/// The handles one staged launch owns, in creation order.
+///
+/// These were `Drop` guards local to `launch_driver_staged`, closed at every
+/// return in reverse declaration order. A guard cannot reach the caller's
+/// platform from `Drop`, so the slots live here instead: each starts
+/// invalid, is filled where its guard used to be created, and
+/// [`StagedLaunchHandles::close_live`] closes the live ones in the same
+/// reverse order when the launch returns. An unfilled or moved slot is
+/// skipped, exactly as a guard not yet created or already moved was.
+#[cfg(feature = "wyr1d-production")]
+struct StagedLaunchHandles {
+    retained: OwnedHandle,
+    child: OwnedHandle,
+    reduced: OwnedHandle,
+    interrupt: OwnedHandle,
+}
+
+#[cfg(feature = "wyr1d-production")]
+impl StagedLaunchHandles {
+    const fn new() -> Self {
+        Self {
+            retained: OwnedHandle(DW_HANDLE_INVALID),
+            child: OwnedHandle(DW_HANDLE_INVALID),
+            reduced: OwnedHandle(DW_HANDLE_INVALID),
+            interrupt: OwnedHandle(DW_HANDLE_INVALID),
+        }
+    }
+
+    fn close_live(&mut self) {
+        for slot in [
+            &mut self.interrupt,
+            &mut self.reduced,
+            &mut self.child,
+            &mut self.retained,
+        ] {
+            if slot.0 != DW_HANDLE_INVALID {
+                let _ = close_handle(slot.0);
+            }
+        }
+    }
+}
+
 #[cfg(feature = "wyr1d-production")]
 fn launch_driver_staged(
     bootstrap: DwHandle,
@@ -2427,36 +2495,30 @@ fn launch_driver_staged(
     parent_resource: DwHandle,
     resident: &mut crate::ResidentController,
 ) -> Result<DwHandle, u32> {
-    struct OwnedHandle(DwHandle);
+    let mut owned = StagedLaunchHandles::new();
+    let result = launch_driver_staged_owned(
+        &mut owned,
+        bootstrap,
+        publication,
+        parent_resource,
+        resident,
+    );
+    owned.close_live();
+    result
+}
 
-    impl OwnedHandle {
-        const fn raw(&self) -> DwHandle {
-            self.0
-        }
-
-        fn moved(&mut self) {
-            self.0 = DW_HANDLE_INVALID;
-        }
-
-        fn into_raw(mut self) -> DwHandle {
-            let raw = self.0;
-            self.moved();
-            raw
-        }
-    }
-
-    impl Drop for OwnedHandle {
-        fn drop(&mut self) {
-            if self.0 != DW_HANDLE_INVALID {
-                let _ = close_handle(self.0);
-            }
-        }
-    }
-
+#[cfg(feature = "wyr1d-production")]
+fn launch_driver_staged_owned(
+    owned: &mut StagedLaunchHandles,
+    bootstrap: DwHandle,
+    publication: DwHandle,
+    parent_resource: DwHandle,
+    resident: &mut crate::ResidentController,
+) -> Result<DwHandle, u32> {
     let (retained_raw, child_raw) =
         create_channel(DIRECT_CONTROL_RIGHTS).map_err(|_| failure(57))?;
-    let retained = OwnedHandle(retained_raw);
-    let mut child = OwnedHandle(child_raw);
+    let retained = owned.retained.hold(retained_raw);
+    let child = owned.child.hold(child_raw);
     if validate_fresh(
         retained.raw(),
         DW_OBJECT_TYPE_CHANNEL,
@@ -2518,7 +2580,7 @@ fn launch_driver_staged(
     let mut staging =
         DeviceStageCoordinator::new(ready_identity, correlations).map_err(|_| failure(68))?;
 
-    let reduced = OwnedHandle(
+    let reduced = owned.reduced.hold(
         duplicate_handle(parent_resource, DEVICE_RESOURCE_TRANSFER_RIGHTS)
             .map_err(|_| failure(69))?,
     );
@@ -2561,7 +2623,6 @@ fn launch_driver_staged(
     {
         return Err(failure(74));
     }
-    let mut reduced = reduced;
     reduced.moved();
     staging.device_stage_moved().map_err(|_| failure(75))?;
     wait_readable(retained.raw(), deadline, 76)?;
@@ -2580,7 +2641,7 @@ fn launch_driver_staged(
 
     // Creating the route-committing Interrupt is deliberately after the exact
     // DEVICE_QUIESCED reply above.
-    let interrupt = OwnedHandle(
+    let interrupt = owned.interrupt.hold(
         create_interrupt(parent_resource, INTERRUPT_CUSTODY_RIGHTS).map_err(|_| failure(81))?,
     );
     if validate_fresh(
@@ -2633,7 +2694,6 @@ fn launch_driver_staged(
     {
         return Err(failure(88));
     }
-    let mut interrupt = interrupt;
     interrupt.moved();
     staging.interrupt_stage_moved().map_err(|_| failure(89))?;
     resident.bundle_transferred().map_err(|_| failure(90))?;
@@ -2663,7 +2723,7 @@ fn launch_driver_staged(
         )
         .map_err(|_| failure(96))?;
     publish_driver(publication, request, resident)?;
-    Ok(retained.into_raw())
+    Ok(retained.take_raw())
 }
 
 #[cfg(all(feature = "wyr1c5-production", not(feature = "wyr1d-production")))]
