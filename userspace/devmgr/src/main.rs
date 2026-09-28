@@ -146,7 +146,9 @@ use wyrmroot_loader::launch::{
     DEVICE_COORDINATOR_RESOURCE_BYTES, RESOURCE_DOMAIN_CLAIM_RIGHTS,
     parse_device_coordinator_resource_init,
 };
-#[cfg(feature = "wyr1c4-production")]
+// Every shape without C5's registry client (the WYR1-C base product's bare
+// `native-devmgr`, and C4) links the crate only through `native-devmgr`.
+#[cfg(not(feature = "wyr1c5-production"))]
 use wyrmroot_registry_proto as _;
 #[cfg(feature = "wyr1c5-production")]
 use wyrmroot_registry_proto::{
