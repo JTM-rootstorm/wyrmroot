@@ -46,6 +46,8 @@ fn connector_broker_activation_is_shared_but_wdr5_remains_selector_only() {
     ));
 }
 
+/// Source text until S3: the role runs over the platform seam, but no
+/// RecordingPlatform script drives this path yet.
 #[test]
 fn production_publication_receiver_uses_the_exact_v1_1_service_generation() {
     let imports = &NATIVE[..NATIVE.find("const FAILURE_BASE").unwrap()];
@@ -59,7 +61,7 @@ fn production_publication_receiver_uses_the_exact_v1_1_service_generation() {
         "#[cfg(any(feature = \"wyr1d-selector32\", feature = \"wyr1e8-production\"))]\nuse wyrmroot_device_proto::d5_controller::{"
     ));
 
-    let receive = &NATIVE[NATIVE.find("fn receive_controller(").unwrap()
+    let receive = &NATIVE[NATIVE.find("fn receive_controller<").unwrap()
         ..NATIVE.find("fn published_driver(").unwrap()];
     let selected = "#[cfg(any(feature = \"wyr1d-selector32\", feature = \"wyr1e-production\"))]";
     let legacy = "#[cfg(not(any(feature = \"wyr1d-selector32\", feature = \"wyr1e-production\")))]";
@@ -119,12 +121,14 @@ fn production_publication_receiver_uses_the_exact_v1_1_service_generation() {
     assert!(!published.contains("endpoint.generation"));
 }
 
+/// Source text until S3: the role runs over the platform seam, but no
+/// RecordingPlatform script drives this path yet.
 #[test]
 fn e8_accepts_only_the_exact_current_driver_retire_request() {
     assert!(MANIFEST.contains("wyr1e8-production = [\"wyr1e-production\"]"));
     let controller = &NATIVE[NATIVE
         .find("let (replacement, action) = match input")
-        .unwrap()..NATIVE.find("fn receive_controller(").unwrap()];
+        .unwrap()..NATIVE.find("fn receive_controller<").unwrap()];
     let e8 = &controller[controller
         .find("#[cfg(feature = \"wyr1e8-production\")]\n                ControllerInput::D5(D5ControllerMessage::RequestRetire(identity))")
         .unwrap()..];

@@ -13,16 +13,17 @@ compile_error!("WYR1-E production and selector-only devmgr policies are mutually
 use core::panic::PanicInfo;
 #[cfg(feature = "dw1e3-selector31")]
 use wyrmroot_dw1e3_com2_test as _;
-use wyrmroot_runtime::StartupBlock;
 #[cfg(target_os = "wyrmroot")]
 use wyrmroot_runtime::panic_abort;
+use wyrmroot_runtime::{NativePlatform, StartupBlock};
 use {
     deepwyrm_syscall as _, wyrmroot_device_proto as _, wyrmroot_loader as _,
     wyrmroot_registry_proto as _,
 };
 
 fn native_main(startup: StartupBlock<'_>) -> u32 {
-    wyrmroot_devmgr::role::run(startup.bootstrap_channel().as_abi()).unwrap_or_else(|code| code)
+    wyrmroot_devmgr::role::run(&mut NativePlatform, startup.bootstrap_channel().as_abi())
+        .unwrap_or_else(|code| code)
 }
 
 #[cfg(target_os = "wyrmroot")]

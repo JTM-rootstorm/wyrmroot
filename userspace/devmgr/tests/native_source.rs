@@ -14,9 +14,11 @@ const NATIVE: &str = concat!(
     include_str!("../src/role.rs")
 );
 
+/// Source text until S3: the role runs over the platform seam, but no
+/// RecordingPlatform script drives this path yet.
 #[test]
 fn native_path_validates_manifest_before_ready_then_enters_bounded_controller_loop() {
-    let run = &NATIVE[NATIVE.find("fn run(").unwrap()..];
+    let run = &NATIVE[NATIVE.find("fn run<").unwrap()..];
     let parse = run.find("parse_device_coordinator_init").unwrap();
     let map = run.find("map_bootfs_read_only").unwrap();
     let prepare = run.find("prepare_operational").unwrap();
@@ -46,6 +48,8 @@ fn native_path_keeps_the_c3_launch_surface_hardware_free() {
     assert!(!c3.contains("pio_"));
 }
 
+/// Source text until S3: the role runs over the platform seam, but no
+/// RecordingPlatform script drives this path yet.
 #[test]
 fn c4_claim_path_is_feature_gated_exact_and_stops_before_interrupt_creation() {
     assert!(NATIVE.contains("#[cfg(feature = \"wyr1c4-production\")]"));
@@ -71,7 +75,7 @@ fn c4_claim_path_is_feature_gated_exact_and_stops_before_interrupt_creation() {
         .find("device_resource_info(resource)")
         .expect("typed resource metadata");
     let retire_domain = c4
-        .find("if close_handle(domain).is_err()")
+        .find("if platform.close_handle(domain).is_err()")
         .expect("domain retirement");
     let status = c4
         .find("send_publication_acknowledgement(bootstrap, &resident)")
@@ -113,6 +117,8 @@ fn c5_moves_exact_reduced_bundle_then_requires_ready_before_publish() {
     assert!(!c5.contains("interrupt_ack"));
 }
 
+/// Source text until S3: the role runs over the platform seam, but no
+/// RecordingPlatform script drives this path yet.
 #[test]
 fn selector29_stale_probes_run_after_p2_publication_and_close_before_probe() {
     let retry_start = NATIVE
@@ -135,7 +141,7 @@ fn selector29_stale_probes_run_after_p2_publication_and_close_before_probe() {
         .find("close_handle(control).map_err(|_| failure(41))")
         .expect("old control closes at cleanup");
     let close_publication = NATIVE
-        .find("close_handle(stale_publication).map_err(|_| failure(149))")
+        .find(".close_handle(stale_publication)\n                    .map_err(|_| failure(149))")
         .expect("old publication closes at cleanup");
     assert!(launch < malformed && malformed < stale_control && stale_control < stale_publication);
     assert!(close_control < retry_start);
@@ -190,6 +196,8 @@ fn c6_retirement_uses_a_fresh_endpoint_local_registry_transaction() {
     assert!(!retire.contains("transaction_id: request.transaction_id"));
 }
 
+/// Source text until S3: the role runs over the platform seam, but no
+/// RecordingPlatform script drives this path yet.
 #[test]
 fn c6_inline_publication_rebind_is_acknowledged_before_driver_backoff() {
     let cleanup = &NATIVE[NATIVE
@@ -214,7 +222,7 @@ fn c6_inline_publication_rebind_is_acknowledged_before_driver_backoff() {
         .find("close_optional(publication.take())")
         .expect("failed acknowledgement closes the replacement publication");
     let close_bootstrap = cleanup
-        .find("let _ = close_handle(bootstrap)")
+        .find("let _ = platform.close_handle(bootstrap)")
         .expect("failed acknowledgement closes the bootstrap channel");
     let cleanup_complete = cleanup
         .find("complete_driver_failure_cleanup(now)")
@@ -281,6 +289,8 @@ fn c3_construction_and_control_ready_share_one_finite_deadline() {
     assert!(!launch.contains("DW_DEADLINE_INFINITE"));
 }
 
+/// Source text until S3: the role runs over the platform seam, but no
+/// RecordingPlatform script drives this path yet.
 #[test]
 fn registry_peer_close_preserves_generation_and_uses_explicit_rebind() {
     let replacement = NATIVE
@@ -296,6 +306,6 @@ fn registry_peer_close_preserves_generation_and_uses_explicit_rebind() {
     assert!(NATIVE.contains("RebindPublication"));
     assert!(NATIVE.contains("validate_fresh(\n                    handles[0].handle,"));
     assert!(NATIVE.contains(
-        "close_optional(publication);\n                    close_optional(driver_control);\n                    let _ = close_handle(bootstrap);"
+        "close_optional(publication);\n                    close_optional(driver_control);\n                    let _ = platform.close_handle(bootstrap);"
     ));
 }
