@@ -5,8 +5,11 @@ use {wyrmroot_registry_proto as _, wyrmroot_registryd as _};
 const NATIVE: &str = include_str!("../src/main.rs");
 const SERVICE: &str = include_str!("../src/service.rs");
 
+/// Source text because `main.rs` is the guest binary and registryd's native
+/// transport has no host seam yet (S2U step 3 moves it into the library).
 #[test]
 fn native_registry_is_resident_and_uses_only_channel_routing_primitives() {
+    let compact: String = NATIVE.split_whitespace().collect();
     assert!(NATIVE.contains("LaunchProfile::BootstrapRegistry"));
     assert!(NATIVE.contains("loop {"));
     assert!(NATIVE.contains("wait_many"));
@@ -14,7 +17,7 @@ fn native_registry_is_resident_and_uses_only_channel_routing_primitives() {
     assert!(NATIVE.contains("DwDeadline(0)"));
     assert!(NATIVE.contains("DW_SIGNAL_PEER_CLOSED"));
     assert!(NATIVE.contains("DW_STATUS_TIMED_OUT"));
-    assert!(NATIVE.contains("close_handle(DwHandle(handle)).map_err"));
+    assert!(compact.contains("close_handle(DwHandle(handle)).map_err"));
     assert!(NATIVE.contains("RegistryService::new"));
     assert!(NATIVE.contains("service.step"));
     assert!(SERVICE.contains("Message::InstallPublication"));

@@ -19,10 +19,10 @@ use wyrmroot_loader::launch::{
     encode_ready_for_profile, parse_wyrmsh_init,
 };
 use wyrmroot_runtime::{
-    BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, CapabilityValidationError, INPUT_WAIT_SIGNALS,
-    NativeError, NativeInput, NativeOutput, OUTPUT_WAIT_SIGNALS, ReceiveCounts, STARTUP_ABI_V2,
-    StartupBlock, StreamEndpoint, StreamError, StreamSystem, native_error_code,
-    validate_bootstrap_channel,
+    BOOTSTRAP_CHANNEL_EXPECTATION, CapabilityInfo, CapabilityValidationError, ChannelPlatform,
+    ClockPlatform, HandlePlatform, INPUT_WAIT_SIGNALS, NativeError, NativeInput, NativeOutput,
+    OUTPUT_WAIT_SIGNALS, ReceiveCounts, STARTUP_ABI_V2, StartupBlock, StreamEndpoint, StreamError,
+    StreamSystem, WaitPlatform, native_error_code, validate_bootstrap_channel,
 };
 #[cfg(test)]
 use wyrmroot_stream_proto as _;
@@ -173,6 +173,72 @@ pub trait WyrmshSystem: StreamSystem {
         deadline: DwDeadline,
     ) -> Result<DwWaitResultV1, NativeError>;
     fn monotonic_active_now(&mut self) -> Result<u64, NativeError>;
+}
+
+/// Every platform with the handle, Channel, wait, and clock families is a
+/// shell system: each method is the family method of the same name, and
+/// `send_channel` is a send with no transfers. Its [`StreamSystem`] half is
+/// the runtime's infinite-wait stream adapter.
+impl<P> WyrmshSystem for P
+where
+    P: HandlePlatform + ChannelPlatform + WaitPlatform + ClockPlatform + ?Sized,
+{
+    fn query_capability_info(
+        &mut self,
+        handle: DwHandle,
+    ) -> Result<CapabilityInfo<DwObjectType, DwRights>, NativeError> {
+        HandlePlatform::query_capability_info(self, handle)
+    }
+
+    fn receive_channel(
+        &mut self,
+        channel: DwHandle,
+        bytes: &mut [u8],
+        handles: &mut [DwReceivedHandleInfoV1],
+    ) -> Result<ReceiveCounts, NativeError> {
+        ChannelPlatform::receive_channel(self, channel, bytes, handles)
+    }
+
+    fn send_channel(&mut self, channel: DwHandle, bytes: &[u8]) -> Result<(), NativeError> {
+        ChannelPlatform::send_channel(self, channel, bytes, &[])
+    }
+
+    fn send_channel_with_handles(
+        &mut self,
+        channel: DwHandle,
+        bytes: &[u8],
+        transfers: &[DwHandleTransferV1],
+    ) -> Result<(), NativeError> {
+        ChannelPlatform::send_channel(self, channel, bytes, transfers)
+    }
+
+    fn create_channel(&mut self, rights: DwRights) -> Result<(DwHandle, DwHandle), NativeError> {
+        ChannelPlatform::create_channel(self, rights)
+    }
+
+    fn duplicate_handle(
+        &mut self,
+        handle: DwHandle,
+        rights: DwRights,
+    ) -> Result<DwHandle, NativeError> {
+        HandlePlatform::duplicate_handle(self, handle, rights)
+    }
+
+    fn close_handle(&mut self, handle: DwHandle) -> Result<(), NativeError> {
+        HandlePlatform::close_handle(self, handle)
+    }
+
+    fn wait_many(
+        &mut self,
+        items: &[DwWaitItemV1],
+        deadline: DwDeadline,
+    ) -> Result<DwWaitResultV1, NativeError> {
+        WaitPlatform::wait_many(self, items, deadline)
+    }
+
+    fn monotonic_active_now(&mut self) -> Result<u64, NativeError> {
+        ClockPlatform::monotonic_active_now(self)
+    }
 }
 
 /// Validates the native ABI and the exact canonical shell argv/environment.
@@ -1641,4 +1707,56 @@ impl<System: StreamSystem> StreamSystem for ReceiveBudget<'_, System> {
 
 const fn native(operation: NativeOperation, cause: NativeError) -> ShellError {
     ShellError::Native { operation, cause }
+}
+
+#[cfg(test)]
+mod platform_adapter_tests {
+    extern crate std;
+
+    use deepwyrm_syscall::{DW_RIGHT_READ, DW_SIGNAL_READABLE, DwHandleTransferV1};
+    use std::vec::Vec;
+    use wyrmroot_runtime::platform::recording::{Call, RecordingPlatform, Reply};
+
+    use super::*;
+
+    /// The shell's two send methods are one family send, with and without
+    /// transfers, and its stream wait is the family's infinite single wait.
+    #[test]
+    fn the_shell_system_is_the_platform_family() {
+        let transfer = DwHandleTransferV1 {
+            handle: DwHandle(8),
+            requested_rights: DW_RIGHT_READ,
+            ..DwHandleTransferV1::default()
+        };
+        let mut platform = RecordingPlatform::scripted([
+            Reply::Unit(Ok(())),
+            Reply::Unit(Ok(())),
+            Reply::Wait(Ok(DwWaitResultV1::default())),
+        ]);
+        WyrmshSystem::send_channel(&mut platform, DwHandle(3), b"a").unwrap();
+        WyrmshSystem::send_channel_with_handles(&mut platform, DwHandle(3), b"b", &[transfer])
+            .unwrap();
+        StreamSystem::wait(&mut platform, DwHandle(4), DW_SIGNAL_READABLE).unwrap();
+        assert_eq!(
+            platform.take_calls(),
+            [
+                Call::SendChannel {
+                    channel: DwHandle(3),
+                    bytes: b"a".to_vec(),
+                    transfers: Vec::new(),
+                },
+                Call::SendChannel {
+                    channel: DwHandle(3),
+                    bytes: b"b".to_vec(),
+                    transfers: std::vec![transfer],
+                },
+                Call::WaitOne {
+                    handle: DwHandle(4),
+                    signals: DW_SIGNAL_READABLE,
+                    deadline: DW_DEADLINE_INFINITE,
+                },
+            ]
+        );
+        platform.assert_script_consumed();
+    }
 }

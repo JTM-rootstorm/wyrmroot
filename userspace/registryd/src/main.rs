@@ -21,9 +21,9 @@ use wyrmroot_registryd::service::{
     RegistryService, Transport, WaitEvent,
 };
 use wyrmroot_runtime::{
-    BOOTSTRAP_CHANNEL_EXPECTATION, NativeError, StartupBlock, close_handle, panic_abort,
-    query_capability_info, receive_channel, send_channel, validate_bootstrap_channel, wait_many,
-    wait_one,
+    BOOTSTRAP_CHANNEL_EXPECTATION, ChannelPlatform, HandlePlatform, NativeError, NativePlatform,
+    StartupBlock, WaitPlatform, close_handle, panic_abort, query_capability_info, receive_channel,
+    send_channel, validate_bootstrap_channel,
 };
 
 const BROAD_CHANNEL_RIGHTS: DwRights = DwRights(
@@ -84,15 +84,21 @@ fn run(startup: StartupBlock<'_>) -> Result<(), u32> {
     close_handle(self_root).map_err(|_| 0xB101_000B_u32)?;
 
     let mut service = RegistryService::new(control.0);
-    let mut transport = NativeTransport;
+    let mut transport = NativeTransport {
+        platform: NativePlatform,
+    };
     loop {
         service.step(&mut transport).map_err(|_| 0xB101_0010_u32)?;
     }
 }
 
-struct NativeTransport;
+/// Registryd's transport over the platform family. The native binary uses
+/// [`NativePlatform`]; each operation keeps its own failure code.
+struct NativeTransport<P> {
+    platform: P,
+}
 
-impl Transport for NativeTransport {
+impl<P: HandlePlatform + ChannelPlatform + WaitPlatform> Transport for NativeTransport<P> {
     type Error = u32;
 
     fn wait(&mut self, control: u64, endpoints: &[InstalledEndpoint]) -> Result<WaitEvent, u32> {
@@ -101,7 +107,9 @@ impl Transport for NativeTransport {
         for (index, endpoint) in endpoints.iter().enumerate() {
             items[index + 1] = wait_item(DwHandle(endpoint.handle));
         }
-        let observed = wait_many(&items[..endpoints.len() + 1], DW_DEADLINE_INFINITE)
+        let observed = self
+            .platform
+            .wait_many(&items[..endpoints.len() + 1], DW_DEADLINE_INFINITE)
             .map_err(|_| 0xB101_0011_u32)?;
         let index = usize::try_from(observed.index).map_err(|_| 0xB101_0012_u32)?;
         Ok(WaitEvent {
@@ -112,7 +120,7 @@ impl Transport for NativeTransport {
     }
 
     fn probe(&mut self, endpoint: InstalledEndpoint) -> Result<ProbeSignals, u32> {
-        match wait_one(
+        match self.platform.wait_one(
             DwHandle(endpoint.handle),
             DwSignals(DW_SIGNAL_READABLE.0 | DW_SIGNAL_PEER_CLOSED.0),
             DwDeadline(0),
@@ -135,8 +143,10 @@ impl Transport for NativeTransport {
         handles: &mut [ReceivedHandle],
     ) -> Result<ReceiveCounts, u32> {
         let mut native = [DwReceivedHandleInfoV1::default(); MAX_RECEIVED_HANDLES];
-        let counts =
-            receive_channel(DwHandle(channel), bytes, &mut native).map_err(|_| 0xB101_0013_u32)?;
+        let counts = self
+            .platform
+            .receive_channel(DwHandle(channel), bytes, &mut native)
+            .map_err(|_| 0xB101_0013_u32)?;
         if counts.handles <= handles.len() {
             for index in 0..counts.handles {
                 handles[index] = ReceivedHandle {
@@ -164,7 +174,10 @@ impl Transport for NativeTransport {
         if !handle.metadata_is_channel || handle.metadata_rights != expected.0 {
             return Err(0xB101_0014_u32);
         }
-        let fresh = query_capability_info(DwHandle(handle.handle)).map_err(|_| 0xB101_0015_u32)?;
+        let fresh = self
+            .platform
+            .query_capability_info(DwHandle(handle.handle))
+            .map_err(|_| 0xB101_0015_u32)?;
         if fresh.object_type != DW_OBJECT_TYPE_CHANNEL || fresh.rights != expected {
             return Err(0xB101_0016_u32);
         }
@@ -172,7 +185,9 @@ impl Transport for NativeTransport {
     }
 
     fn send(&mut self, channel: u64, bytes: &[u8]) -> Result<(), u32> {
-        send_channel(DwHandle(channel), bytes, &[]).map_err(|_| 0xB101_0017_u32)
+        self.platform
+            .send_channel(DwHandle(channel), bytes, &[])
+            .map_err(|_| 0xB101_0017_u32)
     }
 
     fn send_move(
@@ -193,11 +208,15 @@ impl Transport for NativeTransport {
             reserved0: 0,
             reserved: [0; 2],
         };
-        send_channel(DwHandle(channel), bytes, &[transfer]).map_err(|_| 0xB101_0018_u32)
+        self.platform
+            .send_channel(DwHandle(channel), bytes, &[transfer])
+            .map_err(|_| 0xB101_0018_u32)
     }
 
     fn close(&mut self, handle: u64) -> Result<(), u32> {
-        close_handle(DwHandle(handle)).map_err(|_| 0xB101_001A_u32)
+        self.platform
+            .close_handle(DwHandle(handle))
+            .map_err(|_| 0xB101_001A_u32)
     }
 }
 

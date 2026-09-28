@@ -21,6 +21,7 @@ wyrmroot-launch-proto = { path = "../../crates/wyrmroot-launch-proto" }
 wyrmroot-registry-proto = { path = "../../crates/wyrmroot-registry-proto" }
 
 [dev-dependencies]
+wyrmroot-runtime = { path = "../../crates/wyrmroot-runtime", features = ["platform-recording"] }
 wyrmroot-stream-proto = { path = "../../crates/wyrmroot-stream-proto" }
 
 [[bin]]
