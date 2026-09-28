@@ -33,8 +33,6 @@ native-consoled = [
 
 [dependencies]
 wyrmroot-console-proto = { path = "../../crates/wyrmroot-console-proto" }
-
-[target.'cfg(target_os = "wyrmroot")'.dependencies]
 deepwyrm-syscall = { workspace = true, optional = true }
 wyrmroot-device-proto = { path = "../../crates/wyrmroot-device-proto", optional = true }
 wyrmroot-launch-proto = { path = "../../crates/wyrmroot-launch-proto", optional = true }

@@ -1,8 +1,7 @@
-#![no_std]
-#![no_main]
+#![cfg_attr(target_os = "wyrmroot", no_std)]
+#![cfg_attr(target_os = "wyrmroot", no_main)]
 #![deny(unsafe_code)]
 
-use core::panic::PanicInfo;
 use deepwyrm_syscall::{
     DW_RIGHT_INSPECT, DW_RIGHT_MODIFY, DW_RIGHT_WAIT, DW_SIGNAL_SIGNALED, DwDeadline, DwHandle,
     DwHandleTransferV1, DwObjectType, DwReceivedHandleInfoV1, DwRights, DwWaitItemV1,
@@ -30,9 +29,8 @@ use wyrmroot_runtime::WYR0_I_SUPERVISION_POLICY;
 use wyrmroot_runtime::{
     CapabilityInfo, MappingPlan, NativeError, NativeLoaderPlatform, NativeSupervisionPlatform,
     ReceiveCounts, StartupBlock, close_handle, create_channel, create_task_group, create_timer,
-    map_bootfs_read_only, monotonic_active_now, panic_abort, query_capability_info,
-    query_memory_object_size, receive_channel, send_channel, set_timer, unmap_bootfs, wait_many,
-    wait_one,
+    map_bootfs_read_only, monotonic_active_now, query_capability_info, query_memory_object_size,
+    receive_channel, send_channel, set_timer, unmap_bootfs, wait_many, wait_one,
 };
 #[cfg(not(any(feature = "wyr1c4-production", feature = "wyr1c5-production")))]
 use wyrmroot_system_init::continue_system_init_product;
@@ -201,7 +199,7 @@ impl wyrmroot_system_init::r1_relay::R1EvidenceSink for NativeSystem {
     }
 }
 
-fn main(startup: StartupBlock<'_>) -> u32 {
+fn native_main(startup: StartupBlock<'_>) -> u32 {
     let mut system = NativeSystem;
     let mut loader = NativeLoaderPlatform;
     let mut waits = NativeSupervisionPlatform;
@@ -380,8 +378,20 @@ fn continue_resident(
     }
 }
 
-wyrmroot_runtime::native_entry!(crate::main);
+#[cfg(target_os = "wyrmroot")]
+wyrmroot_runtime::native_entry!(crate::native_main);
+#[cfg(target_os = "wyrmroot")]
 #[panic_handler]
-fn panic(_: &PanicInfo<'_>) -> ! {
-    panic_abort()
+fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
+    wyrmroot_runtime::panic_abort()
+}
+
+// This is a guest binary for `x86_64-unknown-wyrmroot`. A host build exists
+// so the role binary can be type-checked and linted on the host: `_start`
+// and a `#[panic_handler]` would each collide with the std that a host build
+// links. Naming the freestanding entry keeps it, and everything it reaches,
+// live for host type-checking; nothing here ever runs on the host.
+#[cfg(not(target_os = "wyrmroot"))]
+fn main() {
+    let _: fn(StartupBlock<'_>) -> u32 = native_main;
 }

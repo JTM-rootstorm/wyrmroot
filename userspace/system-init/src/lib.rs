@@ -3847,9 +3847,9 @@ mod native_cleanup_tests {
 
     /// The last step of F3A.7g, which no host test can reach.
     ///
-    /// Permanent init's loop is in `main.rs`, which is unconditionally
-    /// `#![no_std]` with its own `#[panic_handler]`, so there is no host build
-    /// of it. What the loop does with `session_complete` is the whole point of
+    /// Permanent init's loop is in `main.rs`, whose host build only
+    /// type-checks the guest entry (S2U step 2), so no host test can run the
+    /// loop. What the loop does with `session_complete` is the whole point of
     /// the flag -- a supervisor that latches the fact and keeps ticking has
     /// changed nothing -- so it is read out of the source rather than left
     /// unstated.

@@ -1,8 +1,6 @@
-#![no_std]
-#![no_main]
+#![cfg_attr(target_os = "wyrmroot", no_std)]
+#![cfg_attr(target_os = "wyrmroot", no_main)]
 #![deny(unsafe_code)]
-
-use core::panic::PanicInfo;
 
 mod stream_transfer;
 use stream_transfer::move_transfer;
@@ -45,9 +43,8 @@ use wyrmroot_registry_proto::{
 use wyrmroot_runtime::{
     BOOTSTRAP_CHANNEL_EXPECTATION, NativeError, NativeInput, NativeOutput, ReceiveCounts,
     StartupBlock, StreamEndpoint, StreamError, StreamSystem, WYR0_I_SUPERVISION_POLICY,
-    close_handle, create_channel, duplicate_handle, monotonic_active_now, panic_abort,
-    query_capability_info, receive_channel, send_channel, validate_bootstrap_channel, wait_many,
-    wait_one,
+    close_handle, create_channel, duplicate_handle, monotonic_active_now, query_capability_info,
+    receive_channel, send_channel, validate_bootstrap_channel, wait_many, wait_one,
 };
 
 const FAILURE_BASE: u32 = 0xD400_0000;
@@ -392,7 +389,7 @@ impl StreamSystem for NativeStreams {
     }
 }
 
-fn main(startup: StartupBlock<'_>) -> u32 {
+fn native_main(startup: StartupBlock<'_>) -> u32 {
     run(startup).unwrap_or_else(|step| FAILURE_BASE | step)
 }
 
@@ -3246,9 +3243,21 @@ fn now_millis() -> Result<u64, u32> {
         .map_err(|_| 94)
 }
 
-wyrmroot_runtime::native_entry!(crate::main);
+#[cfg(target_os = "wyrmroot")]
+wyrmroot_runtime::native_entry!(crate::native_main);
 
+#[cfg(target_os = "wyrmroot")]
 #[panic_handler]
-fn panic(_: &PanicInfo<'_>) -> ! {
-    panic_abort()
+fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
+    wyrmroot_runtime::panic_abort()
+}
+
+// This is a guest binary for `x86_64-unknown-wyrmroot`. A host build exists
+// so the role binary can be type-checked and linted on the host: `_start`
+// and a `#[panic_handler]` would each collide with the std that a host build
+// links. Naming the freestanding entry keeps it, and everything it reaches,
+// live for host type-checking; nothing here ever runs on the host.
+#[cfg(not(target_os = "wyrmroot"))]
+fn main() {
+    let _: fn(StartupBlock<'_>) -> u32 = native_main;
 }

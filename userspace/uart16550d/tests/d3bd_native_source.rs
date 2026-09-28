@@ -247,8 +247,8 @@ fn driver_function(name: &str) -> &'static str {
     &DRIVER[start..start + end]
 }
 
-/// Source text because `main.rs` is unconditionally `#![no_std]` and built
-/// only for the guest target, so no host test can call its send or teardown
+/// Source text because `main.rs`'s host build only type-checks the guest
+/// entry (S2U step 2), so no host test can call its send or teardown
 /// path yet (S2U gives it a seam). That a sent record commits is held by the
 /// host test
 /// `send_peer_close_preserves_final_inbound_data_until_empty_queue_proof` in lib.rs.

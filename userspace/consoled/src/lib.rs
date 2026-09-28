@@ -23,7 +23,7 @@ extern crate std;
 #[cfg(any(test, feature = "wyr1e8-recovery"))]
 pub mod quiesce_control;
 
-#[cfg(all(feature = "native-consoled", target_os = "wyrmroot"))]
+#[cfg(feature = "native-consoled")]
 use {
     deepwyrm_syscall as _, wyrmroot_device_proto as _, wyrmroot_launch_proto as _,
     wyrmroot_loader as _, wyrmroot_registry_proto as _, wyrmroot_runtime as _,
@@ -1816,10 +1816,10 @@ mod tests {
 
     /// The supervision half of F3A.7g, which no host test can reach.
     ///
-    /// `consoled`'s event loop lives in `main.rs`, which is unconditionally
-    /// `#![no_std]` with its own `#[panic_handler]`, so there is no host
-    /// build of it to run -- `wyr1f-native` type-checks it for the guest
-    /// target and that is all. The property that matters is a decision inside
+    /// `consoled`'s event loop lives in `main.rs`, whose host build only
+    /// type-checks the guest entry (S2U step 2) and has no platform seam to
+    /// drive it until step 3, so no host test can run the loop. The
+    /// property that matters is a decision inside
     /// one function, so it is read out of the source here rather than left
     /// unstated.
     ///
@@ -1831,7 +1831,7 @@ mod tests {
     /// not the serial line, and closure contract §5.4 requires the console and
     /// the live shell to keep serving. Both wait loops must drop the witness and
     /// carry on; neither may tear the shell down or report the serial lost.
-    /// `main.rs` has no host build, so this reads it.
+    /// `main.rs` has no host-runnable seam yet, so this reads it.
     /// F3A.7k. devmgr's death also withdraws its publication, and registryd
     /// completes consoled's watch with generation 0. Both registry arms must
     /// keep serving on a withdrawal and rebuild only on a real republication.

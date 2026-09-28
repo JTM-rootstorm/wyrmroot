@@ -1,8 +1,8 @@
-#![no_std]
-#![no_main]
+#![cfg_attr(target_os = "wyrmroot", no_std)]
+#![cfg_attr(target_os = "wyrmroot", no_main)]
 #![deny(unsafe_code)]
 
-use core::{cell::Cell, panic::PanicInfo};
+use core::cell::Cell;
 
 use deepwyrm_syscall::{
     DW_DEADLINE_INFINITE, DW_OBJECT_TYPE_ADDRESS_REGION, DW_OBJECT_TYPE_CHANNEL,
@@ -38,7 +38,7 @@ use wyrmroot_loader::launch::{
 use wyrmroot_runtime::{
     BOOTSTRAP_CHANNEL_EXPECTATION, NativeError, StartupBlock, close_handle, device_pio_read,
     device_pio_write, device_resource_info, interrupt_ack, interrupt_info, monotonic_active_now,
-    native_error_code, panic_abort, query_capability_info, receive_channel, send_channel,
+    native_error_code, query_capability_info, receive_channel, send_channel,
     validate_bootstrap_channel, wait_many,
 };
 #[cfg(feature = "dw1e3-selector31")]
@@ -1500,9 +1500,21 @@ fn fail_second_stage(
     Err(code)
 }
 
+#[cfg(target_os = "wyrmroot")]
 wyrmroot_runtime::native_entry!(crate::uart_main);
 
+#[cfg(target_os = "wyrmroot")]
 #[panic_handler]
-fn panic(_: &PanicInfo<'_>) -> ! {
-    panic_abort()
+fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
+    wyrmroot_runtime::panic_abort()
+}
+
+// This is a guest binary for `x86_64-unknown-wyrmroot`. A host build exists
+// so the role binary can be type-checked and linted on the host: `_start`
+// and a `#[panic_handler]` would each collide with the std that a host build
+// links. Naming the freestanding entry keeps it, and everything it reaches,
+// live for host type-checking; nothing here ever runs on the host.
+#[cfg(not(target_os = "wyrmroot"))]
+fn main() {
+    let _: fn(StartupBlock<'_>) -> u32 = uart_main;
 }
