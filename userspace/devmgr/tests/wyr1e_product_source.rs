@@ -139,7 +139,7 @@ fn e8_accepts_only_the_exact_current_driver_retire_request() {
         .unwrap();
     let duplicate = e8.find("e8_retire_requested").unwrap();
     let retire = e8
-        .find("send_driver_retire(control, &mut resident)?")
+        .find("send_driver_retire(platform, control, &mut resident)?")
         .unwrap();
     let one_shot = e8.find("e8_retire_requested = true").unwrap();
     assert!(validate < broker && broker < attach && attach < duplicate);

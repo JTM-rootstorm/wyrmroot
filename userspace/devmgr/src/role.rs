@@ -532,7 +532,7 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
                 close_optional(publication);
                 #[cfg(feature = "wyr1c5-production")]
                 if let Some(control) = driver_control {
-                    let _ = send_driver_retire(control, &mut resident);
+                    let _ = send_driver_retire(platform, control, &mut resident);
                 }
                 close_optional(driver_control);
                 #[cfg(feature = "wyr1c5-production")]
@@ -573,7 +573,7 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
                     {
                         return Err(failure(312));
                     }
-                    send_driver_retire(control, &mut resident)?;
+                    send_driver_retire(platform, control, &mut resident)?;
                     e8_retire_requested = true;
                     continue;
                 }
@@ -895,7 +895,7 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
                 if driver_control.is_some() {
                     return Err(failure(38));
                 }
-                driver_control = Some(launch_driver(bootstrap, &mut resident)?);
+                driver_control = Some(launch_driver(platform, bootstrap, &mut resident)?);
             }
             #[cfg(feature = "wyr1c5-production")]
             if action == ControllerAction::InitialPublicationBound
@@ -904,6 +904,7 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
             {
                 let parent = device_resource.ok_or(failure(53))?;
                 let launched = launch_driver_with_bundle(
+                    platform,
                     bootstrap,
                     publication.ok_or(failure(54))?,
                     parent,
@@ -924,13 +925,14 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
                 activate_connector_broker(&mut resident, &mut connector_broker)?;
             } else if resident.driver_ready() {
                 let republished = publish_driver(
+                    platform,
                     publication.ok_or(failure(55))?,
                     resident.active_driver_request().ok_or(failure(56))?,
                     &mut resident,
                 );
                 if let Err(code) = republished {
                     if let Some(control) = driver_control.take() {
-                        let _ = send_driver_retire(control, &mut resident);
+                        let _ = send_driver_retire(platform, control, &mut resident);
                         let _ = platform.close_handle(control);
                     }
                     close_optional(device_resource.take());
@@ -1241,6 +1243,7 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
                 resident.driver_retry_ready(now).map_err(|_| failure(56))?;
                 let parent = device_resource.ok_or(failure(57))?;
                 let launched = launch_driver_with_bundle(
+                    platform,
                     bootstrap,
                     publication.ok_or(failure(58))?,
                     parent,
@@ -1257,7 +1260,13 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
                         > wyrmroot_device_proto::SELECTOR29_FAILURE_ATTEMPT_GENERATION
                 }) {
                     let replacement = resident.active_driver_request().ok_or(failure(153))?;
-                    probe_malformed_resource_mapping(launched, parent, replacement, &resident)?;
+                    probe_malformed_resource_mapping(
+                        platform,
+                        launched,
+                        parent,
+                        replacement,
+                        &resident,
+                    )?;
                     probe_stale_driver_endpoint(platform, stale_control, request, &resident)?;
                     probe_stale_publication(platform, stale_publication, request, &resident)?;
                     #[cfg(feature = "wyr1c6-selector29")]
@@ -1359,7 +1368,7 @@ pub fn run<P: DevmgrPlatform>(platform: &mut P, bootstrap: DwHandle) -> Result<u
                 close_optional(publication);
                 #[cfg(feature = "wyr1c5-production")]
                 if let Some(control) = driver_control {
-                    let _ = send_driver_retire(control, &mut resident);
+                    let _ = send_driver_retire(platform, control, &mut resident);
                 }
                 close_optional(driver_control);
                 #[cfg(feature = "wyr1c5-production")]
@@ -2331,30 +2340,33 @@ fn send_driver_retired(
 }
 
 #[cfg(not(any(feature = "wyr1c4-production", feature = "wyr1c5-production")))]
-fn launch_driver(
+fn launch_driver<P: DevmgrPlatform>(
+    platform: &mut P,
     bootstrap: DwHandle,
     resident: &mut crate::ResidentController,
 ) -> Result<DwHandle, u32> {
-    let (retained, child) = create_channel(DIRECT_CONTROL_RIGHTS).map_err(|_| failure(44))?;
+    let (retained, child) = platform
+        .create_channel(DIRECT_CONTROL_RIGHTS)
+        .map_err(|_| failure(44))?;
     if validate_fresh(retained, DW_OBJECT_TYPE_CHANNEL, DIRECT_CONTROL_RIGHTS).is_err()
         || validate_fresh(child, DW_OBJECT_TYPE_CHANNEL, DIRECT_CONTROL_RIGHTS).is_err()
     {
-        let _ = close_handle(child);
-        let _ = close_handle(retained);
+        let _ = platform.close_handle(child);
+        let _ = platform.close_handle(retained);
         return Err(failure(45));
     }
     let request = match resident.issue_driver_launch(true, DirectControlRights::ExactReduced) {
         Ok(request) => request,
         Err(_) => {
-            let _ = close_handle(child);
-            let _ = close_handle(retained);
+            let _ = platform.close_handle(child);
+            let _ = platform.close_handle(retained);
             return Err(failure(46));
         }
     };
     let mut bytes = [0u8; LAUNCH_REQUEST_BYTES];
     if encode_request(request, &mut bytes).is_err() {
-        let _ = close_handle(child);
-        let _ = close_handle(retained);
+        let _ = platform.close_handle(child);
+        let _ = platform.close_handle(retained);
         return Err(failure(47));
     }
     let transfer = DwHandleTransferV1 {
@@ -2365,39 +2377,42 @@ fn launch_driver(
         reserved: [0; 2],
     };
     if send_bootstrap_channel(bootstrap, &bytes, core::slice::from_ref(&transfer), 48).is_err() {
-        let _ = close_handle(child);
-        let _ = close_handle(retained);
+        let _ = platform.close_handle(child);
+        let _ = platform.close_handle(retained);
         return Err(failure(48));
     }
 
     // Construction acknowledgement and direct CONTROL_READY share one
     // absolute checked deadline. A late first phase cannot mint a fresh
     // readiness budget for the second phase.
-    let deadline = monotonic_deadline_after(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
+    let deadline = platform
+        .monotonic_deadline_after(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
         .map_err(|_| failure(49))?;
     wait_readable(bootstrap, deadline, 50)?;
     let mut response = [0u8; LAUNCH_RESPONSE_BYTES];
     let mut response_handles = [DwReceivedHandleInfoV1::default(); 1];
-    let counts = receive_channel(bootstrap, &mut response, &mut response_handles)
+    let counts = platform
+        .receive_channel(bootstrap, &mut response, &mut response_handles)
         .map_err(|_| failure(51))?;
     if counts.bytes != response.len() || counts.handles != 0 {
         close_received(&response_handles, counts.handles);
-        let _ = close_handle(retained);
+        let _ = platform.close_handle(retained);
         return Err(failure(52));
     }
     if parse_constructed(&response, request).is_err() || resident.driver_constructed().is_err() {
-        let _ = close_handle(retained);
+        let _ = platform.close_handle(retained);
         return Err(failure(53));
     }
 
     wait_readable(retained, deadline, 54)?;
     let mut control = [0u8; CONTROL_READY_BYTES];
     let mut control_handles = [DwReceivedHandleInfoV1::default(); 1];
-    let counts =
-        receive_channel(retained, &mut control, &mut control_handles).map_err(|_| failure(55))?;
+    let counts = platform
+        .receive_channel(retained, &mut control, &mut control_handles)
+        .map_err(|_| failure(55))?;
     if counts.bytes != control.len() || counts.handles != 0 {
         close_received(&control_handles, counts.handles);
-        let _ = close_handle(retained);
+        let _ = platform.close_handle(retained);
         return Err(failure(56));
     }
     let message = parse_control(&control).map_err(|_| failure(57))?;
@@ -2408,16 +2423,23 @@ fn launch_driver(
 }
 
 #[cfg(feature = "wyr1c5-production")]
-fn launch_driver_with_bundle(
+fn launch_driver_with_bundle<P: DevmgrPlatform>(
+    platform: &mut P,
     bootstrap: DwHandle,
     publication: DwHandle,
     parent_resource: DwHandle,
     resident: &mut crate::ResidentController,
 ) -> Result<DwHandle, u32> {
     #[cfg(feature = "wyr1d-production")]
-    return launch_driver_staged(bootstrap, publication, parent_resource, resident);
+    return launch_driver_staged(platform, bootstrap, publication, parent_resource, resident);
     #[cfg(not(feature = "wyr1d-production"))]
-    return launch_driver_with_historical_bundle(bootstrap, publication, parent_resource, resident);
+    return launch_driver_with_historical_bundle(
+        platform,
+        bootstrap,
+        publication,
+        parent_resource,
+        resident,
+    );
 }
 
 /// One handle the staged launch owns until it moves or returns it.
@@ -2474,7 +2496,7 @@ impl StagedLaunchHandles {
         }
     }
 
-    fn close_live(&mut self) {
+    fn close_live<P: DevmgrPlatform>(&mut self, platform: &mut P) {
         for slot in [
             &mut self.interrupt,
             &mut self.reduced,
@@ -2482,14 +2504,15 @@ impl StagedLaunchHandles {
             &mut self.retained,
         ] {
             if slot.0 != DW_HANDLE_INVALID {
-                let _ = close_handle(slot.0);
+                let _ = platform.close_handle(slot.0);
             }
         }
     }
 }
 
 #[cfg(feature = "wyr1d-production")]
-fn launch_driver_staged(
+fn launch_driver_staged<P: DevmgrPlatform>(
+    platform: &mut P,
     bootstrap: DwHandle,
     publication: DwHandle,
     parent_resource: DwHandle,
@@ -2497,26 +2520,29 @@ fn launch_driver_staged(
 ) -> Result<DwHandle, u32> {
     let mut owned = StagedLaunchHandles::new();
     let result = launch_driver_staged_owned(
+        platform,
         &mut owned,
         bootstrap,
         publication,
         parent_resource,
         resident,
     );
-    owned.close_live();
+    owned.close_live(platform);
     result
 }
 
 #[cfg(feature = "wyr1d-production")]
-fn launch_driver_staged_owned(
+fn launch_driver_staged_owned<P: DevmgrPlatform>(
+    platform: &mut P,
     owned: &mut StagedLaunchHandles,
     bootstrap: DwHandle,
     publication: DwHandle,
     parent_resource: DwHandle,
     resident: &mut crate::ResidentController,
 ) -> Result<DwHandle, u32> {
-    let (retained_raw, child_raw) =
-        create_channel(DIRECT_CONTROL_RIGHTS).map_err(|_| failure(57))?;
+    let (retained_raw, child_raw) = platform
+        .create_channel(DIRECT_CONTROL_RIGHTS)
+        .map_err(|_| failure(57))?;
     let retained = owned.retained.hold(retained_raw);
     let child = owned.child.hold(child_raw);
     if validate_fresh(
@@ -2552,12 +2578,14 @@ fn launch_driver_staged_owned(
         return Err(failure(61));
     }
     child.moved();
-    let deadline = monotonic_deadline_after(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
+    let deadline = platform
+        .monotonic_deadline_after(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
         .map_err(|_| failure(62))?;
     wait_readable(bootstrap, deadline, 63)?;
     let mut constructed = [0u8; LAUNCH_RESPONSE_BYTES];
     let mut constructed_handles = [DwReceivedHandleInfoV1::default(); 1];
-    let counts = receive_channel(bootstrap, &mut constructed, &mut constructed_handles)
+    let counts = platform
+        .receive_channel(bootstrap, &mut constructed, &mut constructed_handles)
         .map_err(|_| failure(64))?;
     if counts.bytes != constructed.len() || counts.handles != 0 {
         close_received(&constructed_handles, counts.handles);
@@ -2581,7 +2609,8 @@ fn launch_driver_staged_owned(
         DeviceStageCoordinator::new(ready_identity, correlations).map_err(|_| failure(68))?;
 
     let reduced = owned.reduced.hold(
-        duplicate_handle(parent_resource, DEVICE_RESOURCE_TRANSFER_RIGHTS)
+        platform
+            .duplicate_handle(parent_resource, DEVICE_RESOURCE_TRANSFER_RIGHTS)
             .map_err(|_| failure(69))?,
     );
     if validate_fresh(
@@ -2593,7 +2622,9 @@ fn launch_driver_staged_owned(
     {
         return Err(failure(70));
     }
-    let resource = device_resource_info(reduced.raw()).map_err(|_| failure(71))?;
+    let resource = platform
+        .device_resource_info(reduced.raw())
+        .map_err(|_| failure(71))?;
     if resource.resource_id != crate::COM2_RESOURCE_ID
         || resource.lease_generation != ready_identity.bundle_generation.0
         || resource.pio_base != 0x2f8
@@ -2614,12 +2645,13 @@ fn launch_driver_staged_owned(
         reserved0: 0,
         reserved: [0; 2],
     };
-    if send_channel(
-        retained.raw(),
-        &device_bytes,
-        core::slice::from_ref(&transfer),
-    )
-    .is_err()
+    if platform
+        .send_channel(
+            retained.raw(),
+            &device_bytes,
+            core::slice::from_ref(&transfer),
+        )
+        .is_err()
     {
         return Err(failure(74));
     }
@@ -2628,7 +2660,8 @@ fn launch_driver_staged_owned(
     wait_readable(retained.raw(), deadline, 76)?;
     let mut quiesced_bytes = [0; D3_DEVICE_QUIESCED_BYTES];
     let mut response_handles = [DwReceivedHandleInfoV1::default(); 1];
-    let counts = receive_channel(retained.raw(), &mut quiesced_bytes, &mut response_handles)
+    let counts = platform
+        .receive_channel(retained.raw(), &mut quiesced_bytes, &mut response_handles)
         .map_err(|_| failure(77))?;
     if counts.bytes != quiesced_bytes.len() || counts.handles != 0 {
         close_received(&response_handles, counts.handles);
@@ -2642,7 +2675,9 @@ fn launch_driver_staged_owned(
     // Creating the route-committing Interrupt is deliberately after the exact
     // DEVICE_QUIESCED reply above.
     let interrupt = owned.interrupt.hold(
-        create_interrupt(parent_resource, INTERRUPT_CUSTODY_RIGHTS).map_err(|_| failure(81))?,
+        platform
+            .create_interrupt(parent_resource, INTERRUPT_CUSTODY_RIGHTS)
+            .map_err(|_| failure(81))?,
     );
     if validate_fresh(
         interrupt.raw(),
@@ -2653,7 +2688,9 @@ fn launch_driver_staged_owned(
     {
         return Err(failure(82));
     }
-    let interrupt_facts = interrupt_info(interrupt.raw()).map_err(|_| failure(83))?;
+    let interrupt_facts = platform
+        .interrupt_info(interrupt.raw())
+        .map_err(|_| failure(83))?;
     if interrupt_facts.size != DW_INTERRUPT_INFO_V1_SIZE
         || interrupt_facts.version != DW_INTERRUPT_INFO_V1_VERSION
         || interrupt_facts.source != resource.interrupt_source
@@ -2685,12 +2722,13 @@ fn launch_driver_staged_owned(
         reserved0: 0,
         reserved: [0; 2],
     };
-    if send_channel(
-        retained.raw(),
-        &interrupt_bytes,
-        core::slice::from_ref(&transfer),
-    )
-    .is_err()
+    if platform
+        .send_channel(
+            retained.raw(),
+            &interrupt_bytes,
+            core::slice::from_ref(&transfer),
+        )
+        .is_err()
     {
         return Err(failure(88));
     }
@@ -2700,7 +2738,8 @@ fn launch_driver_staged_owned(
     wait_readable(retained.raw(), deadline, 91)?;
     let mut ready_bytes = [0; D3_READY_BYTES];
     let mut ready_handles = [DwReceivedHandleInfoV1::default(); 1];
-    let counts = receive_channel(retained.raw(), &mut ready_bytes, &mut ready_handles)
+    let counts = platform
+        .receive_channel(retained.raw(), &mut ready_bytes, &mut ready_handles)
         .map_err(|_| failure(92))?;
     if counts.bytes != ready_bytes.len() || counts.handles != 0 {
         close_received(&ready_handles, counts.handles);
@@ -2722,38 +2761,41 @@ fn launch_driver_staged_owned(
             correlations.ready_transaction_id,
         )
         .map_err(|_| failure(96))?;
-    publish_driver(publication, request, resident)?;
+    publish_driver(platform, publication, request, resident)?;
     Ok(retained.take_raw())
 }
 
 #[cfg(all(feature = "wyr1c5-production", not(feature = "wyr1d-production")))]
-fn launch_driver_with_historical_bundle(
+fn launch_driver_with_historical_bundle<P: DevmgrPlatform>(
+    platform: &mut P,
     bootstrap: DwHandle,
     publication: DwHandle,
     parent_resource: DwHandle,
     resident: &mut crate::ResidentController,
 ) -> Result<DwHandle, u32> {
-    let (retained, child) = create_channel(DIRECT_CONTROL_RIGHTS).map_err(|_| failure(57))?;
+    let (retained, child) = platform
+        .create_channel(DIRECT_CONTROL_RIGHTS)
+        .map_err(|_| failure(57))?;
     if validate_fresh(retained, DW_OBJECT_TYPE_CHANNEL, DIRECT_CONTROL_RIGHTS).is_err()
         || validate_fresh(child, DW_OBJECT_TYPE_CHANNEL, DIRECT_CONTROL_RIGHTS).is_err()
     {
-        let _ = close_handle(child);
-        let _ = close_handle(retained);
+        let _ = platform.close_handle(child);
+        let _ = platform.close_handle(retained);
         return Err(failure(58));
     }
     let request =
         match resident.issue_driver_launch_with_bundle(true, DirectControlRights::ExactReduced) {
             Ok(request) => request,
             Err(_) => {
-                let _ = close_handle(child);
-                let _ = close_handle(retained);
+                let _ = platform.close_handle(child);
+                let _ = platform.close_handle(retained);
                 return Err(failure(59));
             }
         };
     let mut launch = [0u8; LAUNCH_REQUEST_BYTES];
     if encode_request(request, &mut launch).is_err() {
-        let _ = close_handle(child);
-        let _ = close_handle(retained);
+        let _ = platform.close_handle(child);
+        let _ = platform.close_handle(retained);
         return Err(failure(60));
     }
     let child_transfer = DwHandleTransferV1 {
@@ -2771,53 +2813,56 @@ fn launch_driver_with_historical_bundle(
     )
     .is_err()
     {
-        let _ = close_handle(child);
-        let _ = close_handle(retained);
+        let _ = platform.close_handle(child);
+        let _ = platform.close_handle(retained);
         return Err(failure(61));
     }
 
-    let deadline = match monotonic_deadline_after(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns) {
-        Ok(deadline) => deadline,
-        Err(_) => {
-            let _ = close_handle(retained);
-            return Err(failure(62));
-        }
-    };
+    let deadline =
+        match platform.monotonic_deadline_after(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns) {
+            Ok(deadline) => deadline,
+            Err(_) => {
+                let _ = platform.close_handle(retained);
+                return Err(failure(62));
+            }
+        };
     if wait_readable(bootstrap, deadline, 63).is_err() {
-        let _ = close_handle(retained);
+        let _ = platform.close_handle(retained);
         return Err(failure(63));
     }
     let mut constructed = [0u8; LAUNCH_RESPONSE_BYTES];
     let mut constructed_handles = [DwReceivedHandleInfoV1::default(); 1];
-    let counts = match receive_channel(bootstrap, &mut constructed, &mut constructed_handles) {
-        Ok(counts) => counts,
-        Err(_) => {
-            let _ = close_handle(retained);
-            return Err(failure(64));
-        }
-    };
+    let counts =
+        match platform.receive_channel(bootstrap, &mut constructed, &mut constructed_handles) {
+            Ok(counts) => counts,
+            Err(_) => {
+                let _ = platform.close_handle(retained);
+                return Err(failure(64));
+            }
+        };
     if counts.bytes != constructed.len() || counts.handles != 0 {
         close_received(&constructed_handles, counts.handles);
-        let _ = close_handle(retained);
+        let _ = platform.close_handle(retained);
         return Err(failure(65));
     }
     if parse_constructed(&constructed, request).is_err() || resident.driver_constructed().is_err() {
-        let _ = close_handle(retained);
+        let _ = platform.close_handle(retained);
         return Err(failure(66));
     }
 
-    let reduced = match duplicate_handle(parent_resource, DEVICE_RESOURCE_TRANSFER_RIGHTS) {
+    let reduced = match platform.duplicate_handle(parent_resource, DEVICE_RESOURCE_TRANSFER_RIGHTS)
+    {
         Ok(handle) => handle,
         Err(_) => {
-            let _ = close_handle(retained);
+            let _ = platform.close_handle(retained);
             return Err(failure(67));
         }
     };
-    let interrupt = match create_interrupt(parent_resource, INTERRUPT_CUSTODY_RIGHTS) {
+    let interrupt = match platform.create_interrupt(parent_resource, INTERRUPT_CUSTODY_RIGHTS) {
         Ok(handle) => handle,
         Err(_) => {
-            let _ = close_handle(reduced);
-            let _ = close_handle(retained);
+            let _ = platform.close_handle(reduced);
+            let _ = platform.close_handle(retained);
             return Err(failure(68));
         }
     };
@@ -2834,8 +2879,12 @@ fn launch_driver_with_historical_bundle(
             INTERRUPT_CUSTODY_RIGHTS,
         )
         .map_err(|_| failure(70))?;
-        let resource = device_resource_info(reduced).map_err(|_| failure(71))?;
-        let interrupt_info = interrupt_info(interrupt).map_err(|_| failure(72))?;
+        let resource = platform
+            .device_resource_info(reduced)
+            .map_err(|_| failure(71))?;
+        let interrupt_info = platform
+            .interrupt_info(interrupt)
+            .map_err(|_| failure(72))?;
         if resource.resource_id != crate::COM2_RESOURCE_ID
             || Some(wyrmroot_device_proto::coordinator::BundleGeneration(
                 resource.lease_generation,
@@ -2859,9 +2908,9 @@ fn launch_driver_with_historical_bundle(
     let (lease_generation, irq_binding) = match intake {
         Ok(value) => value,
         Err(code) => {
-            let _ = close_handle(interrupt);
-            let _ = close_handle(reduced);
-            let _ = close_handle(retained);
+            let _ = platform.close_handle(interrupt);
+            let _ = platform.close_handle(reduced);
+            let _ = platform.close_handle(retained);
             return Err(code);
         }
     };
@@ -2869,26 +2918,26 @@ fn launch_driver_with_historical_bundle(
         .set_driver_bindings(lease_generation, irq_binding)
         .is_err()
     {
-        let _ = close_handle(interrupt);
-        let _ = close_handle(reduced);
-        let _ = close_handle(retained);
+        let _ = platform.close_handle(interrupt);
+        let _ = platform.close_handle(reduced);
+        let _ = platform.close_handle(retained);
         return Err(failure(74));
     }
 
     let bundle = match resident.resource_bundle_message() {
         Ok(message) => message,
         Err(_) => {
-            let _ = close_handle(interrupt);
-            let _ = close_handle(reduced);
-            let _ = close_handle(retained);
+            let _ = platform.close_handle(interrupt);
+            let _ = platform.close_handle(reduced);
+            let _ = platform.close_handle(retained);
             return Err(failure(74));
         }
     };
     let mut bundle_bytes = [0u8; RESOURCE_BUNDLE_BYTES];
     if encode_control(bundle, &mut bundle_bytes).is_err() {
-        let _ = close_handle(interrupt);
-        let _ = close_handle(reduced);
-        let _ = close_handle(retained);
+        let _ = platform.close_handle(interrupt);
+        let _ = platform.close_handle(reduced);
+        let _ = platform.close_handle(retained);
         return Err(failure(75));
     }
     let transfers = [
@@ -2907,14 +2956,17 @@ fn launch_driver_with_historical_bundle(
             reserved: [0; 2],
         },
     ];
-    if send_channel(retained, &bundle_bytes, &transfers).is_err() {
-        let _ = close_handle(interrupt);
-        let _ = close_handle(reduced);
-        let _ = close_handle(retained);
+    if platform
+        .send_channel(retained, &bundle_bytes, &transfers)
+        .is_err()
+    {
+        let _ = platform.close_handle(interrupt);
+        let _ = platform.close_handle(reduced);
+        let _ = platform.close_handle(retained);
         return Err(failure(76));
     }
     if resident.bundle_transferred().is_err() {
-        let _ = close_handle(retained);
+        let _ = platform.close_handle(retained);
         return Err(failure(92));
     }
 
@@ -2939,32 +2991,32 @@ fn launch_driver_with_historical_bundle(
     }
 
     if wait_readable(retained, deadline, 77).is_err() {
-        let _ = close_handle(retained);
+        let _ = platform.close_handle(retained);
         return Err(failure(77));
     }
     let mut ready = [0u8; READY_BYTES];
     let mut ready_handles = [DwReceivedHandleInfoV1::default(); 1];
-    let counts = match receive_channel(retained, &mut ready, &mut ready_handles) {
+    let counts = match platform.receive_channel(retained, &mut ready, &mut ready_handles) {
         Ok(counts) => counts,
         Err(_) => {
-            let _ = close_handle(retained);
+            let _ = platform.close_handle(retained);
             return Err(failure(78));
         }
     };
     if counts.bytes != ready.len() || counts.handles != 0 {
         close_received(&ready_handles, counts.handles);
-        let _ = close_handle(retained);
+        let _ = platform.close_handle(retained);
         return Err(failure(79));
     }
     let ready = match parse_control(&ready) {
         Ok(ready) => ready,
         Err(_) => {
-            let _ = close_handle(retained);
+            let _ = platform.close_handle(retained);
             return Err(failure(80));
         }
     };
     if resident.accept_driver_ready(ready).is_err() {
-        let _ = close_handle(retained);
+        let _ = platform.close_handle(retained);
         return Err(failure(81));
     }
     #[cfg(feature = "wyr1c6-selector29")]
@@ -2992,9 +3044,9 @@ fn launch_driver_with_historical_bundle(
     #[cfg(not(feature = "wyr1c6-selector29"))]
     let should_publish = true;
     if should_publish {
-        if let Err(code) = publish_driver(publication, request, resident) {
-            let _ = send_driver_retire(retained, resident);
-            let _ = close_handle(retained);
+        if let Err(code) = publish_driver(platform, publication, request, resident) {
+            let _ = send_driver_retire(platform, retained, resident);
+            let _ = platform.close_handle(retained);
             return Err(code);
         }
         #[cfg(feature = "wyr1c6-selector29")]
@@ -3020,13 +3072,14 @@ fn launch_driver_with_historical_bundle(
     }
     #[cfg(feature = "wyr1c6-selector29")]
     if selector29_should_fail(request.supervisor_generation, request.attempt_generation) {
-        send_failure_trigger(retained, request, resident)?;
+        send_failure_trigger(platform, retained, request, resident)?;
     }
     Ok(retained)
 }
 
 #[cfg(feature = "wyr1c6-selector29")]
-fn send_failure_trigger(
+fn send_failure_trigger<P: DevmgrPlatform>(
+    platform: &mut P,
     control: DwHandle,
     request: wyrmroot_device_proto::DriverLaunchRequest,
     resident: &crate::ResidentController,
@@ -3040,29 +3093,34 @@ fn send_failure_trigger(
     };
     let mut bytes = [0u8; wyrmroot_device_proto::control::TRIGGER_FAILURE_BYTES];
     wyrmroot_device_proto::control::encode(message, &mut bytes).map_err(|_| failure(98))?;
-    send_channel(control, &bytes, &[]).map_err(|_| failure(99))
+    platform
+        .send_channel(control, &bytes, &[])
+        .map_err(|_| failure(99))
 }
 
 #[cfg(feature = "wyr1c6-selector29")]
-fn probe_malformed_resource_mapping(
+fn probe_malformed_resource_mapping<P: DevmgrPlatform>(
+    platform: &mut P,
     control: DwHandle,
     parent_resource: DwHandle,
     request: wyrmroot_device_proto::DriverLaunchRequest,
     resident: &crate::ResidentController,
 ) -> Result<(), u32> {
     let active_generation = resident.bundle_generation().ok_or(failure(154))?;
-    let first_resource = duplicate_handle(parent_resource, DEVICE_RESOURCE_TRANSFER_RIGHTS)
+    let first_resource = platform
+        .duplicate_handle(parent_resource, DEVICE_RESOURCE_TRANSFER_RIGHTS)
         .map_err(|_| failure(156))?;
     // U2 already owns the lease's exclusive Interrupt binding. Exercise the
     // typed bundle mapping instead by placing a second reduced DeviceResource
     // in the Interrupt slot; the actor must reject it without disturbing U2.
-    let second_resource = match duplicate_handle(parent_resource, DEVICE_RESOURCE_TRANSFER_RIGHTS) {
-        Ok(handle) => handle,
-        Err(_) => {
-            let _ = close_handle(first_resource);
-            return Err(failure(157));
-        }
-    };
+    let second_resource =
+        match platform.duplicate_handle(parent_resource, DEVICE_RESOURCE_TRANSFER_RIGHTS) {
+            Ok(handle) => handle,
+            Err(_) => {
+                let _ = platform.close_handle(first_resource);
+                return Err(failure(157));
+            }
+        };
     let message = ControlMessage::ResourceBundle {
         role_id: request.role_id,
         bundle_generation: active_generation,
@@ -3072,8 +3130,8 @@ fn probe_malformed_resource_mapping(
     };
     let mut bytes = [0u8; RESOURCE_BUNDLE_BYTES];
     if encode_control(message, &mut bytes).is_err() {
-        let _ = close_handle(second_resource);
-        let _ = close_handle(first_resource);
+        let _ = platform.close_handle(second_resource);
+        let _ = platform.close_handle(first_resource);
         return Err(failure(158));
     }
     let transfers = [
@@ -3092,17 +3150,20 @@ fn probe_malformed_resource_mapping(
             reserved: [0; 2],
         },
     ];
-    if send_channel(control, &bytes, &transfers).is_err() {
-        let _ = close_handle(second_resource);
-        let _ = close_handle(first_resource);
+    if platform.send_channel(control, &bytes, &transfers).is_err() {
+        let _ = platform.close_handle(second_resource);
+        let _ = platform.close_handle(first_resource);
         return Err(failure(159));
     }
-    let deadline = monotonic_deadline_after(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
+    let deadline = platform
+        .monotonic_deadline_after(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
         .map_err(|_| failure(160))?;
     wait_readable(control, deadline, 161)?;
     let mut response = [0u8; wyrmroot_device_proto::control::FAILURE_BYTES];
     let mut handles = [DwReceivedHandleInfoV1::default(); 1];
-    let counts = receive_channel(control, &mut response, &mut handles).map_err(|_| failure(162))?;
+    let counts = platform
+        .receive_channel(control, &mut response, &mut handles)
+        .map_err(|_| failure(162))?;
     if counts.bytes != response.len() || counts.handles != 0 {
         close_received(&handles, counts.handles);
         return Err(failure(163));
@@ -3122,7 +3183,8 @@ fn probe_malformed_resource_mapping(
 }
 
 #[cfg(feature = "wyr1c5-production")]
-fn publish_driver(
+fn publish_driver<P: DevmgrPlatform>(
+    platform: &mut P,
     publication: DwHandle,
     request: wyrmroot_device_proto::DriverLaunchRequest,
     resident: &mut crate::ResidentController,
@@ -3137,14 +3199,18 @@ fn publish_driver(
     };
     let mut bytes = [0u8; REGISTRY_HEADER_BYTES];
     let size = encode_registry_empty(header, &mut bytes).map_err(|_| failure(83))?;
-    send_channel(publication, &bytes[..size], &[]).map_err(|_| failure(84))?;
-    let deadline = monotonic_deadline_after(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
+    platform
+        .send_channel(publication, &bytes[..size], &[])
+        .map_err(|_| failure(84))?;
+    let deadline = platform
+        .monotonic_deadline_after(WYR0_I_SUPERVISION_POLICY.ready_timeout_ns)
         .map_err(|_| failure(85))?;
     wait_readable(publication, deadline, 86)?;
     let mut response = [0u8; REGISTRY_HEADER_BYTES];
     let mut handles = [DwReceivedHandleInfoV1::default(); 1];
-    let counts =
-        receive_channel(publication, &mut response, &mut handles).map_err(|_| failure(87))?;
+    let counts = platform
+        .receive_channel(publication, &mut response, &mut handles)
+        .map_err(|_| failure(87))?;
     if counts.bytes != response.len() || counts.handles != 0 {
         close_received(&handles, counts.handles);
         return Err(failure(88));
@@ -3163,14 +3229,17 @@ fn publish_driver(
 }
 
 #[cfg(feature = "wyr1c5-production")]
-fn send_driver_retire(
+fn send_driver_retire<P: DevmgrPlatform>(
+    platform: &mut P,
     control: DwHandle,
     resident: &mut crate::ResidentController,
 ) -> Result<(), u32> {
     let message = resident.retire_message().map_err(|_| failure(93))?;
     let mut bytes = [0u8; wyrmroot_device_proto::control::RETIRE_BYTES];
     encode_control(message, &mut bytes).map_err(|_| failure(94))?;
-    send_channel(control, &bytes, &[]).map_err(|_| failure(95))
+    platform
+        .send_channel(control, &bytes, &[])
+        .map_err(|_| failure(95))
 }
 
 #[cfg(any(
