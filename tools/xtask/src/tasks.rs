@@ -1404,6 +1404,9 @@ enum Route {
     Full,
     /// The warn-level lint ratchet, which also runs in the unfiltered suite.
     LintRatchet,
+    /// The workspace root's Python suites, through `tools/run-root-tests.py`.
+    /// `true` also prepares fresh F products for the tests that read them.
+    RootTests(bool),
 }
 
 /// Every named `xtask test host` filter, and what it runs.
@@ -1418,6 +1421,8 @@ const NAMED_HOST_FILTERS: &[(&str, Route)] = &[
     ("native", Route::AllNative),
     ("full", Route::Full),
     ("lint-ratchet", Route::LintRatchet),
+    ("root-tests", Route::RootTests(false)),
+    ("root-products", Route::RootTests(true)),
     ("selectors", Route::Host),
     ("wyr1e8-producer-fixture", Route::Host),
     ("wyr1d5-clippy", Route::Host),
@@ -1643,6 +1648,9 @@ pub(crate) fn run_host_tests(repository: &Path, filter: Option<&str>) -> Result<
         }
         Some((_, Some(Route::AllNative))) => run_every_step(repository, native_steps()),
         Some((_, Some(Route::LintRatchet))) => Step::LintRatchet.execute(repository),
+        Some((_, Some(Route::RootTests(products)))) => {
+            Step::RootTests(products).execute(repository)
+        }
         Some((_, Some(Route::Full))) => {
             let mut steps = default_steps()?;
             steps.extend(native_steps());
@@ -1664,6 +1672,7 @@ enum Step {
     Cargo(CargoRun),
     Native(&'static str, NativeGate),
     LintRatchet,
+    RootTests(bool),
 }
 
 impl Step {
@@ -1675,6 +1684,11 @@ impl Step {
                 "lint ratchet against {}",
                 crate::lint_ratchet::BASELINE_PATH
             ),
+            Self::RootTests(false) => "root Python tests (tools/run-root-tests.py)".to_owned(),
+            Self::RootTests(true) => {
+                "root Python tests with fresh F products (tools/run-root-tests.py --products)"
+                    .to_owned()
+            }
         }
     }
 
@@ -1683,7 +1697,48 @@ impl Step {
             Self::Cargo(run) => run.execute(repository),
             Self::Native(name, gate) => gate.run(repository, name),
             Self::LintRatchet => crate::lint_ratchet::run(repository, &lint_ratchet_shapes()?),
+            Self::RootTests(products) => run_root_tests(repository, *products),
         }
+    }
+}
+
+/// Runs the workspace root's Python suites against this checkout.
+///
+/// Those suites check the VM verifier and runner against what this
+/// repository's producer emits, so a producer change can break them. They are
+/// run here, where such a change is made, instead of in the root repository
+/// alone: after F3A.7j/7k three of them stayed red for four days because no
+/// gate ran them. `ROOT_TESTS_WYRMROOT` points them at this checkout, so a
+/// worktree lane checks its own producer rather than the canonical one.
+fn run_root_tests(repository: &Path, products: bool) -> Result<(), Failure> {
+    let project = canonical_project_root(repository)?;
+    let checkout = fs::canonicalize(repository).map_err(|error| {
+        Failure::task(format!("could not resolve the Wyrmroot checkout: {error}"))
+    })?;
+    let script = project.join("tools/run-root-tests.py");
+    if !script.is_file() {
+        return Err(Failure::task(format!(
+            "{} is missing; the root suites cannot run",
+            script.display()
+        )));
+    }
+    let mut command = Command::new("python3");
+    command
+        .arg(&script)
+        .env("ROOT_TESTS_WYRMROOT", &checkout)
+        .current_dir(&project);
+    if products {
+        command.arg("--products");
+    }
+    let status = command
+        .status()
+        .map_err(|error| Failure::task(format!("could not run {}: {error}", script.display())))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(Failure::task(format!(
+            "root Python tests failed ({status})"
+        )))
     }
 }
 
@@ -1712,6 +1767,7 @@ fn default_steps() -> Result<Vec<Step>, Failure> {
         }
     }
     let mut steps = runs.into_iter().map(Step::Cargo).collect::<Vec<_>>();
+    steps.push(Step::RootTests(false));
     steps.push(Step::LintRatchet);
     Ok(steps)
 }
@@ -1744,9 +1800,15 @@ fn lint_ratchet_shapes() -> Result<Vec<Vec<String>>, Failure> {
     Ok(shapes)
 }
 
-/// Every native gate, each once: `xtask test host native`.
+/// Every native gate, each once, then the root suites against freshly
+/// prepared F products: `xtask test host native`.
+///
+/// The product-backed root tests read real prepared products, which change
+/// whenever the producer or the kernel does. Preparing them takes minutes per
+/// product, so they run here with the other slow gates rather than in the
+/// unfiltered suite, which runs the fast root tests.
 fn native_steps() -> Vec<Step> {
-    NAMED_HOST_FILTERS
+    let mut steps = NAMED_HOST_FILTERS
         .iter()
         .filter_map(|(name, route)| match route {
             Route::Native(gate)
@@ -1756,7 +1818,9 @@ fn native_steps() -> Vec<Step> {
             }
             _ => None,
         })
-        .collect()
+        .collect::<Vec<_>>();
+    steps.push(Step::RootTests(true));
+    steps
 }
 
 /// Runs every step even after one fails, then reports each failure.
@@ -3292,10 +3356,12 @@ mod tests {
             .filter_map(|step| match step {
                 Step::Cargo(run) => Some(run.clone()),
                 Step::Native(name, _) => panic!("the unfiltered suite runs native gate {name}"),
-                Step::LintRatchet => None,
+                Step::LintRatchet | Step::RootTests(_) => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(steps.last(), Some(&Step::LintRatchet));
+        assert!(steps.contains(&Step::RootTests(false)));
+        assert!(!steps.contains(&Step::RootTests(true)));
         for (name, route) in NAMED_HOST_FILTERS {
             if *route == Route::Host {
                 for run in named_host_runs(name).unwrap() {
@@ -3351,12 +3417,15 @@ mod tests {
     /// the same check function as the gate that covers it.
     #[test]
     fn native_runs_every_native_gate_or_the_one_covering_it() {
-        let gates = native_steps()
-            .into_iter()
+        let steps = native_steps();
+        assert_eq!(steps.last(), Some(&Step::RootTests(true)));
+        let gates = steps[..steps.len() - 1]
+            .iter()
             .map(|step| match step {
-                Step::Native(name, gate) => (name, gate),
+                Step::Native(name, gate) => (*name, *gate),
                 Step::Cargo(run) => panic!("native runs a host command {:?}", run.arguments),
                 Step::LintRatchet => panic!("native runs the lint ratchet"),
+                Step::RootTests(_) => panic!("native runs the root tests twice"),
             })
             .collect::<Vec<_>>();
         for (index, (name, gate)) in gates.iter().enumerate() {
@@ -3423,6 +3492,8 @@ mod tests {
             assert!(!shapes[..index].contains(shape));
         }
         assert_eq!(named_host_filter("lint-ratchet"), Some(Route::LintRatchet));
+        assert_eq!(named_host_filter("root-tests"), Some(Route::RootTests(false)));
+        assert_eq!(named_host_filter("root-products"), Some(Route::RootTests(true)));
     }
 
     /// S1.2: the gates that name a test are exactly the ones that must see

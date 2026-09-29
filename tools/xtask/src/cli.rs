@@ -15,6 +15,8 @@ Usage:
     tools/pinned-cargo xtask test host native
     tools/pinned-cargo xtask test host full
     tools/pinned-cargo xtask test host lint-ratchet
+    tools/pinned-cargo xtask test host root-tests
+    tools/pinned-cargo xtask test host root-products
     tools/pinned-cargo xtask format
     tools/pinned-cargo xtask clippy
     tools/pinned-cargo xtask doc
@@ -115,6 +117,10 @@ it skips is covered by the one it runs. `full` is the unfiltered run followed by
 reaches with clippy::wildcard_enum_match_arm and
 clippy::undocumented_unsafe_blocks at warn level and fails if any per-package
 count rises above tools/xtask/lint-baseline.toml.
+`root-tests`, also part of the unfiltered run, runs the workspace root's Python
+suites (tools/run-root-tests.py) against this checkout. `root-products`, the
+last step of `native`, first prepares fresh F products under OS-Project/.tmp
+from this checkout's committed revision, so it needs a clean tree.
 
 Host filters may name a component (bootfs, protocol, elf, runtime, bootstrap,
 efi, init0, hello, xtask, dw1c-init0, or dw1d6), one product area (registry,
